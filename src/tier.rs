@@ -51,8 +51,15 @@ pub async fn tier_table(lake: &Lake, table: &str, hwm: u64, nodes: &[String], me
     }
     let upto = segs.last().map_or(hwm, |s| s.0);
     let mut rows = 0;
-    if n > 0 && (meta.key.is_empty() || (!meta.merge.is_empty() && meta.files.len() < 8)) {
-        // Append and merge tables: the log's rows, in one range of segments per node.
+    // Keyed tables fold their versions away once files pile up; that job takes the log too.
+    if !meta.key.is_empty() && meta.files.len() >= 8 {
+        let merged = deal(lake, vec![Job::new(table, &meta, Kind::Compact { upto })], nodes, me).await?;
+        rows = merged.iter().map(|f| f.rows).sum();
+        let old = meta.files.clone();
+        replace(&mut meta, &old, merged);
+    } else if n > 0 {
+        // The log's rows as new files, one range of segments per node. Keyed tables keep one row
+        // per key per file; older files still hold older versions until a compaction folds them.
         let (mut jobs, mut from, mut acc) = (vec![], meta.tiered, 0);
         for &(seg, r) in &segs {
             acc += r;
@@ -64,19 +71,15 @@ pub async fn tier_table(lake: &Lake, table: &str, hwm: u64, nodes: &[String], me
         let files = deal(lake, jobs, nodes, me).await?;
         rows = files.iter().map(|f| f.rows).sum();
         meta.files.extend(files);
-        // Append tables: once 8+ files are small, merge them into one.
-        let small: Vec<DataFile> = meta.files.iter().filter(|f| f.bytes < 64 << 20).cloned().collect();
+        // Append tables: once 8+ files are small, merge them, a group of 8 per node. A file that
+        // is already 64 MB or 4M rows (what a merge writes at most) is left alone, so rows are
+        // never merged twice.
+        let small: Vec<DataFile> = meta.files.iter().filter(|f| f.bytes < 64 << 20 && f.rows < 4_000_000).cloned().collect();
         if meta.key.is_empty() && small.len() >= 8 {
-            let merged = deal(lake, vec![Job::new(table, &meta, Kind::Merge { files: small.clone() })], nodes, me).await?;
+            let jobs = small.chunks(8).map(|g| Job::new(table, &meta, Kind::Merge { files: g.to_vec() })).collect();
+            let merged = deal(lake, jobs, nodes, me).await?;
             replace(&mut meta, &small, merged);
         }
-    } else if n > 0 {
-        // Upsert tables need every version in order, and merge tables with 8+ files get
-        // compacted: files + log, one row per key, into one file.
-        let merged = deal(lake, vec![Job::new(table, &meta, Kind::Compact { upto })], nodes, me).await?;
-        rows = merged.iter().map(|f| f.rows).sum();
-        let old = meta.files.clone();
-        replace(&mut meta, &old, merged);
     }
     meta.tiered = upto;
     lake.cat.commit(vec![(table_key(table), json(&meta))], &[]).await?;
@@ -132,35 +135,45 @@ async fn deal(lake: &Lake, jobs: Vec<Job>, nodes: &[String], me: &str) -> Result
 
 /// Do one job here; returns the Parquet files written.
 pub async fn run_job(lake: &Lake, Job { table, meta, kind }: Job) -> Result<Vec<DataFile>> {
-    let batches = match kind {
-        Kind::Fold { after, upto } if meta.merge.is_empty() => {
+    let keys = meta.key.clone();
+    let (batches, ord) = match kind {
+        Kind::Fold { after, upto } if meta.key.is_empty() => {
             caught_up(lake, upto).await?;
-            tail(lake, &table, after, Some(upto), false).await?
+            (tail(lake, &table, after, Some(upto), false).await?, upto)
         }
+        // Keyed tables: one row per key for this range of the log, delete markers included (they
+        // still have to shadow what older files hold for that key).
         Kind::Fold { after, upto } => {
             caught_up(lake, upto).await?;
-            latest(lake, &table, &TableMeta { files: vec![], tiered: after, ..meta }, upto).await?
+            let part = TableMeta { files: vec![], tiered: after, ..meta };
+            (latest(lake, &table, &part, upto, true).await?, upto)
         }
         Kind::Compact { upto } => {
+            anyhow::ensure!(!meta.key.is_empty(), "only keyed tables have versions to compact");
             caught_up(lake, upto).await?;
-            latest(lake, &table, &meta, upto).await?
+            (latest(lake, &table, &meta, upto, false).await?, upto)
         }
         Kind::Merge { files } => {
             let ctx = lake.session();
             let paths: Vec<String> = files.iter().map(|f| lake.full(&f.path)).collect();
             let schema = schema(&meta.columns)?;
             let df = ctx.read_parquet(paths, ParquetReadOptions::default().schema(&schema)).await?;
-            return write_stream(lake, &table, df.execute_stream().await?, 4_000_000).await;
+            let ord = files.iter().map(|f| f.ord).max().unwrap_or(0);
+            let mut merged = write_stream(lake, &table, df.execute_stream().await?, 4_000_000, &keys).await?;
+            merged.iter_mut().for_each(|f| f.ord = ord);
+            return Ok(merged);
         }
     };
-    Ok(write_file(lake, &table, &batches).await?.into_iter().collect())
+    let mut files: Vec<DataFile> = write_file(lake, &table, &batches, &keys).await?.into_iter().collect();
+    files.iter_mut().for_each(|f| f.ord = ord);
+    Ok(files)
 }
 
-/// One row per key: `meta`'s files plus the log up to `upto`.
-async fn latest(lake: &Lake, table: &str, meta: &TableMeta, upto: u64) -> Result<Vec<RecordBatch>> {
+/// One row per key: `meta`'s files plus the log up to `upto`, sorted by key.
+async fn latest(lake: &Lake, table: &str, meta: &TableMeta, upto: u64, keep_deleted: bool) -> Result<Vec<RecordBatch>> {
     let ctx = lake.session();
     ctx.register_table("__raw", raw(lake, &ctx, table, meta, Some(upto)).await?.into_view())?;
-    Ok(ctx.sql(&latest_sql(meta, "__raw", true)).await?.collect().await?)
+    Ok(ctx.sql(&latest_sql(meta, "__raw", true, keep_deleted)).await?.collect().await?)
 }
 
 /// Wait until this node sees log segment `upto` (a follower's view may lag the leader a bit).
@@ -248,19 +261,28 @@ async fn collect_orphans(lake: &Lake) -> Result<()> {
     Ok(())
 }
 
-fn writer<'a>(buf: &'a mut Vec<u8>, batch: &RecordBatch) -> Result<ArrowWriter<&'a mut Vec<u8>>> {
-    let props = WriterProperties::builder().set_compression(Compression::ZSTD(ZstdLevel::try_new(1)?)).build();
-    Ok(ArrowWriter::try_new(buf, batch.schema(), Some(props))?)
+/// Parquet writer: ZSTD everywhere. Keyed tables are written for lookups as well as scans —
+/// sorted by key (see `latest_sql`), with a bloom filter per key column, and in small row groups
+/// and pages, so reading one key touches one page instead of a million rows.
+fn writer<'a>(buf: &'a mut Vec<u8>, batch: &RecordBatch, keys: &[String]) -> Result<ArrowWriter<&'a mut Vec<u8>>> {
+    let mut props = WriterProperties::builder().set_compression(Compression::ZSTD(ZstdLevel::try_new(1)?));
+    if !keys.is_empty() {
+        props = props.set_max_row_group_size(256 << 10);
+    }
+    for k in keys {
+        props = props.set_column_bloom_filter_enabled(k.as_str().into(), true);
+    }
+    Ok(ArrowWriter::try_new(buf, batch.schema(), Some(props.build()))?)
 }
 
 /// Write batches as one Parquet file (none if there are no rows).
-pub async fn write_file(lake: &Lake, table: &str, batches: &[RecordBatch]) -> Result<Option<DataFile>> {
+pub async fn write_file(lake: &Lake, table: &str, batches: &[RecordBatch], keys: &[String]) -> Result<Option<DataFile>> {
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     if rows == 0 {
         return Ok(None);
     }
     let mut buf = vec![];
-    let mut w = writer(&mut buf, &batches[0])?;
+    let mut w = writer(&mut buf, &batches[0], keys)?;
     for b in batches {
         w.write(b)?;
     }
@@ -268,21 +290,21 @@ pub async fn write_file(lake: &Lake, table: &str, batches: &[RecordBatch]) -> Re
     let (path, bytes) = (format!("data/{table}/{}.parquet", uuid::Uuid::new_v4()), buf.len() as u64);
     lake.put(&path, buf).await?;
     maybe_crash("after_parquet_put");
-    Ok(Some(DataFile { path, rows: rows as u64, bytes }))
+    Ok(Some(DataFile { path, rows: rows as u64, bytes, ord: 0 }))
 }
 
 /// Stream a query result into Parquet files of up to `max_rows` each (bulk INSERT … SELECT).
-pub async fn write_stream(lake: &Lake, table: &str, mut stream: SendableRecordBatchStream, max_rows: usize) -> Result<Vec<DataFile>> {
+pub async fn write_stream(lake: &Lake, table: &str, mut stream: SendableRecordBatchStream, max_rows: usize, keys: &[String]) -> Result<Vec<DataFile>> {
     let (mut files, mut pending, mut n) = (vec![], vec![], 0);
     while let Some(batch) = stream.next().await {
         let batch = batch?;
         n += batch.num_rows();
         pending.push(batch);
         if n >= max_rows {
-            files.extend(write_file(lake, table, &std::mem::take(&mut pending)).await?);
+            files.extend(write_file(lake, table, &std::mem::take(&mut pending), keys).await?);
             n = 0;
         }
     }
-    files.extend(write_file(lake, table, &pending).await?);
+    files.extend(write_file(lake, table, &pending, keys).await?);
     Ok(files)
 }

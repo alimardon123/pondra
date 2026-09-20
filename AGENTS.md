@@ -66,9 +66,14 @@ docs/     ADRs and reports
 4. **A job names its inputs.** Tiering jobs carry the file list and segment range from the leader
    and refuse to run until the node can see the last segment; otherwise a lagging node would write
    an incomplete file that the leader then commits.
-5. **Segments and files are immutable.** Nothing is ever overwritten (`PutMode::Create`);
+5. **A keyed table's files are versions, not a set.** Each file carries `ord`, the last log segment
+   it covers, and a row in a higher-`ord` file is a newer version of its key (`_ord` in a read is
+   `ord << 32` for file rows, `(segment << 32) + position` for log rows). Two rules follow: a file
+   written by a fold keeps delete markers (they shadow older files; only a full compaction drops
+   them), and two files of the same `ord` must never cover the same segments.
+6. **Segments and files are immutable.** Nothing is ever overwritten (`PutMode::Create`);
    replaced files become `garbage` and are deleted after the retention period.
-6. **Expire only what everyone has consumed**, using the floor as of `retain_secs` ago, so a query
+7. **Expire only what everyone has consumed**, using the floor as of `retain_secs` ago, so a query
    that started earlier still finds its segments.
 
 ## Tests: run these before and after any change
@@ -82,6 +87,7 @@ python3 tools/cluster.py failover --secs 45   # 2 leader kills; task state == in
 python3 tools/cluster.py latency [--load 4]   # event -> view row on another node
 python3 tools/cluster.py race | isolate | split | spread
 python3 tools/bench/run.py batch 20000000     # ENGINES=pondra,spark,flink
+python3 tools/serve_bench.py --keys 2000000   # serving: point lookups and dashboard queries
 ```
 
 Add `--s3` to any of them with a simulated-R2 bucket to see the object-storage behaviour:
@@ -92,6 +98,11 @@ export AWS_ENDPOINT=http://127.0.0.1:9000 AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCE
        AWS_REGION=auto AWS_ALLOW_HTTP=true PONDRA_BUCKET=testbucket
 python3 tools/harness.py crash --runs 3 --batches 150 --s3
 ```
+
+**A tiering failure is silent in the correctness tests** — reads stay correct, the log just stops
+draining — so it shows up as a throughput drop in `tools/bench/run.py live` (and as
+`background job failed:` on the leader's stderr), not as a test failure. `harness.py tiering`
+checks the log drains and the file count stays bounded; watch the live benchmark for the rest.
 
 **`failover` is the test that catches read-consistency bugs.** It has found every one so far, and
 it only fails about 1 run in 8 when something is wrong — run it 15–20 times before believing a fix.

@@ -1,6 +1,6 @@
 # Pondra: a streamhouse in one binary
 
-One Rust binary (~2,500 lines) that ingests streams, stores them as an open lakehouse (Parquet +
+One Rust binary (~2,650 lines) that ingests streams, stores them as an open lakehouse (Parquet +
 Arrow on object storage), keeps SQL views and streaming state up to date, answers SQL, and scales
 out by starting more copies of itself on the same bucket. Object storage is the only state: no
 Postgres, no ZooKeeper, no Kafka, no JVM. Runs on a local directory or any S3-compatible store
@@ -53,6 +53,7 @@ differences entirely.
 | General stateful streaming | `POST /tasks/{name}` `{"source","target","sql"[, "key","shards","shard_by"]}`: runs as soon as rows commit, exactly-once, shards spread over nodes | Flink jobs |
 | Push | `GET /watch/{t}`: new rows as NDJSON the moment they commit | Kafka consumers |
 | SQL | `POST /sql[?format=table][&after=<seg>]`: files ∪ log tail, one snapshot. Large tables run SPMD across all nodes (`&spread=1` forces, `0` disables) | Trino / Spark SQL |
+| Serving reads | `GET /lookup/{t}/{key}`: the current row of one key, planned as a lookup (one thread, bloom-filtered, sorted files) rather than a scan | Redis / Postgres in front of the lake |
 | Batch ELT, exactly-once | `POST /insert/{t}?job=` with a `SELECT`: straight to Parquet; a retried job is a no-op | Spark batch jobs |
 | Maintenance | automatic and spread over the nodes: tiering to Parquet, compaction, retention, orphan cleanup, backpressure | Spark OPTIMIZE / VACUUM |
 
@@ -66,7 +67,7 @@ differences entirely.
 | `views.rs` | Inline views; GROUP BY views become merge tables |
 | `tasks.rs` | Streaming tasks: output + progress commit together, only if progress is unchanged (compare-and-swap) |
 | `spmd.rs` | Distributed queries: every node runs the same plan over its slice up to the first exchange; the receiving node finishes it |
-| `tier.rs` | Tiering, merging small files and compaction: the leader decides and commits, the data work is dealt to the nodes as jobs. Retention and orphan cleanup |
+| `tier.rs` | Tiering, merging small files and compaction: the leader decides and commits, the data work is dealt to the nodes as jobs. Keyed tables are LSM-like — each round folds the log tail into a new file, and files are compacted once 8 pile up. Retention and orphan cleanup |
 | `query.rs`, `cache.rs` | Hot+cold snapshot per query (DataFusion); read cache for object storage |
 | `server.rs`, `main.rs` | HTTP API (axum) and CLI |
 
@@ -85,6 +86,7 @@ python3 tools/cluster.py latency [--load 4]     # event -> view row pushed to an
 python3 tools/cluster.py spread                 # distributed queries == single-node results
 python3 tools/cluster.py race | isolate | split # elections, cut-off follower, where the CPU goes
 python3 tools/bench/run.py batch 20000000       # vs Spark and Flink (ENGINES=pondra,spark,flink)
+python3 tools/serve_bench.py --keys 2000000     # point lookups and dashboard queries, p50/p99/QPS
 python3 tools/sizes.py                          # storage bytes per event
 tools/r2_test.sh                                # the main tests against a real bucket
 python3 tools/sim_r2.py --port 9000             # local S3 server with R2-like latency (moto)

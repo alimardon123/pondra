@@ -1,0 +1,3 @@
+latency: 3 nodes, 0 background producers; 17 probe events, 17 pushed back
+  ack (durable)                       p50 931 ms  p99 2311 ms
+  view row pushed to another node     p50 1374 ms  p99 2310 ms

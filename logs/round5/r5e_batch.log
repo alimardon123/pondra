@@ -1,0 +1,1 @@
+{"engine": "pondra", "mode": "batch", "rows": 20000000, "startup_s": 0.024, "write_s": 3.15, "q1_scan_agg": [0.045, 0.044], "q2_filter_group": [0.13, 0.136], "q3_high_card_group": [0.445, 0.478], "q4_count_distinct": [0.35, 0.327], "q5_join": [0.243, 0.24], "q6_time_bucket": [0.252, 0.25], "peak_rss_mb": 279}

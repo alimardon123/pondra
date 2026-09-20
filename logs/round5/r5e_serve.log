@@ -1,0 +1,9 @@
+{"keys": 2000000, "nodes": 1, "load_s": 2.5, "stats": {"role": "leader", "hwm": 8}}
+{"keys": 2000000, "nodes": 1, "load_s": 2.5, "query": "point_lookup_sql", "threads": 1, "queries": 645, "qps": 129, "errors": 0, "p50_ms": 7.7, "p99_ms": 11.3, "max_ms": 15.9}
+{"keys": 2000000, "nodes": 1, "load_s": 2.5, "query": "point_lookup", "threads": 1, "queries": 556, "qps": 111, "errors": 0, "p50_ms": 8.9, "p99_ms": 11.3, "max_ms": 12.2}
+{"keys": 2000000, "nodes": 1, "load_s": 2.5, "query": "point_lookup_sql", "threads": 8, "queries": 1325, "qps": 265, "errors": 0, "p50_ms": 30.0, "p99_ms": 45.8, "max_ms": 57.0}
+{"keys": 2000000, "nodes": 1, "load_s": 2.5, "query": "point_lookup", "threads": 8, "queries": 1159, "qps": 232, "errors": 0, "p50_ms": 34.6, "p99_ms": 54.7, "max_ms": 65.5}
+{"keys": 2000000, "nodes": 1, "load_s": 2.5, "query": "point_lookup_sql", "threads": 32, "queries": 1330, "qps": 266, "errors": 0, "p50_ms": 121.9, "p99_ms": 205.8, "max_ms": 244.0}
+{"keys": 2000000, "nodes": 1, "load_s": 2.5, "query": "point_lookup", "threads": 32, "queries": 1166, "qps": 233, "errors": 0, "p50_ms": 138.9, "p99_ms": 233.0, "max_ms": 274.3}
+{"keys": 2000000, "nodes": 1, "load_s": 2.5, "query": "dashboard_agg", "threads": 1, "queries": 15, "qps": 3, "errors": 0, "p50_ms": 351.1, "p99_ms": 409.0, "max_ms": 409.0}
+{"keys": 2000000, "nodes": 1, "load_s": 2.5, "query": "point_lookup_while_writing", "threads": 8, "queries": 891, "qps": 178, "errors": 0, "p50_ms": 43.8, "p99_ms": 98.6, "max_ms": 109.8}

@@ -2,7 +2,7 @@
 //! writes (tables, views, tasks, bulk inserts, tiering) go to the leader (followers forward them).
 use crate::cluster::Cluster;
 use crate::log::{decode_flush, Ack, Log, Sequencer, Src};
-use crate::query::{schema, session, tail};
+use crate::query::{latest_sql, raw, schema, session, tail};
 use crate::store::*;
 use crate::tasks::Task;
 use crate::tier::{expire, tier_table, write_stream};
@@ -45,6 +45,7 @@ pub fn router(app: App) -> Router {
         .merge(leader_only)
         .route("/append/{name}", post(append))
         .route("/sql", post(sql))
+        .route("/lookup/{name}/{key}", get(lookup))
         .route("/watch/{name}", get(watch))
         .route("/stats", get(stats))
         .route("/cluster/commit", post(commit))
@@ -227,7 +228,8 @@ async fn insert(State(app): State<App>, Path(name): Path<String>, Query(p): Quer
     }
     let df = session(lake, &query, "").await?.sql(&query).await?;
     let out = df.schema().as_arrow().clone();
-    let files = write_stream(lake, &name, df.execute_stream().await?, 1_000_000).await?;
+    let keys = lake.cat.get::<TableMeta>(&table_key(&name)).await?.map(|m| m.key).unwrap_or_default();
+    let files = write_stream(lake, &name, df.execute_stream().await?, 1_000_000, &keys).await?;
     let _guard = app.lock.lock().await;
     if lake.cat.get::<u64>(&producer).await?.is_some() {
         return Ok(Json(j!({"duplicate": true}))); // the same job finished concurrently
@@ -257,6 +259,39 @@ async fn create_view(State(app): State<App>, Path(name): Path<String>, sql: Stri
     let _guard = app.lock.lock().await;
     crate::views::create(&app.lake, &name, &sql).await?;
     Ok(Json(j!({"view": name})))
+}
+
+/// `GET /lookup/{table}/{key}`: the current row of one key, for serving reads. Same answer as
+/// `SELECT … WHERE key = …`, but planned as a filter + "newest wins" instead of a window over the
+/// table, on one thread, so it costs a few milliseconds even with many queries in flight.
+/// Composite keys are comma-separated, in the key's column order.
+async fn lookup(State(app): State<App>, Path((name, key)): Path<(String, String)>) -> Result<Response, E> {
+    let lake = &app.lake;
+    let meta: TableMeta = lake.cat.get(&table_key(&name)).await?.ok_or_else(|| anyhow::anyhow!("no table {name}"))?;
+    ensure!(!meta.key.is_empty(), "{name} has no key: use /sql");
+    let mut where_ = vec![];
+    for (col, val) in meta.key.iter().zip(key.split(',')) {
+        let text = meta.columns.iter().any(|(c, t)| c == col && (t == "Utf8" || t == "LargeUtf8"));
+        ensure!(!val.contains('\''), "quote in key");
+        where_.push(match text {
+            true => format!("\"{col}\" = '{val}'"),
+            false => format!("\"{col}\" = {val}"),
+        });
+    }
+    let (ctx, where_) = (lake.session_with(1), where_.join(" AND "));
+    ctx.register_table("__raw", raw(lake, &ctx, &name, &meta, None).await?.into_view())?;
+    let cols = meta.columns.iter().map(|(c, _)| format!("\"{c}\"")).collect::<Vec<_>>().join(", ");
+    let sql = match meta.merge.is_empty() {
+        // Upsert table: the newest version of the key wins (no window over the whole table).
+        true => format!("SELECT {cols} FROM __raw WHERE {where_} ORDER BY \"_ord\" DESC LIMIT 1"),
+        // Merge table: combine that key's partial rows.
+        false => format!("{} ", latest_sql(&meta, "__raw", false, false)).replace(" GROUP BY ", &format!(" WHERE {where_} GROUP BY ")),
+    };
+    let batches = ctx.sql(&sql).await?.collect().await?;
+    let mut w = arrow_json::ArrayWriter::new(Vec::new());
+    w.write_batches(&batches.iter().collect::<Vec<_>>())?;
+    w.finish()?;
+    Ok(([("content-type", "application/json")], w.into_inner()).into_response())
 }
 
 #[derive(Deserialize)]

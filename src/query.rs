@@ -55,10 +55,27 @@ pub async fn tail(lake: &Lake, table: &str, after: u64, upto: Option<u64>, ord: 
 pub async fn raw(lake: &Lake, ctx: &SessionContext, name: &str, meta: &TableMeta, upto: Option<u64>) -> Result<DataFrame> {
     let (schema, keyed) = (schema(&meta.columns)?, !meta.key.is_empty());
     let mut parts = vec![];
-    if !meta.files.is_empty() {
-        let files: Vec<String> = meta.files.iter().map(|f| lake.full(&f.path)).collect();
-        let df = ctx.read_parquet(files, ParquetReadOptions::default().schema(&schema)).await?;
-        parts.push(if keyed { df.with_column("_ord", lit(0u64))? } else { df });
+    let opts = || ParquetReadOptions::default().schema(&schema);
+    let path = |f: &DataFile| lake.full(&f.path);
+    // Only upsert tables care which file a row came from (the newest version of the key wins).
+    // Merge tables combine their rows in any order, so all their files read as one.
+    match keyed && meta.merge.is_empty() {
+        false if !meta.files.is_empty() => {
+            let df = ctx.read_parquet(meta.files.iter().map(path).collect::<Vec<_>>(), opts()).await?;
+            parts.push(if keyed { df.with_column("_ord", lit(0u64))? } else { df });
+        }
+        false => {}
+        // One read per generation of files: `_ord` puts a newer file above an older one, and both
+        // below the log segments that came after them.
+        true => {
+            let mut by_ord: std::collections::BTreeMap<u64, Vec<String>> = Default::default();
+            for f in &meta.files {
+                by_ord.entry(f.ord).or_default().push(path(f));
+            }
+            for (ord, files) in by_ord {
+                parts.push(ctx.read_parquet(files, opts()).await?.with_column("_ord", lit(ord << 32))?);
+            }
+        }
     }
     let hot = tail(lake, name, meta.tiered, upto, keyed).await?;
     if !hot.is_empty() {
@@ -78,8 +95,11 @@ pub async fn raw(lake: &Lake, ctx: &SessionContext, name: &str, meta: &TableMeta
 
 /// Keyed tables as their users see them. Upsert tables: the latest row per key, without deleted
 /// rows (a true `_deleted` column). Merge tables: each key's rows combined by their merge
-/// functions. `sorted` orders by key (used when compacting, so files prune well on key lookups).
-pub fn latest_sql(meta: &TableMeta, raw_table: &str, sorted: bool) -> String {
+/// functions. `sorted` orders by key, so a file prunes well on key lookups (used when writing
+/// files). `keep_deleted` leaves delete markers in: an intermediate file still has to shadow what
+/// older files hold for that key; a full compaction drops them.
+pub fn latest_sql(meta: &TableMeta, raw_table: &str, sorted: bool, keep_deleted: bool) -> String {
+    debug_assert!(!meta.key.is_empty(), "latest_sql needs a key: an append table has no versions");
     let q = |c: &String| format!("\"{c}\"");
     let key = meta.key.iter().map(q).collect::<Vec<_>>().join(", ");
     let order = if sorted { format!(" ORDER BY {key}") } else { String::new() };
@@ -90,10 +110,28 @@ pub fn latest_sql(meta: &TableMeta, raw_table: &str, sorted: bool) -> String {
         });
         return format!("SELECT {} FROM \"{raw_table}\" GROUP BY {key}{order}", cols.collect::<Vec<_>>().join(", "));
     }
-    let cols = meta.columns.iter().map(|(c, _)| q(c)).collect::<Vec<_>>().join(", ");
-    let deleted = meta.columns.iter().any(|(c, _)| c == "_deleted").then_some(" AND \"_deleted\" IS NOT TRUE").unwrap_or("");
-    format!("SELECT {cols} FROM (SELECT *, row_number() OVER (PARTITION BY {key} ORDER BY \"_ord\" DESC) AS _rn \
-             FROM \"{raw_table}\") WHERE _rn = 1{deleted}{order}")
+    // Newest version per key as a grouped aggregate (a hash table), not a window (a sort).
+    let newest = |c: &String| format!("first_value({} ORDER BY \"_ord\" DESC) AS {}", q(c), q(c));
+    let cols = meta.columns.iter().map(|(c, _)| if meta.key.contains(c) { q(c) } else { newest(c) });
+    let out = meta.columns.iter().map(|(c, _)| q(c)).collect::<Vec<_>>().join(", ");
+    let deleted = match keep_deleted {
+        false => meta.columns.iter().any(|(c, _)| c == "_deleted").then_some(" WHERE \"_deleted\" IS NOT TRUE").unwrap_or(""),
+        true => "",
+    };
+    format!("SELECT {out} FROM (SELECT {} FROM \"{raw_table}\" GROUP BY {key}){deleted}{order}",
+            cols.collect::<Vec<_>>().join(", "))
+}
+
+/// The current rows of a keyed table, over `raw_table`. When the source already holds one row
+/// per key — a single file, with nothing in the log after it — the "newest wins" window (or the
+/// merge GROUP BY) is skipped, so reads of a compacted table cost a plain scan.
+pub fn current_sql(lake: &Lake, meta: &TableMeta, raw_table: &str) -> String {
+    if meta.files.len() > 1 || lake.visible() != meta.tiered {
+        return latest_sql(meta, raw_table, false, false);
+    }
+    let cols = meta.columns.iter().map(|(c, _)| format!("\"{c}\"")).collect::<Vec<_>>().join(", ");
+    let deleted = meta.columns.iter().any(|(c, _)| c == "_deleted").then_some(" WHERE \"_deleted\" IS NOT TRUE").unwrap_or("");
+    format!("SELECT {cols} FROM \"{raw_table}\"{deleted}")
 }
 
 /// A session with every table referenced in `sql` registered (cheap name filter), except
@@ -111,7 +149,7 @@ pub async fn session(lake: &Lake, sql: &str, except: &str) -> Result<SessionCont
         } else {
             let raw_name = format!("__raw_{name}");
             ctx.register_table(raw_name.as_str(), df.into_view())?;
-            ctx.register_table(name, ctx.sql(&latest_sql(&meta, &raw_name, false)).await?.into_view())?;
+            ctx.register_table(name, ctx.sql(&current_sql(lake, &meta, &raw_name)).await?.into_view())?;
         }
     }
     Ok(ctx)

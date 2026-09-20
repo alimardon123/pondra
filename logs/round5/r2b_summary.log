@@ -1,0 +1,10 @@
+fence exit=0
+upsert exit=0
+crash exit=0
+users exit=0
+failover exit=0
+latency exit=0
+latencyload exit=0
+spread exit=0
+serve exit=0
+alldone

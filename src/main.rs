@@ -72,7 +72,10 @@ async fn main() -> anyhow::Result<()> {
             let (_, store, _) = store::open_store(&dir)?;
             let cluster = cluster::Cluster::join(&store, &addr, reader).await?;
             let leader = cluster.is_leader();
-            let lake = match store::Lake::open(&dir, leader, !leader && !reader).await {
+            // Read-only nodes follow the leader's commit stream too (when there is one to ask),
+            // so their reads are as fresh as a follower's instead of waiting for catalog polls.
+            let streamed = !leader && !cluster.leader.addr.is_empty();
+            let lake = match store::Lake::open(&dir, leader, streamed).await {
                 Err(e) if leader => {
                     eprintln!("opening the lake as leader failed: {e:#}"); // e.g. a newer leader fenced us
                     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -110,8 +113,11 @@ async fn main() -> anyhow::Result<()> {
                     }
                 });
             } else {
-                if !reader {
-                    cluster.clone().follow(store);
+                match reader {
+                    false => cluster.clone().follow(store),
+                    true => cluster.clone().watch_leader(store), // a reader never votes or leads
+                }
+                if streamed {
                     cluster::mirror(lake.clone(), cluster.leader.addr.clone());
                 }
                 // How far our own catalog view is: all a reader has, and a follower's fallback.

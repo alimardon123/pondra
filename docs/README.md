@@ -6,7 +6,8 @@ Read in this order:
 |---|---|
 | `prototype-status.md` | Where the prototype stands: what it does, every measured number, what's missing (round 4, the current one) |
 | `comparison-spark-flink-fluss.md` | Head-to-head with Spark, Flink and Fluss: batch, streaming, latency, footprint |
-| `adr-005-every-node-writes.md` | Current design: every node ingests, the leader only orders commits, inline views, push, SPMD queries and maintenance |
+| `adr-006-serving-and-lsm.md` | Current design: keyed tables as an LSM, serving reads, read-only nodes on the commit stream |
+| `adr-005-every-node-writes.md` | The round-4 design: every node ingests, the leader only orders commits, inline views, push, SPMD queries and maintenance |
 | `adr-004-cluster.md` | Clustering: leader election through the bucket, fencing, heartbeats, distributed task state |
 | `adr-003-serverless-spmd.md` | Why serverless and SPMD (Bodo-style) instead of driver/executor |
 | `adr-002-streamhouse-single-binary.md` | Why one binary instead of Fluss + Flink + Kafka; the streamhouse design |

@@ -1,0 +1,1 @@
+fence: 2nd node joined as follower=True; takeover after 17.7s; stale leader's write rejected; it rejoined as follower; rows=[{'producer': 'a', 'n': 200}, {'producer': 'b', 'n': 200}] -> OK

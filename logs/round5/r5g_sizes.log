@@ -1,0 +1,6 @@
+tier: {'rows_tiered': 1000000}
+1M events (user, event, amount, ts):
+  NDJSON as sent            77.9 B/event (  74.3 MB)
+  log segments, no codec    39.0 B/event (  37.2 MB)
+  log segments, ZSTD       12.8 B/event (  12.2 MB)
+  Parquet after tiering      6.8 B/event (   6.5 MB)   <- real Pondra output

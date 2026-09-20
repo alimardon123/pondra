@@ -116,6 +116,19 @@ impl Cluster {
         });
     }
 
+    /// Read-only nodes: no heartbeat, no vote, no takeover. They only notice when leadership
+    /// moves, and restart to follow the new leader's commit stream (see `mirror`).
+    pub fn watch_leader(self: Arc<Self>, store: Store) {
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(15)).await;
+                if matches!(latest(&store).await, Ok(Some(t)) if t.n != self.leader.n) {
+                    restart();
+                }
+            }
+        });
+    }
+
     /// Does another member still hear our leader (same term)?
     async fn peer_sees_leader(&self) -> bool {
         let peers = self.view.lock().unwrap().clone(); // the last member list we were given

@@ -1,0 +1,33 @@
+# 64 KB PUT and GET latency to R2 from this sandbox, via curl --aws-sigv4
+put 1.196150
+put 1.048462
+put 0.746080
+put 0.742175
+put 0.790033
+put 0.809530
+put 0.792957
+put 0.899398
+put 0.741171
+put 0.897482
+put 0.822126
+put 0.809728
+put 0.857604
+put 0.776064
+put 0.752789
+get 0.625114
+get 0.371257
+get 0.403470
+get 0.387927
+get 0.377878
+get 0.378827
+get 0.370119
+get 0.371246
+get 0.367678
+get 0.449361
+get 0.375506
+get 0.369004
+get 0.379553
+get 0.385181
+get 0.393218
+PUT p50 810 ms  p90 1048 ms  n=15
+GET p50 379 ms  p90 449 ms  n=15

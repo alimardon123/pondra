@@ -41,6 +41,11 @@ pub struct DataFile {
     pub rows: u64,
     #[serde(default)]
     pub bytes: u64,
+    /// Keyed tables: the last log segment this file covers. A row in a file with a higher `ord`
+    /// is a newer version of its key, so several files can hold the same key (LSM-style) and
+    /// tiering doesn't have to rewrite the whole table every time.
+    #[serde(default)]
+    pub ord: u64,
 }
 
 /// One log segment = one node's flush, holding rows for many tables. Small segments are stored
@@ -143,6 +148,12 @@ impl Lake {
     pub fn session(&self) -> SessionContext {
         // At least 2 partitions, so every node plans aggregations as partial + final (see spmd.rs).
         let partitions = std::thread::available_parallelism().map_or(2, |n| n.get()).max(2);
+        self.session_with(partitions)
+    }
+
+    /// A session with a fixed number of partitions: 1 for point lookups, where splitting the work
+    /// costs more than it saves and many queries run at once.
+    pub fn session_with(&self, partitions: usize) -> SessionContext {
         SessionContext::new_with_config_rt(SessionConfig::new().with_information_schema(true).with_target_partitions(partitions), self.rt.clone())
     }
 

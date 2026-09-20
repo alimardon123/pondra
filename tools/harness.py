@@ -168,6 +168,36 @@ def upsert():
     return f"12,000 random upserts/deletes with compactions and a restart match the model exactly ({live} live keys)"
 
 
+def tiering():
+    """Tiering has to keep working as files pile up: 12 rounds of writes + /tier over an append
+    table, an upsert table and a GROUP BY view. The log must drain, the file count must stay
+    bounded (merges and compactions), and every row must still be there."""
+    lake, rounds, per = new_lake(), A.rounds, A.size
+    node = Node(lake, A.port, tier_secs=0).start()
+    call(A.port, "POST", "/tables/events", json.dumps([["user", "Utf8"], ["amount", "Int64"]]).encode())
+    call(A.port, "POST", "/tables/kv", json.dumps({"columns": [["id", "Int64"], ["v", "Int64"]], "key": ["id"]}).encode())
+    call(A.port, "POST", "/views/totals", b"SELECT user, sum(amount) AS amount FROM events GROUP BY user")
+    for r in range(1, rounds + 1):
+        call(A.port, "POST", f"/append/events?producer=p&seq={r}", "".join(
+            json.dumps({"user": f"u{i % 50}", "amount": 1}) + "\n" for i in range(per)).encode(), timeout=600)
+        call(A.port, "POST", f"/append/kv?producer=k&seq={r}", "".join(
+            json.dumps({"id": i, "v": r}) + "\n" for i in range(200)).encode())
+        call(A.port, "POST", "/tier", timeout=600)
+    untiered = call(A.port, "GET", "/stats")["untiered_rows"]
+    out = subprocess.run([BIN, "catalog", "--dir", lake, "t/"], capture_output=True, text=True).stdout
+    files = {l.split(" ", 1)[0][2:]: len(json.loads(l.split(" ", 1)[1])["files"]) for l in out.splitlines()}
+    got = {"events": sql(A.port, "SELECT count(*) AS n FROM events")[0]["n"],
+           "kv": sql(A.port, "SELECT count(*) AS n, sum(v) AS v FROM kv")[0],
+           "totals": sql(A.port, "SELECT sum(amount) AS n FROM totals")[0]["n"]}
+    node.kill()
+    ok = (got["events"] == rounds * per and got["totals"] == rounds * per
+          and got["kv"] == {"n": 200, "v": 200 * rounds} and untiered == 0 and max(files.values()) <= 8)
+    print(f"tiering: {rounds} rounds -> files {files}, untiered rows {untiered}, rows {got} -> {'OK' if ok else 'FAIL'}")
+    if not ok:
+        sys.exit(1)
+    return f"{rounds} rounds of writes and tiering: log drained, files bounded ({files}), every row exact"
+
+
 def fence():
     """A second node on the same lake joins as a follower. Then the leader is frozen (SIGSTOP, like
     a network partition), the follower takes over, and the old leader wakes up still believing it
@@ -298,7 +328,7 @@ def load():
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    out = {t.__name__: t() for t in (upsert, fence, insert, reader, crash)}
+    out = {t.__name__: t() for t in (upsert, tiering, fence, insert, reader, crash)}
     A.secs = min(A.secs, 20)
     out["load"] = load()
     print(json.dumps(out, indent=1))
@@ -306,14 +336,15 @@ def all_tests():
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "fence", "reader", "insert", "load", "all"])
+    ap.add_argument("mode", choices=["crash", "upsert", "tiering", "fence", "reader", "insert", "load", "all"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
     ap.add_argument("--producers", type=int, default=3)
     ap.add_argument("--batches", type=int, default=40)
     ap.add_argument("--size", type=int, default=100)
+    ap.add_argument("--rounds", type=int, default=12, help="tiering test: write + /tier rounds")
     ap.add_argument("--secs", type=int, default=30)
     ap.add_argument("--flush-ms", type=int, default=250)
     A = ap.parse_args()
-    {"crash": crash, "upsert": upsert, "fence": fence, "reader": reader, "insert": insert, "load": load, "all": all_tests}[A.mode]()
+    {"crash": crash, "upsert": upsert, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "load": load, "all": all_tests}[A.mode]()

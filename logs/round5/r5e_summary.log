@@ -1,0 +1,22 @@
+all exit=0
+tiering exit=0
+crashbig exit=0
+users exit=0
+failover 1 exit=0
+failover 2 exit=0
+failover 3 exit=0
+failover 4 exit=0
+latency exit=0
+latencyload exit=0
+split exit=0
+spread exit=0
+serve exit=0
+bench done
+r2 tiering exit=0
+r2 upsert exit=0
+r2 crash exit=0
+r2 users exit=0
+r2 failover exit=0
+r2 latency exit=0
+r2 serve exit=0
+alldone
