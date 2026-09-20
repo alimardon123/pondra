@@ -22,9 +22,9 @@ Spark and Flink numbers are from round 3 (same machine, same scripts); Pondra's 
 | Generate + write 20 M rows | **3.1** (Parquet ZSTD, 79 MB) | 7.3 (Parquet Snappy, 209 MB) | 10.5 (CSV, 603 MB) | 2.3x |
 | Q1 `count, sum, avg` | **0.04** | 0.70 | 5.2 | 16x |
 | Q2 filter + group by 1,000 categories | **0.13** | 0.93 | 6.5 | 7x |
-| Q3 group by 1 M users, top 10 | **0.45** | 2.20 | 8.9 | 5x |
-| Q4 `count(DISTINCT user)` | **0.34** | 1.75 | 7.5 | 5x |
-| Q5 join with a dimension table | **0.24** | 2.30 | 9.4 | 10x |
+| Q3 group by 1 M users, top 10 | **0.43** | 2.20 | 8.9 | 5x |
+| Q4 `count(DISTINCT user)` | **0.33** | 1.75 | 7.5 | 5x |
+| Q5 join with a dimension table | **0.25** | 2.30 | 9.4 | 9x |
 | Q6 time buckets | **0.25** | 0.52 | 4.9 | 2x |
 | Peak memory | **258 MB** | 1.5 GB | 3.1 GB |  |
 
@@ -41,7 +41,7 @@ Every engine computes the same running aggregation (count and sum per key, 100,0
 | **Stateful:** keyed running aggregation | **4.0 s end to end (2.5 M events/s)**: 10 M events sent over HTTP by 4 client threads, stored durably, aggregated by an inline view, with the result queryable. Ingest alone: 2.7 s | 3.9 s (2.5 M/s) reading a 10 M-row in-memory backlog in one micro-batch, `noop` sink; 12.8 s in 500k-row micro-batches | 13.3 s (0.75 M/s), in-memory source, `blackhole` sink |
 | **Stateless ETL:** project 4 columns + filter | **3.9 s end to end (2.6 M events/s)**, output stored durably | 5.2 s (2.0 M/s), `noop` sink | 4.0 s (2.5 M/s), `blackhole` sink |
 | **Sustained, durable, end to end:** producers → HTTP (Arrow) → log in storage → aggregated view → query | **1.2 M events/s for 60 s on one node; acked → visible in the aggregate p50 0.16 s, p99 1.1 s** | not measurable here: needs Kafka or Fluss plus checkpointing | same |
-| 3-node cluster, producers writing to followers only | **2.1–2.3 M events/s**, durable, exactly-once | — | — |
+| 3-node cluster, producers writing to followers only | **2.1 M events/s**, durable, exactly-once | — | — |
 
 **How to read these rows:**
 
@@ -74,9 +74,9 @@ One machine can't show multi-machine speed-ups, so these are shape checks, not s
 
 | Check | Result |
 |---|---|
-| Where the write work lands (`split`, 3 nodes, producers writing to the 2 followers) | 2.1–2.3 M events/s; the leader used **30–34 %** of the cluster's CPU — its one-third share. Before the tiering work was dealt out too, it was 70 % |
+| Where the write work lands (`split`, 3 nodes, producers writing to the 2 followers) | 2.1 M events/s; the leader used **30 %** of the cluster's CPU — its one-third share. Before the tiering work was dealt out too, it was 70 % |
 | Distributed query correctness (`spread`, 2 M rows, 3 nodes) | identical results to a single node for all 9 queries, no fallbacks |
-| Distributed query speed-up, one CPU per node (2 nodes, 20 M rows) | scan/filter/join/time-bucket **1.7–1.9x**; high-cardinality group-by and count-distinct 1.0–1.1x (the final merge dominates) |
+| Distributed query speed-up, one CPU per node (2 nodes, 20 M rows) | scan/filter/join/time-bucket **1.7–1.95x**; high-cardinality group-by 1.16x and count-distinct 1.01x (their final merge dominates) |
 | Distributed query speed-up on simulated R2 (3 nodes, I/O-latency bound) | 1.2–4.3x faster than one node on 8 of 9 queries (q1 921→472 ms, q9 760→176 ms), identical results |
 
 ## Fluss (unified streaming storage)
@@ -92,7 +92,7 @@ Fluss can't run in this sandbox (Apache mirrors and Maven Central are blocked), 
 | Primary-key / upsert tables | merge-on-read + compaction to Parquet | KV tablets in RocksDB with a changelog; point lookups in milliseconds |
 | Write → readable, durable | ~6 ms on local disk; ~0.3–0.5 s on object storage (simulated R2) | milliseconds (replicated to TabletServer disks) |
 | Lake freshness | log tail and Parquet in one query; tiering every 10 s, or as soon as 1 M rows wait | union read of Fluss + lake; lake tiering default `table.datalake.freshness` = 3 min |
-| Published throughput | this report: 2.1–2.3 M events/s through 3 nodes on 2 vCPUs, durable | community benchmark (Fluss 0.9.1, docker-compose, one TaskManager): 88.7k records/s vs Kafka's 98.6k. Rednote in production: ~1B records and 10 TB per day on one table; write CPU −30 %, write traffic −50 % after moving from Kafka |
+| Published throughput | this report: 2.1 M events/s through 3 nodes on 2 vCPUs, durable | community benchmark (Fluss 0.9.1, docker-compose, one TaskManager): 88.7k records/s vs Kafka's 98.6k. Rednote in production: ~1B records and 10 TB per day on one table; write CPU −30 %, write traffic −50 % after moving from Kafka |
 
 **Verdict:**
 

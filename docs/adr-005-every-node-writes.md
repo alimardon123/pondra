@@ -31,8 +31,8 @@ The leader used to do all the work. Now it only hands out the order: a ticket co
   There is no fixed flush window any more. An idle node flushes at once; a busy one batches whatever queued up while the previous flush was in flight.
 - **Backpressure:** while more than 10 M rows are waiting to be tiered, commits pause. Producers slow down to what the cluster sustains, instead of memory and latency growing without limit.
 - **Measured** (`cluster.py split`: 8 producers writing only to the 2 followers of a 3-node cluster, all on one 2-vCPU VM):
-  - 2.1–2.3 M events/s;
-  - the leader used 30–34 % of the cluster's CPU: its one-third share, including its share of the tiering work (section 5).
+  - 2.1 M events/s;
+  - the leader used 30 % of the cluster's CPU, below its one-third share, including its share of the tiering work (section 5).
 
   Before the tiering work was dealt out too, the leader's share was 70 %.
 
@@ -93,7 +93,7 @@ General stateful SQL (joins against a task's own state, anything not decomposabl
 
 ### 6. Operational fixes found by the tests
 
-- **Faster restarts:** the catalog's memtable is persisted every 2 s while busy, so a restart, new leader or one-shot reader replays only a few seconds of catalog WAL. On simulated R2, a reader took 28 s to open before this.
+- **Faster restarts:** the catalog's memtable is persisted every 2 s while busy, so a restart, new leader or one-shot reader replays only a few seconds of catalog WAL instead of everything since the last compaction. Before this, opening a lake on simulated R2 could take tens of seconds.
 - **No catalog stalls:** SlateDB's default limit of 8 level-0 files paused catalog flushes for about 30 s on simulated R2 while compaction caught up. Pondra now allows 64 (32 per key).
 - **Tiering in chunks:** tiering runs as soon as a table has 1 M rows waiting, in chunks of at most 4 M rows, so memory stays bounded.
 - **Failover fixes:**

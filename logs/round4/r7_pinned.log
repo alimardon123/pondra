@@ -1,0 +1,7 @@
+q1_scan_agg          1 node (1 CPU)     77 ms   2 nodes (1 CPU each)     45 ms   speed-up 1.72x
+q2_filter_group      1 node (1 CPU)    253 ms   2 nodes (1 CPU each)    146 ms   speed-up 1.73x
+q3_high_card_group   1 node (1 CPU)    941 ms   2 nodes (1 CPU each)    810 ms   speed-up 1.16x
+q4_count_distinct    1 node (1 CPU)    671 ms   2 nodes (1 CPU each)    662 ms   speed-up 1.01x
+q5_join              1 node (1 CPU)    476 ms   2 nodes (1 CPU each)    244 ms   speed-up 1.95x
+q6_time_bucket       1 node (1 CPU)    488 ms   2 nodes (1 CPU each)    264 ms   speed-up 1.85x
+fallbacks: 0

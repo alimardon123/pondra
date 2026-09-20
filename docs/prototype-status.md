@@ -31,8 +31,8 @@ Round 3's report said "one leader commits all writes, so write capacity grows wi
 
 **Measured** (all three nodes share one 2-vCPU VM):
 
-- 8 producers wrote 2.1–2.3 M events/s through the two followers.
-- The leader used 34 % of the cluster's CPU: its one-third share.
+- 8 producers wrote 2.1 M events/s through the two followers.
+- The leader used 30 % of the cluster's CPU, below its one-third share.
 - Before the tiering work was also dealt out, the leader's share was 70 %.
 
 ## What was added this round
@@ -56,7 +56,7 @@ Round 3's report said "one leader commits all writes, so write capacity grows wi
   - the "how many segments exist" mark being read from a *newer* view than the one a read was held to, so a streaming task read a range of the log that its own view couldn't fully see yet, and committed progress past the rows it missed.
 
   Now: a read checks its view before and after reading and decides under one lock, it pins what it needs, and the segment count always comes from a view at most as new as the read's. Twenty failover runs have passed since.
-- **The leader did 70 % of the cluster's work**, because tiering, file merges and compaction ran there. They're now jobs dealt out to all nodes; the leader's share is 34 %.
+- **The leader did 70 % of the cluster's work**, because tiering, file merges and compaction ran there. They're now jobs dealt out to all nodes; the leader's share is 30 %.
 - **A tiering job on a node whose view lagged could have written an incomplete file.** A job now names its inputs exactly and waits until the node sees the last log segment; otherwise it fails and the next round retries.
 - **Catalog writes stalled ~30 s on simulated R2** when SlateDB's default limit of 8 level-0 files was reached. Raised to 64.
 - **A follower that misses commits now restarts** instead of serving reads that could go back in time.
@@ -93,7 +93,7 @@ Limits: producer names must be unique per client; there is no auth or per-user q
 |---|---|---|
 | Binary (stripped) | 88.3 MB (30 MB gzip, 17 MB xz) | 89.2 MB (30 MB gzip, 16.8 MB xz) |
 | Idle memory | 18 MB | 37 MB (mimalloc reserves more up front) |
-| Peak memory under full load | 455 MB | 2.0 GB at 1.2 M events/s sustained (280–613 MB in the batch and streaming benchmarks) |
+| Peak memory under full load | 455 MB | 2.0 GB at 1.2 M events/s sustained (258–639 MB in the batch and streaming benchmarks) |
 | Storage per event (user, event, amount, ts) | NDJSON 77.9 B → log 12.8 B → Parquet 6.8 B | NDJSON 77.9 B → log 12.8 B → Parquet 6.8 B (unchanged) |
 
 ## Memory is a knob, not a mystery
@@ -112,7 +112,7 @@ On this 2-vCPU box tiering competes with ingest for CPU, which is why a small ba
 
 | Criterion | Status |
 |---|---|
-| Freshness p99 ≤5 s at ≥50k events/s | **Pass:** 10 ms p99 idle, 461 ms p99 under load (local disk); ~1.0–1.7 s p99 on simulated R2 |
+| Freshness p99 ≤5 s at ≥50k events/s | **Pass:** 10 ms p99 idle, 461 ms p99 under load (local disk); ~0.9–1.5 s p99 on simulated R2 |
 | 0 lost / 0 duplicated under crashes | **Pass,** including leader failover and split brain |
 | Binary ≤150 MB, idle memory ≤200 MB | **Pass** |
 | Queries within 2x of DuckDB | **Pass** (round 2) |
