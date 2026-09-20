@@ -27,6 +27,22 @@ export AWS_ENDPOINT=https://<account>.r2.cloudflarestorage.com
 `--addr` must be reachable by the other nodes. Read-only nodes and `pondra sql` write nothing, so
 read-only bucket credentials are enough.
 
+## Windows, macOS, Linux
+
+The code is portable Rust; nothing in it is Linux-specific. Three ways to run it on Windows:
+
+- **WSL2** (what I'd test with first): `wsl --install`, then `cargo build --release` and run the
+  Linux binary as above. This is the combination the tests were run on.
+- **Native build:** install [rustup](https://rustup.rs) and the Visual Studio Build Tools (C++),
+  then `cargo build --release` → `target\release\pondra.exe`. Untested so far; the one Unix-only
+  piece (restart-in-place after a leader change) has a Windows path that spawns the replacement
+  process instead.
+- **From CI:** `.github/workflows/build.yml` builds Linux, Windows and macOS binaries on every
+  push; download `pondra-windows-x86_64.exe` from the run's artifacts.
+
+Paths on Windows work either way, but `--dir s3://bucket/lake` (R2, S3, MinIO) avoids local-path
+differences entirely.
+
 ## What it does
 
 | Need | How (HTTP API, on any node) | Replaces |
