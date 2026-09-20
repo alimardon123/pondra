@@ -1,0 +1,40 @@
+upsert: 401 live keys after 12,000 random upserts/deletes, 6 compactions (s: 0.0, 0.0, 0.0, 0.0, 0.0, 0.0), 1 restart -> OK
+fence: 2nd node joined as follower=True; takeover after 6.0s; stale leader's write rejected; it rejoined as follower; rows=[{'producer': 'a', 'n': 200}, {'producer': 'b', 'n': 200}] -> OK
+insert: first={'rows': 5} retry={'duplicate': True} summary={'groups': 5, 'n': 5000} -> OK
+reader: send -> visible on a separate read-only node: p50 163 ms, p99 276 ms
+run  1: kill-9=0 injected={'after_seg_put': 0, 'after_commit': 1, 'after_parquet_put': 1} events=9000/9000 unique=9000 task_output=4500/4500 views=exact -> OK
+run  2: kill-9=1 injected={'after_seg_put': 0, 'after_commit': 0, 'after_parquet_put': 1} events=9000/9000 unique=9000 task_output=4500/4500 views=exact -> OK
+run  3: kill-9=1 injected={'after_seg_put': 0, 'after_commit': 0, 'after_parquet_put': 1} events=9000/9000 unique=9000 task_output=4500/4500 views=exact -> OK
+run  4: kill-9=0 injected={'after_seg_put': 0, 'after_commit': 0, 'after_parquet_put': 2} events=9000/9000 unique=9000 task_output=4500/4500 views=exact -> OK
+run  5: kill-9=0 injected={'after_seg_put': 0, 'after_commit': 0, 'after_parquet_put': 1} events=9000/9000 unique=9000 task_output=4500/4500 views=exact -> OK
+{
+ "events_per_s": 1200,
+ "ack_ms_p50": 251,
+ "ack_ms_p99": 253,
+ "freshness_ms_p50": 142,
+ "freshness_ms_p99": 256,
+ "freshness_samples": 46,
+ "commits_per_s": 4.0,
+ "commit_ms_p50": 2,
+ "commit_ms_p95": 3,
+ "server_cores_used": 0.11
+}
+{
+ "upsert": "12,000 random upserts/deletes with compactions and a restart match the model exactly (401 live keys)",
+ "fence": "a frozen leader is replaced; when it wakes, its write is rejected (fenced) and it rejoins as a follower; nothing lost",
+ "insert": "bulk INSERT \u2026 SELECT writes Parquet directly; a retried job id is applied once",
+ "reader": "freshness on a separate read-only node: p50 163 ms, p99 276 ms",
+ "crash": "5/5 runs, 0 lost, 0 duplicated (events, streaming-task output, views); crashes survived: {'after_seg_put': 0, 'after_commit': 1, 'after_parquet_put': 6, 'kill -9': 2}",
+ "load": {
+  "events_per_s": 1200,
+  "ack_ms_p50": 251,
+  "ack_ms_p99": 253,
+  "freshness_ms_p50": 142,
+  "freshness_ms_p99": 256,
+  "freshness_samples": 46,
+  "commits_per_s": 4.0,
+  "commit_ms_p50": 2,
+  "commit_ms_p95": 3,
+  "server_cores_used": 0.11
+ }
+}

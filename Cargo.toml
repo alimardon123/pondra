@@ -1,0 +1,42 @@
+[package]
+name = "pondra"
+version = "0.1.0"
+edition = "2021"
+description = "Pondra: a streamhouse in one binary"
+
+[dependencies]
+parquet = { version = "59", default-features = false, features = ["snap", "zstd", "lz4"] }
+datafusion = { version = "55", default-features = false, features = ["parquet", "sql", "nested_expressions", "datetime_expressions", "string_expressions", "unicode_expressions", "regex_expressions"] }
+slatedb = { version = "0.16", default-features = false, features = ["aws", "moka"] } # moka: in-memory block cache (foyer adds a disk tier we don't need)
+arrow-ipc = { version = "59", features = ["zstd"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream"] }
+tokio = { version = "1", features = ["full"] }
+axum = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+bytes = "1"
+uuid = { version = "1", features = ["v4"] }
+clap = { version = "4", features = ["derive"] }
+futures = "0.3"
+mimalloc = { version = "0.1", default-features = false }
+async-trait = "0.1"
+lru = "0.18"
+url = "2"
+# S3 / R2 / MinIO. SlateDB and our own I/O use object_store 0.14; DataFusion 55 reads through 0.13.
+object_store = { version = "0.14", features = ["aws"] }
+object_store_df = { package = "object_store", version = "0.13", default-features = false }
+
+[profile.release]
+panic = "abort" # fail fast: a crashed writer restarts and reloads state from the catalog
+codegen-units = 16
+incremental = true
+
+# Size-optimized build used for the binary-size / idle-memory measurements.
+[profile.dist]
+inherits = "release"
+lto = "thin"
+codegen-units = 1
+opt-level = 3
+incremental = false
+strip = true

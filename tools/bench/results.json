@@ -1,0 +1,37 @@
+{"engine": "spark", "mode": "batch", "rows": 20000000, "startup_s": 4.15, "write_s": 7.33, "q1_scan_agg": [1.0, 0.7], "q2_filter_group": [1.422, 0.934], "q3_high_card_group": [2.757, 2.195], "q4_count_distinct": [1.941, 1.754], "q5_join": [2.779, 2.303], "q6_time_bucket": [0.536, 0.523], "peak_rss_mb": 1528}
+{"engine": "flink", "mode": "batch", "rows": 20000000, "startup_s": 5.35, "write_s": 10.473, "q1_scan_agg": [7.043, 5.185], "q2_filter_group": [7.3, 6.521], "q3_high_card_group": [10.091, 8.929], "q4_count_distinct": [8.23, 7.524], "q5_join": [10.871, 9.421], "q6_time_bucket": [4.683, 4.927], "peak_rss_mb": 3136}
+{"engine": "spark", "mode": "stream", "rows": 10000000, "startup_s": 4.11, "processed": 10000000, "secs": 12.75, "rows_per_s": 784604, "batch_ms_p50": 524, "batch_ms_max": 2734, "batches": 20, "peak_rss_mb": 1302}
+{"engine": "flink", "mode": "stream", "rows": 10000000, "startup_s": 5.23, "processed": 10000000, "secs": 13.288, "rows_per_s": 752559, "peak_rss_mb": 1247}
+{"engine": "spark", "mode": "etl", "rows": 10000000, "startup_s": 3.93, "processed": 10500000, "secs": 5.2, "rows_per_s": 2018515, "peak_rss_mb": 752}
+{"engine": "flink", "mode": "etl", "rows": 10000000, "startup_s": 5.15, "processed": 10000000, "secs": 3.989, "rows_per_s": 2506894, "peak_rss_mb": 1198}
+{"engine": "spark", "mode": "stream", "rows": 10000000, "startup_s": 4.06, "processed": 10000000, "secs": 3.93, "rows_per_s": 2544641, "batch_ms_p50": 3642, "batch_ms_max": 3642, "batches": 1, "peak_rss_mb": 707}
+{"engine": "pondra", "mode": "batch", "rows": 20000000, "startup_s": 0.023, "write_s": 3.06, "q1_scan_agg": [0.054, 0.049], "q2_filter_group": [0.136, 0.134], "q3_high_card_group": [0.499, 0.468], "q4_count_distinct": [0.363, 0.361], "q5_join": [0.239, 0.239], "q6_time_bucket": [0.34, 0.262], "peak_rss_mb": 223}
+{"engine": "pondra", "mode": "stream", "rows": 10000000, "startup_s": 0.023, "ingest_s": 2.01, "correct": true, "processed": 10000000, "secs": 3.48, "rows_per_s": 2876569, "peak_rss_mb": 455}
+{"engine": "pondra", "mode": "etl", "rows": 10000000, "startup_s": 0.023, "ingest_s": 1.76, "processed": 10000000, "secs": 2.96, "rows_per_s": 3378851, "peak_rss_mb": 265}
+{"engine": "pondra", "mode": "live", "rows": 60, "startup_s": 0.023, "events": 186200000, "rows_per_s": 3103333, "visible_ms_p50": 664, "visible_ms_p99": 14284, "peak_rss_mb": 5703}
+{"engine": "pondra", "mode": "live", "rows": 60, "startup_s": 0.024, "events": 164040000, "rows_per_s": 2734000, "visible_ms_p50": 510, "visible_ms_p99": 8763, "peak_rss_mb": 3132}
+{"engine": "pondra", "error": "", "peak_rss_mb": 22}
+{"engine": "pondra", "mode": "live", "rows": 60, "startup_s": 0.023, "events": 133940000, "rows_per_s": 2232333, "visible_ms_p50": 519, "visible_ms_p99": 7776, "peak_rss_mb": 3146}
+{"engine": "pondra", "mode": "live", "rows": 30, "startup_s": 0.043, "events": 71620000, "rows_per_s": 2387333, "visible_ms_p50": 473, "visible_ms_p99": 1597, "peak_rss_mb": 2309}
+{"engine": "pondra", "mode": "batch", "rows": 20000000, "startup_s": 0.023, "write_s": 3.09, "q1_scan_agg": [0.045, 0.042], "q2_filter_group": [0.135, 0.128], "q3_high_card_group": [0.436, 0.431], "q4_count_distinct": [0.324, 0.332], "q5_join": [0.256, 0.259], "q6_time_bucket": [0.259, 0.248], "peak_rss_mb": 274}
+{"engine": "pondra", "mode": "stream", "rows": 10000000, "startup_s": 0.023, "ingest_s": 2.68, "correct": true, "processed": 10000000, "secs": 4.07, "rows_per_s": 2457438, "peak_rss_mb": 579}
+{"engine": "pondra", "mode": "etl", "rows": 10000000, "startup_s": 0.023, "ingest_s": 2.81, "processed": 10000000, "secs": 3.83, "rows_per_s": 2611724, "peak_rss_mb": 471}
+{"engine": "pondra", "mode": "live", "rows": 60, "startup_s": 0.023, "events": 72500000, "rows_per_s": 1208333, "visible_ms_p50": 147, "visible_ms_p99": 1063, "peak_rss_mb": 2008}
+{"engine": "pondra", "mode": "live", "rows": 30, "startup_s": 0.024, "events": 46840000, "rows_per_s": 1561333, "visible_ms_p50": 180, "visible_ms_p99": 873, "peak_rss_mb": 984}
+{"engine": "pondra", "mode": "batch", "rows": 20000000, "startup_s": 0.043, "write_s": 3.13, "q1_scan_agg": [0.053, 0.043], "q2_filter_group": [0.13, 0.128], "q3_high_card_group": [0.449, 0.469], "q4_count_distinct": [0.335, 0.337], "q5_join": [0.235, 0.276], "q6_time_bucket": [0.248, 0.26], "peak_rss_mb": 280}
+{"engine": "pondra", "mode": "stream", "rows": 10000000, "startup_s": 0.027, "ingest_s": 2.77, "correct": true, "processed": 10000000, "secs": 4.17, "rows_per_s": 2399897, "peak_rss_mb": 613}
+{"engine": "pondra", "mode": "etl", "rows": 10000000, "startup_s": 0.035, "ingest_s": 2.84, "processed": 10000000, "secs": 3.88, "rows_per_s": 2579246, "peak_rss_mb": 444}
+{"engine": "pondra", "mode": "live", "rows": 60, "startup_s": 0.044, "events": 72480000, "rows_per_s": 1208000, "visible_ms_p50": 166, "visible_ms_p99": 866, "peak_rss_mb": 1993}
+{"engine": "pondra", "mode": "live", "rows": 60, "startup_s": 0.03, "events": 69980000, "rows_per_s": 1166333, "visible_ms_p50": 140, "visible_ms_p99": 653, "peak_rss_mb": 1314}
+{"engine": "pondra", "mode": "live", "rows": 60, "startup_s": 0.024, "events": 71940000, "rows_per_s": 1199000, "visible_ms_p50": null, "visible_ms_p99": null, "peak_rss_mb": 1895}
+{"engine": "pondra", "mode": "live", "rows": 60, "startup_s": 0.023, "events": 90860000, "rows_per_s": 1514333, "visible_ms_p50": null, "visible_ms_p99": null, "peak_rss_mb": 868}
+{"engine": "pondra", "mode": "live", "rows": 60, "startup_s": 0.044, "events": 71000000, "rows_per_s": 1183333, "visible_ms_p50": 162, "visible_ms_p99": 891, "peak_rss_mb": 1600}
+{"engine": "pondra", "mode": "batch", "rows": 20000000, "startup_s": 0.023, "write_s": 3.13, "q1_scan_agg": [0.046, 0.043], "q2_filter_group": [0.132, 0.151], "q3_high_card_group": [0.459, 0.436], "q4_count_distinct": [0.333, 0.34], "q5_join": [0.251, 0.281], "q6_time_bucket": [0.251, 0.252], "peak_rss_mb": 284}
+{"engine": "pondra", "mode": "stream", "rows": 10000000, "startup_s": 0.023, "ingest_s": 2.67, "correct": true, "processed": 10000000, "secs": 4.14, "rows_per_s": 2413595, "peak_rss_mb": 584}
+{"engine": "pondra", "mode": "etl", "rows": 10000000, "startup_s": 0.031, "ingest_s": 2.82, "processed": 10000000, "secs": 3.85, "rows_per_s": 2598442, "peak_rss_mb": 436}
+{"engine": "pondra", "mode": "live", "rows": 60, "startup_s": 0.023, "events": 73180000, "rows_per_s": 1219667, "visible_ms_p50": 162, "visible_ms_p99": 1059, "peak_rss_mb": 1983}
+{"engine": "pondra", "mode": "batch", "rows": 20000000, "startup_s": 0.023, "write_s": 3.08, "q1_scan_agg": [0.046, 0.043], "q2_filter_group": [0.133, 0.127], "q3_high_card_group": [0.459, 0.429], "q4_count_distinct": [0.326, 0.337], "q5_join": [0.251, 0.249], "q6_time_bucket": [0.275, 0.251], "peak_rss_mb": 258}
+{"engine": "pondra", "mode": "stream", "rows": 10000000, "startup_s": 0.023, "ingest_s": 2.67, "correct": true, "processed": 10000000, "secs": 3.97, "rows_per_s": 2518660, "peak_rss_mb": 639}
+{"engine": "pondra", "mode": "etl", "rows": 10000000, "startup_s": 0.023, "ingest_s": 2.84, "processed": 10000000, "secs": 3.86, "rows_per_s": 2590562, "peak_rss_mb": 449}
+{"engine": "pondra", "mode": "live", "rows": 60, "startup_s": 0.023, "events": 33240000, "rows_per_s": 554000, "visible_ms_p50": 53, "visible_ms_p99": 232, "peak_rss_mb": 1270}
+{"engine": "pondra", "mode": "live", "rows": 60, "startup_s": 0.023, "events": 2020000, "rows_per_s": 33667, "visible_ms_p50": 18, "visible_ms_p99": 35, "peak_rss_mb": 414}

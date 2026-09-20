@@ -1,0 +1,43 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: pondra-linux-x86_64
+            bin: target/release/pondra
+          - os: windows-latest
+            name: pondra-windows-x86_64.exe
+            bin: target/release/pondra.exe
+          - os: macos-latest
+            name: pondra-macos-arm64
+            bin: target/release/pondra
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: ${{ matrix.bin }}
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+      # The fast correctness suite: upsert, split brain, bulk insert, reader freshness, crashes.
+      - run: python3 tools/harness.py all
+      - run: python3 tools/cluster.py failover --secs 30

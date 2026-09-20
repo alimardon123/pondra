@@ -1,0 +1,11 @@
+all exit=0
+failover 1 exit=0
+failover 2 exit=0
+failover 3 exit=0
+backlog probes done
+dist exit=0
+size 89200224
+gz 29928755
+xz 16805320
+VmRSS:	   36800 kB
+alldone

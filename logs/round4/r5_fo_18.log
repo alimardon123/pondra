@@ -1,0 +1,6 @@
+  killed leader :18080; new leader :18082 accepting writes after 4.7s
+  killed leader :18082; new leader :18081 accepting writes after 4.6s
+failover: 3 nodes, 6 shards, 8 producers, 1905600 events, 1 follower + 2 leader kills
+  failovers: 4.7s, 4.6s (kill -> writes acked again); state caught up 0.2s after the last write
+  events exactly once: True (1905600 rows); for 1000 users, task state == model: True, inline view == model: True
+  shard runs per node (since each node's last start): {18080: 124, 18081: 136, 18082: 130}

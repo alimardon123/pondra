@@ -1,0 +1,2 @@
+split: 8 Arrow producers -> followers only, 42,380,000 events in 20s (2,119,000/s)
+  CPU seconds per million events: leader 0.18, followers 0.25 + 0.18; leader share 30%

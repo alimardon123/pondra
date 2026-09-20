@@ -1,0 +1,83 @@
+# Pondra: a streamhouse in one binary
+
+One Rust binary (~2,500 lines) that ingests streams, stores them as an open lakehouse (Parquet +
+Arrow on object storage), keeps SQL views and streaming state up to date, answers SQL, and scales
+out by starting more copies of itself on the same bucket. Object storage is the only state: no
+Postgres, no ZooKeeper, no Kafka, no JVM. Runs on a local directory or any S3-compatible store
+(S3, Cloudflare R2, MinIO).
+
+## Run it
+
+```bash
+cargo build --release
+
+# Local directory
+./target/release/pondra serve --dir ./lake
+
+# A cluster: the same command on each machine, same bucket. Every node takes writes and
+# queries; one of them (elected through the bucket) orders the commits; any can take over.
+export AWS_ACCESS_KEY_ID=… AWS_SECRET_ACCESS_KEY=… AWS_REGION=auto
+export AWS_ENDPOINT=https://<account>.r2.cloudflarestorage.com
+./target/release/pondra serve --dir s3://my-bucket/lake --addr 10.0.0.1:8080
+./target/release/pondra serve --dir s3://my-bucket/lake --addr 10.0.0.2:8080
+./target/release/pondra serve --dir s3://my-bucket/lake --addr 10.0.0.3:8080 --reader   # SQL only
+./target/release/pondra sql   --dir s3://my-bucket/lake "SELECT count(*) FROM events"   # serverless: no node at all
+```
+
+`--addr` must be reachable by the other nodes. Read-only nodes and `pondra sql` write nothing, so
+read-only bucket credentials are enough.
+
+## What it does
+
+| Need | How (HTTP API, on any node) | Replaces |
+|---|---|---|
+| Stream ingest, exactly-once | `POST /append/{t}?producer=&seq=` with NDJSON or an Arrow IPC stream | Kafka / Fluss |
+| Tables | `POST /tables/{t}` `[["user","Utf8"],…]`; `{"columns":[…],"key":["id"]}` = upsert table; add `"merge":{"total":"sum"}` = merge table | Delta/Iceberg MERGE |
+| Streaming SQL with no lag | `POST /views/{name}` with SQL. Runs on every flush of new rows, commits with them. With GROUP BY it keeps per-key aggregates (sum/count/min/max) that any number of nodes update at once | Flink SQL jobs + keyed state |
+| General stateful streaming | `POST /tasks/{name}` `{"source","target","sql"[, "key","shards","shard_by"]}`: runs as soon as rows commit, exactly-once, shards spread over nodes | Flink jobs |
+| Push | `GET /watch/{t}`: new rows as NDJSON the moment they commit | Kafka consumers |
+| SQL | `POST /sql[?format=table][&after=<seg>]`: files ∪ log tail, one snapshot. Large tables run SPMD across all nodes (`&spread=1` forces, `0` disables) | Trino / Spark SQL |
+| Batch ELT, exactly-once | `POST /insert/{t}?job=` with a `SELECT`: straight to Parquet; a retried job is a no-op | Spark batch jobs |
+| Maintenance | automatic and spread over the nodes: tiering to Parquet, compaction, retention, orphan cleanup, backpressure | Spark OPTIMIZE / VACUUM |
+
+## How it works
+
+| File | Role |
+|---|---|
+| `log.rs` | Every node batches its writes (Arrow IPC + ZSTD) and runs the views on them; big flushes it writes to storage itself. The leader's sequencer only orders them: dedupes producer retries and commits every flush as a log segment in one catalog write, pipelined |
+| `store.rs` | The lake: object store + catalog (SlateDB, inside the bucket). The leader streams each durable commit to the followers, which lay it over their own view (checked before and after every read, so a read never goes back in time): every node sees a commit within milliseconds |
+| `cluster.rs` | Leader election through the bucket (put-if-absent `cluster/term/{n}`), HTTP heartbeats, takeover after 5 s if no peer still hears the leader; a replaced leader is fenced by the catalog and rejoins |
+| `views.rs` | Inline views; GROUP BY views become merge tables |
+| `tasks.rs` | Streaming tasks: output + progress commit together, only if progress is unchanged (compare-and-swap) |
+| `spmd.rs` | Distributed queries: every node runs the same plan over its slice up to the first exchange; the receiving node finishes it |
+| `tier.rs` | Tiering, merging small files and compaction: the leader decides and commits, the data work is dealt to the nodes as jobs. Retention and orphan cleanup |
+| `query.rs`, `cache.rs` | Hot+cold snapshot per query (DataFusion); read cache for object storage |
+| `server.rs`, `main.rs` | HTTP API (axum) and CLI |
+
+**Producer contract:** each producer has its own name, sends batches in order with increasing
+`seq`, one request in flight, to any node, retrying (on any node) until acknowledged. Retries of
+committed batches come back as `"duplicate": true`.
+
+## Tests
+
+```bash
+python3 tools/harness.py all [--s3]             # upsert, fence (split brain), insert, reader, crash, load
+python3 tools/harness.py crash --runs 20        # kill -9 + injected crashes (PONDRA_CRASH=point:prob)
+python3 tools/cluster.py users                  # 64 writers + 16 readers + serverless reads, 3 nodes
+python3 tools/cluster.py failover               # views + sharded task state; leader killed twice
+python3 tools/cluster.py latency [--load 4]     # event -> view row pushed to another node
+python3 tools/cluster.py spread                 # distributed queries == single-node results
+python3 tools/cluster.py race | isolate | split # elections, cut-off follower, where the CPU goes
+python3 tools/bench/run.py batch 20000000       # vs Spark and Flink (ENGINES=pondra,spark,flink)
+python3 tools/sizes.py                          # storage bytes per event
+tools/r2_test.sh                                # the main tests against a real bucket
+python3 tools/sim_r2.py --port 9000             # local S3 server with R2-like latency (moto)
+```
+
+`--s3` uses `s3://$PONDRA_BUCKET/test-…` with the `AWS_*` variables.
+
+## Not yet
+
+Shuffles in distributed queries (big-to-big joins run on one node); partitioned upsert
+compaction; auth and quotas; DuckLake/Iceberg publishing for other engines; tests on real R2
+(this sandbox can't reach it; use `tools/r2_test.sh`).

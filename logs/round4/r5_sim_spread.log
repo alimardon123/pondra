@@ -1,0 +1,10 @@
+  q1_scan_agg          one node    921 ms   3 nodes    472 ms   same result: True
+  q2_filter_group      one node    548 ms   3 nodes    170 ms   same result: True
+  q3_high_card_group   one node    534 ms   3 nodes    709 ms   same result: True
+  q4_count_distinct    one node    576 ms   3 nodes    269 ms   same result: True
+  q5_join              one node    447 ms   3 nodes    384 ms   same result: True
+  q6_time_bucket       one node    564 ms   3 nodes    225 ms   same result: True
+  q7_avg_distinct      one node    481 ms   3 nodes    226 ms   same result: True
+  q8_top_rows          one node    448 ms   3 nodes    265 ms   same result: True
+  q9_filter_count      one node    760 ms   3 nodes    176 ms   same result: True
+spread: 2,000,000 rows, 3 nodes; results identical: True; fell back to one node: 0 times

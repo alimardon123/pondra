@@ -1,0 +1,1 @@
+{"engine": "pondra", "mode": "etl", "rows": 10000000, "startup_s": 0.023, "ingest_s": 2.84, "processed": 10000000, "secs": 3.86, "rows_per_s": 2590562, "peak_rss_mb": 449}

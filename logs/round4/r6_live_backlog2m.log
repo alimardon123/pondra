@@ -1,0 +1,1 @@
+{"engine": "pondra", "mode": "live", "rows": 60, "startup_s": 0.023, "events": 33240000, "rows_per_s": 554000, "visible_ms_p50": 53, "visible_ms_p99": 232, "peak_rss_mb": 1270}

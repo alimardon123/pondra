@@ -1,0 +1,42 @@
+all exit=0
+crashbig exit=0
+race exit=0
+users exit=0
+isolate exit=0
+latency exit=0
+latencyload exit=0
+spread exit=0
+split exit=0
+failover 1 exit=0
+failover 2 exit=0
+failover 3 exit=0
+failover 4 exit=0
+failover 5 exit=0
+failover 6 exit=0
+failover 7 exit=0
+failover 8 exit=0
+failover 9 exit=0
+failover 10 exit=0
+failover 11 exit=0
+failover 12 exit=0
+failover 13 exit=0
+failover 14 exit=0
+failover 15 exit=0
+failover 16 exit=0
+failover 17 exit=0
+failover 18 exit=0
+failover 19 exit=0
+failover 20 exit=0
+bench live done
+bench batch done
+bench done
+sim crash exit=0
+sim upsert exit=0
+sim fence exit=0
+sim users exit=0
+sim failover exit=0
+sim isolate exit=0
+sim latency exit=0
+sim latencyload exit=0
+sim spread exit=0
+alldone
