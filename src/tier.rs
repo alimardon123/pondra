@@ -1,10 +1,9 @@
 //! Tiering, compaction and retention.
-//! Append tables: the log tail becomes one new Parquet file. Keyed tables combine rows per key:
-//! merge tables fold just the tail's partial rows into a new file (their order doesn't matter)
-//! and compact all files into one every 8 files; upsert tables need every version in order, so
-//! they compact files + tail into one file. Either way the new file list and the new `tiered`
-//! mark are committed in ONE catalog write, so a crash never loses or doubles rows (an
-//! uncommitted Parquet file is just an unreferenced object).
+//! Each round folds a table's log tail into new Parquet files (keyed tables: one row per key per
+//! file, the newest file winning), and commits the new file list and the new `tiered` mark in ONE
+//! catalog write, so a crash never loses or doubles rows (an uncommitted Parquet file is just an
+//! unreferenced object). Then, separately, `maintain` keeps the file count down: small append
+//! files are merged 8 at a time, and keyed tables are compacted into one file once 8 pile up.
 use crate::query::{latest_sql, raw, schema, tail};
 use datafusion::prelude::ParquetReadOptions;
 use crate::store::*;
@@ -19,10 +18,11 @@ use datafusion::parquet::file::properties::WriterProperties;
 use futures::{StreamExt, TryStreamExt};
 use std::collections::BTreeMap;
 
-/// Rows per table in the log after segment `after` (from segment metadata only).
-pub async fn backlog(lake: &Lake, after: u64) -> Result<BTreeMap<String, u64>> {
+/// Rows per table in log segments (after, upto] (`None`: to the end), from segment metadata only.
+pub async fn backlog(lake: &Lake, after: u64, upto: Option<u64>) -> Result<BTreeMap<String, u64>> {
     let mut rows = BTreeMap::new();
-    for (_, seg) in lake.cat.scan::<Segment>(&seg_key(after + 1), "s0").await? {
+    let end = upto.map_or("s0".to_string(), |u| seg_key(u + 1));
+    for (_, seg) in lake.cat.scan::<Segment>(&seg_key(after + 1), &end).await? {
         for (table, parts) in seg.parts {
             *rows.entry(table).or_default() += parts.iter().map(|p| p.2).sum::<u64>();
         }
@@ -49,42 +49,50 @@ pub async fn tier_table(lake: &Lake, table: &str, hwm: u64, nodes: &[String], me
             break;
         }
     }
+    if n == 0 {
+        return Ok((0, true)); // nothing new for this table (`expire` moves its mark along)
+    }
+    // The log's rows as new files, one range of segments per node. Keyed tables keep one row per
+    // key per file; older files still hold older versions until a compaction folds them.
     let upto = segs.last().map_or(hwm, |s| s.0);
-    let mut rows = 0;
-    // Keyed tables fold their versions away once files pile up; that job takes the log too.
-    if !meta.key.is_empty() && meta.files.len() >= 8 {
-        let merged = deal(lake, vec![Job::new(table, &meta, Kind::Compact { upto })], nodes, me).await?;
-        rows = merged.iter().map(|f| f.rows).sum();
-        let old = meta.files.clone();
-        replace(&mut meta, &old, merged);
-    } else if n > 0 {
-        // The log's rows as new files, one range of segments per node. Keyed tables keep one row
-        // per key per file; older files still hold older versions until a compaction folds them.
-        let (mut jobs, mut from, mut acc) = (vec![], meta.tiered, 0);
-        for &(seg, r) in &segs {
-            acc += r;
-            if acc * nodes.len() as u64 >= n * (jobs.len() as u64 + 1) || seg == upto {
-                jobs.push(Job::new(table, &meta, Kind::Fold { after: from, upto: seg }));
-                from = seg;
-            }
-        }
-        let files = deal(lake, jobs, nodes, me).await?;
-        rows = files.iter().map(|f| f.rows).sum();
-        meta.files.extend(files);
-        // Append tables: once 8+ files are small, merge them, a group of 8 per node. A file that
-        // is already 64 MB or 4M rows (what a merge writes at most) is left alone, so rows are
-        // never merged twice.
-        let small: Vec<DataFile> = meta.files.iter().filter(|f| f.bytes < 64 << 20 && f.rows < 4_000_000).cloned().collect();
-        if meta.key.is_empty() && small.len() >= 8 {
-            let jobs = small.chunks(8).map(|g| Job::new(table, &meta, Kind::Merge { files: g.to_vec() })).collect();
-            let merged = deal(lake, jobs, nodes, me).await?;
-            replace(&mut meta, &small, merged);
+    let (mut jobs, mut from, mut acc, mut done) = (vec![], meta.tiered, 0, 0);
+    for &(seg, r) in &segs {
+        acc += r;
+        if acc * nodes.len() as u64 >= n * (jobs.len() as u64 + 1) || seg == upto {
+            jobs.push(Job::new(table, &meta, Kind::Fold { after: from, upto: seg, rows: acc - done }));
+            (from, done) = (seg, acc);
         }
     }
+    let files = deal(lake, jobs, nodes, me).await?;
+    let rows = files.iter().map(|f| f.rows).sum();
+    meta.files.extend(files);
     meta.tiered = upto;
     lake.cat.commit(vec![(table_key(table), json(&meta))], &[]).await?;
     lake.backlog.fetch_sub(n.min(lake.backlog.load(std::sync::atomic::Ordering::Relaxed)), std::sync::atomic::Ordering::Relaxed);
     Ok((rows, n < MAX_ROWS))
+}
+
+/// Keep a table's file count down, once its new rows are committed (so fresh rows never wait
+/// for this). Append tables: once 8+ files are small, merge them, a group of 8 per node; a file
+/// that is already 64 MB or 4M rows (what a merge writes at most) is left alone, so rows are
+/// never merged twice. Keyed tables fold their versions away once 8 files pile up. Returns
+/// whether anything changed.
+pub async fn maintain(lake: &Lake, table: &str, nodes: &[String], me: &str) -> Result<bool> {
+    let Some(mut meta) = lake.cat.get::<TableMeta>(&table_key(table)).await? else { return Ok(false) };
+    let small: Vec<DataFile> = meta.files.iter().filter(|f| f.bytes < 64 << 20 && f.rows < 4_000_000).cloned().collect();
+    if !meta.key.is_empty() && meta.files.len() >= 8 {
+        let merged = deal(lake, vec![Job::new(table, &meta, Kind::Compact { upto: meta.tiered, rows: 0 })], nodes, me).await?;
+        let old = meta.files.clone();
+        replace(&mut meta, &old, merged);
+    } else if meta.key.is_empty() && small.len() >= 8 {
+        let jobs = small.chunks(8).map(|g| Job::new(table, &meta, Kind::Merge { files: g.to_vec() })).collect();
+        let merged = deal(lake, jobs, nodes, me).await?;
+        replace(&mut meta, &small, merged);
+    } else {
+        return Ok(false);
+    }
+    lake.cat.commit(vec![(table_key(table), json(&meta))], &[]).await?;
+    Ok(true)
 }
 
 /// Swap `old` files for `new` ones; the old ones are deleted after the retention period.
@@ -110,9 +118,10 @@ impl Job {
 
 #[derive(Serialize, Deserialize)]
 enum Kind {
-    Fold { after: u64, upto: u64 }, // log segments (after, upto] -> a file (merge tables: one row per key)
-    Merge { files: Vec<DataFile> }, // small files -> one
-    Compact { upto: u64 },          // files + log up to `upto` -> one row per key
+    // `rows`: this table's rows in those log segments, as the leader counts them (see `caught_up`)
+    Fold { after: u64, upto: u64, rows: u64 }, // log segments (after, upto] -> a file (merge tables: one row per key)
+    Merge { files: Vec<DataFile> },            // small files -> one
+    Compact { upto: u64, rows: u64 },          // files + log up to `upto` -> one row per key
 }
 
 /// Run jobs round-robin on the live nodes (each round starts where the last one stopped, so
@@ -135,22 +144,22 @@ async fn deal(lake: &Lake, jobs: Vec<Job>, nodes: &[String], me: &str) -> Result
 
 /// Do one job here; returns the Parquet files written.
 pub async fn run_job(lake: &Lake, Job { table, meta, kind }: Job) -> Result<Vec<DataFile>> {
-    let keys = meta.key.clone();
+    let (keys, whole) = (meta.key.clone(), matches!(kind, Kind::Compact { .. }));
     let (batches, ord) = match kind {
-        Kind::Fold { after, upto } if meta.key.is_empty() => {
-            caught_up(lake, upto).await?;
+        Kind::Fold { after, upto, rows } if meta.key.is_empty() => {
+            caught_up(lake, &table, after, upto, rows).await?;
             (tail(lake, &table, after, Some(upto), false).await?, upto)
         }
         // Keyed tables: one row per key for this range of the log, delete markers included (they
         // still have to shadow what older files hold for that key).
-        Kind::Fold { after, upto } => {
-            caught_up(lake, upto).await?;
+        Kind::Fold { after, upto, rows } => {
+            caught_up(lake, &table, after, upto, rows).await?;
             let part = TableMeta { files: vec![], tiered: after, ..meta };
             (latest(lake, &table, &part, upto, true).await?, upto)
         }
-        Kind::Compact { upto } => {
+        Kind::Compact { upto, rows } => {
             anyhow::ensure!(!meta.key.is_empty(), "only keyed tables have versions to compact");
-            caught_up(lake, upto).await?;
+            caught_up(lake, &table, meta.tiered, upto, rows).await?;
             (latest(lake, &table, &meta, upto, false).await?, upto)
         }
         Kind::Merge { files } => {
@@ -165,7 +174,7 @@ pub async fn run_job(lake: &Lake, Job { table, meta, kind }: Job) -> Result<Vec<
         }
     };
     let mut files: Vec<DataFile> = write_file(lake, &table, &batches, &keys).await?.into_iter().collect();
-    files.iter_mut().for_each(|f| f.ord = ord);
+    files.iter_mut().for_each(|f| (f.ord, f.whole) = (ord, whole));
     Ok(files)
 }
 
@@ -176,12 +185,18 @@ async fn latest(lake: &Lake, table: &str, meta: &TableMeta, upto: u64, keep_dele
     Ok(ctx.sql(&latest_sql(meta, "__raw", true, keep_deleted)).await?.collect().await?)
 }
 
-/// Wait until this node sees log segment `upto` (a follower's view may lag the leader a bit).
-/// Never work from less: a missing segment would mean missing rows.
-async fn caught_up(lake: &Lake, upto: u64) -> Result<()> {
+/// Wait until this node sees log segment `upto` (a follower's view may lag the leader a bit),
+/// then check it sees exactly the rows the leader counted in (after, upto]. Never work from
+/// less: a missing segment would mean missing rows (the job fails; the next round retries).
+async fn caught_up(lake: &Lake, table: &str, after: u64, upto: u64, rows: u64) -> Result<()> {
+    if upto <= after {
+        return Ok(()); // no log to read (a compaction of the files alone)
+    }
     let mut hwm = lake.hwm.subscribe();
     tokio::time::timeout(std::time::Duration::from_secs(30), hwm.wait_for(|h| *h >= upto)).await.context("this node is behind the leader")??;
     anyhow::ensure!(lake.cat.get::<Segment>(&seg_key(upto)).await?.is_some(), "segment {upto} isn't visible here yet");
+    let here = backlog(lake, after, Some(upto)).await?.get(table).copied().unwrap_or(0);
+    anyhow::ensure!(here == rows, "{table}: {here} rows in log segments {after}..={upto} here, {rows} on the leader");
     Ok(())
 }
 
@@ -190,7 +205,13 @@ async fn caught_up(lake: &Lake, upto: u64) -> Result<()> {
 /// may still use them). Catalog first, then the objects: a crash leaves only unreferenced objects.
 pub async fn expire(lake: &Lake, grace_ms: u64) -> Result<()> {
     let cutoff = crate::log::now_ms().saturating_sub(grace_ms);
-    let tables = lake.cat.scan::<TableMeta>("t/", "t0").await?;
+    let mut tables = lake.cat.scan::<TableMeta>("t/", "t0").await?;
+    // A table with nothing new in the log moves its mark to the end of it here (tiering skips it,
+    // rather than commit nothing), so an idle table doesn't hold retention back.
+    let hwm = lake.visible();
+    let pending = backlog(lake, tables.iter().map(|(_, m)| m.tiered).min().unwrap_or(hwm), Some(hwm)).await?;
+    let idle: Vec<bool> = tables.iter().map(|(k, m)| m.tiered < hwm && !pending.contains_key(&k[2..])).collect();
+    tables.iter_mut().zip(&idle).filter(|(_, idle)| **idle).for_each(|((_, m), _)| m.tiered = hwm);
     let mut floor = tables.iter().map(|(_, m)| m.tiered).min().unwrap_or(0);
     for (key, task) in lake.cat.scan::<crate::tasks::Task>("k/", "k0").await? {
         for producer in crate::tasks::producers(&key[2..], &task) {
@@ -217,9 +238,9 @@ pub async fn expire(lake: &Lake, grace_ms: u64) -> Result<()> {
     let mut deletes: Vec<String> = segs.iter().map(|(k, _)| k.clone()).collect();
     deletes.extend(segs.iter().filter(|(_, s)| s.path.is_empty()).map(|(k, _)| data_key(k[2..].parse().unwrap_or(0))));
     let mut puts = vec![];
-    for (key, mut meta) in tables {
+    for ((key, mut meta), idle) in tables.into_iter().zip(idle) {
         let (old, keep): (Vec<_>, Vec<_>) = meta.garbage.drain(..).partition(|(_, ts)| *ts < cutoff);
-        if !old.is_empty() {
+        if !old.is_empty() || idle {
             dead.extend(old.into_iter().map(|(p, _)| p));
             meta.garbage = keep;
             puts.push((key, json(&meta)));
@@ -228,9 +249,7 @@ pub async fn expire(lake: &Lake, grace_ms: u64) -> Result<()> {
     if !puts.is_empty() || !deletes.is_empty() {
         lake.cat.commit(puts, &deletes).await?;
     }
-    for path in dead {
-        lake.delete(&path).await;
-    }
+    futures::stream::iter(dead).for_each_concurrent(16, |path| async move { lake.delete(&path).await }).await; // (one round trip each)
     collect_orphans(lake).await
 }
 
@@ -253,7 +272,7 @@ async fn collect_orphans(lake: &Lake) -> Result<()> {
         let objects: Vec<_> = lake.store.list(Some(&object_store::path::Path::from(prefix))).try_collect().await?;
         for o in objects {
             let old = now as i64 - o.last_modified.timestamp_millis() > 24 * HOUR as i64;
-            if old && !used.contains(o.location.as_ref()) {
+            if old && !used.contains(o.location.as_ref()) && !o.location.as_ref().contains("/_delta_log/") {
                 lake.delete(o.location.as_ref()).await;
             }
         }
@@ -267,7 +286,7 @@ async fn collect_orphans(lake: &Lake) -> Result<()> {
 fn writer<'a>(buf: &'a mut Vec<u8>, batch: &RecordBatch, keys: &[String]) -> Result<ArrowWriter<&'a mut Vec<u8>>> {
     let mut props = WriterProperties::builder().set_compression(Compression::ZSTD(ZstdLevel::try_new(1)?));
     if !keys.is_empty() {
-        props = props.set_max_row_group_size(256 << 10);
+        props = props.set_max_row_group_row_count(Some(256 << 10));
     }
     for k in keys {
         props = props.set_column_bloom_filter_enabled(k.as_str().into(), true);
@@ -290,7 +309,7 @@ pub async fn write_file(lake: &Lake, table: &str, batches: &[RecordBatch], keys:
     let (path, bytes) = (format!("data/{table}/{}.parquet", uuid::Uuid::new_v4()), buf.len() as u64);
     lake.put(&path, buf).await?;
     maybe_crash("after_parquet_put");
-    Ok(Some(DataFile { path, rows: rows as u64, bytes, ord: 0 }))
+    Ok(Some(DataFile { path, rows: rows as u64, bytes, ord: 0, whole: false }))
 }
 
 /// Stream a query result into Parquet files of up to `max_rows` each (bulk INSERT … SELECT).

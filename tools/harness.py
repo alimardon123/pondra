@@ -31,7 +31,8 @@ def sql(port, q):
 
 
 def new_lake():
-    return f"s3://{os.environ['PONDRA_BUCKET']}/test-{uuid.uuid4().hex[:8]}" if A.s3 else tempfile.mkdtemp(prefix="pondra-")
+    prefix = os.environ.get("PONDRA_TEST_PREFIX", "")  # e.g. "round6/": test lakes grouped in one folder
+    return f"s3://{os.environ['PONDRA_BUCKET']}/{prefix}test-{uuid.uuid4().hex[:8]}" if A.s3 else tempfile.mkdtemp(prefix="pondra-")
 
 
 class Node:

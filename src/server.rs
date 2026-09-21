@@ -15,7 +15,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use datafusion::arrow::ipc::reader::StreamReader;
 use datafusion::arrow::{compute::concat_batches, json as arrow_json, record_batch::RecordBatch, util::pretty::pretty_format_batches};
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 use serde::Deserialize;
 use serde_json::{json as j, Value};
 use std::collections::BTreeMap;
@@ -128,31 +128,55 @@ async fn feed(State(app): State<App>) -> Response {
 impl App {
     fn log(&self) -> anyhow::Result<&Log> { self.log.as_deref().ok_or_else(|| anyhow::anyhow!("read-only node")) }
 
-    /// Tier the tables with at least `min_rows` rows in the log (0: all of them), then expire
-    /// what everything has consumed (leader).
+    /// Tier the tables with at least `min_rows` rows in the log (0: all of them), publish them
+    /// for other engines, then expire what everything has consumed (leader).
     pub async fn tier_all(&self, min_rows: u64) -> anyhow::Result<u64> {
         let _guard = self.lock.lock().await;
         let start = std::time::Instant::now();
         let hwm = *self.lake.hwm.borrow();
         let tables = self.lake.cat.scan::<TableMeta>("t/", "t0").await?;
-        let backlog = crate::tier::backlog(&self.lake, tables.iter().map(|(_, m)| m.tiered).min().unwrap_or(hwm)).await?;
-        let mut rows = 0;
-        for (key, _) in tables.iter().filter(|(k, _)| backlog.get(&k[2..]).copied().unwrap_or(0) >= min_rows) {
-            let nodes = if self.cluster.nodes().is_empty() { vec![self.cluster.addr.clone()] } else { self.cluster.nodes() };
-            loop {
-                let (n, done) = tier_table(&self.lake, &key[2..], hwm, &nodes, &self.cluster.addr).await?;
-                rows += n;
-                if done || n == 0 {
-                    break;
-                }
-            }
+        let backlog = crate::tier::backlog(&self.lake, tables.iter().map(|(_, m)| m.tiered).min().unwrap_or(hwm), None).await?;
+        let nodes = if self.cluster.nodes().is_empty() { vec![self.cluster.addr.clone()] } else { self.cluster.nodes() };
+        // Up to 4 tables at once: on object storage each round is a few storage round trips, so
+        // tables side by side finish in the time of one (memory stays bounded: ≤4M rows a job).
+        let busy: Vec<String> = tables.iter().map(|(k, _)| k[2..].to_string()).filter(|t| backlog.get(t).copied().unwrap_or(0) >= min_rows).collect();
+        if busy.is_empty() {
+            return Ok(0); // (the pressure check, most of the time: don't hold the lock for nothing)
         }
-        expire(&self.lake, self.retain_ms).await?;
-        self.lake.cat.checkpoint().await?;
+        let per_table: Vec<_> = busy.iter().map(|t| self.tier_one(t, hwm, &nodes)).collect();
+        let rows: u64 = futures::stream::iter(per_table).buffer_unordered(4).try_collect::<Vec<u64>>().await?.iter().sum();
+        let tiered = start.elapsed();
+        crate::delta::publish_all(&self.lake).await?; // what other engines read, as soon as it's tiered
+        // Then merges and compactions (published too, once done).
+        let maintain: Vec<_> = busy.iter().map(|t| crate::tier::maintain(&self.lake, t, &nodes, &self.cluster.addr)).collect();
+        if futures::stream::iter(maintain).buffer_unordered(4).try_collect::<Vec<bool>>().await?.contains(&true) {
+            crate::delta::publish_all(&self.lake).await?;
+        }
+        let published = start.elapsed();
+        // Retention every 10 s is plenty, and keeps its deletes off the path to fresh Delta versions.
+        static EXPIRED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let now = crate::log::now_ms();
+        if now - EXPIRED.load(std::sync::atomic::Ordering::Relaxed) >= 10_000 {
+            EXPIRED.store(now, std::sync::atomic::Ordering::Relaxed);
+            expire(&self.lake, self.retain_ms).await?;
+        }
         if start.elapsed() >= Duration::from_secs(5) {
-            eprintln!("slow tiering: {rows} rows in {:?}", start.elapsed()); // one line when it drags
+            // one line when it drags
+            eprintln!("slow tiering: {rows} rows in {:?} (tables {tiered:?}, delta + merges {:?}, expire {:?})", start.elapsed(), published - tiered, start.elapsed() - published);
         }
         Ok(rows)
+    }
+
+    /// One table's log up to `hwm`, a chunk at a time.
+    async fn tier_one(&self, table: &str, hwm: u64, nodes: &[String]) -> anyhow::Result<u64> {
+        let mut rows = 0;
+        loop {
+            let (n, done) = tier_table(&self.lake, table, hwm, nodes, &self.cluster.addr).await?;
+            rows += n;
+            if done || n == 0 {
+                return Ok(rows);
+            }
+        }
     }
 
     pub async fn run_tasks(&self) -> anyhow::Result<()> { crate::tasks::run_all(&self.lake, &self.cluster, self.log()?).await }

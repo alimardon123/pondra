@@ -1,0 +1,8 @@
+users: 64 writers + 16 readers + 2 serverless on 3 node(s), 26s  lake /tmp/pondra-ewgyotpv
+  802000 events (31,127/s), ack p50 186 ms p99 603 ms
+  1936 snapshot reads, query p50 185 ms p99 711 ms
+  inconsistent reads: 1666; producers with lost/duplicate batches: 0
+    by node: {'node 18082': 806, 'node 18081': 860}
+    ('node 18082', {'producer': 'u35', 'n': 5400, 'd': 54, 'mx': 55})
+    ('node 18082', {'producer': 'u18', 'n': 5600, 'd': 56, 'mx': 57})
+    ('node 18082', {'producer': 'u35', 'n': 5400, 'd': 54, 'mx': 55})

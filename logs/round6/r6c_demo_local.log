@@ -1,0 +1,44 @@
+lake: /home/claude/demo-local
+rows per table (Pondra SQL): {'events': 200001, 'customers': 20, 'spend_by_user': 100, 'big_orders': 1800, 'regions': 100}
+rows per table (delta-rs / Polars / DuckDB): {'events': {'delta-rs': 200000, 'polars': 200000, 'duckdb': 200000}, 'customers': {'delta-rs': 20, 'polars': 20, 'duckdb': 20}, 'spend_by_user': {'delta-rs': 100, 'polars': 100, 'duckdb': 100}, 'big_orders': {'delta-rs': 1800, 'polars': 1800, 'duckdb': 1800}, 'regions': {'delta-rs': 100, 'polars': 100, 'duckdb': 100}} 
+
+catalog/
+  compactions/
+    00000000000000000001.compactions  (26 B)
+    00000000000000000002.compactions  (42 B)
+    00000000000000000003.compactions  (42 B)
+  manifest/
+    00000000000000000001.manifest  (130 B)
+    00000000000000000002.manifest  (138 B)
+    00000000000000000003.manifest  (146 B)
+  wal/
+    00000000000000000001.sst  (0 B)
+    00000000000000000002.sst  (323 B)
+    00000000000000000003.sst  (341 B)
+    … 13 more
+cluster/
+  term/
+    00000000000000000001  (32 B)
+data/
+  big_orders/
+    22a8e439-31a2-4781-9eac-ee7b4e83f21e.parquet  (912 B)
+    _delta_log/
+      00000000000000000000.json  (596 B)
+  customers/
+    7e99fea8-919a-4181-adae-328a667a0bfb.parquet  (1,266 B)
+    _delta_log/
+      00000000000000000000.json  (668 B)
+  events/
+    a98ee823-f2e2-4bf8-b97e-c0582b42148f.parquet  (23,464 B)
+    _delta_log/
+      00000000000000000000.json  (594 B)
+  regions/
+    a0864a98-a88a-40bd-995a-e6fe5a1cef3d.parquet  (1,047 B)
+    _delta_log/
+      00000000000000000000.json  (594 B)
+  spend_by_user/
+    2f738fa7-6e56-48d9-888e-8eb4e6cd840c.parquet  (1,830 B)
+    _delta_log/
+      00000000000000000000.json  (673 B)
+log/
+  001789984962904-bf686da4-101b-4576-8fe7-f77d1c6f869d.seg  (550,096 B)

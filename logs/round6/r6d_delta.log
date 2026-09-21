@@ -1,0 +1,33 @@
+{
+ "lake": "/tmp/pondra-0r9e4g2_",
+ "pondra": {
+  "events": 55000,
+  "kv": 50,
+  "totals": 100,
+  "dims": 100
+ },
+ "external": {
+  "events": {
+   "delta-rs": 55000,
+   "polars": 55000,
+   "duckdb": 55000
+  },
+  "kv": {
+   "delta-rs": 50,
+   "polars": 50,
+   "duckdb": 50
+  },
+  "totals": {
+   "delta-rs": 100,
+   "polars": 100,
+   "duckdb": 100
+  },
+  "dims": {
+   "delta-rs": 100,
+   "polars": 100,
+   "duckdb": 100
+  }
+ },
+ "match": true
+}
+{"external_freshness_ms": {"tier_secs": 2.0, "ack_p50": 7, "new_delta_version_p50": 17, "visible_to_delta_rs_p50": 31, "max": 1168, "samples": 10, "one_delta_rs_read_p50": null}}

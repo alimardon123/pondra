@@ -1,0 +1,1 @@
+tiering: 18 rounds -> files {'events': 6, 'kv': 4, 'totals': 4}, untiered rows 0, rows {'events': 10800000, 'kv': {'n': 200, 'v': 3600}, 'totals': 10800000} -> OK

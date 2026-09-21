@@ -118,15 +118,29 @@ impl Cluster {
 
     /// Read-only nodes: no heartbeat, no vote, no takeover. They only notice when leadership
     /// moves, and restart to follow the new leader's commit stream (see `mirror`).
-    pub fn watch_leader(self: Arc<Self>, store: Store) {
+    pub fn watch_leader(self: Arc<Self>, store: Store, streamed: bool) {
         tokio::spawn(async move {
+            let mut gone = 0;
             loop {
                 tokio::time::sleep(Duration::from_secs(15)).await;
-                if matches!(latest(&store).await, Ok(Some(t)) if t.n != self.leader.n) {
+                // Following a leader that has been gone for two checks: reopen reading the
+                // catalog's WAL as well, or what it committed in its last seconds (not yet in the
+                // files our view reads) would stay invisible until a new leader appears.
+                gone = if streamed && !self.leader_alive().await { gone + 1 } else { 0 };
+                if gone >= 2 || matches!(latest(&store).await, Ok(Some(t)) if t.n != self.leader.n) {
                     restart();
                 }
             }
         });
+    }
+
+    /// Does the leader of our term answer? (A read-only node follows its commit stream only then.)
+    pub async fn leader_alive(&self) -> bool {
+        let r = http().get(format!("http://{}/cluster/leader", self.leader.addr)).timeout(Duration::from_secs(2)).send().await;
+        match r {
+            Ok(r) => r.json::<(u64, bool)>().await.is_ok_and(|(term, _)| term == self.leader.n),
+            Err(_) => false,
+        }
     }
 
     /// Does another member still hear our leader (same term)?
@@ -148,7 +162,7 @@ impl Cluster {
 /// breaks, reconnect; meanwhile our own catalog view keeps us correct, just a little behind.
 pub fn mirror(lake: Arc<crate::store::Lake>, leader: String) {
     tokio::spawn(async move {
-        let mut last = 0; // the last commit number we got (they're consecutive, unless we missed some)
+        let mut last = 0; // the last commit number we got (a reconnect replays some we have)
         loop {
             if let Ok(r) = http().get(format!("http://{leader}/cluster/log")).send().await {
                 let (mut body, mut buf) = (r.bytes_stream(), bytes::BytesMut::new());
@@ -156,10 +170,8 @@ pub fn mirror(lake: Arc<crate::store::Lake>, leader: String) {
                     buf.extend_from_slice(&chunk);
                     while let Ok(Some(d)) = crate::store::Delta::take(&mut buf) {
                         if d.id > last {
-                            // A gap: commits between our view and this one may be missing.
-                            let gap = d.id > last.max(lake.cat.view_c()) + 1;
                             last = d.id;
-                            lake.apply(&d, gap);
+                            lake.apply(&d);
                         }
                     }
                 }

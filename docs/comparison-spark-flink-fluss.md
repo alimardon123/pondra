@@ -1,9 +1,9 @@
-# Pondra vs Spark, Flink, Fluss and Databricks: batch, streaming, serving (round 5)
+# Pondra vs Spark, Flink, Fluss and Databricks: batch, streaming, serving, open lake (round 6)
 
 **Date:** 2026-09-21 · **Machine:** one 2-vCPU, 7 GB sandbox VM, local disk; every engine ran alone, one at a time
 **Versions:** Pondra (this prototype, DataFusion 55) · Spark 4.2.0 (PySpark, `local[*]`) · Flink 2.3.0 (PyFlink, local MiniCluster, parallelism 2) · Fluss 0.9 (not runnable here; see the last section)
 **Reproduce:** `tools/bench/run.py` (same generated data and same SQL for every engine; results agree across engines), `tools/cluster.py latency | split | spread`.
-Spark and Flink numbers are from round 3 (same machine, same scripts); Pondra's were re-measured on the round-5 binary.
+Spark and Flink numbers are from round 3 (same machine, same scripts); Pondra's batch and streaming numbers were measured on the round-5 binary, and its latency, freshness and open-lake numbers on round 6's.
 
 ## Footprint
 
@@ -111,8 +111,11 @@ Fluss can't run in this sandbox (Apache mirrors and Maven Central are blocked), 
 | Write scale-out | every node ingests (encodes, stores, runs views); one leader only orders the commits | writes spread over buckets and TabletServers |
 | Keyed aggregation in storage | merge tables (inline GROUP BY views): sum / count / min / max, merged on read and folded when tiered | aggregation merge engine (sum, min, max, …) on primary-key tables |
 | Primary-key / upsert tables | merge-on-read + compaction to Parquet | KV tablets in RocksDB with a changelog; point lookups in milliseconds |
-| Write → readable, durable | ~6 ms on local disk; ~0.3–0.5 s on object storage (simulated R2) | milliseconds (replicated to TabletServer disks) |
-| Lake freshness | **no gap at all**: every query reads the log tail with the Parquet, so what is acked is queryable. Tiering to Parquet runs every 10 s, or as soon as 1 M rows wait | union read of Fluss + lake; the lake itself lags by `table.datalake.freshness`, 3 min by default |
+| Write → readable, durable (unified read) | 6 ms on local disk; one PUT on object storage (0.26 s simulated R2, 0.66 s real R2 from this sandbox) | milliseconds (replicated to TabletServer disks) |
+| Union read | **every query, every node**: Parquet files ∪ log tail, one snapshot | Fluss + lake, through Fluss's Flink/Spark connectors |
+| **The lake without the system** — freshness | **Delta Lake, 17 ms** after the ack on local disk (a new version with the row; delta-rs reads it at 31 ms p50); **4.8 s** on real R2 from this far-away sandbox (three object-store round trips). Under a steady stream, plus up to `--tier-secs` (2 s) | Paimon/Iceberg, `table.datalake.freshness`: **3 min** by default, via a separate tiering service (a Flink job) |
+| **The lake without the system** — who can read it | Delta readers: Spark, Databricks, DuckDB, Polars, delta-rs, Trino, Athena (checked: delta-rs, Polars, DuckDB) | Paimon or Iceberg readers |
+| A new user's first query on object storage | **20–30 ms** on a serving node (SSD tier + in-memory catalog); **≈0.95 s** on a node that just joined with an empty disk (real R2, ~0.4 s per GET from here) | milliseconds from TabletServers; lake reads cold from object storage |
 | Freshness on a read-only serving node | 7 ms p50 (it follows the leader's commit stream) | milliseconds (reads from TabletServers) |
 | Published throughput | this report: 3.8 M events/s through 3 nodes on 2 vCPUs, durable | community benchmark (Fluss 0.9.1, docker-compose, one TaskManager): 88.7k records/s vs Kafka's 98.6k. Rednote in production: ~1B records and 10 TB per day on one table; write CPU −30 %, write traffic −50 % after moving from Kafka |
 
@@ -123,13 +126,17 @@ Fluss can't run in this sandbox (Apache mirrors and Maven Central are blocked), 
   - point lookups on primary keys;
   - production proof at Alibaba / Rednote scale.
 - **Pondra wins** on:
-  - operational simplicity (no ZooKeeper, no disks to replicate, no JVM, no separate tiering job);
-  - cost (object storage only);
-  - freshness of the lake itself (the log tail is part of every query);
+  - **the open lake**:
+    - fresh for outside engines in milliseconds on local disk, and seconds on a far-away R2
+      bucket, against Fluss's 3-minute default — roughly 100x or more;
+    - no tiering job to run: it is part of every node;
+  - operational simplicity: no ZooKeeper, no disks to replicate, no JVM;
+  - cost: object storage only, plus a disposable SSD cache;
   - one engine for streaming and batch SQL.
 - **Now matched:**
   - write scale-out;
-  - keyed aggregation in storage.
+  - keyed aggregation in storage;
+  - millisecond reads for a new user on object storage (from local SSD and memory).
 - **For a company growing into enterprise scale:** Pondra covers streaming, batch and serving with one binary. A workload that needs millisecond durability on S3 itself can use S3 Express One Zone as the bucket. Only if that isn't enough does it need a Fluss-like tier.
 
 Sources: [Fluss architecture](https://fluss.apache.org/docs/next/concepts/architecture/), [Fluss aggregation merge engine](https://fluss.apache.org/docs/table-design/merge-engines/aggregation/), [Fluss tiering service](https://fluss.apache.org/docs/1.0/streaming-lakehouse/tiering-service/), [Fluss 0.9 release](https://fluss.apache.org/blog/releases/0.9/), [Jack Vanlightly: Understanding Apache Fluss](https://jack-vanlightly.com/blog/2025/9/2/understanding-apache-fluss), [community Fluss vs Kafka benchmark](https://github.com/fmorillo7694/fluss-kafka-bench/blob/main/bench/results/README.md), [Rednote: Kafka to Fluss](https://fluss.apache.org/blog/rednote-kafka-to-fluss-real-time-indexing/), [Flink: end-to-end exactly-once with Kafka](https://flink.apache.org/2018/02/28/an-overview-of-end-to-end-exactly-once-processing-in-apache-flink-with-apache-kafka-too/), [Confluent: delivery guarantees and latency in Flink](https://docs.confluent.io/cloud/current/flink/concepts/delivery-guarantees.html).

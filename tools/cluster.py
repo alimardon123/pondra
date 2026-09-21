@@ -27,6 +27,7 @@ A = None
 def cluster(n, lake=None, **flags):
     """Start n nodes on one lake; return them once every follower is listed by the leader."""
     lake = lake or harness.new_lake()
+    flags = {**dict(f.split("=", 1) for f in A.flag), **flags}  # --flag tier-secs=10 reaches every node
     nodes = [Node(lake, A.port + i, **flags).start() for i in range(n)]
     wait(lambda: len(leader(nodes)[1]["nodes"]) == n, 30, "followers never joined")
     return lake, nodes
@@ -126,7 +127,7 @@ def users():
     final = {r["producer"]: r for r in call(nodes[-1].port, "POST", f"/sql?after={top[0]}", q.encode())}  # read-your-writes
     lost_or_dup = [u for u in range(A.users) if final[f"u{u}"]["n"] != acked[u] * A.size or final[f"u{u}"]["d"] != acked[u]]
     events = sum(acked.values()) * A.size
-    print(f"users: {A.users} writers + {A.readers} readers + 2 serverless on {A.nodes} node(s), {secs:.0f}s")
+    print(f"users: {A.users} writers + {A.readers} readers + 2 serverless on {A.nodes} node(s), {secs:.0f}s  lake {lake}")
     print(f"  {events} events ({events / secs:,.0f}/s), ack p50 {pct(lat, .5)} ms p99 {pct(lat, .99)} ms")
     print(f"  {reads[0]} snapshot reads, query p50 {pct(qlat, .5)} ms p99 {pct(qlat, .99)} ms")
     print(f"  inconsistent reads: {len(bad)}; producers with lost/duplicate batches: {len(lost_or_dup)}")
@@ -379,5 +380,6 @@ if __name__ == "__main__":
     ap.add_argument("--size", type=int, default=100)
     ap.add_argument("--secs", type=float, default=20)
     ap.add_argument("--port", type=int, default=18080)
+    ap.add_argument("--flag", action="append", default=[], help="extra serve flag for every node, e.g. tier-secs=10")
     A = harness.A = ap.parse_args()
     sys.exit(0 if globals()[A.test]() else 1)

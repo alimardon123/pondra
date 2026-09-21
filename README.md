@@ -1,8 +1,8 @@
 # Pondra: a streamhouse in one binary
 
-One Rust binary (~2,650 lines) that ingests streams, stores them as an open lakehouse (Parquet +
-Arrow on object storage), keeps SQL views and streaming state up to date, answers SQL, and scales
-out by starting more copies of itself on the same bucket. Object storage is the only state: no
+One Rust binary (~3,100 lines) that ingests streams, stores them as an open lakehouse (Parquet
+files with a Delta Lake log, on object storage), keeps SQL views and streaming state up to date,
+answers SQL, and scales out by starting more copies of itself on the same bucket. Object storage is the only state: no
 Postgres, no ZooKeeper, no Kafka, no JVM. Runs on a local directory or any S3-compatible store
 (S3, Cloudflare R2, MinIO).
 
@@ -26,6 +26,27 @@ export AWS_ENDPOINT=https://<account>.r2.cloudflarestorage.com
 
 `--addr` must be reachable by the other nodes. Read-only nodes and `pondra sql` write nothing, so
 read-only bucket credentials are enough.
+
+Useful `serve` flags:
+
+- `--tier-secs 2`: new rows become Parquet and a new Delta version (what other engines see) as
+  soon as they commit, at most this often. Fractions are fine (`0.25`).
+- `--cache-dir`, `--cache-gb 20`: the local SSD tier for lakes on object storage. 0 turns it off.
+- `--retain-secs 60`: how long replaced files and consumed log segments are kept.
+- `--backlog 10000000`: rows allowed to wait for tiering before commits pause.
+
+## Read the lake without Pondra
+
+Every table is also a **Delta Lake table** at `<lake>/data/<table>`, so Spark, Databricks,
+DuckDB, Polars, delta-rs, Trino and Athena read it directly:
+
+```sql
+SELECT user, sum(amount) FROM delta_scan('s3://my-bucket/lake/data/events') GROUP BY user;  -- DuckDB
+```
+
+The Delta log trails Pondra by one tiering round: 17 ms on local disk after a quiet spell, and
+at most `--tier-secs` (2 s) more under a steady stream. The local folder and the bucket use the
+same layout: see `docs/lake-format.md`.
 
 ## Windows, macOS, Linux
 
@@ -56,19 +77,22 @@ differences entirely.
 | Serving reads | `GET /lookup/{t}/{key}`: the current row of one key, planned as a lookup (one thread, bloom-filtered, sorted files) rather than a scan | Redis / Postgres in front of the lake |
 | Batch ELT, exactly-once | `POST /insert/{t}?job=` with a `SELECT`: straight to Parquet; a retried job is a no-op | Spark batch jobs |
 | Maintenance | automatic and spread over the nodes: tiering to Parquet, compaction, retention, orphan cleanup, backpressure | Spark OPTIMIZE / VACUUM |
+| Open lake | every table is published as Delta Lake (`data/{t}/_delta_log`) each tiering round, for engines that don't know Pondra | a separate Delta/Iceberg writer |
 
 ## How it works
 
 | File | Role |
 |---|---|
 | `log.rs` | Every node batches its writes (Arrow IPC + ZSTD) and runs the views on them; big flushes it writes to storage itself. The leader's sequencer only orders them: dedupes producer retries and commits every flush as a log segment in one catalog write, pipelined |
-| `store.rs` | The lake: object store + catalog (SlateDB, inside the bucket). The leader streams each durable commit to the followers, which lay it over their own view (checked before and after every read, so a read never goes back in time): every node sees a commit within milliseconds |
+| `store.rs` | The lake: object store + catalog (SlateDB, inside the bucket). The leader streams each durable commit to the followers. They keep the whole catalog in memory from it (seeded from their own view; after a gap they fall back to the view, checked before and after every read, so a read never goes back in time): every node sees a commit within milliseconds, without asking the bucket |
 | `cluster.rs` | Leader election through the bucket (put-if-absent `cluster/term/{n}`), HTTP heartbeats, takeover after 5 s if no peer still hears the leader; a replaced leader is fenced by the catalog and rejoins |
 | `views.rs` | Inline views; GROUP BY views become merge tables |
 | `tasks.rs` | Streaming tasks: output + progress commit together, only if progress is unchanged (compare-and-swap) |
 | `spmd.rs` | Distributed queries: every node runs the same plan over its slice up to the first exchange; the receiving node finishes it |
 | `tier.rs` | Tiering, merging small files and compaction: the leader decides and commits, the data work is dealt to the nodes as jobs. Keyed tables are LSM-like — each round folds the log tail into a new file, and files are compacted once 8 pile up. Retention and orphan cleanup |
-| `query.rs`, `cache.rs` | Hot+cold snapshot per query (DataFusion); read cache for object storage |
+| `query.rs` | Hot+cold snapshot per query (DataFusion) |
+| `cache.rs` | For lakes on object storage: an in-memory read cache and a local SSD tier (write-through, read-through, prefetched from the commit stream, warmed at start) |
+| `delta.rs` | Delta Lake publishing: a JSON commit per change to a table's files, Parquet checkpoints, crash-safe (derived from the catalog, put-if-absent) |
 | `server.rs`, `main.rs` | HTTP API (axum) and CLI |
 
 **Producer contract:** each producer has its own name, sends batches in order with increasing
@@ -88,14 +112,20 @@ python3 tools/cluster.py race | isolate | split # elections, cut-off follower, w
 python3 tools/bench/run.py batch 20000000       # vs Spark and Flink (ENGINES=pondra,spark,flink)
 python3 tools/serve_bench.py --keys 2000000     # point lookups and dashboard queries, p50/p99/QPS
 python3 tools/sizes.py                          # storage bytes per event
+python3 tools/delta_check.py [--s3]             # delta-rs, Polars and DuckDB read the Delta logs == Pondra
+python3 tools/newuser_bench.py [--s3]           # a new client's first query, a new node's, write→visible
+python3 tools/demo_lake.py --dir <folder|s3://…> # one of everything, then the folder tree
 tools/r2_test.sh                                # the main tests against a real bucket
 python3 tools/sim_r2.py --port 9000             # local S3 server with R2-like latency (moto)
 ```
 
-`--s3` uses `s3://$PONDRA_BUCKET/test-…` with the `AWS_*` variables.
+`--s3` uses `s3://$PONDRA_BUCKET/$PONDRA_TEST_PREFIX` + `test-…` with the `AWS_*` variables. Add
+`--flag tier-secs=10` to `cluster.py` to pass a serve flag to every node.
 
 ## Not yet
 
-Shuffles in distributed queries (big-to-big joins run on one node); partitioned upsert
-compaction; auth and quotas; DuckLake/Iceberg publishing for other engines; tests on real R2
-(this sandbox can't reach it; use `tools/r2_test.sh`).
+- Shuffles in distributed queries: big-to-big joins run on one node.
+- Partitioned upsert compaction, and partitioned Delta tables.
+- Auth and quotas.
+- Iceberg metadata next to the Delta log.
+- On object storage, a durable ack costs one PUT: use S3 Express One Zone for milliseconds.

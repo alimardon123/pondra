@@ -1,0 +1,33 @@
+{
+ "lake": "s3://pondbucket/round6/test-1dd4ee04",
+ "pondra": {
+  "events": 15000,
+  "kv": 50,
+  "totals": 100,
+  "dims": 100
+ },
+ "external": {
+  "events": {
+   "delta-rs": 15000,
+   "polars": 15000,
+   "duckdb": 15000
+  },
+  "kv": {
+   "delta-rs": 50,
+   "polars": 50,
+   "duckdb": 50
+  },
+  "totals": {
+   "delta-rs": 100,
+   "polars": 100,
+   "duckdb": 100
+  },
+  "dims": {
+   "delta-rs": 100,
+   "polars": 100,
+   "duckdb": 100
+  }
+ },
+ "match": true
+}
+{"external_freshness_ms": {"tier_secs": 2.0, "ack_p50": 676, "new_delta_version_p50": 5415, "visible_to_delta_rs_p50": 10741, "max": 11425, "samples": 7, "one_delta_rs_read_p50": null}}

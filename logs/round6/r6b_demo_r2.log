@@ -1,0 +1,51 @@
+lake: s3://pondbucket/pondra-demo
+rows per table (Pondra SQL): {'events': 200001, 'customers': 20, 'spend_by_user': 100, 'big_orders': 1800, 'regions': 100}
+rows per table (delta-rs / Polars / DuckDB): {'events': {'delta-rs': 200000, 'polars': 200000, 'duckdb': 200000}, 'customers': {'delta-rs': 20, 'polars': 20, 'duckdb': 20}, 'spend_by_user': {'delta-rs': 100, 'polars': 100, 'duckdb': 100}, 'big_orders': {'delta-rs': 1800, 'polars': 1800, 'duckdb': 1800}, 'regions': {'delta-rs': 100, 'polars': 100, 'duckdb': 100}} 
+
+catalog/
+  compacted/
+    01M31CQNK07JJ9AZ777SC4E2KC.sst  (1,213 B)
+    01M31CQWYXGY3RRTCCG9Y524PG.sst  (11,011 B)
+    01M31CR3DKJ1M10E7BXQRNS0WJ.sst  (1,327 B)
+    … 1 more
+  compactions/
+    00000000000000000001.compactions  (26 B)
+    00000000000000000002.compactions  (42 B)
+    00000000000000000003.compactions  (42 B)
+    … 1 more
+  manifest/
+    00000000000000000001.manifest  (130 B)
+    00000000000000000002.manifest  (138 B)
+    00000000000000000003.manifest  (146 B)
+    … 4 more
+  wal/
+    00000000000000000001.sst  (0 B)
+    00000000000000000002.sst  (323 B)
+    00000000000000000003.sst  (341 B)
+    … 20 more
+cluster/
+  term/
+    00000000000000000001  (32 B)
+data/
+  big_orders/
+    1a5545ac-bcd5-4359-838d-7c0fc82363b7.parquet  (912 B)
+    _delta_log/
+      00000000000000000000.json  (596 B)
+  customers/
+    a547e32f-a1ce-4c2d-9bc0-250a210f4a71.parquet  (1,266 B)
+    _delta_log/
+      00000000000000000000.json  (668 B)
+  events/
+    a590bfab-6ee0-41eb-b622-0900f449ef4a.parquet  (23,464 B)
+    _delta_log/
+      00000000000000000000.json  (594 B)
+  regions/
+    0432c539-5eb6-4773-bfa2-cbf7f6fd50b4.parquet  (1,047 B)
+    _delta_log/
+      00000000000000000000.json  (594 B)
+  spend_by_user/
+    7432b48f-a5b8-4f3e-940c-232394fb19d8.parquet  (1,830 B)
+    _delta_log/
+      00000000000000000000.json  (673 B)
+log/
+  001789974535570-7a440606-112c-4e2e-ba8a-044676afac8d.seg  (550,096 B)

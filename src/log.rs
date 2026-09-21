@@ -203,7 +203,7 @@ impl Sequencer {
     pub async fn start(lake: Arc<Lake>, max_backlog: Option<u64>) -> Result<Arc<Sequencer>> {
         let mut next: u64 = lake.cat.get("n").await?.unwrap_or(1);
         for (key, meta) in lake.cat.scan::<TableMeta>("t/", "t0").await? {
-            let rows = crate::tier::backlog(&lake, meta.tiered).await?.get(&key[2..]).copied().unwrap_or(0);
+            let rows = crate::tier::backlog(&lake, meta.tiered, None).await?.get(&key[2..]).copied().unwrap_or(0);
             lake.backlog.fetch_add(rows, Ordering::Relaxed);
         }
         let (tx, mut rx) = mpsc::channel::<(Flush, oneshot::Sender<Outcome>)>(10_000);

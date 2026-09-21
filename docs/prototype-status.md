@@ -1,6 +1,6 @@
 # Prototype status: Pondra, a streamhouse in one binary
 
-**Date:** 2026-09-21 (round 5) · **Plan:** ADR-002 / 003 / 004 / 005 · **Code:** `pondra-prototype.tar.gz` (≈2,650 lines of Rust, plus test and benchmark tools)
+**Date:** 2026-09-21 (round 6) · **Plan:** ADR-002 to ADR-007 · **Code:** `pondra.zip` / `pondra.bundle` (≈3,150 lines of Rust, plus test and benchmark tools)
 **Name:** the prototype formerly called `lh` is now **Pondra**. The name is free on crates.io, PyPI and npm. A small personal-finance app uses it (pondra.app), a different category; run a trademark search before a public launch.
 
 ## Where it stands
@@ -14,6 +14,20 @@ One Rust binary replaces the Kafka + Flink + Spark + metastore + ZooKeeper stack
 - upsert and merge tables.
 
 Start more copies on the same bucket to scale out. The only state is object storage. There's no JVM, no database server and no coordination service.
+
+**Round 6 opened the lake to other engines and made first reads on object storage fast:**
+
+1. **Every table is also a Delta Lake table.** Spark, Databricks, DuckDB, Polars, delta-rs,
+   Trino and Athena read `<lake>/data/<table>` without Pondra. Three independent readers were
+   checked row for row.
+   - **Local disk:** a Delta version with a new row exists **17 ms** after the ack, and delta-rs
+     reads it at **30 ms** (p50).
+   - **Real R2** (from this sandbox): 4.8 s — three object-store round trips of 0.6–1.4 s each.
+   - **Fluss, for comparison:** its lake lags 3 minutes by default.
+2. **A new user's first query on R2 takes 20–30 ms** on a serving node (it was 3.0 s), and
+   **≈0.95 s on a node that just joined** with an empty disk. Each node keeps recent objects on a
+   local SSD tier and the whole catalog in memory.
+3. **The local folder and the bucket use exactly the same layout** (`docs/lake-format.md`).
 
 **Round 4 removed the two limits round 3 left, and round 5 made it a serving engine too:**
 
@@ -110,7 +124,77 @@ testing. There is now a `tiering` test (rounds of writes + `/tier`: the log must
 file count stay bounded) and a note in `AGENTS.md` that this failure mode shows up as throughput,
 not as a red test.
 
-## On real R2
+## Round 6: an open lake, and fast first reads on object storage
+
+The design is in ADR-007; the on-disk layout and how to read it without Pondra are in
+`docs/lake-format.md`.
+
+| Change | Effect |
+|---|---|
+| **Delta Lake publishing:** each tiering round writes each table's `_delta_log/` (JSON commit, checkpoint every 10 versions, last 1,000 versions kept), derived from committed catalog state, put-if-absent | Any Delta reader sees the lake. Checked against delta-rs 1.6.4, Polars 1.44.2 and DuckDB 1.5.5 on local disk, simulated R2 and real R2, across 1,250 versions with checkpoints and log cleanup |
+| **Tiering starts when rows commit** (at most every `--tier-secs`, default 2, fractions allowed), commits fresh rows before merges and compactions, and does up to 4 tables at once | New row → Delta version: **17 ms** on local disk (was 10 s + a round) |
+| **SSD tier per node** (`--cache-dir`, `--cache-gb 20`): write-through, read-through, prefetched from the commit stream, warmed at start | Queries on R2 read local disk, not the bucket |
+| **Followers and serving nodes hold the whole catalog in memory**, kept current by the commit stream | No catalog reads from the bucket on the query path |
+| **The leader keeps the catalog's SST files on local disk** (SlateDB's disk cache) | Tiering rounds don't wait on catalog reads |
+| **Catalog flushes only every 5 s, and only when something changed** (and once on takeover) | A tiering round went from 9 s back to milliseconds; the 1,250-round Delta test from 15+ min to 2.5 min |
+
+A new user, measured with `tools/newuser_bench.py` (3 nodes: leader, follower, read-only node; 1 M
+rows; the client has never queried before):
+
+| | Real R2, round 5 | Real R2, round 6 | Simulated R2 | Local disk |
+|---|---|---|---|---|
+| First query on the read-only node (count+sum / top 10 / one user) | 2,999 ms | **20 / 30 / 22 ms** | 20 / 25 / 19 ms | 17 / 24 / 17 ms |
+| Same queries, steady (p50) | ~495 ms | **17 / 31 / 22 ms** | 13 / 23 / 18 ms | 12 / 23 / 18 ms |
+| First queries on a node that just joined, empty SSD tier | — | **949 / 372 / 23 ms** | 452 / 387 / 21 ms | 20 / 26 / 20 ms |
+| Write on node B → visible on node C | 1,999 ms | **660 ms** (≈ one PUT) | 262 ms | 7 ms |
+
+On R2, a node that just joined pays for its first reads from the bucket: one GET takes ~0.4 s from
+this sandbox. They are still under a second, and 20–35 ms once its SSD tier has warmed up (5 s
+later).
+
+Open lake freshness, measured with `tools/delta_check.py`. A probe row is written after a quiet
+spell; the table shows how long until a Delta version containing it exists, and until delta-rs,
+reading on its own, returns it:
+
+| | Local disk | Simulated R2 | Real R2 (from this sandbox) |
+|---|---|---|---|
+| Write acknowledged | 7 ms | 256 ms | 663 ms |
+| Delta version with the row exists | **17 ms** | 1.6 s | 4.8 s |
+| delta-rs returns the row | **31 ms** | 3.7 s | 10.5 s (one delta-rs load takes ~4.7 s from here) |
+| Fluss's lake, for comparison | — | — | 3 min by default |
+
+Under a steady stream of writes, add up to `--tier-secs` (2 s by default): tiering starts as
+soon as rows commit, but at most that often.
+
+### What the tests caught this round
+
+- **Lost and torn reads from the in-memory catalog (fixed).** When a node's own catalog view got
+  ahead of its commit stream, the commits in between were marked "seen" and skipped. But the
+  in-memory copy never reads the view, so reads missed batches. Tiering jobs that ran on such a
+  node then wrote files without those rows, and the leader committed them.
+  - `cluster.py users` failed 4 runs in 5; every run since has passed: 20+ local runs, plus
+    simulated and real R2.
+  - Every tiering job now also checks the leader's row count for its log range, so a node that
+    sees less refuses the job instead of writing a short file.
+- **A 9-second stall per tiering round (fixed).** Flushing the catalog's memtable on every
+  tiering call piled up level-0 files faster than SlateDB compacted them, and writes waited on
+  the limit.
+- **A follower that came back after a leader change read a stale catalog (fixed).** Its view
+  lacked commits the old leader hadn't flushed; a new leader now flushes what it inherited.
+- **A restarted node never came up on simulated R2 (fixed).** Loading the in-memory catalog
+  retried until the catalog stood still, which a busy lake on slow storage never does. It now
+  loads in the background, one try at a time.
+- **SSD tier:** a panic on a one-character catalog key (it killed all nodes in the first R2
+  run), and temporary file names two writers could share.
+
+## On real R2 (round 5 table; round 6's R2 numbers are in the round 6 section)
+
+Round 6 re-ran the core tests on R2, and all passed:
+
+- 64 writers + 16 readers: 91.8k events, 0 inconsistent, snapshot query p50 21 ms (was 12 ms).
+- Failover: 26.0 / 22.3 s, exact.
+- Crash: 18k events with 8 kill -9s and 41 injected crashes, exact.
+- Latency: 0.7–1.2 s p50, depending on the hour.
 
 Same tests, against a Cloudflare R2 bucket, from this sandbox. **A bare 64 KB PUT from here takes
 810 ms p50 (1,048 ms p90) and a GET 379 ms** — that round trip dominates every number below, and
@@ -216,7 +300,11 @@ peak at 279–586 MB.
 - Distributed queries have one stage: no shuffles, so big-to-big joins run on one node.
 - Under sustained overload, commits pause until tiering catches up (`--backlog`); a client with a
   short timeout will see it as a slow ack.
-- No auth, quotas or multi-tenancy, and no DuckLake / Iceberg publishing yet.
+- No auth, quotas or multi-tenancy.
+- Other engines read Delta only (no Iceberg metadata yet), unpartitioned, and keyed tables only
+  as of their last compaction (at most 8 tiering rounds behind). Delta time travel reaches back
+  only as far as `--retain-secs` keeps replaced files.
+- On object storage, what other engines see trails the ack by three storage round trips.
 
 ## Next
 
@@ -226,4 +314,5 @@ peak at 279–586 MB.
 4. **S3 Express One Zone measurements** — the one storage choice that removes the latency gap to
    Fluss and Databricks RT without giving up "object storage is the only state".
 5. **Auth and quotas** per producer and per user.
-6. **DuckLake / Iceberg publishing** so Spark, Trino and DuckDB can read the same tables (ADR-001).
+6. **Iceberg metadata** next to the Delta log (same files), and partitioned tables, so engines
+   that prefer Iceberg — and big tables — are served as well as Delta readers are now.
