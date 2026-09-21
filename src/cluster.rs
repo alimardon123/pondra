@@ -223,10 +223,15 @@ pub fn mirror(lake: Arc<Lake>, leader: String, me: String, replica: Option<Arc<R
     });
 }
 
-/// One HTTP client (connection pool) for all node-to-node traffic.
+/// One HTTP client (connection pool) for all node-to-node traffic. It carries this process's
+/// token: a node's is the admin token, a `pondra sql` writer's is `PONDRA_TOKEN`.
 pub fn http() -> &'static reqwest::Client {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-    CLIENT.get_or_init(reqwest::Client::new)
+    CLIENT.get_or_init(|| {
+        let token = std::env::var("PONDRA_TOKEN").or_else(|_| std::env::var("PONDRA_ADMIN_TOKEN")).ok();
+        let headers = token.iter().filter_map(|t| format!("Bearer {t}").parse().ok()).map(|v| (reqwest::header::AUTHORIZATION, v)).collect();
+        reqwest::Client::builder().default_headers(headers).build().expect("an HTTP client")
+    })
 }
 
 /// The newest term, if any.

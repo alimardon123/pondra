@@ -98,7 +98,7 @@ async fn plan(lake: &Lake, s: &Slice) -> Result<(SessionContext, Arc<dyn Executi
     let (after, upto) = s.tail.unwrap_or((0, 0)); // (0, 0): no tail
     let part = TableMeta { files: s.files.clone(), tiered: after, ..meta };
     ctx.register_table(s.table.as_str(), raw(lake, &ctx, &s.table, &part, Some(upto)).await?.into_view())?;
-    let plan = ctx.sql(&s.sql).await?.create_physical_plan().await?;
+    let plan = ctx.sql_with_options(&s.sql, crate::query::read_only()).await?.create_physical_plan().await?;
     Ok((ctx, plan))
 }
 

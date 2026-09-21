@@ -1,0 +1,5 @@
+dist binary (cargo build --profile dist: thin LTO, 1 codegen unit, stripped)
+raw   90,709,088 bytes (90.7 MB; round 8: 90.0 MB)
+gzip -9  30,540,845 bytes (30.5 MB)
+xz -9    17,224,096 bytes (17.2 MB)
+idle RSS after start: 44 MB

@@ -1,12 +1,13 @@
-# Pondra vs Spark, Flink, Fluss and Databricks Lakehouse//RT (round 8)
+# Pondra vs Spark, Flink, Fluss and Databricks Lakehouse//RT (round 9)
 
-**Date:** 2026-09-21 · **Machine:** one 2-vCPU, 7 GB sandbox VM, local disk (plus a real Cloudflare R2 bucket where marked); every engine ran alone
+**Date:** 2026-09-22 · **Machine:** one 2-vCPU, 7 GB sandbox VM, local disk (plus a real Cloudflare R2 bucket where marked); every engine ran alone
 **Versions:**
 - Pondra (this prototype: Rust, Apache DataFusion 55)
 - Spark 4.2.0 (PySpark, `local[*]`)
 - Flink 2.3.0 (PyFlink, local MiniCluster, parallelism 2)
 - DuckDB 1.5.5 (as a reference)
-- Fluss 0.9 and Lakehouse//RT are compared from their published numbers; neither can run here.
+- Fluss (1.0, released 2026-09-21) and Lakehouse//RT are compared from their published numbers and
+  docs; neither can run here.
 
 **Reproduce:**
 - `tools/bench/tpch.py` (TPC-H)
@@ -16,6 +17,7 @@
 - `tools/freshness.py` (freshness, head to head), `tools/open_check.py` (outside readers)
 
 **Where the numbers come from:**
+- Clients, protocols, MCP, vectors and the roadmaps: round 9.
 - Freshness, write latency and open formats: round 8.
 - Spark's TPC-H and the serving numbers: round 7.
 - Spark's and Flink's batch and streaming numbers: round 3, same machine and scripts.
@@ -46,7 +48,8 @@ All of that comes from one 90 MB binary, with no JVM, ZooKeeper, Kafka or separa
 - **Streaming features:** Flink has event time, watermarks, timers and very large state; Pondra
   has none of these yet.
 - **APIs and ecosystem:** Spark has DataFrame APIs in four languages and hundreds of connectors.
-  Pondra has SQL over HTTP.
+  Pondra has SQL (reads and writes) over HTTP, the Postgres protocol and MCP, and a Python client;
+  no Kafka protocol and few connectors yet.
 - **Maturity:** Pondra is a prototype.
 
 **So the realistic claim:** Pondra can beat them for the common case — small to mid-size
@@ -70,11 +73,12 @@ biggest open risk is scale-out, and only a multi-machine benchmark can retire it
 | Serving: new analytical queries on big data | 35–600 ms (single node) | | | — | ✓ sub-100 ms (claimed) |
 | Scale-out to 100s of machines | unproven; no shuffles | ✓ | ✓ | ✓ | ✓ |
 | Streaming semantics (event time, windows, CEP, huge state) | decomposable aggregates + SQL tasks | good | ✓ | storage only | — |
-| APIs & usability | SQL over HTTP, JSON/Arrow out, one command | ✓ SQL + DataFrames (Python/Scala/Java/R), notebooks | SQL + DataStream API | clients (Java, Rust, Python) | ✓ Databricks SQL |
+| APIs & usability | SQL reads and writes over HTTP and the Postgres protocol; Python client (pandas, Polars, Arrow) | ✓ SQL + DataFrames (Python/Scala/Java/R), notebooks | SQL + DataStream API | clients (Java, Rust, Python, C++); REST gateway; Postgres protocol planned | ✓ Databricks SQL |
+| AI agents and vectors | ✓ MCP server built in; exact vector search in SQL (`cosine_distance`) | AI functions on Databricks only | `ML_PREDICT`, `VECTOR_SEARCH`; Flink Agents (0.2) | MCP and vector columns planned | ✓ Agent Bricks, Genie |
 | Connectors & ecosystem | HTTP in; Delta + Iceberg out | ✓ huge | ✓ huge | Flink/Spark connectors | ✓ Databricks |
-| Operations & footprint | ✓ 1 binary, 39 MB idle, 0.02 s start | JVM cluster | JVM cluster + checkpoints | JVM + ZooKeeper + Flink tiering job | managed |
-| Governance & security | none yet | via platforms | via platforms | TLS/Kerberos (1.0) | ✓ Unity Catalog |
-| Maturity | prototype | ✓ | ✓ | incubating | beta |
+| Operations & footprint | ✓ 1 binary, 44 MB idle, 0.02 s start | JVM cluster | JVM cluster + checkpoints | JVM + ZooKeeper + Flink tiering job | managed |
+| Governance & security | read / write / admin tokens (HTTP, Postgres, MCP); no TLS or per-table grants yet | via platforms | via platforms | SASL users (1.0); TLS planned | ✓ Unity Catalog |
+| Maturity | prototype | ✓ | ✓ | 1.0, a top-level Apache project | beta |
 
 ## Processing power
 
@@ -203,34 +207,171 @@ Where each side stands:
 - **To close that:** more read-only nodes (each has its own caches), shuffles, and partitioned
   tables — all in the plan below.
 
+## Fluss 1.0, item by item
+
+Fluss released 1.0 on 2026-09-21, a month after becoming a top-level Apache project. What it
+added, next to where Pondra stands after round 9:
+
+| Fluss 1.0 | Pondra (round 9) |
+|---|---|
+| REST gateway in Rust (metadata, tables, batch writes) | HTTP API from the start (`/sql`, `/append`, `/lookup`, `/watch`) |
+| Postgres protocol, gRPC and MCP for the gateway: on its roadmap | **Postgres protocol and MCP: built** (tested with psql, psycopg 2 and 3, asyncpg, SQLAlchemy; MCP with the official SDK) |
+| Python, C++ and Rust clients on one Rust core | a Python client (pure Python over HTTP and Arrow), and any Postgres driver; no C++ client |
+| Row-level TTL for primary-key tables; log TTL | TTL on keyed tables; `--changelog-secs` for how long the log is kept |
+| Aggregation merge engine | merge tables (`merge = 'total:sum'`), since round 4 |
+| Batch `$changelog` / `$binlog` reads | `/watch?after=` replays every change, deletes included; MCP `changes` |
+| UPDATE / DELETE without the full primary key (for GDPR erasure) | UPDATE / DELETE with any WHERE |
+| Predicate pushdown via column statistics; server-side primary-key scans | DataFusion prunes Parquet by statistics; `cluster_by` sorts files for it |
+| Bucket rescaling | no buckets to rescale: every node writes, one sequencer orders commits (ADR-005) |
+| Coordinator HA, multiple disks, a health API, a Helm chart | leader election on the bucket (failover 4.5–5.3 s locally); `/stats` for health; no Helm chart yet |
+| Hudi tiering, next to Iceberg, Paimon and Lance | Delta and Iceberg publishing, per table |
+| Spark union read; time-range incremental reads | outside engines read the published Delta/Iceberg tables (3–10 s behind on R2); Pondra's own readers see the log |
+| SASL/PLAIN user management | read / write / admin tokens; no per-user accounts yet |
+
+## What they're building next, and Pondra's answer
+
+Collected on 2026-09-22 from each project's roadmap, release notes and summit announcements
+(sources at the end). Status labels for the newest Databricks and Snowflake items come partly
+from third-party summit recaps; check them before relying on them.
+
+**Fluss** (the roadmap page after 1.0; no dates):
+
+- **Zero Disks** (writes straight to S3, diskless servers) and **ZooKeeper removal.**
+  - This moves Fluss toward the design Pondra started with: object storage only, disposable
+    nodes, leader election by conditional writes on the bucket.
+  - Pondra already acks in 2–4 ms on R2 through replicated acks, without S3 Express.
+- **Postgres protocol, gRPC and MCP on the gateway.** Pondra has the Postgres protocol and MCP
+  as of this round.
+- **A real-time feature store** (point-in-time correctness), **multimodal data** (vectors, variant,
+  images), and a Python SDK for PyTorch, Ray and pandas.
+  - Pondra has vector columns with exact nearest-neighbour search in SQL.
+  - Point-in-time joins and a variant type are in the plan below.
+- **A global secondary index** for non-key lookups. Pondra: `cluster_by` and Parquet pruning; no
+  index.
+- **Lake integration:** Iceberg v3; Delta; an "in-place lakehouse" (Fluss tables defined over
+  existing lake tables); deletion vectors.
+  - Pondra publishes Delta and Iceberg.
+  - Reading existing lake tables in place, and deletion vectors, are in the plan.
+- **Union read in Trino and StarRocks.** Pondra doesn't need a connector for this: both engines
+  already read the Delta/Iceberg tables Pondra publishes.
+- **Also:** full schema evolution, a cost-based optimizer fed by table statistics, (m)TLS.
+
+**Flink** (2.0 in March 2025 through 2.3 in June 2026; its roadmap page hasn't been updated since
+2023):
+
+- **Disaggregated state** (ForSt, 2.0): state on object storage. Flink is converging on
+  Pondra's model too.
+- **Materialized tables** with a declared freshness. Pondra's views are the same idea, kept
+  current on every commit rather than on a freshness schedule.
+- **AI in SQL:**
+  - model DDL and `ML_PREDICT` (2.1);
+  - `VECTOR_SEARCH` (2.2);
+  - Flink Agents (0.2, with MCP support), a separate framework for event-driven agents.
+- **Joins with little state:** the delta join and multi-way join (2.1–2.2), built to read from
+  Fluss.
+- **SQL and types:** VARIANT (2.1), process table functions, `FROM_CHANGELOG` / `TO_CHANGELOG`
+  (2.3).
+- **The threat:** Flink plus Fluss is becoming a streamhouse stack of two mature projects —
+  log, keyed tables, lake and low-state joins. Pondra's answer is to be that stack in one
+  binary: faster to adopt and cheaper to run.
+
+**Spark** (4.0, 4.1, and 4.2 in 2026):
+
+- **Real-Time Mode** for Structured Streaming: millisecond latency without a second engine.
+  - Generally available in 4.1, for stateless Scala queries first.
+  - Pondra's millisecond path is exactly-once and stateful (views, merge tables), not stateless.
+- **Declarative pipelines** (from Databricks' Delta Live Tables). Pondra's views and tasks are
+  declared in SQL too, and run incrementally.
+- **Types and SQL:** VARIANT with shredding, SQL scripting, pipe syntax.
+- **Clients and UDFs:** Spark Connect clients (Python, Go, Swift) and a JDBC driver;
+  Arrow-native Python UDFs; the Python data source API.
+
+**Databricks** (Data + AI Summit 2025 and 2026):
+
+- **Lakebase**, a serverless Postgres (from the Neon acquisition), and **LTAP**, transactions and
+  analytics on one store (announced).
+  - Pondra answers from the other side: the Postgres protocol straight onto the lake, with
+    millisecond upserts. No separate OLTP database to sync.
+- **Lakehouse//RT** (10 ms SQL on Delta/Iceberg, beta). Compared in its own section above.
+- **Zerobus**, direct ingestion, reported as Kafka-compatible in 2026. Kafka-protocol ingest is
+  the top item in Pondra's plan.
+- **Unity Catalog:** an Iceberg REST catalog, attribute-based access control (ABAC), metrics.
+- **Also:** Agent Bricks, Genie, Databricks Apps, and an expanded Free Edition.
+
+**Snowflake** (Summit 2025 and 2026):
+
+- **Snowflake Postgres** (from Crunchy Data), generally available in February 2026.
+- **Openflow** for ingestion; **Snowpipe Streaming's high-performance architecture**, generally
+  available on all three clouds.
+- **Cortex AISQL** (`AI_COMPLETE`, `AI_FILTER`, `AI_AGG` in SQL).
+- **Iceberg v3** and a managed Iceberg catalog; **dynamic tables.**
+
+**Where they are all heading, and where Pondra stands:**
+
+| Direction | Who | Pondra |
+|---|---|---|
+| Postgres everywhere | Lakebase, Snowflake Postgres, Fluss gateway (planned) | ✓ the Postgres protocol over the lake (round 9) |
+| Agents: MCP, AI functions in SQL | Fluss (planned), Flink Agents, Databricks, Cortex AISQL | ✓ MCP (round 9); AI functions in SQL: plan |
+| Vectors and multimodal data | Flink `VECTOR_SEARCH`, Fluss (planned), Lakebase search | ✓ exact k-NN in SQL (round 9); an ANN index: plan |
+| State and storage on object storage, no local disks | Flink ForSt, Fluss Zero Disks | ✓ the design since round 1 |
+| Millisecond streaming inside the main engine | Spark Real-Time Mode, Lakehouse//RT | ✓ 5 ms change → another node, exactly-once |
+| Declarative, incremental pipelines | Spark declarative pipelines, Flink materialized tables, dynamic tables | ✓ views and tasks in SQL |
+| Kafka-compatible ingestion | Zerobus (reported), Fluss log agents | plan: first in line |
+| Open catalogs (the Iceberg REST catalog API) | Unity Catalog, Polaris, Snowflake | plan |
+| A VARIANT type | Spark, Flink, Delta, Iceberg v3 | plan (when DataFusion has it) |
+| Access control | Unity Catalog ABAC, Fluss SASL + TLS | tokens (round 9); grants and TLS: plan |
+
 ## Footprint and operations
 
 | | Pondra | Spark 4.2 | Flink 2.3 | Fluss |
 |---|---|---|---|---|
-| What you install | one binary, 90.0 MB (30.5 MB gzip, 18.7 MB xz) | 485 MB PySpark + a JVM | 353 MB PyFlink + a JVM | CoordinatorServer + TabletServers + ZooKeeper + a Flink tiering job, JVM |
+| What you install | one binary, 90.7 MB (30.5 MB gzip, 17.2 MB xz) | 485 MB PySpark + a JVM | 353 MB PyFlink + a JVM | CoordinatorServer + TabletServers + ZooKeeper + a Flink tiering job, JVM |
 | Start to first query | **0.02–0.07 s** | 4.1 s | 5.2–5.4 s | — |
-| Idle memory | **39 MB** | — | — | — |
+| Idle memory | **44 MB** | — | — | — |
 | Peak memory in these runs | **293–609 MB** (1.3 GB at 2.7 M events/s sustained) | 0.7–1.5 GB | 1.2–3.1 GB | — |
 | State | object storage only; nodes are disposable (SSD tier = a cache) | + Kafka/Fluss + checkpoints | + Kafka/Fluss + checkpoints | TabletServer disks (replicated) + object storage |
 
 ## Where the JVM engines still win, and the plan
 
+In rough order: what closes the most ground per unit of work comes first.
+
 | Gap | Why it matters | Plan | What proves it |
 |---|---|---|---|
-| **Scale-out beyond one stage** (no shuffles; big-to-big joins on one node) | Spark's core strength; TPC-H at SF100+ needs it | Shuffle through the job-dealing mechanism tiering already uses: hash-partitioned exchange between nodes, spill to local SSD | TPC-H SF100 on 3–10 real machines vs Spark, same hardware |
+| **Kafka-protocol ingest** | Every competitor has a Kafka path in (Zerobus, Fluss log agents, Flink's Kafka source); it's how most event data travels | A produce/fetch subset of the Kafka protocol on each node, mapped onto `/append`'s exactly-once producers | Kafka clients and Debezium write to Pondra unchanged |
 | **Multi-machine evidence** | Everything above is one box | Run the suite and benchmarks on 3–20 cloud VMs against S3/R2 | Near-linear ingest and query scaling, failover times |
-| **Streaming semantics** (event time, watermarks, windows, timers, CEP) | Flink's core strength | Tumbling/sliding/session windows with watermarks in views and tasks, on the same exactly-once commit path | Nexmark queries vs Flink |
-| ~~Durable ack in ms on object storage~~ | Fluss's edge | **Done in round 8:** `--ack replicated`, 2–4 ms on R2, recovery tested by failovers. Next: `fsync` option, 3-replica tests on real machines | ✓ ack p50 2 ms on R2 |
-| **Open-format lag** on object storage | Other engines see a table 3–10 s after the ack on R2 (a few sequential round trips) | Hung idle connections fixed (round 8); next: overlap publishing with the next fold, fewer sequential writes for Iceberg, a lower default `--tier-secs` when the bucket is close | p99 < 3 s on a nearby bucket |
-| **APIs** | Usability for data teams | Arrow Flight SQL / Postgres wire (BI tools, JDBC), a Python client with DataFrame-style calls, Python UDFs | Tableau / Power BI / psql connect; notebook demo |
-| **Connectors** | Getting data in and out | Kafka-protocol ingest endpoint, CDC from Postgres/MySQL (Iceberg and Delta output: done in round 8) | Debezium → Pondra → Spark reading Iceberg |
+| **Scale-out beyond one stage** (no shuffles; big-to-big joins on one node) | Spark's core strength; TPC-H at SF100+ needs it | Shuffle through the job-dealing mechanism tiering already uses: hash-partitioned exchange between nodes, spill to local SSD | TPC-H SF100 on 3–10 real machines vs Spark, same hardware |
+| **Streaming semantics** | Flink's core strength | Round 9: event-time tumbling windows (a GROUP BY `date_bin` view), updated incrementally, late rows included, TTL. Next: watermarks that close a window and emit it once, session windows, point-in-time (temporal) joins | Nexmark queries vs Flink |
+| **Open catalogs** | Engines find tables through the Iceberg REST catalog (Unity, Polaris, Snowflake) | Serve the Iceberg REST catalog API from each node, over the Iceberg tables Pondra already publishes | Spark, Trino and DuckDB attach by URL, no paths |
+| **Schema evolution** | Tables change; Fluss 1.0 lists it as a gap too | `ALTER TABLE … ADD COLUMN` (new files and log segments get the column; old ones read it as null), then renames and defaults | Add a column under load; old and new rows read right |
+| **AI in SQL** | Flink `ML_PREDICT`, Snowflake Cortex AISQL, Databricks AI functions | `ai_complete()` / `embed()` against any OpenAI-compatible endpoint, batched per Arrow batch; an ANN index for vector columns | A RAG demo: embed on insert, nearest neighbours in SQL, answered through MCP |
+| **Governance** | Enterprise requirement | Round 9: read / write / admin tokens on HTTP, Postgres and MCP. Next: TLS, per-table grants, an audit log (the change feed of a system table), quotas | Multi-tenant test |
+| **APIs** | Usability for data teams | Round 9: Postgres protocol, Python client, MCP. Next: JDBC / BI tools verified (DBeaver, Tableau, Power BI), Arrow Flight SQL, Python UDFs over Arrow | Tableau / Power BI connect; notebook demo |
+| **Open-format lag** on object storage | Other engines see a table 3–10 s after the ack on R2 (a few sequential round trips) | Next: overlap publishing with the next fold, fewer sequential writes for Iceberg, a lower default `--tier-secs` when the bucket is close | p99 < 3 s on a nearby bucket |
 | **Table layout** (Delta liquid clustering, Iceberg sort orders, partitions) | Big tables with selective filters | `cluster_by` (round 8: 6–11x on selective filters) → partitions → clustering across files → deletion vectors | TPC-H SF100 with partition + clustering pruning |
 | **Heavy new analytical queries at high concurrency** | Lakehouse//RT's edge | Prepared-plan cache, partitioned tables (pruning), per-node caches on many read-only nodes | TPC-H SF10 at 1k+ QPS mixed, p99 < 100 ms on N nodes |
-| **Governance** | Enterprise requirement | Auth (tokens, per-table grants), audit log, quotas | Multi-tenant test |
+| **Types** | VARIANT (Spark, Flink, Delta, Iceberg v3) for semi-structured data | Adopt DataFusion's variant support when it lands; meanwhile JSON functions over string columns (the `datafusion-functions-json` crate) | Semi-structured events queried without a schema up front |
+| ~~Durable ack in ms on object storage~~ | Fluss's edge | **Done in rounds 8–9:** `--ack replicated`, 2–4 ms on R2; `--fsync`; 3 replicas tested | ✓ ack p50 2 ms on R2 |
 | **Maturity** | Trust | Chaos tests on real clusters, fuzzing, long soak runs, versioned upgrades | Months of soak without data loss |
 
 Sources:
 
+- [Fluss roadmap](https://fluss.apache.org/roadmap/)
+- [Fluss 1.0 release](https://fluss.apache.org/blog/releases/1.0/)
+- [Flink 2.3.0 release](https://flink.apache.org/2026/06/25/apache-flink-2.3.0-release-announcement/)
+- [Flink 2.2.0 release](https://flink.apache.org/2025/12/04/apache-flink-2.2.0-advancing-real-time-data--ai-and-empowering-stream-processing-for-the-ai-era/)
+- [Flink 2.1.0 release](https://flink.apache.org/2025/07/31/apache-flink-2.1.0-ushers-in-a-new-era-of-unified-real-time-data--ai-with-comprehensive-upgrades/)
+- [Flink Agents 0.2.0](https://flink.apache.org/2026/02/06/apache-flink-agents-0.2.0-release-announcement/)
+- [Flink community update, April 2026](https://flink.apache.org/2026/04/13/flink-community-update-for-april-2026/)
+- [Spark 4.1.0 release notes](https://spark.apache.org/releases/spark-release-4.1.0.html)
+- [Databricks: introducing Apache Spark 4.1](https://www.databricks.com/blog/introducing-apache-sparkr-41)
+- [Spark 4.2.0 preview 2](https://spark.apache.org/news/spark-4-2-0-preview2-released.html)
+- [Databricks: what's new in Unity Catalog (Summit 2026)](https://www.databricks.com/blog/whats-new-unity-catalog-data-ai-summit-2026)
+- [Flexera: Databricks Data + AI Summit 2026 recap](https://www.flexera.com/blog/perspectives/databricks-data-ai-summit-2026/) (third-party)
+- [Delta Lake 4.0](https://delta.io/blog/2025-09-25-delta-lake-40/)
+- [Snowflake Postgres GA (2026-02-24)](https://docs.snowflake.com/en/release-notes/2026/other/2026-02-24-snowflake-postgres-ga)
+- [Snowflake Cortex AISQL operators GA](https://docs.snowflake.com/en/release-notes/2025/other/2025-11-04-cortex-aisql-operators-ga)
+- [Snowpipe Streaming high-performance architecture](https://docs.snowflake.com/en/release-notes/2025/other/2025-09-23-snowpipe-streaming-high-performance-architecture)
+- [SELECT: Snowflake Summit 2026, what shipped](https://select.dev/posts/snowflake-summit-2026-what-actually-shipped-and-what-it-means) (third-party)
 - [Databricks: Introducing Lakehouse//RT](https://www.databricks.com/blog/introducing-lakehousert-real-time-performance-unified-lakehouse)
 - [Databricks press release (June 2026)](https://www.databricks.com/company/newsroom/press-releases/databricks-launches-lakehousert-bring-real-time-analytics-directly)
 - [StarTree: Lakehouse//RT vs StarTree](https://startree.ai/resources/databricks-lakehouse-rt-vs-startree/)

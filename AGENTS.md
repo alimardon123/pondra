@@ -1,7 +1,7 @@
 # AGENTS.md — working on Pondra
 
 Read this first, then `README.md` (what it does), `docs/adr-005-every-node-writes.md` (why it
-works this way) and `docs/adr-009-native-first.md` (the current round). `docs/prototype-status.md`
+works this way) and `docs/adr-010-anywhere.md` (the current round). `docs/prototype-status.md`
 has the measured numbers and what's left.
 
 ## What this is
@@ -18,14 +18,16 @@ The owner's design principles, which every change must respect:
 2. **As serverless as possible**: no always-on services besides the nodes themselves.
 3. **SPMD, not driver/executor** (Bodo-style): every node runs the same code on its slice.
 4. **No JVM, no Spark, no Flink, no Fluss needed.**
-5. **Short, simple, readable code** — without losing functionality. ~4,550 lines of Rust total.
+5. **Short, simple, readable code** — without losing functionality. ~5,800 lines of Rust total.
    If a change makes a file much longer, look for the simpler shape first.
 
 ## Layout
 
 ```
-src/      4,550 lines of Rust, one file per concern (see the table in README.md)
+src/      5,800 lines of Rust, one file per concern (see the table in README.md)
+python/   the Python client (pure Python, HTTP + Arrow)
 tools/    harness.py, cluster.py (tests), open_check.py (Delta + Iceberg readers == Pondra),
+          keyed_bench.py (compaction cost), clean_bucket.py (keep a bucket to its newest lakes),
           freshness.py (head-to-head freshness), clustering.py (what cluster_by buys),
           newuser_bench.py (first reads, new nodes), demo_lake.py (one of everything + the tree),
           serve_bench.py + loadgen.go (serving), bench/tpch.py (TPC-H vs DuckDB and Spark),
@@ -64,9 +66,14 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
   with `publish` get a Delta log (`data/{table}/_delta_log/`, `delta.rs`) and/or Iceberg metadata
   (`data/{table}/metadata/`, `iceberg.rs`) every tiering round, for engines that don't know
   Pondra.
-- **Serverless:** `pondra sql` reads the bucket with no node running. Its `INSERT … SELECT`
-  writes Parquet itself, then has the running leader record the files — or records them itself,
-  under its own term, when nobody leads (`insert.rs`).
+- **Writes from anywhere** (`write.rs`): `CREATE TABLE`, `INSERT`, `UPDATE`, `DELETE` in SQL on
+  any node, over Postgres (`pg.rs`) or from `pondra sql` on any machine. The work runs where the
+  statement runs; the leader records it — over HTTP, through the bucket inbox (`inbox.rs`) when
+  it can't be reached, or the statement leads for a moment itself when nobody does.
+- **Attached lakes** (`--attach name=dir`): other lakes read as `name.table`; writes to them are
+  recorded by their own leaders. Several clusters share one bucket this way.
+- **Tokens** (`auth.rs`): read / write / admin; none set = open. The same tokens guard HTTP,
+  Postgres and MCP (`mcp.rs`, `POST /mcp`: tools `list_tables`, `query`, `write`, `changes`).
 - **SSD tier** (lakes on object storage): each node keeps immutable objects on local disk —
   written through, read through, prefetched from the commit stream, warmed at start (`cache.rs`).
 - **Leader election** is a put-if-absent object `cluster/term/{n}`; SlateDB fencing stops an old
@@ -155,6 +162,20 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    members that lost a leader they were talking to use the 5 s lease.
    A one-off writer claims with an empty address, keeps its mark fresh while it works, and
    deletes it when done. Nodes and other writers wait for it; they never follow it.
+18. **The inbox is just another door to the leader.** Its requests carry the same exactly-once
+   keys as HTTP (a bulk INSERT's job id, a flush's `(producer, seq)`), and only a process that
+   leads answers them (`inbox::drain`, from the leader loop or a one-off writer that leads). A
+   writer that gives up waiting withdraws its request first; a late answer is then a duplicate.
+19. **Keyed compaction merges consecutive runs only** (`tier::run`). Files are versions in `ord`
+   order; merging around a file would let an older version overtake a newer one. A partial
+   merge (`Squash`) keeps delete markers and expired rows; only a full compaction (the run
+   reaches the oldest file) drops them.
+20. **A write to an attached lake is recorded by that lake's leader** (`write::deliver`), never
+   by ours: our catalog never lists another lake's files.
+21. **SQL from users never touches a node's disk.** Every query that arrives over HTTP, Postgres
+   or MCP runs with `query::read_only()` (no `COPY … TO`, no `CREATE EXTERNAL TABLE`, no session
+   DDL); writes go through `write.rs`. Local files (`enable_url_table`) are for `pondra sql` on
+   its user's own machine only (`prepare(…, files: true)`). `harness.py clients` checks both.
 
 ## Tests: run these before and after any change
 
@@ -168,6 +189,9 @@ python3 tools/cluster.py latency [--load 4]   # event -> view row on another nod
 python3 tools/harness.py serverless            # pondra sql INSERT with and without a leader, 4 at once, a retry
 python3 tools/open_check.py                    # Delta + Iceberg: 6 outside readers == Pondra
 python3 tools/freshness.py [--flag ack=replicated]  # head to head: nodes, pondra sql, Delta, Iceberg
+python3 tools/harness.py clients               # SQL writes, Python client, Postgres drivers, tokens, inbox, attach, vectors, MCP
+python3 tools/mcp_client.py --url http://127.0.0.1:8080/mcp   # the official MCP SDK (pip install mcp) against a node
+python3 tools/keyed_bench.py                   # keyed-table compaction: bytes written, correctness
 python3 tools/cluster.py race | isolate | split | spread
 python3 tools/bench/run.py batch 20000000     # ENGINES=pondra,spark,flink
 python3 tools/serve_bench.py --keys 2000000   # serving: point lookups and dashboard queries
@@ -179,6 +203,7 @@ Add `--s3` to any of them with a simulated-R2 bucket to see the object-storage b
 python3 tools/sim_r2.py --port 9000 &   # moto + R2-like latency (PUT p50 197 ms, GET p50 100 ms)
 export AWS_ENDPOINT=http://127.0.0.1:9000 AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test \
        AWS_REGION=auto AWS_ALLOW_HTTP=true PONDRA_BUCKET=testbucket
+python3 -c "import boto3; boto3.client('s3', endpoint_url='http://127.0.0.1:9000', region_name='us-east-1').create_bucket(Bucket='testbucket')"
 python3 tools/harness.py crash --runs 3 --batches 150 --s3
 python3 tools/cluster.py failover --s3 --flag ack=replicated   # recovery of acked-but-not-durable commits
 ```
@@ -199,65 +224,81 @@ Iceberg snapshot cleanup). Any change to replication or recovery: `users` and `f
 Practical notes for an agent working here:
 
 - Never rebuild the binary while a test suite is running (tests exec `argv[0]` when a node restarts).
+- Test runs delete their lakes when they exit (`harness.new_lake`; `--keep` or `PONDRA_KEEP=1`
+  keeps them). The owner's R2 free tier is 10 GB: after R2 runs, `tools/clean_bucket.py --bucket
+  … --newest 3` leaves only the newest three lakes.
 - Kill leftover nodes with `pgrep -x pondra` (never `pkill -f` or `pgrep -f <script name>`: it
   matches your own shell) and clean `/tmp/pondra-*/` afterwards, or the disk fills up. The SSD
   tier's default folder `/tmp/pondra-cache/` goes with it.
 - Node stderr goes to `/tmp/pondra-<port>-<id>.stderr`; that's where "restarting to rejoin",
   "slow tiering" and panics show up.
 
-## State of the work (2026-09-21, round 8)
+## State of the work (2026-09-22, round 9)
 
-Everything in `docs/prototype-status.md` passes on local disk, on simulated R2 and on a real
-Cloudflare R2 bucket. Two R2 buckets are used for tests: `ponderabucket-us` (Eastern North
-America, ~290 ms per PUT from the sandbox; the default now) and `pondbucket` (~670 ms). Test
-lakes live under `round8/`. Keep them; the owner wants test files kept.
+Everything in `docs/prototype-status.md` passes on local disk and on simulated R2. The round-9
+additions (inbox, SQL writes, Postgres, MCP, vectors, tokens) also ran against real R2.
+
+**R2 test buckets.** There are two:
+
+- `ponderabucket-us` (Eastern North America, ~290 ms per PUT from the sandbox; the default);
+- `pondbucket` (~670 ms per PUT).
+
+**The owner's R2 free tier is 10 GB.** Test runs delete their lakes; keep at most three lakes in
+all. After R2 runs: `tools/clean_bucket.py --bucket ponderabucket-us --bucket pondbucket --newest
+3 --dry-run`, then without `--dry-run`. The three kept now:
+
+- `ponderabucket-us/round8/test-180091d0` (open formats);
+- `ponderabucket-us/round8/test-a263452c` (replicated failover);
+- `pondbucket/pondra-demo`.
 
 Headline numbers, all on one 2-vCPU box:
 
-- **Writes on R2:** acked in 4 ms with `--ack replicated` (299 ms durable). 64 writers: 87k
-  events/s replicated vs 6.4k durable. Durable ingest locally: 4.3–5.1 M events/s through a
-  3-node cluster.
-- **Freshness, like for like:** nodes see a write 10–15 ms after the ack (local and R2). Delta
-  and Iceberg readers see it ~30 ms (local) / 3–4 s (near R2) / 7–10 s (far R2) after the ack.
-  A cold `pondra sql` process takes 34 ms (local) / 3–6 s (R2).
-- **TPC-H SF1:** all 22 queries in 5.9 s (Spark 4.2: 58–65 s).
-- **Serving:** 0.14 ms key lookups and 20–36k lookups/s; repeated dashboards at ~20k/s.
+- **Writes on R2:** acked in 4 ms with `--ack replicated` (299 ms durable); 87k events/s from 64
+  writers, replicated. Locally, `--fsync` and `--replicas 3` cost nothing measurable (4 ms p50).
+- **Writes from anywhere:** a `pondra sql` INSERT through the bucket inbox takes 1.0 s locally
+  and 7.3 s on real R2, including the 3–6 s it takes to open the catalog.
+- **Clients:** 18 checks pass: SQL writes, the Python client, four Postgres drivers, MCP,
+  vectors, tokens, attached lakes, the inbox.
+- **Freshness, like for like:** nodes see a write 10–15 ms after the ack (local and R2); Delta
+  and Iceberg readers ~30 ms (local) / 3–4 s (near R2) / 7–10 s (far R2).
+- **Keyed compaction:** 3x fewer bytes written than full rewrites (size-tiered).
+- **TPC-H SF1:** all 22 queries in 5.9 s (Spark 4.2: 58–65 s). **Serving:** 0.14 ms key lookups,
+  20–36k/s.
 - **Consistency:** 0 torn reads, 0 lost batches, clean failovers, in both ack modes.
 
-The honest comparison with Spark, Flink, Fluss and Lakehouse//RT, with the plan for the gaps,
-is `docs/comparison-spark-flink-fluss.md`.
+The comparison with Spark, Flink, Fluss and Lakehouse//RT — including Fluss 1.0 item by item,
+what each competitor is building next, and the plan for the gaps — is
+`docs/comparison-spark-flink-fluss.md`.
 
 Known limits, in the order they matter:
 
-1. **Replicated acks' window.** A write acked before the bucket has it survives while any one
-   holder does. It does not survive the leader and every holder dying together, and there is no
-   fsync. Recovery waits up to 20 s for unreachable members.
-2. **One sequencer per lake** orders commits (metadata only). Several lakes past that; there are
-   no cross-lake queries yet.
-3. **No shuffles** in distributed queries: big-to-big joins run on one node.
-4. **Keyed-table compaction rewrites the whole table**, as one job. No partitions and no
-   clustering across files yet.
-5. **Cold `pondra sql` on far object storage** costs 2–3 s to open the catalog (SlateDB: ~20
-   sequential requests).
-6. **No auth, quotas or multi-tenancy.** Bucket credentials are the only access control.
+1. **Replicated acks' window.** An acked write survives any one node dying (with `--fsync`,
+   followers' power loss too), but not the leader and every holder dying before the bucket has
+   it. Recovery waits up to 20 s for unreachable members.
+2. **One sequencer per lake** orders commits. Attached lakes split the load across leaders, but
+   there are no transactions across lakes.
+3. **No shuffles** in distributed queries: big-to-big joins run on one node. Everything has run
+   as processes on one machine; no multi-machine run yet.
+4. **Missing doors:** no Kafka protocol, no Iceberg REST catalog, no `ALTER TABLE`.
+5. **Streaming:** event-time windows update on late rows and expire by TTL, but there are no
+   watermarks that close a window and emit it once.
+6. **Security:** tokens per role only; no TLS (use a proxy), no per-table grants or quotas.
+7. **Latency of one-off writers on far storage:** `pondra sql` spends 2–3 s opening the
+   catalog on far object storage, and an inbox write adds a second or two.
+8. **`_deleted` shows** in `SELECT *` of keyed tables (null or false for live rows).
 
-Good next moves, in order (the owner agreed on 1 and 2 for round 9):
+Good next moves, in order. The plan table in the comparison doc has the evidence each should
+produce.
 
-1. **A bucket inbox:** writers that can't reach the leader (another network, another company)
-   drop commit requests into the bucket; the leader picks them up within a second or two. Full,
-   equal write capability from anywhere, exactly-once.
-2. **Split leadership by table or namespace:** several leaders in one shared catalog, each
-   ordering its own tables (like Kafka partition leaders). Millisecond writes for several
-   clusters on one lake, and no more single-sequencer limit.
-3. Shuffles reusing the job-dealing mechanism, plus a multi-machine TPC-H run against Spark.
-4. Replicated acks, hardened: fsync option, 3 replicas on real machines, faster R2 failover.
-5. Event-time windows and watermarks.
-6. Arrow Flight SQL or the Postgres wire protocol.
-7. Partitioned tables, clustering across files, compaction without full rewrites.
-8. Kafka-protocol ingest and CDC.
-9. Auth, and read-only "attach another lake".
-
-The plan table at the end of the comparison doc has the evidence each should produce.
+1. **Kafka-protocol ingest** (produce, plus a fetch subset). Every competitor has a Kafka door.
+2. **A multi-machine run** (3–10 VMs on S3/R2), then **shuffles** through the job-dealing
+   mechanism.
+3. **An Iceberg REST catalog endpoint** over the Iceberg tables Pondra already publishes.
+4. **`ALTER TABLE … ADD COLUMN`**, then renames and defaults.
+5. **Watermarks** and append-only window output; point-in-time joins.
+6. **AI functions in SQL** (`ai_complete`, `embed` against an OpenAI-compatible endpoint) and an
+   approximate vector index.
+7. **TLS, per-table grants, an audit log, quotas.**
 
 ## Conventions
 

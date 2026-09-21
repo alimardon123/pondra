@@ -131,11 +131,7 @@ async fn send(lake: &Lake, to: &To, mut pending: Vec<Append>) {
             let f = pack(lake, &pending).await?;
             match to {
                 To::Local(seq) => seq.submit(f).await,
-                To::Leader(addr) => {
-                    let head = serde_json::to_vec(&f)?;
-                    let body = [&(head.len() as u32).to_le_bytes()[..], &head, &f.data].concat();
-                    Ok(http().post(format!("http://{addr}/cluster/commit")).body(body).send().await?.error_for_status()?.json().await?)
-                }
+                To::Leader(addr) => Ok(http().post(format!("http://{addr}/cluster/commit")).body(encode_flush(&f)?).send().await?.error_for_status()?.json().await?),
             }
         };
         match outcome.await {
@@ -159,7 +155,7 @@ async fn send(lake: &Lake, to: &To, mut pending: Vec<Append>) {
 }
 
 /// Encode the producers' batches and their views' output into one flush.
-async fn pack(lake: &Lake, pending: &[Append]) -> Result<Flush> {
+pub async fn pack(lake: &Lake, pending: &[Append]) -> Result<Flush> {
     let (mut data, mut parts) = (vec![], vec![]);
     let mut add = |table: &str, batch: &RecordBatch, src: Option<Src>| -> Result<()> {
         let off = data.len() as u64;
@@ -189,6 +185,11 @@ async fn pack(lake: &Lake, pending: &[Append]) -> Result<Flush> {
 }
 
 /// The body of POST /cluster/commit: u32 header length | JSON header | inline data.
+pub fn encode_flush(f: &Flush) -> Result<Vec<u8>> {
+    let head = serde_json::to_vec(f)?;
+    Ok([&(head.len() as u32).to_le_bytes()[..], &head, &f.data].concat())
+}
+
 pub fn decode_flush(body: Bytes) -> Result<Flush> {
     let n = u32::from_le_bytes(body.get(..4).ok_or_else(|| anyhow!("empty flush"))?.try_into()?) as usize;
     let mut f: Flush = serde_json::from_slice(&body[4..4 + n])?;

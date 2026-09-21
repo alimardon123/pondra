@@ -16,8 +16,14 @@ Anyone with the binary and credentials for the bucket can use it in one of three
 | | How | Sees | Writes | Costs |
 |---|---|---|---|---|
 | **Join**: `pondra serve --dir …` (add `--reader` to only read) | The catalog in memory, kept current by the leader's commit stream; hot objects on the local SSD | Every committed write, milliseconds after the ack | Yes (`--reader`: no) | A running process |
-| **Serverless**: `pondra sql --dir … "…"` | Opens the catalog in the bucket, reads the log tail and Parquet directly | Every write already in the bucket (every acknowledged write, in the default `--ack durable` mode) | `INSERT INTO t SELECT …`: this machine does the work; the running leader records the files, or this process does if nobody leads | Opening the catalog: ~20 sequential requests (30 ms on local disk, 3–6 s on R2 from this sandbox) |
+| **Serverless**: `pondra sql --dir … "…"` | Opens the catalog in the bucket, reads the log tail and Parquet directly | Every write already in the bucket (every acknowledged write, in the default `--ack durable` mode) | `CREATE TABLE`, `INSERT`, `UPDATE`, `DELETE`: this machine does the work. The leader records it: over HTTP, through the bucket inbox if it can't be reached (`inbox/`), or this process leads for a moment if nobody does | Opening the catalog: ~20 sequential requests (30 ms on local disk, 3–6 s on R2 from this sandbox) |
 | **Other engines**, through Delta Lake or Iceberg | The table's `_delta_log/` or `metadata/`, if the table publishes it | The table as of the last tiering round | No | Nothing extra for Pondra, beyond the publishing itself |
+
+**Several lakes, one bucket.** Each lake is its own prefix with its own leader. A node or a
+`pondra sql` given `--attach sales=s3://bucket/sales` reads that lake's tables as `sales.orders`
+next to its own (joins, views, `SHOW TABLES`). A write to `sales.orders` is recorded by the sales
+lake's leader, never by ours. Nothing in either lake's layout changes: attaching is read-only
+metadata access plus that leader's usual doors (HTTP, inbox).
 
 Delta and Iceberg are **opt-in per table**: `"publish": ["delta", "iceberg"]` when creating it
 (send it again to change it), or `--publish delta,iceberg` for every new table on a node.
@@ -35,6 +41,10 @@ Turning a format off deletes its metadata, so nobody reads a stale copy.
 ├── cluster/
 │   ├── term/0000000001         leader election: one small object per term (put-if-absent)
 │   └── alive/0000000001        "the leader of this term is still here" (rewritten every 10 s)
+├── inbox/                      writes from machines that can't reach the leader
+│   ├── bell                    touched by every writer; the leader HEADs it once a second
+│   ├── <id>.files | .flush | .table   a request: a bulk INSERT's files, a log flush, a new table
+│   └── <id>.out                the leader's answer (deleted by the writer, or after an hour)
 ├── log/<ms>-<uuid>.seg         the log tail: flushes over 64 KB (1 MB with --ack replicated),
 │                               Arrow IPC stream + ZSTD; smaller ones ride inside the catalog commit
 └── data/<table>/               one folder per table (views and task outputs are tables too)
@@ -55,7 +65,8 @@ Turning a format off deletes its metadata, so nobody reads a stale copy.
 | `catalog/` | SlateDB (LSM of SSTs + WAL). Keys: `t/` tables, `s/` log segments, `d/` small segments' data, `p/` producer progress (and bulk-insert jobs), `v/` views, `k/` tasks, `x/` Delta state, `i/` Iceberg state, `m` the followers whose copies count (replicated acks), `n` next segment, `c` commit number | Pondra | new objects only; old ones compacted away |
 | `cluster/term/` | JSON: leader address and term (empty address: a `pondra sql` INSERT recording its files) | Pondra | one new object per election |
 | `cluster/alive/` | empty; its timestamp is what counts | Pondra | rewritten every 10 s by the leader; a one-off writer deletes its own when done |
-| `log/` | Arrow IPC stream + ZSTD, one per large flush (rows of any tables) | Pondra | immutable; deleted once tiered and older than `--retain-secs` |
+| `inbox/` | JSON requests (a flush as its binary body), JSON answers | the leader | each request deleted once answered; answers deleted by the writer (unclaimed ones after an hour) |
+| `log/` | Arrow IPC stream + ZSTD, one per large flush (rows of any tables) | Pondra | immutable; deleted once tiered and older than `--retain-secs`, or `--changelog-secs` if longer (the change feed) |
 | `data/<table>/*.parquet` | Parquet, ZSTD | anyone | immutable; replaced files deleted after `--retain-secs` |
 | `data/<table>/_delta_log/` | Delta Lake protocol 1/2: JSON commits, Parquet checkpoints | Delta readers | append-only; `_last_checkpoint` rewritten; last 1,000 versions kept |
 | `data/<table>/metadata/` | Iceberg v2: metadata JSON, Avro manifest lists and manifests | Iceberg readers | append-only; `version-hint.text` rewritten; last 100 snapshots kept |
@@ -100,8 +111,16 @@ The same on local disk and on object storage:
 - **Append tables:** once 8 files are small, they are merged 8 → 1 (up to 4 M rows / 64 MB). A
   table has at most ~8 small files plus big ones.
 - **Keyed tables** (upsert, merge, GROUP BY views) are an LSM. Each round writes a file with the
-  newest version of each key it saw. Once 8 files pile up, a compaction folds them into one (a
-  full rewrite; the known limit on very large keyed tables).
+  newest version of each key it saw. Once 8 files pile up, the newest run of similar-sized files
+  is merged (size-tiered, round 9):
+  - going back while each older file is at most twice the size of what's newer;
+  - delete markers are kept, so the merged file still hides older versions.
+
+  Only when the run reaches the oldest file is the whole table rewritten. That drops deleted
+  rows and rows past the table's TTL. On a 2 M-key table with 60 rounds of updates this writes
+  3x less than rewriting every time.
+- **TTL** (`ttl = 'ts:86400'` on a keyed table): reads hide rows whose timestamp column is older
+  than that; full compactions delete them.
 - **Retention:** replaced files and consumed log objects are deleted after `--retain-secs`.
   Objects no commit ever referenced are deleted after a day.
 - **Skipping data:**
@@ -111,8 +130,8 @@ The same on local disk and on object storage:
     8 M rows: one-user queries 6.4x faster, ranges 11x; full scans 0.6x
     (`docs/adr-009-native-first.md`).
 
-Not there yet: partitions, compaction of big keyed tables without a full rewrite, clustering
-across files (Z-order / Hilbert), deletion vectors.
+Not there yet: partitions, clustering across files (Z-order / Hilbert), deletion vectors,
+copy-on-write DELETE for append tables.
 
 ## Reading it with other engines
 

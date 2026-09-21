@@ -1,6 +1,6 @@
 # Pondra: a streamhouse in one binary
 
-One Rust binary (~4,550 lines) that ingests streams, stores them as a lakehouse (Parquet files
+One Rust binary (~5,800 lines) that ingests streams, stores them as a lakehouse (Parquet files
 plus a catalog, on object storage; Delta Lake and Iceberg metadata for other engines on request),
 keeps SQL views and streaming state up to date, answers SQL, and scales out by starting more
 copies of itself on the same bucket. Object storage is the only state: no Postgres, no
@@ -26,6 +26,14 @@ export AWS_ENDPOINT=https://<account>.r2.cloudflarestorage.com
 # Serverless, from any machine with the binary and bucket credentials — no node needed:
 ./target/release/pondra sql --dir s3://my-bucket/lake "SELECT count(*) FROM events"
 ./target/release/pondra sql --dir s3://my-bucket/lake "INSERT INTO sales SELECT * FROM 'jan.parquet'"
+./target/release/pondra sql --dir s3://my-bucket/lake "UPDATE users SET plan = 'pro' WHERE id = 7"
+
+# SQL from anything that speaks Postgres, and from Python:
+./target/release/pondra serve --dir ./lake --pg 0.0.0.0:5432      # psql -h localhost, psycopg, SQLAlchemy, BI tools
+pip install ./python && python -c "import pondra; print(pondra.connect('http://127.0.0.1:8080').sql('SELECT 1').to_pandas())"
+
+# AI agents over MCP (Claude Code, Claude Desktop, Cursor, …): every node serves POST /mcp
+claude mcp add --transport http pondra http://127.0.0.1:8080/mcp   # add --header "Authorization: Bearer $TOKEN" with tokens on
 ```
 
 `--addr` must be reachable by the other nodes. Read-only nodes and `pondra sql` queries write
@@ -41,6 +49,11 @@ runs — the `pondra sql` INSERT itself, for a moment.
   - Laptops can join with `pondra serve` (or `--reader`) and leave again.
   - A laptop's `pondra sql` INSERT still does its own work; the leader only records the files.
 - **After a full shutdown**, the first node started on the lake leads at once.
+- **A machine that can't reach the leader** (another network, another company) still writes:
+  its request goes through the bucket (`inbox/`), and the leader records it within a second or so.
+- **Several clusters, one bucket:** each cluster leads its own lake and attaches the others
+  (`--attach sales=s3://my-bucket/sales`): it reads `sales.orders`, and its writes to it are
+  recorded by that lake's leader.
 
 Useful `serve` flags (give every node the same ones: any of them may lead):
 
@@ -55,6 +68,14 @@ Useful `serve` flags (give every node the same ones: any of them may lead):
   engines (default: none; per table: `"publish"`).
 - `--tier-secs 2`: new rows become Parquet (and new Delta/Iceberg versions) as soon as they
   commit, at most this often. Fractions are fine (`0.25`).
+- `--pg 0.0.0.0:5432`: also speak the Postgres protocol.
+- `--read-token`, `--write-token`, `--admin-token`: access control (none set = open). Over
+  Postgres the user name picks the role (`reader`, `writer`, `admin`) and the password is its
+  token. Whatever the token, SQL sent to a node never touches the node's own disk (no `COPY …
+  TO`, no `CREATE EXTERNAL TABLE`); only `pondra sql` reads local files, on its own machine.
+- `--attach name=dir`: read (and write through its leader) another lake as `name.table`.
+- `--changelog-secs 86400`: keep the log as a replayable change feed (`/watch/{t}?after=…`).
+- `--fsync` (with `--ack replicated`): followers flush each copy to disk before acknowledging.
 - `--cache-dir`, `--cache-gb 20`: the local SSD tier for lakes on object storage. 0 turns it off.
 - `--retain-secs 60`: how long replaced files and consumed log segments are kept.
 - `--backlog 10000000`: rows allowed to wait for tiering before commits pause.
@@ -99,10 +120,15 @@ differences entirely.
 | Need | How (HTTP API, on any node) | Replaces |
 |---|---|---|
 | Stream ingest, exactly-once | `POST /append/{t}?producer=&seq=` with NDJSON or an Arrow IPC stream | Kafka / Fluss |
-| Tables | `POST /tables/{t}` `[["user","Utf8"],…]`; `{"columns":[…],"key":["id"]}` = upsert table; add `"merge":{"total":"sum"}` = merge table; `"cluster_by":["user"]` sorts an append table's files for fast filters; `"publish":["delta","iceberg"]` | Delta/Iceberg MERGE, liquid clustering |
+| Tables | SQL `CREATE TABLE t (id BIGINT PRIMARY KEY, …) WITH (publish = 'delta,iceberg', cluster_by = 'user', merge = 'total:sum', ttl = 'ts:86400')`, or `POST /tables/{t}` with the same as JSON. A key = upsert table; `merge` = merge table; `cluster_by` sorts an append table's files for fast filters; `ttl` expires a keyed table's rows | Delta/Iceberg MERGE, liquid clustering, Fluss PK tables with TTL |
+| SQL writes | `INSERT … SELECT/VALUES`, `UPDATE … SET … WHERE`, `DELETE … WHERE` (keyed tables) on any node, over Postgres, or with `pondra sql` on any machine | Spark SQL DML, Fluss 1.0's UPDATE/DELETE by condition |
+| Postgres protocol | `--pg`: psql, psycopg 2/3, asyncpg, SQLAlchemy + pandas (tested); JDBC/BI tools by the same protocol | a Postgres-compatible serving layer |
+| Python | `import pondra`: `sql()` → pandas / Polars / Arrow, `append()` exactly-once, `watch()`, `lookup()` | PySpark / PyFlink clients for the common jobs |
+| AI agents | `POST /mcp` (the Model Context Protocol): tools `list_tables`, `query`, `write`, `changes`, under the same tokens | an MCP server in front of the warehouse |
+| Vector search | `FLOAT[]` embedding columns; `ORDER BY cosine_distance(emb, [...]) LIMIT k` (also `inner_product`, `array_distance`), exact, over the log and the files; Postgres array parameters work | a vector database next to the lake; Flink `VECTOR_SEARCH` |
 | Streaming SQL with no lag | `POST /views/{name}` with SQL. Runs on every flush of new rows, commits with them. With GROUP BY it keeps per-key aggregates (sum/count/min/max) that any number of nodes update at once | Flink SQL jobs + keyed state |
 | General stateful streaming | `POST /tasks/{name}` `{"source","target","sql"[, "key","shards","shard_by"]}`: runs as soon as rows commit, exactly-once, shards spread over nodes | Flink jobs |
-| Push | `GET /watch/{t}`: new rows as NDJSON the moment they commit | Kafka consumers |
+| Push and change feeds | `GET /watch/{t}`: new rows as NDJSON the moment they commit (upserts and deletes of keyed tables included); `?after=N` replays from N, as far back as `--changelog-secs` keeps the log | Kafka consumers, Fluss `$changelog` |
 | SQL | `POST /sql[?format=json\|table\|arrow][&after=<seg>][&stale_ms=N]`: files ∪ log tail, one snapshot. Large tables run SPMD across all nodes (`&spread=1` forces, `0` disables). Repeated queries are answered from a result cache until the next commit (`stale_ms`: accept one up to N ms old) | Trino / Spark SQL / Databricks SQL |
 | Serving reads | `GET /lookup/{t}/{key}` (or SQL `SELECT … WHERE key = …`): the current row of one key without SQL planning — log tail, then the files newest-first, each narrowed to one cached, key-sorted row group: ~0.2 ms, ~20k/s on two cores | Redis / Postgres / Lakehouse//RT in front of the lake |
 | Batch ELT, exactly-once | `POST /insert/{t}?job=` with a `SELECT` (the receiving node does the work), or `pondra sql "INSERT INTO t SELECT …"` from any machine: straight to Parquet; a retried job is a no-op | Spark batch jobs |
@@ -125,7 +151,11 @@ differences entirely.
 | `cache.rs` | For lakes on object storage: an in-memory read cache and a local SSD tier (write-through, read-through, prefetched from the commit stream, warmed at start) |
 | `serve.rs` | Serving reads: key lookups without SQL (tail, then files newest-first, cached key-sorted row groups, binary search), and SQL point queries routed to them |
 | `delta.rs`, `iceberg.rs` | Open formats, per table: a Delta JSON commit / an Iceberg v2 snapshot (hand-written Avro manifests) per change to a table's files; crash-safe (derived from durable catalog state, put-if-absent) |
-| `insert.rs` | Bulk INSERT from any node or any machine: the work runs where the statement runs; the leader (or the statement itself, when nobody leads) records the files |
+| `write.rs` | Writes in SQL from anywhere (CREATE TABLE, INSERT, UPDATE, DELETE): the work runs where the statement runs; the leader records it — over HTTP, through the bucket inbox, or the statement leads for a moment when nobody does. Attached lakes' writes go to their own leaders |
+| `inbox.rs` | The bucket inbox: writers that can't reach the leader leave requests in the bucket; the leader answers them |
+| `pg.rs` | The Postgres wire protocol (queries and writes, text and binary results, typed `$1` parameters, a small `pg_catalog`) |
+| `auth.rs` | Read / write / admin tokens, over HTTP, Postgres and MCP |
+| `mcp.rs` | MCP for AI agents: JSON-RPC over HTTP, four tools |
 | `server.rs`, `main.rs` | HTTP API (axum) and CLI |
 
 **Producer contract:** each producer has its own name, sends batches in order with increasing
@@ -135,7 +165,10 @@ committed batches come back as `"duplicate": true`.
 ## Tests
 
 ```bash
-python3 tools/harness.py all [--s3]             # upsert, fence (split brain), insert, serverless, reader, crash, load
+python3 tools/harness.py all [--s3]             # upsert, fence (split brain), insert, serverless, clients, reader, crash, load
+python3 tools/harness.py clients                # SQL writes, Python client, Postgres drivers, tokens, inbox, attached lakes, vectors, MCP
+python3 tools/mcp_client.py --url http://127.0.0.1:8080/mcp   # the official MCP SDK against a node (pip install mcp)
+python3 tools/keyed_bench.py                    # keyed-table compaction: bytes written, correctness
 python3 tools/harness.py crash --runs 20        # kill -9 + injected crashes (PONDRA_CRASH=point:prob)
 python3 tools/cluster.py users                  # 64 writers + 16 readers + serverless reads, 3 nodes
 python3 tools/cluster.py failover               # views + sharded task state; leader killed twice
@@ -156,14 +189,19 @@ python3 tools/sim_r2.py --port 9000             # local S3 server with R2-like l
 ```
 
 `--s3` uses `s3://$PONDRA_BUCKET/$PONDRA_TEST_PREFIX` + `test-…` with the `AWS_*` variables. Add
-`--flag tier-secs=10` to `cluster.py` to pass a serve flag to every node.
+`--flag tier-secs=10` to `cluster.py` to pass a serve flag to every node. Test runs delete their
+lakes when they finish (`--keep` or `PONDRA_KEEP=1` keeps them); `tools/clean_bucket.py` trims a
+bucket to its newest lakes.
 
 ## Not yet
 
 - Shuffles in distributed queries: big-to-big joins run on one node.
-- Partitioned tables; compaction of big keyed tables without a full rewrite; clustering across
-  files.
-- Auth and quotas.
+- Partitioned tables; clustering across files; copy-on-write DELETE for append tables.
+- Watermarks that close event-time windows (windows update on late rows, and expire by TTL).
+- Per-table grants, quotas and TLS (tokens are per role; put a TLS proxy in front); JDBC and BI
+  tools untested here.
+- Kafka-protocol ingest, an Iceberg REST catalog endpoint, `ALTER TABLE`, AI functions in SQL, an
+  approximate vector index (see the plan in `docs/comparison-spark-flink-fluss.md`).
 - On object storage a *durable* ack costs one PUT; `--ack replicated` trades a small window
   (the leader and every holder dying before that PUT) for milliseconds.
 - A one-off `pondra sql` on far-away object storage spends 1–3 s opening the catalog; join

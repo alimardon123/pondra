@@ -1,0 +1,8 @@
+# the official MCP Python SDK (pip install mcp; streamable HTTP) against a fresh node: pondra serve --admin-token a-tok
+$ tools/mcp_client.py --url http://127.0.0.1:18777/mcp --token a-tok
+server: pondra 2025-11-25
+tools: ['list_tables', 'query', 'write', 'changes']
+write: {"table":"notes","publish":[]}
+write: {"rows":1}
+query: {"rows":[{"id":1,"body":"hello agent"}],"total_rows":1}
+changes: {"rows":[{"id":1,"body":"hello agent"}],"position":1}

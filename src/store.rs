@@ -38,6 +38,15 @@ pub struct TableMeta {
     pub publish: Vec<String>, // open formats other engines also read it in: "delta", "iceberg"
     #[serde(default)]
     pub cluster: Vec<String>, // append tables: each file's rows sorted by these (see `tier::clustered`)
+    #[serde(default)]
+    pub ttl: Option<(String, u64)>, // keyed tables: a row whose (timestamp) column is older than this many seconds is gone
+}
+
+impl TableMeta {
+    /// The TTL as a SQL condition that keeps live rows ("" if none).
+    pub fn ttl_sql(&self) -> String {
+        self.ttl.as_ref().map(|(c, s)| format!("\"{c}\" >= now() - INTERVAL '{s} seconds'")).unwrap_or_default()
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -106,6 +115,7 @@ pub struct Lake {
     tail: Mutex<(lru::LruCache<(u64, String), Rows>, usize)>, // decoded (segment, table) rows; total bytes
     pub disk: Option<Arc<crate::cache::Disk>>, // lakes on object storage: the local SSD tier
     pub groups: crate::serve::Groups,          // decoded row groups for key lookups
+    pub attached: std::sync::RwLock<Vec<(String, Arc<Lake>)>>, // other lakes, read as `name.table` (`--attach`)
 }
 
 pub type Rows = Arc<Vec<datafusion::arrow::record_batch::RecordBatch>>;
@@ -146,7 +156,7 @@ impl Lake {
         let cache = ObjectStoreCacheOptions { root_folder: cache, max_cache_size_bytes: Some(2 << 30), cache_on_flush: true, cache_on_compaction: true, ..Default::default() };
         let cat = if writer { Catalog::writer(store.clone(), cache).await? } else { Catalog::reader(store.clone(), streamed, cache).await? };
         let hwm = watch::Sender::new(cat.get::<u64>("n").await?.unwrap_or(1) - 1);
-        let lake = Arc::new(Lake { url, store, cat, hwm, backlog: Default::default(), rt, tail: Mutex::new((lru::LruCache::unbounded(), 0)), disk, groups: crate::serve::Groups::new(cache_mb() << 19) });
+        let lake = Arc::new(Lake { url, store, cat, hwm, backlog: Default::default(), rt, tail: Mutex::new((lru::LruCache::unbounded(), 0)), disk, groups: crate::serve::Groups::new(cache_mb() << 19), attached: Default::default() });
         if let Some(writes) = lake.cat.unstarted.lock().unwrap().take() {
             tokio::spawn(lake.clone().commits(writes));
         }
@@ -281,6 +291,17 @@ impl Lake {
     /// Note that segments up to `hwm` are committed (wakes tasks and watchers).
     pub fn advance(&self, hwm: u64) {
         self.hwm.send_if_modified(|h| std::mem::replace(h, (*h).max(hwm)) < hwm);
+    }
+
+    /// Read another lake as `name.table` in this one's queries (its bucket's reader goes into our
+    /// runtime too: a query here reads its files).
+    pub fn attach(&self, name: &str, other: Arc<Lake>) -> Result<()> {
+        if let Some(bucket) = other.url.strip_prefix("s3://").map(|r| format!("s3://{}", r.split('/').next().unwrap_or_default())) {
+            let url = url::Url::parse(&bucket)?;
+            self.rt.register_object_store(&url, other.rt.object_store(datafusion::execution::object_store::ObjectStoreUrl::parse(&bucket)?)?);
+        }
+        self.attached.write().unwrap().push((name.to_string(), other));
+        Ok(())
     }
 
     /// A fresh SQL session on the shared runtime.

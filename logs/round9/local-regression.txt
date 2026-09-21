@@ -1,0 +1,128 @@
+== harness all
+ "commit_ms_p50": 2,
+ "commit_ms_p95": 3,
+ "server_cores_used": 0.07
+}
+{
+ "upsert": "12,000 random upserts/deletes with compactions and a restart match the model exactly (403 live keys)",
+ "tiering": "12 rounds of writes and tiering: log drained, files bounded ({'events': 5, 'kv': 5, 'totals': 5}), every row exact",
+ "fence": "a frozen leader is replaced; when it wakes, its write is rejected (fenced) and it rejoins as a follower; nothing lost",
+ "insert": "bulk INSERT \u2026 SELECT writes Parquet directly; a retried job id is applied once",
+ "serverless": "INSERT from a process with no server: 0.02s alone, 4 at once, retries once; a node on the idle lake leads in 0.02s; via a running leader 0.03s; after the leader is killed 30.12s; 8000 rows, no duplicates",
+ "clients": "SQL writes, Python client, Postgres (4 drivers), tokens, change-feed replay, attached lake, inbox (1.0s): all 15 checks pass",
+ "reader": "freshness on a separate read-only node: p50 6 ms, p99 91 ms",
+ "crash": "5/5 runs, 0 lost, 0 duplicated (events, streaming-task output, views); crashes survived: {'after_seg_put': 0, 'after_commit': 0, 'after_parquet_put': 6, 'kill -9': 1}",
+ "load": {
+  "events_per_s": 1200,
+  "ack_ms_p50": 251,
+  "ack_ms_p99": 254,
+  "freshness_ms_p50": 136,
+  "freshness_ms_p99": 263,
+  "freshness_samples": 48,
+  "commits_per_s": 4.0,
+  "commit_ms_p50": 2,
+  "commit_ms_p95": 3,
+  "server_cores_used": 0.07
+ }
+}
+== crash strict
+run  2: kill-9=7 injected={'after_seg_put': 7, 'after_commit': 2, 'after_parquet_put': 26} events=9000000/9000000 unique=9000000 task_output=4500000/4500000 views=exact -> OK
+run  3: kill-9=7 injected={'after_seg_put': 4, 'after_commit': 1, 'after_parquet_put': 19} events=9000000/9000000 unique=9000000 task_output=4500000/4500000 views=exact -> OK
+== users 1
+  3618300 events (116,777/s), ack p50 44 ms p99 196 ms
+  1342 snapshot reads, query p50 315 ms p99 1375 ms
+  inconsistent reads: 0; producers with lost/duplicate batches: 0
+    by node: {}
+== users 2
+  3549700 events (114,539/s), ack p50 44 ms p99 225 ms
+  1224 snapshot reads, query p50 321 ms p99 1258 ms
+  inconsistent reads: 0; producers with lost/duplicate batches: 0
+    by node: {}
+== users 3
+  3569600 events (115,289/s), ack p50 45 ms p99 201 ms
+  1283 snapshot reads, query p50 313 ms p99 1159 ms
+  inconsistent reads: 0; producers with lost/duplicate batches: 0
+    by node: {}
+== failover 1
+  failovers: 5.1s, 4.6s (kill -> writes acked again); state caught up 0.3s after the last write
+  events exactly once: True (1512000 rows); for 1000 users, task state == model: True, inline view == model: True
+  shard runs per node (since each node's last start): {18080: 187, 18081: 273, 18082: 206}
+== failover 2
+  failovers: 4.5s, 4.8s (kill -> writes acked again); state caught up 0.4s after the last write
+  events exactly once: True (892800 rows); for 1000 users, task state == model: True, inline view == model: True
+  shard runs per node (since each node's last start): {18080: 138, 18081: 141, 18082: 201}
+== failover 3
+  failovers: 5.1s, 4.7s (kill -> writes acked again); state caught up 0.4s after the last write
+  events exactly once: True (1027200 rows); for 1000 users, task state == model: True, inline view == model: True
+  shard runs per node (since each node's last start): {18080: 121, 18081: 194, 18082: 135}
+== failover replicated 1
+  failovers: 5.2s, 4.7s (kill -> writes acked again); state caught up 0.4s after the last write
+  events exactly once: True (1014100 rows); for 1000 users, task state == model: True, inline view == model: True
+  shard runs per node (since each node's last start): {18080: 138, 18081: 202, 18082: 151}
+== failover replicated 2
+  failovers: 5.2s, 4.5s (kill -> writes acked again); state caught up 0.3s after the last write
+  events exactly once: True (927000 rows); for 1000 users, task state == model: True, inline view == model: True
+  shard runs per node (since each node's last start): {18080: 219, 18081: 141, 18082: 151}
+== race
+race: 3 nodes started at once -> 1 leader(s), all agree: True
+== isolate
+isolate: cut-off follower deposed a healthy leader: False; after the leader died, :18081 took over in 5.1s (term 2)
+== split
+split: 8 Arrow producers -> followers only, 72,240,000 events in 20s (3,612,000/s)
+  CPU seconds per million events: leader 0.09, followers 0.12 + 0.13; leader share 27%
+== spread
+  q7_avg_distinct      one node    146 ms   3 nodes    167 ms   same result: True
+  q8_top_rows          one node    122 ms   3 nodes    120 ms   same result: True
+  q9_filter_count      one node     30 ms   3 nodes     33 ms   same result: True
+spread: 4,000,000 rows, 3 nodes; results identical: True; fell back to one node: 0 times
+== latency
+latency: 3 nodes, 0 background producers; 249 probe events, 249 pushed back
+  ack (durable)                   p50 5 ms  p99 10 ms
+  view row pushed to another node     p50 5 ms  p99 10 ms
+== open_check
+ },
+ "match": true
+}
+== keyed_bench
+{
+ "keys": 2000000,
+ "rounds": 60,
+ "updates_per_round": 20000,
+ "base_mb": 6.2,
+ "written_by_tiering_and_compaction_mb": 17.9,
+ "full_rewrites_would_write_mb": 53.4,
+ "live_files": 7,
+ "tier_call_s_median": 0.019,
+ "tier_call_s_max": 0.571,
+ "total_s": 5.2,
+ "sql_matches_model": true,
+ "wrong_lookups": 0
+}
+== clustering
+ "files": {
+  "plain": 3,
+  "sorted": 2
+ },
+ "one user (median ms)": {
+  "plain": 276.4,
+  "sorted": 6.0,
+  "speedup": 46.1
+ },
+ "100 users (IN list) (median ms)": {
+  "plain": 220.6,
+  "sorted": 100.9,
+  "speedup": 2.2
+ },
+ "a range of users (median ms)": {
+  "plain": 174.2,
+  "sorted": 2.4,
+  "speedup": 72.6
+ },
+ "full scan (unaffected) (median ms)": {
+  "plain": 122.1,
+  "sorted": 136.4,
+  "speedup": 0.9
+ },
+ "same_rows": true
+}
+DONE

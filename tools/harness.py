@@ -10,7 +10,7 @@
   harness.py load    --secs 30   throughput, ack latency, freshness, catalog commit latency
   harness.py all                 quick run of everything
 """
-import argparse, http.client, json, os, random, signal, subprocess, sys, tempfile, threading, time, uuid
+import argparse, atexit, http.client, itertools, json, os, random, shutil, signal, subprocess, sys, tempfile, threading, time, urllib.request, uuid
 
 BIN = os.environ.get("PONDRA_BIN", os.path.join(os.path.dirname(os.path.abspath(__file__)), "../target/release/pondra"))
 A = None  # parsed args
@@ -30,19 +30,49 @@ def sql(port, q):
     return call(port, "POST", "/sql", q.encode())
 
 
+LAKES, NODES, S3 = [], [], []  # what this run made: removed when it exits, unless --keep or PONDRA_KEEP=1
+
+
 def new_lake():
     prefix = os.environ.get("PONDRA_TEST_PREFIX", "")  # e.g. "round6/": test lakes grouped in one folder
-    return f"s3://{os.environ['PONDRA_BUCKET']}/{prefix}test-{uuid.uuid4().hex[:8]}" if A.s3 else tempfile.mkdtemp(prefix="pondra-")
+    lake = f"s3://{os.environ['PONDRA_BUCKET']}/{prefix}test-{uuid.uuid4().hex[:8]}" if A.s3 else tempfile.mkdtemp(prefix="pondra-")
+    if A.s3 and not S3:  # (made now: at exit, boto3 can no longer start the threads it needs)
+        import boto3
+        S3.append(boto3.client("s3", endpoint_url=os.environ.get("AWS_ENDPOINT"), region_name=os.environ.get("AWS_REGION", "auto")))
+    LAKES.append(lake)
+    return lake
+
+
+@atexit.register
+def clean_up():
+    """Stop the nodes this run started and delete its lakes (buckets have size limits: R2's free tier is 10 GB)."""
+    if getattr(A, "keep", False) or os.environ.get("PONDRA_KEEP") == "1":
+        return
+    for n in NODES:
+        n.kill()
+    for lake in LAKES:
+        try:
+            if not lake.startswith("s3://"):
+                shutil.rmtree(lake, ignore_errors=True)
+                continue
+            bucket, prefix = lake[5:].split("/", 1)
+            s3 = S3[0]
+            for pg in s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix + "/"):
+                keys = [{"Key": o["Key"]} for o in pg.get("Contents", [])]
+                if keys:
+                    s3.delete_objects(Bucket=bucket, Delete={"Objects": keys, "Quiet": True})
+        except Exception as e:
+            print(f"(couldn't delete {lake}: {e})", file=sys.stderr)
 
 
 class Node:
     def __init__(self, lake, port, reader=False, env=None, **flags):
         self.args = [BIN, "serve", "--dir", lake, "--addr", f"127.0.0.1:{port}"] + (["--reader"] if reader else [])
-        self.args += [f"--{k.replace('_', '-')}={v}" for k, v in flags.items()]
+        self.args += [f"--{k.replace('_', '-')}" + ("" if v is True or v == "true" else f"={v}") for k, v in flags.items()]  # (a bare flag for true)
         self.port, self.env, self.p = port, {**os.environ, **(env or {})}, None
         self.log = os.path.join(tempfile.gettempdir(), f"pondra-{port}-{uuid.uuid4().hex[:6]}.stderr")
 
-    def start(self):
+    def start(self, tries=20):
         try:
             call(self.port, "GET", "/stats", timeout=1)
             raise RuntimeError(f"port {self.port} is already in use by another node")
@@ -50,14 +80,17 @@ class Node:
             pass  # free, as it should be
         with open(self.log, "a") as err:
             self.p = subprocess.Popen(self.args, env=self.env, stdout=subprocess.DEVNULL, stderr=err)
+        NODES.append(self)
         deadline = time.time() + 120  # opening a lake on slow object storage can take a while
         while time.time() < deadline:
             try:
                 call(self.port, "GET", "/stats", timeout=2)
                 return self
             except Exception:
+                if self.p.poll() is not None and tries > 1:
+                    return self.start(tries - 1)  # died while starting (e.g. injected crash): try again
                 if self.p.poll() is not None:
-                    return self.start()  # died while starting (e.g. injected crash): try again
+                    break
                 time.sleep(0.02)
         raise RuntimeError("node did not start: " + open(self.log).read()[-500:])
 
@@ -341,6 +374,105 @@ def serverless():
             f"in {node_start_s}s; via a running leader {via_node_s}s; after the leader is killed {after_kill_s}s; {n['n']} rows, no duplicates")
 
 
+def clients():
+    """SQL writes, the Python client, the Postgres protocol, tokens, the bucket inbox and attached
+    lakes, all against one small cluster."""
+    import asyncio, asyncpg, pandas as pd, polars as pl, psycopg, psycopg2, sqlalchemy as sa
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "python"))
+    import pondra
+    tokens = {"read_token": "r-tok", "write_token": "w-tok", "admin_token": "a-tok"}
+    lake, other = new_lake(), new_lake()
+    b = Node(other, A.port + 2, **tokens).start()
+    a = Node(lake, A.port, pg=f"127.0.0.1:{A.port + 10}", attach=f"sales={other}", changelog_secs=600, **tokens).start()
+    admin, writer, reader = (pondra.connect(f"http://127.0.0.1:{A.port}", token=t) for t in ("a-tok", "w-tok", "r-tok"))
+    checks = {}
+    # tokens: nothing without one; a read token can't write; a write token can't create tables
+    checks["no token -> 401"] = _raises(lambda: pondra.connect(f"http://127.0.0.1:{A.port}").sql("SELECT 1"))
+    admin.sql("CREATE TABLE users (id BIGINT PRIMARY KEY, name VARCHAR, score DOUBLE, _deleted BOOLEAN)")
+    admin.sql("CREATE TABLE events (user VARCHAR, amount BIGINT) WITH (cluster_by = 'user')")
+    checks["read token can't write"] = _raises(lambda: reader.sql("INSERT INTO users VALUES (9, 'x', 0, false)"))
+    checks["write token can't create"] = _raises(lambda: writer.sql("CREATE TABLE nope (a BIGINT)"))
+    # SQL writes and the Python client
+    writer.sql("INSERT INTO users VALUES (1, 'ann', 1.0, false), (2, 'bob', 2.0, false), (3, 'cy', 3.0, false)")
+    writer.sql("UPDATE users SET score = score + 10 WHERE id = 1")
+    writer.sql("DELETE FROM users WHERE id = 2")
+    writer.append("events", [{"user": "ann", "amount": 5}])
+    writer.append("events", pd.DataFrame({"user": ["bob"], "amount": [7]}))
+    writer.append("events", pl.DataFrame({"user": ["cy"], "amount": [9]}))
+    checks["users via SQL"] = reader.sql("SELECT id, score FROM users ORDER BY id").rows() == [{"id": 1, "score": 11.0}, {"id": 3, "score": 3.0}]
+    checks["pandas / polars / list appends"] = reader.sql("SELECT sum(amount) AS s FROM events").rows() == [{"s": 21}]
+    checks["lookup"] = reader.lookup("users", 3)["name"] == "cy"
+    feed = list(itertools.islice(reader.watch("users", after=0), 5))
+    checks["change feed replay (upserts + delete)"] = len(feed) == 5 and any(r.get("_deleted") for r in feed)
+    # Postgres protocol: psycopg 3 (extended, text and binary), psycopg2, SQLAlchemy + pandas, asyncpg
+    dsn = f"host=127.0.0.1 port={A.port + 10} dbname=pondra user=writer password=w-tok"
+    with psycopg.connect(dsn, autocommit=True) as c:
+        c.execute("INSERT INTO users VALUES (%s, %s, %s, false)", (4, "dee", 4.5))
+        checks["psycopg 3"] = c.execute("SELECT name FROM users WHERE id = %s", (4,)).fetchone() == ("dee",)
+        checks["psycopg 3 binary"] = c.cursor(binary=True).execute("SELECT score FROM users WHERE id = %s", (4,)).fetchone() == (4.5,)
+    c2 = psycopg2.connect(dsn); c2.autocommit = True
+    cur = c2.cursor(); cur.execute("SELECT count(*) FROM users"); checks["psycopg2"] = cur.fetchone() == (3,)
+    eng = sa.create_engine(f"postgresql+psycopg2://writer:w-tok@127.0.0.1:{A.port + 10}/pondra")
+    checks["SQLAlchemy + pandas"] = pd.read_sql("SELECT user, amount FROM events ORDER BY user", eng)["amount"].tolist() == [5, 7, 9]
+    async def apg():
+        conn = await asyncpg.connect(host="127.0.0.1", port=A.port + 10, user="reader", password="r-tok", database="pondra")
+        rows = await conn.fetch("SELECT id FROM users WHERE score > $1 ORDER BY id", 4.0); await conn.close()
+        return [r["id"] for r in rows]
+    checks["asyncpg"] = asyncio.run(apg()) == [1, 4]
+    checks["wrong password refused"] = _raises(lambda: psycopg.connect(dsn.replace("w-tok", "nope")))
+    # attached lake: write into it through its own leader, join across the two
+    admin.sql("CREATE TABLE sales.orders (id BIGINT PRIMARY KEY, user VARCHAR, amount BIGINT, _deleted BOOLEAN)")
+    writer.sql("INSERT INTO sales.orders VALUES (1, 'ann', 10, false), (2, 'cy', 20, false)")
+    time.sleep(1)
+    checks["cross-lake join"] = reader.sql("SELECT u.name, o.amount FROM sales.orders o JOIN users u ON o.user = u.name ORDER BY 1").rows() == [{"name": "ann", "amount": 10}, {"name": "cy", "amount": 20}]
+    # the bucket inbox: a machine that can't reach the leader still writes (exactly once)
+    env = {**os.environ, "PONDRA_NO_DIRECT": "1", "PONDRA_JOB": "inbox-1"}
+    run = lambda: subprocess.run([BIN, "sql", "--dir", lake, "INSERT INTO users VALUES (5, 'eve', 5.0, false)"], capture_output=True, text=True, env=env, timeout=120)
+    t = time.time(); first = run(); inbox_s = time.time() - t
+    again = run()
+    checks["inbox write"] = '"committed":true' in first.stdout and '"duplicate":true' in again.stdout and reader.lookup("users", 5)["name"] == "eve"
+    # vector search: an embedding column, nearest by cosine distance (SQL, and a Postgres array parameter);
+    # DELETE on a keyed table created without a `_deleted` column
+    admin.sql("CREATE TABLE docs (id BIGINT PRIMARY KEY, title VARCHAR, emb FLOAT[])")
+    writer.sql("INSERT INTO docs VALUES (1, 'cats', [1.0, 0.0, 0.0]), (2, 'dogs', [0.9, 0.1, 0.0]), (3, 'cars', [0.0, 0.0, 1.0])")
+    writer.sql("DELETE FROM docs WHERE id = 1")
+    near = "SELECT id FROM docs ORDER BY cosine_distance(emb, {}) LIMIT 2"
+    with psycopg.connect(dsn, autocommit=True) as c:
+        by_pg = [r[0] for r in c.execute(near.format("%s"), ([1.0, 0.05, 0.0],)).fetchall()]
+    checks["vector search (SQL + Postgres)"] = [r["id"] for r in reader.sql(near.format("[1.0, 0.05, 0.0]")).rows()] == by_pg == [2, 3]
+    checks["SQL can't touch the node's files"] = _raises(lambda: reader.sql("COPY (SELECT 1) TO '/tmp/pondra-copy.csv'")) and \
+        _raises(lambda: reader.sql("CREATE EXTERNAL TABLE e STORED AS CSV LOCATION '/etc/hosts'"))
+    # MCP: an agent lists tables, queries, writes (with a write token only) and reads the change feed
+    def mcp(token, method, params=None):
+        body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params or {}}).encode()
+        req = urllib.request.Request(f"http://127.0.0.1:{A.port}/mcp", data=body, headers={"content-type": "application/json", "authorization": f"Bearer {token}"})
+        return json.loads(urllib.request.urlopen(req).read())["result"]
+    tool = lambda token, name, **args: (lambda r: (json.loads(r["content"][0]["text"]) if not r["isError"] else None))(mcp(token, "tools/call", {"name": name, "arguments": args}))
+    init = mcp("r-tok", "initialize", {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "harness", "version": "1"}})
+    names = [t["name"] for t in mcp("r-tok", "tools/list")["tools"]]
+    tables = {t["table"] for t in tool("r-tok", "list_tables")["tables"]}
+    wrote = tool("w-tok", "write", sql="INSERT INTO docs VALUES (4, 'trucks', [0.0, 0.1, 0.9])", job="mcp-1")
+    feed = tool("r-tok", "changes", table="docs", after=0)
+    checks["MCP"] = init["serverInfo"]["name"] == "pondra" and names == ["list_tables", "query", "write", "changes"] and {"users", "docs", "sales.orders"} <= tables \
+        and tool("r-tok", "query", sql="SELECT count(*) AS n FROM docs")["rows"] == [{"n": 3}] and tool("r-tok", "write", sql="DELETE FROM docs") is None \
+        and wrote == {"rows": 1} and tool("w-tok", "write", sql="INSERT INTO docs VALUES (4, 'trucks', [0.0, 0.1, 0.9])", job="mcp-1") == {"duplicate": True} \
+        and len(feed["rows"]) == 5 and any(r.get("_deleted") for r in feed["rows"]) and feed["position"] > 0
+    a.kill(); b.kill()
+    ok = all(checks.values())
+    print(json.dumps({"clients": checks, "inbox_s": round(inbox_s, 2), "ok": ok}, indent=1))
+    if not ok:
+        sys.exit(1)
+    return f"SQL writes, Python client, Postgres (4 drivers), tokens, change-feed replay, attached lake, inbox ({inbox_s:.1f}s), vector search, MCP, no file access from SQL: all {len(checks)} checks pass"
+
+
+def _raises(f):
+    try:
+        f()
+        return False
+    except Exception:
+        return True
+
+
 def load():
     lake = new_lake()
     node = Node(lake, A.port, flush_ms=A.flush_ms, tier_secs=10).start()
@@ -387,7 +519,7 @@ def load():
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    out = {t.__name__: t() for t in (upsert, tiering, fence, insert, serverless, reader, crash)}
+    out = {t.__name__: t() for t in (upsert, tiering, fence, insert, serverless, clients, reader, crash)}
     A.secs = min(A.secs, 20)
     out["load"] = load()
     print(json.dumps(out, indent=1))
@@ -395,7 +527,7 @@ def all_tests():
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "tiering", "fence", "reader", "insert", "serverless", "load", "all"])
+    ap.add_argument("mode", choices=["crash", "upsert", "tiering", "fence", "reader", "insert", "serverless", "clients", "load", "all"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -406,4 +538,4 @@ if __name__ == "__main__":
     ap.add_argument("--secs", type=int, default=30)
     ap.add_argument("--flush-ms", type=int, default=250)
     A = ap.parse_args()
-    {"crash": crash, "upsert": upsert, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "load": load, "all": all_tests}[A.mode]()
+    {"crash": crash, "upsert": upsert, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "load": load, "all": all_tests}[A.mode]()

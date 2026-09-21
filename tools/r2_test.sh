@@ -15,4 +15,4 @@ for t in "harness.py fence" "harness.py upsert" "harness.py crash --runs 2 --bat
   echo "== $t"
   python3 tools/$t --s3 2>&1 | tail -4 | tee -a "$out/summary.txt"
 done
-echo; echo "Summary saved to $out/summary.txt (test data is under s3://$PONDRA_BUCKET/test-*; delete it when done)."
+echo; echo "Summary saved to $out/summary.txt (each test deletes its lake when it finishes; tools/clean_bucket.py sweeps leftovers)."

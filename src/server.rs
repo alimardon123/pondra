@@ -18,7 +18,7 @@ use datafusion::arrow::{compute::concat_batches, json as arrow_json, record_batc
 use futures::{StreamExt, TryStreamExt};
 use serde::Deserialize;
 use serde_json::{json as j, Value};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -33,6 +33,7 @@ pub struct App {
     pub retain_ms: u64,
     pub results: Arc<Results>,       // recent query results (see `Results`)
     pub replica: Option<Arc<crate::replica::ReplicaLog>>, // what this follower holds for the leader
+    pub auth: Arc<crate::auth::Auth>,
 }
 
 /// Recent query results. By default a result is reused only at exactly the catalog version it
@@ -111,6 +112,7 @@ pub fn router(app: App) -> Router {
         .route("/insert/{name}", post(insert))
         .route("/cluster/files", post(files))
         .route("/sql", post(sql))
+        .route("/mcp", post(crate::mcp::handle))
         .route("/lookup/{name}/{key}", get(lookup))
         .route("/watch/{name}", get(watch))
         .route("/stats", get(stats))
@@ -123,7 +125,19 @@ pub fn router(app: App) -> Router {
         .route("/cluster/replica", get(replica))
         .route("/cluster/leader", get(|State(app): State<App>| async move { Json(app.cluster.leader_status()) }))
         .layer(axum::extract::DefaultBodyLimit::max(1 << 30)) // batches up to 1 GiB
+        .layer(middleware::from_fn_with_state(app.clone(), guard))
         .with_state(app)
+}
+
+/// Tokens (see `auth.rs`): the caller's role must cover the route; handlers see it too.
+async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response {
+    let token = req.headers().get("authorization").and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer "));
+    let role = app.auth.role(token);
+    if role < crate::auth::Auth::needed(req.uri().path()) {
+        return (StatusCode::UNAUTHORIZED, "this needs a token with more rights").into_response();
+    }
+    req.extensions_mut().insert(role);
+    next.run(req).await
 }
 
 /// Followers forward metadata writes to the leader, unchanged.
@@ -222,7 +236,29 @@ async fn replica(State(app): State<App>, Query(p): Query<AckParams>) -> Result<V
 }
 
 impl App {
-    fn log(&self) -> anyhow::Result<&Log> { self.log.as_deref().ok_or_else(|| anyhow::anyhow!("read-only node")) }
+    pub fn log(&self) -> anyhow::Result<&Log> { self.log.as_deref().ok_or_else(|| anyhow::anyhow!("read-only node")) }
+
+    /// Run a query: across the cluster when the tables are big (`spread`: "1" always, "0" never).
+    pub async fn query(&self, query: &str, spread: Option<&str>) -> anyhow::Result<Vec<RecordBatch>> {
+        let nodes = if spread == Some("0") { vec![] } else { self.cluster.nodes() };
+        match crate::spmd::query(&self.lake, &nodes, &self.cluster.addr, query, spread == Some("1")).await {
+            Ok(Some(batches)) => return Ok(batches),
+            Ok(None) => {}
+            Err(e) => eprintln!("distributed query failed, running it here: {e:#}"),
+        }
+        Ok(session(&self.lake, query, "").await?.sql_with_options(query, crate::query::read_only()).await?.collect().await?)
+    }
+
+    /// Record an INSERT's files: here on the leader, or forwarded to it.
+    pub async fn record_files(&self, f: crate::write::Files) -> anyhow::Result<Value> {
+        if self.seq.is_none() {
+            let r = crate::cluster::http().post(format!("http://{}/cluster/files", self.cluster.leader.addr)).json(&f).send().await?;
+            anyhow::ensure!(r.status().is_success(), "leader: {}", r.text().await?);
+            return Ok(r.json().await?);
+        }
+        let _guard = self.lock.lock().await;
+        crate::write::record(&self.lake, f).await
+    }
 
     /// Tier the tables with at least `min_rows` rows in the log (0: all of them), publish them
     /// for other engines, then expire what everything has consumed (leader).
@@ -282,54 +318,11 @@ impl App {
 
 // ---------------------------------------------------------------- the API
 
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum TableSpec {
-    Columns(Vec<(String, String)>),
-    Full {
-        columns: Vec<(String, String)>,
-        #[serde(default)]
-        key: Vec<String>,
-        #[serde(default)]
-        merge: BTreeMap<String, String>,
-        publish: Option<Vec<String>>,
-        #[serde(default)]
-        cluster_by: Vec<String>,
-    },
-}
-
-/// Body: `[["user","Utf8"],["amount","Int64"]]`; or `{"columns": [...], "key": ["user"]}` for an
-/// upsert table (latest row per key wins; a Boolean `_deleted` column marks deletes); add
-/// `"merge": {"total": "sum"}` for a merge table (rows per key combine: sum, min or max).
-/// `"publish": ["delta", "iceberg"]` also keeps the table readable by other engines in those
-/// formats (default: the node's `--publish`); sent again for an existing table, it changes that.
-/// `"cluster_by": ["user"]` (append tables) sorts each file by those columns, so filters on them
-/// skip most of every file.
+/// Body: a table's definition (see `write::TableSpec`): `[["user","Utf8"],…]`, or
+/// `{"columns": [...], "key": ["user"], "merge": {...}, "publish": [...], "cluster_by": [...]}`.
 async fn create_table(State(app): State<App>, Path(name): Path<String>, body: String) -> Result<Json<Value>, E> {
-    let (columns, key, merge, publish, cluster) = match serde_json::from_str(&body)? {
-        TableSpec::Columns(c) => (c, vec![], BTreeMap::new(), None, vec![]),
-        TableSpec::Full { columns, key, merge, publish, cluster_by } => (columns, key, merge, publish, cluster_by),
-    };
-    schema(&columns)?; // validate types
-    ensure!(merge.values().all(|f| ["sum", "min", "max"].contains(&f.as_str())), "merge functions: sum, min, max");
-    ensure!(merge.is_empty() || !key.is_empty(), "a merge table needs a key");
-    ensure!(publish.iter().flatten().all(|f| ["delta", "iceberg"].contains(&f.as_str())), "publish formats: delta, iceberg");
-    ensure!(cluster.iter().all(|c| columns.iter().any(|(n, _)| n == c)) && (cluster.is_empty() || key.is_empty()), "cluster_by: columns of an append table (keyed tables are sorted by key)");
     let _guard = app.lock.lock().await;
-    let meta = match app.lake.cat.get::<TableMeta>(&table_key(&name)).await? {
-        None => TableMeta { columns, key, merge, publish: publish.unwrap_or_else(default_publish), cluster, ..Default::default() },
-        Some(m) if publish.is_none() || publish.as_ref() == Some(&m.publish) => return Ok(Json(j!({"table": name, "publish": m.publish}))),
-        Some(mut m) => {
-            let dropped: Vec<String> = m.publish.iter().filter(|f| !publish.iter().flatten().any(|p| p == *f)).cloned().collect();
-            m.publish = publish.unwrap_or_default();
-            for format in dropped {
-                crate::delta::unpublish(&app.lake, &name, &format).await?; // (no stale copy left for other engines)
-            }
-            m
-        }
-    };
-    app.lake.cat.commit(vec![(table_key(&name), json(&meta))], &[]).await?;
-    Ok(Json(j!({"table": name, "publish": meta.publish})))
+    Ok(Json(crate::write::create_table(&app.lake, &name, &body).await?))
 }
 
 #[derive(Deserialize)]
@@ -346,8 +339,19 @@ async fn append(State(app): State<App>, Path(name): Path<String>, Query(p): Quer
     let schema = schema(&meta.columns)?;
     let arrow = headers.get("content-type").is_some_and(|v| v.as_bytes().starts_with(b"application/vnd.apache.arrow"));
     let batches = if arrow {
+        // Columns by name, cast to the table's types (pandas, Polars and Arrow differ in string
+        // types); a missing `_deleted` means none of these rows is a delete.
+        let conform = |b: RecordBatch| -> anyhow::Result<RecordBatch> {
+            let column = |f: &datafusion::arrow::datatypes::Field| match b.column_by_name(f.name()) {
+                Some(c) => Ok(datafusion::arrow::compute::cast(c, f.data_type())?),
+                None if f.name() == "_deleted" => Ok(datafusion::arrow::array::new_null_array(f.data_type(), b.num_rows())),
+                None => Err(anyhow::anyhow!("no column {}", f.name())),
+            };
+            let cols = schema.fields().iter().map(|f| column(f));
+            Ok(RecordBatch::try_new(schema.clone(), cols.collect::<anyhow::Result<Vec<_>>>()?)?)
+        };
         let ipc = StreamReader::try_new(&body[..], None)?.collect::<Result<Vec<_>, _>>()?;
-        ipc.into_iter().map(|b| b.with_schema(schema.clone())).collect::<Result<Vec<_>, _>>()?
+        ipc.into_iter().map(conform).collect::<anyhow::Result<Vec<_>>>()?
     } else {
         arrow_json::ReaderBuilder::new(schema.clone()).build(&body[..])?.collect::<Result<Vec<_>, _>>()?
     };
@@ -366,22 +370,15 @@ struct InsertParams {
 async fn insert(State(app): State<App>, Path(name): Path<String>, Query(p): Query<InsertParams>, query: String) -> Result<Json<Value>, E> {
     ensure!(!app.cluster.reader, "read-only node");
     let ctx = session(&app.lake, &query, "").await?;
-    match crate::insert::write(&app.lake, ctx, &name, &query, &p.job).await? {
-        Some(f) => files(State(app), Json(f)).await,
+    match crate::write::write_files(&app.lake, &ctx, &name, &query, &p.job).await? {
+        Some(f) => Ok(Json(app.record_files(f).await?)),
         None => Ok(Json(j!({"duplicate": true}))),
     }
 }
 
-/// Record an INSERT's files: on the leader, or forwarded to it (from this node, another node, or
-/// a `pondra sql` somewhere else).
-async fn files(State(app): State<App>, Json(f): Json<crate::insert::Files>) -> Result<Json<Value>, E> {
-    if app.seq.is_none() {
-        let r = crate::cluster::http().post(format!("http://{}/cluster/files", app.cluster.leader.addr)).json(&f).send().await?;
-        ensure!(r.status().is_success(), "leader: {}", r.text().await?);
-        return Ok(Json(r.json().await?));
-    }
-    let _guard = app.lock.lock().await;
-    Ok(Json(crate::insert::record(&app.lake, f).await?))
+/// Record an INSERT's files (from another node, or a `pondra sql` somewhere else).
+async fn files(State(app): State<App>, Json(f): Json<crate::write::Files>) -> Result<Json<Value>, E> {
+    Ok(Json(app.record_files(f).await?))
 }
 
 /// Body: `{"source": "events", "target": "per_user", "sql": "SELECT … FROM events …"}`.
@@ -406,7 +403,7 @@ async fn lookup(State(app): State<App>, Path((name, key)): Path<(String, String)
     let lake = &app.lake;
     let meta: TableMeta = lake.cat.get(&table_key(&name)).await?.ok_or_else(|| anyhow::anyhow!("no table {name}"))?;
     ensure!(!meta.key.is_empty(), "{name} has no key: use /sql");
-    if meta.merge.is_empty() {
+    if meta.merge.is_empty() && meta.ttl.is_none() {
         let names: Vec<&str> = meta.columns.iter().map(|(c, _)| c.as_str()).collect();
         let row = crate::serve::lookup(lake, &name, &meta, &key).await?.map(|r| r.project(&names.iter().map(|n| r.schema().index_of(n)).collect::<Result<Vec<_>, _>>()?)).transpose()?;
         let mut w = arrow_json::ArrayWriter::new(Vec::new());
@@ -429,7 +426,7 @@ async fn lookup(State(app): State<App>, Path((name, key)): Path<(String, String)
     let cols = meta.columns.iter().map(|(c, _)| format!("\"{c}\"")).collect::<Vec<_>>().join(", ");
     let sql = match meta.merge.is_empty() {
         // Upsert table: the newest version of the key wins (no window over the whole table).
-        true => format!("SELECT {cols} FROM __raw WHERE {where_} ORDER BY \"_ord\" DESC LIMIT 1"),
+        true => format!("SELECT * FROM (SELECT {cols} FROM __raw WHERE {where_} ORDER BY \"_ord\" DESC LIMIT 1){}", crate::query::live(&meta)),
         // Merge table: combine that key's partial rows.
         false => format!("{} ", latest_sql(&meta, "__raw", false, false)).replace(" GROUP BY ", &format!(" WHERE {where_} GROUP BY ")),
     };
@@ -446,9 +443,14 @@ struct SqlParams {
     after: Option<u64>,     // read-your-writes: first wait until this node has seen segment `after` (from an ack)
     spread: Option<String>, // "1": run across the cluster even for small tables; "0": only here
     stale_ms: Option<u64>,  // accept a cached result up to this old (see `Results`)
+    job: Option<String>,    // writes: a retry with the same job id is applied once
 }
 
-async fn sql(State(app): State<App>, Query(p): Query<SqlParams>, query: String) -> Result<Response, E> {
+async fn sql(State(app): State<App>, Query(p): Query<SqlParams>, role: axum::Extension<crate::auth::Role>, query: String) -> Result<Response, E> {
+    if let Some(stmt) = crate::write::parse(&query) {
+        app.auth.allows(role.0, &stmt)?;
+        return Ok(Json(crate::write::on_node(&app, stmt, p.job.clone()).await?).into_response()); // CREATE / INSERT / UPDATE / DELETE
+    }
     if let Some(seg) = p.after {
         let mut hwm = app.lake.hwm.subscribe();
         let _ = tokio::time::timeout(Duration::from_secs(30), async { while app.lake.visible() < seg { hwm.changed().await.ok()?; } Some(()) }).await;
@@ -494,16 +496,7 @@ async fn sql(State(app): State<App>, Query(p): Query<SqlParams>, query: String) 
 
 /// Run a query (across the cluster if it's worth it) and format the result.
 async fn run_sql(app: &App, p: &SqlParams, query: &str) -> anyhow::Result<bytes::Bytes> {
-    let nodes = if p.spread.as_deref() == Some("0") { vec![] } else { app.cluster.nodes() };
-    let spread = crate::spmd::query(&app.lake, &nodes, &app.cluster.addr, query, p.spread.as_deref() == Some("1")).await;
-    let batches = match spread {
-        Ok(Some(batches)) => batches,
-        Ok(None) => session(&app.lake, query, "").await?.sql(query).await?.collect().await?,
-        Err(e) => {
-            eprintln!("distributed query failed, running it here: {e:#}");
-            session(&app.lake, query, "").await?.sql(query).await?.collect().await?
-        }
-    };
+    let batches = app.query(query, p.spread.as_deref()).await?;
     Ok(bytes::Bytes::from(match p.format.as_deref() {
         Some("table") => pretty_format_batches(&batches)?.to_string().into_bytes(),
         Some("arrow") => {
@@ -525,19 +518,28 @@ async fn run_sql(app: &App, p: &SqlParams, query: &str) -> anyhow::Result<bytes:
 
 #[derive(Deserialize)]
 struct WatchParams {
-    after: Option<u64>, // default: from now on
+    after: Option<u64>, // default: from now on (earlier: a replay, as far back as the log is kept)
+    #[serde(default)]
+    marks: bool, // after each batch of rows, a `{"_after": N}` line: resume with `?after=N`
 }
 
 /// New rows of a table as NDJSON, pushed the moment they commit (a view's rows included).
 async fn watch(State(app): State<App>, Path(name): Path<String>, Query(p): Query<WatchParams>) -> Response {
     let hwm = app.lake.hwm.subscribe();
     let after = p.after.unwrap_or_else(|| app.lake.visible());
-    let rows = futures::stream::unfold((app, hwm, after, name), |(app, mut hwm, after, name)| async move {
+    let marks = p.marks;
+    let rows = futures::stream::unfold((app, hwm, after, name), move |(app, mut hwm, after, name)| async move {
         loop {
             hwm.borrow_and_update();
             let now = app.lake.visible();
             if now > after {
-                let chunk = tail(&app.lake, &name, after, Some(now), false).await.and_then(|b| ndjson(&b));
+                let mark = |mut b: Vec<u8>| {
+                    if marks && !b.is_empty() {
+                        b.extend(format!("{{\"_after\":{now}}}\n").into_bytes());
+                    }
+                    b
+                };
+                let chunk = tail(&app.lake, &name, after, Some(now), false).await.and_then(|b| ndjson(&b)).map(mark);
                 return Some((chunk.map_err(|e| std::io::Error::other(e.to_string())), (app, hwm, now, name)));
             }
             hwm.changed().await.ok()?;

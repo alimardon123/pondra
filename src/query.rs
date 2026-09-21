@@ -8,7 +8,7 @@ use anyhow::{bail, Result};
 use datafusion::arrow::array::{ArrayRef, UInt64Array};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
-use datafusion::datasource::MemTable;
+use datafusion::datasource::{MemTable, TableProvider};
 use datafusion::prelude::*;
 use futures::{StreamExt, TryStreamExt};
 use std::sync::Arc;
@@ -103,22 +103,21 @@ fn empty(ctx: &SessionContext, meta: &TableMeta) -> Result<DataFrame> {
 /// rows whose key no newer source has — an anti-join against the newer keys, which are usually
 /// few (the log tail and recent files) — and only the log tail is deduplicated itself. A table
 /// that is one compacted file reads as that file.
-pub async fn register_upsert(lake: &Lake, ctx: &SessionContext, name: &str, meta: &TableMeta) -> Result<()> {
+async fn upsert_view(lake: &Lake, ctx: &SessionContext, name: &str, meta: &TableMeta) -> Result<Arc<dyn TableProvider>> {
     let (tail, files) = sources(lake, ctx, name, meta, None).await?;
-    let mut names = vec![];
+    let (mut names, aux) = (vec![], lake.session()); // (the parts live in their own context: SHOW TABLES lists only tables)
     if let Some(t) = tail {
-        ctx.register_table(format!("__tail_{name}").as_str(), t.into_view())?;
-        let newest = latest_sql(meta, &format!("__tail_{name}"), false, true); // (delete markers still shadow)
-        ctx.register_table(format!("__s0_{name}").as_str(), ctx.sql(&newest).await?.into_view())?;
-        names.push(format!("__s0_{name}"));
+        aux.register_table("__tail", t.into_view())?;
+        let newest = latest_sql(meta, "__tail", false, true); // (delete markers still shadow)
+        aux.register_table("__s0", aux.sql(&newest).await?.into_view())?;
+        names.push("__s0".to_string());
     }
     for (i, f) in files.into_iter().enumerate() {
-        ctx.register_table(format!("__f{i}_{name}").as_str(), f.into_view())?;
-        names.push(format!("__f{i}_{name}"));
+        aux.register_table(format!("__f{i}").as_str(), f.into_view())?;
+        names.push(format!("__f{i}"));
     }
     if names.is_empty() {
-        ctx.register_table(name, Arc::new(MemTable::try_new(schema(&meta.columns)?, vec![vec![]])?))?;
-        return Ok(());
+        return Ok(Arc::new(MemTable::try_new(schema(&meta.columns)?, vec![vec![]])?));
     }
     let q = |c: &String| format!("\"{c}\"");
     let cols = |p: &str| meta.columns.iter().map(|(c, _)| format!("{p}{}", q(c))).collect::<Vec<_>>().join(", ");
@@ -131,10 +130,22 @@ pub async fn register_upsert(lake: &Lake, ctx: &SessionContext, name: &str, meta
             format!("SELECT {} FROM \"{src}\" s LEFT ANTI JOIN ({newer}) n ON {on}", cols("s."))
         }
     }).collect();
-    let deleted = meta.columns.iter().any(|(c, _)| c == "_deleted").then_some(" WHERE \"_deleted\" IS NOT TRUE").unwrap_or("");
-    let sql = format!("SELECT {} FROM ({}){deleted}", cols(""), parts.join(" UNION ALL "));
-    ctx.register_table(name, ctx.sql(&sql).await?.into_view())?;
-    Ok(())
+    let sql = format!("SELECT {} FROM ({}){}", cols(""), parts.join(" UNION ALL "), live(meta));
+    Ok(aux.sql(&sql).await?.into_view())
+}
+
+/// A table as its users see it: append tables as files + log; keyed tables their current rows.
+pub async fn table_view(lake: &Lake, ctx: &SessionContext, name: &str, meta: &TableMeta) -> Result<Arc<dyn TableProvider>> {
+    if !meta.key.is_empty() && meta.merge.is_empty() {
+        return upsert_view(lake, ctx, name, meta).await;
+    }
+    let df = raw(lake, ctx, name, meta, None).await?;
+    if meta.key.is_empty() {
+        return Ok(df.into_view());
+    }
+    let aux = lake.session();
+    aux.register_table("__raw", df.into_view())?;
+    Ok(aux.sql(&current_sql(lake, meta, "__raw")).await?.into_view())
 }
 
 /// Keyed tables as their users see them. Upsert tables: the latest row per key, without deleted
@@ -152,16 +163,14 @@ pub fn latest_sql(meta: &TableMeta, raw_table: &str, sorted: bool, keep_deleted:
             Some(f) => format!("{f}({}) AS {}", q(c), q(c)),
             None => q(c),
         });
-        return format!("SELECT {} FROM \"{raw_table}\" GROUP BY {key}{order}", cols.collect::<Vec<_>>().join(", "));
+        let live = if keep_deleted { String::new() } else { live(meta) }; // (windows past their TTL drop out)
+        return format!("SELECT * FROM (SELECT {} FROM \"{raw_table}\" GROUP BY {key}){live}{order}", cols.collect::<Vec<_>>().join(", "));
     }
     // Newest version per key as a grouped aggregate (a hash table), not a window (a sort).
     let newest = |c: &String| format!("first_value({} ORDER BY \"_ord\" DESC) AS {}", q(c), q(c));
     let cols = meta.columns.iter().map(|(c, _)| if meta.key.contains(c) { q(c) } else { newest(c) });
     let out = meta.columns.iter().map(|(c, _)| q(c)).collect::<Vec<_>>().join(", ");
-    let deleted = match keep_deleted {
-        false => meta.columns.iter().any(|(c, _)| c == "_deleted").then_some(" WHERE \"_deleted\" IS NOT TRUE").unwrap_or(""),
-        true => "",
-    };
+    let deleted = if keep_deleted { String::new() } else { live(meta) }; // (a partial merge keeps markers and expired rows)
     format!("SELECT {out} FROM (SELECT {} FROM \"{raw_table}\" GROUP BY {key}){deleted}{order}",
             cols.collect::<Vec<_>>().join(", "))
 }
@@ -174,30 +183,44 @@ pub fn current_sql(lake: &Lake, meta: &TableMeta, raw_table: &str) -> String {
         return latest_sql(meta, raw_table, false, false);
     }
     let cols = meta.columns.iter().map(|(c, _)| format!("\"{c}\"")).collect::<Vec<_>>().join(", ");
-    let deleted = meta.columns.iter().any(|(c, _)| c == "_deleted").then_some(" WHERE \"_deleted\" IS NOT TRUE").unwrap_or("");
-    format!("SELECT {cols} FROM \"{raw_table}\"{deleted}")
+    format!("SELECT {cols} FROM \"{raw_table}\"{}", live(meta))
+}
+
+/// ` WHERE …` keeping a keyed table's live rows: not deleted, not past their TTL ("" if nothing to drop).
+pub fn live(meta: &TableMeta) -> String {
+    let deleted = meta.columns.iter().any(|(c, _)| c == "_deleted").then(|| "\"_deleted\" IS NOT TRUE".to_string());
+    let conds: Vec<String> = deleted.into_iter().chain(Some(meta.ttl_sql()).filter(|t| !t.is_empty())).collect();
+    if conds.is_empty() { String::new() } else { format!(" WHERE {}", conds.join(" AND ")) }
+}
+
+/// What SQL from users may do on a node: queries only. No `COPY … TO` files, no `CREATE EXTERNAL
+/// TABLE` over the node's disk, no session DDL; writes go through `write.rs`, `SET` through pg.rs.
+pub fn read_only() -> datafusion::execution::context::SQLOptions {
+    datafusion::execution::context::SQLOptions::new().with_allow_ddl(false).with_allow_dml(false).with_allow_statements(false)
 }
 
 /// A session with every table referenced in `sql` registered (cheap name filter), except
-/// `except`, which the caller registers itself.
+/// `except`, which the caller registers itself. Attached lakes' tables are `name.table`.
 pub async fn session(lake: &Lake, sql: &str, except: &str) -> Result<SessionContext> {
     let ctx = lake.session();
-    for (key, meta) in lake.cat.scan::<TableMeta>("t/", "t0").await? {
-        let name = &key[2..];
-        if !sql.contains(name) || name == except {
-            continue;
+    let listing = ["information_schema", "show tables", "show columns"].iter().any(|w| sql.to_lowercase().contains(w)); // (every table)
+    let attached = lake.attached.read().unwrap().clone();
+    for (ns, other) in [(String::new(), None)].into_iter().chain(attached.into_iter().map(|(n, l)| (n, Some(l)))) {
+        let from = other.as_deref().unwrap_or(lake);
+        if !ns.is_empty() {
+            if !listing && !sql.contains(&format!("{ns}.")) {
+                continue;
+            }
+            let schemas = ctx.catalog("datafusion").expect("the default catalog");
+            schemas.register_schema(&ns, Arc::new(datafusion::catalog::MemorySchemaProvider::new()))?;
         }
-        if !meta.key.is_empty() && meta.merge.is_empty() {
-            register_upsert(lake, &ctx, name, &meta).await?;
-            continue;
-        }
-        let df = raw(lake, &ctx, name, &meta, None).await?;
-        if meta.key.is_empty() {
-            ctx.register_table(name, df.into_view())?;
-        } else {
-            let raw_name = format!("__raw_{name}");
-            ctx.register_table(raw_name.as_str(), df.into_view())?;
-            ctx.register_table(name, ctx.sql(&current_sql(lake, &meta, &raw_name)).await?.into_view())?;
+        for (key, meta) in from.cat.scan::<TableMeta>("t/", "t0").await? {
+            let name = &key[2..];
+            let full = if ns.is_empty() { name.to_string() } else { format!("{ns}.{name}") };
+            if (!listing && !sql.contains(full.as_str())) || (ns.is_empty() && name == except) {
+                continue;
+            }
+            ctx.register_table(full.as_str(), table_view(from, &ctx, name, &meta).await?)?;
         }
     }
     Ok(ctx)

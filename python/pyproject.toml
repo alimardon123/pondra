@@ -1,0 +1,13 @@
+[project]
+name = "pondra"
+version = "0.9.0"
+description = "Python client for Pondra: SQL into pandas/Polars/Arrow, exactly-once appends, change feeds"
+requires-python = ">=3.9"
+dependencies = []
+
+[project.optional-dependencies]
+arrow = ["pyarrow"]
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"

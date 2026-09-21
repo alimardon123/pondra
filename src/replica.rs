@@ -70,7 +70,10 @@ impl ReplicaLog {
         let frame = Frame::Change(d.clone()).encode();
         let o = st.open.as_mut().expect("open");
         o.0.write_all(&term.to_le_bytes())?;
-        o.0.write_all(&frame)?; // (the page cache survives a process crash; that's the failure covered)
+        o.0.write_all(&frame)?; // (the page cache survives a process crash; `--fsync`: a power loss too)
+        if std::env::var("PONDRA_FSYNC").is_ok_and(|v| v == "true") {
+            o.0.sync_data()?;
+        }
         o.3 = o.3.max(d.id);
         keep(&mut st.held, d.id, term, frame);
         st.run = if st.run.1 > 0 && d.id == st.run.1 + 1 { (st.run.0, d.id) } else { (d.id, d.id) };

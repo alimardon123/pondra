@@ -1,0 +1,69 @@
+upsert: 395 live keys after 12,000 random upserts/deletes, 6 compactions (s: 0.0, 0.0, 0.0, 0.0, 0.0, 0.0), 1 restart, 3,400 lookups (0 wrong) -> OK
+tiering: 12 rounds -> files {'events': 5, 'kv': 5, 'totals': 5}, untiered rows 0, rows {'events': 1200, 'kv': {'n': 200, 'v': 2400}, 'totals': 1200} -> OK
+fence: 2nd node joined as follower=True; takeover after 6.0s; stale leader's write rejected; it rejoined as follower; rows=[{'producer': 'a', 'n': 200}, {'producer': 'b', 'n': 200}] -> OK
+insert: first={'rows': 5} retry={'duplicate': True} summary={'groups': 5, 'n': 5000} -> OK
+{"serverless": {"alone_s": 0.03, "retry": ["{\"rows\":1000}", "{\"duplicate\":true}"], "four_at_once": ["{\"rows\":1000}", "{\"rows\":1000}", "{\"rows\":1000}", "{\"rows\":1000}"], "node_start_s": 0.02, "node_leads": true, "via_node_s": 0.02, "after_leader_killed_s": 30.12, "rows": {"n": 8000, "ids": 1000}, "ok": true}}
+{
+ "clients": {
+  "no token -> 401": true,
+  "read token can't write": true,
+  "write token can't create": true,
+  "users via SQL": true,
+  "pandas / polars / list appends": true,
+  "lookup": true,
+  "change feed replay (upserts + delete)": true,
+  "psycopg 3": true,
+  "psycopg 3 binary": true,
+  "psycopg2": true,
+  "SQLAlchemy + pandas": true,
+  "asyncpg": true,
+  "wrong password refused": true,
+  "cross-lake join": true,
+  "inbox write": true,
+  "vector search (SQL + Postgres)": true,
+  "SQL can't touch the node's files": true,
+  "MCP": true
+ },
+ "inbox_s": 1.03,
+ "ok": true
+}
+reader: send -> visible on a separate read-only node: p50 7 ms, p99 85 ms
+run  1: kill-9=1 injected={'after_seg_put': 0, 'after_commit': 1, 'after_parquet_put': 10} events=9000/9000 unique=9000 task_output=4500/4500 views=exact -> OK
+run  2: kill-9=1 injected={'after_seg_put': 0, 'after_commit': 2, 'after_parquet_put': 5} events=9000/9000 unique=9000 task_output=4500/4500 views=exact -> OK
+run  3: kill-9=3 injected={'after_seg_put': 0, 'after_commit': 1, 'after_parquet_put': 5} events=9000/9000 unique=9000 task_output=4500/4500 views=exact -> OK
+run  4: kill-9=1 injected={'after_seg_put': 0, 'after_commit': 0, 'after_parquet_put': 8} events=9000/9000 unique=9000 task_output=4500/4500 views=exact -> OK
+run  5: kill-9=1 injected={'after_seg_put': 0, 'after_commit': 0, 'after_parquet_put': 1} events=9000/9000 unique=9000 task_output=4500/4500 views=exact -> OK
+{
+ "events_per_s": 1200,
+ "ack_ms_p50": 251,
+ "ack_ms_p99": 254,
+ "freshness_ms_p50": 126,
+ "freshness_ms_p99": 264,
+ "freshness_samples": 54,
+ "commits_per_s": 4.0,
+ "commit_ms_p50": 2,
+ "commit_ms_p95": 3,
+ "server_cores_used": 0.07
+}
+{
+ "upsert": "12,000 random upserts/deletes with compactions and a restart match the model exactly (395 live keys)",
+ "tiering": "12 rounds of writes and tiering: log drained, files bounded ({'events': 5, 'kv': 5, 'totals': 5}), every row exact",
+ "fence": "a frozen leader is replaced; when it wakes, its write is rejected (fenced) and it rejoins as a follower; nothing lost",
+ "insert": "bulk INSERT \u2026 SELECT writes Parquet directly; a retried job id is applied once",
+ "serverless": "INSERT from a process with no server: 0.03s alone, 4 at once, retries once; a node on the idle lake leads in 0.02s; via a running leader 0.02s; after the leader is killed 30.12s; 8000 rows, no duplicates",
+ "clients": "SQL writes, Python client, Postgres (4 drivers), tokens, change-feed replay, attached lake, inbox (1.0s): all 18 checks pass",
+ "reader": "freshness on a separate read-only node: p50 7 ms, p99 85 ms",
+ "crash": "5/5 runs, 0 lost, 0 duplicated (events, streaming-task output, views); crashes survived: {'after_seg_put': 0, 'after_commit': 4, 'after_parquet_put': 29, 'kill -9': 7}",
+ "load": {
+  "events_per_s": 1200,
+  "ack_ms_p50": 251,
+  "ack_ms_p99": 254,
+  "freshness_ms_p50": 126,
+  "freshness_ms_p99": 264,
+  "freshness_samples": 54,
+  "commits_per_s": 4.0,
+  "commit_ms_p50": 2,
+  "commit_ms_p95": 3,
+  "server_cores_used": 0.07
+ }
+}

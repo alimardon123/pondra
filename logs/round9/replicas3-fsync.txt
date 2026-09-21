@@ -1,0 +1,26 @@
+== latency replicated fsync
+latency: 3 nodes, 0 background producers; 254 probe events, 254 pushed back
+  ack (replicated)                p50 4 ms  p99 9 ms
+  view row pushed to another node     p50 4 ms  p99 8 ms
+== latency replicated 3 replicas
+latency: 3 nodes, 0 background producers; 251 probe events, 251 pushed back
+  ack (replicated)                p50 4 ms  p99 7 ms
+  view row pushed to another node     p50 4 ms  p99 7 ms
+== failover replicated 3 replicas fsync 1
+  failovers: 5.1s, 4.7s (kill -> writes acked again); state caught up 0.2s after the last write
+  events exactly once: True (1346800 rows); for 1000 users, task state == model: True, inline view == model: True
+  shard runs per node (since each node's last start): {18080: 239, 18081: 365, 18082: 251}
+== failover replicated 3 replicas fsync 2
+  failovers: 5.1s, 4.5s (kill -> writes acked again); state caught up 0.3s after the last write
+  events exactly once: True (1269100 rows); for 1000 users, task state == model: True, inline view == model: True
+  shard runs per node (since each node's last start): {18080: 224, 18081: 327, 18082: 261}
+== failover replicated 3 replicas fsync 3
+  failovers: 5.2s, 4.4s (kill -> writes acked again); state caught up 0.2s after the last write
+  events exactly once: True (1297400 rows); for 1000 users, task state == model: True, inline view == model: True
+  shard runs per node (since each node's last start): {18080: 245, 18081: 386, 18082: 266}
+== users replicated 3 replicas
+  3547400 events (114,804/s), ack p50 45 ms p99 238 ms
+  1232 snapshot reads, query p50 361 ms p99 1139 ms
+  inconsistent reads: 0; producers with lost/duplicate batches: 0
+    by node: {}
+DONE

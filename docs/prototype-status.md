@@ -1,6 +1,6 @@
 # Prototype status: Pondra, a streamhouse in one binary
 
-**Date:** 2026-09-21 (round 8) · **Plan:** ADR-002 to ADR-009 · **Code:** `pondra.zip` / `pondra.bundle` (≈4,550 lines of Rust, plus test and benchmark tools)
+**Date:** 2026-09-22 (round 9) · **Plan:** ADR-002 to ADR-010 · **Code:** `pondra.zip` / `pondra.bundle` (≈5,800 lines of Rust, plus a Python client and test and benchmark tools)
 **Name:** the prototype formerly called `lh` is now **Pondra**. The name is free on crates.io, PyPI and npm. A small personal-finance app uses it (pondra.app), a different category; run a trademark search before a public launch.
 
 ## Where it stands
@@ -14,6 +14,29 @@ One Rust binary replaces the Kafka + Flink + Spark + metastore + ZooKeeper stack
 - upsert and merge tables.
 
 Start more copies on the same bucket to scale out. The only state is object storage. There's no JVM, no database server and no coordination service.
+
+**Round 9 let every machine write and every tool connect** (ADR-010):
+
+1. **Writes from anywhere, with the same capabilities.**
+   - A machine that can reach the bucket but not the leader writes through the bucket inbox
+     (1.0 s locally, exactly-once).
+   - Several clusters share one bucket, each leading its own lake and attaching the others
+     (cross-lake joins; writes recorded by the owning leader).
+2. **SQL writes everywhere:** `CREATE TABLE`, `INSERT`, `UPDATE`, `DELETE`.
+   - They run on any node, over the **Postgres protocol** (psql, psycopg 2/3, asyncpg,
+     SQLAlchemy tested), over **MCP** for AI agents, or from `pondra sql` on any machine.
+   - A **Python client** reads into pandas, Polars and Arrow.
+3. **What competitors are building next, answered where it was cheap.**
+   - Fluss 1.0 lists the Postgres protocol and MCP as future work; Pondra has both now.
+   - Vector search in SQL (`cosine_distance`), as Flink 2.2 added `VECTOR_SEARCH`.
+   - Read / write / admin tokens on every door. SQL sent to a node can no longer touch the
+     node's disk.
+4. **Keyed tables got cheaper and more capable:**
+   - size-tiered compaction (3x fewer bytes written);
+   - row TTL;
+   - the log as a replayable change feed.
+
+   Replicated acks gained `--fsync` and were tested with 3 replicas.
 
 **Round 8 made the native lake the default and writes fast on any storage** (ADR-009):
 
@@ -155,6 +178,88 @@ correctness test passed while sustained ingest fell by half. It was found by ben
 testing. There is now a `tiering` test (rounds of writes + `/tier`: the log must drain and the
 file count stay bounded) and a note in `AGENTS.md` that this failure mode shows up as throughput,
 not as a red test.
+
+## Round 9: everyone writes, everything speaks SQL
+
+**What's new** (ADR-010):
+
+| | What | Measured |
+|---|---|---|
+| Bucket inbox | A machine that can reach the bucket but not the leader leaves its write in `inbox/`; the leader answers within a second | `pondra sql` INSERT through the inbox: 1.0 s locally, 6.1 s on simulated R2, 7.3 s on real R2 (the whole process, catalog open included); a retry is a duplicate |
+| Attached lakes | `--attach sales=…`: another lake's tables read as `sales.orders`, joins across lakes, writes recorded by that lake's leader | cross-lake join after a write through the other leader: exact |
+| SQL writes | `CREATE TABLE … PRIMARY KEY … WITH (publish, cluster_by, merge, ttl)`, `INSERT`, `UPDATE`, `DELETE`, from any node, Postgres, MCP or `pondra sql` | upsert/delete model exact; a keyed table declared without `_deleted` takes DELETE |
+| Postgres protocol | `--pg`: simple and extended protocol, text and binary, typed and array parameters, a small `pg_catalog` | psql, psycopg 3 (text and binary), psycopg2, asyncpg, SQLAlchemy + pandas |
+| Python client | `import pondra`: SQL → pandas / Polars / Arrow, exactly-once appends, lookups, the change feed | pandas, Polars and list appends; replay with a delete |
+| MCP | `POST /mcp`: `list_tables`, `query`, `write`, `changes`, under the same tokens | raw JSON-RPC in `harness.py clients`; the official MCP Python SDK (`logs/round9/mcp-sdk.txt`) |
+| Vector search | `FLOAT[]` embeddings, `ORDER BY cosine_distance(emb, [...]) LIMIT k` | same neighbours by SQL and by a Postgres array parameter |
+| Tokens | read / write / admin on HTTP, Postgres and MCP | missing, weaker and wrong tokens refused |
+| SQL can't touch a node's disk | `COPY … TO` and `CREATE EXTERNAL TABLE` refused on nodes | refused |
+| Size-tiered keyed compaction | merge the newest run of similar files; rewrite the table only when the run reaches the oldest | 2 M keys, 60 rounds × 20k updates: **17.9 MB written vs 53.4 MB** for full rewrites; 7 files; tier call 19 ms median; every key right |
+| TTL, change feed | `ttl = 'ts:secs'` on keyed tables; `--changelog-secs` keeps the log replayable | expired rows hidden in SQL and lookups |
+| Replicated acks, hardened | `--fsync`; `--replicas 3` | ack 4 ms p50 / 9 ms p99 with fsync; 3 replicas: 4 / 7 ms, `users` 114,804 events/s with 0 inconsistent, 3 × `failover` exact |
+
+**Regression, local disk** (`logs/round9/local-regression.txt`, `harness-all-final.txt`,
+`final-binary-cluster.txt`):
+
+- `harness.py all`: every test passes, twice (the final run's `clients` has 18 of 18 checks; the
+  first ran before the vector, file-access and MCP checks existed, with 15).
+- `crash --size 50000`: 3 runs × 9 M events, 0 lost, 0 duplicated, views exact (the log keeps
+  the last two runs' lines; a failing run stops the test).
+- `users`: 4 runs, 114.5–116.8k events/s, ack p50 44–45 ms, 0 torn reads, 0 lost or duplicated
+  batches.
+- `failover`: 3 durable and 3 replicated runs, back in 4.5–5.3 s, state == view == model.
+- race, isolate, split (3.6 M events/s), spread (identical results): pass.
+- latency: event → view row on another node 5–6 ms p50, 8–10 ms p99.
+- `open_check.py`: all six outside readers equal Pondra.
+- `clustering.py` (8 M rows): one user 276 → 6 ms, a range 174 → 2.4 ms, 100 users 221 →
+  101 ms, full scans 122 → 136 ms.
+
+**Simulated R2** (`logs/round9/sim-r2.txt`):
+
+- `harness.py clients`: 18 of 18 (the inbox write takes 6.1 s, opening the catalog included).
+- `serverless`: an INSERT with nobody running 5.8 s, through a running leader 1.7 s, 8,000 rows
+  and no duplicates.
+- `crash`: 45,000 events through 7 kill -9s and 75 injected crashes, exact. (A second run hit
+  the time limit.)
+- `failover`, replicated: back in 12.8 s and 10.4 s, exactly-once, state == view == model.
+- `users`, replicated: 83.6k events/s, ack p50 62 ms, 0 torn reads.
+- `latency`, replicated: ack 4 ms p50 / 9 ms p99; a view row on another node 3 / 8 ms.
+- Test lakes deleted at exit: 0 objects left in the bucket.
+
+**Real R2** (`ponderabucket-us`, `logs/round9/r2.txt`):
+
+- `harness.py clients`: 18 of 18 on two R2 lakes: Postgres drivers, MCP, vectors, tokens,
+  the cross-lake join. The inbox write takes 7.3 s for the whole `pondra sql` process,
+  including 3–6 s to open the catalog.
+- `serverless`:
+  - an INSERT on a brand-new lake with nobody running: 11.9 s (it creates the catalog);
+  - through a running leader: 4.0 s;
+  - right after the leader is killed: 42 s (waits for its mark to go stale);
+  - 8,000 rows, no duplicates.
+- `latency`, replicated: ack **3 ms p50 / 10 ms p99**; a view row on another node 3 / 7 ms.
+- `failover`, replicated: back in 16.9 s and 15.0 s, exactly-once, state == view == model.
+- Every round-9 test lake was deleted when its test finished. The buckets hold only the three
+  kept lakes.
+
+### What the tests caught this round
+
+- **The test harness passed `tier_secs=1` as a bare flag** (Python treats `1 == True`), so the
+  crash test's node never started, and the restart loop recursed until Python gave up. Flags are
+  now bare only for a real `True`, and a node that keeps dying on start fails after 20 tries.
+- **SQL could reach a node's own disk.** Any token that could run a query could also run `COPY …
+  TO '/path'` or `CREATE EXTERNAL TABLE … LOCATION '/etc/…'` through DataFusion, and an INSERT
+  into an attached lake could read local files. Queries on nodes are now read-only
+  (invariant 21).
+- **DELETE failed on keyed tables created in SQL** unless they declared `_deleted` themselves.
+  They get the column now; INSERTs and Arrow appends may leave it out.
+- **`cluster.py` runs on object storage left their lakes behind.** The cleanup at exit created
+  its S3 client during interpreter shutdown, when boto3 can no longer start threads. On real R2
+  that would have filled the 10 GB free tier. The client is now made when the first lake is,
+  and a simulated-R2 run ends with 0 objects left.
+- **Postgres array parameters** (a Python list for an embedding) arrived as text. They're bound
+  as arrays now.
+- **`SHOW TABLES` listed internal helper tables**, and SQLAlchemy and asyncpg needed `pg_type`,
+  a parseable `version()` and typed parameters. All fixed while building the protocol.
 
 ## Round 8: native first, fast writes on any storage, writes from anywhere
 
@@ -388,12 +493,12 @@ a real Cloudflare R2 bucket. All of them pass on all three.
 
 ## Sizes
 
-| What | Round 3 | Round 5 | Round 8 |
-|---|---|---|---|
-| Binary (stripped) | 88.3 MB (30 MB gzip, 17 MB xz) | 89.2 MB (29.9 MB gzip, 16.8 MB xz) | 90.0 MB (30.5 MB gzip, 18.7 MB xz) |
-| Idle memory | 18 MB | 41 MB (mimalloc reserves more up front) | 42 MB |
-| Peak memory under full load | 455 MB | 1.8 GB at 2.84 M events/s sustained (279–586 MB in the batch and streaming benchmarks) | not re-measured |
-| Storage per event (user, event, amount, ts) | NDJSON 77.9 B → log 12.8 B → Parquet 6.8 B | NDJSON 77.9 B → log 12.8 B → Parquet 6.8 B (unchanged) | unchanged |
+| What | Round 3 | Round 5 | Round 8 | Round 9 |
+|---|---|---|---|---|
+| Binary (stripped) | 88.3 MB (30 MB gzip, 17 MB xz) | 89.2 MB (29.9 MB gzip, 16.8 MB xz) | 90.0 MB (30.5 MB gzip, 18.7 MB xz) | 90.7 MB (30.5 MB gzip, 17.2 MB xz), with the Postgres protocol and MCP |
+| Idle memory | 18 MB | 41 MB (mimalloc reserves more up front) | 42 MB | 44 MB |
+| Peak memory under full load | 455 MB | 1.8 GB at 2.84 M events/s sustained (279–586 MB in the batch and streaming benchmarks) | not re-measured | not re-measured |
+| Storage per event (user, event, amount, ts) | NDJSON 77.9 B → log 12.8 B → Parquet 6.8 B | NDJSON 77.9 B → log 12.8 B → Parquet 6.8 B (unchanged) | unchanged | unchanged |
 
 ## Memory is a knob, not a mystery
 
@@ -424,35 +529,39 @@ peak at 279–586 MB.
 
 ## What remains
 
-- One sequencer per lake orders commits (metadata only). Past its capacity, use several lakes.
+- One sequencer per lake orders commits (metadata only). Past its capacity, split tables across
+  attached lakes (round 9); there are no transactions across lakes.
 - A *durable* acknowledgement costs one object-store write (0.25–0.7 s on R2). `--ack replicated`
   makes it milliseconds, but a write in that window survives only as long as one of its holders
-  does (no fsync; not the leader and every holder at once).
+  does (with `--fsync`, power loss included; not the leader and every holder at once).
+- No Kafka protocol, no Iceberg REST catalog, no `ALTER TABLE` yet (the top of the plan in the
+  comparison doc).
 - A one-off `pondra sql` on far-away object storage spends 2–3 s opening the catalog.
 - Open-format versions trail the ack by a few sequential bucket round trips (3–4 s near, 7–10 s
   far, at `--tier-secs 2`); Iceberg costs two more round trips than Delta.
 - A *new* analytical query costs what its scan costs (TPC-H SF1: 60–600 ms per query on two
   cores). Repeated ones and key lookups are served from caches in about a millisecond.
-- Compaction of a keyed table is one job on one node. Partitioned compaction (a key range per
-  node) is the next step; the LSM layout means it now runs once every 8 rounds, not every round.
+- Compaction of a keyed table is one job on one node. Size-tiered merging (round 9) means the
+  whole table is rewritten only when the newer data has grown to about half of it; partitioned
+  compaction (a key range per node) is the next step.
 - Merge tables only support decomposable aggregates (sum, count, min, max).
 - Distributed queries have one stage: no shuffles, so big-to-big joins run on one node.
 - Under sustained overload, commits pause until tiering catches up (`--backlog`); a client with a
   short timeout will see it as a slow ack.
-- No auth, quotas or multi-tenancy.
+- Tokens per role only (round 9): no TLS, per-table grants, quotas or multi-tenancy.
 - Other engines read Delta and Iceberg (opt-in per table), unpartitioned, and keyed tables only
   as of their last compaction (at most 8 tiering rounds behind). Time travel reaches back only as
   far as `--retain-secs` keeps replaced files.
-- No access control inside Pondra: bucket credentials decide who can do what.
+- Bucket credentials still decide who can use `pondra sql` and the inbox directly.
 
 ## Next
 
-1. **Prepared-plan cache per table version**, so a lookup costs a page read instead of a plan.
-2. **Partitioned compaction and key-range pruning**, so 100 M+ key state stays cheap.
-3. **Shuffles** for big-to-big joins (the job-dealing mechanism the tiering uses already fits).
-4. **Replicated acks, hardened:** an fsync option, three replicas on real machines, and
-   failover times on R2 closer to the 5 s they take on local disk.
-5. **Auth and quotas** per producer and per user; read-only "attach another lake" for queries
-   across lakes.
-6. **Partitioned tables and clustering across files**, so big tables prune as well as Delta
-   liquid clustering and Iceberg sort orders do.
+From the plan in `docs/comparison-spark-flink-fluss.md`, in order:
+
+1. **Kafka-protocol ingest**, so Kafka clients and Debezium write to Pondra unchanged.
+2. **A multi-machine run** (3–10 VMs on S3/R2), then **shuffles** for big-to-big joins.
+3. **An Iceberg REST catalog endpoint**, so Spark, Trino and DuckDB attach by URL.
+4. **`ALTER TABLE … ADD COLUMN`**, then renames and defaults.
+5. **Watermarks** that close event-time windows, and point-in-time joins.
+6. **AI functions in SQL** and an approximate vector index.
+7. **TLS, per-table grants, an audit log, quotas.**

@@ -1,12 +1,15 @@
 //! Pondra: a streamhouse in one binary (see ADR-002 to ADR-005).
 //! Object storage — a local dir or s3://bucket/prefix (S3, R2, MinIO) — is the only state.
+mod auth;
 mod cache;
 mod delta;
 mod iceberg;
-mod insert;
+mod inbox;
 mod serve;
 mod cluster;
 mod log;
+mod mcp;
+mod pg;
 mod query;
 mod replica;
 mod server;
@@ -15,6 +18,7 @@ mod store;
 mod tasks;
 mod tier;
 mod views;
+mod write;
 
 use clap::Parser;
 
@@ -53,6 +57,10 @@ enum Cmd {
         /// Seconds to keep consumed log segments and replaced files before deleting them.
         #[arg(long, default_value_t = 60)]
         retain_secs: u64,
+        /// Keep the log this many seconds as a change feed: `/watch/{t}?after=N` replays every
+        /// change since N (upserts and deletes of keyed tables included). 0: only `--retain-secs`.
+        #[arg(long, default_value_t = 0)]
+        changelog_secs: u64,
         /// Rows allowed to wait in the log for tiering before commits pause (backpressure).
         /// Lower it for less memory, raise it to absorb longer bursts.
         #[arg(long, default_value_t = 10_000_000)]
@@ -75,11 +83,32 @@ enum Cmd {
         /// leader is one). Until enough followers are up, writes are acknowledged once durable.
         #[arg(long, default_value_t = 2)]
         replicas: usize,
+        /// With `--ack replicated`: followers flush each copy to disk before acknowledging it, so
+        /// an acked write survives a power loss of the follower too (costs a disk flush per change).
+        #[arg(long)]
+        fsync: bool,
         /// Open formats new tables are also published in, for engines that don't know Pondra:
         /// `delta`, `iceberg` or `delta,iceberg` (default: none; Pondra and `pondra sql` read the
         /// lake natively, fresher). Per table: `"publish"` when creating it.
         #[arg(long, default_value = "")]
         publish: String,
+        /// Also speak the Postgres wire protocol here (e.g. 0.0.0.0:5432): psql, drivers, BI tools.
+        #[arg(long)]
+        pg: Option<String>,
+        /// Access tokens (also PONDRA_READ_TOKEN, PONDRA_WRITE_TOKEN, PONDRA_ADMIN_TOKEN): reading
+        /// needs any, writing rows write or admin, tables/views/tasks admin. Give every node the
+        /// same ones; none set = no checks.
+        #[arg(long)]
+        read_token: Option<String>,
+        #[arg(long)]
+        write_token: Option<String>,
+        #[arg(long)]
+        admin_token: Option<String>,
+        /// Another lake to read as `name.table`, and write to through its own leader (repeatable):
+        /// `--attach sales=s3://bucket/sales`. Several clusters, each leading its own lake, share
+        /// one bucket this way.
+        #[arg(long)]
+        attach: Vec<String>,
     },
     /// Print catalog entries whose keys start with `prefix` (t/ tables, s/ segments, p/ producers…).
     Catalog {
@@ -88,11 +117,15 @@ enum Cmd {
         prefix: String,
     },
     /// Run SQL straight against the lake, no server needed. Queries read the bucket (and local
-    /// files: `SELECT * FROM 'x.parquet'`); `INSERT INTO t SELECT …` runs here, writes Parquet into
-    /// the bucket and has the running leader record it (or records it itself if nobody leads).
+    /// files: `SELECT * FROM 'x.parquet'`). Writes (CREATE TABLE, INSERT, UPDATE, DELETE) run
+    /// here too; the leader records them — over HTTP, or through the bucket if this machine can't
+    /// reach it — or this process does if nobody leads.
     Sql {
         #[arg(long)]
         dir: String,
+        /// Other lakes to read as `name.table` (`name=dir`, repeatable).
+        #[arg(long)]
+        attach: Vec<String>,
         query: String,
     },
 }
@@ -100,9 +133,16 @@ enum Cmd {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     match Cmd::parse() {
-        Cmd::Serve { dir, addr, reader, flush_ms, tier_secs, task_ms, retain_secs, backlog, cache_dir, cache_gb, ack, replicas, publish } => {
+        Cmd::Serve { dir, addr, reader, flush_ms, tier_secs, task_ms, retain_secs, changelog_secs, backlog, cache_dir, cache_gb, ack, replicas, fsync, publish, pg, read_token, write_token, admin_token, attach: attached } => {
+            let env = |flag: Option<String>, var: &str| flag.or_else(|| std::env::var(var).ok()).filter(|t| !t.is_empty());
+            let auth = Arc::new(auth::Auth::new(env(read_token, "PONDRA_READ_TOKEN"), env(write_token, "PONDRA_WRITE_TOKEN"), env(admin_token.clone(), "PONDRA_ADMIN_TOKEN")));
+            if let Some(t) = env(admin_token, "PONDRA_ADMIN_TOKEN") {
+                std::env::set_var("PONDRA_ADMIN_TOKEN", t); // (nodes call each other with it: cluster::http)
+            }
             std::env::set_var("PONDRA_CACHE_GB", cache_gb.to_string()); // read by Lake::open
             std::env::set_var("PONDRA_PUBLISH", publish); // read by POST /tables
+            std::env::set_var("PONDRA_CHANGELOG_SECS", changelog_secs.to_string()); // read by tier::expire
+            std::env::set_var("PONDRA_FSYNC", fsync.to_string()); // read by replica::ReplicaLog::hold
             std::env::set_var("PONDRA_REPLICAS", if ack == "replicated" { replicas.max(1) } else { 1 }.to_string());
             if let Some(d) = cache_dir {
                 std::env::set_var("PONDRA_CACHE_DIR", d);
@@ -127,6 +167,9 @@ async fn main() -> anyhow::Result<()> {
                 }
                 lake => lake?,
             };
+            for spec in &attached {
+                attach(&lake, spec, &addr, true).await?;
+            }
             let l = lake.clone();
             tokio::spawn(async move { l.warm().await.map_err(|e| eprintln!("warming the SSD tier: {e:#}")) });
             // Followers keep the leader's changes that aren't in the bucket yet (replicated acks);
@@ -144,7 +187,14 @@ async fn main() -> anyhow::Result<()> {
                 };
                 Arc::new(log::Log::start(lake.clone(), Duration::from_millis(flush_ms), to))
             });
-            let app = server::App { lake: lake.clone(), cluster: cluster.clone(), log, seq, lock: Default::default(), retain_ms: retain_secs * 1000, results: Default::default(), replica: replica.clone() };
+            let app = server::App { lake: lake.clone(), cluster: cluster.clone(), log, seq, lock: Default::default(), retain_ms: retain_secs * 1000, results: Default::default(), replica: replica.clone(), auth };
+            if let Some(pg_addr) = pg {
+                let a = app.clone();
+                tokio::spawn(async move { pg::serve(a, pg_addr).await.map_err(|e| eprintln!("postgres protocol: {e:#}")) });
+            }
+            if let Some(seq) = &app.seq {
+                inbox::serve(lake.clone(), seq.clone(), app.lock.clone()); // writers that can't reach us
+            }
             if leader {
                 // The leader's SSD tier learns of objects other nodes wrote from its own commits.
                 let l = lake.clone();
@@ -227,19 +277,39 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        Cmd::Sql { dir, query } => match insert::parse(&query) {
-            Some((table, select)) => match insert::from_cli(&dir, &table, &select).await {
-                Err(e) if e.is::<insert::Duplicate>() => println!("{{\"duplicate\":true}}"),
-                r => println!("{}", r?),
-            },
+        Cmd::Sql { dir, query, attach: attached } => match write::parse(&query) {
+            Some(stmt) => println!("{}", write::from_cli(&dir, stmt).await?),
             None => {
                 let lake = store::Lake::open(&dir, false, false).await?;
+                for spec in &attached {
+                    attach(&lake, spec, "", false).await?;
+                }
                 let batches = query::session(&lake, &query, "").await?.enable_url_table().sql(&query).await?.collect().await?;
                 println!("{}", pretty_format_batches(&batches)?);
             }
         },
     }
     Ok(())
+}
+
+/// `--attach name=dir`: read another lake as `name.table`. A node keeps it fresh the way a
+/// read-only node does: its leader's commit stream when that answers, and its own catalog view.
+async fn attach(home: &store::Lake, spec: &str, me: &str, follow: bool) -> anyhow::Result<()> {
+    let (name, dir) = spec.split_once('=').ok_or_else(|| anyhow::anyhow!("--attach takes name=dir"))?;
+    let leader = cluster::latest(&store::open_store(dir)?.1).await?.map(|t| t.addr).filter(|a| !a.is_empty());
+    let live = match (&leader, follow) {
+        (Some(a), true) => cluster::http().get(format!("http://{a}/cluster/leader")).timeout(Duration::from_secs(2)).send().await.is_ok(),
+        _ => false,
+    };
+    let other = store::Lake::open(dir, false, live).await?;
+    if let (true, Some(a)) = (live, leader) {
+        cluster::mirror(other.clone(), a, me.to_string(), None);
+    }
+    if follow {
+        let l = other.clone();
+        every(Duration::from_millis(250), move || { let l = l.clone(); async move { l.refresh().await } });
+    }
+    home.attach(name, other)
 }
 
 /// Run `job` forever, starting every `period` (right away if a run took longer; a zero period

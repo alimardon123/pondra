@@ -75,15 +75,20 @@ pub async fn tier_table(lake: &Lake, table: &str, hwm: u64, nodes: &[String], me
 /// Keep a table's file count down, once its new rows are committed (so fresh rows never wait
 /// for this). Append tables: once 8+ files are small, merge them, a group of 8 per node; a file
 /// that is already 64 MB or 4M rows (what a merge writes at most) is left alone, so rows are
-/// never merged twice. Keyed tables fold their versions away once 8 files pile up. Returns
-/// whether anything changed.
+/// never merged twice. Keyed tables, once 8 files pile up, merge their newest run of files of
+/// similar size (`run`); only when that run reaches the oldest file is the whole table rewritten.
+/// Returns whether anything changed.
 pub async fn maintain(lake: &Lake, table: &str, nodes: &[String], me: &str) -> Result<bool> {
     let Some(mut meta) = lake.cat.get::<TableMeta>(&table_key(table)).await? else { return Ok(false) };
     let small: Vec<DataFile> = meta.files.iter().filter(|f| f.bytes < 64 << 20 && f.rows < 4_000_000).cloned().collect();
     if !meta.key.is_empty() && meta.files.len() >= 8 {
-        let merged = deal(lake, vec![Job::new(table, &meta, Kind::Compact { upto: meta.tiered, rows: 0 })], nodes, me).await?;
-        let old = meta.files.clone();
-        replace(&mut meta, &old, merged);
+        let run = run(&meta.files);
+        let job = match run.len() == meta.files.len() {
+            true => Kind::Compact { upto: meta.tiered, rows: 0 }, // everything: one row per key, deletes dropped
+            false => Kind::Squash { files: run.clone() },
+        };
+        let merged = deal(lake, vec![Job::new(table, &meta, job)], nodes, me).await?;
+        replace(&mut meta, &run, merged);
     } else if meta.key.is_empty() && small.len() >= 8 {
         let jobs = small.chunks(8).map(|g| Job::new(table, &meta, Kind::Merge { files: g.to_vec() })).collect();
         let merged = deal(lake, jobs, nodes, me).await?;
@@ -93,6 +98,23 @@ pub async fn maintain(lake: &Lake, table: &str, nodes: &[String], me: &str) -> R
     }
     lake.cat.commit(vec![(table_key(table), json(&meta))], &[]).await?;
     Ok(true)
+}
+
+/// A keyed table's files to merge next: the newest ones, going back while each older file is at
+/// most twice the size of everything newer (so a merge rewrites data of similar size, and the big
+/// base is only rewritten once the rest reaches half of it). A run must be consecutive in `ord`:
+/// merging around a file would let an older version jump over a newer one. At least 2 files;
+/// the newest 8 when sizes are too uneven to form a run.
+fn run(files: &[DataFile]) -> Vec<DataFile> {
+    let mut by_age = files.to_vec();
+    by_age.sort_by_key(|f| f.ord);
+    let (mut n, mut rows) = (1, by_age.last().map_or(0, |f| f.rows));
+    while n < by_age.len() && by_age[by_age.len() - n - 1].rows <= 2 * rows.max(1) {
+        rows += by_age[by_age.len() - n - 1].rows;
+        n += 1;
+    }
+    let n = if n >= 2 { n } else { 8.min(by_age.len()) };
+    by_age.split_off(by_age.len() - n)
 }
 
 /// Swap `old` files for `new` ones; the old ones are deleted after the retention period.
@@ -122,6 +144,7 @@ enum Kind {
     Fold { after: u64, upto: u64, rows: u64 }, // log segments (after, upto] -> a file (merge tables: one row per key)
     Merge { files: Vec<DataFile> },            // small files -> one
     Compact { upto: u64, rows: u64 },          // files + log up to `upto` -> one row per key
+    Squash { files: Vec<DataFile> },           // keyed: a run of newer files -> one (delete markers kept)
 }
 
 /// Run jobs round-robin on the live nodes (each round starts where the last one stopped, so
@@ -167,6 +190,13 @@ pub async fn run_job(lake: &Lake, Job { table, meta, kind }: Job) -> Result<Vec<
             anyhow::ensure!(!meta.key.is_empty(), "only keyed tables have versions to compact");
             caught_up(lake, &table, meta.tiered, upto, rows).await?;
             (latest(lake, &table, &meta, upto, false).await?, upto)
+        }
+        // Newer versions of some keys: one row per key over just these files, delete markers kept
+        // (they still shadow the older files left out), as new as the newest of them.
+        Kind::Squash { files } => {
+            let ord = files.iter().map(|f| f.ord).max().unwrap_or(0);
+            let part = TableMeta { files, ..meta.clone() };
+            (latest(lake, &table, &part, meta.tiered, true).await?, ord)
         }
         Kind::Merge { files } => {
             let ctx = lake.session();
@@ -248,8 +278,11 @@ pub async fn expire(lake: &Lake, grace_ms: u64) -> Result<()> {
         }
         if floors[0].0 <= cutoff { floors[0].1 } else { 0 }
     };
+    // (`--changelog-secs`: the log is also a change feed, kept that long for `/watch?after=` replays.)
+    let changelog = std::env::var("PONDRA_CHANGELOG_SECS").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0) * 1000;
+    let log_cutoff = cutoff.min(crate::log::now_ms().saturating_sub(changelog));
     let segs: Vec<(String, Segment)> = lake.cat.scan::<Segment>(&seg_key(1), &seg_key(floor + 1)).await?
-        .into_iter().filter(|(_, s)| s.ts_ms < cutoff).collect();
+        .into_iter().filter(|(_, s)| s.ts_ms < log_cutoff).collect();
     let mut dead: Vec<String> = segs.iter().filter(|(_, s)| !s.path.is_empty()).map(|(_, s)| s.path.clone()).collect();
     let mut deletes: Vec<String> = segs.iter().map(|(k, _)| k.clone()).collect();
     deletes.extend(segs.iter().filter(|(_, s)| s.path.is_empty()).map(|(k, _)| data_key(k[2..].parse().unwrap_or(0))));
