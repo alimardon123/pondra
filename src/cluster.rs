@@ -10,7 +10,11 @@
 //!   `LEASE` and no other member has heard from it either, a follower claims the next term and
 //!   restarts itself as the leader. (The check keeps one badly connected follower from
 //!   deposing a healthy leader.)
-use crate::store::Store;
+//! * The leader also marks itself alive in the bucket every 10 s (`cluster/alive/{n}`), for
+//!   machines outside the cluster: a node starting on an idle lake leads at once instead of
+//!   waiting out a lease, and a `pondra sql` INSERT never deposes a leader it merely can't reach.
+use crate::replica::ReplicaLog;
+use crate::store::{Frame, Lake, Store};
 use anyhow::Result;
 use futures::{StreamExt, TryStreamExt};
 use object_store::{path::Path, ObjectStoreExt, PutMode, PutOptions};
@@ -35,24 +39,30 @@ pub struct Cluster {
     beats: Mutex<BTreeMap<String, Instant>>, // leader: follower -> last heartbeat
     view: Mutex<Vec<String>>,                // follower: live nodes, as told by the leader
     last_ok: Mutex<Instant>,                 // follower: last heartbeat the leader answered
+    heard: std::sync::atomic::AtomicBool,    // follower: the leader has answered us at least once
     pub shard_runs: std::sync::atomic::AtomicU64, // task shards this node has run (for /stats)
 }
 
 impl Cluster {
-    /// Lead if nobody leads yet or the latest term is ours (we're restarting); otherwise follow.
+    /// Follow a live leader; lead if nobody leads (or the latest term is ours: we're restarting).
     pub async fn join(store: &Store, addr: &str, reader: bool) -> Result<Arc<Cluster>> {
-        let leader = match latest(store).await? {
-            Some(t) => t, // ours (we're restarting) or someone else's
-            None if reader => Term { n: 0, addr: String::new() },
-            None => match claim(store, 1, addr).await? {
-                Some(t) => t,
-                None => latest(store).await?.expect("someone just claimed term 1"),
-            },
+        let leader = loop {
+            match latest(store).await? {
+                Some(t) if t.addr == addr || reader => break t, // ours, or we only read anyway
+                None if reader => break Term { n: 0, addr: String::new() },
+                Some(t) if alive(store, &t).await && !t.addr.is_empty() => break t,
+                Some(t) if alive(store, &t).await => tokio::time::sleep(Duration::from_secs(1)).await, // a `pondra sql` INSERT is recording: wait
+                t => {
+                    if let Some(t) = claim(store, t.map_or(1, |t| t.n + 1), addr).await? {
+                        break t; // (or someone else just did: look again)
+                    }
+                }
+            }
         };
         let view = Mutex::new(vec![]); // a follower runs no shards until the leader lists it
         let last_ok = Mutex::new(Instant::now() + STARTUP); // until we first hear from the leader
-        let (beats, shard_runs) = (Default::default(), Default::default());
-        Ok(Arc::new(Cluster { addr: addr.into(), reader, leader, beats, view, last_ok, shard_runs }))
+        let (beats, shard_runs, heard) = (Default::default(), Default::default(), Default::default());
+        Ok(Arc::new(Cluster { addr: addr.into(), reader, leader, beats, view, last_ok, heard, shard_runs }))
     }
 
     pub fn is_leader(&self) -> bool { self.leader.addr == self.addr }
@@ -100,8 +110,12 @@ impl Cluster {
                         }
                         *self.view.lock().unwrap() = nodes;
                         *self.last_ok.lock().unwrap() = Instant::now();
+                        self.heard.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
-                    Err(_) if !self.leader_ok() => match latest(&store).await {
+                    // A member that lost the leader takes over after the lease (if no peer still
+                    // hears it). One that never reached it — say, outside the cluster's network —
+                    // only once the leader's mark in the bucket is stale: it never deposes a live one.
+                    Err(_) if (!self.leader_ok() && self.heard.load(std::sync::atomic::Ordering::Relaxed)) || !alive(&store, &self.leader).await => match latest(&store).await {
                         Ok(Some(t)) if t.n > self.leader.n => restart(), // there's a newer leader: follow it
                         Ok(_) if self.peer_sees_leader().await => {}     // only our link to the leader is down
                         Ok(_) => {
@@ -158,20 +172,48 @@ impl Cluster {
     }
 }
 
-/// Follower: mirror the leader's catalog commits as they happen (see `store.rs`). If the stream
-/// breaks, reconnect; meanwhile our own catalog view keeps us correct, just a little behind.
-pub fn mirror(lake: Arc<crate::store::Lake>, leader: String) {
+/// Follower or read-only node: follow the leader's commit stream (see `store.rs`). If it breaks,
+/// reconnect; meanwhile our own catalog view keeps us correct, just a little behind. A follower
+/// (`replica`) of a leader that replicates commits also keeps every change on local disk and
+/// says so: that is what lets the leader acknowledge a write before the bucket has it.
+pub fn mirror(lake: Arc<Lake>, leader: String, me: String, replica: Option<Arc<ReplicaLog>>) {
+    // Acks, coalesced: however many changes arrive meanwhile, one request says "up to here".
+    let (held, mut to_ack) = tokio::sync::watch::channel((0u64, 0u64, 0u64)); // term, first, last
+    let l = leader.clone();
     tokio::spawn(async move {
-        let mut last = 0; // the last commit number we got (a reconnect replays some we have)
+        while to_ack.changed().await.is_ok() {
+            let (term, first, upto) = *to_ack.borrow_and_update();
+            let url = format!("http://{l}/cluster/ack?from={me}&term={term}&first={first}&upto={upto}");
+            let _ = http().post(url).timeout(Duration::from_secs(2)).send().await;
+        }
+    });
+    tokio::spawn(async move {
+        let mut last = 0; // the last change we got (a reconnect replays some we have)
         loop {
             if let Ok(r) = http().get(format!("http://{leader}/cluster/log")).send().await {
-                let (mut body, mut buf) = (r.bytes_stream(), bytes::BytesMut::new());
+                let (mut body, mut buf, mut term) = (r.bytes_stream(), bytes::BytesMut::new(), None);
                 while let Some(Ok(chunk)) = body.next().await {
                     buf.extend_from_slice(&chunk);
-                    while let Ok(Some(d)) = crate::store::Delta::take(&mut buf) {
-                        if d.id > last {
-                            last = d.id;
-                            lake.apply(&d);
+                    while let Ok(Some(f)) = Frame::take(&mut buf) {
+                        match (f, &replica) {
+                            (Frame::Start { term: t, replicated }, log) => {
+                                term = replicated.then_some(t);
+                                log.iter().for_each(|log| log.start(t));
+                            }
+                            (Frame::Change(d), _) if d.id <= last => {}
+                            (Frame::Change(d), log) => {
+                                last = d.id;
+                                if let (Some(log), Some(t)) = (log, term) {
+                                    match log.hold(t, &d) {
+                                        Ok(Some((first, upto))) => drop(held.send_replace((t, first, upto))),
+                                        Ok(None) => {} // a newer leader exists: never ack this one again
+                                        Err(e) => eprintln!("keeping a replica: {e}"),
+                                    }
+                                }
+                                lake.hold(d);
+                            }
+                            (Frame::Committed(upto), _) => lake.commit_upto(upto),
+                            (Frame::Durable(upto), log) => log.iter().for_each(|log| log.prune(upto)),
                         }
                     }
                 }
@@ -188,21 +230,41 @@ pub fn http() -> &'static reqwest::Client {
 }
 
 /// The newest term, if any.
-async fn latest(store: &Store) -> Result<Option<Term>> {
+pub async fn latest(store: &Store) -> Result<Option<Term>> {
     let metas: Vec<_> = store.list(Some(&Path::from("cluster/term"))).try_collect().await?;
     let Some(m) = metas.iter().max_by_key(|m| m.location.to_string()) else { return Ok(None) };
     Ok(Some(serde_json::from_slice(&store.get(&m.location).await?.bytes().await?)?))
 }
 
-/// Try to become leader of term `n`: put-if-absent, so at most one node succeeds.
-async fn claim(store: &Store, n: u64, addr: &str) -> Result<Option<Term>> {
+/// Try to become leader of term `n`: put-if-absent, so at most one node succeeds. (`addr` is
+/// empty for a `pondra sql` INSERT recording its files: nothing to follow, just wait for it.)
+pub async fn claim(store: &Store, n: u64, addr: &str) -> Result<Option<Term>> {
     let term = Term { n, addr: addr.into() };
     let opts = PutOptions { mode: PutMode::Create, ..Default::default() };
     match store.put_opts(&Path::from(format!("cluster/term/{n:020}")), serde_json::to_vec(&term)?.into(), opts).await {
-        Ok(_) => Ok(Some(term)),
+        Ok(_) => mark_alive(store, n).await.map(|_| Some(term)),
         Err(object_store::Error::AlreadyExists { .. }) => Ok(None),
         Err(e) => Err(e.into()),
     }
+}
+
+/// The holder of term `n` is still here (the leader: every 10 s).
+pub async fn mark_alive(store: &Store, n: u64) -> Result<()> {
+    store.put(&Path::from(format!("cluster/alive/{n:020}")), Vec::<u8>::new().into()).await?;
+    Ok(())
+}
+
+/// Has the holder of term `t` marked itself alive in the last 30 s?
+pub async fn alive(store: &Store, t: &Term) -> bool {
+    match store.head(&Path::from(format!("cluster/alive/{:020}", t.n))).await {
+        Ok(m) => (crate::log::now_ms() as i64 - m.last_modified.timestamp_millis()) < 30_000,
+        Err(_) => false,
+    }
+}
+
+/// A one-off writer is done: whoever comes next doesn't wait for its mark to go stale.
+pub async fn release(store: &Store, n: u64) {
+    let _ = store.delete(&Path::from(format!("cluster/alive/{n:020}"))).await;
 }
 
 /// Re-run this same binary with the same arguments: the new process re-reads its role.

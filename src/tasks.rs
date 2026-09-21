@@ -95,7 +95,7 @@ pub async fn create(lake: &Lake, name: &str, task: &Task) -> Result<()> {
     let mut puts = vec![(task_key(name), json(task))];
     if lake.cat.get::<TableMeta>(&table_key(&task.target)).await?.is_none() {
         let columns = out.fields().iter().map(|f| (f.name().clone(), f.data_type().to_string())).collect();
-        puts.push((table_key(&task.target), json(&TableMeta { columns, key: task.key.clone(), ..Default::default() })));
+        puts.push((table_key(&task.target), json(&TableMeta { columns, key: task.key.clone(), publish: default_publish(), ..Default::default() })));
     }
     lake.cat.commit(puts, &[]).await
 }

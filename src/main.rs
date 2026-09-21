@@ -2,10 +2,13 @@
 //! Object storage — a local dir or s3://bucket/prefix (S3, R2, MinIO) — is the only state.
 mod cache;
 mod delta;
+mod iceberg;
+mod insert;
 mod serve;
 mod cluster;
 mod log;
 mod query;
+mod replica;
 mod server;
 mod spmd;
 mod store;
@@ -61,6 +64,22 @@ enum Cmd {
         /// Size of that SSD tier in GB (0 turns it off).
         #[arg(long, default_value_t = 20)]
         cache_gb: u64,
+        /// When a write is acknowledged. `durable`: once it is in the bucket (one object-store
+        /// write: a millisecond on local disk, 100s of ms on S3 or R2). `replicated`: once
+        /// `--replicas` nodes hold it — the leader in memory, followers on local disk — which
+        /// takes milliseconds on any storage; it reaches the bucket a moment later. Give every
+        /// node the same setting (any of them may lead).
+        #[arg(long, default_value = "durable", value_parser = ["durable", "replicated"])]
+        ack: String,
+        /// With `--ack replicated`: how many nodes hold a write before it's acknowledged (the
+        /// leader is one). Until enough followers are up, writes are acknowledged once durable.
+        #[arg(long, default_value_t = 2)]
+        replicas: usize,
+        /// Open formats new tables are also published in, for engines that don't know Pondra:
+        /// `delta`, `iceberg` or `delta,iceberg` (default: none; Pondra and `pondra sql` read the
+        /// lake natively, fresher). Per table: `"publish"` when creating it.
+        #[arg(long, default_value = "")]
+        publish: String,
     },
     /// Print catalog entries whose keys start with `prefix` (t/ tables, s/ segments, p/ producers…).
     Catalog {
@@ -68,7 +87,9 @@ enum Cmd {
         dir: String,
         prefix: String,
     },
-    /// Run SQL straight against the lake: read-only, no server needed.
+    /// Run SQL straight against the lake, no server needed. Queries read the bucket (and local
+    /// files: `SELECT * FROM 'x.parquet'`); `INSERT INTO t SELECT …` runs here, writes Parquet into
+    /// the bucket and has the running leader record it (or records it itself if nobody leads).
     Sql {
         #[arg(long)]
         dir: String,
@@ -79,14 +100,22 @@ enum Cmd {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     match Cmd::parse() {
-        Cmd::Serve { dir, addr, reader, flush_ms, tier_secs, task_ms, retain_secs, backlog, cache_dir, cache_gb } => {
+        Cmd::Serve { dir, addr, reader, flush_ms, tier_secs, task_ms, retain_secs, backlog, cache_dir, cache_gb, ack, replicas, publish } => {
             std::env::set_var("PONDRA_CACHE_GB", cache_gb.to_string()); // read by Lake::open
+            std::env::set_var("PONDRA_PUBLISH", publish); // read by POST /tables
+            std::env::set_var("PONDRA_REPLICAS", if ack == "replicated" { replicas.max(1) } else { 1 }.to_string());
             if let Some(d) = cache_dir {
                 std::env::set_var("PONDRA_CACHE_DIR", d);
             }
             let (_, store, _) = store::open_store(&dir)?;
             let cluster = cluster::Cluster::join(&store, &addr, reader).await?;
             let leader = cluster.is_leader();
+            if leader {
+                // "Still here", in the bucket, from the start: for machines outside the cluster.
+                let (s, n) = (store.clone(), cluster.leader.n);
+                cluster::mark_alive(&s, n).await?;
+                every(Duration::from_secs(10), move || { let s = s.clone(); async move { cluster::mark_alive(&s, n).await } });
+            }
             // Read-only nodes follow the leader's commit stream too (when a live one is there to ask),
             // so their reads are as fresh as a follower's instead of waiting for catalog polls.
             let streamed = !leader && !cluster.leader.addr.is_empty() && (!reader || cluster.leader_alive().await);
@@ -100,6 +129,12 @@ async fn main() -> anyhow::Result<()> {
             };
             let l = lake.clone();
             tokio::spawn(async move { l.warm().await.map_err(|e| eprintln!("warming the SSD tier: {e:#}")) });
+            // Followers keep the leader's changes that aren't in the bucket yet (replicated acks);
+            // a new leader first commits what they hold from the previous one.
+            let replica = if reader { None } else { Some(replica::ReplicaLog::open(replica::dir(&dir, &addr))?) };
+            if let (true, Some(own)) = (leader, &replica) {
+                replica::recover(&lake, &addr, cluster.leader.n, Some(own)).await?;
+            }
             let max_backlog = (tier_secs > 0.0).then_some(backlog); // rows waiting to be tiered
             let seq = if leader { Some(log::Sequencer::start(lake.clone(), max_backlog).await?) } else { None };
             let log = (!reader).then(|| {
@@ -109,7 +144,7 @@ async fn main() -> anyhow::Result<()> {
                 };
                 Arc::new(log::Log::start(lake.clone(), Duration::from_millis(flush_ms), to))
             });
-            let app = server::App { lake: lake.clone(), cluster: cluster.clone(), log, seq, lock: Default::default(), retain_ms: retain_secs * 1000, results: Default::default() };
+            let app = server::App { lake: lake.clone(), cluster: cluster.clone(), log, seq, lock: Default::default(), retain_ms: retain_secs * 1000, results: Default::default(), replica: replica.clone() };
             if leader {
                 // The leader's SSD tier learns of objects other nodes wrote from its own commits.
                 let l = lake.clone();
@@ -117,7 +152,8 @@ async fn main() -> anyhow::Result<()> {
                     let (_, mut commits) = l.cat.subscribe();
                     loop {
                         match commits.recv().await {
-                            Ok(d) => l.prefetch(&d),
+                            Ok(store::Frame::Change(d)) => l.prefetch(&d),
+                            Ok(_) => {}
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue, // (just fewer prefetches)
                             Err(_) => break,
                         }
@@ -149,13 +185,16 @@ async fn main() -> anyhow::Result<()> {
                 // has to keep up with, and writes stall when too many pile up.
                 let l = lake.clone();
                 every(Duration::from_secs(5), move || { let l = l.clone(); async move { l.cat.checkpoint().await } });
+                if lake.cat.replicas > 1 {
+                    replica::members(lake.clone(), cluster.clone());
+                }
             } else {
                 match reader {
                     false => cluster.clone().follow(store),
                     true => cluster.clone().watch_leader(store, streamed), // a reader never votes or leads
                 }
                 if streamed {
-                    cluster::mirror(lake.clone(), cluster.leader.addr.clone());
+                    cluster::mirror(lake.clone(), cluster.leader.addr.clone(), addr.clone(), replica);
                 }
                 // How far our own catalog view is: all a reader has, and a follower's fallback.
                 every(Duration::from_millis(250), move || { let l = lake.clone(); async move { l.refresh().await } });
@@ -188,11 +227,17 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        Cmd::Sql { dir, query } => {
-            let lake = store::Lake::open(&dir, false, false).await?;
-            let batches = query::session(&lake, &query, "").await?.sql(&query).await?.collect().await?;
-            println!("{}", pretty_format_batches(&batches)?);
-        }
+        Cmd::Sql { dir, query } => match insert::parse(&query) {
+            Some((table, select)) => match insert::from_cli(&dir, &table, &select).await {
+                Err(e) if e.is::<insert::Duplicate>() => println!("{{\"duplicate\":true}}"),
+                r => println!("{}", r?),
+            },
+            None => {
+                let lake = store::Lake::open(&dir, false, false).await?;
+                let batches = query::session(&lake, &query, "").await?.enable_url_table().sql(&query).await?.collect().await?;
+                println!("{}", pretty_format_batches(&batches)?);
+            }
+        },
     }
     Ok(())
 }

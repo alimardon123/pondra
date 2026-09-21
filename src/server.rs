@@ -5,7 +5,7 @@ use crate::log::{decode_flush, Ack, Log, Sequencer, Src};
 use crate::query::{latest_sql, raw, schema, session, tail};
 use crate::store::*;
 use crate::tasks::Task;
-use crate::tier::{expire, tier_table, write_stream};
+use crate::tier::{expire, tier_table};
 use axum::body::{Body, Bytes};
 use axum::extract::{Path, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -32,6 +32,7 @@ pub struct App {
     pub lock: Arc<Mutex<()>>,        // serialises everything that rewrites table metadata
     pub retain_ms: u64,
     pub results: Arc<Results>,       // recent query results (see `Results`)
+    pub replica: Option<Arc<crate::replica::ReplicaLog>>, // what this follower holds for the leader
 }
 
 /// Recent query results. By default a result is reused only at exactly the catalog version it
@@ -102,12 +103,13 @@ pub fn router(app: App) -> Router {
         .route("/tables/{name}", post(create_table))
         .route("/views/{name}", post(create_view))
         .route("/tasks/{name}", post(create_task))
-        .route("/insert/{name}", post(insert))
         .route("/tier", post(tier_now))
         .route_layer(middleware::from_fn_with_state(app.clone(), to_leader));
     Router::new()
         .merge(leader_only)
         .route("/append/{name}", post(append))
+        .route("/insert/{name}", post(insert))
+        .route("/cluster/files", post(files))
         .route("/sql", post(sql))
         .route("/lookup/{name}/{key}", get(lookup))
         .route("/watch/{name}", get(watch))
@@ -117,6 +119,8 @@ pub fn router(app: App) -> Router {
         .route("/cluster/stage", post(stage))
         .route("/cluster/job", post(job))
         .route("/cluster/beat", post(beat))
+        .route("/cluster/ack", post(ack))
+        .route("/cluster/replica", get(replica))
         .route("/cluster/leader", get(|State(app): State<App>| async move { Json(app.cluster.leader_status()) }))
         .layer(axum::extract::DefaultBodyLimit::max(1 << 30)) // batches up to 1 GiB
         .with_state(app)
@@ -182,11 +186,39 @@ async fn job(State(app): State<App>, Json(job): Json<crate::tier::Job>) -> Resul
     Ok(Json(crate::tier::run_job(&app.lake, job).await?))
 }
 
+/// The commit stream (see `Frame`): who leads, then the recent frames, then every new one.
 async fn feed(State(app): State<App>) -> Response {
-    let (recent, rx) = app.lake.cat.subscribe();
-    let live = futures::stream::unfold(rx, |mut rx| async move { rx.recv().await.ok().map(|d| (d, rx)) }); // a lagging follower reconnects
-    let frames = futures::stream::iter(recent).chain(live).map(|d| Ok::<_, std::io::Error>(d.frame()));
+    let cat = &app.lake.cat;
+    let start = Frame::Start { term: app.cluster.leader.n, replicated: cat.replicas > 1 };
+    let (recent, rx) = cat.subscribe();
+    let live = futures::stream::unfold(rx, |mut rx| async move { rx.recv().await.ok().map(|f| (f, rx)) }); // a lagging follower reconnects
+    let frames = futures::stream::iter([start].into_iter().chain(recent)).chain(live).map(|f| Ok::<_, std::io::Error>(f.encode()));
     Body::from_stream(frames).into_response()
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct AckParams {
+    from: String,
+    term: u64,
+    first: u64,
+    upto: u64,
+    after: u64,
+}
+
+/// Leader: a follower holds a run of changes (replicated commits). Acks meant for another
+/// leader's term don't count.
+async fn ack(State(app): State<App>, Query(p): Query<AckParams>) -> StatusCode {
+    if !app.cluster.is_leader() || p.term != app.cluster.leader.n {
+        return StatusCode::CONFLICT;
+    }
+    app.lake.cat.ack(&p.from, p.first, p.upto);
+    StatusCode::OK
+}
+
+/// A new leader taking over collects what this node holds beyond the bucket (`replica::recover`).
+async fn replica(State(app): State<App>, Query(p): Query<AckParams>) -> Result<Vec<u8>, StatusCode> {
+    Ok(app.replica.as_ref().ok_or(StatusCode::NOT_FOUND)?.serve(p.term, p.after))
 }
 
 impl App {
@@ -211,6 +243,7 @@ impl App {
         let rows: u64 = futures::stream::iter(per_table).buffer_unordered(4).try_collect::<Vec<u64>>().await?.iter().sum();
         let tiered = start.elapsed();
         crate::delta::publish_all(&self.lake).await?; // what other engines read, as soon as it's tiered
+        let first_publish = start.elapsed();
         // Then merges and compactions (published too, once done).
         let maintain: Vec<_> = busy.iter().map(|t| crate::tier::maintain(&self.lake, t, &nodes, &self.cluster.addr)).collect();
         if futures::stream::iter(maintain).buffer_unordered(4).try_collect::<Vec<bool>>().await?.contains(&true) {
@@ -226,7 +259,8 @@ impl App {
         }
         if start.elapsed() >= Duration::from_secs(5) {
             // one line when it drags
-            eprintln!("slow tiering: {rows} rows in {:?} (tables {tiered:?}, delta + merges {:?}, expire {:?})", start.elapsed(), published - tiered, start.elapsed() - published);
+            let (publish, merges, expire) = (first_publish - tiered, published - first_publish, start.elapsed() - published);
+            eprintln!("slow tiering: {rows} rows in {:?} (tables {tiered:?}, publish {publish:?}, merges {merges:?}, expire {expire:?})", start.elapsed());
         }
         Ok(rows)
     }
@@ -258,25 +292,44 @@ enum TableSpec {
         key: Vec<String>,
         #[serde(default)]
         merge: BTreeMap<String, String>,
+        publish: Option<Vec<String>>,
+        #[serde(default)]
+        cluster_by: Vec<String>,
     },
 }
 
 /// Body: `[["user","Utf8"],["amount","Int64"]]`; or `{"columns": [...], "key": ["user"]}` for an
 /// upsert table (latest row per key wins; a Boolean `_deleted` column marks deletes); add
 /// `"merge": {"total": "sum"}` for a merge table (rows per key combine: sum, min or max).
+/// `"publish": ["delta", "iceberg"]` also keeps the table readable by other engines in those
+/// formats (default: the node's `--publish`); sent again for an existing table, it changes that.
+/// `"cluster_by": ["user"]` (append tables) sorts each file by those columns, so filters on them
+/// skip most of every file.
 async fn create_table(State(app): State<App>, Path(name): Path<String>, body: String) -> Result<Json<Value>, E> {
-    let (columns, key, merge) = match serde_json::from_str(&body)? {
-        TableSpec::Columns(c) => (c, vec![], BTreeMap::new()),
-        TableSpec::Full { columns, key, merge } => (columns, key, merge),
+    let (columns, key, merge, publish, cluster) = match serde_json::from_str(&body)? {
+        TableSpec::Columns(c) => (c, vec![], BTreeMap::new(), None, vec![]),
+        TableSpec::Full { columns, key, merge, publish, cluster_by } => (columns, key, merge, publish, cluster_by),
     };
     schema(&columns)?; // validate types
     ensure!(merge.values().all(|f| ["sum", "min", "max"].contains(&f.as_str())), "merge functions: sum, min, max");
     ensure!(merge.is_empty() || !key.is_empty(), "a merge table needs a key");
+    ensure!(publish.iter().flatten().all(|f| ["delta", "iceberg"].contains(&f.as_str())), "publish formats: delta, iceberg");
+    ensure!(cluster.iter().all(|c| columns.iter().any(|(n, _)| n == c)) && (cluster.is_empty() || key.is_empty()), "cluster_by: columns of an append table (keyed tables are sorted by key)");
     let _guard = app.lock.lock().await;
-    if app.lake.cat.get::<TableMeta>(&table_key(&name)).await?.is_none() {
-        app.lake.cat.commit(vec![(table_key(&name), json(&TableMeta { columns, key, merge, ..Default::default() }))], &[]).await?;
-    }
-    Ok(Json(j!({"table": name})))
+    let meta = match app.lake.cat.get::<TableMeta>(&table_key(&name)).await? {
+        None => TableMeta { columns, key, merge, publish: publish.unwrap_or_else(default_publish), cluster, ..Default::default() },
+        Some(m) if publish.is_none() || publish.as_ref() == Some(&m.publish) => return Ok(Json(j!({"table": name, "publish": m.publish}))),
+        Some(mut m) => {
+            let dropped: Vec<String> = m.publish.iter().filter(|f| !publish.iter().flatten().any(|p| p == *f)).cloned().collect();
+            m.publish = publish.unwrap_or_default();
+            for format in dropped {
+                crate::delta::unpublish(&app.lake, &name, &format).await?; // (no stale copy left for other engines)
+            }
+            m
+        }
+    };
+    app.lake.cat.commit(vec![(table_key(&name), json(&meta))], &[]).await?;
+    Ok(Json(j!({"table": name, "publish": meta.publish})))
 }
 
 #[derive(Deserialize)]
@@ -307,32 +360,28 @@ struct InsertParams {
     job: String,
 }
 
-/// Bulk `INSERT INTO name <body SQL>`: results go straight to Parquet (no log), and the files are
-/// committed together with `job` so a retried job is not applied twice. Creates the table if missing.
+/// Bulk `INSERT INTO name <body SQL>`: this node runs the query and writes the Parquet (no log);
+/// the leader records the files, together with `job` so a retried job is applied once. Creates
+/// the table if missing.
 async fn insert(State(app): State<App>, Path(name): Path<String>, Query(p): Query<InsertParams>, query: String) -> Result<Json<Value>, E> {
-    let (lake, producer) = (&app.lake, producer_key(&format!("job:{}", p.job)));
-    if lake.cat.get::<u64>(&producer).await?.is_some() {
-        return Ok(Json(j!({"duplicate": true})));
+    ensure!(!app.cluster.reader, "read-only node");
+    let ctx = session(&app.lake, &query, "").await?;
+    match crate::insert::write(&app.lake, ctx, &name, &query, &p.job).await? {
+        Some(f) => files(State(app), Json(f)).await,
+        None => Ok(Json(j!({"duplicate": true}))),
     }
-    let df = session(lake, &query, "").await?.sql(&query).await?;
-    let out = df.schema().as_arrow().clone();
-    let keys = lake.cat.get::<TableMeta>(&table_key(&name)).await?.map(|m| m.key).unwrap_or_default();
-    let files = write_stream(lake, &name, df.execute_stream().await?, 1_000_000, &keys).await?;
+}
+
+/// Record an INSERT's files: on the leader, or forwarded to it (from this node, another node, or
+/// a `pondra sql` somewhere else).
+async fn files(State(app): State<App>, Json(f): Json<crate::insert::Files>) -> Result<Json<Value>, E> {
+    if app.seq.is_none() {
+        let r = crate::cluster::http().post(format!("http://{}/cluster/files", app.cluster.leader.addr)).json(&f).send().await?;
+        ensure!(r.status().is_success(), "leader: {}", r.text().await?);
+        return Ok(Json(r.json().await?));
+    }
     let _guard = app.lock.lock().await;
-    if lake.cat.get::<u64>(&producer).await?.is_some() {
-        return Ok(Json(j!({"duplicate": true}))); // the same job finished concurrently
-    }
-    let mut meta = lake.cat.get::<TableMeta>(&table_key(&name)).await?.unwrap_or_else(|| TableMeta {
-        columns: out.fields().iter().map(|f| (f.name().clone(), f.data_type().to_string())).collect(),
-        ..Default::default()
-    });
-    ensure!(meta.key.is_empty(), "insert into keyed tables goes through /append");
-    let types: Vec<_> = meta.columns.iter().map(|(_, t)| t.clone()).collect();
-    ensure!(types == out.fields().iter().map(|f| f.data_type().to_string()).collect::<Vec<_>>(), "query columns {out:?} don't match table {name}");
-    let rows: u64 = files.iter().map(|f| f.rows).sum();
-    meta.files.extend(files);
-    lake.cat.commit(vec![(table_key(&name), json(&meta)), (producer, json(&1u64))], &[]).await?;
-    Ok(Json(j!({"rows": rows})))
+    Ok(Json(crate::insert::record(&app.lake, f).await?))
 }
 
 /// Body: `{"source": "events", "target": "per_user", "sql": "SELECT … FROM events …"}`.

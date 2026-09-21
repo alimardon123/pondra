@@ -1,0 +1,75 @@
+== harness all
+}
+{
+ "upsert": "12,000 random upserts/deletes with compactions and a restart match the model exactly (398 live keys)",
+ "tiering": "12 rounds of writes and tiering: log drained, files bounded ({'events': 5, 'kv': 5, 'totals': 5}), every row exact",
+ "fence": "a frozen leader is replaced; when it wakes, its write is rejected (fenced) and it rejoins as a follower; nothing lost",
+ "insert": "bulk INSERT \u2026 SELECT writes Parquet directly; a retried job id is applied once",
+ "serverless": "INSERT from a process with no server: 0.02s alone, 4 at once, retries once; a node on the idle lake leads in 0.02s; via a running leader 0.03s; after the leader is killed 30.09s; 8000 rows, no duplicates",
+ "reader": "freshness on a separate read-only node: p50 6 ms, p99 100 ms",
+ "crash": "5/5 runs, 0 lost, 0 duplicated (events, streaming-task output, views); crashes survived: {'after_seg_put': 0, 'after_commit': 2, 'after_parquet_put': 19, 'kill -9': 3}",
+ "load": {
+  "events_per_s": 1200,
+  "ack_ms_p50": 251,
+  "ack_ms_p99": 254,
+  "freshness_ms_p50": 133,
+  "freshness_ms_p99": 258,
+  "freshness_samples": 50,
+  "commits_per_s": 4.0,
+  "commit_ms_p50": 2,
+  "commit_ms_p95": 3,
+  "server_cores_used": 0.07
+ }
+}
+== users 1
+  3793500 events (122,776/s), ack p50 40 ms p99 267 ms
+  1340 snapshot reads, query p50 318 ms p99 1079 ms
+  inconsistent reads: 0; producers with lost/duplicate batches: 0
+    by node: {}
+== users 2
+  3923900 events (126,654/s), ack p50 39 ms p99 207 ms
+  1363 snapshot reads, query p50 297 ms p99 1185 ms
+  inconsistent reads: 0; producers with lost/duplicate batches: 0
+    by node: {}
+== users 3
+  3965300 events (127,630/s), ack p50 38 ms p99 215 ms
+  1380 snapshot reads, query p50 289 ms p99 1105 ms
+  inconsistent reads: 0; producers with lost/duplicate batches: 0
+    by node: {}
+== failover 1
+  failovers: 5.0s, 4.3s (kill -> writes acked again); state caught up 0.3s after the last write
+  events exactly once: True (1774100 rows); for 1000 users, task state == model: True, inline view == model: True
+  shard runs per node (since each node's last start): {18080: 419, 18081: 263, 18082: 302}
+== failover 2
+  failovers: 5.0s, 4.7s (kill -> writes acked again); state caught up 0.2s after the last write
+  events exactly once: True (1816100 rows); for 1000 users, task state == model: True, inline view == model: True
+  shard runs per node (since each node's last start): {18080: 268, 18081: 397, 18082: 286}
+== failover 3
+  failovers: 5.1s, 4.3s (kill -> writes acked again); state caught up 0.2s after the last write
+  events exactly once: True (1645800 rows); for 1000 users, task state == model: True, inline view == model: True
+  shard runs per node (since each node's last start): {18080: 382, 18081: 235, 18082: 278}
+== failover 4
+  failovers: 5.1s, 4.5s (kill -> writes acked again); state caught up 0.2s after the last write
+  events exactly once: True (1830400 rows); for 1000 users, task state == model: True, inline view == model: True
+  shard runs per node (since each node's last start): {18080: 270, 18081: 404, 18082: 308}
+== failover 5
+  failovers: 5.2s, 4.5s (kill -> writes acked again); state caught up 0.3s after the last write
+  events exactly once: True (1814800 rows); for 1000 users, task state == model: True, inline view == model: True
+  shard runs per node (since each node's last start): {18080: 421, 18081: 268, 18082: 306}
+== failover 6
+  failovers: 5.0s, 4.4s (kill -> writes acked again); state caught up 0.2s after the last write
+  events exactly once: True (1734000 rows); for 1000 users, task state == model: True, inline view == model: True
+  shard runs per node (since each node's last start): {18080: 258, 18081: 389, 18082: 279}
+== race
+race: 3 nodes started at once -> 1 leader(s), all agree: True
+== isolate
+isolate: cut-off follower deposed a healthy leader: False; after the leader died, :18081 took over in 5.1s (term 2)
+== split
+split: 8 Arrow producers -> followers only, 101,840,000 events in 20s (5,092,000/s)
+  CPU seconds per million events: leader 0.08, followers 0.11 + 0.11; leader share 26%
+== spread
+  q7_avg_distinct      one node     63 ms   3 nodes     97 ms   same result: True
+  q8_top_rows          one node     71 ms   3 nodes     73 ms   same result: True
+  q9_filter_count      one node     15 ms   3 nodes     18 ms   same result: True
+spread: 4,000,000 rows, 3 nodes; results identical: True; fell back to one node: 0 times
+DONE

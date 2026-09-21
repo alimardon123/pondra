@@ -144,11 +144,17 @@ async fn deal(lake: &Lake, jobs: Vec<Job>, nodes: &[String], me: &str) -> Result
 
 /// Do one job here; returns the Parquet files written.
 pub async fn run_job(lake: &Lake, Job { table, meta, kind }: Job) -> Result<Vec<DataFile>> {
-    let (keys, whole) = (meta.key.clone(), matches!(kind, Kind::Compact { .. }));
+    // (Clustered append tables get what keyed tables get for their key: small row groups, bloom filters.)
+    let (keys, whole) = (if meta.key.is_empty() { meta.cluster.clone() } else { meta.key.clone() }, matches!(kind, Kind::Compact { .. }));
     let (batches, ord) = match kind {
         Kind::Fold { after, upto, rows } if meta.key.is_empty() => {
             caught_up(lake, &table, after, upto, rows).await?;
-            (tail(lake, &table, after, Some(upto), false).await?, upto)
+            let rows = tail(lake, &table, after, Some(upto), false).await?;
+            let rows = match rows.is_empty() || meta.cluster.is_empty() {
+                true => rows,
+                false => clustered(&meta, lake.session().read_batches(rows)?)?.collect().await?,
+            };
+            (rows, upto)
         }
         // Keyed tables: one row per key for this range of the log, delete markers included (they
         // still have to shadow what older files hold for that key).
@@ -166,7 +172,7 @@ pub async fn run_job(lake: &Lake, Job { table, meta, kind }: Job) -> Result<Vec<
             let ctx = lake.session();
             let paths: Vec<String> = files.iter().map(|f| lake.full(&f.path)).collect();
             let schema = schema(&meta.columns)?;
-            let df = ctx.read_parquet(paths, ParquetReadOptions::default().schema(&schema)).await?;
+            let df = clustered(&meta, ctx.read_parquet(paths, ParquetReadOptions::default().schema(&schema)).await?)?;
             let ord = files.iter().map(|f| f.ord).max().unwrap_or(0);
             let mut merged = write_stream(lake, &table, df.execute_stream().await?, 4_000_000, &keys).await?;
             merged.iter_mut().for_each(|f| f.ord = ord);
@@ -176,6 +182,16 @@ pub async fn run_job(lake: &Lake, Job { table, meta, kind }: Job) -> Result<Vec<
     let mut files: Vec<DataFile> = write_file(lake, &table, &batches, &keys).await?.into_iter().collect();
     files.iter_mut().for_each(|f| (f.ord, f.whole) = (ord, whole));
     Ok(files)
+}
+
+/// Append tables with `cluster_by`: every file's rows sorted by those columns (folds and merges
+/// alike), so each row group covers a narrow range of them and a filter on them skips the rest
+/// by min/max statistics and bloom filters — in Pondra and in any engine reading the Parquet.
+fn clustered(meta: &TableMeta, df: datafusion::prelude::DataFrame) -> Result<datafusion::prelude::DataFrame> {
+    if meta.cluster.is_empty() {
+        return Ok(df);
+    }
+    Ok(df.sort(meta.cluster.iter().map(|c| datafusion::prelude::ident(c).sort(true, false)).collect())?)
 }
 
 /// One row per key: `meta`'s files plus the log up to `upto`, sorted by key.
@@ -249,6 +265,7 @@ pub async fn expire(lake: &Lake, grace_ms: u64) -> Result<()> {
     if !puts.is_empty() || !deletes.is_empty() {
         lake.cat.commit(puts, &deletes).await?;
     }
+    lake.cat.wait_durable(lake.cat.committed()).await; // (replicated acks: forget objects only once the bucket has)
     futures::stream::iter(dead).for_each_concurrent(16, |path| async move { lake.delete(&path).await }).await; // (one round trip each)
     collect_orphans(lake).await
 }
@@ -272,7 +289,7 @@ async fn collect_orphans(lake: &Lake) -> Result<()> {
         let objects: Vec<_> = lake.store.list(Some(&object_store::path::Path::from(prefix))).try_collect().await?;
         for o in objects {
             let old = now as i64 - o.last_modified.timestamp_millis() > 24 * HOUR as i64;
-            if old && !used.contains(o.location.as_ref()) && !o.location.as_ref().contains("/_delta_log/") {
+            if old && !used.contains(o.location.as_ref()) && !crate::delta::open_format(o.location.as_ref()) {
                 lake.delete(o.location.as_ref()).await;
             }
         }

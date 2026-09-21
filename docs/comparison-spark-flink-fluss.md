@@ -1,4 +1,4 @@
-# Pondra vs Spark, Flink, Fluss and Databricks Lakehouse//RT (round 7)
+# Pondra vs Spark, Flink, Fluss and Databricks Lakehouse//RT (round 8)
 
 **Date:** 2026-09-21 · **Machine:** one 2-vCPU, 7 GB sandbox VM, local disk (plus a real Cloudflare R2 bucket where marked); every engine ran alone
 **Versions:**
@@ -13,10 +13,11 @@
 - `tools/bench/run.py` (batch / streaming / ETL, same data and SQL for every engine)
 - `tools/serve_bench.py` (serving)
 - `tools/cluster.py latency | split | spread`
-- `tools/delta_check.py` (open-lake freshness)
+- `tools/freshness.py` (freshness, head to head), `tools/open_check.py` (outside readers)
 
 **Where the numbers come from:**
-- Spark's TPC-H and every Pondra number: this round.
+- Freshness, write latency and open formats: round 8.
+- Spark's TPC-H and the serving numbers: round 7.
 - Spark's and Flink's batch and streaming numbers: round 3, same machine and scripts.
 
 ## The short answer
@@ -27,8 +28,11 @@
   queries, same answers).
 - **Stateful streaming:** about **3x Flink's** throughput.
 - **Latency:** a change shows up on another node in **5 ms**, where Flink's exactly-once
-  results wait for a checkpoint.
-- **The open lake:** fresh in **17 ms**, where Fluss's lags 3 minutes.
+  results wait for a checkpoint. Writes are acknowledged in **2–4 ms on R2** with
+  `--ack replicated`, without S3 Express.
+- **Freshness, like for like** (below): Pondra's own readers see a write milliseconds after the
+  ack, as Fluss's do. Its Delta/Iceberg tables follow 3–10 s later on R2, depending on the
+  bucket's distance, where Fluss's lake tables lag 3 minutes by default.
 - **Serving:** **20,000–36,000 lookups/s on two cores**, where Lakehouse//RT publishes 12,000
   QPS.
 
@@ -59,14 +63,15 @@ biggest open risk is scale-out, and only a multi-machine benchmark can retire it
 | Batch SQL per core (TPC-H) | ✓ 10x Spark | | (batch isn't its focus) | — | (not published) |
 | Stateful streaming throughput per core | ✓ ~3x Flink | | | — | — |
 | Change → visible elsewhere, exactly-once | ✓ 5 ms (local disk) | seconds (micro-batches); ms with Databricks RTM | ms per record, but visible at checkpoint | ✓ ms | — |
-| Durable ack on standard object storage | one PUT (0.3–0.7 s) | — | — | ✓ ms (local-disk replication) | — |
-| Open lake freshness | ✓ 17 ms (Delta) | per micro-batch | per checkpoint | 3 min default | reads the lake |
+| Write ack on standard object storage | ✓ 2–4 ms replicated (`--ack replicated`); one PUT (0.25–0.7 s) durable | — | — | ✓ ms (replicated to TabletServer disks) | — |
+| Own readers' freshness (memory/SSD path) | ✓ 10–15 ms, on local disk and on R2 | per micro-batch | per checkpoint | ✓ ms / sub-second | reads the lake |
+| Open-format freshness (lake tables other engines read) | ✓ ~30 ms local, 3–10 s on R2 (Delta + Iceberg) | per micro-batch | per checkpoint | 3 min default (+ up to 2 rounds) | reads the lake |
 | Serving: point reads, repeated dashboards | ✓ 0.1–3 ms, 20–36k/s on 2 cores | | | ms lookups | 10 ms, 12k QPS (cluster) |
 | Serving: new analytical queries on big data | 35–600 ms (single node) | | | — | ✓ sub-100 ms (claimed) |
 | Scale-out to 100s of machines | unproven; no shuffles | ✓ | ✓ | ✓ | ✓ |
 | Streaming semantics (event time, windows, CEP, huge state) | decomposable aggregates + SQL tasks | good | ✓ | storage only | — |
 | APIs & usability | SQL over HTTP, JSON/Arrow out, one command | ✓ SQL + DataFrames (Python/Scala/Java/R), notebooks | SQL + DataStream API | clients (Java, Rust, Python) | ✓ Databricks SQL |
-| Connectors & ecosystem | HTTP in, Delta out | ✓ huge | ✓ huge | Flink/Spark connectors | ✓ Databricks |
+| Connectors & ecosystem | HTTP in; Delta + Iceberg out | ✓ huge | ✓ huge | Flink/Spark connectors | ✓ Databricks |
 | Operations & footprint | ✓ 1 binary, 39 MB idle, 0.02 s start | JVM cluster | JVM cluster + checkpoints | JVM + ZooKeeper + Flink tiering job | managed |
 | Governance & security | none yet | via platforms | via platforms | TLS/Kerberos (1.0) | ✓ Unity Catalog |
 | Maturity | prototype | ✓ | ✓ | incubating | beta |
@@ -119,14 +124,58 @@ Asked a second time, each of these queries now returns in about 1 ms from the re
 Spark and Flink generated input in memory and discarded output; Pondra received its input over
 HTTP and committed the results durably. The comparison is tilted against Pondra.
 
-## Latency and freshness
+## Latency and freshness, head to head
 
-| | Pondra (local disk) | Pondra (R2 from this far-away sandbox) | Flink | Spark | Fluss |
-|---|---|---|---|---|---|
-| Write acked, durable | **5 ms** p50 / 8 ms p99 | 0.66–1.1 s (one PUT) | at checkpoint | per micro-batch | ms |
-| Event → updated aggregate row on another node | **5 ms** p50 / 7 ms p99; 38–77 ms p50 under load | ≈ the ack | ms, exactly-once only at checkpoint | RTM: single-digit ms stateless, open-source at-least-once | ms |
-| New row readable by other engines (open lake) | **17 ms** (a Delta version), 31 ms via delta-rs | ~5 s (3 round trips) | per checkpoint | per micro-batch | 3 min default |
-| A new user's first query | 17–24 ms | **20–30 ms** on a warm node; ≈1 s on a node that just joined | — | — | ms |
+Round 7 put Pondra's 17 ms (a Delta version on local disk) next to Fluss's 3 minutes (its lake
+tables' default freshness). That compared different paths. These tables compare like with like:
+memory/SSD paths with memory/SSD paths, and object storage with object storage.
+
+**Fluss, from its documentation:**
+
+- Writes and streaming reads go through its TabletServers, which replicate to their local disks:
+  milliseconds.
+- Its lake tables (Paimon, Iceberg, Lance) are written by a tiering service every
+  `table.datalake.freshness` (default 3 minutes). Peak lag is roughly freshness + 2 × the
+  tiering round.
+- *Union read* combines both for "sub-second freshness".
+
+**Pondra, measured** (`tools/freshness.py`):
+
+- **Method:** one row per probe, written after a quiet spell; every reader polls at once, each in
+  its own process. Time is from the ack to the first read that sees the row.
+- **Setup:** 3 processes on one 2-vCPU box, with two real R2 buckets: a near one (Eastern North
+  America, ~290 ms per PUT from here) and a far one (~670 ms).
+- **Numbers:** p50, with the worst of 8–10 probes in brackets. On R2 each cell shows `durable` /
+  `--ack replicated`.
+
+| Path | Local disk | Real R2, near | Real R2, far | Fluss |
+|---|---|---|---|---|
+| **Write acknowledged** | 4 ms | 300 ms (458) / **2 ms (5)** | 723 ms (1,000) / **2 ms (4)** | ms |
+| **Memory/SSD path:** another node | 15 ms | 10 ms (56) / 13 ms (16) | 17 ms (28) / 9 ms (27) | ms (TabletServer reads) |
+| read-only node | 15 ms | 11 ms (56) / 13 ms (16) | 13 ms (32) / 14 ms (29) | — |
+| **Serverless:** a new `pondra sql` process | 34 ms | 3.1 s / 2.9 s | 5.8 s / 5.5 s | — |
+| **Lake tables for other engines:** Delta (delta-rs) | 36 ms | 3.3 s (4.3) / 3.6 s (5.1) | 7.1 s (9.4) / 7.2 s (9.1) | — |
+| Iceberg (PyIceberg) | 31 ms | 3.9 s (5.8) / 4.0 s (7.7) | 10.0 s (11.3) / 9.7 s (12.2) | 3 min default + up to 2 rounds |
+
+What this says:
+
+- **Like for like, the fast paths match.** Pondra's nodes see a write 10–15 ms after the ack,
+  on local disk or R2 (with the pollers competing for two cores; alone it's ~5 ms), as Fluss's
+  TabletServers serve theirs in milliseconds. With `--ack replicated`, the write itself is also
+  acknowledged in milliseconds, the way Fluss's is, without S3 Express.
+- **Like for like, the lake tables don't.** A Pondra table's Delta and Iceberg versions trail
+  the ack by ~3–4 s on the near bucket and 7–10 s on the far one, at the default
+  `--tier-secs 2` (tens of ms on local disk). That is a handful of sequential bucket round trips.
+  Iceberg needs two more than Delta: the manifest, then the metadata file, then the version hint.
+  Fluss's lake tables trail by minutes by default. Fluss can be set lower, at the cost of more
+  lake commits, and so can Pondra (`--tier-secs 0.5`).
+- **Serverless reads are fresh, not fast, on far-away storage.** A new `pondra sql` process sees
+  every write already in the bucket, with nothing to wait for. But it spends ~2–3 s opening the
+  catalog over R2 from here, a little less than Delta readers wait for a new version. For fast
+  *and* fresh, join with `pondra serve --reader`.
+- **The first R2 runs had 13–34 s worst cases for the open formats.** The cause was a PUT hanging
+  for its full 30 s timeout on a reused idle connection. Idle connections are now dropped after
+  15 s; the table shows the runs after that fix.
 
 ## Serving vs Databricks Lakehouse//RT
 
@@ -158,7 +207,7 @@ Where each side stands:
 
 | | Pondra | Spark 4.2 | Flink 2.3 | Fluss |
 |---|---|---|---|---|
-| What you install | one binary, 89.6 MB (30.1 MB gzip, 16.9 MB xz) | 485 MB PySpark + a JVM | 353 MB PyFlink + a JVM | CoordinatorServer + TabletServers + ZooKeeper + a Flink tiering job, JVM |
+| What you install | one binary, 90.0 MB (30.5 MB gzip, 18.7 MB xz) | 485 MB PySpark + a JVM | 353 MB PyFlink + a JVM | CoordinatorServer + TabletServers + ZooKeeper + a Flink tiering job, JVM |
 | Start to first query | **0.02–0.07 s** | 4.1 s | 5.2–5.4 s | — |
 | Idle memory | **39 MB** | — | — | — |
 | Peak memory in these runs | **293–609 MB** (1.3 GB at 2.7 M events/s sustained) | 0.7–1.5 GB | 1.2–3.1 GB | — |
@@ -171,9 +220,11 @@ Where each side stands:
 | **Scale-out beyond one stage** (no shuffles; big-to-big joins on one node) | Spark's core strength; TPC-H at SF100+ needs it | Shuffle through the job-dealing mechanism tiering already uses: hash-partitioned exchange between nodes, spill to local SSD | TPC-H SF100 on 3–10 real machines vs Spark, same hardware |
 | **Multi-machine evidence** | Everything above is one box | Run the suite and benchmarks on 3–20 cloud VMs against S3/R2 | Near-linear ingest and query scaling, failover times |
 | **Streaming semantics** (event time, watermarks, windows, timers, CEP) | Flink's core strength | Tumbling/sliding/session windows with watermarks in views and tasks, on the same exactly-once commit path | Nexmark queries vs Flink |
-| **Durable ack in ms on object storage** | Fluss's edge | S3 Express One Zone as the log bucket (measure first); optional ack after replication to 2 nodes' memory/SSD | Ack p50 < 20 ms on S3 Express |
+| ~~Durable ack in ms on object storage~~ | Fluss's edge | **Done in round 8:** `--ack replicated`, 2–4 ms on R2, recovery tested by failovers. Next: `fsync` option, 3-replica tests on real machines | ✓ ack p50 2 ms on R2 |
+| **Open-format lag** on object storage | Other engines see a table 3–10 s after the ack on R2 (a few sequential round trips) | Hung idle connections fixed (round 8); next: overlap publishing with the next fold, fewer sequential writes for Iceberg, a lower default `--tier-secs` when the bucket is close | p99 < 3 s on a nearby bucket |
 | **APIs** | Usability for data teams | Arrow Flight SQL / Postgres wire (BI tools, JDBC), a Python client with DataFrame-style calls, Python UDFs | Tableau / Power BI / psql connect; notebook demo |
-| **Connectors** | Getting data in and out | Kafka-protocol ingest endpoint, CDC from Postgres/MySQL, Iceberg metadata beside Delta | Debezium → Pondra → Spark reading Iceberg |
+| **Connectors** | Getting data in and out | Kafka-protocol ingest endpoint, CDC from Postgres/MySQL (Iceberg and Delta output: done in round 8) | Debezium → Pondra → Spark reading Iceberg |
+| **Table layout** (Delta liquid clustering, Iceberg sort orders, partitions) | Big tables with selective filters | `cluster_by` (round 8: 6–11x on selective filters) → partitions → clustering across files → deletion vectors | TPC-H SF100 with partition + clustering pruning |
 | **Heavy new analytical queries at high concurrency** | Lakehouse//RT's edge | Prepared-plan cache, partitioned tables (pruning), per-node caches on many read-only nodes | TPC-H SF10 at 1k+ QPS mixed, p99 < 100 ms on N nodes |
 | **Governance** | Enterprise requirement | Auth (tokens, per-table grants), audit log, quotas | Multi-tenant test |
 | **Maturity** | Trust | Chaos tests on real clusters, fuzzing, long soak runs, versioned upgrades | Months of soak without data loss |
@@ -189,6 +240,9 @@ Sources:
 - [Fluss 1.0 roadmap](https://github.com/apache/fluss/discussions/2684)
 - [Fluss architecture](https://fluss.apache.org/docs/next/concepts/architecture/)
 - [Fluss tiering service](https://fluss.apache.org/docs/1.0/streaming-lakehouse/tiering-service/)
+- [Fluss tiering service deep dive, part 2: tuning (default freshness 3 min; peak ≈ freshness + 2 rounds)](https://fluss.apache.org/blog/fluss-tiering-service-deep-dive-part2/)
+- [Fluss union read ("sub-second freshness")](https://fluss.apache.org/docs/next/streaming-lakehouse/union-read/)
+- [Fluss 0.8 release (Iceberg, Lance)](https://fluss.apache.org/blog/releases/0.8/)
 - [Jack Vanlightly: Understanding Apache Fluss](https://jack-vanlightly.com/blog/2025/9/2/understanding-apache-fluss)
 - [Flink: end-to-end exactly-once](https://flink.apache.org/2018/02/28/an-overview-of-end-to-end-exactly-once-processing-in-apache-flink-with-apache-kafka-too/)
 - [Confluent: delivery guarantees and latency in Flink](https://docs.confluent.io/cloud/current/flink/concepts/delivery-guarantees.html)

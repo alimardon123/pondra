@@ -21,9 +21,15 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, oneshot};
 
-const INLINE_BYTES: usize = 64 << 10; // small flushes ride inside the commit; big ones (high volume) are objects
+/// Small flushes ride inside the commit; big ones (high volume) are objects. With replicated
+/// acks up to 1 MB rides inside: an object write first would cost the latency they save.
+fn inline_bytes() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let env = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<usize>().ok());
+    *N.get_or_init(|| env("PONDRA_INLINE_KB").unwrap_or(if env("PONDRA_REPLICAS").unwrap_or(1) > 1 { 1024 } else { 64 }) << 10)
+}
 const FLUSHES_IN_FLIGHT: usize = 4; // per node: object-store latency overlaps instead of adding up
-const COMMITS_IN_FLIGHT: usize = 4; // leader: catalog writes not yet durable
+const COMMITS_IN_FLIGHT: usize = 4; // leader: catalog writes not yet committed
 
 /// Who sent a batch: its producer and sequence number (and, optionally, the seq it expects to
 /// follow: a compare-and-swap that streaming tasks use).
@@ -111,7 +117,7 @@ impl Log {
         Log { tx }
     }
 
-    /// Append and wait for the durable ack.
+    /// Append and wait for the ack (the write is committed).
     pub async fn append(&self, table: String, src: Src, batch: RecordBatch) -> Result<Ack> {
         let (ack, rx) = oneshot::channel();
         self.tx.send(Append { table, src, batch, ack }).await.map_err(|_| anyhow!("log closed"))?;
@@ -172,7 +178,7 @@ async fn pack(lake: &Lake, pending: &[Append]) -> Result<Flush> {
         add(&table, &batch, None)?;
     }
     let mut f = Flush { parts, ..Default::default() };
-    if data.len() > INLINE_BYTES {
+    if data.len() > inline_bytes() {
         f.path = format!("log/{:015}-{}.seg", now_ms(), uuid::Uuid::new_v4());
         lake.put(&f.path, data).await?;
         maybe_crash("after_seg_put");
@@ -240,7 +246,7 @@ impl Sequencer {
 }
 
 /// Sequence a batch of flushes and write them as one catalog commit. Without waiting for it to
-/// be durable, the next batch can follow; acks go out once this one is.
+/// be committed, the next batch can follow; acks go out once this one is.
 async fn commit(lake: &Arc<Lake>, next: &mut u64, last_seq: &mut HashMap<String, u64>, batch: Vec<(Flush, oneshot::Sender<Outcome>)>, ms: &Arc<Mutex<Vec<f64>>>, slot: tokio::sync::OwnedSemaphorePermit) -> Result<()> {
     let (mut puts, mut seqs, mut replies) = (vec![], HashMap::<String, u64>::new(), vec![]);
     let (mut inline, mut inline_parts) = (vec![], BTreeMap::<String, Vec<(u64, u64, u64)>>::new()); // all inline flushes: one segment
@@ -302,7 +308,7 @@ async fn commit(lake: &Arc<Lake>, next: &mut u64, last_seq: &mut HashMap<String,
             }
         }
     }
-    // 3. One catalog write for everything; acks once it's durable.
+    // 3. One catalog write for everything; acks once it's committed (see `Lake::commits`).
     puts.extend(seqs.iter().map(|(p, s)| (producer_key(p), json(s))));
     puts.push(("n".into(), json(next)));
     let (t0, durable) = (Instant::now(), lake.cat.write(puts, &[]).await?);

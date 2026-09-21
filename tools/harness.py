@@ -295,6 +295,52 @@ def insert():
     return "bulk INSERT … SELECT writes Parquet directly; a retried job id is applied once"
 
 
+def serverless():
+    """Writes from any machine with the binary, with and without a running node."""
+    import pyarrow as pa, pyarrow.parquet as pq
+    lake, src = new_lake(), os.path.join(tempfile.mkdtemp(prefix="pondra-src-"), "jan.parquet")
+    pq.write_table(pa.table({"id": list(range(1000)), "v": [i % 7 for i in range(1000)]}), src)
+    insert = f"INSERT INTO sales SELECT * FROM '{src}'"
+
+    def cli(q, job=None):
+        env = {**os.environ, **({"PONDRA_JOB": job} if job else {})}
+        return subprocess.Popen([BIN, "sql", "--dir", lake, q], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+
+    def done(p):
+        out, err = p.communicate(timeout=300)
+        if p.returncode:
+            raise RuntimeError(err[-800:])
+        return out.strip()
+
+    def timed(q, job=None):
+        t = time.time()
+        return done(cli(q, job)), round(time.time() - t, 2)
+
+    def leads(node):
+        return "pondra leader" in open(node.log).read()
+
+    first, alone_s = timed(insert)  # nobody running: this process records its own files
+    once = [timed(insert, job="jan-1")[0], timed(insert, job="jan-1")[0]]  # a retried job counts once
+    together = [done(p) for p in [cli(insert) for _ in range(4)]]  # four machines at once, nobody running
+    t = time.time()
+    node = Node(lake, A.port).start()  # a node starting on the idle lake leads at once
+    node_start_s, node_leads = round(time.time() - t, 2), leads(node)
+    via_node, via_node_s = timed(insert)  # the files go to the running leader
+    node.kill()  # kill -9: its mark in the bucket goes stale within 30 s
+    after_kill, after_kill_s = timed(insert)  # (no followers to take over: it waits for the stale mark)
+    node2 = Node(lake, A.port + 1).start()
+    n = sql(node2.port, "SELECT count(*) AS n, count(DISTINCT id) AS ids FROM sales")[0]
+    node2_leads = leads(node2)
+    node2.kill()
+    ok = n == {"n": 8000, "ids": 1000} and '"duplicate":true' in once[1] and node_leads and node2_leads and node_start_s < 10
+    print(json.dumps({"serverless": {"alone_s": alone_s, "retry": once, "four_at_once": together, "node_start_s": node_start_s, "node_leads": node_leads,
+                                     "via_node_s": via_node_s, "after_leader_killed_s": after_kill_s, "rows": n, "ok": ok}}))
+    if not ok:
+        sys.exit(1)
+    return (f"INSERT from a process with no server: {alone_s}s alone, 4 at once, retries once; a node on the idle lake leads "
+            f"in {node_start_s}s; via a running leader {via_node_s}s; after the leader is killed {after_kill_s}s; {n['n']} rows, no duplicates")
+
+
 def load():
     lake = new_lake()
     node = Node(lake, A.port, flush_ms=A.flush_ms, tier_secs=10).start()
@@ -341,7 +387,7 @@ def load():
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    out = {t.__name__: t() for t in (upsert, tiering, fence, insert, reader, crash)}
+    out = {t.__name__: t() for t in (upsert, tiering, fence, insert, serverless, reader, crash)}
     A.secs = min(A.secs, 20)
     out["load"] = load()
     print(json.dumps(out, indent=1))
@@ -349,7 +395,7 @@ def all_tests():
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "tiering", "fence", "reader", "insert", "load", "all"])
+    ap.add_argument("mode", choices=["crash", "upsert", "tiering", "fence", "reader", "insert", "serverless", "load", "all"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -360,4 +406,4 @@ if __name__ == "__main__":
     ap.add_argument("--secs", type=int, default=30)
     ap.add_argument("--flush-ms", type=int, default=250)
     A = ap.parse_args()
-    {"crash": crash, "upsert": upsert, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "load": load, "all": all_tests}[A.mode]()
+    {"crash": crash, "upsert": upsert, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "load": load, "all": all_tests}[A.mode]()

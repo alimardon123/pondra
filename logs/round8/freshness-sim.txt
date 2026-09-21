@@ -1,0 +1,68 @@
+== sim durable
+{
+ "lake": "object storage",
+ "flags": {
+  "tier_secs": 2.0,
+  "publish": "delta,iceberg"
+ },
+ "probes": 8,
+ "write ack": {
+  "p50": 240,
+  "max": 339
+ },
+ "visible to another node after the ack": {
+  "p50": 10,
+  "max": 24
+ },
+ "visible to read-only node after the ack": {
+  "p50": 11,
+  "max": 25
+ },
+ "visible to pondra sql (new process) after the ack": {
+  "p50": 1936,
+  "max": 2202
+ },
+ "visible to Delta (delta-rs) after the ack": {
+  "p50": 2385,
+  "max": 2628
+ },
+ "visible to Iceberg (PyIceberg) after the ack": {
+  "p50": 3026,
+  "max": 3366
+ }
+}
+== sim replicated
+{
+ "lake": "object storage",
+ "flags": {
+  "tier_secs": 2.0,
+  "publish": "delta,iceberg",
+  "ack": "replicated"
+ },
+ "probes": 8,
+ "write ack": {
+  "p50": 3,
+  "max": 4
+ },
+ "visible to another node after the ack": {
+  "p50": 11,
+  "max": 23
+ },
+ "visible to read-only node after the ack": {
+  "p50": 14,
+  "max": 17
+ },
+ "visible to pondra sql (new process) after the ack": {
+  "p50": 2052,
+  "max": 2482
+ },
+ "visible to Delta (delta-rs) after the ack": {
+  "p50": 2189,
+  "max": 3001
+ },
+ "visible to Iceberg (PyIceberg) after the ack": {
+  "p50": 3395,
+  "max": 3840
+ }
+}
+DONE

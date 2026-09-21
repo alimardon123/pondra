@@ -1,6 +1,6 @@
 # Prototype status: Pondra, a streamhouse in one binary
 
-**Date:** 2026-09-21 (round 7) · **Plan:** ADR-002 to ADR-008 · **Code:** `pondra.zip` / `pondra.bundle` (≈3,650 lines of Rust, plus test and benchmark tools)
+**Date:** 2026-09-21 (round 8) · **Plan:** ADR-002 to ADR-009 · **Code:** `pondra.zip` / `pondra.bundle` (≈4,550 lines of Rust, plus test and benchmark tools)
 **Name:** the prototype formerly called `lh` is now **Pondra**. The name is free on crates.io, PyPI and npm. A small personal-finance app uses it (pondra.app), a different category; run a trademark search before a public launch.
 
 ## Where it stands
@@ -14,6 +14,23 @@ One Rust binary replaces the Kafka + Flink + Spark + metastore + ZooKeeper stack
 - upsert and merge tables.
 
 Start more copies on the same bucket to scale out. The only state is object storage. There's no JVM, no database server and no coordination service.
+
+**Round 8 made the native lake the default and writes fast on any storage** (ADR-009):
+
+1. **Millisecond writes without S3 Express.** With `--ack replicated`, a write is acknowledged once
+   two nodes hold it and reaches the bucket a moment later. On real R2: **4 ms p50** (was 299 ms),
+   and 64 writers went from 6,400 to **87,200 events/s**. A new leader recovers what followers
+   held — up to 279 commits in one failover — with 0 lost and 0 duplicated.
+2. **Native first; Delta and Iceberg on request.** Pondra's readers use the catalog directly:
+   nodes see a write 10–15 ms after the ack, on local disk or R2. Tables that ask are also
+   published as Delta and, new, **Iceberg**. Six outside readers (delta-rs, Polars, DuckDB × 2,
+   PyIceberg) match Pondra row for row, on local disk and real R2.
+3. **Writes from any machine.** `pondra sql "INSERT INTO t SELECT …"` runs the query where it's
+   typed and has the leader record the files — or records them itself when nobody runs. A node
+   starting on an idle lake leads at once (was a 30 s wait).
+4. **`cluster_by` for append tables:** selective filters 6–11x faster.
+5. **Freshness compared like for like** with Fluss (memory/SSD vs memory/SSD, object storage vs
+   object storage): see `docs/comparison-spark-flink-fluss.md`.
 
 **Round 7 made it a serving engine at Lakehouse//RT speed, and measured it against Spark on TPC-H:**
 
@@ -138,6 +155,82 @@ correctness test passed while sustained ingest fell by half. It was found by ben
 testing. There is now a `tiering` test (rounds of writes + `/tier`: the log must drain and the
 file count stay bounded) and a note in `AGENTS.md` that this failure mode shows up as throughput,
 not as a red test.
+
+## Round 8: native first, fast writes on any storage, writes from anywhere
+
+**Write latency and throughput** (3 nodes on one 2-vCPU box; `cluster.py latency | users`):
+
+| | Local disk | Simulated R2 | Real R2, Eastern NA bucket (PUT ~290 ms) | Real R2, the far bucket (PUT ~670 ms) |
+|---|---|---|---|---|
+| Ack, `--ack durable` | 5 ms | 255 ms p50, 757 ms p99 | 299 ms p50, 732 ms p99 | 818 ms p50, 2.5 s p99 |
+| Ack, `--ack replicated` | 4 ms | **4 ms p50, 7 ms p99** | **4 ms p50, 5 ms p99** | **4 ms p50, 8 ms p99** |
+| 64 writers + 16 readers, durable | 125k events/s, ack p50 39 ms | — | 6,400 events/s, ack p50 937 ms | — |
+| 64 writers + 16 readers, replicated | 129k events/s, ack p50 38 ms | 89k events/s, ack p50 58 ms | **87,200 events/s, ack p50 60 ms** | — |
+
+Replicated mode passed every consistency test it was given:
+
+- `users`: 0 torn reads, 0 lost or duplicated batches, 4 runs locally, 2 on simulated R2 and 1 on
+  real R2.
+- `failover`: exactly-once and task state == model, 11 runs locally, 4 on simulated R2 and
+  2 on real R2 (14–16 s from kill to writes acked again after the fix).
+- Its leaders were killed with up to 279 acknowledged commits not yet in the bucket; every one
+  was recovered.
+
+**Freshness, head to head:** the table and what it means are in
+`docs/comparison-spark-flink-fluss.md`. In short:
+
+- **Nodes:** 10–15 ms after the ack, on local disk and on R2.
+- **A new `pondra sql` process:** 34 ms on local disk; ~3 s on R2, where opening the catalog
+  costs ~20 requests.
+- **Delta / Iceberg readers:** ~30 ms on local disk; 3–4 s on the near R2 bucket (worst 5–8 s);
+  7–10 s on the far one.
+
+**Writes from any machine** (`harness.py serverless`; local disk / real R2):
+
+| | Local disk | Real R2 |
+|---|---|---|
+| `pondra sql` INSERT on a brand-new lake, nobody running | 0.03 s | 11.3 s (it creates the catalog) |
+| Same job id again | `{"duplicate": true}` | same |
+| 4 INSERTs at once, nobody running | all 4 recorded, in turn | same |
+| A node starting on the idle lake | leads at once (0.02 s) | leads, up in 5.7 s |
+| INSERT while that node runs | 0.02 s (the leader records the files) | 3.5 s |
+| INSERT right after the leader is killed (no followers) | 30 s (waits for the leader's mark to go stale) | 30.6 s |
+| Rows at the end | 8,000, no duplicates | same |
+
+**Open formats:** `open_check.py`, 4 tables (append, upsert, GROUP BY view, bulk insert):
+
+- **Local disk, 120 rounds:** past a Delta checkpoint and Iceberg's 100-snapshot history. All six
+  readers equal Pondra.
+- **Real R2, 30 rounds:** all six equal Pondra. PyIceberg needs its fsspec file IO there: its
+  default PyArrow S3 client got 403s from R2 in this sandbox.
+
+**Clustering** (`clustering.py`, 8 M rows, 100k users, local disk):
+
+- one user: 130 → 20 ms;
+- a range of users: 73 → 6.5 ms;
+- 100 users (`IN` list): 103 → 79 ms;
+- full scans: 52 → 91 ms (sorting scatters columns that were in arrival order, which then
+  compress worse).
+
+### What the tests caught this round
+
+- **A PUT on real R2 hung for its full 30 s timeout.** It slowed a tiering round to 26 s and
+  failed a `/tier` call. In replicated mode, it let 279 commits be acknowledged ahead of the
+  bucket. Two fixes:
+  - idle bucket connections are dropped after 15 s instead of being reused;
+  - at most 256 commits may be acknowledged ahead of the bucket.
+- **Real R2 slowed down when test pollers hammered it** from this sandbox. The freshness tool now
+  polls the bucket every 0.2 s.
+- **`pondra sql` INSERT on a brand-new lake** can't open a catalog that doesn't exist yet: it now
+  writes its files after it has claimed the lake.
+- **A node that could never reach the leader would take over after the 30 s startup lease.** A
+  laptop outside the cluster's network could have deposed a healthy leader. Now only members
+  that lost a leader they were talking to use the lease; everyone else needs the leader's mark
+  in the bucket to be stale.
+- **Readers of other formats:**
+  - DuckDB's iceberg extension needs its avro extension installed next to it;
+  - PyIceberg's default PyArrow S3 client got 403s from R2 here; use fsspec;
+  - Polars reads Iceberg on R2 when given the PyIceberg table.
 
 ## Round 7: serving reads, TPC-H, and the result cache
 
@@ -295,12 +388,12 @@ a real Cloudflare R2 bucket. All of them pass on all three.
 
 ## Sizes
 
-| What | Round 3 | Round 5 |
-|---|---|---|
-| Binary (stripped) | 88.3 MB (30 MB gzip, 17 MB xz) | 89.2 MB (29.9 MB gzip, 16.8 MB xz) |
-| Idle memory | 18 MB | 41 MB (mimalloc reserves more up front) |
-| Peak memory under full load | 455 MB | 1.8 GB at 2.84 M events/s sustained (279–586 MB in the batch and streaming benchmarks) |
-| Storage per event (user, event, amount, ts) | NDJSON 77.9 B → log 12.8 B → Parquet 6.8 B | NDJSON 77.9 B → log 12.8 B → Parquet 6.8 B (unchanged) |
+| What | Round 3 | Round 5 | Round 8 |
+|---|---|---|---|
+| Binary (stripped) | 88.3 MB (30 MB gzip, 17 MB xz) | 89.2 MB (29.9 MB gzip, 16.8 MB xz) | 90.0 MB (30.5 MB gzip, 18.7 MB xz) |
+| Idle memory | 18 MB | 41 MB (mimalloc reserves more up front) | 42 MB |
+| Peak memory under full load | 455 MB | 1.8 GB at 2.84 M events/s sustained (279–586 MB in the batch and streaming benchmarks) | not re-measured |
+| Storage per event (user, event, amount, ts) | NDJSON 77.9 B → log 12.8 B → Parquet 6.8 B | NDJSON 77.9 B → log 12.8 B → Parquet 6.8 B (unchanged) | unchanged |
 
 ## Memory is a knob, not a mystery
 
@@ -332,9 +425,12 @@ peak at 279–586 MB.
 ## What remains
 
 - One sequencer per lake orders commits (metadata only). Past its capacity, use several lakes.
-- Durable acknowledgement costs one object-store write: 1.2 s against R2 from this sandbox, where
-  a bare PUT is 0.81 s; milliseconds on local disks, and expected to be milliseconds on S3 Express
-  One Zone (not measured).
+- A *durable* acknowledgement costs one object-store write (0.25–0.7 s on R2). `--ack replicated`
+  makes it milliseconds, but a write in that window survives only as long as one of its holders
+  does (no fsync; not the leader and every holder at once).
+- A one-off `pondra sql` on far-away object storage spends 2–3 s opening the catalog.
+- Open-format versions trail the ack by a few sequential bucket round trips (3–4 s near, 7–10 s
+  far, at `--tier-secs 2`); Iceberg costs two more round trips than Delta.
 - A *new* analytical query costs what its scan costs (TPC-H SF1: 60–600 ms per query on two
   cores). Repeated ones and key lookups are served from caches in about a millisecond.
 - Compaction of a keyed table is one job on one node. Partitioned compaction (a key range per
@@ -344,18 +440,19 @@ peak at 279–586 MB.
 - Under sustained overload, commits pause until tiering catches up (`--backlog`); a client with a
   short timeout will see it as a slow ack.
 - No auth, quotas or multi-tenancy.
-- Other engines read Delta only (no Iceberg metadata yet), unpartitioned, and keyed tables only
-  as of their last compaction (at most 8 tiering rounds behind). Delta time travel reaches back
-  only as far as `--retain-secs` keeps replaced files.
-- On object storage, what other engines see trails the ack by three storage round trips.
+- Other engines read Delta and Iceberg (opt-in per table), unpartitioned, and keyed tables only
+  as of their last compaction (at most 8 tiering rounds behind). Time travel reaches back only as
+  far as `--retain-secs` keeps replaced files.
+- No access control inside Pondra: bucket credentials decide who can do what.
 
 ## Next
 
 1. **Prepared-plan cache per table version**, so a lookup costs a page read instead of a plan.
 2. **Partitioned compaction and key-range pruning**, so 100 M+ key state stays cheap.
 3. **Shuffles** for big-to-big joins (the job-dealing mechanism the tiering uses already fits).
-4. **S3 Express One Zone measurements** — the one storage choice that removes the latency gap to
-   Fluss and Databricks RT without giving up "object storage is the only state".
-5. **Auth and quotas** per producer and per user.
-6. **Iceberg metadata** next to the Delta log (same files), and partitioned tables, so engines
-   that prefer Iceberg — and big tables — are served as well as Delta readers are now.
+4. **Replicated acks, hardened:** an fsync option, three replicas on real machines, and
+   failover times on R2 closer to the 5 s they take on local disk.
+5. **Auth and quotas** per producer and per user; read-only "attach another lake" for queries
+   across lakes.
+6. **Partitioned tables and clustering across files**, so big tables prune as well as Delta
+   liquid clustering and Iceberg sort orders do.

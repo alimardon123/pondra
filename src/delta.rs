@@ -1,8 +1,10 @@
-//! Delta Lake publishing, so other engines — Spark, Databricks, DuckDB, Polars, Trino, Athena,
-//! Snowflake — can read the lake without Pondra. A table's Parquet files already live in
-//! `data/{table}/`; this keeps that folder's `_delta_log/` in step with the catalog: one JSON
-//! commit per change to the table's file list, plus a Parquet checkpoint every 10 commits so
-//! readers never replay a long log; the last 1,000 versions are kept.
+//! Open formats, for the tables that ask for them (`TableMeta::publish`): Pondra itself reads
+//! the catalog, which is fresher; these are for engines that don't know Pondra — Spark,
+//! Databricks, DuckDB, Polars, Trino, Athena, Snowflake. Iceberg is in `iceberg.rs`; Delta here.
+//! A table's Parquet files already live in `data/{table}/`; this keeps that folder's
+//! `_delta_log/` in step with the catalog: one JSON commit per change to the table's file list,
+//! plus a Parquet checkpoint every 10 commits so readers never replay a long log; the last 1,000
+//! versions are kept.
 //!
 //! The catalog stays the source of truth: a commit is derived only from what the catalog has
 //! already committed, so a crash can at worst leave the Delta log one step behind.
@@ -31,12 +33,20 @@ struct Published {
     files: BTreeMap<String, (u64, u64)>, // path in the table folder -> (bytes, published at ms)
 }
 
-/// Every table at once (each is an object-store write or two), then one catalog write that
-/// records what was published. It isn't awaited: until it is durable, the next round sees the
-/// older state, finds its Delta commit already written and adopts it (see `publish`).
+/// Every table in every format it's published in at once (each is an object-store write or
+/// two), then one catalog write that records what was published. It isn't awaited: until it is
+/// durable, the next round sees the older state and takes over what was written (see `publish`).
 pub async fn publish_all(lake: &Lake) -> Result<()> {
+    lake.cat.wait_durable(lake.cat.committed()).await; // (replicated acks: publish only what's in the bucket)
     let tables = lake.cat.scan::<TableMeta>("t/", "t0").await?;
-    let states = futures::future::try_join_all(tables.iter().map(|(key, meta)| publish(lake, &key[2..], meta))).await?;
+    let jobs = tables.iter().flat_map(|(key, meta)| meta.publish.iter().map(move |f| (&key[2..], meta, f.as_str())));
+    let states = futures::future::try_join_all(jobs.map(|(table, meta, format)| async move {
+        match format {
+            "delta" => publish(lake, table, meta).await,
+            _ => crate::iceberg::publish(lake, table, meta).await,
+        }
+    }))
+    .await?;
     let puts: Vec<(String, Vec<u8>)> = states.into_iter().flatten().collect();
     if !puts.is_empty() {
         drop(lake.cat.write(puts, &[]).await?);
@@ -44,17 +54,44 @@ pub async fn publish_all(lake: &Lake) -> Result<()> {
     Ok(())
 }
 
+/// The files another engine should read as the table, if they read right without Pondra: all of
+/// an append table's; for a keyed table only a single file with one row per key and no delete
+/// markers (a compaction's output, or a first fold of a table without deletes). Between
+/// compactions the last published version stays.
+pub fn publishable(meta: &TableMeta) -> Option<Vec<&DataFile>> {
+    let deletes = meta.columns.iter().any(|(c, _)| c == "_deleted");
+    match meta.key.is_empty() {
+        true => Some(meta.files.iter().collect()),
+        false if meta.files.len() == 1 && (meta.files[0].whole || !deletes) => Some(meta.files.iter().collect()),
+        false => None,
+    }
+}
+
+/// Stop publishing a table in `format`: its metadata goes, so no engine reads a stale copy.
+pub async fn unpublish(lake: &Lake, table: &str, format: &str) -> Result<()> {
+    let (dir, state) = match format {
+        "delta" => (format!("data/{table}/_delta_log"), format!("x/{table}")),
+        _ => (format!("data/{table}/metadata"), format!("i/{table}")),
+    };
+    lake.cat.commit(vec![], &[state]).await?;
+    let objects: Vec<_> = futures::TryStreamExt::try_collect(lake.store.list(Some(&Path::from(dir)))).await?;
+    futures::future::join_all(objects.iter().map(|o| lake.delete(o.location.as_ref()))).await;
+    Ok(())
+}
+
+/// Delta logs and Iceberg metadata: open-format files Pondra writes but never reads.
+pub fn open_format(path: &str) -> bool { path.contains("/_delta_log/") || path.contains("/metadata/") }
+
+/// A Decimal128(p, s) column's precision and scale.
+pub fn decimal(t: &str) -> Option<(u8, i8)> {
+    let (p, s) = t.strip_prefix("Decimal128(")?.strip_suffix(')')?.split_once(',')?;
+    Some((p.trim().parse().ok()?, s.trim().parse().ok()?))
+}
+
 /// The table's next Delta commit, if its files changed; returns the new publish state to record.
 async fn publish(lake: &Lake, table: &str, meta: &TableMeta) -> Result<Option<(String, Vec<u8>)>> {
     let Some(schema) = schema_string(&meta.columns) else { return Ok(None) }; // a type Delta can't carry
-    // Keyed tables: only a single file with one row per key and no delete markers reads right
-    // without Pondra (a compaction's output, or a first fold of a table without deletes).
-    let deletes = meta.columns.iter().any(|(c, _)| c == "_deleted");
-    let files: Vec<&DataFile> = match meta.key.is_empty() {
-        true => meta.files.iter().collect(),
-        false if meta.files.len() == 1 && (meta.files[0].whole || !deletes) => meta.files.iter().collect(),
-        false => return Ok(None), // between compactions: keep the last published version
-    };
+    let Some(files) = publishable(meta) else { return Ok(None) };
     let (dir, key) = (format!("data/{table}/"), format!("x/{table}"));
     let want: BTreeMap<&str, u64> = files.iter().filter_map(|f| Some((f.path.strip_prefix(&dir)?, f.bytes))).collect();
     let mut state: Published = lake.cat.get(&key).await?.unwrap_or_default();
@@ -165,7 +202,7 @@ fn schema_string(columns: &[(String, String)]) -> Option<String> {
             "Boolean" => "boolean",
             "Date32" => "date",
             "Binary" | "LargeBinary" => "binary",
-            _ => return None,
+            t => return decimal(t).map(|(p, s)| json!({"name": name, "type": format!("decimal({p},{s})"), "nullable": true, "metadata": {}})),
         };
         Some(json!({"name": name, "type": t, "nullable": true, "metadata": {}}))
     });

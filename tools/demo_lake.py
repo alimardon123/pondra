@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Build a small lake with one of everything — an append table, an upsert table, an aggregating
 view, a streaming task, a bulk insert, small and large writes, tiered and untiered rows — and
-print its folder tree, with row counts from Pondra and from three engines that read the Delta logs.
+print its folder tree, with row counts from Pondra and from the engines that read its Delta logs and
+Iceberg metadata.
 Run it on a local folder and on a bucket to compare the two layouts.
   demo_lake.py [--dir /tmp/demo | --dir s3://bucket/prefix] [--keep]"""
 import argparse, io, json, os, sys, tempfile, time
@@ -47,7 +48,7 @@ def tree(files, show=3):
 def main(a):
     import pyarrow as pa, pyarrow.ipc
     lake = a.dir or tempfile.mkdtemp(prefix="pondra-demo-")
-    node = Node(lake, a.port, tier_secs=0).start()
+    node = Node(lake, a.port, tier_secs=0, publish="delta,iceberg").start()  # open formats: opt-in
     p = node.port
     call(p, "POST", "/tables/events", json.dumps([["user", "Utf8"], ["amount", "Int64"]]).encode())
     call(p, "POST", "/tables/customers", json.dumps({"columns": [["id", "Utf8"], ["name", "Utf8"], ["tier", "Utf8"]], "key": ["id"]}).encode())
@@ -64,15 +65,16 @@ def main(a):
         call(p, "POST", f"/append/customers?producer=crm&seq={i + 1}", "".join(
             json.dumps({"id": f"c{j}", "name": f"Customer {j}", "tier": ["gold", "silver"][(i + j) % 2]}) + "\n" for j in range(20)).encode())
     time.sleep(2)
-    call(p, "POST", "/tier", timeout=600)  # log -> Parquet (+ the Delta log other engines read)
+    call(p, "POST", "/tier", timeout=600)  # log -> Parquet (+ the Delta log and Iceberg metadata other engines read)
     call(p, "POST", "/append/events?producer=app&seq=2", b'{"user": "u1", "amount": 5}\n')  # left in the log, untiered
     time.sleep(1)
     counts = {tb: sql(p, f"SELECT count(*) AS n FROM {tb}")[0]["n"] for tb in ("events", "customers", "spend_by_user", "big_orders", "regions")}
     if not a.keep:
         node.kill()
     print(f"lake: {lake}\nrows per table (Pondra SQL): {counts}")
-    from delta_check import readers  # the same tables through their Delta logs, without Pondra
-    print("rows per table (delta-rs / Polars / DuckDB):", {tb: readers(lake, tb) for tb in counts}, "\n")
+    from open_check import iceberg_readers, readers  # the same tables through Delta and Iceberg, without Pondra
+    print("rows per table via Delta (delta-rs / Polars / DuckDB):", {tb: readers(lake, tb) for tb in counts})
+    print("rows per table via Iceberg (PyIceberg / Polars / DuckDB):", {tb: iceberg_readers(lake, tb) for tb in counts}, "\n")
     print(tree(listing(lake)))
 
 

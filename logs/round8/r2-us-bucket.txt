@@ -1,0 +1,108 @@
+######## bucket ponderabucket-us
+== freshness durable
+{
+ "lake": "object storage",
+ "flags": {
+  "tier_secs": 2.0,
+  "publish": "delta,iceberg"
+ },
+ "probes": 8,
+ "write ack": {
+  "p50": 251,
+  "max": 324
+ },
+ "visible to another node after the ack": {
+  "p50": 13,
+  "max": 32
+ },
+ "visible to read-only node after the ack": {
+  "p50": 11,
+  "max": 32
+ },
+ "visible to pondra sql (new process) after the ack": {
+  "p50": 3172,
+  "max": 12631
+ },
+ "visible to Delta (delta-rs) after the ack": {
+  "p50": 3448,
+  "max": 5718
+ },
+ "visible to Iceberg (PyIceberg) after the ack": {
+  "p50": 4784,
+  "max": 33785
+ }
+}
+== freshness replicated
+{
+ "lake": "object storage",
+ "flags": {
+  "tier_secs": 2.0,
+  "publish": "delta,iceberg",
+  "ack": "replicated"
+ },
+ "probes": 8,
+ "write ack": {
+  "p50": 2,
+  "max": 4
+ },
+ "visible to another node after the ack": {
+  "p50": 13,
+  "max": 29
+ },
+ "visible to read-only node after the ack": {
+  "p50": 13,
+  "max": 25
+ },
+ "visible to pondra sql (new process) after the ack": {
+  "p50": 2757,
+  "max": 4419
+ },
+ "visible to Delta (delta-rs) after the ack": {
+  "p50": 3225,
+  "max": 13414
+ },
+ "visible to Iceberg (PyIceberg) after the ack": {
+  "p50": 3761,
+  "max": 27233
+ }
+}
+== serverless
+{"serverless": {"alone_s": 11.34, "retry": ["{\"rows\":1000}", "{\"duplicate\":true}"], "four_at_once": ["{\"rows\":1000}", "{\"rows\":1000}", "{\"rows\":1000}", "{\"rows\":1000}"], "node_start_s": 5.7, "node_leads": true, "via_node_s": 3.47, "after_leader_killed_s": 30.62, "rows": {"n": 8000, "ids": 1000}, "ok": true}}
+== open_check
+Traceback (most recent call last):
+  File "/home/claude/pondra/tools/open_check.py", line 133, in <module>
+    main()
+  File "/home/claude/pondra/tools/open_check.py", line 114, in main
+    call(p, "POST", "/tier", timeout=600)
+  File "/home/claude/pondra/tools/harness.py", line 25, in call
+    raise RuntimeError(f"{r.status}: {data[:300]!r}")
+RuntimeError: 500: b'Generic S3 error: Error performing PUT https://<account>.r2.cloudflarestorage.com/ponderabucket-us/round8/test-222bb7db/data/kv/786ac9b5-d899-4458-a27e-2869f30e7a62.parquet in 30.000610564s - HTTP error: error sending request: Error performing PUT https://<account>'
+== failover replicated
+failover: 3 nodes, 6 shards, 8 producers, 943400 events, 1 follower + 2 leader kills
+  failovers: 15.9s, 43.4s (kill -> writes acked again); state caught up 0.4s after the last write
+  events exactly once: True (943400 rows); for 1000 users, task state == model: True, inline view == model: True
+  shard runs per node (since each node's last start): {18080: 319, 18081: 293, 18082: 182}
+== users durable
+users: 64 writers + 16 readers + 2 serverless on 3 node(s), 31s  lake s3://ponderabucket-us/round8/test-4e959b39
+  200900 events (6,404/s), ack p50 937 ms p99 2308 ms
+  48054 snapshot reads, query p50 7 ms p99 56 ms
+  inconsistent reads: 0; producers with lost/duplicate batches: 0
+    by node: {}
+== users replicated
+users: 64 writers + 16 readers + 2 serverless on 3 node(s), 31s  lake s3://ponderabucket-us/round8/test-1edcc7f7
+  2720000 events (87,152/s), ack p50 60 ms p99 226 ms
+  2217 snapshot reads, query p50 180 ms p99 878 ms
+  inconsistent reads: 0; producers with lost/duplicate batches: 0
+    by node: {}
+== fence
+fence: 2nd node joined as follower=True; takeover after 13.9s; stale leader's write rejected; it rejoined as follower; rows=[{'producer': 'a', 'n': 200}, {'producer': 'b', 'n': 200}] -> OK
+== upsert
+upsert: 402 live keys after 12,000 random upserts/deletes, 6 compactions (s: 1.0, 0.6, 0.6, 1.3, 0.6, 0.7), 1 restart, 3,400 lookups (0 wrong) -> OK
+== crash
+run  1: kill-9=4 injected={'after_seg_put': 0, 'after_commit': 2, 'after_parquet_put': 51} events=30000/30000 unique=30000 task_output=15000/15000 views=exact -> OK
+######## bucket pondbucket
+== latency durable
+latency: 3 nodes, 0 background producers; 17 probe events, 17 pushed back
+  ack (durable)                   p50 1336 ms  p99 1845 ms
+  view row pushed to another node     p50 1335 ms  p99 1845 ms
+== latency replicated

@@ -1,7 +1,8 @@
 # AGENTS.md — working on Pondra
 
-Read this first, then `README.md` (what it does) and `docs/adr-005-every-node-writes.md` (why it
-works this way). `docs/prototype-status.md` has the measured numbers and what's left.
+Read this first, then `README.md` (what it does), `docs/adr-005-every-node-writes.md` (why it
+works this way) and `docs/adr-009-native-first.md` (the current round). `docs/prototype-status.md`
+has the measured numbers and what's left.
 
 ## What this is
 
@@ -17,14 +18,15 @@ The owner's design principles, which every change must respect:
 2. **As serverless as possible**: no always-on services besides the nodes themselves.
 3. **SPMD, not driver/executor** (Bodo-style): every node runs the same code on its slice.
 4. **No JVM, no Spark, no Flink, no Fluss needed.**
-5. **Short, simple, readable code** — without losing functionality. ~3,650 lines of Rust total.
+5. **Short, simple, readable code** — without losing functionality. ~4,550 lines of Rust total.
    If a change makes a file much longer, look for the simpler shape first.
 
 ## Layout
 
 ```
-src/      3,650 lines of Rust, one file per concern (see the table in README.md)
-tools/    harness.py, cluster.py (tests), delta_check.py (outside readers == Pondra),
+src/      4,550 lines of Rust, one file per concern (see the table in README.md)
+tools/    harness.py, cluster.py (tests), open_check.py (Delta + Iceberg readers == Pondra),
+          freshness.py (head-to-head freshness), clustering.py (what cluster_by buys),
           newuser_bench.py (first reads, new nodes), demo_lake.py (one of everything + the tree),
           serve_bench.py + loadgen.go (serving), bench/tpch.py (TPC-H vs DuckDB and Spark),
           sizes.py, sim_r2.py (local S3 with R2 latency),
@@ -37,26 +39,40 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
 - **Tables** are Parquet files in the bucket plus a **log tail**. Every query reads files ∪ tail,
   so data is queryable the moment it commits.
 - **The catalog** is a SlateDB key-value store inside the same bucket: `t/` tables, `s/` segments,
-  `d/` inline segment data, `p/` producer progress, `v/` views, `k/` tasks, `x/` Delta publish
-  state, `n` next segment, `c` commit number. One process (the leader) writes it; everyone reads it.
+  `d/` inline segment data, `p/` producer progress, `v/` views, `k/` tasks, `x/` Delta and `i/`
+  Iceberg publish state, `m` members (replicated acks), `n` next segment, `c` commit number. One
+  process (the leader) writes it; everyone reads it.
 - **Writes:** a client POSTs a batch to *any* node. That node encodes it (Arrow IPC + ZSTD), runs
-  the inline views on it, writes it to the bucket if it's over 64 KB, and asks the leader to
-  sequence it. The leader dedupes `(producer, seq)`, numbers the segments and commits — one
-  catalog write for every node's flush in that round. It never touches the data itself.
+  the inline views on it, writes it to the bucket if it's over 64 KB (1 MB with replicated
+  acks), and asks the leader to sequence it. The leader dedupes `(producer, seq)`, numbers the
+  segments and commits — one catalog write for every node's flush in that round. It never
+  touches the data itself.
+- **Committed** means acknowledged and visible. By default (`--ack durable`) a write commits
+  once it's in the bucket. With `--ack replicated` it commits once `--replicas` nodes hold it:
+  the leader in memory, followers in local replica files (`replica.rs`). The bucket gets it a
+  moment later either way.
 - **Exactly-once:** producers send `(producer, seq)` in order, one request in flight, retrying on
   any node. Retries of committed batches come back `"duplicate": true`. Streaming tasks use the
   same mechanism with a compare-and-swap (`prev`), so output and progress commit together.
-- **Followers** get every durable commit streamed over `GET /cluster/log`. They seed an in-memory
+- **Followers** get every change and commit streamed over `GET /cluster/log` (frames: `Start`,
+  `Change`, `Committed`, `Durable`; a change takes effect at its `Committed`). They seed an in-memory
   copy of the whole catalog from their own view and keep it current from the stream (the
   "mirror"), so they see a commit within milliseconds and never ask the bucket for metadata.
   After a gap in the stream they fall back to their view plus the streamed commits (the ADR-005
   rules) until they can seed again.
-- **Open lake:** every tiering round (default every 2 s) also writes each table's Delta Lake log
-  (`data/{table}/_delta_log/`, `src/delta.rs`), so other engines read the lake without Pondra.
+- **Native first, open formats on request:** Pondra's readers use the catalog directly. Tables
+  with `publish` get a Delta log (`data/{table}/_delta_log/`, `delta.rs`) and/or Iceberg metadata
+  (`data/{table}/metadata/`, `iceberg.rs`) every tiering round, for engines that don't know
+  Pondra.
+- **Serverless:** `pondra sql` reads the bucket with no node running. Its `INSERT … SELECT`
+  writes Parquet itself, then has the running leader record the files — or records them itself,
+  under its own term, when nobody leads (`insert.rs`).
 - **SSD tier** (lakes on object storage): each node keeps immutable objects on local disk —
   written through, read through, prefetched from the commit stream, warmed at start (`cache.rs`).
 - **Leader election** is a put-if-absent object `cluster/term/{n}`; SlateDB fencing stops an old
-  leader from writing. HTTP heartbeats decide liveness and who runs which task shard.
+  leader from writing. HTTP heartbeats decide liveness and who runs which task shard. The leader
+  also rewrites `cluster/alive/{n}` every 10 s, so machines outside the cluster can tell a live
+  leader from a dead one.
 - **Maintenance** (log → Parquet, merging small files, compaction, retention) is decided by the
   leader and dealt out to all nodes as jobs.
 
@@ -69,10 +85,12 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
 2. **"How far can I read" comes from the same view as the read** (`Lake::visible`), never from the
    `hwm` watch (which only wakes readers and may be ahead on a follower). A task that reads
    `(done, hwm]` while its view can't see all of it would commit progress past rows it never read.
-   On the leader `visible()` is the durable high-water mark, *not* `last_n`, which counts
+   On the leader `visible()` is the committed high-water mark, *not* `last_n`, which counts
    in-flight commits.
-3. **Only durable data is visible.** Leader reads use SlateDB's `DurabilityLevel::Remote`;
-   followers only ever see commits the leader already made durable.
+3. **Only committed data is visible.** The leader reads its in-memory catalog, which only ever
+   holds committed writes (applied in `Lake::commits`), never ones in flight. Followers apply a
+   change only at the `Committed` frame that covers it. Committed = durable by default; with
+   `--ack replicated`, held by `replicas − 1` member followers or durable (invariant 15).
 4. **A job names its inputs.** Tiering jobs carry the file list and segment range from the leader
    and refuse to run until the node can see the last segment; otherwise a lagging node would write
    an incomplete file that the leader then commits.
@@ -110,10 +128,33 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    file that has the key. A writer that breaks it (say, appending raw rows to a keyed file)
    makes reads return duplicates.
 14. **A cached result is valid for exactly one catalog version** (`Catalog::version`), which only
-   exists where every read reflects exactly that version: the leader (last durable commit) and
+   exists where every read reflects exactly that version: the leader (last committed write) and
    nodes with the in-memory catalog (last streamed commit). Identical queries in flight share one
    computation that covers only requests which arrived before it started. `stale_ms` is the one,
    opt-in, exception.
+15. **Replicated commits** (`--ack replicated`, `replica.rs`). Break one of these and acked writes
+   vanish in a failover:
+   - A follower acks only a run of *consecutive* changes it holds, and never for a term older
+     than the newest it has heard of (a new leader's `/cluster/replica` fetch raises that mark).
+   - Only members listed in the catalog (`m`), durably, count. A follower is listed before it
+     counts; it stops counting, and everything is made durable, before it leaves the list.
+   - A new leader recovers before it takes writes (`replica::recover`, before `Sequencer::start`
+     and before its HTTP server): it asks every member (20 s), re-commits the longest chain
+     (terms never going down), and waits until it's durable.
+   - At most `AHEAD` (256) commits are acknowledged ahead of the bucket; past that, acks wait for
+     it (a hung PUT on real R2 once let 279 pile up).
+   - `failover --flag ack=replicated` on simulated R2 is the test that exercises recovery: its
+     leaders die with commits the bucket doesn't have yet.
+16. **Only durable state leaves the catalog.** Delta/Iceberg publishing and deleting objects
+   (retention) first wait for everything committed so far to be durable
+   (`Catalog::wait_durable`). With replicated acks, a commit that recovery can't find must never
+   have reached another engine or deleted a file.
+17. **Nobody deposes a live leader from outside the cluster.** A node joining, or a `pondra sql`
+   INSERT, claims a new term only if the latest term's `cluster/alive` mark is over 30 s old. A
+   follower that has never reached its leader (`Cluster::heard`) waits for that too; only
+   members that lost a leader they were talking to use the 5 s lease.
+   A one-off writer claims with an empty address, keeps its mark fresh while it works, and
+   deletes it when done. Nodes and other writers wait for it; they never follow it.
 
 ## Tests: run these before and after any change
 
@@ -124,6 +165,9 @@ python3 tools/harness.py crash --runs 3 --batches 60 --size 50000   # kill -9 + 
 python3 tools/cluster.py users --secs 30      # 64 writers + 16 readers: 0 torn reads, 0 lost
 python3 tools/cluster.py failover --secs 45   # 2 leader kills; task state == inline view == model
 python3 tools/cluster.py latency [--load 4]   # event -> view row on another node
+python3 tools/harness.py serverless            # pondra sql INSERT with and without a leader, 4 at once, a retry
+python3 tools/open_check.py                    # Delta + Iceberg: 6 outside readers == Pondra
+python3 tools/freshness.py [--flag ack=replicated]  # head to head: nodes, pondra sql, Delta, Iceberg
 python3 tools/cluster.py race | isolate | split | spread
 python3 tools/bench/run.py batch 20000000     # ENGINES=pondra,spark,flink
 python3 tools/serve_bench.py --keys 2000000   # serving: point lookups and dashboard queries
@@ -136,6 +180,7 @@ python3 tools/sim_r2.py --port 9000 &   # moto + R2-like latency (PUT p50 197 ms
 export AWS_ENDPOINT=http://127.0.0.1:9000 AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test \
        AWS_REGION=auto AWS_ALLOW_HTTP=true PONDRA_BUCKET=testbucket
 python3 tools/harness.py crash --runs 3 --batches 150 --s3
+python3 tools/cluster.py failover --s3 --flag ack=replicated   # recovery of acked-but-not-durable commits
 ```
 
 **A tiering failure is silent in the correctness tests** — reads stay correct, the log just stops
@@ -147,7 +192,9 @@ checks the log drains and the file count stays bounded; watch the live benchmark
 1 run in 8 when something is wrong — run it 15–20 times before believing a fix. `users` caught the
 round-6 mirror bug in 4 of 5 runs; run it at least 5 times after touching `store.rs`.
 `crash --size 50000` is the one that catches "the leader can see its own in-flight writes" bugs.
-`delta_check.py --rounds 1250` is the one that catches slow tiering rounds (and Delta log cleanup).
+`open_check.py --rounds 1250` is the one that catches slow tiering rounds (and Delta log and
+Iceberg snapshot cleanup). Any change to replication or recovery: `users` and `failover` with
+`--flag ack=replicated`, locally and with `--s3` on simulated R2, several runs each.
 
 Practical notes for an agent working here:
 
@@ -158,46 +205,57 @@ Practical notes for an agent working here:
 - Node stderr goes to `/tmp/pondra-<port>-<id>.stderr`; that's where "restarting to rejoin",
   "slow tiering" and panics show up.
 
-## State of the work (2026-09-21, round 7)
+## State of the work (2026-09-21, round 8)
 
 Everything in `docs/prototype-status.md` passes on local disk, on simulated R2 and on a real
-Cloudflare R2 bucket.
+Cloudflare R2 bucket. Two R2 buckets are used for tests: `ponderabucket-us` (Eastern North
+America, ~290 ms per PUT from the sandbox; the default now) and `pondbucket` (~670 ms). Test
+lakes live under `round8/`. Keep them; the owner wants test files kept.
 
 Headline numbers, all on one 2-vCPU box:
 
-- **Durable ingest:** 4.3–4.6 M events/s through a 3-node cluster.
+- **Writes on R2:** acked in 4 ms with `--ack replicated` (299 ms durable). 64 writers: 87k
+  events/s replicated vs 6.4k durable. Durable ingest locally: 4.3–5.1 M events/s through a
+  3-node cluster.
+- **Freshness, like for like:** nodes see a write 10–15 ms after the ack (local and R2). Delta
+  and Iceberg readers see it ~30 ms (local) / 3–4 s (near R2) / 7–10 s (far R2) after the ack.
+  A cold `pondra sql` process takes 34 ms (local) / 3–6 s (R2).
 - **TPC-H SF1:** all 22 queries in 5.9 s (Spark 4.2: 58–65 s).
-- **Write → aggregated row on another node:** 5 ms on local disk; one PUT on object storage.
-- **An open lake:** every table is also a Delta Lake table, readable 17 ms after the ack on
-  local disk and ~5 s on R2 from here.
-- **Serving:** 0.14 ms key lookups and 20–36k lookups/s; repeated dashboards from a
-  version-exact result cache at ~20k/s.
-- **Consistency:** 0 torn reads and 0 lost batches with 64 concurrent writers, and clean
-  failover runs.
+- **Serving:** 0.14 ms key lookups and 20–36k lookups/s; repeated dashboards at ~20k/s.
+- **Consistency:** 0 torn reads, 0 lost batches, clean failovers, in both ack modes.
 
 The honest comparison with Spark, Flink, Fluss and Lakehouse//RT, with the plan for the gaps,
 is `docs/comparison-spark-flink-fluss.md`.
 
 Known limits, in the order they matter:
 
-1. **Durable acks cost one object-store write** (0.3–0.7 s on R2 from this sandbox). Fluss and
-   Databricks RTM get milliseconds by replicating to disks/memory first. S3 Express One Zone
-   would close most of the gap and is untested here.
-2. **One sequencer per lake** orders commits (metadata only). Several lakes past that.
+1. **Replicated acks' window.** A write acked before the bucket has it survives while any one
+   holder does. It does not survive the leader and every holder dying together, and there is no
+   fsync. Recovery waits up to 20 s for unreachable members.
+2. **One sequencer per lake** orders commits (metadata only). Several lakes past that; there are
+   no cross-lake queries yet.
 3. **No shuffles** in distributed queries: big-to-big joins run on one node.
-4. **Keyed-table compaction is one job on one node**; partitioned compaction is next. Other
-   engines see keyed tables as of their last compaction.
-5. **No auth, quotas or multi-tenancy.** Delta only (no Iceberg metadata), unpartitioned.
+4. **Keyed-table compaction rewrites the whole table**, as one job. No partitions and no
+   clustering across files yet.
+5. **Cold `pondra sql` on far object storage** costs 2–3 s to open the catalog (SlateDB: ~20
+   sequential requests).
+6. **No auth, quotas or multi-tenancy.** Bucket credentials are the only access control.
 
-Good next moves, in order:
+Good next moves, in order (the owner agreed on 1 and 2 for round 9):
 
-1. Shuffles reusing the job-dealing mechanism, plus a multi-machine TPC-H run against Spark.
-2. Event-time windows and watermarks.
-3. Arrow Flight SQL or the Postgres wire protocol.
-4. Kafka-protocol ingest and CDC.
-5. Iceberg metadata beside the Delta log.
-6. Partitioned tables.
-7. Auth.
+1. **A bucket inbox:** writers that can't reach the leader (another network, another company)
+   drop commit requests into the bucket; the leader picks them up within a second or two. Full,
+   equal write capability from anywhere, exactly-once.
+2. **Split leadership by table or namespace:** several leaders in one shared catalog, each
+   ordering its own tables (like Kafka partition leaders). Millisecond writes for several
+   clusters on one lake, and no more single-sequencer limit.
+3. Shuffles reusing the job-dealing mechanism, plus a multi-machine TPC-H run against Spark.
+4. Replicated acks, hardened: fsync option, 3 replicas on real machines, faster R2 failover.
+5. Event-time windows and watermarks.
+6. Arrow Flight SQL or the Postgres wire protocol.
+7. Partitioned tables, clustering across files, compaction without full rewrites.
+8. Kafka-protocol ingest and CDC.
+9. Auth, and read-only "attach another lake".
 
 The plan table at the end of the comparison doc has the evidence each should produce.
 

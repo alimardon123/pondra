@@ -268,7 +268,8 @@ def latency():
     stop.set()
     lat = [got[u] - t for u, t in sent.items() if u in got]
     print(f"latency: 3 nodes, {A.load} background producers; {len(sent)} probe events, {len(lat)} pushed back")
-    print(f"  ack (durable)                       p50 {pct(ack, .5)} ms  p99 {pct(ack, .99)} ms")
+    mode = "replicated" if "ack=replicated" in A.flag else "durable"
+    print(f"  ack ({mode}){' ' * (26 - len(mode))}p50 {pct(ack, .5)} ms  p99 {pct(ack, .99)} ms")
     print(f"  view row pushed to another node     p50 {pct(lat, .5)} ms  p99 {pct(lat, .99)} ms")
     [nd.kill() for nd in nodes]
     return len(lat) == len(sent)

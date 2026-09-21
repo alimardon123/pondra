@@ -8,7 +8,8 @@ use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
 use datafusion::prelude::{SessionConfig, SessionContext};
-use object_store::aws::AmazonS3Builder;
+use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey};
+use object_store::ClientConfigKey;
 use object_store::{local::LocalFileSystem, path::Path, prefix::PrefixStore, ObjectStore, ObjectStoreExt, PutMode, PutOptions};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use slatedb::config::{CompactorOptions, DbReaderOptions, DurabilityLevel, FlushOptions, FlushType, ObjectStoreCacheOptions, ReadOptions, ScanOptions, Settings};
@@ -33,6 +34,10 @@ pub struct TableMeta {
     pub tiered: u64, // every segment <= `tiered` is already inside `files`
     #[serde(default)]
     pub garbage: Vec<(String, u64)>, // replaced files + when; deleted after the retention period
+    #[serde(default)]
+    pub publish: Vec<String>, // open formats other engines also read it in: "delta", "iceberg"
+    #[serde(default)]
+    pub cluster: Vec<String>, // append tables: each file's rows sorted by these (see `tier::clustered`)
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -67,7 +72,13 @@ pub fn producer_key(p: &str) -> String { format!("p/{p}") }
 pub fn data_key(seg: u64) -> String { format!("d/{seg:020}") } // small segments live inside the catalog
 pub fn json<T: Serialize>(v: &T) -> Vec<u8> { serde_json::to_vec(v).expect("serializable") }
 
+/// The open formats a new table is published in unless it says otherwise (the node's `--publish`).
+pub fn default_publish() -> Vec<String> {
+    std::env::var("PONDRA_PUBLISH").unwrap_or_default().split(',').filter(|f| !f.is_empty()).map(String::from).collect()
+}
+
 const TAIL_BYTES: usize = 256 << 20; // decoded log segments kept in memory, per node
+const AHEAD: u64 = 256; // replicated acks: commits acknowledged before the bucket has them, at most
 
 const RECENT: Duration = Duration::from_secs(30); // replayed to (re)connecting followers…
 const RECENT_BYTES: usize = 64 << 20; // …within this much memory (past it, a reconnecting
@@ -109,7 +120,10 @@ pub fn open_store(url: &str) -> Result<(String, Store, Option<(String, Store)>)>
     };
     // Credentials and endpoint come from AWS_* env vars (AWS_ENDPOINT for R2 / MinIO).
     let (bucket, prefix) = rest.trim_end_matches('/').split_once('/').unwrap_or((rest, ""));
-    let s3: Store = Arc::new(AmazonS3Builder::from_env().with_bucket_name(bucket).with_allow_http(true).build()?);
+    // Idle connections are dropped after 15 s rather than reused: through proxies and NATs that
+    // silently forget idle connections, a reused one hung a PUT for the full 30 s timeout on R2.
+    let idle = (AmazonS3ConfigKey::Client(ClientConfigKey::PoolIdleTimeout), "15s");
+    let s3: Store = Arc::new(AmazonS3Builder::from_env().with_bucket_name(bucket).with_allow_http(true).with_config(idle.0, idle.1).build()?);
     let store: Store = if prefix.is_empty() { s3.clone() } else { Arc::new(PrefixStore::new(s3.clone(), prefix)) };
     Ok((url.trim_end_matches('/').to_string(), store, Some((format!("s3://{bucket}"), s3))))
 }
@@ -132,13 +146,81 @@ impl Lake {
         let cache = ObjectStoreCacheOptions { root_folder: cache, max_cache_size_bytes: Some(2 << 30), cache_on_flush: true, cache_on_compaction: true, ..Default::default() };
         let cat = if writer { Catalog::writer(store.clone(), cache).await? } else { Catalog::reader(store.clone(), streamed, cache).await? };
         let hwm = watch::Sender::new(cat.get::<u64>("n").await?.unwrap_or(1) - 1);
-        Ok(Arc::new(Lake { url, store, cat, hwm, backlog: Default::default(), rt, tail: Mutex::new((lru::LruCache::unbounded(), 0)), disk, groups: crate::serve::Groups::new(cache_mb() << 19) }))
+        let lake = Arc::new(Lake { url, store, cat, hwm, backlog: Default::default(), rt, tail: Mutex::new((lru::LruCache::unbounded(), 0)), disk, groups: crate::serve::Groups::new(cache_mb() << 19) });
+        if let Some(writes) = lake.cat.unstarted.lock().unwrap().take() {
+            tokio::spawn(lake.clone().commits(writes));
+        }
+        Ok(lake)
     }
 
-    /// Follower: lay a commit streamed from the leader over our view of the catalog.
-    pub fn apply(&self, d: &Delta) {
-        self.prefetch(d);
-        self.cat.apply(d);
+    /// Leader: commits, in write order. A write is committed — acknowledged, visible here, and
+    /// streamed as committed — once it is in the bucket, or (`--ack replicated`) once
+    /// `replicas - 1` member followers hold it, whichever comes first. It reaches the bucket a
+    /// moment later either way. A write that fails to reach the bucket (a newer leader fenced
+    /// us out) has an unknown outcome: restart and rejoin; the restart reloads the state.
+    async fn commits(self: Arc<Self>, mut writes: mpsc::UnboundedReceiver<Write>) {
+        let (to_bucket, mut in_bucket) = mpsc::unbounded_channel::<(Arc<WriteHandle>, u64)>();
+        let lake = self.clone();
+        tokio::spawn(async move {
+            while let Some((handle, id)) = in_bucket.recv().await {
+                if let Err(e) = handle.await_durable().await {
+                    eprintln!("catalog commit failed: {e}");
+                    crate::cluster::restart();
+                }
+                lake.cat.durable.send_replace(id);
+                lake.cat.send(Frame::Durable(id));
+            }
+        });
+        let cat = &self.cat;
+        let need = cat.replicas.saturating_sub(1);
+        while let Some((handle, d, done)) = writes.recv().await {
+            if need > 0 {
+                cat.send(Frame::Change(d.clone())); // followers keep it and say so
+            }
+            let mut acked = cat.acked.subscribe();
+            // (At most AHEAD commits are acknowledged ahead of the bucket: if it stalls, acks wait
+            // for it, so what a failover has to recover — and could lose — stays bounded.)
+            let close = *cat.durable.borrow() + AHEAD >= d.id;
+            loop {
+                if need > 0 && close && cat.holders(d.id) >= need {
+                    break;
+                }
+                tokio::select! {
+                    r = handle.await_durable() => {
+                        if let Err(e) = r {
+                            eprintln!("catalog commit failed: {e}");
+                            crate::cluster::restart();
+                        }
+                        break;
+                    }
+                    _ = acked.changed() => {}
+                }
+            }
+            if need == 0 {
+                cat.send(Frame::Change(d.clone()));
+            }
+            cat.apply(&d); // our in-memory catalog
+            cat.committed.store(d.id, Relaxed);
+            cat.send(Frame::Committed(d.id));
+            let _ = to_bucket.send((handle, d.id));
+            let _ = done.send(());
+        }
+    }
+
+    /// Follower: a change streamed from the leader; it takes effect once committed.
+    pub fn hold(&self, d: Arc<Delta>) {
+        self.prefetch(&d);
+        self.cat.pending.lock().unwrap().insert(d.id, d);
+    }
+
+    /// Follower: lay the committed changes (up to `upto`) over our view of the catalog.
+    pub fn commit_upto(&self, upto: u64) {
+        let ready: Vec<Arc<Delta>> = {
+            let mut p = self.cat.pending.lock().unwrap();
+            let later = p.split_off(&(upto + 1));
+            std::mem::replace(&mut *p, later).into_values().collect()
+        };
+        ready.iter().for_each(|d| self.cat.apply(d));
         self.advance(self.cat.visible_n() - 1);
     }
 
@@ -228,7 +310,7 @@ impl Lake {
         let opts = PutOptions { mode: PutMode::Create, ..Default::default() };
         let bytes = Bytes::from(bytes);
         self.store.put_opts(&Path::from(path), bytes.clone().into(), opts).await?;
-        if let (Some(disk), false) = (&self.disk, path.contains("/_delta_log/")) {
+        if let (Some(disk), false) = (&self.disk, crate::delta::open_format(path)) {
             disk.put(path, &bytes); // what a node writes, it keeps
         }
         Ok(())
@@ -287,10 +369,16 @@ pub struct Catalog {
     db: Db_,
     order: tokio::sync::Mutex<u64>, // leader: next commit id; held while writing, so ids follow write order
     flushed: AtomicU64,             // leader: `order` at the last memtable flush
-    durable_id: Arc<AtomicU64>,     // leader: the last commit that is durable (what reads see)
-    durable: Option<mpsc::UnboundedSender<(WriteHandle, Arc<Delta>, oneshot::Sender<()>)>>, // leader: writes awaiting durability, in order
-    feed: broadcast::Sender<Arc<Delta>>,                  // leader: commits, as they become durable
-    recent: Recent, // leader: the last RECENT of them (and their bytes), for (re)connecting followers
+    writes: Option<mpsc::UnboundedSender<Write>>, // leader: writes waiting to commit, in order
+    unstarted: Mutex<Option<mpsc::UnboundedReceiver<Write>>>, // (until `Lake::open` starts `commits`)
+    committed: AtomicU64,           // leader: the last committed write (what reads see)
+    durable: watch::Sender<u64>,    // leader: the last write that is in the bucket
+    pub replicas: usize,            // leader: copies that commit a write (1: the bucket's alone)
+    acks: Mutex<(BTreeMap<String, (u64, u64)>, Vec<String>)>, // leader: follower -> the run of changes it holds; the members whose copies count
+    acked: watch::Sender<()>,       // leader: an ack arrived
+    pending: Mutex<BTreeMap<u64, Arc<Delta>>>, // follower: changes streamed but not yet committed
+    feed: broadcast::Sender<Frame>, // leader: the commit stream
+    recent: Recent, // leader: its last RECENT (and their bytes), for (re)connecting followers
     last_n: AtomicU64, // the lake's "n" (next segment) after the latest commit written / streamed to us
     // Every commit also writes "c", its number. Follower: the leader's streamed changes (None =
     // deleted), each with its commit number, are laid over our own view of the catalog, which is
@@ -321,7 +409,8 @@ impl Drop for Pin<'_> {
     }
 }
 
-type Recent = Arc<Mutex<(VecDeque<(Instant, Arc<Delta>)>, usize)>>;
+type Recent = Arc<Mutex<(VecDeque<(Instant, Frame)>, usize)>>;
+type Write = (Arc<WriteHandle>, Arc<Delta>, oneshot::Sender<()>);
 
 enum Db_ {
     Writer(Db),
@@ -337,24 +426,52 @@ pub struct Delta {
 
 impl Delta {
     fn bytes(&self) -> usize { self.puts.iter().map(|(k, v)| k.len() + v.len()).sum() }
+}
 
-    /// Wire format: u32 length | u64 id | puts: u32 count, (key, value)* | deletes: u32 count, key*;
-    /// every key and value is a u32 length followed by its bytes.
-    pub fn frame(&self) -> Bytes {
+/// What the leader streams to the other nodes (`GET /cluster/log`), in order.
+#[derive(Clone)]
+pub enum Frame {
+    /// First on every connection: the leader's term, and whether commits are replicated
+    /// (followers then keep each change on disk and acknowledge it; see `replica.rs`).
+    Start { term: u64, replicated: bool },
+    /// A write, in order. It takes effect with the `Committed` notice that covers it.
+    Change(Arc<Delta>),
+    /// Every change up to here is committed: apply it.
+    Committed(u64),
+    /// … and is in the bucket: a follower no longer needs its copy.
+    Durable(u64),
+}
+
+impl Frame {
+    /// Wire format: u32 length | u8 kind | body. A change's body: u64 id | puts: u32 count,
+    /// (key, value)* | deletes: u32 count, key*; every key and value is a u32 length and bytes.
+    pub fn encode(&self) -> Bytes {
         let mut b = vec![0u8; 4];
         let field = |b: &mut Vec<u8>, x: &[u8]| {
             b.extend((x.len() as u32).to_le_bytes());
             b.extend(x);
         };
-        b.extend(self.id.to_le_bytes());
-        b.extend((self.puts.len() as u32).to_le_bytes());
-        for (k, v) in &self.puts {
-            field(&mut b, k.as_bytes());
-            field(&mut b, v);
-        }
-        b.extend((self.deletes.len() as u32).to_le_bytes());
-        for k in &self.deletes {
-            field(&mut b, k.as_bytes());
+        match self {
+            Frame::Start { term, replicated } => {
+                b.push(0);
+                b.extend(term.to_le_bytes());
+                b.push(*replicated as u8);
+            }
+            Frame::Change(d) => {
+                b.push(1);
+                b.extend(d.id.to_le_bytes());
+                b.extend((d.puts.len() as u32).to_le_bytes());
+                for (k, v) in &d.puts {
+                    field(&mut b, k.as_bytes());
+                    field(&mut b, v);
+                }
+                b.extend((d.deletes.len() as u32).to_le_bytes());
+                for k in &d.deletes {
+                    field(&mut b, k.as_bytes());
+                }
+            }
+            Frame::Committed(id) => (b.push(2), b.extend(id.to_le_bytes())).1,
+            Frame::Durable(id) => (b.push(3), b.extend(id.to_le_bytes())).1,
         }
         let n = (b.len() - 4) as u32;
         b[..4].copy_from_slice(&n.to_le_bytes());
@@ -362,16 +479,25 @@ impl Delta {
     }
 
     /// Take one whole frame off the front of `buf`, if it has one.
-    pub fn take(buf: &mut bytes::BytesMut) -> Result<Option<Delta>> {
+    pub fn take(buf: &mut bytes::BytesMut) -> Result<Option<Frame>> {
         if buf.len() < 4 || buf.len() < 4 + u32::from_le_bytes(buf[..4].try_into()?) as usize {
             return Ok(None);
         }
         let n = u32::from_le_bytes(buf[..4].try_into()?) as usize;
         let mut f = buf.split_to(4 + n).freeze().slice(4..);
-        let id = u64::from_le_bytes(next(&mut f, 8)?[..].try_into()?);
-        let puts = (0..count(&mut f)?).map(|_| Ok((String::from_utf8(field(&mut f)?.to_vec())?, field(&mut f)?))).collect::<Result<_>>()?;
-        let deletes = (0..count(&mut f)?).map(|_| Ok(String::from_utf8(field(&mut f)?.to_vec())?)).collect::<Result<_>>()?;
-        Ok(Some(Delta { id, puts, deletes }))
+        let u64_ = |f: &mut Bytes| -> Result<u64> { Ok(u64::from_le_bytes(next(f, 8)?[..].try_into()?)) };
+        Ok(Some(match next(&mut f, 1)?[0] {
+            0 => Frame::Start { term: u64_(&mut f)?, replicated: next(&mut f, 1)?[0] == 1 },
+            1 => {
+                let id = u64_(&mut f)?;
+                let puts = (0..count(&mut f)?).map(|_| Ok((String::from_utf8(field(&mut f)?.to_vec())?, field(&mut f)?))).collect::<Result<_>>()?;
+                let deletes = (0..count(&mut f)?).map(|_| Ok(String::from_utf8(field(&mut f)?.to_vec())?)).collect::<Result<_>>()?;
+                Frame::Change(Arc::new(Delta { id, puts, deletes }))
+            }
+            2 => Frame::Committed(u64_(&mut f)?),
+            3 => Frame::Durable(u64_(&mut f)?),
+            k => bail!("unknown frame kind {k}"),
+        }))
     }
 }
 
@@ -401,13 +527,22 @@ impl Catalog {
         let compactor_options = Some(CompactorOptions { poll_interval: Duration::from_secs(5), ..Default::default() });
         let settings = Settings { flush_interval: Some(Duration::from_millis(1)), manifest_poll_interval: Duration::from_secs(10), l0_sst_size_bytes: 16 << 20, l0_max_ssts: 64, l0_max_ssts_per_key: 32, max_unflushed_bytes: 64 << 20, compactor_options, object_store_cache_options, ..Default::default() };
         let mut cat = Self::new(Db_::Writer(Db::builder("catalog", store).with_settings(settings).build().await?));
+        cat.replicas = std::env::var("PONDRA_REPLICAS").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
         cat.last_n.store(cat.get::<u64>("n").await?.unwrap_or(1), Relaxed);
-        *cat.order.get_mut() = cat.get::<u64>("c").await?.unwrap_or(0) + 1;
+        let c = cat.get::<u64>("c").await?.unwrap_or(0);
+        *cat.order.get_mut() = c + 1;
         let (tx, rx) = mpsc::unbounded_channel();
-        cat.durable_id.store(*cat.order.get_mut() - 1, Relaxed);
-        tokio::spawn(publish(rx, cat.feed.clone(), cat.recent.clone(), cat.durable_id.clone()));
-        cat.durable = Some(tx);
+        (cat.writes, *cat.unstarted.get_mut().unwrap()) = (Some(tx), Some(rx));
+        cat.committed.store(c, Relaxed);
+        cat.durable.send_replace(c);
         cat.checkpoint().await?; // what we inherited (replayed from the WAL) into every node's view
+        // The leader too reads the catalog from memory: everything committed, nothing in flight.
+        let Db_::Writer(db) = &cat.db else { unreachable!() };
+        let mut all = collect(db.scan(b"".to_vec()..b"d/".to_vec()).await.map_err(fatal)?).await?;
+        all.extend(collect(db.scan(b"d0".to_vec()..vec![0xff]).await.map_err(fatal)?).await?);
+        cat.overlay.get_mut().unwrap().extend(all.into_iter().map(|(k, v)| (k, (c, Some(v)))));
+        cat.streamed.store(c, Relaxed);
+        cat.mirror.store(true, Relaxed);
         Ok(cat)
     }
 
@@ -421,16 +556,55 @@ impl Catalog {
     }
 
     fn new(db: Db_) -> Self {
-        let (feed, order) = (broadcast::channel(1024).0, tokio::sync::Mutex::new(1));
-        let (last_n, view, pruned, pins, streamed, hold, mirror, flushed, durable_id) = Default::default();
-        Catalog { db, order, flushed, durable_id, durable: None, feed, recent: Default::default(), last_n, overlay: Default::default(), view, pruned, pins, streamed, hold, follows: false, mirror }
+        let (feed, order) = (broadcast::channel(4096).0, tokio::sync::Mutex::new(1));
+        let (last_n, view, pruned, pins, streamed, hold, mirror, flushed, committed) = Default::default();
+        let (durable, acked, acks, pending, unstarted) = (watch::Sender::new(0), watch::Sender::new(()), Default::default(), Default::default(), Default::default());
+        Catalog { db, order, flushed, writes: None, unstarted, committed, durable, replicas: 1, acks, acked, pending, feed, recent: Default::default(), last_n, overlay: Default::default(), view, pruned, pins, streamed, hold, follows: false, mirror }
     }
 
-    /// Leader: the recent commits plus a receiver for every commit from now on.
-    pub fn subscribe(&self) -> (Vec<Arc<Delta>>, broadcast::Receiver<Arc<Delta>>) {
+    /// Leader: the recent frames plus a receiver for every frame from now on.
+    pub fn subscribe(&self) -> (Vec<Frame>, broadcast::Receiver<Frame>) {
         let rx = self.feed.subscribe();
-        (self.recent.lock().unwrap().0.iter().map(|(_, d)| d.clone()).collect(), rx)
+        (self.recent.lock().unwrap().0.iter().map(|(_, f)| f.clone()).collect(), rx)
     }
+
+    /// Leader: stream a frame (and keep it for followers that connect later).
+    fn send(&self, f: Frame) {
+        let mut r = self.recent.lock().unwrap();
+        r.1 += if let Frame::Change(d) = &f { d.bytes() } else { 0 };
+        r.0.push_back((Instant::now(), f.clone()));
+        while r.0.len() > 1 && r.0.front().is_some_and(|(t, _)| t.elapsed() > RECENT || r.1 > RECENT_BYTES) {
+            if let Some((_, Frame::Change(old))) = r.0.pop_front() {
+                r.1 -= old.bytes();
+            }
+        }
+        drop(r);
+        let _ = self.feed.send(f); // no followers listening is fine
+    }
+
+    /// Leader: a follower holds every change from `first` to `upto` (replicated mode).
+    pub fn ack(&self, from: &str, first: u64, upto: u64) {
+        self.acks.lock().unwrap().0.insert(from.to_string(), (first, upto));
+        self.acked.send_replace(());
+    }
+
+    /// Leader: the followers whose copies count towards committing (listed in the catalog as
+    /// "m", so a new leader knows whom to ask for them; see `replica::recover`).
+    pub fn set_members(&self, members: Vec<String>) { self.acks.lock().unwrap().1 = members; }
+
+    /// Leader: how many members hold change `id`.
+    fn holders(&self, id: u64) -> usize {
+        let a = self.acks.lock().unwrap();
+        a.1.iter().filter(|m| a.0.get(*m).is_some_and(|&(first, upto)| (first..=upto).contains(&id))).count()
+    }
+
+    /// Leader: wait until write `id` is in the bucket.
+    pub async fn wait_durable(&self, id: u64) {
+        let _ = self.durable.subscribe().wait_for(|&d| d >= id).await;
+    }
+
+    /// Leader: the last committed write.
+    pub fn committed(&self) -> u64 { self.committed.load(Relaxed) }
 
     fn apply(&self, d: &Delta) {
         let mut o = self.overlay.lock().unwrap();
@@ -451,8 +625,14 @@ impl Catalog {
         if let Some((_, v)) = d.puts.iter().find(|(k, _)| k == "n") {
             self.last_n.fetch_max(serde_json::from_slice(v).unwrap_or(1), Relaxed);
         }
-        o.extend(d.puts.iter().map(|(k, v)| (k.clone(), (d.id, Some(v.clone())))));
-        o.extend(d.deletes.iter().map(|k| (k.clone(), (d.id, None))));
+        // (The leader reads inline data from its own store; everyone else keeps it until their
+        // view has it. With the whole catalog here, a deleted key is simply gone.)
+        let writer = self.is_writer();
+        o.extend(d.puts.iter().filter(|(k, _)| !(writer && k.starts_with("d/"))).map(|(k, v)| (k.clone(), (d.id, Some(v.clone())))));
+        match self.mirror.load(Relaxed) {
+            true => d.deletes.iter().for_each(|k| drop(o.remove(k))),
+            false => o.extend(d.deletes.iter().map(|k| (k.clone(), (d.id, None)))),
+        }
         self.streamed.fetch_max(d.id, Relaxed);
     }
 
@@ -525,6 +705,7 @@ impl Catalog {
         for (k, v) in all {
             o.entry(k).or_insert((c, Some(v)));
         }
+        o.retain(|_, (_, v)| v.is_some()); // (deleted keys: absent from the whole catalog)
         self.pruned.fetch_max(c, Relaxed); // older streamed commits are in the snapshot
         self.streamed.fetch_max(c, Relaxed);
         self.last_n.fetch_max(n, Relaxed);
@@ -564,7 +745,7 @@ impl Catalog {
     /// the stream. A read that starts after this sees at least this version (never older).
     pub fn version(&self) -> Option<u64> {
         match &self.db {
-            Db_::Writer(_) => Some(self.durable_id.load(Relaxed)),
+            Db_::Writer(_) => Some(self.committed.load(Relaxed)),
             Db_::Reader(_) => self.mirror.load(Relaxed).then(|| self.streamed.load(Relaxed)),
         }
     }
@@ -575,12 +756,12 @@ impl Catalog {
 
     pub async fn get_raw(&self, key: &str) -> Result<Option<Bytes>> {
         Ok(match &self.db {
-            // Queries only ever see durable (acknowledged) data, never in-flight writes.
-            Db_::Writer(db) => match db.get_with_options(key, &ReadOptions::new().with_durability_filter(DurabilityLevel::Remote)).await.map_err(fatal)? {
-                // Inline segment data is only asked for once its segment is visible, so it is
-                // durable too; while a checkpoint moves it the durable-only read can miss it.
-                None if key.starts_with("d/") => db.get(key).await.map_err(fatal)?,
-                v => v,
+            // The leader answers from its in-memory catalog: committed writes only, never ones
+            // in flight. Inline segment data is only asked for once its segment is committed.
+            Db_::Writer(db) if key.starts_with("d/") => db.get(key).await.map_err(fatal)?,
+            Db_::Writer(db) => match self.mirror.load(Relaxed) {
+                true => self.overlay.lock().unwrap().get(key).and_then(|(_, v)| v.clone()),
+                false => db.get_with_options(key, &ReadOptions::new().with_durability_filter(DurabilityLevel::Remote)).await.map_err(fatal)?,
             },
             Db_::Reader(r) => {
                 let inline = key.starts_with("d/");
@@ -613,8 +794,9 @@ impl Catalog {
         let range = from.as_bytes().to_vec()..to.as_bytes().to_vec();
         let decode = |all: BTreeMap<String, Bytes>| all.into_iter().map(|(k, v)| Ok((k, serde_json::from_slice(&v)?))).collect();
         let r = match &self.db {
-            Db_::Writer(db) => return decode(collect(db.scan_with_options(range, &ScanOptions::new().with_durability_filter(DurabilityLevel::Remote)).await.map_err(fatal)?).await?),
-            Db_::Reader(r) => r,
+            Db_::Writer(db) if !self.mirror.load(Relaxed) => return decode(collect(db.scan_with_options(range, &ScanOptions::new().with_durability_filter(DurabilityLevel::Remote)).await.map_err(fatal)?).await?),
+            Db_::Writer(_) => None,
+            Db_::Reader(r) => Some(r),
         };
         {
             let o = self.overlay.lock().unwrap();
@@ -624,7 +806,7 @@ impl Catalog {
                 return decode(hits.collect());
             }
         }
-        let _pin = self.pin();
+        let (r, _pin) = (r.expect("a reader: the leader reads its in-memory catalog above"), self.pin());
         loop {
             // Our view is somewhere between `before` and `after` while we read it.
             let before = self.view_now().await?;
@@ -665,16 +847,16 @@ impl Catalog {
         Ok(())
     }
 
-    /// Write puts and deletes atomically and wait until durable (and streamed to the followers).
+    /// Write puts and deletes atomically and wait until committed (see `Lake::commits`).
     pub async fn commit(&self, puts: Vec<(String, Vec<u8>)>, deletes: &[String]) -> Result<()> {
         Ok(self.write(puts, deletes).await?.await?)
     }
 
-    /// Write puts and deletes atomically. The returned receiver fires once the write is durable;
-    /// writes become durable in the order they were made, so a caller can make the next write
-    /// without waiting (pipelined commits: one object-store round trip no longer blocks the next).
+    /// Write puts and deletes atomically. The returned receiver fires once the write is committed;
+    /// writes commit in the order they were made, so a caller can make the next write without
+    /// waiting (pipelined commits: one round trip no longer blocks the next).
     pub async fn write(&self, puts: Vec<(String, Vec<u8>)>, deletes: &[String]) -> Result<oneshot::Receiver<()>> {
-        let (Db_::Writer(db), Some(durable)) = (&self.db, &self.durable) else { bail!("read-only node") };
+        let (Db_::Writer(db), Some(writes)) = (&self.db, &self.writes) else { bail!("read-only node") };
         let puts: Vec<(String, Bytes)> = puts.into_iter().map(|(k, v)| (k, v.into())).collect();
         let mut batch = WriteBatch::new();
         for (k, v) in &puts {
@@ -692,34 +874,12 @@ impl Catalog {
         }
         let (done, rx) = oneshot::channel();
         let puts = puts.into_iter().chain([c]).collect();
-        let _ = durable.send((handle, Arc::new(Delta { id: *id, puts, deletes: deletes.to_vec() }), done));
+        let _ = writes.send((Arc::new(handle), Arc::new(Delta { id: *id, puts, deletes: deletes.to_vec() }), done));
         *id += 1;
         Ok(rx)
     }
 }
 
-/// Leader: as each write becomes durable (in order), stream it to the followers and release its
-/// writer. If one fails (e.g. a new leader fenced us out) its outcome is unknown: restart and
-/// rejoin; the restart reloads the state.
-async fn publish(mut rx: mpsc::UnboundedReceiver<(WriteHandle, Arc<Delta>, oneshot::Sender<()>)>, feed: broadcast::Sender<Arc<Delta>>, recent: Recent, durable_id: Arc<AtomicU64>) {
-    while let Some((handle, d, done)) = rx.recv().await {
-        if let Err(e) = handle.await_durable().await {
-            eprintln!("catalog commit failed: {e}");
-            crate::cluster::restart();
-        }
-        durable_id.store(d.id, Relaxed);
-        let mut r = recent.lock().unwrap();
-        r.1 += d.bytes();
-        r.0.push_back((Instant::now(), d.clone()));
-        while r.0.front().is_some_and(|(t, old)| t.elapsed() > RECENT || (r.1 > RECENT_BYTES && !Arc::ptr_eq(old, &d))) {
-            let (_, old) = r.0.pop_front().expect("non-empty");
-            r.1 -= old.bytes();
-        }
-        drop(r);
-        let _ = feed.send(d); // no followers listening is fine
-        let _ = done.send(());
-    }
-}
 
 /// A writer that was fenced out (a new leader took over) must stop at once: it restarts and
 /// rejoins the cluster as a follower.

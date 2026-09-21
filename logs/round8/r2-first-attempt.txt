@@ -1,0 +1,53 @@
+######## bucket ponderabucket-us
+== latency durable
+latency: 3 nodes, 0 background producers; 47 probe events, 47 pushed back
+  ack (durable)                       p50 299 ms  p99 732 ms
+  view row pushed to another node     p50 299 ms  p99 732 ms
+== latency replicated
+latency: 3 nodes, 0 background producers; 255 probe events, 255 pushed back
+  ack (durable)                       p50 4 ms  p99 5 ms
+  view row pushed to another node     p50 4 ms  p99 5 ms
+== freshness durable
+iceberg: never visible: When reading information for key 'round8/test-b90f96bf/data/events/metadata/v8.metadata.json' in bucket 'ponderabucket-us': AWS Error ACCESS_DENIED during HeadObject operation: No response body.
+iceberg: never visible: When reading information for key 'round8/test-b90f96bf/data/events/metadata/v10.metadata.json' in bucket 'ponderabucket-us': AWS Error ACCESS_DENIED during HeadObject operation: No response body.
+{
+ "lake": "object storage",
+ "flags": {
+  "tier_secs": 2.0,
+  "publish": "delta,iceberg"
+ },
+ "probes": 8,
+ "write ack": {
+  "p50": 276,
+  "max": 312
+ },
+ "visible to another node after the ack": {
+  "p50": 15,
+  "max": 25
+ },
+ "visible to read-only node after the ack": {
+  "p50": 10,
+  "max": 27
+ },
+ "visible to pondra sql (new process) after the ack": {
+  "p50": 3089,
+  "max": 3339
+ },
+ "visible to Delta (delta-rs) after the ack": {
+  "p50": 13920,
+  "max": 26885
+ },
+ "visible to Iceberg (PyIceberg) after the ack": [
+  null,
+  null,
+  null,
+  null,
+  null,
+  null,
+  null,
+  null
+ ]
+}
+== freshness replicated
+iceberg: never visible: When reading information for key 'round8/test-1807ad2f/data/events/metadata/v1.metadata.json' in bucket 'ponderabucket-us': AWS Error ACCESS_DENIED during HeadObject operation: No response body.
+iceberg: never visible: When reading information for key 'round8/test-1807ad2f/data/events/metadata/v2.metadata.json' in bucket 'ponderabucket-us': AWS Error ACCESS_DENIED during HeadObject operation: No response body.
