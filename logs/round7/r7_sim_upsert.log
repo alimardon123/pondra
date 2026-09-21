@@ -1,0 +1,1 @@
+upsert: 395 live keys after 12,000 random upserts/deletes, 6 compactions (s: 1.2, 0.4, 0.5, 0.7, 0.4, 0.5), 1 restart, 3,400 lookups (0 wrong) -> OK

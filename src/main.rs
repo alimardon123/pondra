@@ -2,6 +2,7 @@
 //! Object storage — a local dir or s3://bucket/prefix (S3, R2, MinIO) — is the only state.
 mod cache;
 mod delta;
+mod serve;
 mod cluster;
 mod log;
 mod query;
@@ -108,7 +109,7 @@ async fn main() -> anyhow::Result<()> {
                 };
                 Arc::new(log::Log::start(lake.clone(), Duration::from_millis(flush_ms), to))
             });
-            let app = server::App { lake: lake.clone(), cluster: cluster.clone(), log, seq, lock: Default::default(), retain_ms: retain_secs * 1000 };
+            let app = server::App { lake: lake.clone(), cluster: cluster.clone(), log, seq, lock: Default::default(), retain_ms: retain_secs * 1000, results: Default::default() };
             if leader {
                 // The leader's SSD tier learns of objects other nodes wrote from its own commits.
                 let l = lake.clone();

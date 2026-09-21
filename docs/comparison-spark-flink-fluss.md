@@ -1,142 +1,194 @@
-# Pondra vs Spark, Flink, Fluss and Databricks: batch, streaming, serving, open lake (round 6)
+# Pondra vs Spark, Flink, Fluss and Databricks Lakehouse//RT (round 7)
 
-**Date:** 2026-09-21 · **Machine:** one 2-vCPU, 7 GB sandbox VM, local disk; every engine ran alone, one at a time
-**Versions:** Pondra (this prototype, DataFusion 55) · Spark 4.2.0 (PySpark, `local[*]`) · Flink 2.3.0 (PyFlink, local MiniCluster, parallelism 2) · Fluss 0.9 (not runnable here; see the last section)
-**Reproduce:** `tools/bench/run.py` (same generated data and same SQL for every engine; results agree across engines), `tools/cluster.py latency | split | spread`.
-Spark and Flink numbers are from round 3 (same machine, same scripts); Pondra's batch and streaming numbers were measured on the round-5 binary, and its latency, freshness and open-lake numbers on round 6's.
+**Date:** 2026-09-21 · **Machine:** one 2-vCPU, 7 GB sandbox VM, local disk (plus a real Cloudflare R2 bucket where marked); every engine ran alone
+**Versions:**
+- Pondra (this prototype: Rust, Apache DataFusion 55)
+- Spark 4.2.0 (PySpark, `local[*]`)
+- Flink 2.3.0 (PyFlink, local MiniCluster, parallelism 2)
+- DuckDB 1.5.5 (as a reference)
+- Fluss 0.9 and Lakehouse//RT are compared from their published numbers; neither can run here.
 
-## Footprint
+**Reproduce:**
+- `tools/bench/tpch.py` (TPC-H)
+- `tools/bench/run.py` (batch / streaming / ETL, same data and SQL for every engine)
+- `tools/serve_bench.py` (serving)
+- `tools/cluster.py latency | split | spread`
+- `tools/delta_check.py` (open-lake freshness)
 
-| | Pondra | Spark 4.2 | Flink 2.3 |
+**Where the numbers come from:**
+- Spark's TPC-H and every Pondra number: this round.
+- Spark's and Flink's batch and streaming numbers: round 3, same machine and scripts.
+
+## The short answer
+
+**Per machine: yes, in the main areas, measured.**
+
+- **Batch SQL:** TPC-H SF1 runs **~10x faster than Spark** (5.9 s vs 58–65 s for all 22
+  queries, same answers).
+- **Stateful streaming:** about **3x Flink's** throughput.
+- **Latency:** a change shows up on another node in **5 ms**, where Flink's exactly-once
+  results wait for a checkpoint.
+- **The open lake:** fresh in **17 ms**, where Fluss's lags 3 minutes.
+- **Serving:** **20,000–36,000 lookups/s on two cores**, where Lakehouse//RT publishes 12,000
+  QPS.
+
+All of that comes from one 90 MB binary, with no JVM, ZooKeeper, Kafka or separate tiering job.
+
+**At cluster scale and in breadth: not yet.**
+
+- **Scale:** Spark and Flink are proven on thousands of machines, with shuffles, spilling and
+  skew handling. Pondra's distributed queries are one stage, and it has only been tested as
+  several processes on one machine.
+- **Streaming features:** Flink has event time, watermarks, timers and very large state; Pondra
+  has none of these yet.
+- **APIs and ecosystem:** Spark has DataFrame APIs in four languages and hundreds of connectors.
+  Pondra has SQL over HTTP.
+- **Maturity:** Pondra is a prototype.
+
+**So the realistic claim:** Pondra can beat them for the common case — small to mid-size
+clusters, up to terabytes a day, SQL-shaped work — and do it with far less to run. The gaps are
+engineering work with a known shape (see the plan at the end), not changes to the design. The
+biggest open risk is scale-out, and only a multi-machine benchmark can retire it.
+
+## Scorecard
+
+✓ = leads in that area today, on the evidence below. "—" = not what that product does.
+
+| Area | Pondra | Spark | Flink | Fluss | Lakehouse//RT |
+|---|---|---|---|---|---|
+| Batch SQL per core (TPC-H) | ✓ 10x Spark | | (batch isn't its focus) | — | (not published) |
+| Stateful streaming throughput per core | ✓ ~3x Flink | | | — | — |
+| Change → visible elsewhere, exactly-once | ✓ 5 ms (local disk) | seconds (micro-batches); ms with Databricks RTM | ms per record, but visible at checkpoint | ✓ ms | — |
+| Durable ack on standard object storage | one PUT (0.3–0.7 s) | — | — | ✓ ms (local-disk replication) | — |
+| Open lake freshness | ✓ 17 ms (Delta) | per micro-batch | per checkpoint | 3 min default | reads the lake |
+| Serving: point reads, repeated dashboards | ✓ 0.1–3 ms, 20–36k/s on 2 cores | | | ms lookups | 10 ms, 12k QPS (cluster) |
+| Serving: new analytical queries on big data | 35–600 ms (single node) | | | — | ✓ sub-100 ms (claimed) |
+| Scale-out to 100s of machines | unproven; no shuffles | ✓ | ✓ | ✓ | ✓ |
+| Streaming semantics (event time, windows, CEP, huge state) | decomposable aggregates + SQL tasks | good | ✓ | storage only | — |
+| APIs & usability | SQL over HTTP, JSON/Arrow out, one command | ✓ SQL + DataFrames (Python/Scala/Java/R), notebooks | SQL + DataStream API | clients (Java, Rust, Python) | ✓ Databricks SQL |
+| Connectors & ecosystem | HTTP in, Delta out | ✓ huge | ✓ huge | Flink/Spark connectors | ✓ Databricks |
+| Operations & footprint | ✓ 1 binary, 39 MB idle, 0.02 s start | JVM cluster | JVM cluster + checkpoints | JVM + ZooKeeper + Flink tiering job | managed |
+| Governance & security | none yet | via platforms | via platforms | TLS/Kerberos (1.0) | ✓ Unity Catalog |
+| Maturity | prototype | ✓ | ✓ | incubating | beta |
+
+## Processing power
+
+### TPC-H SF1 (new this round)
+
+The 22 queries on the same Parquet files (`tpchgen-cli -s 1`: 6 M lineitems), best of two runs
+each. Pondra's runs go over HTTP and return JSON, and each run is a new query, so the result
+cache never answers. All three engines return the same row counts for every query.
+
+| | Pondra | Spark 4.2 | DuckDB 1.5.5 (reference) |
 |---|---|---|---|
-| What you install | one binary, **89.2 MB** (29.9 MB gzip, 16.8 MB xz), no runtime | 485 MB PySpark + a 286 MB JVM | 353 MB PyFlink + a 286 MB JVM |
-| Start to first query | **0.03 s** | 4.1 s | 5.2–5.4 s |
-| Idle memory | **41 MB** | — | — |
-| Peak memory in these runs | **279–586 MB** (1.8 GB saturated for 60 s) | 0.7–1.5 GB | 1.2–3.1 GB |
-| Durable streaming storage | built in (log in the bucket, exactly-once) | needs Kafka / Fluss + checkpoint storage | needs Kafka / Fluss + checkpoint storage |
+| All 22 queries | **5.9 s** | 58.5–65.2 s | 3.8 s |
+| Fastest / slowest query | 0.06 / 0.60 s | 0.6 / 6.8 s | 0.04 / 0.47 s |
+| Per query vs Spark | **3x–23x faster** (median ~11x) | 1x | — |
 
-## Batch: 20M rows, write then 6 queries (seconds, best of two runs)
+DuckDB, the single-machine specialist, is 1.5x faster still. Pondra runs every query through the
+lake (Parquet + log tail, one consistent snapshot) and HTTP. Flink couldn't take part: PyFlink
+ships no Parquet reader, and Maven Central is blocked here.
+
+### Batch: 20 M rows, write then 6 queries (seconds; Pondra's first run, uncached)
 
 | | Pondra | Spark | Flink ¹ | Pondra vs Spark |
 |---|---|---|---|---|
-| Generate + write 20 M rows | **3.1** (Parquet ZSTD, 79 MB) | 7.3 (Parquet Snappy, 209 MB) | 10.5 (CSV, 603 MB) | 2.3x |
-| Q1 `count, sum, avg` | **0.04** | 0.70 | 5.2 | 16x |
-| Q2 filter + group by 1,000 categories | **0.13** | 0.93 | 6.5 | 7x |
-| Q3 group by 1 M users, top 10 | **0.43** | 2.20 | 8.9 | 5x |
-| Q4 `count(DISTINCT user)` | **0.33** | 1.75 | 7.5 | 5x |
-| Q5 join with a dimension table | **0.25** | 2.30 | 9.4 | 9x |
-| Q6 time buckets | **0.25** | 0.52 | 4.7 | 2x |
-| Peak memory | **279 MB** | 1.5 GB | 3.1 GB |  |
+| Generate + write 20 M rows | **3.3** (Parquet ZSTD) | 7.3 | 10.5 (CSV) | 2.2x |
+| Q1 `count, sum, avg` | **0.05** | 0.70 | 5.2 | 14x |
+| Q2 filter + group by 1,000 | **0.14** | 0.93 | 6.5 | 6.5x |
+| Q3 group by 1 M users, top 10 | **0.59** | 2.20 | 8.9 | 3.8x |
+| Q4 `count(DISTINCT user)` | **0.51** | 1.75 | 7.5 | 3.4x |
+| Q5 join with a dimension | **0.26** | 2.30 | 9.4 | 8.8x |
+| Q6 time buckets | **0.25** | 0.52 | 4.7 | 2.1x |
+| Peak memory | **293 MB** | 1.5 GB | 3.1 GB | |
 
-¹ Flink's Parquet format jar isn't bundled with PyFlink, and Maven Central is blocked in this sandbox, so Flink wrote and read CSV. Its batch numbers are therefore pessimistic. Batch isn't Flink's focus anyway.
+Asked a second time, each of these queries now returns in about 1 ms from the result cache
+(round 7) until the table changes.
 
-Round 3 ran these queries 10–25 % faster (e.g. Q1 0.034 s, Q3 0.35 s): the round-4 binary spends a little more per query on the extra bookkeeping (commit numbers, pinned reads) and on checking whether to spread the query across nodes.
+¹ Flink wrote and read CSV (no Parquet format jar here), so its batch numbers are pessimistic.
 
-## Streaming: 10M events
+### Streaming: 10 M events
 
-Every engine computes the same running aggregation (count and sum per key, 100,000 keys) or the same stateless filter/projection.
-
-| Workload | Pondra | Spark Structured Streaming | Flink (streaming mode) |
+| Workload | Pondra | Spark Structured Streaming | Flink |
 |---|---|---|---|
-| **Stateful:** keyed running aggregation | **4.0 s end to end (2.5 M events/s)**: 10 M events sent over HTTP by 4 client threads, stored durably, aggregated by an inline view, with the result queryable. Ingest alone: 2.7 s | 3.9 s (2.5 M/s) reading a 10 M-row in-memory backlog in one micro-batch, `noop` sink; 12.8 s in 500k-row micro-batches | 13.3 s (0.75 M/s), in-memory source, `blackhole` sink |
-| **Stateless ETL:** project 4 columns + filter | **3.9 s end to end (2.6 M events/s)**, output stored durably | 5.2 s (2.0 M/s), `noop` sink | 4.0 s (2.5 M/s), `blackhole` sink |
-| **Sustained, durable, end to end:** producers → HTTP (Arrow) → log in storage → aggregated view → query | **2.8 M events/s for 60 s on one node; acked → visible in the aggregate p50 0.21 s, p99 0.73 s** | not measurable here: needs Kafka or Fluss plus checkpointing | same |
-| 3-node cluster, producers writing to followers only | **3.8 M events/s**, durable, exactly-once | — | — |
+| Keyed running aggregation (100k keys) | **4.2 s end to end (2.4 M/s)**: over HTTP, stored durably, aggregated by an inline view, queryable | 3.9 s from an in-memory backlog, `noop` sink | 13.3 s (0.75 M/s), in-memory source, `blackhole` sink |
+| Stateless ETL (project + filter) | **4.1 s end to end (2.4 M/s)**, output durable | 5.2 s, `noop` sink | 4.0 s, `blackhole` sink |
+| Sustained 60 s, durable, 8 producers, one node | **2.7 M events/s**, acked → visible in the aggregate p50 0.23 s | needs Kafka/Fluss + checkpoints | same |
+| 3-node cluster, producers writing to followers | **4.3–4.6 M events/s** durable, exactly-once (leader 26–28 % of CPU) | — | — |
 
-**How to read these rows:**
+Spark and Flink generated input in memory and discarded output; Pondra received its input over
+HTTP and committed the results durably. The comparison is tilted against Pondra.
 
-- **Sources and sinks differ.** Spark and Flink generated their input in memory (`rate`, `datagen`) and threw the output away. Pondra received its input over HTTP, stored it durably, and committed the results. The comparison is tilted *against* Pondra.
-- **Round 3 for reference:** ingest took 6.95 s (1.44 M/s) and the stateful pass another 1.2 s. Round 4 does both at once in 4.0 s, because views run during ingest on every node.
-- **Engine vs engine.** On 2 vCPUs, JVM and scheduling overhead dominate for Spark and Flink; large clusters would narrow the gap per core, not close it.
+## Latency and freshness
 
-## Latency: how fast does a change show up?
+| | Pondra (local disk) | Pondra (R2 from this far-away sandbox) | Flink | Spark | Fluss |
+|---|---|---|---|---|---|
+| Write acked, durable | **5 ms** p50 / 8 ms p99 | 0.66–1.1 s (one PUT) | at checkpoint | per micro-batch | ms |
+| Event → updated aggregate row on another node | **5 ms** p50 / 7 ms p99; 38–77 ms p50 under load | ≈ the ack | ms, exactly-once only at checkpoint | RTM: single-digit ms stateless, open-source at-least-once | ms |
+| New row readable by other engines (open lake) | **17 ms** (a Delta version), 31 ms via delta-rs | ~5 s (3 round trips) | per checkpoint | per micro-batch | 3 min default |
+| A new user's first query | 17–24 ms | **20–30 ms** on a warm node; ≈1 s on a node that just joined | — | — | ms |
 
-Measured with `tools/cluster.py latency`: 3 nodes. A client writes one event at a time to one follower; another client, subscribed with `GET /watch/totals` on the *other* follower, times each event until the updated row of an aggregating view (`GROUP BY user`) arrives.
+## Serving vs Databricks Lakehouse//RT
 
-| | Local disk, idle | Local disk, 4 busy producers | Simulated R2, idle | Simulated R2, 4 busy producers |
+Lakehouse//RT's published claims: "as low as 10 ms on smaller datasets", "sub-100 millisecond
+latency at 12,000 queries per second on standard analytical benchmarks", read-only beta. Pondra,
+with 2 M keys (500k on R2), on one 2-vCPU box, with the load generator running on the same box:
+
+| | Local disk, leader | Local disk, read-only node | Real R2, read-only node |
+|---|---|---|---|
+| `/lookup`, 1 client | 0.22 ms p50 | **0.14 ms** p50 | **0.14 ms** p50 |
+| `/lookup`, 32–64 clients | 20,000/s, p99 7.4 ms | **35,600/s**, p99 6.4 ms | **31,800/s**, p99 4.0 ms |
+| SQL point query, 64 clients | 15,800/s | 21,100/s | 18,400/s (32 clients) |
+| Dashboard aggregate, a new query each time | 6–42 ms | 43 ms | 17 ms |
+| Same dashboard, 32 clients | 23,300/s, p99 5 ms | 21,300/s | 19,500/s |
+| Same, while writes land every few ms (exact) | 230/s | 842/s | 12,400/s |
+| Same, with `stale_ms=1000` | 10,900/s | 12,400/s | 17,100/s |
+
+Where each side stands:
+
+- **Pondra is ahead** on point reads, repeated dashboards and freshness: it serves rows
+  milliseconds old, and it takes writes itself.
+- **Lakehouse//RT is ahead** on new, heavy analytical queries at high concurrency: it claims
+  sub-100 ms at 12k QPS on TPC-H/TPC-DS-style queries on a cluster. Pondra runs a new TPC-H
+  query in 60–600 ms on two cores.
+- **To close that:** more read-only nodes (each has its own caches), shuffles, and partitioned
+  tables — all in the plan below.
+
+## Footprint and operations
+
+| | Pondra | Spark 4.2 | Flink 2.3 | Fluss |
 |---|---|---|---|---|
-| Write acknowledged (durable) | **6 ms** p50 / 10 ms p99 | 24 / 107 ms | 309 / 919 ms | 453 / 998 ms |
-| View row pushed to a client on another node | **6 ms** p50 / 10 ms p99 | 65 / 461 ms | 333 / 1,072 ms | 602 / 1,146 ms |
+| What you install | one binary, 89.6 MB (30.1 MB gzip, 16.9 MB xz) | 485 MB PySpark + a JVM | 353 MB PyFlink + a JVM | CoordinatorServer + TabletServers + ZooKeeper + a Flink tiering job, JVM |
+| Start to first query | **0.02–0.07 s** | 4.1 s | 5.2–5.4 s | — |
+| Idle memory | **39 MB** | — | — | — |
+| Peak memory in these runs | **293–609 MB** (1.3 GB at 2.7 M events/s sustained) | 0.7–1.5 GB | 1.2–3.1 GB | — |
+| State | object storage only; nodes are disposable (SSD tier = a cache) | + Kafka/Fluss + checkpoints | + Kafka/Fluss + checkpoints | TabletServer disks (replicated) + object storage |
 
-What the numbers mean:
+## Where the JVM engines still win, and the plan
 
-- **Pondra acknowledges only once a write is durable in storage.** On local disk that's a few milliseconds. On object storage it's one catalog write (simulated R2: PUT p50 197 ms, GET p50 100 ms, long tail), so ~0.3–0.5 s. The view update and the push to other nodes add almost nothing: the view is computed before the write and committed with it.
-- **Round 3** took ~0.76 s p50 (1.8 s p99) from ack to a stateful result on local disk. Tasks polled every second and writes waited for a 250 ms group-commit window.
-- **Flink** processes each event in memory within milliseconds. Its exactly-once results reach readers only when a checkpoint commits the sink's transaction: every few seconds to minutes (Confluent Cloud: "roughly one minute").
-- **Fluss** acknowledges after replicating a write to other TabletServers' local disks, so its writes and streaming reads take milliseconds on any object store.
-- **Where Pondra stands:**
-  - On fast storage (local NVMe, or S3 Express One Zone, not measured here), Pondra reacts in milliseconds with exactly-once results, which Flink only gets at checkpoint time.
-  - On standard object storage, Fluss is faster, by one object-store round trip. The reason: Pondra keeps no local disks and no replication protocol, only the bucket.
+| Gap | Why it matters | Plan | What proves it |
+|---|---|---|---|
+| **Scale-out beyond one stage** (no shuffles; big-to-big joins on one node) | Spark's core strength; TPC-H at SF100+ needs it | Shuffle through the job-dealing mechanism tiering already uses: hash-partitioned exchange between nodes, spill to local SSD | TPC-H SF100 on 3–10 real machines vs Spark, same hardware |
+| **Multi-machine evidence** | Everything above is one box | Run the suite and benchmarks on 3–20 cloud VMs against S3/R2 | Near-linear ingest and query scaling, failover times |
+| **Streaming semantics** (event time, watermarks, windows, timers, CEP) | Flink's core strength | Tumbling/sliding/session windows with watermarks in views and tasks, on the same exactly-once commit path | Nexmark queries vs Flink |
+| **Durable ack in ms on object storage** | Fluss's edge | S3 Express One Zone as the log bucket (measure first); optional ack after replication to 2 nodes' memory/SSD | Ack p50 < 20 ms on S3 Express |
+| **APIs** | Usability for data teams | Arrow Flight SQL / Postgres wire (BI tools, JDBC), a Python client with DataFrame-style calls, Python UDFs | Tableau / Power BI / psql connect; notebook demo |
+| **Connectors** | Getting data in and out | Kafka-protocol ingest endpoint, CDC from Postgres/MySQL, Iceberg metadata beside Delta | Debezium → Pondra → Spark reading Iceberg |
+| **Heavy new analytical queries at high concurrency** | Lakehouse//RT's edge | Prepared-plan cache, partitioned tables (pruning), per-node caches on many read-only nodes | TPC-H SF10 at 1k+ QPS mixed, p99 < 100 ms on N nodes |
+| **Governance** | Enterprise requirement | Auth (tokens, per-table grants), audit log, quotas | Multi-tenant test |
+| **Maturity** | Trust | Chaos tests on real clusters, fuzzing, long soak runs, versioned upgrades | Months of soak without data loss |
 
-## Scaling out
+Sources:
 
-One machine can't show multi-machine speed-ups, so these are shape checks, not scale-up numbers:
-
-| Check | Result |
-|---|---|
-| Where the write work lands (`split`, 3 nodes, producers writing to the 2 followers) | 3.8 M events/s; the leader used **31 %** of the cluster's CPU — its one-third share. Before the tiering work was dealt out too, it was 70 % |
-| Distributed query correctness (`spread`, 2 M rows, 3 nodes) | identical results to a single node for all 9 queries, no fallbacks |
-| Distributed query speed-up, one CPU per node (2 nodes, 20 M rows) | scan/filter/join/time-bucket **1.7–1.95x**; high-cardinality group-by 1.16x and count-distinct 1.01x (their final merge dominates) |
-| Distributed query speed-up on simulated R2 (3 nodes, I/O-latency bound) | 1.2–4.3x faster than one node on 8 of 9 queries (q1 921→472 ms, q9 760→176 ms), identical results |
-
-## Serving: Databricks Lakehouse//RT, and where Pondra stands
-
-Databricks' Lakehouse//RT (engine codename Reyden) is a *serving* layer over Delta/Iceberg:
-"response times as low as 10 ms on smaller datasets and sub-100 ms performance on larger ones",
-"sub-100 millisecond latency at 12,000 queries per second", in beta for read-only workloads.
-It doesn't ingest; the write path stays Spark/DLT.
-
-| | Pondra (one 2-vCPU node) | Lakehouse//RT (published) |
-|---|---|---|
-| Point lookup by key, 2 M keys, one client | **7.7 ms** p50, 11 ms p99 | 10 ms on small datasets, sub-100 ms on large |
-| Lookups per second, 8 clients | 265/s on two cores (at 30 ms p50) | 12,000/s (cluster size not stated) |
-| Dashboard aggregate over the whole table | 351 ms for 2 M rows | sub-100 ms |
-| Freshness of what it serves | the log tail is in every read: 7 ms after the write (p50, local disk) | reads the lake; freshness is whatever wrote it |
-| Writes | ingest, views, tasks, exactly-once, in the same binary | none (read-only beta) |
-| What you run | one binary on your own machines | Databricks compute, Unity Catalog, their pricing |
-
-Honest read: on raw serving latency at concurrency, a purpose-built serving engine on a cluster
-wins today, and Pondra's 265 lookups/s per two cores needs prepared-plan caching and more nodes
-to get interesting. On freshness, footprint and "the same system also ingests", Pondra is the
-only one of the two that does the whole job.
-
-## Fluss (unified streaming storage)
-
-Fluss can't run in this sandbox (Apache mirrors and Maven Central are blocked), so this comparison uses its architecture and published numbers only.
-
-| | Pondra | Apache Fluss 0.9 |
-|---|---|---|
-| Processes to run | 1 binary, N copies | CoordinatorServer + TabletServers + ZooKeeper + a Flink job for lake tiering, plus Paimon/Iceberg and object storage. All JVM |
-| Where the durable data lives | object storage only; nodes are stateless | TabletServer local disks, replicated Kafka-style, tiered to object storage later |
-| Write scale-out | every node ingests (encodes, stores, runs views); one leader only orders the commits | writes spread over buckets and TabletServers |
-| Keyed aggregation in storage | merge tables (inline GROUP BY views): sum / count / min / max, merged on read and folded when tiered | aggregation merge engine (sum, min, max, …) on primary-key tables |
-| Primary-key / upsert tables | merge-on-read + compaction to Parquet | KV tablets in RocksDB with a changelog; point lookups in milliseconds |
-| Write → readable, durable (unified read) | 6 ms on local disk; one PUT on object storage (0.26 s simulated R2, 0.66 s real R2 from this sandbox) | milliseconds (replicated to TabletServer disks) |
-| Union read | **every query, every node**: Parquet files ∪ log tail, one snapshot | Fluss + lake, through Fluss's Flink/Spark connectors |
-| **The lake without the system** — freshness | **Delta Lake, 17 ms** after the ack on local disk (a new version with the row; delta-rs reads it at 31 ms p50); **4.8 s** on real R2 from this far-away sandbox (three object-store round trips). Under a steady stream, plus up to `--tier-secs` (2 s) | Paimon/Iceberg, `table.datalake.freshness`: **3 min** by default, via a separate tiering service (a Flink job) |
-| **The lake without the system** — who can read it | Delta readers: Spark, Databricks, DuckDB, Polars, delta-rs, Trino, Athena (checked: delta-rs, Polars, DuckDB) | Paimon or Iceberg readers |
-| A new user's first query on object storage | **20–30 ms** on a serving node (SSD tier + in-memory catalog); **≈0.95 s** on a node that just joined with an empty disk (real R2, ~0.4 s per GET from here) | milliseconds from TabletServers; lake reads cold from object storage |
-| Freshness on a read-only serving node | 7 ms p50 (it follows the leader's commit stream) | milliseconds (reads from TabletServers) |
-| Published throughput | this report: 3.8 M events/s through 3 nodes on 2 vCPUs, durable | community benchmark (Fluss 0.9.1, docker-compose, one TaskManager): 88.7k records/s vs Kafka's 98.6k. Rednote in production: ~1B records and 10 TB per day on one table; write CPU −30 %, write traffic −50 % after moving from Kafka |
-
-**Verdict:**
-
-- **Fluss still wins** on:
-  - millisecond durability on standard object storage (it replicates to local disks instead);
-  - point lookups on primary keys;
-  - production proof at Alibaba / Rednote scale.
-- **Pondra wins** on:
-  - **the open lake**:
-    - fresh for outside engines in milliseconds on local disk, and seconds on a far-away R2
-      bucket, against Fluss's 3-minute default — roughly 100x or more;
-    - no tiering job to run: it is part of every node;
-  - operational simplicity: no ZooKeeper, no disks to replicate, no JVM;
-  - cost: object storage only, plus a disposable SSD cache;
-  - one engine for streaming and batch SQL.
-- **Now matched:**
-  - write scale-out;
-  - keyed aggregation in storage;
-  - millisecond reads for a new user on object storage (from local SSD and memory).
-- **For a company growing into enterprise scale:** Pondra covers streaming, batch and serving with one binary. A workload that needs millisecond durability on S3 itself can use S3 Express One Zone as the bucket. Only if that isn't enough does it need a Fluss-like tier.
-
-Sources: [Fluss architecture](https://fluss.apache.org/docs/next/concepts/architecture/), [Fluss aggregation merge engine](https://fluss.apache.org/docs/table-design/merge-engines/aggregation/), [Fluss tiering service](https://fluss.apache.org/docs/1.0/streaming-lakehouse/tiering-service/), [Fluss 0.9 release](https://fluss.apache.org/blog/releases/0.9/), [Jack Vanlightly: Understanding Apache Fluss](https://jack-vanlightly.com/blog/2025/9/2/understanding-apache-fluss), [community Fluss vs Kafka benchmark](https://github.com/fmorillo7694/fluss-kafka-bench/blob/main/bench/results/README.md), [Rednote: Kafka to Fluss](https://fluss.apache.org/blog/rednote-kafka-to-fluss-real-time-indexing/), [Flink: end-to-end exactly-once with Kafka](https://flink.apache.org/2018/02/28/an-overview-of-end-to-end-exactly-once-processing-in-apache-flink-with-apache-kafka-too/), [Confluent: delivery guarantees and latency in Flink](https://docs.confluent.io/cloud/current/flink/concepts/delivery-guarantees.html).
+- [Databricks: Introducing Lakehouse//RT](https://www.databricks.com/blog/introducing-lakehousert-real-time-performance-unified-lakehouse)
+- [Databricks press release (June 2026)](https://www.databricks.com/company/newsroom/press-releases/databricks-launches-lakehousert-bring-real-time-analytics-directly)
+- [StarTree: Lakehouse//RT vs StarTree](https://startree.ai/resources/databricks-lakehouse-rt-vs-startree/)
+- [Spark Real-Time Mode vs Flink (2026)](https://sparkingscala.com/latest/2026/05/23/spark-rtm-vs-flink/)
+- [Databricks: Real-Time Mode in Spark Structured Streaming](https://www.databricks.com/blog/introducing-real-time-mode-apache-sparktm-structured-streaming)
+- [Fluss releases](https://fluss.apache.org/blog/tags/releases/)
+- [Fluss 1.0 roadmap](https://github.com/apache/fluss/discussions/2684)
+- [Fluss architecture](https://fluss.apache.org/docs/next/concepts/architecture/)
+- [Fluss tiering service](https://fluss.apache.org/docs/1.0/streaming-lakehouse/tiering-service/)
+- [Jack Vanlightly: Understanding Apache Fluss](https://jack-vanlightly.com/blog/2025/9/2/understanding-apache-fluss)
+- [Flink: end-to-end exactly-once](https://flink.apache.org/2018/02/28/an-overview-of-end-to-end-exactly-once-processing-in-apache-flink-with-apache-kafka-too/)
+- [Confluent: delivery guarantees and latency in Flink](https://docs.confluent.io/cloud/current/flink/concepts/delivery-guarantees.html)

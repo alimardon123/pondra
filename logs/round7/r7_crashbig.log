@@ -1,0 +1,3 @@
+run  1: kill-9=9 injected={'after_seg_put': 6, 'after_commit': 1, 'after_parquet_put': 34} events=9000000/9000000 unique=9000000 task_output=4500000/4500000 views=exact -> OK
+run  2: kill-9=6 injected={'after_seg_put': 5, 'after_commit': 1, 'after_parquet_put': 30} events=9000000/9000000 unique=9000000 task_output=4500000/4500000 views=exact -> OK
+run  3: kill-9=11 injected={'after_seg_put': 8, 'after_commit': 3, 'after_parquet_put': 27} events=9000000/9000000 unique=9000000 task_output=4500000/4500000 views=exact -> OK

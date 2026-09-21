@@ -94,6 +94,7 @@ pub struct Lake {
     rt: Arc<RuntimeEnv>,         // shared by all queries: object store registry + Parquet metadata cache
     tail: Mutex<(lru::LruCache<(u64, String), Rows>, usize)>, // decoded (segment, table) rows; total bytes
     pub disk: Option<Arc<crate::cache::Disk>>, // lakes on object storage: the local SSD tier
+    pub groups: crate::serve::Groups,          // decoded row groups for key lookups
 }
 
 pub type Rows = Arc<Vec<datafusion::arrow::record_batch::RecordBatch>>;
@@ -131,7 +132,7 @@ impl Lake {
         let cache = ObjectStoreCacheOptions { root_folder: cache, max_cache_size_bytes: Some(2 << 30), cache_on_flush: true, cache_on_compaction: true, ..Default::default() };
         let cat = if writer { Catalog::writer(store.clone(), cache).await? } else { Catalog::reader(store.clone(), streamed, cache).await? };
         let hwm = watch::Sender::new(cat.get::<u64>("n").await?.unwrap_or(1) - 1);
-        Ok(Arc::new(Lake { url, store, cat, hwm, backlog: Default::default(), rt, tail: Mutex::new((lru::LruCache::unbounded(), 0)), disk }))
+        Ok(Arc::new(Lake { url, store, cat, hwm, backlog: Default::default(), rt, tail: Mutex::new((lru::LruCache::unbounded(), 0)), disk, groups: crate::serve::Groups::new(cache_mb() << 19) }))
     }
 
     /// Follower: lay a commit streamed from the leader over our view of the catalog.
@@ -216,6 +217,12 @@ impl Lake {
     /// Full URL of an object, for DataFusion.
     pub fn full(&self, path: &str) -> String { format!("{}/{path}", self.url) }
 
+    /// The store DataFusion reads `url` through (for lakes on object storage: the read cache and
+    /// the SSD tier in front of the bucket).
+    pub fn object_store(&self, url: &datafusion::datasource::listing::ListingTableUrl) -> Result<Arc<dyn object_store_df::ObjectStore>> {
+        Ok(self.rt.object_store(url)?)
+    }
+
     /// Write an object only if it does not exist yet: data is never overwritten.
     pub async fn put(&self, path: &str, bytes: Vec<u8>) -> Result<()> {
         let opts = PutOptions { mode: PutMode::Create, ..Default::default() };
@@ -280,6 +287,7 @@ pub struct Catalog {
     db: Db_,
     order: tokio::sync::Mutex<u64>, // leader: next commit id; held while writing, so ids follow write order
     flushed: AtomicU64,             // leader: `order` at the last memtable flush
+    durable_id: Arc<AtomicU64>,     // leader: the last commit that is durable (what reads see)
     durable: Option<mpsc::UnboundedSender<(WriteHandle, Arc<Delta>, oneshot::Sender<()>)>>, // leader: writes awaiting durability, in order
     feed: broadcast::Sender<Arc<Delta>>,                  // leader: commits, as they become durable
     recent: Recent, // leader: the last RECENT of them (and their bytes), for (re)connecting followers
@@ -396,7 +404,8 @@ impl Catalog {
         cat.last_n.store(cat.get::<u64>("n").await?.unwrap_or(1), Relaxed);
         *cat.order.get_mut() = cat.get::<u64>("c").await?.unwrap_or(0) + 1;
         let (tx, rx) = mpsc::unbounded_channel();
-        tokio::spawn(publish(rx, cat.feed.clone(), cat.recent.clone()));
+        cat.durable_id.store(*cat.order.get_mut() - 1, Relaxed);
+        tokio::spawn(publish(rx, cat.feed.clone(), cat.recent.clone(), cat.durable_id.clone()));
         cat.durable = Some(tx);
         cat.checkpoint().await?; // what we inherited (replayed from the WAL) into every node's view
         Ok(cat)
@@ -413,8 +422,8 @@ impl Catalog {
 
     fn new(db: Db_) -> Self {
         let (feed, order) = (broadcast::channel(1024).0, tokio::sync::Mutex::new(1));
-        let (last_n, view, pruned, pins, streamed, hold, mirror, flushed) = Default::default();
-        Catalog { db, order, flushed, durable: None, feed, recent: Default::default(), last_n, overlay: Default::default(), view, pruned, pins, streamed, hold, follows: false, mirror }
+        let (last_n, view, pruned, pins, streamed, hold, mirror, flushed, durable_id) = Default::default();
+        Catalog { db, order, flushed, durable_id, durable: None, feed, recent: Default::default(), last_n, overlay: Default::default(), view, pruned, pins, streamed, hold, follows: false, mirror }
     }
 
     /// Leader: the recent commits plus a receiver for every commit from now on.
@@ -550,6 +559,16 @@ impl Catalog {
 
     pub fn is_writer(&self) -> bool { matches!(self.db, Db_::Writer(_)) }
 
+    /// The catalog version every read here reflects right now — on the leader (durable commits)
+    /// or a node that holds the whole catalog in memory — or `None` where reads mix our view with
+    /// the stream. A read that starts after this sees at least this version (never older).
+    pub fn version(&self) -> Option<u64> {
+        match &self.db {
+            Db_::Writer(_) => Some(self.durable_id.load(Relaxed)),
+            Db_::Reader(_) => self.mirror.load(Relaxed).then(|| self.streamed.load(Relaxed)),
+        }
+    }
+
     pub async fn get<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>> {
         self.get_raw(key).await?.map(|v| serde_json::from_slice(&v).context(key.to_string())).transpose()
     }
@@ -682,12 +701,13 @@ impl Catalog {
 /// Leader: as each write becomes durable (in order), stream it to the followers and release its
 /// writer. If one fails (e.g. a new leader fenced us out) its outcome is unknown: restart and
 /// rejoin; the restart reloads the state.
-async fn publish(mut rx: mpsc::UnboundedReceiver<(WriteHandle, Arc<Delta>, oneshot::Sender<()>)>, feed: broadcast::Sender<Arc<Delta>>, recent: Recent) {
+async fn publish(mut rx: mpsc::UnboundedReceiver<(WriteHandle, Arc<Delta>, oneshot::Sender<()>)>, feed: broadcast::Sender<Arc<Delta>>, recent: Recent, durable_id: Arc<AtomicU64>) {
     while let Some((handle, d, done)) = rx.recv().await {
         if let Err(e) = handle.await_durable().await {
             eprintln!("catalog commit failed: {e}");
             crate::cluster::restart();
         }
+        durable_id.store(d.id, Relaxed);
         let mut r = recent.lock().unwrap();
         r.1 += d.bytes();
         r.0.push_back((Instant::now(), d.clone()));

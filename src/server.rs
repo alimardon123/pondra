@@ -18,7 +18,7 @@ use datafusion::arrow::{compute::concat_batches, json as arrow_json, record_batc
 use futures::{StreamExt, TryStreamExt};
 use serde::Deserialize;
 use serde_json::{json as j, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -31,6 +31,70 @@ pub struct App {
     pub seq: Option<Arc<Sequencer>>, // the leader's sequencer
     pub lock: Arc<Mutex<()>>,        // serialises everything that rewrites table metadata
     pub retain_ms: u64,
+    pub results: Arc<Results>,       // recent query results (see `Results`)
+}
+
+/// Recent query results. By default a result is reused only at exactly the catalog version it
+/// was computed at (`Catalog::version`), so a dashboard's repeated query costs a hash lookup until
+/// the next commit, however many ask. With `?stale_ms=N` a caller accepts one up to N ms old
+/// instead — for dashboards over tables that change every few milliseconds — and while one
+/// request recomputes an expired result, the others keep getting the previous one.
+pub struct Results(std::sync::Mutex<(lru::LruCache<String, Cached>, usize)>, std::sync::Mutex<HashMap<String, Arc<Flight>>>);
+
+/// Arrivals so far, and (under the lock: one computation at a time) the arrivals the last
+/// computation covers, with its result.
+type Flight = (std::sync::atomic::AtomicU64, Mutex<(u64, Option<bytes::Bytes>)>);
+
+struct Cached {
+    version: u64,
+    at: std::time::Instant,
+    body: bytes::Bytes,
+    refreshing: Option<std::time::Instant>, // a request is computing a newer one (stale mode)
+}
+
+impl Default for Results {
+    fn default() -> Self { Results(std::sync::Mutex::new((lru::LruCache::unbounded(), 0)), Default::default()) }
+}
+
+impl Results {
+    const MAX: usize = 64 << 20;
+
+    fn flight(&self, key: &str) -> Arc<Flight> {
+        let mut f = self.1.lock().unwrap();
+        if f.len() > 10_000 {
+            f.clear(); // (a flight in progress keeps its own handle)
+        }
+        f.entry(key.to_string()).or_default().clone()
+    }
+
+    fn get(&self, key: &str, version: u64, stale: Option<Duration>) -> Option<bytes::Bytes> {
+        let mut c = self.0.lock().unwrap();
+        let e = c.0.get_mut(key)?;
+        let fresh_enough = stale.is_some_and(|s| e.at.elapsed() <= s);
+        let someone_refreshing = stale.is_some() && e.refreshing.is_some_and(|t| t.elapsed() < Duration::from_secs(10));
+        if e.version == version || fresh_enough || someone_refreshing {
+            return Some(e.body.clone());
+        }
+        if stale.is_some() {
+            e.refreshing = Some(std::time::Instant::now()); // this caller recomputes; the rest wait on nobody
+        }
+        None
+    }
+
+    fn put(&self, key: String, version: u64, body: bytes::Bytes) {
+        if body.len() > 1 << 20 {
+            return; // big results aren't what dashboards repeat
+        }
+        let mut c = self.0.lock().unwrap();
+        c.1 += body.len();
+        if let Some(old) = c.0.put(key, Cached { version, at: std::time::Instant::now(), body, refreshing: None }) {
+            c.1 -= old.body.len();
+        }
+        while c.1 > Self::MAX {
+            let Some((_, old)) = c.0.pop_lru() else { break };
+            c.1 -= old.body.len();
+        }
+    }
 }
 
 pub fn router(app: App) -> Router {
@@ -285,14 +349,23 @@ async fn create_view(State(app): State<App>, Path(name): Path<String>, sql: Stri
     Ok(Json(j!({"view": name})))
 }
 
-/// `GET /lookup/{table}/{key}`: the current row of one key, for serving reads. Same answer as
-/// `SELECT … WHERE key = …`, but planned as a filter + "newest wins" instead of a window over the
-/// table, on one thread, so it costs a few milliseconds even with many queries in flight.
-/// Composite keys are comma-separated, in the key's column order.
+/// `GET /lookup/{table}/{key}`: the current row of one key, for serving reads — same answer as
+/// `SELECT … WHERE key = …`. Upsert tables skip SQL entirely (`serve.rs`); merge tables combine
+/// the key's partial rows with a filter + GROUP BY on one thread. Composite keys are
+/// comma-separated, in the key's column order.
 async fn lookup(State(app): State<App>, Path((name, key)): Path<(String, String)>) -> Result<Response, E> {
     let lake = &app.lake;
     let meta: TableMeta = lake.cat.get(&table_key(&name)).await?.ok_or_else(|| anyhow::anyhow!("no table {name}"))?;
     ensure!(!meta.key.is_empty(), "{name} has no key: use /sql");
+    if meta.merge.is_empty() {
+        let names: Vec<&str> = meta.columns.iter().map(|(c, _)| c.as_str()).collect();
+        let row = crate::serve::lookup(lake, &name, &meta, &key).await?.map(|r| r.project(&names.iter().map(|n| r.schema().index_of(n)).collect::<Result<Vec<_>, _>>()?)).transpose()?;
+        let mut w = arrow_json::ArrayWriter::new(Vec::new());
+        w.write_batches(&row.iter().collect::<Vec<_>>())?;
+        w.finish()?;
+        let body = if row.is_none() { b"[]".to_vec() } else { w.into_inner() };
+        return Ok(([("content-type", "application/json")], body).into_response());
+    }
     let mut where_ = vec![];
     for (col, val) in meta.key.iter().zip(key.split(',')) {
         let text = meta.columns.iter().any(|(c, t)| c == col && (t == "Utf8" || t == "LargeUtf8"));
@@ -320,9 +393,10 @@ async fn lookup(State(app): State<App>, Path((name, key)): Path<(String, String)
 
 #[derive(Deserialize)]
 struct SqlParams {
-    format: Option<String>,
+    format: Option<String>, // json (default), table (text), arrow (Arrow IPC stream)
     after: Option<u64>,     // read-your-writes: first wait until this node has seen segment `after` (from an ack)
     spread: Option<String>, // "1": run across the cluster even for small tables; "0": only here
+    stale_ms: Option<u64>,  // accept a cached result up to this old (see `Results`)
 }
 
 async fn sql(State(app): State<App>, Query(p): Query<SqlParams>, query: String) -> Result<Response, E> {
@@ -330,23 +404,74 @@ async fn sql(State(app): State<App>, Query(p): Query<SqlParams>, query: String) 
         let mut hwm = app.lake.hwm.subscribe();
         let _ = tokio::time::timeout(Duration::from_secs(30), async { while app.lake.visible() < seg { hwm.changed().await.ok()?; } Some(()) }).await;
     }
+    let format = p.format.as_deref().unwrap_or("json");
+    let kind = match format {
+        "table" => "text/plain",
+        "arrow" => "application/vnd.apache.arrow.stream",
+        _ => "application/json",
+    };
+    let respond = |body: bytes::Bytes| ([("content-type", kind)], body).into_response();
+    if format == "json" {
+        if let Some(body) = crate::serve::point_sql(&app.lake, &query).await? {
+            return Ok(respond(body.into())); // a key lookup: no planning
+        }
+    }
+    // Same query, same catalog version: same answer (unless it asks for the time or randomness).
+    let q = query.to_lowercase();
+    let volatile = ["now()", "random(", "current_", "uuid(", "explain"].iter().any(|f| q.contains(f));
+    let Some(version) = app.lake.cat.version().filter(|_| !volatile) else { return Ok(respond(run_sql(&app, &p, &query).await?)) };
+    let key = format!("{format}|{}|{query}", p.spread.as_deref().unwrap_or(""));
+    let stale = p.stale_ms.filter(|_| p.after.is_none()).map(Duration::from_millis); // (read-your-writes wins)
+    if let Some(body) = app.results.get(&key, version, stale) {
+        return Ok(respond(body));
+    }
+    // Identical queries share one computation at a time. Each covers everyone who arrived before
+    // it started, so no one gets an answer older than the lake they arrived at.
+    let flight = app.results.flight(&key);
+    let ticket = flight.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    let mut slot = flight.1.lock().await;
+    if let (true, Some(body)) = (slot.0 >= ticket, &slot.1) {
+        return Ok(respond(body.clone()));
+    }
+    (slot.0, slot.1) = (flight.0.load(std::sync::atomic::Ordering::Relaxed), None);
+    let version = app.lake.cat.version(); // (read after `covers`: this run reads at least this)
+    let body = run_sql(&app, &p, &query).await?;
+    if let Some(v) = version {
+        app.results.put(key, v, body.clone());
+    }
+    slot.1 = Some(body.clone());
+    Ok(respond(body))
+}
+
+/// Run a query (across the cluster if it's worth it) and format the result.
+async fn run_sql(app: &App, p: &SqlParams, query: &str) -> anyhow::Result<bytes::Bytes> {
     let nodes = if p.spread.as_deref() == Some("0") { vec![] } else { app.cluster.nodes() };
-    let spread = crate::spmd::query(&app.lake, &nodes, &app.cluster.addr, &query, p.spread.as_deref() == Some("1")).await;
+    let spread = crate::spmd::query(&app.lake, &nodes, &app.cluster.addr, query, p.spread.as_deref() == Some("1")).await;
     let batches = match spread {
         Ok(Some(batches)) => batches,
-        Ok(None) => session(&app.lake, &query, "").await?.sql(&query).await?.collect().await?,
+        Ok(None) => session(&app.lake, query, "").await?.sql(query).await?.collect().await?,
         Err(e) => {
             eprintln!("distributed query failed, running it here: {e:#}");
-            session(&app.lake, &query, "").await?.sql(&query).await?.collect().await?
+            session(&app.lake, query, "").await?.sql(query).await?.collect().await?
         }
     };
-    if p.format.as_deref() == Some("table") {
-        return Ok(pretty_format_batches(&batches)?.to_string().into_response());
-    }
-    let mut w = arrow_json::ArrayWriter::new(Vec::new());
-    w.write_batches(&batches.iter().collect::<Vec<_>>())?;
-    w.finish()?;
-    Ok(([("content-type", "application/json")], w.into_inner()).into_response())
+    Ok(bytes::Bytes::from(match p.format.as_deref() {
+        Some("table") => pretty_format_batches(&batches)?.to_string().into_bytes(),
+        Some("arrow") => {
+            // Arrow IPC: straight into pandas / Polars / DuckDB, no JSON parsing
+            let schema = batches.first().map(|b| b.schema()).unwrap_or_else(|| Arc::new(datafusion::arrow::datatypes::Schema::empty()));
+            let mut w = datafusion::arrow::ipc::writer::StreamWriter::try_new(Vec::new(), &schema)?;
+            batches.iter().try_for_each(|b| w.write(b))?;
+            w.finish()?;
+            w.into_inner()?
+        }
+        _ => {
+            let mut w = arrow_json::ArrayWriter::new(Vec::new());
+            w.write_batches(&batches.iter().collect::<Vec<_>>())?;
+            w.finish()?;
+            w.into_inner()
+        }
+    }))
 }
 
 #[derive(Deserialize)]

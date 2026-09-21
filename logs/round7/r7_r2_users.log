@@ -1,0 +1,5 @@
+users: 64 writers + 16 readers + 2 serverless on 3 node(s), 36s  lake s3://pondbucket/round7/test-65fda622
+  79300 events (2,188/s), ack p50 2350 ms p99 4720 ms
+  43911 snapshot reads, query p50 7 ms p99 31 ms
+  inconsistent reads: 0; producers with lost/duplicate batches: 0
+    by node: {}

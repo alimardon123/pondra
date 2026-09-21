@@ -17,16 +17,17 @@ The owner's design principles, which every change must respect:
 2. **As serverless as possible**: no always-on services besides the nodes themselves.
 3. **SPMD, not driver/executor** (Bodo-style): every node runs the same code on its slice.
 4. **No JVM, no Spark, no Flink, no Fluss needed.**
-5. **Short, simple, readable code** — without losing functionality. ~3,100 lines of Rust total.
+5. **Short, simple, readable code** — without losing functionality. ~3,650 lines of Rust total.
    If a change makes a file much longer, look for the simpler shape first.
 
 ## Layout
 
 ```
-src/      3,100 lines of Rust, one file per concern (see the table in README.md)
+src/      3,650 lines of Rust, one file per concern (see the table in README.md)
 tools/    harness.py, cluster.py (tests), delta_check.py (outside readers == Pondra),
           newuser_bench.py (first reads, new nodes), demo_lake.py (one of everything + the tree),
-          serve_bench.py, sizes.py, sim_r2.py (local S3 with R2 latency),
+          serve_bench.py + loadgen.go (serving), bench/tpch.py (TPC-H vs DuckDB and Spark),
+          sizes.py, sim_r2.py (local S3 with R2 latency),
           r2_test.sh (run the suite against a real bucket), bench/ (vs Spark and Flink)
 docs/     ADRs and reports; lake-format.md is the on-disk layout
 ```
@@ -103,6 +104,16 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    after the fresh rows are committed and published, in their own commit. A table with no new
    rows is skipped (no empty commit); `expire` moves its `tiered` mark along every 10 s — don't
    write code that assumes `tiered` advances every round.
+13. **Every keyed file holds one row per key** (folds and compactions both write that way). Upsert
+   reads rely on it: they anti-join each file against the keys of newer sources instead of
+   grouping every row by key (`register_upsert` in `query.rs`), and `/lookup` stops at the first
+   file that has the key. A writer that breaks it (say, appending raw rows to a keyed file)
+   makes reads return duplicates.
+14. **A cached result is valid for exactly one catalog version** (`Catalog::version`), which only
+   exists where every read reflects exactly that version: the leader (last durable commit) and
+   nodes with the in-memory catalog (last streamed commit). Identical queries in flight share one
+   computation that covers only requests which arrived before it started. `stale_ms` is the one,
+   opt-in, exception.
 
 ## Tests: run these before and after any change
 
@@ -147,21 +158,25 @@ Practical notes for an agent working here:
 - Node stderr goes to `/tmp/pondra-<port>-<id>.stderr`; that's where "restarting to rejoin",
   "slow tiering" and panics show up.
 
-## State of the work (2026-09-21, round 6)
+## State of the work (2026-09-21, round 7)
 
 Everything in `docs/prototype-status.md` passes on local disk, on simulated R2 and on a real
 Cloudflare R2 bucket.
 
 Headline numbers, all on one 2-vCPU box:
 
-- **Durable ingest:** 4.6 M events/s through a 3-node cluster.
-- **Write → aggregated row on another node:** 6 ms on local disk; one PUT on object storage.
-- **An open lake:** every table is also a Delta Lake table. On local disk, a new Delta version
-  with the row exists 17 ms after the ack; on R2 from this sandbox, ~5 s.
-- **A new user's first query on R2:** ~20–30 ms on a serving node, and ≈0.95 s on a node that just
-  joined.
+- **Durable ingest:** 4.3–4.6 M events/s through a 3-node cluster.
+- **TPC-H SF1:** all 22 queries in 5.9 s (Spark 4.2: 58–65 s).
+- **Write → aggregated row on another node:** 5 ms on local disk; one PUT on object storage.
+- **An open lake:** every table is also a Delta Lake table, readable 17 ms after the ack on
+  local disk and ~5 s on R2 from here.
+- **Serving:** 0.14 ms key lookups and 20–36k lookups/s; repeated dashboards from a
+  version-exact result cache at ~20k/s.
 - **Consistency:** 0 torn reads and 0 lost batches with 64 concurrent writers, and clean
   failover runs.
+
+The honest comparison with Spark, Flink, Fluss and Lakehouse//RT, with the plan for the gaps,
+is `docs/comparison-spark-flink-fluss.md`.
 
 Known limits, in the order they matter:
 
@@ -174,9 +189,17 @@ Known limits, in the order they matter:
    engines see keyed tables as of their last compaction.
 5. **No auth, quotas or multi-tenancy.** Delta only (no Iceberg metadata), unpartitioned.
 
-Good next moves: Iceberg metadata beside the Delta log, partitioned tables and compaction,
-shuffles reusing the job-dealing mechanism, a prepared-plan cache for lookups, S3 Express
-latency measurements, auth.
+Good next moves, in order:
+
+1. Shuffles reusing the job-dealing mechanism, plus a multi-machine TPC-H run against Spark.
+2. Event-time windows and watermarks.
+3. Arrow Flight SQL or the Postgres wire protocol.
+4. Kafka-protocol ingest and CDC.
+5. Iceberg metadata beside the Delta log.
+6. Partitioned tables.
+7. Auth.
+
+The plan table at the end of the comparison doc has the evidence each should produce.
 
 ## Conventions
 

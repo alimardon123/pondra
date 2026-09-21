@@ -1,6 +1,6 @@
 # Prototype status: Pondra, a streamhouse in one binary
 
-**Date:** 2026-09-21 (round 6) · **Plan:** ADR-002 to ADR-007 · **Code:** `pondra.zip` / `pondra.bundle` (≈3,150 lines of Rust, plus test and benchmark tools)
+**Date:** 2026-09-21 (round 7) · **Plan:** ADR-002 to ADR-008 · **Code:** `pondra.zip` / `pondra.bundle` (≈3,650 lines of Rust, plus test and benchmark tools)
 **Name:** the prototype formerly called `lh` is now **Pondra**. The name is free on crates.io, PyPI and npm. A small personal-finance app uses it (pondra.app), a different category; run a trademark search before a public launch.
 
 ## Where it stands
@@ -14,6 +14,21 @@ One Rust binary replaces the Kafka + Flink + Spark + metastore + ZooKeeper stack
 - upsert and merge tables.
 
 Start more copies on the same bucket to scale out. The only state is object storage. There's no JVM, no database server and no coordination service.
+
+**Round 7 made it a serving engine at Lakehouse//RT speed, and measured it against Spark on TPC-H:**
+
+1. **Point reads skip SQL:** 0.14–0.22 ms, and **20,000–36,000 lookups/s on two cores** (was
+   ~200/s). SQL point queries take the same path.
+2. **Repeated dashboards come from a result cache** that is exact until the next commit: about
+   20,000–38,000/s. `?stale_ms=` trades exactness for throughput when tables change every few
+   milliseconds.
+3. **Keyed tables read as anti-joins** instead of grouping every row by key: dashboards on them
+   went from 420 ms to 6–42 ms.
+4. **TPC-H SF1: all 22 queries in 5.9 s**, against 58–65 s for Spark 4.2 on the same machine.
+   The answers are the same; DuckDB, the single-node reference, takes 3.8 s.
+
+The honest comparison with Spark, Flink, Fluss and Lakehouse//RT — where Pondra wins today, where
+it doesn't yet, and the plan — is `docs/comparison-spark-flink-fluss.md`.
 
 **Round 6 opened the lake to other engines and made first reads on object storage fast:**
 
@@ -123,6 +138,34 @@ correctness test passed while sustained ingest fell by half. It was found by ben
 testing. There is now a `tiering` test (rounds of writes + `/tier`: the log must drain and the
 file count stay bounded) and a note in `AGENTS.md` that this failure mode shows up as throughput,
 not as a red test.
+
+## Round 7: serving reads, TPC-H, and the result cache
+
+The design is in ADR-008. All numbers are on one 2-vCPU box with the load generator
+(`tools/loadgen.go`) on the same box, 2 M keys (500k on R2).
+
+| | Round 6 | Round 7 |
+|---|---|---|
+| `/lookup`, one client | 11.2 ms | **0.14–0.22 ms** |
+| `/lookup`, 64 clients | ~200/s | **20,000/s** (leader), **35,600/s** (read-only node), **31,800/s** on R2 (32 clients) |
+| SQL point query, 64 clients | ~280/s | **15,800–21,100/s** |
+| Dashboard aggregate, a new query each time | ~420 ms | **6–43 ms** |
+| Same dashboard, 32 clients | ~2/s | **21,000–23,000/s** (≤ 5 ms p99) |
+| Same, while writes land every few ms: exact / `stale_ms=1000` | 15/s | **230–842/s / 10,900–12,400/s** |
+| 64 writers + 16 readers + 2 serverless, 3 nodes | 30k events/s | **~103k events/s**: identical reader queries now share one computation |
+| TPC-H SF1, 22 queries | — | **5.9 s** (Spark 4.2: 58–65 s; DuckDB: 3.8 s) |
+
+Also this round:
+
+- `POST /sql?format=arrow` returns Arrow IPC.
+- The `upsert` test checks `/lookup` and SQL point queries against the model after every batch:
+  3,400 lookups per run, on local disk, simulated R2 and real R2, with 0 wrong.
+- Everything else still passes on the round-7 binary:
+  - all, crash, tiering, race, isolate, latency and spread;
+  - 5 of 5 `users` runs and 8 of 8 `failover` runs;
+  - Delta and new-user tests;
+  - simulated R2: users, failover ×2 and fence;
+  - real R2: users, upsert, serving, new-user and Delta.
 
 ## Round 6: an open lake, and fast first reads on object storage
 
@@ -292,8 +335,8 @@ peak at 279–586 MB.
 - Durable acknowledgement costs one object-store write: 1.2 s against R2 from this sandbox, where
   a bare PUT is 0.81 s; milliseconds on local disks, and expected to be milliseconds on S3 Express
   One Zone (not measured).
-- Serving throughput is ~265 lookups/s per two cores. Prepared plans cached per table version are
-  the missing piece; read-only nodes already scale out and are 7 ms fresh.
+- A *new* analytical query costs what its scan costs (TPC-H SF1: 60–600 ms per query on two
+  cores). Repeated ones and key lookups are served from caches in about a millisecond.
 - Compaction of a keyed table is one job on one node. Partitioned compaction (a key range per
   node) is the next step; the LSM layout means it now runs once every 8 rounds, not every round.
 - Merge tables only support decomposable aggregates (sum, count, min, max).

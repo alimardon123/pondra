@@ -53,44 +53,88 @@ pub async fn tail(lake: &Lake, table: &str, after: u64, upto: Option<u64>, ord: 
 
 /// All rows of a table (files ∪ tail up to `upto`); upsert tables carry `_ord` (0 for files).
 pub async fn raw(lake: &Lake, ctx: &SessionContext, name: &str, meta: &TableMeta, upto: Option<u64>) -> Result<DataFrame> {
-    let (schema, keyed) = (schema(&meta.columns)?, !meta.key.is_empty());
-    let mut parts = vec![];
+    let (tail, files) = sources(lake, ctx, name, meta, upto).await?;
+    Ok(match tail.into_iter().chain(files).reduce(|a, b| a.union(b).expect("same schema")) {
+        Some(df) => df,
+        None => empty(ctx, meta)?,
+    })
+}
+
+/// A table's rows as separate reads: the log tail up to `upto` (if any rows), and the files.
+/// Upsert tables get one read per generation of files, newest first, and `_ord` on every row: a
+/// newer file's rows above an older one's, and log rows ((segment << 32) + position) above both.
+/// Other tables read all their files as one (merge tables combine rows in any order).
+pub async fn sources(lake: &Lake, ctx: &SessionContext, name: &str, meta: &TableMeta, upto: Option<u64>) -> Result<(Option<DataFrame>, Vec<DataFrame>)> {
+    let (schema, keyed, upsert) = (schema(&meta.columns)?, !meta.key.is_empty(), !meta.key.is_empty() && meta.merge.is_empty());
     let opts = || ParquetReadOptions::default().schema(&schema);
     let path = |f: &DataFile| lake.full(&f.path);
-    // Only upsert tables care which file a row came from (the newest version of the key wins).
-    // Merge tables combine their rows in any order, so all their files read as one.
-    match keyed && meta.merge.is_empty() {
-        false if !meta.files.is_empty() => {
-            let df = ctx.read_parquet(meta.files.iter().map(path).collect::<Vec<_>>(), opts()).await?;
-            parts.push(if keyed { df.with_column("_ord", lit(0u64))? } else { df });
+    let mut files = vec![];
+    if upsert {
+        let mut by_ord: std::collections::BTreeMap<u64, Vec<String>> = Default::default();
+        for f in &meta.files {
+            by_ord.entry(f.ord).or_default().push(path(f));
         }
-        false => {}
-        // One read per generation of files: `_ord` puts a newer file above an older one, and both
-        // below the log segments that came after them.
-        true => {
-            let mut by_ord: std::collections::BTreeMap<u64, Vec<String>> = Default::default();
-            for f in &meta.files {
-                by_ord.entry(f.ord).or_default().push(path(f));
-            }
-            for (ord, files) in by_ord {
-                parts.push(ctx.read_parquet(files, opts()).await?.with_column("_ord", lit(ord << 32))?);
-            }
+        for (ord, paths) in by_ord.into_iter().rev() {
+            files.push(ctx.read_parquet(paths, opts()).await?.with_column("_ord", lit(ord << 32))?);
         }
+    } else if !meta.files.is_empty() {
+        let df = ctx.read_parquet(meta.files.iter().map(path).collect::<Vec<_>>(), opts()).await?;
+        files.push(if keyed { df.with_column("_ord", lit(0u64))? } else { df });
     }
     let hot = tail(lake, name, meta.tiered, upto, keyed).await?;
-    if !hot.is_empty() {
-        let mut fields = schema.fields().to_vec(); // the table's own schema, so every batch agrees
-        if keyed {
-            fields.push(Arc::new(Field::new("_ord", DataType::UInt64, false)));
-        }
-        let s = Arc::new(Schema::new(fields));
-        parts.push(ctx.read_batches(hot.into_iter().map(|b| b.with_schema(s.clone())).collect::<Result<Vec<_>, _>>()?)?);
+    if hot.is_empty() {
+        return Ok((None, files));
     }
-    Ok(match parts.into_iter().reduce(|a, b| a.union(b).expect("same schema")) {
-        Some(df) => df,
-        None if keyed => ctx.read_table(Arc::new(MemTable::try_new(schema, vec![vec![]])?))?.with_column("_ord", lit(0u64))?,
-        None => ctx.read_table(Arc::new(MemTable::try_new(schema, vec![vec![]])?))?,
-    })
+    let mut fields = schema.fields().to_vec(); // the table's own schema, so every batch agrees
+    if keyed {
+        fields.push(Arc::new(Field::new("_ord", DataType::UInt64, false)));
+    }
+    let s = Arc::new(Schema::new(fields));
+    Ok((Some(ctx.read_batches(hot.into_iter().map(|b| b.with_schema(s.clone())).collect::<Result<Vec<_>, _>>()?)?), files))
+}
+
+fn empty(ctx: &SessionContext, meta: &TableMeta) -> Result<DataFrame> {
+    let df = ctx.read_table(Arc::new(MemTable::try_new(schema(&meta.columns)?, vec![vec![]])?))?;
+    Ok(if meta.key.is_empty() { df } else { df.with_column("_ord", lit(0u64))? })
+}
+
+/// An upsert table as its users see it: the newest row of each key, deleted ones left out.
+/// Every file holds one row per key, so rather than group all rows by key, each source keeps the
+/// rows whose key no newer source has — an anti-join against the newer keys, which are usually
+/// few (the log tail and recent files) — and only the log tail is deduplicated itself. A table
+/// that is one compacted file reads as that file.
+pub async fn register_upsert(lake: &Lake, ctx: &SessionContext, name: &str, meta: &TableMeta) -> Result<()> {
+    let (tail, files) = sources(lake, ctx, name, meta, None).await?;
+    let mut names = vec![];
+    if let Some(t) = tail {
+        ctx.register_table(format!("__tail_{name}").as_str(), t.into_view())?;
+        let newest = latest_sql(meta, &format!("__tail_{name}"), false, true); // (delete markers still shadow)
+        ctx.register_table(format!("__s0_{name}").as_str(), ctx.sql(&newest).await?.into_view())?;
+        names.push(format!("__s0_{name}"));
+    }
+    for (i, f) in files.into_iter().enumerate() {
+        ctx.register_table(format!("__f{i}_{name}").as_str(), f.into_view())?;
+        names.push(format!("__f{i}_{name}"));
+    }
+    if names.is_empty() {
+        ctx.register_table(name, Arc::new(MemTable::try_new(schema(&meta.columns)?, vec![vec![]])?))?;
+        return Ok(());
+    }
+    let q = |c: &String| format!("\"{c}\"");
+    let cols = |p: &str| meta.columns.iter().map(|(c, _)| format!("{p}{}", q(c))).collect::<Vec<_>>().join(", ");
+    let keys = meta.key.iter().map(q).collect::<Vec<_>>().join(", ");
+    let on = meta.key.iter().map(|k| format!("s.{} = n.{}", q(k), q(k))).collect::<Vec<_>>().join(" AND ");
+    let parts: Vec<String> = names.iter().enumerate().map(|(i, src)| match i {
+        0 => format!("SELECT {} FROM \"{src}\"", cols("")),
+        _ => {
+            let newer = names[..i].iter().map(|n| format!("SELECT {keys} FROM \"{n}\"")).collect::<Vec<_>>().join(" UNION ALL ");
+            format!("SELECT {} FROM \"{src}\" s LEFT ANTI JOIN ({newer}) n ON {on}", cols("s."))
+        }
+    }).collect();
+    let deleted = meta.columns.iter().any(|(c, _)| c == "_deleted").then_some(" WHERE \"_deleted\" IS NOT TRUE").unwrap_or("");
+    let sql = format!("SELECT {} FROM ({}){deleted}", cols(""), parts.join(" UNION ALL "));
+    ctx.register_table(name, ctx.sql(&sql).await?.into_view())?;
+    Ok(())
 }
 
 /// Keyed tables as their users see them. Upsert tables: the latest row per key, without deleted
@@ -141,6 +185,10 @@ pub async fn session(lake: &Lake, sql: &str, except: &str) -> Result<SessionCont
     for (key, meta) in lake.cat.scan::<TableMeta>("t/", "t0").await? {
         let name = &key[2..];
         if !sql.contains(name) || name == except {
+            continue;
+        }
+        if !meta.key.is_empty() && meta.merge.is_empty() {
+            register_upsert(lake, &ctx, name, &meta).await?;
             continue;
         }
         let df = raw(lake, &ctx, name, &meta, None).await?;

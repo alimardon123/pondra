@@ -1,0 +1,42 @@
+upsert: 387 live keys after 12,000 random upserts/deletes, 6 compactions (s: 0.0, 0.0, 0.0, 0.0, 0.0, 0.0), 1 restart, 3,400 lookups (0 wrong) -> OK
+tiering: 12 rounds -> files {'events': 5, 'kv': 5, 'totals': 5}, untiered rows 0, rows {'events': 1200, 'kv': {'n': 200, 'v': 2400}, 'totals': 1200} -> OK
+fence: 2nd node joined as follower=True; takeover after 6.0s; stale leader's write rejected; it rejoined as follower; rows=[{'producer': 'a', 'n': 200}, {'producer': 'b', 'n': 200}] -> OK
+insert: first={'rows': 5} retry={'duplicate': True} summary={'groups': 5, 'n': 5000} -> OK
+reader: send -> visible on a separate read-only node: p50 7 ms, p99 97 ms
+run  1: kill-9=0 injected={'after_seg_put': 0, 'after_commit': 1, 'after_parquet_put': 2} events=9000/9000 unique=9000 task_output=4500/4500 views=exact -> OK
+run  2: kill-9=1 injected={'after_seg_put': 0, 'after_commit': 0, 'after_parquet_put': 0} events=9000/9000 unique=9000 task_output=4500/4500 views=exact -> OK
+run  3: kill-9=1 injected={'after_seg_put': 0, 'after_commit': 0, 'after_parquet_put': 1} events=9000/9000 unique=9000 task_output=4500/4500 views=exact -> OK
+run  4: kill-9=0 injected={'after_seg_put': 0, 'after_commit': 1, 'after_parquet_put': 1} events=9000/9000 unique=9000 task_output=4500/4500 views=exact -> OK
+run  5: kill-9=1 injected={'after_seg_put': 0, 'after_commit': 0, 'after_parquet_put': 3} events=9000/9000 unique=9000 task_output=4500/4500 views=exact -> OK
+{
+ "events_per_s": 1200,
+ "ack_ms_p50": 251,
+ "ack_ms_p99": 254,
+ "freshness_ms_p50": 153,
+ "freshness_ms_p99": 260,
+ "freshness_samples": 48,
+ "commits_per_s": 4.0,
+ "commit_ms_p50": 2,
+ "commit_ms_p95": 3,
+ "server_cores_used": 0.09
+}
+{
+ "upsert": "12,000 random upserts/deletes with compactions and a restart match the model exactly (387 live keys)",
+ "tiering": "12 rounds of writes and tiering: log drained, files bounded ({'events': 5, 'kv': 5, 'totals': 5}), every row exact",
+ "fence": "a frozen leader is replaced; when it wakes, its write is rejected (fenced) and it rejoins as a follower; nothing lost",
+ "insert": "bulk INSERT \u2026 SELECT writes Parquet directly; a retried job id is applied once",
+ "reader": "freshness on a separate read-only node: p50 7 ms, p99 97 ms",
+ "crash": "5/5 runs, 0 lost, 0 duplicated (events, streaming-task output, views); crashes survived: {'after_seg_put': 0, 'after_commit': 2, 'after_parquet_put': 7, 'kill -9': 3}",
+ "load": {
+  "events_per_s": 1200,
+  "ack_ms_p50": 251,
+  "ack_ms_p99": 254,
+  "freshness_ms_p50": 153,
+  "freshness_ms_p99": 260,
+  "freshness_samples": 48,
+  "commits_per_s": 4.0,
+  "commit_ms_p50": 2,
+  "commit_ms_p95": 3,
+  "server_cores_used": 0.09
+ }
+}

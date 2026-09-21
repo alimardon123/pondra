@@ -141,8 +141,16 @@ def crash():
     return f"{A.runs}/{A.runs} runs, 0 lost, 0 duplicated (events, streaming-task output, views); crashes survived: {totals}"
 
 
+def lookup_mismatch(k, model):
+    """How many of GET /lookup/kv/{k} and the SQL point query disagree with the model (a live
+    value, or nothing if deleted)."""
+    want = [model[k]] if k in model else []
+    rows = [call(A.port, "GET", f"/lookup/kv/{k}"), sql(A.port, f"SELECT id, v FROM kv WHERE id = {k}")]
+    return sum([r["v"] for r in rs] != want for rs in rows)
+
+
 def upsert():
-    lake, model, tiers = new_lake(), {}, []
+    lake, model, tiers, bad_lookups = new_lake(), {}, [], 0
     node = Node(lake, A.port, flush_ms=50, tier_secs=0, retain_secs=0).start()
     call(A.port, "POST", "/tables/kv", json.dumps({"columns": [["id", "Int64"], ["v", "Int64"], ["_deleted", "Boolean"]], "key": ["id"]}).encode())
     for seq in range(1, 61):
@@ -154,6 +162,8 @@ def upsert():
             else:
                 v = random.randrange(10**6); ops.append({"id": k, "v": v, "_deleted": False}); model[k] = v
         call(A.port, "POST", f"/append/kv?producer=u&seq={seq}", "".join(json.dumps(o) + "\n" for o in ops).encode())
+        for k in random.sample(range(500), 20):  # the /lookup fast path agrees with the model too
+            bad_lookups += lookup_mismatch(k, model)
         if seq % 10 == 0:
             t0 = time.time(); call(A.port, "POST", "/tier", timeout=600)  # compaction in between
             tiers.append(time.time() - t0)
@@ -161,9 +171,11 @@ def upsert():
             node.kill(); node.start()  # restart in the middle
     got = {r["id"]: r["v"] for r in sql(A.port, "SELECT id, v FROM kv ORDER BY id")}
     live = sql(A.port, "SELECT count(*) AS n FROM kv")[0]["n"]
+    bad_lookups += sum(lookup_mismatch(k, model) for k in range(500))
     node.kill()
-    ok = got == model
-    print(f"upsert: {len(model)} live keys after 12,000 random upserts/deletes, 6 compactions (s: {', '.join(f'{t:.1f}' for t in tiers)}), 1 restart -> {'OK' if ok else 'FAIL'}")
+    ok = got == model and bad_lookups == 0
+    print(f"upsert: {len(model)} live keys after 12,000 random upserts/deletes, 6 compactions (s: {', '.join(f'{t:.1f}' for t in tiers)}), "
+          f"1 restart, 3,400 lookups ({bad_lookups} wrong) -> {'OK' if ok else 'FAIL'}")
     if not ok:
         sys.exit(1)
     return f"12,000 random upserts/deletes with compactions and a restart match the model exactly ({live} live keys)"

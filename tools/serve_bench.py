@@ -3,7 +3,7 @@
 and how many per second, while new rows keep arriving?
   serve_bench.py [--keys 2000000] [--nodes 1] [--secs 5] [--threads 1,8,32]
 Prints one JSON line per measurement."""
-import argparse, io, json, os, random, statistics, sys, threading, time
+import argparse, io, json, os, random, shutil, statistics, subprocess, sys, tempfile, threading, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import harness
 from harness import Node, call, sql
@@ -11,9 +11,26 @@ from harness import Node, call, sql
 A = None
 
 
-def measure(port, make_query, threads, secs):
+def loadgen():
+    """The Go load generator (tools/loadgen.go), built once if Go is installed; else None."""
+    exe = os.path.join(tempfile.gettempdir(), "pondra-loadgen")
+    if not os.path.exists(exe) and shutil.which("go"):
+        subprocess.run(["go", "build", "-o", exe, os.path.join(os.path.dirname(os.path.abspath(__file__)), "loadgen.go")], check=True)
+    return exe if os.path.exists(exe) else None
+
+
+def measure(port, make_query, threads, secs, path="/sql"):
     """Run queries from `threads` clients for `secs`; return p50/p99/max ms and queries per second.
-    `make_query` returns either SQL, or ("GET", path) for the /lookup fast path."""
+    `make_query` returns either SQL, or ("GET", path) for the /lookup fast path. With Go available
+    the clients are tools/loadgen.go (the Python client tops out near 2k requests/s); then a
+    `{k}` in the query becomes a random key."""
+    exe = loadgen()
+    if exe:
+        q = make_query()
+        args = ["-url", f"http://127.0.0.1:{port}{q[1]}"] if isinstance(q, tuple) else ["-url", f"http://127.0.0.1:{port}{path}", "-body", q]
+        out = subprocess.run([exe, *args, "-keys", str(A.keys), "-c", str(threads), "-secs", str(secs)], capture_output=True, text=True, check=True)
+        r = json.loads(out.stdout)
+        return {"threads": threads, "queries": r["requests"], "qps": r["qps"], "errors": r["errors"], "p50_ms": round(r["p50_ms"], 2), "p99_ms": round(r["p99_ms"], 2), "max_ms": round(r["max_ms"], 1)}
     stop, lat, errs = threading.Event(), [], [0]
 
     def run():
@@ -22,7 +39,7 @@ def measure(port, make_query, threads, secs):
             q = make_query()
             t = time.time()
             try:
-                call(port, "GET", q[1]) if isinstance(q, tuple) else sql(port, q)
+                call(port, "GET", q[1]) if isinstance(q, tuple) else call(port, "POST", path, q.encode())
             except Exception:
                 errs[0] += 1
             mine.append((time.time() - t) * 1000)
@@ -39,7 +56,7 @@ def measure(port, make_query, threads, secs):
 
 def main():
     lake = harness.new_lake()
-    nodes = [Node(lake, A.port + i, reader=(i > 0), tier_secs=10).start() for i in range(A.nodes)]
+    nodes = [Node(lake, A.port + i, reader=(i > 0)).start() for i in range(A.nodes)]
     p = nodes[0].port
     call(p, "POST", "/tables/kv", json.dumps({"columns": [["id", "Int64"], ["name", "Utf8"], ["amount", "Int64"], ["ts", "Int64"]], "key": ["id"]}).encode())
     import pyarrow as pa, pyarrow.ipc
@@ -60,15 +77,19 @@ def main():
     out = {"keys": A.keys, "nodes": A.nodes, "load_s": load_s}
     print(json.dumps({**out, "stats": {k: files[k] for k in ("role", "hwm") if k in files}}), flush=True)
 
-    point = lambda: f"SELECT id, name, amount FROM kv WHERE id = {random.randrange(A.keys)}"
-    fast = lambda: ("GET", f"/lookup/kv/{random.randrange(A.keys)}")
+    go = loadgen() is not None  # ({k}: a random key per request, drawn by the Go client)
+    key = lambda: "{k}" if go else str(random.randrange(A.keys))
+    point = lambda: f"SELECT id, name, amount FROM kv WHERE id = {key()}"
+    fast = lambda: ("GET", f"/lookup/kv/{key()}")
     dash = lambda: "SELECT count(*) AS n, sum(amount) AS total FROM kv WHERE amount > 900"
+    fresh_dash = lambda: f"SELECT count(*) AS n, sum(amount) AS total FROM kv WHERE amount > ({key()} % 1000)"  # a new query each time
     for threads in [int(x) for x in A.threads.split(",")]:
         for name, q in (("point_lookup_sql", point), ("point_lookup", fast)):
             r = measure(nodes[-1].port, q, threads, A.secs)
             print(json.dumps({**out, "query": name, **r}), flush=True)
-    r = measure(nodes[-1].port, dash, 1, A.secs)
-    print(json.dumps({**out, "query": "dashboard_agg", **r}), flush=True)
+    for name, q, threads in (("dashboard_agg_uncached", fresh_dash, 1), ("dashboard_agg_uncached", fresh_dash, 8), ("dashboard_agg_repeated", dash, 32)):
+        r = measure(nodes[-1].port, q, threads, A.secs)
+        print(json.dumps({**out, "query": name, **r}), flush=True)
 
     # …and the same lookups while writes keep landing (the log tail is never empty)
     stop = threading.Event()
@@ -88,6 +109,10 @@ def main():
     time.sleep(2)
     r = measure(nodes[-1].port, fast, 8, A.secs)
     print(json.dumps({**out, "query": "point_lookup_while_writing", **r}), flush=True)
+    r = measure(nodes[-1].port, dash, 32, A.secs)
+    print(json.dumps({**out, "query": "dashboard_agg_repeated_while_writing", **r}), flush=True)
+    r = measure(nodes[-1].port, dash, 32, A.secs, path="/sql?stale_ms=1000")
+    print(json.dumps({**out, "query": "dashboard_agg_repeated_while_writing_stale_1s", **r}), flush=True)
     stop.set()
     [nd.kill() for nd in nodes]
 
@@ -97,7 +122,7 @@ if __name__ == "__main__":
     ap.add_argument("--keys", type=int, default=2_000_000)
     ap.add_argument("--nodes", type=int, default=1)
     ap.add_argument("--secs", type=float, default=5)
-    ap.add_argument("--threads", default="1,8,32")
+    ap.add_argument("--threads", default="1,8,32,64")
     ap.add_argument("--port", type=int, default=18300)
     ap.add_argument("--s3", action="store_true")
     A = harness.A = ap.parse_args()

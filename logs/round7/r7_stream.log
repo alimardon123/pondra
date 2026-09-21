@@ -1,0 +1,1 @@
+{"engine": "pondra", "mode": "stream", "rows": 10000000, "startup_s": 0.023, "ingest_s": 3.08, "correct": true, "processed": 10000000, "secs": 4.23, "rows_per_s": 2366416, "peak_rss_mb": 609}

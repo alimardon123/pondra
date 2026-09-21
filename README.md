@@ -1,6 +1,6 @@
 # Pondra: a streamhouse in one binary
 
-One Rust binary (~3,100 lines) that ingests streams, stores them as an open lakehouse (Parquet
+One Rust binary (~3,650 lines) that ingests streams, stores them as an open lakehouse (Parquet
 files with a Delta Lake log, on object storage), keeps SQL views and streaming state up to date,
 answers SQL, and scales out by starting more copies of itself on the same bucket. Object storage is the only state: no
 Postgres, no ZooKeeper, no Kafka, no JVM. Runs on a local directory or any S3-compatible store
@@ -73,8 +73,8 @@ differences entirely.
 | Streaming SQL with no lag | `POST /views/{name}` with SQL. Runs on every flush of new rows, commits with them. With GROUP BY it keeps per-key aggregates (sum/count/min/max) that any number of nodes update at once | Flink SQL jobs + keyed state |
 | General stateful streaming | `POST /tasks/{name}` `{"source","target","sql"[, "key","shards","shard_by"]}`: runs as soon as rows commit, exactly-once, shards spread over nodes | Flink jobs |
 | Push | `GET /watch/{t}`: new rows as NDJSON the moment they commit | Kafka consumers |
-| SQL | `POST /sql[?format=table][&after=<seg>]`: files ∪ log tail, one snapshot. Large tables run SPMD across all nodes (`&spread=1` forces, `0` disables) | Trino / Spark SQL |
-| Serving reads | `GET /lookup/{t}/{key}`: the current row of one key, planned as a lookup (one thread, bloom-filtered, sorted files) rather than a scan | Redis / Postgres in front of the lake |
+| SQL | `POST /sql[?format=json\|table\|arrow][&after=<seg>][&stale_ms=N]`: files ∪ log tail, one snapshot. Large tables run SPMD across all nodes (`&spread=1` forces, `0` disables). Repeated queries are answered from a result cache until the next commit (`stale_ms`: accept one up to N ms old) | Trino / Spark SQL / Databricks SQL |
+| Serving reads | `GET /lookup/{t}/{key}` (or SQL `SELECT … WHERE key = …`): the current row of one key without SQL planning — log tail, then the files newest-first, each narrowed to one cached, key-sorted row group: ~0.2 ms, ~20k/s on two cores | Redis / Postgres / Lakehouse//RT in front of the lake |
 | Batch ELT, exactly-once | `POST /insert/{t}?job=` with a `SELECT`: straight to Parquet; a retried job is a no-op | Spark batch jobs |
 | Maintenance | automatic and spread over the nodes: tiering to Parquet, compaction, retention, orphan cleanup, backpressure | Spark OPTIMIZE / VACUUM |
 | Open lake | every table is published as Delta Lake (`data/{t}/_delta_log`) each tiering round, for engines that don't know Pondra | a separate Delta/Iceberg writer |
@@ -92,6 +92,7 @@ differences entirely.
 | `tier.rs` | Tiering, merging small files and compaction: the leader decides and commits, the data work is dealt to the nodes as jobs. Keyed tables are LSM-like — each round folds the log tail into a new file, and files are compacted once 8 pile up. Retention and orphan cleanup |
 | `query.rs` | Hot+cold snapshot per query (DataFusion) |
 | `cache.rs` | For lakes on object storage: an in-memory read cache and a local SSD tier (write-through, read-through, prefetched from the commit stream, warmed at start) |
+| `serve.rs` | Serving reads: key lookups without SQL (tail, then files newest-first, cached key-sorted row groups, binary search), and SQL point queries routed to them |
 | `delta.rs` | Delta Lake publishing: a JSON commit per change to a table's files, Parquet checkpoints, crash-safe (derived from the catalog, put-if-absent) |
 | `server.rs`, `main.rs` | HTTP API (axum) and CLI |
 
@@ -110,7 +111,8 @@ python3 tools/cluster.py latency [--load 4]     # event -> view row pushed to an
 python3 tools/cluster.py spread                 # distributed queries == single-node results
 python3 tools/cluster.py race | isolate | split # elections, cut-off follower, where the CPU goes
 python3 tools/bench/run.py batch 20000000       # vs Spark and Flink (ENGINES=pondra,spark,flink)
-python3 tools/serve_bench.py --keys 2000000     # point lookups and dashboard queries, p50/p99/QPS
+python3 tools/serve_bench.py --keys 2000000     # point lookups and dashboard queries, p50/p99/QPS (uses tools/loadgen.go if Go is installed)
+python3 tools/bench/tpch.py --data sf1          # TPC-H (tpchgen-cli) on Pondra, DuckDB and Spark
 python3 tools/sizes.py                          # storage bytes per event
 python3 tools/delta_check.py [--s3]             # delta-rs, Polars and DuckDB read the Delta logs == Pondra
 python3 tools/newuser_bench.py [--s3]           # a new client's first query, a new node's, write→visible

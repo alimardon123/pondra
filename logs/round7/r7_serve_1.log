@@ -1,0 +1,15 @@
+{"keys": 2000000, "nodes": 1, "load_s": 3.1, "stats": {"role": "leader", "hwm": 8}}
+{"keys": 2000000, "nodes": 1, "load_s": 3.1, "query": "point_lookup_sql", "threads": 1, "queries": 17586, "qps": 3517, "errors": 0, "p50_ms": 0.27, "p99_ms": 0.5, "max_ms": 18.2}
+{"keys": 2000000, "nodes": 1, "load_s": 3.1, "query": "point_lookup", "threads": 1, "queries": 21173, "qps": 4234, "errors": 0, "p50_ms": 0.22, "p99_ms": 0.41, "max_ms": 4.8}
+{"keys": 2000000, "nodes": 1, "load_s": 3.1, "query": "point_lookup_sql", "threads": 8, "queries": 57050, "qps": 11410, "errors": 0, "p50_ms": 0.63, "p99_ms": 1.76, "max_ms": 7.3}
+{"keys": 2000000, "nodes": 1, "load_s": 3.1, "query": "point_lookup", "threads": 8, "queries": 73822, "qps": 14764, "errors": 0, "p50_ms": 0.5, "p99_ms": 1.37, "max_ms": 5.9}
+{"keys": 2000000, "nodes": 1, "load_s": 3.1, "query": "point_lookup_sql", "threads": 32, "queries": 77177, "qps": 15435, "errors": 0, "p50_ms": 1.93, "p99_ms": 4.83, "max_ms": 12.5}
+{"keys": 2000000, "nodes": 1, "load_s": 3.1, "query": "point_lookup", "threads": 32, "queries": 99602, "qps": 19920, "errors": 0, "p50_ms": 1.51, "p99_ms": 3.79, "max_ms": 7.4}
+{"keys": 2000000, "nodes": 1, "load_s": 3.1, "query": "point_lookup_sql", "threads": 64, "queries": 78944, "qps": 15788, "errors": 0, "p50_ms": 3.74, "p99_ms": 9.47, "max_ms": 25.2}
+{"keys": 2000000, "nodes": 1, "load_s": 3.1, "query": "point_lookup", "threads": 64, "queries": 100370, "qps": 20074, "errors": 0, "p50_ms": 2.97, "p99_ms": 7.42, "max_ms": 16.5}
+{"keys": 2000000, "nodes": 1, "load_s": 3.1, "query": "dashboard_agg_uncached", "threads": 1, "queries": 742, "qps": 148, "errors": 0, "p50_ms": 6.46, "p99_ms": 10.72, "max_ms": 13.6}
+{"keys": 2000000, "nodes": 1, "load_s": 3.1, "query": "dashboard_agg_uncached", "threads": 8, "queries": 1023, "qps": 204, "errors": 0, "p50_ms": 36.99, "p99_ms": 100.22, "max_ms": 133.8}
+{"keys": 2000000, "nodes": 1, "load_s": 3.1, "query": "dashboard_agg_repeated", "threads": 32, "queries": 116659, "qps": 23331, "errors": 0, "p50_ms": 1.12, "p99_ms": 5.08, "max_ms": 18.2}
+{"keys": 2000000, "nodes": 1, "load_s": 3.1, "query": "point_lookup_while_writing", "threads": 8, "queries": 14635, "qps": 2927, "errors": 0, "p50_ms": 2.24, "p99_ms": 8.61, "max_ms": 94.4}
+{"keys": 2000000, "nodes": 1, "load_s": 3.1, "query": "dashboard_agg_repeated_while_writing", "threads": 32, "queries": 1152, "qps": 230, "errors": 0, "p50_ms": 140.73, "p99_ms": 609.72, "max_ms": 611.0}
+{"keys": 2000000, "nodes": 1, "load_s": 3.1, "query": "dashboard_agg_repeated_while_writing_stale_1s", "threads": 32, "queries": 54415, "qps": 10883, "errors": 0, "p50_ms": 2.03, "p99_ms": 23.54, "max_ms": 276.0}

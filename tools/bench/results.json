@@ -53,3 +53,7 @@
 {"engine": "pondra", "mode": "live", "rows": 60, "startup_s": 0.066, "events": 47020000, "rows_per_s": 783667, "visible_ms_p50": 49, "visible_ms_p99": 234, "peak_rss_mb": 1390}
 {"engine": "pondra", "mode": "live", "rows": 60, "startup_s": 0.023, "events": 2000000, "rows_per_s": 33333, "visible_ms_p50": 18, "visible_ms_p99": 36, "peak_rss_mb": 345}
 {"engine": "pondra", "mode": "live", "rows": 60, "startup_s": 0.023, "events": 329700000, "rows_per_s": 5495000, "visible_ms_p50": null, "visible_ms_p99": null, "peak_rss_mb": 1345}
+{"engine": "pondra", "mode": "batch", "rows": 20000000, "startup_s": 0.065, "write_s": 3.28, "q1_scan_agg": [0.049, 0.001], "q2_filter_group": [0.143, 0.001], "q3_high_card_group": [0.586, 0.001], "q4_count_distinct": [0.514, 0.001], "q5_join": [0.26, 0.001], "q6_time_bucket": [0.254, 0.001], "peak_rss_mb": 293}
+{"engine": "pondra", "mode": "stream", "rows": 10000000, "startup_s": 0.023, "ingest_s": 3.08, "correct": true, "processed": 10000000, "secs": 4.23, "rows_per_s": 2366416, "peak_rss_mb": 609}
+{"engine": "pondra", "mode": "etl", "rows": 10000000, "startup_s": 0.024, "ingest_s": 3.0, "processed": 10000000, "secs": 4.14, "rows_per_s": 2415337, "peak_rss_mb": 477}
+{"engine": "pondra", "mode": "live", "rows": 60, "startup_s": 0.023, "events": 164320000, "rows_per_s": 2738667, "visible_ms_p50": 229, "visible_ms_p99": 1401, "peak_rss_mb": 1322}
