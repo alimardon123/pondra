@@ -160,13 +160,55 @@ pub async fn table_view(lake: &Lake, ctx: &SessionContext, name: &str, meta: &Ta
     if !meta.key.is_empty() && meta.merge.is_empty() {
         return upsert_view(lake, ctx, name, meta).await;
     }
-    let df = raw(lake, ctx, name, meta, None).await?;
     if meta.key.is_empty() {
-        return Ok(df.into_view());
+        return Ok(Arc::new(Pruned { lake: lake.arc(), name: name.into(), meta: meta.clone(), manifests: None, upto: None, schema: schema(&meta.columns)?, share: None }));
     }
+    let df = raw(lake, ctx, name, meta, None).await?;
     let aux = lake.session();
     aux.register_table("__raw", df.into_view())?;
     Ok(aux.sql(&current_sql(lake, meta, "__raw")).await?.into_view())
+}
+
+/// An append table (or a distributed query's slice of one) that picks its files per query: those
+/// whose min/max can match the query's filters, from its inline files and, through the manifest
+/// list, its sealed ones (`manifest.rs`). Plus the log tail, which always counts.
+pub struct Pruned {
+    pub lake: Arc<Lake>,
+    pub name: String,
+    pub meta: TableMeta,
+    pub manifests: Option<Vec<crate::manifest::Manifest>>, // a slice's share; None: the table's list
+    pub upto: Option<u64>,                                  // the log up to this segment (None: the latest)
+    pub schema: SchemaRef,
+    pub share: Option<(u64, u64)>, // a distributed query's slice of it, and the whole table's (rows, bytes)
+}
+
+impl std::fmt::Debug for Pruned {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { write!(f, "Pruned({})", self.name) }
+}
+
+#[async_trait::async_trait]
+impl TableProvider for Pruned {
+    fn schema(&self) -> SchemaRef { self.schema.clone() }
+    fn table_type(&self) -> datafusion::datasource::TableType { datafusion::datasource::TableType::Base }
+
+    fn supports_filters_pushdown(&self, filters: &[&Expr]) -> datafusion::error::Result<Vec<datafusion::logical_expr::TableProviderFilterPushDown>> {
+        Ok(vec![datafusion::logical_expr::TableProviderFilterPushDown::Inexact; filters.len()]) // (they choose files; rows are filtered above)
+    }
+
+    async fn scan(&self, _: &dyn datafusion::catalog::Session, projection: Option<&Vec<usize>>, filters: &[Expr], _: Option<usize>) -> datafusion::error::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+        let e = |e: anyhow::Error| datafusion::error::DataFusionError::External(e.into());
+        let files = crate::manifest::pruned(&self.lake, &self.meta, self.manifests.as_deref(), filters, &self.schema).await.map_err(e)?;
+        let meta = TableMeta { files, sealed: None, ..self.meta.clone() };
+        let ctx = self.lake.session();
+        let df = raw(&self.lake, &ctx, &self.name, &meta, self.upto).await.map_err(e)?;
+        let df = match projection {
+            Some(p) => df.select_columns(&p.iter().map(|&i| self.schema.field(i).name().as_str()).collect::<Vec<_>>())?,
+            None => df,
+        };
+        let plan = df.create_physical_plan().await?;
+        let Some((rows, bytes)) = self.share else { return Ok(plan) };
+        Ok(Arc::new(crate::spmd::ShareExec::new(plan, &self.name, rows, bytes)?))
+    }
 }
 
 /// Keyed tables as their users see them. Upsert tables: the latest row per key, without deleted

@@ -1,6 +1,6 @@
 # Pondra: a streamhouse in one binary
 
-One Rust binary (~7,300 lines) that ingests streams, stores them as a lakehouse (Parquet files
+One Rust binary (~8,800 lines) that ingests streams, stores them as a lakehouse (Parquet files
 plus a catalog, on object storage; Delta Lake and Iceberg metadata for other engines on request),
 keeps SQL views and streaming state up to date, answers SQL, and scales out by starting more
 copies of itself on the same bucket. Object storage is the only state: no Postgres, no
@@ -35,6 +35,9 @@ pip install ./python && python -c "import pondra; print(pondra.connect('http://1
 # Kafka producers and consumers (a topic is a table), and engines attaching the lake by URL:
 ./target/release/pondra serve --dir ./lake --kafka 0.0.0.0:9092   # bootstrap.servers=host:9092
 #   PyIceberg / DuckDB / Spark: an Iceberg REST catalog at http://host:8080 (namespace "default")
+
+# Arrow Flight and Flight SQL: ADBC / JDBC drivers and pyarrow, Arrow in and out
+./target/release/pondra serve --dir ./lake --flight 0.0.0.0:8815  # adbc_driver_flightsql.dbapi.connect("grpc://host:8815")
 
 # AI agents over MCP (Claude Code, Claude Desktop, Cursor, …): every node serves POST /mcp
 claude mcp add --transport http pondra http://127.0.0.1:8080/mcp   # add --header "Authorization: Bearer $TOKEN" with tokens on
@@ -75,6 +78,9 @@ Useful `serve` flags (give every node the same ones: any of them may lead):
 - `--pg 0.0.0.0:5432`: also speak the Postgres protocol.
 - `--kafka 0.0.0.0:9092`: also speak the Kafka protocol (`--kafka-advertise host:port` if clients
   must reach this node at another address than `--addr`'s host).
+- `--flight 0.0.0.0:8815`: also speak Arrow Flight and Flight SQL.
+- `--memory-gb 24`: memory for queries (default: half the machine's); sorts, aggregations and
+  joins that need more spill to the temp directory.
 - `--read-token`, `--write-token`, `--admin-token`: access control (none set = open). Over
   Postgres the user name picks the role (`reader`, `writer`, `admin`) and the password is its
   token. Whatever the token, SQL sent to a node never touches the node's own disk (no `COPY …
@@ -126,7 +132,7 @@ differences entirely.
 | Need | How (HTTP API, on any node) | Replaces |
 |---|---|---|
 | Stream ingest, exactly-once | `POST /append/{t}?producer=&seq=` with NDJSON or an Arrow IPC stream | Kafka / Fluss |
-| Tables | SQL `CREATE TABLE t (id BIGINT PRIMARY KEY, …) WITH (publish = 'delta,iceberg', cluster_by = 'user', merge = 'total:sum', ttl = 'ts:86400')`, or `POST /tables/{t}` with the same as JSON. A key = upsert table; `merge` = merge table; `cluster_by` sorts an append table's files for fast filters; `ttl` expires a keyed table's rows | Delta/Iceberg MERGE, liquid clustering, Fluss PK tables with TTL |
+| Tables | SQL `CREATE TABLE t (id BIGINT PRIMARY KEY, …) WITH (publish = 'delta,iceberg', cluster_by = 'user', partition_by = 'day(ts)', merge = 'total:sum', ttl = 'ts:86400')`, or `POST /tables/{t}` with the same as JSON. A key = upsert table; `merge` = merge table; `cluster_by` sorts an append table's files for fast filters; `partition_by` (a column, or year/month/day/hour of a timestamp) keeps one partition per file; `ttl` expires a keyed table's rows. Every file's column ranges are kept, and past 128 files a table's file list goes into manifests: a table of a million files commits as fast as one of ten, and queries open only the files their filters can match | Delta/Iceberg MERGE, partitioning, liquid clustering, Fluss PK tables with TTL |
 | SQL writes | `INSERT … SELECT/VALUES`, `UPDATE … SET … WHERE`, `DELETE … WHERE` (keyed tables) on any node, over Postgres, or with `pondra sql` on any machine | Spark SQL DML, Fluss 1.0's UPDATE/DELETE by condition |
 | Postgres protocol | `--pg`: psql, psycopg 2/3, asyncpg, SQLAlchemy + pandas (tested); JDBC/BI tools by the same protocol | a Postgres-compatible serving layer |
 | Python | `import pondra`: `sql()` → pandas / Polars / Arrow, `append()` exactly-once, `watch()`, `lookup()` | PySpark / PyFlink clients for the common jobs |
@@ -134,12 +140,14 @@ differences entirely.
 | Schema evolution | `ALTER TABLE t ADD COLUMN c TYPE` (any node, Postgres, `pondra sql`); old rows read it as null; Delta and Iceberg follow | Delta/Iceberg schema evolution |
 | Event-time windows | `POST /views/{v}?window=w&size_secs=60&lateness_secs=10` over `GROUP BY date_bin(…) AS w`: the view updates live; `{v}_final` gets each window once, final, when the watermark passes it | Flink tumbling windows with watermarks |
 | JSON | `json_get(col, 'a', 0)`, `json_get_str/int/float/bool`, `json_contains`, `json_length`, `->`, `->>` | VARIANT / JSON functions |
+| Arrow Flight | `--flight`: Flight SQL for ADBC and JDBC drivers (queries, writes, `adbc_ingest`, catalog); pyarrow `DoPut` to `[table, producer, first seq]` (exactly-once, acks as batches commit), `DoGet` with `{"sql": …}`, or a table's log as a columnar stream with only the columns asked for (`{"table": t, "after": N, "columns": [...], "follow": true}`) | Arrow Flight SQL servers (Dremio, InfluxDB 3), Fluss's columnar log |
 | AI agents | `POST /mcp` (the Model Context Protocol): tools `list_tables`, `query`, `write`, `changes`, under the same tokens | an MCP server in front of the warehouse |
 | Vector search | `FLOAT[]` embedding columns; `ORDER BY cosine_distance(emb, [...]) LIMIT k` (also `inner_product`, `array_distance`), exact, over the log and the files; Postgres array parameters work | a vector database next to the lake; Flink `VECTOR_SEARCH` |
 | Streaming SQL with no lag | `POST /views/{name}` with SQL. Runs on every flush of new rows, commits with them. With GROUP BY it keeps per-key aggregates (sum/count/min/max) that any number of nodes update at once | Flink SQL jobs + keyed state |
 | General stateful streaming | `POST /tasks/{name}` `{"source","target","sql"[, "key","shards","shard_by"]}`: runs as soon as rows commit, exactly-once, shards spread over nodes | Flink jobs |
 | Push and change feeds | `GET /watch/{t}`: new rows as NDJSON the moment they commit (upserts and deletes of keyed tables included); `?after=N` replays from N, as far back as `--changelog-secs` keeps the log | Kafka consumers, Fluss `$changelog` |
-| SQL | `POST /sql[?format=json\|table\|arrow][&after=<seg>][&stale_ms=N]`: files ∪ log tail, one snapshot. Large tables run SPMD across all nodes (`&spread=1` forces, `0` disables). Repeated queries are answered from a result cache until the next commit (`stale_ms`: accept one up to N ms old) | Trino / Spark SQL / Databricks SQL |
+| SQL | `POST /sql[?format=json\|table\|arrow][&after=<seg>][&stale_ms=N]`: files ∪ log tail, one snapshot. Large tables run SPMD across all nodes, with shuffles for many-group aggregations and big joins (`&spread=1` forces, `0` disables). Queries beyond `--memory-gb` spill. Repeated queries are answered from a result cache until the next commit (`stale_ms`: accept one up to N ms old) | Trino / Spark SQL / Databricks SQL |
+| Metrics | `GET /metrics` (Prometheus): rows in, queries and their time, spread and shuffled queries, files scanned and skipped, memory, commit latency, per-table files, rows and bytes | a metrics exporter |
 | Serving reads | `GET /lookup/{t}/{key}` (or SQL `SELECT … WHERE key = …`): the current row of one key without SQL planning — log tail, then the files newest-first, each narrowed to one cached, key-sorted row group: ~0.2 ms, ~20k/s on two cores | Redis / Postgres / Lakehouse//RT in front of the lake |
 | Batch ELT, exactly-once | `POST /insert/{t}?job=` with a `SELECT` (the receiving node does the work), or `pondra sql "INSERT INTO t SELECT …"` from any machine: straight to Parquet; a retried job is a no-op | Spark batch jobs |
 | Maintenance | automatic and spread over the nodes: tiering to Parquet, compaction, retention, orphan cleanup, backpressure | Spark OPTIMIZE / VACUUM |
@@ -155,7 +163,10 @@ differences entirely.
 | `cluster.rs` | Leader election through the bucket (put-if-absent `cluster/term/{n}`), HTTP heartbeats, takeover after 5 s if no peer still hears the leader; a replaced leader is fenced by the catalog and rejoins. A liveness mark in the bucket lets a node on an idle lake lead at once |
 | `views.rs` | Inline views; GROUP BY views become merge tables |
 | `tasks.rs` | Streaming tasks: output + progress commit together, only if progress is unchanged (compare-and-swap) |
-| `spmd.rs` | Distributed queries: every node runs the same plan over its slice up to the first exchange; the receiving node finishes it |
+| `spmd.rs` | Distributed queries: every node runs the same plan over its slice; small tables are read whole (broadcast). Up to the first gather, or through shuffles: each hash exchange becomes a step in which every node splits its output by hash, one bucket per node, and fetches its own bucket from every node. The receiving node finishes the plan |
+| `manifest.rs` | Table metadata that stays small: per-file column ranges, the oldest files sealed into immutable manifests behind one list object, pruning of manifests and files by a query's filters |
+| `flight.rs` | Arrow Flight and Flight SQL: exactly-once `DoPut`, SQL and the log as columnar streams, ADBC's statements, ingest and catalog |
+| `metrics.rs` | `GET /metrics` in Prometheus' format |
 | `tier.rs` | Tiering, merging small files and compaction: the leader decides and commits, the data work is dealt to the nodes as jobs. Keyed tables are LSM-like — each round folds the log tail into a new file, and files are compacted once 8 pile up. Retention and orphan cleanup |
 | `query.rs` | Hot+cold snapshot per query (DataFusion) |
 | `cache.rs` | For lakes on object storage: an in-memory read cache and a local SSD tier (write-through, read-through, prefetched from the commit stream, warmed at start) |
@@ -180,6 +191,10 @@ python3 tools/harness.py all [--s3]             # upsert, fence (split brain), i
 python3 tools/harness.py clients                # SQL writes, Python client, Postgres drivers, tokens, inbox, attached lakes, vectors, MCP
 python3 tools/mcp_client.py --url http://127.0.0.1:8080/mcp   # the official MCP SDK against a node (pip install mcp)
 python3 tools/harness.py kafka | alter | windows   # Kafka clients, ALTER TABLE under load, windows emitted once
+python3 tools/harness.py scale | flight         # partitions, manifests, shuffles, memory limits; Arrow Flight + ADBC
+python3 tools/metadata_bench.py [--files 1000000]   # a table with a million files: commits, pruning, 3 nodes
+python3 tools/flight_bench.py                   # Arrow Flight in, out, and the log as a stream
+python3 tools/cloud/bench.py --nodes …          # a cluster on several machines (tools/cloud/README.md)
 python3 tools/kafka_bench.py                    # Kafka ingest throughput and latency on 3 nodes
 python3 tools/keyed_bench.py                    # keyed-table compaction: bytes written, correctness
 python3 tools/harness.py crash --runs 20        # kill -9 + injected crashes (PONDRA_CRASH=point:prob)
@@ -208,8 +223,11 @@ bucket to its newest lakes.
 
 ## Not yet
 
-- Shuffles in distributed queries: big-to-big joins run on one node.
-- Partitioned tables; clustering across files; copy-on-write DELETE for append tables.
+- Shuffle buckets and big results are held in memory (not streamed or spilled); distributed
+  queries are one SELECT with inner joins. Nothing has run on several machines yet
+  (`tools/cloud/` is the kit).
+- Publishing a huge table to Delta/Iceberg rewrites a manifest of every file each time.
+- Clustering across files; copy-on-write DELETE for append tables.
 - Per-table grants, quotas and TLS (tokens are per role; put a TLS proxy in front); JDBC and BI
   tools untested here.
 - Kafka: one partition per topic, no transactions; offsets are positions in the log (increasing,

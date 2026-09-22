@@ -100,7 +100,7 @@ impl Log {
         let (tx, mut rx) = mpsc::channel::<Append>(100_000);
         let (to, slots) = (Arc::new(to), Arc::new(tokio::sync::Semaphore::new(FLUSHES_IN_FLIGHT)));
         tokio::spawn(async move {
-            let mut last = tokio::time::Instant::now();
+            let (mut last, mut turn) = (tokio::time::Instant::now(), None);
             while let Some(first) = rx.recv().await {
                 // While all flush slots are busy, appends queue up; then they all go in one flush.
                 let slot = slots.clone().acquire_owned().await.expect("never closed");
@@ -110,8 +110,10 @@ impl Log {
                 }
                 last = tokio::time::Instant::now();
                 let (lake, to) = (lake.clone(), to.clone());
+                let (done, next) = oneshot::channel();
+                let turn = std::mem::replace(&mut turn, Some(next));
                 tokio::spawn(async move {
-                    send(&lake, &to, pending).await;
+                    send(&lake, &to, pending, turn, done).await;
                     drop(slot);
                 });
             }
@@ -128,18 +130,34 @@ impl Log {
     /// order, so a client can have several batches in flight (the Kafka protocol does).
     pub async fn queue(&self, table: String, src: Src, batch: RecordBatch) -> Result<impl std::future::Future<Output = Result<Ack>> + use<>> {
         let (ack, rx) = oneshot::channel();
+        crate::metrics::add(&crate::metrics::ROWS_IN, batch.num_rows() as u64);
         self.tx.send(Append { table, src, batch, ack }).await.map_err(|_| anyhow!("log closed"))?;
         Ok(async move { rx.await?.map_err(|e| anyhow!(e)) })
     }
 }
 
-async fn send(lake: &Lake, to: &To, mut pending: Vec<Append>) {
+/// One flush, to the sequencer. Flushes are encoded side by side, but reach this node's
+/// sequencer in the order they were cut (`turn`: the previous one is there; `done`: this one
+/// is), so a producer's pipelined batches commit in order.
+async fn send(lake: &Lake, to: &To, mut pending: Vec<Append>, mut turn: Option<oneshot::Receiver<()>>, done: oneshot::Sender<()>) {
+    let mut done = Some(done);
     while !pending.is_empty() {
         let outcome = async {
             let f = pack(lake, &pending).await?;
+            if let Some(turn) = turn.take() {
+                let _ = turn.await; // (an error: the previous one gave up; its turn is over either way)
+            }
             match to {
-                To::Local(seq) => seq.submit(f).await,
-                To::Leader(addr) => Ok(http().post(format!("http://{addr}/cluster/commit")).body(encode_flush(&f)?).send().await?.error_for_status()?.json().await?),
+                To::Local(seq) => {
+                    let outcome = seq.enqueue(f).await?;
+                    drop(done.take());
+                    anyhow::Ok(outcome.await?)
+                }
+                To::Leader(addr) => {
+                    let request = http().post(format!("http://{addr}/cluster/commit")).body(encode_flush(&f)?).send();
+                    drop(done.take()); // (sent in order; over HTTP they may still arrive out of order, rarely)
+                    Ok(request.await?.error_for_status()?.json().await?)
+                }
             }
         };
         match outcome.await {
@@ -247,10 +265,13 @@ impl Sequencer {
         Ok(Arc::new(Sequencer { tx, commit_ms }))
     }
 
-    pub async fn submit(&self, f: Flush) -> Result<Outcome> {
+    pub async fn submit(&self, f: Flush) -> Result<Outcome> { Ok(self.enqueue(f).await?.await?) }
+
+    /// Queue a flush; its outcome comes once it's committed.
+    pub async fn enqueue(&self, f: Flush) -> Result<oneshot::Receiver<Outcome>> {
         let (reply, rx) = oneshot::channel();
         self.tx.send((f, reply)).await.map_err(|_| anyhow!("sequencer stopped"))?;
-        Ok(rx.await?)
+        Ok(rx)
     }
 }
 

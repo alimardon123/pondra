@@ -116,9 +116,11 @@ pub fn router(app: App) -> Router {
         .route("/lookup/{name}/{key}", get(lookup))
         .route("/watch/{name}", get(watch))
         .route("/stats", get(stats))
+        .route("/metrics", get(|State(app): State<App>| async move { crate::metrics::render(&app).await.map_err(E) }))
         .route("/cluster/commit", post(commit))
         .route("/cluster/log", get(feed))
         .route("/cluster/stage", post(stage))
+        .route("/cluster/shuffle", get(bucket))
         .route("/cluster/job", post(job))
         .route("/cluster/beat", post(beat))
         .route("/cluster/ack", post(ack))
@@ -194,8 +196,19 @@ async fn commit(State(app): State<App>, body: Bytes) -> Result<Json<crate::log::
 
 /// This node's share of a distributed query.
 async fn stage(State(app): State<App>, Json(slice): Json<crate::spmd::Slice>) -> Result<Vec<u8>, E> {
-    Ok(crate::spmd::encode_parts(&crate::spmd::stage(&app.lake, &slice).await?)?)
+    let (shape, parts) = crate::spmd::stage(&app.lake, &slice).await?;
+    Ok(crate::spmd::encode_reply(&shape, &parts)?)
 }
+
+#[derive(Deserialize)]
+struct BucketParams {
+    id: String,
+    exchange: usize,
+    to: usize,
+}
+
+/// A shuffle bucket this node keeps for another node (see `spmd.rs`).
+async fn bucket(Query(p): Query<BucketParams>) -> Result<Vec<u8>, E> { Ok(crate::spmd::bucket(&p.id, p.exchange, p.to)?) }
 
 /// A share of the leader's data work (tiering, merging, compaction): the files written.
 async fn job(State(app): State<App>, Json(job): Json<crate::tier::Job>) -> Result<Json<Vec<DataFile>>, E> {
@@ -242,13 +255,44 @@ impl App {
 
     /// Run a query: across the cluster when the tables are big (`spread`: "1" always, "0" never).
     pub async fn query(&self, query: &str, spread: Option<&str>) -> anyhow::Result<Vec<RecordBatch>> {
-        let nodes = if spread == Some("0") { vec![] } else { self.cluster.nodes() };
-        match crate::spmd::query(&self.lake, &nodes, &self.cluster.addr, query, spread == Some("1")).await {
-            Ok(Some(batches)) => return Ok(batches),
-            Ok(None) => {}
-            Err(e) => eprintln!("distributed query failed, running it here: {e:#}"),
+        use crate::metrics::{add, QUERIES, QUERY_ERRORS, QUERY_US, SPREAD};
+        let start = std::time::Instant::now();
+        let run = async {
+            let nodes = if spread == Some("0") { vec![] } else { self.cluster.nodes() };
+            match crate::spmd::query(&self.lake, &nodes, &self.cluster.addr, query, spread == Some("1")).await {
+                Ok(Some(batches)) => return Ok((batches, true)),
+                Ok(None) => {}
+                Err(e) => eprintln!("distributed query failed, running it here: {e:#}"),
+            }
+            let run = |frugal: bool| async move {
+                let ctx = session(&self.lake, query, "").await?;
+                if frugal {
+                    // Hash joins can't spill, sort-merge joins can; sorts keep less aside to merge.
+                    let state = ctx.state_ref();
+                    let mut state = state.write();
+                    let o = state.config_mut().options_mut();
+                    (o.optimizer.prefer_hash_join, o.execution.sort_spill_reservation_bytes) = (false, 1 << 20);
+                }
+                anyhow::Ok(ctx.sql_with_options(query, crate::query::read_only()).await?.collect().await?)
+            };
+            match run(false).await {
+                Err(e) if format!("{e:#}").contains("Resources exhausted") => Ok((run(true).await?, false)), // out of memory: try again frugally
+                r => Ok((r?, false)),
+            }
+        };
+        let out = run.await;
+        add(&QUERIES, 1);
+        add(&QUERY_US, start.elapsed().as_micros() as u64);
+        match out {
+            Ok((batches, spread)) => {
+                add(&SPREAD, spread as u64);
+                Ok(batches)
+            }
+            Err(e) => {
+                add(&QUERY_ERRORS, 1);
+                Err(e)
+            }
         }
-        Ok(session(&self.lake, query, "").await?.sql_with_options(query, crate::query::read_only()).await?.collect().await?)
     }
 
     /// Record an INSERT's files: here on the leader, or forwarded to it.
@@ -274,7 +318,10 @@ impl App {
         // Up to 4 tables at once: on object storage each round is a few storage round trips, so
         // tables side by side finish in the time of one (memory stays bounded: ≤4M rows a job).
         let busy: Vec<String> = tables.iter().map(|(k, _)| k[2..].to_string()).filter(|t| backlog.get(t).copied().unwrap_or(0) >= min_rows).collect();
-        if busy.is_empty() {
+        // Tables with files to merge or seal, busy or not (bulk INSERTs don't go through the log).
+        let untidy = tables.iter().filter(|(k, m)| m.files.len() >= 8 && !busy.contains(&k[2..].to_string())).map(|(k, _)| k[2..].to_string());
+        let untidy: Vec<String> = busy.iter().cloned().chain(untidy).collect();
+        if untidy.is_empty() {
             return Ok(0); // (the pressure check, most of the time: don't hold the lock for nothing)
         }
         let per_table: Vec<_> = busy.iter().map(|t| self.tier_one(t, hwm, &nodes)).collect();
@@ -283,7 +330,7 @@ impl App {
         crate::delta::publish_all(&self.lake).await?; // what other engines read, as soon as it's tiered
         let first_publish = start.elapsed();
         // Then merges and compactions (published too, once done).
-        let maintain: Vec<_> = busy.iter().map(|t| crate::tier::maintain(&self.lake, t, &nodes, &self.cluster.addr)).collect();
+        let maintain: Vec<_> = untidy.iter().map(|t| crate::tier::maintain(&self.lake, t, &nodes, &self.cluster.addr)).collect();
         if futures::stream::iter(maintain).buffer_unordered(4).try_collect::<Vec<bool>>().await?.contains(&true) {
             crate::delta::publish_all(&self.lake).await?;
         }
@@ -343,16 +390,8 @@ async fn append(State(app): State<App>, Path(name): Path<String>, Query(p): Quer
     let batches = if arrow {
         // Columns by name, cast to the table's types (pandas, Polars and Arrow differ in string
         // types); a column left out is null (as in JSON), e.g. `_deleted`, or one added since.
-        let conform = |b: RecordBatch| -> anyhow::Result<RecordBatch> {
-            let column = |f: &datafusion::arrow::datatypes::Field| match b.column_by_name(f.name()) {
-                Some(c) => Ok(datafusion::arrow::compute::cast(c, f.data_type())?),
-                None => Ok(datafusion::arrow::array::new_null_array(f.data_type(), b.num_rows())),
-            };
-            let cols = schema.fields().iter().map(|f| column(f));
-            Ok(RecordBatch::try_new(schema.clone(), cols.collect::<anyhow::Result<Vec<_>>>()?)?)
-        };
         let ipc = StreamReader::try_new(&body[..], None)?.collect::<Result<Vec<_>, _>>()?;
-        ipc.into_iter().map(conform).collect::<anyhow::Result<Vec<_>>>()?
+        ipc.iter().map(|b| crate::query::conform(b, &schema)).collect::<anyhow::Result<Vec<_>>>()?
     } else {
         arrow_json::ReaderBuilder::new(schema.clone()).build(&body[..])?.collect::<Result<Vec<_>, _>>()?
     };

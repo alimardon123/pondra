@@ -38,8 +38,12 @@ struct Published {
 /// durable, the next round sees the older state and takes over what was written (see `publish`).
 pub async fn publish_all(lake: &Lake) -> Result<()> {
     lake.cat.wait_durable(lake.cat.committed()).await; // (replicated acks: publish only what's in the bucket)
+    // A table whose metadata is as last published is skipped without loading its manifests.
+    static SEEN: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, u64>>> = std::sync::LazyLock::new(Default::default);
+    let print = |meta: &TableMeta| std::hash::BuildHasher::hash_one(&std::hash::BuildHasherDefault::<std::collections::hash_map::DefaultHasher>::default(), json(meta));
     let tables = lake.cat.scan::<TableMeta>("t/", "t0").await?;
-    let jobs = tables.iter().flat_map(|(key, meta)| meta.publish.iter().map(move |f| (&key[2..], meta, f.as_str())));
+    let changed: Vec<_> = tables.iter().filter(|(key, meta)| SEEN.lock().unwrap().get(key) != Some(&print(meta))).collect();
+    let jobs = changed.iter().flat_map(|(key, meta)| meta.publish.iter().map(move |f| (&key[2..], meta, f.as_str())));
     let states = futures::future::try_join_all(jobs.map(|(table, meta, format)| async move {
         match format {
             "delta" => publish(lake, table, meta).await,
@@ -51,6 +55,7 @@ pub async fn publish_all(lake: &Lake) -> Result<()> {
     if !puts.is_empty() {
         drop(lake.cat.write(puts, &[]).await?);
     }
+    SEEN.lock().unwrap().extend(changed.iter().map(|(key, meta)| (key.clone(), print(meta))));
     Ok(())
 }
 
@@ -58,13 +63,13 @@ pub async fn publish_all(lake: &Lake) -> Result<()> {
 /// an append table's; for a keyed table only a single file with one row per key and no delete
 /// markers (a compaction's output, or a first fold of a table without deletes). Between
 /// compactions the last published version stays.
-pub fn publishable(meta: &TableMeta) -> Option<Vec<&DataFile>> {
+pub async fn publishable(lake: &Lake, meta: &TableMeta) -> Result<Option<Vec<DataFile>>> {
     let deletes = meta.columns.iter().any(|(c, _)| c == "_deleted");
-    match meta.key.is_empty() {
-        true => Some(meta.files.iter().collect()),
-        false if meta.files.len() == 1 && (meta.files[0].whole || !deletes) => Some(meta.files.iter().collect()),
+    Ok(match meta.key.is_empty() {
+        true => Some(crate::manifest::all(lake, meta).await?),
+        false if meta.files.len() == 1 && (meta.files[0].whole || !deletes) => Some(meta.files.clone()),
         false => None,
-    }
+    })
 }
 
 /// Stop publishing a table in `format`: its metadata goes, so no engine reads a stale copy.
@@ -91,7 +96,7 @@ pub fn decimal(t: &str) -> Option<(u8, i8)> {
 /// The table's next Delta commit, if its files changed; returns the new publish state to record.
 async fn publish(lake: &Lake, table: &str, meta: &TableMeta) -> Result<Option<(String, Vec<u8>)>> {
     let Some(schema) = schema_string(&meta.columns) else { return Ok(None) }; // a type Delta can't carry
-    let Some(files) = publishable(meta) else { return Ok(None) };
+    let Some(files) = publishable(lake, meta).await? else { return Ok(None) };
     let (dir, key) = (format!("data/{table}/"), format!("x/{table}"));
     let want: BTreeMap<&str, u64> = files.iter().filter_map(|f| Some((f.path.strip_prefix(&dir)?, f.bytes))).collect();
     let mut state: Published = lake.cat.get(&key).await?.unwrap_or_default();
@@ -105,8 +110,8 @@ async fn publish(lake: &Lake, table: &str, meta: &TableMeta) -> Result<Option<(S
         state.id = uuid::Uuid::new_v4().to_string();
     }
     let mut actions = vec![];
-    if version == 0 {
-        actions.push(json!({"protocol": {"minReaderVersion": 1, "minWriterVersion": 2}}));
+    if version == 0 || protocol(&state.schema) != protocol(&schema) {
+        actions.push(protocol(&schema));
     }
     if state.schema != schema {
         actions.push(metadata(&state.id, table, &schema, now));
@@ -154,7 +159,7 @@ fn adopt(mut state: Published, version: u64, commit: &[u8]) -> Result<Published>
 /// instead of replaying every JSON commit. Arrow's JSON reader builds the nested columns from
 /// the same action objects the commits use.
 async fn checkpoint(lake: &Lake, dir: &str, version: u64, state: &Published, table: &str) -> Result<()> {
-    let mut rows = vec![json!({"protocol": {"minReaderVersion": 1, "minWriterVersion": 2}}), metadata(&state.id, table, &state.schema, 0)];
+    let mut rows = vec![protocol(&state.schema), metadata(&state.id, table, &state.schema, 0)];
     rows.extend(state.files.iter().map(|(p, (b, t))| add(p, *b, *t)));
     let body = rows.iter().map(Value::to_string).collect::<Vec<_>>().join("\n");
     let batches = arrow_json::ReaderBuilder::new(checkpoint_schema()).build(body.as_bytes())?.collect::<Result<Vec<_>, _>>()?;
@@ -177,6 +182,14 @@ async fn checkpoint(lake: &Lake, dir: &str, version: u64, state: &Published, tab
         }
     }
     Ok(())
+}
+
+/// The protocol a schema needs: `timestamp_ntz` columns take the `timestampNtz` table feature.
+fn protocol(schema: &str) -> Value {
+    match schema.contains("\"timestamp_ntz\"") {
+        true => json!({"protocol": {"minReaderVersion": 3, "minWriterVersion": 7, "readerFeatures": ["timestampNtz"], "writerFeatures": ["timestampNtz"]}}),
+        false => json!({"protocol": {"minReaderVersion": 1, "minWriterVersion": 2}}),
+    }
 }
 
 fn metadata(id: &str, table: &str, schema: &str, now: u64) -> Value {
@@ -202,9 +215,11 @@ fn schema_string(columns: &[(String, String)]) -> Option<String> {
             "Boolean" => "boolean",
             "Date32" => "date",
             "Binary" | "LargeBinary" => "binary",
-            // (Delta's `timestamp` is an instant: time-zone-aware columns only)
-            t if matches!(t.parse(), Ok(DataType::Timestamp(datafusion::arrow::datatypes::TimeUnit::Microsecond, Some(_)))) => "timestamp",
-            t => return decimal(t).map(|(p, s)| json!({"name": name, "type": format!("decimal({p},{s})"), "nullable": true, "metadata": {}})),
+            // (Delta's `timestamp` is an instant; `timestamp_ntz` a wall-clock time)
+            t => match t.parse() {
+                Ok(DataType::Timestamp(datafusion::arrow::datatypes::TimeUnit::Microsecond, tz)) => if tz.is_some() { "timestamp" } else { "timestamp_ntz" },
+                _ => return decimal(t).map(|(p, s)| json!({"name": name, "type": format!("decimal({p},{s})"), "nullable": true, "metadata": {}})),
+            },
         };
         Some(json!({"name": name, "type": t, "nullable": true, "metadata": {}}))
     });
@@ -217,10 +232,11 @@ fn checkpoint_schema() -> Arc<Schema> {
     let i = |n: &str, t: DataType| Field::new(n, t, true);
     let map = |n: &str| Field::new_map(n, "key_value", Field::new("key", DataType::Utf8, false), s("value"), false, true);
     let st = |n: &str, f: Vec<Field>| Field::new(n, DataType::Struct(Fields::from(f)), true);
+    let list = |n: &str| Field::new_list(n, Field::new("element", DataType::Utf8, true), true);
     Arc::new(Schema::new(vec![
-        st("protocol", vec![i("minReaderVersion", DataType::Int32), i("minWriterVersion", DataType::Int32)]),
+        st("protocol", vec![i("minReaderVersion", DataType::Int32), i("minWriterVersion", DataType::Int32), list("readerFeatures"), list("writerFeatures")]),
         st("metaData", vec![s("id"), s("name"), s("description"), st("format", vec![s("provider"), map("options")]), s("schemaString"),
-            Field::new_list("partitionColumns", Field::new("element", DataType::Utf8, true), true), map("configuration"), i("createdTime", DataType::Int64)]),
+            list("partitionColumns"), map("configuration"), i("createdTime", DataType::Int64)]),
         st("add", vec![s("path"), map("partitionValues"), i("size", DataType::Int64), i("modificationTime", DataType::Int64), i("dataChange", DataType::Boolean), s("stats")]),
         st("remove", vec![s("path"), i("deletionTimestamp", DataType::Int64), i("dataChange", DataType::Boolean)]),
     ]))

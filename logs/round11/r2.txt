@@ -1,0 +1,162 @@
+== harness.py scale --s3 (real R2, ponderabucket-us). A first attempt collided with a simulated-R2 run on the same ports (my mistake); this rerun used its own ports.
+   (output cut to its last 75 lines; "ok": true means all 9 checks passed)
+  "many groups": [
+   true,
+   1
+  ],
+  "groups, no order": [
+   true,
+   1
+  ],
+  "HAVING": [
+   true,
+   1
+  ],
+  "string keys": [
+   true,
+   1
+  ],
+  "DISTINCT": [
+   true,
+   1
+  ],
+  "join, then many groups": [
+   true,
+   1
+  ],
+  "join, filters, count": [
+   true,
+   0
+  ],
+  "join, then another key": [
+   true,
+   1
+  ],
+  "self-join": [
+   true,
+   1
+  ],
+  "count(DISTINCT) per group": [
+   true,
+   1
+  ],
+  "window, PARTITION BY": [
+   true,
+   1
+  ],
+  "window over all": [
+   true,
+   0
+  ],
+  "global aggregate": [
+   true,
+   0
+  ],
+  "a keyed table": [
+   true,
+   1
+  ]
+ },
+ "rows": 23100,
+ "days": 139,
+ "files": {
+  "inline": 83.0,
+  "sealed": 131.0,
+  "parquet_objects": 344,
+  "one_day_scanned": 2.0
+ },
+ "outside_readers": {
+  "delta-rs": 23100,
+  "polars": 23100,
+  "duckdb": 23100,
+  "iceberg/pyiceberg": 23100,
+  "iceberg/polars": 23100,
+  "iceberg/duckdb": 23100
+ },
+ "ok": true
+}
+== harness.py flight --s3 (real R2, ponderabucket-us)
+{
+ "flight": {
+  "DoPut: 10 batches acked": true,
+  "a retried stream is applied once": true,
+  "DoPut to a follower": true,
+  "a read token can't write": true,
+  "DoGet SQL": true,
+  "GetFlightInfo + DoGet": true,
+  "ListFlights": true,
+  "the log, two columns": true,
+  "the log, following": true,
+  "basic-auth handshake": true,
+  "ADBC query": true,
+  "ADBC write as a query, ingest, objects": true,
+  "every row once": true
+ },
+ "follow_ms": 434,
+ "ok": true
+}
+== metadata_bench.py --files 100000 --s3 (real R2, ponderabucket-us)
+before: {"append_ack_ms": 289.4, "tier_commit_ms": 841.5, "insert_ms": 830.4, "query_today_ms": 5.1, "entry_bytes": 2453.0}
+added: {"files": 100000, "seconds": 4.8, "record_ms_per_50k_files": 1883, "inline": 64.0, "sealed": 99940.0, "entry_bytes": 16794.0, "table_bytes": 107374182515255.0}
+after: {"append_ack_ms": 290.4, "tier_commit_ms": 1011.0, "insert_ms": 548.3, "query_today_ms": 17.0, "entry_bytes": 19198.0}
+{
+ "before": {
+  "append_ack_ms": 289.4,
+  "tier_commit_ms": 841.5,
+  "insert_ms": 830.4,
+  "query_today_ms": 5.1,
+  "entry_bytes": 2453.0
+ },
+ "added": {
+  "files": 100000,
+  "seconds": 4.8,
+  "record_ms_per_50k_files": 1883,
+  "inline": 64.0,
+  "sealed": 99940.0,
+  "entry_bytes": 16794.0,
+  "table_bytes": 107374182515255.0
+ },
+ "after": {
+  "append_ack_ms": 290.4,
+  "tier_commit_ms": 1011.0,
+  "insert_ms": 548.3,
+  "query_today_ms": 17.0,
+  "entry_bytes": 19198.0
+ },
+ "today_scanned": 3.0,
+ "today_skipped": 100008.0,
+ "day_2010_files": 15.0,
+ "day_2010_plan_ms": 138.7,
+ "cold_query_ms": 125.0,
+ "three_nodes_ms": 47.4,
+ "checks": {
+  "right answers, before and with 1M more files": true,
+  "today's query opened no fake file": true,
+  "one day of 2010 plans that day's files only": true,
+  "catalog entry stays small (< 256 KB)": true,
+  "commits as fast (within 2x + 20 ms)": true,
+  "restarted node answers right": true,
+  "three nodes, manifests dealt out: same answer": true
+ },
+ "ok": true
+}
+== flight_bench.py --s3 --batches 50 (real R2, ponderabucket-us)
+{
+ "doput": {
+  "writers": 4,
+  "rows": 2000000,
+  "rows_per_s": 1012347,
+  "mb_per_s": 28.2,
+  "all_in": true
+ },
+ "doget": {
+  "rows": 2000000,
+  "rows_per_s": 8455295,
+  "mb_per_s": 235.8
+ },
+ "follow_ms": {
+  "p50": 525.0,
+  "p99": 782.8,
+  "samples": 100
+ }
+}

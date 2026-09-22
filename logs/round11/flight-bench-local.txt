@@ -1,0 +1,20 @@
+== flight_bench.py (local disk)
+{
+ "doput": {
+  "writers": 4,
+  "rows": 8000000,
+  "rows_per_s": 15684442,
+  "mb_per_s": 437.4,
+  "all_in": true
+ },
+ "doget": {
+  "rows": 8000000,
+  "rows_per_s": 9146184,
+  "mb_per_s": 255.1
+ },
+ "follow_ms": {
+  "p50": 2.6,
+  "p99": 5.1,
+  "samples": 100
+ }
+}

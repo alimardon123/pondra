@@ -81,7 +81,7 @@ pub async fn tier_table(lake: &Lake, table: &str, hwm: u64, nodes: &[String], me
 pub async fn maintain(lake: &Lake, table: &str, nodes: &[String], me: &str) -> Result<bool> {
     let Some(mut meta) = lake.cat.get::<TableMeta>(&table_key(table)).await? else { return Ok(false) };
     let small: Vec<DataFile> = meta.files.iter().filter(|f| f.bytes < 64 << 20 && f.rows < 4_000_000).cloned().collect();
-    if !meta.key.is_empty() && meta.files.len() >= 8 {
+    let changed = if !meta.key.is_empty() && meta.files.len() >= 8 {
         // Tables other engines read compact fully (they see keyed tables as of their last full
         // compaction); the rest merge size-tiered runs.
         let run = if meta.publish.is_empty() { run(&meta.files) } else { meta.files.clone() };
@@ -91,11 +91,29 @@ pub async fn maintain(lake: &Lake, table: &str, nodes: &[String], me: &str) -> R
         };
         let merged = deal(lake, vec![Job::new(table, &meta, job)], nodes, me).await?;
         replace(&mut meta, &run, merged);
-    } else if meta.key.is_empty() && small.len() >= 8 {
-        let jobs = small.chunks(8).map(|g| Job::new(table, &meta, Kind::Merge { files: g.to_vec() })).collect();
-        let merged = deal(lake, jobs, nodes, me).await?;
-        replace(&mut meta, &small, merged);
+        true
+    } else if meta.key.is_empty() && small.len() >= 2 {
+        // Small files of one partition merge together (so each file keeps one): 8 at a time, and
+        // all of them before they're sealed (manifests never change, so they'd stay small).
+        let sealing: std::collections::HashSet<&str> = crate::manifest::to_seal(&meta).iter().map(|f| f.path.as_str()).collect();
+        let mut by_part: BTreeMap<(&str, bool), Vec<DataFile>> = BTreeMap::new();
+        small.iter().for_each(|f| by_part.entry((f.part.as_str(), sealing.contains(f.path.as_str()))).or_default().push(f.clone()));
+        let groups: Vec<Vec<DataFile>> = by_part.into_iter().flat_map(|((_, sealing), g)| {
+            let (least, most) = if sealing { (2, 32) } else { (8, 8) };
+            let chunks = g.chunks(most).filter(|c| c.len() > 1).map(<[DataFile]>::to_vec);
+            if g.len() >= least { chunks.collect() } else { vec![] }
+        }).collect();
+        if !groups.is_empty() {
+            let jobs = groups.iter().map(|g| Job::new(table, &meta, Kind::Merge { files: g.clone() })).collect();
+            let merged = deal(lake, jobs, nodes, me).await?;
+            replace(&mut meta, &groups.concat(), merged);
+        }
+        !groups.is_empty()
     } else {
+        false
+    };
+    // The oldest inline files go into manifests once there are too many.
+    if !crate::manifest::seal(lake, table, &mut meta).await? && !changed {
         return Ok(false);
     }
     lake.cat.commit(vec![(table_key(table), json(&meta))], &[]).await?;
@@ -188,7 +206,7 @@ pub async fn run_job(lake: &Lake, Job { table, meta, kind }: Job) -> Result<Vec<
         // still have to shadow what older files hold for that key).
         Kind::Fold { after, upto, rows } => {
             caught_up(lake, &table, after, upto, rows).await?;
-            let part = TableMeta { files: vec![], tiered: after, ..meta };
+            let part = TableMeta { files: vec![], tiered: after, ..meta.clone() };
             (latest(lake, &table, &part, upto, !first).await?, upto)
         }
         Kind::Compact { upto, rows } => {
@@ -208,15 +226,63 @@ pub async fn run_job(lake: &Lake, Job { table, meta, kind }: Job) -> Result<Vec<
             let paths: Vec<String> = files.iter().map(|f| lake.full(&f.path)).collect();
             let schema = schema(&meta.columns)?;
             let df = clustered(&meta, ctx.read_parquet(paths, ParquetReadOptions::default().schema(&schema)).await?)?;
-            let ord = files.iter().map(|f| f.ord).max().unwrap_or(0);
-            let mut merged = write_stream(lake, &table, df.execute_stream().await?, 4_000_000, &keys).await?;
-            merged.iter_mut().for_each(|f| f.ord = ord);
+            let (ord, part) = (files.iter().map(|f| f.ord).max().unwrap_or(0), files[0].part.clone());
+            let mut merged = write_stream(lake, &table, df.execute_stream().await?, 4_000_000, &keys, meta.key.is_empty(), None).await?;
+            merged.iter_mut().for_each(|f| (f.ord, f.part) = (ord, part.clone()));
             return Ok(merged);
         }
     };
-    let mut files: Vec<DataFile> = write_file(lake, &table, &batches, &keys).await?.into_iter().collect();
-    files.iter_mut().for_each(|f| (f.ord, f.whole) = (ord, whole));
+    let parts = match &meta.partition {
+        Some(spec) if meta.key.is_empty() => split(spec, batches).await?,
+        _ => vec![(String::new(), batches)],
+    };
+    let mut files = vec![];
+    for (part, batches) in parts {
+        if let Some(f) = write_file(lake, &table, &batches, &keys, meta.key.is_empty()).await? {
+            files.push(DataFile { ord, whole, part, ..f });
+        }
+    }
     Ok(files)
+}
+
+/// A partitioned table's rows, one group per partition value (`day(ts)`: the day, `col`: the value).
+async fn split(spec: &str, batches: Vec<RecordBatch>) -> Result<Vec<(String, Vec<RecordBatch>)>> {
+    use datafusion::arrow::{array::{AsArray, UInt32Array}, compute::{concat_batches, take_record_batch}};
+    let Some(first) = batches.first() else { return Ok(vec![]) };
+    let all = concat_batches(&first.schema(), &batches)?;
+    let ctx = datafusion::prelude::SessionContext::new();
+    ctx.register_batch("t", all.clone())?;
+    let values = ctx.sql(&format!("SELECT {} FROM t", partition_expr(spec))).await?.collect().await?;
+    let mut groups: BTreeMap<String, Vec<u32>> = BTreeMap::new();
+    let mut i = 0u32;
+    for b in &values {
+        let text = datafusion::arrow::compute::cast(b.column(0), &datafusion::arrow::datatypes::DataType::Utf8)?;
+        for v in text.as_string::<i32>().iter() {
+            groups.entry(v.unwrap_or("null").to_string()).or_default().push(i);
+            i += 1;
+        }
+    }
+    groups.into_iter().map(|(p, rows)| Ok((p, vec![take_record_batch(&all, &UInt32Array::from(rows))?]))).collect()
+}
+
+/// A partition spec as SQL: `day(ts)` → `date_trunc('day', "ts")`; a plain column → itself.
+pub fn partition_expr(spec: &str) -> String {
+    match spec.split_once('(').map(|(f, c)| (f.trim(), c.trim_end_matches(')').trim())) {
+        Some((unit @ ("year" | "month" | "day" | "hour"), col)) => format!("date_trunc('{unit}', \"{col}\")"),
+        _ => format!("\"{}\"", spec.trim()),
+    }
+}
+
+/// A partition spec is a column, or year/month/day/hour of a timestamp or date column.
+pub fn check_partition(spec: &str, columns: &[(String, String)]) -> Result<()> {
+    let (unit, col) = match spec.split_once('(') {
+        Some((f, c)) => (Some(f.trim()), c.trim_end_matches(')').trim()),
+        None => (None, spec.trim()),
+    };
+    let t = columns.iter().find(|(n, _)| n == col).map(|(_, t)| t.as_str());
+    let time = t.is_some_and(|t| t.starts_with("Timestamp") || t.starts_with("Date"));
+    anyhow::ensure!(t.is_some() && (unit.is_none() || (matches!(unit, Some("year" | "month" | "day" | "hour")) && time)), "partition_by: a column, or year/month/day/hour(a timestamp column)");
+    Ok(())
 }
 
 /// Append tables with `cluster_by`: every file's rows sorted by those columns (folds and merges
@@ -321,6 +387,11 @@ async fn collect_orphans(lake: &Lake) -> Result<()> {
     LAST.store(now, std::sync::atomic::Ordering::Relaxed);
     let mut used: std::collections::HashSet<String> = lake.cat.scan::<Segment>("s/", "s0").await?.into_iter().map(|(_, s)| s.path).collect();
     for (_, m) in lake.cat.scan::<TableMeta>("t/", "t0").await? {
+        for manifest in crate::manifest::list(lake, &m).await? {
+            used.extend(crate::manifest::files(lake, &manifest).await?.into_iter().map(|f| f.path));
+            used.insert(manifest.path);
+        }
+        used.extend(m.sealed.iter().map(|s| s.list.clone()));
         used.extend(m.files.into_iter().map(|f| f.path).chain(m.garbage.into_iter().map(|(p, _)| p)));
     }
     for prefix in ["log", "data"] {
@@ -350,7 +421,8 @@ fn writer<'a>(buf: &'a mut Vec<u8>, batch: &RecordBatch, keys: &[String]) -> Res
 }
 
 /// Write batches as one Parquet file (none if there are no rows).
-pub async fn write_file(lake: &Lake, table: &str, batches: &[RecordBatch], keys: &[String]) -> Result<Option<DataFile>> {
+/// One Parquet file of these rows; with `stats`, it carries its columns' min/max (append tables).
+pub async fn write_file(lake: &Lake, table: &str, batches: &[RecordBatch], keys: &[String], stats: bool) -> Result<Option<DataFile>> {
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     if rows == 0 {
         return Ok(None);
@@ -364,21 +436,32 @@ pub async fn write_file(lake: &Lake, table: &str, batches: &[RecordBatch], keys:
     let (path, bytes) = (format!("data/{table}/{}.parquet", uuid::Uuid::new_v4()), buf.len() as u64);
     lake.put(&path, buf).await?;
     maybe_crash("after_parquet_put");
-    Ok(Some(DataFile { path, rows: rows as u64, bytes, ord: 0, whole: false }))
+    let stats = if stats { crate::manifest::stats(batches) } else { Default::default() };
+    Ok(Some(DataFile { path, rows: rows as u64, bytes, ord: 0, whole: false, stats, part: String::new() }))
 }
 
 /// Stream a query result into Parquet files of up to `max_rows` each (bulk INSERT … SELECT).
-pub async fn write_stream(lake: &Lake, table: &str, mut stream: SendableRecordBatchStream, max_rows: usize, keys: &[String]) -> Result<Vec<DataFile>> {
+pub async fn write_stream(lake: &Lake, table: &str, mut stream: SendableRecordBatchStream, max_rows: usize, keys: &[String], stats: bool, partition: Option<&str>) -> Result<Vec<DataFile>> {
     let (mut files, mut pending, mut n) = (vec![], vec![], 0);
-    while let Some(batch) = stream.next().await {
-        let batch = batch?;
-        n += batch.num_rows();
-        pending.push(batch);
-        if n >= max_rows {
-            files.extend(write_file(lake, table, &std::mem::take(&mut pending), keys).await?);
+    loop {
+        let batch = stream.next().await.transpose()?;
+        let end = batch.is_none();
+        if let Some(b) = batch {
+            n += b.num_rows();
+            pending.push(b);
+        }
+        if n >= max_rows || (end && n > 0) {
+            let groups = match partition {
+                Some(spec) => split(spec, std::mem::take(&mut pending)).await?,
+                None => vec![(String::new(), std::mem::take(&mut pending))],
+            };
+            for (part, batches) in groups {
+                files.extend(write_file(lake, table, &batches, keys, stats).await?.map(|f| DataFile { part, ..f }));
+            }
             n = 0;
         }
+        if end {
+            return Ok(files);
+        }
     }
-    files.extend(write_file(lake, table, &pending, keys).await?);
-    Ok(files)
 }

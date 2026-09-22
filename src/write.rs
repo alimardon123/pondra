@@ -27,7 +27,9 @@ use tokio::sync::Mutex;
 /// A table's definition: `[["user","Utf8"],…]`, or `{"columns": […], "key": ["id"]}` for an
 /// upsert table (a Boolean `_deleted` column marks deletes), with `"merge": {"total": "sum"}` for a
 /// merge table (sum, min or max per key), `"publish": ["delta", "iceberg"]` for other engines and
-/// `"cluster_by": ["user"]` (append tables) to sort every file by those columns.
+/// `"cluster_by": ["user"]` (append tables) to sort every file by those columns, and
+/// `"partition_by": "day(ts)"` (append tables; a column, or year/month/day/hour of a timestamp) so
+/// no file mixes partitions.
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum TableSpec {
@@ -42,15 +44,16 @@ enum TableSpec {
         #[serde(default)]
         cluster_by: Vec<String>,
         ttl: Option<String>, // keyed tables: "column:seconds"
+        partition_by: Option<String>,
     },
 }
 
 /// Leader: create a table (sent again for an existing one, `publish` changes). The caller holds
 /// the lock that serialises table rewrites.
 pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> {
-    let (columns, key, merge, publish, cluster, ttl) = match serde_json::from_str(spec)? {
-        TableSpec::Columns(c) => (c, vec![], BTreeMap::new(), None, vec![], None),
-        TableSpec::Full { columns, key, merge, publish, cluster_by, ttl } => (columns, key, merge, publish, cluster_by, ttl),
+    let (columns, key, merge, publish, cluster, ttl, partition) = match serde_json::from_str(spec)? {
+        TableSpec::Columns(c) => (c, vec![], BTreeMap::new(), None, vec![], None, None),
+        TableSpec::Full { columns, key, merge, publish, cluster_by, ttl, partition_by } => (columns, key, merge, publish, cluster_by, ttl, partition_by),
     };
     let ttl = ttl.map(|t| -> Result<(String, u64)> {
         let (c, s) = t.split_once(':').ok_or_else(|| anyhow::anyhow!("ttl: \"column:seconds\""))?;
@@ -62,9 +65,14 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
     ensure!(merge.is_empty() || !key.is_empty(), "a merge table needs a key");
     ensure!(publish.iter().flatten().all(|f| ["delta", "iceberg"].contains(&f.as_str())), "publish formats: delta, iceberg");
     ensure!(cluster.iter().all(|c| columns.iter().any(|(n, _)| n == c)) && (cluster.is_empty() || key.is_empty()), "cluster_by: columns of an append table (keyed tables are sorted by key)");
+    if let Some(p) = &partition {
+        ensure!(key.is_empty(), "partition_by: append tables (keyed tables are sorted by key)");
+        crate::tier::check_partition(p, &columns)?;
+    }
     let meta = match lake.cat.get::<TableMeta>(&table_key(name)).await? {
-        None => TableMeta { columns, key, merge, publish: publish.unwrap_or_else(default_publish), cluster, ttl, ..Default::default() },
+        None => TableMeta { columns, key, merge, publish: publish.unwrap_or_else(default_publish), cluster, ttl, partition, ..Default::default() },
         Some(mut m) => {
+            ensure!(partition.is_none() || partition == m.partition, "{name}'s partition_by can't change");
             // Sent again: columns may only grow at the end (ALTER TABLE … ADD COLUMN; a re-sent
             // original definition is fine), and `publish` may change.
             let (old, new) = (m.columns.len(), columns.len());
@@ -138,7 +146,7 @@ pub fn parse(sql: &str) -> Option<Stmt> {
 }
 
 /// `CREATE TABLE t (a BIGINT, b VARCHAR, PRIMARY KEY (a)) [WITH (publish = 'delta,iceberg',
-/// cluster_by = 'b', merge = 'total:sum')]` → the table name and its spec. SQL types become Arrow
+/// cluster_by = 'b', merge = 'total:sum', partition_by = 'day(ts)')]` → the table name and its spec. SQL types become Arrow
 /// types the way DataFusion maps them.
 async fn create_spec(c: &ast::CreateTable) -> Result<(String, String)> {
     let cols = c.columns.iter().map(|c| format!("{} {}", c.name, c.data_type)).collect::<Vec<_>>().join(", ");
@@ -165,15 +173,24 @@ async fn create_spec(c: &ast::CreateTable) -> Result<(String, String)> {
     if !key.is_empty() && merge.is_empty() && !columns.iter().any(|(c, _)| c == "_deleted") {
         columns.push(("_deleted".into(), "Boolean".into())); // (so DELETE works; writes leave it out)
     }
-    let spec = j!({"columns": columns, "key": key, "merge": merge, "publish": list("publish"), "cluster_by": list("cluster_by").unwrap_or_default(), "ttl": opts.get("ttl")});
+    let spec = j!({"columns": columns, "key": key, "merge": merge, "publish": list("publish"), "cluster_by": list("cluster_by").unwrap_or_default(), "ttl": opts.get("ttl"), "partition_by": opts.get("partition_by")});
     Ok((c.name.to_string(), spec.to_string()))
+}
+
+/// Create a table (or change it: a spec sent again) from any node: the leader does it.
+pub async fn define(app: &crate::server::App, name: &str, spec: &str) -> Result<Value> {
+    if app.seq.is_none() {
+        return Ok(http().post(format!("http://{}/tables/{name}", app.cluster.leader.addr)).body(spec.to_string()).send().await?.error_for_status()?.json().await?);
+    }
+    let _guard = app.lock.lock().await;
+    create_table(&app.lake, name, spec).await
 }
 
 /// How a SQL type is kept: strings as Utf8; timestamps in microseconds, as Iceberg, Delta, Spark
 /// and Postgres keep them.
-fn stored(t: &DataType) -> DataType {
+pub fn stored(t: &DataType) -> DataType {
     match t {
-        DataType::Utf8View => DataType::Utf8,
+        DataType::Utf8View | DataType::LargeUtf8 => DataType::Utf8,
         DataType::Timestamp(_, tz) => DataType::Timestamp(TimeUnit::Microsecond, tz.clone()),
         t => t.clone(),
     }
@@ -192,7 +209,7 @@ async fn alter_spec(lake: &Lake, table: &str, column: &str, sql_type: &str, if_n
     let mut columns = m.columns.clone();
     columns.push((column.to_string(), stored(ctx.table("t").await?.schema().field(0).data_type()).to_string()));
     let ttl = m.ttl.as_ref().map(|(c, s)| format!("{c}:{s}"));
-    Ok(Some(j!({"columns": columns, "key": m.key, "merge": m.merge, "publish": m.publish, "cluster_by": m.cluster, "ttl": ttl}).to_string()))
+    Ok(Some(j!({"columns": columns, "key": m.key, "merge": m.merge, "publish": m.publish, "cluster_by": m.cluster, "ttl": ttl, "partition_by": m.partition}).to_string()))
 }
 
 /// The rows a write to a keyed table upserts: the INSERT's query, the updated rows, or the rows
@@ -275,7 +292,8 @@ pub async fn write_files(lake: &Lake, ctx: &SessionContext, table: &str, query: 
     }
     // The query's columns, by position, as the table's (or, for a new table, with plain Utf8 strings).
     let df = ctx.sql(query).await?;
-    let target: Vec<(String, DataType)> = match lake.cat.get::<TableMeta>(&table_key(table)).await? {
+    let meta = lake.cat.get::<TableMeta>(&table_key(table)).await?;
+    let target: Vec<(String, DataType)> = match &meta {
         Some(m) => schema(&m.columns)?.fields().iter().map(|f| (f.name().clone(), f.data_type().clone())).collect(),
         None => df.schema().fields().iter().map(|f| (f.name().clone(), if *f.data_type() == DataType::Utf8View { DataType::Utf8 } else { f.data_type().clone() })).collect(),
     };
@@ -285,7 +303,8 @@ pub async fn write_files(lake: &Lake, ctx: &SessionContext, table: &str, query: 
     let exprs = target.iter().enumerate().map(|(i, (name, t))| cast_to(given.get(i).map_or_else(null, |c| Expr::Column(c.clone())), t.clone()).alias(name)).collect::<Vec<_>>();
     let df = df.select(exprs)?;
     let columns = target.iter().map(|(n, t)| (n.clone(), t.to_string())).collect();
-    let files = crate::tier::write_stream(lake, table, df.execute_stream().await?, 1_000_000, &[]).await?;
+    let partition = meta.as_ref().and_then(|m| m.partition.clone());
+    let files = crate::tier::write_stream(lake, table, df.execute_stream().await?, 1_000_000, &[], true, partition.as_deref()).await?;
     Ok(Some(Files { table: table.into(), job: job.into(), columns, files }))
 }
 
@@ -301,7 +320,11 @@ pub async fn record(lake: &Lake, f: Files) -> Result<Value> {
     ensure!(meta.key.is_empty(), "INSERT into a keyed table goes through the log");
     ensure!(types(&meta.columns) == types(&f.columns), "query columns {:?} don't match table {}", f.columns, f.table);
     let rows: u64 = f.files.iter().map(|f| f.rows).sum();
-    meta.files.extend(f.files);
+    let ord = lake.visible(); // (append tables: files in the order they arrived)
+    meta.files.extend(f.files.into_iter().map(|f| DataFile { ord, ..f }));
+    if meta.files.len() > 4 * crate::manifest::INLINE {
+        crate::manifest::seal(lake, &f.table, &mut meta).await?; // (a big INSERT's many files: sealed at once; small ones are merged first, by `tier::maintain`)
+    }
     lake.cat.commit(vec![(table_key(&f.table), json(&meta)), (producer, json(&1u64))], &[]).await?;
     Ok(j!({"rows": rows}))
 }
@@ -329,11 +352,7 @@ pub async fn on_node(app: &crate::server::App, stmt: Stmt, job: Option<String>) 
                 },
                 _ => unreachable!(),
             };
-            if app.seq.is_none() {
-                return Ok(http().post(format!("http://{}/tables/{name}", app.cluster.leader.addr)).body(spec).send().await?.error_for_status()?.json().await?);
-            }
-            let _guard = app.lock.lock().await;
-            return create_table(lake, &name, &spec).await;
+            return define(app, &name, &spec).await;
         }
         Stmt::Insert(t, _) | Stmt::Update(t, ..) | Stmt::Delete(t, _) => t.clone(),
     };

@@ -55,7 +55,7 @@ impl Auth {
         let first = path.trim_start_matches('/').split('/').next().unwrap_or_default();
         match first {
             "stats" => Role::None, // (a health check: load balancers and the tests poll it)
-            "sql" | "lookup" | "watch" | "mcp" | "v1" => Role::Read, // (MCP writes are checked by `allows`; v1: the Iceberg REST catalog)
+            "sql" | "lookup" | "watch" | "mcp" | "v1" | "metrics" => Role::Read, // (MCP writes are checked by `allows`; v1: the Iceberg REST catalog)
             "append" | "insert" => Role::Write,
             "cluster" if path.starts_with("/cluster/files") || path.starts_with("/cluster/commit") => Role::Write, // (writers on other machines)
             "cluster" if path.starts_with("/cluster/leader") => Role::None,

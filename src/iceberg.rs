@@ -30,7 +30,7 @@ struct Published {
 /// The table's next Iceberg version, if its files changed; returns the new state to record.
 pub async fn publish(lake: &Lake, table: &str, meta: &TableMeta) -> Result<Option<(String, Vec<u8>)>> {
     let Some(fields) = fields(&meta.columns) else { return Ok(None) }; // a type Iceberg can't carry
-    let Some(files) = crate::delta::publishable(meta) else { return Ok(None) };
+    let Some(files) = crate::delta::publishable(lake, meta).await? else { return Ok(None) };
     let key = format!("i/{table}");
     let mut st: Published = lake.cat.get(&key).await?.unwrap_or_default();
     if st.version > 0 && files.len() == st.files.len() && files.iter().all(|f| st.files.contains_key(&f.path)) {

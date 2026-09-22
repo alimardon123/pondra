@@ -1,0 +1,45 @@
+== metadata_bench.py --files 1000000 (local disk)
+before: {"append_ack_ms": 7.2, "tier_commit_ms": 10.6, "insert_ms": 5.0, "query_today_ms": 5.0, "entry_bytes": 2971.0}
+added: {"files": 1000000, "seconds": 15.5, "record_ms_per_50k_files": 470, "inline": 64.0, "sealed": 999938.0, "entry_bytes": 18116.0, "table_bytes": 1073741824131279.0}
+after: {"append_ack_ms": 6.6, "tier_commit_ms": 11.3, "insert_ms": 4.4, "query_today_ms": 12.9, "entry_bytes": 20879.0}
+{
+ "before": {
+  "append_ack_ms": 7.2,
+  "tier_commit_ms": 10.6,
+  "insert_ms": 5.0,
+  "query_today_ms": 5.0,
+  "entry_bytes": 2971.0
+ },
+ "added": {
+  "files": 1000000,
+  "seconds": 15.5,
+  "record_ms_per_50k_files": 470,
+  "inline": 64.0,
+  "sealed": 999938.0,
+  "entry_bytes": 18116.0,
+  "table_bytes": 1073741824131279.0
+ },
+ "after": {
+  "append_ack_ms": 6.6,
+  "tier_commit_ms": 11.3,
+  "insert_ms": 4.4,
+  "query_today_ms": 12.9,
+  "entry_bytes": 20879.0
+ },
+ "today_scanned": 7.0,
+ "today_skipped": 1000006.0,
+ "day_2010_files": 138.0,
+ "day_2010_plan_ms": 29.2,
+ "cold_query_ms": 35.3,
+ "three_nodes_ms": 34.8,
+ "checks": {
+  "right answers, before and with 1M more files": true,
+  "today's query opened no fake file": true,
+  "one day of 2010 plans that day's files only": true,
+  "catalog entry stays small (< 256 KB)": true,
+  "commits as fast (within 2x + 20 ms)": true,
+  "restarted node answers right": true,
+  "three nodes, manifests dealt out: same answer": true
+ },
+ "ok": true
+}

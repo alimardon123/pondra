@@ -1,0 +1,6 @@
+== cluster.py users (local)
+users: 64 writers + 16 readers + 2 serverless on 3 node(s), 31s  lake /tmp/pondra-xtgrdui6
+  2946000 events (95,255/s), ack p50 52 ms p99 325 ms
+  1377 snapshot reads, query p50 307 ms p99 994 ms
+  inconsistent reads: 0; producers with lost/duplicate batches: 0
+    by node: {}

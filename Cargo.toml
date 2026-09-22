@@ -26,6 +26,11 @@ chrono = { version = "0.4", default-features = false } # (already built for obje
 url = "2"
 datafusion-functions-json = "0.55" # json_get(…), ->, ->> over JSON strings (Kafka raw values, semi-structured columns)
 pgwire = { version = "0.41", default-features = false, features = ["server-api", "pg-type-chrono"] } # the Postgres wire protocol (psql, drivers, BI tools)
+# Arrow Flight and Flight SQL (gRPC): ADBC, JDBC and pyarrow clients, columnar in and out
+arrow-flight = { version = "59", features = ["flight-sql"] }
+tonic = { version = "0.14", default-features = false, features = ["transport", "router"] }
+prost = { version = "0.14", default-features = false }
+base64 = "0.22" # (Flight's basic-auth handshake; already built for object_store)
 # Kafka record batches: their compression codecs and CRC (all already built for parquet, arrow and object_store)
 flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
 lz4_flex = { version = "0.14", default-features = false, features = ["frame"] }

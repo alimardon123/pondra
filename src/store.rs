@@ -30,8 +30,10 @@ pub struct TableMeta {
     pub key: Vec<String>, // primary key: non-empty = upsert table (latest row per key wins)
     #[serde(default)]
     pub merge: BTreeMap<String, String>, // merge table: rows per key combine (column -> sum|min|max)
-    pub files: Vec<DataFile>,
-    pub tiered: u64, // every segment <= `tiered` is already inside `files`
+    pub files: Vec<DataFile>, // the recent files; older ones of append tables are sealed (`manifest.rs`)
+    #[serde(default)]
+    pub sealed: Option<crate::manifest::Sealed>,
+    pub tiered: u64, // every segment <= `tiered` is already inside `files` (or sealed)
     #[serde(default)]
     pub garbage: Vec<(String, u64)>, // replaced files + when; deleted after the retention period
     #[serde(default)]
@@ -40,6 +42,8 @@ pub struct TableMeta {
     pub cluster: Vec<String>, // append tables: each file's rows sorted by these (see `tier::clustered`)
     #[serde(default)]
     pub ttl: Option<(String, u64)>, // keyed tables: a row whose (timestamp) column is older than this many seconds is gone
+    #[serde(default)]
+    pub partition: Option<String>, // append tables: every file holds one value of this ("col", "day(col)", "hour(col)", "month(col)")
 }
 
 impl TableMeta {
@@ -63,6 +67,12 @@ pub struct DataFile {
     /// A compaction output: the whole table, one row per key, no delete markers.
     #[serde(default)]
     pub whole: bool,
+    /// Append tables: each column's min and max, so queries skip files without opening them.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub stats: crate::manifest::Stats,
+    /// Partitioned tables: the one partition value this file holds.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub part: String,
 }
 
 /// One log segment = one node's flush, holding rows for many tables. Small segments are stored
@@ -116,6 +126,20 @@ pub struct Lake {
     pub disk: Option<Arc<crate::cache::Disk>>, // lakes on object storage: the local SSD tier
     pub groups: crate::serve::Groups,          // decoded row groups for key lookups
     pub attached: std::sync::RwLock<Vec<(String, Arc<Lake>)>>, // other lakes, read as `name.table` (`--attach`)
+    me: std::sync::Weak<Lake>,
+}
+
+impl std::fmt::Debug for Lake {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { write!(f, "Lake({})", self.url) }
+}
+
+/// How much memory queries may use on this node (`PONDRA_MEMORY_GB`, else half of RAM). Past it,
+/// sorts, aggregations and joins spill to temporary files, or the query stops with an error:
+/// a query never takes the node down.
+pub fn memory_limit() -> usize {
+    let gb = std::env::var("PONDRA_MEMORY_GB").ok().and_then(|g| g.parse::<f64>().ok());
+    let ram = || std::fs::read_to_string("/proc/meminfo").ok()?.lines().find_map(|l| l.strip_prefix("MemTotal:")?.trim().strip_suffix("kB")?.trim().parse::<usize>().ok()).map(|kb| kb << 10);
+    gb.map(|g| (g * (1u64 << 30) as f64) as usize).or_else(|| ram().map(|r| r / 2)).unwrap_or(4 << 30)
 }
 
 pub type Rows = Arc<Vec<datafusion::arrow::record_batch::RecordBatch>>;
@@ -143,7 +167,8 @@ impl Lake {
     /// the leader, so its own catalog view only needs the leader's checkpoints (no log replay).
     pub async fn open(url: &str, writer: bool, streamed: bool) -> Result<Arc<Lake>> {
         let (url, store, bucket) = open_store(url)?;
-        let rt = RuntimeEnvBuilder::new().build_arc()?;
+        let pool = Arc::new(datafusion::execution::memory_pool::FairSpillPool::new(memory_limit()));
+        let rt = RuntimeEnvBuilder::new().with_memory_pool(pool).build_arc()?; // (spills go to the OS temp dir)
         let disk = bucket.as_ref().and_then(|_| disk_tier(&url, &store));
         if let Some((bucket_url, s3)) = bucket {
             let prefix = url.trim_start_matches(&bucket_url).trim_start_matches('/').to_string();
@@ -156,7 +181,7 @@ impl Lake {
         let cache = ObjectStoreCacheOptions { root_folder: cache, max_cache_size_bytes: Some(2 << 30), cache_on_flush: true, cache_on_compaction: true, ..Default::default() };
         let cat = if writer { Catalog::writer(store.clone(), cache).await? } else { Catalog::reader(store.clone(), streamed, cache).await? };
         let hwm = watch::Sender::new(cat.get::<u64>("n").await?.unwrap_or(1) - 1);
-        let lake = Arc::new(Lake { url, store, cat, hwm, backlog: Default::default(), rt, tail: Mutex::new((lru::LruCache::unbounded(), 0)), disk, groups: crate::serve::Groups::new(cache_mb() << 19), attached: Default::default() });
+        let lake = Arc::new_cyclic(|me| Lake { url, store, cat, hwm, backlog: Default::default(), rt, tail: Mutex::new((lru::LruCache::unbounded(), 0)), disk, groups: crate::serve::Groups::new(cache_mb() << 19), attached: Default::default(), me: me.clone() });
         if let Some(writes) = lake.cat.unstarted.lock().unwrap().take() {
             tokio::spawn(lake.clone().commits(writes));
         }
@@ -242,7 +267,8 @@ impl Lake {
         for (key, value) in &d.puts {
             let paths: Vec<String> = match key.get(..2) {
                 Some("s/") => serde_json::from_slice::<Segment>(value).map(|s| vec![s.path]).unwrap_or_default(),
-                Some("t/") => serde_json::from_slice::<TableMeta>(value).map(|m| m.files.into_iter().map(|f| f.path).collect()).unwrap_or_default(),
+                // (files a tiering round writes; not a bulk load's big files, which only the queries that need them read)
+                Some("t/") => serde_json::from_slice::<TableMeta>(value).map(|m| m.files.into_iter().filter(|f| f.bytes <= 256 << 20).map(|f| f.path).collect()).unwrap_or_default(),
                 _ => vec![], // (keys like "c" and "n" are one character long)
             };
             paths.into_iter().filter(|p| !p.is_empty()).for_each(|p| disk.fetch_later(p));
@@ -318,6 +344,12 @@ impl Lake {
         datafusion_functions_json::register_all(&mut ctx).expect("JSON functions register"); // json_get(…), ->, ->>
         ctx
     }
+
+    /// Query memory in use, and the limit.
+    pub fn memory(&self) -> (usize, usize) { (self.rt.memory_pool.reserved(), memory_limit()) }
+
+    /// This lake as an `Arc` (for query plans that outlive the call that made them).
+    pub fn arc(&self) -> Arc<Lake> { self.me.upgrade().expect("a lake outlives its queries") }
 
     /// Full URL of an object, for DataFusion.
     pub fn full(&self, path: &str) -> String { format!("{}/{path}", self.url) }

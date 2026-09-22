@@ -1,7 +1,7 @@
 # AGENTS.md — working on Pondra
 
 Read this first, then `README.md` (what it does), `docs/adr-005-every-node-writes.md` (why it
-works this way) and `docs/adr-010-anywhere.md` (the current round). `docs/prototype-status.md`
+works this way) and `docs/adr-012-toward-petabytes.md` (the current round). `docs/prototype-status.md`
 has the measured numbers and what's left.
 
 ## What this is
@@ -18,13 +18,13 @@ The owner's design principles, which every change must respect:
 2. **As serverless as possible**: no always-on services besides the nodes themselves.
 3. **SPMD, not driver/executor** (Bodo-style): every node runs the same code on its slice.
 4. **No JVM, no Spark, no Flink, no Fluss needed.**
-5. **Short, simple, readable code** — without losing functionality. ~7,300 lines of Rust total (the Kafka protocol is 1,300 of them).
+5. **Short, simple, readable code** — without losing functionality. ~8,800 lines of Rust total (the Kafka protocol is 1,300 of them).
    If a change makes a file much longer, look for the simpler shape first.
 
 ## Layout
 
 ```
-src/      7,300 lines of Rust, one file per concern (see the table in README.md)
+src/      8,800 lines of Rust, one file per concern (see the table in README.md)
 python/   the Python client (pure Python, HTTP + Arrow)
 tools/    harness.py, cluster.py (tests), open_check.py (Delta + Iceberg readers == Pondra),
           keyed_bench.py (compaction cost), clean_bucket.py (keep a bucket to its newest lakes),
@@ -33,6 +33,8 @@ tools/    harness.py, cluster.py (tests), open_check.py (Delta + Iceberg readers
           newuser_bench.py (first reads, new nodes), demo_lake.py (one of everything + the tree),
           serve_bench.py + loadgen.go (serving), bench/tpch.py (TPC-H vs DuckDB and Spark),
           sizes.py, sim_r2.py (local S3 with R2 latency),
+          metadata_bench.py (a table with a million files), flight_bench.py (Arrow Flight),
+          cloud/ (start a cluster on several machines and benchmark it),
           r2_test.sh (run the suite against a real bucket), bench/ (vs Spark and Flink)
 docs/     ADRs and reports; lake-format.md is the on-disk layout
 ```
@@ -93,6 +95,19 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
   leader from a dead one.
 - **Maintenance** (log → Parquet, merging small files, compaction, retention) is decided by the
   leader and dealt out to all nodes as jobs.
+- **Table metadata that stays small** (`manifest.rs`, append tables): every file carries its
+  columns' min/max; past 128 files, all but the newest 64 are sealed into immutable manifests
+  (`data/{t}/_manifests/`) behind one list object (`TableMeta.sealed`). Queries (`query::Pruned`)
+  prune manifests, then files, by their filters. `partition_by` keeps one partition per file.
+- **Distributed queries** (`spmd.rs`): gather (first exchange is a gather: the coordinator
+  merges partial results) or shuffle (each hash exchange becomes a step: every node splits its
+  output by hash, one bucket per node, and fetches its bucket from every node). Small tables are
+  read whole (broadcast); a node's slice (`ShareExec`) reports the whole table's size; only plans
+  that the spread analysis proves correct run spread.
+- **Arrow Flight / Flight SQL** (`flight.rs`, `--flight`): ADBC/JDBC statements and ingest,
+  pyarrow `DoPut` exactly-once, `DoGet` SQL or a table's log as a columnar stream.
+- **Memory:** one spill pool per node (`--memory-gb`); a query out of memory runs again with
+  sort-merge joins. **`GET /metrics`** (Prometheus) for everything else.
 
 ## Invariants — break these and data goes missing
 
@@ -197,6 +212,21 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    schema without conforming them: rows written before an ALTER have fewer columns.
 24. **A window is emitted once** (`views::emit`): the rows and the `emit:{view}` producer's seq
    (the watermark, µs) commit together, with `prev` = the last watermark.
+25. **An append table's entry lists at most 128 files** (`manifest::seal`, called from
+   `tier::maintain` and `write::record`); the rest are in manifests, which never change. Anything
+   that needs every file goes through `manifest::all` / `manifest::pruned`, never `meta.files`
+   alone (publishing, orphan collection, distributed queries).
+26. **A partitioned table's files each hold one partition value** (`tier::split` on every write,
+   merges grouped by `part`). Never merge files of different partitions.
+27. **Every node plans a distributed query alike.** A slice is scanned through `ShareExec`, which
+   reports the whole table's size, and has 2+ partitions; the coordinator compares each node's
+   plan shape at every step and falls back to one node on any difference.
+28. **A shuffle never carries a whole copy** (`spmd::spread`): a hash exchange over rows every
+   node has in full stays inside the node, and what reaches the coordinator is split. New
+   operators are refused until the analysis knows them.
+29. **Flushes reach the sequencer in the order they were cut** (`log::send`'s turn), so a
+   producer's pipelined batches commit in order. Over HTTP from a follower they may still
+   overtake each other; a door that pipelines (Flight) re-queues a batch refused as out of order.
 
 ## Tests: run these before and after any change
 
@@ -214,6 +244,10 @@ python3 tools/harness.py clients               # SQL writes, Python client, Post
 python3 tools/harness.py kafka                 # Kafka producers/consumers/groups (librdkafka, kafka-python), Debezium, SASL
 python3 tools/harness.py alter                 # ALTER TABLE ADD COLUMN under load, 6 outside readers follow
 python3 tools/harness.py windows               # event-time windows emitted once, late rows, a leader restart
+python3 tools/harness.py scale                 # partitions, manifests, 14 shuffled/spread query shapes == one node, memory limits
+python3 tools/harness.py flight                # Arrow Flight (pyarrow) and Flight SQL (ADBC): exactly-once DoPut, SQL, the log stream
+python3 tools/metadata_bench.py [--files 1000000]   # a million files: commits, pruning, a restart, 3 nodes
+python3 tools/flight_bench.py                  # Flight in, out, and the log as a stream
 python3 tools/kafka_bench.py [--flag ack=replicated]   # Kafka ingest throughput and latency, 3 nodes
 python3 tools/mcp_client.py --url http://127.0.0.1:8080/mcp   # the official MCP SDK (pip install mcp) against a node
 python3 tools/keyed_bench.py                   # keyed-table compaction: bytes written, correctness
@@ -223,7 +257,8 @@ python3 tools/serve_bench.py --keys 2000000   # serving: point lookups and dashb
 ```
 
 The Python tools need `pip install pyarrow pandas polars duckdb deltalake pyiceberg s3fs boto3
-moto psycopg psycopg2-binary asyncpg sqlalchemy confluent-kafka kafka-python mcp`.
+moto psycopg psycopg2-binary asyncpg sqlalchemy confluent-kafka kafka-python mcp
+adbc-driver-flightsql`.
 
 Add `--s3` to any of them with a simulated-R2 bucket to see the object-storage behaviour:
 
@@ -261,10 +296,11 @@ Practical notes for an agent working here:
 - Node stderr goes to `/tmp/pondra-<port>-<id>.stderr`; that's where "restarting to rejoin",
   "slow tiering" and panics show up.
 
-## State of the work (2026-09-22, round 10)
+## State of the work (2026-09-22, round 11)
 
-Everything in `docs/prototype-status.md` passes on local disk and on simulated R2. The round-10
-additions (Kafka, the REST catalog, ALTER TABLE, windows) also ran against real R2.
+Everything in `docs/prototype-status.md` passes on local disk and on simulated R2. The round-11
+additions (manifests, partitions, shuffles, memory limits, Arrow Flight) also ran against real
+R2.
 
 **R2 test buckets.** There are two:
 
@@ -281,17 +317,18 @@ all. After R2 runs: `tools/clean_bucket.py --bucket ponderabucket-us --bucket po
 
 Headline numbers, all on one 2-vCPU box:
 
+- **Petabyte-shaped metadata:** a table given a million files commits a 20 KB entry; commits,
+  INSERTs and acks take what they took with a handful of files; a query over today skips the
+  million files without opening one (13 ms).
+- **Arrow Flight:** 15.7 M rows/s in (exactly-once), 9.1 M rows/s out, the log as a stream in
+  2.6 ms p50.
+- **Shuffles:** 14 query shapes spread over 3 nodes equal one node (11 shuffled). One box can't
+  show speed-ups: three nodes share two cores.
 - **Writes on R2:** acked in 4 ms with `--ack replicated` (299 ms durable); 87k events/s from 64
-  writers, replicated. Locally, `--fsync` and `--replicas 3` cost nothing measurable (4 ms p50).
-- **Writes from anywhere:** a `pondra sql` INSERT through the bucket inbox takes 1.0 s locally
-  and 7.3 s on real R2, including the 3–6 s it takes to open the catalog.
-- **Clients:** 18 checks pass: SQL writes, the Python client, four Postgres drivers, MCP,
-  vectors, tokens, attached lakes, the inbox.
-- **Kafka:** librdkafka producers into 3 nodes on one box: ~0.8 M events/s, exactly-once, ack
-  1 ms p50 (replicated); a consumer on another node has it 1 ms later. On real R2: 461k events/s replicated (ack 1 ms p50), 68.7k durable.
+  writers, replicated.
+- **Kafka:** ~0.8 M events/s exactly-once into 3 nodes, ack 1 ms p50 (replicated).
 - **Freshness, like for like:** nodes see a write 10–15 ms after the ack (local and R2); Delta
   and Iceberg readers ~30 ms (local) / 3–4 s (near R2) / 7–10 s (far R2).
-- **Keyed compaction:** 3x fewer bytes written than full rewrites (size-tiered).
 - **TPC-H SF1:** all 22 queries in 5.9 s (Spark 4.2: 58–65 s). **Serving:** 0.14 ms key lookups,
   20–36k/s.
 - **Consistency:** 0 torn reads, 0 lost batches, clean failovers, in both ack modes.
@@ -302,34 +339,35 @@ what each competitor is building next, and the plan for the gaps — is
 
 Known limits, in the order they matter:
 
-1. **Replicated acks' window.** An acked write survives any one node dying (with `--fsync`,
+1. **No multi-machine run yet.** `tools/cloud/` is the kit: `cluster.sh` over ssh, `bench.py`
+   from a client VM.
+2. **Shuffle buckets and query results live in memory** (not streamed or spilled), a failed
+   shuffle step fails the query (it then runs on one node), no skew handling. Distributed
+   queries are one SELECT with inner joins.
+3. **Replicated acks' window.** An acked write survives any one node dying (with `--fsync`,
    followers' power loss too), but not the leader and every holder dying before the bucket has
-   it. Recovery waits up to 20 s for unreachable members.
-2. **One sequencer per lake** orders commits. Attached lakes split the load across leaders, but
+   it.
+4. **One sequencer per lake** orders commits. Attached lakes split the load across leaders, but
    there are no transactions across lakes.
-3. **No shuffles** in distributed queries: big-to-big joins run on one node. Everything has run
-   as processes on one machine; no multi-machine run yet.
-4. **Kafka's edges:** one partition per topic, no transactions, sparse offsets, consumer groups
-   in the leader's memory; the Java client is untested (no jars here).
-5. **Streaming:** windows emit once past a watermark taken from window starts (not the
-   source's event time); no session windows or point-in-time joins yet.
-6. **Security:** tokens per role only; no TLS (use a proxy), no per-table grants or quotas.
-7. **Latency of one-off writers on far storage:** `pondra sql` spends 2–3 s opening the
-   catalog on far object storage, and an inbox write adds a second or two.
-8. **`_deleted` shows** in `SELECT *` of keyed tables (null or false for live rows).
+5. **Publishing a huge table** to Delta/Iceberg rewrites a manifest of every file per version,
+   and the publish state lists every file: fine for millions of rows, not for millions of files.
+6. **Kafka's edges:** one partition per topic, no transactions, sparse offsets, consumer groups
+   in the leader's memory.
+7. **Streaming:** no session windows or point-in-time joins; the watermark comes from window
+   starts.
+8. **Security:** tokens per role only; no TLS (use a proxy), no per-table grants or quotas.
 
 Good next moves, in order. The plan table in the comparison doc has the evidence each should
 produce.
 
-1. **A multi-machine run** (3–10 VMs on S3/R2), then **shuffles** through the job-dealing
-   mechanism.
-2. **AI functions in SQL** (`ai_complete`, `embed` against an OpenAI-compatible endpoint) and an
-   approximate vector index.
-3. **Kafka partitions** (key-hashed slices of a table) and transactions; the Java client and
-   Kafka Connect verified.
-4. **TLS, per-table grants, an audit log, quotas.**
-5. **Session windows**, a watermark from event time, point-in-time joins.
-6. **More schema evolution:** renames, defaults, type widening.
+1. **A multi-machine run** with `tools/cloud/` (3–10 VMs on S3/R2): ingest over Flight and Kafka,
+   the query suite at 1, 3 and 6 nodes, TPC-H SF100 against Spark.
+2. **Shuffles that stream and spill** to the local SSD, with a failed step retried alone.
+3. **Publishing big tables** from Pondra's manifests (an Iceberg manifest per Pondra manifest,
+   Delta checkpoints), so the open formats scale with the native one.
+4. **Kafka partitions** (key-hashed slices of a table) and transactions.
+5. **AI functions in SQL** and an approximate vector index.
+6. **TLS, per-table grants, an audit log, quotas.**
 
 ## Conventions
 

@@ -19,6 +19,7 @@ Anyone with the binary and credentials for the bucket can use it in one of three
 | **Serverless**: `pondra sql --dir … "…"` | Opens the catalog in the bucket, reads the log tail and Parquet directly | Every write already in the bucket (every acknowledged write, in the default `--ack durable` mode) | `CREATE TABLE`, `INSERT`, `UPDATE`, `DELETE`: this machine does the work. The leader records it: over HTTP, through the bucket inbox if it can't be reached (`inbox/`), or this process leads for a moment if nobody does | Opening the catalog: ~20 sequential requests (30 ms on local disk, 3–6 s on R2 from this sandbox) |
 | **Other engines**, through Delta Lake or Iceberg | The table's `_delta_log/` or `metadata/`, if the table publishes it — directly, or through a node's Iceberg REST catalog (`http://node:8080`, namespace `default`) | The table as of the last tiering round | No | Nothing extra for Pondra, beyond the publishing itself |
 | **Kafka clients**, through a node's `--kafka` port | A topic per table: produce appends through the log, fetch reads the log | Every committed write | Yes | A running node |
+| **Arrow Flight / ADBC clients**, through a node's `--flight` port | Flight SQL statements; `DoPut` appends through the log; `DoGet` reads SQL results or a table's log (chosen columns) | Every committed write | Yes | A running node |
 
 **Several lakes, one bucket.** Each lake is its own prefix with its own leader. A node or a
 `pondra sql` given `--attach sales=s3://bucket/sales` reads that lake's tables as `sales.orders`
@@ -50,7 +51,11 @@ Turning a format off deletes its metadata, so nobody reads a stale copy.
 │                               Arrow IPC stream + ZSTD; smaller ones ride inside the catalog commit
 └── data/<table>/               one folder per table (views and task outputs are tables too)
     ├── <uuid>.parquet          the table's rows (Parquet, ZSTD; keyed tables sorted by key, with
-    │                           bloom filters on the key; `cluster_by` tables sorted by those columns)
+    │                           bloom filters on the key; `cluster_by` tables sorted by those columns;
+    │                           `partition_by` tables: one partition value per file)
+    ├── _manifests/             append tables past 128 files: the older files' list (zstd JSON)
+    │   ├── <uuid>.json.zst     a manifest: up to 4,096 files, each with its column ranges
+    │   └── <uuid>.json.zst     the manifest list: each manifest with its totals and ranges
     ├── _delta_log/             only if the table publishes Delta
     │   ├── 00000000000000000000.json … 00000000000000000010.checkpoint.parquet
     │   └── _last_checkpoint
@@ -69,6 +74,7 @@ Turning a format off deletes its metadata, so nobody reads a stale copy.
 | `inbox/` | JSON requests (a flush as its binary body), JSON answers | the leader | each request deleted once answered; answers deleted by the writer (unclaimed ones after an hour) |
 | `log/` | Arrow IPC stream + ZSTD, one per large flush (rows of any tables) | Pondra | immutable; deleted once tiered and older than `--retain-secs`, or `--changelog-secs` if longer (the change feed) |
 | `data/<table>/*.parquet` | Parquet, ZSTD | anyone | immutable; replaced files deleted after `--retain-secs` |
+| `data/<table>/_manifests/` | zstd JSON: manifests (a list of `DataFile`s) and manifest lists (each manifest's path, files, rows, bytes, column ranges) | Pondra | immutable; a replaced list and merged manifests go to the table's garbage, deleted after `--retain-secs` |
 | `data/<table>/_delta_log/` | Delta Lake protocol 1/2: JSON commits, Parquet checkpoints | Delta readers | append-only; `_last_checkpoint` rewritten; last 1,000 versions kept |
 | `data/<table>/metadata/` | Iceberg v2: metadata JSON, Avro manifest lists and manifests | Iceberg readers | append-only; `version-hint.text` rewritten; last 100 snapshots kept |
 
@@ -110,8 +116,9 @@ the column as null (log rows are conformed to the current columns by name). Delt
 Only adding is supported.
 
 SQL `TIMESTAMP` columns are stored in microseconds (`Timestamp(µs)`), the unit Iceberg, Delta,
-Spark and Postgres use; tables with them publish to Iceberg (`timestamp` / `timestamptz`) and,
-for time-zone-aware ones, Delta.
+Spark and Postgres use; tables with them publish to Iceberg (`timestamp` / `timestamptz`) and
+Delta (`timestamp_ntz`, with its table feature: reader 3 / writer 7; `timestamp` for
+time-zone-aware ones).
 
 ## Small files, compaction and indexes
 
@@ -140,14 +147,24 @@ The same on local disk and on object storage:
 - **Retention:** replaced files and consumed log objects are deleted after `--retain-secs`.
   Objects no commit ever referenced are deleted after a day.
 - **Skipping data:**
+  - every append-table file's column ranges (its first 32 columns), kept in the catalog or its
+    manifest: a query skips whole manifests, then files, before opening any Parquet footer;
+  - `partition_by` (a column, or year/month/day/hour of a timestamp): every file holds one
+    value, so a filter on it skips all other partitions' files;
   - Parquet min/max statistics per row group and page;
   - keyed tables sorted by key, with bloom filters and small row groups;
   - `"cluster_by": ["col"]` on append tables: every file sorted by those columns. Measured with
     8 M rows: one-user queries 6.4x faster, ranges 11x; full scans 0.6x
     (`docs/adr-009-native-first.md`).
 
-Not there yet: partitions, clustering across files (Z-order / Hilbert), deletion vectors,
-copy-on-write DELETE for append tables.
+- **Table metadata that stays small** (append tables): a table's catalog entry lists at most
+  128 files. Past that, all but the newest 64 are sealed into manifests (up to 4,096 files each)
+  behind one manifest list. Small files of a partition are merged before they're sealed, and
+  small manifests are merged 16 at a time. A table of a million files commits a ~19 KB entry, as
+  fast as a table of ten (`tools/metadata_bench.py`).
+
+Not there yet: clustering across files (Z-order / Hilbert), deletion vectors, copy-on-write
+DELETE for append tables, merging files once they're sealed.
 
 ## Reading it with other engines
 

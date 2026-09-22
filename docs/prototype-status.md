@@ -1,6 +1,6 @@
 # Prototype status: Pondra, a streamhouse in one binary
 
-**Date:** 2026-09-22 (round 10) · **Plan:** ADR-002 to ADR-011 · **Code:** `pondra.zip` / `pondra.bundle` (≈7,300 lines of Rust, plus a Python client and test and benchmark tools)
+**Date:** 2026-09-22 (round 11) · **Plan:** ADR-002 to ADR-012 · **Code:** `pondra.zip` / `pondra.bundle` (≈8,800 lines of Rust, plus a Python client and test and benchmark tools)
 **Name:** the prototype formerly called `lh` is now **Pondra**. The name is free on crates.io, PyPI and npm. A small personal-finance app uses it (pondra.app), a different category; run a trademark search before a public launch.
 
 ## Where it stands
@@ -14,6 +14,29 @@ One Rust binary replaces the Kafka + Flink + Spark + metastore + ZooKeeper stack
 - upsert and merge tables.
 
 Start more copies on the same bucket to scale out. The only state is object storage. There's no JVM, no database server and no coordination service.
+
+**Round 11 took on what stood between it and petabyte tables** (ADR-012):
+
+1. **Table metadata that stays small.**
+   - Every file's column ranges are kept.
+   - Past 128 files, a table's file list goes into immutable manifests behind one list object.
+   - A table given a **million files** (1 PiB on paper) commits a 20 KB catalog entry: tiering
+     commits 11 ms, INSERTs 4 ms, as with a handful of files.
+   - A query over today skips the million without opening one: 13 ms.
+2. **Partitions:** `partition_by = 'day(ts)'` (or a column). Every file holds one partition, and a
+   day's query read 2 files of 237.
+3. **Memory limits:** `--memory-gb`. Aggregations, sorts and joins bigger than memory spill, or
+   switch to a join that can: a 2 M-group aggregation, a 3 M-row window sort and a 3 M × 3 M join
+   ran within 50 MB.
+4. **Shuffles.** Many-group aggregations, joins of big tables, DISTINCT and windows by key now
+   run on every node in stages; small tables are broadcast. 14 query shapes on 3 nodes: all
+   equal one node, 11 shuffled.
+5. **Arrow Flight and Flight SQL.**
+   - ADBC and JDBC drivers and pyarrow connect.
+   - **15.7 M rows/s in, exactly-once**, and 9.1 M rows/s out, on one node.
+   - A table's log is a columnar stream: a subscriber has each new commit in **2.6 ms**.
+6. **`GET /metrics`** for Prometheus, and a kit to benchmark a cluster of several machines
+   (`tools/cloud/`).
 
 **Round 10 opened the doors other systems use** (ADR-011):
 
@@ -195,6 +218,98 @@ correctness test passed while sustained ingest fell by half. It was found by ben
 testing. There is now a `tiering` test (rounds of writes + `/tier`: the log must drain and the
 file count stay bounded) and a note in `AGENTS.md` that this failure mode shows up as throughput,
 not as a red test.
+
+## Round 11: toward petabytes: metadata, partitions, memory limits, shuffles, Arrow Flight
+
+**What's new** (ADR-012):
+
+| | What | Measured (local disk, one 2-vCPU box) |
+|---|---|---|
+| Table metadata that stays small | Every append-table file's column ranges. Past 128 files, the rest sealed into immutable manifests (≤4,096 files each, by partition) behind one list object; queries prune manifests, then files, before opening any Parquet | `metadata_bench.py`: 1,000,000 files registered (1 PiB and 10 T rows on paper). Catalog entry 2.9 → 20.4 KB; tiering commit 10.6 → 11.3 ms; INSERT 5.0 → 4.4 ms; append ack 7.2 → 6.6 ms; a query over today 5.0 → 12.9 ms, opening 7 files and skipping 1,000,006; one day of 2010 plans its 138 files in 29 ms; a restarted node answers in 35 ms; 3 nodes dealing out manifests agree |
+| Partitions | `partition_by = 'day(ts)'` (a column, or year/month/day/hour of a timestamp); one partition per file; merges within a partition; a partition's small files merged before they're sealed | `harness.py scale`: 23,100 rows over 139 days, every Parquet file one day, a day's query reads 2 of 237 files |
+| Memory limits | `--memory-gb` (default half of RAM): one spill pool for all queries; out of memory → again with sort-merge joins | under 50 MB: a 2 M-group aggregation, a 3 M-row window sort, a 3 M × 3 M join |
+| Shuffles | Hash exchanges become shuffles between nodes, step by step; small tables broadcast; a node's slice reports the whole table's size; only plans whose operators stay correct split | 14 query shapes on 3 nodes == one node, 11 shuffled; `cluster.py spread` (9 queries, 4 M rows) identical, no fallbacks |
+| Arrow Flight / Flight SQL | `--flight`: ADBC and JDBC drivers (queries, writes, `adbc_ingest`, catalog), pyarrow `DoPut` exactly-once with pipelined acks, `DoGet` SQL, a table's log as a columnar stream with chosen columns | `flight_bench.py`, 4 writers: **15.7 M rows/s (437 MB/s) in**, exactly-once; `SELECT *` out at 9.1 M rows/s; a log subscriber has each commit in **2.6 ms p50 / 5.1 ms p99**. `harness.py flight`: 13 checks |
+| Metrics | `GET /metrics`: rows in, queries, spread and shuffled, files scanned and skipped, memory, commit latency, per-table files, rows, bytes, entry size | used by the tests above |
+| Delta and timestamps | `TIMESTAMP` columns publish to Delta as `timestamp_ntz` | delta-rs, Polars and DuckDB read them (`harness.py scale`) |
+
+**Regression, local disk** (`logs/round11/`):
+
+- `harness.py all`: every test passes, now with `scale` (9 checks) and `flight` (13).
+  - `clients` 18, `kafka` 9, `alter` 8, `windows` 3;
+  - `crash`: 5 runs, 0 lost, 0 duplicated;
+  - `reader` 10 ms p50.
+- `failover`: 3 runs, writes back after 4.5–5.1 s, state == view == model.
+- `users`: 2.95 M events (95k/s), 0 inconsistent reads, 0 lost or duplicated batches.
+- `open_check.py`: all 8 outside readers equal Pondra.
+- `cluster.py spread`: identical on 3 nodes.
+
+  All three nodes share two cores here, so it checks correctness, not speed. The high-cardinality
+  GROUP BY took 0.64–1.5 s spread against 0.65–1.3 s on one node, from run to run.
+
+**Simulated R2** (`logs/round11/sim-r2.txt`; PUT p50 197 ms, GET p50 100 ms):
+
+- `scale`: all 9 checks: 214 files (132 sealed), every file one day, a day's query reads 2
+  files, 14 query shapes on 3 nodes equal one node (11 shuffled), 6 outside readers, the 50 MB
+  limit. The first run failed in the test itself: a replaced file was deleted between listing
+  the folder and reading it. The check now skips such files.
+- `flight`: 13 of 13; a log subscriber has each commit 111 ms after it's sent (durable acks: one
+  PUT each).
+- `metadata_bench.py --files 100000`:
+  - catalog entry 1.9 → 19.0 KB;
+  - tiering commit 781 → 529 ms, INSERT 476 → 348 ms, append ack 225 → 275 ms (each about one
+    PUT);
+  - a query over today 4 → 14 ms, opening 2 files and skipping 100,006;
+  - a restarted node 128 ms; 3 nodes 38 ms, same answer.
+- `flight_bench.py` (durable, 4 writers): 1.5 M rows/s in, 13.8 M rows/s out, a subscriber 359 ms
+  p50.
+- `crash --runs 3 --batches 150`: 3 runs × 45k events, 0 lost, 0 duplicated, views exact,
+  through 251 injected crashes and 12 kill -9s. This covers the new flush ordering.
+- `kafka`: 9 of 9.
+
+**Real R2** (`ponderabucket-us`, `logs/round11/r2.txt`):
+
+- `scale`: all 9 checks: 214 files (131 sealed), every file one day, a day's query reads 2
+  files, 14 query shapes on 3 nodes equal one node (11 shuffled), 6 outside readers equal Pondra,
+  the 50 MB limit.
+- `flight`: 13 of 13; a log subscriber has each commit 434 ms after it's sent (durable).
+- `metadata_bench.py --files 100000`:
+  - catalog entry 2.5 → 19.2 KB;
+  - append ack 289 → 290 ms, INSERT 830 → 548 ms, tiering commit 842 → 1,011 ms (one or two
+    PUTs each);
+  - a query over today 5 → 17 ms, opening 3 files and skipping 100,008;
+  - a restarted node 125 ms; 3 nodes 47 ms, same answer.
+- `flight_bench.py` (durable, 4 writers, while a release build ran on the same two cores):
+  1.0 M rows/s in, 8.5 M rows/s out, a subscriber 525 ms p50.
+- Every test lake was deleted when its test finished; the buckets hold only the three kept
+  lakes.
+
+### What the tests caught this round
+
+- **Statistics that didn't prune.** File ranges were first written with the values' display
+  form: a timestamp came out as a raw integer that didn't parse back as a timestamp. So pruning
+  on timestamps silently kept every file. They're now text that casts back exactly (ISO 8601),
+  checked per column type.
+- **Spreading quietly stopped when a node's slice pruned to nothing.** A single-partition plan
+  merges its aggregate into one step, so there was no place to cut. Every slice now has at least
+  two partitions.
+- **Nodes with empty slices planned joins differently** (build side chosen by local size). The
+  coordinator caught it and fell back to one node. Now a slice reports the whole table's size.
+- **A shuffle ended too early.** A node that finished its last step dropped its buckets while
+  others were still fetching them ("shuffle expired"). Finished shuffles are now kept for a
+  minute.
+- **A keyed table's view plans a hash repartition over data every node has whole.** Treated as a
+  shuffle, each row would have arrived once per node. The spread analysis keeps such a
+  repartition inside the node.
+- **Pipelined batches from one producer overtook each other.** 756 of 800 Flight batches came
+  back "out of order": a node's flushes reached the sequencer in any order. Flushes now reach it
+  in the order they were cut, and the Flight door re-queues the rare batch that still arrives
+  early (over HTTP from a follower).
+- **Tables written only by INSERT never merged their small files.** Maintenance ran only for
+  tables with log traffic. Small files also got sealed into manifests while small (338 of 402);
+  a partition's small files are now merged first (114–152 of ~240).
+- **Delta didn't publish tables with a `TIMESTAMP` column.** They now publish as `timestamp_ntz`.
+- **A Kafka consumer-group check allowed a rebalance only 15 s**; it now waits up to 45 s.
 
 ## Round 10: the Kafka protocol, an Iceberg REST catalog, schema evolution, windows that close
 
@@ -568,12 +683,12 @@ a real Cloudflare R2 bucket. All of them pass on all three.
 
 ## Sizes
 
-| What | Round 3 | Round 5 | Round 8 | Round 9 | Round 10 |
-|---|---|---|---|---|---|
-| Binary (stripped) | 88.3 MB (30 MB gzip, 17 MB xz) | 89.2 MB (29.9 MB gzip, 16.8 MB xz) | 90.0 MB (30.5 MB gzip, 18.7 MB xz) | 90.7 MB (30.5 MB gzip, 17.2 MB xz), with the Postgres protocol and MCP | 93.0 MB (31.4 MB gzip, 17.6 MB xz), with the Kafka protocol and JSON functions |
-| Idle memory | 18 MB | 41 MB (mimalloc reserves more up front) | 42 MB | 44 MB | 49 MB (with `--kafka`) |
-| Peak memory under full load | 455 MB | 1.8 GB at 2.84 M events/s sustained (279–586 MB in the batch and streaming benchmarks) | not re-measured | not re-measured | not re-measured |
-| Storage per event (user, event, amount, ts) | NDJSON 77.9 B → log 12.8 B → Parquet 6.8 B | NDJSON 77.9 B → log 12.8 B → Parquet 6.8 B (unchanged) | unchanged | unchanged | unchanged |
+| What | Round 3 | Round 5 | Round 8 | Round 9 | Round 10 | Round 11 |
+|---|---|---|---|---|---|---|
+| Binary (stripped) | 88.3 MB (30 MB gzip, 17 MB xz) | 89.2 MB (29.9 MB gzip, 16.8 MB xz) | 90.0 MB (30.5 MB gzip, 18.7 MB xz) | 90.7 MB (30.5 MB gzip, 17.2 MB xz), with the Postgres protocol and MCP | 93.0 MB (31.4 MB gzip, 17.6 MB xz), with the Kafka protocol and JSON functions | 95.0 MB (32.0 MB gzip, 18.0 MB xz), with Arrow Flight (gRPC) |
+| Idle memory | 18 MB | 41 MB (mimalloc reserves more up front) | 42 MB | 44 MB | 49 MB (with `--kafka`) | 42 MB (with `--kafka --flight --pg`) |
+| Peak memory under full load | 455 MB | 1.8 GB at 2.84 M events/s sustained (279–586 MB in the batch and streaming benchmarks) | not re-measured | not re-measured | not re-measured | bounded for queries by `--memory-gb` |
+| Storage per event (user, event, amount, ts) | NDJSON 77.9 B → log 12.8 B → Parquet 6.8 B | NDJSON 77.9 B → log 12.8 B → Parquet 6.8 B (unchanged) | unchanged | unchanged | unchanged | unchanged |
 
 ## Memory is a knob, not a mystery
 
@@ -621,11 +736,15 @@ peak at 279–586 MB.
   whole table is rewritten only when the newer data has grown to about half of it; partitioned
   compaction (a key range per node) is the next step.
 - Merge tables only support decomposable aggregates (sum, count, min, max).
-- Distributed queries have one stage: no shuffles, so big-to-big joins run on one node.
+- Distributed queries shuffle (round 11), but their buckets and results are held in memory,
+  a failed step fails the query (it then runs on one node), and there's no skew handling.
+  Nothing has run on several machines yet; `tools/cloud/` is the kit.
+- Publishing a huge table to Delta or Iceberg rewrites a manifest of every file per version:
+  fine for big tables, not yet for millions of files (native reads are).
 - Under sustained overload, commits pause until tiering catches up (`--backlog`); a client with a
   short timeout will see it as a slow ack.
 - Tokens per role only (round 9): no TLS, per-table grants, quotas or multi-tenancy.
-- Other engines read Delta and Iceberg (opt-in per table), unpartitioned, and keyed tables only
+- Other engines read Delta and Iceberg (opt-in per table), published unpartitioned, and keyed tables only
   as of their last compaction (at most 8 tiering rounds behind). Time travel reaches back only as
   far as `--retain-secs` keeps replaced files.
 - Bucket credentials still decide who can use `pondra sql` and the inbox directly.
@@ -634,8 +753,10 @@ peak at 279–586 MB.
 
 From the plan in `docs/comparison-spark-flink-fluss.md`, in order:
 
-1. **A multi-machine run** (3–10 VMs on S3/R2), then **shuffles** for big-to-big joins.
-2. **AI functions in SQL** and an approximate vector index.
-3. **Kafka partitions** and transactions; the Java client and Kafka Connect verified.
-4. **TLS, per-table grants, an audit log, quotas.**
-5. **Session windows**, a watermark from event time, point-in-time joins.
+1. **A multi-machine run** with `tools/cloud/` (3–10 VMs on S3/R2), TPC-H SF100 against Spark.
+2. **Shuffles that stream and spill**, with a failed step retried alone; skew handling.
+3. **Publishing big tables** from Pondra's manifests.
+4. **Kafka partitions** and transactions; the Java client and Kafka Connect verified.
+5. **AI functions in SQL** and an approximate vector index.
+6. **TLS, per-table grants, an audit log, quotas.**
+7. **Session windows**, a watermark from event time, point-in-time joins.

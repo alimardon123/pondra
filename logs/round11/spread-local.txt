@@ -1,0 +1,11 @@
+== cluster.py spread --rows 4000000 (local disk, 3 nodes on one 2-vCPU box)
+  q1_scan_agg          one node     47 ms   3 nodes     41 ms   same result: True
+  q2_filter_group      one node    108 ms   3 nodes    184 ms   same result: True
+  q3_high_card_group   one node    679 ms   3 nodes   1545 ms   same result: True
+  q4_count_distinct    one node    117 ms   3 nodes    318 ms   same result: True
+  q5_join              one node    113 ms   3 nodes    136 ms   same result: True
+  q6_time_bucket       one node     69 ms   3 nodes     75 ms   same result: True
+  q7_avg_distinct      one node     78 ms   3 nodes     97 ms   same result: True
+  q8_top_rows          one node     85 ms   3 nodes     76 ms   same result: True
+  q9_filter_count      one node     22 ms   3 nodes     25 ms   same result: True
+spread: 4,000,000 rows, 3 nodes; results identical: True; fell back to one node: 0 times

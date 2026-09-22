@@ -1,0 +1,31 @@
+== open_check.py (local)
+   "delta/duckdb": 50,
+   "iceberg/pyiceberg": 50,
+   "iceberg/polars": 50,
+   "iceberg/duckdb": 50,
+   "iceberg/rest/pyiceberg": 50,
+   "iceberg/rest/duckdb": 50
+  },
+  "totals": {
+   "delta/delta-rs": 100,
+   "delta/polars": 100,
+   "delta/duckdb": 100,
+   "iceberg/pyiceberg": 100,
+   "iceberg/polars": 100,
+   "iceberg/duckdb": 100,
+   "iceberg/rest/pyiceberg": 100,
+   "iceberg/rest/duckdb": 100
+  },
+  "dims": {
+   "delta/delta-rs": 100,
+   "delta/polars": 100,
+   "delta/duckdb": 100,
+   "iceberg/pyiceberg": 100,
+   "iceberg/polars": 100,
+   "iceberg/duckdb": 100,
+   "iceberg/rest/pyiceberg": 100,
+   "iceberg/rest/duckdb": 100
+  }
+ },
+ "match": true
+}

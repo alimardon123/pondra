@@ -3,12 +3,15 @@
 mod auth;
 mod cache;
 mod delta;
+mod flight;
 mod iceberg;
 mod inbox;
 mod kafka;
 mod serve;
 mod cluster;
 mod log;
+mod manifest;
+mod metrics;
 mod mcp;
 mod pg;
 mod query;
@@ -55,6 +58,10 @@ enum Cmd {
         /// Streaming tasks run as soon as new rows commit, and at least this often (milliseconds).
         #[arg(long, default_value_t = 1000)]
         task_ms: u64,
+        /// Memory for queries, in GB (also PONDRA_MEMORY_GB; default: half the machine's).
+        /// Sorts, joins and aggregations that need more spill to the temp dir.
+        #[arg(long)]
+        memory_gb: Option<f64>,
         /// Seconds to keep consumed log segments and replaced files before deleting them.
         #[arg(long, default_value_t = 60)]
         retain_secs: u64,
@@ -104,6 +111,10 @@ enum Cmd {
         /// port of `--kafka`).
         #[arg(long)]
         kafka_advertise: Option<String>,
+        /// Also speak Arrow Flight and Flight SQL here (e.g. 0.0.0.0:8815): ADBC, JDBC and
+        /// pyarrow clients, Arrow in and out; a table's log as a columnar stream.
+        #[arg(long)]
+        flight: Option<String>,
         /// Access tokens (also PONDRA_READ_TOKEN, PONDRA_WRITE_TOKEN, PONDRA_ADMIN_TOKEN): reading
         /// needs any, writing rows write or admin, tables/views/tasks admin. Give every node the
         /// same ones; none set = no checks.
@@ -142,13 +153,16 @@ enum Cmd {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     match Cmd::parse() {
-        Cmd::Serve { dir, addr, reader, flush_ms, tier_secs, task_ms, retain_secs, changelog_secs, backlog, cache_dir, cache_gb, ack, replicas, fsync, publish, pg, kafka, kafka_advertise, read_token, write_token, admin_token, attach: attached } => {
+        Cmd::Serve { dir, addr, reader, flush_ms, tier_secs, task_ms, memory_gb, retain_secs, changelog_secs, backlog, cache_dir, cache_gb, ack, replicas, fsync, publish, pg, kafka, kafka_advertise, flight, read_token, write_token, admin_token, attach: attached } => {
             let env = |flag: Option<String>, var: &str| flag.or_else(|| std::env::var(var).ok()).filter(|t| !t.is_empty());
             let auth = Arc::new(auth::Auth::new(env(read_token, "PONDRA_READ_TOKEN"), env(write_token, "PONDRA_WRITE_TOKEN"), env(admin_token.clone(), "PONDRA_ADMIN_TOKEN")));
             if let Some(t) = env(admin_token, "PONDRA_ADMIN_TOKEN") {
                 std::env::set_var("PONDRA_ADMIN_TOKEN", t); // (nodes call each other with it: cluster::http)
             }
             std::env::set_var("PONDRA_CACHE_GB", cache_gb.to_string()); // read by Lake::open
+            if let Some(gb) = memory_gb {
+                std::env::set_var("PONDRA_MEMORY_GB", gb.to_string()); // read by Lake::open
+            }
             std::env::set_var("PONDRA_PUBLISH", publish); // read by POST /tables
             std::env::set_var("PONDRA_CHANGELOG_SECS", changelog_secs.to_string()); // read by tier::expire
             std::env::set_var("PONDRA_FSYNC", fsync.to_string()); // read by replica::ReplicaLog::hold
@@ -206,6 +220,10 @@ async fn main() -> anyhow::Result<()> {
                 let advertise = kafka_advertise.unwrap_or_else(|| format!("{}:{port}", addr.rsplit_once(':').map_or("127.0.0.1", |(h, _)| h)));
                 let a = app.clone();
                 tokio::spawn(async move { kafka::serve(a, kafka_addr, advertise).await.map_err(|e| eprintln!("kafka protocol: {e:#}")) });
+            }
+            if let Some(flight_addr) = flight {
+                let a = app.clone();
+                tokio::spawn(async move { flight::serve(a, flight_addr).await.map_err(|e| eprintln!("flight: {e:#}")) });
             }
             if let (Some(_), Some(log)) = (&app.seq, &app.log) {
                 let (lake, log) = (lake.clone(), log.clone()); // event-time windows past the watermark, emitted once

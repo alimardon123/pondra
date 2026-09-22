@@ -584,8 +584,8 @@ def kafka():
     both = first + rest
     live = [ck.Consumer({**sasl("reader", "r-tok"), "group.id": "g2", "auto.offset.reset": "earliest", "bootstrap.servers": f"127.0.0.1:{kport + k}"}) for k in (0, 1)]
     [c.subscribe(["events"]) for c in live]
-    seen, t_end = set(), time.time() + 15
-    while time.time() < t_end:
+    seen, t_end = set(), time.time() + 45  # (a rebalance can take a few heartbeats)
+    while time.time() < t_end and not (len(seen) == n + 1000 and sorted(len(c.assignment()) for c in live) == [0, 1]):
         for c in live:
             seen.update(m.offset() for m in c.consume(1000, 0.2) if m.error() is None)
     holders = [len(c.assignment()) for c in live]
@@ -714,6 +714,279 @@ def windows():
     return "event-time windows: each emitted once, final, after the watermark; late rows update the view only; a leader restart emits nothing twice"
 
 
+def scale():
+    """Tables at scale. A partitioned table (`day(ts)`): every file holds one day, INSERTs and
+    tiered log rows alike, before and after merges and an ADD COLUMN. Its files pile up past the
+    catalog entry's limit and are sealed into manifests; queries skip files by min/max, on one node
+    and spread over three; Delta and Iceberg readers see the sealed files too. Then queries bigger
+    than a 50 MB memory limit: they spill (sorts, aggregations) or switch join strategy."""
+    import datetime, io, pyarrow.parquet as pq
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import open_check
+    iso = lambda t: datetime.datetime.fromtimestamp(t, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    lake = new_lake()
+    port = A.port
+    node = Node(lake, port, tier_secs=0.5).start()
+    q = lambda s, p=port: sql(p, s)
+    refused = [_raises(lambda s=s: q(s)) for s in (
+        "CREATE TABLE bad1 (id BIGINT, ts TIMESTAMP) WITH (partition_by = 'week(ts)')",
+        "CREATE TABLE bad2 (id BIGINT, ts TIMESTAMP) WITH (partition_by = 'nope')",
+        "CREATE TABLE bad3 (id BIGINT PRIMARY KEY, ts TIMESTAMP) WITH (partition_by = 'day(ts)')",
+        "CREATE TABLE bad4 (id BIGINT, name VARCHAR) WITH (partition_by = 'day(name)')")]
+    q("CREATE TABLE ev (id BIGINT, ts TIMESTAMP, v DOUBLE, k VARCHAR) WITH (partition_by = 'day(ts)', publish = 'delta,iceberg')")
+    base = 1_780_000_000 // 86400 * 86400
+    days = {}  # day -> rows, what the table should hold
+    def expect(ts, n=1):
+        d = iso(ts // 86400 * 86400)
+        days[d] = days.get(d, 0) + n
+    # 200 INSERTs of 100 rows 10 minutes apart: each spans one or two days, ~140 days in all.
+    for i in range(200):
+        q(f"INSERT INTO ev SELECT value + {i * 100}, to_timestamp_seconds({base} + (value + {i * 100}) * 600), 1.0, 'k' || (value % 5) FROM generate_series(0, 99)")
+        for r in range(100):
+            expect(base + (r + i * 100) * 600)
+    # Rows through the log: 60 batches, each spread over three days.
+    for j in range(60):
+        rows = [{"id": 10**6 + j * 50 + r, "ts": iso(base + (j + r % 3) * 86400 + r * 60), "v": 2.0, "k": "log"} for r in range(50)]
+        for r in rows:
+            expect(datetime.datetime.fromisoformat(r["ts"]).replace(tzinfo=datetime.timezone.utc).timestamp().__int__())
+        call(port, "POST", f"/append/ev?producer=p&seq={j + 1}", "".join(json.dumps(r) + "\n" for r in rows).encode())
+    q("ALTER TABLE ev ADD COLUMN note VARCHAR")
+    q(f"INSERT INTO ev SELECT value, to_timestamp_seconds({base} + value * 3600), 1.0, 'late', 'x' FROM generate_series(0, 99)")
+    for r in range(100):
+        expect(base + r * 3600)
+    n_rows, total = sum(days.values()), 200 * 100 * 1.0 + 60 * 50 * 2.0 + 100
+    for _ in range(40):  # tiering, merges and sealing settle
+        m = metrics_of(port)
+        if m.get("pondra_untiered_rows", 1) == 0 and m['pondra_table_files{table="ev",where="inline"}'] <= 128:
+            break
+        time.sleep(0.5)
+    call(port, "POST", "/tier")
+    time.sleep(2)
+    m = metrics_of(port)
+    inline, sealed = m['pondra_table_files{table="ev",where="inline"}'], m['pondra_table_files{table="ev",where="sealed"}']
+    per_day = {r["d"]: r["n"] for r in q("SELECT CAST(date_trunc('day', ts) AS VARCHAR) AS d, count(*) AS n FROM ev GROUP BY 1")}
+    per_day = {d.replace(" ", "T")[:19]: n for d, n in per_day.items()}
+    one_day = sorted(days)[30]
+    m0 = metrics_of(port)
+    day_n = q(f"SELECT count(*) AS n FROM ev WHERE ts >= TIMESTAMP '{one_day}' AND ts < TIMESTAMP '{one_day}' + INTERVAL '1 day'")[0]["n"]
+    m1 = metrics_of(port)
+    scanned = m1["pondra_files_scanned_total"] - m0["pondra_files_scanned_total"]
+    # Every Parquet file of the table holds one day (replaced ones included, until they're deleted).
+    files = [k for k in lake_objects(lake, "data/ev/") if k.endswith(".parquet") and "/" not in k[len("data/ev/"):]]
+    def days_in(f):
+        try:
+            return len({str(t)[:10] for t in pq.read_table(io.BytesIO(open_check.read_object(lake, f)), columns=["ts"]).column("ts").to_pylist()})
+        except Exception:
+            return 1  # (a replaced file deleted meanwhile)
+    mixed = [f for f in files if days_in(f) > 1]
+    # Two more nodes: the same query spread over three.
+    for p in (port + 1, port + 2):
+        Node(lake, p).start()
+    while len(call(port, "GET", "/stats")["nodes"]) < 3:
+        time.sleep(0.2)
+    spread = call(port, "POST", "/sql?spread=1", b"SELECT count(*) AS n, sum(v) AS s FROM ev WHERE k <> 'none'")[0]
+    was_spread = metrics_of(port)["pondra_spread_queries_total"] >= 1
+    shuffles = shuffle_checks(port)
+    theirs = {**open_check.readers(lake, "ev"), **{f"iceberg/{k}": v for k, v in open_check.iceberg_readers(lake, "ev").items()}}
+    checks = {
+        "bad partition specs refused": all(refused),
+        "files sealed into manifests": sealed > 0 and inline <= 128,
+        "every row, every day": q("SELECT count(*) AS n, sum(v) AS s FROM ev")[0] == {"n": n_rows, "s": total} and per_day == days,
+        "one day reads only its files": day_n == days[one_day] and 0 < scanned <= 8,
+        "every file holds one day": len(files) > 0 and not mixed,
+        "three nodes: same answer": was_spread and spread == {"n": n_rows, "s": total},
+        "shuffles (GROUP BY, joins, windows) = one node": all(same for same, _ in shuffles.values()) and sum(sh for _, sh in shuffles.values()) >= 10,
+        "Delta and Iceberg readers see sealed files": all(v == n_rows for v in theirs.values()),
+    }
+    for n in list(NODES):
+        n.kill()
+    # A 50 MB memory limit: a 2M-group aggregation and a sort spill, a join of 3M rows switches
+    # to sort-merge (hash joins can't spill), and the node stays up.
+    node = Node(lake, port, memory_gb=0.05).start()
+    q("CREATE TABLE big (id BIGINT, k BIGINT, s VARCHAR)")
+    q("INSERT INTO big SELECT value, value % 2000000, 'name-' || (value % 2000000) FROM generate_series(1, 3000000)")
+    checks["over the memory limit: aggregation, sort, join"] = (
+        q("SELECT count(*) AS g, sum(n) AS n FROM (SELECT s, count(*) AS n FROM big GROUP BY s)") == [{"g": 2000000, "n": 3000000}]
+        and q("SELECT max(r) AS r FROM (SELECT row_number() OVER (ORDER BY s, id) AS r FROM big)") == [{"r": 3000000}]
+        and q("SELECT count(*) AS n FROM big a JOIN big b ON a.id = b.id") == [{"n": 3000000}]
+        and metrics_of(port)["pondra_memory_limit_bytes"] == int(0.05 * (1 << 30)))
+    node.kill()
+    ok = all(checks.values())
+    shown = {q: ("same" if same else "DIFFERENT") + (", shuffled" if sh else "") for q, (same, sh) in shuffles.items()}
+    print(json.dumps({"scale": checks, "shuffles": shown, "rows": n_rows, "days": len(days), "files": {"inline": inline, "sealed": sealed, "parquet_objects": len(files), "one_day_scanned": scanned}, "outside_readers": theirs, "ok": ok}, indent=1))
+    if not ok:
+        print("mixed:", mixed[:3], "per_day diff:", {d: (per_day.get(d), n) for d, n in days.items() if per_day.get(d) != n})
+        sys.exit(1)
+    return f"scale: {n_rows:,} rows over {len(days)} daily partitions, {int(inline + sealed)} files ({int(sealed)} sealed), every file one day, a day's query reads {int(scanned)} files, 3 nodes, {sum(sh for _, sh in shuffles.values())} of {len(shuffles)} queries shuffled (all equal to one node), 6 outside readers, a 50 MB memory limit: all {len(checks)} checks pass"
+
+
+def flight():
+    """Arrow Flight and Flight SQL. pyarrow: DoPut exactly-once (a retried stream is applied
+    once), DoGet SQL, GetFlightInfo, ListFlights, a table's log as a columnar stream (chosen
+    columns; following new commits), tokens and the basic-auth handshake. ADBC (Flight SQL):
+    queries, a write sent as a query, bulk ingest into a new table, catalog objects. Writes to a
+    follower's Flight port reach the leader."""
+    import pyarrow as pa, pyarrow.flight as fl
+    import adbc_driver_flightsql.dbapi as adbc
+    lake = new_lake()
+    port, fport = A.port, A.port + 30
+    tokens = {"read_token": "r", "write_token": "w", "admin_token": "a"}
+    node = Node(lake, port, flight=f"127.0.0.1:{fport}", tier_secs=0.5, **tokens).start()
+    follower = Node(lake, port + 1, flight=f"127.0.0.1:{fport + 1}", **tokens).start()
+    q = lambda s: call(port, "POST", "/sql", s.encode(), headers={"authorization": "Bearer a"})
+    q("CREATE TABLE ev (user VARCHAR, amount BIGINT, ts TIMESTAMP)")
+    opts = lambda t: fl.FlightCallOptions(headers=[(b"authorization", f"Bearer {t}".encode())])
+    client = fl.FlightClient(f"grpc://127.0.0.1:{fport}")
+    schema = pa.schema([("user", pa.string()), ("amount", pa.int64()), ("ts", pa.timestamp("ns"))])
+    def batch(i, n=1000):
+        return pa.record_batch([pa.array([f"u{j % 10}" for j in range(n)]), pa.array([i] * n, pa.int64()), pa.array([1_790_000_000_000_000_000 + j for j in range(n)], pa.timestamp("ns"))], schema=schema)
+    def put(path, batches, token="w", to=client):
+        w, r = to.do_put(fl.FlightDescriptor.for_path(*path), schema, options=opts(token))
+        for b in batches:
+            w.write_batch(b)
+        w.done_writing()
+        acks = []
+        while (buf := r.read()) is not None:
+            acks.append(json.loads(buf.to_pybytes()))
+        w.close()
+        return acks
+    count = lambda: q("SELECT count(*) AS n, sum(amount) AS s FROM ev")[0]
+    first = put(["ev", "p", "1"], [batch(i) for i in range(10)])
+    again = put(["ev", "p", "1"], [batch(i) for i in range(10)])  # a retried stream
+    after_retry = count()
+    via_follower = put(["ev", "q", "1"], [batch(100)], to=fl.FlightClient(f"grpc://127.0.0.1:{fport + 1}"))
+    try:
+        put(["ev"], [batch(0)], token="r")
+        read_token_refused = False
+    except fl.FlightUnauthenticatedError:
+        read_token_refused = True
+    sql_ticket = fl.Ticket(json.dumps({"sql": "SELECT user, sum(amount) AS s FROM ev GROUP BY user ORDER BY user"}))
+    by_user = client.do_get(sql_ticket, options=opts("r")).read_all()
+    info = client.get_flight_info(fl.FlightDescriptor.for_command(json.dumps({"sql": "SELECT count(*) AS n FROM ev"})), opts("r"))
+    via_info = client.do_get(info.endpoints[0].ticket, options=opts("r")).read_all().to_pylist()
+    listed = [f.descriptor.path[0].decode() for f in client.list_flights(options=opts("r"))]
+    # The log as a columnar stream: what's committed so far (two columns), then following.
+    past = client.do_get(fl.Ticket(json.dumps({"table": "ev", "after": 0, "columns": ["user", "amount"], "follow": False})), options=opts("r")).read_all()
+    live = client.do_get(fl.Ticket(json.dumps({"table": "ev", "columns": ["amount"]})), options=opts("r"))
+    got, marks, lag = [0], [], []
+    def follow():
+        for chunk in live:
+            if chunk.data is not None and chunk.data.num_rows:
+                got[0] += chunk.data.num_rows
+                lag.append(time.time())
+            if chunk.app_metadata is not None:
+                marks.append(json.loads(chunk.app_metadata.to_pybytes())["after"])
+            if got[0] >= 3000 and marks:  # (each commit's rows, then where to resume)
+                return
+    t = threading.Thread(target=follow, daemon=True); t.start()
+    time.sleep(0.5)
+    sent_at = time.time()
+    put(["ev", "p", "11"], [batch(i) for i in range(10, 13)])
+    t.join(10)
+    header = client.authenticate_basic_token("reader", "r")
+    shaken = client.do_get(fl.Ticket(json.dumps({"sql": "SELECT 1 AS one FROM ev LIMIT 1"})), options=fl.FlightCallOptions(headers=[header])).read_all().num_rows
+    # ADBC over Flight SQL.
+    conn = adbc.connect(f"grpc://127.0.0.1:{fport}", db_kwargs={"adbc.flight.sql.authorization_header": "Bearer a"})
+    cur = conn.cursor()
+    cur.execute("SELECT count(*) AS n FROM ev")
+    adbc_count = cur.fetchone()[0]
+    cur.execute("INSERT INTO ev VALUES ('adbc', 5, TIMESTAMP '2026-09-22 10:00:00')")
+    ingest = pa.table({"k": pa.array(range(5000), pa.int64()), "name": pa.array([f"n{i}" for i in range(5000)]), "at": pa.array([1_790_000_000_000_000 + i for i in range(5000)], pa.timestamp("us"))})
+    ingested = cur.adbc_ingest("ingested", ingest, mode="create")
+    cur.close(); cur = conn.cursor()  # (an ingesting statement can't run a query after)
+    cur.execute("SELECT count(*) AS n, sum(k) AS s FROM ingested")
+    ingest_back = cur.fetchone()
+    objects = conn.adbc_get_objects(depth="tables").read_all().to_pylist()
+    names = [t["table_name"] for c in objects for s in c["catalog_db_schemas"] for t in s["db_schema_tables"]]
+    cur.close(); conn.close()
+    total = count()
+    checks = {
+        "DoPut: 10 batches acked": len(first) == 10 and not any(a["duplicate"] for a in first),
+        "a retried stream is applied once": len(again) == 10 and all(a["duplicate"] for a in again) and after_retry == {"n": 10000, "s": 1000 * sum(range(10))},
+        "DoPut to a follower": len(via_follower) == 1 and not via_follower[0]["duplicate"],
+        "a read token can't write": read_token_refused,
+        "DoGet SQL": by_user.num_rows == 10 and by_user.column_names == ["user", "s"],
+        "GetFlightInfo + DoGet": info.schema.names == ["n"] and via_info == [{"n": 11000}],
+        "ListFlights": "ev" in listed,
+        "the log, two columns": past.column_names == ["user", "amount"] and past.num_rows == 11000,
+        "the log, following": got[0] == 3000 and len(marks) >= 1,
+        "basic-auth handshake": shaken == 1,
+        "ADBC query": adbc_count == 14000,
+        "ADBC write as a query, ingest, objects": ingest_back == (5000, sum(range(5000))) and ingested == 5000 and {"ev", "ingested"} <= set(names),
+        "every row once": total == {"n": 14001, "s": 1000 * (sum(range(13)) + 100) + 5},
+    }
+    node.kill(); follower.kill()
+    ok = all(checks.values())
+    follow_ms = round((lag[-1] - sent_at) * 1000) if lag else None
+    print(json.dumps({"flight": checks, "follow_ms": follow_ms, "ok": ok}, indent=1))
+    if not ok:
+        print(first[:2], again[:2], after_retry, via_follower, by_user.num_rows, via_info, listed, past.num_rows, got, marks, shaken, adbc_count, ingest_back, ingested, names, total)
+        sys.exit(1)
+    return f"Arrow Flight: pyarrow DoPut exactly-once (retried stream applied once, via a follower too), DoGet SQL, FlightInfo, ListFlights, the log as a columnar stream (a subscriber has each new commit in {follow_ms} ms), tokens and handshake; ADBC queries, writes, ingest and catalog: all {len(checks)} checks pass"
+
+
+def shuffle_checks(port):
+    """Queries spread over the cluster (?spread=1) against the same on one node (?spread=0):
+    {query: (same answer, shuffled)}. Two tables of 800,000 and 40,000 rows (the small one read
+    whole by every node: broadcast), a few rows still in the log, and a keyed table (read whole).
+    The self-join slices both sides: a join shuffled on its key."""
+    q = lambda s, spread: call(port, "POST", f"/sql?spread={spread}", s.encode())
+    q("CREATE TABLE a (id BIGINT, k BIGINT, v DOUBLE, s VARCHAR, p BIGINT) WITH (partition_by = 'p')", 0)
+    q("CREATE TABLE b (k BIGINT, name VARCHAR)", 0)
+    q("CREATE TABLE u (id BIGINT PRIMARY KEY, name VARCHAR)", 0)
+    for i in range(8):
+        q(f"INSERT INTO a SELECT value + {i * 100000}, (value * 7 + {i}) % 50000, value * 0.5, 's' || (value % 13), value % 5 FROM generate_series(1, 100000)", 0)
+    for i in range(4):
+        q(f"INSERT INTO b SELECT value + {i * 10000}, 'n' || value FROM generate_series(0, 9999)", 0)
+    q("INSERT INTO u VALUES (0, 'zero'), (1, 'one'), (2, 'two'), (3, 'three'), (4, 'four')", 0)
+    call(port, "POST", "/append/a?producer=tail&seq=1", "".join(json.dumps({"id": 10**7 + r, "k": r % 50, "v": 1.0, "s": "tail", "p": r % 5}) + "\n" for r in range(500)).encode())
+    queries = {
+        "many groups": "SELECT k, count(*) AS n, sum(v) AS s FROM a GROUP BY k ORDER BY k LIMIT 7",
+        "groups, no order": "SELECT k % 1000 AS g, count(*) AS n FROM a GROUP BY k % 1000",
+        "HAVING": "SELECT k, count(*) AS n FROM a GROUP BY k HAVING count(*) > 15 ORDER BY k",
+        "string keys": "SELECT s, p, count(*) AS n, min(id) AS lo FROM a GROUP BY s, p ORDER BY s, p",
+        "DISTINCT": "SELECT DISTINCT s FROM a ORDER BY s",
+        "join, then many groups": "SELECT a.k, count(*) AS n, max(b.name) AS m FROM a JOIN b ON a.k = b.k GROUP BY a.k ORDER BY n DESC, a.k LIMIT 10",
+        "join, filters, count": "SELECT count(*) AS n, sum(a.v) AS s FROM a JOIN b ON a.k = b.k WHERE a.v > 1000 AND b.name LIKE 'n1%'",
+        "join, then another key": "SELECT a.s, count(*) AS n, sum(b.k) AS t FROM a JOIN b ON a.k = b.k GROUP BY a.s ORDER BY a.s",
+        "self-join": "SELECT count(*) AS n FROM a x JOIN a y ON x.id = y.id + 1",
+        "count(DISTINCT) per group": "SELECT s, count(DISTINCT k) AS d FROM a GROUP BY s ORDER BY s",
+        "window, PARTITION BY": "SELECT k, v, row_number() OVER (PARTITION BY k ORDER BY v) AS r FROM a WHERE k < 3 ORDER BY k, v LIMIT 20",
+        "window over all": "SELECT k, row_number() OVER (ORDER BY v, id) AS r FROM a ORDER BY r LIMIT 5",
+        "global aggregate": "SELECT count(*) AS n, avg(v) AS a, count(DISTINCT k) AS d FROM a",
+        "a keyed table": "SELECT u.name, count(*) AS n FROM a JOIN u ON a.p = u.id GROUP BY u.name ORDER BY u.name",
+    }
+    out = {}
+    for name, s in queries.items():
+        before = metrics_of(port)["pondra_shuffled_queries_total"]
+        one, many = q(s, 0), q(s, 1)
+        ordered = "ORDER BY" in s.split("OVER")[-1]
+        same = one == many if ordered else sorted(map(json.dumps, one)) == sorted(map(json.dumps, many))
+        out[name] = (same and len(one) > 0, int(metrics_of(port)["pondra_shuffled_queries_total"] - before))
+    return out
+
+
+def metrics_of(port):
+    out = {}
+    for line in call(port, "GET", "/metrics").decode().splitlines():
+        if line and not line.startswith("#"):
+            name, v = line.rsplit(" ", 1)
+            out[name] = float(v)
+    return out
+
+
+def lake_objects(lake, prefix):
+    """Keys under `prefix` in the lake (relative to it)."""
+    if not lake.startswith("s3://"):
+        root = os.path.join(lake, prefix)
+        return [prefix + f for f in os.listdir(root)] if os.path.isdir(root) else []
+    bucket, base = lake[5:].split("/", 1)
+    keys = []
+    for pg in S3[0].get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=f"{base}/{prefix}"):
+        keys += [o["Key"][len(base) + 1:] for o in pg.get("Contents", [])]
+    return keys
+
+
 def _raises(f):
     try:
         f()
@@ -768,7 +1041,7 @@ def load():
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    out = {t.__name__: t() for t in (upsert, tiering, fence, insert, serverless, clients, kafka, alter, windows, reader, crash)}
+    out = {t.__name__: t() for t in (upsert, tiering, fence, insert, serverless, clients, kafka, alter, windows, scale, flight, reader, crash)}
     A.secs = min(A.secs, 20)
     out["load"] = load()
     print(json.dumps(out, indent=1))
@@ -776,7 +1049,7 @@ def all_tests():
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "tiering", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "load", "all"])
+    ap.add_argument("mode", choices=["crash", "upsert", "tiering", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "scale", "flight", "load", "all"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -787,4 +1060,4 @@ if __name__ == "__main__":
     ap.add_argument("--secs", type=int, default=30)
     ap.add_argument("--flush-ms", type=int, default=250)
     A = ap.parse_args()
-    {"crash": crash, "upsert": upsert, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "load": load, "all": all_tests}[A.mode]()
+    {"crash": crash, "upsert": upsert, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "scale": scale, "flight": flight, "load": load, "all": all_tests}[A.mode]()
