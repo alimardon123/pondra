@@ -55,7 +55,7 @@ impl Auth {
         let first = path.trim_start_matches('/').split('/').next().unwrap_or_default();
         match first {
             "stats" => Role::None, // (a health check: load balancers and the tests poll it)
-            "sql" | "lookup" | "watch" | "mcp" => Role::Read, // (MCP writes are checked by `allows`)
+            "sql" | "lookup" | "watch" | "mcp" | "v1" => Role::Read, // (MCP writes are checked by `allows`; v1: the Iceberg REST catalog)
             "append" | "insert" => Role::Write,
             "cluster" if path.starts_with("/cluster/files") || path.starts_with("/cluster/commit") => Role::Write, // (writers on other machines)
             "cluster" if path.starts_with("/cluster/leader") => Role::None,
@@ -65,7 +65,7 @@ impl Auth {
 
     /// May this role run this write?
     pub fn allows(&self, role: Role, stmt: &Stmt) -> Result<()> {
-        let need = if matches!(stmt, Stmt::Create(_)) { Role::Admin } else { Role::Write };
+        let need = if matches!(stmt, Stmt::Create(_) | Stmt::AddColumn(..)) { Role::Admin } else { Role::Write };
         if role < need {
             bail!("this token may not {}", if need == Role::Admin { "create tables" } else { "write" });
         }

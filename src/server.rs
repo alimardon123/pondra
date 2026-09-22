@@ -124,6 +124,8 @@ pub fn router(app: App) -> Router {
         .route("/cluster/ack", post(ack))
         .route("/cluster/replica", get(replica))
         .route("/cluster/leader", get(|State(app): State<App>| async move { Json(app.cluster.leader_status()) }))
+        .route("/cluster/kafka", get(|| async { Json(crate::kafka::me()) }))
+        .merge(crate::iceberg::rest())
         .layer(axum::extract::DefaultBodyLimit::max(1 << 30)) // batches up to 1 GiB
         .layer(middleware::from_fn_with_state(app.clone(), guard))
         .with_state(app)
@@ -340,12 +342,11 @@ async fn append(State(app): State<App>, Path(name): Path<String>, Query(p): Quer
     let arrow = headers.get("content-type").is_some_and(|v| v.as_bytes().starts_with(b"application/vnd.apache.arrow"));
     let batches = if arrow {
         // Columns by name, cast to the table's types (pandas, Polars and Arrow differ in string
-        // types); a missing `_deleted` means none of these rows is a delete.
+        // types); a column left out is null (as in JSON), e.g. `_deleted`, or one added since.
         let conform = |b: RecordBatch| -> anyhow::Result<RecordBatch> {
             let column = |f: &datafusion::arrow::datatypes::Field| match b.column_by_name(f.name()) {
                 Some(c) => Ok(datafusion::arrow::compute::cast(c, f.data_type())?),
-                None if f.name() == "_deleted" => Ok(datafusion::arrow::array::new_null_array(f.data_type(), b.num_rows())),
-                None => Err(anyhow::anyhow!("no column {}", f.name())),
+                None => Ok(datafusion::arrow::array::new_null_array(f.data_type(), b.num_rows())),
             };
             let cols = schema.fields().iter().map(|f| column(f));
             Ok(RecordBatch::try_new(schema.clone(), cols.collect::<anyhow::Result<Vec<_>>>()?)?)
@@ -389,9 +390,19 @@ async fn create_task(State(app): State<App>, Path(name): Path<String>, body: Str
 }
 
 /// Body: the view's SQL, e.g. `SELECT user, sum(amount) AS total, count(*) AS n FROM events GROUP BY user`.
-async fn create_view(State(app): State<App>, Path(name): Path<String>, sql: String) -> Result<Json<Value>, E> {
+#[derive(Deserialize)]
+struct ViewParams {
+    window: Option<String>,
+    size_secs: Option<u64>,
+    lateness_secs: Option<u64>,
+}
+
+/// `POST /views/{name}` with the SQL; `?window=w&size_secs=60&lateness_secs=10` also emits each
+/// window of column `w` once, final, to `{name}_final` (see `views.rs`).
+async fn create_view(State(app): State<App>, Path(name): Path<String>, Query(p): Query<ViewParams>, sql: String) -> Result<Json<Value>, E> {
     let _guard = app.lock.lock().await;
-    crate::views::create(&app.lake, &name, &sql).await?;
+    let emit = p.window.map(|window| crate::views::Emit { window, size_secs: p.size_secs.unwrap_or(60), lateness_secs: p.lateness_secs.unwrap_or(0) });
+    crate::views::create(&app.lake, &name, &sql, emit).await?;
     Ok(Json(j!({"view": name})))
 }
 

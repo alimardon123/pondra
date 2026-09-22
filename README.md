@@ -1,6 +1,6 @@
 # Pondra: a streamhouse in one binary
 
-One Rust binary (~5,800 lines) that ingests streams, stores them as a lakehouse (Parquet files
+One Rust binary (~7,300 lines) that ingests streams, stores them as a lakehouse (Parquet files
 plus a catalog, on object storage; Delta Lake and Iceberg metadata for other engines on request),
 keeps SQL views and streaming state up to date, answers SQL, and scales out by starting more
 copies of itself on the same bucket. Object storage is the only state: no Postgres, no
@@ -31,6 +31,10 @@ export AWS_ENDPOINT=https://<account>.r2.cloudflarestorage.com
 # SQL from anything that speaks Postgres, and from Python:
 ./target/release/pondra serve --dir ./lake --pg 0.0.0.0:5432      # psql -h localhost, psycopg, SQLAlchemy, BI tools
 pip install ./python && python -c "import pondra; print(pondra.connect('http://127.0.0.1:8080').sql('SELECT 1').to_pandas())"
+
+# Kafka producers and consumers (a topic is a table), and engines attaching the lake by URL:
+./target/release/pondra serve --dir ./lake --kafka 0.0.0.0:9092   # bootstrap.servers=host:9092
+#   PyIceberg / DuckDB / Spark: an Iceberg REST catalog at http://host:8080 (namespace "default")
 
 # AI agents over MCP (Claude Code, Claude Desktop, Cursor, …): every node serves POST /mcp
 claude mcp add --transport http pondra http://127.0.0.1:8080/mcp   # add --header "Authorization: Bearer $TOKEN" with tokens on
@@ -69,6 +73,8 @@ Useful `serve` flags (give every node the same ones: any of them may lead):
 - `--tier-secs 2`: new rows become Parquet (and new Delta/Iceberg versions) as soon as they
   commit, at most this often. Fractions are fine (`0.25`).
 - `--pg 0.0.0.0:5432`: also speak the Postgres protocol.
+- `--kafka 0.0.0.0:9092`: also speak the Kafka protocol (`--kafka-advertise host:port` if clients
+  must reach this node at another address than `--addr`'s host).
 - `--read-token`, `--write-token`, `--admin-token`: access control (none set = open). Over
   Postgres the user name picks the role (`reader`, `writer`, `admin`) and the password is its
   token. Whatever the token, SQL sent to a node never touches the node's own disk (no `COPY …
@@ -124,6 +130,10 @@ differences entirely.
 | SQL writes | `INSERT … SELECT/VALUES`, `UPDATE … SET … WHERE`, `DELETE … WHERE` (keyed tables) on any node, over Postgres, or with `pondra sql` on any machine | Spark SQL DML, Fluss 1.0's UPDATE/DELETE by condition |
 | Postgres protocol | `--pg`: psql, psycopg 2/3, asyncpg, SQLAlchemy + pandas (tested); JDBC/BI tools by the same protocol | a Postgres-compatible serving layer |
 | Python | `import pondra`: `sql()` → pandas / Polars / Arrow, `append()` exactly-once, `watch()`, `lookup()` | PySpark / PyFlink clients for the common jobs |
+| Kafka | `--kafka`: producers write to tables (a topic is a table; JSON values; `_key`/`_timestamp`/`_value` columns; idempotent producers exactly-once; gzip/snappy/lz4/zstd), Debezium change events and tombstones become upserts and deletes; consumers and consumer groups read the log (offsets = `_ord`); SASL/PLAIN with the tokens. Tested: librdkafka (confluent-kafka), kafka-python | Kafka / Fluss ingest, Debezium sinks |
+| Schema evolution | `ALTER TABLE t ADD COLUMN c TYPE` (any node, Postgres, `pondra sql`); old rows read it as null; Delta and Iceberg follow | Delta/Iceberg schema evolution |
+| Event-time windows | `POST /views/{v}?window=w&size_secs=60&lateness_secs=10` over `GROUP BY date_bin(…) AS w`: the view updates live; `{v}_final` gets each window once, final, when the watermark passes it | Flink tumbling windows with watermarks |
+| JSON | `json_get(col, 'a', 0)`, `json_get_str/int/float/bool`, `json_contains`, `json_length`, `->`, `->>` | VARIANT / JSON functions |
 | AI agents | `POST /mcp` (the Model Context Protocol): tools `list_tables`, `query`, `write`, `changes`, under the same tokens | an MCP server in front of the warehouse |
 | Vector search | `FLOAT[]` embedding columns; `ORDER BY cosine_distance(emb, [...]) LIMIT k` (also `inner_product`, `array_distance`), exact, over the log and the files; Postgres array parameters work | a vector database next to the lake; Flink `VECTOR_SEARCH` |
 | Streaming SQL with no lag | `POST /views/{name}` with SQL. Runs on every flush of new rows, commits with them. With GROUP BY it keeps per-key aggregates (sum/count/min/max) that any number of nodes update at once | Flink SQL jobs + keyed state |
@@ -133,7 +143,7 @@ differences entirely.
 | Serving reads | `GET /lookup/{t}/{key}` (or SQL `SELECT … WHERE key = …`): the current row of one key without SQL planning — log tail, then the files newest-first, each narrowed to one cached, key-sorted row group: ~0.2 ms, ~20k/s on two cores | Redis / Postgres / Lakehouse//RT in front of the lake |
 | Batch ELT, exactly-once | `POST /insert/{t}?job=` with a `SELECT` (the receiving node does the work), or `pondra sql "INSERT INTO t SELECT …"` from any machine: straight to Parquet; a retried job is a no-op | Spark batch jobs |
 | Maintenance | automatic and spread over the nodes: tiering to Parquet, compaction, retention, orphan cleanup, backpressure | Spark OPTIMIZE / VACUUM |
-| Open formats | tables that ask are published as Delta Lake (`data/{t}/_delta_log`) and Iceberg (`data/{t}/metadata`) each tiering round, for engines that don't know Pondra | a separate Delta/Iceberg writer |
+| Open formats | tables that ask are published as Delta Lake (`data/{t}/_delta_log`) and Iceberg (`data/{t}/metadata`) each tiering round, for engines that don't know Pondra; an Iceberg REST catalog (`/v1/…`) lets them attach by URL | a separate Delta/Iceberg writer and catalog |
 
 ## How it works
 
@@ -150,12 +160,13 @@ differences entirely.
 | `query.rs` | Hot+cold snapshot per query (DataFusion) |
 | `cache.rs` | For lakes on object storage: an in-memory read cache and a local SSD tier (write-through, read-through, prefetched from the commit stream, warmed at start) |
 | `serve.rs` | Serving reads: key lookups without SQL (tail, then files newest-first, cached key-sorted row groups, binary search), and SQL point queries routed to them |
-| `delta.rs`, `iceberg.rs` | Open formats, per table: a Delta JSON commit / an Iceberg v2 snapshot (hand-written Avro manifests) per change to a table's files; crash-safe (derived from durable catalog state, put-if-absent) |
+| `delta.rs`, `iceberg.rs` | Open formats, per table: a Delta JSON commit / an Iceberg v2 snapshot (hand-written Avro manifests) per change to a table's files; crash-safe (derived from durable catalog state, put-if-absent); the Iceberg REST catalog |
 | `write.rs` | Writes in SQL from anywhere (CREATE TABLE, INSERT, UPDATE, DELETE): the work runs where the statement runs; the leader records it — over HTTP, through the bucket inbox, or the statement leads for a moment when nobody does. Attached lakes' writes go to their own leaders |
 | `inbox.rs` | The bucket inbox: writers that can't reach the leader leave requests in the bucket; the leader answers them |
 | `pg.rs` | The Postgres wire protocol (queries and writes, text and binary results, typed `$1` parameters, a small `pg_catalog`) |
 | `auth.rs` | Read / write / admin tokens, over HTTP, Postgres and MCP |
 | `mcp.rs` | MCP for AI agents: JSON-RPC over HTTP, four tools |
+| `kafka.rs` | The Kafka protocol: produce (record batches → rows, exactly-once), fetch, offsets, consumer groups, SASL/PLAIN |
 | `server.rs`, `main.rs` | HTTP API (axum) and CLI |
 
 **Producer contract:** each producer has its own name, sends batches in order with increasing
@@ -168,6 +179,8 @@ committed batches come back as `"duplicate": true`.
 python3 tools/harness.py all [--s3]             # upsert, fence (split brain), insert, serverless, clients, reader, crash, load
 python3 tools/harness.py clients                # SQL writes, Python client, Postgres drivers, tokens, inbox, attached lakes, vectors, MCP
 python3 tools/mcp_client.py --url http://127.0.0.1:8080/mcp   # the official MCP SDK against a node (pip install mcp)
+python3 tools/harness.py kafka | alter | windows   # Kafka clients, ALTER TABLE under load, windows emitted once
+python3 tools/kafka_bench.py                    # Kafka ingest throughput and latency on 3 nodes
 python3 tools/keyed_bench.py                    # keyed-table compaction: bytes written, correctness
 python3 tools/harness.py crash --runs 20        # kill -9 + injected crashes (PONDRA_CRASH=point:prob)
 python3 tools/cluster.py users                  # 64 writers + 16 readers + serverless reads, 3 nodes
@@ -179,7 +192,7 @@ python3 tools/bench/run.py batch 20000000       # vs Spark and Flink (ENGINES=po
 python3 tools/serve_bench.py --keys 2000000     # point lookups and dashboard queries, p50/p99/QPS (uses tools/loadgen.go if Go is installed)
 python3 tools/bench/tpch.py --data sf1          # TPC-H (tpchgen-cli) on Pondra, DuckDB and Spark
 python3 tools/sizes.py                          # storage bytes per event
-python3 tools/open_check.py [--s3]              # 6 readers (Delta: delta-rs/Polars/DuckDB; Iceberg: PyIceberg/Polars/DuckDB) == Pondra
+python3 tools/open_check.py [--s3]              # 8 readers (Delta: delta-rs/Polars/DuckDB; Iceberg: PyIceberg/Polars/DuckDB, and both through the REST catalog) == Pondra
 python3 tools/freshness.py [--s3] [--flag ack=replicated]  # head to head: nodes, pondra sql, Delta, Iceberg
 python3 tools/clustering.py                     # what cluster_by buys
 python3 tools/newuser_bench.py [--s3]           # a new client's first query, a new node's, write→visible
@@ -197,11 +210,12 @@ bucket to its newest lakes.
 
 - Shuffles in distributed queries: big-to-big joins run on one node.
 - Partitioned tables; clustering across files; copy-on-write DELETE for append tables.
-- Watermarks that close event-time windows (windows update on late rows, and expire by TTL).
 - Per-table grants, quotas and TLS (tokens are per role; put a TLS proxy in front); JDBC and BI
   tools untested here.
-- Kafka-protocol ingest, an Iceberg REST catalog endpoint, `ALTER TABLE`, AI functions in SQL, an
-  approximate vector index (see the plan in `docs/comparison-spark-flink-fluss.md`).
+- Kafka: one partition per topic, no transactions; offsets are positions in the log (increasing,
+  not dense). Consumer groups live in the leader's memory (members rejoin after a failover).
+- `ALTER TABLE` only adds columns; session windows; AI functions in SQL; an approximate vector
+  index (see the plan in `docs/comparison-spark-flink-fluss.md`).
 - On object storage a *durable* ack costs one PUT; `--ack replicated` trades a small window
   (the leader and every holder dying before that PUT) for milliseconds.
 - A one-off `pondra sql` on far-away object storage spends 1–3 s opening the catalog; join

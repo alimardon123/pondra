@@ -1,0 +1,99 @@
+== kafka --s3 (real R2, ponderabucket-us)
+{
+ "kafka": {
+  "librdkafka (5 codecs, idempotent) + kafka-python": true,
+  "a view fed by Kafka": true,
+  "exactly-once retries (idempotent producer)": true,
+  "Debezium events and tombstones": true,
+  "raw values (_value), queried as JSON": true,
+  "kafka-python consumer (upserts, deletes as tombstones)": true,
+  "librdkafka consumer": true,
+  "consumer groups (commit, hand-over via a follower, one holder)": true,
+  "wrong password / read token refused": true
+ },
+ "librdkafka_20k_events_s": 3.79,
+ "ok": true
+}
+== alter --s3
+{
+ "alter": {
+  "old and new rows": true,
+  "the new column": true,
+  "a view over the table": true,
+  "a keyed table": true,
+  "lookup": true,
+  "IF NOT EXISTS": true,
+  "a clash is refused": true,
+  "Delta and Iceberg readers": true
+ },
+ "rows_written_during": 2500,
+ "outside_readers": {
+  "delta-rs": 2503,
+  "polars": 2503,
+  "duckdb": 2503,
+  "iceberg/pyiceberg": 2503,
+  "iceberg/polars": 2503,
+  "iceberg/duckdb": 2503
+ },
+ "ok": true
+}
+== windows --s3
+{
+ "windows": {
+  "closed windows only": true,
+  "each window once, final": true,
+  "late row: in the view, not re-emitted": true
+ },
+ "ok": true
+}
+== open_check --s3 (REST catalog included)
+ },
+ "match": true
+}
+== kafka_bench --s3 replicated
+{
+ "nodes": 3,
+ "producers": 4,
+ "flags": {
+  "ack": "replicated"
+ },
+ "events": 400000,
+ "wall_s": 0.9,
+ "events_per_s": 460815,
+ "producer_s": {
+  "p2": 0.8,
+  "p0": 0.8,
+  "p3": 0.8,
+  "p1": 0.8
+ },
+ "unflushed": 0,
+ "exactly_once": true,
+ "ack_ms_p50": 1,
+ "ack_ms_p99": 20,
+ "consumer_on_other_node_ms_p50": 1,
+ "consumer_on_other_node_ms_p99": 20,
+ "probes_seen": 200
+}
+== kafka_bench --s3 durable
+{
+ "nodes": 3,
+ "producers": 4,
+ "flags": {},
+ "events": 400000,
+ "wall_s": 5.8,
+ "events_per_s": 68667,
+ "producer_s": {
+  "p0": 5.6,
+  "p1": 5.8,
+  "p3": 5.8,
+  "p2": 5.8
+ },
+ "unflushed": 0,
+ "exactly_once": true,
+ "ack_ms_p50": 245,
+ "ack_ms_p99": 606,
+ "consumer_on_other_node_ms_p50": 245,
+ "consumer_on_other_node_ms_p99": 606,
+ "probes_seen": 200
+}
+DONE

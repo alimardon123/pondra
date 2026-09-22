@@ -10,6 +10,7 @@
 //! (`schema.name-mapping.default`).
 use crate::store::*;
 use anyhow::Result;
+use datafusion::arrow::datatypes::{DataType, TimeUnit};
 use object_store::{path::Path, ObjectStoreExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -114,7 +115,10 @@ fn fields(columns: &[(String, String)]) -> Option<Vec<Value>> {
             "Boolean" => "boolean".into(),
             "Date32" => "date".into(),
             "Binary" | "LargeBinary" => "binary".into(),
-            t => crate::delta::decimal(t).map(|(p, s)| format!("decimal({p}, {s})"))?,
+            t => match t.parse() {
+                Ok(DataType::Timestamp(TimeUnit::Microsecond, tz)) => if tz.is_some() { "timestamptz" } else { "timestamp" }.into(),
+                _ => crate::delta::decimal(t).map(|(p, s)| format!("decimal({p}, {s})"))?,
+            },
         })
     };
     columns.iter().enumerate().map(|(i, (name, t))| Some(json!({"id": i + 1, "name": name, "required": false, "type": iceberg(t)?}))).collect()
@@ -218,4 +222,63 @@ fn list_schema() -> String {
     fields.extend(ints.iter().map(|(n, id, t)| req(n, *id, json!(t))));
     fields.extend([opt("partitions", 507, json!({"type": "array", "element-id": 508, "items": summary})), opt("key_metadata", 519, json!("bytes"))]);
     json!({"type": "record", "name": "manifest_file", "fields": fields}).to_string()
+}
+
+// ---------------------------------------------------------------- the REST catalog
+
+/// The Iceberg REST catalog API over what Pondra publishes (read-only): engines attach a node
+/// by URL — PyIceberg, DuckDB, Spark, Trino, Snowflake — instead of pointing at metadata files.
+/// Namespace `default` is this lake; each attached lake is a namespace of its own. Tables appear
+/// once they publish Iceberg. Tokens work as elsewhere (`Authorization: Bearer …`, any role).
+pub fn rest() -> axum::Router<crate::server::App> {
+    use axum::routing::get;
+    axum::Router::new()
+        .route("/v1/config", get(|| async { axum::Json(json!({"defaults": {}, "overrides": {}})) }))
+        .route("/v1/namespaces", get(namespaces))
+        .route("/v1/namespaces/{ns}", get(namespace).head(namespace))
+        .route("/v1/namespaces/{ns}/tables", get(tables))
+        .route("/v1/namespaces/{ns}/tables/{table}", get(load).head(load))
+}
+
+type Reply = Result<axum::Json<Value>, (axum::http::StatusCode, axum::Json<Value>)>;
+
+fn missing(what: &str, kind: &str) -> (axum::http::StatusCode, axum::Json<Value>) {
+    (axum::http::StatusCode::NOT_FOUND, axum::Json(json!({"error": {"message": format!("no {what}"), "type": kind, "code": 404}})))
+}
+
+/// This lake and the attached ones, by namespace.
+fn lakes(app: &crate::server::App) -> Vec<(String, std::sync::Arc<Lake>)> {
+    let attached = app.lake.attached.read().unwrap().clone();
+    [("default".to_string(), app.lake.clone())].into_iter().chain(attached).collect()
+}
+
+fn lake(app: &crate::server::App, ns: &str) -> Result<std::sync::Arc<Lake>, (axum::http::StatusCode, axum::Json<Value>)> {
+    lakes(app).into_iter().find(|(n, _)| n == ns).map(|(_, l)| l).ok_or_else(|| missing(&format!("namespace {ns}"), "NoSuchNamespaceException"))
+}
+
+async fn namespaces(axum::extract::State(app): axum::extract::State<crate::server::App>) -> axum::Json<Value> {
+    axum::Json(json!({"namespaces": lakes(&app).into_iter().map(|(n, _)| [n]).collect::<Vec<_>>()}))
+}
+
+async fn namespace(axum::extract::State(app): axum::extract::State<crate::server::App>, axum::extract::Path(ns): axum::extract::Path<String>) -> Reply {
+    lake(&app, &ns)?;
+    Ok(axum::Json(json!({"namespace": [ns], "properties": {}})))
+}
+
+/// The tables with Iceberg metadata published.
+async fn tables(axum::extract::State(app): axum::extract::State<crate::server::App>, axum::extract::Path(ns): axum::extract::Path<String>) -> Reply {
+    let lake = lake(&app, &ns)?;
+    let published = lake.cat.scan::<Published>("i/", "i0").await.unwrap_or_default();
+    let ids: Vec<Value> = published.iter().filter(|(_, p)| p.version > 0).map(|(k, _)| json!({"namespace": [ns], "name": &k[2..]})).collect();
+    Ok(axum::Json(json!({"identifiers": ids})))
+}
+
+/// A table: its current metadata file, and what it says.
+async fn load(axum::extract::State(app): axum::extract::State<crate::server::App>, axum::extract::Path((ns, table)): axum::extract::Path<(String, String)>) -> Reply {
+    let lake = lake(&app, &ns)?;
+    let no_table = || missing(&format!("table {ns}.{table}"), "NoSuchTableException");
+    let st: Published = lake.cat.get(&format!("i/{table}")).await.ok().flatten().filter(|p: &Published| p.version > 0).ok_or_else(no_table)?;
+    let path = format!("data/{table}/metadata/v{}.metadata.json", st.version);
+    let metadata: Value = serde_json::from_slice(&lake.object(&path).await.map_err(|_| no_table())?).map_err(|_| no_table())?;
+    Ok(axum::Json(json!({"metadata-location": lake.full(&path), "metadata": metadata, "config": {}})))
 }

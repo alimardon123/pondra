@@ -54,8 +54,9 @@ def iceberg_props(lake):
             "s3.access-key-id": os.environ["AWS_ACCESS_KEY_ID"], "s3.secret-access-key": os.environ["AWS_SECRET_ACCESS_KEY"], "s3.region": "auto"}
 
 
-def iceberg_readers(lake, table):
-    """Row count of `table`'s Iceberg metadata per external reader."""
+def iceberg_readers(lake, table, port=None):
+    """Row count of `table`'s Iceberg metadata per external reader; with `port`, also through the
+    node's Iceberg REST catalog (PyIceberg and DuckDB attach it by URL)."""
     out, s3 = {}, lake.startswith("s3://")
     try:
         from pyiceberg.table import StaticTable
@@ -73,6 +74,20 @@ def iceberg_readers(lake, table):
         out["duckdb"] = duck(lake).execute(f"SELECT count(*) FROM iceberg_scan('{iceberg_metadata(lake, table)}')").fetchone()[0]
     except Exception as e:
         out["duckdb"] = f"error: {str(e)[:160]}"
+    if port is None:
+        return out
+    try:
+        from pyiceberg.catalog import load_catalog
+        cat = load_catalog("pondra", **{"type": "rest", "uri": f"http://127.0.0.1:{port}", **iceberg_props(lake)})
+        out["rest/pyiceberg"] = cat.load_table(f"default.{table}").scan().to_arrow().num_rows
+    except Exception as e:
+        out["rest/pyiceberg"] = f"error: {str(e)[:160]}"
+    try:
+        con = duck(lake)
+        con.execute(f"ATTACH 'pondra' AS rest (TYPE iceberg, ENDPOINT 'http://127.0.0.1:{port}', AUTHORIZATION_TYPE 'none')")
+        out["rest/duckdb"] = con.execute(f"SELECT count(*) FROM rest.default.{table}").fetchone()[0]
+    except Exception as e:
+        out["rest/duckdb"] = f"error: {str(e)[:160]}"
     return out
 
 
@@ -116,7 +131,7 @@ def main():
         call(p, "POST", "/tier", timeout=600)
     time.sleep(2)
     ours = {t: sql(p, f"SELECT count(*) AS n FROM {t}")[0]["n"] for t in ("events", "kv", "totals", "dims")}
-    theirs = {t: {**{f"delta/{k}": v for k, v in readers(lake, t).items()}, **{f"iceberg/{k}": v for k, v in iceberg_readers(lake, t).items()}} for t in ours}
+    theirs = {t: {**{f"delta/{k}": v for k, v in readers(lake, t).items()}, **{f"iceberg/{k}": v for k, v in iceberg_readers(lake, t, p).items()}} for t in ours}
     ok = all(v == ours[t] for t in ours for v in theirs[t].values())
     print(json.dumps({"lake": lake, "pondra": ours, "external": theirs, "match": ok}, indent=1))
     if not A.keep:

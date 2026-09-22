@@ -17,7 +17,8 @@ Anyone with the binary and credentials for the bucket can use it in one of three
 |---|---|---|---|---|
 | **Join**: `pondra serve --dir …` (add `--reader` to only read) | The catalog in memory, kept current by the leader's commit stream; hot objects on the local SSD | Every committed write, milliseconds after the ack | Yes (`--reader`: no) | A running process |
 | **Serverless**: `pondra sql --dir … "…"` | Opens the catalog in the bucket, reads the log tail and Parquet directly | Every write already in the bucket (every acknowledged write, in the default `--ack durable` mode) | `CREATE TABLE`, `INSERT`, `UPDATE`, `DELETE`: this machine does the work. The leader records it: over HTTP, through the bucket inbox if it can't be reached (`inbox/`), or this process leads for a moment if nobody does | Opening the catalog: ~20 sequential requests (30 ms on local disk, 3–6 s on R2 from this sandbox) |
-| **Other engines**, through Delta Lake or Iceberg | The table's `_delta_log/` or `metadata/`, if the table publishes it | The table as of the last tiering round | No | Nothing extra for Pondra, beyond the publishing itself |
+| **Other engines**, through Delta Lake or Iceberg | The table's `_delta_log/` or `metadata/`, if the table publishes it — directly, or through a node's Iceberg REST catalog (`http://node:8080`, namespace `default`) | The table as of the last tiering round | No | Nothing extra for Pondra, beyond the publishing itself |
+| **Kafka clients**, through a node's `--kafka` port | A topic per table: produce appends through the log, fetch reads the log | Every committed write | Yes | A running node |
 
 **Several lakes, one bucket.** Each lake is its own prefix with its own leader. A node or a
 `pondra sql` given `--attach sales=s3://bucket/sales` reads that lake's tables as `sales.orders`
@@ -62,7 +63,7 @@ Turning a format off deletes its metadata, so nobody reads a stale copy.
 
 | Path | Format | Who reads it | Changes? |
 |---|---|---|---|
-| `catalog/` | SlateDB (LSM of SSTs + WAL). Keys: `t/` tables, `s/` log segments, `d/` small segments' data, `p/` producer progress (and bulk-insert jobs), `v/` views, `k/` tasks, `x/` Delta state, `i/` Iceberg state, `m` the followers whose copies count (replicated acks), `n` next segment, `c` commit number | Pondra | new objects only; old ones compacted away |
+| `catalog/` | SlateDB (LSM of SSTs + WAL). Keys: `t/` tables, `s/` log segments, `d/` small segments' data, `p/` producer progress (and bulk-insert jobs; Kafka producers `kafka:{id}:{topic}`, consumer-group offsets `kafka-group:{group}:{topic}`, window emission `emit:{view}`), `v/` views, `k/` tasks, `x/` Delta state, `i/` Iceberg state, `m` the followers whose copies count (replicated acks), `n` next segment, `c` commit number | Pondra | new objects only; old ones compacted away |
 | `cluster/term/` | JSON: leader address and term (empty address: a `pondra sql` INSERT recording its files) | Pondra | one new object per election |
 | `cluster/alive/` | empty; its timestamp is what counts | Pondra | rewritten every 10 s by the leader; a one-off writer deletes its own when done |
 | `inbox/` | JSON requests (a flush as its binary body), JSON answers | the leader | each request deleted once answered; answers deleted by the writer (unclaimed ones after an hour) |
@@ -100,6 +101,18 @@ Not in the lake, on each node:
    as `remove` + `add`; Iceberg writes a new snapshot without the old files. Old files are
    deleted after `--retain-secs`.
 
+## Changing a table
+
+`ALTER TABLE t ADD COLUMN c TYPE` adds a column at the end of the table's definition in the
+catalog; nothing already written changes. Parquet files and log segments written before read
+the column as null (log rows are conformed to the current columns by name). Delta gets a new
+`metaData` action; the next Iceberg snapshot carries the new schema (columns mapped by name).
+Only adding is supported.
+
+SQL `TIMESTAMP` columns are stored in microseconds (`Timestamp(µs)`), the unit Iceberg, Delta,
+Spark and Postgres use; tables with them publish to Iceberg (`timestamp` / `timestamptz`) and,
+for time-zone-aware ones, Delta.
+
 ## Small files, compaction and indexes
 
 The same on local disk and on object storage:
@@ -119,6 +132,9 @@ The same on local disk and on object storage:
   Only when the run reaches the oldest file is the whole table rewritten. That drops deleted
   rows and rows past the table's TTL. On a 2 M-key table with 60 rounds of updates this writes
   3x less than rewriting every time.
+  - A keyed table's first file drops delete markers at once (nothing older to shadow).
+  - Keyed tables that publish Delta/Iceberg compact fully whenever 8 files pile up: other
+    engines see them as of their last full compaction.
 - **TTL** (`ttl = 'ts:86400'` on a keyed table): reads hide rows whose timestamp column is older
   than that; full compactions delete them.
 - **Retention:** replaced files and consumed log objects are deleted after `--retain-secs`.
@@ -137,8 +153,8 @@ copy-on-write DELETE for append tables.
 
 Only for tables that publish (see above). Point a Delta reader at `<lake root>/data/<table>`, or
 an Iceberg reader at `<lake root>/data/<table>/metadata/v<N>.metadata.json` (N is in
-`version-hint.text`). `tools/open_check.py` and `tools/demo_lake.py` compare six readers against
-Pondra's own SQL:
+`version-hint.text`). `tools/open_check.py` compares eight readers against Pondra's own SQL (the six below, plus
+PyIceberg and DuckDB through a node's Iceberg REST catalog); `tools/demo_lake.py` the six:
 
 ```python
 # Delta: delta-rs and Polars
@@ -155,6 +171,17 @@ StaticTable.from_metadata(meta, properties={"py-io-impl": "pyiceberg.io.fsspec.F
     "s3.endpoint": "https://<account>.r2.cloudflarestorage.com", "s3.region": "auto",
     "s3.access-key-id": "...", "s3.secret-access-key": "..."}).scan().to_arrow()
 pl.scan_iceberg(meta, storage_options=opts).collect()
+```
+
+Through the REST catalog, no paths at all:
+
+```python
+from pyiceberg.catalog import load_catalog
+cat = load_catalog("pondra", type="rest", uri="http://node:8080", token="<read token>")  # (on R2, add the s3.* properties above)
+cat.load_table("default.events").scan().to_arrow()
+# DuckDB: CREATE SECRET t (TYPE iceberg, TOKEN '<read token>');
+#         ATTACH 'pondra' AS p (TYPE iceberg, ENDPOINT 'http://node:8080', SECRET t);  -- no tokens: AUTHORIZATION_TYPE 'none'
+#         SELECT count(*) FROM p.default.events;
 ```
 
 ```sql

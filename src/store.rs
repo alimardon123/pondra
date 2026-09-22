@@ -314,7 +314,9 @@ impl Lake {
     /// A session with a fixed number of partitions: 1 for point lookups, where splitting the work
     /// costs more than it saves and many queries run at once.
     pub fn session_with(&self, partitions: usize) -> SessionContext {
-        SessionContext::new_with_config_rt(SessionConfig::new().with_information_schema(true).with_target_partitions(partitions), self.rt.clone())
+        let mut ctx = SessionContext::new_with_config_rt(SessionConfig::new().with_information_schema(true).with_target_partitions(partitions), self.rt.clone());
+        datafusion_functions_json::register_all(&mut ctx).expect("JSON functions register"); // json_get(…), ->, ->>
+        ctx
     }
 
     /// Full URL of an object, for DataFusion.

@@ -1,0 +1,5 @@
+dist binary (cargo build --profile dist: thin LTO, 1 codegen unit, stripped)
+raw   93032096 bytes (round 9: 90.7 MB)
+gzip -9  31378622 bytes
+xz -9    17623312 bytes
+idle RSS after start (with --kafka): 48628 KB

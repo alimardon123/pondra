@@ -18,16 +18,17 @@ The owner's design principles, which every change must respect:
 2. **As serverless as possible**: no always-on services besides the nodes themselves.
 3. **SPMD, not driver/executor** (Bodo-style): every node runs the same code on its slice.
 4. **No JVM, no Spark, no Flink, no Fluss needed.**
-5. **Short, simple, readable code** — without losing functionality. ~5,800 lines of Rust total.
+5. **Short, simple, readable code** — without losing functionality. ~7,300 lines of Rust total (the Kafka protocol is 1,300 of them).
    If a change makes a file much longer, look for the simpler shape first.
 
 ## Layout
 
 ```
-src/      5,800 lines of Rust, one file per concern (see the table in README.md)
+src/      7,300 lines of Rust, one file per concern (see the table in README.md)
 python/   the Python client (pure Python, HTTP + Arrow)
 tools/    harness.py, cluster.py (tests), open_check.py (Delta + Iceberg readers == Pondra),
           keyed_bench.py (compaction cost), clean_bucket.py (keep a bucket to its newest lakes),
+          kafka_bench.py (Kafka clients: throughput, latency), mcp_client.py (the MCP SDK),
           freshness.py (head-to-head freshness), clustering.py (what cluster_by buys),
           newuser_bench.py (first reads, new nodes), demo_lake.py (one of everything + the tree),
           serve_bench.py + loadgen.go (serving), bench/tpch.py (TPC-H vs DuckDB and Spark),
@@ -41,7 +42,8 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
 - **Tables** are Parquet files in the bucket plus a **log tail**. Every query reads files ∪ tail,
   so data is queryable the moment it commits.
 - **The catalog** is a SlateDB key-value store inside the same bucket: `t/` tables, `s/` segments,
-  `d/` inline segment data, `p/` producer progress, `v/` views, `k/` tasks, `x/` Delta and `i/`
+  `d/` inline segment data, `p/` producer progress (also Kafka producers, consumer-group offsets
+  and window emission), `v/` views, `k/` tasks, `x/` Delta and `i/`
   Iceberg publish state, `m` members (replicated acks), `n` next segment, `c` commit number. One
   process (the leader) writes it; everyone reads it.
 - **Writes:** a client POSTs a batch to *any* node. That node encodes it (Arrow IPC + ZSTD), runs
@@ -73,7 +75,16 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
 - **Attached lakes** (`--attach name=dir`): other lakes read as `name.table`; writes to them are
   recorded by their own leaders. Several clusters share one bucket this way.
 - **Tokens** (`auth.rs`): read / write / admin; none set = open. The same tokens guard HTTP,
-  Postgres and MCP (`mcp.rs`, `POST /mcp`: tools `list_tables`, `query`, `write`, `changes`).
+  Postgres, MCP (`mcp.rs`, `POST /mcp`: tools `list_tables`, `query`, `write`, `changes`),
+  Kafka (SASL/PLAIN) and the Iceberg REST catalog.
+- **The Kafka protocol** (`kafka.rs`, `--kafka`): a topic is a table with one partition; every
+  node takes producers (idempotent ones exactly-once) and consumers (offsets are `_ord`); the
+  leader coordinates consumer groups in memory. JSON values become rows; Debezium events and
+  tombstones become upserts and deletes.
+- **The Iceberg REST catalog** (`GET /v1/…`, `iceberg.rs`): engines attach a node by URL.
+- **Schema evolution:** `ALTER TABLE … ADD COLUMN`; reads conform older rows (`query::conform`).
+- **Window views that emit once** (`views.rs`, `?window=w&size_secs=&lateness_secs=`): closed
+  windows go to `{view}_final`, emitted by the leader.
 - **SSD tier** (lakes on object storage): each node keeps immutable objects on local disk —
   written through, read through, prefetched from the commit stream, warmed at start (`cache.rs`).
 - **Leader election** is a put-if-absent object `cluster/term/{n}`; SlateDB fencing stops an old
@@ -169,13 +180,23 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
 19. **Keyed compaction merges consecutive runs only** (`tier::run`). Files are versions in `ord`
    order; merging around a file would let an older version overtake a newer one. A partial
    merge (`Squash`) keeps delete markers and expired rows; only a full compaction (the run
-   reaches the oldest file) drops them.
+   reaches the oldest file) drops them — or a keyed table's first file, which has nothing older
+   to shadow. Tables that publish Delta/Iceberg always compact fully.
 20. **A write to an attached lake is recorded by that lake's leader** (`write::deliver`), never
    by ours: our catalog never lists another lake's files.
 21. **SQL from users never touches a node's disk.** Every query that arrives over HTTP, Postgres
    or MCP runs with `query::read_only()` (no `COPY … TO`, no `CREATE EXTERNAL TABLE`, no session
    DDL); writes go through `write.rs`. Local files (`enable_url_table`) are for `pondra sql` on
    its user's own machine only (`prepare(…, files: true)`). `harness.py clients` checks both.
+22. **A Kafka batch's seq comes from its producer id and sequence** (`kafka::queue`): seq = base
+   sequence + record count, `prev` = base sequence, producer `kafka:{id}:{topic}`. Producers
+   without a name (non-idempotent Kafka producers) are never checked (`log::commit`); nothing
+   else may use an empty name.
+23. **Columns only grow, at the end** (`write::create_table`), and every read of log rows goes
+   through `query::conform` (by name; missing → null). Never read segment rows with the table
+   schema without conforming them: rows written before an ALTER have fewer columns.
+24. **A window is emitted once** (`views::emit`): the rows and the `emit:{view}` producer's seq
+   (the watermark, µs) commit together, with `prev` = the last watermark.
 
 ## Tests: run these before and after any change
 
@@ -187,15 +208,22 @@ python3 tools/cluster.py users --secs 30      # 64 writers + 16 readers: 0 torn 
 python3 tools/cluster.py failover --secs 45   # 2 leader kills; task state == inline view == model
 python3 tools/cluster.py latency [--load 4]   # event -> view row on another node
 python3 tools/harness.py serverless            # pondra sql INSERT with and without a leader, 4 at once, a retry
-python3 tools/open_check.py                    # Delta + Iceberg: 6 outside readers == Pondra
+python3 tools/open_check.py                    # Delta + Iceberg: 8 outside readers (REST catalog included) == Pondra
 python3 tools/freshness.py [--flag ack=replicated]  # head to head: nodes, pondra sql, Delta, Iceberg
 python3 tools/harness.py clients               # SQL writes, Python client, Postgres drivers, tokens, inbox, attach, vectors, MCP
+python3 tools/harness.py kafka                 # Kafka producers/consumers/groups (librdkafka, kafka-python), Debezium, SASL
+python3 tools/harness.py alter                 # ALTER TABLE ADD COLUMN under load, 6 outside readers follow
+python3 tools/harness.py windows               # event-time windows emitted once, late rows, a leader restart
+python3 tools/kafka_bench.py [--flag ack=replicated]   # Kafka ingest throughput and latency, 3 nodes
 python3 tools/mcp_client.py --url http://127.0.0.1:8080/mcp   # the official MCP SDK (pip install mcp) against a node
 python3 tools/keyed_bench.py                   # keyed-table compaction: bytes written, correctness
 python3 tools/cluster.py race | isolate | split | spread
 python3 tools/bench/run.py batch 20000000     # ENGINES=pondra,spark,flink
 python3 tools/serve_bench.py --keys 2000000   # serving: point lookups and dashboard queries
 ```
+
+The Python tools need `pip install pyarrow pandas polars duckdb deltalake pyiceberg s3fs boto3
+moto psycopg psycopg2-binary asyncpg sqlalchemy confluent-kafka kafka-python mcp`.
 
 Add `--s3` to any of them with a simulated-R2 bucket to see the object-storage behaviour:
 
@@ -233,10 +261,10 @@ Practical notes for an agent working here:
 - Node stderr goes to `/tmp/pondra-<port>-<id>.stderr`; that's where "restarting to rejoin",
   "slow tiering" and panics show up.
 
-## State of the work (2026-09-22, round 9)
+## State of the work (2026-09-22, round 10)
 
-Everything in `docs/prototype-status.md` passes on local disk and on simulated R2. The round-9
-additions (inbox, SQL writes, Postgres, MCP, vectors, tokens) also ran against real R2.
+Everything in `docs/prototype-status.md` passes on local disk and on simulated R2. The round-10
+additions (Kafka, the REST catalog, ALTER TABLE, windows) also ran against real R2.
 
 **R2 test buckets.** There are two:
 
@@ -259,6 +287,8 @@ Headline numbers, all on one 2-vCPU box:
   and 7.3 s on real R2, including the 3–6 s it takes to open the catalog.
 - **Clients:** 18 checks pass: SQL writes, the Python client, four Postgres drivers, MCP,
   vectors, tokens, attached lakes, the inbox.
+- **Kafka:** librdkafka producers into 3 nodes on one box: ~0.8 M events/s, exactly-once, ack
+  1 ms p50 (replicated); a consumer on another node has it 1 ms later. On real R2: 461k events/s replicated (ack 1 ms p50), 68.7k durable.
 - **Freshness, like for like:** nodes see a write 10–15 ms after the ack (local and R2); Delta
   and Iceberg readers ~30 ms (local) / 3–4 s (near R2) / 7–10 s (far R2).
 - **Keyed compaction:** 3x fewer bytes written than full rewrites (size-tiered).
@@ -279,9 +309,10 @@ Known limits, in the order they matter:
    there are no transactions across lakes.
 3. **No shuffles** in distributed queries: big-to-big joins run on one node. Everything has run
    as processes on one machine; no multi-machine run yet.
-4. **Missing doors:** no Kafka protocol, no Iceberg REST catalog, no `ALTER TABLE`.
-5. **Streaming:** event-time windows update on late rows and expire by TTL, but there are no
-   watermarks that close a window and emit it once.
+4. **Kafka's edges:** one partition per topic, no transactions, sparse offsets, consumer groups
+   in the leader's memory; the Java client is untested (no jars here).
+5. **Streaming:** windows emit once past a watermark taken from window starts (not the
+   source's event time); no session windows or point-in-time joins yet.
 6. **Security:** tokens per role only; no TLS (use a proxy), no per-table grants or quotas.
 7. **Latency of one-off writers on far storage:** `pondra sql` spends 2–3 s opening the
    catalog on far object storage, and an inbox write adds a second or two.
@@ -290,15 +321,15 @@ Known limits, in the order they matter:
 Good next moves, in order. The plan table in the comparison doc has the evidence each should
 produce.
 
-1. **Kafka-protocol ingest** (produce, plus a fetch subset). Every competitor has a Kafka door.
-2. **A multi-machine run** (3–10 VMs on S3/R2), then **shuffles** through the job-dealing
+1. **A multi-machine run** (3–10 VMs on S3/R2), then **shuffles** through the job-dealing
    mechanism.
-3. **An Iceberg REST catalog endpoint** over the Iceberg tables Pondra already publishes.
-4. **`ALTER TABLE … ADD COLUMN`**, then renames and defaults.
-5. **Watermarks** and append-only window output; point-in-time joins.
-6. **AI functions in SQL** (`ai_complete`, `embed` against an OpenAI-compatible endpoint) and an
+2. **AI functions in SQL** (`ai_complete`, `embed` against an OpenAI-compatible endpoint) and an
    approximate vector index.
-7. **TLS, per-table grants, an audit log, quotas.**
+3. **Kafka partitions** (key-hashed slices of a table) and transactions; the Java client and
+   Kafka Connect verified.
+4. **TLS, per-table grants, an audit log, quotas.**
+5. **Session windows**, a watermark from event time, point-in-time joins.
+6. **More schema evolution:** renames, defaults, type widening.
 
 ## Conventions
 

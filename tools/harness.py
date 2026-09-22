@@ -465,6 +465,255 @@ def clients():
     return f"SQL writes, Python client, Postgres (4 drivers), tokens, change-feed replay, attached lake, inbox ({inbox_s:.1f}s), vector search, MCP, no file access from SQL: all {len(checks)} checks pass"
 
 
+def kafka():
+    """Kafka clients against a node: librdkafka (idempotent, every codec) and kafka-python
+    producers, exactly-once retries, Debezium change events and tombstones, raw values, a view
+    fed by Kafka, consumers reading the log back (deletes as tombstones), SASL/PLAIN tokens."""
+    import confluent_kafka as ck, kafka as kp, struct, socket
+    from kafka.record.default_records import DefaultRecordBatchBuilder
+    tokens = {"read_token": "r-tok", "write_token": "w-tok", "admin_token": "a-tok"}
+    lake, kport = new_lake(), A.port + 20
+    node = Node(lake, A.port, kafka=f"127.0.0.1:{kport}", changelog_secs=600, **tokens).start()
+    sql_ = lambda q, t="a-tok": call(A.port, "POST", "/sql", q.encode(), headers={"authorization": f"Bearer {t}"})
+    sql_("CREATE TABLE events (user VARCHAR, amount BIGINT, _key VARCHAR, _timestamp TIMESTAMP)")
+    sql_("CREATE TABLE users (id BIGINT PRIMARY KEY, name VARCHAR, score DOUBLE)")
+    sql_("CREATE TABLE lines (_key VARCHAR, _value VARCHAR, _timestamp TIMESTAMP)")
+    call(A.port, "POST", "/views/per_user", b"SELECT user, count(*) AS n, sum(amount) AS total FROM events GROUP BY user", headers={"authorization": "Bearer a-tok"})
+    sasl = lambda user, pw: {"bootstrap.servers": f"127.0.0.1:{kport}", "security.protocol": "SASL_PLAINTEXT", "sasl.mechanisms": "PLAIN", "sasl.username": user, "sasl.password": pw}
+    checks, n = {}, 20_000
+    # librdkafka, idempotent, each compression codec
+    t = time.time()
+    for i, codec in enumerate(["none", "gzip", "snappy", "lz4", "zstd"]):
+        p = ck.Producer({**sasl("writer", "w-tok"), "enable.idempotence": True, "compression.type": codec, "linger.ms": 5})
+        for j in range(n // 5):
+            p.produce("events", key=f"u{j % 50}", value=json.dumps({"user": f"u{j % 50}", "amount": 1}))
+            p.poll(0)
+        assert p.flush(60) == 0
+    librdkafka_s = time.time() - t
+    # kafka-python, not idempotent, gzip
+    kp_prod = kp.KafkaProducer(bootstrap_servers=f"127.0.0.1:{kport}", security_protocol="SASL_PLAINTEXT", sasl_mechanism="PLAIN",
+                               sasl_plain_username="writer", sasl_plain_password="w-tok", compression_type="gzip", value_serializer=lambda v: json.dumps(v).encode())
+    for j in range(1000):
+        kp_prod.send("events", {"user": "kp", "amount": 2})
+    kp_prod.flush(); kp_prod.close()
+    got = sql_("SELECT count(*) AS n, sum(amount) AS s, count(_key) AS keys, min(_timestamp) IS NOT NULL AS ts FROM events")[0]
+    checks["librdkafka (5 codecs, idempotent) + kafka-python"] = got == {"n": n + 1000, "s": n + 2000, "keys": n, "ts": True}
+    view = sql_("SELECT sum(n) AS n, sum(total) AS s FROM per_user")[0]
+    checks["a view fed by Kafka"] = view == {"n": n + 1000, "s": n + 2000}
+    # exactly-once: the same idempotent batch twice is applied once; one that skips ahead is refused
+    def raw(frames, user="writer", pw="w-tok"):
+        s = socket.create_connection(("127.0.0.1", kport))
+        def req(key, ver, body):
+            head = struct.pack(">hhih", key, ver, 7, 1) + b"t"
+            s.sendall(struct.pack(">i", len(head) + len(body)) + head + body)
+            size = struct.unpack(">i", s.recv(4))[0]
+            data = b""
+            while len(data) < size:
+                data += s.recv(size - len(data))
+            return data[4:]
+        mech = b"PLAIN"
+        req(17, 1, struct.pack(">h", len(mech)) + mech)
+        auth = b"\0" + user.encode() + b"\0" + pw.encode()
+        out = [req(36, 0, struct.pack(">i", len(auth)) + auth)[:2]]
+        for key, ver, body in frames:
+            out.append(req(key, ver, body))
+        s.close()
+        return out
+    def batch(seq, rows, producer=424242):
+        b = DefaultRecordBatchBuilder(magic=2, compression_type=0, is_transactional=False, producer_id=producer, producer_epoch=0, base_sequence=seq, batch_size=1 << 20)
+        for k, r in enumerate(rows):
+            b.append(k, timestamp=int(time.time() * 1000), key=None, value=json.dumps(r).encode(), headers=[])
+        return bytes(b.build())
+    def produce(topic, records):
+        body = struct.pack(">hhi", -1, -1, 5000) + struct.pack(">i", 1) + struct.pack(">h", len(topic)) + topic.encode()
+        return (0, 3, body + struct.pack(">i", 1) + struct.pack(">ii", 0, len(records)) + records)
+    error = lambda resp: struct.unpack(">h", resp[4 + 2 + len("users") + 4 + 4:4 + 2 + len("users") + 4 + 4 + 2])[0]
+    b0 = batch(0, [{"id": 1, "name": "ann", "score": 1.0}, {"id": 2, "name": "bob", "score": 2.0}])
+    auth, first, again, ahead = raw([produce("users", b0), produce("users", b0), produce("users", batch(7, [{"id": 9, "name": "x", "score": 0}]))])
+    checks["exactly-once retries (idempotent producer)"] = (auth, error(first), error(again), error(ahead)) == (b"\0\0", 0, 0, 45) and \
+        sql_("SELECT count(*) AS n FROM users")[0]["n"] == 2
+    # Debezium change events (with Kafka Connect's schema wrapper) and a tombstone
+    dbz = lambda op, before, after: json.dumps({"schema": {}, "payload": {"op": op, "before": before, "after": after, "source": {}}})
+    p = ck.Producer(sasl("writer", "w-tok"))
+    p.produce("users", key=json.dumps({"id": 3}), value=dbz("c", None, {"id": 3, "name": "cy", "score": 3.0}))
+    p.produce("users", key=json.dumps({"id": 1}), value=dbz("u", {"id": 1}, {"id": 1, "name": "ann", "score": 11.0}))
+    p.produce("users", key=json.dumps({"id": 2}), value=dbz("d", {"id": 2, "name": "bob", "score": 2.0}, None))
+    p.produce("users", key=json.dumps({"id": 2}), value=None)  # Debezium's tombstone after a delete
+    p.produce("users", key=b"3", value=json.dumps({"id": 4, "name": "dee", "score": 4.0}))
+    p.produce("users", key=b"4", value=None)  # a tombstone with a plain key
+    p.produce("lines", key=b"k1", value=b"plain text, not JSON")
+    p.produce("lines", key=b"k2", value=b'{"event": "click", "n": 3}')
+    assert p.flush(30) == 0
+    checks["Debezium events and tombstones"] = sql_("SELECT id, name, score FROM users ORDER BY id") == [{"id": 1, "name": "ann", "score": 11.0}, {"id": 3, "name": "cy", "score": 3.0}]
+    checks["raw values (_value), queried as JSON"] = sql_("SELECT _key, _value FROM lines ORDER BY _key")[0] == {"_key": "k1", "_value": "plain text, not JSON"} and \
+        sql_("SELECT _value->>'event' AS e, json_get_int(_value, 'n') AS n FROM lines WHERE _key = 'k2'") == [{"e": "click", "n": 3}]
+    # consumers: kafka-python and librdkafka read the log back from the beginning
+    tp = kp.TopicPartition("users", 0)
+    c = kp.KafkaConsumer(bootstrap_servers=f"127.0.0.1:{kport}", security_protocol="SASL_PLAINTEXT", sasl_mechanism="PLAIN",
+                         sasl_plain_username="reader", sasl_plain_password="r-tok", group_id=None, enable_auto_commit=False, consumer_timeout_ms=3000)
+    c.assign([tp]); c.seek_to_beginning(tp)
+    msgs = list(c); c.close()
+    tombstones = [json.loads(m.key) for m in msgs if m.value is None]
+    offsets = [m.offset for m in msgs]
+    checks["kafka-python consumer (upserts, deletes as tombstones)"] = len(msgs) == 8 and {"id": 2} in tombstones and {"id": 4} in tombstones and offsets == sorted(offsets)
+    cc = ck.Consumer({**sasl("reader", "r-tok"), "group.id": "pondra-test", "enable.auto.commit": False})
+    cc.assign([ck.TopicPartition("events", 0, ck.OFFSET_BEGINNING)])
+    count, deadline = 0, time.time() + 30
+    while count < n + 1000 and time.time() < deadline:
+        for m in cc.consume(1000, 1.0):
+            count += m.error() is None
+    cc.close()
+    checks["librdkafka consumer"] = count == n + 1000
+    # consumer groups, coordinated by the leader: a member commits and leaves; the next one, which
+    # starts from a follower node, resumes exactly there. Two live members: one holds the partition.
+    follower = Node(lake, A.port + 1, kafka=f"127.0.0.1:{kport + 1}", **tokens).start()
+    time.sleep(1)
+    kc = lambda port, group: kp.KafkaConsumer("events", bootstrap_servers=f"127.0.0.1:{port}", group_id=group, auto_offset_reset="earliest", enable_auto_commit=False,
+                                               security_protocol="SASL_PLAINTEXT", sasl_mechanism="PLAIN", sasl_plain_username="reader", sasl_plain_password="r-tok")
+    first, rest, deadline = [], [], time.time() + 60
+    c1 = kc(kport, "g1")
+    while len(first) < 10_000 and time.time() < deadline:
+        for recs in c1.poll(timeout_ms=500, max_records=1000).values():
+            first.extend(r.offset for r in recs)
+    c1.commit(); c1.close()
+    c2 = kc(kport + 1, "g1")
+    while len(first) + len(rest) < n + 1000 and time.time() < deadline:
+        for recs in c2.poll(timeout_ms=500).values():
+            rest.extend(r.offset for r in recs)
+    c2.close()
+    both = first + rest
+    live = [ck.Consumer({**sasl("reader", "r-tok"), "group.id": "g2", "auto.offset.reset": "earliest", "bootstrap.servers": f"127.0.0.1:{kport + k}"}) for k in (0, 1)]
+    [c.subscribe(["events"]) for c in live]
+    seen, t_end = set(), time.time() + 15
+    while time.time() < t_end:
+        for c in live:
+            seen.update(m.offset() for m in c.consume(1000, 0.2) if m.error() is None)
+    holders = [len(c.assignment()) for c in live]
+    [c.close() for c in live]
+    checks["consumer groups (commit, hand-over via a follower, one holder)"] = len(set(both)) == len(both) == n + 1000 and min(rest) > max(first) and \
+        sorted(holders) == [0, 1] and len(seen) == n + 1000
+    if not checks["consumer groups (commit, hand-over via a follower, one holder)"]:
+        print("groups:", len(first), len(rest), len(set(both)), min(rest, default=None), max(first, default=None), holders, len(seen))
+    follower.kill()
+    # tokens: a wrong password is refused; a read token can't produce
+    failed = []
+    for user, pw in [("writer", "nope"), ("reader", "r-tok")]:
+        p = ck.Producer({**sasl(user, pw), "message.timeout.ms": 3000})
+        p.produce("events", value=b"{}", on_delivery=lambda err, msg: failed.append(err is not None))
+        p.flush(6)
+    checks["wrong password / read token refused"] = failed == [True, True] and sql_("SELECT count(*) AS n FROM events")[0]["n"] == n + 1000
+    node.kill()
+    ok = all(checks.values())
+    print(json.dumps({"kafka": checks, "librdkafka_20k_events_s": round(librdkafka_s, 2), "ok": ok}, indent=1))
+    if not ok:
+        sys.exit(1)
+    return f"Kafka: librdkafka (5 codecs, idempotent) and kafka-python producers, exactly-once retries, Debezium, tombstones, raw values as JSON, consumers, consumer groups, SASL tokens: all {len(checks)} checks pass"
+
+
+def alter():
+    """ALTER TABLE … ADD COLUMN under load: producers keep writing the old columns while a column
+    is added; old rows (log and Parquet) read it as null, new ones carry it; keyed tables, views,
+    bulk INSERTs, Arrow appends and the Delta/Iceberg copies all follow."""
+    import io, pyarrow as pa
+    lake = new_lake()
+    node = Node(lake, A.port, tier_secs=0.25, publish="delta,iceberg").start()
+    q = lambda s: sql(A.port, s)
+    q("CREATE TABLE events (user VARCHAR, amount BIGINT)")
+    q("CREATE TABLE users (id BIGINT PRIMARY KEY, name VARCHAR)")
+    call(A.port, "POST", "/views/per_user", b"SELECT user, count(*) AS n, sum(amount) AS total FROM events GROUP BY user")
+    stop, sent = threading.Event(), [0]
+    def produce():  # an old producer: never sends the new column
+        seq = 0
+        while not stop.is_set():
+            seq += 1
+            call(A.port, "POST", f"/append/events?producer=old&seq={seq}", "".join(json.dumps({"user": f"u{i % 10}", "amount": 1}) + "\n" for i in range(100)).encode())
+            sent[0] += 100
+    t = threading.Thread(target=produce); t.start()
+    q("INSERT INTO users VALUES (1, 'ann'), (2, 'bob')")
+    time.sleep(1.5)  # some rows tiered to Parquet, some still in the log
+    q("ALTER TABLE events ADD COLUMN country VARCHAR")
+    q("ALTER TABLE users ADD COLUMN email VARCHAR")
+    again = q("ALTER TABLE users ADD COLUMN IF NOT EXISTS email VARCHAR")
+    call(A.port, "POST", "/append/events?producer=new&seq=1", b'{"user": "u1", "amount": 5, "country": "UZ"}\n')
+    q("INSERT INTO events VALUES ('u2', 7)")  # (bulk, the old columns only)
+    b = pa.record_batch([pa.array(["u3"]), pa.array([9], pa.int64())], names=["user", "amount"])
+    buf = io.BytesIO()
+    with pa.ipc.new_stream(buf, b.schema) as w:
+        w.write_batch(b)
+    call(A.port, "POST", "/append/events?producer=arrow&seq=1", buf.getvalue(), headers={"content-type": "application/vnd.apache.arrow.stream"})
+    q("UPDATE users SET email = 'ann@x.io' WHERE id = 1")
+    time.sleep(1); stop.set(); t.join(); time.sleep(1.5)
+    call(A.port, "POST", "/tier")
+    time.sleep(1)
+    total = sent[0] + 5 + 7 + 9
+    checks = {
+        "old and new rows": q("SELECT count(*) AS n, sum(amount) AS s, count(country) AS c FROM events")[0] == {"n": sent[0] + 3, "s": total, "c": 1},
+        "the new column": q("SELECT country FROM events WHERE country IS NOT NULL") == [{"country": "UZ"}],
+        "a view over the table": q("SELECT sum(n) AS n, sum(total) AS s FROM per_user")[0] == {"n": sent[0] + 3, "s": total},
+        "a keyed table": q("SELECT id, name, email FROM users ORDER BY id") == [{"id": 1, "name": "ann", "email": "ann@x.io"}, {"id": 2, "name": "bob"}],
+        "lookup": call(A.port, "GET", "/lookup/users/1")[0].get("email") == "ann@x.io",
+        "IF NOT EXISTS": again == {"table": "users", "unchanged": True},
+        "a clash is refused": _raises(lambda: q("ALTER TABLE users ADD COLUMN name VARCHAR")),
+    }
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import open_check
+    theirs = {**open_check.readers(lake, "events"), **{f"iceberg/{k}": v for k, v in open_check.iceberg_readers(lake, "events").items()}}
+    duck = open_check.duck(lake)
+    countries = [duck.execute(f"SELECT count(country) FROM {scan}").fetchone()[0] for scan in (f"delta_scan('{lake}/data/events')", f"iceberg_scan('{open_check.iceberg_metadata(lake, 'events')}')")]
+    checks["Delta and Iceberg readers"] = all(v == sent[0] + 3 for v in theirs.values()) and countries == [1, 1]
+    node.kill()
+    ok = all(checks.values())
+    print(json.dumps({"alter": checks, "rows_written_during": sent[0], "outside_readers": theirs, "ok": ok}, indent=1))
+    if not ok:
+        sys.exit(1)
+    return f"ALTER TABLE ADD COLUMN under load ({sent[0]:,} rows written meanwhile): old rows null, new ones set, keyed table, view, bulk and Arrow appends, 6 outside readers: all {len(checks)} checks pass"
+
+
+def windows():
+    """Event-time windows that emit once: 1-minute windows, 10 s allowed lateness. Each window
+    reaches `{view}_final` once, final, after the watermark passes it; a late row updates the view
+    but not what was emitted; a restart of the leader emits nothing twice."""
+    import datetime
+    lake = new_lake()
+    node = Node(lake, A.port, tier_secs=1).start()
+    q = lambda s: sql(A.port, s)
+    q("CREATE TABLE clicks (user VARCHAR, ts TIMESTAMP)")
+    call(A.port, "POST", "/views/per_minute?window=w&size_secs=60&lateness_secs=10",
+         b"SELECT date_bin(INTERVAL '1 minute', ts) AS w, user, count(*) AS n FROM clicks GROUP BY 1, 2")
+    base = 1_790_000_000 // 60 * 60
+    iso = lambda s: datetime.datetime.fromtimestamp(s, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    seq = 0
+    def send(rows):
+        nonlocal seq
+        seq += 1
+        call(A.port, "POST", f"/append/clicks?producer=p&seq={seq}", "".join(json.dumps(r) + "\n" for r in rows).encode())
+    for m in range(5):  # minutes 0-4, in order: a 20 clicks and b 10 in each
+        send([{"user": "a" if i % 3 else "b", "ts": iso(base + m * 60 + i)} for i in range(30)])
+    time.sleep(2)
+    minutes = lambda rows: sorted({(datetime.datetime.fromisoformat(r["w"]).replace(tzinfo=datetime.timezone.utc).timestamp() - base) // 60 for r in rows})
+    first = q("SELECT w, user, n FROM per_minute_final ORDER BY w, user")
+    send([{"user": "a", "ts": iso(base + 5)}])  # late, for minute 0 (already final)
+    send([{"user": "a", "ts": iso(base + 6 * 60)}])  # minute 6: the watermark passes minutes 3 and 4
+    time.sleep(2)
+    node.kill()
+    node = Node(lake, A.port, tier_secs=1).start()  # (a new leader: nothing emitted twice)
+    time.sleep(2)
+    final = q("SELECT w, user, n FROM per_minute_final ORDER BY w, user")
+    view0 = q(f"SELECT n FROM per_minute WHERE user = 'a' AND w = '{iso(base)}'")
+    node.kill()
+    checks = {
+        "closed windows only": minutes(first) == [0, 1, 2],
+        "each window once, final": minutes(final) == [0, 1, 2, 3, 4] and len(final) == 10 and all(r["n"] == (20 if r["user"] == "a" else 10) for r in final),
+        "late row: in the view, not re-emitted": view0 == [{"n": 21}],
+    }
+    ok = all(checks.values())
+    print(json.dumps({"windows": checks, "ok": ok}, indent=1))
+    if not ok:
+        print(first, final, view0)
+        sys.exit(1)
+    return "event-time windows: each emitted once, final, after the watermark; late rows update the view only; a leader restart emits nothing twice"
+
+
 def _raises(f):
     try:
         f()
@@ -519,7 +768,7 @@ def load():
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    out = {t.__name__: t() for t in (upsert, tiering, fence, insert, serverless, clients, reader, crash)}
+    out = {t.__name__: t() for t in (upsert, tiering, fence, insert, serverless, clients, kafka, alter, windows, reader, crash)}
     A.secs = min(A.secs, 20)
     out["load"] = load()
     print(json.dumps(out, indent=1))
@@ -527,7 +776,7 @@ def all_tests():
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "tiering", "fence", "reader", "insert", "serverless", "clients", "load", "all"])
+    ap.add_argument("mode", choices=["crash", "upsert", "tiering", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "load", "all"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -538,4 +787,4 @@ if __name__ == "__main__":
     ap.add_argument("--secs", type=int, default=30)
     ap.add_argument("--flush-ms", type=int, default=250)
     A = ap.parse_args()
-    {"crash": crash, "upsert": upsert, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "load": load, "all": all_tests}[A.mode]()
+    {"crash": crash, "upsert": upsert, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "load": load, "all": all_tests}[A.mode]()

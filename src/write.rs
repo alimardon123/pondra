@@ -11,6 +11,7 @@ use crate::store::*;
 use anyhow::{bail, ensure, Result};
 use bytes::Bytes;
 use datafusion::arrow::compute::{cast, concat_batches};
+use datafusion::arrow::datatypes::{DataType, TimeUnit};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::prelude::SessionContext;
 use datafusion::sql::sqlparser::ast::{self, Statement};
@@ -63,12 +64,24 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
     ensure!(cluster.iter().all(|c| columns.iter().any(|(n, _)| n == c)) && (cluster.is_empty() || key.is_empty()), "cluster_by: columns of an append table (keyed tables are sorted by key)");
     let meta = match lake.cat.get::<TableMeta>(&table_key(name)).await? {
         None => TableMeta { columns, key, merge, publish: publish.unwrap_or_else(default_publish), cluster, ttl, ..Default::default() },
-        Some(m) if publish.is_none() || publish.as_ref() == Some(&m.publish) => return Ok(j!({"table": name, "publish": m.publish})),
         Some(mut m) => {
-            let dropped: Vec<String> = m.publish.iter().filter(|f| !publish.iter().flatten().any(|p| p == *f)).cloned().collect();
-            m.publish = publish.unwrap_or_default();
-            for format in dropped {
-                crate::delta::unpublish(lake, name, &format).await?; // (no stale copy left for other engines)
+            // Sent again: columns may only grow at the end (ALTER TABLE … ADD COLUMN; a re-sent
+            // original definition is fine), and `publish` may change.
+            let (old, new) = (m.columns.len(), columns.len());
+            ensure!(columns[..new.min(old)] == m.columns[..new.min(old)], "{name} exists with other columns (only new ones can be added, at the end)");
+            let republish = publish.as_ref().is_some_and(|p| *p != m.publish);
+            if new <= old && !republish {
+                return Ok(j!({"table": name, "publish": m.publish}));
+            }
+            if new > old {
+                m.columns = columns;
+            }
+            if let Some(publish) = publish.filter(|_| republish) {
+                let dropped: Vec<String> = m.publish.iter().filter(|f| !publish.contains(f)).cloned().collect();
+                m.publish = publish;
+                for format in dropped {
+                    crate::delta::unpublish(lake, name, &format).await?; // (no stale copy left for other engines)
+                }
             }
             m
         }
@@ -85,6 +98,7 @@ pub enum Stmt {
     Insert(String, String),                              // table, the query giving the rows
     Update(String, Vec<(String, String)>, Option<String>), // table, column = expression, WHERE
     Delete(String, Option<String>),                      // table, WHERE
+    AddColumn(String, String, String, bool),             // table, column, SQL type, IF NOT EXISTS
 }
 
 impl Stmt {
@@ -92,7 +106,7 @@ impl Stmt {
     fn table(&self) -> String {
         match self {
             Stmt::Create(c) => c.name.to_string(),
-            Stmt::Insert(t, _) | Stmt::Update(t, ..) | Stmt::Delete(t, _) => t.clone(),
+            Stmt::Insert(t, _) | Stmt::Update(t, ..) | Stmt::Delete(t, _) | Stmt::AddColumn(t, ..) => t.clone(),
         }
     }
 }
@@ -111,6 +125,10 @@ pub fn parse(sql: &str) -> Option<Stmt> {
             });
             Stmt::Update(u.table.relation.to_string(), set.collect(), where_(&u.selection))
         }
+        Statement::AlterTable(a) => match &a.operations[..] {
+            [ast::AlterTableOperation::AddColumn { if_not_exists, column_def: c, .. }] => Stmt::AddColumn(a.name.to_string(), c.name.value.clone(), c.data_type.to_string(), *if_not_exists),
+            _ => return None,
+        },
         Statement::Delete(d) => {
             let (ast::FromTable::WithFromKeyword(t) | ast::FromTable::WithoutKeyword(t)) = &d.from;
             Stmt::Delete(t.first()?.relation.to_string(), where_(&d.selection))
@@ -126,7 +144,7 @@ async fn create_spec(c: &ast::CreateTable) -> Result<(String, String)> {
     let cols = c.columns.iter().map(|c| format!("{} {}", c.name, c.data_type)).collect::<Vec<_>>().join(", ");
     let ctx = SessionContext::new();
     ctx.sql(&format!("CREATE TABLE t ({cols})")).await?;
-    let columns: Vec<(String, String)> = ctx.table("t").await?.schema().fields().iter().map(|f| (f.name().clone(), f.data_type().to_string().replace("Utf8View", "Utf8"))).collect();
+    let columns: Vec<(String, String)> = ctx.table("t").await?.schema().fields().iter().map(|f| (f.name().clone(), stored(f.data_type()).to_string())).collect();
     let name = |e: &ast::Expr| e.to_string().trim_matches('"').to_string();
     let mut key: Vec<String> = c.constraints.iter().flat_map(|k| match k {
         ast::TableConstraint::PrimaryKey(pk) => pk.columns.iter().map(|i| name(&i.column.expr)).collect(),
@@ -149,6 +167,32 @@ async fn create_spec(c: &ast::CreateTable) -> Result<(String, String)> {
     }
     let spec = j!({"columns": columns, "key": key, "merge": merge, "publish": list("publish"), "cluster_by": list("cluster_by").unwrap_or_default(), "ttl": opts.get("ttl")});
     Ok((c.name.to_string(), spec.to_string()))
+}
+
+/// How a SQL type is kept: strings as Utf8; timestamps in microseconds, as Iceberg, Delta, Spark
+/// and Postgres keep them.
+fn stored(t: &DataType) -> DataType {
+    match t {
+        DataType::Utf8View => DataType::Utf8,
+        DataType::Timestamp(_, tz) => DataType::Timestamp(TimeUnit::Microsecond, tz.clone()),
+        t => t.clone(),
+    }
+}
+
+/// `ALTER TABLE t ADD COLUMN c TYPE`: the table's definition with the new column at the end, sent
+/// like a CREATE TABLE (the leader adds it; old rows read it as null). None: IF NOT EXISTS, and it does.
+async fn alter_spec(lake: &Lake, table: &str, column: &str, sql_type: &str, if_not_exists: bool) -> Result<Option<String>> {
+    let m: TableMeta = lake.cat.get(&table_key(table)).await?.ok_or_else(|| anyhow::anyhow!("no table {table}"))?;
+    if m.columns.iter().any(|(c, _)| c == column) {
+        ensure!(if_not_exists, "{table} already has a column {column}");
+        return Ok(None);
+    }
+    let ctx = SessionContext::new();
+    ctx.sql(&format!("CREATE TABLE t ({column} {sql_type})")).await?;
+    let mut columns = m.columns.clone();
+    columns.push((column.to_string(), stored(ctx.table("t").await?.schema().field(0).data_type()).to_string()));
+    let ttl = m.ttl.as_ref().map(|(c, s)| format!("{c}:{s}"));
+    Ok(Some(j!({"columns": columns, "key": m.key, "merge": m.merge, "publish": m.publish, "cluster_by": m.cluster, "ttl": ttl}).to_string()))
 }
 
 /// The rows a write to a keyed table upserts: the INSERT's query, the updated rows, or the rows
@@ -177,7 +221,7 @@ fn rows_sql(meta: &TableMeta, stmt: &Stmt) -> Result<String> {
             ensure!(meta.merge.is_empty() && deletes, "DELETE needs an upsert table with a Boolean _deleted column");
             Ok(select(&|c: &str| if c == "_deleted" { "true".into() } else { q(c) }, t, cond))
         }
-        Stmt::Create(_) => unreachable!("not a row write"),
+        Stmt::Create(_) | Stmt::AddColumn(..) => unreachable!("not a row write"),
     }
 }
 
@@ -198,12 +242,15 @@ async fn rows(ctx: &SessionContext, meta: &TableMeta, sql: &str) -> Result<Recor
     let batches = ctx.sql(sql).await?.collect().await?;
     let Some(first) = batches.first() else { return Ok(RecordBatch::new_empty(target)) };
     let all = concat_batches(&first.schema(), &batches)?;
-    let mut given = all.columns().to_vec();
-    if given.len() + 1 == target.fields().len() && target.fields().last().is_some_and(|f| f.name() == "_deleted") {
-        given.push(datafusion::arrow::array::new_null_array(&datafusion::arrow::datatypes::DataType::Boolean, all.num_rows())); // (INSERTs may leave `_deleted` out)
-    }
-    ensure!(given.len() == target.fields().len(), "{} columns given, the table has {}", given.len(), target.fields().len() - usize::from(target.fields().last().is_some_and(|f| f.name() == "_deleted")));
-    let columns = given.iter().zip(target.fields()).map(|(c, f)| cast(c, f.data_type())).collect::<Result<Vec<_>, _>>()?;
+    // The given columns fill the table's in order — all of them, or all but `_deleted`, or the
+    // first few (later ones, such as added columns, are null).
+    let skip_deleted = all.num_columns() < target.fields().len();
+    let mut given = all.columns().iter();
+    let columns = target.fields().iter().map(|f| match given.len() > 0 && !(skip_deleted && f.name() == "_deleted") {
+        true => cast(given.next().expect("counted"), f.data_type()),
+        false => Ok(datafusion::arrow::array::new_null_array(f.data_type(), all.num_rows())),
+    }).collect::<Result<Vec<_>, _>>()?;
+    ensure!(given.len() == 0, "{} columns given, the table has {}", all.num_columns(), target.fields().len());
     Ok(RecordBatch::try_new(target, columns)?)
 }
 
@@ -232,8 +279,10 @@ pub async fn write_files(lake: &Lake, ctx: &SessionContext, table: &str, query: 
         Some(m) => schema(&m.columns)?.fields().iter().map(|f| (f.name().clone(), f.data_type().clone())).collect(),
         None => df.schema().fields().iter().map(|f| (f.name().clone(), if *f.data_type() == DataType::Utf8View { DataType::Utf8 } else { f.data_type().clone() })).collect(),
     };
-    ensure!(target.len() == df.schema().fields().len(), "{} columns given, table {table} has {}", df.schema().fields().len(), target.len());
-    let exprs = df.schema().columns().into_iter().zip(&target).map(|(c, (name, t))| cast_to(Expr::Column(c), t.clone()).alias(name)).collect::<Vec<_>>();
+    ensure!(df.schema().fields().len() <= target.len(), "{} columns given, table {table} has {}", df.schema().fields().len(), target.len());
+    let given = df.schema().columns(); // (the table's first columns; any after them are null)
+    let null = || datafusion::prelude::lit(datafusion::scalar::ScalarValue::Null);
+    let exprs = target.iter().enumerate().map(|(i, (name, t))| cast_to(given.get(i).map_or_else(null, |c| Expr::Column(c.clone())), t.clone()).alias(name)).collect::<Vec<_>>();
     let df = df.select(exprs)?;
     let columns = target.iter().map(|(n, t)| (n.clone(), t.to_string())).collect();
     let files = crate::tier::write_stream(lake, table, df.execute_stream().await?, 1_000_000, &[]).await?;
@@ -271,8 +320,15 @@ pub async fn on_node(app: &crate::server::App, stmt: Stmt, job: Option<String>) 
         return deliver(&other.url, Some(req), &stmt, &job).await;
     }
     let table = match &stmt {
-        Stmt::Create(c) => {
-            let (name, spec) = create_spec(c).await?;
+        Stmt::Create(_) | Stmt::AddColumn(..) => {
+            let (name, spec) = match &stmt {
+                Stmt::Create(c) => create_spec(c).await?,
+                Stmt::AddColumn(t, c, ty, if_not) => match alter_spec(lake, t, c, ty, *if_not).await? {
+                    Some(spec) => (t.clone(), spec),
+                    None => return Ok(j!({"table": t, "unchanged": true})),
+                },
+                _ => unreachable!(),
+            };
             if app.seq.is_none() {
                 return Ok(http().post(format!("http://{}/tables/{name}", app.cluster.leader.addr)).body(spec).send().await?.error_for_status()?.json().await?);
             }
@@ -414,6 +470,9 @@ async fn prepare(query: &Lake, target: &Arc<Lake>, table: &str, stmt: &Stmt, job
     if let Stmt::Create(c) = stmt {
         let (_, spec) = create_spec(c).await?;
         return Ok(Some(Request::Table(table.into(), spec)));
+    }
+    if let Stmt::AddColumn(_, c, ty, if_not) = stmt {
+        return Ok(alter_spec(target, table, c, ty, *if_not).await?.map(|spec| Request::Table(table.into(), spec)));
     }
     let meta = target.cat.get::<TableMeta>(&table_key(table)).await?;
     let log = match &meta {

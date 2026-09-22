@@ -7,6 +7,10 @@
 //! * A view with GROUP BY is a merge table: each flush adds partial aggregates per key, and reads
 //!   combine them (sum, min, max; counts are summed); compaction folds them into one row per key.
 //!   So any number of nodes add to the same keys at once, without coordinating.
+//! * An event-time window view (GROUP BY a `date_bin(…)` window column, with `emit`) also emits
+//!   each window once, final, to `{view}_final` when the watermark passes it: the newest window
+//!   started, less the window's size and the allowed lateness. Rows arriving later still update
+//!   the view, not what was emitted. Emission is exactly-once: its progress is a producer's seq.
 use crate::query::{first_table, over, session};
 use crate::store::*;
 use anyhow::{bail, ensure, Context, Result};
@@ -19,13 +23,24 @@ use std::collections::BTreeMap;
 pub struct View {
     pub source: String, // the first table in FROM: the stream the view follows
     pub sql: String,
+    #[serde(default)]
+    pub emit: Option<Emit>,
+}
+
+/// Emit-once windows: `window` is the view's window-start column (a key), windows are
+/// `size_secs` long and take rows up to `lateness_secs` late.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct Emit {
+    pub window: String,
+    pub size_secs: u64,
+    pub lateness_secs: u64,
 }
 
 pub fn view_key(name: &str) -> String { format!("v/{name}") }
 
 /// Register view `name` (leader only): its table gets the query's output columns; a GROUP BY
 /// query makes it a merge table keyed by the group columns.
-pub async fn create(lake: &Lake, name: &str, sql: &str) -> Result<()> {
+pub async fn create(lake: &Lake, name: &str, sql: &str, emit: Option<Emit>) -> Result<()> {
     ensure!(lake.cat.get::<TableMeta>(&table_key(name)).await?.is_none(), "table {name} already exists");
     let source = first_table(sql)?;
     ensure!(lake.cat.get::<TableMeta>(&table_key(&source)).await?.is_some(), "no table {source}");
@@ -33,7 +48,51 @@ pub async fn create(lake: &Lake, name: &str, sql: &str) -> Result<()> {
     let (key, merge) = merges(&plan)?;
     let columns = plan.schema().fields().iter().map(|f| (f.name().clone(), f.data_type().to_string())).collect();
     let meta = TableMeta { columns, key, merge, publish: default_publish(), ..Default::default() };
-    lake.cat.commit(vec![(view_key(name), json(&View { source, sql: sql.into() })), (table_key(name), json(&meta))], &[]).await
+    let mut puts = vec![(view_key(name), json(&View { source, sql: sql.into(), emit: emit.clone() })), (table_key(name), json(&meta))];
+    if let Some(e) = &emit {
+        let is_time = meta.columns.iter().any(|(c, t)| *c == e.window && t.starts_with("Timestamp"));
+        ensure!(meta.key.contains(&e.window) && is_time, "emit: the window column must be a GROUP BY timestamp (date_bin(…) AS {})", e.window);
+        let columns = meta.columns.iter().filter(|(c, _)| c != "_deleted").cloned().collect();
+        puts.push((table_key(&format!("{name}_final")), json(&TableMeta { columns, publish: default_publish(), ..Default::default() })));
+    }
+    lake.cat.commit(puts, &[]).await
+}
+
+/// Leader: emit every window view's windows that the watermark has passed, once each.
+pub async fn emit_all(lake: &Lake, log: &crate::log::Log) -> Result<()> {
+    for (key, v) in lake.cat.scan::<View>("v/", "v0").await? {
+        if let Some(e) = &v.emit {
+            emit(lake, log, &key[2..], e).await?;
+        }
+    }
+    Ok(())
+}
+
+/// The windows of `view` now past the watermark, appended to `{view}_final` with the watermark
+/// as the producer's seq (`prev`: the last one), so each window is emitted exactly once.
+async fn emit(lake: &Lake, log: &crate::log::Log, view: &str, e: &Emit) -> Result<()> {
+    use datafusion::arrow::{array::AsArray, compute::cast, datatypes::{DataType, TimeUnit, TimestampMicrosecondType}};
+    let micros = |b: &RecordBatch| -> Result<Option<i64>> {
+        let c = cast(b.column(0), &DataType::Timestamp(TimeUnit::Microsecond, None))?;
+        Ok(c.as_primitive::<TimestampMicrosecondType>().iter().next().flatten())
+    };
+    let w = format!("\"{}\"", e.window);
+    let newest = crate::query::session(lake, view, "").await?.sql(&format!("SELECT max({w}) FROM \"{view}\"")).await?.collect().await?;
+    let Some(newest) = newest.first().map(micros).transpose()?.flatten() else { return Ok(()) };
+    let upto = newest - ((e.size_secs + e.lateness_secs) * 1_000_000) as i64; // windows starting at or before this are final
+    let (producer, final_table) = (format!("emit:{view}"), format!("{view}_final"));
+    let done: u64 = lake.cat.get(&producer_key(&producer)).await?.unwrap_or(0);
+    if upto <= done as i64 {
+        return Ok(());
+    }
+    let sql = format!("SELECT * FROM \"{view}\" WHERE {w} > to_timestamp_micros({done}) AND {w} <= to_timestamp_micros({upto}) ORDER BY {w}");
+    let rows = crate::query::session(lake, &sql, "").await?.sql(&sql).await?.collect().await?;
+    let meta: TableMeta = lake.cat.get(&table_key(&final_table)).await?.context("window view without its final table")?;
+    let s = crate::query::schema(&meta.columns)?;
+    let rows = datafusion::arrow::compute::concat_batches(&s, &rows.iter().map(|b| crate::query::conform(b, &s)).collect::<Result<Vec<_>>>()?)?;
+    let src = crate::log::Src { producer, seq: upto as u64, prev: Some(done) };
+    log.append(final_table, src, rows).await?; // (a conflict: another leader emitted first; the next round catches up)
+    Ok(())
 }
 
 /// The rows every view derives from a flush's new rows, per view table.

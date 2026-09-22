@@ -202,6 +202,8 @@ fn schema_string(columns: &[(String, String)]) -> Option<String> {
             "Boolean" => "boolean",
             "Date32" => "date",
             "Binary" | "LargeBinary" => "binary",
+            // (Delta's `timestamp` is an instant: time-zone-aware columns only)
+            t if matches!(t.parse(), Ok(DataType::Timestamp(datafusion::arrow::datatypes::TimeUnit::Microsecond, Some(_)))) => "timestamp",
             t => return decimal(t).map(|(p, s)| json!({"name": name, "type": format!("decimal({p},{s})"), "nullable": true, "metadata": {}})),
         };
         Some(json!({"name": name, "type": t, "nullable": true, "metadata": {}}))

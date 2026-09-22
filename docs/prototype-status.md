@@ -1,6 +1,6 @@
 # Prototype status: Pondra, a streamhouse in one binary
 
-**Date:** 2026-09-22 (round 9) · **Plan:** ADR-002 to ADR-010 · **Code:** `pondra.zip` / `pondra.bundle` (≈5,800 lines of Rust, plus a Python client and test and benchmark tools)
+**Date:** 2026-09-22 (round 10) · **Plan:** ADR-002 to ADR-011 · **Code:** `pondra.zip` / `pondra.bundle` (≈7,300 lines of Rust, plus a Python client and test and benchmark tools)
 **Name:** the prototype formerly called `lh` is now **Pondra**. The name is free on crates.io, PyPI and npm. A small personal-finance app uses it (pondra.app), a different category; run a trademark search before a public launch.
 
 ## Where it stands
@@ -14,6 +14,23 @@ One Rust binary replaces the Kafka + Flink + Spark + metastore + ZooKeeper stack
 - upsert and merge tables.
 
 Start more copies on the same bucket to scale out. The only state is object storage. There's no JVM, no database server and no coordination service.
+
+**Round 10 opened the doors other systems use** (ADR-011):
+
+1. **The Kafka protocol.**
+   - Kafka producers write to tables:
+     - JSON values become rows;
+     - idempotent producers are exactly-once;
+     - Debezium change events and tombstones become upserts and deletes.
+   - Consumers and consumer groups read the log back.
+   - Measured on one box with 3 nodes, via librdkafka:
+     - **~0.8 M events/s**, exactly-once;
+     - ack **1 ms p50**, and a consumer on another node gets the event 1 ms later;
+     - on real R2: 461k events/s, ack 1 ms p50 (replicated).
+2. **An Iceberg REST catalog.** PyIceberg and DuckDB attach a node by URL.
+3. **`ALTER TABLE … ADD COLUMN`**, under load, with Delta and Iceberg following.
+4. **Event-time windows that close:** each window is emitted once, final, past a watermark.
+5. **JSON functions** (`json_get`, `->>`) over text.
 
 **Round 9 let every machine write and every tool connect** (ADR-010):
 
@@ -178,6 +195,64 @@ correctness test passed while sustained ingest fell by half. It was found by ben
 testing. There is now a `tiering` test (rounds of writes + `/tier`: the log must drain and the
 file count stay bounded) and a note in `AGENTS.md` that this failure mode shows up as throughput,
 not as a red test.
+
+## Round 10: the Kafka protocol, an Iceberg REST catalog, schema evolution, windows that close
+
+**What's new** (ADR-011):
+
+| | What | Measured |
+|---|---|---|
+| Kafka protocol | `--kafka`: a topic is a table. Producers: JSON values → rows (`_key`, `_timestamp`, raw `_value` columns), idempotent producers exactly-once, all 4 codecs, Debezium events and tombstones → upserts and deletes. Consumers read the log; consumer groups coordinated by the leader; SASL/PLAIN tokens | 3 nodes, 4 librdkafka producers, one 2-vCPU box: **776k events/s** durable, **796k** replicated, every event exactly once. Ack **1 ms p50 / 2 ms p99** (replicated), 3 / 21 ms (durable); a consumer on another node gets it 1 / 2 ms after the send (replicated) |
+| Iceberg REST catalog | `GET /v1/…` on every node: engines attach by URL | PyIceberg and DuckDB attach it; 8 outside readers in `open_check.py` equal Pondra |
+| Publishing | Timestamps kept in µs, so tables with timestamps publish; a keyed table's first file publishes at once; published keyed tables compact fully | timestamps read back right by PyIceberg and DuckDB |
+| `ALTER TABLE … ADD COLUMN` | Any node, Postgres, MCP, `pondra sql`; old rows read null; writes that don't know the column keep working; Delta and Iceberg follow | under load (65–72k rows written during the change): 8 checks, 6 outside readers |
+| Windows that close | `?window=w&size_secs=&lateness_secs=` on a `date_bin` GROUP BY view: `{view}_final` gets each window once, final, past the watermark | each window once; a late row updates the view only; a leader restart emits nothing twice |
+| JSON functions | `json_get…`, `json_contains`, `json_length`, `->`, `->>` | over HTTP and Postgres; Kafka raw values queried as JSON |
+
+**Regression, local disk** (`logs/round10/local-regression.txt`):
+
+- `harness.py all`: every test passes, now with `kafka` (9 checks), `alter` (8) and `windows` (3).
+- `crash --size 50000`: 3 runs × 9 M events, 0 lost, 0 duplicated, views exact.
+- `users`: 3 runs, 129.5–138.1k events/s, ack p50 36–38 ms, 0 torn reads, 0 lost or duplicated batches.
+- `failover`: 3 durable and 2 replicated runs, back in 4.3–5.1 s, state == view == model.
+- race, isolate, split (4.97 M events/s), spread (identical): pass.
+- latency: event → view row on another node 6 ms p50, 9 ms p99.
+- `open_check.py`: all 8 outside readers (the REST catalog's two included) equal Pondra.
+- `keyed_bench.py`: 17.9 MB written vs 53.4 MB for full rewrites (unchanged from round 9).
+
+**Simulated R2** (`logs/round10/sim-r2.txt`):
+
+- `kafka`: 9 of 9, the same checks as locally.
+- `alter` (8 of 8) and `windows` (3 of 3): pass.
+- `open_check.py`: all 8 outside readers, the REST catalog's included, equal Pondra.
+- `kafka_bench.py`, 3 nodes, 1 M events:
+  - replicated: 683k events/s, ack 1 ms p50 / 5 ms p99;
+  - durable (one PUT per commit): 84.6k events/s, ack 231 / 764 ms.
+
+**Real R2** (`ponderabucket-us`, `logs/round10/r2.txt`):
+
+- `kafka`: 9 of 9 — the same producers, Debezium, consumers, groups and tokens, on R2.
+- `alter` (8 of 8) and `windows` (3 of 3): pass.
+- `open_check.py`: all 8 outside readers equal Pondra, the REST catalog's included.
+- `kafka_bench.py`, 3 nodes, 400k events:
+  - replicated: **461k events/s**, ack **1 ms p50** / 20 ms p99, a consumer on another node
+    1 / 20 ms;
+  - durable: 68.7k events/s, ack 245 / 606 ms (one PUT per commit).
+- Every test lake was deleted when its test finished; the buckets hold only the three kept
+  lakes.
+
+### What the tests caught this round
+
+- **Offsets across segment boundaries.** The first group test expected a consumer to resume at
+  the last committed offset + 1. Offsets are `_ord`, so after a segment's last row the next
+  offset is the next segment's first; the check (not the code) was wrong.
+- **Keyed tables created in SQL stopped publishing** since round 9 added `_deleted` to them:
+  they waited for a full compaction, which size-tiered merging made rare. Now a first file
+  publishes at once, and published keyed tables compact fully.
+- **Tables with timestamp columns never published** (nanoseconds, which Iceberg v2 can't hold).
+  SQL timestamps are now microseconds.
+- **Arrow appends missing a column were refused**, which would have broken every producer after
+  an ALTER. Missing columns are now null, as in JSON.
 
 ## Round 9: everyone writes, everything speaks SQL
 
@@ -493,12 +568,12 @@ a real Cloudflare R2 bucket. All of them pass on all three.
 
 ## Sizes
 
-| What | Round 3 | Round 5 | Round 8 | Round 9 |
-|---|---|---|---|---|
-| Binary (stripped) | 88.3 MB (30 MB gzip, 17 MB xz) | 89.2 MB (29.9 MB gzip, 16.8 MB xz) | 90.0 MB (30.5 MB gzip, 18.7 MB xz) | 90.7 MB (30.5 MB gzip, 17.2 MB xz), with the Postgres protocol and MCP |
-| Idle memory | 18 MB | 41 MB (mimalloc reserves more up front) | 42 MB | 44 MB |
-| Peak memory under full load | 455 MB | 1.8 GB at 2.84 M events/s sustained (279–586 MB in the batch and streaming benchmarks) | not re-measured | not re-measured |
-| Storage per event (user, event, amount, ts) | NDJSON 77.9 B → log 12.8 B → Parquet 6.8 B | NDJSON 77.9 B → log 12.8 B → Parquet 6.8 B (unchanged) | unchanged | unchanged |
+| What | Round 3 | Round 5 | Round 8 | Round 9 | Round 10 |
+|---|---|---|---|---|---|
+| Binary (stripped) | 88.3 MB (30 MB gzip, 17 MB xz) | 89.2 MB (29.9 MB gzip, 16.8 MB xz) | 90.0 MB (30.5 MB gzip, 18.7 MB xz) | 90.7 MB (30.5 MB gzip, 17.2 MB xz), with the Postgres protocol and MCP | 93.0 MB (31.4 MB gzip, 17.6 MB xz), with the Kafka protocol and JSON functions |
+| Idle memory | 18 MB | 41 MB (mimalloc reserves more up front) | 42 MB | 44 MB | 49 MB (with `--kafka`) |
+| Peak memory under full load | 455 MB | 1.8 GB at 2.84 M events/s sustained (279–586 MB in the batch and streaming benchmarks) | not re-measured | not re-measured | not re-measured |
+| Storage per event (user, event, amount, ts) | NDJSON 77.9 B → log 12.8 B → Parquet 6.8 B | NDJSON 77.9 B → log 12.8 B → Parquet 6.8 B (unchanged) | unchanged | unchanged | unchanged |
 
 ## Memory is a knob, not a mystery
 
@@ -534,8 +609,9 @@ peak at 279–586 MB.
 - A *durable* acknowledgement costs one object-store write (0.25–0.7 s on R2). `--ack replicated`
   makes it milliseconds, but a write in that window survives only as long as one of its holders
   does (with `--fsync`, power loss included; not the leader and every holder at once).
-- No Kafka protocol, no Iceberg REST catalog, no `ALTER TABLE` yet (the top of the plan in the
-  comparison doc).
+- Kafka: one partition per topic, no transactions, sparse offsets; consumer groups live in the
+  leader's memory. `ALTER TABLE` only adds columns. Windows take their watermark from window
+  starts; no session windows.
 - A one-off `pondra sql` on far-away object storage spends 2–3 s opening the catalog.
 - Open-format versions trail the ack by a few sequential bucket round trips (3–4 s near, 7–10 s
   far, at `--tier-secs 2`); Iceberg costs two more round trips than Delta.
@@ -558,10 +634,8 @@ peak at 279–586 MB.
 
 From the plan in `docs/comparison-spark-flink-fluss.md`, in order:
 
-1. **Kafka-protocol ingest**, so Kafka clients and Debezium write to Pondra unchanged.
-2. **A multi-machine run** (3–10 VMs on S3/R2), then **shuffles** for big-to-big joins.
-3. **An Iceberg REST catalog endpoint**, so Spark, Trino and DuckDB attach by URL.
-4. **`ALTER TABLE … ADD COLUMN`**, then renames and defaults.
-5. **Watermarks** that close event-time windows, and point-in-time joins.
-6. **AI functions in SQL** and an approximate vector index.
-7. **TLS, per-table grants, an audit log, quotas.**
+1. **A multi-machine run** (3–10 VMs on S3/R2), then **shuffles** for big-to-big joins.
+2. **AI functions in SQL** and an approximate vector index.
+3. **Kafka partitions** and transactions; the Java client and Kafka Connect verified.
+4. **TLS, per-table grants, an audit log, quotas.**
+5. **Session windows**, a watermark from event time, point-in-time joins.

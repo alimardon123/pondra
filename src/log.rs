@@ -64,6 +64,8 @@ pub struct Ack {
     pub seg: u64,
     pub duplicate: bool, // this seq was already committed: nothing to do
     pub conflict: bool,  // `prev` didn't match: someone else committed first; re-read and retry
+    #[serde(default)]
+    pub row: u64, // where the rows start among the table's rows in `seg` (their `_ord` is (seg << 32) + row)
 }
 
 /// The sequencer's answer: an ack per part, or (rarely) "these parts are retries of committed
@@ -119,9 +121,15 @@ impl Log {
 
     /// Append and wait for the ack (the write is committed).
     pub async fn append(&self, table: String, src: Src, batch: RecordBatch) -> Result<Ack> {
+        self.queue(table, src, batch).await?.await
+    }
+
+    /// Queue rows now and get their ack later: rows queued one after another commit in that
+    /// order, so a client can have several batches in flight (the Kafka protocol does).
+    pub async fn queue(&self, table: String, src: Src, batch: RecordBatch) -> Result<impl std::future::Future<Output = Result<Ack>> + use<>> {
         let (ack, rx) = oneshot::channel();
         self.tx.send(Append { table, src, batch, ack }).await.map_err(|_| anyhow!("log closed"))?;
-        rx.await?.map_err(|e| anyhow!(e))
+        Ok(async move { rx.await?.map_err(|e| anyhow!(e)) })
     }
 }
 
@@ -254,7 +262,8 @@ async fn commit(lake: &Arc<Lake>, next: &mut u64, last_seq: &mut HashMap<String,
     for (f, reply) in batch {
         // 1. Skip retries of committed batches, and batches whose `prev` no longer holds.
         let (mut acks, mut bad, mut mine) = (vec![Ack::default(); f.parts.len()], vec![], HashMap::new());
-        for (i, src) in f.parts.iter().enumerate().filter_map(|(i, p)| Some((i, p.src.as_ref()?))) {
+        // (A part without a producer name is at-least-once: nothing to check.)
+        for (i, src) in f.parts.iter().enumerate().filter_map(|(i, p)| Some((i, p.src.as_ref().filter(|s| !s.producer.is_empty())?))) {
             let last = match mine.get(&src.producer).or(seqs.get(&src.producer)).or(last_seq.get(&src.producer)) {
                 Some(s) => *s,
                 None => lake.cat.get(&producer_key(&src.producer)).await?.unwrap_or(0),
@@ -278,8 +287,11 @@ async fn commit(lake: &Arc<Lake>, next: &mut u64, last_seq: &mut HashMap<String,
         // 2. An object flush becomes the next segment; inline flushes all go into one (below).
         let base = if f.path.is_empty() { inline.len() as u64 } else { 0 };
         let mut parts: BTreeMap<String, Vec<(u64, u64, u64)>> = BTreeMap::new();
-        for (_, p) in f.parts.iter().enumerate().filter(|(i, p)| p.rows > 0 && !bad.contains(i)) {
-            parts.entry(p.table.clone()).or_default().push((base + p.off, p.len, p.rows));
+        let before = |t: &str| if f.path.is_empty() { inline_parts.get(t).map_or(0, |v| v.iter().map(|p| p.2).sum()) } else { 0 };
+        for (i, p) in f.parts.iter().enumerate().filter(|(i, p)| p.rows > 0 && !bad.contains(i)) {
+            let rows = parts.entry(p.table.clone()).or_default();
+            acks[i].row = before(&p.table) + rows.iter().map(|p| p.2).sum::<u64>();
+            rows.push((base + p.off, p.len, p.rows));
             lake.backlog.fetch_add(p.rows, Ordering::Relaxed);
         }
         let seg = match (parts.is_empty(), f.path.is_empty()) {

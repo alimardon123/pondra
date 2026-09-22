@@ -18,6 +18,19 @@ pub fn schema(columns: &[(String, String)]) -> Result<SchemaRef> {
     Ok(Arc::new(Schema::new(fields.collect::<Result<Vec<_>>>()?)))
 }
 
+/// `b` with `s`'s columns, by name: older rows (written before an ALTER TABLE … ADD COLUMN) get
+/// nulls for the columns added since.
+pub fn conform(b: &RecordBatch, s: &SchemaRef) -> Result<RecordBatch> {
+    if b.schema().fields() == s.fields() {
+        return Ok(b.clone());
+    }
+    let columns = s.fields().iter().map(|f| match b.column_by_name(f.name()) {
+        Some(c) => Ok(datafusion::arrow::compute::cast(c, f.data_type())?),
+        None => Ok(datafusion::arrow::array::new_null_array(f.data_type(), b.num_rows())),
+    });
+    Ok(RecordBatch::try_new(s.clone(), columns.collect::<Result<Vec<_>>>()?)?)
+}
+
 /// Rows of `table` from committed segments in (after, upto]; `None` = up to the latest.
 /// With `ord`, each row gets `_ord` = (segment << 32) + position, so later versions sort last.
 pub async fn tail(lake: &Lake, table: &str, after: u64, upto: Option<u64>, ord: bool) -> Result<Vec<RecordBatch>> {
@@ -31,10 +44,18 @@ pub async fn tail(lake: &Lake, table: &str, after: u64, upto: Option<u64>, ord: 
     // Fetch many segments at once: on object storage each one may be a round trip.
     let fetches: Vec<_> = segs.iter().map(|(n, seg)| lake.segment_rows(*n, seg, table)).collect();
     let fetched: Vec<Rows> = futures::stream::iter(fetches).buffered(32).try_collect().await?;
+    let target = match lake.cat.get::<TableMeta>(&table_key(table)).await? {
+        Some(m) => Some(schema(&m.columns)?),
+        None => None,
+    };
     let mut out = vec![];
     for ((n, _), rows) in segs.iter().zip(fetched) {
         let (n, mut pos) = (*n, 0u64);
         for b in rows.iter() {
+            let b = &match &target {
+                Some(s) => conform(b, s)?,
+                None => b.clone(),
+            };
             if !ord {
                 out.push(b.clone());
                 continue;
@@ -231,7 +252,9 @@ pub async fn session(lake: &Lake, sql: &str, except: &str) -> Result<SessionCont
 pub async fn over(lake: &Lake, source: &str, rows: Vec<RecordBatch>, sql: &str) -> Result<RecordBatch> {
     let meta: TableMeta = lake.cat.get(&table_key(source)).await?.ok_or_else(|| anyhow::anyhow!("no table {source}"))?;
     let ctx = session(lake, sql, source).await?;
-    ctx.register_table(source, Arc::new(MemTable::try_new(schema(&meta.columns)?, vec![rows])?))?;
+    let s = schema(&meta.columns)?;
+    let rows = rows.iter().map(|b| conform(b, &s)).collect::<Result<Vec<_>>>()?;
+    ctx.register_table(source, Arc::new(MemTable::try_new(s, vec![rows])?))?;
     let df = ctx.sql(sql).await?;
     let out = Arc::new(df.schema().as_arrow().clone());
     Ok(datafusion::arrow::compute::concat_batches(&out, &df.collect().await?)?)

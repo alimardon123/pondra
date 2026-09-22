@@ -5,6 +5,7 @@ mod cache;
 mod delta;
 mod iceberg;
 mod inbox;
+mod kafka;
 mod serve;
 mod cluster;
 mod log;
@@ -95,6 +96,14 @@ enum Cmd {
         /// Also speak the Postgres wire protocol here (e.g. 0.0.0.0:5432): psql, drivers, BI tools.
         #[arg(long)]
         pg: Option<String>,
+        /// Also speak the Kafka protocol here (e.g. 0.0.0.0:9092): Kafka producers write to tables
+        /// (a topic is a table), consumers read their log.
+        #[arg(long)]
+        kafka: Option<String>,
+        /// Where Kafka clients are told to connect to this node (default: the host of `--addr`, the
+        /// port of `--kafka`).
+        #[arg(long)]
+        kafka_advertise: Option<String>,
         /// Access tokens (also PONDRA_READ_TOKEN, PONDRA_WRITE_TOKEN, PONDRA_ADMIN_TOKEN): reading
         /// needs any, writing rows write or admin, tables/views/tasks admin. Give every node the
         /// same ones; none set = no checks.
@@ -133,7 +142,7 @@ enum Cmd {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     match Cmd::parse() {
-        Cmd::Serve { dir, addr, reader, flush_ms, tier_secs, task_ms, retain_secs, changelog_secs, backlog, cache_dir, cache_gb, ack, replicas, fsync, publish, pg, read_token, write_token, admin_token, attach: attached } => {
+        Cmd::Serve { dir, addr, reader, flush_ms, tier_secs, task_ms, retain_secs, changelog_secs, backlog, cache_dir, cache_gb, ack, replicas, fsync, publish, pg, kafka, kafka_advertise, read_token, write_token, admin_token, attach: attached } => {
             let env = |flag: Option<String>, var: &str| flag.or_else(|| std::env::var(var).ok()).filter(|t| !t.is_empty());
             let auth = Arc::new(auth::Auth::new(env(read_token, "PONDRA_READ_TOKEN"), env(write_token, "PONDRA_WRITE_TOKEN"), env(admin_token.clone(), "PONDRA_ADMIN_TOKEN")));
             if let Some(t) = env(admin_token, "PONDRA_ADMIN_TOKEN") {
@@ -191,6 +200,23 @@ async fn main() -> anyhow::Result<()> {
             if let Some(pg_addr) = pg {
                 let a = app.clone();
                 tokio::spawn(async move { pg::serve(a, pg_addr).await.map_err(|e| eprintln!("postgres protocol: {e:#}")) });
+            }
+            if let Some(kafka_addr) = kafka {
+                let port = kafka_addr.rsplit_once(':').map_or("9092", |(_, p)| p).to_string();
+                let advertise = kafka_advertise.unwrap_or_else(|| format!("{}:{port}", addr.rsplit_once(':').map_or("127.0.0.1", |(h, _)| h)));
+                let a = app.clone();
+                tokio::spawn(async move { kafka::serve(a, kafka_addr, advertise).await.map_err(|e| eprintln!("kafka protocol: {e:#}")) });
+            }
+            if let (Some(_), Some(log)) = (&app.seq, &app.log) {
+                let (lake, log) = (lake.clone(), log.clone()); // event-time windows past the watermark, emitted once
+                tokio::spawn(async move {
+                    loop {
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        if let Err(e) = views::emit_all(&lake, &log).await {
+                            eprintln!("window emission: {e:#}");
+                        }
+                    }
+                });
             }
             if let Some(seq) = &app.seq {
                 inbox::serve(lake.clone(), seq.clone(), app.lock.clone()); // writers that can't reach us

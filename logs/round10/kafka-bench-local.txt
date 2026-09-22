@@ -1,0 +1,47 @@
+$ tools/kafka_bench.py --events 1000000   # 3 nodes, --ack durable, local disk
+{
+ "nodes": 3,
+ "producers": 4,
+ "flags": {},
+ "events": 4000000,
+ "wall_s": 5.8,
+ "events_per_s": 695166,
+ "producer_s": {
+  "p3": 5.4,
+  "p0": 5.4,
+  "p1": 5.6,
+  "p2": 5.7
+ },
+ "unflushed": 0,
+ "exactly_once": true,
+ "ack_ms_p50": 3,
+ "ack_ms_p99": 7,
+ "consumer_on_other_node_ms_p50": 3,
+ "consumer_on_other_node_ms_p99": 25,
+ "probes_seen": 200
+}
+
+$ tools/kafka_bench.py --events 1000000 --flag ack=replicated
+{
+ "nodes": 3,
+ "producers": 4,
+ "flags": {
+  "ack": "replicated"
+ },
+ "events": 4000000,
+ "wall_s": 5.9,
+ "events_per_s": 674108,
+ "producer_s": {
+  "p3": 5.3,
+  "p0": 5.3,
+  "p2": 5.7,
+  "p1": 5.9
+ },
+ "unflushed": 0,
+ "exactly_once": true,
+ "ack_ms_p50": 1,
+ "ack_ms_p99": 4,
+ "consumer_on_other_node_ms_p50": 1,
+ "consumer_on_other_node_ms_p99": 5,
+ "probes_seen": 200
+}

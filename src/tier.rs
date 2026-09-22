@@ -82,7 +82,9 @@ pub async fn maintain(lake: &Lake, table: &str, nodes: &[String], me: &str) -> R
     let Some(mut meta) = lake.cat.get::<TableMeta>(&table_key(table)).await? else { return Ok(false) };
     let small: Vec<DataFile> = meta.files.iter().filter(|f| f.bytes < 64 << 20 && f.rows < 4_000_000).cloned().collect();
     if !meta.key.is_empty() && meta.files.len() >= 8 {
-        let run = run(&meta.files);
+        // Tables other engines read compact fully (they see keyed tables as of their last full
+        // compaction); the rest merge size-tiered runs.
+        let run = if meta.publish.is_empty() { run(&meta.files) } else { meta.files.clone() };
         let job = match run.len() == meta.files.len() {
             true => Kind::Compact { upto: meta.tiered, rows: 0 }, // everything: one row per key, deletes dropped
             false => Kind::Squash { files: run.clone() },
@@ -168,7 +170,10 @@ async fn deal(lake: &Lake, jobs: Vec<Job>, nodes: &[String], me: &str) -> Result
 /// Do one job here; returns the Parquet files written.
 pub async fn run_job(lake: &Lake, Job { table, meta, kind }: Job) -> Result<Vec<DataFile>> {
     // (Clustered append tables get what keyed tables get for their key: small row groups, bloom filters.)
-    let (keys, whole) = (if meta.key.is_empty() { meta.cluster.clone() } else { meta.key.clone() }, matches!(kind, Kind::Compact { .. }));
+    // A keyed table's first file has nothing older to shadow: it drops delete markers (and expired
+    // rows) like a full compaction, and is as complete as one.
+    let first = !meta.key.is_empty() && meta.files.is_empty() && matches!(kind, Kind::Fold { .. });
+    let (keys, whole) = (if meta.key.is_empty() { meta.cluster.clone() } else { meta.key.clone() }, first || matches!(kind, Kind::Compact { .. }));
     let (batches, ord) = match kind {
         Kind::Fold { after, upto, rows } if meta.key.is_empty() => {
             caught_up(lake, &table, after, upto, rows).await?;
@@ -184,7 +189,7 @@ pub async fn run_job(lake: &Lake, Job { table, meta, kind }: Job) -> Result<Vec<
         Kind::Fold { after, upto, rows } => {
             caught_up(lake, &table, after, upto, rows).await?;
             let part = TableMeta { files: vec![], tiered: after, ..meta };
-            (latest(lake, &table, &part, upto, true).await?, upto)
+            (latest(lake, &table, &part, upto, !first).await?, upto)
         }
         Kind::Compact { upto, rows } => {
             anyhow::ensure!(!meta.key.is_empty(), "only keyed tables have versions to compact");

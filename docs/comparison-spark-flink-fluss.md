@@ -1,4 +1,4 @@
-# Pondra vs Spark, Flink, Fluss and Databricks Lakehouse//RT (round 9)
+# Pondra vs Spark, Flink, Fluss and Databricks Lakehouse//RT (round 10)
 
 **Date:** 2026-09-22 · **Machine:** one 2-vCPU, 7 GB sandbox VM, local disk (plus a real Cloudflare R2 bucket where marked); every engine ran alone
 **Versions:**
@@ -17,6 +17,7 @@
 - `tools/freshness.py` (freshness, head to head), `tools/open_check.py` (outside readers)
 
 **Where the numbers come from:**
+- The Kafka protocol, the Iceberg REST catalog, schema evolution and windows: round 10.
 - Clients, protocols, MCP, vectors and the roadmaps: round 9.
 - Freshness, write latency and open formats: round 8.
 - Spark's TPC-H and the serving numbers: round 7.
@@ -48,8 +49,8 @@ All of that comes from one 90 MB binary, with no JVM, ZooKeeper, Kafka or separa
 - **Streaming features:** Flink has event time, watermarks, timers and very large state; Pondra
   has none of these yet.
 - **APIs and ecosystem:** Spark has DataFrame APIs in four languages and hundreds of connectors.
-  Pondra has SQL (reads and writes) over HTTP, the Postgres protocol and MCP, and a Python client;
-  no Kafka protocol and few connectors yet.
+  Pondra has SQL (reads and writes) over HTTP, the Postgres protocol and MCP, a Python client,
+  the Kafka protocol and an Iceberg REST catalog; few connectors beyond those.
 - **Maturity:** Pondra is a prototype.
 
 **So the realistic claim:** Pondra can beat them for the common case — small to mid-size
@@ -72,11 +73,11 @@ biggest open risk is scale-out, and only a multi-machine benchmark can retire it
 | Serving: point reads, repeated dashboards | ✓ 0.1–3 ms, 20–36k/s on 2 cores | | | ms lookups | 10 ms, 12k QPS (cluster) |
 | Serving: new analytical queries on big data | 35–600 ms (single node) | | | — | ✓ sub-100 ms (claimed) |
 | Scale-out to 100s of machines | unproven; no shuffles | ✓ | ✓ | ✓ | ✓ |
-| Streaming semantics (event time, windows, CEP, huge state) | decomposable aggregates + SQL tasks | good | ✓ | storage only | — |
+| Streaming semantics (event time, windows, CEP, huge state) | decomposable aggregates, SQL tasks, event-time windows emitted once past a watermark | good | ✓ | storage only | — |
 | APIs & usability | SQL reads and writes over HTTP and the Postgres protocol; Python client (pandas, Polars, Arrow) | ✓ SQL + DataFrames (Python/Scala/Java/R), notebooks | SQL + DataStream API | clients (Java, Rust, Python, C++); REST gateway; Postgres protocol planned | ✓ Databricks SQL |
 | AI agents and vectors | ✓ MCP server built in; exact vector search in SQL (`cosine_distance`) | AI functions on Databricks only | `ML_PREDICT`, `VECTOR_SEARCH`; Flink Agents (0.2) | MCP and vector columns planned | ✓ Agent Bricks, Genie |
-| Connectors & ecosystem | HTTP in; Delta + Iceberg out | ✓ huge | ✓ huge | Flink/Spark connectors | ✓ Databricks |
-| Operations & footprint | ✓ 1 binary, 44 MB idle, 0.02 s start | JVM cluster | JVM cluster + checkpoints | JVM + ZooKeeper + Flink tiering job | managed |
+| Connectors & ecosystem | Kafka protocol in and out (any Kafka client, Debezium), Postgres, HTTP; Delta + Iceberg out, Iceberg REST catalog | ✓ huge | ✓ huge | Flink/Spark connectors | ✓ Databricks |
+| Operations & footprint | ✓ 1 binary, 44–49 MB idle, 0.02 s start | JVM cluster | JVM cluster + checkpoints | JVM + ZooKeeper + Flink tiering job | managed |
 | Governance & security | read / write / admin tokens (HTTP, Postgres, MCP); no TLS or per-table grants yet | via platforms | via platforms | SASL users (1.0); TLS planned | ✓ Unity Catalog |
 | Maturity | prototype | ✓ | ✓ | 1.0, a top-level Apache project | beta |
 
@@ -316,18 +317,18 @@ from third-party summit recaps; check them before relying on them.
 | State and storage on object storage, no local disks | Flink ForSt, Fluss Zero Disks | ✓ the design since round 1 |
 | Millisecond streaming inside the main engine | Spark Real-Time Mode, Lakehouse//RT | ✓ 5 ms change → another node, exactly-once |
 | Declarative, incremental pipelines | Spark declarative pipelines, Flink materialized tables, dynamic tables | ✓ views and tasks in SQL |
-| Kafka-compatible ingestion | Zerobus (reported), Fluss log agents | plan: first in line |
-| Open catalogs (the Iceberg REST catalog API) | Unity Catalog, Polaris, Snowflake | plan |
-| A VARIANT type | Spark, Flink, Delta, Iceberg v3 | plan (when DataFusion has it) |
+| Kafka-compatible ingestion | Zerobus (reported), Fluss log agents | ✓ the Kafka protocol on every node (round 10) |
+| Open catalogs (the Iceberg REST catalog API) | Unity Catalog, Polaris, Snowflake | ✓ read-only REST catalog on every node (round 10) |
+| A VARIANT type | Spark, Flink, Delta, Iceberg v3 | JSON functions and `->` / `->>` (round 10); VARIANT when DataFusion has it |
 | Access control | Unity Catalog ABAC, Fluss SASL + TLS | tokens (round 9); grants and TLS: plan |
 
 ## Footprint and operations
 
 | | Pondra | Spark 4.2 | Flink 2.3 | Fluss |
 |---|---|---|---|---|
-| What you install | one binary, 90.7 MB (30.5 MB gzip, 17.2 MB xz) | 485 MB PySpark + a JVM | 353 MB PyFlink + a JVM | CoordinatorServer + TabletServers + ZooKeeper + a Flink tiering job, JVM |
+| What you install | one binary, 93.0 MB (31.4 MB gzip, 17.6 MB xz) | 485 MB PySpark + a JVM | 353 MB PyFlink + a JVM | CoordinatorServer + TabletServers + ZooKeeper + a Flink tiering job, JVM |
 | Start to first query | **0.02–0.07 s** | 4.1 s | 5.2–5.4 s | — |
-| Idle memory | **44 MB** | — | — | — |
+| Idle memory | **44–49 MB** | — | — | — |
 | Peak memory in these runs | **293–609 MB** (1.3 GB at 2.7 M events/s sustained) | 0.7–1.5 GB | 1.2–3.1 GB | — |
 | State | object storage only; nodes are disposable (SSD tier = a cache) | + Kafka/Fluss + checkpoints | + Kafka/Fluss + checkpoints | TabletServer disks (replicated) + object storage |
 
@@ -337,20 +338,21 @@ In rough order: what closes the most ground per unit of work comes first.
 
 | Gap | Why it matters | Plan | What proves it |
 |---|---|---|---|
-| **Kafka-protocol ingest** | Every competitor has a Kafka path in (Zerobus, Fluss log agents, Flink's Kafka source); it's how most event data travels | A produce/fetch subset of the Kafka protocol on each node, mapped onto `/append`'s exactly-once producers | Kafka clients and Debezium write to Pondra unchanged |
 | **Multi-machine evidence** | Everything above is one box | Run the suite and benchmarks on 3–20 cloud VMs against S3/R2 | Near-linear ingest and query scaling, failover times |
 | **Scale-out beyond one stage** (no shuffles; big-to-big joins on one node) | Spark's core strength; TPC-H at SF100+ needs it | Shuffle through the job-dealing mechanism tiering already uses: hash-partitioned exchange between nodes, spill to local SSD | TPC-H SF100 on 3–10 real machines vs Spark, same hardware |
-| **Streaming semantics** | Flink's core strength | Round 9: event-time tumbling windows (a GROUP BY `date_bin` view), updated incrementally, late rows included, TTL. Next: watermarks that close a window and emit it once, session windows, point-in-time (temporal) joins | Nexmark queries vs Flink |
-| **Open catalogs** | Engines find tables through the Iceberg REST catalog (Unity, Polaris, Snowflake) | Serve the Iceberg REST catalog API from each node, over the Iceberg tables Pondra already publishes | Spark, Trino and DuckDB attach by URL, no paths |
-| **Schema evolution** | Tables change; Fluss 1.0 lists it as a gap too | `ALTER TABLE … ADD COLUMN` (new files and log segments get the column; old ones read it as null), then renames and defaults | Add a column under load; old and new rows read right |
+| **Streaming semantics** | Flink's core strength | Rounds 9–10: event-time tumbling windows (a GROUP BY `date_bin` view), updated incrementally, and emitted once, final, past a watermark with allowed lateness. Next: session windows, a watermark from the source's event time, point-in-time (temporal) joins | Nexmark queries vs Flink |
+| **Kafka beyond one partition** | Kafka clients scale reads by partitions | Round 10: produce, consume, consumer groups, one partition per topic. Next: key-hashed partitions (each a slice of the table), transactions for Kafka Streams / Flink exactly-once sinks, the Java client verified | Kafka Connect and Flink's Kafka source against Pondra |
+| **Schema evolution** | Tables change; Fluss 1.0 lists it as a gap too | Round 10: `ALTER TABLE … ADD COLUMN` (old rows read null; Delta and Iceberg follow). Next: renames, defaults, type widening | ✓ adding a column under load (`harness.py alter`) |
 | **AI in SQL** | Flink `ML_PREDICT`, Snowflake Cortex AISQL, Databricks AI functions | `ai_complete()` / `embed()` against any OpenAI-compatible endpoint, batched per Arrow batch; an ANN index for vector columns | A RAG demo: embed on insert, nearest neighbours in SQL, answered through MCP |
 | **Governance** | Enterprise requirement | Round 9: read / write / admin tokens on HTTP, Postgres and MCP. Next: TLS, per-table grants, an audit log (the change feed of a system table), quotas | Multi-tenant test |
 | **APIs** | Usability for data teams | Round 9: Postgres protocol, Python client, MCP. Next: JDBC / BI tools verified (DBeaver, Tableau, Power BI), Arrow Flight SQL, Python UDFs over Arrow | Tableau / Power BI connect; notebook demo |
 | **Open-format lag** on object storage | Other engines see a table 3–10 s after the ack on R2 (a few sequential round trips) | Next: overlap publishing with the next fold, fewer sequential writes for Iceberg, a lower default `--tier-secs` when the bucket is close | p99 < 3 s on a nearby bucket |
 | **Table layout** (Delta liquid clustering, Iceberg sort orders, partitions) | Big tables with selective filters | `cluster_by` (round 8: 6–11x on selective filters) → partitions → clustering across files → deletion vectors | TPC-H SF100 with partition + clustering pruning |
 | **Heavy new analytical queries at high concurrency** | Lakehouse//RT's edge | Prepared-plan cache, partitioned tables (pruning), per-node caches on many read-only nodes | TPC-H SF10 at 1k+ QPS mixed, p99 < 100 ms on N nodes |
-| **Types** | VARIANT (Spark, Flink, Delta, Iceberg v3) for semi-structured data | Adopt DataFusion's variant support when it lands; meanwhile JSON functions over string columns (the `datafusion-functions-json` crate) | Semi-structured events queried without a schema up front |
+| **Types** | VARIANT (Spark, Flink, Delta, Iceberg v3) for semi-structured data | Round 10: JSON functions over string columns (`json_get`, `->>`). Next: DataFusion's variant type when it lands | Semi-structured events queried without a schema up front |
 | ~~Durable ack in ms on object storage~~ | Fluss's edge | **Done in rounds 8–9:** `--ack replicated`, 2–4 ms on R2; `--fsync`; 3 replicas tested | ✓ ack p50 2 ms on R2 |
+| ~~Kafka-protocol ingest~~ | How most event data travels | **Done in round 10:** producers (exactly-once when idempotent), Debezium, consumers, groups, SASL | ✓ ~0.7 M events/s via librdkafka on one box |
+| ~~Open catalogs~~ | Engines attach by URL | **Done in round 10:** the Iceberg REST catalog (read-only) | ✓ PyIceberg and DuckDB attach it |
 | **Maturity** | Trust | Chaos tests on real clusters, fuzzing, long soak runs, versioned upgrades | Months of soak without data loss |
 
 Sources:
