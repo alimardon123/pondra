@@ -202,7 +202,9 @@ pub async fn table_view(lake: &Lake, ctx: &SessionContext, name: &str, meta: &Ta
         return upsert_view(lake, ctx, name, meta).await;
     }
     if meta.key.is_empty() {
-        return Ok(Arc::new(Pruned { lake: lake.arc(), name: name.into(), meta: meta.clone(), manifests: None, upto: None, schema: read_schema(&meta.columns)?, share: None }));
+        let schema = read_schema(&meta.columns)?;
+        let ranges = crate::manifest::ranges(name, &crate::manifest::list(lake, meta).await?, &meta.files, &schema);
+        return Ok(Arc::new(Pruned { lake: lake.arc(), name: name.into(), meta: meta.clone(), manifests: None, upto: None, schema, share: None, ranges }));
     }
     let df = raw(lake, ctx, name, meta, None).await?;
     let aux = lake.session();
@@ -221,6 +223,7 @@ pub struct Pruned {
     pub upto: Option<u64>,                                  // the log up to this segment (None: the latest)
     pub schema: SchemaRef,
     pub share: Option<(u64, u64)>, // a distributed query's slice of it, and the whole table's (rows, bytes)
+    pub ranges: Arc<crate::manifest::Stats>, // every column's min and max over the whole table
 }
 
 impl std::fmt::Debug for Pruned {
@@ -234,6 +237,31 @@ impl TableProvider for Pruned {
 
     fn supports_filters_pushdown(&self, filters: &[&Expr]) -> datafusion::error::Result<Vec<datafusion::logical_expr::TableProviderFilterPushDown>> {
         Ok(vec![datafusion::logical_expr::TableProviderFilterPushDown::Inexact; filters.len()]) // (they choose files; rows are filtered above)
+    }
+
+    /// How big the table is, from what the catalog already knows: its files' row counts and bytes,
+    /// plus the sealed manifests' totals (`manifest.rs`), without opening a single footer. A
+    /// distributed query's slice reports the whole table (`share`), so every node orders its joins
+    /// alike. The log tail isn't counted — it is bounded by a tiering round, and this is for
+    /// choosing a join order (`optimize::JoinOrder`), not for counting rows.
+    fn statistics(&self) -> Option<datafusion::common::Statistics> {
+        use datafusion::common::stats::Precision;
+        let (rows, bytes) = self.share.unwrap_or_else(|| {
+            let sealed = self.meta.sealed.clone().unwrap_or_default();
+            let (rows, bytes) = self.meta.files.iter().fold((0, 0), |(r, b), f| (r + f.rows, b + f.bytes));
+            (sealed.rows + rows, sealed.bytes + bytes)
+        });
+        let mut stats = datafusion::common::Statistics::new_unknown(&self.schema);
+        (stats.num_rows, stats.total_byte_size) = (Precision::Inexact(rows as usize), Precision::Inexact(bytes as usize));
+        for (i, f) in self.schema.fields().iter().enumerate() {
+            let parse = |v: &String| datafusion::common::ScalarValue::try_from_string(v.clone(), f.data_type()).ok();
+            let Some((lo, hi)) = self.ranges.get(f.name()).and_then(|(lo, hi)| Some((parse(lo)?, parse(hi)?))) else { continue };
+            if let Some(n) = crate::manifest::span(&lo, &hi) {
+                stats.column_statistics[i].distinct_count = Precision::Inexact((n as usize).min(rows as usize));
+            }
+            (stats.column_statistics[i].min_value, stats.column_statistics[i].max_value) = (Precision::Inexact(lo), Precision::Inexact(hi));
+        }
+        Some(stats)
     }
 
     async fn scan(&self, _: &dyn datafusion::catalog::Session, projection: Option<&Vec<usize>>, filters: &[Expr], _: Option<usize>) -> datafusion::error::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {

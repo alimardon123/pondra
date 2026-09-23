@@ -1,0 +1,234 @@
+=== harness.py all (local disk)
+ "serverless": "INSERT from a process with no server: 0.03s alone, 4 at once, retries once; a node on the idle lake leads in 0.02s; via a running leader 0.03s; after the leader is killed 30.14s; 8000 rows, no duplicates",
+ "clients": "SQL writes, Python client, Postgres (4 drivers), tokens, change-feed replay, attached lake, inbox (1.1s), vector search, MCP, no file access from SQL: all 18 checks pass",
+ "kafka": "Kafka: librdkafka (5 codecs, idempotent) and kafka-python producers, exactly-once retries, Debezium, tombstones, raw values as JSON, consumers, consumer groups, SASL tokens: all 9 checks pass",
+ "alter": "ALTER TABLE ADD COLUMN under load (61,000 rows written meanwhile): old rows null, new ones set, keyed table, view, bulk and Arrow appends, 6 outside readers: all 8 checks pass",
+ "windows": "event-time windows: each emitted once, final, after the watermark; late rows update the view only; a leader restart emits nothing twice",
+ "scale": "scale: 23,100 rows over 139 daily partitions, 250 files (152 sealed), every file one day, a day's query reads 2 files, 3 nodes, 11 of 14 queries shuffled (all equal to one node), 6 outside readers, a 50 MB memory limit: all 9 checks pass",
+ "flight": "Arrow Flight: pyarrow DoPut exactly-once (retried stream applied once, via a follower too), DoGet SQL, FlightInfo, ListFlights, the log as a columnar stream (a subscriber has each new commit in 7 ms), tokens and handshake; ADBC queries, writes, ingest and catalog: all 13 checks pass",
+ "reader": "freshness on a separate read-only node: p50 9 ms, p99 90 ms",
+ "crash": "5/5 runs, 0 lost, 0 duplicated (events, streaming-task output, views); crashes survived: {'after_seg_put': 0, 'after_commit': 2, 'after_parquet_put': 20, 'kill -9': 4}",
+ "load": {
+  "events_per_s": 1200,
+  "ack_ms_p50": 251,
+  "ack_ms_p99": 256,
+  "freshness_ms_p50": 132,
+  "freshness_ms_p99": 266,
+  "freshness_samples": 48,
+  "commits_per_s": 4.0,
+  "commit_ms_p50": 2,
+  "commit_ms_p95": 3,
+  "server_cores_used": 0.09
+ }
+}
+
+=== shuffle_spill.py (local disk)
+ "one_node_s": 1.4,
+ "spread_s": 1.2,
+ "after_a_node_died_s": 0.5,
+ "spilled_mb": [
+  96.8,
+  96.8
+ ],
+ "left_bytes": [
+  0,
+  0
+ ],
+ "peak_rss_mb": [
+  558,
+  350,
+  357
+ ],
+ "skew": 1.0,
+ "answer": [
+  {
+   "keys": 4000000,
+   "total": 287994492.0
+  }
+ ],
+ "checks": {
+  "the shuffled answer equals the one-node answer": true,
+  "the query shuffled": true,
+  "buckets went to disk": true,
+  "the scratch is empty again": true,
+  "memory stayed under the budget": true,
+  "the buckets came out even": true,
+  "a node dying mid-query doesn't change the answer": true
+ },
+ "ok": true
+}
+
+=== join_order.py (TPC-H SF1 lake)
+{
+ "queries": 10,
+ "rule_on": {
+  "well_s": 1.494,
+  "badly_s": 1.719,
+  "worst_ratio": 1.65
+ },
+ "rule_off": {
+  "well_s": 1.488,
+  "badly_s": 1.887,
+  "worst_ratio": 1.99
+ },
+ "slower_with_the_rule": {
+  "well": [],
+  "badly": []
+ },
+ "per_query": {
+  "star": {
+   "on": {
+    "well": 0.116,
+    "badly": 0.125,
+    "same": true
+   },
+   "off": {
+    "well": 0.121,
+    "badly": 0.18,
+    "same": true
+   }
+  },
+  "snowflake": {
+   "on": {
+    "well": 0.121,
+    "badly": 0.155,
+    "same": true
+   },
+   "off": {
+    "well": 0.122,
+    "badly": 0.156,
+    "same": true
+   }
+  },
+  "filtered dimension": {
+   "on": {
+    "well": 0.111,
+    "badly": 0.164,
+    "same": true
+   },
+   "off": {
+    "well": 0.107,
+    "badly": 0.168,
+    "same": true
+   }
+  },
+  "tpch-q2": {
+   "on": {
+    "well": 0.054,
+    "badly": 0.058,
+    "same": true
+   },
+   "off": {
+    "well": 0.058,
+    "badly": 0.07,
+    "same": true
+   }
+  },
+  "tpch-q3": {
+   "on": {
+    "well": 0.126,
+    "badly": 0.13,
+    "same": true
+   },
+   "off": {
+    "well": 0.137,
+    "badly": 0.156,
+    "same": true
+   }
+  },
+  "tpch-q5": {
+   "on": {
+    "well": 0.168,
+    "badly": 0.146,
+    "same": true
+   },
+   "off": {
+    "well": 0.169,
+    "badly": 0.138,
+    "same": true
+   }
+  },
+  "tpch-q9": {
+   "on": {
+    "well": 0.272,
+    "badly": 0.449,
+    "same": true
+   },
+   "off": {
+    "well": 0.249,
+    "badly": 0.495,
+    "same": true
+   }
+  },
+  "tpch-q10": {
+   "on": {
+    "well": 0.19,
+    "badly": 0.189,
+    "same": true
+   },
+   "off": {
+    "well": 0.201,
+    "badly": 0.192,
+    "same": true
+   }
+  },
+  "tpch-q11": {
+   "on": {
+    "well": 0.049,
+    "badly": 0.045,
+    "same": true
+   },
+   "off": {
+    "well": 0.045,
+    "badly": 0.048,
+    "same": true
+   }
+  },
+  "tpch-q18": {
+   "on": {
+    "well": 0.287,
+    "badly": 0.258,
+    "same": true
+   },
+   "off": {
+    "well": 0.279,
+    "badly": 0.284,
+    "same": true
+   }
+  }
+ },
+ "checks": {
+  "the badly written queries answer the same": true,
+  "the badly written queries cost less with the rule": true,
+  "no badly written query is slower with the rule": true,
+  "no well written query is slower with the rule": true
+ },
+ "ok": true
+}
+
+=== cluster.py spread
+  q1_scan_agg          one node    104 ms   3 nodes    102 ms   same result: True
+  q2_filter_group      one node    182 ms   3 nodes    252 ms   same result: True
+  q3_high_card_group   one node   1000 ms   3 nodes   1346 ms   same result: True
+  q4_count_distinct    one node    170 ms   3 nodes    320 ms   same result: True
+  q5_join              one node    104 ms   3 nodes    100 ms   same result: True
+  q6_time_bucket       one node     57 ms   3 nodes    149 ms   same result: True
+  q7_avg_distinct      one node    196 ms   3 nodes    119 ms   same result: True
+  q8_top_rows          one node     39 ms   3 nodes    215 ms   same result: True
+  q9_filter_count      one node     12 ms   3 nodes     23 ms   same result: True
+spread: 4,000,000 rows, 3 nodes; results identical: True; fell back to one node: 0 times
+
+=== cluster.py users --secs 30
+users: 64 writers + 16 readers + 2 serverless on 3 node(s), 31s  lake /tmp/pondra-2fdq4l0h
+  2607200 events (83,557/s), ack p50 58 ms p99 273 ms
+  1962 snapshot reads, query p50 224 ms p99 955 ms
+  inconsistent reads: 0; producers with lost/duplicate batches: 0
+    by node: {}
+
+=== cluster.py failover --secs 45
+  killed leader :18082; new leader :18080 accepting writes after 4.4s
+failover: 3 nodes, 6 shards, 8 producers, 1458800 events, 1 follower + 2 leader kills
+  failovers: 5.2s, 4.4s (kill -> writes acked again); state caught up 0.1s after the last write
+  events exactly once: True (1458800 rows); for 1000 users, task state == model: True, inline view == model: True
+  shard runs per node (since each node's last start): {18080: 483, 18081: 287, 18082: 351}
+=== FINAL_DONE

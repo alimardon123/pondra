@@ -1,8 +1,8 @@
 # AGENTS.md — working on Pondra
 
 Read this first, then `README.md` (what it does), `docs/adr-005-every-node-writes.md` (why it
-works this way) and `docs/adr-012-toward-petabytes.md` (the current round). `docs/prototype-status.md`
-has the measured numbers and what's left.
+works this way) and `docs/adr-014-shuffles-that-fit-on-disk-and-a-join-order-of-its-own.md` (the
+current round). `docs/prototype-status.md` has the measured numbers and what's left.
 
 ## What this is
 
@@ -18,13 +18,13 @@ The owner's design principles, which every change must respect:
 2. **As serverless as possible**: no always-on services besides the nodes themselves.
 3. **SPMD, not driver/executor** (Bodo-style): every node runs the same code on its slice.
 4. **No JVM, no Spark, no Flink, no Fluss needed.**
-5. **Short, simple, readable code** — without losing functionality. ~8,800 lines of Rust total (the Kafka protocol is 1,300 of them).
+5. **Short, simple, readable code** — without losing functionality. ~11,000 lines of Rust total (the Kafka protocol is 1,300 of them).
    If a change makes a file much longer, look for the simpler shape first.
 
 ## Layout
 
 ```
-src/      10,100 lines of Rust, one file per concern (see the table in README.md)
+src/      11,000 lines of Rust, one file per concern (see the table in README.md)
 python/   the Python client (pure Python, HTTP + Arrow)
 tools/    harness.py, cluster.py (tests), open_check.py (Delta + Iceberg readers == Pondra),
           keyed_bench.py (compaction cost), clean_bucket.py (keep a bucket to its newest lakes),
@@ -35,6 +35,8 @@ tools/    harness.py, cluster.py (tests), open_check.py (Delta + Iceberg readers
           sizes.py, sim_r2.py (local S3 with R2 latency), udf_server.py (a function of your own,
           in Python, over Arrow Flight), bench/singlenode.py (TPC-H vs DuckDB, Polars, Daft, Bodo),
           metadata_bench.py (a table with a million files), flight_bench.py (Arrow Flight),
+          shuffle_spill.py (a shuffle bigger than memory, and one that loses a node),
+          join_order.py (the same queries written badly: same answers, no slower),
           cloud/ (start a cluster on several machines and benchmark it),
           r2_test.sh (run the suite against a real bucket), bench/ (vs Spark and Flink)
 docs/     ADRs and reports; lake-format.md is the on-disk layout
@@ -104,7 +106,18 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
   merges partial results) or shuffle (each hash exchange becomes a step: every node splits its
   output by hash, one bucket per node, and fetches its bucket from every node). Small tables are
   read whole (broadcast); a node's slice (`ShareExec`) reports the whole table's size; only plans
-  that the spread analysis proves correct run spread.
+  that the spread analysis proves correct run spread. Work is dealt by bytes, a step that fails is
+  retried once and then the shuffle runs again without that node, and below three live nodes the
+  query falls back to one.
+- **What a shuffle moves lives in pieces** (`spill.rs`): a bucket is Arrow IPC pieces of
+  `PONDRA_SPILL_MB` (64 MB), held in memory while small and written to the node's scratch folder
+  beyond. A piece is what is written, what crosses the wire (length-prefixed) and what one
+  partition of the next stage reads, so nothing holds a whole bucket — including the coordinator,
+  which reads each node's results onto its own disk and finishes the query over them.
+- **Join order from the catalog** (`optimize::JoinOrder`, `query::Pruned::statistics`): rows,
+  bytes and each column's range (bounding its distinct values) become DataFusion statistics;
+  inner joins are rebuilt smallest-first when that costs less than the order the query wrote,
+  which is costed the same way as the tree it is. `PONDRA_JOIN_ORDER=0` turns it off.
 - **Arrow Flight / Flight SQL** (`flight.rs`, `--flight`): ADBC/JDBC statements and ingest,
   pyarrow `DoPut` exactly-once, `DoGet` SQL or a table's log as a columnar stream.
 - **Memory:** one spill pool per node (`--memory-gb`); a query out of memory runs again with
@@ -228,6 +241,18 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
 29. **Flushes reach the sequencer in the order they were cut** (`log::send`'s turn), so a
    producer's pipelined batches commit in order. Over HTTP from a follower they may still
    overtake each other; a door that pipelines (Flight) re-queues a batch refused as out of order.
+30. **A shuffle's scratch folder has the node's own id in it** (`spill::dir`). Two nodes on one
+   machine share a cache directory and name their buckets the same way; without the id they write
+   over each other's rows and the answer is quietly wrong. This is what `tools/shuffle_spill.py`
+   caught when the id wasn't there.
+31. **A step's buckets are kept, not taken** (`spmd::fetch`, `bucket`): reading one clones it, so
+   a step that has to be run again reads the same rows. Everything a job spilled goes when the job
+   ends (`Drop for Job`, `gc`, `?drop=1`), and a dead node's is swept an hour later. A gather's
+   spill is freed by the guard its response stream holds instead, since nothing retries it.
+32. **Every node splits the same rows the same way.** `spmd::scatter` runs a stage's partitions at
+   once, each into buckets of its own, and joins them in partition order at the end; the hash is
+   DataFusion's `BatchPartitioner` over the exchange's own expressions. Anything that made the
+   split depend on arrival order would send a key to two nodes.
 
 ## Tests: run these before and after any change
 
@@ -246,6 +271,8 @@ python3 tools/harness.py kafka                 # Kafka producers/consumers/group
 python3 tools/harness.py alter                 # ALTER TABLE ADD COLUMN under load, 6 outside readers follow
 python3 tools/harness.py windows               # event-time windows emitted once, late rows, a leader restart
 python3 tools/harness.py scale                 # partitions, manifests, 14 shuffled/spread query shapes == one node, memory limits
+python3 tools/shuffle_spill.py                 # a shuffle bigger than memory, a node killed mid-query, the scratch freed
+python3 tools/join_order.py --lake <tpch lake> # the same queries written badly: same answers, no slower
 python3 tools/harness.py flight                # Arrow Flight (pyarrow) and Flight SQL (ADBC): exactly-once DoPut, SQL, the log stream
 python3 tools/metadata_bench.py [--files 1000000]   # a million files: commits, pruning, a restart, 3 nodes
 python3 tools/flight_bench.py                  # Flight in, out, and the log as a stream
@@ -299,11 +326,11 @@ Practical notes for an agent working here:
 - Node stderr goes to `/tmp/pondra-<port>-<id>.stderr`; that's where "restarting to rejoin",
   "slow tiering" and panics show up.
 
-## State of the work (2026-09-23, round 12)
+## State of the work (2026-09-23, round 13)
 
 Everything in `docs/prototype-status.md` passes on local disk and on simulated R2. The round-11
 additions (manifests, partitions, shuffles, memory limits, Arrow Flight) also ran against real
-R2; round 12's are in `logs/round12/`.
+R2; round 12's are in `logs/round12/` and round 13's in `logs/round13/`.
 
 **R2 test buckets.** There are two:
 
@@ -340,12 +367,13 @@ Known limits, in the order they matter:
 
 1. **No multi-machine run yet.** `tools/cloud/` is the kit: `cluster.sh` over ssh, `bench.py`
    from a client VM.
-2. **Shuffle buckets and query results live in memory** (not streamed or spilled), a failed
-   shuffle step fails the query (it then runs on one node), no skew handling. Distributed
-   queries are one SELECT with inner joins.
-3. **No cost-based join reordering.** Joins run in the order the query names them; the build
-   side is chosen by size at the physical level (TPC-H q7 is where this shows). Files written in
-   key order aren't declared as sorted either, so an aggregation on that key hashes.
+2. **Shuffle skew is measured, not corrected** (`pondra_shuffle_skew`): a key holding much of a
+   table is one node's work. Distributed queries are one SELECT with inner joins, and a query's
+   own answer still passes through the coordinator's memory once (an HTTP answer is one body).
+3. **Join order is bounded by what the ranges say.** A column's distinct values are bounded by
+   its min/max, which says little about a wide-ranged foreign key, so the order the query wrote
+   is the baseline and has to be beaten. Files written in key order aren't declared as sorted
+   either, so an aggregation on that key hashes.
 4. **Replicated acks' window.** An acked write survives any one node dying (with `--fsync`,
    followers' power loss too), but not the leader and every holder dying before the bucket has
    it.
@@ -367,9 +395,10 @@ produce.
 
 1. **A multi-machine run** with `tools/cloud/` (3–10 VMs on S3/R2): ingest over Flight and Kafka,
    the query suite at 1, 3 and 6 nodes, TPC-H SF100 against Spark.
-2. **Shuffles that stream and spill** to the local SSD, with a failed step retried alone.
-3. **Cost-based join order** from the statistics the manifests already hold, and sorted files
-   declared as sorted (streaming aggregation, merge joins, `ORDER BY` without a sort).
+2. **Skew corrected, not just measured** (a hot join key split across nodes), and distributed
+   queries beyond one SELECT of inner joins.
+3. **Sorted files declared as sorted** (streaming aggregation, merge joins, `ORDER BY` without a
+   sort), and real distinct-value counts to feed the join-order cost model.
 4. **Kafka partitions** (key-hashed slices of a table) and transactions.
 5. **An approximate vector index**, and merging files inside sealed manifests (cold compaction).
 6. **TLS, per-table grants, an audit log, quotas.**

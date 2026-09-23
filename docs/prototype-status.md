@@ -1,6 +1,6 @@
 # Prototype status: Pondra, a streamhouse in one binary
 
-**Date:** 2026-09-23 (round 12) · **Plan:** ADR-002 to ADR-013 · **Code:** `pondra.zip` / `pondra.bundle` (≈10,100 lines of Rust, plus a Python client and test and benchmark tools)
+**Date:** 2026-09-23 (round 13) · **Plan:** ADR-002 to ADR-014 · **Code:** `pondra.zip` / `pondra.bundle` (≈11,000 lines of Rust, plus a Python client and test and benchmark tools)
 **Name:** the prototype formerly called `lh` is now **Pondra**. The name is free on crates.io, PyPI and npm. A small personal-finance app uses it (pondra.app), a different category; run a trademark search before a public launch.
 
 ## Where it stands
@@ -14,6 +14,36 @@ One Rust binary replaces the Kafka + Flink + Spark + metastore + ZooKeeper stack
 - upsert and merge tables.
 
 Start more copies on the same bucket to scale out. The only state is object storage. There's no JVM, no database server and no coordination service.
+
+**Round 13 made queries across nodes something you can rely on, and gave Pondra a join order of
+its own** (ADR-014):
+
+1. **A shuffle is bounded by disk, not by memory.** Rows going from one node to another are held
+   in pieces (`PONDRA_SPILL_MB`, 64 MB); a piece past that size is written to the node's scratch
+   folder, sent length-prefixed, and read back a piece at a time by whoever needs it. Nothing —
+   the stage that makes it, the wire, the coordinator that finishes the query — ever holds a whole
+   bucket. Three nodes shuffling 4 million distinct keys with the piece size set to 1 MB: the
+   answer is identical to one node's, 97 MB went to each node's disk, the scratch is empty
+   afterwards, and no node passed its 1 GB budget.
+2. **A step that fails is run again; a node that fails is dropped.** A step reads buckets that are
+   kept, not taken, so it is the same work every time: one retry after 250 ms, and if that fails
+   too, the whole shuffle runs again without that node. A node killed just before a query changed
+   nothing about the answer.
+3. **Work dealt by size.** Manifests and files go to whichever node holds the fewest bytes so far
+   (ties keep the old round-robin, so a time range still spreads). In the spill test this alone
+   turned 193 MB / 97 MB of spilling into 97 MB / 97 MB. What skew is left —
+   a key that holds much of the table — is measured as `pondra_shuffle_skew`, not corrected.
+4. **A join order of Pondra's own** (`PONDRA_JOIN_ORDER=0` to turn it off). The catalog already
+   knows each table's rows and each column's range, so `Pruned` reports them as statistics,
+   including a bound on a column's distinct values. Inner joins are then rebuilt smallest-first,
+   costing each step as `rows(a) × rows(b) / distinct(key)` — which is what catches the joins that
+   *expand* (TPC-H q5 relates customers to suppliers by nation: 25 values, 400 suppliers each).
+   The order the query wrote is costed the same way and kept unless the new one is cheaper.
+   Ten queries written badly — the same query with its tables named biggest-first — answer the
+   same and cost 1.75–1.83 s together with the rule against 1.87–1.95 s without it, with none of
+   them slower; TPC-H's own 22 answers and its 3.35 s SF1 total are unchanged, because those
+   queries name their tables well already. A modest win, and ADR-014 says why: DataFusion's
+   physical planner already picks build sides from exact Parquet row counts.
 
 **Round 12 made one node fast, gave columns something other than numbers to hold, and made
 publishing cost what changed** (ADR-013):
@@ -782,11 +812,15 @@ peak at 279–586 MB.
   whole table is rewritten only when the newer data has grown to about half of it; partitioned
   compaction (a key range per node) is the next step.
 - Merge tables only support decomposable aggregates (sum, count, min, max).
-- Distributed queries shuffle (round 11), but their buckets and results are held in memory,
-  a failed step fails the query (it then runs on one node), and there's no skew handling.
-  Nothing has run on several machines yet; `tools/cloud/` is the kit.
-- Joins run in the order the query names them, with the build side chosen by size at the physical
-  level: there is no cost-based join reordering (TPC-H q7 is where this shows).
+- Distributed queries spill their buckets and stream their results (round 13), and a step that
+  fails is retried and then run without that node — but skew is measured, not corrected: a hot
+  join key is still one node's work. Nothing has run on several machines yet; `tools/cloud/` is
+  the kit.
+- A query's own answer still passes through the coordinator's memory once, because an HTTP answer
+  is one body that identical queries share (invariant 14). What the nodes send no longer does.
+- Join order is chosen from the catalog's statistics (round 13), but only when it clearly beats
+  the order the query wrote; the cost model bounds a column's distinct values by its range, which
+  says little about a wide-ranged foreign key.
 - Files written in key order aren't declared as sorted, so an aggregation on that key hashes
   rather than streams.
 - The columns kept decoded in memory (`hot.rs`) are a cache of what was read, not a policy: no
@@ -805,9 +839,10 @@ peak at 279–586 MB.
 From the plan in `docs/comparison-spark-flink-fluss.md`, in order:
 
 1. **A multi-machine run** with `tools/cloud/` (3–10 VMs on S3/R2), TPC-H SF100 against Spark.
-2. **Shuffles that stream and spill**, with a failed step retried alone; skew handling.
-3. **Cost-based join order**, and sorted data declared as sorted (streaming aggregation, merge
-   joins, `ORDER BY` without a sort).
+2. **Skew corrected, not just measured** (a hot join key split across nodes), and distributed
+   queries beyond one SELECT of inner joins.
+3. **Sorted data declared as sorted** (streaming aggregation, merge joins, `ORDER BY` without a
+   sort), and better distinct-value estimates for the join-order cost model.
 4. **Kafka partitions** and transactions; the Java client and Kafka Connect verified.
 5. **An approximate vector index**, and `VARIANT` as a real type once Arrow has one.
 6. **TLS, per-table grants, an audit log, quotas.**

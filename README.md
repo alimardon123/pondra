@@ -1,6 +1,6 @@
 # Pondra: a streamhouse in one binary
 
-One Rust binary (~10,100 lines) that ingests streams, stores them as a lakehouse (Parquet files
+One Rust binary (~11,000 lines) that ingests streams, stores them as a lakehouse (Parquet files
 plus a catalog, on object storage; Delta Lake and Iceberg metadata for other engines on request),
 keeps SQL views and streaming state up to date, answers SQL, and scales out by starting more
 copies of itself on the same bucket. Object storage is the only state: no Postgres, no
@@ -171,14 +171,15 @@ differences entirely.
 | `cluster.rs` | Leader election through the bucket (put-if-absent `cluster/term/{n}`), HTTP heartbeats, takeover after 5 s if no peer still hears the leader; a replaced leader is fenced by the catalog and rejoins. A liveness mark in the bucket lets a node on an idle lake lead at once |
 | `views.rs` | Inline views; GROUP BY views become merge tables |
 | `tasks.rs` | Streaming tasks: output + progress commit together, only if progress is unchanged (compare-and-swap) |
-| `spmd.rs` | Distributed queries: every node runs the same plan over its slice; small tables are read whole (broadcast). Up to the first gather, or through shuffles: each hash exchange becomes a step in which every node splits its output by hash, one bucket per node, and fetches its own bucket from every node. The receiving node finishes the plan |
+| `spmd.rs` | Distributed queries: every node runs the same plan over its slice; small tables are read whole (broadcast). Up to the first gather, or through shuffles: each hash exchange becomes a step in which every node splits its output by hash, one bucket per node, and fetches its own bucket from every node. Work is dealt by bytes; a step that fails is retried, then run again without that node |
+| `spill.rs` | What a shuffle moves, in pieces (`PONDRA_SPILL_MB`): held in memory while small, written to the node's scratch disk beyond, sent length-prefixed and read back a piece at a time — so a shuffle, and what the coordinator gathers, is bounded by disk rather than memory |
 | `manifest.rs` | Table metadata that stays small: per-file column ranges, the oldest files sealed into immutable manifests behind one list object, pruning of manifests and files by a query's filters |
 | `flight.rs` | Arrow Flight and Flight SQL: exactly-once `DoPut`, SQL and the log as columnar streams, ADBC's statements, ingest and catalog |
 | `metrics.rs` | `GET /metrics` in Prometheus' format |
 | `tier.rs` | Tiering, merging small files and compaction: the leader decides and commits, the data work is dealt to the nodes as jobs. Keyed tables are LSM-like — each round folds the log tail into a new file, and files are compacted once 8 pile up. Retention and orphan cleanup |
 | `query.rs` | Hot+cold snapshot per query (DataFusion); strings are read as views |
 | `hot.rs` | The columns queries read lately, decoded, in memory, per file: a scan that finds them all there skips reading and decoding Parquet. Files never change, so nothing goes stale. Filled in the background, only for a file a second scan came back to, and never at the expense of a running query |
-| `optimize.rs` | The engine settings Pondra starts from, and four planning rules of its own: a semi join runs on the table it filters, a grouped subquery groups only the keys the join keeps, a filter's conditions run cheapest first, and the few groups a HAVING keeps make the hash table |
+| `optimize.rs` | The engine settings Pondra starts from, and five planning rules of its own: a semi join runs on the table it filters, a grouped subquery groups only the keys the join keeps, a filter's conditions run cheapest first, the few groups a HAVING keeps make the hash table, and inner joins are ordered by what the catalog knows (rows and column ranges) when that beats the order the query wrote |
 | `files.rs`, `ai.rs`, `udf.rs` | Files in the lake (`files('…')`, `file_read`), models in SQL (`ai_complete`, `ai_embed`) and vector maths, and functions of your own on an Arrow Flight server |
 | `cache.rs` | For lakes on object storage: an in-memory read cache and a local SSD tier (write-through, read-through, prefetched from the commit stream, warmed at start) |
 | `serve.rs` | Serving reads: key lookups without SQL (tail, then files newest-first, cached key-sorted row groups, binary search), and SQL point queries routed to them |
@@ -203,6 +204,8 @@ python3 tools/harness.py clients                # SQL writes, Python client, Pos
 python3 tools/mcp_client.py --url http://127.0.0.1:8080/mcp   # the official MCP SDK against a node (pip install mcp)
 python3 tools/harness.py kafka | alter | windows   # Kafka clients, ALTER TABLE under load, windows emitted once
 python3 tools/harness.py scale | flight         # partitions, manifests, shuffles, memory limits; Arrow Flight + ADBC
+python3 tools/shuffle_spill.py                 # a shuffle bigger than memory, and one that loses a node
+python3 tools/join_order.py                    # the same query written badly runs as fast
 python3 tools/metadata_bench.py [--files 1000000]   # a table with a million files: commits, pruning, 3 nodes
 python3 tools/flight_bench.py                   # Arrow Flight in, out, and the log as a stream
 python3 tools/cloud/bench.py --nodes …          # a cluster on several machines (tools/cloud/README.md)
@@ -234,17 +237,20 @@ bucket to its newest lakes.
 
 ## Not yet
 
-- Shuffle buckets and big results are held in memory (not streamed or spilled); distributed
-  queries are one SELECT with inner joins. Nothing has run on several machines yet
-  (`tools/cloud/` is the kit).
-- Publishing a huge table to Delta/Iceberg rewrites a manifest of every file each time.
+- Shuffle skew is measured (`pondra_shuffle_skew`), not corrected: a key that holds much of a
+  table is still one node's work. Distributed queries are one SELECT with inner joins. Nothing has
+  run on several machines yet (`tools/cloud/` is the kit).
+- A query's own answer passes through the coordinator's memory once (an HTTP answer is one body,
+  shared by identical queries); what the nodes send does not.
+- Files written in key order aren't declared as sorted, so an aggregation on that key hashes
+  rather than streams.
 - Clustering across files; copy-on-write DELETE for append tables.
 - Per-table grants, quotas and TLS (tokens are per role; put a TLS proxy in front); JDBC and BI
   tools untested here.
 - Kafka: one partition per topic, no transactions; offsets are positions in the log (increasing,
   not dense). Consumer groups live in the leader's memory (members rejoin after a failover).
-- `ALTER TABLE` only adds columns; session windows; AI functions in SQL; an approximate vector
-  index (see the plan in `docs/comparison-spark-flink-fluss.md`).
+- `ALTER TABLE` only adds columns; session windows; an approximate vector index (see the plan in
+  `docs/comparison-spark-flink-fluss.md`).
 - On object storage a *durable* ack costs one PUT; `--ack replicated` trades a small window
   (the leader and every holder dying before that PUT) for milliseconds.
 - A one-off `pondra sql` on far-away object storage spends 1–3 s opening the catalog; join

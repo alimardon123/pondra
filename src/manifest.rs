@@ -94,6 +94,40 @@ fn orderable(t: &DataType) -> bool {
     t.is_integer() || t.is_floating() || matches!(t, DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8 | DataType::Date32 | DataType::Date64 | DataType::Timestamp(..) | DataType::Decimal128(..) | DataType::Boolean)
 }
 
+/// The ranges covering a table's whole contents: its manifests' and its files'. What a query's
+/// planning knows about the values in each column (`query::Pruned::statistics`). Worked out once
+/// per version of the table — every query would otherwise re-parse every file's min and max.
+pub fn ranges(table: &str, manifests: &[Manifest], files: &[DataFile], schema: &SchemaRef) -> Arc<Stats> {
+    use std::hash::{Hash, Hasher};
+    static SEEN: LazyLock<Mutex<lru::LruCache<String, (u64, Arc<Stats>)>>> = LazyLock::new(|| Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(256).unwrap())));
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    files.iter().for_each(|f| f.path.hash(&mut h));
+    manifests.iter().for_each(|m| m.path.hash(&mut h));
+    let mark = h.finish();
+    if let Some((had, stats)) = SEEN.lock().unwrap().get(table) {
+        if *had == mark {
+            return stats.clone();
+        }
+    }
+    let parts: Vec<&Stats> = manifests.iter().map(|m| &m.stats).chain(files.iter().map(|f| &f.stats)).collect();
+    let stats = Arc::new(union(&parts, schema));
+    SEEN.lock().unwrap().put(table.to_string(), (mark, stats.clone()));
+    stats
+}
+
+/// How many values a range could hold, for the types that count in whole numbers: an upper bound
+/// on a column's distinct values, which is what the size of a join on it turns on. None where a
+/// range says nothing about that — floats, strings, timestamps.
+pub fn span(lo: &ScalarValue, hi: &ScalarValue) -> Option<u64> {
+    if !(lo.data_type().is_integer() || matches!(lo.data_type(), DataType::Date32 | DataType::Date64)) {
+        return None;
+    }
+    match hi.sub(lo).ok()?.cast_to(&DataType::Int64).ok()? {
+        ScalarValue::Int64(Some(n)) if n >= 0 => Some(n as u64 + 1),
+        _ => None,
+    }
+}
+
 /// The ranges covering all of `parts` (a column missing from any of them has no range).
 fn union(parts: &[&Stats], schema: &SchemaRef) -> Stats {
     let Some(first) = parts.first() else { return Stats::new() };

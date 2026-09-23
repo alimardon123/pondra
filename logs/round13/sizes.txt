@@ -1,0 +1,4 @@
+Round 13 binary (cargo build --profile dist):
+  96.1 MB, 32.7 MB gzipped  (round 12: 95.9 MB / 32.4 MB)
+  +0.2 MB for spill.rs, the join-order rule and the statistics it reads.
+Rust source: 11026 lines across 30 files.

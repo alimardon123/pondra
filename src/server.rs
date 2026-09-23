@@ -235,10 +235,11 @@ async fn commit(State(app): State<App>, body: Bytes) -> Result<Json<crate::log::
     Ok(Json(seq.submit(decode_flush(body)?).await?))
 }
 
-/// This node's share of a distributed query.
-async fn stage(State(app): State<App>, Json(slice): Json<crate::spmd::Slice>) -> Result<Vec<u8>, E> {
+/// This node's share of a distributed query, sent a piece at a time (a big share is on disk).
+async fn stage(State(app): State<App>, Json(slice): Json<crate::spmd::Slice>) -> Result<Response, E> {
     let (shape, parts) = crate::spmd::stage(&app.lake, &slice).await?;
-    Ok(crate::spmd::encode_reply(&shape, &parts)?)
+    let done = slice.shuffle.is_none().then(|| crate::spill::Gone(slice.id.clone()));
+    Ok(Body::from_stream(crate::spmd::reply(&shape, parts, done)).into_response())
 }
 
 #[derive(Deserialize)]
@@ -246,10 +247,19 @@ struct BucketParams {
     id: String,
     exchange: usize,
     to: usize,
+    #[serde(default)]
+    drop: bool, // the coordinator gave up on this shuffle: forget it and delete what it spilled
 }
 
 /// A shuffle bucket this node keeps for another node (see `spmd.rs`).
-async fn bucket(Query(p): Query<BucketParams>) -> Result<Vec<u8>, E> { Ok(crate::spmd::bucket(&p.id, p.exchange, p.to)?) }
+async fn bucket(Query(p): Query<BucketParams>) -> Result<Response, E> {
+    if p.drop {
+        crate::spmd::forget(&p.id);
+        return Ok(Body::empty().into_response());
+    }
+    let spill = crate::spmd::bucket(&p.id, p.exchange, p.to)?;
+    Ok(Body::from_stream(spill.framed()).into_response()) // (a piece at a time: a big bucket is on disk)
+}
 
 /// A share of the leader's data work (tiering, merging, compaction): the files written.
 async fn job(State(app): State<App>, Json(job): Json<crate::tier::Job>) -> Result<Json<Vec<DataFile>>, E> {

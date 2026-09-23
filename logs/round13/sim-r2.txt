@@ -1,0 +1,71 @@
+=== simulated R2 (PUT p50 ~197 ms, GET p50 ~100 ms)
+=== harness.py scale --s3
+  "iceberg/pyiceberg": 23100,
+  "iceberg/polars": 23100,
+  "iceberg/duckdb": 23100
+ },
+ "ok": true
+}
+
+=== shuffle_spill.py --s3
+ "one_node_s": 1.6,
+ "spread_s": 0.8,
+ "after_a_node_died_s": 0.4,
+ "spilled_mb": [
+  96.8,
+  192.9
+ ],
+ "left_bytes": [
+  0,
+  0
+ ],
+ "peak_rss_mb": [
+  923,
+  376,
+  370
+ ],
+ "skew": 1.0,
+ "answer": [
+  {
+   "keys": 4000000,
+   "total": 287994492.0
+  }
+ ],
+ "checks": {
+  "the shuffled answer equals the one-node answer": true,
+  "the query shuffled": true,
+  "buckets went to disk": true,
+  "the scratch is empty again": true,
+  "memory stayed under the budget": true,
+  "the buckets came out even": true,
+  "a node dying mid-query doesn't change the answer": true
+ },
+ "ok": true
+}
+
+=== harness.py serverless --s3
+{"serverless": {"alone_s": 5.71, "retry": ["{\"rows\":1000}", "{\"duplicate\":true}"], "four_at_once": ["{\"rows\":1000}", "{\"rows\":1000}", "{\"rows\":1000}", "{\"rows\":1000}"], "node_start_s": 3.95, "node_leads": true, "via_node_s": 2.04, "after_leader_killed_s": 34.47, "rows": {"n": 8000, "ids": 1000}, "ok": true}}
+
+=== cluster.py failover --s3 --flag ack=replicated
+  killed leader :18081; new leader :18080 accepting writes after 11.6s
+failover: 3 nodes, 6 shards, 8 producers, 955100 events, 1 follower + 2 leader kills
+  failovers: 13.0s, 11.6s (kill -> writes acked again); state caught up 0.2s after the last write
+  events exactly once: True (955100 rows); for 1000 users, task state == model: True, inline view == model: True
+  shard runs per node (since each node's last start): {18080: 340, 18081: 236, 18082: 313}
+
+=== harness.py crash --runs 2 --batches 60 --s3
+run  1: kill-9=2 injected={'after_seg_put': 0, 'after_commit': 1, 'after_parquet_put': 32} events=18000/18000 unique=18000 task_output=9000/9000 views=exact -> OK
+run  2: kill-9=0 injected={'after_seg_put': 0, 'after_commit': 4, 'after_parquet_put': 34} events=18000/18000 unique=18000 task_output=9000/9000 views=exact -> OK
+
+=== open_check.py --s3
+ },
+ "match": true
+}
+
+=== cluster.py users --s3 --flag ack=replicated
+users: 64 writers + 16 readers + 2 serverless on 3 node(s), 33s  lake s3://testbucket/test-a9db2d3b
+  1991000 events (60,657/s), ack p50 80 ms p99 436 ms
+  2672 snapshot reads, query p50 167 ms p99 558 ms
+  inconsistent reads: 0; producers with lost/duplicate batches: 0
+    by node: {}
+=== SIM_DONE

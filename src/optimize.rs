@@ -2,8 +2,8 @@
 use datafusion::arrow::datatypes::DataType;
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRecursion};
 use datafusion::common::{Column, DFSchema, NullEquality, Result};
-use datafusion::logical_expr::utils::{conjunction, disjunction, split_binary, split_conjunction};
-use datafusion::logical_expr::{Aggregate, Expr, Filter, Join, JoinConstraint, JoinType, LogicalPlan, LogicalPlanBuilder, Operator, Projection, SubqueryAlias};
+use datafusion::logical_expr::utils::{can_hash, conjunction, disjunction, find_valid_equijoin_key_pair, split_binary, split_conjunction};
+use datafusion::logical_expr::{build_join_schema, Aggregate, Expr, Filter, Join, JoinConstraint, JoinType, LogicalPlan, LogicalPlanBuilder, Operator, Projection, SubqueryAlias};
 use datafusion::optimizer::{optimizer::ApplyOrder, Optimizer, OptimizerConfig, OptimizerRule};
 use datafusion::common::config::ConfigOptions;
 use datafusion::physical_optimizer::{optimizer::PhysicalOptimizer, PhysicalOptimizerRule};
@@ -34,6 +34,9 @@ pub fn rules() -> Vec<Arc<dyn OptimizerRule + Send + Sync>> {
     let at = rules.iter().position(|r| r.name() == "push_down_filter").map_or(rules.len(), |i| i + 1);
     rules.insert(at, Arc::new(SemiJoinDown));
     rules.insert(at, Arc::new(GroupOnlyJoined));
+    if std::env::var("PONDRA_JOIN_ORDER").as_deref() != Ok("0") {
+        rules.insert(at, Arc::new(JoinOrder)); // (after the filters are down: they say how big each input is)
+    }
     rules.push(Arc::new(CheapFirst));
     rules
 }
@@ -278,4 +281,267 @@ impl OptimizerRule for SemiJoinDown {
         let j = Join::try_new(left, right, inner.on.clone(), inner.filter.clone(), inner.join_type, inner.join_constraint, inner.null_equality, inner.null_aware)?;
         Ok(Transformed::yes(LogicalPlan::Join(j)))
     }
+}
+
+/// Inner joins run in the order the query names them, so a query that starts from its biggest
+/// table carries those rows through every join after it. This picks the order by what the catalog
+/// already knows — each table's row count and each column's range (`query::Pruned::statistics`,
+/// from the file and manifest entries, which cost nothing to read) — building the tree one input
+/// at a time, each time the one that leaves the fewest rows in flight.
+///
+/// A join's rows are estimated the textbook way — `rows(a) × rows(b) / distinct(key)`, a side
+/// whose distinct count nothing knows counting as one row per value, which is what a key usually
+/// is. That is what catches the joins that *expand*: TPC-H q5 relates customers to suppliers by
+/// nation, 25 values, so every customer meets four hundred suppliers.
+///
+/// Two things keep it honest, and they matter more than the search. The order the query wrote is
+/// costed the same way, as the tree it is, and kept unless the new one is cheaper — a query that
+/// already says it well is left alone. And nothing is reordered unless every input's size is
+/// known and every step joins on a key: a tree with a cross join in it is one these estimates say
+/// nothing useful about. And because the estimates are bounds rather than counts, the new order
+/// has to look a good deal cheaper, not a little (`PONDRA_JOIN_ORDER`: the margin, 2 by default;
+/// `0` turns the rule off).
+#[derive(Debug)]
+struct JoinOrder;
+
+/// How much cheaper the new order has to look before it is taken (`PONDRA_JOIN_ORDER`, 2 by
+/// default). The estimates are bounds, not counts, so a small difference between two orders is
+/// not a reason to overrule the one the query asked for.
+fn margin() -> u64 {
+    std::env::var("PONDRA_JOIN_ORDER").ok().and_then(|m| m.parse().ok()).unwrap_or(2).max(1)
+}
+
+impl OptimizerRule for JoinOrder {
+    fn name(&self) -> &str {
+        "join_order"
+    }
+
+    fn apply_order(&self) -> Option<ApplyOrder> {
+        Some(ApplyOrder::TopDown)
+    }
+
+    fn rewrite(&self, plan: LogicalPlan, _: &dyn OptimizerConfig) -> Result<Transformed<LogicalPlan>> {
+        let LogicalPlan::Join(top) = &plan else { return Ok(Transformed::no(plan)) };
+        let (equality, constraint) = (top.null_equality, top.join_constraint);
+        if !flat(top, equality) {
+            return Ok(Transformed::no(plan));
+        }
+        let (mut leaves, mut keys, mut filters) = (vec![], vec![], vec![]);
+        flatten(&plan, equality, &mut leaves, &mut keys, &mut filters);
+        if leaves.len() < 3 {
+            return Ok(Transformed::no(plan)); // (two inputs: the build side is chosen by size when it runs)
+        }
+        let Some(sizes) = leaves.iter().map(size).collect::<Option<Vec<Size>>>() else { return Ok(Transformed::no(plan)) };
+        let asked: Vec<usize> = (0..leaves.len()).collect();
+        let order = cheapest(&leaves, &sizes, &keys)?;
+        // Both costed the same way, and only when every step joins on a key: a tree with a cross
+        // join in it is one these estimates can say nothing useful about.
+        let (Some((_, was)), Some(now)) = (as_written(&plan, equality)?, rows_moved(&leaves, &sizes, &keys, &order)?) else { return Ok(Transformed::no(plan)) };
+        if order == asked || now.saturating_mul(margin()) >= was {
+            return Ok(Transformed::no(plan));
+        }
+        // Rebuilt left-deep in that order: each join takes the keys that connect its input to what
+        // is built, and every condition that can be evaluated by then.
+        let mut used = vec![false; keys.len()];
+        let mut left = leaves[order[0]].clone();
+        for &i in &order[1..] {
+            let right = Arc::new(leaves[i].clone());
+            let mut on = vec![];
+            for (k, pair) in connect(&keys, left.schema(), right.schema())? {
+                if !std::mem::replace(&mut used[k], true) {
+                    on.push(pair);
+                }
+            }
+            let schema = build_join_schema(left.schema(), right.schema(), &JoinType::Inner)?;
+            let (mine, rest) = std::mem::take(&mut filters).into_iter().partition::<Vec<Expr>, _>(|f| f.column_refs().iter().all(|c| schema.has_column(c)));
+            filters = rest;
+            left = LogicalPlan::Join(Join::try_new(Arc::new(left), right, on, conjunction(mine), JoinType::Inner, constraint, equality, false)?);
+        }
+        // A key no join could take (one side spanning two inputs joined apart) stays a condition,
+        // so nothing is ever dropped; the next pass pushes it back down.
+        filters.extend(keys.iter().zip(&used).filter(|(_, &u)| !u).map(|((l, r), _)| l.clone().eq(r.clone())));
+        let schema = Arc::clone(plan.schema());
+        if left.schema() != &schema {
+            left = LogicalPlan::Projection(Projection::new_from_schema(Arc::new(left), schema)); // (the columns as the query had them)
+        }
+        if let Some(rest) = conjunction(filters) {
+            left = LogicalPlan::Filter(Filter::try_new(rest, Arc::new(left))?);
+        }
+        Ok(Transformed::yes(left))
+    }
+}
+
+/// A join tree this rule may take apart: inner joins on equalities, nothing null-aware, all
+/// treating nulls alike.
+fn flat(j: &Join, equality: NullEquality) -> bool {
+    j.join_type == JoinType::Inner && j.join_constraint == JoinConstraint::On && !j.null_aware && j.null_equality == equality
+}
+
+/// The tree's inputs, in the order it joins them, with every equi-key and condition it holds.
+fn flatten(plan: &LogicalPlan, equality: NullEquality, leaves: &mut Vec<LogicalPlan>, keys: &mut Vec<(Expr, Expr)>, filters: &mut Vec<Expr>) {
+    match plan {
+        LogicalPlan::Join(j) if flat(j, equality) => {
+            keys.extend(j.on.iter().cloned());
+            filters.extend(j.filter.iter().flat_map(split_conjunction).cloned());
+            flatten(&j.left, equality, leaves, keys, filters);
+            flatten(&j.right, equality, leaves, keys, filters);
+        }
+        _ => leaves.push(plan.clone()),
+    }
+}
+
+/// How big a join input is: its rows, and an upper bound on each column's distinct values where
+/// the catalog knows one (by column name: a name is unique within one table, and an input holding
+/// more than one table is left without bounds).
+#[derive(Clone, Default)]
+struct Size {
+    rows: u64,
+    distinct: std::collections::HashMap<String, u64>,
+}
+
+impl Size {
+    /// The same input cut to `rows` (a filter, or a join that kept some of them).
+    fn cut(&self, rows: u64) -> Size {
+        Size { rows, distinct: self.distinct.iter().map(|(c, &n)| (c.clone(), n.min(rows))).collect() }
+    }
+
+    fn of(&self, e: &Expr) -> Option<u64> {
+        match e {
+            Expr::Column(c) => self.distinct.get(&c.name).copied(),
+            Expr::Alias(a) => self.of(&a.expr),
+            Expr::Cast(c) => self.of(&c.expr),
+            _ => None,
+        }
+    }
+}
+
+/// The two put together, as a join leaves them.
+fn joined(a: &Size, b: &Size, rows: u64) -> Size {
+    let mut distinct = a.cut(rows).distinct;
+    for (c, n) in b.cut(rows).distinct {
+        let n = distinct.get(&c).map_or(n, |had| n.min(*had)); // (the same name twice: take the smaller — the join looks no cheaper than it is)
+        distinct.insert(c, n);
+    }
+    Size { rows, distinct }
+}
+
+/// How many rows a join of `a` and `b` on `on` leaves: every row of one side meets the rows of the
+/// other that share its key, which is `rows(a) × rows(b) / distinct(key)` — the textbook estimate,
+/// and the one that catches a join on a column with few values (TPC-H q5 joins customers to
+/// suppliers by nation: 25 values, so every customer meets 400 suppliers). A side whose distinct
+/// count nothing knows counts as one row per value, which is what a key usually is.
+fn join_rows(a: &Size, b: &Size, on: &[(Expr, Expr)]) -> u64 {
+    let (ra, rb) = (a.rows.max(1) as f64, b.rows.max(1) as f64);
+    if on.is_empty() {
+        return (ra * rb).min(u64::MAX as f64) as u64; // a cross join
+    }
+    let spread: f64 = on.iter().map(|(l, r)| {
+        let d = |s: &Size, e: &Expr, rows: f64| s.of(e).map_or(rows, |n| n as f64);
+        d(a, l, ra).max(d(b, r, rb)).max(1.0)
+    }).product();
+    (ra * rb / spread).max(1.0).min(u64::MAX as f64) as u64
+}
+
+/// The order to join the inputs in: the cheapest first pair, then each time the input that leaves
+/// the fewest rows. Inputs that share no key with what is built go last — a cross join the query
+/// already asked for, never one this makes up.
+fn cheapest(leaves: &[LogicalPlan], sizes: &[Size], keys: &[(Expr, Expr)]) -> Result<Vec<usize>> {
+    let mut todo: Vec<usize> = (0..leaves.len()).collect();
+    todo.sort_by_key(|&i| (sizes[i].rows, i));
+    let first = todo.remove(0); // (the smallest input: nothing else is joined yet, so nothing else can be costed)
+    let (mut order, mut built, mut schema) = (vec![first], sizes[first].clone(), leaves[first].schema().as_ref().clone());
+    while !todo.is_empty() {
+        let mut best: Option<(u64, usize, usize)> = None; // (rows, whether it is joined at all, place in todo)
+        for (at, &i) in todo.iter().enumerate() {
+            let on: Vec<(Expr, Expr)> = connect(keys, &schema, leaves[i].schema())?.into_iter().map(|(_, p)| p).collect();
+            let rank = (join_rows(&built, &sizes[i], &on), usize::from(on.is_empty()), at);
+            if best.is_none_or(|b| (rank.1, rank.0) < (b.1, b.0)) {
+                best = Some(rank);
+            }
+        }
+        let at = best.expect("something is left to join").2;
+        let i = todo.remove(at);
+        let on: Vec<(Expr, Expr)> = connect(keys, &schema, leaves[i].schema())?.into_iter().map(|(_, p)| p).collect();
+        (built, schema) = (joined(&built, &sizes[i], join_rows(&built, &sizes[i], &on)), build_join_schema(&schema, leaves[i].schema(), &JoinType::Inner)?);
+        order.push(i);
+    }
+    Ok(order)
+}
+
+/// What the tree as the query wrote it costs, and how big its result is — the shape it has, which
+/// may be deeper than left-deep. The order this rule picks has to beat this to be worth it.
+fn as_written(plan: &LogicalPlan, equality: NullEquality) -> Result<Option<(Size, u64)>> {
+    let LogicalPlan::Join(j) = plan else { return Ok(size(plan).map(|s| (s, 0))) };
+    if !flat(j, equality) {
+        return Ok(size(plan).map(|s| (s, 0)));
+    }
+    let (Some((l, cl)), Some((r, cr))) = (as_written(&j.left, equality)?, as_written(&j.right, equality)?) else { return Ok(None) };
+    if j.on.is_empty() {
+        return Ok(None);
+    }
+    let rows = join_rows(&l, &r, &j.on);
+    Ok(Some((joined(&l, &r, rows), cl.saturating_add(cr).saturating_add(rows))))
+}
+
+/// What joining them left-deep in this order costs: the rows every step leaves, added up.
+fn rows_moved(leaves: &[LogicalPlan], sizes: &[Size], keys: &[(Expr, Expr)], order: &[usize]) -> Result<Option<u64>> {
+    let (mut built, mut schema, mut total) = (sizes[order[0]].clone(), leaves[order[0]].schema().as_ref().clone(), 0u64);
+    for &i in &order[1..] {
+        let on: Vec<(Expr, Expr)> = connect(keys, &schema, leaves[i].schema())?.into_iter().map(|(_, p)| p).collect();
+        if on.is_empty() {
+            return Ok(None); // a step with nothing to join on: not an order worth trusting
+        }
+        let rows = join_rows(&built, &sizes[i], &on);
+        (built, schema, total) = (joined(&built, &sizes[i], rows), build_join_schema(&schema, leaves[i].schema(), &JoinType::Inner)?, total.saturating_add(rows));
+    }
+    Ok(Some(total))
+}
+
+/// The keys that join `right` to what is built, each written (built side, right side) and with
+/// its place in `keys`, so the caller can take each one exactly once.
+fn connect(keys: &[(Expr, Expr)], left: &DFSchema, right: &DFSchema) -> Result<Vec<(usize, (Expr, Expr))>> {
+    use datafusion::logical_expr::ExprSchemable;
+    let mut on: Vec<(usize, (Expr, Expr))> = vec![];
+    for (k, (l, r)) in keys.iter().enumerate() {
+        let Some(pair) = find_valid_equijoin_key_pair(l, r, left, right)? else { continue };
+        if can_hash(&pair.0.get_type(left)?) && !on.iter().any(|(_, p)| *p == pair) {
+            on.push((k, pair));
+        }
+    }
+    Ok(on)
+}
+
+/// How big a join input is, as well as anything here can say: a table's own count from the
+/// catalog, scaled by the filters above it (a condition keeps about a third of the rows, which is
+/// what DataFusion assumes too), and the column bounds that came with it. `None` where nothing
+/// knows — then the joins are left in the order the query wrote them.
+fn size(plan: &LogicalPlan) -> Option<Size> {
+    let kept = |s: &Size, conds: usize| s.cut((s.rows as f64 * 0.3f64.powi(conds as i32)).ceil() as u64);
+    let groups = |s: &Size| s.cut((s.rows as f64).sqrt().ceil() as u64); // (a grouping's rows: unknowable, but far fewer)
+    let rows = |n: u64| Size { rows: n, distinct: Default::default() };
+    Some(match plan {
+        LogicalPlan::TableScan(s) => {
+            let stats = datafusion::datasource::source_as_provider(&s.source).ok()?.statistics()?;
+            // `column_statistics` covers the table's own schema, not the columns this scan reads.
+            let distinct = s.source.schema().fields().iter().zip(&stats.column_statistics)
+                .filter_map(|(f, c)| Some((f.name().clone(), *c.distinct_count.get_value()? as u64)))
+                .collect();
+            let whole = Size { rows: *stats.num_rows.get_value()? as u64, distinct };
+            kept(&whole, s.filters.len()).cut(whole.rows.min(s.fetch.unwrap_or(usize::MAX) as u64))
+        }
+        LogicalPlan::Filter(f) => kept(&size(&f.input)?, split_conjunction(&f.predicate).len()),
+        LogicalPlan::Projection(p) => size(&p.input)?,
+        LogicalPlan::SubqueryAlias(a) => size(&a.input)?,
+        LogicalPlan::Sort(s) => size(&s.input)?,
+        LogicalPlan::Limit(l) => size(&l.input)?,
+        LogicalPlan::Aggregate(a) if a.group_expr.is_empty() => rows(1),
+        LogicalPlan::Aggregate(a) => groups(&size(&a.input)?),
+        LogicalPlan::Distinct(datafusion::logical_expr::Distinct::All(input)) => groups(&size(input)?),
+        LogicalPlan::Distinct(datafusion::logical_expr::Distinct::On(d)) => groups(&size(&d.input)?),
+        LogicalPlan::Union(u) => rows(u.inputs.iter().map(|i| Some(size(i)?.rows)).sum::<Option<u64>>()?),
+        LogicalPlan::Join(j) => rows(size(&j.left)?.rows.max(size(&j.right)?.rows)),
+        LogicalPlan::Values(v) => rows(v.values.len() as u64),
+        LogicalPlan::EmptyRelation(_) => rows(1),
+        _ => return None,
+    })
 }

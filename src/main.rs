@@ -21,6 +21,7 @@ mod pg;
 mod query;
 mod replica;
 mod server;
+mod spill;
 mod spmd;
 mod store;
 mod tasks;
@@ -260,6 +261,8 @@ async fn main() -> anyhow::Result<()> {
                     }
                 });
             }
+            // Finished shuffles are forgotten here, and what they spilled deleted.
+            every(Duration::from_secs(30), || async { spmd::gc(); Ok(()) });
             if let Some(seq) = &app.seq {
                 inbox::serve(lake.clone(), seq.clone(), app.lock.clone()); // writers that can't reach us
             }
