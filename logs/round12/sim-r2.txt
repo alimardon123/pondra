@@ -1,0 +1,416 @@
+=== tools/harness.py all --s3 ===
+upsert: 404 live keys after 12,000 random upserts/deletes, 6 compactions (s: 1.0, 0.3, 0.6, 0.7, 0.4, 0.5), 1 restart, 3,400 lookups (0 wrong) -> OK
+tiering: 12 rounds -> files {'events': 5, 'kv': 5, 'totals': 5}, untiered rows 0, rows {'events': 1200, 'kv': {'n': 200, 'v': 2400}, 'totals': 1200} -> OK
+fence: 2nd node joined as follower=True; takeover after 11.5s; stale leader's write rejected; it rejoined as follower; rows=[{'producer': 'a', 'n': 200}, {'producer': 'b', 'n': 200}] -> OK
+insert: first={'rows': 5} retry={'duplicate': True} summary={'groups': 5, 'n': 5000} -> OK
+Traceback (most recent call last):
+  File "/home/claude/pondra/tools/harness.py", line 1063, in <module>
+    {"crash": crash, "upsert": upsert, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "scale": scale, "flight": flight, "load": load, "all": all_tests}[A.mode]()
+  File "/home/claude/pondra/tools/harness.py", line 1044, in all_tests
+    out = {t.__name__: t() for t in (upsert, tiering, fence, insert, serverless, clients, kafka, alter, windows, scale, flight, reader, crash)}
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/claude/pondra/tools/harness.py", line 1044, in <dictcomp>
+    out = {t.__name__: t() for t in (upsert, tiering, fence, insert, serverless, clients, kafka, alter, windows, scale, flight, reader, crash)}
+                       ^^^
+  File "/home/claude/pondra/tools/harness.py", line 357, in serverless
+    together = [done(p) for p in [cli(insert) for _ in range(4)]]  # four machines at once, nobody running
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/claude/pondra/tools/harness.py", line 357, in <listcomp>
+    together = [done(p) for p in [cli(insert) for _ in range(4)]]  # four machines at once, nobody running
+                ^^^^^^^
+  File "/home/claude/pondra/tools/harness.py", line 345, in done
+    raise RuntimeError(err[-800:])
+RuntimeError: Error: Closed error: detected newer DB client
+
+Stack backtrace:
+   0: anyhow::error::<impl core::convert::From<E> for anyhow::Error>::from
+   1: pondra::store::Catalog::checkpoint::{{closure}}
+   2: pondra::store::Lake::open::{{closure}}
+   3: pondra::write::from_cli::{{closure}}
+   4: pondra::main::{{closure}}
+   5: tokio::runtime::park::CachedParkThread::block_on
+   6: pondra::main
+   7: std::sys::backtrace::__rust_begin_short_backtrace
+   8: std::rt::lang_start::{{closure}}
+   9: std::rt::lang_start_internal
+  10: main
+
+--- exit 1 ---
+=== tools/harness.py scale --s3 ===
+{
+ "scale": {
+  "bad partition specs refused": true,
+  "files sealed into manifests": true,
+  "every row, every day": true,
+  "one day reads only its files": true,
+  "every file holds one day": true,
+  "three nodes: same answer": true,
+  "shuffles (GROUP BY, joins, windows) = one node": true,
+  "Delta and Iceberg readers see sealed files": true,
+  "over the memory limit: aggregation, sort, join": true
+ },
+ "shuffles": {
+  "many groups": "same, shuffled",
+  "groups, no order": "same, shuffled",
+  "HAVING": "same, shuffled",
+  "string keys": "same, shuffled",
+  "DISTINCT": "same, shuffled",
+  "join, then many groups": "same, shuffled",
+  "join, filters, count": "same",
+  "join, then another key": "same, shuffled",
+  "self-join": "same, shuffled",
+  "count(DISTINCT) per group": "same, shuffled",
+  "window, PARTITION BY": "same, shuffled",
+  "window over all": "same",
+  "global aggregate": "same",
+  "a keyed table": "same, shuffled"
+ },
+ "rows": 23100,
+ "days": 139,
+ "files": {
+  "inline": 69.0,
+  "sealed": 142.0,
+  "parquet_objects": 342,
+  "one_day_scanned": 2.0
+ },
+ "outside_readers": {
+  "delta-rs": 23100,
+  "polars": 23100,
+  "duckdb": 23100,
+  "iceberg/pyiceberg": 23100,
+  "iceberg/polars": 23100,
+  "iceberg/duckdb": 23100
+ },
+ "ok": true
+}
+--- exit 0 ---
+=== tools/open_check.py --s3 ===
+{
+ "lake": "s3://testbucket/test-5f6fb60d",
+ "pondra": {
+  "events": 60000,
+  "kv": 50,
+  "totals": 100,
+  "dims": 100
+ },
+ "external": {
+  "events": {
+   "delta/delta-rs": 60000,
+   "delta/polars": 60000,
+   "delta/duckdb": 60000,
+   "iceberg/pyiceberg": 60000,
+   "iceberg/polars": 60000,
+   "iceberg/duckdb": 60000,
+   "iceberg/rest/pyiceberg": 60000,
+   "iceberg/rest/duckdb": 60000
+  },
+  "kv": {
+   "delta/delta-rs": 50,
+   "delta/polars": 50,
+   "delta/duckdb": 50,
+   "iceberg/pyiceberg": 50,
+   "iceberg/polars": 50,
+   "iceberg/duckdb": 50,
+   "iceberg/rest/pyiceberg": 50,
+   "iceberg/rest/duckdb": 50
+  },
+  "totals": {
+   "delta/delta-rs": 100,
+   "delta/polars": 100,
+   "delta/duckdb": 100,
+   "iceberg/pyiceberg": 100,
+   "iceberg/polars": 100,
+   "iceberg/duckdb": 100,
+   "iceberg/rest/pyiceberg": 100,
+   "iceberg/rest/duckdb": 100
+  },
+  "dims": {
+   "delta/delta-rs": 100,
+   "delta/polars": 100,
+   "delta/duckdb": 100,
+   "iceberg/pyiceberg": 100,
+   "iceberg/polars": 100,
+   "iceberg/duckdb": 100,
+   "iceberg/rest/pyiceberg": 100,
+   "iceberg/rest/duckdb": 100
+  }
+ },
+ "match": true
+}
+--- exit 0 ---
+=== tools/harness.py flight --s3 ===
+/usr/local/lib/python3.11/dist-packages/adbc_driver_manager/dbapi.py:369: Warning: Cannot disable autocommit; conn will not be DB-API 2.0 compliant
+  warnings.warn(
+{
+ "flight": {
+  "DoPut: 10 batches acked": true,
+  "a retried stream is applied once": true,
+  "DoPut to a follower": true,
+  "a read token can't write": true,
+  "DoGet SQL": true,
+  "GetFlightInfo + DoGet": true,
+  "ListFlights": true,
+  "the log, two columns": true,
+  "the log, following": true,
+  "basic-auth handshake": true,
+  "ADBC query": true,
+  "ADBC write as a query, ingest, objects": true,
+  "every row once": true
+ },
+ "follow_ms": 246,
+ "ok": true
+}
+--- exit 0 ---
+=== tools/cluster.py failover --s3 --secs 45 ===
+  killed leader :18080; new leader :18081 accepting writes after 12.4s
+  killed leader :18081; new leader :18082 accepting writes after 12.5s
+failover: 3 nodes, 6 shards, 8 producers, 88100 events, 1 follower + 2 leader kills
+  failovers: 12.4s, 12.5s (kill -> writes acked again); state caught up 0.8s after the last write
+  events exactly once: True (88100 rows); for 1000 users, task state == model: True, inline view == model: True
+  shard runs per node (since each node's last start): {18080: 69, 18081: 53, 18082: 66}
+--- exit 0 ---
+=== tools/metadata_bench.py --files 200000 --publish --s3 ===
+before: {"append_ack_ms": 243.3, "tier_commit_ms": 1873.0, "insert_ms": 407.3, "query_today_ms": 2.8, "entry_bytes": 1940.0}
+added: {"files": 200000, "seconds": 18.4, "record_ms_per_50k_files": 4583, "inline": 64.0, "sealed": 199938.0, "entry_bytes": 16987.0, "table_bytes": 214748365020093.0}
+after: {"append_ack_ms": 199.2, "tier_commit_ms": 1826.7, "insert_ms": 908.1, "query_today_ms": 9.3, "entry_bytes": 18634.0, "publish_ms": 1022, "delta_state_bytes": 7777.0, "iceberg_state_bytes": 27842.0}
+{
+ "before": {
+  "append_ack_ms": 243.3,
+  "tier_commit_ms": 1873.0,
+  "insert_ms": 407.3,
+  "query_today_ms": 2.8,
+  "entry_bytes": 1940.0
+ },
+ "added": {
+  "files": 200000,
+  "seconds": 18.4,
+  "record_ms_per_50k_files": 4583,
+  "inline": 64.0,
+  "sealed": 199938.0,
+  "entry_bytes": 16987.0,
+  "table_bytes": 214748365020093.0
+ },
+ "after": {
+  "append_ack_ms": 199.2,
+  "tier_commit_ms": 1826.7,
+  "insert_ms": 908.1,
+  "query_today_ms": 9.3,
+  "entry_bytes": 18634.0,
+  "publish_ms": 1022,
+  "delta_state_bytes": 7777.0,
+  "iceberg_state_bytes": 27842.0
+ },
+ "today_scanned": 2.0,
+ "today_skipped": 200004.0,
+ "day_2010_files": 29.0,
+ "day_2010_plan_ms": 93.4,
+ "cold_query_ms": 181.5,
+ "three_nodes_ms": 93.1,
+ "checks": {
+  "right answers, before and with 1M more files": true,
+  "today's query opened no fake file": true,
+  "one day of 2010 plans that day's files only": true,
+  "catalog entry stays small (< 256 KB)": true,
+  "published state stays small (< 256 KB)": true,
+  "commits as fast (within 2x + 20 ms)": false,
+  "restarted node answers right": true,
+  "three nodes, manifests dealt out: same answer": true
+ },
+ "ok": false
+}
+--- exit 1 ---
+SIMDONE
+=== tools/harness.py all --s3 (re-run with the fenced-writer retry) ===
+upsert: 397 live keys after 12,000 random upserts/deletes, 6 compactions (s: 1.1, 0.6, 0.3, 0.6, 0.5, 0.6), 1 restart, 3,400 lookups (0 wrong) -> OK
+tiering: 12 rounds -> files {'events': 5, 'kv': 5, 'totals': 5}, untiered rows 0, rows {'events': 1200, 'kv': {'n': 200, 'v': 2400}, 'totals': 1200} -> OK
+fence: 2nd node joined as follower=True; takeover after 11.4s; stale leader's write rejected; it rejoined as follower; rows=[{'producer': 'a', 'n': 200}, {'producer': 'b', 'n': 200}] -> OK
+insert: first={'rows': 5} retry={'duplicate': True} summary={'groups': 5, 'n': 5000} -> OK
+{"serverless": {"alone_s": 5.42, "retry": ["{\"rows\":1000}", "{\"duplicate\":true}"], "four_at_once": ["{\"rows\":1000}", "{\"rows\":1000}", "{\"rows\":1000}", "{\"rows\":1000}"], "node_start_s": 4.75, "node_leads": true, "via_node_s": 1.55, "after_leader_killed_s": 35.16, "rows": {"n": 8000, "ids": 1000}, "ok": true}}
+{
+ "clients": {
+  "no token -> 401": true,
+  "read token can't write": true,
+  "write token can't create": true,
+  "users via SQL": true,
+  "pandas / polars / list appends": true,
+  "lookup": true,
+  "change feed replay (upserts + delete)": true,
+  "psycopg 3": true,
+  "psycopg 3 binary": true,
+  "psycopg2": true,
+  "SQLAlchemy + pandas": true,
+  "asyncpg": true,
+  "wrong password refused": true,
+  "cross-lake join": true,
+  "inbox write": true,
+  "vector search (SQL + Postgres)": true,
+  "SQL can't touch the node's files": true,
+  "MCP": true
+ },
+ "inbox_s": 5.39,
+ "ok": true
+}
+/home/claude/pondra/tools/harness.py:1044: DeprecationWarning: value_serializer does not implement kafka.serializer.Serializer
+  out = {t.__name__: t() for t in (upsert, tiering, fence, insert, serverless, clients, kafka, alter, windows, scale, flight, reader, crash)}
+%3|1790119866.470|FAIL|rdkafka#producer-10| [thrd:sasl_plaintext://127.0.0.1:8110/bootstrap]: sasl_plaintext://127.0.0.1:8110/bootstrap: SASL authentication error: wrong user name or password (after 0ms in state AUTH_REQ)
+%3|1790119866.710|FAIL|rdkafka#producer-10| [thrd:sasl_plaintext://127.0.0.1:8110/bootstrap]: sasl_plaintext://127.0.0.1:8110/bootstrap: SASL authentication error: wrong user name or password (after 0ms in state AUTH_REQ, 1 identical error(s) suppressed)
+%5|1790119869.472|PARTCNT|rdkafka#producer-11| [thrd:sasl_plaintext://127.0.0.1:8110/2111747765]: Topic events (id AAAAAAAAAAAAAAAAAAAAAA) partition count changed from 1 to 0
+{
+ "kafka": {
+  "librdkafka (5 codecs, idempotent) + kafka-python": true,
+  "a view fed by Kafka": true,
+  "exactly-once retries (idempotent producer)": true,
+  "Debezium events and tombstones": true,
+  "raw values (_value), queried as JSON": true,
+  "kafka-python consumer (upserts, deletes as tombstones)": true,
+  "librdkafka consumer": true,
+  "consumer groups (commit, hand-over via a follower, one holder)": true,
+  "wrong password / read token refused": true
+ },
+ "librdkafka_20k_events_s": 4.09,
+ "ok": true
+}
+%6|1790119869.481|FAIL|rdkafka#producer-11| [thrd:sasl_plaintext://127.0.0.1:8110/2111747765]: sasl_plaintext://127.0.0.1:8110/2111747765: Disconnected: connection closed by peer: receive 0 after POLLIN (after 9ms in state UP)
+{
+ "alter": {
+  "old and new rows": true,
+  "the new column": true,
+  "a view over the table": true,
+  "a keyed table": true,
+  "lookup": true,
+  "IF NOT EXISTS": true,
+  "a clash is refused": true,
+  "Delta and Iceberg readers": true
+ },
+ "rows_written_during": 2600,
+ "outside_readers": {
+  "delta-rs": 2603,
+  "polars": 2603,
+  "duckdb": 2603,
+  "iceberg/pyiceberg": 2603,
+  "iceberg/polars": 2603,
+  "iceberg/duckdb": 2603
+ },
+ "ok": true
+}
+{
+ "windows": {
+  "closed windows only": true,
+  "each window once, final": true,
+  "late row: in the view, not re-emitted": true
+ },
+ "ok": true
+}
+{
+ "scale": {
+  "bad partition specs refused": true,
+  "files sealed into manifests": true,
+  "every row, every day": true,
+  "one day reads only its files": true,
+  "every file holds one day": true,
+  "three nodes: same answer": true,
+  "shuffles (GROUP BY, joins, windows) = one node": true,
+  "Delta and Iceberg readers see sealed files": true,
+  "over the memory limit: aggregation, sort, join": true
+ },
+ "shuffles": {
+  "many groups": "same, shuffled",
+  "groups, no order": "same, shuffled",
+  "HAVING": "same, shuffled",
+  "string keys": "same, shuffled",
+  "DISTINCT": "same, shuffled",
+  "join, then many groups": "same, shuffled",
+  "join, filters, count": "same",
+  "join, then another key": "same, shuffled",
+  "self-join": "same, shuffled",
+  "count(DISTINCT) per group": "same, shuffled",
+  "window, PARTITION BY": "same, shuffled",
+  "window over all": "same",
+  "global aggregate": "same",
+  "a keyed table": "same, shuffled"
+ },
+ "rows": 23100,
+ "days": 139,
+ "files": {
+  "inline": 69.0,
+  "sealed": 142.0,
+  "parquet_objects": 343,
+  "one_day_scanned": 2.0
+ },
+ "outside_readers": {
+  "delta-rs": 23100,
+  "polars": 23100,
+  "duckdb": 23100,
+  "iceberg/pyiceberg": 23100,
+  "iceberg/polars": 23100,
+  "iceberg/duckdb": 23100
+ },
+ "ok": true
+}
+/usr/local/lib/python3.11/dist-packages/adbc_driver_manager/dbapi.py:369: Warning: Cannot disable autocommit; conn will not be DB-API 2.0 compliant
+  warnings.warn(
+{
+ "flight": {
+  "DoPut: 10 batches acked": true,
+  "a retried stream is applied once": true,
+  "DoPut to a follower": true,
+  "a read token can't write": true,
+  "DoGet SQL": true,
+  "GetFlightInfo + DoGet": true,
+  "ListFlights": true,
+  "the log, two columns": true,
+  "the log, following": true,
+  "basic-auth handshake": true,
+  "ADBC query": true,
+  "ADBC write as a query, ingest, objects": true,
+  "every row once": true
+ },
+ "follow_ms": 171,
+ "ok": true
+}
+reader: send -> visible on a separate read-only node: p50 202 ms, p99 607 ms
+run  1: kill-9=1 injected={'after_seg_put': 0, 'after_commit': 1, 'after_parquet_put': 15} events=9000/9000 unique=9000 task_output=4500/4500 views=exact -> OK
+run  2: kill-9=0 injected={'after_seg_put': 0, 'after_commit': 3, 'after_parquet_put': 15} events=9000/9000 unique=9000 task_output=4500/4500 views=exact -> OK
+run  3: kill-9=1 injected={'after_seg_put': 0, 'after_commit': 0, 'after_parquet_put': 13} events=9000/9000 unique=9000 task_output=4500/4500 views=exact -> OK
+run  4: kill-9=0 injected={'after_seg_put': 0, 'after_commit': 0, 'after_parquet_put': 9} events=9000/9000 unique=9000 task_output=4500/4500 views=exact -> OK
+run  5: kill-9=2 injected={'after_seg_put': 0, 'after_commit': 1, 'after_parquet_put': 17} events=9000/9000 unique=9000 task_output=4500/4500 views=exact -> OK
+{
+ "events_per_s": 810,
+ "ack_ms_p50": 299,
+ "ack_ms_p99": 887,
+ "freshness_ms_p50": 343,
+ "freshness_ms_p99": 978,
+ "freshness_samples": 29,
+ "commits_per_s": 3.6,
+ "commit_ms_p50": 226,
+ "commit_ms_p95": 576,
+ "server_cores_used": 0.05
+}
+{
+ "upsert": "12,000 random upserts/deletes with compactions and a restart match the model exactly (397 live keys)",
+ "tiering": "12 rounds of writes and tiering: log drained, files bounded ({'events': 5, 'kv': 5, 'totals': 5}), every row exact",
+ "fence": "a frozen leader is replaced; when it wakes, its write is rejected (fenced) and it rejoins as a follower; nothing lost",
+ "insert": "bulk INSERT \u2026 SELECT writes Parquet directly; a retried job id is applied once",
+ "serverless": "INSERT from a process with no server: 5.42s alone, 4 at once, retries once; a node on the idle lake leads in 4.75s; via a running leader 1.55s; after the leader is killed 35.16s; 8000 rows, no duplicates",
+ "clients": "SQL writes, Python client, Postgres (4 drivers), tokens, change-feed replay, attached lake, inbox (5.4s), vector search, MCP, no file access from SQL: all 18 checks pass",
+ "kafka": "Kafka: librdkafka (5 codecs, idempotent) and kafka-python producers, exactly-once retries, Debezium, tombstones, raw values as JSON, consumers, consumer groups, SASL tokens: all 9 checks pass",
+ "alter": "ALTER TABLE ADD COLUMN under load (2,600 rows written meanwhile): old rows null, new ones set, keyed table, view, bulk and Arrow appends, 6 outside readers: all 8 checks pass",
+ "windows": "event-time windows: each emitted once, final, after the watermark; late rows update the view only; a leader restart emits nothing twice",
+ "scale": "scale: 23,100 rows over 139 daily partitions, 211 files (142 sealed), every file one day, a day's query reads 2 files, 3 nodes, 11 of 14 queries shuffled (all equal to one node), 6 outside readers, a 50 MB memory limit: all 9 checks pass",
+ "flight": "Arrow Flight: pyarrow DoPut exactly-once (retried stream applied once, via a follower too), DoGet SQL, FlightInfo, ListFlights, the log as a columnar stream (a subscriber has each new commit in 171 ms), tokens and handshake; ADBC queries, writes, ingest and catalog: all 13 checks pass",
+ "reader": "freshness on a separate read-only node: p50 202 ms, p99 607 ms",
+ "crash": "5/5 runs, 0 lost, 0 duplicated (events, streaming-task output, views); crashes survived: {'after_seg_put': 0, 'after_commit': 5, 'after_parquet_put': 69, 'kill -9': 4}",
+ "load": {
+  "events_per_s": 810,
+  "ack_ms_p50": 299,
+  "ack_ms_p99": 887,
+  "freshness_ms_p50": 343,
+  "freshness_ms_p99": 978,
+  "freshness_samples": 29,
+  "commits_per_s": 3.6,
+  "commit_ms_p50": 226,
+  "commit_ms_p95": 576,
+  "server_cores_used": 0.05
+ }
+}
+--- exit 0 ---

@@ -1,0 +1,3 @@
+== sizes (cargo build --profile dist; one node with --kafka --flight --pg, idle 8 s)
+binary: 95944800 bytes (95.9 MB); gzip -9: 32409914 (32.4 MB); xz -9: 18236724 (18.2 MB)
+idle RSS: 40112 kB

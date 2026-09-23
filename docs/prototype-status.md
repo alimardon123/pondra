@@ -1,6 +1,6 @@
 # Prototype status: Pondra, a streamhouse in one binary
 
-**Date:** 2026-09-22 (round 11) · **Plan:** ADR-002 to ADR-012 · **Code:** `pondra.zip` / `pondra.bundle` (≈8,800 lines of Rust, plus a Python client and test and benchmark tools)
+**Date:** 2026-09-23 (round 12) · **Plan:** ADR-002 to ADR-013 · **Code:** `pondra.zip` / `pondra.bundle` (≈10,100 lines of Rust, plus a Python client and test and benchmark tools)
 **Name:** the prototype formerly called `lh` is now **Pondra**. The name is free on crates.io, PyPI and npm. A small personal-finance app uses it (pondra.app), a different category; run a trademark search before a public launch.
 
 ## Where it stands
@@ -14,6 +14,46 @@ One Rust binary replaces the Kafka + Flink + Spark + metastore + ZooKeeper stack
 - upsert and merge tables.
 
 Start more copies on the same bucket to scale out. The only state is object storage. There's no JVM, no database server and no coordination service.
+
+**Round 12 made one node fast, gave columns something other than numbers to hold, and made
+publishing cost what changed** (ADR-013):
+
+1. **TPC-H on one machine, against the single-node engines** (SF1 and SF10, 2 cores, 8 GB, best of
+   three, every answer checked against DuckDB's):
+
+   | From Parquet files | SF1 | SF10 | | From memory | SF1 | SF10 |
+   |---|---|---|---|---|---|---|
+   | **Pondra** | **3.19 s** | **38.0 s** | | **Pondra** (hot columns) | **1.96 s** | **35.9 s** |
+   | DuckDB | 3.36 s | 39.8 s | | DuckDB (native tables) | 1.80 s | no room on this machine |
+   | Polars | 3.78 s | q9 out of memory | | | | |
+   | Polars (streaming) | 3.18 s | 42.8 s | | | | |
+   | Daft | 6.11 s | 89.0 s | | | | |
+   | Bodo | 8 queries differ, 1 crash, minutes each | — | | | | |
+
+   Round 11 ran SF1 in 6.45 s against DuckDB's 4.18 s on the same files. What closed the gap:
+   strings read as views, LZ4 instead of ZSTD, decimal literals, three planning rules of Pondra's
+   own (a semi join runs on the table it filters; a grouped subquery groups only the keys the join
+   keeps; a filter's conditions run cheapest first) and one physical rule (the groups a HAVING
+   keeps make the hash table). The "from memory" column is the columns queries read lately, kept
+   decoded in memory (`hot.rs`) — DuckDB's own trick, reported separately.
+2. **Anything in a column.** Files in the lake (`PUT /files/…`, `files('photos/')`,
+   `file_read(path)`), `BINARY` with `byte_length`/`sha256`/`md5`/`encode`, `VARIANT` for
+   semi-structured text, `Float32[]` vectors with `cosine_similarity`/`l2_distance`/`dot_product`
+   (published as a Delta array and an Iceberg list; delta-rs, DuckDB, Polars and PyIceberg read
+   them back), `ai_complete`/`ai_embed` against any OpenAI-compatible endpoint, and functions of
+   your own on an Arrow Flight server (`tools/udf_server.py`: forty lines of Python).
+3. **Publishing that costs what changed.** Delta and Iceberg metadata is now derived from Pondra's
+   immutable manifests: one Iceberg manifest per Pondra manifest, and a Delta state that names
+   manifests instead of files. A table of **a million files** published in both formats keeps a
+   20 KB catalog entry, a 24 KB Delta state and a 70 KB Iceberg state, and a publish round takes
+   **17 ms**; at 20,000 files the first publish (20,001 adds) takes 0.33 s and the next 1 ms.
+4. **Memory that holds.** The hot columns come out of the query budget and are given back when the
+   node's own memory runs high; merge jobs are bounded in size and number; the query budget
+   defaults to a third of RAM (it was half) because Parquet decoding and the batches in flight
+   are not counted in it. Before these, TPC-H SF10 could take a node down.
+5. **Orphan collection in a few megabytes** (a Bloom filter of the paths in use, ten bits each),
+   and a node stopped with Ctrl-C or SIGTERM hands leadership over at once instead of leaving the
+   next one to wait out the lease.
 
 **Round 11 took on what stood between it and petabyte tables** (ADR-012):
 
@@ -663,8 +703,14 @@ Limits: producer names must be unique per client; there is no auth or per-user q
 
 ## Tests
 
-Every test runs on local disk, on a local S3 server with R2-like latency, and (this round) against
-a real Cloudflare R2 bucket. All of them pass on all three.
+Every test runs on local disk, on a local S3 server with R2-like latency, and against a real
+Cloudflare R2 bucket. All of them pass on all three.
+
+Round 12's runs are in `logs/round12/`: the suite on local disk (`local.txt`, `harness-all.txt`),
+on the R2 simulator (`sim-r2.txt`), and on a real R2 bucket (`r2.txt`: the eight outside readers
+of Delta and Iceberg, partitions and manifests, the clients, upsert against a model, and 2.4 M
+events through eleven `kill -9`s), plus TPC-H against DuckDB, Polars, Daft and Bodo
+(`tpch-sf1.json`, `tpch-sf10.json`) and the binary's size (`sizes.txt`).
 
 | Test | Local disk | Real R2 |
 |---|---|---|
@@ -683,12 +729,12 @@ a real Cloudflare R2 bucket. All of them pass on all three.
 
 ## Sizes
 
-| What | Round 3 | Round 5 | Round 8 | Round 9 | Round 10 | Round 11 |
-|---|---|---|---|---|---|---|
-| Binary (stripped) | 88.3 MB (30 MB gzip, 17 MB xz) | 89.2 MB (29.9 MB gzip, 16.8 MB xz) | 90.0 MB (30.5 MB gzip, 18.7 MB xz) | 90.7 MB (30.5 MB gzip, 17.2 MB xz), with the Postgres protocol and MCP | 93.0 MB (31.4 MB gzip, 17.6 MB xz), with the Kafka protocol and JSON functions | 95.0 MB (32.0 MB gzip, 18.0 MB xz), with Arrow Flight (gRPC) |
-| Idle memory | 18 MB | 41 MB (mimalloc reserves more up front) | 42 MB | 44 MB | 49 MB (with `--kafka`) | 42 MB (with `--kafka --flight --pg`) |
-| Peak memory under full load | 455 MB | 1.8 GB at 2.84 M events/s sustained (279–586 MB in the batch and streaming benchmarks) | not re-measured | not re-measured | not re-measured | bounded for queries by `--memory-gb` |
-| Storage per event (user, event, amount, ts) | NDJSON 77.9 B → log 12.8 B → Parquet 6.8 B | NDJSON 77.9 B → log 12.8 B → Parquet 6.8 B (unchanged) | unchanged | unchanged | unchanged | unchanged |
+| What | Round 3 | Round 5 | Round 8 | Round 9 | Round 10 | Round 11 | Round 12 |
+|---|---|---|---|---|---|---|---|
+| Binary (stripped) | 88.3 MB (30 MB gzip, 17 MB xz) | 89.2 MB (29.9 MB gzip, 16.8 MB xz) | 90.0 MB (30.5 MB gzip, 18.7 MB xz) | 90.7 MB (30.5 MB gzip, 17.2 MB xz), with the Postgres protocol and MCP | 93.0 MB (31.4 MB gzip, 17.6 MB xz), with the Kafka protocol and JSON functions | 95.0 MB (32.0 MB gzip, 18.0 MB xz), with Arrow Flight (gRPC) | 95.9 MB (32.4 MB gzip, 18.2 MB xz), with hashing, base64, files, vectors and AI functions |
+| Idle memory | 18 MB | 41 MB (mimalloc reserves more up front) | 42 MB | 44 MB | 49 MB (with `--kafka`) | 42 MB (with `--kafka --flight --pg`) | 39 MB (with `--kafka --flight --pg`) |
+| Peak memory under full load | 455 MB | 1.8 GB at 2.84 M events/s sustained (279–586 MB in the batch and streaming benchmarks) | not re-measured | not re-measured | not re-measured | bounded for queries by `--memory-gb` | as before, plus the decoded columns (`PONDRA_HOT_GB`, a quarter of the query budget), which are given back when the node's own memory runs high |
+| Storage per event (user, event, amount, ts) | NDJSON 77.9 B → log 12.8 B → Parquet 6.8 B | NDJSON 77.9 B → log 12.8 B → Parquet 6.8 B (unchanged) | unchanged | unchanged | unchanged | unchanged | Parquet files are LZ4 now, about a third bigger than ZSTD's and much cheaper to read (`PONDRA_CODEC=zstd` to go back) |
 
 ## Memory is a knob, not a mystery
 
@@ -739,8 +785,13 @@ peak at 279–586 MB.
 - Distributed queries shuffle (round 11), but their buckets and results are held in memory,
   a failed step fails the query (it then runs on one node), and there's no skew handling.
   Nothing has run on several machines yet; `tools/cloud/` is the kit.
-- Publishing a huge table to Delta or Iceberg rewrites a manifest of every file per version:
-  fine for big tables, not yet for millions of files (native reads are).
+- Joins run in the order the query names them, with the build side chosen by size at the physical
+  level: there is no cost-based join reordering (TPC-H q7 is where this shows).
+- Files written in key order aren't declared as sorted, so an aggregation on that key hashes
+  rather than streams.
+- The columns kept decoded in memory (`hot.rs`) are a cache of what was read, not a policy: no
+  pinning a table in memory, and nothing is loaded before a second read asks for it.
+- `VARIANT` is JSON text (`json_get` parses at read time), not a shredded variant type.
 - Under sustained overload, commits pause until tiering catches up (`--backlog`); a client with a
   short timeout will see it as a slow ack.
 - Tokens per role only (round 9): no TLS, per-table grants, quotas or multi-tenancy.
@@ -755,8 +806,9 @@ From the plan in `docs/comparison-spark-flink-fluss.md`, in order:
 
 1. **A multi-machine run** with `tools/cloud/` (3–10 VMs on S3/R2), TPC-H SF100 against Spark.
 2. **Shuffles that stream and spill**, with a failed step retried alone; skew handling.
-3. **Publishing big tables** from Pondra's manifests.
+3. **Cost-based join order**, and sorted data declared as sorted (streaming aggregation, merge
+   joins, `ORDER BY` without a sort).
 4. **Kafka partitions** and transactions; the Java client and Kafka Connect verified.
-5. **AI functions in SQL** and an approximate vector index.
+5. **An approximate vector index**, and `VARIANT` as a real type once Arrow has one.
 6. **TLS, per-table grants, an audit log, quotas.**
 7. **Session windows**, a watermark from event time, point-in-time joins.

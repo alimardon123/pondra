@@ -40,6 +40,9 @@ pub async fn render(app: &App) -> anyhow::Result<String> {
     let (reserved, limit) = app.lake.memory();
     metric("memory_limit_bytes", "gauge", "query memory limit (spills beyond it)", &one(limit as f64));
     metric("memory_reserved_bytes", "gauge", "query memory in use", &one(reserved as f64));
+    let (hot, hot_max) = app.lake.hot.usage();
+    metric("hot_bytes", "gauge", "decoded columns kept in memory (hot.rs)", &one(hot as f64));
+    metric("hot_limit_bytes", "gauge", "the most the hot columns may hold (PONDRA_HOT_GB)", &one(hot_max as f64));
     let rss = std::fs::read_to_string("/proc/self/statm").ok().and_then(|s| s.split_whitespace().nth(1)?.parse::<f64>().ok());
     metric("resident_bytes", "gauge", "resident memory of the process", &one(rss.unwrap_or(0.0) * 4096.0));
     if let Some(seq) = &app.seq {
@@ -64,5 +67,13 @@ pub async fn render(app: &App) -> anyhow::Result<String> {
     metric("table_rows", "gauge", "rows in Parquet files", &rows);
     metric("table_bytes", "gauge", "bytes of Parquet files", &bytes);
     metric("table_entry_bytes", "gauge", "size of the table's catalog entry (what every commit to it writes)", &entry);
+    // What publishing a table in an open format keeps (it names manifests, not files: ADR-012).
+    let mut published = vec![];
+    for (format, prefix) in [("delta", "x/"), ("iceberg", "i/")] {
+        for (key, v) in app.lake.cat.scan::<serde_json::Value>(prefix, &format!("{prefix}\u{10ffff}")).await? {
+            published.push((format!("{{table=\"{}\",format=\"{format}\"}}", &key[prefix.len()..]), crate::store::json(&v).len() as f64));
+        }
+    }
+    metric("published_state_bytes", "gauge", "size of what the catalog keeps about a published table", &published);
     Ok(out)
 }

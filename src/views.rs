@@ -46,7 +46,7 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, emit: Option<Emit>) -> R
     ensure!(lake.cat.get::<TableMeta>(&table_key(&source)).await?.is_some(), "no table {source}");
     let plan = session(lake, sql, "").await?.sql(sql).await?.logical_plan().clone();
     let (key, merge) = merges(&plan)?;
-    let columns = plan.schema().fields().iter().map(|f| (f.name().clone(), f.data_type().to_string())).collect();
+    let columns = plan.schema().fields().iter().map(|f| (f.name().clone(), crate::query::type_name(f.data_type()))).collect();
     let meta = TableMeta { columns, key, merge, publish: default_publish(), ..Default::default() };
     let mut puts = vec![(view_key(name), json(&View { source, sql: sql.into(), emit: emit.clone() })), (table_key(name), json(&meta))];
     if let Some(e) = &emit {

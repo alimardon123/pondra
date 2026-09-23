@@ -91,7 +91,7 @@ fn text(v: &ScalarValue) -> Option<String> {
 }
 
 fn orderable(t: &DataType) -> bool {
-    t.is_integer() || t.is_floating() || matches!(t, DataType::Utf8 | DataType::Date32 | DataType::Date64 | DataType::Timestamp(..) | DataType::Decimal128(..) | DataType::Boolean)
+    t.is_integer() || t.is_floating() || matches!(t, DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8 | DataType::Date32 | DataType::Date64 | DataType::Timestamp(..) | DataType::Decimal128(..) | DataType::Boolean)
 }
 
 /// The ranges covering all of `parts` (a column missing from any of them has no range).

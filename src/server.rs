@@ -11,7 +11,7 @@ use axum::extract::{Path, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use datafusion::arrow::ipc::reader::StreamReader;
 use datafusion::arrow::{compute::concat_batches, json as arrow_json, record_batch::RecordBatch, util::pretty::pretty_format_batches};
@@ -104,6 +104,7 @@ pub fn router(app: App) -> Router {
         .route("/tables/{name}", post(create_table))
         .route("/views/{name}", post(create_view))
         .route("/tasks/{name}", post(create_task))
+        .route("/functions/{name}", post(create_function).delete(drop_function))
         .route("/tier", post(tier_now))
         .route_layer(middleware::from_fn_with_state(app.clone(), to_leader));
     Router::new()
@@ -113,8 +114,10 @@ pub fn router(app: App) -> Router {
         .route("/cluster/files", post(files))
         .route("/sql", post(sql))
         .route("/mcp", post(crate::mcp::handle))
+        .route("/files/{*path}", put(put_file).get(get_file))
         .route("/lookup/{name}/{key}", get(lookup))
         .route("/watch/{name}", get(watch))
+        .route("/functions", get(list_functions))
         .route("/stats", get(stats))
         .route("/metrics", get(|State(app): State<App>| async move { crate::metrics::render(&app).await.map_err(E) }))
         .route("/cluster/commit", post(commit))
@@ -133,11 +136,49 @@ pub fn router(app: App) -> Router {
         .with_state(app)
 }
 
+/// `POST /functions/<name>`: a function this lake has, run by an Arrow Flight server of your own
+/// (see `udf.rs`): `{"flight": "http://host:port", "args": ["Binary"], "returns": "Utf8"}`.
+/// `DELETE /functions/<name>` takes it away; `GET /functions` lists them.
+async fn create_function(State(app): State<App>, Path(name): Path<String>, body: Bytes) -> Result<Json<Value>, E> {
+    let udf: crate::udf::Udf = serde_json::from_slice(&body).map_err(|e| E(anyhow::anyhow!("{e}: {{\"flight\": \"http://host:port\", \"args\": [\"Binary\"], \"returns\": \"Utf8\"}}")))?;
+    for t in udf.args.iter().chain([&udf.returns]) {
+        crate::query::dtype(t)?;
+    }
+    app.lake.cat.commit(vec![(crate::udf::key(&name), serde_json::to_vec(&udf)?)], &[]).await?;
+    Ok(Json(j!({"function": name})))
+}
+
+async fn drop_function(State(app): State<App>, Path(name): Path<String>) -> Result<Json<Value>, E> {
+    app.lake.cat.commit(vec![], &[crate::udf::key(&name)]).await?;
+    Ok(Json(j!({"dropped": name})))
+}
+
+/// `PUT /files/<path>`: an object in the lake next to the tables — an image, a PDF, a model —
+/// for `files('…')` to list and `file_read(path)` to read (see `files.rs`). Objects are never
+/// overwritten: a path that exists is an error.
+async fn put_file(State(app): State<App>, Path(path): Path<String>, body: Bytes) -> Result<Json<Value>, E> {
+    let (path, bytes) = (format!("files/{}", path.trim_start_matches('/')), body.len());
+    app.lake.put(&path, body.to_vec()).await?;
+    Ok(Json(j!({"path": path, "bytes": bytes})))
+}
+
+/// `GET /files/<path>`: that object's bytes.
+async fn get_file(State(app): State<App>, Path(path): Path<String>) -> Result<Response, E> {
+    let bytes = app.lake.object(&format!("files/{}", path.trim_start_matches('/'))).await?;
+    Ok(([("content-type", "application/octet-stream")], bytes).into_response())
+}
+
+/// `GET /functions`: the lake's own functions, by name.
+async fn list_functions(State(app): State<App>) -> Result<Json<Value>, E> {
+    let fns = app.lake.cat.scan::<crate::udf::Udf>("f/", "f0").await?;
+    Ok(Json(j!(fns.into_iter().map(|(k, u)| (k[2..].to_string(), serde_json::to_value(u).unwrap_or_default())).collect::<serde_json::Map<_, _>>())))
+}
+
 /// Tokens (see `auth.rs`): the caller's role must cover the route; handlers see it too.
 async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response {
     let token = req.headers().get("authorization").and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer "));
     let role = app.auth.role(token);
-    if role < crate::auth::Auth::needed(req.uri().path()) {
+    if role < crate::auth::Auth::needed(req.uri().path(), req.method().as_str()) {
         return (StatusCode::UNAUTHORIZED, "this needs a token with more rights").into_response();
     }
     req.extensions_mut().insert(role);

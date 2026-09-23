@@ -49,8 +49,11 @@ Turning a format off deletes its metadata, so nobody reads a stale copy.
 │   └── <id>.out                the leader's answer (deleted by the writer, or after an hour)
 ├── log/<ms>-<uuid>.seg         the log tail: flushes over 64 KB (1 MB with --ack replicated),
 │                               Arrow IPC stream + ZSTD; smaller ones ride inside the catalog commit
+├── files/                      objects put there with PUT /files/<path>: images, PDFs, models —
+│                               what a table's rows point at (files('…'), file_read(path))
 └── data/<table>/               one folder per table (views and task outputs are tables too)
-    ├── <uuid>.parquet          the table's rows (Parquet, ZSTD; keyed tables sorted by key, with
+    ├── <uuid>.parquet          the table's rows (Parquet, LZ4 by default — PONDRA_CODEC=zstd for
+    │                           smaller files; keyed tables sorted by key, with
     │                           bloom filters on the key; `cluster_by` tables sorted by those columns;
     │                           `partition_by` tables: one partition value per file)
     ├── _manifests/             append tables past 128 files: the older files' list (zstd JSON)
@@ -73,10 +76,11 @@ Turning a format off deletes its metadata, so nobody reads a stale copy.
 | `cluster/alive/` | empty; its timestamp is what counts | Pondra | rewritten every 10 s by the leader; a one-off writer deletes its own when done |
 | `inbox/` | JSON requests (a flush as its binary body), JSON answers | the leader | each request deleted once answered; answers deleted by the writer (unclaimed ones after an hour) |
 | `log/` | Arrow IPC stream + ZSTD, one per large flush (rows of any tables) | Pondra | immutable; deleted once tiered and older than `--retain-secs`, or `--changelog-secs` if longer (the change feed) |
-| `data/<table>/*.parquet` | Parquet, ZSTD | anyone | immutable; replaced files deleted after `--retain-secs` |
+| `data/<table>/*.parquet` | Parquet, LZ4 (`PONDRA_CODEC=zstd\|snappy\|none`) | anyone | immutable; replaced files deleted after `--retain-secs` |
+| `files/` | whatever was put there (images, PDFs, audio, models) | anyone | immutable: a path that exists is never overwritten |
 | `data/<table>/_manifests/` | zstd JSON: manifests (a list of `DataFile`s) and manifest lists (each manifest's path, files, rows, bytes, column ranges) | Pondra | immutable; a replaced list and merged manifests go to the table's garbage, deleted after `--retain-secs` |
 | `data/<table>/_delta_log/` | Delta Lake protocol 1/2: JSON commits, Parquet checkpoints | Delta readers | append-only; `_last_checkpoint` rewritten; last 1,000 versions kept |
-| `data/<table>/metadata/` | Iceberg v2: metadata JSON, Avro manifest lists and manifests | Iceberg readers | append-only; `version-hint.text` rewritten; last 100 snapshots kept |
+| `data/<table>/metadata/` | Iceberg v2: metadata JSON, Avro manifest lists and manifests — one manifest per Pondra manifest, written once and named by every later snapshot | Iceberg readers | append-only; `version-hint.text` rewritten; last 100 snapshots kept |
 
 Not in the lake, on each node:
 

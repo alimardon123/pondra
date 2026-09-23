@@ -14,8 +14,42 @@ use futures::{StreamExt, TryStreamExt};
 use std::sync::Arc;
 
 pub fn schema(columns: &[(String, String)]) -> Result<SchemaRef> {
-    let fields = columns.iter().map(|(n, t)| Ok(Field::new(n, t.parse::<DataType>()?, true)));
+    let fields = columns.iter().map(|(n, t)| Ok(Field::new(n, dtype(t)?, true)));
     Ok(Arc::new(Schema::new(fields.collect::<Result<Vec<_>>>()?)))
+}
+
+/// A column's type by name: Arrow's own (`Utf8`, `Int64`, `Timestamp(Microsecond, None)`,
+/// `Binary`), `T[]` for a list of T (`Float32[]`: an embedding), and `VARIANT`/`JSON` for
+/// semi-structured text, which is stored as a string and read with `json_get(…)`, `->` and `->>`.
+pub fn dtype(t: &str) -> Result<DataType> {
+    let t = t.trim();
+    Ok(match t.strip_suffix("[]") {
+        Some(item) => DataType::List(Arc::new(Field::new("item", dtype(item)?, true))),
+        None => match t.to_uppercase().as_str() {
+            "VARIANT" | "JSON" => DataType::Utf8,
+            _ => t.parse::<DataType>().map_err(|e| anyhow::anyhow!("unknown column type {t}: {e}"))?,
+        },
+    })
+}
+
+/// The name a table's columns record a type under (what `dtype` reads back).
+pub fn type_name(t: &DataType) -> String {
+    match crate::write::stored(t) {
+        DataType::List(f) | DataType::LargeList(f) | DataType::FixedSizeList(f, _) => format!("{}[]", type_name(f.data_type())),
+        t => t.to_string(),
+    }
+}
+
+/// A table's columns as queries read them: strings as views (Utf8View), so scans don't copy them
+/// and string filters and joins take their fast paths (TPC-H runs about 8% faster). Tables store
+/// plain Utf8 (see `schema`).
+pub fn read_schema(columns: &[(String, String)]) -> Result<SchemaRef> {
+    let stored = schema(columns)?;
+    let fields = stored.fields().iter().map(|f| match f.data_type() {
+        DataType::Utf8 => Arc::new(f.as_ref().clone().with_data_type(DataType::Utf8View)),
+        _ => f.clone(),
+    });
+    Ok(Arc::new(Schema::new(fields.collect::<Vec<_>>())))
 }
 
 /// `b` with `s`'s columns, by name: older rows (written before an ALTER TABLE … ADD COLUMN) get
@@ -86,20 +120,18 @@ pub async fn raw(lake: &Lake, ctx: &SessionContext, name: &str, meta: &TableMeta
 /// newer file's rows above an older one's, and log rows ((segment << 32) + position) above both.
 /// Other tables read all their files as one (merge tables combine rows in any order).
 pub async fn sources(lake: &Lake, ctx: &SessionContext, name: &str, meta: &TableMeta, upto: Option<u64>) -> Result<(Option<DataFrame>, Vec<DataFrame>)> {
-    let (schema, keyed, upsert) = (schema(&meta.columns)?, !meta.key.is_empty(), !meta.key.is_empty() && meta.merge.is_empty());
-    let opts = || ParquetReadOptions::default().schema(&schema);
-    let path = |f: &DataFile| lake.full(&f.path);
+    let (schema, keyed, upsert) = (read_schema(&meta.columns)?, !meta.key.is_empty(), !meta.key.is_empty() && meta.merge.is_empty());
     let mut files = vec![];
     if upsert {
-        let mut by_ord: std::collections::BTreeMap<u64, Vec<String>> = Default::default();
+        let mut by_ord: std::collections::BTreeMap<u64, Vec<&DataFile>> = Default::default();
         for f in &meta.files {
-            by_ord.entry(f.ord).or_default().push(path(f));
+            by_ord.entry(f.ord).or_default().push(f);
         }
-        for (ord, paths) in by_ord.into_iter().rev() {
-            files.push(ctx.read_parquet(paths, opts()).await?.with_column("_ord", lit(ord << 32))?);
+        for (ord, group) in by_ord.into_iter().rev() {
+            files.push(read_files(lake, ctx, group, &schema).await?.with_column("_ord", lit(ord << 32))?);
         }
     } else if !meta.files.is_empty() {
-        let df = ctx.read_parquet(meta.files.iter().map(path).collect::<Vec<_>>(), opts()).await?;
+        let df = read_files(lake, ctx, meta.files.iter().collect(), &schema).await?;
         files.push(if keyed { df.with_column("_ord", lit(0u64))? } else { df });
     }
     let hot = tail(lake, name, meta.tiered, upto, keyed).await?;
@@ -111,11 +143,20 @@ pub async fn sources(lake: &Lake, ctx: &SessionContext, name: &str, meta: &Table
         fields.push(Arc::new(Field::new("_ord", DataType::UInt64, false)));
     }
     let s = Arc::new(Schema::new(fields));
-    Ok((Some(ctx.read_batches(hot.into_iter().map(|b| b.with_schema(s.clone())).collect::<Result<Vec<_>, _>>()?)?), files))
+    Ok((Some(ctx.read_batches(hot.iter().map(|b| conform(b, &s)).collect::<Result<Vec<_>>>()?)?), files))
+}
+
+/// Parquet files as one read: through the hot columns (`hot.rs`) when they're on.
+async fn read_files(lake: &Lake, ctx: &SessionContext, files: Vec<&DataFile>, schema: &SchemaRef) -> Result<DataFrame> {
+    if lake.hot.on() {
+        let files = files.into_iter().cloned().collect();
+        return Ok(ctx.read_table(Arc::new(crate::hot::HotFiles { lake: lake.arc(), files, schema: schema.clone() }))?);
+    }
+    Ok(ctx.read_parquet(files.iter().map(|f| lake.full(&f.path)).collect::<Vec<_>>(), ParquetReadOptions::default().schema(schema)).await?)
 }
 
 fn empty(ctx: &SessionContext, meta: &TableMeta) -> Result<DataFrame> {
-    let df = ctx.read_table(Arc::new(MemTable::try_new(schema(&meta.columns)?, vec![vec![]])?))?;
+    let df = ctx.read_table(Arc::new(MemTable::try_new(read_schema(&meta.columns)?, vec![vec![]])?))?;
     Ok(if meta.key.is_empty() { df } else { df.with_column("_ord", lit(0u64))? })
 }
 
@@ -138,7 +179,7 @@ async fn upsert_view(lake: &Lake, ctx: &SessionContext, name: &str, meta: &Table
         names.push(format!("__f{i}"));
     }
     if names.is_empty() {
-        return Ok(Arc::new(MemTable::try_new(schema(&meta.columns)?, vec![vec![]])?));
+        return Ok(Arc::new(MemTable::try_new(read_schema(&meta.columns)?, vec![vec![]])?));
     }
     let q = |c: &String| format!("\"{c}\"");
     let cols = |p: &str| meta.columns.iter().map(|(c, _)| format!("{p}{}", q(c))).collect::<Vec<_>>().join(", ");
@@ -161,7 +202,7 @@ pub async fn table_view(lake: &Lake, ctx: &SessionContext, name: &str, meta: &Ta
         return upsert_view(lake, ctx, name, meta).await;
     }
     if meta.key.is_empty() {
-        return Ok(Arc::new(Pruned { lake: lake.arc(), name: name.into(), meta: meta.clone(), manifests: None, upto: None, schema: schema(&meta.columns)?, share: None }));
+        return Ok(Arc::new(Pruned { lake: lake.arc(), name: name.into(), meta: meta.clone(), manifests: None, upto: None, schema: read_schema(&meta.columns)?, share: None }));
     }
     let df = raw(lake, ctx, name, meta, None).await?;
     let aux = lake.session();
@@ -266,6 +307,7 @@ pub fn read_only() -> datafusion::execution::context::SQLOptions {
 /// `except`, which the caller registers itself. Attached lakes' tables are `name.table`.
 pub async fn session(lake: &Lake, sql: &str, except: &str) -> Result<SessionContext> {
     let ctx = lake.session();
+    crate::udf::register(lake, &ctx).await?; // the lake's own functions (`POST /functions/…`)
     let listing = ["information_schema", "show tables", "show columns"].iter().any(|w| sql.to_lowercase().contains(w)); // (every table)
     let attached = lake.attached.read().unwrap().clone();
     for (ns, other) in [(String::new(), None)].into_iter().chain(attached.into_iter().map(|(n, l)| (n, Some(l)))) {

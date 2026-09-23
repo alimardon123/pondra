@@ -78,6 +78,8 @@ pub async fn tier_table(lake: &Lake, table: &str, hwm: u64, nodes: &[String], me
 /// never merged twice. Keyed tables, once 8 files pile up, merge their newest run of files of
 /// similar size (`run`); only when that run reaches the oldest file is the whole table rewritten.
 /// Returns whether anything changed.
+const MERGE_BYTES: u64 = 256 << 20; // input a merge job takes at most
+
 pub async fn maintain(lake: &Lake, table: &str, nodes: &[String], me: &str) -> Result<bool> {
     let Some(mut meta) = lake.cat.get::<TableMeta>(&table_key(table)).await? else { return Ok(false) };
     let small: Vec<DataFile> = meta.files.iter().filter(|f| f.bytes < 64 << 20 && f.rows < 4_000_000).cloned().collect();
@@ -100,8 +102,20 @@ pub async fn maintain(lake: &Lake, table: &str, nodes: &[String], me: &str) -> R
         small.iter().for_each(|f| by_part.entry((f.part.as_str(), sealing.contains(f.path.as_str()))).or_default().push(f.clone()));
         let groups: Vec<Vec<DataFile>> = by_part.into_iter().flat_map(|((_, sealing), g)| {
             let (least, most) = if sealing { (2, 32) } else { (8, 8) };
-            let chunks = g.chunks(most).filter(|c| c.len() > 1).map(<[DataFile]>::to_vec);
-            if g.len() >= least { chunks.collect() } else { vec![] }
+            if g.len() < least {
+                return vec![];
+            }
+            // …and at most MERGE_BYTES of input per job, whatever the count: what a job merges is
+            // what it holds (its rows, and the Parquet file it is writing).
+            let mut groups: Vec<Vec<DataFile>> = vec![];
+            for f in g {
+                match groups.last_mut() {
+                    Some(last) if last.len() < most && last.iter().map(|f| f.bytes).sum::<u64>() + f.bytes <= MERGE_BYTES => last.push(f),
+                    _ => groups.push(vec![f]),
+                }
+            }
+            groups.retain(|g| g.len() > 1);
+            groups
         }).collect();
         if !groups.is_empty() {
             let jobs = groups.iter().map(|g| Job::new(table, &meta, Kind::Merge { files: g.clone() })).collect();
@@ -187,6 +201,19 @@ async fn deal(lake: &Lake, jobs: Vec<Job>, nodes: &[String], me: &str) -> Result
 
 /// Do one job here; returns the Parquet files written.
 pub async fn run_job(lake: &Lake, Job { table, meta, kind }: Job) -> Result<Vec<DataFile>> {
+    // A job holds its rows and the Parquet file it is writing, so what a node runs at once is
+    // bounded by the data behind them, not by their number: small merges go side by side, big
+    // ones take turns (however many the leader deals out — it waits for them all anyway).
+    static SLOTS: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    let budget = (crate::store::memory_limit() / 4 >> 20).max(256);
+    let slots = SLOTS.get_or_init(|| tokio::sync::Semaphore::new(budget));
+    let mb = |files: &[DataFile]| (files.iter().map(|f| f.bytes).sum::<u64>() >> 20) as usize;
+    let takes = match &kind {
+        Kind::Merge { files } | Kind::Squash { files } => mb(files),
+        Kind::Compact { .. } => mb(&meta.files),
+        Kind::Fold { .. } => 32,
+    };
+    let _slot = slots.acquire_many(takes.clamp(1, budget) as u32).await?;
     // (Clustered append tables get what keyed tables get for their key: small row groups, bloom filters.)
     // A keyed table's first file has nothing older to shadow: it drops delete markers (and expired
     // rows) like a full compaction, and is as complete as one.
@@ -385,20 +412,28 @@ async fn collect_orphans(lake: &Lake) -> Result<()> {
         return Ok(());
     }
     LAST.store(now, std::sync::atomic::Ordering::Relaxed);
-    let mut used: std::collections::HashSet<String> = lake.cat.scan::<Segment>("s/", "s0").await?.into_iter().map(|(_, s)| s.path).collect();
-    for (_, m) in lake.cat.scan::<TableMeta>("t/", "t0").await? {
-        for manifest in crate::manifest::list(lake, &m).await? {
-            used.extend(crate::manifest::files(lake, &manifest).await?.into_iter().map(|f| f.path));
-            used.insert(manifest.path);
+    let tables = lake.cat.scan::<TableMeta>("t/", "t0").await?;
+    let segments = lake.cat.scan::<Segment>("s/", "s0").await?;
+    // A Bloom filter of the paths in use, sized for them, so this costs a few megabytes on a
+    // table of a million files instead of holding every path (ADR-013).
+    let n = segments.len() + tables.iter().map(|(_, m)| m.files.len() + m.garbage.len() + m.sealed.as_ref().map_or(0, |s| s.files as usize) + 64).sum::<usize>();
+    let mut used = Seen::of(n);
+    segments.iter().for_each(|(_, s)| used.add(&s.path));
+    for (_, m) in &tables {
+        for manifest in crate::manifest::list(lake, m).await? {
+            crate::manifest::files(lake, &manifest).await?.iter().for_each(|f| used.add(&f.path));
+            used.add(&manifest.path);
         }
-        used.extend(m.sealed.iter().map(|s| s.list.clone()));
-        used.extend(m.files.into_iter().map(|f| f.path).chain(m.garbage.into_iter().map(|(p, _)| p)));
+        m.sealed.iter().for_each(|s| used.add(&s.list));
+        m.files.iter().for_each(|f| used.add(&f.path));
+        m.garbage.iter().for_each(|(p, _)| used.add(p));
     }
     for prefix in ["log", "data"] {
-        let objects: Vec<_> = lake.store.list(Some(&object_store::path::Path::from(prefix))).try_collect().await?;
-        for o in objects {
+        let mut objects = lake.store.list(Some(&object_store::path::Path::from(prefix)));
+        while let Some(o) = objects.next().await {
+            let o = o?;
             let old = now as i64 - o.last_modified.timestamp_millis() > 24 * HOUR as i64;
-            if old && !used.contains(o.location.as_ref()) && !crate::delta::open_format(o.location.as_ref()) {
+            if old && !used.has(o.location.as_ref()) && !crate::delta::open_format(o.location.as_ref()) {
                 lake.delete(o.location.as_ref()).await;
             }
         }
@@ -406,11 +441,34 @@ async fn collect_orphans(lake: &Lake) -> Result<()> {
     Ok(())
 }
 
-/// Parquet writer: ZSTD everywhere. Keyed tables are written for lookups as well as scans —
-/// sorted by key (see `latest_sql`), with a bloom filter per key column, and in small row groups
-/// and pages, so reading one key touches one page instead of a million rows.
+/// A Bloom filter of paths in use: a path it doesn't have is certainly not in use; one it has may
+/// or may not be, and simply survives to the next round (about one in a hundred does).
+struct Seen(Vec<u64>);
+
+impl Seen {
+    /// Room for `n` paths at ten bits each.
+    fn of(n: usize) -> Seen { Seen(vec![0; (n.max(4096) * 10 / 64).next_power_of_two()]) }
+
+    fn bits(&self, path: &str) -> [usize; 7] {
+        let h = std::hash::BuildHasher::hash_one(&std::hash::BuildHasherDefault::<std::collections::hash_map::DefaultHasher>::default(), path);
+        let (a, b) = ((h >> 32) as usize, (h as u32 | 1) as usize); // (double hashing: b is odd, so it strides)
+        std::array::from_fn(|i| (a.wrapping_add(i.wrapping_mul(b))) % (self.0.len() * 64))
+    }
+
+    fn add(&mut self, path: &str) {
+        for bit in self.bits(path) {
+            self.0[bit / 64] |= 1 << (bit % 64);
+        }
+    }
+
+    fn has(&self, path: &str) -> bool { self.bits(path).into_iter().all(|bit| self.0[bit / 64] >> (bit % 64) & 1 == 1) }
+}
+
+/// Parquet writer. Keyed tables are written for lookups as well as scans — sorted by key (see
+/// `latest_sql`), with a bloom filter per key column, and in small row groups and pages, so reading
+/// one key touches one page instead of a million rows.
 fn writer<'a>(buf: &'a mut Vec<u8>, batch: &RecordBatch, keys: &[String]) -> Result<ArrowWriter<&'a mut Vec<u8>>> {
-    let mut props = WriterProperties::builder().set_compression(Compression::ZSTD(ZstdLevel::try_new(1)?));
+    let mut props = WriterProperties::builder().set_compression(codec());
     if !keys.is_empty() {
         props = props.set_max_row_group_row_count(Some(256 << 10));
     }
@@ -418,6 +476,18 @@ fn writer<'a>(buf: &'a mut Vec<u8>, batch: &RecordBatch, keys: &[String]) -> Res
         props = props.set_column_bloom_filter_enabled(k.as_str().into(), true);
     }
     Ok(ArrowWriter::try_new(buf, batch.schema(), Some(props.build()))?)
+}
+
+/// The codec data files are written with (`PONDRA_CODEC`). LZ4 by default: it decodes fastest,
+/// so scans are CPU-cheap (TPC-H runs 13-20% faster than on ZSTD, with files a third bigger).
+/// `zstd` where storage or bandwidth costs more than CPU; `snappy` or `none` also work.
+fn codec() -> Compression {
+    match std::env::var("PONDRA_CODEC").unwrap_or_default().to_lowercase().as_str() {
+        "zstd" => Compression::ZSTD(ZstdLevel::try_new(1).expect("a valid level")),
+        "snappy" => Compression::SNAPPY,
+        "none" => Compression::UNCOMPRESSED,
+        _ => Compression::LZ4_RAW,
+    }
 }
 
 /// Write batches as one Parquet file (none if there are no rows).

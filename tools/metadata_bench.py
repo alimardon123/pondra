@@ -2,7 +2,7 @@
 """Table metadata at scale: does a table with a million files commit and answer as fast as one
 with a handful?
 
-  metadata_bench.py [--files 1000000] [--s3]
+  metadata_bench.py [--files 1000000] [--s3] [--publish]
 
 The files are fake: they are registered with the leader the way finished INSERT jobs are
 (`/cluster/files`), each claiming 1 GiB and 10 million rows (1 PiB and 10 trillion rows in all),
@@ -50,9 +50,9 @@ def timed(f, n=5):
 def main():
     lake = harness.new_lake()
     port = A.port
-    node = Node(lake, port).start()
+    node = Node(lake, port, **({"publish": "delta,iceberg"} if A.publish else {})).start()
     sql(port, "CREATE TABLE events (id BIGINT, ts TIMESTAMP, v DOUBLE, name VARCHAR)")
-    columns = [[r["column_name"], r["data_type"]] for r in sql(port, "SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 'events' ORDER BY ordinal_position")]
+    columns = [["id", "Int64"], ["ts", "Timestamp(Microsecond, None)"], ["v", "Float64"], ["name", "Utf8"]] # (as created above)
     now, appended = int(time.time()), [0]
 
     def append(i):  # 1,000 rows through the log, acknowledged once committed
@@ -107,7 +107,17 @@ def main():
     print("added:", json.dumps(added), flush=True)
 
     after = measure()
-    after["entry_bytes"] = metrics(port)['pondra_table_entry_bytes{table="events"}']
+    m = metrics(port)
+    after["entry_bytes"] = m['pondra_table_entry_bytes{table="events"}']
+    # Published in open formats, the catalog keeps manifests, not files (ADR-012): a table of a
+    # million files costs about what a table of a thousand does.
+    if A.publish:
+        t = time.time()
+        call(port, "POST", "/tier", timeout=3600)
+        after["publish_ms"] = round((time.time() - t) * 1000)
+        m = metrics(port)
+        after["delta_state_bytes"] = m['pondra_published_state_bytes{table="events",format="delta"}']
+        after["iceberg_state_bytes"] = m['pondra_published_state_bytes{table="events",format="iceberg"}']
     print("after:", json.dumps(after), flush=True)
     # Same answer (bulk rows added since are left out), and no fake file opened.
     same = query(99)
@@ -125,7 +135,7 @@ def main():
     day_files = m2["pondra_files_scanned_total"] - m1["pondra_files_scanned_total"]
     # A restarted node: nothing cached.
     node.kill()
-    node = Node(lake, port).start()
+    node = Node(lake, port, **({"publish": "delta,iceberg"} if A.publish else {})).start()
     s = time.time()
     cold = query(8)
     cold_ms = round((time.time() - s) * 1000, 1)
@@ -143,6 +153,7 @@ def main():
         "today's query opened no fake file": scanned <= 128 and skipped >= n,
         "one day of 2010 plans that day's files only": 0 < day_files <= 2 * n / (20 * 365) + 64,
         "catalog entry stays small (< 256 KB)": after["entry_bytes"] < 256 << 10,
+        "published state stays small (< 256 KB)": not A.publish or max(after["delta_state_bytes"], after["iceberg_state_bytes"]) < 256 << 10,
         "commits as fast (within 2x + 20 ms)": after["tier_commit_ms"] <= 2 * before["tier_commit_ms"] + 20 and after["insert_ms"] <= 2 * before["insert_ms"] + 20,
         "restarted node answers right": cold == expected(),
         "three nodes, manifests dealt out: same answer": was_spread and spread == expected(),
@@ -157,6 +168,7 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--files", type=int, default=1_000_000)
     ap.add_argument("--s3", action="store_true")
+    ap.add_argument("--publish", action="store_true", help="also publish the table as Delta and Iceberg")
     ap.add_argument("--port", type=int, default=8095)
     A = ap.parse_args()
     harness.A = A

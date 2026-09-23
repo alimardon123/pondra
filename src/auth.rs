@@ -51,9 +51,11 @@ impl Auth {
     pub fn role_of_user(&self, user: &str) -> Role { self.role(self.token_for(user).as_deref()) }
 
     /// What an HTTP route needs (writes in `POST /sql` are checked by `allows`).
-    pub fn needed(path: &str) -> Role {
+    pub fn needed(path: &str, method: &str) -> Role {
         let first = path.trim_start_matches('/').split('/').next().unwrap_or_default();
         match first {
+            "files" if method == "GET" => Role::Read, // (objects next to the tables: files.rs)
+            "files" => Role::Write,
             "stats" => Role::None, // (a health check: load balancers and the tests poll it)
             "sql" | "lookup" | "watch" | "mcp" | "v1" | "metrics" => Role::Read, // (MCP writes are checked by `allows`; v1: the Iceberg REST catalog)
             "append" | "insert" => Role::Write,

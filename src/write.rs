@@ -55,6 +55,8 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
         TableSpec::Columns(c) => (c, vec![], BTreeMap::new(), None, vec![], None, None),
         TableSpec::Full { columns, key, merge, publish, cluster_by, ttl, partition_by } => (columns, key, merge, publish, cluster_by, ttl, partition_by),
     };
+    // Types as the lake records them: `VARIANT` is JSON text, `Float32[]` a list (see `query::dtype`).
+    let columns = columns.iter().map(|(n, t)| Ok((n.clone(), crate::query::type_name(&crate::query::dtype(t)?)))).collect::<Result<Vec<_>>>()?;
     let ttl = ttl.map(|t| -> Result<(String, u64)> {
         let (c, s) = t.split_once(':').ok_or_else(|| anyhow::anyhow!("ttl: \"column:seconds\""))?;
         ensure!(!key.is_empty() && columns.iter().any(|(n, ty)| n == c && (ty.starts_with("Timestamp") || ty.starts_with("Date"))), "ttl: a timestamp or date column of a keyed table");
@@ -152,7 +154,7 @@ async fn create_spec(c: &ast::CreateTable) -> Result<(String, String)> {
     let cols = c.columns.iter().map(|c| format!("{} {}", c.name, c.data_type)).collect::<Vec<_>>().join(", ");
     let ctx = SessionContext::new();
     ctx.sql(&format!("CREATE TABLE t ({cols})")).await?;
-    let columns: Vec<(String, String)> = ctx.table("t").await?.schema().fields().iter().map(|f| (f.name().clone(), stored(f.data_type()).to_string())).collect();
+    let columns: Vec<(String, String)> = ctx.table("t").await?.schema().fields().iter().map(|f| (f.name().clone(), crate::query::type_name(f.data_type()))).collect();
     let name = |e: &ast::Expr| e.to_string().trim_matches('"').to_string();
     let mut key: Vec<String> = c.constraints.iter().flat_map(|k| match k {
         ast::TableConstraint::PrimaryKey(pk) => pk.columns.iter().map(|i| name(&i.column.expr)).collect(),
@@ -207,7 +209,7 @@ async fn alter_spec(lake: &Lake, table: &str, column: &str, sql_type: &str, if_n
     let ctx = SessionContext::new();
     ctx.sql(&format!("CREATE TABLE t ({column} {sql_type})")).await?;
     let mut columns = m.columns.clone();
-    columns.push((column.to_string(), stored(ctx.table("t").await?.schema().field(0).data_type()).to_string()));
+    columns.push((column.to_string(), crate::query::type_name(ctx.table("t").await?.schema().field(0).data_type())));
     let ttl = m.ttl.as_ref().map(|(c, s)| format!("{c}:{s}"));
     Ok(Some(j!({"columns": columns, "key": m.key, "merge": m.merge, "publish": m.publish, "cluster_by": m.cluster, "ttl": ttl, "partition_by": m.partition}).to_string()))
 }
@@ -316,7 +318,8 @@ pub async fn record(lake: &Lake, f: Files) -> Result<Value> {
     }
     let new = || TableMeta { columns: f.columns.clone(), publish: default_publish(), ..Default::default() };
     let mut meta = lake.cat.get::<TableMeta>(&table_key(&f.table)).await?.unwrap_or_else(new);
-    let types = |c: &[(String, String)]| c.iter().map(|(_, t)| t.clone()).collect::<Vec<_>>();
+    // Types as the lake stores them, so a writer may name them its own way (`Utf8View`, `VARIANT`).
+    let types = |c: &[(String, String)]| c.iter().map(|(_, t)| crate::query::dtype(t).map(|t| crate::query::type_name(&t)).unwrap_or_else(|_| t.clone())).collect::<Vec<_>>();
     ensure!(meta.key.is_empty(), "INSERT into a keyed table goes through the log");
     ensure!(types(&meta.columns) == types(&f.columns), "query columns {:?} don't match table {}", f.columns, f.table);
     let rows: u64 = f.files.iter().map(|f| f.rows).sum();
@@ -475,7 +478,13 @@ async fn deliver(dir: &str, mut req: Option<Option<Request>>, stmt: &Stmt, job: 
             }
             t => {
                 let Some(term) = claim(&store, t.map_or(1, |t| t.n + 1), "").await? else { continue };
-                return lead(dir, &store, term.n, req, stmt, job).await;
+                return match lead(dir, &store, term.n, req, stmt, job).await {
+                    // Another one-off writer took the catalog while this one was leading (both
+                    // found the lake idle). Start over with the same job: whoever wins records it
+                    // once, and the rest go through them.
+                    Err(e) if fenced(&e) && tries() < 5 => crate::cluster::restart(),
+                    r => r,
+                };
             }
         }
     }
@@ -538,6 +547,18 @@ fn summary(flush: bool, v: Value) -> Result<Value> {
         Outcome::Retry(r) => r.into_iter().map(|(_, a)| a).collect(),
     };
     Ok(if acks.iter().all(|a| a.duplicate) { j!({"duplicate": true}) } else { j!({"committed": true}) })
+}
+
+/// Was this writer fenced out of the catalog by a newer one?
+fn fenced(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<slatedb::Error>().is_some_and(|e| matches!(e.kind(), slatedb::ErrorKind::Closed(_))) || format!("{e:#}").contains("newer DB client")
+}
+
+/// How many times this command has already started over (it re-runs itself, keeping `PONDRA_JOB`).
+fn tries() -> u32 {
+    let n = std::env::var("PONDRA_TRIES").ok().and_then(|t| t.parse().ok()).unwrap_or(0);
+    std::env::set_var("PONDRA_TRIES", (n + 1).to_string());
+    n
 }
 
 /// Nobody leads: record the write under our own term, and whatever waits in the inbox, then let go.

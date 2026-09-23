@@ -1,6 +1,6 @@
 # Pondra: a streamhouse in one binary
 
-One Rust binary (~8,800 lines) that ingests streams, stores them as a lakehouse (Parquet files
+One Rust binary (~10,100 lines) that ingests streams, stores them as a lakehouse (Parquet files
 plus a catalog, on object storage; Delta Lake and Iceberg metadata for other engines on request),
 keeps SQL views and streaming state up to date, answers SQL, and scales out by starting more
 copies of itself on the same bucket. Object storage is the only state: no Postgres, no
@@ -79,8 +79,12 @@ Useful `serve` flags (give every node the same ones: any of them may lead):
 - `--kafka 0.0.0.0:9092`: also speak the Kafka protocol (`--kafka-advertise host:port` if clients
   must reach this node at another address than `--addr`'s host).
 - `--flight 0.0.0.0:8815`: also speak Arrow Flight and Flight SQL.
-- `--memory-gb 24`: memory for queries (default: half the machine's); sorts, aggregations and
-  joins that need more spill to the temp directory.
+- `--memory-gb 24`: memory for queries (default: a third of the machine's); sorts, aggregations
+  and joins that need more spill to the temp directory. The columns kept decoded in memory
+  (`PONDRA_HOT_GB`, a quarter of it by default) come out of the same budget and give way to
+  queries; `PONDRA_HOT_GB=0` turns them off.
+- `PONDRA_CODEC=lz4|zstd|snappy|none`: how Parquet files are compressed. LZ4 by default — it
+  decodes fastest, so scans are CPU-cheap; `zstd` where storage or bandwidth costs more than CPU.
 - `--read-token`, `--write-token`, `--admin-token`: access control (none set = open). Over
   Postgres the user name picks the role (`reader`, `writer`, `admin`) and the password is its
   token. Whatever the token, SQL sent to a node never touches the node's own disk (no `COPY …
@@ -142,7 +146,11 @@ differences entirely.
 | JSON | `json_get(col, 'a', 0)`, `json_get_str/int/float/bool`, `json_contains`, `json_length`, `->`, `->>` | VARIANT / JSON functions |
 | Arrow Flight | `--flight`: Flight SQL for ADBC and JDBC drivers (queries, writes, `adbc_ingest`, catalog); pyarrow `DoPut` to `[table, producer, first seq]` (exactly-once, acks as batches commit), `DoGet` with `{"sql": …}`, or a table's log as a columnar stream with only the columns asked for (`{"table": t, "after": N, "columns": [...], "follow": true}`) | Arrow Flight SQL servers (Dremio, InfluxDB 3), Fluss's columnar log |
 | AI agents | `POST /mcp` (the Model Context Protocol): tools `list_tables`, `query`, `write`, `changes`, under the same tokens | an MCP server in front of the warehouse |
-| Vector search | `FLOAT[]` embedding columns; `ORDER BY cosine_distance(emb, [...]) LIMIT k` (also `inner_product`, `array_distance`), exact, over the log and the files; Postgres array parameters work | a vector database next to the lake; Flink `VECTOR_SEARCH` |
+| Vector search | `FLOAT[]` embedding columns (`Float32[]`, published as a Delta `array` and an Iceberg `list`); `ORDER BY cosine_similarity(emb, [...]) DESC LIMIT k` (also `l2_distance`, `dot_product`, `cosine_distance`, `inner_product`, `array_distance`), exact, over the log and the files; Postgres array parameters work | a vector database next to the lake; Flink `VECTOR_SEARCH` |
+| Files (images, PDFs, audio) | `PUT /files/<path>` and `GET /files/<path>` put objects in the lake next to the tables; `SELECT * FROM files('photos/')` lists them (path, size, written); `file_read(path)` reads one where a query needs it. `BINARY` columns hold bytes, with `byte_length`, `sha256`, `md5`, `encode(…, 'base64')`, `decode`, `substr` | Databricks file types, Hudi blobs, a blob store beside the warehouse |
+| Semi-structured | `VARIANT` columns (JSON text): `json_get(col, 'a', 0)`, `json_get_str/int/float/bool`, `json_contains`, `json_length`, `->`, `->>` | VARIANT / JSON functions |
+| Models in SQL | `ai_complete(prompt [, model])` and `ai_embed(text [, model])` call an OpenAI-compatible endpoint (`PONDRA_AI_URL`: your own vLLM or Ollama, or a hosted one), eight rows in flight, a failed row null | Databricks `ai_query` / `ai_forecast`, Snowflake Cortex |
+| Your own functions | `POST /functions/{name}` `{"flight": "http://host:port", "args": ["Binary"], "returns": "Utf8"}`: an Arrow Flight server of yours gets the rows as one Arrow batch and returns one column, so a model, a GPU or any Python library runs in that process and not in the node (`tools/udf_server.py` is one in forty lines) | Python/Pandas UDFs, Databricks model serving, Daft UDFs |
 | Streaming SQL with no lag | `POST /views/{name}` with SQL. Runs on every flush of new rows, commits with them. With GROUP BY it keeps per-key aggregates (sum/count/min/max) that any number of nodes update at once | Flink SQL jobs + keyed state |
 | General stateful streaming | `POST /tasks/{name}` `{"source","target","sql"[, "key","shards","shard_by"]}`: runs as soon as rows commit, exactly-once, shards spread over nodes | Flink jobs |
 | Push and change feeds | `GET /watch/{t}`: new rows as NDJSON the moment they commit (upserts and deletes of keyed tables included); `?after=N` replays from N, as far back as `--changelog-secs` keeps the log | Kafka consumers, Fluss `$changelog` |
@@ -168,7 +176,10 @@ differences entirely.
 | `flight.rs` | Arrow Flight and Flight SQL: exactly-once `DoPut`, SQL and the log as columnar streams, ADBC's statements, ingest and catalog |
 | `metrics.rs` | `GET /metrics` in Prometheus' format |
 | `tier.rs` | Tiering, merging small files and compaction: the leader decides and commits, the data work is dealt to the nodes as jobs. Keyed tables are LSM-like — each round folds the log tail into a new file, and files are compacted once 8 pile up. Retention and orphan cleanup |
-| `query.rs` | Hot+cold snapshot per query (DataFusion) |
+| `query.rs` | Hot+cold snapshot per query (DataFusion); strings are read as views |
+| `hot.rs` | The columns queries read lately, decoded, in memory, per file: a scan that finds them all there skips reading and decoding Parquet. Files never change, so nothing goes stale. Filled in the background, only for a file a second scan came back to, and never at the expense of a running query |
+| `optimize.rs` | The engine settings Pondra starts from, and four planning rules of its own: a semi join runs on the table it filters, a grouped subquery groups only the keys the join keeps, a filter's conditions run cheapest first, and the few groups a HAVING keeps make the hash table |
+| `files.rs`, `ai.rs`, `udf.rs` | Files in the lake (`files('…')`, `file_read`), models in SQL (`ai_complete`, `ai_embed`) and vector maths, and functions of your own on an Arrow Flight server |
 | `cache.rs` | For lakes on object storage: an in-memory read cache and a local SSD tier (write-through, read-through, prefetched from the commit stream, warmed at start) |
 | `serve.rs` | Serving reads: key lookups without SQL (tail, then files newest-first, cached key-sorted row groups, binary search), and SQL point queries routed to them |
 | `delta.rs`, `iceberg.rs` | Open formats, per table: a Delta JSON commit / an Iceberg v2 snapshot (hand-written Avro manifests) per change to a table's files; crash-safe (derived from durable catalog state, put-if-absent); the Iceberg REST catalog |

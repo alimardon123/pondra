@@ -6,7 +6,7 @@ description = "Pondra: a streamhouse in one binary"
 
 [dependencies]
 parquet = { version = "59", default-features = false, features = ["snap", "zstd", "lz4"] }
-datafusion = { version = "55", default-features = false, features = ["parquet", "sql", "nested_expressions", "datetime_expressions", "string_expressions", "unicode_expressions", "regex_expressions"] }
+datafusion = { version = "55", default-features = false, features = ["parquet", "sql", "nested_expressions", "datetime_expressions", "string_expressions", "unicode_expressions", "regex_expressions", "crypto_expressions", "encoding_expressions"] }
 slatedb = { version = "0.16", default-features = false, features = ["aws", "moka"] } # moka: in-memory block cache (foyer adds a disk tier we don't need)
 arrow-ipc = { version = "59", features = ["zstd"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream"] }

@@ -1,0 +1,933 @@
+{
+ "data": "/home/claude/tpch/sf1-bench",
+ "sf": 1.0,
+ "cores": 2,
+ "runs": 3,
+ "info": {
+  "pondra_load_s": 12.1,
+  "duckdb_load_s": 0.0,
+  "duckdb_wall_s": 11.6,
+  "duckdb-native_load_s": 5.8,
+  "duckdb-native_wall_s": 11.9,
+  "pondra_warm_s": 11.7,
+  "pondra_wall_s": 7.6,
+  "pondra-cold_wall_s": 11.1,
+  "polars_wall_s": 13.9,
+  "polars-streaming_wall_s": 10.6,
+  "daft_wall_s": 20.2,
+  "bodo_wall_s": 638.9
+ },
+ "results": {
+  "duckdb": {
+   "1": {
+    "hot": 0.207,
+    "first": 0.617,
+    "same_as_duckdb": true
+   },
+   "2": {
+    "hot": 0.052,
+    "first": 0.08,
+    "same_as_duckdb": true
+   },
+   "3": {
+    "hot": 0.141,
+    "first": 0.156,
+    "same_as_duckdb": true
+   },
+   "4": {
+    "hot": 0.096,
+    "first": 0.096,
+    "same_as_duckdb": true
+   },
+   "5": {
+    "hot": 0.157,
+    "first": 0.168,
+    "same_as_duckdb": true
+   },
+   "6": {
+    "hot": 0.105,
+    "first": 0.105,
+    "same_as_duckdb": true
+   },
+   "7": {
+    "hot": 0.151,
+    "first": 0.187,
+    "same_as_duckdb": true
+   },
+   "8": {
+    "hot": 0.19,
+    "first": 0.212,
+    "same_as_duckdb": true
+   },
+   "9": {
+    "hot": 0.308,
+    "first": 0.553,
+    "same_as_duckdb": true
+   },
+   "10": {
+    "hot": 0.196,
+    "first": 0.196,
+    "same_as_duckdb": true
+   },
+   "11": {
+    "hot": 0.024,
+    "first": 0.028,
+    "same_as_duckdb": true
+   },
+   "12": {
+    "hot": 0.118,
+    "first": 0.118,
+    "same_as_duckdb": true
+   },
+   "13": {
+    "hot": 0.18,
+    "first": 0.189,
+    "same_as_duckdb": true
+   },
+   "14": {
+    "hot": 0.136,
+    "first": 0.148,
+    "same_as_duckdb": true
+   },
+   "15": {
+    "hot": 0.08,
+    "first": 0.08,
+    "same_as_duckdb": true
+   },
+   "16": {
+    "hot": 0.045,
+    "first": 0.048,
+    "same_as_duckdb": true
+   },
+   "17": {
+    "hot": 0.152,
+    "first": 0.16,
+    "same_as_duckdb": true
+   },
+   "18": {
+    "hot": 0.264,
+    "first": 0.267,
+    "same_as_duckdb": true
+   },
+   "19": {
+    "hot": 0.164,
+    "first": 0.169,
+    "same_as_duckdb": true
+   },
+   "20": {
+    "hot": 0.138,
+    "first": 0.138,
+    "same_as_duckdb": true
+   },
+   "21": {
+    "hot": 0.412,
+    "first": 0.412,
+    "same_as_duckdb": true
+   },
+   "22": {
+    "hot": 0.046,
+    "first": 0.052,
+    "same_as_duckdb": true
+   },
+   "total_hot": 3.36,
+   "answers_match": 22
+  },
+  "duckdb-native": {
+   "1": {
+    "hot": 0.167,
+    "first": 0.313,
+    "same_as_duckdb": true
+   },
+   "2": {
+    "hot": 0.039,
+    "first": 0.049,
+    "same_as_duckdb": true
+   },
+   "3": {
+    "hot": 0.05,
+    "first": 0.066,
+    "same_as_duckdb": true
+   },
+   "4": {
+    "hot": 0.062,
+    "first": 0.069,
+    "same_as_duckdb": true
+   },
+   "5": {
+    "hot": 0.057,
+    "first": 0.058,
+    "same_as_duckdb": true
+   },
+   "6": {
+    "hot": 0.049,
+    "first": 0.049,
+    "same_as_duckdb": true
+   },
+   "7": {
+    "hot": 0.052,
+    "first": 0.052,
+    "same_as_duckdb": true
+   },
+   "8": {
+    "hot": 0.035,
+    "first": 0.035,
+    "same_as_duckdb": true
+   },
+   "9": {
+    "hot": 0.26,
+    "first": 0.336,
+    "same_as_duckdb": true
+   },
+   "10": {
+    "hot": 0.135,
+    "first": 0.135,
+    "same_as_duckdb": true
+   },
+   "11": {
+    "hot": 0.007,
+    "first": 0.009,
+    "same_as_duckdb": true
+   },
+   "12": {
+    "hot": 0.095,
+    "first": 0.095,
+    "same_as_duckdb": true
+   },
+   "13": {
+    "hot": 0.107,
+    "first": 0.113,
+    "same_as_duckdb": true
+   },
+   "14": {
+    "hot": 0.048,
+    "first": 0.052,
+    "same_as_duckdb": true
+   },
+   "15": {
+    "hot": 0.036,
+    "first": 0.039,
+    "same_as_duckdb": true
+   },
+   "16": {
+    "hot": 0.041,
+    "first": 0.046,
+    "same_as_duckdb": true
+   },
+   "17": {
+    "hot": 0.031,
+    "first": 0.032,
+    "same_as_duckdb": true
+   },
+   "18": {
+    "hot": 0.169,
+    "first": 0.199,
+    "same_as_duckdb": true
+   },
+   "19": {
+    "hot": 0.117,
+    "first": 0.117,
+    "same_as_duckdb": true
+   },
+   "20": {
+    "hot": 0.064,
+    "first": 0.064,
+    "same_as_duckdb": true
+   },
+   "21": {
+    "hot": 0.157,
+    "first": 0.182,
+    "same_as_duckdb": true
+   },
+   "22": {
+    "hot": 0.023,
+    "first": 0.026,
+    "same_as_duckdb": true
+   },
+   "total_hot": 1.8,
+   "answers_match": 22
+  },
+  "pondra": {
+   "1": {
+    "hot": 0.115,
+    "first": 0.156,
+    "same_as_duckdb": true
+   },
+   "2": {
+    "hot": 0.027,
+    "first": 0.032,
+    "same_as_duckdb": true
+   },
+   "3": {
+    "hot": 0.055,
+    "first": 0.057,
+    "same_as_duckdb": true
+   },
+   "4": {
+    "hot": 0.05,
+    "first": 0.054,
+    "same_as_duckdb": true
+   },
+   "5": {
+    "hot": 0.082,
+    "first": 0.114,
+    "same_as_duckdb": true
+   },
+   "6": {
+    "hot": 0.049,
+    "first": 0.051,
+    "same_as_duckdb": true
+   },
+   "7": {
+    "hot": 0.194,
+    "first": 0.835,
+    "same_as_duckdb": true
+   },
+   "8": {
+    "hot": 0.052,
+    "first": 0.065,
+    "same_as_duckdb": true
+   },
+   "9": {
+    "hot": 0.101,
+    "first": 0.13,
+    "same_as_duckdb": true
+   },
+   "10": {
+    "hot": 0.125,
+    "first": 0.125,
+    "same_as_duckdb": true
+   },
+   "11": {
+    "hot": 0.025,
+    "first": 0.026,
+    "same_as_duckdb": true
+   },
+   "12": {
+    "hot": 0.083,
+    "first": 0.092,
+    "same_as_duckdb": true
+   },
+   "13": {
+    "hot": 0.158,
+    "first": 0.161,
+    "same_as_duckdb": true
+   },
+   "14": {
+    "hot": 0.018,
+    "first": 0.022,
+    "same_as_duckdb": true
+   },
+   "15": {
+    "hot": 0.029,
+    "first": 0.04,
+    "same_as_duckdb": true
+   },
+   "16": {
+    "hot": 0.051,
+    "first": 0.052,
+    "same_as_duckdb": true
+   },
+   "17": {
+    "hot": 0.099,
+    "first": 0.099,
+    "same_as_duckdb": true
+   },
+   "18": {
+    "hot": 0.157,
+    "first": 0.257,
+    "same_as_duckdb": true
+   },
+   "19": {
+    "hot": 0.128,
+    "first": 0.129,
+    "same_as_duckdb": true
+   },
+   "20": {
+    "hot": 0.065,
+    "first": 0.068,
+    "same_as_duckdb": true
+   },
+   "21": {
+    "hot": 0.266,
+    "first": 0.689,
+    "same_as_duckdb": true
+   },
+   "22": {
+    "hot": 0.027,
+    "first": 0.029,
+    "same_as_duckdb": true
+   },
+   "total_hot": 1.96,
+   "answers_match": 22
+  },
+  "pondra-cold": {
+   "1": {
+    "hot": 0.166,
+    "first": 0.213,
+    "same_as_duckdb": true
+   },
+   "2": {
+    "hot": 0.098,
+    "first": 0.098,
+    "same_as_duckdb": true
+   },
+   "3": {
+    "hot": 0.12,
+    "first": 0.182,
+    "same_as_duckdb": true
+   },
+   "4": {
+    "hot": 0.089,
+    "first": 0.096,
+    "same_as_duckdb": true
+   },
+   "5": {
+    "hot": 0.158,
+    "first": 0.248,
+    "same_as_duckdb": true
+   },
+   "6": {
+    "hot": 0.083,
+    "first": 0.093,
+    "same_as_duckdb": true
+   },
+   "7": {
+    "hot": 0.158,
+    "first": 0.256,
+    "same_as_duckdb": true
+   },
+   "8": {
+    "hot": 0.165,
+    "first": 0.167,
+    "same_as_duckdb": true
+   },
+   "9": {
+    "hot": 0.213,
+    "first": 0.251,
+    "same_as_duckdb": true
+   },
+   "10": {
+    "hot": 0.204,
+    "first": 0.204,
+    "same_as_duckdb": true
+   },
+   "11": {
+    "hot": 0.045,
+    "first": 0.06,
+    "same_as_duckdb": true
+   },
+   "12": {
+    "hot": 0.117,
+    "first": 0.119,
+    "same_as_duckdb": true
+   },
+   "13": {
+    "hot": 0.173,
+    "first": 0.173,
+    "same_as_duckdb": true
+   },
+   "14": {
+    "hot": 0.073,
+    "first": 0.091,
+    "same_as_duckdb": true
+   },
+   "15": {
+    "hot": 0.115,
+    "first": 0.125,
+    "same_as_duckdb": true
+   },
+   "16": {
+    "hot": 0.064,
+    "first": 0.064,
+    "same_as_duckdb": true
+   },
+   "17": {
+    "hot": 0.171,
+    "first": 0.218,
+    "same_as_duckdb": true
+   },
+   "18": {
+    "hot": 0.266,
+    "first": 0.274,
+    "same_as_duckdb": true
+   },
+   "19": {
+    "hot": 0.154,
+    "first": 0.176,
+    "same_as_duckdb": true
+   },
+   "20": {
+    "hot": 0.126,
+    "first": 0.143,
+    "same_as_duckdb": true
+   },
+   "21": {
+    "hot": 0.391,
+    "first": 0.731,
+    "same_as_duckdb": true
+   },
+   "22": {
+    "hot": 0.044,
+    "first": 0.046,
+    "same_as_duckdb": true
+   },
+   "total_hot": 3.19,
+   "answers_match": 22
+  },
+  "polars": {
+   "1": {
+    "hot": 0.296,
+    "first": 1.06,
+    "same_as_duckdb": true
+   },
+   "2": {
+    "hot": 0.018,
+    "first": 0.025,
+    "same_as_duckdb": true
+   },
+   "3": {
+    "hot": 0.138,
+    "first": 0.138,
+    "same_as_duckdb": true
+   },
+   "4": {
+    "hot": 0.105,
+    "first": 0.12,
+    "same_as_duckdb": true
+   },
+   "5": {
+    "hot": 0.155,
+    "first": 0.179,
+    "same_as_duckdb": true
+   },
+   "6": {
+    "hot": 0.056,
+    "first": 0.059,
+    "same_as_duckdb": true
+   },
+   "7": {
+    "hot": 0.15,
+    "first": 0.163,
+    "same_as_duckdb": true
+   },
+   "8": {
+    "hot": 0.159,
+    "first": 0.205,
+    "same_as_duckdb": true
+   },
+   "9": {
+    "hot": 0.397,
+    "first": 0.666,
+    "same_as_duckdb": true
+   },
+   "10": {
+    "hot": 0.15,
+    "first": 0.174,
+    "same_as_duckdb": true
+   },
+   "11": {
+    "hot": 0.035,
+    "first": 0.043,
+    "same_as_duckdb": true
+   },
+   "12": {
+    "hot": 0.114,
+    "first": 0.119,
+    "same_as_duckdb": true
+   },
+   "13": {
+    "hot": 0.22,
+    "first": 0.257,
+    "same_as_duckdb": true
+   },
+   "14": {
+    "hot": 0.081,
+    "first": 0.082,
+    "same_as_duckdb": true
+   },
+   "15": {
+    "hot": 0.059,
+    "first": 0.061,
+    "same_as_duckdb": true
+   },
+   "16": {
+    "hot": 0.028,
+    "first": 0.035,
+    "same_as_duckdb": true
+   },
+   "17": {
+    "hot": 0.114,
+    "first": 0.124,
+    "same_as_duckdb": true
+   },
+   "18": {
+    "hot": 0.35,
+    "first": 0.411,
+    "same_as_duckdb": true
+   },
+   "19": {
+    "hot": 0.125,
+    "first": 0.13,
+    "same_as_duckdb": true
+   },
+   "20": {
+    "hot": 0.197,
+    "first": 0.268,
+    "same_as_duckdb": true
+   },
+   "21": {
+    "hot": 0.793,
+    "first": 0.837,
+    "same_as_duckdb": true
+   },
+   "22": {
+    "hot": 0.042,
+    "first": 0.042,
+    "same_as_duckdb": true
+   },
+   "total_hot": 3.78,
+   "answers_match": 22
+  },
+  "polars-streaming": {
+   "1": {
+    "hot": 0.282,
+    "first": 0.366,
+    "same_as_duckdb": true
+   },
+   "2": {
+    "hot": 0.025,
+    "first": 0.028,
+    "same_as_duckdb": true
+   },
+   "3": {
+    "hot": 0.144,
+    "first": 0.165,
+    "same_as_duckdb": true
+   },
+   "4": {
+    "hot": 0.118,
+    "first": 0.119,
+    "same_as_duckdb": true
+   },
+   "5": {
+    "hot": 0.157,
+    "first": 0.182,
+    "same_as_duckdb": true
+   },
+   "6": {
+    "hot": 0.053,
+    "first": 0.054,
+    "same_as_duckdb": true
+   },
+   "7": {
+    "hot": 0.147,
+    "first": 0.156,
+    "same_as_duckdb": true
+   },
+   "8": {
+    "hot": 0.187,
+    "first": 0.187,
+    "same_as_duckdb": true
+   },
+   "9": {
+    "hot": 0.292,
+    "first": 0.33,
+    "same_as_duckdb": true
+   },
+   "10": {
+    "hot": 0.157,
+    "first": 0.168,
+    "same_as_duckdb": true
+   },
+   "11": {
+    "hot": 0.036,
+    "first": 0.04,
+    "same_as_duckdb": true
+   },
+   "12": {
+    "hot": 0.118,
+    "first": 0.119,
+    "same_as_duckdb": true
+   },
+   "13": {
+    "hot": 0.178,
+    "first": 0.195,
+    "same_as_duckdb": true
+   },
+   "14": {
+    "hot": 0.078,
+    "first": 0.081,
+    "same_as_duckdb": true
+   },
+   "15": {
+    "hot": 0.063,
+    "first": 0.063,
+    "same_as_duckdb": true
+   },
+   "16": {
+    "hot": 0.04,
+    "first": 0.048,
+    "same_as_duckdb": true
+   },
+   "17": {
+    "hot": 0.118,
+    "first": 0.132,
+    "same_as_duckdb": true
+   },
+   "18": {
+    "hot": 0.221,
+    "first": 0.256,
+    "same_as_duckdb": true
+   },
+   "19": {
+    "hot": 0.1,
+    "first": 0.1,
+    "same_as_duckdb": true
+   },
+   "20": {
+    "hot": 0.127,
+    "first": 0.142,
+    "same_as_duckdb": true
+   },
+   "21": {
+    "hot": 0.505,
+    "first": 0.545,
+    "same_as_duckdb": true
+   },
+   "22": {
+    "hot": 0.033,
+    "first": 0.033,
+    "same_as_duckdb": true
+   },
+   "total_hot": 3.18,
+   "answers_match": 22
+  },
+  "daft": {
+   "1": {
+    "hot": 0.329,
+    "first": 0.531,
+    "same_as_duckdb": true
+   },
+   "2": {
+    "hot": 0.101,
+    "first": 0.12,
+    "same_as_duckdb": true
+   },
+   "3": {
+    "hot": 0.304,
+    "first": 0.312,
+    "same_as_duckdb": true
+   },
+   "4": {
+    "hot": 0.103,
+    "first": 0.106,
+    "same_as_duckdb": true
+   },
+   "5": {
+    "hot": 0.207,
+    "first": 0.243,
+    "same_as_duckdb": true
+   },
+   "6": {
+    "hot": 0.104,
+    "first": 0.104,
+    "same_as_duckdb": true
+   },
+   "7": {
+    "hot": 0.276,
+    "first": 0.283,
+    "same_as_duckdb": true
+   },
+   "8": {
+    "hot": 0.265,
+    "first": 0.278,
+    "same_as_duckdb": true
+   },
+   "9": {
+    "hot": 0.356,
+    "first": 0.356,
+    "same_as_duckdb": true
+   },
+   "10": {
+    "hot": 0.44,
+    "first": 0.462,
+    "same_as_duckdb": true
+   },
+   "11": {
+    "hot": 0.092,
+    "first": 0.102,
+    "same_as_duckdb": true
+   },
+   "12": {
+    "hot": 0.269,
+    "first": 0.269,
+    "same_as_duckdb": true
+   },
+   "13": {
+    "hot": 0.272,
+    "first": 0.272,
+    "same_as_duckdb": true
+   },
+   "14": {
+    "hot": 0.252,
+    "first": 0.262,
+    "same_as_duckdb": true
+   },
+   "15": {
+    "hot": 0.199,
+    "first": 0.218,
+    "same_as_duckdb": false
+   },
+   "16": {
+    "hot": 0.121,
+    "first": 0.127,
+    "same_as_duckdb": true
+   },
+   "17": {
+    "hot": 0.418,
+    "first": 0.511,
+    "same_as_duckdb": true
+   },
+   "18": {
+    "hot": 0.28,
+    "first": 0.318,
+    "same_as_duckdb": true
+   },
+   "19": {
+    "hot": 0.378,
+    "first": 0.378,
+    "same_as_duckdb": true
+   },
+   "20": {
+    "hot": 0.246,
+    "first": 0.254,
+    "same_as_duckdb": true
+   },
+   "21": {
+    "hot": 1.04,
+    "first": 1.3,
+    "same_as_duckdb": true
+   },
+   "22": {
+    "hot": 0.056,
+    "first": 0.062,
+    "same_as_duckdb": true
+   },
+   "total_hot": 6.11,
+   "answers_match": 21
+  },
+  "bodo": {
+   "1": {
+    "hot": 12.815,
+    "first": 15.451,
+    "same_as_duckdb": true
+   },
+   "2": {
+    "hot": 2.712,
+    "first": 2.966,
+    "same_as_duckdb": true
+   },
+   "3": {
+    "hot": 6.75,
+    "first": 7.458,
+    "same_as_duckdb": true
+   },
+   "4": {
+    "hot": 3.42,
+    "first": 3.42,
+    "same_as_duckdb": false
+   },
+   "5": {
+    "hot": 4.14,
+    "first": 4.348,
+    "same_as_duckdb": false
+   },
+   "6": {
+    "hot": 0.79,
+    "first": 0.805,
+    "same_as_duckdb": false
+   },
+   "7": {
+    "hot": 11.691,
+    "first": 11.691,
+    "same_as_duckdb": true
+   },
+   "8": {
+    "error": "  warnings.warn("
+   },
+   "9": {
+    "hot": 8.476,
+    "first": 10.857,
+    "same_as_duckdb": false
+   },
+   "10": {
+    "hot": 14.262,
+    "first": 14.501,
+    "same_as_duckdb": false
+   },
+   "11": {
+    "hot": 0.651,
+    "first": 0.706,
+    "same_as_duckdb": true
+   },
+   "12": {
+    "hot": 4.017,
+    "first": 4.228,
+    "same_as_duckdb": true
+   },
+   "13": {
+    "hot": 2.77,
+    "first": 3.096,
+    "same_as_duckdb": true
+   },
+   "14": {
+    "hot": 1.139,
+    "first": 1.331,
+    "same_as_duckdb": false
+   },
+   "15": {
+    "hot": 3.592,
+    "first": 3.674,
+    "same_as_duckdb": true
+   },
+   "16": {
+    "hot": 1.276,
+    "first": 1.291,
+    "same_as_duckdb": true
+   },
+   "17": {
+    "hot": 1.102,
+    "first": 1.255,
+    "same_as_duckdb": true
+   },
+   "18": {
+    "hot": 6.131,
+    "first": 6.131,
+    "same_as_duckdb": true
+   },
+   "19": {
+    "hot": 2.904,
+    "first": 3.269,
+    "same_as_duckdb": true
+   },
+   "20": {
+    "hot": 4.475,
+    "first": 4.492,
+    "same_as_duckdb": false
+   },
+   "21": {
+    "hot": 11.499,
+    "first": 12.645,
+    "same_as_duckdb": true
+   },
+   "22": {
+    "hot": 1.132,
+    "first": 1.24,
+    "same_as_duckdb": true
+   },
+   "total_hot": null,
+   "answers_match": 14
+  }
+ },
+ "note": "polars, daft and bodo ran earlier on the same machine and data, with the same script; the engines above them were re-run together at the end (bodo takes ten minutes a query here)"
+}

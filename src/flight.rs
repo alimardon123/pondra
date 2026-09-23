@@ -288,7 +288,7 @@ impl FlightSqlService for Sql {
                 Some(Ok(b)) => b.schema(),
                 _ => return Err(Status::invalid_argument("no rows to take the table's columns from")),
             };
-            let columns: Vec<(String, String)> = schema.fields().iter().map(|f| (f.name().clone(), crate::write::stored(f.data_type()).to_string())).collect();
+            let columns: Vec<(String, String)> = schema.fields().iter().map(|f| (f.name().clone(), crate::query::type_name(f.data_type()))).collect();
             crate::write::define(&self.0, &table, &serde_json::json!(columns).to_string()).await.map_err(status)?;
         }
         let mut acks = append(&self.0, table, String::new(), 0, batches)?;

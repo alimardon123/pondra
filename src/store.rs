@@ -7,6 +7,7 @@
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
+use datafusion::execution::SessionStateBuilder;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey};
 use object_store::ClientConfigKey;
@@ -125,6 +126,7 @@ pub struct Lake {
     tail: Mutex<(lru::LruCache<(u64, String), Rows>, usize)>, // decoded (segment, table) rows; total bytes
     pub disk: Option<Arc<crate::cache::Disk>>, // lakes on object storage: the local SSD tier
     pub groups: crate::serve::Groups,          // decoded row groups for key lookups
+    pub hot: Arc<crate::hot::Hot>,             // decoded columns of files queries read lately
     pub attached: std::sync::RwLock<Vec<(String, Arc<Lake>)>>, // other lakes, read as `name.table` (`--attach`)
     me: std::sync::Weak<Lake>,
 }
@@ -133,13 +135,25 @@ impl std::fmt::Debug for Lake {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { write!(f, "Lake({})", self.url) }
 }
 
-/// How much memory queries may use on this node (`PONDRA_MEMORY_GB`, else half of RAM). Past it,
-/// sorts, aggregations and joins spill to temporary files, or the query stops with an error:
-/// a query never takes the node down.
+/// How much memory queries may use on this node (`PONDRA_MEMORY_GB`, else a third of RAM). Past
+/// it, sorts, aggregations and joins spill to temporary files, or the query stops with an error:
+/// a query never takes the node down. (A third, not half: what DataFusion counts here is the big
+/// hash tables and sort buffers, not the Parquet decoding and the batches in flight around them,
+/// so the node's own memory runs ahead of this number. The hot columns come out of it too.)
 pub fn memory_limit() -> usize {
     let gb = std::env::var("PONDRA_MEMORY_GB").ok().and_then(|g| g.parse::<f64>().ok());
-    let ram = || std::fs::read_to_string("/proc/meminfo").ok()?.lines().find_map(|l| l.strip_prefix("MemTotal:")?.trim().strip_suffix("kB")?.trim().parse::<usize>().ok()).map(|kb| kb << 10);
-    gb.map(|g| (g * (1u64 << 30) as f64) as usize).or_else(|| ram().map(|r| r / 2)).unwrap_or(4 << 30)
+    gb.map(|g| (g * (1u64 << 30) as f64) as usize).or_else(|| ram().map(|r| r / 3)).unwrap_or(4 << 30)
+}
+
+/// The machine's memory, if it says.
+pub fn ram() -> Option<usize> {
+    std::fs::read_to_string("/proc/meminfo").ok()?.lines().find_map(|l| l.strip_prefix("MemTotal:")?.trim().strip_suffix("kB")?.trim().parse::<usize>().ok()).map(|kb| kb << 10)
+}
+
+/// This process's resident memory, if the OS says.
+pub fn resident() -> Option<usize> {
+    let pages = std::fs::read_to_string("/proc/self/statm").ok()?.split_whitespace().nth(1)?.parse::<usize>().ok()?;
+    Some(pages * 4096)
 }
 
 pub type Rows = Arc<Vec<datafusion::arrow::record_batch::RecordBatch>>;
@@ -181,7 +195,8 @@ impl Lake {
         let cache = ObjectStoreCacheOptions { root_folder: cache, max_cache_size_bytes: Some(2 << 30), cache_on_flush: true, cache_on_compaction: true, ..Default::default() };
         let cat = if writer { Catalog::writer(store.clone(), cache).await? } else { Catalog::reader(store.clone(), streamed, cache).await? };
         let hwm = watch::Sender::new(cat.get::<u64>("n").await?.unwrap_or(1) - 1);
-        let lake = Arc::new_cyclic(|me| Lake { url, store, cat, hwm, backlog: Default::default(), rt, tail: Mutex::new((lru::LruCache::unbounded(), 0)), disk, groups: crate::serve::Groups::new(cache_mb() << 19), attached: Default::default(), me: me.clone() });
+        let lake = Arc::new_cyclic(|me| Lake { url, store, cat, hwm, backlog: Default::default(), rt, tail: Mutex::new((lru::LruCache::unbounded(), 0)), disk, groups: crate::serve::Groups::new(cache_mb() << 19), hot: Arc::new(crate::hot::Hot::new()), attached: Default::default(), me: me.clone() });
+        lake.hot.watch(); // the decoded columns give memory back when the node needs it
         if let Some(writes) = lake.cat.unstarted.lock().unwrap().take() {
             tokio::spawn(lake.clone().commits(writes));
         }
@@ -340,8 +355,13 @@ impl Lake {
     /// A session with a fixed number of partitions: 1 for point lookups, where splitting the work
     /// costs more than it saves and many queries run at once.
     pub fn session_with(&self, partitions: usize) -> SessionContext {
-        let mut ctx = SessionContext::new_with_config_rt(SessionConfig::new().with_information_schema(true).with_target_partitions(partitions), self.rt.clone());
+        let config = crate::optimize::config(SessionConfig::new().with_information_schema(true).with_target_partitions(partitions));
+        let state = SessionStateBuilder::new().with_config(config).with_runtime_env(self.rt.clone()).with_default_features();
+        let state = state.with_optimizer_rules(crate::optimize::rules()).with_physical_optimizer_rules(crate::optimize::physical_rules());
+        let mut ctx = SessionContext::new_with_state(state.build());
         datafusion_functions_json::register_all(&mut ctx).expect("JSON functions register"); // json_get(…), ->, ->>
+        crate::files::register(&ctx, self.arc()); // files('…'), file_read(path)
+        crate::ai::register(&ctx); // ai_complete, ai_embed, cosine_similarity, …
         ctx
     }
 

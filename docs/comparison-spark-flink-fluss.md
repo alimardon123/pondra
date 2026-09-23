@@ -1,22 +1,25 @@
-# Pondra vs Spark, Flink, Fluss and Databricks Lakehouse//RT (round 11)
+# Pondra vs Spark, Flink, Fluss, Databricks Lakehouse//RT — and the single-node engines (round 12)
 
-**Date:** 2026-09-22 · **Machine:** one 2-vCPU, 7 GB sandbox VM, local disk (plus a real Cloudflare R2 bucket where marked); every engine ran alone
+**Date:** 2026-09-23 · **Machine:** one 2-vCPU, 7 GB sandbox VM, local disk (plus a real Cloudflare R2 bucket where marked); every engine ran alone
 **Versions:**
 - Pondra (this prototype: Rust, Apache DataFusion 55)
 - Spark 4.2.0 (PySpark, `local[*]`)
 - Flink 2.3.0 (PyFlink, local MiniCluster, parallelism 2)
 - DuckDB 1.5.5 (as a reference)
+- DuckDB 1.5.5, Polars 1.44.2, Daft and Bodo (the single-node engines, new this round; each runs
+  its own published TPC-H code)
 - Fluss (1.0, released 2026-09-21) and Lakehouse//RT are compared from their published numbers and
   docs; neither can run here.
 
 **Reproduce:**
-- `tools/bench/tpch.py` (TPC-H)
+- `tools/bench/singlenode.py` (TPC-H against DuckDB, Polars, Daft and Bodo), `tools/bench/tpch.py` (against Spark)
 - `tools/bench/run.py` (batch / streaming / ETL, same data and SQL for every engine)
 - `tools/serve_bench.py` (serving)
 - `tools/cluster.py latency | split | spread`
 - `tools/freshness.py` (freshness, head to head), `tools/open_check.py` (outside readers)
 
 **Where the numbers come from:**
+- TPC-H against DuckDB, Polars, Daft and Bodo, and everything multimodal: round 12.
 - Table metadata at a million files, partitions, memory limits, shuffles and Arrow Flight: round 11.
 - The Kafka protocol, the Iceberg REST catalog, schema evolution and windows: round 10.
 - Clients, protocols, MCP, vectors and the roadmaps: round 9.
@@ -80,7 +83,9 @@ biggest open risk is scale-out, and only a multi-machine benchmark can retire it
 | Scale-out to 100s of machines | unproven: shuffles and spilling since round 11, tested on one box only | ✓ | ✓ | ✓ | ✓ |
 | Streaming semantics (event time, windows, CEP, huge state) | decomposable aggregates, SQL tasks, event-time windows emitted once past a watermark | good | ✓ | storage only | — |
 | APIs & usability | SQL reads and writes over HTTP, the Postgres protocol and Arrow Flight SQL (ADBC, JDBC); Python client (pandas, Polars, Arrow) | ✓ SQL + DataFrames (Python/Scala/Java/R), notebooks | SQL + DataStream API | clients (Java, Rust, Python, C++); REST gateway; Postgres protocol planned | ✓ Databricks SQL |
-| AI agents and vectors | ✓ MCP server built in; exact vector search in SQL (`cosine_distance`) | AI functions on Databricks only | `ML_PREDICT`, `VECTOR_SEARCH`; Flink Agents (0.2) | MCP and vector columns planned | ✓ Agent Bricks, Genie |
+| Batch SQL on one machine (TPC-H) | ✓ fastest of Pondra, DuckDB, Polars, Daft and Bodo from files, at SF1 and SF10 | | | — | — |
+| AI agents and vectors | ✓ MCP server built in; `ai_complete`/`ai_embed` against any OpenAI-compatible endpoint; your own functions on an Arrow Flight server; exact vector search in SQL | AI functions on Databricks only | `ML_PREDICT`, `VECTOR_SEARCH`; Flink Agents (0.2) | MCP and vector columns planned | ✓ Agent Bricks, Genie |
+| Unstructured and multimodal | ✓ files in the lake (`files('…')`, `file_read`), `BINARY` with hashing and base64, `VARIANT`, `Float32[]` vectors — published as Delta arrays and Iceberg lists | — | — | blob and variant types planned | ✓ Databricks file types, `ai_query` |
 | Connectors & ecosystem | Kafka protocol in and out (any Kafka client, Debezium), Postgres, HTTP; Delta + Iceberg out, Iceberg REST catalog | ✓ huge | ✓ huge | Flink/Spark connectors | ✓ Databricks |
 | Operations & footprint | ✓ 1 binary, 44–49 MB idle, 0.02 s start | JVM cluster | JVM cluster + checkpoints | JVM + ZooKeeper + Flink tiering job | managed |
 | Governance & security | read / write / admin tokens (HTTP, Postgres, MCP); no TLS or per-table grants yet | via platforms | via platforms | SASL users (1.0); TLS planned | ✓ Unity Catalog |
@@ -88,7 +93,43 @@ biggest open risk is scale-out, and only a multi-machine benchmark can retire it
 
 ## Processing power
 
-### TPC-H SF1 (new this round)
+### TPC-H against the single-node engines (new this round)
+
+The 22 queries at SF1 (6 M lineitems) and SF10 (60 M), on one 2-vCPU, 8 GB machine, best of three
+runs, every answer checked against DuckDB's. Each engine runs its own published TPC-H code (Polars'
+`pola-rs/tpch`, Daft's `benchmarking/tpch`, Bodo's `benchmarks/tpch`; DataFusion's SQL for Pondra
+and DuckDB) and reads the same Parquet files — except Pondra, which reads its own lake, loaded with
+one INSERT per table. `tools/bench/singlenode.py` runs all of it.
+
+**From files, every query** (nothing loaded into memory first):
+
+| | SF1 | SF10 |
+|---|---|---|
+| **Pondra** (`PONDRA_HOT_GB=0`) | **3.19 s** | **38.0 s** |
+| DuckDB 1.5.5 | 3.36 s | 39.8 s |
+| Polars 1.44.2 (in-memory engine) | 3.78 s | q9 out of memory |
+| Polars (streaming engine) | 3.18 s | 42.8 s |
+| Daft | 6.11 s | 89.0 s |
+| Bodo | 8 of 21 answers differ from DuckDB's, one query crashes, minutes per query | not run |
+
+**From memory** (the load is not in the times):
+
+| | SF1 | SF10 |
+|---|---|---|
+| **Pondra**, hot columns (1.5 GB) | **1.96 s** | **35.9 s** |
+| DuckDB, native tables | 1.80 s | needs ~7 GB of temporary space beyond this machine's memory: no room |
+
+Pondra is the fastest of the five reading Parquet, at both scales, and the only one that also
+ingests, serves and scales out. DuckDB stays ~9% ahead when both hold the data in memory at SF1;
+at SF10 it can't hold it here at all, while Pondra's cache takes what fits and gives it back when
+queries need the memory. Bodo's numbers are its own published code at this scale on two cores; its
+answers differ often enough that they aren't a comparison.
+
+What changed since round 11 (SF1 went from 6.45 s to 3.19 s, DuckDB from 4.18 to 3.36 on a quieter
+machine): strings read as Arrow views, LZ4 instead of ZSTD for Pondra's own files, SQL-standard
+decimal literals, three planning rules of Pondra's own and one physical rule (ADR-013).
+
+### TPC-H SF1 against Spark (round 7)
 
 The 22 queries on the same Parquet files (`tpchgen-cli -s 1`: 6 M lineitems), best of two runs
 each. Pondra's runs go over HTTP and return JSON, and each run is a new query, so the result
@@ -251,8 +292,10 @@ from third-party summit recaps; check them before relying on them.
   as of this round.
 - **A real-time feature store** (point-in-time correctness), **multimodal data** (vectors, variant,
   images), and a Python SDK for PyTorch, Ray and pandas.
-  - Pondra has vector columns with exact nearest-neighbour search in SQL.
-  - Point-in-time joins and a variant type are in the plan below.
+  - Pondra has vector columns with exact nearest-neighbour search in SQL, `VARIANT` columns,
+    `BINARY` with hashing and base64, and files in the lake that a query reads by path
+    (`files('photos/')`, `file_read`) — round 12.
+  - Point-in-time joins are in the plan below; a shredded variant waits for Arrow to have one.
 - **A global secondary index** for non-key lookups. Pondra: `cluster_by` and Parquet pruning; no
   index.
 - **Lake integration:** Iceberg v3; Delta; an "in-place lakehouse" (Fluss tables defined over
@@ -277,7 +320,7 @@ from third-party summit recaps; check them before relying on them.
 - **Joins with little state:** the delta join and multi-way join (2.1–2.2), built to read from
   Fluss.
 - **SQL and types:** VARIANT (2.1), process table functions, `FROM_CHANGELOG` / `TO_CHANGELOG`
-  (2.3).
+  (2.3). Pondra has `VARIANT` as JSON text with `json_get` and `->>`.
 - **The threat:** Flink plus Fluss is becoming a streamhouse stack of two mature projects —
   log, keyed tables, lake and low-state joins. Pondra's answer is to be that stack in one
   binary: faster to adopt and cheaper to run.
@@ -291,7 +334,9 @@ from third-party summit recaps; check them before relying on them.
   declared in SQL too, and run incrementally.
 - **Types and SQL:** VARIANT with shredding, SQL scripting, pipe syntax.
 - **Clients and UDFs:** Spark Connect clients (Python, Go, Swift) and a JDBC driver;
-  Arrow-native Python UDFs; the Python data source API.
+  Arrow-native Python UDFs; the Python data source API. Pondra's answer to UDFs is a function
+  that lives on an Arrow Flight server of yours: it gets a batch of arguments and returns a
+  column, so the model or library runs in that process and a slow one can't take a node down.
 
 **Databricks** (Data + AI Summit 2025 and 2026):
 

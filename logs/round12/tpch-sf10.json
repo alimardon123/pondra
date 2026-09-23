@@ -1,0 +1,702 @@
+{
+ "data": "/home/claude/tpch/sf10-bench",
+ "sf": 10.0,
+ "cores": 2,
+ "runs": 3,
+ "info": {
+  "pondra_load_s": 85.0,
+  "duckdb_load_s": 0.0,
+  "duckdb_wall_s": 125.8,
+  "pondra_warm_s": 90.2,
+  "pondra_wall_s": 123.8,
+  "pondra-cold_wall_s": 131.9,
+  "polars_wall_s": 163.1,
+  "polars-streaming_wall_s": 133.1,
+  "daft_wall_s": 277.8
+ },
+ "results": {
+  "duckdb": {
+   "1": {
+    "hot": 2.242,
+    "first": 2.551,
+    "same_as_duckdb": true
+   },
+   "2": {
+    "hot": 0.383,
+    "first": 1.057,
+    "same_as_duckdb": true
+   },
+   "3": {
+    "hot": 1.685,
+    "first": 2.314,
+    "same_as_duckdb": true
+   },
+   "4": {
+    "hot": 1.067,
+    "first": 1.205,
+    "same_as_duckdb": true
+   },
+   "5": {
+    "hot": 1.929,
+    "first": 1.948,
+    "same_as_duckdb": true
+   },
+   "6": {
+    "hot": 1.106,
+    "first": 1.133,
+    "same_as_duckdb": true
+   },
+   "7": {
+    "hot": 1.729,
+    "first": 1.803,
+    "same_as_duckdb": true
+   },
+   "8": {
+    "hot": 2.176,
+    "first": 2.476,
+    "same_as_duckdb": true
+   },
+   "9": {
+    "hot": 4.009,
+    "first": 5.024,
+    "same_as_duckdb": true
+   },
+   "10": {
+    "hot": 1.878,
+    "first": 2.044,
+    "same_as_duckdb": true
+   },
+   "11": {
+    "hot": 0.285,
+    "first": 0.326,
+    "same_as_duckdb": true
+   },
+   "12": {
+    "hot": 1.343,
+    "first": 1.384,
+    "same_as_duckdb": true
+   },
+   "13": {
+    "hot": 2.577,
+    "first": 2.595,
+    "same_as_duckdb": true
+   },
+   "14": {
+    "hot": 1.283,
+    "first": 1.324,
+    "same_as_duckdb": true
+   },
+   "15": {
+    "hot": 1.048,
+    "first": 1.057,
+    "same_as_duckdb": true
+   },
+   "16": {
+    "hot": 0.419,
+    "first": 0.447,
+    "same_as_duckdb": true
+   },
+   "17": {
+    "hot": 1.889,
+    "first": 1.952,
+    "same_as_duckdb": true
+   },
+   "18": {
+    "hot": 3.368,
+    "first": 3.902,
+    "same_as_duckdb": true
+   },
+   "19": {
+    "hot": 1.941,
+    "first": 1.994,
+    "same_as_duckdb": true
+   },
+   "20": {
+    "hot": 1.737,
+    "first": 1.878,
+    "same_as_duckdb": true
+   },
+   "21": {
+    "hot": 5.04,
+    "first": 5.482,
+    "same_as_duckdb": true
+   },
+   "22": {
+    "hot": 0.613,
+    "first": 0.613,
+    "same_as_duckdb": true
+   },
+   "total_hot": 39.75,
+   "answers_match": 22
+  },
+  "pondra": {
+   "1": {
+    "hot": 1.842,
+    "first": 1.842,
+    "same_as_duckdb": true
+   },
+   "2": {
+    "hot": 0.166,
+    "first": 0.26,
+    "same_as_duckdb": true
+   },
+   "3": {
+    "hot": 0.927,
+    "first": 0.987,
+    "same_as_duckdb": true
+   },
+   "4": {
+    "hot": 0.819,
+    "first": 0.845,
+    "same_as_duckdb": true
+   },
+   "5": {
+    "hot": 1.953,
+    "first": 2.241,
+    "same_as_duckdb": true
+   },
+   "6": {
+    "hot": 0.98,
+    "first": 0.988,
+    "same_as_duckdb": true
+   },
+   "7": {
+    "hot": 2.523,
+    "first": 4.41,
+    "same_as_duckdb": true
+   },
+   "8": {
+    "hot": 1.888,
+    "first": 1.908,
+    "same_as_duckdb": true
+   },
+   "9": {
+    "hot": 3.207,
+    "first": 5.614,
+    "same_as_duckdb": true
+   },
+   "10": {
+    "hot": 2.282,
+    "first": 2.391,
+    "same_as_duckdb": true
+   },
+   "11": {
+    "hot": 0.235,
+    "first": 0.287,
+    "same_as_duckdb": true
+   },
+   "12": {
+    "hot": 1.389,
+    "first": 1.663,
+    "same_as_duckdb": true
+   },
+   "13": {
+    "hot": 1.851,
+    "first": 2.482,
+    "same_as_duckdb": true
+   },
+   "14": {
+    "hot": 0.674,
+    "first": 0.748,
+    "same_as_duckdb": true
+   },
+   "15": {
+    "hot": 1.315,
+    "first": 1.412,
+    "same_as_duckdb": true
+   },
+   "16": {
+    "hot": 0.519,
+    "first": 1.582,
+    "same_as_duckdb": true
+   },
+   "17": {
+    "hot": 1.225,
+    "first": 1.225,
+    "same_as_duckdb": true
+   },
+   "18": {
+    "hot": 4.434,
+    "first": 6.279,
+    "same_as_duckdb": true
+   },
+   "19": {
+    "hot": 1.667,
+    "first": 1.985,
+    "same_as_duckdb": true
+   },
+   "20": {
+    "hot": 1.329,
+    "first": 2.112,
+    "same_as_duckdb": true
+   },
+   "21": {
+    "hot": 4.337,
+    "first": 4.337,
+    "same_as_duckdb": true
+   },
+   "22": {
+    "hot": 0.332,
+    "first": 0.632,
+    "same_as_duckdb": true
+   },
+   "total_hot": 35.89,
+   "answers_match": 22
+  },
+  "pondra-cold": {
+   "1": {
+    "hot": 1.951,
+    "first": 2.65,
+    "same_as_duckdb": true
+   },
+   "2": {
+    "hot": 0.286,
+    "first": 0.42,
+    "same_as_duckdb": true
+   },
+   "3": {
+    "hot": 1.354,
+    "first": 1.979,
+    "same_as_duckdb": true
+   },
+   "4": {
+    "hot": 0.874,
+    "first": 0.917,
+    "same_as_duckdb": true
+   },
+   "5": {
+    "hot": 1.889,
+    "first": 2.653,
+    "same_as_duckdb": true
+   },
+   "6": {
+    "hot": 0.937,
+    "first": 0.969,
+    "same_as_duckdb": true
+   },
+   "7": {
+    "hot": 2.69,
+    "first": 4.762,
+    "same_as_duckdb": true
+   },
+   "8": {
+    "hot": 1.71,
+    "first": 2.567,
+    "same_as_duckdb": true
+   },
+   "9": {
+    "hot": 3.509,
+    "first": 5.665,
+    "same_as_duckdb": true
+   },
+   "10": {
+    "hot": 2.495,
+    "first": 2.495,
+    "same_as_duckdb": true
+   },
+   "11": {
+    "hot": 0.205,
+    "first": 0.245,
+    "same_as_duckdb": true
+   },
+   "12": {
+    "hot": 1.307,
+    "first": 1.342,
+    "same_as_duckdb": true
+   },
+   "13": {
+    "hot": 1.812,
+    "first": 1.939,
+    "same_as_duckdb": true
+   },
+   "14": {
+    "hot": 0.714,
+    "first": 0.739,
+    "same_as_duckdb": true
+   },
+   "15": {
+    "hot": 1.359,
+    "first": 1.359,
+    "same_as_duckdb": true
+   },
+   "16": {
+    "hot": 0.66,
+    "first": 1.597,
+    "same_as_duckdb": true
+   },
+   "17": {
+    "hot": 1.094,
+    "first": 1.203,
+    "same_as_duckdb": true
+   },
+   "18": {
+    "hot": 4.97,
+    "first": 6.018,
+    "same_as_duckdb": true
+   },
+   "19": {
+    "hot": 1.563,
+    "first": 1.767,
+    "same_as_duckdb": true
+   },
+   "20": {
+    "hot": 1.344,
+    "first": 2.06,
+    "same_as_duckdb": true
+   },
+   "21": {
+    "hot": 4.897,
+    "first": 7.776,
+    "same_as_duckdb": true
+   },
+   "22": {
+    "hot": 0.391,
+    "first": 0.402,
+    "same_as_duckdb": true
+   },
+   "total_hot": 38.01,
+   "answers_match": 22
+  },
+  "polars": {
+   "1": {
+    "hot": 4.462,
+    "first": 7.439,
+    "same_as_duckdb": true
+   },
+   "2": {
+    "hot": 0.178,
+    "first": 0.472,
+    "same_as_duckdb": true
+   },
+   "3": {
+    "hot": 1.71,
+    "first": 2.313,
+    "same_as_duckdb": true
+   },
+   "4": {
+    "hot": 1.314,
+    "first": 1.573,
+    "same_as_duckdb": true
+   },
+   "5": {
+    "hot": 1.82,
+    "first": 2.319,
+    "same_as_duckdb": true
+   },
+   "6": {
+    "hot": 0.503,
+    "first": 0.542,
+    "same_as_duckdb": true
+   },
+   "7": {
+    "hot": 1.858,
+    "first": 1.862,
+    "same_as_duckdb": true
+   },
+   "8": {
+    "hot": 2.308,
+    "first": 2.622,
+    "same_as_duckdb": true
+   },
+   "9": {
+    "error": "exit -9"
+   },
+   "10": {
+    "hot": 1.751,
+    "first": 2.541,
+    "same_as_duckdb": true
+   },
+   "11": {
+    "hot": 0.462,
+    "first": 0.593,
+    "same_as_duckdb": true
+   },
+   "12": {
+    "hot": 1.151,
+    "first": 1.208,
+    "same_as_duckdb": true
+   },
+   "13": {
+    "hot": 3.257,
+    "first": 3.257,
+    "same_as_duckdb": true
+   },
+   "14": {
+    "hot": 0.904,
+    "first": 1.206,
+    "same_as_duckdb": true
+   },
+   "15": {
+    "hot": 0.806,
+    "first": 0.871,
+    "same_as_duckdb": true
+   },
+   "16": {
+    "hot": 0.314,
+    "first": 0.345,
+    "same_as_duckdb": true
+   },
+   "17": {
+    "hot": 1.052,
+    "first": 1.264,
+    "same_as_duckdb": true
+   },
+   "18": {
+    "hot": 6.192,
+    "first": 8.411,
+    "same_as_duckdb": true
+   },
+   "19": {
+    "hot": 1.409,
+    "first": 1.796,
+    "same_as_duckdb": true
+   },
+   "20": {
+    "hot": 3.185,
+    "first": 3.185,
+    "same_as_duckdb": true
+   },
+   "21": {
+    "hot": 12.972,
+    "first": 13.179,
+    "same_as_duckdb": true
+   },
+   "22": {
+    "hot": 0.416,
+    "first": 0.561,
+    "same_as_duckdb": true
+   },
+   "total_hot": null,
+   "answers_match": 21
+  },
+  "polars-streaming": {
+   "1": {
+    "hot": 2.566,
+    "first": 2.566,
+    "same_as_duckdb": true
+   },
+   "2": {
+    "hot": 0.205,
+    "first": 0.254,
+    "same_as_duckdb": true
+   },
+   "3": {
+    "hot": 1.747,
+    "first": 1.747,
+    "same_as_duckdb": true
+   },
+   "4": {
+    "hot": 1.798,
+    "first": 1.905,
+    "same_as_duckdb": true
+   },
+   "5": {
+    "hot": 1.833,
+    "first": 2.044,
+    "same_as_duckdb": true
+   },
+   "6": {
+    "hot": 0.529,
+    "first": 0.529,
+    "same_as_duckdb": true
+   },
+   "7": {
+    "hot": 1.937,
+    "first": 1.937,
+    "same_as_duckdb": true
+   },
+   "8": {
+    "hot": 1.965,
+    "first": 2.341,
+    "same_as_duckdb": true
+   },
+   "9": {
+    "hot": 3.767,
+    "first": 3.985,
+    "same_as_duckdb": true
+   },
+   "10": {
+    "hot": 1.897,
+    "first": 1.898,
+    "same_as_duckdb": true
+   },
+   "11": {
+    "hot": 0.362,
+    "first": 0.369,
+    "same_as_duckdb": true
+   },
+   "12": {
+    "hot": 1.235,
+    "first": 1.266,
+    "same_as_duckdb": true
+   },
+   "13": {
+    "hot": 2.285,
+    "first": 2.308,
+    "same_as_duckdb": true
+   },
+   "14": {
+    "hot": 0.869,
+    "first": 0.925,
+    "same_as_duckdb": true
+   },
+   "15": {
+    "hot": 0.751,
+    "first": 0.751,
+    "same_as_duckdb": true
+   },
+   "16": {
+    "hot": 0.42,
+    "first": 0.464,
+    "same_as_duckdb": true
+   },
+   "17": {
+    "hot": 1.209,
+    "first": 1.27,
+    "same_as_duckdb": true
+   },
+   "18": {
+    "hot": 3.515,
+    "first": 3.748,
+    "same_as_duckdb": true
+   },
+   "19": {
+    "hot": 1.298,
+    "first": 1.396,
+    "same_as_duckdb": true
+   },
+   "20": {
+    "hot": 2.026,
+    "first": 2.137,
+    "same_as_duckdb": true
+   },
+   "21": {
+    "hot": 10.115,
+    "first": 11.041,
+    "same_as_duckdb": true
+   },
+   "22": {
+    "hot": 0.467,
+    "first": 0.543,
+    "same_as_duckdb": true
+   },
+   "total_hot": 42.8,
+   "answers_match": 22
+  },
+  "daft": {
+   "1": {
+    "hot": 4.607,
+    "first": 6.235,
+    "same_as_duckdb": true
+   },
+   "2": {
+    "hot": 1.153,
+    "first": 1.267,
+    "same_as_duckdb": true
+   },
+   "3": {
+    "hot": 4.13,
+    "first": 4.13,
+    "same_as_duckdb": true
+   },
+   "4": {
+    "hot": 1.371,
+    "first": 1.437,
+    "same_as_duckdb": true
+   },
+   "5": {
+    "hot": 3.32,
+    "first": 3.554,
+    "same_as_duckdb": true
+   },
+   "6": {
+    "hot": 1.214,
+    "first": 1.214,
+    "same_as_duckdb": true
+   },
+   "7": {
+    "hot": 4.079,
+    "first": 4.079,
+    "same_as_duckdb": true
+   },
+   "8": {
+    "hot": 4.306,
+    "first": 4.968,
+    "same_as_duckdb": true
+   },
+   "9": {
+    "hot": 7.003,
+    "first": 7.003,
+    "same_as_duckdb": true
+   },
+   "10": {
+    "hot": 5.878,
+    "first": 6.279,
+    "same_as_duckdb": true
+   },
+   "11": {
+    "hot": 1.243,
+    "first": 1.339,
+    "same_as_duckdb": true
+   },
+   "12": {
+    "hot": 3.402,
+    "first": 3.571,
+    "same_as_duckdb": true
+   },
+   "13": {
+    "hot": 4.525,
+    "first": 4.525,
+    "same_as_duckdb": true
+   },
+   "14": {
+    "hot": 3.216,
+    "first": 3.566,
+    "same_as_duckdb": true
+   },
+   "15": {
+    "hot": 2.742,
+    "first": 3.152,
+    "same_as_duckdb": false
+   },
+   "16": {
+    "hot": 1.0,
+    "first": 1.12,
+    "same_as_duckdb": true
+   },
+   "17": {
+    "hot": 7.692,
+    "first": 7.973,
+    "same_as_duckdb": true
+   },
+   "18": {
+    "hot": 4.524,
+    "first": 4.988,
+    "same_as_duckdb": true
+   },
+   "19": {
+    "hot": 4.333,
+    "first": 4.418,
+    "same_as_duckdb": true
+   },
+   "20": {
+    "hot": 3.55,
+    "first": 3.954,
+    "same_as_duckdb": true
+   },
+   "21": {
+    "hot": 15.057,
+    "first": 15.529,
+    "same_as_duckdb": true
+   },
+   "22": {
+    "hot": 0.618,
+    "first": 0.743,
+    "same_as_duckdb": true
+   },
+   "total_hot": 88.96,
+   "answers_match": 21
+  }
+ },
+ "note": "duckdb, pondra and pondra-cold ran with the final memory defaults (a third of RAM for queries, 1.5 GB for the hot columns); polars, daft and polars-streaming ran earlier on the same machine and data. duckdb-native is missing: loading SF10 into DuckDB needs about 7 GB of temporary space beyond this machine's memory, and there wasn't room for it."
+}

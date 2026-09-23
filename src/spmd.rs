@@ -175,7 +175,7 @@ async fn plan(lake: &Lake, s: &Slice) -> Result<(SessionContext, Arc<dyn Executi
     for p in &s.parts {
         let meta: TableMeta = lake.cat.get(&table_key(&p.table)).await?.context("no table")?;
         let (after, upto) = p.tail.unwrap_or((0, 0)); // (0, 0): no tail
-        let schema = crate::query::schema(&meta.columns)?;
+        let schema = crate::query::read_schema(&meta.columns)?;
         let sealed = meta.sealed.clone().unwrap_or_default();
         let share = Some((sealed.rows + meta.files.iter().map(|f| f.rows).sum::<u64>(), sealed.bytes + meta.files.iter().map(|f| f.bytes).sum::<u64>()));
         let meta = TableMeta { files: p.files.clone(), tiered: after, ..meta };

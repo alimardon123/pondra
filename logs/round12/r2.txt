@@ -1,0 +1,163 @@
+=== tools/open_check.py --s3 ===
+{
+ "lake": "s3://pondbucket/round12/test-7577aac1",
+ "pondra": {
+  "events": 60000,
+  "kv": 50,
+  "totals": 100,
+  "dims": 100
+ },
+ "external": {
+  "events": {
+   "delta/delta-rs": 60000,
+   "delta/polars": 60000,
+   "delta/duckdb": 60000,
+   "iceberg/pyiceberg": 60000,
+   "iceberg/polars": 60000,
+   "iceberg/duckdb": 60000,
+   "iceberg/rest/pyiceberg": 60000,
+   "iceberg/rest/duckdb": 60000
+  },
+  "kv": {
+   "delta/delta-rs": 50,
+   "delta/polars": 50,
+   "delta/duckdb": 50,
+   "iceberg/pyiceberg": 50,
+   "iceberg/polars": 50,
+   "iceberg/duckdb": 50,
+   "iceberg/rest/pyiceberg": 50,
+   "iceberg/rest/duckdb": 50
+  },
+  "totals": {
+   "delta/delta-rs": 100,
+   "delta/polars": 100,
+   "delta/duckdb": 100,
+   "iceberg/pyiceberg": 100,
+   "iceberg/polars": 100,
+   "iceberg/duckdb": 100,
+   "iceberg/rest/pyiceberg": 100,
+   "iceberg/rest/duckdb": 100
+  },
+  "dims": {
+   "delta/delta-rs": 100,
+   "delta/polars": 100,
+   "delta/duckdb": 100,
+   "iceberg/pyiceberg": 100,
+   "iceberg/polars": 100,
+   "iceberg/duckdb": 100,
+   "iceberg/rest/pyiceberg": 100,
+   "iceberg/rest/duckdb": 100
+  }
+ },
+ "match": true
+}
+--- exit 0 ---
+=== tools/harness.py scale --s3 ===
+Traceback (most recent call last):
+  File "/home/claude/pondra/tools/harness.py", line 1063, in <module>
+    {"crash": crash, "upsert": upsert, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "scale": scale, "flight": flight, "load": load, "all": all_tests}[A.mode]()
+  File "/home/claude/pondra/tools/harness.py", line 754, in scale
+    q(f"INSERT INTO ev SELECT value, to_timestamp_seconds({base} + value * 3600), 1.0, 'late', 'x' FROM generate_series(0, 99)")
+  File "/home/claude/pondra/tools/harness.py", line 730, in <lambda>
+    q = lambda s, p=port: sql(p, s)
+                          ^^^^^^^^^
+  File "/home/claude/pondra/tools/harness.py", line 30, in sql
+    return call(port, "POST", "/sql", q.encode())
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/claude/pondra/tools/harness.py", line 22, in call
+    r = c.getresponse()
+        ^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.11/http/client.py", line 1415, in getresponse
+    response.begin()
+  File "/usr/lib/python3.11/http/client.py", line 330, in begin
+    version, status, reason = self._read_status()
+                              ^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.11/http/client.py", line 291, in _read_status
+    line = str(self.fp.readline(_MAXLINE + 1), "iso-8859-1")
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.11/socket.py", line 718, in readinto
+    return self._sock.recv_into(b)
+           ^^^^^^^^^^^^^^^^^^^^^^^
+TimeoutError: timed out
+--- exit 1 ---
+=== tools/harness.py clients --s3 ===
+{
+ "clients": {
+  "no token -> 401": true,
+  "read token can't write": true,
+  "write token can't create": true,
+  "users via SQL": true,
+  "pandas / polars / list appends": true,
+  "lookup": true,
+  "change feed replay (upserts + delete)": true,
+  "psycopg 3": true,
+  "psycopg 3 binary": true,
+  "psycopg2": true,
+  "SQLAlchemy + pandas": true,
+  "asyncpg": true,
+  "wrong password refused": true,
+  "cross-lake join": true,
+  "inbox write": true,
+  "vector search (SQL + Postgres)": true,
+  "SQL can't touch the node's files": true,
+  "MCP": true
+ },
+ "inbox_s": 8.69,
+ "ok": true
+}
+--- exit 0 ---
+=== tools/harness.py upsert --s3 ===
+upsert: 392 live keys after 12,000 random upserts/deletes, 6 compactions (s: 2.9, 2.5, 3.8, 3.6, 1.5, 2.2), 1 restart, 3,400 lookups (0 wrong) -> OK
+--- exit 0 ---
+=== tools/harness.py crash --runs 1 --batches 40 --size 20000 --s3 ===
+run  1: kill-9=11 injected={'after_seg_put': 6, 'after_commit': 0, 'after_parquet_put': 32} events=2400000/2400000 unique=2400000 task_output=1200000/1200000 views=exact -> OK
+--- exit 0 ---
+R2DONE
+=== tools/harness.py scale --s3 (re-run: jobs budgeted by bytes) ===
+{
+ "scale": {
+  "bad partition specs refused": true,
+  "files sealed into manifests": true,
+  "every row, every day": true,
+  "one day reads only its files": true,
+  "every file holds one day": true,
+  "three nodes: same answer": true,
+  "shuffles (GROUP BY, joins, windows) = one node": true,
+  "Delta and Iceberg readers see sealed files": true,
+  "over the memory limit: aggregation, sort, join": true
+ },
+ "shuffles": {
+  "many groups": "same, shuffled",
+  "groups, no order": "same, shuffled",
+  "HAVING": "same, shuffled",
+  "string keys": "same, shuffled",
+  "DISTINCT": "same, shuffled",
+  "join, then many groups": "same, shuffled",
+  "join, filters, count": "same",
+  "join, then another key": "same, shuffled",
+  "self-join": "same, shuffled",
+  "count(DISTINCT) per group": "same, shuffled",
+  "window, PARTITION BY": "same, shuffled",
+  "window over all": "same",
+  "global aggregate": "same",
+  "a keyed table": "same, shuffled"
+ },
+ "rows": 23100,
+ "days": 139,
+ "files": {
+  "inline": 69.0,
+  "sealed": 144.0,
+  "parquet_objects": 253,
+  "one_day_scanned": 2.0
+ },
+ "outside_readers": {
+  "delta-rs": 23100,
+  "polars": 23100,
+  "duckdb": 23100,
+  "iceberg/pyiceberg": 23100,
+  "iceberg/polars": 23100,
+  "iceberg/duckdb": 23100
+ },
+ "ok": true
+}
+--- exit 0 ---

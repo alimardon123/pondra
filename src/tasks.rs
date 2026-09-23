@@ -94,7 +94,7 @@ pub async fn create(lake: &Lake, name: &str, task: &Task) -> Result<()> {
     let out = session(lake, &task.sql, "").await?.sql(&task.sql).await?.schema().as_arrow().clone();
     let mut puts = vec![(task_key(name), json(task))];
     if lake.cat.get::<TableMeta>(&table_key(&task.target)).await?.is_none() {
-        let columns = out.fields().iter().map(|f| (f.name().clone(), f.data_type().to_string())).collect();
+        let columns = out.fields().iter().map(|f| (f.name().clone(), crate::query::type_name(f.data_type()))).collect();
         puts.push((table_key(&task.target), json(&TableMeta { columns, key: task.key.clone(), publish: default_publish(), ..Default::default() })));
     }
     lake.cat.commit(puts, &[]).await

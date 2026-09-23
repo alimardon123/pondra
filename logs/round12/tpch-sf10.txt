@@ -1,0 +1,144 @@
+== duckdb
+  duckdb            q1    2.242 s
+  duckdb            q2    0.383 s
+  duckdb            q3    1.685 s
+  duckdb            q4    1.067 s
+  duckdb            q5    1.929 s
+  duckdb            q6    1.106 s
+  duckdb            q7    1.729 s
+  duckdb            q8    2.176 s
+  duckdb            q9    4.009 s
+  duckdb            q10   1.878 s
+  duckdb            q11   0.285 s
+  duckdb            q12   1.343 s
+  duckdb            q13   2.577 s
+  duckdb            q14   1.283 s
+  duckdb            q15   1.048 s
+  duckdb            q16   0.419 s
+  duckdb            q17   1.889 s
+  duckdb            q18   3.368 s
+  duckdb            q19   1.941 s
+  duckdb            q20   1.737 s
+  duckdb            q21   5.040 s
+  duckdb            q22   0.613 s
+== pondra
+  pondra            q1    1.959 s
+  pondra            q2    0.156 s
+  pondra            q3    0.832 s
+  pondra            q4    0.828 s
+  pondra            q5    2.065 s
+  pondra            q6    1.013 s
+  pondra            q7    2.809 s
+  pondra            q8    2.010 s
+  pondra            q9    4.133 s
+  pondra            q10   2.543 s
+  pondra            q11   0.206 s
+  pondra            q12   1.385 s
+  pondra            q13   1.690 s
+  pondra            q14   0.793 s
+  pondra            q15   1.434 s
+  pondra            q16   0.467 s
+  pondra            q17   1.167 s
+  pondra            q18   5.296 s
+  pondra            q19   1.762 s
+  pondra            q20   1.772 s
+  pondra            q21 FAILED: http.client.RemoteDisconnected: Remote end closed connection without response
+  pondra            q22 FAILED: ConnectionRefusedError: [Errno 111] Connection refused
+== pondra-cold
+  pondra-cold       q1    1.951 s
+  pondra-cold       q2    0.286 s
+  pondra-cold       q3    1.354 s
+  pondra-cold       q4    0.874 s
+  pondra-cold       q5    1.889 s
+  pondra-cold       q6    0.937 s
+  pondra-cold       q7    2.690 s
+  pondra-cold       q8    1.710 s
+  pondra-cold       q9    3.509 s
+  pondra-cold       q10   2.495 s
+  pondra-cold       q11   0.205 s
+  pondra-cold       q12   1.307 s
+  pondra-cold       q13   1.812 s
+  pondra-cold       q14   0.714 s
+  pondra-cold       q15   1.359 s
+  pondra-cold       q16   0.660 s
+  pondra-cold       q17   1.094 s
+  pondra-cold       q18   4.970 s
+  pondra-cold       q19   1.563 s
+  pondra-cold       q20   1.344 s
+  pondra-cold       q21   4.897 s
+  pondra-cold       q22   0.391 s
+
+            duckdb      pondra pondra-cold
+q1          2.242      1.959      1.951
+q2          0.383      0.156      0.286
+q3          1.685      0.832      1.354
+q4          1.067      0.828      0.874
+q5          1.929      2.065      1.889
+q6          1.106      1.013      0.937
+q7          1.729      2.809      2.690
+q8          2.176      2.010      1.710
+q9          4.009      4.133      3.509
+q10         1.878      2.543      2.495
+q11         0.285      0.206      0.205
+q12         1.343      1.385      1.307
+q13         2.577      1.690      1.812
+q14         1.283      0.793      0.714
+q15         1.048      1.434      1.359
+q16         0.419      0.467      0.660
+q17         1.889      1.167      1.094
+q18         3.368      5.296      4.970
+q19         1.941      1.762      1.563
+q20         1.737      1.772      1.344
+q21         5.040        FAIL      4.897
+q22         0.613        FAIL      0.391
+total        39.75         nan       38.01
+{"pondra_load_s": 85.0, "duckdb_load_s": 0.0, "duckdb_wall_s": 125.8, "pondra_warm_s": 98.5, "pondra_wall_s": 519.1, "pondra-cold_wall_s": 131.9}
+== pondra
+  pondra            q1    1.842 s
+  pondra            q2    0.166 s
+  pondra            q3    0.927 s
+  pondra            q4    0.819 s
+  pondra            q5    1.953 s
+  pondra            q6    0.980 s
+  pondra            q7    2.523 s
+  pondra            q8    1.888 s
+  pondra            q9    3.207 s
+  pondra            q10   2.282 s
+  pondra            q11   0.235 s
+  pondra            q12   1.389 s
+  pondra            q13   1.851 s
+  pondra            q14   0.674 s
+  pondra            q15   1.315 s
+  pondra            q16   0.519 s
+  pondra            q17   1.225 s
+  pondra            q18   4.434 s
+  pondra            q19   1.667 s
+  pondra            q20   1.329 s
+  pondra            q21   4.337 s
+  pondra            q22   0.332 s
+
+            pondra
+q1          1.842
+q2          0.166
+q3          0.927
+q4          0.819
+q5          1.953
+q6          0.980
+q7          2.523
+q8          1.888
+q9          3.207
+q10         2.282
+q11         0.235
+q12         1.389
+q13         1.851
+q14         0.674
+q15         1.315
+q16         0.519
+q17         1.225
+q18         4.434
+q19         1.667
+q20         1.329
+q21         4.337
+q22         0.332
+total        35.89
+{"pondra_load_s": 89.3, "pondra_warm_s": 90.2, "pondra_wall_s": 123.8}

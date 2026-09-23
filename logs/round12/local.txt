@@ -1,0 +1,469 @@
+=== tools/harness.py all ===
+upsert: 396 live keys after 12,000 random upserts/deletes, 6 compactions (s: 0.1, 0.0, 0.0, 0.0, 0.0, 0.0), 1 restart, 3,400 lookups (0 wrong) -> OK
+tiering: 12 rounds -> files {'events': 5, 'kv': 5, 'totals': 5}, untiered rows 0, rows {'events': 1200, 'kv': {'n': 200, 'v': 2400}, 'totals': 1200} -> OK
+fence: 2nd node joined as follower=True; takeover after 6.0s; stale leader's write rejected; it rejoined as follower; rows=[{'producer': 'a', 'n': 200}, {'producer': 'b', 'n': 200}] -> OK
+insert: first={'rows': 5} retry={'duplicate': True} summary={'groups': 5, 'n': 5000} -> OK
+{"serverless": {"alone_s": 0.03, "retry": ["{\"rows\":1000}", "{\"duplicate\":true}"], "four_at_once": ["{\"rows\":1000}", "{\"rows\":1000}", "{\"rows\":1000}", "{\"rows\":1000}"], "node_start_s": 0.07, "node_leads": true, "via_node_s": 0.09, "after_leader_killed_s": 30.13, "rows": {"n": 8000, "ids": 1000}, "ok": true}}
+{
+ "clients": {
+  "no token -> 401": true,
+  "read token can't write": true,
+  "write token can't create": true,
+  "users via SQL": true,
+  "pandas / polars / list appends": true,
+  "lookup": true,
+  "change feed replay (upserts + delete)": true,
+  "psycopg 3": true,
+  "psycopg 3 binary": true,
+  "psycopg2": true,
+  "SQLAlchemy + pandas": true,
+  "asyncpg": true,
+  "wrong password refused": true,
+  "cross-lake join": true,
+  "inbox write": true,
+  "vector search (SQL + Postgres)": true,
+  "SQL can't touch the node's files": true,
+  "MCP": true
+ },
+ "inbox_s": 1.09,
+ "ok": true
+}
+/home/claude/pondra/tools/harness.py:1044: DeprecationWarning: value_serializer does not implement kafka.serializer.Serializer
+  out = {t.__name__: t() for t in (upsert, tiering, fence, insert, serverless, clients, kafka, alter, windows, scale, flight, reader, crash)}
+%4|1790109467.192|OFFSET|rdkafka#consumer-9| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109468.193|OFFSET|rdkafka#consumer-9| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109469.194|OFFSET|rdkafka#consumer-9| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109470.196|OFFSET|rdkafka#consumer-9| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109471.198|OFFSET|rdkafka#consumer-9| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109472.199|OFFSET|rdkafka#consumer-9| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109473.202|OFFSET|rdkafka#consumer-9| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109474.204|OFFSET|rdkafka#consumer-9| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109475.206|OFFSET|rdkafka#consumer-9| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109476.207|OFFSET|rdkafka#consumer-9| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109477.210|OFFSET|rdkafka#consumer-9| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109478.211|OFFSET|rdkafka#consumer-9| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109479.213|OFFSET|rdkafka#consumer-9| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109480.214|OFFSET|rdkafka#consumer-9| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109481.217|OFFSET|rdkafka#consumer-9| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109482.219|OFFSET|rdkafka#consumer-9| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109483.221|OFFSET|rdkafka#consumer-9| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109484.223|OFFSET|rdkafka#consumer-9| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109485.225|OFFSET|rdkafka#consumer-9| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109486.227|OFFSET|rdkafka#consumer-9| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109487.229|OFFSET|rdkafka#consumer-9| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109488.231|OFFSET|rdkafka#consumer-9| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109489.233|OFFSET|rdkafka#consumer-9| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109490.235|OFFSET|rdkafka#consumer-9| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109491.237|OFFSET|rdkafka#consumer-9| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109492.239|OFFSET|rdkafka#consumer-9| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109493.240|OFFSET|rdkafka#consumer-9| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109494.241|OFFSET|rdkafka#consumer-9| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109495.243|OFFSET|rdkafka#consumer-9| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109496.245|OFFSET|rdkafka#consumer-9| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109497.248|OFFSET|rdkafka#consumer-9| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109498.250|OFFSET|rdkafka#consumer-9| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109499.252|OFFSET|rdkafka#consumer-9| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109500.253|OFFSET|rdkafka#consumer-9| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109501.256|OFFSET|rdkafka#consumer-9| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109502.258|OFFSET|rdkafka#consumer-9| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109503.260|OFFSET|rdkafka#consumer-9| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109504.262|OFFSET|rdkafka#consumer-9| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109505.264|OFFSET|rdkafka#consumer-9| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109506.266|OFFSET|rdkafka#consumer-9| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109507.268|OFFSET|rdkafka#consumer-9| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109508.270|OFFSET|rdkafka#consumer-9| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+groups: 10000 11000 21000 12884903888 12884903887 [0, 1] 15000
+%3|1790109508.536|FAIL|rdkafka#producer-10| [thrd:sasl_plaintext://127.0.0.1:8110/bootstrap]: sasl_plaintext://127.0.0.1:8110/bootstrap: SASL authentication error: wrong user name or password (after 0ms in state AUTH_REQ)
+%3|1790109508.721|FAIL|rdkafka#producer-10| [thrd:sasl_plaintext://127.0.0.1:8110/bootstrap]: sasl_plaintext://127.0.0.1:8110/bootstrap: SASL authentication error: wrong user name or password (after 0ms in state AUTH_REQ, 1 identical error(s) suppressed)
+%5|1790109511.538|PARTCNT|rdkafka#producer-11| [thrd:sasl_plaintext://127.0.0.1:8110/2111747765]: Topic events (id AAAAAAAAAAAAAAAAAAAAAA) partition count changed from 1 to 0
+%6|1790109511.549|FAIL|rdkafka#producer-11| [thrd:sasl_plaintext://127.0.0.1:8110/2111747765]: sasl_plaintext://127.0.0.1:8110/2{
+ "kafka": {
+  "librdkafka (5 codecs, idempotent) + kafka-python": true,
+  "a view fed by Kafka": true,
+  "exactly-once retries (idempotent producer)": true,
+  "Debezium events and tombstones": true,
+  "raw values (_value), queried as JSON": true,
+  "kafka-python consumer (upserts, deletes as tombstones)": true,
+  "librdkafka consumer": true,
+  "consumer groups (commit, hand-over via a follower, one holder)": false,
+  "wrong password / read token refused": true
+ },
+ "librdkafka_20k_events_s": 2.69,
+ "ok": false
+}
+111747765: Disconnected: connection closed by peer: receive 0 after POLLIN (after 11ms in state UP)
+--- exit 1 ---
+=== tools/harness.py clients ===
+{
+ "clients": {
+  "no token -> 401": true,
+  "read token can't write": true,
+  "write token can't create": true,
+  "users via SQL": true,
+  "pandas / polars / list appends": true,
+  "lookup": true,
+  "change feed replay (upserts + delete)": true,
+  "psycopg 3": true,
+  "psycopg 3 binary": true,
+  "psycopg2": true,
+  "SQLAlchemy + pandas": true,
+  "asyncpg": true,
+  "wrong password refused": true,
+  "cross-lake join": true,
+  "inbox write": true,
+  "vector search (SQL + Postgres)": true,
+  "SQL can't touch the node's files": true,
+  "MCP": true
+ },
+ "inbox_s": 1.07,
+ "ok": true
+}
+--- exit 0 ---
+=== tools/harness.py scale ===
+{
+ "scale": {
+  "bad partition specs refused": true,
+  "files sealed into manifests": true,
+  "every row, every day": true,
+  "one day reads only its files": true,
+  "every file holds one day": true,
+  "three nodes: same answer": true,
+  "shuffles (GROUP BY, joins, windows) = one node": true,
+  "Delta and Iceberg readers see sealed files": true,
+  "over the memory limit: aggregation, sort, join": true
+ },
+ "shuffles": {
+  "many groups": "same, shuffled",
+  "groups, no order": "same, shuffled",
+  "HAVING": "same, shuffled",
+  "string keys": "same, shuffled",
+  "DISTINCT": "same, shuffled",
+  "join, then many groups": "same, shuffled",
+  "join, filters, count": "same",
+  "join, then another key": "same, shuffled",
+  "self-join": "same, shuffled",
+  "count(DISTINCT) per group": "same, shuffled",
+  "window, PARTITION BY": "same, shuffled",
+  "window over all": "same",
+  "global aggregate": "same",
+  "a keyed table": "same, shuffled"
+ },
+ "rows": 23100,
+ "days": 139,
+ "files": {
+  "inline": 98.0,
+  "sealed": 152.0,
+  "parquet_objects": 512,
+  "one_day_scanned": 2.0
+ },
+ "outside_readers": {
+  "delta-rs": 23100,
+  "polars": 23100,
+  "duckdb": 23100,
+  "iceberg/pyiceberg": 23100,
+  "iceberg/polars": 23100,
+  "iceberg/duckdb": 23100
+ },
+ "ok": true
+}
+--- exit 0 ---
+=== tools/harness.py flight ===
+/usr/local/lib/python3.11/dist-packages/adbc_driver_manager/dbapi.py:369: Warning: Cannot disable autocommit; conn will not be DB-API 2.0 compliant
+  warnings.warn(
+{
+ "flight": {
+  "DoPut: 10 batches acked": true,
+  "a retried stream is applied once": true,
+  "DoPut to a follower": true,
+  "a read token can't write": true,
+  "DoGet SQL": true,
+  "GetFlightInfo + DoGet": true,
+  "ListFlights": true,
+  "the log, two columns": true,
+  "the log, following": true,
+  "basic-auth handshake": true,
+  "ADBC query": true,
+  "ADBC write as a query, ingest, objects": true,
+  "every row once": true
+ },
+ "follow_ms": 6,
+ "ok": true
+}
+--- exit 0 ---
+=== tools/harness.py windows ===
+{
+ "windows": {
+  "closed windows only": true,
+  "each window once, final": true,
+  "late row: in the view, not re-emitted": true
+ },
+ "ok": true
+}
+--- exit 0 ---
+=== tools/harness.py alter ===
+{
+ "alter": {
+  "old and new rows": true,
+  "the new column": true,
+  "a view over the table": true,
+  "a keyed table": true,
+  "lookup": true,
+  "IF NOT EXISTS": true,
+  "a clash is refused": true,
+  "Delta and Iceberg readers": true
+ },
+ "rows_written_during": 65800,
+ "outside_readers": {
+  "delta-rs": 65803,
+  "polars": 65803,
+  "duckdb": 65803,
+  "iceberg/pyiceberg": 65803,
+  "iceberg/polars": 65803,
+  "iceberg/duckdb": 65803
+ },
+ "ok": true
+}
+--- exit 0 ---
+=== tools/harness.py serverless ===
+{"serverless": {"alone_s": 0.03, "retry": ["{\"rows\":1000}", "{\"duplicate\":true}"], "four_at_once": ["{\"rows\":1000}", "{\"rows\":1000}", "{\"rows\":1000}", "{\"rows\":1000}"], "node_start_s": 0.02, "node_leads": true, "via_node_s": 0.03, "after_leader_killed_s": 30.13, "rows": {"n": 8000, "ids": 1000}, "ok": true}}
+--- exit 0 ---
+=== tools/harness.py kafka ===
+/home/claude/pondra/tools/harness.py:1063: DeprecationWarning: value_serializer does not implement kafka.serializer.Serializer
+  {"crash": crash, "upsert": upsert, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "scale": scale, "flight": flight, "load": load, "all": all_tests}[A.mode]()
+%4|1790109609.875|OFFSET|rdkafka#consumer-8| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109610.876|OFFSET|rdkafka#consumer-8| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109611.878|OFFSET|rdkafka#consumer-8| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109612.880|OFFSET|rdkafka#consumer-8| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109613.882|OFFSET|rdkafka#consumer-8| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109614.885|OFFSET|rdkafka#consumer-8| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109615.886|OFFSET|rdkafka#consumer-8| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109616.888|OFFSET|rdkafka#consumer-8| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109617.889|OFFSET|rdkafka#consumer-8| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109618.891|OFFSET|rdkafka#consumer-8| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109619.893|OFFSET|rdkafka#consumer-8| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109620.895|OFFSET|rdkafka#consumer-8| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109621.896|OFFSET|rdkafka#consumer-8| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109622.898|OFFSET|rdkafka#consumer-8| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109623.900|OFFSET|rdkafka#consumer-8| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109624.903|OFFSET|rdkafka#consumer-8| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109625.904|OFFSET|rdkafka#consumer-8| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109626.907|OFFSET|rdkafka#consumer-8| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109627.908|OFFSET|rdkafka#consumer-8| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109628.910|OFFSET|rdkafka#consumer-8| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109629.913|OFFSET|rdkafka#consumer-8| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109630.914|OFFSET|rdkafka#consumer-8| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109631.917|OFFSET|rdkafka#consumer-8| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109632.919|OFFSET|rdkafka#consumer-8| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109633.921|OFFSET|rdkafka#consumer-8| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109634.922|OFFSET|rdkafka#consumer-8| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109635.924|OFFSET|rdkafka#consumer-8| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109636.925|OFFSET|rdkafka#consumer-8| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109637.927|OFFSET|rdkafka#consumer-8| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109638.929|OFFSET|rdkafka#consumer-8| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109639.931|OFFSET|rdkafka#consumer-8| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109640.933|OFFSET|rdkafka#consumer-8| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109641.935|OFFSET|rdkafka#consumer-8| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109642.937|OFFSET|rdkafka#consumer-8| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109643.940|OFFSET|rdkafka#consumer-8| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109644.942|OFFSET|rdkafka#consumer-8| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109645.945|OFFSET|rdkafka#consumer-8| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109646.946|OFFSET|rdkafka#consumer-8| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109647.949|OFFSET|rdkafka#consumer-8| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109648.951|OFFSET|rdkafka#consumer-8| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109649.953|OFFSET|rdkafka#consumer-8| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+%4|1790109650.955|OFFSET|rdkafka#consumer-8| [thrd:main]: events [0]: offset reset (at offset 0 (leader epoch -1), broker 2111747765) to cached BEGINNING offset offset 0 (leader epoch -1): fetch failed due to requested offset not available on the broker: Broker: Offset out of range
+groups: 10000 11000 21000 12884903888 12884903887 [1, 0] 15000
+%3|1790109651.421|FAIL|rdkafka#producer-10| [thrd:sasl_plaintext://127.0.0.1:8110/bootstrap]: sasl_plaintext://127.0.0.1:8110/bootstrap: SASL authentication error: wrong user name or password (after 0ms in state AUTH_REQ)
+%3|1790109651.719|FAIL|rdkafka#producer-10| [thrd:sasl_plaintext://127.0.0.1:8110/bootstrap]: sasl_plaintext://127.0.0.1:8110/bootstrap: SASL authentication error: wrong user name or password (after 0ms in state AUTH_REQ, 1 identical error(s) suppressed)
+%5|1790109654.424|PARTCNT|rdkafka#producer-11| [thrd:sasl_plaintext://127.0.0.1:8110/2111747765]: Topic events (id AAAAAAAAAAAAAAAAAAAAAA) partition count changed from 1 to 0
+%6|1790109654.436|FAIL|rdkafka#producer-11| [thrd:sasl_plaintext://127.0.0.1:8110/2111747765]: sasl_plaintext://127.0.0.1:8110/2111747765: Disconnected: connection closed by peer: receive 0 after POLLIN (after 12ms in state UP)
+{
+ "kafka": {
+  "librdkafka (5 codecs, idempotent) + kafka-python": true,
+  "a view fed by Kafka": true,
+  "exactly-once retries (idempotent producer)": true,
+  "Debezium events and tombstones": true,
+  "raw values (_value), queried as JSON": true,
+  "kafka-python consumer (upserts, deletes as tombstones)": true,
+  "librdkafka consumer": true,
+  "consumer groups (commit, hand-over via a follower, one holder)": false,
+  "wrong password / read token refused": true
+ },
+ "librdkafka_20k_events_s": 2.64,
+ "ok": false
+}
+--- exit 1 ---
+=== tools/cluster.py users --secs 30 ===
+users: 64 writers + 16 readers + 2 serverless on 3 node(s), 31s  lake /tmp/pondra-jr55i5m7
+  2683800 events (87,575/s), ack p50 57 ms p99 286 ms
+  1981 snapshot reads, query p50 218 ms p99 1001 ms
+  inconsistent reads: 0; producers with lost/duplicate batches: 0
+    by node: {}
+--- exit 0 ---
+=== tools/cluster.py failover --secs 45 ===
+  killed leader :18080; new leader :18082 accepting writes after 4.8s
+  killed leader :18082; new leader :18081 accepting writes after 4.5s
+failover: 3 nodes, 6 shards, 8 producers, 1612900 events, 1 follower + 2 leader kills
+  failovers: 4.8s, 4.5s (kill -> writes acked again); state caught up 0.1s after the last write
+  events exactly once: True (1612900 rows); for 1000 users, task state == model: True, inline view == model: True
+  shard runs per node (since each node's last start): {18080: 336, 18081: 488, 18082: 343}
+--- exit 0 ---
+=== tools/open_check.py ===
+{
+ "lake": "/tmp/pondra-y0yq6sku",
+ "pondra": {
+  "events": 60000,
+  "kv": 50,
+  "totals": 100,
+  "dims": 100
+ },
+ "external": {
+  "events": {
+   "delta/delta-rs": 60000,
+   "delta/polars": 60000,
+   "delta/duckdb": 60000,
+   "iceberg/pyiceberg": 60000,
+   "iceberg/polars": 60000,
+   "iceberg/duckdb": 60000,
+   "iceberg/rest/pyiceberg": 60000,
+   "iceberg/rest/duckdb": 60000
+  },
+  "kv": {
+   "delta/delta-rs": 50,
+   "delta/polars": 50,
+   "delta/duckdb": 50,
+   "iceberg/pyiceberg": 50,
+   "iceberg/polars": 50,
+   "iceberg/duckdb": 50,
+   "iceberg/rest/pyiceberg": 50,
+   "iceberg/rest/duckdb": 50
+  },
+  "totals": {
+   "delta/delta-rs": 100,
+   "delta/polars": 100,
+   "delta/duckdb": 100,
+   "iceberg/pyiceberg": 100,
+   "iceberg/polars": 100,
+   "iceberg/duckdb": 100,
+   "iceberg/rest/pyiceberg": 100,
+   "iceberg/rest/duckdb": 100
+  },
+  "dims": {
+   "delta/delta-rs": 100,
+   "delta/polars": 100,
+   "delta/duckdb": 100,
+   "iceberg/pyiceberg": 100,
+   "iceberg/polars": 100,
+   "iceberg/duckdb": 100,
+   "iceberg/rest/pyiceberg": 100,
+   "iceberg/rest/duckdb": 100
+  }
+ },
+ "match": true
+}
+--- exit 0 ---
+=== tools/freshness.py ===
+{
+ "lake": "local disk",
+ "flags": {
+  "tier_secs": 2.0,
+  "publish": "delta,iceberg"
+ },
+ "probes": 10,
+ "write ack": {
+  "p50": 4,
+  "max": 5
+ },
+ "visible to another node after the ack": {
+  "p50": 17,
+  "max": 41
+ },
+ "visible to read-only node after the ack": {
+  "p50": 11,
+  "max": 49
+ },
+ "visible to pondra sql (new process) after the ack": {
+  "p50": 58,
+  "max": 171
+ },
+ "visible to Delta (delta-rs) after the ack": {
+  "p50": 41,
+  "max": 520
+ },
+ "visible to Iceberg (PyIceberg) after the ack": {
+  "p50": 42,
+  "max": 782
+ }
+}
+--- exit 0 ---
+=== tools/harness.py crash --runs 2 --batches 40 --size 20000 ===
+run  1: kill-9=3 injected={'after_seg_put': 3, 'after_commit': 1, 'after_parquet_put': 14} events=2400000/2400000 unique=2400000 task_output=1200000/1200000 views=exact -> OK
+run  2: kill-9=2 injected={'after_seg_put': 2, 'after_commit': 1, 'after_parquet_put': 15} events=2400000/2400000 unique=2400000 task_output=1200000/1200000 views=exact -> OK
+--- exit 0 ---
+=== tools/metadata_bench.py --files 1000000 --publish ===
+before: {"append_ack_ms": 6.0, "tier_commit_ms": 10.3, "insert_ms": 4.4, "query_today_ms": 4.3, "entry_bytes": 2994.0}
+added: {"files": 1000000, "seconds": 17.6, "record_ms_per_50k_files": 495, "inline": 64.0, "sealed": 999947.0, "entry_bytes": 17308.0, "table_bytes": 1073741824338390.0}
+after: {"append_ack_ms": 7.4, "tier_commit_ms": 25.2, "insert_ms": 5.6, "query_today_ms": 10.0, "entry_bytes": 19840.0, "publish_ms": 17, "delta_state_bytes": 24049.0, "iceberg_state_bytes": 70043.0}
+{
+ "before": {
+  "append_ack_ms": 6.0,
+  "tier_commit_ms": 10.3,
+  "insert_ms": 4.4,
+  "query_today_ms": 4.3,
+  "entry_bytes": 2994.0
+ },
+ "added": {
+  "files": 1000000,
+  "seconds": 17.6,
+  "record_ms_per_50k_files": 495,
+  "inline": 64.0,
+  "sealed": 999947.0,
+  "entry_bytes": 17308.0,
+  "table_bytes": 1073741824338390.0
+ },
+ "after": {
+  "append_ack_ms": 7.4,
+  "tier_commit_ms": 25.2,
+  "insert_ms": 5.6,
+  "query_today_ms": 10.0,
+  "entry_bytes": 19840.0,
+  "publish_ms": 17,
+  "delta_state_bytes": 24049.0,
+  "iceberg_state_bytes": 70043.0
+ },
+ "today_scanned": 7.0,
+ "today_skipped": 1000006.0,
+ "day_2010_files": 138.0,
+ "day_2010_plan_ms": 30.3,
+ "cold_query_ms": 26.2,
+ "three_nodes_ms": 104.3,
+ "checks": {
+  "right answers, before and with 1M more files": true,
+  "today's query opened no fake file": true,
+  "one day of 2010 plans that day's files only": true,
+  "catalog entry stays small (< 256 KB)": true,
+  "published state stays small (< 256 KB)": true,
+  "commits as fast (within 2x + 20 ms)": true,
+  "restarted node answers right": true,
+  "three nodes, manifests dealt out: same answer": true
+ },
+ "ok": true
+}
+--- exit 0 ---
+=== tools/keyed_bench.py ===
+{
+ "keys": 2000000,
+ "rounds": 60,
+ "updates_per_round": 20000,
+ "base_mb": 12.3,
+ "written_by_tiering_and_compaction_mb": 30.1,
+ "full_rewrites_would_write_mb": 105.6,
+ "live_files": 7,
+ "tier_call_s_median": 0.012,
+ "tier_call_s_max": 0.356,
+ "total_s": 3.7,
+ "sql_matches_model": true,
+ "wrong_lookups": 0
+}
+--- exit 0 ---
+ALLDONE

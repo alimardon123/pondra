@@ -19,79 +19,147 @@ use std::collections::BTreeMap;
 const HISTORY: usize = 100; // snapshots (and metadata files) kept
 
 /// What the Iceberg metadata says right now (kept in the catalog under `i/{table}`).
+///
+/// One Iceberg manifest per Pondra manifest: ours are immutable, so a sealed manifest's files are
+/// written to Avro once and every later snapshot names that same object. Only the inline files'
+/// manifest is rewritten, and it holds at most `INLINE` of them. So a snapshot of a table with a
+/// million files costs one manifest, not a million entries (ADR-012).
 #[derive(Serialize, Deserialize, Default)]
 struct Published {
     uuid: String,
     version: u64,
-    files: BTreeMap<String, (u64, u64, u64)>, // path in the lake -> (bytes, rows, version that added it)
-    snapshots: Vec<(Value, [String; 2])>,     // kept, oldest first: (snapshot entry, [manifest, manifest list])
+    manifests: BTreeMap<String, Avro>, // our manifest's path -> the Iceberg manifest written for it
+    inline: Option<Avro>,              // the inline files' manifest
+    inlined: BTreeMap<String, u64>,    // those files (path -> rows), to see when they change
+    snapshots: Vec<(Value, String)>,   // kept, oldest first: (snapshot entry, its manifest list)
+    dropped: Vec<(u64, String)>,       // manifests no longer named, deleted once no kept snapshot names them
+}
+
+/// An Iceberg manifest this lake wrote.
+#[derive(Serialize, Deserialize, Default, Clone)]
+struct Avro {
+    path: String,
+    bytes: u64,
+    files: u64,
+    rows: u64,
+    seq: u64, // the snapshot that added it; its entries carry this sequence number
 }
 
 /// The table's next Iceberg version, if its files changed; returns the new state to record.
 pub async fn publish(lake: &Lake, table: &str, meta: &TableMeta) -> Result<Option<(String, Vec<u8>)>> {
     let Some(fields) = fields(&meta.columns) else { return Ok(None) }; // a type Iceberg can't carry
-    let Some(files) = crate::delta::publishable(lake, meta).await? else { return Ok(None) };
+    let Some(parts) = crate::delta::publishable(lake, meta).await? else { return Ok(None) };
     let key = format!("i/{table}");
     let mut st: Published = lake.cat.get(&key).await?.unwrap_or_default();
-    if st.version > 0 && files.len() == st.files.len() && files.iter().all(|f| st.files.contains_key(&f.path)) {
+    let inlined: BTreeMap<String, u64> = parts.inline.iter().map(|f| (f.path.clone(), f.rows)).collect();
+    let fresh: Vec<&crate::manifest::Manifest> = parts.manifests.iter().filter(|m| !st.manifests.contains_key(&m.path)).collect();
+    let went: Vec<String> = st.manifests.keys().filter(|p| !parts.manifests.iter().any(|m| m.path == **p)).cloned().collect();
+    let inline_changed = st.inline.is_none() != parts.inline.is_empty() || st.inlined != inlined;
+    if st.version > 0 && fresh.is_empty() && went.is_empty() && !inline_changed {
         return Ok(None);
     }
     if st.uuid.is_empty() {
         st.uuid = uuid::Uuid::new_v4().to_string();
     }
-    let (dir, now) = (format!("data/{table}/metadata"), crate::log::now_ms());
-    for v in st.version + 1.. {
-        // Every live file, in one manifest: new ones as added by this snapshot, the rest as they were.
-        let live: BTreeMap<&str, (u64, u64, u64)> = files.iter().map(|f| (f.path.as_str(), st.files.get(&f.path).copied().unwrap_or((f.bytes, f.rows, v)))).collect();
-        let entries: Vec<Vec<u8>> = live.iter().map(|(p, &(bytes, rows, added))| entry(added == v, added, &lake.full(p), rows, bytes)).collect();
-        let schema = json!({"type": "struct", "schema-id": 0, "fields": fields});
-        let spec = [("schema", schema.to_string()), ("schema-id", "0".into()), ("partition-spec", "[]".into()), ("partition-spec-id", "0".into()), ("format-version", "2".into()), ("content", "data".into())];
-        let manifest_bytes = ocf(&entry_schema(), &spec, &entries);
-        let id = uuid::Uuid::new_v4();
-        let (manifest, list) = (format!("{dir}/{id}-m0.avro"), format!("{dir}/snap-{v}-{id}.avro"));
-        let (added, existing): (Vec<_>, Vec<_>) = live.values().partition(|f| f.2 == v);
-        let rows = |fs: &[&(u64, u64, u64)]| fs.iter().map(|f| f.1 as i64).sum::<i64>();
-        let min_seq = live.values().map(|f| f.2).min().unwrap_or(v);
-        let list_entry = manifest_file(&lake.full(&manifest), manifest_bytes.len(), v, min_seq, [added.len(), existing.len()], [rows(&added), rows(&existing)]);
-        let parent = st.snapshots.last().map(|(s, _)| s["snapshot-id"].clone());
-        let list_meta = [("snapshot-id", v.to_string()), ("parent-snapshot-id", parent.as_ref().map_or("null".into(), Value::to_string)), ("sequence-number", v.to_string()), ("format-version", "2".into())];
-        futures::try_join!(lake.put(&manifest, manifest_bytes), lake.put(&list, ocf(&list_schema(), &list_meta, &[list_entry])))?;
-        let op = if existing.len() == st.files.len() { "append" } else { "overwrite" }; // (nothing removed, or something)
-        let mut snapshot = json!({"snapshot-id": v, "sequence-number": v, "timestamp-ms": now, "manifest-list": lake.full(&list), "schema-id": 0,
-            "summary": {"operation": op, "added-data-files": added.len().to_string(), "total-data-files": live.len().to_string(), "total-records": rows(&live.values().collect::<Vec<_>>()).to_string()}});
-        if let Some(p) = parent {
-            snapshot["parent-snapshot-id"] = p;
-        }
-        let mut snapshots = st.snapshots.clone();
-        snapshots.push((snapshot, [manifest, list]));
-        let gone: Vec<(Value, [String; 2])> = snapshots.drain(..snapshots.len().saturating_sub(HISTORY)).collect();
-        let body = metadata(lake, table, &st.uuid, v, now, &schema, &meta.columns, &snapshots);
-        // Written once, never overwritten; if it's there, an attempt that crashed wrote it: skip it.
-        match lake.put(&format!("{dir}/v{v}.metadata.json"), body.to_string().into_bytes()).await {
-            Err(e) if e.downcast_ref::<object_store::Error>().is_some_and(|e| matches!(e, object_store::Error::AlreadyExists { .. })) => continue,
-            r => r?,
-        }
-        lake.store.put(&Path::from(format!("{dir}/version-hint.text")), v.to_string().into_bytes().into()).await?; // (only a hint)
-        for (s, [manifest, list]) in &gone {
-            lake.delete(&format!("{dir}/v{}.metadata.json", s["snapshot-id"])).await;
-            lake.delete(manifest).await;
-            lake.delete(list).await;
-        }
-        (st.version, st.snapshots) = (v, snapshots);
-        st.files = live.into_iter().map(|(p, f)| (p.to_string(), f)).collect();
-        return Ok(Some((key, json(&st))));
+    let (dir, now, v) = (format!("data/{table}/metadata"), crate::log::now_ms(), st.version + 1);
+    let schema = json!({"type": "struct", "schema-id": 0, "fields": fields});
+    // The manifests this snapshot adds: one per new manifest of ours, and one for the inline files.
+    let mut written = vec![];
+    for m in &fresh {
+        let files = crate::manifest::files(lake, m).await?;
+        written.push((Some(m.path.clone()), write_manifest(lake, &dir, &schema, v, &files).await?));
     }
-    unreachable!("versions never run out")
+    if inline_changed && !parts.inline.is_empty() {
+        written.push((None, write_manifest(lake, &dir, &schema, v, &parts.inline).await?));
+    }
+    // The snapshot's manifest list: the ones written now, plus the ones it keeps from before.
+    let kept: Vec<Avro> = parts.manifests.iter().filter_map(|m| st.manifests.get(&m.path).cloned()).collect();
+    let inline = match inline_changed {
+        true => written.iter().find(|(of, _)| of.is_none()).map(|(_, a)| a.clone()),
+        false => st.inline.clone(),
+    };
+    let all: Vec<Avro> = written.iter().map(|(_, a)| a.clone()).chain(kept).chain(inline.clone().filter(|_| !inline_changed)).collect();
+    let entries: Vec<Vec<u8>> = all.iter().map(|a| {
+        let new = a.seq == v;
+        manifest_file(&lake.full(&a.path), a.bytes as usize, v, a.seq, [if new { a.files as usize } else { 0 }, if new { 0 } else { a.files as usize }],
+                      [if new { a.rows as i64 } else { 0 }, if new { 0 } else { a.rows as i64 }])
+    }).collect();
+    let list = format!("{dir}/snap-{v}-{}.avro", uuid::Uuid::new_v4());
+    let parent = st.snapshots.last().map(|(s, _)| s["snapshot-id"].clone());
+    let list_meta = [("snapshot-id", v.to_string()), ("parent-snapshot-id", parent.as_ref().map_or("null".into(), Value::to_string)), ("sequence-number", v.to_string()), ("format-version", "2".into())];
+    lake.put(&list, ocf(&list_schema(), &list_meta, &entries)).await?;
+    let (files, rows) = (all.iter().map(|a| a.files).sum::<u64>(), all.iter().map(|a| a.rows).sum::<u64>());
+    let added: u64 = written.iter().map(|(_, a)| a.files).sum();
+    let op = if went.is_empty() && !inline_changed { "append" } else { "overwrite" };
+    let mut snapshot = json!({"snapshot-id": v, "sequence-number": v, "timestamp-ms": now, "manifest-list": lake.full(&list), "schema-id": 0,
+        "summary": {"operation": op, "added-data-files": added.to_string(), "total-data-files": files.to_string(), "total-records": rows.to_string()}});
+    if let Some(p) = parent {
+        snapshot["parent-snapshot-id"] = p;
+    }
+    st.snapshots.push((snapshot, list));
+    let gone: Vec<(Value, String)> = st.snapshots.drain(..st.snapshots.len().saturating_sub(HISTORY)).collect();
+    let body = metadata(lake, table, &st.uuid, v, now, &schema, &meta.columns, &st.snapshots);
+    // Written once, never overwritten; if it's there, an attempt that crashed wrote it, and this
+    // one's objects are garbage the next round's version replaces.
+    lake.put(&format!("{dir}/v{v}.metadata.json"), body.to_string().into_bytes()).await?;
+    lake.store.put(&Path::from(format!("{dir}/version-hint.text")), v.to_string().into_bytes().into()).await?; // (only a hint)
+    // Manifests no longer named go once no snapshot that named them is kept; so do dropped snapshots.
+    for p in &went {
+        if let Some(a) = st.manifests.remove(p) {
+            st.dropped.push((v, a.path));
+        }
+    }
+    if inline_changed {
+        st.dropped.extend(st.inline.take().map(|a| (v, a.path)));
+    }
+    for (s, list) in &gone {
+        lake.delete(&format!("{dir}/v{}.metadata.json", s["snapshot-id"])).await;
+        lake.delete(list).await;
+    }
+    let oldest = st.snapshots.first().map_or(v, |(s, _)| s["snapshot-id"].as_u64().unwrap_or(v));
+    for (_, path) in st.dropped.iter().filter(|(at, _)| *at < oldest) {
+        lake.delete(path).await;
+    }
+    st.dropped.retain(|(at, _)| *at >= oldest);
+    for (of, a) in written {
+        match of {
+            Some(m) => drop(st.manifests.insert(m, a)),
+            None => st.inline = Some(a),
+        }
+    }
+    if !inline_changed {
+        st.inline = inline;
+    }
+    if parts.inline.is_empty() {
+        st.inline = None;
+    }
+    (st.version, st.inlined) = (v, inlined);
+    Ok(Some((key, json(&st))))
+}
+
+/// One Iceberg manifest holding `files`, added by snapshot `v`.
+async fn write_manifest(lake: &Lake, dir: &str, schema: &Value, v: u64, files: &[DataFile]) -> Result<Avro> {
+    let entries: Vec<Vec<u8>> = files.iter().map(|f| entry(true, v, &lake.full(&f.path), f.rows, f.bytes)).collect();
+    let spec = [("schema", schema.to_string()), ("schema-id", "0".into()), ("partition-spec", "[]".into()), ("partition-spec-id", "0".into()), ("format-version", "2".into()), ("content", "data".into())];
+    let body = ocf(&entry_schema(), &spec, &entries);
+    let path = format!("{dir}/{}-m0.avro", uuid::Uuid::new_v4());
+    let a = Avro { bytes: body.len() as u64, files: files.len() as u64, rows: files.iter().map(|f| f.rows).sum(), seq: v, path: path.clone() };
+    lake.put(&path, body).await?;
+    Ok(a)
 }
 
 /// The table metadata file (format v2): one unpartitioned spec, no sort order, the snapshots kept.
 #[allow(clippy::too_many_arguments)]
-fn metadata(lake: &Lake, table: &str, uuid: &str, v: u64, now: u64, schema: &Value, columns: &[(String, String)], snapshots: &[(Value, [String; 2])]) -> Value {
-    let names: Vec<Value> = columns.iter().enumerate().map(|(i, (c, _))| json!({"field-id": i + 1, "names": [c]})).collect();
+fn metadata(lake: &Lake, table: &str, uuid: &str, v: u64, now: u64, schema: &Value, columns: &[(String, String)], snapshots: &[(Value, String)]) -> Value {
+    // A list's elements need a mapping of their own: arrow-rs writes them as `item` (parquet-mr as `element`).
+    let names: Vec<Value> = columns.iter().enumerate().map(|(i, (c, t))| match t.ends_with("[]") {
+        true => json!({"field-id": i + 1, "names": [c], "fields": [{"field-id": columns.len() + i + 1, "names": ["item", "element"]}]}),
+        false => json!({"field-id": i + 1, "names": [c]}),
+    }).collect();
     let older = &snapshots[..snapshots.len() - 1];
     json!({
         "format-version": 2, "table-uuid": uuid, "location": lake.full(&format!("data/{table}")),
-        "last-sequence-number": v, "last-updated-ms": now, "last-column-id": columns.len(),
+        "last-sequence-number": v, "last-updated-ms": now, "last-column-id": 2 * columns.len(), // (list elements take ids after the columns')
         "current-schema-id": 0, "schemas": [schema],
         "default-spec-id": 0, "partition-specs": [{"spec-id": 0, "fields": []}], "last-partition-id": 999,
         "default-sort-order-id": 0, "sort-orders": [{"order-id": 0, "fields": []}],
@@ -121,7 +189,13 @@ fn fields(columns: &[(String, String)]) -> Option<Vec<Value>> {
             },
         })
     };
-    columns.iter().enumerate().map(|(i, (name, t))| Some(json!({"id": i + 1, "name": name, "required": false, "type": iceberg(t)?}))).collect()
+    let n = columns.len();
+    // A list column (an embedding, say) needs an id for its elements too: they follow the columns'.
+    let kind = |i: usize, t: &String| match t.strip_suffix("[]") {
+        Some(item) => Some(json!({"type": "list", "element-id": n + i + 1, "element": iceberg(item)?, "element-required": false})),
+        None => Some(Value::String(iceberg(t)?)),
+    };
+    columns.iter().enumerate().map(|(i, (name, t))| Some(json!({"id": i + 1, "name": name, "required": false, "type": kind(i, t)?}))).collect()
 }
 
 // ---------------------------------------------------------------- Avro, just what manifests need

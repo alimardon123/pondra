@@ -1,9 +1,12 @@
 //! Pondra: a streamhouse in one binary (see ADR-002 to ADR-005).
 //! Object storage — a local dir or s3://bucket/prefix (S3, R2, MinIO) — is the only state.
+mod ai;
 mod auth;
 mod cache;
 mod delta;
+mod files;
 mod flight;
+mod hot;
 mod iceberg;
 mod inbox;
 mod kafka;
@@ -12,6 +15,7 @@ mod cluster;
 mod log;
 mod manifest;
 mod metrics;
+mod optimize;
 mod mcp;
 mod pg;
 mod query;
@@ -21,6 +25,7 @@ mod spmd;
 mod store;
 mod tasks;
 mod tier;
+mod udf;
 mod views;
 mod write;
 
@@ -150,6 +155,17 @@ enum Cmd {
     },
 }
 
+/// Ctrl-C, or SIGTERM (how schedulers and `kill` stop a process).
+async fn stopped() {
+    #[cfg(unix)]
+    {
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("signal handler");
+        tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = term.recv() => {} }
+    }
+    #[cfg(not(unix))]
+    let _ = tokio::signal::ctrl_c().await;
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     match Cmd::parse() {
@@ -178,6 +194,14 @@ async fn main() -> anyhow::Result<()> {
                 let (s, n) = (store.clone(), cluster.leader.n);
                 cluster::mark_alive(&s, n).await?;
                 every(Duration::from_secs(10), move || { let s = s.clone(); async move { cluster::mark_alive(&s, n).await } });
+                // Stopped (Ctrl-C, or SIGTERM from a scheduler scaling down): the next node leads at
+                // once instead of waiting out the lease. Acknowledged writes are already durable.
+                let s = store.clone();
+                tokio::spawn(async move {
+                    stopped().await;
+                    cluster::release(&s, n).await;
+                    std::process::exit(0);
+                });
             }
             // Read-only nodes follow the leader's commit stream too (when a live one is there to ask),
             // so their reads are as fresh as a follower's instead of waiting for catalog polls.

@@ -24,7 +24,7 @@ The owner's design principles, which every change must respect:
 ## Layout
 
 ```
-src/      8,800 lines of Rust, one file per concern (see the table in README.md)
+src/      10,100 lines of Rust, one file per concern (see the table in README.md)
 python/   the Python client (pure Python, HTTP + Arrow)
 tools/    harness.py, cluster.py (tests), open_check.py (Delta + Iceberg readers == Pondra),
           keyed_bench.py (compaction cost), clean_bucket.py (keep a bucket to its newest lakes),
@@ -32,7 +32,8 @@ tools/    harness.py, cluster.py (tests), open_check.py (Delta + Iceberg readers
           freshness.py (head-to-head freshness), clustering.py (what cluster_by buys),
           newuser_bench.py (first reads, new nodes), demo_lake.py (one of everything + the tree),
           serve_bench.py + loadgen.go (serving), bench/tpch.py (TPC-H vs DuckDB and Spark),
-          sizes.py, sim_r2.py (local S3 with R2 latency),
+          sizes.py, sim_r2.py (local S3 with R2 latency), udf_server.py (a function of your own,
+          in Python, over Arrow Flight), bench/singlenode.py (TPC-H vs DuckDB, Polars, Daft, Bodo),
           metadata_bench.py (a table with a million files), flight_bench.py (Arrow Flight),
           cloud/ (start a cluster on several machines and benchmark it),
           r2_test.sh (run the suite against a real bucket), bench/ (vs Spark and Flink)
@@ -253,6 +254,8 @@ python3 tools/mcp_client.py --url http://127.0.0.1:8080/mcp   # the official MCP
 python3 tools/keyed_bench.py                   # keyed-table compaction: bytes written, correctness
 python3 tools/cluster.py race | isolate | split | spread
 python3 tools/bench/run.py batch 20000000     # ENGINES=pondra,spark,flink
+python3 tools/bench/singlenode.py prepare --data ~/tpch/sf1   # tpchgen-cli output -> the bench copy
+python3 tools/bench/singlenode.py run --data ~/tpch/sf1-bench --sf 1   # vs DuckDB, Polars, Daft, Bodo
 python3 tools/serve_bench.py --keys 2000000   # serving: point lookups and dashboard queries
 ```
 
@@ -296,11 +299,11 @@ Practical notes for an agent working here:
 - Node stderr goes to `/tmp/pondra-<port>-<id>.stderr`; that's where "restarting to rejoin",
   "slow tiering" and panics show up.
 
-## State of the work (2026-09-22, round 11)
+## State of the work (2026-09-23, round 12)
 
 Everything in `docs/prototype-status.md` passes on local disk and on simulated R2. The round-11
 additions (manifests, partitions, shuffles, memory limits, Arrow Flight) also ran against real
-R2.
+R2; round 12's are in `logs/round12/`.
 
 **R2 test buckets.** There are two:
 
@@ -309,32 +312,28 @@ R2.
 
 **The owner's R2 free tier is 10 GB.** Test runs delete their lakes; keep at most three lakes in
 all. After R2 runs: `tools/clean_bucket.py --bucket ponderabucket-us --bucket pondbucket --newest
-3 --dry-run`, then without `--dry-run`. The three kept now:
-
-- `ponderabucket-us/round8/test-180091d0` (open formats);
-- `ponderabucket-us/round8/test-a263452c` (replicated failover);
-- `pondbucket/pondra-demo`.
+3 --dry-run`, then without `--dry-run`.
 
 Headline numbers, all on one 2-vCPU box:
 
-- **Petabyte-shaped metadata:** a table given a million files commits a 20 KB entry; commits,
-  INSERTs and acks take what they took with a handful of files; a query over today skips the
-  million files without opening one (13 ms).
+- **TPC-H on one machine, from Parquet:** SF1 **3.19 s**, SF10 **38.0 s** — ahead of DuckDB
+  (3.36 / 39.8), Polars (3.78 / out of memory), Polars streaming (3.18 / 42.8) and Daft
+  (6.11 / 89.0). With the columns in memory: **1.96 s** / **35.9 s** (DuckDB's native tables:
+  1.80 s at SF1; SF10 doesn't fit on this machine). Every answer is checked against DuckDB's.
+- **Petabyte-shaped metadata:** a table given a million files commits a 20 KB entry, and,
+  published as Delta and Iceberg, keeps a 24 KB / 70 KB state and publishes in 17 ms.
 - **Arrow Flight:** 15.7 M rows/s in (exactly-once), 9.1 M rows/s out, the log as a stream in
   2.6 ms p50.
-- **Shuffles:** 14 query shapes spread over 3 nodes equal one node (11 shuffled). One box can't
-  show speed-ups: three nodes share two cores.
 - **Writes on R2:** acked in 4 ms with `--ack replicated` (299 ms durable); 87k events/s from 64
   writers, replicated.
 - **Kafka:** ~0.8 M events/s exactly-once into 3 nodes, ack 1 ms p50 (replicated).
 - **Freshness, like for like:** nodes see a write 10–15 ms after the ack (local and R2); Delta
   and Iceberg readers ~30 ms (local) / 3–4 s (near R2) / 7–10 s (far R2).
-- **TPC-H SF1:** all 22 queries in 5.9 s (Spark 4.2: 58–65 s). **Serving:** 0.14 ms key lookups,
-  20–36k/s.
+- **Serving:** 0.14 ms key lookups, 20–36k/s.
 - **Consistency:** 0 torn reads, 0 lost batches, clean failovers, in both ack modes.
 
-The comparison with Spark, Flink, Fluss and Lakehouse//RT — including Fluss 1.0 item by item,
-what each competitor is building next, and the plan for the gaps — is
+The comparison with Spark, Flink, Fluss, Lakehouse//RT and the single-node engines — item by
+item, with what each is building next and the plan for the gaps — is
 `docs/comparison-spark-flink-fluss.md`.
 
 Known limits, in the order they matter:
@@ -344,18 +343,24 @@ Known limits, in the order they matter:
 2. **Shuffle buckets and query results live in memory** (not streamed or spilled), a failed
    shuffle step fails the query (it then runs on one node), no skew handling. Distributed
    queries are one SELECT with inner joins.
-3. **Replicated acks' window.** An acked write survives any one node dying (with `--fsync`,
+3. **No cost-based join reordering.** Joins run in the order the query names them; the build
+   side is chosen by size at the physical level (TPC-H q7 is where this shows). Files written in
+   key order aren't declared as sorted either, so an aggregation on that key hashes.
+4. **Replicated acks' window.** An acked write survives any one node dying (with `--fsync`,
    followers' power loss too), but not the leader and every holder dying before the bucket has
    it.
-4. **One sequencer per lake** orders commits. Attached lakes split the load across leaders, but
+5. **One sequencer per lake** orders commits. Attached lakes split the load across leaders, but
    there are no transactions across lakes.
-5. **Publishing a huge table** to Delta/Iceberg rewrites a manifest of every file per version,
-   and the publish state lists every file: fine for millions of rows, not for millions of files.
-6. **Kafka's edges:** one partition per topic, no transactions, sparse offsets, consumer groups
+6. **Memory is bounded by budgets, not by accounting.** What DataFusion counts is the big hash
+   tables and sort buffers; Parquet decoding and the batches in flight are not counted, so the
+   query budget defaults to a third of RAM and the hot columns watch the process's own memory.
+7. **Kafka's edges:** one partition per topic, no transactions, sparse offsets, consumer groups
    in the leader's memory.
-7. **Streaming:** no session windows or point-in-time joins; the watermark comes from window
+8. **Streaming:** no session windows or point-in-time joins; the watermark comes from window
    starts.
-8. **Security:** tokens per role only; no TLS (use a proxy), no per-table grants or quotas.
+9. **Security:** tokens per role only; no TLS (use a proxy), no per-table grants or quotas.
+10. **`VARIANT` is JSON text**, not a shredded variant; `ai_*` and Flight functions call out of
+    the process, so their latency is the endpoint's.
 
 Good next moves, in order. The plan table in the comparison doc has the evidence each should
 produce.
@@ -363,10 +368,10 @@ produce.
 1. **A multi-machine run** with `tools/cloud/` (3–10 VMs on S3/R2): ingest over Flight and Kafka,
    the query suite at 1, 3 and 6 nodes, TPC-H SF100 against Spark.
 2. **Shuffles that stream and spill** to the local SSD, with a failed step retried alone.
-3. **Publishing big tables** from Pondra's manifests (an Iceberg manifest per Pondra manifest,
-   Delta checkpoints), so the open formats scale with the native one.
+3. **Cost-based join order** from the statistics the manifests already hold, and sorted files
+   declared as sorted (streaming aggregation, merge joins, `ORDER BY` without a sort).
 4. **Kafka partitions** (key-hashed slices of a table) and transactions.
-5. **AI functions in SQL** and an approximate vector index.
+5. **An approximate vector index**, and merging files inside sealed manifests (cold compaction).
 6. **TLS, per-table grants, an audit log, quotas.**
 
 ## Conventions
