@@ -185,14 +185,6 @@ pub async fn list(lake: &Lake, meta: &TableMeta) -> Result<Vec<Manifest>> {
 /// The files in one manifest.
 pub async fn files(lake: &Lake, m: &Manifest) -> Result<Vec<DataFile>> { Ok(serde_json::from_slice(&object(lake, &m.path).await?)?) }
 
-/// Every file of the table: sealed and inline, oldest first.
-pub async fn all(lake: &Lake, meta: &TableMeta) -> Result<Vec<DataFile>> {
-    let listed = list(lake, meta).await?;
-    let loads: Vec<_> = listed.iter().map(|m| files(lake, m)).collect();
-    let loaded: Vec<Vec<DataFile>> = futures::StreamExt::buffered(futures::stream::iter(loads), 32).try_collect().await?;
-    Ok(loaded.into_iter().flatten().chain(meta.files.iter().cloned()).collect())
-}
-
 /// The files that can hold rows matching `filters`: manifests pruned first, then files.
 /// `manifests`: a subset to look in (a distributed query's slice), else the table's list.
 pub async fn pruned(lake: &Lake, meta: &TableMeta, manifests: Option<&[Manifest]>, filters: &[Expr], schema: &SchemaRef) -> Result<Vec<DataFile>> {

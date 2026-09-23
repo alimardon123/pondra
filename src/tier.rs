@@ -15,7 +15,7 @@ use datafusion::execution::SendableRecordBatchStream;
 use datafusion::parquet::arrow::ArrowWriter;
 use datafusion::parquet::basic::{Compression, ZstdLevel};
 use datafusion::parquet::file::properties::WriterProperties;
-use futures::{StreamExt, TryStreamExt};
+use futures::StreamExt;
 use std::collections::BTreeMap;
 
 /// Rows per table in log segments (after, upto] (`None`: to the end), from segment metadata only.
