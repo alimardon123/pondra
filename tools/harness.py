@@ -786,6 +786,11 @@ def scale():
         time.sleep(0.2)
     spread = call(port, "POST", "/sql?spread=1", b"SELECT count(*) AS n, sum(v) AS s FROM ev WHERE k <> 'none'")[0]
     was_spread = metrics_of(port)["pondra_spread_queries_total"] >= 1
+    # Each file (sealed ones too) holds one day of `ts`: a self-join on it runs by its ranges,
+    # without a shuffle.
+    self_join = b"SELECT count(*) AS n, sum(x.v) AS s FROM ev x JOIN ev y ON x.ts = y.ts"
+    before = metrics_of(port)["pondra_ranged_queries_total"]
+    by_ranges = call(port, "POST", "/sql?spread=1", self_join) == call(port, "POST", "/sql?spread=0", self_join) and metrics_of(port)["pondra_ranged_queries_total"] > before
     shuffles = shuffle_checks(port)
     theirs = {**open_check.readers(lake, "ev"), **{f"iceberg/{k}": v for k, v in open_check.iceberg_readers(lake, "ev").items()}}
     checks = {
@@ -795,8 +800,10 @@ def scale():
         "one day reads only its files": day_n == days[one_day] and 0 < scanned <= 8,
         "every file holds one day": len(files) > 0 and not mixed,
         "three nodes: same answer": was_spread and spread == {"n": n_rows, "s": total},
-        "shuffles (GROUP BY, joins, windows) = one node": all(same for same, _, _ in shuffles.values()) and sum(sh for _, sh, _ in shuffles.values()) >= 10,
-        "outer, semi and anti joins, subqueries, CTEs and unions run across the nodes": sum(sp for _, _, sp in list(shuffles.values())[14:]) >= 9,
+        "three nodes: a self-join on sealed files by their time ranges": by_ranges,
+        "shuffles (GROUP BY, joins, windows) = one node": all(same for same, *_ in shuffles.values()) and sum(sh for _, sh, *_ in shuffles.values()) >= 10,
+        "outer, semi and anti joins, subqueries, CTEs and unions run across the nodes": sum(sp for _, _, sp, _ in list(shuffles.values())[14:23]) >= 9,
+        "tables that share a key meet where they are, by its ranges": sum(r for *_, r in list(shuffles.values())[23:]) >= 4,
         "Delta and Iceberg readers see sealed files": all(v == n_rows for v in theirs.values()),
     }
     for n in list(NODES):
@@ -813,12 +820,12 @@ def scale():
         and metrics_of(port)["pondra_memory_limit_bytes"] == int(0.05 * (1 << 30)))
     node.kill()
     ok = all(checks.values())
-    shown = {q: ("same" if same else "DIFFERENT") + (", shuffled" if sh else ", gathered" if sp else ", one node") for q, (same, sh, sp) in shuffles.items()}
+    shown = {q: ("same" if same else "DIFFERENT") + (", by ranges" if r else "") + (", shuffled" if sh else ", gathered" if sp else ", one node") for q, (same, sh, sp, r) in shuffles.items()}
     print(json.dumps({"scale": checks, "shuffles": shown, "rows": n_rows, "days": len(days), "files": {"inline": inline, "sealed": sealed, "parquet_objects": len(files), "one_day_scanned": scanned}, "outside_readers": theirs, "ok": ok}, indent=1))
     if not ok:
         print("mixed:", mixed[:3], "per_day diff:", {d: (per_day.get(d), n) for d, n in days.items() if per_day.get(d) != n})
         sys.exit(1)
-    return f"scale: {n_rows:,} rows over {len(days)} daily partitions, {int(inline + sealed)} files ({int(sealed)} sealed), every file one day, a day's query reads {int(scanned)} files, 3 nodes, {sum(sp for _, _, sp in shuffles.values())} of {len(shuffles)} queries spread, {sum(sh for _, sh, _ in shuffles.values())} shuffled (all equal to one node), 6 outside readers, a 50 MB memory limit: all {len(checks)} checks pass"
+    return f"scale: {n_rows:,} rows over {len(days)} daily partitions, {int(inline + sealed)} files ({int(sealed)} sealed), every file one day, a day's query reads {int(scanned)} files, 3 nodes, {sum(sp for _, _, sp, _ in shuffles.values())} of {len(shuffles)} queries spread, {sum(sh for _, sh, *_ in shuffles.values())} shuffled, {sum(r for *_, r in shuffles.values())} by key ranges (all equal to one node), 6 outside readers, a 50 MB memory limit: all {len(checks)} checks pass"
 
 
 def flight():
@@ -941,6 +948,15 @@ def shuffle_checks(port):
         q(f"INSERT INTO b SELECT value + {i * 10000}, 'n' || value FROM generate_series(0, 9999)", 0)
     q("INSERT INTO u VALUES (0, 'zero'), (1, 'one'), (2, 'two'), (3, 'three'), (4, 'four')", 0)
     call(port, "POST", "/append/a?producer=tail&seq=1", "".join(json.dumps({"id": 10**7 + r, "k": r % 50, "v": 1.0, "s": "tail", "p": r % 5}) + "\n" for r in range(500)).encode())
+    # Round 15: two tables written in the order of a key they share (orders and their lines), so
+    # each file holds a narrow range of it; a few rows of each still in the log, some with no key.
+    q("CREATE TABLE o (id BIGINT, c BIGINT)", 0)
+    q("CREATE TABLE li (oid BIGINT, qty BIGINT)", 0)
+    for i in range(4):
+        q(f"INSERT INTO o SELECT value + {i * 50000}, value % 97 FROM generate_series(1, 50000)", 0)
+        q(f"INSERT INTO li SELECT (value + 3) / 4 + {i * 50000}, value % 50 FROM generate_series(1, 200000)", 0)
+    call(port, "POST", "/append/o?producer=tail-o&seq=1", "".join(json.dumps({"id": 200001 + r, "c": r}) + "\n" for r in range(50)).encode())
+    call(port, "POST", "/append/li?producer=tail-li&seq=1", "".join(json.dumps({"oid": None if r % 10 == 0 else 200001 + r % 60, "qty": r % 50}) + "\n" for r in range(200)).encode())
     queries = {
         "many groups": "SELECT k, count(*) AS n, sum(v) AS s FROM a GROUP BY k ORDER BY k LIMIT 7",
         "groups, no order": "SELECT k % 1000 AS g, count(*) AS n FROM a GROUP BY k % 1000",
@@ -966,6 +982,14 @@ def shuffle_checks(port):
         "a scalar subquery": "SELECT count(*) AS n FROM a WHERE v > (SELECT avg(v) FROM a)",
         "a CTE and UNION ALL": "WITH hi AS (SELECT k FROM a WHERE v > 30000), lo AS (SELECT k FROM a WHERE v < 100) SELECT count(*) AS n, sum(k) AS s FROM (SELECT k FROM hi UNION ALL SELECT k FROM lo)",
         "a keyed table, LEFT JOIN": "SELECT a.p, count(u.name) AS n FROM a LEFT JOIN u ON a.p = u.id GROUP BY a.p ORDER BY a.p",
+        # Round 15: tables sliced by the ranges of the key they share (`ranges.rs`).
+        "by key ranges: join, then groups": "SELECT o.c % 10 AS g, count(*) AS n, sum(li.qty) AS q FROM o JOIN li ON o.id = li.oid GROUP BY o.c % 10",
+        "by key ranges: EXISTS": "SELECT count(*) AS n FROM o WHERE EXISTS (SELECT 1 FROM li WHERE li.oid = o.id AND li.qty > 45)",
+        "by key ranges: groups of the key": "SELECT oid, sum(qty) AS q FROM li GROUP BY oid HAVING sum(qty) > 180 ORDER BY oid NULLS FIRST LIMIT 20",
+        "by key ranges: LEFT JOIN": "SELECT count(*) AS n, count(li.oid) AS m FROM o LEFT JOIN li ON o.id = li.oid AND li.qty = 1",
+        "by key ranges: NULL keys": "SELECT count(*) AS n, sum(qty) AS q FROM li WHERE oid IS NULL OR oid > 199990",
+        # (the NULLs a LEFT JOIN pads with sit wherever the unmatched rows are: not keyed by range)
+        "by key ranges: grouped by a padded key": "SELECT li.oid, count(*) AS n FROM o LEFT JOIN li ON o.id = li.oid AND li.qty = 1 GROUP BY li.oid ORDER BY n DESC, li.oid LIMIT 3",
     }
     out = {}
     for name, s in queries.items():
@@ -975,7 +999,7 @@ def shuffle_checks(port):
         ordered = "ORDER BY" in s.split("OVER")[-1]
         same = one == many if ordered else sorted(map(json.dumps, one)) == sorted(map(json.dumps, many))
         ran = lambda m: int(after[f"pondra_{m}_queries_total"] - before[f"pondra_{m}_queries_total"])
-        out[name] = (same and len(one) > 0, ran("shuffled"), ran("spread"))
+        out[name] = (same and len(one) > 0, ran("shuffled"), ran("spread"), ran("ranged"))
     return out
 
 

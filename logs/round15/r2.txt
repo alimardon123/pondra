@@ -1,0 +1,151 @@
+=== real R2 (ponderabucket-us, Eastern North America, ~290 ms per PUT from the sandbox)
+=== harness.py scale --s3
+{
+ "scale": {
+  "bad partition specs refused": true,
+  "files sealed into manifests": true,
+  "every row, every day": true,
+  "one day reads only its files": true,
+  "every file holds one day": true,
+  "three nodes: same answer": true,
+  "three nodes: a self-join on sealed files by their time ranges": true,
+  "shuffles (GROUP BY, joins, windows) = one node": true,
+  "outer, semi and anti joins, subqueries, CTEs and unions run across the nodes": true,
+  "tables that share a key meet where they are, by its ranges": true,
+  "Delta and Iceberg readers see sealed files": true,
+  "over the memory limit: aggregation, sort, join": true
+ },
+ "shuffles": {
+  "many groups": "same, shuffled",
+  "groups, no order": "same, shuffled",
+  "HAVING": "same, shuffled",
+  "string keys": "same, by ranges, gathered",
+  "DISTINCT": "same, shuffled",
+  "join, then many groups": "same, shuffled",
+  "join, filters, count": "same, gathered",
+  "join, then another key": "same, shuffled",
+  "self-join": "same, shuffled",
+  "count(DISTINCT) per group": "same, shuffled",
+  "window, PARTITION BY": "same, shuffled",
+  "window over all": "same, gathered",
+  "global aggregate": "same, gathered",
+  "a keyed table": "same, by ranges, shuffled",
+  "LEFT JOIN, unmatched rows kept": "same, gathered",
+  "small table LEFT JOIN big one": "same, shuffled",
+  "FULL JOIN": "same, shuffled",
+  "IN (a semi join)": "same, gathered",
+  "NOT EXISTS (an anti join)": "same, shuffled",
+  "NOT IN (NULLs matter)": "same, gathered",
+  "a scalar subquery": "same, shuffled",
+  "a CTE and UNION ALL": "same, gathered",
+  "a keyed table, LEFT JOIN": "same, by ranges, gathered",
+  "by key ranges: join, then groups": "same, by ranges, shuffled",
+  "by key ranges: EXISTS": "same, by ranges, gathered",
+  "by key ranges: groups of the key": "same, by ranges, gathered",
+  "by key ranges: LEFT JOIN": "same, by ranges, gathered",
+  "by key ranges: NULL keys": "same, gathered",
+  "by key ranges: grouped by a padded key": "same, by ranges, shuffled"
+ },
+ "rows": 23100,
+ "days": 139,
+ "files": {
+  "inline": 69.0,
+  "sealed": 142.0,
+  "parquet_objects": 342,
+  "one_day_scanned": 2.0
+ },
+ "outside_readers": {
+ },
+ "ok": true
+}
+
+=== shuffle_spill.py --s3
+ "one_node_s": 0.4,
+ "spread_s": 0.9,
+ "after_a_node_died_s": 1.4,
+ "spilled_mb": [
+  130.2,
+  209.1
+ ],
+ "left_bytes": [
+  0,
+  0
+ ],
+ "peak_rss_mb": [
+  725,
+  500,
+  438
+ ],
+ "skew": 1.0,
+ "answer": [
+  {
+   "keys": 4000000,
+   "total": 287994492.0
+  }
+ ],
+ "checks": {
+  "the shuffled answer equals the one-node answer": true,
+  "the query shuffled": true,
+  "buckets went to disk": true,
+  "the scratch is empty again": true,
+  "memory stayed under the budget": true,
+  "the buckets came out even": true,
+  "a node dying mid-query doesn't change the answer": true
+ },
+ "ok": true
+}
+
+=== skew_check.py --s3
+{
+ "rows": 2000000,
+ "without": {
+  "same": {
+   "inner join": true,
+   "LEFT JOIN": true,
+   "IN": true,
+   "grouped by the key": true
+  },
+  "splits": 0.0,
+  "read_mb": [
+   14.6,
+   54.5,
+   14.6
+  ],
+  "busiest_over_average": 1.95
+ },
+ "shared_out": {
+  "same": {
+   "inner join": true,
+   "LEFT JOIN": true,
+   "IN": true,
+   "grouped by the key": true
+  },
+  "splits": 3.0,
+  "read_mb": [
+   24.4,
+   35.8,
+   24.4
+  ],
+  "busiest_over_average": 1.27
+ },
+ "checks": {
+  "every answer equals one node's, without sharing": true,
+  "every answer equals one node's, with hot partitions shared out": true,
+  "hot partitions were shared out": true,
+  "the busiest node read much less": true
+ },
+ "ok": true
+}
+
+=== open_check.py --s3
+ },
+ "match": true
+}
+
+=== cluster.py failover --s3 --secs 45
+  killed leader :18081; new leader :18082 accepting writes after 13.2s
+failover: 3 nodes, 6 shards, 8 producers, 83400 events, 1 follower + 2 leader kills
+  failovers: 11.1s, 13.2s (kill -> writes acked again); state caught up 1.0s after the last write
+  events exactly once: True (83400 rows); for 1000 users, task state == model: True, inline view == model: True
+  shard runs per node (since each node's last start): {18080: 60, 18081: 51, 18082: 69}
+=== R2_DONE

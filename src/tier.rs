@@ -63,8 +63,9 @@ pub async fn tier_table(lake: &Lake, table: &str, hwm: u64, nodes: &[String], me
             (from, done) = (seg, acc);
         }
     }
-    let files = deal(lake, jobs, nodes, me).await?;
+    let mut files = deal(lake, jobs, nodes, me).await?;
     let rows = files.iter().map(|f| f.rows).sum();
+    crate::sketch::add(&mut meta, &mut files);
     meta.files.extend(files);
     meta.tiered = upto;
     lake.cat.commit(vec![(table_key(table), json(&meta))], &[]).await?;
@@ -156,7 +157,7 @@ fn replace(meta: &mut TableMeta, old: &[DataFile], new: Vec<DataFile>) {
     let now = crate::log::now_ms();
     meta.files.retain(|f| !old.iter().any(|o| o.path == f.path));
     meta.garbage.extend(old.iter().map(|f| (f.path.clone(), now)));
-    meta.files.extend(new);
+    meta.files.extend(new.into_iter().map(|f| DataFile { sketch: Default::default(), ..f })); // (rows the table's sketches already saw)
 }
 
 /// Data work the leader deals out. It names its inputs exactly (the table as the leader sees
@@ -249,12 +250,24 @@ pub async fn run_job(lake: &Lake, Job { table, meta, kind }: Job) -> Result<Vec<
             (latest(lake, &table, &part, meta.tiered, true).await?, ord)
         }
         Kind::Merge { files } => {
-            let ctx = lake.session();
             let paths: Vec<String> = files.iter().map(|f| lake.full(&f.path)).collect();
             let schema = schema(&meta.columns)?;
-            let df = clustered(&meta, ctx.read_parquet(paths, ParquetReadOptions::default().schema(&schema)).await?)?;
+            let rows = match meta.cluster.is_empty() {
+                false => clustered(&meta, lake.session().read_parquet(paths, ParquetReadOptions::default().schema(&schema)).await?)?.execute_stream().await?,
+                // One file after another, each in one partition: files that each held a narrow
+                // range of a key (data that arrived in order) merge into one that still does.
+                // (Several files in one read come in whatever order they're listed.)
+                true => {
+                    let (ctx, s) = (lake.session_with(1), schema.clone());
+                    let each = futures::stream::iter(paths).then(move |p| {
+                        let (ctx, s) = (ctx.clone(), s.clone());
+                        async move { ctx.read_parquet(p, ParquetReadOptions::default().schema(&s)).await?.execute_stream().await }
+                    });
+                    Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(schema.clone(), futures::TryStreamExt::try_flatten(each)))
+                }
+            };
             let (ord, part) = (files.iter().map(|f| f.ord).max().unwrap_or(0), files[0].part.clone());
-            let mut merged = write_stream(lake, &table, df.execute_stream().await?, 4_000_000, &keys, meta.key.is_empty(), None).await?;
+            let mut merged = write_stream(lake, &table, rows, 4_000_000, &keys, meta.key.is_empty(), None).await?;
             merged.iter_mut().for_each(|f| (f.ord, f.part) = (ord, part.clone()));
             return Ok(merged);
         }
@@ -506,8 +519,11 @@ pub async fn write_file(lake: &Lake, table: &str, batches: &[RecordBatch], keys:
     let (path, bytes) = (format!("data/{table}/{}.parquet", uuid::Uuid::new_v4()), buf.len() as u64);
     lake.put(&path, buf).await?;
     maybe_crash("after_parquet_put");
-    let stats = if stats { crate::manifest::stats(batches) } else { Default::default() };
-    Ok(Some(DataFile { path, rows: rows as u64, bytes, ord: 0, whole: false, stats, part: String::new() }))
+    let (stats, nulls, sketch) = match stats {
+        true => (crate::manifest::stats(batches), Some(crate::manifest::nulls(batches)), crate::sketch::of(batches)),
+        false => Default::default(),
+    };
+    Ok(Some(DataFile { path, rows: rows as u64, bytes, ord: 0, whole: false, stats, part: String::new(), nulls, sketch }))
 }
 
 /// Stream a query result into Parquet files of up to `max_rows` each (bulk INSERT … SELECT).

@@ -43,6 +43,9 @@ pub struct Manifest {
     pub rows: u64,
     pub bytes: u64,
     pub stats: Stats,
+    /// The columns any of its files holds a NULL in (None: some file doesn't say).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nulls: Option<Vec<String>>,
 }
 
 /// A table's sealed files: its manifest list object, and totals.
@@ -79,9 +82,16 @@ pub fn stats(batches: &[RecordBatch]) -> Stats {
     out
 }
 
+/// The columns (of the first 32, as `stats`) that hold a NULL.
+pub fn nulls(batches: &[RecordBatch]) -> Vec<String> {
+    let Some(first) = batches.first() else { return vec![] };
+    let schema = first.schema();
+    (0..schema.fields().len().min(32)).filter(|&i| batches.iter().any(|b| b.column(i).null_count() > 0)).map(|i| schema.field(i).name().clone()).collect()
+}
+
 /// A value as text that casts back to it exactly (timestamps as ISO 8601), or None for a null
 /// or a string too long to keep.
-fn text(v: &ScalarValue) -> Option<String> {
+pub fn text(v: &ScalarValue) -> Option<String> {
     use datafusion::arrow::array::AsArray;
     if v.is_null() {
         return None;
@@ -119,13 +129,14 @@ pub fn ranges(table: &str, manifests: &[Manifest], files: &[DataFile], schema: &
 /// on a column's distinct values, which is what the size of a join on it turns on. None where a
 /// range says nothing about that — floats, strings, timestamps.
 pub fn span(lo: &ScalarValue, hi: &ScalarValue) -> Option<u64> {
-    if !(lo.data_type().is_integer() || matches!(lo.data_type(), DataType::Date32 | DataType::Date64)) {
-        return None;
-    }
-    match hi.sub(lo).ok()?.cast_to(&DataType::Int64).ok()? {
-        ScalarValue::Int64(Some(n)) if n >= 0 => Some(n as u64 + 1),
+    // (dates as the days they are: a difference of dates comes out in seconds)
+    let whole = |v: &ScalarValue| match v.cast_to(&DataType::Int64).ok()? {
+        ScalarValue::Int64(Some(n)) if matches!(v.data_type(), DataType::Date64) => Some(n / 86_400_000),
+        ScalarValue::Int64(Some(n)) if v.data_type().is_integer() || v.data_type() == DataType::Date32 => Some(n),
         _ => None,
-    }
+    };
+    let (lo, hi) = (whole(lo)?, whole(hi)?);
+    (hi >= lo).then(|| hi.abs_diff(lo) + 1)
 }
 
 /// The ranges covering all of `parts` (a column missing from any of them has no range).
@@ -255,7 +266,8 @@ async fn write(lake: &Lake, dir: &str, files: &[DataFile], schema: &SchemaRef) -
 
 fn summary(path: String, files: &[DataFile], schema: &SchemaRef) -> Manifest {
     let stats = union(&files.iter().map(|f| &f.stats).collect::<Vec<_>>(), schema);
-    Manifest { path, files: files.len() as u64, rows: files.iter().map(|f| f.rows).sum(), bytes: files.iter().map(|f| f.bytes).sum(), stats }
+    let nulls = files.iter().map(|f| f.nulls.clone()).collect::<Option<Vec<_>>>().map(|n| n.concat().into_iter().collect::<std::collections::BTreeSet<_>>().into_iter().collect());
+    Manifest { path, files: files.len() as u64, rows: files.iter().map(|f| f.rows).sum(), bytes: files.iter().map(|f| f.bytes).sum(), stats, nulls }
 }
 
 /// Leader, in `tier::maintain`: seal the oldest inline files once there are too many, and merge

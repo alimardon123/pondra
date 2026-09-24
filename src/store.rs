@@ -45,6 +45,8 @@ pub struct TableMeta {
     pub ttl: Option<(String, u64)>, // keyed tables: a row whose (timestamp) column is older than this many seconds is gone
     #[serde(default)]
     pub partition: Option<String>, // append tables: every file holds one value of this ("col", "day(col)", "hour(col)", "month(col)")
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub sketch: BTreeMap<String, String>, // append tables: each key-like column's distinct values, sketched (`sketch.rs`)
 }
 
 impl TableMeta {
@@ -74,6 +76,13 @@ pub struct DataFile {
     /// Partitioned tables: the one partition value this file holds.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub part: String,
+    /// Append tables: the columns (of those with `stats`) that hold a NULL. None: not known (files
+    /// written before round 15).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nulls: Option<Vec<String>>,
+    /// A new file's distinct-value sketches (`sketch.rs`), on their way into its table's.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub sketch: BTreeMap<String, String>,
 }
 
 /// One log segment = one node's flush, holding rows for many tables. Small segments are stored

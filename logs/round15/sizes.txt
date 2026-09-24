@@ -1,0 +1,4 @@
+Round 15 binary (cargo build --profile dist):
+  96.5 MB, 32.9 MB gzipped  (round 14: 96.3 MB / 32.8 MB)
+  ranges.rs, skew.rs and sketch.rs; no new dependencies.
+Rust source: 12104 lines across 33 files.

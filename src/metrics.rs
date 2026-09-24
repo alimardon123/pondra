@@ -10,10 +10,13 @@ pub static QUERY_ERRORS: AtomicU64 = AtomicU64::new(0);
 pub static QUERY_US: AtomicU64 = AtomicU64::new(0); // their total time
 pub static SPREAD: AtomicU64 = AtomicU64::new(0); // queries run across the cluster from here
 pub static SHUFFLED: AtomicU64 = AtomicU64::new(0); // …of them with a shuffle
+pub static RANGED: AtomicU64 = AtomicU64::new(0); // …of them with their tables sliced by a key's ranges
 pub static FILES_SCANNED: AtomicU64 = AtomicU64::new(0); // append-table files queries opened…
 pub static FILES_SKIPPED: AtomicU64 = AtomicU64::new(0); // …and skipped by their min/max
 pub static SPILLED: AtomicU64 = AtomicU64::new(0); // shuffle bytes written to this node's disk
 pub static SKEW: AtomicU64 = AtomicU64::new(0); // the worst bucket/average seen in a shuffle, x100
+pub static SKEW_SPLITS: AtomicU64 = AtomicU64::new(0); // hot partitions of shuffled joins shared out
+pub static RECEIVED: AtomicU64 = AtomicU64::new(0); // shuffle bytes this node's steps read (its share of the work)
 
 pub fn add(c: &AtomicU64, n: u64) { c.fetch_add(n, Relaxed); }
 
@@ -37,11 +40,14 @@ pub async fn render(app: &App) -> anyhow::Result<String> {
     metric("query_seconds_total", "counter", "time spent in SQL queries", &one(get(&QUERY_US) / 1e6));
     metric("spread_queries_total", "counter", "queries run across the cluster from here", &one(get(&SPREAD)));
     metric("shuffled_queries_total", "counter", "…of them with a shuffle", &one(get(&SHUFFLED)));
+    metric("ranged_queries_total", "counter", "…of them with their tables sliced by a key's ranges", &one(get(&RANGED)));
     metric("files_scanned_total", "counter", "Parquet files queries read", &one(get(&FILES_SCANNED)));
     metric("files_skipped_total", "counter", "Parquet files queries skipped by min/max, unopened", &one(get(&FILES_SKIPPED)));
     metric("shuffle_spilled_bytes_total", "counter", "shuffle rows written to this node's disk", &one(get(&SPILLED)));
     metric("shuffle_disk_bytes", "gauge", "shuffle buckets on this node's disk now", &one(crate::spill::held() as f64));
     metric("shuffle_skew", "gauge", "worst bucket vs the average one in a shuffle here (1 = even)", &one(get(&SKEW) / 100.0));
+    metric("skew_splits_total", "counter", "hot partitions of shuffled joins shared out over the nodes", &one(get(&SKEW_SPLITS)));
+    metric("shuffle_received_bytes_total", "counter", "shuffle bytes this node's steps read", &one(get(&RECEIVED)));
     let (reserved, limit) = app.lake.memory();
     metric("memory_limit_bytes", "gauge", "query memory limit (spills beyond it)", &one(limit as f64));
     metric("memory_reserved_bytes", "gauge", "query memory in use", &one(reserved as f64));

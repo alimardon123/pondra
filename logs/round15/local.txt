@@ -1,0 +1,430 @@
+Round 15, local disk, one 2-vCPU box (three nodes share its cores: the timings say what is correct, not what is fast).
+
+(Everything below ran on the final round-15 binary, except harness.py all, the driver, cluster.py users/failover and open_check, which ran on it before its last three fixes — the review's two (a cut written down as text, a key padded with NULLs by an outer join) and dates' range in days — all in distributed planning, which the sections that follow them ran again.)
+
+=== harness.py all (local disk)
+ "commit_ms_p95": 3,
+ "server_cores_used": 0.07
+}
+{
+ "upsert": "12,000 random upserts/deletes with compactions and a restart match the model exactly (390 live keys)",
+ "tiering": "12 rounds of writes and tiering: log drained, files bounded ({'events': 5, 'kv': 5, 'totals': 5}), every row exact",
+ "fence": "a frozen leader is replaced; when it wakes, its write is rejected (fenced) and it rejoins as a follower; nothing lost",
+ "insert": "bulk INSERT \u2026 SELECT writes Parquet directly; a retried job id is applied once",
+ "serverless": "INSERT from a process with no server: 0.03s alone, 4 at once, retries once; a node on the idle lake leads in 0.02s; via a running leader 0.03s; after the leader is killed 30.13s; 8000 rows, no duplicates",
+ "clients": "SQL writes, Python client, Postgres (4 drivers), tokens, change-feed replay, attached lake, inbox (1.0s), vector search, MCP, no file access from SQL: all 18 checks pass",
+ "kafka": "Kafka: librdkafka (5 codecs, idempotent) and kafka-python producers, exactly-once retries, Debezium, tombstones, raw values as JSON, consumers, consumer groups, SASL tokens: all 9 checks pass",
+ "alter": "ALTER TABLE ADD COLUMN under load (64,200 rows written meanwhile): old rows null, new ones set, keyed table, view, bulk and Arrow appends, 6 outside readers: all 8 checks pass",
+ "windows": "event-time windows: each emitted once, final, after the watermark; late rows update the view only; a leader restart emits nothing twice",
+ "scale": "scale: 23,100 rows over 139 daily partitions, 244 files (180 sealed), every file one day, a day's query reads 2 files, 3 nodes, 28 of 28 queries spread, 15 shuffled, 7 by key ranges (all equal to one node), 6 outside readers, a 50 MB memory limit: all 12 checks pass",
+ "flight": "Arrow Flight: pyarrow DoPut exactly-once (retried stream applied once, via a follower too), DoGet SQL, FlightInfo, ListFlights, the log as a columnar stream (a subscriber has each new commit in 5 ms), tokens and handshake; ADBC queries, writes, ingest and catalog: all 13 checks pass",
+ "reader": "freshness on a separate read-only node: p50 7 ms, p99 92 ms",
+ "crash": "5/5 runs, 0 lost, 0 duplicated (events, streaming-task output, views); crashes survived: {'after_seg_put': 0, 'after_commit': 6, 'after_parquet_put': 12, 'kill -9': 2}",
+ "load": {
+  "events_per_s": 1200,
+  "ack_ms_p50": 251,
+  "ack_ms_p99": 255,
+  "freshness_ms_p50": 146,
+  "freshness_ms_p99": 244,
+  "freshness_samples": 49,
+  "commits_per_s": 4.0,
+  "commit_ms_p50": 2,
+  "commit_ms_p95": 3,
+  "server_cores_used": 0.07
+ }
+}
+
+=== spread_tpch.py --expect 22 (TPC-H SF1, DOUBLE copy, 3 nodes; tables under 64 MB read whole)
+q1   shuffled          same=True    0.27s  
+q2   ranged, gathered  same=True    0.10s  
+q3   ranged, gathered  same=True    0.21s  
+q4   ranged, shuffled  same=True    0.15s  
+q5   ranged, shuffled  same=True    0.19s  
+q6   gathered          same=True    0.10s  
+q7   ranged, shuffled  same=True    0.21s  
+q8   ranged, shuffled  same=True    0.23s  
+q9   ranged, shuffled  same=True    0.34s  
+q10  ranged, shuffled  same=True    0.29s  
+q11  ranged, shuffled  same=True    0.08s  
+q12  ranged, shuffled  same=True    0.16s  
+q13  shuffled          same=True    0.26s  
+q14  gathered          same=True    0.11s  
+q15  shuffled          same=True    0.17s  
+q16  ranged, shuffled  same=True    0.15s  
+q17  shuffled          same=True    0.22s  
+q18  ranged, gathered  same=True    0.27s  
+q19  gathered          same=True    0.19s  
+q20  shuffled          same=True    0.28s  
+q21  ranged, shuffled  same=True    0.47s  
+q22  shuffled          same=True    0.16s  
+{
+ "nodes": 3,
+ "broadcast_mb": 64,
+ "spread": 22,
+ "shuffled": 16,
+ "ranged": 13,
+ "queries": {
+ },
+ "checks": {
+  "every answer across the nodes equals one node's": true,
+  "at least 22 of the 22 ran across the nodes": true
+ },
+ "ok": true
+}
+
+=== spread_tpch.py --broadcast-mb 0 --expect 22 (every table sliced)
+q1   shuffled          same=True    0.29s  
+q2   ranged, shuffled  same=True    0.12s  
+q3   ranged, shuffled  same=True    0.16s  
+q4   ranged, shuffled  same=True    0.14s  
+q5   ranged, shuffled  same=True    0.23s  
+q6   gathered          same=True    0.10s  
+q7   ranged, shuffled  same=True    0.30s  
+q8   ranged, shuffled  same=True    0.31s  
+q9   ranged, shuffled  same=True    0.54s  
+q10  ranged, shuffled  same=True    0.49s  
+q11  ranged, shuffled  same=True    0.08s  
+q12  ranged, shuffled  same=True    0.15s  
+q13  ranged, shuffled  same=True    0.42s  
+q14  shuffled          same=True    0.14s  
+q15  shuffled          same=True    0.17s  
+q16  ranged, shuffled  same=True    0.14s  
+q17  shuffled          same=True    0.20s  
+q18  ranged, shuffled  same=True    0.30s  
+q19  shuffled          same=True    0.18s  
+q20  shuffled          same=True    0.24s  
+q21  ranged, shuffled  same=True    0.46s  
+q22  shuffled          same=True    0.13s  
+{
+ "nodes": 3,
+ "broadcast_mb": 0,
+ "spread": 22,
+ "shuffled": 21,
+ "ranged": 14,
+ "queries": {
+ },
+ "checks": {
+  "every answer across the nodes equals one node's": true,
+  "at least 22 of the 22 ran across the nodes": true
+ },
+ "ok": true
+}
+
+=== harness.py scale
+{
+ "scale": {
+  "bad partition specs refused": true,
+  "files sealed into manifests": true,
+  "every row, every day": true,
+  "one day reads only its files": true,
+  "every file holds one day": true,
+  "three nodes: same answer": true,
+  "three nodes: a self-join on sealed files by their time ranges": true,
+  "shuffles (GROUP BY, joins, windows) = one node": true,
+  "outer, semi and anti joins, subqueries, CTEs and unions run across the nodes": true,
+  "tables that share a key meet where they are, by its ranges": true,
+  "Delta and Iceberg readers see sealed files": true,
+  "over the memory limit: aggregation, sort, join": true
+ },
+ "shuffles": {
+  "many groups": "same, shuffled",
+  "groups, no order": "same, shuffled",
+  "HAVING": "same, shuffled",
+  "string keys": "same, by ranges, gathered",
+  "DISTINCT": "same, shuffled",
+  "join, then many groups": "same, shuffled",
+  "join, filters, count": "same, gathered",
+  "join, then another key": "same, shuffled",
+  "self-join": "same, shuffled",
+  "count(DISTINCT) per group": "same, shuffled",
+  "window, PARTITION BY": "same, shuffled",
+  "window over all": "same, gathered",
+  "global aggregate": "same, gathered",
+  "a keyed table": "same, by ranges, shuffled",
+  "LEFT JOIN, unmatched rows kept": "same, gathered",
+  "small table LEFT JOIN big one": "same, shuffled",
+  "FULL JOIN": "same, shuffled",
+  "IN (a semi join)": "same, gathered",
+  "NOT EXISTS (an anti join)": "same, shuffled",
+  "NOT IN (NULLs matter)": "same, gathered",
+  "a scalar subquery": "same, shuffled",
+  "a CTE and UNION ALL": "same, gathered",
+  "a keyed table, LEFT JOIN": "same, by ranges, gathered",
+  "by key ranges: join, then groups": "same, by ranges, shuffled",
+  "by key ranges: EXISTS": "same, by ranges, gathered",
+  "by key ranges: groups of the key": "same, by ranges, gathered",
+  "by key ranges: LEFT JOIN": "same, by ranges, gathered",
+  "by key ranges: NULL keys": "same, gathered",
+  "by key ranges: grouped by a padded key": "same, by ranges, shuffled"
+ },
+ "rows": 23100,
+ "days": 139,
+ "files": {
+  "inline": 64.0,
+  "sealed": 180.0,
+  "parquet_objects": 516,
+  "one_day_scanned": 2.0
+ },
+ "outside_readers": {
+ },
+ "ok": true
+}
+
+=== skew_check.py
+{
+ "rows": 2000000,
+ "without": {
+  "same": {
+   "inner join": true,
+   "LEFT JOIN": true,
+   "IN": true,
+   "grouped by the key": true
+  },
+  "splits": 0.0,
+  "read_mb": [
+   14.6,
+   54.5,
+   14.6
+  ],
+  "busiest_over_average": 1.95
+ },
+ "shared_out": {
+  "same": {
+   "inner join": true,
+   "LEFT JOIN": true,
+   "IN": true,
+   "grouped by the key": true
+  },
+  "splits": 3.0,
+  "read_mb": [
+   24.4,
+   35.8,
+   24.4
+  ],
+  "busiest_over_average": 1.27
+ },
+ "checks": {
+  "every answer equals one node's, without sharing": true,
+  "every answer equals one node's, with hot partitions shared out": true,
+  "hot partitions were shared out": true,
+  "the busiest node read much less": true
+ },
+ "ok": true
+}
+
+=== shuffle_spill.py (local disk)
+ "one_node_s": 0.3,
+ "spread_s": 1.2,
+ "after_a_node_died_s": 1.3,
+ "spilled_mb": [
+  156.3,
+  182.4
+ ],
+ "left_bytes": [
+  0,
+  0
+ ],
+ "peak_rss_mb": [
+  626,
+  458,
+  332
+ ],
+ "skew": 1.0,
+ "answer": [
+  {
+   "keys": 4000000,
+   "total": 287994492.0
+  }
+ ],
+ "checks": {
+  "the shuffled answer equals the one-node answer": true,
+  "the query shuffled": true,
+  "buckets went to disk": true,
+  "the scratch is empty again": true,
+  "memory stayed under the budget": true,
+  "the buckets came out even": true,
+  "a node dying mid-query doesn't change the answer": true
+ },
+ "ok": true
+}
+
+=== cluster.py spread
+  q1_scan_agg          one node     16 ms   3 nodes     20 ms   same result: True
+  q2_filter_group      one node     56 ms   3 nodes     88 ms   same result: True
+  q3_high_card_group   one node    152 ms   3 nodes    212 ms   same result: True
+  q4_count_distinct    one node     90 ms   3 nodes    145 ms   same result: True
+  q5_join              one node     66 ms   3 nodes     92 ms   same result: True
+  q6_time_bucket       one node     65 ms   3 nodes    101 ms   same result: True
+  q7_avg_distinct      one node     45 ms   3 nodes    171 ms   same result: True
+  q8_top_rows          one node     25 ms   3 nodes     48 ms   same result: True
+  q9_filter_count      one node     11 ms   3 nodes     16 ms   same result: True
+spread: 4,000,000 rows, 3 nodes; results identical: True; fell back to one node: 0 times
+
+=== join_order.py (TPC-H SF1 lake)
+{
+ "queries": 10,
+ "rule_on": {
+  "well_s": 1.353,
+  "badly_s": 1.554,
+  "worst_ratio": 2.0
+ },
+ "rule_off": {
+  "well_s": 1.315,
+  "badly_s": 1.72,
+  "worst_ratio": 2.18
+ },
+ "slower_with_the_rule": {
+  "well": [],
+  "badly": []
+ },
+ "checks": {
+  "the badly written queries answer the same": true,
+  "the badly written queries cost less with the rule": true,
+  "no badly written query is slower with the rule": true,
+  "no well written query is slower with the rule": true
+ },
+ "ok": true
+}
+{"star": {"on": [0.124, 0.122], "off": [0.118, 0.153]}, "snowflake": {"on": [0.116, 0.118], "off": [0.12, 0.151]}, "filtered dimension": {"on": [0.112, 0.11], "off": [0.113, 0.149]}, "tpch-q2": {"on": [0.042, 0.044], "off": [0.047, 0.052]}, "tpch-q3": {"on": [0.119, 0.124], "off": [0.12, 0.137]}, "tpch-q5": {"on": [0.151, 0.143], "off": [0.138, 0.138]}, "tpch-q9": {"on": [0.218, 0.436], "off": [0.219, 0.477]}, "tpch-q10": {"on": [0.184, 0.179], "off": [0.176, 0.17]}, "tpch-q11": {"on": [0.034, 0.033], "off": [0.034, 0.033]}, "tpch-q18": {"on": [0.253, 0.245], "off": [0.23, 0.26]}}
+
+=== bench/singlenode.py run --engines duckdb,pondra,pondra-cold (TPC-H SF1, one node, best of 3; answers checked against DuckDB's, "!" where one differs)
+  pondra-cold       q22   0.038 s
+
+            duckdb      pondra pondra-cold
+q1          0.214      0.128      0.180
+q2          0.039      0.021      0.042
+q3          0.144      0.044      0.126
+q4          0.108      0.045      0.105
+q5          0.157      0.064      0.152
+q6          0.109      0.047      0.094
+q7          0.158      0.068      0.140
+q8          0.195      0.054      0.150
+q9          0.299      0.121      0.211
+q10         0.193      0.111      0.189
+q11         0.028      0.017      0.032
+q12         0.119      0.092      0.120
+q13         0.187      0.091      0.138
+q14         0.135      0.018      0.075
+q15         0.082      0.029      0.133!
+q16         0.044      0.050      0.058
+q17         0.154      0.088      0.170
+q18         0.266      0.148      0.267
+q19         0.174      0.119      0.179
+q20         0.137      0.075      0.137
+q21         0.393      0.233      0.339
+q22         0.049      0.026      0.038
+total         3.38        1.69        3.07
+{"pondra_load_s": 7.3, "duckdb_load_s": 0.0, "duckdb_wall_s": 10.8, "pondra_warm_s": 7.2, "pondra_wall_s": 5.7, "pondra-cold_wall_s": 9.8}
+
+
+=== cloud/actions/driver.py on 3 local nodes, TPC-H SF1 as tpchgen-cli writes it (DECIMAL), best of 3, as the GitHub workflow runs it
+{"rows":6001215}
+q1   one node    0.29s  3 nodes    0.33s  shuffled  same=True
+q2   one node    0.04s  3 nodes    0.11s  gathered  same=True
+q3   one node    0.12s  3 nodes    0.17s  gathered  same=True
+q4   one node    0.09s  3 nodes    0.14s  shuffled  same=True
+q5   one node    0.16s  3 nodes    0.20s  shuffled  same=True
+q6   one node    0.10s  3 nodes    0.11s  gathered  same=True
+q7   one node    0.17s  3 nodes    0.21s  shuffled  same=True
+q8   one node    0.16s  3 nodes    0.23s  shuffled  same=True
+q9   one node    0.24s  3 nodes    0.34s  shuffled  same=True
+q10  one node    0.19s  3 nodes    0.31s  shuffled  same=True
+q11  one node    0.04s  3 nodes    0.08s  shuffled  same=True
+q12  one node    0.14s  3 nodes    0.15s  shuffled  same=True
+q13  one node    0.14s  3 nodes    0.25s  shuffled  same=True
+q14  one node    0.10s  3 nodes    0.11s  gathered  same=True
+q15  one node    0.15s  3 nodes    0.19s  shuffled  same=True
+q16  one node    0.07s  3 nodes    0.12s  shuffled  same=True
+q17  one node    0.18s  3 nodes    0.21s  shuffled  same=True
+q18  one node    0.27s  3 nodes    0.25s  gathered  same=True
+q19  one node    0.16s  3 nodes    0.18s  gathered  same=True
+q20  one node    0.15s  3 nodes    0.28s  shuffled  same=True
+q21  one node    0.36s  3 nodes    0.43s  shuffled  same=True
+q22  one node    0.04s  3 nodes    0.14s  shuffled  same=True
+{
+ "nodes": 3,
+ "lake": "/tmp/claude-0/drvlake",
+ "data": "/home/claude/tpch/sf1-raw",
+ "load_s": 7.5,
+ "one_node_s": 3.37,
+ "cluster_s": 4.53,
+ "spread": 22,
+ "all_same": true,
+ "cpus": 2
+}
+
+=== cluster.py users --secs 30
+users: 64 writers + 16 readers + 2 serverless on 3 node(s), 31s  lake /tmp/pondra-rqsag4k8
+  2910400 events (94,243/s), ack p50 51 ms p99 296 ms
+  2079 snapshot reads, query p50 226 ms p99 566 ms
+  inconsistent reads: 0; producers with lost/duplicate batches: 0
+    by node: {}
+
+=== cluster.py failover --secs 45
+  killed leader :18082; new leader :18081 accepting writes after 4.6s
+failover: 3 nodes, 6 shards, 8 producers, 1844900 events, 1 follower + 2 leader kills
+  failovers: 5.0s, 4.6s (kill -> writes acked again); state caught up 0.1s after the last write
+  events exactly once: True (1844900 rows); for 1000 users, task state == model: True, inline view == model: True
+  shard runs per node (since each node's last start): {18080: 321, 18081: 474, 18082: 358}
+
+=== open_check.py
+ },
+ "match": true
+}
+
+
+=== TPC-H on 3 nodes, round 14 against round 15 (SF1 DOUBLE copy; seconds per query across the nodes, one run each, hows.py)
+q1    0.24s (one 0.21s) refusals=1 o key its biggest table's files hold narrow ranges of
+q2    0.14s (one 0.05s) refusals=0 
+q3    0.18s (one 0.15s) refusals=0 
+q4    0.16s (one 0.12s) refusals=0 
+q5    0.21s (one 0.18s) refusals=0 
+q6    0.12s (one 0.10s) refusals=0 
+q7    0.23s (one 0.17s) refusals=0 
+q8    0.23s (one 0.18s) refusals=0 
+q9    0.33s (one 0.29s) refusals=0 
+q10   0.30s (one 0.21s) refusals=0 
+q11   0.09s (one 0.05s) refusals=0 
+q12   0.16s (one 0.17s) refusals=0 
+q13   0.28s (one 0.20s) refusals=0 
+q14   0.11s (one 0.09s) refusals=1 o key its biggest table's files hold narrow ranges of
+q15   0.19s (one 0.15s) refusals=1 o key its biggest table's files hold narrow ranges of
+q16   0.13s (one 0.07s) refusals=0 
+q17   0.22s (one 0.19s) refusals=2 o key its biggest table's files hold narrow ranges of | ashJoinExec: mode=CollectLeft, join_type=LeftSemi, on=[(p_partkey@2, l_partkey@1)], filter=l_quantity@0 < Decimal128(0.2,1,1) * a
+q18   0.31s (one 0.33s) refusals=0 
+q19   0.24s (one 0.23s) refusals=1 o key its biggest table's files hold narrow ranges of
+q20   0.30s (one 0.18s) refusals=3 o key its biggest table's files hold narrow ranges of | ashJoinExec: mode=CollectLeft, join_type=LeftSemi, on=[(ps_partkey@0, l_partkey@1), (ps_suppkey@1, l_suppkey@2)], filter=CAST(ps_ | ashJoinExec: mode=CollectLeft, join_type=LeftSemi, on=[(s_suppkey@0, ps_suppkey@0)], projection=[s_name@1, s_address@2, s_nationk
+q21   0.50s (one 0.44s) refusals=0 
+q22   0.14s (one 0.04s) refusals=2 o key its biggest table's files hold narrow ranges of | ashJoinExec: mode=CollectLeft, join_type=LeftAnti, on=[(c_custkey@0, o_custkey@0)], projection=[c_phone@1, c_acctbal@2] over [Who
+(small tables whole: 4.81 s; round 14: 5.85 s)
+q1    0.24s (one 0.20s) refusals=1 o key its biggest table's files hold narrow ranges of
+q2    0.14s (one 0.06s) refusals=0 
+q3    0.19s (one 0.15s) refusals=0 
+q4    0.21s (one 0.14s) refusals=0 
+q5    0.22s (one 0.19s) refusals=0 
+q6    0.11s (one 0.11s) refusals=0 
+q7    0.31s (one 0.20s) refusals=0 
+q8    0.34s (one 0.19s) refusals=0 
+q9    0.63s (one 0.24s) refusals=0 
+q10   0.58s (one 0.20s) refusals=0 
+q11   0.08s (one 0.04s) refusals=0 
+q12   0.17s (one 0.15s) refusals=0 
+q13   0.44s (one 0.20s) refusals=0 
+q14   0.15s (one 0.09s) refusals=1 o key its biggest table's files hold narrow ranges of
+q15   0.19s (one 0.13s) refusals=1 o key its biggest table's files hold narrow ranges of
+q16   0.10s (one 0.07s) refusals=5 ashJoinExec: mode=CollectLeft, join_type=LeftAnti, on=[(ps_suppkey@0, s_suppkey@0)], null_aware over [Ranged, Split] | ashJoinExec: mode=CollectLeft, join_type=LeftAnti, on=[(ps_suppkey@0, s_suppkey@0)], null_aware over [Split, Split] | ashJoinExec: mode=CollectLeft, join_type=LeftAnti, on=[(ps_suppkey@0, s_suppkey@0)], null_aware over [Keyed, Split] | ashJoinExec: mode=CollectLeft, join_type=Left
+q17   0.21s (one 0.17s) refusals=2 o key its biggest table's files hold narrow ranges of | ashJoinExec: mode=CollectLeft, join_type=LeftSemi, on=[(p_partkey@2, l_partkey@1)], filter=l_quantity@0 < Decimal128(0.2,1,1) * a
+q18   0.34s (one 0.32s) refusals=0 
+q19   0.21s (one 0.18s) refusals=1 o key its biggest table's files hold narrow ranges of
+q20   0.26s (one 0.15s) refusals=3 o key its biggest table's files hold narrow ranges of | ashJoinExec: mode=CollectLeft, join_type=LeftSemi, on=[(ps_partkey@0, l_partkey@1), (ps_suppkey@1, l_suppkey@2)], filter=CAST(ps_ | ashJoinExec: mode=CollectLeft, join_type=LeftSemi, on=[(s_suppkey@0, ps_suppkey@0)], projection=[s_name@1, s_address@2, s_nationk
+q21   0.45s (one 0.40s) refusals=0 
+q22   0.13s (one 0.04s) refusals=2 o key its biggest table's files hold narrow ranges of | ashJoinExec: mode=CollectLeft, join_type=LeftAnti, on=[(c_custkey@0, o_custkey@0)], projection=[c_phone@1, c_acctbal@2] over [Spl
+(every table sliced: 5.70 s; round 14: 7.66 s)
+
+pondra-cold's q15 differing from DuckDB above: q15 compares a DOUBLE sum with the max of the same sums, and
+DataFusion's aggregation on one node adds them up in an order that varies from run to run (12 runs of q15 on
+one node: 1 to 5 of them return its row, with round 14's binary and round 15's alike). On the nodes it adds up
+in node order and returns the row every time (spread_tpch.py above); with DECIMAL money (TPC-H's own types,
+the driver's run above) sums are exact and it never differs.
+
+=== FINAL_DONE

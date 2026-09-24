@@ -292,6 +292,11 @@ pub async fn write_files(lake: &Lake, ctx: &SessionContext, table: &str, query: 
     if lake.cat.get::<u64>(&producer_key(&format!("job:{job}"))).await?.is_some() {
         return Ok(None);
     }
+    // Each partition of the query writes its own files, in the order its rows come: data that
+    // arrives in order (by time, by key) lands in files that each hold a narrow range of it, which
+    // is what lets a filter skip files and a distributed query split tables by key (`spmd`).
+    // (Round-robin repartitioning would interleave them, so it is off here.)
+    ctx.state_ref().write().config_mut().options_mut().optimizer.enable_round_robin_repartition = false;
     // The query's columns, by position, as the table's (or, for a new table, with plain Utf8 strings).
     let df = ctx.sql(query).await?;
     let meta = lake.cat.get::<TableMeta>(&table_key(table)).await?;
@@ -306,7 +311,8 @@ pub async fn write_files(lake: &Lake, ctx: &SessionContext, table: &str, query: 
     let df = df.select(exprs)?;
     let columns = target.iter().map(|(n, t)| (n.clone(), t.to_string())).collect();
     let partition = meta.as_ref().and_then(|m| m.partition.clone());
-    let files = crate::tier::write_stream(lake, table, df.execute_stream().await?, 1_000_000, &[], true, partition.as_deref()).await?;
+    let writes = df.execute_stream_partitioned().await?.into_iter().map(|rows| crate::tier::write_stream(lake, table, rows, 1_000_000, &[], true, partition.as_deref()));
+    let files = futures::future::try_join_all(writes).await?.concat();
     Ok(Some(Files { table: table.into(), job: job.into(), columns, files }))
 }
 
@@ -324,7 +330,9 @@ pub async fn record(lake: &Lake, f: Files) -> Result<Value> {
     ensure!(types(&meta.columns) == types(&f.columns), "query columns {:?} don't match table {}", f.columns, f.table);
     let rows: u64 = f.files.iter().map(|f| f.rows).sum();
     let ord = lake.visible(); // (append tables: files in the order they arrived)
-    meta.files.extend(f.files.into_iter().map(|f| DataFile { ord, ..f }));
+    let mut files: Vec<DataFile> = f.files.into_iter().map(|f| DataFile { ord, ..f }).collect();
+    crate::sketch::add(&mut meta, &mut files);
+    meta.files.extend(files);
     if meta.files.len() > 4 * crate::manifest::INLINE {
         crate::manifest::seal(lake, &f.table, &mut meta).await?; // (a big INSERT's many files: sealed at once; small ones are merged first, by `tier::maintain`)
     }

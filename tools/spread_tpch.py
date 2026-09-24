@@ -77,7 +77,7 @@ def main():
         took = round(time.time() - t0, 2)
         after = counters(port)
         ran = lambda m: after.get(f"pondra_{m}_queries_total", 0) > before.get(f"pondra_{m}_queries_total", 0)
-        how = "shuffled" if ran("shuffled") else "gathered" if ran("spread") else "one node"
+        how = ("ranged, " if ran("ranged") else "") + ("shuffled" if ran("shuffled") else "gathered" if ran("spread") else "one node")
         agree = spread is not None and same(one, spread)
         # A query whose answer turns on floating-point sums matching exactly (TPC-H q15 compares a
         # sum with the max of the same sums, over DOUBLE columns) can give different answers from
@@ -91,16 +91,17 @@ def main():
                 break
         out[f"q{i}"] = {"how": how, "same": agree, "s": took, **({"one node varies": True} if unstable else {}),
                         **({"why": why(nodes[0], since)} if how == "one node" else {}), **({"error": error} if error else {})}
-        print(f"q{i:<3} {how:<9} same={out[f'q{i}']['same']!s:<5} {took:>6.2f}s  {out[f'q{i}'].get('why', '')}", file=sys.stderr, flush=True)
+        print(f"q{i:<3} {how:<17} same={out[f'q{i}']['same']!s:<5} {took:>6.2f}s  {out[f'q{i}'].get('why', '')}", file=sys.stderr, flush=True)
     for n in nodes:
         n.kill()
     subprocess.run(["rm", "-rf", scratch])
     spread = [q for q, v in out.items() if v["how"] != "one node"]
+    ranged = [q for q, v in out.items() if v["how"].startswith("ranged")]
     checks = {
         "every answer across the nodes equals one node's": all(v["same"] for v in out.values()),
         f"at least {A.expect} of the 22 ran across the nodes": len(spread) >= A.expect,
     }
-    result = {"nodes": A.nodes, "broadcast_mb": A.broadcast_mb, "spread": len(spread), "shuffled": sum(v["how"] == "shuffled" for v in out.values()),
+    result = {"nodes": A.nodes, "broadcast_mb": A.broadcast_mb, "spread": len(spread), "shuffled": sum(v["how"].endswith("shuffled") for v in out.values()), "ranged": len(ranged),
               "queries": out, "checks": checks, "ok": all(checks.values())}
     print(json.dumps(result, indent=1))
     sys.exit(0 if result["ok"] else 1)

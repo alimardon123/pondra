@@ -249,6 +249,7 @@ struct BucketParams {
     to: usize,
     #[serde(default)]
     drop: bool, // the coordinator gave up on this shuffle: forget it and delete what it spilled
+    part: Option<usize>, // just this partition of it (a hot one shared out: `skew.rs`)
 }
 
 /// A shuffle bucket this node keeps for another node (see `spmd.rs`).
@@ -257,7 +258,7 @@ async fn bucket(Query(p): Query<BucketParams>) -> Result<Response, E> {
         crate::spmd::forget(&p.id);
         return Ok(Body::empty().into_response());
     }
-    let buckets = crate::spmd::bucket(&p.id, p.exchange, p.to)?;
+    let buckets = crate::spmd::bucket(&p.id, p.exchange, p.to, p.part)?;
     Ok(Body::from_stream(crate::spmd::reply("", buckets, None)).into_response()) // (a piece at a time: a big bucket is on disk)
 }
 

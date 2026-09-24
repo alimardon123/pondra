@@ -205,7 +205,7 @@ pub async fn table_view(lake: &Lake, ctx: &SessionContext, name: &str, meta: &Ta
     if meta.key.is_empty() {
         let schema = read_schema(&meta.columns)?;
         let ranges = crate::manifest::ranges(name, &crate::manifest::list(lake, meta).await?, &meta.files, &schema);
-        return Ok(Arc::new(Pruned { lake: lake.arc(), name: name.into(), meta: meta.clone(), manifests: None, upto, schema, share: None, ranges }));
+        return Ok(Arc::new(Pruned { lake: lake.arc(), name: name.into(), meta: meta.clone(), manifests: None, upto, schema, share: None, ranges, range: None }));
     }
     let df = raw(lake, ctx, name, meta, upto).await?;
     let aux = lake.session();
@@ -225,6 +225,7 @@ pub struct Pruned {
     pub schema: SchemaRef,
     pub share: Option<(u64, u64)>, // a distributed query's slice of it, and the whole table's (rows, bytes)
     pub ranges: Arc<crate::manifest::Stats>, // every column's min and max over the whole table
+    pub range: Option<crate::ranges::Range>, // a distributed query's slice by a key's range: only its rows
 }
 
 impl std::fmt::Debug for Pruned {
@@ -256,28 +257,43 @@ impl TableProvider for Pruned {
         (stats.num_rows, stats.total_byte_size) = (Precision::Inexact(rows as usize), Precision::Inexact(bytes as usize));
         for (i, f) in self.schema.fields().iter().enumerate() {
             let parse = |v: &String| datafusion::common::ScalarValue::try_from_string(v.clone(), f.data_type()).ok();
-            let Some((lo, hi)) = self.ranges.get(f.name()).and_then(|(lo, hi)| Some((parse(lo)?, parse(hi)?))) else { continue };
-            if let Some(n) = crate::manifest::span(&lo, &hi) {
-                stats.column_statistics[i].distinct_count = Precision::Inexact((n as usize).min(rows as usize));
+            let range = self.ranges.get(f.name()).and_then(|(lo, hi)| Some((parse(lo)?, parse(hi)?)));
+            // Distinct values: what the table's sketch saw (`sketch.rs`), no more than its range
+            // could hold, nor than its rows.
+            let sketched = self.meta.sketch.get(f.name()).and_then(|s| crate::sketch::estimate(s));
+            let spanned = range.as_ref().and_then(|(lo, hi)| crate::manifest::span(lo, hi));
+            if let Some(n) = [sketched, spanned].into_iter().flatten().min() {
+                stats.column_statistics[i].distinct_count = Precision::Inexact((n as usize).min(rows as usize).max(1));
             }
-            (stats.column_statistics[i].min_value, stats.column_statistics[i].max_value) = (Precision::Inexact(lo), Precision::Inexact(hi));
+            if let Some((lo, hi)) = range {
+                (stats.column_statistics[i].min_value, stats.column_statistics[i].max_value) = (Precision::Inexact(lo), Precision::Inexact(hi));
+            }
         }
         Some(stats)
     }
 
     async fn scan(&self, _: &dyn datafusion::catalog::Session, projection: Option<&Vec<usize>>, filters: &[Expr], _: Option<usize>) -> datafusion::error::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
         let e = |e: anyhow::Error| datafusion::error::DataFusionError::External(e.into());
-        let files = crate::manifest::pruned(&self.lake, &self.meta, self.manifests.as_deref(), filters, &self.schema).await.map_err(e)?;
+        let range = match &self.range {
+            Some(r) => Some(r.expr(self.schema.field_with_name(&r.column)?.data_type()).map_err(e)?),
+            None => None,
+        };
+        let filters: Vec<Expr> = filters.iter().cloned().chain(range.clone()).collect();
+        let files = crate::manifest::pruned(&self.lake, &self.meta, self.manifests.as_deref(), &filters, &self.schema).await.map_err(e)?;
         let meta = TableMeta { files, sealed: None, ..self.meta.clone() };
         let ctx = self.lake.session();
         let df = raw(&self.lake, &ctx, &self.name, &meta, self.upto).await.map_err(e)?;
+        let df = match range {
+            Some(r) => df.filter(r)?, // (reaches the Parquet reader: row groups outside it are skipped)
+            None => df,
+        };
         let df = match projection {
             Some(p) => df.select_columns(&p.iter().map(|&i| self.schema.field(i).name().as_str()).collect::<Vec<_>>())?,
             None => df,
         };
         let plan = df.create_physical_plan().await?;
         let Some((rows, bytes)) = self.share else { return Ok(plan) };
-        Ok(Arc::new(crate::spmd::ShareExec::new(plan, &self.name, rows, bytes)?))
+        Ok(Arc::new(crate::spmd::ShareExec::new(plan, &self.name, rows, bytes, self.range.as_ref().map(|r| r.column.clone()))?))
     }
 }
 
