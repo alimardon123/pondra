@@ -1,7 +1,7 @@
 # AGENTS.md — working on Pondra
 
 Read this first, then `README.md` (what it does), `docs/adr-005-every-node-writes.md` (why it
-works this way) and `docs/adr-016-data-that-knows-where-it-is.md` (the current round).
+works this way) and `docs/adr-017-streams-on-their-own-time.md` (the current round).
 `docs/prototype-status.md` has the measured numbers and what's left.
 
 ## What this is
@@ -18,13 +18,13 @@ The owner's design principles, which every change must respect:
 2. **As serverless as possible**: no always-on services besides the nodes themselves.
 3. **SPMD, not driver/executor** (Bodo-style): every node runs the same code on its slice.
 4. **No JVM, no Spark, no Flink, no Fluss needed.**
-5. **Short, simple, readable code** — without losing functionality. ~12,100 lines of Rust total (the Kafka protocol is 1,300 of them).
+5. **Short, simple, readable code** — without losing functionality. ~12,800 lines of Rust total (the Kafka protocol is 1,300 of them).
    If a change makes a file much longer, look for the simpler shape first.
 
 ## Layout
 
 ```
-src/      12,100 lines of Rust, one file per concern (see the table in README.md)
+src/      12,800 lines of Rust, one file per concern (see the table in README.md)
 python/   the Python client (pure Python, HTTP + Arrow)
 tools/    harness.py, cluster.py (tests), open_check.py (Delta + Iceberg readers == Pondra),
           keyed_bench.py (compaction cost), clean_bucket.py (keep a bucket to its newest lakes),
@@ -39,6 +39,8 @@ tools/    harness.py, cluster.py (tests), open_check.py (Delta + Iceberg readers
           join_order.py (the same queries written badly: same answers, no slower),
           spread_tpch.py (all 22 TPC-H queries across N nodes == one node, and why not),
           skew_check.py (a hot join key: same answers, the work shared out),
+          asof_check.py (ASOF JOIN == DuckDB's, one node and three), stream_check.py (windows,
+          sessions and an as-of view over one stream: every click once; rates and delays),
           cloud/ (a cluster on several machines; cloud/actions/ + .github/workflows/: on GitHub runners),
           bench/tpch-queries/ (the 22 TPC-H queries),
           r2_test.sh (run the suite against a real bucket), bench/ (vs Spark and Flink)
@@ -51,7 +53,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
   so data is queryable the moment it commits.
 - **The catalog** is a SlateDB key-value store inside the same bucket: `t/` tables, `s/` segments,
   `d/` inline segment data, `p/` producer progress (also Kafka producers, consumer-group offsets
-  and window emission), `v/` views, `k/` tasks, `x/` Delta and `i/`
+  and window emission), `v/` views, `w/` session views' bounds, `k/` tasks, `x/` Delta and `i/`
   Iceberg publish state, `m` members (replicated acks), `n` next segment, `c` commit number. One
   process (the leader) writes it; everyone reads it.
 - **Writes:** a client POSTs a batch to *any* node. That node encodes it (Arrow IPC + ZSTD), runs
@@ -146,6 +148,21 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
   bytes and each column's range (bounding its distinct values) become DataFusion statistics;
   inner joins are rebuilt smallest-first when that costs less than the order the query wrote,
   which is costed the same way as the tree it is. `PONDRA_JOIN_ORDER=0` turns it off.
+- **Streams on their own time** (round 16, `views.rs`): the watermark of a window or session
+  view is its source's newest event time less the lateness (`views::newest`: file ranges, then
+  each new log segment once, in the leader's memory). Window views emit each window to
+  `{v}_final` when it passes the window's end; session views (`?session=ts&gap_secs=…`) cut each
+  key's rows at gaps in SQL each round, over the rows from the earliest open session's start (a
+  lower bound under `w/{v}`), leave out rows inside a session already emitted, and append the
+  closed sessions to `{v}`. Both commit their progress as a producer's seq (`emit:{v}`).
+- **`ASOF JOIN`** (`asof.rs`): `rewrite` turns it into a LEFT JOIN whose condition carries the
+  marker `pondra_asof(l op r)` wherever SQL comes in; the physical rule `asof::Rule` (right after
+  `join_selection`) replaces the hash / sort-merge / nested-loop join carrying it with
+  `AsOfJoinExec` (children: kept side, looked-up side; `Mode::Collected` one lookup table,
+  `Partitioned` one per partition when both sides are hashed by the key, `Keys` the small kept
+  side first and only its keys' rows of the other). `KeepOuter` keeps the join outer so a WHERE
+  isn't pushed into the lookup. `spmd::asof`: looked-up side whole, both hashed, or sent whole to
+  every node.
 - **Arrow Flight / Flight SQL** (`flight.rs`, `--flight`): ADBC/JDBC statements and ingest,
   pyarrow `DoPut` exactly-once, `DoGet` SQL or a table's log as a columnar stream.
 - **Memory:** one spill pool per node (`--memory-gb`); a query out of memory runs again with
@@ -317,6 +334,25 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
 40. **A file's sketch travels only until its commit** (`sketch::add` in `tier_table` and
    `write::record`; `replace` drops merged files' ones). A table's entry lists 128 files; each
    with a sketch of every column would be too big.
+41. **A watermark only grows, and comes from the source's own rows** (`views::newest`): the
+   newest event time in its files' ranges and in each log segment after them. Read the view (or
+   the source's rows) only after working it out: views commit with their rows, so what is read
+   then includes every row the watermark counted.
+42. **A row inside a session already emitted is late** (`views::sessions`: the `_last` join, per
+   key, against the view's own rows). Without it a late row re-emits its session, longer
+   (`harness.py sessions` fails). The `w/{v}` bound is a lower bound: written after the append,
+   stale is only slower.
+43. **An as-of join is never run as a filter.** The marker errs if executed; a plan shape
+   `asof::Rule` doesn't know must fail loudly, not return every earlier row. And no WHERE may be
+   pushed into its looked-up side (`KeepOuter`; `asof_check.py`'s "filtered after the join"
+   differs from DuckDB without it).
+44. **An as-of join sees all of a key's rows on its looked-up side** (`spmd::asof`): that side
+   whole, both sides hashed by the key (a node's partition *i* holds the keys of a whole copy's
+   partition *i*: invariant 33), or all-gathered.
+45. **A view's or task's rows go into its table by position, cast** (`query::cast_as`): strings
+   a query reads from files are views, the table holds plain ones. `with_schema` refused them, and
+   a view that took a string from a table it joins failed every flush (`harness.py asof`'s
+   `venue`).
 
 ## Tests: run these before and after any change
 
@@ -333,7 +369,11 @@ python3 tools/freshness.py [--flag ack=replicated]  # head to head: nodes, pondr
 python3 tools/harness.py clients               # SQL writes, Python client, Postgres drivers, tokens, inbox, attach, vectors, MCP
 python3 tools/harness.py kafka                 # Kafka producers/consumers/groups (librdkafka, kafka-python), Debezium, SASL
 python3 tools/harness.py alter                 # ALTER TABLE ADD COLUMN under load, 6 outside readers follow
-python3 tools/harness.py windows               # event-time windows emitted once, late rows, a leader restart
+python3 tools/harness.py windows               # event-time windows closed by the data's time, emitted once, late rows, a leader restart
+python3 tools/harness.py sessions              # session windows emitted once, whole; late rows; a leader restart
+python3 tools/harness.py asof                  # ASOF JOIN over a stream (a view), ad hoc, over Postgres; refusals
+python3 tools/asof_check.py                    # ASOF JOIN == DuckDB's: 4 directions and more, one node and 3, 4 ways of planning
+python3 tools/stream_check.py                  # one stream, window + session + as-of views: every click once; clicks/s; emission delay
 python3 tools/harness.py scale                 # partitions, manifests, 29 spread query shapes (joins of every kind, subqueries, CTEs, key ranges) == one node, memory limits
 python3 tools/shuffle_spill.py                 # a shuffle bigger than memory, a node killed mid-query, the scratch freed
 python3 tools/join_order.py --lake <tpch lake> # the same queries written badly: same answers, no slower
@@ -392,12 +432,12 @@ Practical notes for an agent working here:
 - Node stderr goes to `/tmp/pondra-<port>-<id>.stderr`; that's where "restarting to rejoin",
   "slow tiering" and panics show up.
 
-## State of the work (2026-09-25, round 15)
+## State of the work (2026-09-26, round 16)
 
 Everything in `docs/prototype-status.md` passes on local disk and on simulated R2. The round-11
 additions (manifests, partitions, shuffles, memory limits, Arrow Flight) also ran against real
 R2; round 12's are in `logs/round12/`, round 13's in `logs/round13/`, round 14's in
-`logs/round14/` and round 15's in `logs/round15/`.
+`logs/round14/`, round 15's in `logs/round15/` and round 16's in `logs/round16/`.
 
 **R2 test buckets.** There are two:
 
@@ -418,7 +458,7 @@ tests themselves, later, on one of:
   unlimited, while the binary stays in R2 and the source stays private. Jobs last at most 6 hours;
   runners have 14 GB of disk (SF10 fits, SF100 doesn't) and are shared, so compare shapes (1 → 3 →
   6 nodes), not headline numbers. `.github/workflows/cluster-bench.yml` and `tools/cloud/actions/`
-  are the workflow; `bench-bin/pondra` in `ponderabucket-us` holds the round-15 dist binary
+  are the workflow; `bench-bin/pondra` in `ponderabucket-us` holds the round-16 dist binary
   (Linux x86-64, glibc 2.39) for its `binary: r2` input. Rebuild and re-upload it when the code
   changes, and read results from `bench-results/<run id>/results.json`.
 - **A Google Cloud VM trial** ($300 for 90 days, no charge unless they upgrade) for dedicated
@@ -439,7 +479,12 @@ Headline numbers, all on one 2-vCPU box:
   7.66 s). A hot key's partition is shared out (busiest node 1.27× the average, not 1.95×)
   (ADR-016).
 
-- **TPC-H on one machine, from Parquet:** SF1 **3.19 s** (round 12; 3.07 s in round 15's run, DuckDB 3.38 s), SF10 **38.0 s** — ahead of DuckDB
+- **Streaming on event time** (round 16, ADR-017): windows closed by the data's own time, session
+  windows, `ASOF JOIN` (1 M trades × 200 k quotes in 0.18–0.32 s on one node, DuckDB 0.24 s; the same
+  answers as DuckDB's every way, on one node and three). One stream with window, session and
+  as-of views: 0.37 M clicks/s in (2.4 M with none), every click once, windows out 0.5 s after
+  the click that closes them.
+- **TPC-H on one machine, from Parquet:** SF1 **3.19 s** (round 12; 3.07 s in round 15's run, 2.99–3.17 s in round 16's, DuckDB 3.18–3.38 s), SF10 **38.0 s** — ahead of DuckDB
   (3.36 / 39.8), Polars (3.78 / out of memory), Polars streaming (3.18 / 42.8) and Daft
   (6.11 / 89.0). With the columns in memory: **1.96 s** / **35.9 s** (DuckDB's native tables:
   1.80 s at SF1; SF10 doesn't fit on this machine). Every answer is checked against DuckDB's.
@@ -481,9 +526,14 @@ Known limits, in the order they matter:
    tables and sort buffers; Parquet decoding and the batches in flight are not counted, so the
    query budget defaults to a third of RAM and the hot columns watch the process's own memory.
 7. **Kafka's edges:** one partition per topic, no transactions, sparse offsets, consumer groups
-   in the leader's memory.
-8. **Streaming:** no session windows or point-in-time joins; the watermark comes from window
-   starts.
+   in the leader's memory. A consumer told the earliest offset just before those segments expired
+   gets "out of range" from `fetch`, and librdkafka retries its cached earliest until it
+   refreshes: `harness.py kafka`'s group check timed out on it once in round 16 (passed on
+   re-runs). Serving an offset before the first segment from the first one would end it.
+8. **Streaming:** one watermark per source (not per partition or node), held by a quiet source;
+   no sliding windows, timers or CEP; an as-of join in a view joins what the table has when the
+   event arrives (Flink's temporal join waits for the table's watermark); keyed tables keep only
+   their latest row, so as-of joins need a table's history kept as rows.
 9. **Security:** tokens per role only; no TLS (use a proxy), no per-table grants or quotas.
 10. **`VARIANT` is JSON text**, not a shredded variant; `ai_*` and Flight functions call out of
     the process, so their latency is the endpoint's.
@@ -500,8 +550,11 @@ produce.
 3. **Where DataFusion gains from a known order** (streaming aggregation, merge joins), declared
    there only: declaring it everywhere made TPC-H slower in round 15.
 4. **Kafka partitions** (key-hashed slices of a table) and transactions.
-5. **An approximate vector index**, and merging files inside sealed manifests (cold compaction).
-6. **TLS, per-table grants, an audit log, quotas.**
+5. **Streaming, next:** Nexmark against Flink (PyFlink needs reinstalling: `venv-flink` is gone),
+   as-of joins in views that wait for the table's watermark, sliding windows, a side table for late
+   rows.
+6. **An approximate vector index**, and merging files inside sealed manifests (cold compaction).
+7. **TLS, per-table grants, an audit log, quotas.**
 
 ## Conventions
 

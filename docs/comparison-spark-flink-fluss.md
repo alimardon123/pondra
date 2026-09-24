@@ -19,6 +19,7 @@
 - `tools/freshness.py` (freshness, head to head), `tools/open_check.py` (outside readers)
 
 **Where the numbers come from:**
+- Watermarks from event time, session windows and `ASOF JOIN` (against DuckDB's): round 16.
 - Tables split by a shared key's ranges, hot keys shared out, distinct values sketched: round 15.
 - Any query across the nodes (all 22 TPC-H queries, answers equal to one node's): round 14.
 - Shuffles that spill and stream, steps that retry, and join order from the catalog: round 13.
@@ -61,8 +62,10 @@ All of that comes from one 95 MB binary, with no JVM, ZooKeeper, Kafka or separa
     key by its ranges, so a join on it needs no shuffle (13 of TPC-H's 22), and shared out a hot
     key's partition over the nodes (Spark's adaptive skew join, without a driver).
   - But it has only been tested as several processes on one machine.
-- **Streaming features:** Flink has event time, watermarks, timers and very large state; Pondra
-  has none of these yet.
+- **Streaming features:** Flink has timers, CEP, sliding windows, a watermark per partition and
+  very large keyed state. Pondra has event-time watermarks from the data (round 16), tumbling
+  and session windows emitted once, point-in-time joins, views with no lag and stateful SQL
+  tasks — but one watermark per source, and no timers or CEP.
 - **APIs and ecosystem:** Spark has DataFrame APIs in four languages and hundreds of connectors.
   Pondra has SQL (reads and writes) over HTTP, the Postgres protocol, Arrow Flight SQL (ADBC,
   JDBC) and MCP, a Python client, the Kafka protocol and an Iceberg REST catalog; few connectors
@@ -89,7 +92,7 @@ biggest open risk is scale-out, and only a multi-machine benchmark can retire it
 | Serving: point reads, repeated dashboards | ✓ 0.1–3 ms, 20–36k/s on 2 cores | | | ms lookups | 10 ms, 12k QPS (cluster) |
 | Serving: new analytical queries on big data | 35–600 ms (single node) | | | — | ✓ sub-100 ms (claimed) |
 | Scale-out to 100s of machines | unproven: shuffles that spill to disk, retried steps and a node dropped mid-query since round 13, all 22 TPC-H queries across the nodes since round 14, tables split by key ranges and hot keys shared out since round 15 — tested on one box only | ✓ | ✓ | ✓ | ✓ |
-| Streaming semantics (event time, windows, CEP, huge state) | decomposable aggregates, SQL tasks, event-time windows emitted once past a watermark | good | ✓ | storage only | — |
+| Streaming semantics (event time, windows, CEP, huge state) | watermarks from event time; tumbling and session windows emitted once; `ASOF JOIN` (ad hoc, across nodes, in views); decomposable aggregates, SQL tasks — no timers, CEP or sliding windows | good | ✓ | storage only | — |
 | APIs & usability | SQL reads and writes over HTTP, the Postgres protocol and Arrow Flight SQL (ADBC, JDBC); Python client (pandas, Polars, Arrow) | ✓ SQL + DataFrames (Python/Scala/Java/R), notebooks | SQL + DataStream API | clients (Java, Rust, Python, C++); REST gateway; Postgres protocol planned | ✓ Databricks SQL |
 | Batch SQL on one machine (TPC-H) | ✓ fastest of Pondra, DuckDB, Polars, Daft and Bodo from files, at SF1 and SF10 | | | — | — |
 | AI agents and vectors | ✓ MCP server built in; `ai_complete`/`ai_embed` against any OpenAI-compatible endpoint; your own functions on an Arrow Flight server; exact vector search in SQL | AI functions on Databricks only | `ML_PREDICT`, `VECTOR_SEARCH`; Flink Agents (0.2) | MCP and vector columns planned | ✓ Agent Bricks, Genie |
@@ -403,7 +406,7 @@ In rough order: what closes the most ground per unit of work comes first.
 | **Scale-out beyond one stage** | Spark's core strength; TPC-H at SF100+ needs it | Round 11: hash exchanges become shuffles between nodes, small tables broadcast, spilling under `--memory-gb`. Round 13: buckets and gathered results in pieces on the node's disk, a failed step retried and a failed node dropped from the shuffle, work dealt by size, skew measured. Round 14: any query — every join type, subqueries answered between steps, CTEs, unions, keyed tables read whole at one snapshot — with exchanges that add up in the same order every run (TPC-H 22 of 22 on 3 nodes). Round 15: big tables sliced by the ranges of a key they share, joins and aggregations on it where the rows are (TPC-H on 3 nodes 5.85 → 4.81 s, 7.66 → 5.70 s with every table sliced); a hot key's partition shared out (busiest node 1.95× → 1.27× the average); NOT IN across the nodes. Next: ranges declared through `cluster_by`, a LIMIT inside a subquery | TPC-H SF100 on 3–10 real machines vs Spark, same hardware (`.github/workflows/cluster-bench.yml` or `tools/cloud/`) |
 | **A plan chosen by cost** | A query written in a bad order shouldn't be a slow query | Round 13: rows and column ranges from the catalog become DataFusion statistics; inner joins rebuilt smallest-first when that beats the order written (`tools/join_order.py`). Round 15: distinct values from a HyperLogLog sketch per column, folded into each table as its files commit (badly written queries 1.72 → 1.55 s with the rule). Next: statistics of what a filter keeps | A badly written query costing what a well written one does, at SF10 and SF100 |
 | **Petabyte tables** | Big tables mean millions of files | Round 11: per-file column ranges, manifests behind one list object (Iceberg's layout), partitions: a million files commit a 20 KB entry, and a query over today skips them all in 13 ms. Next: publishing big tables to Delta/Iceberg by reusing the manifests; merging files after sealing | 1 PB-scale table on real storage with steady commits |
-| **Streaming semantics** | Flink's core strength | Rounds 9–10: event-time tumbling windows (a GROUP BY `date_bin` view), updated incrementally, and emitted once, final, past a watermark with allowed lateness. Next: session windows, a watermark from the source's event time, point-in-time (temporal) joins | Nexmark queries vs Flink |
+| **Streaming semantics** | Flink's core strength | Rounds 9–10: event-time tumbling windows (a GROUP BY `date_bin` view), updated incrementally, and emitted once, final, past a watermark with allowed lateness. Round 16: the watermark from the stream's own event time (newest less the lateness), session windows emitted once, whole, `ASOF JOIN` (0.18–0.32 s for 1 M × 200 k rows, DuckDB 0.24 s; the same answers). Next: as-of joins in views that wait for the table's watermark, sliding windows, late rows to a side table | Nexmark queries vs Flink |
 | **Kafka beyond one partition** | Kafka clients scale reads by partitions | Round 10: produce, consume, consumer groups, one partition per topic. Next: key-hashed partitions (each a slice of the table), transactions for Kafka Streams / Flink exactly-once sinks, the Java client verified | Kafka Connect and Flink's Kafka source against Pondra |
 | **Schema evolution** | Tables change; Fluss 1.0 lists it as a gap too | Round 10: `ALTER TABLE … ADD COLUMN` (old rows read null; Delta and Iceberg follow). Next: renames, defaults, type widening | ✓ adding a column under load (`harness.py alter`) |
 | **AI in SQL** | Flink `ML_PREDICT`, Snowflake Cortex AISQL, Databricks AI functions | `ai_complete()` / `embed()` against any OpenAI-compatible endpoint, batched per Arrow batch; an ANN index for vector columns | A RAG demo: embed on insert, nearest neighbours in SQL, answered through MCP |

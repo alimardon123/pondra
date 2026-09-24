@@ -71,7 +71,7 @@ Turning a format off deletes its metadata, so nobody reads a stale copy.
 
 | Path | Format | Who reads it | Changes? |
 |---|---|---|---|
-| `catalog/` | SlateDB (LSM of SSTs + WAL). Keys: `t/` tables, `s/` log segments, `d/` small segments' data, `p/` producer progress (and bulk-insert jobs; Kafka producers `kafka:{id}:{topic}`, consumer-group offsets `kafka-group:{group}:{topic}`, window emission `emit:{view}`), `v/` views, `k/` tasks, `x/` Delta state, `i/` Iceberg state, `m` the followers whose copies count (replicated acks), `n` next segment, `c` commit number | Pondra | new objects only; old ones compacted away |
+| `catalog/` | SlateDB (LSM of SSTs + WAL). Keys: `t/` tables, `s/` log segments, `d/` small segments' data, `p/` producer progress (and bulk-insert jobs; Kafka producers `kafka:{id}:{topic}`, consumer-group offsets `kafka-group:{group}:{topic}`, window and session emission `emit:{view}`), `v/` views, `w/` a session view's bound (no open session starts before it), `k/` tasks, `x/` Delta state, `i/` Iceberg state, `m` the followers whose copies count (replicated acks), `n` next segment, `c` commit number | Pondra | new objects only; old ones compacted away |
 | `cluster/term/` | JSON: leader address and term (empty address: a `pondra sql` INSERT recording its files) | Pondra | one new object per election |
 | `cluster/alive/` | empty; its timestamp is what counts | Pondra | rewritten every 10 s by the leader; a one-off writer deletes its own when done |
 | `inbox/` | JSON requests (a flush as its binary body), JSON answers | the leader | each request deleted once answered; answers deleted by the writer (unclaimed ones after an hour) |

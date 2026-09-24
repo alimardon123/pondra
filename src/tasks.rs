@@ -60,7 +60,7 @@ pub async fn run_all(lake: &Lake, cluster: &Cluster, log: &Log) -> Result<()> {
             if rows.iter().all(|b| b.num_rows() == 0) {
                 continue; // nothing new for this task: no run, no commit
             }
-            let batch = run(lake, &task, s as u32, rows).await?.with_schema(target_schema(lake, &task).await?)?;
+            let batch = crate::query::cast_as(&run(lake, &task, s as u32, rows).await?, &target_schema(lake, &task).await?)?;
             cluster.shard_runs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let src = Src { producer, seq: hwm, prev: Some(done) }; // output + progress, if progress is still `done`
             runs.push(log.append(task.target.clone(), src, batch));
@@ -91,7 +91,7 @@ pub async fn create(lake: &Lake, name: &str, task: &Task) -> Result<()> {
     if task.shards > 1 && task.shard_by.is_none() {
         bail!("shard_by is required with shards > 1");
     }
-    let out = session(lake, &task.sql, "").await?.sql(&task.sql).await?.schema().as_arrow().clone();
+    let out = session(lake, &task.sql, "").await?.sql(&crate::asof::rewrite(&task.sql)?).await?.schema().as_arrow().clone();
     let mut puts = vec![(task_key(name), json(task))];
     if lake.cat.get::<TableMeta>(&table_key(&task.target)).await?.is_none() {
         let columns = out.fields().iter().map(|f| (f.name().clone(), crate::query::type_name(f.data_type()))).collect();

@@ -104,7 +104,7 @@ fn user_error(e: anyhow::Error) -> PgWireError {
 impl Backend {
     /// Run one statement the way `POST /sql` does, for a client whose role comes from its user name.
     async fn run(&self, user: &str, sql: &str, format: &Format) -> PgWireResult<Response> {
-        let sql = pg_dialect(sql);
+        let sql = crate::asof::rewrite(&pg_dialect(sql)).map_err(user_error)?.into_owned();
         if let Some(r) = session_command(&sql) {
             return Ok(r);
         }
@@ -129,7 +129,8 @@ impl Backend {
 
     /// A query's result columns, without running it.
     async fn schema(&self, sql: &str) -> PgWireResult<Arc<Schema>> {
-        let df = self.session(sql).await?.sql_with_options(sql, read_only()).await.map_err(|e| user_error(e.into()))?;
+        let sql = crate::asof::rewrite(sql).map_err(user_error)?;
+        let df = self.session(&sql).await?.sql_with_options(&sql, read_only()).await.map_err(|e| user_error(e.into()))?;
         Ok(Arc::new(df.schema().as_arrow().clone()))
     }
 
@@ -328,7 +329,7 @@ impl Backend {
         let n = (1..).take_while(|i| sql.contains(&format!("${i}"))).count();
         let mut types = vec![Type::VARCHAR; n];
         if n > 0 && session_command(sql).is_none() && crate::write::parse(sql).is_none() {
-            let plan = async { self.session(sql).await.ok()?.sql_with_options(sql, read_only()).await.ok() }.await;
+            let plan = async { self.session(sql).await.ok()?.sql_with_options(&crate::asof::rewrite(sql).ok()?, read_only()).await.ok() }.await;
             for (name, t) in plan.and_then(|df| df.logical_plan().get_parameter_types().ok()).unwrap_or_default() {
                 if let (Some(i @ 1..), Some(t)) = (name.trim_start_matches('$').parse::<usize>().ok(), t) {
                     if i <= n {

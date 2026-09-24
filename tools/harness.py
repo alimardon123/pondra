@@ -669,10 +669,21 @@ def alter():
     return f"ALTER TABLE ADD COLUMN under load ({sent[0]:,} rows written meanwhile): old rows null, new ones set, keyed table, view, bulk and Arrow appends, 6 outside readers: all {len(checks)} checks pass"
 
 
+def until(f, want, secs=60):
+    """f() once it returns `want` (polled; on object storage emission takes a few round trips), or
+    what it returns when the time is up."""
+    deadline = time.time() + secs
+    while (got := f()) != want and time.time() < deadline:
+        time.sleep(0.3)
+    return got
+
+
 def windows():
-    """Event-time windows that emit once: 1-minute windows, 10 s allowed lateness. Each window
-    reaches `{view}_final` once, final, after the watermark passes it; a late row updates the view
-    but not what was emitted; a restart of the leader emits nothing twice."""
+    """Event-time windows that emit once: 1-minute windows, 10 s allowed lateness. The watermark
+    is the newest event time less the lateness, so a window closes as soon as the data has moved
+    10 s past its end — not when a later window starts. Rows up to 10 s out of order still count;
+    each window reaches `{view}_final` once, final; a later row updates the view but not what was
+    emitted; a restart of the leader emits nothing twice."""
     import datetime
     lake = new_lake()
     node = Node(lake, A.port, tier_secs=1).start()
@@ -687,31 +698,137 @@ def windows():
         nonlocal seq
         seq += 1
         call(A.port, "POST", f"/append/clicks?producer=p&seq={seq}", "".join(json.dumps(r) + "\n" for r in rows).encode())
-    for m in range(5):  # minutes 0-4, in order: a 20 clicks and b 10 in each
+    for m in range(5):  # minutes 0-4, in order: a 20 clicks and b 10 in each, in its first 30 s
         send([{"user": "a" if i % 3 else "b", "ts": iso(base + m * 60 + i)} for i in range(30)])
-    time.sleep(2)
     minutes = lambda rows: sorted({(datetime.datetime.fromisoformat(r["w"]).replace(tzinfo=datetime.timezone.utc).timestamp() - base) // 60 for r in rows})
-    first = q("SELECT w, user, n FROM per_minute_final ORDER BY w, user")
+    emitted = lambda: minutes(q("SELECT w FROM per_minute_final"))
+    first = until(emitted, [0, 1, 2, 3])  # newest 4:29, watermark 4:19: minutes 0-3 have ended
+    send([{"user": "a", "ts": iso(base + 4 * 60 + 55)}])  # the watermark moves to 4:45…
+    send([{"user": "a", "ts": iso(base + 4 * 60 + 40)}])  # …and a row 15 s out of order still counts: minute 4 is open
     send([{"user": "a", "ts": iso(base + 5)}])  # late, for minute 0 (already final)
-    send([{"user": "a", "ts": iso(base + 6 * 60)}])  # minute 6: the watermark passes minutes 3 and 4
-    time.sleep(2)
+    time.sleep(3)
+    middle = emitted()
+    send([{"user": "b", "ts": iso(base + 5 * 60 + 10)}])  # 5:10: the watermark reaches 5:00, the end of minute 4
+    until(emitted, [0, 1, 2, 3, 4])
     node.kill()
     node = Node(lake, A.port, tier_secs=1).start()  # (a new leader: nothing emitted twice)
-    time.sleep(2)
+    time.sleep(3)
     final = q("SELECT w, user, n FROM per_minute_final ORDER BY w, user")
     view0 = q(f"SELECT n FROM per_minute WHERE user = 'a' AND w = '{iso(base)}'")
     node.kill()
+    want = lambda r: (22 if (minutes([r]) == [4]) else 20) if r["user"] == "a" else 10
     checks = {
-        "closed windows only": minutes(first) == [0, 1, 2],
-        "each window once, final": minutes(final) == [0, 1, 2, 3, 4] and len(final) == 10 and all(r["n"] == (20 if r["user"] == "a" else 10) for r in final),
+        "a window closes when event time passes its end, not when the next one starts": first == [0, 1, 2, 3] and middle == [0, 1, 2, 3],
+        "each window once, final, with rows up to the lateness out of order": minutes(final) == [0, 1, 2, 3, 4] and len(final) == 10 and all(r["n"] == want(r) for r in final),
         "late row: in the view, not re-emitted": view0 == [{"n": 21}],
     }
     ok = all(checks.values())
     print(json.dumps({"windows": checks, "ok": ok}, indent=1))
     if not ok:
-        print(first, final, view0)
+        print(first, middle, final, view0)
         sys.exit(1)
-    return "event-time windows: each emitted once, final, after the watermark; late rows update the view only; a leader restart emits nothing twice"
+    return "event-time windows: closed by the data's own time, each emitted once, final; rows out of order within the lateness count; late rows update the view only; a leader restart emits nothing twice"
+
+
+def sessions():
+    """Session windows: each user's clicks with no 30 s gap between them are one session, emitted
+    once when the watermark (newest event time less 5 s) passes its last click plus 30 s. A session
+    that spans many rounds is emitted once, whole; a row out of order within the lateness joins its
+    session; a late row inside a session already emitted is left out; a leader restart emits
+    nothing twice."""
+    import datetime
+    lake = new_lake()
+    node = Node(lake, A.port, tier_secs=1).start()
+    q = lambda s: sql(A.port, s)
+    q("CREATE TABLE visits (user VARCHAR, ts TIMESTAMP, amount BIGINT)")
+    call(A.port, "POST", "/views/user_sessions?session=ts&gap_secs=30&lateness_secs=5",
+         b"SELECT user, count(*) AS n, sum(amount) AS spent FROM visits GROUP BY user")
+    base = 1_790_000_000 // 60 * 60
+    iso = lambda s: datetime.datetime.fromtimestamp(s, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    seq = 0
+    def send(*rows):
+        nonlocal seq
+        seq += 1
+        call(A.port, "POST", f"/append/visits?producer=p&seq={seq}", "".join(json.dumps({"user": u, "ts": iso(base + t), "amount": 2}) + "\n" for u, t in rows).encode())
+        time.sleep(1.5)
+    got = lambda: sorted((r["user"], int(datetime.datetime.fromisoformat(r["session_start"]).replace(tzinfo=datetime.timezone.utc).timestamp()) - base,
+                          int(datetime.datetime.fromisoformat(r["session_end"]).replace(tzinfo=datetime.timezone.utc).timestamp()) - base, r["n"], r["spent"])
+                         for r in q("SELECT * FROM user_sessions"))
+    send(("a", 0), ("a", 10), ("a", 20), ("b", 0), ("b", 25))  # watermark 20: nothing has closed
+    send(("b", 50), ("b", 60))  # watermark 55: a's first session (0-20, ends 50) has
+    first = until(got, [("a", 0, 50, 3, 6)])
+    send(("a", 40), ("a", 97), ("b", 75), ("b", 100))  # a at 40: late, inside a session already emitted
+    send(("a", 110), ("a", 100), ("b", 125))  # a at 100 is out of order, within the lateness
+    send(("c", 300))  # watermark 295: a's second session and b's one long one close
+    want = [("a", 0, 50, 3, 6), ("a", 97, 140, 3, 6), ("b", 0, 155, 7, 14)]
+    until(got, want)
+    node.kill()
+    node = Node(lake, A.port, tier_secs=1).start()  # (a new leader: nothing emitted twice)
+    time.sleep(3)
+    final = got()
+    node.kill()
+    checks = {
+        "a session closes when the watermark passes its last row plus the gap": first == [("a", 0, 50, 3, 6)],
+        "each session once, whole, with rows out of order within the lateness": final == want,
+    }
+    ok = all(checks.values())
+    print(json.dumps({"sessions": checks, "ok": ok}, indent=1))
+    if not ok:
+        print(first, final)
+        sys.exit(1)
+    return "session windows: each closed by event time, emitted once, whole; out-of-order rows within the lateness join their session; late rows inside an emitted session are left out; a leader restart emits nothing twice"
+
+
+def asof():
+    """Point-in-time joins over a stream: an inline view gives each trade the price its symbol had
+    at the trade's own time (`ASOF JOIN … MATCH_CONDITION (t.ts >= p.ts)`), whatever the price is
+    when the trade arrives: a trade that arrives after a newer price still gets the one of its
+    time, and one before any price of its symbol gets NULL. The same query run ad hoc agrees (over
+    HTTP, and over Postgres's extended protocol), and what can't be an as-of join is refused."""
+    import datetime
+    import psycopg
+    lake = new_lake()
+    node = Node(lake, A.port, tier_secs=1, pg=f"127.0.0.1:{A.port + 10}").start()
+    q = lambda s: sql(A.port, s)
+    q("CREATE TABLE prices (sym VARCHAR, ts TIMESTAMP, price DOUBLE, venue VARCHAR)")
+    q("CREATE TABLE trades (id BIGINT, sym VARCHAR, ts TIMESTAMP, qty BIGINT)")
+    # (`venue`: a string read from the looked-up table's files, where strings are views)
+    view = "SELECT t.id, t.sym, t.qty, p.price, t.qty * p.price AS value, p.venue FROM trades t ASOF JOIN prices p MATCH_CONDITION (t.ts >= p.ts) ON t.sym = p.sym"
+    call(A.port, "POST", "/views/priced", view.encode())
+    base = 1_790_000_000
+    iso = lambda s: datetime.datetime.fromtimestamp(base + s, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    seq = itertools.count(1)
+    send = lambda table, rows: call(A.port, "POST", f"/append/{table}?producer={table}&seq={next(seq)}", "".join(json.dumps(r) + "\n" for r in rows).encode())
+    send("prices", [{"sym": "A", "ts": iso(0), "price": 10.0, "venue": "x"}, {"sym": "A", "ts": iso(60), "price": 11.0, "venue": "y"}, {"sym": "A", "ts": iso(120), "price": 12.0, "venue": "x"}, {"sym": "B", "ts": iso(30), "price": 100.0, "venue": "z"}])
+    q("INSERT INTO prices VALUES ('D', '2026-01-01T00:00:00', 1.0, 'w')")  # (and a file of them, not only the log)
+    send("trades", [{"id": 1, "sym": "A", "ts": iso(30), "qty": 1}, {"id": 2, "sym": "A", "ts": iso(90), "qty": 2}, {"id": 3, "sym": "B", "ts": iso(10), "qty": 1},
+                    {"id": 4, "sym": "B", "ts": iso(45), "qty": 3}, {"id": 5, "sym": "C", "ts": iso(50), "qty": 1}])
+    send("prices", [{"sym": "A", "ts": iso(200), "price": 13.0, "venue": "y"}])
+    send("trades", [{"id": 6, "sym": "A", "ts": iso(70), "qty": 1}, {"id": 7, "sym": "A", "ts": iso(250), "qty": 1}])  # 6 arrives late: 11, not 13
+    time.sleep(1.5)
+    want = {1: 10.0, 2: 11.0, 3: None, 4: 100.0, 5: None, 6: 11.0, 7: 13.0}
+    derived = {r["id"]: r.get("price") for r in q("SELECT id, price FROM priced")}
+    values = {r["id"]: r.get("value") for r in q("SELECT id, value FROM priced")}
+    venues = {r["id"]: r.get("venue") for r in q("SELECT id, venue FROM priced")}
+    adhoc = {r["id"]: r.get("price") for r in q(view + " ORDER BY t.id")}
+    with psycopg.connect(f"host=127.0.0.1 port={A.port + 10} user=pondra dbname=pondra", autocommit=True) as c:  # (the extended protocol: described, then run)
+        postgres = dict(c.execute("SELECT t.id, p.price FROM trades t ASOF JOIN prices p MATCH_CONDITION (t.ts >= p.ts) ON t.sym = p.sym WHERE t.qty >= %s ORDER BY t.id", (0,)).fetchall())
+    refused = [_raises(lambda s=s: q(s)) for s in (
+        "SELECT * FROM trades t ASOF JOIN prices p MATCH_CONDITION (t.ts = p.ts) ON t.sym = p.sym",
+        "SELECT * FROM trades t ASOF JOIN prices p MATCH_CONDITION (t.ts >= p.ts) USING (sym)",
+        "SELECT * FROM trades t ASOF JOIN prices p MATCH_CONDITION (t.ts >= p.ts) ON t.sym = p.sym AND t.qty > p.price")]
+    node.kill()
+    checks = {
+        "each trade priced as of its own time, in the stream": derived == want and values[2] == 22.0 and values[3] is None and venues == {1: "x", 2: "y", 3: None, 4: "z", 5: None, 6: "y", 7: "y"},
+        "the same query ad hoc agrees, over HTTP and Postgres (described, then run)": adhoc == want and postgres == want,
+        "what isn't an as-of join is refused": all(refused),
+    }
+    ok = all(checks.values())
+    print(json.dumps({"asof": checks, "ok": ok}, indent=1))
+    if not ok:
+        print(derived, values, adhoc, postgres, refused)
+        sys.exit(1)
+    return "point-in-time joins: each streamed trade priced as of its own time, late ones too; ad hoc queries agree; non-as-of conditions refused"
 
 
 def scale():
@@ -1078,7 +1195,7 @@ def load():
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    out = {t.__name__: t() for t in (upsert, tiering, fence, insert, serverless, clients, kafka, alter, windows, scale, flight, reader, crash)}
+    out = {t.__name__: t() for t in (upsert, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, asof, scale, flight, reader, crash)}
     A.secs = min(A.secs, 20)
     out["load"] = load()
     print(json.dumps(out, indent=1))
@@ -1086,7 +1203,7 @@ def all_tests():
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "tiering", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "scale", "flight", "load", "all"])
+    ap.add_argument("mode", choices=["crash", "upsert", "tiering", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "asof", "scale", "flight", "load", "all"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -1097,4 +1214,4 @@ if __name__ == "__main__":
     ap.add_argument("--secs", type=int, default=30)
     ap.add_argument("--flush-ms", type=int, default=250)
     A = ap.parse_args()
-    {"crash": crash, "upsert": upsert, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "scale": scale, "flight": flight, "load": load, "all": all_tests}[A.mode]()
+    {"crash": crash, "upsert": upsert, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "asof": asof, "scale": scale, "flight": flight, "load": load, "all": all_tests}[A.mode]()

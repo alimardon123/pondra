@@ -369,6 +369,7 @@ impl Lake {
         datafusion_functions_json::register_all(&mut ctx).expect("JSON functions register"); // json_get(…), ->, ->>
         crate::files::register(&ctx, self.arc()); // files('…'), file_read(path)
         crate::ai::register(&ctx); // ai_complete, ai_embed, cosine_similarity, …
+        crate::asof::register(&ctx); // (ASOF JOIN's marker)
         ctx
     }
 

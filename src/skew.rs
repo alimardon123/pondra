@@ -85,7 +85,7 @@ fn keyed(p: &Arc<dyn ExecutionPlan>) -> bool {
     let line = datafusion::physical_plan::displayable(p.as_ref()).one_line().to_string();
     match p.name() {
         "AggregateExec" => !line.contains("mode=Partial,"),
-        "HashJoinExec" => line.contains("mode=Partitioned,"),
+        "HashJoinExec" | "AsOfJoinExec" => line.contains("mode=Partitioned,"),
         "SortMergeJoinExec" | "SortMergeJoin" | "SymmetricHashJoinExec" | "InterleaveExec" | "BoundedWindowAggExec" | "WindowAggExec" => true,
         _ => false,
     }

@@ -1,6 +1,6 @@
 # Prototype status: Pondra, a streamhouse in one binary
 
-**Date:** 2026-09-25 (round 15) · **Plan:** ADR-002 to ADR-016 · **Code:** `pondra.zip` / `pondra.bundle` (≈12,100 lines of Rust, plus a Python client and test and benchmark tools)
+**Date:** 2026-09-26 (round 16) · **Plan:** ADR-002 to ADR-017 · **Code:** `pondra.zip` / `pondra.bundle` (≈12,800 lines of Rust, plus a Python client and test and benchmark tools)
 **Name:** the prototype formerly called `lh` is now **Pondra**. The name is free on crates.io, PyPI and npm. A small personal-finance app uses it (pondra.app), a different category; run a trademark search before a public launch.
 
 ## Where it stands
@@ -14,6 +14,46 @@ One Rust binary replaces the Kafka + Flink + Spark + metastore + ZooKeeper stack
 - upsert and merge tables.
 
 Start more copies on the same bucket to scale out. The only state is object storage. There's no JVM, no database server and no coordination service.
+
+**Round 16 put streams on their own time: watermarks from the data, session windows,
+point-in-time joins** (ADR-017):
+
+1. **The watermark is the newest event time, less the lateness** (as Flink's bounded
+   out-of-orderness). It comes from the source's own event-time column: what its files' ranges
+   say, then each new log segment, once. A window now closes as soon as event time is past its
+   end by the lateness, not when a window after the next one starts; rows that far out of order
+   still count, and each window is still emitted once.
+2. **Session windows** (`POST /views/{v}?session=ts&gap_secs=30&lateness_secs=5` over a plain
+   `SELECT user, count(*) … GROUP BY user`): each user's rows with no gap of 30 s between them
+   are a session, emitted once, whole, with `session_start` and `session_end`, when the watermark
+   passes its last row plus the gap. A session spanning many rounds is emitted once; a row out of
+   order within the lateness joins its session; a late row inside a session already emitted is
+   left out (without that, the session came out twice).
+3. **`ASOF JOIN`** (`asof.rs`): `trades t ASOF JOIN quotes q MATCH_CONDITION (t.ts >= q.ts) ON
+   t.sym = q.sym` gives each trade the quote of its moment (also `>`, `<=`, `<`; NULL if none).
+   DataFusion plans it as a LEFT JOIN carrying a marker, which a join of Pondra's replaces: the
+   looked-up side per key in time order, a binary search per row, in one table or one per
+   partition. 1 M trades × 200 k quotes: **0.18–0.32 s** on one node over four runs (DuckDB
+   0.24–0.26 s), 0.34–0.39 s on three (one box). Every answer equals DuckDB's in all eight shapes
+   tested, on one node and three,
+   planned four ways. In a view over a stream, each event gets the table's row of its own time;
+   for a few rows (a flush) only their keys' rows are looked up.
+4. **One stream, three views** (`tools/stream_check.py`): 2 M clicks from 4 producers, with a
+   window, a session and an as-of view: 0.37 M clicks/s in (2.4 M with no views; 1.03 / 1.08 /
+   0.58 M with each alone), every click in exactly one window and one session, each enriched
+   with its tier of that moment, and the last window and session out 0.51 s and 0.73 s after
+   the click that closed them (on real R2: 2.5 s and 3.0 s, with every durable ack a PUT).
+   TPC-H on one node is unchanged: 1.90–2.01 s from memory and 2.99–3.17 s from Parquet, with
+   round 15's binary at 1.91 / 2.97 s run beside it (DuckDB 3.18–3.26 s).
+5. **What the tests found:**
+   - A WHERE on the quote was pushed into the lookup — the latest quote that passes the filter
+     instead of the latest quote, filtered — because DataFusion turns such an outer join inner
+     first; as-of joins now stay outer (`asof_check.py` against DuckDB caught it).
+   - A view that took a string from a table it joins failed every flush: strings read from files
+     are views, and the view's rows were fitted to its table without a cast. Views and tasks now
+     cast their rows (`stream_check.py` found it).
+   - A review found the Postgres extended protocol's Describe and sort-merge join plans (the
+     out-of-memory retry) missed the rewrite; both covered now.
 
 **Round 15 made the data know where it is: tables split by the ranges of a key they share,
 hot keys shared out, distinct values counted** (ADR-016):
@@ -817,7 +857,8 @@ Limits: producer names must be unique per client; there is no auth or per-user q
 Every test runs on local disk, on a local S3 server with R2-like latency, and against a real
 Cloudflare R2 bucket. All of them pass on all three.
 
-Round 15's runs are in `logs/round15/`: on local disk (`local.txt`: the suite, TPC-H on three
+Round 16's runs are in `logs/round16/` (the suite, `asof_check.py` and `stream_check.py` on
+local disk, the streaming tests on the R2 simulator and on real R2). Round 15's runs are in `logs/round15/`: on local disk (`local.txt`: the suite, TPC-H on three
 nodes with small tables whole and with every table sliced, hot keys, shuffles bigger than memory,
 the GitHub workflow's driver, join order and the single-node benchmark), on the R2 simulator
 (`sim-r2.txt`) and on a real R2 bucket (`r2.txt`), plus the binary's size (`sizes.txt`). Round
@@ -841,12 +882,12 @@ the GitHub workflow's driver, join order and the single-node benchmark), on the 
 
 ## Sizes
 
-| What | Round 3 | Round 5 | Round 8 | Round 9 | Round 10 | Round 11 | Round 12 | Round 14 | Round 15 |
-|---|---|---|---|---|---|---|---|---|---|
-| Binary (stripped) | 88.3 MB (30 MB gzip, 17 MB xz) | 89.2 MB (29.9 MB gzip, 16.8 MB xz) | 90.0 MB (30.5 MB gzip, 18.7 MB xz) | 90.7 MB (30.5 MB gzip, 17.2 MB xz), with the Postgres protocol and MCP | 93.0 MB (31.4 MB gzip, 17.6 MB xz), with the Kafka protocol and JSON functions | 95.0 MB (32.0 MB gzip, 18.0 MB xz), with Arrow Flight (gRPC) | 95.9 MB (32.4 MB gzip, 18.2 MB xz), with hashing, base64, files, vectors and AI functions | 96.3 MB (32.8 MB gzip), with shuffles that spill, the join order and any query across the nodes | 96.5 MB (32.9 MB gzip), with tables split by key ranges, hot keys shared out and distinct values sketched |
-| Idle memory | 18 MB | 41 MB (mimalloc reserves more up front) | 42 MB | 44 MB | 49 MB (with `--kafka`) | 42 MB (with `--kafka --flight --pg`) | 39 MB (with `--kafka --flight --pg`) | not re-measured | not re-measured |
-| Peak memory under full load | 455 MB | 1.8 GB at 2.84 M events/s sustained (279–586 MB in the batch and streaming benchmarks) | not re-measured | not re-measured | not re-measured | bounded for queries by `--memory-gb` | as before, plus the decoded columns (`PONDRA_HOT_GB`, a quarter of the query budget), which are given back when the node's own memory runs high | as before; a shuffle's buckets past `PONDRA_SPILL_MB` go to the node's disk | as before |
-| Storage per event (user, event, amount, ts) | NDJSON 77.9 B → log 12.8 B → Parquet 6.8 B | NDJSON 77.9 B → log 12.8 B → Parquet 6.8 B (unchanged) | unchanged | unchanged | unchanged | unchanged | Parquet files are LZ4 now, about a third bigger than ZSTD's and much cheaper to read (`PONDRA_CODEC=zstd` to go back) | unchanged | unchanged; a table's entry carries a ~350-byte sketch per key-like column |
+| What | Round 3 | Round 5 | Round 8 | Round 9 | Round 10 | Round 11 | Round 12 | Round 14 | Round 15 | Round 16 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| Binary (stripped) | 88.3 MB (30 MB gzip, 17 MB xz) | 89.2 MB (29.9 MB gzip, 16.8 MB xz) | 90.0 MB (30.5 MB gzip, 18.7 MB xz) | 90.7 MB (30.5 MB gzip, 17.2 MB xz), with the Postgres protocol and MCP | 93.0 MB (31.4 MB gzip, 17.6 MB xz), with the Kafka protocol and JSON functions | 95.0 MB (32.0 MB gzip, 18.0 MB xz), with Arrow Flight (gRPC) | 95.9 MB (32.4 MB gzip, 18.2 MB xz), with hashing, base64, files, vectors and AI functions | 96.3 MB (32.8 MB gzip), with shuffles that spill, the join order and any query across the nodes | 96.5 MB (32.9 MB gzip), with tables split by key ranges, hot keys shared out and distinct values sketched | 96.7 MB (33.0 MB gzip), with `ASOF JOIN`, session windows and watermarks from event time |
+| Idle memory | 18 MB | 41 MB (mimalloc reserves more up front) | 42 MB | 44 MB | 49 MB (with `--kafka`) | 42 MB (with `--kafka --flight --pg`) | 39 MB (with `--kafka --flight --pg`) | not re-measured | not re-measured | not re-measured |
+| Peak memory under full load | 455 MB | 1.8 GB at 2.84 M events/s sustained (279–586 MB in the batch and streaming benchmarks) | not re-measured | not re-measured | not re-measured | bounded for queries by `--memory-gb` | as before, plus the decoded columns (`PONDRA_HOT_GB`, a quarter of the query budget), which are given back when the node's own memory runs high | as before; a shuffle's buckets past `PONDRA_SPILL_MB` go to the node's disk | as before | as before; an `ASOF JOIN`'s lookup table counts against the query budget |
+| Storage per event (user, event, amount, ts) | NDJSON 77.9 B → log 12.8 B → Parquet 6.8 B | NDJSON 77.9 B → log 12.8 B → Parquet 6.8 B (unchanged) | unchanged | unchanged | unchanged | unchanged | Parquet files are LZ4 now, about a third bigger than ZSTD's and much cheaper to read (`PONDRA_CODEC=zstd` to go back) | unchanged | unchanged; a table's entry carries a ~350-byte sketch per key-like column | unchanged |
 
 ## Memory is a knob, not a mystery
 
@@ -883,8 +924,11 @@ peak at 279–586 MB.
   makes it milliseconds, but a write in that window survives only as long as one of its holders
   does (with `--fsync`, power loss included; not the leader and every holder at once).
 - Kafka: one partition per topic, no transactions, sparse offsets; consumer groups live in the
-  leader's memory. `ALTER TABLE` only adds columns. Windows take their watermark from window
-  starts; no session windows.
+  leader's memory. `ALTER TABLE` only adds columns.
+- Streaming: one watermark per source, not per partition or node, and a quiet source holds it;
+  no sliding windows, timers or CEP. An as-of join in a view joins what the table has when the
+  event arrives (Flink's temporal join waits for the table's watermark), and against a keyed
+  table it sees only the latest row per key.
 - A one-off `pondra sql` on far-away object storage spends 2–3 s opening the catalog.
 - Open-format versions trail the ack by a few sequential bucket round trips (3–4 s near, 7–10 s
   far, at `--tier-secs 2`); Iceberg costs two more round trips than Delta.
@@ -933,4 +977,5 @@ From the plan in `docs/comparison-spark-flink-fluss.md`, in order:
 4. **Kafka partitions** and transactions; the Java client and Kafka Connect verified.
 5. **An approximate vector index**, and `VARIANT` as a real type once Arrow has one.
 6. **TLS, per-table grants, an audit log, quotas.**
-7. **Session windows**, a watermark from event time, point-in-time joins.
+7. **Streaming, next:** Nexmark against Flink; as-of joins in views that wait for the table's
+   watermark; sliding windows; a side table for late rows.

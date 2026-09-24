@@ -780,6 +780,7 @@ fn spread(p: &Arc<dyn ExecutionPlan>, exchanges: &mut Vec<Exchange>) -> Option<S
             join(&line, Keyed, Keyed, true)
         }),
         "HashJoinExec" | "CrossJoinExec" | "NestedLoopJoinExec" => join(&line, kids[0], kids[1], false).or_else(|| collected(p, &line, &kids, exchanges)),
+        "AsOfJoinExec" => asof(p, &line, &kids, exchanges),
         "SortMergeJoinExec" | "SortMergeJoin" => join(&line, kids[0], kids[1], true),
         // (every node's own rows of each input: a copy read whole on every node would repeat)
         "UnionExec" => (!kids.contains(&Whole)).then_some(Split),
@@ -900,6 +901,24 @@ fn collected(p: &Arc<dyn ExecutionPlan>, line: &str, kids: &[Spread], exchanges:
     Some(out)
 }
 
+/// A point-in-time join (`asof.rs`): each row of its left side looks up the rows of its key on
+/// the right, all of them, so they must be where it is — the right side read whole, both sides
+/// hashed by the key, or else the right side sent to every node.
+fn asof(p: &Arc<dyn ExecutionPlan>, line: &str, kids: &[Spread], exchanges: &mut Vec<Exchange>) -> Option<Spread> {
+    use Spread::*;
+    let partitioned = line.contains("mode=Partitioned");
+    let out = match (kids[0], kids[1]) {
+        (k, Whole) => k, // (hashed alike: a whole copy's partition i holds the keys a node's partition i does)
+        (Keyed, Keyed) if partitioned => Keyed,
+        (k, _) if !partitioned => {
+            exchanges.push(Exchange { plan: p.children()[1].clone(), own: false, whole: true });
+            k
+        }
+        _ => return None,
+    };
+    Some(if out == Keyed { Split } else { out }) // (it reports no partitioning of its own)
+}
+
 /// A final aggregate over rows spread across the nodes — a scalar subquery's `avg`, a `max` over
 /// groups. What reaches it is partial aggregates, a few rows per node, so every node is sent all
 /// of them (an all-gather: the gather below becomes an exchange) and computes the same answer.
@@ -926,7 +945,7 @@ fn shape(p: &Arc<dyn ExecutionPlan>) -> String {
     }
     let what = match p.name() {
         "RepartitionExec" => p.output_partitioning().to_string(),
-        "AggregateExec" | "HashJoinExec" | "SortMergeJoinExec" | "SortExec" | "SortExec(TopK)" | "BoundedWindowAggExec" => displayable(p.as_ref()).one_line().to_string(),
+        "AggregateExec" | "HashJoinExec" | "AsOfJoinExec" | "SortMergeJoinExec" | "SortExec" | "SortExec(TopK)" | "BoundedWindowAggExec" => displayable(p.as_ref()).one_line().to_string(),
         name => name.to_string(),
     };
     // (a subquery's answer, shown in the line, may differ in its last digit from node to node)

@@ -65,6 +65,15 @@ pub fn conform(b: &RecordBatch, s: &SchemaRef) -> Result<RecordBatch> {
     Ok(RecordBatch::try_new(s.clone(), columns.collect::<Result<Vec<_>>>()?)?)
 }
 
+/// A query's rows as `s`'s columns, by position, cast to its types: a view's or a task's output
+/// into its table (strings a query reads from files are views; the table holds plain ones).
+pub fn cast_as(b: &RecordBatch, s: &SchemaRef) -> Result<RecordBatch> {
+    anyhow::ensure!(b.num_columns() == s.fields().len(), "{} columns for a table of {}", b.num_columns(), s.fields().len());
+    let columns = b.columns().iter().zip(s.fields()).map(|(c, f)| datafusion::arrow::compute::cast(c, f.data_type()));
+    let options = datafusion::arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(b.num_rows()));
+    Ok(RecordBatch::try_new_with_options(s.clone(), columns.collect::<Result<Vec<_>, _>>()?, &options)?)
+}
+
 /// Rows of `table` from committed segments in (after, upto]; `None` = up to the latest.
 /// With `ord`, each row gets `_ord` = (segment << 32) + position, so later versions sort last.
 pub async fn tail(lake: &Lake, table: &str, after: u64, upto: Option<u64>, ord: bool) -> Result<Vec<RecordBatch>> {
@@ -380,13 +389,18 @@ pub async fn session(lake: &Lake, sql: &str, except: &str) -> Result<SessionCont
 /// other table it mentions is read from the lake as usual.
 pub async fn over(lake: &Lake, source: &str, rows: Vec<RecordBatch>, sql: &str) -> Result<RecordBatch> {
     let meta: TableMeta = lake.cat.get(&table_key(source)).await?.ok_or_else(|| anyhow::anyhow!("no table {source}"))?;
-    let ctx = session(lake, sql, source).await?;
-    let s = schema(&meta.columns)?;
-    let rows = rows.iter().map(|b| conform(b, &s)).collect::<Result<Vec<_>>>()?;
-    ctx.register_table(source, Arc::new(MemTable::try_new(s, vec![rows])?))?;
-    let df = ctx.sql(sql).await?;
+    let sql = crate::asof::rewrite(sql)?;
+    let df = over_ctx(lake, source, schema(&meta.columns)?, rows, &sql).await?.sql(&sql).await?;
     let out = Arc::new(df.schema().as_arrow().clone());
     Ok(datafusion::arrow::compute::concat_batches(&out, &df.collect().await?)?)
+}
+
+/// A session for `sql` where table `source` is just `rows`, as columns `s`.
+pub async fn over_ctx(lake: &Lake, source: &str, s: SchemaRef, rows: Vec<RecordBatch>, sql: &str) -> Result<SessionContext> {
+    let ctx = session(lake, sql, source).await?;
+    let rows = rows.iter().map(|b| conform(b, &s)).collect::<Result<Vec<_>>>()?;
+    ctx.register_table(source, Arc::new(MemTable::try_new(s, vec![rows])?))?;
+    Ok(ctx)
 }
 
 /// The first table in the FROM clause (looking inside a FROM subquery): the stream a view follows,

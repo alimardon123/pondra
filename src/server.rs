@@ -309,6 +309,7 @@ impl App {
     pub async fn query(&self, query: &str, spread: Option<&str>) -> anyhow::Result<Vec<RecordBatch>> {
         use crate::metrics::{add, QUERIES, QUERY_ERRORS, QUERY_US, SPREAD};
         let start = std::time::Instant::now();
+        let query = &*crate::asof::rewrite(query)?; // (ASOF JOIN, as DataFusion can plan it)
         let run = async {
             let nodes = if spread == Some("0") { vec![] } else { self.cluster.nodes() };
             match crate::spmd::query(&self.lake, &nodes, &self.cluster.addr, query, spread == Some("1")).await {
@@ -486,14 +487,19 @@ struct ViewParams {
     window: Option<String>,
     size_secs: Option<u64>,
     lateness_secs: Option<u64>,
+    session: Option<String>,
+    gap_secs: Option<u64>,
 }
 
 /// `POST /views/{name}` with the SQL; `?window=w&size_secs=60&lateness_secs=10` also emits each
-/// window of column `w` once, final, to `{name}_final` (see `views.rs`).
+/// window of column `w` once, final, to `{name}_final`; `?session=ts&gap_secs=30&lateness_secs=5`
+/// makes it a view of each key's sessions of event time `ts`, each emitted once (see `views.rs`).
 async fn create_view(State(app): State<App>, Path(name): Path<String>, Query(p): Query<ViewParams>, sql: String) -> Result<Json<Value>, E> {
     let _guard = app.lock.lock().await;
-    let emit = p.window.map(|window| crate::views::Emit { window, size_secs: p.size_secs.unwrap_or(60), lateness_secs: p.lateness_secs.unwrap_or(0) });
-    crate::views::create(&app.lake, &name, &sql, emit).await?;
+    let lateness_secs = p.lateness_secs.unwrap_or(0);
+    let emit = p.window.map(|window| crate::views::Emit { window, size_secs: p.size_secs.unwrap_or(60), lateness_secs, time: None });
+    let sessions = p.session.map(|time| crate::views::Sessions { time, gap_secs: p.gap_secs.unwrap_or(1800), lateness_secs, keys: vec![] });
+    crate::views::create(&app.lake, &name, &sql, emit, sessions).await?;
     Ok(Json(j!({"view": name})))
 }
 

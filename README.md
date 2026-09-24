@@ -142,7 +142,9 @@ differences entirely.
 | Python | `import pondra`: `sql()` → pandas / Polars / Arrow, `append()` exactly-once, `watch()`, `lookup()` | PySpark / PyFlink clients for the common jobs |
 | Kafka | `--kafka`: producers write to tables (a topic is a table; JSON values; `_key`/`_timestamp`/`_value` columns; idempotent producers exactly-once; gzip/snappy/lz4/zstd), Debezium change events and tombstones become upserts and deletes; consumers and consumer groups read the log (offsets = `_ord`); SASL/PLAIN with the tokens. Tested: librdkafka (confluent-kafka), kafka-python | Kafka / Fluss ingest, Debezium sinks |
 | Schema evolution | `ALTER TABLE t ADD COLUMN c TYPE` (any node, Postgres, `pondra sql`); old rows read it as null; Delta and Iceberg follow | Delta/Iceberg schema evolution |
-| Event-time windows | `POST /views/{v}?window=w&size_secs=60&lateness_secs=10` over `GROUP BY date_bin(…) AS w`: the view updates live; `{v}_final` gets each window once, final, when the watermark passes it | Flink tumbling windows with watermarks |
+| Event-time windows | `POST /views/{v}?window=w&size_secs=60&lateness_secs=10` over `GROUP BY date_bin(…, ts) AS w`: the view updates live; `{v}_final` gets each window once, final, when the watermark — the newest `ts` in the stream less the lateness — passes its end | Flink tumbling windows with bounded out-of-orderness watermarks |
+| Session windows | `POST /views/{v}?session=ts&gap_secs=30&lateness_secs=5` over `SELECT user, count(*) … GROUP BY user`: each user's rows with no 30 s gap between them are a session; `{v}` gets each once, whole, with `session_start` and `session_end`, when the watermark passes its last row plus the gap | Flink / Spark session windows |
+| Point-in-time joins | `FROM trades t ASOF JOIN quotes q MATCH_CONDITION (t.ts >= q.ts) ON t.sym = q.sym` (also `>`, `<=`, `<`): each row gets the other table's row as it was at that moment, NULL if none; in ad hoc queries, across the nodes, and in views over a stream, where each event gets the table as of its own time however late it arrives | Snowflake / DuckDB ASOF JOIN, Flink temporal joins |
 | JSON | `json_get(col, 'a', 0)`, `json_get_str/int/float/bool`, `json_contains`, `json_length`, `->`, `->>` | VARIANT / JSON functions |
 | Arrow Flight | `--flight`: Flight SQL for ADBC and JDBC drivers (queries, writes, `adbc_ingest`, catalog); pyarrow `DoPut` to `[table, producer, first seq]` (exactly-once, acks as batches commit), `DoGet` with `{"sql": …}`, or a table's log as a columnar stream with only the columns asked for (`{"table": t, "after": N, "columns": [...], "follow": true}`) | Arrow Flight SQL servers (Dremio, InfluxDB 3), Fluss's columnar log |
 | AI agents | `POST /mcp` (the Model Context Protocol): tools `list_tables`, `query`, `write`, `changes`, under the same tokens | an MCP server in front of the warehouse |
@@ -169,7 +171,8 @@ differences entirely.
 | `store.rs` | The lake: object store + catalog (SlateDB, inside the bucket). The leader commits in order and streams every change and commit to the other nodes. They keep the whole catalog in memory from it (seeded from their own view; after a gap they fall back to the view, checked before and after every read, so a read never goes back in time): every node sees a commit within milliseconds, without asking the bucket |
 | `replica.rs` | `--ack replicated`: followers keep the changes the bucket doesn't have yet in local files and acknowledge them; a new leader collects and re-commits them before taking writes |
 | `cluster.rs` | Leader election through the bucket (put-if-absent `cluster/term/{n}`), HTTP heartbeats, takeover after 5 s if no peer still hears the leader; a replaced leader is fenced by the catalog and rejoins. A liveness mark in the bucket lets a node on an idle lake lead at once |
-| `views.rs` | Inline views; GROUP BY views become merge tables |
+| `views.rs` | Inline views; GROUP BY views become merge tables. Window and session views emit what is final once, exactly-once, by a watermark taken from the data's own event time |
+| `asof.rs` | `ASOF JOIN`: rewritten as a LEFT JOIN DataFusion can plan with a marker on its condition, then run by a join that looks each row's match up — per key, in time order, a binary search — in one table, one per partition, or, for a few rows (a stream's new ones), only their keys' rows |
 | `tasks.rs` | Streaming tasks: output + progress commit together, only if progress is unchanged (compare-and-swap) |
 | `spmd.rs` | Distributed queries: every node runs the same plan over its slice of the biggest table; small and keyed tables are read whole, at the coordinator's snapshot. The plan decides what splits (any join type, subqueries, CTEs, unions): up to the first gather, or through shuffles, each exchange a step in which every node splits its output into a bucket per node and partition and reads its own from every node, in node order, so answers are the same every time. Scalar subqueries are answered between steps. Work is dealt by bytes; a step that fails is retried, then run again without that node |
 | `ranges.rs` | Slicing big tables by the ranges of a key they share (cut where the biggest one's bytes split evenly; each node keeps the rows in its range, NULLs in the first), so joins and aggregations on that key run where the rows are |
@@ -205,7 +208,10 @@ committed batches come back as `"duplicate": true`.
 python3 tools/harness.py all [--s3]             # upsert, fence (split brain), insert, serverless, clients, reader, crash, load
 python3 tools/harness.py clients                # SQL writes, Python client, Postgres drivers, tokens, inbox, attached lakes, vectors, MCP
 python3 tools/mcp_client.py --url http://127.0.0.1:8080/mcp   # the official MCP SDK against a node (pip install mcp)
-python3 tools/harness.py kafka | alter | windows   # Kafka clients, ALTER TABLE under load, windows emitted once
+python3 tools/harness.py kafka | alter           # Kafka clients, ALTER TABLE under load
+python3 tools/harness.py windows | sessions | asof   # event-time windows and sessions emitted once; point-in-time joins over a stream
+python3 tools/asof_check.py                     # ASOF JOIN == DuckDB's, every direction, on one node and three
+python3 tools/stream_check.py                   # one stream, window + session + as-of views: every click once; clicks/s, emission delay
 python3 tools/harness.py scale | flight         # partitions, manifests, shuffles, memory limits; Arrow Flight + ADBC
 python3 tools/shuffle_spill.py                 # a shuffle bigger than memory, and one that loses a node
 python3 tools/spread_tpch.py --expect 22        # all 22 TPC-H queries on 3 nodes == one node (13 by key ranges)
@@ -254,8 +260,12 @@ bucket to its newest lakes.
   tools untested here.
 - Kafka: one partition per topic, no transactions; offsets are positions in the log (increasing,
   not dense). Consumer groups live in the leader's memory (members rejoin after a failover).
-- `ALTER TABLE` only adds columns; session windows; an approximate vector index (see the plan in
+- `ALTER TABLE` only adds columns; an approximate vector index (see the plan in
   `docs/comparison-spark-flink-fluss.md`).
+- Streaming: a watermark per source, not per partition or node, and a source that goes quiet
+  holds it (its last windows and sessions wait for more rows); sliding windows; an as-of join
+  looks up a table's rows, so a keyed table, which keeps only its latest row per key, gives the
+  latest, not the one of that moment — keep a table's history as rows for that.
 - On object storage a *durable* ack costs one PUT; `--ack replicated` trades a small window
   (the leader and every holder dying before that PUT) for milliseconds.
 - A one-off `pondra sql` on far-away object storage spends 1–3 s opening the catalog; join

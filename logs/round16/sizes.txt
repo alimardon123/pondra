@@ -1,0 +1,4 @@
+Round 16 binary (cargo build --profile dist):
+  96.7 MB, 33.0 MB gzipped  (round 15: 96.5 MB / 32.9 MB)
+  asof.rs (ASOF JOIN), session windows and event-time watermarks in views.rs; no new dependencies.
+Rust source: 12781 lines across 34 files.

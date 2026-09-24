@@ -73,7 +73,7 @@ async fn query(app: &App, sql: &str) -> anyhow::Result<(SchemaRef, Vec<RecordBat
 
 async fn plan_schema(app: &App, sql: &str) -> anyhow::Result<Schema> {
     let ctx = crate::query::session(&app.lake, sql, "").await?;
-    Ok(ctx.sql_with_options(sql, crate::query::read_only()).await?.schema().as_arrow().clone())
+    Ok(ctx.sql_with_options(&crate::asof::rewrite(sql)?, crate::query::read_only()).await?.schema().as_arrow().clone())
 }
 
 /// A write sent as SQL: a CREATE, INSERT, UPDATE, DELETE or ALTER. Returns the rows written.

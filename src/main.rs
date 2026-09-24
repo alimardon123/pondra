@@ -1,6 +1,7 @@
 //! Pondra: a streamhouse in one binary (see ADR-002 to ADR-005).
 //! Object storage — a local dir or s3://bucket/prefix (S3, R2, MinIO) — is the only state.
 mod ai;
+mod asof;
 mod auth;
 mod cache;
 mod delta;
@@ -254,12 +255,12 @@ async fn main() -> anyhow::Result<()> {
                 tokio::spawn(async move { flight::serve(a, flight_addr).await.map_err(|e| eprintln!("flight: {e:#}")) });
             }
             if let (Some(_), Some(log)) = (&app.seq, &app.log) {
-                let (lake, log) = (lake.clone(), log.clone()); // event-time windows past the watermark, emitted once
+                let (lake, log) = (lake.clone(), log.clone()); // windows and sessions past the watermark, emitted once
                 tokio::spawn(async move {
                     loop {
                         tokio::time::sleep(Duration::from_millis(500)).await;
                         if let Err(e) = views::emit_all(&lake, &log).await {
-                            eprintln!("window emission: {e:#}");
+                            eprintln!("emission: {e:#}");
                         }
                     }
                 });

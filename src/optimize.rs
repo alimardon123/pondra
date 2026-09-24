@@ -31,6 +31,9 @@ pub fn config(mut config: SessionConfig) -> SessionConfig {
 /// DataFusion's rules, with Pondra's placed where they work best.
 pub fn rules() -> Vec<Arc<dyn OptimizerRule + Send + Sync>> {
     let mut rules = Optimizer::new().rules;
+    for r in rules.iter_mut().filter(|r| r.name() == "eliminate_outer_join") {
+        *r = Arc::new(crate::asof::KeepOuter(r.clone()));
+    }
     let at = rules.iter().position(|r| r.name() == "push_down_filter").map_or(rules.len(), |i| i + 1);
     rules.insert(at, Arc::new(SemiJoinDown));
     rules.insert(at, Arc::new(GroupOnlyJoined));
@@ -187,6 +190,7 @@ pub fn physical_rules() -> Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> {
     let mut rules = PhysicalOptimizer::new().rules;
     let at = rules.iter().position(|r| r.name() == "join_selection").map_or(0, |i| i + 1);
     rules.insert(at, Arc::new(HavingBuilds));
+    rules.insert(at + 1, Arc::new(crate::asof::Rule)); // (before the rules that add exchanges: it asks for its own)
     rules
 }
 

@@ -258,7 +258,7 @@ async fn through_log(lake: &Lake, table: &str, meta: &TableMeta) -> Result<bool>
 /// Run a row query here: its rows in the table's column order and types.
 async fn rows(ctx: &SessionContext, meta: &TableMeta, sql: &str) -> Result<RecordBatch> {
     let target = schema(&meta.columns)?;
-    let batches = ctx.sql(sql).await?.collect().await?;
+    let batches = ctx.sql(&crate::asof::rewrite(sql)?).await?.collect().await?;
     let Some(first) = batches.first() else { return Ok(RecordBatch::new_empty(target)) };
     let all = concat_batches(&first.schema(), &batches)?;
     // The given columns fill the table's in order — all of them, or all but `_deleted`, or the
@@ -298,7 +298,7 @@ pub async fn write_files(lake: &Lake, ctx: &SessionContext, table: &str, query: 
     // (Round-robin repartitioning would interleave them, so it is off here.)
     ctx.state_ref().write().config_mut().options_mut().optimizer.enable_round_robin_repartition = false;
     // The query's columns, by position, as the table's (or, for a new table, with plain Utf8 strings).
-    let df = ctx.sql(query).await?;
+    let df = ctx.sql(&crate::asof::rewrite(query)?).await?;
     let meta = lake.cat.get::<TableMeta>(&table_key(table)).await?;
     let target: Vec<(String, DataType)> = match &meta {
         Some(m) => schema(&m.columns)?.fields().iter().map(|f| (f.name().clone(), f.data_type().clone())).collect(),

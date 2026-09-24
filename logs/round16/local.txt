@@ -1,0 +1,1282 @@
+Round 16, local disk, one 2-vCPU box (three nodes share its cores: the timings say what is correct, not what is fast).
+
+=== harness.py all (local disk; run again after the last changes — its Kafka consumer-group check timed out this time, 15,000 of 21,000 records seen in 45 s, and passed on two re-runs of harness.py kafka; the first full run before the changes passed every check)
+upsert: 401 live keys after 12,000 random upserts/deletes, 6 compactions (s: 0.0, 0.0, 0.0, 0.0, 0.0, 0.0), 1 restart, 3,400 lookups (0 wrong) -> OK
+tiering: 12 rounds -> files {'events': 5, 'kv': 5, 'totals': 5}, untiered rows 0, rows {'events': 1200, 'kv': {'n': 200, 'v': 2400}, 'totals': 1200} -> OK
+fence: 2nd node joined as follower=True; takeover after 6.0s; stale leader's write rejected; it rejoined as follower; rows=[{'producer': 'a', 'n': 200}, {'producer': 'b', 'n': 200}] -> OK
+insert: first={'rows': 5} retry={'duplicate': True} summary={'groups': 5, 'n': 5000} -> OK
+{"serverless": {"alone_s": 0.03, "retry": ["{\"rows\":1000}", "{\"duplicate\":true}"], "four_at_once": ["{\"rows\":1000}", "{\"rows\":1000}", "{\"rows\":1000}", "{\"rows\":1000}"], "node_start_s": 0.04, "node_leads": true, "via_node_s": 0.03, "after_leader_killed_s": 30.18, "rows": {"n": 8000, "ids": 1000}, "ok": true}}
+{
+ "clients": {
+  "no token -> 401": true,
+  "read token can't write": true,
+  "write token can't create": true,
+  "users via SQL": true,
+  "pandas / polars / list appends": true,
+  "lookup": true,
+  "change feed replay (upserts + delete)": true,
+  "psycopg 3": true,
+  "psycopg 3 binary": true,
+  "psycopg2": true,
+  "SQLAlchemy + pandas": true,
+  "asyncpg": true,
+  "wrong password refused": true,
+  "cross-lake join": true,
+  "inbox write": true,
+  "vector search (SQL + Postgres)": true,
+  "SQL can't touch the node's files": true,
+  "MCP": true
+ },
+ "inbox_s": 1.03,
+ "ok": true
+}
+groups: 10000 11000 21000 12884903888 12884903887 [0, 1] 15000
+{
+ "kafka": {
+  "librdkafka (5 codecs, idempotent) + kafka-python": true,
+  "a view fed by Kafka": true,
+  "exactly-once retries (idempotent producer)": true,
+  "Debezium events and tombstones": true,
+  "raw values (_value), queried as JSON": true,
+  "kafka-python consumer (upserts, deletes as tombstones)": true,
+  "librdkafka consumer": true,
+  "consumer groups (commit, hand-over via a follower, one holder)": false,
+  "wrong password / read token refused": true
+ },
+ "librdkafka_20k_events_s": 2.59,
+ "ok": false
+}
+
+=== asof_check.py (1 M trades x 200 k quotes, DuckDB 1.5.5 as the reference; 1 node and 3, four ways of planning)
+{
+ "trades": 1000000,
+ "quotes": 200000,
+ "runs": {
+  "quotes whole": {
+   "same_as_duckdb_[one node, spread]": {
+    ">=": [
+     true,
+     true
+    ],
+    ">": [
+     true,
+     true
+    ],
+    "<=": [
+     true,
+     true
+    ],
+    "<": [
+     true,
+     true
+    ],
+    "no key": [
+     true,
+     true
+    ],
+    "small table": [
+     true,
+     true
+    ],
+    "few trades": [
+     true,
+     true
+    ],
+    "filtered after the join": [
+     true,
+     true
+    ]
+   },
+   "joins": {
+    ">=": [
+     "mode=Collected join_type=Left"
+    ],
+    ">": [
+     "mode=Collected join_type=Left"
+    ],
+    "<=": [
+     "mode=Collected join_type=Left"
+    ],
+    "<": [
+     "mode=Collected join_type=Left"
+    ],
+    "no key": [
+     "mode=Collected join_type=Left"
+    ],
+    "small table": [
+     "mode=Collected join_type=Left"
+    ],
+    "few trades": [
+     "mode=Keys join_type=Left"
+    ]
+   },
+   "spread_queries": 8.0,
+   "pondra_one_node_s": 0.225,
+   "pondra_3_nodes_s": 0.388,
+   "duckdb_s": 0.255
+  },
+  "quotes whole, hashed by the key": {
+   "same_as_duckdb_[one node, spread]": {
+    ">=": [
+     true,
+     true
+    ],
+    ">": [
+     true,
+     true
+    ],
+    "<=": [
+     true,
+     true
+    ],
+    "<": [
+     true,
+     true
+    ],
+    "no key": [
+     true,
+     true
+    ],
+    "small table": [
+     true,
+     true
+    ],
+    "few trades": [
+     true,
+     true
+    ],
+    "filtered after the join": [
+     true,
+     true
+    ]
+   },
+   "joins": {
+    ">=": [
+     "mode=Partitioned join_type=Left"
+    ],
+    ">": [
+     "mode=Partitioned join_type=Left"
+    ],
+    "<=": [
+     "mode=Partitioned join_type=Left"
+    ],
+    "<": [
+     "mode=Partitioned join_type=Left"
+    ],
+    "no key": [
+     "mode=Collected join_type=Left"
+    ],
+    "small table": [
+     "mode=Partitioned join_type=Left"
+    ],
+    "few trades": [
+     "mode=Partitioned join_type=Left"
+    ]
+   },
+   "spread_queries": 8.0
+  },
+  "every table sliced, both sides shuffled": {
+   "same_as_duckdb_[one node, spread]": {
+    ">=": [
+     true,
+     true
+    ],
+    ">": [
+     true,
+     true
+    ],
+    "<=": [
+     true,
+     true
+    ],
+    "<": [
+     true,
+     true
+    ],
+    "no key": [
+     true,
+     true
+    ],
+    "small table": [
+     true,
+     true
+    ],
+    "few trades": [
+     true,
+     true
+    ],
+    "filtered after the join": [
+     true,
+     true
+    ]
+   },
+   "joins": {
+    ">=": [
+     "mode=Partitioned join_type=Left"
+    ],
+    ">": [
+     "mode=Partitioned join_type=Left"
+    ],
+    "<=": [
+     "mode=Partitioned join_type=Left"
+    ],
+    "<": [
+     "mode=Partitioned join_type=Left"
+    ],
+    "no key": [
+     "mode=Collected join_type=Left"
+    ],
+    "small table": [
+     "mode=Partitioned join_type=Left"
+    ],
+    "few trades": [
+     "mode=Partitioned join_type=Left"
+    ]
+   },
+   "spread_queries": 8.0
+  },
+  "sort-merge joins preferred": {
+   "same_as_duckdb_[one node, spread]": {
+    ">=": [
+     true,
+     true
+    ],
+    ">": [
+     true,
+     true
+    ],
+    "<=": [
+     true,
+     true
+    ],
+    "<": [
+     true,
+     true
+    ],
+    "no key": [
+     true,
+     true
+    ],
+    "small table": [
+     true,
+     true
+    ],
+    "few trades": [
+     true,
+     true
+    ],
+    "filtered after the join": [
+     true,
+     true
+    ]
+   },
+   "joins": {
+    ">=": [
+     "mode=Partitioned join_type=Left"
+    ],
+    ">": [
+     "mode=Partitioned join_type=Left"
+    ],
+    "<=": [
+     "mode=Partitioned join_type=Left"
+    ],
+    "<": [
+     "mode=Partitioned join_type=Left"
+    ],
+    "no key": [
+     "mode=Collected join_type=Left"
+    ],
+    "small table": [
+     "mode=Partitioned join_type=Left"
+    ],
+    "few trades": [
+     "mode=Partitioned join_type=Left"
+    ]
+   },
+   "spread_queries": 8.0
+  }
+ },
+ "checks": {
+  "one node: every answer equals DuckDB's": true,
+  "across the nodes: every answer equals DuckDB's": true,
+  "the joins ran across the nodes": true,
+  "every way of looking up was used": true
+ },
+ "ok": true
+}
+
+=== stream_check.py (2 M clicks, 20 k users, 4 Arrow producers; window, session and as-of views)
+{
+ "events": 2000000,
+ "users": 20000,
+ "producers": 4,
+ "clicks_per_s": {
+  "no views": 2405485,
+  "window view": 1025728,
+  "session view": 1078232,
+  "as-of view": 584297,
+  "all three": 367761
+ },
+ "seconds_after_the_last_click": {
+  "windows": 0.51,
+  "sessions": 0.73
+ },
+ "sessions": 34000,
+ "checks": {
+  "every click in exactly one emitted window": true,
+  "every click in exactly one emitted session": true,
+  "every click enriched once, with its tier as of its time": true
+ },
+ "ok": true
+}
+
+=== spread_tpch.py --expect 22 (TPC-H SF1, DOUBLE copy, 3 nodes; tables under 64 MB read whole)
+q1   shuffled          same=True    0.25s  
+q2   ranged, gathered  same=True    0.12s  
+q3   ranged, gathered  same=True    0.25s  
+q4   ranged, shuffled  same=True    0.17s  
+q5   ranged, shuffled  same=True    0.22s  
+q6   gathered          same=True    0.11s  
+q7   ranged, shuffled  same=True    0.20s  
+q8   ranged, shuffled  same=True    0.24s  
+q9   ranged, shuffled  same=True    0.41s  
+q10  ranged, shuffled  same=True    0.33s  
+q11  ranged, shuffled  same=True    0.08s  
+q12  ranged, shuffled  same=True    0.15s  
+q13  shuffled          same=True    0.28s  
+q14  gathered          same=True    0.17s  
+q15  shuffled          same=True    0.16s  
+q16  ranged, shuffled  same=True    0.13s  
+q17  shuffled          same=True    0.23s  
+q18  ranged, gathered  same=True    0.29s  
+q19  gathered          same=True    0.19s  
+q20  shuffled          same=True    0.24s  
+q21  ranged, shuffled  same=True    0.50s  
+q22  shuffled          same=True    0.16s  
+{
+ "nodes": 3,
+ "broadcast_mb": 64,
+ "spread": 22,
+ "shuffled": 16,
+ "ranged": 13,
+ "queries": {
+  "q1": {
+   "how": "shuffled",
+   "same": true,
+   "s": 0.25
+  },
+  "q2": {
+   "how": "ranged, gathered",
+   "same": true,
+   "s": 0.12
+  },
+  "q3": {
+   "how": "ranged, gathered",
+   "same": true,
+   "s": 0.25
+  },
+  "q4": {
+   "how": "ranged, shuffled",
+   "same": true,
+   "s": 0.17
+  },
+  "q5": {
+   "how": "ranged, shuffled",
+   "same": true,
+   "s": 0.22
+  },
+  "q6": {
+   "how": "gathered",
+   "same": true,
+   "s": 0.11
+  },
+  "q7": {
+   "how": "ranged, shuffled",
+   "same": true,
+   "s": 0.2
+  },
+  "q8": {
+   "how": "ranged, shuffled",
+   "same": true,
+   "s": 0.24
+  },
+  "q9": {
+   "how": "ranged, shuffled",
+   "same": true,
+   "s": 0.41
+  },
+  "q10": {
+   "how": "ranged, shuffled",
+   "same": true,
+   "s": 0.33
+  },
+  "q11": {
+   "how": "ranged, shuffled",
+   "same": true,
+   "s": 0.08
+  },
+  "q12": {
+   "how": "ranged, shuffled",
+   "same": true,
+   "s": 0.15
+  },
+  "q13": {
+   "how": "shuffled",
+   "same": true,
+   "s": 0.28
+  },
+  "q14": {
+   "how": "gathered",
+   "same": true,
+   "s": 0.17
+  },
+  "q15": {
+   "how": "shuffled",
+   "same": true,
+   "s": 0.16
+  },
+  "q16": {
+   "how": "ranged, shuffled",
+   "same": true,
+   "s": 0.13
+  },
+  "q17": {
+   "how": "shuffled",
+   "same": true,
+   "s": 0.23
+  },
+  "q18": {
+   "how": "ranged, gathered",
+   "same": true,
+   "s": 0.29
+  },
+  "q19": {
+   "how": "gathered",
+   "same": true,
+   "s": 0.19
+  },
+  "q20": {
+   "how": "shuffled",
+   "same": true,
+   "s": 0.24
+  },
+  "q21": {
+   "how": "ranged, shuffled",
+   "same": true,
+   "s": 0.5
+  },
+  "q22": {
+   "how": "shuffled",
+   "same": true,
+   "s": 0.16
+  }
+ },
+ "checks": {
+  "every answer across the nodes equals one node's": true,
+  "at least 22 of the 22 ran across the nodes": true
+ },
+ "ok": true
+}
+
+=== spread_tpch.py --broadcast-mb 0 --expect 22 (every table sliced)
+q1   shuffled          same=True    0.26s  
+q2   ranged, shuffled  same=True    0.13s  
+q3   ranged, shuffled  same=True    0.20s  
+q4   ranged, shuffled  same=True    0.16s  
+q5   ranged, shuffled  same=True    0.19s  
+q6   gathered          same=True    0.10s  
+q7   ranged, shuffled  same=True    0.31s  
+q8   ranged, shuffled  same=True    0.35s  
+q9   ranged, shuffled  same=True    0.59s  
+q10  ranged, shuffled  same=True    0.50s  
+q11  ranged, shuffled  same=True    0.08s  
+q12  ranged, shuffled  same=True    0.16s  
+q13  ranged, shuffled  same=True    0.43s  
+q14  shuffled          same=True    0.15s  
+q15  shuffled          same=True    0.17s  
+q16  ranged, shuffled  same=True    0.11s  
+q17  shuffled          same=True    0.20s  
+q18  ranged, shuffled  same=True    0.33s  
+q19  shuffled          same=True    0.17s  
+q20  shuffled          same=True    0.23s  
+q21  ranged, shuffled  same=True    0.47s  
+q22  shuffled          same=True    0.17s  
+{
+ "nodes": 3,
+ "broadcast_mb": 0,
+ "spread": 22,
+ "shuffled": 21,
+ "ranged": 14,
+ "queries": {
+  "q1": {
+   "how": "shuffled",
+   "same": true,
+   "s": 0.26
+  },
+  "q2": {
+   "how": "ranged, shuffled",
+   "same": true,
+   "s": 0.13
+  },
+  "q3": {
+   "how": "ranged, shuffled",
+   "same": true,
+   "s": 0.2
+  },
+  "q4": {
+   "how": "ranged, shuffled",
+   "same": true,
+   "s": 0.16
+  },
+  "q5": {
+   "how": "ranged, shuffled",
+   "same": true,
+   "s": 0.19
+  },
+  "q6": {
+   "how": "gathered",
+   "same": true,
+   "s": 0.1
+  },
+  "q7": {
+   "how": "ranged, shuffled",
+   "same": true,
+   "s": 0.31
+  },
+  "q8": {
+   "how": "ranged, shuffled",
+   "same": true,
+   "s": 0.35
+  },
+  "q9": {
+   "how": "ranged, shuffled",
+   "same": true,
+   "s": 0.59
+  },
+  "q10": {
+   "how": "ranged, shuffled",
+   "same": true,
+   "s": 0.5
+  },
+  "q11": {
+   "how": "ranged, shuffled",
+   "same": true,
+   "s": 0.08
+  },
+  "q12": {
+   "how": "ranged, shuffled",
+   "same": true,
+   "s": 0.16
+  },
+  "q13": {
+   "how": "ranged, shuffled",
+   "same": true,
+   "s": 0.43
+  },
+  "q14": {
+   "how": "shuffled",
+   "same": true,
+   "s": 0.15
+  },
+  "q15": {
+   "how": "shuffled",
+   "same": true,
+   "s": 0.17
+  },
+  "q16": {
+   "how": "ranged, shuffled",
+   "same": true,
+   "s": 0.11
+  },
+  "q17": {
+   "how": "shuffled",
+   "same": true,
+   "s": 0.2
+  },
+  "q18": {
+   "how": "ranged, shuffled",
+   "same": true,
+   "s": 0.33
+  },
+  "q19": {
+   "how": "shuffled",
+   "same": true,
+   "s": 0.17
+  },
+  "q20": {
+   "how": "shuffled",
+   "same": true,
+   "s": 0.23
+  },
+  "q21": {
+   "how": "ranged, shuffled",
+   "same": true,
+   "s": 0.47
+  },
+  "q22": {
+   "how": "shuffled",
+   "same": true,
+   "s": 0.17
+  }
+ },
+ "checks": {
+  "every answer across the nodes equals one node's": true,
+  "at least 22 of the 22 ran across the nodes": true
+ },
+ "ok": true
+}
+
+=== skew_check.py
+{
+ "rows": 2000000,
+ "without": {
+  "same": {
+   "inner join": true,
+   "LEFT JOIN": true,
+   "IN": true,
+   "grouped by the key": true
+  },
+  "splits": 0.0,
+  "read_mb": [
+   14.6,
+   54.5,
+   14.6
+  ],
+  "busiest_over_average": 1.95
+ },
+ "shared_out": {
+  "same": {
+   "inner join": true,
+   "LEFT JOIN": true,
+   "IN": true,
+   "grouped by the key": true
+  },
+  "splits": 3.0,
+  "read_mb": [
+   24.4,
+   35.8,
+   24.4
+  ],
+  "busiest_over_average": 1.27
+ },
+ "checks": {
+  "every answer equals one node's, without sharing": true,
+  "every answer equals one node's, with hot partitions shared out": true,
+  "hot partitions were shared out": true,
+  "the busiest node read much less": true
+ },
+ "ok": true
+}
+
+=== shuffle_spill.py (local disk)
+{
+ "rows": 4000000,
+ "nodes": 3,
+ "spill_mb": 1,
+ "load_s": 0.8,
+ "one_node_s": 0.5,
+ "spread_s": 1.3,
+ "after_a_node_died_s": 1.4,
+ "spilled_mb": [
+  130.2,
+  209.1
+ ],
+ "left_bytes": [
+  0,
+  0
+ ],
+ "peak_rss_mb": [
+  714,
+  331,
+  343
+ ],
+ "skew": 1.0,
+ "answer": [
+  {
+   "keys": 4000000,
+   "total": 287994492.0
+  }
+ ],
+ "checks": {
+  "the shuffled answer equals the one-node answer": true,
+  "the query shuffled": true,
+  "buckets went to disk": true,
+  "the scratch is empty again": true,
+  "memory stayed under the budget": true,
+  "the buckets came out even": true,
+  "a node dying mid-query doesn't change the answer": true
+ },
+ "ok": true
+}
+
+=== cluster.py spread --rows 2000000
+  q1_scan_agg          one node     11 ms   3 nodes     13 ms   same result: True
+  q2_filter_group      one node     34 ms   3 nodes     58 ms   same result: True
+  q3_high_card_group   one node    106 ms   3 nodes    181 ms   same result: True
+  q4_count_distinct    one node     58 ms   3 nodes    119 ms   same result: True
+  q5_join              one node     32 ms   3 nodes     62 ms   same result: True
+  q6_time_bucket       one node     34 ms   3 nodes     70 ms   same result: True
+  q7_avg_distinct      one node     34 ms   3 nodes    125 ms   same result: True
+  q8_top_rows          one node     15 ms   3 nodes     29 ms   same result: True
+  q9_filter_count      one node      9 ms   3 nodes     16 ms   same result: True
+spread: 2,000,000 rows, 3 nodes; results identical: True; fell back to one node: 0 times
+
+=== join_order.py (TPC-H SF1 lake)
+{
+ "queries": 10,
+ "rule_on": {
+  "well_s": 1.391,
+  "badly_s": 1.597,
+  "worst_ratio": 1.93
+ },
+ "rule_off": {
+  "well_s": 1.37,
+  "badly_s": 1.743,
+  "worst_ratio": 2.11
+ },
+ "slower_with_the_rule": {
+  "well": [],
+  "badly": []
+ },
+ "per_query": {
+  "star": {
+   "on": {
+    "well": 0.125,
+    "badly": 0.128,
+    "same": true
+   },
+   "off": {
+    "well": 0.123,
+    "badly": 0.163,
+    "same": true
+   }
+  },
+  "snowflake": {
+   "on": {
+    "well": 0.111,
+    "badly": 0.112,
+    "same": true
+   },
+   "off": {
+    "well": 0.112,
+    "badly": 0.148,
+    "same": true
+   }
+  },
+  "filtered dimension": {
+   "on": {
+    "well": 0.113,
+    "badly": 0.122,
+    "same": true
+   },
+   "off": {
+    "well": 0.105,
+    "badly": 0.157,
+    "same": true
+   }
+  },
+  "tpch-q2": {
+   "on": {
+    "well": 0.05,
+    "badly": 0.051,
+    "same": true
+   },
+   "off": {
+    "well": 0.055,
+    "badly": 0.056,
+    "same": true
+   }
+  },
+  "tpch-q3": {
+   "on": {
+    "well": 0.127,
+    "badly": 0.12,
+    "same": true
+   },
+   "off": {
+    "well": 0.112,
+    "badly": 0.143,
+    "same": true
+   }
+  },
+  "tpch-q5": {
+   "on": {
+    "well": 0.156,
+    "badly": 0.134,
+    "same": true
+   },
+   "off": {
+    "well": 0.158,
+    "badly": 0.139,
+    "same": true
+   }
+  },
+  "tpch-q9": {
+   "on": {
+    "well": 0.226,
+    "badly": 0.436,
+    "same": true
+   },
+   "off": {
+    "well": 0.225,
+    "badly": 0.474,
+    "same": true
+   }
+  },
+  "tpch-q10": {
+   "on": {
+    "well": 0.18,
+    "badly": 0.182,
+    "same": true
+   },
+   "off": {
+    "well": 0.186,
+    "badly": 0.187,
+    "same": true
+   }
+  },
+  "tpch-q11": {
+   "on": {
+    "well": 0.038,
+    "badly": 0.036,
+    "same": true
+   },
+   "off": {
+    "well": 0.035,
+    "badly": 0.034,
+    "same": true
+   }
+  },
+  "tpch-q18": {
+   "on": {
+    "well": 0.265,
+    "badly": 0.276,
+    "same": true
+   },
+   "off": {
+    "well": 0.259,
+    "badly": 0.242,
+    "same": true
+   }
+  }
+ },
+ "checks": {
+  "the badly written queries answer the same": true,
+  "the badly written queries cost less with the rule": true,
+  "no badly written query is slower with the rule": true,
+  "no well written query is slower with the rule": true
+ },
+ "ok": true
+}
+
+=== bench/singlenode.py run --engines duckdb,pondra,pondra-cold (TPC-H SF1, one node, best of 3; answers checked against DuckDB's, "!" where one differs)
+== duckdb
+  duckdb            q1    0.188 s
+  duckdb            q2    0.044 s
+  duckdb            q3    0.130 s
+  duckdb            q4    0.082 s
+  duckdb            q5    0.143 s
+  duckdb            q6    0.081 s
+  duckdb            q7    0.145 s
+  duckdb            q8    0.176 s
+  duckdb            q9    0.281 s
+  duckdb            q10   0.205 s
+  duckdb            q11   0.027 s
+  duckdb            q12   0.108 s
+  duckdb            q13   0.180 s
+  duckdb            q14   0.113 s
+  duckdb            q15   0.078 s
+  duckdb            q16   0.042 s
+  duckdb            q17   0.136 s
+  duckdb            q18   0.268 s
+  duckdb            q19   0.161 s
+  duckdb            q20   0.127 s
+  duckdb            q21   0.411 s
+  duckdb            q22   0.051 s
+== pondra
+  pondra            q1    0.108 s
+  pondra            q2    0.021 s
+  pondra            q3    0.052 s
+  pondra            q4    0.056 s
+  pondra            q5    0.121 s
+  pondra            q6    0.051 s
+  pondra            q7    0.077 s
+  pondra            q8    0.064 s
+  pondra            q9    0.175 s
+  pondra            q10   0.137 s
+  pondra            q11   0.024 s
+  pondra            q12   0.090 s
+  pondra            q13   0.165 s
+  pondra            q14   0.018 s
+  pondra            q15   0.037 s
+  pondra            q16   0.051 s
+  pondra            q17   0.102 s
+  pondra            q18   0.152 s
+  pondra            q19   0.125 s
+  pondra            q20   0.075 s
+  pondra            q21   0.257 s
+  pondra            q22   0.027 s
+== pondra-cold
+  pondra-cold       q1    0.174 s
+  pondra-cold       q2    0.042 s
+  pondra-cold       q3    0.118 s
+  pondra-cold       q4    0.090 s
+  pondra-cold       q5    0.150 s
+  pondra-cold       q6    0.096 s
+  pondra-cold       q7    0.143 s
+  pondra-cold       q8    0.153 s
+  pondra-cold       q9    0.216 s
+  pondra-cold       q10   0.196 s
+  pondra-cold       q11   0.047 s
+  pondra-cold       q12   0.127 s
+  pondra-cold       q13   0.134 s
+  pondra-cold       q14   0.073 s
+  pondra-cold       q15   0.118 s
+  pondra-cold       q16   0.062 s
+  pondra-cold       q17   0.188 s
+  pondra-cold       q18   0.258 s
+  pondra-cold       q19   0.164 s
+  pondra-cold       q20   0.142 s
+  pondra-cold       q21   0.374 s
+  pondra-cold       q22   0.033 s
+
+            duckdb      pondra pondra-cold
+q1          0.188      0.108      0.174
+q2          0.044      0.021      0.042
+q3          0.130      0.052      0.118
+q4          0.082      0.056      0.090
+q5          0.143      0.121      0.150
+q6          0.081      0.051      0.096
+q7          0.145      0.077      0.143
+q8          0.176      0.064      0.153
+q9          0.281      0.175      0.216
+q10         0.205      0.137      0.196
+q11         0.027      0.024      0.047
+q12         0.108      0.090      0.127
+q13         0.180      0.165      0.134
+q14         0.113      0.018      0.073
+q15         0.078      0.037      0.118!
+q16         0.042      0.051      0.062
+q17         0.136      0.102      0.188
+q18         0.268      0.152      0.258
+q19         0.161      0.125      0.164
+q20         0.127      0.075      0.142
+q21         0.411      0.257      0.374
+q22         0.051      0.027      0.033
+total         3.18        1.98        3.10
+{"pondra_load_s": 8.0, "duckdb_load_s": 0.0, "duckdb_wall_s": 10.5, "pondra_warm_s": 7.9, "pondra_wall_s": 7.0, "pondra-cold_wall_s": 10.6}
+
+=== bench/singlenode.py again, later, on a quiet box (duckdb, pondra, pondra-cold)
+== duckdb
+  duckdb            q1    0.190 s
+  duckdb            q2    0.044 s
+  duckdb            q3    0.142 s
+  duckdb            q4    0.089 s
+  duckdb            q5    0.148 s
+  duckdb            q6    0.092 s
+  duckdb            q7    0.155 s
+  duckdb            q8    0.196 s
+  duckdb            q9    0.301 s
+  duckdb            q10   0.204 s
+  duckdb            q11   0.026 s
+  duckdb            q12   0.117 s
+  duckdb            q13   0.187 s
+  duckdb            q14   0.134 s
+  duckdb            q15   0.073 s
+  duckdb            q16   0.036 s
+  duckdb            q17   0.134 s
+  duckdb            q18   0.268 s
+  duckdb            q19   0.153 s
+  duckdb            q20   0.119 s
+  duckdb            q21   0.399 s
+  duckdb            q22   0.049 s
+== pondra
+  pondra            q1    0.122 s
+  pondra            q2    0.024 s
+  pondra            q3    0.059 s
+  pondra            q4    0.062 s
+  pondra            q5    0.092 s
+  pondra            q6    0.049 s
+  pondra            q7    0.080 s
+  pondra            q8    0.065 s
+  pondra            q9    0.172 s
+  pondra            q10   0.153 s
+  pondra            q11   0.022 s
+  pondra            q12   0.099 s
+  pondra            q13   0.173 s
+  pondra            q14   0.019 s
+  pondra            q15   0.036 s
+  pondra            q16   0.055 s
+  pondra            q17   0.086 s
+  pondra            q18   0.170 s
+  pondra            q19   0.106 s
+  pondra            q20   0.077 s
+  pondra            q21   0.262 s
+  pondra            q22   0.026 s
+== pondra-cold
+  pondra-cold       q1    0.229 s
+  pondra-cold       q2    0.047 s
+  pondra-cold       q3    0.121 s
+  pondra-cold       q4    0.101 s
+  pondra-cold       q5    0.152 s
+  pondra-cold       q6    0.094 s
+  pondra-cold       q7    0.152 s
+  pondra-cold       q8    0.156 s
+  pondra-cold       q9    0.209 s
+  pondra-cold       q10   0.221 s
+  pondra-cold       q11   0.033 s
+  pondra-cold       q12   0.112 s
+  pondra-cold       q13   0.137 s
+  pondra-cold       q14   0.070 s
+  pondra-cold       q15   0.118 s
+  pondra-cold       q16   0.057 s
+  pondra-cold       q17   0.158 s
+  pondra-cold       q18   0.269 s
+  pondra-cold       q19   0.159 s
+  pondra-cold       q20   0.148 s
+  pondra-cold       q21   0.386 s
+  pondra-cold       q22   0.041 s
+
+            duckdb      pondra pondra-cold
+q1          0.190      0.122      0.229
+q2          0.044      0.024      0.047
+q3          0.142      0.059      0.121
+q4          0.089      0.062      0.101
+q5          0.148      0.092      0.152
+q6          0.092      0.049      0.094
+q7          0.155      0.080      0.152
+q8          0.196      0.065      0.156
+q9          0.301      0.172      0.209
+q10         0.204      0.153      0.221
+q11         0.026      0.022      0.033
+q12         0.117      0.099      0.112
+q13         0.187      0.173      0.137
+q14         0.134      0.019      0.070
+q15         0.073      0.036      0.118
+q16         0.036      0.055      0.057
+q17         0.134      0.086      0.158
+q18         0.268      0.170      0.269
+q19         0.153      0.106      0.159
+q20         0.119      0.077      0.148
+q21         0.399      0.262      0.386
+q22         0.049      0.026      0.041
+total         3.26        2.01        3.17
+{"pondra_load_s": 7.9, "duckdb_load_s": 0.0, "duckdb_wall_s": 10.5, "pondra_warm_s": 8.6, "pondra_wall_s": 7.1, "pondra-cold_wall_s": 10.6}
+
+=== bench/singlenode.py: round 15's binary (c484271), then round 16's, back to back (pondra, pondra-cold) — the hot run's 1.69 s in round 15 was the box, not the code
+== pondra
+  pondra            q1    0.112 s
+  pondra            q2    0.023 s
+  pondra            q3    0.059 s
+  pondra            q4    0.057 s
+  pondra            q5    0.099 s
+  pondra            q6    0.053 s
+  pondra            q7    0.078 s
+  pondra            q8    0.062 s
+  pondra            q9    0.152 s
+  pondra            q10   0.144 s
+  pondra            q11   0.025 s
+  pondra            q12   0.087 s
+  pondra            q13   0.172 s
+  pondra            q14   0.019 s
+  pondra            q15   0.037 s
+  pondra            q16   0.052 s
+  pondra            q17   0.081 s
+  pondra            q18   0.150 s
+  pondra            q19   0.101 s
+  pondra            q20   0.087 s
+  pondra            q21   0.237 s
+  pondra            q22   0.024 s
+== pondra-cold
+  pondra-cold       q1    0.187 s
+  pondra-cold       q2    0.038 s
+  pondra-cold       q3    0.118 s
+  pondra-cold       q4    0.080 s
+  pondra-cold       q5    0.140 s
+  pondra-cold       q6    0.080 s
+  pondra-cold       q7    0.140 s
+  pondra-cold       q8    0.152 s
+  pondra-cold       q9    0.229 s
+  pondra-cold       q10   0.184 s
+  pondra-cold       q11   0.031 s
+  pondra-cold       q12   0.111 s
+  pondra-cold       q13   0.139 s
+  pondra-cold       q14   0.072 s
+  pondra-cold       q15   0.098 s
+  pondra-cold       q16   0.057 s
+  pondra-cold       q17   0.164 s
+  pondra-cold       q18   0.255 s
+  pondra-cold       q19   0.150 s
+  pondra-cold       q20   0.124 s
+  pondra-cold       q21   0.382 s
+  pondra-cold       q22   0.035 s
+
+            pondra pondra-cold
+q1          0.112      0.187
+q2          0.023      0.038
+q3          0.059      0.118
+q4          0.057      0.080
+q5          0.099      0.140
+q6          0.053      0.080
+q7          0.078      0.140
+q8          0.062      0.152
+q9          0.152      0.229
+q10         0.144      0.184
+q11         0.025      0.031
+q12         0.087      0.111
+q13         0.172      0.139
+q14         0.019      0.072
+q15         0.037      0.098
+q16         0.052      0.057
+q17         0.081      0.164
+q18         0.150      0.255
+q19         0.101      0.150
+q20         0.087      0.124
+q21         0.237      0.382
+q22         0.024      0.035
+total         1.91        2.97
+{"pondra_load_s": 8.1, "pondra_warm_s": 7.9, "pondra_wall_s": 6.8, "pondra-cold_wall_s": 9.9}
+
+=== …round 16's binary, right after
+== pondra
+  pondra            q1    0.140 s
+  pondra            q2    0.022 s
+  pondra            q3    0.054 s
+  pondra            q4    0.057 s
+  pondra            q5    0.095 s
+  pondra            q6    0.053 s
+  pondra            q7    0.088 s
+  pondra            q8    0.061 s
+  pondra            q9    0.131 s
+  pondra            q10   0.127 s
+  pondra            q11   0.022 s
+  pondra            q12   0.094 s
+  pondra            q13   0.167 s
+  pondra            q14   0.018 s
+  pondra            q15   0.039 s
+  pondra            q16   0.054 s
+  pondra            q17   0.088 s
+  pondra            q18   0.151 s
+  pondra            q19   0.114 s
+  pondra            q20   0.072 s
+  pondra            q21   0.236 s
+  pondra            q22   0.020 s
+== pondra-cold
+  pondra-cold       q1    0.181 s
+  pondra-cold       q2    0.046 s
+  pondra-cold       q3    0.130 s
+  pondra-cold       q4    0.099 s
+  pondra-cold       q5    0.160 s
+  pondra-cold       q6    0.084 s
+  pondra-cold       q7    0.136 s
+  pondra-cold       q8    0.165 s
+  pondra-cold       q9    0.208 s
+  pondra-cold       q10   0.212 s
+  pondra-cold       q11   0.034 s
+  pondra-cold       q12   0.125 s
+  pondra-cold       q13   0.149 s
+  pondra-cold       q14   0.072 s
+  pondra-cold       q15   0.135 s
+  pondra-cold       q16   0.067 s
+  pondra-cold       q17   0.194 s
+  pondra-cold       q18   0.262 s
+  pondra-cold       q19   0.162 s
+  pondra-cold       q20   0.123 s
+  pondra-cold       q21   0.358 s
+  pondra-cold       q22   0.039 s
+
+            pondra pondra-cold
+q1          0.140      0.181
+q2          0.022      0.046
+q3          0.054      0.130
+q4          0.057      0.099
+q5          0.095      0.160
+q6          0.053      0.084
+q7          0.088      0.136
+q8          0.061      0.165
+q9          0.131      0.208
+q10         0.127      0.212
+q11         0.022      0.034
+q12         0.094      0.125
+q13         0.167      0.149
+q14         0.018      0.072
+q15         0.039      0.135
+q16         0.054      0.067
+q17         0.088      0.194
+q18         0.151      0.262
+q19         0.114      0.162
+q20         0.072      0.123
+q21         0.236      0.358
+q22         0.020      0.039
+total         1.90        3.14
+{"pondra_load_s": 8.1, "pondra_warm_s": 8.0, "pondra_wall_s": 6.7, "pondra-cold_wall_s": 10.6}
+
+=== cluster.py users --secs 30
+users: 64 writers + 16 readers + 2 serverless on 3 node(s), 31s  lake /tmp/pondra-lnq8eoan
+  2710500 events (88,128/s), ack p50 55 ms p99 311 ms
+  2196 snapshot reads, query p50 216 ms p99 522 ms
+  inconsistent reads: 0; producers with lost/duplicate batches: 0
+    by node: {}
+
+=== cluster.py failover --secs 45
+  killed leader :18080; new leader :18082 accepting writes after 5.0s
+  killed leader :18082; new leader :18081 accepting writes after 4.8s
+failover: 3 nodes, 6 shards, 8 producers, 1620300 events, 1 follower + 2 leader kills
+  failovers: 5.0s, 4.8s (kill -> writes acked again); state caught up 0.1s after the last write
+  events exactly once: True (1620300 rows); for 1000 users, task state == model: True, inline view == model: True
+  shard runs per node (since each node's last start): {18080: 326, 18081: 469, 18082: 348}
+
+=== open_check.py
+{
+ "lake": "/tmp/pondra-w47c7qna",
+ "pondra": {
+  "events": 60000,
+  "kv": 50,
+  "totals": 100,
+  "dims": 100
+ },
+ "external": {
+  "events": {
+   "delta/delta-rs": 60000,
+   "delta/polars": 60000,
+   "delta/duckdb": 60000,
+   "iceberg/pyiceberg": 60000,
+   "iceberg/polars": 60000,
+   "iceberg/duckdb": 60000,
+   "iceberg/rest/pyiceberg": 60000,
+   "iceberg/rest/duckdb": 60000
+  },
+  "kv": {
+   "delta/delta-rs": 50,
+   "delta/polars": 50,
+   "delta/duckdb": 50,
+   "iceberg/pyiceberg": 50,
+   "iceberg/polars": 50,
+   "iceberg/duckdb": 50,
+   "iceberg/rest/pyiceberg": 50,
+   "iceberg/rest/duckdb": 50
+  },
+  "totals": {
+   "delta/delta-rs": 100,
+   "delta/polars": 100,
+   "delta/duckdb": 100,
+   "iceberg/pyiceberg": 100,
+   "iceberg/polars": 100,
+   "iceberg/duckdb": 100,
+   "iceberg/rest/pyiceberg": 100,
+   "iceberg/rest/duckdb": 100
+  },
+  "dims": {
+   "delta/delta-rs": 100,
+   "delta/polars": 100,
+   "delta/duckdb": 100,
+   "iceberg/pyiceberg": 100,
+   "iceberg/polars": 100,
+   "iceberg/duckdb": 100,
+   "iceberg/rest/pyiceberg": 100,
+   "iceberg/rest/duckdb": 100
+  }
+ },
+ "match": true
+}
+
