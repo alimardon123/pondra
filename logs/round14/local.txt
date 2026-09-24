@@ -1,0 +1,650 @@
+Round 14, local disk, one 2-vCPU box (three nodes share its cores: the timings say what is correct, not what is fast).
+
+=== harness.py all (local disk)
+(run on the binary before the last changes — a tidy, by_key, collected, WholeExec and Slice::partitions — which touch distributed queries only; the sections below ran them again on the final binary, except join_order (one node))
+{
+ "upsert": "12,000 random upserts/deletes with compactions and a restart match the model exactly (410 live keys)",
+ "tiering": "12 rounds of writes and tiering: log drained, files bounded ({'events': 5, 'kv': 5, 'totals': 5}), every row exact",
+ "fence": "a frozen leader is replaced; when it wakes, its write is rejected (fenced) and it rejoins as a follower; nothing lost",
+ "insert": "bulk INSERT \u2026 SELECT writes Parquet directly; a retried job id is applied once",
+ "serverless": "INSERT from a process with no server: 0.03s alone, 4 at once, retries once; a node on the idle lake leads in 0.04s; via a running leader 0.03s; after the leader is killed 30.13s; 8000 rows, no duplicates",
+ "clients": "SQL writes, Python client, Postgres (4 drivers), tokens, change-feed replay, attached lake, inbox (0.5s), vector search, MCP, no file access from SQL: all 18 checks pass",
+ "kafka": "Kafka: librdkafka (5 codecs, idempotent) and kafka-python producers, exactly-once retries, Debezium, tombstones, raw values as JSON, consumers, consumer groups, SASL tokens: all 9 checks pass",
+ "alter": "ALTER TABLE ADD COLUMN under load (59,500 rows written meanwhile): old rows null, new ones set, keyed table, view, bulk and Arrow appends, 6 outside readers: all 8 checks pass",
+ "windows": "event-time windows: each emitted once, final, after the watermark; late rows update the view only; a leader restart emits nothing twice",
+ "scale": "scale: 23,100 rows over 139 daily partitions, 244 files (180 sealed), every file one day, a day's query reads 2 files, 3 nodes, 23 of 23 queries spread, 16 shuffled (all equal to one node), 6 outside readers, a 50 MB memory limit: all 10 checks pass",
+ "flight": "Arrow Flight: pyarrow DoPut exactly-once (retried stream applied once, via a follower too), DoGet SQL, FlightInfo, ListFlights, the log as a columnar stream (a subscriber has each new commit in 5 ms), tokens and handshake; ADBC queries, writes, ingest and catalog: all 13 checks pass",
+ "reader": "freshness on a separate read-only node: p50 7 ms, p99 75 ms",
+ "crash": "5/5 runs, 0 lost, 0 duplicated (events, streaming-task output, views); crashes survived: {'after_seg_put': 0, 'after_commit': 1, 'after_parquet_put': 13, 'kill -9': 5}",
+ "load": {
+  "events_per_s": 1200,
+  "ack_ms_p50": 251,
+  "ack_ms_p99": 254,
+  "freshness_ms_p50": 108,
+  "freshness_ms_p99": 267,
+  "freshness_samples": 50,
+  "commits_per_s": 4.0,
+  "commit_ms_p50": 2,
+  "commit_ms_p95": 3,
+  "server_cores_used": 0.08
+ }
+}
+
+=== spread_tpch.py --expect 22 (TPC-H SF1, DOUBLE copy, 3 nodes; tables under 64 MB read whole)
+q1   shuffled  same=True    0.21s  
+q2   shuffled  same=True    0.10s  
+q3   shuffled  same=True    0.21s  
+q4   shuffled  same=True    0.32s  
+q5   shuffled  same=True    0.25s  
+q6   gathered  same=True    0.10s  
+q7   shuffled  same=True    0.24s  
+q8   shuffled  same=True    0.25s  
+q9   shuffled  same=True    0.45s  
+q10  shuffled  same=True    0.34s  
+q11  shuffled  same=True    0.08s  
+q12  shuffled  same=True    0.19s  
+q13  shuffled  same=True    0.27s  
+q14  gathered  same=True    0.10s  
+q15  shuffled  same=True    0.19s  
+q16  shuffled  same=True    0.16s  
+q17  shuffled  same=True    0.22s  
+q18  shuffled  same=True    0.43s  
+q19  gathered  same=True    0.19s  
+q20  shuffled  same=True    0.28s  
+q21  shuffled  same=True    0.92s  
+q22  shuffled  same=True    0.14s  
+{
+ "nodes": 3,
+ "broadcast_mb": 64,
+ "spread": 22,
+ "shuffled": 19,
+ "queries": {
+  "q1": {
+   "how": "shuffled",
+   "same": true,
+   "s": 0.21
+  },
+  "q2": {
+   "how": "shuffled",
+   "same": true,
+   "s": 0.1
+  },
+  "q3": {
+   "how": "shuffled",
+   "same": true,
+   "s": 0.21
+  },
+  "q4": {
+   "how": "shuffled",
+   "same": true,
+   "s": 0.32
+  },
+  "q5": {
+   "how": "shuffled",
+   "same": true,
+   "s": 0.25
+  },
+  "q6": {
+   "how": "gathered",
+   "same": true,
+   "s": 0.1
+  },
+  "q7": {
+   "how": "shuffled",
+   "same": true,
+   "s": 0.24
+  },
+  "q8": {
+   "how": "shuffled",
+   "same": true,
+   "s": 0.25
+  },
+  "q9": {
+   "how": "shuffled",
+   "same": true,
+   "s": 0.45
+  },
+  "q10": {
+   "how": "shuffled",
+   "same": true,
+   "s": 0.34
+  },
+  "q11": {
+   "how": "shuffled",
+   "same": true,
+   "s": 0.08
+  },
+  "q12": {
+   "how": "shuffled",
+   "same": true,
+   "s": 0.19
+  },
+  "q13": {
+   "how": "shuffled",
+   "same": true,
+   "s": 0.27
+  },
+  "q14": {
+   "how": "gathered",
+   "same": true,
+   "s": 0.1
+  },
+  "q15": {
+   "how": "shuffled",
+   "same": true,
+   "s": 0.19,
+   "one node varies": true
+  },
+  "q16": {
+   "how": "shuffled",
+   "same": true,
+   "s": 0.16
+  },
+  "q17": {
+   "how": "shuffled",
+   "same": true,
+   "s": 0.22
+  },
+  "q18": {
+   "how": "shuffled",
+   "same": true,
+   "s": 0.43
+  },
+  "q19": {
+   "how": "gathered",
+   "same": true,
+   "s": 0.19
+  },
+  "q20": {
+   "how": "shuffled",
+   "same": true,
+   "s": 0.28
+  },
+  "q21": {
+   "how": "shuffled",
+   "same": true,
+   "s": 0.92
+  },
+  "q22": {
+   "how": "shuffled",
+   "same": true,
+   "s": 0.14
+  }
+ },
+ "checks": {
+  "every answer across the nodes equals one node's": true,
+  "at least 22 of the 22 ran across the nodes": true
+ },
+ "ok": true
+}
+
+=== spread_tpch.py --broadcast-mb 0 --expect 21 (every table sliced)
+q1   shuffled  same=True    0.28s  
+q2   shuffled  same=True    0.13s  
+q3   shuffled  same=True    0.18s  
+q4   shuffled  same=True    0.27s  
+q5   shuffled  same=True    0.24s  
+q6   gathered  same=True    0.10s  
+q7   shuffled  same=True    0.34s  
+q8   shuffled  same=True    0.33s  
+q9   shuffled  same=True    0.51s  
+q10  shuffled  same=True    0.69s  
+q11  shuffled  same=True    0.08s  
+q12  shuffled  same=True    0.29s  
+q13  shuffled  same=True    0.39s  
+q14  shuffled  same=True    0.14s  
+q15  shuffled  same=True    0.20s  
+q16  one node  same=True    0.11s  HashJoinExec: mode=CollectLeft, join_type=LeftAnti, on=[(ps_suppkey@0, s_suppkey@0)], null_aware over [Split, Split] | HashJoinExec: mode=CollectLeft, join_type=LeftAnti, on=[(ps_suppkey@0, s_suppkey@0)], null_aware over [Keyed, Split] | no split of its plan is correct
+q17  shuffled  same=True    0.23s  
+q18  shuffled  same=True    0.57s  
+q19  shuffled  same=True    0.20s  
+q20  shuffled  same=True    0.25s  
+q21  shuffled  same=True    2.37s  
+q22  shuffled  same=True    0.14s  
+{
+ "nodes": 3,
+ "broadcast_mb": 0,
+ "spread": 21,
+ "shuffled": 20,
+ "queries": {
+  "q1": {
+   "how": "shuffled",
+   "same": true,
+   "s": 0.28
+  },
+  "q2": {
+   "how": "shuffled",
+   "same": true,
+   "s": 0.13
+  },
+  "q3": {
+   "how": "shuffled",
+   "same": true,
+   "s": 0.18
+  },
+  "q4": {
+   "how": "shuffled",
+   "same": true,
+   "s": 0.27
+  },
+  "q5": {
+   "how": "shuffled",
+   "same": true,
+   "s": 0.24
+  },
+  "q6": {
+   "how": "gathered",
+   "same": true,
+   "s": 0.1
+  },
+  "q7": {
+   "how": "shuffled",
+   "same": true,
+   "s": 0.34
+  },
+  "q8": {
+   "how": "shuffled",
+   "same": true,
+   "s": 0.33
+  },
+  "q9": {
+   "how": "shuffled",
+   "same": true,
+   "s": 0.51
+  },
+  "q10": {
+   "how": "shuffled",
+   "same": true,
+   "s": 0.69
+  },
+  "q11": {
+   "how": "shuffled",
+   "same": true,
+   "s": 0.08
+  },
+  "q12": {
+   "how": "shuffled",
+   "same": true,
+   "s": 0.29
+  },
+  "q13": {
+   "how": "shuffled",
+   "same": true,
+   "s": 0.39
+  },
+  "q14": {
+   "how": "shuffled",
+   "same": true,
+   "s": 0.14
+  },
+  "q15": {
+   "how": "shuffled",
+   "same": true,
+   "s": 0.2
+  },
+  "q16": {
+   "how": "one node",
+   "same": true,
+   "s": 0.11,
+   "why": "HashJoinExec: mode=CollectLeft, join_type=LeftAnti, on=[(ps_suppkey@0, s_suppkey@0)], null_aware over [Split, Split] | HashJoinExec: mode=CollectLeft, join_type=LeftAnti, on=[(ps_suppkey@0, s_suppkey@0)], null_aware over [Keyed, Split] | no split of its plan is correct"
+  },
+  "q17": {
+   "how": "shuffled",
+   "same": true,
+   "s": 0.23
+  },
+  "q18": {
+   "how": "shuffled",
+   "same": true,
+   "s": 0.57
+  },
+  "q19": {
+   "how": "shuffled",
+   "same": true,
+   "s": 0.2
+  },
+  "q20": {
+   "how": "shuffled",
+   "same": true,
+   "s": 0.25
+  },
+  "q21": {
+   "how": "shuffled",
+   "same": true,
+   "s": 2.37
+  },
+  "q22": {
+   "how": "shuffled",
+   "same": true,
+   "s": 0.14
+  }
+ },
+ "checks": {
+  "every answer across the nodes equals one node's": true,
+  "at least 21 of the 22 ran across the nodes": true
+ },
+ "ok": true
+}
+
+=== harness.py scale
+  "over the memory limit: aggregation, sort, join": true
+ },
+ "shuffles": {
+  "many groups": "same, shuffled",
+  "groups, no order": "same, shuffled",
+  "HAVING": "same, shuffled",
+  "string keys": "same, shuffled",
+  "DISTINCT": "same, shuffled",
+  "join, then many groups": "same, shuffled",
+  "join, filters, count": "same, gathered",
+  "join, then another key": "same, shuffled",
+  "self-join": "same, shuffled",
+  "count(DISTINCT) per group": "same, shuffled",
+  "window, PARTITION BY": "same, shuffled",
+  "window over all": "same, gathered",
+  "global aggregate": "same, gathered",
+  "a keyed table": "same, shuffled",
+  "LEFT JOIN, unmatched rows kept": "same, gathered",
+  "small table LEFT JOIN big one": "same, shuffled",
+  "FULL JOIN": "same, shuffled",
+  "IN (a semi join)": "same, gathered",
+  "NOT EXISTS (an anti join)": "same, shuffled",
+  "NOT IN (NULLs matter)": "same, gathered",
+  "a scalar subquery": "same, shuffled",
+  "a CTE and UNION ALL": "same, gathered",
+  "a keyed table, LEFT JOIN": "same, shuffled"
+ },
+ "rows": 23100,
+ "days": 139,
+ "files": {
+  "inline": 93.0,
+  "sealed": 152.0,
+  "parquet_objects": 516,
+  "one_day_scanned": 2.0
+ },
+ "outside_readers": {
+  "delta-rs": 23100,
+  "polars": 23100,
+  "duckdb": 23100,
+  "iceberg/pyiceberg": 23100,
+  "iceberg/polars": 23100,
+  "iceberg/duckdb": 23100
+ },
+ "ok": true
+}
+
+=== shuffle_spill.py
+ "one_node_s": 0.3,
+ "spread_s": 0.4,
+ "after_a_node_died_s": 1.4,
+ "spilled_mb": [
+  106.2,
+  105.0
+ ],
+ "left_bytes": [
+  0,
+  0
+ ],
+ "peak_rss_mb": [
+  946,
+  341,
+  393
+ ],
+ "skew": 1.0,
+ "answer": [
+  {
+   "keys": 4000000,
+   "total": 287994492.0
+  }
+ ],
+ "checks": {
+  "the shuffled answer equals the one-node answer": true,
+  "the query shuffled": true,
+  "buckets went to disk": true,
+  "the scratch is empty again": true,
+  "memory stayed under the budget": true,
+  "the buckets came out even": true,
+  "a node dying mid-query doesn't change the answer": true
+ },
+ "ok": true
+}
+
+=== cluster.py spread
+  q1_scan_agg          one node     14 ms   3 nodes     24 ms   same result: True
+  q2_filter_group      one node     45 ms   3 nodes     81 ms   same result: True
+  q3_high_card_group   one node    171 ms   3 nodes    404 ms   same result: True
+  q4_count_distinct    one node     68 ms   3 nodes    227 ms   same result: True
+  q5_join              one node     64 ms   3 nodes     93 ms   same result: True
+  q6_time_bucket       one node     58 ms   3 nodes     88 ms   same result: True
+  q7_avg_distinct      one node     29 ms   3 nodes     69 ms   same result: True
+  q8_top_rows          one node     27 ms   3 nodes     49 ms   same result: True
+  q9_filter_count      one node     10 ms   3 nodes     15 ms   same result: True
+spread: 4,000,000 rows, 3 nodes; results identical: True; fell back to one node: 0 times
+
+=== cloud/actions/driver.py on 3 local nodes, TPC-H SF1 as tpchgen-cli writes it (DECIMAL), best of 3, as the GitHub workflow runs it
+{"rows":6001215}
+q1   one node    0.30s  3 nodes    0.31s  shuffled  same=True
+q2   one node    0.05s  3 nodes    0.10s  shuffled  same=True
+q3   one node    0.13s  3 nodes    0.19s  shuffled  same=True
+q4   one node    0.09s  3 nodes    0.30s  shuffled  same=True
+q5   one node    0.17s  3 nodes    0.25s  shuffled  same=True
+q6   one node    0.10s  3 nodes    0.12s  gathered  same=True
+q7   one node    0.16s  3 nodes    0.22s  shuffled  same=True
+q8   one node    0.17s  3 nodes    0.25s  shuffled  same=True
+q9   one node    0.25s  3 nodes    0.36s  shuffled  same=True
+q10  one node    0.20s  3 nodes    0.33s  shuffled  same=True
+q11  one node    0.05s  3 nodes    0.08s  shuffled  same=True
+q12  one node    0.14s  3 nodes    0.19s  shuffled  same=True
+q13  one node    0.17s  3 nodes    0.27s  shuffled  same=True
+q14  one node    0.09s  3 nodes    0.10s  gathered  same=True
+q15  one node    0.15s  3 nodes    0.18s  shuffled  same=True
+q16  one node    0.09s  3 nodes    0.13s  shuffled  same=True
+q17  one node    0.18s  3 nodes    0.22s  shuffled  same=True
+q18  one node    0.27s  3 nodes    0.39s  shuffled  same=True
+q19  one node    0.16s  3 nodes    0.18s  gathered  same=True
+q20  one node    0.16s  3 nodes    0.27s  shuffled  same=True
+q21  one node    0.38s  3 nodes    0.92s  shuffled  same=True
+q22  one node    0.04s  3 nodes    0.13s  shuffled  same=True
+{
+ "nodes": 3,
+ "lake": "/tmp/claude-0/drvlake",
+ "data": "/home/claude/tpch/sf1-raw",
+ "load_s": 6.9,
+ "one_node_s": 3.5,
+ "cluster_s": 5.48,
+ "spread": 22,
+ "all_same": true,
+ "cpus": 2
+}
+
+=== join_order.py (TPC-H SF1 lake)
+{
+ "queries": 10,
+ "rule_on": {
+  "well_s": 1.456,
+  "badly_s": 1.743,
+  "worst_ratio": 1.85
+ },
+ "rule_off": {
+  "well_s": 1.479,
+  "badly_s": 1.887,
+  "worst_ratio": 2.09
+ },
+ "slower_with_the_rule": {
+  "well": [],
+  "badly": []
+ },
+ "per_query": {
+  "star": {
+   "on": {
+    "well": 0.123,
+    "badly": 0.123,
+    "same": true
+   },
+   "off": {
+    "well": 0.141,
+    "badly": 0.165,
+    "same": true
+   }
+  },
+  "snowflake": {
+   "on": {
+    "well": 0.121,
+    "badly": 0.169,
+    "same": true
+   },
+   "off": {
+    "well": 0.116,
+    "badly": 0.174,
+    "same": true
+   }
+  },
+  "filtered dimension": {
+   "on": {
+    "well": 0.119,
+    "badly": 0.166,
+    "same": true
+   },
+   "off": {
+    "well": 0.115,
+    "badly": 0.173,
+    "same": true
+   }
+  },
+  "tpch-q2": {
+   "on": {
+    "well": 0.053,
+    "badly": 0.057,
+    "same": true
+   },
+   "off": {
+    "well": 0.065,
+    "badly": 0.067,
+    "same": true
+   }
+  },
+  "tpch-q3": {
+   "on": {
+    "well": 0.138,
+    "badly": 0.136,
+    "same": true
+   },
+   "off": {
+    "well": 0.129,
+    "badly": 0.163,
+    "same": true
+   }
+  },
+  "tpch-q5": {
+   "on": {
+    "well": 0.167,
+    "badly": 0.152,
+    "same": true
+   },
+   "off": {
+    "well": 0.163,
+    "badly": 0.15,
+    "same": true
+   }
+  },
+  "tpch-q9": {
+   "on": {
+    "well": 0.243,
+    "badly": 0.449,
+    "same": true
+   },
+   "off": {
+    "well": 0.232,
+    "badly": 0.484,
+    "same": true
+   }
+  },
+  "tpch-q10": {
+   "on": {
+    "well": 0.187,
+    "badly": 0.183,
+    "same": true
+   },
+   "off": {
+    "well": 0.193,
+    "badly": 0.186,
+    "same": true
+   }
+  },
+  "tpch-q11": {
+   "on": {
+    "well": 0.049,
+    "badly": 0.047,
+    "same": true
+   },
+   "off": {
+    "well": 0.05,
+    "badly": 0.047,
+    "same": true
+   }
+  },
+  "tpch-q18": {
+   "on": {
+    "well": 0.256,
+    "badly": 0.261,
+    "same": true
+   },
+   "off": {
+    "well": 0.275,
+    "badly": 0.278,
+    "same": true
+   }
+  }
+ },
+ "checks": {
+  "the badly written queries answer the same": true,
+  "the badly written queries cost less with the rule": true,
+  "no badly written query is slower with the rule": true,
+  "no well written query is slower with the rule": true
+ },
+ "ok": true
+}
+
+
+=== cluster.py users --secs 30
+users: 64 writers + 16 readers + 2 serverless on 3 node(s), 31s  lake /tmp/pondra-y5u8q5o1
+  2968800 events (95,949/s), ack p50 50 ms p99 266 ms
+  1934 snapshot reads, query p50 245 ms p99 674 ms
+  inconsistent reads: 0; producers with lost/duplicate batches: 0
+    by node: {}
+
+=== cluster.py failover --secs 45
+  killed leader :18082; new leader :18080 accepting writes after 4.5s
+failover: 3 nodes, 6 shards, 8 producers, 1692900 events, 1 follower + 2 leader kills
+  failovers: 5.1s, 4.5s (kill -> writes acked again); state caught up 0.2s after the last write
+  events exactly once: True (1692900 rows); for 1000 users, task state == model: True, inline view == model: True
+  shard runs per node (since each node's last start): {18080: 441, 18081: 325, 18082: 335}
+
+=== 3 nodes, before and after by_key and collected (TPC-H SF1 DOUBLE copy; seconds per query across the nodes, one run each)
+query   tables<64MB whole: before  after   every table sliced: before  after
+q1                          0.22   0.24                        0.26   0.24
+q2                          0.28   0.12                        0.29   0.13
+q3                          0.19   0.22                        0.48   0.19
+q4                          0.24   0.27                        0.29   0.30
+q5                          0.24   0.25                        0.95   0.24
+q6                          0.12   0.10                        0.10   0.12
+q7                          0.25   0.25                        0.64   0.33
+q8                          0.27   0.26                        1.08   0.37
+q9                          0.34   0.34                        1.49   0.56
+q10                         0.31   0.32                        0.58   0.63
+q11                         0.07   0.07                        0.25   0.08
+q12                         0.20   0.20                        0.26   0.29
+q13                         0.26   0.27                        0.30   0.43
+q14                         0.11   0.10                        0.16   0.15
+q15                         0.18   0.17                        0.18   0.19
+q16                         0.15   0.13                        0.10   0.09 (one node: NOT IN over a sliced table)
+q17                         1.11   0.21                        1.04   0.19
+q18                         0.68   0.74                        0.78   0.57
+q19                         0.22   0.21                        0.21   0.20
+q20                         0.31   0.28                        0.33   0.26
+q21                         2.12   0.96                        2.21   1.97
+q22                         0.15   0.14                        0.12   0.13
+total                       8.02   5.85                       12.09   7.66
+(before: 7 of the 22 fell through to the plan that shuffles every join; after: none)
+
+=== FINAL_DONE

@@ -1,6 +1,6 @@
 # Pondra: a streamhouse in one binary
 
-One Rust binary (~11,000 lines) that ingests streams, stores them as a lakehouse (Parquet files
+One Rust binary (~11,400 lines) that ingests streams, stores them as a lakehouse (Parquet files
 plus a catalog, on object storage; Delta Lake and Iceberg metadata for other engines on request),
 keeps SQL views and streaming state up to date, answers SQL, and scales out by starting more
 copies of itself on the same bucket. Object storage is the only state: no Postgres, no
@@ -171,8 +171,8 @@ differences entirely.
 | `cluster.rs` | Leader election through the bucket (put-if-absent `cluster/term/{n}`), HTTP heartbeats, takeover after 5 s if no peer still hears the leader; a replaced leader is fenced by the catalog and rejoins. A liveness mark in the bucket lets a node on an idle lake lead at once |
 | `views.rs` | Inline views; GROUP BY views become merge tables |
 | `tasks.rs` | Streaming tasks: output + progress commit together, only if progress is unchanged (compare-and-swap) |
-| `spmd.rs` | Distributed queries: every node runs the same plan over its slice; small tables are read whole (broadcast). Up to the first gather, or through shuffles: each hash exchange becomes a step in which every node splits its output by hash, one bucket per node, and fetches its own bucket from every node. Work is dealt by bytes; a step that fails is retried, then run again without that node |
-| `spill.rs` | What a shuffle moves, in pieces (`PONDRA_SPILL_MB`): held in memory while small, written to the node's scratch disk beyond, sent length-prefixed and read back a piece at a time — so a shuffle, and what the coordinator gathers, is bounded by disk rather than memory |
+| `spmd.rs` | Distributed queries: every node runs the same plan over its slice of the biggest table; small and keyed tables are read whole, at the coordinator's snapshot. The plan decides what splits (any join type, subqueries, CTEs, unions): up to the first gather, or through shuffles, each exchange a step in which every node splits its output into a bucket per node and partition and reads its own from every node, in node order, so answers are the same every time. Scalar subqueries are answered between steps. Work is dealt by bytes; a step that fails is retried, then run again without that node |
+| `spill.rs` | What a shuffle moves, in pieces (`PONDRA_SPILL_MB`): held in memory while small, written to the node's scratch disk beyond, sent length-prefixed and read back a piece at a time, buckets chained in order — so a shuffle, and what the coordinator gathers, is bounded by disk rather than memory |
 | `manifest.rs` | Table metadata that stays small: per-file column ranges, the oldest files sealed into immutable manifests behind one list object, pruning of manifests and files by a query's filters |
 | `flight.rs` | Arrow Flight and Flight SQL: exactly-once `DoPut`, SQL and the log as columnar streams, ADBC's statements, ingest and catalog |
 | `metrics.rs` | `GET /metrics` in Prometheus' format |
@@ -205,6 +205,7 @@ python3 tools/mcp_client.py --url http://127.0.0.1:8080/mcp   # the official MCP
 python3 tools/harness.py kafka | alter | windows   # Kafka clients, ALTER TABLE under load, windows emitted once
 python3 tools/harness.py scale | flight         # partitions, manifests, shuffles, memory limits; Arrow Flight + ADBC
 python3 tools/shuffle_spill.py                 # a shuffle bigger than memory, and one that loses a node
+python3 tools/spread_tpch.py --expect 22        # all 22 TPC-H queries on 3 nodes == one node
 python3 tools/join_order.py                    # the same query written badly runs as fast
 python3 tools/metadata_bench.py [--files 1000000]   # a table with a million files: commits, pruning, 3 nodes
 python3 tools/flight_bench.py                   # Arrow Flight in, out, and the log as a stream
@@ -238,8 +239,9 @@ bucket to its newest lakes.
 ## Not yet
 
 - Shuffle skew is measured (`pondra_shuffle_skew`), not corrected: a key that holds much of a
-  table is still one node's work. Distributed queries are one SELECT with inner joins. Nothing has
-  run on several machines yet (`tools/cloud/` is the kit).
+  table is still one node's work. `NOT IN` over a sliced subquery, a `LIMIT` inside a subquery,
+  a window over all rows and order-preserving shuffles run on one node. Nothing has run on several
+  machines yet (`tools/cloud/` and `.github/workflows/cluster-bench.yml` are the kits).
 - A query's own answer passes through the coordinator's memory once (an HTTP answer is one body,
   shared by identical queries); what the nodes send does not.
 - Files written in key order aren't declared as sorted, so an aggregation on that key hashes

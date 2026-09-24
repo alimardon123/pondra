@@ -49,14 +49,19 @@ def shapes():
     return out
 
 
-def same(a, b):
-    """The same answer, allowing for sums adding up in a different order."""
+def same(a, b, ordered=False):
+    """The same answer, allowing for sums adding up in a different order — and, for a list of
+    rows, for rows an ORDER BY ties on coming out in another order."""
+    if isinstance(a, list) and isinstance(b, list) and not ordered and len(a) == len(b) and not same(a, b, True):
+        rounded = lambda r: {k: round(v, 6) if isinstance(v, float) else v for k, v in r.items()} if isinstance(r, dict) else r
+        key = lambda r: json.dumps(rounded(r), sort_keys=True, default=str)
+        return same(sorted(a, key=key), sorted(b, key=key), True)
     if type(a) is not type(b):
         return False
     if isinstance(a, float) or isinstance(b, float):
         return abs(a - b) <= 1e-9 * max(abs(a), abs(b), 1.0)
     if isinstance(a, list):
-        return len(a) == len(b) and all(same(x, y) for x, y in zip(a, b))
+        return len(a) == len(b) and all(same(x, y, True) for x, y in zip(a, b))
     if isinstance(a, dict):
         return a.keys() == b.keys() and all(same(a[k], b[k]) for k in a)
     return a == b

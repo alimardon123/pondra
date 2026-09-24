@@ -4,19 +4,21 @@
 //! scheduler: every node plans the same query the same way, so the plans' exchanges line up.
 //! Two ways, chosen from DataFusion's own parallel plan:
 //!
-//! - **Gather.** The query's main table (the first in FROM) is sliced; every other table is read
-//!   whole by each node (broadcast, so star joins work). Each node runs the plan up to its first
-//!   exchange — for an aggregation, the partial aggregate — and the coordinator merges.
-//! - **Shuffle.** When the plan exchanges rows by hash — a GROUP BY with many groups, a join of
-//!   two big tables — every table is sliced and each hash exchange becomes a shuffle between
-//!   nodes: a node runs a stage over its inputs, splits the output by the exchange's hash into one
-//!   bucket per node and keeps it; the next stage on node j fetches bucket j from every node. The
-//!   last stage's results go to the coordinator. Only operators that stay correct when split this
-//!   way are allowed; anything else runs the gather way, or on one node.
+//! - **Gather.** The query's biggest append table is sliced; every other table is read whole by
+//!   each node (broadcast, so star joins work). Each node runs the plan up to its first exchange —
+//!   for an aggregation, the partial aggregate — and the coordinator merges.
+//! - **Shuffle.** When the plan exchanges rows — a GROUP BY with many groups, a join of two big
+//!   tables — each exchange becomes a step between nodes: every node runs a stage over its inputs
+//!   and splits its output by the exchange's hash, a bucket per node and partition; the next stage
+//!   on node j reads bucket j from every node, in node order. A final aggregate over rows spread
+//!   across the nodes (a scalar subquery's `avg`) sends every node all the partial aggregates
+//!   instead, and a table read whole that has to meet a sliced one by key keeps each node's own
+//!   keys of it. The last stage's results go to the coordinator.
 //!
-//! Which queries: one SELECT (no subqueries, CTEs or set operations), inner joins only, over
-//! append tables. The cuts are taken from DataFusion's own plan, so they are right for any
-//! aggregate DataFusion can split (avg, count distinct, …).
+//! Which queries: any single query — joins of every kind, subqueries, CTEs, unions — over this
+//! lake's tables; keyed tables are read whole, at the coordinator's snapshot. Whether a plan may
+//! be split is decided operator by operator (`spread`): only what stays correct run this way runs
+//! this way, and anything else runs on one node.
 use crate::manifest::Manifest;
 use crate::query::{session, Pruned};
 use crate::spill::Spill;
@@ -24,6 +26,7 @@ use crate::store::*;
 use anyhow::{bail, ensure, Context, Result};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::logical_expr::physical_planning_context::{ScalarSubqueryResults, SubqueryIndex};
 use datafusion::physical_plan::execution_plan::replace_children_if_necessary;
 use datafusion::physical_plan::streaming::StreamingTableExec;
 use datafusion::physical_plan::{displayable, ExecutionPlan, ExecutionPlanProperties, Partitioning};
@@ -33,11 +36,14 @@ use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
-/// Tables smaller than this aren't worth spreading.
-const SPREAD_BYTES: u64 = 256 << 20;
+/// Tables smaller than this aren't worth spreading (`PONDRA_SPREAD_MB`, 256).
+fn spread_bytes() -> u64 { mb("PONDRA_SPREAD_MB", 256) }
 
-/// In a shuffle, tables smaller than this are read whole by every node (joins broadcast them).
-const BROADCAST_BYTES: u64 = 64 << 20;
+/// In a shuffle, tables smaller than this are read whole by every node, so joins broadcast them
+/// (`PONDRA_BROADCAST_MB`, 64; 0 slices every table).
+fn broadcast_bytes() -> u64 { mb("PONDRA_BROADCAST_MB", 64) }
+
+fn mb(var: &str, default: u64) -> u64 { std::env::var(var).ok().and_then(|v| v.parse().ok()).unwrap_or(default) << 20 }
 
 /// One table's share on one node: manifests and files, and maybe the log tail (after..=upto).
 #[derive(Serialize, Deserialize, Clone, Default)]
@@ -57,6 +63,16 @@ pub struct Slice {
     pub shuffle: Option<Shuffle>,
     #[serde(default)]
     pub id: String,
+    /// The tables it reads whole, as the coordinator saw them, and how far into the log: every
+    /// node reads the very same rows of them, whatever commit its own catalog is at.
+    #[serde(default)]
+    pub whole: Vec<(String, TableMeta)>,
+    #[serde(default)]
+    pub upto: u64,
+    /// The coordinator's partitions per query: every node plans with as many, whatever its cores,
+    /// or their plans' exchanges wouldn't line up.
+    #[serde(default)]
+    pub partitions: usize,
 }
 
 impl Slice {
@@ -72,39 +88,60 @@ pub struct Shuffle {
     pub nodes: Vec<String>,
     pub me: usize,
     pub step: usize, // a hash exchange (bottom-up); the number of them: the last stage
-    pub all: bool,   // every table sliced (else small ones are read whole: broadcast)
+    pub how: How,
+}
+
+/// The ways a shuffle is tried, cheapest first.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug)]
+pub enum How {
+    Broadcast,   // small tables read whole by every node; joins as DataFusion plans them
+    Partitioned, // …and every join shuffles both sides by its key (two big tables meet)
+    Sliced,      // every append table sliced (a small table on the kept side of an outer join)
 }
 
 /// Run `sql` across `nodes` (this node is `me`), or None if it should just run here.
 pub async fn query(lake: &Lake, nodes: &[String], me: &str, sql: &str, force: bool) -> Result<Option<Vec<RecordBatch>>> {
-    if nodes.len() < 2 || !spreadable(sql) {
+    if nodes.len() < 2 {
         return Ok(None);
     }
-    let tables = tables(sql)?;
-    let main = tables[0].clone();
-    let Some(meta) = lake.cat.get::<TableMeta>(&table_key(&main)).await? else { return Ok(None) };
-    let sealed = meta.sealed.clone().unwrap_or_default();
-    let bytes = sealed.bytes + meta.files.iter().map(|f| f.bytes).sum::<u64>();
-    let files = sealed.files as usize + meta.files.len();
-    if !meta.key.is_empty() || files == 0 || (!force && (files < nodes.len() || bytes < SPREAD_BYTES)) {
+    let Some(tables) = tables(sql) else { return Ok(refused("not a single query")) };
+    // The table to slice is the biggest append table it reads. Keyed tables are read whole: a
+    // key's versions are spread over the files, so a share of the files isn't a share of the rows.
+    let mut main: Option<(String, TableMeta, u64)> = None;
+    for t in &tables {
+        let Some(meta) = lake.cat.get::<TableMeta>(&table_key(t)).await?.filter(|m| m.key.is_empty()) else { continue };
+        let bytes = size(&meta).1;
+        if main.as_ref().is_none_or(|m| bytes > m.2) {
+            main = Some((t.clone(), meta, bytes));
+        }
+    }
+    let Some((main, meta, bytes)) = main else { return Ok(refused("no append table to slice")) };
+    let files = size(&meta).0;
+    if files == 0 || (!force && (files < nodes.len() || bytes < spread_bytes())) {
         return Ok(None); // (`force`: spread anyway, for tests)
     }
     let mine = nodes.iter().position(|n| n == me).context("not a member")?;
     let parts = deal(lake, &meta, &main, nodes.len()).await?;
     let id = uuid::Uuid::new_v4().to_string(); // (the folder every node spills this query's results into)
-    let slices: Vec<Slice> = parts.into_iter().map(|p| Slice { sql: sql.into(), parts: vec![p], shuffle: None, id: id.clone() }).collect();
+    let (whole, upto) = (whole(lake, &tables, &[&main]).await?, lake.visible());
+    let slice = |parts| Slice { sql: sql.into(), parts, shuffle: None, id: id.clone(), whole: whole.clone(), upto, partitions: partitions() };
+    let slices: Vec<Slice> = parts.into_iter().map(|p| slice(vec![p])).collect();
     let (ctx, plan) = plan(lake, &slices[mine]).await?;
-    // (a table sliced twice, in a self-join, would only meet its own slice)
-    let cut = find_cut(&plan).filter(|_| tables.iter().filter(|t| **t == main).count() == 1);
-    if cut.as_ref().is_none_or(hashed) {
-        if let Some(rows) = shuffle(lake, nodes, me, sql, &tables).await? {
-            return Ok(Some(rows));
-        }
-    }
-    let Some(cut) = cut else { return Ok(None) };
+    // Gather when everything below the plan's first gather splits over the nodes as it is (each
+    // node's share of the main table, the others whole); shuffle when it takes exchanges.
+    let cut = find_cut(&plan).filter(|c| {
+        let mut exchanges = vec![]; // (a gather has none: they take a shuffle)
+        !hashed(c) && spread(&c.children()[0], &mut exchanges) == Some(Spread::Split) && exchanges.is_empty()
+    });
+    let Some(cut) = cut else {
+        return match shuffle(lake, nodes, me, sql, &tables, &main).await? {
+            Some(rows) => Ok(Some(rows)),
+            None => Ok(refused("no split of its plan is correct")),
+        };
+    };
     // Gather: every node computes its partial result at the same time (this one: its files and,
     // as one more slice, the log tail).
-    let tail = Slice { sql: sql.into(), parts: vec![Part { table: main, tail: Some((meta.tiered, lake.visible())), ..Default::default() }], shuffle: None, id: id.clone() };
+    let tail = slice(vec![Part { table: main, tail: Some((meta.tiered, upto)), ..Default::default() }]);
     let runs = nodes.iter().zip(&slices).map(|(node, s)| async move {
         match node == me {
             true => Ok(vec![]), // below
@@ -131,22 +168,41 @@ pub async fn query(lake: &Lake, nodes: &[String], me: &str, sql: &str, force: bo
 /// at a time, so what the nodes sent never has to fit in its memory at once. No cut: they are the
 /// results.
 async fn finish(ctx: &SessionContext, plan: &Arc<dyn ExecutionPlan>, cut: Option<&Arc<dyn ExecutionPlan>>, parts: Vec<Spill>) -> Result<Vec<RecordBatch>> {
-    let Some(cut) = cut else { return rows(parts, ctx).await };
-    let schema = cut.children()[0].schema();
-    ensure!(parts.iter().filter_map(|s| s.schema()).all(|s| s.fields() == schema.fields()), "nodes planned the query differently");
-    let pieces: Vec<_> = parts.into_iter().flat_map(|s| s.pieces(schema.clone())).collect();
-    let input = Arc::new(StreamingTableExec::try_new(schema, pieces, None, [], false, None)?) as Arc<dyn ExecutionPlan>;
+    let schema = cut.map_or_else(|| plan.schema(), |c| c.children()[0].schema());
+    ensure!(parts.iter().filter_map(|s| s.schema()).all(|s| s.fields() == schema.fields()), "nodes planned the query differently: {:?} / {:?}", schema, parts.iter().filter_map(|s| s.schema()).find(|s| s.fields() != schema.fields()));
+    // A merge of sorted runs takes each node's partitions as they are; anything else reads them
+    // as one partition, in node order, so the rows are combined in the same order every time.
+    let parts = match cut.is_some_and(|c| c.name() == "SortPreservingMergeExec") {
+        true => parts.into_iter().map(|s| crate::spill::chain(vec![s], schema.clone())).collect(),
+        false => vec![crate::spill::chain(parts, schema.clone())],
+    };
+    let input = Arc::new(StreamingTableExec::try_new(schema, parts, None, [], false, None)?) as Arc<dyn ExecutionPlan>;
+    let Some(cut) = cut else { return Ok(datafusion::physical_plan::collect(input, ctx.task_ctx()).await?) };
     let plan = plan.clone().transform_down(|p| Ok(if Arc::ptr_eq(&p, cut) { Transformed::yes(replace_children_if_necessary(p, vec![input.clone()])?) } else { Transformed::no(p) }))?.data;
     Ok(datafusion::physical_plan::collect(plan, ctx.task_ctx()).await?)
 }
 
-/// Buckets read back as rows (the answer itself, when there is nothing left to do to it).
-async fn rows(parts: Vec<Spill>, ctx: &SessionContext) -> Result<Vec<RecordBatch>> {
-    let Some(schema) = parts.iter().find_map(|s| s.schema()) else { return Ok(vec![]) };
-    ensure!(parts.iter().filter_map(|s| s.schema()).all(|s| s.fields() == schema.fields()), "nodes planned the query differently");
-    let pieces = parts.into_iter().flat_map(|s| s.pieces(schema.clone())).collect();
-    let plan = Arc::new(StreamingTableExec::try_new(schema, pieces, None, [], false, None)?);
-    Ok(datafusion::physical_plan::collect(plan, ctx.task_ctx()).await?)
+/// The tables of this lake a query reads that aren't sliced, as this node sees them now.
+async fn whole(lake: &Lake, tables: &[String], sliced: &[&str]) -> Result<Vec<(String, TableMeta)>> {
+    let mut out = vec![];
+    for t in tables.iter().filter(|t| !sliced.contains(&t.as_str())) {
+        if let Some(meta) = lake.cat.get::<TableMeta>(&table_key(t)).await? {
+            out.push((t.clone(), meta));
+        }
+    }
+    Ok(out)
+}
+
+/// A table's (files, bytes): its inline files and its sealed manifests.
+fn size(meta: &TableMeta) -> (usize, u64) {
+    let sealed = meta.sealed.clone().unwrap_or_default();
+    (sealed.files as usize + meta.files.len(), sealed.bytes + meta.files.iter().map(|f| f.bytes).sum::<u64>())
+}
+
+/// A table's (rows, bytes) as the catalog has them (the log tail not counted).
+fn totals(meta: &TableMeta) -> (u64, u64) {
+    let sealed = meta.sealed.clone().unwrap_or_default();
+    (sealed.rows + meta.files.iter().map(|f| f.rows).sum::<u64>(), size(meta).1)
 }
 
 /// A table's manifests and files dealt over `n` nodes, oldest first (so a time range spreads over
@@ -211,13 +267,17 @@ async fn drain(plan: &Arc<dyn ExecutionPlan>, ctx: Arc<datafusion::execution::Ta
 async fn remote(node: &str, s: &Slice) -> Result<(String, Vec<Spill>)> {
     let res = crate::cluster::http().post(format!("http://{node}/cluster/stage")).json(s).send().await?;
     ensure!(res.status().is_success(), "{node}: {}", res.text().await?);
+    read_reply(res, &s.job(), &format!("from-{}", node.replace(':', "_"))).await
+}
+
+/// A `reply` read back onto this node's disk, a piece at a time.
+async fn read_reply(res: reqwest::Response, job: &str, name: &str) -> Result<(String, Vec<Spill>)> {
     let mut frames = crate::spill::Frames::new(res.bytes_stream());
     let shape = String::from_utf8(frames.next().await?.context("an empty reply")?)?;
-    let (dir, mut parts) = (crate::spill::dir(&s.job()), vec![]);
+    let (dir, mut parts) = (crate::spill::dir(job), vec![]);
     for p in 0..frames.count().await? {
-        let name = format!("from-{}-{p}", node.replace(':', "_"));
         let pieces = frames.count().await?;
-        parts.push(Spill::take(dir.clone(), name, &mut frames, pieces).await?);
+        parts.push(Spill::take(dir.clone(), format!("{name}-{p}"), &mut frames, pieces).await?);
     }
     Ok((shape, parts))
 }
@@ -236,17 +296,31 @@ pub fn reply(shape: &str, parts: Vec<Spill>, done: Option<crate::spill::Gone>) -
 /// The physical plan of the slice's query, its tables standing for just their parts.
 async fn plan(lake: &Lake, s: &Slice) -> Result<(SessionContext, Arc<dyn ExecutionPlan>)> {
     let ctx = session(lake, &s.sql, "").await?;
+    if !s.whole.is_empty() {
+        // The whole tables as the coordinator saw them: this node must have seen the log that far.
+        let mut hwm = lake.hwm.subscribe();
+        let _ = tokio::time::timeout(Duration::from_secs(10), async { while lake.visible() < s.upto && hwm.changed().await.is_ok() {} }).await;
+        ensure!(lake.visible() >= s.upto, "this node is behind the lake ({} < {})", lake.visible(), s.upto);
+        for (t, meta) in &s.whole {
+            let inner = crate::query::table_view(lake, &ctx, t, meta, Some(s.upto)).await?;
+            ctx.deregister_table(t.as_str())?;
+            ctx.register_table(t.as_str(), Arc::new(WholeTable { inner, name: t.clone(), size: totals(meta) }))?;
+        }
+    }
     {
         let state = ctx.state_ref();
         let mut state = state.write();
         let o = state.config_mut().options_mut();
+        if s.partitions > 0 {
+            o.execution.target_partitions = s.partitions;
+        }
         // Always aggregate before the exchange: partial results cross the network, so passing
         // raw rows through (DataFusion's shortcut for high-cardinality groups) would ship the table.
         o.execution.skip_partial_aggregation_probe_rows_threshold = usize::MAX;
         if let Some(sh) = &s.shuffle {
             o.optimizer.enable_dynamic_filter_pushdown = false; // (a join's filter would reach a scan of an earlier step)
-            if sh.all {
-                // Every table sliced: a join must shuffle both sides (a broadcast side would be partial).
+            if sh.how != How::Broadcast {
+                // Every join shuffles both sides (a broadcast side, if sliced, would be partial).
                 (o.optimizer.hash_join_single_partition_threshold, o.optimizer.hash_join_single_partition_threshold_rows) = (0, 0);
             }
         }
@@ -255,8 +329,7 @@ async fn plan(lake: &Lake, s: &Slice) -> Result<(SessionContext, Arc<dyn Executi
         let meta: TableMeta = lake.cat.get(&table_key(&p.table)).await?.context("no table")?;
         let (after, upto) = p.tail.unwrap_or((0, 0)); // (0, 0): no tail
         let schema = crate::query::read_schema(&meta.columns)?;
-        let sealed = meta.sealed.clone().unwrap_or_default();
-        let share = Some((sealed.rows + meta.files.iter().map(|f| f.rows).sum::<u64>(), sealed.bytes + meta.files.iter().map(|f| f.bytes).sum::<u64>()));
+        let share = Some(totals(&meta));
         // The whole table's ranges, not this slice's: every node has to plan the query alike.
         let ranges = crate::manifest::ranges(&p.table, &crate::manifest::list(lake, &meta).await?, &meta.files, &schema);
         let meta = TableMeta { files: p.files.clone(), tiered: after, ..meta };
@@ -289,13 +362,14 @@ fn hashed(p: &Arc<dyn ExecutionPlan>) -> bool { p.name() == "RepartitionExec" &&
 /// Run `sql` as a shuffle, or None if its plan can't be split that way. A node that drops out is
 /// left out and the shuffle runs again (its buckets went with it, so there is nothing to resume);
 /// with too few nodes left for that, the query runs here instead.
-async fn shuffle(lake: &Lake, nodes: &[String], me: &str, sql: &str, tables: &[String]) -> Result<Option<Vec<RecordBatch>>> {
+async fn shuffle(lake: &Lake, nodes: &[String], me: &str, sql: &str, tables: &[String], main: &str) -> Result<Option<Vec<RecordBatch>>> {
     let mut live: Vec<String> = nodes.to_vec();
     for _ in 0..3 {
         let mine = live.iter().position(|n| n == me).context("not a member")?;
-        let out = spread_once(lake, &live, mine, sql, tables).await;
+        let out = spread_once(lake, &live, mine, sql, tables, main).await;
         let Err(e) = out else { return out };
-        let Some(dead) = e.downcast_ref::<Dead>().map(|d| d.node).filter(|_| live.len() > 2) else {
+        // (this node failing its own step, or too few nodes left: the query runs here instead)
+        let Some(dead) = e.downcast_ref::<Dead>().map(|d| d.node).filter(|&d| live.len() > 2 && d != mine) else {
             return match e.downcast_ref::<Dead>() {
                 Some(d) => {
                     eprintln!("shuffle: {d}; running the query here instead");
@@ -315,33 +389,35 @@ async fn shuffle(lake: &Lake, nodes: &[String], me: &str, sql: &str, tables: &[S
 async fn abandon(nodes: &[String], me: &str) {
     let Some(id) = LAST.lock().unwrap().clone() else { return };
     forget(&id);
-    let asks = nodes.iter().filter(|n| *n != me).map(|n| crate::cluster::http().get(format!("http://{n}/cluster/shuffle?id={id}&exchange=0&to=0&drop=1")).send());
+    let asks = nodes.iter().filter(|n| *n != me).map(|n| crate::cluster::http().get(format!("http://{n}/cluster/shuffle?id={id}&exchange=0&to=0&drop=true")).send());
     futures::future::join_all(asks).await;
 }
 
 /// The id of the shuffle this node started last (for `abandon`).
 static LAST: LazyLock<Mutex<Option<String>>> = LazyLock::new(Default::default);
 
-/// One attempt: first with small tables read whole by every node (broadcast joins), then with
-/// every table sliced.
-async fn spread_once(lake: &Lake, nodes: &[String], mine: usize, sql: &str, tables: &[String]) -> Result<Option<Vec<RecordBatch>>> {
-    for all in [false, true] {
+/// One attempt, planned each way in turn (`How`) until one splits correctly. Keyed tables, and
+/// tables of attached lakes, are always read whole.
+async fn spread_once(lake: &Lake, nodes: &[String], mine: usize, sql: &str, tables: &[String], main: &str) -> Result<Option<Vec<RecordBatch>>> {
+    for how in [How::Broadcast, How::Partitioned, How::Sliced] {
         let id = uuid::Uuid::new_v4().to_string();
         *LAST.lock().unwrap() = Some(id.clone());
-        let mut slices: Vec<Slice> = (0..nodes.len()).map(|me| Slice { sql: sql.into(), parts: vec![], shuffle: Some(Shuffle { id: id.clone(), nodes: nodes.to_vec(), me, step: 0, all }), id: id.clone() }).collect();
-        let mut seen = std::collections::HashSet::new();
-        for t in tables.iter().filter(|t| seen.insert(*t)) {
-            let meta = lake.cat.get::<TableMeta>(&table_key(t)).await?;
-            let bytes = meta.as_ref().map_or(0, |m| m.sealed.as_ref().map_or(0, |s| s.bytes) + m.files.iter().map(|f| f.bytes).sum::<u64>());
-            if !all && *t != tables[0] && bytes < BROADCAST_BYTES {
+        let upto = lake.visible();
+        let shuffle = |me| Some(Shuffle { id: id.clone(), nodes: nodes.to_vec(), me, step: 0, how });
+        let mut slices: Vec<Slice> = (0..nodes.len()).map(|me| Slice { sql: sql.into(), parts: vec![], shuffle: shuffle(me), id: id.clone(), whole: vec![], upto, partitions: partitions() }).collect();
+        for t in tables {
+            let Some(meta) = lake.cat.get::<TableMeta>(&table_key(t)).await?.filter(|m| m.key.is_empty()) else { continue };
+            if how != How::Sliced && t != main && size(&meta).1 < broadcast_bytes() {
                 continue; // (read whole)
             }
-            let Some(meta) = meta.filter(|m| m.key.is_empty()) else { return Ok(None) }; // (append tables of this lake only)
             for (i, mut p) in deal(lake, &meta, t, nodes.len()).await?.into_iter().enumerate() {
-                p.tail = (i == mine).then(|| (meta.tiered, lake.visible())); // (the log tails here)
+                p.tail = (i == mine).then_some((meta.tiered, upto)); // (the log tails here)
                 slices[i].parts.push(p);
             }
         }
+        let sliced: Vec<&str> = slices[mine].parts.iter().map(|p| p.table.as_str()).collect();
+        let whole = whole(lake, tables, &sliced).await?;
+        slices.iter_mut().for_each(|s| s.whole = whole.clone());
         if let Some(job) = Job::open(lake, &slices[mine]).await? {
             return run(lake, nodes, mine, &slices, job).await.map(Some); // (step 0 here uses this plan)
         }
@@ -352,7 +428,6 @@ async fn spread_once(lake: &Lake, nodes: &[String], mine: usize, sql: &str, tabl
 /// Every step of a shuffle on every node, then the coordinator's finish.
 async fn run(lake: &Lake, nodes: &[String], mine: usize, slices: &[Slice], job: Arc<Job>) -> Result<Vec<RecordBatch>> {
     let id = slices[mine].shuffle.as_ref().expect("a shuffle").id.clone();
-    crate::metrics::add(&crate::metrics::SHUFFLED, !job.exchanges.is_empty() as u64);
     let run = async {
         let mut last: Vec<Spill> = vec![];
         for step in 0..=job.exchanges.len() {
@@ -377,12 +452,16 @@ async fn run(lake: &Lake, nodes: &[String], mine: usize, slices: &[Slice], job: 
                 }
             });
             let outs = futures::future::try_join_all(runs).await?;
-            ensure!(outs.iter().all(|(shape, _)| *shape == job.shape), "nodes planned the query differently");
+            if let Some((other, _)) = outs.iter().find(|(shape, _)| *shape != job.shape) {
+                refused::<()>(format!("plans differ:\n  here:  {}\n  there: {other}", job.shape));
+                bail!("nodes planned the query differently");
+            }
             last = outs.into_iter().flat_map(|(_, parts)| parts).collect();
         }
         finish(&job.ctx, &job.plan, job.cut.as_ref(), last).await
     };
     let out = run.await;
+    crate::metrics::add(&crate::metrics::SHUFFLED, (out.is_ok() && !job.exchanges.is_empty()) as u64);
     JOBS.lock().unwrap().remove(&id); // (all steps done: nobody fetches from here any more)
     crate::spill::clear(&id);
     out
@@ -405,13 +484,23 @@ impl std::error::Error for Dead {}
 struct Job {
     ctx: SessionContext,
     plan: Arc<dyn ExecutionPlan>,
-    exchanges: Vec<Arc<dyn ExecutionPlan>>, // the hash exchanges below the cut, bottom-up
+    exchanges: Vec<Exchange>, // the exchanges below the cut, bottom-up
     cut: Option<Arc<dyn ExecutionPlan>>,     // the first gather on the plan's path down (None: nodes run it all)
     shape: String,
     id: String,
-    buckets: Mutex<HashMap<(usize, usize), crate::spill::Spill>>, // (exchange, node) -> its rows for that node
+    buckets: Mutex<HashMap<(usize, usize), Vec<Spill>>>, // (exchange, node) -> its rows for that node, by partition
+    subqueries: Vec<Subquery>, // answered as soon as the exchanges they need are done
     at: std::time::Instant,
     done: std::sync::atomic::AtomicBool, // its last step ran here (others may still fetch)
+}
+
+/// A scalar subquery a shuffle answers on the way (`hoist`): its plan, where its answer goes, and
+/// the step from which it can be worked out (its own exchanges done).
+struct Subquery {
+    plan: Arc<dyn ExecutionPlan>,
+    index: SubqueryIndex,
+    results: ScalarSubqueryResults,
+    from: usize,
 }
 
 static JOBS: LazyLock<Mutex<HashMap<String, Arc<Job>>>> = LazyLock::new(Default::default);
@@ -422,19 +511,25 @@ impl Drop for Job {
     fn drop(&mut self) { crate::spill::clear(&self.id) }
 }
 
-/// Forget one shuffle here and delete what it spilled (`GET /cluster/shuffle?drop=1`: the
-/// coordinator gave up on it, so nobody will fetch from it again).
+/// Forget one shuffle here and delete what it spilled (`GET /cluster/shuffle?drop=true`: the
+/// coordinator gave up on it, so nobody will fetch from it again). It is remembered as dropped for
+/// a while: a step of it still on its way here must not open it again and leave its buckets behind.
 pub fn forget(id: &str) {
-    JOBS.lock().unwrap().remove(id);
+    let mut jobs = JOBS.lock().unwrap(); // (held while it is marked: `Job::open` checks under it)
+    let mut dropped = DROPPED.lock().unwrap();
+    dropped.retain(|_, at| at.elapsed().as_secs() < 600);
+    dropped.insert(id.to_string(), std::time::Instant::now());
+    jobs.remove(id);
+    drop((dropped, jobs));
     crate::spill::clear(id);
 }
+
+static DROPPED: LazyLock<Mutex<HashMap<String, std::time::Instant>>> = LazyLock::new(Default::default);
 
 /// Forget finished shuffles (and delete what they spilled). Runs every half minute on every node,
 /// so a node that took part in a shuffle frees its scratch without being asked.
 pub fn gc() {
-    let mut jobs = JOBS.lock().unwrap();
-    jobs.retain(|_, j| j.at.elapsed().as_secs() < if j.done.load(std::sync::atomic::Ordering::Relaxed) { 30 } else { 600 });
-    drop(jobs);
+    JOBS.lock().unwrap().retain(|_, j| !j.stale());
     crate::spill::sweep();
 }
 
@@ -442,6 +537,17 @@ impl Job {
     /// Plan the slice's query; None if it can't be split into shuffle stages.
     async fn open(lake: &Lake, s: &Slice) -> Result<Option<Arc<Job>>> {
         let (ctx, plan) = plan(lake, s).await?;
+        let (plan, hoisted) = hoist(plan)?;
+        let plan = by_key(plan, ctx.state().config().target_partitions())?;
+        // The subqueries first: their exchanges are the job's first steps, and every step after
+        // them can use their answers.
+        let (mut exchanges, mut subqueries) = (vec![], vec![]);
+        for (plan, index, results) in hoisted {
+            if spread(&plan, &mut exchanges) != Some(Spread::Whole) {
+                return Ok(refused("a subquery that can't be answered alike on every node"));
+            }
+            subqueries.push(Subquery { plan, index, results, from: exchanges.len() });
+        }
         let mut cut = None;
         let mut p = plan.clone();
         while let [child] = p.children()[..] {
@@ -455,20 +561,97 @@ impl Job {
             p = child.clone();
         }
         let region = cut.as_ref().map_or(plan.clone(), |c| c.children()[0].clone());
-        let mut exchanges = vec![];
         // What reaches the coordinator must be split between the nodes (a whole copy from each
         // would count everything once per node).
         if !matches!(spread(&region, &mut exchanges), Some(Spread::Split | Spread::Keyed)) {
             return Ok(None); // (no exchanges is fine: every node runs its share, the coordinator merges)
         }
         let id = s.shuffle.as_ref().expect("a shuffle").id.clone();
-        let job = Arc::new(Job { id: id.clone(), ctx, plan, exchanges, cut, shape: shape(&region), buckets: Default::default(), at: std::time::Instant::now(), done: Default::default() });
+        let job = Arc::new(Job { id: id.clone(), ctx, plan, exchanges, cut, shape: shape(&region), buckets: Default::default(), subqueries, at: std::time::Instant::now(), done: Default::default() });
         let mut jobs = JOBS.lock().unwrap();
-        // (finished ones after a minute, abandoned ones after ten)
-        jobs.retain(|_, j| j.at.elapsed().as_secs() < if j.done.load(std::sync::atomic::Ordering::Relaxed) { 30 } else { 600 });
+        // (a shuffle given up on while this one was being planned must not be left behind)
+        ensure!(!DROPPED.lock().unwrap().contains_key(&id), "shuffle abandoned");
+        jobs.retain(|_, j| !j.stale());
         jobs.insert(id, job.clone());
         Ok(Some(job))
     }
+
+    /// Done here for half a minute (the others have fetched what they need), or given up on ten
+    /// minutes ago.
+    fn stale(&self) -> bool { self.at.elapsed().as_secs() >= if self.done.load(std::sync::atomic::Ordering::Relaxed) { 30 } else { 600 } }
+}
+
+/// Why a query runs on one node after all (`PONDRA_DEBUG_SPREAD=1` prints it on stderr).
+fn refused<T>(why: impl std::fmt::Display) -> Option<T> {
+    if std::env::var_os("PONDRA_DEBUG_SPREAD").is_some() {
+        eprintln!("spread: not spread: {why}");
+    }
+    None
+}
+
+/// Where rows go between two steps of a shuffle: a hash exchange sends each row to the node its
+/// key belongs to; a gather sends every node all of them (`everywhere`, `collected`).
+/// `own`: every node already has all the rows (a table read whole) and keeps just its own keys' —
+/// nothing moves, and a small table can meet a sliced one in an outer join by key.
+#[derive(Clone)]
+struct Exchange {
+    plan: Arc<dyn ExecutionPlan>,
+    own: bool,
+}
+
+/// The plan with its scalar subqueries taken out, and the subqueries (innermost first). An
+/// operator that answers them (`ScalarSubqueryExec`) does it when its step runs, and whatever uses
+/// the answer may sit in an earlier step, below a shuffle — TPC-H q22 filters customers by an
+/// `avg` before shuffling them. So a shuffle answers them itself, on every node, as soon as the
+/// exchanges they need are done, and the expressions that use them (which hold the same answer
+/// slots) find the answers whichever step they run in.
+type Hoisted = (Arc<dyn ExecutionPlan>, SubqueryIndex, ScalarSubqueryResults);
+
+fn hoist(plan: Arc<dyn ExecutionPlan>) -> Result<(Arc<dyn ExecutionPlan>, Vec<Hoisted>)> {
+    use datafusion::physical_plan::scalar_subquery::ScalarSubqueryExec;
+    let mut found = vec![];
+    let plan = plan.transform_up(|p| {
+        let Some(s) = p.downcast_ref::<ScalarSubqueryExec>() else { return Ok(Transformed::no(p)) };
+        found.extend(s.subqueries().iter().map(|q| (q.plan.clone(), q.index, s.results().clone())));
+        Ok(Transformed::yes(s.input().clone()))
+    })?;
+    Ok((plan.data, found))
+}
+
+/// A join that keeps its left side by looking at all of its right one (left, semi, anti), planned
+/// to collect the left side, where that doesn't split correctly: shuffled by its key instead, both
+/// sides (a side read whole keeps just its own keys' rows: `own`). Without it the whole query goes
+/// to the plan that shuffles every join — TPC-H q17's and q21's `EXISTS` moved all of `lineitem`
+/// two or three times over for one such join. Only a join that fails as it is changes, so a plan
+/// that split before splits the same way now.
+fn by_key(plan: Arc<dyn ExecutionPlan>, parts: usize) -> Result<Arc<dyn ExecutionPlan>> {
+    use datafusion::common::JoinType::*;
+    use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
+    use datafusion::physical_plan::repartition::RepartitionExec;
+    Ok(plan.transform_up(|p| {
+        let Some(j) = p.downcast_ref::<HashJoinExec>() else { return Ok(Transformed::no(p)) };
+        let line = displayable(p.as_ref()).one_line().to_string();
+        let as_is = || Some(join(&line, spread(j.left(), &mut vec![])?, spread(j.right(), &mut vec![])?, false).is_none());
+        if *j.partition_mode() != PartitionMode::CollectLeft || !matches!(j.join_type(), Left | LeftSemi | LeftAnti | LeftMark) || j.null_aware || as_is() != Some(true) {
+            return Ok(Transformed::no(p));
+        }
+        let left = if j.left().name() == "CoalescePartitionsExec" { j.left().children()[0] } else { j.left() };
+        let hash = |side: &Arc<dyn ExecutionPlan>, keys| RepartitionExec::try_new(side.clone(), Partitioning::Hash(keys, parts)).map(|r| Arc::new(r) as Arc<dyn ExecutionPlan>);
+        let sides = vec![hash(left, j.on().iter().map(|k| k.0.clone()).collect())?, hash(j.right(), j.on().iter().map(|k| k.1.clone()).collect())?];
+        Ok(Transformed::yes(j.builder().with_partition_mode(PartitionMode::Partitioned).with_new_children(sides)?.recompute_properties().reset_state().build_exec()?))
+    })?.data)
+}
+
+/// One scalar subquery's answer, worked out from its plan: NULL for no row, an error for two.
+async fn scalar(plan: Arc<dyn ExecutionPlan>, ctx: Arc<datafusion::execution::TaskContext>) -> Result<datafusion::common::ScalarValue> {
+    let schema = plan.schema();
+    let rows = datafusion::physical_plan::collect(plan, ctx).await?;
+    let rows: Vec<&RecordBatch> = rows.iter().filter(|b| b.num_rows() > 0).collect();
+    Ok(match rows[..] {
+        [] => datafusion::common::ScalarValue::try_from(schema.field(0).data_type())?,
+        [b] if b.num_rows() == 1 => datafusion::common::ScalarValue::try_from_array(b.column(0), 0)?,
+        _ => bail!("a scalar subquery returned more than one row"),
+    })
 }
 
 /// How a plan's rows are spread over the nodes when each node runs it on its share.
@@ -480,27 +663,38 @@ enum Spread {
 }
 
 /// The spread of `p`'s output if every operator in it stays correct run this way, else None.
-/// Collects the hash exchanges (shuffles), bottom-up.
-fn spread(p: &Arc<dyn ExecutionPlan>, exchanges: &mut Vec<Arc<dyn ExecutionPlan>>) -> Option<Spread> {
+/// Collects the exchanges, bottom-up.
+fn spread(p: &Arc<dyn ExecutionPlan>, exchanges: &mut Vec<Exchange>) -> Option<Spread> {
     use Spread::*;
-    if p.name() == "ShareExec" {
-        return Some(Split);
+    match p.name() {
+        "ShareExec" => return Some(Split),
+        "WholeExec" => return Some(Whole),
+        _ => {}
     }
-    let kids = p.children().into_iter().map(|c| spread(c, exchanges)).collect::<Option<Vec<_>>>()?;
+    let (mut kids, mut below_input) = (vec![], 0..0);
+    for (i, c) in p.children().into_iter().enumerate() {
+        let before = exchanges.len();
+        kids.push(spread(c, exchanges)?);
+        if i == 0 {
+            below_input = before..exchanges.len();
+        }
+    }
     let line = displayable(p.as_ref()).one_line().to_string();
     let has = |s: &str| line.contains(s);
     let one = kids.first().copied();
     let single = p.children().first().is_some_and(|c| c.output_partitioning().partition_count() == 1);
-    let join = |l: Spread, r: Spread, partitioned: bool| match (l, r, partitioned) {
-        (Whole, Whole, _) => Some(Whole),
-        (Keyed, Keyed, true) => Some(Keyed), // (both sides shuffled by the join key)
-        (Whole, x, false) => Some(x),        // a broadcast build side
-        (x, Whole, false) => Some(if x == Keyed { Split } else { x }),
-        _ => None,
-    };
     if hashed(p) && one? != Whole {
-        exchanges.push(p.clone()); // (over a whole copy it stays within the node: shuffled, each row would arrive N times)
+        if has("preserve_order=true") {
+            return refused(format!("{} (a shuffle keeps no order)", line.trim()));
+        }
+        exchanges.push(Exchange { plan: p.clone(), own: false }); // (over a whole copy it stays within the node: shuffled, each row would arrive N times)
         return Some(Keyed);
+    }
+    if p.name() == "ScalarSubqueryExec" {
+        // Every node works out the same answer to each subquery, and whatever uses the answer must
+        // run in the same step as this — not below a shuffle, where it would run before it exists.
+        let used_below = exchanges[below_input].iter().any(|x| x.plan.exists(|n| Ok(displayable(n.as_ref()).one_line().to_string().contains("scalar_subquery("))).unwrap_or(true));
+        return (kids[1..].iter().all(|k| *k == Whole) && !used_below).then_some(one?).or_else(|| refused(format!("{} over {kids:?}", line.trim())));
     }
     if !kids.is_empty() && kids.iter().all(|k| *k == Whole) {
         return Some(Whole); // (every node computes the same)
@@ -508,14 +702,28 @@ fn spread(p: &Arc<dyn ExecutionPlan>, exchanges: &mut Vec<Arc<dyn ExecutionPlan>
     match p.name() {
         "DataSourceExec" | "EmptyExec" | "PlaceholderRowExec" => Some(Whole),
         "ProjectionExec" | "FilterExec" | "CoalesceBatchesExec" | "CooperativeExec" | "LocalLimitExec" => one,
-        "CoalescePartitionsExec" | "SortPreservingMergeExec" => one, // (within a node)
+        // (within a node — and a limit within one node, over rows spread across them all, is wrong)
+        "CoalescePartitionsExec" | "SortPreservingMergeExec" => (!has("fetch=")).then_some(one?),
         "RepartitionExec" => one,
         "AggregateExec" if has("mode=Partial,") => one,
         "AggregateExec" if has("mode=FinalPartitioned,") || has("mode=SinglePartitioned,") => matches!(one?, Keyed | Whole).then_some(one?),
-        "AggregateExec" => (one? == Whole).then_some(Whole), // (a final aggregate over all rows)
-        "HashJoinExec" if has("join_type=Inner") => join(kids[0], kids[1], has("mode=Partitioned,")),
-        "SortMergeJoinExec" | "SortMergeJoin" if has("join_type=Inner") => join(kids[0], kids[1], true),
-        "CrossJoinExec" | "NestedLoopJoinExec" if !has("join_type=") || has("join_type=Inner") => join(kids[0], kids[1], false),
+        "AggregateExec" => everywhere(p, exchanges), // (a final aggregate over all rows)
+        "HashJoinExec" if has("mode=Partitioned,") => join(&line, kids[0], kids[1], true).or_else(|| {
+            // A side read whole on every node where each node must hold only its own keys (the
+            // kept side of an outer, semi or anti join): every node keeps its own share of it.
+            let whole = match (kids[0], kids[1]) {
+                (Whole, Keyed) => p.children()[0],
+                (Keyed, Whole) => p.children()[1],
+                _ => return None,
+            };
+            hashed(whole).then(|| exchanges.push(Exchange { plan: whole.clone(), own: true }))?;
+            join(&line, Keyed, Keyed, true)
+        }),
+        "HashJoinExec" | "CrossJoinExec" | "NestedLoopJoinExec" => join(&line, kids[0], kids[1], false).or_else(|| collected(p, &line, &kids, exchanges)),
+        "SortMergeJoinExec" | "SortMergeJoin" => join(&line, kids[0], kids[1], true),
+        // (every node's own rows of each input: a copy read whole on every node would repeat)
+        "UnionExec" => (!kids.contains(&Whole)).then_some(Split),
+        "InterleaveExec" => kids.iter().all(|k| *k == Keyed).then_some(Keyed),
         "SortExec" | "SortExec(TopK)" if has("preserve_partitioning=[true]") => one,
         "SortExec" | "SortExec(TopK)" | "GlobalLimitExec" => (one? == Whole).then_some(Whole),
         "BoundedWindowAggExec" | "WindowAggExec" => match single {
@@ -524,13 +732,67 @@ fn spread(p: &Arc<dyn ExecutionPlan>, exchanges: &mut Vec<Arc<dyn ExecutionPlan>
         },
         _ => None,
     }
+    .or_else(|| refused(format!("{} over {kids:?}", line.trim())))
+}
+
+/// A join over rows spread across the nodes (the left side builds, the right probes). Whatever a
+/// join emits for a row by looking at *all* of the other side — an outer join's unmatched rows, a
+/// semi or anti join's answer, a mark — needs that other side whole on every node, or both sides
+/// shuffled by the key. Rows it emits only on a match are right either way.
+fn join(line: &str, l: Spread, r: Spread, partitioned: bool) -> Option<Spread> {
+    use Spread::*;
+    let kind = line.split("join_type=").nth(1).map_or("Inner", |t| t.split(|c: char| !c.is_alphanumeric()).next().unwrap_or(""));
+    let (left_needs_all_right, right_needs_all_left) = match kind {
+        "Inner" => (false, false),
+        "Left" | "LeftSemi" | "LeftAnti" | "LeftMark" => (true, false),
+        "Right" | "RightSemi" | "RightAnti" | "RightMark" => (false, true),
+        "Full" => (true, true),
+        _ => return None,
+    };
+    match (l, r) {
+        (Whole, Whole) => Some(Whole),
+        // (a key's rows meet on one node — but NOT IN must see a NULL wherever it is)
+        (Keyed, Keyed) if partitioned && !line.contains("null_aware") => Some(Keyed),
+        (Whole, x) if !left_needs_all_right => Some(x),
+        (x, Whole) if !right_needs_all_left => Some(if x == Keyed && !partitioned { Split } else { x }),
+        _ => None,
+    }
+}
+
+/// A join that collects its left side, where that side is spread across the nodes (a small table
+/// sliced, or a big one filtered down): every node is sent all of it — DataFusion collects it
+/// because it expects it to be small — and joins its own share of the other side against it. A
+/// broadcast of a result rather than of a table; without it both sides would be shuffled.
+fn collected(p: &Arc<dyn ExecutionPlan>, line: &str, kids: &[Spread], exchanges: &mut Vec<Exchange>) -> Option<Spread> {
+    let c = p.children()[0];
+    if c.name() != "CoalescePartitionsExec" || kids[0] == Spread::Whole || displayable(c.as_ref()).one_line().to_string().contains("fetch=") {
+        return None;
+    }
+    let out = join(line, Spread::Whole, kids[1], false)?;
+    exchanges.push(Exchange { plan: c.clone(), own: false });
+    Some(out)
+}
+
+/// A final aggregate over rows spread across the nodes — a scalar subquery's `avg`, a `max` over
+/// groups. What reaches it is partial aggregates, a few rows per node, so every node is sent all
+/// of them (an all-gather: the gather below becomes an exchange) and computes the same answer.
+fn everywhere(p: &Arc<dyn ExecutionPlan>, exchanges: &mut Vec<Exchange>) -> Option<Spread> {
+    let g = p.children()[0];
+    let partial = |c: &Arc<dyn ExecutionPlan>| c.name() == "AggregateExec" && displayable(c.as_ref()).one_line().to_string().contains("mode=Partial,");
+    if g.name() != "CoalescePartitionsExec" || !partial(g.children()[0]) {
+        return None;
+    }
+    exchanges.push(Exchange { plan: g.clone(), own: false });
+    Some(Spread::Whole)
 }
 
 /// The plan's shape above its scans, which every node must plan alike.
 fn shape(p: &Arc<dyn ExecutionPlan>) -> String {
     fn scan(p: &Arc<dyn ExecutionPlan>) -> bool {
-        let leafish = matches!(p.name(), "DataSourceExec" | "EmptyExec" | "UnionExec" | "FilterExec" | "ProjectionExec" | "CoalesceBatchesExec" | "CooperativeExec");
-        p.name() == "ShareExec" || (leafish || p.name() == "RepartitionExec" && !hashed(p)) && p.children().into_iter().all(scan)
+        // (how a node reads a table — its partitions, gathered into one or not — depends on what it
+        // holds in memory (`hot.rs`); only the exchanges have to line up)
+        let leafish = matches!(p.name(), "DataSourceExec" | "EmptyExec" | "UnionExec" | "FilterExec" | "ProjectionExec" | "CoalesceBatchesExec" | "CooperativeExec" | "CoalescePartitionsExec");
+        matches!(p.name(), "ShareExec" | "WholeExec") || (leafish || p.name() == "RepartitionExec" && !hashed(p)) && p.children().into_iter().all(scan)
     }
     if scan(p) {
         return format!("scan{:?}", p.schema().fields().iter().map(|f| f.name()).collect::<Vec<_>>());
@@ -540,48 +802,51 @@ fn shape(p: &Arc<dyn ExecutionPlan>) -> String {
         "AggregateExec" | "HashJoinExec" | "SortMergeJoinExec" | "SortExec" | "SortExec(TopK)" | "BoundedWindowAggExec" => displayable(p.as_ref()).one_line().to_string(),
         name => name.to_string(),
     };
+    // (a subquery's answer, shown in the line, may differ in its last digit from node to node)
+    let what = what.split("scalar_subquery(").enumerate().map(|(i, part)| if i == 0 { part } else { part.split_once(')').map_or(part, |(_, rest)| rest) }).collect::<Vec<_>>().join("scalar_subquery()");
     format!("{}[{}]", what.trim(), p.children().iter().map(|c| shape(c)).collect::<Vec<_>>().join(", "))
 }
 
 /// One step of a shuffle on this node: the stage below exchange `step` (or, after the last
 /// exchange, the last stage), over the buckets for this node of the exchanges right below it.
 async fn step(lake: &Lake, s: &Slice, sh: &Shuffle) -> Result<(String, Vec<Spill>)> {
+    ensure!(!DROPPED.lock().unwrap().contains_key(&sh.id), "shuffle abandoned");
     let open = JOBS.lock().unwrap().get(&sh.id).cloned();
     let job = match (open, sh.step) {
         (Some(job), _) => job,
         (None, 0) => Job::open(lake, s).await?.context("can't shuffle this plan here")?,
         (None, _) => bail!("shuffle expired"),
     };
+    // The subqueries whose exchanges are done are answered first, here as on every node.
+    for q in job.subqueries.iter().filter(|q| sh.step >= q.from && q.results.get(q.index).is_none()) {
+        let plan = received(&job, sh, &q.plan).await?;
+        q.results.set(q.index, scalar(plan, job.ctx.task_ctx()).await?)?;
+    }
     let last = sh.step == job.exchanges.len();
     let top = match last {
         true => job.cut.as_ref().map_or(job.plan.clone(), |c| c.children()[0].clone()),
-        false => job.exchanges[sh.step].children()[0].clone(),
+        false => job.exchanges[sh.step].plan.children()[0].clone(),
     };
-    let mut inputs = vec![];
-    collect_inputs(&top, &job.exchanges, &mut inputs);
-    let mut replaced = vec![];
-    for x in inputs {
-        let k = job.exchanges.iter().position(|e| Arc::ptr_eq(e, &x)).context("an unknown exchange")?;
-        let schema = x.children()[0].schema();
-        // Each node's bucket for this one, read a piece at a time (they are on disk past 64 MB).
-        let fetches = sh.nodes.iter().enumerate().map(|(i, node)| fetch(&job, &sh.id, node, i == sh.me, k, sh.me));
-        let pieces = futures::future::try_join_all(fetches).await?.into_iter().flat_map(|s| s.pieces(schema.clone())).collect();
-        let input = StreamingTableExec::try_new(schema, pieces, None, [], false, None)?;
-        replaced.push((x.clone(), Arc::new(input) as Arc<dyn ExecutionPlan>));
-    }
-    let top = top.transform_down(|p| match replaced.iter().find(|(x, _)| Arc::ptr_eq(x, &p)) {
-        Some((_, input)) => Ok(Transformed::yes(replace_children_if_necessary(p, vec![input.clone()])?)),
-        None => Ok(Transformed::no(p)),
-    })?.data;
+    let top = received(&job, sh, &top).await?;
     if last {
         let out = drain(&top, job.ctx.task_ctx(), &sh.id, &format!("out-{}", sh.step)).await?;
         job.done.store(true, std::sync::atomic::Ordering::Relaxed); // (the sweep frees its scratch shortly)
         return Ok((job.shape.clone(), out));
     }
-    // Split by the exchange's hash, one bucket per node (the same hash on every node). A bucket
-    // past 64 MB goes to this node's disk as it is filled, so a shuffle isn't bounded by memory.
-    let Partitioning::Hash(exprs, _) = job.exchanges[sh.step].output_partitioning().clone() else { bail!("not a hash exchange") };
-    let made = scatter(&top, job.ctx.task_ctx(), &sh.id, sh.step, Partitioning::Hash(exprs, sh.nodes.len())).await?;
+    // Split by the exchange's hash (the same on every node): a bucket per node and partition. A
+    // bucket past 64 MB goes to this node's disk as it is filled, so a shuffle isn't bounded by memory.
+    let x = &job.exchanges[sh.step];
+    let made = match x.plan.output_partitioning().clone() {
+        Partitioning::Hash(exprs, parts) => scatter(&top, job.ctx.task_ctx(), &sh.id, sh.step, exprs, sh.nodes.len(), parts, x.own.then_some(sh.me)).await?,
+        _ => {
+            // An all-gather (`everywhere`): every node is sent all of what this one has.
+            let mut all = Spill::new(crate::spill::dir(&sh.id), format!("{}-gathered", sh.step));
+            for part in drain(&top, job.ctx.task_ctx(), &sh.id, &format!("{}-all", sh.step)).await? {
+                all.absorb(part)?;
+            }
+            vec![vec![all]; sh.nodes.len()]
+        }
+    };
     let mut buckets = job.buckets.lock().unwrap();
     for (to, spill) in made.into_iter().enumerate() {
         buckets.insert((sh.step, to), spill);
@@ -589,22 +854,47 @@ async fn step(lake: &Lake, s: &Slice, sh: &Shuffle) -> Result<(String, Vec<Spill
     Ok((job.shape.clone(), vec![]))
 }
 
-/// Every partition of `plan` run and split by `hash` into one bucket per node — as it runs, so a
-/// step's output is bounded by this node's disk, not by its memory. The partitions run at once,
-/// each filling buckets of its own; they are joined at the end, in partition order, so every node
-/// splits the same rows the same way whatever order they finish in.
-async fn scatter(plan: &Arc<dyn ExecutionPlan>, ctx: Arc<datafusion::execution::TaskContext>, job: &str, step: usize, hash: Partitioning) -> Result<Vec<Spill>> {
+/// `top` with the exchanges right below it replaced by what they brought this node: every node's
+/// buckets for it, read a piece at a time (they are on disk past 64 MB) — an `own` exchange's
+/// are this node's alone.
+async fn received(job: &Job, sh: &Shuffle, top: &Arc<dyn ExecutionPlan>) -> Result<Arc<dyn ExecutionPlan>> {
+    let mut inputs = vec![];
+    collect_inputs(top, &job.exchanges, &mut inputs);
+    let mut replaced = vec![];
+    for x in inputs {
+        let k = job.exchanges.iter().position(|e| Arc::ptr_eq(&e.plan, &x)).context("an unknown exchange")?;
+        let own = job.exchanges[k].own;
+        let fetches = sh.nodes.iter().enumerate().filter(|(i, _)| !own || *i == sh.me).map(|(i, node)| fetch(job, &sh.id, node, i == sh.me, k, sh.me));
+        replaced.push((x.clone(), Received::new(&x, futures::future::try_join_all(fetches).await?)?));
+    }
+    Ok(top.clone().transform_down(|p| match replaced.iter().find(|(x, _)| Arc::ptr_eq(x, &p)) {
+        Some((_, input)) => Ok(Transformed::yes(input.clone())),
+        None => Ok(Transformed::no(p)),
+    })?.data)
+}
+
+/// Every partition of `plan` run and split by the exchange's hash into a bucket per node and
+/// partition — as it runs, so a step's output is bounded by this node's disk, not by its memory.
+/// Hashing into `nodes × parts` buckets does both splits at once: bucket `i` goes to node
+/// `i / parts` and lands in partition `i % parts`, which is the partition DataFusion itself would
+/// put the row in (`hash % parts`), so a receiving node needs no second pass and the operators
+/// above it find each key where they expect it. The partitions run at once, each filling buckets
+/// of its own; they are joined at the end in partition order, so a bucket's rows are always in
+/// the same order.
+async fn scatter(plan: &Arc<dyn ExecutionPlan>, ctx: Arc<datafusion::execution::TaskContext>, job: &str, step: usize, exprs: Vec<Arc<dyn datafusion::physical_plan::PhysicalExpr>>, nodes: usize, parts: usize, only: Option<usize>) -> Result<Vec<Vec<Spill>>> {
     use datafusion::physical_plan::repartition::BatchPartitioner;
-    let (dir, nodes) = (crate::spill::dir(job), hash.partition_count());
+    let (dir, n) = (crate::spill::dir(job), nodes * parts);
     let runs = (0..plan.output_partitioning().partition_count()).map(|p| {
-        let (plan, ctx, dir, hash) = (plan.clone(), ctx.clone(), dir.clone(), hash.clone());
+        let (plan, ctx, dir, exprs) = (plan.clone(), ctx.clone(), dir.clone(), exprs.clone());
         async move {
-            let mut into: Vec<Spill> = (0..nodes).map(|to| Spill::new(dir.clone(), format!("{step}-{to}-p{p}"))).collect();
-            let (mut split, mut rows) = (BatchPartitioner::try_new(hash, Default::default(), p, 1)?, plan.execute(p, ctx)?);
+            let mut into: Vec<Spill> = (0..n).map(|i| Spill::new(dir.clone(), format!("{step}-{i}-p{p}"))).collect();
+            let (mut split, mut rows) = (BatchPartitioner::try_new(Partitioning::Hash(exprs, n), Default::default(), p, 1)?, plan.execute(p, ctx)?);
             while let Some(b) = futures::StreamExt::next(&mut rows).await {
                 let mut wrote = Ok(());
-                split.partition(b?, |to, b| {
-                    wrote = wrote.as_ref().map_err(|e: &anyhow::Error| anyhow::anyhow!("{e:#}")).and_then(|_| into[to].push(b));
+                split.partition(b?, |i, b| {
+                    if only.is_none_or(|me| i / parts == me) {
+                        wrote = wrote.as_ref().map_err(|e: &anyhow::Error| anyhow::anyhow!("{e:#}")).and_then(|_| into[i].push(b));
+                    }
                     Ok(())
                 })?;
                 wrote?;
@@ -612,14 +902,20 @@ async fn scatter(plan: &Arc<dyn ExecutionPlan>, ctx: Arc<datafusion::execution::
             Ok::<_, anyhow::Error>(into)
         }
     });
-    let mut out: Vec<Spill> = (0..nodes).map(|to| Spill::new(dir.clone(), format!("{step}-{to}"))).collect();
+    let mut out: Vec<Spill> = (0..n).map(|i| Spill::new(dir.clone(), format!("{step}-{i}"))).collect();
     for made in futures::future::try_join_all(runs).await? {
-        for (to, s) in made.into_iter().enumerate() {
-            out[to].absorb(s)?;
+        for (i, s) in made.into_iter().enumerate() {
+            out[i].absorb(s)?;
         }
     }
-    skew(&out);
-    Ok(out)
+    let mut by_node: Vec<Vec<Spill>> = vec![vec![]; nodes];
+    for (i, s) in out.into_iter().enumerate() {
+        by_node[i / parts].push(s);
+    }
+    if only.is_none() {
+        skew(&by_node);
+    }
+    Ok(by_node)
 }
 
 /// How uneven the buckets came out: the biggest against the average (1 = even). Rows are dealt by
@@ -627,8 +923,8 @@ async fn scatter(plan: &Arc<dyn ExecutionPlan>, ctx: Arc<datafusion::execution::
 /// work — the query still answers (a bucket is bounded by disk, not memory), just not in parallel.
 /// `pondra_shuffle_skew` is where that shows, and `GROUP BY` mostly avoids it: every node
 /// aggregates its own rows before the exchange, so a hot key crosses as one row per node.
-fn skew(buckets: &[Spill]) {
-    let sizes: Vec<u64> = buckets.iter().map(|s| s.bytes()).collect();
+fn skew(buckets: &[Vec<Spill>]) {
+    let sizes: Vec<u64> = buckets.iter().map(|b| b.iter().map(|s| s.bytes()).sum()).collect();
     let total: u64 = sizes.iter().sum();
     let (Some(&worst), true) = (sizes.iter().max(), total > 0) else { return };
     let ratio = worst as f64 * sizes.len() as f64 / total as f64;
@@ -637,9 +933,9 @@ fn skew(buckets: &[Spill]) {
 }
 
 /// The shuffles right below `p` (not below another one).
-fn collect_inputs(p: &Arc<dyn ExecutionPlan>, exchanges: &[Arc<dyn ExecutionPlan>], out: &mut Vec<Arc<dyn ExecutionPlan>>) {
+fn collect_inputs(p: &Arc<dyn ExecutionPlan>, exchanges: &[Exchange], out: &mut Vec<Arc<dyn ExecutionPlan>>) {
     for c in p.children() {
-        match exchanges.iter().any(|x| Arc::ptr_eq(x, c)) {
+        match exchanges.iter().any(|x| Arc::ptr_eq(&x.plan, c)) {
             true => out.push(c.clone()),
             false => collect_inputs(c, exchanges, out),
         }
@@ -649,81 +945,157 @@ fn collect_inputs(p: &Arc<dyn ExecutionPlan>, exchanges: &[Arc<dyn ExecutionPlan
 /// Node `from`'s bucket of exchange `k` for node `to`. A remote one is streamed onto this node's
 /// disk piece by piece, never held whole in memory. Buckets are kept until the job ends, not
 /// taken, so a step that has to be retried can read them again.
-async fn fetch(job: &Job, id: &str, from: &str, local: bool, k: usize, to: usize) -> Result<crate::spill::Spill> {
+async fn fetch(job: &Job, id: &str, from: &str, local: bool, k: usize, to: usize) -> Result<Vec<Spill>> {
     if local {
         return Ok(job.buckets.lock().unwrap().get(&(k, to)).cloned().unwrap_or_default());
     }
     let res = crate::cluster::http().get(format!("http://{from}/cluster/shuffle?id={id}&exchange={k}&to={to}")).send().await?;
     ensure!(res.status().is_success(), "{from}: {}", res.text().await?);
-    let name = format!("in-{k}-{}", from.replace(':', "_"));
-    crate::spill::Spill::receive(crate::spill::dir(id), name, res.bytes_stream()).await
+    Ok(read_reply(res, id, &format!("in-{k}-{}", from.replace(':', "_"))).await?.1)
 }
 
-/// `GET /cluster/shuffle`: a bucket this node keeps for another, sent a piece at a time.
-pub fn bucket(id: &str, exchange: usize, to: usize) -> Result<crate::spill::Spill> {
+/// `GET /cluster/shuffle`: the buckets this node keeps for another, one per partition, sent a
+/// piece at a time (as `reply` sends a stage's).
+pub fn bucket(id: &str, exchange: usize, to: usize) -> Result<Vec<Spill>> {
     let job = JOBS.lock().unwrap().get(id).cloned().context("shuffle expired")?;
     let bucket = job.buckets.lock().unwrap().get(&(exchange, to)).cloned();
     Ok(bucket.unwrap_or_default())
 }
 
-// ---------------------------------------------------------------- SQL
-
-/// One plain SELECT with inner joins only (then per-slice results combine exactly).
-fn spreadable(sql: &str) -> bool {
-    use datafusion::sql::sqlparser::{ast::*, dialect::GenericDialect, parser::Parser};
-    let Ok(stmts) = Parser::parse_sql(&GenericDialect {}, sql) else { return false };
-    let [Statement::Query(q)] = &stmts[..] else { return false };
-    let SetExpr::Select(s) = q.body.as_ref() else { return false };
-    let inner = s.from.iter().flat_map(|t| &t.joins).all(|j| matches!(j.join_operator, JoinOperator::Join(_) | JoinOperator::Inner(_)));
-    q.with.is_none() && inner && sql.to_lowercase().matches("select").count() == 1
+/// What an exchange brought this node, standing where the exchange was: one partition for each
+/// of the exchange's own, each the nodes' rows for it in node order. It reports the exchange's
+/// partitioning, so what is above it runs as planned.
+#[derive(Debug)]
+struct Received {
+    props: Arc<datafusion::physical_plan::PlanProperties>,
+    parts: Vec<Arc<dyn datafusion::physical_plan::streaming::PartitionStream>>,
 }
 
-/// The tables a (spreadable) query reads, in order, as often as it reads them.
-fn tables(sql: &str) -> Result<Vec<String>> {
+impl Received {
+    /// `from[node][partition]`: every node's buckets for this one.
+    fn new(x: &Arc<dyn ExecutionPlan>, from: Vec<Vec<Spill>>) -> Result<Arc<dyn ExecutionPlan>> {
+        let (n, schema) = (x.output_partitioning().partition_count(), x.schema());
+        ensure!(from.iter().flatten().filter_map(|s| s.schema()).all(|s| s.fields() == schema.fields()), "nodes planned the query differently: {schema:?} / {:?}", from.iter().flatten().filter_map(|s| s.schema()).find(|s| s.fields() != schema.fields()));
+        let parts = (0..n).map(|q| crate::spill::chain(from.iter().map(|f| f.get(q).cloned().unwrap_or_default()).collect(), schema.clone())).collect();
+        Ok(Arc::new(Received { props: x.properties().clone(), parts }))
+    }
+}
+
+impl datafusion::physical_plan::DisplayAs for Received {
+    fn fmt_as(&self, _: datafusion::physical_plan::DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result { write!(f, "Received: partitions={}", self.parts.len()) }
+}
+
+impl ExecutionPlan for Received {
+    fn name(&self) -> &str { "Received" }
+    fn properties(&self) -> &Arc<datafusion::physical_plan::PlanProperties> { &self.props }
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> { vec![] }
+    fn apply_expressions(&self, _: &mut dyn FnMut(&Arc<dyn datafusion::physical_plan::PhysicalExpr>) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion>) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    }
+    fn with_new_children(self: Arc<Self>, _: Vec<Arc<dyn ExecutionPlan>>) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> { Ok(self) }
+    fn execute(&self, partition: usize, ctx: Arc<datafusion::execution::TaskContext>) -> datafusion::error::Result<datafusion::execution::SendableRecordBatchStream> {
+        Ok(self.parts[partition].execute(ctx))
+    }
+}
+
+// ---------------------------------------------------------------- SQL
+
+/// Every table a single query reads, anywhere in it — joins, subqueries, CTEs, unions — once
+/// each, CTE names left out. None for anything that isn't one query. Whether the query can be
+/// split is not decided here but from its plan (`spread`), operator by operator.
+fn tables(sql: &str) -> Option<Vec<String>> {
     use datafusion::sql::sqlparser::{ast::*, dialect::GenericDialect, parser::Parser};
-    let stmts = Parser::parse_sql(&GenericDialect {}, sql)?;
-    let [Statement::Query(q)] = &stmts[..] else { bail!("not a query") };
-    let SetExpr::Select(s) = q.body.as_ref() else { bail!("not a SELECT") };
-    let relations = s.from.iter().flat_map(|t| std::iter::once(&t.relation).chain(t.joins.iter().map(|j| &j.relation)));
-    let names: Vec<String> = relations.map(|r| match r {
-        TableFactor::Table { name, .. } => Ok(name.to_string().trim_matches('"').to_string()),
-        _ => bail!("not a table"),
-    }).collect::<Result<_>>()?;
-    ensure!(!names.is_empty(), "no table");
-    Ok(names)
+    use std::ops::ControlFlow;
+    #[derive(Default)]
+    struct Names {
+        tables: Vec<String>,
+        ctes: std::collections::HashSet<String>,
+    }
+    fn name(i: &Ident) -> String { if i.quote_style.is_some() { i.value.clone() } else { i.value.to_lowercase() } } // (as SQL resolves it)
+    impl Visitor for Names {
+        type Break = ();
+        fn pre_visit_query(&mut self, q: &Query) -> ControlFlow<()> {
+            self.ctes.extend(q.with.iter().flat_map(|w| &w.cte_tables).map(|c| name(&c.alias.name)));
+            ControlFlow::Continue(())
+        }
+        fn pre_visit_relation(&mut self, r: &ObjectName) -> ControlFlow<()> {
+            let parts: Option<Vec<String>> = r.0.iter().map(|p| p.as_ident().map(name)).collect();
+            self.tables.extend(parts.map(|p| p.join(".")));
+            ControlFlow::Continue(())
+        }
+    }
+    let stmts = Parser::parse_sql(&GenericDialect {}, sql).ok()?;
+    let [stmt @ Statement::Query(_)] = &stmts[..] else { return None };
+    let mut names = Names::default();
+    let _ = stmt.visit(&mut names);
+    let mut seen = std::collections::HashSet::new();
+    let tables: Vec<String> = names.tables.into_iter().filter(|t| !names.ctes.contains(t) && seen.insert(t.clone())).collect();
+    (!tables.is_empty()).then_some(tables)
 }
 
 // ---------------------------------------------------------------- a node's share of a table
 
 /// A node's share of a sliced table: its scan, with 2+ partitions (so aggregations plan as
 /// partial + final everywhere), reporting the whole table's size, so every node plans its query
-/// (join order, build sides) as for the whole table, whatever its share holds.
+/// (join order, build sides) as for the whole table, whatever its share holds. `whole`
+/// (`WholeExec`): a table every node reads in full, reporting its size from the catalog.
 #[derive(Debug)]
 pub struct ShareExec {
     input: Arc<dyn ExecutionPlan>,
     table: String,
     stats: Arc<datafusion::common::Statistics>,
+    whole: bool,
 }
 
 impl ShareExec {
     pub fn new(input: Arc<dyn ExecutionPlan>, table: &str, rows: u64, bytes: u64) -> datafusion::error::Result<ShareExec> {
-        use datafusion::common::stats::Precision;
         let input = match input.output_partitioning().partition_count() < 2 {
             true => datafusion::physical_plan::union::UnionExec::try_new(vec![input.clone(), Arc::new(datafusion::physical_plan::empty::EmptyExec::new(input.schema()))])?,
             false => input,
         };
+        Ok(ShareExec::of(input, table, rows, bytes, false))
+    }
+
+    fn of(input: Arc<dyn ExecutionPlan>, table: &str, rows: u64, bytes: u64, whole: bool) -> ShareExec {
+        use datafusion::common::stats::Precision;
         let mut stats = datafusion::common::Statistics::new_unknown(&input.schema());
         (stats.num_rows, stats.total_byte_size) = (Precision::Inexact(rows as usize), Precision::Inexact(bytes as usize));
-        Ok(ShareExec { input, table: table.into(), stats: Arc::new(stats) })
+        ShareExec { input, table: table.into(), stats: Arc::new(stats), whole }
+    }
+}
+
+/// A table every node of a distributed query reads in full (a small one, a keyed one), as the
+/// coordinator saw it. Its size comes from the catalog, not from how this node happens to read it:
+/// decoded in memory (`hot.rs`) or from Parquet, more of it in the log or less, the sizes differ,
+/// DataFusion picks joins by size, and every node must plan alike. What is inside a whole read —
+/// the joins of a keyed table's versions — is the node's own business (`shape`).
+#[derive(Debug)]
+struct WholeTable {
+    inner: Arc<dyn datafusion::catalog::TableProvider>,
+    name: String,
+    size: (u64, u64),
+}
+
+#[async_trait::async_trait]
+impl datafusion::catalog::TableProvider for WholeTable {
+    fn schema(&self) -> datafusion::arrow::datatypes::SchemaRef { self.inner.schema() }
+    fn table_type(&self) -> datafusion::datasource::TableType { self.inner.table_type() }
+    fn statistics(&self) -> Option<datafusion::common::Statistics> { self.inner.statistics() }
+    fn supports_filters_pushdown(&self, f: &[&datafusion::logical_expr::Expr]) -> datafusion::error::Result<Vec<datafusion::logical_expr::TableProviderFilterPushDown>> {
+        self.inner.supports_filters_pushdown(f)
+    }
+    async fn scan(&self, state: &dyn datafusion::catalog::Session, projection: Option<&Vec<usize>>, filters: &[datafusion::logical_expr::Expr], limit: Option<usize>) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        let input = self.inner.scan(state, projection, filters, limit).await?;
+        Ok(Arc::new(ShareExec::of(input, &self.name, self.size.0, self.size.1, true)))
     }
 }
 
 impl datafusion::physical_plan::DisplayAs for ShareExec {
-    fn fmt_as(&self, _: datafusion::physical_plan::DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result { write!(f, "ShareExec: table={}", self.table) }
+    fn fmt_as(&self, _: datafusion::physical_plan::DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result { write!(f, "{}: table={}", self.name(), self.table) }
 }
 
 impl ExecutionPlan for ShareExec {
-    fn name(&self) -> &str { "ShareExec" }
+    fn name(&self) -> &str { if self.whole { "WholeExec" } else { "ShareExec" } }
     fn properties(&self) -> &Arc<datafusion::physical_plan::PlanProperties> { self.input.properties() }
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> { vec![&self.input] }
     fn maintains_input_order(&self) -> Vec<bool> { vec![true] }
@@ -732,7 +1104,7 @@ impl ExecutionPlan for ShareExec {
         Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
     }
     fn with_new_children(self: Arc<Self>, children: Vec<Arc<dyn ExecutionPlan>>) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(ShareExec { input: children[0].clone(), table: self.table.clone(), stats: self.stats.clone() }))
+        Ok(Arc::new(ShareExec { input: children[0].clone(), table: self.table.clone(), stats: self.stats.clone(), whole: self.whole }))
     }
     fn execute(&self, partition: usize, ctx: Arc<datafusion::execution::TaskContext>) -> datafusion::error::Result<datafusion::execution::SendableRecordBatchStream> { self.input.execute(partition, ctx) }
     fn statistics_from_inputs(&self, _: &[Arc<datafusion::common::Statistics>], args: &datafusion::physical_plan::statistics::StatisticsArgs) -> datafusion::error::Result<Arc<datafusion::common::Statistics>> {

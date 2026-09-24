@@ -1,0 +1,114 @@
+# A Pondra cluster on separate machines, benchmarked: TPC-H on one node and across all of them.
+# Runs only when started by hand (Actions → cluster-bench → Run workflow). See
+# tools/cloud/actions/README.md for the secrets it needs and what it costs.
+name: cluster-bench
+
+on:
+  workflow_dispatch:
+    inputs:
+      nodes:
+        description: "Nodes in the cluster"
+        default: "3"
+      sf:
+        description: "TPC-H scale factor (runners have 14 GB of disk: 10 fits, 100 doesn't)"
+        default: "10"
+      binary:
+        description: "build (from this repo's source) or r2 (bench-bin/pondra in the bucket)"
+        default: "build"
+      runner:
+        description: "Runner label for the nodes"
+        default: "ubuntu-24.04"
+
+env:
+  AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+  AWS_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+  AWS_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT }}
+  AWS_REGION: auto
+  AWS_DEFAULT_REGION: auto
+  AWS_REQUEST_CHECKSUM_CALCULATION: when_required # (R2 and newer AWS CLIs)
+  AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+  BUCKET: ${{ secrets.R2_BUCKET }}
+
+jobs:
+  binary:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build from source
+        if: inputs.binary == 'build'
+        run: cargo build --profile dist && cp target/dist/pondra pondra
+      - name: Or take the one in the bucket
+        if: inputs.binary == 'r2'
+        run: aws s3 cp "s3://$BUCKET/bench-bin/pondra" pondra
+      - uses: actions/upload-artifact@v4
+        with: { name: pondra, path: pondra, retention-days: 1 }
+
+  plan:
+    runs-on: ubuntu-24.04
+    outputs:
+      nodes: ${{ steps.n.outputs.nodes }}
+    steps:
+      - id: n
+        run: echo "nodes=$(python3 -c 'import json; print(json.dumps(list(range(${{ inputs.nodes }}))))')" >> "$GITHUB_OUTPUT"
+
+  node:
+    needs: [binary, plan]
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        i: ${{ fromJSON(needs.plan.outputs.nodes) }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: pondra }
+      - uses: tailscale/github-action@v3
+        with:
+          authkey: ${{ secrets.TS_AUTHKEY }}
+          hostname: pondra-${{ github.run_id }}-${{ matrix.i }}
+      - name: Serve until the driver is done
+        run: |
+          chmod +x pondra
+          ip=$(tailscale ip -4)
+          ./pondra serve --dir "s3://$BUCKET/bench-${{ github.run_id }}" --addr "$ip:8080" --cache-gb 4 > node.log 2>&1 &
+          echo "$ip:8080" | aws s3 cp - "s3://$BUCKET/bench-results/${{ github.run_id }}/nodes/${{ matrix.i }}"
+          until aws s3 ls "s3://$BUCKET/bench-results/${{ github.run_id }}/done" > /dev/null 2>&1; do sleep 15; done
+      - if: always()
+        run: aws s3 cp node.log "s3://$BUCKET/bench-results/${{ github.run_id }}/logs/node-${{ matrix.i }}.log" || true
+
+  driver:
+    needs: [binary]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - uses: actions/download-artifact@v4
+        with: { name: pondra }
+      - uses: tailscale/github-action@v3
+        with:
+          authkey: ${{ secrets.TS_AUTHKEY }}
+          hostname: pondra-${{ github.run_id }}-driver
+      - name: TPC-H data
+        run: |
+          chmod +x pondra
+          pip install tpchgen-cli
+          tpchgen-cli -s ${{ inputs.sf }} --format=parquet --output-dir tpch
+      - name: Wait for the nodes, run the benchmark
+        run: |
+          prefix="s3://$BUCKET/bench-results/${{ github.run_id }}"
+          until [ "$(aws s3 ls "$prefix/nodes/" | wc -l)" -ge "${{ inputs.nodes }}" ]; do sleep 10; done
+          nodes=$(for i in $(seq 0 $(( ${{ inputs.nodes }} - 1 ))); do aws s3 cp "$prefix/nodes/$i" -; done | paste -sd, -)
+          python3 tools/cloud/actions/driver.py --nodes "$nodes" --lake "s3://$BUCKET/bench-${{ github.run_id }}" \
+            --data tpch --queries tools/bench/tpch-queries --bin ./pondra --out results.json
+          aws s3 cp results.json "$prefix/results.json"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: results, path: results.json, if-no-files-found: ignore }
+      - name: Let the nodes go, and delete the lake
+        if: always()
+        run: |
+          echo done | aws s3 cp - "s3://$BUCKET/bench-results/${{ github.run_id }}/done"
+          aws s3 rm --recursive "s3://$BUCKET/bench-${{ github.run_id }}" > /dev/null || true

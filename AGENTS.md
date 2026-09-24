@@ -1,8 +1,8 @@
 # AGENTS.md — working on Pondra
 
 Read this first, then `README.md` (what it does), `docs/adr-005-every-node-writes.md` (why it
-works this way) and `docs/adr-014-shuffles-that-fit-on-disk-and-a-join-order-of-its-own.md` (the
-current round). `docs/prototype-status.md` has the measured numbers and what's left.
+works this way) and `docs/adr-015-any-query-across-the-nodes.md` (the current round).
+`docs/prototype-status.md` has the measured numbers and what's left.
 
 ## What this is
 
@@ -18,13 +18,13 @@ The owner's design principles, which every change must respect:
 2. **As serverless as possible**: no always-on services besides the nodes themselves.
 3. **SPMD, not driver/executor** (Bodo-style): every node runs the same code on its slice.
 4. **No JVM, no Spark, no Flink, no Fluss needed.**
-5. **Short, simple, readable code** — without losing functionality. ~11,000 lines of Rust total (the Kafka protocol is 1,300 of them).
+5. **Short, simple, readable code** — without losing functionality. ~11,400 lines of Rust total (the Kafka protocol is 1,300 of them).
    If a change makes a file much longer, look for the simpler shape first.
 
 ## Layout
 
 ```
-src/      11,000 lines of Rust, one file per concern (see the table in README.md)
+src/      11,400 lines of Rust, one file per concern (see the table in README.md)
 python/   the Python client (pure Python, HTTP + Arrow)
 tools/    harness.py, cluster.py (tests), open_check.py (Delta + Iceberg readers == Pondra),
           keyed_bench.py (compaction cost), clean_bucket.py (keep a bucket to its newest lakes),
@@ -37,7 +37,9 @@ tools/    harness.py, cluster.py (tests), open_check.py (Delta + Iceberg readers
           metadata_bench.py (a table with a million files), flight_bench.py (Arrow Flight),
           shuffle_spill.py (a shuffle bigger than memory, and one that loses a node),
           join_order.py (the same queries written badly: same answers, no slower),
-          cloud/ (start a cluster on several machines and benchmark it),
+          spread_tpch.py (all 22 TPC-H queries across N nodes == one node, and why not),
+          cloud/ (a cluster on several machines; cloud/actions/ + .github/workflows/: on GitHub runners),
+          bench/tpch-queries/ (the 22 TPC-H queries),
           r2_test.sh (run the suite against a real bucket), bench/ (vs Spark and Flink)
 docs/     ADRs and reports; lake-format.md is the on-disk layout
 ```
@@ -102,11 +104,20 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
   columns' min/max; past 128 files, all but the newest 64 are sealed into immutable manifests
   (`data/{t}/_manifests/`) behind one list object (`TableMeta.sealed`). Queries (`query::Pruned`)
   prune manifests, then files, by their filters. `partition_by` keeps one partition per file.
-- **Distributed queries** (`spmd.rs`): gather (first exchange is a gather: the coordinator
-  merges partial results) or shuffle (each hash exchange becomes a step: every node splits its
-  output by hash, one bucket per node, and fetches its bucket from every node). Small tables are
-  read whole (broadcast); a node's slice (`ShareExec`) reports the whole table's size; only plans
-  that the spread analysis proves correct run spread. Work is dealt by bytes, a step that fails is
+- **Distributed queries** (`spmd.rs`): any statement — joins of every type, subqueries, CTEs,
+  unions. `tables()` finds every table it reads; it is sliced on the biggest append table, and
+  small and keyed tables are read whole, at the coordinator's snapshot (`Slice::whole`, `upto`).
+  Then the physical plan decides (`spread`: states Whole/Split/Keyed): gather (first exchange is a
+  gather: the coordinator merges partial results) or shuffle (each exchange becomes a step: every
+  node splits its output into `nodes × partitions` buckets and reads its own from every node, in
+  node order). Exchanges are Hash, Own (a whole table keeps its own keys' rows) or All-gather (a
+  final aggregate over partial ones). Three ways are tried (`How`: broadcast, both sides
+  partitioned, every table sliced); a left/semi/anti join that fails as planned is first rewritten
+  to shuffle both sides by its key (`by_key`), and a join's collected side that is spread across
+  the nodes is all-gathered (`collected`). Scalar subqueries are hoisted out of the plan and answered
+  between steps (`hoist`, `Subquery`). A node's slice (`ShareExec`) reports the whole table's
+  size; only plans that the spread analysis proves correct run spread (`PONDRA_DEBUG_SPREAD=1`
+  says which operator refused). Work is dealt by bytes, a step that fails is
   retried once and then the shuffle runs again without that node, and below three live nodes the
   query falls back to one.
 - **What a shuffle moves lives in pieces** (`spill.rs`): a bucket is Arrow IPC pieces of
@@ -233,8 +244,10 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
 26. **A partitioned table's files each hold one partition value** (`tier::split` on every write,
    merges grouped by `part`). Never merge files of different partitions.
 27. **Every node plans a distributed query alike.** A slice is scanned through `ShareExec`, which
-   reports the whole table's size, and has 2+ partitions; the coordinator compares each node's
-   plan shape at every step and falls back to one node on any difference.
+   reports the whole table's size, and has 2+ partitions; a table read whole through `WholeExec`,
+   which reports its size from the catalog (not from what the node holds decoded or in its log);
+   every node plans with the coordinator's partition count (`Slice::partitions`). The coordinator
+   compares each node's plan shape at every step and falls back to one node on any difference.
 28. **A shuffle never carries a whole copy** (`spmd::spread`): a hash exchange over rows every
    node has in full stays inside the node, and what reaches the coordinator is split. New
    operators are refused until the analysis knows them.
@@ -247,12 +260,27 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    caught when the id wasn't there.
 31. **A step's buckets are kept, not taken** (`spmd::fetch`, `bucket`): reading one clones it, so
    a step that has to be run again reads the same rows. Everything a job spilled goes when the job
-   ends (`Drop for Job`, `gc`, `?drop=1`), and a dead node's is swept an hour later. A gather's
+   ends (`Drop for Job`, `gc`, `?drop=true`), and a dead node's is swept an hour later. A gather's
    spill is freed by the guard its response stream holds instead, since nothing retries it.
 32. **Every node splits the same rows the same way.** `spmd::scatter` runs a stage's partitions at
    once, each into buckets of its own, and joins them in partition order at the end; the hash is
    DataFusion's `BatchPartitioner` over the exchange's own expressions. Anything that made the
    split depend on arrival order would send a key to two nodes.
+33. **Every exchange adds up in the same order** (`spmd::scatter`, `spill::chain`, `Received`):
+   rows are hashed once into `nodes × partitions` buckets (bucket `i` → node `i / parts`,
+   partition `i % parts`, which is DataFusion's own `hash % parts`), and a partition reads every
+   node's bucket for it in node order; the coordinator reads the nodes' results the same way.
+   Reading them as they arrive made float sums differ run to run (TPC-H q15's `= max(...)`).
+34. **Tables not sliced are read at the coordinator's snapshot** (`Slice::whole`, `upto`,
+   `query::table_view(.., Some(upto))`): every node reads the very same rows of a small or keyed
+   table, waiting (10 s) for its log to reach `upto`. Reading each node's own catalog let two
+   nodes see a commit apart. Plan shapes don't count `CoalescePartitionsExec` (`shape`): whether a
+   table's partitions are gathered depends on what `hot.rs` holds decoded, not on the query.
+35. **A scalar subquery is answered before anything that uses it runs** (`spmd::hoist`): a shuffle
+   takes the `ScalarSubqueryExec`s out of the plan, and `step()` fills their shared answer slots
+   as soon as the exchanges they read are done — on every node, from the same all-gathered rows.
+   A shuffle's pieces are compacted (`spill::compact`) before they are counted or written: a
+   `Utf8View` slice otherwise carries every string of the batch it was cut from.
 
 ## Tests: run these before and after any change
 
@@ -270,9 +298,10 @@ python3 tools/harness.py clients               # SQL writes, Python client, Post
 python3 tools/harness.py kafka                 # Kafka producers/consumers/groups (librdkafka, kafka-python), Debezium, SASL
 python3 tools/harness.py alter                 # ALTER TABLE ADD COLUMN under load, 6 outside readers follow
 python3 tools/harness.py windows               # event-time windows emitted once, late rows, a leader restart
-python3 tools/harness.py scale                 # partitions, manifests, 14 shuffled/spread query shapes == one node, memory limits
+python3 tools/harness.py scale                 # partitions, manifests, 23 spread query shapes (joins of every kind, subqueries, CTEs) == one node, memory limits
 python3 tools/shuffle_spill.py                 # a shuffle bigger than memory, a node killed mid-query, the scratch freed
 python3 tools/join_order.py --lake <tpch lake> # the same queries written badly: same answers, no slower
+python3 tools/spread_tpch.py --expect 22 [--broadcast-mb 0]  # TPC-H SF1 on 3 nodes == one node; 22 of 22 spread (21 all sliced)
 python3 tools/harness.py flight                # Arrow Flight (pyarrow) and Flight SQL (ADBC): exactly-once DoPut, SQL, the log stream
 python3 tools/metadata_bench.py [--files 1000000]   # a million files: commits, pruning, a restart, 3 nodes
 python3 tools/flight_bench.py                  # Flight in, out, and the log as a stream
@@ -326,11 +355,12 @@ Practical notes for an agent working here:
 - Node stderr goes to `/tmp/pondra-<port>-<id>.stderr`; that's where "restarting to rejoin",
   "slow tiering" and panics show up.
 
-## State of the work (2026-09-23, round 13)
+## State of the work (2026-09-24, round 14)
 
 Everything in `docs/prototype-status.md` passes on local disk and on simulated R2. The round-11
 additions (manifests, partitions, shuffles, memory limits, Arrow Flight) also ran against real
-R2; round 12's are in `logs/round12/` and round 13's in `logs/round13/`.
+R2; round 12's are in `logs/round12/`, round 13's in `logs/round13/` and round 14's in
+`logs/round14/`.
 
 **R2 test buckets.** There are two:
 
@@ -341,7 +371,33 @@ R2; round 12's are in `logs/round12/` and round 13's in `logs/round13/`.
 all. After R2 runs: `tools/clean_bucket.py --bucket ponderabucket-us --bucket pondbucket --newest
 3 --dry-run`, then without `--dry-run`.
 
+**Where the multi-machine run will happen (the owner's plan, 2026-09-23).** The owner has no VMs
+of their own and the repo (`alimardon123/pondra`) is **private**. They will run the multi-machine
+tests themselves, later, on one of:
+
+- **GitHub Actions** — free runners joined into one network with Tailscale's free plan, the lake
+  in their R2 bucket. A private repo gets 2-vCPU / 8 GB runners and a monthly minute allowance; a
+  small *public* bench repo holding only the workflow gets 4-vCPU / 16 GB runners, free and
+  unlimited, while the binary stays in R2 and the source stays private. Jobs last at most 6 hours;
+  runners have 14 GB of disk (SF10 fits, SF100 doesn't) and are shared, so compare shapes (1 → 3 →
+  6 nodes), not headline numbers. `.github/workflows/cluster-bench.yml` and `tools/cloud/actions/`
+  are the workflow; `bench-bin/pondra` in `ponderabucket-us` holds the round-14 dist binary
+  (Linux x86-64, glibc 2.39) for its `binary: r2` input. Rebuild and re-upload it when the code
+  changes, and read results from `bench-results/<run id>/results.json`.
+- **A Google Cloud VM trial** ($300 for 90 days, no charge unless they upgrade) for dedicated
+  machines, SF100 and Spark on the same VMs, with `tools/cloud/cluster.sh`.
+
+An agent can't reach VMs from its sandbox (outbound HTTPS only, through a proxy: no SSH, nothing
+inbound) and must not push to GitHub. So the pattern is: the agent prepares the workflow or
+scripts, the owner runs them, and the runs write their results under `bench-results/` in the R2
+bucket, which the agent can read with the credentials in `/home/claude/.r2env`. If the owner
+links a session to their computer, an agent can drive VMs from there instead.
+
 Headline numbers, all on one 2-vCPU box:
+
+- **Any query across the nodes:** all 22 TPC-H queries run on 3 nodes (19 shuffled, 3
+  gathered), each answer equal to one node's, the same every run; 21 with every table sliced
+  (`tools/spread_tpch.py`, ADR-015).
 
 - **TPC-H on one machine, from Parquet:** SF1 **3.19 s**, SF10 **38.0 s** — ahead of DuckDB
   (3.36 / 39.8), Polars (3.78 / out of memory), Polars streaming (3.18 / 42.8) and Daft
@@ -365,11 +421,13 @@ item, with what each is building next and the plan for the gaps — is
 
 Known limits, in the order they matter:
 
-1. **No multi-machine run yet.** `tools/cloud/` is the kit: `cluster.sh` over ssh, `bench.py`
-   from a client VM.
+1. **No multi-machine run yet.** `.github/workflows/cluster-bench.yml` (GitHub runners +
+   Tailscale + R2, results in `bench-results/`) and `tools/cloud/` (`cluster.sh` over ssh,
+   `bench.py` from a client VM) are the kits; the owner starts them.
 2. **Shuffle skew is measured, not corrected** (`pondra_shuffle_skew`): a key holding much of a
-   table is one node's work. Distributed queries are one SELECT with inner joins, and a query's
-   own answer still passes through the coordinator's memory once (an HTTP answer is one body).
+   table is one node's work. `NOT IN` over a sliced subquery, a `LIMIT` inside a subquery, a window
+   over all rows and order-preserving shuffles run on one node, and a query's own answer still
+   passes through the coordinator's memory once (an HTTP answer is one body).
 3. **Join order is bounded by what the ranges say.** A column's distinct values are bounded by
    its min/max, which says little about a wide-ranged foreign key, so the order the query wrote
    is the baseline and has to be beaten. Files written in key order aren't declared as sorted
@@ -393,10 +451,11 @@ Known limits, in the order they matter:
 Good next moves, in order. The plan table in the comparison doc has the evidence each should
 produce.
 
-1. **A multi-machine run** with `tools/cloud/` (3–10 VMs on S3/R2): ingest over Flight and Kafka,
-   the query suite at 1, 3 and 6 nodes, TPC-H SF100 against Spark.
-2. **Skew corrected, not just measured** (a hot join key split across nodes), and distributed
-   queries beyond one SELECT of inner joins.
+1. **A multi-machine run**: read the owner's `bench-results/<run>/results.json` from the bucket
+   if there is one; otherwise help them start `cluster-bench.yml` or `tools/cloud/`: the query
+   suite at 1, 3 and 6 nodes, ingest over Flight and Kafka, TPC-H SF100 against Spark.
+2. **Skew corrected, not just measured** (a hot join key split across nodes), and the shapes that
+   still run on one node (a range exchange for windows over all rows and `ORDER BY` shuffles).
 3. **Sorted files declared as sorted** (streaming aggregation, merge joins, `ORDER BY` without a
    sort), and real distinct-value counts to feed the join-order cost model.
 4. **Kafka partitions** (key-hashed slices of a table) and transactions.

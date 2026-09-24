@@ -1,6 +1,6 @@
 # Prototype status: Pondra, a streamhouse in one binary
 
-**Date:** 2026-09-23 (round 13) · **Plan:** ADR-002 to ADR-014 · **Code:** `pondra.zip` / `pondra.bundle` (≈11,000 lines of Rust, plus a Python client and test and benchmark tools)
+**Date:** 2026-09-24 (round 14) · **Plan:** ADR-002 to ADR-015 · **Code:** `pondra.zip` / `pondra.bundle` (≈11,400 lines of Rust, plus a Python client and test and benchmark tools)
 **Name:** the prototype formerly called `lh` is now **Pondra**. The name is free on crates.io, PyPI and npm. A small personal-finance app uses it (pondra.app), a different category; run a trademark search before a public launch.
 
 ## Where it stands
@@ -14,6 +14,52 @@ One Rust binary replaces the Kafka + Flink + Spark + metastore + ZooKeeper stack
 - upsert and merge tables.
 
 Start more copies on the same bucket to scale out. The only state is object storage. There's no JVM, no database server and no coordination service.
+
+**Round 14 let any query run across the nodes, with the same answer every time** (ADR-015):
+
+1. **The plan decides what spreads, not the SQL.** Round 13 let one plain SELECT of inner joins
+   over append tables run across the nodes — 8 of TPC-H's 22 queries. Now every table a query
+   reads is found (joins, subqueries, CTEs, unions), it is sliced on its biggest append table, and
+   keyed tables are read whole; then the physical plan is checked operator by operator. Every
+   join type has one rule: whatever a join emits by looking at *all* of the other side needs that
+   side whole, or both sides shuffled by the key. **All 22 TPC-H queries now run across three
+   nodes (19 shuffled, 3 gathered), every answer equal to one node's**; with every table sliced
+   (`PONDRA_BROADCAST_MB=0`), 21. `harness.py scale` spreads 23 of 23 query shapes, nine of them
+   new (LEFT, FULL, `IN`, `NOT EXISTS`, `NOT IN`, a scalar subquery, a CTE with `UNION ALL`, a
+   keyed table on the right of a LEFT JOIN).
+2. **Two new exchanges.** *Own*: a table every node read whole that must meet a sliced one on the
+   kept side of an outer join — each node keeps its own keys' rows, and nothing moves.
+   *All-gather*: a final aggregate over partial ones (a subquery's `avg`) — every node gets the few
+   partial rows and computes the same answer.
+3. **A join that doesn't split moves what it needs**, not the whole query: a semi or anti
+   join planned to stream a sliced table past a collected one is rewritten into one that hashes
+   both sides by its key (`by_key`), where before the whole query fell to the plan that shuffles
+   every join; and an inner join whose collected side is sliced gets that side sent to every node
+   (`collected`) instead of both sides shuffled. Across three nodes on one box, q17 went from
+   1.11 s to 0.21 s, q21 from 2.12 s to 0.95 s, and all 22 queries from 8.0 s to 5.8 s — with every
+   table sliced, as a bigger lake would have them, from 12.1 s to 7.7 s.
+4. **Scalar subqueries answered between steps.** What uses a subquery's answer can sit below a
+   shuffle (q22 filters customers by an `avg` before shuffling them), so a shuffle answers the
+   subqueries itself, on every node, as soon as their exchanges are done.
+5. **The same answer every time.** Each exchange now hashes once into `nodes × partitions`
+   buckets — the partition DataFusion itself would choose, so nothing is re-partitioned on arrival
+   — and a partition reads the nodes' buckets in node order. TPC-H q15 over DOUBLE columns
+   (`total_revenue = max(total_revenue)`) returned no rows in one run of three on a single node;
+   across three nodes it returns the same row every time.
+6. **Whole tables at one snapshot.** The coordinator sends the tables it doesn't slice along with
+   the slices, as of the log position it planned at; a node that is behind waits for it.
+7. **What the new tests found:** a shuffle's pieces kept every string of the batch they were cut
+   from (`Utf8View` buffers), so q21 wrote 2.5 GB per node and filled the disk — now 12 MB, and
+   62 s became 2.2 s; spill sizes were counted by buffer (145 MB for 10 MB); abandoning a shuffle
+   never cleaned up (`?drop=1` against a handler that wanted `true`); a coordinator that failed
+   its own step dropped itself from the shuffle; and, only on real R2, a small table decoded in
+   memory on one node and read from Parquet on another made two nodes plan the same query two
+   ways (now a table read whole reports its size from the catalog, and every node plans with the
+   coordinator's partition count — machines with different core counts can share a query too).
+8. **A cluster benchmark anyone can start.** `.github/workflows/cluster-bench.yml` runs N nodes on
+   GitHub-hosted runners joined by Tailscale against an R2 bucket, loads TPC-H and times each query
+   on one node and across the cluster (`tools/cloud/actions/`). Nothing has run on several machines
+   yet; this is the kit for it.
 
 **Round 13 made queries across nodes something you can rely on, and gave Pondra a join order of
 its own** (ADR-014):
@@ -736,11 +782,12 @@ Limits: producer names must be unique per client; there is no auth or per-user q
 Every test runs on local disk, on a local S3 server with R2-like latency, and against a real
 Cloudflare R2 bucket. All of them pass on all three.
 
-Round 12's runs are in `logs/round12/`: the suite on local disk (`local.txt`, `harness-all.txt`),
-on the R2 simulator (`sim-r2.txt`), and on a real R2 bucket (`r2.txt`: the eight outside readers
-of Delta and Iceberg, partitions and manifests, the clients, upsert against a model, and 2.4 M
-events through eleven `kill -9`s), plus TPC-H against DuckDB, Polars, Daft and Bodo
-(`tpch-sf1.json`, `tpch-sf10.json`) and the binary's size (`sizes.txt`).
+Round 14's runs are in `logs/round14/`: on local disk (`local.txt`: the suite, all 22 TPC-H
+queries on three nodes against one — with small tables read whole and with every table sliced —
+the GitHub workflow's driver on three local nodes, shuffles bigger than memory, join order, and
+the before/after of `by_key` and `collected`), on the R2 simulator (`sim-r2.txt`) and on a real
+R2 bucket (`r2.txt`), plus the binary's size (`sizes.txt`). Round 12's (`logs/round12/`) have
+TPC-H against DuckDB, Polars, Daft and Bodo (`tpch-sf1.json`, `tpch-sf10.json`).
 
 | Test | Local disk | Real R2 |
 |---|---|---|
@@ -759,12 +806,12 @@ events through eleven `kill -9`s), plus TPC-H against DuckDB, Polars, Daft and B
 
 ## Sizes
 
-| What | Round 3 | Round 5 | Round 8 | Round 9 | Round 10 | Round 11 | Round 12 |
-|---|---|---|---|---|---|---|---|
-| Binary (stripped) | 88.3 MB (30 MB gzip, 17 MB xz) | 89.2 MB (29.9 MB gzip, 16.8 MB xz) | 90.0 MB (30.5 MB gzip, 18.7 MB xz) | 90.7 MB (30.5 MB gzip, 17.2 MB xz), with the Postgres protocol and MCP | 93.0 MB (31.4 MB gzip, 17.6 MB xz), with the Kafka protocol and JSON functions | 95.0 MB (32.0 MB gzip, 18.0 MB xz), with Arrow Flight (gRPC) | 95.9 MB (32.4 MB gzip, 18.2 MB xz), with hashing, base64, files, vectors and AI functions |
-| Idle memory | 18 MB | 41 MB (mimalloc reserves more up front) | 42 MB | 44 MB | 49 MB (with `--kafka`) | 42 MB (with `--kafka --flight --pg`) | 39 MB (with `--kafka --flight --pg`) |
-| Peak memory under full load | 455 MB | 1.8 GB at 2.84 M events/s sustained (279–586 MB in the batch and streaming benchmarks) | not re-measured | not re-measured | not re-measured | bounded for queries by `--memory-gb` | as before, plus the decoded columns (`PONDRA_HOT_GB`, a quarter of the query budget), which are given back when the node's own memory runs high |
-| Storage per event (user, event, amount, ts) | NDJSON 77.9 B → log 12.8 B → Parquet 6.8 B | NDJSON 77.9 B → log 12.8 B → Parquet 6.8 B (unchanged) | unchanged | unchanged | unchanged | unchanged | Parquet files are LZ4 now, about a third bigger than ZSTD's and much cheaper to read (`PONDRA_CODEC=zstd` to go back) |
+| What | Round 3 | Round 5 | Round 8 | Round 9 | Round 10 | Round 11 | Round 12 | Round 14 |
+|---|---|---|---|---|---|---|---|---|
+| Binary (stripped) | 88.3 MB (30 MB gzip, 17 MB xz) | 89.2 MB (29.9 MB gzip, 16.8 MB xz) | 90.0 MB (30.5 MB gzip, 18.7 MB xz) | 90.7 MB (30.5 MB gzip, 17.2 MB xz), with the Postgres protocol and MCP | 93.0 MB (31.4 MB gzip, 17.6 MB xz), with the Kafka protocol and JSON functions | 95.0 MB (32.0 MB gzip, 18.0 MB xz), with Arrow Flight (gRPC) | 95.9 MB (32.4 MB gzip, 18.2 MB xz), with hashing, base64, files, vectors and AI functions | 96.3 MB (32.8 MB gzip), with shuffles that spill, the join order and any query across the nodes |
+| Idle memory | 18 MB | 41 MB (mimalloc reserves more up front) | 42 MB | 44 MB | 49 MB (with `--kafka`) | 42 MB (with `--kafka --flight --pg`) | 39 MB (with `--kafka --flight --pg`) | not re-measured |
+| Peak memory under full load | 455 MB | 1.8 GB at 2.84 M events/s sustained (279–586 MB in the batch and streaming benchmarks) | not re-measured | not re-measured | not re-measured | bounded for queries by `--memory-gb` | as before, plus the decoded columns (`PONDRA_HOT_GB`, a quarter of the query budget), which are given back when the node's own memory runs high | as before; a shuffle's buckets past `PONDRA_SPILL_MB` go to the node's disk |
+| Storage per event (user, event, amount, ts) | NDJSON 77.9 B → log 12.8 B → Parquet 6.8 B | NDJSON 77.9 B → log 12.8 B → Parquet 6.8 B (unchanged) | unchanged | unchanged | unchanged | unchanged | Parquet files are LZ4 now, about a third bigger than ZSTD's and much cheaper to read (`PONDRA_CODEC=zstd` to go back) | unchanged |
 
 ## Memory is a knob, not a mystery
 
@@ -812,10 +859,12 @@ peak at 279–586 MB.
   whole table is rewritten only when the newer data has grown to about half of it; partitioned
   compaction (a key range per node) is the next step.
 - Merge tables only support decomposable aggregates (sum, count, min, max).
-- Distributed queries spill their buckets and stream their results (round 13), and a step that
-  fails is retried and then run without that node — but skew is measured, not corrected: a hot
-  join key is still one node's work. Nothing has run on several machines yet; `tools/cloud/` is
-  the kit.
+- Any query can run across the nodes (round 14: all 22 TPC-H queries), its buckets spilled and
+  its results streamed, a failed step retried and then run without that node — but skew is
+  measured, not corrected: a hot join key is still one node's work. `NOT IN` over a sliced
+  subquery, a `LIMIT` inside a subquery, a window over all rows and order-preserving shuffles run
+  on one node. Nothing has run on several machines yet; `tools/cloud/` and the GitHub Actions
+  workflow are the kits.
 - A query's own answer still passes through the coordinator's memory once, because an HTTP answer
   is one body that identical queries share (invariant 14). What the nodes send no longer does.
 - Join order is chosen from the catalog's statistics (round 13), but only when it clearly beats
@@ -838,9 +887,11 @@ peak at 279–586 MB.
 
 From the plan in `docs/comparison-spark-flink-fluss.md`, in order:
 
-1. **A multi-machine run** with `tools/cloud/` (3–10 VMs on S3/R2), TPC-H SF100 against Spark.
-2. **Skew corrected, not just measured** (a hot join key split across nodes), and distributed
-   queries beyond one SELECT of inner joins.
+1. **A multi-machine run**: `.github/workflows/cluster-bench.yml` (GitHub-hosted runners +
+   Tailscale + R2) or `tools/cloud/` on VMs (e.g. a Google Cloud trial), TPC-H SF10–SF100 against
+   Spark.
+2. **Skew corrected, not just measured** (a hot join key split across nodes), and the last shapes
+   that stay on one node: windows over all rows (a range exchange), `NOT IN` over sliced data.
 3. **Sorted data declared as sorted** (streaming aggregation, merge joins, `ORDER BY` without a
    sort), and better distinct-value estimates for the join-order cost model.
 4. **Kafka partitions** and transactions; the Java client and Kafka Connect verified.

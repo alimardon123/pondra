@@ -345,11 +345,9 @@ impl Lake {
         Ok(())
     }
 
-    /// A fresh SQL session on the shared runtime.
+    /// A fresh SQL session on the shared runtime (`partitions()` of them).
     pub fn session(&self) -> SessionContext {
-        // At least 2 partitions, so every node plans aggregations as partial + final (see spmd.rs).
-        let partitions = std::thread::available_parallelism().map_or(2, |n| n.get()).max(2);
-        self.session_with(partitions)
+        self.session_with(partitions())
     }
 
     /// A session with a fixed number of partitions: 1 for point lookups, where splitting the work
@@ -978,3 +976,7 @@ pub fn maybe_crash(point: &str) {
         }
     }
 }
+
+/// How many partitions a query runs in here: one per core, and at least 2, so every node plans
+/// aggregations as partial + final (see spmd.rs).
+pub fn partitions() -> usize { std::thread::available_parallelism().map_or(2, |n| n.get()).max(2) }

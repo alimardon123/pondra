@@ -12,6 +12,8 @@ def lakes(s3, bucket):
     for pg in s3.get_paginator("list_objects_v2").paginate(Bucket=bucket):
         for o in pg.get("Contents", []):
             parts = o["Key"].split("/")
+            if parts[0] in ("bench-bin", "bench-results"):
+                continue  # (not lakes: the cluster benchmark's binary and results, tools/cloud/actions)
             top = "/".join(parts[:2]) if parts[0].startswith("round") and len(parts) > 2 else parts[0]
             lake = out[top]
             lake[0] = max(lake[0] or o["LastModified"], o["LastModified"])

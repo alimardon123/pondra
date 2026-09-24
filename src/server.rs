@@ -257,8 +257,8 @@ async fn bucket(Query(p): Query<BucketParams>) -> Result<Response, E> {
         crate::spmd::forget(&p.id);
         return Ok(Body::empty().into_response());
     }
-    let spill = crate::spmd::bucket(&p.id, p.exchange, p.to)?;
-    Ok(Body::from_stream(spill.framed()).into_response()) // (a piece at a time: a big bucket is on disk)
+    let buckets = crate::spmd::bucket(&p.id, p.exchange, p.to)?;
+    Ok(Body::from_stream(crate::spmd::reply("", buckets, None)).into_response()) // (a piece at a time: a big bucket is on disk)
 }
 
 /// A share of the leader's data work (tiering, merging, compaction): the files written.

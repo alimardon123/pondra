@@ -165,8 +165,8 @@ fn empty(ctx: &SessionContext, meta: &TableMeta) -> Result<DataFrame> {
 /// rows whose key no newer source has — an anti-join against the newer keys, which are usually
 /// few (the log tail and recent files) — and only the log tail is deduplicated itself. A table
 /// that is one compacted file reads as that file.
-async fn upsert_view(lake: &Lake, ctx: &SessionContext, name: &str, meta: &TableMeta) -> Result<Arc<dyn TableProvider>> {
-    let (tail, files) = sources(lake, ctx, name, meta, None).await?;
+async fn upsert_view(lake: &Lake, ctx: &SessionContext, name: &str, meta: &TableMeta, upto: Option<u64>) -> Result<Arc<dyn TableProvider>> {
+    let (tail, files) = sources(lake, ctx, name, meta, upto).await?;
     let (mut names, aux) = (vec![], lake.session()); // (the parts live in their own context: SHOW TABLES lists only tables)
     if let Some(t) = tail {
         aux.register_table("__tail", t.into_view())?;
@@ -197,19 +197,20 @@ async fn upsert_view(lake: &Lake, ctx: &SessionContext, name: &str, meta: &Table
 }
 
 /// A table as its users see it: append tables as files + log; keyed tables their current rows.
-pub async fn table_view(lake: &Lake, ctx: &SessionContext, name: &str, meta: &TableMeta) -> Result<Arc<dyn TableProvider>> {
+/// `upto`: the log only that far (a distributed query reads every node's copy at one snapshot).
+pub async fn table_view(lake: &Lake, ctx: &SessionContext, name: &str, meta: &TableMeta, upto: Option<u64>) -> Result<Arc<dyn TableProvider>> {
     if !meta.key.is_empty() && meta.merge.is_empty() {
-        return upsert_view(lake, ctx, name, meta).await;
+        return upsert_view(lake, ctx, name, meta, upto).await;
     }
     if meta.key.is_empty() {
         let schema = read_schema(&meta.columns)?;
         let ranges = crate::manifest::ranges(name, &crate::manifest::list(lake, meta).await?, &meta.files, &schema);
-        return Ok(Arc::new(Pruned { lake: lake.arc(), name: name.into(), meta: meta.clone(), manifests: None, upto: None, schema, share: None, ranges }));
+        return Ok(Arc::new(Pruned { lake: lake.arc(), name: name.into(), meta: meta.clone(), manifests: None, upto, schema, share: None, ranges }));
     }
-    let df = raw(lake, ctx, name, meta, None).await?;
+    let df = raw(lake, ctx, name, meta, upto).await?;
     let aux = lake.session();
     aux.register_table("__raw", df.into_view())?;
-    Ok(aux.sql(&current_sql(lake, meta, "__raw")).await?.into_view())
+    Ok(aux.sql(&current_sql(meta, "__raw", upto.unwrap_or(lake.visible()))).await?.into_view())
 }
 
 /// An append table (or a distributed query's slice of one) that picks its files per query: those
@@ -310,8 +311,8 @@ pub fn latest_sql(meta: &TableMeta, raw_table: &str, sorted: bool, keep_deleted:
 /// The current rows of a keyed table, over `raw_table`. When the source already holds one row
 /// per key — a single file, with nothing in the log after it — the "newest wins" window (or the
 /// merge GROUP BY) is skipped, so reads of a compacted table cost a plain scan.
-pub fn current_sql(lake: &Lake, meta: &TableMeta, raw_table: &str) -> String {
-    if meta.files.len() > 1 || lake.visible() != meta.tiered {
+pub fn current_sql(meta: &TableMeta, raw_table: &str, upto: u64) -> String {
+    if meta.files.len() > 1 || upto != meta.tiered {
         return latest_sql(meta, raw_table, false, false);
     }
     let cols = meta.columns.iter().map(|(c, _)| format!("\"{c}\"")).collect::<Vec<_>>().join(", ");
@@ -353,7 +354,7 @@ pub async fn session(lake: &Lake, sql: &str, except: &str) -> Result<SessionCont
             if (!listing && !sql.contains(full.as_str())) || (ns.is_empty() && name == except) {
                 continue;
             }
-            ctx.register_table(full.as_str(), table_view(from, &ctx, name, &meta).await?)?;
+            ctx.register_table(full.as_str(), table_view(from, &ctx, name, &meta, None).await?)?;
         }
     }
     Ok(ctx)

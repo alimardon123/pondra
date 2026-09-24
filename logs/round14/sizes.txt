@@ -1,0 +1,4 @@
+Round 14 binary (cargo build --profile dist):
+  96.3 MB, 32.8 MB gzipped  (round 13: 96.1 MB / 32.7 MB)
+  spmd.rs grew (every join type, subqueries, by_key, collected, whole tables); no new dependencies.
+Rust source: 11418 lines across 30 files.

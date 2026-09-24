@@ -4,6 +4,11 @@ Everything so far was measured on one 2-vCPU box. This kit runs the same binary 
 machines against one bucket, and measures what a cluster adds: ingest spread over nodes,
 distributed queries and shuffles.
 
+**No machines of your own?** `.github/workflows/cluster-bench.yml` runs the nodes on
+GitHub-hosted runners joined by Tailscale, with the lake in your bucket, and times all 22 TPC-H
+queries on one node and across the cluster (`actions/README.md`: the secrets it needs and what it
+costs). The steps below are for VMs you run yourself (e.g. a Google Cloud trial).
+
 1. **Machines.** N Linux VMs in one region with the bucket (e.g. 3 × 8 vCPU), plus one client
    VM with Python and `pyarrow`. Open ports 8080 (HTTP), 8815 (Flight) and 9092 (Kafka) between
    them.

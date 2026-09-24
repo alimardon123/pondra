@@ -795,7 +795,8 @@ def scale():
         "one day reads only its files": day_n == days[one_day] and 0 < scanned <= 8,
         "every file holds one day": len(files) > 0 and not mixed,
         "three nodes: same answer": was_spread and spread == {"n": n_rows, "s": total},
-        "shuffles (GROUP BY, joins, windows) = one node": all(same for same, _ in shuffles.values()) and sum(sh for _, sh in shuffles.values()) >= 10,
+        "shuffles (GROUP BY, joins, windows) = one node": all(same for same, _, _ in shuffles.values()) and sum(sh for _, sh, _ in shuffles.values()) >= 10,
+        "outer, semi and anti joins, subqueries, CTEs and unions run across the nodes": sum(sp for _, _, sp in list(shuffles.values())[14:]) >= 9,
         "Delta and Iceberg readers see sealed files": all(v == n_rows for v in theirs.values()),
     }
     for n in list(NODES):
@@ -812,12 +813,12 @@ def scale():
         and metrics_of(port)["pondra_memory_limit_bytes"] == int(0.05 * (1 << 30)))
     node.kill()
     ok = all(checks.values())
-    shown = {q: ("same" if same else "DIFFERENT") + (", shuffled" if sh else "") for q, (same, sh) in shuffles.items()}
+    shown = {q: ("same" if same else "DIFFERENT") + (", shuffled" if sh else ", gathered" if sp else ", one node") for q, (same, sh, sp) in shuffles.items()}
     print(json.dumps({"scale": checks, "shuffles": shown, "rows": n_rows, "days": len(days), "files": {"inline": inline, "sealed": sealed, "parquet_objects": len(files), "one_day_scanned": scanned}, "outside_readers": theirs, "ok": ok}, indent=1))
     if not ok:
         print("mixed:", mixed[:3], "per_day diff:", {d: (per_day.get(d), n) for d, n in days.items() if per_day.get(d) != n})
         sys.exit(1)
-    return f"scale: {n_rows:,} rows over {len(days)} daily partitions, {int(inline + sealed)} files ({int(sealed)} sealed), every file one day, a day's query reads {int(scanned)} files, 3 nodes, {sum(sh for _, sh in shuffles.values())} of {len(shuffles)} queries shuffled (all equal to one node), 6 outside readers, a 50 MB memory limit: all {len(checks)} checks pass"
+    return f"scale: {n_rows:,} rows over {len(days)} daily partitions, {int(inline + sealed)} files ({int(sealed)} sealed), every file one day, a day's query reads {int(scanned)} files, 3 nodes, {sum(sp for _, _, sp in shuffles.values())} of {len(shuffles)} queries spread, {sum(sh for _, sh, _ in shuffles.values())} shuffled (all equal to one node), 6 outside readers, a 50 MB memory limit: all {len(checks)} checks pass"
 
 
 def flight():
@@ -955,14 +956,26 @@ def shuffle_checks(port):
         "window over all": "SELECT k, row_number() OVER (ORDER BY v, id) AS r FROM a ORDER BY r LIMIT 5",
         "global aggregate": "SELECT count(*) AS n, avg(v) AS a, count(DISTINCT k) AS d FROM a",
         "a keyed table": "SELECT u.name, count(*) AS n FROM a JOIN u ON a.p = u.id GROUP BY u.name ORDER BY u.name",
+        # Round 14: shapes that used to run on one node. Each must still equal one node's answer.
+        "LEFT JOIN, unmatched rows kept": "SELECT count(*) AS n, count(b.name) AS m FROM a LEFT JOIN b ON a.k = b.k + 45000",
+        "small table LEFT JOIN big one": "SELECT b.k, count(a.id) AS n FROM b LEFT JOIN a ON a.k = b.k GROUP BY b.k ORDER BY n, b.k LIMIT 10",
+        "FULL JOIN": "SELECT count(*) AS n, count(a.id) AS x, count(b.k) AS y FROM a FULL JOIN b ON a.id = b.k",
+        "IN (a semi join)": "SELECT count(*) AS n FROM a WHERE k IN (SELECT k FROM b WHERE name LIKE 'n2%')",
+        "NOT EXISTS (an anti join)": "SELECT count(*) AS n FROM b WHERE NOT EXISTS (SELECT 1 FROM a WHERE a.k = b.k)",
+        "NOT IN (NULLs matter)": "SELECT count(*) AS n FROM a WHERE k NOT IN (SELECT k FROM b WHERE k < 20000)",
+        "a scalar subquery": "SELECT count(*) AS n FROM a WHERE v > (SELECT avg(v) FROM a)",
+        "a CTE and UNION ALL": "WITH hi AS (SELECT k FROM a WHERE v > 30000), lo AS (SELECT k FROM a WHERE v < 100) SELECT count(*) AS n, sum(k) AS s FROM (SELECT k FROM hi UNION ALL SELECT k FROM lo)",
+        "a keyed table, LEFT JOIN": "SELECT a.p, count(u.name) AS n FROM a LEFT JOIN u ON a.p = u.id GROUP BY a.p ORDER BY a.p",
     }
     out = {}
     for name, s in queries.items():
-        before = metrics_of(port)["pondra_shuffled_queries_total"]
+        before = metrics_of(port)
         one, many = q(s, 0), q(s, 1)
+        after = metrics_of(port)
         ordered = "ORDER BY" in s.split("OVER")[-1]
         same = one == many if ordered else sorted(map(json.dumps, one)) == sorted(map(json.dumps, many))
-        out[name] = (same and len(one) > 0, int(metrics_of(port)["pondra_shuffled_queries_total"] - before))
+        ran = lambda m: int(after[f"pondra_{m}_queries_total"] - before[f"pondra_{m}_queries_total"])
+        out[name] = (same and len(one) > 0, ran("shuffled"), ran("spread"))
     return out
 
 
