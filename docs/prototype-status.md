@@ -40,8 +40,11 @@ Windows:
    (Windows got a fixed 4 GiB and 0 bytes); they come from the OS now, and every push runs
    `tools/smoke.py` on Windows, macOS and Linux.
 6. **The cluster bench measures the network** (bytes sent between nodes, time waiting for them,
-   the runners' ping and bandwidth), so the 3-node slowdown can be explained before it is fixed.
-   Planning queries costs what it did (`logs/round18/query-latency.txt`).
+   the runners' ping and bandwidth). On round 18's code, 3 GitHub runners, TPC-H SF10: every
+   answer right, but 46.6 s against one node's 23.1 s. The runners talk over the public internet
+   (17–54 ms, 51–150 MB/s): queries that move little take what one node does, and the 12 that
+   shuffle 936 MB pay about 15 ms per MB. Planning queries costs what it did
+   (`logs/round18/query-latency.txt`).
 
 **Round 17 made it install anywhere** (ADR-018):
 

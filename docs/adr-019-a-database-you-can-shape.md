@@ -194,6 +194,7 @@ One 2-vCPU box (`logs/round18/`).
 | The rest of the suite, local disk (`harness.py all`, users ×2, failover ×3, race, isolate, spread, latency, open formats, as-of, skew, shuffle spill, stream, freshness, crash at 9 M events, smoke) | all pass: users 86.8–88.2 k events/s, 0 inconsistent reads; failovers 4.4–5.0 s, state == view == model; event → view row on another node 6 ms p50 |
 | The R2 simulator (before `ATTACH` and the partition cap; `schemas` and `race` again on real R2 after) | schemas, race, clients, windows, failover and users with replicated acks, crash (3 × 45 k events, 0 lost or duplicated), Flight: all pass |
 | The portable binary | 97.0 MB (32.8 MB gzip), glibc 2.17 at most |
+| The owner's cluster bench on this round's code: 3 GitHub runners (4 vCPUs each), TPC-H SF10 | every answer equal to one node's, all 22 queries spread; a node hit the new-lake race and restarted once, as designed. One node 23.1 s, three 46.6 s. The runners' network: 17–54 ms round trips, 51–150 MB/s through Tailscale over the public internet. Queries moving under 1 MB: 9.8 s on one node, 10.7 s on three; the 12 that shuffle (936 MB): 13.3 s against 36.0 s (`logs/round18/cluster-bench-3-nodes.json`) |
 
 ## What this costs
 
@@ -216,4 +217,7 @@ One 2-vCPU box (`logs/round18/`).
   views' rows with the catalog they have, so the boundary isn't one commit. Until then, create
   the view before the data, or `CREATE TABLE … AS` for the rows so far.
 - **`ALTER … RENAME`**, `ALTER SCHEMA`, grants per schema, and `search_path`.
-- **Speed across machines.** The fixes wait for the measurements of a run that completes.
+- **Speed across machines.** The run that completed says where the time goes: on this network,
+  about 0.7 s plus 15 ms for each MB a query moves. A cluster should spread a query only when
+  that costs less than the work it shares out, and scale-out needs measuring where machines
+  share a data centre.

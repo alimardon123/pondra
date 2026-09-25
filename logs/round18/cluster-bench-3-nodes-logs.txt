@@ -1,0 +1,12 @@
+== node 0
+17:39:34 pondra follower (term 1) serving s3://<bucket>/bench-36166870463 on 100.111.218.57:8080
+17:47:16 restarting to rejoin the cluster: the leader stopped answering (and no peer hears it): the next term was claimed
+17:47:20 pondra leader (term 2) serving s3://<bucket>/bench-36166870463 on 100.111.218.57:8080
+== node 1
+17:39:31 restarting to rejoin the cluster: the lake has no catalog yet: its leader is still making it
+17:39:32 pondra follower (term 1) serving s3://<bucket>/bench-36166870463 on 100.117.195.79:8080
+== node 2
+17:39:33 pondra leader (term 1) serving s3://<bucket>/bench-36166870463 on 100.76.98.19:8080
+17:41:20 slow tiering: 0 rows in 19.393857572s (tables 144.721µs, publish 200.657µs, merges 19.393413699s, expire 98.435µs)
+17:41:42 slow tiering: 0 rows in 21.730265589s (tables 178.165µs, publish 302.016µs, merges 21.729693877s, expire 91.471µs)
+17:42:51 slow tiering: 0 rows in 35.61485081s (tables 690.996µs, publish 710.444µs, merges 35.044391004s, expire 569.058296ms)

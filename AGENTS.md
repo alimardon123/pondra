@@ -518,11 +518,19 @@ their clone, runs `git pull <bundle> main` and `git push`; GitHub then builds it
 Windows and macOS (`.github/workflows/build.yml`).
 
 **The cluster bench so far (round 18).** The owner has run `cluster-bench.yml` on GitHub's
-runners three times: one node (TPC-H 18.6 s in all); three nodes (every answer right, all 22
-queries spread, but 33.2 s); three nodes again, with the network measured (commit 1092999),
-which lost a node at start to the follower-before-catalog race (invariant 52, fixed in round
-18) and wrote no `results.json`. Next: the same run with round 18's code, then read
-`wire_mb`, `wait_s` and `network` in its results before changing how queries spread.
+4-vCPU runners, TPC-H SF10 (60 M lineitems), four times: one node (18.6 s in all); three nodes
+(every answer right, all 22 queries spread, but 33.2 s); three nodes again, which lost a node at
+start to the follower-before-catalog race (invariant 52, fixed); and three nodes on round 18's
+code (`logs/round18/cluster-bench-3-nodes.json`): every answer right, the race hit and handled
+(a node restarted once), one node 23.1 s, three nodes 46.6 s. The runners reach each other over
+the public internet through Tailscale: 17–54 ms round trips, 51–150 MB/s. The ten queries that
+move under 1 MB between nodes take about what one node does (9.8 s against 10.7 s); the twelve
+that shuffle move 936 MB and take 36.0 s against 13.3 s: about 0.7 s plus 15 ms per MB (about
+68 MB/s). So on this network a shuffle costs more than it saves, and even picking the faster way
+per query would give 22.4 s against one node's 23.1 s. Next: spread a query only when the bytes
+it would move, at the network's measured speed, cost less than the work it shares out (so a
+cluster is never slower than one node), then measure scale-out where machines share a data
+centre (the owner's Google Cloud trial: one zone, well under 1 ms, 1–2 GB/s).
 
 **Where the multi-machine run will happen (the owner's plan, 2026-09-23).** The owner has no VMs
 of their own. They will run the multi-machine tests themselves, later, on one of:
