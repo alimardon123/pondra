@@ -1,11 +1,47 @@
 # Pondra: a streamhouse in one binary
 
-One Rust binary (~12,100 lines) that ingests streams, stores them as a lakehouse (Parquet files
+One Rust binary (~13,200 lines) that ingests streams, stores them as a lakehouse (Parquet files
 plus a catalog, on object storage; Delta Lake and Iceberg metadata for other engines on request),
 keeps SQL views and streaming state up to date, answers SQL, and scales out by starting more
 copies of itself on the same bucket. Object storage is the only state: no Postgres, no
 ZooKeeper, no Kafka, no JVM. Runs on a local directory or any S3-compatible store (S3,
 Cloudflare R2, MinIO).
+
+## Install
+
+```bash
+pip install pondra          # the binary for this machine, and the Python client
+npm install pondra          # the same binary, and a JavaScript client
+```
+
+The Linux binary asks for nothing newer than glibc 2.17, so it runs on any Linux from 2014 on —
+tested on CentOS 7 and Ubuntu 22.04, the base of most cloud notebooks. macOS, Windows and ARM
+Linux get their own builds from the release workflow. Until the first release is published (`.github/workflows/release.yml`, on a version tag),
+build the packages from a binary: `python3 tools/package.py --bin <pondra> --platform linux-x64
+--npm-main --out dist`, then `pip install dist/pondra-*.whl`.
+
+```bash
+pondra                      # a SQL shell on ./lake (or: pondra my-lake, pondra s3://bucket/lake)
+```
+
+```python
+import pondra
+db = pondra.local("lake")   # a node on ./lake, in the background; it stops when Python does
+db.sql("CREATE TABLE events (user VARCHAR, amount BIGINT)")
+db.append("events", [{"user": "ann", "amount": 5}])
+db.sql("SELECT user, sum(amount) AS total FROM events GROUP BY user").to_pandas()
+```
+
+```js
+import { local } from "pondra";
+const db = await local("lake");
+await db.sql("SELECT 42 AS answer");
+```
+
+`examples/quickstart.ipynb` is the same in a notebook: tables, a view that keeps itself current,
+new rows as they commit, and a point-in-time join. The shell and `local()` start a node with
+`--stop-with-stdin`: it stops when the shell or program that started it exits — or is killed —
+and hands the lake on at once, so the next one opens it straight away.
 
 ## Run it
 
@@ -117,16 +153,22 @@ folder and the bucket use the same layout: see `docs/lake-format.md`.
 
 ## Windows, macOS, Linux
 
-The code is portable Rust; nothing in it is Linux-specific. Three ways to run it on Windows:
+The code is portable Rust; nothing in it is Linux-specific. `.github/workflows/release.yml`
+builds Linux (x86-64 and ARM, glibc 2.17), macOS (Intel and Apple) and Windows binaries, packages
+each for pip and npm, and tries each package on its own platform before publishing. On Windows:
 
-- **WSL2** (what I'd test with first): `wsl --install`, then `cargo build --release` and run the
-  Linux binary as above. This is the combination the tests were run on.
+- **`pip install pondra` or `npm install pondra`** once a release is out; until then, the
+  `pondra-windows-x64` artifact of a `release` run started by hand holds the wheel and the `.exe`.
+- **WSL2:** `wsl --install`, then the Linux package or binary as above. This is the combination
+  the tests were run on.
 - **Native build:** install [rustup](https://rustup.rs) and the Visual Studio Build Tools (C++),
-  then `cargo build --release` → `target\release\pondra.exe`. Untested so far; the one Unix-only
-  piece (restart-in-place after a leader change) has a Windows path that spawns the replacement
-  process instead.
-- **From CI:** `.github/workflows/build.yml` builds Linux, Windows and macOS binaries on every
-  push; download `pondra-windows-x86_64.exe` from the run's artifacts.
+  then `cargo build --release` → `target\release\pondra.exe`. Not yet tried on a real Windows
+  machine; the one Unix-only piece (restart-in-place after a leader change) has a Windows path
+  that spawns the replacement process instead.
+
+The Linux binary is portable because it is built with `cargo zigbuild --profile dist --target
+x86_64-unknown-linux-gnu.2.17`: it asks for nothing newer than glibc 2.17, the floor Python's
+own manylinux2014 wheels use.
 
 Paths on Windows work either way, but `--dir s3://bucket/lake` (R2, S3, MinIO) avoids local-path
 differences entirely.
@@ -139,7 +181,8 @@ differences entirely.
 | Tables | SQL `CREATE TABLE t (id BIGINT PRIMARY KEY, …) WITH (publish = 'delta,iceberg', cluster_by = 'user', partition_by = 'day(ts)', merge = 'total:sum', ttl = 'ts:86400')`, or `POST /tables/{t}` with the same as JSON. A key = upsert table; `merge` = merge table; `cluster_by` sorts an append table's files for fast filters; `partition_by` (a column, or year/month/day/hour of a timestamp) keeps one partition per file; `ttl` expires a keyed table's rows. Every file's column ranges are kept, and past 128 files a table's file list goes into manifests: a table of a million files commits as fast as one of ten, and queries open only the files their filters can match | Delta/Iceberg MERGE, partitioning, liquid clustering, Fluss PK tables with TTL |
 | SQL writes | `INSERT … SELECT/VALUES`, `UPDATE … SET … WHERE`, `DELETE … WHERE` (keyed tables) on any node, over Postgres, or with `pondra sql` on any machine | Spark SQL DML, Fluss 1.0's UPDATE/DELETE by condition |
 | Postgres protocol | `--pg`: psql, psycopg 2/3, asyncpg, SQLAlchemy + pandas (tested); JDBC/BI tools by the same protocol | a Postgres-compatible serving layer |
-| Python | `import pondra`: `sql()` → pandas / Polars / Arrow, `append()` exactly-once, `watch()`, `lookup()` | PySpark / PyFlink clients for the common jobs |
+| Python and JavaScript | `pip install pondra` / `npm install pondra`: `local()` starts a node here, `connect()` reaches one; `sql()` → pandas / Polars / Arrow, `append()` exactly-once, `view()`, `watch()`, `lookup()` | PySpark / PyFlink clients for the common jobs |
+| A shell | `pondra` or `pondra <lake>`: SQL typed or piped in, answers as tables, DuckDB-style | the DuckDB / psql prompt |
 | Kafka | `--kafka`: producers write to tables (a topic is a table; JSON values; `_key`/`_timestamp`/`_value` columns; idempotent producers exactly-once; gzip/snappy/lz4/zstd), Debezium change events and tombstones become upserts and deletes; consumers and consumer groups read the log (offsets = `_ord`); SASL/PLAIN with the tokens. Tested: librdkafka (confluent-kafka), kafka-python | Kafka / Fluss ingest, Debezium sinks |
 | Schema evolution | `ALTER TABLE t ADD COLUMN c TYPE` (any node, Postgres, `pondra sql`); old rows read it as null; Delta and Iceberg follow | Delta/Iceberg schema evolution |
 | Event-time windows | `POST /views/{v}?window=w&size_secs=60&lateness_secs=10` over `GROUP BY date_bin(…, ts) AS w`: the view updates live; `{v}_final` gets each window once, final, when the watermark — the newest `ts` in the stream less the lateness — passes its end | Flink tumbling windows with bounded out-of-orderness watermarks |
@@ -196,6 +239,8 @@ differences entirely.
 | `auth.rs` | Read / write / admin tokens, over HTTP, Postgres and MCP |
 | `mcp.rs` | MCP for AI agents: JSON-RPC over HTTP, four tools |
 | `kafka.rs` | The Kafka protocol: produce (record batches → rows, exactly-once), fetch, offsets, consumer groups, SASL/PLAIN |
+| `fsum.rs` | `sum` over DOUBLE that gives the same answer in any order: each addition's rounding error is carried in a second double and added back at the end |
+| `shell.rs` | `pondra [lake]`: a SQL shell, with a node on the lake in the background |
 | `server.rs`, `main.rs` | HTTP API (axum) and CLI |
 
 **Producer contract:** each producer has its own name, sends batches in order with increasing
@@ -213,6 +258,9 @@ python3 tools/harness.py windows | sessions | asof   # event-time windows and se
 python3 tools/asof_check.py                     # ASOF JOIN == DuckDB's, every direction, on one node and three
 python3 tools/stream_check.py                   # one stream, window + session + as-of views: every click once; clicks/s, emission delay
 python3 tools/harness.py scale | flight         # partitions, manifests, shuffles, memory limits; Arrow Flight + ADBC
+python3 tools/harness.py sums                   # sum(DOUBLE) == math.fsum, in any order, on every node
+python3 tools/anywhere_check.py --bin <pondra> --dist dist [--docker]   # the shell, local(), the wheel, npm, the notebook; glibc 2.17 and Ubuntu 22.04
+python3 tools/bench/repeat.py --data <tpch> --query 15 --runs 20       # one TPC-H query many times, every answer against DuckDB's
 python3 tools/shuffle_spill.py                 # a shuffle bigger than memory, and one that loses a node
 python3 tools/spread_tpch.py --expect 22        # all 22 TPC-H queries on 3 nodes == one node (13 by key ranges)
 python3 tools/skew_check.py                     # a hot join key: same answers, work shared out over the nodes
@@ -256,6 +304,10 @@ bucket to its newest lakes.
 - Files written in key order split tables by ranges across nodes but aren't declared as sorted
   to DataFusion (it made TPC-H slower), so an aggregation on that key still hashes.
 - Clustering across files; copy-on-write DELETE for append tables.
+- The packages aren't published yet (the release workflow is ready; the names and the repository
+  are the owner's call), and the Windows and macOS builds haven't run on real machines.
+- Only `sum` over DOUBLE is order-independent; `avg`, `stddev` and friends over DOUBLE can still
+  differ in their last bits from run to run.
 - Per-table grants, quotas and TLS (tokens are per role; put a TLS proxy in front); JDBC and BI
   tools untested here.
 - Kafka: one partition per topic, no transactions; offsets are positions in the log (increasing,

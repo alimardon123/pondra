@@ -117,12 +117,31 @@ const RECENT_BYTES: usize = 64 << 20; // …within this much memory (past it, a 
 fn cache_mb() -> usize { std::env::var("PONDRA_CACHE_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(1024) }
 
 /// The local SSD tier for a lake on object storage (`serve --cache-dir/--cache-gb`, or env
-/// PONDRA_CACHE_DIR / PONDRA_CACHE_GB): default 20 GB under the temp dir. 0 GB turns it off.
+/// PONDRA_CACHE_DIR / PONDRA_CACHE_GB): under the temp dir, 20 GB, or a quarter of the free disk
+/// if that is less (a notebook's sandbox may have a few GB). 0 GB turns it off.
 fn disk_tier(url: &str, store: &Store) -> Option<Arc<crate::cache::Disk>> {
-    let gb: u64 = std::env::var("PONDRA_CACHE_GB").ok().and_then(|v| v.parse().ok()).unwrap_or(20);
     let dir = std::env::var("PONDRA_CACHE_DIR").map(std::path::PathBuf::from).unwrap_or_else(|_| std::env::temp_dir().join("pondra-cache"));
+    let bytes = match std::env::var("PONDRA_CACHE_GB").ok().and_then(|v| v.parse::<u64>().ok()) {
+        Some(gb) => gb << 30,
+        None => free_bytes(&dir).map_or(20 << 30, |free| (free / 4).min(20 << 30)),
+    };
     let dir = dir.join(url.trim_start_matches("s3://").replace(['/', ':', '\\'], "_")); // one folder per lake
-    (gb > 0).then(|| crate::cache::Disk::open(dir, gb << 30, store.clone()).ok()).flatten()
+    (bytes > 0).then(|| crate::cache::Disk::open(dir, bytes, store.clone()).ok()).flatten()
+}
+
+/// Free bytes on the disk that holds `dir` (or its nearest existing parent), where the platform says.
+fn free_bytes(dir: &std::path::Path) -> Option<u64> {
+    #[cfg(unix)]
+    {
+        let at = std::ffi::CString::new(dir.ancestors().find(|a| a.exists())?.as_os_str().as_encoded_bytes()).ok()?;
+        let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
+        (unsafe { libc::statvfs(at.as_ptr(), &mut s) } == 0).then(|| s.f_bavail as u64 * s.f_frsize as u64)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        None
+    }
 }
 
 pub struct Lake {
@@ -370,6 +389,7 @@ impl Lake {
         crate::files::register(&ctx, self.arc()); // files('…'), file_read(path)
         crate::ai::register(&ctx); // ai_complete, ai_embed, cosine_similarity, …
         crate::asof::register(&ctx); // (ASOF JOIN's marker)
+        crate::fsum::register(&ctx); // sum(DOUBLE): the same answer in any order
         ctx
     }
 

@@ -689,9 +689,12 @@ async fn fetch(app: &App, ver: i16, req: FetchReq) -> Result<Vec<u8>> {
             let meta: Option<TableMeta> = app.lake.cat.get(&table_key(name)).await?;
             let mut out = vec![];
             for &(index, offset, limit) in parts {
-                let (seg, end) = (offset >> 32, (visible + 1) << 32);
+                // An offset before the oldest segment still kept reads from that one: its rows went
+                // with retention, as Kafka's would. ("Out of range" made librdkafka retry an
+                // earliest offset it had cached from before those segments expired, in a loop.)
+                let (offset, end) = (offset.max(first << 32), (visible + 1) << 32);
                 let (error, records) = match &meta {
-                    Some(meta) if index == 0 && offset <= end && seg >= first => (0, read(app, name, meta, offset, visible, limit.min(budget)).await?),
+                    Some(meta) if index == 0 && offset <= end => (0, read(app, name, meta, offset, visible, limit.min(budget)).await?),
                     Some(_) if index == 0 => (OFFSET_OUT_OF_RANGE, vec![]),
                     _ => (UNKNOWN_TOPIC, vec![]),
                 };

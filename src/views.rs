@@ -66,6 +66,12 @@ fn open_key(name: &str) -> String { format!("w/{name}") }
 /// Register view `name` (leader only): its table gets the query's output columns; a GROUP BY
 /// query makes it a merge table keyed by the group columns.
 pub async fn create(lake: &Lake, name: &str, sql: &str, mut emit: Option<Emit>, sessions: Option<Sessions>) -> Result<()> {
+    if let Some(v) = lake.cat.get::<View>(&view_key(name)).await? {
+        let windows = |e: &Option<Emit>| e.as_ref().map(|e| (e.window.clone(), e.size_secs, e.lateness_secs));
+        let gaps = |s: &Option<Sessions>| s.as_ref().map(|s| (s.time.clone(), s.gap_secs, s.lateness_secs));
+        ensure!(v.sql == sql && windows(&v.emit) == windows(&emit) && gaps(&v.sessions) == gaps(&sessions), "view {name} already exists, with other SQL or options");
+        return Ok(()); // (asked again, the same: a notebook cell run twice)
+    }
     ensure!(lake.cat.get::<TableMeta>(&table_key(name)).await?.is_none(), "table {name} already exists");
     let source = first_table(sql)?;
     let src: TableMeta = lake.cat.get(&table_key(&source)).await?.with_context(|| format!("no table {source}"))?;

@@ -1,0 +1,12 @@
+{
+  "name": "pondra",
+  "version": "0.17.0",
+  "description": "Pondra, a streamhouse in one binary: the binary for your platform, and a JavaScript client (SQL, exactly-once appends, change feeds)",
+  "type": "module",
+  "main": "index.js",
+  "bin": { "pondra": "bin/pondra.js" },
+  "files": ["index.js", "bin/pondra.js", "README.md"],
+  "engines": { "node": ">=18" },
+  "license": "UNLICENSED",
+  "optionalDependencies": {}
+}

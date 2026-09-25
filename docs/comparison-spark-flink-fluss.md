@@ -19,6 +19,7 @@
 - `tools/freshness.py` (freshness, head to head), `tools/open_check.py` (outside readers)
 
 **Where the numbers come from:**
+- Installing (pip, npm, a glibc 2.17 binary), the shell, and `sum` over DOUBLE the same in any order: round 17.
 - Watermarks from event time, session windows and `ASOF JOIN` (against DuckDB's): round 16.
 - Tables split by a shared key's ranges, hot keys shared out, distinct values sketched: round 15.
 - Any query across the nodes (all 22 TPC-H queries, answers equal to one node's): round 14.
@@ -93,7 +94,7 @@ biggest open risk is scale-out, and only a multi-machine benchmark can retire it
 | Serving: new analytical queries on big data | 35–600 ms (single node) | | | — | ✓ sub-100 ms (claimed) |
 | Scale-out to 100s of machines | unproven: shuffles that spill to disk, retried steps and a node dropped mid-query since round 13, all 22 TPC-H queries across the nodes since round 14, tables split by key ranges and hot keys shared out since round 15 — tested on one box only | ✓ | ✓ | ✓ | ✓ |
 | Streaming semantics (event time, windows, CEP, huge state) | watermarks from event time; tumbling and session windows emitted once; `ASOF JOIN` (ad hoc, across nodes, in views); decomposable aggregates, SQL tasks — no timers, CEP or sliding windows | good | ✓ | storage only | — |
-| APIs & usability | SQL reads and writes over HTTP, the Postgres protocol and Arrow Flight SQL (ADBC, JDBC); Python client (pandas, Polars, Arrow) | ✓ SQL + DataFrames (Python/Scala/Java/R), notebooks | SQL + DataStream API | clients (Java, Rust, Python, C++); REST gateway; Postgres protocol planned | ✓ Databricks SQL |
+| APIs & usability | `pip install pondra` / `npm install pondra` (built and tried; not yet published), a SQL shell (`pondra`), `pondra.local()` in a notebook; SQL reads and writes over HTTP, the Postgres protocol and Arrow Flight SQL (ADBC, JDBC); Python and JavaScript clients (pandas, Polars, Arrow) | ✓ SQL + DataFrames (Python/Scala/Java/R), notebooks | SQL + DataStream API | clients (Java, Rust, Python, C++); REST gateway; Postgres protocol planned | ✓ Databricks SQL |
 | Batch SQL on one machine (TPC-H) | ✓ fastest of Pondra, DuckDB, Polars, Daft and Bodo from files, at SF1 and SF10 | | | — | — |
 | AI agents and vectors | ✓ MCP server built in; `ai_complete`/`ai_embed` against any OpenAI-compatible endpoint; your own functions on an Arrow Flight server; exact vector search in SQL | AI functions on Databricks only | `ML_PREDICT`, `VECTOR_SEARCH`; Flink Agents (0.2) | MCP and vector columns planned | ✓ Agent Bricks, Genie |
 | Unstructured and multimodal | ✓ files in the lake (`files('…')`, `file_read`), `BINARY` with hashing and base64, `VARIANT`, `Float32[]` vectors — published as Delta arrays and Iceberg lists | — | — | blob and variant types planned | ✓ Databricks file types, `ai_query` |
@@ -390,7 +391,7 @@ from third-party summit recaps; check them before relying on them.
 
 | | Pondra | Spark 4.2 | Flink 2.3 | Fluss |
 |---|---|---|---|---|
-| What you install | one binary, 93.0 MB (31.4 MB gzip, 17.6 MB xz) | 485 MB PySpark + a JVM | 353 MB PyFlink + a JVM | CoordinatorServer + TabletServers + ZooKeeper + a Flink tiering job, JVM |
+| What you install | one binary, 96.7 MB (33 MB compressed in its wheel), any Linux with glibc 2.17+ (round 17); `pip install pondra` or `npm install pondra` carries it | 485 MB PySpark + a JVM | 353 MB PyFlink + a JVM | CoordinatorServer + TabletServers + ZooKeeper + a Flink tiering job, JVM |
 | Start to first query | **0.02–0.07 s** | 4.1 s | 5.2–5.4 s | — |
 | Idle memory | **44–49 MB** | — | — | — |
 | Peak memory in these runs | **293–609 MB** (1.3 GB at 2.7 M events/s sustained) | 0.7–1.5 GB | 1.2–3.1 GB | — |

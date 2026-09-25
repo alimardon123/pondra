@@ -229,8 +229,13 @@ pub fn http() -> &'static reqwest::Client {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     CLIENT.get_or_init(|| {
         let token = std::env::var("PONDRA_TOKEN").or_else(|_| std::env::var("PONDRA_ADMIN_TOKEN")).ok();
-        let headers = token.iter().filter_map(|t| format!("Bearer {t}").parse().ok()).map(|v| (reqwest::header::AUTHORIZATION, v)).collect();
-        reqwest::Client::builder().default_headers(headers).build().expect("an HTTP client")
+        let headers: reqwest::header::HeaderMap = token.iter().filter_map(|t| format!("Bearer {t}").parse().ok()).map(|v| (reqwest::header::AUTHORIZATION, v)).collect();
+        let client = |b: reqwest::ClientBuilder| b.default_headers(headers.clone()).build();
+        client(reqwest::Client::builder()).unwrap_or_else(|e| {
+            // (a minimal container image with no CA certificates: nodes talk plain HTTP anyway)
+            eprintln!("HTTPS calls out will fail: {e} (install the ca-certificates package)");
+            client(reqwest::Client::builder().tls_certs_only([])).expect("an HTTP client")
+        })
     })
 }
 

@@ -1,0 +1,107 @@
+name: release
+
+# A tag vX.Y.Z (or a run started by hand): the binary for every platform, packaged for pip and
+# npm (`tools/package.py`), each package tried on its platform, then attached to a GitHub release
+# and published to PyPI and npm. Publishing needs, once: PyPI's "trusted publishing" set up for
+# this workflow (no token), and an NPM_TOKEN secret. A run started by hand publishes nothing
+# unless `publish` is ticked.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish to PyPI and npm"
+        type: boolean
+        default: false
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux: built against glibc 2.17 (zig), so it runs on any Linux from 2014 on.
+          - { platform: linux-x64, os: ubuntu-latest, target: x86_64-unknown-linux-gnu, zig: x86_64-unknown-linux-gnu.2.17 }
+          - { platform: linux-arm64, os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, zig: aarch64-unknown-linux-gnu.2.17 }
+          - { platform: macos-x64, os: macos-13, target: x86_64-apple-darwin }
+          - { platform: macos-arm64, os: macos-latest, target: aarch64-apple-darwin }
+          - { platform: windows-x64, os: windows-latest, target: x86_64-pc-windows-msvc, exe: .exe }
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Build
+        run: |
+          if [ -n "${{ matrix.zig }}" ]; then
+            pip install ziglang cargo-zigbuild
+            cargo zigbuild --profile dist --target ${{ matrix.zig }}
+          else
+            cargo build --profile dist --target ${{ matrix.target }}
+          fi
+      - name: Package
+        run: python tools/package.py --bin target/${{ matrix.target }}/dist/pondra${{ matrix.exe }} --platform ${{ matrix.platform }} --npm-main --out dist
+      - name: Try the wheel and the npm package here
+        run: |
+          python -m venv /tmp/venv && source /tmp/venv/bin/activate 2>/dev/null || source /tmp/venv/Scripts/activate
+          pip install dist/*.whl pyarrow
+          python tools/package_check.py
+          mkdir /tmp/npm && cd /tmp/npm && npm init -y > /dev/null
+          npm install "$GITHUB_WORKSPACE"/dist/pondra-${{ matrix.platform }}-*.tgz "$GITHUB_WORKSPACE"/dist/pondra-[0-9]*.tgz
+          cp "$GITHUB_WORKSPACE/tools/package_check.mjs" . && node package_check.mjs
+      - name: Try the Linux wheel on glibc 2.17 (CentOS 7) and on Ubuntu 22.04
+        if: matrix.platform == 'linux-x64'
+        run: |
+          docker run --rm -v "$PWD":/w -w /w quay.io/pypa/manylinux2014_x86_64 bash -c \
+            "/opt/python/cp311-cp311/bin/python -m pip install -q --only-binary=:all: dist/*.whl 'pyarrow<19' && /opt/python/cp311-cp311/bin/python tools/package_check.py"
+          docker run --rm -v "$PWD":/w -w /w ubuntu:22.04 bash -c \
+            "apt-get update -qq && apt-get install -y -qq python3-pip > /dev/null && pip install -q dist/*.whl pyarrow && python3 tools/package_check.py"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pondra-${{ matrix.platform }}
+          path: dist/*
+
+  publish:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # the GitHub release
+      id-token: write # PyPI trusted publishing, npm provenance
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - name: GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+      - run: mkdir pypi && mv dist/*.whl pypi/
+      - name: PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: pypi
+      - name: npm (the platform packages first, then `pondra`, which depends on them)
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          for p in dist/pondra-*-*.tgz; do npm publish "$p" --access public --provenance; done
+          npm publish dist/pondra-[0-9]*.tgz --access public --provenance

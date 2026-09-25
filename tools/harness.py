@@ -7,6 +7,7 @@
   harness.py fence               a second writer takes over; the first must stop, nothing lost
   harness.py reader              freshness as seen by a separate read-only node
   harness.py insert              bulk INSERT … SELECT, retried: applied exactly once
+  harness.py sums                sum(DOUBLE) == math.fsum, in any order, on every node
   harness.py load    --secs 30   throughput, ack latency, freshness, catalog commit latency
   harness.py all                 quick run of everything
 """
@@ -556,6 +557,17 @@ def kafka():
     tombstones = [json.loads(m.key) for m in msgs if m.value is None]
     offsets = [m.offset for m in msgs]
     checks["kafka-python consumer (upserts, deletes as tombstones)"] = len(msgs) == 8 and {"id": 2} in tombstones and {"id": 4} in tombstones and offsets == sorted(offsets)
+    # an offset from before the oldest segment kept (0 always is) reads from there, with no reset
+    # to fall back on: "out of range" once had librdkafka retrying a stale earliest offset forever
+    c = kp.KafkaConsumer(bootstrap_servers=f"127.0.0.1:{kport}", security_protocol="SASL_PLAINTEXT", sasl_mechanism="PLAIN", auto_offset_reset="none",
+                         sasl_plain_username="reader", sasl_plain_password="r-tok", group_id=None, enable_auto_commit=False, consumer_timeout_ms=3000)
+    c.assign([tp]); c.seek(tp, 0)
+    try:
+        early = len(list(c))
+    except Exception as e:
+        early = repr(e)
+    c.close()
+    checks["an offset before the oldest segment reads from there"] = early == 8
     cc = ck.Consumer({**sasl("reader", "r-tok"), "group.id": "pondra-test", "enable.auto.commit": False})
     cc.assign([ck.TopicPartition("events", 0, ck.OFFSET_BEGINNING)])
     count, deadline = 0, time.time() + 30
@@ -689,8 +701,10 @@ def windows():
     node = Node(lake, A.port, tier_secs=1).start()
     q = lambda s: sql(A.port, s)
     q("CREATE TABLE clicks (user VARCHAR, ts TIMESTAMP)")
-    call(A.port, "POST", "/views/per_minute?window=w&size_secs=60&lateness_secs=10",
-         b"SELECT date_bin(INTERVAL '1 minute', ts) AS w, user, count(*) AS n FROM clicks GROUP BY 1, 2")
+    per_minute = b"SELECT date_bin(INTERVAL '1 minute', ts) AS w, user, count(*) AS n FROM clicks GROUP BY 1, 2"
+    for _ in range(2):  # (asked twice, the same: the second changes nothing)
+        call(A.port, "POST", "/views/per_minute?window=w&size_secs=60&lateness_secs=10", per_minute)
+    other = [_raises(lambda o=o: call(A.port, "POST", f"/views/per_minute{o}", per_minute)) for o in ("", "?window=w&size_secs=30&lateness_secs=10")]
     base = 1_790_000_000 // 60 * 60
     iso = lambda s: datetime.datetime.fromtimestamp(s, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
     seq = 0
@@ -721,11 +735,12 @@ def windows():
         "a window closes when event time passes its end, not when the next one starts": first == [0, 1, 2, 3] and middle == [0, 1, 2, 3],
         "each window once, final, with rows up to the lateness out of order": minutes(final) == [0, 1, 2, 3, 4] and len(final) == 10 and all(r["n"] == want(r) for r in final),
         "late row: in the view, not re-emitted": view0 == [{"n": 21}],
+        "the same view asked for again changes nothing; with other options, it is refused": all(other),
     }
     ok = all(checks.values())
     print(json.dumps({"windows": checks, "ok": ok}, indent=1))
     if not ok:
-        print(first, middle, final, view0)
+        print(first, middle, final, view0, other)
         sys.exit(1)
     return "event-time windows: closed by the data's own time, each emitted once, final; rows out of order within the lateness count; late rows update the view only; a leader restart emits nothing twice"
 
@@ -829,6 +844,53 @@ def asof():
         print(derived, values, adhoc, postgres, refused)
         sys.exit(1)
     return "point-in-time joins: each streamed trade priced as of its own time, late ones too; ad hoc queries agree; non-as-of conditions refused"
+
+
+def sums():
+    """sum(DOUBLE) is the true sum rounded once, whatever order its rows are added in (`fsum.rs`):
+    equal to Python's math.fsum, grouped or not, over files and the log tail, on every node. With
+    DataFusion's own sum, [1e16, 1, -1e16] added up to 0, and TPC-H q15, which compares a sum with
+    the max of the same sums, found its row only some of the time."""
+    import math
+    lake = new_lake()
+    nodes = [Node(lake, A.port + i, tier_secs=0.25).start() for i in range(3)]
+    q = lambda s, p=A.port: sql(p, s)
+    q("CREATE TABLE m (k BIGINT, i BIGINT, v DOUBLE, d DECIMAL(12, 2))")
+    rnd, want, rows = random.Random(7), {}, []
+    for n in range(20_000):  # magnitudes 1e-3 to 1e12: a plain running sum depends on the order
+        k, v = n % 40, rnd.uniform(-1, 1) * 10 ** rnd.randint(-3, 12)
+        rows.append({"k": k, "i": n, "v": v, "d": f"{n % 1000}.25"})
+        want.setdefault(k, []).append(v)
+    for b in range(0, len(rows), 2_500):  # in batches: some become Parquet files, some stay in the log
+        call(A.port, "POST", f"/append/m?producer=p&seq={b + 1}", "".join(json.dumps(r) + "\n" for r in rows[b:b + 2_500]).encode())
+        time.sleep(0.2)
+    q("CREATE TABLE edge (k BIGINT, v DOUBLE)")
+    edge_rows = [(1, 1e16), (1, 1.0), (1, -1e16), (2, 1e308), (2, 1e308), (2, -1e308), (3, None)]
+    call(A.port, "POST", "/append/edge?producer=e&seq=1", "".join(json.dumps({"k": k, "v": v}) + "\n" for k, v in edge_rows).encode())
+    total = math.fsum(v for vs in want.values() for v in vs)
+    every = [(q("SELECT sum(v) AS s FROM m", n.port)[0]["s"], {r["k"]: r["s"] for r in q("SELECT k, sum(v) AS s FROM m GROUP BY k", n.port)})
+             for n in nodes for _ in range(3)]
+    over = {r["k"]: r["s"] for r in q("SELECT DISTINCT k, sum(v) OVER (PARTITION BY k) AS s FROM m")}
+    edge = {r["k"]: r.get("s") for r in q("SELECT k, sum(v) AS s FROM edge WHERE k = 1 OR k = 3 GROUP BY k")}
+    big = q("SELECT isnan(sum(v)) AS nan, sum(v) > CAST('1e307' AS DOUBLE) AS inf FROM edge WHERE k = 2")[0]
+    sliding = q("SELECT i, v, sum(v) OVER (ORDER BY i ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS s FROM m WHERE k = 0 ORDER BY i")
+    types = q("SELECT arrow_typeof(sum(i)) AS i, arrow_typeof(sum(d)) AS d, arrow_typeof(sum(v)) AS v, arrow_typeof(sum(DISTINCT v)) AS dv, "
+              "sum(v) FILTER (WHERE k = 3) AS f, sum(v) FILTER (WHERE k < 0) AS none FROM m")[0]
+    [n.kill() for n in nodes]
+    checks = {
+        "sum(DOUBLE) == math.fsum, whole and per group, on every node, every time": all(s == total and g == {k: math.fsum(vs) for k, vs in want.items()} for s, g in every),
+        "and in a window over each group": over == {k: math.fsum(vs) for k, vs in want.items()},
+        "[1e16, 1, -1e16] adds up to 1; all NULLs to NULL; overflow to infinity, not NaN": edge == {1: 1.0, 3: None} and big == {"nan": False, "inf": True},
+        "a sliding window takes values back out": all(math.isclose(r["s"], math.fsum(x["v"] for x in sliding[max(0, j - 2):j + 1]), rel_tol=1e-9, abs_tol=1e-6) for j, r in enumerate(sliding)),
+        "integers, decimals and DISTINCT keep DataFusion's sum; FILTER works": types["i"] == "Int64" and types["d"].startswith("Decimal128(22, 2)") and types["v"] == types["dv"] == "Float64"
+                                                                              and types["f"] == math.fsum(want[3]) and types.get("none") is None,
+    }
+    ok = all(checks.values())
+    print(json.dumps({"sums": checks, "ok": ok}, indent=1))
+    if not ok:
+        print(total, every[0][0], edge, big, types)
+        sys.exit(1)
+    return "sum(DOUBLE): the true sum rounded once in any order (== math.fsum), grouped, windowed, on every node; NULLs, overflow, sliding windows and other types as before"
 
 
 def scale():
@@ -1195,7 +1257,7 @@ def load():
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    out = {t.__name__: t() for t in (upsert, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, asof, scale, flight, reader, crash)}
+    out = {t.__name__: t() for t in (upsert, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, asof, sums, scale, flight, reader, crash)}
     A.secs = min(A.secs, 20)
     out["load"] = load()
     print(json.dumps(out, indent=1))
@@ -1203,7 +1265,7 @@ def all_tests():
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "tiering", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "asof", "scale", "flight", "load", "all"])
+    ap.add_argument("mode", choices=["crash", "upsert", "tiering", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "asof", "sums", "scale", "flight", "load", "all"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -1214,4 +1276,4 @@ if __name__ == "__main__":
     ap.add_argument("--secs", type=int, default=30)
     ap.add_argument("--flush-ms", type=int, default=250)
     A = ap.parse_args()
-    {"crash": crash, "upsert": upsert, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "asof": asof, "scale": scale, "flight": flight, "load": load, "all": all_tests}[A.mode]()
+    {"crash": crash, "upsert": upsert, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "asof": asof, "sums": sums, "scale": scale, "flight": flight, "load": load, "all": all_tests}[A.mode]()

@@ -1,7 +1,7 @@
 # AGENTS.md — working on Pondra
 
 Read this first, then `README.md` (what it does), `docs/adr-005-every-node-writes.md` (why it
-works this way) and `docs/adr-017-streams-on-their-own-time.md` (the current round).
+works this way) and `docs/adr-018-install-anywhere.md` (the current round).
 `docs/prototype-status.md` has the measured numbers and what's left.
 
 ## What this is
@@ -18,14 +18,16 @@ The owner's design principles, which every change must respect:
 2. **As serverless as possible**: no always-on services besides the nodes themselves.
 3. **SPMD, not driver/executor** (Bodo-style): every node runs the same code on its slice.
 4. **No JVM, no Spark, no Flink, no Fluss needed.**
-5. **Short, simple, readable code** — without losing functionality. ~12,800 lines of Rust total (the Kafka protocol is 1,300 of them).
+5. **Short, simple, readable code** — without losing functionality. ~13,200 lines of Rust total (the Kafka protocol is 1,300 of them).
    If a change makes a file much longer, look for the simpler shape first.
 
 ## Layout
 
 ```
-src/      12,800 lines of Rust, one file per concern (see the table in README.md)
-python/   the Python client (pure Python, HTTP + Arrow)
+src/      13,200 lines of Rust, one file per concern (see the table in README.md)
+python/   the Python client (pure Python, HTTP + Arrow; `local()` starts a node)
+js/       the JavaScript client and the `pondra` npm package's files
+examples/ quickstart.ipynb (pip install to an as-of join, in the owner's notebook style)
 tools/    harness.py, cluster.py (tests), open_check.py (Delta + Iceberg readers == Pondra),
           keyed_bench.py (compaction cost), clean_bucket.py (keep a bucket to its newest lakes),
           kafka_bench.py (Kafka clients: throughput, latency), mcp_client.py (the MCP SDK),
@@ -43,7 +45,9 @@ tools/    harness.py, cluster.py (tests), open_check.py (Delta + Iceberg readers
           sessions and an as-of view over one stream: every click once; rates and delays),
           cloud/ (a cluster on several machines; cloud/actions/ + .github/workflows/: on GitHub runners),
           bench/tpch-queries/ (the 22 TPC-H queries),
-          r2_test.sh (run the suite against a real bucket), bench/ (vs Spark and Flink)
+          r2_test.sh (run the suite against a real bucket), bench/ (vs Spark and Flink),
+          package.py (wheels and npm packages from a binary), anywhere_check.py (the shell, local(),
+          the packages, the notebook; old Linux in docker), bench/repeat.py (one query many times)
 docs/     ADRs and reports; lake-format.md is the on-disk layout
 ```
 
@@ -165,6 +169,16 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
   every node.
 - **Arrow Flight / Flight SQL** (`flight.rs`, `--flight`): ADBC/JDBC statements and ingest,
   pyarrow `DoPut` exactly-once, `DoGet` SQL or a table's log as a columnar stream.
+- **Installed anywhere** (round 17, ADR-018). The Linux release binary is built for glibc 2.17
+  (`cargo zigbuild --profile dist --target x86_64-unknown-linux-gnu.2.17`). `tools/package.py`
+  puts a binary in a wheel (as a script, like maturin's bin wheels) and in npm packages
+  (esbuild's pattern: `pondra` + optional `pondra-<platform>`). `pondra [lake]` with no command
+  is a SQL shell (`shell.rs`) over a node it starts; Python's and JavaScript's `local()` start
+  one too. All three start it with `--stop-with-stdin`: the node stops, and a leader gives up its
+  term, when its standard input closes.
+- **`sum` over DOUBLE is order-independent** (`fsum.rs`): it replaces DataFusion's `sum` in every
+  session; Float64 sums carry a second double with the rounding errors (state: two columns),
+  other types go to DataFusion's.
 - **Memory:** one spill pool per node (`--memory-gb`); a query out of memory runs again with
   sort-merge joins. **`GET /metrics`** (Prometheus) for everything else.
 
@@ -353,6 +367,20 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    a query reads from files are views, the table holds plain ones. `with_schema` refused them, and
    a view that took a string from a table it joins failed every flush (`harness.py asof`'s
    `venue`).
+46. **A node started by another program lives as long as its standard input** (`--stop-with-stdin`).
+   Whatever spawns one (the shell, `local()` in Python and JavaScript) keeps the pipe open for
+   the node's life and stops it by closing the pipe, never by killing it first: closing lets a
+   leader release its term, so the next process on the lake leads at once. A parent killed
+   outright closes the pipe too. `anywhere_check.py`'s "second shell starts at once" and "the
+   lake reopens at once… for writes" fail when a node is killed instead.
+47. **Float sums keep their error term everywhere** (`fsum.rs`). A sum of DOUBLEs is a pair (sum,
+   error) in every state: partial aggregates, what crosses the nodes, windows. An operator that
+   added partial sums as plain doubles would bring back order-dependent answers (TPC-H q15's
+   `= max(...)`); `harness.py sums` compares with `math.fsum` on every node.
+48. **The Linux release binary needs nothing newer than glibc 2.17.** A dependency that links a
+   newer glibc symbol stops the wheel from installing on older systems.
+   `anywhere_check.py --docker` runs the binary on CentOS 7 and Ubuntu 22.04; check `objdump -T
+   <pondra> | grep -o 'GLIBC_[0-9.]*' | sort -V | tail -1` after adding one.
 
 ## Tests: run these before and after any change
 
@@ -372,6 +400,9 @@ python3 tools/harness.py alter                 # ALTER TABLE ADD COLUMN under lo
 python3 tools/harness.py windows               # event-time windows closed by the data's time, emitted once, late rows, a leader restart
 python3 tools/harness.py sessions              # session windows emitted once, whole; late rows; a leader restart
 python3 tools/harness.py asof                  # ASOF JOIN over a stream (a view), ad hoc, over Postgres; refusals
+python3 tools/harness.py sums                  # sum(DOUBLE) == math.fsum, whole, grouped, windowed, on every node
+python3 tools/anywhere_check.py --bin <pondra> --dist dist [--docker]   # shell, local(), kill -9, wheel, npm, notebook; glibc 2.17 + Ubuntu 22.04
+python3 tools/bench/repeat.py --data ~/tpch/sf1-bench --query 15 --runs 20 [--hot]   # one query many times vs DuckDB
 python3 tools/asof_check.py                    # ASOF JOIN == DuckDB's: 4 directions and more, one node and 3, 4 ways of planning
 python3 tools/stream_check.py                  # one stream, window + session + as-of views: every click once; clicks/s; emission delay
 python3 tools/harness.py scale                 # partitions, manifests, 29 spread query shapes (joins of every kind, subqueries, CTEs, key ranges) == one node, memory limits
@@ -432,12 +463,13 @@ Practical notes for an agent working here:
 - Node stderr goes to `/tmp/pondra-<port>-<id>.stderr`; that's where "restarting to rejoin",
   "slow tiering" and panics show up.
 
-## State of the work (2026-09-26, round 16)
+## State of the work (2026-09-27, round 17)
 
 Everything in `docs/prototype-status.md` passes on local disk and on simulated R2. The round-11
 additions (manifests, partitions, shuffles, memory limits, Arrow Flight) also ran against real
 R2; round 12's are in `logs/round12/`, round 13's in `logs/round13/`, round 14's in
-`logs/round14/`, round 15's in `logs/round15/` and round 16's in `logs/round16/`.
+`logs/round14/`, round 15's in `logs/round15/`, round 16's in `logs/round16/` and round 17's in
+`logs/round17/`.
 
 **R2 test buckets.** There are two:
 
@@ -458,8 +490,8 @@ tests themselves, later, on one of:
   unlimited, while the binary stays in R2 and the source stays private. Jobs last at most 6 hours;
   runners have 14 GB of disk (SF10 fits, SF100 doesn't) and are shared, so compare shapes (1 → 3 →
   6 nodes), not headline numbers. `.github/workflows/cluster-bench.yml` and `tools/cloud/actions/`
-  are the workflow; `bench-bin/pondra` in `ponderabucket-us` holds the round-16 dist binary
-  (Linux x86-64, glibc 2.39) for its `binary: r2` input. Rebuild and re-upload it when the code
+  are the workflow; `bench-bin/pondra` in `ponderabucket-us` holds the round-17 portable binary
+  (Linux x86-64, glibc 2.17) for its `binary: r2` input. Rebuild and re-upload it when the code
   changes, and read results from `bench-results/<run id>/results.json`.
 - **A Google Cloud VM trial** ($300 for 90 days, no charge unless they upgrade) for dedicated
   machines, SF100 and Spark on the same VMs, with `tools/cloud/cluster.sh`.
@@ -472,6 +504,12 @@ links a session to their computer, an agent can drive VMs from there instead.
 
 Headline numbers, all on one 2-vCPU box:
 
+- **Installs anywhere** (round 17, ADR-018): a glibc 2.17 binary (CentOS 7, Ubuntu 22.04), a
+  wheel and npm packages built by `tools/package.py` and tried in fresh environments (not yet
+  published), `pondra` as a shell (a session in 0.14–0.44 s), `pondra.local()` in a notebook,
+  and a node that stops, handing the lake on, when whoever started it dies (the lake reopens for
+  writes 0.2 s after `kill -9`). `sum(DOUBLE)` gives the same answer in any order (TPC-H q15: 0
+  of 20 runs wrong, 8 of 20 before).
 - **Any query across the nodes:** all 22 TPC-H queries run on 3 nodes, each answer equal to one
   node's, the same every run, with small tables whole or every table sliced (ADR-015). 13 of them
   run by key ranges, `orders` and `lineitem` meeting on the order key without a shuffle: 4.81 s
@@ -526,10 +564,7 @@ Known limits, in the order they matter:
    tables and sort buffers; Parquet decoding and the batches in flight are not counted, so the
    query budget defaults to a third of RAM and the hot columns watch the process's own memory.
 7. **Kafka's edges:** one partition per topic, no transactions, sparse offsets, consumer groups
-   in the leader's memory. A consumer told the earliest offset just before those segments expired
-   gets "out of range" from `fetch`, and librdkafka retries its cached earliest until it
-   refreshes: `harness.py kafka`'s group check timed out on it once in round 16 (passed on
-   re-runs). Serving an offset before the first segment from the first one would end it.
+   in the leader's memory.
 8. **Streaming:** one watermark per source (not per partition or node), held by a quiet source;
    no sliding windows, timers or CEP; an as-of join in a view joins what the table has when the
    event arrives (Flink's temporal join waits for the table's watermark); keyed tables keep only
@@ -537,24 +572,27 @@ Known limits, in the order they matter:
 9. **Security:** tokens per role only; no TLS (use a proxy), no per-table grants or quotas.
 10. **`VARIANT` is JSON text**, not a shredded variant; `ai_*` and Flight functions call out of
     the process, so their latency is the endpoint's.
+11. **Packages built, not published.** PyPI and npm names and the repository's visibility are
+    the owner's call; the macOS, Windows and ARM Linux builds exist only in the release
+    workflow, which hasn't run yet. Only `sum` over DOUBLE is order-independent (not `avg`,
+    `stddev`, …).
 
-Good next moves, in order. The plan table in the comparison doc has the evidence each should
-produce.
+Good next moves: `docs/roadmap.md` (2026-09-25, with round 17's progress) is the plan, with the
+reasons. Round 17 (install anywhere) is done except what needs the owner: publishing the
+packages, and Windows on a real machine (the release workflow's first run does both). In short:
 
-1. **A multi-machine run**: read the owner's `bench-results/<run>/results.json` from the bucket
-   if there is one; otherwise help them start `cluster-bench.yml` or `tools/cloud/`: the query
-   suite at 1, 3 and 6 nodes, ingest over Flight and Kafka, TPC-H SF100 against Spark.
-2. **Ranges declared, not only found**: keep `cluster_by` tables in order across files so they
-   split by key too; a `LIMIT` inside a subquery across the nodes (each node's top rows, then the
-   top of those); both sides of a join with a hot key on both.
-3. **Where DataFusion gains from a known order** (streaming aggregation, merge joins), declared
-   there only: declaring it everywhere made TPC-H slower in round 15.
-4. **Kafka partitions** (key-hashed slices of a table) and transactions.
-5. **Streaming, next:** Nexmark against Flink (PyFlink needs reinstalling: `venv-flink` is gone),
-   as-of joins in views that wait for the table's watermark, sliding windows, a side table for late
-   rows.
-6. **An approximate vector index**, and merging files inside sealed manifests (cold compaction).
-7. **TLS, per-table grants, an audit log, quotas.**
+1. **Publish:** once the owner reserves `pondra` on PyPI and npm and picks the repository's
+   visibility, tag `v0.17.0` and let `.github/workflows/release.yml` build, try and publish.
+2. **Round 18, proof at scale:** TPC-H SF10 on 1, 3 and 6 separate machines (GitHub runners),
+   Nexmark against Flink, DataFusion's sqllogictest files run through Pondra.
+3. **Round 19:** a web console at `/`, live queries (`/live?sql=`), dbt and BI tools.
+4. **Round 20:** a `pondra-core` library and an in-process Python module.
+5. **Round 21:** TLS, per-table grants, an audit log; random-query checks against DuckDB.
+6. **Round 22:** a read-only browser Pondra (DataFusion in WebAssembly over published lake
+   snapshots), after checking whether DuckDB-WASM can already read the published Parquet.
+
+The owner decides whether the repo goes public (or a public bench repo holds only the
+workflow), whether to link their Windows laptop, and the package names on PyPI, npm and crates.io.
 
 ## Conventions
 

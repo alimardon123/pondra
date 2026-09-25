@@ -7,11 +7,13 @@ mod cache;
 mod delta;
 mod files;
 mod flight;
+mod fsum;
 mod hot;
 mod iceberg;
 mod inbox;
 mod kafka;
 mod serve;
+mod shell;
 mod cluster;
 mod log;
 mod manifest;
@@ -41,7 +43,17 @@ static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc; // returns freed memory t
 use datafusion::arrow::util::pretty::pretty_format_batches;
 use std::{future::Future, sync::Arc, time::Duration};
 
+/// Pondra: a streamhouse in one binary. With no command, a SQL shell on a lake.
 #[derive(Parser)]
+#[command(version, args_conflicts_with_subcommands = true)]
+struct Cli {
+    #[command(subcommand)]
+    cmd: Option<Cmd>,
+    /// With no command: the lake the SQL shell opens (a folder or s3://bucket/prefix; default ./lake).
+    lake: Option<String>,
+}
+
+#[derive(clap::Subcommand)]
 enum Cmd {
     /// Run a node. Nodes started on the same lake form a cluster: the first leads (ingest,
     /// tiering, commits), the rest follow (SQL, task shards, writes forwarded to the leader) and
@@ -87,9 +99,10 @@ enum Cmd {
         /// (default: <temp dir>/pondra-cache).
         #[arg(long)]
         cache_dir: Option<String>,
-        /// Size of that SSD tier in GB (0 turns it off).
-        #[arg(long, default_value_t = 20)]
-        cache_gb: u64,
+        /// Size of that SSD tier in GB (0 turns it off; default: 20, or a quarter of the free
+        /// disk if that is less).
+        #[arg(long)]
+        cache_gb: Option<u64>,
         /// When a write is acknowledged. `durable`: once it is in the bucket (one object-store
         /// write: a millisecond on local disk, 100s of ms on S3 or R2). `replicated`: once
         /// `--replicas` nodes hold it — the leader in memory, followers on local disk — which
@@ -139,6 +152,10 @@ enum Cmd {
         /// one bucket this way.
         #[arg(long)]
         attach: Vec<String>,
+        /// Stop, as on Ctrl-C, when standard input closes: when the program that started this
+        /// node ends, however it ends (`pondra.local()` in Python and JavaScript, the shell).
+        #[arg(long)]
+        stop_with_stdin: bool,
     },
     /// Print catalog entries whose keys start with `prefix` (t/ tables, s/ segments, p/ producers…).
     Catalog {
@@ -160,27 +177,38 @@ enum Cmd {
     },
 }
 
-/// Ctrl-C, or SIGTERM (how schedulers and `kill` stop a process).
-async fn stopped() {
+/// Ctrl-C, SIGTERM (how schedulers and `kill` stop a process), or with `stdin`, standard input
+/// closing (on every OS alike, and even when the program that started this one was killed).
+async fn stopped(stdin: bool) {
+    let closed = async move {
+        match stdin {
+            true => drop(tokio::task::spawn_blocking(|| std::io::copy(&mut std::io::stdin(), &mut std::io::sink())).await),
+            false => std::future::pending().await,
+        }
+    };
     #[cfg(unix)]
     {
         let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("signal handler");
-        tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = term.recv() => {} }
+        tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = term.recv() => {}, _ = closed => {} }
     }
     #[cfg(not(unix))]
-    let _ = tokio::signal::ctrl_c().await;
+    tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = closed => {} }
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    match Cmd::parse() {
-        Cmd::Serve { dir, addr, reader, flush_ms, tier_secs, task_ms, memory_gb, retain_secs, changelog_secs, backlog, cache_dir, cache_gb, ack, replicas, fsync, publish, pg, kafka, kafka_advertise, flight, read_token, write_token, admin_token, attach: attached } => {
+    let cli = Cli::parse();
+    let Some(cmd) = cli.cmd else { return shell::run(&cli.lake.unwrap_or_else(|| "lake".into())).await };
+    match cmd {
+        Cmd::Serve { dir, addr, reader, flush_ms, tier_secs, task_ms, memory_gb, retain_secs, changelog_secs, backlog, cache_dir, cache_gb, ack, replicas, fsync, publish, pg, kafka, kafka_advertise, flight, read_token, write_token, admin_token, attach: attached, stop_with_stdin } => {
             let env = |flag: Option<String>, var: &str| flag.or_else(|| std::env::var(var).ok()).filter(|t| !t.is_empty());
             let auth = Arc::new(auth::Auth::new(env(read_token, "PONDRA_READ_TOKEN"), env(write_token, "PONDRA_WRITE_TOKEN"), env(admin_token.clone(), "PONDRA_ADMIN_TOKEN")));
             if let Some(t) = env(admin_token, "PONDRA_ADMIN_TOKEN") {
                 std::env::set_var("PONDRA_ADMIN_TOKEN", t); // (nodes call each other with it: cluster::http)
             }
-            std::env::set_var("PONDRA_CACHE_GB", cache_gb.to_string()); // read by Lake::open
+            if let Some(gb) = cache_gb {
+                std::env::set_var("PONDRA_CACHE_GB", gb.to_string()); // read by Lake::open
+            }
             if let Some(gb) = memory_gb {
                 std::env::set_var("PONDRA_MEMORY_GB", gb.to_string()); // read by Lake::open
             }
@@ -199,15 +227,18 @@ async fn main() -> anyhow::Result<()> {
                 let (s, n) = (store.clone(), cluster.leader.n);
                 cluster::mark_alive(&s, n).await?;
                 every(Duration::from_secs(10), move || { let s = s.clone(); async move { cluster::mark_alive(&s, n).await } });
-                // Stopped (Ctrl-C, or SIGTERM from a scheduler scaling down): the next node leads at
-                // once instead of waiting out the lease. Acknowledged writes are already durable.
-                let s = store.clone();
-                tokio::spawn(async move {
-                    stopped().await;
-                    cluster::release(&s, n).await;
-                    std::process::exit(0);
-                });
             }
+            // Stopped (Ctrl-C, SIGTERM from a scheduler scaling down, or the program that started
+            // this node ending): the next node leads at once instead of waiting out the lease.
+            // Acknowledged writes are already durable.
+            let (s, n) = (store.clone(), leader.then_some(cluster.leader.n));
+            tokio::spawn(async move {
+                stopped(stop_with_stdin).await;
+                if let Some(n) = n {
+                    cluster::release(&s, n).await;
+                }
+                std::process::exit(0);
+            });
             // Read-only nodes follow the leader's commit stream too (when a live one is there to ask),
             // so their reads are as fresh as a follower's instead of waiting for catalog polls.
             let streamed = !leader && !cluster.leader.addr.is_empty() && (!reader || cluster.leader_alive().await);
