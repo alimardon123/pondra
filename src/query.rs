@@ -357,32 +357,113 @@ pub fn read_only() -> datafusion::execution::context::SQLOptions {
     datafusion::execution::context::SQLOptions::new().with_allow_ddl(false).with_allow_dml(false).with_allow_statements(false)
 }
 
-/// A session with every table referenced in `sql` registered (cheap name filter), except
-/// `except`, which the caller registers itself. Attached lakes' tables are `name.table`.
+/// A table of this lake in a session: `t` in the default schema (`public`), `s.t` in schema `s`,
+/// exactly as named (SQL folds unquoted names to lower case; a name that isn't must be quoted).
+pub fn table_ref(name: &str) -> datafusion::common::TableReference {
+    match name.split_once('.') {
+        Some((s, t)) => datafusion::common::TableReference::partial(s.to_string(), t.to_string()),
+        None => datafusion::common::TableReference::bare(name.to_string()),
+    }
+}
+
+/// A session with every table and stored view `sql` names registered (a cheap word filter),
+/// except `except`, which the caller registers itself. A lake is a catalog of schemas (`ddl.rs`):
+/// this one is the default catalog, and also goes by its own name; each attached lake is a
+/// catalog by the name it was attached as, and — unless a schema here has that name — its
+/// `public` tables are also that schema's (`name.table`, from before schemas).
 pub async fn session(lake: &Lake, sql: &str, except: &str) -> Result<SessionContext> {
+    use crate::ddl::{mentions, split, PUBLIC};
+    use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider, MemorySchemaProvider};
     let ctx = lake.session();
     crate::udf::register(lake, &ctx).await?; // the lake's own functions (`POST /functions/…`)
     let listing = ["information_schema", "show tables", "show columns"].iter().any(|w| sql.to_lowercase().contains(w)); // (every table)
-    let attached = lake.attached.read().unwrap().clone();
-    for (ns, other) in [(String::new(), None)].into_iter().chain(attached.into_iter().map(|(n, l)| (n, Some(l)))) {
-        let from = other.as_deref().unwrap_or(lake);
-        if !ns.is_empty() {
-            if !listing && !sql.contains(&format!("{ns}.")) {
-                continue;
-            }
-            let schemas = ctx.catalog("datafusion").expect("the default catalog");
-            schemas.register_schema(&ns, Arc::new(datafusion::catalog::MemorySchemaProvider::new()))?;
-        }
-        for (key, meta) in from.cat.scan::<TableMeta>("t/", "t0").await? {
-            let name = &key[2..];
-            let full = if ns.is_empty() { name.to_string() } else { format!("{ns}.{name}") };
-            if (!listing && !sql.contains(full.as_str())) || (ns.is_empty() && name == except) {
-                continue;
-            }
-            ctx.register_table(full.as_str(), table_view(from, &ctx, name, &meta, None).await?)?;
+    let views = stored_views(lake, sql, listing).await?; // (their tables are wanted too)
+    let text = views.iter().fold(sql.to_string(), |t, (_, s)| format!("{t} {s}"));
+    let default = ctx.catalog(&crate::ddl::lake_name(lake)).expect("the lake's catalog"); // (`lake.schema.table`)
+    for s in crate::ddl::schemas(lake).await?.into_iter().filter(|s| s != PUBLIC) {
+        default.register_schema(&s, Arc::new(MemorySchemaProvider::new()))?;
+    }
+    for (key, meta) in lake.cat.scan::<TableMeta>("t/", "t0").await? {
+        let name = &key[2..];
+        if name != except && (listing || mentions(&text, name)) {
+            ctx.register_table(table_ref(name), table_view(lake, &ctx, name, &meta, None).await?)?;
         }
     }
+    let attached = lake.attached.read().unwrap().clone();
+    for (ns, other) in attached {
+        if !listing && !mentions(&text, &ns) {
+            continue;
+        }
+        let catalog = Arc::new(MemoryCatalogProvider::new());
+        for s in crate::ddl::schemas(&other).await? {
+            catalog.register_schema(&s, Arc::new(MemorySchemaProvider::new()))?;
+        }
+        let old = default.schema(&ns).is_none();
+        if old {
+            default.register_schema(&ns, Arc::new(MemorySchemaProvider::new()))?;
+        }
+        for (key, meta) in other.cat.scan::<TableMeta>("t/", "t0").await? {
+            let name = &key[2..];
+            if !(listing || mentions(&text, name)) {
+                continue;
+            }
+            let view = table_view(&other, &ctx, name, &meta, None).await?;
+            let (s, t) = split(name);
+            if old && s == PUBLIC {
+                default.schema(&ns).expect("registered").register_table(t.to_string(), view.clone())?;
+            }
+            catalog.schema(s).expect("registered").register_table(t.to_string(), view)?;
+        }
+        ctx.register_catalog(ns, catalog);
+    }
+    register_views(&ctx, views, !listing).await?; // (a listing shows what it can)
     Ok(ctx)
+}
+
+/// The stored views (`CREATE VIEW`) `sql` names, and the ones they name; every one for a listing.
+pub async fn stored_views(lake: &Lake, sql: &str, listing: bool) -> Result<Vec<(String, String)>> {
+    let (mut text, mut views) = (sql.to_string(), vec![]);
+    let stored = lake.cat.scan::<crate::ddl::StoredView>("q/", "q0").await?;
+    loop {
+        let more: Vec<(String, String)> = stored.iter().map(|(k, v)| (k[2..].to_string(), v.sql.clone()))
+            .filter(|(n, _)| !views.iter().any(|(m, _): &(String, String)| m == n) && (listing || crate::ddl::mentions(&text, n))).collect();
+        if more.is_empty() {
+            return Ok(views);
+        }
+        more.iter().for_each(|(_, s)| text.push_str(&format!(" {s}")));
+        views.extend(more);
+    }
+}
+
+/// Stored views over the tables `ctx` has now — again, if they are there already: a node's shares
+/// of its tables replace them (`spmd.rs`), and the views must read those. One view may use
+/// another: until none is left.
+pub async fn register_views(ctx: &SessionContext, mut views: Vec<(String, String)>, strict: bool) -> Result<()> {
+    let mut failed = None;
+    while !views.is_empty() {
+        let before = views.len();
+        let mut left = vec![];
+        for (name, sql) in views {
+            match ctx.sql(&crate::asof::rewrite(&sql)?).await {
+                Ok(df) => {
+                    ctx.deregister_table(table_ref(&name))?;
+                    ctx.register_table(table_ref(&name), Arc::new(datafusion::catalog::view::ViewTable::new(df.into_unoptimized_plan(), Some(sql))))?;
+                }
+                Err(e) => {
+                    failed = Some(anyhow::anyhow!("view {name}: {e}"));
+                    left.push((name, sql));
+                }
+            }
+        }
+        if left.len() == before {
+            match failed {
+                Some(e) if strict => return Err(e),
+                _ => break,
+            }
+        }
+        views = left;
+    }
+    Ok(())
 }
 
 /// Run `sql` with table `source` standing for just `rows` (new rows of a streaming source); every
@@ -399,7 +480,7 @@ pub async fn over(lake: &Lake, source: &str, rows: Vec<RecordBatch>, sql: &str) 
 pub async fn over_ctx(lake: &Lake, source: &str, s: SchemaRef, rows: Vec<RecordBatch>, sql: &str) -> Result<SessionContext> {
     let ctx = session(lake, sql, source).await?;
     let rows = rows.iter().map(|b| conform(b, &s)).collect::<Result<Vec<_>>>()?;
-    ctx.register_table(source, Arc::new(MemTable::try_new(s, vec![rows])?))?;
+    ctx.register_table(table_ref(source), Arc::new(MemTable::try_new(s, vec![rows])?))?;
     Ok(ctx)
 }
 
@@ -410,7 +491,7 @@ pub fn first_table(sql: &str) -> Result<String> {
     fn first(q: &Query) -> Option<String> {
         let SetExpr::Select(s) = q.body.as_ref() else { return None };
         match &s.from.first()?.relation {
-            TableFactor::Table { name, .. } => Some(name.to_string().trim_matches('"').to_string()),
+            TableFactor::Table { name, .. } => Some(crate::write::object(name)),
             TableFactor::Derived { subquery, .. } => first(subquery),
             _ => None,
         }

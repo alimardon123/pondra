@@ -1,6 +1,6 @@
 [package]
 name = "pondra"
-version = "0.17.0"
+version = "0.18.0"
 edition = "2021"
 description = "Pondra: a streamhouse in one binary"
 license-file = "LICENSE"
@@ -42,6 +42,7 @@ crc-fast = "1.10"
 # S3 / R2 / MinIO. SlateDB and our own I/O use object_store 0.14; DataFusion 55 reads through 0.13.
 object_store = { version = "0.14", features = ["aws"] }
 object_store_df = { package = "object_store", version = "0.13", default-features = false }
+sysinfo = { version = "0.35", default-features = false, features = ["system"] } # (RAM and resident memory where there is no /proc: Windows, macOS; already built for SlateDB)
 
 
 [target.'cfg(unix)'.dependencies]

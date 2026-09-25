@@ -302,8 +302,10 @@ fn list_schema() -> String {
 
 /// The Iceberg REST catalog API over what Pondra publishes (read-only): engines attach a node
 /// by URL — PyIceberg, DuckDB, Spark, Trino, Snowflake — instead of pointing at metadata files.
-/// Namespace `default` is this lake; each attached lake is a namespace of its own. Tables appear
-/// once they publish Iceberg. Tokens work as elsewhere (`Authorization: Bearer …`, any role).
+/// Namespace `default` is this lake's `public` schema, and each other schema is a namespace of
+/// its own; an attached lake `l` is namespace `l` (its `public`), and `l.s` (`["l", "s"]`) for
+/// its others. Tables appear once they publish Iceberg. Tokens work as elsewhere
+/// (`Authorization: Bearer …`, any role).
 pub fn rest() -> axum::Router<crate::server::App> {
     use axum::routing::get;
     axum::Router::new()
@@ -320,37 +322,54 @@ fn missing(what: &str, kind: &str) -> (axum::http::StatusCode, axum::Json<Value>
     (axum::http::StatusCode::NOT_FOUND, axum::Json(json!({"error": {"message": format!("no {what}"), "type": kind, "code": 404}})))
 }
 
-/// This lake and the attached ones, by namespace.
-fn lakes(app: &crate::server::App) -> Vec<(String, std::sync::Arc<Lake>)> {
+/// Every namespace: its parts, its lake, and the schema in it.
+async fn spaces(app: &crate::server::App) -> Vec<(Vec<String>, std::sync::Arc<Lake>, String)> {
+    use crate::ddl::{schemas, PUBLIC};
     let attached = app.lake.attached.read().unwrap().clone();
-    [("default".to_string(), app.lake.clone())].into_iter().chain(attached).collect()
+    let mut out = vec![];
+    for (name, lake) in [(None, app.lake.clone())].into_iter().chain(attached.into_iter().map(|(n, l)| (Some(n), l))) {
+        for s in schemas(&lake).await.unwrap_or_default() {
+            let parts = match (&name, s == PUBLIC) {
+                (None, true) => vec!["default".to_string()],
+                (None, false) => vec![s.clone()],
+                (Some(n), true) => vec![n.clone()],
+                (Some(n), false) => vec![n.clone(), s.clone()],
+            };
+            out.push((parts, lake.clone(), s));
+        }
+    }
+    out
 }
 
-fn lake(app: &crate::server::App, ns: &str) -> Result<std::sync::Arc<Lake>, (axum::http::StatusCode, axum::Json<Value>)> {
-    lakes(app).into_iter().find(|(n, _)| n == ns).map(|(_, l)| l).ok_or_else(|| missing(&format!("namespace {ns}"), "NoSuchNamespaceException"))
+/// A namespace from the URL (its parts joined by 0x1F, as the REST spec has it).
+async fn space(app: &crate::server::App, ns: &str) -> Result<(Vec<String>, std::sync::Arc<Lake>, String), (axum::http::StatusCode, axum::Json<Value>)> {
+    let parts: Vec<&str> = ns.split('\u{1f}').collect();
+    spaces(app).await.into_iter().find(|(p, _, _)| *p == parts).ok_or_else(|| missing(&format!("namespace {}", parts.join(".")), "NoSuchNamespaceException"))
 }
 
 async fn namespaces(axum::extract::State(app): axum::extract::State<crate::server::App>) -> axum::Json<Value> {
-    axum::Json(json!({"namespaces": lakes(&app).into_iter().map(|(n, _)| [n]).collect::<Vec<_>>()}))
+    axum::Json(json!({"namespaces": spaces(&app).await.into_iter().map(|(p, _, _)| p).collect::<Vec<_>>()}))
 }
 
 async fn namespace(axum::extract::State(app): axum::extract::State<crate::server::App>, axum::extract::Path(ns): axum::extract::Path<String>) -> Reply {
-    lake(&app, &ns)?;
-    Ok(axum::Json(json!({"namespace": [ns], "properties": {}})))
+    let (parts, _, _) = space(&app, &ns).await?;
+    Ok(axum::Json(json!({"namespace": parts, "properties": {}})))
 }
 
 /// The tables with Iceberg metadata published.
 async fn tables(axum::extract::State(app): axum::extract::State<crate::server::App>, axum::extract::Path(ns): axum::extract::Path<String>) -> Reply {
-    let lake = lake(&app, &ns)?;
+    let (parts, lake, schema) = space(&app, &ns).await?;
     let published = lake.cat.scan::<Published>("i/", "i0").await.unwrap_or_default();
-    let ids: Vec<Value> = published.iter().filter(|(_, p)| p.version > 0).map(|(k, _)| json!({"namespace": [ns], "name": &k[2..]})).collect();
+    let ids: Vec<Value> = published.iter().filter(|(k, p)| p.version > 0 && crate::ddl::split(&k[2..]).0 == schema)
+        .map(|(k, _)| json!({"namespace": parts, "name": crate::ddl::split(&k[2..]).1})).collect();
     Ok(axum::Json(json!({"identifiers": ids})))
 }
 
 /// A table: its current metadata file, and what it says.
 async fn load(axum::extract::State(app): axum::extract::State<crate::server::App>, axum::extract::Path((ns, table)): axum::extract::Path<(String, String)>) -> Reply {
-    let lake = lake(&app, &ns)?;
-    let no_table = || missing(&format!("table {ns}.{table}"), "NoSuchTableException");
+    let (_, lake, schema) = space(&app, &ns).await?;
+    let no_table = || missing(&format!("table {}.{table}", ns.replace('\u{1f}', ".")), "NoSuchTableException");
+    let table = crate::ddl::join(&schema, &table);
     let st: Published = lake.cat.get(&format!("i/{table}")).await.ok().flatten().filter(|p: &Published| p.version > 0).ok_or_else(no_table)?;
     let path = format!("data/{table}/metadata/v{}.metadata.json", st.version);
     let metadata: Value = serde_json::from_slice(&lake.object(&path).await.map_err(|_| no_table())?).map_err(|_| no_table())?;

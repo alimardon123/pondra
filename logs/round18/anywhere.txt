@@ -1,0 +1,39 @@
+{
+ "binary": "/home/claude/pondra/target/x86_64-unknown-linux-gnu/dist/pondra",
+ "checks": {
+  "a piped shell writes and queries a lake": true,
+  "a second shell on the same lake starts at once (the first handed the lake on)": true,
+  "statements end at a ; outside strings and comments; errors don't end the session": true,
+  "pondra.local() starts a node, close() stops it": true,
+  "when Python is killed, its node stops too": true,
+  "the lake reopens at once after that, for writes too": true,
+  "with a proxy in the environment, the shell and pondra.local() reach their node directly": true,
+  "the wheel works in a fresh virtualenv": true,
+  "the npm packages work in a fresh project": true,
+  "the quick-start notebook runs, top to bottom, on the wheel": true
+ },
+ "details": {
+  "shell": {
+   "first_shell_s": 0.09,
+   "second_shell_s": 0.09,
+   "stderr": "Error: Schema error: No field named nope.: Schema error: No field named nope.: No field named nope.\n",
+   "third": "{\"rows\":2}\n+----+\n| n; |\n+----+\n| 5  |\n+----+\n+---+\n| m |\n+---+\n| 5 |\n+---+\n"
+  },
+  "python": {
+   "reopen_s": 0.26,
+   "stderr": ""
+  },
+  "proxy": {
+   "shell": "+----+\n| n  |\n+----+\n| 42 |\n+----+\n",
+   "python": "[{'n': 42}]\n"
+  },
+  "packages": {
+   "wheel": "pondra-0.18.0-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+   "pip": "\n[notice] A new release of pip is available: 24.0 -> 26.2.1\n[notice] To update, run: python -m pip install --upgrade pip\n",
+   "check": "pondra 0.18.0\nok: [{'v': 'a', 'n': 2}, {'v': 'b', 'n': 1}]\n",
+   "npm": "ok: [{\"v\":\"a\",\"n\":2},{\"v\":\"b\",\"n\":1}]\n",
+   "notebook": "ok: 10 cells\n[IPKernelApp] WARNING | Kernel is running over TCP without encryption. All communication (including code and outputs) is sent in plain text and is susceptible to eavesdropping. Use IPC transport or launch with kernel manager-provisioned CurveZMQ keys to enable transport encryption.\n"
+  }
+ },
+ "ok": true
+}

@@ -1,6 +1,6 @@
 [project]
 name = "pondra"
-version = "0.17.0"
+version = "0.18.0"
 description = "Pondra, a streamhouse in one binary: the binary, and a Python client (SQL into pandas/Polars/Arrow, exactly-once appends, change feeds)"
 requires-python = ">=3.9"
 classifiers = ["License :: Other/Proprietary License", "Private :: Do Not Upload"]  # (PyPI refuses it until a license is chosen)

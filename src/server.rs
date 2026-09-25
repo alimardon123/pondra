@@ -106,6 +106,7 @@ pub fn router(app: App) -> Router {
         .route("/tasks/{name}", post(create_task))
         .route("/functions/{name}", post(create_function).delete(drop_function))
         .route("/tier", post(tier_now))
+        .route("/cluster/ddl", post(ddl))
         .route_layer(middleware::from_fn_with_state(app.clone(), to_leader));
     Router::new()
         .merge(leader_only)
@@ -481,26 +482,19 @@ async fn create_task(State(app): State<App>, Path(name): Path<String>, body: Str
     Ok(Json(j!({"task": name})))
 }
 
-/// Body: the view's SQL, e.g. `SELECT user, sum(amount) AS total, count(*) AS n FROM events GROUP BY user`.
-#[derive(Deserialize)]
-struct ViewParams {
-    window: Option<String>,
-    size_secs: Option<u64>,
-    lateness_secs: Option<u64>,
-    session: Option<String>,
-    gap_secs: Option<u64>,
+/// `POST /views/{name}` with the view's SQL, e.g. `SELECT user, sum(amount) AS total, count(*) AS n
+/// FROM events GROUP BY user`; `?window=w&size_secs=60&lateness_secs=10` also emits each
+/// window of column `w` once, final, to `{name}_final`; `?session=ts&gap_secs=30&lateness_secs=5`
+/// makes it a session view (`views.rs`): `CREATE MATERIALIZED VIEW … WITH (…)` in SQL.
+async fn create_view(State(app): State<App>, Path(name): Path<String>, Query(options): Query<std::collections::BTreeMap<String, String>>, sql: String) -> Result<Json<Value>, E> {
+    let _guard = app.lock.lock().await;
+    Ok(Json(crate::ddl::apply(&app.lake, crate::ddl::Ddl::CreateMaterialized { name, sql, options }).await?))
 }
 
-/// `POST /views/{name}` with the SQL; `?window=w&size_secs=60&lateness_secs=10` also emits each
-/// window of column `w` once, final, to `{name}_final`; `?session=ts&gap_secs=30&lateness_secs=5`
-/// makes it a view of each key's sessions of event time `ts`, each emitted once (see `views.rs`).
-async fn create_view(State(app): State<App>, Path(name): Path<String>, Query(p): Query<ViewParams>, sql: String) -> Result<Json<Value>, E> {
+/// A `CREATE`/`DROP` of a schema, view or table that a follower's SQL asked for (`ddl.rs`).
+async fn ddl(State(app): State<App>, Json(d): Json<crate::ddl::Ddl>) -> Result<Json<Value>, E> {
     let _guard = app.lock.lock().await;
-    let lateness_secs = p.lateness_secs.unwrap_or(0);
-    let emit = p.window.map(|window| crate::views::Emit { window, size_secs: p.size_secs.unwrap_or(60), lateness_secs, time: None });
-    let sessions = p.session.map(|time| crate::views::Sessions { time, gap_secs: p.gap_secs.unwrap_or(1800), lateness_secs, keys: vec![] });
-    crate::views::create(&app.lake, &name, &sql, emit, sessions).await?;
-    Ok(Json(j!({"view": name})))
+    Ok(Json(crate::ddl::apply(&app.lake, d).await?))
 }
 
 /// `GET /lookup/{table}/{key}`: the current row of one key, for serving reads — same answer as
@@ -578,7 +572,7 @@ async fn sql(State(app): State<App>, Query(p): Query<SqlParams>, role: axum::Ext
     // Same query, same catalog version: same answer (unless it asks for the time or randomness).
     let q = query.to_lowercase();
     let volatile = ["now()", "random(", "current_", "uuid(", "explain"].iter().any(|f| q.contains(f));
-    let Some(version) = app.lake.cat.version().filter(|_| !volatile) else { return Ok(respond(run_sql(&app, &p, &query).await?)) };
+    let Some(version) = app.lake.version_for(&query).await.filter(|_| !volatile) else { return Ok(respond(run_sql(&app, &p, &query).await?)) };
     let key = format!("{format}|{}|{query}", p.spread.as_deref().unwrap_or(""));
     let stale = p.stale_ms.filter(|_| p.after.is_none()).map(Duration::from_millis); // (read-your-writes wins)
     if let Some(body) = app.results.get(&key, version, stale) {
@@ -593,7 +587,7 @@ async fn sql(State(app): State<App>, Query(p): Query<SqlParams>, role: axum::Ext
         return Ok(respond(body.clone()));
     }
     (slot.0, slot.1) = (flight.0.load(std::sync::atomic::Ordering::Relaxed), None);
-    let version = app.lake.cat.version(); // (read after `covers`: this run reads at least this)
+    let version = app.lake.version_for(&query).await; // (read after `covers`: this run reads at least this)
     let body = run_sql(&app, &p, &query).await?;
     if let Some(v) = version {
         app.results.put(key, v, body.clone());

@@ -19,6 +19,7 @@
 - `tools/freshness.py` (freshness, head to head), `tools/open_check.py` (outside readers)
 
 **Where the numbers come from:**
+- Schemas and `lake.schema.table`, DDL and views in SQL, Windows checked: round 18.
 - Installing (pip, npm, a glibc 2.17 binary), the shell, and `sum` over DOUBLE the same in any order: round 17.
 - Watermarks from event time, session windows and `ASOF JOIN` (against DuckDB's): round 16.
 - Tables split by a shared key's ranges, hot keys shared out, distinct values sketched: round 15.
@@ -95,7 +96,7 @@ biggest open risk is scale-out, and only a multi-machine benchmark can retire it
 | Scale-out to 100s of machines | unproven: shuffles that spill to disk, retried steps and a node dropped mid-query since round 13, all 22 TPC-H queries across the nodes since round 14, tables split by key ranges and hot keys shared out since round 15 — tested on one box only | ✓ | ✓ | ✓ | ✓ |
 | Streaming semantics (event time, windows, CEP, huge state) | watermarks from event time; tumbling and session windows emitted once; `ASOF JOIN` (ad hoc, across nodes, in views); decomposable aggregates, SQL tasks — no timers, CEP or sliding windows | good | ✓ | storage only | — |
 | APIs & usability | `pip install pondra` / `npm install pondra` (built and tried; not yet published), a SQL shell (`pondra`), `pondra.local()` in a notebook; SQL reads and writes over HTTP, the Postgres protocol and Arrow Flight SQL (ADBC, JDBC); Python and JavaScript clients (pandas, Polars, Arrow) | ✓ SQL + DataFrames (Python/Scala/Java/R), notebooks | SQL + DataStream API | clients (Java, Rust, Python, C++); REST gateway; Postgres protocol planned | ✓ Databricks SQL |
-| Batch SQL on one machine (TPC-H) | ✓ fastest of Pondra, DuckDB, Polars, Daft and Bodo from files, at SF1 and SF10 | | | — | — |
+| Batch SQL on one machine (TPC-H) | ✓ from files: fastest at SF10 (38.0 s; DuckDB 39.8, Polars 42.8); at SF1 level with Polars' streaming engine (3.19 s vs 3.18) and ahead of DuckDB, Daft and Bodo | | | — | — |
 | AI agents and vectors | ✓ MCP server built in; `ai_complete`/`ai_embed` against any OpenAI-compatible endpoint; your own functions on an Arrow Flight server; exact vector search in SQL | AI functions on Databricks only | `ML_PREDICT`, `VECTOR_SEARCH`; Flink Agents (0.2) | MCP and vector columns planned | ✓ Agent Bricks, Genie |
 | Unstructured and multimodal | ✓ files in the lake (`files('…')`, `file_read`), `BINARY` with hashing and base64, `VARIANT`, `Float32[]` vectors — published as Delta arrays and Iceberg lists | — | — | blob and variant types planned | ✓ Databricks file types, `ai_query` |
 | Connectors & ecosystem | Kafka protocol in and out (any Kafka client, Debezium), Postgres, HTTP; Delta + Iceberg out, Iceberg REST catalog | ✓ huge | ✓ huge | Flink/Spark connectors | ✓ Databricks |
@@ -131,7 +132,9 @@ one INSERT per table. `tools/bench/singlenode.py` runs all of it.
 | **Pondra**, hot columns (1.5 GB) | **1.96 s** | **35.9 s** |
 | DuckDB, native tables | 1.80 s | needs ~7 GB of temporary space beyond this machine's memory: no room |
 
-Pondra is the fastest of the five reading Parquet, at both scales, and the only one that also
+Reading Parquet, Pondra is the fastest of the five at SF10 and level with Polars' streaming engine at
+SF1 (3.19 s against 3.18 s: a tie, not a lead; round 17's build does SF1 from Parquet in 2.8–3.0 s,
+Polars not re-run). It is the only one that also
 ingests, serves and scales out. DuckDB stays ~9% ahead when both hold the data in memory at SF1;
 at SF10 it can't hold it here at all, while Pondra's cache takes what fits and gives it back when
 queries need the memory. Bodo's numbers are its own published code at this scale on two cores; its
@@ -410,6 +413,7 @@ In rough order: what closes the most ground per unit of work comes first.
 | **Streaming semantics** | Flink's core strength | Rounds 9–10: event-time tumbling windows (a GROUP BY `date_bin` view), updated incrementally, and emitted once, final, past a watermark with allowed lateness. Round 16: the watermark from the stream's own event time (newest less the lateness), session windows emitted once, whole, `ASOF JOIN` (0.18–0.32 s for 1 M × 200 k rows, DuckDB 0.24 s; the same answers). Next: as-of joins in views that wait for the table's watermark, sliding windows, late rows to a side table | Nexmark queries vs Flink |
 | **Kafka beyond one partition** | Kafka clients scale reads by partitions | Round 10: produce, consume, consumer groups, one partition per topic. Next: key-hashed partitions (each a slice of the table), transactions for Kafka Streams / Flink exactly-once sinks, the Java client verified | Kafka Connect and Flink's Kafka source against Pondra |
 | **Schema evolution** | Tables change; Fluss 1.0 lists it as a gap too | Round 10: `ALTER TABLE … ADD COLUMN` (old rows read null; Delta and Iceberg follow). Next: renames, defaults, type widening | ✓ adding a column under load (`harness.py alter`) |
+| **A database's SQL** | What Snowflake, Databricks SQL and Postgres users type first: schemas, three-part names, views, `DROP`, `CREATE TABLE … AS` | Round 18: a lake is a database of schemas (`lake.schema.table`; attached lakes are databases too), `CREATE`/`DROP SCHEMA`, `DROP TABLE`, CTAS, stored views and `CREATE MATERIALIZED VIEW` (the streaming view), listed over Postgres, Flight SQL, Iceberg REST and MCP. Next: `UPDATE`/`DELETE`/`MERGE` on every table with system columns (row id, commit time, version); materialized views filled from existing rows; renames | ✓ `harness.py schemas` |
 | **AI in SQL** | Flink `ML_PREDICT`, Snowflake Cortex AISQL, Databricks AI functions | `ai_complete()` / `embed()` against any OpenAI-compatible endpoint, batched per Arrow batch; an ANN index for vector columns | A RAG demo: embed on insert, nearest neighbours in SQL, answered through MCP |
 | **Governance** | Enterprise requirement | Round 9: read / write / admin tokens on HTTP, Postgres and MCP. Next: TLS, per-table grants, an audit log (the change feed of a system table), quotas | Multi-tenant test |
 | **APIs** | Usability for data teams | Round 9: Postgres protocol, Python client, MCP. Round 11: Arrow Flight SQL (ADBC tested: queries, writes, ingest, catalog) and plain Flight (15.7 M rows/s in, exactly-once; the log as a columnar stream). Next: JDBC / BI tools verified (DBeaver, Tableau, Power BI), Python UDFs over Arrow | Tableau / Power BI connect; notebook demo |

@@ -70,7 +70,7 @@ pip install ./python && python -c "import pondra; print(pondra.connect('http://1
 
 # Kafka producers and consumers (a topic is a table), and engines attaching the lake by URL:
 ./target/release/pondra serve --dir ./lake --kafka 0.0.0.0:9092   # bootstrap.servers=host:9092
-#   PyIceberg / DuckDB / Spark: an Iceberg REST catalog at http://host:8080 (namespace "default")
+#   PyIceberg / DuckDB / Spark: an Iceberg REST catalog at http://host:8080 (namespace "default" = schema public; one per schema)
 
 # Arrow Flight and Flight SQL: ADBC / JDBC drivers and pyarrow, Arrow in and out
 ./target/release/pondra serve --dir ./lake --flight 0.0.0.0:8815  # adbc_driver_flightsql.dbapi.connect("grpc://host:8815")
@@ -95,8 +95,8 @@ runs — the `pondra sql` INSERT itself, for a moment.
 - **A machine that can't reach the leader** (another network, another company) still writes:
   its request goes through the bucket (`inbox/`), and the leader records it within a second or so.
 - **Several clusters, one bucket:** each cluster leads its own lake and attaches the others
-  (`--attach sales=s3://my-bucket/sales`): it reads `sales.orders`, and its writes to it are
-  recorded by that lake's leader.
+  (`--attach sales=s3://my-bucket/sales`): it reads `sales.orders` (or `sales.eu.orders`, a
+  table of that lake's schema `eu`), and its writes to it are recorded by that lake's leader.
 
 Useful `serve` flags (give every node the same ones: any of them may lead):
 
@@ -125,7 +125,9 @@ Useful `serve` flags (give every node the same ones: any of them may lead):
   Postgres the user name picks the role (`reader`, `writer`, `admin`) and the password is its
   token. Whatever the token, SQL sent to a node never touches the node's own disk (no `COPY …
   TO`, no `CREATE EXTERNAL TABLE`); only `pondra sql` reads local files, on its own machine.
-- `--attach name=dir`: read (and write through its leader) another lake as `name.table`.
+- `--attach name=dir`: read (and write through its leader) another lake as a database of its
+  own: `name.table`, `name.schema.table`. This lake's own name is its folder's. In SQL, `ATTACH
+  'dir' AS name` does the same for every node of the cluster, kept in the lake.
 - `--changelog-secs 86400`: keep the log as a replayable change feed (`/watch/{t}?after=…`).
 - `--fsync` (with `--ack replicated`): followers flush each copy to disk before acknowledging.
 - `--cache-dir`, `--cache-gb 20`: the local SSD tier for lakes on object storage. 0 turns it off.
@@ -161,10 +163,14 @@ each for pip and npm, and tries each package on its own platform before publishi
   `pondra-windows-x64` artifact of a `release` run started by hand holds the wheel and the `.exe`.
 - **WSL2:** `wsl --install`, then the Linux package or binary as above. This is the combination
   the tests were run on.
+- **The build workflow's binary:** every push builds `pondra-windows-x86_64.exe` (an artifact of
+  the `build` run) and runs `tools/smoke.py` with it — the shell, SQL with a schema and a view,
+  and the node's memory figures — as it does on macOS and Linux. The owner has run it on Windows:
+  the shell, SQL and the HTTP API work.
 - **Native build:** install [rustup](https://rustup.rs) and the Visual Studio Build Tools (C++),
-  then `cargo build --release` → `target\release\pondra.exe`. Not yet tried on a real Windows
-  machine; the one Unix-only piece (restart-in-place after a leader change) has a Windows path
-  that spawns the replacement process instead.
+  then `cargo build --release` → `target\release\pondra.exe`. The one Unix-only piece
+  (restart-in-place after a leader change) has a Windows path that spawns the replacement process
+  instead.
 
 The Linux binary is portable because it is built with `cargo zigbuild --profile dist --target
 x86_64-unknown-linux-gnu.2.17`: it asks for nothing newer than glibc 2.17, the floor Python's
@@ -179,10 +185,12 @@ differences entirely.
 |---|---|---|
 | Stream ingest, exactly-once | `POST /append/{t}?producer=&seq=` with NDJSON or an Arrow IPC stream | Kafka / Fluss |
 | Tables | SQL `CREATE TABLE t (id BIGINT PRIMARY KEY, …) WITH (publish = 'delta,iceberg', cluster_by = 'user', partition_by = 'day(ts)', merge = 'total:sum', ttl = 'ts:86400')`, or `POST /tables/{t}` with the same as JSON. A key = upsert table; `merge` = merge table; `cluster_by` sorts an append table's files for fast filters; `partition_by` (a column, or year/month/day/hour of a timestamp) keeps one partition per file; `ttl` expires a keyed table's rows. Every file's column ranges are kept, and past 128 files a table's file list goes into manifests: a table of a million files commits as fast as one of ten, and queries open only the files their filters can match | Delta/Iceberg MERGE, partitioning, liquid clustering, Fluss PK tables with TTL |
+| Schemas and names | A lake is a database: `CREATE SCHEMA sales; CREATE TABLE sales.orders (…)`; a table is `t` (schema `public`), `schema.t` or `lake.schema.t`, and other lakes are databases too: `ATTACH 's3://bucket/sales' AS sales` (or `--attach`), then `sales.eu.orders` joined with this lake's tables, and `INSERT INTO sales.t …` through its leader; `DETACH sales`. `DROP TABLE`, `DROP SCHEMA … [CASCADE]`, `CREATE TABLE … AS SELECT`; a drop is refused while a view or task reads the table. Postgres, Flight SQL, the Iceberg REST catalog and MCP list the schemas | Postgres / Snowflake `database.schema.table` |
+| Views | `CREATE [OR REPLACE] VIEW v AS …`: a stored query, run over the tables as they are when read (spread over the nodes like any query); `CREATE MATERIALIZED VIEW v [WITH (window = 'w', size_secs = 60)] AS …`: the streaming view below, kept up to date with every flush of new rows (from its creation on) | SQL views, Databricks materialized views, Flink SQL jobs |
 | SQL writes | `INSERT … SELECT/VALUES`, `UPDATE … SET … WHERE`, `DELETE … WHERE` (keyed tables) on any node, over Postgres, or with `pondra sql` on any machine | Spark SQL DML, Fluss 1.0's UPDATE/DELETE by condition |
 | Postgres protocol | `--pg`: psql, psycopg 2/3, asyncpg, SQLAlchemy + pandas (tested); JDBC/BI tools by the same protocol | a Postgres-compatible serving layer |
 | Python and JavaScript | `pip install pondra` / `npm install pondra`: `local()` starts a node here, `connect()` reaches one; `sql()` → pandas / Polars / Arrow, `append()` exactly-once, `view()`, `watch()`, `lookup()` | PySpark / PyFlink clients for the common jobs |
-| A shell | `pondra` or `pondra <lake>`: SQL typed or piped in, answers as tables, DuckDB-style | the DuckDB / psql prompt |
+| A shell | `pondra` or `pondra <lake>`: SQL typed or piped in, answers as tables, `.tables`, `.databases`, DuckDB-style | the DuckDB / psql prompt |
 | Kafka | `--kafka`: producers write to tables (a topic is a table; JSON values; `_key`/`_timestamp`/`_value` columns; idempotent producers exactly-once; gzip/snappy/lz4/zstd), Debezium change events and tombstones become upserts and deletes; consumers and consumer groups read the log (offsets = `_ord`); SASL/PLAIN with the tokens. Tested: librdkafka (confluent-kafka), kafka-python | Kafka / Fluss ingest, Debezium sinks |
 | Schema evolution | `ALTER TABLE t ADD COLUMN c TYPE` (any node, Postgres, `pondra sql`); old rows read it as null; Delta and Iceberg follow | Delta/Iceberg schema evolution |
 | Event-time windows | `POST /views/{v}?window=w&size_secs=60&lateness_secs=10` over `GROUP BY date_bin(…, ts) AS w`: the view updates live; `{v}_final` gets each window once, final, when the watermark — the newest `ts` in the stream less the lateness — passes its end | Flink tumbling windows with bounded out-of-orderness watermarks |
@@ -196,7 +204,7 @@ differences entirely.
 | Semi-structured | `VARIANT` columns (JSON text): `json_get(col, 'a', 0)`, `json_get_str/int/float/bool`, `json_contains`, `json_length`, `->`, `->>` | VARIANT / JSON functions |
 | Models in SQL | `ai_complete(prompt [, model])` and `ai_embed(text [, model])` call an OpenAI-compatible endpoint (`PONDRA_AI_URL`: your own vLLM or Ollama, or a hosted one), eight rows in flight, a failed row null | Databricks `ai_query` / `ai_forecast`, Snowflake Cortex |
 | Your own functions | `POST /functions/{name}` `{"flight": "http://host:port", "args": ["Binary"], "returns": "Utf8"}`: an Arrow Flight server of yours gets the rows as one Arrow batch and returns one column, so a model, a GPU or any Python library runs in that process and not in the node (`tools/udf_server.py` is one in forty lines) | Python/Pandas UDFs, Databricks model serving, Daft UDFs |
-| Streaming SQL with no lag | `POST /views/{name}` with SQL. Runs on every flush of new rows, commits with them. With GROUP BY it keeps per-key aggregates (sum/count/min/max) that any number of nodes update at once | Flink SQL jobs + keyed state |
+| Streaming SQL with no lag | `CREATE MATERIALIZED VIEW name AS …`, or `POST /views/{name}` with the SQL. Runs on every flush of new rows, commits with them. With GROUP BY it keeps per-key aggregates (sum/count/min/max) that any number of nodes update at once | Flink SQL jobs + keyed state |
 | General stateful streaming | `POST /tasks/{name}` `{"source","target","sql"[, "key","shards","shard_by"]}`: runs as soon as rows commit, exactly-once, shards spread over nodes | Flink jobs |
 | Push and change feeds | `GET /watch/{t}`: new rows as NDJSON the moment they commit (upserts and deletes of keyed tables included); `?after=N` replays from N, as far back as `--changelog-secs` keeps the log | Kafka consumers, Fluss `$changelog` |
 | SQL | `POST /sql[?format=json\|table\|arrow][&after=<seg>][&stale_ms=N]`: files ∪ log tail, one snapshot. Large tables run SPMD across all nodes, with shuffles for many-group aggregations and big joins (`&spread=1` forces, `0` disables). Queries beyond `--memory-gb` spill. Repeated queries are answered from a result cache until the next commit (`stale_ms`: accept one up to N ms old) | Trino / Spark SQL / Databricks SQL |
@@ -233,7 +241,8 @@ differences entirely.
 | `cache.rs` | For lakes on object storage: an in-memory read cache and a local SSD tier (write-through, read-through, prefetched from the commit stream, warmed at start) |
 | `serve.rs` | Serving reads: key lookups without SQL (tail, then files newest-first, cached key-sorted row groups, binary search), and SQL point queries routed to them |
 | `delta.rs`, `iceberg.rs` | Open formats, per table: a Delta JSON commit / an Iceberg v2 snapshot (hand-written Avro manifests) per change to a table's files; crash-safe (derived from durable catalog state, put-if-absent); the Iceberg REST catalog |
-| `write.rs` | Writes in SQL from anywhere (CREATE TABLE, INSERT, UPDATE, DELETE): the work runs where the statement runs; the leader records it — over HTTP, through the bucket inbox, or the statement leads for a moment when nobody does. Attached lakes' writes go to their own leaders |
+| `ddl.rs` | Schemas and names (`lake.schema.table`, attached lakes), and the statements that shape a lake: `CREATE`/`DROP SCHEMA`, `DROP TABLE`, `CREATE VIEW` (stored), `CREATE MATERIALIZED VIEW`, `DROP VIEW` — carried out by the leader |
+| `write.rs` | Writes in SQL from anywhere (CREATE TABLE [AS], INSERT, UPDATE, DELETE, and the DDL of `ddl.rs`): the work runs where the statement runs; the leader records it — over HTTP, through the bucket inbox, or the statement leads for a moment when nobody does. Attached lakes' writes go to their own leaders |
 | `inbox.rs` | The bucket inbox: writers that can't reach the leader leave requests in the bucket; the leader answers them |
 | `pg.rs` | The Postgres wire protocol (queries and writes, text and binary results, typed `$1` parameters, a small `pg_catalog`) |
 | `auth.rs` | Read / write / admin tokens, over HTTP, Postgres and MCP |
@@ -259,6 +268,8 @@ python3 tools/asof_check.py                     # ASOF JOIN == DuckDB's, every d
 python3 tools/stream_check.py                   # one stream, window + session + as-of views: every click once; clicks/s, emission delay
 python3 tools/harness.py scale | flight         # partitions, manifests, shuffles, memory limits; Arrow Flight + ADBC
 python3 tools/harness.py sums                   # sum(DOUBLE) == math.fsum, in any order, on every node
+python3 tools/harness.py schemas                # lake.schema.table, attached lakes, CREATE/DROP SCHEMA/TABLE/VIEW, CTAS, views spread, clients list schemas
+python3 tools/smoke.py <pondra>                 # a first run on any OS (stdlib only): the shell, SQL, memory figures
 python3 tools/anywhere_check.py --bin <pondra> --dist dist [--docker]   # the shell, local(), the wheel, npm, the notebook; glibc 2.17 and Ubuntu 22.04
 python3 tools/bench/repeat.py --data <tpch> --query 15 --runs 20       # one TPC-H query many times, every answer against DuckDB's
 python3 tools/shuffle_spill.py                 # a shuffle bigger than memory, and one that loses a node
@@ -275,7 +286,7 @@ python3 tools/cluster.py users                  # 64 writers + 16 readers + serv
 python3 tools/cluster.py failover               # views + sharded task state; leader killed twice
 python3 tools/cluster.py latency [--load 4]     # event -> view row pushed to another node (add --flag ack=replicated)
 python3 tools/cluster.py spread                 # distributed queries == single-node results
-python3 tools/cluster.py race | isolate | split # elections, cut-off follower, where the CPU goes
+python3 tools/cluster.py race | isolate | split # elections (and a leader that dies before making the catalog), cut-off follower, where the CPU goes
 python3 tools/bench/run.py batch 20000000       # vs Spark and Flink (ENGINES=pondra,spark,flink)
 python3 tools/serve_bench.py --keys 2000000     # point lookups and dashboard queries, p50/p99/QPS (uses tools/loadgen.go if Go is installed)
 python3 tools/bench/tpch.py --data sf1          # TPC-H (tpchgen-cli) on Pondra, DuckDB and Spark
@@ -303,7 +314,12 @@ bucket to its newest lakes.
   shared by identical queries); what the nodes send does not.
 - Files written in key order split tables by ranges across nodes but aren't declared as sorted
   to DataFusion (it made TPC-H slower), so an aggregation on that key still hashes.
-- Clustering across files; copy-on-write DELETE for append tables.
+- `UPDATE`, `DELETE` and `MERGE` on append tables, and system columns (a row id, when a row was
+  written, its version): next round. `UPDATE`/`DELETE` work on keyed tables. Clustering across
+  files.
+- A write to two lakes is two commits, not one transaction.
+- A materialized view starts empty: it follows the rows written after it was created. `ALTER …
+  RENAME`, `search_path` and grants per schema.
 - The packages aren't published yet (the release workflow is ready; the names and the repository
   are the owner's call), and the Windows and macOS builds haven't run on real machines.
 - Only `sum` over DOUBLE is order-independent; `avg`, `stddev` and friends over DOUBLE can still

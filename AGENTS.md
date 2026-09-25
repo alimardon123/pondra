@@ -24,7 +24,7 @@ The owner's design principles, which every change must respect:
 ## Layout
 
 ```
-src/      13,200 lines of Rust, one file per concern (see the table in README.md)
+src/      13,700 lines of Rust, one file per concern (see the table in README.md)
 python/   the Python client (pure Python, HTTP + Arrow; `local()` starts a node)
 js/       the JavaScript client and the `pondra` npm package's files
 examples/ quickstart.ipynb (pip install to an as-of join, in the owner's notebook style)
@@ -381,6 +381,32 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    newer glibc symbol stops the wheel from installing on older systems.
    `anywhere_check.py --docker` runs the binary on CentOS 7 and Ubuntu 22.04; check `objdump -T
    <pondra> | grep -o 'GLIBC_[0-9.]*' | sort -V | tail -1` after adding one.
+49. **A table's name inside the lake is `schema.table`, and just `table` in `public`** (`ddl.rs`).
+   Everything keyed by a name (the catalog, the log, `data/…`, Delta, Iceberg, Kafka topics, the
+   HTTP API) takes that form; SQL names are resolved to it once (`ddl::resolve`, `ddl::local`),
+   unquoted parts lower-cased. A second form of the same table's name anywhere would make two
+   tables of one.
+50. **A new table starts at the log's end** (`create_table`: `tiered = lake.visible()`). A table's
+   log rows are those after `tiered`; starting at 0, a table re-created after `DROP TABLE` read
+   the dropped one's rows still in the log (`harness.py schemas`: "a new table of its name is
+   empty" fails without it).
+51. **A node plans stored views after its shares are in place** (`spmd::plan`:
+   `query::register_views` again). A `ViewTable` keeps the table it was planned over; planned
+   over whole tables, a spread query over a view counted every row once per node
+   (`harness.py schemas`: "queries over views spread" fails without it).
+52. **A follower that finds no catalog starts over** (`main.rs`: `cluster::restart`). A new lake's
+   leader may not have made it yet, or may have died first; the restart waits for the one or
+   takes over from the other when its mark is stale. Exiting instead lost a node of the R2
+   cluster bench (`cluster.py race`: "a leader that never made the catalog").
+53. **A node runs at most one partition per 24 MB of query memory** (`store::partitions`). Each
+   partition's sort keeps 10 MB aside to merge its spills; on 4 cores with 50 MB the reserves
+   took the budget and the merge above them failed, and smaller reserves can't merge at all
+   (`harness.py scale`'s memory check runs as `PONDRA_CORES=4` and fails without it; GitHub's
+   4-core runner found it).
+54. **A remembered answer is keyed by every lake it reads** (`Lake::version_for`): this lake's
+   catalog version and those of the attached lakes the query, or a view it reads, names. Keyed
+   by this lake's alone, a query over an attached lake kept its answer after a write there or a
+   `DETACH` (`harness.py schemas`' `ATTACH` check failed on one node without it).
 
 ## Tests: run these before and after any change
 
@@ -401,6 +427,8 @@ python3 tools/harness.py windows               # event-time windows closed by th
 python3 tools/harness.py sessions              # session windows emitted once, whole; late rows; a leader restart
 python3 tools/harness.py asof                  # ASOF JOIN over a stream (a view), ad hoc, over Postgres; refusals
 python3 tools/harness.py sums                  # sum(DOUBLE) == math.fsum, whole, grouped, windowed, on every node
+python3 tools/harness.py schemas               # schemas, three-part names, attached lakes, DDL, stored and materialized views, drops
+python3 tools/smoke.py target/release/pondra   # what CI runs on Windows, macOS and Linux (stdlib only)
 python3 tools/anywhere_check.py --bin <pondra> --dist dist [--docker]   # shell, local(), kill -9, wheel, npm, notebook; glibc 2.17 + Ubuntu 22.04
 python3 tools/bench/repeat.py --data ~/tpch/sf1-bench --query 15 --runs 20 [--hot]   # one query many times vs DuckDB
 python3 tools/asof_check.py                    # ASOF JOIN == DuckDB's: 4 directions and more, one node and 3, 4 ways of planning
@@ -463,13 +491,13 @@ Practical notes for an agent working here:
 - Node stderr goes to `/tmp/pondra-<port>-<id>.stderr`; that's where "restarting to rejoin",
   "slow tiering" and panics show up.
 
-## State of the work (2026-09-27, round 17)
+## State of the work (2026-09-28, round 18)
 
 Everything in `docs/prototype-status.md` passes on local disk and on simulated R2. The round-11
 additions (manifests, partitions, shuffles, memory limits, Arrow Flight) also ran against real
 R2; round 12's are in `logs/round12/`, round 13's in `logs/round13/`, round 14's in
-`logs/round14/`, round 15's in `logs/round15/`, round 16's in `logs/round16/` and round 17's in
-`logs/round17/`.
+`logs/round14/`, round 15's in `logs/round15/`, round 16's in `logs/round16/`, round 17's in `logs/round17/`
+and round 18's in `logs/round18/`.
 
 **R2 test buckets.** There are two:
 
@@ -488,6 +516,13 @@ put the owner's GitHub noreply address on the four commits that had their email;
 before then (in older bundles) differ. Each round the owner downloads the new bundle and, in
 their clone, runs `git pull <bundle> main` and `git push`; GitHub then builds it on Linux,
 Windows and macOS (`.github/workflows/build.yml`).
+
+**The cluster bench so far (round 18).** The owner has run `cluster-bench.yml` on GitHub's
+runners three times: one node (TPC-H 18.6 s in all); three nodes (every answer right, all 22
+queries spread, but 33.2 s); three nodes again, with the network measured (commit 1092999),
+which lost a node at start to the follower-before-catalog race (invariant 52, fixed in round
+18) and wrote no `results.json`. Next: the same run with round 18's code, then read
+`wire_mb`, `wait_s` and `network` in its results before changing how queries spread.
 
 **Where the multi-machine run will happen (the owner's plan, 2026-09-23).** The owner has no VMs
 of their own. They will run the multi-machine tests themselves, later, on one of:
@@ -512,6 +547,11 @@ links a session to their computer, an agent can drive VMs from there instead.
 
 Headline numbers, all on one 2-vCPU box:
 
+- **A database you can shape** (round 18, ADR-019): schemas and `lake.schema.table`, other lakes
+  attached in SQL (`ATTACH … AS …`) and queried and written across, `CREATE`/`DROP SCHEMA`, `DROP TABLE`, CTAS, stored views that spread over
+  the nodes, `CREATE MATERIALIZED VIEW`; the schemas listed over Postgres, Flight SQL, Iceberg
+  REST and MCP. Query planning costs what it did. Memory figures on Windows and macOS; a smoke
+  test on all three OSes in CI.
 - **Installs anywhere** (round 17, ADR-018): a glibc 2.17 binary (CentOS 7, Ubuntu 22.04), a
   wheel and npm packages built by `tools/package.py` and tried in fresh environments (not yet
   published), `pondra` as a shell (a session in 0.14–0.44 s), `pondra.local()` in a notebook,
@@ -585,19 +625,22 @@ Known limits, in the order they matter:
     workflow, which hasn't run yet. Only `sum` over DOUBLE is order-independent (not `avg`,
     `stddev`, …).
 
-Good next moves: `docs/roadmap.md` (2026-09-25, with round 17's progress) is the plan, with the
-reasons. Round 17 (install anywhere) is done except what needs the owner: publishing the
-packages, and Windows on a real machine (the release workflow's first run does both). In short:
+Good next moves: `docs/roadmap.md` (2026-09-28, after round 18) is the plan, with the reasons.
+Rounds 17 (install anywhere) and 18 (a database you can shape) are done except what needs the
+owner: publishing the packages, and a cluster-bench run that completes. In short:
 
-1. **Publish:** once the owner reserves `pondra` on PyPI and npm and picks the repository's
-   visibility, tag `v0.17.0` and let `.github/workflows/release.yml` build, try and publish.
-2. **Round 18, proof at scale:** TPC-H SF10 on 1, 3 and 6 separate machines (GitHub runners),
-   Nexmark against Flink, DataFusion's sqllogictest files run through Pondra.
-3. **Round 19:** a web console at `/`, live queries (`/live?sql=`), dbt and BI tools.
-4. **Round 20:** a `pondra-core` library and an in-process Python module.
-5. **Round 21:** TLS, per-table grants, an audit log; random-query checks against DuckDB.
-6. **Round 22:** a read-only browser Pondra (DataFusion in WebAssembly over published lake
-   snapshots), after checking whether DuckDB-WASM can already read the published Parquet.
+1. **Round 19, change any row (the owner's request):** `UPDATE`, `DELETE` and `MERGE` on append
+   tables too, with system columns — a row id assigned at commit (Iceberg v3's row lineage is
+   the model), the commit time, a version — and streaming following every change (views, the
+   change feed, Kafka consumers, Delta and Iceberg readers). Design first: an ADR before code.
+   Also: materialized views filled from the rows already there.
+2. **The cluster bench:** once the owner reruns `cluster-bench.yml` with 3 nodes on round 18's
+   code (`bench-bin/pondra` holds it), read `wire_mb`, `wait_s` and `network` in
+   `bench-results/<run id>/results.json` before changing how queries spread; then 6 nodes.
+3. **Publish:** once the owner reserves `pondra` on PyPI and npm and picks a license, tag
+   `v0.18.0` and let `.github/workflows/release.yml` build, try and publish.
+4. **Then:** proof at scale (TPC-H SF10 on 1/3/6 machines, Nexmark, sqllogictest), a web console
+   and live queries, the in-process module, TLS and grants, the browser (roadmap rounds 20–24).
 
 The owner decides whether the repo goes public (or a public bench repo holds only the
 workflow), whether to link their Windows laptop, and the package names on PyPI, npm and crates.io.

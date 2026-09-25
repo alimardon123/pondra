@@ -26,6 +26,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python tools/smoke.py ${{ matrix.bin }} # (on this OS: the shell, SQL, and memory read without /proc)
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.name }}
@@ -48,6 +52,6 @@ jobs:
           python-version: "3.11"
       - run: pip install -r tools/requirements.txt
       # The quick correctness suite (upserts, split brain, crashes, clients, Kafka, windows,
-      # sums, scale, Flight…), then a cluster losing its leader twice.
+      # sums, schemas, scale, Flight…), then a cluster losing its leader twice.
       - run: python3 tools/harness.py all
       - run: python3 tools/cluster.py failover --secs 30

@@ -1,0 +1,9 @@
+schemas exit=0 secs=36
+race exit=0 secs=41
+clients exit=0 secs=28
+windows exit=0 secs=19
+failover-replicated exit=0 secs=62
+users-replicated exit=0 secs=40
+crash exit=0 secs=2732
+flight exit=0 secs=10
+ALL-DONE

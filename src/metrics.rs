@@ -58,8 +58,7 @@ pub async fn render(app: &App) -> anyhow::Result<String> {
     let (hot, hot_max) = app.lake.hot.usage();
     metric("hot_bytes", "gauge", "decoded columns kept in memory (hot.rs)", &one(hot as f64));
     metric("hot_limit_bytes", "gauge", "the most the hot columns may hold (PONDRA_HOT_GB)", &one(hot_max as f64));
-    let rss = std::fs::read_to_string("/proc/self/statm").ok().and_then(|s| s.split_whitespace().nth(1)?.parse::<f64>().ok());
-    metric("resident_bytes", "gauge", "resident memory of the process", &one(rss.unwrap_or(0.0) * 4096.0));
+    metric("resident_bytes", "gauge", "resident memory of the process", &one(crate::store::resident().unwrap_or(0) as f64));
     if let Some(seq) = &app.seq {
         metric("untiered_rows", "gauge", "rows in the log waiting to become Parquet", &one(app.lake.backlog.load(Relaxed) as f64));
         let mut ms = seq.commit_ms.lock().unwrap().clone();

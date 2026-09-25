@@ -46,15 +46,16 @@ fn tools() -> Value {
     let sql = json!({"sql": {"type": "string"}});
     json!([
         {"name": "list_tables", "annotations": {"readOnlyHint": true}, "inputSchema": args(json!({}), &[]),
-         "description": "Every table (attached lakes' as name.table): its columns; its kind — append, upsert (a primary key: \
-             the newest row per key wins) or merge (rows per key combine, e.g. sum); and for views, the SQL they follow."},
+         "description": "Every table and view, as SQL names it (schema.table in a schema other than public; attached lakes' as lake.table or lake.schema.table): \
+             its columns; its kind — append, upsert (a primary key: the newest row per key wins), merge (rows per key combine, e.g. sum) \
+             or view (a stored query); and for views, their SQL."},
         {"name": "query", "annotations": {"readOnlyHint": true}, "inputSchema": args(sql.clone(), &["sql"]),
          "description": format!("Run one SQL query and get its rows as JSON (the first {ROWS}, and the total). \
              `WHERE key = …` on an upsert table is a fast point lookup. Vector search: ORDER BY cosine_distance(embedding, [0.1, …]) LIMIT k.")},
         {"name": "write", "annotations": {"readOnlyHint": false, "destructiveHint": true, "idempotentHint": true},
          "inputSchema": args(json!({"sql": {"type": "string"}, "job": {"type": "string", "description": "an id for this write: retried with the same id, it is applied once"}}), &["sql"]),
-         "description": "CREATE TABLE, INSERT, UPDATE or DELETE (UPDATE and DELETE on tables with a primary key). \
-             Committed and durable when this returns. Needs a write token; CREATE TABLE an admin token."},
+         "description": "INSERT, UPDATE or DELETE (UPDATE and DELETE on tables with a primary key); CREATE/DROP of a TABLE, VIEW, \
+             MATERIALIZED VIEW or SCHEMA. Committed and durable when this returns. Needs a write token; CREATE and DROP an admin token."},
         {"name": "changes", "annotations": {"readOnlyHint": true},
          "inputSchema": args(json!({"table": {"type": "string"}, "after": {"type": "integer", "description": "a position from an earlier call; 0 for as far back as kept; none for from now"}}), &["table"]),
          "description": format!("What was committed to a table after a position — every append, upsert and delete (`_deleted`) — \
@@ -95,6 +96,9 @@ async fn list(app: &App) -> Result<Value> {
             let view = views.iter().find(|(k, _)| &k[2..] == name).map(|(_, v)| v.sql.clone());
             tables.push(json!({"table": format!("{prefix}{name}"), "kind": kind, "key": m.key, "merge": m.merge, "columns": columns, "view": view}));
         }
+        for (key, v) in lake.cat.scan::<crate::ddl::StoredView>("q/", "q0").await? {
+            tables.push(json!({"table": format!("{prefix}{}", &key[2..]), "kind": "view", "view": v.sql})); // (CREATE VIEW: run when read)
+        }
     }
     Ok(json!({"tables": tables}))
 }
@@ -107,7 +111,7 @@ async fn query(app: &App, sql: &str) -> Result<Value> {
 }
 
 async fn write(app: &App, role: Role, sql: &str, job: Option<&str>) -> Result<Value> {
-    let stmt = crate::write::parse(sql).ok_or_else(|| anyhow!("not a write (CREATE TABLE, INSERT, UPDATE, DELETE): use the query tool"))?;
+    let stmt = crate::write::parse(sql).ok_or_else(|| anyhow!("not a write (INSERT, UPDATE, DELETE, CREATE or DROP): use the query tool"))?;
     app.auth.allows(role, &stmt)?;
     crate::write::on_node(app, stmt, job.map(String::from)).await
 }

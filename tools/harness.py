@@ -8,6 +8,7 @@
   harness.py reader              freshness as seen by a separate read-only node
   harness.py insert              bulk INSERT … SELECT, retried: applied exactly once
   harness.py sums                sum(DOUBLE) == math.fsum, in any order, on every node
+  harness.py schemas             lake.schema.table, attached lakes, CREATE/DROP SCHEMA/TABLE/VIEW, CTAS
   harness.py load    --secs 30   throughput, ack latency, freshness, catalog commit latency
   harness.py all                 quick run of everything
 """
@@ -893,6 +894,161 @@ def sums():
     return "sum(DOUBLE): the true sum rounded once in any order (== math.fsum), grouped, windowed, on every node; NULLs, overflow, sliding windows and other types as before"
 
 
+def schemas():
+    """A lake is a database (ADR-019): tables live in schemas — `public` unless one is named —
+    and other lakes attach as catalogs, so a table is `t`, `schema.t` or `lake.schema.t`.
+    CREATE/DROP SCHEMA, DROP TABLE, CREATE TABLE … AS, CREATE [OR REPLACE] VIEW (a stored query)
+    and CREATE MATERIALIZED VIEW in SQL, sent to any node (a follower hands them to the leader);
+    ATTACH 'dir' AS name and DETACH, kept in the lake for every node.
+    A query over a view spreads with the view's tables sliced too; a dropped table's rows never
+    come back with a new table of its name; names are checked; Postgres, Flight SQL and the Iceberg
+    REST catalog list the schemas."""
+    import psycopg, adbc_driver_flightsql.dbapi as adbc, pyarrow as pa
+    lake, other = new_lake(), new_lake()
+    b = Node(other, A.port + 5).start()
+    for s in ("CREATE TABLE sales (id BIGINT, amount DOUBLE)", "INSERT INTO sales VALUES (1, 10.0), (2, 20.0)",
+              "CREATE SCHEMA eu", "CREATE TABLE eu.sales (id BIGINT, amount DOUBLE)", "INSERT INTO eu.sales VALUES (1, 70.0)"):
+        sql(A.port + 5, s)
+    nodes = [Node(lake, A.port + i, attach=f"Other={other}", tier_secs=600, **({"pg": f"127.0.0.1:{A.port + 10}", "flight": f"127.0.0.1:{A.port + 30}"} if i == 0 else {})).start() for i in range(3)]
+    me = lake.rstrip("/").rsplit("/", 1)[-1].lower()  # (this lake's name: its folder's)
+    q = lambda s, i=0, spread=None: call(A.port + i, "POST", "/sql" + ("" if spread is None else f"?spread={spread}"), s.encode())
+    def err(s, i=0):
+        try:
+            q(s, i)
+            return None
+        except RuntimeError as e:
+            return str(e)
+    checks = {}
+    # schemas, made on followers (the leader carries them out)
+    before = err("CREATE TABLE dbo.t (k BIGINT, v DOUBLE)", 1)
+    q("CREATE SCHEMA dbo", 2)
+    checks["a schema must exist before its tables; CREATE SCHEMA on a follower"] = "CREATE SCHEMA dbo" in (before or "") and q("CREATE SCHEMA IF NOT EXISTS dbo", 1)["unchanged"] \
+        and err("CREATE SCHEMA dbo") is not None and err("DROP SCHEMA public") is not None
+    q("CREATE TABLE t (k BIGINT, v DOUBLE)", 1)
+    q("CREATE TABLE dbo.t (k BIGINT, v DOUBLE)", 2)
+    q("INSERT INTO t VALUES (1, 1.0), (2, 2.0)", 1)
+    q("INSERT INTO dbo.t VALUES (1, 10.0), (2, 20.0), (3, 30.0)", 2)
+    time.sleep(0.5)
+    n = lambda name, i=0: q(f"SELECT count(*) AS n FROM {name}", i)[0]["n"]
+    checks["t, public.t and lake.public.t are one table; dbo.t another"] = all(n(x, i) == 2 for x in ("t", "public.t", f'"{me}".public.t') for i in range(3)) \
+        and all(n(x, i) == 3 for x in ("dbo.t", f'"{me}".dbo.t', "DBO.T") for i in range(3))
+    checks["a join across schemas"] = q("SELECT a.k, a.v + b.v AS s FROM t a JOIN dbo.t b USING (k) ORDER BY k") == [{"k": 1, "s": 11.0}, {"k": 2, "s": 22.0}]
+    # other lakes: catalogs by the name they were attached with (lower case); `lake.t` still works
+    checks["attached lakes: other.t, other.public.t, other.eu.t, joined with this lake's"] = n("other.sales") == n("Other.public.sales") == 2 and n("other.eu.sales") == 1 \
+        and q(f'SELECT o.amount + t.v AS s FROM other.eu.sales o JOIN "{me}".public.t t ON o.id = t.k') == [{"s": 71.0}] \
+        and "no lake" in (err("CREATE TABLE nolake.s.t (a BIGINT)") or "") and err("SELECT * FROM nolake.public.t") is not None
+    # names
+    q("CREATE TABLE Mixed (Id BIGINT)")
+    q("INSERT INTO MIXED VALUES (5)")
+    checks["names: unquoted ones are lower case; odd characters and four parts refused"] = q("SELECT id FROM mixed") == [{"id": 5}] \
+        and all(err(s) is not None for s in ('CREATE TABLE "bad name" (a BIGINT)', "CREATE TABLE a.b.c.d (a BIGINT)", 'CREATE SCHEMA "a/b"', 'CREATE TABLE "x.y" (a BIGINT)'))
+    # CREATE TABLE … AS, in pieces big enough to spread
+    q("CREATE TABLE dbo.big AS SELECT value AS id, value % 100 AS k, value * 0.5 AS v FROM generate_series(1, 20000)", 1)
+    for i in range(1, 6):
+        q(f"INSERT INTO dbo.big SELECT value + {i * 20000}, value % 100, value * 0.5 FROM generate_series(1, 20000)")
+    time.sleep(0.5)
+    cols = q("SELECT column_name, data_type FROM information_schema.columns WHERE table_schema = 'dbo' AND table_name = 'big' ORDER BY ordinal_position")
+    checks["CREATE TABLE … AS: the query's rows and columns"] = n("dbo.big") == 120000 and [c["column_name"] for c in cols] == ["id", "k", "v"]
+    # stored views: run where they are used, over what the tables hold then
+    q("CREATE VIEW dbo.small AS SELECT k, v FROM dbo.big WHERE k < 10", 2)
+    q("CREATE VIEW both_t AS SELECT k, v FROM t UNION ALL SELECT k, v FROM dbo.t")
+    q("CREATE VIEW dbo.nested AS SELECT k, count(*) AS n FROM dbo.small GROUP BY k", 1)
+    live = n("both_t")
+    q("INSERT INTO t VALUES (9, 9.0)")
+    time.sleep(0.5)
+    checks["a view: the query, run over the tables as they are now; a view of a view"] = live == 5 and n("both_t", 1) == 6 and n("dbo.small") == 12000 \
+        and q("SELECT sum(n) AS n FROM dbo.nested", 2) == [{"n": 12000}]
+    checks["CREATE VIEW over a name in use refused; OR REPLACE replaces"] = err("CREATE VIEW both_t AS SELECT 1 AS x") is not None and err("CREATE VIEW t AS SELECT 1 AS x") is not None \
+        and q("CREATE OR REPLACE VIEW both_t AS SELECT k FROM t") and n("both_t") == 3 and err("CREATE TABLE both_t (a BIGINT)") is not None
+    # a query over a view, spread over the three nodes: the view reads each node's share
+    spread = lambda s: (lambda before: (q(s, spread=0), q(s, spread=1), metrics_of(A.port)["pondra_spread_queries_total"] + metrics_of(A.port)["pondra_shuffled_queries_total"] - before))(
+        metrics_of(A.port)["pondra_spread_queries_total"] + metrics_of(A.port)["pondra_shuffled_queries_total"])
+    over_view = [spread(s) for s in ("SELECT count(*) AS n, sum(v) AS s FROM dbo.small",
+                                     "SELECT k, count(*) AS n FROM dbo.small GROUP BY k ORDER BY k",
+                                     "SELECT count(*) AS n FROM (SELECT k FROM dbo.small UNION ALL SELECT k FROM dbo.big)",
+                                     f'SELECT count(*) AS n FROM "{me}".dbo.big b JOIN dbo.small s ON b.id = s.k + 1')]
+    checks["queries over views spread, with the same answers"] = all(one == many and ran >= 1 for one, many, ran in over_view)
+    # materialized views in SQL
+    q("CREATE MATERIALIZED VIEW dbo.per_k AS SELECT k, count(*) AS n, sum(v) AS s FROM dbo.t GROUP BY k", 1)
+    q("CREATE TABLE clicks (w_ts TIMESTAMP, u VARCHAR)")
+    q("CREATE MATERIALIZED VIEW per_min WITH (window = 'w', size_secs = 60) AS SELECT date_bin(INTERVAL '1 minute', w_ts) AS w, count(*) AS n FROM clicks GROUP BY 1", 2)
+    q("INSERT INTO dbo.t VALUES (1, 5.0)")
+    q("INSERT INTO dbo.t VALUES (1, 1.0), (3, 3.0)", 2)
+    got = until(lambda: q("SELECT k, n, s FROM dbo.per_k ORDER BY k"), [{"k": 1, "n": 2, "s": 6.0}, {"k": 3, "n": 1, "s": 3.0}], 30)
+    checks["CREATE MATERIALIZED VIEW follows the rows written from then on; WITH (window …) emits to _final; bad options refused"] = got == [{"k": 1, "n": 2, "s": 6.0}, {"k": 3, "n": 1, "s": 3.0}] \
+        and n("per_min_final") == 0 and err("CREATE MATERIALIZED VIEW m2 WITH (windw = 'w') AS SELECT k FROM t") is not None
+    # clients see the schemas
+    with psycopg.connect(f"host=127.0.0.1 port={A.port + 10} dbname={me} user=x", autocommit=True) as c:
+        spaces = {r[0] for r in c.execute("SELECT nspname FROM pg_catalog.pg_namespace").fetchall()}
+        in_dbo = {r[0] for r in c.execute("SELECT c.relname FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON c.relnamespace = n.oid WHERE n.nspname = 'dbo'").fetchall()}
+        by_pg = c.execute("SELECT count(*) FROM dbo.t").fetchone()[0]
+    conn = adbc.connect(f"grpc://127.0.0.1:{A.port + 30}")
+    cur = conn.cursor()
+    cur.adbc_ingest("landed", pa.table({"a": pa.array([1, 2, 3], pa.int64())}), mode="create", db_schema_name="dbo")
+    cur.close()
+    objects = conn.adbc_get_objects(depth="tables").read_all().to_pylist()
+    conn.close()
+    by_flight = {(c["catalog_name"], s["db_schema_name"], t["table_name"]) for c in objects for s in c["catalog_db_schemas"] for t in (s["db_schema_tables"] or [])}
+    rest = call(A.port, "GET", "/v1/namespaces")["namespaces"]
+    checks["Postgres, Flight SQL (ADBC ingest into a schema) and Iceberg REST see the schemas"] = {"public", "dbo"} <= spaces and {"t", "big", "small", "per_k"} <= in_dbo and by_pg == 6 \
+        and {(me, "dbo", "landed"), (me, "dbo", "t"), (me, "public", "t"), (me, "dbo", "small")} <= by_flight and n("dbo.landed") == 3 \
+        and ["default"] in rest and ["dbo"] in rest and ["other"] in rest and ["other", "eu"] in rest
+    # dropping: refused while something reads it; a new table of the name starts empty
+    used = err("DROP TABLE dbo.big", 1)
+    q("DROP VIEW dbo.nested")
+    q("DROP VIEW dbo.small", 2)
+    q("DROP TABLE dbo.big", 1)
+    q("CREATE TABLE dbo.big (id BIGINT, k BIGINT, v DOUBLE)")
+    q("INSERT INTO dbo.t VALUES (4, 40.0)")  # (still in the log)
+    view_owned = err("DROP TABLE dbo.per_k")
+    q("DROP MATERIALIZED VIEW dbo.per_k")
+    q("DROP TABLE dbo.t", 2)
+    q("CREATE TABLE dbo.t (k BIGINT, v DOUBLE)", 1)
+    time.sleep(0.5)
+    checks["DROP refused while a view reads it; after the drop, a new table of its name is empty"] = "used by" in (used or "") and view_owned is not None \
+        and n("dbo.big") == 0 and all(n("dbo.t", i) == 0 for i in range(3)) and err("SELECT * FROM dbo.small") is not None and err("DROP TABLE nope") is not None \
+        and q("DROP TABLE IF EXISTS nope")["dropped"] is False
+    # DROP SCHEMA: refused while it holds anything, unless CASCADE
+    q("CREATE VIEW dbo.again AS SELECT * FROM dbo.t")
+    full = err("DROP SCHEMA dbo", 1)
+    q("DROP SCHEMA dbo CASCADE", 1)
+    time.sleep(0.5)
+    shown = {(r["table_schema"], r["table_name"]) for r in q("SHOW TABLES", 2)}
+    checks["DROP SCHEMA refused while it holds tables; CASCADE drops them all"] = "isn't empty" in (full or "") and not any(s == "dbo" for s, _ in shown) \
+        and ("public", "t") in shown and err("SELECT * FROM dbo.t") is not None and err("CREATE TABLE dbo.t (a BIGINT)") is not None
+    # ATTACH in SQL: kept in the lake, so every node attaches it (after a restart too, and in
+    # `pondra sql`), queried and written across the two; DETACH takes it off every node
+    third = new_lake()
+    c = Node(third, A.port + 6).start()
+    for s in ("CREATE TABLE stock (id BIGINT, qty BIGINT)", "INSERT INTO stock VALUES (1, 100), (2, 200)"):
+        sql(A.port + 6, s)
+    refused = [err(f"ATTACH '{d}' AS {n}", 1) for d, n in ((third, "public"), (lake, "self"), (third + "-nowhere", "w"), (other, f'"{me}"'))]  # a schema's name, this lake, no lake, this lake's name
+    q(f"ATTACH '{third}' AS Warehouse", 1)
+    reach = lambda i: not _raises(lambda: q("SELECT count(*) AS n FROM warehouse.public.stock", i))
+    everywhere = [until(lambda i=i: reach(i), True, 15) for i in range(3)]
+    joined = q("SELECT t.k, s.qty FROM warehouse.stock s JOIN t ON s.id = t.k ORDER BY 1", 2)
+    before_insert = n("warehouse.stock", 0)
+    q("INSERT INTO warehouse.stock VALUES (3, 300)", 2)
+    fresh = until(lambda: n("warehouse.stock", 0), 3, 15)  # (an answer remembered from before is not)
+    nodes[2].kill()
+    nodes[2].start(tries=1)
+    after_restart = until(lambda: _try(lambda: n("warehouse.stock", 2)), 3, 15)  # (within a second of starting)
+    cli = subprocess.run([BIN, "sql", "--dir", lake, "SELECT count(*) AS n FROM warehouse.stock"], capture_output=True, text=True, timeout=120).stdout
+    listed = {r["catalog_name"] for r in q("SELECT DISTINCT catalog_name FROM information_schema.schemata")}
+    q("DETACH warehouse")
+    gone = [until(lambda i=i: reach(i), False, 15) for i in range(3)]
+    checks["ATTACH 'dir' AS name on one node: every node, after a restart, pondra sql; joins and writes across; DETACH everywhere; bad ones refused"] = \
+        all(refused) and all(everywhere) and joined == [{"k": 1, "qty": 100}, {"k": 2, "qty": 200}] and (before_insert, fresh) == (2, 3) and after_restart == 3 and "| 3 |" in cli \
+        and {me, "other", "warehouse"} <= listed and not any(gone)
+    [x.kill() for x in nodes + [b, c]]
+    ok = all(checks.values())
+    print(json.dumps({"schemas": checks, "ok": ok}, indent=1))
+    if not ok:
+        print(before, over_view, got, spaces, in_dbo, by_flight, rest, used, view_owned, full, shown, refused, everywhere, joined, before_insert, fresh, after_restart, cli, listed, gone)
+        sys.exit(1)
+    return f"schemas: lake.schema.table, attached lakes as catalogs, CREATE/DROP SCHEMA, DROP TABLE, CTAS, stored and materialized views in SQL from any node, spread over views, clients list schemas: all {len(checks)} checks pass"
+
+
 def scale():
     """Tables at scale. A partitioned table (`day(ts)`): every file holds one day, INSERTs and
     tiered log rows alike, before and after merges and an ADD COLUMN. Its files pile up past the
@@ -988,8 +1144,10 @@ def scale():
     for n in list(NODES):
         n.kill()
     # A 50 MB memory limit: a 2M-group aggregation and a sort spill, a join of 3M rows switches
-    # to sort-merge (hash joins can't spill), and the node stays up.
-    node = Node(lake, port, memory_gb=0.05).start()
+    # to sort-merge (hash joins can't spill), and the node stays up. As on a 4-core machine
+    # (GitHub's runners), where each partition's sort kept 10 MB aside and the merge above the
+    # sorts found the budget gone: a partition per 24 MB at most.
+    node = Node(lake, port, memory_gb=0.05, env={"PONDRA_CORES": os.environ.get("PONDRA_TEST_CORES", "4")}).start()
     q("CREATE TABLE big (id BIGINT, k BIGINT, s VARCHAR)")
     q("INSERT INTO big SELECT value, value % 2000000, 'name-' || (value % 2000000) FROM generate_series(1, 3000000)")
     checks["over the memory limit: aggregation, sort, join"] = (
@@ -1203,6 +1361,25 @@ def lake_objects(lake, prefix):
     return keys
 
 
+def put_object(lake, key, body):
+    """Write an object into a lake directly, as another program would."""
+    if not lake.startswith("s3://"):
+        os.makedirs(os.path.dirname(os.path.join(lake, key)), exist_ok=True)
+        with open(os.path.join(lake, key), "wb") as f:
+            f.write(body)
+        return
+    bucket, base = lake[5:].split("/", 1)
+    S3[0].put_object(Bucket=bucket, Key=f"{base}/{key}", Body=body)
+
+
+def _try(f):
+    """f(), or None if it raises."""
+    try:
+        return f()
+    except Exception:
+        return None
+
+
 def _raises(f):
     try:
         f()
@@ -1257,7 +1434,7 @@ def load():
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    out = {t.__name__: t() for t in (upsert, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, asof, sums, scale, flight, reader, crash)}
+    out = {t.__name__: t() for t in (upsert, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, asof, sums, schemas, scale, flight, reader, crash)}
     A.secs = min(A.secs, 20)
     out["load"] = load()
     print(json.dumps(out, indent=1))
@@ -1265,7 +1442,7 @@ def all_tests():
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "tiering", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "asof", "sums", "scale", "flight", "load", "all"])
+    ap.add_argument("mode", choices=["crash", "upsert", "tiering", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "asof", "sums", "schemas", "scale", "flight", "load", "all"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -1276,4 +1453,4 @@ if __name__ == "__main__":
     ap.add_argument("--secs", type=int, default=30)
     ap.add_argument("--flush-ms", type=int, default=250)
     A = ap.parse_args()
-    {"crash": crash, "upsert": upsert, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "asof": asof, "sums": sums, "scale": scale, "flight": flight, "load": load, "all": all_tests}[A.mode]()
+    {"crash": crash, "upsert": upsert, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "asof": asof, "sums": sums, "schemas": schemas, "scale": scale, "flight": flight, "load": load, "all": all_tests}[A.mode]()

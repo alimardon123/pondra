@@ -1,0 +1,22 @@
+/usr/local/lib/python3.11/dist-packages/adbc_driver_manager/dbapi.py:369: Warning: Cannot disable autocommit; conn will not be DB-API 2.0 compliant
+  warnings.warn(
+{"time":"2026-09-25T20:43:50.19994154+05:00","level":"ERROR","msg":"FlightSQL endpoint DoGet failed","connection_id":"conn-fdc5d7a9434e","statement_id":"stmt-a10af9839902","endpointIndex":0,"numEndpoints":1,"ticketBytes":78,"locations":"<empty: using default client connection>","err":"rpc error: code = Canceled desc = context canceled","elapsed":"no batches received before failure; elapsed=1.814322ms"}
+{
+ "flight": {
+  "DoPut: 10 batches acked": true,
+  "a retried stream is applied once": true,
+  "DoPut to a follower": true,
+  "a read token can't write": true,
+  "DoGet SQL": true,
+  "GetFlightInfo + DoGet": true,
+  "ListFlights": true,
+  "the log, two columns": true,
+  "the log, following": true,
+  "basic-auth handshake": true,
+  "ADBC query": true,
+  "ADBC write as a query, ingest, objects": true,
+  "every row once": true
+ },
+ "follow_ms": 607,
+ "ok": true
+}

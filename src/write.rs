@@ -51,6 +51,8 @@ enum TableSpec {
 /// Leader: create a table (sent again for an existing one, `publish` changes). The caller holds
 /// the lock that serialises table rewrites.
 pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> {
+    let name = &crate::ddl::new_name(lake, name).await?; // (its schema exists; `public.t` is `t`)
+    ensure!(lake.cat.get::<crate::ddl::StoredView>(&crate::ddl::query_key(name)).await?.is_none(), "{name} is a view");
     let (columns, key, merge, publish, cluster, ttl, partition) = match serde_json::from_str(spec)? {
         TableSpec::Columns(c) => (c, vec![], BTreeMap::new(), None, vec![], None, None),
         TableSpec::Full { columns, key, merge, publish, cluster_by, ttl, partition_by } => (columns, key, merge, publish, cluster_by, ttl, partition_by),
@@ -72,7 +74,9 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
         crate::tier::check_partition(p, &columns)?;
     }
     let meta = match lake.cat.get::<TableMeta>(&table_key(name)).await? {
-        None => TableMeta { columns, key, merge, publish: publish.unwrap_or_else(default_publish), cluster, ttl, partition, ..Default::default() },
+        // (A new table reads the log from now on: a table of this name dropped earlier left rows
+        // in segments that aren't expired yet.)
+        None => TableMeta { columns, key, merge, publish: publish.unwrap_or_else(default_publish), cluster, ttl, partition, tiered: lake.visible(), ..Default::default() },
         Some(mut m) => {
             ensure!(partition.is_none() || partition == m.partition, "{name}'s partition_by can't change");
             // Sent again: columns may only grow at the end (ALTER TABLE … ADD COLUMN; a re-sent
@@ -102,47 +106,107 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
 
 // ---------------------------------------------------------------- statements
 
-/// A write statement.
+/// A write statement. Tables are named as SQL resolves them (`object`): `t`, `schema.t` or
+/// `lake.schema.t`, unquoted parts in lower case.
 pub enum Stmt {
-    Create(Box<ast::CreateTable>),
+    Create(Box<ast::CreateTable>),                       // (with a query: CREATE TABLE … AS SELECT)
+    Define(String, String),                              // table, its definition (CREATE TABLE … AS SELECT's first step)
     Insert(String, String),                              // table, the query giving the rows
     Update(String, Vec<(String, String)>, Option<String>), // table, column = expression, WHERE
     Delete(String, Option<String>),                      // table, WHERE
     AddColumn(String, String, String, bool),             // table, column, SQL type, IF NOT EXISTS
+    Ddl(Vec<crate::ddl::Ddl>),                            // schemas, views, drops: the leader's (`ddl.rs`)
 }
 
 impl Stmt {
     /// The table it writes.
     fn table(&self) -> String {
         match self {
-            Stmt::Create(c) => c.name.to_string(),
-            Stmt::Insert(t, _) | Stmt::Update(t, ..) | Stmt::Delete(t, _) | Stmt::AddColumn(t, ..) => t.clone(),
+            Stmt::Create(c) => object(&c.name),
+            Stmt::Define(t, _) | Stmt::Insert(t, _) | Stmt::Update(t, ..) | Stmt::Delete(t, _) | Stmt::AddColumn(t, ..) => t.clone(),
+            Stmt::Ddl(_) => String::new(),
         }
     }
+
+    /// The same statement writing `table` (a name resolved to one inside its lake).
+    fn on(self, table: String) -> Stmt {
+        match self {
+            Stmt::Insert(_, q) => Stmt::Insert(table, q),
+            Stmt::Update(_, set, w) => Stmt::Update(table, set, w),
+            Stmt::Delete(_, w) => Stmt::Delete(table, w),
+            Stmt::AddColumn(_, c, ty, i) => Stmt::AddColumn(table, c, ty, i),
+            Stmt::Define(_, spec) => Stmt::Define(table, spec),
+            s => s,
+        }
+    }
+}
+
+/// A name as SQL resolves it: its parts, unquoted ones in lower case, joined by dots.
+pub fn object(n: &ast::ObjectName) -> String {
+    let part = |p: &ast::ObjectNamePart| p.as_ident().map(ident).unwrap_or_else(|| p.to_string());
+    n.0.iter().map(part).collect::<Vec<_>>().join(".")
+}
+
+/// One part of a name: as written if quoted, else in lower case.
+fn ident(i: &ast::Ident) -> String { if i.quote_style.is_some() { i.value.clone() } else { i.value.to_lowercase() } }
+
+/// A name in SQL, each part quoted as it is: `"t"`, `"schema"."t"`, `"lake"."schema"."t"`.
+pub fn sql_name(name: &str) -> String {
+    name.split('.').map(|p| format!("\"{p}\"")).collect::<Vec<_>>().join(".")
 }
 
 /// A write statement, or None for a query.
 pub fn parse(sql: &str) -> Option<Stmt> {
     use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
+    use crate::ddl::Ddl;
     let where_ = |e: &Option<ast::Expr>| e.as_ref().map(|e| e.to_string());
+    let relation = |r: &ast::TableFactor| match r {
+        ast::TableFactor::Table { name, .. } => Some(object(name)),
+        _ => None,
+    };
     Some(match Parser::parse_sql(&GenericDialect {}, sql).ok()?.pop()? {
         Statement::CreateTable(c) => Stmt::Create(Box::new(c)),
-        Statement::Insert(ast::Insert { table: ast::TableObject::TableName(t), source: Some(q), columns, .. }) if columns.is_empty() => Stmt::Insert(t.to_string(), q.to_string()),
+        Statement::Insert(ast::Insert { table: ast::TableObject::TableName(t), source: Some(q), columns, .. }) if columns.is_empty() => Stmt::Insert(object(&t), q.to_string()),
         Statement::Update(u) => {
             let set = u.assignments.iter().filter_map(|a| match &a.target {
                 ast::AssignmentTarget::ColumnName(c) => Some((c.to_string(), a.value.to_string())),
                 _ => None,
             });
-            Stmt::Update(u.table.relation.to_string(), set.collect(), where_(&u.selection))
+            Stmt::Update(relation(&u.table.relation)?, set.collect(), where_(&u.selection))
         }
         Statement::AlterTable(a) => match &a.operations[..] {
-            [ast::AlterTableOperation::AddColumn { if_not_exists, column_def: c, .. }] => Stmt::AddColumn(a.name.to_string(), c.name.value.clone(), c.data_type.to_string(), *if_not_exists),
+            [ast::AlterTableOperation::AddColumn { if_not_exists, column_def: c, .. }] => Stmt::AddColumn(object(&a.name), c.name.value.clone(), c.data_type.to_string(), *if_not_exists),
             _ => return None,
         },
         Statement::Delete(d) => {
             let (ast::FromTable::WithFromKeyword(t) | ast::FromTable::WithoutKeyword(t)) = &d.from;
-            Stmt::Delete(t.first()?.relation.to_string(), where_(&d.selection))
+            Stmt::Delete(relation(&t.first()?.relation)?, where_(&d.selection))
         }
+        Statement::CreateSchema { schema_name: ast::SchemaName::Simple(n) | ast::SchemaName::NamedAuthorization(n, _), if_not_exists, .. } => {
+            Stmt::Ddl(vec![Ddl::CreateSchema { name: object(&n), if_not_exists }])
+        }
+        Statement::Drop { object_type, if_exists, names, cascade, .. } => Stmt::Ddl(names.iter().map(object).map(|name| match object_type {
+            ast::ObjectType::Schema => Some(Ddl::DropSchema { name, if_exists, cascade }),
+            ast::ObjectType::Table => Some(Ddl::DropTable { name, if_exists }),
+            ast::ObjectType::View | ast::ObjectType::MaterializedView => Some(Ddl::DropView { name, if_exists }),
+            _ => None,
+        }).collect::<Option<Vec<_>>>()?),
+        Statement::CreateView(v) if v.materialized => {
+            let options = match &v.options {
+                ast::CreateTableOptions::With(o) | ast::CreateTableOptions::Options(o) => o.iter().filter_map(|o| match o {
+                    ast::SqlOption::KeyValue { key, value } => Some((key.value.to_lowercase(), value.to_string().trim_matches('\'').to_string())),
+                    _ => None,
+                }).collect(),
+                _ => Default::default(),
+            };
+            Stmt::Ddl(vec![Ddl::CreateMaterialized { name: object(&v.name), sql: v.query.to_string(), options }])
+        }
+        Statement::CreateView(v) => Stmt::Ddl(vec![Ddl::CreateView { name: object(&v.name), sql: v.query.to_string(), replace: v.or_replace }]),
+        Statement::AttachDatabase { schema_name, database_file_name: ast::Expr::Value(v), .. } => match &v.value {
+            ast::Value::SingleQuotedString(dir) | ast::Value::DoubleQuotedString(dir) => Stmt::Ddl(vec![Ddl::Attach { name: ident(&schema_name), dir: dir.clone() }]),
+            _ => return None,
+        },
+        Statement::DetachDuckDBDatabase { if_exists, database_alias, .. } => Stmt::Ddl(vec![Ddl::Detach { name: ident(&database_alias), if_exists }]),
         _ => return None,
     })
 }
@@ -150,11 +214,24 @@ pub fn parse(sql: &str) -> Option<Stmt> {
 /// `CREATE TABLE t (a BIGINT, b VARCHAR, PRIMARY KEY (a)) [WITH (publish = 'delta,iceberg',
 /// cluster_by = 'b', merge = 'total:sum', partition_by = 'day(ts)')]` → the table name and its spec. SQL types become Arrow
 /// types the way DataFusion maps them.
-async fn create_spec(c: &ast::CreateTable) -> Result<(String, String)> {
-    let cols = c.columns.iter().map(|c| format!("{} {}", c.name, c.data_type)).collect::<Vec<_>>().join(", ");
-    let ctx = SessionContext::new();
-    ctx.sql(&format!("CREATE TABLE t ({cols})")).await?;
-    let columns: Vec<(String, String)> = ctx.table("t").await?.schema().fields().iter().map(|f| (f.name().clone(), crate::query::type_name(f.data_type()))).collect();
+/// With `AS SELECT`, the columns are the query's (run over `from`'s tables; `files`: local files
+/// too, for `pondra sql` on its own machine).
+async fn create_spec(c: &ast::CreateTable, from: &Lake, files: bool) -> Result<String> {
+    let fields = match &c.query {
+        Some(q) => {
+            let sql = q.to_string();
+            let ctx = session(from, &sql, "").await?;
+            let ctx = if files { ctx.enable_url_table() } else { ctx };
+            ctx.sql(&sql).await?.schema().fields().iter().cloned().collect::<Vec<_>>()
+        }
+        None => {
+            let cols = c.columns.iter().map(|c| format!("{} {}", c.name, c.data_type)).collect::<Vec<_>>().join(", ");
+            let ctx = SessionContext::new();
+            ctx.sql(&format!("CREATE TABLE t ({cols})")).await?;
+            ctx.table("t").await?.schema().fields().iter().cloned().collect()
+        }
+    };
+    let columns: Vec<(String, String)> = fields.iter().map(|f| (f.name().clone(), crate::query::type_name(f.data_type()))).collect();
     let name = |e: &ast::Expr| e.to_string().trim_matches('"').to_string();
     let mut key: Vec<String> = c.constraints.iter().flat_map(|k| match k {
         ast::TableConstraint::PrimaryKey(pk) => pk.columns.iter().map(|i| name(&i.column.expr)).collect(),
@@ -176,7 +253,7 @@ async fn create_spec(c: &ast::CreateTable) -> Result<(String, String)> {
         columns.push(("_deleted".into(), "Boolean".into())); // (so DELETE works; writes leave it out)
     }
     let spec = j!({"columns": columns, "key": key, "merge": merge, "publish": list("publish"), "cluster_by": list("cluster_by").unwrap_or_default(), "ttl": opts.get("ttl"), "partition_by": opts.get("partition_by")});
-    Ok((c.name.to_string(), spec.to_string()))
+    Ok(spec.to_string())
 }
 
 /// Create a table (or change it: a spec sent again) from any node: the leader does it.
@@ -220,7 +297,7 @@ fn rows_sql(meta: &TableMeta, stmt: &Stmt) -> Result<String> {
     let q = |c: &str| format!("\"{c}\"");
     let select = |pick: &dyn Fn(&str) -> String, table: &str, cond: &Option<String>| {
         let cols = meta.columns.iter().map(|(c, _)| format!("{} AS {}", pick(c), q(c))).collect::<Vec<_>>().join(", ");
-        format!("SELECT {cols} FROM {table} {}", cond.as_ref().map(|w| format!("WHERE {w}")).unwrap_or_default())
+        format!("SELECT {cols} FROM {} {}", sql_name(table), cond.as_ref().map(|w| format!("WHERE {w}")).unwrap_or_default())
     };
     let deletes = meta.columns.iter().any(|(c, _)| c == "_deleted");
     ensure!(matches!(stmt, Stmt::Insert(..)) || !meta.key.is_empty(), "UPDATE and DELETE need a keyed table (append tables only take INSERTs)");
@@ -240,7 +317,7 @@ fn rows_sql(meta: &TableMeta, stmt: &Stmt) -> Result<String> {
             ensure!(meta.merge.is_empty() && deletes, "DELETE needs an upsert table with a Boolean _deleted column");
             Ok(select(&|c: &str| if c == "_deleted" { "true".into() } else { q(c) }, t, cond))
         }
-        Stmt::Create(_) | Stmt::AddColumn(..) => unreachable!("not a row write"),
+        Stmt::Create(_) | Stmt::Define(..) | Stmt::AddColumn(..) | Stmt::Ddl(_) => unreachable!("not a row write"),
     }
 }
 
@@ -346,27 +423,45 @@ pub async fn record(lake: &Lake, f: Files) -> Result<Value> {
 pub async fn on_node(app: &crate::server::App, stmt: Stmt, job: Option<String>) -> Result<Value> {
     ensure!(!app.cluster.reader, "read-only node");
     let (lake, job) = (&app.lake, job.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()));
-    // A table of an attached lake (`name.table`): the work runs here, that lake's leader records it.
-    let full = stmt.table();
-    let other = full.split_once('.').and_then(|(ns, t)| Some((lake.attached.read().unwrap().iter().find(|(n, _)| n == ns)?.1.clone(), t.to_string())));
-    if let Some((other, table)) = other {
+    if let Stmt::Ddl(ddls) = stmt {
+        let mut out = j!({});
+        for d in ddls {
+            out = if app.seq.is_some() {
+                let _guard = app.lock.lock().await;
+                crate::ddl::apply(lake, d.clone()).await?
+            } else {
+                post(&app.cluster.leader.addr, &Request::Ddl(d.clone())).await?
+            };
+            crate::ddl::settle(lake, &d, &app.cluster.addr).await?; // (ATTACH, DETACH: here at once)
+        }
+        return Ok(out);
+    }
+    // CREATE TABLE … AS SELECT: the table, with the query's columns, then its rows.
+    if let Stmt::Create(c) = &stmt {
+        if let Some(q) = &c.query {
+            let (name, query) = (object(&c.name), q.to_string());
+            Box::pin(on_node(app, Stmt::Define(name.clone(), create_spec(c, lake, false).await?), Some(job.clone()))).await?;
+            return Box::pin(on_node(app, Stmt::Insert(name, query), Some(job))).await;
+        }
+    }
+    // A table of an attached lake: the work runs here, that lake's leader records it.
+    let (other, table) = crate::ddl::resolve(lake, &stmt.table()).await?;
+    if let Some(other) = other {
         let req = prepare(lake, &other, &table, &stmt, &job, false).await?;
         return deliver(&other.url, Some(req), &stmt, &job).await;
     }
-    let table = match &stmt {
-        Stmt::Create(_) | Stmt::AddColumn(..) => {
-            let (name, spec) = match &stmt {
-                Stmt::Create(c) => create_spec(c).await?,
-                Stmt::AddColumn(t, c, ty, if_not) => match alter_spec(lake, t, c, ty, *if_not).await? {
-                    Some(spec) => (t.clone(), spec),
-                    None => return Ok(j!({"table": t, "unchanged": true})),
-                },
-                _ => unreachable!(),
+    let stmt = stmt.on(table.clone());
+    match &stmt {
+        Stmt::Create(c) => return define(app, &table, &create_spec(c, lake, false).await?).await,
+        Stmt::Define(_, spec) => return define(app, &table, spec).await,
+        Stmt::AddColumn(t, c, ty, if_not) => {
+            return match alter_spec(lake, t, c, ty, *if_not).await? {
+                Some(spec) => define(app, t, &spec).await,
+                None => Ok(j!({"table": t, "unchanged": true})),
             };
-            return define(app, &name, &spec).await;
         }
-        Stmt::Insert(t, _) | Stmt::Update(t, ..) | Stmt::Delete(t, _) => t.clone(),
-    };
+        _ => {}
+    }
     let meta = lake.cat.get::<TableMeta>(&table_key(&table)).await?;
     let sql = match (&meta, &stmt) {
         (Some(m), _) if through_log(lake, &table, m).await? => rows_sql(m, &stmt)?,
@@ -392,6 +487,7 @@ pub enum Request {
     Files(Files),
     Flush(Bytes), // the body of POST /cluster/commit
     Table(String, String),
+    Ddl(crate::ddl::Ddl),
 }
 
 impl Request {
@@ -401,6 +497,7 @@ impl Request {
             Request::Files(f) => ("/cluster/files".into(), serde_json::to_vec(f)?),
             Request::Flush(b) => ("/cluster/commit".into(), b.to_vec()),
             Request::Table(name, spec) => (format!("/tables/{name}"), spec.clone().into_bytes()),
+            Request::Ddl(d) => ("/cluster/ddl".into(), serde_json::to_vec(d)?),
         })
     }
 
@@ -409,6 +506,7 @@ impl Request {
             Request::Table(name, spec) => ("table".into(), serde_json::to_vec(&(name, spec))?),
             Request::Files(_) => ("files".into(), self.http()?.1),
             Request::Flush(_) => ("flush".into(), self.http()?.1),
+            Request::Ddl(_) => ("ddl".into(), self.http()?.1),
         })
     }
 
@@ -416,6 +514,7 @@ impl Request {
         Ok(match kind {
             "files" => Request::Files(serde_json::from_slice(&body)?),
             "flush" => Request::Flush(body),
+            "ddl" => Request::Ddl(serde_json::from_slice(&body)?),
             "table" => {
                 let (name, spec): (String, String) = serde_json::from_slice(&body)?;
                 Request::Table(name, spec)
@@ -437,6 +536,10 @@ pub async fn handle(lake: &Lake, seq: &Sequencer, lock: &Mutex<()>, req: Request
             let _guard = lock.lock().await;
             create_table(lake, &name, &spec).await
         }
+        Request::Ddl(d) => {
+            let _guard = lock.lock().await;
+            crate::ddl::apply(lake, d).await
+        }
     }
 }
 
@@ -448,14 +551,39 @@ pub async fn handle(lake: &Lake, seq: &Sequencer, lock: &Mutex<()>, req: Request
 /// it takes, under its own term, so a node starting meanwhile waits for it. It never takes over
 /// from a live leader.
 pub async fn from_cli(dir: &str, stmt: Stmt) -> Result<Value> {
+    match stmt {
+        // CREATE TABLE … AS SELECT: the table, with the query's columns, then its rows.
+        Stmt::Create(c) if c.query.is_some() => {
+            let lake = Lake::open(dir, false, false).await?;
+            let (name, query) = (object(&c.name), c.query.as_ref().expect("a query").to_string());
+            Box::pin(one_from_cli(dir, Stmt::Define(name.clone(), create_spec(&c, &lake, true).await?))).await?;
+            Box::pin(one_from_cli(dir, Stmt::Insert(name, query))).await
+        }
+        Stmt::Ddl(ddls) => {
+            let mut out = j!({});
+            for d in ddls {
+                out = Box::pin(one_from_cli(dir, Stmt::Ddl(vec![d]))).await?;
+            }
+            Ok(out)
+        }
+        stmt => one_from_cli(dir, stmt).await,
+    }
+}
+
+async fn one_from_cli(dir: &str, stmt: Stmt) -> Result<Value> {
     let job = std::env::var("PONDRA_JOB").unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
     std::env::set_var("PONDRA_JOB", &job); // (if fenced, the process restarts: the same job again)
     // (A lake with no catalog yet can't be read: then the work is done once this process leads.)
-    let req = match Lake::open(dir, false, false).await {
-        Ok(lake) => Some(prepare(&lake, &lake, &stmt.table(), &stmt, &job, true).await?),
-        Err(_) => None,
+    let (req, stmt, to) = match Lake::open(dir, false, false).await {
+        Ok(lake) => {
+            crate::ddl::sync(&lake, "", false).await?; // (lakes attached by ATTACH: read here too)
+            let (other, table) = crate::ddl::resolve(&lake, &stmt.table()).await?;
+            let (stmt, target) = (stmt.on(table.clone()), other.unwrap_or_else(|| lake.clone())); // (a write to an attached lake goes to its leader)
+            (Some(prepare(&lake, &target, &table, &stmt, &job, true).await?), stmt, target.url.clone())
+        }
+        Err(_) => (None, stmt, dir.to_string()),
     };
-    deliver(dir, req, &stmt, &job).await
+    deliver(&to, req, &stmt, &job).await
 }
 
 /// Have the leader of the lake at `dir` record a write: over HTTP, through the bucket inbox if it
@@ -503,9 +631,11 @@ async fn deliver(dir: &str, mut req: Option<Option<Request>>, stmt: &Stmt, job: 
 /// `files`: the query may read local files (`FROM 'jan.parquet'`) — on the author's own machine.
 async fn prepare(query: &Lake, target: &Arc<Lake>, table: &str, stmt: &Stmt, job: &str, files: bool) -> Result<Option<Request>> {
     let open = |ctx: SessionContext| if files { ctx.enable_url_table() } else { ctx };
-    if let Stmt::Create(c) = stmt {
-        let (_, spec) = create_spec(c).await?;
-        return Ok(Some(Request::Table(table.into(), spec)));
+    match stmt {
+        Stmt::Create(c) => return Ok(Some(Request::Table(table.into(), create_spec(c, query, files).await?))),
+        Stmt::Define(_, spec) => return Ok(Some(Request::Table(table.into(), spec.clone()))),
+        Stmt::Ddl(d) => return Ok(Some(Request::Ddl(d.first().cloned().ok_or_else(|| anyhow::anyhow!("nothing to do"))?))),
+        _ => {}
     }
     if let Stmt::AddColumn(_, c, ty, if_not) = stmt {
         return Ok(alter_spec(target, table, c, ty, *if_not).await?.map(|spec| Request::Table(table.into(), spec)));

@@ -173,15 +173,29 @@ pub fn memory_limit() -> usize {
     gb.map(|g| (g * (1u64 << 30) as f64) as usize).or_else(|| ram().map(|r| r / 3)).unwrap_or(4 << 30)
 }
 
-/// The machine's memory, if it says.
+/// The machine's memory, if it says: `/proc` on Linux, the OS's own call elsewhere.
 pub fn ram() -> Option<usize> {
-    std::fs::read_to_string("/proc/meminfo").ok()?.lines().find_map(|l| l.strip_prefix("MemTotal:")?.trim().strip_suffix("kB")?.trim().parse::<usize>().ok()).map(|kb| kb << 10)
+    static RAM: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *RAM.get_or_init(read_ram)
+}
+
+fn read_ram() -> Option<usize> {
+    let proc = std::fs::read_to_string("/proc/meminfo").ok().and_then(|m| m.lines().find_map(|l| l.strip_prefix("MemTotal:")?.trim().strip_suffix("kB")?.trim().parse::<usize>().ok()));
+    proc.map(|kb| kb << 10).or_else(|| {
+        let s = sysinfo::System::new_with_specifics(sysinfo::RefreshKind::nothing().with_memory(sysinfo::MemoryRefreshKind::nothing().with_ram()));
+        Some(s.total_memory() as usize).filter(|&b| b > 0)
+    })
 }
 
 /// This process's resident memory, if the OS says.
 pub fn resident() -> Option<usize> {
-    let pages = std::fs::read_to_string("/proc/self/statm").ok()?.split_whitespace().nth(1)?.parse::<usize>().ok()?;
-    Some(pages * 4096)
+    let proc = std::fs::read_to_string("/proc/self/statm").ok().and_then(|s| s.split_whitespace().nth(1)?.parse::<usize>().ok());
+    proc.map(|pages| pages * 4096).or_else(|| {
+        use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
+        let (pid, mut s) = (sysinfo::get_current_pid().ok()?, System::new());
+        s.refresh_processes_specifics(ProcessesToUpdate::Some(&[pid]), false, ProcessRefreshKind::nothing().with_memory());
+        Some(s.process(pid)?.memory() as usize).filter(|&b| b > 0)
+    })
 }
 
 pub type Rows = Arc<Vec<datafusion::arrow::record_batch::RecordBatch>>;
@@ -362,9 +376,29 @@ impl Lake {
         self.hwm.send_if_modified(|h| std::mem::replace(h, (*h).max(hwm)) < hwm);
     }
 
+    /// What a remembered answer to `sql` depends on: this lake's catalog, and those of the attached
+    /// lakes it may read, itself or through the views it reads (and which lakes are attached).
+    /// None: nothing to remember it by.
+    pub async fn version_for(&self, sql: &str) -> Option<u64> {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.cat.version()?.hash(&mut h);
+        let mut text = sql.to_string();
+        if !self.attached.read().unwrap().is_empty() {
+            crate::query::stored_views(self, sql, false).await.ok()?.iter().for_each(|(_, v)| text.push_str(&format!(" {v}")));
+        }
+        for (name, other) in self.attached.read().unwrap().iter().filter(|(n, _)| crate::ddl::mentions(&text, n)) {
+            (name, other.cat.version()?).hash(&mut h);
+        }
+        Some(h.finish())
+    }
+
     /// Read another lake as `name.table` in this one's queries (its bucket's reader goes into our
     /// runtime too: a query here reads its files).
     pub fn attach(&self, name: &str, other: Arc<Lake>) -> Result<()> {
+        let name = &name.to_lowercase(); // (as SQL reads an unquoted name)
+        crate::ddl::check(name)?;
+        anyhow::ensure!(*name != crate::ddl::lake_name(self), "this lake is called {name} already: attach the other under another name");
         if let Some(bucket) = other.url.strip_prefix("s3://").map(|r| format!("s3://{}", r.split('/').next().unwrap_or_default())) {
             let url = url::Url::parse(&bucket)?;
             self.rt.register_object_store(&url, other.rt.object_store(datafusion::execution::object_store::ObjectStoreUrl::parse(&bucket)?)?);
@@ -381,7 +415,8 @@ impl Lake {
     /// A session with a fixed number of partitions: 1 for point lookups, where splitting the work
     /// costs more than it saves and many queries run at once.
     pub fn session_with(&self, partitions: usize) -> SessionContext {
-        let config = crate::optimize::config(SessionConfig::new().with_information_schema(true).with_target_partitions(partitions));
+        let config = crate::optimize::config(SessionConfig::new().with_information_schema(true).with_target_partitions(partitions)
+            .with_default_catalog_and_schema(crate::ddl::lake_name(self), crate::ddl::PUBLIC));
         let state = SessionStateBuilder::new().with_config(config).with_runtime_env(self.rt.clone()).with_default_features();
         let state = state.with_optimizer_rules(crate::optimize::rules()).with_physical_optimizer_rules(crate::optimize::physical_rules());
         let mut ctx = SessionContext::new_with_state(state.build());
@@ -1007,6 +1042,12 @@ pub fn maybe_crash(point: &str) {
     }
 }
 
-/// How many partitions a query runs in here: one per core, and at least 2, so every node plans
-/// aggregations as partial + final (see spmd.rs).
-pub fn partitions() -> usize { std::thread::available_parallelism().map_or(2, |n| n.get()).max(2) }
+/// How many partitions a query runs in here: one per core (`PONDRA_CORES` stands for another
+/// machine's count), at least 2, so every node plans aggregations as partial + final (see
+/// spmd.rs), and at most one per 24 MB of query memory. Each partition's sort keeps 10 MB aside to
+/// merge what it spilled (DataFusion's default); on 4 cores with 50 MB the reserves took the
+/// budget and the merge above them failed, and smaller reserves can't merge at all.
+pub fn partitions() -> usize {
+    let cores = std::env::var("PONDRA_CORES").ok().and_then(|p| p.parse().ok()).unwrap_or_else(|| std::thread::available_parallelism().map_or(2, |n| n.get()));
+    cores.min(memory_limit() / (24 << 20)).max(2)
+}

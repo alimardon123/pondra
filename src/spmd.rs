@@ -20,7 +20,7 @@
 //! be split is decided operator by operator (`spread`): only what stays correct run this way runs
 //! this way, and anything else runs on one node.
 use crate::manifest::Manifest;
-use crate::query::{session, Pruned};
+use crate::query::{session, table_ref, Pruned};
 use crate::spill::Spill;
 use crate::store::*;
 use anyhow::{bail, ensure, Context, Result};
@@ -111,7 +111,7 @@ pub async fn query(lake: &Lake, nodes: &[String], me: &str, sql: &str, force: bo
     if nodes.len() < 2 {
         return Ok(None);
     }
-    let Some(tables) = tables(sql) else { return Ok(refused("not a single query")) };
+    let Some(tables) = read(lake, sql).await? else { return Ok(refused("not a single query")) };
     // The table to slice is the biggest append table it reads. Keyed tables are read whole: a
     // key's versions are spread over the files, so a share of the files isn't a share of the rows.
     let mut main: Option<(String, TableMeta, u64)> = None;
@@ -311,8 +311,8 @@ async fn plan(lake: &Lake, s: &Slice) -> Result<(SessionContext, Arc<dyn Executi
         ensure!(lake.visible() >= s.upto, "this node is behind the lake ({} < {})", lake.visible(), s.upto);
         for (t, meta) in &s.whole {
             let inner = crate::query::table_view(lake, &ctx, t, meta, Some(s.upto)).await?;
-            ctx.deregister_table(t.as_str())?;
-            ctx.register_table(t.as_str(), Arc::new(WholeTable { inner, name: t.clone(), size: totals(meta) }))?;
+            ctx.deregister_table(table_ref(t))?;
+            ctx.register_table(table_ref(t), Arc::new(WholeTable { inner, name: t.clone(), size: totals(meta) }))?;
         }
     }
     {
@@ -342,9 +342,10 @@ async fn plan(lake: &Lake, s: &Slice) -> Result<(SessionContext, Arc<dyn Executi
         let ranges = crate::manifest::ranges(&p.table, &crate::manifest::list(lake, &meta).await?, &meta.files, &schema);
         let meta = TableMeta { files: p.files.clone(), tiered: after, ..meta };
         let table = Pruned { lake: lake.arc(), name: p.table.clone(), meta, manifests: Some(p.manifests.clone()), upto: Some(upto), schema, share, ranges, range: p.range.clone() };
-        ctx.deregister_table(p.table.as_str())?;
-        ctx.register_table(p.table.as_str(), Arc::new(table))?;
+        ctx.deregister_table(table_ref(&p.table))?;
+        ctx.register_table(table_ref(&p.table), Arc::new(table))?;
     }
+    crate::query::register_views(&ctx, crate::query::stored_views(lake, &s.sql, false).await?, true).await?; // (over the shares)
     let plan = ctx.sql_with_options(&s.sql, crate::query::read_only()).await?.create_physical_plan().await?;
     Ok((ctx, plan))
 }
@@ -1186,10 +1187,22 @@ impl ExecutionPlan for Received {
 
 // ---------------------------------------------------------------- SQL
 
+/// The tables of this lake a single query reads, by their names in it, through the stored views
+/// it reads too (whose tables every node's share must stand for as well).
+async fn read(lake: &Lake, sql: &str) -> Result<Option<Vec<String>>> {
+    let Some(named) = tables(sql) else { return Ok(None) };
+    let mut out = vec![];
+    for (_, v) in crate::query::stored_views(lake, sql, false).await? {
+        out.extend(tables(&v).unwrap_or_default());
+    }
+    let mut seen = std::collections::HashSet::new();
+    Ok(Some(named.into_iter().chain(out).filter_map(|t| crate::ddl::local(lake, &t)).filter(|t| seen.insert(t.clone())).collect()))
+}
+
 /// Every table a single query reads, anywhere in it — joins, subqueries, CTEs, unions — once
 /// each, CTE names left out. None for anything that isn't one query. Whether the query can be
 /// split is not decided here but from its plan (`spread`), operator by operator.
-fn tables(sql: &str) -> Option<Vec<String>> {
+pub fn tables(sql: &str) -> Option<Vec<String>> {
     use datafusion::sql::sqlparser::{ast::*, dialect::GenericDialect, parser::Parser};
     use std::ops::ControlFlow;
     #[derive(Default)]

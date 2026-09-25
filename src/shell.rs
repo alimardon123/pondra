@@ -37,7 +37,7 @@ async fn session(dir: &str, base: &str, node: &mut Child, log: &Path) -> Result<
     }
     let tty = std::io::stdin().is_terminal();
     if tty {
-        eprintln!("Pondra {} on {dir}, also at {base}. End each statement with ;  .tables lists tables, .quit leaves.", env!("CARGO_PKG_VERSION"));
+        eprintln!("Pondra {} on {dir}, also at {base}. End each statement with ;  .tables and .databases list them, .quit leaves.", env!("CARGO_PKG_VERSION"));
     }
     let mut sql = String::new();
     loop {
@@ -49,7 +49,8 @@ async fn session(dir: &str, base: &str, node: &mut Child, log: &Path) -> Result<
         let end = std::io::stdin().lock().read_line(&mut line)? == 0;
         match (sql.is_empty(), line.trim()) {
             (true, ".quit" | ".exit" | "\\q") => break,
-            (true, ".tables") => line = "SHOW TABLES;".into(),
+            (true, ".databases") => line = "SELECT DISTINCT catalog_name AS database FROM information_schema.schemata ORDER BY 1;".into(),
+            (true, ".tables") => line = "SELECT table_catalog AS lake, table_schema AS schema, table_name AS name, table_type AS kind FROM information_schema.tables WHERE table_schema <> 'information_schema' ORDER BY 1, 2, 3;".into(),
             _ => {}
         }
         sql.push_str(&line);
@@ -57,16 +58,21 @@ async fn session(dir: &str, base: &str, node: &mut Child, log: &Path) -> Result<
         sql = rest;
         for statement in statements.iter().filter(|s| !s.trim().is_empty()) {
             let at = Instant::now();
-            match http.post(format!("{base}/sql?format=table")).body(statement.trim().to_string()).send().await {
-                Ok(r) => match (r.status().is_success(), r.text().await.unwrap_or_default()) {
-                    (true, body) => println!("{}", body.trim_end()),
-                    (false, body) => eprintln!("Error: {}", body.trim()),
-                },
+            let answer = match http.post(format!("{base}/sql?format=table")).body(statement.trim().to_string()).send().await {
+                Ok(r) => Ok((r.status().is_success(), r.text().await.unwrap_or_default())),
                 Err(_) if node.try_wait()?.is_some() => bail!("the node stopped: {}", std::fs::read_to_string(log).unwrap_or_default()),
+                Err(e) => Err(e),
+            };
+            let took = at.elapsed(); // (the answer's time, not the terminal's: printing is timed apart)
+            let mut out = std::io::stdout().lock();
+            match answer {
+                Ok((true, body)) => writeln!(out, "{}", body.trim_end())?, // (one write: consoles are slow per call)
+                Ok((false, body)) => eprintln!("Error: {}", body.trim()),
                 Err(e) => eprintln!("Error: {e}"),
             }
+            out.flush()?;
             if tty {
-                eprintln!("({:.3} s)", at.elapsed().as_secs_f64());
+                eprintln!("({:.3} s)", took.as_secs_f64());
             }
         }
         if end {

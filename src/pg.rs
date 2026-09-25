@@ -104,7 +104,7 @@ fn user_error(e: anyhow::Error) -> PgWireError {
 impl Backend {
     /// Run one statement the way `POST /sql` does, for a client whose role comes from its user name.
     async fn run(&self, user: &str, sql: &str, format: &Format) -> PgWireResult<Response> {
-        let sql = crate::asof::rewrite(&pg_dialect(sql)).map_err(user_error)?.into_owned();
+        let sql = crate::asof::rewrite(&pg_dialect(&self.app.lake, sql)).map_err(user_error)?.into_owned();
         if let Some(r) = session_command(&sql) {
             return Ok(r);
         }
@@ -139,15 +139,20 @@ impl Backend {
     async fn session(&self, sql: &str) -> PgWireResult<datafusion::prelude::SessionContext> {
         let ctx = crate::query::session(&self.app.lake, sql, "").await.map_err(user_error)?;
         if sql.contains("pg_") {
-            let tables = self.app.lake.cat.scan::<crate::store::TableMeta>("t/", "t0").await.map_err(user_error)?;
-            let classes = tables.iter().enumerate().map(|(i, (k, _))| format!("({}, '{}', 2200, 'r')", 16384 + i, &k[2..])).collect::<Vec<_>>();
+            let lake = &self.app.lake;
+            let schemas = crate::ddl::schemas(lake).await.map_err(user_error)?; // (public first: oid 2200, as in Postgres)
+            let oid = |schema: &str| schemas.iter().position(|s| s == schema).map_or(2200, |i| if i == 0 { 2200 } else { 30000 + i });
+            let tables = lake.cat.scan::<crate::store::TableMeta>("t/", "t0").await.map_err(user_error)?.into_iter().map(|(k, _)| (k, 'r'));
+            let views = lake.cat.scan::<crate::ddl::StoredView>("q/", "q0").await.map_err(user_error)?.into_iter().map(|(k, _)| (k, 'v'));
+            let classes = tables.chain(views).enumerate().map(|(i, (k, kind))| format!("({}, '{}', {}, '{kind}')", 16384 + i, crate::ddl::split(&k[2..]).1, oid(crate::ddl::split(&k[2..]).0))).collect::<Vec<_>>();
+            let namespaces = schemas.iter().map(|s| format!(", ({}, '{s}')", oid(s))).collect::<String>();
             let types = [(16, "bool"), (17, "bytea"), (20, "int8"), (21, "int2"), (23, "int4"), (25, "text"), (700, "float4"), (701, "float8"), (1043, "varchar"), (1082, "date"), (1114, "timestamp"), (1700, "numeric")];
             let types = types.iter().map(|(o, n)| format!("({o}, '{n}', 0, 11, 'b', 0)")).collect::<Vec<_>>();
             for view in [
                 format!("pg_type AS SELECT * FROM (VALUES {}) AS t(oid, typname, typarray, typnamespace, typtype, typrelid)", types.join(", ")),
-                "pg_namespace AS SELECT * FROM (VALUES (11, 'pg_catalog'), (2200, 'public')) AS t(oid, nspname)".into(),
+                format!("pg_namespace AS SELECT * FROM (VALUES (11, 'pg_catalog'){namespaces}) AS t(oid, nspname)"),
                 format!("pg_class AS SELECT * FROM (VALUES (0, '', 0, ''){}) AS t(oid, relname, relnamespace, relkind) WHERE oid > 0", classes.iter().map(|c| format!(", {c}")).collect::<String>()),
-                "pg_database AS SELECT * FROM (VALUES (1, 'pondra')) AS t(oid, datname)".into(),
+                format!("pg_database AS SELECT * FROM (VALUES (1, '{}')) AS t(oid, datname)", crate::ddl::lake_name(lake)),
             ] {
                 ctx.sql(&format!("CREATE VIEW {view}")).await.map_err(|e| user_error(e.into()))?;
             }
@@ -157,10 +162,10 @@ impl Backend {
 }
 
 /// psql, JDBC and SQLAlchemy ask for a few Postgres-only things on connect.
-fn pg_dialect(sql: &str) -> String {
+fn pg_dialect(lake: &crate::store::Lake, sql: &str) -> String {
     let sql = sql.trim().trim_end_matches(';').replace("pg_catalog.", "");
     let sql = if sql.eq_ignore_ascii_case("select version()") { "SELECT version() AS version".into() } else { sql }; // (the column's name in Postgres)
-    sql.replace("current_schema()", "'public'").replace("current_database()", "'pondra'").replace("version()", "'PostgreSQL 16.0 (Pondra on Apache DataFusion)'")
+    sql.replace("current_schema()", "'public'").replace("current_database()", &format!("'{}'", crate::ddl::lake_name(lake))).replace("version()", "'PostgreSQL 16.0 (Pondra on Apache DataFusion)'")
 }
 
 /// Session settings and transactions: accepted (every statement commits on its own).
@@ -301,7 +306,7 @@ impl ExtendedQueryHandler for Backend {
         C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
     {
         let user = client.metadata().get("user").cloned().unwrap_or_default();
-        let inferred = self.param_types(&pg_dialect(&portal.statement.statement)).await;
+        let inferred = self.param_types(&pg_dialect(&self.app.lake, &portal.statement.statement)).await;
         self.run(&user, &bind(portal, &inferred)?, &portal.result_column_format).await
     }
 
@@ -309,7 +314,7 @@ impl ExtendedQueryHandler for Backend {
     where
         C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
     {
-        let sql = pg_dialect(&stmt.statement);
+        let sql = pg_dialect(&self.app.lake, &stmt.statement);
         Ok(DescribeStatementResponse::new(self.param_types(&sql).await, self.describe(&sql, &Format::UnifiedText).await?))
     }
 
@@ -317,8 +322,8 @@ impl ExtendedQueryHandler for Backend {
     where
         C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
     {
-        let inferred = self.param_types(&pg_dialect(&portal.statement.statement)).await;
-        Ok(DescribePortalResponse::new(self.describe(&pg_dialect(&bind(portal, &inferred)?), &portal.result_column_format).await?))
+        let inferred = self.param_types(&pg_dialect(&self.app.lake, &portal.statement.statement)).await;
+        Ok(DescribePortalResponse::new(self.describe(&pg_dialect(&self.app.lake, &bind(portal, &inferred)?), &portal.result_column_format).await?))
     }
 }
 

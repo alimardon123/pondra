@@ -1,0 +1,52 @@
+{
+ "lake": "/tmp/pondra-23pp4znp",
+ "pondra": {
+  "events": 60000,
+  "kv": 50,
+  "totals": 100,
+  "dims": 100
+ },
+ "external": {
+  "events": {
+   "delta/delta-rs": 60000,
+   "delta/polars": 60000,
+   "delta/duckdb": 60000,
+   "iceberg/pyiceberg": 60000,
+   "iceberg/polars": 60000,
+   "iceberg/duckdb": 60000,
+   "iceberg/rest/pyiceberg": 60000,
+   "iceberg/rest/duckdb": 60000
+  },
+  "kv": {
+   "delta/delta-rs": 50,
+   "delta/polars": 50,
+   "delta/duckdb": 50,
+   "iceberg/pyiceberg": 50,
+   "iceberg/polars": 50,
+   "iceberg/duckdb": 50,
+   "iceberg/rest/pyiceberg": 50,
+   "iceberg/rest/duckdb": 50
+  },
+  "totals": {
+   "delta/delta-rs": 100,
+   "delta/polars": 100,
+   "delta/duckdb": 100,
+   "iceberg/pyiceberg": 100,
+   "iceberg/polars": 100,
+   "iceberg/duckdb": 100,
+   "iceberg/rest/pyiceberg": 100,
+   "iceberg/rest/duckdb": 100
+  },
+  "dims": {
+   "delta/delta-rs": 100,
+   "delta/polars": 100,
+   "delta/duckdb": 100,
+   "iceberg/pyiceberg": 100,
+   "iceberg/polars": 100,
+   "iceberg/duckdb": 100,
+   "iceberg/rest/pyiceberg": 100,
+   "iceberg/rest/duckdb": 100
+  }
+ },
+ "match": true
+}

@@ -276,7 +276,10 @@ impl FlightSqlService for Sql {
 
     async fn do_put_statement_ingest(&self, cmd: CommandStatementIngest, req: Request<PeekableFlightDataStream>) -> Result<i64, Status> {
         let role = allowed(&self.0, &req, Role::Write)?;
-        let table = cmd.table.clone();
+        let table = match cmd.schema.as_deref() {
+            Some(schema) if !schema.is_empty() => crate::ddl::join(schema, &cmd.table), // (ADBC's db_schema_name)
+            _ => cmd.table.clone(),
+        };
         let mut batches = arrow_flight::decode::FlightRecordBatchStream::new_from_flight_data(req.into_inner().map_err(Into::into)).map_err(Status::from).peekable();
         let exists = self.0.lake.cat.get::<TableMeta>(&table_key(&table)).await.map_err(status)?.is_some();
         if !exists {
@@ -332,7 +335,7 @@ impl FlightSqlService for Sql {
     async fn do_get_catalogs(&self, q: CommandGetCatalogs, req: Request<Ticket>) -> Result<Response<Out<FlightData>>, Status> {
         allowed(&self.0, &req, Role::Read)?;
         let mut b = q.into_builder();
-        b.append("pondra");
+        b.append(crate::ddl::lake_name(&self.0.lake));
         Ok(Response::new(send(b.schema(), vec![b.build().map_err(status)?])))
     }
 
@@ -343,7 +346,9 @@ impl FlightSqlService for Sql {
     async fn do_get_schemas(&self, q: CommandGetDbSchemas, req: Request<Ticket>) -> Result<Response<Out<FlightData>>, Status> {
         allowed(&self.0, &req, Role::Read)?;
         let mut b = q.into_builder();
-        b.append("pondra", "default");
+        for schema in crate::ddl::schemas(&self.0.lake).await.map_err(status)? {
+            b.append(crate::ddl::lake_name(&self.0.lake), schema);
+        }
         Ok(Response::new(send(b.schema(), vec![b.build().map_err(status)?])))
     }
 
@@ -353,10 +358,17 @@ impl FlightSqlService for Sql {
 
     async fn do_get_tables(&self, q: CommandGetTables, req: Request<Ticket>) -> Result<Response<Out<FlightData>>, Status> {
         allowed(&self.0, &req, Role::Read)?;
-        let mut b = q.into_builder();
-        for (key, meta) in self.0.lake.cat.scan::<TableMeta>("t/", "t0").await.map_err(status)? {
-            let schema = crate::query::schema(&meta.columns).map_err(status)?;
-            b.append("pondra", "default", &key[2..], "TABLE", &schema).map_err(status)?;
+        let (mut b, lake) = (q.into_builder(), &self.0.lake);
+        for (key, meta) in lake.cat.scan::<TableMeta>("t/", "t0").await.map_err(status)? {
+            let (schema, table) = crate::ddl::split(&key[2..]);
+            let columns = crate::query::schema(&meta.columns).map_err(status)?;
+            b.append(crate::ddl::lake_name(lake), schema, table, "TABLE", &columns).map_err(status)?;
+        }
+        for (key, _) in lake.cat.scan::<crate::ddl::StoredView>("q/", "q0").await.map_err(status)? {
+            let (schema, view) = crate::ddl::split(&key[2..]);
+            if let Ok(columns) = plan_schema(&self.0, &format!("SELECT * FROM {}", crate::write::sql_name(&key[2..]))).await {
+                b.append(crate::ddl::lake_name(lake), schema, view, "VIEW", &columns).map_err(status)?;
+            }
         }
         Ok(Response::new(send(b.schema(), vec![b.build().map_err(status)?])))
     }
@@ -386,7 +398,7 @@ impl FlightService for Door {
         let mut infos = vec![];
         for (key, meta) in app.lake.cat.scan::<TableMeta>("t/", "t0").await.map_err(status)? {
             let table = &key[2..];
-            let ticket = serde_json::json!({"sql": format!("SELECT * FROM \"{table}\"")}).to_string();
+            let ticket = serde_json::json!({"sql": format!("SELECT * FROM {}", crate::write::sql_name(table))}).to_string();
             let schema = crate::query::schema(&meta.columns).map_err(status)?;
             infos.push(Ok(FlightInfo::new().try_with_schema(&schema).map_err(status)?.with_endpoint(FlightEndpoint::new().with_ticket(Ticket::new(ticket))).with_descriptor(FlightDescriptor::new_path(vec![table.to_string()]))));
         }

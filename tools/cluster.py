@@ -140,10 +140,13 @@ def users():
 
 
 def race():
-    """Every node starts at the same moment on an empty lake: exactly one must lead."""
+    """Every node starts at the same moment on an empty lake: exactly one must lead, and none may
+    fail (a follower that opened the lake before its leader had made the catalog used to exit:
+    seen on R2 with three machines). Then a node finds the lake's first leader gone before it
+    made the catalog: it waits for that leader's mark to go stale, then leads."""
     lake = harness.new_lake()
     nodes = [Node(lake, A.port + i) for i in range(A.nodes)]
-    threads = [threading.Thread(target=nd.start) for nd in nodes]
+    threads = [threading.Thread(target=nd.start, kwargs={"tries": 1}) for nd in nodes]  # (no second chance)
     [t.start() for t in threads]
     [t.join() for t in threads]
     time.sleep(2)
@@ -152,7 +155,22 @@ def race():
     agree = len({s.get("leader") or f"127.0.0.1:{nd.port}" for nd, s in zip(nodes, stats)})
     print(f"race: {A.nodes} nodes started at once -> {len(leaders)} leader(s), all agree: {agree == 1}")
     [nd.kill() for nd in nodes]
-    return len(leaders) == 1 and agree == 1
+    # A leader that claimed the lake and died before making its catalog (its mark is fresh).
+    young = harness.new_lake()
+    put = lambda key, body: harness.put_object(young, key, body)
+    put("cluster/term/" + "1".zfill(20), json.dumps({"n": 1, "addr": "127.0.0.1:1"}).encode())
+    put("cluster/alive/" + "1".zfill(20), b"")
+    t = time.time()
+    late = Node(young, A.port + A.nodes)
+    try:
+        late.start(tries=1)
+        took_over = call(late.port, "GET", "/stats")["role"] == "leader"
+    except RuntimeError as e:
+        print(f"race: the node didn't wait for the catalog: {e}")
+        took_over = False
+    print(f"race: a leader that never made the catalog -> the next node leads after {time.time() - t:.0f} s: {took_over}")
+    late.kill()
+    return len(leaders) == 1 and agree == 1 and took_over
 
 
 def failover():

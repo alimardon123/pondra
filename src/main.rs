@@ -4,6 +4,7 @@ mod ai;
 mod asof;
 mod auth;
 mod cache;
+mod ddl;
 mod delta;
 mod files;
 mod flight;
@@ -80,7 +81,7 @@ enum Cmd {
         /// Streaming tasks run as soon as new rows commit, and at least this often (milliseconds).
         #[arg(long, default_value_t = 1000)]
         task_ms: u64,
-        /// Memory for queries, in GB (also PONDRA_MEMORY_GB; default: half the machine's).
+        /// Memory for queries, in GB (also PONDRA_MEMORY_GB; default: a third of the machine's).
         /// Sorts, joins and aggregations that need more spill to the temp dir.
         #[arg(long)]
         memory_gb: Option<f64>,
@@ -248,11 +249,22 @@ async fn main() -> anyhow::Result<()> {
                     tokio::time::sleep(Duration::from_secs(1)).await;
                     cluster::restart("opening the lake as leader failed")
                 }
+                // A new lake whose first leader hasn't made the catalog yet (nodes started
+                // together), or never will (it died first): look again, until it has or its
+                // mark goes stale and this node takes over.
+                Err(e) if format!("{e:#}").contains("failed to find latest transactional object") => {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    cluster::restart("the lake has no catalog yet: its leader is still making it")
+                }
                 lake => lake?,
             };
             for spec in &attached {
                 attach(&lake, spec, &addr, true).await?;
             }
+            // The lakes attached in SQL (`ATTACH … AS …`), and later ATTACHes and DETACHes.
+            let (l, me) = (lake.clone(), addr.clone());
+            ddl::sync(&l, &me, true).await?;
+            every(Duration::from_secs(1), move || { let (l, me) = (l.clone(), me.clone()); async move { ddl::sync(&l, &me, true).await } });
             let l = lake.clone();
             tokio::spawn(async move { l.warm().await.map_err(|e| eprintln!("warming the SSD tier: {e:#}")) });
             // Followers keep the leader's changes that aren't in the bucket yet (replicated acks);
@@ -370,7 +382,10 @@ async fn main() -> anyhow::Result<()> {
             }
             let role = if reader { "reader" } else if leader { "leader" } else { "follower" };
             eprintln!("pondra {role} (term {}) serving {dir} on {addr}", cluster.leader.n);
-            axum::serve(tokio::net::TcpListener::bind(&addr).await?, server::router(app)).await?;
+            // No Nagle: a small answer goes out at once, not after the client's delayed ACK (the
+            // Postgres, Kafka and Flight ports do the same).
+            let listener = axum::serve::ListenerExt::tap_io(tokio::net::TcpListener::bind(&addr).await?, |tcp| drop(tcp.set_nodelay(true)));
+            axum::serve(listener, server::router(app)).await?;
         }
         Cmd::Catalog { dir, prefix } => {
             let lake = store::Lake::open(&dir, false, false).await?;
@@ -390,6 +405,7 @@ async fn main() -> anyhow::Result<()> {
                 for spec in &attached {
                     attach(&lake, spec, "", false).await?;
                 }
+                ddl::sync(&lake, "", false).await?;
                 let batches = query::session(&lake, &query, "").await?.enable_url_table().sql(&query).await?.collect().await?;
                 println!("{}", pretty_format_batches(&batches)?);
             }
@@ -402,20 +418,7 @@ async fn main() -> anyhow::Result<()> {
 /// read-only node does: its leader's commit stream when that answers, and its own catalog view.
 async fn attach(home: &store::Lake, spec: &str, me: &str, follow: bool) -> anyhow::Result<()> {
     let (name, dir) = spec.split_once('=').ok_or_else(|| anyhow::anyhow!("--attach takes name=dir"))?;
-    let leader = cluster::latest(&store::open_store(dir)?.1).await?.map(|t| t.addr).filter(|a| !a.is_empty());
-    let live = match (&leader, follow) {
-        (Some(a), true) => cluster::http().get(format!("http://{a}/cluster/leader")).timeout(Duration::from_secs(2)).send().await.is_ok(),
-        _ => false,
-    };
-    let other = store::Lake::open(dir, false, live).await?;
-    if let (true, Some(a)) = (live, leader) {
-        cluster::mirror(other.clone(), a, me.to_string(), None);
-    }
-    if follow {
-        let l = other.clone();
-        every(Duration::from_millis(250), move || { let l = l.clone(); async move { l.refresh().await } });
-    }
-    home.attach(name, other)
+    ddl::attach(home, name, dir, me, follow, follow).await
 }
 
 /// Run `job` forever, starting every `period` (right away if a run took longer; a zero period

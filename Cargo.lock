@@ -3158,7 +3158,7 @@ checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 
 [[package]]
 name = "pondra"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "anyhow",
  "arrow-flight",
@@ -3188,6 +3188,7 @@ dependencies = [
  "serde_json",
  "slatedb",
  "snap",
+ "sysinfo",
  "tokio",
  "tonic",
  "url",

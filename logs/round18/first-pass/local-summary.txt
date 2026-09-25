@@ -1,0 +1,18 @@
+harness-all exit=0 secs=194
+users-1 exit=0 secs=32
+users-2 exit=0 secs=32
+failover-1 exit=0 secs=66
+failover-2 exit=0 secs=65
+failover-3 exit=0 secs=65
+race exit=0 secs=33
+isolate exit=0 secs=18
+spread exit=0 secs=5
+latency exit=0 secs=24
+open-check exit=0 secs=13
+asof-check exit=0 secs=31
+skew-check exit=0 secs=4
+shuffle-spill exit=0 secs=62
+stream-check exit=0 secs=22
+freshness exit=0 secs=35
+crash-big exit=0 secs=154
+ALL-DONE

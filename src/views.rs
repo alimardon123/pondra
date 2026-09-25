@@ -60,6 +60,19 @@ pub struct Sessions {
 }
 
 pub fn view_key(name: &str) -> String { format!("v/{name}") }
+
+/// `CREATE MATERIALIZED VIEW … WITH (window = 'w', size_secs = 60, lateness_secs = 10)` or
+/// `WITH (session = 'ts', gap_secs = 1800, lateness_secs = 5)`: what `POST /views/{v}?…` takes.
+pub fn options(kv: &std::collections::BTreeMap<String, String>) -> Result<(Option<Emit>, Option<Sessions>)> {
+    if let Some(k) = kv.keys().find(|k| !["window", "size_secs", "lateness_secs", "session", "gap_secs"].contains(&k.as_str())) {
+        bail!("{k}: a materialized view's options are window, size_secs, lateness_secs, session and gap_secs");
+    }
+    let num = |k: &str, d: u64| kv.get(k).map_or(Ok(d), |v| v.parse::<u64>().map_err(|_| anyhow::anyhow!("{k} is a number of seconds")));
+    let lateness_secs = num("lateness_secs", 0)?;
+    let emit = kv.get("window").map(|w| Ok::<_, anyhow::Error>(Emit { window: w.clone(), size_secs: num("size_secs", 60)?, lateness_secs, time: None })).transpose()?;
+    let sessions = kv.get("session").map(|t| Ok::<_, anyhow::Error>(Sessions { time: t.clone(), gap_secs: num("gap_secs", 1800)?, lateness_secs, keys: vec![] })).transpose()?;
+    Ok((emit, sessions))
+}
 /// A session view's bound: no session still open starts before this (µs).
 fn open_key(name: &str) -> String { format!("w/{name}") }
 
@@ -73,7 +86,8 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, mut emit: Option<Emit>, 
         return Ok(()); // (asked again, the same: a notebook cell run twice)
     }
     ensure!(lake.cat.get::<TableMeta>(&table_key(name)).await?.is_none(), "table {name} already exists");
-    let source = first_table(sql)?;
+    let (other, source) = crate::ddl::resolve(lake, &first_table(sql)?).await?;
+    ensure!(other.is_none(), "a view follows a table of this lake");
     let src: TableMeta = lake.cat.get(&table_key(&source)).await?.with_context(|| format!("no table {source}"))?;
     if let Some(s) = sessions {
         ensure!(emit.is_none(), "a view emits windows or sessions, not both");

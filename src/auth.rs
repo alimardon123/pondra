@@ -67,7 +67,7 @@ impl Auth {
 
     /// May this role run this write?
     pub fn allows(&self, role: Role, stmt: &Stmt) -> Result<()> {
-        let need = if matches!(stmt, Stmt::Create(_) | Stmt::AddColumn(..)) { Role::Admin } else { Role::Write };
+        let need = if matches!(stmt, Stmt::Create(_) | Stmt::Define(..) | Stmt::AddColumn(..) | Stmt::Ddl(_)) { Role::Admin } else { Role::Write };
         if role < need {
             bail!("this token may not {}", if need == Role::Admin { "create tables" } else { "write" });
         }

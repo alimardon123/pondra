@@ -1,0 +1,9 @@
+# Per-query cost of schemas and stored views (two more catalog scans per planned query).
+# One node, local disk, 800 queries each (first 100 dropped), [p50 ms, p99 ms], two runs each, alternating.
+# point: SELECT v FROM kv WHERE k = i (the serving fast path); agg: SELECT count(*) FROM ev WHERE x > i.5
+# (200k rows; unique, so never from the result cache); scan: SELECT v FROM kv WHERE v = 'vi' (20k rows);
+# select1: SELECT i. 22 tables in the catalog. pondra-r17-nofsum = round 17's code.
+{"bin": "pondra-r17-nofsum", "point": [0.253, 0.439], "agg": [3.353, 7.007], "scan": [1.63, 3.067], "select1": [0.63, 1.937]}
+{"bin": "pondra", "point": [0.25, 0.688], "agg": [2.944, 5.912], "scan": [1.517, 3.037], "select1": [0.599, 1.023]}
+{"bin": "pondra-r17-nofsum", "point": [0.247, 0.961], "agg": [3.069, 10.337], "scan": [1.72, 2.876], "select1": [0.607, 1.102]}
+{"bin": "pondra", "point": [0.242, 0.534], "agg": [2.904, 5.722], "scan": [1.842, 4.006], "select1": [0.647, 1.268]}

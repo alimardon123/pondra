@@ -1,20 +1,28 @@
-# Pondra: what's left, and in what order (after round 16)
+# Pondra: what's left, and in what order (after round 18)
 
 **Date:** 2026-09-25 · **Status:** proposed; the order in "The rounds" is what I recommend, the
 decisions in "What only you can decide" are yours · **Builds on:** ADR-002 to ADR-017,
 `prototype-status.md`, `comparison-spark-flink-fluss.md`
 
-**Progress (2026-09-27):** round 17 is done (ADR-018). The Linux binary needs only glibc 2.17
-and runs on CentOS 7 and Ubuntu 22.04. The pip and npm packages are built and tried in fresh
-environments, a quick-start notebook runs from its own `%pip install`, and `pondra` opens a SQL
-shell. Both flaky tests are fixed: the Kafka earliest-offset loop, and q15, where `sum` over
-DOUBLE now gives the same answer in any order. A5 was measured and the lite build rejected: the
-front doors are under 1% of the binary. Still waiting:
+**Progress (2026-09-28):** rounds 17 and 18 are done (ADR-018, ADR-019).
 
-- **A7, Windows on a real machine:** the release workflow's first run, or your laptop.
+- **Round 17** made Pondra install anywhere: a glibc 2.17 Linux binary, pip and npm packages
+  (built, not published), a SQL shell, and both flaky tests fixed.
+- **Round 18** took the owner's first session on Windows as its list. A lake is now a database of
+  schemas: `lake.schema.table`, attached lakes as databases too, `CREATE`/`DROP SCHEMA`, `DROP
+  TABLE`, `CREATE TABLE … AS`, stored views (`CREATE VIEW`), `CREATE MATERIALIZED VIEW`, and
+  `ATTACH … AS …` for queries across lakes, as SQL Server allows across databases. A7
+  is done: the owner ran the Windows build, and its memory figures, which came from Linux's
+  `/proc`, now come from the OS; CI runs a smoke test on Windows, macOS and Linux. C1 started:
+  the first 3-node run on GitHub's runners was right but slower than one node; the second lost a
+  node at start to a race (fixed), and the bench now measures what crosses the network.
+
+Still waiting:
+
+- **C1's numbers:** a 3-node run that completes, with the new measurements.
 - **Publishing:** the package names and the repository decision below.
 
-Round 18 is next.
+Round 19 is next: `UPDATE`, `DELETE` and `MERGE` on every table, with system columns.
 
 ## Where Pondra stands
 
@@ -109,7 +117,7 @@ Size: **S** = part of a round, **M** = about one round, **L** = more than one.
 | A4 | A built-in web console at `/`: SQL editor, tables and their columns, live results | The first five minutes of a new user | M | Open a browser at the node, no other install |
 | A5 | Cargo features for Kafka, Flight, Postgres, AI and the Iceberg REST catalog, and a measured "lite" build | Smaller downloads where they matter | S–M | Sizes of the full and lite builds, side by side |
 | A6 | Defaults for small machines: the disk cache sized to the free disk, and `pondra` with no arguments starting a lake in `./lake` | Sandboxes with little disk | S | The notebook test above, on a 10 GB disk |
-| A7 | Windows checked on a real Windows machine | Your laptop runs Windows | S | The `.exe` runs the quick start on your laptop |
+| A7 ✓ | Windows checked on a real Windows machine | Your laptop runs Windows | S | The `.exe` runs on your laptop (round 18); CI runs `smoke.py` on Windows and macOS |
 
 ### B. In-process and in the browser
 
@@ -149,6 +157,9 @@ a list of URLs? If it can, that gives a browser read path at no cost.
 | E2 | BI tools on Windows: Power BI Desktop, DBeaver, Tableau, over Postgres ODBC/JDBC and Flight SQL | How teams look at data | S | Each connects and refreshes a report |
 | E3 | Security: TLS built in, per-table grants, an audit log (a system table fed by the change feed), quotas | Before anyone else's data goes in | M–L | A second user sees only what they are granted; every write audited |
 | E4 | Schema changes beyond ADD COLUMN: rename, drop, widen a type, defaults | Tables change | M | Each under load, with Delta and Iceberg readers following |
+| E5 ✓ | Schemas and three-part names, DDL in SQL (`DROP`, `CREATE TABLE … AS`, `CREATE VIEW`, `CREATE MATERIALIZED VIEW`) | What a database user types first (the owner, on Windows) | M | `harness.py schemas` (round 18) |
+| E6 | `UPDATE`, `DELETE` and `MERGE` on every table; system columns: a row id, when a row was written, its version | The owner's request; changing an append table's rows needs to know which row is which | M–L | Each on append and keyed tables, under streaming ingest, with views, the change feed, Kafka consumers, Delta and Iceberg readers following |
+| E7 | Materialized views filled from the rows already there | A view created on a table with data starts empty today | M | A view created mid-stream equals the query over the whole table |
 
 ### F. Depth, ordered by what the tracks above show
 
@@ -180,21 +191,26 @@ simulated R2 and real R2, an ADR, and a bundle.
 
 | Round | Theme | Items | What you'd see at the end |
 |---|---|---|---|
-| 17 ✓ | Install anywhere (done: ADR-018) | A1, A2, A3, A5 (measure), A6, A7, D3 | `pip install pondra` works in a fresh Ubuntu 22.04 notebook; the `.exe` runs on your laptop; both flakes fixed |
-| 18 | Proof at scale | C1, C3, D1 (start) | TPC-H SF10 at 1/3/6 machines; Nexmark against Flink; the SQL test files' pass rate |
-| 19 | Use it from anything | A4, B3, E1, E2 | A console at `/`, live queries, dbt and Power BI working |
-| 20 | In-process | B1, B2 | `pondra.open(…)` in a notebook reads and writes a cluster's lake, no server |
-| 21 | Safe to share | E3, D2 | TLS, grants, audit; random-query checks against DuckDB |
-| 22 | In the browser | B4 (after the DuckDB-WASM check) | A lake queried in a web page, straight from the bucket |
-| 23+ | Depth | C2, C4, E4, then F by evidence | Whatever the scale runs and first users show matters most |
+| 17 ✓ | Install anywhere (done: ADR-018) | A1, A2, A3, A5 (measure), A6, D3 | `pip install pondra` works in a fresh Ubuntu 22.04 notebook; both flakes fixed |
+| 18 ✓ | A database you can shape (done: ADR-019) | E5, A7, C1 (measuring) | `lake.schema.table`, DDL and views in SQL; the `.exe` on your laptop; the cluster bench measures the network |
+| 19 | Change any row | E6, E7 | `UPDATE`/`DELETE`/`MERGE` on every table with system columns, streaming following every change |
+| 20 | Proof at scale | C1, C3, D1 (start) | TPC-H SF10 at 1/3/6 machines; Nexmark against Flink; the SQL test files' pass rate |
+| 21 | Use it from anything | A4, B3, E1, E2 | A console at `/`, live queries, dbt and Power BI working |
+| 22 | In-process | B1, B2 | `pondra.open(…)` in a notebook reads and writes a cluster's lake, no server |
+| 23 | Safe to share | E3, D2 | TLS, grants, audit; random-query checks against DuckDB |
+| 24 | In the browser | B4 (after the DuckDB-WASM check) | A lake queried in a web page, straight from the bucket |
+| 25+ | Depth | C2, C4, E4, then F by evidence | Whatever the scale runs and first users show matters most |
 
 Why this order:
 
 - **Round 17 comes first** because it needs nothing from you but decisions. It also makes every
   later demo possible: a notebook, a laptop, a CI runner.
-- **Round 18 needs machines.** It can run while you set up round 17's outcomes.
-- **Round 19 comes before the in-process and browser work** because a console and live queries
-  are short steps on what exists. The library split in round 20 is the bigger change.
+- **Round 19 is the owner's request**, and it needs the row identity that `MERGE`, CDC and the
+  system columns all rest on; it is design work before code.
+- **Proof at scale needs machines,** and runs on GitHub's runners whenever the owner starts the
+  bench: its fixes can land in any round, as the numbers come in.
+- **"Use it from anything" comes before the in-process and browser work** because a console and
+  live queries are short steps on what exists. The library split is the bigger change.
 - **Security comes before the browser.** It matters as soon as anyone else's data goes in.
 
 ## What only you can decide

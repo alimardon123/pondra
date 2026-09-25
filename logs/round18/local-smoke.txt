@@ -1,0 +1,10 @@
+{
+ "smoke": {
+  "the shell runs statements from its input": true,
+  "SQL: a schema, a table in it, a view": true,
+  "the node knows its resident memory": true,
+  "and the machine's (a third of it for queries, not the 4 GiB guess)": true
+ },
+ "platform": "linux",
+ "ok": true
+}

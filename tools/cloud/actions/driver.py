@@ -94,13 +94,25 @@ def best(node, sql, spread, runs):
     return round(min(times), 3), out
 
 
+def answers(node):
+    try:
+        return call(node, "GET", "/stats", timeout=5)
+    except OSError:
+        return None
+
+
+def joined(nodes):
+    """The members the cluster lists, asked of every node that answers."""
+    return max((set(s.get("nodes", [])) for s in map(answers, nodes) if s), key=len, default=set())
+
+
 def main():
     nodes = A.nodes.split(",")
     head = nodes[0]
     deadline = time.time() + 600
-    while len(call(head, "GET", "/stats").get("nodes", [])) < len(nodes):
+    while len(joined(nodes)) < len(nodes):  # (a node may still be starting, or restarting to rejoin)
         if time.time() > deadline:
-            sys.exit(f"only {call(head, 'GET', '/stats').get('nodes')} of {len(nodes)} nodes joined")
+            sys.exit(f"only {joined(nodes)} of {nodes} joined; not answering: {[n for n in nodes if not answers(n)]}")
         time.sleep(2)
     net = network(nodes)
     print(json.dumps({"network": net}, indent=1), flush=True)
