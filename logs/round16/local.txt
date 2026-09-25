@@ -1063,7 +1063,7 @@ q22         0.049      0.026      0.041
 total         3.26        2.01        3.17
 {"pondra_load_s": 7.9, "duckdb_load_s": 0.0, "duckdb_wall_s": 10.5, "pondra_warm_s": 8.6, "pondra_wall_s": 7.1, "pondra-cold_wall_s": 10.6}
 
-=== bench/singlenode.py: round 15's binary (c484271), then round 16's, back to back (pondra, pondra-cold) — the hot run's 1.69 s in round 15 was the box, not the code
+=== bench/singlenode.py: round 15's binary (21b4df2), then round 16's, back to back (pondra, pondra-cold) — the hot run's 1.69 s in round 15 was the box, not the code
 == pondra
   pondra            q1    0.112 s
   pondra            q2    0.023 s

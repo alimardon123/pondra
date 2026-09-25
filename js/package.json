@@ -8,5 +8,6 @@
   "files": ["index.js", "bin/pondra.js", "README.md"],
   "engines": { "node": ">=18" },
   "license": "UNLICENSED",
+  "private": true,
   "optionalDependencies": {}
 }

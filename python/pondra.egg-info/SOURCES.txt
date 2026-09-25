@@ -1,0 +1,7 @@
+pyproject.toml
+pondra/__init__.py
+pondra.egg-info/PKG-INFO
+pondra.egg-info/SOURCES.txt
+pondra.egg-info/dependency_links.txt
+pondra.egg-info/requires.txt
+pondra.egg-info/top_level.txt

@@ -1,0 +1,9 @@
+Metadata-Version: 2.4
+Name: pondra
+Version: 0.17.0
+Summary: Pondra, a streamhouse in one binary: the binary, and a Python client (SQL into pandas/Polars/Arrow, exactly-once appends, change feeds)
+Classifier: License :: Other/Proprietary License
+Classifier: Private :: Do Not Upload
+Requires-Python: >=3.9
+Provides-Extra: arrow
+Requires-Dist: pyarrow; extra == "arrow"

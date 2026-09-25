@@ -37,7 +37,8 @@ def wheel(binary, platform, out):
     meta = "\n".join([
         "Metadata-Version: 2.1", "Name: pondra", f"Version: {v}",
         "Summary: Pondra, a streamhouse in one binary: the binary, and a Python client",
-        "Requires-Python: >=3.9", "Provides-Extra: arrow", 'Requires-Dist: pyarrow; extra == "arrow"',
+        "Requires-Python: >=3.9", "Classifier: License :: Other/Proprietary License",
+        "Classifier: Private :: Do Not Upload", "Provides-Extra: arrow", 'Requires-Dist: pyarrow; extra == "arrow"',
         "Description-Content-Type: text/markdown", "", readme])
     wheel_file = "\n".join(["Wheel-Version: 1.0", "Generator: pondra tools/package.py", "Root-Is-Purelib: false"] + [f"Tag: py3-none-{t}" for t in tags.split(".")]) + "\n"
     files = {"pondra/__init__.py": open(os.path.join(ROOT, "python/pondra/__init__.py"), "rb").read(),
@@ -66,7 +67,7 @@ def npm_platform(binary, platform, out):
         shutil.copy2(binary, os.path.join(d, exe))
         os.chmod(os.path.join(d, exe), 0o755)
         json.dump({"name": f"pondra-{platform}", "version": version(), "description": f"The pondra binary for {platform}: install `pondra` instead",
-                   "os": [os_], "cpu": [cpu], "files": [exe], "license": "UNLICENSED"}, open(os.path.join(d, "package.json"), "w"), indent=2)
+                   "os": [os_], "cpu": [cpu], "files": [exe], "license": "UNLICENSED", "private": True}, open(os.path.join(d, "package.json"), "w"), indent=2)
         return npm_pack(d, out)
 
 

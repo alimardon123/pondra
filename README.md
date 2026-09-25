@@ -322,3 +322,10 @@ bucket to its newest lakes.
   (the leader and every holder dying before that PUT) for milliseconds.
 - A one-off `pondra sql` on far-away object storage spends 1–3 s opening the catalog; join
   (`pondra serve --reader`) for millisecond reads.
+
+## License
+
+All rights reserved (`LICENSE`). The code is public to read, but it may not be used, copied,
+changed or redistributed without the author's written permission. Until a license is chosen,
+the packages are marked so that PyPI and npm refuse them (`Private :: Do Not Upload`,
+`"private": true`) and the crate so that crates.io does (`publish = false`).

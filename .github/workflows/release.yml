@@ -4,7 +4,8 @@ name: release
 # npm (`tools/package.py`), each package tried on its platform, then attached to a GitHub release
 # and published to PyPI and npm. Publishing needs, once: PyPI's "trusted publishing" set up for
 # this workflow (no token), and an NPM_TOKEN secret. A run started by hand publishes nothing
-# unless `publish` is ticked.
+# unless `publish` is ticked. While Pondra is all rights reserved, its packages are marked so that PyPI
+# and npm refuse them (README, "License"): lift those marks when a license is chosen.
 on:
   push:
     tags: ["v*"]

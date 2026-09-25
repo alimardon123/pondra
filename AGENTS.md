@@ -480,9 +480,17 @@ R2; round 12's are in `logs/round12/`, round 13's in `logs/round13/`, round 14's
 all. After R2 runs: `tools/clean_bucket.py --bucket ponderabucket-us --bucket pondbucket --newest
 3 --dry-run`, then without `--dry-run`.
 
+**The repository (2026-09-27).** `alimardon123/pondra` on GitHub holds the code, pushed by the
+owner from the bundles (the sandbox can't push). It is public but **all rights reserved**
+(`LICENSE`): nobody may reuse it, and the packages are marked so PyPI, npm and crates.io refuse
+them until the owner picks a license. Its history was rewritten once, before it went public, to
+put the owner's GitHub noreply address on the four commits that had their email; commit IDs from
+before then (in older bundles) differ. Each round the owner downloads the new bundle and, in
+their clone, runs `git pull <bundle> main` and `git push`; GitHub then builds it on Linux,
+Windows and macOS (`.github/workflows/build.yml`).
+
 **Where the multi-machine run will happen (the owner's plan, 2026-09-23).** The owner has no VMs
-of their own and the repo (`alimardon123/pondra`) is **private**. They will run the multi-machine
-tests themselves, later, on one of:
+of their own. They will run the multi-machine tests themselves, later, on one of:
 
 - **GitHub Actions** — free runners joined into one network with Tailscale's free plan, the lake
   in their R2 bucket. A private repo gets 2-vCPU / 8 GB runners and a monthly minute allowance; a

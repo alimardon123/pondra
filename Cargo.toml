@@ -3,6 +3,8 @@ name = "pondra"
 version = "0.17.0"
 edition = "2021"
 description = "Pondra: a streamhouse in one binary"
+license-file = "LICENSE"
+publish = false # (all rights reserved until a license is chosen)
 
 [dependencies]
 parquet = { version = "59", default-features = false, features = ["snap", "zstd", "lz4"] }
