@@ -423,9 +423,9 @@ python3 tools/bench/singlenode.py run --data ~/tpch/sf1-bench --sf 1   # vs Duck
 python3 tools/serve_bench.py --keys 2000000   # serving: point lookups and dashboard queries
 ```
 
-The Python tools need `pip install pyarrow pandas polars duckdb deltalake pyiceberg s3fs boto3
-moto psycopg psycopg2-binary asyncpg sqlalchemy confluent-kafka kafka-python mcp
-adbc-driver-flightsql`.
+The Python tools need `pip install -r tools/requirements.txt` (Python 3.11; the versions the
+suite last passed with). `.github/workflows/build.yml` runs `harness.py all` and a failover on
+every push with them.
 
 Add `--s3` to any of them with a simulated-R2 bucket to see the object-storage behaviour:
 

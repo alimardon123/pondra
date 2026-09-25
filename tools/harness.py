@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Test harness for Pondra (stdlib only). Every test runs on a fresh lake: a temp dir, or with
+"""Test harness for Pondra (the Python packages it uses: tools/requirements.txt). Every test runs on a fresh lake: a temp dir, or with
 --s3 a fresh s3://$PONDRA_BUCKET/test-<id> prefix (AWS_* env vars point at R2/MinIO/the simulator).
 
   harness.py crash   --runs 20   kill -9 + injected crashes during commit, tiering and tasks

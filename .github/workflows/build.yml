@@ -32,12 +32,22 @@ jobs:
           path: ${{ matrix.bin }}
 
   test:
+    needs: build # (the Linux binary the build job made: no second compile)
     runs-on: ubuntu-latest
+    env:
+      PONDRA_BIN: ${{ github.workspace }}/bin/pondra
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release
-      # The fast correctness suite: upsert, split brain, bulk insert, reader freshness, crashes.
+      - uses: actions/download-artifact@v4
+        with:
+          name: pondra-linux-x86_64
+          path: bin
+      - run: chmod +x bin/pondra
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r tools/requirements.txt
+      # The quick correctness suite (upserts, split brain, crashes, clients, Kafka, windows,
+      # sums, scale, Flight…), then a cluster losing its leader twice.
       - run: python3 tools/harness.py all
       - run: python3 tools/cluster.py failover --secs 30
