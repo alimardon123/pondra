@@ -27,12 +27,11 @@ def read_object(lake, path):
 
 def duck(lake):
     """A DuckDB connection with the delta, iceberg and httpfs extensions (and the bucket's secret)."""
-    import duckdb, glob
+    import duckdb, glob, site
     con = duckdb.connect()
-    for ext in ("delta", "avro", "iceberg", "httpfs"):  # from the pip packages (duckdb-extension-…) when installed
-        found = glob.glob(f"{sys.prefix}/**/duckdb_extension_{ext}/**/{ext}.duckdb_extension", recursive=True)
-        found += glob.glob(f"/usr/local/lib/python3*/dist-packages/duckdb_extension_{ext}/**/{ext}.duckdb_extension", recursive=True)
-        con.execute(f"LOAD '{found[0]}'" if found else f"LOAD {ext}")
+    for ext in ("delta", "avro", "iceberg", "httpfs"):  # from the pip packages (duckdb-extension-…), else DuckDB's download
+        found = [f for d in site.getsitepackages() for f in glob.glob(f"{d}/duckdb_extension_{ext}/**/{ext}.duckdb_extension", recursive=True)]
+        con.execute(f"LOAD '{found[0]}'" if found else f"INSTALL {ext}; LOAD {ext}")
     if lake.startswith("s3://"):
         scheme, host = os.environ["AWS_ENDPOINT"].split("://")
         con.execute(f"CREATE SECRET (TYPE s3, KEY_ID '{os.environ['AWS_ACCESS_KEY_ID']}', SECRET '{os.environ['AWS_SECRET_ACCESS_KEY']}', "

@@ -4,6 +4,10 @@ pyarrow==25.0.1
 pandas==3.0.2
 polars==1.44.2
 duckdb==1.5.5
+duckdb-extension-avro==1.5.5
+duckdb-extension-delta==1.5.5
+duckdb-extension-httpfs==1.5.5
+duckdb-extension-iceberg==1.5.5
 deltalake==1.6.6
 pyiceberg==0.12.0
 s3fs
