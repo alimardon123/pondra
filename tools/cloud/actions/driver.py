@@ -4,11 +4,13 @@
   driver.py --nodes 100.64.0.1:8080,100.64.0.2:8080,100.64.0.3:8080 --lake s3://bucket/bench-7 \
             --data tpch-sf10 --queries tools/bench/tpch-queries --bin ./pondra --out results.json
 
-Waits until every node is in the cluster, loads TPC-H with one `pondra sql` INSERT per table
+Waits until every node is in the cluster, measures the network to each node (Tailscale's path,
+direct or relayed, and a 256 MB download), loads TPC-H with one `pondra sql` INSERT per table
 (Parquet straight into the bucket), then runs each of the 22 queries on one node (`?spread=0`)
 and across the cluster (`?spread=1`), best of `--runs`, and checks that the two answers agree.
-results.json has, per query, both times and how it ran (shuffled, gathered, one node), plus the
-load time and every node's /metrics. Standalone on purpose: a bench repo needs only this file,
+results.json has, per query, both times, how it ran (shuffled, gathered, one node), what the
+nodes sent each other and how long their steps waited for it; plus the network, the load time
+and every node's /metrics. Standalone on purpose: a bench repo needs only this file,
 the queries and the workflow.
 """
 import argparse, http.client, itertools, json, os, re, subprocess, sys, time
@@ -35,6 +37,30 @@ def metrics(node):
             name, v = line.rsplit(" ", 1)
             out[name] = float(v)
     return out
+
+
+def network(nodes):
+    """How the machines reach each other: Tailscale's path to each node (a direct link, or relayed
+    through a DERP server, and its latency) and a 256 MB download from it (nodes serve one on 8081)."""
+    out = {}
+    for n in nodes:
+        host = n.rsplit(":", 1)[0]
+        def run(*cmd):
+            try:
+                return subprocess.run(cmd, capture_output=True, text=True, timeout=600).stdout.strip()
+            except (OSError, subprocess.SubprocessError):
+                return ""
+        ping = run("sudo", "tailscale", "ping", "-c", "3", host).splitlines()
+        speed = run("curl", "-s", "-o", "/dev/null", "-w", "%{speed_download}", f"http://{host}:8081/blob")
+        out[n] = {"path": ping[-1] if ping else "", "mb_s": round(float(speed or 0) / 1e6, 1)}
+    return out
+
+
+def moved(nodes):
+    """Bytes the nodes have sent each other (compressed, as sent) and seconds their steps have
+    waited for them, summed over the nodes."""
+    ms = [metrics(n) for n in nodes]
+    return sum(m.get("pondra_wire_bytes_total", 0) for m in ms), sum(m.get("pondra_shuffle_wait_seconds_total", 0) for m in ms)
 
 
 def queries(folder):
@@ -76,6 +102,8 @@ def main():
         if time.time() > deadline:
             sys.exit(f"only {call(head, 'GET', '/stats').get('nodes')} of {len(nodes)} nodes joined")
         time.sleep(2)
+    net = network(nodes)
+    print(json.dumps({"network": net}, indent=1), flush=True)
     t0 = time.time()
     for t in TABLES:
         subprocess.run([A.bin, "sql", "--dir", A.lake, f"INSERT INTO {t} SELECT * FROM '{os.path.join(A.data, t)}.parquet'"], check=True)
@@ -87,17 +115,19 @@ def main():
             pass
     results = {}
     for i, sql in queries(A.queries).items():
-        before = metrics(head)
         one_s, one = best(head, sql, 0, A.runs)
+        before, (wire0, wait0) = metrics(head), moved(nodes)
         many_s, many = best(head, sql, 1, A.runs)
-        after = metrics(head)
+        after, (wire1, wait1) = metrics(head), moved(nodes)
         ran = lambda m: after.get(f"pondra_{m}_queries_total", 0) > before.get(f"pondra_{m}_queries_total", 0)
-        results[f"q{i}"] = {"one_node_s": one_s, "cluster_s": many_s, "how": "shuffled" if ran("shuffled") else "gathered" if ran("spread") else "one node", "same": same(one, many)}
-        print(f"q{i:<3} one node {one_s:>7.2f}s  {len(nodes)} nodes {many_s:>7.2f}s  {results[f'q{i}']['how']:<9} same={results[f'q{i}']['same']}", flush=True)
+        r = results[f"q{i}"] = {"one_node_s": one_s, "cluster_s": many_s, "how": "shuffled" if ran("shuffled") else "gathered" if ran("spread") else "one node", "same": same(one, many),
+                                "wire_mb": round((wire1 - wire0) / 1e6 / A.runs, 1), "wait_s": round((wait1 - wait0) / A.runs, 3)}  # (per run; wait summed over the nodes)
+        print(f"q{i:<3} one node {one_s:>7.2f}s  {len(nodes)} nodes {many_s:>7.2f}s  {r['how']:<9} same={r['same']}  sent {r['wire_mb']} MB, waited {r['wait_s']} s", flush=True)
     total = lambda k: round(sum(r[k] for r in results.values()), 2)
-    out = {"nodes": len(nodes), "lake": A.lake, "data": A.data, "load_s": load_s, "one_node_s": total("one_node_s"), "cluster_s": total("cluster_s"),
+    out = {"nodes": len(nodes), "lake": A.lake, "data": A.data, "network": net, "load_s": load_s, "one_node_s": total("one_node_s"), "cluster_s": total("cluster_s"),
            "spread": sum(r["how"] != "one node" for r in results.values()), "all_same": all(r["same"] for r in results.values()),
            "cpus": os.cpu_count(), "queries": results, "metrics": {n: metrics(n) for n in nodes}}
+    out["wire_mb"], out["wait_s"] = round(sum(r["wire_mb"] for r in results.values()), 1), round(sum(r["wait_s"] for r in results.values()), 2)
     json.dump(out, open(A.out, "w"), indent=1)
     print(json.dumps({k: v for k, v in out.items() if k not in ("queries", "metrics")}, indent=1))
 

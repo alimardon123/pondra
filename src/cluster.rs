@@ -106,7 +106,7 @@ impl Cluster {
                     Ok(r) => {
                         let (term, nodes): (u64, Vec<String>) = r.json().await.unwrap_or_default();
                         if term != self.leader.n {
-                            restart(); // a new leader came up at the same address: rejoin
+                            restart("a new leader answers at the leader's address");
                         }
                         *self.view.lock().unwrap() = nodes;
                         *self.last_ok.lock().unwrap() = Instant::now();
@@ -116,11 +116,11 @@ impl Cluster {
                     // hears it). One that never reached it — say, outside the cluster's network —
                     // only once the leader's mark in the bucket is stale: it never deposes a live one.
                     Err(_) if (!self.leader_ok() && self.heard.load(std::sync::atomic::Ordering::Relaxed)) || !alive(&store, &self.leader).await => match latest(&store).await {
-                        Ok(Some(t)) if t.n > self.leader.n => restart(), // there's a newer leader: follow it
+                        Ok(Some(t)) if t.n > self.leader.n => restart(&format!("term {} has a newer leader", t.n)), // follow it
                         Ok(_) if self.peer_sees_leader().await => {}     // only our link to the leader is down
                         Ok(_) => {
                             claim(&store, self.leader.n + 1, &self.addr).await.ok(); // we win the term, or someone else does
-                            restart();
+                            restart("the leader stopped answering (and no peer hears it): the next term was claimed");
                         }
                         Err(_) => {} // can't reach the bucket either: wait
                     },
@@ -142,7 +142,7 @@ impl Cluster {
                 // files our view reads) would stay invisible until a new leader appears.
                 gone = if streamed && !self.leader_alive().await { gone + 1 } else { 0 };
                 if gone >= 2 || matches!(latest(&store).await, Ok(Some(t)) if t.n != self.leader.n) {
-                    restart();
+                    restart("the leader is gone or another leads");
                 }
             }
         });
@@ -279,8 +279,8 @@ pub async fn release(store: &Store, n: u64) {
 
 /// Re-run this same binary with the same arguments: the new process re-reads its role.
 /// (By the path it was started with: if the binary was upgraded in place, the new one starts.)
-pub fn restart() -> ! {
-    eprintln!("restarting to rejoin the cluster");
+pub fn restart(why: &str) -> ! {
+    eprintln!("restarting to rejoin the cluster: {why}");
     let mut args = std::env::args_os();
     let mut cmd = std::process::Command::new(args.next().expect("argv[0]"));
     cmd.args(args);

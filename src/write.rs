@@ -490,7 +490,7 @@ async fn deliver(dir: &str, mut req: Option<Option<Request>>, stmt: &Stmt, job: 
                     // Another one-off writer took the catalog while this one was leading (both
                     // found the lake idle). Start over with the same job: whoever wins records it
                     // once, and the rest go through them.
-                    Err(e) if fenced(&e) && tries() < 5 => crate::cluster::restart(),
+                    Err(e) if fenced(&e) && tries() < 5 => crate::cluster::restart("fenced while writing"),
                     r => r,
                 };
             }

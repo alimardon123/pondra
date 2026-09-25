@@ -1016,7 +1016,9 @@ async fn received(job: &Job, sh: &Shuffle, top: &Arc<dyn ExecutionPlan>) -> Resu
         let k = job.exchanges.iter().position(|e| Arc::ptr_eq(&e.plan, &x)).context("an unknown exchange")?;
         let own = job.exchanges[k].own;
         let fetches = sh.nodes.iter().enumerate().filter(|(i, _)| !own || *i == sh.me).map(|(i, node)| fetch(job, &sh.id, node, i == sh.me, k, sh.me, None));
+        let waited = std::time::Instant::now();
         let from = futures::future::try_join_all(fetches).await?;
+        crate::metrics::add(&crate::metrics::WAIT_US, waited.elapsed().as_micros() as u64);
         let mut parts: Vec<Vec<Spill>> = (0..x.output_partitioning().partition_count()).map(|q| from.iter().map(|f| f.get(q).cloned().unwrap_or_default()).collect()).collect();
         // A hot partition shared out (`skew.rs`): on its split side, each node keeps the share it
         // hashed there itself; on the other, every node gets all of it — in its own partition of

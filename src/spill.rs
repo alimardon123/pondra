@@ -135,6 +135,7 @@ impl Spill {
         if piece.is_empty() {
             return Ok(());
         }
+        crate::metrics::add(&crate::metrics::WIRE, piece.len() as u64);
         if self.files.is_empty() && piece.len() < self::piece() / 8 && self.rows.is_empty() {
             self.rows = crate::log::decode(piece)?;
             self.bytes = self.rows.iter().map(size).sum();

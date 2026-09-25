@@ -71,9 +71,16 @@ jobs:
         run: |
           chmod +x pondra
           ip=$(tailscale ip -4)
-          ./pondra serve --dir "s3://$BUCKET/bench-${{ github.run_id }}" --addr "$ip:8080" --cache-gb 4 > node.log 2>&1 &
+          # (256 MB for the driver to download: what the network between the machines carries)
+          head -c 268435456 /dev/urandom > blob && (python3 -m http.server 8081 --bind "$ip" > /dev/null 2>&1 &)
+          # (every line of the node's log with the time it was written)
+          ./pondra serve --dir "s3://$BUCKET/bench-${{ github.run_id }}" --addr "$ip:8080" --cache-gb 4 \
+            > >(perl -MPOSIX -pe 'BEGIN { $| = 1 } print strftime("%H:%M:%S ", gmtime)' > node.log) 2>&1 &
+          pid=$!
           echo "$ip:8080" | aws s3 cp - "s3://$BUCKET/bench-results/${{ github.run_id }}/nodes/${{ matrix.i }}"
           until aws s3 ls "s3://$BUCKET/bench-results/${{ github.run_id }}/done" > /dev/null 2>&1; do sleep 15; done
+          kill -TERM $pid || true # (stopped, as a scheduler stops it: a leader hands its term on)
+          sleep 5
       - if: always()
         run: aws s3 cp node.log "s3://$BUCKET/bench-results/${{ github.run_id }}/logs/node-${{ matrix.i }}.log" || true
 
@@ -111,4 +118,5 @@ jobs:
         if: always()
         run: |
           echo done | aws s3 cp - "s3://$BUCKET/bench-results/${{ github.run_id }}/done"
+          sleep 30 # (the nodes stop first: a lake deleted under them only makes noise in their logs)
           aws s3 rm --recursive "s3://$BUCKET/bench-${{ github.run_id }}" > /dev/null || true

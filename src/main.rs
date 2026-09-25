@@ -246,7 +246,7 @@ async fn main() -> anyhow::Result<()> {
                 Err(e) if leader => {
                     eprintln!("opening the lake as leader failed: {e:#}"); // e.g. a newer leader fenced us
                     tokio::time::sleep(Duration::from_secs(1)).await;
-                    cluster::restart()
+                    cluster::restart("opening the lake as leader failed")
                 }
                 lake => lake?,
             };

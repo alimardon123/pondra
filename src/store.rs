@@ -243,7 +243,7 @@ impl Lake {
             while let Some((handle, id)) = in_bucket.recv().await {
                 if let Err(e) = handle.await_durable().await {
                     eprintln!("catalog commit failed: {e}");
-                    crate::cluster::restart();
+                    crate::cluster::restart("a catalog commit failed");
                 }
                 lake.cat.durable.send_replace(id);
                 lake.cat.send(Frame::Durable(id));
@@ -267,7 +267,7 @@ impl Lake {
                     r = handle.await_durable() => {
                         if let Err(e) = r {
                             eprintln!("catalog commit failed: {e}");
-                            crate::cluster::restart();
+                            crate::cluster::restart("a catalog commit failed");
                         }
                         break;
                     }
@@ -989,7 +989,7 @@ impl Catalog {
 fn fatal(e: slatedb::Error) -> anyhow::Error {
     if matches!(e.kind(), ErrorKind::Closed(_)) {
         eprintln!("catalog closed: {e}");
-        crate::cluster::restart();
+        crate::cluster::restart("the catalog was closed (fenced by a newer leader)");
     }
     e.into()
 }

@@ -17,6 +17,8 @@ pub static SPILLED: AtomicU64 = AtomicU64::new(0); // shuffle bytes written to t
 pub static SKEW: AtomicU64 = AtomicU64::new(0); // the worst bucket/average seen in a shuffle, x100
 pub static SKEW_SPLITS: AtomicU64 = AtomicU64::new(0); // hot partitions of shuffled joins shared out
 pub static RECEIVED: AtomicU64 = AtomicU64::new(0); // shuffle bytes this node's steps read (its share of the work)
+pub static WIRE: AtomicU64 = AtomicU64::new(0); // bytes other nodes sent this node, compressed as sent (shuffles, gathered results)
+pub static WAIT_US: AtomicU64 = AtomicU64::new(0); // time this node's steps waited for other nodes' buckets
 
 pub fn add(c: &AtomicU64, n: u64) { c.fetch_add(n, Relaxed); }
 
@@ -48,6 +50,8 @@ pub async fn render(app: &App) -> anyhow::Result<String> {
     metric("shuffle_skew", "gauge", "worst bucket vs the average one in a shuffle here (1 = even)", &one(get(&SKEW) / 100.0));
     metric("skew_splits_total", "counter", "hot partitions of shuffled joins shared out over the nodes", &one(get(&SKEW_SPLITS)));
     metric("shuffle_received_bytes_total", "counter", "shuffle bytes this node's steps read", &one(get(&RECEIVED)));
+    metric("wire_bytes_total", "counter", "bytes other nodes sent this node, compressed as sent", &one(get(&WIRE)));
+    metric("shuffle_wait_seconds_total", "counter", "time this node's steps waited for other nodes' buckets", &one(get(&WAIT_US) / 1e6));
     let (reserved, limit) = app.lake.memory();
     metric("memory_limit_bytes", "gauge", "query memory limit (spills beyond it)", &one(limit as f64));
     metric("memory_reserved_bytes", "gauge", "query memory in use", &one(reserved as f64));
