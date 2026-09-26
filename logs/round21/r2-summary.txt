@@ -1,0 +1,6 @@
+columns exit=1 secs=98
+fills exit=0 secs=159
+dedup exit=0 secs=60
+ALL-DONE
+columns (again, after the publishing fix) exit=0 secs=126
+ALL-DONE-2

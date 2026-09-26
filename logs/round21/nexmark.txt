@@ -1,0 +1,10 @@
+Nexmark subset (tools/bench/nexmark.py): q1, q2, q5, q7, q11 over bids, one 2-vCPU box, one engine at a time.
+Pondra: from the first bid sent (HTTP, Arrow batches of 100 k) until every view's rows equal DuckDB's answers over the
+same bids; every view written to the lake. Flink 2.3 (PyFlink MiniCluster, parallelism 2, mini-batches): the bids from
+datagen inside Flink, all five queries in one statement set, blackhole sinks; JVM start outside the time.
+
+            Pondra             Flink 2.3
+4 M bids    3.75 s, 5.13 s     11.2 s, 11.0 s
+10 M bids   8.68 s, 10.94 s    25.0 s, 24.3 s
+
+(The first Pondra runs, 6.07 s and 16.87 s, counted DuckDB's own answers inside the clock: fixed, those runs dropped.)

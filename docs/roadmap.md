@@ -1,10 +1,10 @@
-# Pondra: what's left, and in what order (after round 20)
+# Pondra: what's left, and in what order (after round 21)
 
-**Date:** 2026-09-25 · **Status:** proposed; the order in "The rounds" is what I recommend, the
+**Date:** 2026-09-27 · **Status:** proposed; the order in "The rounds" is what I recommend, the
 decisions in "What only you can decide" are yours · **Builds on:** ADR-002 to ADR-017,
 `prototype-status.md`, `comparison-spark-flink-fluss.md`
 
-**Progress (2026-09-26):** rounds 17 to 20 are done (ADR-018 to ADR-021).
+**Progress (2026-09-27):** rounds 17 to 21 are done (ADR-018 to ADR-022).
 
 - **Round 17** made Pondra install anywhere: a glibc 2.17 Linux binary, pip and npm packages
   (built, not published), a SQL shell, and both flaky tests fixed.
@@ -34,14 +34,21 @@ decisions in "What only you can decide" are yours · **Builds on:** ADR-002 to A
   showed the guard works (18.0 s against one node's 15.7 s, from 46.6 s) and found loading 4×
   slower (fixed).
 
+- **Round 21** (ADR-022): `RENAME COLUMN`, `DROP COLUMN` and widening types with no file
+  rewritten (Delta column mapping, Iceberg field ids); materialized views filled from the rows
+  already there, every row once (the sequencer now holds every flush to the views);
+  deduplication by event time (`order_by`); Nexmark q1, q2, q5, q7, q11 against Flink 2.3 (10 M
+  bids: 8.7–10.9 s against 24.3–25.0 s, the answers equal to DuckDB's). The DataFrame API was designed
+  (`dataframe-api.md`). C1: the owner's run on round 20 showed loading fixed (106 s from 442 s)
+  and the cluster at one node's speed (24.8 s against 24.5 s). Pondra is now MIT OR Apache-2.0.
+
 Still waiting:
 
 - **C1 in one data centre:** machines under a millisecond apart, where spreading should pay.
-- **Publishing:** the package names and the repository decision below.
+- **Publishing:** the owner's PyPI pending publisher and npm token; then a `v0.21.0` tag.
 
-Round 21 is next: the rest of `ALTER TABLE` (rename and drop columns and tables, widen types:
-column ids in the files), materialized views filled from the rows already there, more of Flink
-(deduplication and Top-N by event time, timers), and Nexmark against Flink.
+Round 22 is next: the DataFrame API (`pondra.frame`, Polars-style, and `pondra.spark`,
+PySpark's names, one tree compiling to SQL), with a console at `/` and live queries.
 
 ## Where Pondra stands
 
@@ -187,7 +194,7 @@ a list of URLs? If it can, that gives a browser read path at no cost.
   - as-of joins in views that wait for the looked-up table to catch up to the event's time;
   - a watermark per partition or per node;
   - late rows to a side table;
-  - deduplication and Top-N per key by event time;
+  - Top-N per key by event time (deduplication is done: `order_by`, round 21);
   - timers and `MATCH_RECOGNIZE`;
   - stream joins sharded across the nodes.
 - **Distributed:**
@@ -216,8 +223,8 @@ simulated R2 and real R2, an ADR, and a bundle.
 | 18 ✓ | A database you can shape (done: ADR-019) | E5, A7, C1 (measuring) | `lake.schema.table`, DDL and views in SQL; the `.exe` on your laptop; the cluster bench measures the network |
 | 19 ✓ | Change any row (done: ADR-020) | E6, C1 (the guard) | `UPDATE`/`DELETE`/`MERGE` on every table with system columns, streaming following every change; a cluster never slower than one node |
 | 20 ✓ | Fewer objects, any layout, streams joined (done: ADR-021) | the owner's questions, C1 (round 19's run) | a trickle of INSERTs writes under a third of the objects; `PRIMARY KEY` with `partition_by`/`cluster_by` (Hilbert); `COPY`; stream joins and sliding windows |
-| 21 | Shape it further, and more of Flink | E8, E7, C3, F (streaming) | `ALTER TABLE … RENAME/DROP COLUMN`; views filled from existing rows; dedup and Top-N; Nexmark against Flink |
-| 22 | Use it from anything, and proof at scale | A4, B3, E1, E2, C1, D1 (start) | A console at `/`, live queries, dbt and Power BI working; TPC-H at 1/3/6 machines in one data centre |
+| 21 ✓ | Shape it further, and more of Flink (done: ADR-022) | E8, E7, C3, F (streaming) | `ALTER TABLE … RENAME/DROP COLUMN`, widening; views filled from existing rows; dedup by event time; Nexmark against Flink; the DataFrame API designed |
+| 22 | A DataFrame API, and use it from anything | the DataFrame API (`dataframe-api.md`), A4, B3, E1, E2, C1, D1 (start) | `pondra.frame` and `pondra.spark` over SQL, tested against Polars and PySpark; a console at `/`, live queries, dbt and Power BI; TPC-H at 1/3/6 machines in one data centre |
 | 23 | In-process | B1, B2 | `pondra.open(…)` in a notebook reads and writes a cluster's lake, no server |
 | 24 | Safe to share | E3, D2 | TLS, grants, audit; random-query checks against DuckDB |
 | 25 | In the browser | B4 (after the DuckDB-WASM check) | A lake queried in a web page, straight from the bucket |
@@ -237,23 +244,8 @@ Why this order:
 
 ## What only you can decide
 
-1. **The repository.** Three choices:
-   - **Make `alimardon123/pondra` public.** This gives free, unlimited GitHub Actions with
-     4-vCPU Linux runners; private repos get 2-vCPU runners and a monthly allowance. It also
-     means CI can publish releases, wheels and npm packages, and people can find the project.
-     It needs a license first. Apache-2.0 (as DataFusion) or MIT (as DuckDB) gives the widest
-     use; a source-available license (BSL, ELv2) keeps others from selling it as a service; AGPL
-     sits between. Every round's history has been scanned for the bucket's keys and account; a
-     last full scan with a dedicated tool belongs just before going public. Check the name too:
-     a small app already uses pondra.app.
-   - **Keep it private, and add a small public `pondra-bench` repo** holding only the benchmark
-     workflow, which pulls the binary from your bucket. This gets the bigger free runners for
-     the multi-machine runs and exposes no source.
-   - **Stay private for now.** Smaller runners with a monthly allowance, and no public releases.
-
-   My recommendation: the bench repo now, and the main repo public once round 17 makes
-   `pip install pondra` work and you've picked a license. A first impression that installs in
-   one line is worth waiting for.
+1. **The repository and the license: decided.** `alimardon123/pondra` is public and, since round
+   21, MIT OR Apache-2.0. A managed cloud service may come later, on top.
 2. **Linking your laptop.** It would help with:
    - runs bigger than this 2-core sandbox allows: Flink for Nexmark, TPC-H SF10 to SF100 if the
      disk allows;
@@ -263,8 +255,10 @@ Why this order:
    Tell me its cores, memory and free disk. Through the link I work in a Linux environment on
    the laptop. So Windows-only checks, the `.exe` and Power BI, are for you to run, with my
    scripts, or for GitHub's Windows runners.
-3. **Package names.** Reserve `pondra` on PyPI, npm and crates.io. Publishing can then go
-   through GitHub's trusted publishing, so no tokens pass through me.
+3. **Publishing (in progress).** PyPI: a pending trusted publisher for `release.yml`, environment
+   `pypi`. npm: a token (the `NPM_TOKEN` secret) for the first release, then each package's
+   Trusted Publisher set to `release.yml` and the token removed. Then tag `v0.21.0`. crates.io
+   can wait (`publish = false`).
 
 ## What not to do yet
 
@@ -272,7 +266,8 @@ Why this order:
   build gets the same reach.
 - **No browser engine before the pip package, the console and live queries.** Those reach more
   people, sooner.
-- **No chase after Flink's full list (timers, CEP)** until Nexmark shows which gaps cost the most.
+- **No chase after Flink's full list (timers, CEP)** until Nexmark shows which gaps cost the most
+  (round 21's five queries all run; q3, q4 and q8, over persons and auctions, are next).
 - **No enterprise governance suite beyond TLS, grants and an audit log** until someone other than
   us uses it.
 - **No DuckLake as Pondra's own catalog:** it needs a database, and Pondra needs none.

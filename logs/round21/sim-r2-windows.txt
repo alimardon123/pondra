@@ -1,0 +1,9 @@
+{
+ "windows": {
+  "a window closes when event time passes its end, not when the next one starts": true,
+  "each window once, final, with rows up to the lateness out of order": true,
+  "late row: in the view, not re-emitted": true,
+  "the same view asked for again changes nothing; with other options, it is refused": true
+ },
+ "ok": true
+}

@@ -187,11 +187,13 @@ fn overlaps(s: &Span, cuts: &[ScalarValue], i: usize) -> bool {
     (after_lo && before_hi) || (i == 0 && s.nulls)
 }
 
-/// The columns of `meta` a query can be sliced by: named in its text, with an order.
+/// The columns of `meta` a query can be sliced by: named in its text (by SQL's names), with an
+/// order. Their stored names: files' ranges and a slice's scan know them so (ADR-022).
 fn named(meta: &TableMeta, words: &HashSet<String>) -> Result<Vec<(String, DataType)>> {
     let schema = crate::query::read_schema(&meta.columns)?;
     let key = |t: &DataType| t.is_integer() || matches!(t, DataType::Date32 | DataType::Date64 | DataType::Timestamp(..) | DataType::Decimal128(..) | DataType::Utf8);
-    Ok(schema.fields().iter().filter(|f| words.contains(&f.name().to_lowercase()) && key(f.data_type())).map(|f| (f.name().clone(), f.data_type().clone())).collect())
+    let live = |c: &String| !meta.dropped.contains(c) && words.contains(&meta.name_of(c).to_lowercase());
+    Ok(schema.fields().iter().filter(|f| live(f.name()) && key(f.data_type())).map(|f| (f.name().clone(), f.data_type().clone())).collect())
 }
 
 /// How to slice a query's big tables by ranges (the biggest one first in `tables`), or None

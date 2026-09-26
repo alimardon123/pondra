@@ -11,6 +11,9 @@
   harness.py schemas             lake.schema.table, attached lakes, CREATE/DROP SCHEMA/TABLE/VIEW, CTAS
   harness.py changes             UPDATE/DELETE/MERGE on every table vs a model: row ids, views, the change feed, purges
   harness.py guard               a query spreads only when it pays (a slow link keeps it on one node)
+  harness.py columns             RENAME/DROP COLUMN, a name added again, widened types, under streaming, vs a model
+  harness.py fills               materialized views filled from the rows already there, every row once
+  harness.py dedup               a keyed table deduplicated by event time (order_by) vs a model
   harness.py load    --secs 30   throughput, ack latency, freshness, catalog commit latency
   harness.py all                 quick run of everything
 """
@@ -976,8 +979,9 @@ def schemas():
     q("CREATE MATERIALIZED VIEW per_min WITH (window = 'w', size_secs = 60) AS SELECT date_bin(INTERVAL '1 minute', w_ts) AS w, count(*) AS n FROM clicks GROUP BY 1", 2)
     q("INSERT INTO dbo.t VALUES (1, 5.0)")
     q("INSERT INTO dbo.t VALUES (1, 1.0), (3, 3.0)", 2)
-    got = until(lambda: q("SELECT k, n, s FROM dbo.per_k ORDER BY k"), [{"k": 1, "n": 2, "s": 6.0}, {"k": 3, "n": 1, "s": 3.0}], 30)
-    checks["CREATE MATERIALIZED VIEW follows the rows written from then on; WITH (window …) emits to _final; bad options refused"] = got == [{"k": 1, "n": 2, "s": 6.0}, {"k": 3, "n": 1, "s": 3.0}] \
+    want = q("SELECT k, count(*) AS n, sum(v) AS s FROM dbo.t GROUP BY k ORDER BY k")  # (the rows already there too: ADR-022)
+    got = until(lambda: q("SELECT k, n, s FROM dbo.per_k ORDER BY k"), want, 30)
+    checks["CREATE MATERIALIZED VIEW: the rows already there and those written after; WITH (window …) emits to _final; bad options refused"] = got == want and len(want) == 3 \
         and n("per_min_final") == 0 and err("CREATE MATERIALIZED VIEW m2 WITH (windw = 'w') AS SELECT k FROM t") is not None
     # clients see the schemas
     with psycopg.connect(f"host=127.0.0.1 port={A.port + 10} dbname={me} user=x", autocommit=True) as c:
@@ -1967,9 +1971,291 @@ def streams():
     return out
 
 
+def columns():
+    """The rest of ALTER TABLE (ADR-022): RENAME COLUMN, DROP COLUMN, a dropped name added again,
+    ALTER COLUMN … TYPE (widening), while rows stream into two nodes and tiering runs; a writer
+    still using a renamed column's old name has it left out, never taken for the column now stored
+    under it. Against a model: every node, a query spread over three nodes, a bulk INSERT, UPDATE,
+    a keyed table and its lookups, Delta and Iceberg readers. Refused: key and partition columns,
+    columns a view reads, narrowing, RENAME TABLE (with the way round it)."""
+    lake = new_lake()
+    ports = [A.port, A.port + 1, A.port + 2]
+    nodes = [Node(lake, p, tier_secs=0.3, publish="delta,iceberg").start() for p in ports]
+    q = lambda s, port=A.port: sql(port, s)
+    q("CREATE TABLE events (id BIGINT, user VARCHAR, amount INT, note VARCHAR)")
+    model, now = {}, {"total": "amount", "note": "note", "big": False}  # (the names writers use now)
+    pause, paused, stop, seq = threading.Event(), threading.Event(), threading.Event(), [0]
+    def send(port, names=None, n=50):
+        names = names or now
+        seq[0] += 1
+        rows = []
+        for _ in range(n):
+            i = len(model) + 1
+            v = 5_000_000_000 + i if names["big"] else i
+            r = {"id": i, "user": f"u{i % 7}", names["total"]: v}
+            if names["note"]:
+                r[names["note"]] = f"n{i}"
+            rows.append(json.dumps(r) + "\n")
+            # (an old name is left out: its column reads null)
+            model[i] = {"total": v if names["total"] == now["total"] else None, "note": r.get(now["note"]) if names["note"] == now["note"] and now["note"] else None}
+        call(port, "POST", f"/append/events?producer=p&seq={seq[0]}", "".join(rows).encode())
+    def produce():
+        k = 0
+        while not stop.is_set():
+            if pause.is_set():
+                paused.set(); time.sleep(0.01); continue
+            send(ports[k % 2]); k += 1
+    def alter(stmt, want):  # (the writers wait: rows cross the change in the log and in files)
+        pause.set(); paused.wait(); paused.clear()
+        out = q(stmt, ports[1])
+        until(lambda: all([c["column_name"] for c in q("DESCRIBE events", p)] == want for p in ports), True, secs=10)
+        return out
+    t = threading.Thread(target=produce, daemon=True); t.start()
+    time.sleep(1.5)
+    alter("ALTER TABLE events RENAME COLUMN amount TO total", ["id", "user", "total", "note"])
+    now["total"] = "total"
+    send(ports[0], {"total": "amount", "note": "note", "big": False})  # (a writer from before the rename)
+    pause.clear(); time.sleep(1.2)
+    alter("ALTER TABLE events DROP COLUMN note", ["id", "user", "total"])
+    now["note"] = None
+    for r in model.values():
+        r["note"] = None  # (dropped: gone for good)
+    pause.clear(); time.sleep(1)
+    alter("ALTER TABLE events ADD COLUMN note VARCHAR", ["id", "user", "total", "note"])
+    now["note"] = "note"
+    pause.clear(); time.sleep(0.8)
+    pause.set(); paused.wait(); paused.clear()
+    q("INSERT INTO events SELECT id + 1000000, user, total, note FROM events WHERE id <= 20", ports[2])  # (bulk: Parquet under stored names)
+    for i in range(1, 21):
+        model[i + 1_000_000] = dict(model[i])
+    pause.clear(); time.sleep(0.5)
+    alter("ALTER TABLE events ALTER COLUMN total TYPE BIGINT", ["id", "user", "total", "note"])
+    now["big"] = True
+    pause.clear(); time.sleep(1)
+    stop.set(); t.join()
+    q("UPDATE events SET total = total + 1 WHERE id <= 5")
+    for i in range(1, 6):
+        model[i]["total"] = model[i]["total"] + 1 if model[i]["total"] is not None else None
+    # A keyed table: renamed, updated, looked up, a column dropped.
+    q("CREATE TABLE users (id BIGINT PRIMARY KEY, name VARCHAR, score INT)")
+    q("INSERT INTO users VALUES (1, 'ann', 5), (2, 'bob', 7)")
+    q("ALTER TABLE users RENAME COLUMN score TO points")
+    q("UPDATE users SET points = points + 1 WHERE id = 1")
+    lookup = call(A.port, "GET", "/lookup/users/1")
+    q("ALTER TABLE users DROP COLUMN name")
+    q("CREATE TABLE clicks (user VARCHAR, ts TIMESTAMP) WITH (partition_by = 'day(ts)')")
+    q("CREATE MATERIALIZED VIEW per_user AS SELECT user, count(*) AS n FROM clicks GROUP BY user")
+    refused = {
+        "a key column": _raises(lambda: q("ALTER TABLE users DROP COLUMN id")),
+        "narrowing": _raises(lambda: q("ALTER TABLE events ALTER COLUMN total TYPE INT")),
+        "a column a view reads": _raises(lambda: q("ALTER TABLE clicks RENAME COLUMN user TO who")),
+        "a partition column": (q("DROP MATERIALIZED VIEW per_user"), _raises(lambda: q("ALTER TABLE clicks DROP COLUMN ts")))[1],
+        "a clash": _raises(lambda: q("ALTER TABLE events RENAME COLUMN user TO id")),
+        "a system column": _raises(lambda: q("ALTER TABLE events RENAME COLUMN _row_id TO r")),
+    }
+    try:
+        q("ALTER TABLE events RENAME TO events2"); refused["RENAME TABLE, with the way round it"] = False
+    except Exception as e:
+        refused["RENAME TABLE, with the way round it"] = "CREATE TABLE events2 AS SELECT" in str(e)
+    q("CHECKPOINT")
+    want = sorted((i, r["total"], r["note"]) for i, r in model.items())
+    total = sum(r["total"] or 0 for r in model.values())
+    got = lambda port: sorted((r["id"], r.get("total"), r.get("note")) for r in q("SELECT id, total, note FROM events", port))
+    one = q("SELECT user, sum(total) AS s, count(note) AS n FROM events GROUP BY user ORDER BY user")
+    spread = call(A.port, "POST", "/sql?spread=1", b"SELECT user, sum(total) AS s, count(note) AS n FROM events GROUP BY user ORDER BY user")
+    joined = "SELECT count(*) AS n FROM events a JOIN events b ON a.total = b.total AND a.id <> b.id"
+    checks = {
+        "every node == the model": all(got(p) == want for p in ports),
+        "SELECT * has SQL's columns": list(q("SELECT * FROM events WHERE id = 1")[0]) == ["id", "user", "total"] or list(q("SELECT * FROM events WHERE id = 1")[0]) == ["id", "user", "total", "note"],
+        "spread over three nodes == one node": spread == one and call(A.port, "POST", "/sql?spread=1", joined.encode()) == q(joined),
+        "a keyed table: renamed, updated, looked up": lookup == [{"id": 1, "name": "ann", "points": 6}] and q("SELECT * FROM users ORDER BY id") == [{"id": 1, "points": 6}, {"id": 2, "points": 7}],
+        **{f"refused: {k}": v for k, v in refused.items()},
+    }
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import open_check, pyarrow as pa
+    until(lambda: open_check.duck(lake).execute(f"SELECT count(*) FROM delta_scan('{lake}/data/events')").fetchone()[0], len(model), secs=30)
+    duck = open_check.duck(lake)
+    theirs = {}
+    for name, scan in (("duckdb/delta", f"delta_scan('{lake}/data/events')"), ("duckdb/iceberg", f"iceberg_scan('{open_check.iceberg_metadata(lake, 'events')}')")):
+        try:
+            theirs[name] = list(duck.execute(f"SELECT count(*), sum(total), count(note) FROM {scan}").fetchone())
+        except Exception as e:
+            theirs[name] = f"error: {str(e)[:120]}"
+    try:
+        from pyiceberg.table import StaticTable
+        t = StaticTable.from_metadata(open_check.iceberg_metadata(lake, "events"), properties=open_check.iceberg_props(lake) if A.s3 else {}).scan().to_arrow()
+        theirs["pyiceberg"] = [t.num_rows, pa.compute.sum(t["total"]).as_py(), t.num_rows - t["note"].null_count]
+    except Exception as e:
+        theirs["pyiceberg"] = f"error: {str(e)[:120]}"
+    try:
+        import deltalake
+        from deltalake import QueryBuilder
+        opts = {"AWS_ENDPOINT_URL": os.environ["AWS_ENDPOINT"], "AWS_ACCESS_KEY_ID": os.environ["AWS_ACCESS_KEY_ID"], "AWS_SECRET_ACCESS_KEY": os.environ["AWS_SECRET_ACCESS_KEY"],
+                "AWS_REGION": "auto", "AWS_ALLOW_HTTP": "true"} if A.s3 else None
+        dt = deltalake.DeltaTable(f"{lake}/data/events", storage_options=opts)  # (its DataFusion reader maps columns; the pyarrow one refuses)
+        r = pa.table(QueryBuilder().register("t", dt).execute("SELECT count(*) AS n, sum(total) AS s, count(note) AS c FROM t").read_all()).to_pylist()[0]
+        theirs["delta-rs"] = [r["n"], r["s"], r["c"]]
+    except Exception as e:
+        theirs["delta-rs"] = f"error: {str(e)[:120]}"
+    try:  # (its pyarrow reader can't map columns: it must say so, not read them by the wrong names)
+        t = deltalake.DeltaTable(f"{lake}/data/events", storage_options=opts).to_pyarrow_table()
+        theirs["delta-rs pyarrow"] = [t.num_rows, pa.compute.sum(t["total"]).as_py(), t.num_rows - t["note"].null_count]
+    except Exception as e:
+        theirs["delta-rs pyarrow"] = "refused" if "columnMapping" in str(e) else f"error: {str(e)[:120]}"
+    notes = sum(1 for r in model.values() if r["note"])
+    checks["Delta and Iceberg readers (by column id / physical name)"] = all(v in ([len(model), total, notes], "refused") for v in theirs.values()) and theirs["delta-rs"] != "refused"
+    ok = all(checks.values())
+    diff = [] if ok else sorted(set(want) ^ set(got(A.port)))[:8]
+    for n in nodes:
+        n.kill()
+    print(json.dumps({"columns": checks, "rows": len(model), "outside_readers": theirs, "expected": [len(model), total, notes], "ok": ok}, indent=1))
+    if not ok:
+        print(diff)
+        sys.exit(1)
+    return f"RENAME/DROP/ADD again/widen under streaming ({len(model):,} rows), 3 nodes, bulk INSERT, UPDATE, a keyed table, {len(theirs)} outside readers: all {len(checks)} checks pass"
+
+
+def fills():
+    """Materialized views filled from the rows already there (ADR-022): made while two producers
+    stream into two nodes (and a bulk INSERT writes files), dropped and made again, one made as the
+    leader is killed. Each view == its query over the source, every row once: the sequencer holds
+    every flush to a view from one commit on, and the view is filled with the rows before it."""
+    lake = new_lake()
+    a = Node(lake, A.port, tier_secs=0.5).start()
+    b = Node(lake, A.port + 1, tier_secs=0.5).start()
+    ports = [A.port, A.port + 1]
+    q = lambda s, port=A.port: sql(port, s)
+    q("CREATE TABLE events (id BIGINT, user VARCHAR, amount BIGINT)")
+    stop, sent = threading.Event(), [0, 0]
+    def produce(k):
+        seq, rng = 0, random.Random(k)
+        while not stop.is_set():
+            seq += 1
+            body = "".join(json.dumps({"id": k * 10**9 + seq * 100 + i, "user": f"u{rng.randrange(20)}", "amount": rng.randrange(1000)}) + "\n" for i in range(100)).encode()
+            while True:  # (the same seq until it's in: exactly once through a leader restart)
+                try:
+                    call(ports[k], "POST", f"/append/events?producer=p{k}&seq={seq}", body, timeout=15)
+                    break
+                except Exception:
+                    if stop.is_set():
+                        return
+                    time.sleep(0.1)
+            sent[k] += 100
+    def retry(s, port):
+        deadline = time.time() + 90
+        while True:
+            try:
+                return q(s, port)
+            except Exception:
+                if time.time() > deadline:
+                    raise
+                time.sleep(0.3)
+    threads = [threading.Thread(target=produce, args=(k,), daemon=True) for k in (0, 1)]  # (daemons: a failure ends the run)
+    for t in threads:
+        t.start()
+    time.sleep(1.5)
+    views = []
+    def make(n, port):
+        print(f"(making views {n} on :{port})", file=sys.stderr)
+        retry(f"CREATE MATERIALIZED VIEW per_user{n} AS SELECT user, count(*) AS n, sum(amount) AS s FROM events GROUP BY user", port)
+        retry(f"CREATE MATERIALIZED VIEW evens{n} AS SELECT id, amount * 2 AS a2 FROM events WHERE amount % 2 = 0", port)
+        views.append(n)
+    make(0, ports[0])
+    q("INSERT INTO events SELECT id + 5000000000, user, amount FROM events WHERE id % 7 = 0", ports[1])  # (bulk, beside a view)
+    time.sleep(1)
+    make(1, ports[1])
+    time.sleep(0.8)
+    q("DROP MATERIALIZED VIEW per_user0"); q("DROP MATERIALIZED VIEW evens0"); views.remove(0)
+    make(0, ports[1])  # (again: filled afresh)
+    time.sleep(0.5)
+    maker = threading.Thread(target=make, args=(2, ports[1])); maker.start()
+    time.sleep(0.05)
+    a.kill(); a.start()  # (the leader, as the view fills)
+    maker.join()
+    time.sleep(1)
+    stop.set()
+    for t in threads:
+        t.join()
+    time.sleep(2)
+    source = lambda port: q("SELECT user, count(*) AS n, sum(amount) AS s FROM events GROUP BY user ORDER BY user", port)
+    evens = lambda port: q("SELECT count(*) AS n, sum(amount * 2) AS s FROM events WHERE amount % 2 = 0", port)
+    checks = {}
+    for n in sorted(views):
+        for port in ports:
+            checks[f"per_user{n} == its query (:{port})"] = until(lambda: q(f"SELECT user, n, s FROM per_user{n} ORDER BY user", port), source(port), secs=20) == source(port)
+            checks[f"evens{n} == its query (:{port})"] = until(lambda: q(f"SELECT count(*) AS n, sum(a2) AS s FROM evens{n}", port), evens(port), secs=20) == evens(port)
+    count = q("SELECT count(*) AS n FROM events")[0]["n"]
+    a.kill(); b.kill()
+    ok = all(checks.values())
+    print(json.dumps({"fills": checks, "rows": count, "ok": ok}, indent=1))
+    if not ok:
+        sys.exit(1)
+    return f"views filled from existing rows while {count:,} rows streamed in, made again, and through a leader restart: all {len(checks)} checks pass"
+
+
+def dedup():
+    """A keyed table deduplicated by event time (`order_by`, ADR-022): rows arrive out of order
+    over two nodes and tiering rounds; a late row doesn't replace a newer one. Against a model:
+    reads, /lookup, point queries, a DELETE and late rows after it, an UPDATE, compaction, and
+    DuckDB reading its Delta copy. And a keyed table's `SELECT *` leaves `_deleted` out."""
+    lake = new_lake()
+    a = Node(lake, A.port, tier_secs=0.3).start()
+    b = Node(lake, A.port + 1, tier_secs=0.3).start()
+    q = lambda s, port=A.port: sql(port, s)
+    q("CREATE TABLE latest (k BIGINT PRIMARY KEY, ts BIGINT, v BIGINT) WITH (order_by = 'ts', publish = 'delta')")
+    rng, model, n = random.Random(7), {}, 0
+    def put(k, ts, v, port):
+        call(port, "POST", f"/append/latest?producer=d&seq={v}", (json.dumps({"k": k, "ts": ts, "v": v}) + "\n").encode())
+    for r in range(16):
+        batch = []
+        for _ in range(150):
+            n += 1
+            k, ts = rng.randrange(200), rng.randrange(10_000)
+            batch.append({"k": k, "ts": ts, "v": n})
+            if k not in model or ts >= model[k][0]:  # (a tie: the later one)
+                model[k] = (ts, n)
+        call((A.port, A.port + 1)[r % 2], "POST", f"/append/latest?producer=d&seq={r + 1}", "".join(json.dumps(x) + "\n" for x in batch).encode())
+        time.sleep(0.35)  # (tiering rounds: generations, then compactions)
+    q("DELETE FROM latest WHERE k < 10")
+    for k in range(10):
+        model.pop(k, None)
+    late = [{"k": 1, "ts": -5, "v": 900001}, {"k": 2, "ts": 20_000, "v": 900002}]  # (older than its delete: stays gone; newer: back)
+    call(A.port, "POST", "/append/latest?producer=d&seq=100", "".join(json.dumps(x) + "\n" for x in late).encode())
+    model[2] = (20_000, 900002)
+    q("UPDATE latest SET v = -1 WHERE k = 20")
+    if 20 in model:
+        model[20] = (model[20][0], -1)
+    want = sorted((k, ts, v) for k, (ts, v) in model.items())
+    got = lambda port=A.port: sorted((r["k"], r["ts"], r["v"]) for r in q("SELECT k, ts, v FROM latest", port))
+    reads = [got(), got(A.port + 1)]
+    probe = sorted(model)[len(model) // 2]
+    q("CHECKPOINT")
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import open_check
+    delta = lambda: sorted(tuple(r) for r in open_check.duck(lake).execute(f"SELECT k, ts, v FROM delta_scan('{lake}/data/latest')").fetchall())
+    checks = {
+        "reads == the model, both nodes": reads == [want, want],
+        "after compaction": got() == want,
+        "/lookup": call(A.port, "GET", f"/lookup/latest/{probe}") == [{"k": probe, "ts": model[probe][0], "v": model[probe][1]}],
+        "a point query": q(f"SELECT * FROM latest WHERE k = {probe}") == [{"k": probe, "ts": model[probe][0], "v": model[probe][1]}],
+        "a late row doesn't bring a deleted key back; a newer one does": q("SELECT k FROM latest WHERE k < 10 ORDER BY k") == [{"k": 2}],
+        "SELECT * leaves _deleted out": list(q("SELECT * FROM latest LIMIT 1")[0]) == ["k", "ts", "v"],
+        "…unless named": list(q("SELECT *, coalesce(_deleted, false) AS d FROM latest LIMIT 1")[0]) == ["k", "ts", "v", "d"] and len(q("SELECT *, _deleted FROM latest LIMIT 1")) == 1,
+        "DuckDB reads the Delta copy == the model": until(delta, want, secs=30) == want,
+    }
+    ok = all(checks.values())
+    diff = [] if ok else [sorted(set(want) ^ set(got()))[:8], sorted(set(want) ^ set(delta()))[:8]]
+    a.kill(); b.kill()
+    print(json.dumps({"dedup": checks, "keys": len(model), "rows": n, "ok": ok}, indent=1))
+    if not ok:
+        print(diff)
+        sys.exit(1)
+    return f"deduplication by event time: {n:,} rows out of order over {len(model)} keys, a delete and late rows, compaction, Delta: all {len(checks)} checks pass"
+
+
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    out = {t.__name__: t() for t in (upsert, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, scale, flight, reader, crash)}
+    out = {t.__name__: t() for t in (upsert, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, scale, flight, reader, crash)}
     A.secs = min(A.secs, 20)
     out["load"] = load()
     print(json.dumps(out, indent=1))
@@ -1977,7 +2263,7 @@ def all_tests():
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "tiering", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "scale", "flight", "load", "all"])
+    ap.add_argument("mode", choices=["crash", "upsert", "tiering", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "scale", "flight", "load", "all"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -1988,4 +2274,4 @@ if __name__ == "__main__":
     ap.add_argument("--secs", type=int, default=30)
     ap.add_argument("--flush-ms", type=int, default=250)
     A = ap.parse_args()
-    {"crash": crash, "upsert": upsert, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "scale": scale, "flight": flight, "load": load, "all": all_tests}[A.mode]()
+    {"crash": crash, "upsert": upsert, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "scale": scale, "flight": flight, "load": load, "all": all_tests}[A.mode]()

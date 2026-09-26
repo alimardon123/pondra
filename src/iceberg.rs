@@ -47,7 +47,7 @@ struct Avro {
 
 /// The table's next Iceberg version, if its files changed; returns the new state to record.
 pub async fn publish(lake: &Lake, table: &str, meta: &TableMeta) -> Result<Option<(String, Vec<u8>)>> {
-    let Some(fields) = fields(&meta.columns) else { return Ok(None) }; // a type Iceberg can't carry
+    let Some(fields) = fields(meta) else { return Ok(None) }; // a type Iceberg can't carry
     let Some(parts) = crate::delta::publishable(lake, meta).await? else { return Ok(None) };
     let key = format!("i/{table}");
     let mut st: Published = lake.cat.get(&key).await?.unwrap_or_default();
@@ -61,7 +61,12 @@ pub async fn publish(lake: &Lake, table: &str, meta: &TableMeta) -> Result<Optio
     if st.uuid.is_empty() {
         st.uuid = uuid::Uuid::new_v4().to_string();
     }
-    let (dir, now, v) = (format!("data/{table}/metadata"), crate::log::now_ms(), st.version + 1);
+    let (dir, now, mut v) = (format!("data/{table}/metadata"), crate::log::now_ms(), st.version + 1);
+    // (a version already there was written by an attempt that crashed before recording it: it's
+    // never overwritten, so this one takes the next number)
+    while lake.store.head(&Path::from(format!("{dir}/v{v}.metadata.json"))).await.is_ok() {
+        v += 1;
+    }
     let schema = json!({"type": "struct", "schema-id": 0, "fields": fields});
     // The manifests this snapshot adds: one per new manifest of ours, and one for the inline files.
     let mut written = vec![];
@@ -175,8 +180,11 @@ fn metadata(lake: &Lake, table: &str, uuid: &str, v: u64, now: u64, schema: &Val
     })
 }
 
-/// The table's columns as Iceberg fields (ids 1..n, all optional), if every type has an equivalent.
-fn fields(columns: &[(String, String)]) -> Option<Vec<Value>> {
+/// The table's columns as Iceberg fields, if every type has an equivalent: all optional, each
+/// with its place among the stored columns as its id and the name SQL knows it by (a renamed
+/// column keeps its id; a dropped one leaves the schema, its id unused again: ADR-022).
+fn fields(meta: &TableMeta) -> Option<Vec<Value>> {
+    let columns = &meta.columns;
     let iceberg = |t: &str| -> Option<String> {
         Some(match t {
             "Int64" => "long".into(),
@@ -199,7 +207,8 @@ fn fields(columns: &[(String, String)]) -> Option<Vec<Value>> {
         Some(item) => Some(json!({"type": "list", "element-id": n + i + 1, "element": iceberg(item)?, "element-required": false})),
         None => Some(Value::String(iceberg(t)?)),
     };
-    columns.iter().enumerate().map(|(i, (name, t))| Some(json!({"id": i + 1, "name": name, "required": false, "type": kind(i, t)?}))).collect()
+    let live = columns.iter().enumerate().filter(|(_, (c, _))| !meta.dropped.contains(c));
+    live.map(|(i, (c, t))| Some(json!({"id": i + 1, "name": meta.name_of(c), "required": false, "type": kind(i, t)?}))).collect()
 }
 
 // ---------------------------------------------------------------- Avro, just what manifests need

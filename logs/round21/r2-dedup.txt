@@ -1,0 +1,15 @@
+{
+ "dedup": {
+  "reads == the model, both nodes": true,
+  "after compaction": true,
+  "/lookup": true,
+  "a point query": true,
+  "a late row doesn't bring a deleted key back; a newer one does": true,
+  "SELECT * leaves _deleted out": true,
+  "\u2026unless named": true,
+  "DuckDB reads the Delta copy == the model": true
+ },
+ "keys": 191,
+ "rows": 2400,
+ "ok": true
+}

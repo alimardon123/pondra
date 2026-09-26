@@ -313,7 +313,7 @@ impl App {
         match self.query_as(&crate::asof::rewrite(query)?, spread, false).await {
             // (`*` left as it is when `sys::hide`'s EXCLUDE names a column its table lacks: a
             // stored view's, say)
-            Err(e) if crate::sys::mentioned(query) && crate::sys::mentioned(&format!("{e:#}")) => self.query_as(&crate::asof::as_of(query)?, spread, false).await,
+            Err(e) if [crate::sys::mentioned, crate::query::names_deleted].iter().any(|m| m(query) && m(&format!("{e:#}"))) => self.query_as(&crate::asof::as_of(query)?, spread, false).await,
             r => r,
         }
     }
@@ -482,9 +482,12 @@ impl App {
 
     pub async fn run_tasks(&self) -> anyhow::Result<()> {
         crate::tasks::run_all(&self.lake, &self.cluster, self.log()?).await?;
-        match self.seq.is_some() {
-            true => crate::views::join_all(&self.lake, self.log()?).await, // (the leader: stream joins)
-            false => Ok(()),
+        match &self.seq {
+            Some(seq) => {
+                crate::views::fill_all(&self.lake, seq, self.log()?, &self.lock).await?; // (the leader: views filled from the rows already there)
+                crate::views::join_all(&self.lake, self.log()?).await // (and stream joins)
+            }
+            None => Ok(()),
         }
     }
 }
@@ -509,7 +512,7 @@ struct AppendParams {
 async fn append(State(app): State<App>, Path(name): Path<String>, Query(p): Query<AppendParams>, headers: HeaderMap, body: Bytes) -> Result<Json<Ack>, E> {
     let log = app.log()?;
     let meta: TableMeta = app.lake.cat.get(&table_key(&name)).await?.ok_or_else(|| anyhow::anyhow!("no table {name}"))?;
-    let schema = schema(&meta.columns)?;
+    let schema = schema(&meta.logical().columns)?; // (rows come under SQL's names; the log keeps stored ones: ADR-022)
     let arrow = headers.get("content-type").is_some_and(|v| v.as_bytes().starts_with(b"application/vnd.apache.arrow"));
     let batches = if arrow {
         // Columns by name, cast to the table's types (pandas, Polars and Arrow differ in string
@@ -557,8 +560,13 @@ async fn create_task(State(app): State<App>, Path(name): Path<String>, body: Str
 /// window of column `w` once, final, to `{name}_final`; `?session=ts&gap_secs=30&lateness_secs=5`
 /// makes it a session view (`views.rs`): `CREATE MATERIALIZED VIEW … WITH (…)` in SQL.
 async fn create_view(State(app): State<App>, Path(name): Path<String>, Query(options): Query<std::collections::BTreeMap<String, String>>, sql: String) -> Result<Json<Value>, E> {
-    let _guard = app.lock.lock().await;
-    Ok(Json(crate::ddl::apply(&app.lake, crate::ddl::Ddl::CreateMaterialized { name, sql, options }).await?))
+    let d = crate::ddl::Ddl::CreateMaterialized { name, sql, options };
+    let out = {
+        let _guard = app.lock.lock().await;
+        crate::ddl::apply(&app.lake, d.clone()).await?
+    };
+    crate::ddl::settle(&app.lake, &d, &app.cluster.addr).await?; // (once it's filled from the rows already there)
+    Ok(Json(out))
 }
 
 /// An UPDATE, DELETE or MERGE a follower's SQL asked for (`change.rs`): `[sql, job]`.
@@ -586,9 +594,10 @@ async fn lookup(State(app): State<App>, Path((name, key)): Path<(String, String)
     let lake = &app.lake;
     let meta: TableMeta = lake.cat.get(&table_key(&name)).await?.ok_or_else(|| anyhow::anyhow!("no table {name}"))?;
     ensure!(!meta.key.is_empty(), "{name} has no key: use /sql");
-    if meta.merge.is_empty() && meta.ttl.is_none() {
-        let names: Vec<&str> = meta.columns.iter().map(|(c, _)| c.as_str()).collect();
+    if meta.merge.is_empty() && meta.ttl.is_none() && meta.order.is_none() {
+        let names: Vec<&str> = meta.columns.iter().map(|(c, _)| c.as_str()).filter(|c| *c != "_deleted").collect(); // (as `SELECT *` shows it)
         let row = crate::serve::lookup(lake, &name, &meta, &key).await?.map(|r| r.project(&names.iter().map(|n| r.schema().index_of(n)).collect::<Result<Vec<_>, _>>()?)).transpose()?;
+        let row = row.map(|r| meta.to_logical(&r)).transpose()?;
         let mut w = arrow_json::ArrayWriter::new(Vec::new());
         w.write_batches(&row.iter().collect::<Vec<_>>())?;
         w.finish()?;
@@ -609,11 +618,12 @@ async fn lookup(State(app): State<App>, Path((name, key)): Path<(String, String)
     let cols = meta.columns.iter().map(|(c, _)| format!("\"{c}\"")).collect::<Vec<_>>().join(", ");
     let sql = match meta.merge.is_empty() {
         // Upsert table: the newest version of the key wins (no window over the whole table).
-        true => format!("SELECT * FROM (SELECT {cols} FROM __raw WHERE {where_} ORDER BY \"_ord\" DESC LIMIT 1){}", crate::query::live(&meta)),
+        true => format!("SELECT * FROM (SELECT {cols} FROM __raw WHERE {where_} ORDER BY {}\"_ord\" DESC LIMIT 1){}", meta.order.as_ref().map(|o| format!("\"{o}\" DESC NULLS LAST, ")).unwrap_or_default(), crate::query::live(&meta)),
         // Merge table: combine that key's partial rows.
         false => format!("{} ", latest_sql(&meta, "__raw", false, false)).replace(" GROUP BY ", &format!(" WHERE {where_} GROUP BY ")),
     };
-    let batches = ctx.sql(&sql).await?.collect().await?;
+    let shown = |b: &RecordBatch| b.project(&(0..b.num_columns()).filter(|&i| b.schema().field(i).name() != "_deleted").collect::<Vec<_>>());
+    let batches = ctx.sql(&sql).await?.collect().await?.iter().map(|b| meta.to_logical(&shown(b)?)).collect::<anyhow::Result<Vec<_>>>()?;
     let mut w = arrow_json::ArrayWriter::new(Vec::new());
     w.write_batches(&batches.iter().collect::<Vec<_>>())?;
     w.finish()?;

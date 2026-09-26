@@ -6,6 +6,8 @@
 //! catalog: every node sees a commit within milliseconds, while the bucket stays the source of truth.
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
+use datafusion::arrow::datatypes::Schema;
+use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
 use datafusion::execution::SessionStateBuilder;
 use datafusion::prelude::{SessionConfig, SessionContext};
@@ -45,6 +47,10 @@ pub struct TableMeta {
     pub ttl: Option<(String, u64)>, // keyed tables: a row whose (timestamp) column is older than this many seconds is gone
     #[serde(default)]
     pub partition: Option<String>, // append tables: every file holds one value of this ("col", "day(col)", "hour(col)", "month(col)")
+    /// Keyed tables: of a key's rows, the one with the greatest value of this column is current
+    /// (its event time: a late row doesn't replace a newer one), not the one that came last.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub sketch: BTreeMap<String, String>, // append tables: each key-like column's distinct values, sketched (`sketch.rs`)
     #[serde(default)]
@@ -53,11 +59,91 @@ pub struct TableMeta {
     pub changed: bool, // append tables: UPDATE, DELETE or MERGE has replaced rows (`{t}$deleted` holds the old ones)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub purges: Vec<(u64, u64)>, // changed tables: (commit, when): the old rows of every change up to it are out of the files (`tier::purge`)
+    /// Columns renamed since they were first written: the name in the files and the log (what
+    /// `columns` says) -> the name SQL knows it by. Files are never rewritten for a rename.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub names: BTreeMap<String, String>,
+    /// Columns dropped (their stored names): older files still hold them; nothing reads them again.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dropped: Vec<String>,
 }
 
 impl TableMeta {
     /// The changes whose old rows are out of the table's files: reads skip their `{t}$deleted` rows.
     pub fn purged(&self) -> u64 { self.purges.last().map_or(0, |p| p.0) }
+
+    /// Has any column been renamed or dropped (ADR-022)? If not, SQL sees `columns` as stored.
+    pub fn mapped(&self) -> bool { !self.names.is_empty() || !self.dropped.is_empty() }
+
+    /// A stored column's name in SQL.
+    pub fn name_of<'a>(&'a self, stored: &'a str) -> &'a str { self.names.get(stored).map_or(stored, String::as_str) }
+
+    /// The columns SQL sees, as (stored name, name in SQL, type): all but the dropped.
+    pub fn live(&self) -> impl Iterator<Item = (&str, &str, &str)> {
+        self.columns.iter().filter(|(c, _)| !self.dropped.contains(c)).map(|(c, t)| (c.as_str(), self.name_of(c), t.as_str()))
+    }
+
+    /// The column SQL calls `name`: its stored name.
+    pub fn stored(&self, name: &str) -> Option<&str> { self.live().find(|(_, n, _)| *n == name).map(|(s, _, _)| s) }
+
+    /// The table as SQL sees it: columns (and key, clustering, merges, partition, TTL) under their
+    /// SQL names, dropped ones gone. Everything that works on SQL names uses this; storage keeps
+    /// `self`.
+    pub fn logical(&self) -> TableMeta {
+        if !self.mapped() {
+            return self.clone();
+        }
+        let n = |c: &String| self.name_of(c).to_string();
+        let partition = self.partition.as_ref().map(|p| match p.split_once('(') {
+            Some((f, c)) => format!("{f}({})", self.name_of(c.trim_end_matches(')'))),
+            None => self.name_of(p).to_string(),
+        });
+        TableMeta {
+            columns: self.live().map(|(_, n, t)| (n.to_string(), t.to_string())).collect(),
+            key: self.key.iter().map(n).collect(),
+            merge: self.merge.iter().map(|(c, f)| (n(c), f.clone())).collect(),
+            cluster: self.cluster.iter().map(n).collect(),
+            ttl: self.ttl.as_ref().map(|(c, s)| (n(c), *s)),
+            order: self.order.as_ref().map(n),
+            partition,
+            names: BTreeMap::new(),
+            dropped: vec![],
+            ..self.clone()
+        }
+    }
+
+    /// `b` (columns by their SQL names) as stored: renamed columns under their stored names. A
+    /// column under a name SQL no longer knows (a writer from before a rename or drop) is left
+    /// out, never taken for the column now stored under it. Every writer into the log gives SQL's
+    /// names (`log::pack` calls this).
+    pub fn to_stored(&self, b: &RecordBatch) -> Result<RecordBatch> {
+        if !self.mapped() {
+            return Ok(b.clone());
+        }
+        let (mut fields, mut columns) = (vec![], vec![]);
+        for (f, c) in b.schema().fields().iter().zip(b.columns()) {
+            let name = match self.stored(f.name()) {
+                Some(s) => s,
+                None if self.columns.iter().any(|(n, _)| n == f.name()) => continue, // (an old name)
+                None => f.name(), // (not the table's: reads leave it out)
+            };
+            fields.push(Arc::new(f.as_ref().clone().with_name(name)));
+            columns.push(c.clone());
+        }
+        let options = datafusion::arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(b.num_rows()));
+        Ok(RecordBatch::try_new_with_options(Arc::new(Schema::new_with_metadata(fields, b.schema().metadata().clone())), columns, &options)?)
+    }
+
+    /// `b` (as stored) under the names SQL knows its columns by, dropped columns left out.
+    pub fn to_logical(&self, b: &RecordBatch) -> Result<RecordBatch> {
+        if !self.mapped() {
+            return Ok(b.clone());
+        }
+        let keep: Vec<usize> = (0..b.num_columns()).filter(|&i| !self.dropped.contains(b.schema().field(i).name())).collect();
+        let b = b.project(&keep)?;
+        let fields: Vec<_> = b.schema().fields().iter().map(|f| Arc::new(f.as_ref().clone().with_name(self.name_of(f.name())))).collect();
+        Ok(RecordBatch::try_new(Arc::new(Schema::new_with_metadata(fields, b.schema().metadata().clone())), b.columns().to_vec())?)
+    }
 
     /// The TTL as a SQL condition that keeps live rows ("" if none).
     pub fn ttl_sql(&self) -> String {

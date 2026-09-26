@@ -213,6 +213,9 @@ async fn send(lake: &Lake, to: &To, mut pending: Vec<Append>, mut turn: Option<o
                 }
             }
             Ok(Outcome::Retry(retried)) => {
+                if retried.is_empty() {
+                    tokio::time::sleep(Duration::from_millis(10)).await; // (packed with views this node didn't know of yet: again)
+                }
                 for (i, ack) in retried.into_iter().rev() {
                     let _ = pending.remove(i).ack.send(Ok(ack)); // and go again with the rest
                 }
@@ -238,8 +241,16 @@ pub async fn pack(lake: &Lake, pending: &[Append]) -> Result<Flush> {
         Ok(())
     };
     let mut by_table: BTreeMap<String, Vec<RecordBatch>> = BTreeMap::new();
+    let mut metas: BTreeMap<String, Option<TableMeta>> = BTreeMap::new(); // (the log keeps columns under their stored names: ADR-022)
     for a in pending {
-        add(&a.table, &a.batch, Some(a.src.clone()))?;
+        if !metas.contains_key(&a.table) {
+            metas.insert(a.table.clone(), lake.cat.get::<TableMeta>(&table_key(&a.table)).await?);
+        }
+        let stored = match &metas[&a.table] {
+            Some(m) => m.to_stored(&a.batch)?,
+            None => a.batch.clone(),
+        };
+        add(&a.table, &stored, Some(a.src.clone()))?;
         by_table.entry(a.table.clone()).or_default().push(a.batch.clone());
     }
     for (table, batch) in crate::views::derive(lake, &by_table).await? {
@@ -281,6 +292,7 @@ impl Sequencer {
     /// (so producers slow down to what the cluster sustains, instead of memory growing).
     pub async fn start(lake: Arc<Lake>, max_backlog: Option<u64>) -> Result<Arc<Sequencer>> {
         let mut next: u64 = lake.cat.get("n").await?.unwrap_or(1);
+        crate::views::forget(&lake); // (the views as this leader finds them)
         for (key, meta) in lake.cat.scan::<TableMeta>("t/", "t0").await? {
             let rows = crate::tier::backlog(&lake, meta.tiered, None).await?.get(&key[2..]).copied().unwrap_or(0);
             lake.backlog.fetch_add(rows, Ordering::Relaxed);
@@ -329,17 +341,36 @@ impl Sequencer {
     }
 }
 
+/// Producers whose progress left the catalog (a view dropped: `emit:`, `join:`, `fill:`): the
+/// sequencer forgets what it remembered of them, so a view made again under the name starts over.
+static FORGOTTEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+pub fn forget_producers(names: impl IntoIterator<Item = String>) { FORGOTTEN.lock().unwrap().extend(names); }
+
 /// Sequence a batch of flushes and write them as one catalog commit. Without waiting for it to
 /// be committed, the next batch can follow; acks go out once this one is.
 async fn commit(lake: &Arc<Lake>, next: &mut u64, last_seq: &mut HashMap<String, u64>, batch: Vec<(Flush, oneshot::Sender<Outcome>)>, ms: &Arc<Mutex<Vec<f64>>>, slot: tokio::sync::OwnedSemaphorePermit) -> Result<()> {
     let (mut puts, mut seqs, mut replies) = (vec![], HashMap::<String, u64>::new(), vec![]);
     let (mut inline, mut inline_parts) = (vec![], BTreeMap::<String, Vec<(u64, u64, u64)>>::new()); // all inline flushes: one segment
+    for p in std::mem::take(&mut *FORGOTTEN.lock().unwrap()) {
+        last_seq.remove(&p);
+    }
+    let views = crate::views::inline(lake).await?;
+    puts.extend(crate::views::bound(lake, &views, *next)); // (views made since: their filling ends before this commit)
     for (f, reply) in batch {
         if f.reserve > 0 {
             // (numbers no segment will take: gaps in the log's sequence, which nothing minds)
             let ack = Ack { seg: *next, ms: now_ms(), ..Default::default() };
             *next += f.reserve;
             replies.push((reply, Outcome::Acks(vec![ack])));
+            continue;
+        }
+        // 0. A flush packed with other views than the ones its tables have now goes back to be
+        // packed again (`views::Inline`).
+        let derived: std::collections::HashSet<&str> = f.parts.iter().filter(|p| p.src.is_none()).map(|p| p.table.as_str()).collect();
+        let mut owed = f.parts.iter().filter(|p| p.src.is_some() && p.rows > 0).flat_map(|p| views.by_source.get(&p.table).into_iter().flatten());
+        if owed.any(|v| !derived.contains(v.as_str())) || derived.iter().any(|t| !views.tables.contains(*t)) {
+            replies.push((reply, Outcome::Retry(vec![])));
             continue;
         }
         // 1. Skip retries of committed batches, and batches whose `prev` no longer holds.

@@ -116,7 +116,8 @@ def package_checks(work):
 
 def notebook_check(py, wheel, work):
     """examples/quickstart.ipynb, run as a notebook user would, from its own `%pip install` on:
-    no cell may fail, and the last join must price order 5000 at the later tea price."""
+    no cell may fail; the as-of join prices order 5000 (20 teas after the UPDATE) at the later tea
+    price, the widened column holds 5 billion, and the late position didn't replace the newer one."""
     run([py, "-m", "pip", "install", "-q", "nbclient", "nbformat", "ipykernel", "pandas"])
     folder = os.path.join(work, "notebook")
     os.makedirs(folder)
@@ -125,7 +126,7 @@ import nbformat, nbclient
 nb = nbformat.read({os.path.join(HERE, "..", "examples", "quickstart.ipynb")!r}, as_version=4)
 nbclient.NotebookClient(nb, timeout=300, kernel_name="python3", resources={{"metadata": {{"path": {folder!r}}}}}).execute()
 text = "".join(o.get("data", {{}}).get("text/plain", "") for c in nb.cells if c.cell_type == "code" for o in c.outputs)
-assert "5000   tea" in text and "35.0" in text, text[-600:]
+assert "5000   tea" in text and "70.0" in text and "5000000000" in text and "41.3" in text, text[-600:]
 print("ok:", len(nb.cells), "cells")
 """
     return run([py, "-c", code], env={**{k: v for k, v in os.environ.items() if k != "PONDRA_BIN"}, "PONDRA_WHEEL": wheel})

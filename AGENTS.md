@@ -1,7 +1,7 @@
 # AGENTS.md — working on Pondra
 
 Read this first, then `README.md` (what it does), `docs/adr-005-every-node-writes.md` (why it
-works this way) and `docs/adr-020-change-any-row.md` (the current round).
+works this way) and `docs/adr-022-columns-views-and-frames.md` (the current round).
 `docs/prototype-status.md` has the measured numbers and what's left.
 
 ## What this is
@@ -18,13 +18,13 @@ The owner's design principles, which every change must respect:
 2. **As serverless as possible**: no always-on services besides the nodes themselves.
 3. **SPMD, not driver/executor** (Bodo-style): every node runs the same code on its slice.
 4. **No JVM, no Spark, no Flink, no Fluss needed.**
-5. **Short, simple, readable code** — without losing functionality. ~15,300 lines of Rust total (the Kafka protocol is 1,300 of them).
+5. **Short, simple, readable code** — without losing functionality. ~16,600 lines of Rust total (the Kafka protocol is 1,300 of them).
    If a change makes a file much longer, look for the simpler shape first.
 
 ## Layout
 
 ```
-src/      16,100 lines of Rust, one file per concern (see the table in README.md)
+src/      16,600 lines of Rust, one file per concern (see the table in README.md)
 python/   the Python client (pure Python, HTTP + Arrow; `local()` starts a node)
 js/       the JavaScript client and the `pondra` npm package's files
 examples/ quickstart.ipynb (pip install to an as-of join, in the owner's notebook style)
@@ -41,7 +41,7 @@ tools/    harness.py, cluster.py (tests), open_check.py (Delta + Iceberg readers
           join_order.py (the same queries written badly: same answers, no slower),
           spread_tpch.py (all 22 TPC-H queries across N nodes == one node, and why not),
           skew_check.py (a hot join key: same answers, the work shared out),
-          asof_check.py (ASOF JOIN == DuckDB's, one node and three), stream_check.py (windows,
+          bench/nexmark.py (five Nexmark queries, Pondra and Flink), asof_check.py (ASOF JOIN == DuckDB's, one node and three), stream_check.py (windows,
           sessions and an as-of view over one stream: every click once; rates and delays),
           cloud/ (a cluster on several machines; cloud/actions/ + .github/workflows/: on GitHub runners),
           bench/tpch-queries/ (the 22 TPC-H queries),
@@ -97,6 +97,10 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
   tombstones become upserts and deletes.
 - **The Iceberg REST catalog** (`GET /v1/…`, `iceberg.rs`): engines attach a node by URL.
 - **Schema evolution:** `ALTER TABLE … ADD COLUMN`; reads conform older rows (`query::conform`).
+  `RENAME COLUMN`, `DROP COLUMN` and widening `ALTER COLUMN … TYPE` (round 21, ADR-022) change the
+  catalog, never the files: `TableMeta::columns` are the stored names, `names` and `dropped` say
+  what SQL sees (`TableMeta::logical`); reads alias them (`query::named`), the log keeps stored
+  names (`log::pack`: `to_stored`), Delta maps columns by name and Iceberg by field id.
 - **Window views that emit once** (`views.rs`, `?window=w&size_secs=&lateness_secs=`): closed
   windows go to `{view}_final`, emitted by the leader.
 - **SSD tier** (lakes on object storage): each node keeps immutable objects on local disk —
@@ -204,6 +208,16 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
   leader after commits (Δa ⋈ b ∪ a ⋈ Δb by `_version`); `slide_secs` windows combine panes.
 - **The Postgres port** (`pg.rs`): rows a batch at a time, `COPY` in (text, CSV) and out (text,
   CSV, binary), DECIMAL as NUMERIC.
+- **Views that start full** (round 21, `views.rs`): the sequencer holds every flush to the inline
+  views (`views::Inline`, checked in `log::commit`: a flush with a table's rows carries a part per
+  view of it, and none for a view it doesn't have, or its node packs it again); a new view's
+  filling ends at the first commit that holds flushes to it (`Fill::upto`, set by
+  `views::bound` in that commit) and the leader fills it from the rows up to there once
+  (`fill_all`, producer `fill:{view}`).
+- **The latest row by event time** (round 21): a keyed table's `order_by` column decides which of
+  a key's rows is current (`query::latest_sql`: the greatest, then the last to come); such tables
+  read by grouping every generation, not by shadowing. A keyed table's `_deleted` is left out of
+  reads unless a query names it (`query::named`).
 - **Memory:** one spill pool per node (`--memory-gb`); a query out of memory runs again with
   sort-merge joins. **`GET /metrics`** (Prometheus) for everything else.
 
@@ -243,9 +257,12 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    (`caught_up` in `tier.rs`). A node whose catalog disagrees refuses the job; the next round
    retries. This turns any future "a node saw less than the leader" bug into a retry, not a loss.
 10. **The Delta log is derived, never authoritative.** A Delta commit is computed from committed
-   catalog state only and written put-if-absent; an unrecorded one found later is adopted (which
-   is also why the catalog write recording it isn't awaited). Only `_last_checkpoint` is ever
-   overwritten, and nothing in `_delta_log/` goes through the SSD tier.
+   catalog state only and written put-if-absent; an unrecorded one found later is adopted (an
+   Iceberg version already there is skipped: its next number is taken). Publishing runs one round
+   at a time, each committing what it published before the next reads it (`delta::publish_all`):
+   a `CHECKPOINT` and a tiering round publishing at once wrote the same Iceberg version on R2.
+   Only `_last_checkpoint` is ever overwritten, and nothing in `_delta_log/` goes through the SSD
+   tier.
 11. **Catalog memtable flushes are rationed:** one loop, every 5 s, only if something committed,
    plus one when a leader takes over (followers' views read no WAL and need it). Each flush is a
    level-0 file; flushing on every tiering call stalled writes for 9 s at a time (round 6).
@@ -305,9 +322,10 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    sequence + record count, `prev` = base sequence, producer `kafka:{id}:{topic}`. Producers
    without a name (non-idempotent Kafka producers) are never checked (`log::commit`); nothing
    else may use an empty name.
-23. **Columns only grow, at the end** (`write::create_table`), and every read of log rows goes
-   through `query::conform` (by name; missing → null). Never read segment rows with the table
-   schema without conforming them: rows written before an ALTER have fewer columns.
+23. **Stored columns only grow, at the end** (`write::create_table`), and every read of log rows
+   goes through `query::conform` (by name; missing → null). Never read segment rows with the table
+   schema without conforming them: rows written before an ALTER have fewer columns. A rename or
+   drop changes `names`/`dropped`, never `columns` (invariant 74).
 24. **A window is emitted once** (`views::emit`): the rows and the `emit:{view}` producer's seq
    (the watermark, µs) commit together, with `prev` = the last watermark.
 25. **An append table's entry lists at most 128 files** (`manifest::seal`, called from
@@ -509,6 +527,38 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
 73. **`pondra_object_requests_total` counts what the store was asked to do** (`store::Counted`), not
    what SlateDB tried: a local disk refuses SlateDB's tagged PUT before writing, and it tries again
    untagged; the refusal isn't counted.
+74. **A column keeps the name it was first written under** (`TableMeta::columns`); SQL's names are
+   `names` and `dropped` over it (`TableMeta::logical`). Everything users write goes in by SQL's
+   names and into the log by stored names (`log::pack` → `to_stored`), and a name SQL no longer
+   knows is left out — never taken for the column now stored under it (`harness.py columns`: the
+   writer from before the rename). Reads alias stored to SQL names in one place
+   (`query::named`, also on every node of a spread query); key ranges and file statistics stay
+   in stored names (`ranges::named`).
+75. **A table's type only widens** (`ddl::widens`): every file already written must read as the
+   new type. Delta readers learn renamed columns from column mapping declared as the
+   `columnMapping` table feature (reader 3), never reader version 2 alone: delta-rs's pyarrow
+   reader ignored version 2 and read renamed columns as null (`harness.py columns`).
+76. **The sequencer holds every flush to the inline views** (`log::commit`, `views::Inline`): a
+   flush with rows of a table views follow carries a part for each (empty if none derived), and no
+   part for a view the table doesn't have; otherwise it goes back to be packed again. A view's
+   filling ends at the first commit that holds flushes to it, written in that commit
+   (`views::bound`); the fill covers `_version ≤ upto`, as of `upto`. `harness.py fills`: with the
+   check off, all 12 checks fail.
+77. **The inline views the sequencer holds flushes to are reloaded after every view made or
+   dropped** (`views::forget`), and a cache that changed meanwhile is never overwritten with an
+   older one (`views::bound` checks it's the same). A stale set refuses every flush of the new
+   view's rows forever.
+78. **A producer whose progress leaves the catalog leaves the sequencer's memory too**
+   (`log::forget_producers`, from `drop_view`): a view dropped and made again under its name had
+   its fill taken for a duplicate of the old one's, and never filled (`harness.py fills`: made
+   again).
+79. **A keyed table with `order_by` is never read by shadowing** (`query::table_view`): a newer
+   generation may hold an older event. Reads, folds and compactions take each key's greatest
+   `order_by` then the last `_ord` (`latest_sql`); lookups and point queries go through SQL
+   (`harness.py dedup`).
+80. **A keyed table's `_deleted` is shown only to a query that names it, decided alike on every
+   node** (`query::names_deleted` over the query and the stored views it reads, in `session_at` and
+   `spmd::plan`): nodes that disagreed would plan the query differently.
 
 ## Tests: run these before and after any change
 
@@ -537,6 +587,10 @@ python3 tools/harness.py layouts               # PRIMARY KEY + partition_by + cl
 python3 tools/harness.py clusters              # cluster_by over two columns: row groups narrow in both (Hilbert order)
 python3 tools/harness.py copies                # COPY FROM STDIN (text, CSV), TO STDOUT (text, CSV, binary); the ADBC Postgres driver
 python3 tools/harness.py streams               # a stream join over two nodes and a restart vs a model; sliding windows vs a model
+python3 tools/harness.py columns               # RENAME/DROP COLUMN, a name added again, widened types under streaming vs a model; 4 outside readers
+python3 tools/harness.py fills                 # views filled from existing rows while rows stream in, made again, through a leader restart
+python3 tools/harness.py dedup                 # a keyed table deduplicated by event time (order_by) vs a model; SELECT * without _deleted
+python3 tools/bench/nexmark.py [--bids 4000000] # Nexmark q1, q2, q5, q7, q11: Pondra (== DuckDB) and Flink 2.3 (venv-flink)
 python3 tools/smoke.py target/release/pondra   # what CI runs on Windows, macOS and Linux (stdlib only)
 python3 tools/anywhere_check.py --bin <pondra> --dist dist [--docker]   # shell, local(), kill -9, wheel, npm, notebook; glibc 2.17 + Ubuntu 22.04
 python3 tools/bench/repeat.py --data ~/tpch/sf1-bench --query 15 --runs 20 [--hot]   # one query many times vs DuckDB
@@ -600,13 +654,13 @@ Practical notes for an agent working here:
 - Node stderr goes to `/tmp/pondra-<port>-<id>.stderr`; that's where "restarting to rejoin",
   "slow tiering" and panics show up.
 
-## State of the work (2026-09-26, round 20)
+## State of the work (2026-09-27, round 21)
 
 Everything in `docs/prototype-status.md` passes on local disk and on simulated R2. The round-11
 additions (manifests, partitions, shuffles, memory limits, Arrow Flight) also ran against real
 R2; round 12's are in `logs/round12/`, round 13's in `logs/round13/`, round 14's in
 `logs/round14/`, round 15's in `logs/round15/`, round 16's in `logs/round16/`, round 17's in `logs/round17/`,
-round 18's in `logs/round18/`, round 19's in `logs/round19/` and round 20's in `logs/round20/`.
+round 18's in `logs/round18/`, round 19's in `logs/round19/`, round 20's in `logs/round20/` and round 21's in `logs/round21/`.
 
 **R2 test buckets.** There are two:
 
@@ -618,9 +672,11 @@ all. After R2 runs: `tools/clean_bucket.py --bucket ponderabucket-us --bucket po
 3 --dry-run`, then without `--dry-run`.
 
 **The repository (2026-09-27).** `alimardon123/pondra` on GitHub holds the code, pushed by the
-owner from the bundles (the sandbox can't push). It is public but **all rights reserved**
-(`LICENSE`): nobody may reuse it, and the packages are marked so PyPI, npm and crates.io refuse
-them until the owner picks a license. Its history was rewritten once, before it went public, to
+owner from the bundles (the sandbox can't push). It is public and, since round 21, licensed
+**MIT OR Apache-2.0** (`LICENSE-MIT`, `LICENSE-APACHE`); the wheel and npm packages carry both.
+The owner is setting up PyPI (trusted publisher: `release.yml`, environment `pypi`) and npm (a
+token for the first release, trusted publishing after); a `v*` tag then builds, tries and
+publishes (`.github/workflows/release.yml`); `publish = false` keeps the crate off crates.io. Its history was rewritten once, before it went public, to
 put the owner's GitHub noreply address on the four commits that had their email; commit IDs from
 before then (in older bundles) differ. Each round the owner downloads the new bundle and, in
 their clone, runs `git pull <bundle> main` and `git push`; GitHub then builds it on Linux,
@@ -650,6 +706,12 @@ spread, 4 of them slower for it: 2.3 s in all), spread anyway 39.5 s; 80 MB move
 were rewritten by the leader to stamp row ids (fixed: invariant 70). A query that has run both
 ways now goes the faster way (invariant 72). Next: machines in one data centre.
 
+**The cluster bench on round 20** (the owner's run, `logs/round21/cluster-bench-round20-run.json`,
+links 41–53 ms and 53–69 MB/s): loading 105.9 s (442 s on round 19: fixed); one node 24.5 s, as
+the cluster decides 24.8 s (8 queries spread: 0.22 s lost, 0.15 s won), spread anyway 34.7 s;
+every answer the same. The runners vary: compare within a run. Right after the load the leader's
+tiering merged small files for 16–28 s a round on R2 (open).
+
 **Where the multi-machine run will happen (the owner's plan, 2026-09-23).** The owner has no VMs
 of their own. They will run the multi-machine tests themselves, later, on one of:
 
@@ -672,6 +734,13 @@ bucket, which the agent can read with the credentials in `/home/claude/.r2env`. 
 links a session to their computer, an agent can drive VMs from there instead.
 
 Headline numbers, all on one 2-vCPU box:
+
+- **Columns that change, views that start full** (round 21, ADR-022): `RENAME COLUMN`, `DROP
+  COLUMN`, widening `ALTER COLUMN … TYPE` with no file rewritten (a scan of 10 M rows 0.033 s
+  before, 0.034 s after), and Delta (column mapping) and Iceberg (field ids) readers following;
+  `CREATE MATERIALIZED VIEW` filled from the rows already there, every row once (10 M rows:
+  2.3–2.6 s); keyed tables deduplicated by event time (`order_by`). Nexmark q1, q2, q5, q7, q11
+  over 10 M bids: 8.7–10.9 s (Flink 2.3: 24.3–25.0 s), the same answers as DuckDB.
 
 - **Fewer objects, any layout, streams joined** (round 20, ADR-021): a trickle of one-row INSERTs
   writes 1.1 objects each (3.9 before) and leaves 217 (5,962); tiering with system columns 1.10–1.16 s
@@ -736,7 +805,7 @@ Known limits, in the order they matter:
 2. **What follows a table and can't take a row back** (windows emitted once, min/max views, views
    over joins, streaming tasks) makes a change of it refused; Kafka consumers see an UPDATE's new
    rows, not its deletes; a purge rewrites whole files (no deletion vectors yet); `ALTER TABLE`
-   renames and drops need column ids (round 20).
+   renames a table only by copying it (`CREATE TABLE … AS`, `DROP TABLE`), and never narrows a type.
 3. **Distributed edges:** a `LIMIT` inside a subquery over sliced data and order-preserving
    shuffles run on one node; a join with a hot key on both sides shares out only one side; key
    ranges are found from the files, not declared (a table written out of order isn't sliced by
@@ -756,34 +825,34 @@ Known limits, in the order they matter:
 8. **Kafka's edges:** one partition per topic, no transactions, sparse offsets, consumer groups
    in the leader's memory.
 9. **Streaming:** one watermark per source (not per partition or node), held by a quiet source;
-   no sliding windows, timers or CEP; an as-of join in a view joins what the table has when the
+   no timers or CEP, no Top-N per key by event time yet; a view's fill runs in one go on the
+   leader (rows in memory); an as-of join in a view joins what the table has when the
    event arrives (Flink's temporal join waits for the table's watermark); keyed tables keep only
    their latest row, so as-of joins need a table's history kept as rows.
-10. **Security:** tokens per role only; no TLS (use a proxy), no per-table grants or quotas.
+10. **Security:** tokens per role only; no TLS (use a proxy) — the nodes' own calls to each other
+    are plain HTTP too, so run a cluster in a private network, a VPC or Tailscale — no per-table
+    grants or quotas.
 11. **`VARIANT` is JSON text**, not a shredded variant; `ai_*` and Flight functions call out of
     the process, so their latency is the endpoint's.
-12. **Packages built, not published.** PyPI and npm names and the repository's visibility are
-    the owner's call; the macOS, Windows and ARM Linux builds exist only in the release
-    workflow, which hasn't run yet. Only `sum` over DOUBLE is order-independent (not `avg`,
+12. **Packages built, not yet published.** The owner is setting up PyPI and npm (MIT OR
+    Apache-2.0 since round 21); the macOS, Windows and ARM Linux builds exist only in the
+    release workflow, which hasn't run yet. Only `sum` over DOUBLE is order-independent (not `avg`,
     `stddev`, …).
 
-Good next moves: `docs/roadmap.md` (2026-09-26, after round 19) is the plan, with the reasons.
-Rounds 17–19 are done except what needs the owner: publishing the packages, and cluster-bench
-runs. In short:
+Good next moves: `docs/roadmap.md` (2026-09-27, after round 21) is the plan, with the reasons.
+Rounds 17–21 are done except what needs the owner (publishing, cluster-bench runs). In short:
 
-1. **Round 20, shape it further:** the rest of `ALTER TABLE` (rename a table, rename and drop
-   columns, widen types) on column ids the files carry (Iceberg's field ids) — the owner asked;
-   design first, an ADR before code. Also: materialized views filled from the rows already there.
-2. **The cluster bench:** once the owner reruns `cluster-bench.yml` with 3 nodes on round 19's
-   code (`bench-bin/pondra` holds it), compare `cluster_s` (the guard) with `one_node_s` and
-   `forced_s` in `bench-results/<run id>/results.json`; then machines in one data centre.
-3. **Publish:** once the owner reserves `pondra` on PyPI and npm and picks a license, tag
-   `v0.20.0` and let `.github/workflows/release.yml` build, try and publish.
-4. **Then:** proof at scale (TPC-H SF10 on 1/3/6 machines, Nexmark, sqllogictest), a web console
-   and live queries, the in-process module, TLS and grants, the browser (roadmap rounds 20–24).
+1. **Round 22, the DataFrame API** (`docs/dataframe-api.md`, designed in ADR-022): `pondra.frame`
+   (Polars-style, lazy) and `pondra.spark` (PySpark's names), one expression tree compiling to
+   SQL, tested against Polars and PySpark; with it, a console at `/` and live queries.
+2. **Publish:** once the owner's PyPI pending publisher and npm token are in place, tag
+   `v0.21.0` and let `.github/workflows/release.yml` build, try and publish.
+3. **Security before anyone else's data:** TLS on the node port and mutual TLS between nodes, then
+   grants (roadmap E3).
+4. **Then:** machines in one data centre for the cluster bench, the in-process library, the
+   browser, and streaming depth by evidence (Top-N, timers, the rest of Nexmark).
 
-The owner decides whether the repo goes public (or a public bench repo holds only the
-workflow), whether to link their Windows laptop, and the package names on PyPI, npm and crates.io.
+The owner decides whether to link their Windows laptop, and when to publish.
 
 ## Conventions
 

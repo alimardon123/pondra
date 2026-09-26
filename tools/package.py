@@ -29,21 +29,27 @@ def version():
             return line.split('"')[1]
 
 
+LICENSES = ["LICENSE-APACHE", "LICENSE-MIT"]  # (MIT OR Apache-2.0, at the user's choice)
+REPO = {"type": "git", "url": "git+https://github.com/alimardon123/pondra.git"}  # (npm's provenance checks it's this repository)
+
+
 def wheel(binary, platform, out):
     v, tags = version(), PLATFORMS[platform][0]
     name = f"pondra-{v}-py3-none-{tags}.whl"
     exe = "pondra.exe" if platform.startswith("windows") else "pondra"
     readme = open(os.path.join(ROOT, "README.md"), encoding="utf-8").read().split("\n## ")[0]
     meta = "\n".join([
-        "Metadata-Version: 2.1", "Name: pondra", f"Version: {v}",
-        "Summary: Pondra, a streamhouse in one binary: the binary, and a Python client",
-        "Requires-Python: >=3.9", "Classifier: License :: Other/Proprietary License",
-        "Classifier: Private :: Do Not Upload", "Provides-Extra: arrow", 'Requires-Dist: pyarrow; extra == "arrow"',
+        "Metadata-Version: 2.4", "Name: pondra", f"Version: {v}",
+        "Summary: Pondra, a streamhouse in one binary: the binary, and a Python client", "Author: Alimardon",
+        "License-Expression: MIT OR Apache-2.0", "License-File: LICENSE-APACHE", "License-File: LICENSE-MIT",
+        "Project-URL: Repository, https://github.com/alimardon123/pondra",
+        "Requires-Python: >=3.9", "Provides-Extra: arrow", 'Requires-Dist: pyarrow; extra == "arrow"',
         "Description-Content-Type: text/markdown", "", readme])
     wheel_file = "\n".join(["Wheel-Version: 1.0", "Generator: pondra tools/package.py", "Root-Is-Purelib: false"] + [f"Tag: py3-none-{t}" for t in tags.split(".")]) + "\n"
     files = {"pondra/__init__.py": open(os.path.join(ROOT, "python/pondra/__init__.py"), "rb").read(),
              f"pondra-{v}.data/scripts/{exe}": open(binary, "rb").read(),
-             f"pondra-{v}.dist-info/METADATA": meta.encode(), f"pondra-{v}.dist-info/WHEEL": wheel_file.encode()}
+             f"pondra-{v}.dist-info/METADATA": meta.encode(), f"pondra-{v}.dist-info/WHEEL": wheel_file.encode(),
+             **{f"pondra-{v}.dist-info/licenses/{n}": open(os.path.join(ROOT, n), "rb").read() for n in LICENSES}}
     digest = lambda b: "sha256=" + base64.urlsafe_b64encode(hashlib.sha256(b).digest()).rstrip(b"=").decode()
     record = "".join(f"{p},{digest(b)},{len(b)}\n" for p, b in files.items()) + f"pondra-{v}.dist-info/RECORD,,\n"
     files[f"pondra-{v}.dist-info/RECORD"] = record.encode()
@@ -67,7 +73,9 @@ def npm_platform(binary, platform, out):
         shutil.copy2(binary, os.path.join(d, exe))
         os.chmod(os.path.join(d, exe), 0o755)
         json.dump({"name": f"pondra-{platform}", "version": version(), "description": f"The pondra binary for {platform}: install `pondra` instead",
-                   "os": [os_], "cpu": [cpu], "files": [exe], "license": "UNLICENSED", "private": True}, open(os.path.join(d, "package.json"), "w"), indent=2)
+                   "os": [os_], "cpu": [cpu], "files": [exe, *LICENSES], "license": "MIT OR Apache-2.0", "repository": REPO}, open(os.path.join(d, "package.json"), "w"), indent=2)
+        for n in LICENSES:
+            shutil.copy2(os.path.join(ROOT, n), d)
         return npm_pack(d, out)
 
 
@@ -77,6 +85,8 @@ def npm_main(out):
         pkg = json.load(open(os.path.join(d, "package.json")))
         pkg["version"] = version()
         pkg["optionalDependencies"] = {f"pondra-{p}": version() for p in PLATFORMS}
+        for n in LICENSES:
+            shutil.copy2(os.path.join(ROOT, n), d)
         json.dump(pkg, open(os.path.join(d, "package.json"), "w"), indent=2)
         return npm_pack(d, out)
 

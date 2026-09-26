@@ -181,8 +181,8 @@ impl Backend {
         if other.is_some() {
             return refuse("COPY into an attached lake: INSERT INTO it instead");
         }
-        let meta = self.app.lake.cat.get::<crate::store::TableMeta>(&crate::store::table_key(&table)).await.map_err(user_error)?.ok_or_else(|| user_error(anyhow::anyhow!("no table {table}")))?;
-        let n = if c.columns.is_empty() { meta.columns.len() } else { c.columns.len() };
+        let meta = self.app.lake.cat.get::<crate::store::TableMeta>(&crate::store::table_key(&table)).await.map_err(user_error)?.ok_or_else(|| user_error(anyhow::anyhow!("no table {table}")))?.logical();
+        let n = if c.columns.is_empty() { meta.columns.iter().filter(|(c, _)| c != "_deleted").count() } else { c.columns.len() };
         COPIES.lock().unwrap().insert(client.socket_addr(), Pending { copy: Copy { table, ..c }, data: vec![], rows: 0, seq: 0, job: uuid::Uuid::new_v4().to_string() });
         Ok(Response::CopyIn(CopyResponse::new(0, n, stream::empty())))
     }
@@ -204,8 +204,8 @@ impl Backend {
         }
         let err = |e: anyhow::Error| user_error(e);
         let meta = self.app.lake.cat.get::<crate::store::TableMeta>(&crate::store::table_key(&p.copy.table)).await.map_err(err)?.ok_or_else(|| err(anyhow::anyhow!("no table {}", p.copy.table)))?;
-        let table = crate::query::schema(&meta.columns).map_err(err)?;
-        let given: Vec<String> = if p.copy.columns.is_empty() { table.fields().iter().map(|f| f.name().clone()).collect() } else { p.copy.columns.clone() };
+        let table = crate::query::schema(&meta.logical().columns).map_err(err)?; // (SQL's names: ADR-022)
+        let given: Vec<String> = if p.copy.columns.is_empty() { table.fields().iter().map(|f| f.name().clone()).filter(|c| c != "_deleted").collect() } else { p.copy.columns.clone() }; // (as `SELECT *` shows it)
         let schema = Arc::new(Schema::new(given.iter().map(|c| table.field_with_name(c).cloned()).collect::<Result<Vec<_>, _>>().map_err(|e| err(e.into()))?));
         let null = regex::Regex::new(&format!("^{}$", regex::escape(&p.copy.null.clone().unwrap_or(if csv { String::new() } else { "\\N".into() })))).map_err(|e| err(e.into()))?;
         let mut reader = datafusion::arrow::csv::ReaderBuilder::new(schema.clone()).with_header(header).with_delimiter(p.copy.delimiter.unwrap_or(if csv { ',' } else { '\t' }) as u8).with_null_regex(null);

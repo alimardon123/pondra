@@ -74,10 +74,15 @@ pub fn cast_as(b: &RecordBatch, s: &SchemaRef) -> Result<RecordBatch> {
     Ok(RecordBatch::try_new_with_options(s.clone(), columns.collect::<Result<Vec<_>, _>>()?, &options)?)
 }
 
-/// Rows of `table` from committed segments in (after, upto]; `None` = up to the latest.
+/// Rows of `table` from committed segments in (after, upto]; `None` = up to the latest; under
+/// the names SQL knows their columns by (ADR-022: `tail_of` gives them as stored).
 /// With `ord`, each row gets `_ord` = (segment << 32) + position, so later versions sort last.
 pub async fn tail(lake: &Lake, table: &str, after: u64, upto: Option<u64>, ord: bool) -> Result<Vec<RecordBatch>> {
-    tail_of(lake, table, after, upto, ord, false).await
+    let rows = tail_of(lake, table, after, upto, ord, false).await?;
+    match lake.cat.get::<TableMeta>(&table_key(table)).await? {
+        Some(m) if m.mapped() => rows.iter().map(|b| m.to_logical(b)).collect(),
+        _ => Ok(rows),
+    }
 }
 
 /// `tail`, with the system columns (`sys.rs`) when `sys`: each row's commit, and its `_row_id`.
@@ -259,11 +264,30 @@ async fn upsert_view(lake: &Lake, ctx: &SessionContext, name: &str, meta: &Table
     Ok(aux.sql(&sql).await?.into_view())
 }
 
+/// A table's reads under the names SQL knows its columns by (ADR-022): renamed columns aliased
+/// from their stored names, dropped ones left out. (Filters still reach the files by their stored
+/// names, through the projection: min/max pruning works as before.) A keyed table's `_deleted`
+/// is left out too, unless the query names it (`deleted`): reads leave deleted rows out anyway,
+/// so `SELECT *` shows the table's own columns.
+pub fn named(ctx: &SessionContext, provider: Arc<dyn TableProvider>, meta: &TableMeta, deleted: bool) -> Result<Arc<dyn TableProvider>> {
+    let hide = !deleted && !meta.key.is_empty() && meta.columns.iter().any(|(c, _)| c == "_deleted");
+    if !meta.mapped() && !hide {
+        return Ok(provider);
+    }
+    let df = ctx.read_table(provider)?;
+    let shown = |c: &String| !meta.dropped.contains(c) && !(hide && c == "_deleted");
+    let keep: Vec<Expr> = df.schema().fields().iter().filter(|f| shown(f.name())).map(|f| datafusion::prelude::ident(f.name()).alias(meta.name_of(f.name()))).collect();
+    Ok(df.select(keep)?.into_view())
+}
+
+/// Does a query (with the stored views it reads) name a keyed table's `_deleted` (`named`)?
+pub fn names_deleted(text: &str) -> bool { text.to_lowercase().contains("_deleted") }
+
 /// A table as its users see it: append tables as files + log; keyed tables their current rows.
 /// `upto`: the log only that far (a distributed query reads every node's copy at one snapshot).
 pub async fn table_view(lake: &Lake, ctx: &SessionContext, name: &str, meta: &TableMeta, upto: Option<u64>) -> Result<Arc<dyn TableProvider>> {
-    if !meta.key.is_empty() && meta.merge.is_empty() {
-        return upsert_view(lake, ctx, name, meta, upto).await;
+    if !meta.key.is_empty() && meta.merge.is_empty() && meta.order.is_none() {
+        return upsert_view(lake, ctx, name, meta, upto).await; // (by event time: every source's rows grouped by key, below)
     }
     if meta.key.is_empty() {
         let schema = read_schema(&meta.columns)?;
@@ -389,11 +413,21 @@ pub fn latest_sql(meta: &TableMeta, raw_table: &str, sorted: bool, keep_deleted:
         let live = if keep_deleted { String::new() } else { live(meta) }; // (windows past their TTL drop out; emptied groups too)
         return format!("SELECT * FROM (SELECT {} FROM \"{raw_table}\" GROUP BY {key}){live}{order}", cols.collect::<Vec<_>>().join(", "));
     }
+    let out = meta.columns.iter().map(|(c, _)| q(c)).collect::<Vec<_>>().join(", ");
+    let deleted = if keep_deleted { String::new() } else { live(meta) }; // (a partial merge keeps markers and expired rows)
+    if let Some(o) = &meta.order {
+        // By event time: each key's greatest `order_by`, then the last to come among rows that tie
+        // on it — two hash aggregates and two hash joins (`(key, _ord)` is one row).
+        let on = |a: &str, b: &str| meta.key.iter().map(|k| format!("{a}.{} = {b}.{}", q(k), q(k))).collect::<Vec<_>>().join(" AND ");
+        let picked = meta.columns.iter().map(|(c, _)| format!("c.{} AS {}", q(c), q(c))).collect::<Vec<_>>().join(", ");
+        return format!("WITH m AS (SELECT {key}, max({o}) AS __m FROM \"{raw_table}\" GROUP BY {key}), \
+            c AS (SELECT r.* FROM \"{raw_table}\" r JOIN m ON {} AND r.{o} IS NOT DISTINCT FROM m.__m), \
+            l AS (SELECT {key}, max(\"_ord\") AS __o FROM c GROUP BY {key}) \
+            SELECT {out} FROM (SELECT {picked} FROM c JOIN l ON {} AND c.\"_ord\" = l.__o){deleted}{order}", on("r", "m"), on("c", "l"), o = q(o));
+    }
     // Newest version per key as a grouped aggregate (a hash table), not a window (a sort).
     let newest = |c: &String| format!("first_value({} ORDER BY \"_ord\" DESC) AS {}", q(c), q(c));
     let cols = meta.columns.iter().map(|(c, _)| if meta.key.contains(c) { q(c) } else { newest(c) });
-    let out = meta.columns.iter().map(|(c, _)| q(c)).collect::<Vec<_>>().join(", ");
-    let deleted = if keep_deleted { String::new() } else { live(meta) }; // (a partial merge keeps markers and expired rows)
     format!("SELECT {out} FROM (SELECT {} FROM \"{raw_table}\" GROUP BY {key}){deleted}{order}",
             cols.collect::<Vec<_>>().join(", "))
 }
@@ -457,7 +491,8 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
     for (key, meta) in lake.cat.scan::<TableMeta>("t/", "t0").await? {
         let name = &key[2..];
         if name != except && !crate::sys::hidden(name) && (listing || mentions(&text, name)) {
-            ctx.register_table(table_ref(name), table_view(lake, &ctx, name, &sys(meta), upto).await?)?;
+            let view = table_view(lake, &ctx, name, &sys(meta.clone()), upto).await?;
+            ctx.register_table(table_ref(name), named(&ctx, view, &meta, names_deleted(&text))?)?;
         }
     }
     let attached = lake.attached.read().unwrap().clone();
@@ -478,7 +513,7 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
             if crate::sys::hidden(name) || !(listing || mentions(&text, name)) {
                 continue;
             }
-            let view = table_view(&other, &ctx, name, &sys(meta), None).await?;
+            let view = named(&ctx, table_view(&other, &ctx, name, &sys(meta.clone()), None).await?, &meta, names_deleted(&text))?;
             let (s, t) = split(name);
             if old && s == PUBLIC {
                 default.schema(&ns).expect("registered").register_table(t.to_string(), view.clone())?;
@@ -540,7 +575,7 @@ pub async fn register_views(ctx: &SessionContext, mut views: Vec<(String, String
 /// Run `sql` with table `source` standing for just `rows` (new rows of a streaming source); every
 /// other table it mentions is read from the lake as usual.
 pub async fn over(lake: &Lake, source: &str, rows: Vec<RecordBatch>, sql: &str) -> Result<RecordBatch> {
-    let meta: TableMeta = lake.cat.get(&table_key(source)).await?.ok_or_else(|| anyhow::anyhow!("no table {source}"))?;
+    let meta: TableMeta = lake.cat.get::<TableMeta>(&table_key(source)).await?.ok_or_else(|| anyhow::anyhow!("no table {source}"))?.logical(); // (rows under SQL's names)
     let sql = crate::asof::rewrite(sql)?;
     let df = over_ctx(lake, source, schema(&meta.columns)?, rows, &sql).await?.sql(&sql).await?;
     let out = Arc::new(df.schema().as_arrow().clone());

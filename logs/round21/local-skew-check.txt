@@ -1,0 +1,40 @@
+{
+ "rows": 2000000,
+ "without": {
+  "same": {
+   "inner join": true,
+   "LEFT JOIN": true,
+   "IN": true,
+   "grouped by the key": true
+  },
+  "splits": 0.0,
+  "read_mb": [
+   14.6,
+   54.5,
+   14.6
+  ],
+  "busiest_over_average": 1.95
+ },
+ "shared_out": {
+  "same": {
+   "inner join": true,
+   "LEFT JOIN": true,
+   "IN": true,
+   "grouped by the key": true
+  },
+  "splits": 3.0,
+  "read_mb": [
+   24.4,
+   35.8,
+   24.4
+  ],
+  "busiest_over_average": 1.27
+ },
+ "checks": {
+  "every answer equals one node's, without sharing": true,
+  "every answer equals one node's, with hot partitions shared out": true,
+  "hot partitions were shared out": true,
+  "the busiest node read much less": true
+ },
+ "ok": true
+}

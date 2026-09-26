@@ -95,7 +95,7 @@ fn append(app: &App, table: String, producer: String, first: u64, batches: impl 
     tokio::spawn(async move {
         let mut batches = std::pin::pin!(batches);
         let meta: Option<TableMeta> = lake.cat.get(&table_key(&table)).await.ok().flatten();
-        let Some(schema) = meta.and_then(|m| crate::query::schema(&m.columns).ok()) else {
+        let Some(schema) = meta.and_then(|m| crate::query::schema(&m.logical().columns).ok()) else { // (SQL's names: ADR-022)
             let _ = acks_tx.send(Err(Status::not_found(format!("no table {table}")))).await;
             return;
         };
@@ -168,7 +168,7 @@ impl Json {
 /// a message with `{"after": N}`.
 async fn log_stream(app: App, table: String, after: Option<u64>, columns: Option<Vec<String>>, follow: bool) -> Result<Out<FlightData>, Status> {
     let meta: TableMeta = app.lake.cat.get(&table_key(&table)).await.map_err(status)?.ok_or_else(|| Status::not_found(format!("no table {table}")))?;
-    let full = crate::query::schema(&meta.columns).map_err(status)?;
+    let full = crate::query::schema(&meta.logical().columns).map_err(status)?;
     let pick: Vec<usize> = match &columns {
         Some(cols) => cols.iter().map(|c| full.index_of(c).map_err(|_| Status::invalid_argument(format!("no column {c}")))).collect::<Result<_, _>>()?,
         None => (0..full.fields().len()).collect(),
@@ -361,7 +361,7 @@ impl FlightSqlService for Sql {
         let (mut b, lake) = (q.into_builder(), &self.0.lake);
         for (key, meta) in lake.cat.scan::<TableMeta>("t/", "t0").await.map_err(status)?.into_iter().filter(|(k, _)| !crate::sys::hidden(k)) {
             let (schema, table) = crate::ddl::split(&key[2..]);
-            let columns = crate::query::schema(&meta.columns).map_err(status)?;
+            let columns = crate::query::schema(&meta.logical().columns).map_err(status)?;
             b.append(crate::ddl::lake_name(lake), schema, table, "TABLE", &columns).map_err(status)?;
         }
         for (key, _) in lake.cat.scan::<crate::ddl::StoredView>("q/", "q0").await.map_err(status)? {
@@ -399,7 +399,7 @@ impl FlightService for Door {
         for (key, meta) in app.lake.cat.scan::<TableMeta>("t/", "t0").await.map_err(status)?.into_iter().filter(|(k, _)| !crate::sys::hidden(k)) {
             let table = &key[2..];
             let ticket = serde_json::json!({"sql": format!("SELECT * FROM {}", crate::write::sql_name(table))}).to_string();
-            let schema = crate::query::schema(&meta.columns).map_err(status)?;
+            let schema = crate::query::schema(&meta.logical().columns).map_err(status)?;
             infos.push(Ok(FlightInfo::new().try_with_schema(&schema).map_err(status)?.with_endpoint(FlightEndpoint::new().with_ticket(Ticket::new(ticket))).with_descriptor(FlightDescriptor::new_path(vec![table.to_string()]))));
         }
         Ok(Response::new(Box::pin(futures::stream::iter(infos))))
@@ -413,7 +413,7 @@ impl FlightService for Door {
             (Some(sql), _) => plan_schema(app, sql).await.map_err(|e| Status::invalid_argument(format!("{e:#}")))?,
             (None, Some(table)) => {
                 let meta: TableMeta = app.lake.cat.get(&table_key(table)).await.map_err(status)?.ok_or_else(|| Status::not_found(format!("no table {table}")))?;
-                let full = crate::query::schema(&meta.columns).map_err(status)?;
+                let full = crate::query::schema(&meta.logical().columns).map_err(status)?;
                 let pick = json.columns.iter().flatten().filter_map(|c| full.index_of(c).ok()).collect::<Vec<_>>();
                 if json.columns.is_some() { full.project(&pick).map_err(status)? } else { full.as_ref().clone() }
             }

@@ -92,6 +92,7 @@ async fn list(app: &App) -> Result<Value> {
         for (key, m) in lake.cat.scan::<TableMeta>("t/", "t0").await?.into_iter().filter(|(k, _)| !crate::sys::hidden(k)) {
             let name = &key[2..];
             let kind = if !m.merge.is_empty() { "merge" } else if !m.key.is_empty() { "upsert" } else { "append" };
+            let m = m.logical(); // (SQL's names: ADR-022)
             let columns: Vec<Value> = m.columns.iter().filter(|(c, _)| c != "_deleted").map(|(c, t)| json!({"name": c, "type": t})).collect();
             let view = views.iter().find(|(k, _)| &k[2..] == name).map(|(_, v)| v.sql.clone());
             tables.push(json!({"table": format!("{prefix}{name}"), "kind": kind, "key": m.key, "merge": m.merge, "columns": columns, "view": view}));

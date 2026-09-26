@@ -50,8 +50,8 @@ export class Pondra {
     }
   }
 
-  /** A view: `sql` over each new batch of rows, committed with them (with GROUP BY, kept per
-   * key). Options make it emit what is final: `{ window: "w", size_secs: 60, lateness_secs: 10 }`
+  /** A view: `sql` over the rows already there, then over each new batch of rows, committed
+   * with them (with GROUP BY, kept per key). Options make it emit what is final: `{ window: "w", size_secs: 60, lateness_secs: 10 }`
    * (and `slide_secs: 10`: sliding), or `{ session: "ts", gap_secs: 1800 }`; `{ join: "streams",
    * time: "ts", within_secs: 600 }` pairs two tables' rows as either arrives. Asking again changes nothing. */
   async view(name, sql, options = {}) {

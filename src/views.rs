@@ -41,6 +41,19 @@ pub struct View {
     pub ids: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub join: Option<Join>,
+    /// Filled from the rows its source had when it was made (views made from Pondra 0.21 on).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fill: Option<Fill>,
+}
+
+/// A view's filling (ADR-022). Its rows are its source's rows up to commit `upto`, run through
+/// its SQL once (by the leader: `fill_all`, producer `fill:{view}`), and the rows every flush
+/// after it derives as it is packed. `upto` is set by the sequencer, in the first commit from
+/// which it holds every flush to the view (`inline`), so no row counts twice or never.
+#[derive(Serialize, Deserialize, Clone, Default)]
+pub struct Fill {
+    pub id: String, // (this view, not an earlier one of its name)
+    pub upto: Option<u64>,
 }
 
 /// A join of two streams (`join = 'streams'`): a row of either table pairs with the other's rows
@@ -131,7 +144,7 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, mut emit: Option<Emit>, 
     ensure!(lake.cat.get::<TableMeta>(&table_key(name)).await?.is_none(), "table {name} already exists");
     let (other, source) = crate::ddl::resolve(lake, &first_table(sql)?).await?;
     ensure!(other.is_none(), "a view follows a table of this lake");
-    let src: TableMeta = lake.cat.get(&table_key(&source)).await?.with_context(|| format!("no table {source}"))?;
+    let src: TableMeta = lake.cat.get::<TableMeta>(&table_key(&source)).await?.with_context(|| format!("no table {source}"))?.logical(); // (SQL's names: ADR-022)
     if let Some(s) = sessions {
         ensure!(emit.is_none() && join.is_none(), "a view emits windows or sessions, or joins streams: one of them");
         return create_sessions(lake, name, sql, source, &src, s).await;
@@ -158,7 +171,8 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, mut emit: Option<Emit>, 
         let columns = meta.columns.iter().filter(|(c, _)| c != "_deleted").cloned().collect();
         puts.push((table_key(&format!("{name}_final")), json(&TableMeta { columns, publish: default_publish(), ids: true, tiered: lake.visible(), ..Default::default() })));
     }
-    puts.push((view_key(name), json(&View { source, sql: sql.into(), emit, sessions: None, ids, join: None })));
+    let fill = Some(Fill { id: uuid::Uuid::new_v4().to_string(), upto: None }); // (from the rows already there)
+    puts.push((view_key(name), json(&View { source, sql: sql.into(), emit, sessions: None, ids, join: None, fill })));
     lake.cat.commit(puts, &[]).await
 }
 
@@ -183,7 +197,7 @@ async fn create_sessions(lake: &Lake, name: &str, sql: &str, source: String, src
     ensure!(s.keys.iter().all(|k| out.field_with_unqualified_name(k).is_ok()), "a session view SELECTs its GROUP BY columns, as they are named");
     let columns = out.fields().iter().map(|f| (f.name().clone(), crate::query::type_name(f.data_type()))).collect();
     let meta = TableMeta { columns, publish: default_publish(), ids: true, tiered: lake.visible(), ..Default::default() };
-    let view = View { source, sql: sql.into(), emit: None, sessions: Some(s), ids: false, join: None };
+    let view = View { source, sql: sql.into(), emit: None, sessions: Some(s), ids: false, join: None, fill: None };
     lake.cat.commit(vec![(view_key(name), json(&view)), (table_key(name), json(&meta))], &[]).await
 }
 
@@ -256,6 +270,7 @@ async fn newest(lake: &Lake, table: &str, time: &str) -> Result<Option<i64>> {
     static SEEN: LazyLock<Mutex<std::collections::HashMap<String, (u64, Option<i64>)>>> = LazyLock::new(Default::default);
     let key = format!("{}|{table}|{time}", lake.url);
     let meta: TableMeta = lake.cat.get(&table_key(table)).await?.with_context(|| format!("no table {table}"))?;
+    let stored = meta.stored(time).unwrap_or(time).to_string(); // (files' ranges know it by its stored name: ADR-022)
     let upto = lake.visible();
     let (mut seen, mut newest) = SEEN.lock().unwrap().get(&key).copied().unwrap_or((0, None));
     let us = DataType::Timestamp(TimeUnit::Microsecond, None);
@@ -263,8 +278,8 @@ async fn newest(lake: &Lake, table: &str, time: &str) -> Result<Option<i64>> {
         // (rows went into files since: their ranges say how new they were)
         let s = crate::query::schema(&meta.columns)?;
         let ranges = crate::manifest::ranges(table, &crate::manifest::list(lake, &meta).await?, &meta.files, &s);
-        if let Some((_, hi)) = ranges.get(time) {
-            if let ScalarValue::TimestampMicrosecond(v, _) = ScalarValue::try_from_string(hi.clone(), s.field_with_name(time)?.data_type())?.cast_to(&us)? {
+        if let Some((_, hi)) = ranges.get(&stored) {
+            if let ScalarValue::TimestampMicrosecond(v, _) = ScalarValue::try_from_string(hi.clone(), s.field_with_name(&stored)?.data_type())?.cast_to(&us)? {
                 newest = newest.max(v);
             }
         }
@@ -372,7 +387,7 @@ async fn sessions(lake: &Lake, log: &crate::log::Log, view: &str, v: &View, s: &
         open = start.iter().zip(end.iter()).filter_map(|(s, e)| s.filter(|_| e.is_some_and(|e| e > wm))).fold(open, i64::min);
         closed.push(datafusion::arrow::compute::filter_record_batch(b, &keep)?);
     }
-    let src: TableMeta = lake.cat.get(&table_key(&v.source)).await?.context("a session view without its source")?;
+    let src: TableMeta = lake.cat.get::<TableMeta>(&table_key(&v.source)).await?.context("a session view without its source")?.logical();
     let with = sessionized(&v.sql)?;
     let out = crate::query::over_ctx(lake, &v.source, extended(&src, &s.time)?, closed, &with).await?.sql(&with).await?.collect().await?;
     append(lake, log, view, crate::log::Src { producer, seq: wm as u64, prev: Some(done) }, out).await?;
@@ -467,6 +482,109 @@ pub async fn derive(lake: &Lake, new: &BTreeMap<String, Vec<RecordBatch>>) -> Re
     Ok(out)
 }
 
+/// The views whose rows are derived as flushes are packed (`derive`): the sequencer holds every
+/// flush to them (`log::commit`). A flush carrying rows of a table such views follow must carry a
+/// part for each (empty if it derived none), and none for a view it doesn't know: else its node
+/// packs it again, with the views as they are now. So a view made (or dropped) mid-stream never
+/// misses a flush's rows or gets them from a flush packed without it. Kept in the leader's
+/// memory; `forget` after a view is made or dropped.
+#[derive(Default)]
+pub struct Inline {
+    pub by_source: std::collections::HashMap<String, Vec<String>>, // table -> its views
+    pub tables: std::collections::HashSet<String>,                  // the views' tables (and `$deleted`s)
+    pub unbounded: Vec<(String, View)>,                             // views whose filling doesn't end yet
+}
+
+static INLINE: std::sync::Mutex<BTreeMap<String, std::sync::Arc<Inline>>> = std::sync::Mutex::new(BTreeMap::new());
+static BOUNDED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new()); // (fills this process set `upto` for)
+
+pub fn forget(lake: &Lake) { INLINE.lock().unwrap().remove(&lake.url); }
+
+/// The inline views, as the sequencer holds flushes to them.
+pub async fn inline(lake: &Lake) -> Result<std::sync::Arc<Inline>> {
+    if let Some(i) = INLINE.lock().unwrap().get(&lake.url) {
+        return Ok(i.clone());
+    }
+    let mut i = Inline::default();
+    for (key, v) in lake.cat.scan::<View>("v/", "v0").await? {
+        if v.sessions.is_some() || v.join.is_some() {
+            continue;
+        }
+        let t = key[2..].to_string();
+        i.by_source.entry(v.source.clone()).or_default().push(t.clone());
+        i.tables.extend([crate::sys::deleted(&t), t.clone()]);
+        if v.fill.as_ref().is_some_and(|f| f.upto.is_none() && !BOUNDED.lock().unwrap().contains(&f.id)) {
+            i.unbounded.push((t, v));
+        }
+    }
+    let i = std::sync::Arc::new(i);
+    INLINE.lock().unwrap().insert(lake.url.clone(), i.clone());
+    Ok(i)
+}
+
+/// Sequencer: where the fillings of views made since the last commit end (this commit's puts):
+/// every row before `next` is theirs to fill; every flush from this commit on derives their rows.
+pub fn bound(lake: &Lake, inline: &Inline, next: u64) -> Vec<(String, Vec<u8>)> {
+    let mut puts = vec![];
+    for (t, v) in &inline.unbounded {
+        let fill = v.fill.clone().map(|f| Fill { upto: Some(next - 1), ..f });
+        BOUNDED.lock().unwrap().extend(fill.iter().map(|f| f.id.clone()));
+        puts.push((view_key(t), json(&View { fill, ..v.clone() })));
+    }
+    let mut cache = INLINE.lock().unwrap();
+    if !puts.is_empty() && cache.get(&lake.url).is_some_and(|c| std::ptr::eq(c.as_ref(), inline)) {
+        // (unless a view was made or dropped meanwhile: then the next commit reads them all again)
+        let bounded = Inline { by_source: inline.by_source.clone(), tables: inline.tables.clone(), unbounded: vec![] };
+        cache.insert(lake.url.clone(), std::sync::Arc::new(bounded));
+    }
+    puts
+}
+
+/// A view still filling from its source's rows, if one follows `table` (changes of it wait).
+pub async fn filling(lake: &Lake, table: &str) -> Result<Option<String>> {
+    for (key, v) in lake.cat.scan::<View>("v/", "v0").await? {
+        if v.source == table && v.fill.is_some() && lake.cat.get::<u64>(&producer_key(&format!("fill:{}", &key[2..]))).await?.is_none() {
+            return Ok(Some(key[2..].to_string()));
+        }
+    }
+    Ok(None)
+}
+
+/// Leader: fill the views made since, from their sources' rows up to where their filling ends,
+/// once each (producer `fill:{view}`, seq 1). One whose end isn't set yet gets a commit to set it.
+/// Under the lake's lock: a view dropped (and made again) meanwhile would get another's rows.
+pub async fn fill_all(lake: &Lake, seq: &crate::log::Sequencer, log: &crate::log::Log, lock: &tokio::sync::Mutex<()>) -> Result<()> {
+    let mut waiting = vec![];
+    for (key, v) in lake.cat.scan::<View>("v/", "v0").await? {
+        if v.fill.is_some() && lake.cat.get::<u64>(&producer_key(&format!("fill:{}", &key[2..]))).await?.is_none() {
+            waiting.push(key[2..].to_string());
+        }
+    }
+    if waiting.is_empty() {
+        return Ok(());
+    }
+    let _guard = lock.lock().await;
+    for name in &waiting {
+        let producer = format!("fill:{name}");
+        let (Some(v), None) = (lake.cat.get::<View>(&view_key(name)).await?, lake.cat.get::<u64>(&producer_key(&producer)).await?) else { continue }; // (dropped, or filled, meanwhile)
+        let Some(fill) = &v.fill else { continue };
+        let Some(upto) = fill.upto else {
+            seq.reserve().await?; // (a commit: the sequencer sets `upto` in it)
+            continue;
+        };
+        // The source as it was at `upto`: its rows (and changes) from then, none from after.
+        let sql = format!("SELECT *, \"{}\", \"{}\" FROM {} WHERE \"{}\" <= {upto}", crate::sys::ROW_ID, crate::sys::CREATED, crate::write::sql_name(&v.source), crate::sys::VERSION);
+        let rows = session_at(lake, &sql, "", Some(upto)).await?.sql(&crate::asof::rewrite(&sql)?).await?.collect().await?;
+        let meta: TableMeta = lake.cat.get(&table_key(name)).await?.context("view without table")?;
+        let out = match rows.iter().any(|b| b.num_rows() > 0) {
+            true => view_rows(lake, &v, &meta, &rows, false).await?,
+            false => RecordBatch::new_empty(crate::query::schema(&meta.columns)?),
+        };
+        log.append(name.to_string(), crate::log::Src { producer, seq: 1, prev: None }, out).await?;
+    }
+    Ok(())
+}
+
 /// A view's rows of `rows`, in its table's columns; a row-by-row view's with their source rows'
 /// `_row_id` and `_created_at` after them (and `old`: `_old_version`, as `{view}$deleted` holds).
 async fn view_rows(lake: &Lake, v: &View, meta: &TableMeta, rows: &[RecordBatch], old: bool) -> Result<RecordBatch> {
@@ -478,7 +596,7 @@ async fn view_rows(lake: &Lake, v: &View, meta: &TableMeta, rows: &[RecordBatch]
     if old {
         ids.push(("_old_version".into(), "Int64".into()));
     }
-    let src: TableMeta = lake.cat.get(&table_key(&v.source)).await?.with_context(|| format!("no table {}", v.source))?;
+    let src: TableMeta = lake.cat.get::<TableMeta>(&table_key(&v.source)).await?.with_context(|| format!("no table {}", v.source))?.logical();
     let sql = crate::asof::rewrite(&v.sql)?;
     let ctx = crate::query::over_ctx(lake, &v.source, schema(&[src.columns, ids.clone()].concat())?, rows.to_vec(), &sql).await?;
     let names: Vec<&str> = ids.iter().map(|(c, _)| c.as_str()).collect();
@@ -589,7 +707,7 @@ async fn create_join(lake: &Lake, name: &str, sql: &str, source: String, mut j: 
     j.tables = tables;
     let now = lake.visible();
     let meta = TableMeta { columns, publish: default_publish(), ids: true, tiered: now, ..Default::default() };
-    let view = View { source, sql: sql.into(), emit: None, sessions: None, ids: false, join: Some(j) };
+    let view = View { source, sql: sql.into(), emit: None, sessions: None, ids: false, join: Some(j), fill: None };
     lake.cat.commit(vec![(table_key(name), json(&meta)), (view_key(name), json(&view)), (producer_key(&format!("join:{name}")), json(&now))], &[]).await
 }
 

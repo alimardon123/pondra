@@ -194,16 +194,16 @@ differences entirely.
 | Need | How (HTTP API, on any node) | Replaces |
 |---|---|---|
 | Stream ingest, exactly-once | `POST /append/{t}?producer=&seq=` with NDJSON or an Arrow IPC stream | Kafka / Fluss |
-| Tables | SQL `CREATE TABLE t (id BIGINT PRIMARY KEY, …) WITH (publish = 'delta,iceberg', cluster_by = 'user', partition_by = 'day(ts)', merge = 'total:sum', ttl = 'ts:86400')`, or `POST /tables/{t}` with the same as JSON. A key = upsert table; `merge` = merge table; `cluster_by` sorts files for fast filters (two or more columns: along a Hilbert curve, so a filter on any of them skips most row groups); `partition_by` (a column, or year/month/day/hour of a timestamp) keeps one partition per file; a key, `cluster_by` and `partition_by` go together; `ttl` expires a keyed table's rows. Every file's column ranges are kept, and past 128 files a table's file list goes into manifests: a table of a million files commits as fast as one of ten, and queries open only the files their filters can match | Delta/Iceberg MERGE, partitioning, liquid clustering, Fluss PK tables with TTL |
+| Tables | SQL `CREATE TABLE t (id BIGINT PRIMARY KEY, …) WITH (publish = 'delta,iceberg', cluster_by = 'user', partition_by = 'day(ts)', merge = 'total:sum', ttl = 'ts:86400', order_by = 'ts')`, or `POST /tables/{t}` with the same as JSON. A key = upsert table (`SELECT *` shows its own columns; `_deleted` only when named); `order_by` = the row with the latest event time wins, not the last to arrive (Flink's deduplication by event time); `merge` = merge table; `cluster_by` sorts files for fast filters (two or more columns: along a Hilbert curve, so a filter on any of them skips most row groups); `partition_by` (a column, or year/month/day/hour of a timestamp) keeps one partition per file; a key, `cluster_by` and `partition_by` go together; `ttl` expires a keyed table's rows. Every file's column ranges are kept, and past 128 files a table's file list goes into manifests: a table of a million files commits as fast as one of ten, and queries open only the files their filters can match | Delta/Iceberg MERGE, partitioning, liquid clustering, Fluss PK tables with TTL |
 | Schemas and names | A lake is a database: `CREATE SCHEMA sales; CREATE TABLE sales.orders (…)`; a table is `t` (schema `public`), `schema.t` or `lake.schema.t`, and other lakes are databases too: `CREATE DATABASE l2` (a new lake beside this one), `ATTACH 's3://bucket/sales' AS sales` (or `--attach`), then `sales.eu.orders` joined with this lake's tables, and `INSERT INTO sales.t …` through its leader; `DETACH sales`. `DROP TABLE`, `DROP SCHEMA … [CASCADE]`, `CREATE TABLE … AS SELECT`; a drop is refused while a view or task reads the table. Postgres, Flight SQL, the Iceberg REST catalog and MCP list the schemas | Postgres / Snowflake `database.schema.table` |
-| Views | `CREATE [OR REPLACE] VIEW v AS …`: a stored query, run over the tables as they are when read (spread over the nodes like any query); `CREATE MATERIALIZED VIEW v [WITH (window = 'w', size_secs = 60)] AS …`: the streaming view below, kept up to date with every flush of new rows (from its creation on) | SQL views, Databricks materialized views, Flink SQL jobs |
+| Views | `CREATE [OR REPLACE] VIEW v AS …`: a stored query, run over the tables as they are when read (spread over the nodes like any query); `CREATE MATERIALIZED VIEW v [WITH (window = 'w', size_secs = 60)] AS …`: the streaming view below, filled from the rows already there when it is made, then kept up to date with every flush of new rows — every row once, even with rows streaming in as it is made | SQL views, Databricks materialized views, Flink SQL jobs |
 | SQL writes | `INSERT … SELECT/VALUES`, `UPDATE … SET … WHERE`, `DELETE … WHERE` and `MERGE INTO t USING s ON … WHEN [NOT] MATCHED [BY SOURCE] …` on every table, on any node, over Postgres, or with `pondra sql` on any machine; from a local file in the shell (`MERGE INTO t USING 'new.csv' …`). A change is one commit from one snapshot, exactly-once with a job id; views, the change feed and Delta/Iceberg readers follow it | Delta/Iceberg MERGE, Snowflake DML, Fluss 1.0's UPDATE/DELETE by condition |
 | System columns | every row has `_row_id` (kept through an UPDATE or MERGE), `_version` (the commit that wrote it), `_created_at`, `_updated_at`: `SELECT _row_id, * FROM t`; `SELECT *` leaves them out | Postgres `ctid`/`xmin`, Iceberg v3 row lineage, Delta row tracking |
 | Postgres protocol | `--pg`: psql, psycopg 2/3, asyncpg, SQLAlchemy + pandas (tested); JDBC/BI tools by the same protocol. `COPY t FROM STDIN` (text, CSV; psql's `\copy`, psycopg's `cursor.copy`) and `COPY (query) TO STDOUT` (text, CSV, binary); the ADBC Postgres driver reads results as Arrow that way. For speed, Arrow Flight SQL | a Postgres-compatible serving layer |
 | Python and JavaScript | `pip install pondra` / `npm install pondra`: `local()` starts a node here, `connect()` reaches one; `sql()` → pandas / Polars / Arrow, `append()` exactly-once, `view()`, `watch()`, `lookup()` | PySpark / PyFlink clients for the common jobs |
 | A shell | `pondra` or `pondra <lake>`: SQL typed or piped in, answers as tables, `.tables`, `.databases`, DuckDB-style | the DuckDB / psql prompt |
 | Kafka | `--kafka`: producers write to tables (a topic is a table; JSON values; `_key`/`_timestamp`/`_value` columns; idempotent producers exactly-once; gzip/snappy/lz4/zstd), Debezium change events and tombstones become upserts and deletes; consumers and consumer groups read the log (offsets = `_ord`); SASL/PLAIN with the tokens. Tested: librdkafka (confluent-kafka), kafka-python | Kafka / Fluss ingest, Debezium sinks |
-| Schema evolution | `ALTER TABLE t ADD COLUMN c TYPE` (any node, Postgres, `pondra sql`); old rows read it as null; Delta and Iceberg follow. `ALTER TABLE t SET (publish = 'delta', cluster_by = 'user', ttl = 'ts:3600')` | Delta/Iceberg schema evolution |
+| Schema evolution | `ALTER TABLE t ADD COLUMN c TYPE`, `RENAME COLUMN a TO b`, `DROP COLUMN c`, `ALTER COLUMN c TYPE BIGINT` (widening) on any node, over Postgres or from `pondra sql`, while rows stream in: no file is rewritten (the catalog keeps each column's stored name), old rows read a new column as null, and Delta (column mapping) and Iceberg (field ids) readers follow. `ALTER TABLE t SET (publish = 'delta', cluster_by = 'user', ttl = 'ts:3600', order_by = 'ts')` | Delta/Iceberg schema evolution |
 | Event-time windows | `POST /views/{v}?window=w&size_secs=60&lateness_secs=10` over `GROUP BY date_bin(…, ts) AS w`: the view updates live; `{v}_final` gets each window once, final, when the watermark — the newest `ts` in the stream less the lateness — passes its end. Sliding: `slide_secs=60` with `size_secs=300` (and `date_bin` of the slide) gives a 5-minute window every minute, each row added once | Flink tumbling and sliding windows with bounded out-of-orderness watermarks |
 | Stream joins | `CREATE MATERIALIZED VIEW v WITH (join = 'streams', time = 'ts', within_secs = 600) AS SELECT … FROM orders o JOIN payments p ON …`: a row of either table pairs with the other's rows when it arrives and with those that arrive after, each pair once, exactly-once through restarts; `within_secs` bounds what is read to pair them | Flink regular and interval joins |
 | Session windows | `POST /views/{v}?session=ts&gap_secs=30&lateness_secs=5` over `SELECT user, count(*) … GROUP BY user`: each user's rows with no 30 s gap between them are a session; `{v}` gets each once, whole, with `session_start` and `session_end`, when the watermark passes its last row plus the gap | Flink / Spark session windows |
@@ -230,11 +230,11 @@ differences entirely.
 
 | File | Role |
 |---|---|
-| `log.rs` | Every node batches its writes (Arrow IPC + ZSTD) and runs the views on them; big flushes it writes to storage itself. The leader's sequencer only orders them: dedupes producer retries and commits every flush as a log segment in one catalog write, pipelined |
+| `log.rs` | Every node batches its writes (Arrow IPC + ZSTD) and runs the views on them; big flushes it writes to storage itself. The leader's sequencer only orders them: dedupes producer retries, sends back a flush packed with other views than its tables have, and commits every flush as a log segment in one catalog write, pipelined |
 | `store.rs` | The lake: object store + catalog (SlateDB, inside the bucket). The leader commits in order and streams every change and commit to the other nodes. They keep the whole catalog in memory from it (seeded from their own view; after a gap they fall back to the view, checked before and after every read, so a read never goes back in time): every node sees a commit within milliseconds, without asking the bucket |
 | `replica.rs` | `--ack replicated`: followers keep the changes the bucket doesn't have yet in local files and acknowledge them; a new leader collects and re-commits them before taking writes |
 | `cluster.rs` | Leader election through the bucket (put-if-absent `cluster/term/{n}`), HTTP heartbeats, takeover after 5 s if no peer still hears the leader; a replaced leader is fenced by the catalog and rejoins. A liveness mark in the bucket lets a node on an idle lake lead at once |
-| `views.rs` | Inline views; GROUP BY views become merge tables. Window and session views emit what is final once, exactly-once, by a watermark taken from the data's own event time |
+| `views.rs` | Inline views, filled from the rows already there when made; GROUP BY views become merge tables. Window and session views emit what is final once, exactly-once, by a watermark taken from the data's own event time |
 | `asof.rs` | `ASOF JOIN`: rewritten as a LEFT JOIN DataFusion can plan with a marker on its condition, then run by a join that looks each row's match up — per key, in time order, a binary search — in one table, one per partition, or, for a few rows (a stream's new ones), only their keys' rows |
 | `tasks.rs` | Streaming tasks: output + progress commit together, only if progress is unchanged (compare-and-swap) |
 | `spmd.rs` | Distributed queries: every node runs the same plan over its slice of the biggest table; small and keyed tables are read whole, at the coordinator's snapshot. The plan decides what splits (any join type, subqueries, CTEs, unions): up to the first gather, or through shuffles, each exchange a step in which every node splits its output into a bucket per node and partition and reads its own from every node, in node order, so answers are the same every time. Scalar subqueries are answered between steps. Work is dealt by bytes; a step that fails is retried, then run again without that node |
@@ -257,7 +257,7 @@ differences entirely.
 | `sys.rs` | System columns: row ids reserved in blocks from the leader, stamped as rows enter the log or a bulk INSERT's files; versions and times from the commit |
 | `guard.rs` | Spread a query only when it pays: links measured, what a query takes on one node, and which way was faster once it ran both |
 | `hilbert.rs` | `cluster_by` over two or more columns: rows along a Hilbert curve through their ranks |
-| `ddl.rs` | Schemas and names (`lake.schema.table`, attached lakes), and the statements that shape a lake: `CREATE`/`DROP SCHEMA`, `DROP TABLE`, `CREATE VIEW` (stored), `CREATE MATERIALIZED VIEW`, `DROP VIEW` — carried out by the leader |
+| `ddl.rs` | Schemas and names (`lake.schema.table`, attached lakes), and the statements that shape a lake: `CREATE`/`DROP SCHEMA`, `DROP TABLE`, `CREATE VIEW` (stored), `CREATE MATERIALIZED VIEW`, `DROP VIEW`, `ALTER TABLE … RENAME/DROP/ALTER COLUMN` — carried out by the leader |
 | `write.rs` | Writes in SQL from anywhere (CREATE TABLE [AS], INSERT, UPDATE, DELETE, and the DDL of `ddl.rs`): the work runs where the statement runs; the leader records it — over HTTP, through the bucket inbox, or the statement leads for a moment when nobody does. Attached lakes' writes go to their own leaders |
 | `inbox.rs` | The bucket inbox: writers that can't reach the leader leave requests in the bucket; the leader answers them |
 | `pg.rs` | The Postgres wire protocol (queries and writes, text and binary results, typed `$1` parameters, a small `pg_catalog`) |
@@ -279,6 +279,8 @@ python3 tools/harness.py all [--s3]             # upsert, fence (split brain), i
 python3 tools/harness.py clients                # SQL writes, Python client, Postgres drivers, tokens, inbox, attached lakes, vectors, MCP
 python3 tools/mcp_client.py --url http://127.0.0.1:8080/mcp   # the official MCP SDK against a node (pip install mcp)
 python3 tools/harness.py kafka | alter           # Kafka clients, ALTER TABLE under load
+python3 tools/harness.py columns | fills | dedup # RENAME/DROP/widen under streaming; views filled from existing rows; dedup by event time
+python3 tools/bench/nexmark.py                  # Nexmark q1, q2, q5, q7, q11: Pondra and Flink, the answers checked against DuckDB
 python3 tools/harness.py windows | sessions | asof   # event-time windows and sessions emitted once; point-in-time joins over a stream
 python3 tools/asof_check.py                     # ASOF JOIN == DuckDB's, every direction, on one node and three
 python3 tools/stream_check.py                   # one stream, window + session + as-of views: every click once; clicks/s, emission delay
@@ -338,22 +340,23 @@ bucket to its newest lakes.
   Tables made before 0.19 (without row ids) change after a copy (`CREATE TABLE t2 AS SELECT …`).
   Clustering across files.
 - A write to two lakes is two commits, not one transaction.
-- A materialized view starts empty: it follows the rows written after it was created. `ALTER …
-  RENAME`, `search_path` and grants per schema.
-- The packages aren't published yet (the release workflow is ready; the names and the repository
-  are the owner's call), and the Windows and macOS builds haven't run on real machines.
+- A materialized view that is a session window or a stream join starts from its creation; others
+  are filled from the rows already there, in one go on the leader. `ALTER TABLE … RENAME TO`
+  (copy with `CREATE TABLE … AS`), narrowing a type, `search_path` and grants per schema.
+- The packages aren't published yet (the release workflow is ready; PyPI and npm are being set
+  up), and the Windows and macOS packages haven't run on real machines.
 - Only `sum` over DOUBLE is order-independent; `avg`, `stddev` and friends over DOUBLE can still
   differ in their last bits from run to run.
-- Per-table grants, quotas and TLS (tokens are per role; put a TLS proxy in front); JDBC and BI
-  tools untested here.
+- Per-table grants, quotas and TLS (tokens are per role; put a TLS proxy in front, and keep a
+  cluster's nodes on a private network: they talk plain HTTP to each other); JDBC and BI tools
+  untested here.
 - Kafka: one partition per topic, no transactions; offsets are positions in the log (increasing,
   not dense). Consumer groups live in the leader's memory (members rejoin after a failover).
-- `ALTER TABLE` adds columns and sets options; renaming or dropping a column or a table, and
-  changing a column's type, need column ids in the files (next); an approximate vector index (see the plan in
-  `docs/comparison-spark-flink-fluss.md`).
+- An approximate vector index (see the plan in `docs/comparison-spark-flink-fluss.md`); a
+  DataFrame API (`docs/dataframe-api.md`: next round).
 - Streaming: a watermark per source, not per partition or node, and a source that goes quiet
-  holds it (its last windows and sessions wait for more rows); deduplication and Top-N by event
-  time, timers, `MATCH_RECOGNIZE`; stream joins run on the leader alone; an as-of join
+  holds it (its last windows and sessions wait for more rows); Top-N by event time, timers,
+  `MATCH_RECOGNIZE`; stream joins run on the leader alone; an as-of join
   looks up a table's rows, so a keyed table, which keeps only its latest row per key, gives the
   latest, not the one of that moment — keep a table's history as rows for that.
 - On object storage a *durable* ack costs one PUT; `--ack replicated` trades a small window
@@ -363,7 +366,10 @@ bucket to its newest lakes.
 
 ## License
 
-All rights reserved (`LICENSE`). The code is public to read, but it may not be used, copied,
-changed or redistributed without the author's written permission. Until a license is chosen,
-the packages are marked so that PyPI and npm refuse them (`Private :: Do Not Upload`,
-`"private": true`) and the crate so that crates.io does (`publish = false`).
+Pondra is licensed under either of the [Apache License, Version 2.0](LICENSE-APACHE) or the
+[MIT license](LICENSE-MIT), at your option — as Rust itself and much of its ecosystem are. The
+Python and npm packages carry both.
+
+Unless you explicitly state otherwise, any contribution you intentionally submit for inclusion in
+Pondra, as defined in the Apache-2.0 license, is licensed as above, without any additional terms
+or conditions. Third-party libraries Pondra depends on keep their own licenses.

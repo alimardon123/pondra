@@ -133,6 +133,17 @@ pub enum Ddl {
     Attach { name: String, dir: String },
     Detach { name: String, if_exists: bool },
     CreateDatabase { name: String, if_not_exists: bool, dir: Option<String> }, // a new lake (beside this one unless `dir`), attached
+    AlterColumn { table: String, column: String, change: Change }, // ALTER TABLE … RENAME/DROP/ALTER COLUMN (ADR-022)
+    RenameTable { name: String, to: String }, // (not yet: refused with the way round it)
+}
+
+/// What `ALTER TABLE` does to a column: rename it, drop it, or widen its type (a SQL type).
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "snake_case")]
+pub enum Change {
+    Rename(String),
+    Drop { if_exists: bool },
+    Type(String),
 }
 
 /// Leader: carry one out (under the lake's lock).
@@ -183,7 +194,8 @@ pub async fn apply(lake: &Lake, d: Ddl) -> Result<Value> {
             let name = new_name(lake, &name).await?;
             ensure!(lake.cat.get::<StoredView>(&query_key(&name)).await?.is_none(), "{name} is a (stored) view");
             crate::views::create(lake, &name, &sql, emit, sessions, join).await?;
-            Ok(j!({"view": name, "materialized": true, "follows": "rows written from now on"})) // (no backfill yet: ADR-019)
+            crate::views::forget(lake); // (the sequencer holds flushes to it from its next commit)
+            Ok(j!({"view": name, "materialized": true}))
         }
         Ddl::DropView { name, if_exists } => drop_view(lake, &name, if_exists).await,
         Ddl::Attach { name, dir } => {
@@ -211,6 +223,10 @@ pub async fn apply(lake: &Lake, d: Ddl) -> Result<Value> {
             }
             Box::pin(apply(lake, Ddl::Attach { name, dir })).await
         }
+        Ddl::AlterColumn { table, column, change } => alter_column(lake, &table, &column, change).await,
+        // A table's name is where its files, log rows, Delta and Iceberg copies and Kafka topic are:
+        // renaming one is a new table (ADR-022).
+        Ddl::RenameTable { name, to } => bail!("ALTER TABLE … RENAME TO isn't supported yet: a table's name is where its files, log and Delta and Iceberg copies live. CREATE TABLE {to} AS SELECT * FROM {name}; then DROP TABLE {name}; does it"),
         Ddl::Detach { name, if_exists } => {
             if lake.cat.get::<Attachment>(&attachment_key(&name)).await?.is_none() {
                 let flag = lake.attached.read().unwrap().iter().any(|(n, _)| *n == name);
@@ -323,8 +339,38 @@ pub async fn sync(lake: &Lake, me: &str, follow: bool) -> Result<()> {
     Ok(())
 }
 
-/// After this node sent an `ATTACH` or `DETACH`: once its catalog shows it, as it does here.
+/// After this node sent an `ATTACH` or `DETACH`: once its catalog shows it, as it does here. After
+/// `CREATE MATERIALIZED VIEW`: once it is filled from the rows already there (`views::fill_all`).
 pub async fn settle(lake: &Lake, d: &Ddl, me: &str) -> Result<()> {
+    if let Ddl::CreateMaterialized { name, .. } = d {
+        let name = local(lake, name).unwrap_or_default();
+        let filled = crate::store::producer_key(&format!("fill:{name}"));
+        for _ in 0..12_000 {
+            let view = lake.cat.get::<crate::views::View>(&crate::views::view_key(&name)).await?;
+            if view.is_none_or(|v| v.fill.is_none()) || lake.cat.get::<u64>(&filled).await?.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        return Ok(());
+    }
+    if let Ddl::AlterColumn { table, column, change } = d {
+        // (a write to this node right after uses the new names: it must know them)
+        let key = table_key(&local(lake, table).unwrap_or_default());
+        for _ in 0..200 {
+            let Some(m) = lake.cat.get::<TableMeta>(&key).await? else { break };
+            let done = match change {
+                Change::Rename(to) => m.stored(to).is_some(),
+                Change::Drop { .. } => m.stored(column).is_none(),
+                Change::Type(_) => true, // (the same names either way)
+            };
+            if done {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        return Ok(());
+    }
     let (Ddl::Attach { name, .. } | Ddl::Detach { name, .. } | Ddl::CreateDatabase { name, .. }) = d else { return Ok(()) };
     let want = !matches!(d, Ddl::Detach { .. });
     for _ in 0..100 {
@@ -345,28 +391,124 @@ async fn drop_table(lake: &Lake, name: &str, if_exists: bool) -> Result<Value> {
     };
     let owner = name.strip_suffix("_final").unwrap_or(name);
     ensure!(lake.cat.get::<Value>(&crate::views::view_key(owner)).await?.is_none(), "{name} is materialized view {owner}'s: DROP MATERIALIZED VIEW {owner}");
-    let mut readers: Vec<String> = vec![];
-    for (k, v) in lake.cat.scan::<crate::views::View>("v/", "v0").await? {
-        if v.source == name || reads(lake, &v.sql, name) {
-            readers.push(format!("materialized view {}", &k[2..]));
-        }
-    }
-    for (k, v) in lake.cat.scan::<StoredView>("q/", "q0").await? {
-        if reads(lake, &v.sql, name) {
-            readers.push(format!("view {}", &k[2..]));
-        }
-    }
-    for (k, t) in lake.cat.scan::<crate::tasks::Task>("k/", "k0").await? {
-        if t.source == name || t.target == name {
-            readers.push(format!("task {}", &k[2..]));
-        }
-    }
+    let readers = readers(lake, name).await?;
     ensure!(readers.is_empty(), "{name} is used by {}: drop them first", readers.join(", "));
     for format in &meta.publish {
         crate::delta::unpublish(lake, name, format).await?; // (no copy left for other engines)
     }
     lake.cat.commit(vec![], &[table_key(name), table_key(&crate::sys::deleted(name))]).await?; // (and its replaced rows)
     Ok(j!({"table": name, "dropped": true}))
+}
+
+/// What reads or writes table `name` by its columns: views, stored views, tasks.
+async fn readers(lake: &Lake, name: &str) -> Result<Vec<String>> {
+    let mut out: Vec<String> = vec![];
+    for (k, v) in lake.cat.scan::<crate::views::View>("v/", "v0").await? {
+        if v.source == name || reads(lake, &v.sql, name) {
+            out.push(format!("materialized view {}", &k[2..]));
+        }
+    }
+    for (k, v) in lake.cat.scan::<StoredView>("q/", "q0").await? {
+        if reads(lake, &v.sql, name) {
+            out.push(format!("view {}", &k[2..]));
+        }
+    }
+    for (k, t) in lake.cat.scan::<crate::tasks::Task>("k/", "k0").await? {
+        if t.source == name || t.target == name {
+            out.push(format!("task {}", &k[2..]));
+        }
+    }
+    Ok(out)
+}
+
+/// `ALTER TABLE t RENAME COLUMN a TO b`, `DROP COLUMN a`, `ALTER COLUMN a TYPE BIGINT`: the
+/// catalog changes, the files never do (ADR-022). A column keeps the name it was written under
+/// (`TableMeta::columns`); `names` says what SQL calls it, `dropped` that nothing reads it again.
+/// A type only widens (what every file holds still reads as it). Refused while a view or task
+/// names the table's columns: it would break.
+async fn alter_column(lake: &Lake, table: &str, column: &str, change: Change) -> Result<Value> {
+    let name = local(lake, table).ok_or_else(|| anyhow::anyhow!("{table} is an attached lake's: ALTER it from a node of that lake"))?;
+    let Some(mut m) = lake.cat.get::<TableMeta>(&table_key(&name)).await? else { anyhow::bail!("no table {name}") };
+    let owner = name.strip_suffix("_final").unwrap_or(&name);
+    ensure!(lake.cat.get::<Value>(&crate::views::view_key(owner)).await?.is_none(), "{name} is materialized view {owner}'s: its columns are its query's");
+    let readers = readers(lake, &name).await?;
+    ensure!(readers.is_empty(), "{name} is used by {}, which name its columns: drop them first", readers.join(", "));
+    let system = |c: &str| crate::sys::NAMES.contains(&c) || c == "_old_version" || c == "_deleted" || c.contains('~');
+    ensure!(!system(column), "{column} is a system column: it stays as it is");
+    let Some(stored) = m.stored(column).map(str::to_string) else {
+        ensure!(matches!(change, Change::Drop { if_exists: true }), "{name} has no column {column}");
+        return Ok(j!({"table": name, "unchanged": true}));
+    };
+    let partition = m.partition.as_deref().map(|p| p.split_once('(').map_or(p, |(_, c)| c.trim_end_matches(')')));
+    let what = match change {
+        Change::Rename(to) => {
+            ensure!(!to.is_empty(), "a column needs a name");
+            ensure!(!system(&to), "{to} is a system column's name");
+            ensure!(m.stored(&to).is_none(), "{name} already has a column {to}");
+            match to == stored {
+                true => m.names.remove(&stored),
+                false => m.names.insert(stored.clone(), to.clone()),
+            };
+            j!({"renamed": column, "to": to})
+        }
+        Change::Drop { .. } => {
+            let role = match () {
+                _ if m.key.contains(&stored) => "key",
+                _ if partition == Some(stored.as_str()) => "partition_by",
+                _ if m.ttl.as_ref().is_some_and(|(c, _)| *c == stored) => "ttl",
+                _ if m.order.as_ref() == Some(&stored) => "order_by",
+                _ => "",
+            };
+            ensure!(role.is_empty(), "{column} is {name}'s {role} column: it stays");
+            ensure!(m.live().count() > 1 + usize::from(m.stored("_deleted").is_some()), "{column} is {name}'s last column (DROP TABLE {name})");
+            m.cluster.retain(|c| *c != stored);
+            m.merge.remove(&stored);
+            m.names.remove(&stored);
+            m.dropped.push(stored.clone());
+            j!({"dropped": column})
+        }
+        Change::Type(sql_type) => {
+            let ctx = datafusion::prelude::SessionContext::new();
+            ctx.sql(&format!("CREATE TABLE t (c {sql_type})")).await?;
+            let new = crate::write::stored(ctx.table("t").await?.schema().field(0).data_type());
+            let at = m.columns.iter().position(|(c, _)| *c == stored).expect("a live column");
+            let old = crate::query::dtype(&m.columns[at].1)?;
+            if old == new {
+                return Ok(j!({"table": name, "unchanged": true}));
+            }
+            ensure!(widens(&old, &new), "{column} is {old}: a column's type can only widen (a smaller integer to a bigger one, FLOAT to DOUBLE, a DECIMAL to more digits), which every file already written still reads as");
+            ensure!(partition != Some(stored.as_str()), "{column} is {name}'s partition_by column: its type stays");
+            m.columns[at].1 = crate::query::type_name(&new);
+            j!({"column": column, "type": m.columns[at].1})
+        }
+    };
+    let mut puts = vec![(table_key(&name), json(&m))];
+    let del = crate::sys::deleted(&name);
+    if let Some(mut d) = lake.cat.get::<TableMeta>(&table_key(&del)).await? {
+        // (its replaced rows' table follows: the same columns, before its `_old_version`)
+        d.columns = m.columns.iter().cloned().chain([("_old_version".to_string(), "Int64".to_string())]).collect();
+        (d.names, d.dropped) = (m.names.clone(), m.dropped.clone());
+        puts.push((table_key(&del), json(&d)));
+    }
+    lake.cat.commit(puts, &[]).await?;
+    Ok(j!({"table": name, "altered": what}))
+}
+
+/// Does every value of type `old` read as `new`, exactly? The widenings Iceberg and Delta allow.
+fn widens(old: &datafusion::arrow::datatypes::DataType, new: &datafusion::arrow::datatypes::DataType) -> bool {
+    use datafusion::arrow::datatypes::DataType::*;
+    let int = |t: &datafusion::arrow::datatypes::DataType| match t {
+        Int8 => Some(8),
+        Int16 => Some(16),
+        Int32 => Some(32),
+        Int64 => Some(64),
+        _ => None,
+    };
+    match (old, new) {
+        (Float16 | Float32, Float64) | (Float16, Float32) => true,
+        (Decimal128(p, s), Decimal128(q, t)) => q > p && s == t,
+        _ => matches!((int(old), int(new)), (Some(a), Some(b)) if b > a),
+    }
 }
 
 /// `DROP VIEW` or `DROP MATERIALIZED VIEW`: a stored view, or a live one with its tables and state.
@@ -379,7 +521,8 @@ async fn drop_view(lake: &Lake, name: &str, if_exists: bool) -> Result<Value> {
         ensure!(if_exists, "no view {name}");
         return Ok(j!({"view": name, "dropped": false}));
     };
-    let mut gone = vec![crate::views::view_key(name), format!("w/{name}"), crate::store::producer_key(&format!("emit:{name}")), crate::store::producer_key(&format!("join:{name}"))];
+    let producers = ["emit", "join", "fill"].map(|p| format!("{p}:{name}"));
+    let mut gone: Vec<String> = [crate::views::view_key(name), format!("w/{name}")].into_iter().chain(producers.iter().map(|p| crate::store::producer_key(p))).collect();
     for table in [name.to_string(), format!("{name}_final")] {
         if let Some(meta) = lake.cat.get::<TableMeta>(&table_key(&table)).await? {
             for format in &meta.publish {
@@ -389,6 +532,8 @@ async fn drop_view(lake: &Lake, name: &str, if_exists: bool) -> Result<Value> {
         }
     }
     lake.cat.commit(vec![], &gone).await?;
+    crate::log::forget_producers(producers); // (a view made again under this name starts over)
+    crate::views::forget(lake);
     Ok(j!({"view": name, "dropped": true}))
 }
 

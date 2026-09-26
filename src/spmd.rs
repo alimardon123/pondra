@@ -343,9 +343,11 @@ async fn plan(lake: &Lake, s: &Slice) -> Result<(SessionContext, Arc<dyn Executi
     let mut hwm = lake.hwm.subscribe();
     let _ = tokio::time::timeout(Duration::from_secs(10), async { while lake.visible() < s.upto && hwm.changed().await.is_ok() {} }).await;
     ensure!(lake.visible() >= s.upto, "this node is behind the lake ({} < {})", lake.visible(), s.upto);
+    let views = crate::query::stored_views(lake, &s.sql, false).await?;
+    let deleted = crate::query::names_deleted(&views.iter().fold(s.sql.clone(), |t, (_, v)| format!("{t} {v}"))); // (as `session_at` decides)
     {
         for (t, meta) in &s.whole {
-            let inner = crate::query::table_view(lake, &ctx, t, meta, Some(s.upto)).await?;
+            let inner = crate::query::named(&ctx, crate::query::table_view(lake, &ctx, t, meta, Some(s.upto)).await?, meta, deleted)?;
             ctx.deregister_table(table_ref(t))?;
             ctx.register_table(table_ref(t), Arc::new(WholeTable { inner, name: t.clone(), size: totals(meta) }))?;
         }
@@ -377,9 +379,11 @@ async fn plan(lake: &Lake, s: &Slice) -> Result<(SessionContext, Arc<dyn Executi
         let ranges = crate::manifest::ranges(&p.table, &crate::manifest::list(lake, &meta).await?, &meta.files, &schema);
         let purges = if p.purged > 0 { vec![(p.purged, 0)] } else { vec![] };
         let meta = TableMeta { files: p.files.clone(), tiered: after, purges, ..meta };
-        let table = Pruned { lake: lake.arc(), name: p.table.clone(), meta, manifests: Some(p.manifests.clone()), upto: Some(upto), at: Some(s.upto), schema, share, ranges, range: p.range.clone() };
+        // (a range's column is a stored name, as the files and the slice's scan know it: `ranges::named`)
+        let pruned = Pruned { lake: lake.arc(), name: p.table.clone(), meta: meta.clone(), manifests: Some(p.manifests.clone()), upto: Some(upto), at: Some(s.upto), schema, share, ranges, range: p.range.clone() };
+        let table = crate::query::named(&ctx, Arc::new(pruned), &meta, deleted)?;
         ctx.deregister_table(table_ref(&p.table))?;
-        ctx.register_table(table_ref(&p.table), Arc::new(table))?;
+        ctx.register_table(table_ref(&p.table), table)?;
     }
     crate::query::register_views(&ctx, crate::query::stored_views(lake, &s.sql, false).await?, true).await?; // (over the shares)
     let plan = ctx.sql_with_options(&s.sql, crate::query::read_only()).await?.create_physical_plan().await?;

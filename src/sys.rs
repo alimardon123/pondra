@@ -59,16 +59,20 @@ pub fn mentioned(sql: &str) -> bool {
 /// `*` without the system columns, in a query that names one (so they are in its tables):
 /// `SELECT *, _row_id FROM t` shows the table's columns and `_row_id` once. Only a SELECT from one
 /// table is rewritten; over a join, `*` shows each table's system columns too.
+/// A keyed table's `_deleted` too, which reads leave out unless a query names it
+/// (`query::named`): `SELECT *, _deleted FROM t` shows it once.
 pub fn hide(sql: &str) -> Cow<'_, str> {
     use datafusion::sql::sqlparser::{ast::*, dialect::GenericDialect, parser::Parser};
     use std::ops::ControlFlow;
-    if !mentioned(sql) {
+    let deleted = crate::query::names_deleted(sql);
+    if !mentioned(sql) && !deleted {
         return Cow::Borrowed(sql);
     }
     let Ok(mut stmts) = Parser::parse_sql(&GenericDialect {}, sql) else { return Cow::Borrowed(sql) };
     struct Hide {
         ctes: Vec<String>,
         changed: bool,
+        names: Vec<&'static str>,
     }
     impl VisitorMut for Hide {
         type Break = ();
@@ -83,14 +87,15 @@ pub fn hide(sql: &str) -> Cow<'_, str> {
             for item in &mut s.projection {
                 let (SelectItem::Wildcard(o) | SelectItem::QualifiedWildcard(_, o)) = item else { continue };
                 if o.opt_exclude.is_none() && o.opt_except.is_none() {
-                    o.opt_exclude = Some(ExcludeSelectItem::Multiple(NAMES.iter().map(|n| ObjectName::from(vec![Ident::new(*n)])).collect()));
+                    o.opt_exclude = Some(ExcludeSelectItem::Multiple(self.names.iter().map(|n| ObjectName::from(vec![Ident::new(*n)])).collect()));
                     self.changed = true;
                 }
             }
             ControlFlow::Continue(())
         }
     }
-    let mut v = Hide { ctes: vec![], changed: false };
+    let names = NAMES.iter().copied().filter(|_| mentioned(sql)).chain(deleted.then_some("_deleted")).collect();
+    let mut v = Hide { ctes: vec![], changed: false, names };
     let _ = VisitMut::visit(&mut stmts, &mut v);
     match v.changed {
         true => Cow::Owned(stmts.iter().map(|s| s.to_string()).collect::<Vec<_>>().join("; ")),

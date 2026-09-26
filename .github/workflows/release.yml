@@ -2,10 +2,11 @@ name: release
 
 # A tag vX.Y.Z (or a run started by hand): the binary for every platform, packaged for pip and
 # npm (`tools/package.py`), each package tried on its platform, then attached to a GitHub release
-# and published to PyPI and npm. Publishing needs, once: PyPI's "trusted publishing" set up for
-# this workflow (no token), and an NPM_TOKEN secret. A run started by hand publishes nothing
-# unless `publish` is ticked. While Pondra is all rights reserved, its packages are marked so that PyPI
-# and npm refuse them (README, "License"): lift those marks when a license is chosen.
+# and published to PyPI and npm. Publishing needs, once: PyPI's "trusted publishing" (a pending
+# publisher for this workflow: no token); for npm, an NPM_TOKEN secret for the first release (npm
+# trusts a workflow only for packages that exist), then each package's "Trusted Publisher" set to
+# this workflow and the secret removed (npm then takes this workflow's OIDC token). A run started by hand publishes nothing
+# unless `publish` is ticked. Pondra is MIT OR Apache-2.0: the packages carry both licenses.
 on:
   push:
     tags: ["v*"]
@@ -25,7 +26,7 @@ jobs:
           # Linux: built against glibc 2.17 (zig), so it runs on any Linux from 2014 on.
           - { platform: linux-x64, os: ubuntu-latest, target: x86_64-unknown-linux-gnu, zig: x86_64-unknown-linux-gnu.2.17 }
           - { platform: linux-arm64, os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, zig: aarch64-unknown-linux-gnu.2.17 }
-          - { platform: macos-x64, os: macos-13, target: x86_64-apple-darwin }
+          - { platform: macos-x64, os: macos-15-intel, target: x86_64-apple-darwin } # (macos-13 was retired; Intel images last until 2027)
           - { platform: macos-arm64, os: macos-latest, target: aarch64-apple-darwin }
           - { platform: windows-x64, os: windows-latest, target: x86_64-pc-windows-msvc, exe: .exe }
     runs-on: ${{ matrix.os }}
@@ -78,6 +79,7 @@ jobs:
     needs: build
     if: startsWith(github.ref, 'refs/tags/v') || inputs.publish
     runs-on: ubuntu-latest
+    environment: pypi # (PyPI's trusted publisher names it; Settings -> Environments can require an approval)
     permissions:
       contents: write # the GitHub release
       id-token: write # PyPI trusted publishing, npm provenance
@@ -102,7 +104,8 @@ jobs:
           packages-dir: pypi
       - name: npm (the platform packages first, then `pondra`, which depends on them)
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }} # (empty once npm trusts this workflow)
         run: |
+          npm install -g npm@latest # (trusted publishing needs npm 11.5.1 or later)
           for p in dist/pondra-*-*.tgz; do npm publish "$p" --access public --provenance; done
           npm publish dist/pondra-[0-9]*.tgz --access public --provenance

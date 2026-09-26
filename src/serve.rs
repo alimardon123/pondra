@@ -81,11 +81,11 @@ pub async fn point_sql(lake: &Lake, sql: &str) -> Result<Option<Vec<u8>>> {
     cols.sort();
     let mut key: Vec<&String> = meta.key.iter().collect();
     key.sort();
-    if meta.key.is_empty() || !meta.merge.is_empty() || cols != key {
+    if meta.key.is_empty() || !meta.merge.is_empty() || cols != key || meta.mapped() || meta.order.is_some() { // (renamed columns, event-time order: SQL answers it)
         return Ok(None);
     }
     let names: Vec<String> = match s.projection.as_slice() {
-        [SelectItem::Wildcard(_)] => meta.columns.iter().map(|(c, _)| c.clone()).collect(),
+        [SelectItem::Wildcard(_)] => meta.columns.iter().map(|(c, _)| c.clone()).filter(|c| c != "_deleted").collect(), // (as `SELECT *` shows it)
         items => items.iter().map(|i| match i {
             SelectItem::UnnamedExpr(Expr::Identifier(c)) if meta.columns.iter().any(|(n, _)| *n == c.value) => Some(c.value.clone()),
             _ => None,

@@ -71,7 +71,7 @@ Turning a format off deletes its metadata, so nobody reads a stale copy.
 
 | Path | Format | Who reads it | Changes? |
 |---|---|---|---|
-| `catalog/` | SlateDB (LSM of SSTs + WAL). Keys: `t/` tables, `s/` log segments, `d/` small segments' data, `p/` producer progress (and bulk-insert jobs; Kafka producers `kafka:{id}:{topic}`, consumer-group offsets `kafka-group:{group}:{topic}`, window and session emission `emit:{view}`), `v/` views, `w/` a session view's bound (no open session starts before it), `k/` tasks, `x/` Delta state, `i/` Iceberg state, `m` the followers whose copies count (replicated acks), `n` next segment, `c` commit number | Pondra | new objects only; old ones compacted away |
+| `catalog/` | SlateDB (LSM of SSTs + WAL). Keys: `t/` tables, `s/` log segments, `d/` small segments' data, `p/` producer progress (and bulk-insert jobs; Kafka producers `kafka:{id}:{topic}`, consumer-group offsets `kafka-group:{group}:{topic}`, window and session emission `emit:{view}`, stream joins `join:{view}`, a view's filling `fill:{view}`), `v/` views (a view's `fill.upto`: the last commit its filling covers), `w/` a session view's bound (no open session starts before it), `k/` tasks, `x/` Delta state, `i/` Iceberg state, `m` the followers whose copies count (replicated acks), `n` next segment, `c` commit number | Pondra | new objects only; old ones compacted away |
 | `cluster/term/` | JSON: leader address and term (empty address: a `pondra sql` INSERT recording its files) | Pondra | one new object per election |
 | `cluster/alive/` | empty; its timestamp is what counts | Pondra | rewritten every 10 s by the leader; a one-off writer deletes its own when done |
 | `inbox/` | JSON requests (a flush as its binary body), JSON answers | the leader | each request deleted once answered; answers deleted by the writer (unclaimed ones after an hour) |
@@ -148,6 +148,15 @@ The same on local disk and on object storage:
     engines see them as of their last full compaction.
 - **TTL** (`ttl = 'ts:86400'` on a keyed table): reads hide rows whose timestamp column is older
   than that; full compactions delete them.
+- **`order_by`** (`order_by = 'ts'` on a keyed table): of a key's versions the one with the
+  greatest `ts` is current (then the newest file or log row); reads, folds and compactions all
+  choose so, and each file still holds one row per key.
+- **Columns renamed or dropped** (round 21): a table's entry lists its columns under the names
+  they were first written with (`columns`), what SQL calls them now (`names`: stored → SQL) and
+  the ones dropped (`dropped`); files and log segments keep the stored names, a column added
+  again under a taken name is stored as `name~2`. Delta publishes such a table with column
+  mapping by name (each field's `delta.columnMapping.id` and `physicalName`; the `columnMapping`
+  table feature), Iceberg with field ids by stored position and a name mapping to the stored names.
 - **Retention:** replaced files and consumed log objects are deleted after `--retain-secs`.
   Objects no commit ever referenced are deleted after a day.
 - **Skipping data:**
@@ -220,7 +229,7 @@ connector jars can't be downloaded in this sandbox.
 Rules for outside readers:
 
 - **Read-only.** Pondra owns the folder; write through Pondra (any node, or `pondra sql`).
-- **Latest version, plus a little history:** 1,000 Delta versions and 100 Iceberg snapshots are
+- **Latest version, plus a little history:** 100 Delta versions and 100 Iceberg snapshots are
   listed. Files replaced by compaction are deleted after `--retain-secs` (60 s by default), so
   time travel further back than that fails.
 - **Types:** Int32/64, Float32/64, Utf8, Boolean, Date32, Binary and Decimal128 in both formats;

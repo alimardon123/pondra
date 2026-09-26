@@ -40,9 +40,12 @@ struct Published {
 }
 
 /// Every table in every format it's published in at once (each is an object-store write or
-/// two), then one catalog write that records what was published. It isn't awaited: until it is
-/// durable, the next round sees the older state and takes over what was written (see `publish`).
+/// two), then one catalog write that records what was published. One round at a time, each
+/// starting from the last one's recorded state: a tiering round and a `CHECKPOINT` publishing at
+/// once both wrote an Iceberg table's next version, and the second failed (real R2, round 21).
 pub async fn publish_all(lake: &Lake) -> Result<()> {
+    static ONE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _one = ONE.lock().await;
     lake.cat.wait_durable(lake.cat.committed()).await; // (replicated acks: publish only what's in the bucket)
     // A table whose metadata is as last published is skipped without loading its manifests.
     static SEEN: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, u64>>> = std::sync::LazyLock::new(Default::default);
@@ -59,7 +62,7 @@ pub async fn publish_all(lake: &Lake) -> Result<()> {
     .await?;
     let puts: Vec<(String, Vec<u8>)> = states.into_iter().flatten().collect();
     if !puts.is_empty() {
-        drop(lake.cat.write(puts, &[]).await?);
+        lake.cat.commit(puts, &[]).await?; // (committed before the next round reads it)
     }
     SEEN.lock().unwrap().extend(changed.iter().map(|(key, meta)| (key.clone(), print(meta))));
     Ok(())
@@ -111,10 +114,12 @@ pub fn decimal(t: &str) -> Option<(u8, i8)> {
 
 /// The table's next Delta commit, if its files changed; returns the new publish state to record.
 async fn publish(lake: &Lake, table: &str, meta: &TableMeta) -> Result<Option<(String, Vec<u8>)>> {
-    let Some(schema) = schema_string(&meta.columns) else { return Ok(None) }; // a type Delta can't carry
     let Some(parts) = publishable(lake, meta).await? else { return Ok(None) };
     let (dir, key) = (format!("data/{table}/"), format!("x/{table}"));
     let mut state: Published = lake.cat.get(&key).await?.unwrap_or_default();
+    // (once a column was renamed or dropped, Delta's column mapping stays on: it can't be turned off)
+    let mapped = meta.mapped() || state.schema.contains(MAPPING_ID);
+    let Some(schema) = table_schema(meta, mapped) else { return Ok(None) }; // a type Delta can't carry
     // Only the manifests that came or went are read: their files are what the log gains or loses.
     let now: BTreeMap<String, u64> = parts.manifests.iter().map(|m| (m.path.clone(), m.files)).collect();
     let came: Vec<&crate::manifest::Manifest> = parts.manifests.iter().filter(|m| !state.manifests.contains_key(&m.path)).collect();
@@ -245,17 +250,45 @@ async fn checkpoint(lake: &Lake, dir: &str, version: u64, state: &Published, tab
     Ok(())
 }
 
-/// The protocol a schema needs: `timestamp_ntz` columns take the `timestampNtz` table feature.
+/// The protocol a schema needs: `timestamp_ntz` columns take the `timestampNtz` table feature;
+/// renamed or dropped columns, `columnMapping` — as a named feature, not reader version 2: a
+/// reader that can't map columns then says so (delta-rs's pyarrow reader, Polars) instead of
+/// reading them by the wrong names.
 fn protocol(schema: &str) -> Value {
-    match schema.contains("\"timestamp_ntz\"") {
-        true => json!({"protocol": {"minReaderVersion": 3, "minWriterVersion": 7, "readerFeatures": ["timestampNtz"], "writerFeatures": ["timestampNtz"]}}),
-        false => json!({"protocol": {"minReaderVersion": 1, "minWriterVersion": 2}}),
+    let features: Vec<&str> = [("timestampNtz", schema.contains("\"timestamp_ntz\"")), ("columnMapping", schema.contains(MAPPING_ID))].iter().filter(|f| f.1).map(|f| f.0).collect();
+    match features.is_empty() {
+        false => json!({"protocol": {"minReaderVersion": 3, "minWriterVersion": 7, "readerFeatures": features, "writerFeatures": features}}),
+        true => json!({"protocol": {"minReaderVersion": 1, "minWriterVersion": 2}}),
     }
 }
 
 fn metadata(id: &str, table: &str, schema: &str, now: u64) -> Value {
+    // (column mapping by name: the files' columns are the fields' physical names)
+    let ids = serde_json::from_str::<Value>(schema).ok().and_then(|s| s["fields"].as_array().map(|f| f.iter().filter_map(|f| f["metadata"][MAPPING_ID].as_u64()).max()));
+    let configuration = match ids.flatten() {
+        Some(max) => json!({"delta.columnMapping.mode": "name", "delta.columnMapping.maxColumnId": max.to_string()}),
+        None => json!({}),
+    };
     json!({"metaData": {"id": id, "name": table, "format": {"provider": "parquet", "options": {}}, "schemaString": schema,
-        "partitionColumns": [], "configuration": {}, "createdTime": now}})
+        "partitionColumns": [], "configuration": configuration, "createdTime": now}})
+}
+
+const MAPPING_ID: &str = "delta.columnMapping.id";
+
+/// A table's Delta schema: its columns as they are stored, or (`mapped`: ADR-022) the columns SQL
+/// sees, under SQL's names, each with its id (its place among the stored columns) and the name
+/// the files hold it under — Delta's column mapping, by name.
+fn table_schema(meta: &TableMeta, mapped: bool) -> Option<String> {
+    if !mapped {
+        return schema_string(&meta.columns);
+    }
+    let live: Vec<(String, String)> = meta.live().map(|(_, n, t)| (n.to_string(), t.to_string())).collect();
+    let mut schema: Value = serde_json::from_str(&schema_string(&live)?).ok()?;
+    let ids = meta.columns.iter().enumerate().filter(|(_, (c, _))| !meta.dropped.contains(c)).map(|(i, (c, _))| (i + 1, c));
+    for (f, (id, stored)) in schema["fields"].as_array_mut()?.iter_mut().zip(ids) {
+        f["metadata"] = json!({(MAPPING_ID): id, "delta.columnMapping.physicalName": stored});
+    }
+    Some(schema.to_string())
 }
 
 fn add(path: &str, bytes: u64, at: u64) -> Value {

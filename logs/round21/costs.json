@@ -1,0 +1,11 @@
+{
+ "scan_10m_plain_s": 0.033,
+ "scan_10m_renamed_and_dropped_s": 0.034,
+ "view_filled_from_10m_rows_s": 2.57,
+ "view_rows_ok": true,
+ "row_view_filled_from_10m_rows_s": 2.27,
+ "keyed_2m_by_arrival_rows": 200000,
+ "keyed_2m_by_arrival_s": 0.026,
+ "keyed_2m_by_event_time_rows": 200000,
+ "keyed_2m_by_event_time_s": 0.143
+}

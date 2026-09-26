@@ -314,7 +314,7 @@ async fn produce(app: &App, allowed: bool, ver: i16, r: &mut Rd) -> Result<BoxFu
     let mut topics: Vec<(String, Vec<(i32, BoxFuture<'static, Outcome>)>)> = vec![];
     for _ in 0..r.len()? {
         let name = r.str()?;
-        let meta: Option<TableMeta> = app.lake.cat.get(&table_key(&name)).await?;
+        let meta: Option<TableMeta> = app.lake.cat.get::<TableMeta>(&table_key(&name)).await?.map(|m| m.logical()); // (JSON fields by SQL's names: ADR-022)
         let mut parts = vec![];
         for _ in 0..r.len()? {
             let (index, records) = (r.i32()?, r.nbytes()?.unwrap_or_default());
@@ -769,7 +769,7 @@ async fn read(app: &App, table: &str, meta: &TableMeta, offset: u64, visible: u6
             let start = if n == from { skip.min(all.num_rows() as u64) as usize } else { 0 };
             let rows = all.slice(start, all.num_rows() - start);
             if rows.num_rows() > 0 {
-                out.extend(encode_batch(((n << 32) + start as u64) as i64, seg.ts_ms as i64, &records(meta, &rows)?));
+                out.extend(encode_batch(((n << 32) + start as u64) as i64, seg.ts_ms as i64, &records(&meta.logical(), &meta.to_logical(&rows)?)?)); // (SQL's names: ADR-022)
             }
         }
         at = upto + 1;
@@ -1271,7 +1271,7 @@ async fn offset_commit(app: &App, ver: i16, r: &mut Rd) -> Result<Vec<u8>> {
                 (_, e) if e != 0 => e,
                 (Some(meta), _) if index == 0 && offset >= 0 => {
                     let src = Src { producer: offsets_key(&group, &name), seq: offset as u64 + 1, prev: None };
-                    match app.log()?.append(name.clone(), src, RecordBatch::new_empty(schema(&meta.columns)?)).await {
+                    match app.log()?.append(name.clone(), src, RecordBatch::new_empty(schema(&meta.logical().columns)?)).await {
                         Ok(_) => 0,
                         Err(e) => {
                             eprintln!("kafka offset commit: {e:#}");

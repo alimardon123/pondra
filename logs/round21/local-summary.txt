@@ -1,0 +1,35 @@
+harness-all exit=1 secs=133
+users-1 exit=0 secs=33
+users-2 exit=0 secs=33
+failover-1 exit=0 secs=65
+failover-2 exit=0 secs=65
+failover-3 exit=0 secs=66
+race exit=0 secs=33
+isolate exit=0 secs=19
+spread exit=0 secs=5
+smoke exit=0 secs=2
+latency exit=0 secs=25
+open-check exit=0 secs=11
+asof-check exit=0 secs=29
+skew-check exit=0 secs=4
+shuffle-spill exit=0 secs=62
+stream-check exit=0 secs=19
+freshness exit=0 secs=36
+crash-big exit=0 secs=162
+ALL-DONE
+(the final code: POST /views waits for its fill; the schemas test expects views that start full)
+harness-all-final exit=0 secs=254
+failover-final exit=0 secs=66
+users-final exit=0 secs=33
+smoke-final exit=0 secs=1
+FINAL-DONE
+anywhere-check (dist build, glibc 2.17; the new packages and notebook) exit=0
+stream-check x2 more (ingest with views, against round 20's): all three views 421,975 and 425,815 clicks/s (round 20: 406,919)
+(publishing one round at a time, each recorded before the next: the R2 columns test found two rounds writing one Iceberg version)
+columns-after-fix exit=0 secs=10
+open-check-after-fix exit=0 secs=12
+layouts-after-fix exit=0 secs=0
+alter-after-fix exit=0 secs=9
+changes-after-fix exit=0 secs=7
+files-after-fix exit=0 secs=11
+AFTER-DONE

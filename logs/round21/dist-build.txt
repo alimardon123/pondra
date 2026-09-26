@@ -1,0 +1,3 @@
+   Compiling pondra v0.21.0 (/home/claude/pondra)
+    Finished `dist` profile [optimized] target(s) in 22m 03s
+dist exit=0 secs=1324

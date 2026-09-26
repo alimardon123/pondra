@@ -1,6 +1,6 @@
 # Prototype status: Pondra, a streamhouse in one binary
 
-**Date:** 2026-09-26 (round 20) · **Plan:** ADR-002 to ADR-021, `roadmap.md` · **Code:** `pondra.zip` / `pondra.bundle` (≈16,100 lines of Rust, plus Python and JavaScript clients, packaging, and test and benchmark tools)
+**Date:** 2026-09-27 (round 21) · **Plan:** ADR-002 to ADR-022, `roadmap.md` · **Code:** `pondra.zip` / `pondra.bundle` (≈16,600 lines of Rust, plus Python and JavaScript clients, packaging, and test and benchmark tools)
 **Name:** the prototype formerly called `lh` is now **Pondra**. The name is free on crates.io, PyPI and npm. A small personal-finance app uses it (pondra.app), a different category; run a trademark search before a public launch.
 
 ## Where it stands
@@ -14,6 +14,45 @@ One Rust binary replaces the Kafka + Flink + Spark + metastore + ZooKeeper stack
 - upsert and merge tables.
 
 Start more copies on the same bucket to scale out. The only state is object storage. There's no JVM, no database server and no coordination service.
+
+**Round 21 shaped tables further and took on more of Flink** (ADR-022):
+
+1. **Columns that change without a file rewritten.** `RENAME COLUMN`, `DROP COLUMN`, a dropped
+   name added again, and widening `ALTER COLUMN … TYPE`, on any node while rows stream in. The
+   catalog keeps each column's stored name and what SQL calls it; reads alias one to the other,
+   so a scan costs the same (10 M rows: 0.033 s before, 0.034 s after). A writer still using an
+   old name has it left out, never mistaken for the column now stored under it. DuckDB (Delta and
+   Iceberg), PyIceberg and delta-rs's DataFusion reader read renamed, dropped and widened columns
+   right (Delta: column mapping; Iceberg: field ids); delta-rs's pyarrow reader and Polars say
+   they can't map columns instead of guessing.
+2. **Materialized views filled from the rows already there, every row once**, even with rows
+   streaming into several nodes as the view is made, or the leader killed meanwhile. The
+   sequencer now holds every flush to the views: a flush packed with other views than its tables
+   have goes back to its node. Without that check every view in the test missed rows. A GROUP BY
+   view over 10 M rows is filled in 2.6 s.
+3. **Deduplication by event time:** `order_by = 'ts'` on a keyed table keeps each key's latest
+   event, not its last arrival; late rows, deletes and compaction follow it. 200 k keys over five
+   generations of files and the log read in 0.14 s (by arrival 0.03 s).
+4. **`SELECT *` on a keyed table** leaves `_deleted` out unless a query names it.
+5. **Nexmark against Flink** (q1, q2, q5, q7, q11 over bids; `logs/round21/nexmark-*.jsonl`):
+   10 M bids in 8.7–10.9 s on Pondra, taken over HTTP and written to the lake, the answers equal
+   to DuckDB's; Flink 2.3 (PyFlink MiniCluster, generating the bids itself, blackhole sinks)
+   24.3–25.0 s. 4 M bids: 3.8–5.1 s against 11.0–11.2 s.
+6. **The owner's cluster bench on round 20:** loading TPC-H 105.9 s (442 s on round 19); one node
+   24.5 s, as the cluster decides 24.8 s, spread anyway 34.7 s, every answer the same.
+7. **A DataFrame API, designed** (`docs/dataframe-api.md`): `pondra.frame` (Polars-style) and
+   `pondra.spark` (PySpark's names) on one expression tree that compiles to SQL; built next round.
+8. **MIT OR Apache-2.0.** The packages carry both licenses; the release workflow publishes to
+   PyPI (trusted publishing) and npm once the owner's accounts are set up.
+9. **Tests** (`logs/round21/`): the local suite with the new `columns`, `fills` and `dedup`
+   passes — `harness.py all`, failover ×4, users ×3, race, isolate, spread, latency,
+   `open_check`, `asof_check`, `skew_check`, `shuffle_spill`, `stream_check` (ingest with views as
+   round 20's), freshness, the big crash run, `smoke`, and `anywhere_check` on the glibc 2.17
+   build (the new wheel, npm packages and notebook); 12 tests on simulated R2 (the three new
+   ones, `changes`, `schemas`, `streams`, `windows`, `alter`, `clients`, failover and users with
+   replicated acks, the crash run) and the three new ones on real R2. Real R2 caught two
+   publishing rounds writing one Iceberg version (a `CHECKPOINT` beside a tiering round):
+   publishing now runs one round at a time.
 
 **Round 20 took the owner's questions after round 19 as its list** (ADR-021):
 
@@ -1097,9 +1136,11 @@ peak at 279–586 MB.
   makes it milliseconds, but a write in that window survives only as long as one of its holders
   does (with `--fsync`, power loss included; not the leader and every holder at once).
 - Kafka: one partition per topic, no transactions, sparse offsets; consumer groups live in the
-  leader's memory. `ALTER TABLE` only adds columns.
+  leader's memory. `ALTER TABLE` renames, drops and widens columns (round 21), but renames a
+  table only by copying it, and never narrows a type.
 - Streaming: one watermark per source, not per partition or node, and a quiet source holds it;
-  no sliding windows, timers or CEP. An as-of join in a view joins what the table has when the
+  no timers, CEP or Top-N by event time (sliding windows: round 20; deduplication by event time:
+  round 21). A view's fill runs on the leader in one go. An as-of join in a view joins what the table has when the
   event arrives (Flink's temporal join waits for the table's watermark), and against a keyed
   table it sees only the latest row per key.
 - A one-off `pondra sql` on far-away object storage spends 2–3 s opening the catalog.
@@ -1129,7 +1170,8 @@ peak at 279–586 MB.
 - `VARIANT` is JSON text (`json_get` parses at read time), not a shredded variant type.
 - Under sustained overload, commits pause until tiering catches up (`--backlog`); a client with a
   short timeout will see it as a slow ack.
-- Tokens per role only (round 9): no TLS, per-table grants, quotas or multi-tenancy.
+- Tokens per role only (round 9): no TLS, per-table grants, quotas or multi-tenancy. Nodes call
+  each other over plain HTTP: keep a cluster on a private network (a VPC, Tailscale).
 - Other engines read Delta and Iceberg (opt-in per table), published unpartitioned, and keyed tables only
   as of their last compaction (at most 8 tiering rounds behind). Time travel reaches back only as
   far as `--retain-secs` keeps replaced files.
@@ -1139,9 +1181,10 @@ peak at 279–586 MB.
 
 From the plan in `docs/comparison-spark-flink-fluss.md`, in order:
 
-1. **A multi-machine run**: `.github/workflows/cluster-bench.yml` (GitHub-hosted runners +
-   Tailscale + R2) or `tools/cloud/` on VMs (e.g. a Google Cloud trial), TPC-H SF10–SF100 against
-   Spark.
+0. **The DataFrame API** (`dataframe-api.md`, round 22): `pondra.frame` and `pondra.spark` over SQL.
+1. **A multi-machine run in one data centre** (`.github/workflows/cluster-bench.yml` has run on
+   GitHub's runners over the internet, rounds 18–20): `tools/cloud/` on VMs (e.g. a Google Cloud
+   trial), TPC-H SF10–SF100 against Spark and Sail.
 2. **Ranges declared, not only found**: `cluster_by` columns kept in order through merges, so a
    table written out of order can still be split by key; and a `LIMIT` in a subquery across the
    nodes (each node's top rows, then the top of those).

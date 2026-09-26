@@ -99,12 +99,16 @@ pub async fn run(lake: &Lake, seq: &Sequencer, sql: &str, job: &str) -> Result<V
     let stmt = crate::write::parse(sql).context("not an UPDATE, DELETE or MERGE")?;
     let (other, table) = crate::ddl::resolve(lake, &stmt.table()).await?;
     ensure!(other.is_none(), "{table} is another lake's: change it on a node of that lake");
-    let meta: TableMeta = lake.cat.get(&table_key(&table)).await?.with_context(|| format!("no table {table}"))?;
+    let stored: TableMeta = lake.cat.get(&table_key(&table)).await?.with_context(|| format!("no table {table}"))?;
+    let meta = stored.logical(); // (the change's SQL names columns as SQL knows them: ADR-022)
     let view = lake.cat.get::<crate::views::View>(&crate::views::view_key(&table)).await?;
     ensure!(view.is_none() && meta.merge.is_empty(), "{table} is a view's: change the table it follows");
     let append = meta.key.is_empty();
     ensure!(meta.ids || !append, "{table} holds rows from before row ids (made before Pondra 0.19): copy it once (CREATE TABLE t2 AS SELECT * FROM {table}) and change the copy");
     crate::views::can_follow(lake, &table, append).await?;
+    if let Some(v) = crate::views::filling(lake, &table).await? {
+        bail!("materialized view {v} is still being filled from {table}'s rows: change them once it is (in a moment)"); // (it reads them as they were)
+    }
     let upto = lake.visible(); // (one snapshot for every query below: the lock keeps its files)
     let (old, new) = match &stmt {
         crate::write::Stmt::Update(_, set, cond) => update(lake, &table, &meta, set, cond, upto).await?,
@@ -112,7 +116,7 @@ pub async fn run(lake: &Lake, seq: &Sequencer, sql: &str, job: &str) -> Result<V
         crate::write::Stmt::Merge(m) => merge(lake, &table, &meta, m, upto).await?,
         _ => bail!("not an UPDATE, DELETE or MERGE"),
     };
-    commit(lake, seq, &table, &meta, old, new, job).await
+    commit(lake, seq, &table, &stored, old, new, job).await
 }
 
 fn from(table: &str) -> String { format!("{} AS {}", crate::write::sql_name(table), q(table.rsplit('.').next().unwrap_or(table))) }
@@ -217,7 +221,8 @@ async fn merge(lake: &Lake, table: &str, meta: &TableMeta, m: &Merge, upto: u64)
 }
 
 /// The change as one commit: new versions and new rows into the table; the old versions into
-/// `{t}$deleted` (an append table) or as delete markers (a keyed one).
+/// `{t}$deleted` (an append table) or as delete markers (a keyed one). `meta` as stored; the rows
+/// are under their SQL names (the log takes them so: `log::pack`).
 async fn commit(lake: &Lake, seq: &Sequencer, table: &str, meta: &TableMeta, old: Vec<RecordBatch>, new: Vec<RecordBatch>, job: &str) -> Result<Value> {
     let rows = |b: &[RecordBatch]| b.iter().map(|b| b.num_rows()).sum::<usize>();
     let (replaced, added) = (rows(&old), rows(&new));
@@ -231,7 +236,7 @@ async fn commit(lake: &Lake, seq: &Sequencer, table: &str, meta: &TableMeta, old
             false => Ok(Some(concat_batches(&s, &b.iter().map(|b| crate::query::conform(b, &s)).collect::<Result<Vec<_>>>()?)?)),
         }
     };
-    let ids = with_ids(&crate::query::schema(&meta.columns)?);
+    let ids = with_ids(&crate::query::schema(&meta.logical().columns)?);
     let old = match old.first().map(|f| f.schema()) {
         Some(s) => one(old, s)?,
         None => None,
@@ -271,7 +276,12 @@ async fn commit(lake: &Lake, seq: &Sequencer, table: &str, meta: &TableMeta, old
         };
         a.batch = sys::stamp(&a.batch, first)?;
     }
-    let outcome = seq.submit(pack(lake, &pending).await?).await?;
+    let outcome = loop {
+        match seq.submit(pack(lake, &pending).await?).await? {
+            Outcome::Retry(r) if r.is_empty() => tokio::time::sleep(std::time::Duration::from_millis(10)).await, // (views changed: pack again)
+            o => break o,
+        }
+    };
     Ok(match outcome {
         Outcome::Acks(acks) if acks.iter().all(|a| !a.duplicate) => j!({"rows": replaced + inserted, "updated": added - inserted, "deleted": replaced + inserted - added, "inserted": inserted}),
         _ => j!({"duplicate": true}), // (this job's change is already in)
@@ -312,7 +322,7 @@ async fn companion(lake: &Lake, table: &str, meta: &TableMeta) -> Result<()> {
     }
     let mut columns = meta.columns.clone();
     columns.push(("_old_version".into(), "Int64".into()));
-    let deleted = TableMeta { columns, tiered: lake.visible(), ids: true, ..Default::default() };
+    let deleted = TableMeta { columns, tiered: lake.visible(), ids: true, names: meta.names.clone(), dropped: meta.dropped.clone(), ..Default::default() };
     let changed = TableMeta { changed: true, ..meta.clone() };
     lake.cat.commit(vec![(table_key(&sys::deleted(table)), json(&deleted)), (table_key(table), json(&changed))], &[]).await
 }
@@ -370,5 +380,5 @@ pub async fn feed(lake: &Lake, table: &str, after: u64, upto: Option<u64>) -> Re
         all.push((label(b, &kind)?, 1));
     }
     all.sort_by_key(|((version, _), side)| (*version, *side)); // (stable: each side's own order kept)
-    Ok(all.into_iter().map(|((_, b), _)| b).collect())
+    all.into_iter().map(|((_, b), _)| meta.to_logical(&b)).collect() // (under the names SQL knows)
 }

@@ -1,10 +1,11 @@
 [package]
 name = "pondra"
-version = "0.20.0"
+version = "0.21.0"
 edition = "2021"
 description = "Pondra: a streamhouse in one binary"
-license-file = "LICENSE"
-publish = false # (all rights reserved until a license is chosen)
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/alimardon123/pondra"
+publish = false # (not on crates.io yet: pip and npm carry the binary)
 
 [dependencies]
 parquet = { version = "59", default-features = false, features = ["snap", "zstd", "lz4"] }
