@@ -137,6 +137,11 @@ not what this measures.
   and `pondra.spark`, PySpark's `SparkSession`, `DataFrame`, `functions` and `Window`, so a job
   moves by changing its imports. Spark's semantics (nulls first, integer division, names
   regardless of case) are written out in the SQL; what isn't covered says so.
+- **SQL and Python used interchangeably** (the owner's point): `con.sql(…)` gives a lazy frame;
+  SQL names frames, pandas, Polars and Arrow data by their Python names (as DuckDB does, or by
+  keyword as PySpark does); frame methods take SQL snippets; `.sql` files and Python share the
+  lake's names (`con.run("file.sql")`, `to_view`); `%%sql` notebook cells; later, pipelines of
+  `.sql` and `.py` model files (`pondra run models/`).
 - **Writes and streams are SQL's:** `write_table` (CTAS, INSERT), `update`, `delete`, `merge`
   with Delta Lake's builder names, `to_view(materialized=True, window=…)`, `watch()`.
 - **Tested differentially** against Polars and PySpark (local), and TPC-H written as frames.
