@@ -3,7 +3,6 @@
 //! as everyone else (`Authorization: Bearer …`). JSON-RPC 2.0 over MCP's "streamable HTTP"
 //! transport, each answer plain JSON (no event stream: every tool answers at once).
 use crate::auth::Role;
-use crate::query::tail;
 use crate::server::App;
 use crate::store::{Lake, TableMeta};
 use crate::views::View;
@@ -58,7 +57,8 @@ fn tools() -> Value {
              MATERIALIZED VIEW or SCHEMA. Committed and durable when this returns. Needs a write token; CREATE and DROP an admin token."},
         {"name": "changes", "annotations": {"readOnlyHint": true},
          "inputSchema": args(json!({"table": {"type": "string"}, "after": {"type": "integer", "description": "a position from an earlier call; 0 for as far back as kept; none for from now"}}), &["table"]),
-         "description": format!("What was committed to a table after a position — every append, upsert and delete (`_deleted`) — \
+         "description": format!("What was committed to a table after a position — every insert, update and delete, each row with its \
+             `_change_type` (insert, update_preimage, update_postimage, delete; upsert on a keyed table), `_row_id` and `_version` — \
              about {ROWS} rows at a time, and the position to ask from next.")},
     ])
 }
@@ -89,7 +89,7 @@ async fn list(app: &App) -> Result<Value> {
     let mut tables = vec![];
     for (prefix, lake) in lakes(app) {
         let views = lake.cat.scan::<View>("v/", "v0").await?;
-        for (key, m) in lake.cat.scan::<TableMeta>("t/", "t0").await? {
+        for (key, m) in lake.cat.scan::<TableMeta>("t/", "t0").await?.into_iter().filter(|(k, _)| !crate::sys::hidden(k)) {
             let name = &key[2..];
             let kind = if !m.merge.is_empty() { "merge" } else if !m.key.is_empty() { "upsert" } else { "append" };
             let columns: Vec<Value> = m.columns.iter().filter(|(c, _)| c != "_deleted").map(|(c, t)| json!({"name": c, "type": t})).collect();
@@ -125,10 +125,19 @@ async fn changes(app: &App, table: &str, after: Option<u64>) -> Result<Value> {
     let (mut at, mut step, mut got) = (after.unwrap_or(now).min(now), 16, vec![]);
     while at < now && got.iter().map(RecordBatch::num_rows).sum::<usize>() < ROWS {
         let upto = now.min(at + step);
-        got.extend(tail(&lake, &name, at, Some(upto), false).await?);
+        got.extend(crate::change::feed(&lake, &name, at, Some(upto)).await?);
         (at, step) = (upto, step * 2);
     }
-    Ok(json!({"rows": rows(&got)?, "position": at}))
+    Ok(json!({"rows": all_rows(&got)?, "position": at})) // (all of them: `position` is past every one)
+}
+
+/// Every row as a JSON object.
+fn all_rows(batches: &[RecordBatch]) -> Result<Value> {
+    let mut w = ArrayWriter::new(Vec::new());
+    batches.iter().try_for_each(|b| w.write(b))?;
+    w.finish()?;
+    let out = w.into_inner();
+    Ok(if out.is_empty() { json!([]) } else { serde_json::from_slice(&out)? })
 }
 
 /// The first `ROWS` rows as JSON objects.

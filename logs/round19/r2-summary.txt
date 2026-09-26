@@ -1,0 +1,11 @@
+changes exit=1 secs=661
+schemas exit=0 secs=244
+guard exit=1 secs=100
+ALL-DONE
+(again, after the test fixes: the watch check waits for a commit on R2, the slow-link check covers queries that would shuffle)
+changes exit=1 secs=170
+guard exit=0 secs=192
+ALL-DONE
+(again: the changes test waits up to 300 s for a statement; a change waits for a tiering round in progress, and with a purge in every round on R2 that took over 30 s)
+changes exit=0 secs=640
+ALL-DONE

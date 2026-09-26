@@ -5,7 +5,7 @@
 //! of each key (sum, min, max).
 use crate::store::*;
 use anyhow::{bail, Result};
-use datafusion::arrow::array::{ArrayRef, UInt64Array};
+use datafusion::arrow::array::{ArrayRef, Int64Array, UInt64Array};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::datasource::{MemTable, TableProvider};
@@ -77,6 +77,11 @@ pub fn cast_as(b: &RecordBatch, s: &SchemaRef) -> Result<RecordBatch> {
 /// Rows of `table` from committed segments in (after, upto]; `None` = up to the latest.
 /// With `ord`, each row gets `_ord` = (segment << 32) + position, so later versions sort last.
 pub async fn tail(lake: &Lake, table: &str, after: u64, upto: Option<u64>, ord: bool) -> Result<Vec<RecordBatch>> {
+    tail_of(lake, table, after, upto, ord, false).await
+}
+
+/// `tail`, with the system columns (`sys.rs`) when `sys`: each row's commit, and its `_row_id`.
+pub async fn tail_of(lake: &Lake, table: &str, after: u64, upto: Option<u64>, ord: bool, sys: bool) -> Result<Vec<RecordBatch>> {
     let end = upto.map_or("s0".to_string(), |u| seg_key(u + 1)); // "s0" sorts right after every "s/…"
     let mut segs = vec![];
     for (key, seg) in lake.cat.scan::<Segment>(&seg_key(after + 1), &end).await? {
@@ -88,18 +93,21 @@ pub async fn tail(lake: &Lake, table: &str, after: u64, upto: Option<u64>, ord: 
     let fetches: Vec<_> = segs.iter().map(|(n, seg)| lake.segment_rows(*n, seg, table)).collect();
     let fetched: Vec<Rows> = futures::stream::iter(fetches).buffered(32).try_collect().await?;
     let target = match lake.cat.get::<TableMeta>(&table_key(table)).await? {
+        Some(m) if sys => Some(schema(&crate::sys::with_sys(&m).columns)?),
         Some(m) => Some(schema(&m.columns)?),
         None => None,
     };
     let mut out = vec![];
-    for ((n, _), rows) in segs.iter().zip(fetched) {
+    for ((n, seg), rows) in segs.iter().zip(fetched) {
         let (n, mut pos) = (*n, 0u64);
         for b in rows.iter() {
             let b = &match &target {
+                Some(s) if sys => conform(&crate::sys::derive(b, n, pos, seg.ts_ms)?, s)?,
                 Some(s) => conform(b, s)?,
                 None => b.clone(),
             };
             if !ord {
+                pos += b.num_rows() as u64;
                 out.push(b.clone());
                 continue;
             }
@@ -124,6 +132,51 @@ pub async fn raw(lake: &Lake, ctx: &SessionContext, name: &str, meta: &TableMeta
     })
 }
 
+/// An append table whose rows have changed (`change.rs`): its rows but the old versions that
+/// `{t}$deleted` holds (every (`_row_id`, `_version`) in it) from the changes not yet purged out
+/// of its files (`tier::purge`). Those are few next to the table's rows, so they are held as a list;
+/// only the files whose ranges can hold one of them, and the log, go through the anti-join, and
+/// with none waiting the table reads as if it never changed.
+/// `at`: the commit the whole query reads as of, up to which `{t}$deleted` is read — a slice of a
+/// spread query may read none of the table's log itself (`upto` 0), but its files hold rows
+/// changed since.
+async fn current(lake: &Lake, ctx: &SessionContext, name: &str, meta: &TableMeta, upto: Option<u64>, at: Option<u64>) -> Result<DataFrame> {
+    use crate::sys::{with_sys, ROW_ID, VERSION};
+    let (upto, at) = (upto.or(Some(lake.visible())), at.or(upto)); // (as of one commit: a change writes both)
+    let dead = dead(lake, ctx, name, meta, at).await?;
+    if dead.is_empty() {
+        return raw(lake, ctx, name, meta, upto).await;
+    }
+    let (touched, clean): (Vec<DataFile>, Vec<DataFile>) = meta.files.iter().cloned().partition(|f| crate::sys::holds(&dead, &f.stats));
+    let meta = with_sys(meta);
+    let clean = raw(lake, ctx, name, &TableMeta { files: clean, ..meta.clone() }, Some(meta.tiered)).await?; // (the log goes with the touched files)
+    let touched = raw(lake, ctx, name, &TableMeta { files: touched, ..meta }, upto).await?;
+    let (ids, versions): (Vec<i64>, Vec<i64>) = dead.into_iter().unzip();
+    let s = Arc::new(Schema::new(vec![Field::new("__id", DataType::Int64, false), Field::new("__v", DataType::Int64, false)]));
+    let gone = ctx.read_batch(RecordBatch::try_new(s, vec![Arc::new(Int64Array::from(ids)), Arc::new(Int64Array::from(versions))])?)?;
+    Ok(clean.union(gone.join(touched, JoinType::RightAnti, &["__id", "__v"], &[ROW_ID, VERSION], None)?)?)
+}
+
+/// A changed table's old rows (`_row_id`, `_version`), sorted, from the changes after its last
+/// purge up to commit `at` (`{t}$deleted`'s files may be newer than the query's snapshot).
+async fn dead(lake: &Lake, ctx: &SessionContext, name: &str, meta: &TableMeta, at: Option<u64>) -> Result<Vec<(i64, i64)>> {
+    use crate::sys::{with_sys, ROW_ID, VERSION};
+    use datafusion::arrow::array::AsArray;
+    let deleted = crate::sys::deleted(name);
+    let Some(dmeta) = lake.cat.get::<TableMeta>(&table_key(&deleted)).await? else { return Ok(vec![]) };
+    let within = col(VERSION).gt(lit(meta.purged() as i64)).and(col(VERSION).lt_eq(lit(at.unwrap_or(u64::MAX >> 1) as i64)));
+    let dmeta = with_sys(&dmeta);
+    let files = crate::manifest::pruned(lake, &dmeta, None, &[within.clone()], &schema(&dmeta.columns)?).await?;
+    let dmeta = TableMeta { files, sealed: None, ..dmeta };
+    let mut out = vec![];
+    for b in raw(lake, ctx, &deleted, &dmeta, at).await?.filter(within)?.select(vec![col(ROW_ID), col("_old_version")])?.collect().await? {
+        let (ids, versions) = (b.column(0).as_primitive::<datafusion::arrow::datatypes::Int64Type>(), b.column(1).as_primitive::<datafusion::arrow::datatypes::Int64Type>());
+        out.extend(ids.iter().zip(versions.iter()).filter_map(|(i, v)| Some((i?, v?))));
+    }
+    out.sort_unstable();
+    Ok(out)
+}
+
 /// A table's rows as separate reads: the log tail up to `upto` (if any rows), and the files.
 /// Upsert tables get one read per generation of files, newest first, and `_ord` on every row: a
 /// newer file's rows above an older one's, and log rows ((segment << 32) + position) above both.
@@ -143,7 +196,8 @@ pub async fn sources(lake: &Lake, ctx: &SessionContext, name: &str, meta: &Table
         let df = read_files(lake, ctx, meta.files.iter().collect(), &schema).await?;
         files.push(if keyed { df.with_column("_ord", lit(0u64))? } else { df });
     }
-    let hot = tail(lake, name, meta.tiered, upto, keyed).await?;
+    let sys = meta.columns.iter().any(|(c, _)| c == crate::sys::ROW_ID); // (`sys::with_sys`)
+    let hot = tail_of(lake, name, meta.tiered, upto, keyed, sys).await?;
     if hot.is_empty() {
         return Ok((None, files));
     }
@@ -214,7 +268,7 @@ pub async fn table_view(lake: &Lake, ctx: &SessionContext, name: &str, meta: &Ta
     if meta.key.is_empty() {
         let schema = read_schema(&meta.columns)?;
         let ranges = crate::manifest::ranges(name, &crate::manifest::list(lake, meta).await?, &meta.files, &schema);
-        return Ok(Arc::new(Pruned { lake: lake.arc(), name: name.into(), meta: meta.clone(), manifests: None, upto, schema, share: None, ranges, range: None }));
+        return Ok(Arc::new(Pruned { lake: lake.arc(), name: name.into(), meta: meta.clone(), manifests: None, upto, at: upto, schema, share: None, ranges, range: None }));
     }
     let df = raw(lake, ctx, name, meta, upto).await?;
     let aux = lake.session();
@@ -231,6 +285,7 @@ pub struct Pruned {
     pub meta: TableMeta,
     pub manifests: Option<Vec<crate::manifest::Manifest>>, // a slice's share; None: the table's list
     pub upto: Option<u64>,                                  // the log up to this segment (None: the latest)
+    pub at: Option<u64>,                                    // the commit the query reads as of (a slice: its coordinator's; None: the latest)
     pub schema: SchemaRef,
     pub share: Option<(u64, u64)>, // a distributed query's slice of it, and the whole table's (rows, bytes)
     pub ranges: Arc<crate::manifest::Stats>, // every column's min and max over the whole table
@@ -291,15 +346,21 @@ impl TableProvider for Pruned {
         let files = crate::manifest::pruned(&self.lake, &self.meta, self.manifests.as_deref(), &filters, &self.schema).await.map_err(e)?;
         let meta = TableMeta { files, sealed: None, ..self.meta.clone() };
         let ctx = self.lake.session();
-        let df = raw(&self.lake, &ctx, &self.name, &meta, self.upto).await.map_err(e)?;
+        if self.meta.changed {
+            // (the query this scan is part of may still swap the anti-join's sides: DataFusion
+            // refuses once a join has built its dynamic filter)
+            ctx.state_ref().write().config_mut().options_mut().set("datafusion.optimizer.enable_dynamic_filter_pushdown", "false").map_err(|e| datafusion::error::DataFusionError::External(e.into()))?;
+        }
+        let df = match self.meta.changed {
+            true => current(&self.lake, &ctx, &self.name, &meta, self.upto, self.at).await.map_err(e)?,
+            false => raw(&self.lake, &ctx, &self.name, &meta, self.upto).await.map_err(e)?,
+        };
         let df = match range {
             Some(r) => df.filter(r)?, // (reaches the Parquet reader: row groups outside it are skipped)
             None => df,
         };
-        let df = match projection {
-            Some(p) => df.select_columns(&p.iter().map(|&i| self.schema.field(i).name().as_str()).collect::<Vec<_>>())?,
-            None => df,
-        };
+        let all: Vec<usize> = (0..self.schema.fields().len()).collect();
+        let df = df.select_columns(&projection.unwrap_or(&all).iter().map(|&i| self.schema.field(i).name().as_str()).collect::<Vec<_>>())?;
         let plan = df.create_physical_plan().await?;
         let Some((rows, bytes)) = self.share else { return Ok(plan) };
         Ok(Arc::new(crate::spmd::ShareExec::new(plan, &self.name, rows, bytes, self.range.as_ref().map(|r| r.column.clone()))?))
@@ -317,11 +378,12 @@ pub fn latest_sql(meta: &TableMeta, raw_table: &str, sorted: bool, keep_deleted:
     let key = meta.key.iter().map(q).collect::<Vec<_>>().join(", ");
     let order = if sorted { format!(" ORDER BY {key}") } else { String::new() };
     if !meta.merge.is_empty() {
-        let cols = meta.columns.iter().map(|(c, _)| match meta.merge.get(c) {
+        let cols = meta.columns.iter().map(|(c, _)| match meta.merge.get(c).map(String::as_str) {
+            Some("count") => format!("sum({}) AS {}", q(c), q(c)), // (partial counts add up)
             Some(f) => format!("{f}({}) AS {}", q(c), q(c)),
             None => q(c),
         });
-        let live = if keep_deleted { String::new() } else { live(meta) }; // (windows past their TTL drop out)
+        let live = if keep_deleted { String::new() } else { live(meta) }; // (windows past their TTL drop out; emptied groups too)
         return format!("SELECT * FROM (SELECT {} FROM \"{raw_table}\" GROUP BY {key}){live}{order}", cols.collect::<Vec<_>>().join(", "));
     }
     // Newest version per key as a grouped aggregate (a hash table), not a window (a sort).
@@ -347,7 +409,9 @@ pub fn current_sql(meta: &TableMeta, raw_table: &str, upto: u64) -> String {
 /// ` WHERE …` keeping a keyed table's live rows: not deleted, not past their TTL ("" if nothing to drop).
 pub fn live(meta: &TableMeta) -> String {
     let deleted = meta.columns.iter().any(|(c, _)| c == "_deleted").then(|| "\"_deleted\" IS NOT TRUE".to_string());
-    let conds: Vec<String> = deleted.into_iter().chain(Some(meta.ttl_sql()).filter(|t| !t.is_empty())).collect();
+    // A view's group whose rows a change took back (its count added up to 0) is gone.
+    let emptied = meta.merge.iter().find(|(_, f)| *f == "count").map(|(c, _)| format!("\"{c}\" <> 0"));
+    let conds: Vec<String> = deleted.into_iter().chain(emptied).chain(Some(meta.ttl_sql()).filter(|t| !t.is_empty())).collect();
     if conds.is_empty() { String::new() } else { format!(" WHERE {}", conds.join(" AND ")) }
 }
 
@@ -371,7 +435,10 @@ pub fn table_ref(name: &str) -> datafusion::common::TableReference {
 /// this one is the default catalog, and also goes by its own name; each attached lake is a
 /// catalog by the name it was attached as, and — unless a schema here has that name — its
 /// `public` tables are also that schema's (`name.table`, from before schemas).
-pub async fn session(lake: &Lake, sql: &str, except: &str) -> Result<SessionContext> {
+pub async fn session(lake: &Lake, sql: &str, except: &str) -> Result<SessionContext> { session_at(lake, sql, except, None).await }
+
+/// `session`, this lake's tables as of log segment `upto` (every query in it reads the same rows).
+pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>) -> Result<SessionContext> {
     use crate::ddl::{mentions, split, PUBLIC};
     use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider, MemorySchemaProvider};
     let ctx = lake.session();
@@ -379,14 +446,15 @@ pub async fn session(lake: &Lake, sql: &str, except: &str) -> Result<SessionCont
     let listing = ["information_schema", "show tables", "show columns"].iter().any(|w| sql.to_lowercase().contains(w)); // (every table)
     let views = stored_views(lake, sql, listing).await?; // (their tables are wanted too)
     let text = views.iter().fold(sql.to_string(), |t, (_, s)| format!("{t} {s}"));
+    let sys = |m: TableMeta| if crate::sys::mentioned(&text) { crate::sys::with_sys(&m) } else { m }; // (named: the tables get their system columns)
     let default = ctx.catalog(&crate::ddl::lake_name(lake)).expect("the lake's catalog"); // (`lake.schema.table`)
     for s in crate::ddl::schemas(lake).await?.into_iter().filter(|s| s != PUBLIC) {
         default.register_schema(&s, Arc::new(MemorySchemaProvider::new()))?;
     }
     for (key, meta) in lake.cat.scan::<TableMeta>("t/", "t0").await? {
         let name = &key[2..];
-        if name != except && (listing || mentions(&text, name)) {
-            ctx.register_table(table_ref(name), table_view(lake, &ctx, name, &meta, None).await?)?;
+        if name != except && !crate::sys::hidden(name) && (listing || mentions(&text, name)) {
+            ctx.register_table(table_ref(name), table_view(lake, &ctx, name, &sys(meta), upto).await?)?;
         }
     }
     let attached = lake.attached.read().unwrap().clone();
@@ -404,10 +472,10 @@ pub async fn session(lake: &Lake, sql: &str, except: &str) -> Result<SessionCont
         }
         for (key, meta) in other.cat.scan::<TableMeta>("t/", "t0").await? {
             let name = &key[2..];
-            if !(listing || mentions(&text, name)) {
+            if crate::sys::hidden(name) || !(listing || mentions(&text, name)) {
                 continue;
             }
-            let view = table_view(&other, &ctx, name, &meta, None).await?;
+            let view = table_view(&other, &ctx, name, &sys(meta), None).await?;
             let (s, t) = split(name);
             if old && s == PUBLIC {
                 default.schema(&ns).expect("registered").register_table(t.to_string(), view.clone())?;

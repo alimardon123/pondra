@@ -61,13 +61,13 @@ pub struct Sealed {
 
 /// The min and max of each of the first 32 columns that has an order (as Delta does, so a wide
 /// table's entries stay small; strings only up to 64 characters, where a cut-off value would no
-/// longer bound them).
+/// longer bound them), and of the system columns (`sys.rs`: a purge finds changed rows by them).
 pub fn stats(batches: &[RecordBatch]) -> Stats {
     use datafusion::functions_aggregate::min_max::{MaxAccumulator, MinAccumulator};
     let Some(first) = batches.first() else { return Stats::new() };
     let mut out = Stats::new();
-    for (i, f) in first.schema().fields().iter().enumerate().take(32) {
-        if !orderable(f.data_type()) {
+    for (i, f) in first.schema().fields().iter().enumerate() {
+        if (i >= 32 && !crate::sys::NAMES.contains(&f.name().as_str())) || !orderable(f.data_type()) {
             continue;
         }
         let (Ok(mut lo), Ok(mut hi)) = (MinAccumulator::try_new(f.data_type()), MaxAccumulator::try_new(f.data_type())) else { continue };
@@ -288,7 +288,7 @@ pub async fn seal(lake: &Lake, table: &str, meta: &mut TableMeta) -> Result<bool
     if !meta.key.is_empty() || meta.files.len() <= INLINE {
         return Ok(false);
     }
-    let (dir, schema) = (format!("data/{table}/_manifests"), crate::query::schema(&meta.columns)?);
+    let (dir, schema) = (format!("data/{table}/_manifests"), crate::query::schema(&crate::sys::with_sys(meta).columns)?);
     meta.files.sort_by_key(|f| f.ord);
     let mut sealing: Vec<DataFile> = meta.files.drain(..meta.files.len() - SEAL).collect();
     sealing.sort_by(|a, b| (&a.part, a.ord).cmp(&(&b.part, b.ord))); // (a manifest covers few partitions)
@@ -313,4 +313,25 @@ pub async fn seal(lake: &Lake, table: &str, meta: &mut TableMeta) -> Result<bool
         meta.garbage.push((old.list, crate::log::now_ms()));
     }
     Ok(true)
+}
+
+/// Take manifests `which` (of `list`, the table's) apart: their files back inline, the list
+/// without them (a purge is about to replace some of their files; `seal` puts the rest away again).
+pub async fn unseal(lake: &Lake, table: &str, meta: &mut TableMeta, mut list: Vec<Manifest>, which: &[usize]) -> Result<()> {
+    if which.is_empty() {
+        return Ok(());
+    }
+    let now = crate::log::now_ms();
+    for i in which.iter().rev() {
+        let m = list.remove(*i);
+        meta.files.extend(files(lake, &m).await?);
+        meta.garbage.push((m.path, now));
+    }
+    let old = meta.sealed.take();
+    if !list.is_empty() {
+        let (files, rows, bytes) = list.iter().fold((0, 0, 0), |(f, r, b), m| (f + m.files, r + m.rows, b + m.bytes));
+        meta.sealed = Some(Sealed { list: put(lake, &format!("data/{table}/_manifests"), &list).await?, files, rows, bytes });
+    }
+    meta.garbage.extend(old.map(|o| (o.list, now)));
+    Ok(())
 }

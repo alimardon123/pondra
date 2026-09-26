@@ -6,11 +6,13 @@
 
 Waits until every node is in the cluster, measures the network to each node (Tailscale's path,
 direct or relayed, and a 256 MB download), loads TPC-H with one `pondra sql` INSERT per table
-(Parquet straight into the bucket), then runs each of the 22 queries on one node (`?spread=0`)
-and across the cluster (`?spread=1`), best of `--runs`, and checks that the two answers agree.
-results.json has, per query, both times, how it ran (shuffled, gathered, one node), what the
-nodes sent each other and how long their steps waited for it; plus the network, the load time
-and every node's /metrics. Standalone on purpose: a bench repo needs only this file,
+(Parquet straight into the bucket), waits until the lake is settled (every row tiered, merges
+done: they would otherwise run under the first queries), then runs each of the 22 queries on one
+node (`?spread=0`), as the cluster decides (the default: spread only when it pays, `guard.rs`)
+and spread anyway (`?spread=1`), best of `--runs`, and checks that the answers agree.
+results.json has, per query, the three times, how each ran (shuffled, gathered, one node), what
+the nodes sent each other and how long their steps waited for it; plus the network, the load
+time and every node's /metrics. Standalone on purpose: a bench repo needs only this file,
 the queries and the workflow.
 """
 import argparse, http.client, itertools, json, os, re, subprocess, sys, time
@@ -85,11 +87,28 @@ def same(a, b):
     return len(a) == len(b) and all(r.keys() == s.keys() and all(close(r[k], s[k]) for k in r) for r, s in pairs)
 
 
+def settle(nodes):
+    """Wait until the lake is settled — every row tiered, merges and sealing done — so none of it
+    runs under the queries being timed: the leader's /tier until a round finds nothing to do."""
+    t0 = time.time()
+    while time.time() - t0 < 1800:
+        leader = next((n for n in nodes if (answers(n) or {}).get("role") == "leader"), nodes[0])
+        t = time.time()
+        try:
+            tiered = call(leader, "POST", "/tier").get("rows_tiered", 0)
+        except Exception:
+            tiered = -1
+        if tiered == 0 and time.time() - t < 1 and (answers(leader) or {}).get("untiered_rows", 1) == 0:
+            break
+        time.sleep(1)
+    return round(time.time() - t0, 1)
+
+
 def best(node, sql, spread, runs):
     times, out = [], None
     for _ in range(runs):
         t0 = time.time()
-        out = call(node, "POST", f"/sql?spread={spread}", (sql + f" -- {next(RUNS)}").encode())
+        out = call(node, "POST", "/sql" + (f"?spread={spread}" if spread != "" else ""), (sql + f" -- {next(RUNS)}").encode())
         times.append(time.time() - t0)
     return round(min(times), 3), out
 
@@ -120,25 +139,27 @@ def main():
     for t in TABLES:
         subprocess.run([A.bin, "sql", "--dir", A.lake, f"INSERT INTO {t} SELECT * FROM '{os.path.join(A.data, t)}.parquet'"], check=True)
     load_s = round(time.time() - t0, 1)
-    for n in nodes:  # (merges and sealing done before timing; only the leader acts on it)
-        try:
-            call(n, "POST", "/tier")
-        except Exception:
-            pass
+    settle_s = settle(nodes)
     results = {}
     for i, sql in queries(A.queries).items():
         one_s, one = best(head, sql, 0, A.runs)
-        before, (wire0, wait0) = metrics(head), moved(nodes)
-        many_s, many = best(head, sql, 1, A.runs)
-        after, (wire1, wait1) = metrics(head), moved(nodes)
-        ran = lambda m: after.get(f"pondra_{m}_queries_total", 0) > before.get(f"pondra_{m}_queries_total", 0)
-        r = results[f"q{i}"] = {"one_node_s": one_s, "cluster_s": many_s, "how": "shuffled" if ran("shuffled") else "gathered" if ran("spread") else "one node", "same": same(one, many),
-                                "wire_mb": round((wire1 - wire0) / 1e6 / A.runs, 1), "wait_s": round((wait1 - wait0) / A.runs, 3)}  # (per run; wait summed over the nodes)
-        print(f"q{i:<3} one node {one_s:>7.2f}s  {len(nodes)} nodes {many_s:>7.2f}s  {r['how']:<9} same={r['same']}  sent {r['wire_mb']} MB, waited {r['wait_s']} s", flush=True)
+        runs = {}
+        for name, spread in (("cluster", ""), ("forced", 1)):  # (as the cluster decides; spread anyway)
+            before, (wire0, wait0) = metrics(head), moved(nodes)
+            took, rows = best(head, sql, spread, A.runs)
+            after, (wire1, wait1) = metrics(head), moved(nodes)
+            ran = lambda m: after.get(f"pondra_{m}_queries_total", 0) > before.get(f"pondra_{m}_queries_total", 0)
+            runs[name] = {"s": took, "how": "shuffled" if ran("shuffled") else "gathered" if ran("spread") else "one node", "same": same(one, rows),
+                          "wire_mb": round((wire1 - wire0) / 1e6 / A.runs, 1), "wait_s": round((wait1 - wait0) / A.runs, 3)}  # (per run; wait summed over the nodes)
+        c, f = runs["cluster"], runs["forced"]
+        r = results[f"q{i}"] = {"one_node_s": one_s, "cluster_s": c["s"], "how": c["how"], "forced_s": f["s"], "forced_how": f["how"], "same": c["same"] and f["same"],
+                                "wire_mb": c["wire_mb"], "wait_s": c["wait_s"], "forced_wire_mb": f["wire_mb"], "forced_wait_s": f["wait_s"]}
+        print(f"q{i:<3} one node {one_s:>7.2f}s  {len(nodes)} nodes {c['s']:>7.2f}s {c['how']:<9} (spread anyway {f['s']:>7.2f}s {f['how']:<9})  same={r['same']}  "
+              f"sent {c['wire_mb']} MB ({f['wire_mb']} MB), waited {c['wait_s']} s ({f['wait_s']} s)", flush=True)
     total = lambda k: round(sum(r[k] for r in results.values()), 2)
-    out = {"nodes": len(nodes), "lake": A.lake, "data": A.data, "network": net, "load_s": load_s, "one_node_s": total("one_node_s"), "cluster_s": total("cluster_s"),
-           "spread": sum(r["how"] != "one node" for r in results.values()), "all_same": all(r["same"] for r in results.values()),
-           "cpus": os.cpu_count(), "queries": results, "metrics": {n: metrics(n) for n in nodes}}
+    out = {"nodes": len(nodes), "lake": A.lake, "data": A.data, "network": net, "load_s": load_s, "settle_s": settle_s, "one_node_s": total("one_node_s"), "cluster_s": total("cluster_s"),
+           "forced_s": total("forced_s"), "spread": sum(r["how"] != "one node" for r in results.values()), "forced_spread": sum(r["forced_how"] != "one node" for r in results.values()),
+           "all_same": all(r["same"] for r in results.values()), "cpus": os.cpu_count(), "queries": results, "metrics": {n: metrics(n) for n in nodes}}
     out["wire_mb"], out["wait_s"] = round(sum(r["wire_mb"] for r in results.values()), 1), round(sum(r["wait_s"] for r in results.values()), 2)
     json.dump(out, open(A.out, "w"), indent=1)
     print(json.dumps({k: v for k, v in out.items() if k not in ("queries", "metrics")}, indent=1))

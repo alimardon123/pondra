@@ -1,0 +1,39 @@
+{
+ "rows": 4000000,
+ "nodes": 3,
+ "spill_mb": 1,
+ "load_s": 0.9,
+ "one_node_s": 0.4,
+ "spread_s": 1.2,
+ "after_a_node_died_s": 1.7,
+ "spilled_mb": [
+  174.5,
+  278.5
+ ],
+ "left_bytes": [
+  0,
+  0
+ ],
+ "peak_rss_mb": [
+  791,
+  518,
+  368
+ ],
+ "skew": 1.12,
+ "answer": [
+  {
+   "keys": 4000000,
+   "total": 287994492.0
+  }
+ ],
+ "checks": {
+  "the shuffled answer equals the one-node answer": true,
+  "the query shuffled": true,
+  "buckets went to disk": true,
+  "the scratch is empty again": true,
+  "memory stayed under the budget": true,
+  "the buckets came out even": true,
+  "a node dying mid-query doesn't change the answer": true
+ },
+ "ok": true
+}

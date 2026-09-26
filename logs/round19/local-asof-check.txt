@@ -1,0 +1,256 @@
+{
+ "trades": 1000000,
+ "quotes": 200000,
+ "runs": {
+  "quotes whole": {
+   "same_as_duckdb_[one node, spread]": {
+    ">=": [
+     true,
+     true
+    ],
+    ">": [
+     true,
+     true
+    ],
+    "<=": [
+     true,
+     true
+    ],
+    "<": [
+     true,
+     true
+    ],
+    "no key": [
+     true,
+     true
+    ],
+    "small table": [
+     true,
+     true
+    ],
+    "few trades": [
+     true,
+     true
+    ],
+    "filtered after the join": [
+     true,
+     true
+    ]
+   },
+   "joins": {
+    ">=": [
+     "mode=Collected join_type=Left"
+    ],
+    ">": [
+     "mode=Collected join_type=Left"
+    ],
+    "<=": [
+     "mode=Collected join_type=Left"
+    ],
+    "<": [
+     "mode=Collected join_type=Left"
+    ],
+    "no key": [
+     "mode=Collected join_type=Left"
+    ],
+    "small table": [
+     "mode=Collected join_type=Left"
+    ],
+    "few trades": [
+     "mode=Keys join_type=Left"
+    ]
+   },
+   "spread_queries": 8.0,
+   "pondra_one_node_s": 0.334,
+   "pondra_3_nodes_s": 0.35,
+   "duckdb_s": 0.28
+  },
+  "quotes whole, hashed by the key": {
+   "same_as_duckdb_[one node, spread]": {
+    ">=": [
+     true,
+     true
+    ],
+    ">": [
+     true,
+     true
+    ],
+    "<=": [
+     true,
+     true
+    ],
+    "<": [
+     true,
+     true
+    ],
+    "no key": [
+     true,
+     true
+    ],
+    "small table": [
+     true,
+     true
+    ],
+    "few trades": [
+     true,
+     true
+    ],
+    "filtered after the join": [
+     true,
+     true
+    ]
+   },
+   "joins": {
+    ">=": [
+     "mode=Partitioned join_type=Left"
+    ],
+    ">": [
+     "mode=Partitioned join_type=Left"
+    ],
+    "<=": [
+     "mode=Partitioned join_type=Left"
+    ],
+    "<": [
+     "mode=Partitioned join_type=Left"
+    ],
+    "no key": [
+     "mode=Collected join_type=Left"
+    ],
+    "small table": [
+     "mode=Partitioned join_type=Left"
+    ],
+    "few trades": [
+     "mode=Partitioned join_type=Left"
+    ]
+   },
+   "spread_queries": 8.0
+  },
+  "every table sliced, both sides shuffled": {
+   "same_as_duckdb_[one node, spread]": {
+    ">=": [
+     true,
+     true
+    ],
+    ">": [
+     true,
+     true
+    ],
+    "<=": [
+     true,
+     true
+    ],
+    "<": [
+     true,
+     true
+    ],
+    "no key": [
+     true,
+     true
+    ],
+    "small table": [
+     true,
+     true
+    ],
+    "few trades": [
+     true,
+     true
+    ],
+    "filtered after the join": [
+     true,
+     true
+    ]
+   },
+   "joins": {
+    ">=": [
+     "mode=Partitioned join_type=Left"
+    ],
+    ">": [
+     "mode=Partitioned join_type=Left"
+    ],
+    "<=": [
+     "mode=Partitioned join_type=Left"
+    ],
+    "<": [
+     "mode=Partitioned join_type=Left"
+    ],
+    "no key": [
+     "mode=Collected join_type=Left"
+    ],
+    "small table": [
+     "mode=Partitioned join_type=Left"
+    ],
+    "few trades": [
+     "mode=Partitioned join_type=Left"
+    ]
+   },
+   "spread_queries": 8.0
+  },
+  "sort-merge joins preferred": {
+   "same_as_duckdb_[one node, spread]": {
+    ">=": [
+     true,
+     true
+    ],
+    ">": [
+     true,
+     true
+    ],
+    "<=": [
+     true,
+     true
+    ],
+    "<": [
+     true,
+     true
+    ],
+    "no key": [
+     true,
+     true
+    ],
+    "small table": [
+     true,
+     true
+    ],
+    "few trades": [
+     true,
+     true
+    ],
+    "filtered after the join": [
+     true,
+     true
+    ]
+   },
+   "joins": {
+    ">=": [
+     "mode=Partitioned join_type=Left"
+    ],
+    ">": [
+     "mode=Partitioned join_type=Left"
+    ],
+    "<=": [
+     "mode=Partitioned join_type=Left"
+    ],
+    "<": [
+     "mode=Partitioned join_type=Left"
+    ],
+    "no key": [
+     "mode=Collected join_type=Left"
+    ],
+    "small table": [
+     "mode=Partitioned join_type=Left"
+    ],
+    "few trades": [
+     "mode=Partitioned join_type=Left"
+    ]
+   },
+   "spread_queries": 8.0
+  }
+ },
+ "checks": {
+  "one node: every answer equals DuckDB's": true,
+  "across the nodes: every answer equals DuckDB's": true,
+  "the joins ran across the nodes": true,
+  "every way of looking up was used": true
+ },
+ "ok": true
+}

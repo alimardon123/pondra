@@ -1,0 +1,36 @@
+harness-all exit=1 secs=104
+users-1 exit=0 secs=32
+users-2 exit=0 secs=32
+failover-1 exit=0 secs=65
+failover-2 exit=0 secs=66
+failover-3 exit=0 secs=65
+race exit=0 secs=32
+isolate exit=0 secs=18
+spread exit=0 secs=6
+smoke exit=0 secs=1
+latency exit=0 secs=25
+open-check exit=1 secs=13
+asof-check exit=0 secs=30
+skew-check exit=0 secs=4
+shuffle-spill exit=0 secs=62
+stream-check exit=0 secs=21
+freshness exit=0 secs=632
+crash-big exit=0 secs=187
+ALL-DONE
+open-check (again, after the Iceberg name-mapping fix) exit=0
+harness-all (again, after the Iceberg name-mapping fix) exit=1 secs=105
+harness-all (again: Iceberg name mapping, ATTACH makes a lake) exit=0 secs=186
+harness-all (final code) exit=1 secs=97
+open-check (final code) exit=0
+smoke (final code) exit=0
+failover-final-1 exit=1
+harness-all (final code) exit=0 secs=188
+open-check (final code) exit=0
+smoke (final code) exit=0
+failover-final-1 exit=0
+failover-final-2 exit=0
+failover-final-3 exit=0
+users-final exit=0
+spread (final code) exit=0
+stream-check (final code) exit=0
+FINAL-DONE

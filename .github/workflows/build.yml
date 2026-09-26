@@ -22,15 +22,15 @@ jobs:
             bin: target/release/pondra
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
       - run: python tools/smoke.py ${{ matrix.bin }} # (on this OS: the shell, SQL, and memory read without /proc)
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: ${{ matrix.name }}
           path: ${{ matrix.bin }}
@@ -41,13 +41,13 @@ jobs:
     env:
       PONDRA_BIN: ${{ github.workspace }}/bin/pondra
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v7
         with:
           name: pondra-linux-x86_64
           path: bin
       - run: chmod +x bin/pondra
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
       - run: pip install -r tools/requirements.txt

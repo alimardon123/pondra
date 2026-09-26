@@ -1,7 +1,7 @@
 # AGENTS.md — working on Pondra
 
 Read this first, then `README.md` (what it does), `docs/adr-005-every-node-writes.md` (why it
-works this way) and `docs/adr-018-install-anywhere.md` (the current round).
+works this way) and `docs/adr-020-change-any-row.md` (the current round).
 `docs/prototype-status.md` has the measured numbers and what's left.
 
 ## What this is
@@ -18,13 +18,13 @@ The owner's design principles, which every change must respect:
 2. **As serverless as possible**: no always-on services besides the nodes themselves.
 3. **SPMD, not driver/executor** (Bodo-style): every node runs the same code on its slice.
 4. **No JVM, no Spark, no Flink, no Fluss needed.**
-5. **Short, simple, readable code** — without losing functionality. ~13,200 lines of Rust total (the Kafka protocol is 1,300 of them).
+5. **Short, simple, readable code** — without losing functionality. ~15,300 lines of Rust total (the Kafka protocol is 1,300 of them).
    If a change makes a file much longer, look for the simpler shape first.
 
 ## Layout
 
 ```
-src/      13,700 lines of Rust, one file per concern (see the table in README.md)
+src/      15,300 lines of Rust, one file per concern (see the table in README.md)
 python/   the Python client (pure Python, HTTP + Arrow; `local()` starts a node)
 js/       the JavaScript client and the `pondra` npm package's files
 examples/ quickstart.ipynb (pip install to an as-of join, in the owner's notebook style)
@@ -179,6 +179,23 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
 - **`sum` over DOUBLE is order-independent** (`fsum.rs`): it replaces DataFusion's `sum` in every
   session; Float64 sums carry a second double with the rounding errors (state: two columns),
   other types go to DataFusion's.
+- **Rows that change** (round 19, ADR-020, `change.rs`, `sys.rs`). Every row has system columns:
+  `_row_id` (stamped as it enters the log or a bulk INSERT's files, from blocks of ids the leader
+  hands out as commit numbers: `Ids`, `Flush::reserve`), `_version` (its commit), `_created_at`,
+  `_updated_at`; tiering writes them into the files, `SELECT *` hides them (`sys::hide`).
+  `UPDATE`/`DELETE`/`MERGE` on an append table are the leader's, under the lock, from one
+  snapshot, in one commit: new versions (their `_row_id` kept) into `t`, old ones into the hidden
+  `{t}$deleted` (`_version` → `_old_version`); reads anti-join on (`_row_id`, `_version`)
+  (`query::current`). Keyed tables' changes are upserts and delete markers, ids kept. Views take
+  the old rows back (`views::derive`): adding-up views subtract them, row-by-row views carry their
+  source's ids and drop old versions into `{view}$deleted`. `change::feed` is the change feed
+  (`_change_type`, Delta CDF's names). `tier::purge` rewrites files without the old rows (every
+  round for published tables) and moves `TableMeta::purges` on.
+- **Spread only when it pays** (`guard.rs`): a query goes across the nodes when what its plan
+  would move (DataFusion's estimates at each exchange), at the slowest link's measured speed, plus
+  a few round trips a step, costs less than what it saves on one node (the time it took here when
+  last asked, else its tables' bytes at this node's rate). Nothing known yet: it runs here.
+  `?spread=1` forces; `PONDRA_LINK=ms,MB/s` states a network.
 - **Memory:** one spill pool per node (`--memory-gb`); a query out of memory runs again with
   sort-merge joins. **`GET /metrics`** (Prometheus) for everything else.
 
@@ -408,6 +425,50 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    by this lake's alone, a query over an attached lake kept its answer after a write there or a
    `DETACH` (`harness.py schemas`' `ATTACH` check failed on one node without it).
 
+55. **A changed row keeps its `_row_id`, and its old version leaves in the same commit**
+   (`change::commit`): the new versions go into the table, the old ones into `{t}$deleted`, in
+   one flush, and every read leaves out the (`_row_id`, `_version`) pairs that table holds. Ids
+   are never reused: a block is a commit number the leader reserved (`Flush::reserve`), so no
+   segment ever has it. `harness.py changes`: "an UPDATE or MERGE keeps a row's _row_id; ids are
+   unique".
+56. **A change is the leader's, under the lake's lock, from one snapshot** (`change::run`: every
+   query of it `session_at(upto)`). Two nodes changing the same rows at once would each start
+   from the other's old version. `harness.py changes`: "three nodes changing the same rows at
+   once: every change counts".
+57. **What follows a table follows its changes, or the change is refused** (`views::can_follow`,
+   `views::derive`). A view that adds up subtracts the old rows (and needs a count, so a group a
+   change empties goes); a row-by-row view over the table alone carries each source row's
+   `_row_id` and `_created_at` (`View::ids`, `carry`) and drops its rows of old versions into
+   `{view}$deleted`. Windows and sessions emitted once, min/max, joins and tasks can't take a row
+   back: refused. `harness.py changes`: the view checks and "refused: …".
+58. **A purge covers only changes whose old rows are in files, and a read skips only what the
+   entry it read says is purged** (`tier::purge`: up to both tables' `tiered`; `TableMeta::purges`;
+   a slice gets the coordinator's mark, `Part::purged`). A `{t}$deleted` file goes only once every
+   reader has passed the purge that covered it (`retain_ms`). `harness.py changes` purges every
+   round (`PONDRA_PURGE_ROWS=1`) while it changes rows: "== the model, every node, while tiering
+   and purging".
+59. **A changed table's `{t}$deleted` is read as of the query's snapshot** (`Pruned::at`), also in
+   a slice of a spread query that reads none of the table's log (`upto` 0): its files hold rows
+   changed since. Read as of the slice's `upto`, a spread query counted deleted rows and both
+   versions of updated ones (`harness.py changes`: "spread over three nodes == one node"). Every
+   slice waits for its node to see the coordinator's snapshot first.
+60. **A query spreads only when it pays, unless asked to** (`guard.rs`). A node that knows nothing
+   about a query yet runs it itself, and learns from it. `harness.py guard`: "over a slow
+   network, queries that would shuffle stay on one node", "over a fast one, they spread", "?spread=1 spreads anyway".
+61. **Only the program that started a node reads files through it** (`server::owner`: the key in
+   `PONDRA_OWNER_KEY`, which the shell and `local()` make and send). Invariant 21 holds for
+   everyone else. `smoke.py`: "the shell reads a file on this machine…" and "a node doesn't read
+   this machine's files for whoever asks".
+62. **A node never leads another lake in its own process** (`inbox::lead_once`): a write to an
+   attached lake nobody leads, `CREATE DATABASE` and `ATTACH` of a new folder go through a `pondra
+   sql` of their own, which leads for a moment and ends. That lake's catalog writer would
+   otherwise stay open in the node, and its next leader would fence it. (No test catches the
+   stray writer yet; `smoke.py`'s `CREATE DATABASE` and `harness.py changes` run the path.)
+63. **DataFusion settings that have their own switches are changed through `set`**
+   (`enable_dynamic_filter_pushdown`): assigning the umbrella field left the joins' own switch on,
+   and a changed table's anti-join, planned with its dynamic filter built, failed when the query
+   around it swapped its sides (`harness.py changes`' spread query fell back to one node).
+
 ## Tests: run these before and after any change
 
 ```bash
@@ -428,6 +489,8 @@ python3 tools/harness.py sessions              # session windows emitted once, w
 python3 tools/harness.py asof                  # ASOF JOIN over a stream (a view), ad hoc, over Postgres; refusals
 python3 tools/harness.py sums                  # sum(DOUBLE) == math.fsum, whole, grouped, windowed, on every node
 python3 tools/harness.py schemas               # schemas, three-part names, attached lakes, DDL, stored and materialized views, drops
+python3 tools/harness.py changes               # UPDATE/DELETE/MERGE vs a model on 3 nodes: row ids, views, change feed, purges, Delta, spread
+python3 tools/harness.py guard                 # a query spreads only when it pays (PONDRA_LINK: a slow link keeps it on one node)
 python3 tools/smoke.py target/release/pondra   # what CI runs on Windows, macOS and Linux (stdlib only)
 python3 tools/anywhere_check.py --bin <pondra> --dist dist [--docker]   # shell, local(), kill -9, wheel, npm, notebook; glibc 2.17 + Ubuntu 22.04
 python3 tools/bench/repeat.py --data ~/tpch/sf1-bench --query 15 --runs 20 [--hot]   # one query many times vs DuckDB
@@ -491,13 +554,13 @@ Practical notes for an agent working here:
 - Node stderr goes to `/tmp/pondra-<port>-<id>.stderr`; that's where "restarting to rejoin",
   "slow tiering" and panics show up.
 
-## State of the work (2026-09-28, round 18)
+## State of the work (2026-09-26, round 19)
 
 Everything in `docs/prototype-status.md` passes on local disk and on simulated R2. The round-11
 additions (manifests, partitions, shuffles, memory limits, Arrow Flight) also ran against real
 R2; round 12's are in `logs/round12/`, round 13's in `logs/round13/`, round 14's in
-`logs/round14/`, round 15's in `logs/round15/`, round 16's in `logs/round16/`, round 17's in `logs/round17/`
-and round 18's in `logs/round18/`.
+`logs/round14/`, round 15's in `logs/round15/`, round 16's in `logs/round16/`, round 17's in `logs/round17/`,
+round 18's in `logs/round18/` and round 19's in `logs/round19/`.
 
 **R2 test buckets.** There are two:
 
@@ -527,10 +590,12 @@ the public internet through Tailscale: 17–54 ms round trips, 51–150 MB/s. Th
 move under 1 MB between nodes take about what one node does (9.8 s against 10.7 s); the twelve
 that shuffle move 936 MB and take 36.0 s against 13.3 s: about 0.7 s plus 15 ms per MB (about
 68 MB/s). So on this network a shuffle costs more than it saves, and even picking the faster way
-per query would give 22.4 s against one node's 23.1 s. Next: spread a query only when the bytes
-it would move, at the network's measured speed, cost less than the work it shares out (so a
-cluster is never slower than one node), then measure scale-out where machines share a data
-centre (the owner's Google Cloud trial: one zone, well under 1 ms, 1–2 GB/s).
+per query would give 22.4 s against one node's 23.1 s. Round 19 made that the rule (`guard.rs`,
+invariant 60): a query spreads only when the bytes it would move, at the measured speed of the
+slowest link, cost less than the work it shares out. `driver.py` now waits for a settled lake and
+times each query on one node, as the cluster decides, and spread anyway. Next: that run on round
+19's code, then scale-out where machines share a data centre (the owner's Google Cloud trial: one
+zone, well under 1 ms, 1–2 GB/s).
 
 **Where the multi-machine run will happen (the owner's plan, 2026-09-23).** The owner has no VMs
 of their own. They will run the multi-machine tests themselves, later, on one of:
@@ -541,8 +606,8 @@ of their own. They will run the multi-machine tests themselves, later, on one of
   unlimited, while the binary stays in R2 and the source stays private. Jobs last at most 6 hours;
   runners have 14 GB of disk (SF10 fits, SF100 doesn't) and are shared, so compare shapes (1 → 3 →
   6 nodes), not headline numbers. `.github/workflows/cluster-bench.yml` and `tools/cloud/actions/`
-  are the workflow; `bench-bin/pondra` in `ponderabucket-us` holds the round-17 portable binary
-  (Linux x86-64, glibc 2.17) for its `binary: r2` input. Rebuild and re-upload it when the code
+  are the workflow; `bench-bin/pondra` in `ponderabucket-us` holds the portable binary
+  (Linux x86-64, glibc 2.17) for its `binary: r2` input (round 19's since this round). Rebuild and re-upload it when the code
   changes, and read results from `bench-results/<run id>/results.json`.
 - **A Google Cloud VM trial** ($300 for 90 days, no charge unless they upgrade) for dedicated
   machines, SF100 and Spark on the same VMs, with `tools/cloud/cluster.sh`.
@@ -555,6 +620,12 @@ links a session to their computer, an agent can drive VMs from there instead.
 
 Headline numbers, all on one 2-vCPU box:
 
+- **Change any row** (round 19, ADR-020): `UPDATE`/`DELETE`/`MERGE` on every table, system
+  columns (`_row_id`, `_version`, `_created_at`, `_updated_at`), views and a Delta-style change
+  feed that follow every change, purges so Delta and Iceberg see it. On 10 M rows: an UPDATE of
+  100,000 rows 0.26 s, a MERGE of 100,000 0.9–1.2 s; a scan 0.07 s unchanged, 0.08 s with a row
+  changed, 0.17 s with 1% changed in every file until the purge (2.6 s). A query spreads only when
+  it pays. `CREATE DATABASE`, `CHECKPOINT`, `ALTER TABLE … SET`, local files in the shell.
 - **A database you can shape** (round 18, ADR-019): schemas and `lake.schema.table`, other lakes
   attached in SQL (`ATTACH … AS …`) and queried and written across, `CREATE`/`DROP SCHEMA`, `DROP TABLE`, CTAS, stored views that spread over
   the nodes, `CREATE MATERIALIZED VIEW`; the schemas listed over Postgres, Flight SQL, Iceberg
@@ -600,53 +671,55 @@ item, with what each is building next and the plan for the gaps — is
 
 Known limits, in the order they matter:
 
-1. **No multi-machine run yet.** `.github/workflows/cluster-bench.yml` (GitHub runners +
-   Tailscale + R2, results in `bench-results/`) and `tools/cloud/` (`cluster.sh` over ssh,
-   `bench.py` from a client VM) are the kits; the owner starts them.
-2. **Distributed edges:** a `LIMIT` inside a subquery over sliced data and order-preserving
+1. **Multi-machine runs only over the internet so far** (GitHub's runners, where a shuffle costs
+   more than it saves: the guard keeps such queries on one node). `.github/workflows/cluster-bench.yml`
+   and `tools/cloud/` are the kits; the owner starts them.
+2. **What follows a table and can't take a row back** (windows emitted once, min/max views, views
+   over joins, streaming tasks) makes a change of it refused; Kafka consumers see an UPDATE's new
+   rows, not its deletes; a purge rewrites whole files (no deletion vectors yet); `ALTER TABLE`
+   renames and drops need column ids (round 20).
+3. **Distributed edges:** a `LIMIT` inside a subquery over sliced data and order-preserving
    shuffles run on one node; a join with a hot key on both sides shares out only one side; key
    ranges are found from the files, not declared (a table written out of order isn't sliced by
    them); a query's own answer still passes through the coordinator's memory once.
-3. **Join order is only as good as its statistics.** Distinct values come from per-table
+4. **Join order is only as good as its statistics.** Distinct values come from per-table
    sketches (about 6% off; rows deleted from keyed tables stay counted), and the order the query
    wrote is the baseline to beat. Declaring files' order to DataFusion made TPC-H slower (round
    15), so an aggregation on a sorted key still hashes.
-4. **Replicated acks' window.** An acked write survives any one node dying (with `--fsync`,
+5. **Replicated acks' window.** An acked write survives any one node dying (with `--fsync`,
    followers' power loss too), but not the leader and every holder dying before the bucket has
    it.
-5. **One sequencer per lake** orders commits. Attached lakes split the load across leaders, but
+6. **One sequencer per lake** orders commits. Attached lakes split the load across leaders, but
    there are no transactions across lakes.
-6. **Memory is bounded by budgets, not by accounting.** What DataFusion counts is the big hash
+7. **Memory is bounded by budgets, not by accounting.** What DataFusion counts is the big hash
    tables and sort buffers; Parquet decoding and the batches in flight are not counted, so the
    query budget defaults to a third of RAM and the hot columns watch the process's own memory.
-7. **Kafka's edges:** one partition per topic, no transactions, sparse offsets, consumer groups
+8. **Kafka's edges:** one partition per topic, no transactions, sparse offsets, consumer groups
    in the leader's memory.
-8. **Streaming:** one watermark per source (not per partition or node), held by a quiet source;
+9. **Streaming:** one watermark per source (not per partition or node), held by a quiet source;
    no sliding windows, timers or CEP; an as-of join in a view joins what the table has when the
    event arrives (Flink's temporal join waits for the table's watermark); keyed tables keep only
    their latest row, so as-of joins need a table's history kept as rows.
-9. **Security:** tokens per role only; no TLS (use a proxy), no per-table grants or quotas.
-10. **`VARIANT` is JSON text**, not a shredded variant; `ai_*` and Flight functions call out of
+10. **Security:** tokens per role only; no TLS (use a proxy), no per-table grants or quotas.
+11. **`VARIANT` is JSON text**, not a shredded variant; `ai_*` and Flight functions call out of
     the process, so their latency is the endpoint's.
-11. **Packages built, not published.** PyPI and npm names and the repository's visibility are
+12. **Packages built, not published.** PyPI and npm names and the repository's visibility are
     the owner's call; the macOS, Windows and ARM Linux builds exist only in the release
     workflow, which hasn't run yet. Only `sum` over DOUBLE is order-independent (not `avg`,
     `stddev`, …).
 
-Good next moves: `docs/roadmap.md` (2026-09-28, after round 18) is the plan, with the reasons.
-Rounds 17 (install anywhere) and 18 (a database you can shape) are done except what needs the
-owner: publishing the packages, and a cluster-bench run that completes. In short:
+Good next moves: `docs/roadmap.md` (2026-09-26, after round 19) is the plan, with the reasons.
+Rounds 17–19 are done except what needs the owner: publishing the packages, and cluster-bench
+runs. In short:
 
-1. **Round 19, change any row (the owner's request):** `UPDATE`, `DELETE` and `MERGE` on append
-   tables too, with system columns — a row id assigned at commit (Iceberg v3's row lineage is
-   the model), the commit time, a version — and streaming following every change (views, the
-   change feed, Kafka consumers, Delta and Iceberg readers). Design first: an ADR before code.
-   Also: materialized views filled from the rows already there.
-2. **The cluster bench:** once the owner reruns `cluster-bench.yml` with 3 nodes on round 18's
-   code (`bench-bin/pondra` holds it), read `wire_mb`, `wait_s` and `network` in
-   `bench-results/<run id>/results.json` before changing how queries spread; then 6 nodes.
+1. **Round 20, shape it further:** the rest of `ALTER TABLE` (rename a table, rename and drop
+   columns, widen types) on column ids the files carry (Iceberg's field ids) — the owner asked;
+   design first, an ADR before code. Also: materialized views filled from the rows already there.
+2. **The cluster bench:** once the owner reruns `cluster-bench.yml` with 3 nodes on round 19's
+   code (`bench-bin/pondra` holds it), compare `cluster_s` (the guard) with `one_node_s` and
+   `forced_s` in `bench-results/<run id>/results.json`; then machines in one data centre.
 3. **Publish:** once the owner reserves `pondra` on PyPI and npm and picks a license, tag
-   `v0.18.0` and let `.github/workflows/release.yml` build, try and publish.
+   `v0.19.0` and let `.github/workflows/release.yml` build, try and publish.
 4. **Then:** proof at scale (TPC-H SF10 on 1/3/6 machines, Nexmark, sqllogictest), a web console
    and live queries, the in-process module, TLS and grants, the browser (roadmap rounds 20–24).
 

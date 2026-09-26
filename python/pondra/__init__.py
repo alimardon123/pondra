@@ -27,7 +27,7 @@ import urllib.parse
 import urllib.request
 import uuid
 
-__version__ = "0.18.0"
+__version__ = "0.19.0"
 __all__ = ["connect", "local", "Pondra", "Result"]
 
 
@@ -65,6 +65,8 @@ class Pondra:
         h = dict(headers or {})
         if self.token:
             h["Authorization"] = f"Bearer {self.token}"
+        if getattr(self, "owner", None):
+            h["x-pondra-owner"] = self.owner  # (the node `local()` started: its SQL may read files here)
         req = urllib.request.Request(self.url + path, data=body if method == "POST" else None, headers=h, method=method)
         try:
             r = self._open(req, timeout=None if stream else self.timeout)
@@ -104,11 +106,13 @@ class Pondra:
         rows = json.loads(self._call("GET", f"/lookup/{table}/{key}"))
         return rows[0] if rows else None
 
-    def watch(self, table, after=None):
+    def watch(self, table, after=None, changes=False):
         """New rows of a table as they commit (for keyed tables, every upsert and delete). With
         `after`, a replay from that point first (as far back as the node keeps its change feed).
+        With `changes`, every change: UPDATE's and DELETE's too, each row with its `_change_type`
+        (insert, update_preimage, update_postimage, delete), `_row_id` and `_version`.
         Each yielded row is a dict; `self.position` is where to resume."""
-        path = f"/watch/{table}?marks=true" + (f"&after={after}" if after is not None else "")
+        path = f"/watch/{table}?marks=true" + (f"&after={after}" if after is not None else "") + ("&changes=true" if changes else "")
         for line in self._call("GET", path, stream=True):
             row = json.loads(line)
             if "_after" in row and len(row) == 1:
@@ -141,17 +145,18 @@ def connect(url="http://127.0.0.1:8080", token=None, **kw):
 
 def local(dir="lake", port=None, token=None, flags=(), timeout=120):
     """Start a node on a lake here — a folder, or s3://bucket/prefix — and connect to it. It stops
-    when Python exits, or with `close()`; the lake stays. `flags`: more `pondra serve` options,
-    such as `["--memory-gb", "2"]`."""
-    port = port or _free_port()
+    when Python exits, or with `close()`; the lake stays. Its SQL may read files on this machine
+    (`SELECT * FROM 'jan.csv'`), as DuckDB's may. `flags`: more `pondra serve` options, such as
+    `["--memory-gb", "2"]`."""
+    port, owner = port or _free_port(), uuid.uuid4().hex
     if "://" not in dir:
         os.makedirs(dir, exist_ok=True)
     log = os.path.join(tempfile.gettempdir(), f"pondra-{port}.log")
     with open(log, "ab") as err:
         args = [binary(), "serve", "--dir", dir, "--addr", f"127.0.0.1:{port}", "--stop-with-stdin", *flags]
-        proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=err)
+        proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=err, env={**os.environ, "PONDRA_OWNER_KEY": owner})
     db = Pondra(f"http://127.0.0.1:{port}", token)
-    db.process, deadline = proc, time.time() + timeout
+    db.process, db.owner, deadline = proc, owner, time.time() + timeout
     while True:
         try:
             db._call("GET", "/stats")

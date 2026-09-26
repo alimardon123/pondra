@@ -210,7 +210,7 @@ async fn metadata(app: &App, me: &Broker, ver: i16, r: &mut Rd) -> Result<Vec<u8
         -1 => None, // all topics
         n => Some((0..n).map(|_| r.str()).collect::<Result<_>>()?),
     };
-    let tables: Vec<String> = app.lake.cat.scan::<TableMeta>("t/", "t0").await?.into_iter().map(|(k, _)| k[2..].to_string()).collect();
+    let tables: Vec<String> = app.lake.cat.scan::<TableMeta>("t/", "t0").await?.into_iter().map(|(k, _)| k[2..].to_string()).filter(|t| !crate::sys::hidden(t)).collect();
     let topics: Vec<(String, bool)> = match asked {
         None => tables.into_iter().map(|t| (t, true)).collect(),
         Some(names) => names.into_iter().map(|n| (n.clone(), tables.contains(&n))).collect(),

@@ -47,9 +47,18 @@ pub struct TableMeta {
     pub partition: Option<String>, // append tables: every file holds one value of this ("col", "day(col)", "hour(col)", "month(col)")
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub sketch: BTreeMap<String, String>, // append tables: each key-like column's distinct values, sketched (`sketch.rs`)
+    #[serde(default)]
+    pub ids: bool, // every row has its system columns (`sys.rs`): tables made from round 19 on
+    #[serde(default)]
+    pub changed: bool, // append tables: UPDATE, DELETE or MERGE has replaced rows (`{t}$deleted` holds the old ones)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub purges: Vec<(u64, u64)>, // changed tables: (commit, when): the old rows of every change up to it are out of the files (`tier::purge`)
 }
 
 impl TableMeta {
+    /// The changes whose old rows are out of the table's files: reads skip their `{t}$deleted` rows.
+    pub fn purged(&self) -> u64 { self.purges.last().map_or(0, |p| p.0) }
+
     /// The TTL as a SQL condition that keeps live rows ("" if none).
     pub fn ttl_sql(&self) -> String {
         self.ttl.as_ref().map(|(c, s)| format!("\"{c}\" >= now() - INTERVAL '{s} seconds'")).unwrap_or_default()
@@ -76,6 +85,9 @@ pub struct DataFile {
     /// Partitioned tables: the one partition value this file holds.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub part: String,
+    /// Its rows carry their system columns (`sys.rs`); files written before round 19 don't.
+    #[serde(default)]
+    pub sys: bool,
     /// Append tables: the columns (of those with `stats`) that hold a NULL. None: not known (files
     /// written before round 15).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -156,6 +168,7 @@ pub struct Lake {
     pub groups: crate::serve::Groups,          // decoded row groups for key lookups
     pub hot: Arc<crate::hot::Hot>,             // decoded columns of files queries read lately
     pub attached: std::sync::RwLock<Vec<(String, Arc<Lake>)>>, // other lakes, read as `name.table` (`--attach`)
+    pub ids: crate::sys::Ids, // the row ids this process stamps rows with (a block reserved from the leader)
     me: std::sync::Weak<Lake>,
 }
 
@@ -237,7 +250,7 @@ impl Lake {
         let cache = ObjectStoreCacheOptions { root_folder: cache, max_cache_size_bytes: Some(2 << 30), cache_on_flush: true, cache_on_compaction: true, ..Default::default() };
         let cat = if writer { Catalog::writer(store.clone(), cache).await? } else { Catalog::reader(store.clone(), streamed, cache).await? };
         let hwm = watch::Sender::new(cat.get::<u64>("n").await?.unwrap_or(1) - 1);
-        let lake = Arc::new_cyclic(|me| Lake { url, store, cat, hwm, backlog: Default::default(), rt, tail: Mutex::new((lru::LruCache::unbounded(), 0)), disk, groups: crate::serve::Groups::new(cache_mb() << 19), hot: Arc::new(crate::hot::Hot::new()), attached: Default::default(), me: me.clone() });
+        let lake = Arc::new_cyclic(|me| Lake { url, store, cat, hwm, backlog: Default::default(), rt, tail: Mutex::new((lru::LruCache::unbounded(), 0)), disk, groups: crate::serve::Groups::new(cache_mb() << 19), hot: Arc::new(crate::hot::Hot::new()), attached: Default::default(), ids: Default::default(), me: me.clone() });
         lake.hot.watch(); // the decoded columns give memory back when the node needs it
         if let Some(writes) = lake.cat.unstarted.lock().unwrap().take() {
             tokio::spawn(lake.clone().commits(writes));
@@ -482,7 +495,9 @@ impl Lake {
         };
         let mut rows = vec![];
         for &(off, len, _) in parts {
-            rows.extend(crate::log::decode(&bytes[off as usize..(off + len) as usize])?);
+            for b in crate::log::decode(&bytes[off as usize..(off + len) as usize])? {
+                rows.push(crate::sys::expand(b)?); // (fresh row ids: one number in the log)
+            }
         }
         let rows: Rows = Arc::new(rows);
         let size = rows.iter().map(|b| b.get_array_memory_size()).sum::<usize>();

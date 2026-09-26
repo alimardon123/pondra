@@ -359,7 +359,7 @@ impl FlightSqlService for Sql {
     async fn do_get_tables(&self, q: CommandGetTables, req: Request<Ticket>) -> Result<Response<Out<FlightData>>, Status> {
         allowed(&self.0, &req, Role::Read)?;
         let (mut b, lake) = (q.into_builder(), &self.0.lake);
-        for (key, meta) in lake.cat.scan::<TableMeta>("t/", "t0").await.map_err(status)? {
+        for (key, meta) in lake.cat.scan::<TableMeta>("t/", "t0").await.map_err(status)?.into_iter().filter(|(k, _)| !crate::sys::hidden(k)) {
             let (schema, table) = crate::ddl::split(&key[2..]);
             let columns = crate::query::schema(&meta.columns).map_err(status)?;
             b.append(crate::ddl::lake_name(lake), schema, table, "TABLE", &columns).map_err(status)?;
@@ -396,7 +396,7 @@ impl FlightService for Door {
         let app = &self.0 .0;
         allowed(app, &req, Role::Read)?;
         let mut infos = vec![];
-        for (key, meta) in app.lake.cat.scan::<TableMeta>("t/", "t0").await.map_err(status)? {
+        for (key, meta) in app.lake.cat.scan::<TableMeta>("t/", "t0").await.map_err(status)?.into_iter().filter(|(k, _)| !crate::sys::hidden(k)) {
             let table = &key[2..];
             let ticket = serde_json::json!({"sql": format!("SELECT * FROM {}", crate::write::sql_name(table))}).to_string();
             let schema = crate::query::schema(&meta.columns).map_err(status)?;

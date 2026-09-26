@@ -1,6 +1,6 @@
 # Prototype status: Pondra, a streamhouse in one binary
 
-**Date:** 2026-09-28 (round 18) · **Plan:** ADR-002 to ADR-019, `roadmap.md` · **Code:** `pondra.zip` / `pondra.bundle` (≈13,700 lines of Rust, plus Python and JavaScript clients, packaging, and test and benchmark tools)
+**Date:** 2026-09-26 (round 19) · **Plan:** ADR-002 to ADR-020, `roadmap.md` · **Code:** `pondra.zip` / `pondra.bundle` (≈15,400 lines of Rust, plus Python and JavaScript clients, packaging, and test and benchmark tools)
 **Name:** the prototype formerly called `lh` is now **Pondra**. The name is free on crates.io, PyPI and npm. A small personal-finance app uses it (pondra.app), a different category; run a trademark search before a public launch.
 
 ## Where it stands
@@ -14,6 +14,50 @@ One Rust binary replaces the Kafka + Flink + Spark + metastore + ZooKeeper stack
 - upsert and merge tables.
 
 Start more copies on the same bucket to scale out. The only state is object storage. There's no JVM, no database server and no coordination service.
+
+**Round 19 made every row changeable** (ADR-020), the owner's request, and kept a cluster from
+being slower than one node:
+
+1. **`UPDATE`, `DELETE` and `MERGE` on every table**, from any node, Postgres, `pondra sql` or the
+   shell. On an append table a row changes by version: the new one goes in like any row, the old
+   one into the hidden `{t}$deleted`, and every read leaves it out; nothing is rewritten when a row
+   changes. The leader carries a change out from one snapshot, in one commit, exactly once per
+   job id. `MERGE` takes `WHEN MATCHED [AND …]`, `WHEN NOT MATCHED`, `WHEN NOT MATCHED BY SOURCE`,
+   and refuses a row that two source rows match.
+2. **System columns on every row:** `_row_id` (kept through an UPDATE or MERGE; ids handed out in
+   blocks, so no one coordinates per row), `_version` (the commit), `_created_at`, `_updated_at`.
+   `SELECT _row_id, * FROM t`; `SELECT *` leaves them out. Ingest costs what it did (the log
+   keeps a batch's fresh ids as one number); tiering writes the four columns, about half again
+   the CPU per row, into files 2.5% bigger (`logs/round19/ingest-and-tiering.txt`).
+3. **Streaming follows every change.** Views that add up subtract the old rows (a group a change
+   empties goes); row-by-row views carry their source rows' ids and change as their source does.
+   `/watch/{t}?changes=true` and MCP's `changes` give Delta-style change rows (`insert`,
+   `update_preimage`, `update_postimage`, `delete`). A view that can't take a row back (windows
+   emitted once, min/max, joins) makes a change refuse, with the reason.
+4. **Purges** rewrite the files holding changed rows without them: every round for published
+   tables, so Delta and Iceberg readers see the change; otherwise once 100,000 changed rows wait,
+   or `CHECKPOINT`. On 10 M rows: an UPDATE of 100,000 rows 0.26 s, a MERGE of 100,000 0.9–1.2 s;
+   a scan 0.07 s unchanged, 0.08 s with a row changed, 0.17 s with 1% changed in every file until
+   the purge (2.6 s), 0.07 s after.
+5. **A query spreads only when it pays** (`guard.rs`): what its plan would move, at the measured
+   speed of the slowest link, against what it saves on one node. By the last cluster bench's own
+   numbers, the twelve TPC-H queries that shuffled (about 78 MB each over 50–150 MB/s, against
+   under a second saved) would stay on one node; the next run measures it. `?spread=1` still
+   forces a spread.
+   The cluster bench now waits for a settled lake and times each query three ways.
+6. **From the owner's second Windows session:** `CREATE DATABASE`, `ATTACH` of an empty folder
+   (a new lake), the lake named after its folder on Windows (`mylake.dbo.t`), the shell reading
+   local files (`SELECT * FROM 'D:\…\x.csv'`, `MERGE … USING 'new.csv'`), `CHECKPOINT`, and `ALTER
+   TABLE … SET (publish, cluster_by, ttl)`. Found on the way: a spread query over a changed table
+   read the changes as of the slice, not the query (fixed, invariant 59), and a DataFusion switch
+   set the wrong way left joins' dynamic filters on inside shuffles (invariant 63).
+7. **Tests** (`logs/round19/`): the local suite (`harness.py all` with the new `changes` and
+   `guard`, `open_check`, failover ×3, users, race, isolate, spread, latency, `asof_check`,
+   `skew_check`, `shuffle_spill`, `stream_check`, freshness, the big crash run, `smoke`), 9 tests
+   on simulated R2 (`changes`, `schemas`, failover and users with replicated acks, the crash run
+   among them) and `changes`, `schemas` and `guard` on real R2 all pass. On R2, `changes` needed
+   a longer statement timeout: a change waits for a tiering round in progress, which with a purge
+   every round took over 30 s once (ADR-020, "What is still open").
 
 **Round 18 made it a database you can shape** (ADR-019), from the owner's first session on
 Windows:

@@ -14,18 +14,22 @@ pub async fn run(dir: &str) -> Result<()> {
     }
     let port = std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
     let log = std::env::temp_dir().join(format!("pondra-shell-{port}.log"));
+    // (a key only this shell knows: with it, the node lets its SQL read files on this machine,
+    // `FROM 'D:\data\jan.csv'`, as DuckDB's shell does)
+    let key = uuid::Uuid::new_v4().to_string();
     let mut node = Command::new(std::env::current_exe()?)
         .args(["serve", "--dir", dir, "--addr", &format!("127.0.0.1:{port}"), "--stop-with-stdin"])
+        .env("PONDRA_OWNER_KEY", &key)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(std::fs::File::create(&log)?)
         .spawn()?;
-    let r = session(dir, &format!("http://127.0.0.1:{port}"), &mut node, &log).await;
+    let r = session(dir, &format!("http://127.0.0.1:{port}"), &key, &mut node, &log).await;
     stop(&mut node); // (whatever happened: the node never outlives the shell)
     r
 }
 
-async fn session(dir: &str, base: &str, node: &mut Child, log: &Path) -> Result<()> {
+async fn session(dir: &str, base: &str, key: &str, node: &mut Child, log: &Path) -> Result<()> {
     // Only ever this machine's own node, over plain HTTP: never through a proxy the environment
     // names (it couldn't reach the node), and no CA certificates needed (minimal images have none).
     let (http, started) = (reqwest::Client::builder().no_proxy().tls_certs_only([]).build()?, Instant::now());
@@ -50,7 +54,8 @@ async fn session(dir: &str, base: &str, node: &mut Child, log: &Path) -> Result<
         match (sql.is_empty(), line.trim()) {
             (true, ".quit" | ".exit" | "\\q") => break,
             (true, ".databases") => line = "SELECT DISTINCT catalog_name AS database FROM information_schema.schemata ORDER BY 1;".into(),
-            (true, ".tables") => line = "SELECT table_catalog AS lake, table_schema AS schema, table_name AS name, table_type AS kind FROM information_schema.tables WHERE table_schema <> 'information_schema' ORDER BY 1, 2, 3;".into(),
+            // (an attached lake's tables are also this lake's schema of its name, so `l2.t` works: listed once)
+            (true, ".tables") => line = "SELECT table_catalog AS lake, table_schema AS schema, table_name AS name, table_type AS kind FROM information_schema.tables WHERE table_schema <> 'information_schema' AND table_schema NOT IN (SELECT catalog_name FROM information_schema.schemata) ORDER BY 1, 2, 3;".into(),
             _ => {}
         }
         sql.push_str(&line);
@@ -58,7 +63,7 @@ async fn session(dir: &str, base: &str, node: &mut Child, log: &Path) -> Result<
         sql = rest;
         for statement in statements.iter().filter(|s| !s.trim().is_empty()) {
             let at = Instant::now();
-            let answer = match http.post(format!("{base}/sql?format=table")).body(statement.trim().to_string()).send().await {
+            let answer = match http.post(format!("{base}/sql?format=table")).header("x-pondra-owner", key).body(statement.trim().to_string()).send().await {
                 Ok(r) => Ok((r.status().is_success(), r.text().await.unwrap_or_default())),
                 Err(_) if node.try_wait()?.is_some() => bail!("the node stopped: {}", std::fs::read_to_string(log).unwrap_or_default()),
                 Err(e) => Err(e),

@@ -6,7 +6,7 @@ machine's memory and its own (on Windows and macOS there is no /proc to read the
   python3 tools/smoke.py path/to/pondra[.exe]
 
 Only the standard library: the build machines have Python but nothing installed for it."""
-import json, os, subprocess, sys, tempfile, time, urllib.request
+import json, os, subprocess, sys, tempfile, time, urllib.error, urllib.request
 
 BIN = os.path.abspath(sys.argv[1] if len(sys.argv) > 1 else "target/release/pondra")
 direct = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # (this machine's own node: never a proxy)
@@ -19,9 +19,14 @@ def call(port, path, body=None):
 
 def main():
     checks, work = {}, tempfile.mkdtemp(prefix="pondra-smoke-")
-    shell = subprocess.run([BIN, os.path.join(work, "shell")], input="CREATE SCHEMA s;\nCREATE TABLE s.t (x BIGINT);\nINSERT INTO s.t VALUES (1), (2);\nSELECT sum(x) AS total FROM s.t;\n",
+    csv = os.path.join(work, "AMEX_SPY, 1(1).csv")  # (a name as downloads get them: a space, a comma, brackets)
+    with open(csv, "w") as f:
+        f.write("id,price\n1,10.5\n2,20.25\n3,7\n4,1\n")
+    shell = subprocess.run([BIN, os.path.join(work, "shell")], input="CREATE SCHEMA s;\nCREATE TABLE s.t (x BIGINT);\nINSERT INTO s.t VALUES (1), (2);\nSELECT sum(x) AS total FROM s.t;\n"
+                           f"SELECT count(*) AS rows_in_file FROM '{csv}';\nCREATE DATABASE other;\nCREATE TABLE other.p AS SELECT * FROM '{csv}';\nSELECT count(*) AS n FROM other.p;\n",
                            capture_output=True, text=True, timeout=180)
     checks["the shell runs statements from its input"] = "| 3 " in shell.stdout
+    checks["the shell reads a file on this machine; CREATE DATABASE makes another lake"] = "| 4 " in shell.stdout and shell.stdout.count("| 4 ") == 2
     port = 8099
     log = open(os.path.join(work, "node.log"), "w")
     node = subprocess.Popen([BIN, "serve", "--dir", os.path.join(work, "lake"), "--addr", f"127.0.0.1:{port}"], stdout=subprocess.DEVNULL, stderr=log)
@@ -37,6 +42,15 @@ def main():
                   "CREATE VIEW big AS SELECT * FROM sales.orders WHERE amount > 3"):
             sql(s)
         checks["SQL: a schema, a table in it, a view"] = sql("SELECT count(*) AS n FROM big") == [{"n": 1}] and sql("SELECT sum(amount) AS s FROM sales.orders") == [{"s": 6.5}]
+        checks["the lake is named after its folder (lake.schema.table), on Windows too"] = sql("SELECT count(*) AS n FROM lake.sales.orders") == [{"n": 2}]
+        try:
+            sql(f"SELECT count(*) AS n FROM '{csv}'")
+            refused = False
+        except urllib.error.HTTPError:
+            refused = True
+        checks["a node doesn't read this machine's files for whoever asks"] = refused
+        sql("UPDATE sales.orders SET amount = amount * 2 WHERE id = 1")
+        checks["UPDATE: the new version, the same row"] = sql("SELECT sum(amount) AS s, count(DISTINCT _row_id) AS ids FROM sales.orders") == [{"s": 9.0, "ids": 2}]
         metrics = dict(line.rsplit(" ", 1) for line in call(port, "/metrics").splitlines() if line and not line.startswith("#"))
         resident, limit = float(metrics["pondra_resident_bytes"]), float(metrics["pondra_memory_limit_bytes"])
         checks["the node knows its resident memory"] = resident > 10 << 20

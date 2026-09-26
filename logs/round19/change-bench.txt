@@ -1,0 +1,68 @@
+{
+ "rows": 10000000,
+ "load_s": 3.7,
+ "changes_s": {
+  "UPDATE 1 row": 0.024,
+  "UPDATE 1%": 0.255,
+  "DELETE 1%": 0.209,
+  "MERGE 100,000 (half new)": 1.223,
+  "UPDATE 10% (after the rest)": 0.471
+ },
+ "changed": {
+  "update_1pct": {
+   "rows": 100000,
+   "updated": 100000,
+   "deleted": 0,
+   "inserted": 0
+  },
+  "update_10pct": {
+   "rows": 1000000,
+   "updated": 1000000,
+   "deleted": 0,
+   "inserted": 0
+  },
+  "delete_1pct": {
+   "rows": 100000,
+   "updated": 0,
+   "deleted": 100000,
+   "inserted": 0
+  },
+  "merge": {
+   "rows": 100000,
+   "updated": 98000,
+   "deleted": 0,
+   "inserted": 2000
+  }
+ },
+ "reads_s": {
+  "count, sum": {
+   "before": 0.015,
+   "changes_waiting": 0.127,
+   "tiered": 0.138,
+   "purged": 0.056
+  },
+  "a filter": {
+   "before": 0.011,
+   "changes_waiting": 0.048,
+   "tiered": 0.107,
+   "purged": 0.017
+  },
+  "group by": {
+   "before": 0.042,
+   "changes_waiting": 0.171,
+   "tiered": 0.155,
+   "purged": 0.084
+  }
+ },
+ "tier_s": 0.13,
+ "checkpoint_with_purge_s": 2.68,
+ "checkpoint": {
+  "checkpoint": true,
+  "rows_tiered": 0,
+  "purged": [
+   "t"
+  ]
+ },
+ "right_answers": true,
+ "rows_after": 9902000
+}

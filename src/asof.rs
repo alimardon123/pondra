@@ -44,6 +44,14 @@ type Expr = Arc<dyn PhysicalExpr>;
 /// The SQL with each `ASOF JOIN … MATCH_CONDITION (…) [ON …]` turned into a LEFT JOIN on its
 /// keys whose condition carries the marker; as it was if it has none.
 pub fn rewrite(sql: &str) -> anyhow::Result<Cow<'_, str>> {
+    Ok(match as_of(sql)? {
+        Cow::Borrowed(s) => crate::sys::hide(s), // (and `*` without the system columns)
+        Cow::Owned(s) => Cow::Owned(crate::sys::hide(&s).into_owned()),
+    })
+}
+
+/// `rewrite`, leaving `*` as it is (for a query `sys::hide` couldn't place its EXCLUDE in).
+pub fn as_of(sql: &str) -> anyhow::Result<Cow<'_, str>> {
     use datafusion::sql::sqlparser::{ast::*, dialect::GenericDialect, parser::Parser};
     use std::ops::ControlFlow;
     if !sql.to_ascii_lowercase().contains("asof") {

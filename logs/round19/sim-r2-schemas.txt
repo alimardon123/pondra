@@ -1,0 +1,22 @@
+/usr/local/lib/python3.11/dist-packages/adbc_driver_manager/dbapi.py:369: Warning: Cannot disable autocommit; conn will not be DB-API 2.0 compliant
+  warnings.warn(
+{
+ "schemas": {
+  "a schema must exist before its tables; CREATE SCHEMA on a follower": true,
+  "t, public.t and lake.public.t are one table; dbo.t another": true,
+  "a join across schemas": true,
+  "attached lakes: other.t, other.public.t, other.eu.t, joined with this lake's": true,
+  "names: unquoted ones are lower case; odd characters and four parts refused": true,
+  "CREATE TABLE \u2026 AS: the query's rows and columns": true,
+  "a view: the query, run over the tables as they are now; a view of a view": true,
+  "CREATE VIEW over a name in use refused; OR REPLACE replaces": true,
+  "queries over views spread, with the same answers": true,
+  "CREATE MATERIALIZED VIEW follows the rows written from then on; WITH (window \u2026) emits to _final; bad options refused": true,
+  "Postgres, Flight SQL (ADBC ingest into a schema) and Iceberg REST see the schemas": true,
+  "DROP refused while a view reads it; after the drop, a new table of its name is empty": true,
+  "DROP SCHEMA refused while it holds tables; CASCADE drops them all": true,
+  "ATTACH 'dir' AS name on one node: every node, after a restart, pondra sql; joins and writes across; DETACH everywhere; bad ones refused": true,
+  "ATTACH of a place with no lake makes one; CREATE DATABASE makes one beside this lake, attached; twice is refused": true
+ },
+ "ok": true
+}

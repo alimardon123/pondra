@@ -107,6 +107,7 @@ pub fn router(app: App) -> Router {
         .route("/functions/{name}", post(create_function).delete(drop_function))
         .route("/tier", post(tier_now))
         .route("/cluster/ddl", post(ddl))
+        .route("/cluster/change", post(change))
         .route_layer(middleware::from_fn_with_state(app.clone(), to_leader));
     Router::new()
         .merge(leader_only)
@@ -126,6 +127,7 @@ pub fn router(app: App) -> Router {
         .route("/cluster/stage", post(stage))
         .route("/cluster/shuffle", get(bucket))
         .route("/cluster/job", post(job))
+        .route("/cluster/probe", get(|Query(p): Query<HashMap<String, usize>>| async move { crate::guard::probe(p.get("bytes").copied().unwrap_or(0)) }))
         .route("/cluster/beat", post(beat))
         .route("/cluster/ack", post(ack))
         .route("/cluster/replica", get(replica))
@@ -308,9 +310,19 @@ impl App {
 
     /// Run a query: across the cluster when the tables are big (`spread`: "1" always, "0" never).
     pub async fn query(&self, query: &str, spread: Option<&str>) -> anyhow::Result<Vec<RecordBatch>> {
+        match self.query_as(&crate::asof::rewrite(query)?, spread, false).await {
+            // (`*` left as it is when `sys::hide`'s EXCLUDE names a column its table lacks: a
+            // stored view's, say)
+            Err(e) if crate::sys::mentioned(query) && crate::sys::mentioned(&format!("{e:#}")) => self.query_as(&crate::asof::as_of(query)?, spread, false).await,
+            r => r,
+        }
+    }
+
+    /// Run a query as rewritten (`asof::rewrite`: ASOF JOIN as DataFusion can plan it); `files`:
+    /// it may read files on this machine (`owner`).
+    pub async fn query_as(&self, query: &str, spread: Option<&str>, files: bool) -> anyhow::Result<Vec<RecordBatch>> {
         use crate::metrics::{add, QUERIES, QUERY_ERRORS, QUERY_US, SPREAD};
         let start = std::time::Instant::now();
-        let query = &*crate::asof::rewrite(query)?; // (ASOF JOIN, as DataFusion can plan it)
         let run = async {
             let nodes = if spread == Some("0") { vec![] } else { self.cluster.nodes() };
             match crate::spmd::query(&self.lake, &nodes, &self.cluster.addr, query, spread == Some("1")).await {
@@ -320,6 +332,7 @@ impl App {
             }
             let run = |frugal: bool| async move {
                 let ctx = session(&self.lake, query, "").await?;
+                let ctx = if files { ctx.enable_url_table() } else { ctx };
                 if frugal {
                     // Hash joins can't spill, sort-merge joins can; sorts keep less aside to merge.
                     let state = ctx.state_ref();
@@ -329,10 +342,15 @@ impl App {
                 }
                 anyhow::Ok(ctx.sql_with_options(query, crate::query::read_only()).await?.collect().await?)
             };
-            match run(false).await {
-                Err(e) if format!("{e:#}").contains("Resources exhausted") => Ok((run(true).await?, false)), // out of memory: try again frugally
-                r => Ok((r?, false)),
+            let here = std::time::Instant::now();
+            let out = match run(false).await {
+                Err(e) if format!("{e:#}").contains("Resources exhausted") => run(true).await?, // out of memory: try again frugally
+                r => r?,
+            };
+            if self.cluster.nodes().len() > 1 && here.elapsed() >= Duration::from_millis(20) {
+                crate::guard::ran_here(query, crate::spmd::reads_sql(&self.lake, query).await?, here.elapsed()); // (how fast queries go here: `guard.rs`)
             }
+            Ok((out, false))
         };
         let out = run.await;
         add(&QUERIES, 1);
@@ -357,7 +375,15 @@ impl App {
             return Ok(r.json().await?);
         }
         let _guard = self.lock.lock().await;
-        crate::write::record(&self.lake, f).await
+        crate::write::record(&self.lake, f, self.seq.as_deref()).await
+    }
+
+    /// Where this node gets commit numbers (`log::To::reserve`): its own sequencer, or the leader's.
+    pub fn to(&self) -> crate::log::To {
+        match &self.seq {
+            Some(seq) => crate::log::To::Local(seq.clone()),
+            None => crate::log::To::Leader(self.cluster.leader.addr.clone()),
+        }
     }
 
     /// Tier the tables with at least `min_rows` rows in the log (0: all of them), publish them
@@ -375,11 +401,16 @@ impl App {
         // Tables with files to merge or seal, busy or not (bulk INSERTs don't go through the log).
         let untidy = tables.iter().filter(|(k, m)| m.files.len() >= 8 && !busy.contains(&k[2..].to_string())).map(|(k, _)| k[2..].to_string());
         let untidy: Vec<String> = busy.iter().cloned().chain(untidy).collect();
-        if untidy.is_empty() {
+        // (tables whose changed rows may wait in files: `tier::purge` says whether it's time)
+        let changed: Vec<String> = tables.iter().filter(|(_, m)| m.changed && m.purged() < m.tiered).map(|(k, _)| k[2..].to_string()).collect();
+        if untidy.is_empty() && changed.is_empty() {
             return Ok(0); // (the pressure check, most of the time: don't hold the lock for nothing)
         }
         let per_table: Vec<_> = busy.iter().map(|t| self.tier_one(t, hwm, &nodes)).collect();
         let rows: u64 = futures::stream::iter(per_table).buffer_unordered(4).try_collect::<Vec<u64>>().await?.iter().sum();
+        // Changed rows out of the files (published tables: before they are published).
+        let purge: Vec<_> = changed.iter().map(|t| crate::tier::purge(&self.lake, t, &nodes, &self.cluster.addr, self.retain_ms, false)).collect();
+        futures::stream::iter(purge).buffer_unordered(4).try_collect::<Vec<bool>>().await?;
         let tiered = start.elapsed();
         crate::delta::publish_all(&self.lake).await?; // what other engines read, as soon as it's tiered
         let first_publish = start.elapsed();
@@ -402,6 +433,31 @@ impl App {
             eprintln!("slow tiering: {rows} rows in {:?} (tables {tiered:?}, publish {publish:?}, merges {merges:?}, expire {expire:?})", start.elapsed());
         }
         Ok(rows)
+    }
+
+    /// `CHECKPOINT`: every table's log into Parquet, and the catalog written down (the leader's
+    /// work: a follower asks it).
+    pub async fn checkpoint(&self) -> anyhow::Result<Value> {
+        if self.seq.is_none() {
+            let r = crate::cluster::http().post(format!("http://{}/sql", self.cluster.leader.addr)).body("CHECKPOINT").send().await?;
+            anyhow::ensure!(r.status().is_success(), "the leader: {}", r.text().await?);
+            return Ok(r.json().await?);
+        }
+        let rows = self.tier_all(0).await?;
+        let (mut purged, nodes) = (vec![], if self.cluster.nodes().is_empty() { vec![self.cluster.addr.clone()] } else { self.cluster.nodes() });
+        {
+            let _guard = self.lock.lock().await;
+            for (k, _) in self.lake.cat.scan::<TableMeta>("t/", "t0").await?.into_iter().filter(|(_, m)| m.changed) {
+                if crate::tier::purge(&self.lake, &k[2..], &nodes, &self.cluster.addr, self.retain_ms, true).await? {
+                    purged.push(k[2..].to_string());
+                }
+            }
+        }
+        if !purged.is_empty() {
+            crate::delta::publish_all(&self.lake).await?;
+        }
+        self.lake.cat.checkpoint().await?;
+        Ok(j!({"checkpoint": true, "rows_tiered": rows, "purged": purged}))
     }
 
     /// One table's log up to `hwm`, a chunk at a time.
@@ -464,7 +520,7 @@ struct InsertParams {
 async fn insert(State(app): State<App>, Path(name): Path<String>, Query(p): Query<InsertParams>, query: String) -> Result<Json<Value>, E> {
     ensure!(!app.cluster.reader, "read-only node");
     let ctx = session(&app.lake, &query, "").await?;
-    match crate::write::write_files(&app.lake, &ctx, &name, &query, &p.job).await? {
+    match crate::write::write_files(&app.lake, &ctx, &name, &query, &p.job, Some(app.to().reserve().await?)).await? {
         Some(f) => Ok(Json(app.record_files(f).await?)),
         None => Ok(Json(j!({"duplicate": true}))),
     }
@@ -491,10 +547,21 @@ async fn create_view(State(app): State<App>, Path(name): Path<String>, Query(opt
     Ok(Json(crate::ddl::apply(&app.lake, crate::ddl::Ddl::CreateMaterialized { name, sql, options }).await?))
 }
 
+/// An UPDATE, DELETE or MERGE a follower's SQL asked for (`change.rs`): `[sql, job]`.
+async fn change(State(app): State<App>, Json((sql, job)): Json<(String, String)>) -> Result<Json<Value>, E> {
+    let seq = app.seq.as_ref().ok_or_else(|| anyhow::anyhow!("not the leader"))?;
+    let _guard = app.lock.lock().await;
+    Ok(Json(crate::change::run(&app.lake, seq, &sql, &job).await?))
+}
+
 /// A `CREATE`/`DROP` of a schema, view or table that a follower's SQL asked for (`ddl.rs`).
 async fn ddl(State(app): State<App>, Json(d): Json<crate::ddl::Ddl>) -> Result<Json<Value>, E> {
-    let _guard = app.lock.lock().await;
-    Ok(Json(crate::ddl::apply(&app.lake, d).await?))
+    let out = {
+        let _guard = app.lock.lock().await;
+        crate::ddl::apply(&app.lake, d.clone()).await?
+    };
+    crate::ddl::settle(&app.lake, &d, &app.cluster.addr).await?; // (ATTACH, CREATE DATABASE: the leader too at once, not in a second)
+    Ok(Json(out))
 }
 
 /// `GET /lookup/{table}/{key}`: the current row of one key, for serving reads — same answer as
@@ -548,10 +615,22 @@ struct SqlParams {
     job: Option<String>,    // writes: a retry with the same job id is applied once
 }
 
-async fn sql(State(app): State<App>, Query(p): Query<SqlParams>, role: axum::Extension<crate::auth::Role>, query: String) -> Result<Response, E> {
+/// Is this request from whoever started the node here (the shell: `PONDRA_OWNER_KEY`)? Then its
+/// SQL may read files on this machine, as `pondra sql` may (invariant 21: nobody else's).
+fn owner(headers: &axum::http::HeaderMap) -> bool {
+    static KEY: std::sync::LazyLock<Option<String>> = std::sync::LazyLock::new(|| std::env::var("PONDRA_OWNER_KEY").ok().filter(|k| k.len() >= 16));
+    KEY.as_deref().is_some_and(|k| headers.get("x-pondra-owner").is_some_and(|h| h.as_bytes() == k.as_bytes()))
+}
+
+async fn sql(State(app): State<App>, Query(p): Query<SqlParams>, role: axum::Extension<crate::auth::Role>, headers: axum::http::HeaderMap, query: String) -> Result<Response, E> {
+    if crate::write::checkpoint(&query) {
+        ensure!(role.0 >= crate::auth::Role::Write, "CHECKPOINT needs a write token");
+        return Ok(Json(app.checkpoint().await?).into_response());
+    }
+    let files = owner(&headers);
     if let Some(stmt) = crate::write::parse(&query) {
         app.auth.allows(role.0, &stmt)?;
-        return Ok(Json(crate::write::on_node(&app, stmt, p.job.clone()).await?).into_response()); // CREATE / INSERT / UPDATE / DELETE
+        return Ok(Json(crate::write::on_node_as(&app, stmt, p.job.clone(), files).await?).into_response()); // CREATE / INSERT / UPDATE / DELETE
     }
     if let Some(seg) = p.after {
         let mut hwm = app.lake.hwm.subscribe();
@@ -569,10 +648,11 @@ async fn sql(State(app): State<App>, Query(p): Query<SqlParams>, role: axum::Ext
             return Ok(respond(body.into())); // a key lookup: no planning
         }
     }
-    // Same query, same catalog version: same answer (unless it asks for the time or randomness).
+    // Same query, same catalog version: same answer (unless it asks for the time or randomness,
+    // or may read a file on this machine).
     let q = query.to_lowercase();
-    let volatile = ["now()", "random(", "current_", "uuid(", "explain"].iter().any(|f| q.contains(f));
-    let Some(version) = app.lake.version_for(&query).await.filter(|_| !volatile) else { return Ok(respond(run_sql(&app, &p, &query).await?)) };
+    let volatile = files || ["now()", "random(", "current_", "uuid(", "explain"].iter().any(|f| q.contains(f));
+    let Some(version) = app.lake.version_for(&query).await.filter(|_| !volatile) else { return Ok(respond(run_sql(&app, &p, &query, files).await?)) };
     let key = format!("{format}|{}|{query}", p.spread.as_deref().unwrap_or(""));
     let stale = p.stale_ms.filter(|_| p.after.is_none()).map(Duration::from_millis); // (read-your-writes wins)
     if let Some(body) = app.results.get(&key, version, stale) {
@@ -588,7 +668,7 @@ async fn sql(State(app): State<App>, Query(p): Query<SqlParams>, role: axum::Ext
     }
     (slot.0, slot.1) = (flight.0.load(std::sync::atomic::Ordering::Relaxed), None);
     let version = app.lake.version_for(&query).await; // (read after `covers`: this run reads at least this)
-    let body = run_sql(&app, &p, &query).await?;
+    let body = run_sql(&app, &p, &query, false).await?;
     if let Some(v) = version {
         app.results.put(key, v, body.clone());
     }
@@ -597,8 +677,11 @@ async fn sql(State(app): State<App>, Query(p): Query<SqlParams>, role: axum::Ext
 }
 
 /// Run a query (across the cluster if it's worth it) and format the result.
-async fn run_sql(app: &App, p: &SqlParams, query: &str) -> anyhow::Result<bytes::Bytes> {
-    let batches = app.query(query, p.spread.as_deref()).await?;
+async fn run_sql(app: &App, p: &SqlParams, query: &str, files: bool) -> anyhow::Result<bytes::Bytes> {
+    let batches = match files {
+        true => app.query_as(&crate::asof::rewrite(query)?, Some("0"), true).await?, // (a file here: this node only)
+        false => app.query(query, p.spread.as_deref()).await?,
+    };
     Ok(bytes::Bytes::from(match p.format.as_deref() {
         Some("table") => pretty_format_batches(&batches)?.to_string().into_bytes(),
         Some("arrow") => {
@@ -623,13 +706,16 @@ struct WatchParams {
     after: Option<u64>, // default: from now on (earlier: a replay, as far back as the log is kept)
     #[serde(default)]
     marks: bool, // after each batch of rows, a `{"_after": N}` line: resume with `?after=N`
+    #[serde(default)]
+    changes: bool, // the change feed (`change::feed`): old versions too, and what each row is
 }
 
-/// New rows of a table as NDJSON, pushed the moment they commit (a view's rows included).
+/// New rows of a table as NDJSON, pushed the moment they commit (a view's rows included); with
+/// `?changes=true`, its changes: UPDATE's and DELETE's too, with the rows' system columns.
 async fn watch(State(app): State<App>, Path(name): Path<String>, Query(p): Query<WatchParams>) -> Response {
     let hwm = app.lake.hwm.subscribe();
     let after = p.after.unwrap_or_else(|| app.lake.visible());
-    let marks = p.marks;
+    let (marks, changes) = (p.marks, p.changes);
     let rows = futures::stream::unfold((app, hwm, after, name), move |(app, mut hwm, after, name)| async move {
         loop {
             hwm.borrow_and_update();
@@ -641,7 +727,11 @@ async fn watch(State(app): State<App>, Path(name): Path<String>, Query(p): Query
                     }
                     b
                 };
-                let chunk = tail(&app.lake, &name, after, Some(now), false).await.and_then(|b| ndjson(&b)).map(mark);
+                let rows = match changes {
+                    true => crate::change::feed(&app.lake, &name, after, Some(now)).await,
+                    false => tail(&app.lake, &name, after, Some(now), false).await,
+                };
+                let chunk = rows.and_then(|b| ndjson(&b)).map(mark);
                 return Some((chunk.map_err(|e| std::io::Error::other(e.to_string())), (app, hwm, now, name)));
             }
             hwm.changed().await.ok()?;

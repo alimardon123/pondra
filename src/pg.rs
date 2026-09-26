@@ -142,7 +142,7 @@ impl Backend {
             let lake = &self.app.lake;
             let schemas = crate::ddl::schemas(lake).await.map_err(user_error)?; // (public first: oid 2200, as in Postgres)
             let oid = |schema: &str| schemas.iter().position(|s| s == schema).map_or(2200, |i| if i == 0 { 2200 } else { 30000 + i });
-            let tables = lake.cat.scan::<crate::store::TableMeta>("t/", "t0").await.map_err(user_error)?.into_iter().map(|(k, _)| (k, 'r'));
+            let tables = lake.cat.scan::<crate::store::TableMeta>("t/", "t0").await.map_err(user_error)?.into_iter().filter(|(k, _)| !crate::sys::hidden(k)).map(|(k, _)| (k, 'r'));
             let views = lake.cat.scan::<crate::ddl::StoredView>("q/", "q0").await.map_err(user_error)?.into_iter().map(|(k, _)| (k, 'v'));
             let classes = tables.chain(views).enumerate().map(|(i, (k, kind))| format!("({}, '{}', {}, '{kind}')", 16384 + i, crate::ddl::split(&k[2..]).1, oid(crate::ddl::split(&k[2..]).0))).collect::<Vec<_>>();
             let namespaces = schemas.iter().map(|s| format!(", ({}, '{s}')", oid(s))).collect::<String>();

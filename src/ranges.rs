@@ -241,7 +241,7 @@ pub async fn parts(lake: &Lake, meta: &TableMeta, table: &str, scheme: &Scheme, 
     let spans = spans(&pieces(lake, meta, n).await?, column, &t).context("a piece without a range")?;
     let cuts: Vec<String> = scheme.cuts.iter().map(|c| crate::manifest::text(c).context("a cut that can't be written down")).collect::<Result<_>>()?;
     Ok((0..n).map(|i| {
-        let mut part = Part { table: table.into(), tail: Some(tail), ..Default::default() };
+        let mut part = Part { table: table.into(), tail: Some(tail), purged: meta.purged(), ..Default::default() };
         for s in spans.iter().filter(|s| overlaps(s, &scheme.cuts, i)) {
             match &s.piece {
                 Piece::File(f) => part.files.push(f.clone()),

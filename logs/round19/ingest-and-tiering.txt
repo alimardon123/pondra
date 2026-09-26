@@ -1,0 +1,14 @@
+# Ingest and tiering, round 19 (system columns) against round 18. Both glibc 2.17 dist builds, one
+# 2-vCPU box, alternating. ingest-tiering.py: 8 M rows appended as Arrow over HTTP, then /tier.
+# Then tools/flight_bench.py (4 writers, 8 M rows in; SELECT * out; the log as a stream);
+# 'scratchpad' = round 18's binary, 'dist' = round 19's.
+{"bin": "pondra-r18", "rows": 8000000, "append_rows_per_s": 12071924, "untiered_before_tier": 8000000, "tier_s": 0.75, "tier_rows_per_s": 10706990, "parquet_mb": 35.2}
+{"bin": "pondra", "rows": 8000000, "append_rows_per_s": 11604908, "untiered_before_tier": 8000000, "tier_s": 1.12, "tier_rows_per_s": 7154607, "parquet_mb": 36.1}
+{"bin": "pondra-r18", "rows": 8000000, "append_rows_per_s": 12194233, "untiered_before_tier": 8000000, "tier_s": 0.78, "tier_rows_per_s": 10239350, "parquet_mb": 35.5}
+{"bin": "pondra", "rows": 8000000, "append_rows_per_s": 12287121, "untiered_before_tier": 8000000, "tier_s": 1.17, "tier_rows_per_s": 6854748, "parquet_mb": 36.4}
+{"bin": "pondra-r18", "rows": 8000000, "append_rows_per_s": 12626662, "untiered_before_tier": 8000000, "tier_s": 0.76, "tier_rows_per_s": 10524586, "parquet_mb": 35.2}
+{"bin": "pondra", "rows": 8000000, "append_rows_per_s": 11115583, "untiered_before_tier": 8000000, "tier_s": 1.11, "tier_rows_per_s": 7175083, "parquet_mb": 36.1}
+scratchpad {"in_rows_per_s": 17563775, "out_rows_per_s": 12941653, "follow_ms_p50": 2.7}
+dist {"in_rows_per_s": 19849666, "out_rows_per_s": 12001389, "follow_ms_p50": 2.7}
+scratchpad {"in_rows_per_s": 21021933, "out_rows_per_s": 11300730, "follow_ms_p50": 2.2}
+dist {"in_rows_per_s": 20657119, "out_rows_per_s": 10116117, "follow_ms_p50": 2.3}

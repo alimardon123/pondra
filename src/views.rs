@@ -35,6 +35,10 @@ pub struct View {
     pub emit: Option<Emit>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sessions: Option<Sessions>,
+    /// Row by row over its source alone: each of its rows carries its source row's `_row_id` and
+    /// `_created_at`, so it follows that row's changes (views made from Pondra 0.19 on).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ids: bool,
 }
 
 /// Emit-once windows: `window` is the view's window-start column (a key), cut from the source's
@@ -96,8 +100,12 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, mut emit: Option<Emit>, 
     let planned = crate::asof::rewrite(sql)?;
     let plan = session(lake, &planned, "").await?.sql(&planned).await?.logical_plan().clone();
     let (key, merge) = merges(&plan)?;
-    let columns = plan.schema().fields().iter().map(|f| (f.name().clone(), crate::query::type_name(f.data_type()))).collect();
-    let meta = TableMeta { columns, key, merge, publish: default_publish(), ..Default::default() };
+    let columns: Vec<(String, String)> = plan.schema().fields().iter().map(|f| (f.name().clone(), crate::query::type_name(f.data_type()))).collect();
+    if let Some((c, _)) = columns.iter().find(|(c, _)| crate::sys::NAMES.contains(&c.as_str())) {
+        bail!("{c} is a system column of the view's own table: name it something else ({c} AS source{c})");
+    }
+    let ids = merge.is_empty() && alone(&plan, false);
+    let meta = TableMeta { columns, key, merge, publish: default_publish(), ids: true, tiered: lake.visible(), ..Default::default() };
     let mut puts = vec![(table_key(name), json(&meta))];
     if let Some(e) = &mut emit {
         let is_time = meta.columns.iter().any(|(c, t)| *c == e.window && t.starts_with("Timestamp"));
@@ -105,9 +113,9 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, mut emit: Option<Emit>, 
         e.time = event_time(&plan, &e.window).filter(|t| timestamp(&src, t));
         ensure!(e.time.is_some(), "emit: the window must be cut from a timestamp column of {source}: date_bin(INTERVAL '1 minute', ts) AS {}", e.window);
         let columns = meta.columns.iter().filter(|(c, _)| c != "_deleted").cloned().collect();
-        puts.push((table_key(&format!("{name}_final")), json(&TableMeta { columns, publish: default_publish(), ..Default::default() })));
+        puts.push((table_key(&format!("{name}_final")), json(&TableMeta { columns, publish: default_publish(), ids: true, tiered: lake.visible(), ..Default::default() })));
     }
-    puts.push((view_key(name), json(&View { source, sql: sql.into(), emit, sessions: None })));
+    puts.push((view_key(name), json(&View { source, sql: sql.into(), emit, sessions: None, ids })));
     lake.cat.commit(puts, &[]).await
 }
 
@@ -131,8 +139,8 @@ async fn create_sessions(lake: &Lake, name: &str, sql: &str, source: String, src
     let out = plan.schema();
     ensure!(s.keys.iter().all(|k| out.field_with_unqualified_name(k).is_ok()), "a session view SELECTs its GROUP BY columns, as they are named");
     let columns = out.fields().iter().map(|f| (f.name().clone(), crate::query::type_name(f.data_type()))).collect();
-    let meta = TableMeta { columns, publish: default_publish(), ..Default::default() };
-    let view = View { source, sql: sql.into(), emit: None, sessions: Some(s) };
+    let meta = TableMeta { columns, publish: default_publish(), ids: true, tiered: lake.visible(), ..Default::default() };
+    let view = View { source, sql: sql.into(), emit: None, sessions: Some(s), ids: false };
     lake.cat.commit(vec![(view_key(name), json(&view)), (table_key(name), json(&meta))], &[]).await
 }
 
@@ -311,17 +319,141 @@ async fn sessions(lake: &Lake, log: &crate::log::Log, view: &str, v: &View, s: &
     lake.cat.commit(vec![(open_key(view), json(&open))], &[]).await // (a lower bound: stale is safe, only slower)
 }
 
-/// The rows every view derives from a flush's new rows, per view table.
+/// Can what follows `table` take its rows' changes (UPDATE, DELETE, MERGE)? A view over the table
+/// alone takes the old rows back: one that adds up (sum and count, with a count to drop the groups
+/// a change empties) subtracts them; one that is row by row (`View::ids`) drops their rows. Views
+/// that emit windows or sessions once, keep a min or max, or read other tables too (which a change
+/// would find as they are now, not as they were), and streaming tasks can't, so a change is
+/// refused while they follow the table. (`append`: an append table's; a keyed table's changes are
+/// upserts, which its followers already see as new rows.)
+pub async fn can_follow(lake: &Lake, table: &str, append: bool) -> Result<()> {
+    let mut not = vec![];
+    for (k, v) in lake.cat.scan::<View>("v/", "v0").await?.into_iter().filter(|(_, v)| v.source == table) {
+        let name = &k[2..];
+        let meta: TableMeta = lake.cat.get(&table_key(name)).await?.context("view without table")?;
+        let why = match () {
+            _ if v.emit.is_some() || v.sessions.is_some() => Some("emits windows or sessions once"),
+            _ if !append => None,
+            _ if meta.merge.is_empty() && !v.ids => Some("isn't row by row over the table alone (a join, DISTINCT, …), or was made before Pondra 0.19"),
+            _ if meta.merge.is_empty() => None,
+            _ if !alone(&plan(lake, &v).await?, true) => Some("reads other tables too"),
+            _ if meta.merge.values().any(|f| f != "sum" && f != "count") => Some("keeps a min or max"),
+            _ if !meta.merge.values().any(|f| f == "count") => Some("has no count(*) to drop the groups a change empties"),
+            _ if meta.columns.iter().any(|(c, t)| meta.merge.contains_key(c) && t.starts_with("UInt")) => Some("adds up an unsigned column (it can't subtract)"),
+            _ => None,
+        };
+        not.extend(why.map(|w| format!("view {name} ({w})")));
+    }
+    for (k, t) in lake.cat.scan::<crate::tasks::Task>("k/", "k0").await? {
+        if t.source == table {
+            not.push(format!("task {} (streaming tasks see new rows only)", &k[2..]));
+        }
+    }
+    ensure!(not.is_empty(), "{table}'s rows can't change while these follow it: {}. Drop them first, or change a copy of the table", not.join("; "));
+    Ok(())
+}
+
+/// The row-by-row views of `table` (`View::ids`), with their tables: a change of its rows
+/// changes theirs.
+pub async fn row_views(lake: &Lake, table: &str) -> Result<Vec<(String, TableMeta)>> {
+    let mut out = vec![];
+    for (k, _) in lake.cat.scan::<View>("v/", "v0").await?.into_iter().filter(|(_, v)| v.source == table && v.ids) {
+        out.push((k[2..].to_string(), lake.cat.get(&table_key(&k[2..])).await?.context("view without table")?));
+    }
+    Ok(out)
+}
+
+async fn plan(lake: &Lake, v: &View) -> Result<LogicalPlan> {
+    let planned = crate::asof::rewrite(&v.sql)?;
+    Ok(session(lake, &planned, "").await?.sql(&planned).await?.into_unoptimized_plan())
+}
+
+/// Does a view read its source alone, row by row: projections and filters over one table, no
+/// subquery (`grouped`: under a GROUP BY too)? Only then can it take a changed row back, since
+/// anything else it read would be as it is when the change comes, not as it was.
+fn alone(p: &LogicalPlan, grouped: bool) -> bool {
+    use datafusion::common::tree_node::TreeNode;
+    use datafusion::logical_expr::LogicalPlan::*;
+    let node = matches!(p, Projection(_) | Filter(_) | SubqueryAlias(_) | TableScan(_)) || (grouped && matches!(p, Aggregate(_)));
+    let subquery = |e: &Expr| e.exists(|e| Ok(matches!(e, Expr::ScalarSubquery(_) | Expr::Exists(_) | Expr::InSubquery(_)))).unwrap_or(true);
+    node && !p.expressions().iter().any(subquery) && p.inputs().len() <= 1 && p.inputs().iter().all(|i| alone(i, grouped))
+}
+
+/// The rows every view derives from a flush's new rows, per view table. A change's old rows
+/// (`{source}$deleted`, `change.rs`) are taken back: subtracted from a view that adds up, and, for
+/// a row-by-row view, its rows of them go to `{view}$deleted` (whose rows reads leave out).
 pub async fn derive(lake: &Lake, new: &BTreeMap<String, Vec<RecordBatch>>) -> Result<Vec<(String, RecordBatch)>> {
     let mut out = vec![];
     for (key, v) in lake.cat.scan::<View>("v/", "v0").await? {
-        let Some(rows) = new.get(&v.source).filter(|_| v.sessions.is_none()) else { continue }; // (sessions are cut as they close)
+        if v.sessions.is_some() {
+            continue; // (sessions are cut as they close)
+        }
+        let (rows, gone) = (new.get(&v.source), new.get(&crate::sys::deleted(&v.source)));
+        if rows.is_none() && gone.is_none() {
+            continue;
+        }
         let target = key[2..].to_string();
         let meta: TableMeta = lake.cat.get(&table_key(&target)).await?.context("view without table")?;
-        let batch = over(lake, &v.source, rows.clone(), &v.sql).await?;
-        out.push((target, crate::query::cast_as(&batch, &crate::query::schema(&meta.columns)?)?));
+        if let Some(rows) = rows {
+            out.push((target.clone(), view_rows(lake, &v, &meta, rows, false).await?));
+        }
+        match gone {
+            Some(gone) if !meta.merge.is_empty() => out.push((target, negated(&view_rows(lake, &v, &meta, gone, false).await?, &meta)?)),
+            Some(gone) if v.ids => out.push((crate::sys::deleted(&target), view_rows(lake, &v, &meta, gone, true).await?)),
+            _ => {}
+        }
     }
     Ok(out)
+}
+
+/// A view's rows of `rows`, in its table's columns; a row-by-row view's with their source rows'
+/// `_row_id` and `_created_at` after them (and `old`: `_old_version`, as `{view}$deleted` holds).
+async fn view_rows(lake: &Lake, v: &View, meta: &TableMeta, rows: &[RecordBatch], old: bool) -> Result<RecordBatch> {
+    use crate::query::{cast_as, schema};
+    if !v.ids {
+        return cast_as(&over(lake, &v.source, rows.to_vec(), &v.sql).await?, &schema(&meta.columns)?);
+    }
+    let mut ids = vec![(crate::sys::ROW_ID.to_string(), "Int64".to_string()), crate::sys::columns()[2].clone()];
+    if old {
+        ids.push(("_old_version".into(), "Int64".into()));
+    }
+    let src: TableMeta = lake.cat.get(&table_key(&v.source)).await?.with_context(|| format!("no table {}", v.source))?;
+    let sql = crate::asof::rewrite(&v.sql)?;
+    let ctx = crate::query::over_ctx(lake, &v.source, schema(&[src.columns, ids.clone()].concat())?, rows.to_vec(), &sql).await?;
+    let names: Vec<&str> = ids.iter().map(|(c, _)| c.as_str()).collect();
+    let plan = carry(ctx.sql(&sql).await?.into_unoptimized_plan(), &names)?;
+    let batches = ctx.execute_logical_plan(plan).await?.collect().await?;
+    let target = schema(&[meta.columns.clone(), ids].concat())?;
+    let Some(first) = batches.first() else { return Ok(RecordBatch::new_empty(target)) };
+    let all = datafusion::arrow::compute::concat_batches(&first.schema(), &batches)?;
+    let picked = target.fields().iter().map(|f| all.schema().index_of(f.name())).collect::<Result<Vec<_>, _>>()?;
+    cast_as(&all.project(&picked)?, &target)
+}
+
+/// `plan` with columns `names` of its table carried through every projection, as they are.
+fn carry(plan: LogicalPlan, names: &[&str]) -> Result<LogicalPlan> {
+    use datafusion::common::tree_node::{Transformed, TreeNode};
+    let carried = plan.transform_up(|p| {
+        let LogicalPlan::Projection(p) = p else { return Ok(Transformed::yes(p.recompute_schema()?)) };
+        let mut expr = p.expr.clone();
+        for n in names {
+            if p.schema.field_with_unqualified_name(n).is_err() {
+                let (q, f) = p.input.schema().qualified_field_with_unqualified_name(n)?;
+                expr.push(Expr::Column(datafusion::common::Column::new(q.cloned(), f.name())));
+            }
+        }
+        Ok(Transformed::yes(LogicalPlan::Projection(datafusion::logical_expr::Projection::try_new(expr, p.input)?)))
+    })?;
+    Ok(carried.data)
+}
+
+/// Partial aggregates taken back: their sums and counts negated.
+fn negated(b: &RecordBatch, meta: &TableMeta) -> Result<RecordBatch> {
+    let columns = b.schema().fields().iter().zip(b.columns()).map(|(f, c)| match meta.merge.get(f.name()).map(String::as_str) {
+        Some("sum" | "count") => Ok(datafusion::arrow::compute::kernels::numeric::neg(c)?),
+        _ => Ok(c.clone()),
+    }).collect::<Result<Vec<_>>>()?;
+    Ok(RecordBatch::try_new(b.schema(), columns)?)
 }
 
 /// For a GROUP BY query: its key columns and how each aggregate column merges. Only aggregates
@@ -342,7 +474,8 @@ fn merges(plan: &LogicalPlan) -> Result<(Vec<String>, BTreeMap<String, String>)>
         let Expr::AggregateFunction(a) = agg.aggr_expr[i - agg.group_expr.len()].clone().unalias() else { bail!("unexpected aggregate") };
         ensure!(!a.params.distinct, "DISTINCT aggregates can't be combined from partial results");
         let m = match a.func.name() {
-            "sum" | "count" => "sum",
+            "count" => "count", // (added up like a sum; a group whose count is 0 is gone: a change emptied it)
+            "sum" => "sum",
             "min" => "min",
             "max" => "max",
             other => bail!("{other}() can't be combined from partial results: use sum, count, min or max (e.g. avg = sum / count at query time)"),

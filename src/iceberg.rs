@@ -152,10 +152,14 @@ async fn write_manifest(lake: &Lake, dir: &str, schema: &Value, v: u64, files: &
 #[allow(clippy::too_many_arguments)]
 fn metadata(lake: &Lake, table: &str, uuid: &str, v: u64, now: u64, schema: &Value, columns: &[(String, String)], snapshots: &[(Value, String)]) -> Value {
     // A list's elements need a mapping of their own: arrow-rs writes them as `item` (parquet-mr as `element`).
-    let names: Vec<Value> = columns.iter().enumerate().map(|(i, (c, t))| match t.ends_with("[]") {
+    let mut names: Vec<Value> = columns.iter().enumerate().map(|(i, (c, t))| match t.ends_with("[]") {
         true => json!({"field-id": i + 1, "names": [c], "fields": [{"field-id": columns.len() + i + 1, "names": ["item", "element"]}]}),
         false => json!({"field-id": i + 1, "names": [c]}),
     }).collect();
+    // The files also hold the rows' system columns (`sys.rs`), which the schema leaves out: named
+    // too (ids of their own, never the schema's), so a reader that maps a file's every column by
+    // name — PyIceberg — takes them, and leaves them out as the schema does.
+    names.extend(crate::sys::NAMES.iter().enumerate().map(|(i, c)| json!({"field-id": 1_000_001 + i, "names": [c]})));
     let older = &snapshots[..snapshots.len() - 1];
     json!({
         "format-version": 2, "table-uuid": uuid, "location": lake.full(&format!("data/{table}")),

@@ -1,0 +1,24 @@
+{
+ "clients": {
+  "no token -> 401": true,
+  "read token can't write": true,
+  "write token can't create": true,
+  "users via SQL": true,
+  "pandas / polars / list appends": true,
+  "lookup": true,
+  "change feed replay (upserts + delete)": true,
+  "psycopg 3": true,
+  "psycopg 3 binary": true,
+  "psycopg2": true,
+  "SQLAlchemy + pandas": true,
+  "asyncpg": true,
+  "wrong password refused": true,
+  "cross-lake join": true,
+  "inbox write": true,
+  "vector search (SQL + Postgres)": true,
+  "SQL can't touch the node's files": true,
+  "MCP": true
+ },
+ "inbox_s": 5.61,
+ "ok": true
+}

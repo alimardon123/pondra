@@ -33,15 +33,15 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
       - name: Build
@@ -69,7 +69,7 @@ jobs:
             "/opt/python/cp311-cp311/bin/python -m pip install -q --only-binary=:all: dist/*.whl 'pyarrow<19' && /opt/python/cp311-cp311/bin/python tools/package_check.py"
           docker run --rm -v "$PWD":/w -w /w ubuntu:22.04 bash -c \
             "apt-get update -qq && apt-get install -y -qq python3-pip > /dev/null && pip install -q dist/*.whl pyarrow && python3 tools/package_check.py"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: pondra-${{ matrix.platform }}
           path: dist/*
@@ -82,11 +82,11 @@ jobs:
       contents: write # the GitHub release
       id-token: write # PyPI trusted publishing, npm provenance
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           path: dist
           merge-multiple: true
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
           registry-url: https://registry.npmjs.org

@@ -20,7 +20,7 @@ pub fn of(batches: &[RecordBatch]) -> BTreeMap<String, String> {
     let schema = first.schema();
     let key = |t: &DataType| t.is_integer() || matches!(t, DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View | DataType::Date32 | DataType::Date64 | DataType::Decimal128(..));
     let mut out = BTreeMap::new();
-    for (i, f) in schema.fields().iter().enumerate().take(32).filter(|(_, f)| key(f.data_type())) {
+    for (i, f) in schema.fields().iter().enumerate().take(32).filter(|(_, f)| key(f.data_type()) && !crate::sys::NAMES.contains(&f.name().as_str())) {
         let mut regs = [0u8; M];
         for b in batches {
             let c = b.column(i);

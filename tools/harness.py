@@ -9,6 +9,8 @@
   harness.py insert              bulk INSERT … SELECT, retried: applied exactly once
   harness.py sums                sum(DOUBLE) == math.fsum, in any order, on every node
   harness.py schemas             lake.schema.table, attached lakes, CREATE/DROP SCHEMA/TABLE/VIEW, CTAS
+  harness.py changes             UPDATE/DELETE/MERGE on every table vs a model: row ids, views, the change feed, purges
+  harness.py guard               a query spreads only when it pays (a slow link keeps it on one node)
   harness.py load    --secs 30   throughput, ack latency, freshness, catalog commit latency
   harness.py all                 quick run of everything
 """
@@ -1022,7 +1024,7 @@ def schemas():
     c = Node(third, A.port + 6).start()
     for s in ("CREATE TABLE stock (id BIGINT, qty BIGINT)", "INSERT INTO stock VALUES (1, 100), (2, 200)"):
         sql(A.port + 6, s)
-    refused = [err(f"ATTACH '{d}' AS {n}", 1) for d, n in ((third, "public"), (lake, "self"), (third + "-nowhere", "w"), (other, f'"{me}"'))]  # a schema's name, this lake, no lake, this lake's name
+    refused = [err(f"ATTACH '{d}' AS {n}", 1) for d, n in ((third, "public"), (lake, "self"), (other, f'"{me}"'))]  # a schema's name, this lake, this lake's name
     q(f"ATTACH '{third}' AS Warehouse", 1)
     reach = lambda i: not _raises(lambda: q("SELECT count(*) AS n FROM warehouse.public.stock", i))
     everywhere = [until(lambda i=i: reach(i), True, 15) for i in range(3)]
@@ -1040,6 +1042,14 @@ def schemas():
     checks["ATTACH 'dir' AS name on one node: every node, after a restart, pondra sql; joins and writes across; DETACH everywhere; bad ones refused"] = \
         all(refused) and all(everywhere) and joined == [{"k": 1, "qty": 100}, {"k": 2, "qty": 200}] and (before_insert, fresh) == (2, 3) and after_restart == 3 and "| 3 |" in cli \
         and {me, "other", "warehouse"} <= listed and not any(gone)
+    # a new lake: ATTACH of a place with no lake makes one there; CREATE DATABASE makes one beside this lake
+    fresh, beside = third + "-new", f"made_{uuid.uuid4().hex[:6]}"
+    LAKES.extend([fresh, lake.rstrip("/").rsplit("/", 1)[0] + "/" + beside])
+    made, db = q(f"ATTACH '{fresh}' AS fresh", 1), q(f"CREATE DATABASE {beside}", 2)
+    q(f"CREATE TABLE {beside}.x (a BIGINT)")
+    q(f"INSERT INTO {beside}.x VALUES (1), (2)", 1)
+    checks["ATTACH of a place with no lake makes one; CREATE DATABASE makes one beside this lake, attached; twice is refused"] = made.get("created") is True and db.get("created") is True \
+        and until(lambda: _try(lambda: n(f"{beside}.x", 2)), 2, 15) == 2 and err(f"CREATE DATABASE {beside}") is not None and "unchanged" in q(f"CREATE DATABASE IF NOT EXISTS {beside}")
     [x.kill() for x in nodes + [b, c]]
     ok = all(checks.values())
     print(json.dumps({"schemas": checks, "ok": ok}, indent=1))
@@ -1372,6 +1382,253 @@ def put_object(lake, key, body):
     S3[0].put_object(Bucket=bucket, Key=f"{base}/{key}", Body=body)
 
 
+def changes():
+    """UPDATE, DELETE and MERGE on every table (ADR-020), against a model. An append table's rows
+    change by version: `_row_id` and `_created_at` kept, `_version` the change's commit, and the old
+    version gone from every read on every node at once — before and after tiering, and after the
+    purge that rewrites the files holding it (every round here: PONDRA_PURGE_ROWS=1), which Delta
+    readers see. Changes go to any node, from `pondra sql` too; three nodes adding to the same rows
+    at once lose none; a retried job applies once. A row-by-row view and an adding-up one follow
+    every change; the change feed (MCP `changes`, `/watch?changes=true`) replays to the same rows,
+    each old version as it was; a spread query over the changed tables == one node. Keyed tables
+    keep a row's id through an UPDATE and a MERGE. What can't follow a change is refused."""
+    import deltalake
+    lake, rnd = new_lake(), random.Random(19)
+    env = {"PONDRA_PURGE_ROWS": "1"}
+    nodes = [Node(lake, A.port + i, tier_secs=1, changelog_secs=3600, env=env).start() for i in range(3)]
+    # (a change waits for a tiering round in progress — with a purge in every one, on R2, seconds)
+    q = lambda s, i=0, **p: call(A.port + i, "POST", "/sql" + ("?" + "&".join(f"{k}={v}" for k, v in p.items()) if p else ""), s.encode(), timeout=300)
+    def err(s, i=0):
+        try:
+            q(s, i)
+            return None
+        except RuntimeError as e:
+            return str(e)
+    checks, model, ids = {}, {}, {}  # id -> [owner, bal]; id -> _row_id once seen
+    q("CREATE TABLE acct (id BIGINT, owner VARCHAR, bal DOUBLE) WITH (publish = 'delta')")
+    q("CREATE MATERIALIZED VIEW rich AS SELECT id, owner, bal FROM acct WHERE bal >= 50", 1)
+    q("CREATE MATERIALIZED VIEW per_owner AS SELECT owner, sum(bal) AS total, count(*) AS n FROM acct GROUP BY owner", 2)
+    owners, next_id = "abcd", [1]
+    def insert(i):
+        rows = []
+        for _ in range(rnd.randint(1, 30)):
+            model[next_id[0]] = [rnd.choice(owners), float(rnd.randint(0, 100))]
+            rows.append(f"({next_id[0]}, '{model[next_id[0]][0]}', {model[next_id[0]][1]})")
+            next_id[0] += 1
+        q("INSERT INTO acct VALUES " + ", ".join(rows), i)
+    def update(i):
+        m, r, d = rnd.randint(2, 5), rnd.randint(0, 1), rnd.randint(-20, 20)
+        q(f"UPDATE acct SET bal = bal + {d} WHERE id % {m} = {r}", i)
+        for k, v in model.items():
+            if k % m == r:
+                v[1] += d
+    def reown(i):
+        o, x = rnd.choice(owners), rnd.randint(0, 60)
+        q(f"UPDATE acct SET owner = '{o}' WHERE bal < {x}", i)
+        for v in model.values():
+            if v[1] < x:
+                v[0] = o
+    def delete(i):
+        x, r = rnd.randint(40, 120), rnd.randint(0, 2)
+        q(f"DELETE FROM acct WHERE bal > {x} AND id % 3 = {r}", i)
+        for k in [k for k, v in model.items() if v[1] > x and k % 3 == r]:
+            del model[k]
+    def merge(i):
+        src = {}
+        for _ in range(rnd.randint(1, 8)):
+            k = rnd.choice(list(model) or [1]) if rnd.random() < 0.6 else next_id[0] + rnd.randint(0, 5)
+            src[k] = (rnd.choice(owners), float(rnd.randint(0, 30)))
+        values = ", ".join(f"({k}, '{o}', {b})" for k, (o, b) in src.items())
+        q(f"MERGE INTO acct t USING (VALUES {values}) AS s(id, owner, bal) ON t.id = s.id "
+          "WHEN MATCHED AND s.bal < 5 THEN DELETE WHEN MATCHED THEN UPDATE SET bal = t.bal + s.bal WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.owner, s.bal)", i)
+        for k, (o, b) in src.items():
+            if k in model and b < 5:
+                del model[k]
+            elif k in model:
+                model[k][1] += b
+            else:
+                model[k] = [o, b]
+        next_id[0] = max(next_id[0], max(src) + 1)
+    want = lambda: [{"id": k, "owner": v[0], "bal": v[1]} for k, v in sorted(model.items())]
+    table = lambda i=0: q("SELECT id, owner, bal FROM acct ORDER BY id", i)
+    def per_owner():
+        out = {}
+        for o, b in model.values():
+            t = out.setdefault(o, [0.0, 0])
+            t[0], t[1] = t[0] + b, t[1] + 1
+        return [{"owner": o, "total": t[0], "n": t[1]} for o, t in sorted(out.items())]
+    seen, kept, agree = [], [], []
+    insert(0)
+    for step in range(60):
+        rnd.choice([insert, update, update, reown, delete, merge, merge])(rnd.randrange(3))
+        if step % 6 == 5:
+            now = want()
+            agree.append(all(until(lambda i=i: table(i), now, 10) == now for i in range(3)))
+            agree.append(until(lambda: q("SELECT id, owner, bal FROM rich ORDER BY id", 1), [r for r in now if r["bal"] >= 50], 10) == [r for r in now if r["bal"] >= 50])
+            agree.append(until(lambda: q("SELECT owner, total, n FROM per_owner ORDER BY owner", 2), per_owner(), 10) == per_owner())
+            rows = {r["id"]: r["_row_id"] for r in q("SELECT id, _row_id FROM acct")}
+            kept.append(all(rows.get(k, v) == v for k, v in ids.items() if k in model) and len(set(rows.values())) == len(rows))
+            ids.update(rows)
+            seen.append(len(model))
+    checks["60 random INSERT/UPDATE/DELETE/MERGE on 3 nodes == the model, every node, while tiering and purging"] = all(agree)
+    checks["an UPDATE or MERGE keeps a row's _row_id; ids are unique"] = all(kept)
+    # a retried job, and changes from `pondra sql` (to the running leader)
+    first, again = q("UPDATE acct SET bal = bal + 1000 WHERE id % 2 = 0", 1, job="bump-1"), q("UPDATE acct SET bal = bal + 1000 WHERE id % 2 = 0", 2, job="bump-1")
+    for k, v in model.items():
+        v[1] += 1000 if k % 2 == 0 else 0
+    cli = subprocess.run([BIN, "sql", "--dir", lake, "UPDATE acct SET bal = bal - 1000 WHERE id % 2 = 0"], capture_output=True, text=True, timeout=120)
+    for k, v in model.items():
+        v[1] -= 1000 if k % 2 == 0 else 0
+    checks["a retried job changes rows once; `pondra sql` changes them through the leader"] = "duplicate" in again and "duplicate" not in first and cli.returncode == 0 \
+        and until(table, want(), 10) == want()
+    # three nodes adding to the same rows at once: none lost
+    live = sorted(model)[:20]
+    def bump(i):
+        for _ in range(5):
+            q(f"UPDATE acct SET bal = bal + 1 WHERE id IN ({', '.join(map(str, live))})", i)
+    threads = [threading.Thread(target=bump, args=(i,)) for i in range(3)]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    for k in live:
+        model[k][1] += 15
+    checks["three nodes changing the same rows at once: every change counts"] = until(table, want(), 10) == want()
+    # the change feed replays to the table, each old version as it was
+    state, (pos, pre_ok) = {}, (0, True)
+    def mcp_changes(after):
+        body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "changes", "arguments": {"table": "acct", "after": after}}}).encode()
+        r = call(A.port, "POST", "/mcp", body, headers={"content-type": "application/json"})
+        return json.loads(r["result"]["content"][0]["text"])
+    for _ in range(1000):
+        got = mcp_changes(pos)
+        for r in got["rows"]:
+            key, row = r["_row_id"], (r["id"], r["owner"], r["bal"])
+            if r["_change_type"] in ("insert", "update_postimage"):
+                state[key] = row
+            else:  # the version it replaces, as it was
+                pre_ok &= state.pop(key, None) == row
+        if got["position"] == pos and not got["rows"]:
+            break
+        pos = got["position"]
+    replayed = sorted((i, o, b) for i, o, b in state.values())
+    checks["the change feed replays to the table's rows; each old version as it was"] = pre_ok and replayed == [(r["id"], r["owner"], r["bal"]) for r in want()]
+    watched = []
+    def watch():
+        c = http.client.HTTPConnection("127.0.0.1", A.port + 1, timeout=120)  # (nothing comes until the change commits: seconds, on R2)
+        c.request("GET", "/watch/acct?changes=true")
+        r = c.getresponse()
+        while len(watched) < 2:
+            watched.append(json.loads(r.readline()))
+    w = threading.Thread(target=watch)
+    w.start()
+    time.sleep(0.5)
+    one = sorted(model)[0]
+    q(f"UPDATE acct SET owner = 'w' WHERE id = {one}", 2)
+    model[one][0] = "w"
+    w.join(60)
+    checks["/watch?changes=true: an UPDATE as its old and new versions"] = [r["_change_type"] for r in watched] == ["update_preimage", "update_postimage"] \
+        and watched[0]["_row_id"] == watched[1]["_row_id"] and watched[1]["owner"] == "w"
+    # Delta readers, once the change is tiered and purged
+    opts = {} if not A.s3 else {"AWS_ENDPOINT_URL": os.environ["AWS_ENDPOINT"], "AWS_ACCESS_KEY_ID": os.environ["AWS_ACCESS_KEY_ID"], "AWS_SECRET_ACCESS_KEY": os.environ["AWS_SECRET_ACCESS_KEY"],
+                                "AWS_REGION": "auto", "AWS_ALLOW_HTTP": os.environ.get("AWS_ALLOW_HTTP", "false")}
+    delta = lambda: sorted((r["id"], r["owner"], r["bal"]) for r in deltalake.DeltaTable(f"{lake}/data/acct", storage_options=opts).to_pyarrow_table().select(["id", "owner", "bal"]).to_pylist())
+    checks["Delta readers see the changes once they are tiered and purged"] = until(lambda: _try(delta), [(r["id"], r["owner"], r["bal"]) for r in want()], 60) == [(r["id"], r["owner"], r["bal"]) for r in want()]
+    # spread over the nodes: a changed table in pieces, its old rows in files, the log and $deleted
+    q("CREATE TABLE big (id BIGINT, k BIGINT, v DOUBLE)")
+    for i in range(6):
+        q(f"INSERT INTO big SELECT value + {i * 20000}, value % 50, value * 0.5 FROM generate_series(1, 20000)")
+    q("UPDATE big SET v = v * 2 WHERE k < 10")
+    q("DELETE FROM big WHERE k >= 45")
+    q("MERGE INTO big t USING (SELECT id, k FROM big WHERE k = 20) s ON t.id = s.id WHEN MATCHED THEN DELETE")
+    spread = []
+    for s in ("SELECT count(*) AS n, sum(v) AS s FROM big", "SELECT k, count(*) AS n, sum(v) AS s FROM big GROUP BY k ORDER BY k",
+              "SELECT count(*) AS n, sum(b.v + a.bal) AS s FROM big b JOIN acct a ON b.k = a.id"):
+        before = metrics_of(A.port)["pondra_spread_queries_total"]
+        spread.append((q(s, spread=0), q(s, spread=1), metrics_of(A.port)["pondra_spread_queries_total"] > before))
+    n_big = q("SELECT count(*) AS n, sum(v) AS s FROM big")[0]
+    expect_n = sum(1 for i in range(1, 120001) if not (i % 20000 % 50 >= 45 or i % 20000 % 50 == 20))
+    checks["spread over three nodes == one node, over the changed tables"] = all(a == b and ran for a, b, ran in spread) and n_big["n"] == expect_n
+    # views: what can't follow is refused; a view's table isn't changed by hand
+    q("CREATE MATERIALIZED VIEW top AS SELECT owner, max(bal) AS m FROM acct GROUP BY owner")
+    refused = [err("UPDATE acct SET bal = 0 WHERE id = 1"), err("UPDATE rich SET bal = 0"), err("UPDATE acct SET _row_id = 1"),
+               err("MERGE INTO acct t USING (VALUES (1, 'x', 1.0), (1, 'y', 2.0)) AS s(id, owner, bal) ON t.id = s.id WHEN MATCHED THEN UPDATE SET bal = s.bal")]
+    q("DROP MATERIALIZED VIEW top")
+    checks["refused: a change under a view keeping a max; a view's table; a system column; a MERGE matching a row twice"] = \
+        "view top (keeps a min or max)" in (refused[0] or "") and "view's" in (refused[1] or "") and all(refused[2:]) and until(table, want(), 10) == want()
+    # keyed tables: an UPDATE keeps the row's id; MERGE updates, inserts and deletes
+    q("CREATE TABLE kv (k BIGINT, v BIGINT, _deleted BOOLEAN, PRIMARY KEY (k))")
+    q("INSERT INTO kv VALUES (1, 10, false), (2, 20, false)")
+    before = {r["k"]: r["_row_id"] for r in q("SELECT k, _row_id FROM kv")}
+    q("UPDATE kv SET v = v + 1 WHERE k = 1", 1)
+    q("MERGE INTO kv t USING (VALUES (1, 100), (3, 300), (2, 0)) AS s(k, v) ON t.k = s.k WHEN MATCHED AND s.v = 0 THEN DELETE WHEN MATCHED THEN UPDATE SET v = s.v WHEN NOT MATCHED THEN INSERT (k, v) VALUES (s.k, s.v)", 2)
+    after = q("SELECT k, v, _row_id FROM kv ORDER BY k")
+    checks["keyed tables: UPDATE and MERGE keep a row's _row_id; MERGE inserts and deletes"] = [(r["k"], r["v"]) for r in after] == [(1, 100), (3, 300)] and after[0]["_row_id"] == before[1] \
+        and after[1]["_row_id"] not in before.values()
+    # a new node, and every node after a restart, reads the same
+    nodes[1].kill()
+    nodes[1].start(tries=1)
+    checks["after a restart, the same rows"] = until(lambda: table(1), want(), 30) == want()
+    [n.kill() for n in nodes]
+    ok = all(checks.values())
+    print(json.dumps({"changes": checks, "ok": ok}, indent=1))
+    if not ok:
+        print(agree, kept, first, again, cli.stderr[-500:], replayed[:5], want()[:5], watched, spread, n_big, expect_n, refused, after, before)
+        sys.exit(1)
+    return f"changes: 60 random changes on 3 nodes == the model, rows keep their ids, views and the change feed follow, Delta sees them purged, spread == one node: all {len(checks)} checks pass"
+
+
+def guard():
+    """A query spreads over the nodes only when it pays (`guard.rs`): what it would move, at the
+    link's speed, against the time it takes on one node less a node's share. The same queries
+    through a node that sees a slow network (PONDRA_LINK=40,60: 40 ms, 60 MB/s, as between GitHub's
+    runners) stay on it when they would shuffle, and through one that sees a fast one spread; `?spread=1` spreads anyway;
+    a query nothing is known about yet stays on one node; the answers are the same every way."""
+    lake = new_lake()
+    small = {"PONDRA_SPREAD_MB": "1"}  # (tables this small are left on one node by size alone)
+    slow = Node(lake, A.port, env={"PONDRA_LINK": "40,60", **small}).start()
+    fast = Node(lake, A.port + 1, env={"PONDRA_LINK": "0.2,5000", **small}).start()
+    third = Node(lake, A.port + 2, env=small).start()
+    n = itertools.count()  # (a comment makes each ask new to the result cache; the guard knows it as the same query)
+    q = lambda s, port, spread=None: call(port, "POST", "/sql" + ("" if spread is None else f"?spread={spread}"), f"{s} -- {next(n)}".encode(), timeout=300)
+    q("CREATE TABLE f (id BIGINT, k BIGINT, v DOUBLE, p BIGINT) WITH (partition_by = 'p')", A.port)  # (a file per partition, merged or not)
+    q("CREATE TABLE g (id BIGINT, w DOUBLE)", A.port)
+    for i in range(8):
+        q(f"INSERT INTO f SELECT value + {i * 500000}, value % 100000, value * 0.5, value % 4 FROM generate_series(1, 500000)", A.port)
+        q(f"INSERT INTO g SELECT value * 7 + {i * 3500000}, value * 0.25 FROM generate_series(1, 500000)", A.port)
+    time.sleep(1)
+    spreads = lambda port: metrics_of(port)["pondra_spread_queries_total"]
+    queries = ["SELECT k, count(*) AS n, sum(v) AS s FROM f GROUP BY k ORDER BY n DESC, k LIMIT 5",
+               "SELECT count(*) AS n, sum(f.v + g.w) AS s FROM f JOIN g ON f.k = g.id",
+               "SELECT count(DISTINCT v) AS n FROM f"]
+    out = {}
+    for first, s in zip((True, False, False), queries):
+        runs = {}
+        for name, node in (("slow", slow), ("fast", fast)):
+            before = spreads(node.port)
+            unknown = q(s, node.port)  # (the first query: nothing known yet, it stays here)
+            stayed = spreads(node.port) == before or not first
+            one = q(s, node.port, 0)
+            before = spreads(node.port)
+            auto = q(s, node.port)
+            runs[name] = (auto == one == unknown, spreads(node.port) > before, stayed)
+        before, shuffles = spreads(slow.port), metrics_of(slow.port)["pondra_shuffled_queries_total"]
+        forced = q(s, slow.port, 1)
+        runs["forced"] = (forced == q(s, fast.port, 0), spreads(slow.port) > before, metrics_of(slow.port)["pondra_shuffled_queries_total"] > shuffles)
+        out[s[:40]] = runs
+    [n.kill() for n in (slow, fast, third)]
+    checks = {"the same answers every way": all(r["slow"][0] and r["fast"][0] and r["forced"][0] for r in out.values()),
+              "a query nothing is known about stays on one node": all(r["slow"][2] and r["fast"][2] for r in out.values()),
+              # (a query that moves nothing — its tables split by a key's ranges — may pay even there: on R2 a node's reads are slow)
+              "over a slow network, queries that would shuffle stay on one node": not any(r["slow"][1] for r in out.values() if r["forced"][2]) and any(r["forced"][2] for r in out.values()),
+              "over a fast one, they spread": all(r["fast"][1] for r in out.values()),
+              "?spread=1 spreads anyway": all(r["forced"][1] for r in out.values())}
+    ok = all(checks.values())
+    print(json.dumps({"guard": checks, "ok": ok}, indent=1))
+    if not ok:
+        print(out)
+        sys.exit(1)
+    return f"guard: {len(queries)} queries stay on one node over a slow network and spread over a fast one, forced ones spread, the same answers: all {len(checks)} checks pass"
+
+
 def _try(f):
     """f(), or None if it raises."""
     try:
@@ -1434,7 +1691,7 @@ def load():
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    out = {t.__name__: t() for t in (upsert, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, asof, sums, schemas, scale, flight, reader, crash)}
+    out = {t.__name__: t() for t in (upsert, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, asof, sums, schemas, changes, guard, scale, flight, reader, crash)}
     A.secs = min(A.secs, 20)
     out["load"] = load()
     print(json.dumps(out, indent=1))
@@ -1442,7 +1699,7 @@ def all_tests():
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "tiering", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "asof", "sums", "schemas", "scale", "flight", "load", "all"])
+    ap.add_argument("mode", choices=["crash", "upsert", "tiering", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "asof", "sums", "schemas", "changes", "guard", "scale", "flight", "load", "all"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -1453,4 +1710,4 @@ if __name__ == "__main__":
     ap.add_argument("--secs", type=int, default=30)
     ap.add_argument("--flush-ms", type=int, default=250)
     A = ap.parse_args()
-    {"crash": crash, "upsert": upsert, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "asof": asof, "sums": sums, "schemas": schemas, "scale": scale, "flight": flight, "load": load, "all": all_tests}[A.mode]()
+    {"crash": crash, "upsert": upsert, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "scale": scale, "flight": flight, "load": load, "all": all_tests}[A.mode]()

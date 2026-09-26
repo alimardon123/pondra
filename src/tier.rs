@@ -135,6 +135,94 @@ pub async fn maintain(lake: &Lake, table: &str, nodes: &[String], me: &str) -> R
     Ok(true)
 }
 
+/// UPDATE, DELETE and MERGE leave an append table's old rows in its files, and reads leave them
+/// out (`query::current`, against `{t}$deleted`). A purge rewrites the files holding them without
+/// them — so other engines (Delta, Iceberg) see the change, and reads stop paying for it: every
+/// round for a table that is published, else once `PONDRA_PURGE_ROWS` (100,000) old rows or a
+/// tenth of the table wait. It covers the changes whose old rows are all in files and whose
+/// tombstones are too (commits up to both tables' `tiered`), and says so (`TableMeta::purges`).
+/// `now_anyway`: whatever waits (`CHECKPOINT`).
+/// A `{t}$deleted` file whose changes were all purged goes once every reader has passed that
+/// purge (`retain_ms` later: a reader with an older entry for the table still needs it).
+pub async fn purge(lake: &Lake, table: &str, nodes: &[String], me: &str, retain_ms: u64, now_anyway: bool) -> Result<bool> {
+    use crate::sys::{deleted, with_sys, VERSION};
+    let Some(mut meta) = lake.cat.get::<TableMeta>(&table_key(table)).await?.filter(|m| m.changed && m.key.is_empty()) else { return Ok(false) };
+    let Some(mut dmeta) = lake.cat.get::<TableMeta>(&table_key(&deleted(table))).await? else { return Ok(false) };
+    let (after, upto, now) = (meta.purged(), meta.tiered.min(dmeta.tiered), crate::log::now_ms());
+    if upto <= after {
+        return Ok(false);
+    }
+    let within = datafusion::prelude::col(VERSION).between(datafusion::prelude::lit(after as i64 + 1), datafusion::prelude::lit(upto as i64));
+    let gone = crate::manifest::pruned(lake, &dmeta, None, &[within], &schema(&with_sys(&dmeta).columns)?).await?;
+    let waiting: u64 = gone.iter().map(|f| f.rows).sum();
+    let rows = meta.files.iter().map(|f| f.rows).sum::<u64>() + meta.sealed.as_ref().map_or(0, |s| s.rows);
+    let at_least = std::env::var("PONDRA_PURGE_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(100_000);
+    if !now_anyway && meta.publish.is_empty() && waiting < at_least && waiting * 10 < rows {
+        return Ok(false);
+    }
+    // The files that can hold an old row: by their `_row_id` and `_version` ranges.
+    let mut dead = dead(lake, &gone, after, upto).await?;
+    dead.sort_unstable();
+    let range = |s: &crate::manifest::Stats, c: &str| s.get(c).and_then(|(lo, hi)| Some((lo.parse::<i64>().ok()?, hi.parse::<i64>().ok()?)));
+    let holds = |s: &crate::manifest::Stats| crate::sys::holds(&dead, s);
+    let (list, mut sealed, mut hit) = (crate::manifest::list(lake, &meta).await?, vec![], vec![]);
+    for (i, m) in list.iter().enumerate().filter(|(_, m)| holds(&m.stats)) {
+        let files: Vec<DataFile> = crate::manifest::files(lake, m).await?.into_iter().filter(|f| holds(&f.stats)).collect();
+        if !files.is_empty() {
+            sealed.push(i);
+            hit.extend(files);
+        }
+    }
+    hit.extend(meta.files.iter().filter(|f| holds(&f.stats)).cloned());
+    if !hit.is_empty() {
+        crate::manifest::unseal(lake, table, &mut meta, list, &sealed).await?;
+        let mut groups: Vec<Vec<DataFile>> = vec![];
+        for f in hit.iter().cloned() {
+            match groups.last_mut() {
+                Some(g) if g.iter().map(|f| f.bytes).sum::<u64>() + f.bytes <= MERGE_BYTES => g.push(f),
+                _ => groups.push(vec![f]),
+            }
+        }
+        let jobs = groups.into_iter().map(|files| Job::new(table, &meta, Kind::Purge { files, gone: gone.clone(), after, upto })).collect();
+        let kept = deal(lake, jobs, nodes, me).await?;
+        replace(&mut meta, &hit, kept);
+        crate::manifest::seal(lake, table, &mut meta).await?;
+    }
+    // (the newest purge every reader has passed, and those after it, are kept)
+    meta.purges.push((upto, now));
+    let passed = meta.purges.iter().rposition(|p| now - p.1 >= retain_ms);
+    if let Some(i) = passed {
+        let settled = meta.purges[i].0 as i64;
+        meta.purges.drain(..i);
+        let done: Vec<DataFile> = dmeta.files.iter().filter(|f| range(&f.stats, VERSION).is_some_and(|(_, hi)| hi <= settled)).cloned().collect();
+        replace(&mut dmeta, &done, vec![]);
+    }
+    lake.cat.commit(vec![(table_key(table), json(&meta)), (table_key(&deleted(table)), json(&dmeta))], &[]).await?;
+    Ok(true)
+}
+
+/// The old rows of the changes in (after, upto]: (`_row_id`, `_version`) pairs, from `{t}$deleted` files.
+async fn dead(lake: &Lake, gone: &[DataFile], after: u64, upto: u64) -> Result<Vec<(i64, i64)>> {
+    use datafusion::arrow::{array::AsArray, datatypes::Int64Type};
+    let mut out = vec![];
+    for b in dead_rows(lake, gone, after, upto).await?.collect().await? {
+        let (ids, versions) = (b.column(0).as_primitive::<Int64Type>(), b.column(1).as_primitive::<Int64Type>());
+        out.extend(ids.iter().zip(versions.iter()).filter_map(|(i, v)| Some((i?, v?))));
+    }
+    Ok(out)
+}
+
+async fn dead_rows(lake: &Lake, gone: &[DataFile], after: u64, upto: u64) -> Result<datafusion::prelude::DataFrame> {
+    use datafusion::prelude::{col, lit};
+    let paths: Vec<String> = gone.iter().map(|f| lake.full(&f.path)).collect();
+    let ctx = lake.session();
+    let within = col(crate::sys::VERSION).between(lit(after as i64 + 1), lit(upto as i64));
+    Ok(match paths.is_empty() {
+        true => ctx.read_empty()?.select(vec![lit(0i64).alias("__id"), lit(0i64).alias("__v")])?.limit(0, Some(0))?,
+        false => ctx.read_parquet(paths, ParquetReadOptions::default()).await?.filter(within)?.select(vec![col(crate::sys::ROW_ID).alias("__id"), col("_old_version").alias("__v")])?,
+    })
+}
+
 /// A keyed table's files to merge next: the newest ones, going back while each older file is at
 /// most twice the size of everything newer (so a merge rewrites data of similar size, and the big
 /// base is only rewritten once the rest reaches half of it). A run must be consecutive in `ord`:
@@ -180,6 +268,7 @@ enum Kind {
     Merge { files: Vec<DataFile> },            // small files -> one
     Compact { upto: u64, rows: u64 },          // files + log up to `upto` -> one row per key
     Squash { files: Vec<DataFile> },           // keyed: a run of newer files -> one (delete markers kept)
+    Purge { files: Vec<DataFile>, gone: Vec<DataFile>, after: u64, upto: u64 }, // each file, without the old rows `gone` (`{t}$deleted`'s) holds for changes in (after, upto]
 }
 
 /// Run jobs round-robin on the live nodes (each round starts where the last one stopped, so
@@ -202,6 +291,7 @@ async fn deal(lake: &Lake, jobs: Vec<Job>, nodes: &[String], me: &str) -> Result
 
 /// Do one job here; returns the Parquet files written.
 pub async fn run_job(lake: &Lake, Job { table, meta, kind }: Job) -> Result<Vec<DataFile>> {
+    let meta = crate::sys::with_sys(&meta); // (files carry every row's system columns)
     // A job holds its rows and the Parquet file it is writing, so what a node runs at once is
     // bounded by the data behind them, not by their number: small merges go side by side, big
     // ones take turns (however many the leader deals out — it waits for them all anyway).
@@ -210,7 +300,7 @@ pub async fn run_job(lake: &Lake, Job { table, meta, kind }: Job) -> Result<Vec<
     let slots = SLOTS.get_or_init(|| tokio::sync::Semaphore::new(budget));
     let mb = |files: &[DataFile]| (files.iter().map(|f| f.bytes).sum::<u64>() >> 20) as usize;
     let takes = match &kind {
-        Kind::Merge { files } | Kind::Squash { files } => mb(files),
+        Kind::Merge { files } | Kind::Squash { files } | Kind::Purge { files, .. } => mb(files),
         Kind::Compact { .. } => mb(&meta.files),
         Kind::Fold { .. } => 32,
     };
@@ -223,7 +313,7 @@ pub async fn run_job(lake: &Lake, Job { table, meta, kind }: Job) -> Result<Vec<
     let (batches, ord) = match kind {
         Kind::Fold { after, upto, rows } if meta.key.is_empty() => {
             caught_up(lake, &table, after, upto, rows).await?;
-            let rows = tail(lake, &table, after, Some(upto), false).await?;
+            let rows = crate::query::tail_of(lake, &table, after, Some(upto), false, true).await?;
             let rows = match rows.is_empty() || meta.cluster.is_empty() {
                 true => rows,
                 false => clustered(&meta, lake.session().read_batches(rows)?)?.collect().await?,
@@ -248,6 +338,20 @@ pub async fn run_job(lake: &Lake, Job { table, meta, kind }: Job) -> Result<Vec<
             let ord = files.iter().map(|f| f.ord).max().unwrap_or(0);
             let part = TableMeta { files, ..meta.clone() };
             (latest(lake, &table, &part, meta.tiered, true).await?, ord)
+        }
+        // Each file on its own (its partition, its order), its rows but the old versions.
+        Kind::Purge { files, gone, after, upto } => {
+            let (mut out, s) = (vec![], schema(&meta.columns)?);
+            for f in files {
+                let ctx = lake.session_with(1);
+                let rows = ctx.read_parquet(lake.full(&f.path), ParquetReadOptions::default().schema(&s)).await?;
+                let dead = ctx.read_batches(dead_rows(lake, &gone, after, upto).await?.collect().await?)?;
+                let kept = dead.join(rows, datafusion::common::JoinType::RightAnti, &["__id", "__v"], &[crate::sys::ROW_ID, crate::sys::VERSION], None)?.collect().await?;
+                if let Some(new) = write_file(lake, &table, &kept, &keys, true).await? {
+                    out.push(DataFile { ord: f.ord, part: f.part.clone(), ..new });
+                }
+            }
+            return Ok(out);
         }
         Kind::Merge { files } => {
             let paths: Vec<String> = files.iter().map(|f| lake.full(&f.path)).collect();
@@ -488,6 +592,14 @@ fn writer<'a>(buf: &'a mut Vec<u8>, batch: &RecordBatch, keys: &[String]) -> Res
     for k in keys {
         props = props.set_column_bloom_filter_enabled(k.as_str().into(), true);
     }
+    // System columns: row ids count up, deltas of a few bits each; versions and times repeat per
+    // commit, and plain values the codec squeezes are what costs least to write (the files come
+    // out the size they were without them).
+    for c in crate::sys::NAMES.iter().filter(|c| batch.schema().index_of(c).is_ok()) {
+        let path: datafusion::parquet::schema::types::ColumnPath = (*c).into();
+        let encoding = if *c == crate::sys::ROW_ID { datafusion::parquet::basic::Encoding::DELTA_BINARY_PACKED } else { datafusion::parquet::basic::Encoding::PLAIN };
+        props = props.set_column_dictionary_enabled(path.clone(), false).set_column_encoding(path, encoding);
+    }
     Ok(ArrowWriter::try_new(buf, batch.schema(), Some(props.build()))?)
 }
 
@@ -523,7 +635,8 @@ pub async fn write_file(lake: &Lake, table: &str, batches: &[RecordBatch], keys:
         true => (crate::manifest::stats(batches), Some(crate::manifest::nulls(batches)), crate::sketch::of(batches)),
         false => Default::default(),
     };
-    Ok(Some(DataFile { path, rows: rows as u64, bytes, ord: 0, whole: false, stats, part: String::new(), nulls, sketch }))
+    let sys = batches[0].schema().index_of(crate::sys::ROW_ID).is_ok();
+    Ok(Some(DataFile { path, rows: rows as u64, bytes, ord: 0, whole: false, stats, part: String::new(), nulls, sketch, sys }))
 }
 
 /// Stream a query result into Parquet files of up to `max_rows` each (bulk INSERT … SELECT).

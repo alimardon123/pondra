@@ -55,6 +55,10 @@ pub struct Part {
     /// Sliced by a key's range (`ranges.rs`): only the rows in it, whatever the files hold.
     #[serde(default)]
     pub range: Option<crate::ranges::Range>,
+    /// How far the files it names are purged of changed rows (`TableMeta::purged`), as the
+    /// coordinator saw them: a node whose own entry is newer would skip old rows they still hold.
+    #[serde(default)]
+    pub purged: u64,
 }
 
 /// One node's share of a query: gathering, the main table's part; shuffling, every table's.
@@ -125,8 +129,16 @@ pub async fn query(lake: &Lake, nodes: &[String], me: &str, sql: &str, force: bo
     let Some((main, meta, bytes)) = main else { return Ok(refused("no append table to slice")) };
     let files = size(&meta).0;
     if files == 0 || (!force && (files < nodes.len() || bytes < spread_bytes())) {
-        return Ok(None); // (`force`: spread anyway, for tests)
+        return Ok(refused(format!("{main} is too small ({files} files, {bytes} bytes)"))); // (`force`: spread anyway, for tests)
     }
+    // Whether it pays (`guard.rs`), unless it is to spread anyway: the slowest link, what it reads.
+    let guard = match force {
+        true => None,
+        false => match crate::guard::slowest(nodes, me).await {
+            Some(link) => Some((link, reads(lake, &tables).await?)),
+            None => return Ok(refused("a node's link can't be measured")),
+        },
+    };
     let mine = nodes.iter().position(|n| n == me).context("not a member")?;
     let parts = deal(lake, &meta, &main, nodes.len()).await?;
     let id = uuid::Uuid::new_v4().to_string(); // (the folder every node spills this query's results into)
@@ -141,14 +153,20 @@ pub async fn query(lake: &Lake, nodes: &[String], me: &str, sql: &str, force: bo
         !hashed(c) && spread(&c.children()[0], &mut exchanges) == Some(Spread::Split) && exchanges.is_empty()
     });
     let Some(cut) = cut else {
-        return match shuffle(lake, nodes, me, sql, &tables, &main).await? {
+        return match shuffle(lake, nodes, me, sql, &tables, &main, guard).await? {
             Some(rows) => Ok(Some(rows)),
-            None => Ok(refused("no split of its plan is correct")),
+            None => Ok(refused("no split of its plan is correct, or pays")),
         };
     };
+    if let Some((link, read)) = guard {
+        let moved = crate::guard::bytes_out(&cut.children()[0]).unwrap_or(3 * read) * (nodes.len() as u64 - 1) / nodes.len() as u64;
+        if !crate::guard::pays(sql, link, moved, 0, read, nodes.len()) {
+            return Ok(refused("it wouldn't pay"));
+        }
+    }
     // Gather: every node computes its partial result at the same time (this one: its files and,
     // as one more slice, the log tail).
-    let tail = slice(vec![Part { table: main, tail: Some((meta.tiered, upto)), ..Default::default() }]);
+    let tail = slice(vec![Part { table: main, tail: Some((meta.tiered, upto)), purged: meta.purged(), ..Default::default() }]);
     let runs = nodes.iter().zip(&slices).map(|(node, s)| async move {
         match node == me {
             true => Ok(vec![]), // below
@@ -200,6 +218,23 @@ async fn whole(lake: &Lake, tables: &[String], sliced: &[&str]) -> Result<Vec<(S
     Ok(out)
 }
 
+/// The bytes of the tables a query reads (`guard.rs`: what a query's time goes with).
+pub async fn reads(lake: &Lake, tables: &[String]) -> Result<u64> {
+    let mut bytes = 0;
+    for t in tables {
+        bytes += lake.cat.get::<TableMeta>(&table_key(t)).await?.map_or(0, |m| size(&m).1);
+    }
+    Ok(bytes)
+}
+
+/// What `sql` reads, in bytes (0 if it isn't one query).
+pub async fn reads_sql(lake: &Lake, sql: &str) -> Result<u64> {
+    match read(lake, sql).await? {
+        Some(tables) => reads(lake, &tables).await,
+        None => Ok(0),
+    }
+}
+
 /// A table's (files, bytes): its inline files and its sealed manifests.
 fn size(meta: &TableMeta) -> (usize, u64) {
     let sealed = meta.sealed.clone().unwrap_or_default();
@@ -226,7 +261,7 @@ async fn deal(lake: &Lake, meta: &TableMeta, table: &str, n: usize) -> Result<Ve
         }
     }
     files.extend(meta.files.iter().cloned());
-    let (mut parts, mut load) = (vec![Part { table: table.into(), ..Default::default() }; n], vec![0u64; n]);
+    let (mut parts, mut load) = (vec![Part { table: table.into(), purged: meta.purged(), ..Default::default() }; n], vec![0u64; n]);
     let lightest = |load: &[u64]| load.iter().enumerate().min_by_key(|(i, b)| (**b, *i)).expect("a node").0;
     for m in manifests {
         let i = lightest(&load);
@@ -303,12 +338,12 @@ pub fn reply(shape: &str, parts: Vec<Spill>, done: Option<crate::spill::Gone>) -
 /// The physical plan of the slice's query, its tables standing for just their parts.
 async fn plan(lake: &Lake, s: &Slice) -> Result<(SessionContext, Arc<dyn ExecutionPlan>)> {
     let ctx = session(lake, &s.sql, "").await?;
-    if !s.whole.is_empty() || s.parts.iter().any(|p| p.tail.is_some()) {
-        // The whole tables, and log tails, as the coordinator saw them: this node must have seen
-        // the log that far.
-        let mut hwm = lake.hwm.subscribe();
-        let _ = tokio::time::timeout(Duration::from_secs(10), async { while lake.visible() < s.upto && hwm.changed().await.is_ok() {} }).await;
-        ensure!(lake.visible() >= s.upto, "this node is behind the lake ({} < {})", lake.visible(), s.upto);
+    // The whole tables, log tails and changed rows (`{t}$deleted`) as the coordinator saw them:
+    // this node must have seen the log that far.
+    let mut hwm = lake.hwm.subscribe();
+    let _ = tokio::time::timeout(Duration::from_secs(10), async { while lake.visible() < s.upto && hwm.changed().await.is_ok() {} }).await;
+    ensure!(lake.visible() >= s.upto, "this node is behind the lake ({} < {})", lake.visible(), s.upto);
+    {
         for (t, meta) in &s.whole {
             let inner = crate::query::table_view(lake, &ctx, t, meta, Some(s.upto)).await?;
             ctx.deregister_table(table_ref(t))?;
@@ -326,7 +361,7 @@ async fn plan(lake: &Lake, s: &Slice) -> Result<(SessionContext, Arc<dyn Executi
         // raw rows through (DataFusion's shortcut for high-cardinality groups) would ship the table.
         o.execution.skip_partial_aggregation_probe_rows_threshold = usize::MAX;
         if let Some(sh) = &s.shuffle {
-            o.optimizer.enable_dynamic_filter_pushdown = false; // (a join's filter would reach a scan of an earlier step)
+            o.set("datafusion.optimizer.enable_dynamic_filter_pushdown", "false")?; // (a join's filter would reach a scan of an earlier step; `set`: the join's own switch too)
             if !matches!(sh.how, How::Ranged | How::Broadcast) {
                 // Every join shuffles both sides (a broadcast side, if sliced, would be partial).
                 (o.optimizer.hash_join_single_partition_threshold, o.optimizer.hash_join_single_partition_threshold_rows) = (0, 0);
@@ -340,8 +375,9 @@ async fn plan(lake: &Lake, s: &Slice) -> Result<(SessionContext, Arc<dyn Executi
         let share = Some(totals(&meta));
         // The whole table's ranges, not this slice's: every node has to plan the query alike.
         let ranges = crate::manifest::ranges(&p.table, &crate::manifest::list(lake, &meta).await?, &meta.files, &schema);
-        let meta = TableMeta { files: p.files.clone(), tiered: after, ..meta };
-        let table = Pruned { lake: lake.arc(), name: p.table.clone(), meta, manifests: Some(p.manifests.clone()), upto: Some(upto), schema, share, ranges, range: p.range.clone() };
+        let purges = if p.purged > 0 { vec![(p.purged, 0)] } else { vec![] };
+        let meta = TableMeta { files: p.files.clone(), tiered: after, purges, ..meta };
+        let table = Pruned { lake: lake.arc(), name: p.table.clone(), meta, manifests: Some(p.manifests.clone()), upto: Some(upto), at: Some(s.upto), schema, share, ranges, range: p.range.clone() };
         ctx.deregister_table(table_ref(&p.table))?;
         ctx.register_table(table_ref(&p.table), Arc::new(table))?;
     }
@@ -371,11 +407,11 @@ fn hashed(p: &Arc<dyn ExecutionPlan>) -> bool { p.name() == "RepartitionExec" &&
 /// Run `sql` as a shuffle, or None if its plan can't be split that way. A node that drops out is
 /// left out and the shuffle runs again (its buckets went with it, so there is nothing to resume);
 /// with too few nodes left for that, the query runs here instead.
-async fn shuffle(lake: &Lake, nodes: &[String], me: &str, sql: &str, tables: &[String], main: &str) -> Result<Option<Vec<RecordBatch>>> {
+async fn shuffle(lake: &Lake, nodes: &[String], me: &str, sql: &str, tables: &[String], main: &str, guard: Option<(crate::guard::Link, u64)>) -> Result<Option<Vec<RecordBatch>>> {
     let mut live: Vec<String> = nodes.to_vec();
     for _ in 0..3 {
         let mine = live.iter().position(|n| n == me).context("not a member")?;
-        let out = spread_once(lake, &live, mine, sql, tables, main).await;
+        let out = spread_once(lake, &live, mine, sql, tables, main, guard).await;
         let Err(e) = out else { return out };
         // (this node failing its own step, or too few nodes left: the query runs here instead)
         let Some(dead) = e.downcast_ref::<Dead>().map(|d| d.node).filter(|&d| live.len() > 2 && d != mine) else {
@@ -405,9 +441,9 @@ async fn abandon(nodes: &[String], me: &str) {
 /// The id of the shuffle this node started last (for `abandon`).
 static LAST: LazyLock<Mutex<Option<String>>> = LazyLock::new(Default::default);
 
-/// One attempt, planned each way in turn (`How`) until one splits correctly. Keyed tables, and
-/// tables of attached lakes, are always read whole.
-async fn spread_once(lake: &Lake, nodes: &[String], mine: usize, sql: &str, tables: &[String], main: &str) -> Result<Option<Vec<RecordBatch>>> {
+/// One attempt, planned each way in turn (`How`) until one splits correctly — and pays (`guard`:
+/// the ways after it move more). Keyed tables, and tables of attached lakes, are always read whole.
+async fn spread_once(lake: &Lake, nodes: &[String], mine: usize, sql: &str, tables: &[String], main: &str, guard: Option<(crate::guard::Link, u64)>) -> Result<Option<Vec<RecordBatch>>> {
     for how in [How::Ranged, How::Broadcast, How::Partitioned, How::Sliced] {
         let upto = lake.visible();
         // Its append tables (the biggest first), as of now.
@@ -448,6 +484,10 @@ async fn spread_once(lake: &Lake, nodes: &[String], mine: usize, sql: &str, tabl
         let whole = whole(lake, tables, &sliced).await?;
         slices.iter_mut().for_each(|s| s.whole = whole.clone());
         if let Some(job) = Job::open(lake, &slices[mine]).await? {
+            if guard.is_some_and(|(link, read)| !job.pays(sql, link, read, nodes.len())) {
+                forget(&job.id);
+                return Ok(refused("it wouldn't pay"));
+            }
             if std::env::var_os("PONDRA_DEBUG_SPREAD").is_some() {
                 let over = job.exchanges.iter().map(|x| displayable(x.plan.as_ref()).one_line().to_string().trim().to_string()).collect::<Vec<_>>();
                 eprintln!("spread: shuffled {how:?}{}: {over:?}", scheme.map(|s| format!(", by ranges of {:?}", s.columns)).unwrap_or_default());
@@ -623,6 +663,20 @@ impl Job {
         jobs.retain(|_, j| !j.stale());
         jobs.insert(id, job.clone());
         Ok(Some(job))
+    }
+
+    /// Does running it across `n` nodes pay (`guard.rs`), for a query reading `read` bytes? What
+    /// its exchanges move — a hash exchange's rows but the share each node keeps, an all-gather's
+    /// to every other node, a whole table's own keys nothing — and what reaches the coordinator.
+    fn pays(&self, sql: &str, link: crate::guard::Link, read: u64, n: usize) -> bool {
+        let (n, out) = (n as u64, |p: &Arc<dyn ExecutionPlan>| crate::guard::bytes_out(p).unwrap_or(3 * read));
+        let moved: u64 = self.exchanges.iter().map(|x| match (x.own, x.whole) {
+            (true, _) => 0,
+            (_, true) => out(&x.plan) * (n - 1),
+            _ => out(&x.plan) * (n - 1) / n,
+        }).sum();
+        let last = self.cut.as_ref().map_or(self.plan.clone(), |c| c.children()[0].clone());
+        crate::guard::pays(sql, link, moved + out(&last) * (n - 1) / n, self.exchanges.len(), read, n as usize)
     }
 
     /// Done here for half a minute (the others have fetched what they need), or given up on ten

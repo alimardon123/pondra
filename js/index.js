@@ -25,7 +25,7 @@ export class Pondra {
   }
 
   async call(method, path, body, type) {
-    const headers = { ...(this.token && { authorization: `Bearer ${this.token}` }), ...(type && { "content-type": type }) };
+    const headers = { ...(this.token && { authorization: `Bearer ${this.token}` }), ...(type && { "content-type": type }), ...(this.owner && { "x-pondra-owner": this.owner }) };
     const r = await fetch(this.url + path, { method, body, headers });
     if (!r.ok) throw new Error(`${r.status}: ${(await r.text()).slice(0, 500)}`);
     return r;
@@ -64,9 +64,11 @@ export class Pondra {
     return rows[0] ?? null;
   }
 
-  /** New rows of a table as they commit; with `after`, a replay from there first. */
-  async *watch(table, { after } = {}) {
-    const r = await this.call("GET", `/watch/${table}` + (after === undefined ? "" : `?after=${after}`));
+  /** New rows of a table as they commit; with `after`, a replay from there first. With
+   * `changes`, every change: UPDATE's and DELETE's too, each row with its `_change_type`. */
+  async *watch(table, { after, changes } = {}) {
+    const q = [after === undefined ? "" : `after=${after}`, changes ? "changes=true" : ""].filter(Boolean).join("&");
+    const r = await this.call("GET", `/watch/${table}` + (q ? `?${q}` : ""));
     const decoder = new TextDecoder();
     let rest = "";
     for await (const chunk of r.body) {
@@ -92,16 +94,19 @@ export class Pondra {
 export const connect = (url, options) => new Pondra(url, options);
 
 /** Start a node on a lake here — a folder, or s3://bucket/prefix — and connect to it. It stops
- * when this process exits, or with `close()`; the lake stays. */
+ * when this process exits, or with `close()`; the lake stays. Its SQL may read files on this
+ * machine (`SELECT * FROM 'jan.csv'`), as DuckDB's may. */
 export async function local(dir = "lake", { port, token, flags = [], timeoutMs = 120_000 } = {}) {
   port ??= await freePort();
   if (!dir.includes("://")) mkdirSync(dir, { recursive: true });
   const args = ["serve", "--dir", dir, "--addr", `127.0.0.1:${port}`, "--stop-with-stdin", ...flags];
-  const node = spawn(binary(), args, { stdio: ["pipe", "ignore", "ignore"] });
+  const owner = randomUUID().replaceAll("-", ""); // (with it, the node lets this process's SQL read files here)
+  const node = spawn(binary(), args, { stdio: ["pipe", "ignore", "ignore"], env: { ...process.env, PONDRA_OWNER_KEY: owner } });
   let failed = null;
   node.on("error", (e) => (failed = e)); // (no binary, say)
   const db = new Pondra(`http://127.0.0.1:${port}`, { token });
   db.process = node;
+  db.owner = owner;
   process.on("exit", () => node.stdin.end());
   for (const until = Date.now() + timeoutMs; ; await sleep(50)) {
     try {

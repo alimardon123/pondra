@@ -1,0 +1,16 @@
+{
+ "changes": {
+  "60 random INSERT/UPDATE/DELETE/MERGE on 3 nodes == the model, every node, while tiering and purging": true,
+  "an UPDATE or MERGE keeps a row's _row_id; ids are unique": true,
+  "a retried job changes rows once; `pondra sql` changes them through the leader": true,
+  "three nodes changing the same rows at once: every change counts": true,
+  "the change feed replays to the table's rows; each old version as it was": true,
+  "/watch?changes=true: an UPDATE as its old and new versions": true,
+  "Delta readers see the changes once they are tiered and purged": true,
+  "spread over three nodes == one node, over the changed tables": true,
+  "refused: a change under a view keeping a max; a view's table; a system column; a MERGE matching a row twice": true,
+  "keyed tables: UPDATE and MERGE keep a row's _row_id; MERGE inserts and deletes": true,
+  "after a restart, the same rows": true
+ },
+ "ok": true
+}

@@ -1,10 +1,10 @@
-# Pondra: what's left, and in what order (after round 18)
+# Pondra: what's left, and in what order (after round 19)
 
 **Date:** 2026-09-25 · **Status:** proposed; the order in "The rounds" is what I recommend, the
 decisions in "What only you can decide" are yours · **Builds on:** ADR-002 to ADR-017,
 `prototype-status.md`, `comparison-spark-flink-fluss.md`
 
-**Progress (2026-09-28):** rounds 17 and 18 are done (ADR-018, ADR-019).
+**Progress (2026-09-26):** rounds 17, 18 and 19 are done (ADR-018, ADR-019, ADR-020).
 
 - **Round 17** made Pondra install anywhere: a glibc 2.17 Linux binary, pip and npm packages
   (built, not published), a SQL shell, and both flaky tests fixed.
@@ -17,12 +17,22 @@ decisions in "What only you can decide" are yours · **Builds on:** ADR-002 to A
   the first 3-node run on GitHub's runners was right but slower than one node; the second lost a
   node at start to a race (fixed), and the bench now measures what crosses the network.
 
+- **Round 19** (ADR-020) made every row changeable: `UPDATE`, `DELETE` and `MERGE` on every
+  table, system columns (`_row_id`, `_version`, `_created_at`, `_updated_at`), views and a change
+  feed that follow every change, and files rewritten without changed rows so Delta and Iceberg
+  see them. C1's second finding became a guard: a query spreads only when what it would move
+  costs less than the work it shares, so a cluster on a slow network is no slower than one node.
+  The owner's second Windows session added `CREATE DATABASE`, `ATTACH` of a new folder,
+  `CHECKPOINT`, `ALTER TABLE … SET`, local files in the shell, and fixed the lake's name on Windows.
+
 Still waiting:
 
-- **C1's numbers:** a 3-node run that completes, with the new measurements.
+- **C1's numbers:** a 3-node run on round 19's code (the guard on), then machines in one data centre.
 - **Publishing:** the package names and the repository decision below.
 
-Round 19 is next: `UPDATE`, `DELETE` and `MERGE` on every table, with system columns.
+Round 20 is next: the rest of `ALTER TABLE` (rename and drop columns and tables, widen types:
+column ids in the files), materialized views filled from the rows already there, and C1 on
+machines in one data centre.
 
 ## Where Pondra stands
 
@@ -160,6 +170,7 @@ a list of URLs? If it can, that gives a browser read path at no cost.
 | E5 ✓ | Schemas and three-part names, DDL in SQL (`DROP`, `CREATE TABLE … AS`, `CREATE VIEW`, `CREATE MATERIALIZED VIEW`) | What a database user types first (the owner, on Windows) | M | `harness.py schemas` (round 18) |
 | E6 | `UPDATE`, `DELETE` and `MERGE` on every table; system columns: a row id, when a row was written, its version | The owner's request; changing an append table's rows needs to know which row is which | M–L | Each on append and keyed tables, under streaming ingest, with views, the change feed, Kafka consumers, Delta and Iceberg readers following |
 | E7 | Materialized views filled from the rows already there | A view created on a table with data starts empty today | M | A view created mid-stream equals the query over the whole table |
+| E8 | The rest of `ALTER TABLE`: rename a table, rename and drop columns, widen a column's type | The owner's third Windows session. Files and the log match columns by name, so a renamed column would lose its values and a dropped one come back with a new column of its name: every column needs an id that the files carry (Iceberg's field ids) | M | Each under streaming ingest, with views and Delta/Iceberg readers following; old files read by id |
 
 ### F. Depth, ordered by what the tracks above show
 
@@ -179,7 +190,7 @@ a list of URLs? If it can, that gives a browser read path at no cost.
   - merging files inside sealed manifests;
   - publishing big tables to Delta and Iceberg from the manifests;
   - keyed compaction split by key range;
-  - DELETE on append tables.
+  - deletion vectors (Delta) and position deletes (Iceberg) instead of rewriting files on a purge.
 - **Kafka:** partitions, transactions, the Java client and Kafka Connect.
 - **Other:** an approximate vector index, `VARIANT` as a real type, and statistics of what a
   filter keeps.
@@ -193,8 +204,8 @@ simulated R2 and real R2, an ADR, and a bundle.
 |---|---|---|---|
 | 17 ✓ | Install anywhere (done: ADR-018) | A1, A2, A3, A5 (measure), A6, D3 | `pip install pondra` works in a fresh Ubuntu 22.04 notebook; both flakes fixed |
 | 18 ✓ | A database you can shape (done: ADR-019) | E5, A7, C1 (measuring) | `lake.schema.table`, DDL and views in SQL; the `.exe` on your laptop; the cluster bench measures the network |
-| 19 | Change any row | E6, E7 | `UPDATE`/`DELETE`/`MERGE` on every table with system columns, streaming following every change |
-| 20 | Proof at scale | C1, C3, D1 (start) | TPC-H SF10 at 1/3/6 machines; Nexmark against Flink; the SQL test files' pass rate |
+| 19 ✓ | Change any row (done: ADR-020) | E6, C1 (the guard) | `UPDATE`/`DELETE`/`MERGE` on every table with system columns, streaming following every change; a cluster never slower than one node |
+| 20 | Shape it further, and proof at scale | E8, E7, C1, C3, D1 (start) | `ALTER TABLE … RENAME/DROP COLUMN`; TPC-H SF10 at 1/3/6 machines in one data centre; Nexmark against Flink; the SQL test files' pass rate |
 | 21 | Use it from anything | A4, B3, E1, E2 | A console at `/`, live queries, dbt and Power BI working |
 | 22 | In-process | B1, B2 | `pondra.open(…)` in a notebook reads and writes a cluster's lake, no server |
 | 23 | Safe to share | E3, D2 | TLS, grants, audit; random-query checks against DuckDB |

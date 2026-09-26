@@ -1,0 +1,5 @@
+users: 64 writers + 16 readers + 2 serverless on 3 node(s), 31s  lake /tmp/pondra-12bqxe57
+  2568300 events (83,366/s), ack p50 57 ms p99 343 ms
+  1820 snapshot reads, query p50 252 ms p99 730 ms
+  inconsistent reads: 0; producers with lost/duplicate batches: 0
+    by node: {}
