@@ -109,9 +109,12 @@ Useful `serve` flags (give every node the same ones: any of them may lead):
     holder dying within that moment (see ADR-009).
 - `--publish delta,iceberg`: new tables are also published as Delta Lake and/or Iceberg for other
   engines (default: none; per table: `"publish"`).
-- `--tier-secs 2`: new rows become Parquet (and new Delta/Iceberg versions) as soon as they
-  commit, at most this often. Fractions are fine (`0.25`).
-- `--pg 0.0.0.0:5432`: also speak the Postgres protocol.
+- `--tier-secs 10`: new rows become Parquet (and new Delta/Iceberg versions) as soon as they
+  commit, at most this often (a table with a million rows waiting: within a second). Pondra's own
+  reads see every commit at once; each run is a few object-store writes per busy table, so a
+  bucket's bill and rate limits (S3: 3,500 writes a second per prefix) favour fewer. Fractions are
+  fine (`0.25`). `GET /metrics` counts the writes, lists and deletes (`pondra_object_requests_total`).
+- `--pg 0.0.0.0:5432`: also speak the Postgres protocol (with `COPY … TO STDOUT` and `COPY … FROM STDIN`).
 - `--kafka 0.0.0.0:9092`: also speak the Kafka protocol (`--kafka-advertise host:port` if clients
   must reach this node at another address than `--addr`'s host).
 - `--flight 0.0.0.0:8815`: also speak Arrow Flight and Flight SQL.
@@ -191,17 +194,18 @@ differences entirely.
 | Need | How (HTTP API, on any node) | Replaces |
 |---|---|---|
 | Stream ingest, exactly-once | `POST /append/{t}?producer=&seq=` with NDJSON or an Arrow IPC stream | Kafka / Fluss |
-| Tables | SQL `CREATE TABLE t (id BIGINT PRIMARY KEY, …) WITH (publish = 'delta,iceberg', cluster_by = 'user', partition_by = 'day(ts)', merge = 'total:sum', ttl = 'ts:86400')`, or `POST /tables/{t}` with the same as JSON. A key = upsert table; `merge` = merge table; `cluster_by` sorts an append table's files for fast filters; `partition_by` (a column, or year/month/day/hour of a timestamp) keeps one partition per file; `ttl` expires a keyed table's rows. Every file's column ranges are kept, and past 128 files a table's file list goes into manifests: a table of a million files commits as fast as one of ten, and queries open only the files their filters can match | Delta/Iceberg MERGE, partitioning, liquid clustering, Fluss PK tables with TTL |
+| Tables | SQL `CREATE TABLE t (id BIGINT PRIMARY KEY, …) WITH (publish = 'delta,iceberg', cluster_by = 'user', partition_by = 'day(ts)', merge = 'total:sum', ttl = 'ts:86400')`, or `POST /tables/{t}` with the same as JSON. A key = upsert table; `merge` = merge table; `cluster_by` sorts files for fast filters (two or more columns: along a Hilbert curve, so a filter on any of them skips most row groups); `partition_by` (a column, or year/month/day/hour of a timestamp) keeps one partition per file; a key, `cluster_by` and `partition_by` go together; `ttl` expires a keyed table's rows. Every file's column ranges are kept, and past 128 files a table's file list goes into manifests: a table of a million files commits as fast as one of ten, and queries open only the files their filters can match | Delta/Iceberg MERGE, partitioning, liquid clustering, Fluss PK tables with TTL |
 | Schemas and names | A lake is a database: `CREATE SCHEMA sales; CREATE TABLE sales.orders (…)`; a table is `t` (schema `public`), `schema.t` or `lake.schema.t`, and other lakes are databases too: `CREATE DATABASE l2` (a new lake beside this one), `ATTACH 's3://bucket/sales' AS sales` (or `--attach`), then `sales.eu.orders` joined with this lake's tables, and `INSERT INTO sales.t …` through its leader; `DETACH sales`. `DROP TABLE`, `DROP SCHEMA … [CASCADE]`, `CREATE TABLE … AS SELECT`; a drop is refused while a view or task reads the table. Postgres, Flight SQL, the Iceberg REST catalog and MCP list the schemas | Postgres / Snowflake `database.schema.table` |
 | Views | `CREATE [OR REPLACE] VIEW v AS …`: a stored query, run over the tables as they are when read (spread over the nodes like any query); `CREATE MATERIALIZED VIEW v [WITH (window = 'w', size_secs = 60)] AS …`: the streaming view below, kept up to date with every flush of new rows (from its creation on) | SQL views, Databricks materialized views, Flink SQL jobs |
 | SQL writes | `INSERT … SELECT/VALUES`, `UPDATE … SET … WHERE`, `DELETE … WHERE` and `MERGE INTO t USING s ON … WHEN [NOT] MATCHED [BY SOURCE] …` on every table, on any node, over Postgres, or with `pondra sql` on any machine; from a local file in the shell (`MERGE INTO t USING 'new.csv' …`). A change is one commit from one snapshot, exactly-once with a job id; views, the change feed and Delta/Iceberg readers follow it | Delta/Iceberg MERGE, Snowflake DML, Fluss 1.0's UPDATE/DELETE by condition |
 | System columns | every row has `_row_id` (kept through an UPDATE or MERGE), `_version` (the commit that wrote it), `_created_at`, `_updated_at`: `SELECT _row_id, * FROM t`; `SELECT *` leaves them out | Postgres `ctid`/`xmin`, Iceberg v3 row lineage, Delta row tracking |
-| Postgres protocol | `--pg`: psql, psycopg 2/3, asyncpg, SQLAlchemy + pandas (tested); JDBC/BI tools by the same protocol | a Postgres-compatible serving layer |
+| Postgres protocol | `--pg`: psql, psycopg 2/3, asyncpg, SQLAlchemy + pandas (tested); JDBC/BI tools by the same protocol. `COPY t FROM STDIN` (text, CSV; psql's `\copy`, psycopg's `cursor.copy`) and `COPY (query) TO STDOUT` (text, CSV, binary); the ADBC Postgres driver reads results as Arrow that way. For speed, Arrow Flight SQL | a Postgres-compatible serving layer |
 | Python and JavaScript | `pip install pondra` / `npm install pondra`: `local()` starts a node here, `connect()` reaches one; `sql()` → pandas / Polars / Arrow, `append()` exactly-once, `view()`, `watch()`, `lookup()` | PySpark / PyFlink clients for the common jobs |
 | A shell | `pondra` or `pondra <lake>`: SQL typed or piped in, answers as tables, `.tables`, `.databases`, DuckDB-style | the DuckDB / psql prompt |
 | Kafka | `--kafka`: producers write to tables (a topic is a table; JSON values; `_key`/`_timestamp`/`_value` columns; idempotent producers exactly-once; gzip/snappy/lz4/zstd), Debezium change events and tombstones become upserts and deletes; consumers and consumer groups read the log (offsets = `_ord`); SASL/PLAIN with the tokens. Tested: librdkafka (confluent-kafka), kafka-python | Kafka / Fluss ingest, Debezium sinks |
 | Schema evolution | `ALTER TABLE t ADD COLUMN c TYPE` (any node, Postgres, `pondra sql`); old rows read it as null; Delta and Iceberg follow. `ALTER TABLE t SET (publish = 'delta', cluster_by = 'user', ttl = 'ts:3600')` | Delta/Iceberg schema evolution |
-| Event-time windows | `POST /views/{v}?window=w&size_secs=60&lateness_secs=10` over `GROUP BY date_bin(…, ts) AS w`: the view updates live; `{v}_final` gets each window once, final, when the watermark — the newest `ts` in the stream less the lateness — passes its end | Flink tumbling windows with bounded out-of-orderness watermarks |
+| Event-time windows | `POST /views/{v}?window=w&size_secs=60&lateness_secs=10` over `GROUP BY date_bin(…, ts) AS w`: the view updates live; `{v}_final` gets each window once, final, when the watermark — the newest `ts` in the stream less the lateness — passes its end. Sliding: `slide_secs=60` with `size_secs=300` (and `date_bin` of the slide) gives a 5-minute window every minute, each row added once | Flink tumbling and sliding windows with bounded out-of-orderness watermarks |
+| Stream joins | `CREATE MATERIALIZED VIEW v WITH (join = 'streams', time = 'ts', within_secs = 600) AS SELECT … FROM orders o JOIN payments p ON …`: a row of either table pairs with the other's rows when it arrives and with those that arrive after, each pair once, exactly-once through restarts; `within_secs` bounds what is read to pair them | Flink regular and interval joins |
 | Session windows | `POST /views/{v}?session=ts&gap_secs=30&lateness_secs=5` over `SELECT user, count(*) … GROUP BY user`: each user's rows with no 30 s gap between them are a session; `{v}` gets each once, whole, with `session_start` and `session_end`, when the watermark passes its last row plus the gap | Flink / Spark session windows |
 | Point-in-time joins | `FROM trades t ASOF JOIN quotes q MATCH_CONDITION (t.ts >= q.ts) ON t.sym = q.sym` (also `>`, `<=`, `<`): each row gets the other table's row as it was at that moment, NULL if none; in ad hoc queries, across the nodes, and in views over a stream, where each event gets the table as of its own time however late it arrives | Snowflake / DuckDB ASOF JOIN, Flink temporal joins |
 | JSON | `json_get(col, 'a', 0)`, `json_get_str/int/float/bool`, `json_contains`, `json_length`, `->`, `->>` | VARIANT / JSON functions |
@@ -218,8 +222,8 @@ differences entirely.
 | SQL | `POST /sql[?format=json\|table\|arrow][&after=<seg>][&stale_ms=N]`: files ∪ log tail, one snapshot. Large tables run SPMD across all nodes, with shuffles for many-group aggregations and big joins — when that pays: what the plan would move, at the measured speed of the network, against the time the query takes on one node (`&spread=1` forces, `0` disables). Queries beyond `--memory-gb` spill. Repeated queries are answered from a result cache until the next commit (`stale_ms`: accept one up to N ms old) | Trino / Spark SQL / Databricks SQL |
 | Metrics | `GET /metrics` (Prometheus): rows in, queries and their time, spread and shuffled queries, files scanned and skipped, memory, commit latency, per-table files, rows and bytes | a metrics exporter |
 | Serving reads | `GET /lookup/{t}/{key}` (or SQL `SELECT … WHERE key = …`): the current row of one key without SQL planning — log tail, then the files newest-first, each narrowed to one cached, key-sorted row group: ~0.2 ms, ~20k/s on two cores | Redis / Postgres / Lakehouse//RT in front of the lake |
-| Batch ELT, exactly-once | `POST /insert/{t}?job=` with a `SELECT` (the receiving node does the work), or `pondra sql "INSERT INTO t SELECT …"` from any machine: straight to Parquet; a retried job is a no-op | Spark batch jobs |
-| Maintenance | automatic and spread over the nodes: tiering to Parquet, compaction, rewriting files without changed rows (every round for published tables), retention, orphan cleanup, backpressure; `CHECKPOINT` tiers everything now | Spark OPTIMIZE / VACUUM |
+| Batch ELT, exactly-once | `POST /insert/{t}?job=` with a `SELECT` (the receiving node does the work), or `pondra sql "INSERT INTO t SELECT …"` from any machine: straight to Parquet (`INSERT … VALUES` goes through the log, gathered into a file per tiering round); a retried job is a no-op | Spark batch jobs |
+| Maintenance | automatic and spread over the nodes: tiering to Parquet, compaction, rewriting files without changed rows (every round for published tables), retention, orphan cleanup, backpressure; `CHECKPOINT` tiers everything now (and compacts a published keyed table, so Delta and Iceberg see it as it is) | Spark OPTIMIZE / VACUUM |
 | Open formats | tables that ask are published as Delta Lake (`data/{t}/_delta_log`) and Iceberg (`data/{t}/metadata`) each tiering round, for engines that don't know Pondra; an Iceberg REST catalog (`/v1/…`) lets them attach by URL | a separate Delta/Iceberg writer and catalog |
 
 ## How it works
@@ -251,7 +255,8 @@ differences entirely.
 | `delta.rs`, `iceberg.rs` | Open formats, per table: a Delta JSON commit / an Iceberg v2 snapshot (hand-written Avro manifests) per change to a table's files; crash-safe (derived from durable catalog state, put-if-absent); the Iceberg REST catalog |
 | `change.rs` | UPDATE, DELETE and MERGE: an append table's rows change by version (the old ones go to `{t}$deleted`, which reads leave out); the change feed |
 | `sys.rs` | System columns: row ids reserved in blocks from the leader, stamped as rows enter the log or a bulk INSERT's files; versions and times from the commit |
-| `guard.rs` | Spread a query only when it pays: links measured, and what a query takes on one node |
+| `guard.rs` | Spread a query only when it pays: links measured, what a query takes on one node, and which way was faster once it ran both |
+| `hilbert.rs` | `cluster_by` over two or more columns: rows along a Hilbert curve through their ranks |
 | `ddl.rs` | Schemas and names (`lake.schema.table`, attached lakes), and the statements that shape a lake: `CREATE`/`DROP SCHEMA`, `DROP TABLE`, `CREATE VIEW` (stored), `CREATE MATERIALIZED VIEW`, `DROP VIEW` — carried out by the leader |
 | `write.rs` | Writes in SQL from anywhere (CREATE TABLE [AS], INSERT, UPDATE, DELETE, and the DDL of `ddl.rs`): the work runs where the statement runs; the leader records it — over HTTP, through the bucket inbox, or the statement leads for a moment when nobody does. Attached lakes' writes go to their own leaders |
 | `inbox.rs` | The bucket inbox: writers that can't reach the leader leave requests in the bucket; the leader answers them |
@@ -328,8 +333,8 @@ bucket to its newest lakes.
 - Files written in key order split tables by ranges across nodes but aren't declared as sorted
   to DataFusion (it made TPC-H slower), so an aggregation on that key still hashes.
 - Changes and what follows a table: a view that emits windows or sessions once, keeps a min or
-  max, or joins another table, and a streaming task, can't take a row back, so a change is
-  refused while one follows the table. Kafka consumers see an UPDATE's new rows, not its deletes.
+  max, joins another table or joins two streams, and a streaming task, can't take a row back, so
+  a change is refused while one follows the table. Kafka consumers see an UPDATE's new rows, not its deletes.
   Tables made before 0.19 (without row ids) change after a copy (`CREATE TABLE t2 AS SELECT …`).
   Clustering across files.
 - A write to two lakes is two commits, not one transaction.
@@ -347,7 +352,8 @@ bucket to its newest lakes.
   changing a column's type, need column ids in the files (next); an approximate vector index (see the plan in
   `docs/comparison-spark-flink-fluss.md`).
 - Streaming: a watermark per source, not per partition or node, and a source that goes quiet
-  holds it (its last windows and sessions wait for more rows); sliding windows; an as-of join
+  holds it (its last windows and sessions wait for more rows); deduplication and Top-N by event
+  time, timers, `MATCH_RECOGNIZE`; stream joins run on the leader alone; an as-of join
   looks up a table's rows, so a keyed table, which keeps only its latest row per key, gives the
   latest, not the one of that moment — keep a table's history as rows for that.
 - On object storage a *durable* ack costs one PUT; `--ack replicated` trades a small window

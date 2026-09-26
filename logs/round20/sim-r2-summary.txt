@@ -1,0 +1,16 @@
+changes exit=0 secs=190
+schemas exit=0 secs=86
+race exit=0 secs=42
+clients exit=0 secs=28
+windows exit=0 secs=19
+failover-replicated exit=0 secs=63
+users-replicated exit=0 secs=38
+crash exit=0 secs=3406
+flight exit=0 secs=10
+files exit=0 secs=66
+layouts exit=0 secs=23
+clusters exit=0 secs=28
+copies exit=0 secs=7
+streams exit=1 secs=22
+ALL-DONE
+streams (again: writes retried with a job id through the leader restart, which on object storage takes seconds) exit=0 secs=37

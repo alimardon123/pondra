@@ -1,0 +1,34 @@
+harness-all exit=1 secs=171
+scale exit=0 secs=14
+flight exit=0 secs=3
+reader exit=0 secs=5
+crash exit=0 secs=156
+load exit=0 secs=30
+(the rest of the local suite)
+users-1 exit=0 secs=33
+users-2 exit=0 secs=33
+failover-1 exit=0 secs=65
+failover-2 exit=0 secs=65
+failover-3 exit=0 secs=65
+race exit=0 secs=33
+isolate exit=0 secs=18
+spread exit=0 secs=6
+smoke exit=0 secs=1
+latency exit=0 secs=25
+open-check exit=0 secs=11
+asof-check exit=0 secs=30
+skew-check exit=0 secs=4
+shuffle-spill exit=0 secs=62
+stream-check exit=0 secs=19
+freshness exit=0 secs=36
+crash-big exit=0 secs=136
+harness-all-final exit=0 secs=211
+ALL-DONE
+harness-all (final code: NUMERIC, system columns built with fewer passes, the view options compared, the files test's checks) exit=0 secs=207
+open-check (final code) exit=0 secs=10
+smoke (final code) exit=0 secs=2
+stream-check (final code) exit=0 secs=18
+failover-final exit=0 secs=65
+users-final exit=0 secs=32
+spread-final exit=0 secs=6
+FINAL-DONE

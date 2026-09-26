@@ -1,0 +1,1 @@
+{"copies": {"passed": true, "checks": {"COPY FROM STDIN, text and CSV": true, "COPY TO STDOUT, text": true, "COPY TO STDOUT, binary": true, "COPY TO STDOUT, csv": true, "ADBC Postgres driver (Arrow)": true, "DECIMAL as NUMERIC, text and binary": true}}}

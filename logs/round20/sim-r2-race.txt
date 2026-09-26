@@ -1,0 +1,2 @@
+race: 3 nodes started at once -> 1 leader(s), all agree: True
+race: a leader that never made the catalog -> the next node leads after 34 s: True

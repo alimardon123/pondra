@@ -13,6 +13,9 @@ pub static SHUFFLED: AtomicU64 = AtomicU64::new(0); // …of them with a shuffle
 pub static RANGED: AtomicU64 = AtomicU64::new(0); // …of them with their tables sliced by a key's ranges
 pub static FILES_SCANNED: AtomicU64 = AtomicU64::new(0); // append-table files queries opened…
 pub static FILES_SKIPPED: AtomicU64 = AtomicU64::new(0); // …and skipped by their min/max
+pub static OBJECT_WRITES: AtomicU64 = AtomicU64::new(0); // object-store requests this process made (`store::Counted`): writes…
+pub static OBJECT_LISTS: AtomicU64 = AtomicU64::new(0); // …lists…
+pub static OBJECT_DELETES: AtomicU64 = AtomicU64::new(0); // …and deletes
 pub static SPILLED: AtomicU64 = AtomicU64::new(0); // shuffle bytes written to this node's disk
 pub static SKEW: AtomicU64 = AtomicU64::new(0); // the worst bucket/average seen in a shuffle, x100
 pub static SKEW_SPLITS: AtomicU64 = AtomicU64::new(0); // hot partitions of shuffled joins shared out
@@ -45,6 +48,8 @@ pub async fn render(app: &App) -> anyhow::Result<String> {
     metric("ranged_queries_total", "counter", "…of them with their tables sliced by a key's ranges", &one(get(&RANGED)));
     metric("files_scanned_total", "counter", "Parquet files queries read", &one(get(&FILES_SCANNED)));
     metric("files_skipped_total", "counter", "Parquet files queries skipped by min/max, unopened", &one(get(&FILES_SKIPPED)));
+    let requests = [("write", &OBJECT_WRITES), ("list", &OBJECT_LISTS), ("delete", &OBJECT_DELETES)].map(|(op, c)| (format!("{{op=\"{op}\"}}"), get(c)));
+    metric("object_requests_total", "counter", "object-store writes, lists and deletes this process made (what a bucket bills and rate-limits most)", &requests);
     metric("shuffle_spilled_bytes_total", "counter", "shuffle rows written to this node's disk", &one(get(&SPILLED)));
     metric("shuffle_disk_bytes", "gauge", "shuffle buckets on this node's disk now", &one(crate::spill::held() as f64));
     metric("shuffle_skew", "gauge", "worst bucket vs the average one in a shuffle here (1 = even)", &one(get(&SKEW) / 100.0));

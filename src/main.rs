@@ -6,6 +6,7 @@ mod auth;
 mod cache;
 mod change;
 mod guard;
+mod hilbert;
 mod ddl;
 mod delta;
 mod files;
@@ -77,9 +78,11 @@ enum Cmd {
         #[arg(long, default_value_t = 0)]
         flush_ms: u64,
         /// Tiering starts as soon as rows commit, at most once per this many seconds (fractions
-        /// allowed): how soon new rows are Parquet, and a Delta version other engines can read.
-        /// Each run costs a few object-store writes per busy table (0 = only via POST /tier).
-        #[arg(long, default_value_t = 2.0)]
+        /// allowed): how soon new rows are Parquet, and a Delta or Iceberg version other engines
+        /// can read (Pondra's own reads see every commit at once). Each run costs a few
+        /// object-store writes per busy table, so not more often than that by default; a table
+        /// with a million rows waiting is tiered within a second anyway (0 = only via POST /tier).
+        #[arg(long, default_value_t = 10.0)]
         tier_secs: f64,
         /// Streaming tasks run as soon as new rows commit, and at least this often (milliseconds).
         #[arg(long, default_value_t = 1000)]

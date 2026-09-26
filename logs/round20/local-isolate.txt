@@ -1,0 +1,1 @@
+isolate: cut-off follower deposed a healthy leader: False; after the leader died, :18081 took over in 5.0s (term 2)

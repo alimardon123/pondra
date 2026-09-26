@@ -1,0 +1,1 @@
+{"files": {"passed": false, "checks": {"all rows": true, "parquet files made (\u2264 6)": true, "writes per INSERT (\u2264 2)": true, "write-ahead log objects left (\u2264 30)": true, "a pondra sql INSERT's files recorded as written": false}, "parquet_files_made": 5, "writes_per_insert": 1.32, "wal_objects_left": 3, "cli_insert": {"files": 3, "leader_writes": 19.0}}}

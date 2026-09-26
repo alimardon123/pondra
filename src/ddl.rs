@@ -179,10 +179,10 @@ pub async fn apply(lake: &Lake, d: Ddl) -> Result<Value> {
             Ok(j!({"view": name}))
         }
         Ddl::CreateMaterialized { name, sql, options } => {
-            let (emit, sessions) = crate::views::options(&options)?;
+            let (emit, sessions, join) = crate::views::options(&options)?;
             let name = new_name(lake, &name).await?;
             ensure!(lake.cat.get::<StoredView>(&query_key(&name)).await?.is_none(), "{name} is a (stored) view");
-            crate::views::create(lake, &name, &sql, emit, sessions).await?;
+            crate::views::create(lake, &name, &sql, emit, sessions, join).await?;
             Ok(j!({"view": name, "materialized": true, "follows": "rows written from now on"})) // (no backfill yet: ADR-019)
         }
         Ddl::DropView { name, if_exists } => drop_view(lake, &name, if_exists).await,
@@ -379,7 +379,7 @@ async fn drop_view(lake: &Lake, name: &str, if_exists: bool) -> Result<Value> {
         ensure!(if_exists, "no view {name}");
         return Ok(j!({"view": name, "dropped": false}));
     };
-    let mut gone = vec![crate::views::view_key(name), format!("w/{name}"), crate::store::producer_key(&format!("emit:{name}"))];
+    let mut gone = vec![crate::views::view_key(name), format!("w/{name}"), crate::store::producer_key(&format!("emit:{name}")), crate::store::producer_key(&format!("join:{name}"))];
     for table in [name.to_string(), format!("{name}_final")] {
         if let Some(meta) = lake.cat.get::<TableMeta>(&table_key(&table)).await? {
             for format in &meta.publish {

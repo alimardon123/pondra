@@ -19,6 +19,7 @@ use futures::TryStreamExt;
 use datafusion::arrow::array::{ArrayRef, BooleanArray};
 use datafusion::arrow::datatypes::{DataType, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::parquet::file::metadata::ParquetMetaData;
 use datafusion::common::pruning::PruningStatistics;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{Column, DFSchema, ScalarValue};
@@ -62,24 +63,46 @@ pub struct Sealed {
 /// The min and max of each of the first 32 columns that has an order (as Delta does, so a wide
 /// table's entries stay small; strings only up to 64 characters, where a cut-off value would no
 /// longer bound them), and of the system columns (`sys.rs`: a purge finds changed rows by them).
-pub fn stats(batches: &[RecordBatch]) -> Stats {
-    use datafusion::functions_aggregate::min_max::{MaxAccumulator, MinAccumulator};
+/// `written`: the file's footer, whose statistics the writer kept as it went — read from there,
+/// they cost no second pass over the rows (floats aside: Parquet leaves NaN out of them).
+pub fn stats(batches: &[RecordBatch], written: Option<&ParquetMetaData>) -> Stats {
     let Some(first) = batches.first() else { return Stats::new() };
     let mut out = Stats::new();
     for (i, f) in first.schema().fields().iter().enumerate() {
         if (i >= 32 && !crate::sys::NAMES.contains(&f.name().as_str())) || !orderable(f.data_type()) {
             continue;
         }
-        let (Ok(mut lo), Ok(mut hi)) = (MinAccumulator::try_new(f.data_type()), MaxAccumulator::try_new(f.data_type())) else { continue };
+        let footer = written.filter(|_| !f.data_type().is_floating()).and_then(|md| from_footer(md, &first.schema(), f.name()));
         let cols: Vec<ArrayRef> = batches.iter().map(|b| b.column(i).clone()).collect();
-        let (Ok(()), Ok(())) = (cols.iter().try_for_each(|c| lo.update_batch(&[c.clone()])), cols.iter().try_for_each(|c| hi.update_batch(&[c.clone()]))) else { continue };
-        if let (Ok(lo), Ok(hi)) = (lo.evaluate(), hi.evaluate()) {
+        if let Some((lo, hi)) = footer.or_else(|| min_max(&cols)) {
             if let (Some(lo), Some(hi)) = (text(&lo), text(&hi)) {
                 out.insert(f.name().clone(), (lo, hi));
             }
         }
     }
     out
+}
+
+/// The least and greatest value in `cols` (None if they can't be ordered).
+fn min_max(cols: &[ArrayRef]) -> Option<(ScalarValue, ScalarValue)> {
+    use datafusion::functions_aggregate::min_max::{MaxAccumulator, MinAccumulator};
+    let (mut lo, mut hi) = (MinAccumulator::try_new(cols.first()?.data_type()).ok()?, MaxAccumulator::try_new(cols[0].data_type()).ok()?);
+    cols.iter().try_for_each(|c| lo.update_batch(&[c.clone()]).and_then(|_| hi.update_batch(&[c.clone()]))).ok()?;
+    Some((lo.evaluate().ok()?, hi.evaluate().ok()?))
+}
+
+/// Column `name`'s min and max from a file's footer: over its row groups' own, when every row
+/// group that holds a value has them, exact (not cut short).
+fn from_footer(md: &ParquetMetaData, schema: &datafusion::arrow::datatypes::Schema, name: &str) -> Option<(ScalarValue, ScalarValue)> {
+    use datafusion::parquet::arrow::arrow_reader::statistics::StatisticsConverter;
+    let c = StatisticsConverter::try_new(name, schema, md.file_metadata().schema_descr()).ok()?;
+    let groups = || md.row_groups().iter();
+    let (lo, hi, nulls) = (c.row_group_mins(groups()).ok()?, c.row_group_maxes(groups()).ok()?, c.row_group_null_counts(groups()).ok()?);
+    let (lo_exact, hi_exact) = (c.row_group_is_min_value_exact(groups()).ok()?, c.row_group_is_max_value_exact(groups()).ok()?);
+    let complete = groups().enumerate().all(|(j, g)| {
+        nulls.value(j) as i64 == g.num_rows() || (lo.is_valid(j) && hi.is_valid(j) && lo_exact.value(j) && hi_exact.value(j))
+    });
+    complete.then(|| min_max(&[lo]).zip(min_max(&[hi]))).flatten().map(|((lo, _), (_, hi))| (lo, hi))
 }
 
 /// The columns (of the first 32, as `stats`) that hold a NULL.

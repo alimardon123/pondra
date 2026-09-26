@@ -20,4 +20,5 @@ SQLAlchemy==2.0.54
 confluent-kafka==2.15.1
 kafka-python==3.0.11
 adbc-driver-flightsql==1.12.0
+adbc-driver-postgresql==1.12.0
 mcp==1.27.0

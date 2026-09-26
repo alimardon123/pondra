@@ -1,0 +1,22 @@
+# Ingest (8 M rows as Arrow over HTTP) and one tiering round, dist builds of rounds 18, 19 and 20 (glibc 2.17),
+# alternating on one 2-vCPU box (logs/round19/ingest-tiering.py). The box ran slower than in round 19: round 18 took 0.75-0.78 s then.
+{"bin": "pondra-r18", "rows": 8000000, "append_rows_per_s": 10688174, "untiered_before_tier": 8000000, "tier_s": 0.89, "tier_rows_per_s": 8977806, "parquet_mb": 35.2}
+{"bin": "pondra-r19", "rows": 8000000, "append_rows_per_s": 12047414, "untiered_before_tier": 8000000, "tier_s": 1.55, "tier_rows_per_s": 5146347, "parquet_mb": 36.1}
+{"bin": "pondra-r20", "rows": 8000000, "append_rows_per_s": 14961310, "untiered_before_tier": 8000000, "tier_s": 1.16, "tier_rows_per_s": 6919290, "parquet_mb": 36.1}
+{"bin": "pondra-r18", "rows": 8000000, "append_rows_per_s": 13423657, "untiered_before_tier": 8000000, "tier_s": 0.88, "tier_rows_per_s": 9054327, "parquet_mb": 35.2}
+{"bin": "pondra-r19", "rows": 8000000, "append_rows_per_s": 11200562, "untiered_before_tier": 8000000, "tier_s": 1.45, "tier_rows_per_s": 5521353, "parquet_mb": 36.4}
+{"bin": "pondra-r20", "rows": 8000000, "append_rows_per_s": 12421389, "untiered_before_tier": 8000000, "tier_s": 1.1, "tier_rows_per_s": 7268235, "parquet_mb": 36.4}
+{"bin": "pondra-r18", "rows": 8000000, "append_rows_per_s": 15090539, "untiered_before_tier": 8000000, "tier_s": 0.98, "tier_rows_per_s": 8122225, "parquet_mb": 35.2}
+{"bin": "pondra-r19", "rows": 8000000, "append_rows_per_s": 12662317, "untiered_before_tier": 8000000, "tier_s": 1.49, "tier_rows_per_s": 5376093, "parquet_mb": 36.1}
+{"bin": "pondra-r20", "rows": 8000000, "append_rows_per_s": 13354743, "untiered_before_tier": 8000000, "tier_s": 1.1, "tier_rows_per_s": 7303401, "parquet_mb": 36.4}
+# The same, with round 20's final build (after this file was first written); runs where ingest was slow had
+# tiering started during the append (a million rows waiting), so their tier_s covers only the rest.
+{"bin": "pondra-r18", "rows": 8000000, "append_rows_per_s": 12314624, "untiered_before_tier": 8000000, "tier_s": 0.85, "tier_rows_per_s": 9413295, "parquet_mb": 35.5}
+{"bin": "pondra-r19", "rows": 8000000, "append_rows_per_s": 13609668, "untiered_before_tier": 8000000, "tier_s": 1.55, "tier_rows_per_s": 5152420, "parquet_mb": 36.1}
+{"bin": "pondra-r20", "rows": 8000000, "append_rows_per_s": 13657101, "untiered_before_tier": 8000000, "tier_s": 1.07, "tier_rows_per_s": 7491737, "parquet_mb": 36.4}
+{"bin": "pondra-r18", "rows": 8000000, "append_rows_per_s": 15753572, "untiered_before_tier": 8000000, "tier_s": 0.88, "tier_rows_per_s": 9133440, "parquet_mb": 35.2}
+{"bin": "pondra-r19", "rows": 8000000, "append_rows_per_s": 12577694, "untiered_before_tier": 8000000, "tier_s": 1.38, "tier_rows_per_s": 5789012, "parquet_mb": 36.1}
+{"bin": "pondra-r20", "rows": 8000000, "append_rows_per_s": 8575419, "untiered_before_tier": 8000000, "tier_s": 0.63, "tier_rows_per_s": 12701876, "parquet_mb": 36.4}
+{"bin": "pondra-r18", "rows": 8000000, "append_rows_per_s": 15000457, "untiered_before_tier": 8000000, "tier_s": 1.08, "tier_rows_per_s": 7383810, "parquet_mb": 35.2}
+{"bin": "pondra-r19", "rows": 8000000, "append_rows_per_s": 7368104, "untiered_before_tier": 8000000, "tier_s": 0.91, "tier_rows_per_s": 8789506, "parquet_mb": 36.1}
+{"bin": "pondra-r20", "rows": 8000000, "append_rows_per_s": 14421450, "untiered_before_tier": 8000000, "tier_s": 1.0, "tier_rows_per_s": 7986587, "parquet_mb": 36.1}

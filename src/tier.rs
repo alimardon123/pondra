@@ -81,10 +81,14 @@ pub async fn tier_table(lake: &Lake, table: &str, hwm: u64, nodes: &[String], me
 /// Returns whether anything changed.
 const MERGE_BYTES: u64 = 256 << 20; // input a merge job takes at most
 
-pub async fn maintain(lake: &Lake, table: &str, nodes: &[String], me: &str) -> Result<bool> {
+/// `now_anyway` (`CHECKPOINT`): a keyed table that publishes is compacted whatever it holds, so
+/// other engines see its rows as they are now.
+pub async fn maintain(lake: &Lake, table: &str, nodes: &[String], me: &str, now_anyway: bool) -> Result<bool> {
     let Some(mut meta) = lake.cat.get::<TableMeta>(&table_key(table)).await? else { return Ok(false) };
     let small: Vec<DataFile> = meta.files.iter().filter(|f| f.bytes < 64 << 20 && f.rows < 4_000_000).cloned().collect();
-    let changed = if !meta.key.is_empty() && meta.files.len() >= 8 {
+    let generations = meta.files.iter().map(|f| f.ord).collect::<std::collections::BTreeSet<_>>().len();
+    let stale = now_anyway && !meta.publish.is_empty() && (generations > 1 || meta.files.iter().any(|f| !f.whole));
+    let changed = if !meta.key.is_empty() && (generations >= 8 || stale) {
         // Tables other engines read compact fully (they see keyed tables as of their last full
         // compaction); the rest merge size-tiered runs.
         let run = if meta.publish.is_empty() { run(&meta.files) } else { meta.files.clone() };
@@ -223,21 +227,30 @@ async fn dead_rows(lake: &Lake, gone: &[DataFile], after: u64, upto: u64) -> Res
     })
 }
 
-/// A keyed table's files to merge next: the newest ones, going back while each older file is at
-/// most twice the size of everything newer (so a merge rewrites data of similar size, and the big
-/// base is only rewritten once the rest reaches half of it). A run must be consecutive in `ord`:
-/// merging around a file would let an older version jump over a newer one. At least 2 files;
-/// the newest 8 when sizes are too uneven to form a run.
+/// A keyed table's files to merge next: the newest generations (a tiering round's files, one per
+/// partition, share an `ord`), going back while each older one is at most twice the size of
+/// everything newer (so a merge rewrites data of similar size, and the big base is only rewritten
+/// once the rest reaches half of it). A run must be consecutive in `ord`: merging around a
+/// generation would let an older version jump over a newer one. At least 2 generations; the newest
+/// 8 when sizes are too uneven to form a run.
 fn run(files: &[DataFile]) -> Vec<DataFile> {
+    let mut gens: Vec<(u64, u64)> = vec![]; // (ord, rows), oldest first
     let mut by_age = files.to_vec();
     by_age.sort_by_key(|f| f.ord);
-    let (mut n, mut rows) = (1, by_age.last().map_or(0, |f| f.rows));
-    while n < by_age.len() && by_age[by_age.len() - n - 1].rows <= 2 * rows.max(1) {
-        rows += by_age[by_age.len() - n - 1].rows;
+    for f in &by_age {
+        match gens.last_mut() {
+            Some((ord, rows)) if *ord == f.ord => *rows += f.rows,
+            _ => gens.push((f.ord, f.rows)),
+        }
+    }
+    let (mut n, mut rows) = (1, gens.last().map_or(0, |g| g.1));
+    while n < gens.len() && gens[gens.len() - n - 1].1 <= 2 * rows.max(1) {
+        rows += gens[gens.len() - n - 1].1;
         n += 1;
     }
-    let n = if n >= 2 { n } else { 8.min(by_age.len()) };
-    by_age.split_off(by_age.len() - n)
+    let n = if n >= 2 { n } else { 8.min(gens.len()) };
+    let from = gens.get(gens.len().saturating_sub(n)).map_or(0, |g| g.0);
+    by_age.into_iter().filter(|f| f.ord >= from).collect()
 }
 
 /// Swap `old` files for `new` ones; the old ones are deleted after the retention period.
@@ -314,9 +327,10 @@ pub async fn run_job(lake: &Lake, Job { table, meta, kind }: Job) -> Result<Vec<
         Kind::Fold { after, upto, rows } if meta.key.is_empty() => {
             caught_up(lake, &table, after, upto, rows).await?;
             let rows = crate::query::tail_of(lake, &table, after, Some(upto), false, true).await?;
-            let rows = match rows.is_empty() || meta.cluster.is_empty() {
-                true => rows,
-                false => clustered(&meta, lake.session().read_batches(rows)?)?.collect().await?,
+            let rows = match (rows.is_empty(), meta.cluster.len()) {
+                (true, _) | (_, 0) => rows,
+                (_, 1) => clustered(&meta, lake.session().read_batches(rows)?)?.collect().await?,
+                _ => crate::hilbert::sort(&rows, &meta.cluster)?,
             };
             (rows, upto)
         }
@@ -356,8 +370,15 @@ pub async fn run_job(lake: &Lake, Job { table, meta, kind }: Job) -> Result<Vec<
         Kind::Merge { files } => {
             let paths: Vec<String> = files.iter().map(|f| lake.full(&f.path)).collect();
             let schema = schema(&meta.columns)?;
+            let session = lake.session();
+            let read = || session.read_parquet(paths.clone(), ParquetReadOptions::default().schema(&schema));
             let rows = match meta.cluster.is_empty() {
-                false => clustered(&meta, lake.session().read_parquet(paths, ParquetReadOptions::default().schema(&schema)).await?)?.execute_stream().await?,
+                false if meta.cluster.len() > 1 => {
+                    let rows = crate::hilbert::sort(&read().await?.collect().await?, &meta.cluster)?; // (what a merge takes fits: MERGE_BYTES)
+                    let stream = futures::stream::iter(rows.into_iter().map(Ok));
+                    Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(schema.clone(), stream))
+                }
+                false => clustered(&meta, read().await?)?.execute_stream().await?,
                 // One file after another, each in one partition: files that each held a narrow
                 // range of a key (data that arrived in order) merge into one that still does.
                 // (Several files in one read come in whatever order they're listed.)
@@ -377,8 +398,8 @@ pub async fn run_job(lake: &Lake, Job { table, meta, kind }: Job) -> Result<Vec<
         }
     };
     let parts = match &meta.partition {
-        Some(spec) if meta.key.is_empty() => split(spec, batches).await?,
-        _ => vec![(String::new(), batches)],
+        Some(spec) => split(spec, batches).await?,
+        None => vec![(String::new(), batches)],
     };
     let mut files = vec![];
     for (part, batches) in parts {
@@ -429,9 +450,10 @@ pub fn check_partition(spec: &str, columns: &[(String, String)]) -> Result<()> {
     Ok(())
 }
 
-/// Append tables with `cluster_by`: every file's rows sorted by those columns (folds and merges
-/// alike), so each row group covers a narrow range of them and a filter on them skips the rest
-/// by min/max statistics and bloom filters — in Pondra and in any engine reading the Parquet.
+/// Append tables with `cluster_by`: every file's rows sorted by that column (folds and merges
+/// alike), so each row group covers a narrow range of it and a filter on it skips the rest by
+/// min/max statistics and bloom filters — in Pondra and in any engine reading the Parquet. (Two
+/// or more columns: along a Hilbert curve through them, `hilbert.rs`.)
 fn clustered(meta: &TableMeta, df: datafusion::prelude::DataFrame) -> Result<datafusion::prelude::DataFrame> {
     if meta.cluster.is_empty() {
         return Ok(df);
@@ -443,7 +465,8 @@ fn clustered(meta: &TableMeta, df: datafusion::prelude::DataFrame) -> Result<dat
 async fn latest(lake: &Lake, table: &str, meta: &TableMeta, upto: u64, keep_deleted: bool) -> Result<Vec<RecordBatch>> {
     let ctx = lake.session();
     ctx.register_table("__raw", raw(lake, &ctx, table, meta, Some(upto)).await?.into_view())?;
-    Ok(ctx.sql(&latest_sql(meta, "__raw", true, keep_deleted)).await?.collect().await?)
+    let rows = ctx.sql(&latest_sql(meta, "__raw", true, keep_deleted)).await?.collect().await?;
+    if meta.cluster.len() > 1 { crate::hilbert::sort(&rows, &meta.cluster) } else { Ok(rows) }
 }
 
 /// Wait until this node sees log segment `upto` (a follower's view may lag the leader a bit),
@@ -627,12 +650,12 @@ pub async fn write_file(lake: &Lake, table: &str, batches: &[RecordBatch], keys:
     for b in batches {
         w.write(b)?;
     }
-    w.close()?;
+    let footer = w.close()?; // (its statistics: the file's min and max, without a second pass)
     let (path, bytes) = (format!("data/{table}/{}.parquet", uuid::Uuid::new_v4()), buf.len() as u64);
     lake.put(&path, buf).await?;
     maybe_crash("after_parquet_put");
     let (stats, nulls, sketch) = match stats {
-        true => (crate::manifest::stats(batches), Some(crate::manifest::nulls(batches)), crate::sketch::of(batches)),
+        true => (crate::manifest::stats(batches, Some(&footer)), Some(crate::manifest::nulls(batches)), crate::sketch::of(batches)),
         false => Default::default(),
     };
     let sys = batches[0].schema().index_of(crate::sys::ROW_ID).is_ok();

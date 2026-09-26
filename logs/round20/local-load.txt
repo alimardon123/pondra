@@ -1,0 +1,12 @@
+{
+ "events_per_s": 1200,
+ "ack_ms_p50": 251,
+ "ack_ms_p99": 254,
+ "freshness_ms_p50": 119,
+ "freshness_ms_p99": 270,
+ "freshness_samples": 73,
+ "commits_per_s": 4.0,
+ "commit_ms_p50": 2,
+ "commit_ms_p95": 3,
+ "server_cores_used": 0.08
+}

@@ -19,7 +19,7 @@
 //! * A session view (`sessions`) holds each key's sessions, a session being its rows with no gap
 //!   of `gap_secs` between them, each emitted once, when the watermark passes its last row plus
 //!   the gap. A row that falls inside a session already emitted is late, and left out.
-use crate::query::{first_table, over, session};
+use crate::query::{first_table, over, session, session_at};
 use crate::store::*;
 use anyhow::{bail, ensure, Context, Result};
 use datafusion::arrow::record_batch::RecordBatch;
@@ -39,10 +39,27 @@ pub struct View {
     /// `_created_at`, so it follows that row's changes (views made from Pondra 0.19 on).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub ids: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub join: Option<Join>,
+}
+
+/// A join of two streams (`join = 'streams'`): a row of either table pairs with the other's rows
+/// when it arrives, and with those that arrive after it. The leader keeps it up to date right after
+/// commits (`join_all`). `time` and `within_secs` bound what a new row is paired against: the
+/// other table's rows at most that far from it in time (so only their files are read).
+#[derive(Serialize, Deserialize, Clone)]
+pub struct Join {
+    pub tables: Vec<String>,
+    pub time: Vec<String>, // one column both tables have, or one per table
+    pub within_secs: Option<u64>,
 }
 
 /// Emit-once windows: `window` is the view's window-start column (a key), cut from the source's
 /// event-time column `time`; windows are `size_secs` long and take rows up to `lateness_secs` late.
+/// Sliding windows (`slide_secs`, a divisor of `size_secs`): a new window every `slide_secs`, each
+/// `size_secs` long. The view then keeps `slide_secs`-long panes (its `date_bin` is the slide), and
+/// each window emitted combines the panes it covers (sums and counts added, min of mins, max of
+/// maxes): a row is added once, not once per window it falls in.
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Emit {
     pub window: String,
@@ -50,6 +67,8 @@ pub struct Emit {
     pub lateness_secs: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub time: Option<String>, // (None in views made before round 16: found from the SQL)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slide_secs: Option<u64>,
 }
 
 /// Session windows over the source's event-time column `time`, per value of `keys` (the view's
@@ -65,28 +84,48 @@ pub struct Sessions {
 
 pub fn view_key(name: &str) -> String { format!("v/{name}") }
 
-/// `CREATE MATERIALIZED VIEW … WITH (window = 'w', size_secs = 60, lateness_secs = 10)` or
-/// `WITH (session = 'ts', gap_secs = 1800, lateness_secs = 5)`: what `POST /views/{v}?…` takes.
-pub fn options(kv: &std::collections::BTreeMap<String, String>) -> Result<(Option<Emit>, Option<Sessions>)> {
-    if let Some(k) = kv.keys().find(|k| !["window", "size_secs", "lateness_secs", "session", "gap_secs"].contains(&k.as_str())) {
-        bail!("{k}: a materialized view's options are window, size_secs, lateness_secs, session and gap_secs");
+impl View {
+    /// Does this view follow `table`'s rows (its source, or either side of a stream join)?
+    pub fn follows(&self, table: &str) -> bool { self.source == table || self.join.as_ref().is_some_and(|j| j.tables.iter().any(|t| t == table)) }
+}
+
+/// `CREATE MATERIALIZED VIEW … WITH (window = 'w', size_secs = 60, lateness_secs = 10)` (and
+/// `slide_secs = 10`: sliding), `WITH (session = 'ts', gap_secs = 1800, lateness_secs = 5)`, or
+/// `WITH (join = 'streams', time = 'ts', within_secs = 600)`: what `POST /views/{v}?…` takes.
+pub fn options(kv: &std::collections::BTreeMap<String, String>) -> Result<(Option<Emit>, Option<Sessions>, Option<Join>)> {
+    const KNOWN: [&str; 9] = ["window", "size_secs", "slide_secs", "lateness_secs", "session", "gap_secs", "join", "time", "within_secs"];
+    if let Some(k) = kv.keys().find(|k| !KNOWN.contains(&k.as_str())) {
+        bail!("{k}: a materialized view's options are {}", KNOWN.join(", "));
     }
     let num = |k: &str, d: u64| kv.get(k).map_or(Ok(d), |v| v.parse::<u64>().map_err(|_| anyhow::anyhow!("{k} is a number of seconds")));
     let lateness_secs = num("lateness_secs", 0)?;
-    let emit = kv.get("window").map(|w| Ok::<_, anyhow::Error>(Emit { window: w.clone(), size_secs: num("size_secs", 60)?, lateness_secs, time: None })).transpose()?;
+    let slide_secs = kv.get("slide_secs").map(|_| num("slide_secs", 0)).transpose()?;
+    let emit = kv.get("window").map(|w| Ok::<_, anyhow::Error>(Emit { window: w.clone(), size_secs: num("size_secs", 60)?, lateness_secs, time: None, slide_secs })).transpose()?;
+    if let Some(e) = &emit {
+        ensure!(e.slide_secs.is_none_or(|s| s > 0 && s < e.size_secs && e.size_secs % s == 0), "slide_secs: a divisor of size_secs, less than it");
+    }
+    ensure!(emit.is_some() || slide_secs.is_none(), "slide_secs slides a window: window = '…', size_secs = …");
+    let join = match kv.get("join").map(String::as_str) {
+        Some("streams") => Some(Join { tables: vec![], time: kv.get("time").map(|t| t.split(',').map(|c| c.trim().to_string()).collect()).unwrap_or_default(), within_secs: kv.get("within_secs").map(|_| num("within_secs", 0)).transpose()? }),
+        Some(other) => bail!("join = '{other}': join = 'streams' pairs the rows of two tables as they arrive on either side"),
+        None => None,
+    };
+    ensure!(join.as_ref().is_none_or(|j| j.within_secs.is_none() || !j.time.is_empty()), "within_secs needs time = '…': the column (or one per table) it bounds");
     let sessions = kv.get("session").map(|t| Ok::<_, anyhow::Error>(Sessions { time: t.clone(), gap_secs: num("gap_secs", 1800)?, lateness_secs, keys: vec![] })).transpose()?;
-    Ok((emit, sessions))
+    Ok((emit, sessions, join))
 }
 /// A session view's bound: no session still open starts before this (µs).
 fn open_key(name: &str) -> String { format!("w/{name}") }
 
 /// Register view `name` (leader only): its table gets the query's output columns; a GROUP BY
 /// query makes it a merge table keyed by the group columns.
-pub async fn create(lake: &Lake, name: &str, sql: &str, mut emit: Option<Emit>, sessions: Option<Sessions>) -> Result<()> {
+pub async fn create(lake: &Lake, name: &str, sql: &str, mut emit: Option<Emit>, sessions: Option<Sessions>, join: Option<Join>) -> Result<()> {
     if let Some(v) = lake.cat.get::<View>(&view_key(name)).await? {
-        let windows = |e: &Option<Emit>| e.as_ref().map(|e| (e.window.clone(), e.size_secs, e.lateness_secs));
+        let windows = |e: &Option<Emit>| e.as_ref().map(|e| (e.window.clone(), e.size_secs, e.lateness_secs, e.slide_secs));
         let gaps = |s: &Option<Sessions>| s.as_ref().map(|s| (s.time.clone(), s.gap_secs, s.lateness_secs));
-        ensure!(v.sql == sql && windows(&v.emit) == windows(&emit) && gaps(&v.sessions) == gaps(&sessions), "view {name} already exists, with other SQL or options");
+        let joins = |j: &Option<Join>| j.as_ref().map(|j| (j.time.clone(), j.within_secs));
+        let same = v.sql == sql && windows(&v.emit) == windows(&emit) && gaps(&v.sessions) == gaps(&sessions) && joins(&v.join) == joins(&join);
+        ensure!(same, "view {name} already exists, with other SQL or options");
         return Ok(()); // (asked again, the same: a notebook cell run twice)
     }
     ensure!(lake.cat.get::<TableMeta>(&table_key(name)).await?.is_none(), "table {name} already exists");
@@ -94,8 +133,12 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, mut emit: Option<Emit>, 
     ensure!(other.is_none(), "a view follows a table of this lake");
     let src: TableMeta = lake.cat.get(&table_key(&source)).await?.with_context(|| format!("no table {source}"))?;
     if let Some(s) = sessions {
-        ensure!(emit.is_none(), "a view emits windows or sessions, not both");
+        ensure!(emit.is_none() && join.is_none(), "a view emits windows or sessions, or joins streams: one of them");
         return create_sessions(lake, name, sql, source, &src, s).await;
+    }
+    if let Some(j) = join {
+        ensure!(emit.is_none(), "a view emits windows or joins streams, not both");
+        return create_join(lake, name, sql, source, j).await;
     }
     let planned = crate::asof::rewrite(sql)?;
     let plan = session(lake, &planned, "").await?.sql(&planned).await?.logical_plan().clone();
@@ -115,7 +158,7 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, mut emit: Option<Emit>, 
         let columns = meta.columns.iter().filter(|(c, _)| c != "_deleted").cloned().collect();
         puts.push((table_key(&format!("{name}_final")), json(&TableMeta { columns, publish: default_publish(), ids: true, tiered: lake.visible(), ..Default::default() })));
     }
-    puts.push((view_key(name), json(&View { source, sql: sql.into(), emit, sessions: None, ids })));
+    puts.push((view_key(name), json(&View { source, sql: sql.into(), emit, sessions: None, ids, join: None })));
     lake.cat.commit(puts, &[]).await
 }
 
@@ -140,7 +183,7 @@ async fn create_sessions(lake: &Lake, name: &str, sql: &str, source: String, src
     ensure!(s.keys.iter().all(|k| out.field_with_unqualified_name(k).is_ok()), "a session view SELECTs its GROUP BY columns, as they are named");
     let columns = out.fields().iter().map(|f| (f.name().clone(), crate::query::type_name(f.data_type()))).collect();
     let meta = TableMeta { columns, publish: default_publish(), ids: true, tiered: lake.visible(), ..Default::default() };
-    let view = View { source, sql: sql.into(), emit: None, sessions: Some(s), ids: false };
+    let view = View { source, sql: sql.into(), emit: None, sessions: Some(s), ids: false, join: None };
     lake.cat.commit(vec![(view_key(name), json(&view)), (table_key(name), json(&meta))], &[]).await
 }
 
@@ -263,7 +306,24 @@ async fn emit(lake: &Lake, log: &crate::log::Log, view: &str, v: &View, e: &Emit
         return Ok(());
     }
     let w = quoted(&e.window);
-    let sql = format!("SELECT * FROM {} WHERE {w} > to_timestamp_micros({done}) AND {w} <= to_timestamp_micros({upto}) ORDER BY {w}", quoted(view));
+    let sql = match e.slide_secs {
+        None => format!("SELECT * FROM {} WHERE {w} > to_timestamp_micros({done}) AND {w} <= to_timestamp_micros({upto}) ORDER BY {w}", quoted(view)),
+        // Each window (starting on a pane) is the panes it covers: every pane, shifted back by
+        // each offset a window can start before it, grouped by where that window starts.
+        Some(slide) => {
+            let meta: TableMeta = lake.cat.get(&table_key(view)).await?.with_context(|| format!("no table {view}"))?;
+            let offsets = (0..e.size_secs / slide).map(|i| format!("(INTERVAL '{} seconds')", i * slide)).collect::<Vec<_>>().join(", ");
+            let cols = meta.columns.iter().filter(|(c, _)| c != "_deleted").map(|(c, _)| match (c == &e.window, meta.merge.get(c).map(String::as_str)) {
+                (true, _) => format!("{w} - __o AS {w}"),
+                (_, Some("count" | "sum")) => format!("sum({0}) AS {0}", quoted(c)),
+                (_, Some(f)) => format!("{f}({0}) AS {0}", quoted(c)),
+                (_, None) => quoted(c),
+            });
+            let keys = meta.key.iter().map(|k| if k == &e.window { format!("{w} - __o") } else { quoted(k) }).collect::<Vec<_>>().join(", ");
+            format!("SELECT {} FROM {} CROSS JOIN (VALUES {offsets}) AS __offsets(__o) WHERE {w} - __o > to_timestamp_micros({done}) AND {w} - __o <= to_timestamp_micros({upto}) GROUP BY {keys} ORDER BY 1",
+                    cols.collect::<Vec<_>>().join(", "), quoted(view))
+        }
+    };
     let rows = session(lake, &sql, "").await?.sql(&sql).await?.collect().await?;
     append(lake, log, &final_table, crate::log::Src { producer, seq: upto as u64, prev: Some(done) }, rows).await
 }
@@ -328,11 +388,12 @@ async fn sessions(lake: &Lake, log: &crate::log::Log, view: &str, v: &View, s: &
 /// upserts, which its followers already see as new rows.)
 pub async fn can_follow(lake: &Lake, table: &str, append: bool) -> Result<()> {
     let mut not = vec![];
-    for (k, v) in lake.cat.scan::<View>("v/", "v0").await?.into_iter().filter(|(_, v)| v.source == table) {
+    for (k, v) in lake.cat.scan::<View>("v/", "v0").await?.into_iter().filter(|(_, v)| v.follows(table)) {
         let name = &k[2..];
         let meta: TableMeta = lake.cat.get(&table_key(name)).await?.context("view without table")?;
         let why = match () {
             _ if v.emit.is_some() || v.sessions.is_some() => Some("emits windows or sessions once"),
+            _ if v.join.is_some() => Some("pairs two streams' rows as they arrive"),
             _ if !append => None,
             _ if meta.merge.is_empty() && !v.ids => Some("isn't row by row over the table alone (a join, DISTINCT, …), or was made before Pondra 0.19"),
             _ if meta.merge.is_empty() => None,
@@ -385,8 +446,8 @@ fn alone(p: &LogicalPlan, grouped: bool) -> bool {
 pub async fn derive(lake: &Lake, new: &BTreeMap<String, Vec<RecordBatch>>) -> Result<Vec<(String, RecordBatch)>> {
     let mut out = vec![];
     for (key, v) in lake.cat.scan::<View>("v/", "v0").await? {
-        if v.sessions.is_some() {
-            continue; // (sessions are cut as they close)
+        if v.sessions.is_some() || v.join.is_some() {
+            continue; // (sessions are cut as they close; stream joins run once rows commit)
         }
         let (rows, gone) = (new.get(&v.source), new.get(&crate::sys::deleted(&v.source)));
         if rows.is_none() && gone.is_none() {
@@ -494,4 +555,137 @@ fn top_aggregate(plan: &LogicalPlan) -> Option<&LogicalPlan> {
         LogicalPlan::Projection(_) | LogicalPlan::Sort(_) | LogicalPlan::Limit(_) | LogicalPlan::Filter(_) => top_aggregate(plan.inputs()[0]),
         _ => None,
     }
+}
+
+/// A stream join view: its two tables (both of this lake, append tables), its columns from the
+/// query, and where it starts (rows written from now on, paired with whatever the other side has).
+async fn create_join(lake: &Lake, name: &str, sql: &str, source: String, mut j: Join) -> Result<()> {
+    use datafusion::common::tree_node::TreeNode;
+    let planned = crate::asof::rewrite(sql)?;
+    let plan = session(lake, &planned, "").await?.sql(&planned).await?.into_unoptimized_plan();
+    let mut scans = vec![];
+    plan.apply(|p| {
+        if let LogicalPlan::TableScan(t) = p {
+            scans.push(t.table_name.to_string());
+        }
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    })?;
+    let mut tables = vec![];
+    for t in scans {
+        let (other, t) = crate::ddl::resolve(lake, &t).await?;
+        let meta: Option<TableMeta> = lake.cat.get(&table_key(&t)).await?;
+        if other.is_none() && meta.is_some_and(|m| m.key.is_empty()) && !tables.contains(&t) {
+            tables.push(t);
+        }
+    }
+    ensure!(tables.len() == 2 && tables[0] == source, "join = 'streams': the query joins two append tables of this lake (it names {tables:?})");
+    for (i, t) in tables.iter().enumerate() {
+        if let Some(c) = j.time.get(i).or(j.time.first()) {
+            let meta: TableMeta = lake.cat.get(&table_key(t)).await?.context("no table")?;
+            ensure!(timestamp(&meta, c), "time: {c} isn't a timestamp column of {t}");
+        }
+    }
+    let columns: Vec<(String, String)> = plan.schema().fields().iter().map(|f| (f.name().clone(), crate::query::type_name(f.data_type()))).collect();
+    j.tables = tables;
+    let now = lake.visible();
+    let meta = TableMeta { columns, publish: default_publish(), ids: true, tiered: now, ..Default::default() };
+    let view = View { source, sql: sql.into(), emit: None, sessions: None, ids: false, join: Some(j) };
+    lake.cat.commit(vec![(table_key(name), json(&meta)), (view_key(name), json(&view)), (producer_key(&format!("join:{name}")), json(&now))], &[]).await
+}
+
+/// Leader, right after commits: every stream join view brought up to date (one that fails is
+/// tried again next time; the others go on).
+pub async fn join_all(lake: &Lake, log: &crate::log::Log) -> Result<()> {
+    for (key, v) in lake.cat.scan::<View>("v/", "v0").await? {
+        if let Some(j) = &v.join {
+            if let Err(e) = join(lake, log, &key[2..], &v, j).await {
+                eprintln!("stream join {}: {e:#}", &key[2..]);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The pairs commits (done, now] made: the new rows of one table against the other's as of now,
+/// and the other's new rows against the first's as of `done` — Δa ⋈ b ∪ a(done) ⋈ Δb, so each pair
+/// comes once. `_version` (the commit that wrote a row, `sys.rs`) tells new rows from old. The
+/// pairs and the progress (`join:{view}`) commit together: none lost, none twice.
+async fn join(lake: &Lake, log: &crate::log::Log, view: &str, v: &View, j: &Join) -> Result<()> {
+    use crate::sys::VERSION;
+    use datafusion::prelude::{col, lit};
+    let producer = format!("join:{view}");
+    let done: u64 = lake.cat.get(&producer_key(&producer)).await?.unwrap_or(0);
+    let now = lake.visible();
+    if now <= done {
+        return Ok(());
+    }
+    let (a, b) = (&j.tables[0], &j.tables[1]);
+    let rows = session_at(lake, &format!("SELECT {VERSION} FROM {a}, {b}"), "", Some(now)).await?; // (with their system columns)
+    let (new_a, new_b) = (versions(&rows, a, Some(done), now).await?.collect().await?, versions(&rows, b, Some(done), now).await?.collect().await?);
+    if new_a.iter().chain(&new_b).all(|b| b.num_rows() == 0) {
+        return Ok(()); // (nothing new on either side: no run, no commit)
+    }
+    // What the new rows of one side pair with: the other's rows up to a commit, and, bounded,
+    // those within `within_secs` of the new rows' times.
+    let time = |i: usize| j.time.get(i).or(j.time.first()).cloned();
+    let bound = |i: usize, fresh: &[RecordBatch]| match (time(i), time(1 - i), j.within_secs) {
+        (Some(mine), Some(theirs), Some(w)) => span(fresh, &theirs, w).map(|range| (mine, range)),
+        _ => None,
+    };
+    let (for_a, for_b) = (bound(1, &new_a), bound(0, &new_b));
+    let mut other_b = versions(&rows, b, None, now).await?;
+    let mut other_a = versions(&rows, a, None, done).await?;
+    for (df, bound) in [(&mut other_b, for_a), (&mut other_a, for_b)] {
+        if let Some((c, (lo, hi))) = bound {
+            let dt = df.schema().field_with_unqualified_name(&c)?.data_type().clone();
+            let at = |us: i64| datafusion::common::ScalarValue::TimestampMicrosecond(Some(us), None).cast_to(&dt);
+            *df = df.clone().filter(col(c.as_str()).gt_eq(lit(at(lo)?)).and(col(c.as_str()).lt_eq(lit(at(hi)?))))?;
+        }
+    }
+    let mut out = vec![];
+    for (fresh, other) in [(0usize, other_b), (1, other_a)] {
+        let (fresh_rows, other_i) = if fresh == 0 { (&new_a, 1) } else { (&new_b, 0) };
+        if fresh_rows.iter().all(|b| b.num_rows() == 0) {
+            continue;
+        }
+        // The view's SQL over the fresh rows of one table and the other's rows, each with its own
+        // columns only (the system columns stay out of the view's `*`).
+        let ctx = session_at(lake, &v.sql, "", Some(now)).await?;
+        for (i, df) in [(fresh, rows.read_batches(fresh_rows.clone())?), (other_i, other.clone())] {
+            let t = &j.tables[i];
+            let meta: TableMeta = lake.cat.get(&table_key(t)).await?.with_context(|| format!("no table {t}"))?;
+            let df = df.select_columns(&meta.columns.iter().map(|(c, _)| c.as_str()).collect::<Vec<_>>())?;
+            ctx.deregister_table(crate::query::table_ref(t))?;
+            ctx.register_table(crate::query::table_ref(t), df.into_view())?;
+        }
+        out.extend(ctx.sql(&crate::asof::rewrite(&v.sql)?).await?.collect().await?);
+    }
+    let meta: TableMeta = lake.cat.get(&table_key(view)).await?.with_context(|| format!("no table {view}"))?;
+    let s = crate::query::schema(&meta.columns)?;
+    let out = out.iter().map(|b| crate::query::cast_as(b, &s)).collect::<Result<Vec<_>>>()?;
+    append(lake, log, view, crate::log::Src { producer, seq: now, prev: Some(done) }, out).await
+}
+
+/// Table `t`'s rows (in `ctx`, with system columns) written by commits (after, upto].
+async fn versions(ctx: &datafusion::prelude::SessionContext, t: &str, after: Option<u64>, upto: u64) -> Result<datafusion::prelude::DataFrame> {
+    use datafusion::prelude::{col, lit};
+    let upto = col(crate::sys::VERSION).lt_eq(lit(upto as i64));
+    let cond = match after {
+        Some(after) => col(crate::sys::VERSION).gt(lit(after as i64)).and(upto),
+        None => upto,
+    };
+    Ok(ctx.table(crate::query::table_ref(t)).await?.filter(cond)?)
+}
+
+/// The time range (µs) `within_secs` around the values of column `c` in `rows` (None: no rows).
+fn span(rows: &[RecordBatch], c: &str, within_secs: u64) -> Option<(i64, i64)> {
+    use datafusion::arrow::compute::{max, min};
+    let (mut lo, mut hi) = (None::<i64>, None::<i64>);
+    for b in rows.iter().filter(|b| b.num_rows() > 0) {
+        let us = micros(b, c).ok()?;
+        lo = lo.min(min(&us)).or(min(&us)).or(lo);
+        hi = hi.max(max(&us));
+    }
+    let w = (within_secs * 1_000_000) as i64;
+    Some((lo? - w, hi? + w))
 }

@@ -1,0 +1,1 @@
+{"streams": {"passed": true, "checks": {"stream join: each pair once, whichever side came first": true, "sliding windows: every window, every click it covers": true}, "pairs": 203, "windows": 52}}

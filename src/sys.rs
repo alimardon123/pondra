@@ -211,22 +211,22 @@ pub fn derive(b: &RecordBatch, seg: u64, pos: u64, ms: u64) -> Result<RecordBatc
     let n = b.num_rows();
     let us = (ms * 1000) as i64;
     let keep = |name: &str, dt: &DataType| b.column_by_name(name).map(|c| datafusion::arrow::compute::cast(c, dt)).transpose();
+    // (a column the rows carry whole is kept as it is: no pass over it)
     let ids: ArrayRef = match keep(ROW_ID, &DataType::Int64)? {
+        Some(c) if c.null_count() == 0 => c,
         Some(c) => Arc::new(c.as_primitive::<Int64Type>().iter().enumerate().map(|(i, v)| v.or(Some(((seg << 32) + pos + i as u64) as i64))).collect::<Int64Array>()),
         None => Arc::new(Int64Array::from_iter_values((0..n as i64).map(|i| ((seg << 32) + pos) as i64 + i))),
     };
-    let at = |v: Option<ArrayRef>| -> ArrayRef {
-        let now = TimestampMicrosecondArray::from(vec![us; n]);
-        let a = match v {
-            Some(c) => c.as_primitive::<TimestampMicrosecondType>().iter().map(|v| v.or(Some(us))).collect::<TimestampMicrosecondArray>(),
-            None => now,
-        };
-        Arc::new(a.with_timezone("UTC"))
+    let now: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![us; n]).with_timezone("UTC")); // (created and updated alike: one array)
+    let created: ArrayRef = match keep(CREATED, &time())? {
+        Some(c) if c.null_count() == 0 => c,
+        Some(c) => Arc::new(c.as_primitive::<TimestampMicrosecondType>().iter().map(|v| v.or(Some(us))).collect::<TimestampMicrosecondArray>().with_timezone("UTC")),
+        None => now.clone(),
     };
     let b = set(b, ROW_ID, ids)?;
     let b = set(&b, VERSION, Arc::new(Int64Array::from(vec![seg as i64; n])))?;
-    let b = set(&b, CREATED, at(keep(CREATED, &time())?))?;
-    set(&b, UPDATED, at(None))
+    let b = set(&b, CREATED, created)?;
+    set(&b, UPDATED, now)
 }
 
 /// `b` with column `name` set to `values` (replaced if it has one, else added at the end).

@@ -24,7 +24,7 @@ The owner's design principles, which every change must respect:
 ## Layout
 
 ```
-src/      15,300 lines of Rust, one file per concern (see the table in README.md)
+src/      16,100 lines of Rust, one file per concern (see the table in README.md)
 python/   the Python client (pure Python, HTTP + Arrow; `local()` starts a node)
 js/       the JavaScript client and the `pondra` npm package's files
 examples/ quickstart.ipynb (pip install to an as-of join, in the owner's notebook style)
@@ -194,8 +194,16 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
 - **Spread only when it pays** (`guard.rs`): a query goes across the nodes when what its plan
   would move (DataFusion's estimates at each exchange), at the slowest link's measured speed, plus
   a few round trips a step, costs less than what it saves on one node (the time it took here when
-  last asked, else its tables' bytes at this node's rate). Nothing known yet: it runs here.
-  `?spread=1` forces; `PONDRA_LINK=ms,MB/s` states a network.
+  last asked, else its tables' bytes at this node's rate). Nothing known yet: it runs here; run
+  both ways, the faster way wins. `?spread=1` forces; `PONDRA_LINK=ms,MB/s` states a network.
+- **Few objects** (round 20): `INSERT … VALUES` through the log, the catalog's WAL cleared every
+  minute, tiering at most every 10 s by default; `store::Counted` counts writes, lists and deletes.
+  A keyed table's tiering round is a generation (a file per partition, sorted by `cluster_by` then
+  the key); two or more `cluster_by` columns order rows along a Hilbert curve (`hilbert.rs`).
+- **Stream joins and sliding windows** (round 20, `views.rs`): `join = 'streams'` views run on the
+  leader after commits (Δa ⋈ b ∪ a ⋈ Δb by `_version`); `slide_secs` windows combine panes.
+- **The Postgres port** (`pg.rs`): rows a batch at a time, `COPY` in (text, CSV) and out (text,
+  CSV, binary), DECIMAL as NUMERIC.
 - **Memory:** one spill pool per node (`--memory-gb`); a query out of memory runs again with
   sort-merge joins. **`GET /metrics`** (Prometheus) for everything else.
 
@@ -468,6 +476,39 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    (`enable_dynamic_filter_pushdown`): assigning the umbrella field left the joins' own switch on,
    and a changed table's anti-join, planned with its dynamic filter built, failed when the query
    around it swapped its sides (`harness.py changes`' spread query fell back to one node).
+64. **`INSERT … VALUES` goes through the log** (`write::through_log`): a Parquet file per INSERT
+   piled up (200 one-row INSERTs, 215 files), and a bucket bills and rate-limits every object.
+   Bulk `INSERT … SELECT` still writes Parquet itself (`harness.py files`).
+65. **A file's min and max come from its Parquet footer** (`manifest::stats`), except floats
+   (Parquet leaves NaN out, and a NaN must not be pruned away): a second pass over every column
+   cost more than the system columns' encoding. Only exact statistics count: a row group whose
+   min or max is missing or cut short (strings over 64 bytes) leaves the column without a range.
+66. **A keyed table's files come in generations** (one `ord` per tiering round: a file per
+   partition). Compaction takes whole generations, newest back (`tier::run`), and counts them,
+   not files; a keyed table is published only as one generation (`delta::publishable`); reads let
+   a newer generation's row for a key shadow an older one's in any partition, so Pondra doesn't
+   prune a keyed table by partition (`harness.py layouts`).
+67. **A table a stream join follows takes every write through the log** (`View::follows`): its
+   rows' `_version` must be the commit that made them visible. A bulk INSERT's files carry the
+   commit number reserved before they were written, older than the commit that records them, so
+   a join run in between would miss them.
+68. **A stream join's pairs and its progress commit together** (`views::join`, producer
+   `join:{view}`): over commits (done, now], Δa ⋈ b(≤ now) ∪ a(≤ done) ⋈ Δb, each pair once; a run
+   with nothing new on either side commits nothing (`harness.py streams`, a leader restart in it).
+69. **A sliding window is its panes, combined** (`slide_secs` divides `size_secs`): the view keeps
+   `slide_secs` panes and each emitted window adds counts and sums, takes the min of mins and max
+   of maxes — a row is added once, not once per window.
+70. **`pondra sql` takes a block of row ids from a reachable leader before a bulk INSERT writes**
+   (`write::reserve`): unstamped files are rewritten by the leader to add them, which made loading
+   TPC-H 4× slower on round 19 (`harness.py files`: the leader writes nothing but its commits).
+71. **COPY is the Postgres port's, not DataFusion's** (`pg::Copy`): described with no columns, never
+   planned; `COPY … FROM STDIN` gathers per connection and loads through the log 32 MB at a time,
+   split at a line's end (for CSV, outside quotes).
+72. **A query that ran both ways goes the way that was faster** (`guard::ran_spread`), unless the
+   network is pretended (`PONDRA_LINK`: the model alone, as the tests need).
+73. **`pondra_object_requests_total` counts what the store was asked to do** (`store::Counted`), not
+   what SlateDB tried: a local disk refuses SlateDB's tagged PUT before writing, and it tries again
+   untagged; the refusal isn't counted.
 
 ## Tests: run these before and after any change
 
@@ -490,7 +531,12 @@ python3 tools/harness.py asof                  # ASOF JOIN over a stream (a view
 python3 tools/harness.py sums                  # sum(DOUBLE) == math.fsum, whole, grouped, windowed, on every node
 python3 tools/harness.py schemas               # schemas, three-part names, attached lakes, DDL, stored and materialized views, drops
 python3 tools/harness.py changes               # UPDATE/DELETE/MERGE vs a model on 3 nodes: row ids, views, change feed, purges, Delta, spread
-python3 tools/harness.py guard                 # a query spreads only when it pays (PONDRA_LINK: a slow link keeps it on one node)
+python3 tools/harness.py guard                 # a query spreads only when it pays (PONDRA_LINK: a slow link keeps it on one node); measured times decide after
+python3 tools/harness.py files                 # one-row INSERTs: one Parquet file, one object write each; the catalog's WAL cleared; pondra sql INSERTs not rewritten
+python3 tools/harness.py layouts               # PRIMARY KEY + partition_by + cluster_by: rows moving between days vs a model; delta-rs
+python3 tools/harness.py clusters              # cluster_by over two columns: row groups narrow in both (Hilbert order)
+python3 tools/harness.py copies                # COPY FROM STDIN (text, CSV), TO STDOUT (text, CSV, binary); the ADBC Postgres driver
+python3 tools/harness.py streams               # a stream join over two nodes and a restart vs a model; sliding windows vs a model
 python3 tools/smoke.py target/release/pondra   # what CI runs on Windows, macOS and Linux (stdlib only)
 python3 tools/anywhere_check.py --bin <pondra> --dist dist [--docker]   # shell, local(), kill -9, wheel, npm, notebook; glibc 2.17 + Ubuntu 22.04
 python3 tools/bench/repeat.py --data ~/tpch/sf1-bench --query 15 --runs 20 [--hot]   # one query many times vs DuckDB
@@ -554,13 +600,13 @@ Practical notes for an agent working here:
 - Node stderr goes to `/tmp/pondra-<port>-<id>.stderr`; that's where "restarting to rejoin",
   "slow tiering" and panics show up.
 
-## State of the work (2026-09-26, round 19)
+## State of the work (2026-09-26, round 20)
 
 Everything in `docs/prototype-status.md` passes on local disk and on simulated R2. The round-11
 additions (manifests, partitions, shuffles, memory limits, Arrow Flight) also ran against real
 R2; round 12's are in `logs/round12/`, round 13's in `logs/round13/`, round 14's in
 `logs/round14/`, round 15's in `logs/round15/`, round 16's in `logs/round16/`, round 17's in `logs/round17/`,
-round 18's in `logs/round18/` and round 19's in `logs/round19/`.
+round 18's in `logs/round18/`, round 19's in `logs/round19/` and round 20's in `logs/round20/`.
 
 **R2 test buckets.** There are two:
 
@@ -597,6 +643,13 @@ times each query on one node, as the cluster decides, and spread anyway. Next: t
 19's code, then scale-out where machines share a data centre (the owner's Google Cloud trial: one
 zone, well under 1 ms, 1–2 GB/s).
 
+**The cluster bench on round 19** (the owner's run, `logs/round20/cluster-bench-round19-run.json`,
+links 23–65 ms and 43–116 MB/s): one node 15.7 s, as the cluster decides 18.0 s (5 queries
+spread, 4 of them slower for it: 2.3 s in all), spread anyway 39.5 s; 80 MB moved instead of
+938; every answer the same. Loading took 442 s against 108 s: a `pondra sql` bulk INSERT's files
+were rewritten by the leader to stamp row ids (fixed: invariant 70). A query that has run both
+ways now goes the faster way (invariant 72). Next: machines in one data centre.
+
 **Where the multi-machine run will happen (the owner's plan, 2026-09-23).** The owner has no VMs
 of their own. They will run the multi-machine tests themselves, later, on one of:
 
@@ -607,7 +660,7 @@ of their own. They will run the multi-machine tests themselves, later, on one of
   runners have 14 GB of disk (SF10 fits, SF100 doesn't) and are shared, so compare shapes (1 → 3 →
   6 nodes), not headline numbers. `.github/workflows/cluster-bench.yml` and `tools/cloud/actions/`
   are the workflow; `bench-bin/pondra` in `ponderabucket-us` holds the portable binary
-  (Linux x86-64, glibc 2.17) for its `binary: r2` input (round 19's since this round). Rebuild and re-upload it when the code
+  (Linux x86-64, glibc 2.17) for its `binary: r2` input (round 20's since this round). Rebuild and re-upload it when the code
   changes, and read results from `bench-results/<run id>/results.json`.
 - **A Google Cloud VM trial** ($300 for 90 days, no charge unless they upgrade) for dedicated
   machines, SF100 and Spark on the same VMs, with `tools/cloud/cluster.sh`.
@@ -620,6 +673,12 @@ links a session to their computer, an agent can drive VMs from there instead.
 
 Headline numbers, all on one 2-vCPU box:
 
+- **Fewer objects, any layout, streams joined** (round 20, ADR-021): a trickle of one-row INSERTs
+  writes 1.1 objects each (3.9 before) and leaves 217 (5,962); tiering with system columns 1.10–1.16 s
+  per 8 M rows (round 19 1.45–1.55, round 18 0.88–0.98, side by side); a PRIMARY KEY with
+  `partition_by` and `cluster_by`; `cluster_by` over two columns along a Hilbert curve (a filter on
+  the second 2× faster); `COPY` over Postgres, the ADBC Postgres driver; joins of two streams (a
+  pair 14 ms after its second row) and sliding windows.
 - **Change any row** (round 19, ADR-020): `UPDATE`/`DELETE`/`MERGE` on every table, system
   columns (`_row_id`, `_version`, `_created_at`, `_updated_at`), views and a Delta-style change
   feed that follow every change, purges so Delta and Iceberg see it. On 10 M rows: an UPDATE of
@@ -719,7 +778,7 @@ runs. In short:
    code (`bench-bin/pondra` holds it), compare `cluster_s` (the guard) with `one_node_s` and
    `forced_s` in `bench-results/<run id>/results.json`; then machines in one data centre.
 3. **Publish:** once the owner reserves `pondra` on PyPI and npm and picks a license, tag
-   `v0.19.0` and let `.github/workflows/release.yml` build, try and publish.
+   `v0.20.0` and let `.github/workflows/release.yml` build, try and publish.
 4. **Then:** proof at scale (TPC-H SF10 on 1/3/6 machines, Nexmark, sqllogictest), a web console
    and live queries, the in-process module, TLS and grants, the browser (roadmap rounds 20–24).
 

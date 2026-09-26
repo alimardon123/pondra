@@ -1,0 +1,37 @@
+/usr/local/lib/python3.11/dist-packages/adbc_driver_manager/dbapi.py:369: Warning: Cannot disable autocommit; conn will not be DB-API 2.0 compliant
+  warnings.warn(
+{
+ "rows": 1000000,
+ "ways": {
+  "Postgres, psycopg text rows": {
+   "s": 0.72,
+   "rows_per_s": 1389025,
+   "rows": 1000000
+  },
+  "Postgres, psycopg binary rows": {
+   "s": 1.23,
+   "rows_per_s": 811925,
+   "rows": 1000000
+  },
+  "Postgres COPY binary, psycopg": {
+   "s": 1.61,
+   "rows_per_s": 622240,
+   "rows": 1000000
+  },
+  "Postgres COPY binary, ADBC (Arrow)": {
+   "s": 0.67,
+   "rows_per_s": 1487395,
+   "rows": 1000000
+  },
+  "Flight SQL, ADBC (Arrow)": {
+   "s": 0.1,
+   "rows_per_s": 10379911,
+   "rows": 1000000
+  },
+  "HTTP, Arrow IPC": {
+   "s": 0.05,
+   "rows_per_s": 18436177,
+   "rows": 1000000
+  }
+ }
+}

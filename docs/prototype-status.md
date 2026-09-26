@@ -1,6 +1,6 @@
 # Prototype status: Pondra, a streamhouse in one binary
 
-**Date:** 2026-09-26 (round 19) · **Plan:** ADR-002 to ADR-020, `roadmap.md` · **Code:** `pondra.zip` / `pondra.bundle` (≈15,400 lines of Rust, plus Python and JavaScript clients, packaging, and test and benchmark tools)
+**Date:** 2026-09-26 (round 20) · **Plan:** ADR-002 to ADR-021, `roadmap.md` · **Code:** `pondra.zip` / `pondra.bundle` (≈16,100 lines of Rust, plus Python and JavaScript clients, packaging, and test and benchmark tools)
 **Name:** the prototype formerly called `lh` is now **Pondra**. The name is free on crates.io, PyPI and npm. A small personal-finance app uses it (pondra.app), a different category; run a trademark search before a public launch.
 
 ## Where it stands
@@ -14,6 +14,55 @@ One Rust binary replaces the Kafka + Flink + Spark + metastore + ZooKeeper stack
 - upsert and merge tables.
 
 Start more copies on the same bucket to scale out. The only state is object storage. There's no JVM, no database server and no coordination service.
+
+**Round 20 took the owner's questions after round 19 as its list** (ADR-021):
+
+1. **Far fewer objects.** A bucket bills, and rate-limits, every request. A trickle of one-row
+   INSERTs (20 a second for 2 minutes, a table publishing Delta and Iceberg) wrote 9,244 objects
+   and left 5,962 on round 19; now 2,667 and 217 (`logs/round20/objects.txt`): `INSERT … VALUES`
+   goes through the log instead of a Parquet file each, the catalog's write-ahead log is cleared
+   every minute instead of every 10, and tiering runs at most every 10 s by default (a million
+   rows waiting: within a second). What remains is about one write per acknowledged commit.
+   `/metrics` counts the store's writes, lists and deletes.
+2. **System columns cost tiering a third of what they did.** Tiering 8 M rows, dist builds side by
+   side (`logs/round20/tiering-r18-r19-r20.txt`): round 18 0.88–0.98 s, round 19 1.45–1.55 s,
+   round 20 1.10–1.16 s; ingest the same. File statistics now come from the Parquet footer the
+   writer builds anyway, not a second pass over every column — that pass cost more than encoding
+   the system columns (`_row_id` alone, delta-encoded, costs next to nothing:
+   `logs/round20/syscols.rs`).
+3. **A PRIMARY KEY goes with `partition_by` and `cluster_by`** — the owner's `CREATE TABLE`, as
+   written. Each tiering round's newest rows go into a file per partition, sorted by the cluster
+   columns then the key; a newer round's row for a key shadows an older one's in any partition, so
+   a row that moves to another day has one current version. `CHECKPOINT` compacts a published
+   keyed table so Delta and Iceberg see it as it is.
+4. **`cluster_by` over two or more columns orders rows along a Hilbert curve,** as Databricks'
+   liquid clustering does. 4 M rows read from Parquet (`logs/round20/clustering-two-columns.txt`):
+   a range of the second column 21.9 ms unclustered, 23.3 ms sorted by the first alone, 11.4 ms
+   Hilbert; one value of the first column 39.9 / 5.5 / 14.4 ms. Each column gets about half of
+   what sorting by it alone gives, and the second column is no longer left out.
+5. **`COPY` over the Postgres protocol:** `COPY … TO STDOUT` (text, CSV, binary) and `COPY … FROM
+   STDIN` (text, CSV); rows encoded a batch at a time; DECIMAL sent as NUMERIC in text and binary;
+   the ADBC Postgres driver works. 1 M rows × 4 columns (`logs/round20/pg-bench.txt`): psycopg
+   0.72 s, the ADBC Postgres driver (COPY binary → Arrow) 0.67 s, Flight SQL through ADBC 0.10 s,
+   HTTP Arrow 0.05 s — Postgres for everything that speaks it, Flight for speed.
+6. **Streams joined as they arrive** (`join = 'streams'`): a row of either table pairs with the
+   other's when it arrives and with those that come after, each pair once, exactly-once through a
+   leader restart; `within_secs` bounds what is read. The leader runs it right after commits: a
+   payment's pair shows 14 ms after its ack (p50; 24 ms at worst, `logs/round20/stream-join-latency.txt`).
+   **Sliding windows** (`slide_secs`): the view keeps panes, each window combines the ones it covers.
+7. **The owner's cluster bench on round 19** (3 GitHub runners, TPC-H): one node 15.7 s, as the
+   cluster decides 18.0 s (round 18: 46.6 s), spread anyway 39.5 s, 80 MB moved instead of 938,
+   every answer the same. It found loading 4× slower (442 s against 108 s): a `pondra sql` bulk
+   INSERT's files were rewritten by the leader to add row ids. Now `pondra sql` takes a block of
+   ids from the leader first (6 M rows locally: 2.7 s → 1.3 s). And a query that has run both
+   ways goes the faster way next time.
+8. **Tests** (`logs/round20/`): the local suite with the new `files`, `layouts`, `clusters`,
+   `copies` and `streams` passes, with `open_check`, failover ×3, users, race, isolate, spread,
+   latency, `asof_check`, `skew_check`, `shuffle_spill`, `stream_check`, freshness, the big crash
+   run and `smoke`; 15 tests on simulated R2 (the five new ones, `changes`, `schemas`, failover
+   and users with replicated acks, the crash run among them) and the five new ones on real R2. On
+   R2, 200 one-row INSERTs took 179 s (a durable ack is a PUT): one Parquet file per tiering round
+   (20), 2.5 object writes per INSERT counting what the node writes meanwhile anyway.
 
 **Round 19 made every row changeable** (ADR-020), the owner's request, and kept a cluster from
 being slower than one node:

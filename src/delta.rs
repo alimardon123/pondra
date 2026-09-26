@@ -22,7 +22,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 const CHECKPOINT_EVERY: u64 = 10; // as Delta itself does: a reader replays at most 9 JSON commits
-const HISTORY: u64 = 1000; // versions of the log kept (the files older ones name are gone after --retain-secs)
+const HISTORY: u64 = 100; // versions of the log kept (the files older ones name are gone after --retain-secs)
 
 /// What the Delta log says right now (kept in the catalog under `x/{table}`).
 #[derive(Serialize, Deserialize, Default)]
@@ -67,8 +67,8 @@ pub async fn publish_all(lake: &Lake) -> Result<()> {
 
 /// What another engine should read as the table, if it reads right without Pondra: an append
 /// table's sealed manifests (immutable, so what they hold is published once) and its inline
-/// files; for a keyed table only a single file with one row per key and no delete markers (a
-/// compaction's output, or a first fold of a table without deletes) — between compactions the
+/// files; for a keyed table only a single generation of files (one per partition) with one row
+/// per key and no delete markers (a compaction's output, or a first fold of a table without deletes) — between compactions the
 /// last published version stays.
 ///
 /// Published in these two parts, a commit costs what changed, not what the table holds: a table
@@ -82,7 +82,8 @@ pub async fn publishable(lake: &Lake, meta: &TableMeta) -> Result<Option<Parts>>
     let deletes = meta.columns.iter().any(|(c, _)| c == "_deleted");
     Ok(match meta.key.is_empty() {
         true => Some(Parts { manifests: crate::manifest::list(lake, meta).await?, inline: meta.files.clone() }),
-        false if meta.files.len() == 1 && (meta.files[0].whole || !deletes) => Some(Parts { manifests: vec![], inline: meta.files.clone() }),
+        // (one generation: a compaction's files, one per partition)
+        false if meta.files.windows(2).all(|w| w[0].ord == w[1].ord) && !meta.files.is_empty() && meta.files.iter().all(|f| f.whole || !deletes) => Some(Parts { manifests: vec![], inline: meta.files.clone() }),
         false => None,
     })
 }

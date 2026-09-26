@@ -10,7 +10,8 @@
 //! would take here less a node's share of it — what it took here when last asked, else the bytes
 //! of the tables it reads at the rate this node has been reading them. Links are measured
 //! (`probe`), and so are those times (`ran_here`); until a query has run here, queries stay here.
-//! `?spread=1` spreads anyway.
+//! Once a query has run both ways, what each took decides (`ran_spread`): the model only guesses
+//! the first time. `?spread=1` spreads anyway.
 use datafusion::physical_plan::ExecutionPlan;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
@@ -83,7 +84,13 @@ pub fn ran_here(sql: &str, bytes: u64, took: Duration) {
     *here = Some(here.map_or(rate, |r| 0.7 * r + 0.3 * rate));
 }
 
+/// Query `sql` took `took` spread over the nodes.
+pub fn ran_spread(sql: &str, took: Duration) {
+    SPREAD_TOOK.lock().unwrap().put(key(sql), took.as_secs_f64());
+}
+
 static TOOK: LazyLock<Mutex<lru::LruCache<u64, f64>>> = LazyLock::new(|| Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(4096).unwrap())));
+static SPREAD_TOOK: LazyLock<Mutex<lru::LruCache<u64, f64>>> = LazyLock::new(|| Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(4096).unwrap())));
 
 /// A query as the same query asked again (its comments and spacing aside).
 fn key(sql: &str) -> u64 {
@@ -98,6 +105,10 @@ fn key(sql: &str) -> u64 {
 /// here yet.
 pub fn pays(sql: &str, link: Link, moved: u64, steps: usize, bytes: u64, n: usize) -> bool {
     let known = TOOK.lock().unwrap().get(&key(sql)).copied();
+    let learned = std::env::var_os("PONDRA_LINK").is_none(); // (a network pretended: the model alone)
+    if let (Some(here), Some(spread), true) = (known, SPREAD_TOOK.lock().unwrap().get(&key(sql)).copied(), learned) {
+        return spread < here; // (it ran both ways: no need to guess)
+    }
     let Some(here) = known.or_else(|| HERE.lock().unwrap().map(|rate| bytes as f64 / rate)) else { return false };
     let saved = here * (1.0 - 1.0 / n as f64);
     let cost = link.rtt * (2.0 + 3.0 * steps as f64) + moved as f64 / WIRE / link.rate;

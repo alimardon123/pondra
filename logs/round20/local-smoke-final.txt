@@ -1,0 +1,14 @@
+{
+ "smoke": {
+  "the shell runs statements from its input": true,
+  "the shell reads a file on this machine; CREATE DATABASE makes another lake": true,
+  "SQL: a schema, a table in it, a view": true,
+  "the lake is named after its folder (lake.schema.table), on Windows too": true,
+  "a node doesn't read this machine's files for whoever asks": true,
+  "UPDATE: the new version, the same row": true,
+  "the node knows its resident memory": true,
+  "and the machine's (a third of it for queries, not the 4 GiB guess)": true
+ },
+ "platform": "linux",
+ "ok": true
+}

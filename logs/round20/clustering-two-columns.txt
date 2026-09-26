@@ -1,0 +1,48 @@
+  "plain": 2,
+  "sorted": 2,
+  "hilbert": 3
+ },
+ "one user (median ms)": {
+  "plain": 39.9,
+  "sorted": 5.5,
+  "hilbert": 14.4,
+  "speedup sorted": 7.3,
+  "speedup hilbert": 2.8
+ },
+ "100 users (IN list) (median ms)": {
+  "plain": 35.7,
+  "sorted": 21.4,
+  "hilbert": 41.5,
+  "speedup sorted": 1.7,
+  "speedup hilbert": 0.9
+ },
+ "a range of users (median ms)": {
+  "plain": 28.3,
+  "sorted": 3.7,
+  "hilbert": 9.1,
+  "speedup sorted": 7.6,
+  "speedup hilbert": 3.1
+ },
+ "full scan (unaffected) (median ms)": {
+  "plain": 20.0,
+  "sorted": 24.3,
+  "hilbert": 26.9,
+  "speedup sorted": 0.8,
+  "speedup hilbert": 0.7
+ },
+ "a range of amounts (median ms)": {
+  "plain": 21.9,
+  "sorted": 23.3,
+  "hilbert": 11.4,
+  "speedup sorted": 0.9,
+  "speedup hilbert": 1.9
+ },
+ "a user and a range of amounts (median ms)": {
+  "plain": 38.0,
+  "sorted": 5.6,
+  "hilbert": 8.0,
+  "speedup sorted": 6.8,
+  "speedup hilbert": 4.8
+ },
+ "same_rows": true
+}

@@ -1,0 +1,1 @@
+{"layouts": {"passed": true, "checks": {"every round as the model": true, "files: one day each, sorted by user": true, "lookup of a moved row": true, "delta-rs sees what Pondra sees": true}, "rounds": 10, "rows": 309, "delta_rows": 309, "pondra": {"n": 309, "s": 314895}}}

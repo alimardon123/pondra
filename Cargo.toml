@@ -1,6 +1,6 @@
 [package]
 name = "pondra"
-version = "0.19.0"
+version = "0.20.0"
 edition = "2021"
 description = "Pondra: a streamhouse in one binary"
 license-file = "LICENSE"
@@ -27,6 +27,8 @@ lru = "0.18"
 chrono = { version = "0.4", default-features = false } # (already built for object_store: ObjectMeta timestamps)
 url = "2"
 datafusion-functions-json = "0.55" # json_get(…), ->, ->> over JSON strings (Kafka raw values, semi-structured columns)
+regex = "1" # (COPY FROM: its NULL string; already built for arrow-csv)
+postgres-types = "0.2" # (DECIMAL as NUMERIC over the Postgres protocol; already built for pgwire)
 pgwire = { version = "0.41", default-features = false, features = ["server-api", "pg-type-chrono"] } # the Postgres wire protocol (psql, drivers, BI tools)
 # Arrow Flight and Flight SQL (gRPC): ADBC, JDBC and pyarrow clients, columnar in and out
 arrow-flight = { version = "59", features = ["flight-sql"] }

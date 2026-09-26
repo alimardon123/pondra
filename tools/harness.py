@@ -1076,7 +1076,7 @@ def scale():
     refused = [_raises(lambda s=s: q(s)) for s in (
         "CREATE TABLE bad1 (id BIGINT, ts TIMESTAMP) WITH (partition_by = 'week(ts)')",
         "CREATE TABLE bad2 (id BIGINT, ts TIMESTAMP) WITH (partition_by = 'nope')",
-        "CREATE TABLE bad3 (id BIGINT PRIMARY KEY, ts TIMESTAMP) WITH (partition_by = 'day(ts)')",
+        "CREATE TABLE bad3 (id BIGINT PRIMARY KEY, ts TIMESTAMP) WITH (partition_by = 'day(when)')",  # (a keyed table may be partitioned, ADR-021: by a column it has)
         "CREATE TABLE bad4 (id BIGINT, name VARCHAR) WITH (partition_by = 'day(name)')")]
     q("CREATE TABLE ev (id BIGINT, ts TIMESTAMP, v DOUBLE, k VARCHAR) WITH (partition_by = 'day(ts)', publish = 'delta,iceberg')")
     base = 1_780_000_000 // 86400 * 86400
@@ -1614,15 +1614,26 @@ def guard():
         forced = q(s, slow.port, 1)
         runs["forced"] = (forced == q(s, fast.port, 0), spreads(slow.port) > before, metrics_of(slow.port)["pondra_shuffled_queries_total"] > shuffles)
         out[s[:40]] = runs
+    # A node on the real network (no PONDRA_LINK): once a query ran both ways, the faster way wins.
+    learned = []
+    for s in queries:
+        timed = lambda spread: (lambda t: (q(s, third.port, spread), time.time() - t)[1])(time.time())
+        here, spread = min(timed(0) for _ in range(2)), min(timed(1) for _ in range(2))
+        before = spreads(third.port)
+        q(s, third.port)
+        went = spreads(third.port) > before
+        if max(here, spread) > 1.5 * min(here, spread):  # (clearly apart: else either is right)
+            learned.append(went == (spread < here))
     [n.kill() for n in (slow, fast, third)]
     checks = {"the same answers every way": all(r["slow"][0] and r["fast"][0] and r["forced"][0] for r in out.values()),
               "a query nothing is known about stays on one node": all(r["slow"][2] and r["fast"][2] for r in out.values()),
               # (a query that moves nothing — its tables split by a key's ranges — may pay even there: on R2 a node's reads are slow)
               "over a slow network, queries that would shuffle stay on one node": not any(r["slow"][1] for r in out.values() if r["forced"][2]) and any(r["forced"][2] for r in out.values()),
               "over a fast one, they spread": all(r["fast"][1] for r in out.values()),
-              "?spread=1 spreads anyway": all(r["forced"][1] for r in out.values())}
+              "?spread=1 spreads anyway": all(r["forced"][1] for r in out.values()),
+              "a query that ran both ways goes the faster way": all(learned)}
     ok = all(checks.values())
-    print(json.dumps({"guard": checks, "ok": ok}, indent=1))
+    print(json.dumps({"guard": checks, "ok": ok, "learned": learned}, indent=1))
     if not ok:
         print(out)
         sys.exit(1)
@@ -1689,9 +1700,276 @@ def load():
     return res
 
 
+def files():
+    """Few objects (ADR-021): a bucket bills, and rate-limits, every request. An INSERT … VALUES goes
+    through the log, so one-row INSERTs make a Parquet file per tiering round, not one each; the
+    catalog's write-ahead log is cleared every minute (here every 2 s: PONDRA_GC_SECS), not every
+    10; `/metrics` counts the writes. 200 one-row INSERTs into a table that publishes Delta."""
+    lake = new_lake()
+    node = Node(lake, A.port, env={"PONDRA_GC_SECS": "2"}).start()  # (tiering as by default: at most every 10 s)
+    q = lambda s: sql(A.port, s)
+    q("CREATE TABLE ev (user_id BIGINT, amount DOUBLE) WITH (publish = 'delta')")
+    seen, stop = {"ev": set(), "big": set()}, threading.Event()
+    def watch():  # (every data file that ever appears, merged away or not)
+        while not stop.is_set():
+            for t in seen:
+                seen[t].update(k for k in lake_objects(lake, f"data/{t}/") if k.endswith(".parquet"))
+            stop.wait(0.5 if lake.startswith("s3://") else 0.05)
+    watcher = threading.Thread(target=watch, daemon=True)
+    watcher.start()
+    writes = lambda: metrics_of(A.port).get('pondra_object_requests_total{op="write"}', float("nan"))
+    before, t0 = writes(), time.time()
+    for i in range(200):
+        q(f"INSERT INTO ev VALUES ({i}, {i * 0.5})")
+    secs, made = time.time() - t0, len(seen["ev"])
+    per_insert = (writes() - before) / 200  # (with what the node writes meanwhile anyway: tiering, the catalog's own files)
+    got = q("SELECT count(*) AS n, sum(user_id) AS s FROM ev")
+    # A bulk INSERT from another process (`pondra sql`) gets its row ids from the leader first, so
+    # the leader records its files as written rather than rewriting them.
+    q("CREATE TABLE big (id BIGINT, v BIGINT)")
+    subprocess.run([BIN, "sql", "--dir", lake, "INSERT INTO big SELECT value, value * 2 FROM range(0, 3000000)"], check=True, capture_output=True, env=node.env)
+    time.sleep(1.5)
+    big = {k for k in lake_objects(lake, "data/big/") if k.endswith(".parquet")}  # (a rewrite would have put new files in place of those written)
+    call(A.port, "POST", "/tier", timeout=120)
+    time.sleep(8)  # (the write-ahead log's cleaner: every 2 s, for objects 2 s old)
+    stop.set()
+    watcher.join()
+    wal = len(lake_objects(lake, "catalog/wal/"))
+    node.kill()
+    checks = {"all rows": got == [{"n": 200, "s": 19900}], "a Parquet file per tiering round (every 10 s), not per INSERT": made <= 3 + secs / 10,
+              "about one object write per INSERT (≤ 1.2, and ≤ 2 a second meanwhile)": 200 * per_insert <= 240 + 2 * secs,
+              "write-ahead log objects left (≤ 30)": wal <= 30, "a pondra sql INSERT's files recorded as written": seen["big"] == big and len(big) > 0}
+    out = {"passed": all(checks.values()), "checks": checks, "secs": round(secs, 1), "parquet_files_made": made, "writes_per_insert": round(per_insert, 2),
+           "wal_objects_left": wal, "cli_insert": {"files": len(big), "files_seen": len(seen["big"])}}
+    print(json.dumps({"files": out}))
+    if not out["passed"]:
+        sys.exit(1)
+    return out
+
+
+def layouts():
+    """A table with a PRIMARY KEY takes partition_by and cluster_by too (ADR-021), as written in the
+    owner's shell: each tiering round's newest rows go into a file per day, sorted by user, then
+    id, and a newer round's row for a key shadows an older round's whatever its day. Rows move
+    between days (an UPDATE of ts) over 9 rounds, against a model; every file holds one day, sorted
+    by user; a lookup finds a moved row where it moved to; once the table is compacted, Delta
+    readers (delta-rs) see what Pondra sees."""
+    lake = new_lake()
+    node = Node(lake, A.port, tier_secs=0).start()
+    q = lambda s: sql(A.port, s)
+    q("""CREATE TABLE t ( id BIGINT PRIMARY KEY, user text, ts timestamp, v BIGINT ) WITH ( publish = 'delta,iceberg' ,cluster_by = 'user' ,partition_by = 'day(ts)' )""")
+    day = lambda d: f"TIMESTAMP '2026-09-0{d} 12:00:00'"
+    model = {i: (f"u{i % 7}", 1 + i % 3, i) for i in range(300)}
+    q("INSERT INTO t VALUES " + ", ".join(f"({i}, '{u}', {day(d)}, {v})" for i, (u, d, v) in model.items()))
+    tier = lambda: call(A.port, "POST", "/tier", timeout=300)
+    now = lambda: {r["id"]: (r["u"], r["d"], r["v"]) for r in q('SELECT id, "user" AS u, CAST(date_part(\'day\', ts) AS BIGINT) AS d, v FROM t')}
+    tier()
+    rounds_ok = [now() == model]
+    for r in range(1, 10):
+        q(f"UPDATE t SET ts = {day(4)}, v = v + 1000 WHERE id % 10 = {r}")  # (to another day's files)
+        model.update({i: (u, 4, v + 1000) for i, (u, d, v) in model.items() if i % 10 == r})
+        q(f"INSERT INTO t VALUES ({1000 + r}, 'u{r}', {day(5)}, {r})")
+        model[1000 + r] = (f"u{r}", 5, r)
+        tier()
+        rounds_ok.append(now() == model)
+    moved = call(A.port, "GET", "/lookup/t/11")
+    q("CHECKPOINT")  # (other engines see a keyed table as of its last compaction: this one, now)
+    files_ok = None
+    if not lake.startswith("s3://"):
+        import glob, pyarrow.parquet as pq
+        files_ok = True
+        for f in glob.glob(os.path.join(lake, "data", "t", "*.parquet")):
+            b = pq.read_table(f, columns=["user", "id", "ts"])
+            users, days = b.column("user").to_pylist(), {str(t)[:10] for t in b.column("ts").to_pylist() if t is not None}
+            files_ok &= users == sorted(users) and len(days) <= 1
+    import deltalake
+    endpoint = os.environ.get("AWS_ENDPOINT", "")
+    opts = {} if not lake.startswith("s3://") else {k: v for k, v in {"AWS_ENDPOINT_URL": endpoint, "AWS_REGION": os.environ.get("AWS_REGION", "auto"), "AWS_ALLOW_HTTP": "true" if endpoint.startswith("http://") else ""}.items() if v}
+    theirs = deltalake.DeltaTable(os.path.join(lake, "data", "t") if not lake.startswith("s3://") else lake + "/data/t", storage_options=opts or None).to_pyarrow_table()
+    ours = q("SELECT count(*) AS n, sum(v) AS s FROM t")[0]
+    node.kill()
+    checks = {"every round as the model": all(rounds_ok), "files: one day each, sorted by user": files_ok is not False,
+              "lookup of a moved row": moved and moved[0]["v"] == model[11][2] and str(moved[0]["ts"]).startswith("2026-09-04"),
+              "delta-rs sees what Pondra sees": theirs.num_rows == ours["n"] == len(model) and sum(theirs.column("v").to_pylist()) == ours["s"]}
+    out = {"passed": all(checks.values()), "checks": checks, "rounds": len(rounds_ok), "rows": len(model), "delta_rows": theirs.num_rows, "pondra": ours}
+    print(json.dumps({"layouts": out}))
+    if not out["passed"]:
+        sys.exit(1)
+    return out
+
+
+def clusters():
+    """cluster_by over two columns orders files along a Hilbert curve (ADR-021): each row group
+    then holds a narrow range of both columns, where rows sorted by (a, b) would give every row
+    group the whole of b. An append table and a keyed table, 2 M rows of two independent random
+    columns each, folded from the log; every file's row groups' min and max, read back."""
+    lake = new_lake()
+    node = Node(lake, A.port, tier_secs=0).start()
+    import pyarrow as pa, pyarrow.parquet as pq
+    q = lambda s: sql(A.port, s)
+    q("CREATE TABLE app (id BIGINT, a BIGINT, b DOUBLE) WITH (cluster_by = 'a, b')")
+    q("CREATE TABLE kv (id BIGINT PRIMARY KEY, a BIGINT, b DOUBLE) WITH (cluster_by = 'a, b')")
+    rng = random.Random(11)
+    for seq in range(8):
+        n = 250_000
+        rb = pa.record_batch([pa.array(range(seq * n, seq * n + n), pa.int64()), pa.array([rng.randrange(10**6) for _ in range(n)], pa.int64()),
+                              pa.array([rng.random() for _ in range(n)], pa.float64())], names=["id", "a", "b"])
+        sink = pa.BufferOutputStream()
+        with pa.ipc.new_stream(sink, rb.schema) as w:
+            w.write_batch(rb)
+        for t in ("app", "kv"):
+            call(A.port, "POST", f"/append/{t}?producer=p-{t}&seq={seq + 1}", sink.getvalue().to_pybytes(), headers={"content-type": "application/vnd.apache.arrow.stream"}, timeout=300)
+    call(A.port, "POST", "/tier", timeout=600)
+    spans = {}
+    for t in ("app", "kv"):
+        files = [f"data/{t}/" + k.split("/")[-1] for k in lake_objects(lake, f"data/{t}/") if k.endswith(".parquet")]
+        width = {}
+        for f in files:
+            data = open(os.path.join(lake, f), "rb").read() if not lake.startswith("s3://") else S3[0].get_object(Bucket=lake[5:].split("/", 1)[0], Key=lake[5:].split("/", 1)[1] + "/" + f)["Body"].read()
+            md = pq.ParquetFile(pa.BufferReader(data)).metadata
+            names = [md.schema.column(i).name for i in range(md.num_columns)]
+            for c in ("a", "b"):
+                col = names.index(c)
+                ranges = [(md.row_group(g).column(col).statistics.min, md.row_group(g).column(col).statistics.max) for g in range(md.num_row_groups)]
+                lo, hi = min(r[0] for r in ranges), max(r[1] for r in ranges)
+                width.setdefault(c, []).extend((r[1] - r[0]) / (hi - lo) for r in ranges if md.num_row_groups > 1)
+        spans[t] = {c: round(sum(w) / len(w), 2) for c, w in width.items() if w}
+    rows = q("SELECT (SELECT count(*) FROM app) AS app, (SELECT count(*) FROM kv) AS kv")[0]
+    node.kill()
+    checks = {"all rows": rows == {"app": 2_000_000, "kv": 2_000_000},
+              "row groups narrow in a and in b (each < 0.75 of the whole)": all(len(v) == 2 and max(v.values()) < 0.75 for v in spans.values())}
+    out = {"passed": all(checks.values()), "checks": checks, "row_group_span": spans, "rows": rows}
+    print(json.dumps({"clusters": out}))
+    if not out["passed"]:
+        sys.exit(1)
+    return out
+
+
+def copies():
+    """COPY over the Postgres protocol (ADR-021): `COPY … FROM STDIN` loads text (psycopg's
+    write_row, NULLs included) and CSV with a header and quoted commas; `COPY … TO STDOUT` sends
+    text, CSV and binary, each read back as the rows went in; the ADBC Postgres driver, which reads
+    every result as `COPY (query) TO STDOUT (FORMAT binary)`, gets them as Arrow."""
+    import io, psycopg, adbc_driver_postgresql.dbapi as adbc
+    lake, pg = new_lake(), A.port + 10
+    node = Node(lake, A.port, pg=f"127.0.0.1:{pg}").start()
+    dsn = f"host=127.0.0.1 port={pg} user=u dbname=lake"
+    want = [(i, None if i % 10 == 0 else f"n, {i}", i * 0.5) for i in range(2000)]
+    with psycopg.connect(dsn, autocommit=True) as c:
+        cur = c.cursor()
+        cur.execute("CREATE TABLE ev (id BIGINT, name VARCHAR, amount DOUBLE)")
+        with cur.copy("COPY ev FROM STDIN") as cp:
+            for r in want[:1000]:
+                cp.write_row(r)
+        text_in = cur.rowcount
+        csv = "id,name,amount\n" + "".join(f'{i},{"" if n is None else chr(34) + n + chr(34)},{a}\n' for i, n, a in want[1000:])
+        with cur.copy("COPY ev FROM STDIN WITH (FORMAT csv, HEADER true)") as cp:
+            cp.write(csv)
+        csv_in = cur.rowcount
+        got = {}
+        for fmt in ("text", "binary"):
+            with cur.copy(f"COPY (SELECT id, name, amount FROM ev ORDER BY id) TO STDOUT WITH (FORMAT {fmt})") as cp:
+                cp.set_types(["int8", "text", "float8"])
+                got[fmt] = list(cp.rows())
+        import csv as csvlib
+        with cur.copy("COPY (SELECT id, name, amount FROM ev ORDER BY id) TO STDOUT WITH (FORMAT csv)") as cp:
+            text = b"".join(cp).decode()
+        got["csv"] = [(int(i), n or None, float(a)) for i, n, a in csvlib.reader(io.StringIO(text))]
+        # DECIMAL goes as NUMERIC, text and binary alike (the ADBC driver reads NUMERIC's binary form)
+        import decimal
+        money = "SELECT CAST(amount - 500 AS DECIMAL(12, 3)) AS m FROM ev ORDER BY id"
+        numeric = [c.execute(money).fetchall(), c.cursor(binary=True).execute(money).fetchall()]
+        numeric_ok = all([r[0] for r in rows] == [decimal.Decimal(f"{a - 500:.3f}") for _, _, a in want] for rows in numeric)
+    with adbc.connect(f"postgresql://u@127.0.0.1:{pg}/lake") as c, c.cursor() as cur:
+        cur.execute("SELECT id, name, amount FROM ev ORDER BY id")
+        arrow = cur.fetch_arrow_table()
+    node.kill()
+    checks = {"COPY FROM STDIN, text and CSV": (text_in, csv_in) == (1000, 1000),
+              **{f"COPY TO STDOUT, {f}": got[f] == want for f in got},
+              "ADBC Postgres driver (Arrow)": [tuple(r.values()) for r in arrow.to_pylist()] == want,
+              "DECIMAL as NUMERIC, text and binary": numeric_ok}
+    out = {"passed": all(checks.values()), "checks": checks}
+    print(json.dumps({"copies": out}))
+    if not out["passed"]:
+        sys.exit(1)
+    return out
+
+
+def streams():
+    """Flink's stream operators (ADR-021). A join of two streams: orders and payments arrive in any
+    order, over two nodes; a payment pairs with its order whichever came first, when it's within
+    10 minutes of it, each pair once (the leader keeps the view up to date right after commits,
+    `join = 'streams'`), against a model — through a leader restart. Sliding windows: 5-minute
+    windows every minute (`slide_secs`), each emitted once with every click it covers."""
+    import datetime
+    lake = new_lake()
+    a = Node(lake, A.port, tier_secs=1).start()
+    b = Node(lake, A.port + 1, tier_secs=1).start()
+    q = lambda s, port=A.port: sql(port, s)
+    base = 1_790_000_000 // 3600 * 3600
+    iso = lambda s: datetime.datetime.fromtimestamp(s, datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    q("CREATE TABLE orders (id BIGINT, amount DOUBLE, ts TIMESTAMP)")
+    q("CREATE TABLE payments (order_id BIGINT, paid DOUBLE, ts TIMESTAMP)")
+    q("""CREATE MATERIALIZED VIEW paid WITH (join = 'streams', time = 'ts', within_secs = 600) AS
+         SELECT o.id, o.amount, p.paid FROM orders o JOIN payments p ON o.id = p.order_id AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '10 minutes'""")
+    rng, want, orders, payments = random.Random(5), set(), [], []
+    for i in range(300):
+        t = base + i * 7
+        orders.append((i, float(i), t))
+        late = rng.choice([30, 300, 900])  # (15 minutes late: too late, no pair)
+        payments.append((i, i + 0.5, t + late))
+        if late <= 600:
+            want.add((i, float(i), i + 0.5))
+    events = [("orders", o) for o in orders] + [("payments", p) for p in payments]
+    rng.shuffle(events)  # (a payment may come before its order)
+    def write(s, port):  # (retried through the restart below: a job id makes a retry a no-op)
+        job, deadline = uuid.uuid4().hex, time.time() + 90
+        while True:
+            try:
+                return call(port, "POST", f"/sql?job={job}", s.encode())
+            except Exception:
+                if time.time() > deadline:
+                    raise
+                time.sleep(0.5)
+    for n, chunk in enumerate(range(0, len(events), 40)):
+        port = (A.port, A.port + 1)[n % 2]
+        for table in ("orders", "payments"):
+            rows = [r for t, r in events[chunk:chunk + 40] if t == table]
+            if rows:
+                write(f"INSERT INTO {table} VALUES " + ", ".join(f"({r[0]}, {r[1]}, TIMESTAMP '{iso(r[2])}')" for r in rows), port)
+        if n == 7:
+            a.kill(); a.start()  # (the leader again: nothing paired twice, nothing lost)
+    got = lambda: sorted((r["id"], r["amount"], r["paid"]) for r in q("SELECT id, amount, paid FROM paid"))
+    pairs = until(got, sorted(want), secs=90)
+    # Sliding windows: 5 minutes long, one a minute; a click at minute m is in windows m-4..m.
+    q("CREATE TABLE clicks (user VARCHAR, ts TIMESTAMP)")
+    q("""CREATE MATERIALIZED VIEW per5 WITH (window = 'w', size_secs = 300, slide_secs = 60) AS
+         SELECT date_bin(INTERVAL '1 minute', ts) AS w, user, count(*) AS n FROM clicks GROUP BY 1, 2""")
+    clicks = [("a" if i % 3 else "b", base + i * 13) for i in range(100)]  # (21 minutes)
+    q("INSERT INTO clicks VALUES " + ", ".join(f"('{u}', TIMESTAMP '{iso(t)}')" for u, t in clicks))
+    q(f"INSERT INTO clicks VALUES ('z', TIMESTAMP '{iso(base + 3600)}')")  # (the watermark an hour on: every window closes)
+    final = lambda: {(r["w"][:19].replace("T", " "), r["user"]): r["n"] for r in q("SELECT w, user, n FROM per5_final")}
+    model = {}
+    for u, t in clicks:
+        m = (t - base) // 60
+        for start in range(m - 4, m + 1):
+            model[(iso(base + start * 60), u)] = model.get((iso(base + start * 60), u), 0) + 1
+    emitted = until(lambda: len(final()), len(model), secs=60)
+    windows = final()
+    a.kill(); b.kill()
+    checks = {"stream join: each pair once, whichever side came first": pairs == sorted(want),
+              "sliding windows: every window, every click it covers": windows == model}
+    out = {"passed": all(checks.values()), "checks": checks, "pairs": len(want), "windows": len(model)}
+    print(json.dumps({"streams": out}))
+    if not out["passed"]:
+        print(len(pairs), len(want), sorted(set(map(tuple, pairs)) ^ want)[:5], emitted, sorted(set(windows.items()) ^ set(model.items()))[:6])
+        sys.exit(1)
+    return out
+
+
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    out = {t.__name__: t() for t in (upsert, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, asof, sums, schemas, changes, guard, scale, flight, reader, crash)}
+    out = {t.__name__: t() for t in (upsert, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, scale, flight, reader, crash)}
     A.secs = min(A.secs, 20)
     out["load"] = load()
     print(json.dumps(out, indent=1))
@@ -1699,7 +1977,7 @@ def all_tests():
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "tiering", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "asof", "sums", "schemas", "changes", "guard", "scale", "flight", "load", "all"])
+    ap.add_argument("mode", choices=["crash", "upsert", "tiering", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "scale", "flight", "load", "all"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -1710,4 +1988,4 @@ if __name__ == "__main__":
     ap.add_argument("--secs", type=int, default=30)
     ap.add_argument("--flush-ms", type=int, default=250)
     A = ap.parse_args()
-    {"crash": crash, "upsert": upsert, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "scale": scale, "flight": flight, "load": load, "all": all_tests}[A.mode]()
+    {"crash": crash, "upsert": upsert, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "scale": scale, "flight": flight, "load": load, "all": all_tests}[A.mode]()

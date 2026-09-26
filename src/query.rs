@@ -370,13 +370,16 @@ impl TableProvider for Pruned {
 /// Keyed tables as their users see them. Upsert tables: the latest row per key, without deleted
 /// rows (a true `_deleted` column). Merge tables: each key's rows combined by their merge
 /// functions. `sorted` orders by key, so a file prunes well on key lookups (used when writing
-/// files). `keep_deleted` leaves delete markers in: an intermediate file still has to shadow what
+/// files) — after the table's `cluster_by` column, if it has one. `keep_deleted` leaves delete markers in: an intermediate file still has to shadow what
 /// older files hold for that key; a full compaction drops them.
 pub fn latest_sql(meta: &TableMeta, raw_table: &str, sorted: bool, keep_deleted: bool) -> String {
     debug_assert!(!meta.key.is_empty(), "latest_sql needs a key: an append table has no versions");
     let q = |c: &String| format!("\"{c}\"");
     let key = meta.key.iter().map(q).collect::<Vec<_>>().join(", ");
-    let order = if sorted { format!(" ORDER BY {key}") } else { String::new() };
+    let order = match (sorted, meta.cluster.len()) {
+        (true, 0 | 1) => format!(" ORDER BY {}", meta.cluster.iter().chain(&meta.key).map(q).collect::<Vec<_>>().join(", ")),
+        _ => String::new(), // (two or more cluster_by columns: a Hilbert curve's order, `tier::latest`)
+    };
     if !meta.merge.is_empty() {
         let cols = meta.columns.iter().map(|(c, _)| match meta.merge.get(c).map(String::as_str) {
             Some("count") => format!("sum({}) AS {}", q(c), q(c)), // (partial counts add up)

@@ -1,0 +1,7 @@
+files exit=0 secs=214
+layouts exit=0 secs=85
+streams exit=0 secs=98
+copies exit=0 secs=17
+clusters exit=0 secs=68
+ALL-DONE
+files (again, with checks that allow for the time a write takes on R2) exit=0 secs=222

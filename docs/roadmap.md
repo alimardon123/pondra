@@ -1,10 +1,10 @@
-# Pondra: what's left, and in what order (after round 19)
+# Pondra: what's left, and in what order (after round 20)
 
 **Date:** 2026-09-25 · **Status:** proposed; the order in "The rounds" is what I recommend, the
 decisions in "What only you can decide" are yours · **Builds on:** ADR-002 to ADR-017,
 `prototype-status.md`, `comparison-spark-flink-fluss.md`
 
-**Progress (2026-09-26):** rounds 17, 18 and 19 are done (ADR-018, ADR-019, ADR-020).
+**Progress (2026-09-26):** rounds 17 to 20 are done (ADR-018 to ADR-021).
 
 - **Round 17** made Pondra install anywhere: a glibc 2.17 Linux binary, pip and npm packages
   (built, not published), a SQL shell, and both flaky tests fixed.
@@ -25,14 +25,23 @@ decisions in "What only you can decide" are yours · **Builds on:** ADR-002 to A
   The owner's second Windows session added `CREATE DATABASE`, `ATTACH` of a new folder,
   `CHECKPOINT`, `ALTER TABLE … SET`, local files in the shell, and fixed the lake's name on Windows.
 
+- **Round 20** (ADR-021) took the owner's questions after round 19 as its list. Lakes write far
+  fewer objects (a trickle of one-row INSERTs: 3.9 objects each down to 1.1, and 217 left
+  instead of 5,962); system columns cost tiering almost nothing (file statistics from the Parquet footer); a
+  PRIMARY KEY goes with `partition_by` and `cluster_by`; `cluster_by` over two or more columns
+  orders along a Hilbert curve; the Postgres protocol has `COPY` (and the ADBC Postgres driver
+  works); two streams join as their rows arrive; sliding windows. C1: the owner's run on round 19
+  showed the guard works (18.0 s against one node's 15.7 s, from 46.6 s) and found loading 4×
+  slower (fixed).
+
 Still waiting:
 
-- **C1's numbers:** a 3-node run on round 19's code (the guard on), then machines in one data centre.
+- **C1 in one data centre:** machines under a millisecond apart, where spreading should pay.
 - **Publishing:** the package names and the repository decision below.
 
-Round 20 is next: the rest of `ALTER TABLE` (rename and drop columns and tables, widen types:
-column ids in the files), materialized views filled from the rows already there, and C1 on
-machines in one data centre.
+Round 21 is next: the rest of `ALTER TABLE` (rename and drop columns and tables, widen types:
+column ids in the files), materialized views filled from the rows already there, more of Flink
+(deduplication and Top-N by event time, timers), and Nexmark against Flink.
 
 ## Where Pondra stands
 
@@ -177,9 +186,10 @@ a list of URLs? If it can, that gives a browser read path at no cost.
 - **Streaming:**
   - as-of joins in views that wait for the looked-up table to catch up to the event's time;
   - a watermark per partition or per node;
-  - sliding windows;
   - late rows to a side table;
-  - timers.
+  - deduplication and Top-N per key by event time;
+  - timers and `MATCH_RECOGNIZE`;
+  - stream joins sharded across the nodes.
 - **Distributed:**
   - a `LIMIT` inside a subquery;
   - shuffles that keep order;
@@ -205,12 +215,13 @@ simulated R2 and real R2, an ADR, and a bundle.
 | 17 ✓ | Install anywhere (done: ADR-018) | A1, A2, A3, A5 (measure), A6, D3 | `pip install pondra` works in a fresh Ubuntu 22.04 notebook; both flakes fixed |
 | 18 ✓ | A database you can shape (done: ADR-019) | E5, A7, C1 (measuring) | `lake.schema.table`, DDL and views in SQL; the `.exe` on your laptop; the cluster bench measures the network |
 | 19 ✓ | Change any row (done: ADR-020) | E6, C1 (the guard) | `UPDATE`/`DELETE`/`MERGE` on every table with system columns, streaming following every change; a cluster never slower than one node |
-| 20 | Shape it further, and proof at scale | E8, E7, C1, C3, D1 (start) | `ALTER TABLE … RENAME/DROP COLUMN`; TPC-H SF10 at 1/3/6 machines in one data centre; Nexmark against Flink; the SQL test files' pass rate |
-| 21 | Use it from anything | A4, B3, E1, E2 | A console at `/`, live queries, dbt and Power BI working |
-| 22 | In-process | B1, B2 | `pondra.open(…)` in a notebook reads and writes a cluster's lake, no server |
-| 23 | Safe to share | E3, D2 | TLS, grants, audit; random-query checks against DuckDB |
-| 24 | In the browser | B4 (after the DuckDB-WASM check) | A lake queried in a web page, straight from the bucket |
-| 25+ | Depth | C2, C4, E4, then F by evidence | Whatever the scale runs and first users show matters most |
+| 20 ✓ | Fewer objects, any layout, streams joined (done: ADR-021) | the owner's questions, C1 (round 19's run) | a trickle of INSERTs writes under a third of the objects; `PRIMARY KEY` with `partition_by`/`cluster_by` (Hilbert); `COPY`; stream joins and sliding windows |
+| 21 | Shape it further, and more of Flink | E8, E7, C3, F (streaming) | `ALTER TABLE … RENAME/DROP COLUMN`; views filled from existing rows; dedup and Top-N; Nexmark against Flink |
+| 22 | Use it from anything, and proof at scale | A4, B3, E1, E2, C1, D1 (start) | A console at `/`, live queries, dbt and Power BI working; TPC-H at 1/3/6 machines in one data centre |
+| 23 | In-process | B1, B2 | `pondra.open(…)` in a notebook reads and writes a cluster's lake, no server |
+| 24 | Safe to share | E3, D2 | TLS, grants, audit; random-query checks against DuckDB |
+| 25 | In the browser | B4 (after the DuckDB-WASM check) | A lake queried in a web page, straight from the bucket |
+| 26+ | Depth | C2, C4, E4, then F by evidence | Whatever the scale runs and first users show matters most |
 
 Why this order:
 

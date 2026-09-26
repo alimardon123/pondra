@@ -326,7 +326,10 @@ impl App {
         let run = async {
             let nodes = if spread == Some("0") { vec![] } else { self.cluster.nodes() };
             match crate::spmd::query(&self.lake, &nodes, &self.cluster.addr, query, spread == Some("1")).await {
-                Ok(Some(batches)) => return Ok((batches, true)),
+                Ok(Some(batches)) => {
+                    crate::guard::ran_spread(query, start.elapsed());
+                    return Ok((batches, true));
+                }
                 Ok(None) => {}
                 Err(e) => eprintln!("distributed query failed, running it here: {e:#}"),
             }
@@ -415,7 +418,7 @@ impl App {
         crate::delta::publish_all(&self.lake).await?; // what other engines read, as soon as it's tiered
         let first_publish = start.elapsed();
         // Then merges and compactions (published too, once done).
-        let maintain: Vec<_> = untidy.iter().map(|t| crate::tier::maintain(&self.lake, t, &nodes, &self.cluster.addr)).collect();
+        let maintain: Vec<_> = untidy.iter().map(|t| crate::tier::maintain(&self.lake, t, &nodes, &self.cluster.addr, false)).collect();
         if futures::stream::iter(maintain).buffer_unordered(4).try_collect::<Vec<bool>>().await?.contains(&true) {
             crate::delta::publish_all(&self.lake).await?;
         }
@@ -447,8 +450,13 @@ impl App {
         let (mut purged, nodes) = (vec![], if self.cluster.nodes().is_empty() { vec![self.cluster.addr.clone()] } else { self.cluster.nodes() });
         {
             let _guard = self.lock.lock().await;
-            for (k, _) in self.lake.cat.scan::<TableMeta>("t/", "t0").await?.into_iter().filter(|(_, m)| m.changed) {
-                if crate::tier::purge(&self.lake, &k[2..], &nodes, &self.cluster.addr, self.retain_ms, true).await? {
+            for (k, m) in self.lake.cat.scan::<TableMeta>("t/", "t0").await? {
+                // (changed rows out of the files; keyed tables that publish, compacted)
+                let done = match m.key.is_empty() {
+                    true => m.changed && crate::tier::purge(&self.lake, &k[2..], &nodes, &self.cluster.addr, self.retain_ms, true).await?,
+                    false => crate::tier::maintain(&self.lake, &k[2..], &nodes, &self.cluster.addr, true).await?,
+                };
+                if done {
                     purged.push(k[2..].to_string());
                 }
             }
@@ -457,7 +465,7 @@ impl App {
             crate::delta::publish_all(&self.lake).await?;
         }
         self.lake.cat.checkpoint().await?;
-        Ok(j!({"checkpoint": true, "rows_tiered": rows, "purged": purged}))
+        Ok(j!({"checkpoint": true, "rows_tiered": rows, "rewritten": purged}))
     }
 
     /// One table's log up to `hwm`, a chunk at a time.
@@ -472,7 +480,13 @@ impl App {
         }
     }
 
-    pub async fn run_tasks(&self) -> anyhow::Result<()> { crate::tasks::run_all(&self.lake, &self.cluster, self.log()?).await }
+    pub async fn run_tasks(&self) -> anyhow::Result<()> {
+        crate::tasks::run_all(&self.lake, &self.cluster, self.log()?).await?;
+        match self.seq.is_some() {
+            true => crate::views::join_all(&self.lake, self.log()?).await, // (the leader: stream joins)
+            false => Ok(()),
+        }
+    }
 }
 
 // ---------------------------------------------------------------- the API

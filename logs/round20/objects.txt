@@ -1,0 +1,29 @@
+# Objects a trickle of one-row INSERTs writes (20 a second for 120 s into one table publishing Delta and Iceberg,
+# then 130 s idle), round 19's binary against round 20's. 'made' = every name seen by a 0.25 s poll of the lake folder.
+== pondra-r19
+2400 inserts in 120s (20/s)
+folder                                  objects now  made (≥)
+catalog/compacted                                62        62
+catalog/compactions                              48        48
+catalog/manifest                                 52        52
+catalog/wal                                    5194      5199
+cluster/alive                                     1         1
+cluster/term                                      1         1
+data/ev/*.parquet                                 1      2760
+data/ev/_delta_log                              301       301
+data/ev/metadata                                302       820
+total                                          5962      9244
+== release
+2400 inserts in 120s (20/s)
+folder                                  objects now  made (≥)
+catalog/compacted                                58        58
+catalog/compactions                              43        43
+catalog/gc                                        1         1
+catalog/manifest                                 44        47
+catalog/wal                                       4      2443
+cluster/alive                                     1         1
+cluster/term                                      1         1
+data/ev/*.parquet                                 6        14
+data/ev/_delta_log                               16        16
+data/ev/metadata                                 43        43
+total                                           217      2667

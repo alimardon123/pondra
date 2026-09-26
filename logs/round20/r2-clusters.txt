@@ -1,0 +1,1 @@
+{"clusters": {"passed": true, "checks": {"all rows": true, "row groups narrow in a and in b (each < 0.75 of the whole)": true}, "row_group_span": {"app": {"a": 0.42, "b": 0.46}, "kv": {"a": 0.42, "b": 0.46}}, "rows": {"app": 2000000, "kv": 2000000}}}

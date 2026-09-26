@@ -68,11 +68,11 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
     ensure!(merge.values().all(|f| ["sum", "count", "min", "max"].contains(&f.as_str())), "merge functions: sum, count, min, max");
     ensure!(merge.is_empty() || !key.is_empty(), "a merge table needs a key");
     ensure!(publish.iter().flatten().all(|f| ["delta", "iceberg"].contains(&f.as_str())), "publish formats: delta, iceberg");
-    let keyed = "a table with a PRIMARY KEY keeps its files sorted by the key (so a key's newest row is found fast): drop cluster_by and partition_by, or drop the PRIMARY KEY for an append table";
-    ensure!(cluster.iter().flatten().next().is_none() || key.is_empty(), "cluster_by: {keyed}");
+    // (A keyed table takes them too: each tiering round's newest rows go into a file per
+    // partition, sorted by cluster_by, then the key; reads let a newer round's key shadow an older
+    // round's wherever its partition, `query::upsert_view`.)
     ensure!(cluster.iter().flatten().all(|c| columns.iter().any(|(n, _)| n == c)), "cluster_by: columns of the table");
     if let Some(p) = &partition {
-        ensure!(key.is_empty(), "partition_by: {keyed}");
         crate::tier::check_partition(p, &columns)?;
     }
     let meta = match lake.cat.get::<TableMeta>(&table_key(name)).await? {
@@ -388,13 +388,15 @@ pub fn checkpoint(sql: &str) -> bool {
 }
 
 /// Does a write to this table go through the log? Keyed tables' do (new versions), and so do
-/// those of append tables that views or streaming tasks follow (they only see the log); other
-/// INSERTs go straight to Parquet.
-async fn through_log(lake: &Lake, table: &str, meta: &TableMeta) -> Result<bool> {
-    if !meta.key.is_empty() {
+/// those of append tables that views or streaming tasks follow (they only see the log), and every
+/// `INSERT … VALUES` (a few rows each: a Parquet file apiece would pile up — the log gathers them
+/// into one per tiering round). Other INSERTs go straight to Parquet.
+async fn through_log(lake: &Lake, table: &str, meta: &TableMeta, stmt: &Stmt) -> Result<bool> {
+    let values = |q: &str| q.trim_start().get(..6).is_some_and(|w| w.eq_ignore_ascii_case("values"));
+    if !meta.key.is_empty() || matches!(stmt, Stmt::Insert(_, q) if values(q)) {
         return Ok(true);
     }
-    let views = lake.cat.scan::<crate::views::View>("v/", "v0").await?.into_iter().any(|(_, v)| v.source == table);
+    let views = lake.cat.scan::<crate::views::View>("v/", "v0").await?.into_iter().any(|(_, v)| v.follows(table));
     Ok(views || lake.cat.scan::<crate::tasks::Task>("k/", "k0").await?.into_iter().any(|(_, t)| t.source == table))
 }
 
@@ -587,7 +589,7 @@ pub async fn on_node_as(app: &crate::server::App, stmt: Stmt, job: Option<String
     }
     let meta = lake.cat.get::<TableMeta>(&table_key(&table)).await?;
     let sql = match (&meta, &stmt) {
-        (Some(m), _) if through_log(lake, &table, m).await? => rows_sql(m, &stmt)?,
+        (Some(m), _) if through_log(lake, &table, m, &stmt).await? => rows_sql(m, &stmt)?,
         (_, Stmt::Insert(_, query)) => {
             let ctx = open(session(lake, query, "").await?);
             let Some(f) = write_files(lake, &ctx, &table, query, &job, Some(app.to().reserve().await?)).await? else { return Ok(j!({"duplicate": true})) };
@@ -796,7 +798,7 @@ async fn prepare(query: &Lake, target: &Arc<Lake>, table: &str, stmt: &Stmt, job
     }
     let meta = target.cat.get::<TableMeta>(&table_key(table)).await?;
     let log = match &meta {
-        Some(m) => through_log(target, table, m).await?,
+        Some(m) => through_log(target, table, m, stmt).await?,
         None => false,
     };
     match (meta, stmt) {
@@ -809,11 +811,22 @@ async fn prepare(query: &Lake, target: &Arc<Lake>, table: &str, stmt: &Stmt, job
         }
         (_, Stmt::Insert(_, sql)) => {
             let ctx = open(session(query, sql, "").await?);
-            Ok(write_files(target, &ctx, table, sql, job, None).await?.map(Request::Files)) // (stamped as its leader records them)
+            Ok(write_files(target, &ctx, table, sql, job, reserve(target).await).await?.map(Request::Files))
         }
         (None, _) => bail!("no table {table}"),
         _ => bail!("UPDATE and DELETE need a keyed table (append tables only take INSERTs)"),
     }
+}
+
+/// Row ids for a bulk INSERT from any machine: a block from the lake's leader, if it can be
+/// reached, so the files are written with their system columns (`sys.rs`); None: the leader
+/// stamps them as it records them, which rewrites them (the inbox, or no leader yet).
+async fn reserve(lake: &Lake) -> Option<(u64, u64)> {
+    let t = latest(&lake.store).await.ok()??;
+    if t.addr.is_empty() || !alive(&lake.store, &t).await || std::env::var_os("PONDRA_NO_DIRECT").is_some() {
+        return None;
+    }
+    crate::log::reserve_at(&t.addr).await.ok()
 }
 
 /// Send a request to the leader over HTTP.

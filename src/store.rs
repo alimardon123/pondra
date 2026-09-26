@@ -13,7 +13,7 @@ use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey};
 use object_store::ClientConfigKey;
 use object_store::{local::LocalFileSystem, path::Path, prefix::PrefixStore, ObjectStore, ObjectStoreExt, PutMode, PutOptions};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use slatedb::config::{CompactorOptions, DbReaderOptions, DurabilityLevel, FlushOptions, FlushType, ObjectStoreCacheOptions, ReadOptions, ScanOptions, Settings};
+use slatedb::config::{CompactorOptions, DbReaderOptions, GarbageCollectorDirectoryOptions, GarbageCollectorOptions, DurabilityLevel, FlushOptions, FlushType, ObjectStoreCacheOptions, ReadOptions, ScanOptions, Settings};
 use slatedb::{Db, DbReader, DbReaderMode, ErrorKind, WriteBatch, WriteHandle};
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
@@ -219,7 +219,7 @@ pub fn open_store(url: &str) -> Result<(String, Store, Option<(String, Store)>)>
     let Some(rest) = url.strip_prefix("s3://") else {
         std::fs::create_dir_all(url)?;
         let dir = std::fs::canonicalize(url)?.to_string_lossy().trim_start_matches(r"\\?\").to_string(); // (Windows verbatim prefix)
-        return Ok((dir.clone(), Arc::new(LocalFileSystem::new_with_prefix(&dir)?), None));
+        return Ok((dir.clone(), Arc::new(Counted(Arc::new(LocalFileSystem::new_with_prefix(&dir)?))), None));
     };
     // Credentials and endpoint come from AWS_* env vars (AWS_ENDPOINT for R2 / MinIO).
     let (bucket, prefix) = rest.trim_end_matches('/').split_once('/').unwrap_or((rest, ""));
@@ -228,7 +228,48 @@ pub fn open_store(url: &str) -> Result<(String, Store, Option<(String, Store)>)>
     let idle = (AmazonS3ConfigKey::Client(ClientConfigKey::PoolIdleTimeout), "15s");
     let s3: Store = Arc::new(AmazonS3Builder::from_env().with_bucket_name(bucket).with_allow_http(true).with_config(idle.0, idle.1).build()?);
     let store: Store = if prefix.is_empty() { s3.clone() } else { Arc::new(PrefixStore::new(s3.clone(), prefix)) };
-    Ok((url.trim_end_matches('/').to_string(), store, Some((format!("s3://{bucket}"), s3))))
+    Ok((url.trim_end_matches('/').to_string(), Arc::new(Counted(store)), Some((format!("s3://{bucket}"), s3))))
+}
+
+/// A lake's store, counting the requests that cost the most and meet a bucket's rate limits
+/// (S3: 3,500 writes a second per prefix): writes, lists and deletes (`GET /metrics`).
+#[derive(Debug)]
+struct Counted(Store);
+
+impl std::fmt::Display for Counted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { self.0.fmt(f) }
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for Counted {
+    async fn put_opts(&self, at: &Path, body: object_store::PutPayload, opts: PutOptions) -> object_store::Result<object_store::PutResult> {
+        let r = self.0.put_opts(at, body, opts).await;
+        if !matches!(r, Err(object_store::Error::NotSupported { .. } | object_store::Error::NotImplemented { .. })) {
+            crate::metrics::add(&crate::metrics::OBJECT_WRITES, 1); // (a local disk refuses SlateDB's tagged PUT before writing; it tries again untagged)
+        }
+        r
+    }
+    async fn put_multipart_opts(&self, at: &Path, opts: object_store::PutMultipartOptions) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        crate::metrics::add(&crate::metrics::OBJECT_WRITES, 1);
+        self.0.put_multipart_opts(at, opts).await
+    }
+    async fn get_opts(&self, at: &Path, opts: object_store::GetOptions) -> object_store::Result<object_store::GetResult> { self.0.get_opts(at, opts).await }
+    fn delete_stream(&self, at: futures::stream::BoxStream<'static, object_store::Result<Path>>) -> futures::stream::BoxStream<'static, object_store::Result<Path>> {
+        use futures::StreamExt;
+        self.0.delete_stream(at.inspect(|_| crate::metrics::add(&crate::metrics::OBJECT_DELETES, 1)).boxed())
+    }
+    fn list(&self, prefix: Option<&Path>) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        crate::metrics::add(&crate::metrics::OBJECT_LISTS, 1);
+        self.0.list(prefix)
+    }
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<object_store::ListResult> {
+        crate::metrics::add(&crate::metrics::OBJECT_LISTS, 1);
+        self.0.list_with_delimiter(prefix).await
+    }
+    async fn copy_opts(&self, from: &Path, to: &Path, opts: object_store::CopyOptions) -> object_store::Result<()> {
+        crate::metrics::add(&crate::metrics::OBJECT_WRITES, 1);
+        self.0.copy_opts(from, to, opts).await
+    }
 }
 
 impl Lake {
@@ -678,7 +719,13 @@ impl Catalog {
         // Poll object storage rarely when idle (that's an idle writer's request bill), but often
         // enough that compaction keeps up with the checkpoints.
         let compactor_options = Some(CompactorOptions { poll_interval: Duration::from_secs(5), ..Default::default() });
-        let settings = Settings { flush_interval: Some(Duration::from_millis(1)), manifest_poll_interval: Duration::from_secs(10), l0_sst_size_bytes: 16 << 20, l0_max_ssts: 64, l0_max_ssts_per_key: 32, max_unflushed_bytes: 64 << 20, compactor_options, object_store_cache_options, ..Default::default() };
+        // Every commit is a write-ahead-log object: clear those (and old manifests) every minute
+        // once a minute old, not SlateDB's every 10 minutes — thousands would sit in the bucket.
+        // (What a reader's checkpoint still needs stays.)
+        let every = |secs: u64| Some(GarbageCollectorDirectoryOptions { interval: Some(Duration::from_secs(secs)), min_age: Duration::from_secs(secs), dry_run: false });
+        let secs = std::env::var("PONDRA_GC_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(60);
+        let garbage_collector_options = Some(GarbageCollectorOptions { wal_options: every(secs), manifest_options: every(secs), ..Default::default() });
+        let settings = Settings { garbage_collector_options, flush_interval: Some(Duration::from_millis(1)), manifest_poll_interval: Duration::from_secs(10), l0_sst_size_bytes: 16 << 20, l0_max_ssts: 64, l0_max_ssts_per_key: 32, max_unflushed_bytes: 64 << 20, compactor_options, object_store_cache_options, ..Default::default() };
         let mut cat = Self::new(Db_::Writer(Db::builder("catalog", store).with_settings(settings).build().await?));
         cat.replicas = std::env::var("PONDRA_REPLICAS").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
         cat.last_n.store(cat.get::<u64>("n").await?.unwrap_or(1), Relaxed);
