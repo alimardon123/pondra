@@ -43,17 +43,27 @@ with pondra.local(lake, python=arrow) as db:
 # `python -m pondra`: the binary, from wherever pip put it
 by_module = subprocess.run([sys.executable, "-m", "pondra", "--version"], capture_output=True, text=True)
 assert by_module.returncode == 0 and by_module.stdout.strip() == version, by_module
-# `--add-to-path`: once, then "already" (a home of its own; Windows's registry only in CI)
+# `--add-to-path`: once, then "already" (a home of its own; Windows's registry only in CI, and put
+# back as it was: this check runs twice, without pyarrow and with it, on the same machine)
 if os.name != "nt" or os.environ.get("CI"):
     env = {**os.environ, "HOME": tempfile.mkdtemp(prefix="pondra-home-"), "SHELL": "/bin/bash"}
-    said = [subprocess.run([sys.executable, "-m", "pondra", "--add-to-path"], env=env, capture_output=True, text=True, check=True).stdout for _ in range(2)]
-    assert "on your PATH now" in said[0] and "already" in said[1], said
     folder = os.path.dirname(pondra.binary())
     if os.name == "nt":
         import winreg
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as k:
-            assert folder.lower() in winreg.QueryValueEx(k, "Path")[0].lower(), "not in the user's Path"
-    else:
-        rc = os.path.join(env["HOME"], ".bash_profile" if sys.platform == "darwin" else ".bashrc")
-        assert open(rc).read().count(folder) == 1, rc
+        key = lambda: winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment", 0, winreg.KEY_READ | winreg.KEY_WRITE)
+        with key() as k:
+            before = winreg.QueryValueEx(k, "Path")
+    try:
+        said = [subprocess.run([sys.executable, "-m", "pondra", "--add-to-path"], env=env, capture_output=True, text=True, check=True).stdout for _ in range(2)]
+        assert "on your PATH now" in said[0] and "already" in said[1], said
+        if os.name == "nt":
+            with key() as k:
+                assert folder.lower() in winreg.QueryValueEx(k, "Path")[0].lower(), "not in the user's Path"
+        else:
+            rc = os.path.join(env["HOME"], ".bash_profile" if sys.platform == "darwin" else ".bashrc")
+            assert open(rc).read().count(folder) == 1, rc
+    finally:
+        if os.name == "nt":
+            with key() as k:
+                winreg.SetValueEx(k, "Path", 0, before[1], before[0])
 print("ok:", rows)
