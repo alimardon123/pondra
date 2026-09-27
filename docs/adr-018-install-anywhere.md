@@ -151,8 +151,10 @@ DuckDB's is its engine's too. The portable binary is 97 MB, and 33 MB compressed
 
 Its first run, on the tag `v0.21.0` (2026-09-27), stopped on Windows while packaging: `npm` is
 `npm.cmd` there, and a process started without a shell isn't looked up with `.cmd`, so
-`package.py` finds it with `shutil.which`. Nothing was published (publishing waits for every
-platform). Since then:
+`package.py` finds it with `shutil.which`. The other four (Linux x86-64 and ARM, macOS Intel and
+Apple) built, packaged and passed their checks, the Linux wheel on CentOS 7 and Ubuntu 22.04
+too; macOS Intel is the slowest, at 38 minutes. Nothing was published (publishing waits for
+every platform). Since then:
 
 - The build workflow makes and tries the packages on Linux, Windows and macOS on every push
   (`tools/try_packages.sh`, which the release uses too), so this shows before a tag.

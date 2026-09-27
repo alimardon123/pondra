@@ -732,7 +732,7 @@ The owner is setting up PyPI (trusted publisher: `release.yml`, environment `pyp
 token for the first release, trusted publishing after); a `v*` tag then builds, tries and
 publishes (`.github/workflows/release.yml`); `publish = false` keeps the crate off crates.io.
 The first tag, `v0.21.0`, failed on Windows when packaging (`npm` is `npm.cmd` there, which
-`subprocess` doesn't look for), so nothing was published; fixed after round 22, with checkouts
+`subprocess` doesn't look for), so nothing was published (the other four platforms passed); fixed after round 22, with checkouts
 kept at `\n` line endings everywhere (`.gitattributes`) and `pondra`'s own npm package
 uploaded from Linux only. Its history was rewritten once, before it went public, to
 put the owner's GitHub noreply address on the four commits that had their email; commit IDs from
