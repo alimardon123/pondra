@@ -269,7 +269,7 @@ pub async fn expand(lake: &Lake, sql: &str) -> Result<String> { expand_with(lake
 async fn expand_with(lake: &Lake, sql: &str, views: &HashMap<String, String>) -> Result<String> {
     let all = listed(lake).await?;
     let named = |n: &String| crate::ddl::mentions(sql, n);
-    if !all.iter().any(|(n, r)| r.kind != Kind::Procedure && named(n)) && !views.keys().any(named) {
+    if !all.iter().any(|(n, r)| r.kind != Kind::Procedure && named(n)) && !views.keys().any(named) && !FROM_FIRST.is_match(sql) {
         return Ok(sql.to_string());
     }
     let Ok(mut stmts) = Parser::parse_sql(&GenericDialect {}, sql) else { return Ok(sql.to_string()) };
@@ -281,6 +281,28 @@ async fn expand_with(lake: &Lake, sql: &str, views: &HashMap<String, String>) ->
         }
     }
     Ok(text(&stmts))
+}
+
+/// A query that may start with FROM (DuckDB's `FROM t`, alone or as a subquery, a CTE or a view's).
+static FROM_FIRST: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r"(?is)(?:^|[(;]|\bas)\s*(?:(?:--[^\n]*\n|/\*.*?\*/)\s*)*from\b").expect("a regex"));
+
+/// DuckDB's `FROM t` with no SELECT is `SELECT * FROM t` (DataFusion took it as no columns at all).
+fn select_star(body: &mut ast::SetExpr) {
+    match body {
+        ast::SetExpr::Select(s) if s.flavor == ast::SelectFlavor::FromFirstNoSelect => {
+            s.flavor = ast::SelectFlavor::Standard;
+            if s.projection.is_empty() {
+                s.projection = vec![ast::SelectItem::Wildcard(Default::default())];
+            }
+        }
+        ast::SetExpr::SetOperation { left, right, .. } => {
+            select_star(left);
+            select_star(right);
+        }
+        ast::SetExpr::Query(q) => select_star(&mut q.body),
+        _ => {}
+    }
 }
 
 struct Expander<'a> {
@@ -317,6 +339,11 @@ impl Expander<'_> {
 
 impl VisitorMut for Expander<'_> {
     type Break = anyhow::Error;
+
+    fn post_visit_query(&mut self, q: &mut ast::Query) -> ControlFlow<Self::Break> {
+        select_star(&mut q.body);
+        ControlFlow::Continue(())
+    }
 
     fn post_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<Self::Break> {
         let Expr::Function(f) = expr else { return ControlFlow::Continue(()) };

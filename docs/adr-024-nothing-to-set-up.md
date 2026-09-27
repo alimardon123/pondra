@@ -16,6 +16,17 @@
    README's first example failed with `ModuleNotFoundError`. CI missed it because every check
    installed pyarrow alongside the wheel.
 
+Then, in the shell, three more:
+
+3. **A folder of lakes wasn't a server's databases.** The owner keeps `lake`, `mydb` and
+   `mylake` side by side. `pondra mydb` saw only `mydb` until an `ATTACH` for each of the others,
+   and the `ATTACH` was then saved in `mydb`'s catalog.
+4. **`FROM t` answered with no columns.** DuckDB reads `FROM t` as `SELECT * FROM t`; DataFusion
+   planned it with an empty projection, and the shell printed an empty table.
+5. **`UPDATE mylake.dbo.t …` said "dbo.t is another lake's: change it on a node of that lake".**
+   That refusal is round 19's design (a change is its own lake's leader's, invariant 56), but the
+   message named neither the lake nor what to do, and didn't say that `INSERT` works.
+
 A pip package can't change PATH: wheels run no code when they're installed, by design. DuckDB's
 pip package has no command at all (only `import duckdb`); its command-line tool is a separate
 download.
@@ -55,12 +66,33 @@ way the installers do. It's a command you run, not something done behind your ba
 - Python procedures still need pyarrow (their runner reads its arguments as Arrow); calling one
   without it fails with "No module named 'pyarrow'".
 
+**The shell's databases are the lakes beside it.** The shell starts its node with
+`--attach-found <its current folder>`: every subfolder there that holds a lake is attached under
+its folder's name, for as long as the node runs (`ddl::attach_found`), and the startup line lists
+the databases. Only the shell does this (a server attaches nothing it wasn't told about), and
+nothing is written to the catalog, so the lake doesn't remember the folder it was once opened
+from. Left out: the shell's own lake, a name the catalog already attaches (that `ATTACH` says
+where), a schema's name, and a lake that won't open (said in the node's log, never fatal).
+`DETACH` of one says it stays for the session.
+
+**`FROM t` is `SELECT * FROM t`**, alone, in a subquery or CTE, or as a view's query:
+`routines::expand` already sees every query at every door, and now also turns a FROM-first
+select without a SELECT into one with `*` (a pattern on the text keeps the rest from being parsed
+twice).
+
+**A change to an attached lake says where it runs:** "mylake.dbo.t is in attached lake mylake:
+UPDATE, DELETE and MERGE run on that lake's own node for now (pondra <its folder>); INSERT works
+from here". Letting them run from here is round 23's (the change sent to that lake's leader, or
+led for a moment when none runs, as an `INSERT` is).
+
 ## Rejected
 
 - **pyarrow as a requirement.** It's about 40 MB, and on old Linux (glibc 2.17) pip would pick
   its newest version and try to build it from source.
 - **A console-script launcher instead of the binary.** pip would then warn about PATH, but every
   `pondra` would start Python first, and the warning still leaves the work to the user.
+- **Accepting `ATTACH mylake AS mylake`** (a name for a path): DuckDB refuses it too, and the
+  owner was fine with quotes.
 - **winget and Homebrew now.** Both want a submission per release, and winget reviews take days.
   They're worth doing once there are users asking for them.
 
@@ -81,6 +113,13 @@ before every release:
   the PATH step it isn't found. On Windows, in CI, `tools/try_install.ps1` runs `install.ps1` as
   `irm | iex` does. `Get-Command pondra` must then be the installed one and the user's `Path` must
   hold the folder.
+
+- **`smoke.py`** (Linux, Windows and macOS, every push): a shell started in a folder with two
+  other lakes lists them in `.databases` and reads one with `FROM lake.sales.orders`; the same
+  lake opened from elsewhere lists neither. 0.22.0's binary fails the first two.
+- **`harness.py schemas`**: `FROM t` alone, as a subquery and as a view's query on three nodes;
+  `UPDATE` on an attached lake names it and says `INSERT works from here`. 0.22.0's binary fails
+  with "No field named id".
 
 The GitHub release now opens with an install table (`.github/release.md`) above GitHub's
 generated notes.

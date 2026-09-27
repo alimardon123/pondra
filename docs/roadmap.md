@@ -57,6 +57,14 @@ Still waiting:
 - **Publishing:** 0.22.0 is on PyPI; `v0.22.1` (ADR-024: one-line installers, `python -m
   pondra`, rows without pyarrow) publishes PyPI and npm together.
 
+First, before round 23: an open bug. An adding-up materialized view over a table being changed
+can lose one change's delta while tiering runs (`harness.py changes` fails on release builds;
+`logs/round22/0.22.1-changes-view-drift.txt`).
+
+Round 23 also takes two gaps the owner met in the shell: `UPDATE`/`DELETE`/`MERGE` on an attached
+lake from any node (they run only on that lake's own node today, while `INSERT` works from
+anywhere), and temporary tables (`CREATE TEMP TABLE` makes an ordinary table today).
+
 Round 23 is next: use it from anything — a console at `/`, live queries, dbt and BI tools (A4,
 B3, E1, E2), moved from round 22 when the owner chose frames and procedures for it.
 

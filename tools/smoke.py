@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """A first run of a freshly built binary, on each OS it is built for (CI's build job): the shell
 takes statements on its input, a node serves SQL, schemas and views work, and the node knows the
-machine's memory and its own (on Windows and macOS there is no /proc to read them from).
+machine's memory and its own (on Windows and macOS there is no /proc to read them from); the
+shell attaches the lakes beside its own, for that session, and `FROM t` reads every column.
 
   python3 tools/smoke.py path/to/pondra[.exe]
 
@@ -58,10 +59,18 @@ def main():
     finally:
         node.terminate()
         node.wait(timeout=30)
+    # The shell attaches the other lakes in its folder, for as long as it runs (ADR-024): here
+    # `lake` (the node's, just stopped) and `other` (CREATE DATABASE's) beside `shell`.
+    beside = subprocess.run([BIN, "shell"], cwd=work, input=".databases\nFROM lake.sales.orders ORDER BY id;\n", capture_output=True, text=True, timeout=180)
+    elsewhere = subprocess.run([BIN, os.path.join(work, "shell")], cwd=tempfile.mkdtemp(), input=".databases\n", capture_output=True, text=True, timeout=180)
+    cells = lambda out: {c.strip() for line in out.splitlines() if line.startswith("|") for c in line.strip("|").split("|")}
+    checks["the shell attaches the lakes beside it: .databases lists them"] = {"shell", "other", "lake"} <= cells(beside.stdout)
+    checks["FROM t is SELECT * FROM t (DuckDB's), on a lake found beside the shell's"] = {"id", "amount", "1", "2"} <= cells(beside.stdout)
+    checks["…for that session only: nothing saved in the shell's lake"] = "lake" not in cells(elsewhere.stdout) and {"shell", "other"} <= cells(elsewhere.stdout)
     ok = all(checks.values())
     print(json.dumps({"smoke": checks, "platform": sys.platform, "ok": ok}, indent=1))
     if not ok:
-        print(shell.stdout, shell.stderr, open(log.name).read()[-2000:], file=sys.stderr)
+        print(shell.stdout, shell.stderr, beside.stdout, beside.stderr, elsewhere.stdout, open(log.name).read()[-2000:], file=sys.stderr)
         sys.exit(1)
 
 

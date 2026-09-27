@@ -1,0 +1,11 @@
+# smoke.py with the 0.22.0 binary: the new shell checks fail
+  "the shell attaches the lakes beside it: .databases lists them": false,
+  "FROM t is SELECT * FROM t (DuckDB's), on a lake found beside the shell's": false,
+  "\u2026for that session only: nothing saved in the shell's lake": true
+
+# harness.py schemas with the 0.22.0 binary
+RuntimeError: 500: b'Schema error: No field named id.: No field named id.'
+
+# harness.py schemas with 0.22.1
+  "FROM t is SELECT * FROM t (alone, a subquery, a view's); UPDATE on an attached lake names it and where it runs": true,
+ "ok": true

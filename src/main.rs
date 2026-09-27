@@ -160,6 +160,11 @@ enum Cmd {
         /// one bucket this way.
         #[arg(long)]
         attach: Vec<String>,
+        /// Attach, for as long as this node runs, the lakes in this folder (its subfolders that hold
+        /// one) under their folder names: the shell passes its own folder, so the lakes side by
+        /// side are its databases. Nothing is saved in the catalog.
+        #[arg(long)]
+        attach_found: Option<String>,
         /// Stop, as on Ctrl-C, when standard input closes: when the program that started this
         /// node ends, however it ends (`pondra.local()` in Python and JavaScript, the shell).
         #[arg(long)]
@@ -229,7 +234,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let Some(cmd) = cli.cmd else { return shell::run(&cli.lake.unwrap_or_else(|| "lake".into())).await };
     match cmd {
-        Cmd::Serve { dir, addr, reader, flush_ms, tier_secs, task_ms, memory_gb, retain_secs, changelog_secs, backlog, cache_dir, cache_gb, ack, replicas, fsync, publish, pg, kafka, kafka_advertise, flight, read_token, write_token, admin_token, attach: attached, stop_with_stdin, python } => {
+        Cmd::Serve { dir, addr, reader, flush_ms, tier_secs, task_ms, memory_gb, retain_secs, changelog_secs, backlog, cache_dir, cache_gb, ack, replicas, fsync, publish, pg, kafka, kafka_advertise, flight, read_token, write_token, admin_token, attach: attached, attach_found, stop_with_stdin, python } => {
             let env = |flag: Option<String>, var: &str| flag.or_else(|| std::env::var(var).ok()).filter(|t| !t.is_empty());
             let auth = Arc::new(auth::Auth::new(env(read_token, "PONDRA_READ_TOKEN"), env(write_token, "PONDRA_WRITE_TOKEN"), env(admin_token.clone(), "PONDRA_ADMIN_TOKEN")));
             if let Some(t) = env(admin_token, "PONDRA_ADMIN_TOKEN") {
@@ -290,6 +295,12 @@ async fn main() -> anyhow::Result<()> {
             };
             for spec in &attached {
                 attach(&lake, spec, &addr, true).await?;
+            }
+            if let Some(folder) = &attach_found {
+                let found = ddl::attach_found(&lake, folder, &addr).await;
+                if !found.is_empty() {
+                    eprintln!("attached the lakes in {folder}: {}", found.join(", "));
+                }
             }
             // The lakes attached in SQL (`ATTACH … AS …`), and later ATTACHes and DETACHes.
             let (l, me) = (lake.clone(), addr.clone());

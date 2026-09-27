@@ -1,7 +1,8 @@
 //! `pondra`, or `pondra <lake>`: a SQL shell on a lake (`./lake` unless another folder or
 //! `s3://bucket/prefix` is named), DuckDB-style. It runs a node on the lake — this same binary,
 //! in the background — so views, tasks and windows run while it is open, other nodes can join,
-//! and the lake is left as any node leaves it. Each statement goes to that node.
+//! and the lake is left as any node leaves it. Each statement goes to that node. The other lakes
+//! in the current folder are attached as its databases, for as long as it runs (ADR-024).
 use anyhow::{bail, Result};
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::Path;
@@ -24,8 +25,9 @@ fn start(dir: &str) -> Result<(Child, String, String, std::path::PathBuf)> {
     let port = std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
     let log = std::env::temp_dir().join(format!("pondra-shell-{port}.log"));
     let key = uuid::Uuid::new_v4().to_string();
+    let here = std::env::current_dir()?.to_string_lossy().to_string(); // (its lakes: this one's databases)
     let node = Command::new(std::env::current_exe()?)
-        .args(["serve", "--dir", dir, "--addr", &format!("127.0.0.1:{port}"), "--stop-with-stdin"])
+        .args(["serve", "--dir", dir, "--addr", &format!("127.0.0.1:{port}"), "--stop-with-stdin", "--attach-found", &here])
         .env("PONDRA_OWNER_KEY", &key)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -87,11 +89,21 @@ pub fn params(args: &[String]) -> Result<serde_json::Map<String, serde_json::Val
     Ok(out)
 }
 
+const DATABASES: &str = "SELECT DISTINCT catalog_name AS database FROM information_schema.schemata ORDER BY 1";
+
+/// This lake and the ones attached to it, by name.
+async fn databases(http: &reqwest::Client, base: &str) -> Result<Vec<String>> {
+    let rows: Vec<serde_json::Value> = http.post(format!("{base}/sql")).body(DATABASES).send().await?.json().await?;
+    Ok(rows.iter().filter_map(|r| r["database"].as_str().map(str::to_string)).collect())
+}
+
 async fn session(dir: &str, base: &str, key: &str, node: &mut Child, log: &Path) -> Result<()> {
     let http = up(base, node, log).await?;
     let tty = std::io::stdin().is_terminal();
     if tty {
-        eprintln!("Pondra {} on {dir}, also at {base}. End each statement with ;  .tables and .databases list them, .quit leaves.", env!("CARGO_PKG_VERSION"));
+        let others = databases(&http, base).await.unwrap_or_default();
+        let others = if others.len() > 1 { format!(" Databases: {}.", others.join(", ")) } else { String::new() };
+        eprintln!("Pondra {} on {dir}, also at {base}.{others} End each statement with ;  .tables and .databases list them, .quit leaves.", env!("CARGO_PKG_VERSION"));
     }
     let mut sql = String::new();
     loop {
@@ -103,7 +115,7 @@ async fn session(dir: &str, base: &str, key: &str, node: &mut Child, log: &Path)
         let end = std::io::stdin().lock().read_line(&mut line)? == 0;
         match (sql.is_empty(), line.trim()) {
             (true, ".quit" | ".exit" | "\\q") => break,
-            (true, ".databases") => line = "SELECT DISTINCT catalog_name AS database FROM information_schema.schemata ORDER BY 1;".into(),
+            (true, ".databases") => line = format!("{DATABASES};"),
             // (an attached lake's tables are also this lake's schema of its name, so `l2.t` works: listed once)
             (true, ".tables") => line = "SELECT table_catalog AS lake, table_schema AS schema, table_name AS name, table_type AS kind FROM information_schema.tables WHERE table_schema <> 'information_schema' AND table_schema NOT IN (SELECT catalog_name FROM information_schema.schemata) ORDER BY 1, 2, 3;".into(),
             _ => {}

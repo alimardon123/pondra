@@ -1050,6 +1050,15 @@ def schemas():
     after_restart = until(lambda: _try(lambda: n("warehouse.stock", 2)), 3, 15)  # (within a second of starting)
     cli = subprocess.run([BIN, "sql", "--dir", lake, "SELECT count(*) AS n FROM warehouse.stock"], capture_output=True, text=True, timeout=120).stdout
     listed = {r["catalog_name"] for r in q("SELECT DISTINCT catalog_name FROM information_schema.schemata")}
+    # DuckDB's FROM-first (`FROM t` is SELECT * FROM t): alone, as a subquery, as a view's query;
+    # a change to an attached lake's table says which lake and where it runs (ADR-024)
+    q("CREATE VIEW from_first AS FROM warehouse.stock")
+    from_first = [q("FROM warehouse.stock ORDER BY id"), q("SELECT count(*) AS n FROM (FROM warehouse.stock)", 1), q("FROM from_first ORDER BY id", 2)]
+    change = err("UPDATE warehouse.stock SET qty = 0 WHERE id = 1", 2)
+    checks["FROM t is SELECT * FROM t (alone, a subquery, a view's); UPDATE on an attached lake names it and where it runs"] = \
+        from_first[0] == [{"id": 1, "qty": 100}, {"id": 2, "qty": 200}, {"id": 3, "qty": 300}] and from_first[1] == [{"n": 3}] and from_first[2] == from_first[0] \
+        and change is not None and "warehouse.stock is in attached lake warehouse" in change and "INSERT works from here" in change
+    q("DROP VIEW from_first")
     q("DETACH warehouse")
     gone = [until(lambda i=i: reach(i), False, 15) for i in range(3)]
     checks["ATTACH 'dir' AS name on one node: every node, after a restart, pondra sql; joins and writes across; DETACH everywhere; bad ones refused"] = \
@@ -1067,7 +1076,7 @@ def schemas():
     ok = all(checks.values())
     print(json.dumps({"schemas": checks, "ok": ok}, indent=1))
     if not ok:
-        print(before, over_view, got, spaces, in_dbo, by_flight, rest, used, view_owned, full, shown, refused, everywhere, joined, before_insert, fresh, after_restart, cli, listed, gone)
+        print(before, over_view, got, spaces, in_dbo, by_flight, rest, used, view_owned, full, shown, refused, everywhere, joined, before_insert, fresh, after_restart, cli, listed, gone, from_first, change)
         sys.exit(1)
     return f"schemas: lake.schema.table, attached lakes as catalogs, CREATE/DROP SCHEMA, DROP TABLE, CTAS, stored and materialized views in SQL from any node, spread over views, clients list schemas: all {len(checks)} checks pass"
 

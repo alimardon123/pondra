@@ -213,7 +213,7 @@ pub async fn apply(lake: &Lake, d: Ddl) -> Result<Value> {
                 ensure!(a.dir == full(&dir)?, "{name} is attached already, to {}", a.dir);
                 return Ok(j!({"attached": name, "dir": a.dir, "unchanged": true}));
             }
-            ensure!(!lake.attached.read().unwrap().iter().any(|(n, _)| *n == name), "{name} is attached already (--attach)");
+            ensure!(!lake.attached.read().unwrap().iter().any(|(n, _)| *n == name), "{name} is attached already (--attach, or found beside this lake by the shell)");
             ensure!(full(&dir)? != lake.url, "{dir} is this lake");
             let (dir, created) = lake_dir(&dir).await?;
             lake.cat.commit(vec![(attachment_key(&name), json(&Attachment { dir: dir.clone() }))], &[]).await?;
@@ -239,7 +239,7 @@ pub async fn apply(lake: &Lake, d: Ddl) -> Result<Value> {
         Ddl::Detach { name, if_exists } => {
             if lake.cat.get::<Attachment>(&attachment_key(&name)).await?.is_none() {
                 let flag = lake.attached.read().unwrap().iter().any(|(n, _)| *n == name);
-                ensure!(if_exists && !flag, "{name} {}", if flag { "was attached with --attach, when the node started: it stays" } else { "isn't attached" });
+                ensure!(if_exists && !flag, "{name} {}", if flag { "was attached when the node started (--attach, or found beside this lake by the shell): it stays" } else { "isn't attached" });
                 return Ok(j!({"detached": name, "unchanged": true}));
             }
             lake.cat.commit(vec![], &[attachment_key(&name)]).await?;
@@ -320,6 +320,32 @@ pub async fn attach(home: &Lake, name: &str, dir: &str, me: &str, follow: bool, 
         });
     }
     home.attach(name, other)
+}
+
+/// The lakes in `folder` (its subfolders that hold one), attached under their folder names for as
+/// long as this node runs: the shell's own folder, so the lakes side by side are its databases, as
+/// a database server's are (ADR-024). Nothing is written to the catalog. Left out: this lake, a
+/// name the catalog attaches (that ATTACH says where), a schema's name here, and a lake that won't
+/// open (said on the log). The names attached.
+pub async fn attach_found(home: &Lake, folder: &str, me: &str) -> Vec<String> {
+    let mut dirs: Vec<_> = std::fs::read_dir(folder).into_iter().flatten().flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
+    dirs.sort();
+    let mut found = vec![];
+    for path in dirs {
+        let (Some(name), Ok(dir)) = (path.file_name().and_then(|n| n.to_str()).map(str::to_lowercase), full(&path.to_string_lossy())) else { continue };
+        let taken = dir == home.url || check(&name).is_err() || name == lake_name(home)
+            || home.attached.read().unwrap().iter().any(|(n, _)| *n == name)
+            || !matches!(home.cat.get::<Attachment>(&attachment_key(&name)).await, Ok(None))
+            || has_schema(home, &name).await.unwrap_or(true);
+        if taken || !has_catalog(&dir).await.unwrap_or(false) {
+            continue;
+        }
+        match attach(home, &name, &dir, me, true, false).await {
+            Ok(()) => found.push(name),
+            Err(e) => eprintln!("attaching {name} ({dir}), found in {folder}: {e:#}"),
+        }
+    }
+    found
 }
 
 /// The lakes this process attached because the catalog said so, per home lake.

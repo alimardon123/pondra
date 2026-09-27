@@ -1,0 +1,33 @@
+# harness.py all on the 0.22.1 binary (release build): changes fails; the suites after it run one by one
+upsert: 393 live keys after 12,000 random upserts/deletes, 6 compactions (s: 0.0, 0.0, 0.0, 0.0, 0.0, 0.0), 1 restart, 3,400 lookups (0 wrong) -> OK
+tiering: 12 rounds -> files {'events': 5, 'kv': 5, 'totals': 5}, untiered rows 0, rows {'events': 1200, 'kv': {'n': 200, 'v': 2400}, 'totals': 1200} -> OK
+fence: 2nd node joined as follower=True; takeover after 6.0s; stale leader's write rejected; it rejoined as follower; rows=[{'producer': 'a', 'n': 200}, {'producer': 'b', 'n': 200}] -> OK
+insert: first={'rows': 5} retry={'duplicate': True} summary={'groups': 5, 'n': 5000} -> OK
+{"serverless": {"alone_s": 0.03, "retry": ["{\"rows\":1000}", "{\"duplicate\":true}"], "four_at_once": ["{\"rows\":1000}", "{\"rows\":1000}", "{\"rows\":1000}", "{\"rows\":1000}"], "node_start_s": 0.04, "node_leads": true, "via_node_s": 0.03, "after_leader_killed_s": 30.15, "rows": {"n": 8000, "ids": 1000}, "ok": true}}
+ "ok": true
+ "ok": true
+ "ok": true
+ "ok": true
+ "ok": true
+ "ok": true
+ "ok": true
+ "ok": true
+ "ok": false
+changes: see 0.22.1-changes-view-drift.txt
+guard exit 0
+files exit 0
+layouts exit 0
+clusters exit 0
+copies exit 0
+streams exit 0
+columns exit 0
+fills exit 0
+dedup exit 0
+scale exit 0
+flight exit 0
+reader exit 0
+crash exit 0
+load exit 0
+done
+procedures:  "ok": true
+frames_check: {"pipelines_equal": 26, "pipelines": 26, "ways_equal": 11, "ways": 11, "ok": true}

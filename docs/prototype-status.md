@@ -71,10 +71,13 @@ change PATH. And `pip install pondra` without pyarrow couldn't answer a query. 0
   too);
 - `python -m pondra`, which works wherever pip put the binary, and `--add-to-path` for the short
   name;
-- rows as JSON when pyarrow isn't installed.
+- rows as JSON when pyarrow isn't installed;
+- in the shell, the other lakes in its folder attached as its databases for the session, `FROM t`
+  read as `SELECT * FROM t` (it answered with no columns), and a change to an attached lake's
+  table saying which lake and where it runs.
 
-`tools/try_packages.sh` tries all of it on Linux, Windows and macOS on every push (invariants 89
-and 90, each checked to fail without its fix).
+`tools/try_packages.sh` and `smoke.py` try all of it on Linux, Windows and macOS on every push
+(invariants 89 to 92, each checked to fail without its fix).
 
 **Round 21 shaped tables further and took on more of Flink** (ADR-022):
 

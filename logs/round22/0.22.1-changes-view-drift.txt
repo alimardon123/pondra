@@ -1,0 +1,11 @@
+# harness.py changes: 'the model, every node' fails at steps 53 and 59 (per_owner, owner c: total 213 short, count right)
+## 0.22.1 release build, three runs: fails
+  "60 random INSERT/UPDATE/DELETE/MERGE on 3 nodes == the model, every node, while tiering and purging": false,
+  "60 random INSERT/UPDATE/DELETE/MERGE on 3 nodes == the model, every node, while tiering and purging": false,
+## HEAD 087e078 without this change's Rust (release build): fails too
+  "60 random INSERT/UPDATE/DELETE/MERGE on 3 nodes == the model, every node, while tiering and purging": false,
+## round 22's dist build (0.22.0 code, thin LTO, one codegen unit): passes
+  "60 random INSERT/UPDATE/DELETE/MERGE on 3 nodes == the model, every node, while tiering and purging": true,
+## what the view held
+DEBUG step 53 got [{'owner': 'a', 'total': 959.0, 'n': 14}, {'owner': 'b', 'total': 1473.0, 'n': 31}, {'owner': 'c', 'total': 168.0, 'n': 8}, {'owner': 'd', 'total': 835.0, 'n': 35}] want [{'owner': 'a', 'total': 959.0, 'n': 14}, {'owner': 'b', 'total': 1473.0, 'n': 31}, {'owner': 'c', 'total': 381.0, 'n': 8}, {'owner': 'd', 'total': 835.0, 'n': 35}] direct [{'owner': 'a', 'total': 959.0, 'n': 14}, {'owner': 'b', 'total': 1473.0, 'n': 31}, {'owner': 'c', 'total': 381.0, 'n': 8}, {'owner': 'd', 'total': 835.0, 'n': 35}]
+DEBUG step 59 got [{'owner': 'a', 'total': 673.0, 'n': 11}, {'owner': 'b', 'total': 1018.0, 'n': 28}, {'owner': 'c', 'total': 106.0, 'n': 9}, {'owner': 'd', 'total': 521.0, 'n': 35}] want [{'owner': 'a', 'total': 673.0, 'n': 11}, {'owner': 'b', 'total': 1018.0, 'n': 28}, {'owner': 'c', 'total': 319.0, 'n': 9}, {'owner': 'd', 'total': 521.0, 'n': 35}] direct [{'owner': 'a', 'total': 673.0, 'n': 11}, {'owner': 'b', 'total': 1018.0, 'n': 28}, {'owner': 'c', 'total': 319.0, 'n': 9}, {'owner': 'd', 'total': 521.0, 'n': 35}]

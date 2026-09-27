@@ -98,7 +98,11 @@ async fn session(lake: &Lake, sql: &str, upto: u64) -> Result<datafusion::prelud
 pub async fn run(lake: &Lake, seq: &Sequencer, sql: &str, job: &str) -> Result<Value> {
     let stmt = crate::write::parse(sql).context("not an UPDATE, DELETE or MERGE")?;
     let (other, table) = crate::ddl::resolve(lake, &stmt.table()).await?;
-    ensure!(other.is_none(), "{table} is another lake's: change it on a node of that lake");
+    if let Some(other) = other {
+        let name = lake.attached.read().unwrap().iter().find(|(_, o)| std::sync::Arc::ptr_eq(o, &other)).map(|(n, _)| n.clone());
+        bail!("{} is in attached lake {}: UPDATE, DELETE and MERGE run on that lake's own node for now (pondra {}); INSERT works from here",
+              stmt.table(), name.unwrap_or_else(|| crate::ddl::lake_name(&other)), other.url);
+    }
     let stored: TableMeta = lake.cat.get(&table_key(&table)).await?.with_context(|| format!("no table {table}"))?;
     let meta = stored.logical(); // (the change's SQL names columns as SQL knows them: ADR-022)
     let view = lake.cat.get::<crate::views::View>(&crate::views::view_key(&table)).await?;

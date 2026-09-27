@@ -29,7 +29,8 @@ Windows and ARM Linux get their own builds; each release tries every package and
 on its own platform before publishing.
 
 ```bash
-pondra                      # a SQL shell on ./lake (or: pondra my-lake, pondra s3://bucket/lake)
+pondra                      # a SQL shell on ./lake (or: pondra my-lake, pondra s3://bucket/lake);
+                            # the other lakes in this folder are its databases too (.databases)
 ```
 
 ```python

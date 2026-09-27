@@ -185,8 +185,8 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
   (`cargo zigbuild --profile dist --target x86_64-unknown-linux-gnu.2.17`). `tools/package.py`
   puts a binary in a wheel (as a script, like maturin's bin wheels) and in npm packages
   (esbuild's pattern: `pondra` + optional `pondra-<platform>`). `pondra [lake]` with no command
-  is a SQL shell (`shell.rs`) over a node it starts; Python's and JavaScript's `local()` start
-  one too. All three start it with `--stop-with-stdin`: the node stops, and a leader gives up its
+  is a SQL shell (`shell.rs`) over a node it starts (with the other lakes in its folder attached:
+  ADR-024); Python's and JavaScript's `local()` start one too. All three start it with `--stop-with-stdin`: the node stops, and a leader gives up its
   term, when its standard input closes.
 - **`sum` over DOUBLE is order-independent** (`fsum.rs`): it replaces DataFusion's `sum` in every
   session; Float64 sums carry a second double with the rounding errors (state: two columns),
@@ -619,6 +619,13 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    binary wherever pip put it; the installers leave their folder on the user's PATH (and on
    Windows on this terminal's). `try_packages.sh` checks `command -v pondra` in a clean shell,
    and `Get-Command pondra` plus the user's `Path` on CI's Windows (both fail without the PATH step).
+91. **The shell's lakes found beside it are the session's, never the catalog's** (ADR-024,
+   `ddl::attach_found`, `serve --attach-found`): attached in memory like `--attach`, skipping a
+   name the catalog attaches, and a lake that won't open never stops the node. `smoke.py`: "the
+   shell attaches the lakes beside it", "…for that session only: nothing saved in the shell's lake".
+92. **`FROM t` is `SELECT * FROM t` wherever SQL comes in** (`routines::expand`, `select_star`,
+   `FROM_FIRST`): DataFusion plans a FROM-first select as no columns. `harness.py schemas` and
+   `smoke.py` fail without it.
 
 ## Tests: run these before and after any change
 
@@ -753,7 +760,12 @@ packages are published by starting `release.yml` by hand with publish ticked (th
 is made only on a tag; PyPI skips what it has). The owner installed 0.22.0 from PyPI on Windows:
 it worked from Python, but `pondra` wasn't found (a user install: pip's folder isn't on PATH) and
 `pip install pondra` without pyarrow couldn't answer a query. 0.22.1 (ADR-024) fixes both, with
-one-line installers on every release; its tag publishes PyPI and npm together. Its history was rewritten once, before it went public, to
+one-line installers on every release, and makes the shell's folder of lakes its databases.
+npm refused the release's first publish (a token needing a two-factor code; npm doesn't take a
+package's first version through trusted publishing), so the owner published 0.22.0's six npm
+packages by hand (`npm.cmd`: PowerShell's scripts are off there) and set each one's trusted
+publisher (`release.yml`, environment `pypi`, "Allow npm publish"); from 0.22.1 on, the tag
+publishes PyPI and npm with no token. Its history was rewritten once, before it went public, to
 put the owner's GitHub noreply address on the four commits that had their email; commit IDs from
 before then (in older bundles) differ. Each round the owner downloads the new bundle and, in
 their clone, runs `git pull <bundle> main` and `git push`; GitHub then builds it on Linux,
@@ -886,6 +898,15 @@ The comparison with Spark, Flink, Fluss, Lakehouse//RT and the single-node engin
 item, with what each is building next and the plan for the gaps — is
 `docs/comparison-spark-flink-fluss.md`.
 
+**Open bug (found 2026-09-27, while testing 0.22.1; 0.22.0 has it too).** `harness.py changes`
+fails on release builds: after about 50 random changes on three nodes, tiering and purging every
+second, the adding-up view `per_owner` (sum and count per owner) is 213 short in one group's
+total while its count is right, and stays so. The table itself matches the model. A change's net
+delta for that group (n +0, total +213) went missing, so the likely place is a merge view's delta
+rows meeting tiering, folding or purging, not the change itself. Round 22's dist build (thin LTO,
+one codegen unit) passes the same seeded run, and every earlier round passed it: a timing-dependent
+race. `logs/round22/0.22.1-changes-view-drift.txt`. Next thing to fix.
+
 Known limits, in the order they matter:
 
 1. **Multi-machine runs only over the internet so far** (GitHub's runners, where a shuffle costs
@@ -907,7 +928,8 @@ Known limits, in the order they matter:
    followers' power loss too), but not the leader and every holder dying before the bucket has
    it.
 6. **One sequencer per lake** orders commits. Attached lakes split the load across leaders, but
-   there are no transactions across lakes.
+   there are no transactions across lakes, and `UPDATE`/`DELETE`/`MERGE` on an attached lake's
+   table run only on a node of that lake (an `INSERT` works from anywhere; round 23).
 7. **Memory is bounded by budgets, not by accounting.** What DataFusion counts is the big hash
    tables and sort buffers; Parquet decoding and the batches in flight are not counted, so the
    query budget defaults to a third of RAM and the hot columns watch the process's own memory.
@@ -923,7 +945,7 @@ Known limits, in the order they matter:
     grants or quotas.
 11. **`VARIANT` is JSON text**, not a shredded variant; `ai_*` and Flight functions call out of
     the process, so their latency is the endpoint's.
-12. **Packages:** 0.22.0 is on PyPI (all five platforms), npm waits for 0.22.1's tag. Only the
+12. **Packages:** 0.22.0 is on PyPI and npm (all five platforms; npm's by hand, once). Only the
     owner's Windows machine has run a published package outside CI; the installers have run only
     on CI's machines; no winget or Homebrew package. The node's JSON leaves out nulls (the Python
     client puts them back; the JavaScript client doesn't yet). Only `sum` over DOUBLE is
@@ -939,7 +961,9 @@ Rounds 17–22 are done except what needs the owner (publishing, cluster-bench r
 
 1. **Round 23, use it from anything:** a console at `/`, live queries (`GET /live?sql=…`), dbt
    over the Postgres port and BI tools on Windows; procedures on a schedule; `pondra run
-   models/`.
+   models/`; `UPDATE`/`DELETE`/`MERGE` on an attached lake from any node (sent to its leader, or
+   led for a moment, as an `INSERT` is); temporary tables (a `TEMP` table is refused or made
+   per session, not silently kept, as it is now).
 2. **Publish 0.22.1:** tag `v0.22.1` (PyPI, npm, the installers); then set npm's trusted
    publisher on the six packages and delete the `NPM_TOKEN` secret.
 3. **Security before anyone else's data:** TLS on the node port and mutual TLS between nodes, then
