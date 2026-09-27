@@ -67,12 +67,14 @@ Round 23 also takes two gaps the owner met in the shell: `UPDATE`/`DELETE`/`MERG
 lake from any node (they run only on that lake's own node today, while `INSERT` works from
 anywhere), and temporary tables (`CREATE TEMP TABLE` makes an ordinary table today).
 
-Round 23 is next: **read and write anything** (track G below). The owner, 2026-09-28: Pondra is
-becoming a processing engine too, and should read and write as many sources and targets as its
-competitors; they left the order to the agent. Files and other lakes' tables anywhere come first
-(what a new user tries first: "point it at my data"), then Kafka both ways and databases. "Use it
-from anything" (a console at `/`, live queries, dbt and BI tools: A4, B3, E1, E2) moves to round
-24. The plan comes as an ADR before the code.
+Round 23 is next: **read and write anything** (track G, ADR-026, proposed). The owner,
+2026-09-28: Pondra is becoming a processing engine too, and should read and write as many
+sources and targets as its competitors; they left the order to the agent. Files and other lakes'
+tables anywhere come first (what a new user tries first: "point it at my data"), with
+`CREATE SECRET`, then Kafka clusters both ways. Round 24 is **SQL and Python as one** (track H,
+ADR-027, proposed, the owner's same day): `CREATE FUNCTION` for what macros were, Python
+functions and procedures without needless limits, decorators that take a notebook's function as
+it is, schedules. Round 25 is the console, the server and databases attached.
 
 ## Where Pondra stands
 
@@ -153,7 +155,7 @@ it runs one partition at a time, because its parallel execution needs a Tokio ru
 browser Pondra would read a published snapshot of the lake (the list of files and log segments),
 not the catalog.
 
-## Everything still open, in seven tracks
+## Everything still open, in eight tracks
 
 Size: **S** = part of a round, **M** = about one round, **L** = more than one.
 
@@ -252,6 +254,18 @@ table's slices.
 | G6 | Databases: `ATTACH 'postgres://…'` / MySQL as a database to read (filters pushed down) and write; their changes streamed in natively (logical replication, binlog) | CDC without Debezium | L | Tables equal the source's under changes; a restart |
 | G7 | Sinks: a materialized view or task kept in step in an outside target (Kafka, Postgres upsert, files) | The other half of ETL | M | Exactly-once through failovers |
 
+### H. SQL and Python as one (the owner, 2026-09-28; ADR-027)
+
+| # | Item | Why | Size | Proof |
+|---|---|---|---|---|
+| H1 | `CREATE FUNCTION` in Postgres's forms (macros become SQL functions; `CREATE MACRO` stays) | The word Postgres users know | S–M | Postgres 17's answers for its forms |
+| H2 | Python functions: per row, vectorized, table; spread over the nodes | Python where SQL can't: text, PDFs, images, APIs | M | One node == three; a worker killed mid-query |
+| H3 | Warm Python workers per node, packages per routine | A `CALL` in milliseconds; the same libraries on every node | M | Under 10 ms warm; a package installed once per node |
+| H4 | Procedures without limits: `pondra.sql` as the caller, notices back, secrets, no answer needed | "Send an email from a SQL cell" | S–M | Mail to a local SMTP server from the shell, psql and JavaScript |
+| H5 | Decorators that take a notebook's function as it is (imports, helpers, constants) | Python users write Python, not wrappers | S–M | The same function runs in the notebook and on the node |
+| H6 | Schedules (`CREATE TASK … SCHEDULE`) and the run log (`pondra.runs`) | Jobs that run by themselves, and what they did | M | Every tick once through a failover |
+| H7 | Notebooks in the catalog: `.ipynb` in the lake, run as a procedure, on a schedule | The platform on top | M–L | Later: after the console (round 25) |
+
 ## The rounds
 
 Each round is about one session like the last sixteen, ending with tests on local disk,
@@ -265,12 +279,25 @@ simulated R2 and real R2, an ADR, and a bundle.
 | 20 ✓ | Fewer objects, any layout, streams joined (done: ADR-021) | the owner's questions, C1 (round 19's run) | a trickle of INSERTs writes under a third of the objects; `PRIMARY KEY` with `partition_by`/`cluster_by` (Hilbert); `COPY`; stream joins and sliding windows |
 | 21 ✓ | Shape it further, and more of Flink (done: ADR-022) | E8, E7, C3, F (streaming) | `ALTER TABLE … RENAME/DROP COLUMN`, widening; views filled from existing rows; dedup by event time; Nexmark against Flink; the DataFrame API designed |
 | 22 ✓ | Frames and procedures (done: ADR-023) | the DataFrame API (`dataframe-api.md`), the owner's macros and procedures | `pondra.frame` and `pondra.spark` over SQL, equal to Polars and PySpark; SQL and Python mixed every way; macros and procedures (SQL, Python) in the catalog |
-| 23 | Read and write anything | G1, G2, G3, G4, then G5 | files, Delta and Iceberg anywhere read and written from SQL and frames, spread; GCS and Azure; Kafka clusters in and out |
-| 24 | Use it from anything | A4, B3, E1, E2, C1, D1 (start), G6 | a console at `/`, live queries, dbt and Power BI; procedures on a schedule; `pondra run models/`; Postgres and MySQL attached |
-| 25 | In-process | B1, B2 | `pondra.open(…)` in a notebook reads and writes a cluster's lake, no server |
-| 26 | Safe to share | E3, D2 | TLS, grants, audit; random-query checks against DuckDB |
-| 27 | In the browser | B4 (after the DuckDB-WASM check) | A lake queried in a web page, straight from the bucket |
-| 28+ | Depth | C2, C4, E4, G7, then F by evidence | Whatever the scale runs and first users show matters most |
+| 23 | Read and write anything (ADR-026) | G1–G5, secrets; D1 set up and measured | files, Delta and Iceberg anywhere read, joined and written, spread; GCS and Azure lakes; Kafka clusters in and out; `CREATE SECRET` |
+| 24 | SQL and Python as one (ADR-027) | H1–H6 | `CREATE FUNCTION` in SQL and Python; procedures that send mail from a SQL cell; decorators that take a notebook's function; schedules and a run log |
+| 25 | Use it from anything, and the server (ADR-028) | A4, B3, E1, E2, G6, the server, TEMP tables, changes to attached lakes | a console at `/` with SQL and Python cells; live queries; dbt and Power BI; a folder of lakes served as databases (`--server`); Postgres and MySQL attached |
+| 26 | Safe to share | E3 | TLS, mutual TLS between nodes, users and grants down to a table, an audit log, quotas |
+| 27 | Production-ready SQL and frames | D1 to its end, D2, TPC-DS | sqllogictest passing (every exception named), TPC-DS's 99 queries == DuckDB, random queries 1 node == 3 == DuckDB, Polars and PySpark coverage published |
+| 28 | Scale, proven (ADR-029: burst) | C1 in one data centre, C2, C4, burst functions | 1 → 3 → 6 machines in one zone; SF100 against Spark; a 24-hour soak; serverless bursts for a big query |
+| 29 | In-process and in the browser | B1, B2, B4 | `pondra.open(…)` without a server; a lake queried in a web page (WebAssembly) |
+| 30+ | Depth | G7, H7, E4, F by evidence | sinks, notebooks in the catalog, streaming depth, what users show matters |
+
+**Every round, whatever its theme** (the owner's rules: nothing half-done, performance only goes
+up, scale-out is the point):
+
+- the suite on local disk, simulated R2 and real R2, and CI on five platforms;
+- performance gates: TPC-H SF1 and SF10 on one node against DuckDB, the in-memory run, and the
+  cluster bench at 3 and 6 nodes (the owner starts it, `binary: ci`): each holds or improves;
+- from round 23, the sqllogictest pass rate (D1), which never drops and climbs every round;
+- a new feature works from SQL, Python (connection and frames), JavaScript, Postgres and MCP
+  alike (ADR-025), or is refused by name;
+- an ADR, and a release (a tag publishes what the build tested).
 
 Why this order:
 
@@ -280,9 +307,19 @@ Why this order:
   system columns all rest on; it is design work before code.
 - **Proof at scale needs machines,** and runs on GitHub's runners whenever the owner starts the
   bench: its fixes can land in any round, as the numbers come in.
-- **"Use it from anything" comes before the in-process and browser work** because a console and
-  live queries are short steps on what exists. The library split is the bigger change.
-- **Security comes before the browser.** It matters as soon as anyone else's data goes in.
+- **Reading and writing anything comes first** (round 23) because it is what a new user tries
+  first ("point it at my data"), and its `CREATE SECRET` is what round 24's procedures need for
+  mail, APIs and databases.
+- **SQL and Python as one comes before the console** (round 24) because the console's Python
+  cells, schedules and notebooks run on its workers and run log.
+- **The console and the server come together** (round 25): a folder of lakes served as databases
+  is what the console lists, and dbt and BI tools connect to.
+- **Security right after** (round 26): a server others connect to needs users, grants and TLS
+  before anyone else's data goes in.
+- **Conformance runs every round and finishes in round 27**, before the scale runs, so what is
+  proven at scale is the finished SQL.
+- **The in-process library and the browser come last** of these: the library split is the
+  biggest change, and everything above makes what it exposes settle first.
 
 ## What only you can decide
 

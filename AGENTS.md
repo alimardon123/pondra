@@ -989,15 +989,14 @@ Known limits, in the order they matter:
 Good next moves: `docs/roadmap.md` (2026-09-27, after round 22) is the plan, with the reasons.
 Rounds 17–22 are done except what needs the owner (publishing, cluster-bench runs). In short:
 
-1. **Round 23, read and write anything** (roadmap track G; the owner, 2026-09-28: as many sources
-   and targets as the competitors, order left to the agent): files (Parquet, CSV, JSON) and
-   Delta and Iceberg tables anywhere on S3, GCS, Azure and HTTPS, read and joined from SQL and
-   frames and spread over the nodes; `COPY … TO` anywhere; GCS and Azure lakes; an existing Kafka
-   cluster in and out. An ADR first, sent to the owner before the code. Then round 24, use it
-   from anything: a console at `/`, live queries (`GET /live?sql=…`), dbt over the Postgres port
-   and BI tools on Windows; procedures on a schedule; `pondra run models/`; Postgres and MySQL
-   attached; `UPDATE`/`DELETE`/`MERGE` on an attached lake from any node; temporary tables (a
-   `TEMP` table is refused or made per session, not silently kept, as it is now).
+1. **Rounds 23–30 are planned in `docs/roadmap.md`** (re-planned 2026-09-28 with the owner's
+   asks). Round 23, read and write anything (ADR-026, proposed: files, Delta and Iceberg anywhere,
+   `CREATE SECRET`, GCS and Azure, Kafka clusters both ways); round 24, SQL and Python as one
+   (ADR-027, proposed: `CREATE FUNCTION` in SQL and Python, procedures that can do anything Python
+   can, decorators that take a notebook's function as it is, schedules, a run log); round 25, the
+   console, the server (a folder of lakes as databases) and databases attached, TEMP tables and
+   changes to attached lakes; 26 security; 27 conformance to its end; 28 scale proven, with burst
+   functions; 29 in-process and the browser. Both ADRs wait for the owner's go-ahead.
 2. **Publish 0.23.0** (ADR-025's names; `v0.22.2`, the fix of invariant 93, is tagged at c47e2c7
    and releases the old way): tag `v0.23.0` once its build run is green; the release publishes
    that run's packages.
