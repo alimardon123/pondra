@@ -54,7 +54,8 @@ decisions in "What only you can decide" are yours · **Builds on:** ADR-002 to A
 Still waiting:
 
 - **C1 in one data centre:** machines under a millisecond apart, where spreading should pay.
-- **Publishing:** the owner's PyPI pending publisher and npm token; then a `v0.22.0` tag.
+- **Publishing:** 0.22.0 is on PyPI; `v0.22.1` (ADR-024: one-line installers, `python -m
+  pondra`, rows without pyarrow) publishes PyPI and npm together.
 
 Round 23 is next: use it from anything — a console at `/`, live queries, dbt and BI tools (A4,
 B3, E1, E2), moved from round 22 when the owner chose frames and procedures for it.
@@ -265,11 +266,10 @@ Why this order:
    Tell me its cores, memory and free disk. Through the link I work in a Linux environment on
    the laptop. So Windows-only checks, the `.exe` and Power BI, are for you to run, with my
    scripts, or for GitHub's Windows runners.
-3. **Publishing (in progress).** PyPI: a pending trusted publisher for `release.yml`, environment
-   `pypi`. npm: a token (the `NPM_TOKEN` secret) for the first release, then each package's
-   Trusted Publisher set to `release.yml` and the token removed. Then tag `v0.22.0` (`v0.21.0`
-   failed on Windows before publishing anything; fixed). crates.io
-   can wait (`publish = false`).
+3. **Publishing.** PyPI's trusted publisher is set and 0.22.0 is there. npm: the `NPM_TOKEN` secret
+   publishes the first release (0.22.1, as npm refused 0.22.0's paths), then each package's
+   Trusted Publisher set to `release.yml` and the token removed. Tag `v0.22.1` next. winget and
+   Homebrew when users ask. crates.io can wait (`publish = false`).
 
 ## What not to do yet
 

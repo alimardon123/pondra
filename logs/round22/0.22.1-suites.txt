@@ -1,0 +1,6 @@
+# 0.22.1's client against the suites that use it (local, round-22 binary)
+frames_check: {"pipelines_equal": 26, "pipelines": 26, "ways_equal": 11, "ways": 11, "ok": true}
+spark_check: {"equal": 44, "names_equal": 44, "total": 44}
+harness clients: ok=1
+harness procedures: ok=1
+anywhere_check:  "ok": true

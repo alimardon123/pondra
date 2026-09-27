@@ -9,16 +9,24 @@ Cloudflare R2, MinIO).
 
 ## Install
 
-```bash
-pip install pondra          # the binary for this machine, and the Python client
-npm install pondra          # the same binary, and a JavaScript client
-```
+| You have | Run | Then |
+|---|---|---|
+| Windows | `irm https://github.com/alimardon123/pondra/releases/latest/download/install.ps1 \| iex` | `pondra` |
+| Linux, macOS | `curl -fsSL https://github.com/alimardon123/pondra/releases/latest/download/install.sh \| sh` | `pondra` |
+| Python | `pip install pondra` (add `pyarrow` for pandas, Polars and Arrow) | `pondra`, `python -m pondra`, or `import pondra` |
+| Node | `npm install -g pondra` (or `npm install pondra` in a project) | `pondra`, or `npx pondra` with no install |
+
+The installers put the binary in your own folder (`~/.local/bin`, or `%LOCALAPPDATA%\Programs\pondra`)
+and that folder on your PATH: no admin rights, nothing else to set up. pip puts `pondra` next to
+Python; where that folder isn't on PATH (a user install into a Python installed for everyone, on
+Windows or macOS), `python -m pondra` runs it anyway and `python -m pondra --add-to-path` puts it
+there once. Without pyarrow the Python client's rows come as JSON (dates and times as text);
+tables for pandas, Polars and Arrow need it.
 
 The Linux binary asks for nothing newer than glibc 2.17, so it runs on any Linux from 2014 on —
-tested on CentOS 7 and Ubuntu 22.04, the base of most cloud notebooks. macOS, Windows and ARM
-Linux get their own builds from the release workflow. Until the first release is published (`.github/workflows/release.yml`, on a version tag),
-build the packages from a binary: `python3 tools/package.py --bin <pondra> --platform linux-x64
---npm-main --out dist`, then `pip install dist/pondra-*.whl`.
+tested on CentOS 7 and Ubuntu 22.04, the base of most cloud notebooks. macOS (Intel and Apple),
+Windows and ARM Linux get their own builds; each release tries every package and the installer
+on its own platform before publishing.
 
 ```bash
 pondra                      # a SQL shell on ./lake (or: pondra my-lake, pondra s3://bucket/lake)
@@ -179,8 +187,9 @@ The code is portable Rust; nothing in it is Linux-specific. `.github/workflows/r
 builds Linux (x86-64 and ARM, glibc 2.17), macOS (Intel and Apple) and Windows binaries, packages
 each for pip and npm, and tries each package on its own platform before publishing. On Windows:
 
-- **`pip install pondra` or `npm install pondra`** once a release is out; until then, the
-  `pondra-windows-x64` artifact of a `release` run started by hand holds the wheel and the `.exe`.
+- **The installer** (`irm …/install.ps1 | iex`, above), **`pip install pondra`** or **`npm
+  install -g pondra`**. With pip, if `pondra` isn't found afterwards, `python -m pondra` works,
+  and `python -m pondra --add-to-path` fixes it for good.
 - **WSL2:** `wsl --install`, then the Linux package or binary as above. This is the combination
   the tests were run on.
 - **The build workflow's binary:** every push builds `pondra-windows-x86_64.exe` (an artifact of
@@ -309,6 +318,8 @@ python3 tools/harness.py changes                # UPDATE/DELETE/MERGE vs a model
 python3 tools/harness.py guard                  # a query spreads only when it pays: a slow link keeps it on one node, a fast one spreads it
 python3 tools/smoke.py <pondra>                 # a first run on any OS (stdlib only): the shell, SQL, memory figures
 python3 tools/anywhere_check.py --bin <pondra> --dist dist [--docker]   # the shell, local(), the wheel, npm, the notebook; glibc 2.17 and Ubuntu 22.04
+bash tools/try_packages.sh linux-x64            # dist/'s packages as users get them: pip without and with pyarrow, python -m pondra, npm, the installer
+bash tools/npm_publish.sh --dry-run             # the release's npm publish, tried
 python3 tools/bench/repeat.py --data <tpch> --query 15 --runs 20       # one TPC-H query many times, every answer against DuckDB's
 python3 tools/shuffle_spill.py                 # a shuffle bigger than memory, and one that loses a node
 python3 tools/spread_tpch.py --expect 22        # all 22 TPC-H queries on 3 nodes == one node (13 by key ranges)
@@ -361,8 +372,10 @@ bucket to its newest lakes.
 - A materialized view that is a session window or a stream join starts from its creation; others
   are filled from the rows already there, in one go on the leader. `ALTER TABLE … RENAME TO`
   (copy with `CREATE TABLE … AS`), narrowing a type, `search_path` and grants per schema.
-- The packages aren't published yet (the release workflow is ready; PyPI and npm are being set
-  up), and the Windows and macOS packages haven't run on real machines.
+- The owner has installed the Windows wheel from PyPI on a real machine; the macOS packages, and
+  the installers on anything but CI's machines, haven't run elsewhere yet. No winget or Homebrew
+  package. The node's JSON leaves out nulls (the Python client puts them back as None; the
+  JavaScript client doesn't yet).
 - Only `sum` over DOUBLE is order-independent; `avg`, `stddev` and friends over DOUBLE can still
   differ in their last bits from run to run.
 - Per-table grants, quotas and TLS (tokens are per role; put a TLS proxy in front, and keep a

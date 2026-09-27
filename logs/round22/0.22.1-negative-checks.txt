@@ -1,0 +1,13 @@
+# The new checks against what 0.22.0 did (each must fail)
+## tools/package_check.py with pondra 0.22.0 from PyPI, no pyarrow
+
+    import pyarrow as pa
+ModuleNotFoundError: No module named 'pyarrow'
+exit 1
+## the same with pyarrow: python -m pondra (0.22.0 has none)
+
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: CompletedProcess(args=['/tmp/claude-0/-home-claude/a721e85c-57d7-54bc-a61a-31b89c7beef9/scratchpad/neg/bin/python', '-m', 'pondra', '--version'], returncode=1, stdout='', stderr="/tmp/claude-0/-home-claude/a721e85c-57d7-54bc-a61a-31b89c7beef9/scratchpad/neg/bin/python: No module named pondra.__main__; 'pondra' is a package and cannot be directly executed\n")
+exit 1
+## install.sh without its PATH step
+the check fails: pondra not on PATH ('')

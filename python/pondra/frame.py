@@ -13,6 +13,7 @@ that `.sql` files and every other client read.
 import builtins
 import datetime as _dt
 import decimal
+import html
 import itertools
 import math
 import re
@@ -492,8 +493,10 @@ class Frame:
         return f"<pondra Frame\n{self.sql}\n>"
 
     def _repr_html_(self):  # (a notebook shows the first rows, as DuckDB's relations do)
-        t = self.limit(20).collect()
-        return t.to_pandas()._repr_html_() if hasattr(t, "to_pandas") else None
+        import importlib.util
+        if not all(importlib.util.find_spec(m) for m in ("pyarrow", "pandas")):
+            return "<pre>" + html.escape(self._con._frame_rows(self.limit(20), format="table")) + "</pre>"
+        return self.limit(20).collect().to_pandas()._repr_html_()
 
     @property
     def schema(self):
@@ -663,6 +666,8 @@ class Frame:
     # results
     def collect(self):
         """Run it: a pyarrow Table."""
+        from .client import _pyarrow
+        _pyarrow("collect()")
         return self._con._frame_rows(self)
 
     to_arrow = collect
@@ -675,15 +680,18 @@ class Frame:
         return pl.from_arrow(self.collect())
 
     def rows(self):
-        return self.collect().to_pylist()
+        """Its rows, as dicts (with no pyarrow here, as the node's JSON gives them)."""
+        r = self._con._frame_rows(self)
+        return r if isinstance(r, list) else r.to_pylist()
 
     def item(self):
         """The one value of a one-row, one-column answer."""
-        t = self.collect()
-        return t.column(0)[0].as_py()
+        r = self._con._frame_rows(self)
+        return next(iter(r[0].values())) if isinstance(r, list) else r.column(0)[0].as_py()
 
     def show(self, n=20):
-        print(self.limit(n).collect().to_pandas().to_string(index=False))
+        """Its first `n` rows, as a text table."""
+        print(self._con._frame_rows(self.limit(n), format="table"))
 
     def explain(self):
         """Pondra's plan for it, and whether it would spread over the nodes."""

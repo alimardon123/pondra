@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Pondra's packages, from a built binary: a Python wheel and npm packages for one platform.
+"""Pondra's packages, from a built binary: a Python wheel, npm packages and the binary alone (what
+the one-line installers, install.sh and install.ps1, download) for one platform.
 
   package.py --bin target/x86_64-unknown-linux-gnu/dist/pondra --platform linux-x64 --out dist/
   package.py --npm-main --out dist/        # the `pondra` npm package itself (once, any platform)
@@ -10,7 +11,7 @@ where `pondra.local()` finds it. The npm packages follow esbuild's pattern: `pon
 JavaScript client and depends, optionally, on `pondra-<platform>` packages that each hold one
 binary, so npm installs only the one that fits. No build tools beyond Python and npm.
 """
-import argparse, base64, hashlib, json, os, shutil, subprocess, sys, tempfile, zipfile
+import argparse, base64, hashlib, json, os, shutil, subprocess, sys, tarfile, tempfile, zipfile
 
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 # platform -> (wheel tags, npm os, npm cpu)
@@ -64,6 +65,27 @@ def wheel(binary, platform, out):
     return name
 
 
+def archive(binary, platform, out):
+    """The binary and its licenses, for install.sh (a .tar.gz) and install.ps1 (a .zip). No version
+    in the name: the latest release's URL (`releases/latest/download/…`) stays the same."""
+    exe = "pondra.exe" if platform.startswith("windows") else "pondra"
+    files = {exe: binary, **{n: os.path.join(ROOT, n) for n in LICENSES}}
+    if platform.startswith("windows"):
+        name = f"pondra-{platform}.zip"
+        with zipfile.ZipFile(os.path.join(out, name), "w", zipfile.ZIP_DEFLATED) as z:
+            for n, path in files.items():
+                z.write(path, n)
+        return name
+    name = f"pondra-{platform}.tar.gz"
+    with tarfile.open(os.path.join(out, name), "w:gz") as t:
+        for n, path in files.items():
+            info = t.gettarinfo(path, n)
+            info.mode, info.uid, info.gid, info.uname, info.gname = 0o755 if n == exe else 0o644, 0, 0, "", ""
+            with open(path, "rb") as f:
+                t.addfile(info, f)
+    return name
+
+
 def npm_pack(folder, out):
     npm = shutil.which("npm.cmd" if os.name == "nt" else "npm")  # (on Windows npm is npm.cmd, which a process started without a shell isn't looked up as)
     if not npm:
@@ -104,7 +126,7 @@ if __name__ == "__main__":
     ap.add_argument("--out", default="dist")
     A = ap.parse_args()
     os.makedirs(A.out, exist_ok=True)
-    made = [wheel(A.bin, A.platform, A.out), npm_platform(A.bin, A.platform, A.out)] if A.bin else []
+    made = [wheel(A.bin, A.platform, A.out), npm_platform(A.bin, A.platform, A.out), archive(A.bin, A.platform, A.out)] if A.bin else []
     made += [npm_main(A.out)] if A.npm_main else []
     print("\n".join(made))
     sys.exit(0 if made else 1)

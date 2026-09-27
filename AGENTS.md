@@ -27,7 +27,9 @@ The owner's design principles, which every change must respect:
 src/      17,500 lines of Rust, one file per concern (see the table in README.md)
 python/   the Python client (pure Python, HTTP + Arrow; `local()` starts a node): `client.py`, frames
           (`frame.py`, Polars' names), `spark/` (PySpark's names), `procedure.py` (runs a Python
-          procedure for a node), `magic.py` (`%%sql`)
+          procedure for a node), `magic.py` (`%%sql`), `__main__.py` (`python -m pondra`, and
+          `--add-to-path`); without pyarrow, rows come as JSON (ADR-024)
+install.sh, install.ps1   the one-line installers each release carries (ADR-024)
 js/       the JavaScript client and the `pondra` npm package's files
 examples/ quickstart.ipynb (pip install to an as-of join, in the owner's notebook style)
 tools/    harness.py, cluster.py (tests), open_check.py (Delta + Iceberg readers == Pondra),
@@ -50,8 +52,9 @@ tools/    harness.py, cluster.py (tests), open_check.py (Delta + Iceberg readers
           cloud/ (a cluster on several machines; cloud/actions/ + .github/workflows/: on GitHub runners),
           bench/tpch-queries/ (the 22 TPC-H queries),
           r2_test.sh (run the suite against a real bucket), bench/ (vs Spark and Flink),
-          package.py (wheels and npm packages from a binary), try_packages.sh (them installed and
-          tried, as CI does on each OS), npm_publish.sh (the release's npm publish; CI dry-runs it), anywhere_check.py (the shell, local(),
+          package.py (wheels, npm packages and the binary alone from a binary), try_packages.sh
+          (them installed and tried as CI does on each OS: pip without and with pyarrow, npm, the
+          installer; try_install.ps1 is Windows's), npm_publish.sh (the release's npm publish; CI dry-runs it), anywhere_check.py (the shell, local(),
           the packages, the notebook; old Linux in docker), bench/repeat.py (one query many times)
 docs/     ADRs and reports; lake-format.md is the on-disk layout
 ```
@@ -608,6 +611,14 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    sessions register them; `App::query_as` never spreads a query that has them; no result cache).
 88. **An answer with no rows keeps its columns** (`App::query_as`: one empty batch with the
    plan's schema): a frame learns its columns from `LIMIT 0` (`frames_check.py` fails without it).
+89. **`pip install pondra` alone answers queries** (ADR-024): without pyarrow, rows come as the
+   node's JSON with nulls put back as `None`; only tables (`collect()`, pandas, Polars) need it,
+   and say so. `try_packages.sh` runs `package_check.py` before installing pyarrow (0.22.0's
+   client fails it).
+90. **After any install, pondra runs with nothing set up** (ADR-024): `python -m pondra` finds the
+   binary wherever pip put it; the installers leave their folder on the user's PATH (and on
+   Windows on this terminal's). `try_packages.sh` checks `command -v pondra` in a clean shell,
+   and `Get-Command pondra` plus the user's `Path` on CI's Windows (both fail without the PATH step).
 
 ## Tests: run these before and after any change
 
@@ -739,7 +750,10 @@ uploaded from Linux only. `v0.22.0` (b70033e) made the GitHub release and put al
 on PyPI, then npm refused its first package: the newest npm (12) reads `dist/x.tgz` as the GitHub
 repository "dist/x.tgz" and won't fetch git. `tools/npm_publish.sh` passes `./dist/…`; the npm
 packages are published by starting `release.yml` by hand with publish ticked (the GitHub release
-is made only on a tag; PyPI skips what it has). Its history was rewritten once, before it went public, to
+is made only on a tag; PyPI skips what it has). The owner installed 0.22.0 from PyPI on Windows:
+it worked from Python, but `pondra` wasn't found (a user install: pip's folder isn't on PATH) and
+`pip install pondra` without pyarrow couldn't answer a query. 0.22.1 (ADR-024) fixes both, with
+one-line installers on every release; its tag publishes PyPI and npm together. Its history was rewritten once, before it went public, to
 put the owner's GitHub noreply address on the four commits that had their email; commit IDs from
 before then (in older bundles) differ. Each round the owner downloads the new bundle and, in
 their clone, runs `git pull <bundle> main` and `git push`; GitHub then builds it on Linux,
@@ -909,10 +923,11 @@ Known limits, in the order they matter:
     grants or quotas.
 11. **`VARIANT` is JSON text**, not a shredded variant; `ai_*` and Flight functions call out of
     the process, so their latency is the endpoint's.
-12. **Packages built, not yet published.** The owner is setting up PyPI and npm (MIT OR
-    Apache-2.0 since round 21); the macOS, Windows and ARM Linux builds exist only in the
-    release workflow, which hasn't run yet. Only `sum` over DOUBLE is order-independent (not `avg`,
-    `stddev`, …).
+12. **Packages:** 0.22.0 is on PyPI (all five platforms), npm waits for 0.22.1's tag. Only the
+    owner's Windows machine has run a published package outside CI; the installers have run only
+    on CI's machines; no winget or Homebrew package. The node's JSON leaves out nulls (the Python
+    client puts them back; the JavaScript client doesn't yet). Only `sum` over DOUBLE is
+    order-independent (not `avg`, `stddev`, …).
 13. **Frames and procedures** (round 22): a Python procedure starts a process per call (a warm
     pool would take the 0.15 s away) and doesn't run on a schedule yet; the JavaScript client has
     no frame builder; `pondra run models/` (a folder of `.sql` and `.py` models in order of what
@@ -925,8 +940,8 @@ Rounds 17–22 are done except what needs the owner (publishing, cluster-bench r
 1. **Round 23, use it from anything:** a console at `/`, live queries (`GET /live?sql=…`), dbt
    over the Postgres port and BI tools on Windows; procedures on a schedule; `pondra run
    models/`.
-2. **Publish:** once the owner's PyPI pending publisher and npm token are in place, start
-   `release.yml` by hand (publish unticked) to try all five platforms, then tag `v0.22.0`.
+2. **Publish 0.22.1:** tag `v0.22.1` (PyPI, npm, the installers); then set npm's trusted
+   publisher on the six packages and delete the `NPM_TOKEN` secret.
 3. **Security before anyone else's data:** TLS on the node port and mutual TLS between nodes, then
    grants (roadmap E3).
 4. **Then:** machines in one data centre for the cluster bench, the in-process library, the

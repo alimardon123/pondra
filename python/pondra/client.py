@@ -1,6 +1,7 @@
 """The client: a node over HTTP (`connect`), or one started here (`local`). Queries become frames
 (`frame.py`); writes, scripts and procedures run at once."""
 import atexit
+import importlib.util
 import inspect
 import io
 import itertools
@@ -27,14 +28,40 @@ _names = itertools.count(1)
 _last = None  # the newest connection (what `%%sql` cells use)
 
 
-class Result:
-    """Rows a statement returned at once (a script's last query, a procedure's answer), as Arrow IPC."""
+def _has_arrow():
+    """Whether pyarrow is here. Without it, rows come as the node's JSON (dates and times as text)
+    and `rows()`, `item()`, `show()` still work; tables (`collect()`, `to_pandas()`…) need it."""
+    return importlib.util.find_spec("pyarrow") is not None
 
-    def __init__(self, ipc: bytes):
-        self.ipc = ipc
+
+def _pyarrow(what):
+    try:
+        import pyarrow
+        return pyarrow
+    except ImportError:
+        raise ImportError(f"{what} needs pyarrow: pip install pyarrow (rows() works without it)") from None
+
+
+def _json_rows(out):
+    """The node's JSON rows (it leaves out nulls: they come back as None)."""
+    rows = json.loads(out)
+    if not isinstance(rows, list):
+        return []  # (an outcome, not rows)
+    keys = list(dict.fromkeys(k for r in rows for k in r))
+    return [{k: r.get(k) for k in keys} for r in rows]
+
+
+class Result:
+    """Rows a statement returned at once (a script's last query, a procedure's answer): Arrow IPC,
+    or JSON rows where pyarrow isn't installed."""
+
+    def __init__(self, ipc: bytes = b"", rows=None):
+        self.ipc, self._rows = ipc, rows
 
     def to_arrow(self):
-        import pyarrow as pa
+        pa = _pyarrow("to_arrow()")
+        if self._rows is not None:
+            return pa.Table.from_pylist(self._rows)
         return pa.ipc.open_stream(self.ipc).read_all() if self.ipc else pa.table({})
 
     collect = to_arrow
@@ -47,10 +74,10 @@ class Result:
         return pl.from_arrow(self.to_arrow())
 
     def rows(self):
-        return self.to_arrow().to_pylist()
+        return self._rows if self._rows is not None else self.to_arrow().to_pylist()
 
     def __repr__(self):
-        return repr(self.to_arrow())
+        return repr(self._rows) if self._rows is not None else repr(self.to_arrow())
 
 
 class Pondra:
@@ -78,11 +105,12 @@ class Pondra:
             raise RuntimeError(f"{e.code}: {e.read().decode(errors='replace')}") from None
         return r if stream else r.read()
 
-    def _post(self, sql, params=None, sent=None, job=None, views=None):
+    def _post(self, sql, params=None, sent=None, job=None, views=None, format=None):
         """Send statements: as they are; with `$name` parameters and frames by name (`views`: JSON);
         or with tables of our own too (`application/vnd.pondra.request`: the JSON's length, the
         JSON, then each table's length and Arrow IPC)."""
-        path = "/sql?format=arrow" + (f"&job={urllib.parse.quote(job)}" if job else "")
+        format = format or ("arrow" if _has_arrow() else "json")
+        path = f"/sql?format={format}" + (f"&job={urllib.parse.quote(job)}" if job else "")
         if not params and not sent and not views:
             return self._call("POST", path, sql.encode())
         head = {"sql": sql, "params": {k: _param(v) for k, v in (params or {}).items()}, "views": views or {}, "tables": list(sent or {})}
@@ -100,7 +128,9 @@ class Pondra:
         if job is None and self._job:
             job = f"{self._job}:{next(self._jobs)}"  # (a procedure's writes: its caller's job, each its own)
         out = self._post(sql, params, sent, job, views)
-        return json.loads(out) if out[:1] == b"{" else Result(out)
+        if out[:1] == b"{":
+            return json.loads(out)
+        return Result(rows=_json_rows(out)) if out[:1] == b"[" else Result(out)
 
     # ------------------------------------------------------------ SQL and frames
 
@@ -152,13 +182,19 @@ class Pondra:
         text = open(file, encoding="utf-8").read() if str(file).endswith(".sql") and os.path.exists(file) else str(file)
         return self._run(text, params, None, job)
 
-    def _frame_rows(self, frame):
-        """A frame's rows. A name the lake doesn't have is looked for among this connection's
-        temporary views and the Python names where the frame's SQL was written (DuckDB's rule)."""
-        import pyarrow as pa
+    def _frame_rows(self, frame, format=None):
+        """A frame's rows: a pyarrow Table, or (no pyarrow here) a list of dicts, or the text table
+        `format="table"` asks for. A name the lake doesn't have is looked for among this
+        connection's temporary views and the Python names where the frame's SQL was written
+        (DuckDB's rule)."""
         for _ in range(32):
             try:
-                out = self._post(frame.sql, frame._params, frame._sent)
+                out = self._post(frame.sql, frame._params, frame._sent, format=format)
+                if format == "table":
+                    return out.decode()
+                if out[:1] == b"[" or not _has_arrow():
+                    return _json_rows(out)
+                import pyarrow as pa
                 return pa.ipc.open_stream(out).read_all() if out[:1] != b"{" else pa.table({})
             except RuntimeError as e:
                 name = _missing(e)

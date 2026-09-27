@@ -61,6 +61,21 @@ Start more copies on the same bucket to scale out. The only state is object stor
    test. Each new
    rule was checked to fail without it (invariants 81, 83, 84, 86, 88).
 
+**Published, then 0.22.1: nothing to set up** (ADR-024). 0.22.0 went to PyPI for all five
+platforms (npm refused the release's paths; fixed). The owner installed it on Windows, where
+`pondra` wasn't found: a user install puts it in a folder that isn't on PATH, and pip can't
+change PATH. And `pip install pondra` without pyarrow couldn't answer a query. 0.22.1 adds:
+
+- one-line installers on every release (`irm …/install.ps1 | iex`, `curl …/install.sh | sh`), which
+  put the binary in the user's own folder and that folder on PATH (on Windows, this terminal's
+  too);
+- `python -m pondra`, which works wherever pip put the binary, and `--add-to-path` for the short
+  name;
+- rows as JSON when pyarrow isn't installed.
+
+`tools/try_packages.sh` tries all of it on Linux, Windows and macOS on every push (invariants 89
+and 90, each checked to fail without its fix).
+
 **Round 21 shaped tables further and took on more of Flink** (ADR-022):
 
 1. **Columns that change without a file rewritten.** `RENAME COLUMN`, `DROP COLUMN`, a dropped

@@ -1,7 +1,8 @@
 name: release
 
 # A tag vX.Y.Z (or a run started by hand): the binary for every platform, packaged for pip and
-# npm (`tools/package.py`), each package tried on its platform, then attached to a GitHub release
+# npm and alone for the one-line installers (`tools/package.py`), each tried on its platform
+# (`tools/try_packages.sh`), then attached to a GitHub release with install.sh and install.ps1
 # and published to PyPI and npm. Publishing needs, once: PyPI's "trusted publishing" (a pending
 # publisher for this workflow: no token); for npm, an NPM_TOKEN secret for the first release (npm
 # trusts a workflow only for packages that exist), then each package's "Trusted Publisher" set to
@@ -70,6 +71,7 @@ jobs:
           path: |
             dist/*.whl
             dist/pondra-${{ matrix.platform }}-*.tgz
+            dist/pondra-${{ matrix.platform }}.*
       - uses: actions/upload-artifact@v6 # (`pondra` itself, the same from every platform: published from one)
         if: matrix.platform == 'linux-x64'
         with:
@@ -94,11 +96,16 @@ jobs:
         with:
           node-version: 22
           registry-url: https://registry.npmjs.org
-      - name: GitHub release
+      - name: GitHub release (with the installers, and how to install at the top)
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/*
+          body_path: .github/release.md
+          generate_release_notes: true
+          files: |
+            dist/*
+            install.sh
+            install.ps1
       - run: mkdir pypi && mv dist/*.whl pypi/
       - name: PyPI
         uses: pypa/gh-action-pypi-publish@release/v1

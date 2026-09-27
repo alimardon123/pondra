@@ -1,0 +1,21 @@
+
+pondra 0.22.0 (no pyarrow)
++---+---+
+| v | n |
++---+---+
+| a | 2 |
+| b | 1 |
++---+---+
+ok: [{'v': 'a', 'n': 2}, {'v': 'b', 'n': 1}]
+
+pondra 0.22.0 (with pyarrow)
+ok: [{'v': 'a', 'n': 2}, {'v': 'b', 'n': 1}]
+
+added 2 packages, and audited 3 packages in 5s
+
+found 0 vulnerabilities
+ok: [{"v":"a","n":2},{"v":"b","n":1}]
+Added /tmp/tmp.r1ezbHVnVz/installed to your PATH in /tmp/tmp.r1ezbHVnVz/.bashrc: open a new terminal, or run: export PATH="/tmp/tmp.r1ezbHVnVz/installed:$PATH"
+pondra 0.22.0
+Installed: try `pondra` (a SQL shell on ./lake)
+packages and installer ok
