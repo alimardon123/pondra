@@ -16,8 +16,10 @@ only when started by hand, and deletes its lake when it's done.
 
 ## Running it
 
-Actions → cluster-bench → Run workflow. Inputs: `nodes` (3), `sf` (10), `binary` (`build`
-compiles this repo's source; `r2` takes `bench-bin/pondra` from the bucket) and `runner`.
+Actions → cluster-bench → Run workflow. Inputs: `nodes` (3), `sf` (10), `binary` (`ci`, the
+default, takes the Linux binary the build workflow made and tested for the chosen branch's
+commit, the one a release ships, so nothing compiles; `build` compiles this repo's source; `r2`
+takes `bench-bin/pondra` from the bucket) and `runner`.
 
 It runs a `binary` job, one `node` job per node, and a `driver` job that generates the data with
 `tpchgen-cli`, loads it with `pondra sql` and runs `tools/cloud/actions/driver.py`. The results go

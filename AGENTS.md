@@ -698,10 +698,14 @@ python3 tools/serve_bench.py --keys 2000000   # serving: point lookups and dashb
 ```
 
 The Python tools need `pip install -r tools/requirements.txt` (Python 3.11; the versions the
-suite last passed with). `.github/workflows/build.yml` runs `harness.py all` and a failover on
-every push with them, and on Linux, Windows and macOS makes the pip and npm packages and tries
-them (`tools/try_packages.sh`), so packaging that breaks on one OS shows on a push, not on a tag;
-on Linux it also dry-runs the release's npm publish (`tools/npm_publish.sh --dry-run`, newest npm).
+suite last passed with). `.github/workflows/build.yml` builds on every push what a release ships:
+the dist profile for all five platforms (Linux with zig, for glibc 2.17), each tried there
+(`smoke.py`), packaged and its packages tried (`tools/try_packages.sh`; the Linux wheel on CentOS
+7 and Ubuntu 22.04 too); the Linux job then runs `harness.py all`, `frames_check.py` and a
+failover on its own binary, and dry-runs the release's npm publish (`tools/npm_publish.sh
+--dry-run`, newest npm). A tag's `release.yml` builds nothing: it waits for that commit's build
+run, refuses one that failed or a tag that isn't Cargo.toml's version, and publishes the run's
+packages (a minute or two). `cluster-bench.yml`'s default binary (`ci`) is that run's too.
 
 Add `--s3` to any of them with a simulated-R2 bucket to see the object-storage behaviour:
 
@@ -777,7 +781,10 @@ npm refused the release's first publish (a token needing a two-factor code; npm 
 package's first version through trusted publishing), so the owner published 0.22.0's six npm
 packages by hand (`npm.cmd`: PowerShell's scripts are off there) and set each one's trusted
 publisher (`release.yml`, environment `pypi`, "Allow npm publish"); from 0.22.1 on, the tag
-publishes PyPI and npm with no token. Its history was rewritten once, before it went public, to
+publishes PyPI and npm with no token. 0.22.1 (the tag at 3c59e6a) is on PyPI and npm with its
+installers on the release; from the sandbox, the Linux one-liner put `pondra` on PATH in a clean
+shell and the PyPI wheel answered `FROM t` without pyarrow (`logs/round22/0.22.1-published.txt`).
+From 0.22.2 on, a tag publishes what the build workflow made and tested. Its history was rewritten once, before it went public, to
 put the owner's GitHub noreply address on the four commits that had their email; commit IDs from
 before then (in older bundles) differ. Each round the owner downloads the new bundle and, in
 their clone, runs `git pull <bundle> main` and `git push`; GitHub then builds it on Linux,
@@ -960,9 +967,9 @@ Known limits, in the order they matter:
     grants or quotas.
 11. **`VARIANT` is JSON text**, not a shredded variant; `ai_*` and Flight functions call out of
     the process, so their latency is the endpoint's.
-12. **Packages:** 0.22.0 is on PyPI and npm (all five platforms; npm's by hand, once). Only the
-    owner's Windows machine has run a published package outside CI; the installers have run only
-    on CI's machines; no winget or Homebrew package. The node's JSON leaves out nulls (the Python
+12. **Packages:** 0.22.1 is on PyPI and npm (all five platforms). Outside CI, only the owner's
+    Windows machine (0.22.0 from PyPI) and the sandbox's Linux (0.22.1: the installer, the wheel)
+    have run a published package; no winget or Homebrew package. The node's JSON leaves out nulls (the Python
     client puts them back; the JavaScript client doesn't yet). Only `sum` over DOUBLE is
     order-independent (not `avg`, `stddev`, …).
 13. **Frames and procedures** (round 22): a Python procedure starts a process per call (a warm
@@ -979,8 +986,8 @@ Rounds 17–22 are done except what needs the owner (publishing, cluster-bench r
    models/`; `UPDATE`/`DELETE`/`MERGE` on an attached lake from any node (sent to its leader, or
    led for a moment, as an `INSERT` is); temporary tables (a `TEMP` table is refused or made
    per session, not silently kept, as it is now).
-2. **Publish 0.22.1:** tag `v0.22.1` (PyPI, npm, the installers); then set npm's trusted
-   publisher on the six packages and delete the `NPM_TOKEN` secret.
+2. **Publish 0.22.2** (the fix of invariant 93): tag `v0.22.2` once its build run is green;
+   the release publishes that run's packages.
 3. **Security before anyone else's data:** TLS on the node port and mutual TLS between nodes, then
    grants (roadmap E3).
 4. **Then:** machines in one data centre for the cluster bench, the in-process library, the

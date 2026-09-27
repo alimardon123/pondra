@@ -1,0 +1,15 @@
+# 0.22.1 as published (tag v0.22.1 at 3c59e6a), tried from the sandbox (Linux x86-64), 2026-09-28
+$ pip index versions pondra            -> Available versions: 0.22.1, 0.22.0
+$ npm view pondra versions             -> [ '0.22.0', '0.22.1' ];  npm view pondra-linux-x64 version -> 0.22.1
+$ curl -fsSL https://github.com/alimardon123/pondra/releases/latest/download/install.sh | HOME=$T SHELL=/bin/bash sh
+Added $T/.local/bin to your PATH in $T/.bashrc: open a new terminal, or run: export PATH="$T/.local/bin:$PATH"
+pondra 0.22.1
+Installed: try `pondra` (a SQL shell on ./lake)
+$ env -i HOME=$T PATH=/usr/bin:/bin bash -c ". $T/.bashrc; command -v pondra; pondra --version"
+$T/.local/bin/pondra
+pondra 0.22.1
+$ python3 -m venv $T/venv && $T/venv/bin/pip install pondra==0.22.1     (no pyarrow)
+$ $T/venv/bin/python -m pondra --version
+pondra 0.22.1
+$ $T/venv/bin/python -c 'with pondra.local(lake) as db: CREATE TABLE t; INSERT (1,'a'), (2,NULL); db.sql("FROM t ORDER BY id").rows()'
+[{'id': 1, 'v': 'a'}, {'id': 2, 'v': None}]

@@ -13,8 +13,8 @@ on:
         description: "TPC-H scale factor (runners have 14 GB of disk: 10 fits, 100 doesn't)"
         default: "10"
       binary:
-        description: "build (from this repo's source) or r2 (bench-bin/pondra in the bucket)"
-        default: "build"
+        description: "ci (the build workflow's, for this commit), build (from this repo's source) or r2 (bench-bin/pondra in the bucket)"
+        default: "ci"
       runner:
         description: "Runner label for the nodes"
         default: "ubuntu-24.04"
@@ -33,9 +33,20 @@ env:
 jobs:
   binary:
     runs-on: ubuntu-24.04
+    permissions:
+      actions: read # (the build workflow's runs)
+      contents: read
     steps:
       - uses: actions/checkout@v5
-      - name: Build from source
+      - name: The build workflow's, for this commit (what a release publishes)
+        if: inputs.binary == 'ci'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          run=$(gh run list --workflow build.yml --commit "$GITHUB_SHA" --status success --limit 1 --json databaseId --jq '.[0].databaseId')
+          [ -n "$run" ] || { echo "::error::no passing build run for $GITHUB_SHA: wait for it, or use binary: build"; exit 1; }
+          gh run download "$run" --name pondra-linux-x64 --dir dl && tar -xzf dl/pondra-linux-x64.tar.gz pondra
+      - name: Or build from source
         if: inputs.binary == 'build'
         run: cargo build --profile dist && cp target/dist/pondra pondra
       - name: Or take the one in the bucket

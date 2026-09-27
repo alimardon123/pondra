@@ -1,0 +1,122 @@
+# CI's new Linux job, run here: the suite on the glibc 2.17 dist binary (cargo zigbuild --profile dist), 0.22.2, 2026-09-28
+# (objdump: newest glibc symbol GLIBC_2.17; stripped size 98,684,792 bytes)
+## harness.py all
+{
+ "upsert": "12,000 random upserts/deletes with compactions and a restart match the model exactly (413 live keys)",
+ "deal": "a keyed table's and a view's first tiering round, dealt to three nodes: markers and changes kept",
+ "tiering": "12 rounds of writes and tiering: log drained, files bounded ({'events': 5, 'kv': 5, 'totals': 5}), every row exact",
+ "fence": "a frozen leader is replaced; when it wakes, its write is rejected (fenced) and it rejoins as a follower; nothing lost",
+ "insert": "bulk INSERT \u2026 SELECT writes Parquet directly; a retried job id is applied once",
+ "serverless": "INSERT from a process with no server: 0.03s alone, 4 at once, retries once; a node on the idle lake leads in 0.02s; via a running leader 0.03s; after the leader is killed 30.14s; 8000 rows, no duplicates",
+ "clients": "SQL writes, Python client, Postgres (4 drivers), tokens, change-feed replay, attached lake, inbox (1.0s), vector search, MCP, no file access from SQL: all 18 checks pass",
+ "kafka": "Kafka: librdkafka (5 codecs, idempotent) and kafka-python producers, exactly-once retries, Debezium, tombstones, raw values as JSON, consumers, consumer groups, SASL tokens: all 10 checks pass",
+ "alter": "ALTER TABLE ADD COLUMN under load (63,400 rows written meanwhile): old rows null, new ones set, keyed table, view, bulk and Arrow appends, 6 outside readers: all 8 checks pass",
+ "windows": "event-time windows: closed by the data's own time, each emitted once, final; rows out of order within the lateness count; late rows update the view only; a leader restart emits nothing twice",
+ "sessions": "session windows: each closed by event time, emitted once, whole; out-of-order rows within the lateness join their session; late rows inside an emitted session are left out; a leader restart emits nothing twice",
+ "asof": "point-in-time joins: each streamed trade priced as of its own time, late ones too; ad hoc queries agree; non-as-of conditions refused",
+ "sums": "sum(DOUBLE): the true sum rounded once in any order (== math.fsum), grouped, windowed, on every node; NULLs, overflow, sliding windows and other types as before",
+ "schemas": "schemas: lake.schema.table, attached lakes as catalogs, CREATE/DROP SCHEMA, DROP TABLE, CTAS, stored and materialized views in SQL from any node, spread over views, clients list schemas: all 16 checks pass",
+ "changes": "changes: 60 random changes on 3 nodes == the model, rows keep their ids, views and the change feed follow, Delta sees them purged, spread == one node: all 11 checks pass",
+ "guard": "guard: 3 queries stay on one node over a slow network and spread over a fast one, forced ones spread, the same answers: all 6 checks pass",
+ "files": {
+  "passed": true,
+  "checks": {
+   "all rows": true,
+   "a Parquet file per tiering round (every 10 s), not per INSERT": true,
+   "about one object write per INSERT (\u2264 1.2, and \u2264 2 a second meanwhile)": true,
+   "write-ahead log objects left (\u2264 30)": true,
+   "a pondra sql INSERT's files recorded as written": true
+  },
+  "secs": 0.5,
+  "parquet_files_made": 0,
+  "writes_per_insert": 1.0,
+  "wal_objects_left": 2,
+  "cli_insert": {
+   "files": 3,
+   "files_seen": 3
+  }
+ },
+ "layouts": {
+  "passed": true,
+  "checks": {
+   "every round as the model": true,
+   "files: one day each, sorted by user": true,
+   "lookup of a moved row": true,
+   "delta-rs sees what Pondra sees": true
+  },
+  "rounds": 10,
+  "rows": 309,
+  "delta_rows": 309,
+  "pondra": {
+   "n": 309,
+   "s": 314895
+  }
+ },
+ "clusters": {
+  "passed": true,
+  "checks": {
+   "all rows": true,
+   "row groups narrow in a and in b (each < 0.75 of the whole)": true
+  },
+  "row_group_span": {
+   "app": {
+    "a": 0.42,
+    "b": 0.46
+   },
+   "kv": {
+    "a": 0.42,
+    "b": 0.46
+   }
+  },
+  "rows": {
+   "app": 2000000,
+   "kv": 2000000
+  }
+ },
+ "copies": {
+  "passed": true,
+  "checks": {
+   "COPY FROM STDIN, text and CSV": true,
+   "COPY TO STDOUT, text": true,
+   "COPY TO STDOUT, binary": true,
+   "COPY TO STDOUT, csv": true,
+   "ADBC Postgres driver (Arrow)": true,
+   "DECIMAL as NUMERIC, text and binary": true
+  }
+ },
+ "streams": {
+  "passed": true,
+  "checks": {
+   "stream join: each pair once, whichever side came first": true,
+   "sliding windows: every window, every click it covers": true
+  },
+  "pairs": 203,
+  "windows": 52
+ },
+ "columns": "RENAME/DROP/ADD again/widen under streaming (107,970 rows), 3 nodes, bulk INSERT, UPDATE, a keyed table, 5 outside readers: all 12 checks pass",
+ "fills": "views filled from existing rows while 181,042 rows streamed in, made again, and through a leader restart: all 12 checks pass",
+ "dedup": "deduplication by event time: 2,400 rows out of order over 191 keys, a delete and late rows, compaction, Delta: all 8 checks pass",
+ "procedures": "macros, procedures (SQL and Python) and scripts on three nodes: all 29 checks pass",
+ "scale": "scale: 23,100 rows over 139 daily partitions, 207 files (143 sealed), every file one day, a day's query reads 2 files, 3 nodes, 29 of 29 queries spread, 16 shuffled, 8 by key ranges (all equal to one node), 6 outside readers, a 50 MB memory limit: all 12 checks pass",
+ "flight": "Arrow Flight: pyarrow DoPut exactly-once (retried stream applied once, via a follower too), DoGet SQL, FlightInfo, ListFlights, the log as a columnar stream (a subscriber has each new commit in 6 ms), tokens and handshake; ADBC queries, writes, ingest and catalog: all 13 checks pass",
+ "reader": "freshness on a separate read-only node: p50 7 ms, p99 93 ms",
+ "crash": "5/5 runs, 0 lost, 0 duplicated (events, streaming-task output, views); crashes survived: {'after_seg_put': 0, 'after_commit': 1, 'after_parquet_put': 18, 'kill -9': 8}",
+ "load": {
+  "events_per_s": 1200,
+  "ack_ms_p50": 251,
+  "ack_ms_p99": 254,
+  "freshness_ms_p50": 144,
+  "freshness_ms_p99": 260,
+  "freshness_samples": 51,
+  "commits_per_s": 4.0,
+  "commit_ms_p50": 2,
+  "commit_ms_p95": 3,
+  "server_cores_used": 0.07
+ }
+}
+exit 0
+## frames_check.py
+{"pipelines_equal": 26, "pipelines": 26, "ways_equal": 11, "ways": 11, "ok": true}
+exit 0
+## cluster.py failover --secs 30
+3 nodes, 6 shards, 8 producers, 1,141,300 events, 1 follower + 2 leader kills; failovers 4.7 s, 5.1 s; exactly once: True; task state == model: True, inline view == model: True

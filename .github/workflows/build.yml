@@ -1,5 +1,12 @@
 name: build
 
+# Every push to main: Pondra built as it is released (the dist profile; Linux against glibc 2.17,
+# with zig, so it runs on any Linux from 2014 on) for all five platforms, tried there (smoke.py),
+# packaged for pip and npm and alone for the one-line installers (tools/package.py), and the
+# packages installed and tried as users get them (tools/try_packages.sh). The Linux job then runs
+# the suite on its binary, while the others finish (the slowest, macOS Intel, doesn't hold it up).
+# A tag's release (release.yml) publishes this run's packages: nothing is built twice, and what
+# the suite tested is what ships.
 on:
   push:
     branches: [main]
@@ -11,61 +18,73 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-            name: pondra-linux-x86_64
-            platform: linux-x64
-            bin: target/release/pondra
-          - os: windows-latest
-            name: pondra-windows-x86_64.exe
-            platform: windows-x64
-            bin: target/release/pondra.exe
-          - os: macos-latest
-            name: pondra-macos-arm64
-            platform: macos-arm64
-            bin: target/release/pondra
+          - { platform: linux-x64, os: ubuntu-latest, target: x86_64-unknown-linux-gnu, zig: x86_64-unknown-linux-gnu.2.17 }
+          - { platform: linux-arm64, os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, zig: aarch64-unknown-linux-gnu.2.17 }
+          - { platform: macos-x64, os: macos-15-intel, target: x86_64-apple-darwin } # (macos-13 was retired; Intel images last until 2027)
+          - { platform: macos-arm64, os: macos-latest, target: aarch64-apple-darwin }
+          - { platform: windows-x64, os: windows-latest, target: x86_64-pc-windows-msvc, exe: .exe }
     runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash # (Git Bash on Windows)
+    env:
+      BIN: target/${{ matrix.target }}/dist/pondra${{ matrix.exe }}
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release
       - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
-      - run: python tools/smoke.py ${{ matrix.bin }} # (on this OS: the shell, SQL, and memory read without /proc)
       - uses: actions/setup-node@v5
         with:
           node-version: 22
-      # The pip and npm packages made from this binary, installed and tried as on a release: packaging
-      # that breaks on an OS (npm is npm.cmd on Windows) shows here, on a push, not on a release's tag.
-      - run: python tools/package.py --bin ${{ matrix.bin }} --platform ${{ matrix.platform }} --npm-main --out dist && bash tools/try_packages.sh ${{ matrix.platform }}
-        shell: bash
+      - name: Build
+        run: |
+          if [ -n "${{ matrix.zig }}" ]; then
+            pip install ziglang cargo-zigbuild
+            cargo zigbuild --profile dist --target ${{ matrix.zig }}
+          else
+            cargo build --profile dist --target ${{ matrix.target }}
+          fi
+      - run: python tools/smoke.py "$BIN" # (on this OS: the shell, SQL, and memory read without /proc)
+      # The pip and npm packages and the installers' archive, installed and tried as on a user's
+      # machine: packaging that breaks on an OS (npm is npm.cmd on Windows) shows on a push.
+      - run: python tools/package.py --bin "$BIN" --platform ${{ matrix.platform }} --npm-main --out dist && bash tools/try_packages.sh ${{ matrix.platform }}
+      - name: The Linux wheel on glibc 2.17 (CentOS 7) and on Ubuntu 22.04
+        if: matrix.platform == 'linux-x64'
+        run: |
+          docker run --rm -v "$PWD":/w -w /w quay.io/pypa/manylinux2014_x86_64 bash -c \
+            "/opt/python/cp311-cp311/bin/python -m pip install -q --only-binary=:all: dist/*.whl 'pyarrow<19' && /opt/python/cp311-cp311/bin/python tools/package_check.py"
+          docker run --rm -v "$PWD":/w -w /w ubuntu:22.04 bash -c \
+            "apt-get update -qq && apt-get install -y -qq python3-pip > /dev/null && pip install -q dist/*.whl pyarrow && python3 tools/package_check.py"
       - name: The release's npm publish, tried (--dry-run, with the npm the release uses)
         if: matrix.platform == 'linux-x64'
         run: npm install -g npm@latest && bash tools/npm_publish.sh --dry-run
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v6 # (what release.yml publishes, and cluster-bench.yml can run)
         with:
-          name: ${{ matrix.name }}
-          path: ${{ matrix.bin }}
+          name: pondra-${{ matrix.platform }}
+          path: |
+            dist/*.whl
+            dist/pondra-${{ matrix.platform }}-*.tgz
+            dist/pondra-${{ matrix.platform }}.*
+      - uses: actions/upload-artifact@v6 # (`pondra` itself, the same from every platform: published from one)
+        if: matrix.platform == 'linux-x64'
+        with:
+          name: pondra-npm
+          path: dist/pondra-[0-9]*.tgz
 
-  test:
-    needs: build # (the Linux binary the build job made: no second compile)
-    runs-on: ubuntu-latest
-    env:
-      PONDRA_BIN: ${{ github.workspace }}/bin/pondra
-    steps:
-      - uses: actions/checkout@v5
-      - uses: actions/download-artifact@v7
-        with:
-          name: pondra-linux-x86_64
-          path: bin
-      - run: chmod +x bin/pondra
-      - uses: actions/setup-python@v6
-        with:
-          python-version: "3.11"
-      - run: pip install -r tools/requirements.txt
-      # The quick correctness suite (upserts, split brain, crashes, clients, Kafka, windows,
-      # sums, schemas, scale, Flight…), then a cluster losing its leader twice.
-      - run: python3 tools/harness.py all
-      - run: python3 tools/frames_check.py  # (frames == Polars; SQL and Python mixed; procedures from Python)
-      - run: python3 tools/cluster.py failover --secs 30
+      # The suite, on this very binary (Linux): the quick correctness suite (upserts, split brain,
+      # crashes, clients, Kafka, windows, sums, schemas, scale, Flight…), frames against Polars,
+      # then a cluster losing its leader twice.
+      - name: The suite
+        if: matrix.platform == 'linux-x64'
+        env:
+          PONDRA_BIN: ${{ github.workspace }}/${{ env.BIN }}
+        run: |
+          pip install -r tools/requirements.txt
+          python3 tools/harness.py all
+          python3 tools/frames_check.py
+          python3 tools/cluster.py failover --secs 30

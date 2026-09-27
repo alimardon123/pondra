@@ -54,8 +54,9 @@ decisions in "What only you can decide" are yours · **Builds on:** ADR-002 to A
 Still waiting:
 
 - **C1 in one data centre:** machines under a millisecond apart, where spreading should pay.
-- **Publishing:** 0.22.0 is on PyPI and npm; `v0.22.1` (ADR-024: one-line installers, `python -m
-  pondra`, rows without pyarrow) is tagged; `v0.22.2` adds the fix below.
+- **Publishing:** 0.22.1 (ADR-024: one-line installers, `python -m pondra`, rows without
+  pyarrow) is on PyPI and npm; `v0.22.2` adds the fix below, and is the first release that
+  publishes the build workflow's packages instead of building again.
 
 0.22.2 fixes a bug found while testing 0.22.1: on a cluster, a keyed table's first tiering round
 could bring deleted keys back, and an adding-up view could lose part of an UPDATE (every job of

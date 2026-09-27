@@ -171,6 +171,16 @@ dry-runs it on every push with the npm the release uses (a dry run needs no logi
 for a version npm already has, so it keeps trying the command). The npm packages of 0.22.0 are
 published by starting the release by hand with publish ticked.
 
+**Build once (0.22.2, the owner's ask: a release took 30 minutes and compiled everything
+again).** The build workflow now makes on every push what a release ships: the dist profile for
+all five platforms (Linux with zig, for glibc 2.17), each tried there, packaged, and its packages
+tried, the Linux wheel on CentOS 7 and Ubuntu 22.04 too; the Linux job then runs the suite on its
+own binary, so what the tests passed is what ships. `release.yml` builds nothing: on a tag it
+waits for that commit's build run (`gh run watch`), stops if it failed or if the tag isn't
+Cargo.toml's version, downloads the run's packages and publishes them — a minute or two. The
+cost moves to every push (macOS Intel's leg is the slowest; the suite doesn't wait for it), and a
+flaky test now holds a release until its job is re-run.
+
 ## What it measures
 
 One 2-vCPU box (`logs/round17/`).

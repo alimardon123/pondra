@@ -1,13 +1,16 @@
 name: release
 
-# A tag vX.Y.Z (or a run started by hand): the binary for every platform, packaged for pip and
-# npm and alone for the one-line installers (`tools/package.py`), each tried on its platform
-# (`tools/try_packages.sh`), then attached to a GitHub release with install.sh and install.ps1
-# and published to PyPI and npm. Publishing needs, once: PyPI's "trusted publishing" (a pending
-# publisher for this workflow: no token); for npm, an NPM_TOKEN secret for the first release (npm
-# trusts a workflow only for packages that exist), then each package's "Trusted Publisher" set to
-# this workflow and the secret removed (npm then takes this workflow's OIDC token). A run started by hand publishes nothing
-# unless `publish` is ticked. Pondra is MIT OR Apache-2.0: the packages carry both licenses.
+# A tag vX.Y.Z (or a run started by hand): publishes what the build workflow made and tested for
+# that very commit (build.yml: the five platforms' wheels, npm packages and installer archives,
+# each tried on its platform, and the suite run on the Linux binary) to a GitHub release with
+# install.sh and install.ps1, to PyPI and to npm. Nothing is built here, so a release takes a
+# minute or two: tag a commit once its build is green. A build still running is waited for; one
+# that failed stops the release (re-run its failed jobs, then this).
+#
+# Publishing needs no token: PyPI and npm both trust this workflow ("trusted publishing", with
+# the environment `pypi`). A run started by hand checks that the build's packages are all there
+# and publishes nothing unless `publish` is ticked (then PyPI and npm, not a GitHub release).
+# Pondra is MIT OR Apache-2.0: the packages carry both licenses.
 on:
   push:
     tags: ["v*"]
@@ -19,79 +22,41 @@ on:
         default: false
 
 jobs:
-  build:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # Linux: built against glibc 2.17 (zig), so it runs on any Linux from 2014 on.
-          - { platform: linux-x64, os: ubuntu-latest, target: x86_64-unknown-linux-gnu, zig: x86_64-unknown-linux-gnu.2.17 }
-          - { platform: linux-arm64, os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, zig: aarch64-unknown-linux-gnu.2.17 }
-          - { platform: macos-x64, os: macos-15-intel, target: x86_64-apple-darwin } # (macos-13 was retired; Intel images last until 2027)
-          - { platform: macos-arm64, os: macos-latest, target: aarch64-apple-darwin }
-          - { platform: windows-x64, os: windows-latest, target: x86_64-pc-windows-msvc, exe: .exe }
-    runs-on: ${{ matrix.os }}
-    defaults:
-      run:
-        shell: bash
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-python@v6
-        with:
-          python-version: "3.12"
-      - uses: actions/setup-node@v5
-        with:
-          node-version: 22
-      - name: Build
-        run: |
-          if [ -n "${{ matrix.zig }}" ]; then
-            pip install ziglang cargo-zigbuild
-            cargo zigbuild --profile dist --target ${{ matrix.zig }}
-          else
-            cargo build --profile dist --target ${{ matrix.target }}
-          fi
-      - name: Package
-        run: python tools/package.py --bin target/${{ matrix.target }}/dist/pondra${{ matrix.exe }} --platform ${{ matrix.platform }} --npm-main --out dist
-      - name: Try the wheel and the npm packages here
-        run: bash tools/try_packages.sh ${{ matrix.platform }}
-      - name: Try the Linux wheel on glibc 2.17 (CentOS 7) and on Ubuntu 22.04
-        if: matrix.platform == 'linux-x64'
-        run: |
-          docker run --rm -v "$PWD":/w -w /w quay.io/pypa/manylinux2014_x86_64 bash -c \
-            "/opt/python/cp311-cp311/bin/python -m pip install -q --only-binary=:all: dist/*.whl 'pyarrow<19' && /opt/python/cp311-cp311/bin/python tools/package_check.py"
-          docker run --rm -v "$PWD":/w -w /w ubuntu:22.04 bash -c \
-            "apt-get update -qq && apt-get install -y -qq python3-pip > /dev/null && pip install -q dist/*.whl pyarrow && python3 tools/package_check.py"
-      - uses: actions/upload-artifact@v6
-        with:
-          name: pondra-${{ matrix.platform }}
-          path: |
-            dist/*.whl
-            dist/pondra-${{ matrix.platform }}-*.tgz
-            dist/pondra-${{ matrix.platform }}.*
-      - uses: actions/upload-artifact@v6 # (`pondra` itself, the same from every platform: published from one)
-        if: matrix.platform == 'linux-x64'
-        with:
-          name: pondra-npm
-          path: dist/pondra-[0-9]*.tgz
-
   publish:
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/v') || inputs.publish
     runs-on: ubuntu-latest
     environment: pypi # (PyPI's trusted publisher names it; Settings -> Environments can require an approval)
     permissions:
+      actions: read # this commit's build run and its packages
       contents: write # the GitHub release
       id-token: write # PyPI trusted publishing, npm provenance
     steps:
-      - uses: actions/checkout@v5 # (tools/npm_publish.sh)
+      - uses: actions/checkout@v5 # (Cargo.toml's version, the installers, tools/npm_publish.sh)
+      - name: This commit's build run (waited for while it runs; it must have passed)
+        id: build
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          run=$(gh run list --workflow build.yml --commit "$GITHUB_SHA" --limit 1 --json databaseId --jq '.[0].databaseId')
+          [ -n "$run" ] || { echo "::error::no build run for $GITHUB_SHA: push it to main first (or start the build workflow on this tag)"; exit 1; }
+          gh run watch "$run" --exit-status --interval 30 > /dev/null || { echo "::error::build run $run didn't pass: re-run its failed jobs, then this"; exit 1; }
+          echo "run=$run" >> "$GITHUB_OUTPUT"
       - uses: actions/download-artifact@v7
         with:
+          run-id: ${{ steps.build.outputs.run }}
+          github-token: ${{ github.token }}
+          pattern: pondra-*
           path: dist
           merge-multiple: true
+      - name: The packages, every platform, of this version
+        run: |
+          v=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          [ "$GITHUB_REF_TYPE" != tag ] || [ "$GITHUB_REF_NAME" = "v$v" ] || { echo "::error::tag $GITHUB_REF_NAME, but Cargo.toml says $v"; exit 1; }
+          ls -l dist
+          for p in linux-x64 linux-arm64 macos-x64 macos-arm64 windows-x64; do
+            a=dist/pondra-$p.tar.gz; [ $p != windows-x64 ] || a=dist/pondra-$p.zip
+            ls dist/pondra-$v-*.whl dist/pondra-$p-$v.tgz "$a" > /dev/null || exit 1
+          done
+          [ "$(ls dist/pondra-$v-*.whl | wc -l)" = 5 ] && ls dist/pondra-$v.tgz
       - uses: actions/setup-node@v5
         with:
           node-version: 22
@@ -108,13 +73,15 @@ jobs:
             install.ps1
       - run: mkdir pypi && mv dist/*.whl pypi/
       - name: PyPI
+        if: startsWith(github.ref, 'refs/tags/v') || inputs.publish
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: pypi
           skip-existing: true # (a run started again publishes only what's missing)
       - name: npm (the platform packages first, then `pondra`, which depends on them)
+        if: startsWith(github.ref, 'refs/tags/v') || inputs.publish
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }} # (empty once npm trusts this workflow)
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }} # (empty: npm takes this workflow's OIDC token, as for 0.22.1)
         run: |
           npm install -g npm@latest # (trusted publishing needs npm 11.5.1 or later)
           bash tools/npm_publish.sh --provenance
