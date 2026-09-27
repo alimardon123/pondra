@@ -8,11 +8,13 @@
 set -eo pipefail
 platform=$1 root=$PWD try=$(mktemp -d)  # ($PWD, not $GITHUB_WORKSPACE: a /d/a/… path Git Bash globs and hands on)
 python -m venv "$try/venv"
-source "$try/venv/bin/activate" 2>/dev/null || source "$try/venv/Scripts/activate"  # (Scripts on Windows)
-pip install -q "$root"/dist/*.whl
-python "$root/tools/package_check.py"  # (no pyarrow: rows as JSON)
-pip install -q pyarrow
-python "$root/tools/package_check.py"
+# The virtualenv's own Python, named, not "activated": activating it in Git Bash on CI's Windows
+# (Python 3.11) didn't take, so python and pip were the runner's own and the wheel went there.
+py=$try/venv/bin/python && [ -x "$py" ] || py=$try/venv/Scripts/python.exe
+"$py" -m pip install -q "$root"/dist/*.whl
+"$py" "$root/tools/package_check.py"  # (no pyarrow: rows as JSON)
+"$py" -m pip install -q pyarrow
+"$py" "$root/tools/package_check.py"
 
 (cd "$try" && npm init -y > /dev/null &&
   npm install "$root"/dist/pondra-"$platform"-*.tgz "$root"/dist/pondra-[0-9]*.tgz &&
