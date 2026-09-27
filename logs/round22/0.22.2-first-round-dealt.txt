@@ -1,0 +1,31 @@
+# 0.22.2: a keyed table's first tiering round, dealt to three nodes (invariant 93)
+# (follows 0.22.1-changes-view-drift.txt: harness.py changes failing now and then on release builds)
+
+## 1. A failing run kept (PONDRA_KEEP=1), 0.22.1 release build: run 3 of a loop of harness.py changes
+The view per_owner, read on a reader node started on a copy of the lake, against the table:
+  view   c: total 373.0, n 9
+  direct c: total 334.0, n 9          (+39 in the view; a, b, d, w agree)
+per_owner's log, replayed from segment 0 (/watch/per_owner?after=0; --changelog-secs keeps it):
+  c: total 334.0, n 9                 -> the derived rows are right; the files are not
+Its current files (pondra catalog --dir <lake> t/per_owner): ord 61 (whole), 62, 68, 73, 79.
+  ord 61 file c 358.0/9, log (0,61] c 319.0/9   <- the compaction's output is 39 off
+The compaction's inputs (the files it replaced, still in garbage), each against its log range:
+  (0,21]  file [a 994/30, c 149/2, d 217/3]                       == log
+  (21,38] file [a -229/7, d 5/-1]                                  DIFFERS
+          log  [a -229/7, c -39/0, d 5/-1]      <- c's part of an UPDATE (n +0) dropped
+  (38,50] ... (60,61]                                              == log, every one
+(0,21] and (21,38] are two jobs of per_owner's first tiering round, dealt to two nodes. Both
+took their file for the table's first (meta.files was empty), and the first file drops delete
+markers and a view's emptied groups (live(): "n" <> 0). A partial group with n 0 is a change.
+
+## 2. harness.py deal (new): a first round on three nodes, on purpose
+Without the fix (0.22.1 code), every run:
+ "before tiering, every node": true,
+ "after the first round, dealt to three nodes: deleted keys stay deleted, every node": false,   (ids 1..10 back)
+ "…and the view keeps the UPDATE that changed a total, not a count": false                   (a: 40.0, not 50.0)
+With it (tier::run_job: first only for the fold starting at the table's tiered mark):
+ all three true.
+
+## 3. harness.py changes, in a loop, release builds
+0.22.1: runs 1, 2 ok; run 3 FAILED (the run above). Earlier: CI's test job on 3c59e6a, and 4 of 4 local runs.
+0.22.2: 6 of 6 ok.

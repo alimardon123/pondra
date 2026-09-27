@@ -79,6 +79,12 @@ change PATH. And `pip install pondra` without pyarrow couldn't answer a query. 0
 `tools/try_packages.sh` and `smoke.py` try all of it on Linux, Windows and macOS on every push
 (invariants 89 to 92, each checked to fail without its fix).
 
+**0.22.2: deleted keys stay deleted on a cluster.** A keyed table's first tiering round deals a
+job per node, and each took its file for the table's first, dropping its delete markers; the keys
+deleted in the later jobs' part of the log came back, and an adding-up view lost the part of an
+UPDATE that changed a total but not a count. Only the job starting where the table's files end
+writes the first file now (invariant 93); `harness.py deal` fails without it on every run.
+
 **Round 21 shaped tables further and took on more of Flink** (ADR-022):
 
 1. **Columns that change without a file rewritten.** `RENAME COLUMN`, `DROP COLUMN`, a dropped

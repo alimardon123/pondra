@@ -631,6 +631,12 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
 92. **`FROM t` is `SELECT * FROM t` wherever SQL comes in** (`routines::expand`, `select_star`,
    `FROM_FIRST`): DataFusion plans a FROM-first select as no columns. `harness.py schemas` and
    `smoke.py` fail without it.
+93. **Only a keyed table's first file drops delete markers** (`tier::run_job`: `first`): the fold
+   job whose range starts where the table's files end, when it has none. A round deals a job per
+   node, and the others' older rows are in that job's file; they keep their markers, expired rows
+   and a view's emptied groups, as every later fold does (invariants 5, 19). `harness.py deal`: a
+   first round on three nodes, deleted keys stay deleted and a view keeps an UPDATE of a total;
+   both fail without it.
 
 ## Tests: run these before and after any change
 
@@ -653,6 +659,7 @@ python3 tools/harness.py asof                  # ASOF JOIN over a stream (a view
 python3 tools/harness.py sums                  # sum(DOUBLE) == math.fsum, whole, grouped, windowed, on every node
 python3 tools/harness.py schemas               # schemas, three-part names, attached lakes, DDL, stored and materialized views, drops
 python3 tools/harness.py changes               # UPDATE/DELETE/MERGE vs a model on 3 nodes: row ids, views, change feed, purges, Delta, spread
+python3 tools/harness.py deal                  # a keyed table's and a view's first tiering round on 3 nodes: deleted keys stay deleted
 python3 tools/harness.py guard                 # a query spreads only when it pays (PONDRA_LINK: a slow link keeps it on one node); measured times decide after
 python3 tools/harness.py files                 # one-row INSERTs: one Parquet file, one object write each; the catalog's WAL cleared; pondra sql INSERTs not rewritten
 python3 tools/harness.py layouts               # PRIMARY KEY + partition_by + cluster_by: rows moving between days vs a model; delta-rs
@@ -903,14 +910,17 @@ The comparison with Spark, Flink, Fluss, Lakehouse//RT and the single-node engin
 item, with what each is building next and the plan for the gaps — is
 `docs/comparison-spark-flink-fluss.md`.
 
-**Open bug (found 2026-09-27, while testing 0.22.1; 0.22.0 has it too).** `harness.py changes`
-fails on release builds: after about 50 random changes on three nodes, tiering and purging every
-second, the adding-up view `per_owner` (sum and count per owner) is 213 short in one group's
-total while its count is right, and stays so. The table itself matches the model. A change's net
-delta for that group (n +0, total +213) went missing, so the likely place is a merge view's delta
-rows meeting tiering, folding or purging, not the change itself. Round 22's dist build (thin LTO,
-one codegen unit) passes the same seeded run, and every earlier round passed it: a timing-dependent
-race. `logs/round22/0.22.1-changes-view-drift.txt`. Next thing to fix.
+**Fixed in 0.22.2: deleted keys that came back** (found 2026-09-27 as `harness.py changes`
+failing now and then on release builds). A keyed table's first tiering round on a cluster deals a
+job per node, and every one of them took its file for the table's first (the table had no files
+yet), so each dropped its delete markers and a view's emptied groups. The jobs after the first one
+have older rows to shadow, in the first job's file: keys deleted in their part of the log came
+back, and an adding-up view lost the part of an UPDATE that changed a total but not a count. Only
+multi-node clusters, only the first round (or the first after a compaction left no rows), and
+only what that round's later jobs held, hence "now and then". Found by keeping a failing run's
+lake and comparing each file with the log segments it covers (the log was right; one file lacked
+a group). `harness.py deal` does it on purpose: fails without the fix, every run (invariant 93,
+`logs/round22/0.22.2-first-round-dealt.txt`).
 
 Known limits, in the order they matter:
 

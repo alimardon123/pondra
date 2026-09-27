@@ -54,12 +54,12 @@ decisions in "What only you can decide" are yours · **Builds on:** ADR-002 to A
 Still waiting:
 
 - **C1 in one data centre:** machines under a millisecond apart, where spreading should pay.
-- **Publishing:** 0.22.0 is on PyPI; `v0.22.1` (ADR-024: one-line installers, `python -m
-  pondra`, rows without pyarrow) publishes PyPI and npm together.
+- **Publishing:** 0.22.0 is on PyPI and npm; `v0.22.1` (ADR-024: one-line installers, `python -m
+  pondra`, rows without pyarrow) is tagged; `v0.22.2` adds the fix below.
 
-First, before round 23: an open bug. An adding-up materialized view over a table being changed
-can lose one change's delta while tiering runs (`harness.py changes` fails on release builds;
-`logs/round22/0.22.1-changes-view-drift.txt`).
+0.22.2 fixes a bug found while testing 0.22.1: on a cluster, a keyed table's first tiering round
+could bring deleted keys back, and an adding-up view could lose part of an UPDATE (every job of
+the round took its file for the table's first; invariant 93, `harness.py deal`).
 
 Round 23 also takes two gaps the owner met in the shell: `UPDATE`/`DELETE`/`MERGE` on an attached
 lake from any node (they run only on that lake's own node today, while `INSERT` works from

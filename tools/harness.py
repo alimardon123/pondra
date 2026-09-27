@@ -198,6 +198,42 @@ def lookup_mismatch(k, model):
     return sum([r["v"] for r in rs] != want for rs in rows)
 
 
+def deal():
+    """A keyed table's first tiering round, dealt to three nodes: a job per third of its log, each
+    writing a file. Only the job that starts where the table's files end (there are none yet) may
+    drop delete markers, and an adding-up view's groups a change added nothing to the count of;
+    the other jobs' older rows are in its file (invariant 93). When every job of that round took
+    itself for the first, the keys deleted in the last third came back, and a view lost the part of
+    an UPDATE that changed a total but not a count (`harness.py changes`' drift, now and then)."""
+    lake = new_lake()
+    nodes = [Node(lake, A.port + i, tier_secs=0).start() for i in range(3)]
+    q = lambda s, i=0: sql(A.port + i, s)
+    q("CREATE TABLE kv (id BIGINT PRIMARY KEY, v BIGINT)")
+    q("CREATE TABLE acct (id BIGINT, owner VARCHAR, bal DOUBLE)")
+    q("CREATE MATERIALIZED VIEW per_owner AS SELECT owner, sum(bal) AS total, count(*) AS n FROM acct GROUP BY owner")
+    # Commits of about a third of each table's rows each, so the round deals a job per node: kv's
+    # delete markers, and the UPDATE's rows in per_owner (a: total +10, n +0), are in the last.
+    q("INSERT INTO kv VALUES " + ", ".join(f"({i}, {i})" for i in range(1, 31)))
+    q("INSERT INTO acct VALUES (1, 'a', 10), (2, 'b', 20)")
+    q("INSERT INTO kv VALUES " + ", ".join(f"({i}, {i})" for i in range(31, 61)))
+    q("INSERT INTO acct VALUES (3, 'a', 30), (4, 'b', 40)")
+    q("DELETE FROM kv WHERE id <= 10")
+    q("UPDATE acct SET bal = bal + 5 WHERE owner = 'a'")
+    keys, view = list(range(11, 61)), [{"owner": "a", "total": 50.0, "n": 2}, {"owner": "b", "total": 60.0, "n": 2}]
+    read = lambda i: ([r["id"] for r in q("SELECT id FROM kv ORDER BY id", i)], q("SELECT owner, total, n FROM per_owner ORDER BY owner", i))
+    checks = {"before tiering, every node": all(until(lambda i=i: read(i), (keys, view), 10) == (keys, view) for i in range(3))}
+    call(A.port, "POST", "/tier", timeout=600)
+    got = [until(lambda i=i: read(i), (keys, view), 10) for i in range(3)]
+    checks["after the first round, dealt to three nodes: deleted keys stay deleted, every node"] = all(g[0] == keys for g in got)
+    checks["…and the view keeps the UPDATE that changed a total, not a count"] = all(g[1] == view for g in got)
+    [n.kill() for n in nodes]
+    print(json.dumps(checks, indent=1, ensure_ascii=False))
+    if not all(checks.values()):
+        print("got:", got)
+        sys.exit(1)
+    return "a keyed table's and a view's first tiering round, dealt to three nodes: markers and changes kept"
+
+
 def upsert():
     lake, model, tiers, bad_lookups = new_lake(), {}, [], 0
     node = Node(lake, A.port, flush_ms=50, tier_secs=0, retain_secs=0).start()
@@ -2409,7 +2445,7 @@ $$""")
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    out = {t.__name__: t() for t in (upsert, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, scale, flight, reader, crash)}
+    out = {t.__name__: t() for t in (upsert, deal, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, scale, flight, reader, crash)}
     A.secs = min(A.secs, 20)
     out["load"] = load()
     print(json.dumps(out, indent=1))
@@ -2417,7 +2453,7 @@ def all_tests():
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "tiering", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "scale", "flight", "load", "all"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "tiering", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "scale", "flight", "load", "all"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -2428,4 +2464,4 @@ if __name__ == "__main__":
     ap.add_argument("--secs", type=int, default=30)
     ap.add_argument("--flush-ms", type=int, default=250)
     A = ap.parse_args()
-    {"crash": crash, "upsert": upsert, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "scale": scale, "flight": flight, "load": load, "all": all_tests}[A.mode]()
+    {"crash": crash, "upsert": upsert, "deal": deal, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "scale": scale, "flight": flight, "load": load, "all": all_tests}[A.mode]()

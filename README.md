@@ -316,6 +316,7 @@ python3 tools/harness.py scale | flight         # partitions, manifests, shuffle
 python3 tools/harness.py sums                   # sum(DOUBLE) == math.fsum, in any order, on every node
 python3 tools/harness.py schemas                # lake.schema.table, attached lakes, CREATE/DROP SCHEMA/TABLE/VIEW, CTAS, views spread, clients list schemas
 python3 tools/harness.py changes                # UPDATE/DELETE/MERGE vs a model on 3 nodes: row ids, views, the change feed, purges, Delta, spread
+python3 tools/harness.py deal                   # a keyed table's and a view's first tiering round on 3 nodes: deleted keys stay deleted
 python3 tools/harness.py guard                  # a query spreads only when it pays: a slow link keeps it on one node, a fast one spreads it
 python3 tools/smoke.py <pondra>                 # a first run on any OS (stdlib only): the shell, SQL, memory figures
 python3 tools/anywhere_check.py --bin <pondra> --dist dist [--docker]   # the shell, local(), the wheel, npm, the notebook; glibc 2.17 and Ubuntu 22.04

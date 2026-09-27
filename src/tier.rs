@@ -320,8 +320,9 @@ pub async fn run_job(lake: &Lake, Job { table, meta, kind }: Job) -> Result<Vec<
     let _slot = slots.acquire_many(takes.clamp(1, budget) as u32).await?;
     // (Clustered append tables get what keyed tables get for their key: small row groups, bloom filters.)
     // A keyed table's first file has nothing older to shadow: it drops delete markers (and expired
-    // rows) like a full compaction, and is as complete as one.
-    let first = !meta.key.is_empty() && meta.files.is_empty() && matches!(kind, Kind::Fold { .. });
+    // rows, and a view's emptied groups) like a full compaction, and is as complete as one. Only
+    // the round's first job writes it: the others' older rows are in that file (invariant 93).
+    let first = !meta.key.is_empty() && meta.files.is_empty() && matches!(kind, Kind::Fold { after, .. } if after == meta.tiered);
     let (keys, whole) = (if meta.key.is_empty() { meta.cluster.clone() } else { meta.key.clone() }, first || matches!(kind, Kind::Compact { .. }));
     let (batches, ord) = match kind {
         Kind::Fold { after, upto, rows } if meta.key.is_empty() => {
