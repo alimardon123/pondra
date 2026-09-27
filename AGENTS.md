@@ -20,6 +20,11 @@ The owner's design principles, which every change must respect:
 4. **No JVM, no Spark, no Flink, no Fluss needed.**
 5. **Short, simple, readable code** — without losing functionality. ~17,500 lines of Rust total (the Kafka protocol is 1,300 of them).
    If a change makes a file much longer, look for the simpler shape first.
+6. **Scale-out is the point** (the owner, 2026-09-27): running across machines is what sets
+   Pondra apart from single-node engines (DuckDB, Polars, Daft, Bodo) and makes it leaner than
+   Spark and Flink. No feature may slow a cluster down, add a single node everything depends on,
+   or cost memory when unused; the cluster bench (3 and 6 nodes) runs every round and must hold or
+   improve.
 
 ## Layout
 
