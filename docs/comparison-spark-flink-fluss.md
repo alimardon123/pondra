@@ -1,6 +1,6 @@
 # Pondra vs Spark, Flink, Fluss, Databricks Lakehouse//RT — and the single-node engines (round 12)
 
-**Date:** 2026-09-27 (Nexmark and schema rows: round 21) · **Machine:** one 2-vCPU, 7 GB sandbox VM, local disk (plus a real Cloudflare R2 bucket where marked); every engine ran alone
+**Date:** 2026-09-27 (Nexmark and schema rows: round 21; DataFrames and procedures: round 22) · **Machine:** one 2-vCPU, 7 GB sandbox VM, local disk (plus a real Cloudflare R2 bucket where marked); every engine ran alone
 **Versions:**
 - Pondra (this prototype: Rust, Apache DataFusion 55)
 - Spark 4.2.0 (PySpark, `local[*]`)
@@ -74,9 +74,12 @@ All of that comes from one 95 MB binary, with no JVM, ZooKeeper, Kafka or separa
   q5, q7, q11; round 21) Pondra ran 10 M bids in 8.7–10.9 s against Flink 2.3's 24.3–25.0 s on the same
   2 vCPUs, with ingest over HTTP and every view written to the lake (Flink generated its bids in
   process, into blackhole sinks).
-- **APIs and ecosystem:** Spark has DataFrame APIs in four languages and hundreds of connectors
-  (Pondra's DataFrame API — Polars-style, and PySpark's names over the same tree — is designed
-  in round 21 and built next: `dataframe-api.md`).
+- **APIs and ecosystem:** Spark has DataFrame APIs in four languages and hundreds of connectors.
+  Pondra has a Python DataFrame API (round 22): Polars' names (`pondra.frame`) and PySpark's
+  (`pondra.spark`, a job moved by its imports), each one SQL statement underneath; all 22 TPC-H
+  queries written as PySpark code give SQL's answers, and 44 PySpark pipelines give PySpark 4's
+  own answers and column names. SQL and Python mix either way round, and stored procedures in
+  SQL or Python (Snowflake's and Postgres's idea) are callable from every client and as MCP tools.
   Pondra has SQL (reads and writes) over HTTP, the Postgres protocol, Arrow Flight SQL (ADBC,
   JDBC) and MCP, a Python client, the Kafka protocol and an Iceberg REST catalog; few connectors
   beyond those.
@@ -103,7 +106,7 @@ biggest open risk is scale-out, and only a multi-machine benchmark can retire it
 | Serving: new analytical queries on big data | 35–600 ms (single node) | | | — | ✓ sub-100 ms (claimed) |
 | Scale-out to 100s of machines | unproven: shuffles that spill to disk, retried steps and a node dropped mid-query since round 13, all 22 TPC-H queries across the nodes since round 14, tables split by key ranges and hot keys shared out since round 15 — tested on one box only | ✓ | ✓ | ✓ | ✓ |
 | Streaming semantics (event time, windows, CEP, huge state) | watermarks from event time; tumbling, sliding and session windows emitted once; joins of two streams (each pair once, bounded by time); `ASOF JOIN` (ad hoc, across nodes, in views); decomposable aggregates, SQL tasks, dedup by event time (`order_by`); Nexmark q1/q2/q5/q7/q11 10 M bids 8.7–10.9 s (Flink 2.3: 24.3–25.0 s) — no timers, CEP, or Top-N | good | ✓ | storage only | — |
-| APIs & usability | `pip install pondra` / `npm install pondra` (built and tried; not yet published), a SQL shell (`pondra`), `pondra.local()` in a notebook; SQL reads and writes over HTTP, the Postgres protocol and Arrow Flight SQL (ADBC, JDBC); Python and JavaScript clients (pandas, Polars, Arrow) | ✓ SQL + DataFrames (Python/Scala/Java/R), notebooks | SQL + DataStream API | clients (Java, Rust, Python, C++); REST gateway; Postgres protocol planned | ✓ Databricks SQL |
+| APIs & usability | `pip install pondra` / `npm install pondra` (built and tried; not yet published), a SQL shell (`pondra`), `pondra.local()` in a notebook; SQL reads and writes over HTTP, the Postgres protocol and Arrow Flight SQL (ADBC, JDBC); Python and JavaScript clients (pandas, Polars, Arrow); DataFrames with Polars' or PySpark's names (round 22); macros and stored procedures in SQL or Python | ✓ SQL + DataFrames (Python/Scala/Java/R), notebooks | SQL + DataStream API | clients (Java, Rust, Python, C++); REST gateway; Postgres protocol planned | ✓ Databricks SQL |
 | Batch SQL on one machine (TPC-H) | ✓ from files: fastest at SF10 (38.0 s; DuckDB 39.8, Polars 42.8); at SF1 level with Polars' streaming engine (3.19 s vs 3.18) and ahead of DuckDB, Daft and Bodo | | | — | — |
 | AI agents and vectors | ✓ MCP server built in; `ai_complete`/`ai_embed` against any OpenAI-compatible endpoint; your own functions on an Arrow Flight server; exact vector search in SQL | AI functions on Databricks only | `ML_PREDICT`, `VECTOR_SEARCH`; Flink Agents (0.2) | MCP and vector columns planned | ✓ Agent Bricks, Genie |
 | Unstructured and multimodal | ✓ files in the lake (`files('…')`, `file_read`), `BINARY` with hashing and base64, `VARIANT`, `Float32[]` vectors — published as Delta arrays and Iceberg lists | — | — | blob and variant types planned | ✓ Databricks file types, `ai_query` |
@@ -413,6 +416,19 @@ Spark Connect for PySpark jobs unchanged (option C in `dataframe-api.md`; its cr
 Apache-2.0), Python UDFs in the process, reading external catalogs, shuffles over Flight gRPC,
 and the engine in a Python wheel (`pysail`) for the in-process library. Next: Sail in
 `bench/singlenode.py`, on the same box.
+
+Round 22 took the other road to PySpark first: `pondra.spark`, PySpark's names in the client over
+SQL (no Spark Connect server in the binary). It covers what most jobs use and says what it
+doesn't; Spark Connect stays the answer if Scala and Java jobs need to move.
+
+### Macros and procedures (round 22)
+
+| | DuckDB | Snowflake | Databricks | Postgres | Pondra |
+|---|---|---|---|---|---|
+| SQL macros / SQL functions | `CREATE MACRO` (scalar, table) | SQL UDFs | SQL UDFs | SQL functions | `CREATE MACRO` (scalar, table), kept in the lake: every node and client has them |
+| Stored procedures | — | SQL (Snowflake Scripting), Python, Java, Scala | SQL procedures (2025), jobs | PL/pgSQL, PL/Python (superuser) | SQL and Python; `CALL` from SQL, Postgres, Python, JS, MCP |
+| Where Python runs | in process | Snowpark sandbox, in the warehouse | clusters | in the server process | beside the node (`--python`), a process per call, lent the caller's rights |
+| Who may make one | anyone | owner roles | owner/admin | superuser for untrusted languages | the admin token |
 
 ## Footprint and operations
 

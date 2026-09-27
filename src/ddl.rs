@@ -135,6 +135,8 @@ pub enum Ddl {
     CreateDatabase { name: String, if_not_exists: bool, dir: Option<String> }, // a new lake (beside this one unless `dir`), attached
     AlterColumn { table: String, column: String, change: Change }, // ALTER TABLE … RENAME/DROP/ALTER COLUMN (ADR-022)
     RenameTable { name: String, to: String }, // (not yet: refused with the way round it)
+    CreateRoutine { name: String, routine: crate::routines::Routine, replace: bool }, // CREATE MACRO, CREATE PROCEDURE (ADR-023)
+    DropRoutine { name: String, if_exists: bool },
 }
 
 /// What `ALTER TABLE` does to a column: rename it, drop it, or widen its type (a SQL type).
@@ -167,8 +169,12 @@ pub async fn apply(lake: &Lake, d: Ddl) -> Result<Value> {
             let inside = |k: &str, p: usize| split(&k[p..]).0 == name && k[p..].contains('.');
             let views: Vec<String> = lake.cat.scan::<Value>("v/", "v0").await?.into_iter().chain(lake.cat.scan::<Value>("q/", "q0").await?)
                 .filter(|(k, _)| inside(k, 2)).map(|(k, _)| k[2..].to_string()).collect();
+            let routines: Vec<String> = lake.cat.scan::<Value>("r/", "r0").await?.into_iter().filter(|(k, _)| inside(k, 2)).map(|(k, _)| k[2..].to_string()).collect();
             let tables: Vec<String> = lake.cat.scan::<TableMeta>("t/", "t0").await?.into_iter().filter(|(k, _)| inside(k, 2) && !crate::sys::hidden(k)).map(|(k, _)| k[2..].to_string()).collect();
-            ensure!(cascade || (views.is_empty() && tables.is_empty()), "schema {name} isn't empty ({}): drop them first, or DROP SCHEMA {name} CASCADE", [&views[..], &tables[..]].concat().join(", "));
+            ensure!(cascade || (views.is_empty() && tables.is_empty() && routines.is_empty()), "schema {name} isn't empty ({}): drop them first, or DROP SCHEMA {name} CASCADE", [&views[..], &tables[..], &routines[..]].concat().join(", "));
+            for r in &routines {
+                crate::routines::drop(lake, r, true).await?;
+            }
             for v in &views {
                 drop_view(lake, v, true).await?;
             }
@@ -184,7 +190,8 @@ pub async fn apply(lake: &Lake, d: Ddl) -> Result<Value> {
             ensure!(lake.cat.get::<TableMeta>(&table_key(&name)).await?.is_none(), "{name} is a table");
             ensure!(lake.cat.get::<Value>(&crate::views::view_key(&name)).await?.is_none(), "{name} is a materialized view");
             ensure!(replace || lake.cat.get::<StoredView>(&query_key(&name)).await?.is_none(), "view {name} already exists (CREATE OR REPLACE VIEW)");
-            let planned = crate::asof::rewrite(&sql)?;
+            let expanded = crate::routines::expand(lake, &sql).await?; // (kept as written: macros are read when it is used)
+            let planned = crate::asof::rewrite(&expanded)?;
             crate::query::session(lake, &planned, "").await?.sql(&planned).await.context("the view's query")?; // (it plans)
             lake.cat.commit(vec![(query_key(&name), json(&StoredView { sql }))], &[]).await?;
             Ok(j!({"view": name}))
@@ -227,6 +234,8 @@ pub async fn apply(lake: &Lake, d: Ddl) -> Result<Value> {
         // A table's name is where its files, log rows, Delta and Iceberg copies and Kafka topic are:
         // renaming one is a new table (ADR-022).
         Ddl::RenameTable { name, to } => bail!("ALTER TABLE … RENAME TO isn't supported yet: a table's name is where its files, log and Delta and Iceberg copies live. CREATE TABLE {to} AS SELECT * FROM {name}; then DROP TABLE {name}; does it"),
+        Ddl::CreateRoutine { name, routine, replace } => crate::routines::create(lake, &name, routine, replace).await,
+        Ddl::DropRoutine { name, if_exists } => crate::routines::drop(lake, &name, if_exists).await,
         Ddl::Detach { name, if_exists } => {
             if lake.cat.get::<Attachment>(&attachment_key(&name)).await?.is_none() {
                 let flag = lake.attached.read().unwrap().iter().any(|(n, _)| *n == name);
@@ -365,6 +374,20 @@ pub async fn settle(lake: &Lake, d: &Ddl, me: &str) -> Result<()> {
                 Change::Type(_) => true, // (the same names either way)
             };
             if done {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        return Ok(());
+    }
+    if let Ddl::CreateRoutine { name, .. } | Ddl::DropRoutine { name, .. } = d {
+        // (a statement sent here right after may use it, or expect it gone)
+        let (key, want) = (crate::routines::key(&local(lake, name).unwrap_or_default()), match d {
+            Ddl::CreateRoutine { routine, .. } => Some(routine.clone()),
+            _ => None,
+        });
+        for _ in 0..200 {
+            if lake.cat.get::<crate::routines::Routine>(&key).await? == want {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;

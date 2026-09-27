@@ -14,6 +14,7 @@
   harness.py columns             RENAME/DROP COLUMN, a name added again, widened types, under streaming, vs a model
   harness.py fills               materialized views filled from the rows already there, every row once
   harness.py dedup               a keyed table deduplicated by event time (order_by) vs a model
+  harness.py procedures          macros, procedures (SQL, Python), scripts, parameters: rights, depth, three nodes
   harness.py load    --secs 30   throughput, ack latency, freshness, catalog commit latency
   harness.py all                 quick run of everything
 """
@@ -29,7 +30,7 @@ def call(port, method, path, body=b"", timeout=30, headers=None):
     r = c.getresponse()
     data = r.read()
     if r.status != 200:
-        raise RuntimeError(f"{r.status}: {data[:300]!r}")
+        raise RuntimeError(f"{r.status}: {data[:3000]!r}")
     return json.loads(data) if data[:1] in (b"{", b"[") else data
 
 
@@ -402,7 +403,7 @@ def clients():
     admin, writer, reader = (pondra.connect(f"http://127.0.0.1:{A.port}", token=t) for t in ("a-tok", "w-tok", "r-tok"))
     checks = {}
     # tokens: nothing without one; a read token can't write; a write token can't create tables
-    checks["no token -> 401"] = _raises(lambda: pondra.connect(f"http://127.0.0.1:{A.port}").sql("SELECT 1"))
+    checks["no token -> 401"] = _raises(lambda: pondra.connect(f"http://127.0.0.1:{A.port}").sql("SELECT 1").rows())
     admin.sql("CREATE TABLE users (id BIGINT PRIMARY KEY, name VARCHAR, score DOUBLE, _deleted BOOLEAN)")
     admin.sql("CREATE TABLE events (user VARCHAR, amount BIGINT) WITH (cluster_by = 'user')")
     checks["read token can't write"] = _raises(lambda: reader.sql("INSERT INTO users VALUES (9, 'x', 0, false)"))
@@ -2261,9 +2262,145 @@ def dedup():
     return f"deduplication by event time: {n:,} rows out of order over {len(model)} keys, a delete and late rows, compaction, Delta: all {len(checks)} checks pass"
 
 
+def procedures():
+    """Macros, procedures and scripts (ADR-023) on three nodes with tokens and `--python`: macros
+    expanded where SQL comes in (spread == one node, a follower uses one it just made, stored
+    views read them late, materialized views as made); SQL procedures run with the caller's
+    rights, arguments worked out once, retried with a job applied once, 16 deep at most; Python
+    procedures lent the caller's rights for as long as they run; scripts split around `$$` bodies;
+    parameters; rows sent with a request; the Postgres port, MCP and `pondra run`."""
+    lake = new_lake()
+    here = os.path.dirname(os.path.abspath(__file__))
+    env = {"PYTHONPATH": os.path.join(here, "..", "python")}
+    toks = dict(read_token="r-tok", write_token="w-tok", admin_token="a-tok")
+    nodes = [Node(lake, A.port + i, env=env, python=sys.executable, pg=f"127.0.0.1:{A.port + 10 + i}", **toks).start() for i in range(3)]
+    time.sleep(1)  # (the followers hear of each other: spread queries need them)
+    def q(s, port=A.port, token="a-tok", path="/sql", headers=None):
+        return call(port, "POST", path, s.encode() if isinstance(s, str) else s, headers={"authorization": f"Bearer {token}", **(headers or {})}, timeout=120)
+    def err(s, **kw):
+        try:
+            q(s, **kw)
+            return ""
+        except Exception as e:
+            return str(e)
+    checks = {}
+    q("CREATE TABLE orders (id BIGINT, user VARCHAR, qty BIGINT, price DOUBLE)")
+    q("INSERT INTO orders SELECT value, 'u' || (value % 50), value % 7, (value % 1000) * 0.25 FROM generate_series(1, 300000)")
+    q("CREATE TABLE users (user VARCHAR, tier VARCHAR)")
+    q("INSERT INTO users SELECT 'u' || value, CASE WHEN value % 3 = 0 THEN 'gold' ELSE 'plain' END FROM generate_series(0, 49)")
+    # macros
+    q("CREATE MACRO net(x, rate := 0.2) AS x * (1 - rate)", port=A.port + 1)
+    checks["a macro made on a follower is used there at once"] = q("SELECT net(10.0) AS a, net(10.0, rate := 0.5) AS b", port=A.port + 1) == [{"a": 8.0, "b": 5.0}]
+    q("CREATE MACRO big(n) AS TABLE SELECT * FROM orders WHERE qty >= n")
+    q("CREATE MACRO gross(x) AS net(x, rate := -0.1)")
+    spread = "SELECT u.tier, count(*) AS n, round(sum(gross(b.price)), 2) AS s FROM big(3) b JOIN users u ON b.user = u.user GROUP BY u.tier ORDER BY u.tier"
+    one = q(spread, path="/sql?spread=0")
+    checks["a macro in a query spread over three nodes == one node == the SQL written out"] = one == q(spread, path="/sql?spread=1") == q(spread.replace("big(3) b", "(SELECT * FROM orders WHERE qty >= 3) b").replace("gross(b.price)", "b.price * 1.1"), path="/sql?spread=0")
+    q("CREATE MACRO loop_a(x) AS loop_b(x)"); q("CREATE MACRO loop_b(x) AS loop_a(x)")
+    checks["macros calling each other stop 16 deep"] = "16 deep" in err("SELECT loop_a(1)")
+    checks["a macro can't hide SQL's own function"] = "SQL's own" in err("CREATE MACRO round(x) AS x")
+    q("CREATE VIEW priced AS SELECT id, net(price) AS p FROM orders WHERE id <= 3")
+    q("CREATE MATERIALIZED VIEW priced_live AS SELECT id, net(price) AS p FROM orders WHERE id > 300000")
+    q("CREATE OR REPLACE MACRO net(x, rate := 0.2) AS x * 100")
+    q("INSERT INTO orders VALUES (300001, 'u1', 1, 2.0)")
+    checks["a stored view reads macros as they are now"] = q("SELECT p FROM priced ORDER BY id") == q("SELECT price * 100 AS p FROM orders WHERE id <= 3 ORDER BY id")
+    checks["a materialized view keeps them as they were made"] = until(lambda: q("SELECT p FROM priced_live"), [{"p": 1.6}], secs=20) == [{"p": 1.6}]
+    # SQL procedures
+    q("CREATE TABLE log (x DOUBLE, tag VARCHAR)")
+    q("""CREATE PROCEDURE twice(x DOUBLE, tag VARCHAR DEFAULT 'none') LANGUAGE sql AS $$
+           INSERT INTO log VALUES ($x, $tag);   -- a ';' in a comment
+           INSERT INTO log VALUES ($x, $tag || ';');
+           SELECT count(*) AS n FROM log;
+         $$""")
+    checks["a procedure's answer is its last statement's"] = q("CALL twice(1.5)") == [{"n": 2}]
+    q("CALL twice(random(), tag => 'r')")
+    xs = q("SELECT x, tag FROM log WHERE tag LIKE 'r%' ORDER BY tag")
+    checks["its arguments are worked out once (random() is one value)"] = len(xs) == 2 and xs[0]["x"] == xs[1]["x"] and xs[1]["tag"] == "r;"
+    checks["a reader may not CALL a procedure that writes"] = "may not write" in err("CALL twice(2)", token="r-tok")
+    checks["a writer may not make one"] = "may not" in err("CREATE PROCEDURE p() AS $$ SELECT 1 $$", token="w-tok")
+    for _ in range(2):
+        q("CALL twice(7, tag => 'job')", path="/sql?job=j-7")
+    checks["a CALL retried with its job writes once"] = q("SELECT count(*) AS n FROM log WHERE tag LIKE 'job%'") == [{"n": 2}]
+    q("CREATE PROCEDURE deep(n BIGINT) AS $$ CALL deep($n + 1) $$")
+    checks["procedures calling procedures stop 16 deep"] = "16 deep" in err("CALL deep(0)")
+    script = "CREATE TABLE s (a VARCHAR); INSERT INTO s VALUES ('x;y'); CREATE PROCEDURE s_n() LANGUAGE sql AS $$ SELECT count(*) AS n FROM s; $$; CALL s_n()"
+    checks["a script: statements split around strings and $$ bodies"] = q(script, port=A.port + 2) == [{"n": 1}] and q("SELECT a FROM s") == [{"a": "x;y"}]
+    body = json.dumps({"sql": "SELECT count(*) AS n FROM orders WHERE qty = $q AND user = $u AND id < $top", "params": {"q": 3, "u": "u7", "top": {"sql": "1000 + 1"}}}).encode()
+    checks["$name parameters (JSON values, SQL expressions)"] = q(body, headers={"content-type": "application/json"}) == q("SELECT count(*) AS n FROM orders WHERE qty = 3 AND user = 'u7' AND id < 1001")
+    checks["a parameter with no value is an error"] = "no value for $nope" in err(json.dumps({"sql": "SELECT $nope", "params": {"x": 1}}), headers={"content-type": "application/json"})
+    # Python procedures
+    q("""CREATE PROCEDURE py_top(k BIGINT DEFAULT 3) LANGUAGE python AS $$
+print("running on", con.url)
+con.table("orders").group_by("user").agg(pondra.col("qty").sum().alias("q")).sort("q", "user", descending=[True, False]).limit(k)
+$$""")
+    want = q("SELECT user, sum(qty) AS q FROM orders GROUP BY user ORDER BY q DESC, user LIMIT 2")
+    checks["a Python procedure's frame runs here, called by a reader on a follower"] = q("CALL py_top(2)", port=A.port + 2, token="r-tok") == want
+    q("""CREATE PROCEDURE py_write(tag VARCHAR) LANGUAGE python AS $$
+import json, os
+con.sql(f"INSERT INTO log VALUES (1, '{tag}')")
+open(os.environ["LEASE_FILE"], "w").write(con.token) if "LEASE_FILE" in os.environ else None
+{"token": con.token, "n": con.sql("SELECT count(*) AS n FROM log").item()}
+$$""")
+    checks["…and with its rights: it may not write for a reader"] = "may not write" in err("CALL py_write('r')", token="r-tok")
+    got = q("CALL py_write('w')", token="w-tok")
+    lent = got[0]["token"]
+    checks["it writes for a writer; its lent token dies with it"] = got[0]["n"] >= 1 and _raises(lambda: q("SELECT 1", token=lent))
+    q("""CREATE PROCEDURE py_fail() LANGUAGE python AS $$
+raise ValueError("no such thing")
+$$""")
+    checks["a Python error comes back as the error"] = "ValueError: no such thing" in err("CALL py_fail()")
+    q("""CREATE PROCEDURE py_deep(n BIGINT) LANGUAGE python AS $$
+con.call("py_deep", n + 1)
+$$""")
+    checks["Python procedures calling themselves stop 16 deep"] = "16 deep" in err("CALL py_deep(0)")
+    # rows sent with a request: a join with a table of the lake, forced to spread
+    import pyarrow as pa, io as _io
+    t = pa.table({"user": ["u1", "u2"], "target": [5, 6]})
+    buf = _io.BytesIO()
+    with pa.ipc.new_stream(buf, t.schema) as w:
+        w.write_table(t)
+    head = json.dumps({"sql": "SELECT m.user, m.target, count(*) AS n FROM orders o JOIN mine m ON o.user = m.user GROUP BY 1, 2 ORDER BY 1", "tables": ["mine"]}).encode()
+    body = len(head).to_bytes(4, "little") + head + len(buf.getvalue()).to_bytes(8, "little") + buf.getvalue()
+    sent = q(body, path="/sql?spread=1", port=A.port + 1, headers={"content-type": "application/vnd.pondra.request"})
+    checks["rows sent with a request, joined with the lake's (asked to spread: here only)"] = sent == q("SELECT m.user, m.target, count(*) AS n FROM orders o JOIN (VALUES ('u1', 5), ('u2', 6)) AS m(user, target) ON o.user = m.user GROUP BY 1, 2 ORDER BY 1")
+    # other doors
+    import psycopg
+    with psycopg.connect(f"host=127.0.0.1 port={A.port + 11} user=admin password=a-tok dbname=lake", autocommit=True) as c:
+        checks["Postgres: a macro, a CALL"] = c.execute("SELECT net(1.0) AS v").fetchone() == (100.0,) and c.execute("CALL py_top(1)").fetchone() == tuple(want[0].values())
+    mcp = call(A.port, "POST", "/mcp", json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "write", "arguments": {"sql": "CALL twice(9, tag => 'mcp')"}}}).encode(), headers={"authorization": "Bearer w-tok", "content-type": "application/json"})
+    checks["MCP: CALL through the write tool"] = '\\"n\\"' in json.dumps(mcp) and q("SELECT count(*) AS n FROM log WHERE tag LIKE 'mcp%'") == [{"n": 2}]
+    rpc = lambda method, params, token="r-tok": call(A.port, "POST", "/mcp", json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode(), headers={"authorization": f"Bearer {token}", "content-type": "application/json"})["result"]
+    listed = {t["name"]: t for t in rpc("tools/list", {})["tools"]}
+    top = rpc("tools/call", {"name": "py_top", "arguments": {"k": 1}})
+    checks["MCP: each procedure is a tool, its parameters the tool's"] = listed.get("py_top", {}).get("inputSchema", {}).get("properties", {}).get("k", {}).get("type") == "integer" and \
+        "k" not in listed["py_top"]["inputSchema"]["required"] and not top["isError"] and json.loads(top["content"][0]["text"])["rows"] == want[:1]
+    q("CREATE SCHEMA ops"); q("CREATE MACRO ops.twice_it(x) AS x * 2")
+    checks["a schema's macros"] = q("SELECT ops.twice_it(21) AS v") == [{"v": 42}]
+    q("DROP SCHEMA ops CASCADE")
+    checks["…go with it (DROP SCHEMA … CASCADE)"] = "ops" not in json.dumps(call(A.port, "GET", "/routines", headers={"authorization": "Bearer r-tok"}))
+    q("DROP MACRO big"); q("DROP PROCEDURE twice")
+    checks["DROP MACRO, DROP PROCEDURE"] = err("CALL twice(1)").endswith("no procedure twice'") or "no procedure twice" in err("CALL twice(1)")
+    for n in nodes:
+        n.kill()
+    # a node on another address with --python and no tokens refuses to start; `pondra run` runs a file
+    open_node = subprocess.run([BIN, "serve", "--dir", lake, "--addr", f"0.0.0.0:{A.port + 5}", "--python", sys.executable], capture_output=True, text=True, timeout=60)
+    checks["--python without tokens only on 127.0.0.1"] = open_node.returncode != 0 and "--python" in open_node.stderr
+    f = os.path.join(tempfile.mkdtemp(prefix="pondra-run-"), "load.sql")
+    open(f, "w").write("CREATE TABLE IF NOT EXISTS runs (d DATE, n BIGINT);\nINSERT INTO runs VALUES (CAST($day AS DATE), $n);\nSELECT count(*) AS runs FROM runs;\n")
+    local = new_lake()
+    ran = [subprocess.run([BIN, "run", f, local, "--day", "2026-09-27", "--n", str(i)], capture_output=True, text=True, timeout=120) for i in (1, 2)]
+    checks["pondra run: a .sql file with parameters, on a node started for it"] = all(r.returncode == 0 for r in ran) and "| 2    |" in ran[1].stdout
+    ok = all(checks.values())
+    print(json.dumps({"procedures": checks, "ok": ok}, indent=1))
+    if not ok:
+        print(ran[1].stdout, ran[1].stderr, open_node.stderr[-300:])
+        sys.exit(1)
+    return f"macros, procedures (SQL and Python) and scripts on three nodes: all {len(checks)} checks pass"
+
+
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    out = {t.__name__: t() for t in (upsert, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, scale, flight, reader, crash)}
+    out = {t.__name__: t() for t in (upsert, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, scale, flight, reader, crash)}
     A.secs = min(A.secs, 20)
     out["load"] = load()
     print(json.dumps(out, indent=1))
@@ -2271,7 +2408,7 @@ def all_tests():
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "tiering", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "scale", "flight", "load", "all"])
+    ap.add_argument("mode", choices=["crash", "upsert", "tiering", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "scale", "flight", "load", "all"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -2282,4 +2419,4 @@ if __name__ == "__main__":
     ap.add_argument("--secs", type=int, default=30)
     ap.add_argument("--flush-ms", type=int, default=250)
     A = ap.parse_args()
-    {"crash": crash, "upsert": upsert, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "scale": scale, "flight": flight, "load": load, "all": all_tests}[A.mode]()
+    {"crash": crash, "upsert": upsert, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "scale": scale, "flight": flight, "load": load, "all": all_tests}[A.mode]()

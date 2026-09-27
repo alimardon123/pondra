@@ -63,6 +63,7 @@ fn send(schema: SchemaRef, batches: Vec<RecordBatch>) -> Out<FlightData> {
 
 /// Run a query (spread over the cluster when it pays), with its schema.
 async fn query(app: &App, sql: &str) -> anyhow::Result<(SchemaRef, Vec<RecordBatch>)> {
+    let sql = &crate::routines::expand(&app.lake, sql).await?; // (macros: ADR-023)
     let batches = app.query(sql, None).await?;
     let schema = match batches.first() {
         Some(b) => b.schema(),
@@ -78,7 +79,8 @@ async fn plan_schema(app: &App, sql: &str) -> anyhow::Result<Schema> {
 
 /// A write sent as SQL: a CREATE, INSERT, UPDATE, DELETE or ALTER. Returns the rows written.
 async fn write(app: &App, role: Role, sql: &str) -> Result<i64, Status> {
-    let stmt = crate::write::parse(sql).ok_or_else(|| Status::invalid_argument("not a write statement"))?;
+    let sql = crate::routines::expand(&app.lake, sql).await.map_err(status)?;
+    let stmt = crate::write::parse(&sql).ok_or_else(|| Status::invalid_argument("not a write statement"))?;
     app.auth.allows(role, &stmt).map_err(|e| Status::permission_denied(e.to_string()))?;
     let done = crate::write::on_node(app, stmt, None).await.map_err(status)?;
     Ok(done["rows"].as_i64().unwrap_or(0))

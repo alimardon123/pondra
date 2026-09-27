@@ -9,29 +9,34 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 pub async fn run(dir: &str) -> Result<()> {
+    let (mut node, base, key, log) = start(dir)?;
+    let r = session(dir, &base, &key, &mut node, &log).await;
+    stop(&mut node); // (whatever happened: the node never outlives the shell)
+    r
+}
+
+/// A node on `dir`, here, for this program alone: it, its address, the key that lets this program's
+/// SQL read files on this machine (`FROM 'D:\data\jan.csv'`, as DuckDB's shell does), its log.
+fn start(dir: &str) -> Result<(Child, String, String, std::path::PathBuf)> {
     if !dir.contains("://") {
         std::fs::create_dir_all(dir)?;
     }
     let port = std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
     let log = std::env::temp_dir().join(format!("pondra-shell-{port}.log"));
-    // (a key only this shell knows: with it, the node lets its SQL read files on this machine,
-    // `FROM 'D:\data\jan.csv'`, as DuckDB's shell does)
     let key = uuid::Uuid::new_v4().to_string();
-    let mut node = Command::new(std::env::current_exe()?)
+    let node = Command::new(std::env::current_exe()?)
         .args(["serve", "--dir", dir, "--addr", &format!("127.0.0.1:{port}"), "--stop-with-stdin"])
         .env("PONDRA_OWNER_KEY", &key)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(std::fs::File::create(&log)?)
         .spawn()?;
-    let r = session(dir, &format!("http://127.0.0.1:{port}"), &key, &mut node, &log).await;
-    stop(&mut node); // (whatever happened: the node never outlives the shell)
-    r
+    Ok((node, format!("http://127.0.0.1:{port}"), key, log))
 }
 
-async fn session(dir: &str, base: &str, key: &str, node: &mut Child, log: &Path) -> Result<()> {
-    // Only ever this machine's own node, over plain HTTP: never through a proxy the environment
-    // names (it couldn't reach the node), and no CA certificates needed (minimal images have none).
+/// Only ever this machine's own node, over plain HTTP: never through a proxy the environment names
+/// (it couldn't reach the node), and no CA certificates needed (minimal images have none).
+async fn up(base: &str, node: &mut Child, log: &Path) -> Result<reqwest::Client> {
     let (http, started) = (reqwest::Client::builder().no_proxy().tls_certs_only([]).build()?, Instant::now());
     while http.get(format!("{base}/stats")).send().await.is_err() {
         if node.try_wait()?.is_some() || started.elapsed() > Duration::from_secs(120) {
@@ -39,6 +44,51 @@ async fn session(dir: &str, base: &str, key: &str, node: &mut Child, log: &Path)
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    Ok(http)
+}
+
+/// `pondra run`: a script (`{"sql", "params"}`) on a node started for it, or on `url`; its answer
+/// (rows as a table).
+pub async fn script(dir: &str, url: Option<&str>, token: Option<&str>, body: serde_json::Value) -> Result<String> {
+    let send = |http: reqwest::Client, base: String, key: String| async move {
+        let mut r = http.post(format!("{base}/sql?format=table")).header("x-pondra-owner", key).json(&body);
+        if let Some(t) = token {
+            r = r.bearer_auth(t);
+        }
+        let r = r.send().await?;
+        let (ok, text) = (r.status().is_success(), r.text().await?);
+        anyhow::ensure!(ok, "{}", text.trim());
+        Ok(format!("{}\n", text.trim_end()))
+    };
+    if let Some(url) = url {
+        return send(reqwest::Client::new(), url.trim_end_matches('/').to_string(), String::new()).await;
+    }
+    let (mut node, base, key, log) = start(dir)?;
+    let r = match up(&base, &mut node, &log).await {
+        Ok(http) => send(http, base, key).await,
+        Err(e) => Err(e),
+    };
+    stop(&mut node);
+    r
+}
+
+/// `--name value` (or `--name=value`) pairs: numbers and true/false as such, the rest as text.
+pub fn params(args: &[String]) -> Result<serde_json::Map<String, serde_json::Value>> {
+    let (mut out, mut it) = (serde_json::Map::new(), args.iter());
+    while let Some(a) = it.next() {
+        let Some(name) = a.strip_prefix("--") else { bail!("{a}: parameters are --name value") };
+        let (name, value) = match name.split_once('=') {
+            Some((n, v)) => (n.to_string(), v.to_string()),
+            None => (name.to_string(), it.next().ok_or_else(|| anyhow::anyhow!("--{name} needs a value"))?.clone()),
+        };
+        let v = serde_json::from_str::<serde_json::Value>(&value).ok().filter(|v| v.is_number() || v.is_boolean()).unwrap_or(serde_json::Value::String(value));
+        out.insert(name.replace('-', "_"), v);
+    }
+    Ok(out)
+}
+
+async fn session(dir: &str, base: &str, key: &str, node: &mut Child, log: &Path) -> Result<()> {
+    let http = up(base, node, log).await?;
     let tty = std::io::stdin().is_terminal();
     if tty {
         eprintln!("Pondra {} on {dir}, also at {base}. End each statement with ;  .tables and .databases list them, .quit leaves.", env!("CARGO_PKG_VERSION"));
@@ -59,7 +109,7 @@ async fn session(dir: &str, base: &str, key: &str, node: &mut Child, log: &Path)
             _ => {}
         }
         sql.push_str(&line);
-        let (statements, rest) = if end { (vec![std::mem::take(&mut sql)], String::new()) } else { split(&sql) }; // (the last may lack its ;)
+        let (statements, rest) = if end { (vec![std::mem::take(&mut sql)], String::new()) } else { crate::routines::statements(&sql) }; // (the last may lack its ;)
         sql = rest;
         for statement in statements.iter().filter(|s| !s.trim().is_empty()) {
             let at = Instant::now();
@@ -85,37 +135,6 @@ async fn session(dir: &str, base: &str, key: &str, node: &mut Child, log: &Path)
         }
     }
     Ok(())
-}
-
-/// The complete statements in `text` — each ends at a `;` outside strings, quoted names and
-/// comments — and the rest, if it holds more than whitespace and comments.
-fn split(text: &str) -> (Vec<String>, String) {
-    let (b, mut done, mut start, mut inside, mut code) = (text.as_bytes(), vec![], 0, None, false);
-    let mut i = 0;
-    while i < b.len() {
-        let next = b.get(i + 1).copied();
-        match (inside, b[i]) {
-            (Some(b'*'), b'*') if next == Some(b'/') => (inside, i) = (None, i + 1), // end of /* … */
-            (Some(end), c) if end != b'*' && c == end => inside = None, // end of '…', "…", -- …
-            (Some(_), _) => {}
-            (None, b'-') if next == Some(b'-') => inside = Some(b'\n'),
-            (None, b'/') if next == Some(b'*') => (inside, i) = (Some(b'*'), i + 1),
-            (None, b';') => {
-                if code {
-                    done.push(text[start..i].to_string());
-                }
-                (start, code) = (i + 1, false);
-            }
-            (None, c) => {
-                code |= !c.is_ascii_whitespace();
-                if c == b'\'' || c == b'"' {
-                    inside = Some(c);
-                }
-            }
-        }
-        i += 1;
-    }
-    (done, if code || inside.is_some() { text[start..].to_string() } else { String::new() })
 }
 
 /// Stop the node by closing its input (`--stop-with-stdin`): it hands the lake on at once, rather

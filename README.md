@@ -1,6 +1,6 @@
 # Pondra: a streamhouse in one binary
 
-One Rust binary (~15,300 lines) that ingests streams, stores them as a lakehouse (Parquet files
+One Rust binary (~17,500 lines) that ingests streams, stores them as a lakehouse (Parquet files
 plus a catalog, on object storage; Delta Lake and Iceberg metadata for other engines on request),
 keeps SQL views and streaming state up to date, answers SQL, and scales out by starting more
 copies of itself on the same bucket. Object storage is the only state: no Postgres, no
@@ -26,10 +26,15 @@ pondra                      # a SQL shell on ./lake (or: pondra my-lake, pondra 
 
 ```python
 import pondra
+from pondra import col
 db = pondra.local("lake")   # a node on ./lake, in the background; it stops when Python does
 db.sql("CREATE TABLE events (user VARCHAR, amount BIGINT)")
 db.append("events", [{"user": "ann", "amount": 5}])
 db.sql("SELECT user, sum(amount) AS total FROM events GROUP BY user").to_pandas()
+
+# Frames, with Polars' names (or PySpark's: pondra.spark): one SQL statement underneath
+top = db.table("events").group_by("user").agg(col("amount").sum()).sort("amount", descending=True)
+db.sql("SELECT * FROM top WHERE amount > $min", min=1).to_polars()   # SQL reads Python by name
 ```
 
 ```js
@@ -39,7 +44,8 @@ await db.sql("SELECT 42 AS answer");
 ```
 
 `examples/quickstart.ipynb` is the same in a notebook: tables, a view that keeps itself current,
-new rows as they commit, and a point-in-time join. The shell and `local()` start a node with
+new rows as they commit, a point-in-time join, frames and `%%sql` cells, a macro and procedures in
+SQL and Python. The shell and `local()` start a node with
 `--stop-with-stdin`: it stops when the shell or program that started it exits — or is killed —
 and hands the lake on at once, so the next one opens it straight away.
 
@@ -140,6 +146,10 @@ Useful `serve` flags (give every node the same ones: any of them may lead):
   only when what it would move costs less than the work it shares out. `PONDRA_PURGE_ROWS`
   (100,000): changed rows waiting before their files are rewritten without them.
 - `--fsync` (with `--ack replicated`): followers flush each copy to disk before acknowledging.
+- `--python /usr/bin/python3`: run Python procedures (`CREATE PROCEDURE … LANGUAGE python`) with
+  this Python, which has the `pondra` package. They run any code on the machine, so only an admin
+  token makes one, and a node without tokens takes `--python` only on 127.0.0.1 (`local()` passes
+  its own Python).
 - `--cache-dir`, `--cache-gb 20`: the local SSD tier for lakes on object storage. 0 turns it off.
 - `--retain-secs 60`: how long replaced files and consumed log segments are kept.
 - `--backlog 10000000`: rows allowed to wait for tiering before commits pause.
@@ -200,7 +210,11 @@ differences entirely.
 | SQL writes | `INSERT … SELECT/VALUES`, `UPDATE … SET … WHERE`, `DELETE … WHERE` and `MERGE INTO t USING s ON … WHEN [NOT] MATCHED [BY SOURCE] …` on every table, on any node, over Postgres, or with `pondra sql` on any machine; from a local file in the shell (`MERGE INTO t USING 'new.csv' …`). A change is one commit from one snapshot, exactly-once with a job id; views, the change feed and Delta/Iceberg readers follow it | Delta/Iceberg MERGE, Snowflake DML, Fluss 1.0's UPDATE/DELETE by condition |
 | System columns | every row has `_row_id` (kept through an UPDATE or MERGE), `_version` (the commit that wrote it), `_created_at`, `_updated_at`: `SELECT _row_id, * FROM t`; `SELECT *` leaves them out | Postgres `ctid`/`xmin`, Iceberg v3 row lineage, Delta row tracking |
 | Postgres protocol | `--pg`: psql, psycopg 2/3, asyncpg, SQLAlchemy + pandas (tested); JDBC/BI tools by the same protocol. `COPY t FROM STDIN` (text, CSV; psql's `\copy`, psycopg's `cursor.copy`) and `COPY (query) TO STDOUT` (text, CSV, binary); the ADBC Postgres driver reads results as Arrow that way. For speed, Arrow Flight SQL | a Postgres-compatible serving layer |
-| Python and JavaScript | `pip install pondra` / `npm install pondra`: `local()` starts a node here, `connect()` reaches one; `sql()` → pandas / Polars / Arrow, `append()` exactly-once, `view()`, `watch()`, `lookup()` | PySpark / PyFlink clients for the common jobs |
+| Python and JavaScript | `pip install pondra` / `npm install pondra`: `local()` starts a node here, `connect()` reaches one; `sql()` → pandas / Polars / Arrow, `append()` exactly-once, `view()`, `watch()`, `lookup()`, `$name` parameters, `run("model.sql", …)`, `call(procedure, …)` | PySpark / PyFlink clients for the common jobs |
+| DataFrames, and SQL mixed with them | `pondra.frame`: Polars' lazy API (`db.table("orders").filter(col("amount") > 100).group_by("user").agg(col("amount").sum())`), each step a CTE of one SQL statement (`frame.sql`) that runs, spreads and is remembered like any query. `pondra.spark`: PySpark's names over the same frames (`from pondra.spark import SparkSession, functions as F, Window`), PySpark's meanings where they differ (null order, `/`, column names). Either way round: `db.sql(…)` is a frame; SQL names Python frames and pandas / Polars / Arrow data by their variable names (or `{name}`); frame methods take SQL snippets; `to_view()` makes a frame a view every client reads; `%load_ext pondra` gives notebooks `%%sql` cells. All 22 TPC-H queries give the same answers as SQL, as frames and as PySpark code; 44 PySpark pipelines give PySpark's own answers and column names | Polars / PySpark on a lake, SQLMesh / dbt's Python models |
+| Macros | `CREATE MACRO net(x, rate := 0.2) AS x * (1 - rate)`, `CREATE MACRO recent(days) AS TABLE SELECT …` (DuckDB's), kept in the lake: every node and every client has them, replaced by their bodies where SQL comes in (so queries using them spread as any other). Stored views read them as they are now; materialized views keep them as made | DuckDB macros, SQL UDFs |
+| Procedures | `CREATE PROCEDURE p(day DATE, n BIGINT DEFAULT 10) LANGUAGE sql AS $$ …; …; $$` or `LANGUAGE python` (a Python program: its last value is the answer, `con` its connection back); `CALL p(DATE '2026-09-27')` from SQL, Postgres, Python (`con.call`; `@con.procedure` on a function, or `con.create_procedure(name, file="job.py")` from a file), JavaScript, and as MCP tools. Arguments worked out once; every statement with the caller's rights (a Python procedure is lent them, for as long as it runs); exactly-once with a job; Python runs beside the node with `--python`, never in it | Snowflake / Postgres stored procedures, Databricks jobs |
+| Scripts and parameters | `POST /sql` takes several statements and `{"sql": …, "params": {"day": "2026-09-27"}}` for `$day` (bound by the node, never pasted in); `pondra run load.sql lake --day 2026-09-27` runs a file | psql scripts, dbt's `var()` |
 | A shell | `pondra` or `pondra <lake>`: SQL typed or piped in, answers as tables, `.tables`, `.databases`, DuckDB-style | the DuckDB / psql prompt |
 | Kafka | `--kafka`: producers write to tables (a topic is a table; JSON values; `_key`/`_timestamp`/`_value` columns; idempotent producers exactly-once; gzip/snappy/lz4/zstd), Debezium change events and tombstones become upserts and deletes; consumers and consumer groups read the log (offsets = `_ord`); SASL/PLAIN with the tokens. Tested: librdkafka (confluent-kafka), kafka-python | Kafka / Fluss ingest, Debezium sinks |
 | Schema evolution | `ALTER TABLE t ADD COLUMN c TYPE`, `RENAME COLUMN a TO b`, `DROP COLUMN c`, `ALTER COLUMN c TYPE BIGINT` (widening) on any node, over Postgres or from `pondra sql`, while rows stream in: no file is rewritten (the catalog keeps each column's stored name), old rows read a new column as null, and Delta (column mapping) and Iceberg (field ids) readers follow. `ALTER TABLE t SET (publish = 'delta', cluster_by = 'user', ttl = 'ts:3600', order_by = 'ts')` | Delta/Iceberg schema evolution |
@@ -210,7 +224,7 @@ differences entirely.
 | Point-in-time joins | `FROM trades t ASOF JOIN quotes q MATCH_CONDITION (t.ts >= q.ts) ON t.sym = q.sym` (also `>`, `<=`, `<`): each row gets the other table's row as it was at that moment, NULL if none; in ad hoc queries, across the nodes, and in views over a stream, where each event gets the table as of its own time however late it arrives | Snowflake / DuckDB ASOF JOIN, Flink temporal joins |
 | JSON | `json_get(col, 'a', 0)`, `json_get_str/int/float/bool`, `json_contains`, `json_length`, `->`, `->>` | VARIANT / JSON functions |
 | Arrow Flight | `--flight`: Flight SQL for ADBC and JDBC drivers (queries, writes, `adbc_ingest`, catalog); pyarrow `DoPut` to `[table, producer, first seq]` (exactly-once, acks as batches commit), `DoGet` with `{"sql": …}`, or a table's log as a columnar stream with only the columns asked for (`{"table": t, "after": N, "columns": [...], "follow": true}`) | Arrow Flight SQL servers (Dremio, InfluxDB 3), Fluss's columnar log |
-| AI agents | `POST /mcp` (the Model Context Protocol): tools `list_tables`, `query`, `write`, `changes`, under the same tokens | an MCP server in front of the warehouse |
+| AI agents | `POST /mcp` (the Model Context Protocol): tools `list_tables`, `query`, `write`, `changes`, and every stored procedure as a tool of its own (its parameters the tool's), under the same tokens | an MCP server in front of the warehouse |
 | Vector search | `FLOAT[]` embedding columns (`Float32[]`, published as a Delta `array` and an Iceberg `list`); `ORDER BY cosine_similarity(emb, [...]) DESC LIMIT k` (also `l2_distance`, `dot_product`, `cosine_distance`, `inner_product`, `array_distance`), exact, over the log and the files; Postgres array parameters work | a vector database next to the lake; Flink `VECTOR_SEARCH` |
 | Files (images, PDFs, audio) | `PUT /files/<path>` and `GET /files/<path>` put objects in the lake next to the tables; `SELECT * FROM files('photos/')` lists them (path, size, written); `file_read(path)` reads one where a query needs it. `BINARY` columns hold bytes, with `byte_length`, `sha256`, `md5`, `encode(…, 'base64')`, `decode`, `substr` | Databricks file types, Hudi blobs, a blob store beside the warehouse |
 | Semi-structured | `VARIANT` columns (JSON text): `json_get(col, 'a', 0)`, `json_get_str/int/float/bool`, `json_contains`, `json_length`, `->`, `->>` | VARIANT / JSON functions |
@@ -281,6 +295,10 @@ python3 tools/mcp_client.py --url http://127.0.0.1:8080/mcp   # the official MCP
 python3 tools/harness.py kafka | alter           # Kafka clients, ALTER TABLE under load
 python3 tools/harness.py columns | fills | dedup # RENAME/DROP/widen under streaming; views filled from existing rows; dedup by event time
 python3 tools/bench/nexmark.py                  # Nexmark q1, q2, q5, q7, q11: Pondra and Flink, the answers checked against DuckDB
+python3 tools/harness.py procedures             # macros, procedures (SQL and Python), scripts, parameters: rights, depth, three nodes, MCP tools
+python3 tools/frames_check.py                   # pondra.frame == Polars; one question asked ten ways (SQL, frames, pandas, .sql, %%sql, procedures)
+<venv with pyspark>/python tools/spark_check.py # pondra.spark == PySpark 4: 44 pipelines, values and column names
+python3 tools/bench/tpch_frames.py              # the 22 TPC-H queries as SQL, as frames and as PySpark code: the same answers
 python3 tools/harness.py windows | sessions | asof   # event-time windows and sessions emitted once; point-in-time joins over a stream
 python3 tools/asof_check.py                     # ASOF JOIN == DuckDB's, every direction, on one node and three
 python3 tools/stream_check.py                   # one stream, window + session + as-of views: every click once; clicks/s, emission delay
@@ -352,8 +370,11 @@ bucket to its newest lakes.
   untested here.
 - Kafka: one partition per topic, no transactions; offsets are positions in the log (increasing,
   not dense). Consumer groups live in the leader's memory (members rejoin after a failover).
-- An approximate vector index (see the plan in `docs/comparison-spark-flink-fluss.md`); a
-  DataFrame API (`docs/dataframe-api.md`: next round).
+- An approximate vector index (see the plan in `docs/comparison-spark-flink-fluss.md`).
+- Frames: the JavaScript client has parameters, `run` and `callProcedure`, not the frame builder;
+  a sort inside `db.sql(…)`'s own SQL by an expression (not a column) ends at the next frame step.
+  Python procedures start a Python process per call (0.1–0.2 s) and don't run on a schedule yet;
+  a folder of `.sql` and `.py` models run in order of what reads what (`pondra run models/`) is next.
 - Streaming: a watermark per source, not per partition or node, and a source that goes quiet
   holds it (its last windows and sessions wait for more rows); Top-N by event time, timers,
   `MATCH_RECOGNIZE`; stream joins run on the leader alone; an as-of join

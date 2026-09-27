@@ -1,7 +1,7 @@
 # AGENTS.md — working on Pondra
 
 Read this first, then `README.md` (what it does), `docs/adr-005-every-node-writes.md` (why it
-works this way) and `docs/adr-022-columns-views-and-frames.md` (the current round).
+works this way) and `docs/adr-023-frames-and-procedures.md` (the current round).
 `docs/prototype-status.md` has the measured numbers and what's left.
 
 ## What this is
@@ -18,14 +18,16 @@ The owner's design principles, which every change must respect:
 2. **As serverless as possible**: no always-on services besides the nodes themselves.
 3. **SPMD, not driver/executor** (Bodo-style): every node runs the same code on its slice.
 4. **No JVM, no Spark, no Flink, no Fluss needed.**
-5. **Short, simple, readable code** — without losing functionality. ~16,600 lines of Rust total (the Kafka protocol is 1,300 of them).
+5. **Short, simple, readable code** — without losing functionality. ~17,500 lines of Rust total (the Kafka protocol is 1,300 of them).
    If a change makes a file much longer, look for the simpler shape first.
 
 ## Layout
 
 ```
-src/      16,600 lines of Rust, one file per concern (see the table in README.md)
-python/   the Python client (pure Python, HTTP + Arrow; `local()` starts a node)
+src/      17,500 lines of Rust, one file per concern (see the table in README.md)
+python/   the Python client (pure Python, HTTP + Arrow; `local()` starts a node): `client.py`, frames
+          (`frame.py`, Polars' names), `spark/` (PySpark's names), `procedure.py` (runs a Python
+          procedure for a node), `magic.py` (`%%sql`)
 js/       the JavaScript client and the `pondra` npm package's files
 examples/ quickstart.ipynb (pip install to an as-of join, in the owner's notebook style)
 tools/    harness.py, cluster.py (tests), open_check.py (Delta + Iceberg readers == Pondra),
@@ -41,7 +43,9 @@ tools/    harness.py, cluster.py (tests), open_check.py (Delta + Iceberg readers
           join_order.py (the same queries written badly: same answers, no slower),
           spread_tpch.py (all 22 TPC-H queries across N nodes == one node, and why not),
           skew_check.py (a hot join key: same answers, the work shared out),
-          bench/nexmark.py (five Nexmark queries, Pondra and Flink), asof_check.py (ASOF JOIN == DuckDB's, one node and three), stream_check.py (windows,
+          bench/nexmark.py (five Nexmark queries, Pondra and Flink), frames_check.py (frames == Polars; SQL and
+          Python mixed every way), spark_check.py (pondra.spark == PySpark), bench/tpch_frames.py (TPC-H as
+          SQL, frames and PySpark code), asof_check.py (ASOF JOIN == DuckDB's, one node and three), stream_check.py (windows,
           sessions and an as-of view over one stream: every click once; rates and delays),
           cloud/ (a cluster on several machines; cloud/actions/ + .github/workflows/: on GitHub runners),
           bench/tpch-queries/ (the 22 TPC-H queries),
@@ -218,6 +222,19 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
   a key's rows is current (`query::latest_sql`: the greatest, then the last to come); such tables
   read by grouping every generation, not by shadowing. A keyed table's `_deleted` is left out of
   reads unless a query names it (`query::named`).
+- **Frames** (round 22, ADR-023, `python/pondra/`): `pondra.frame` (Polars' names) and
+  `pondra.spark` (PySpark's) build one SQL statement, a CTE per step; the engine sees only SQL.
+  `con.sql` gives a frame; a name the lake lacks is looked up among the caller's Python names (a
+  frame goes into the query's `WITH`, pandas / Polars / Arrow data travel with the request as its
+  own tables: `query::SENT`); a write that names a frame sends it as a view of the request
+  (`routines::Expander` puts its query in place). A frame's sort is put in every step that keeps it.
+- **Macros, procedures, scripts** (round 22, `routines.rs`, catalog `r/`): macros are replaced by
+  their bodies in the syntax tree where SQL comes in (`routines::expand`: the doors, a
+  materialized view when made, stored views as read). `CALL` runs a procedure's statements as
+  its caller (`routines::one`), arguments worked out once; a Python one runs in `python -m
+  pondra.procedure` beside a node started with `--python`, with a token lent the caller's rights
+  (`auth::lend`). `POST /sql` takes several statements (`routines::statements`) and `$name`
+  parameters (`routines::bind`); MCP lists every procedure as a tool.
 - **Memory:** one spill pool per node (`--memory-gb`); a query out of memory runs again with
   sort-merge joins. **`GET /metrics`** (Prometheus) for everything else.
 
@@ -561,6 +578,35 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
 80. **A keyed table's `_deleted` is shown only to a query that names it, decided alike on every
    node** (`query::names_deleted` over the query and the stored views it reads, in `session_at` and
    `spmd::plan`): nodes that disagreed would plan the query differently.
+81. **A frame puts its sort in every step that keeps order** (`Frame._order`, `_step`, and
+   `trailing_order` for SQL given to `con.sql`): DataFusion drops the `ORDER BY` of a CTE or a
+   subquery, so `sort().limit(5)` as two CTEs returned rows in scan order (`frames_check.py`'s
+   "sort, then limit: the top rows" fails without it). A step that drops a sort column, groups or
+   joins ends the sort, as in Polars.
+82. **A macro is expanded where SQL comes in, before anything plans it** (`routines::expand`: every
+   door, a materialized view's SQL when made, stored views as read — `query::stored_views`), and
+   a spread query's coordinator sends the expanded statement. After that it is plain SQL. A
+   follower waits to see a macro it made before answering (`ddl::settle`). `harness.py procedures`:
+   "a macro made on a follower is used there at once", "spread over three nodes == one node".
+83. **A procedure's arguments are worked out once, as its caller** (`routines::call`: one `SELECT
+   CAST((arg) AS type)`, bound as `arrow_cast` values): `harness.py procedures`' "random() is one
+   value" fails when the argument's text is put in each statement instead.
+84. **What a procedure runs, runs with its caller's rights and no more**: each statement is
+   checked as the caller's (`routines::one`), and a Python procedure's connection back uses a token
+   lent the caller's role and file access (`auth::lend`) that ends with the call. `harness.py
+   procedures`: "…it may not write for a reader" fails with a lease of more rights; "its lent
+   token dies with it". Procedures and macros call each other 16 deep at most.
+85. **Code runs on a node only if its owner allowed it and an admin stored it** (`--python`; a node
+   without tokens takes it only on 127.0.0.1). Invariant 21 stands for SQL: a Python procedure is
+   the admin's code, run with the caller's rights. `harness.py procedures`: "--python without
+   tokens only on 127.0.0.1".
+86. **Statements split outside strings, `$tag$` bodies and comments, in one place**
+   (`routines::statements`: `POST /sql`, the shell, the Postgres port, procedure bodies): the
+   Postgres port split at every `;`. `harness.py procedures`' setup fails without the `$$` rule.
+87. **Rows sent with a request are its own, on that node only** (`query::SENT`, a task-local: its
+   sessions register them; `App::query_as` never spreads a query that has them; no result cache).
+88. **An answer with no rows keeps its columns** (`App::query_as`: one empty batch with the
+   plan's schema): a frame learns its columns from `LIMIT 0` (`frames_check.py` fails without it).
 
 ## Tests: run these before and after any change
 
@@ -592,6 +638,10 @@ python3 tools/harness.py streams               # a stream join over two nodes an
 python3 tools/harness.py columns               # RENAME/DROP COLUMN, a name added again, widened types under streaming vs a model; 4 outside readers
 python3 tools/harness.py fills                 # views filled from existing rows while rows stream in, made again, through a leader restart
 python3 tools/harness.py dedup                 # a keyed table deduplicated by event time (order_by) vs a model; SELECT * without _deleted
+python3 tools/harness.py procedures            # macros, SQL and Python procedures, scripts, parameters, sent rows: rights, depth, 3 nodes, Postgres, MCP, pondra run
+python3 tools/frames_check.py                  # pondra.frame == Polars (26 pipelines); one question asked 10 ways; a sort kept through steps
+~/venv-spark/bin/python tools/spark_check.py   # pondra.spark == PySpark 4.0.1 (44 pipelines: values and column names)
+python3 tools/bench/tpch_frames.py --data ~/tpch/sf1-bench   # TPC-H: SQL == frames == PySpark code, 22 of 22
 python3 tools/bench/nexmark.py [--bids 4000000] # Nexmark q1, q2, q5, q7, q11: Pondra (== DuckDB) and Flink 2.3 (venv-flink)
 python3 tools/smoke.py target/release/pondra   # what CI runs on Windows, macOS and Linux (stdlib only)
 python3 tools/anywhere_check.py --bin <pondra> --dist dist [--docker]   # shell, local(), kill -9, wheel, npm, notebook; glibc 2.17 + Ubuntu 22.04
@@ -656,13 +706,13 @@ Practical notes for an agent working here:
 - Node stderr goes to `/tmp/pondra-<port>-<id>.stderr`; that's where "restarting to rejoin",
   "slow tiering" and panics show up.
 
-## State of the work (2026-09-27, round 21)
+## State of the work (2026-09-27, round 22)
 
 Everything in `docs/prototype-status.md` passes on local disk and on simulated R2. The round-11
 additions (manifests, partitions, shuffles, memory limits, Arrow Flight) also ran against real
 R2; round 12's are in `logs/round12/`, round 13's in `logs/round13/`, round 14's in
 `logs/round14/`, round 15's in `logs/round15/`, round 16's in `logs/round16/`, round 17's in `logs/round17/`,
-round 18's in `logs/round18/`, round 19's in `logs/round19/`, round 20's in `logs/round20/` and round 21's in `logs/round21/`.
+round 18's in `logs/round18/`, round 19's in `logs/round19/`, round 20's in `logs/round20/`, round 21's in `logs/round21/` and round 22's in `logs/round22/`.
 
 **R2 test buckets.** There are two:
 
@@ -729,7 +779,7 @@ of their own. They will run the multi-machine tests themselves, later, on one of
   runners have 14 GB of disk (SF10 fits, SF100 doesn't) and are shared, so compare shapes (1 → 3 →
   6 nodes), not headline numbers. `.github/workflows/cluster-bench.yml` and `tools/cloud/actions/`
   are the workflow; `bench-bin/pondra` in `ponderabucket-us` holds the portable binary
-  (Linux x86-64, glibc 2.17) for its `binary: r2` input (round 20's since this round). Rebuild and re-upload it when the code
+  (Linux x86-64, glibc 2.17) for its `binary: r2` input (round 22's since this round). Rebuild and re-upload it when the code
   changes, and read results from `bench-results/<run id>/results.json`.
 - **A Google Cloud VM trial** ($300 for 90 days, no charge unless they upgrade) for dedicated
   machines, SF100 and Spark on the same VMs, with `tools/cloud/cluster.sh`.
@@ -741,6 +791,13 @@ bucket, which the agent can read with the credentials in `/home/claude/.r2env`. 
 links a session to their computer, an agent can drive VMs from there instead.
 
 Headline numbers, all on one 2-vCPU box:
+
+- **Frames, macros and procedures** (round 22, ADR-023): `pondra.frame` (Polars' names) and
+  `pondra.spark` (PySpark's), one SQL statement each, as fast as the SQL (10 M rows: 0.063 s
+  against 0.065 s); 26 pipelines equal to Polars, 44 to PySpark 4.0.1 (values and column names),
+  the 22 TPC-H queries equal as SQL, frames and PySpark code; SQL and Python mixed ten ways, one
+  answer. Macros cost a small query 0.07 ms; a SQL `CALL` 2.9 ms; a Python procedure a process
+  start (0.15 s).
 
 - **Columns that change, views that start full** (round 21, ADR-022): `RENAME COLUMN`, `DROP
   COLUMN`, widening `ALTER COLUMN … TYPE` with no file rewritten (a scan of 10 M rows 0.033 s
@@ -845,15 +902,20 @@ Known limits, in the order they matter:
     Apache-2.0 since round 21); the macOS, Windows and ARM Linux builds exist only in the
     release workflow, which hasn't run yet. Only `sum` over DOUBLE is order-independent (not `avg`,
     `stddev`, …).
+13. **Frames and procedures** (round 22): a Python procedure starts a process per call (a warm
+    pool would take the 0.15 s away) and doesn't run on a schedule yet; the JavaScript client has
+    no frame builder; `pondra run models/` (a folder of `.sql` and `.py` models in order of what
+    reads what) is next; a `MERGE` from rows sent with a request needs the leader to receive it.
+    `con.sql(query)` is lazy since round 22: it runs when its rows are asked for, each time.
 
-Good next moves: `docs/roadmap.md` (2026-09-27, after round 21) is the plan, with the reasons.
-Rounds 17–21 are done except what needs the owner (publishing, cluster-bench runs). In short:
+Good next moves: `docs/roadmap.md` (2026-09-27, after round 22) is the plan, with the reasons.
+Rounds 17–22 are done except what needs the owner (publishing, cluster-bench runs). In short:
 
-1. **Round 22, the DataFrame API** (`docs/dataframe-api.md`, designed in ADR-022): `pondra.frame`
-   (Polars-style, lazy) and `pondra.spark` (PySpark's names), one expression tree compiling to
-   SQL, tested against Polars and PySpark; with it, a console at `/` and live queries.
+1. **Round 23, use it from anything:** a console at `/`, live queries (`GET /live?sql=…`), dbt
+   over the Postgres port and BI tools on Windows; procedures on a schedule; `pondra run
+   models/`.
 2. **Publish:** once the owner's PyPI pending publisher and npm token are in place, tag
-   `v0.21.0` and let `.github/workflows/release.yml` build, try and publish.
+   `v0.22.0` and let `.github/workflows/release.yml` build, try and publish.
 3. **Security before anyone else's data:** TLS on the node port and mutual TLS between nodes, then
    grants (roadmap E3).
 4. **Then:** machines in one data centre for the cluster bench, the in-process library, the

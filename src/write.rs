@@ -152,6 +152,7 @@ pub enum Stmt {
     SetOptions(String, Vec<(String, String)>),           // table, ALTER TABLE … SET (publish = 'delta', cluster_by = 'user', ttl = 'ts:3600')
     Ddl(Vec<crate::ddl::Ddl>),                            // schemas, views, drops: the leader's (`ddl.rs`)
     Merge(Box<crate::change::Merge>),                     // MERGE INTO … (`change.rs`)
+    Invalid(String),                                      // CREATE PROCEDURE or DROP MACRO, written wrong: why
 }
 
 impl Stmt {
@@ -160,7 +161,7 @@ impl Stmt {
         match self {
             Stmt::Create(c) => object(&c.name),
             Stmt::Define(t, _) | Stmt::Insert(t, _) | Stmt::Update(t, ..) | Stmt::Delete(t, _) | Stmt::AddColumn(t, ..) | Stmt::SetOptions(t, _) => t.clone(),
-            Stmt::Ddl(_) => String::new(),
+            Stmt::Ddl(_) | Stmt::Invalid(_) => String::new(),
             Stmt::Merge(m) => m.target.clone(),
         }
     }
@@ -201,7 +202,7 @@ pub fn object(n: &ast::ObjectName) -> String {
 }
 
 /// One part of a name: as written if quoted, else in lower case.
-fn ident(i: &ast::Ident) -> String { if i.quote_style.is_some() { i.value.clone() } else { i.value.to_lowercase() } }
+pub fn ident(i: &ast::Ident) -> String { if i.quote_style.is_some() { i.value.clone() } else { i.value.to_lowercase() } }
 
 /// A name in SQL, each part quoted as it is: `"t"`, `"schema"."t"`, `"lake"."schema"."t"`.
 pub fn sql_name(name: &str) -> String {
@@ -218,7 +219,11 @@ pub fn parse(sql: &str) -> Option<Stmt> {
         ast::TableFactor::Table { name, .. } => Some(object(name)),
         _ => None,
     };
-    Some(match Parser::parse_sql(&GenericDialect {}, sql).ok()?.pop()? {
+    let parsed = match Parser::parse_sql(&GenericDialect {}, sql) {
+        Ok(mut s) => s.pop()?,
+        Err(_) => return crate::routines::statement(sql), // (CREATE PROCEDURE, DROP MACRO)
+    };
+    Some(match parsed {
         Statement::CreateTable(c) => Stmt::Create(Box::new(c)),
         Statement::Insert(ast::Insert { table: ast::TableObject::TableName(t), source: Some(q), columns, .. }) if columns.is_empty() => Stmt::Insert(object(&t), q.to_string()),
         Statement::Update(u) => {
@@ -272,6 +277,10 @@ pub fn parse(sql: &str) -> Option<Stmt> {
         Statement::CreateDatabase { db_name, if_not_exists, location, .. } => Stmt::Ddl(vec![Ddl::CreateDatabase { name: object(&db_name).to_lowercase(), if_not_exists, dir: location }]),
         Statement::DetachDuckDBDatabase { if_exists, database_alias, .. } => Stmt::Ddl(vec![Ddl::Detach { name: ident(&database_alias), if_exists }]),
         Statement::Merge(m) => Stmt::Merge(Box::new(crate::change::merge_of(&m)?)),
+        Statement::CreateMacro { or_replace, name, args, definition, .. } => Stmt::Ddl(vec![Ddl::CreateRoutine { name: object(&name), routine: crate::routines::of_macro(&args, &definition), replace: or_replace }]),
+        Statement::DropFunction(ast::DropFunction { if_exists, func_desc: names, .. }) | Statement::DropProcedure { if_exists, proc_desc: names, .. } => {
+            Stmt::Ddl(names.iter().map(|f| Ddl::DropRoutine { name: object(&f.name), if_exists }).collect())
+        }
         _ => return None,
     })
 }
@@ -403,7 +412,7 @@ fn rows_sql(meta: &TableMeta, stmt: &Stmt) -> Result<String> {
             ensure!(meta.merge.is_empty() && deletes, "DELETE needs an upsert table with a Boolean _deleted column");
             Ok(select(&|c: &str| if c == "_deleted" { "true".into() } else { q(c) }, t, cond))
         }
-        Stmt::Create(_) | Stmt::Define(..) | Stmt::AddColumn(..) | Stmt::SetOptions(..) | Stmt::Ddl(_) | Stmt::Merge(_) => unreachable!("not a row write here"),
+        Stmt::Create(_) | Stmt::Define(..) | Stmt::AddColumn(..) | Stmt::SetOptions(..) | Stmt::Ddl(_) | Stmt::Merge(_) | Stmt::Invalid(_) => unreachable!("not a row write here"),
     }
 }
 
@@ -571,6 +580,9 @@ pub async fn on_node(app: &crate::server::App, stmt: Stmt, job: Option<String>) 
 /// node, `server::owner`).
 pub async fn on_node_as(app: &crate::server::App, stmt: Stmt, job: Option<String>, files: bool) -> Result<Value> {
     ensure!(!app.cluster.reader, "read-only node");
+    if let Stmt::Invalid(why) = stmt {
+        bail!(why);
+    }
     let open = |ctx: SessionContext| if files { ctx.enable_url_table() } else { ctx };
     let (lake, job) = (&app.lake, job.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()));
     if let Stmt::Ddl(ddls) = stmt {

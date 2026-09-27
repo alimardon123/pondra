@@ -6,11 +6,12 @@
 //   const db = connect("http://127.0.0.1:8080");    // one running somewhere
 //   await db.sql("CREATE TABLE events (user VARCHAR, amount BIGINT)");
 //   await db.append("events", [{ user: "ann", amount: 5 }]);
-//   console.log(await db.sql("SELECT user, sum(amount) AS total FROM events GROUP BY user"));
+//   console.log(await db.sql("SELECT user, sum(amount) AS total FROM events WHERE amount > $min GROUP BY user", { min: 1 }));
+//   await db.callProcedure("load_day", "2026-09-27");    // a stored procedure
 //   for await (const row of db.watch("events")) { … }   // new rows as they commit
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { createServer } from "node:net";
 
@@ -31,9 +32,21 @@ export class Pondra {
     return r;
   }
 
-  /** A query's rows, as objects; for CREATE TABLE / INSERT / UPDATE / DELETE, the outcome. */
-  async sql(query) {
-    return (await this.call("POST", "/sql", query)).json();
+  /** A query's rows, as objects; for other statements (CREATE, INSERT, UPDATE, DELETE, CALL,
+   * several at once), the last one's outcome. `params`: values for `$name` in it. */
+  async sql(query, params) {
+    if (!params) return (await this.call("POST", "/sql", query)).json();
+    return (await this.call("POST", "/sql", JSON.stringify({ sql: query, params }), "application/json")).json();
+  }
+
+  /** A `.sql` file (or SQL), its statements in order, `$name` taking `params.name`. */
+  async run(file, params = {}) {
+    return this.sql(file.endsWith(".sql") && existsSync(file) ? readFileSync(file, "utf8") : file, params);
+  }
+
+  /** A stored procedure (`CREATE PROCEDURE`), called: `await db.callProcedure("load_day", "2026-09-27")`. */
+  async callProcedure(name, ...args) {
+    return this.sql(`CALL ${name}(${args.map((_, i) => `$p${i}`).join(", ")})`, Object.fromEntries(args.map((a, i) => [`p${i}`, a])));
   }
 
   /** Append rows exactly once: a retry after a lost answer is recognised, not applied twice. */

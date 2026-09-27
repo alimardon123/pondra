@@ -1,6 +1,7 @@
 # Pondra's DataFrame API: a design (round 21, built in round 22)
 
-**Status:** proposed · **Date:** 2026-09-27 · **Part of:** ADR-022 · **Asked for by the owner:**
+**Status:** built in round 22 (ADR-023; what differs from this design is listed at the end) ·
+**Date:** 2026-09-27 · **Part of:** ADR-022 · **Asked for by the owner:**
 "a Python DataFrame API, as easy as Polars or directly like PySpark for easy migration, with the
 SQL side converged in it and in any other API" — and then, to be precise: "an easy way to use
 both SQL and Python DataFrames that feels natural and native, using them interchangeably in
@@ -253,3 +254,26 @@ The shim is a thin layer over `pondra.frame`: the same tree, PySpark's names and
 - **Spark Connect in the binary** (option C) if Scala or Java Spark jobs need to move.
 - **Python UDFs on the nodes** through the Arrow Flight function server (`udf_server.py`), not in
   the node's process.
+
+## As built (round 22)
+
+Everything above is built (`python/pondra/frame.py`, `client.py`, `spark/`, `magic.py`) and
+tested (`tools/frames_check.py`, `tools/spark_check.py`, `tools/bench/tpch_frames.py`), except:
+
+- **`con.table(name, at=commit)`** (time travel) and **`@pondra.function`** (a Python function
+  callable from SQL) aren't built. Functions of your own are Arrow Flight servers (`POST
+  /functions`), as before; a stored Python *procedure* (`@con.procedure`, ADR-023) covers the
+  jobs.
+- **Pipelines of `.sql` and `.py` files** (`pondra run models/`) aren't built; `pondra run
+  file.sql` and `con.run("file.sql", …)` are.
+- **The JavaScript client** has `$name` parameters, `run` and `callProcedure`, not the builder.
+- **`sample(n)`** is `ORDER BY random() LIMIT n` (DataFusion ignores `TABLESAMPLE`).
+- **Rows sent with a query** go in the request itself (`application/vnd.pondra.request`), and a
+  write that names a frame sends it as a view the node puts in place.
+- **Frames learn their columns** (for `with_columns`, `rename`, joins) with one `LIMIT 0` query,
+  about a millisecond, remembered per frame.
+- **A sort is kept** through the steps after it (DataFusion drops a CTE's `ORDER BY`): a frame
+  puts it in each step that keeps order.
+- Beyond the design: **macros and procedures** (SQL and Python) kept in the catalog, callable from
+  every client and as MCP tools (ADR-023).
+

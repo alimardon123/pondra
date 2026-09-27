@@ -33,7 +33,10 @@ pub async fn handle(State(app): State<App>, Extension(role): Extension<Role>, bo
                 are queryable within milliseconds, in SQL (Apache DataFusion's dialect, close to PostgreSQL). \
                 Start with list_tables."}),
         "ping" => json!({}),
-        "tools/list" => json!({"tools": tools()}),
+        "tools/list" => {
+            let all = [tools().as_array().cloned().unwrap_or_default(), procedures(&app).await].concat();
+            json!({"tools": all})
+        }
         "tools/call" => call(&app, role, params).await,
         _ => return Json(json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32601, "message": format!("no method {method}")}})).into_response(),
     };
@@ -70,13 +73,55 @@ async fn call(app: &App, role: Role, params: &Value) -> Value {
         "query" => query(app, arg("sql")).await,
         "write" => write(app, role, arg("sql"), params["arguments"]["job"].as_str()).await,
         "changes" => changes(app, arg("table"), params["arguments"]["after"].as_u64()).await,
-        other => Err(anyhow!("no tool {other}")),
+        other => match procedure(app, other).await {
+            Some(name) => {
+                let given = params["arguments"].as_object().into_iter().flatten().map(|(k, v)| Ok(format!("{k} => {}", crate::routines::literal(v)?))).collect::<Result<Vec<_>>>();
+                match given {
+                    Ok(given) => called(app, role, &format!("CALL {name}({})", given.join(", ")), None).await,
+                    Err(e) => Err(e),
+                }
+            }
+            None => Err(anyhow!("no tool {other}")),
+        },
     };
     let (text, error) = match out {
         Ok(v) => (v.to_string(), false),
         Err(e) => (format!("{e:#}"), true), // (a tool error, which the agent sees and can act on)
     };
     json!({"content": [{"type": "text", "text": text}], "isError": error})
+}
+
+/// Each stored procedure is a tool too, its parameters the tool's (ADR-023): what a lake's owner
+/// wrote for a job becomes something an agent can do, with the agent's token's rights.
+async fn procedures(app: &App) -> Vec<Value> {
+    let Ok(all) = crate::routines::listed(&app.lake).await else { return vec![] };
+    let kind = |t: Option<&str>| match t.unwrap_or_default().split('(').next().unwrap_or_default().to_uppercase().as_str() {
+        "BIGINT" | "INT" | "INTEGER" | "SMALLINT" | "TINYINT" => "integer",
+        "DOUBLE" | "REAL" | "FLOAT" | "DECIMAL" | "NUMERIC" => "number",
+        "BOOLEAN" | "BOOL" => "boolean",
+        _ => "string",
+    };
+    let mut out: Vec<Value> = all.iter().filter(|(_, r)| r.kind == crate::routines::Kind::Procedure).map(|(name, r)| {
+        let props: serde_json::Map<String, Value> = r.params.iter().map(|p| (p.name.clone(), json!({"type": kind(p.ty.as_deref()), "description": p.ty}))).collect();
+        let required: Vec<&str> = r.params.iter().filter(|p| p.default.is_none()).map(|p| p.name.as_str()).collect();
+        let about = r.body.lines().map(str::trim).find(|l| !l.is_empty()).filter(|l| l.starts_with("--") || l.starts_with('#')).map(|l| l.trim_start_matches(['-', '#', ' ']).to_string());
+        json!({"name": tool(name), "annotations": {"readOnlyHint": false}, "inputSchema": {"type": "object", "properties": props, "required": required},
+               "description": format!("{} (the stored procedure {name}, LANGUAGE {}: CALL {name}(…))", about.unwrap_or_else(|| "A job this lake's owner wrote".into()), r.language)})
+    }).collect();
+    out.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+    out
+}
+
+/// A procedure's name as a tool's (letters, digits, `_`, `-`; not one of the four).
+fn tool(name: &str) -> String {
+    let t = name.replace('.', "__");
+    if ["list_tables", "query", "write", "changes"].contains(&t.as_str()) { format!("call_{t}") } else { t }
+}
+
+/// The procedure a tool stands for.
+async fn procedure(app: &App, t: &str) -> Option<String> {
+    let all = crate::routines::listed(&app.lake).await.ok()?;
+    all.iter().find(|(n, r)| r.kind == crate::routines::Kind::Procedure && tool(n) == t).map(|(n, _)| n.clone())
 }
 
 /// This lake and the attached ones, with the prefix their tables go by.
@@ -105,16 +150,30 @@ async fn list(app: &App) -> Result<Value> {
 }
 
 async fn query(app: &App, sql: &str) -> Result<Value> {
-    ensure!(crate::write::parse(sql).is_none(), "this is a write: use the write tool");
+    let sql = &crate::routines::expand(&app.lake, sql).await?; // (macros: ADR-023)
+    ensure!(crate::write::parse(sql).is_none() && crate::routines::call_of(sql).is_none(), "this is a write: use the write tool");
     let batches = app.query(sql, None).await?;
     let total: usize = batches.iter().map(RecordBatch::num_rows).sum();
     Ok(json!({"rows": rows(&batches)?, "total_rows": total}))
 }
 
 async fn write(app: &App, role: Role, sql: &str, job: Option<&str>) -> Result<Value> {
-    let stmt = crate::write::parse(sql).ok_or_else(|| anyhow!("not a write (INSERT, UPDATE, DELETE, CREATE or DROP): use the query tool"))?;
+    let sql = &crate::routines::expand(&app.lake, sql).await?;
+    if crate::routines::call_of(sql).is_some() {
+        return called(app, role, sql, job).await; // (CALL: a procedure may write)
+    }
+    let stmt = crate::write::parse(sql).ok_or_else(|| anyhow!("not a write (INSERT, UPDATE, DELETE, CREATE, DROP or CALL): use the query tool"))?;
     app.auth.allows(role, &stmt)?;
     crate::write::on_node(app, stmt, job.map(String::from)).await
+}
+
+/// A procedure's answer, as a tool's.
+async fn called(app: &App, role: Role, sql: &str, job: Option<&str>) -> Result<Value> {
+    let who = crate::routines::Who { role, files: false, depth: 0 };
+    Ok(match crate::routines::one(app, sql, who, job.map(String::from)).await? {
+        crate::routines::Outcome::Rows(batches) => json!({"rows": rows(&batches)?}),
+        crate::routines::Outcome::Done(v) => v,
+    })
 }
 
 /// Rows committed after `after`, in steps of doubling size until about `ROWS` are in hand.

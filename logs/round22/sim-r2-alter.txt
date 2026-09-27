@@ -1,0 +1,22 @@
+{
+ "alter": {
+  "old and new rows": true,
+  "the new column": true,
+  "a view over the table": true,
+  "a keyed table": true,
+  "lookup": true,
+  "IF NOT EXISTS": true,
+  "a clash is refused": true,
+  "Delta and Iceberg readers": true
+ },
+ "rows_written_during": 2800,
+ "outside_readers": {
+  "delta-rs": 2803,
+  "polars": 2803,
+  "duckdb": 2803,
+  "iceberg/pyiceberg": 2803,
+  "iceberg/polars": 2803,
+  "iceberg/duckdb": 2803
+ },
+ "ok": true
+}

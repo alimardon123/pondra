@@ -1,0 +1,14 @@
+{
+ "10m_rows_sql_s": 0.0646,
+ "10m_rows_frame_run_s": 0.0633,
+ "frame_build_with_schema_s": 0.0016,
+ "small_sql_ms": 2.2,
+ "small_frame_ms": 2.35,
+ "small_with_macro_ms": 2.64,
+ "small_macro_written_out_ms": 2.57,
+ "call_sql_procedure_ms": 2.94,
+ "call_python_procedure_ms": 408.4,
+ "call_python_procedure_frame_ms": 155.5,
+ "pandas_1000_rows_joined_with_10m_s": 0.1237,
+ "pandas_1m_rows_sent_and_summed_s": 0.0585
+}

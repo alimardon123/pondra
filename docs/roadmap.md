@@ -1,10 +1,10 @@
-# Pondra: what's left, and in what order (after round 21)
+# Pondra: what's left, and in what order (after round 22)
 
 **Date:** 2026-09-27 · **Status:** proposed; the order in "The rounds" is what I recommend, the
 decisions in "What only you can decide" are yours · **Builds on:** ADR-002 to ADR-017,
 `prototype-status.md`, `comparison-spark-flink-fluss.md`
 
-**Progress (2026-09-27):** rounds 17 to 21 are done (ADR-018 to ADR-022).
+**Progress (2026-09-27):** rounds 17 to 22 are done (ADR-018 to ADR-023).
 
 - **Round 17** made Pondra install anywhere: a glibc 2.17 Linux binary, pip and npm packages
   (built, not published), a SQL shell, and both flaky tests fixed.
@@ -42,13 +42,22 @@ decisions in "What only you can decide" are yours · **Builds on:** ADR-002 to A
   (`dataframe-api.md`). C1: the owner's run on round 20 showed loading fixed (106 s from 442 s)
   and the cluster at one node's speed (24.8 s against 24.5 s). Pondra is now MIT OR Apache-2.0.
 
+- **Round 22** (ADR-023): the DataFrame API, built: `pondra.frame` (Polars' names) and
+  `pondra.spark` (PySpark's), each a CTE per step of one SQL statement — as fast as the SQL (10 M
+  rows: 0.063 s against 0.065 s); SQL and Python either way round (SQL names Python frames and
+  pandas data, `.sql` files with parameters, `%%sql` cells); all 22 TPC-H queries the same as
+  SQL, as frames and as PySpark code, and 44 PySpark pipelines equal to PySpark 4's answers and
+  column names. The owner's idea came with it: **macros and procedures** kept in the catalog, SQL
+  or Python (a Python procedure runs beside the node, lent its caller's rights), called from SQL,
+  Postgres, Python, JavaScript and as MCP tools; scripts with `$name` parameters; `pondra run`.
+
 Still waiting:
 
 - **C1 in one data centre:** machines under a millisecond apart, where spreading should pay.
-- **Publishing:** the owner's PyPI pending publisher and npm token; then a `v0.21.0` tag.
+- **Publishing:** the owner's PyPI pending publisher and npm token; then a `v0.22.0` tag.
 
-Round 22 is next: the DataFrame API (`pondra.frame`, Polars-style, and `pondra.spark`,
-PySpark's names, one tree compiling to SQL), with a console at `/` and live queries.
+Round 23 is next: use it from anything — a console at `/`, live queries, dbt and BI tools (A4,
+B3, E1, E2), moved from round 22 when the owner chose frames and procedures for it.
 
 ## Where Pondra stands
 
@@ -224,11 +233,12 @@ simulated R2 and real R2, an ADR, and a bundle.
 | 19 ✓ | Change any row (done: ADR-020) | E6, C1 (the guard) | `UPDATE`/`DELETE`/`MERGE` on every table with system columns, streaming following every change; a cluster never slower than one node |
 | 20 ✓ | Fewer objects, any layout, streams joined (done: ADR-021) | the owner's questions, C1 (round 19's run) | a trickle of INSERTs writes under a third of the objects; `PRIMARY KEY` with `partition_by`/`cluster_by` (Hilbert); `COPY`; stream joins and sliding windows |
 | 21 ✓ | Shape it further, and more of Flink (done: ADR-022) | E8, E7, C3, F (streaming) | `ALTER TABLE … RENAME/DROP COLUMN`, widening; views filled from existing rows; dedup by event time; Nexmark against Flink; the DataFrame API designed |
-| 22 | A DataFrame API, and use it from anything | the DataFrame API (`dataframe-api.md`), A4, B3, E1, E2, C1, D1 (start) | `pondra.frame` and `pondra.spark` over SQL, tested against Polars and PySpark; a console at `/`, live queries, dbt and Power BI; TPC-H at 1/3/6 machines in one data centre |
-| 23 | In-process | B1, B2 | `pondra.open(…)` in a notebook reads and writes a cluster's lake, no server |
-| 24 | Safe to share | E3, D2 | TLS, grants, audit; random-query checks against DuckDB |
-| 25 | In the browser | B4 (after the DuckDB-WASM check) | A lake queried in a web page, straight from the bucket |
-| 26+ | Depth | C2, C4, E4, then F by evidence | Whatever the scale runs and first users show matters most |
+| 22 ✓ | Frames and procedures (done: ADR-023) | the DataFrame API (`dataframe-api.md`), the owner's macros and procedures | `pondra.frame` and `pondra.spark` over SQL, equal to Polars and PySpark; SQL and Python mixed every way; macros and procedures (SQL, Python) in the catalog |
+| 23 | Use it from anything | A4, B3, E1, E2, C1, D1 (start) | a console at `/`, live queries, dbt and Power BI; procedures on a schedule; `pondra run models/`; TPC-H at 1/3/6 machines in one data centre |
+| 24 | In-process | B1, B2 | `pondra.open(…)` in a notebook reads and writes a cluster's lake, no server |
+| 25 | Safe to share | E3, D2 | TLS, grants, audit; random-query checks against DuckDB |
+| 26 | In the browser | B4 (after the DuckDB-WASM check) | A lake queried in a web page, straight from the bucket |
+| 27+ | Depth | C2, C4, E4, then F by evidence | Whatever the scale runs and first users show matters most |
 
 Why this order:
 

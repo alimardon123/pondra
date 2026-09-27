@@ -1,0 +1,12 @@
+procedures exit=0 secs=36
+fills exit=0 secs=56
+changes exit=0 secs=208
+schemas exit=0 secs=88
+streams exit=0 secs=43
+windows exit=0 secs=23
+alter exit=0 secs=31
+clients exit=0 secs=29
+failover-replicated exit=0 secs=63
+users-replicated exit=0 secs=38
+crash exit=0 secs=3260
+ALL-DONE

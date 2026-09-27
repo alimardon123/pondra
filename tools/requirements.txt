@@ -22,3 +22,4 @@ kafka-python==3.0.11
 adbc-driver-flightsql==1.12.0
 adbc-driver-postgresql==1.12.0
 mcp==1.27.0
+ipython==9.17.1

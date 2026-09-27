@@ -1,0 +1,25 @@
+harness-all exit=1 secs=52
+frames-check exit=0 secs=2
+spark-check exit=0 secs=31
+tpch-frames exit=0 secs=42
+users-1 exit=0 secs=33
+users-2 exit=0 secs=33
+failover-1 exit=0 secs=66
+failover-2 exit=0 secs=66
+failover-3 exit=0 secs=66
+race exit=0 secs=33
+spread exit=0 secs=6
+smoke exit=0 secs=1
+open-check exit=0 secs=76
+asof-check exit=0 secs=32
+stream-check exit=0 secs=25
+spread-tpch exit=1 secs=0
+crash-big exit=0 secs=154
+ALL-DONE
+harness-all exit=0 secs=278
+spread-tpch exit=1 secs=17
+AFTER-DONE
+spread-tpch exit=0
+frames-check exit=0
+anywhere-check exit=0
+anywhere-check exit=0

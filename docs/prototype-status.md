@@ -1,6 +1,6 @@
 # Prototype status: Pondra, a streamhouse in one binary
 
-**Date:** 2026-09-27 (round 21) · **Plan:** ADR-002 to ADR-022, `roadmap.md` · **Code:** `pondra.zip` / `pondra.bundle` (≈16,600 lines of Rust, plus Python and JavaScript clients, packaging, and test and benchmark tools)
+**Date:** 2026-09-27 (round 22) · **Plan:** ADR-002 to ADR-023, `roadmap.md` · **Code:** `pondra.zip` / `pondra.bundle` (≈17,500 lines of Rust, plus Python and JavaScript clients, packaging, and test and benchmark tools)
 **Name:** the prototype formerly called `lh` is now **Pondra**. The name is free on crates.io, PyPI and npm. A small personal-finance app uses it (pondra.app), a different category; run a trademark search before a public launch.
 
 ## Where it stands
@@ -14,6 +14,52 @@ One Rust binary replaces the Kafka + Flink + Spark + metastore + ZooKeeper stack
 - upsert and merge tables.
 
 Start more copies on the same bucket to scale out. The only state is object storage. There's no JVM, no database server and no coordination service.
+
+**Round 22 built the DataFrame API, and macros and procedures with it** (ADR-023):
+
+1. **Frames, with Polars' names or PySpark's.** `pondra.frame` is Polars' lazy API over a lake;
+   `pondra.spark` gives PySpark's names over the same frames, so a PySpark job moves by changing
+   its imports. A frame is one SQL statement, a CTE per step (`frame.sql`): it runs, spreads and
+   is remembered as SQL does, as fast (10 M rows: 0.063 s against 0.065 s for the same SQL
+   written by hand; a small table's round trip 2.35 ms against 2.2 ms). Where Polars' or
+   PySpark's meaning differs from SQL's (the order of nulls, `/`, rounding, column names), the
+   SQL says theirs; a frame's sort is carried through the steps after it (DataFusion drops a
+   CTE's `ORDER BY`).
+2. **SQL and Python, either way round.** `con.sql(…)` is a frame; SQL names Python frames and
+   pandas, Polars and Arrow data by their variable names (data travels with the request: a
+   million pandas rows sent and summed in 0.06 s); frame methods take SQL snippets; `to_view`
+   makes a frame a view every client reads; `.sql` files run with `$name` parameters
+   (`con.run`, `pondra run`); `%%sql` cells in notebooks. One question asked ten ways gives one
+   answer.
+3. **Checked against the real thing:** 26 pipelines equal to Polars value by value; 44 PySpark
+   pipelines, written once, give PySpark 4.0.1's answers and column names; all 22 TPC-H
+   queries give SQL's answers written as frames and as PySpark code (SQL 3.6 s, frames 5.3 s,
+   PySpark code 5.1 s for all 22: the frame versions are written as Polars' own TPC-H is, and
+   q21's two aggregations over lineitem cost more than SQL's `EXISTS`).
+4. **Macros** (DuckDB's `CREATE MACRO`, scalar and table), kept in the lake and replaced by
+   their bodies where SQL comes in, so queries that use them spread like any other (a small
+   query 2.64 ms with a macro, 2.57 ms written out).
+5. **Procedures in SQL or Python** (the owner's idea): `CREATE PROCEDURE … LANGUAGE sql|python
+   AS $$ … $$`, `CALL` from SQL, Postgres, Python (`con.call`, `@con.procedure`), JavaScript and
+   as MCP tools. Arguments worked out once; every statement with the caller's rights; a job makes
+   a call exactly-once. A Python procedure runs beside a node started with `--python`, never in
+   it, with a token lent the caller's rights for as long as it runs. A SQL `CALL` costs 2.9 ms; a
+   Python one starts a process (about 0.15 s).
+6. **Scripts:** `POST /sql` takes several statements and `$name` parameters (bound by the node).
+7. **Tests** (`logs/round22/`): locally, `harness.py all` with the new `procedures` (29 checks
+   on three nodes with tokens: macros spread, a follower's new macro used at once, stored and
+   materialized views, rights, arguments once, a job's retry, 16 deep, Python procedures and
+   their lent tokens, `$$` scripts, parameters, rows sent with a request, Postgres, MCP tools,
+   `--python`'s refusal, `pondra run`), `frames_check` (26 pipelines equal to Polars; one question
+   eleven ways; a sort kept; writes and Delta's merge builders), `spark_check` (44 of 44 equal to
+   PySpark 4.0.1, values and names), `tpch_frames` (22 of 22, both ways), users ×2, failover ×3,
+   race, spread, `open_check`, `asof_check`, `stream_check`, `spread_tpch` (22 of 22), the big
+   crash run, `smoke`, and `anywhere_check` on the glibc 2.17 build (the wheel runs a frame and a
+   Python procedure in a fresh virtualenv; npm calls a procedure; the notebook's new cells run);
+   on simulated R2 eleven tests (procedures, fills, changes, schemas, streams, windows, alter,
+   clients, failover and users with replicated acks, the crash run); on real R2 the procedures
+   test. Each new
+   rule was checked to fail without it (invariants 81, 83, 84, 86, 88).
 
 **Round 21 shaped tables further and took on more of Flink** (ADR-022):
 

@@ -452,6 +452,32 @@ pub fn live(meta: &TableMeta) -> String {
     if conds.is_empty() { String::new() } else { format!(" WHERE {}", conds.join(" AND ")) }
 }
 
+tokio::task_local! {
+    /// Tables a request sent along with its SQL (Arrow): its queries see them by name, nothing
+    /// else does, and they run on this node only (`POST /sql`, ADR-023).
+    pub static SENT: Arc<Vec<(String, Vec<RecordBatch>)>>;
+}
+
+/// Does this request carry tables of its own?
+pub fn sent() -> bool { SENT.try_with(|t| !t.is_empty()).unwrap_or(false) }
+
+/// Batches as an Arrow IPC stream.
+pub fn ipc(batches: &[RecordBatch]) -> Result<Vec<u8>> {
+    let schema = batches.first().map(|b| b.schema()).unwrap_or_else(|| Arc::new(Schema::empty()));
+    let mut w = datafusion::arrow::ipc::writer::StreamWriter::try_new(Vec::new(), &schema)?;
+    batches.iter().try_for_each(|b| w.write(b))?;
+    w.finish()?;
+    Ok(w.into_inner()?)
+}
+
+/// An Arrow IPC stream's batches (none for no bytes).
+pub fn read_ipc(bytes: &[u8]) -> Result<Vec<RecordBatch>> {
+    if bytes.is_empty() {
+        return Ok(vec![]);
+    }
+    Ok(datafusion::arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(bytes), None)?.collect::<Result<Vec<_>, _>>()?)
+}
+
 /// What SQL from users may do on a node: queries only. No `COPY … TO` files, no `CREATE EXTERNAL
 /// TABLE` over the node's disk, no session DDL; writes go through `write.rs`, `SET` through pg.rs.
 pub fn read_only() -> datafusion::execution::context::SQLOptions {
@@ -522,6 +548,13 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
         }
         ctx.register_catalog(ns, catalog);
     }
+    if let Ok(sent) = SENT.try_with(|t| t.clone()) {
+        for (name, batches) in sent.iter() {
+            let schema = batches.first().map(|b| b.schema()).unwrap_or_else(|| Arc::new(Schema::empty()));
+            ctx.deregister_table(name.as_str())?; // (named for this request: it wins)
+            ctx.register_table(name.as_str(), Arc::new(MemTable::try_new(schema, vec![batches.clone()])?))?;
+        }
+    }
     register_views(&ctx, views, !listing).await?; // (a listing shows what it can)
     Ok(ctx)
 }
@@ -529,7 +562,10 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
 /// The stored views (`CREATE VIEW`) `sql` names, and the ones they name; every one for a listing.
 pub async fn stored_views(lake: &Lake, sql: &str, listing: bool) -> Result<Vec<(String, String)>> {
     let (mut text, mut views) = (sql.to_string(), vec![]);
-    let stored = lake.cat.scan::<crate::ddl::StoredView>("q/", "q0").await?;
+    let mut stored = lake.cat.scan::<crate::ddl::StoredView>("q/", "q0").await?;
+    for (_, v) in stored.iter_mut() {
+        v.sql = crate::routines::expand(lake, &v.sql).await?; // (macros as they are now)
+    }
     loop {
         let more: Vec<(String, String)> = stored.iter().map(|(k, v)| (k[2..].to_string(), v.sql.clone()))
             .filter(|(n, _)| !views.iter().any(|(m, _): &(String, String)| m == n) && (listing || crate::ddl::mentions(&text, n))).collect();

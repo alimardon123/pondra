@@ -29,6 +29,9 @@ impl Auth {
 
     /// The role a bearer token grants.
     pub fn role(&self, token: Option<&str>) -> Role {
+        if let Some((role, _)) = lent(token) {
+            return role; // (a Python procedure's calls back: its caller's)
+        }
         let is = |t: &Option<String>| t.is_some() && t.as_deref() == token;
         match () {
             _ if !self.on() || is(&self.admin) => Role::Admin,
@@ -57,7 +60,7 @@ impl Auth {
             "files" if method == "GET" => Role::Read, // (objects next to the tables: files.rs)
             "files" => Role::Write,
             "stats" => Role::None, // (a health check: load balancers and the tests poll it)
-            "sql" | "lookup" | "watch" | "mcp" | "v1" | "metrics" => Role::Read, // (MCP writes are checked by `allows`; v1: the Iceberg REST catalog)
+            "sql" | "lookup" | "watch" | "mcp" | "v1" | "metrics" | "routines" => Role::Read, // (MCP writes are checked by `allows`; v1: the Iceberg REST catalog)
             "append" | "insert" => Role::Write,
             "cluster" if path.starts_with("/cluster/files") || path.starts_with("/cluster/commit") => Role::Write, // (writers on other machines)
             "cluster" if path.starts_with("/cluster/leader") => Role::None,
@@ -73,4 +76,23 @@ impl Auth {
         }
         Ok(())
     }
+}
+
+/// A token lent to a Python procedure for its calls back to the node (`routines::python`): the
+/// rights of whoever called it (and whether it may read files on this machine), until it ends.
+pub struct Lease(pub String);
+
+static LENT: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, (Role, bool)>>> = std::sync::LazyLock::new(Default::default);
+
+pub fn lend(role: Role, files: bool) -> Lease {
+    let token = format!("lease-{}", uuid::Uuid::new_v4().simple());
+    LENT.lock().unwrap().insert(token.clone(), (role, files));
+    Lease(token)
+}
+
+/// What a lent token allows, while its procedure runs.
+pub fn lent(token: Option<&str>) -> Option<(Role, bool)> { LENT.lock().unwrap().get(token?).copied() }
+
+impl Drop for Lease {
+    fn drop(&mut self) { LENT.lock().unwrap().remove(&self.0); }
 }

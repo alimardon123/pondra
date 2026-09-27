@@ -1,0 +1,23 @@
+{
+ "events": 2000000,
+ "users": 20000,
+ "producers": 4,
+ "clicks_per_s": {
+  "no views": 2378634,
+  "window view": 1011304,
+  "session view": 871234,
+  "as-of view": 463874,
+  "all three": 370698
+ },
+ "seconds_after_the_last_click": {
+  "windows": 0.51,
+  "sessions": 0.75
+ },
+ "sessions": 34000,
+ "checks": {
+  "every click in exactly one emitted window": true,
+  "every click in exactly one emitted session": true,
+  "every click enriched once, with its tier as of its time": true
+ },
+ "ok": true
+}

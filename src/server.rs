@@ -34,6 +34,7 @@ pub struct App {
     pub results: Arc<Results>,       // recent query results (see `Results`)
     pub replica: Option<Arc<crate::replica::ReplicaLog>>, // what this follower holds for the leader
     pub auth: Arc<crate::auth::Auth>,
+    pub python: Option<String>,      // the Python that runs Python procedures (`--python`)
 }
 
 /// Recent query results. By default a result is reused only at exactly the catalog version it
@@ -120,6 +121,7 @@ pub fn router(app: App) -> Router {
         .route("/lookup/{name}/{key}", get(lookup))
         .route("/watch/{name}", get(watch))
         .route("/functions", get(list_functions))
+        .route("/routines", get(|State(app): State<App>| async move { Ok::<_, E>(Json(j!(*crate::routines::listed(&app.lake).await?))) }))
         .route("/stats", get(stats))
         .route("/metrics", get(|State(app): State<App>| async move { crate::metrics::render(&app).await.map_err(E) }))
         .route("/cluster/commit", post(commit))
@@ -324,7 +326,7 @@ impl App {
         use crate::metrics::{add, QUERIES, QUERY_ERRORS, QUERY_US, SPREAD};
         let start = std::time::Instant::now();
         let run = async {
-            let nodes = if spread == Some("0") { vec![] } else { self.cluster.nodes() };
+            let nodes = if spread == Some("0") || crate::query::sent() { vec![] } else { self.cluster.nodes() }; // (rows sent with a request are here only)
             match crate::spmd::query(&self.lake, &nodes, &self.cluster.addr, query, spread == Some("1")).await {
                 Ok(Some(batches)) => {
                     crate::guard::ran_spread(query, start.elapsed());
@@ -343,7 +345,10 @@ impl App {
                     let o = state.config_mut().options_mut();
                     (o.optimizer.prefer_hash_join, o.execution.sort_spill_reservation_bytes) = (false, 1 << 20);
                 }
-                anyhow::Ok(ctx.sql_with_options(query, crate::query::read_only()).await?.collect().await?)
+                let df = ctx.sql_with_options(query, crate::query::read_only()).await?;
+                let schema = Arc::new(df.schema().as_arrow().clone());
+                let out = df.collect().await?;
+                anyhow::Ok(if out.is_empty() { vec![RecordBatch::new_empty(schema)] } else { out }) // (no rows: still its columns)
             };
             let here = std::time::Instant::now();
             let out = match run(false).await {
@@ -536,6 +541,7 @@ struct InsertParams {
 /// the table if missing.
 async fn insert(State(app): State<App>, Path(name): Path<String>, Query(p): Query<InsertParams>, query: String) -> Result<Json<Value>, E> {
     ensure!(!app.cluster.reader, "read-only node");
+    let query = crate::routines::expand(&app.lake, &query).await?;
     let ctx = session(&app.lake, &query, "").await?;
     match crate::write::write_files(&app.lake, &ctx, &name, &query, &p.job, Some(app.to().reserve().await?)).await? {
         Some(f) => Ok(Json(app.record_files(f).await?)),
@@ -550,7 +556,8 @@ async fn files(State(app): State<App>, Json(f): Json<crate::write::Files>) -> Re
 
 /// Body: `{"source": "events", "target": "per_user", "sql": "SELECT … FROM events …"}`.
 async fn create_task(State(app): State<App>, Path(name): Path<String>, body: String) -> Result<Json<Value>, E> {
-    let task: Task = serde_json::from_str(&body)?;
+    let mut task: Task = serde_json::from_str(&body)?;
+    task.sql = crate::routines::expand(&app.lake, &task.sql).await?;
     crate::tasks::create(&app.lake, &name, &task).await?;
     Ok(Json(j!({"task": name})))
 }
@@ -560,6 +567,7 @@ async fn create_task(State(app): State<App>, Path(name): Path<String>, body: Str
 /// window of column `w` once, final, to `{name}_final`; `?session=ts&gap_secs=30&lateness_secs=5`
 /// makes it a session view (`views.rs`): `CREATE MATERIALIZED VIEW … WITH (…)` in SQL.
 async fn create_view(State(app): State<App>, Path(name): Path<String>, Query(options): Query<std::collections::BTreeMap<String, String>>, sql: String) -> Result<Json<Value>, E> {
+    let sql = crate::routines::expand(&app.lake, &sql).await?; // (as they are now: ADR-023)
     let d = crate::ddl::Ddl::CreateMaterialized { name, sql, options };
     let out = {
         let _guard = app.lock.lock().await;
@@ -643,32 +651,52 @@ struct SqlParams {
 /// SQL may read files on this machine, as `pondra sql` may (invariant 21: nobody else's).
 fn owner(headers: &axum::http::HeaderMap) -> bool {
     static KEY: std::sync::LazyLock<Option<String>> = std::sync::LazyLock::new(|| std::env::var("PONDRA_OWNER_KEY").ok().filter(|k| k.len() >= 16));
-    KEY.as_deref().is_some_and(|k| headers.get("x-pondra-owner").is_some_and(|h| h.as_bytes() == k.as_bytes()))
+    let token = headers.get("authorization").and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer "));
+    crate::auth::lent(token).is_some_and(|l| l.1) // (a Python procedure the owner called)
+        || KEY.as_deref().is_some_and(|k| headers.get("x-pondra-owner").is_some_and(|h| h.as_bytes() == k.as_bytes()))
 }
 
-async fn sql(State(app): State<App>, Query(p): Query<SqlParams>, role: axum::Extension<crate::auth::Role>, headers: axum::http::HeaderMap, query: String) -> Result<Response, E> {
-    if crate::write::checkpoint(&query) {
-        ensure!(role.0 >= crate::auth::Role::Write, "CHECKPOINT needs a write token");
-        return Ok(Json(app.checkpoint().await?).into_response());
-    }
-    let files = owner(&headers);
-    if let Some(stmt) = crate::write::parse(&query) {
-        app.auth.allows(role.0, &stmt)?;
-        return Ok(Json(crate::write::on_node_as(&app, stmt, p.job.clone(), files).await?).into_response()); // CREATE / INSERT / UPDATE / DELETE
-    }
+/// `POST /sql`: statements (SQL, or JSON with `$name` parameters, or that and tables of the
+/// caller's own: `routines::Request`), run in order; the last one's answer. A single query as it
+/// was sent may be answered from `Results`.
+async fn sql(State(app): State<App>, Query(p): Query<SqlParams>, role: axum::Extension<crate::auth::Role>, headers: axum::http::HeaderMap, body: Bytes) -> Result<Response, E> {
+    use crate::routines::{Outcome, Who};
+    let kind = headers.get("content-type").and_then(|v| v.to_str().ok()).unwrap_or_default();
+    let req = crate::routines::Request::read(kind, &body)?;
+    let depth = headers.get("x-pondra-depth").and_then(|v| v.to_str().ok()?.parse().ok()).unwrap_or(0); // (a Python procedure's own calls)
+    let who = Who { role: role.0, files: owner(&headers), depth };
     if let Some(seg) = p.after {
         let mut hwm = app.lake.hwm.subscribe();
         let _ = tokio::time::timeout(Duration::from_secs(30), async { while app.lake.visible() < seg { hwm.changed().await.ok()?; } Some(()) }).await;
     }
-    let format = p.format.as_deref().unwrap_or("json");
-    let kind = match format {
-        "table" => "text/plain",
-        "arrow" => "application/vnd.apache.arrow.stream",
+    if let ([one], true, true, true) = (&crate::routines::split(&req.sql)[..], req.params.is_empty(), req.tables.is_empty(), req.views.is_empty()) {
+        let one = crate::routines::expand(&app.lake, one).await?;
+        if !crate::write::checkpoint(&one) && crate::routines::call_of(&one).is_none() && crate::write::parse(&one).is_none() {
+            return Ok(query(&app, &p, &one, who.files).await?);
+        }
+    }
+    let tables = Arc::new(req.tables);
+    match crate::query::SENT.scope(tables, crate::routines::script(&app, &req.sql, &req.params, &req.views, who, p.job.clone())).await? {
+        Outcome::Rows(batches) => Ok(([("content-type", content_type(&p))], render(&batches, p.format.as_deref())?).into_response()),
+        Outcome::Done(v) => Ok(Json(v).into_response()),
+    }
+}
+
+fn content_type(p: &SqlParams) -> &'static str {
+    match p.format.as_deref() {
+        Some("table") => "text/plain",
+        Some("arrow") => "application/vnd.apache.arrow.stream",
         _ => "application/json",
-    };
-    let respond = |body: bytes::Bytes| ([("content-type", kind)], body).into_response();
+    }
+}
+
+/// One query: a key lookup without planning, a remembered answer, or run (once for everyone who
+/// asks at the same moment).
+async fn query(app: &App, p: &SqlParams, query: &str, files: bool) -> anyhow::Result<Response> {
+    let format = p.format.as_deref().unwrap_or("json");
+    let respond = |body: bytes::Bytes| ([("content-type", content_type(p))], body).into_response();
     if format == "json" {
-        if let Some(body) = crate::serve::point_sql(&app.lake, &query).await? {
+        if let Some(body) = crate::serve::point_sql(&app.lake, query).await? {
             return Ok(respond(body.into())); // a key lookup: no planning
         }
     }
@@ -676,7 +704,7 @@ async fn sql(State(app): State<App>, Query(p): Query<SqlParams>, role: axum::Ext
     // or may read a file on this machine).
     let q = query.to_lowercase();
     let volatile = files || ["now()", "random(", "current_", "uuid(", "explain"].iter().any(|f| q.contains(f));
-    let Some(version) = app.lake.version_for(&query).await.filter(|_| !volatile) else { return Ok(respond(run_sql(&app, &p, &query, files).await?)) };
+    let Some(version) = app.lake.version_for(query).await.filter(|_| !volatile) else { return Ok(respond(run_sql(app, p, query, files).await?)) };
     let key = format!("{format}|{}|{query}", p.spread.as_deref().unwrap_or(""));
     let stale = p.stale_ms.filter(|_| p.after.is_none()).map(Duration::from_millis); // (read-your-writes wins)
     if let Some(body) = app.results.get(&key, version, stale) {
@@ -691,8 +719,8 @@ async fn sql(State(app): State<App>, Query(p): Query<SqlParams>, role: axum::Ext
         return Ok(respond(body.clone()));
     }
     (slot.0, slot.1) = (flight.0.load(std::sync::atomic::Ordering::Relaxed), None);
-    let version = app.lake.version_for(&query).await; // (read after `covers`: this run reads at least this)
-    let body = run_sql(&app, &p, &query, false).await?;
+    let version = app.lake.version_for(query).await; // (read after `covers`: this run reads at least this)
+    let body = run_sql(app, p, query, false).await?;
     if let Some(v) = version {
         app.results.put(key, v, body.clone());
     }
@@ -706,16 +734,15 @@ async fn run_sql(app: &App, p: &SqlParams, query: &str, files: bool) -> anyhow::
         true => app.query_as(&crate::asof::rewrite(query)?, Some("0"), true).await?, // (a file here: this node only)
         false => app.query(query, p.spread.as_deref()).await?,
     };
-    Ok(bytes::Bytes::from(match p.format.as_deref() {
-        Some("table") => pretty_format_batches(&batches)?.to_string().into_bytes(),
-        Some("arrow") => {
-            // Arrow IPC: straight into pandas / Polars / DuckDB, no JSON parsing
-            let schema = batches.first().map(|b| b.schema()).unwrap_or_else(|| Arc::new(datafusion::arrow::datatypes::Schema::empty()));
-            let mut w = datafusion::arrow::ipc::writer::StreamWriter::try_new(Vec::new(), &schema)?;
-            batches.iter().try_for_each(|b| w.write(b))?;
-            w.finish()?;
-            w.into_inner()?
-        }
+    render(&batches, p.format.as_deref())
+}
+
+/// Rows as `?format=` asks: JSON, a text table, or Arrow IPC (straight into pandas, Polars and
+/// DuckDB, no JSON parsing).
+fn render(batches: &[RecordBatch], format: Option<&str>) -> anyhow::Result<bytes::Bytes> {
+    Ok(bytes::Bytes::from(match format {
+        Some("table") => pretty_format_batches(batches)?.to_string().into_bytes(),
+        Some("arrow") => crate::query::ipc(batches)?,
         _ => {
             let mut w = arrow_json::ArrayWriter::new(Vec::new());
             w.write_batches(&batches.iter().collect::<Vec<_>>())?;

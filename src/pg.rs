@@ -110,7 +110,8 @@ fn user_error(e: anyhow::Error) -> PgWireError {
 impl Backend {
     /// Run one statement the way `POST /sql` does, for a client whose role comes from its user name.
     async fn run(&self, user: &str, sql: &str, format: &Format) -> PgWireResult<Response> {
-        let sql = crate::asof::rewrite(&pg_dialect(&self.app.lake, sql)).map_err(user_error)?.into_owned();
+        let sql = crate::routines::expand(&self.app.lake, sql).await.map_err(user_error)?; // (macros: ADR-023)
+        let sql = crate::asof::rewrite(&pg_dialect(&self.app.lake, &sql)).map_err(user_error)?.into_owned();
         if let Some(r) = session_command(&sql) {
             return Ok(r);
         }
@@ -118,6 +119,16 @@ impl Backend {
             return self.copy_out(copy?).await;
         }
         let role = self.app.auth.role_of_user(user);
+        if crate::routines::call_of(&sql).is_some() {
+            let who = crate::routines::Who { role, files: false, depth: 0 };
+            return match crate::routines::one(&self.app, &sql, who, None).await.map_err(user_error)? {
+                crate::routines::Outcome::Rows(batches) => {
+                    let schema = batches.first().map(|b| b.schema()).unwrap_or_else(|| Arc::new(datafusion::arrow::datatypes::Schema::empty()));
+                    Ok(Response::Query(rows(&schema, batches, format)?))
+                }
+                crate::routines::Outcome::Done(_) => Ok(Response::Execution(Tag::new("CALL"))),
+            };
+        }
         if let Some(stmt) = crate::write::parse(&sql) {
             self.app.auth.allows(role, &stmt).map_err(user_error)?;
             let tag = sql.split_whitespace().next().unwrap_or("OK").to_uppercase();
@@ -548,7 +559,7 @@ impl SimpleQueryHandler for Backend {
     {
         let user = client.metadata().get("user").cloned().unwrap_or_default();
         let mut out = vec![];
-        for q in query.split(';').map(str::trim).filter(|q| !q.is_empty()) {
+        for q in crate::routines::split(query).iter().map(|q| q.trim()) {
             out.push(match Copy::of(q) {
                 Some(Ok(c)) if !c.to => self.copy_in(client, &user, c).await?,
                 _ => self.run(&user, q, &Format::UnifiedText).await?,

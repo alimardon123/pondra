@@ -117,7 +117,8 @@ def package_checks(work):
 def notebook_check(py, wheel, work):
     """examples/quickstart.ipynb, run as a notebook user would, from its own `%pip install` on:
     no cell may fail; the as-of join prices order 5000 (20 teas after the UPDATE) at the later tea
-    price, the widened column holds 5 billion, and the late position didn't replace the newer one."""
+    price, the widened column holds 5 billion, the late position didn't replace the newer one, a
+    frame shows its SQL, SQL joins pandas data, and a macro prices with tax."""
     run([py, "-m", "pip", "install", "-q", "nbclient", "nbformat", "ipykernel", "pandas"])
     folder = os.path.join(work, "notebook")
     os.makedirs(folder)
@@ -127,6 +128,8 @@ nb = nbformat.read({os.path.join(HERE, "..", "examples", "quickstart.ipynb")!r},
 nbclient.NotebookClient(nb, timeout=300, kernel_name="python3", resources={{"metadata": {{"path": {folder!r}}}}}).execute()
 text = "".join(o.get("data", {{}}).get("text/plain", "") for c in nb.cells if c.cell_type == "code" for o in c.outputs)
 assert "5000   tea" in text and "70.0" in text and "5000000000" in text and "41.3" in text, text[-600:]
+assert "WITH _" in "".join(o.get("text", "") for c in nb.cells if c.cell_type == "code" for o in c.outputs), "frame.sql"  # (R12: a frame's SQL)
+assert "met" in text and "gross" in text, text[-600:]  # (R12: SQL naming pandas data; R13: a macro)
 print("ok:", len(nb.cells), "cells")
 """
     return run([py, "-c", code], env={**{k: v for k, v in os.environ.items() if k != "PONDRA_BIN"}, "PONDRA_WHEEL": wheel})

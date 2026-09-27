@@ -30,6 +30,7 @@ mod ranges;
 mod sketch;
 mod skew;
 mod replica;
+mod routines;
 mod server;
 mod spill;
 mod spmd;
@@ -163,6 +164,11 @@ enum Cmd {
         /// node ends, however it ends (`pondra.local()` in Python and JavaScript, the shell).
         #[arg(long)]
         stop_with_stdin: bool,
+        /// Run Python procedures (`CREATE PROCEDURE … LANGUAGE python`) with this Python, which
+        /// has the `pondra` package. A procedure runs any code on this machine, so only an admin
+        /// token makes one, and a node without tokens takes this only when it listens on 127.0.0.1.
+        #[arg(long)]
+        python: Option<String>,
     },
     /// Print catalog entries whose keys start with `prefix` (t/ tables, s/ segments, p/ producers…).
     Catalog {
@@ -181,6 +187,22 @@ enum Cmd {
         #[arg(long)]
         attach: Vec<String>,
         query: String,
+    },
+    /// Run a SQL file — its statements in order, `$name` taking the value of `--name` — on a node
+    /// of the lake started for it (`pondra run load.sql lake --day 2026-09-27`), or on a node
+    /// already running (`--url http://host:8080`).
+    Run {
+        file: String,
+        /// The lake (a folder or s3://bucket/prefix; default ./lake), unless `--url`.
+        lake: Option<String>,
+        #[arg(long)]
+        url: Option<String>,
+        /// A token for that node (also PONDRA_TOKEN).
+        #[arg(long)]
+        token: Option<String>,
+        /// The file's parameters: `--name value` …
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
+        params: Vec<String>,
     },
 }
 
@@ -207,12 +229,14 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let Some(cmd) = cli.cmd else { return shell::run(&cli.lake.unwrap_or_else(|| "lake".into())).await };
     match cmd {
-        Cmd::Serve { dir, addr, reader, flush_ms, tier_secs, task_ms, memory_gb, retain_secs, changelog_secs, backlog, cache_dir, cache_gb, ack, replicas, fsync, publish, pg, kafka, kafka_advertise, flight, read_token, write_token, admin_token, attach: attached, stop_with_stdin } => {
+        Cmd::Serve { dir, addr, reader, flush_ms, tier_secs, task_ms, memory_gb, retain_secs, changelog_secs, backlog, cache_dir, cache_gb, ack, replicas, fsync, publish, pg, kafka, kafka_advertise, flight, read_token, write_token, admin_token, attach: attached, stop_with_stdin, python } => {
             let env = |flag: Option<String>, var: &str| flag.or_else(|| std::env::var(var).ok()).filter(|t| !t.is_empty());
             let auth = Arc::new(auth::Auth::new(env(read_token, "PONDRA_READ_TOKEN"), env(write_token, "PONDRA_WRITE_TOKEN"), env(admin_token.clone(), "PONDRA_ADMIN_TOKEN")));
             if let Some(t) = env(admin_token, "PONDRA_ADMIN_TOKEN") {
                 std::env::set_var("PONDRA_ADMIN_TOKEN", t); // (nodes call each other with it: cluster::http)
             }
+            let local = ["127.0.0.1:", "localhost:", "[::1]:"].iter().any(|a| addr.starts_with(a));
+            anyhow::ensure!(python.is_none() || auth.on() || local, "--python lets whoever makes a procedure run code on this machine: set --admin-token, or listen on 127.0.0.1");
             if let Some(gb) = cache_gb {
                 std::env::set_var("PONDRA_CACHE_GB", gb.to_string()); // read by Lake::open
             }
@@ -288,7 +312,7 @@ async fn main() -> anyhow::Result<()> {
                 };
                 Arc::new(log::Log::start(lake.clone(), Duration::from_millis(flush_ms), to))
             });
-            let app = server::App { lake: lake.clone(), cluster: cluster.clone(), log, seq, lock: Default::default(), retain_ms: retain_secs * 1000, results: Default::default(), replica: replica.clone(), auth };
+            let app = server::App { lake: lake.clone(), cluster: cluster.clone(), log, seq, lock: Default::default(), retain_ms: retain_secs * 1000, results: Default::default(), replica: replica.clone(), auth, python };
             if let Some(pg_addr) = pg {
                 let a = app.clone();
                 tokio::spawn(async move { pg::serve(a, pg_addr).await.map_err(|e| eprintln!("postgres protocol: {e:#}")) });
@@ -393,6 +417,12 @@ async fn main() -> anyhow::Result<()> {
             let listener = axum::serve::ListenerExt::tap_io(tokio::net::TcpListener::bind(&addr).await?, |tcp| drop(tcp.set_nodelay(true)));
             axum::serve(listener, server::router(app)).await?;
         }
+        Cmd::Run { file, lake, url, token, params } => {
+            let sql = std::fs::read_to_string(&file).map_err(|e| anyhow::anyhow!("{file}: {e}"))?;
+            let body = serde_json::json!({"sql": sql, "params": shell::params(&params)?});
+            let token = token.or_else(|| std::env::var("PONDRA_TOKEN").ok());
+            print!("{}", shell::script(lake.as_deref().unwrap_or("lake"), url.as_deref(), token.as_deref(), body).await?);
+        }
         Cmd::Catalog { dir, prefix } => {
             let lake = store::Lake::open(&dir, false, false).await?;
             match prefix.starts_with("d/") {
@@ -423,6 +453,7 @@ async fn main() -> anyhow::Result<()> {
                     attach(&lake, spec, "", false).await?;
                 }
                 ddl::sync(&lake, "", false).await?;
+                let query = routines::expand(&lake, &query).await?;
                 let batches = query::session(&lake, &query, "").await?.enable_url_table().sql(&query).await?.collect().await?;
                 println!("{}", pretty_format_batches(&batches)?);
             }

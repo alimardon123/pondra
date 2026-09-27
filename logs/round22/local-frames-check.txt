@@ -1,0 +1,32 @@
+{"pipeline": "filter + select", "equal": true}
+{"pipeline": "with_columns: new and replaced", "equal": true}
+{"pipeline": "group_by: sum mean min max count n_unique len", "equal": true}
+{"pipeline": "group_by two keys, std and var", "equal": true}
+{"pipeline": "sort desc (nulls first) + limit", "equal": true}
+{"pipeline": "sort nulls_last, then filter and select (the sort kept)", "equal": true}
+{"pipeline": "join inner", "equal": true}
+{"pipeline": "join left", "equal": true}
+{"pipeline": "join full", "equal": true}
+{"pipeline": "join semi / anti", "equal": true}
+{"pipeline": "join left_on/right_on, a clashing name", "equal": true}
+{"pipeline": "join cross (small)", "equal": true}
+/home/claude/pondra/tools/frames_check.py:264: UserWarning: Sortedness of columns cannot be checked when 'by' groups provided
+  ok, why = compare(f(con, ours["orders"], ours["users"], ours["quotes"]).collect(), g(theirs["orders"], theirs["users"], theirs["quotes"]).collect().to_arrow(), ordered)
+{"pipeline": "join_asof backward by", "equal": true}
+{"pipeline": "unique", "equal": true}
+{"pipeline": "drop, rename, cast", "equal": true}
+{"pipeline": "when / then / otherwise", "equal": true}
+{"pipeline": "is_in, is_between, is_null, fill_null", "equal": true}
+{"pipeline": "fill_null over the frame, drop_nulls", "equal": true}
+{"pipeline": "str: case, contains, starts_with, len, slice, replace_all", "equal": true}
+{"pipeline": "dt: year month day weekday hour, truncate, date", "equal": true}
+{"pipeline": "over: sum, rank dense, shift, cum_sum", "equal": true}
+{"pipeline": "rank average", "equal": true}
+{"pipeline": "concat vertical and diagonal", "equal": true}
+{"pipeline": "division, floor division, modulo", "equal": true}
+{"pipeline": "round, abs, sqrt, clip", "equal": true}
+{"pipeline": "SQL snippets inside frame methods", "equal": true}
+{"one question, every way": {"frames alone": true, "SQL, then frames": true, "a frame named in SQL": true, "pandas named in SQL": true, "keywords: {frame}, $param": true, "a .sql file, then Python": true, "a view made from a frame, read by SQL": true, "a %%sql cell": true, "a Python procedure CALLed from SQL": true, "\u2026and from Python": true, "\u2026and a Python file kept as one": true}, "answer": [{"tier": "gold", "revenue": 15660.56}, {"tier": "new", "revenue": 14847.31}, {"tier": "plain", "revenue": 12244.65}]}
+{"sorts": {"sort, then limit: the top rows": true, "sort, filter, select, limit": true}}
+{"writes": {"write_table: create, then append": true, "update, delete": true, "merge (delta-rs's names): matched updated, new inserted": true, "merge (Delta on Spark's names)": true, "saveAsTable append": true}}
+{"pipelines_equal": 26, "pipelines": 26, "ways_equal": 11, "ways": 11, "ok": true}
