@@ -267,7 +267,8 @@ Why this order:
    scripts, or for GitHub's Windows runners.
 3. **Publishing (in progress).** PyPI: a pending trusted publisher for `release.yml`, environment
    `pypi`. npm: a token (the `NPM_TOKEN` secret) for the first release, then each package's
-   Trusted Publisher set to `release.yml` and the token removed. Then tag `v0.21.0`. crates.io
+   Trusted Publisher set to `release.yml` and the token removed. Then tag `v0.22.0` (`v0.21.0`
+   failed on Windows before publishing anything; fixed). crates.io
    can wait (`publish = false`).
 
 ## What not to do yet

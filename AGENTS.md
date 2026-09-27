@@ -50,7 +50,8 @@ tools/    harness.py, cluster.py (tests), open_check.py (Delta + Iceberg readers
           cloud/ (a cluster on several machines; cloud/actions/ + .github/workflows/: on GitHub runners),
           bench/tpch-queries/ (the 22 TPC-H queries),
           r2_test.sh (run the suite against a real bucket), bench/ (vs Spark and Flink),
-          package.py (wheels and npm packages from a binary), anywhere_check.py (the shell, local(),
+          package.py (wheels and npm packages from a binary), try_packages.sh (them installed and
+          tried, as CI does on each OS), anywhere_check.py (the shell, local(),
           the packages, the notebook; old Linux in docker), bench/repeat.py (one query many times)
 docs/     ADRs and reports; lake-format.md is the on-disk layout
 ```
@@ -668,7 +669,8 @@ python3 tools/serve_bench.py --keys 2000000   # serving: point lookups and dashb
 
 The Python tools need `pip install -r tools/requirements.txt` (Python 3.11; the versions the
 suite last passed with). `.github/workflows/build.yml` runs `harness.py all` and a failover on
-every push with them.
+every push with them, and on Linux, Windows and macOS makes the pip and npm packages and tries
+them (`tools/try_packages.sh`), so packaging that breaks on one OS shows on a push, not on a tag.
 
 Add `--s3` to any of them with a simulated-R2 bucket to see the object-storage behaviour:
 
@@ -728,7 +730,11 @@ owner from the bundles (the sandbox can't push). It is public and, since round 2
 **MIT OR Apache-2.0** (`LICENSE-MIT`, `LICENSE-APACHE`); the wheel and npm packages carry both.
 The owner is setting up PyPI (trusted publisher: `release.yml`, environment `pypi`) and npm (a
 token for the first release, trusted publishing after); a `v*` tag then builds, tries and
-publishes (`.github/workflows/release.yml`); `publish = false` keeps the crate off crates.io. Its history was rewritten once, before it went public, to
+publishes (`.github/workflows/release.yml`); `publish = false` keeps the crate off crates.io.
+The first tag, `v0.21.0`, failed on Windows when packaging (`npm` is `npm.cmd` there, which
+`subprocess` doesn't look for), so nothing was published; fixed after round 22, with checkouts
+kept at `\n` line endings everywhere (`.gitattributes`) and `pondra`'s own npm package
+uploaded from Linux only. Its history was rewritten once, before it went public, to
 put the owner's GitHub noreply address on the four commits that had their email; commit IDs from
 before then (in older bundles) differ. Each round the owner downloads the new bundle and, in
 their clone, runs `git pull <bundle> main` and `git push`; GitHub then builds it on Linux,
@@ -914,8 +920,8 @@ Rounds 17–22 are done except what needs the owner (publishing, cluster-bench r
 1. **Round 23, use it from anything:** a console at `/`, live queries (`GET /live?sql=…`), dbt
    over the Postgres port and BI tools on Windows; procedures on a schedule; `pondra run
    models/`.
-2. **Publish:** once the owner's PyPI pending publisher and npm token are in place, tag
-   `v0.22.0` and let `.github/workflows/release.yml` build, try and publish.
+2. **Publish:** once the owner's PyPI pending publisher and npm token are in place, start
+   `release.yml` by hand (publish unticked) to try all five platforms, then tag `v0.22.0`.
 3. **Security before anyone else's data:** TLS on the node port and mutual TLS between nodes, then
    grants (roadmap E3).
 4. **Then:** machines in one data centre for the cluster bench, the in-process library, the

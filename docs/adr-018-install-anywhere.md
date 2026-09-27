@@ -149,8 +149,17 @@ DuckDB's is its engine's too. The portable binary is 97 MB, and 33 MB compressed
   tried in CentOS 7 and Ubuntu 22.04 containers.
 - **Publishes** to a GitHub release, PyPI (trusted publishing: no token) and npm (`NPM_TOKEN`).
 
-It hasn't run: the sandbox can't push, and publishing needs the package names reserved and, for
-free runners of any size, the owner's call on the repository.
+Its first run, on the tag `v0.21.0` (2026-09-27), stopped on Windows while packaging: `npm` is
+`npm.cmd` there, and a process started without a shell isn't looked up with `.cmd`, so
+`package.py` finds it with `shutil.which`. Nothing was published (publishing waits for every
+platform). Since then:
+
+- The build workflow makes and tries the packages on Linux, Windows and macOS on every push
+  (`tools/try_packages.sh`, which the release uses too), so this shows before a tag.
+- Every OS checks the repository out with `\n` line endings (`.gitattributes`; Git on Windows
+  turns them to `\r\n` by default), so the packages made on each are the same and scripts run
+  in Git Bash.
+- `pondra`'s own npm package, which every platform makes to try, is uploaded from Linux only.
 
 ## What it measures
 

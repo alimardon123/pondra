@@ -55,14 +55,8 @@ jobs:
           fi
       - name: Package
         run: python tools/package.py --bin target/${{ matrix.target }}/dist/pondra${{ matrix.exe }} --platform ${{ matrix.platform }} --npm-main --out dist
-      - name: Try the wheel and the npm package here
-        run: |
-          python -m venv /tmp/venv && source /tmp/venv/bin/activate 2>/dev/null || source /tmp/venv/Scripts/activate
-          pip install dist/*.whl pyarrow
-          python tools/package_check.py
-          mkdir /tmp/npm && cd /tmp/npm && npm init -y > /dev/null
-          npm install "$GITHUB_WORKSPACE"/dist/pondra-${{ matrix.platform }}-*.tgz "$GITHUB_WORKSPACE"/dist/pondra-[0-9]*.tgz
-          cp "$GITHUB_WORKSPACE/tools/package_check.mjs" . && node package_check.mjs
+      - name: Try the wheel and the npm packages here
+        run: bash tools/try_packages.sh ${{ matrix.platform }}
       - name: Try the Linux wheel on glibc 2.17 (CentOS 7) and on Ubuntu 22.04
         if: matrix.platform == 'linux-x64'
         run: |
@@ -73,7 +67,14 @@ jobs:
       - uses: actions/upload-artifact@v6
         with:
           name: pondra-${{ matrix.platform }}
-          path: dist/*
+          path: |
+            dist/*.whl
+            dist/pondra-${{ matrix.platform }}-*.tgz
+      - uses: actions/upload-artifact@v6 # (`pondra` itself, the same from every platform: published from one)
+        if: matrix.platform == 'linux-x64'
+        with:
+          name: pondra-npm
+          path: dist/pondra-[0-9]*.tgz
 
   publish:
     needs: build

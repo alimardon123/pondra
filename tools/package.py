@@ -65,7 +65,10 @@ def wheel(binary, platform, out):
 
 
 def npm_pack(folder, out):
-    return subprocess.run(["npm", "pack", "--pack-destination", os.path.abspath(out)], cwd=folder, check=True, capture_output=True, text=True).stdout.strip().splitlines()[-1]
+    npm = shutil.which("npm.cmd" if os.name == "nt" else "npm")  # (on Windows npm is npm.cmd, which a process started without a shell isn't looked up as)
+    if not npm:
+        sys.exit("npm is needed to make the npm packages")
+    return subprocess.run([npm, "pack", "--pack-destination", os.path.abspath(out)], cwd=folder, check=True, capture_output=True, text=True).stdout.strip().splitlines()[-1]
 
 
 def npm_platform(binary, platform, out):

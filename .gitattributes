@@ -1,0 +1,3 @@
+# Text files are checked out with \n on every OS, Windows too (its Git turns them to \r\n by
+# default): the packages made on each platform are the same, and shell scripts run in Git Bash.
+* text=auto eol=lf
