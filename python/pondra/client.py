@@ -21,6 +21,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+import warnings
 
 from .frame import Frame, _literal, _quote, sql_type, trailing_order
 
@@ -269,13 +270,26 @@ class Pondra:
                     raise
                 time.sleep(min(0.1 * 2 ** attempt, 5))  # the same seq again: applied once
 
-    def view(self, name, sql, **options):
-        """A view: `sql` over the rows already there, then over each new batch of rows, committed
-        with them (with GROUP BY, kept per key). Options make it emit what is final: `window="w", size_secs=60, lateness_secs=10` (and
-        `slide_secs=10`: sliding), or `session="ts", gap_secs=1800`; `join="streams", time="ts",
-        within_secs=600` pairs two tables' rows as either arrives. Asking again changes nothing."""
-        query = urllib.parse.urlencode(options)
-        return json.loads(self._call("POST", f"/views/{name}" + (f"?{query}" if query else ""), sql.encode()))
+    def view(self, name, query, materialized=None, temporary=False, replace=None, **options):
+        """A view others read by name, as SQL's `CREATE VIEW` and a frame's `to_view` make one:
+        `query` (SQL or a frame) runs over the tables as they are when the view is read.
+        `materialized=True`: kept up to date instead (`CREATE MATERIALIZED VIEW`), filled from the
+        rows already there, then with each batch of new rows, committed with them (with GROUP BY,
+        kept per key); `options` make it emit what is final: `window="w", size_secs=60,
+        lateness_secs=10` (and `slide_secs=10`: sliding), `session="ts", gap_secs=1800`, or
+        `join="streams", time="ts", within_secs=600`. `temporary`: this connection's only.
+        The view, as a frame."""
+        if materialized is None and options:  # (up to 0.22, db.view made every view a materialized one)
+            warnings.warn("db.view(…) with window/session/join options: pass materialized=True (a view is a stored query unless asked)", DeprecationWarning, stacklevel=2)
+            materialized = True
+        frame = query if isinstance(query, Frame) else Frame(self, query)
+        return frame.to_view(name, temporary=temporary, materialized=bool(materialized), replace=replace, **options)
+
+    def write_table(self, name, data, mode="create"):
+        """Rows into a table, as a frame's `write_table`: `data` is a frame, SQL, or pandas / Polars
+        / Arrow data (a list of dicts too); `mode` create, append or overwrite."""
+        frame = data if isinstance(data, Frame) else Frame(self, data) if isinstance(data, str) else self.from_arrow(data)
+        return frame.write_table(name, mode)
 
     def lookup(self, table, key):
         """The current row of one key of a keyed table (None if absent)."""

@@ -15,10 +15,11 @@ version = subprocess.run([pondra.binary(), "--version"], capture_output=True, te
 print(version, "(with pyarrow)" if arrow else "(no pyarrow)")
 with pondra.local(lake, python=arrow) as db:
     db.sql("CREATE TABLE t (id BIGINT, v VARCHAR)")
-    db.view("per_v", "SELECT v, count(*) AS n FROM t GROUP BY v")
+    db.view("per_v", "SELECT v, count(*) AS n FROM t GROUP BY v", materialized=True)  # (kept up to date)
     db.append("t", [{"id": 1, "v": "a"}, {"id": 2, "v": "b"}, {"id": 3, "v": "a"}])
     rows = db.sql("SELECT v, n FROM per_v ORDER BY v").rows()
     assert rows == [{"v": "a", "n": 2}, {"v": "b", "n": 1}], rows
+    assert db.view("recent", "SELECT * FROM t WHERE id > 1").select(pondra.len()).item() == 2  # (a stored query)
     # a frame, and SQL naming it
     frame = db.table("t").group_by("v").agg(pondra.len().alias("n")).sort("v")
     assert db.sql("SELECT * FROM frame WHERE n > $k", k=1).rows() == [{"v": "a", "n": 2}]

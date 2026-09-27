@@ -1,0 +1,14 @@
+# 0.23.0: one name, one meaning (ADR-025), 2026-09-28, release build, local disk
+## frames_check.py (section 5, "names"), with this change
+{"names": {"db.view is a stored query, as CREATE VIEW and to_view make": true, "…materialized=True keeps it up to date, from SQL or a frame": true, "…all three answer alike": true, "options without materialized=True are refused": true, "0.22's db.view(…, window=…): still materialized, with a warning": true, "db.write_table: pandas data, then a frame, as a frame's write_table": true}}
+{"pipelines_equal": 26, "pipelines": 26, "ways_equal": 11, "ways": 11, "ok": true}
+## the same with 0.22's client (python/pondra/client.py and frame.py at HEAD): fails
+    return json.loads(self._call("POST", f"/views/{name}" + (f"?{query}" if query else ""), sql.encode()))
+AttributeError: 'Frame' object has no attribute 'encode'
+## tools/package.py + tools/try_packages.sh linux-x64 (as CI's Linux job): wheel without and with pyarrow, npm, installer
+pondra 0.23.0 (with pyarrow)
+ok: [{'v': 'a', 'n': 2}, {'v': 'b', 'n': 1}]
+ok: [{"v":"a","n":2},{"v":"b","n":1}]        (package_check.mjs: a materialized view, a stored one, db.call)
+pondra 0.23.0
+packages and installer ok
+## harness.py clients: exit 0, 0 false; harness.py procedures: exit 0, 0 false

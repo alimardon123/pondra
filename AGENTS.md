@@ -231,7 +231,8 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
   a key's rows is current (`query::latest_sql`: the greatest, then the last to come); such tables
   read by grouping every generation, not by shadowing. A keyed table's `_deleted` is left out of
   reads unless a query names it (`query::named`).
-- **Frames** (round 22, ADR-023, `python/pondra/`): `pondra.frame` (Polars' names) and
+- **Frames** (round 22, ADR-023, `python/pondra/`; one set of names with SQL and the connection:
+  ADR-025): `pondra.frame` (Polars' names) and
   `pondra.spark` (PySpark's) build one SQL statement, a CTE per step; the engine sees only SQL.
   `con.sql` gives a frame; a name the lake lacks is looked up among the caller's Python names (a
   frame goes into the query's `WITH`, pandas / Polars / Arrow data travel with the request as its
@@ -637,6 +638,12 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    and a view's emptied groups, as every later fold does (invariants 5, 19). `harness.py deal`: a
    first round on three nodes, deleted keys stay deleted and a view keeps an UPDATE of a total;
    both fail without it.
+94. **A client's names mean what SQL's do, from the connection and from a frame** (ADR-025):
+   `view` is a stored query (`CREATE VIEW`) unless `materialized=True` (`CREATE MATERIALIZED
+   VIEW`), in Python's `db.view` and `to_view` and JavaScript's `view`; a connection's verb takes
+   what the frame's is called on (`db.view(name, frame)` is `frame.to_view(name)`, `db.write_table`
+   is `frame.write_table`); a materialized view's options without `materialized` are refused.
+   `frames_check.py` section 5 fails with 0.22's client.
 
 ## Tests: run these before and after any change
 
@@ -784,7 +791,8 @@ publisher (`release.yml`, environment `pypi`, "Allow npm publish"); from 0.22.1 
 publishes PyPI and npm with no token. 0.22.1 (the tag at 3c59e6a) is on PyPI and npm with its
 installers on the release; from the sandbox, the Linux one-liner put `pondra` on PATH in a clean
 shell and the PyPI wheel answered `FROM t` without pyarrow (`logs/round22/0.22.1-published.txt`).
-From 0.22.2 on, a tag publishes what the build workflow made and tested. Its history was rewritten once, before it went public, to
+`v0.22.2` (the fix of invariant 93) was tagged at c47e2c7, which still builds on the tag; from
+0.23.0 on, a tag publishes what the build workflow made and tested. Its history was rewritten once, before it went public, to
 put the owner's GitHub noreply address on the four commits that had their email; commit IDs from
 before then (in older bundles) differ. Each round the owner downloads the new bundle and, in
 their clone, runs `git pull <bundle> main` and `git push`; GitHub then builds it on Linux,
@@ -981,13 +989,18 @@ Known limits, in the order they matter:
 Good next moves: `docs/roadmap.md` (2026-09-27, after round 22) is the plan, with the reasons.
 Rounds 17–22 are done except what needs the owner (publishing, cluster-bench runs). In short:
 
-1. **Round 23, use it from anything:** a console at `/`, live queries (`GET /live?sql=…`), dbt
-   over the Postgres port and BI tools on Windows; procedures on a schedule; `pondra run
-   models/`; `UPDATE`/`DELETE`/`MERGE` on an attached lake from any node (sent to its leader, or
-   led for a moment, as an `INSERT` is); temporary tables (a `TEMP` table is refused or made
-   per session, not silently kept, as it is now).
-2. **Publish 0.22.2** (the fix of invariant 93): tag `v0.22.2` once its build run is green;
-   the release publishes that run's packages.
+1. **Round 23, read and write anything** (roadmap track G; the owner, 2026-09-28: as many sources
+   and targets as the competitors, order left to the agent): files (Parquet, CSV, JSON) and
+   Delta and Iceberg tables anywhere on S3, GCS, Azure and HTTPS, read and joined from SQL and
+   frames and spread over the nodes; `COPY … TO` anywhere; GCS and Azure lakes; an existing Kafka
+   cluster in and out. An ADR first, sent to the owner before the code. Then round 24, use it
+   from anything: a console at `/`, live queries (`GET /live?sql=…`), dbt over the Postgres port
+   and BI tools on Windows; procedures on a schedule; `pondra run models/`; Postgres and MySQL
+   attached; `UPDATE`/`DELETE`/`MERGE` on an attached lake from any node; temporary tables (a
+   `TEMP` table is refused or made per session, not silently kept, as it is now).
+2. **Publish 0.23.0** (ADR-025's names; `v0.22.2`, the fix of invariant 93, is tagged at c47e2c7
+   and releases the old way): tag `v0.23.0` once its build run is green; the release publishes
+   that run's packages.
 3. **Security before anyone else's data:** TLS on the node port and mutual TLS between nodes, then
    grants (roadmap E3).
 4. **Then:** machines in one data centre for the cluster bench, the in-process library, the

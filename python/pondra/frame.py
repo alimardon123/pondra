@@ -705,9 +705,12 @@ class Frame:
 
     # back to SQL, and writes
     def to_view(self, name, temporary=False, materialized=False, replace=None, **options):
-        """A view of this frame others read by name: `.sql` files, SQL clients, BI. `temporary`:
-        this connection's only; `materialized`: kept up to date as rows arrive (`options` as
-        `CREATE MATERIALIZED VIEW … WITH (…)` takes them: window, size_secs, …)."""
+        """A view of this frame others read by name: `.sql` files, SQL clients, BI (`db.view(name,
+        frame)` is the same). `temporary`: this connection's only; `materialized`: kept up to date
+        as rows arrive (`options` as `CREATE MATERIALIZED VIEW … WITH (…)` takes them: window,
+        size_secs, …)."""
+        if options and not materialized:
+            raise ValueError(f"{', '.join(options)}: options of a materialized view (materialized=True)")
         if temporary:
             self._con._temp[name.lower()] = self
             return self._con.table(name)

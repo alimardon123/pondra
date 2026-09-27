@@ -55,8 +55,9 @@ Still waiting:
 
 - **C1 in one data centre:** machines under a millisecond apart, where spreading should pay.
 - **Publishing:** 0.22.1 (ADR-024: one-line installers, `python -m pondra`, rows without
-  pyarrow) is on PyPI and npm; `v0.22.2` adds the fix below, and is the first release that
-  publishes the build workflow's packages instead of building again.
+  pyarrow) is on PyPI and npm; `v0.22.2` (tagged) adds the fix below. 0.23.0 makes the clients'
+  names SQL's (ADR-025: `db.view` is a stored query unless `materialized=True`) and is the first
+  release that publishes the build workflow's packages instead of building again.
 
 0.22.2 fixes a bug found while testing 0.22.1: on a cluster, a keyed table's first tiering round
 could bring deleted keys back, and an adding-up view could lose part of an UPDATE (every job of
@@ -66,8 +67,12 @@ Round 23 also takes two gaps the owner met in the shell: `UPDATE`/`DELETE`/`MERG
 lake from any node (they run only on that lake's own node today, while `INSERT` works from
 anywhere), and temporary tables (`CREATE TEMP TABLE` makes an ordinary table today).
 
-Round 23 is next: use it from anything — a console at `/`, live queries, dbt and BI tools (A4,
-B3, E1, E2), moved from round 22 when the owner chose frames and procedures for it.
+Round 23 is next: **read and write anything** (track G below). The owner, 2026-09-28: Pondra is
+becoming a processing engine too, and should read and write as many sources and targets as its
+competitors; they left the order to the agent. Files and other lakes' tables anywhere come first
+(what a new user tries first: "point it at my data"), then Kafka both ways and databases. "Use it
+from anything" (a console at `/`, live queries, dbt and BI tools: A4, B3, E1, E2) moves to round
+24. The plan comes as an ADR before the code.
 
 ## Where Pondra stands
 
@@ -148,7 +153,7 @@ it runs one partition at a time, because its parallel execution needs a Tokio ru
 browser Pondra would read a published snapshot of the lake (the list of files and log segments),
 not the catalog.
 
-## Everything still open, in six tracks
+## Everything still open, in seven tracks
 
 Size: **S** = part of a round, **M** = about one round, **L** = more than one.
 
@@ -231,6 +236,22 @@ a list of URLs? If it can, that gives a browser read path at no cost.
 - **Other:** an approximate vector index, `VARIANT` as a real type, and statistics of what a
   filter keeps.
 
+### G. Read and write anything (the owner, 2026-09-28)
+
+Every connector is Rust inside the one binary (no JVM, no plugin process), costs nothing until a
+query uses it, and runs where the work is: files and partitions are dealt out to the nodes like a
+table's slices.
+
+| # | Item | Why | Size | Proof |
+|---|---|---|---|---|
+| G1 | Files anywhere, from SQL: Parquet, CSV, JSON (and Avro) on S3, GCS, Azure and HTTPS (`FROM 's3://b/x/*.parquet'`, `read_csv(…)`), spread across the nodes | The first thing a new user tries: their data where it is | M | Each format × each store, one node == three; DuckDB's answers |
+| G2 | Other lakes' tables: Delta (`delta_scan`), Iceberg (`iceberg_scan`, and REST catalogs: Polaris, Unity, Glue) as tables to read and join | Where most companies' data already is | M | delta-rs's and PyIceberg's tables read right, with deletes and schema changes |
+| G3 | Files out: `COPY (query) TO 's3://…' (FORMAT parquet/csv/json, PARTITION_BY …)`, from any node, spread | Exports and hand-offs | S–M | Round trip through each format; other engines read them |
+| G4 | GCS and Azure for lakes themselves | Not everyone is on S3 | S | The suite on each (emulators) |
+| G5 | Kafka both ways: a table fed from an existing Kafka cluster (exactly-once, offsets in the catalog), and a table's or view's changes produced to one | Joining a company's streams | M | librdkafka's cluster in, out; a restart in each |
+| G6 | Databases: `ATTACH 'postgres://…'` / MySQL as a database to read (filters pushed down) and write; their changes streamed in natively (logical replication, binlog) | CDC without Debezium | L | Tables equal the source's under changes; a restart |
+| G7 | Sinks: a materialized view or task kept in step in an outside target (Kafka, Postgres upsert, files) | The other half of ETL | M | Exactly-once through failovers |
+
 ## The rounds
 
 Each round is about one session like the last sixteen, ending with tests on local disk,
@@ -244,11 +265,12 @@ simulated R2 and real R2, an ADR, and a bundle.
 | 20 ✓ | Fewer objects, any layout, streams joined (done: ADR-021) | the owner's questions, C1 (round 19's run) | a trickle of INSERTs writes under a third of the objects; `PRIMARY KEY` with `partition_by`/`cluster_by` (Hilbert); `COPY`; stream joins and sliding windows |
 | 21 ✓ | Shape it further, and more of Flink (done: ADR-022) | E8, E7, C3, F (streaming) | `ALTER TABLE … RENAME/DROP COLUMN`, widening; views filled from existing rows; dedup by event time; Nexmark against Flink; the DataFrame API designed |
 | 22 ✓ | Frames and procedures (done: ADR-023) | the DataFrame API (`dataframe-api.md`), the owner's macros and procedures | `pondra.frame` and `pondra.spark` over SQL, equal to Polars and PySpark; SQL and Python mixed every way; macros and procedures (SQL, Python) in the catalog |
-| 23 | Use it from anything | A4, B3, E1, E2, C1, D1 (start) | a console at `/`, live queries, dbt and Power BI; procedures on a schedule; `pondra run models/`; TPC-H at 1/3/6 machines in one data centre |
-| 24 | In-process | B1, B2 | `pondra.open(…)` in a notebook reads and writes a cluster's lake, no server |
-| 25 | Safe to share | E3, D2 | TLS, grants, audit; random-query checks against DuckDB |
-| 26 | In the browser | B4 (after the DuckDB-WASM check) | A lake queried in a web page, straight from the bucket |
-| 27+ | Depth | C2, C4, E4, then F by evidence | Whatever the scale runs and first users show matters most |
+| 23 | Read and write anything | G1, G2, G3, G4, then G5 | files, Delta and Iceberg anywhere read and written from SQL and frames, spread; GCS and Azure; Kafka clusters in and out |
+| 24 | Use it from anything | A4, B3, E1, E2, C1, D1 (start), G6 | a console at `/`, live queries, dbt and Power BI; procedures on a schedule; `pondra run models/`; Postgres and MySQL attached |
+| 25 | In-process | B1, B2 | `pondra.open(…)` in a notebook reads and writes a cluster's lake, no server |
+| 26 | Safe to share | E3, D2 | TLS, grants, audit; random-query checks against DuckDB |
+| 27 | In the browser | B4 (after the DuckDB-WASM check) | A lake queried in a web page, straight from the bucket |
+| 28+ | Depth | C2, C4, E4, G7, then F by evidence | Whatever the scale runs and first users show matters most |
 
 Why this order:
 

@@ -85,6 +85,13 @@ deleted in the later jobs' part of the log came back, and an adding-up view lost
 UPDATE that changed a total but not a count. Only the job starting where the table's files end
 writes the first file now (invariant 93); `harness.py deal` fails without it on every run.
 
+**0.23.0: one name, one meaning** (ADR-025). Python's `db.view` made a materialized view while
+SQL's `CREATE VIEW` and a frame's `to_view` make a stored query. Now every client uses SQL's
+words: `view` is a stored query unless `materialized=True`, from the connection (SQL or a frame)
+and from a frame alike, and in JavaScript; `db.write_table` is a frame's `write_table`; JavaScript
+calls a procedure with `call`, as Python does. 0.22's `db.view(…, window=…)` still works, with a
+warning. `frames_check.py` checks it (section 5).
+
 **Round 21 shaped tables further and took on more of Flink** (ADR-022):
 
 1. **Columns that change without a file rewritten.** `RENAME COLUMN`, `DROP COLUMN`, a dropped

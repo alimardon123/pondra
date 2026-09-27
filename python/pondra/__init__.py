@@ -21,7 +21,7 @@ from .client import Pondra, Result, binary, connect, local
 from .frame import Expr, Frame, GroupBy, coalesce, col, concat, concat_str, lit, sql_expr, when
 from .frame import all, count, first, last, len, max, mean, median, min, n_unique, sum  # noqa: A004 (Polars' names)
 
-__version__ = "0.22.2"
+__version__ = "0.23.0"
 __all__ = ["connect", "local", "Pondra", "Result", "Frame", "Expr", "GroupBy", "col", "lit", "when", "sql_expr", "coalesce", "concat", "concat_str",
            "all", "count", "first", "last", "len", "max", "mean", "median", "min", "n_unique", "sum"]
 

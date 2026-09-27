@@ -7,7 +7,7 @@
 //   await db.sql("CREATE TABLE events (user VARCHAR, amount BIGINT)");
 //   await db.append("events", [{ user: "ann", amount: 5 }]);
 //   console.log(await db.sql("SELECT user, sum(amount) AS total FROM events WHERE amount > $min GROUP BY user", { min: 1 }));
-//   await db.callProcedure("load_day", "2026-09-27");    // a stored procedure
+//   await db.call("load_day", "2026-09-27");             // a stored procedure
 //   for await (const row of db.watch("events")) { … }   // new rows as they commit
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
@@ -25,7 +25,8 @@ export class Pondra {
     this.seq = 0;
   }
 
-  async call(method, path, body, type) {
+  /** One HTTP request to the node (what the methods below are made of). */
+  async request(method, path, body, type) {
     const headers = { ...(this.token && { authorization: `Bearer ${this.token}` }), ...(type && { "content-type": type }), ...(this.owner && { "x-pondra-owner": this.owner }) };
     const r = await fetch(this.url + path, { method, body, headers });
     if (!r.ok) throw new Error(`${r.status}: ${(await r.text()).slice(0, 500)}`);
@@ -35,8 +36,8 @@ export class Pondra {
   /** A query's rows, as objects; for other statements (CREATE, INSERT, UPDATE, DELETE, CALL,
    * several at once), the last one's outcome. `params`: values for `$name` in it. */
   async sql(query, params) {
-    if (!params) return (await this.call("POST", "/sql", query)).json();
-    return (await this.call("POST", "/sql", JSON.stringify({ sql: query, params }), "application/json")).json();
+    if (!params) return (await this.request("POST", "/sql", query)).json();
+    return (await this.request("POST", "/sql", JSON.stringify({ sql: query, params }), "application/json")).json();
   }
 
   /** A `.sql` file (or SQL), its statements in order, `$name` taking `params.name`. */
@@ -44,9 +45,14 @@ export class Pondra {
     return this.sql(file.endsWith(".sql") && existsSync(file) ? readFileSync(file, "utf8") : file, params);
   }
 
-  /** A stored procedure (`CREATE PROCEDURE`), called: `await db.callProcedure("load_day", "2026-09-27")`. */
-  async callProcedure(name, ...args) {
+  /** A stored procedure (`CREATE PROCEDURE`), called, as Python's `con.call`: `await db.call("load_day", "2026-09-27")`. */
+  async call(name, ...args) {
     return this.sql(`CALL ${name}(${args.map((_, i) => `$p${i}`).join(", ")})`, Object.fromEntries(args.map((a, i) => [`p${i}`, a])));
+  }
+
+  /** `call`'s name up to 0.22. */
+  async callProcedure(name, ...args) {
+    return this.call(name, ...args);
   }
 
   /** Append rows exactly once: a retry after a lost answer is recognised, not applied twice. */
@@ -55,7 +61,7 @@ export class Pondra {
     const body = rows.map((r) => JSON.stringify(r)).join("\n") + "\n";
     for (let attempt = 0; ; attempt++) {
       try {
-        return await (await this.call("POST", `/append/${table}?producer=${this.producer}&seq=${seq}`, body, "application/x-ndjson")).json();
+        return await (await this.request("POST", `/append/${table}?producer=${this.producer}&seq=${seq}`, body, "application/x-ndjson")).json();
       } catch (e) {
         if (/^\d{3}:/.test(e.message) || attempt === retries - 1) throw e; // (refused: retrying won't help)
         await sleep(Math.min(100 * 2 ** attempt, 5000)); // the same seq again: applied once
@@ -63,18 +69,27 @@ export class Pondra {
     }
   }
 
-  /** A view: `sql` over the rows already there, then over each new batch of rows, committed
-   * with them (with GROUP BY, kept per key). Options make it emit what is final: `{ window: "w", size_secs: 60, lateness_secs: 10 }`
-   * (and `slide_secs: 10`: sliding), or `{ session: "ts", gap_secs: 1800 }`; `{ join: "streams",
-   * time: "ts", within_secs: 600 }` pairs two tables' rows as either arrives. Asking again changes nothing. */
-  async view(name, sql, options = {}) {
-    const query = new URLSearchParams(options).toString();
-    return (await this.call("POST", `/views/${name}` + (query ? `?${query}` : ""), sql)).json();
+  /** A view others read by name, as SQL's `CREATE VIEW` and Python's `db.view` make one: `sql`
+   * runs over the tables as they are when the view is read. `{ materialized: true }`: kept up to
+   * date instead (`CREATE MATERIALIZED VIEW`), filled from the rows already there, then with each
+   * batch of new rows (with GROUP BY, kept per key); its other options make it emit what is
+   * final: `{ window: "w", size_secs: 60, lateness_secs: 10 }` (and `slide_secs`: sliding),
+   * `{ session: "ts", gap_secs: 1800 }`, or `{ join: "streams", time: "ts", within_secs: 600 }`. */
+  async view(name, sql, { materialized, replace = true, ...options } = {}) {
+    const opts = Object.entries(options);
+    if (materialized === undefined && opts.length) { // (up to 0.22, view() made every view a materialized one)
+      console.warn("view(…) with window/session/join options: pass { materialized: true } (a view is a stored query unless asked)");
+      materialized = true;
+    }
+    if (!materialized && opts.length) throw new Error(`${opts.map(([k]) => k).join(", ")}: options of a materialized view ({ materialized: true })`);
+    const literal = (v) => (typeof v === "number" ? String(v) : `'${String(v).replaceAll("'", "''")}'`);
+    const withs = opts.length ? ` WITH (${opts.map(([k, v]) => `${k} = ${literal(v)}`).join(", ")})` : "";
+    return this.sql(materialized ? `CREATE MATERIALIZED VIEW ${name}${withs} AS ${sql}` : `CREATE ${replace ? "OR REPLACE " : ""}VIEW ${name} AS ${sql}`);
   }
 
   /** The current row of one key of a keyed table, or null. */
   async lookup(table, key) {
-    const rows = await (await this.call("GET", `/lookup/${table}/${encodeURIComponent(key)}`)).json();
+    const rows = await (await this.request("GET", `/lookup/${table}/${encodeURIComponent(key)}`)).json();
     return rows[0] ?? null;
   }
 
@@ -82,7 +97,7 @@ export class Pondra {
    * `changes`, every change: UPDATE's and DELETE's too, each row with its `_change_type`. */
   async *watch(table, { after, changes } = {}) {
     const q = [after === undefined ? "" : `after=${after}`, changes ? "changes=true" : ""].filter(Boolean).join("&");
-    const r = await this.call("GET", `/watch/${table}` + (q ? `?${q}` : ""));
+    const r = await this.request("GET", `/watch/${table}` + (q ? `?${q}` : ""));
     const decoder = new TextDecoder();
     let rest = "";
     for await (const chunk of r.body) {
@@ -124,7 +139,7 @@ export async function local(dir = "lake", { port, token, flags = [], timeoutMs =
   process.on("exit", () => node.stdin.end());
   for (const until = Date.now() + timeoutMs; ; await sleep(50)) {
     try {
-      await db.call("GET", "/stats");
+      await db.request("GET", "/stats");
       return db;
     } catch (e) {
       if (failed || node.exitCode !== null || Date.now() > until) throw new Error(`the node didn't start: ${(failed ?? e).message}`);

@@ -9,6 +9,8 @@
 3. A frame's sort survives the steps after it (SQL drops a CTE's ORDER BY: a sort then a limit
    gave the wrong rows before the frame put it in each step again).
 4. Frames write: CREATE TABLE … AS, INSERT, UPDATE, DELETE and MERGE with Delta's builder names.
+5. One name, one meaning: `db.view` and a frame's `to_view` make a stored query unless
+   `materialized=True`; `db.write_table` is a frame's `write_table` (ADR-025).
 
   frames_check.py [--only name,…] [--port 8830]      (pondra.spark vs PySpark: spark_check.py)
 """
@@ -236,6 +238,47 @@ def writes(con):
     return checks
 
 
+# ---------------------------------------------------------------- 5. one name, one meaning
+
+def names(con):
+    """A connection and a frame make things by the same names, as SQL does (ADR-025): `db.view`
+    and `to_view` a stored query unless `materialized=True`; `db.write_table` and a frame's
+    `write_table` a table. (0.22's `db.view` made every view a materialized one.)"""
+    import warnings
+    per_user = "SELECT user, count(*) AS n FROM orders GROUP BY user"
+    kind = lambda v: "materialized" if _made_again(con, v) else "stored"
+    con.view("n_plain", per_user)
+    con.view("n_live", con.sql(per_user), materialized=True)
+    con.table("orders").group_by("user").agg(pondra.len().alias("n")).to_view("n_frame")
+    want = con.sql(per_user).sort("user").rows()
+    checks = {"db.view is a stored query, as CREATE VIEW and to_view make": (kind("n_plain"), kind("n_frame")) == ("stored", "stored"),
+              "…materialized=True keeps it up to date, from SQL or a frame": kind("n_live") == "materialized",
+              "…all three answer alike": all(con.table(v).sort("user").rows() == want for v in ("n_plain", "n_live", "n_frame"))}
+    try:
+        con.table("orders").to_view("n_bad", window="w")
+        checks["options without materialized=True are refused"] = False
+    except ValueError:
+        checks["options without materialized=True are refused"] = True
+    with warnings.catch_warnings(record=True) as said:
+        warnings.simplefilter("always")
+        con.view("n_old", "SELECT date_bin(INTERVAL '1 day', ts) AS w, count(*) AS n FROM orders GROUP BY w", window="w", size_secs=86400)
+    checks["0.22's db.view(…, window=…): still materialized, with a warning"] = kind("n_old") == "materialized" and any(issubclass(w.category, DeprecationWarning) for w in said)
+    con.write_table("w_rows", pd.DataFrame({"id": [1, 2, 3]}))
+    con.write_table("w_rows", con.table("w_rows").filter(col("id") > 2), mode="append")
+    checks["db.write_table: pandas data, then a frame, as a frame's write_table"] = con.table("w_rows").sort("id").rows() == [{"id": 1}, {"id": 2}, {"id": 3}, {"id": 3}]
+    return checks
+
+
+def _made_again(con, name):
+    """Is `name` a materialized view? Making another under its name says it exists already; a
+    stored view of that name is refused as one ("is a (stored) view")."""
+    try:
+        con.sql(f"CREATE MATERIALIZED VIEW {name} AS SELECT id FROM orders")
+    except RuntimeError as e:
+        return "already exists" in str(e)
+    raise AssertionError(f"there was no view {name}")
+
+
 def coalesce_(*xs):
     return pondra.coalesce(*xs)
 
@@ -272,7 +315,10 @@ def main():
         print(json.dumps({"sorts": kept}), flush=True)
         wrote = writes(con)
         print(json.dumps({"writes": wrote}), flush=True)
+        named = names(con)
+        print(json.dumps({"names": named}, ensure_ascii=False), flush=True)
         kept.update(wrote)
+        kept.update(named)
         ok = all(results.values()) and all(v is True for v in ways.values()) and all(kept.values())
         print(json.dumps({"pipelines_equal": sum(results.values()), "pipelines": len(results), "ways_equal": sum(v is True for v in ways.values()), "ways": len(ways), "ok": ok}))
         sys.exit(0 if ok else 1)

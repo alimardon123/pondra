@@ -68,6 +68,9 @@ orders.filter("amount > 100 AND item LIKE 'tea%'") \
 lake's, seen the same way from both. A `.sql` file's `CREATE VIEW` is a frame in Python
 (`con.table("clean_orders")`); a frame saved with `to_view("…")` is a view a `.sql` file reads
 (`to_view(temporary=True)` keeps it to the session, `materialized=True` keeps it up to date).
+The connection has the same verbs, taking the frame, SQL or Python data as the second argument:
+`con.view(name, frame_or_sql, materialized=…)` is `frame.to_view(name, materialized=…)`, and
+`con.write_table(name, data, mode)` is `frame.write_table(name, mode)` (ADR-025).
 Python runs `.sql` files, with parameters and the Python names of rule 2:
 
 ```sql
@@ -150,7 +153,7 @@ top.explain()            # Pondra's plan, and whether it would spread
 |---|---|---|
 | Sources | `con.table(name)`, `con.sql(query, **frames_and_params)`, `con.run("file.sql", **params)`, `con.from_arrow(t)` / `from_pandas` / `from_polars` | the table; `(query)` with frames as CTEs; a file's statements; the rows sent with the query (Arrow, one query's temporary table) |
 | SQL inside | `filter("…")`, `with_columns("… AS x", y="…")`, `agg("sum(x) AS s")`, `pondra.sql_expr("…")` | the snippet, as written, in its place |
-| Back to SQL | `to_view(name, temporary=, materialized=)`, `frame.sql` | `CREATE [OR REPLACE] VIEW` (session-only, or kept up to date); the statement itself |
+| Back to SQL | `to_view(name, temporary=, materialized=)` (or `con.view(name, frame, …)`), `frame.sql` | `CREATE [OR REPLACE] VIEW`, session-only, or `CREATE MATERIALIZED VIEW` (kept up to date); the statement itself |
 | Rows | `filter`, `head`/`limit`, `sort(…, descending=, nulls_last=)`, `unique(subset=)`, `sample` | `WHERE`, `LIMIT`, `ORDER BY`, `DISTINCT ON`-style `ROW_NUMBER() = 1`, `TABLESAMPLE` |
 | Columns | `select`, `with_columns`, `drop`, `rename`, `cast` | the projection |
 | Expressions | `col`, `lit`, `+ - * / // %`, comparisons, `& \| ~`, `is_null`, `is_in`, `between`, `when().then().otherwise()`, `.str.*`, `.dt.*`, `.alias`, `.over(…)` | SQL expressions; `CASE`; window functions |
@@ -266,7 +269,7 @@ tested (`tools/frames_check.py`, `tools/spark_check.py`, `tools/bench/tpch_frame
   jobs.
 - **Pipelines of `.sql` and `.py` files** (`pondra run models/`) aren't built; `pondra run
   file.sql` and `con.run("file.sql", …)` are.
-- **The JavaScript client** has `$name` parameters, `run` and `callProcedure`, not the builder.
+- **The JavaScript client** has `$name` parameters, `run`, `call` and `view`, not the builder.
 - **`sample(n)`** is `ORDER BY random() LIMIT n` (DataFusion ignores `TABLESAMPLE`).
 - **Rows sent with a query** go in the request itself (`application/vnd.pondra.request`), and a
   write that names a frame sends it as a view the node puts in place.
