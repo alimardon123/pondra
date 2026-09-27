@@ -143,11 +143,19 @@ def crash():
     for run in range(1, A.runs + 1):
         lake = new_lake()
         node = Node(lake, A.port, env=env, flush_ms=50, tier_secs=1, task_ms=200, retain_secs=0).start()
-        events_table(A.port)
-        call(A.port, "POST", "/tasks/copy", json.dumps({"source": "events", "target": "events_copy",
-                                                       "sql": "SELECT producer, seq, i FROM events WHERE i % 2 = 0"}).encode())
-        call(A.port, "POST", "/views/per_producer", b"SELECT producer, count(*) AS n, sum(i) AS s FROM events GROUP BY producer")
-        call(A.port, "POST", "/views/thirds", b"SELECT producer, seq, i FROM events WHERE i % 3 = 0")
+        def setup(path, body):  # (asked again after a restart: a view's fill commits, and a commit may be where the node crashes)
+            for _ in range(20):
+                try:
+                    return call(A.port, "POST", path, body)
+                except Exception:
+                    if not node.alive():
+                        node.start()
+                    time.sleep(0.1)
+            raise RuntimeError(f"{path}: the node kept crashing")
+        setup("/tables/events", json.dumps([["producer", "Utf8"], ["seq", "Int64"], ["i", "Int64"], ["ts", "Float64"]]).encode())
+        setup("/tasks/copy", json.dumps({"source": "events", "target": "events_copy", "sql": "SELECT producer, seq, i FROM events WHERE i % 2 = 0"}).encode())
+        setup("/views/per_producer", b"SELECT producer, count(*) AS n, sum(i) AS s FROM events GROUP BY producer")
+        setup("/views/thirds", b"SELECT producer, seq, i FROM events WHERE i % 3 = 0")
         stop, kills = threading.Event(), 0
         threads = [threading.Thread(target=producer, args=(A.port, f"p{k}", A.batches, A.size, stop)) for k in range(A.producers)]
         [t.start() for t in threads]

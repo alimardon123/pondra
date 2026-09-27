@@ -38,8 +38,10 @@ Start more copies on the same bucket to scale out. The only state is object stor
    10 M bids in 8.7–10.9 s on Pondra, taken over HTTP and written to the lake, the answers equal
    to DuckDB's; Flink 2.3 (PyFlink MiniCluster, generating the bids itself, blackhole sinks)
    24.3–25.0 s. 4 M bids: 3.8–5.1 s against 11.0–11.2 s.
-6. **The owner's cluster bench on round 20:** loading TPC-H 105.9 s (442 s on round 19); one node
-   24.5 s, as the cluster decides 24.8 s, spread anyway 34.7 s, every answer the same.
+6. **The owner's cluster benches:** on round 20, loading TPC-H 105.9 s (442 s on round 19), one
+   node 24.5 s, as the cluster decides 24.8 s, spread anyway 34.7 s; on round 21, loading 100.5 s,
+   one node 21.7 s, as the cluster decides 21.5 s (3 queries spread, 9 MB moved), spread anyway
+   38.9 s. Every answer the same both times.
 7. **A DataFrame API, designed** (`docs/dataframe-api.md`): `pondra.frame` (Polars-style) and
    `pondra.spark` (PySpark's names) on one expression tree that compiles to SQL; built next round.
 8. **MIT OR Apache-2.0.** The packages carry both licenses; the release workflow publishes to

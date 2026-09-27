@@ -102,10 +102,15 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: pypi
+          skip-existing: true # (a run started again publishes only what's missing)
       - name: npm (the platform packages first, then `pondra`, which depends on them)
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }} # (empty once npm trusts this workflow)
         run: |
           npm install -g npm@latest # (trusted publishing needs npm 11.5.1 or later)
-          for p in dist/pondra-*-*.tgz; do npm publish "$p" --access public --provenance; done
-          npm publish dist/pondra-[0-9]*.tgz --access public --provenance
+          publish() { # (a version already there is skipped: a run started again publishes only what's missing)
+            v=$(tar -xzOf "$1" package/package.json | node -p 'const p = JSON.parse(require("fs").readFileSync(0)); p.name + "@" + p.version')
+            if npm view "$v" version > /dev/null 2>&1; then echo "$v is published already"; else npm publish "$1" --access public --provenance; fi
+          }
+          for p in dist/pondra-*-*.tgz; do publish "$p"; done
+          publish dist/pondra-[0-9]*.tgz

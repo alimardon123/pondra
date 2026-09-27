@@ -186,6 +186,11 @@ open).
   and every flush of the new view's rows was refused (invariant 77).
 - **Reading by event time was slow** (the cost run): an ordered aggregate per column, 2.3 s on
   200 k keys; now two hash aggregates and two joins, 0.14 s.
+- **A crash could drop the call that made a view** (GitHub's CI, `harness.py crash`): making a
+  view now commits (its fill), and the test injects crashes at commits, so its setup call lost
+  its node now and then. Asking again after the restart, as any client would, makes the same
+  view once and fills it once (forced: commits crashing half the time, 6 views, 5 restarts, all
+  made).
 - **Two checks were stale:** `schemas` expected a view to start empty, and `anywhere_check`'s
   notebook check hadn't run since round 18 and still expected round 18's numbers.
 

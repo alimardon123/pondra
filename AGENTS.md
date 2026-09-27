@@ -543,7 +543,9 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    part for a view the table doesn't have; otherwise it goes back to be packed again. A view's
    filling ends at the first commit that holds flushes to it, written in that commit
    (`views::bound`); the fill covers `_version ≤ upto`, as of `upto`. `harness.py fills`: with the
-   check off, all 12 checks fail.
+   check off, all 12 checks fail. Making a view waits for its fill, which commits: a crash there
+   drops the call, and asking again (the same view) is the answer — `harness.py crash`'s setup
+   does, or CI fails now and then.
 77. **The inline views the sequencer holds flushes to are reloaded after every view made or
    dropped** (`views::forget`), and a cache that changed meanwhile is never overwritten with an
    older one (`views::bound` checks it's the same). A stale set refuses every flush of the new
@@ -711,6 +713,11 @@ links 41–53 ms and 53–69 MB/s): loading 105.9 s (442 s on round 19: fixed); 
 the cluster decides 24.8 s (8 queries spread: 0.22 s lost, 0.15 s won), spread anyway 34.7 s;
 every answer the same. The runners vary: compare within a run. Right after the load the leader's
 tiering merged small files for 16–28 s a round on R2 (open).
+
+**The cluster bench on round 21** (`logs/round21/cluster-bench-round21-run.json`, links 34–66 ms,
+40–84 MB/s): loading 100.5 s; one node 21.7 s, as the cluster decides **21.5 s** (3 queries
+spread, 9 MB moved), spread anyway 38.9 s; every answer the same. The cluster is now no slower
+than one node over the internet; the tiering merges after the load took 13–32 s a round again.
 
 **Where the multi-machine run will happen (the owner's plan, 2026-09-23).** The owner has no VMs
 of their own. They will run the multi-machine tests themselves, later, on one of:
