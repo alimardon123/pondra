@@ -163,6 +163,14 @@ every platform). Since then:
   in Git Bash.
 - `pondra`'s own npm package, which every platform makes to try, is uploaded from Linux only.
 
+The second, on `v0.22.0`, built and tried all five, made the GitHub release and put the five
+wheels on PyPI; then npm refused the first package. The newest npm (12) reads `dist/x.tgz`, with
+no `./`, as the GitHub repository "dist/x.tgz" and no longer fetches from git (`EALLOWGIT`). The
+publishing moved to `tools/npm_publish.sh`, which passes `./dist/…`, and the build workflow
+dry-runs it on every push with the npm the release uses (a dry run needs no login, and runs even
+for a version npm already has, so it keeps trying the command). The npm packages of 0.22.0 are
+published by starting the release by hand with publish ticked.
+
 ## What it measures
 
 One 2-vCPU box (`logs/round17/`).

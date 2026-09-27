@@ -40,6 +40,9 @@ jobs:
       # that breaks on an OS (npm is npm.cmd on Windows) shows here, on a push, not on a release's tag.
       - run: python tools/package.py --bin ${{ matrix.bin }} --platform ${{ matrix.platform }} --npm-main --out dist && bash tools/try_packages.sh ${{ matrix.platform }}
         shell: bash
+      - name: The release's npm publish, tried (--dry-run, with the npm the release uses)
+        if: matrix.platform == 'linux-x64'
+        run: npm install -g npm@latest && bash tools/npm_publish.sh --dry-run
       - uses: actions/upload-artifact@v6
         with:
           name: ${{ matrix.name }}

@@ -1,0 +1,11 @@
+# npm 12.1.0: the release's old command, then tools/npm_publish.sh (both --dry-run)
+$ npm publish dist/pondra-linux-x64-0.22.0.tgz --access public --dry-run
+npm error code EALLOWGIT
+npm error Fetching packages of type "git" have been disabled
+npm error Refusing to fetch "github:dist/pondra-linux-x64-0.22.0.tgz"
+
+$ bash tools/npm_publish.sh --dry-run
+npm notice Publishing to https://registry.npmjs.org/ with tag latest and public access (dry-run)
++ pondra-linux-x64@0.22.0
+npm notice Publishing to https://registry.npmjs.org/ with tag latest and public access (dry-run)
++ pondra@0.22.0

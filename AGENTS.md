@@ -51,7 +51,7 @@ tools/    harness.py, cluster.py (tests), open_check.py (Delta + Iceberg readers
           bench/tpch-queries/ (the 22 TPC-H queries),
           r2_test.sh (run the suite against a real bucket), bench/ (vs Spark and Flink),
           package.py (wheels and npm packages from a binary), try_packages.sh (them installed and
-          tried, as CI does on each OS), anywhere_check.py (the shell, local(),
+          tried, as CI does on each OS), npm_publish.sh (the release's npm publish; CI dry-runs it), anywhere_check.py (the shell, local(),
           the packages, the notebook; old Linux in docker), bench/repeat.py (one query many times)
 docs/     ADRs and reports; lake-format.md is the on-disk layout
 ```
@@ -670,7 +670,8 @@ python3 tools/serve_bench.py --keys 2000000   # serving: point lookups and dashb
 The Python tools need `pip install -r tools/requirements.txt` (Python 3.11; the versions the
 suite last passed with). `.github/workflows/build.yml` runs `harness.py all` and a failover on
 every push with them, and on Linux, Windows and macOS makes the pip and npm packages and tries
-them (`tools/try_packages.sh`), so packaging that breaks on one OS shows on a push, not on a tag.
+them (`tools/try_packages.sh`), so packaging that breaks on one OS shows on a push, not on a tag;
+on Linux it also dry-runs the release's npm publish (`tools/npm_publish.sh --dry-run`, newest npm).
 
 Add `--s3` to any of them with a simulated-R2 bucket to see the object-storage behaviour:
 
@@ -734,7 +735,11 @@ publishes (`.github/workflows/release.yml`); `publish = false` keeps the crate o
 The first tag, `v0.21.0`, failed on Windows when packaging (`npm` is `npm.cmd` there, which
 `subprocess` doesn't look for), so nothing was published (the other four platforms passed); fixed after round 22, with checkouts
 kept at `\n` line endings everywhere (`.gitattributes`) and `pondra`'s own npm package
-uploaded from Linux only. Its history was rewritten once, before it went public, to
+uploaded from Linux only. `v0.22.0` (b70033e) made the GitHub release and put all five wheels
+on PyPI, then npm refused its first package: the newest npm (12) reads `dist/x.tgz` as the GitHub
+repository "dist/x.tgz" and won't fetch git. `tools/npm_publish.sh` passes `./dist/…`; the npm
+packages are published by starting `release.yml` by hand with publish ticked (the GitHub release
+is made only on a tag; PyPI skips what it has). Its history was rewritten once, before it went public, to
 put the owner's GitHub noreply address on the four commits that had their email; commit IDs from
 before then (in older bundles) differ. Each round the owner downloads the new bundle and, in
 their clone, runs `git pull <bundle> main` and `git push`; GitHub then builds it on Linux,

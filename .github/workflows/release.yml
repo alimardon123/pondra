@@ -85,6 +85,7 @@ jobs:
       contents: write # the GitHub release
       id-token: write # PyPI trusted publishing, npm provenance
     steps:
+      - uses: actions/checkout@v5 # (tools/npm_publish.sh)
       - uses: actions/download-artifact@v7
         with:
           path: dist
@@ -109,9 +110,4 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }} # (empty once npm trusts this workflow)
         run: |
           npm install -g npm@latest # (trusted publishing needs npm 11.5.1 or later)
-          publish() { # (a version already there is skipped: a run started again publishes only what's missing)
-            v=$(tar -xzOf "$1" package/package.json | node -p 'const p = JSON.parse(require("fs").readFileSync(0)); p.name + "@" + p.version')
-            if npm view "$v" version > /dev/null 2>&1; then echo "$v is published already"; else npm publish "$1" --access public --provenance; fi
-          }
-          for p in dist/pondra-*-*.tgz; do publish "$p"; done
-          publish dist/pondra-[0-9]*.tgz
+          bash tools/npm_publish.sh --provenance
