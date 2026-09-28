@@ -1,5 +1,6 @@
 //! Pondra: a streamhouse in one binary (see ADR-002 to ADR-005).
 //! Object storage — a local dir or s3://bucket/prefix (S3, R2, MinIO) — is the only state.
+#![recursion_limit = "256"] // (the Send check of a query's future, many awaits deep)
 mod ai;
 mod avro;
 mod bridge;
@@ -7,6 +8,7 @@ mod asof;
 mod auth;
 mod cache;
 mod change;
+mod copy;
 mod guard;
 mod hilbert;
 mod ddl;

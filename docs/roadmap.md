@@ -1,10 +1,10 @@
-# Pondra: what's left, and in what order (after round 22)
+# Pondra: what's left, and in what order (after round 23)
 
-**Date:** 2026-09-27 · **Status:** proposed; the order in "The rounds" is what I recommend, the
+**Date:** 2026-09-28 · **Status:** proposed; the order in "The rounds" is what I recommend, the
 decisions in "What only you can decide" are yours · **Builds on:** ADR-002 to ADR-017,
 `prototype-status.md`, `comparison-spark-flink-fluss.md`
 
-**Progress (2026-09-27):** rounds 17 to 22 are done (ADR-018 to ADR-023).
+**Progress (2026-09-28):** rounds 17 to 23 are done (ADR-018 to ADR-026).
 
 - **Round 17** made Pondra install anywhere: a glibc 2.17 Linux binary, pip and npm packages
   (built, not published), a SQL shell, and both flaky tests fixed.
@@ -51,6 +51,18 @@ decisions in "What only you can decide" are yours · **Builds on:** ADR-002 to A
   or Python (a Python procedure runs beside the node, lent its caller's rights), called from SQL,
   Postgres, Python, JavaScript and as MCP tools; scripts with `$name` parameters; `pondra run`.
 
+- **Round 23** (ADR-026): read and write anything. Files on S3, GCS, Azure, HTTPS and the
+  owner's machine are tables wherever SQL takes one (DuckDB's names: `'s3://…/*.parquet'`,
+  `read_csv`, Hive folders), spread over the nodes and read fresh each statement; Delta and
+  Iceberg tables read natively (checkpoints, deletion vectors, column mapping, position and
+  equality deletes, REST catalogs), attached, and written by `INSERT`; `COPY … TO` files anywhere
+  (a big folder written by every node) or a Kafka topic; other Kafka clusters read as tables and
+  fed into views, every record once; `CREATE SECRET`; lakes on GCS and Azure. Read from files,
+  TPC-H SF1 is as fast as from the lake's own tables (3.67 s against 3.73 s on disk, 3.51 s
+  against 3.48 s on S3). D1 is set up: DataFusion's own sqllogictest files pass 67.2% on one node
+  and on three (72.6% without its Spark-function files); it found `INSERT INTO t (columns)` and
+  `CREATE TABLE t (columns) AS VALUES` wrong, both fixed.
+
 Still waiting:
 
 - **C1 in one data centre:** machines under a millisecond apart, where spreading should pay.
@@ -63,18 +75,15 @@ Still waiting:
 could bring deleted keys back, and an adding-up view could lose part of an UPDATE (every job of
 the round took its file for the table's first; invariant 93, `harness.py deal`).
 
-Round 23 also takes two gaps the owner met in the shell: `UPDATE`/`DELETE`/`MERGE` on an attached
-lake from any node (they run only on that lake's own node today, while `INSERT` works from
-anywhere), and temporary tables (`CREATE TEMP TABLE` makes an ordinary table today).
+Two gaps the owner met in the shell go with round 25 (the table below): `UPDATE`/`DELETE`/`MERGE`
+on an attached lake from any node (they run only on that lake's own node today, while `INSERT`
+works from anywhere), and temporary tables (`CREATE TEMP TABLE` makes an ordinary table today).
 
-Round 23 is next: **read and write anything** (track G, ADR-026, proposed). The owner,
-2026-09-28: Pondra is becoming a processing engine too, and should read and write as many
-sources and targets as its competitors; they left the order to the agent. Files and other lakes'
-tables anywhere come first (what a new user tries first: "point it at my data"), with
-`CREATE SECRET`, then Kafka clusters both ways. Round 24 is **SQL and Python as one** (track H,
-ADR-027, proposed, the owner's same day): `CREATE FUNCTION` for what macros were, Python
-functions and procedures without needless limits, decorators that take a notebook's function as
-it is, schedules. Round 25 is the console, the server and databases attached.
+Round 24 is next: **SQL and Python as one** (track H, ADR-027, proposed, the owner's
+2026-09-28): `CREATE FUNCTION` for what macros were, Python functions and procedures without
+needless limits, decorators that take a notebook's function as it is, schedules and a run log;
+its procedures use round 23's secrets for mail, APIs and databases. Round 25 is the console, the
+server and databases attached.
 
 ## Where Pondra stands
 
@@ -279,7 +288,7 @@ simulated R2 and real R2, an ADR, and a bundle.
 | 20 ✓ | Fewer objects, any layout, streams joined (done: ADR-021) | the owner's questions, C1 (round 19's run) | a trickle of INSERTs writes under a third of the objects; `PRIMARY KEY` with `partition_by`/`cluster_by` (Hilbert); `COPY`; stream joins and sliding windows |
 | 21 ✓ | Shape it further, and more of Flink (done: ADR-022) | E8, E7, C3, F (streaming) | `ALTER TABLE … RENAME/DROP COLUMN`, widening; views filled from existing rows; dedup by event time; Nexmark against Flink; the DataFrame API designed |
 | 22 ✓ | Frames and procedures (done: ADR-023) | the DataFrame API (`dataframe-api.md`), the owner's macros and procedures | `pondra.frame` and `pondra.spark` over SQL, equal to Polars and PySpark; SQL and Python mixed every way; macros and procedures (SQL, Python) in the catalog |
-| 23 | Read and write anything (ADR-026) | G1–G5, secrets; D1 set up and measured | files, Delta and Iceberg anywhere read, joined and written, spread; GCS and Azure lakes; Kafka clusters in and out; `CREATE SECRET` |
+| 23 ✓ | Read and write anything (done: ADR-026) | G1–G5, secrets; D1 set up and measured | files, Delta and Iceberg anywhere read, joined and written, spread; GCS and Azure lakes; Kafka clusters in and out; `CREATE SECRET` |
 | 24 | SQL and Python as one (ADR-027) | H1–H6 | `CREATE FUNCTION` in SQL and Python; procedures that send mail from a SQL cell; decorators that take a notebook's function; schedules and a run log |
 | 25 | Use it from anything, and the server (ADR-028) | A4, B3, E1, E2, G6, the server, TEMP tables, changes to attached lakes | a console at `/` with SQL and Python cells; live queries; dbt and Power BI; a folder of lakes served as databases (`--server`); Postgres and MySQL attached |
 | 26 | Safe to share | E3 | TLS, mutual TLS between nodes, users and grants down to a table, an audit log, quotas |

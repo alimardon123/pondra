@@ -280,3 +280,19 @@ tested (`tools/frames_check.py`, `tools/spark_check.py`, `tools/bench/tpch_frame
 - Beyond the design: **macros and procedures** (SQL and Python) kept in the catalog, callable from
   every client and as MCP tools (ADR-023).
 
+
+## Round 23: files in and out (ADR-026)
+
+Frames read and write what is outside the lake with Polars' names, and `pondra.spark` with
+PySpark's; each is the SQL of ADR-026, so every client does the same:
+
+- `db.scan_parquet(url)`, `scan_csv`, `scan_ndjson`, `scan_delta(url, version=…)`,
+  `scan_iceberg(url, …)`: a frame over files, a folder, a glob or another engine's table
+  (`read_parquet`, `read_csv`, `read_json`, `delta_scan`, `iceberg_scan`).
+- `frame.sink_parquet(url, partition_by=…)`, `sink_csv`, `sink_ndjson`: `COPY (frame) TO url`.
+- `spark.read.option(…).parquet/csv/json(url)`, `spark.read.format("delta" | "iceberg").load(url)`,
+  and `df.write.mode("overwrite" | "append" | "error" | "ignore").partitionBy(…).parquet/csv/json(url)`
+  (Spark's modes as `COPY … TO`'s `OVERWRITE` and `APPEND`).
+
+`frames_check.py` section 6 and `spark_check.py`'s seven file pipelines compare them with Polars
+and PySpark reading and writing the same files.

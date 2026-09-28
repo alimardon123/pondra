@@ -46,7 +46,7 @@ pub async fn listing<F: std::future::Future>(f: F) -> F::Output {
     }
 }
 
-fn owner() -> bool { OWNER.try_with(|o| *o).unwrap_or(false) }
+pub(crate) fn owner() -> bool { OWNER.try_with(|o| *o).unwrap_or(false) }
 
 // ---------------------------------------------------------------- what a query reads
 
@@ -140,7 +140,7 @@ fn literal(e: &Expr) -> Result<String> {
 }
 
 /// A file's format by its extension (a glob's too: `*.parquet`).
-fn format_of(url: &str) -> Result<(String, BTreeMap<String, String>)> {
+pub(crate) fn format_of(url: &str) -> Result<(String, BTreeMap<String, String>)> {
     if url.starts_with("kafka://") {
         return Ok(("kafka".into(), BTreeMap::new())); // (a topic)
     }
@@ -157,7 +157,7 @@ fn format_of(url: &str) -> Result<(String, BTreeMap<String, String>)> {
 }
 
 /// A URL's scheme, if it names one Pondra reads (not a path on this machine).
-fn scheme(url: &str) -> Option<&str> {
+pub(crate) fn scheme(url: &str) -> Option<&str> {
     let s = url.split_once("://")?.0;
     ["s3", "r2", "gs", "gcs", "az", "azure", "abfs", "abfss", "http", "https", "kafka", "file"].contains(&s).then_some(s)
 }
@@ -280,7 +280,7 @@ async fn check_files(lake: &Lake, m: &TableMeta) -> Result<()> {
 }
 
 /// What to do about a URL no secret covers: the statement that would, for its store.
-fn uncovered(u: &str) -> String {
+pub(crate) fn uncovered(u: &str) -> String {
     let (kind, keys) = match scheme(u) {
         Some("gs" | "gcs") => ("gcs", "SERVICE_ACCOUNT_KEY '…'"),
         Some("az" | "azure" | "abfs" | "abfss") => ("azure", "CONNECTION_STRING '…'"),
@@ -349,10 +349,15 @@ async fn resolve(lake: &Lake, spec: &Spec) -> Result<TableMeta> {
         let (format, schema, state) = (format.clone(), schema.clone(), state.clone());
         let part = if hived { hive(&url, &o) } else { vec![] };
         async move {
-            let full = format!("{}{}", url.object_store().as_str().trim_end_matches('/'), url_path(&o));
+            let root = url.object_store();
+            let full = format!("{}{}", root.as_str().strip_suffix('/').unwrap_or(root.as_str()), url_path(&o)); // (`file:///x`, `s3://b/x`)
             let s = if parquet { Some(format.infer_stats(&state, &store, schema.clone(), &o).await?) } else { None };
             let mut f = file(full, o.size, s.as_ref(), &schema);
             f.part = part.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("/");
+            if parquet && hived {
+                let values = part.iter().map(|(k, v)| (k.clone(), hive_value(v))).collect();
+                f.outside = Some(Box::new(crate::scan::Outside { values, ..Default::default() })); // (its folders' values, as `scan::read` takes them)
+            }
             for (k, v) in part {
                 match hive_value(&v) {
                     Some(v) => _ = f.stats.insert(k, (v.clone(), v)),
@@ -468,6 +473,9 @@ pub async fn read(lake: &Lake, ctx: &datafusion::prelude::SessionContext, files:
     if spec.format == "kafka" {
         return crate::kafka_client::read(lake, ctx, files, schema).await; // (a topic)
     }
+    if spec.format == "parquet" {
+        return crate::scan::read(ctx, files, schema, None).await; // (as listed: no second look at each file before it is read)
+    }
     use datafusion::datasource::listing::{ListingOptions, ListingTable, ListingTableConfig};
     use datafusion::prelude::{cast, ident, lit};
     let folders = |f: &DataFile| f.part.split('/').filter_map(|s| s.split_once('=')).map(|(k, v)| (k.to_string(), v.to_string())).collect::<Vec<_>>();
@@ -506,7 +514,7 @@ fn root(url: &str) -> Option<String> {
 
 /// DataFusion reads `url` through a store for its bucket, made with the secret covering it (or,
 /// for the node's owner, the node's own credentials). The lake's own bucket keeps its store.
-async fn register(lake: &Lake, url: &str) -> Result<()> {
+pub(crate) async fn register(lake: &Lake, url: &str) -> Result<()> {
     let Some(root) = root(url).filter(|_| scheme(url).is_some_and(|s| s != "file" && s != "kafka")) else { return Ok(()) }; // (this machine's: DataFusion's own; a topic: a Kafka client's)
     let lake_root = self::root(&lake.url);
     let attached: Vec<Option<String>> = lake.attached.read().unwrap().iter().map(|(_, o)| self::root(&o.url)).collect();
@@ -522,7 +530,7 @@ async fn register(lake: &Lake, url: &str) -> Result<()> {
     }
     let params = secret.as_ref().map(|(n, s)| open(n, s)).transpose()?;
     let store = build(&url::Url::parse(&root)?, params.as_ref())?;
-    lake.rt.register_object_store(&url::Url::parse(&root)?, Arc::new(crate::bridge::Bridge(store)));
+    lake.rt.register_object_store(&url::Url::parse(&root)?, Arc::new(crate::cache::CachedStore::files(store))); // (a file's ranges kept by its version)
     MADE.lock().unwrap().get_or_insert_default().insert(root, made_with);
     Ok(())
 }
@@ -921,102 +929,6 @@ fn copy_statement(p: &mut datafusion::sql::sqlparser::parser::Parser) -> Option<
     Some(crate::write::Stmt::CopyTo(query, to, options))
 }
 
-/// `COPY … TO` a file or folder outside the lake, from this node: Parquet, CSV or JSON lines, by
-/// `FORMAT` or the name's extension; `PARTITION_BY` writes Hive-style folders. A name ending in
-/// `/` is a folder of files; otherwise one file, replaced if it is there. A folder that holds
-/// files already takes `OVERWRITE` (replace them) or `APPEND` (DuckDB's). With the secret
-/// covering it (an admin's statement anyway: `auth::allows`), or, on the node's machine, from
-/// its owner.
-pub async fn copy_to(lake: &Lake, query: &str, to: &str, options: &BTreeMap<String, String>) -> Result<serde_json::Value> {
-    use datafusion::dataframe::DataFrameWriteOptions;
-    let known = ["format", "partition_by", "header", "delimiter", "delim", "sep", "compression", "row_group_size", "overwrite", "append", "overwrite_or_ignore", "key"];
-    if let Some(k) = options.keys().find(|k| !known.contains(&k.as_str())) {
-        bail!("COPY … TO has no option {k}: {}", known.join(", "));
-    }
-    let on = |k: &str| options.get(k).is_some_and(|v| !v.eq_ignore_ascii_case("false"));
-    let lakes: Vec<String> = std::iter::once(lake.url.clone()).chain(lake.attached.read().unwrap().iter().map(|(_, o)| o.url.clone())).collect();
-    let full = crate::ddl::full(to).unwrap_or_else(|_| to.to_string());
-    if let Some(l) = lakes.iter().find(|l| full.trim_end_matches('/') == l.as_str() || full.starts_with(&format!("{l}/"))) {
-        bail!("COPY … TO {to}: that's inside the lake at {l}, whose files are its own (write beside it, or INSERT into a table)");
-    }
-    match scheme(to).filter(|s| *s != "file") {
-        None => ensure!(owner(), "COPY … TO {to}: a file on the node's machine; only the program that started the node (the shell) writes those"),
-        Some(_) => {
-            ensure!(owner() || covering(&list(lake).await?, to).is_some(), "{}", uncovered(to));
-            register(lake, to).await?;
-        }
-    }
-    if to.starts_with("kafka://") {
-        let query = crate::routines::expand(lake, query).await?;
-        let df = crate::query::session(lake, &query, "").await?.sql_with_options(&query, crate::query::read_only()).await?;
-        return crate::kafka_client::copy_to(lake, df, to, options).await; // (rows as records: a topic's)
-    }
-    ensure!(!options.contains_key("key"), "KEY is a Kafka topic's (COPY … TO 'kafka://brokers/topic')");
-    let format = match options.get("format") {
-        Some(f) => f.to_lowercase(),
-        None => format_of(to.trim_end_matches('/')).map(|f| f.0).with_context(|| format!("COPY … TO {to}: which FORMAT? (parquet, csv, json)"))?,
-    };
-    let partition: Vec<String> = options.get("partition_by").map(|p| p.split(',').map(|c| c.trim().to_string()).collect()).unwrap_or_default();
-    let folder = to.ends_with('/') || !partition.is_empty();
-    if folder {
-        // (what is there: kept and added to, replaced, or a mistake — Spark's and DuckDB's default)
-        let url = ListingTableUrl::parse(to)?;
-        let store = lake.rt.object_store(url.object_store())?;
-        let there: Vec<_> = match store.list(Some(url.prefix())).map_ok(|o| o.location).try_collect().await {
-            Err(object_store_df::Error::NotFound { .. }) => vec![],
-            r => r?,
-        };
-        if !there.is_empty() && !on("append") && !on("overwrite_or_ignore") {
-            ensure!(on("overwrite"), "COPY … TO {to}: the folder holds files already: OVERWRITE replaces them, APPEND adds to them");
-            store.delete_stream(futures::stream::iter(there.into_iter().map(Ok)).boxed()).try_collect::<Vec<_>>().await?;
-        }
-    }
-    let query = crate::routines::expand(lake, query).await?; // (the files, macros and FROM-first queries it reads)
-    let mut df = crate::query::session(lake, &query, "").await?.sql_with_options(&query, crate::query::read_only()).await?;
-    if !partition.is_empty() {
-        // A folder a value, as text; NULL's folder as Hive and Spark name it (DataFusion's is empty).
-        use datafusion::prelude::{cast, coalesce, ident, lit};
-        let names: Vec<String> = df.schema().fields().iter().map(|f| f.name().clone()).collect();
-        if let Some(c) = partition.iter().find(|c| !names.contains(c)) {
-            bail!("PARTITION_BY {c}: no such column ({})", names.join(", "));
-        }
-        let text = |c: &String| coalesce(vec![cast(ident(c), datafusion::arrow::datatypes::DataType::Utf8), lit(NULL_FOLDER)]).alias(c);
-        df = df.select(names.iter().map(|c| if partition.contains(c) { text(c) } else { ident(c) }).collect::<Vec<_>>())?;
-    }
-    let write = DataFrameWriteOptions::new().with_single_file_output(!folder).with_partition_by(partition);
-    ensure!(format == "parquet" || !options.contains_key("compression") && !options.contains_key("row_group_size"), "COPY … TO as {format}: COMPRESSION and ROW_GROUP_SIZE are Parquet's (files are read as they are: not compressed)");
-    let out = match format.as_str() {
-        "parquet" => {
-            let mut parquet = datafusion::common::config::TableParquetOptions::default();
-            if let Some(c) = options.get("compression") {
-                parquet.global.compression = Some(match c.to_lowercase().as_str() {
-                    "zstd" => "zstd(3)".into(),
-                    "gzip" => "gzip(6)".into(),
-                    "brotli" => "brotli(4)".into(),
-                    c @ ("snappy" | "lz4" | "lz4_raw" | "uncompressed") => c.into(),
-                    c => bail!("COMPRESSION {c}: snappy, zstd, gzip, brotli, lz4 or uncompressed"),
-                });
-            }
-            if let Some(n) = options.get("row_group_size") {
-                parquet.global.max_row_group_size = n.parse().context("ROW_GROUP_SIZE is a number of rows")?;
-            }
-            df.write_parquet(to, write, Some(parquet)).await?
-        }
-        "json" => df.write_json(to, write, None).await?,
-        "csv" => {
-            let mut csv = datafusion::common::config::CsvOptions::default().with_has_header(options.get("header").is_none_or(|h| !h.eq_ignore_ascii_case("false")));
-            if let Some(d) = options.get("delimiter").or(options.get("delim")).or(options.get("sep")) {
-                csv = csv.with_delimiter(d.bytes().next().filter(|_| d.len() == 1).context("DELIMITER is one character")?);
-            }
-            df.write_csv(to, write, Some(csv)).await?
-        }
-        f => bail!("COPY … TO as {f}: parquet, csv or json"),
-    };
-    use datafusion::arrow::array::AsArray;
-    let rows: u64 = out.iter().map(|b| b.column(0).as_primitive::<datafusion::arrow::datatypes::UInt64Type>().iter().flatten().sum::<u64>()).sum();
-    Ok(serde_json::json!({"copied": rows, "to": to}))
-}
-
 /// Leader: keep a secret, sealed. Its scope's bucket may have no other secret's scope in it:
 /// a bucket is read with one secret.
 pub async fn create(lake: &Lake, name: &str, mut params: BTreeMap<String, String>, replace: bool, if_not_exists: bool) -> Result<serde_json::Value> {
@@ -1039,7 +951,7 @@ pub async fn create(lake: &Lake, name: &str, mut params: BTreeMap<String, String
     let bucket = |s: &str| root(s);
     if let Some(b) = scope.as_deref().and_then(bucket) {
         for (other, s) in list(lake).await? {
-            let same = s.scope.as_deref().is_some_and(|o| bucket(o).as_deref() == Some(b.as_str()) && Some(o) != scope.as_deref());
+            let same = s.scope.as_deref().is_some_and(|o| bucket(o).as_deref() == Some(b.as_str()));
             ensure!(other == name || !same, "{b} already has secret {other} for {}: a bucket is read with one secret (one SCOPE in it)", s.scope.unwrap_or_default());
         }
     }
@@ -1063,7 +975,7 @@ pub async fn list(lake: &Lake) -> Result<Vec<(String, Secret)>> {
 
 /// The secret for a URL: the longest scope that is a prefix of it (no scope: every URL of its
 /// type's schemes).
-fn covering(secrets: &[(String, Secret)], url: &str) -> Option<(String, Secret)> {
+pub(crate) fn covering(secrets: &[(String, Secret)], url: &str) -> Option<(String, Secret)> {
     let s = scheme(url)?;
     secrets.iter().filter(|(_, x)| kind(&x.kind).is_ok_and(|(_, schemes)| schemes.contains(&s)))
         .filter(|(_, x)| x.scope.as_deref().is_none_or(|p| url.starts_with(p)))

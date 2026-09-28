@@ -1,6 +1,6 @@
 # Prototype status: Pondra, a streamhouse in one binary
 
-**Date:** 2026-09-27 (round 22) · **Plan:** ADR-002 to ADR-023, `roadmap.md` · **Code:** `pondra.zip` / `pondra.bundle` (≈17,500 lines of Rust, plus Python and JavaScript clients, packaging, and test and benchmark tools)
+**Date:** 2026-09-28 (round 23) · **Plan:** ADR-002 to ADR-027, `roadmap.md` · **Code:** `pondra.zip` / `pondra.bundle` (≈22,200 lines of Rust, plus Python and JavaScript clients, packaging, and test and benchmark tools)
 **Name:** the prototype formerly called `lh` is now **Pondra**. The name is free on crates.io, PyPI and npm. A small personal-finance app uses it (pondra.app), a different category; run a trademark search before a public launch.
 
 ## Where it stands
@@ -14,6 +14,59 @@ One Rust binary replaces the Kafka + Flink + Spark + metastore + ZooKeeper stack
 - upsert and merge tables.
 
 Start more copies on the same bucket to scale out. The only state is object storage. There's no JVM, no database server and no coordination service.
+
+**Round 23 read and wrote everything else** (ADR-026): Pondra is a processing engine for data
+that isn't in its lake too.
+
+1. **Files anywhere are tables.** `SELECT … FROM 's3://sales/2026/*.parquet'`, `read_csv(…)`,
+   `read_json(…)`: globs, folders and lists on S3/R2/MinIO, GCS, Azure, HTTPS and the owner's
+   machine; Hive folders become typed columns (NULL's folder as NULL). Files are listed again by
+   every statement, so a file added or changed under its name is read as it is at once; their
+   byte ranges stay in memory only as the version that statement listed (fetched with
+   `If-Match`), and their footers' rows and ranges reach the join order. Spread over the nodes
+   like a table's files.
+2. **Credentials in secrets:** `CREATE SECRET` (s3, r2, gcs, azure, http, iceberg, kafka,
+   generic), sealed with the nodes' key; one secret per bucket; `secrets()` lists names and
+   scopes, never values. A URL no secret covers is refused, except for the program that started
+   the node.
+3. **Other engines' tables, read natively:** `delta_scan` (JSON commits, every kind of
+   checkpoint, deletion vectors, column mapping, old versions) and `iceberg_scan` (v1–v3,
+   position and equality deletes, deletion vectors, field ids, snapshots), folders of them and
+   Iceberg REST catalogs attached (`ATTACH … (TYPE delta | iceberg)`), each equal to what Spark
+   4, delta-rs and PyIceberg read of them (50 checks, `formats_check.py`); a feature Pondra doesn't read
+   is refused by name. `INSERT` into them commits through the format, exactly-once by job.
+4. **`COPY … TO`** Parquet, CSV or JSON files anywhere (`PARTITION_BY`, `OVERWRITE`, `APPEND`),
+   from every door, Postgres included; a folder from a big table is written by every node at
+   once, each its own share's files.
+5. **Other Kafka clusters:** a topic is a table (`'kafka://brokers/topic'` or `ATTACH … (TYPE
+   kafka)`), spread by partition; `COPY … TO` a topic with Kafka's own key partitioning; a
+   materialized view over a topic is a feed, every record once through a node killed and then
+   the leader (Apache Kafka 4.3.1; SASL PLAIN and SCRAM).
+6. **Lakes on GCS and Azure** as on S3, failover included (on their emulators).
+7. **As fast as its own tables:** TPC-H SF1 from Parquet files takes 3.67 s against the lake's
+   3.73 s on local disk and 3.51 s against 3.48 s on a local S3 (the same data written as the lake
+   writes it; `tools/bench/files_tpch.py`, `logs/round23/files-tpch-sf1.txt`). tpchgen's own files
+   take 4.16 s against 3.44 s: their Snappy and small row groups. The first version took 214 s on
+   S3 (nothing kept between queries) and then 4.69 s (a second look at every file, and no
+   statistics for the join order), both fixed this round. On real R2, a glob's second read took
+   0.11 s after 1.37 s cold (`files_s3_check.py`).
+8. **SQL conformance measured (D1):** DataFusion 55.1's own 504 sqllogictest files run through
+   Pondra (`tools/slt_check.py`): 16,644 of 24,783 records (67.2%) pass on one node, 72.6%
+   without the files of its optional Spark function library. On three nodes, every query spread,
+   16,643 pass: the few records that differ return rows in another order, where the query sets
+   none. They found two gaps, fixed:
+   `INSERT INTO t (b, a) …` wasn't taken, and `CREATE TABLE t (a INT) AS VALUES …` ignored its
+   column names. What else fails is grouped in `logs/round23/slt-1-node.json`.
+9. **Tests** (`logs/round23/`): locally, `harness.py all` (with `outside`, 27 checks; `clouds`,
+   GCS and Azure, 10; `kafkas`, 9; `schemas` with INSERT's columns and CTAS's names),
+   `formats_check` (50 of 50), `frames_check` (26 pipelines, 11 ways, the file section),
+   `spark_check` (51 of 51), `tpch_frames` (22 of 22), failover ×3, users, race, spread,
+   `open_check`, `asof_check`, `stream_check`, `spread_tpch` (22 of 22), `smoke`, the sqllogictest
+   run on one node and three; on real R2 `files_s3_check`. TPC-H SF1 on one node: 2.60 s from
+   memory and 4.18 s from Parquet against DuckDB's 4.47 s — a slower day for this machine (DuckDB
+   took 3.2–3.4 s in earlier rounds), and the same standing: 0.94 of DuckDB's time from Parquet
+   (0.93–0.97 before), 0.58 from memory (0.6). Invariants 95, 96, 98, 100, 101, 104 and 106 were each seen to fail
+   their tests without their code.
 
 **Round 22 built the DataFrame API, and macros and procedures with it** (ADR-023):
 
@@ -1173,12 +1226,12 @@ the GitHub workflow's driver, join order and the single-node benchmark), on the 
 
 ## Sizes
 
-| What | Round 3 | Round 5 | Round 8 | Round 9 | Round 10 | Round 11 | Round 12 | Round 14 | Round 15 | Round 16 | Round 17 | Round 18 |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| Binary (stripped) | 88.3 MB (30 MB gzip, 17 MB xz) | 89.2 MB (29.9 MB gzip, 16.8 MB xz) | 90.0 MB (30.5 MB gzip, 18.7 MB xz) | 90.7 MB (30.5 MB gzip, 17.2 MB xz), with the Postgres protocol and MCP | 93.0 MB (31.4 MB gzip, 17.6 MB xz), with the Kafka protocol and JSON functions | 95.0 MB (32.0 MB gzip, 18.0 MB xz), with Arrow Flight (gRPC) | 95.9 MB (32.4 MB gzip, 18.2 MB xz), with hashing, base64, files, vectors and AI functions | 96.3 MB (32.8 MB gzip), with shuffles that spill, the join order and any query across the nodes | 96.5 MB (32.9 MB gzip), with tables split by key ranges, hot keys shared out and distinct values sketched | 96.7 MB (33.0 MB gzip), with `ASOF JOIN`, session windows and watermarks from event time | 96.7 MB, built for glibc 2.17 (the wheel 32.8 MB, the npm platform package 33.3 MB), with the shell and exact float sums | 97.0 MB (32.8 MB gzip), glibc 2.17, with schemas, DDL, stored views and `ATTACH` |
-| Idle memory | 18 MB | 41 MB (mimalloc reserves more up front) | 42 MB | 44 MB | 49 MB (with `--kafka`) | 42 MB (with `--kafka --flight --pg`) | 39 MB (with `--kafka --flight --pg`) | not re-measured | not re-measured | not re-measured | not re-measured | not re-measured |
-| Peak memory under full load | 455 MB | 1.8 GB at 2.84 M events/s sustained (279–586 MB in the batch and streaming benchmarks) | not re-measured | not re-measured | not re-measured | bounded for queries by `--memory-gb` | as before, plus the decoded columns (`PONDRA_HOT_GB`, a quarter of the query budget), which are given back when the node's own memory runs high | as before; a shuffle's buckets past `PONDRA_SPILL_MB` go to the node's disk | as before | as before; an `ASOF JOIN`'s lookup table counts against the query budget | as before | as before; a node runs at most one partition per 24 MB of query memory |
-| Storage per event (user, event, amount, ts) | NDJSON 77.9 B → log 12.8 B → Parquet 6.8 B | NDJSON 77.9 B → log 12.8 B → Parquet 6.8 B (unchanged) | unchanged | unchanged | unchanged | unchanged | Parquet files are LZ4 now, about a third bigger than ZSTD's and much cheaper to read (`PONDRA_CODEC=zstd` to go back) | unchanged | unchanged; a table's entry carries a ~350-byte sketch per key-like column | unchanged | unchanged | unchanged |
+| What | Round 3 | Round 5 | Round 8 | Round 9 | Round 10 | Round 11 | Round 12 | Round 14 | Round 15 | Round 16 | Round 17 | Round 18 | Round 23 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| Binary (stripped) | 88.3 MB (30 MB gzip, 17 MB xz) | 89.2 MB (29.9 MB gzip, 16.8 MB xz) | 90.0 MB (30.5 MB gzip, 18.7 MB xz) | 90.7 MB (30.5 MB gzip, 17.2 MB xz), with the Postgres protocol and MCP | 93.0 MB (31.4 MB gzip, 17.6 MB xz), with the Kafka protocol and JSON functions | 95.0 MB (32.0 MB gzip, 18.0 MB xz), with Arrow Flight (gRPC) | 95.9 MB (32.4 MB gzip, 18.2 MB xz), with hashing, base64, files, vectors and AI functions | 96.3 MB (32.8 MB gzip), with shuffles that spill, the join order and any query across the nodes | 96.5 MB (32.9 MB gzip), with tables split by key ranges, hot keys shared out and distinct values sketched | 96.7 MB (33.0 MB gzip), with `ASOF JOIN`, session windows and watermarks from event time | 96.7 MB, built for glibc 2.17 (the wheel 32.8 MB, the npm platform package 33.3 MB), with the shell and exact float sums | 97.0 MB (32.8 MB gzip), glibc 2.17, with schemas, DDL, stored views and `ATTACH` | 101.2 MB (34.4 MB gzip, 21.6 MB xz), with files anywhere, Delta and Iceberg read and written, GCS and Azure, Kafka's client side (0.22.2: 97.9 MB) |
+| Idle memory | 18 MB | 41 MB (mimalloc reserves more up front) | 42 MB | 44 MB | 49 MB (with `--kafka`) | 42 MB (with `--kafka --flight --pg`) | 39 MB (with `--kafka --flight --pg`) | not re-measured | not re-measured | not re-measured | not re-measured | not re-measured | not re-measured |
+| Peak memory under full load | 455 MB | 1.8 GB at 2.84 M events/s sustained (279–586 MB in the batch and streaming benchmarks) | not re-measured | not re-measured | not re-measured | bounded for queries by `--memory-gb` | as before, plus the decoded columns (`PONDRA_HOT_GB`, a quarter of the query budget), which are given back when the node's own memory runs high | as before; a shuffle's buckets past `PONDRA_SPILL_MB` go to the node's disk | as before | as before; an `ASOF JOIN`'s lookup table counts against the query budget | as before | as before; a node runs at most one partition per 24 MB of query memory | not re-measured |
+| Storage per event (user, event, amount, ts) | NDJSON 77.9 B → log 12.8 B → Parquet 6.8 B | NDJSON 77.9 B → log 12.8 B → Parquet 6.8 B (unchanged) | unchanged | unchanged | unchanged | unchanged | Parquet files are LZ4 now, about a third bigger than ZSTD's and much cheaper to read (`PONDRA_CODEC=zstd` to go back) | unchanged | unchanged; a table's entry carries a ~350-byte sketch per key-like column | unchanged | unchanged | unchanged | unchanged |
 
 ## Memory is a knob, not a mystery
 

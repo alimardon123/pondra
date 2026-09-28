@@ -8,6 +8,8 @@
 //! * `CachedStore`, what DataFusion reads through: byte ranges in memory, then the SSD tier, then
 //!   the bucket. It also serves DataFusion's object-store interface (object_store 0.13) from our
 //!   single S3 client (0.14), so the binary carries one HTTP/TLS stack.
+//! * Files outside the lakes (ADR-026) can change under their names, so their byte ranges are
+//!   kept only as a version (`Outside`): the e-tag and size the statement's own listing saw.
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::{self, BoxStream, StreamExt};
@@ -116,6 +118,24 @@ impl Disk {
 
 type Entry = (Bytes, ObjectMeta, Range<u64>);
 
+/// Byte ranges of objects outside the lakes, in memory, shared by every store
+/// (`PONDRA_FILES_CACHE_MB`, 512): each kept under the version its statement listed — the e-tag
+/// (or the time) and size a listing or HEAD gave just before — and fetched as that version
+/// (`if_match`), so a newer version's bytes are never kept under an older one's key. The next
+/// statement lists again, and a file changed since is a new key.
+struct Outside {
+    seen: lru::LruCache<String, (String, Option<String>)>, // store|location -> (version, e-tag)
+    ranges: lru::LruCache<String, Entry>,                    // store|location|version|range -> bytes
+    bytes: usize,
+}
+
+static OUTSIDE: std::sync::LazyLock<Mutex<Outside>> = std::sync::LazyLock::new(|| {
+    let seen = lru::LruCache::new(std::num::NonZeroUsize::new(100_000).expect("nonzero"));
+    Mutex::new(Outside { seen, ranges: lru::LruCache::unbounded(), bytes: 0 })
+});
+
+fn files_cache_bytes() -> usize { std::env::var("PONDRA_FILES_CACHE_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(512) << 20 }
+
 #[derive(Debug)]
 pub struct CachedStore {
     inner: Arc<dyn object_store::ObjectStore>,
@@ -123,6 +143,7 @@ pub struct CachedStore {
     max_bytes: usize,
     disk: Option<(Arc<Disk>, String)>, // the SSD tier, and the lake's prefix in the bucket
     lakes: std::sync::RwLock<Vec<String>>, // the prefix of each lake read through it (`a/b/`, or `` at the bucket's root)
+    id: String, // (this store, in the keys of `OUTSIDE`)
 }
 
 impl std::fmt::Debug for Disk {
@@ -131,9 +152,51 @@ impl std::fmt::Debug for Disk {
 
 impl CachedStore {
     pub fn new(inner: Arc<dyn object_store::ObjectStore>, max_bytes: usize, disk: Option<(Arc<Disk>, String)>, prefix: &str) -> Self {
-        let this = Self { inner, cache: Mutex::new((lru::LruCache::unbounded(), 0)), max_bytes, disk, lakes: Default::default() };
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        let this = Self { inner, cache: Mutex::new((lru::LruCache::unbounded(), 0)), max_bytes, disk, lakes: Default::default(), id };
         this.add_lake(prefix);
         this
+    }
+
+    /// A store of files outside any lake (a bucket `CREATE SECRET` covers, a web server).
+    pub fn files(inner: Arc<dyn object_store::ObjectStore>) -> Self {
+        Self { inner, cache: Mutex::new((lru::LruCache::unbounded(), 0)), max_bytes: 0, disk: None, lakes: Default::default(), id: uuid::Uuid::new_v4().simple().to_string() }
+    }
+
+    fn saw(&self, m: &ObjectMeta) { saw(&self.id, &self.lakes.read().unwrap(), m) }
+
+    /// An object outside the lakes: a byte range of the version last listed, from memory or
+    /// fetched as that version; anything else (a whole object, a HEAD, one never listed) as it is.
+    async fn outside_get(&self, location: &Path, mut options: GetOptions) -> Result<GetResult> {
+        let bridge = crate::bridge::Bridge(self.inner.clone());
+        let at = format!("{}|{location}", self.id);
+        let seen = OUTSIDE.lock().unwrap().seen.get(&at).cloned();
+        let (Some((listed, e_tag)), Some(range), false) = (seen, options.range.clone(), options.head) else {
+            let r = bridge.get_opts(location, options).await?;
+            self.saw(&r.meta);
+            return Ok(r);
+        };
+        let key = format!("{at}|{listed}|{range:?}");
+        if let Some(entry) = OUTSIDE.lock().unwrap().ranges.get(&key).cloned() {
+            return Ok(result(entry));
+        }
+        options.if_match = e_tag; // (changed since it was listed: an error, not another version's bytes)
+        let r = bridge.get_opts(location, options).await?;
+        let (meta, range) = (r.meta.clone(), r.range.clone());
+        let entry = (r.bytes().await?, meta, range);
+        if version(&entry.1) == listed {
+            // (a store without e-tags whose file changed meanwhile: read, not kept)
+            let mut o = OUTSIDE.lock().unwrap();
+            o.bytes += entry.0.len();
+            if let Some((old, ..)) = o.ranges.put(key, entry.clone()) {
+                o.bytes -= old.len();
+            }
+            while o.bytes > files_cache_bytes() {
+                let Some((_, (old, ..))) = o.ranges.pop_lru() else { break };
+                o.bytes -= old.len();
+            }
+        }
+        Ok(result(entry))
     }
 
     /// Another lake in this bucket (attached): its files are cached too.
@@ -143,9 +206,10 @@ impl CachedStore {
     }
 
     /// Is this object in a lake (`sub`: in that part of it)? A lake's files (`data/`) are written
-    /// once and never change: cached. Other objects in the bucket (files outside the lake,
-    /// ADR-026) may change under their names: read as they are, and written as COPY … TO asks.
-    fn in_lake(&self, location: &Path, sub: &str) -> bool { self.lakes.read().unwrap().iter().any(|p| location.as_ref().starts_with(&format!("{p}{sub}"))) }
+    /// once and never change: cached as they are. Other objects in the bucket (files outside the
+    /// lake, ADR-026) may change under their names: kept only by version (`Outside`), and written
+    /// as COPY … TO asks.
+    fn in_lake(&self, location: &Path, sub: &str) -> bool { inside(&self.lakes.read().unwrap(), location, sub) }
 
     /// Not a lake's object: DataFusion may write it (COPY … TO beside a lake, never into one).
     fn outside(&self, location: &Path) -> Result<crate::bridge::Bridge> {
@@ -202,6 +266,29 @@ impl CachedStore {
     }
 }
 
+fn result((bytes, meta, range): Entry) -> GetResult {
+    let payload = GetResultPayload::Stream(stream::once(async move { Ok(bytes) }).boxed());
+    GetResult { payload, meta, range, attributes: Default::default() }
+}
+
+fn inside(lakes: &[String], location: &Path, sub: &str) -> bool { lakes.iter().any(|p| location.as_ref().starts_with(&format!("{p}{sub}"))) }
+
+/// An object's version: its e-tag and size, or (a store without e-tags) its time, to the second as
+/// every store's headers give it, and size.
+fn version(m: &ObjectMeta) -> String {
+    match &m.e_tag {
+        Some(e) => format!("{e}:{}", m.size),
+        None => format!("@{}:{}", m.last_modified.timestamp(), m.size),
+    }
+}
+
+/// What a listing or HEAD says an object outside the lakes is now (`Outside`).
+fn saw(id: &str, lakes: &[String], m: &ObjectMeta) {
+    if !inside(lakes, &m.location, "") {
+        OUTSIDE.lock().unwrap().seen.put(format!("{id}|{}", m.location), (version(m), m.e_tag.clone()));
+    }
+}
+
 fn generic(e: object_store::Error) -> Error { Error::Generic { store: "lake", source: Box::new(e) } }
 
 fn unsupported<T>() -> Result<T> { Err(Error::NotImplemented { operation: "write".into(), implementer: "pondra read cache".into() }) }
@@ -213,8 +300,11 @@ impl std::fmt::Display for CachedStore {
 #[async_trait]
 impl ObjectStore for CachedStore {
     async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
+        if !self.in_lake(location, "") {
+            return self.outside_get(location, options).await;
+        }
         if !self.in_lake(location, "data/") {
-            return crate::bridge::Bridge(self.inner.clone()).get_opts(location, options).await;
+            return crate::bridge::Bridge(self.inner.clone()).get_opts(location, options).await; // (the lake's other objects: its own client's)
         }
         let key = format!("{location}|{:?}|{}", options.range, options.head);
         let hit = self.cache.lock().unwrap().0.get(&key).cloned();
@@ -222,7 +312,7 @@ impl ObjectStore for CachedStore {
             Some(entry) => Some(entry),
             None => self.on_disk(location, &options).await,
         };
-        let (bytes, meta, range) = match hit {
+        let entry = match hit {
             Some(entry) => entry,
             None => {
                 let entry = self.fetch(location, options.range, options.head).await?;
@@ -230,8 +320,7 @@ impl ObjectStore for CachedStore {
                 entry
             }
         };
-        let payload = GetResultPayload::Stream(stream::once(async move { Ok(bytes) }).boxed());
-        Ok(GetResult { payload, meta, range, attributes: Default::default() })
+        Ok(result(entry))
     }
 
     // DataFusion only reads the lake; Pondra writes through its own client. Beside it: COPY … TO.
@@ -251,7 +340,14 @@ impl ObjectStore for CachedStore {
             }
         }).boxed()
     }
-    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> { crate::bridge::Bridge(self.inner.clone()).list(prefix) } // (files outside the lake)
-    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> { crate::bridge::Bridge(self.inner.clone()).list_with_delimiter(prefix).await }
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
+        let (id, lakes) = (self.id.clone(), self.lakes.read().unwrap().clone());
+        crate::bridge::Bridge(self.inner.clone()).list(prefix).inspect(move |m| m.iter().for_each(|m| saw(&id, &lakes, m))).boxed() // (files outside the lake)
+    }
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
+        let r = crate::bridge::Bridge(self.inner.clone()).list_with_delimiter(prefix).await?;
+        r.objects.iter().for_each(|m| self.saw(m));
+        Ok(r)
+    }
     async fn copy_opts(&self, _: &Path, _: &Path, _: CopyOptions) -> Result<()> { unsupported() }
 }

@@ -388,7 +388,10 @@ impl Lake {
     pub async fn open(url: &str, writer: bool, streamed: bool) -> Result<Arc<Lake>> {
         let (url, store, bucket) = open_store(url)?;
         let pool = Arc::new(datafusion::execution::memory_pool::FairSpillPool::new(memory_limit()));
-        let rt = RuntimeEnvBuilder::new().with_memory_pool(pool).build_arc()?; // (spills go to the OS temp dir)
+        // (spills go to the OS temp dir; no listing kept past its statement: DataFusion's own
+        // cache of them would hide a file added to a folder outside the lake, ADR-026)
+        let caches = datafusion::execution::cache::cache_manager::CacheManagerConfig::default().with_list_files_cache_limit(0);
+        let rt = RuntimeEnvBuilder::new().with_memory_pool(pool).with_cache_manager(caches).build_arc()?;
         let disk = bucket.as_ref().and_then(|_| disk_tier(&url, &store));
         let mut cached_store = None;
         if let Some((bucket_url, s3)) = bucket {

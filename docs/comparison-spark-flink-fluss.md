@@ -81,8 +81,11 @@ All of that comes from one 95 MB binary, with no JVM, ZooKeeper, Kafka or separa
   own answers and column names. SQL and Python mix either way round, and stored procedures in
   SQL or Python (Snowflake's and Postgres's idea) are callable from every client and as MCP tools.
   Pondra has SQL (reads and writes) over HTTP, the Postgres protocol, Arrow Flight SQL (ADBC,
-  JDBC) and MCP, a Python client, the Kafka protocol and an Iceberg REST catalog; few connectors
-  beyond those.
+  JDBC) and MCP, a Python client, the Kafka protocol and an Iceberg REST catalog. Since round 23
+  (ADR-026) it reads and writes what is outside its lake as well: Parquet, CSV and JSON files on
+  S3, GCS, Azure and HTTPS; Delta and Iceberg tables (read natively, `INSERT` into them, REST
+  catalogs); other Kafka clusters both ways, and views fed from their topics. Databases (Postgres,
+  MySQL) attached are round 25; JDBC sources and CDC from databases are not planned yet.
 - **Maturity:** Pondra is a prototype.
 
 **So the realistic claim:** Pondra can beat them for the common case — small to mid-size
@@ -110,7 +113,7 @@ biggest open risk is scale-out, and only a multi-machine benchmark can retire it
 | Batch SQL on one machine (TPC-H) | ✓ from files: fastest at SF10 (38.0 s; DuckDB 39.8, Polars 42.8); at SF1 level with Polars' streaming engine (3.19 s vs 3.18) and ahead of DuckDB, Daft and Bodo | | | — | — |
 | AI agents and vectors | ✓ MCP server built in; `ai_complete`/`ai_embed` against any OpenAI-compatible endpoint; your own functions on an Arrow Flight server; exact vector search in SQL | AI functions on Databricks only | `ML_PREDICT`, `VECTOR_SEARCH`; Flink Agents (0.2) | MCP and vector columns planned | ✓ Agent Bricks, Genie |
 | Unstructured and multimodal | ✓ files in the lake (`files('…')`, `file_read`), `BINARY` with hashing and base64, `VARIANT`, `Float32[]` vectors — published as Delta arrays and Iceberg lists | — | — | blob and variant types planned | ✓ Databricks file types, `ai_query` |
-| Connectors & ecosystem | Kafka protocol in and out (any Kafka client, Debezium), Postgres, HTTP; Delta + Iceberg out, Iceberg REST catalog | ✓ huge | ✓ huge | Flink/Spark connectors | ✓ Databricks |
+| Connectors & ecosystem | Kafka protocol in and out (any Kafka client, Debezium), Postgres, HTTP; Delta + Iceberg out, Iceberg REST catalog; files on S3/GCS/Azure/HTTPS, other engines' Delta and Iceberg tables and other Kafka clusters, read and written (round 23) | ✓ huge | ✓ huge | Flink/Spark connectors | ✓ Databricks |
 | Operations & footprint | ✓ 1 binary, 44–49 MB idle, 0.02 s start | JVM cluster | JVM cluster + checkpoints | JVM + ZooKeeper + Flink tiering job | managed |
 | Governance & security | read / write / admin tokens (HTTP, Postgres, MCP); no TLS or per-table grants yet | via platforms | via platforms | SASL users (1.0); TLS planned | ✓ Unity Catalog |
 | Maturity | prototype | ✓ | ✓ | 1.0, a top-level Apache project | beta |

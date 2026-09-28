@@ -525,8 +525,10 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
             ctx.register_table(table_ref(name), named(&ctx, view, &meta, names_deleted(&text))?)?;
         }
     }
-    for name in crate::ext::names(&text) {
-        let meta = crate::ext::meta(lake, &name).await?.expect("files"); // (files anywhere: `ext.rs`)
+    let names = crate::ext::names(&text);
+    let metas = futures::future::try_join_all(names.iter().map(|n| crate::ext::meta(lake, n))).await?; // (listed at once)
+    for (name, meta) in names.into_iter().zip(metas) {
+        let meta = meta.expect("files"); // (files anywhere: `ext.rs`)
         let view = table_view(lake, &ctx, &name, &meta, upto).await?;
         ctx.register_table(datafusion::common::TableReference::bare(name.clone()), named(&ctx, view, &meta, false)?)?; // (another engine's names for its columns)
     }

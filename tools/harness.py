@@ -237,6 +237,8 @@ def outside():
     put("feed/events.ndjson", b'{"k":"a","v":1}\n{"k":"b","v":2}\n{"k":"a","v":3,"x":true}\n')
     for day in ("2026-01-01", "2026-01-02"):
         put(f"hive/day={day}/data.parquet", parquet(pa.table({"v": [1, 2, 3]})))
+    for k, n in (("__HIVE_DEFAULT_PARTITION__", 2), ("x", 3)):
+        put(f"hive_null/k={k}/data.parquet", parquet(pa.table({"v": list(range(n))})))
     web = tempfile.mkdtemp(prefix="pondra-web-")
     open(os.path.join(web, "small.parquet"), "wb").write(parquet(pa.table({"x": [1, 2, 3, 4]})))
 
@@ -260,7 +262,8 @@ def outside():
     lake = new_lake()
     env = {"PONDRA_SECRET_KEY": "one key for the cluster", "PONDRA_OWNER_KEY": owner_key, "AWS_ENDPOINT": f"http://127.0.0.1:{s3p}",
            "AWS_ACCESS_KEY_ID": "k", "AWS_SECRET_ACCESS_KEY": "s", "AWS_REGION": "us-east-1", "AWS_ALLOW_HTTP": "true"}  # (the owner's own credentials)
-    nodes = [Node(lake, A.port + i, env=env).start() for i in range(3)]
+    pgp = A.port + 52
+    nodes = [Node(lake, A.port + i, env={**env, "PONDRA_SPREAD_MB": "0"} if i == 0 else env, **({"pg": f"127.0.0.1:{pgp}"} if i == 1 else {})).start() for i in range(3)]  # (node 0 spreads a COPY of these few files)
 
     def q(s, i=0, owner=False, spread=None):
         path = "/sql" + (f"?spread={spread}" if spread is not None else "")
@@ -286,14 +289,18 @@ def outside():
     sealed = not any(b"pondra-sealed-7f3a" in open(os.path.join(d, f), "rb").read() for d, _, fs in os.walk(lake) for f in fs)
     checks["CREATE SECRET: listed by secrets() without its values, sealed in the catalog"] = sealed and q("SELECT * FROM secrets() ORDER BY name", 1) == [
         {"name": "ext_s3", "type": "s3", "scope": "s3://ext"}, {"name": "web", "type": "http", "scope": "http://127.0.0.1:%d" % webp}]
+    checks["one secret a bucket: another scope in it, or the same one, refused"] = all("a bucket is read with one secret" in refused(
+        f"CREATE SECRET s{i} (TYPE s3, KEY_ID 'x', SECRET 'y', SCOPE '{s}')") for i, s in enumerate(["s3://ext/sales", "s3://ext"]))
     checks["a Parquet glob, a folder, a list of files == pyarrow"] = (q(by_region, 1) == want and q(by_region.replace(glob, "read_parquet('s3://ext/sales/2026/')"), 2) == want
         and q(f"SELECT count(*) AS n FROM read_parquet(['s3://ext/sales/2026/part-0.parquet', 's3://ext/sales/2026/part-3.parquet'])") == [{"n": 4000}]
         and q(f"SELECT count(*) AS n, count(note) AS notes FROM {glob}") == [{"n": len(sales), "notes": sum(r["note"] is not None for r in sales)}])
     checks["CSV with options, TSV by extension, JSON lines"] = (q("SELECT who, sum(amount) AS s FROM read_csv('s3://ext/drop/orders.csv', delim => ';') GROUP BY who ORDER BY who") == [{"who": "ann", "s": 6}, {"who": "bo", "s": 7}]
         and q("SELECT sum(amount) AS s FROM 's3://ext/drop/orders.tsv'") == [{"s": 12}]
         and q("SELECT k, sum(v) AS s, count(x) AS x FROM 's3://ext/feed/events.ndjson' GROUP BY k ORDER BY k") == [{"k": "a", "s": 4, "x": 1}, {"k": "b", "s": 2, "x": 0}])
-    checks["Hive-style folders are columns, and filter"] = (q("SELECT day, sum(v) AS s FROM read_parquet('s3://ext/hive/', hive_partitioning => true) GROUP BY day ORDER BY day") == [{"day": "2026-01-01", "s": 6}, {"day": "2026-01-02", "s": 6}]
-        and q("SELECT count(*) AS n FROM read_parquet('s3://ext/hive/**/*.parquet', hive_partitioning => true) WHERE day = '2026-01-02'") == [{"n": 3}])
+    checks["Hive-style folders are columns, and filter (NULL's folder too)"] = (q("SELECT day, sum(v) AS s FROM read_parquet('s3://ext/hive/', hive_partitioning => true) GROUP BY day ORDER BY day") == [{"day": "2026-01-01", "s": 6}, {"day": "2026-01-02", "s": 6}]
+        and q("SELECT count(*) AS n FROM read_parquet('s3://ext/hive/**/*.parquet', hive_partitioning => true) WHERE day = '2026-01-02'") == [{"n": 3}]
+        and q("SELECT count(*) AS n FROM read_parquet('s3://ext/hive_null/') WHERE k IS NULL") == [{"n": 2}] and q("SELECT count(*) AS n FROM read_parquet('s3://ext/hive_null/') WHERE k = 'x'") == [{"n": 3}]
+        and q("SELECT count(k) AS n, count(*) AS rows FROM read_parquet('s3://ext/hive_null/')") == [{"n": 3, "rows": 5}])
     before = metrics_of(A.port)
     march = q(f"SELECT count(*) AS n FROM {glob} WHERE day >= '2026-03-01' AND day < '2026-04-01'", spread=0)
     after = metrics_of(A.port)
@@ -312,7 +319,14 @@ def outside():
     total = "SELECT sum(amount) AS s FROM read_csv('s3://ext/drop/orders.csv', delim => ';')"
     before = q(total)
     put("drop/orders.csv", b"id;who;amount\n1;ann;50\n")
-    checks["a file changed under its name: the next query, at once, reads it as it is now"] = before == [{"s": 13}] and q(total) == [{"s": 50}]
+    put("drop/x/1.parquet", parquet(pa.table({"x": [1, 2, 3]})))
+    xs = "SELECT count(*) AS n, max(x) AS m, sum(x) AS s FROM 's3://ext/drop/x/*.parquet'"
+    small = q(xs, 1)
+    put("drop/x/2.parquet", parquet(pa.table({"x": list(range(5000))})))
+    more = _try(lambda: q(xs, 1))
+    put("drop/x/1.parquet", parquet(pa.table({"x": [7, 8, 9]})))  # (as big as it was: its bytes were read, and kept by their version)
+    checks["a file changed under its name, or one more in a folder: the next query, at once, reads them as they are now"] = (before == [{"s": 13}] and q(total) == [{"s": 50}]
+        and small == [{"n": 3, "m": 3, "s": 6}] and more == [{"n": 5003, "m": 4999, "s": 12497506}] and _try(lambda: q(xs, 1)) == [{"n": 5003, "m": 4999, "s": 12497524}])
     checks["refused by name: an unknown option, a compressed file, an unknown format"] = all(w in refused(s) for s, w in [
         ("SELECT * FROM read_csv('s3://ext/drop/orders.csv', bogus => 1)", "no option bogus"), ("SELECT * FROM 's3://ext/x.csv.gz'", "compressed"), ("SELECT * FROM 's3://ext/x.xlsx'", "which format")])
     # COPY … TO: files out, in each format, read back by pyarrow and by Pondra.
@@ -325,6 +339,21 @@ def outside():
     folders = sorted({k.split("/")[2] for k in keys("out/by_region/")})
     checks["…a folder of files by PARTITION_BY, read back as one table"] = (folders == [f"region={g}" for g in per(sales)]
         and q("SELECT region, count(*) AS n, sum(amount) AS s FROM read_parquet('s3://ext/out/by_region/', hive_partitioning => true) GROUP BY region ORDER BY region", 1) == want)
+    names = lambda prefix: {k.rsplit("/", 1)[1].split("_")[0] for k in keys(prefix)}  # (one write's files share the first part of their names)
+    checks["…written by every node at once, each its own share's files"] = len(names("out/by_region/")) == 3
+    q("CREATE TABLE spread_me (id BIGINT, amount BIGINT)")
+    for i in range(3):
+        q(f"INSERT INTO spread_me SELECT id, amount FROM {glob} WHERE id % 3 = {i}")
+        call(A.port, "POST", "/tier", timeout=600)
+    q("INSERT INTO spread_me VALUES " + ", ".join(f"({i}, {i})" for i in range(10)))  # (in the log only, for now)
+    copied = q("COPY spread_me TO 's3://ext/out/lake/' (FORMAT parquet)")
+    lake_rows = [{"n": len(sales) + 10, "s": sum(r["amount"] for r in sales) + sum(range(10))}]
+    checks["…a lake table's files and its log tail, every node its share"] = (copied["copied"] == lake_rows[0]["n"] and len(names("out/lake/")) >= 3
+        and q("SELECT count(*) AS n, sum(amount) AS s FROM read_parquet('s3://ext/out/lake/')", 1) == lake_rows)
+    q(f"COPY (SELECT region, count(*) AS n FROM {glob} GROUP BY region) TO 's3://ext/out/counts/' (FORMAT parquet)")
+    q(f"COPY (SELECT * FROM {glob} LIMIT 10) TO 's3://ext/out/ten/' (FORMAT parquet)")
+    checks["…but an aggregate or a LIMIT, whose rows no node has alone, from one node"] = (q("SELECT region, n FROM read_parquet('s3://ext/out/counts/') ORDER BY region", 1) == [{"region": w["region"], "n": w["n"]} for w in want]
+        and q("SELECT count(*) AS n FROM read_parquet('s3://ext/out/ten/')", 1) == [{"n": 10}] and len(names("out/counts/")) == len(names("out/ten/")) == 1)
     q("COPY eu TO 's3://ext/out/eu.csv' (HEADER true, DELIMITER ';')")
     q("COPY (SELECT k, v FROM 's3://ext/feed/events.ndjson' ORDER BY v) TO 's3://ext/out/events.json'")
     lines = got("out/eu.csv").decode().splitlines()
@@ -332,10 +361,15 @@ def outside():
         and [json.loads(l) for l in got("out/events.json").decode().splitlines()] == [{"k": "a", "v": 1}, {"k": "b", "v": 2}, {"k": "a", "v": 3}])
     q("COPY (SELECT 1 AS a) TO 's3://ext/out/eu.parquet'")
     checks["…a file there already is replaced"] = pq.read_table(io.BytesIO(got("out/eu.parquet"))).to_pylist() == [{"a": 1}]
+    import psycopg
+    with psycopg.connect(f"host=127.0.0.1 port={pgp} user=u dbname=lake", autocommit=True) as c:
+        c.execute("COPY (SELECT 2 AS b) TO 's3://ext/out/pg.parquet'")
+    checks["…from the Postgres port too"] = pq.read_table(io.BytesIO(got("out/pg.parquet"))).to_pylist() == [{"b": 2}]
     mine = tempfile.mkdtemp(prefix="pondra-copy-")
     checks["…to a bucket no secret covers: refused, but the node's owner may"] = ("no secret covers" in refused("COPY eu TO 's3://elsewhere/eu.parquet'")
         and "only the program that started the node" in refused(f"COPY eu TO '{mine}/eu.parquet'")
-        and q(f"COPY eu TO '{mine}/eu.parquet'", owner=True) and pq.read_table(f"{mine}/eu.parquet").num_rows == len(lines) - 1)
+        and q(f"COPY eu TO '{mine}/eu.parquet'", owner=True) and pq.read_table(f"{mine}/eu.parquet").num_rows == len(lines) - 1
+        and q(f"SELECT count(*) AS n FROM '{mine}/*.parquet'", owner=True) == [{"n": len(lines) - 1}])
     checks["…and never into a lake, not even by the node's owner"] = "inside the lake" in refused(f"COPY eu TO '{lake}/data/eu/x.parquet'", owner=True)
     shutil.rmtree(mine, ignore_errors=True)
     tokens = {"read_token": "r", "write_token": "w", "admin_token": "a"}
@@ -485,8 +519,8 @@ def kafkas():
     Pondra node's own Kafka port. A topic read as a table == what was produced, spread over three
     nodes == one node, a LIMIT reading only what it needs; COPY … TO a topic, each key in the
     partition Kafka's producers would pick; a view fed by a topic, every record once while the
-    node running a partition is killed; SASL SCRAM-SHA-256 and PLAIN from secrets, a wrong
-    password refused."""
+    node running a partition is killed, and then the leader; SASL SCRAM-SHA-256 and PLAIN from
+    secrets, a wrong password refused."""
     import kafka as kp
     from kafka.partitioner.default import murmur2
     root = tempfile.mkdtemp(prefix="pondra-kafkas-")
@@ -549,14 +583,19 @@ def kafkas():
         more = 3000
         for i in range(sent, sent + more):
             prod.send("orders", key=f"k{i % 17}", value={"id": i, "amount": i % 100})
-            if i == sent + more // 2:
+            if i == sent + more // 3:
                 prod.flush()
                 nodes[2].kill()  # (its partitions go to the others)
+            if i == sent + 2 * more // 3:
+                prod.flush()
+                time.sleep(1)
+                nodes[0].kill()  # (the leader: the last node leads, and runs every partition)
         prod.flush()
         total = sent + more
-        count = lambda: q("SELECT count(*) AS n, count(DISTINCT (_partition, _offset)) AS d, count(DISTINCT id) AS ids FROM orders_in")
-        got = until(count, [{"n": total, "d": total, "ids": total}], 60)
-        checks["a view fed by a topic on three nodes, one killed: every record once"] = got == [{"n": total, "d": total, "ids": total}]
+        count = lambda: _try(lambda: q("SELECT count(*) AS n, count(DISTINCT (_partition, _offset)) AS d, count(DISTINCT id) AS ids FROM orders_in", 1))
+        got = until(count, [{"n": total, "d": total, "ids": total}], 90)
+        checks["a view fed by a topic on three nodes, one killed, then the leader: every record once"] = got == [{"n": total, "d": total, "ids": total}]
+        checks["…its feed kept apart from the lake's functions (`/functions` lists them)"] = _try(lambda: call(A.port + 1, "GET", "/functions")) == {}
         if got != [{"n": total, "d": total, "ids": total}]:
             print("feed:", got)
     [n.kill() for n in nodes]
@@ -1371,7 +1410,16 @@ def schemas():
         q(f"INSERT INTO dbo.big SELECT value + {i * 20000}, value % 100, value * 0.5 FROM generate_series(1, 20000)")
     time.sleep(0.5)
     cols = q("SELECT column_name, data_type FROM information_schema.columns WHERE table_schema = 'dbo' AND table_name = 'big' ORDER BY ordinal_position")
-    checks["CREATE TABLE … AS: the query's rows and columns"] = n("dbo.big") == 120000 and [c["column_name"] for c in cols] == ["id", "k", "v"]
+    q("CREATE TABLE dbo.named (a INT, b VARCHAR) AS VALUES (1, 'x'), (2, NULL)")
+    named = q("SELECT column_name, data_type FROM information_schema.columns WHERE table_schema = 'dbo' AND table_name = 'named' ORDER BY ordinal_position")
+    checks["CREATE TABLE … AS: the query's rows and columns, or the ones it names"] = (n("dbo.big") == 120000 and [c["column_name"] for c in cols] == ["id", "k", "v"]
+        and [c["column_name"] for c in named] == ["a", "b"] and named[0]["data_type"] == "Int32" and q("SELECT a, b FROM dbo.named ORDER BY a") == [{"a": 1, "b": "x"}, {"a": 2}]
+        and err("CREATE TABLE dbo.wrong (a INT) AS VALUES (1, 2)") is not None)
+    q("CREATE TABLE dbo.cols (a INT, b VARCHAR, c DOUBLE)")
+    q("INSERT INTO dbo.cols (c, a) VALUES (1.5, 1), (2.5, 2)")
+    q("INSERT INTO dbo.cols (b, a) SELECT 'x', 3", 1)
+    checks["INSERT INTO t (columns): the ones named, by position, the rest NULL"] = (q("SELECT a, b, c FROM dbo.cols ORDER BY a") == [{"a": 1, "c": 1.5}, {"a": 2, "c": 2.5}, {"a": 3, "b": "x"}]
+        and err("INSERT INTO dbo.cols (nope) VALUES (1)") is not None and err("INSERT INTO dbo.cols (a, b) VALUES (1)") is not None)
     # stored views: run where they are used, over what the tables hold then
     q("CREATE VIEW dbo.small AS SELECT k, v FROM dbo.big WHERE k < 10", 2)
     q("CREATE VIEW both_t AS SELECT k, v FROM t UNION ALL SELECT k, v FROM dbo.t")

@@ -1,7 +1,7 @@
 # AGENTS.md — working on Pondra
 
 Read this first, then `README.md` (what it does), `docs/adr-005-every-node-writes.md` (why it
-works this way) and `docs/adr-023-frames-and-procedures.md` (the current round).
+works this way) and `docs/adr-026-read-and-write-anything.md` (the latest round).
 `docs/prototype-status.md` has the measured numbers and what's left.
 
 ## What this is
@@ -18,7 +18,7 @@ The owner's design principles, which every change must respect:
 2. **As serverless as possible**: no always-on services besides the nodes themselves.
 3. **SPMD, not driver/executor** (Bodo-style): every node runs the same code on its slice.
 4. **No JVM, no Spark, no Flink, no Fluss needed.**
-5. **Short, simple, readable code** — without losing functionality. ~17,500 lines of Rust total (the Kafka protocol is 1,300 of them).
+5. **Short, simple, readable code** — without losing functionality. ~22,000 lines of Rust total (the Kafka protocol is 1,300 of them; other engines' formats, Kafka's client side and files anywhere, round 23, 4,650).
    If a change makes a file much longer, look for the simpler shape first.
 6. **Scale-out is the point** (the owner, 2026-09-27): running across machines is what sets
    Pondra apart from single-node engines (DuckDB, Polars, Daft, Bodo) and makes it leaner than
@@ -29,7 +29,7 @@ The owner's design principles, which every change must respect:
 ## Layout
 
 ```
-src/      17,500 lines of Rust, one file per concern (see the table in README.md)
+src/      22,000 lines of Rust, one file per concern (see the table in README.md)
 python/   the Python client (pure Python, HTTP + Arrow; `local()` starts a node): `client.py`, frames
           (`frame.py`, Polars' names), `spark/` (PySpark's names), `procedure.py` (runs a Python
           procedure for a node), `magic.py` (`%%sql`), `__main__.py` (`python -m pondra`, and
@@ -50,6 +50,10 @@ tools/    harness.py, cluster.py (tests), open_check.py (Delta + Iceberg readers
           join_order.py (the same queries written badly: same answers, no slower),
           spread_tpch.py (all 22 TPC-H queries across N nodes == one node, and why not),
           skew_check.py (a hot join key: same answers, the work shared out),
+          formats_check.py (Delta and Iceberg tables by Spark 4, delta-rs and PyIceberg == Pondra's reads; attached,
+          written, spread), sim_gcs.py and sim_iceberg_rest.py (a local GCS and an Iceberg REST catalog),
+          bench/files_tpch.py (TPC-H from files outside the lake against the lake's tables),
+          files_s3_check.py (files in a real bucket), slt_check.py (DataFusion's sqllogictest files: D1),
           bench/nexmark.py (five Nexmark queries, Pondra and Flink), frames_check.py (frames == Polars; SQL and
           Python mixed every way), spark_check.py (pondra.spark == PySpark), bench/tpch_frames.py (TPC-H as
           SQL, frames and PySpark code), asof_check.py (ASOF JOIN == DuckDB's, one node and three), stream_check.py (windows,
@@ -71,8 +75,10 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
 - **The catalog** is a SlateDB key-value store inside the same bucket: `t/` tables, `s/` segments,
   `d/` inline segment data, `p/` producer progress (also Kafka producers, consumer-group offsets
   and window emission), `v/` views, `w/` session views' bounds, `k/` tasks, `x/` Delta and `i/`
-  Iceberg publish state, `m` members (replicated acks), `n` next segment, `c` commit number. One
-  process (the leader) writes it; everyone reads it.
+  Iceberg publish state, `a/` lakes attached, `f/` functions, `r/` macros and procedures, `e/`
+  secrets (sealed), `o/` catalogs attached from outside and `fd/` feeds (round 23), `m` members
+  (replicated acks), `n` next segment, `c` commit number. One process (the leader) writes it;
+  everyone reads it.
 - **Writes:** a client POSTs a batch to *any* node. That node encodes it (Arrow IPC + ZSTD), runs
   the inline views on it, writes it to the bucket if it's over 64 KB (1 MB with replicated
   acks), and asks the leader to sequence it. The leader dedupes `(producer, seq)`, numbers the
@@ -245,6 +251,23 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
   pondra.procedure` beside a node started with `--python`, with a token lent the caller's rights
   (`auth::lend`). `POST /sql` takes several statements (`routines::statements`) and `$name`
   parameters (`routines::bind`); MCP lists every procedure as a tool.
+- **Files and other engines' tables, anywhere** (round 23, ADR-026). A file, folder or glob
+  (`'s3://b/*.parquet'`, `read_csv(…)`), another engine's table (`delta_scan`, `iceberg_scan`), a
+  topic (`'kafka://brokers/topic'`) or a name under a catalog attached with `ATTACH … (TYPE delta
+  | iceberg | kafka)` is rewritten where SQL comes in to a quoted `"ext:<base64url JSON Spec>"`
+  (`routines::expand`, `ext::table`), which `ext::meta` resolves to a TableMeta of its files:
+  listed once a statement (`ext::scope`/`listing`), sent with a spread query's slices
+  (`Slice::ext`). Plain files are read by DataFusion's listing table (`ext::read`), Delta and
+  Iceberg files by `scan.rs` (partition values, deletion vectors and position deletes as a row
+  selection, equality deletes as an anti join by sequence number, columns by field id), a topic
+  by `kafka_client.rs`. A bucket's store is registered with its secret (`ext::register`;
+  `CachedStore::files` keeps byte ranges by the version listed). `CREATE SECRET` (`ext::create`,
+  catalog `e/`) seals credentials with `PONDRA_SECRET_KEY`. `COPY … TO` (`copy.rs`) writes files
+  anywhere or a topic; a folder from a big table is written by every node (`spmd::copy`).
+  `INSERT` into an attached Delta or Iceberg table commits through the format
+  (`write_outside.rs`; Iceberg's Avro is `avro.rs`). A materialized view over a topic is a feed
+  (`feeds.rs`, catalog `fd/`): a shard per partition, rows and offset committed together. Lakes
+  may be on GCS and Azure too (`store::open_store`).
 - **Memory:** one spill pool per node (`--memory-gb`); a query out of memory runs again with
   sort-merge joins. **`GET /metrics`** (Prometheus) for everything else.
 
@@ -645,6 +668,66 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    is `frame.write_table`); a materialized view's options without `materialized` are refused.
    `frames_check.py` section 5 fails with 0.22's client.
 
+95. **Files outside the lakes are listed once a statement, and never kept longer** (`ext::LISTED`
+   through `ext::scope`/`listing` at every door; a spread query's nodes get the coordinator's list:
+   `Slice::ext`, `ext::prime`; DataFusion's own list-files cache is off, `Lake::open`). A file added
+   to a folder or changed under its name is read as it is by the next statement. `harness.py
+   outside`: "a file changed under its name, or one more in a folder" fails with the list kept
+   across statements, and with DataFusion's cache on (it never expires).
+96. **A file outside the lakes is cached only as the version its statement listed** (`cache::Outside`:
+   the e-tag, time and size a listing or HEAD gave; fetched with `if_match`; a reply of another
+   version is read, not kept). Only a lake's own `data/` goes through its caches and SSD tier as it
+   is. `harness.py outside` (a Parquet file rewritten at the same size) fails with the version out
+   of the key; `clouds`' "a file beside the lake, changed under its name" fails with a lake's
+   bucket cached whole.
+97. **Who reads a file is checked, and an `ext:` name carries no trust** (`ext::check`,
+   `check_files`): a URL needs a secret whose scope covers it, or the node's owner (the shell,
+   `local()`, a node running a share its coordinator checked); a path on the node's machine only
+   its owner; every file another engine's log names is checked, not just its folder. Anyone can
+   write an `ext:` name by hand, so a Spec never says which secret to use or who may read.
+   `harness.py outside`: the refusals.
+98. **A bucket is read with one secret** (`ext::create`): a second scope in a bucket, or the same
+   scope twice, is refused, since a bucket's store is registered once (`ext::register`).
+   `harness.py outside`: "one secret a bucket".
+99. **Nothing writes into a lake but its own catalog's writers** (`copy::copy_to` refuses a target
+   in this lake or an attached one; `CachedStore::outside` and `delete_stream` refuse writes and
+   deletes under a lake's prefix, whoever asks). `harness.py outside`: "…never into a lake, not
+   even by the node's owner"; `clouds`: "COPY … TO into the lake: refused".
+100. **A `COPY … TO` a folder spreads only when every row is written by one node from its own
+   share** (`spmd::copy`: the plan is `Split` with no exchange and no sort on top; the coordinator
+   writes its share and the log tail). A spread that fails takes away what it wrote, then one node
+   writes it all. `harness.py outside`: "…an aggregate or a LIMIT… from one node" and "…a lake
+   table's files and its log tail" fail without it.
+101. **Iceberg deletes follow sequence numbers and written paths** (`read_iceberg`): an equality
+   delete removes rows only from files with an older data sequence number (with equality deletes
+   about, every data file carries its own: `Outside::seq`); a position delete names the path a file
+   was written at, matched before `allow_moved_paths` moves it. `formats_check.py`'s
+   `iceberg:equality` (a row inserted after the delete) fails without the first.
+102. **A commit to another engine's table is put-if-absent and names its job** (`write_outside`:
+   Delta's `{v:020}.json` with a `txn` action `pondra:{job}`; Iceberg's `v{N+1}.metadata.json` or
+   a REST commit asserting the snapshot it read, summary `pondra.job`). A lost race reads again; a
+   retried job that committed writes nothing. `formats_check.py`: "INSERT retried with its job:
+   applied once".
+103. **A feed's rows and its offset commit together** (`feeds::shard`: producer
+   `feed:{view}:{partition}`, seq = the next offset, `prev` = the offset it read from): every
+   record lands once whichever node runs the partition; a refused append starts again from what
+   was committed. `harness.py kafkas`: "a view fed by a topic on three nodes, one killed, then the
+   leader: every record once".
+104. **Each kind of catalog entry has a prefix of its own** (round 23: `o/` catalogs attached from
+   outside, `fd/` feeds, `e/` secrets; `f/` is the functions'). A scan of one prefix must never see
+   another kind: feeds under `f/` broke `/functions` ("missing field flight"). `harness.py kafkas`:
+   "…its feed kept apart from the lake's functions".
+105. **A query that reads files on the node's machine runs there alone** (`spmd::sliced`:
+   `ext::local`): other machines don't have them. One machine can't show it (every node there
+   has the files), so no test fails without it; `outside` checks such a query's answer.
+106. **A file outside the lake tells the planner what its listing found, and nothing it didn't**
+   (`scan::statistics`, `Files::scan`): rows exact from a Parquet footer (an estimate from
+   another engine's log), column ranges only from footers, and no statistics at all for a file
+   in a NULL's Hive folder — DataFusion adds partition columns' statistics with no NULLs, so
+   `count(k)` counted the NULL folder's rows. `harness.py outside`: "Hive-style folders… (NULL's
+   folder too)" fails without it. (Without statistics the join order went wrong: TPC-H over files
+   took 20% longer.)
+
 ## Tests: run these before and after any change
 
 ```bash
@@ -677,8 +760,15 @@ python3 tools/harness.py columns               # RENAME/DROP COLUMN, a name adde
 python3 tools/harness.py fills                 # views filled from existing rows while rows stream in, made again, through a leader restart
 python3 tools/harness.py dedup                 # a keyed table deduplicated by event time (order_by) vs a model; SELECT * without _deleted
 python3 tools/harness.py procedures            # macros, SQL and Python procedures, scripts, parameters, sent rows: rights, depth, 3 nodes, Postgres, MCP, pondra run
+python3 tools/harness.py outside               # files on S3 and HTTP (moto): globs, CSV, JSON, Hive folders, spread, COPY … TO (spread too), secrets, who may read
+python3 tools/harness.py clouds                # GCS (sim_gcs.py) and Azure (Azurite) lakes and files: failover, COPY, a file changed beside a lake
+python3 tools/harness.py kafkas                # Apache Kafka 4 (~/kafka_2.13-*) and a Pondra node's port: topics as tables, COPY to a topic, feeds through kills, SASL
+python3 tools/formats_check.py --spark ~/venv-spark/bin/python   # Delta/Iceberg by Spark 4, delta-rs, PyIceberg == Pondra; attached, REST, INSERT, spread
+python3 tools/bench/files_tpch.py --data ~/tpch/sf1-bench        # TPC-H from files (local, S3) against the lake's own tables
+python3 tools/files_s3_check.py                # files in a real bucket (R2): a glob, the cache by version, a file changed, COPY there
+python3 tools/slt_check.py --slt <datafusion>/datafusion/sqllogictest/test_files [--nodes 3]   # DataFusion's sqllogictest: pass rate, failures grouped (D1)
 python3 tools/frames_check.py                  # pondra.frame == Polars (26 pipelines); one question asked 10 ways; a sort kept through steps
-~/venv-spark/bin/python tools/spark_check.py   # pondra.spark == PySpark 4.0.1 (44 pipelines: values and column names)
+~/venv-spark/bin/python tools/spark_check.py   # pondra.spark == PySpark 4.0.1 (51 pipelines, files among them: values and column names)
 python3 tools/bench/tpch_frames.py --data ~/tpch/sf1-bench   # TPC-H: SQL == frames == PySpark code, 22 of 22
 python3 tools/bench/nexmark.py [--bids 4000000] # Nexmark q1, q2, q5, q7, q11: Pondra (== DuckDB) and Flink 2.3 (venv-flink)
 python3 tools/smoke.py target/release/pondra   # what CI runs on Windows, macOS and Linux (stdlib only)
@@ -750,13 +840,22 @@ Practical notes for an agent working here:
 - Node stderr goes to `/tmp/pondra-<port>-<id>.stderr`; that's where "restarting to rejoin",
   "slow tiering" and panics show up.
 
-## State of the work (2026-09-27, round 22)
+## State of the work (2026-09-28, round 23)
 
 Everything in `docs/prototype-status.md` passes on local disk and on simulated R2. The round-11
 additions (manifests, partitions, shuffles, memory limits, Arrow Flight) also ran against real
 R2; round 12's are in `logs/round12/`, round 13's in `logs/round13/`, round 14's in
 `logs/round14/`, round 15's in `logs/round15/`, round 16's in `logs/round16/`, round 17's in `logs/round17/`,
-round 18's in `logs/round18/`, round 19's in `logs/round19/`, round 20's in `logs/round20/`, round 21's in `logs/round21/` and round 22's in `logs/round22/`.
+round 18's in `logs/round18/`, round 19's in `logs/round19/`, round 20's in `logs/round20/`, round 21's in `logs/round21/`, round 22's in `logs/round22/` and round 23's in `logs/round23/`.
+
+**Round 23 (ADR-026) read and wrote everything else:** files on S3, GCS, Azure, HTTPS and the
+owner's machine as tables (listed each statement, cached only by version, spread, their footers'
+statistics in the join order); Delta and Iceberg tables read natively and `INSERT`ed into;
+`COPY … TO` files (a big folder by every node) and topics; other Kafka clusters as tables and
+feeds; `CREATE SECRET`; lakes on GCS and Azure. TPC-H SF1 from files runs as fast as from the
+lake's own tables (`logs/round23/files-tpch-sf1.txt`). D1 began: DataFusion's own sqllogictest
+files through Pondra (`tools/slt_check.py`, `logs/round23/slt-*.json`), which found `INSERT INTO t
+(columns)` missing and `CREATE TABLE t (a INT) AS VALUES` ignoring its names (both fixed).
 
 **R2 test buckets.** There are two:
 
@@ -985,21 +1084,29 @@ Known limits, in the order they matter:
     no frame builder; `pondra run models/` (a folder of `.sql` and `.py` models in order of what
     reads what) is next; a `MERGE` from rows sent with a request needs the leader to receive it.
     `con.sql(query)` is lazy since round 22: it runs when its rows are asked for, each time.
+14. **Outside the lake** (round 23): another engine's table takes `INSERT`, not `UPDATE`,
+    `DELETE` or `MERGE`; Iceberg is written as v2 only; Kafka's SCRAM-SHA-512 and TLS are built
+    but untested against a broker; `CREATE EXTERNAL TABLE` isn't taken (a view over files is the
+    way: `CREATE VIEW t AS SELECT * FROM 's3://…'`); Delta and Iceberg data files aren't kept in
+    memory between statements (files named by URL, a glob or a folder are, by version).
+15. **SQL conformance (D1):** 67% of DataFusion's sqllogictest records pass on one node (73%
+    without its Spark-function files). The rest, grouped in `logs/round23/slt-1-node.json`: session
+    `SET`/`RESET`/`PREPARE` (each request is its own session), `CREATE EXTERNAL TABLE` and the
+    tables it would have made, Spark's function library, EXPLAIN's text (Pondra plans its own
+    way), number literals typed DECIMAL (as Postgres and DuckDB do), strings read as `Utf8View`.
 
-Good next moves: `docs/roadmap.md` (2026-09-27, after round 22) is the plan, with the reasons.
-Rounds 17–22 are done except what needs the owner (publishing, cluster-bench runs). In short:
+Good next moves: `docs/roadmap.md` (2026-09-28, after round 23) is the plan, with the reasons.
+Rounds 17–23 are done except what needs the owner (publishing, cluster-bench runs). In short:
 
-1. **Rounds 23–30 are planned in `docs/roadmap.md`** (re-planned 2026-09-28 with the owner's
-   asks). Round 23, read and write anything (ADR-026, proposed: files, Delta and Iceberg anywhere,
-   `CREATE SECRET`, GCS and Azure, Kafka clusters both ways); round 24, SQL and Python as one
-   (ADR-027, proposed: `CREATE FUNCTION` in SQL and Python, procedures that can do anything Python
-   can, decorators that take a notebook's function as it is, schedules, a run log); round 25, the
-   console, the server (a folder of lakes as databases) and databases attached, TEMP tables and
-   changes to attached lakes; 26 security; 27 conformance to its end; 28 scale proven, with burst
-   functions; 29 in-process and the browser. Both ADRs wait for the owner's go-ahead.
-2. **Publish 0.23.0** (ADR-025's names; `v0.22.2`, the fix of invariant 93, is tagged at c47e2c7
-   and releases the old way): tag `v0.23.0` once its build run is green; the release publishes
-   that run's packages.
+1. **Round 24, SQL and Python as one** (ADR-027, proposed: `CREATE FUNCTION` in SQL and Python,
+   procedures that can do anything Python can, with round 23's secrets; decorators that take a
+   notebook's function as it is; schedules; a run log). Then round 25, the console, the server (a
+   folder of lakes as databases) and databases attached, TEMP tables and changes to attached
+   lakes; 26 security; 27 conformance to its end (D1's pass rate climbs every round from 67%);
+   28 scale proven, with burst functions; 29 in-process and the browser.
+2. **Publish 0.23.0** (ADR-025's names and round 23; `v0.22.2`, the fix of invariant 93, is
+   tagged at c47e2c7 and releases the old way): tag `v0.23.0` once its build run is green; the
+   release publishes that run's packages.
 3. **Security before anyone else's data:** TLS on the node port and mutual TLS between nodes, then
    grants (roadmap E3).
 4. **Then:** machines in one data centre for the cluster bench, the in-process library, the

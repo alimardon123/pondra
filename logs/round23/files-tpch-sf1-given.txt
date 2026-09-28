@@ -1,0 +1,4 @@
+q22          0.039         0.055
+all           3.44          4.16
+same         22/22         22/22
+local: files 4.16 s against the lake's 3.44 s (+20.9%)

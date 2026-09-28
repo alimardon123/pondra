@@ -127,6 +127,7 @@ pub fn router(app: App) -> Router {
         .route("/cluster/commit", post(commit))
         .route("/cluster/log", get(feed))
         .route("/cluster/stage", post(stage))
+        .route("/cluster/copy", post(copy))
         .route("/cluster/shuffle", get(bucket))
         .route("/cluster/job", post(job))
         .route("/cluster/probe", get(|Query(p): Query<HashMap<String, usize>>| async move { crate::guard::probe(p.get("bytes").copied().unwrap_or(0)) }))
@@ -245,6 +246,11 @@ async fn stage(State(app): State<App>, Json(slice): Json<crate::spmd::Slice>) ->
     let (shape, parts) = crate::spmd::stage(&app.lake, &slice).await?;
     let done = slice.shuffle.is_none().then(|| crate::spill::Gone(slice.id.clone()));
     Ok(Body::from_stream(crate::spmd::reply(&shape, parts, done)).into_response())
+}
+
+/// This node's share of a `COPY … TO` a folder, written (see `spmd::copy`): how many rows.
+async fn copy(State(app): State<App>, Json((slice, target)): Json<(crate::spmd::Slice, crate::copy::Target)>) -> Result<Json<u64>, E> {
+    Ok(Json(crate::spmd::copy_share(&app.lake, &slice, &target).await?))
 }
 
 #[derive(Deserialize)]

@@ -146,6 +146,7 @@ pub enum Stmt {
     Create(Box<ast::CreateTable>),                       // (with a query: CREATE TABLE … AS SELECT)
     Define(String, String),                              // table, its definition (CREATE TABLE … AS SELECT's first step)
     Insert(String, String),                              // table, the query giving the rows
+    InsertInto(String, Vec<String>, String),             // INSERT INTO t (b, a) …: the columns it names (`whole_rows`)
     Update(String, Vec<(String, String)>, Option<String>), // table, column = expression, WHERE
     Delete(String, Option<String>),                      // table, WHERE
     AddColumn(String, String, String, bool),             // table, column, SQL type, IF NOT EXISTS
@@ -161,7 +162,7 @@ impl Stmt {
     pub fn table(&self) -> String {
         match self {
             Stmt::Create(c) => object(&c.name),
-            Stmt::Define(t, _) | Stmt::Insert(t, _) | Stmt::Update(t, ..) | Stmt::Delete(t, _) | Stmt::AddColumn(t, ..) | Stmt::SetOptions(t, _) => t.clone(),
+            Stmt::Define(t, _) | Stmt::Insert(t, _) | Stmt::InsertInto(t, ..) | Stmt::Update(t, ..) | Stmt::Delete(t, _) | Stmt::AddColumn(t, ..) | Stmt::SetOptions(t, _) => t.clone(),
             Stmt::Ddl(_) | Stmt::Invalid(_) | Stmt::CopyTo(..) => String::new(),
             Stmt::Merge(m) => m.target.clone(),
         }
@@ -182,6 +183,7 @@ impl Stmt {
     fn on(self, table: String) -> Stmt {
         match self {
             Stmt::Insert(_, q) => Stmt::Insert(table, q),
+            Stmt::InsertInto(_, c, q) => Stmt::InsertInto(table, c, q),
             Stmt::Update(_, set, w) => Stmt::Update(table, set, w),
             Stmt::Delete(_, w) => Stmt::Delete(table, w),
             Stmt::AddColumn(_, c, ty, i) => Stmt::AddColumn(table, c, ty, i),
@@ -229,7 +231,10 @@ pub fn parse(sql: &str) -> Option<Stmt> {
     };
     Some(match parsed {
         Statement::CreateTable(c) => Stmt::Create(Box::new(c)),
-        Statement::Insert(ast::Insert { table: ast::TableObject::TableName(t), source: Some(q), columns, .. }) if columns.is_empty() => Stmt::Insert(object(&t), q.to_string()),
+        Statement::Insert(ast::Insert { table: ast::TableObject::TableName(t), source: Some(q), columns, .. }) => match columns.is_empty() {
+            true => Stmt::Insert(object(&t), q.to_string()),
+            false => Stmt::InsertInto(object(&t), columns.iter().map(object).collect(), q.to_string()),
+        },
         Statement::Update(u) => {
             let set = u.assignments.iter().filter_map(|a| match &a.target {
                 ast::AssignmentTarget::ColumnName(c) => Some((c.0.last()?.as_ident().map(ident)?, a.value.to_string())),
@@ -293,21 +298,30 @@ pub fn parse(sql: &str) -> Option<Stmt> {
 /// cluster_by = 'b', merge = 'total:sum', partition_by = 'day(ts)')]` → the table name and its spec. SQL types become Arrow
 /// types the way DataFusion maps them.
 /// With `AS SELECT`, the columns are the query's (run over `from`'s tables; `files`: local files
-/// too, for `pondra sql` on its own machine).
+/// too, for `pondra sql` on its own machine), or those it names (`CREATE TABLE t (a INT, b
+/// VARCHAR) AS VALUES …`: the query's columns by position).
 async fn create_spec(c: &ast::CreateTable, from: &Lake, files: bool) -> Result<String> {
+    let declared = || async {
+        let cols = c.columns.iter().map(|c| format!("{} {}", c.name, c.data_type)).collect::<Vec<_>>().join(", ");
+        let ctx = SessionContext::new();
+        ctx.sql(&format!("CREATE TABLE t ({cols})")).await?;
+        anyhow::Ok(ctx.table("t").await?.schema().fields().iter().cloned().collect::<Vec<_>>())
+    };
     let fields = match &c.query {
         Some(q) => {
             let sql = q.to_string();
             let ctx = session(from, &sql, "").await?;
             let ctx = if files { ctx.enable_url_table() } else { ctx };
-            ctx.sql(&sql).await?.schema().fields().iter().cloned().collect::<Vec<_>>()
+            let fields = ctx.sql(&sql).await?.schema().fields().iter().cloned().collect::<Vec<_>>();
+            match c.columns.is_empty() {
+                true => fields,
+                false => {
+                    ensure!(fields.len() == c.columns.len(), "CREATE TABLE {} names {} columns, and its query gives {}", c.name, c.columns.len(), fields.len());
+                    declared().await?
+                }
+            }
         }
-        None => {
-            let cols = c.columns.iter().map(|c| format!("{} {}", c.name, c.data_type)).collect::<Vec<_>>().join(", ");
-            let ctx = SessionContext::new();
-            ctx.sql(&format!("CREATE TABLE t ({cols})")).await?;
-            ctx.table("t").await?.schema().fields().iter().cloned().collect()
-        }
+        None => declared().await?,
     };
     let columns: Vec<(String, String)> = fields.iter().map(|f| (f.name().clone(), crate::query::type_name(f.data_type()))).collect();
     let name = |e: &ast::Expr| e.to_string().trim_matches('"').to_string();
@@ -416,8 +430,40 @@ fn rows_sql(meta: &TableMeta, stmt: &Stmt) -> Result<String> {
             ensure!(meta.merge.is_empty() && deletes, "DELETE needs an upsert table with a Boolean _deleted column");
             Ok(select(&|c: &str| if c == "_deleted" { "true".into() } else { q(c) }, t, cond))
         }
-        Stmt::Create(_) | Stmt::Define(..) | Stmt::AddColumn(..) | Stmt::SetOptions(..) | Stmt::Ddl(_) | Stmt::Merge(_) | Stmt::Invalid(_) | Stmt::CopyTo(..) => unreachable!("not a row write here"),
+        Stmt::Create(_) | Stmt::Define(..) | Stmt::AddColumn(..) | Stmt::SetOptions(..) | Stmt::Ddl(_) | Stmt::Merge(_) | Stmt::Invalid(_) | Stmt::CopyTo(..) | Stmt::InsertInto(..) => unreachable!("not a row write here"),
     }
+}
+
+/// `INSERT INTO t (b, a) …` as an INSERT of whole rows: the columns it names from its query, by
+/// position, the others NULL (`_deleted` left for `rows` to fill), in the table's order. `VALUES`
+/// stay `VALUES`, so they still go through the log.
+async fn whole_rows(lake: &Lake, table: &str, names: &[String], query: &str) -> Result<String> {
+    use anyhow::Context;
+    use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
+    let (other, name) = crate::ddl::resolve(lake, table).await?;
+    let meta: TableMeta = other.as_deref().unwrap_or(lake).cat.get(&table_key(&name)).await?.with_context(|| format!("no table {table}"))?;
+    let columns: Vec<String> = meta.logical().columns.into_iter().map(|(c, _)| c).filter(|c| c != "_deleted" || names.contains(c)).collect();
+    if let Some(n) = names.iter().find(|n| !columns.contains(n)) {
+        bail!("INSERT INTO {table} ({n}): no such column ({})", columns.join(", "));
+    }
+    ensure!(names.iter().collect::<std::collections::HashSet<_>>().len() == names.len(), "INSERT INTO {table}: a column named twice");
+    let at = |c: &String| names.iter().position(|n| n == c);
+    let parsed = Parser::new(&GenericDialect {}).try_with_sql(query)?.parse_query()?;
+    if let (ast::SetExpr::Values(v), None) = (parsed.body.as_ref(), &parsed.order_by) {
+        let mut rows = vec![];
+        for r in &v.rows {
+            ensure!(r.len() == names.len(), "INSERT INTO {table} names {} columns, and a row has {}", names.len(), r.len());
+            rows.push(format!("({})", columns.iter().map(|c| at(c).map_or("NULL".into(), |i| r[i].to_string())).collect::<Vec<_>>().join(", ")));
+        }
+        return Ok(format!("VALUES {}", rows.join(", ")));
+    }
+    let q = |c: &str| format!("\"{}\"", c.replace('"', "\"\""));
+    let list = columns.iter().map(|c| match at(c) {
+        Some(i) => format!("__pondra_q.c{i} AS {}", q(c)),
+        None => format!("NULL AS {}", q(c)),
+    });
+    let aliases = (0..names.len()).map(|i| format!("c{i}")).collect::<Vec<_>>().join(", ");
+    Ok(format!("SELECT {} FROM ({query}) AS __pondra_q({aliases})", list.collect::<Vec<_>>().join(", ")))
 }
 
 /// `CHECKPOINT` (DuckDB's word for it): tier every table's log into Parquet now, and write the
@@ -591,8 +637,12 @@ async fn on_node_listed(app: &crate::server::App, stmt: Stmt, job: Option<String
     if let Stmt::Invalid(why) = stmt {
         bail!(why);
     }
+    let stmt = match stmt {
+        Stmt::InsertInto(t, names, query) => Stmt::Insert(t.clone(), whole_rows(&app.lake, &t, &names, &query).await?),
+        s => s,
+    };
     if let Stmt::CopyTo(query, to, options) = &stmt {
-        return crate::ext::copy_to(&app.lake, query, to, options).await; // (files outside the lake, written from here)
+        return crate::copy::copy_to(&app.lake, query, to, options, &app.cluster.nodes(), &app.cluster.addr).await; // (files outside the lake: from here, or every node its share)
     }
     let open = |ctx: SessionContext| if files { ctx.enable_url_table() } else { ctx };
     let (lake, job) = (&app.lake, job.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()));
@@ -769,10 +819,14 @@ pub async fn handle(lake: &Lake, seq: &Sequencer, lock: &Mutex<()>, req: Request
 /// it takes, under its own term, so a node starting meanwhile waits for it. It never takes over
 /// from a live leader.
 pub async fn from_cli(dir: &str, stmt: Stmt) -> Result<Value> {
+    let stmt = match stmt {
+        Stmt::InsertInto(t, names, query) => Stmt::Insert(t.clone(), whole_rows(&*Lake::open(dir, false, false).await?, &t, &names, &query).await?),
+        s => s,
+    };
     match stmt {
         Stmt::CopyTo(query, to, options) => {
             let lake = Lake::open(dir, false, false).await?;
-            crate::ext::scope(true, async move { crate::ext::copy_to(&lake, &query, &to, &options).await }).await // (its user's own machine)
+            crate::ext::scope(true, async move { crate::copy::copy_to(&lake, &query, &to, &options, &[], "").await }).await // (its user's own machine)
         }
         // CREATE TABLE … AS SELECT: the table, with the query's columns, then its rows.
         Stmt::Create(c) if c.query.is_some() => {

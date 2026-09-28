@@ -1,0 +1,37 @@
+# round 23 suite, local disk, release build, 2 vCPUs, 2026-09-28 (tools as in /home/claude/r23/suite.sh; clouds again with AZURITE set: 10 of 10)
+11:50:54 --- round 23 suite ---
+11:50:54 start all
+11:57:27 all exit=0 secs=393
+11:57:27 start frames
+11:57:36 frames exit=0 secs=9
+11:57:36 start spark
+11:58:28 spark exit=0 secs=52
+11:58:28 start formats
+12:01:20 formats exit=0 secs=172
+12:01:20 start tpch_frames
+12:02:20 tpch_frames exit=0 secs=60
+12:02:20 start failover-1
+12:03:26 failover-1 exit=0 secs=66
+12:03:26 start failover-2
+12:04:32 failover-2 exit=0 secs=66
+12:04:32 start failover-3
+12:05:38 failover-3 exit=0 secs=66
+12:05:38 start users-1
+12:06:11 users-1 exit=0 secs=33
+12:06:11 start race
+12:06:43 race exit=0 secs=32
+12:06:43 start spread
+12:06:52 spread exit=0 secs=9
+12:06:52 start open
+12:07:07 open exit=0 secs=15
+12:07:07 start asof
+12:07:43 asof exit=0 secs=36
+12:07:43 start stream
+12:08:11 stream exit=0 secs=28
+12:08:11 start spread_tpch
+12:08:41 spread_tpch exit=0 secs=30
+12:08:41 start smoke
+12:08:42 smoke exit=0 secs=1
+12:08:42 start single
+12:09:53 single exit=0 secs=71
+12:09:53 SUITE_DONE

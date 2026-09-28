@@ -1,0 +1,30 @@
+[502/504] window_limits.slt: 0/73
+[503/504] window_topk_pushdown.slt: 0/12
+[504/504] window_topn.slt: 46/100
+
+16644 of 24783 records pass (67.2%), 504 files, 1 node(s)
+  1804  Error during planning: Invalid function ….
+  1695  answer differs
+  1520  Error during planning: table … not found: Error during planning: table … not found"
+  1055  Error during planning: Statement not supported: SetVariable'
+   271  Error during planning: DDL not supported: CreateExternalTable'
+   259  Error during planning: Statement not supported: ResetVariable'
+    70  an error was expected
+    59  Schema error: No field named id.: Schema error: No field named id.: Schema error: No field named id.: No field named id.'
+    52  Schema error: No field named id.: Schema error: No field named id.: No field named id.'
+    40  Execution error: date_part requires non-empty constant string'
+    34  SQL error: ParserError(…): sql parser error: Expected: \… or \… after column definition, found: ( at Line: N, Column: N'
+    32  Error during planning: Statement not supported: Execute'
+    28  Error during planning: table … not found: Error during planning: table … not found: Error during planning: table … not found"
+    27  [<class …>]
+    26  Schema error: No field named x.: No field named x.'
+    25  Error during planning: Statement not supported: Prepare'
+    22  Optimizer rule … failed
+    22  Schema error: No field named v.: No field named v.'
+    22  Schema error: No field named v.
+    22  Schema error: No field named s.: Schema error: No field named s.: No field named s.'
+    22  Error during planning: Statement not supported: Deallocate'
+    19  SQL error: ParserError(…): sql parser error: Expected: ), found: ( at Line: N, Column: N'
+    16  Schema error: No field named species.: Schema error: No field named species.: No field named species.'
+    15  Error during planning: table … not found"
+    14  no table t'

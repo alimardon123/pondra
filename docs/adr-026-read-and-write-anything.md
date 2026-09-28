@@ -1,6 +1,6 @@
 # ADR-026: Read and write anything (round 23)
 
-**Date:** 2026-09-28 · **Status:** proposed (for the owner) · **Follows:** ADR-019 (attached lakes), ADR-020, ADR-025
+**Date:** 2026-09-28 · **Status:** accepted and built (round 23; the owner: "go ahead with building next round") · **Follows:** ADR-019 (attached lakes), ADR-020, ADR-025
 
 ## Context
 
@@ -150,3 +150,52 @@ Postgres and MySQL attached (G6) follow in round 25, with the console.
   Apache Kafka image).
 - A secret never appears in a query's text, a log, the catalog in the clear, or an error.
 - Performance: TPC-H SF1 read from Parquet files on S3 as fast as from Pondra's own tables (within 10%).
+
+## As built (round 23, 2026-09-28)
+
+Everything in the decision is built, from every door (SQL over HTTP and Postgres, Python's
+connection and frames, `pondra.spark`, JavaScript and MCP by SQL):
+
+| | Read | Write |
+|---|---|---|
+| Files: Parquet, CSV/TSV, JSON lines | `'s3://…/*.parquet'`, `read_parquet/csv/json(…)`: globs, folders, lists; Hive folders typed, NULL's folder as NULL; S3/R2/MinIO, GCS, Azure, HTTP(S), the owner's machine | `COPY … TO` a file or folder: `PARTITION_BY`, `OVERWRITE`/`APPEND`, Parquet's compression and row groups, CSV's header and delimiter |
+| Delta Lake | `delta_scan(url [, version =>])`, `ATTACH … (TYPE delta)`: JSON commits, checkpoints (classic, in parts, v2 with sidecars), deletion vectors, column mapping by name and id, partitions | `INSERT` into an attached table: a put-if-absent commit with a `txn` for the job |
+| Iceberg | `iceberg_scan(url [, version, snapshot_from_id, snapshot_from_timestamp, allow_moved_paths])`; REST catalogs with OAuth: v1–v3, position and equality deletes, deletion vectors, field ids, partitions | `INSERT` into a v2 table (a folder's or a REST catalog's), exactly-once by job |
+| Kafka | `'kafka://brokers/topic'`, `ATTACH … (TYPE kafka)`: `_partition, _offset, _timestamp, key, value`, spread by partition; SASL PLAIN, SCRAM-SHA-256/512, TLS | `COPY … TO 'kafka://…'` with Kafka's key partitioning; a materialized view over a topic is a feed, every record once |
+| Lakes | on GCS and Azure too (`serve --dir gs://…`, `az://…`) | |
+
+Where it went beyond the decision, or differs from it:
+
+- **Kafka's client is Pondra's own**, over the wire code its Kafka port already had (`kafka.rs`),
+  not `rskafka`: the same encoders both ways, no new crate; SCRAM through aws-lc-rs, TLS through
+  rustls (both already in the binary). SCRAM-SHA-512 and TLS are built, not yet tested against
+  a broker (SCRAM-SHA-256 and PLAIN are).
+- **The GCS emulator is `tools/sim_gcs.py`** (the XML API `object_store` speaks):
+  fake-gcs-server refused its uploads and gcp-storage-emulator its listings. Azure's is Azurite.
+- **Files are fresh and still fast.** Every statement lists them again (a file added or changed
+  under its name is read as it is); byte ranges are kept in memory only as the version that
+  statement listed (the e-tag, fetched with `If-Match`); the listing is the only look at a file
+  before it is read; each file's rows and ranges reach the planner. Found on the way: DataFusion
+  55 keeps folder listings forever by default (turned off: invariant 95).
+- **`COPY … TO` a folder is written by every node** when the query's rows split over them as they
+  are (`spmd::copy`); anything else is written from one node.
+- **Not yet:** Iceberg v1 and v3 tables are read, not written (refused by name); `UPDATE`,
+  `DELETE` and `MERGE` into another engine's table (as decided: later); Postgres and MySQL
+  attached (round 25).
+
+Measured (`logs/round23/`):
+
+- **TPC-H SF1 from files is as fast as from the lake's own tables** (`tools/bench/files_tpch.py`,
+  best of 5, two cores): on this machine's disk 3.67 s against 3.73 s, on a local S3 3.51 s
+  against 3.48 s, every answer equal. From tpchgen's own files (Snappy, small row groups) 4.16 s
+  against 3.44 s: the encoding, not the path. Before this round's last fixes, files on S3 took
+  214 s (no cache: every read went to the bucket), then 4.69 s (a second look at each file, and
+  no statistics for the join order).
+- **The binary** grew by 3.3 MB, to 101.2 MB (34.4 MB gzipped; 0.22.2's is 97.9 MB): GCS and
+  Azure's clients, the Kafka client, both formats' readers and writers, Avro. The code grew by
+  4,650 lines, to 22,200.
+- **Tests:** `harness.py outside` (27 checks), `clouds` (10), `kafkas` (9), `formats_check.py`
+  (50: Spark 4, delta-rs and PyIceberg's tables, attached, inserted, spread), `frames_check.py`
+  section 6, `spark_check.py`'s file pipelines. Invariants 95, 96, 98, 100, 101, 104 and 106
+  were each seen to fail their tests without their code; 97, 99, 102 and 103 have tests that run
+  them; 105 can't be shown on one machine.

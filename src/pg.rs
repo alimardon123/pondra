@@ -438,6 +438,9 @@ impl Copy {
         if !sql.trim_start().get(..4).is_some_and(|w| w.eq_ignore_ascii_case("copy")) {
             return None;
         }
+        if matches!(crate::ext::statement(sql), Some(crate::write::Stmt::CopyTo(..))) {
+            return None; // (`COPY … TO 's3://…'`: files anywhere, the statement every door runs: ADR-026)
+        }
         let parsed = datafusion::sql::sqlparser::parser::Parser::parse_sql(&datafusion::sql::sqlparser::dialect::PostgreSqlDialect {}, sql);
         let Ok(Some(Statement::Copy { source, to, target, options, legacy_options, .. })) = parsed.map(|mut s| s.pop()) else { return Some(Err(user_error(anyhow::anyhow!("COPY: can't read {sql}")))) };
         if !matches!((to, &target), (true, CopyTarget::Stdout) | (false, CopyTarget::Stdin)) {

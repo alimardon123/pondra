@@ -1,0 +1,5 @@
+# tools/files_s3_check.py (a node on this machine, files in the R2 bucket ponderabucket-us, read as the node's owner), 2026-09-28
+times (cold, then kept by version): [1.367, 0.109, 0.147]
+ok   a glob on R2 == pyarrow, three times
+ok   a file changed under its name and one added: read as they are, at once
+ok   COPY … TO a folder on R2, read back

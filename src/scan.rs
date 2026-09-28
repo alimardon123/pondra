@@ -96,7 +96,8 @@ pub async fn read(ctx: &datafusion::prelude::SessionContext, files: &[&crate::st
             (Some(_), None) => footer_rows(ctx, &store, &key, f.bytes).await?,
             (_, rows) => rows.unwrap_or(f.rows),
         };
-        out.push(File { key, size: f.bytes, rows, partition, deleted: gone });
+        let stats = Arc::new(statistics(f, rows, gone.as_ref().map_or(0, |g| g.len()), table.is_none(), &file_schema));
+        out.push(File { key, size: f.bytes, rows, partition, deleted: gone, stats });
     }
     let adapter = (!ids.is_empty()).then(|| Arc::new(ById { ids: ids.clone(), mapping: table.and_then(|t| t.name_mapping.as_deref()).map(name_mapping).unwrap_or_default() }) as _);
     let df = ctx.read_table(Arc::new(Files { store, file_schema, partition: partition_fields, files: out, adapter }))?;
@@ -105,6 +106,24 @@ pub async fn read(ctx: &datafusion::prelude::SessionContext, files: &[&crate::st
 }
 
 const SEQ: &str = "__pondra_seq";
+
+/// What the planner knows of a file before reading it (the join order rests on it): its rows
+/// and bytes and, for plain Parquet files, its columns' ranges from their footers, as the
+/// statement listed them (bounds for pruning, never read as answers). Another engine's counts
+/// come from its log: estimates.
+fn statistics(f: &crate::store::DataFile, rows: u64, deleted: usize, plain: bool, schema: &Schema) -> datafusion::common::Statistics {
+    use datafusion::common::stats::Precision::{Exact, Inexact};
+    let mut s = datafusion::common::Statistics::new_unknown(schema);
+    let n = rows.saturating_sub(deleted as u64) as usize;
+    (s.num_rows, s.total_byte_size) = (if plain { Exact(n) } else { Inexact(n) }, Inexact(f.bytes as usize));
+    for (field, c) in schema.fields().iter().zip(s.column_statistics.iter_mut()).filter(|_| plain) {
+        let parse = |v: &String| ScalarValue::try_from_string(v.clone(), field.data_type()).ok();
+        if let Some((Some(lo), Some(hi))) = f.stats.get(field.name()).map(|(lo, hi)| (parse(lo), parse(hi))) {
+            (c.min_value, c.max_value) = (Inexact(lo), Inexact(hi));
+        }
+    }
+    s
+}
 
 /// Rows left by Iceberg's equality deletes: a delete file's row removes the equal rows (NULL
 /// equal to NULL) of the files older than it (a smaller data sequence number).
@@ -297,6 +316,7 @@ pub struct File {
     pub rows: u64,
     pub partition: Vec<ScalarValue>,
     pub deleted: Option<Arc<Vec<u64>>>, // the positions of its deleted rows, sorted
+    pub stats: Arc<datafusion::common::Statistics>, // (its file columns': partition values add theirs)
 }
 
 #[async_trait::async_trait]
@@ -329,6 +349,9 @@ impl TableProvider for Files {
                 version: None,
             })
             .with_partition_values(f.partition.clone());
+            if f.partition.iter().all(|v| !v.is_null()) {
+                pf = pf.with_statistics(f.stats.clone()); // (a NULL folder's value would be taken for one without NULLs)
+            }
             if let Some(gone) = &f.deleted {
                 pf = pf.with_extension(datafusion::datasource::physical_plan::parquet::ParquetRowSelection::new(kept(gone, f.rows)));
             }
@@ -336,8 +359,14 @@ impl TableProvider for Files {
             least.0 += f.size;
             least.1.push(pf);
         }
+        let schema = self.schema();
+        let known: Vec<_> = groups.iter().flat_map(|g| g.1.iter()).filter_map(|f| f.statistics.clone()).collect();
+        let stats = match known.len() == self.files.len() {
+            true => datafusion::common::Statistics::try_merge_iter(known.iter().map(|s| s.as_ref()), &schema)?,
+            false => datafusion::common::Statistics::new_unknown(&schema),
+        };
         let groups = groups.into_iter().filter(|g| !g.1.is_empty()).map(|g| FileGroup::new(g.1)).collect();
-        let config = FileScanConfigBuilder::new(self.store.clone(), source).with_file_groups(groups).with_projection_indices(projection.cloned())?.with_limit(limit).with_expr_adapter(self.adapter.clone()).build();
+        let config = FileScanConfigBuilder::new(self.store.clone(), source).with_file_groups(groups).with_statistics(stats).with_projection_indices(projection.cloned())?.with_limit(limit).with_expr_adapter(self.adapter.clone()).build();
         format.create_physical_plan(state, config).await
     }
 }

@@ -1,0 +1,4 @@
+# round 23 dist build (cargo build --profile dist, native, glibc 2.39; the release is zigbuild for 2.17), 2026-09-28
+    Finished `dist` profile [optimized] target(s) in 39m 12s
+binary 101185056 bytes (gzip -9: 34361632, xz -6: 21583380)
+0.22.2 (PyPI wheel, zigbuild): 97939064 bytes; +3.25 MB (+3.3%)
