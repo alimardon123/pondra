@@ -1,6 +1,6 @@
 # Prototype status: Pondra, a streamhouse in one binary
 
-**Date:** 2026-09-28 (round 24) · **Plan:** ADR-002 to ADR-027, `roadmap.md` · **Code:** `pondra.zip` / `pondra.bundle` (≈23,800 lines of Rust, plus Python and JavaScript clients, packaging, and test and benchmark tools)
+**Date:** 2026-09-29 (round 25) · **Plan:** ADR-002 to ADR-029, `roadmap.md` · **Code:** `pondra.zip` / `pondra.bundle` (≈25,100 lines of Rust, plus Python and JavaScript clients, packaging, and test and benchmark tools)
 **Name:** the prototype formerly called `lh` is now **Pondra**. The name is free on crates.io, PyPI and npm. A small personal-finance app uses it (pondra.app), a different category; run a trademark search before a public launch.
 
 ## Where it stands
@@ -14,6 +14,79 @@ One Rust binary replaces the Kafka + Flink + Spark + metastore + ZooKeeper stack
 - upsert and merge tables.
 
 Start more copies on the same bucket to scale out. The only state is object storage. There's no JVM, no database server and no coordination service.
+
+**Round 25 gave Pondra one vocabulary and opened its tables to other engines' writes** (ADR-028):
+the names a user already knows work everywhere, and Spark or PyIceberg can append to a Pondra
+table.
+
+1. **One vocabulary:**
+   - `read_*` and `write_*` in SQL, Python, PySpark and JavaScript.
+   - The tools' own names are fallbacks with the same answers: Polars' `scan_*` and `sink_*`,
+     DuckDB's `delta_scan` and `parquet_scan`, PySpark's `spark.read` and `df.write`.
+   - `dataframe-api.md` lists 69 names, and a test runs each one.
+   - `COPY … TO '<folder>' (FORMAT delta | iceberg)`, `write_delta` and `write_iceberg` make a
+     table in a folder, append to one or overwrite it. delta-rs and PyIceberg read the result.
+2. **Other engines append through the node's Iceberg REST catalog:**
+   - tested with Spark 4 (Iceberg 1.10), PyIceberg and another Pondra;
+   - each commit lands once: a stale one gets 409 and a retry, a repeated one is answered as done;
+   - the rows become the table's own, with row ids, and views and the Delta copy follow;
+   - deletes, schema changes, keyed tables and new tables are refused by name.
+   
+   The node copies the rows: 1.1 CPU-seconds for 4 M rows (`tools/bench/outside_append.py`).
+   ADR-029 (proposed) is the design that removes that copy.
+3. **Live queries:** `GET /live`, `db.live(…)` in Python and JavaScript. You get an answer now,
+   and a new one after each commit that changes it: 9–19 ms after the statement on local disk,
+   0.4–0.5 s on R2 (the commit's own round trip included). Nothing runs once the client closes.
+4. **Function answers kept:** `WITH (cache = '10 minutes')`. Each node keeps them in an LRU of
+   up to 256 MB.
+5. **Temporary tables and views:** they belong to a Postgres connection or a client's session.
+   Every statement works on them, and they are gone at `close()`, on disconnect or after an
+   hour idle.
+6. **`UPDATE`, `DELETE` and `MERGE` on an attached lake, from any node.** What the statement reads
+   is sent along. When nobody leads that lake, the node leads it for the moment.
+7. **What building it found:**
+   - Spark reads its own manifest list right after committing, so the writer's manifests now go
+     later, with the table's replaced files.
+   - A retried commit got 409; "already done" is now checked first.
+   - A Delta or Iceberg folder named relatively couldn't be read back. The notebook found it.
+   - A frame's display in a notebook had failed since 0.22.1 (`all` in `frame.py` is Polars'
+     `all()`). IPython fell back to text, so no test saw it. `package_check.py` checks the
+     display now, and `anywhere_check.py` fails on any error a notebook shows.
+   - On R2, PyIceberg's own writes need its fsspec file IO. The docs say so.
+   - **A known limit, found while designing ADR-029.** Row ids and Kafka offsets are built on
+     commit numbers shifted by 32 bits. With a steady trickle of writes on local disk (about 500
+     commits a second), Kafka offsets turn negative after about 50 days, and row ids repeat after
+     about 100. On R2 this is years away. ADR-029's phase 1 fixes it.
+8. **Tests** (`logs/round25/`):
+   - **Locally:**
+     - `harness.py all`: 40 tests, with the new `names` (7 checks), `answers` (7), `writes` (7),
+       `live` (4), `temps` (8) and `across` (3);
+     - `frames_check.py`: 26 pipelines, one question 11 ways;
+     - `spark_check.py`: 55 of 55;
+     - `formats_check.py`: 52 tables, with Spark appending through Pondra's catalog;
+     - `tpch_frames.py`: 22 of 22, three ways;
+     - `cluster.py`: failover 3 times, users, race and spread; the spread guard;
+     - `open_check.py`, `asof_check.py`, `stream_check.py`, `smoke.py`, `package_check.py`,
+       `anywhere_check.py` (the wheel, npm, the notebook top to bottom);
+     - `spread_tpch.py`: 22 of 22 spread.
+   - **DataFusion's sqllogictest:** 16,646 of 24,783 records (67.2%, one more than round 24).
+   - **Single-node TPC-H SF1, 2 vCPUs:**
+
+     | Engine | Time |
+     |---|---|
+     | Pondra | 2.11 s (a recheck: 2.06 s) |
+     | DuckDB over the same Parquet | 3.45 s (recheck: 3.35 s) |
+     | DuckDB in its own format | 1.65 s |
+     | Polars | 3.80 s |
+     | Daft | 6.98 s |
+
+     Pondra's ratio to DuckDB is the same as round 24's (0.61 against 0.60), on a machine that
+     ran DuckDB 6–9% slower that day. Most of Pondra's difference is q13, whose time here is
+     bimodal: 25 runs on a warm node ranged from 0.108 to 0.236 s. Round 24's 0.094 was a best of
+     3.
+   - **On simulated R2:** `writes`, `temps`, `across`, `live`, `names`, `answers`, `schemas`,
+     failover and users with replicated acks, and two crash runs.
+   - **On real R2:** `writes`, `temps`, `across` and `live`.
 
 **Round 24 made SQL and Python one** (ADR-027): someone who works only in SQL or only in Python
 can do anything the other can.

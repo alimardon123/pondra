@@ -33,11 +33,16 @@ use std::sync::Arc;
 /// Accept Postgres clients on `addr`.
 pub async fn serve(app: App, addr: String) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    let pg = Arc::new(Pg(Arc::new(Backend { app, parser: Arc::new(NoopQueryParser::new()) })));
+    let parser = Arc::new(NoopQueryParser::new());
     loop {
         let (socket, _) = listener.accept().await?;
-        let pg = pg.clone();
-        tokio::spawn(async move { pgwire::tokio::process_socket(socket, None, pg).await });
+        // A connection is a session: its temporary tables end with it (`temp.rs`).
+        let session = format!("pg-{}", uuid::Uuid::new_v4().simple());
+        let pg = Arc::new(Pg(Arc::new(Backend { app: app.clone(), parser: parser.clone(), session: session.clone() })));
+        tokio::spawn(async move {
+            let _ = pgwire::tokio::process_socket(socket, None, pg).await;
+            crate::temp::end(&session);
+        });
     }
 }
 
@@ -46,6 +51,7 @@ struct Pg(Arc<Backend>);
 struct Backend {
     app: App,
     parser: Arc<NoopQueryParser>,
+    session: String,
 }
 
 impl PgWireServerHandlers for Pg {
@@ -149,7 +155,7 @@ impl Backend {
 
     /// `run`, the notices its procedures send (what they print) sent first: psql shows NOTICE.
     async fn told<C: Sink<PgWireBackendMessage> + Unpin + Send>(&self, client: &mut C, user: &str, sql: &str, format: &Format) -> PgWireResult<Response> {
-        let (out, heard) = crate::routines::with_notices(self.run(user, sql, format)).await;
+        let (out, heard) = crate::routines::with_notices(crate::temp::SESSION.scope(Some(self.session.clone()), self.run(user, sql, format))).await;
         for n in heard {
             let _ = client.send(PgWireBackendMessage::NoticeResponse(ErrorInfo::new("NOTICE".into(), "00000".into(), n).into())).await; // (a client gone: the answer fails too)
         }
@@ -596,7 +602,7 @@ impl ExtendedQueryHandler for Backend {
         if let Some(Ok(c)) = Copy::of(&portal.statement.statement).filter(|c| c.as_ref().is_ok_and(|c| !c.to)) {
             return self.copy_in(client, &user, c).await;
         }
-        let inferred = self.param_types(&pg_dialect(&self.app.lake, &portal.statement.statement)).await;
+        let inferred = crate::temp::SESSION.scope(Some(self.session.clone()), self.param_types(&pg_dialect(&self.app.lake, &portal.statement.statement))).await;
         self.told(client, &user, &bind(portal, &inferred)?, &portal.result_column_format).await
     }
 
@@ -605,15 +611,18 @@ impl ExtendedQueryHandler for Backend {
         C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
     {
         let sql = pg_dialect(&self.app.lake, &stmt.statement);
-        Ok(DescribeStatementResponse::new(self.param_types(&sql).await, self.describe(&sql, &Format::UnifiedText).await?))
+        crate::temp::SESSION.scope(Some(self.session.clone()), async { Ok(DescribeStatementResponse::new(self.param_types(&sql).await, self.describe(&sql, &Format::UnifiedText).await?)) }).await // (its temporary tables too)
     }
 
     async fn do_describe_portal<C>(&self, _client: &mut C, portal: &Portal<Self::Statement>) -> PgWireResult<DescribePortalResponse>
     where
         C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
     {
-        let inferred = self.param_types(&pg_dialect(&self.app.lake, &portal.statement.statement)).await;
-        Ok(DescribePortalResponse::new(self.describe(&pg_dialect(&self.app.lake, &bind(portal, &inferred)?), &portal.result_column_format).await?))
+        crate::temp::SESSION.scope(Some(self.session.clone()), async {
+            let inferred = self.param_types(&pg_dialect(&self.app.lake, &portal.statement.statement)).await;
+            Ok(DescribePortalResponse::new(self.describe(&pg_dialect(&self.app.lake, &bind(portal, &inferred)?), &portal.result_column_format).await?))
+        })
+        .await
     }
 }
 

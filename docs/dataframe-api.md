@@ -288,14 +288,52 @@ PySpark's; each is the SQL of ADR-026, so every client does the same:
 
 - `db.scan_parquet(url)`, `scan_csv`, `scan_ndjson`, `scan_delta(url, version=…)`,
   `scan_iceberg(url, …)`: a frame over files, a folder, a glob or another engine's table
-  (`read_parquet`, `read_csv`, `read_json`, `delta_scan`, `iceberg_scan`).
-- `frame.sink_parquet(url, partition_by=…)`, `sink_csv`, `sink_ndjson`: `COPY (frame) TO url`.
+  (`read_parquet`, `read_csv`, `read_json`, `delta_scan`, `iceberg_scan`). Since round 25,
+  `db.read_parquet(url)` and the rest are the names, and these the fallbacks.
+- `frame.sink_parquet(url, partition_by=…)`, `sink_csv`, `sink_ndjson`: `COPY (frame) TO url`
+  (since round 25: `frame.write_parquet(url)` and the rest).
 - `spark.read.option(…).parquet/csv/json(url)`, `spark.read.format("delta" | "iceberg").load(url)`,
   and `df.write.mode("overwrite" | "append" | "error" | "ignore").partitionBy(…).parquet/csv/json(url)`
   (Spark's modes as `COPY … TO`'s `OVERWRITE` and `APPEND`).
 
 `frames_check.py` section 6 and `spark_check.py`'s seven file pipelines compare them with Polars
 and PySpark reading and writing the same files.
+
+## Round 25: one vocabulary (ADR-028)
+
+Pondra's own names come first everywhere: reading is `read_<format>`, writing `write_<format>`.
+The names Polars, DuckDB and PySpark users know stay as fallbacks, with the same answers. This
+table is checked by `harness.py names`: every name in it exists, runs, and each fallback equals its
+standard name.
+
+<!-- vocabulary -->
+| Operation | SQL | Python (connection, module, frames) | PySpark (`pondra.spark`) | Fallbacks |
+|---|---|---|---|---|
+| Parquet files | `read_parquet` | `db.read_parquet`, `pondra.read_parquet` | `spark.read.parquet` | `parquet_scan`, `db.scan_parquet`, `pondra.scan_parquet` |
+| CSV files | `read_csv` | `db.read_csv`, `pondra.read_csv` | `spark.read.csv` | `read_csv_auto`, `db.scan_csv`, `pondra.scan_csv` |
+| JSON lines | `read_json` | `db.read_json`, `pondra.read_json` | `spark.read.json` | `read_json_auto`, `read_ndjson`, `db.scan_ndjson`, `db.read_ndjson`, `pondra.scan_ndjson`, `pondra.read_ndjson` |
+| A Delta table | `read_delta` | `db.read_delta`, `pondra.read_delta` | `spark.read.format("delta").load` | `delta_scan`, `db.scan_delta`, `pondra.scan_delta` |
+| An Iceberg table | `read_iceberg` | `db.read_iceberg`, `pondra.read_iceberg` | `spark.read.format("iceberg").load` | `iceberg_scan`, `db.scan_iceberg`, `pondra.scan_iceberg` |
+| A lake's table | `FROM t` | `db.table`, `pondra.table` | `spark.table`, `spark.read.table` | |
+| Parquet files out | `COPY … TO (FORMAT parquet)` | `frame.write_parquet` | `df.write.parquet` | `frame.sink_parquet` |
+| CSV files out | `COPY … TO (FORMAT csv)` | `frame.write_csv` | `df.write.csv` | `frame.sink_csv` |
+| JSON lines out | `COPY … TO (FORMAT json)` | `frame.write_json` | `df.write.json` | `frame.sink_ndjson`, `frame.write_ndjson` |
+| A Delta table out | `COPY … TO (FORMAT delta)` | `frame.write_delta` | `df.write.format("delta").save`, `df.write.delta` | |
+| An Iceberg table out | `COPY … TO (FORMAT iceberg)` | `frame.write_iceberg` | `df.write.format("iceberg").save` | |
+| Into a lake's table | `INSERT INTO t …`, `CREATE TABLE t AS …` | `frame.write_table`, `db.write_table` | `df.write.saveAsTable`, `df.write.insertInto` | |
+<!-- /vocabulary -->
+
+- **Writing Delta and Iceberg tables to a folder:** the folder gets a new table if it holds
+  none. One that holds a table takes `mode="append"` or `"overwrite"` (SQL's `APPEND`,
+  `OVERWRITE`), as a folder of files does; `"error"` (the default) refuses, `"ignore"` leaves it.
+  delta-rs, PyIceberg and DuckDB read what is written.
+- **JavaScript** has no frames: SQL is its API (`db.sql("SELECT * FROM read_parquet('…')")`), so
+  its names are SQL's.
+- **Live answers:** `db.live(sql_or_frame)` yields a query's rows now and each time a commit
+  changes them (`for await (const rows of db.live(sql))` in JavaScript).
+- **Temporary tables and views** are the connection's own (`CREATE TEMP TABLE`, and a frame's
+  `to_view(name, temporary=True)`); `db.close()` ends them.
+- **Function answers reused:** `@db.function(cache="10 minutes")`.
 
 ## Round 24: functions and procedures from Python (ADR-027)
 

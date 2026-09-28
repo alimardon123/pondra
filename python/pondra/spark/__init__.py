@@ -549,7 +549,7 @@ class _Reader:
             else:
                 args[known[k]] = int(v)
         given = "".join(f", {k} => {_literal(v)}" for k, v in args.items())
-        return DataFrame(self.spark, self.spark.con.sql(f"SELECT * FROM {self.fmt}_scan({_literal(str(paths[0]))}{given})"))
+        return DataFrame(self.spark, self.spark.con.sql(f"SELECT * FROM read_{self.fmt}({_literal(str(paths[0]))}{given})"))
 
 
 # ---------------------------------------------------------------- data frames
@@ -878,8 +878,9 @@ class GroupedData:
 class _Writer:
     """`df.write`: into the lake's tables (`saveAsTable`, `insertInto`), or into files anywhere
     (`parquet`, `csv`, `json`, `save`: SQL's `COPY … TO`, a folder of files as Spark writes, by
-    `partitionBy` in `k=v` folders). Modes are Spark's: `error` (the default: a folder holding
-    files is refused), `overwrite`, `append`, `ignore`."""
+    `partitionBy` in `k=v` folders; `format("delta")` and `format("iceberg")` a table in the folder).
+    Modes are Spark's: `error` (the default: a folder holding files is refused), `overwrite`,
+    `append`, `ignore`."""
 
     OPTIONS = {"parquet": {"compression": "compression"}, "json": {}, "csv": {"header": "header", "sep": "delimiter", "delimiter": "delimiter"}}
 
@@ -939,9 +940,13 @@ class _Writer:
             self.partitionBy(partitionBy)
         if path is None:
             raise ValueError("df.write.save(path): where to? (saveAsTable(name) for a table)")
+        if self.fmt in ("delta", "iceberg"):
+            if self.parts or self.opts or options:
+                raise ValueError(f"df.write.format('{self.fmt}').save(path): a table as it is (partitionBy and options: not yet)")
+            return self.df._f._table_to(path, self.fmt, self.how)  # (COPY … TO … (FORMAT delta): made, appended to, or replaced)
         known = self.OPTIONS.get(self.fmt)
         if known is None:
-            raise ValueError(f"df.write.format('{self.fmt}'): parquet, csv or json (Delta and Iceberg: saveAsTable, published)")
+            raise ValueError(f"df.write.format('{self.fmt}'): parquet, csv, json, delta or iceberg")
         self.options(**{k: v for k, v in options.items() if v is not None})
         for k in self.opts:
             if k not in known:
@@ -969,6 +974,9 @@ class _Writer:
 
     def json(self, path, mode=None, partitionBy=None, **options):
         return self.format("json").save(path, mode=mode, partitionBy=partitionBy, **options)
+
+    def delta(self, path, mode=None):  # (Delta's own `df.write.delta(path)`, from delta-spark)
+        return self.format("delta").save(path, mode=mode)
 
 
 class DeltaTable:

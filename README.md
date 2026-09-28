@@ -55,7 +55,7 @@ await db.sql("SELECT 42 AS answer");
 
 `examples/quickstart.ipynb` is the same in a notebook: tables, a view that keeps itself current,
 new rows as they commit, a point-in-time join, frames and `%%sql` cells, functions and procedures
-in SQL and Python. The shell and `local()` start a node with
+in SQL and Python, another engine appending, and a live answer. The shell and `local()` start a node with
 `--stop-with-stdin`: it stops when the shell or program that started it exits — or is killed —
 and hands the lake on at once, so the next one opens it straight away.
 
@@ -177,26 +177,43 @@ SELECT user, sum(amount) FROM delta_scan('s3://my-bucket/lake/data/events') GROU
 SELECT count(*) FROM iceberg_scan('s3://my-bucket/lake/data/events/metadata/v42.metadata.json');
 ```
 
-Other engines read the table as of the last tiering round, and read-only:
+Other engines read the table as of the last tiering round:
 
 - ~30 ms after the ack on local disk;
 - 3–10 s on R2 at the default `--tier-secs 2`, depending on how far away the bucket is.
 
-Pondra's own readers (nodes, `pondra sql`) see every write sooner, and can write. The local
-folder and the bucket use the same layout: see `docs/lake-format.md`.
+**And they append to it** through the node's Iceberg REST catalog, as they would through Polaris
+or Unity Catalog (Pondra's own catalog stays the one that counts):
+
+```python
+from pyiceberg.catalog import load_catalog
+load_catalog("lake", type="rest", uri="http://node:8080").load_table("default.events").append(arrow_table)
+# (a lake on R2: add "py-io-impl": "pyiceberg.io.fsspec.FsspecFileIO" and the s3.* properties; pip install s3fs)
+# Spark: spark.sql.catalog.lake=org.apache.iceberg.spark.SparkCatalog, …lake.type=rest, …lake.uri=http://node:8080
+#        spark.sql("INSERT INTO lake.default.events SELECT …"); df.writeTo("lake.default.events").append()
+```
+
+An append becomes the table's own rows, as a bulk `INSERT`'s would (row ids, the table's layout,
+views following), each commit once: a stale one gets 409 and the writer retries on top. Deletes,
+schema changes and keyed tables stay with Pondra's SQL, and are refused by name.
+
+Pondra's own readers (nodes, `pondra sql`) see every write sooner. The local folder and the bucket
+use the same layout: see `docs/lake-format.md`.
 
 ## Read and write anything else
 
-Files, other engines' tables and Kafka topics are tables wherever SQL takes one, with DuckDB's
-names, and `COPY … TO` writes files or topics. Credentials go in a secret, never in the SQL:
+Files, other engines' tables and Kafka topics are tables wherever SQL takes one, and `COPY … TO`
+writes files, Delta and Iceberg tables, or topics. Reading is `read_<format>` and writing
+`write_<format>` in SQL and every client; DuckDB's, Polars' and PySpark's names work too
+(`docs/dataframe-api.md` has the table). Credentials go in a secret, never in the SQL:
 
 ```sql
 CREATE SECRET sales (TYPE s3, KEY_ID '…', SECRET '…', REGION 'eu-west-1', SCOPE 's3://sales');
 SELECT region, sum(amount) FROM 's3://sales/2026/*.parquet' GROUP BY region;   -- spread over the nodes
 SELECT * FROM read_csv('gs://drop/orders_*.csv', header => true, delim => ';');
 SELECT day, count(*) FROM read_parquet('az://lake/events/', hive_partitioning => true) GROUP BY day;
-SELECT * FROM delta_scan('s3://other/warehouse/orders', version => 12);        -- Spark's, Databricks'
-SELECT * FROM iceberg_scan('s3://other/warehouse/db/orders');
+SELECT * FROM read_delta('s3://other/warehouse/orders', version => 12);        -- Spark's, Databricks' (or delta_scan)
+SELECT * FROM read_iceberg('s3://other/warehouse/db/orders');                   -- (or iceberg_scan)
 
 ATTACH 's3://other/warehouse' AS spark_lake (TYPE delta);                      -- a folder of tables
 ATTACH 'https://catalog.example.com/api/catalog' AS pol (TYPE iceberg, SECRET polaris);  -- REST
@@ -205,13 +222,15 @@ INSERT INTO spark_lake.sales.orders SELECT * FROM orders WHERE day = '2026-09-27
 CREATE MATERIALIZED VIEW orders_in AS SELECT … FROM k.orders;                  -- a feed, every record once
 
 COPY (SELECT * FROM orders) TO 's3://exports/orders/' (FORMAT parquet, PARTITION_BY (region));
+COPY (SELECT * FROM orders) TO 's3://exports/orders_delta/' (FORMAT delta, APPEND);  -- a Delta table there, made or added to
 COPY alerts TO 'kafka://broker1:9092/alerts' (FORMAT json, KEY id);
 ```
 
-The same from Python: `db.scan_parquet(url)`, `scan_csv`, `scan_ndjson`, `scan_delta`,
-`scan_iceberg` give frames and `frame.sink_parquet(url)`, `sink_csv`, `sink_ndjson` write them;
+The same from Python: `db.read_parquet(url)`, `read_csv`, `read_json`, `read_delta`,
+`read_iceberg` give frames and `frame.write_parquet(url)`, `write_csv`, `write_json`,
+`write_delta(url, mode=…)`, `write_iceberg` write them (Polars' `scan_*` and `sink_*` too);
 `pondra.spark` has `spark.read.parquet(url)`, `spark.read.format("delta").load(url)` and
-`df.write.mode("overwrite").parquet(url)`.
+`df.write.mode("overwrite").format("delta").save(url)`.
 
 - **Stores:** `s3://` (AWS, R2, MinIO), `gs://`, `az://` / `abfss://`, `http(s)://`, and the
   machine's own paths — those only for the program that started the node (the shell, `local()`).
@@ -260,13 +279,15 @@ differences entirely.
 | Tables | SQL `CREATE TABLE t (id BIGINT PRIMARY KEY, …) WITH (publish = 'delta,iceberg', cluster_by = 'user', partition_by = 'day(ts)', merge = 'total:sum', ttl = 'ts:86400', order_by = 'ts')`, or `POST /tables/{t}` with the same as JSON. A key = upsert table (`SELECT *` shows its own columns; `_deleted` only when named); `order_by` = the row with the latest event time wins, not the last to arrive (Flink's deduplication by event time); `merge` = merge table; `cluster_by` sorts files for fast filters (two or more columns: along a Hilbert curve, so a filter on any of them skips most row groups); `partition_by` (a column, or year/month/day/hour of a timestamp) keeps one partition per file; a key, `cluster_by` and `partition_by` go together; `ttl` expires a keyed table's rows. Every file's column ranges are kept, and past 128 files a table's file list goes into manifests: a table of a million files commits as fast as one of ten, and queries open only the files their filters can match | Delta/Iceberg MERGE, partitioning, liquid clustering, Fluss PK tables with TTL |
 | Schemas and names | A lake is a database: `CREATE SCHEMA sales; CREATE TABLE sales.orders (…)`; a table is `t` (schema `public`), `schema.t` or `lake.schema.t`, and other lakes are databases too: `CREATE DATABASE l2` (a new lake beside this one), `ATTACH 's3://bucket/sales' AS sales` (or `--attach`), then `sales.eu.orders` joined with this lake's tables, and `INSERT INTO sales.t …` through its leader; `DETACH sales`. `DROP TABLE`, `DROP SCHEMA … [CASCADE]`, `CREATE TABLE … AS SELECT`; a drop is refused while a view or task reads the table. Postgres, Flight SQL, the Iceberg REST catalog and MCP list the schemas | Postgres / Snowflake `database.schema.table` |
 | Views | `CREATE [OR REPLACE] VIEW v AS …`: a stored query, run over the tables as they are when read (spread over the nodes like any query); `CREATE MATERIALIZED VIEW v [WITH (window = 'w', size_secs = 60)] AS …`: the streaming view below, filled from the rows already there when it is made, then kept up to date with every flush of new rows — every row once, even with rows streaming in as it is made | SQL views, Databricks materialized views, Flink SQL jobs |
-| SQL writes | `INSERT … SELECT/VALUES`, `UPDATE … SET … WHERE`, `DELETE … WHERE` and `MERGE INTO t USING s ON … WHEN [NOT] MATCHED [BY SOURCE] …` on every table, on any node, over Postgres, or with `pondra sql` on any machine; from a local file in the shell (`MERGE INTO t USING 'new.csv' …`). A change is one commit from one snapshot, exactly-once with a job id; views, the change feed and Delta/Iceberg readers follow it | Delta/Iceberg MERGE, Snowflake DML, Fluss 1.0's UPDATE/DELETE by condition |
+| SQL writes | `INSERT … SELECT/VALUES`, `UPDATE … SET … WHERE`, `DELETE … WHERE` and `MERGE INTO t USING s ON … WHEN [NOT] MATCHED [BY SOURCE] …` on every table (an attached lake's too), on any node, over Postgres, or with `pondra sql` on any machine; from a local file in the shell (`MERGE INTO t USING 'new.csv' …`). A change is one commit from one snapshot, exactly-once with a job id; views, the change feed and Delta/Iceberg readers follow it | Delta/Iceberg MERGE, Snowflake DML, Fluss 1.0's UPDATE/DELETE by condition |
 | System columns | every row has `_row_id` (kept through an UPDATE or MERGE), `_version` (the commit that wrote it), `_created_at`, `_updated_at`: `SELECT _row_id, * FROM t`; `SELECT *` leaves them out | Postgres `ctid`/`xmin`, Iceberg v3 row lineage, Delta row tracking |
 | Postgres protocol | `--pg`: psql, psycopg 2/3, asyncpg, SQLAlchemy + pandas (tested); JDBC/BI tools by the same protocol. `COPY t FROM STDIN` (text, CSV; psql's `\copy`, psycopg's `cursor.copy`) and `COPY (query) TO STDOUT` (text, CSV, binary); the ADBC Postgres driver reads results as Arrow that way. For speed, Arrow Flight SQL | a Postgres-compatible serving layer |
-| Python and JavaScript | `pip install pondra` / `npm install pondra`: `local()` starts a node here, `connect()` reaches one; `sql()` → pandas / Polars / Arrow, `append()` exactly-once, `view(name, sql)` (`materialized=True`: kept up to date, as `CREATE MATERIALIZED VIEW`), `write_table()`, `watch()`, `lookup()`, `$name` parameters, `run("model.sql", …)`, `call(procedure, …)`: the same names as SQL and frames (ADR-025) | PySpark / PyFlink clients for the common jobs |
+| Python and JavaScript | `pip install pondra` / `npm install pondra`: `local()` starts a node here, `connect()` reaches one; `sql()` → pandas / Polars / Arrow, `append()` exactly-once, `view(name, sql)` (`materialized=True`: kept up to date, as `CREATE MATERIALIZED VIEW`), `write_table()`, `watch()`, `live()`, `lookup()`, `$name` parameters, `run("model.sql", …)`, `call(procedure, …)`: the same names as SQL and frames (ADR-025, ADR-028) | PySpark / PyFlink clients for the common jobs |
+| Live queries | `GET /live?sql=…` (`db.live(sql)` in Python, `for await (const rows of db.live(sql))` in JavaScript): the answer now, then again within milliseconds of each commit that changes it — not for commits to other tables, and not when the answer comes out the same. Nothing runs once the client goes | PGlite's live queries, a dashboard's polling |
+| Temporary tables | `CREATE TEMP TABLE t AS …`, `CREATE TEMP VIEW v AS …`: a session's own (a Postgres connection, or a client's), in the node's memory; `INSERT`, `UPDATE`, `DELETE`, `MERGE` and joins with the lake's tables; gone when the session ends | Postgres / DuckDB temporary tables |
 | DataFrames, and SQL mixed with them | `pondra.frame`: Polars' lazy API (`db.table("orders").filter(col("amount") > 100).group_by("user").agg(col("amount").sum())`), each step a CTE of one SQL statement (`frame.sql`) that runs, spreads and is remembered like any query. `pondra.spark`: PySpark's names over the same frames (`from pondra.spark import SparkSession, functions as F, Window`), PySpark's meanings where they differ (null order, `/`, column names). Either way round: `db.sql(…)` is a frame; SQL names Python frames and pandas / Polars / Arrow data by their variable names (or `{name}`); frame methods take SQL snippets; `to_view()` makes a frame a view every client reads; `%load_ext pondra` gives notebooks `%%sql` cells. All 22 TPC-H queries give the same answers as SQL, as frames and as PySpark code; 51 PySpark pipelines (files read and written too) give PySpark's own answers and column names | Polars / PySpark on a lake, SQLMesh / dbt's Python models |
 | SQL functions | Postgres's `CREATE FUNCTION net(x DOUBLE, rate DOUBLE DEFAULT 0.2) RETURNS DOUBLE RETURN x * (1 - rate)`, `… RETURNS TABLE (id BIGINT, …) LANGUAGE sql AS $$ SELECT … $$`, `SETOF`, `$1`, `STRICT`, `IMMUTABLE`; DuckDB's `CREATE MACRO` too. Kept in the lake: every node and every client has them, replaced by their bodies where SQL comes in (so queries using them spread as any other). Stored views read them as they are now; materialized views keep them as made | Postgres / DuckDB SQL functions |
-| Python functions | `CREATE FUNCTION slug(t VARCHAR) RETURNS VARCHAR LANGUAGE python AS $$ … $$`: per row, a batch at once (`WITH (vectorized = true)`: pyarrow in and out) or a table (`RETURNS TABLE`); `WITH (packages = 'requests')`; PL/Python's `plpy`. Run on warm workers beside every node (each node its own rows), anywhere SQL's own functions go; no connection back, a time limit per batch; `@db.function` on a notebook's function (its imports, helpers and constants go along), PySpark's `udf` / `pandas_udf` | Snowflake / Databricks Python UDFs and UDTFs, PySpark UDFs |
+| Python functions | `CREATE FUNCTION slug(t VARCHAR) RETURNS VARCHAR LANGUAGE python AS $$ … $$`: per row, a batch at once (`WITH (vectorized = true)`: pyarrow in and out) or a table (`RETURNS TABLE`); `WITH (packages = 'requests')`; `WITH (cache = '10 minutes')`: an answer reused for the same arguments (an API or model called once, not once a query); PL/Python's `plpy`. Run on warm workers beside every node (each node its own rows), anywhere SQL's own functions go; no connection back, a time limit per batch; `@db.function` on a notebook's function (its imports, helpers and constants go along), PySpark's `udf` / `pandas_udf` | Snowflake / Databricks Python UDFs and UDTFs, PySpark UDFs |
 | Procedures | `CREATE PROCEDURE p(day DATE, n BIGINT DEFAULT 10) LANGUAGE sql AS $$ …; …; $$` or `LANGUAGE python` (anything Python can do — mail, HTTP, files; `pondra.sql(…)` is the caller's connection, `pondra.secret(…)` a `CREATE SECRET`'s values, never shown; `return` optional); `CALL p(DATE '2026-09-27')` from SQL, Postgres, Python (`db.call`; `@db.procedure`, or `db.create_procedure(name, file="job.py")`), JavaScript, the shell, and as MCP tools. What it prints comes back as notices (psql's NOTICE). Arguments worked out once; the caller's rights; exactly-once with a job; `SELECT pondra.start('p', …)` / `db.call(…, wait=False)` without waiting; every call in `pondra.runs`; a warm call in about 2 ms | Snowflake / Postgres stored procedures, Databricks jobs |
 | Tasks | `CREATE TASK nightly SCHEDULE 'cron 0 2 * * * UTC' AS CALL report(current_date - 1)` (or `'5 minutes'`): the leader runs each tick once, through a failover; `SHOW TASKS`, `DROP TASK` (and `SHOW USER FUNCTIONS`, `SHOW PROCEDURES`) | Snowflake tasks, Databricks jobs, cron |
 | Scripts and parameters | `POST /sql` takes several statements and `{"sql": …, "params": {"day": "2026-09-27"}}` for `$day` (bound by the node, never pasted in); `pondra run load.sql lake --day 2026-09-27` runs a file | psql scripts, dbt's `var()` |
@@ -295,7 +316,7 @@ differences entirely.
 | Serving reads | `GET /lookup/{t}/{key}` (or SQL `SELECT … WHERE key = …`): the current row of one key without SQL planning — log tail, then the files newest-first, each narrowed to one cached, key-sorted row group: ~0.2 ms, ~20k/s on two cores | Redis / Postgres / Lakehouse//RT in front of the lake |
 | Batch ELT, exactly-once | `POST /insert/{t}?job=` with a `SELECT` (the receiving node does the work), or `pondra sql "INSERT INTO t SELECT …"` from any machine: straight to Parquet (`INSERT … VALUES` goes through the log, gathered into a file per tiering round); a retried job is a no-op | Spark batch jobs |
 | Maintenance | automatic and spread over the nodes: tiering to Parquet, compaction, rewriting files without changed rows (every round for published tables), retention, orphan cleanup, backpressure; `CHECKPOINT` tiers everything now (and compacts a published keyed table, so Delta and Iceberg see it as it is) | Spark OPTIMIZE / VACUUM |
-| Open formats | tables that ask are published as Delta Lake (`data/{t}/_delta_log`) and Iceberg (`data/{t}/metadata`) each tiering round, for engines that don't know Pondra; an Iceberg REST catalog (`/v1/…`) lets them attach by URL | a separate Delta/Iceberg writer and catalog |
+| Open formats | tables that ask are published as Delta Lake (`data/{t}/_delta_log`) and Iceberg (`data/{t}/metadata`) each tiering round, for engines that don't know Pondra; an Iceberg REST catalog (`/v1/…`) lets them attach by URL and append (Spark, PyIceberg, Trino, another Pondra) | a separate Delta/Iceberg writer and catalog (Polaris, Unity Catalog) |
 
 ## How it works
 
@@ -362,10 +383,13 @@ python3 tools/harness.py columns | fills | dedup # RENAME/DROP/widen under strea
 python3 tools/bench/nexmark.py                  # Nexmark q1, q2, q5, q7, q11: Pondra and Flink, the answers checked against DuckDB
 python3 tools/harness.py procedures             # macros, procedures (SQL and Python), scripts, parameters: rights, depth, three nodes, MCP tools
 python3 tools/harness.py functions              # functions (SQL, Python), workers, notices at every door, mail, secrets, run log, tasks, speed
+python3 tools/harness.py names | answers         # read_*/write_* == the tools' names, the docs' table run; function answers kept for a while
+python3 tools/harness.py writes | live           # PyIceberg (and Pondra) appending through the Iceberg catalog; live queries
+python3 tools/harness.py temps | across          # temporary tables and views in sessions; UPDATE/DELETE/MERGE on another lake from any node
 python3 tools/frames_check.py                   # pondra.frame == Polars; one question asked ten ways (SQL, frames, pandas, .sql, %%sql, procedures)
-<venv with pyspark>/python tools/spark_check.py # pondra.spark == PySpark 4: 51 pipelines, values and column names
+<venv with pyspark>/python tools/spark_check.py # pondra.spark == PySpark 4: 55 pipelines, values and column names
 python3 tools/harness.py outside | clouds | kafkas   # files on S3/HTTP/this machine, GCS and Azure (emulated), other Kafka clusters
-python3 tools/formats_check.py --spark <python with pyspark>   # Delta and Iceberg by Spark 4, delta-rs, PyIceberg == Pondra's reads; INSERT
+python3 tools/formats_check.py --spark <python with pyspark>   # Delta and Iceberg by Spark 4, delta-rs, PyIceberg == Pondra's reads; INSERT; Spark appending to Pondra's tables
 python3 tools/bench/files_tpch.py --data <tpch>  # TPC-H from files outside the lake against the lake's own tables
 python3 tools/slt_check.py --slt <datafusion>/datafusion/sqllogictest/test_files   # DataFusion's SQL tests: the pass rate
 python3 tools/bench/tpch_frames.py              # the 22 TPC-H queries as SQL, as frames and as PySpark code: the same answers
@@ -431,6 +455,10 @@ bucket to its newest lakes.
   Tables made before 0.19 (without row ids) change after a copy (`CREATE TABLE t2 AS SELECT …`).
   Clustering across files.
 - A write to two lakes is two commits, not one transaction.
+- Other engines append to append tables through the Iceberg REST catalog; their deletes, schema
+  changes and writes to keyed tables are refused (next: equality deletes as upserts), and so is
+  a table made through the catalog (make it with `CREATE TABLE … WITH (publish = 'iceberg')`).
+  Delta writers need Delta's catalog-managed commits, which aren't out yet.
 - A materialized view that is a session window or a stream join starts from its creation; others
   are filled from the rows already there, in one go on the leader. `ALTER TABLE … RENAME TO`
   (copy with `CREATE TABLE … AS`), narrowing a type, `search_path` and grants per schema.

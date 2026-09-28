@@ -126,6 +126,8 @@ def notebook_check(py, wheel, work):
 import nbformat, nbclient
 nb = nbformat.read({os.path.join(HERE, "..", "examples", "quickstart.ipynb")!r}, as_version=4)
 nbclient.NotebookClient(nb, timeout=300, kernel_name="python3", resources={{"metadata": {{"path": {folder!r}}}}}).execute()
+shown = [o for c in nb.cells if c.cell_type == "code" for o in c.outputs if o.get("output_type") == "error"]
+assert not shown, [o.get("evalue") for o in shown]  # (a display that failed doesn't fail its cell: a frame's _repr_html_ did, since 0.22.1)
 text = "".join(o.get("data", {{}}).get("text/plain", "") for c in nb.cells if c.cell_type == "code" for o in c.outputs)
 assert "5000   tea" in text and "70.0" in text and "5000000000" in text and "41.3" in text, text[-600:]
 assert "WITH _" in "".join(o.get("text", "") for c in nb.cells if c.cell_type == "code" for o in c.outputs), "frame.sql"  # (R12: a frame's SQL)

@@ -25,11 +25,12 @@ export class Pondra {
     this.onNotice = onNotice; // (each one, as it comes back; null: keep them quiet)
     this.producer = `js-${randomUUID().slice(0, 12)}`; // exactly-once: one name, increasing seq
     this.seq = 0;
+    this.session = randomUUID(); // this connection's temporary tables and views, on the node until close()
   }
 
   /** One HTTP request to the node (what the methods below are made of). */
   async request(method, path, body, type) {
-    const headers = { ...(this.token && { authorization: `Bearer ${this.token}` }), ...(type && { "content-type": type }), ...(this.owner && { "x-pondra-owner": this.owner }) };
+    const headers = { "x-pondra-session": this.session, ...(this.token && { authorization: `Bearer ${this.token}` }), ...(type && { "content-type": type }), ...(this.owner && { "x-pondra-owner": this.owner }) };
     const r = await fetch(this.url + path, { method, body, headers });
     const said = r.headers.get("x-pondra-notices");
     this.notices = said ? JSON.parse(said) : [];
@@ -121,9 +122,36 @@ export class Pondra {
     }
   }
 
-  /** Stop the node `local()` started: closing its input stops it (it hands the lake on at once),
-   * on every OS; it would stop the same way if this process were killed. */
+  /** A query's answer now, and again each time a commit changes a table it reads: each is its
+   * rows. An answer that comes out the same isn't sent again; a busy table is queried at most every
+   * `everyMs` (100). Leaving the loop ends it on the node.
+   *   for await (const rows of db.live("SELECT region, sum(amount) AS total FROM orders GROUP BY region")) redraw(rows); */
+  async *live(sql, { params = {}, everyMs } = {}) {
+    const r = await this.request("POST", "/live" + (everyMs ? `?every_ms=${everyMs}` : ""), JSON.stringify({ sql, params }), "application/json");
+    const decoder = new TextDecoder();
+    let rest = "";
+    try {
+      for await (const chunk of r.body) {
+        const lines = (rest + decoder.decode(chunk, { stream: true })).split("\n");
+        rest = lines.pop();
+        for (const line of lines) {
+          if (!line.trim()) continue; // (the node's keep-alive)
+          const answer = JSON.parse(line);
+          if (answer.error) throw new Error(answer.error);
+          this.position = answer.at;
+          yield answer.rows;
+        }
+      }
+    } finally {
+      await r.body.cancel().catch(() => {});
+    }
+  }
+
+  /** End this connection's session (its temporary tables and views), and stop the node `local()`
+   * started: closing its input stops it (it hands the lake on at once), on every OS; it would stop
+   * the same way if this process were killed. */
   async close(timeoutMs = 15_000) {
+    await this.request("DELETE", `/sessions/${this.session}`).catch(() => {});
     const node = this.process;
     if (!node || node.exitCode !== null || node.signalCode !== null) return;
     const exited = new Promise((resolve) => node.once("exit", resolve));

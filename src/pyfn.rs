@@ -10,6 +10,9 @@
 //!
 //! Functions have no connection back to the lake: a query may run one over millions of rows on
 //! every node. They may import anything and call out.
+//!
+//! A function made `WITH (cache = '10 minutes')` has its answers reused for that long (`Answers`,
+//! ADR-028): an API or a model called again for the same arguments costs nothing.
 use crate::routines::{Kind, Routine};
 use crate::store::Lake;
 use anyhow::{Context, Result};
@@ -146,13 +149,59 @@ impl AsyncScalarUDFImpl for Function {
         // An IMMUTABLE or STABLE function called per row gets each distinct argument once
         // (`geocode(city)` over a million rows of a thousand cities: a thousand calls), and its
         // answers go back to every row that had them.
-        let once = self.routine.cacheable() && !self.routine.with.vectorized && rows > 1;
+        // (a function whose answers are kept is asked each distinct argument once, vectorized or not)
+        let cache = self.routine.with.cache;
+        let once = (self.routine.cacheable() && !self.routine.with.vectorized || cache.is_some()) && rows > 1;
         let (arrays, back) = if once { distinct(arrays, rows)? } else { (arrays, None) };
         let asked = back.as_ref().map_or(rows, |(n, _)| *n);
         let go = async {
-            let answers = ask(&self.name, &self.routine, false, batch(&self.routine, arrays, asked)?, out.clone()).await?;
-            let column = datafusion::arrow::compute::concat(&answers.iter().map(|b| b.column(0).as_ref()).collect::<Vec<_>>())?;
-            anyhow::ensure!(column.len() == asked, "{} values back for {asked} rows", column.len());
+            // Answers kept from earlier calls, and the rows still to ask for.
+            let keys = match cache {
+                Some(_) => keys(&self.name, &self.routine, &arrays, asked)?,
+                None => vec![],
+            };
+            let kept: Vec<Option<ArrayRef>> = keys.iter().map(|k| ANSWERS.lock().unwrap().value(k)).collect();
+            let missing: Vec<u32> = (0..asked as u32).filter(|&i| kept.get(i as usize).is_none_or(Option::is_none)).collect();
+            let arrays = match missing.len() == asked {
+                true => arrays,
+                false => {
+                    let picked = datafusion::arrow::array::UInt32Array::from(missing.clone());
+                    arrays.iter().map(|a| datafusion::arrow::compute::take(a, &picked, None)).collect::<Result<Vec<_>, _>>()?
+                }
+            };
+            let column = match missing.is_empty() {
+                true => datafusion::arrow::array::new_empty_array(&self.returns),
+                false => {
+                    let answers = ask(&self.name, &self.routine, false, batch(&self.routine, arrays, missing.len())?, out.clone()).await?;
+                    datafusion::arrow::compute::concat(&answers.iter().map(|b| b.column(0).as_ref()).collect::<Vec<_>>())?
+                }
+            };
+            anyhow::ensure!(column.len() == missing.len(), "{} values back for {} rows", column.len(), missing.len());
+            let column = match cache {
+                Some(secs) => {
+                    let mut answers = ANSWERS.lock().unwrap();
+                    for (at, &i) in missing.iter().enumerate() {
+                        answers.keep(keys[i as usize].clone(), Kept::Value(datafusion::arrow::compute::take(&column, &datafusion::arrow::array::UInt32Array::from(vec![at as u32]), None)?), secs);
+                    }
+                    // Each row's answer: kept (a one-row array of its own) or just asked for.
+                    let mut sources: Vec<&dyn datafusion::arrow::array::Array> = vec![column.as_ref()];
+                    let (mut at, mut pick) = (0, Vec::with_capacity(asked));
+                    for k in &kept {
+                        pick.push(match k {
+                            Some(v) => {
+                                sources.push(v.as_ref());
+                                (sources.len() - 1, 0)
+                            }
+                            None => {
+                                at += 1;
+                                (0, at - 1)
+                            }
+                        });
+                    }
+                    datafusion::arrow::compute::interleave(&sources, &pick)?
+                }
+                None => column,
+            };
             anyhow::Ok(match &back {
                 Some((_, rows)) => datafusion::arrow::compute::take(&column, rows, None)?,
                 None => column,
@@ -229,10 +278,96 @@ impl TableProvider for Called {
     async fn scan(&self, state: &dyn Session, projection: Option<&Vec<usize>>, _: &[Expr], _: Option<usize>) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
         let go = async {
             let arrays = self.values.iter().map(|v| v.to_array()).collect::<datafusion::common::Result<Vec<_>>>()?;
+            let key = match self.routine.with.cache {
+                Some(_) => keys(&self.name, &self.routine, &arrays, 1)?.pop(),
+                None => None,
+            };
+            if let Some(rows) = key.as_ref().and_then(|k| ANSWERS.lock().unwrap().rows(k)) {
+                return anyhow::Ok(rows);
+            }
             let rows = ask(&self.name, &self.routine, true, batch(&self.routine, arrays, 1)?, self.schema.clone()).await?;
+            if let (Some(k), Some(secs)) = (key, self.routine.with.cache) {
+                ANSWERS.lock().unwrap().keep(k, Kept::Rows(rows.clone()), secs);
+            }
             anyhow::Ok(rows)
         };
         let rows = go.await.map_err(|e| exec_datafusion_err!("{e:#}"))?;
         MemTable::try_new(self.schema.clone(), vec![rows])?.scan(state, projection, &[], None).await
     }
+}
+
+// ---------------------------------------------------------------- answers kept (ADR-028)
+
+/// Answers of functions made `WITH (cache = '…')`, on this node: by the function's definition (a
+/// replaced function never reuses an old answer) and its argument values, each for the function's
+/// lifetime, within `PONDRA_FUNCTION_CACHE_MB` (256), least recently used out first. Only calls
+/// that succeeded are kept. The caller isn't in the key: a function sees only its arguments.
+struct Answers {
+    kept: lru::LruCache<Vec<u8>, (std::time::Instant, Kept)>,
+    bytes: usize,
+}
+
+enum Kept {
+    Value(ArrayRef),       // a function's answer for one row of arguments
+    Rows(Vec<RecordBatch>), // a table function's rows
+}
+
+impl Kept {
+    fn size(&self) -> usize {
+        match self {
+            Kept::Value(a) => a.get_array_memory_size(),
+            Kept::Rows(r) => r.iter().map(|b| b.get_array_memory_size()).sum(),
+        }
+    }
+}
+
+static ANSWERS: LazyLock<Mutex<Answers>> = LazyLock::new(|| Mutex::new(Answers { kept: lru::LruCache::unbounded(), bytes: 0 }));
+
+impl Answers {
+    fn get(&mut self, key: &[u8]) -> Option<&Kept> {
+        if self.kept.peek(key).is_some_and(|(until, _)| *until <= std::time::Instant::now()) {
+            let (_, (_, old)) = self.kept.pop_entry(key).expect("there");
+            self.bytes -= old.size() + key.len();
+            return None;
+        }
+        self.kept.get(key).map(|(_, k)| k)
+    }
+
+    fn value(&mut self, key: &[u8]) -> Option<ArrayRef> {
+        match self.get(key)? {
+            Kept::Value(a) => Some(a.clone()),
+            Kept::Rows(_) => None,
+        }
+    }
+
+    fn rows(&mut self, key: &[u8]) -> Option<Vec<RecordBatch>> {
+        match self.get(key)? {
+            Kept::Rows(r) => Some(r.clone()),
+            Kept::Value(_) => None,
+        }
+    }
+
+    fn keep(&mut self, key: Vec<u8>, answer: Kept, secs: u64) {
+        static BUDGET: LazyLock<usize> = LazyLock::new(|| std::env::var("PONDRA_FUNCTION_CACHE_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(256usize) << 20);
+        self.bytes += answer.size() + key.len();
+        if let Some((k, (_, old))) = self.kept.push(key, (std::time::Instant::now() + std::time::Duration::from_secs(secs), answer)) {
+            self.bytes -= old.size() + k.len(); // (the key's answer before)
+        }
+        while self.bytes > *BUDGET {
+            let Some((k, (_, old))) = self.kept.pop_lru() else { break };
+            self.bytes -= old.size() + k.len();
+        }
+    }
+}
+
+/// Each row's key: the function (its name and definition) and the row's argument values.
+fn keys(name: &str, r: &Routine, arrays: &[ArrayRef], rows: usize) -> Result<Vec<Vec<u8>>> {
+    use datafusion::arrow::row::{RowConverter, SortField};
+    let version = std::hash::BuildHasher::hash_one(&std::hash::BuildHasherDefault::<std::collections::hash_map::DefaultHasher>::default(), serde_json::to_vec(r)?);
+    let head = format!("{name}\0{version:x}\0").into_bytes();
+    if arrays.is_empty() {
+        return Ok(vec![head; rows]);
+    }
+    let converted = RowConverter::new(arrays.iter().map(|a| SortField::new(a.data_type().clone())).collect())?.convert_columns(arrays)?;
+    Ok((0..rows).map(|i| [head.as_slice(), converted.row(i).data()].concat()).collect())
 }

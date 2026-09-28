@@ -1,7 +1,8 @@
 # AGENTS.md — working on Pondra
 
 Read this first, then `README.md` (what it does), `docs/adr-005-every-node-writes.md` (why it
-works this way) and `docs/adr-027-sql-and-python-as-one.md` (the latest round).
+works this way) and `docs/adr-028-one-vocabulary-and-open-writes.md` (the latest round;
+`docs/adr-029-anyones-compute-one-catalog.md` is the next design, proposed).
 `docs/prototype-status.md` has the measured numbers and what's left.
 
 ## What this is
@@ -18,7 +19,7 @@ The owner's design principles, which every change must respect:
 2. **As serverless as possible**: no always-on services besides the nodes themselves.
 3. **SPMD, not driver/executor** (Bodo-style): every node runs the same code on its slice.
 4. **No JVM, no Spark, no Flink, no Fluss needed.**
-5. **Short, simple, readable code** — without losing functionality. ~23,800 lines of Rust total (the Kafka protocol is 1,300 of them; other engines' formats, Kafka's client side and files anywhere, round 23, 4,650; Python functions, procedures on workers, the run log and tasks, round 24, 1,400).
+5. **Short, simple, readable code** — without losing functionality. ~25,100 lines of Rust total (the Kafka protocol is 1,300 of them; other engines' formats, Kafka's client side and files anywhere, round 23, 4,650; Python functions, procedures on workers, the run log and tasks, round 24, 1,400; outside appends, live queries, temporary tables, answers kept and changes across lakes, round 25, 1,200).
    If a change makes a file much longer, look for the simpler shape first.
 6. **Scale-out is the point** (the owner, 2026-09-27): running across machines is what sets
    Pondra apart from single-node engines (DuckDB, Polars, Daft, Bodo) and makes it leaner than
@@ -29,7 +30,8 @@ The owner's design principles, which every change must respect:
 ## Layout
 
 ```
-src/      23,800 lines of Rust, one file per concern (see the table in README.md)
+src/      25,100 lines of Rust, one file per concern (see the table in README.md); round 25 added
+          live.rs (live queries) and temp.rs (a session's temporary tables and views)
 python/   the Python client (pure Python, HTTP + Arrow; `local()` starts a node): `client.py`, frames
           (`frame.py`, Polars' names), `spark/` (PySpark's names), `worker.py` (a node's warm
           Python worker: functions' batches and procedures' calls, ADR-027), `plpy.py` (PL/Python's
@@ -790,6 +792,61 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    batch once, and its answers are spread back to the rows; a volatile one, or a vectorized one
    (it may look across rows), gets every row. `harness.py functions`: "an IMMUTABLE function gets
    each distinct argument once a batch…" takes 1,000 s without it (past the batch's time limit).
+   (107's error names the worker's end because `python::ask` waits up to a second for its exit
+   status: its pipes close a moment before the OS reports it gone. CI's busy runner lost that race
+   once in a while, round 24's second fix.)
+
+118. **Another engine's append is recorded once, and only on the version it was written on**
+   (ADR-028, `iceberg::record`): the leader checks `assert-table-uuid` and
+   `assert-ref-snapshot-id` under the lake's lock, against the version last published, and
+   answers 409 otherwise (the writer retries on top). A snapshot id already recorded (the job
+   `iceberg:{table}:{snapshot}`) is answered as done, before any requirement is checked.
+   `harness.py writes`: "two writers at once…" (a lost append without the check) and "a commit
+   sent twice…" (a duplicate without the job).
+119. **An outside append's rows are the table's own, never the writer's files** (`iceberg::update`):
+   they are read and written again, as a bulk INSERT's are (row ids, the table's layout), or go
+   through the log when views or tasks follow the table (`write::follows`). The writer's data files
+   go once recorded; its manifests go with the table's replaced files, after the retention period
+   (Iceberg 1.10 reads its own manifest list once more after a commit). `harness.py writes`: "…the
+   rows are the table's own (row ids), the writer's files gone" and "a view of the table follows".
+120. **The version published for an outside commit carries the writer's snapshot id**
+   (`iceberg::publish`'s `Named`): PyIceberg and Java look their commit up by it after a retry.
+   So a version's number (its file `v{N}.metadata.json`, its sequence number) and its snapshot id
+   are two things now; only the number names files. `harness.py writes`: "…its snapshot found by
+   its id".
+121. **Only files in the table's own `data/` folder are taken, and nothing else is deleted**
+   (`iceberg::parse`, `inside`): a manifest naming a file anywhere else — another table's, a path
+   with `..` — is refused before anything is read. `harness.py writes`: "files outside the table's
+   folder" (refused, and the file still there).
+122. **A cached function answer is reused only for the same definition and arguments, within its
+   lifetime, and only after success** (`pyfn::Answers`: keyed by the routine's JSON and the
+   argument row). `harness.py answers`: each check fails without its part.
+123. **A live query sends an answer only when one of its tables changed and the answer with it, and
+   nothing runs once its client goes** (`live.rs`: a print of its tables' definitions and the
+   commits touching them; a keep-alive line every 15 s notices a gone client). `harness.py live`:
+   "…none for other tables or the same answer" and "closed: nothing runs…" (`/stats`
+   `live_queries`).
+124. **A temporary table is its session's alone, and a query reading one runs on its node and is
+   never answered from the result cache** (`temp.rs`; `temp::mentioned` in `App::query_as`,
+   `server::query`). `harness.py temps`: "another session doesn't see them", "a query spread over
+   three nodes reading one runs on its node, with the same answer" (the other nodes have no such
+   table), "not answered from the result cache".
+125. **A change to another lake's table is its leader's, with everything it reads that the leader
+   can't read sent along** (`change::for_leader`: this lake's tables, files here, the session's
+   temporary tables, as `__sent_N`). `harness.py across`: that lake has tables of the same names
+   with other rows, so a relation not sent reads the wrong rows.
+126. **Each fallback name is its standard name** (ADR-028): DuckDB's, Polars' and PySpark's names
+   map to the same code, never a second one. `harness.py names` compares their answers and runs
+   every name in `dataframe-api.md`'s table.
+127. **A folder named relatively is where the node runs, made absolute** (`ddl::full`: canonical if
+   it exists, otherwise absolute with `.` and `..` removed, since object stores refuse them).
+   Delta and Iceberg tables written to one (`write_delta("out/x")`) and read back
+   (`read_delta`, `read_iceberg`, `delta_scan`), and an Iceberg `location`, are always absolute.
+   Tested by `harness.py names`.
+128. **A frame shows itself in a notebook** (`_repr_html_`). In `frame.py`, `all`, `len` and friends
+   are Polars' expressions, so Python's own must be reached as `builtins.all`, `builtins.len` and
+   so on. `package_check.py` calls the display. `anywhere_check.py` fails on any error a notebook
+   shows, because IPython turns a failed display into text and the cell still passes.
 
 ## Tests: run these before and after any change
 
@@ -824,10 +881,16 @@ python3 tools/harness.py fills                 # views filled from existing rows
 python3 tools/harness.py dedup                 # a keyed table deduplicated by event time (order_by) vs a model; SELECT * without _deleted
 python3 tools/harness.py procedures            # macros, SQL and Python procedures, scripts, parameters, sent rows: rights, depth, 3 nodes, Postgres, MCP, pondra run
 python3 tools/harness.py functions             # CREATE FUNCTION (SQL, Python), workers, spread, notices at every door, mail (aiosmtpd), secrets, run log, tasks through failover, speed
+python3 tools/harness.py names                 # read_*/write_* names == the tools' fallbacks; dataframe-api.md's table runs; Delta/Iceberg folders (delta-rs, PyIceberg)
+python3 tools/harness.py answers               # WITH (cache = '…'): reused within the lifetime, by definition and arguments, only after success
+python3 tools/harness.py writes                # PyIceberg (and Pondra) append through the Iceberg REST catalog: once, row ids, 409 + retry, views, refusals
+python3 tools/harness.py live                  # live queries: an answer per change of its tables, none for others, gone when closed; JavaScript
+python3 tools/harness.py temps                 # TEMP tables and views on 3 nodes: every statement, sessions (HTTP, Postgres, procedures), spread, idle end
+python3 tools/harness.py across                # UPDATE/DELETE/MERGE on an attached lake from a follower of another: sent rows, a file, a temp table, no leader
 python3 tools/harness.py outside               # files on S3 and HTTP (moto): globs, CSV, JSON, Hive folders, spread, COPY … TO (spread too), secrets, who may read
 python3 tools/harness.py clouds                # GCS (sim_gcs.py) and Azure (Azurite) lakes and files: failover, COPY, a file changed beside a lake
 python3 tools/harness.py kafkas                # Apache Kafka 4 (~/kafka_2.13-*) and a Pondra node's port: topics as tables, COPY to a topic, feeds through kills, SASL
-python3 tools/formats_check.py --spark ~/venv-spark/bin/python   # Delta/Iceberg by Spark 4, delta-rs, PyIceberg == Pondra; attached, REST, INSERT, spread
+python3 tools/formats_check.py --spark ~/venv-spark/bin/python   # Delta/Iceberg by Spark 4, delta-rs, PyIceberg == Pondra; attached, REST, INSERT, spread; Spark appending through Pondra's catalog
 python3 tools/bench/files_tpch.py --data ~/tpch/sf1-bench        # TPC-H from files (local, S3) against the lake's own tables
 python3 tools/files_s3_check.py                # files in a real bucket (R2): a glob, the cache by version, a file changed, COPY there
 python3 tools/slt_check.py --slt <datafusion>/datafusion/sqllogictest/test_files [--nodes 3]   # DataFusion's sqllogictest: pass rate, failures grouped (D1)
@@ -838,6 +901,7 @@ python3 tools/bench/nexmark.py [--bids 4000000] # Nexmark q1, q2, q5, q7, q11: P
 python3 tools/smoke.py target/release/pondra   # what CI runs on Windows, macOS and Linux (stdlib only)
 python3 tools/anywhere_check.py --bin <pondra> --dist dist [--docker]   # shell, local(), kill -9, wheel, npm, notebook; glibc 2.17 + Ubuntu 22.04
 python3 tools/bench/repeat.py --data ~/tpch/sf1-bench --query 15 --runs 20 [--hot]   # one query many times vs DuckDB
+python3 tools/bench/outside_append.py            # what another engine's append costs the node (ADR-028's copy; ADR-029's before/after)
 python3 tools/asof_check.py                    # ASOF JOIN == DuckDB's: 4 directions and more, one node and 3, 4 ways of planning
 python3 tools/stream_check.py                  # one stream, window + session + as-of views: every click once; clicks/s; emission delay
 python3 tools/harness.py scale                 # partitions, manifests, 29 spread query shapes (joins of every kind, subqueries, CTEs, key ranges) == one node, memory limits
@@ -904,13 +968,13 @@ Practical notes for an agent working here:
 - Node stderr goes to `/tmp/pondra-<port>-<id>.stderr`; that's where "restarting to rejoin",
   "slow tiering" and panics show up.
 
-## State of the work (2026-09-28, round 24)
+## State of the work (2026-09-29, round 25)
 
 Everything in `docs/prototype-status.md` passes on local disk and on simulated R2. The round-11
 additions (manifests, partitions, shuffles, memory limits, Arrow Flight) also ran against real
 R2; round 12's are in `logs/round12/`, round 13's in `logs/round13/`, round 14's in
 `logs/round14/`, round 15's in `logs/round15/`, round 16's in `logs/round16/`, round 17's in `logs/round17/`,
-round 18's in `logs/round18/`, round 19's in `logs/round19/`, round 20's in `logs/round20/`, round 21's in `logs/round21/`, round 22's in `logs/round22/`, round 23's in `logs/round23/` and round 24's in `logs/round24/`.
+round 18's in `logs/round18/`, round 19's in `logs/round19/`, round 20's in `logs/round20/`, round 21's in `logs/round21/`, round 22's in `logs/round22/`, round 23's in `logs/round23/`, round 24's in `logs/round24/` and round 25's in `logs/round25/`.
 
 **Round 23 (ADR-026) read and wrote everything else:** files on S3, GCS, Azure, HTTPS and the
 owner's machine as tables (listed each statement, cached only by version, spread, their footers'
@@ -948,11 +1012,56 @@ files through Pondra (`tools/slt_check.py`, `logs/round23/slt-*.json`), which fo
     (now `cache-on-failure`).
 
   The pondra crate itself takes about 9 minutes in the dist profile on every push.
-- **The owner's decisions for round 25** (`roadmap.md`):
-  - E9: Pondra's own `read_*` / `write_*` names everywhere, the tools' names as fallbacks;
-  - G8: other engines write Pondra's tables through its own Iceberg REST catalog (not Polaris
-    or Unity: JVM services, and the catalog must stay Pondra's);
-  - E10: function results cached with a lifetime.
+- **Round 24's CI** failed three times on the Linux job after the round was pushed; each fix is
+  its own commit on top of it (the tag `v0.24.0` goes on the last):
+  - two function checks were too tight for the runner (9672068);
+  - a dead worker's error lost its reason when the OS reported the exit a moment late (7bf651a);
+  - the spread guard chose a query's way by its last run, so one slow run flipped it (e123acf).
+
+**Round 25 (ADR-028): one vocabulary, open writes, live answers.** The owner split the planned
+round: the engine first (this), then the console and `--server` (round 26).
+
+- **E9, one vocabulary:** `read_*` / `write_*` in SQL, Python and PySpark; the tools' names are the
+  same functions. `dataframe-api.md` has the table, and `harness.py names` runs every name in it.
+  `COPY … TO` makes, appends to and overwrites Delta and Iceberg tables in a folder.
+- **G8, other engines append** through the node's Iceberg REST catalog: Spark 4, PyIceberg and
+  another Pondra. Their rows become the table's own, each commit once (invariants 118–121). The
+  owner's reason for not using Polaris or Unity: JVM services, and they'd be the truth, not Pondra.
+- **B3, live queries;** **E10, answers kept** (`WITH (cache = …)`); **temporary tables and views**;
+  **changes to attached lakes from any node** (invariants 122–126).
+- **The owner's questions after it:**
+  - Do other engines use Pondra's compute? Reading, no: they read the files. An append costs
+    the receiving node a read and a write of the appended rows (the price of row ids). Taking the
+    writer's files as they are, with ids by position, would be a design change: ask first.
+  - MERGE/DELETE into other engines' tables? Not yet: Pondra appends to Delta and Iceberg
+    (INSERT, and `COPY … (FORMAT delta | iceberg, APPEND | OVERWRITE)`), and refuses the rest by
+    name. Databases are G6, planned after the console round. Writing Delta's removes and deletion
+    vectors and Iceberg's overwrites and position deletes is within reach (Pondra reads all of
+    them), when the owner wants it.
+- **The owner's direction, 2026-09-29:** "total serverless and compute/storage separation":
+  other engines should read *and write* with their own compute. That is **ADR-029, proposed**
+  (G9 in the roadmap, in three phases). Its round is the owner's call: before or after the
+  console.
+  - It **builds on the first step's decisions** (ADR-001: files in place, never copied; ADR-002:
+    the streamhouse R1–R6 and the Fluss verdict; ADR-003: serverless, "your compute, the
+    leader's commit").
+  - It does not reopen them. The owner pointed out that a restated comparison with Flink, Fluss,
+    Spark and DuckDB had already been done at the start. **Before writing an ADR, read ADR-001 to
+    ADR-003 and cite them instead of re-deriving.**
+- **Found while designing ADR-029:** row ids are `(commit << 32) + n` and Kafka offsets `(segment
+  << 32) + row`, both 64-bit signed. At about 500 commits a second (a trickle on local disk),
+  offsets turn negative after about 50 days and ids repeat after about 100. It is a known limit,
+  fixed in ADR-029's phase 1 (blocks from a counter of their own).
+- **Found at the end of round 25,** by running the notebook on the wheel:
+  - a relatively named Delta or Iceberg folder couldn't be read back (invariant 127);
+  - a frame's notebook display had failed since 0.22.1 (invariant 128);
+  - on R2, PyIceberg's writes need its fsspec file IO.
+- **CI:** `v0.24.0` was released from e123acf (run #21 green on all five platforms). The Kafka
+  cache step moved to `actions/cache@v5` (Node 24). The linux-x64 build and the release job are
+  pinned to `ubuntu-24.04`, because `ubuntu-latest` becomes 26.04 on 2026-10-19; move them on
+  purpose, after a green run there.
+- **The cluster bench:** the owner runs it on `main` (v0.24.0) at 3 and then 6 nodes, as round
+  25's baseline, and again once round 25 is pushed.
 
 **R2 test buckets.** There are two:
 

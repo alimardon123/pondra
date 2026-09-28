@@ -23,7 +23,7 @@ on:
 
 jobs:
   publish:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04 # (pinned, as the build is: ubuntu-latest becomes 26.04 from 2026-10-19)
     environment: pypi # (PyPI's trusted publisher names it; Settings -> Environments can require an approval)
     permissions:
       actions: read # this commit's build run and its packages

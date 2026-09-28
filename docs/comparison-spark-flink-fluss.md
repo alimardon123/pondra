@@ -113,7 +113,7 @@ biggest open risk is scale-out, and only a multi-machine benchmark can retire it
 | Batch SQL on one machine (TPC-H) | ✓ from files: fastest at SF10 (38.0 s; DuckDB 39.8, Polars 42.8); at SF1 level with Polars' streaming engine (3.19 s vs 3.18) and ahead of DuckDB, Daft and Bodo | | | — | — |
 | AI agents and vectors | ✓ MCP server built in; `ai_complete`/`ai_embed` against any OpenAI-compatible endpoint; your own functions on an Arrow Flight server; exact vector search in SQL | AI functions on Databricks only | `ML_PREDICT`, `VECTOR_SEARCH`; Flink Agents (0.2) | MCP and vector columns planned | ✓ Agent Bricks, Genie |
 | Unstructured and multimodal | ✓ files in the lake (`files('…')`, `file_read`), `BINARY` with hashing and base64, `VARIANT`, `Float32[]` vectors — published as Delta arrays and Iceberg lists | — | — | blob and variant types planned | ✓ Databricks file types, `ai_query` |
-| Connectors & ecosystem | Kafka protocol in and out (any Kafka client, Debezium), Postgres, HTTP; Delta + Iceberg out, Iceberg REST catalog; files on S3/GCS/Azure/HTTPS, other engines' Delta and Iceberg tables and other Kafka clusters, read and written (round 23) | ✓ huge | ✓ huge | Flink/Spark connectors | ✓ Databricks |
+| Connectors & ecosystem | Kafka protocol in and out (any Kafka client, Debezium), Postgres, HTTP; Delta + Iceberg out, an Iceberg REST catalog that other engines append through (round 25); files on S3/GCS/Azure/HTTPS, other engines' Delta and Iceberg tables and other Kafka clusters, read and written (round 23) | ✓ huge | ✓ huge | Flink/Spark connectors | ✓ Databricks |
 | Operations & footprint | ✓ 1 binary, 44–49 MB idle, 0.02 s start | JVM cluster | JVM cluster + checkpoints | JVM + ZooKeeper + Flink tiering job | managed |
 | Governance & security | read / write / admin tokens (HTTP, Postgres, MCP); no TLS or per-table grants yet | via platforms | via platforms | SASL users (1.0); TLS planned | ✓ Unity Catalog |
 | Maturity | prototype | ✓ | ✓ | 1.0, a top-level Apache project | beta |
@@ -399,7 +399,7 @@ from third-party summit recaps; check them before relying on them.
 | Millisecond streaming inside the main engine | Spark Real-Time Mode, Lakehouse//RT | ✓ 5 ms change → another node, exactly-once |
 | Declarative, incremental pipelines | Spark declarative pipelines, Flink materialized tables, dynamic tables | ✓ views and tasks in SQL |
 | Kafka-compatible ingestion | Zerobus (reported), Fluss log agents | ✓ the Kafka protocol on every node (round 10) |
-| Open catalogs (the Iceberg REST catalog API) | Unity Catalog, Polaris, Snowflake | ✓ read-only REST catalog on every node (round 10) |
+| Open catalogs (the Iceberg REST catalog API) | Unity Catalog, Polaris, Snowflake | ✓ a REST catalog on every node (round 10), and other engines append through it: Spark 4, PyIceberg and another Pondra, tested (round 25). Polaris and Unity are JVM services other engines treat as the table's truth; here the node is the catalog, and an append becomes the table's own rows (row ids, views following) |
 | A VARIANT type | Spark, Flink, Delta, Iceberg v3 | JSON functions and `->` / `->>` (round 10); VARIANT when DataFusion has it |
 | Arrow-native clients (ADBC, Flight SQL), columnar logs | Dremio, InfluxDB 3, Fluss's Arrow log, Databricks ADBC | ✓ Arrow Flight and Flight SQL on every node; the log as a columnar stream with chosen columns (round 11) |
 | Petabyte tables: manifests, partitions, file skipping | Iceberg, Delta, Snowflake micro-partitions | ✓ per-file statistics, manifests, `partition_by` (round 11) |
@@ -469,7 +469,7 @@ In rough order: what closes the most ground per unit of work comes first.
 | **Types** | VARIANT (Spark, Flink, Delta, Iceberg v3) for semi-structured data | Round 10: JSON functions over string columns (`json_get`, `->>`). Next: DataFusion's variant type when it lands | Semi-structured events queried without a schema up front |
 | ~~Durable ack in ms on object storage~~ | Fluss's edge | **Done in rounds 8–9:** `--ack replicated`, 2–4 ms on R2; `--fsync`; 3 replicas tested | ✓ ack p50 2 ms on R2 |
 | ~~Kafka-protocol ingest~~ | How most event data travels | **Done in round 10:** producers (exactly-once when idempotent), Debezium, consumers, groups, SASL | ✓ ~0.7 M events/s via librdkafka on one box |
-| ~~Open catalogs~~ | Engines attach by URL | **Done in round 10:** the Iceberg REST catalog (read-only) | ✓ PyIceberg and DuckDB attach it |
+| ~~Open catalogs~~ | Engines attach by URL | **Done in round 10:** the Iceberg REST catalog (read-only); **round 25:** appends through it | ✓ PyIceberg and DuckDB attach it; Spark and PyIceberg append |
 | **Maturity** | Trust | Chaos tests on real clusters, fuzzing, long soak runs, versioned upgrades | Months of soak without data loss |
 
 Sources:

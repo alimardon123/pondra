@@ -1,10 +1,10 @@
-# Pondra: what's left, and in what order (after round 24)
+# Pondra: what's left, and in what order (after round 25)
 
 **Date:** 2026-09-28 · **Status:** proposed; the order in "The rounds" is what I recommend, the
 decisions in "What only you can decide" are yours · **Builds on:** ADR-002 to ADR-017,
 `prototype-status.md`, `comparison-spark-flink-fluss.md`
 
-**Progress (2026-09-28):** rounds 17 to 24 are done (ADR-018 to ADR-027).
+**Progress (2026-09-29):** rounds 17 to 25 are done (ADR-018 to ADR-028).
 
 - **Round 17** made Pondra install anywhere: a glibc 2.17 Linux binary, pip and npm packages
   (built, not published), a SQL shell, and both flaky tests fixed.
@@ -75,9 +75,8 @@ Still waiting:
 could bring deleted keys back, and an adding-up view could lose part of an UPDATE (every job of
 the round took its file for the table's first; invariant 93, `harness.py deal`).
 
-Two gaps the owner met in the shell go with round 25 (the table below): `UPDATE`/`DELETE`/`MERGE`
-on an attached lake from any node (they run only on that lake's own node today, while `INSERT`
-works from anywhere), and temporary tables (`CREATE TEMP TABLE` makes an ordinary table today).
+Two gaps the owner met in the shell went with round 25, and are closed: `UPDATE`/`DELETE`/`MERGE`
+on an attached lake from any node, and temporary tables.
 
 **Round 24** (ADR-027) made **SQL and Python one** (track H, H1–H6):
 
@@ -90,7 +89,32 @@ works from anywhere), and temporary tables (`CREATE TEMP TABLE` makes an ordinar
 - **Decorators** take a notebook's function as it is.
 - **Speed:** a warm `CALL` in 2.4 ms.
 
-Round 25 is next: the console, the server and databases attached.
+**Round 25** (ADR-028, the owner's split: the engine first):
+
+- **One vocabulary:** `read_*` / `write_*` in SQL, Python, PySpark and JavaScript, the tools' names
+  as fallbacks with the same answers; `COPY … TO` (and `write_delta`, `write_iceberg`) makes,
+  appends to or overwrites Delta and Iceberg tables in a folder.
+- **Other engines append to Pondra's tables** through its own Iceberg REST catalog: Spark 4,
+  PyIceberg and another Pondra, each commit once, the rows the table's own.
+- **Live queries** push an answer within milliseconds of a commit that changes it.
+- **Function answers reused** for a lifetime (`WITH (cache = '10 minutes')`).
+- **Temporary tables and views**, a session's own; changes to attached lakes from any node.
+
+Round 26 is next: the console and the server.
+
+**Proposed, 2026-09-29: anyone's compute, one catalog** (ADR-029, the owner's direction: "total
+serverless and compute/storage separation"). It takes two rules from the first step one step
+further, from Pondra's own processes and from other engines' reads to other engines' writes:
+ADR-001's "files in place, never copied" and ADR-003's "your compute, the leader's commit". Other
+engines would write Pondra's tables with their own compute, and Pondra would only commit:
+
+- files taken as written, with their row ids from each file's first id plus position (Iceberg v3's
+  row lineage, Delta's row tracking);
+- deletes, overwrites and upserts from Spark and PyIceberg;
+- the table's layout published for writers to follow;
+- views fed from the files.
+
+It is G9 below, in three phases. Its round is the owner's call.
 
 ## Where Pondra stands
 
@@ -193,7 +217,7 @@ Size: **S** = part of a round, **M** = about one round, **L** = more than one.
 |---|---|---|---|---|
 | B1 | Split a `pondra-core` library (lake, log, query) from the server | Everything below builds on it | M | The server is a thin layer over the library; every test still passes |
 | B2 | An in-process Python module: `pondra.open("s3://…/lake")`, answers as Arrow straight into pandas and Polars | The DuckDB experience, on a lake a cluster also uses | M | The same lake written by a cluster and read in a notebook with no server |
-| B3 | Live queries: `GET /live?sql=…` pushes a new answer whenever a commit touches the query's tables; Python and JS clients subscribe | Dashboards that keep themselves current (PGlite's lesson) | S–M | A dashboard updates within 50 ms of a write, locally |
+| B3 ✓ | Live queries: `GET /live?sql=…` pushes a new answer whenever a commit touches the query's tables; Python and JS clients subscribe | Dashboards that keep themselves current (PGlite's lesson) | S–M | A dashboard updates within 50 ms of a write, locally |
 | B4 | A browser Pondra, read-only: DataFusion in WebAssembly reading a per-commit snapshot of the lake (Parquet files and log segments) straight from the bucket | Viewers do the work; no node in the query path | L | A 1–10 GB lake queried in a browser, answers equal to a node's |
 | B5 | A browser or notebook as one more SPMD peer, working on its own data (MotherDuck's lesson) | Local data joined with the lake without uploading it | L | Later; after B2 and B4 |
 
@@ -228,8 +252,8 @@ a list of URLs? If it can, that gives a browser read path at no cost.
 | E5 ✓ | Schemas and three-part names, DDL in SQL (`DROP`, `CREATE TABLE … AS`, `CREATE VIEW`, `CREATE MATERIALIZED VIEW`) | What a database user types first (the owner, on Windows) | M | `harness.py schemas` (round 18) |
 | E6 | `UPDATE`, `DELETE` and `MERGE` on every table; system columns: a row id, when a row was written, its version | The owner's request; changing an append table's rows needs to know which row is which | M–L | Each on append and keyed tables, under streaming ingest, with views, the change feed, Kafka consumers, Delta and Iceberg readers following |
 | E7 | Materialized views filled from the rows already there | A view created on a table with data starts empty today | M | A view created mid-stream equals the query over the whole table |
-| E9 | Pondra's own names, the same everywhere (the owner, 2026-09-28: "in the end we will be independent"): reading is `read_parquet`, `read_csv`, `read_json`, `read_delta`, `read_iceberg` and `table(name)` in SQL and every client; writing is `write_parquet`, `write_csv`, `write_json`, `write_delta`, `write_iceberg` and `write_table(name)` (SQL: `COPY … TO`). The tools' names stay as fallbacks: Polars' `scan_*`/`sink_*`/`ndjson`, DuckDB's `delta_scan`/`iceberg_scan`, PySpark's `spark.read`/`df.write`. The docs lead with Pondra's names, the others in a column beside them | One vocabulary to learn; nothing breaks for someone arriving from Polars, PySpark or DuckDB | S–M | Each fallback equal to its standard name's answer; one table of every operation in SQL, frames, Spark and JavaScript, checked by a test |
-| E10 | Function results reused (from query.farm's HTTP caching for DuckDB's remote functions): `WITH (cache = '5 minutes')` on a function or table function, keyed by the function's version, its arguments and the caller, kept only when the call succeeded (an argument's distinct values per batch are already sent once: round 24) | An API or model called again for the same arguments costs a round trip each time | S–M | A second query within the lifetime makes no call; a changed function or another caller doesn't reuse it |
+| E9 ✓ | Pondra's own names, the same everywhere (the owner, 2026-09-28: "in the end we will be independent"): reading is `read_parquet`, `read_csv`, `read_json`, `read_delta`, `read_iceberg` and `table(name)` in SQL and every client; writing is `write_parquet`, `write_csv`, `write_json`, `write_delta`, `write_iceberg` and `write_table(name)` (SQL: `COPY … TO`). The tools' names stay as fallbacks: Polars' `scan_*`/`sink_*`/`ndjson`, DuckDB's `delta_scan`/`iceberg_scan`, PySpark's `spark.read`/`df.write`. The docs lead with Pondra's names, the others in a column beside them | One vocabulary to learn; nothing breaks for someone arriving from Polars, PySpark or DuckDB | S–M | Each fallback equal to its standard name's answer; one table of every operation in SQL, frames, Spark and JavaScript, checked by a test |
+| E10 ✓ | Function results reused (from query.farm's HTTP caching for DuckDB's remote functions): `WITH (cache = '5 minutes')` on a function or table function, keyed by the function's version, its arguments and the caller, kept only when the call succeeded (an argument's distinct values per batch are already sent once: round 24) | An API or model called again for the same arguments costs a round trip each time | S–M | A second query within the lifetime makes no call; a changed function or another caller doesn't reuse it |
 | E8 | The rest of `ALTER TABLE`: rename a table, rename and drop columns, widen a column's type | The owner's third Windows session. Files and the log match columns by name, so a renamed column would lose its values and a dropped one come back with a new column of its name: every column needs an id that the files carry (Iceberg's field ids) | M | Each under streaming ingest, with views and Delta/Iceberg readers following; old files read by id |
 
 ### F. Depth, ordered by what the tracks above show
@@ -271,7 +295,8 @@ table's slices.
 | G5 | Kafka both ways: a table fed from an existing Kafka cluster (exactly-once, offsets in the catalog), and a table's or view's changes produced to one | Joining a company's streams | M | librdkafka's cluster in, out; a restart in each |
 | G6 | Databases: `ATTACH 'postgres://…'` / MySQL as a database to read (filters pushed down) and write; their changes streamed in natively (logical replication, binlog) | CDC without Debezium | L | Tables equal the source's under changes; a restart |
 | G7 | Sinks: a materialized view or task kept in step in an outside target (Kafka, Postgres upsert, files) | The other half of ETL | M | Exactly-once through failovers |
-| G8 | Outside engines write Pondra's tables through its Iceberg REST catalog (the owner, 2026-09-28: others should write too; Polaris and Unity Catalog are JVM services and would have to be the source of truth, so Pondra plays their part itself): appends to append tables first, committed by the leader as its own (schema checked, exactly-once, views and the change feed following); keyed tables later (equality deletes as upserts); Delta through catalog-managed commits when Delta has them. Never by writing the published files behind Pondra's back: its catalog is the truth, and a commit it didn't see would break views, row ids and the next publish | Spark, Trino, Flink, PyIceberg, Snowflake and DuckDB write through a REST catalog, as with Polaris and Unity | M | Spark and PyIceberg append; Pondra's views, change feed and Delta copy follow; a retried commit applied once |
+| G8 ✓ (appends) | Outside engines write Pondra's tables through its Iceberg REST catalog (the owner, 2026-09-28: others should write too; Polaris and Unity Catalog are JVM services and would have to be the source of truth, so Pondra plays their part itself): appends to append tables first, committed by the leader as its own (schema checked, exactly-once, views and the change feed following); keyed tables later (equality deletes as upserts); Delta through catalog-managed commits when Delta has them. Never by writing the published files behind Pondra's back: its catalog is the truth, and a commit it didn't see would break views, row ids and the next publish | Spark, Trino, Flink, PyIceberg, Snowflake and DuckDB write through a REST catalog, as with Polaris and Unity | M | Spark and PyIceberg append; Pondra's views, change feed and Delta copy follow; a retried commit applied once |
+| G9 | Other engines' compute for their writes (ADR-029, proposed). Files are taken as written: the leader records them and reads only their footers. Each file's rows get ids from its first id plus position (Iceberg v3's row lineage, Delta's row tracking). Deletes are kept as positions, and Pondra publishes its own deletes the same way (purges become maintenance). Keyed tables take upserts. Partition spec, sort order and key are published for writers. Views are fed from the files. The Iceberg REST catalog becomes complete (create, alter, transactions, vended credentials, scan planning). Also fixes the row-id and Kafka-offset limits (ADR-029 decision 11) | Batch writes cost Pondra nothing but the commit, which makes compute and storage separate | L (3 phases) | An outside 1 GB append costs the node its footers and one commit; Spark's `DELETE`/`MERGE` equal Pondra's; views and the change feed follow |
 
 ### H. SQL and Python as one (the owner, 2026-09-28; ADR-027)
 
@@ -283,7 +308,7 @@ table's slices.
 | H4 ✓ | Procedures without limits: `pondra.sql` as the caller, notices back, secrets, no answer needed | "Send an email from a SQL cell" | S–M | Mail to a local SMTP server from HTTP, psql, MCP, JavaScript and the shell (done) |
 | H5 ✓ | Decorators that take a notebook's function as it is (imports, helpers, constants) | Python users write Python, not wrappers | S–M | The same function runs in the notebook and on the node (done); PySpark's `udf` too |
 | H6 ✓ | Schedules (`CREATE TASK … SCHEDULE`) and the run log (`pondra.runs`) | Jobs that run by themselves, and what they did | M | Every tick's writes once through a failover (done) |
-| H7 | Notebooks in the catalog: `.ipynb` in the lake, run as a procedure, on a schedule | The platform on top | M–L | Later: after the console (round 25) |
+| H7 | Notebooks in the catalog: `.ipynb` in the lake, run as a procedure, on a schedule | The platform on top | M–L | Later: after the console (round 26) |
 
 ## The rounds
 
@@ -300,12 +325,13 @@ simulated R2 and real R2, an ADR, and a bundle.
 | 22 ✓ | Frames and procedures (done: ADR-023) | the DataFrame API (`dataframe-api.md`), the owner's macros and procedures | `pondra.frame` and `pondra.spark` over SQL, equal to Polars and PySpark; SQL and Python mixed every way; macros and procedures (SQL, Python) in the catalog |
 | 23 ✓ | Read and write anything (done: ADR-026) | G1–G5, secrets; D1 set up and measured | files, Delta and Iceberg anywhere read, joined and written, spread; GCS and Azure lakes; Kafka clusters in and out; `CREATE SECRET` |
 | 24 ✓ | SQL and Python as one (done: ADR-027) | H1–H6 | `CREATE FUNCTION` in SQL and Python; procedures that send mail from a SQL cell; decorators that take a notebook's function; schedules and a run log |
-| 25 | Use it from anything, and the server (ADR-028) | E9 first, A4, B3, E1, E2, E10, G6, G8, the server, TEMP tables, changes to attached lakes | a console at `/` with SQL and Python cells; live queries; dbt and Power BI; a folder of lakes served as databases (`--server`); Postgres and MySQL attached |
-| 26 | Safe to share | E3 | TLS, mutual TLS between nodes, users and grants down to a table, an audit log, quotas |
-| 27 | Production-ready SQL and frames | D1 to its end, D2, TPC-DS | sqllogictest passing (every exception named), TPC-DS's 99 queries == DuckDB, random queries 1 node == 3 == DuckDB, Polars and PySpark coverage published |
-| 28 | Scale, proven (ADR-029: burst) | C1 in one data centre, C2, C4, burst functions | 1 → 3 → 6 machines in one zone; SF100 against Spark; a 24-hour soak; serverless bursts for a big query |
-| 29 | In-process and in the browser | B1, B2, B4 | `pondra.open(…)` without a server; a lake queried in a web page (WebAssembly) |
-| 30+ | Depth | G7, H7, E4, F by evidence | sinks, notebooks in the catalog, streaming depth, what users show matters |
+| 25 ✓ | One vocabulary, open writes, live answers (done: ADR-028) | E9, E10, G8, B3, temporary tables, changes to attached lakes | `read_*`/`write_*` everywhere (the tools' names as fallbacks); Spark and PyIceberg append to Pondra's tables through its Iceberg catalog; live queries; function results reused; `CREATE TEMP TABLE`; `UPDATE`/`MERGE` on attached lakes from any node |
+| 26 | The console and the server (ADR-030) | A4, E1, E2, the server | a console at `/` with SQL and Python cells; a folder of lakes served as databases (`--server`); dbt and Power BI |
+| 27 | Safe to share | E3, G6 | TLS, mutual TLS between nodes, users and grants down to a table, an audit log, quotas; Postgres and MySQL attached |
+| 28 | Production-ready SQL and frames | D1 to its end, D2, TPC-DS | sqllogictest passing (every exception named), TPC-DS's 99 queries == DuckDB, random queries 1 node == 3 == DuckDB, Polars and PySpark coverage published |
+| 29 | Scale, proven (an ADR of its own: burst) | C1 in one data centre, C2, C4, burst functions | 1 → 3 → 6 machines in one zone; SF100 against Spark; a 24-hour soak; serverless bursts for a big query |
+| 30 | In-process and in the browser | B1, B2, B4 | `pondra.open(…)` without a server; a lake queried in a web page (WebAssembly) |
+| 31+ | Depth | G7, H7, E4, F by evidence | sinks, notebooks in the catalog, streaming depth, what users show matters |
 
 **Every round, whatever its theme** (the owner's rules: nothing half-done, performance only goes
 up, scale-out is the point):
@@ -331,11 +357,14 @@ Why this order:
   mail, APIs and databases.
 - **SQL and Python as one comes before the console** (round 24) because the console's Python
   cells, schedules and notebooks run on its workers and run log.
-- **The console and the server come together** (round 25): a folder of lakes served as databases
+- **The engine before the console** (round 25, the owner's choice): the names the console shows,
+  the writes other tools make and the live answers it draws all come first, and each is testable
+  here without a browser or Windows.
+- **The console and the server come together** (round 26): a folder of lakes served as databases
   is what the console lists, and dbt and BI tools connect to.
-- **Security right after** (round 26): a server others connect to needs users, grants and TLS
+- **Security right after** (round 27): a server others connect to needs users, grants and TLS
   before anyone else's data goes in.
-- **Conformance runs every round and finishes in round 27**, before the scale runs, so what is
+- **Conformance runs every round and finishes in round 28**, before the scale runs, so what is
   proven at scale is the finished SQL.
 - **The in-process library and the browser come last** of these: the library split is the
   biggest change, and everything above makes what it exposes settle first.
@@ -357,6 +386,10 @@ Why this order:
    publishes the first release (0.22.1, as npm refused 0.22.0's paths), then each package's
    Trusted Publisher set to `release.yml` and the token removed. Tag `v0.22.1` next. winget and
    Homebrew when users ask. crates.io can wait (`publish = false`).
+
+4. **When other engines' compute comes (ADR-029).** Phase 1 (appends as written) can go before
+   the console (round 26) or right after it, with phase 2 (deletes, overwrites, upserts) in the
+   round after that.
 
 ## What not to do yet
 

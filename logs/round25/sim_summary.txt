@@ -1,0 +1,21 @@
+01:56:41 start writes
+01:57:59 writes exit=0
+01:57:59 start temps
+01:58:15 temps exit=0
+01:58:15 start across
+01:59:11 across exit=1
+01:59:11 start live
+01:59:22 live exit=0
+01:59:22 start names
+01:59:32 names exit=0
+01:59:32 start answers
+01:59:41 answers exit=0
+01:59:41 start schemas
+02:01:09 schemas exit=0
+02:01:09 start failover
+02:02:10 failover exit=0
+02:02:10 start users
+02:02:40 users exit=0
+02:02:40 start crash
+02:15:57 crash exit=0
+02:15:57 SIM_DONE

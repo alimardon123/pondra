@@ -1,0 +1,12 @@
+{
+ "gcs: two nodes on a lake there, rows from both, tiered to Parquet, read on both": true,
+ "gcs: the leader killed, the other leads (a put-if-absent term there) with every row": true,
+ "gcs: a file beside the lake, changed under its name: read as it is now": true,
+ "gcs: COPY … TO into the lake: refused": true,
+ "gcs: COPY … TO the store with a secret, read back by its folders": true,
+ "azure: two nodes on a lake there, rows from both, tiered to Parquet, read on both": true,
+ "azure: the leader killed, the other leads (a put-if-absent term there) with every row": true,
+ "azure: a file beside the lake, changed under its name: read as it is now": true,
+ "azure: COPY … TO into the lake: refused": true,
+ "azure: COPY … TO the store with a secret, read back by its folders": true
+}

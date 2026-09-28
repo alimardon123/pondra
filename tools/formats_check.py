@@ -32,6 +32,50 @@ def session(root):
              .config("spark.sql.shuffle.partitions", "2").config("spark.ui.enabled", "false").getOrCreate())
 
 
+def spark_commits(url):
+    """Spark (Iceberg 1.10) appends to a Pondra table through Pondra's Iceberg REST catalog
+    (`--commit`, ADR-028): SQL's INSERT and DataFrame.writeTo().append(); then a DELETE and an ALTER
+    TABLE, each refused by name. Prints what Spark read back and what it was told."""
+    os.environ["TZ"] = "UTC"
+    time.tzset()
+    from pyspark.sql import SparkSession
+    spark = (SparkSession.builder.master("local[2]").appName("pondra_commits")
+             .config("spark.jars.packages", "org.apache.iceberg:iceberg-spark-runtime-4.0_2.13:1.10.0")
+             .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
+             .config("spark.sql.catalog.pondra", "org.apache.iceberg.spark.SparkCatalog").config("spark.sql.catalog.pondra.type", "rest")
+             .config("spark.sql.catalog.pondra.uri", url).config("spark.sql.session.timeZone", "UTC").config("spark.ui.enabled", "false").getOrCreate())
+    spark.sparkContext.setLogLevel("ERROR")
+    spark.sql("INSERT INTO pondra.default.spark_in VALUES (1, 'a', TIMESTAMP '2026-09-28 10:00:00'), (2, NULL, NULL)")
+    spark.createDataFrame([(3, "c", None)], "id BIGINT, name STRING, ts TIMESTAMP").writeTo("pondra.default.spark_in").append()
+    out = {"rows": [[plain(v) for v in r] for r in spark.sql("SELECT id, name, ts FROM pondra.default.spark_in ORDER BY id").collect()]}
+    for name, stmt in (("delete", "DELETE FROM pondra.default.spark_in WHERE id = 1"), ("alter", "ALTER TABLE pondra.default.spark_in ADD COLUMN x INT")):
+        try:
+            spark.sql(stmt)
+            out[name] = ""
+        except Exception as e:  # noqa: BLE001 (what Spark was told)
+            out[name] = str(e)[:2000]
+    print(json.dumps(out, default=str))
+    spark.stop()
+
+
+def commits(con, spark):
+    """Spark appends to Pondra's tables through its Iceberg REST catalog (`spark_commits`): the rows
+    are the table's, each with its row id; a DELETE and an ALTER TABLE from Spark refused by name."""
+    con.sql("CREATE TABLE spark_in (id BIGINT, name VARCHAR, ts TIMESTAMP) WITH (publish = 'iceberg')")
+    run = subprocess.run([spark, os.path.abspath(__file__), "--commit", con.url], capture_output=True, text=True, env={**os.environ, "TZ": "UTC"}, timeout=1200)
+    try:
+        theirs = json.loads(run.stdout.strip().splitlines()[-1])
+    except (IndexError, json.JSONDecodeError):
+        theirs = {"rows": [], "delete": "", "alter": "", "why": run.stderr[-1500:]}
+    ours = con.sql("SELECT id, name, ts, _row_id FROM spark_in ORDER BY id").rows()
+    want = [[1, "a", "2026-09-28 10:00:00"], [2, None, None], [3, "c", None]]
+    ok = [[r["id"], r.get("name"), plain(r.get("ts"))] for r in ours] == want == theirs["rows"] and all(r.get("_row_id") is not None for r in ours)
+    refused = "go through Pondra's SQL" in theirs["delete"] and "ALTER TABLE" in theirs["alter"]
+    print(json.dumps({"table": "Spark appends through Pondra's Iceberg REST catalog (INSERT, writeTo().append()): the table's rows, with row ids", "equal": ok, **({} if ok else {"ours": ours, "theirs": theirs})}, default=str), flush=True)
+    print(json.dumps({"table": "…a DELETE and an ALTER TABLE from Spark: refused by name", "equal": refused, **({} if refused else {"delete": theirs["delete"][:500], "alter": theirs["alter"][:500]})}), flush=True)
+    return {"commits:spark": ok, "commits:refused": refused}
+
+
 def read_spark(tables):
     """What Spark reads of these tables now (`--read`): name -> its columns and rows."""
     spark = session(tempfile.mkdtemp())
@@ -182,6 +226,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--make", help=argparse.SUPPRESS)  # (run by --spark's Python: write Spark's tables here)
     ap.add_argument("--read", help=argparse.SUPPRESS)  # (run by --spark's Python: read these tables)
+    ap.add_argument("--commit", help=argparse.SUPPRESS)  # (run by --spark's Python: append through this node's catalog)
     ap.add_argument("--spark", help="a Python with PySpark 4 and delta-spark: Spark's tables too")
     ap.add_argument("--port", type=int, default=8860)
     ap.add_argument("--only", default="")
@@ -191,6 +236,8 @@ def main():
         return make_spark(a.make)
     if a.read:
         return read_spark(json.loads(a.read))
+    if a.commit:
+        return spark_commits(a.commit)
     sys.path.insert(0, os.path.join(HERE, "..", "python"))
     os.environ.setdefault("PONDRA_BIN", os.path.join(HERE, "..", "target", "release", "pondra"))
     import pondra
@@ -234,6 +281,8 @@ def main():
             checks.update(python_names(con, expected))
         if not only or "insert" in only:
             checks.update(inserts(con, root, expected, a.spark, a.port + 7))
+        if a.spark and (not only or "commits" in only):
+            checks.update(commits(con, a.spark))
         if a.spark and (not only or "spread" in only):
             checks.update(spread(root, expected, a.port + 10))
     finally:

@@ -300,7 +300,18 @@ pub fn full(dir: &str) -> Result<String> {
         true => dir.trim_end_matches('/').to_string(),
         false => match std::fs::canonicalize(dir) {
             Ok(p) => p.to_string_lossy().trim_start_matches(r"\\?\").to_string(), // (as `store::open_store` has it)
-            Err(_) => std::path::absolute(dir)?.to_string_lossy().to_string(), // (not there yet)
+            Err(_) => {
+                // Not there yet: absolute, with `.` and `..` taken out (object stores refuse them).
+                let mut p = std::path::PathBuf::new();
+                for c in std::path::absolute(dir)?.components() {
+                    match c {
+                        std::path::Component::ParentDir => drop(p.pop()),
+                        std::path::Component::CurDir => {}
+                        c => p.push(c),
+                    }
+                }
+                p.to_string_lossy().to_string()
+            }
         },
     })
 }

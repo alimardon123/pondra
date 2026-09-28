@@ -108,6 +108,7 @@ pub fn router(app: App) -> Router {
         .route("/tier", post(tier_now))
         .route("/cluster/ddl", post(ddl))
         .route("/cluster/change", post(change))
+        .route("/cluster/iceberg", post(|State(app): State<App>, Json(c): Json<crate::iceberg::Commit>| async move { Ok::<_, E>(Json(app.record_iceberg(c).await?)) }))
         .route_layer(middleware::from_fn_with_state(app.clone(), to_leader));
     Router::new()
         .merge(leader_only)
@@ -119,6 +120,8 @@ pub fn router(app: App) -> Router {
         .route("/files/{*path}", put(put_file).get(get_file))
         .route("/lookup/{name}/{key}", get(lookup))
         .route("/watch/{name}", get(watch))
+        .route("/live", get(crate::live::live).post(crate::live::live))
+        .route("/sessions/{id}", axum::routing::delete(|Path(id): Path<String>| async move { Json(j!({"ended": crate::temp::end(&id)})) }))
         .route("/functions", get(list_functions))
         .route("/routines", get(|State(app): State<App>| async move { Ok::<_, E>(Json(j!(*crate::routines::listed(&app.lake).await?))) }))
         .route("/secrets/{name}", get(secret))
@@ -339,7 +342,7 @@ impl App {
         use crate::metrics::{add, QUERIES, QUERY_ERRORS, QUERY_US, SPREAD};
         let start = std::time::Instant::now();
         let run = async {
-            let here_only = spread == Some("0") || crate::query::sent() || crate::routines::pinned(&self.lake, query).await; // (rows sent with a request are here only; so is a Python table function's call)
+            let here_only = spread == Some("0") || crate::query::sent() || crate::temp::mentioned(query) || crate::routines::pinned(&self.lake, query).await; // (rows sent with a request are here only; so are the session's temporary tables, and a Python table function's call)
             let nodes = if here_only { vec![] } else { self.cluster.nodes() };
             match crate::spmd::query(&self.lake, &nodes, &self.cluster.addr, query, spread == Some("1")).await {
                 Ok(Some(batches)) => {
@@ -398,6 +401,14 @@ impl App {
         }
         let _guard = self.lock.lock().await;
         crate::write::record(&self.lake, f, self.seq.as_deref()).await
+    }
+
+    /// Another engine's append (`iceberg::update`), recorded by the leader under the lake's lock.
+    pub async fn record_iceberg(&self, c: crate::iceberg::Commit) -> anyhow::Result<Value> {
+        let Some(seq) = &self.seq else { return crate::write::post(&self.cluster.leader.addr, &crate::write::Request::Iceberg(Box::new(c))).await };
+        let _guard = self.lock.lock().await;
+        let nodes = if self.cluster.nodes().is_empty() { vec![self.cluster.addr.clone()] } else { self.cluster.nodes() };
+        crate::iceberg::record(&self.lake, seq, c, &nodes, &self.cluster.addr).await
     }
 
     /// Where this node gets commit numbers (`log::To::reserve`): its own sequencer, or the leader's.
@@ -479,9 +490,9 @@ impl App {
                     purged.push(k[2..].to_string());
                 }
             }
-        }
-        if !purged.is_empty() {
-            crate::delta::publish_all(&self.lake).await?;
+            if !purged.is_empty() {
+                crate::delta::publish_all(&self.lake).await?; // (publishing happens under the lock: `iceberg::record`)
+            }
         }
         self.lake.cat.checkpoint().await?;
         Ok(j!({"checkpoint": true, "rows_tiered": rows, "rewritten": purged}))
@@ -592,10 +603,11 @@ async fn create_view(State(app): State<App>, Path(name): Path<String>, Query(opt
 }
 
 /// An UPDATE, DELETE or MERGE a follower's SQL asked for (`change.rs`): `[sql, job]`.
-async fn change(State(app): State<App>, Json((sql, job)): Json<(String, String)>) -> Result<Json<Value>, E> {
+async fn change(State(app): State<App>, Json((sql, job, sent)): Json<(String, String, crate::change::Sent)>) -> Result<Json<Value>, E> {
     let seq = app.seq.as_ref().ok_or_else(|| anyhow::anyhow!("not the leader"))?;
     let _guard = app.lock.lock().await;
-    Ok(Json(crate::change::run(&app.lake, seq, &sql, &job).await?))
+    let sent = Arc::new(crate::change::unpack(&sent)?); // (what it reads that this node can't: `change::for_leader`)
+    Ok(Json(crate::query::SENT.scope(sent, crate::change::run(&app.lake, seq, &sql, &job)).await?))
 }
 
 /// A `CREATE`/`DROP` of a schema, view or table that a follower's SQL asked for (`ddl.rs`).
@@ -675,7 +687,8 @@ fn owner(headers: &axum::http::HeaderMap) -> bool {
 /// was sent may be answered from `Results`.
 async fn sql(State(app): State<App>, Query(p): Query<SqlParams>, role: axum::Extension<crate::auth::Role>, headers: axum::http::HeaderMap, body: Bytes) -> Response {
     let files = owner(&headers); // (the program that started this node: its files, and URLs no secret covers)
-    let (out, heard) = crate::routines::with_notices(crate::ext::scope(files, sql_as(app, p, role, headers, body))).await;
+    let session = crate::temp::of(&headers); // (its temporary tables: `temp.rs`)
+    let (out, heard) = crate::routines::with_notices(crate::temp::SESSION.scope(session, crate::ext::scope(files, sql_as(app, p, role, headers, body)))).await;
     let mut r = out.unwrap_or_else(IntoResponse::into_response);
     if let Some(h) = notices(&heard) {
         r.headers_mut().insert("x-pondra-notices", h);
@@ -750,7 +763,7 @@ fn content_type(p: &SqlParams) -> &'static str {
 async fn query(app: &App, p: &SqlParams, query: &str, files: bool) -> anyhow::Result<Response> {
     let format = p.format.as_deref().unwrap_or("json");
     let respond = |body: bytes::Bytes| ([("content-type", content_type(p))], body).into_response();
-    if format == "json" {
+    if format == "json" && !crate::temp::mentioned(query) {
         if let Some(body) = crate::serve::point_sql(&app.lake, query).await? {
             return Ok(respond(body.into())); // a key lookup: no planning
         }
@@ -759,6 +772,7 @@ async fn query(app: &App, p: &SqlParams, query: &str, files: bool) -> anyhow::Re
     // or may read a file on this machine).
     let q = query.to_lowercase();
     let volatile = files || !crate::ext::names(query).is_empty() || ["now()", "random(", "current_", "uuid(", "explain", "pondra.runs", "pondra.tasks"].iter().any(|f| q.contains(f)) // (files outside the lake change on their own)
+        || crate::temp::mentioned(query) // (the session's temporary tables change without a commit)
         || crate::routines::volatile(&app.lake, query).await; // (a Python function may answer differently each time)
     let Some(version) = app.lake.version_for(query).await.filter(|_| !volatile) else { return Ok(respond(run_sql(app, p, query, files).await?)) };
     let key = format!("{format}|{}|{query}", p.spread.as_deref().unwrap_or(""));
@@ -797,7 +811,7 @@ async fn run_sql(app: &App, p: &SqlParams, query: &str, files: bool) -> anyhow::
 
 /// Rows as `?format=` asks: JSON, a text table, or Arrow IPC (straight into pandas, Polars and
 /// DuckDB, no JSON parsing).
-fn render(batches: &[RecordBatch], format: Option<&str>) -> anyhow::Result<bytes::Bytes> {
+pub fn render(batches: &[RecordBatch], format: Option<&str>) -> anyhow::Result<bytes::Bytes> {
     Ok(bytes::Bytes::from(match format {
         Some("table") => pretty_format_batches(batches)?.to_string().into_bytes(),
         Some("arrow") => crate::query::ipc(batches)?,
@@ -864,7 +878,8 @@ async fn stats(State(app): State<App>) -> Json<Value> {
     let c = &app.cluster;
     let role = if c.reader { "reader" } else if app.seq.is_some() { "leader" } else { "follower" };
     let mut s = j!({"role": role, "leader": c.leader.addr, "term": c.leader.n, "nodes": c.nodes(),
-                    "hwm": *app.lake.hwm.borrow(), "shard_runs": c.shard_runs.load(std::sync::atomic::Ordering::Relaxed), "python_workers": crate::python::workers()});
+                    "hwm": *app.lake.hwm.borrow(), "shard_runs": c.shard_runs.load(std::sync::atomic::Ordering::Relaxed), "python_workers": crate::python::workers(),
+                    "live_queries": crate::live::OPEN.load(std::sync::atomic::Ordering::Relaxed)});
     if let Some(seq) = &app.seq {
         s["untiered_rows"] = j!(app.lake.backlog.load(std::sync::atomic::Ordering::Relaxed));
         let mut ms = seq.commit_ms.lock().unwrap().clone();

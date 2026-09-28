@@ -17,7 +17,7 @@ Anyone with the binary and credentials for the bucket can use it in one of three
 |---|---|---|---|---|
 | **Join**: `pondra serve --dir …` (add `--reader` to only read) | The catalog in memory, kept current by the leader's commit stream; hot objects on the local SSD | Every committed write, milliseconds after the ack | Yes (`--reader`: no) | A running process |
 | **Serverless**: `pondra sql --dir … "…"` | Opens the catalog in the bucket, reads the log tail and Parquet directly | Every write already in the bucket (every acknowledged write, in the default `--ack durable` mode) | `CREATE TABLE`, `INSERT`, `UPDATE`, `DELETE`: this machine does the work. The leader records it: over HTTP, through the bucket inbox if it can't be reached (`inbox/`), or this process leads for a moment if nobody does | Opening the catalog: ~20 sequential requests (30 ms on local disk, 3–6 s on R2 from this sandbox) |
-| **Other engines**, through Delta Lake or Iceberg | The table's `_delta_log/` or `metadata/`, if the table publishes it — directly, or through a node's Iceberg REST catalog (`http://node:8080`, namespace `default`) | The table as of the last tiering round | No | Nothing extra for Pondra, beyond the publishing itself |
+| **Other engines**, through Delta Lake or Iceberg | The table's `_delta_log/` or `metadata/`, if the table publishes it — directly, or through a node's Iceberg REST catalog (`http://node:8080`, namespace `default`) | The table as of the last tiering round | Appends to an append table publishing Iceberg, through the REST catalog (ADR-028): the node takes the files a commit adds and makes them the table's own rows | Nothing extra for reading; an append is read and written once more, as a bulk INSERT is |
 | **Kafka clients**, through a node's `--kafka` port | A topic per table: produce appends through the log, fetch reads the log | Every committed write | Yes | A running node |
 | **Arrow Flight / ADBC clients**, through a node's `--flight` port | Flight SQL statements; `DoPut` appends through the log; `DoGet` reads SQL results or a table's log (chosen columns) | Every committed write | Yes | A running node |
 
@@ -62,11 +62,13 @@ Turning a format off deletes its metadata, so nobody reads a stale copy.
     ├── _delta_log/             only if the table publishes Delta
     │   ├── 00000000000000000000.json … 00000000000000000010.checkpoint.parquet
     │   └── _last_checkpoint
-    └── metadata/               only if the table publishes Iceberg (format v2)
-        ├── v1.metadata.json …  one per version
-        ├── snap-<N>-<uuid>.avro   manifest lists
-        ├── <uuid>-m0.avro      manifests
-        └── version-hint.text   the newest version
+    ├── metadata/               only if the table publishes Iceberg (format v2)
+    │   ├── v1.metadata.json …  one per version
+    │   ├── snap-<N>-<uuid>.avro   manifest lists
+    │   ├── <uuid>-m0.avro      manifests
+    │   └── version-hint.text   the newest version
+    └── data/                   only while another engine's append is in flight (ADR-028): its
+                                Parquet files, before the node reads them into the table
 ```
 
 | Path | Format | Who reads it | Changes? |
@@ -80,7 +82,8 @@ Turning a format off deletes its metadata, so nobody reads a stale copy.
 | `files/` | whatever was put there (images, PDFs, audio, models) | anyone | immutable: a path that exists is never overwritten |
 | `data/<table>/_manifests/` | zstd JSON: manifests (a list of `DataFile`s) and manifest lists (each manifest's path, files, rows, bytes, column ranges) | Pondra | immutable; a replaced list and merged manifests go to the table's garbage, deleted after `--retain-secs` |
 | `data/<table>/_delta_log/` | Delta Lake protocol 1/2: JSON commits, Parquet checkpoints | Delta readers | append-only; `_last_checkpoint` rewritten; last 1,000 versions kept |
-| `data/<table>/metadata/` | Iceberg v2: metadata JSON, Avro manifest lists and manifests — one manifest per Pondra manifest, written once and named by every later snapshot | Iceberg readers | append-only; `version-hint.text` rewritten; last 100 snapshots kept |
+| `data/<table>/metadata/` | Iceberg v2: metadata JSON, Avro manifest lists and manifests — one manifest per Pondra manifest, written once and named by every later snapshot. A version's number (`v<N>`, its sequence number) is its snapshot id too, unless another engine's commit named it: then its snapshot id is that engine's | Iceberg readers | append-only; `version-hint.text` rewritten; last 100 snapshots kept. An outside writer's own manifest list and manifests land here too, and go with the table's replaced files after `--retain-secs` |
+| `data/<table>/data/` | Parquet: an outside writer's files for its append (Iceberg's default data folder) | the node taking the commit | deleted once the append is recorded; a commit that never came, after a day (orphans) |
 
 Not in the lake, on each node:
 
@@ -232,7 +235,15 @@ connector jars can't be downloaded in this sandbox.
 
 Rules for outside readers:
 
-- **Read-only.** Pondra owns the folder; write through Pondra (any node, or `pondra sql`).
+- **Write through Pondra.** Pondra owns the folder: write through a node or `pondra sql`, or
+  append through the node's Iceberg REST catalog (Spark, PyIceberg, Trino). Never commit to the
+  metadata folder behind its back: its catalog is the truth, and a version it didn't write would
+  be overwritten by its next.
+  - On R2, PyIceberg writes its files with its fsspec file IO (`"py-io-impl":
+    "pyiceberg.io.fsspec.FsspecFileIO"`, `pip install s3fs`); pyarrow's multipart upload is
+    refused there.
+  - Today the node reads an appended file's rows and writes them into the table again.
+    ADR-029 (proposed) would take the files as written and only commit them.
 - **Latest version, plus a little history:** 100 Delta versions and 100 Iceberg snapshots are
   listed. Files replaced by compaction are deleted after `--retain-secs` (60 s by default), so
   time travel further back than that fails.

@@ -1,0 +1,12 @@
+{
+ "answers": {
+  "a second query within the lifetime calls nothing (100 calls, then 0)": true,
+  "a replaced function never reuses an old answer": true,
+  "past its lifetime, it calls again": true,
+  "a table function's rows too (by its arguments)": true,
+  "a failed call isn't kept": true,
+  "refused by name: on a SQL function, a procedure, a schedule": true,
+  "@db.function(cache=\u2026), in SQL and frames": true
+ },
+ "ok": true
+}

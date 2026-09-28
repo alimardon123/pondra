@@ -23,6 +23,8 @@ with pondra.local(lake, python=arrow) as db:
     # a frame, and SQL naming it
     frame = db.table("t").group_by("v").agg(pondra.len().alias("n")).sort("v")
     assert db.sql("SELECT * FROM frame WHERE n > $k", k=1).rows() == [{"v": "a", "n": 2}]
+    shown = frame._repr_html_()  # (what a notebook shows; `all` in frame.py is Polars' all(), not Python's)
+    assert shown and "<" in shown and "a" in shown, shown
     db.sql("CREATE PROCEDURE count_v(v VARCHAR) LANGUAGE sql AS $$ SELECT count(*) AS n FROM t WHERE v = $v $$")
     assert db.call("count_v", "b").rows() == [{"n": 1}]
     if arrow:  # a Python procedure (it runs in this very Python, beside the node)

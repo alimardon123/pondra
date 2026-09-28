@@ -27,6 +27,9 @@ pub struct Log {
 }
 
 impl Log {
+    /// The table's files, as their add actions.
+    pub fn live(&self) -> impl Iterator<Item = &Value> { self.files.values() }
+
     /// One action. A checkpoint's removes are tombstones for cleanup: its adds are the table.
     fn apply(&mut self, a: &Value, checkpoint: bool) {
         if let Some(p) = a.get("protocol") {
@@ -59,7 +62,8 @@ static SEEN: LazyLock<Mutex<lru::LruCache<String, Arc<Log>>>> = LazyLock::new(||
 
 /// The table at `root` (its latest version, or `version`), as a table of files.
 pub async fn resolve(lake: &Lake, root: &str, version: Option<i64>) -> Result<TableMeta> {
-    let root = root.trim_end_matches('/');
+    let root = crate::ddl::full(root)?; // (a folder named relatively: from where the node runs)
+    let root = root.as_str();
     let log = replay(lake, root, version).await?;
     features(root, &log.protocol)?;
     let (columns, partitions, mapped) = schema(root, &log.metadata)?;

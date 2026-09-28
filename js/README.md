@@ -12,8 +12,16 @@ await db.append("events", [{ user: "ann", amount: 5 }]); // exactly once
 console.log(await db.sql("SELECT user, sum(amount) AS total FROM events GROUP BY user"));
 await db.call("send_report", "2026-09-27");            // a stored procedure; what it printed: db.notices
 const run = await db.start("send_report", "2026-09-28"); // …started, not waited for (pondra.runs)
-await db.close();
+for await (const rows of db.live("SELECT user, sum(amount) AS total FROM events GROUP BY user")) {
+  console.log(rows);                                   // now, and again each time a commit changes it
+  break;
+}
+await db.sql("CREATE TEMP TABLE picked AS SELECT * FROM events WHERE amount > 1"); // this connection's own
+await db.close();                                      // (its temporary tables end with it)
 ```
+
+Files and other engines' tables are SQL's: `read_parquet`, `read_csv`, `read_json`, `read_delta`,
+`read_iceberg`, and `COPY (…) TO '…' (FORMAT parquet | csv | json | delta | iceberg)`.
 
 Functions and procedures written in SQL or Python (`CREATE FUNCTION`, `CREATE PROCEDURE … LANGUAGE
 python`) run on the node; `local()` gives the node a Python with the `pondra` package if this

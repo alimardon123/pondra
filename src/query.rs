@@ -512,7 +512,11 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
     crate::udf::register(lake, &ctx).await?; // the lake's own functions (`POST /functions/…`)
     crate::pyfn::register(lake, &ctx).await?; // …and its Python functions (`CREATE FUNCTION … LANGUAGE python`)
     let listing = ["information_schema", "show tables", "show columns"].iter().any(|w| sql.to_lowercase().contains(w)); // (every table)
-    let views = stored_views(lake, sql, listing).await?; // (their tables are wanted too)
+    let temps = crate::temp::views(sql); // (the session's own: over the lake's of the same name)
+    let seen = temps.iter().fold(sql.to_string(), |t, (_, s)| format!("{t} {s}"));
+    let mut views = stored_views(lake, &seen, listing).await?; // (their tables are wanted too)
+    views.retain(|(n, _)| !temps.iter().any(|(m, _)| m == n));
+    views.extend(temps);
     let text = views.iter().fold(sql.to_string(), |t, (_, s)| format!("{t} {s}"));
     let sys = |m: TableMeta| if crate::sys::mentioned(&text) { crate::sys::with_sys(&m) } else { m }; // (named: the tables get their system columns)
     let default = ctx.catalog(&crate::ddl::lake_name(lake)).expect("the lake's catalog"); // (`lake.schema.table`)
@@ -581,6 +585,7 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
             ctx.register_table(name.as_str(), Arc::new(MemTable::try_new(schema, vec![batches.clone()])?))?;
         }
     }
+    crate::temp::register(&ctx, &text)?; // (the session's temporary tables, over the lake's)
     register_views(&ctx, views, !listing).await?; // (a listing shows what it can)
     Ok(ctx)
 }

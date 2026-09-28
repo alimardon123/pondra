@@ -27,8 +27,8 @@ pub async fn insert(lake: &Lake, table: &str, query: &str, job: &str) -> Result<
     let query = crate::routines::expand(lake, query).await?;
     let df = crate::query::session(lake, &query, "").await?.sql_with_options(&query, crate::query::read_only()).await?;
     match spec.format.as_str() {
-        "delta" => delta(lake, spec.urls[0].trim_end_matches('/'), df, job).await,
-        "iceberg" => crate::write_outside::iceberg(lake, &spec, df, job).await,
+        "delta" => delta(lake, spec.urls[0].trim_end_matches('/'), df, job, false).await,
+        "iceberg" => iceberg(lake, &spec, df, job, false).await,
         f => bail!("INSERT into {f} files: into a table attached as delta or iceberg"),
     }
 }
@@ -39,7 +39,51 @@ pub async fn insert(lake: &Lake, table: &str, query: &str, job: &str) -> Result<
 const DELTA_WRITES: &[&str] = &["appendOnly", "invariants", "checkConstraints", "changeDataFeed", "columnMapping", "deletionVectors", "timestampNtz", "typeWidening",
     "typeWidening-preview", "v2Checkpoint", "vacuumProtocolCheck", "domainMetadata", "inCommitTimestamp", "clustering", "generatedColumns", "identityColumns"];
 
-async fn delta(lake: &Lake, root: &str, df: datafusion::prelude::DataFrame, job: &str) -> Result<Value> {
+/// `COPY … TO '<folder>' (FORMAT delta | iceberg)` (ADR-028): a table of that format there, made
+/// if the folder holds none; one that is there takes APPEND (rows added) or OVERWRITE (its rows
+/// replaced), as a folder of files does. Polars' `write_delta` and Spark's `format("delta")`.
+pub async fn copy_table(lake: &Lake, df: datafusion::prelude::DataFrame, to: &str, format: &str, append: bool, overwrite: bool) -> Result<Value> {
+    let root = crate::ddl::full(to)?; // (a folder named relatively: from where the node runs; Iceberg's location is absolute)
+    let root = root.as_str();
+    let (store, dir) = crate::ext::store(lake, &format!("{root}/")).await?;
+    let there: Vec<object_store_df::ObjectMeta> = match futures::TryStreamExt::try_collect(store.list(Some(&dir))).await {
+        Err(object_store_df::Error::NotFound { .. }) => vec![],
+        r => r?,
+    };
+    let marker = if format == "delta" { "/_delta_log/" } else { "/metadata/" };
+    let table = there.iter().any(|o| o.location.as_ref().contains(marker));
+    let job = uuid::Uuid::new_v4().to_string();
+    match table {
+        true => ensure!(append || overwrite, "COPY … TO {to}: a {format} table is there already: APPEND adds to it, OVERWRITE replaces its rows"),
+        false => {
+            ensure!(there.is_empty(), "COPY … TO {to}: the folder holds files that aren't a {format} table");
+            let columns: Vec<(String, String)> = df.schema().fields().iter().map(|f| (f.name().clone(), crate::query::type_name(&crate::write::stored(f.data_type())))).collect();
+            let name = root.rsplit('/').next().unwrap_or("table");
+            let now = crate::log::now_ms();
+            let (file, body) = match format {
+                "delta" => {
+                    let schema = crate::delta::schema_string(&columns).with_context(|| format!("COPY … TO {to}: a column's type has no Delta equivalent"))?;
+                    let actions = [crate::delta::protocol(&schema), crate::delta::metadata(&uuid::Uuid::new_v4().to_string(), name, &schema, now)];
+                    ("_delta_log/00000000000000000000.json", actions.iter().map(|a| a.to_string() + "\n").collect::<String>())
+                }
+                _ => ("metadata/v1.metadata.json", crate::iceberg::empty(root, &columns, now).with_context(|| format!("COPY … TO {to}: a column's type has no Iceberg equivalent"))?.to_string()),
+            };
+            ensure!(put_new(lake, &format!("{root}/{file}"), body.into_bytes()).await?, "COPY … TO {to}: another writer made a table there at the same time");
+            if format == "iceberg" {
+                let (store, hint) = crate::ext::store(lake, &format!("{root}/metadata/version-hint.text")).await?;
+                object_store_df::ObjectStoreExt::put(&store, &hint, "1".into()).await?;
+            }
+        }
+    }
+    let replace = table && overwrite;
+    match format {
+        "delta" => delta(lake, root, df, &job, replace).await,
+        _ => iceberg(lake, &crate::ext::Spec { urls: vec![root.to_string()], format: format.into(), options: Default::default() }, df, &job, replace).await,
+    }
+}
+
+/// Rows into a Delta table: added, or (`replace`) instead of its rows.
+async fn delta(lake: &Lake, root: &str, df: datafusion::prelude::DataFrame, job: &str, replace: bool) -> Result<Value> {
     let app = format!("pondra:{job}");
     let log = read_delta::replay(lake, root, None).await?;
     if log.txns.contains(&app) {
@@ -80,12 +124,21 @@ async fn delta(lake: &Lake, root: &str, df: datafusion::prelude::DataFrame, job:
     let mut version = log.version + 1;
     let mut last = log;
     loop {
-        let mut info = json!({"timestamp": now, "operation": "WRITE", "operationParameters": {"mode": "Append", "partitionBy": serde_json::to_string(&partitions)?},
-                              "isBlindAppend": true, "engineInfo": format!("Pondra/{}", env!("CARGO_PKG_VERSION")), "txnId": uuid::Uuid::new_v4().to_string()});
+        let mode = if replace { "Overwrite" } else { "Append" };
+        let mut info = json!({"timestamp": now, "operation": "WRITE", "operationParameters": {"mode": mode, "partitionBy": serde_json::to_string(&partitions)?},
+                              "isBlindAppend": !replace, "engineInfo": format!("Pondra/{}", env!("CARGO_PKG_VERSION")), "txnId": uuid::Uuid::new_v4().to_string()});
         if last.metadata["configuration"]["delta.enableInCommitTimestamps"].as_str() == Some("true") {
             info["inCommitTimestamp"] = json!(now.max(previous_ict(lake, root, version - 1).await? + 1)); // (its commits' times only grow)
         }
-        let actions = std::iter::once(json!({"commitInfo": info})).chain([json!({"txn": {"appId": app, "version": 0, "lastUpdated": now}})]).chain(adds.iter().cloned());
+        // (replacing the rows: every file the table has now is removed, deletion vector and all)
+        let removes = last.live().filter(|_| replace).map(|a| {
+            let mut r = json!({"path": a["path"], "deletionTimestamp": now, "dataChange": true, "extendedFileMetadata": true, "partitionValues": a["partitionValues"], "size": a["size"]});
+            if !a["deletionVector"].is_null() {
+                r["deletionVector"] = a["deletionVector"].clone();
+            }
+            json!({"remove": r})
+        });
+        let actions = std::iter::once(json!({"commitInfo": info})).chain([json!({"txn": {"appId": app, "version": 0, "lastUpdated": now}})]).chain(removes).chain(adds.iter().cloned());
         let body = actions.map(|a| a.to_string()).collect::<Vec<_>>().join("\n") + "\n";
         match put_new(lake, &format!("{root}/_delta_log/{version:020}.json"), body.into_bytes()).await? {
             true => return Ok(json!({"rows": rows, "version": version})),
@@ -301,7 +354,8 @@ pub async fn put_new(lake: &Lake, url: &str, body: Vec<u8>) -> Result<bool> {
 /// INSERT into an Iceberg table (format v2): data files, a manifest of them, a manifest list of
 /// the snapshot's manifests and it, and the next metadata — a new file beside the last (put if
 /// absent), or the REST catalog's commit (the current snapshot asserted).
-pub async fn iceberg(lake: &Lake, spec: &crate::ext::Spec, df: datafusion::prelude::DataFrame, job: &str) -> Result<Value> {
+/// …`replace`: the snapshot holds only the new files (an overwrite).
+pub async fn iceberg(lake: &Lake, spec: &crate::ext::Spec, df: datafusion::prelude::DataFrame, job: &str, replace: bool) -> Result<Value> {
     let url = spec.urls[0].trim_end_matches('/');
     let rest = spec.options.contains_key("namespace");
     let (mut at, mut meta) = crate::read_iceberg::current(lake, url, &spec.options).await?;
@@ -364,7 +418,7 @@ pub async fn iceberg(lake: &Lake, spec: &crate::ext::Spec, df: datafusion::prelu
         // The manifest list: the current snapshot's manifests, and the new one.
         let current = meta["current-snapshot-id"].as_i64().filter(|id| *id >= 0);
         let snapshot = |id: i64| meta["snapshots"].as_array().into_iter().flatten().find(|s| s["snapshot-id"].as_i64() == Some(id)).cloned();
-        let mut list = match current.and_then(snapshot) {
+        let mut list = match current.and_then(snapshot).filter(|_| !replace) {
             Some(s) => crate::avro::records(&crate::ext::get(lake, s["manifest-list"].as_str().context("a snapshot without its manifest list")?).await?)?,
             None => vec![],
         };
@@ -376,9 +430,9 @@ pub async fn iceberg(lake: &Lake, spec: &crate::ext::Spec, df: datafusion::prelu
         let list_body = crate::avro::write(&list_schema, &list_meta, &list)?;
         let list_path = format!("{location}/metadata/snap-{snapshot_id}-1-{}.avro", uuid::Uuid::new_v4());
         ensure!(put_new(lake, &list_path, list_body).await?, "{list_path} is there already");
-        let total = |k: &str, add: u64| -> String { (current.and_then(snapshot).and_then(|s| s["summary"][k].as_str().and_then(|v| v.parse::<u64>().ok())).unwrap_or(0) + add).to_string() };
+        let total = |k: &str, add: u64| -> String { (current.and_then(snapshot).filter(|_| !replace).and_then(|s| s["summary"][k].as_str().and_then(|v| v.parse::<u64>().ok())).unwrap_or(0) + add).to_string() };
         let snap = json!({"snapshot-id": snapshot_id, "parent-snapshot-id": current, "sequence-number": seq, "timestamp-ms": now, "manifest-list": list_path,
-                          "schema-id": meta["current-schema-id"], "summary": {"operation": "append", "added-data-files": written.len().to_string(), "added-records": rows.to_string(),
+                          "schema-id": meta["current-schema-id"], "summary": {"operation": if replace { "overwrite" } else { "append" }, "added-data-files": written.len().to_string(), "added-records": rows.to_string(),
                           "added-files-size": written.iter().map(|w| w.bytes).sum::<u64>().to_string(), "total-records": total("total-records", rows),
                           "total-data-files": total("total-data-files", written.len() as u64), "pondra.job": job}});
         let committed = match rest {

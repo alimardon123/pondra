@@ -1,0 +1,12 @@
+{
+ "names": {
+  "every name in dataframe-api.md's table exists and runs (69 names)": true,
+  "SQL: parquet_scan, read_csv_auto, read_json_auto, read_ndjson, delta_scan, iceberg_scan == Pondra's names": true,
+  "Python: scan_* and read_ndjson == read_*, on the connection and the module": true,
+  "frames: sink_parquet, sink_csv, sink_ndjson, write_ndjson == write_parquet, write_csv, write_json": true,
+  "PySpark: spark.read.format('delta' | 'iceberg').load == read_delta, read_iceberg": true,
+  "Delta and Iceberg folders: made, APPEND, OVERWRITE; again without a mode refused, 'ignore' leaves it; delta-rs and PyIceberg agree": true,
+  "a folder named relatively: written and read back (read_delta, read_iceberg, delta_scan); Iceberg's location absolute, as PyIceberg reads it": true
+ },
+ "ok": true
+}

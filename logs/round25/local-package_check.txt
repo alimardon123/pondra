@@ -1,0 +1,2 @@
+pondra 0.25.0 (with pyarrow)
+ok: [{'v': 'a', 'n': 2}, {'v': 'b', 'n': 1}]

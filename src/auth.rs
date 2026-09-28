@@ -61,7 +61,8 @@ impl Auth {
             "files" => Role::Write,
             "stats" => Role::None, // (a health check: load balancers and the tests poll it)
             "secrets" => Role::None, // (a procedure's lent token only: `server::secret`)
-            "sql" | "lookup" | "watch" | "mcp" | "v1" | "metrics" | "routines" => Role::Read, // (MCP writes are checked by `allows`; v1: the Iceberg REST catalog)
+            "v1" if method == "POST" => Role::Write, // (another engine's append: ADR-028)
+            "sql" | "lookup" | "watch" | "live" | "sessions" | "mcp" | "v1" | "metrics" | "routines" => Role::Read, // (MCP writes are checked by `allows`; v1: the Iceberg REST catalog)
             "append" | "insert" => Role::Write,
             "cluster" if path.starts_with("/cluster/files") || path.starts_with("/cluster/commit") => Role::Write, // (writers on other machines)
             "cluster" if path.starts_with("/cluster/leader") => Role::None,
@@ -71,6 +72,9 @@ impl Auth {
 
     /// May this role run this write?
     pub fn allows(&self, role: Role, stmt: &Stmt) -> Result<()> {
+        if crate::temp::own(stmt) {
+            return Ok(()); // (the session's own tables and views: any role may keep them)
+        }
         let need = if matches!(stmt, Stmt::Create(_) | Stmt::Define(..) | Stmt::AddColumn(..) | Stmt::SetOptions(..) | Stmt::Ddl(_) | Stmt::CopyTo(..)) { Role::Admin } else { Role::Write };
         if role < need {
             bail!("this token may not {}", match stmt { Stmt::CopyTo(..) => "write files outside the lake", _ if need == Role::Admin => "create tables", _ => "write" });
@@ -88,18 +92,22 @@ struct Lent {
     role: Role,
     files: bool,
     secrets: Vec<String>,
+    session: Option<String>, // (its caller's temporary tables are its own too: `temp.rs`)
 }
 
 static LENT: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, Lent>>> = std::sync::LazyLock::new(Default::default);
 
 pub fn lend(role: Role, files: bool) -> Lease {
     let token = format!("lease-{}", uuid::Uuid::new_v4().simple());
-    LENT.lock().unwrap().insert(token.clone(), Lent { role, files, secrets: vec![] });
+    LENT.lock().unwrap().insert(token.clone(), Lent { role, files, secrets: vec![], session: crate::temp::current() });
     Lease(token)
 }
 
 /// What a lent token allows, while its procedure runs.
 pub fn lent(token: Option<&str>) -> Option<(Role, bool)> { LENT.lock().unwrap().get(token?).map(|l| (l.role, l.files)) }
+
+/// The session of the caller a lent token's procedure runs for.
+pub fn lent_session(token: Option<&str>) -> Option<String> { LENT.lock().unwrap().get(token?).and_then(|l| l.session.clone()) }
 
 /// A secret's values, read by a lent token's procedure: kept, to be blanked out of its notices,
 /// its error and the run log. False: not a lent token (only a procedure's code reads a secret).

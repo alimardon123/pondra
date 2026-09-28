@@ -43,7 +43,10 @@ struct Published {
 /// two), then one catalog write that records what was published. One round at a time, each
 /// starting from the last one's recorded state: a tiering round and a `CHECKPOINT` publishing at
 /// once both wrote an Iceberg table's next version, and the second failed (real R2, round 21).
-pub async fn publish_all(lake: &Lake) -> Result<()> {
+pub async fn publish_all(lake: &Lake) -> Result<()> { publish_named(lake, None).await }
+
+/// `publish_all`, and the version of `named`'s table carries that engine's snapshot id (ADR-028).
+pub async fn publish_named(lake: &Lake, named: Option<&crate::iceberg::Named<'_>>) -> Result<()> {
     static ONE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     let _one = ONE.lock().await;
     lake.cat.wait_durable(lake.cat.committed()).await; // (replicated acks: publish only what's in the bucket)
@@ -51,12 +54,12 @@ pub async fn publish_all(lake: &Lake) -> Result<()> {
     static SEEN: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, u64>>> = std::sync::LazyLock::new(Default::default);
     let print = |meta: &TableMeta| std::hash::BuildHasher::hash_one(&std::hash::BuildHasherDefault::<std::collections::hash_map::DefaultHasher>::default(), json(meta));
     let tables = lake.cat.scan::<TableMeta>("t/", "t0").await?;
-    let changed: Vec<_> = tables.iter().filter(|(key, meta)| SEEN.lock().unwrap().get(key) != Some(&print(meta))).collect();
+    let changed: Vec<_> = tables.iter().filter(|(key, meta)| named.is_some_and(|n| key[2..] == *n.table) || SEEN.lock().unwrap().get(key) != Some(&print(meta))).collect();
     let jobs = changed.iter().flat_map(|(key, meta)| meta.publish.iter().map(move |f| (&key[2..], meta, f.as_str())));
     let states = futures::future::try_join_all(jobs.map(|(table, meta, format)| async move {
         match format {
             "delta" => publish(lake, table, meta).await,
-            _ => crate::iceberg::publish(lake, table, meta).await,
+            _ => crate::iceberg::publish(lake, table, meta, named.filter(|n| n.table == table)).await,
         }
     }))
     .await?;
@@ -254,7 +257,7 @@ async fn checkpoint(lake: &Lake, dir: &str, version: u64, state: &Published, tab
 /// renamed or dropped columns, `columnMapping` — as a named feature, not reader version 2: a
 /// reader that can't map columns then says so (delta-rs's pyarrow reader, Polars) instead of
 /// reading them by the wrong names.
-fn protocol(schema: &str) -> Value {
+pub fn protocol(schema: &str) -> Value {
     let features: Vec<&str> = [("timestampNtz", schema.contains("\"timestamp_ntz\"")), ("columnMapping", schema.contains(MAPPING_ID))].iter().filter(|f| f.1).map(|f| f.0).collect();
     match features.is_empty() {
         false => json!({"protocol": {"minReaderVersion": 3, "minWriterVersion": 7, "readerFeatures": features, "writerFeatures": features}}),
@@ -262,7 +265,7 @@ fn protocol(schema: &str) -> Value {
     }
 }
 
-fn metadata(id: &str, table: &str, schema: &str, now: u64) -> Value {
+pub fn metadata(id: &str, table: &str, schema: &str, now: u64) -> Value {
     // (column mapping by name: the files' columns are the fields' physical names)
     let ids = serde_json::from_str::<Value>(schema).ok().and_then(|s| s["fields"].as_array().map(|f| f.iter().filter_map(|f| f["metadata"][MAPPING_ID].as_u64()).max()));
     let configuration = match ids.flatten() {
@@ -303,7 +306,7 @@ fn element(t: &str) -> Option<Value> {
 }
 
 /// The table's columns as a Delta schema, if every type has a Delta equivalent.
-fn schema_string(columns: &[(String, String)]) -> Option<String> {
+pub fn schema_string(columns: &[(String, String)]) -> Option<String> {
     let fields = columns.iter().map(|(name, t)| {
         if let Some(item) = t.strip_suffix("[]") {
             // A list column (an embedding, say): Delta's array type.

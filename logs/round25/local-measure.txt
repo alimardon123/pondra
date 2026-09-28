@@ -1,0 +1,12 @@
+tools/bench/outside_append.py (round 25's outside append: PyIceberg through a node's Iceberg REST catalog, local disk, 2 vCPUs)
+{
+ "tiny": {"rows": 10, "parquet_mb": 0.0, "client_wall_s": 0.07, "node_cpu_s": -0.0},
+ "big": {"rows": 4000000, "parquet_mb": 24.5, "client_wall_s": 1.91, "node_cpu_s": 1.09},
+ "tiny again": {"rows": 10, "parquet_mb": 0.0, "client_wall_s": 0.03, "node_cpu_s": -0.01},
+ "node_cpu_s_per_gb": 44.5,
+ "rows_ok": [{"n": 4000020, "ids": 4000020}]
+}
+
+TPC-H SF1 recheck (pondra, duckdb; best of 5): singlenode_check.log
+total pondra 2.06 s, duckdb 3.35 s (round 24: 1.91 / 3.17: the same ratio, 0.61 vs 0.60)
+q13 alone, 25 runs on a hot node: 0.108 to 0.236 s (bimodal; best 0.108; round 24's 0.094 was a best of 3)

@@ -1,0 +1,14 @@
+Commit failed due to a concurrent update, retrying (1/4) in 103 ms
+Commit failed due to a concurrent update, retrying (1/4) in 104 ms
+{
+ "writes": {
+  "PyIceberg appends through a follower: the rows are the table's own (row ids), the writer's files gone, its snapshot found by its id": true,
+  "two writers at once: the second gets 409, retries, and each append is in once": true,
+  "a commit sent twice (a retry after a lost answer) is applied once": true,
+  "a view of the table follows (through the log), and so does its Delta copy": true,
+  "an attached lake's table, through this lake's catalog: its leader records it": true,
+  "Pondra itself appends to another Pondra's table through its catalog": true,
+  "refused by name: a delete, a schema change, a keyed table, a new table": true
+ },
+ "ok": true
+}

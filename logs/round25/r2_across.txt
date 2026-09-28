@@ -1,0 +1,8 @@
+{
+ "across": {
+  "from a follower of another lake: UPDATE, DELETE with a temporary table, MERGE from this lake's table and from a file here == the same on that lake's node": true,
+  "a retried job applies once": true,
+  "with nobody leading that lake: this node leads it for the moment it takes": true
+ },
+ "ok": true
+}

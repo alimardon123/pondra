@@ -1,0 +1,72 @@
+== pondra
+  pondra            q1    0.121 s
+  pondra            q2    0.025 s
+  pondra            q3    0.068 s
+  pondra            q4    0.075 s
+  pondra            q5    0.106 s
+  pondra            q6    0.061 s
+  pondra            q7    0.084 s
+  pondra            q8    0.068 s
+  pondra            q9    0.152 s
+  pondra            q10   0.135 s
+  pondra            q11   0.022 s
+  pondra            q12   0.088 s
+  pondra            q13   0.191 s
+  pondra            q14   0.019 s
+  pondra            q15   0.040 s
+  pondra            q16   0.051 s
+  pondra            q17   0.090 s
+  pondra            q18   0.173 s
+  pondra            q19   0.113 s
+  pondra            q20   0.081 s
+  pondra            q21   0.275 s
+  pondra            q22   0.027 s
+== duckdb
+  duckdb            q1    0.171 s
+  duckdb            q2    0.038 s
+  duckdb            q3    0.136 s
+  duckdb            q4    0.097 s
+  duckdb            q5    0.136 s
+  duckdb            q6    0.087 s
+  duckdb            q7    0.154 s
+  duckdb            q8    0.202 s
+  duckdb            q9    0.317 s
+  duckdb            q10   0.231 s
+  duckdb            q11   0.029 s
+  duckdb            q12   0.158 s
+  duckdb            q13   0.218 s
+  duckdb            q14   0.171 s
+  duckdb            q15   0.094 s
+  duckdb            q16   0.039 s
+  duckdb            q17   0.159 s
+  duckdb            q18   0.269 s
+  duckdb            q19   0.152 s
+  duckdb            q20   0.110 s
+  duckdb            q21   0.333 s
+  duckdb            q22   0.053 s
+
+            pondra      duckdb
+q1          0.121      0.171
+q2          0.025      0.038
+q3          0.068      0.136
+q4          0.075      0.097
+q5          0.106      0.136
+q6          0.061      0.087
+q7          0.084      0.154
+q8          0.068      0.202
+q9          0.152      0.317
+q10         0.135      0.231
+q11         0.022      0.029
+q12         0.088      0.158
+q13         0.191      0.218
+q14         0.019      0.171
+q15         0.040      0.094
+q16         0.051      0.039
+q17         0.090      0.159
+q18         0.173      0.269
+q19         0.113      0.152
+q20         0.081      0.110
+q21         0.275      0.333
+q22         0.027      0.053
+total         2.06        3.35
+{"pondra_load_s": 15.2, "pondra_warm_s": 9.0, "pondra_wall_s": 12.0, "duckdb_load_s": 0.0, "duckdb_wall_s": 19.3}

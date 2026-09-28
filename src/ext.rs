@@ -70,14 +70,16 @@ pub fn spec(name: &str) -> Option<Spec> { serde_json::from_slice(&B64.decode(nam
 /// Might `sql` name files? (A cheap test, before anything is parsed.)
 pub fn mentions(sql: &str) -> bool {
     static FILES: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r"(?i)'(s3|r2|gs|gcs|az|azure|abfss?|https?)://|\b(from|join|using)\s+'|\b(read_parquet|parquet_scan|read_csv|read_csv_auto|read_json|read_json_auto|read_ndjson|delta_scan|iceberg_scan)\s*\(").expect("a regex")
+        regex::Regex::new(r"(?i)'(s3|r2|gs|gcs|az|azure|abfss?|https?)://|\b(from|join|using)\s+'|\b(read_parquet|parquet_scan|read_csv|read_csv_auto|read_json|read_json_auto|read_ndjson|read_delta|read_iceberg|delta_scan|iceberg_scan)\s*\(").expect("a regex")
     });
     FILES.is_match(sql)
 }
 
 /// The table a reference to files is: `'s3://…/x.parquet'` or `'sales/*.csv'` (a URL or a path,
-/// its format by extension), or `read_parquet(…)`, `read_csv(…)`, `read_json(…)` with URLs or
-/// paths and DuckDB's options by name. None: not files.
+/// its format by extension), or `read_parquet(…)`, `read_csv(…)`, `read_json(…)`, `read_delta(…)`,
+/// `read_iceberg(…)` with URLs or paths and DuckDB's options by name. Pondra's names come first;
+/// DuckDB's (`parquet_scan`, `read_csv_auto`, `read_json_auto`, `read_ndjson`, `delta_scan`,
+/// `iceberg_scan`) are the same (ADR-028). None: not files.
 pub fn table(t: &TableFactor) -> Result<Option<String>> {
     let TableFactor::Table { name: n, args, .. } = t else { return Ok(None) };
     let Some(args) = args else {
@@ -91,8 +93,8 @@ pub fn table(t: &TableFactor) -> Result<Option<String>> {
         "read_parquet" | "parquet_scan" => "parquet",
         "read_csv" | "read_csv_auto" => "csv",
         "read_json" | "read_json_auto" | "read_ndjson" => "json",
-        "delta_scan" => "delta",
-        "iceberg_scan" => "iceberg",
+        "read_delta" | "delta_scan" => "delta",
+        "read_iceberg" | "iceberg_scan" => "iceberg",
         _ => return Ok(None),
     };
     let (mut urls, mut options) = (vec![], BTreeMap::new());

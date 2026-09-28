@@ -1,0 +1,13 @@
+{
+ "temps": {
+  "CREATE TEMP TABLE, INSERT (all columns or some), UPDATE (a row keeps its _row_id), DELETE, MERGE": true,
+  "TEMP VIEW, CTAS; a query spread over three nodes reading one runs on its node, with the same answer": true,
+  "not answered from the result cache (the same query after a change to it)": true,
+  "a temporary table shadows the lake's of its name, for its session only; DROP takes it away": true,
+  "another session doesn't see them; without a session, CREATE TEMP TABLE is refused by name": true,
+  "a lake's view over one refused; a procedure sees its caller's": true,
+  "Postgres: a connection's own, gone when it ends": true,
+  "close() ends a session; so does idleness (PONDRA_SESSION_IDLE_SECS)": true
+ },
+ "ok": true
+}

@@ -114,13 +114,20 @@ pub async fn run(lake: &Lake, seq: &Sequencer, sql: &str, job: &str) -> Result<V
         bail!("materialized view {v} is still being filled from {table}'s rows: change them once it is (in a moment)"); // (it reads them as they were)
     }
     let upto = lake.visible(); // (one snapshot for every query below: the lock keeps its files)
-    let (old, new) = match &stmt {
-        crate::write::Stmt::Update(_, set, cond) => update(lake, &table, &meta, set, cond, upto).await?,
-        crate::write::Stmt::Delete(_, cond) => (select(lake, &table, &meta, &[], &format!("FROM {} {}", from(&table), filter(cond)), upto).await?.0, vec![]),
-        crate::write::Stmt::Merge(m) => merge(lake, &table, &meta, m, upto).await?,
-        _ => bail!("not an UPDATE, DELETE or MERGE"),
-    };
+    let (old, new) = rows_of(lake, &table, &meta, &stmt, upto).await?;
     commit(lake, seq, &table, &stored, old, new, job).await
+}
+
+/// What an UPDATE, DELETE or MERGE of `table` changes, as of commit `upto`: the old versions of
+/// the rows it replaces (with their `_row_id`, `_created_at` and `_version`), and the new versions
+/// (keeping their `_row_id` and `_created_at`) and new rows. A temporary table's too (`temp.rs`).
+pub async fn rows_of(lake: &Lake, table: &str, meta: &TableMeta, stmt: &crate::write::Stmt, upto: u64) -> Result<(Vec<RecordBatch>, Vec<RecordBatch>)> {
+    Ok(match stmt {
+        crate::write::Stmt::Update(_, set, cond) => update(lake, table, meta, set, cond, upto).await?,
+        crate::write::Stmt::Delete(_, cond) => (select(lake, table, meta, &[], &format!("FROM {} {}", from(table), filter(cond)), upto).await?.0, vec![]),
+        crate::write::Stmt::Merge(m) => merge(lake, table, meta, m, upto).await?,
+        _ => bail!("not an UPDATE, DELETE or MERGE"),
+    })
 }
 
 fn from(table: &str) -> String { format!("{} AS {}", crate::write::sql_name(table), q(table.rsplit('.').next().unwrap_or(table))) }
@@ -386,3 +393,122 @@ pub async fn feed(lake: &Lake, table: &str, after: u64, upto: Option<u64>) -> Re
     all.sort_by_key(|((version, _), side)| (*version, *side)); // (stable: each side's own order kept)
     all.into_iter().map(|((_, b), _)| meta.to_logical(&b)).collect() // (under the names SQL knows)
 }
+
+// ---------------------------------------------------------------- a change for another leader (ADR-028)
+
+/// Tables a change reads that its leader can't: their names, and their rows (Arrow IPC, base64).
+pub type Sent = Vec<(String, String)>;
+
+/// `sql`, a change of `target`'s table written `written` (`local` in that lake), for that lake's
+/// leader: the target as that lake names it, and each other relation it reads that the leader
+/// can't — another lake's table or view, a file or table function here, this session's temporary
+/// tables — read here and sent with it, as `__sent_1`, … (under the name the statement gave it).
+pub async fn for_leader(query: &Lake, target: &Lake, written: &str, local: &str, sql: &str, files: bool) -> Result<(String, Sent)> {
+    use datafusion::sql::sqlparser::{ast::*, dialect::GenericDialect, parser::Parser};
+    use std::collections::{HashMap, HashSet};
+    use std::ops::ControlFlow;
+    let mut stmts = Parser::parse_sql(&GenericDialect {}, sql)?;
+    // A relation as written, without its alias: the key, and what `SELECT * FROM …` reads here.
+    let key = |t: &TableFactor| {
+        let mut t = t.clone();
+        if let TableFactor::Table { alias, .. } = &mut t {
+            *alias = None;
+        }
+        t.to_string()
+    };
+    struct Seen<F> {
+        ctes: HashSet<String>,
+        tables: Vec<(String, ObjectName, bool)>, // (key, name, a file or a function's rows)
+        key: F,
+    }
+    impl<F: Fn(&TableFactor) -> String> Visitor for Seen<F> {
+        type Break = ();
+        fn pre_visit_query(&mut self, q: &Query) -> ControlFlow<()> {
+            self.ctes.extend(q.with.iter().flat_map(|w| &w.cte_tables).map(|c| c.alias.name.value.to_lowercase()));
+            ControlFlow::Continue(())
+        }
+        fn pre_visit_table_factor(&mut self, t: &TableFactor) -> ControlFlow<()> {
+            if let TableFactor::Table { name, args, .. } = t {
+                let quoted = name.0.len() == 1 && name.0[0].as_ident().is_some_and(|i| i.quote_style == Some('\''));
+                self.tables.push(((self.key)(t), name.clone(), args.is_some() || quoted));
+            }
+            ControlFlow::Continue(())
+        }
+    }
+    let mut seen = Seen { ctes: HashSet::new(), tables: vec![], key };
+    let _ = Visit::visit(&stmts, &mut seen);
+    let same = std::ptr::eq(query, target);
+    let (mut renamed, mut sent, mut kept) = (HashMap::new(), vec![], HashMap::new());
+    for (k, name, rows_of_call) in seen.tables {
+        let n = crate::write::object(&name);
+        let rows_of_call = rows_of_call || crate::ext::is(&n); // (files here, as the statement names them by now: `ext.rs`)
+        if kept.contains_key(&k) || renamed.contains_key(&k) || (!rows_of_call && seen.ctes.contains(&n)) {
+            continue;
+        }
+        let here = match rows_of_call {
+            true => true, // (a file here, or a function's rows)
+            false if n == written => {
+                renamed.insert(k, local.to_string());
+                continue;
+            }
+            false if crate::temp::mentioned(&n) => true, // (the session's own)
+            false => match crate::ddl::resolve(query, &n).await {
+                Ok((Some(o), t)) if std::ptr::eq(&*o, target) => {
+                    renamed.insert(k, t);
+                    continue;
+                }
+                Ok((Some(_), _)) => true, // (a third lake's)
+                Ok((None, t)) if !same => query.cat.get_raw(&crate::store::table_key(&t)).await?.is_some() || query.cat.get_raw(&crate::ddl::query_key(&t)).await?.is_some(),
+                _ => false, // (the leader's own, or none: it says so)
+            },
+        };
+        if here {
+            let read = format!("SELECT * FROM {k}");
+            let ctx = crate::query::session(query, &read, "").await?;
+            let ctx = if files { ctx.enable_url_table() } else { ctx };
+            let batches = ctx.sql(&crate::asof::rewrite(&read)?).await?.collect().await.with_context(|| format!("reading {k} for the change"))?;
+            let alias = if rows_of_call { None } else { name.0.last().and_then(|p| p.as_ident()).map(|i| i.value.clone()) }; // (a table's name stays its rows' name)
+            let as_sent = format!("__sent_{}", sent.len() + 1);
+            kept.insert(k, (as_sent.clone(), alias));
+            sent.push((as_sent, B64.encode(crate::query::ipc(&batches)?)));
+        }
+    }
+    struct Rewrite<'a> {
+        renamed: &'a HashMap<String, String>,
+        kept: &'a HashMap<String, (String, Option<String>)>,
+    }
+    impl VisitorMut for Rewrite<'_> {
+        type Break = ();
+        fn pre_visit_table_factor(&mut self, t: &mut TableFactor) -> ControlFlow<()> {
+            let k = {
+                let mut c = t.clone();
+                if let TableFactor::Table { alias, .. } = &mut c {
+                    *alias = None;
+                }
+                c.to_string()
+            };
+            if let TableFactor::Table { name, alias, args, .. } = t {
+                let named = |n: &str| ObjectName::from(n.split('.').map(|p| Ident::with_quote('"', p)).collect::<Vec<_>>());
+                if let Some(local) = self.renamed.get(&k) {
+                    *name = named(local);
+                } else if let Some((as_sent, was)) = self.kept.get(&k) {
+                    (*name, *args) = (ObjectName::from(vec![Ident::new(as_sent)]), None);
+                    if let (None, Some(was)) = (&alias, was) {
+                        *alias = Some(TableAlias { explicit: true, name: Ident::with_quote('"', was), columns: vec![], at: None }); // (so `src.id` still means it)
+                    }
+                }
+            }
+            ControlFlow::Continue(())
+        }
+    }
+    let _ = VisitMut::visit(&mut stmts, &mut Rewrite { renamed: &renamed, kept: &kept });
+    Ok((stmts.iter().map(|s| s.to_string()).collect::<Vec<_>>().join("; "), sent))
+}
+
+/// The rows a change was sent with, as tables its queries read by name (`query::SENT`).
+pub fn unpack(sent: &Sent) -> Result<Vec<(String, Vec<RecordBatch>)>> {
+    sent.iter().map(|(n, b)| Ok((n.clone(), crate::query::read_ipc(&B64.decode(b)?)?))).collect()
+}
+
+use base64::Engine;
+const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;

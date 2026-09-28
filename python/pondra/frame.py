@@ -512,7 +512,7 @@ class Frame:
 
     def _repr_html_(self):  # (a notebook shows the first rows, as DuckDB's relations do)
         import importlib.util
-        if not all(importlib.util.find_spec(m) for m in ("pyarrow", "pandas")):
+        if not builtins.all(importlib.util.find_spec(m) for m in ("pyarrow", "pandas")):  # (`all` here is Polars' all())
             return "<pre>" + html.escape(self._con._frame_rows(self.limit(20), format="table")) + "</pre>"
         return self.limit(20).collect().to_pandas()._repr_html_()
 
@@ -747,23 +747,50 @@ class Frame:
                 "overwrite": f"DROP TABLE IF EXISTS {name}; CREATE TABLE {name} AS {self.sql}"}[mode]
         return self._con._run(body, self._params, self._sent)
 
-    def sink_parquet(self, path, partition_by=None):
+    def write_parquet(self, path, partition_by=None, mode=None):
         """Its rows into Parquet outside the lake (SQL's `COPY … TO`): a file, or a folder of files
-        when `path` ends in `/` or `partition_by` names columns (Hive-style folders). A URL needs a
-        secret covering it and an admin's token; with `local()`, this machine's paths too."""
-        return self._sink(path, "parquet", partition_by)
+        when `path` ends in `/` or `partition_by` names columns (Hive-style folders). A folder
+        holding files takes `mode="append"` or `"overwrite"`. A URL needs a secret covering it and
+        an admin's token; with `local()`, this machine's paths too. (Polars' `sink_parquet`.)"""
+        return self._sink(path, "parquet", partition_by, mode)
 
-    def sink_csv(self, path, separator=None, include_header=True, partition_by=None):
-        """Its rows into CSV outside the lake (Polars' names; `COPY … TO`)."""
-        return self._sink(path, "csv", partition_by, header=include_header, delimiter=separator)
+    def write_csv(self, path, separator=None, include_header=True, partition_by=None, mode=None):
+        """Its rows into CSV outside the lake (`COPY … TO`; Polars' `sink_csv`)."""
+        return self._sink(path, "csv", partition_by, mode, header=include_header, delimiter=separator)
 
-    def sink_ndjson(self, path, partition_by=None):
-        """Its rows into JSON lines outside the lake (`COPY … TO`)."""
-        return self._sink(path, "json", partition_by)
+    def write_json(self, path, partition_by=None, mode=None):
+        """Its rows into JSON lines outside the lake (`COPY … TO`; Polars' `sink_ndjson`, `write_ndjson`)."""
+        return self._sink(path, "json", partition_by, mode)
 
-    def _sink(self, path, format, partition_by, **options):
+    def write_delta(self, target, mode="error"):
+        """Its rows as a Delta table in a folder (`COPY … TO … (FORMAT delta)`): made if the folder
+        holds none; one there takes `mode` "append" or "overwrite" ("error": refused; "ignore":
+        left as it is), as Polars' `write_delta`."""
+        return self._table_to(target, "delta", mode)
+
+    def write_iceberg(self, target, mode="error"):
+        """Its rows as an Iceberg table in a folder (`COPY … TO … (FORMAT iceberg)`), as `write_delta`."""
+        return self._table_to(target, "iceberg", mode)
+
+    # Polars' names for the same (ADR-028).
+    sink_parquet, sink_csv = write_parquet, write_csv
+    sink_ndjson = write_ndjson = write_json
+
+    def _table_to(self, target, format, mode):
+        if mode not in ("error", "append", "overwrite", "ignore"):
+            raise ValueError(f"mode {mode!r}: error, append, overwrite or ignore")
+        try:
+            return self._sink(str(target), format, None, None if mode in ("error", "ignore") else mode)
+        except RuntimeError as e:
+            if mode == "ignore" and "is there already" in str(e):
+                return None
+            raise
+
+    def _sink(self, path, format, partition_by, mode=None, **options):
+        if mode not in (None, "append", "overwrite"):
+            raise ValueError(f"mode {mode!r}: append or overwrite (none: a folder must be empty)")
         cols = [partition_by] if isinstance(partition_by, str) else list(partition_by or [])
-        given = [f"FORMAT {format}"] + [f"PARTITION_BY ({', '.join(_quote(c) for c in cols)})"] * builtins.bool(cols)
+        given = [f"FORMAT {format}"] + [f"PARTITION_BY ({', '.join(_quote(c) for c in cols)})"] * builtins.bool(cols) + ([mode.upper()] if mode else [])
         given += [f"{k.upper()} {_literal(v)}" for k, v in options.items() if v is not None]
         return self._con._run(f"COPY ({self.sql}) TO {_literal(str(path))} ({', '.join(given)})", self._params, self._sent)
 

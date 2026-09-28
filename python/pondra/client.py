@@ -101,6 +101,7 @@ class Pondra:
         self.notices, self.echo = [], echo  # what the last statement's procedures printed; printed here too, unless echo=False
         self.producer = producer or f"py-{uuid.uuid4().hex[:12]}"  # exactly-once: one name, increasing seq
         self.seq = 0
+        self.session = uuid.uuid4().hex  # (this connection's temporary tables and views: the node's, until close())
         self._headers, self._job, self._jobs, self._temp = dict(headers or {}), job, itertools.count(1), {}
         # a node on this machine is reached directly, whatever proxy the environment names
         local = urllib.parse.urlsplit(self.url).hostname in ("127.0.0.1", "localhost", "::1")
@@ -108,7 +109,7 @@ class Pondra:
         _last = self
 
     def _call(self, method, path, body=b"", headers=None, stream=False):
-        h = {**self._headers, **(headers or {})}
+        h = {"x-pondra-session": self.session, **self._headers, **(headers or {})}
         if self.token:
             h["Authorization"] = f"Bearer {self.token}"
         if getattr(self, "owner", None):
@@ -208,30 +209,34 @@ class Pondra:
 
     # ------------------------------------------------------------ files anywhere (ADR-026)
 
-    def scan_parquet(self, source, hive_partitioning=None, **options):
+    def read_parquet(self, source, hive_partitioning=None, **options):
         """Parquet files as a frame, read where the node runs each time it's asked for rows: a
         URL (`s3://`, `gs://`, `az://`, `https://`), a folder, a glob or a list of them; with
         `local()`, this machine's paths too. SQL's `read_parquet`: a URL needs a secret covering it
-        (`CREATE SECRET`), unless the node is yours."""
+        (`CREATE SECRET`), unless the node is yours. (Polars' `scan_parquet` is the same.)"""
         return self._scan("read_parquet", source, dict(options, hive_partitioning=hive_partitioning))
 
-    def scan_csv(self, source, separator=None, has_header=None, hive_partitioning=None, **options):
-        """CSV files as a frame (Polars' names; SQL's `read_csv`)."""
+    def read_csv(self, source, separator=None, has_header=None, hive_partitioning=None, **options):
+        """CSV files as a frame (SQL's `read_csv`; Polars' `scan_csv` is the same)."""
         return self._scan("read_csv", source, dict(options, delim=separator, header=has_header, hive_partitioning=hive_partitioning))
 
-    def scan_ndjson(self, source, hive_partitioning=None, **options):
-        """JSON lines as a frame (SQL's `read_json`)."""
+    def read_json(self, source, hive_partitioning=None, **options):
+        """JSON lines as a frame (SQL's `read_json`; Polars' `scan_ndjson` and `read_ndjson` are the same)."""
         return self._scan("read_json", source, dict(options, hive_partitioning=hive_partitioning))
 
-    def scan_delta(self, source, version=None):
-        """A Delta table as a frame (`delta_scan`): its latest version, or `version`; deletion
+    def read_delta(self, source, version=None):
+        """A Delta table as a frame (SQL's `read_delta`): its latest version, or `version`; deletion
         vectors, column mapping and partitions as Delta's own readers read them."""
-        return self._scan("delta_scan", source, {"version": version})
+        return self._scan("read_delta", source, {"version": version})
 
-    def scan_iceberg(self, source, snapshot_id=None, version=None, allow_moved_paths=None):
-        """An Iceberg table as a frame (`iceberg_scan`): its folder or a metadata file; its current
-        snapshot, or `snapshot_id`, or its metadata `version`."""
-        return self._scan("iceberg_scan", source, {"snapshot_from_id": snapshot_id, "version": version, "allow_moved_paths": allow_moved_paths})
+    def read_iceberg(self, source, snapshot_id=None, version=None, allow_moved_paths=None):
+        """An Iceberg table as a frame (SQL's `read_iceberg`): its folder or a metadata file; its
+        current snapshot, or `snapshot_id`, or its metadata `version`."""
+        return self._scan("read_iceberg", source, {"snapshot_from_id": snapshot_id, "version": version, "allow_moved_paths": allow_moved_paths})
+
+    # Polars' names for the same (ADR-028: Pondra's names first, the tools' as fallbacks).
+    scan_parquet, scan_csv, scan_delta, scan_iceberg = read_parquet, read_csv, read_delta, read_iceberg
+    scan_ndjson = read_ndjson = read_json
 
     def _scan(self, fn, source, options):
         paths = [str(source)] if isinstance(source, (str, os.PathLike)) else [str(s) for s in source]
@@ -296,16 +301,17 @@ class Pondra:
         return json.loads(self._call("GET", f"/secrets/{urllib.parse.quote(name)}"))
 
     def create_function(self, name, body=None, file=None, params=None, returns=None, language="python", entry=None, vectorized=False, strict=False,
-                        volatility=None, packages=None, timeout=None, replace=True):
+                        volatility=None, packages=None, timeout=None, cache=None, replace=True):
         """A stored function from code (or a file of it), as `CREATE FUNCTION … LANGUAGE python`:
         `params` maps each parameter to its SQL type (or a Python one), or to (type, default);
         `returns` is a SQL type, or `TABLE (…)`, or a dict of columns and types (a table function).
         The body is a function's body (Postgres's PL/Python form), or, with `entry`, a module whose
-        function of that name runs."""
+        function of that name runs. `cache="10 minutes"`: an answer is reused that long for the
+        same arguments (an API or a model called again costs nothing)."""
         body = open(file, encoding="utf-8").read() if file else body
         if isinstance(returns, dict):
             returns = "TABLE (" + ", ".join(f"{_quote(k)} {_sql_type_of(v) or 'VARIANT'}" for k, v in returns.items()) + ")"
-        with_ = {"entry": entry, "vectorized": vectorized or None, "packages": packages, "timeout": timeout}
+        with_ = {"entry": entry, "vectorized": vectorized or None, "packages": packages, "timeout": timeout, "cache": cache}
         words = " ".join(w for w in ["STRICT" if strict else "", (volatility or "").upper()] if w)
         return self._run(f"CREATE {'OR REPLACE ' if replace else ''}FUNCTION {name}({_params(params)}) RETURNS {_sql_type_of(returns) or returns} "
                          f"LANGUAGE {language} {words}{_with(with_)} AS {_dollar(body)}")
@@ -317,7 +323,7 @@ class Pondra:
         return self._run(f"CREATE {'OR REPLACE ' if replace else ''}PROCEDURE {name}({_params(params)}) LANGUAGE {language}"
                          f"{_with({'entry': entry, 'packages': packages, 'timeout': timeout})} AS {_dollar(body)}")
 
-    def function(self, fn=None, *, name=None, returns=None, vectorized=False, strict=False, volatility=None, packages=None, timeout=None, replace=True):
+    def function(self, fn=None, *, name=None, returns=None, vectorized=False, strict=False, volatility=None, packages=None, timeout=None, cache=None, replace=True):
         """A decorator: this Python function becomes one of the lake's functions, for SQL
         (`SELECT slug(title) …`) and frames (`pondra.fn.slug(col("title"))`), on every node. Its
         types come from its annotations (`returns=` says what it returns otherwise: a SQL type, or a
@@ -330,7 +336,7 @@ class Pondra:
             if ret is None:
                 raise TypeError(f"{f.__name__}: say what it returns — an annotation (-> str) or @db.function(returns='DOUBLE'), or returns={{'col': int, …}} for a table")
             self.create_function(name or f.__name__, _module_of(f), params=params, returns=ret, entry=f.__name__, vectorized=vectorized, strict=strict,
-                                 volatility=volatility, packages=packages, timeout=timeout, replace=replace)
+                                 volatility=volatility, packages=packages, timeout=timeout, cache=cache, replace=replace)
             return f
         return make(fn) if fn else make
 
@@ -411,9 +417,40 @@ class Pondra:
                 continue
             yield row
 
+    def live(self, query, every_ms=None, **params):
+        """A query's answer now, and again each time a commit changes a table it reads (ADR-028):
+        each is its rows, a list of dicts; `self.position` is the commit it is as of. An answer
+        that comes out the same isn't sent again, and a busy table is queried at most every
+        `every_ms` (100). The query runs on the node; stopping the loop ends it there.
+
+            for rows in db.live("SELECT region, sum(amount) AS total FROM orders GROUP BY region"):
+                redraw(rows)"""
+        if isinstance(query, Frame):
+            if query._sent:
+                raise ValueError("a live query reads the lake: a frame of rows from Python never changes (write_table them first)")
+            query, params = query.sql, {**query._params, **params}
+        body = json.dumps({"sql": query, "params": {k: _param(v) for k, v in params.items()}}).encode()
+        r = self._call("POST", "/live" + (f"?every_ms={int(every_ms)}" if every_ms else ""), body, {"content-type": "application/json"}, stream=True)
+        try:
+            for line in r:
+                if not line.strip():
+                    continue  # (the node's keep-alive)
+                answer = json.loads(line)
+                if "error" in answer:
+                    raise RuntimeError(answer["error"])
+                self.position = answer["at"]
+                yield _json_rows(json.dumps(answer["rows"]))
+        finally:
+            r.close()
+
     def close(self):
-        """Stop the node `local()` started: closing its input stops it (it hands the lake on at
-        once), on every OS; it would stop the same way if Python were killed."""
+        """End this connection's session (its temporary tables and views), and stop the node
+        `local()` started: closing its input stops it (it hands the lake on at once), on every OS;
+        it would stop the same way if Python were killed."""
+        try:
+            self._call("DELETE", f"/sessions/{self.session}")
+        except Exception:
+            pass  # (the node is gone, or never had one: an idle session ends by itself)
         p = getattr(self, "process", None)
         if p and p.poll() is None:
             p.stdin.close()

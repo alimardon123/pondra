@@ -24,6 +24,8 @@ pub async fn resolve(lake: &Lake, url: &str, options: &BTreeMap<String, String>)
     if options.contains_key("namespace") {
         return rest(lake, url, options).await;
     }
+    let url = crate::ddl::full(url)?; // (a folder or file named relatively: from where the node runs)
+    let url = url.as_str();
     let (at, meta) = metadata(lake, url, options.get("version").map(String::as_str)).await?;
     resolve_metadata(lake, url, &at, &meta, options).await
 }

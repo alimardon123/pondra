@@ -1,0 +1,9 @@
+02:22:26 start writes
+02:22:47 writes exit=1
+02:22:47 start temps
+02:23:07 temps exit=0
+02:23:07 start across
+02:24:22 across exit=0
+02:24:22 start live
+02:24:33 live exit=0
+02:24:33 R2_DONE

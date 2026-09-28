@@ -135,6 +135,9 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
         }
     };
     lake.cat.commit(vec![(table_key(name), json(&meta))], &[]).await?;
+    if !meta.publish.is_empty() {
+        crate::delta::publish_all(lake).await?; // (an empty table is there for other engines at once: they may append to it, ADR-028)
+    }
     Ok(j!({"table": name, "publish": meta.publish}))
 }
 
@@ -155,6 +158,7 @@ pub enum Stmt {
     Merge(Box<crate::change::Merge>),                     // MERGE INTO … (`change.rs`)
     Invalid(String),                                      // CREATE PROCEDURE or DROP MACRO, written wrong: why
     CopyTo(String, String, std::collections::BTreeMap<String, String>), // COPY (query) TO 'url' (options): files outside the lake (`ext.rs`)
+    TempView(String, String, bool),                        // CREATE [OR REPLACE] TEMP VIEW name AS query: the session's (`temp.rs`)
 }
 
 impl Stmt {
@@ -164,6 +168,7 @@ impl Stmt {
             Stmt::Create(c) => object(&c.name),
             Stmt::Define(t, _) | Stmt::Insert(t, _) | Stmt::InsertInto(t, ..) | Stmt::Update(t, ..) | Stmt::Delete(t, _) | Stmt::AddColumn(t, ..) | Stmt::SetOptions(t, _) => t.clone(),
             Stmt::Ddl(_) | Stmt::Invalid(_) | Stmt::CopyTo(..) => String::new(),
+            Stmt::TempView(v, ..) => v.clone(),
             Stmt::Merge(m) => m.target.clone(),
         }
     }
@@ -281,6 +286,7 @@ pub fn parse(sql: &str) -> Option<Stmt> {
             };
             Stmt::Ddl(vec![Ddl::CreateMaterialized { name: object(&v.name), sql: v.query.to_string(), options }])
         }
+        Statement::CreateView(v) if v.temporary => Stmt::TempView(object(&v.name), v.query.to_string(), v.or_replace), // (the session's: `temp.rs`)
         Statement::CreateView(v) => Stmt::Ddl(vec![Ddl::CreateView { name: object(&v.name), sql: v.query.to_string(), replace: v.or_replace }]),
         Statement::AttachDatabase { schema_name, database_file_name: ast::Expr::Value(v), .. } => match &v.value {
             ast::Value::SingleQuotedString(dir) | ast::Value::DoubleQuotedString(dir) => Stmt::Ddl(vec![Ddl::Attach { name: ident(&schema_name), dir: dir.clone() }]),
@@ -303,7 +309,7 @@ pub fn parse(sql: &str) -> Option<Stmt> {
 /// With `AS SELECT`, the columns are the query's (run over `from`'s tables; `files`: local files
 /// too, for `pondra sql` on its own machine), or those it names (`CREATE TABLE t (a INT, b
 /// VARCHAR) AS VALUES …`: the query's columns by position).
-async fn create_spec(c: &ast::CreateTable, from: &Lake, files: bool) -> Result<String> {
+pub async fn create_spec(c: &ast::CreateTable, from: &Lake, files: bool) -> Result<String> {
     let declared = || async {
         let cols = c.columns.iter().map(|c| format!("{} {}", c.name, c.data_type)).collect::<Vec<_>>().join(", ");
         let ctx = SessionContext::new();
@@ -433,7 +439,7 @@ fn rows_sql(meta: &TableMeta, stmt: &Stmt) -> Result<String> {
             ensure!(meta.merge.is_empty() && deletes, "DELETE needs an upsert table with a Boolean _deleted column");
             Ok(select(&|c: &str| if c == "_deleted" { "true".into() } else { q(c) }, t, cond))
         }
-        Stmt::Create(_) | Stmt::Define(..) | Stmt::AddColumn(..) | Stmt::SetOptions(..) | Stmt::Ddl(_) | Stmt::Merge(_) | Stmt::Invalid(_) | Stmt::CopyTo(..) | Stmt::InsertInto(..) => unreachable!("not a row write here"),
+        Stmt::Create(_) | Stmt::Define(..) | Stmt::AddColumn(..) | Stmt::SetOptions(..) | Stmt::Ddl(_) | Stmt::Merge(_) | Stmt::Invalid(_) | Stmt::CopyTo(..) | Stmt::InsertInto(..) | Stmt::TempView(..) => unreachable!("not a row write here"),
     }
 }
 
@@ -442,10 +448,16 @@ fn rows_sql(meta: &TableMeta, stmt: &Stmt) -> Result<String> {
 /// stay `VALUES`, so they still go through the log.
 async fn whole_rows(lake: &Lake, table: &str, names: &[String], query: &str) -> Result<String> {
     use anyhow::Context;
-    use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
     let (other, name) = crate::ddl::resolve(lake, table).await?;
     let meta: TableMeta = other.as_deref().unwrap_or(lake).cat.get(&table_key(&name)).await?.with_context(|| format!("no table {table}"))?;
     let columns: Vec<String> = meta.logical().columns.into_iter().map(|(c, _)| c).filter(|c| c != "_deleted" || names.contains(c)).collect();
+    rows_for(table, &columns, names, query)
+}
+
+/// `INSERT INTO table (names) query` as a query of all its `columns`, in order (`whole_rows`; a
+/// temporary table's too, `temp.rs`).
+pub fn rows_for(table: &str, columns: &[String], names: &[String], query: &str) -> Result<String> {
+    use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
     if let Some(n) = names.iter().find(|n| !columns.contains(n)) {
         bail!("INSERT INTO {table} ({n}): no such column ({})", columns.join(", "));
     }
@@ -485,12 +497,17 @@ async fn through_log(lake: &Lake, table: &str, meta: &TableMeta, stmt: &Stmt) ->
     if !meta.key.is_empty() || matches!(stmt, Stmt::Insert(_, q) if values(q)) {
         return Ok(true);
     }
+    follows(lake, table).await
+}
+
+/// Do views or streaming tasks follow this table? (They see only what goes through the log.)
+pub async fn follows(lake: &Lake, table: &str) -> Result<bool> {
     let views = lake.cat.scan::<crate::views::View>("v/", "v0").await?.into_iter().any(|(_, v)| v.follows(table));
     Ok(views || lake.cat.scan::<crate::tasks::Task>("k/", "k0").await?.into_iter().any(|(_, t)| t.source == table))
 }
 
 /// Run a row query here: its rows in the table's column order and types.
-async fn rows(ctx: &SessionContext, meta: &TableMeta, sql: &str) -> Result<RecordBatch> {
+pub async fn rows(ctx: &SessionContext, meta: &TableMeta, sql: &str) -> Result<RecordBatch> {
     let target = schema(&meta.columns)?;
     let batches = ctx.sql(&crate::asof::rewrite(sql)?).await?.collect().await?;
     let Some(first) = batches.first() else { return Ok(RecordBatch::new_empty(target)) };
@@ -517,12 +534,17 @@ async fn rows(ctx: &SessionContext, meta: &TableMeta, sql: &str) -> Result<Recor
 // ---------------------------------------------------------------- bulk INSERT into append tables
 
 /// The files one INSERT wrote (`job`: a retried job is recorded once).
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct Files {
     table: String,
     job: String,
     columns: Vec<(String, String)>,
     files: Vec<DataFile>,
+}
+
+impl Files {
+    /// Where its files are.
+    pub fn paths(&self) -> Vec<String> { self.files.iter().map(|f| f.path.clone()).collect() }
 }
 
 /// Run the query here and write its rows as Parquet into the table's folder (None: this job was
@@ -637,6 +659,9 @@ pub fn on_node_as(app: &crate::server::App, stmt: Stmt, job: Option<String>, fil
 }
 
 async fn on_node_listed(app: &crate::server::App, stmt: Stmt, job: Option<String>, files: bool) -> Result<Value> {
+    if let Some(out) = crate::temp::statement(app, &stmt, files).await? {
+        return Ok(out); // (the session's own tables and views: on this node, in memory)
+    }
     ensure!(!app.cluster.reader, "read-only node");
     if let Stmt::Invalid(why) = stmt {
         bail!(why);
@@ -679,14 +704,19 @@ async fn on_node_listed(app: &crate::server::App, stmt: Stmt, job: Option<String
             _ => bail!("{}: another engine's table takes INSERTs from Pondra (UPDATE, DELETE and MERGE: not yet)", stmt.table()),
         };
     }
-    // UPDATE and DELETE of an append table, and MERGE: the leader's, from one snapshot (`change.rs`).
+    // UPDATE and DELETE of an append table, and MERGE: the leader's (of the table's lake), from
+    // one snapshot (`change.rs`). Another leader is sent what it can't read (ADR-028).
     if let Some(sql) = changes(lake, &stmt).await? {
-        return match &app.seq {
-            Some(seq) => {
-                let _guard = app.lock.lock().await;
-                crate::change::FILES.scope(files, crate::change::run(lake, seq, &sql, &job)).await
-            }
-            None => post(&app.cluster.leader.addr, &Request::Change(sql, job)).await, // (the leader can't read this machine's files)
+        let (other, local) = crate::ddl::resolve(lake, &stmt.table()).await?;
+        if let (None, Some(seq)) = (&other, &app.seq) {
+            let _guard = app.lock.lock().await;
+            return crate::change::FILES.scope(files, crate::change::run(lake, seq, &sql, &job)).await;
+        }
+        let target = other.clone().unwrap_or_else(|| lake.arc());
+        let (sql, sent) = crate::change::for_leader(lake, &target, &stmt.table(), &local, &sql, files).await?;
+        return match other {
+            None => post(&app.cluster.leader.addr, &Request::Change(sql, job, sent)).await,
+            Some(o) => deliver(&o.url, Some(Some(Request::Change(sql, job.clone(), sent))), &stmt, &job, false).await,
         };
     }
     // A table of an attached lake: the work runs here, that lake's leader records it.
@@ -749,7 +779,8 @@ pub enum Request {
     Flush(Bytes), // the body of POST /cluster/commit
     Table(String, String),
     Ddl(crate::ddl::Ddl),
-    Change(String, String), // an UPDATE, DELETE or MERGE the leader carries out (`change.rs`): SQL, job
+    Change(String, String, crate::change::Sent), // an UPDATE, DELETE or MERGE the leader carries out (`change.rs`): SQL, job, the rows it reads that the leader can't
+    Iceberg(Box<crate::iceberg::Commit>), // another engine's append (ADR-028)
 }
 
 impl Request {
@@ -760,7 +791,8 @@ impl Request {
             Request::Flush(b) => ("/cluster/commit".into(), b.to_vec()),
             Request::Table(name, spec) => (format!("/tables/{name}"), spec.clone().into_bytes()),
             Request::Ddl(d) => ("/cluster/ddl".into(), serde_json::to_vec(d)?),
-            Request::Change(sql, job) => ("/cluster/change".into(), serde_json::to_vec(&(sql, job))?),
+            Request::Change(sql, job, sent) => ("/cluster/change".into(), serde_json::to_vec(&(sql, job, sent))?),
+            Request::Iceberg(c) => ("/cluster/iceberg".into(), serde_json::to_vec(c)?),
         })
     }
 
@@ -771,6 +803,7 @@ impl Request {
             Request::Flush(_) => ("flush".into(), self.http()?.1),
             Request::Ddl(_) => ("ddl".into(), self.http()?.1),
             Request::Change(..) => ("change".into(), self.http()?.1),
+            Request::Iceberg(_) => ("iceberg".into(), self.http()?.1),
         })
     }
 
@@ -778,10 +811,11 @@ impl Request {
         Ok(match kind {
             "files" => Request::Files(serde_json::from_slice(&body)?),
             "flush" => Request::Flush(body),
+            "iceberg" => Request::Iceberg(serde_json::from_slice(&body)?),
             "ddl" => Request::Ddl(serde_json::from_slice(&body)?),
             "change" => {
-                let (sql, job): (String, String) = serde_json::from_slice(&body)?;
-                Request::Change(sql, job)
+                let (sql, job, sent): (String, String, crate::change::Sent) = serde_json::from_slice(&body)?;
+                Request::Change(sql, job, sent)
             }
             "table" => {
                 let (name, spec): (String, String) = serde_json::from_slice(&body)?;
@@ -808,9 +842,13 @@ pub async fn handle(lake: &Lake, seq: &Sequencer, lock: &Mutex<()>, req: Request
             let _guard = lock.lock().await;
             crate::ddl::apply(lake, d).await
         }
-        Request::Change(sql, job) => {
+        Request::Change(sql, job, sent) => {
             let _guard = lock.lock().await;
-            crate::change::run(lake, seq, &sql, &job).await
+            crate::query::SENT.scope(Arc::new(crate::change::unpack(&sent)?), crate::change::run(lake, seq, &sql, &job)).await
+        }
+        Request::Iceberg(c) => {
+            let _guard = lock.lock().await;
+            crate::iceberg::record(lake, seq, *c, &[String::new()], "").await
         }
     }
 }
@@ -865,6 +903,9 @@ async fn one_from_cli(dir: &str, stmt: Stmt) -> Result<Value> {
     };
     deliver(&to, req, &stmt, &job, true).await
 }
+
+/// Have the leader of the lake at `dir` record `req` (made on this node), however it's reached.
+pub async fn send(dir: &str, req: Request) -> Result<Value> { deliver(dir, Some(Some(req)), &Stmt::Invalid(String::new()), "", false).await }
 
 /// Have the leader of the lake at `dir` record a write: over HTTP, through the bucket inbox if it
 /// can't be reached, or, when nobody leads, by leading for a moment: here (`one_off`: a `pondra
@@ -928,7 +969,9 @@ async fn prepare(query: &Lake, target: &Arc<Lake>, table: &str, stmt: &Stmt, job
         return Ok(alter_spec(target, stmt).await?.map(|spec| Request::Table(table.into(), spec)));
     }
     if let Some(sql) = changes(target, stmt).await? {
-        return Ok(Some(Request::Change(sql, job.into())));
+        let t = stmt.table();
+        let (sql, sent) = crate::change::for_leader(query, target, &t, &t, &sql, files).await?; // (files here: this machine's)
+        return Ok(Some(Request::Change(sql, job.into(), sent)));
     }
     let meta = target.cat.get::<TableMeta>(&table_key(table)).await?.map(|m| m.logical());
     let log = match &meta {
@@ -955,7 +998,7 @@ async fn prepare(query: &Lake, target: &Arc<Lake>, table: &str, stmt: &Stmt, job
 /// Row ids for a bulk INSERT from any machine: a block from the lake's leader, if it can be
 /// reached, so the files are written with their system columns (`sys.rs`); None: the leader
 /// stamps them as it records them, which rewrites them (the inbox, or no leader yet).
-async fn reserve(lake: &Lake) -> Option<(u64, u64)> {
+pub async fn reserve(lake: &Lake) -> Option<(u64, u64)> {
     let t = latest(&lake.store).await.ok()??;
     if t.addr.is_empty() || !alive(&lake.store, &t).await || std::env::var_os("PONDRA_NO_DIRECT").is_some() {
         return None;
@@ -964,7 +1007,7 @@ async fn reserve(lake: &Lake) -> Option<(u64, u64)> {
 }
 
 /// Send a request to the leader over HTTP.
-async fn post(addr: &str, r: &Request) -> Result<Value> {
+pub async fn post(addr: &str, r: &Request) -> Result<Value> {
     let (path, body) = r.http()?;
     let res = http().post(format!("http://{addr}{path}")).header("content-type", "application/json").body(body).send().await?;
     ensure!(res.status().is_success(), "the leader at {addr}: {}", res.text().await?);

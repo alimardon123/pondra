@@ -1,0 +1,23 @@
+02:43:37 start frames
+02:43:41 frames exit=0
+02:43:41 start spark
+02:44:22 spark exit=0
+02:44:22 start formats
+02:47:00 formats exit=0
+02:47:00 start h_outside
+02:47:05 h_outside exit=0
+02:47:05 start h_clouds
+02:48:26 h_clouds exit=0
+02:48:26 start h_copies
+02:48:27 h_copies exit=0
+02:48:27 start h_writes
+02:48:31 h_writes exit=0
+02:48:31 start h_across
+02:49:03 h_across exit=0
+02:49:03 start h_names
+02:49:04 h_names exit=0
+02:49:04 start h_temps
+02:49:13 h_temps exit=0
+02:49:13 start open
+02:49:26 open exit=0
+02:49:26 SUITE3_DONE

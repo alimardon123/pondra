@@ -1,0 +1,9 @@
+{
+ "live": {
+  "an answer at once, then one after each commit that changes it ([186, 492] ms), none for other tables or the same answer": true,
+  "closed: nothing runs for it on the node (/stats live_queries back to 0)": true,
+  "JavaScript: for await (const rows of db.live(sql))": true,
+  "refused by name: rows sent with it, and a write": true
+ },
+ "ok": true
+}

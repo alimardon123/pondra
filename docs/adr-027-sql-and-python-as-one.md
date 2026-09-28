@@ -243,7 +243,7 @@ send_report(date.today(), ["ann@example.com"])               # …or right here,
 - **Python inside the binary (PyO3):** it would tie the binary to one Python version and break
   the glibc 2.17 build, and a crashing library would take the node down.
 - **Pyodide / WebAssembly Python for functions:** safe, but many native libraries don't load
-  there. Worth it later, for users who may not run code on the machine (with grants, round 26).
+  there. Worth it later, for users who may not run code on the machine (with grants, round 27).
 - **cloudpickle for the decorators:** bytecode tied to one Python version, unreadable in the
   catalog.
 - **Separate words for SQL and Python routines:** Postgres has one `CREATE FUNCTION` with a

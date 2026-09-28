@@ -1516,10 +1516,10 @@ def schemas():
     # a change to an attached lake's table says which lake and where it runs (ADR-024)
     q("CREATE VIEW from_first AS FROM warehouse.stock")
     from_first = [q("FROM warehouse.stock ORDER BY id"), q("SELECT count(*) AS n FROM (FROM warehouse.stock)", 1), q("FROM from_first ORDER BY id", 2)]
-    change = err("UPDATE warehouse.stock SET qty = 0 WHERE id = 1", 2)
-    checks["FROM t is SELECT * FROM t (alone, a subquery, a view's); UPDATE on an attached lake names it and where it runs"] = \
+    change = q("UPDATE warehouse.stock SET qty = qty + 1 WHERE id = 1", 2)  # (from a follower: that lake's leader carries it out, ADR-028)
+    checks["FROM t is SELECT * FROM t (alone, a subquery, a view's); UPDATE on an attached lake, from any node, is its leader's"] = \
         from_first[0] == [{"id": 1, "qty": 100}, {"id": 2, "qty": 200}, {"id": 3, "qty": 300}] and from_first[1] == [{"n": 3}] and from_first[2] == from_first[0] \
-        and change is not None and "warehouse.stock is in attached lake warehouse" in change and "INSERT works from here" in change
+        and change.get("updated") == 1 and until(lambda: sql(A.port + 6, "SELECT qty FROM stock WHERE id = 1"), [{"qty": 101}], 15) == [{"qty": 101}]
     q("DROP VIEW from_first")
     q("DETACH warehouse")
     gone = [until(lambda i=i: reach(i), False, 15) for i in range(3)]
@@ -3184,9 +3184,482 @@ def _raises_text(f):
         return str(e)
 
 
+# ---------------------------------------------------------------- round 25 (ADR-028)
+
+def _client(port, owner=None):
+    """A Python connection to a node (with the owner's key: this machine's files too)."""
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "python"))
+    import pondra
+    db = pondra.connect(f"http://127.0.0.1:{port}", echo=False)
+    db.owner = owner
+    return db
+
+
+def names():
+    """One vocabulary (ADR-028): every name in dataframe-api.md's table exists and runs; each
+    fallback's answer equals its standard name's, in SQL, Python and PySpark; Delta and Iceberg
+    tables written to a folder — made, APPEND, OVERWRITE, refused, ignored — read back by Pondra,
+    delta-rs and PyIceberg."""
+    import deltalake, glob as g, re
+    from pyiceberg.table import StaticTable
+    lake, out, owner = new_lake(), tempfile.mkdtemp(prefix="pondra-names-"), uuid.uuid4().hex
+    node = Node(lake, A.port, env={"PONDRA_OWNER_KEY": owner}).start()
+    db = _client(A.port, owner)
+    import pondra
+    from pondra.frame import Frame
+    from pondra.spark import SparkSession
+    spark = SparkSession(db)
+    checks = {}
+    db.sql("CREATE TABLE t AS SELECT value AS id, 'n' || value AS name, value * 0.5 AS x FROM generate_series(1, 1000)")
+    paths = {f: f"{out}/{f}/" for f in ("parquet", "csv", "json")}
+    for f, p in paths.items():
+        db.sql(f"COPY (SELECT * FROM t) TO '{p}' (FORMAT {f})")
+    db.table("t").write_delta(f"{out}/delta")
+    db.table("t").write_iceberg(f"{out}/iceberg")
+    paths.update(delta=f"{out}/delta", iceberg=f"{out}/iceberg")
+    rows = lambda frame: sorted(frame.rows(), key=lambda r: r["id"])
+    fmt = lambda name: next(f for f in ("parquet", "csv", "json", "delta", "iceberg") if f in name) if "ndjson" not in name else "json"
+    sql_rows = lambda fn, f: db.sql(f"SELECT * FROM {fn}('{paths[f]}') ORDER BY id").rows()
+    # the table in the docs: each name exists and runs
+    doc = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "docs", "dataframe-api.md")).read()
+    table = doc.split("<!-- vocabulary -->")[1].split("<!-- /vocabulary -->")[0]
+    names_ = [n for line in table.splitlines()[3:] for cell in line.split("|")[2:] for n in re.findall(r"`([^`]+)`", cell)]
+    df = spark.table("t")
+    def works(n):
+        if n.startswith("db."):
+            return callable(getattr(db, n[3:], None))
+        if n.startswith("pondra."):
+            return callable(getattr(pondra, n[7:], None))
+        if n.startswith("frame."):
+            return callable(getattr(Frame, n[6:], None))
+        if n.startswith("spark.read."):
+            return callable(getattr(spark.read, "load" if "format(" in n else n[11:], None))
+        if n.startswith("spark."):
+            return callable(getattr(spark, n[6:], None))
+        if n.startswith("df.write."):
+            return callable(getattr(df.write, "save" if "format(" in n else n[9:], None))
+        if n.startswith("COPY"):
+            f = n.split("FORMAT ")[1].rstrip(")")
+            db.sql(f"COPY (SELECT * FROM t) TO '{out}/copy_{f}/' (FORMAT {f})")
+            return len(db.sql(f"SELECT * FROM read_{f}('{out}/copy_{f}/')").rows()) == 1000
+        if n == "FROM t":
+            return len(db.sql("FROM t").rows()) == 1000
+        if n.startswith("INSERT") or n.startswith("CREATE"):
+            db.sql("CREATE TABLE IF NOT EXISTS t2 AS SELECT * FROM t")
+            return db.sql("INSERT INTO t2 SELECT * FROM t").get("rows") == 1000
+        return len(sql_rows(n, fmt(n))) == 1000  # (a SQL function)
+    missing = [n for n in names_ if not _try(lambda n=n: works(n))]
+    checks[f"every name in dataframe-api.md's table exists and runs ({len(names_)} names)"] = len(names_) > 40 and not missing
+    # each fallback equals its standard name
+    sql_pairs = {"read_parquet": ["parquet_scan"], "read_csv": ["read_csv_auto"], "read_json": ["read_json_auto", "read_ndjson"], "read_delta": ["delta_scan"], "read_iceberg": ["iceberg_scan"]}
+    checks["SQL: parquet_scan, read_csv_auto, read_json_auto, read_ndjson, delta_scan, iceberg_scan == Pondra's names"] = \
+        all(sql_rows(o, fmt(s)) == sql_rows(s, fmt(s)) and len(sql_rows(s, fmt(s))) == 1000 for s, others in sql_pairs.items() for o in others)
+    py_pairs = {"read_parquet": ["scan_parquet"], "read_csv": ["scan_csv"], "read_json": ["scan_ndjson", "read_ndjson"], "read_delta": ["scan_delta"], "read_iceberg": ["scan_iceberg"]}
+    checks["Python: scan_* and read_ndjson == read_*, on the connection and the module"] = \
+        all(rows(getattr(where, o)(paths[fmt(s)])) == rows(getattr(where, s)(paths[fmt(s)])) for s, others in py_pairs.items() for o in others for where in (db, pondra))
+    def written(fn, f):
+        p = f"{out}/w_{fn}/"
+        getattr(db.table("t"), fn)(p)
+        return rows(getattr(db, f"read_{f}")(p))
+    checks["frames: sink_parquet, sink_csv, sink_ndjson, write_ndjson == write_parquet, write_csv, write_json"] = \
+        written("sink_parquet", "parquet") == written("write_parquet", "parquet") and written("sink_csv", "csv") == written("write_csv", "csv") \
+        and written("sink_ndjson", "json") == written("write_json", "json") == written("write_ndjson", "json")
+    spark_rows = lambda d: sorted((r.asDict() for r in d.collect()), key=lambda r: r["id"])
+    checks["PySpark: spark.read.format('delta' | 'iceberg').load == read_delta, read_iceberg"] = \
+        spark_rows(spark.read.format("delta").load(paths["delta"])) == rows(db.read_delta(paths["delta"])) and spark_rows(spark.read.format("iceberg").load(paths["iceberg"])) == rows(db.read_iceberg(paths["iceberg"]))
+    # Delta and Iceberg tables in a folder
+    d, i = f"{out}/modes_delta", f"{out}/modes_iceberg"
+    small = db.sql("SELECT * FROM t WHERE id <= 10")
+    small.write_delta(d)
+    small.write_iceberg(i)
+    refused = [_raises_text(lambda: small.write_delta(d)), _raises_text(lambda: db.sql(f"COPY (SELECT * FROM t) TO '{i}/' (FORMAT iceberg)"))]
+    ignored = [small.write_delta(d, mode="ignore"), small.write_iceberg(i, mode="ignore")]
+    small.write_delta(d, mode="append")
+    db.sql(f"COPY (SELECT * FROM t WHERE id <= 10) TO '{i}/' (FORMAT iceberg, APPEND)")
+    appended = [len(db.read_delta(d).rows()), len(db.read_iceberg(i).rows())]
+    db.sql("SELECT * FROM t WHERE id <= 3").write_delta(d, mode="overwrite")
+    df.filter("id <= 3").write.format("iceberg").mode("overwrite").save(i)
+    latest = sorted(g.glob(f"{i}/metadata/v*.metadata.json"), key=lambda p: int(p.rsplit("/v", 1)[1].split(".")[0]))[-1]
+    theirs = [deltalake.DeltaTable(d).to_pyarrow_table().num_rows, StaticTable.from_metadata(latest).scan().to_arrow().num_rows]
+    checks["Delta and Iceberg folders: made, APPEND, OVERWRITE; again without a mode refused, 'ignore' leaves it; delta-rs and PyIceberg agree"] = \
+        all("is there already" in r for r in refused) and ignored == [None, None] and appended == [20, 20] \
+        and [len(db.read_delta(d).rows()), len(db.read_iceberg(i).rows())] == [3, 3] and theirs == [3, 3]
+    # A folder named relatively is where the node runs (as a notebook's `out/x`): written and read back
+    rd, ri = os.path.relpath(f"{out}/rel_delta"), os.path.relpath(f"{out}/rel_iceberg")  # (the node runs where this does)
+    small.write_delta(rd)
+    small.write_iceberg(ri)
+    back = [len(db.read_delta(rd).rows()), len(db.read_iceberg(ri).rows()), len(db.sql(f"SELECT * FROM delta_scan('{rd}')").rows())]
+    rel_meta = sorted(g.glob(f"{out}/rel_iceberg/metadata/v*.metadata.json"))[-1]
+    checks["a folder named relatively: written and read back (read_delta, read_iceberg, delta_scan); Iceberg's location absolute, as PyIceberg reads it"] = \
+        back == [10, 10, 10] and StaticTable.from_metadata(rel_meta).scan().to_arrow().num_rows == 10
+    node.kill()
+    ok = all(checks.values())
+    print(json.dumps({"names": checks, "ok": ok}, indent=1))
+    if not ok:
+        print("missing:", missing, refused, ignored, appended, theirs, back)
+        sys.exit(1)
+    return f"names: {len(names_)} names in the docs' table run, fallbacks equal, Delta and Iceberg folders: all {len(checks)} checks pass"
+
+
+def answers():
+    """Function answers reused for a while (ADR-028, E10): a second query within the lifetime
+    calls nothing; after it, it calls again; a replaced function never reuses an old answer; a
+    failed call isn't kept; a table function too; the decorator; refused on SQL functions,
+    procedures and schedules."""
+    lake, d = new_lake(), tempfile.mkdtemp(prefix="pondra-answers-")
+    node = Node(lake, A.port, env={"PYTHONPATH": os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "python")}, python=sys.executable).start()
+    db = _client(A.port)
+    calls = os.path.join(d, "calls")
+    n = lambda: sum(1 for _ in open(calls)) if os.path.exists(calls) else 0
+    q = lambda s: sql(A.port, s)
+    checks = {}
+    body = lambda how: f"open({calls!r}, 'a').write(city + '\\n')\nreturn city.{how}()"
+    db.create_function("geo", body("upper"), params={"city": "VARCHAR"}, returns="VARCHAR", cache="10 minutes")
+    q("CREATE TABLE places AS SELECT 'c' || (value % 50) AS city FROM generate_series(1, 20000)")
+    first = (q("SELECT count(DISTINCT geo(city)) AS n FROM places"), n())
+    second = (q("SELECT count(DISTINCT geo(city)) AS n FROM places WHERE city <> ''"), n() - first[1])
+    checks[f"a second query within the lifetime calls nothing ({first[1]} calls, then {second[1]})"] = first[0] == second[0] == [{"n": 50}] and 50 <= first[1] <= 50 * (os.cpu_count() or 1) and second[1] == 0
+    db.create_function("geo", body("lower"), params={"city": "VARCHAR"}, returns="VARCHAR", cache="10 minutes")
+    before = n()
+    checks["a replaced function never reuses an old answer"] = q("SELECT min(geo(city)) AS m FROM places") == [{"m": "c0"}] and n() - before >= 50
+    q(f"CREATE FUNCTION short(x BIGINT) RETURNS BIGINT LANGUAGE python WITH (cache = '1 second') AS $$ open({calls!r}, 'a').write('s\\n'); return x * 2 $$")
+    run = lambda: q("SELECT sum(short(value % 3)) AS s FROM generate_series(1, 100)")
+    k = [n(), run(), n(), run(), n(), time.sleep(1.3), run(), n()]
+    checks["past its lifetime, it calls again"] = k[1] == k[3] == k[6] == [{"s": 200}] and (k[2] - k[0], k[4] - k[2], k[7] - k[4]) == (3, 0, 3)
+    q(f"CREATE FUNCTION rates(base VARCHAR) RETURNS TABLE (cur VARCHAR, r DOUBLE) LANGUAGE python WITH (cache = '5 minutes') AS $$ open({calls!r}, 'a').write('t\\n'); return [(base, 1.0), ('x', 2.0)] $$")
+    before = n()
+    both = [q("SELECT * FROM rates('eur') ORDER BY cur"), q("SELECT count(*) AS n FROM rates('eur')"), q("SELECT count(*) AS n FROM rates('usd')")]
+    checks["a table function's rows too (by its arguments)"] = both[0] == [{"cur": "eur", "r": 1.0}, {"cur": "x", "r": 2.0}] and both[1] == both[2] == [{"n": 2}] and n() - before == 2
+    q(f"""CREATE FUNCTION flaky(x BIGINT) RETURNS BIGINT LANGUAGE python WITH (cache = '5 minutes') AS $$
+    import os
+    if not os.path.exists({calls!r} + '.ok'):
+        open({calls!r} + '.ok', 'w').close()
+        raise ValueError('the first call fails')
+    return x
+$$""")
+    checks["a failed call isn't kept"] = "the first call fails" in _raises_text(lambda: q("SELECT flaky(1) AS v")) and q("SELECT flaky(1) AS v") == [{"v": 1}]
+    refused = [_raises_text(lambda s=s: q(s)) for s in ("CREATE FUNCTION f(x INT) RETURNS INT LANGUAGE sql WITH (cache = '1 minute') AS $$ SELECT x $$",
+                                                        "CREATE PROCEDURE p() LANGUAGE python WITH (cache = '1 minute') AS $$ pass $$",
+                                                        "CREATE FUNCTION g(x INT) RETURNS INT LANGUAGE python WITH (cache = 'cron 0 * * * *') AS $$ return x $$")]
+    checks["refused by name: on a SQL function, a procedure, a schedule"] = all("cache:" in r for r in refused)
+    import pondra
+    @db.function(cache="1 minute")
+    def dbl(x: int) -> int:
+        return x * 2
+    checks["@db.function(cache=…), in SQL and frames"] = q("SELECT dbl(21) AS v") == [{"v": 42}] and db.sql("SELECT 5 AS x").select(pondra.fn.dbl(pondra.col("x")).alias("y")).rows() == [{"y": 10}]
+    node.kill()
+    ok = all(checks.values())
+    print(json.dumps({"answers": checks, "ok": ok}, indent=1))
+    if not ok:
+        print(first, second, k, both, refused)
+        sys.exit(1)
+    return f"answers: reused within their lifetime, by definition and arguments, only after success: all {len(checks)} checks pass"
+
+
+class _Twice(__import__("http.server").server.BaseHTTPRequestHandler):
+    """A proxy to a node that sends every Iceberg commit twice (a retry after a lost answer)."""
+    port = 0
+
+    def _to(self, body=None):
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=120)
+        c.request(self.command, self.path, body, {k: v for k, v in self.headers.items() if k.lower() not in ("host", "content-length")})
+        r = c.getresponse()
+        return r.status, r.getheader("content-type") or "application/json", r.read()
+
+    def _reply(self, status, kind, data):
+        self.send_response(status)
+        self.send_header("content-type", kind)
+        self.send_header("content-length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        self._reply(*self._to())
+
+    do_HEAD = do_GET
+
+    def do_POST(self):
+        body = self.rfile.read(int(self.headers.get("content-length", 0)))
+        first = self._to(body)
+        self._reply(*(self._to(body) if "/tables/" in self.path else first))
+
+    def log_message(self, *_):
+        pass
+
+
+def writes():
+    """Other engines append to Pondra's tables through its Iceberg REST catalog (ADR-028, G8), on
+    two nodes: PyIceberg through the follower; the rows are the table's own (row ids, no writer's
+    files left), and its snapshot is found under its id; two writers at once, one retrying on
+    409, each applied once; a commit sent twice applied once; a view and the Delta copy follow;
+    an attached lake's table; Pondra itself writing to another Pondra's; refused by name: a
+    delete, a schema change, a keyed table, files outside the table's folder, a new table."""
+    import deltalake, glob as g, http.server, pyarrow as pa
+    from pyiceberg.catalog import load_catalog
+    lake, other, third = new_lake(), new_lake(), new_lake()
+    owner = uuid.uuid4().hex
+    a = Node(lake, A.port, tier_secs=0.5).start()
+    b = Node(lake, A.port + 1, tier_secs=0.5).start()
+    o = Node(other, A.port + 2, tier_secs=0.5).start()
+    q = lambda s, port=A.port: sql(port, s)
+    checks = {}
+    q("CREATE TABLE events (id BIGINT, name VARCHAR, amount DOUBLE) WITH (publish = 'iceberg,delta')")
+    q("CREATE TABLE sales (region VARCHAR, amount DOUBLE) WITH (publish = 'iceberg')")
+    q("CREATE MATERIALIZED VIEW by_region AS SELECT region, sum(amount) AS total FROM sales GROUP BY region")
+    q("CREATE TABLE kv (k BIGINT PRIMARY KEY, v VARCHAR) WITH (publish = 'iceberg')")
+    q("INSERT INTO events VALUES (1, 'a', 1.5), (2, 'b', 2.5)")
+    # (on a bucket, PyIceberg writes its files with this environment's credentials, as any writer would)
+    io = {"s3.endpoint": os.environ.get("AWS_ENDPOINT"), "s3.access-key-id": os.environ.get("AWS_ACCESS_KEY_ID"), "s3.secret-access-key": os.environ.get("AWS_SECRET_ACCESS_KEY"),
+          "s3.region": os.environ.get("AWS_REGION", "auto"), "py-io-impl": "pyiceberg.io.fsspec.FsspecFileIO"} if A.s3 else {}  # (fsspec: on R2, pyarrow's multipart upload is refused; lake-format.md says so)
+    cat = load_catalog("pondra", type="rest", uri=f"http://127.0.0.1:{A.port + 1}", **io)  # (the follower)
+    rows = lambda lo, hi: pa.table({"id": pa.array(range(lo, hi), pa.int64()), "name": [f"n{i}" for i in range(lo, hi)], "amount": [i * 0.5 for i in range(lo, hi)]})
+    t = cat.load_table("default.events")
+    t.append(rows(100, 1100))
+    snap = t.current_snapshot().snapshot_id
+    t.refresh()
+    got = q("SELECT count(*) AS n, count(_row_id) AS ids, count(DISTINCT _row_id) AS distinct_ids, sum(id) AS s FROM events WHERE id >= 100")
+    left = g.glob(f"{lake}/data/events/data/*") if not A.s3 else []
+    checks["PyIceberg appends through a follower: the rows are the table's own (row ids), the writer's files gone, its snapshot found by its id"] = \
+        got == [{"n": 1000, "ids": 1000, "distinct_ids": 1000, "s": sum(range(100, 1100))}] and not left and t.metadata.snapshot_by_id(snap) is not None
+    one, two = cat.load_table("default.events"), cat.load_table("default.events")
+    one.append(rows(2000, 2100))
+    two.append(rows(3000, 3100))  # (written on the snapshot before: 409, then PyIceberg retries on top)
+    checks["two writers at once: the second gets 409, retries, and each append is in once"] = \
+        q("SELECT count(*) AS n FROM events WHERE id >= 2000") == [{"n": 200}]
+    _Twice.port = A.port
+    proxy = http.server.ThreadingHTTPServer(("127.0.0.1", A.port + 9), _Twice)
+    threading.Thread(target=proxy.serve_forever, daemon=True).start()
+    twice = load_catalog("twice", type="rest", uri=f"http://127.0.0.1:{A.port + 9}", **io).load_table("default.events")
+    twice.append(rows(5000, 5010))
+    proxy.shutdown()
+    checks["a commit sent twice (a retry after a lost answer) is applied once"] = q("SELECT count(*) AS n FROM events WHERE id >= 5000") == [{"n": 10}]
+    cat.load_table("default.sales").append(pa.table({"region": ["eu", "us", "eu"], "amount": [1.0, 2.0, 3.0]}))
+    view = until(lambda: q("SELECT region, total FROM by_region ORDER BY region"), [{"region": "eu", "total": 4.0}, {"region": "us", "total": 2.0}], 15)
+    delta = until(lambda: _try(lambda: deltalake.DeltaTable(f"{lake}/data/events").to_pyarrow_table().num_rows) if not A.s3 else 1212, 1212, 20)
+    checks["a view of the table follows (through the log), and so does its Delta copy"] = view == [{"region": "eu", "total": 4.0}, {"region": "us", "total": 2.0}] and delta == 1212
+    q(f"ATTACH '{other}' AS other")
+    sql(A.port + 2, "CREATE TABLE stock (id BIGINT, qty BIGINT) WITH (publish = 'iceberg')")
+    until(lambda: _try(lambda: cat.load_table("other.stock")) is not None, True, 15)  # (the follower attaches it a moment later)
+    cat.load_table("other.stock").append(pa.table({"id": pa.array([1, 2], pa.int64()), "qty": pa.array([10, 20], pa.int64())}))
+    checks["an attached lake's table, through this lake's catalog: its leader records it"] = \
+        until(lambda: sql(A.port + 2, "SELECT sum(qty) AS s FROM stock"), [{"s": 30}], 15) == [{"s": 30}]
+    c = Node(third, A.port + 3, env={"PONDRA_OWNER_KEY": owner}).start()
+    as_owner = lambda s: call(A.port + 3, "POST", "/sql", s.encode(), headers={"x-pondra-owner": owner})
+    as_owner(f"ATTACH 'http://127.0.0.1:{A.port}' AS pondra_a (TYPE iceberg)")
+    as_owner("INSERT INTO pondra_a.default.events SELECT value + 9000, 'p', 0.0 FROM generate_series(1, 5)")
+    checks["Pondra itself appends to another Pondra's table through its catalog"] = q("SELECT count(*) AS n FROM events WHERE name = 'p'") == [{"n": 5}]
+    q("INSERT INTO kv VALUES (1, 'a')")
+    q("CHECKPOINT")  # (a keyed table is published once compacted)
+    ev = cat.load_table("default.events")
+    refused = {
+        "a delete": _raises_text(lambda: ev.delete("id < 10")),
+        "a schema change": _raises_text(lambda: ev.update_schema().add_column("extra", __import__("pyiceberg.types").types.IntegerType()).commit()),
+        "a keyed table": _raises_text(lambda: cat.load_table("default.kv").append(pa.table({"k": pa.array([1], pa.int64()), "v": ["x"]}))),
+        "a new table": _raises_text(lambda: cat.create_table("default.fresh", schema=rows(0, 1).schema)),
+    }
+    outside = None if A.s3 else f"{lake}/data/sales/stray.parquet"  # (in the lake, not in the table's data folder)
+    if outside:
+        import pyarrow.parquet as pq
+        pq.write_table(pa.table({"region": ["zz"], "amount": [9.0]}), outside)
+        refused["files outside the table's folder"] = _raises_text(lambda: cat.load_table("default.sales").add_files([outside]))
+    said = {"a delete": "go through Pondra's SQL", "a schema change": "ALTER TABLE", "a keyed table": "keyed table", "a new table": "support", "files outside the table's folder": "data folder"}
+    checks["refused by name: " + ", ".join(refused)] = all(said[k] in v for k, v in refused.items()) \
+        and (outside is None or os.path.exists(outside)) and q("SELECT count(*) AS n FROM events WHERE id < 10") == [{"n": 2}]
+    [x.kill() for x in (a, b, o, c)]
+    ok = all(checks.values())
+    print(json.dumps({"writes": checks, "ok": ok}, indent=1))
+    if not ok:
+        print(got, left, view, delta, {k: v[:300] for k, v in refused.items()})
+        sys.exit(1)
+    return f"writes: PyIceberg and Pondra append through the Iceberg REST catalog, once each, views following: all {len(checks)} checks pass"
+
+
+def live():
+    """Live queries (ADR-028, B3): an answer at once, then one within milliseconds of a commit
+    that changes the query's table (an INSERT, an UPDATE, through a view), none for commits to
+    other tables or that leave the answer as it was; Python and JavaScript; closed, nothing runs."""
+    lake = new_lake()
+    node = Node(lake, A.port).start()
+    db = _client(A.port)
+    q = lambda s: sql(A.port, s)
+    checks = {}
+    q("CREATE TABLE orders (id BIGINT, region VARCHAR, amount DOUBLE)")
+    q("CREATE TABLE other (x BIGINT)")
+    q("INSERT INTO orders VALUES (1, 'eu', 10), (2, 'us', 20)")
+    q("CREATE VIEW big AS SELECT region, sum(amount) AS total FROM orders GROUP BY region")
+    got, stop = [], threading.Event()
+    def listen():
+        for rows in db.live("SELECT * FROM big ORDER BY region"):
+            got.append((time.time(), rows))
+            if stop.is_set():
+                break
+    t = threading.Thread(target=listen, daemon=True)
+    t.start()
+    until(lambda: len(got), 1, 10)
+    q("INSERT INTO other VALUES (1)")
+    q("INSERT INTO orders VALUES (3, 'eu', 0)")  # (the answer stays as it was)
+    time.sleep(1)
+    quiet = len(got)
+    lat = []
+    for s in ("INSERT INTO orders VALUES (4, 'asia', 5)", "UPDATE orders SET amount = amount + 1 WHERE id = 1"):
+        n0, t0 = len(got), time.time()
+        q(s)
+        until(lambda: len(got), n0 + 1, 10)
+        lat.append(round((got[-1][0] - t0) * 1000) if len(got) > n0 else None)
+    checks[f"an answer at once, then one after each commit that changes it ({lat} ms), none for other tables or the same answer"] = \
+        quiet == 1 and got[0][1] == [{"region": "eu", "total": 10.0}, {"region": "us", "total": 20.0}] \
+        and got[-1][1] == [{"region": "asia", "total": 5.0}, {"region": "eu", "total": 11.0}, {"region": "us", "total": 20.0}] and all(x is not None and x < 1000 for x in lat)
+    stop.set()
+    q("INSERT INTO orders VALUES (5, 'eu', 1)")
+    t.join(10)
+    open_after = until(lambda: call(A.port, "GET", "/stats")["live_queries"], 0, 25)
+    checks["closed: nothing runs for it on the node (/stats live_queries back to 0)"] = not t.is_alive() and open_after == 0
+    js = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "js", "index.js")
+    script = f"""import {{ connect }} from {json.dumps(js)};
+const db = connect("http://127.0.0.1:{A.port}"); const seen = [];
+for await (const rows of db.live("SELECT count(*) AS n FROM orders")) {{ seen.push(rows[0].n); if (seen.length === 1) await db.sql("INSERT INTO orders VALUES (6, 'eu', 1)"); else break; }}
+console.log(JSON.stringify(seen));"""
+    path = os.path.join(tempfile.mkdtemp(prefix="pondra-live-"), "live.mjs")
+    open(path, "w").write(script)
+    js_out = subprocess.run(["node", path], capture_output=True, text=True, timeout=60)
+    checks["JavaScript: for await (const rows of db.live(sql))"] = js_out.stdout.strip() == "[5,6]"
+    checks["refused by name: rows sent with it, and a write"] = "never change" in _raises_text(lambda: next(db.live(db.from_arrow([{"a": 1}])))) \
+        and "one query" in _raises_text(lambda: next(db.live("INSERT INTO other VALUES (2)")))
+    node.kill()
+    ok = all(checks.values())
+    print(json.dumps({"live": checks, "ok": ok}, indent=1))
+    if not ok:
+        print(got, quiet, lat, open_after, js_out.stdout, js_out.stderr[-500:])
+        sys.exit(1)
+    return f"live: answers pushed within {max(lat)} ms of a commit that changes them, nothing when closed: all {len(checks)} checks pass"
+
+
+def temps():
+    """Temporary tables and views (ADR-028), on three nodes: CREATE TEMP TABLE (with columns, AS
+    a query), INSERT, UPDATE (a row keeps its _row_id), DELETE, MERGE, TEMP VIEW, DROP; they shadow
+    a lake table; another session doesn't see them; a spread query reading one runs on its node
+    with the same answer; not answered from the result cache; a procedure sees its caller's;
+    a Postgres connection's end with it; close() and idleness end a session; without one, refused."""
+    import psycopg
+    lake = new_lake()
+    env = {"PYTHONPATH": os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "python"), "PONDRA_SESSION_IDLE_SECS": "3"}
+    nodes = [Node(lake, A.port + i, env=env, python=sys.executable, pg=f"127.0.0.1:{A.port + 10 + i}").start() for i in range(3)]
+    time.sleep(1)
+    db, other = _client(A.port), _client(A.port)
+    rows = lambda s, c=db: c.sql(s).rows()
+    run = lambda s, c=db: c.sql(s)
+    checks = {}
+    run("CREATE TABLE orders AS SELECT value AS id, 'u' || (value % 7) AS who, value * 1.0 AS amount FROM generate_series(1, 30000)")
+    run("CREATE TEMP TABLE picked (id BIGINT, note VARCHAR)")
+    run("INSERT INTO picked SELECT id, 'big' FROM orders WHERE amount > 29990")
+    run("INSERT INTO picked (id) VALUES (1), (2)")
+    before = {r["id"]: r["_row_id"] for r in rows("SELECT id, _row_id FROM picked")}
+    run("UPDATE picked SET note = 'small' WHERE id < 10")
+    run("DELETE FROM picked WHERE id = 2")
+    run("MERGE INTO picked p USING (SELECT 29999 AS id UNION ALL SELECT 7) s ON p.id = s.id WHEN MATCHED THEN DELETE WHEN NOT MATCHED THEN INSERT VALUES (s.id, 'merged')")
+    got = rows("SELECT id, note, _row_id FROM picked ORDER BY id")
+    checks["CREATE TEMP TABLE, INSERT (all columns or some), UPDATE (a row keeps its _row_id), DELETE, MERGE"] = \
+        [(r["id"], r["note"]) for r in got] == [(1, "small"), (7, "merged"), (29991, "big"), (29992, "big"), (29993, "big"), (29994, "big"), (29995, "big"), (29996, "big"), (29997, "big"), (29998, "big"), (30000, "big")] \
+        and next(r["_row_id"] for r in got if r["id"] == 1) == before[1]
+    run("CREATE TEMP TABLE top AS SELECT who, sum(amount) AS total FROM orders GROUP BY who")
+    run("CREATE TEMP VIEW mine AS SELECT o.* FROM orders o JOIN picked USING (id)")
+    joined = rows("SELECT count(*) AS n FROM mine")
+    spread = [call(A.port, "POST", f"/sql?spread={s}", b"SELECT count(*) AS n, sum(o.amount) AS s FROM orders o JOIN picked USING (id)", headers={"x-pondra-session": db.session}) for s in (0, 1)]
+    checks["TEMP VIEW, CTAS; a query spread over three nodes reading one runs on its node, with the same answer"] = \
+        joined == [{"n": 11}] and spread[0] == spread[1] and spread[0][0]["n"] == 11 and len(rows("SELECT * FROM top")) == 7
+    cached = [rows("SELECT count(*) AS n FROM picked"), run("INSERT INTO picked VALUES (5, 'x')"), rows("SELECT count(*) AS n FROM picked")]
+    checks["not answered from the result cache (the same query after a change to it)"] = cached[0] == [{"n": 11}] and cached[2] == [{"n": 12}]
+    run("CREATE TEMP TABLE orders AS SELECT 99 AS id")
+    shadow = [rows("SELECT count(*) AS n FROM orders"), rows("SELECT count(*) AS n FROM orders", other)]
+    run("DROP TABLE orders")
+    checks["a temporary table shadows the lake's of its name, for its session only; DROP takes it away"] = \
+        shadow == [[{"n": 1}], [{"n": 30000}]] and rows("SELECT count(*) AS n FROM orders") == [{"n": 30000}]
+    unseen = [_raises_text(lambda: rows("SELECT * FROM picked", other)), _raises_text(lambda: call(A.port, "POST", "/sql", b"SELECT * FROM picked"))]
+    no_session = _raises_text(lambda: call(A.port, "POST", "/sql", b"CREATE TEMP TABLE x (a INT)"))
+    checks["another session doesn't see them; without a session, CREATE TEMP TABLE is refused by name"] = all("picked" in u for u in unseen) and "x-pondra-session" in no_session
+    lake_view = _raises_text(lambda: run("CREATE VIEW v AS SELECT * FROM picked"))
+    run("CREATE PROCEDURE count_picked() LANGUAGE python AS $$ return pondra.sql('SELECT count(*) AS n FROM picked').rows()[0]['n'] $$")
+    answer = db.call("count_picked")
+    checks["a lake's view over one refused; a procedure sees its caller's"] = "ends with the session" in lake_view and "12" in str(answer.rows() if hasattr(answer, "rows") else answer)
+    with psycopg.connect(f"host=127.0.0.1 port={A.port + 10} user=u dbname=lake", autocommit=True) as pg:
+        pg.execute("CREATE TEMP TABLE t1 (a INT)")
+        pg.execute("INSERT INTO t1 VALUES (1), (2)")
+        mine = pg.execute("SELECT sum(a) FROM t1 WHERE a > %s", (0,)).fetchall()  # (described, then run: both in the connection's session)
+    time.sleep(0.5)
+    with psycopg.connect(f"host=127.0.0.1 port={A.port + 10} user=u dbname=lake", autocommit=True) as pg:
+        gone = _raises_text(lambda: pg.execute("SELECT * FROM t1").fetchall())
+    checks["Postgres: a connection's own, gone when it ends"] = mine == [(3,)] and "t1" in gone
+    session = db.session
+    db.close()
+    closed = _raises_text(lambda: call(A.port, "POST", "/sql", b"SELECT * FROM picked", headers={"x-pondra-session": session}))
+    idle = _client(A.port)
+    idle.sql("CREATE TEMP TABLE soon (a INT)")
+    time.sleep(6.5)
+    idled = _raises_text(lambda: idle.sql("SELECT * FROM soon").rows())
+    checks["close() ends a session; so does idleness (PONDRA_SESSION_IDLE_SECS)"] = "picked" in closed and "soon" in idled
+    [n.kill() for n in nodes]
+    ok = all(checks.values())
+    print(json.dumps({"temps": checks, "ok": ok}, indent=1))
+    if not ok:
+        print(got, before, joined, spread, cached, shadow, unseen, no_session, lake_view, mine, gone, closed, idled)
+        sys.exit(1)
+    return f"temps: a session's own tables and views, every statement, on its node: all {len(checks)} checks pass"
+
+
+def across():
+    """UPDATE, DELETE and MERGE on an attached lake from another lake's follower (ADR-028): that
+    lake's leader carries them out, reading what it can't — this lake's tables, a session's
+    temporary table, a file on this machine — sent with them; equal to the same statements run on
+    that lake's own node; a retried job applies once; with nobody leading that lake, too."""
+    lake, other = new_lake(), new_lake()
+    owner, files = uuid.uuid4().hex, tempfile.mkdtemp(prefix="pondra-across-")
+    a = [Node(lake, A.port + i, env={"PONDRA_OWNER_KEY": owner}).start() for i in range(2)]
+    b = Node(other, A.port + 2).start()
+    q = lambda s, port=A.port + 1, job=None, h=None: call(port, "POST", "/sql" + (f"?job={job}" if job else ""), s.encode(), headers={"x-pondra-owner": owner, **(h or {})})
+    checks = {}
+    rows4 = "(1, 'a'), (2, 'b'), (3, 'c'), (4, 'd')"
+    for s in ("CREATE TABLE t (id BIGINT, v VARCHAR)", "CREATE TABLE twin (id BIGINT, v VARCHAR)", f"INSERT INTO t VALUES {rows4}", f"INSERT INTO twin VALUES {rows4}",
+              "CREATE TABLE src_twin (id BIGINT, v VARCHAR)", "INSERT INTO src_twin VALUES (2, 'B'), (5, 'e')", "CREATE TABLE fix (id BIGINT, v VARCHAR)",
+              "INSERT INTO fix VALUES (3, 'C'), (6, 'f')", "CREATE TABLE drop_twin AS SELECT 4 AS id",  # (that lake's own, for the same statements there)
+              "CREATE TABLE src (id BIGINT, v VARCHAR)", "INSERT INTO src VALUES (2, 'WRONG')", "CREATE TABLE drop_these AS SELECT 1 AS id"):  # (same names, other rows: never read for ours)
+        sql(A.port + 2, s)
+    q(f"ATTACH '{other}' AS b", A.port)
+    until(lambda: _try(lambda: q("SELECT count(*) AS n FROM b.t")), [{"n": 4}], 15)  # (the follower attaches it a moment later)
+    q("CREATE TABLE src (id BIGINT, v VARCHAR)", A.port)
+    q("INSERT INTO src VALUES (2, 'B'), (5, 'e')", A.port)
+    open(f"{files}/fix.csv", "w").write("id,v\n3,C\n6,f\n")
+    h = {"x-pondra-session": "across-session-1"}
+    q("CREATE TEMP TABLE drop_these AS SELECT 4 AS id", h=h)
+    steps = ["UPDATE {t} SET v = v || '!' WHERE id = 1",
+             "DELETE FROM {t} WHERE id IN (SELECT id FROM {drop})",
+             "MERGE INTO {t} AS x USING {src} ON x.id = src.id WHEN MATCHED THEN UPDATE SET v = src.v WHEN NOT MATCHED THEN INSERT VALUES (src.id, src.v)",
+             "MERGE INTO {t} AS x USING {fix} AS f ON x.id = f.id WHEN MATCHED THEN UPDATE SET v = f.v WHEN NOT MATCHED THEN INSERT VALUES (f.id, f.v)"]
+    outs = []
+    for s in steps:
+        outs.append(q(s.format(t="b.t", fix=f"'{files}/fix.csv'", src="src", drop="drop_these"), h=h, job=f"across-{len(outs)}"))  # (this lake's src, the session's drop_these, a file here)
+        sql(A.port + 2, s.format(t="twin", fix="fix", src="src_twin AS src", drop="drop_twin"))  # (the same, with that lake's own tables)
+    theirs = sql(A.port + 2, "SELECT id, v FROM t ORDER BY id")
+    twin = sql(A.port + 2, "SELECT id, v FROM twin ORDER BY id")
+    checks["from a follower of another lake: UPDATE, DELETE with a temporary table, MERGE from this lake's table and from a file here == the same on that lake's node"] = \
+        theirs == twin == [{"id": 1, "v": "a!"}, {"id": 2, "v": "B"}, {"id": 3, "v": "C"}, {"id": 5, "v": "e"}, {"id": 6, "v": "f"}]
+    again = q(steps[0].format(t="b.t", fix="", src="", drop=""), h=h, job="across-0")
+    checks["a retried job applies once"] = again.get("duplicate") is True and sql(A.port + 2, "SELECT v FROM t WHERE id = 1") == [{"v": "a!"}]
+    b.kill()
+    idle = call(A.port + 1, "POST", "/sql", b"UPDATE b.t SET v = 'idle' WHERE id = 6", timeout=180)  # (once its leader's lease lapses)
+    seen = until(lambda: q("SELECT v FROM b.t WHERE id = 6", A.port), [{"v": "idle"}], 30)  # (another node: once it reads that lake's catalog again)
+    checks["with nobody leading that lake: this node leads it for the moment it takes"] = idle.get("updated") == 1 and seen == [{"v": "idle"}]
+    [n.kill() for n in a]
+    ok = all(checks.values())
+    print(json.dumps({"across": checks, "ok": ok}, indent=1))
+    if not ok:
+        print(outs, theirs, twin, again, idle)
+        sys.exit(1)
+    return f"across: changes to an attached lake from any node: all {len(checks)} checks pass"
+
+
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    out = {t.__name__: t() for t in (upsert, deal, outside, clouds, kafkas, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, scale, flight, reader, crash)}
+    out = {t.__name__: t() for t in (upsert, deal, outside, clouds, kafkas, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, names, answers, writes, live, temps, across, scale, flight, reader, crash)}
     A.secs = min(A.secs, 20)
     out["load"] = load()
     print(json.dumps(out, indent=1))
@@ -3194,7 +3667,7 @@ def all_tests():
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "scale", "flight", "load", "all"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "names", "answers", "writes", "live", "temps", "across", "scale", "flight", "load", "all"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -3205,4 +3678,4 @@ if __name__ == "__main__":
     ap.add_argument("--secs", type=int, default=30)
     ap.add_argument("--flush-ms", type=int, default=250)
     A = ap.parse_args()
-    {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "scale": scale, "flight": flight, "load": load, "all": all_tests}[A.mode]()
+    {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "names": names, "answers": answers, "writes": writes, "live": live, "temps": temps, "across": across, "scale": scale, "flight": flight, "load": load, "all": all_tests}[A.mode]()

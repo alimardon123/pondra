@@ -1,0 +1,15 @@
+{
+ "guard": {
+  "the same answers every way": true,
+  "a query nothing is known about stays on one node": true,
+  "over a slow network, queries that would shuffle stay on one node": true,
+  "over a fast one, they spread": true,
+  "?spread=1 spreads anyway": true,
+  "a query that ran both ways goes the faster way": true
+ },
+ "ok": true,
+ "learned": [
+  true,
+  true
+ ]
+}

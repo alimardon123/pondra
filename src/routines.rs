@@ -89,6 +89,9 @@ pub struct Options {
     /// Seconds a call may take (a function's: each batch, 60 by default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout: Option<f64>,
+    /// Seconds an answer is reused for the same arguments (`cache = '5 minutes'`: `pyfn::Answers`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache: Option<u64>,
 }
 
 impl Options {
@@ -260,6 +263,7 @@ fn routine(p: &mut Parser, procedure: bool) -> Result<(String, Routine)> {
     ensure!(r.returns.as_deref().is_none_or(|t| !crate::pyfn::loose(Some(t)) || crate::pyfn::is_json(Some(t))), "RETURNS ANY: say the type it returns (VARIANT for any JSON value)");
     ensure!(!r.with.vectorized || (r.python() && r.kind == Kind::Macro), "vectorized: a Python function returning a value (not a table, or a procedure)");
     ensure!(r.python() || (r.with.packages.is_empty() && r.with.entry.is_empty()), "packages and entry: a Python routine's");
+    ensure!(r.with.cache.is_none() || (r.python() && !procedure), "cache: a Python function's (a SQL function is part of its query, whose answers the result cache keeps; a procedure is called for what it does)");
     Ok((name, r))
 }
 
@@ -319,11 +323,15 @@ fn options(p: &mut Parser, o: &mut Options) -> Result<()> {
             "packages" => o.packages = v.split(',').map(str::trim).filter(|s| !s.is_empty()).collect::<Vec<_>>().join(", "),
             "entry" => o.entry = v.clone(),
             "timeout" => o.timeout = Some(v.parse::<f64>().ok().filter(|s| *s > 0.0).context("timeout: seconds")?),
+            "cache" => o.cache = Some(match crate::runs::every(&v).context("cache: how long an answer is reused ('10 minutes', '30 seconds')")? {
+                crate::runs::Every::Seconds(s) => s,
+                crate::runs::Every::Cron(..) => bail!("cache: how long ('10 minutes'), not a schedule"),
+            }),
             "volatility" => {
                 ensure!(["immutable", "stable", "volatile"].contains(&v.as_str()), "volatility: immutable, stable or volatile");
                 o.volatility = Some(v.clone());
             }
-            _ => bail!("WITH ({k} …): vectorized, packages, entry, timeout, strict or volatility"),
+            _ => bail!("WITH ({k} …): vectorized, packages, entry, timeout, cache, strict or volatility"),
         }
         if p.consume_token(&Token::RParen) {
             return Ok(());

@@ -9,7 +9,7 @@
 //! rewritten. Pondra's Parquet files carry no Iceberg field ids, so columns are mapped by name
 //! (`schema.name-mapping.default`).
 use crate::store::*;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use datafusion::arrow::datatypes::{DataType, TimeUnit};
 use object_store::{path::Path, ObjectStoreExt};
 use serde::{Deserialize, Serialize};
@@ -45,8 +45,9 @@ struct Avro {
     seq: u64, // the snapshot that added it; its entries carry this sequence number
 }
 
-/// The table's next Iceberg version, if its files changed; returns the new state to record.
-pub async fn publish(lake: &Lake, table: &str, meta: &TableMeta) -> Result<Option<(String, Vec<u8>)>> {
+/// The table's next Iceberg version, if its files changed (or `named`: another engine's commit
+/// is in them, and its version carries that engine's snapshot id); returns the new state to record.
+pub async fn publish(lake: &Lake, table: &str, meta: &TableMeta, named: Option<&Named<'_>>) -> Result<Option<(String, Vec<u8>)>> {
     let Some(fields) = fields(meta) else { return Ok(None) }; // a type Iceberg can't carry
     let Some(parts) = crate::delta::publishable(lake, meta).await? else { return Ok(None) };
     let key = format!("i/{table}");
@@ -55,7 +56,7 @@ pub async fn publish(lake: &Lake, table: &str, meta: &TableMeta) -> Result<Optio
     let fresh: Vec<&crate::manifest::Manifest> = parts.manifests.iter().filter(|m| !st.manifests.contains_key(&m.path)).collect();
     let went: Vec<String> = st.manifests.keys().filter(|p| !parts.manifests.iter().any(|m| m.path == **p)).cloned().collect();
     let inline_changed = st.inline.is_none() != parts.inline.is_empty() || st.inlined != inlined;
-    if st.version > 0 && fresh.is_empty() && went.is_empty() && !inline_changed {
+    if st.version > 0 && fresh.is_empty() && went.is_empty() && !inline_changed && named.is_none() {
         return Ok(None);
     }
     if st.uuid.is_empty() {
@@ -67,15 +68,18 @@ pub async fn publish(lake: &Lake, table: &str, meta: &TableMeta) -> Result<Optio
     while lake.store.head(&Path::from(format!("{dir}/v{v}.metadata.json"))).await.is_ok() {
         v += 1;
     }
+    // Version N is sequence number N; its snapshot id is N too, unless another engine's commit
+    // named it (`record`), so the engine finds its snapshot.
+    let id = named.map_or(v as i64, |n| n.id);
     let schema = json!({"type": "struct", "schema-id": 0, "fields": fields});
     // The manifests this snapshot adds: one per new manifest of ours, and one for the inline files.
     let mut written = vec![];
     for m in &fresh {
         let files = crate::manifest::files(lake, m).await?;
-        written.push((Some(m.path.clone()), write_manifest(lake, &dir, &schema, v, &files).await?));
+        written.push((Some(m.path.clone()), write_manifest(lake, &dir, &schema, v, id, &files).await?));
     }
     if inline_changed && !parts.inline.is_empty() {
-        written.push((None, write_manifest(lake, &dir, &schema, v, &parts.inline).await?));
+        written.push((None, write_manifest(lake, &dir, &schema, v, id, &parts.inline).await?));
     }
     // The snapshot's manifest list: the ones written now, plus the ones it keeps from before.
     let kept: Vec<Avro> = parts.manifests.iter().filter_map(|m| st.manifests.get(&m.path).cloned()).collect();
@@ -86,18 +90,21 @@ pub async fn publish(lake: &Lake, table: &str, meta: &TableMeta) -> Result<Optio
     let all: Vec<Avro> = written.iter().map(|(_, a)| a.clone()).chain(kept).chain(inline.clone().filter(|_| !inline_changed)).collect();
     let entries: Vec<Vec<u8>> = all.iter().map(|a| {
         let new = a.seq == v;
-        manifest_file(&lake.full(&a.path), a.bytes as usize, v, a.seq, [if new { a.files as usize } else { 0 }, if new { 0 } else { a.files as usize }],
+        manifest_file(&lake.full(&a.path), a.bytes as usize, v, a.seq, id, [if new { a.files as usize } else { 0 }, if new { 0 } else { a.files as usize }],
                       [if new { a.rows as i64 } else { 0 }, if new { 0 } else { a.rows as i64 }])
     }).collect();
     let list = format!("{dir}/snap-{v}-{}.avro", uuid::Uuid::new_v4());
     let parent = st.snapshots.last().map(|(s, _)| s["snapshot-id"].clone());
-    let list_meta = [("snapshot-id", v.to_string()), ("parent-snapshot-id", parent.as_ref().map_or("null".into(), Value::to_string)), ("sequence-number", v.to_string()), ("format-version", "2".into())];
+    let list_meta = [("snapshot-id", id.to_string()), ("parent-snapshot-id", parent.as_ref().map_or("null".into(), Value::to_string)), ("sequence-number", v.to_string()), ("format-version", "2".into())];
     lake.put(&list, ocf(&list_schema(), &list_meta, &entries)).await?;
     let (files, rows) = (all.iter().map(|a| a.files).sum::<u64>(), all.iter().map(|a| a.rows).sum::<u64>());
     let added: u64 = written.iter().map(|(_, a)| a.files).sum();
     let op = if went.is_empty() && !inline_changed { "append" } else { "overwrite" };
-    let mut snapshot = json!({"snapshot-id": v, "sequence-number": v, "timestamp-ms": now, "manifest-list": lake.full(&list), "schema-id": 0,
-        "summary": {"operation": op, "added-data-files": added.to_string(), "total-data-files": files.to_string(), "total-records": rows.to_string()}});
+    let mut summary = named.map(|n| n.summary.clone()).unwrap_or_default(); // (the writer's own keys, `pondra.job` say)
+    for (k, val) in [("operation", op.to_string()), ("added-data-files", added.to_string()), ("total-data-files", files.to_string()), ("total-records", rows.to_string())] {
+        summary.insert(k.into(), val.into());
+    }
+    let mut snapshot = json!({"snapshot-id": id, "sequence-number": v, "timestamp-ms": now, "manifest-list": lake.full(&list), "schema-id": 0, "summary": summary});
     if let Some(p) = parent {
         snapshot["parent-snapshot-id"] = p;
     }
@@ -118,10 +125,10 @@ pub async fn publish(lake: &Lake, table: &str, meta: &TableMeta) -> Result<Optio
         st.dropped.extend(st.inline.take().map(|a| (v, a.path)));
     }
     for (s, list) in &gone {
-        lake.delete(&format!("{dir}/v{}.metadata.json", s["snapshot-id"])).await;
+        lake.delete(&format!("{dir}/v{}.metadata.json", s["sequence-number"])).await;
         lake.delete(list).await;
     }
-    let oldest = st.snapshots.first().map_or(v, |(s, _)| s["snapshot-id"].as_u64().unwrap_or(v));
+    let oldest = st.snapshots.first().map_or(v, |(s, _)| s["sequence-number"].as_u64().unwrap_or(v));
     for (_, path) in st.dropped.iter().filter(|(at, _)| *at < oldest) {
         lake.delete(path).await;
     }
@@ -142,9 +149,9 @@ pub async fn publish(lake: &Lake, table: &str, meta: &TableMeta) -> Result<Optio
     Ok(Some((key, json(&st))))
 }
 
-/// One Iceberg manifest holding `files`, added by snapshot `v`.
-async fn write_manifest(lake: &Lake, dir: &str, schema: &Value, v: u64, files: &[DataFile]) -> Result<Avro> {
-    let entries: Vec<Vec<u8>> = files.iter().map(|f| entry(true, v, &lake.full(&f.path), f.rows, f.bytes)).collect();
+/// One Iceberg manifest holding `files`, added by version `v` (snapshot `id`).
+async fn write_manifest(lake: &Lake, dir: &str, schema: &Value, v: u64, id: i64, files: &[DataFile]) -> Result<Avro> {
+    let entries: Vec<Vec<u8>> = files.iter().map(|f| entry(true, v, id, &lake.full(&f.path), f.rows, f.bytes)).collect();
     let spec = [("schema", schema.to_string()), ("schema-id", "0".into()), ("partition-spec", "[]".into()), ("partition-spec-id", "0".into()), ("format-version", "2".into()), ("content", "data".into())];
     let body = ocf(&entry_schema(), &spec, &entries);
     let path = format!("{dir}/{}-m0.avro", uuid::Uuid::new_v4());
@@ -166,6 +173,7 @@ fn metadata(lake: &Lake, table: &str, uuid: &str, v: u64, now: u64, schema: &Val
     // name — PyIceberg — takes them, and leaves them out as the schema does.
     names.extend(crate::sys::NAMES.iter().enumerate().map(|(i, c)| json!({"field-id": 1_000_001 + i, "names": [c]})));
     let older = &snapshots[..snapshots.len() - 1];
+    let current = &snapshots[snapshots.len() - 1].0["snapshot-id"];
     json!({
         "format-version": 2, "table-uuid": uuid, "location": lake.full(&format!("data/{table}")),
         "last-sequence-number": v, "last-updated-ms": now, "last-column-id": 2 * columns.len(), // (list elements take ids after the columns')
@@ -173,11 +181,24 @@ fn metadata(lake: &Lake, table: &str, uuid: &str, v: u64, now: u64, schema: &Val
         "default-spec-id": 0, "partition-specs": [{"spec-id": 0, "fields": []}], "last-partition-id": 999,
         "default-sort-order-id": 0, "sort-orders": [{"order-id": 0, "fields": []}],
         "properties": {"schema.name-mapping.default": Value::Array(names).to_string(), "written-by": "pondra"},
-        "current-snapshot-id": v, "refs": {"main": {"snapshot-id": v, "type": "branch"}},
+        "current-snapshot-id": current, "refs": {"main": {"snapshot-id": current, "type": "branch"}},
         "snapshots": snapshots.iter().map(|(s, _)| s).collect::<Vec<_>>(),
         "snapshot-log": snapshots.iter().map(|(s, _)| json!({"snapshot-id": s["snapshot-id"], "timestamp-ms": s["timestamp-ms"]})).collect::<Vec<_>>(),
-        "metadata-log": older.iter().map(|(s, _)| json!({"metadata-file": lake.full(&format!("data/{table}/metadata/v{}.metadata.json", s["snapshot-id"])), "timestamp-ms": s["timestamp-ms"]})).collect::<Vec<_>>(),
+        "metadata-log": older.iter().map(|(s, _)| json!({"metadata-file": lake.full(&format!("data/{table}/metadata/v{}.metadata.json", s["sequence-number"])), "timestamp-ms": s["timestamp-ms"]})).collect::<Vec<_>>(),
     })
+}
+
+/// A new table's first metadata, with no snapshot (`COPY … TO … (FORMAT iceberg)`: ADR-028).
+pub fn empty(location: &str, columns: &[(String, String)], now: u64) -> Option<Value> {
+    let fields = fields(&TableMeta { columns: columns.to_vec(), ..Default::default() })?;
+    Some(json!({
+        "format-version": 2, "table-uuid": uuid::Uuid::new_v4().to_string(), "location": location,
+        "last-sequence-number": 0, "last-updated-ms": now, "last-column-id": 2 * columns.len(),
+        "current-schema-id": 0, "schemas": [{"type": "struct", "schema-id": 0, "fields": fields}],
+        "default-spec-id": 0, "partition-specs": [{"spec-id": 0, "fields": []}], "last-partition-id": 999,
+        "default-sort-order-id": 0, "sort-orders": [{"order-id": 0, "fields": []}],
+        "properties": {"written-by": "pondra"}, "current-snapshot-id": -1, "refs": {}, "snapshots": [], "snapshot-log": [], "metadata-log": [],
+    }))
 }
 
 /// The table's columns as Iceberg fields, if every type has an equivalent: all optional, each
@@ -249,12 +270,12 @@ fn ocf(schema: &str, meta: &[(&str, String)], records: &[Vec<u8>]) -> Vec<u8> {
 }
 
 /// A manifest entry for a data file (status 1 = added by this snapshot, 0 = existing).
-fn entry(added: bool, seq: u64, path: &str, rows: u64, size: u64) -> Vec<u8> {
+fn entry(added: bool, seq: u64, id: i64, path: &str, rows: u64, size: u64) -> Vec<u8> {
     let mut b = vec![];
     long(&mut b, added as i64);
-    for v in [seq, seq, seq] {
-        long(&mut b, 1); // (the union's "long" branch) snapshot id = sequence number = file sequence number
-        long(&mut b, v as i64);
+    for v in [id, seq as i64, seq as i64] {
+        long(&mut b, 1); // (the union's "long" branch) snapshot id, sequence number, file sequence number
+        long(&mut b, v);
     }
     long(&mut b, 0); // content: data
     bytes(&mut b, path.as_bytes());
@@ -266,10 +287,10 @@ fn entry(added: bool, seq: u64, path: &str, rows: u64, size: u64) -> Vec<u8> {
 }
 
 /// A manifest list entry for the snapshot's one manifest.
-fn manifest_file(path: &str, len: usize, seq: u64, min_seq: u64, files: [usize; 2], rows: [i64; 2]) -> Vec<u8> {
+fn manifest_file(path: &str, len: usize, seq: u64, min_seq: u64, id: i64, files: [usize; 2], rows: [i64; 2]) -> Vec<u8> {
     let mut b = vec![];
     bytes(&mut b, path.as_bytes());
-    for v in [len as i64, 0, 0, seq as i64, min_seq as i64, seq as i64, files[0] as i64, files[1] as i64, 0, rows[0], rows[1], 0] {
+    for v in [len as i64, 0, 0, seq as i64, min_seq as i64, id, files[0] as i64, files[1] as i64, 0, rows[0], rows[1], 0] {
         long(&mut b, v); // length, spec id, content (data), sequence numbers, snapshot, file and row counts
     }
     b.extend([0, 0]); // partitions, key metadata: null
@@ -316,20 +337,26 @@ pub fn list_schema() -> String {
 
 // ---------------------------------------------------------------- the REST catalog
 
-/// The Iceberg REST catalog API over what Pondra publishes (read-only): engines attach a node
-/// by URL — PyIceberg, DuckDB, Spark, Trino, Snowflake — instead of pointing at metadata files.
-/// Namespace `default` is this lake's `public` schema, and each other schema is a namespace of
-/// its own; an attached lake `l` is namespace `l` (its `public`), and `l.s` (`["l", "s"]`) for
-/// its others. Tables appear once they publish Iceberg. Tokens work as elsewhere
-/// (`Authorization: Bearer …`, any role).
+/// The Iceberg REST catalog API over what Pondra publishes: engines attach a node by URL —
+/// PyIceberg, DuckDB, Spark, Trino, Snowflake — instead of pointing at metadata files, and append
+/// to its tables (`update`, ADR-028). Namespace `default` is this lake's `public` schema, and each
+/// other schema is a namespace of its own; an attached lake `l` is namespace `l` (its `public`),
+/// and `l.s` (`["l", "s"]`) for its others. Tables appear once they publish Iceberg. Tokens work
+/// as elsewhere (`Authorization: Bearer …`; a commit needs a writer's).
 pub fn rest() -> axum::Router<crate::server::App> {
-    use axum::routing::get;
+    use axum::routing::{get, post};
+    let endpoints = ["GET /v1/{prefix}/namespaces", "GET /v1/{prefix}/namespaces/{namespace}", "HEAD /v1/{prefix}/namespaces/{namespace}",
+        "GET /v1/{prefix}/namespaces/{namespace}/tables", "GET /v1/{prefix}/namespaces/{namespace}/tables/{table}",
+        "HEAD /v1/{prefix}/namespaces/{namespace}/tables/{table}", "POST /v1/{prefix}/namespaces/{namespace}/tables/{table}"];
+    let refuse = |what: &'static str| move || async move { Err::<axum::Json<Value>, _>(bad(format!("{what} in Pondra's SQL; other engines read its tables and append to them"))) };
     axum::Router::new()
-        .route("/v1/config", get(|| async { axum::Json(json!({"defaults": {}, "overrides": {}})) }))
-        .route("/v1/namespaces", get(namespaces))
-        .route("/v1/namespaces/{ns}", get(namespace).head(namespace))
-        .route("/v1/namespaces/{ns}/tables", get(tables))
-        .route("/v1/namespaces/{ns}/tables/{table}", get(load).head(load))
+        .route("/v1/config", get(move || async move { axum::Json(json!({"defaults": {}, "overrides": {}, "endpoints": endpoints})) }))
+        .route("/v1/namespaces", get(namespaces).post(refuse("CREATE SCHEMA")))
+        .route("/v1/namespaces/{ns}", get(namespace).head(namespace).delete(refuse("DROP SCHEMA")))
+        .route("/v1/namespaces/{ns}/tables", get(tables).post(refuse("CREATE TABLE … WITH (publish = 'iceberg')")))
+        .route("/v1/namespaces/{ns}/tables/{table}", get(load).head(load).post(update).delete(refuse("DROP TABLE")))
+        .route("/v1/tables/rename", post(refuse("ALTER TABLE … RENAME")))
+        .route("/v1/transactions/commit", post(refuse("A change to several tables at once goes")))
 }
 
 type Reply = Result<axum::Json<Value>, (axum::http::StatusCode, axum::Json<Value>)>;
@@ -385,9 +412,281 @@ async fn tables(axum::extract::State(app): axum::extract::State<crate::server::A
 async fn load(axum::extract::State(app): axum::extract::State<crate::server::App>, axum::extract::Path((ns, table)): axum::extract::Path<(String, String)>) -> Reply {
     let (_, lake, schema) = space(&app, &ns).await?;
     let no_table = || missing(&format!("table {}.{table}", ns.replace('\u{1f}', ".")), "NoSuchTableException");
-    let table = crate::ddl::join(&schema, &table);
-    let st: Published = lake.cat.get(&format!("i/{table}")).await.ok().flatten().filter(|p: &Published| p.version > 0).ok_or_else(no_table)?;
+    Ok(axum::Json(loaded(&lake, &crate::ddl::join(&schema, &table)).await.map_err(|_| no_table())?))
+}
+
+/// A table's current version, as the catalog answers it (`metadata-location`, `metadata`).
+async fn loaded(lake: &Lake, table: &str) -> Result<Value> {
+    let st: Published = lake.cat.get(&format!("i/{table}")).await?.filter(|p: &Published| p.version > 0).context("not published")?;
     let path = format!("data/{table}/metadata/v{}.metadata.json", st.version);
-    let metadata: Value = serde_json::from_slice(&lake.object(&path).await.map_err(|_| no_table())?).map_err(|_| no_table())?;
-    Ok(axum::Json(json!({"metadata-location": lake.full(&path), "metadata": metadata, "config": {}})))
+    let metadata: Value = serde_json::from_slice(&lake.object(&path).await?)?;
+    Ok(json!({"metadata-location": lake.full(&path), "metadata": metadata, "config": {}}))
+}
+
+// ---------------------------------------------------------------- other engines' appends (ADR-028)
+
+/// Another engine's commit whose version is being published: its snapshot id, and its summary's
+/// own keys (`pondra.job`, say), so the engine finds its snapshot.
+pub struct Named<'a> {
+    pub table: &'a str,
+    pub id: i64,
+    pub summary: &'a serde_json::Map<String, Value>,
+}
+
+/// Another engine's append, as the leader records it (`record`).
+#[derive(Serialize, Deserialize)]
+pub struct Commit {
+    pub table: String,
+    pub snapshot: i64, // the writer's snapshot id: the version published for it carries it
+    summary: serde_json::Map<String, Value>,
+    uuid: Option<String>,        // assert-table-uuid
+    parent: Option<Option<i64>>, // assert-ref-snapshot-id on main (Some(None): no snapshot yet)
+    incoming: Vec<String>,       // the writer's data files (paths in the lake)
+    cleanup: Vec<String>,        // its manifest list and the manifests it added
+    /// Those rows as the table's own files, written by the node that took the commit (None: they
+    /// go through the log, for the views and tasks that follow the table).
+    written: Option<crate::write::Files>,
+}
+
+impl Commit {
+    fn job(&self) -> String { format!("iceberg:{}:{}", self.table, self.snapshot) }
+}
+
+/// The leader's answer when the table changed since the writer read it: 409, so it retries.
+pub const CONFLICT: &str = "the table changed since the writer read it";
+/// …and when it refused the commit before recording anything: 400.
+const REFUSED: &str = "Pondra refused the commit";
+
+type Refusal = (axum::http::StatusCode, axum::Json<Value>);
+
+fn refused(code: u16, kind: &str, message: String) -> Refusal {
+    (axum::http::StatusCode::from_u16(code).expect("a status"), axum::Json(json!({"error": {"message": message, "type": kind, "code": code}})))
+}
+
+fn bad(message: String) -> Refusal { refused(400, "BadRequestException", message) }
+
+fn conflict(message: String) -> Refusal { refused(409, "CommitFailedException", message) }
+
+/// `POST /v1/namespaces/{ns}/tables/{table}`: another engine's commit. An append's files become
+/// the table's rows as a bulk INSERT's would: rewritten here with their row ids, sized and
+/// partitioned as the table says (or through the log, when views or tasks follow the table). The
+/// leader checks what the commit asserts and records it, and the table's next version is
+/// published under the writer's snapshot id. Anything else is refused by name.
+async fn update(axum::extract::State(app): axum::extract::State<crate::server::App>, axum::extract::Path((ns, table)): axum::extract::Path<(String, String)>, body: bytes::Bytes) -> Reply {
+    let (_, lake, schema) = space(&app, &ns).await?;
+    let name = crate::ddl::join(&schema, &table);
+    let current = loaded(&lake, &name).await.map_err(|_| missing(&format!("table {}.{table}", ns.replace('\u{1f}', ".")), "NoSuchTableException"))?;
+    let asked: Value = serde_json::from_slice(&body).map_err(|e| bad(format!("the commit: {e}")))?;
+    let meta = lake.cat.get::<TableMeta>(&crate::store::table_key(&name)).await.ok().flatten().ok_or_else(|| bad(format!("no table {name}")))?;
+    if !meta.key.is_empty() {
+        return Err(bad(format!("{name} is a keyed table: other engines append to append tables (keyed ones: not yet; INSERT through Pondra)")));
+    }
+    let mut c = parse(&lake, &name, &current["metadata"], &asked).await?;
+    if done(&lake, &c.job()).await.map_err(|e| bad(format!("{e:#}")))? {
+        return Ok(axum::Json(current)); // (this commit is in already: a retry, answered as it was)
+    }
+    check(&lake, &c).await.map_err(|e| conflict(format!("{e:#}")))?;
+    let here = std::sync::Arc::ptr_eq(&lake, &app.lake);
+    if !c.incoming.is_empty() && !crate::write::follows(&lake, &name).await.map_err(|e| bad(format!("{e:#}")))? {
+        let written = async {
+            let stamp = match here { true => Some(app.to().reserve().await?), false => crate::write::reserve(&lake).await };
+            let (ctx, query) = incoming(&lake, &meta, &c.incoming).await?;
+            crate::write::write_files(&lake, &ctx, &name, &query, &c.job(), stamp).await
+        };
+        c.written = written.await.map_err(|e| bad(format!("{REFUSED}: {e:#}")))?;
+    }
+    let files: Vec<String> = c.written.iter().flat_map(|f| f.paths()).collect();
+    let out = match here {
+        true => app.record_iceberg(c).await,
+        false => crate::write::send(&lake.url, crate::write::Request::Iceberg(Box::new(c))).await,
+    };
+    out.map(axum::Json).map_err(|e| {
+        let e = format!("{e:#}");
+        match (e.contains(CONFLICT), e.contains(REFUSED)) {
+            (true, _) => {
+                let lake = lake.clone();
+                tokio::spawn(async move { futures::future::join_all(files.iter().map(|f| lake.delete(f))).await }); // (never recorded)
+                conflict(e)
+            }
+            (_, true) => bad(e),
+            _ => refused(500, "CommitStateUnknownException", e),
+        }
+    })
+}
+
+/// What a commit asks, if Pondra takes it: one append snapshot, on main, and the Parquet files it
+/// adds in the table's `data/` folder.
+async fn parse(lake: &Lake, table: &str, meta: &Value, asked: &Value) -> Result<Commit, Refusal> {
+    let (mut uuid, mut parent, mut snapshot, mut main) = (None, None, None, None);
+    for r in asked["requirements"].as_array().into_iter().flatten() {
+        let kind = r["type"].as_str().unwrap_or_default();
+        let same = |mine: &str| r[kind.trim_start_matches("assert-")] == meta[mine];
+        match kind {
+            "assert-table-uuid" => uuid = r["uuid"].as_str().map(String::from),
+            "assert-ref-snapshot-id" if r["ref"] == "main" => parent = Some(r["snapshot-id"].as_i64()),
+            "assert-ref-snapshot-id" => return Err(bad(format!("branch or tag {}: Pondra's tables have main only", r["ref"]))),
+            "assert-current-schema-id" | "assert-default-spec-id" | "assert-default-sort-order-id" => {
+                if !same(kind.trim_start_matches("assert-")) {
+                    return Err(conflict(format!("{kind}: {CONFLICT}")));
+                }
+            }
+            "assert-last-assigned-field-id" | "assert-last-assigned-partition-id" => {
+                if !same(if kind.ends_with("field-id") { "last-column-id" } else { "last-partition-id" }) {
+                    return Err(conflict(format!("{kind}: {CONFLICT}")));
+                }
+            }
+            "assert-create" => return Err(conflict(format!("{table} exists"))),
+            k => return Err(bad(format!("requirement {k}: not one Pondra checks"))),
+        }
+    }
+    for u in asked["updates"].as_array().into_iter().flatten() {
+        match u["action"].as_str().unwrap_or_default() {
+            "add-snapshot" if snapshot.is_none() => snapshot = Some(u["snapshot"].clone()),
+            "set-snapshot-ref" if u["ref-name"] == "main" && u["type"] == "branch" => main = u["snapshot-id"].as_i64(),
+            "set-snapshot-ref" => return Err(bad(format!("branch or tag {}: Pondra's tables have main only", u["ref-name"]))),
+            a => return Err(bad(format!("{a}: a Pondra table changes through its SQL (ALTER TABLE; DELETE, UPDATE, MERGE), and other engines append to it"))),
+        }
+    }
+    let s = snapshot.ok_or_else(|| bad("a commit with no snapshot: other engines append to Pondra's tables".into()))?;
+    let id = s["snapshot-id"].as_i64().ok_or_else(|| bad("a snapshot without its snapshot-id".into()))?;
+    if main != Some(id) {
+        return Err(bad("a snapshot not made main (staged): not taken".into()));
+    }
+    let op = s["summary"]["operation"].as_str().unwrap_or("append");
+    if op != "append" {
+        return Err(bad(format!("a snapshot that does {op}: other engines append; deletes and overwrites go through Pondra's SQL (DELETE, UPDATE, MERGE)")));
+    }
+    if !s["schema-id"].is_null() && s["schema-id"] != meta["current-schema-id"] {
+        return Err(conflict(format!("the snapshot's schema: {CONFLICT}")));
+    }
+    let under = |uri: &Value, folder: &str| -> Result<String, Refusal> {
+        let uri = uri.as_str().unwrap_or_default();
+        inside(lake, uri).filter(|p| p.starts_with(&format!("data/{table}/{folder}/"))).ok_or_else(|| bad(format!("{uri}: not in {table}'s {folder} folder")))
+    };
+    let get = |path: String| async move {
+        let bytes = lake.store.get(&Path::from(path.as_str())).await.map_err(|e| bad(format!("{path}: {e}")))?.bytes().await.map_err(|e| bad(format!("{path}: {e}")))?;
+        crate::avro::records(&bytes).map_err(|e| bad(format!("{path}: {e:#}")))
+    };
+    let list = under(&s["manifest-list"], "metadata")?;
+    let (mut incoming, mut cleanup) = (vec![], vec![list.clone()]);
+    for m in get(list).await? {
+        if m["added_snapshot_id"].as_i64() != Some(id) {
+            continue; // (the table's manifests, as they were)
+        }
+        if m["content"].as_i64().unwrap_or(0) != 0 {
+            return Err(bad("delete files: other engines append; deletes go through Pondra's SQL".into()));
+        }
+        let path = under(&m["manifest_path"], "metadata")?;
+        cleanup.push(path.clone());
+        for e in get(path).await? {
+            match e["status"].as_i64() {
+                Some(1) => {}
+                Some(0) => continue, // (a file already in the table, in a manifest the writer merged)
+                _ => return Err(bad("an append that deletes files: not taken".into())),
+            }
+            let d = &e["data_file"];
+            if d["content"].as_i64().unwrap_or(0) != 0 || !d["file_format"].as_str().unwrap_or_default().eq_ignore_ascii_case("parquet") {
+                return Err(bad(format!("{}: Pondra takes Parquet data files", d["file_path"])));
+            }
+            incoming.push(under(&d["file_path"], "data")?);
+        }
+    }
+    let summary = s["summary"].as_object().cloned().unwrap_or_default();
+    Ok(Commit { table: table.into(), snapshot: id, summary, uuid, parent, incoming, cleanup, written: None })
+}
+
+/// A writer's URI as a path in the lake, if it is in it (`file:` or none, for a lake on disk).
+fn inside(lake: &Lake, uri: &str) -> Option<String> {
+    let plain = |u: &str| u.strip_prefix("file://").or_else(|| u.strip_prefix("file:")).unwrap_or(u).replacen("s3a://", "s3://", 1);
+    let rest = plain(uri).strip_prefix(&format!("{}/", plain(&lake.url).trim_end_matches('/')))?.to_string();
+    (!rest.split('/').any(|p| p == ".." || p == "." || p.is_empty())).then_some(rest)
+}
+
+/// Does the table still stand as the writer read it (its uuid, and main's snapshot)?
+async fn check(lake: &Lake, c: &Commit) -> Result<()> {
+    let st: Published = lake.cat.get(&format!("i/{}", c.table)).await?.unwrap_or_default();
+    anyhow::ensure!(c.uuid.as_ref().is_none_or(|u| *u == st.uuid), "{CONFLICT}: it is another table now (a new uuid)");
+    let main = st.snapshots.last().and_then(|(s, _)| s["snapshot-id"].as_i64());
+    anyhow::ensure!(c.parent.is_none_or(|p| p == main), "{CONFLICT}: main is snapshot {main:?} now, not {:?}", c.parent.flatten());
+    anyhow::ensure!(!st.snapshots.iter().any(|(s, _)| s["snapshot-id"].as_i64() == Some(c.snapshot)), "{CONFLICT}: snapshot id {} is taken", c.snapshot);
+    Ok(())
+}
+
+/// Has this commit been recorded?
+async fn done(lake: &Lake, job: &str) -> Result<bool> { Ok(lake.cat.get::<u64>(&crate::store::producer_key(&format!("job:{job}"))).await?.is_some()) }
+
+/// The writer's files as a table `__incoming` of the table's columns (by name), and the query
+/// that reads them in the table's order.
+async fn incoming(lake: &Lake, meta: &TableMeta, files: &[String]) -> Result<(datafusion::prelude::SessionContext, String)> {
+    let meta = meta.logical();
+    let schema = crate::query::schema(&meta.columns)?;
+    let ctx = lake.session();
+    let urls: Vec<String> = files.iter().map(|f| lake.full(f)).collect();
+    let df = ctx.read_parquet(urls, datafusion::prelude::ParquetReadOptions::default().schema(&schema)).await?;
+    ctx.register_table("__incoming", df.into_view())?;
+    let columns: Vec<String> = meta.columns.iter().map(|(c, _)| format!("\"{}\"", c.replace('"', "\"\""))).collect();
+    Ok((ctx, format!("SELECT {} FROM __incoming", columns.join(", "))))
+}
+
+/// Leader, under the lake's lock: record another engine's append, once, if the table still
+/// stands as the writer read it; then publish its next version under the writer's snapshot id,
+/// and delete the writer's own files. Answers the table as the catalog does.
+pub async fn record(lake: &Lake, seq: &crate::log::Sequencer, c: Commit, nodes: &[String], me: &str) -> Result<Value> {
+    if !done(lake, &c.job()).await? {
+        check(lake, &c).await?;
+        let files: Vec<String> = c.written.iter().flat_map(|f| f.paths()).collect();
+        let into_files = match c.written {
+            Some(ref f) => match crate::write::record(lake, f.clone(), Some(seq)).await {
+                Err(e) if format!("{e:#}").contains(crate::write::AGAIN) => {
+                    futures::future::join_all(files.iter().map(|f| lake.delete(f))).await; // (a view came: through the log)
+                    false
+                }
+                r => r.map(|_| true)?,
+            },
+            None => false,
+        };
+        if !into_files {
+            through_log(lake, seq, &c, nodes, me).await?;
+        }
+        crate::delta::publish_named(lake, Some(&Named { table: &c.table, id: c.snapshot, summary: &c.summary })).await?;
+        futures::future::join_all(c.incoming.iter().map(|f| lake.delete(f))).await; // (its rows are the table's now)
+        // Its manifests go with the table's replaced files, after the retention period: the writer
+        // may read them once more as it cleans up after its commit (Iceberg 1.10 does).
+        let key = crate::store::table_key(&c.table);
+        if let Some(mut meta) = lake.cat.get::<TableMeta>(&key).await? {
+            let now = crate::log::now_ms();
+            meta.garbage.extend(c.cleanup.iter().map(|p| (p.clone(), now)));
+            lake.cat.commit(vec![(key, json(&meta))], &[]).await?;
+        }
+    }
+    loaded(lake, &c.table).await
+}
+
+/// The writer's rows into the log, for the views and tasks that follow the table (one append:
+/// all or nothing), then into files at once, so the version published holds them.
+async fn through_log(lake: &Lake, seq: &crate::log::Sequencer, c: &Commit, nodes: &[String], me: &str) -> Result<()> {
+    use crate::log::{pack, Append, Outcome, Src};
+    if !c.incoming.is_empty() {
+        let meta = lake.cat.get::<TableMeta>(&crate::store::table_key(&c.table)).await?.context("no table")?;
+        let rows = async {
+            let (ctx, query) = incoming(lake, &meta, &c.incoming).await?;
+            crate::write::rows(&ctx, &meta.logical(), &query).await
+        };
+        let batch = rows.await.context(REFUSED)?;
+        let first = loop {
+            if let Some(f) = lake.ids.take(batch.num_rows() as u64) {
+                break f;
+            }
+            lake.ids.refill(seq.reserve().await?.0);
+        };
+        let batch = crate::sys::stamp(&batch, first)?;
+        let append = [Append { table: c.table.clone(), src: Src { producer: c.job(), seq: 1, prev: None }, batch, ack: tokio::sync::oneshot::channel().0 }];
+        while let Outcome::Retry(r) = seq.submit(pack(lake, &append).await?).await? {
+            anyhow::ensure!(r.is_empty(), "the log refused the commit's rows");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await; // (views changed: pack again)
+        }
+        let upto = lake.visible();
+        while !crate::tier::tier_table(lake, &c.table, upto, nodes, me).await?.1 {}
+    }
+    lake.cat.commit(vec![(crate::store::producer_key(&format!("job:{}", c.job())), json(&1u64))], &[]).await
 }
