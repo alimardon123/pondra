@@ -87,6 +87,7 @@ jobs:
         run: |
           pip install -r tools/requirements.txt
           npm install -g azurite   # (Azure's emulator: harness.py clouds)
+          curl -sSL https://archive.apache.org/dist/kafka/4.3.1/kafka_2.13-4.3.1.tgz | tar xz -C ~   # (Apache Kafka: harness.py kafkas)
           python3 tools/harness.py all
           python3 tools/frames_check.py
           python3 tools/cluster.py failover --secs 30

@@ -449,6 +449,128 @@ def clouds():
     return f"lakes and files on {' and '.join(s[0] for s in stores)} (emulated): all {len(checks)} checks pass"
 
 
+def start_kafka(port, root):
+    """Apache Kafka (KRaft, one node), if it is here (KAFKA_HOME, or ~/kafka_2.13-*): PLAINTEXT on
+    `port`, SASL SCRAM-SHA-256 (alice / alice-secret) on `port + 1`. None if it isn't."""
+    home = os.environ.get("KAFKA_HOME") or next(iter(sorted(glob_.glob(os.path.expanduser("~/kafka_2.13-*")) + glob_.glob("/home/claude/kafka_2.13-*"))), None)
+    if not home:
+        return None
+    logs = os.path.join(root, "kafka-logs")
+    conf = os.path.join(root, "kafka.properties")
+    open(conf, "w").write("\n".join([
+        "process.roles=broker,controller", "node.id=1", f"controller.quorum.bootstrap.servers=127.0.0.1:{port + 2}",
+        f"listeners=PLAINTEXT://127.0.0.1:{port},SASL_PLAINTEXT://127.0.0.1:{port + 1},CONTROLLER://127.0.0.1:{port + 2}",
+        f"advertised.listeners=PLAINTEXT://127.0.0.1:{port},SASL_PLAINTEXT://127.0.0.1:{port + 1}", "controller.listener.names=CONTROLLER",
+        "listener.security.protocol.map=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,SASL_PLAINTEXT:SASL_PLAINTEXT", "sasl.enabled.mechanisms=SCRAM-SHA-256",
+        "listener.name.sasl_plaintext.scram-sha-256.sasl.jaas.config=org.apache.kafka.common.security.scram.ScramLoginModule required;",
+        f"log.dirs={logs}", "num.partitions=3", "offsets.topic.replication.factor=1", "transaction.state.log.replication.factor=1",
+        "transaction.state.log.min.isr=1", "group.initial.rebalance.delay.ms=0", ""]))
+    env = {**os.environ, "KAFKA_HEAP_OPTS": "-Xmx512m"}
+    cluster = subprocess.run([f"{home}/bin/kafka-storage.sh", "random-uuid"], capture_output=True, text=True, env=env).stdout.strip().splitlines()[-1]
+    subprocess.run([f"{home}/bin/kafka-storage.sh", "format", "--standalone", "-t", cluster, "-c", conf, "--add-scram", "SCRAM-SHA-256=[name=alice,password=alice-secret]"], capture_output=True, env=env, check=True)
+    broker = subprocess.Popen([f"{home}/bin/kafka-server-start.sh", conf], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+    atexit.register(broker.kill)
+    import kafka as kp
+    for _ in range(120):
+        try:
+            kp.KafkaAdminClient(bootstrap_servers=f"127.0.0.1:{port}").close()
+            return broker
+        except Exception:
+            time.sleep(0.5)
+    raise RuntimeError("Kafka didn't start")
+
+
+def kafkas():
+    """Other Kafka clusters (ADR-026), in and out: Apache Kafka 4 (if here: `start_kafka`) and a
+    Pondra node's own Kafka port. A topic read as a table == what was produced, spread over three
+    nodes == one node, a LIMIT reading only what it needs; COPY … TO a topic, each key in the
+    partition Kafka's producers would pick; a view fed by a topic, every record once while the
+    node running a partition is killed; SASL SCRAM-SHA-256 and PLAIN from secrets, a wrong
+    password refused."""
+    import kafka as kp
+    from kafka.partitioner.default import murmur2
+    root = tempfile.mkdtemp(prefix="pondra-kafkas-")
+    kport = A.port + 60
+    broker = start_kafka(kport, root)
+    lake = new_lake()
+    nodes = [Node(lake, A.port + i, env={"PONDRA_SECRET_KEY": "k"}).start() for i in range(3)]
+    q = lambda s, i=0, spread=None: call(A.port + i, "POST", "/sql" + (f"?spread={spread}" if spread is not None else ""), s.encode())
+    def refused(s):
+        try:
+            q(s)
+            return ""
+        except RuntimeError as e:
+            return str(e)
+    while len(call(A.port + 1, "GET", "/stats")["nodes"]) < 3:
+        time.sleep(0.1)
+    checks = {}
+    # A Pondra node as the other cluster: a topic is its table (one partition), tokens its passwords.
+    other = new_lake()
+    pk = A.port + 70
+    them = Node(other, A.port + 5, kafka=f"127.0.0.1:{pk}", read_token="r-tok", write_token="w-tok", admin_token="a-tok").start()
+    call(A.port + 5, "POST", "/sql", b"CREATE TABLE ticks (id BIGINT, v BIGINT)", headers={"authorization": "Bearer a-tok"})
+    call(A.port + 5, "POST", "/sql", ("INSERT INTO ticks VALUES " + ", ".join(f"({i}, {i * 2})" for i in range(500))).encode(), headers={"authorization": "Bearer a-tok"})
+    q(f"CREATE SECRET theirs (TYPE kafka, SECURITY_PROTOCOL 'SASL_PLAINTEXT', SASL_MECHANISM 'PLAIN', USERNAME 'reader', PASSWORD 'r-tok', SCOPE 'kafka://127.0.0.1:{pk}')")
+    q(f"ATTACH 'kafka://127.0.0.1:{pk}' AS pondra_k (TYPE kafka)")
+    got = q("SELECT count(*) AS n, sum(CAST(value->>'v' AS BIGINT)) AS s FROM pondra_k.ticks")
+    checks["a Pondra node's Kafka port, SASL PLAIN from a secret: its table as a topic"] = got == [{"n": 500, "s": 249500}]
+    q(f"CREATE OR REPLACE SECRET theirs (TYPE kafka, SECURITY_PROTOCOL 'SASL_PLAINTEXT', SASL_MECHANISM 'PLAIN', USERNAME 'reader', PASSWORD 'wrong', SCOPE 'kafka://127.0.0.1:{pk}')")
+    checks["…a wrong password: refused"] = "refused" in refused("SELECT count(*) AS n FROM pondra_k.ticks")
+    them.kill()
+    if broker:
+        url = f"kafka://127.0.0.1:{kport}"
+        admin = kp.KafkaAdminClient(bootstrap_servers=f"127.0.0.1:{kport}")
+        admin.create_topics([kp.admin.NewTopic("orders", 3, 1), kp.admin.NewTopic("keyed", 3, 1)])
+        prod = kp.KafkaProducer(bootstrap_servers=f"127.0.0.1:{kport}", key_serializer=str.encode, value_serializer=lambda v: json.dumps(v).encode(), compression_type="gzip")
+        sent = 3000
+        for i in range(sent):
+            prod.send("orders", key=f"k{i % 17}", value={"id": i, "amount": i % 100})
+        prod.flush()
+        q(f"CREATE SECRET plain (TYPE kafka, SCOPE '{url}')")  # (no password there: still, a grant)
+        q(f"ATTACH '{url}' AS k (TYPE kafka)")
+        want = [{"n": sent, "s": sum(i % 100 for i in range(sent)), "keys": 17}]
+        agg = "SELECT count(*) AS n, sum(CAST(value->>'amount' AS BIGINT)) AS s, count(DISTINCT key) AS keys FROM k.orders"
+        checks["Apache Kafka: a topic as a table == what was produced"] = q(agg) == want and len(q("SELECT * FROM k.orders LIMIT 5")) == 5
+        spread = metrics_of(A.port + 1)["pondra_spread_queries_total"]
+        checks["…spread over three nodes (its partitions dealt) == one node"] = q(agg, 1, spread=1) == want and metrics_of(A.port + 1)["pondra_spread_queries_total"] > spread
+        # COPY … TO a topic: each key where Kafka's own producers put it.
+        q(f"COPY (SELECT id, 'u' || (id % 23) AS who FROM generate_series(1, 2000) AS t(id)) TO '{url}/keyed' (FORMAT json, KEY who)")
+        cons = kp.KafkaConsumer("keyed", bootstrap_servers=f"127.0.0.1:{kport}", auto_offset_reset="earliest", consumer_timeout_ms=3000)
+        records = list(cons)
+        placed = all(r.partition == (murmur2(r.key) & 0x7fffffff) % 3 for r in records)  # (the Java client's, as kafka-python has it)
+        checks["COPY … TO a topic: every row once, each key in Kafka's partition for it"] = len(records) == 2000 and placed and len({json.loads(r.value)["id"] for r in records}) == 2000
+        # SCRAM-SHA-256 from a secret.
+        q(f"CREATE SECRET scram (TYPE kafka, SECURITY_PROTOCOL 'SASL_PLAINTEXT', SASL_MECHANISM 'SCRAM-SHA-256', USERNAME 'alice', PASSWORD 'alice-secret', SCOPE 'kafka://127.0.0.1:{kport + 1}')")
+        checks["SASL SCRAM-SHA-256 from a secret"] = q(f"SELECT count(*) AS n FROM 'kafka://127.0.0.1:{kport + 1}/orders'") == [{"n": sent}]
+        q(f"CREATE OR REPLACE SECRET scram (TYPE kafka, SECURITY_PROTOCOL 'SASL_PLAINTEXT', SASL_MECHANISM 'SCRAM-SHA-256', USERNAME 'alice', PASSWORD 'nope', SCOPE 'kafka://127.0.0.1:{kport + 1}')")
+        checks["…a wrong SCRAM password: refused"] = "refused" in refused(f"SELECT count(*) AS n FROM 'kafka://127.0.0.1:{kport + 1}/orders'")
+        # A view fed by the topic across three nodes, one of them killed while records arrive.
+        q("CREATE MATERIALIZED VIEW orders_in AS SELECT CAST(value->>'id' AS BIGINT) AS id, key, _partition, _offset FROM k.orders")
+        more = 3000
+        for i in range(sent, sent + more):
+            prod.send("orders", key=f"k{i % 17}", value={"id": i, "amount": i % 100})
+            if i == sent + more // 2:
+                prod.flush()
+                nodes[2].kill()  # (its partitions go to the others)
+        prod.flush()
+        total = sent + more
+        count = lambda: q("SELECT count(*) AS n, count(DISTINCT (_partition, _offset)) AS d, count(DISTINCT id) AS ids FROM orders_in")
+        got = until(count, [{"n": total, "d": total, "ids": total}], 60)
+        checks["a view fed by a topic on three nodes, one killed: every record once"] = got == [{"n": total, "d": total, "ids": total}]
+        if got != [{"n": total, "d": total, "ids": total}]:
+            print("feed:", got)
+    [n.kill() for n in nodes]
+    if broker:
+        broker.kill()
+    shutil.rmtree(root, ignore_errors=True)
+    if not broker:
+        print("(Apache Kafka not found: KAFKA_HOME, or ~/kafka_2.13-*; its checks are skipped)")
+    print(json.dumps(checks, indent=1, ensure_ascii=False))
+    if not all(checks.values()):
+        sys.exit(1)
+    return f"other Kafka clusters in and out{'' if broker else ' (Pondra only)'}: all {len(checks)} checks pass"
+
+
 def deal():
     """A keyed table's first tiering round, dealt to three nodes: a job per third of its log, each
     writing a file. Only the job that starts where the table's files end (there are none yet) may
@@ -2696,7 +2818,7 @@ $$""")
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    out = {t.__name__: t() for t in (upsert, deal, outside, clouds, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, scale, flight, reader, crash)}
+    out = {t.__name__: t() for t in (upsert, deal, outside, clouds, kafkas, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, scale, flight, reader, crash)}
     A.secs = min(A.secs, 20)
     out["load"] = load()
     print(json.dumps(out, indent=1))
@@ -2704,7 +2826,7 @@ def all_tests():
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "tiering", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "scale", "flight", "load", "all"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "scale", "flight", "load", "all"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -2715,4 +2837,4 @@ if __name__ == "__main__":
     ap.add_argument("--secs", type=int, default=30)
     ap.add_argument("--flush-ms", type=int, default=250)
     A = ap.parse_args()
-    {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "scale": scale, "flight": flight, "load": load, "all": all_tests}[A.mode]()
+    {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "scale": scale, "flight": flight, "load": load, "all": all_tests}[A.mode]()

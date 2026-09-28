@@ -47,6 +47,8 @@ object_store = { version = "0.14", features = ["aws", "gcp", "azure", "http"] } 
 object_store_df = { package = "object_store", version = "0.13", default-features = false }
 glob = "0.3" # (a URL's glob: DataFusion splits only paths'; already built for it)
 aws-lc-rs = "1" # (secrets sealed with AES-256-GCM: already built for object_store's TLS)
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs"] } # (Kafka clusters over TLS: already built for reqwest)
+rustls-platform-verifier = "0.7" # (…checked against the system's certificates, as reqwest does)
 sysinfo = { version = "0.35", default-features = false, features = ["system"] } # (RAM and resident memory where there is no /proc: Windows, macOS; already built for SlateDB)
 
 

@@ -453,7 +453,7 @@ class _Reader:
 
     def _read(self, paths):
         if self.fmt in ("delta", "iceberg"):
-            raise NotImplementedError(f"spark.read.format('{self.fmt}'): read with SQL's {self.fmt}_scan(…) (ADR-026, round 23)")
+            return self._table(paths)
         known = self.OPTIONS.get(self.fmt)
         if known is None:
             raise ValueError(f"spark.read.format('{self.fmt}'): parquet, csv or json")
@@ -485,6 +485,24 @@ class _Reader:
         elif names:  # (Parquet's and JSON's columns by name)
             frame = frame.select(*[sql_expr(f"CAST({_quote(n)} AS {_type(t)}) AS {_quote(n)}") for n, t in zip(names, types_ or ["string"] * len(names))])
         return DataFrame(self.spark, frame)
+
+    # Delta's and Iceberg's options for reading an older version, as SQL's arguments.
+    TABLE_OPTIONS = {"delta": {"versionasof": "version"}, "iceberg": {"snapshot-id": "snapshot_from_id", "as-of-timestamp": None}}
+
+    def _table(self, paths):
+        if len(paths) != 1:
+            raise ValueError(f"spark.read.format('{self.fmt}').load(path): one table")
+        known, args = self.TABLE_OPTIONS[self.fmt], {}
+        for k, v in self.opts.items():
+            if k not in known:
+                raise ValueError(f"spark.read.option('{k}') isn't taken for {self.fmt}: {', '.join(sorted(known))}")
+            if k == "as-of-timestamp":  # (Iceberg's: milliseconds since 1970)
+                import datetime
+                args["snapshot_from_timestamp"] = datetime.datetime.fromtimestamp(int(v) / 1000, datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")
+            else:
+                args[known[k]] = int(v)
+        given = "".join(f", {k} => {_literal(v)}" for k, v in args.items())
+        return DataFrame(self.spark, self.spark.con.sql(f"SELECT * FROM {self.fmt}_scan({_literal(str(paths[0]))}{given})"))
 
 
 # ---------------------------------------------------------------- data frames

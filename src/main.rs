@@ -12,6 +12,7 @@ mod hilbert;
 mod ddl;
 mod delta;
 mod ext;
+mod feeds;
 mod files;
 mod flight;
 mod fsum;
@@ -19,6 +20,7 @@ mod hot;
 mod iceberg;
 mod inbox;
 mod kafka;
+mod kafka_client;
 mod serve;
 mod shell;
 mod cluster;
@@ -344,6 +346,9 @@ async fn main() -> anyhow::Result<()> {
             if let Some(flight_addr) = flight {
                 let a = app.clone();
                 tokio::spawn(async move { flight::serve(a, flight_addr).await.map_err(|e| eprintln!("flight: {e:#}")) });
+            }
+            if app.log.is_some() {
+                feeds::start(app.clone()); // (other clusters' topics feeding views: none, no work)
             }
             if let (Some(_), Some(log)) = (&app.seq, &app.log) {
                 let (lake, log) = (lake.clone(), log.clone()); // windows and sessions past the watermark, emitted once

@@ -189,7 +189,7 @@ async fn dead(lake: &Lake, ctx: &SessionContext, name: &str, meta: &TableMeta, a
 pub async fn sources(lake: &Lake, ctx: &SessionContext, name: &str, meta: &TableMeta, upto: Option<u64>) -> Result<(Option<DataFrame>, Vec<DataFrame>)> {
     if let Some(spec) = &meta.ext {
         let files = meta.files.iter().collect::<Vec<_>>(); // (files outside the lake: no log, no hot columns)
-        return Ok((None, if files.is_empty() { vec![] } else { vec![crate::ext::read(ctx, &files, &read_schema(&meta.columns)?, spec, meta.outside.as_ref()).await?] }));
+        return Ok((None, if files.is_empty() { vec![] } else { vec![crate::ext::read(lake, ctx, &files, &read_schema(&meta.columns)?, spec, meta.outside.as_ref()).await?] }));
     }
     let (schema, keyed, upsert) = (read_schema(&meta.columns)?, !meta.key.is_empty(), !meta.key.is_empty() && meta.merge.is_empty());
     let mut files = vec![];

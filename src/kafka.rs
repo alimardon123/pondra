@@ -451,7 +451,7 @@ fn decode_batches(mut b: &[u8]) -> Result<Vec<Batch>> {
     Ok(out)
 }
 
-fn decompress(codec: i16, data: &[u8]) -> Result<Vec<u8>> {
+pub(crate) fn decompress(codec: i16, data: &[u8]) -> Result<Vec<u8>> {
     let mut out = vec![];
     match codec {
         0 => out.extend_from_slice(data),
@@ -833,37 +833,37 @@ fn encode_batch(base: i64, ts: i64, recs: &[(Option<Vec<u8>>, Option<Vec<u8>>)])
 
 // ---------------------------------------------------------------- encoding
 
-struct Rd {
-    b: Bytes,
-    at: usize,
+pub(crate) struct Rd {
+    pub(crate) b: Bytes,
+    pub(crate) at: usize,
 }
 
 impl Rd {
-    fn take(&mut self, n: usize) -> Result<&[u8]> {
+    pub(crate) fn take(&mut self, n: usize) -> Result<&[u8]> {
         ensure!(self.at + n <= self.b.len(), "request ends early");
         self.at += n;
         Ok(&self.b[self.at - n..self.at])
     }
-    fn i8(&mut self) -> Result<i8> { Ok(self.take(1)?[0] as i8) }
-    fn i16(&mut self) -> Result<i16> { Ok(i16::from_be_bytes(self.take(2)?.try_into()?)) }
-    fn i32(&mut self) -> Result<i32> { Ok(i32::from_be_bytes(self.take(4)?.try_into()?)) }
-    fn i64(&mut self) -> Result<i64> { Ok(i64::from_be_bytes(self.take(8)?.try_into()?)) }
+    pub(crate) fn i8(&mut self) -> Result<i8> { Ok(self.take(1)?[0] as i8) }
+    pub(crate) fn i16(&mut self) -> Result<i16> { Ok(i16::from_be_bytes(self.take(2)?.try_into()?)) }
+    pub(crate) fn i32(&mut self) -> Result<i32> { Ok(i32::from_be_bytes(self.take(4)?.try_into()?)) }
+    pub(crate) fn i64(&mut self) -> Result<i64> { Ok(i64::from_be_bytes(self.take(8)?.try_into()?)) }
     /// An array's length (a null array reads as empty).
-    fn len(&mut self) -> Result<usize> { Ok(self.i32()?.max(0) as usize) }
-    fn nstr(&mut self) -> Result<Option<String>> {
+    pub(crate) fn len(&mut self) -> Result<usize> { Ok(self.i32()?.max(0) as usize) }
+    pub(crate) fn nstr(&mut self) -> Result<Option<String>> {
         let n = self.i16()?;
         Ok(if n < 0 { None } else { Some(String::from_utf8(self.take(n as usize)?.to_vec())?) })
     }
-    fn str(&mut self) -> Result<String> { Ok(self.nstr()?.unwrap_or_default()) }
-    fn nbytes(&mut self) -> Result<Option<Bytes>> {
+    pub(crate) fn str(&mut self) -> Result<String> { Ok(self.nstr()?.unwrap_or_default()) }
+    pub(crate) fn nbytes(&mut self) -> Result<Option<Bytes>> {
         let n = self.i32()?;
         Ok(if n < 0 { None } else { Some(self.slice(n as usize)?) })
     }
-    fn slice(&mut self, n: usize) -> Result<Bytes> {
+    pub(crate) fn slice(&mut self, n: usize) -> Result<Bytes> {
         self.take(n)?;
         Ok(self.b.slice(self.at - n..self.at))
     }
-    fn uvarint(&mut self) -> Result<u64> {
+    pub(crate) fn uvarint(&mut self) -> Result<u64> {
         let (mut v, mut shift) = (0u64, 0);
         loop {
             let b = self.take(1)?[0];
@@ -875,17 +875,17 @@ impl Rd {
             ensure!(shift < 64, "bad varint");
         }
     }
-    fn varint(&mut self) -> Result<i64> {
+    pub(crate) fn varint(&mut self) -> Result<i64> {
         let v = self.uvarint()?;
         Ok((v >> 1) as i64 ^ -((v & 1) as i64))
     }
     /// Varint-length bytes inside a record (-1 = null).
-    fn vbytes(&mut self) -> Result<Option<Bytes>> {
+    pub(crate) fn vbytes(&mut self) -> Result<Option<Bytes>> {
         let n = self.varint()?;
         Ok(if n < 0 { None } else { Some(self.slice(n as usize)?) })
     }
     /// Tagged fields (flexible versions): skipped.
-    fn tags(&mut self) -> Result<()> {
+    pub(crate) fn tags(&mut self) -> Result<()> {
         for _ in 0..self.uvarint()? {
             self.uvarint()?;
             let n = self.uvarint()? as usize;
@@ -895,12 +895,12 @@ impl Rd {
     }
 }
 
-fn put_str(w: &mut Vec<u8>, s: &str) {
+pub(crate) fn put_str(w: &mut Vec<u8>, s: &str) {
     w.put_i16(s.len() as i16);
     w.put_slice(s.as_bytes());
 }
 
-fn put_nstr(w: &mut Vec<u8>, s: Option<&str>) {
+pub(crate) fn put_nstr(w: &mut Vec<u8>, s: Option<&str>) {
     match s {
         Some(s) => put_str(w, s),
         None => w.put_i16(-1),
@@ -915,7 +915,7 @@ fn put_len(w: &mut Vec<u8>, n: usize, compact: bool) {
     }
 }
 
-fn put_uvarint(w: &mut Vec<u8>, mut v: u64) {
+pub(crate) fn put_uvarint(w: &mut Vec<u8>, mut v: u64) {
     while v >= 0x80 {
         w.put_u8(v as u8 | 0x80);
         v >>= 7;
@@ -923,9 +923,9 @@ fn put_uvarint(w: &mut Vec<u8>, mut v: u64) {
     w.put_u8(v as u8);
 }
 
-fn put_varint(w: &mut Vec<u8>, v: i64) { put_uvarint(w, ((v << 1) ^ (v >> 63)) as u64) }
+pub(crate) fn put_varint(w: &mut Vec<u8>, v: i64) { put_uvarint(w, ((v << 1) ^ (v >> 63)) as u64) }
 
-fn crc32c(data: &[u8]) -> u32 { crc_fast::checksum(crc_fast::CrcAlgorithm::Crc32Iscsi, data) as u32 }
+pub(crate) fn crc32c(data: &[u8]) -> u32 { crc_fast::checksum(crc_fast::CrcAlgorithm::Crc32Iscsi, data) as u32 }
 
 fn now_ms() -> i64 { std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64) }
 

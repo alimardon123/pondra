@@ -200,10 +200,18 @@ pub async fn apply(lake: &Lake, d: Ddl) -> Result<Value> {
             Ok(j!({"view": name}))
         }
         Ddl::CreateMaterialized { name, sql, options } => {
-            let (emit, sessions, join) = crate::views::options(&options)?;
             let name = new_name(lake, &name).await?;
             ensure!(lake.cat.get::<StoredView>(&query_key(&name)).await?.is_none(), "{name} is a (stored) view");
-            ensure!(crate::ext::names(&sql).is_empty(), "a materialized view follows the rows its tables take in, and files outside the lake take none: read them into a table (CREATE TABLE … AS, INSERT … SELECT) and follow that, or make a stored view (CREATE VIEW)");
+            let outside = crate::ext::names(&sql);
+            if let [topic] = &outside[..] {
+                if crate::ext::spec(topic).is_some_and(|s| s.format == "kafka") {
+                    crate::feeds::create(lake, &name, &sql, topic, &options).await?; // (a topic's records, as they arrive)
+                    crate::views::forget(lake);
+                    return Ok(j!({"view": name, "feed": true}));
+                }
+            }
+            ensure!(outside.is_empty(), "a materialized view follows the rows its tables take in, and files outside the lake take none: read them into a table (CREATE TABLE … AS, INSERT … SELECT) and follow that, or make a stored view (CREATE VIEW)");
+            let (emit, sessions, join) = crate::views::options(&options)?;
             crate::views::create(lake, &name, &sql, emit, sessions, join).await?;
             crate::views::forget(lake); // (the sequencer holds flushes to it from its next commit)
             Ok(j!({"view": name, "materialized": true}))
@@ -577,6 +585,12 @@ fn widens(old: &datafusion::arrow::datatypes::DataType, new: &datafusion::arrow:
 
 /// `DROP VIEW` or `DROP MATERIALIZED VIEW`: a stored view, or a live one with its tables and state.
 async fn drop_view(lake: &Lake, name: &str, if_exists: bool) -> Result<Value> {
+    if lake.cat.get::<crate::feeds::Feed>(&crate::feeds::feed_key(name)).await?.is_some() {
+        let mut gone = vec![crate::feeds::feed_key(name), table_key(name)];
+        gone.extend(lake.cat.scan::<u64>(&crate::store::producer_key(&format!("feed:{name}:")), &crate::store::producer_key(&format!("feed:{name};"))).await?.into_iter().map(|(k, _)| k)); // (its offsets: made again, it starts over)
+        lake.cat.commit(vec![], &gone).await?;
+        return Ok(j!({"view": name, "dropped": true}));
+    }
     if lake.cat.get::<StoredView>(&query_key(name)).await?.is_some() {
         lake.cat.commit(vec![], &[query_key(name)]).await?;
         return Ok(j!({"view": name, "dropped": true}));

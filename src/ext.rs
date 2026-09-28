@@ -141,6 +141,9 @@ fn literal(e: &Expr) -> Result<String> {
 
 /// A file's format by its extension (a glob's too: `*.parquet`).
 fn format_of(url: &str) -> Result<(String, BTreeMap<String, String>)> {
+    if url.starts_with("kafka://") {
+        return Ok(("kafka".into(), BTreeMap::new())); // (a topic)
+    }
     let path = url.split(['?', '#']).next().unwrap_or(url).to_lowercase();
     let tsv = BTreeMap::from([("delim".to_string(), "\t".to_string())]);
     Ok(match path.rsplit('.').next().unwrap_or_default() {
@@ -156,7 +159,7 @@ fn format_of(url: &str) -> Result<(String, BTreeMap<String, String>)> {
 /// A URL's scheme, if it names one Pondra reads (not a path on this machine).
 fn scheme(url: &str) -> Option<&str> {
     let s = url.split_once("://")?.0;
-    ["s3", "r2", "gs", "gcs", "az", "azure", "abfs", "abfss", "http", "https", "file"].contains(&s).then_some(s)
+    ["s3", "r2", "gs", "gcs", "az", "azure", "abfs", "abfss", "http", "https", "kafka", "file"].contains(&s).then_some(s)
 }
 
 // ---------------------------------------------------------------- the table they make
@@ -282,6 +285,7 @@ fn uncovered(u: &str) -> String {
         Some("gs" | "gcs") => ("gcs", "SERVICE_ACCOUNT_KEY '…'"),
         Some("az" | "azure" | "abfs" | "abfss") => ("azure", "CONNECTION_STRING '…'"),
         Some("http" | "https") => ("http", "BEARER_TOKEN '…'"),
+        Some("kafka") => ("kafka", "SECURITY_PROTOCOL 'SASL_SSL', USERNAME '…', PASSWORD '…'"),
         _ => ("s3", "KEY_ID '…', SECRET '…'"),
     };
     format!("no secret covers {u}: an admin makes one (CREATE SECRET name (TYPE {kind}, {keys}, SCOPE '{}'))", root(u).unwrap_or_default())
@@ -291,6 +295,7 @@ fn uncovered(u: &str) -> String {
 async fn resolve(lake: &Lake, spec: &Spec) -> Result<TableMeta> {
     let version = |k: &str| spec.options.get(k).map(|v| v.parse::<i64>().with_context(|| format!("{k} is a number, not {v}"))).transpose();
     match spec.format.as_str() {
+        "kafka" => return Ok(TableMeta { ext: Some(spec.clone()), ..crate::kafka_client::resolve(lake, &spec.urls[0]).await? }),
         "delta" | "iceberg" => {
             let m = match spec.format.as_str() {
                 "delta" => crate::read_delta::resolve(lake, &spec.urls[0], version("version")?).await?,
@@ -456,9 +461,12 @@ fn file_format(spec: &Spec) -> Result<Arc<dyn FileFormat>> {
 
 /// The rows of `files` of an `ext:` table, as `schema`: DataFusion's own readers, without the hot
 /// columns (outside the lake, a file may change under the same name).
-pub async fn read(ctx: &datafusion::prelude::SessionContext, files: &[&DataFile], schema: &datafusion::arrow::datatypes::SchemaRef, spec: &Spec, table: Option<&crate::scan::Table>) -> Result<datafusion::prelude::DataFrame> {
+pub async fn read(lake: &Lake, ctx: &datafusion::prelude::SessionContext, files: &[&DataFile], schema: &datafusion::arrow::datatypes::SchemaRef, spec: &Spec, table: Option<&crate::scan::Table>) -> Result<datafusion::prelude::DataFrame> {
     if ["delta", "iceberg"].contains(&spec.format.as_str()) {
         return crate::scan::read(ctx, files, schema, table).await; // (another engine's table: its partition values, its deletes)
+    }
+    if spec.format == "kafka" {
+        return crate::kafka_client::read(lake, ctx, files, schema).await; // (a topic)
     }
     use datafusion::datasource::listing::{ListingOptions, ListingTable, ListingTableConfig};
     use datafusion::prelude::{cast, ident, lit};
@@ -499,7 +507,7 @@ fn root(url: &str) -> Option<String> {
 /// DataFusion reads `url` through a store for its bucket, made with the secret covering it (or,
 /// for the node's owner, the node's own credentials). The lake's own bucket keeps its store.
 async fn register(lake: &Lake, url: &str) -> Result<()> {
-    let Some(root) = root(url).filter(|_| scheme(url).is_some_and(|s| s != "file")) else { return Ok(()) }; // (this machine's: DataFusion's own)
+    let Some(root) = root(url).filter(|_| scheme(url).is_some_and(|s| s != "file" && s != "kafka")) else { return Ok(()) }; // (this machine's: DataFusion's own; a topic: a Kafka client's)
     let lake_root = self::root(&lake.url);
     let attached: Vec<Option<String>> = lake.attached.read().unwrap().iter().map(|(_, o)| self::root(&o.url)).collect();
     if lake_root.as_deref() == Some(root.as_str()) || attached.iter().any(|a| a.as_deref() == Some(root.as_str())) {
@@ -629,6 +637,10 @@ pub async fn is_attached(lake: &Lake, name: &str) -> Result<bool> { Ok(lake.cat.
 pub fn attached_table(all: &[(String, Attached)], parts: &[String]) -> Result<Option<String>> {
     let Some((_, a)) = all.iter().find(|(n, _)| *n == parts[0]) else { return Ok(None) };
     let rest = &parts[1..];
+    if a.kind == "kafka" {
+        let [topic] = rest else { bail!("{}: a Kafka cluster's topics are {0}.topic", parts[0]) };
+        return Ok(Some(name(&Spec { urls: vec![format!("{}/{topic}", a.url.trim_end_matches('/'))], format: "kafka".into(), options: BTreeMap::new() })));
+    }
     let endpoint = a.options.get("endpoint").cloned().or_else(|| a.url.starts_with("http").then(|| a.url.clone()));
     let spec = match endpoint {
         Some(endpoint) => {
@@ -660,7 +672,8 @@ pub async fn outside_target(lake: &Lake, name: &str) -> Result<Option<String>> {
 /// Leader: keep an attachment of another engine's tables.
 pub async fn attach(lake: &Lake, name: &str, url: &str, kind: &str, options: BTreeMap<String, String>) -> Result<serde_json::Value> {
     crate::ddl::check(name)?;
-    ensure!(["delta", "iceberg"].contains(&kind), "ATTACH … (TYPE {kind}): delta or iceberg (or a Pondra lake, with no TYPE)");
+    ensure!(["delta", "iceberg", "kafka"].contains(&kind), "ATTACH … (TYPE {kind}): delta, iceberg or kafka (or a Pondra lake, with no TYPE)");
+    ensure!((kind == "kafka") == url.starts_with("kafka://"), "ATTACH … (TYPE kafka) takes a kafka://brokers URL, and only it does");
     let known = ["endpoint", "secret", "read_only"];
     if let Some(k) = options.keys().find(|k| !known.contains(&k.as_str())) {
         bail!("ATTACH … (TYPE {kind}) has no option {k}: {}", known.join(", "));
@@ -689,6 +702,11 @@ pub async fn detach(lake: &Lake, name: &str) -> Result<bool> {
     }
     lake.cat.commit(vec![], &[attached_key(name)]).await?;
     Ok(true)
+}
+
+/// The settings of the secret covering `url`, for a client of the service it names (Kafka).
+pub async fn secret_for(lake: &Lake, url: &str) -> Result<Option<BTreeMap<String, String>>> {
+    covering(&list(lake).await?, url).map(|(n, s)| open(&n, &s)).transpose()
 }
 
 /// A client for other engines' services (REST catalogs): Pondra's own tokens never go there.
@@ -746,8 +764,9 @@ fn kind(t: &str) -> Result<(&'static [&'static str], &'static [&'static str])> {
         "azure" => (&["connection_string", "account_name", "account_key", "sas_token", "tenant_id", "client_id", "client_secret", "endpoint", "use_emulator", "provider", "scope"], &["az", "azure", "abfs", "abfss"]),
         "http" => (&["bearer_token", "scope"], &["http", "https"]),
         "iceberg" => (&["token", "client_id", "client_secret", "oauth2_server_uri", "oauth2_scope", "scope"], &["http", "https"]), // (a REST catalog)
+        "kafka" => (&["security_protocol", "sasl_mechanism", "username", "password", "scope"], &["kafka"]),
         "generic" => (&[], &[]), // (any settings: for procedures, `pondra.secret(name)`)
-        t => bail!("secrets of TYPE {t}: s3, r2, gcs, azure, http, iceberg or generic"),
+        t => bail!("secrets of TYPE {t}: s3, r2, gcs, azure, http, iceberg, kafka or generic"),
     })
 }
 
@@ -910,7 +929,7 @@ fn copy_statement(p: &mut datafusion::sql::sqlparser::parser::Parser) -> Option<
 /// its owner.
 pub async fn copy_to(lake: &Lake, query: &str, to: &str, options: &BTreeMap<String, String>) -> Result<serde_json::Value> {
     use datafusion::dataframe::DataFrameWriteOptions;
-    let known = ["format", "partition_by", "header", "delimiter", "delim", "sep", "compression", "row_group_size", "overwrite", "append", "overwrite_or_ignore"];
+    let known = ["format", "partition_by", "header", "delimiter", "delim", "sep", "compression", "row_group_size", "overwrite", "append", "overwrite_or_ignore", "key"];
     if let Some(k) = options.keys().find(|k| !known.contains(&k.as_str())) {
         bail!("COPY … TO has no option {k}: {}", known.join(", "));
     }
@@ -927,6 +946,12 @@ pub async fn copy_to(lake: &Lake, query: &str, to: &str, options: &BTreeMap<Stri
             register(lake, to).await?;
         }
     }
+    if to.starts_with("kafka://") {
+        let query = crate::routines::expand(lake, query).await?;
+        let df = crate::query::session(lake, &query, "").await?.sql_with_options(&query, crate::query::read_only()).await?;
+        return crate::kafka_client::copy_to(lake, df, to, options).await; // (rows as records: a topic's)
+    }
+    ensure!(!options.contains_key("key"), "KEY is a Kafka topic's (COPY … TO 'kafka://brokers/topic')");
     let format = match options.get("format") {
         Some(f) => f.to_lowercase(),
         None => format_of(to.trim_end_matches('/')).map(|f| f.0).with_context(|| format!("COPY … TO {to}: which FORMAT? (parquet, csv, json)"))?,

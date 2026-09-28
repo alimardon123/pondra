@@ -194,6 +194,16 @@ class Pondra:
         """JSON lines as a frame (SQL's `read_json`)."""
         return self._scan("read_json", source, dict(options, hive_partitioning=hive_partitioning))
 
+    def scan_delta(self, source, version=None):
+        """A Delta table as a frame (`delta_scan`): its latest version, or `version`; deletion
+        vectors, column mapping and partitions as Delta's own readers read them."""
+        return self._scan("delta_scan", source, {"version": version})
+
+    def scan_iceberg(self, source, snapshot_id=None, version=None, allow_moved_paths=None):
+        """An Iceberg table as a frame (`iceberg_scan`): its folder or a metadata file; its current
+        snapshot, or `snapshot_id`, or its metadata `version`."""
+        return self._scan("iceberg_scan", source, {"snapshot_from_id": snapshot_id, "version": version, "allow_moved_paths": allow_moved_paths})
+
     def _scan(self, fn, source, options):
         paths = [str(source)] if isinstance(source, (str, os.PathLike)) else [str(s) for s in source]
         where = _literal(paths[0]) if len(paths) == 1 else "[" + ", ".join(_literal(p) for p in paths) + "]"

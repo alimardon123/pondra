@@ -230,6 +230,8 @@ def main():
             checks.update(own(con, root))
         if not only or "attach" in only:
             checks.update(attach(con, root, expected, a.port + 5))
+        if not only or "python" in only:
+            checks.update(python_names(con, expected))
         if not only or "insert" in only:
             checks.update(inserts(con, root, expected, a.spark, a.port + 7))
         if a.spark and (not only or "spread" in only):
@@ -288,6 +290,31 @@ def attach(con, root, expected, port):
         print(json.dumps({"table": "attached: a REST catalog with the wrong secret, refused", "equal": out["attach:wrong secret"], **({} if out["attach:wrong secret"] else {"why": refused[:300]})}), flush=True)
     finally:
         server.kill()
+    return out
+
+
+def python_names(con, expected):
+    """The same tables from Python: frames' `scan_delta` / `scan_iceberg`, and pondra.spark's
+    `spark.read.format("delta" | "iceberg")` with Spark's options for an older version."""
+    from pondra.spark import SparkSession
+    spark, out = SparkSession(con), {}
+    as_rows = lambda t: sorted([[plain(v) for v in r.values()] for r in t.to_pylist()], key=json.dumps)
+    cases = []
+    if "delta:dv" in expected:
+        snapshot = expected["iceberg:mor@2"]["options"].split("=>")[1].strip()
+        cases = [("frames: scan_delta", lambda: con.scan_delta(expected["delta:dv"]["path"]).collect(), "delta:dv"),
+                 ("frames: scan_iceberg", lambda: con.scan_iceberg(expected["iceberg:mor"]["path"]).collect(), "iceberg:mor"),
+                 ("pondra.spark: format('delta'), versionAsOf", lambda: spark.read.format("delta").option("versionAsOf", 2).load(expected["delta:dv@2"]["path"])._f.collect(), "delta:dv@2"),
+                 ("pondra.spark: format('iceberg'), snapshot-id", lambda: spark.read.format("iceberg").option("snapshot-id", snapshot).load(expected["iceberg:mor@2"]["path"])._f.collect(), "iceberg:mor@2")]
+    cases.append(("frames: scan_delta of delta-rs's table", lambda: con.scan_delta(expected["delta:deltars"]["path"]).collect(), "delta:deltars"))
+    for label, read, name in cases:
+        try:
+            ok = as_rows(read()) == expected[name]["rows"]
+            why = None if ok else "differs"
+        except Exception as e:  # noqa: BLE001
+            ok, why = False, str(e)[:300]
+        out[f"python:{label}"] = ok
+        print(json.dumps({"table": label, "equal": ok, **({"why": why} if why else {})}), flush=True)
     return out
 
 
