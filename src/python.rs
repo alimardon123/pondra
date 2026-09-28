@@ -248,7 +248,10 @@ pub async fn ask(packages: &str, kind: Use, head: Value, parts: Vec<Vec<u8>>, li
         }
     };
     let answer = match limit {
-        Some(l) => tokio::time::timeout(l, exchange).await.unwrap_or_else(|_| Err(anyhow::anyhow!("it took longer than {} s, its limit (the worker was stopped)", l.as_secs_f64()))),
+        Some(l) => match tokio::time::timeout(l, exchange).await {
+            Ok(a) => a,
+            Err(_) => bail!("it took longer than {} s, its limit (the worker was stopped)", l.as_secs_f64()), // (not given back: killed)
+        },
         None => exchange.await,
     };
     match answer {
@@ -260,7 +263,9 @@ pub async fn ask(packages: &str, kind: Use, head: Value, parts: Vec<Vec<u8>>, li
             }
         }
         Err(e) => {
-            let status = w.child.try_wait().ok().flatten();
+            // A worker that dies closes its pipes a moment before the OS reports it gone: wait for
+            // that (a second at most), so the reason is always said.
+            let status = tokio::time::timeout(Duration::from_secs(1), w.child.wait()).await.ok().and_then(Result::ok);
             Err(match status {
                 Some(s) => e.context(format!("the Python worker ended ({s})")),
                 None => e,
