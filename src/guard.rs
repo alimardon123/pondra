@@ -75,7 +75,7 @@ async fn link(node: &str) -> Option<Link> {
 /// Query `sql`, which read tables of `bytes`, took `took` here: how long it takes (asked again),
 /// and the rate queries go at on one node (anything else).
 pub fn ran_here(sql: &str, bytes: u64, took: Duration) {
-    TOOK.lock().unwrap().put(key(sql), took.as_secs_f64());
+    note(&TOOK, sql, took);
     if bytes < 1 << 20 {
         return; // (too small to say anything about the rate)
     }
@@ -85,12 +85,24 @@ pub fn ran_here(sql: &str, bytes: u64, took: Duration) {
 }
 
 /// Query `sql` took `took` spread over the nodes.
-pub fn ran_spread(sql: &str, took: Duration) {
-    SPREAD_TOOK.lock().unwrap().put(key(sql), took.as_secs_f64());
+pub fn ran_spread(sql: &str, took: Duration) { note(&SPREAD_TOOK, sql, took) }
+
+/// A query's last three times, one way. A busy machine makes a run slower, never faster, so the
+/// best of them is what that way costs: one slow run doesn't turn the choice.
+type Times = Mutex<lru::LruCache<u64, Vec<f64>>>;
+static TOOK: LazyLock<Times> = LazyLock::new(|| Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(4096).unwrap())));
+static SPREAD_TOOK: LazyLock<Times> = LazyLock::new(|| Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(4096).unwrap())));
+
+fn note(times: &Times, sql: &str, took: Duration) {
+    let mut all = times.lock().unwrap();
+    let t = all.get_or_insert_mut(key(sql), Vec::new);
+    t.push(took.as_secs_f64());
+    if t.len() > 3 {
+        t.remove(0);
+    }
 }
 
-static TOOK: LazyLock<Mutex<lru::LruCache<u64, f64>>> = LazyLock::new(|| Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(4096).unwrap())));
-static SPREAD_TOOK: LazyLock<Mutex<lru::LruCache<u64, f64>>> = LazyLock::new(|| Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(4096).unwrap())));
+fn best(times: &Times, sql: &str) -> Option<f64> { times.lock().unwrap().get(&key(sql)).and_then(|t| t.iter().copied().reduce(f64::min)) }
 
 /// A query as the same query asked again (its comments and spacing aside).
 fn key(sql: &str) -> u64 {
@@ -104,9 +116,9 @@ fn key(sql: &str) -> u64 {
 /// over `link`, to share out a query over tables of `bytes` among `n` nodes? No if nothing has run
 /// here yet.
 pub fn pays(sql: &str, link: Link, moved: u64, steps: usize, bytes: u64, n: usize) -> bool {
-    let known = TOOK.lock().unwrap().get(&key(sql)).copied();
+    let known = best(&TOOK, sql);
     let learned = std::env::var_os("PONDRA_LINK").is_none(); // (a network pretended: the model alone)
-    if let (Some(here), Some(spread), true) = (known, SPREAD_TOOK.lock().unwrap().get(&key(sql)).copied(), learned) {
+    if let (Some(here), Some(spread), true) = (known, best(&SPREAD_TOOK, sql), learned) {
         return spread < here; // (it ran both ways: no need to guess)
     }
     let Some(here) = known.or_else(|| HERE.lock().unwrap().map(|rate| bytes as f64 / rate)) else { return false };
