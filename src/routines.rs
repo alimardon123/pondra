@@ -269,7 +269,7 @@ pub async fn expand(lake: &Lake, sql: &str) -> Result<String> { expand_with(lake
 async fn expand_with(lake: &Lake, sql: &str, views: &HashMap<String, String>) -> Result<String> {
     let all = listed(lake).await?;
     let named = |n: &String| crate::ddl::mentions(sql, n);
-    if !all.iter().any(|(n, r)| r.kind != Kind::Procedure && named(n)) && !views.keys().any(named) && !FROM_FIRST.is_match(sql) {
+    if !all.iter().any(|(n, r)| r.kind != Kind::Procedure && named(n)) && !views.keys().any(named) && !FROM_FIRST.is_match(sql) && !crate::ext::mentions(sql) {
         return Ok(sql.to_string());
     }
     let Ok(mut stmts) = Parser::parse_sql(&GenericDialect {}, sql) else { return Ok(sql.to_string()) };
@@ -360,6 +360,16 @@ impl VisitorMut for Expander<'_> {
     }
 
     fn post_visit_table_factor(&mut self, t: &mut TableFactor) -> ControlFlow<Self::Break> {
+        match crate::ext::table(t) {
+            Ok(Some(files)) => {
+                if let TableFactor::Table { name, args, .. } = t {
+                    (*name, *args) = (ast::ObjectName::from(vec![ast::Ident::with_quote('"', files)]), None); // (files anywhere: `ext.rs`)
+                }
+                return ControlFlow::Continue(());
+            }
+            Err(e) => return ControlFlow::Break(e),
+            Ok(None) => {}
+        }
         if let TableFactor::Table { name, alias, args: None, .. } = t {
             let Some(sql) = self.views.get(&object(name)) else { return ControlFlow::Continue(()) };
             static NONE: std::sync::LazyLock<HashMap<String, String>> = std::sync::LazyLock::new(HashMap::new);

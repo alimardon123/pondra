@@ -13,6 +13,7 @@ pyiceberg==0.12.0
 s3fs
 boto3
 moto==5.2.3
+azure-storage-blob==12.30.3  # (Azurite's containers, harness.py clouds; Azurite itself: npm install -g azurite)
 psycopg[binary]==3.3.6
 psycopg2-binary==2.9.13
 asyncpg==0.31.0

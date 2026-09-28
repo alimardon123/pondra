@@ -122,6 +122,7 @@ pub struct CachedStore {
     cache: Mutex<(lru::LruCache<String, Entry>, usize)>, // entries, total bytes
     max_bytes: usize,
     disk: Option<(Arc<Disk>, String)>, // the SSD tier, and the lake's prefix in the bucket
+    lakes: std::sync::RwLock<Vec<String>>, // the prefix of each lake read through it (`a/b/`, or `` at the bucket's root)
 }
 
 impl std::fmt::Debug for Disk {
@@ -129,8 +130,29 @@ impl std::fmt::Debug for Disk {
 }
 
 impl CachedStore {
-    pub fn new(inner: Arc<dyn object_store::ObjectStore>, max_bytes: usize, disk: Option<(Arc<Disk>, String)>) -> Self {
-        Self { inner, cache: Mutex::new((lru::LruCache::unbounded(), 0)), max_bytes, disk }
+    pub fn new(inner: Arc<dyn object_store::ObjectStore>, max_bytes: usize, disk: Option<(Arc<Disk>, String)>, prefix: &str) -> Self {
+        let this = Self { inner, cache: Mutex::new((lru::LruCache::unbounded(), 0)), max_bytes, disk, lakes: Default::default() };
+        this.add_lake(prefix);
+        this
+    }
+
+    /// Another lake in this bucket (attached): its files are cached too.
+    pub fn add_lake(&self, prefix: &str) {
+        let p = prefix.trim_matches('/');
+        self.lakes.write().unwrap().push(if p.is_empty() { String::new() } else { format!("{p}/") });
+    }
+
+    /// Is this object in a lake (`sub`: in that part of it)? A lake's files (`data/`) are written
+    /// once and never change: cached. Other objects in the bucket (files outside the lake,
+    /// ADR-026) may change under their names: read as they are, and written as COPY … TO asks.
+    fn in_lake(&self, location: &Path, sub: &str) -> bool { self.lakes.read().unwrap().iter().any(|p| location.as_ref().starts_with(&format!("{p}{sub}"))) }
+
+    /// Not a lake's object: DataFusion may write it (COPY … TO beside a lake, never into one).
+    fn outside(&self, location: &Path) -> Result<crate::bridge::Bridge> {
+        match self.in_lake(location, "") {
+            true => Err(Error::PermissionDenied { path: location.to_string(), source: "a lake's objects are written by Pondra alone".into() }),
+            false => Ok(crate::bridge::Bridge(self.inner.clone())),
+        }
     }
 
     /// Serve from the SSD tier if the object is there; otherwise have it fetched for next time.
@@ -171,7 +193,7 @@ impl CachedStore {
             GetRange::Suffix(n) => object_store::GetRange::Suffix(n),
         });
         let opts = object_store::GetOptions { range, head, ..Default::default() };
-        let res = self.inner.get_opts(&object_store::path::Path::from(location.as_ref()), opts).await.map_err(generic)?;
+        let res = self.inner.get_opts(&object_store::path::Path::parse(location.as_ref()).map_err(|e| generic(e.into()))?, opts).await.map_err(generic)?;
         let m = &res.meta;
         let meta = ObjectMeta { location: location.clone(), last_modified: m.last_modified, size: m.size, e_tag: m.e_tag.clone(), version: m.version.clone() };
         let range = res.range.clone();
@@ -191,6 +213,9 @@ impl std::fmt::Display for CachedStore {
 #[async_trait]
 impl ObjectStore for CachedStore {
     async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
+        if !self.in_lake(location, "data/") {
+            return crate::bridge::Bridge(self.inner.clone()).get_opts(location, options).await;
+        }
         let key = format!("{location}|{:?}|{}", options.range, options.head);
         let hit = self.cache.lock().unwrap().0.get(&key).cloned();
         let hit = match hit {
@@ -209,11 +234,24 @@ impl ObjectStore for CachedStore {
         Ok(GetResult { payload, meta, range, attributes: Default::default() })
     }
 
-    // DataFusion only reads the lake; Pondra writes through its own client.
-    async fn put_opts(&self, _: &Path, _: PutPayload, _: PutOptions) -> Result<PutResult> { unsupported() }
-    async fn put_multipart_opts(&self, _: &Path, _: PutMultipartOptions) -> Result<Box<dyn MultipartUpload>> { unsupported() }
-    fn delete_stream(&self, _: BoxStream<'static, Result<Path>>) -> BoxStream<'static, Result<Path>> { stream::once(async { unsupported() }).boxed() }
-    fn list(&self, _: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> { stream::once(async { unsupported() }).boxed() }
-    async fn list_with_delimiter(&self, _: Option<&Path>) -> Result<ListResult> { unsupported() }
+    // DataFusion only reads the lake; Pondra writes through its own client. Beside it: COPY … TO.
+    async fn put_opts(&self, at: &Path, data: PutPayload, o: PutOptions) -> Result<PutResult> { self.outside(at)?.put_opts(at, data, o).await }
+    async fn put_multipart_opts(&self, at: &Path, o: PutMultipartOptions) -> Result<Box<dyn MultipartUpload>> { self.outside(at)?.put_multipart_opts(at, o).await }
+    fn delete_stream(&self, at: BoxStream<'static, Result<Path>>) -> BoxStream<'static, Result<Path>> {
+        let (inner, lakes) = (self.inner.clone(), self.lakes.read().unwrap().clone());
+        at.then(move |p| {
+            let (inner, lakes) = (inner.clone(), lakes.clone());
+            async move {
+                let p = p?;
+                if lakes.iter().any(|l| p.as_ref().starts_with(l.as_str())) {
+                    return Err(Error::PermissionDenied { path: p.to_string(), source: "a lake's objects are deleted by Pondra alone".into() });
+                }
+                let one = stream::once(std::future::ready(Ok(p.clone()))).boxed();
+                crate::bridge::Bridge(inner).delete_stream(one).next().await.unwrap_or(Ok(p))
+            }
+        }).boxed()
+    }
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> { crate::bridge::Bridge(self.inner.clone()).list(prefix) } // (files outside the lake)
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> { crate::bridge::Bridge(self.inner.clone()).list_with_delimiter(prefix).await }
     async fn copy_opts(&self, _: &Path, _: &Path, _: CopyOptions) -> Result<()> { unsupported() }
 }

@@ -78,14 +78,15 @@ jobs:
           path: dist/pondra-[0-9]*.tgz
 
       # The suite, on this very binary (Linux): the quick correctness suite (upserts, split brain,
-      # crashes, clients, Kafka, windows, sums, schemas, scale, Flight…), frames against Polars,
-      # then a cluster losing its leader twice.
+      # crashes, clients, Kafka, windows, sums, schemas, files on S3, lakes on GCS and Azure,
+      # scale, Flight…), frames against Polars, then a cluster losing its leader twice.
       - name: The suite
         if: matrix.platform == 'linux-x64'
         env:
           PONDRA_BIN: ${{ github.workspace }}/${{ env.BIN }}
         run: |
           pip install -r tools/requirements.txt
+          npm install -g azurite   # (Azure's emulator: harness.py clouds)
           python3 tools/harness.py all
           python3 tools/frames_check.py
           python3 tools/cluster.py failover --secs 30

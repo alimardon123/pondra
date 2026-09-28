@@ -12,6 +12,8 @@ use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
 use datafusion::execution::SessionStateBuilder;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey};
+use object_store::azure::{AzureConfigKey, MicrosoftAzureBuilder};
+use object_store::gcp::{GoogleCloudStorageBuilder, GoogleConfigKey};
 use object_store::ClientConfigKey;
 use object_store::{local::LocalFileSystem, path::Path, prefix::PrefixStore, ObjectStore, ObjectStoreExt, PutMode, PutOptions};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -66,6 +68,12 @@ pub struct TableMeta {
     /// Columns dropped (their stored names): older files still hold them; nothing reads them again.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dropped: Vec<String>,
+    /// Not the lake's: files outside it a query reads as a table (`ext.rs`), never in the catalog.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ext: Option<crate::ext::Spec>,
+    /// Another engine's table (`scan.rs`): what matches its files' columns to its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outside: Option<crate::scan::Table>,
 }
 
 impl TableMeta {
@@ -151,7 +159,7 @@ impl TableMeta {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Default)]
 pub struct DataFile {
     pub path: String,
     pub rows: u64,
@@ -181,6 +189,9 @@ pub struct DataFile {
     /// A new file's distinct-value sketches (`sketch.rs`), on their way into its table's.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub sketch: BTreeMap<String, String>,
+    /// Another engine's table's file (`scan.rs`): its partition values and deletes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outside: Option<Box<crate::scan::Outside>>,
 }
 
 /// One log segment = one node's flush, holding rows for many tables. Small segments are stored
@@ -243,17 +254,18 @@ fn free_bytes(dir: &std::path::Path) -> Option<u64> {
 }
 
 pub struct Lake {
-    pub url: String, // absolute local dir or "s3://bucket/prefix"
+    pub url: String, // absolute local dir or "s3://bucket/prefix" (gs://, az://, abfss:// too)
     pub store: Store,
     pub cat: Catalog,
     pub hwm: watch::Sender<u64>, // the last committed segment this node knows of
     pub backlog: std::sync::atomic::AtomicU64, // leader: rows in the log not yet tiered (all tables)
-    rt: Arc<RuntimeEnv>,         // shared by all queries: object store registry + Parquet metadata cache
+    pub rt: Arc<RuntimeEnv>,         // shared by all queries: object store registry + Parquet metadata cache
     tail: Mutex<(lru::LruCache<(u64, String), Rows>, usize)>, // decoded (segment, table) rows; total bytes
     pub disk: Option<Arc<crate::cache::Disk>>, // lakes on object storage: the local SSD tier
     pub groups: crate::serve::Groups,          // decoded row groups for key lookups
     pub hot: Arc<crate::hot::Hot>,             // decoded columns of files queries read lately
     pub attached: std::sync::RwLock<Vec<(String, Arc<Lake>)>>, // other lakes, read as `name.table` (`--attach`)
+    cached: Option<Arc<crate::cache::CachedStore>>, // what DataFusion reads the bucket through
     pub ids: crate::sys::Ids, // the row ids this process stamps rows with (a block reserved from the leader)
     me: std::sync::Weak<Lake>,
 }
@@ -299,22 +311,34 @@ pub fn resident() -> Option<usize> {
 
 pub type Rows = Arc<Vec<datafusion::arrow::record_batch::RecordBatch>>;
 
-/// Open a lake's object store. For s3:// URLs, also returns the bucket-level client that query
-/// scans use (DataFusion addresses objects by their full path in the bucket).
+/// Open a lake's object store. For a bucket (`s3://`, `gs://`, `az://`, `abfss://`), also returns
+/// the bucket-level client that query scans use (DataFusion addresses objects by their full path
+/// in the bucket). Credentials and endpoints come from the environment, as each cloud's own tools
+/// read them: `AWS_*` (`AWS_ENDPOINT` for R2 and MinIO), `GOOGLE_*`, `AZURE_*`.
 pub fn open_store(url: &str) -> Result<(String, Store, Option<(String, Store)>)> {
-    let Some(rest) = url.strip_prefix("s3://") else {
+    let Some((scheme, rest)) = url.split_once("://").filter(|(s, _)| ["s3", "gs", "az", "abfs", "abfss"].contains(s)) else {
         std::fs::create_dir_all(url)?;
         let dir = std::fs::canonicalize(url)?.to_string_lossy().trim_start_matches(r"\\?\").to_string(); // (Windows verbatim prefix)
         return Ok((dir.clone(), Arc::new(Counted(Arc::new(LocalFileSystem::new_with_prefix(&dir)?))), None));
     };
-    // Credentials and endpoint come from AWS_* env vars (AWS_ENDPOINT for R2 / MinIO).
     let (bucket, prefix) = rest.trim_end_matches('/').split_once('/').unwrap_or((rest, ""));
+    let root = format!("{scheme}://{bucket}");
     // Idle connections are dropped after 15 s rather than reused: through proxies and NATs that
     // silently forget idle connections, a reused one hung a PUT for the full 30 s timeout on R2.
-    let idle = (AmazonS3ConfigKey::Client(ClientConfigKey::PoolIdleTimeout), "15s");
-    let s3: Store = Arc::new(AmazonS3Builder::from_env().with_bucket_name(bucket).with_allow_http(true).with_config(idle.0, idle.1).build()?);
-    let store: Store = if prefix.is_empty() { s3.clone() } else { Arc::new(PrefixStore::new(s3.clone(), prefix)) };
-    Ok((url.trim_end_matches('/').to_string(), Arc::new(Counted(store)), Some((format!("s3://{bucket}"), s3))))
+    let (idle, after) = (ClientConfigKey::PoolIdleTimeout, "15s");
+    let whole: Store = match scheme {
+        "s3" => Arc::new(AmazonS3Builder::from_env().with_bucket_name(bucket).with_allow_http(true).with_config(AmazonS3ConfigKey::Client(idle), after).build()?),
+        "gs" => Arc::new(GoogleCloudStorageBuilder::from_env().with_bucket_name(bucket).with_config(GoogleConfigKey::Client(idle), after).build()?),
+        _ => Arc::new(MicrosoftAzureBuilder::from_env().with_url(&root).with_config(AzureConfigKey::Client(idle), after).build()?),
+    };
+    let store: Store = if prefix.is_empty() { whole.clone() } else { Arc::new(PrefixStore::new(whole.clone(), prefix)) };
+    Ok((url.trim_end_matches('/').to_string(), Arc::new(Counted(store)), Some((root, whole))))
+}
+
+/// A lake's bucket, as DataFusion names its store (`s3://bucket`), or None for a folder.
+pub fn bucket_url(url: &str) -> Option<String> {
+    let (scheme, rest) = url.split_once("://")?;
+    Some(format!("{scheme}://{}", rest.split('/').next().unwrap_or_default()))
 }
 
 /// A lake's store, counting the requests that cost the most and meet a bucket's rate limits
@@ -366,10 +390,12 @@ impl Lake {
         let pool = Arc::new(datafusion::execution::memory_pool::FairSpillPool::new(memory_limit()));
         let rt = RuntimeEnvBuilder::new().with_memory_pool(pool).build_arc()?; // (spills go to the OS temp dir)
         let disk = bucket.as_ref().and_then(|_| disk_tier(&url, &store));
+        let mut cached_store = None;
         if let Some((bucket_url, s3)) = bucket {
             let prefix = url.trim_start_matches(&bucket_url).trim_start_matches('/').to_string();
-            let cached = crate::cache::CachedStore::new(s3, cache_mb() << 20, disk.clone().map(|d| (d, prefix)));
-            rt.register_object_store(&url::Url::parse(&bucket_url)?, Arc::new(cached));
+            let cached = Arc::new(crate::cache::CachedStore::new(s3, cache_mb() << 20, disk.clone().map(|d| (d, prefix.clone())), &prefix));
+            rt.register_object_store(&url::Url::parse(&bucket_url)?, cached.clone());
+            cached_store = Some(cached);
         }
         // The catalog's own files go on the SSD tier too (next to the lake's objects), so catalog
         // reads — the leader's, a new node's, a reader's without a live leader — are local.
@@ -377,7 +403,7 @@ impl Lake {
         let cache = ObjectStoreCacheOptions { root_folder: cache, max_cache_size_bytes: Some(2 << 30), cache_on_flush: true, cache_on_compaction: true, ..Default::default() };
         let cat = if writer { Catalog::writer(store.clone(), cache).await? } else { Catalog::reader(store.clone(), streamed, cache).await? };
         let hwm = watch::Sender::new(cat.get::<u64>("n").await?.unwrap_or(1) - 1);
-        let lake = Arc::new_cyclic(|me| Lake { url, store, cat, hwm, backlog: Default::default(), rt, tail: Mutex::new((lru::LruCache::unbounded(), 0)), disk, groups: crate::serve::Groups::new(cache_mb() << 19), hot: Arc::new(crate::hot::Hot::new()), attached: Default::default(), ids: Default::default(), me: me.clone() });
+        let lake = Arc::new_cyclic(|me| Lake { url, store, cat, hwm, backlog: Default::default(), rt, tail: Mutex::new((lru::LruCache::unbounded(), 0)), disk, groups: crate::serve::Groups::new(cache_mb() << 19), hot: Arc::new(crate::hot::Hot::new()), attached: Default::default(), ids: Default::default(), cached: cached_store, me: me.clone() });
         lake.hot.watch(); // the decoded columns give memory back when the node needs it
         if let Some(writes) = lake.cat.unstarted.lock().unwrap().take() {
             tokio::spawn(lake.clone().commits(writes));
@@ -539,9 +565,13 @@ impl Lake {
         let name = &name.to_lowercase(); // (as SQL reads an unquoted name)
         crate::ddl::check(name)?;
         anyhow::ensure!(*name != crate::ddl::lake_name(self), "this lake is called {name} already: attach the other under another name");
-        if let Some(bucket) = other.url.strip_prefix("s3://").map(|r| format!("s3://{}", r.split('/').next().unwrap_or_default())) {
-            let url = url::Url::parse(&bucket)?;
-            self.rt.register_object_store(&url, other.rt.object_store(datafusion::execution::object_store::ObjectStoreUrl::parse(&bucket)?)?);
+        match (bucket_url(&other.url), &self.cached) {
+            (Some(bucket), Some(ours)) if bucket_url(&self.url).as_ref() == Some(&bucket) => ours.add_lake(other.url[bucket.len()..].trim_start_matches('/')), // (one bucket: our reader, its files cached too)
+            (Some(bucket), _) => {
+                let url = url::Url::parse(&bucket)?;
+                self.rt.register_object_store(&url, other.rt.object_store(datafusion::execution::object_store::ObjectStoreUrl::parse(&bucket)?)?);
+            }
+            _ => {}
         }
         self.attached.write().unwrap().push((name.to_string(), other));
         Ok(())
@@ -562,6 +592,7 @@ impl Lake {
         let mut ctx = SessionContext::new_with_state(state.build());
         datafusion_functions_json::register_all(&mut ctx).expect("JSON functions register"); // json_get(…), ->, ->>
         crate::files::register(&ctx, self.arc()); // files('…'), file_read(path)
+        crate::ext::register_secrets(&ctx, self.arc()); // secrets()
         crate::ai::register(&ctx); // ai_complete, ai_embed, cosine_similarity, …
         crate::asof::register(&ctx); // (ASOF JOIN's marker)
         crate::fsum::register(&ctx); // sum(DOUBLE): the same answer in any order
@@ -575,7 +606,12 @@ impl Lake {
     pub fn arc(&self) -> Arc<Lake> { self.me.upgrade().expect("a lake outlives its queries") }
 
     /// Full URL of an object, for DataFusion.
-    pub fn full(&self, path: &str) -> String { format!("{}/{path}", self.url) }
+    pub fn full(&self, path: &str) -> String {
+        match path.contains("://") {
+            true => path.to_string(), // (a file outside the lake: `ext.rs`)
+            false => format!("{}/{path}", self.url),
+        }
+    }
 
     /// The store DataFusion reads `url` through (for lakes on object storage: the read cache and
     /// the SSD tier in front of the bucket).

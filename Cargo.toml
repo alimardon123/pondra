@@ -43,8 +43,10 @@ snap = "1"
 zstd = "0.13"
 crc-fast = "1.10"
 # S3 / R2 / MinIO. SlateDB and our own I/O use object_store 0.14; DataFusion 55 reads through 0.13.
-object_store = { version = "0.14", features = ["aws"] }
+object_store = { version = "0.14", features = ["aws", "gcp", "azure", "http"] } # (files outside the lake too: ADR-026)
 object_store_df = { package = "object_store", version = "0.13", default-features = false }
+glob = "0.3" # (a URL's glob: DataFusion splits only paths'; already built for it)
+aws-lc-rs = "1" # (secrets sealed with AES-256-GCM: already built for object_store's TLS)
 sysinfo = { version = "0.35", default-features = false, features = ["system"] } # (RAM and resident memory where there is no /proc: Windows, macOS; already built for SlateDB)
 
 

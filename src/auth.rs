@@ -70,9 +70,9 @@ impl Auth {
 
     /// May this role run this write?
     pub fn allows(&self, role: Role, stmt: &Stmt) -> Result<()> {
-        let need = if matches!(stmt, Stmt::Create(_) | Stmt::Define(..) | Stmt::AddColumn(..) | Stmt::SetOptions(..) | Stmt::Ddl(_)) { Role::Admin } else { Role::Write };
+        let need = if matches!(stmt, Stmt::Create(_) | Stmt::Define(..) | Stmt::AddColumn(..) | Stmt::SetOptions(..) | Stmt::Ddl(_) | Stmt::CopyTo(..)) { Role::Admin } else { Role::Write };
         if role < need {
-            bail!("this token may not {}", if need == Role::Admin { "create tables" } else { "write" });
+            bail!("this token may not {}", match stmt { Stmt::CopyTo(..) => "write files outside the lake", _ if need == Role::Admin => "create tables", _ => "write" });
         }
         Ok(())
     }

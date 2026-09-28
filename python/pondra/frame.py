@@ -729,6 +729,26 @@ class Frame:
                 "overwrite": f"DROP TABLE IF EXISTS {name}; CREATE TABLE {name} AS {self.sql}"}[mode]
         return self._con._run(body, self._params, self._sent)
 
+    def sink_parquet(self, path, partition_by=None):
+        """Its rows into Parquet outside the lake (SQL's `COPY … TO`): a file, or a folder of files
+        when `path` ends in `/` or `partition_by` names columns (Hive-style folders). A URL needs a
+        secret covering it and an admin's token; with `local()`, this machine's paths too."""
+        return self._sink(path, "parquet", partition_by)
+
+    def sink_csv(self, path, separator=None, include_header=True, partition_by=None):
+        """Its rows into CSV outside the lake (Polars' names; `COPY … TO`)."""
+        return self._sink(path, "csv", partition_by, header=include_header, delimiter=separator)
+
+    def sink_ndjson(self, path, partition_by=None):
+        """Its rows into JSON lines outside the lake (`COPY … TO`)."""
+        return self._sink(path, "json", partition_by)
+
+    def _sink(self, path, format, partition_by, **options):
+        cols = [partition_by] if isinstance(partition_by, str) else list(partition_by or [])
+        given = [f"FORMAT {format}"] + [f"PARTITION_BY ({', '.join(_quote(c) for c in cols)})"] * builtins.bool(cols)
+        given += [f"{k.upper()} {_literal(v)}" for k, v in options.items() if v is not None]
+        return self._con._run(f"COPY ({self.sql}) TO {_literal(str(path))} ({', '.join(given)})", self._params, self._sent)
+
     def _target(self, what):
         if not self._table:
             raise ValueError(f"{what} changes a table: con.table(name).{what}(…)")

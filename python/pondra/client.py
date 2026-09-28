@@ -177,6 +177,29 @@ class Pondra:
 
     from_pandas = from_polars = from_rows = from_arrow
 
+    # ------------------------------------------------------------ files anywhere (ADR-026)
+
+    def scan_parquet(self, source, hive_partitioning=None, **options):
+        """Parquet files as a frame, read where the node runs each time it's asked for rows: a
+        URL (`s3://`, `gs://`, `az://`, `https://`), a folder, a glob or a list of them; with
+        `local()`, this machine's paths too. SQL's `read_parquet`: a URL needs a secret covering it
+        (`CREATE SECRET`), unless the node is yours."""
+        return self._scan("read_parquet", source, dict(options, hive_partitioning=hive_partitioning))
+
+    def scan_csv(self, source, separator=None, has_header=None, hive_partitioning=None, **options):
+        """CSV files as a frame (Polars' names; SQL's `read_csv`)."""
+        return self._scan("read_csv", source, dict(options, delim=separator, header=has_header, hive_partitioning=hive_partitioning))
+
+    def scan_ndjson(self, source, hive_partitioning=None, **options):
+        """JSON lines as a frame (SQL's `read_json`)."""
+        return self._scan("read_json", source, dict(options, hive_partitioning=hive_partitioning))
+
+    def _scan(self, fn, source, options):
+        paths = [str(source)] if isinstance(source, (str, os.PathLike)) else [str(s) for s in source]
+        where = _literal(paths[0]) if len(paths) == 1 else "[" + ", ".join(_literal(p) for p in paths) + "]"
+        args = "".join(f", {k} => {_literal(v)}" for k, v in options.items() if v is not None)
+        return Frame(self, f"SELECT * FROM {fn}({where}{args})")
+
     def run(self, file, job=None, **params):
         """A `.sql` file's statements (or the SQL itself), in order, `$name` taking `name`'s value:
         the last one's rows or outcome."""

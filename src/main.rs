@@ -1,6 +1,8 @@
 //! Pondra: a streamhouse in one binary (see ADR-002 to ADR-005).
 //! Object storage — a local dir or s3://bucket/prefix (S3, R2, MinIO) — is the only state.
 mod ai;
+mod avro;
+mod bridge;
 mod asof;
 mod auth;
 mod cache;
@@ -9,6 +11,7 @@ mod guard;
 mod hilbert;
 mod ddl;
 mod delta;
+mod ext;
 mod files;
 mod flight;
 mod fsum;
@@ -26,11 +29,14 @@ mod optimize;
 mod mcp;
 mod pg;
 mod query;
+mod read_delta;
+mod read_iceberg;
 mod ranges;
 mod sketch;
 mod skew;
 mod replica;
 mod routines;
+mod scan;
 mod server;
 mod spill;
 mod spmd;
@@ -464,8 +470,11 @@ async fn main() -> anyhow::Result<()> {
                     attach(&lake, spec, "", false).await?;
                 }
                 ddl::sync(&lake, "", false).await?;
-                let query = routines::expand(&lake, &query).await?;
-                let batches = query::session(&lake, &query, "").await?.enable_url_table().sql(&query).await?.collect().await?;
+                let run = async {
+                    let query = routines::expand(&lake, &query).await?;
+                    anyhow::Ok(query::session(&lake, &query, "").await?.enable_url_table().sql(&query).await?.collect().await?)
+                };
+                let batches = ext::scope(true, run).await?; // (its user's own machine: its files, its credentials)
                 println!("{}", pretty_format_batches(&batches)?);
             }
         },

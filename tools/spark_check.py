@@ -411,6 +411,70 @@ def p_count_first_collect(spark, F, Window):
     return {"count": n, "first_id": first_row["id"], "top3": top3}
 
 
+# ---- files anywhere (ADR-026): spark.read and df.write, the same code against both
+
+FILES = {}  # (made in main: the same input files for both sides; each side writes its own folder)
+
+
+def _files(orders_t):
+    import pyarrow.csv as pcsv, pyarrow.parquet as pq
+    root = tempfile.mkdtemp(prefix="pondra-sparkfiles-")
+    flat = orders_t.select(["id", "user", "item", "qty", "price", "region"])
+    pcsv.write_csv(flat, os.path.join(root, "orders.csv"), pcsv.WriteOptions(delimiter=";"))
+    pq.write_to_dataset(orders_t.select(["id", "user", "qty", "price", "region"]), os.path.join(root, "by_region"), partition_cols=["region"])
+    with open(os.path.join(root, "orders.json"), "w") as f:
+        f.writelines(json.dumps(r) + "\n" for r in flat.select(["id", "user", "qty"]).to_pylist())
+    FILES.update(root=root, csv=os.path.join(root, "orders.csv"), parquet=os.path.join(root, "by_region"), json=os.path.join(root, "orders.json"))
+
+
+def _out(spark, name):
+    return os.path.join(FILES["root"], ("pondra-" if type(spark).__module__.startswith("pondra") else "spark-") + name)
+
+
+def p_read_csv_header(spark, F, Window):
+    return spark.read.csv(FILES["csv"], header=True, inferSchema=True, sep=";").groupBy("user").agg(F.sum("qty").alias("q"), F.count("*").alias("n"))
+
+
+def p_read_csv_strings(spark, F, Window):
+    return spark.read.option("sep", ";").csv(FILES["csv"]).where(F.col("_c1") == "u007").select("_c0", "_c3", "_c5")
+
+
+def p_read_parquet_partitions(spark, F, Window):
+    return spark.read.parquet(FILES["parquet"]).groupBy("region").agg(F.count("*").alias("n"), F.sum("qty").alias("q"))
+
+
+def p_read_json(spark, F, Window):
+    return spark.read.json(FILES["json"]).where(F.col("qty") > 10).select("id", "user", "qty")
+
+
+def p_write_parquet_read_back(spark, F, Window):
+    out = _out(spark, "parquet")
+    df = spark.table("orders").select("id", "user", "qty", "region")
+    df.write.mode("overwrite").partitionBy("region").parquet(out)
+    df.where(F.col("id") <= 10).write.mode("append").partitionBy("region").parquet(out)
+    return spark.read.parquet(out).groupBy("region").agg(F.count("*").alias("n"), F.sum("qty").alias("q"))
+
+
+def p_write_csv_read_back(spark, F, Window):
+    out = _out(spark, "csv")
+    spark.table("orders").select("id", "user", "qty").write.mode("overwrite").option("header", True).csv(out)
+    return spark.read.csv(out, header=True, inferSchema=True).groupBy("user").agg(F.sum("qty").alias("q"))
+
+
+def p_write_modes(spark, F, Window):
+    out, df, said = _out(spark, "modes"), spark.table("users"), []
+    df.write.parquet(out)  # (a new folder)
+    try:
+        df.write.parquet(out)  # (the default mode: a folder holding files is refused)
+        said.append("written again")
+    except Exception:  # noqa: BLE001
+        said.append("refused")
+    df.write.mode("ignore").parquet(out)
+    df.write.mode("append").json(out + "-json")
+    df.write.mode("append").json(out + "-json")
+    return said + [spark.read.parquet(out).count(), spark.read.json(out + "-json").count()]
+
+
 PIPELINES = [
     ("select", False, "frame", p_select),
     ("selectExpr", False, "frame", p_select_expr),
@@ -456,6 +520,13 @@ PIPELINES = [
     ("createDataFrame_tuples_schema", False, "frame", p_create_dataframe_tuples),
     ("write_saveAsTable_then_table", False, "frame", p_write_then_read),
     ("count_first_collect_row_access", None, "value", p_count_first_collect),
+    ("read_csv_header_inferSchema", False, "frame", p_read_csv_header),
+    ("read_csv_strings_no_header", False, "frame", p_read_csv_strings),
+    ("read_parquet_partition_folders", False, "frame", p_read_parquet_partitions),
+    ("read_json", False, "frame", p_read_json),
+    ("write_parquet_partitionBy_modes", False, "frame", p_write_parquet_read_back),
+    ("write_csv_header", False, "frame", p_write_csv_read_back),
+    ("write_modes_error_ignore_append", None, "value", p_write_modes),
 ]
 
 
@@ -507,6 +578,7 @@ def main():
     con = real_spark = None
     try:
         orders_t, users_t = build_data()
+        _files(orders_t)
 
         con = pondra.local(lake, port=args.port)
         load_pondra(con, orders_t, users_t)
@@ -535,6 +607,7 @@ def main():
             con.close()
         shutil.rmtree(lake, ignore_errors=True)
         shutil.rmtree(warehouse, ignore_errors=True)
+        shutil.rmtree(FILES.get("root", "/nonexistent"), ignore_errors=True)
         shutil.rmtree("spark-warehouse", ignore_errors=True)  # (created in cwd if the config were ever ignored)
 
 

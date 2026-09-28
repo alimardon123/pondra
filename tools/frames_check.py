@@ -11,6 +11,8 @@
 4. Frames write: CREATE TABLE … AS, INSERT, UPDATE, DELETE and MERGE with Delta's builder names.
 5. One name, one meaning: `db.view` and a frame's `to_view` make a stored query unless
    `materialized=True`; `db.write_table` is a frame's `write_table` (ADR-025).
+6. Files as frames (ADR-026): `scan_parquet/csv/ndjson` == Polars' own, and `sink_*` written
+   files Polars reads back, a folder by `partition_by` too.
 
   frames_check.py [--only name,…] [--port 8830]      (pondra.spark vs PySpark: spark_check.py)
 """
@@ -269,6 +271,45 @@ def names(con):
     return checks
 
 
+def files(con, tmp):
+    """Files as frames, with Polars' names (ADR-026): `scan_parquet`, `scan_csv`, `scan_ndjson`
+    read what Polars reads the same way, and `sink_parquet`, `sink_csv`, `sink_ndjson` write what
+    Polars reads back — a folder by `partition_by` too. (A `local()` connection: this machine's
+    files; a URL takes a secret, `harness.py outside`.)"""
+    orders = con.table("orders").sort("id").collect()
+    src = os.path.join(tmp, "in")
+    os.makedirs(src)
+    df = pl.from_arrow(orders)
+    for i, part in enumerate(df.iter_slices(1000)):
+        part.write_parquet(os.path.join(src, f"orders-{i}.parquet"))
+    df.write_csv(os.path.join(src, "orders.csv"), separator=";")
+    df.select("id", "user", "qty").write_ndjson(os.path.join(src, "orders.ndjson"))
+    per_user = lambda f, n: f.group_by("user").agg(n.col("qty").sum().alias("q"), n.len().alias("n"))
+    glob = os.path.join(src, "*.parquet")
+    checks = {"scan_parquet (a glob) == pl.scan_parquet": compare(per_user(con.scan_parquet(glob), pondra).collect(), per_user(pl.scan_parquet(glob), pl).collect().to_arrow(), False)[0],
+              "scan_csv(separator=';') == pl.scan_csv": compare(per_user(con.scan_csv(os.path.join(src, "orders.csv"), separator=";"), pondra).collect(),
+                                                                per_user(pl.scan_csv(os.path.join(src, "orders.csv"), separator=";"), pl).collect().to_arrow(), False)[0],
+              "scan_ndjson == pl.scan_ndjson": compare(per_user(con.scan_ndjson(os.path.join(src, "orders.ndjson")), pondra).collect(),
+                                                       per_user(pl.scan_ndjson(os.path.join(src, "orders.ndjson")), pl).collect().to_arrow(), False)[0]}
+    out = os.path.join(tmp, "out")
+    big = con.table("orders").filter(col("qty") > 4).select("id", "user", "qty", "price", "region")
+    want = big.sort("id").collect()
+    big.sink_parquet(os.path.join(out, "big.parquet"))
+    big.sink_csv(os.path.join(out, "big.csv"), separator="|")
+    big.sink_ndjson(os.path.join(out, "big.ndjson"))
+    big.sink_parquet(os.path.join(out, "by_region") + "/", partition_by="region")
+    sort = lambda d: d.sort("id").to_arrow()
+    checks["sink_parquet: pl.read_parquet reads the frame's rows"] = compare(want, sort(pl.read_parquet(os.path.join(out, "big.parquet"))), True)[0]
+    checks["sink_csv(separator='|'), sink_ndjson: Polars reads them back"] = (
+        compare(want, sort(pl.read_csv(os.path.join(out, "big.csv"), separator="|", schema=pl.from_arrow(want).schema)), True)[0]
+        and compare(want, sort(pl.read_ndjson(os.path.join(out, "big.ndjson"), schema=pl.from_arrow(want).schema)), True)[0])
+    back = pl.scan_parquet(os.path.join(out, "by_region", "**", "*.parquet"), hive_partitioning=True).select(want.column_names).collect()
+    checks["sink_parquet(partition_by=…): a folder a value, read back by Polars"] = (
+        sorted(os.listdir(os.path.join(out, "by_region"))) == sorted({f"region={v}" for v in want.column("region").to_pylist() if v is not None} | {"region=__HIVE_DEFAULT_PARTITION__"} & set(os.listdir(os.path.join(out, "by_region"))))
+        and compare(want, sort(back.with_columns(pl.col("region").replace("__HIVE_DEFAULT_PARTITION__", None))), True)[0])
+    return checks
+
+
 def _made_again(con, name):
     """Is `name` a materialized view? Making another under its name says it exists already; a
     stored view of that name is refused as one ("is a (stored) view")."""
@@ -317,8 +358,11 @@ def main():
         print(json.dumps({"writes": wrote}), flush=True)
         named = names(con)
         print(json.dumps({"names": named}, ensure_ascii=False), flush=True)
+        filed = files(con, tmp)
+        print(json.dumps({"files": filed}, ensure_ascii=False), flush=True)
         kept.update(wrote)
         kept.update(named)
+        kept.update(filed)
         ok = all(results.values()) and all(v is True for v in ways.values()) and all(kept.values())
         print(json.dumps({"pipelines_equal": sum(results.values()), "pipelines": len(results), "ways_equal": sum(v is True for v in ways.values()), "ways": len(ways), "ok": ok}))
         sys.exit(0 if ok else 1)

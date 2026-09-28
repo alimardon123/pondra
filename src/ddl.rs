@@ -137,6 +137,8 @@ pub enum Ddl {
     RenameTable { name: String, to: String }, // (not yet: refused with the way round it)
     CreateRoutine { name: String, routine: crate::routines::Routine, replace: bool }, // CREATE MACRO, CREATE PROCEDURE (ADR-023)
     DropRoutine { name: String, if_exists: bool },
+    CreateSecret { name: String, params: std::collections::BTreeMap<String, String>, replace: bool, if_not_exists: bool }, // (ADR-026: `ext.rs`)
+    DropSecret { name: String, if_exists: bool },
 }
 
 /// What `ALTER TABLE` does to a column: rename it, drop it, or widen its type (a SQL type).
@@ -200,6 +202,7 @@ pub async fn apply(lake: &Lake, d: Ddl) -> Result<Value> {
             let (emit, sessions, join) = crate::views::options(&options)?;
             let name = new_name(lake, &name).await?;
             ensure!(lake.cat.get::<StoredView>(&query_key(&name)).await?.is_none(), "{name} is a (stored) view");
+            ensure!(crate::ext::names(&sql).is_empty(), "a materialized view follows the rows its tables take in, and files outside the lake take none: read them into a table (CREATE TABLE … AS, INSERT … SELECT) and follow that, or make a stored view (CREATE VIEW)");
             crate::views::create(lake, &name, &sql, emit, sessions, join).await?;
             crate::views::forget(lake); // (the sequencer holds flushes to it from its next commit)
             Ok(j!({"view": name, "materialized": true}))
@@ -236,6 +239,8 @@ pub async fn apply(lake: &Lake, d: Ddl) -> Result<Value> {
         Ddl::RenameTable { name, to } => bail!("ALTER TABLE … RENAME TO isn't supported yet: a table's name is where its files, log and Delta and Iceberg copies live. CREATE TABLE {to} AS SELECT * FROM {name}; then DROP TABLE {name}; does it"),
         Ddl::CreateRoutine { name, routine, replace } => crate::routines::create(lake, &name, routine, replace).await,
         Ddl::DropRoutine { name, if_exists } => crate::routines::drop(lake, &name, if_exists).await,
+        Ddl::CreateSecret { name, params, replace, if_not_exists } => crate::ext::create(lake, &name, params, replace, if_not_exists).await,
+        Ddl::DropSecret { name, if_exists } => crate::ext::drop(lake, &name, if_exists).await,
         Ddl::Detach { name, if_exists } => {
             if lake.cat.get::<Attachment>(&attachment_key(&name)).await?.is_none() {
                 let flag = lake.attached.read().unwrap().iter().any(|(n, _)| *n == name);
@@ -266,7 +271,7 @@ async fn lake_dir(dir: &str) -> Result<(String, bool)> {
 }
 
 /// A lake's place as its nodes name it: a bucket's URL as it is, a folder's full path.
-fn full(dir: &str) -> Result<String> {
+pub fn full(dir: &str) -> Result<String> {
     Ok(match dir.contains("://") {
         true => dir.trim_end_matches('/').to_string(),
         false => match std::fs::canonicalize(dir) {

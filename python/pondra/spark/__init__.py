@@ -16,7 +16,7 @@ import re
 import sys
 
 from .. import client as _client
-from ..frame import Frame, _literal, _quote
+from ..frame import Frame, _literal, _quote, sql_expr
 
 _ids = itertools.count(1)
 _SIMPLE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*$")
@@ -307,7 +307,6 @@ class SparkSession:
     def __init__(self, con):
         self.con = con
         self.catalog = _Catalog(self)
-        self.read = _Reader(self)
         self.version = "4.0.0 (pondra)"
 
     @classmethod
@@ -357,6 +356,11 @@ class SparkSession:
     def udf(self):
         raise NotImplementedError("Python UDFs don't run on the nodes: write the expression in SQL (F.expr), or register a function over Arrow Flight (POST /functions)")
 
+    @property
+    def read(self):
+        """A reader of files (each time a new one, as PySpark's: options don't carry over)."""
+        return _Reader(self)
+
     def readStream(self, *_):
         raise NotImplementedError("Structured Streaming: a materialized view keeps a query up to date as rows arrive (df.to_view(…, materialized=True))")
 
@@ -394,29 +398,93 @@ class _Catalog:
 
 
 class _Reader:
-    """`spark.read`: files this machine's node reads (a `pondra.local` session's own files)."""
+    """`spark.read`: files anywhere (ADR-026: `s3://`, `gs://`, `az://`, `https://`, and a
+    `pondra.local` session's own machine), as SQL's `read_parquet`, `read_csv` and `read_json`
+    read them, with Spark's options and defaults: a folder's `k=v` folders are columns; CSV has no
+    header and every column a string unless `header` and `inferSchema` say otherwise. An option
+    Pondra doesn't take is refused by name, never ignored."""
+
+    # Spark's options (case-insensitive) → the reader's arguments; None: taken here, not passed on.
+    OPTIONS = {"parquet": {"mergeschema": "union_by_name", "recursivefilelookup": None, "pathglobfilter": None},
+               "csv": {"header": "header", "sep": "delim", "delimiter": "delim", "quote": "quote", "escape": "escape", "inferschema": None,
+                       "encoding": None, "charset": None, "recursivefilelookup": None, "pathglobfilter": None},
+               "json": {"multiline": None, "encoding": None, "recursivefilelookup": None, "pathglobfilter": None}}
 
     def __init__(self, spark):
-        self.spark, self.opts = spark, {}
+        self.spark, self.fmt, self.opts, self._schema = spark, "parquet", {}, None
+
+    def format(self, f):
+        self.fmt = f.lower()
+        return self
 
     def option(self, k, v):
-        self.opts[k] = v
+        self.opts[k.lower()] = v
         return self
 
     def options(self, **kw):
-        self.opts.update(kw)
+        for k, v in kw.items():
+            self.option(k, v)
         return self
 
-    def format(self, _):
+    def schema(self, schema):
+        self._schema = schema
         return self
 
-    def _file(self, path):
-        return DataFrame(self.spark, self.spark.con.sql(f"SELECT * FROM '{path}'"))
+    def load(self, path=None, format=None, schema=None, **options):
+        if format:
+            self.format(format)
+        if schema is not None:
+            self.schema(schema)
+        if path is None:
+            raise ValueError("spark.read.load(path): which files?")
+        return self.options(**options)._read([path] if isinstance(path, str) else list(path))
 
-    parquet = csv = json = load = _file
+    def parquet(self, *paths, **options):
+        return self.format("parquet").options(**options)._read(list(paths))
+
+    def csv(self, path, schema=None, **options):
+        return self.format("csv").load(path, schema=schema, **{k: v for k, v in options.items() if v is not None})
+
+    def json(self, path, schema=None, **options):
+        return self.format("json").load(path, schema=schema, **{k: v for k, v in options.items() if v is not None})
 
     def table(self, name):
         return self.spark.table(name)
+
+    def _read(self, paths):
+        if self.fmt in ("delta", "iceberg"):
+            raise NotImplementedError(f"spark.read.format('{self.fmt}'): read with SQL's {self.fmt}_scan(…) (ADR-026, round 23)")
+        known = self.OPTIONS.get(self.fmt)
+        if known is None:
+            raise ValueError(f"spark.read.format('{self.fmt}'): parquet, csv or json")
+        o = {k: str(v).lower() == "true" if str(v).lower() in ("true", "false") else v for k, v in self.opts.items()}  # (Spark takes "true" and True)
+        for k, v in o.items():
+            if k not in known:
+                raise ValueError(f"spark.read.option('{k}') isn't taken for {self.fmt}: {', '.join(sorted(known))}")
+            if k in ("encoding", "charset") and str(v).lower().replace("-", "") != "utf8" or k == "multiline" and v is True:
+                raise ValueError(f"spark.read.option('{k}', {v!r}): files are read as UTF-8, JSON as one record a line")
+        glob = o.get("pathglobfilter")
+        paths = [p.rstrip("/") + "/**/" + glob if glob else p for p in paths]
+        args = {"hive_partitioning": False} if o.get("recursivefilelookup") is True else {}  # (else k=v folders are found)
+        args.update({known[k]: v for k, v in o.items() if known[k]})
+        if self.fmt == "csv":
+            args.setdefault("header", False)  # (Spark's: a CSV file's first line is a row)
+        fn = {"parquet": "read_parquet", "csv": "read_csv", "json": "read_json"}[self.fmt]
+        where = _literal(paths[0]) if len(paths) == 1 else "[" + ", ".join(_literal(p) for p in paths) + "]"
+        given = "".join(f", {k} => {_literal(v)}" for k, v in args.items())
+        frame = self.spark.con.sql(f"SELECT * FROM {fn}({where}{given})")
+        header = args.get("header") is True
+        names, types_ = _schema(self._schema)
+        if self.fmt == "csv" and (names or not header or o.get("inferschema") is not True):
+            cols = frame.columns  # (a CSV file's columns by position: Spark's _c0, _c1 … without a header)
+            names = names or [c if header else f"_c{i}" for i, c in enumerate(cols)]
+            types_ = types_ or ["string"] * len(cols)
+            if len(names) != len(cols):
+                raise ValueError(f"the schema has {len(names)} columns, the files {len(cols)}")
+            frame = frame.select(*[sql_expr(f"CAST({_quote(c)} AS {_type(t)}) AS {_quote(n)}") for c, n, t in zip(cols, names, types_)])
+        elif names:  # (Parquet's and JSON's columns by name)
+            frame = frame.select(*[sql_expr(f"CAST({_quote(n)} AS {_type(t)}) AS {_quote(n)}") for n, t in zip(names, types_ or ["string"] * len(names))])
+        return DataFrame(self.spark, frame)
 
 
 # ---------------------------------------------------------------- data frames
@@ -743,28 +811,44 @@ class GroupedData:
 
 
 class _Writer:
-    """`df.write`: into the lake's tables."""
+    """`df.write`: into the lake's tables (`saveAsTable`, `insertInto`), or into files anywhere
+    (`parquet`, `csv`, `json`, `save`: SQL's `COPY … TO`, a folder of files as Spark writes, by
+    `partitionBy` in `k=v` folders). Modes are Spark's: `error` (the default: a folder holding
+    files is refused), `overwrite`, `append`, `ignore`."""
+
+    OPTIONS = {"parquet": {"compression": "compression"}, "json": {}, "csv": {"header": "header", "sep": "delimiter", "delimiter": "delimiter"}}
 
     def __init__(self, df):
-        self.df, self.how = df, "error"
+        self.df, self.how, self.fmt, self.opts, self.parts = df, "error", "parquet", {}, []
 
     def mode(self, m):
-        self.how = m.lower()
+        m = m.lower()
+        if m not in ("error", "errorifexists", "overwrite", "append", "ignore"):
+            raise ValueError(f"mode {m!r}: error, overwrite, append or ignore")
+        self.how = "error" if m == "errorifexists" else m
         return self
 
-    def format(self, _):
+    def format(self, f):
+        self.fmt = f.lower()
         return self
 
-    def option(self, *_):
+    def option(self, k, v):
+        self.opts[k.lower()] = v
         return self
 
-    options = option
+    def options(self, **kw):
+        for k, v in kw.items():
+            self.option(k, v)
+        return self
 
-    def partitionBy(self, *_):
+    def partitionBy(self, *cols):
+        self.parts = [c for cs in cols for c in ([cs] if isinstance(cs, str) else cs)]
         return self
 
     def saveAsTable(self, name):
         f, con = self.df._f, self.df.spark.con
+        if self.parts:
+            raise ValueError("saveAsTable with partitionBy: make the table with partition_by (CREATE TABLE … WITH (partition_by = '…'))")
         if self.how == "append":
             try:
                 return f.write_table(name, "append")
@@ -781,10 +865,45 @@ class _Writer:
             self.df.spark.con._run(f"DELETE FROM {name}")
         return f.write_table(name, "append")
 
-    def parquet(self, *_, **__):
-        raise NotImplementedError("writing files from a node: saveAsTable, and publish it as Delta or Iceberg (ALTER TABLE … SET (publish = 'delta'))")
+    def save(self, path=None, format=None, mode=None, partitionBy=None, **options):
+        if format:
+            self.format(format)
+        if mode:
+            self.mode(mode)
+        if partitionBy:
+            self.partitionBy(partitionBy)
+        if path is None:
+            raise ValueError("df.write.save(path): where to? (saveAsTable(name) for a table)")
+        known = self.OPTIONS.get(self.fmt)
+        if known is None:
+            raise ValueError(f"df.write.format('{self.fmt}'): parquet, csv or json (Delta and Iceberg: saveAsTable, published)")
+        self.options(**{k: v for k, v in options.items() if v is not None})
+        for k in self.opts:
+            if k not in known:
+                raise ValueError(f"df.write.option('{k}') isn't taken for {self.fmt}: {', '.join(sorted(known)) or 'none'}")
+        given = {known[k]: v for k, v in self.opts.items()}
+        if self.fmt == "csv":
+            given.setdefault("header", False)  # (Spark's: no header line unless asked)
+        given.update({"overwrite": True} if self.how == "overwrite" else {"append": True} if self.how == "append" else {})
+        folder = path if path.endswith("/") else path + "/"  # (Spark writes a folder of files)
+        cols = ", ".join(_quote(c) for c in self.parts)
+        opts = [f"FORMAT {self.fmt}"] + [f"PARTITION_BY ({cols})"] * bool(self.parts) + [f"{k.upper()} {_literal(v)}" for k, v in given.items()]
+        f = self.df._f
+        try:
+            return self.df.spark.con._run(f"COPY ({f.sql}) TO {_literal(folder)} ({', '.join(opts)})", f._params, f._sent)
+        except RuntimeError as e:
+            if self.how == "ignore" and "holds files already" in str(e):
+                return None
+            raise
 
-    csv = json = save = parquet
+    def parquet(self, path, mode=None, partitionBy=None, compression=None):
+        return self.format("parquet").save(path, mode=mode, partitionBy=partitionBy, compression=compression)
+
+    def csv(self, path, mode=None, partitionBy=None, sep=None, header=None, **options):
+        return self.format("csv").save(path, mode=mode, partitionBy=partitionBy, sep=sep, header=header, **options)
+
+    def json(self, path, mode=None, partitionBy=None, **options):
+        return self.format("json").save(path, mode=mode, partitionBy=partitionBy, **options)
 
 
 class DeltaTable:

@@ -323,6 +323,10 @@ impl App {
     /// Run a query as rewritten (`asof::rewrite`: ASOF JOIN as DataFusion can plan it); `files`:
     /// it may read files on this machine (`owner`).
     pub async fn query_as(&self, query: &str, spread: Option<&str>, files: bool) -> anyhow::Result<Vec<RecordBatch>> {
+        crate::ext::listing(self.query_listed(query, spread, files)).await // (every door: files listed once a statement)
+    }
+
+    async fn query_listed(&self, query: &str, spread: Option<&str>, files: bool) -> anyhow::Result<Vec<RecordBatch>> {
         use crate::metrics::{add, QUERIES, QUERY_ERRORS, QUERY_US, SPREAD};
         let start = std::time::Instant::now();
         let run = async {
@@ -660,6 +664,11 @@ fn owner(headers: &axum::http::HeaderMap) -> bool {
 /// caller's own: `routines::Request`), run in order; the last one's answer. A single query as it
 /// was sent may be answered from `Results`.
 async fn sql(State(app): State<App>, Query(p): Query<SqlParams>, role: axum::Extension<crate::auth::Role>, headers: axum::http::HeaderMap, body: Bytes) -> Result<Response, E> {
+    let files = owner(&headers); // (the program that started this node: its files, and URLs no secret covers)
+    crate::ext::scope(files, sql_as(app, p, role, headers, body)).await
+}
+
+async fn sql_as(app: App, p: SqlParams, role: axum::Extension<crate::auth::Role>, headers: axum::http::HeaderMap, body: Bytes) -> Result<Response, E> {
     use crate::routines::{Outcome, Who};
     let kind = headers.get("content-type").and_then(|v| v.to_str().ok()).unwrap_or_default();
     let req = crate::routines::Request::read(kind, &body)?;
@@ -703,7 +712,7 @@ async fn query(app: &App, p: &SqlParams, query: &str, files: bool) -> anyhow::Re
     // Same query, same catalog version: same answer (unless it asks for the time or randomness,
     // or may read a file on this machine).
     let q = query.to_lowercase();
-    let volatile = files || ["now()", "random(", "current_", "uuid(", "explain"].iter().any(|f| q.contains(f));
+    let volatile = files || !crate::ext::names(query).is_empty() || ["now()", "random(", "current_", "uuid(", "explain"].iter().any(|f| q.contains(f)); // (files outside the lake change on their own)
     let Some(version) = app.lake.version_for(query).await.filter(|_| !volatile) else { return Ok(respond(run_sql(app, p, query, files).await?)) };
     let key = format!("{format}|{}|{query}", p.spread.as_deref().unwrap_or(""));
     let stale = p.stale_ms.filter(|_| p.after.is_none()).map(Duration::from_millis); // (read-your-writes wins)
@@ -734,6 +743,8 @@ async fn run_sql(app: &App, p: &SqlParams, query: &str, files: bool) -> anyhow::
         true => app.query_as(&crate::asof::rewrite(query)?, Some("0"), true).await?, // (a file here: this node only)
         false => app.query(query, p.spread.as_deref()).await?,
     };
+    let explained = query.trim_start().get(..7).is_some_and(|w| w.eq_ignore_ascii_case("explain"));
+    let batches = if explained { crate::ext::readable_rows(batches)? } else { batches }; // (files as SQL named them)
     render(&batches, p.format.as_deref())
 }
 
@@ -835,5 +846,5 @@ impl<T: Into<anyhow::Error>> From<T> for E {
     fn from(e: T) -> Self { E(e.into()) }
 }
 impl IntoResponse for E {
-    fn into_response(self) -> Response { (StatusCode::INTERNAL_SERVER_ERROR, format!("{:#}", self.0)).into_response() }
+    fn into_response(self) -> Response { (StatusCode::INTERNAL_SERVER_ERROR, crate::ext::readable(&format!("{:#}", self.0))).into_response() }
 }

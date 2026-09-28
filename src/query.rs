@@ -187,6 +187,10 @@ async fn dead(lake: &Lake, ctx: &SessionContext, name: &str, meta: &TableMeta, a
 /// newer file's rows above an older one's, and log rows ((segment << 32) + position) above both.
 /// Other tables read all their files as one (merge tables combine rows in any order).
 pub async fn sources(lake: &Lake, ctx: &SessionContext, name: &str, meta: &TableMeta, upto: Option<u64>) -> Result<(Option<DataFrame>, Vec<DataFrame>)> {
+    if let Some(spec) = &meta.ext {
+        let files = meta.files.iter().collect::<Vec<_>>(); // (files outside the lake: no log, no hot columns)
+        return Ok((None, if files.is_empty() { vec![] } else { vec![crate::ext::read(ctx, &files, &read_schema(&meta.columns)?, spec, meta.outside.as_ref()).await?] }));
+    }
     let (schema, keyed, upsert) = (read_schema(&meta.columns)?, !meta.key.is_empty(), !meta.key.is_empty() && meta.merge.is_empty());
     let mut files = vec![];
     if upsert {
@@ -520,6 +524,11 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
             let view = table_view(lake, &ctx, name, &sys(meta.clone()), upto).await?;
             ctx.register_table(table_ref(name), named(&ctx, view, &meta, names_deleted(&text))?)?;
         }
+    }
+    for name in crate::ext::names(&text) {
+        let meta = crate::ext::meta(lake, &name).await?.expect("files"); // (files anywhere: `ext.rs`)
+        let view = table_view(lake, &ctx, &name, &meta, upto).await?;
+        ctx.register_table(datafusion::common::TableReference::bare(name.clone()), named(&ctx, view, &meta, false)?)?; // (another engine's names for its columns)
     }
     let attached = lake.attached.read().unwrap().clone();
     for (ns, other) in attached {

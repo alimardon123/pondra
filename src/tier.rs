@@ -660,7 +660,7 @@ pub async fn write_file(lake: &Lake, table: &str, batches: &[RecordBatch], keys:
         false => Default::default(),
     };
     let sys = batches[0].schema().index_of(crate::sys::ROW_ID).is_ok();
-    Ok(Some(DataFile { path, rows: rows as u64, bytes, ord: 0, whole: false, stats, part: String::new(), nulls, sketch, sys }))
+    Ok(Some(DataFile { path, rows: rows as u64, bytes, ord: 0, whole: false, stats, part: String::new(), nulls, sketch, sys, outside: None }))
 }
 
 /// Stream a query result into Parquet files of up to `max_rows` each (bulk INSERT … SELECT).
