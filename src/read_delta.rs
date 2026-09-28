@@ -18,11 +18,12 @@ const FEATURES: &[&str] = &["columnMapping", "deletionVectors", "timestampNtz", 
 
 /// A table as its log says at a version.
 #[derive(Default, Clone)]
-struct Log {
-    version: i64,
-    protocol: Value,
-    metadata: Value,
+pub struct Log {
+    pub version: i64,
+    pub protocol: Value,
+    pub metadata: Value,
     files: HashMap<String, Value>, // add actions, by logical file (its path and deletion vector)
+    pub txns: std::collections::HashSet<String>, // the writers' transactions applied (their app ids)
 }
 
 impl Log {
@@ -39,6 +40,9 @@ impl Log {
         }
         if let (Some(r), false) = (a.get("remove"), checkpoint) {
             self.files.remove(&logical(r));
+        }
+        if let Some(id) = a["txn"]["appId"].as_str() {
+            self.txns.insert(id.to_string());
         }
     }
 }
@@ -72,7 +76,7 @@ pub async fn resolve(lake: &Lake, root: &str, version: Option<i64>) -> Result<Ta
 
 /// The log replayed to `version` (the newest there is if none): from the newest version already
 /// replayed or the newest checkpoint before it, then the commits after.
-async fn replay(lake: &Lake, root: &str, version: Option<i64>) -> Result<Arc<Log>> {
+pub async fn replay(lake: &Lake, root: &str, version: Option<i64>) -> Result<Arc<Log>> {
     let (store, dir) = crate::ext::store(lake, &format!("{root}/_delta_log/")).await?;
     let known = SEEN.lock().unwrap().get(root).cloned();
     // Only what's newer than we know (or than a checkpoint): the log is listed from there.
@@ -188,7 +192,7 @@ fn features(root: &str, protocol: &Value) -> Result<()> {
 
 /// The table's columns — (physical name, logical name, type), partition columns in their place —
 /// its partition columns (physical names), and whether names are mapped (column mapping).
-fn schema(root: &str, metadata: &Value) -> Result<(Vec<(String, String, DataType)>, Vec<String>, bool)> {
+pub fn schema(root: &str, metadata: &Value) -> Result<(Vec<(String, String, DataType)>, Vec<String>, bool)> {
     ensure!(metadata["format"]["provider"].as_str().is_none_or(|p| p == "parquet"), "{root}: a Delta table of {} files (Parquet only)", metadata["format"]["provider"]);
     let mode = metadata["configuration"]["delta.columnMapping.mode"].as_str().unwrap_or("none");
     let s: Value = serde_json::from_str(metadata["schemaString"].as_str().with_context(|| format!("{root}: no schema in the log"))?)?;
@@ -318,4 +322,4 @@ fn bound(v: &Value, t: &DataType, max: bool) -> Option<String> {
 }
 
 /// A path in the log, as the object it names (the log escapes it as a URI).
-fn unescape(p: &str) -> String { url::form_urlencoded::parse(format!("x={}", p.replace('+', "%2B")).as_bytes()).next().map(|(_, v)| v.into_owned()).unwrap_or_default() }
+pub fn unescape(p: &str) -> String { url::form_urlencoded::parse(format!("x={}", p.replace('+', "%2B")).as_bytes()).next().map(|(_, v)| v.into_owned()).unwrap_or_default() }

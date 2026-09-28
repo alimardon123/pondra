@@ -21,9 +21,116 @@ static MANIFESTS: LazyLock<Mutex<lru::LruCache<String, Arc<Vec<Value>>>>> = Lazy
 /// asked for: `version` (of its metadata), `snapshot_from_id`, `snapshot_from_timestamp`.
 pub async fn resolve(lake: &Lake, url: &str, options: &BTreeMap<String, String>) -> Result<TableMeta> {
     let url = url.trim_end_matches('/');
+    if options.contains_key("namespace") {
+        return rest(lake, url, options).await;
+    }
     let (at, meta) = metadata(lake, url, options.get("version").map(String::as_str)).await?;
     resolve_metadata(lake, url, &at, &meta, options).await
 }
+
+/// A table's current metadata (and where it is): its newest metadata file, or its REST
+/// catalog's (for writing it: `write_outside`).
+pub async fn current(lake: &Lake, url: &str, options: &BTreeMap<String, String>) -> Result<(String, Value)> {
+    match options.contains_key("namespace") {
+        true => {
+            let body = rest_table(lake, url, options).await?;
+            Ok((body["metadata-location"].as_str().unwrap_or_default().to_string(), body["metadata"].clone()))
+        }
+        false => metadata(lake, url, None).await,
+    }
+}
+
+/// The current schema, and its columns (name, field id, type).
+pub fn schema_of(meta: &Value) -> Result<(Value, Vec<(String, i64, DataType)>)> {
+    let schema = current_schema(meta).context("no current schema")?;
+    let columns = fields(&schema)?;
+    Ok((schema, columns))
+}
+
+/// Commit a folder's table's next metadata: the file after `at` (put if absent), then its
+/// version hint. False: another writer's is there.
+pub async fn commit_file(lake: &Lake, url: &str, at: &str, next: &Value) -> Result<bool> {
+    let name = at.rsplit('/').next().unwrap_or_default();
+    let (hinted, number) = match name.strip_prefix('v') {
+        Some(rest) => (true, rest.split('.').next().and_then(|n| n.parse::<i64>().ok())),
+        None => (false, name.split('-').next().and_then(|n| n.parse::<i64>().ok())),
+    };
+    let n = number.with_context(|| format!("{at}: which version is this metadata?"))? + 1;
+    let file = if hinted { format!("v{n}.metadata.json") } else { format!("{n:05}-{}.metadata.json", uuid::Uuid::new_v4()) };
+    let dir = &at[..at.len() - name.len()];
+    if !crate::write_outside::put_new(lake, &format!("{dir}{file}"), serde_json::to_vec_pretty(next)?).await? {
+        return Ok(false);
+    }
+    if hinted {
+        let (store, path) = crate::ext::store(lake, &format!("{dir}version-hint.text")).await?;
+        object_store_df::ObjectStoreExt::put(&store, &path, n.to_string().into_bytes().into()).await.with_context(|| format!("writing {url}'s version hint"))?;
+    }
+    Ok(true)
+}
+
+/// Commit a snapshot through a REST catalog, asserting the one it follows. False: another
+/// writer's came first.
+pub async fn rest_commit(lake: &Lake, url: &str, options: &BTreeMap<String, String>, after: Option<i64>, snapshot: &Value) -> Result<bool> {
+    let (at, token) = rest_path(lake, url, options).await?;
+    let body = serde_json::json!({
+        "requirements": [{"type": "assert-ref-snapshot-id", "ref": "main", "snapshot-id": after}],
+        "updates": [{"action": "add-snapshot", "snapshot": snapshot}, {"action": "set-snapshot-ref", "ref-name": "main", "type": "branch", "snapshot-id": snapshot["snapshot-id"]}],
+    });
+    let mut r = crate::ext::web().post(&at).json(&body);
+    if let Some(t) = &token {
+        r = r.bearer_auth(t);
+    }
+    let r = r.send().await.with_context(|| format!("reaching {at}"))?;
+    let status = r.status();
+    if status.as_u16() == 409 {
+        return Ok(false);
+    }
+    let answer: Value = r.json().await.unwrap_or_default();
+    ensure!(status.is_success(), "{url}: the commit was refused ({status}: {})", answer["error"]["message"].as_str().unwrap_or(""));
+    Ok(true)
+}
+
+/// A table's path in its REST catalog (after the catalog's own prefix), and the token to use.
+async fn rest_path(lake: &Lake, url: &str, options: &BTreeMap<String, String>) -> Result<(String, Option<String>)> {
+    let token = crate::ext::rest_token(lake, url).await?;
+    let enc = |s: &str| url::form_urlencoded::byte_serialize(s.as_bytes()).collect::<String>().replace('+', "%20");
+    let mut config = format!("{url}/v1/config");
+    if let Some(w) = options.get("warehouse") {
+        config += &format!("?warehouse={}", enc(w));
+    }
+    let mut r = crate::ext::web().get(&config);
+    if let Some(t) = &token {
+        r = r.bearer_auth(t);
+    }
+    let r = r.send().await.with_context(|| format!("reaching {config}"))?;
+    let conf: Value = if r.status().is_success() { r.json().await.unwrap_or_default() } else { Value::Null }; // (a catalog with no config: no prefix)
+    let prefix = conf["overrides"]["prefix"].as_str().or(conf["defaults"]["prefix"].as_str()).map(|p| format!("{p}/")).unwrap_or_default();
+    let (ns, table) = (&options["namespace"], &options["table"]);
+    Ok((format!("{url}/v1/{prefix}namespaces/{}/tables/{}", enc(&ns.replace('.', "\u{1f}")), enc(table)), token))
+}
+
+/// A table as its REST catalog gives it (`metadata-location`, `metadata`, `config`).
+async fn rest_table(lake: &Lake, url: &str, options: &BTreeMap<String, String>) -> Result<Value> {
+    let (at, token) = rest_path(lake, url, options).await?;
+    let mut r = crate::ext::web().get(&at);
+    if let Some(t) = &token {
+        r = r.bearer_auth(t);
+    }
+    let r = r.send().await.with_context(|| format!("reaching {at}"))?;
+    let status = r.status();
+    let body: Value = r.json().await.unwrap_or_default();
+    ensure!(status.is_success(), "{url}: no table {}.{} ({status}: {})", options["namespace"], options["table"], body["error"]["message"].as_str().unwrap_or(""));
+    Ok(body)
+}
+
+/// A table of an Iceberg REST catalog at `url`: its metadata as the catalog gives it (with the
+/// token the secret covering the catalog gets: `ext::rest_token`).
+async fn rest(lake: &Lake, url: &str, options: &BTreeMap<String, String>) -> Result<TableMeta> {
+    let body = rest_table(lake, url, options).await?;
+    let location = body["metadata-location"].as_str().unwrap_or(url).to_string();
+    resolve_metadata(lake, body["metadata"]["location"].as_str().unwrap_or(url), &location, &body["metadata"], options).await
+}
+
 
 /// A table from its metadata (read from a file, or given by a REST catalog).
 pub async fn resolve_metadata(lake: &Lake, url: &str, at: &str, meta: &Value, options: &BTreeMap<String, String>) -> Result<TableMeta> {
@@ -124,7 +231,7 @@ async fn manifest(lake: &Lake, path: String) -> Result<Arc<Vec<Value>>> {
 
 /// The metadata file: the one named, the one `version` names, the one `version-hint.text` names,
 /// or the newest in `metadata/`.
-async fn metadata(lake: &Lake, url: &str, version: Option<&str>) -> Result<(String, Value)> {
+pub async fn metadata(lake: &Lake, url: &str, version: Option<&str>) -> Result<(String, Value)> {
     let read = |at: String| async move {
         let b = crate::ext::get(lake, &at).await?;
         let b = if at.ends_with(".gz") { let mut v = vec![]; std::io::Read::read_to_end(&mut flate2::read::GzDecoder::new(&b[..]), &mut v)?; v.into() } else { b };

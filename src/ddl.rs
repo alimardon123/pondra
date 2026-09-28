@@ -138,6 +138,7 @@ pub enum Ddl {
     CreateRoutine { name: String, routine: crate::routines::Routine, replace: bool }, // CREATE MACRO, CREATE PROCEDURE (ADR-023)
     DropRoutine { name: String, if_exists: bool },
     CreateSecret { name: String, params: std::collections::BTreeMap<String, String>, replace: bool, if_not_exists: bool }, // (ADR-026: `ext.rs`)
+    AttachOutside { name: String, url: String, kind: String, options: std::collections::BTreeMap<String, String> }, // another engine's tables (`ext.rs`)
     DropSecret { name: String, if_exists: bool },
 }
 
@@ -212,6 +213,7 @@ pub async fn apply(lake: &Lake, d: Ddl) -> Result<Value> {
             check(&name)?;
             ensure!(name != lake_name(lake), "this lake is called {name}: attach the other under another name");
             ensure!(!has_schema(lake, &name).await?, "a schema here is called {name}: attach the other under another name");
+            ensure!(!crate::ext::is_attached(lake, &name).await?, "{name} is attached already, as another engine's tables");
             if let Some(a) = lake.cat.get::<Attachment>(&attachment_key(&name)).await? {
                 ensure!(a.dir == full(&dir)?, "{name} is attached already, to {}", a.dir);
                 return Ok(j!({"attached": name, "dir": a.dir, "unchanged": true}));
@@ -241,7 +243,15 @@ pub async fn apply(lake: &Lake, d: Ddl) -> Result<Value> {
         Ddl::DropRoutine { name, if_exists } => crate::routines::drop(lake, &name, if_exists).await,
         Ddl::CreateSecret { name, params, replace, if_not_exists } => crate::ext::create(lake, &name, params, replace, if_not_exists).await,
         Ddl::DropSecret { name, if_exists } => crate::ext::drop(lake, &name, if_exists).await,
+        Ddl::AttachOutside { name, url, kind, options } => {
+            ensure!(!has_schema(lake, &name).await?, "a schema here is called {name}: attach under another name");
+            ensure!(lake.cat.get::<Attachment>(&attachment_key(&name)).await?.is_none(), "{name} is an attached lake: attach under another name");
+            crate::ext::attach(lake, &name, &url, &kind, options).await
+        }
         Ddl::Detach { name, if_exists } => {
+            if crate::ext::detach(lake, &name).await? {
+                return Ok(j!({"detached": name})); // (another engine's tables)
+            }
             if lake.cat.get::<Attachment>(&attachment_key(&name)).await?.is_none() {
                 let flag = lake.attached.read().unwrap().iter().any(|(n, _)| *n == name);
                 ensure!(if_exists && !flag, "{name} {}", if flag { "was attached when the node started (--attach, or found beside this lake by the shell): it stays" } else { "isn't attached" });

@@ -173,3 +173,125 @@ impl<'a> Reader<'a> {
 
 /// Hex text (as `records` gives bytes) back to bytes.
 pub fn unhex(s: &str) -> Result<Vec<u8>> { (0..s.len()).step_by(2).map(|i| Ok(u8::from_str_radix(s.get(i..i + 2).context("odd hex")?, 16)?)).collect() }
+
+// ---------------------------------------------------------------- written
+
+/// An Avro object container file of `records` (JSON, as `records` gives them back: bytes and
+/// fixed values as hex text), written by `schema`, uncompressed, with the metadata given.
+pub fn write(schema: &Value, meta: &[(&str, String)], records: &[Value]) -> Result<Vec<u8>> {
+    let mut names = HashMap::new();
+    named(schema, &mut names);
+    let mut body = vec![];
+    for r in records {
+        put(&mut body, schema, r, &names)?;
+    }
+    let mut out = b"Obj\x01".to_vec();
+    let mut all = vec![("avro.schema", schema.to_string()), ("avro.codec", "null".to_string())];
+    all.extend(meta.iter().map(|(k, v)| (*k, v.clone())));
+    long(&mut out, all.len() as i64);
+    for (k, v) in all {
+        bytes(&mut out, k.as_bytes());
+        bytes(&mut out, v.as_bytes());
+    }
+    long(&mut out, 0);
+    let sync: [u8; 16] = *uuid::Uuid::new_v4().as_bytes();
+    out.extend_from_slice(&sync);
+    if !records.is_empty() {
+        long(&mut out, records.len() as i64);
+        long(&mut out, body.len() as i64);
+        out.extend_from_slice(&body);
+        out.extend_from_slice(&sync);
+    }
+    Ok(out)
+}
+
+fn long(b: &mut Vec<u8>, v: i64) {
+    let mut z = ((v << 1) ^ (v >> 63)) as u64;
+    while z >= 0x80 {
+        b.push((z as u8 & 0x7f) | 0x80);
+        z >>= 7;
+    }
+    b.push(z as u8);
+}
+
+fn bytes(b: &mut Vec<u8>, v: &[u8]) {
+    long(b, v.len() as i64);
+    b.extend_from_slice(v);
+}
+
+/// One value, as `schema` says; a union takes the first branch the value fits.
+fn put(b: &mut Vec<u8>, s: &Value, v: &Value, names: &HashMap<String, Value>) -> Result<()> {
+    match s {
+        Value::String(t) => match t.as_str() {
+            "null" => ensure!(v.is_null(), "{v} for an Avro null"),
+            "boolean" => b.push(v.as_bool().context("a boolean")? as u8),
+            "int" | "long" => long(b, v.as_i64().with_context(|| format!("{v} for an Avro {t}"))?),
+            "float" => b.extend_from_slice(&(v.as_f64().context("a float")? as f32).to_le_bytes()),
+            "double" => b.extend_from_slice(&v.as_f64().context("a double")?.to_le_bytes()),
+            "bytes" => bytes(b, &unhex(v.as_str().context("bytes as hex")?)?),
+            "string" => bytes(b, v.as_str().with_context(|| format!("{v} for an Avro string"))?.as_bytes()),
+            name => put(b, names.get(name).with_context(|| format!("an Avro type {name} never defined"))?, v, names)?,
+        },
+        Value::Array(branches) => {
+            let i = branches.iter().position(|t| fits(t, v, names)).with_context(|| format!("{v} fits no branch of {s}"))?;
+            long(b, i as i64);
+            put(b, &branches[i], v, names)?;
+        }
+        Value::Object(o) => match o.get("type").and_then(Value::as_str).context("an Avro type without a name")? {
+            "record" => {
+                for f in o.get("fields").and_then(Value::as_array).into_iter().flatten() {
+                    let field = v.get(f["name"].as_str().unwrap_or_default()).unwrap_or(&Value::Null);
+                    put(b, &f["type"], field, names).with_context(|| format!("field {}", f["name"]))?;
+                }
+            }
+            "array" => {
+                let items = v.as_array().context("an array")?;
+                if !items.is_empty() {
+                    long(b, items.len() as i64);
+                    for i in items {
+                        put(b, &o["items"], i, names)?;
+                    }
+                }
+                long(b, 0);
+            }
+            "map" => {
+                let m = v.as_object().context("a map")?;
+                if !m.is_empty() {
+                    long(b, m.len() as i64);
+                    for (k, x) in m {
+                        bytes(b, k.as_bytes());
+                        put(b, &o["values"], x, names)?;
+                    }
+                }
+                long(b, 0);
+            }
+            "fixed" => b.extend_from_slice(&unhex(v.as_str().context("fixed as hex")?)?),
+            "enum" => long(b, o["symbols"].as_array().and_then(|s| s.iter().position(|x| x == v)).context("an enum symbol")? as i64),
+            t => put(b, &Value::String(t.to_string()), v, names)?,
+        },
+        other => bail!("an Avro type {other}"),
+    }
+    Ok(())
+}
+
+/// Does `v` fit type `t` (to choose a union's branch)?
+fn fits(t: &Value, v: &Value, names: &HashMap<String, Value>) -> bool {
+    match t {
+        Value::String(n) => match n.as_str() {
+            "null" => v.is_null(),
+            "boolean" => v.is_boolean(),
+            "int" | "long" => v.is_i64(),
+            "float" | "double" => v.is_number(),
+            "bytes" | "string" => v.is_string(),
+            name => names.get(name).is_some_and(|d| fits(d, v, names)),
+        },
+        Value::Object(o) => match o.get("type").and_then(Value::as_str) {
+            Some("record" | "map") => v.is_object(),
+            Some("array") => v.is_array(),
+            Some("fixed" | "enum") => v.is_string(),
+            Some(other) => fits(&Value::String(other.to_string()), v, names),
+            None => false,
+        },
+        _ => false,
+    }
+}

@@ -47,6 +47,7 @@ mod tier;
 mod udf;
 mod views;
 mod write;
+mod write_outside;
 
 use clap::Parser;
 

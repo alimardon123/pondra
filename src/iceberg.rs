@@ -276,16 +276,19 @@ fn manifest_file(path: &str, len: usize, seq: u64, min_seq: u64, files: [usize; 
     b
 }
 
-fn req(name: &str, id: u32, t: Value) -> Value { json!({"name": name, "field-id": id, "type": t}) }
-fn opt(name: &str, id: u32, t: Value) -> Value { json!({"name": name, "field-id": id, "type": ["null", t], "default": null}) }
+pub fn req(name: &str, id: u32, t: Value) -> Value { json!({"name": name, "field-id": id, "type": t}) }
+pub fn opt(name: &str, id: u32, t: Value) -> Value { json!({"name": name, "field-id": id, "type": ["null", t], "default": null}) }
 
 /// The Avro schema of a manifest entry (Iceberg v2).
-fn entry_schema() -> String {
+fn entry_schema() -> String { entry_schema_with(vec![]).to_string() }
+
+/// The Avro schema of a manifest entry (Iceberg v2), its partition's fields as given.
+pub fn entry_schema_with(partition: Vec<Value>) -> Value {
     let map = |k: u32, v: u32, t: &str| json!({"type": "array", "logicalType": "map", "items": {"type": "record", "name": format!("k{k}_v{v}"), "fields": [{"name": "key", "type": "int", "field-id": k}, {"name": "value", "type": t, "field-id": v}]}});
     let list = |id: u32, t: &str| json!({"type": "array", "element-id": id, "items": t});
     let data_file = json!({"type": "record", "name": "r2", "fields": [
         req("content", 134, json!("int")), req("file_path", 100, json!("string")), req("file_format", 101, json!("string")),
-        req("partition", 102, json!({"type": "record", "name": "r102", "fields": []})),
+        req("partition", 102, json!({"type": "record", "name": "r102", "fields": partition})),
         req("record_count", 103, json!("long")), req("file_size_in_bytes", 104, json!("long")),
         opt("column_sizes", 108, map(117, 118, "long")), opt("value_counts", 109, map(119, 120, "long")),
         opt("null_value_counts", 110, map(121, 122, "long")), opt("nan_value_counts", 137, map(138, 139, "long")),
@@ -295,11 +298,11 @@ fn entry_schema() -> String {
     ]});
     let fields = [req("status", 0, json!("int")), opt("snapshot_id", 1, json!("long")), opt("sequence_number", 3, json!("long")),
         opt("file_sequence_number", 4, json!("long")), req("data_file", 2, data_file)];
-    json!({"type": "record", "name": "manifest_entry", "fields": fields}).to_string()
+    json!({"type": "record", "name": "manifest_entry", "fields": fields})
 }
 
 /// The Avro schema of a manifest list entry (Iceberg v2).
-fn list_schema() -> String {
+pub fn list_schema() -> String {
     let summary = json!({"type": "record", "name": "r508", "fields": [req("contains_null", 509, json!("boolean")),
         opt("contains_nan", 518, json!("boolean")), opt("lower_bound", 510, json!("bytes")), opt("upper_bound", 511, json!("bytes"))]});
     let ints = [("manifest_length", 501, "long"), ("partition_spec_id", 502, "int"), ("content", 517, "int"), ("sequence_number", 515, "long"),

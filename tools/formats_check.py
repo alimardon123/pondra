@@ -19,18 +19,30 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 # ---------------------------------------------------------------- Spark's tables (run with --make)
 
-def make_spark(root):
-    """Spark writes its tables under `root`, and what it reads back as `root/expected.json`."""
+def session(root):
     os.environ["TZ"] = "UTC"
     time.tzset()
     from pyspark.sql import SparkSession
-    spark = (SparkSession.builder.master("local[2]").appName("formats_check")
+    return (SparkSession.builder.master("local[2]").appName("formats_check")
              .config("spark.jars.packages", "io.delta:delta-spark_2.13:4.0.0,org.apache.iceberg:iceberg-spark-runtime-4.0_2.13:1.10.0")
              .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension,org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
              .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog")
              .config("spark.sql.catalog.ice", "org.apache.iceberg.spark.SparkCatalog").config("spark.sql.catalog.ice.type", "hadoop")
              .config("spark.sql.catalog.ice.warehouse", f"{root}/iceberg").config("spark.sql.session.timeZone", "UTC")
              .config("spark.sql.shuffle.partitions", "2").config("spark.ui.enabled", "false").getOrCreate())
+
+
+def read_spark(tables):
+    """What Spark reads of these tables now (`--read`): name -> its columns and rows."""
+    spark = session(tempfile.mkdtemp())
+    spark.sparkContext.setLogLevel("ERROR")
+    print(json.dumps({name: rows(spark.read.format(kind).load(path)) for name, (kind, path) in tables.items()}, default=str))
+    spark.stop()
+
+
+def make_spark(root):
+    """Spark writes its tables under `root`, and what it reads back as `root/expected.json`."""
+    spark = session(root)
     spark.sparkContext.setLogLevel("ERROR")
     expected = {}
 
@@ -94,6 +106,14 @@ def make_spark(root):
     equality_delete(spark, root, "ice.db.equality", [(3, "r3"), (5, None), (9, "nope")])
     spark.sql("INSERT INTO ice.db.equality VALUES (3, 'r3', 9.0, DATE'2026-01-09', TIMESTAMP'2026-01-09 00:00:00')")  # (newer than the delete: kept)
     expected["iceberg:equality"] = {"path": f"{root}/iceberg/db/equality", **rows(spark.table("ice.db.equality"))}
+    # Tables for Pondra to INSERT into (and Spark to read back).
+    delta("ins_dv", [f"CREATE TABLE {{t}} ({cols}) USING delta TBLPROPERTIES ('delta.enableDeletionVectors' = 'true')", f"INSERT INTO {{t}} VALUES {values(0, 50)}", "DELETE FROM {t} WHERE id < 5"])
+    delta("ins_mapped", [f"CREATE TABLE {{t}} ({cols}) USING delta TBLPROPERTIES ('delta.columnMapping.mode' = 'name', 'delta.minReaderVersion' = '2', 'delta.minWriterVersion' = '5')",
+                         f"INSERT INTO {{t}} VALUES {values(0, 20)}", "ALTER TABLE {t} RENAME COLUMN amount TO total"])
+    delta("ins_part", ["CREATE TABLE {t} (id BIGINT, day DATE, tag STRING, n INT) USING delta PARTITIONED BY (day, tag)", "INSERT INTO {t} VALUES (1, DATE'2026-01-01', 'a', 1)"])
+    ice("ins", [f"CREATE TABLE {{t}} ({cols}) USING iceberg TBLPROPERTIES ('format-version' = '2')", f"INSERT INTO {{t}} VALUES {values(0, 30)}"])
+    ice("ins_part", [f"CREATE TABLE {{t}} ({cols}) USING iceberg PARTITIONED BY (days(ts), bucket(4, id), region, truncate(3, region)) TBLPROPERTIES ('format-version' = '2')",
+                     f"INSERT INTO {{t}} VALUES {values(0, 30)}"])
     # What Pondra doesn't read is refused by name.
     spark.sql(f"CREATE TABLE delta.`{root}/delta/variant` (id BIGINT, v VARIANT) USING delta")
     spark.sql(f"INSERT INTO delta.`{root}/delta/variant` SELECT 1, parse_json('{{\"a\": 1}}')")
@@ -161,6 +181,7 @@ def duck():
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--make", help=argparse.SUPPRESS)  # (run by --spark's Python: write Spark's tables here)
+    ap.add_argument("--read", help=argparse.SUPPRESS)  # (run by --spark's Python: read these tables)
     ap.add_argument("--spark", help="a Python with PySpark 4 and delta-spark: Spark's tables too")
     ap.add_argument("--port", type=int, default=8860)
     ap.add_argument("--only", default="")
@@ -168,6 +189,8 @@ def main():
     a = ap.parse_args()
     if a.make:
         return make_spark(a.make)
+    if a.read:
+        return read_spark(json.loads(a.read))
     sys.path.insert(0, os.path.join(HERE, "..", "python"))
     os.environ.setdefault("PONDRA_BIN", os.path.join(HERE, "..", "target", "release", "pondra"))
     import pondra
@@ -205,6 +228,10 @@ def main():
             print(json.dumps({"table": name, "equal": ok, **({"why": why} if why else {})}, default=str), flush=True)
         if not only or "own" in only:
             checks.update(own(con, root))
+        if not only or "attach" in only:
+            checks.update(attach(con, root, expected, a.port + 5))
+        if not only or "insert" in only:
+            checks.update(inserts(con, root, expected, a.spark, a.port + 7))
         if a.spark and (not only or "spread" in only):
             checks.update(spread(root, expected, a.port + 10))
     finally:
@@ -214,6 +241,114 @@ def main():
             shutil.rmtree(root, ignore_errors=True)
     print(json.dumps({"equal": sum(checks.values()), "tables": len(checks)}))
     sys.exit(0 if all(checks.values()) else 1)
+
+
+def attach(con, root, expected, port):
+    """Other engines' tables attached, read by name: a folder of Delta tables, one Delta table, an
+    Iceberg warehouse's folder, and an Iceberg REST catalog reached with OAuth (its client id and
+    secret in a secret whose scope is the catalog); DETACH."""
+    out, have = {}, lambda k: k in expected
+    rows_of = lambda q: sorted([[plain(v) for v in r.values()] for r in con.sql(q).collect().to_pylist()], key=json.dumps)
+    def same(label, q, want):
+        try:
+            ok = rows_of(q) == want["rows"]
+            why = None if ok else "differs"
+        except Exception as e:  # noqa: BLE001
+            ok, why = False, str(e)[:400]
+        out[f"attach:{label}"] = ok
+        print(json.dumps({"table": f"attached: {label}", "equal": ok, **({"why": why} if why else {})}), flush=True)
+    if have("delta:dv"):
+        con.sql(f"ATTACH '{root}/delta' AS spark_delta (TYPE delta)")
+        con.sql(f"ATTACH '{root}/delta/partitioned' AS one_table (TYPE delta)")
+        con.sql(f"ATTACH '{root}/iceberg' AS warehouse (TYPE iceberg)")
+        same("a folder of Delta tables, name.table", "SELECT * FROM spark_delta.dv", expected["delta:dv"])
+        same("one Delta table, by its name alone", "SELECT * FROM one_table", expected["delta:partitioned"])
+        same("an Iceberg warehouse's folder, name.namespace.table", "SELECT * FROM warehouse.db.mor", expected["iceberg:mor"])
+        con.sql("DETACH spark_delta")
+        try:
+            con.sql("SELECT * FROM spark_delta.dv").collect()
+            out["attach:DETACH"] = False
+        except RuntimeError:
+            out["attach:DETACH"] = True
+        print(json.dumps({"table": "attached: DETACH, then not there", "equal": out["attach:DETACH"]}), flush=True)
+    # An Iceberg REST catalog (PyIceberg's tables behind it), with OAuth.
+    server = subprocess.Popen([sys.executable, os.path.join(HERE, "sim_iceberg_rest.py"), "--port", str(port), "--warehouse", f"{root}/pyiceberg"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        time.sleep(1.5)
+        con.sql(f"CREATE SECRET rest (TYPE iceberg, CLIENT_ID 'pondra', CLIENT_SECRET 's3cret', SCOPE 'http://127.0.0.1:{port}')")
+        con.sql(f"ATTACH 'http://127.0.0.1:{port}' AS rest_cat (TYPE iceberg, SECRET rest)")
+        same("an Iceberg REST catalog with OAuth, name.namespace.table", "SELECT * FROM rest_cat.db.sales", expected["iceberg:pyiceberg"])
+        con.sql(f"CREATE OR REPLACE SECRET rest (TYPE iceberg, CLIENT_ID 'pondra', CLIENT_SECRET 'wrong', SCOPE 'http://127.0.0.1:{port}')")
+        try:
+            con.sql("SELECT * FROM rest_cat.db.sales").collect()
+            refused = ""
+        except RuntimeError as e:
+            refused = str(e)
+        out["attach:wrong secret"] = "gave no token" in refused
+        print(json.dumps({"table": "attached: a REST catalog with the wrong secret, refused", "equal": out["attach:wrong secret"], **({} if out["attach:wrong secret"] else {"why": refused[:300]})}), flush=True)
+    finally:
+        server.kill()
+    return out
+
+
+def inserts(con, root, expected, spark, port):
+    """INSERT into other engines' tables, attached: Delta (deletion vectors on, columns mapped by
+    name, partitions with odd values and NULL) and Iceberg (plain, and partitioned by day, bucket,
+    identity and truncate), then read back by the engine that made them (Spark) == Pondra's read,
+    every row there once; a retried INSERT (same job) applied once; a PyIceberg table in a REST
+    catalog, committed through the catalog, read back by PyIceberg."""
+    import uuid
+    out = {}
+    got = lambda q: sorted([[plain(v) for v in r.values()] for r in con.sql(q).collect().to_pylist()], key=json.dumps)
+    new_rows = lambda lo, hi: " UNION ALL ".join(f"SELECT {i} AS id, 'r{i % 3}' AS region, {i}.5 AS amount, DATE '2026-02-{1 + i % 27:02d}' AS day, TIMESTAMP '2026-02-01 00:00:00' + INTERVAL '{i} minutes' AS ts" for i in range(lo, hi))
+    if spark and "delta:ins_dv" in expected:
+        con.sql(f"ATTACH '{root}/delta' AS dw (TYPE delta)")
+        con.sql(f"ATTACH '{root}/iceberg' AS iw (TYPE iceberg)")
+        job = uuid.uuid4().hex
+        before = {t: con.sql(f"SELECT count(*) AS n FROM {t}").rows()[0]["n"] for t in ("dw.ins_dv", "dw.ins_mapped", "dw.ins_part", "iw.db.ins", "iw.db.ins_part")}
+        con.sql(f"INSERT INTO dw.ins_dv {new_rows(1000, 1010)}", job=job)
+        again = con.sql(f"INSERT INTO dw.ins_dv {new_rows(1000, 1010)}", job=job)  # (the same job, retried)
+        con.sql("INSERT INTO dw.ins_mapped SELECT id + 100, region, total, day, ts FROM dw.ins_mapped WHERE id < 3")
+        con.sql("INSERT INTO dw.ins_part VALUES (2, DATE '2026-01-01', 'a/b c', 2), (3, NULL, 'x', 3), (4, DATE '2026-01-02', NULL, 4)")
+        con.sql(f"INSERT INTO iw.db.ins {new_rows(2000, 2025)}")
+        con.sql(f"INSERT INTO iw.db.ins_part {new_rows(3000, 3040)}")
+        added = {"dw.ins_dv": 10, "dw.ins_mapped": 3, "dw.ins_part": 3, "iw.db.ins": 25, "iw.db.ins_part": 40}
+        places = {"dw.ins_dv": ("delta", f"{root}/delta/ins_dv"), "dw.ins_mapped": ("delta", f"{root}/delta/ins_mapped"), "dw.ins_part": ("delta", f"{root}/delta/ins_part"),
+                  "iw.db.ins": ("iceberg", f"{root}/iceberg/db/ins"), "iw.db.ins_part": ("iceberg", f"{root}/iceberg/db/ins_part")}
+        theirs = json.loads(subprocess.run([spark, os.path.abspath(__file__), "--read", json.dumps(places)], capture_output=True, text=True, check=True, env={**os.environ, "TZ": "UTC"}).stdout.strip().splitlines()[-1])
+        for t in places:
+            ours = got(f"SELECT * FROM {t}")
+            ok = ours == theirs[t]["rows"] and len(ours) == before[t] + added[t]
+            out[f"insert:{t}"] = ok
+            print(json.dumps({"table": f"INSERT into {t}, read back by Spark == Pondra", "equal": ok, **({} if ok else {"why": diff(theirs[t], {"columns": theirs[t]["columns"], "rows": ours}), "before": before[t]})}), flush=True)
+        # Partition values as Iceberg computes them (day, bucket, truncate): PyIceberg, pruning
+        # files by them, finds every row Pondra wrote by its id and its time.
+        from pyiceberg.table import StaticTable
+        from pyiceberg.expressions import EqualTo
+        meta = sorted(glob.glob(f"{root}/iceberg/db/ins_part/metadata/v*.metadata.json"), key=lambda p: int(p.rsplit("/v", 1)[1].split(".")[0]))[-1]
+        static = StaticTable.from_metadata(meta)
+        found = all(static.scan(row_filter=EqualTo("id", i)).to_arrow().num_rows == con.sql(f"SELECT count(*) AS n FROM iw.db.ins_part WHERE id = {i}").rows()[0]["n"] > 0 for i in range(3000, 3040, 3))
+        out["insert:partitions"] = found
+        print(json.dumps({"table": "INSERT into an Iceberg table by day, bucket and truncate: PyIceberg prunes by the values Pondra wrote", "equal": found}), flush=True)
+        out["insert:retried"] = again.get("duplicate") is True
+        print(json.dumps({"table": "INSERT retried with its job: applied once", "equal": out["insert:retried"]}), flush=True)
+    # Through an Iceberg REST catalog: the catalog commits it.
+    from pyiceberg.catalog.sql import SqlCatalog
+    server = subprocess.Popen([sys.executable, os.path.join(HERE, "sim_iceberg_rest.py"), "--port", str(port), "--warehouse", f"{root}/pyiceberg"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        time.sleep(1.5)
+        con.sql(f"CREATE OR REPLACE SECRET rest_w (TYPE iceberg, CLIENT_ID 'pondra', CLIENT_SECRET 's3cret', SCOPE 'http://127.0.0.1:{port}')")
+        con.sql(f"ATTACH 'http://127.0.0.1:{port}' AS rest_w (TYPE iceberg)")
+        n = con.sql("SELECT count(*) AS n FROM rest_w.db.sales").rows()[0]["n"]
+        con.sql("INSERT INTO rest_w.db.sales SELECT id + 10000, region, total, day FROM rest_w.db.sales WHERE id < 30")
+        table = SqlCatalog("local", uri=f"sqlite:///{root}/pyiceberg/catalog.db", warehouse=f"file://{root}/pyiceberg").load_table("db.sales")
+        theirs = sorted([[plain(v) for v in r.values()] for r in table.scan().to_arrow().to_pylist()], key=json.dumps)
+        ok = got("SELECT * FROM rest_w.db.sales") == theirs and len(theirs) == n + 20
+        out["insert:rest"] = ok
+        print(json.dumps({"table": "INSERT into a REST catalog's table, committed by the catalog, read back by PyIceberg", "equal": ok, **({} if ok else {"n": n, "theirs": len(theirs)})}), flush=True)
+    finally:
+        server.kill()
+    return out
 
 
 def own(con, root):

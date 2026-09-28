@@ -93,7 +93,7 @@ fn min_max(cols: &[ArrayRef]) -> Option<(ScalarValue, ScalarValue)> {
 
 /// Column `name`'s min and max from a file's footer: over its row groups' own, when every row
 /// group that holds a value has them, exact (not cut short).
-fn from_footer(md: &ParquetMetaData, schema: &datafusion::arrow::datatypes::Schema, name: &str) -> Option<(ScalarValue, ScalarValue)> {
+pub fn from_footer(md: &ParquetMetaData, schema: &datafusion::arrow::datatypes::Schema, name: &str) -> Option<(ScalarValue, ScalarValue)> {
     use datafusion::parquet::arrow::arrow_reader::statistics::StatisticsConverter;
     let c = StatisticsConverter::try_new(name, schema, md.file_metadata().schema_descr()).ok()?;
     let groups = || md.row_groups().iter();

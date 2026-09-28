@@ -617,6 +617,14 @@ async fn on_node_listed(app: &crate::server::App, stmt: Stmt, job: Option<String
             return Box::pin(on_node_as(app, Stmt::Insert(name, query), Some(job), files)).await;
         }
     }
+    // Another engine's table, attached (`ATTACH … (TYPE delta | iceberg)`): its next version,
+    // written from here.
+    if let Some(target) = crate::ext::outside_target(lake, &stmt.table()).await? {
+        return match &stmt {
+            Stmt::Insert(_, query) => crate::write_outside::insert(lake, &target, query, &job).await,
+            _ => bail!("{}: another engine's table takes INSERTs from Pondra (UPDATE, DELETE and MERGE: not yet)", stmt.table()),
+        };
+    }
     // UPDATE and DELETE of an append table, and MERGE: the leader's, from one snapshot (`change.rs`).
     if let Some(sql) = changes(lake, &stmt).await? {
         return match &app.seq {

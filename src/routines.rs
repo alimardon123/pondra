@@ -268,14 +268,16 @@ pub async fn expand(lake: &Lake, sql: &str) -> Result<String> { expand_with(lake
 
 async fn expand_with(lake: &Lake, sql: &str, views: &HashMap<String, String>) -> Result<String> {
     let all = listed(lake).await?;
+    let outside = crate::ext::attached(lake).await?;
     let named = |n: &String| crate::ddl::mentions(sql, n);
-    if !all.iter().any(|(n, r)| r.kind != Kind::Procedure && named(n)) && !views.keys().any(named) && !FROM_FIRST.is_match(sql) && !crate::ext::mentions(sql) {
+    if !all.iter().any(|(n, r)| r.kind != Kind::Procedure && named(n)) && !views.keys().any(named) && !FROM_FIRST.is_match(sql) && !crate::ext::mentions(sql)
+        && !outside.iter().any(|(n, _)| named(n)) {
         return Ok(sql.to_string());
     }
     let Ok(mut stmts) = Parser::parse_sql(&GenericDialect {}, sql) else { return Ok(sql.to_string()) };
     for s in stmts.iter_mut() {
         if !matches!(s, Statement::CreateMacro { .. } | Statement::CreateView(ast::CreateView { materialized: false, .. })) {
-            if let ControlFlow::Break(e) = s.visit(&mut Expander { lake, all: &all, views, depth: 0 }) {
+            if let ControlFlow::Break(e) = s.visit(&mut Expander { lake, all: &all, views, outside: &outside, depth: 0 }) {
                 return Err(e);
             }
         }
@@ -309,6 +311,7 @@ struct Expander<'a> {
     lake: &'a Lake,
     all: &'a HashMap<String, Routine>,
     views: &'a HashMap<String, String>, // (a request's own: `FROM name` is its query)
+    outside: &'a [(String, crate::ext::Attached)], // other engines' tables attached (`ext.rs`)
     depth: usize,
 }
 
@@ -360,6 +363,17 @@ impl VisitorMut for Expander<'_> {
     }
 
     fn post_visit_table_factor(&mut self, t: &mut TableFactor) -> ControlFlow<Self::Break> {
+        if let (TableFactor::Table { name, args: None, .. }, false) = (&mut *t, self.outside.is_empty()) {
+            let parts: Vec<String> = object(name).split('.').map(str::to_string).collect();
+            match crate::ext::attached_table(self.outside, &parts) {
+                Ok(Some(files)) => {
+                    *name = ast::ObjectName::from(vec![ast::Ident::with_quote('"', files)]); // (another engine's table: `ext.rs`)
+                    return ControlFlow::Continue(());
+                }
+                Err(e) => return ControlFlow::Break(e),
+                Ok(None) => {}
+            }
+        }
         match crate::ext::table(t) {
             Ok(Some(files)) => {
                 if let TableFactor::Table { name, args, .. } = t {

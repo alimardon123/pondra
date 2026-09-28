@@ -65,7 +65,7 @@ pub fn is(name: &str) -> bool { name.starts_with(PREFIX) }
 
 fn name(spec: &Spec) -> String { format!("{PREFIX}{}", B64.encode(serde_json::to_vec(spec).expect("a spec"))) }
 
-fn spec(name: &str) -> Option<Spec> { serde_json::from_slice(&B64.decode(name.strip_prefix(PREFIX)?).ok()?).ok() }
+pub fn spec(name: &str) -> Option<Spec> { serde_json::from_slice(&B64.decode(name.strip_prefix(PREFIX)?).ok()?).ok() }
 
 /// Might `sql` name files? (A cheap test, before anything is parsed.)
 pub fn mentions(sql: &str) -> bool {
@@ -241,7 +241,7 @@ pub async fn prime(lake: &Lake, tables: &[(String, TableMeta)]) -> Result<()> {
 /// May this caller read these files? A path on this machine: only the program that started the
 /// node. A URL: with the secret whose scope covers it (an admin made it: the grant), or, if none
 /// does, only that program again, with the node's own credentials.
-async fn check(lake: &Lake, spec: &Spec) -> Result<()> {
+pub async fn check(lake: &Lake, spec: &Spec) -> Result<()> {
     if owner() {
         return Ok(());
     }
@@ -362,7 +362,7 @@ async fn resolve(lake: &Lake, spec: &Spec) -> Result<TableMeta> {
 }
 
 /// A NULL's folder, as Hive, Spark, pyarrow and Polars name it.
-const NULL_FOLDER: &str = "__HIVE_DEFAULT_PARTITION__";
+pub const NULL_FOLDER: &str = "__HIVE_DEFAULT_PARTITION__";
 
 /// A folder's value as written (percent-escaped where a path can't hold a character), or None
 /// for a NULL's folder.
@@ -603,6 +603,129 @@ fn build(url: &url::Url, p: Option<&BTreeMap<String, String>>) -> Result<Arc<dyn
     })
 }
 
+// ---------------------------------------------------------------- other engines' catalogs
+
+/// Another engine's tables, attached (`ATTACH 'url' AS name (TYPE delta | iceberg, …)`): one
+/// table read as `name`, a folder of them as `name.table` and `name.folder.table`, or an Iceberg
+/// REST catalog's as `name.namespace.table`. Kept in the catalog (`o/`): every node reads them.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct Attached {
+    pub kind: String,
+    pub url: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub options: BTreeMap<String, String>,
+}
+
+fn attached_key(n: &str) -> String { format!("o/{n}") }
+
+pub async fn attached(lake: &Lake) -> Result<Vec<(String, Attached)>> {
+    Ok(lake.cat.scan::<Attached>("o/", "o0").await?.into_iter().map(|(k, a)| (k[2..].to_string(), a)).collect())
+}
+
+/// Is this attached as another engine's tables?
+pub async fn is_attached(lake: &Lake, name: &str) -> Result<bool> { Ok(lake.cat.get::<Attached>(&attached_key(name)).await?.is_some()) }
+
+/// The table of files a name of an attached catalog is (None: not one of theirs).
+pub fn attached_table(all: &[(String, Attached)], parts: &[String]) -> Result<Option<String>> {
+    let Some((_, a)) = all.iter().find(|(n, _)| *n == parts[0]) else { return Ok(None) };
+    let rest = &parts[1..];
+    let endpoint = a.options.get("endpoint").cloned().or_else(|| a.url.starts_with("http").then(|| a.url.clone()));
+    let spec = match endpoint {
+        Some(endpoint) => {
+            let (ns, t) = match rest {
+                [t] => ("default", t),
+                [ns, t] => (ns.as_str(), t),
+                _ => bail!("{}: a REST catalog's tables are {0}.namespace.table", parts[0]),
+            };
+            let mut options = BTreeMap::from([("namespace".to_string(), ns.to_string()), ("table".to_string(), t.clone())]);
+            if a.options.contains_key("endpoint") {
+                options.insert("warehouse".into(), a.url.clone());
+            }
+            Spec { urls: vec![endpoint.trim_end_matches('/').to_string()], format: "iceberg".into(), options }
+        }
+        None => Spec { urls: vec![std::iter::once(a.url.trim_end_matches('/')).chain(rest.iter().map(String::as_str)).collect::<Vec<_>>().join("/")], format: a.kind.clone(), options: BTreeMap::new() },
+    };
+    Ok(Some(name(&spec)))
+}
+
+/// The table of files a statement's target is, if it names an attached catalog's table.
+pub async fn outside_target(lake: &Lake, name: &str) -> Result<Option<String>> {
+    let all = attached(lake).await?;
+    if all.is_empty() {
+        return Ok(None);
+    }
+    attached_table(&all, &name.split('.').map(str::to_string).collect::<Vec<_>>())
+}
+
+/// Leader: keep an attachment of another engine's tables.
+pub async fn attach(lake: &Lake, name: &str, url: &str, kind: &str, options: BTreeMap<String, String>) -> Result<serde_json::Value> {
+    crate::ddl::check(name)?;
+    ensure!(["delta", "iceberg"].contains(&kind), "ATTACH … (TYPE {kind}): delta or iceberg (or a Pondra lake, with no TYPE)");
+    let known = ["endpoint", "secret", "read_only"];
+    if let Some(k) = options.keys().find(|k| !known.contains(&k.as_str())) {
+        bail!("ATTACH … (TYPE {kind}) has no option {k}: {}", known.join(", "));
+    }
+    ensure!(kind == "iceberg" || !options.contains_key("endpoint"), "ENDPOINT is an Iceberg REST catalog's");
+    ensure!(!lake.attached.read().unwrap().iter().any(|(n, _)| n == name) && name != crate::ddl::lake_name(lake), "{name} is a lake's name here: attach under another name");
+    // A REST catalog is reached with the secret whose scope covers it (never one named anywhere else).
+    if let Some(secret) = options.get("secret") {
+        let at = options.get("endpoint").unwrap_or(&url.to_string()).clone();
+        let found = list(lake).await?.into_iter().find(|(n, _)| n == secret).with_context(|| format!("no secret {secret}"))?;
+        ensure!(covering(&[found.clone()], &at).is_some(), "secret {secret}'s SCOPE doesn't cover {at} (CREATE OR REPLACE SECRET {secret} (…, SCOPE '{at}'))");
+    }
+    let a = Attached { kind: kind.into(), url: url.trim_end_matches('/').into(), options };
+    if let Some(had) = lake.cat.get::<Attached>(&attached_key(name)).await? {
+        ensure!(had.url == a.url && had.kind == a.kind, "{name} is attached already, to {}", had.url);
+        return Ok(serde_json::json!({"attached": name, "unchanged": true}));
+    }
+    lake.cat.commit(vec![(attached_key(name), json(&a))], &[]).await?;
+    Ok(serde_json::json!({"attached": name, "type": kind, "url": a.url}))
+}
+
+/// Leader: DETACH one (false: not attached this way).
+pub async fn detach(lake: &Lake, name: &str) -> Result<bool> {
+    if lake.cat.get::<Attached>(&attached_key(name)).await?.is_none() {
+        return Ok(false);
+    }
+    lake.cat.commit(vec![], &[attached_key(name)]).await?;
+    Ok(true)
+}
+
+/// A client for other engines' services (REST catalogs): Pondra's own tokens never go there.
+pub fn web() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| reqwest::Client::builder().timeout(std::time::Duration::from_secs(60)).build().expect("an HTTP client"))
+}
+
+/// The bearer token for a REST catalog, from the secret covering it: its TOKEN, or one its
+/// CLIENT_ID and CLIENT_SECRET get (OAuth's client credentials), kept until it expires.
+pub async fn rest_token(lake: &Lake, url: &str) -> Result<Option<String>> {
+    static TOKENS: Mutex<Option<HashMap<String, (String, std::time::Instant)>>> = Mutex::new(None);
+    let Some((name, secret)) = covering(&list(lake).await?, url).filter(|(_, s)| s.kind == "iceberg") else { return Ok(None) };
+    let p = open(&name, &secret)?;
+    if let Some(t) = p.get("token") {
+        return Ok(Some(t.clone()));
+    }
+    let (Some(id), Some(pass)) = (p.get("client_id"), p.get("client_secret")) else { return Ok(None) };
+    let key = format!("{name}:{}", secret.sealed);
+    if let Some((t, until)) = TOKENS.lock().unwrap().get_or_insert_default().get(&key) {
+        if std::time::Instant::now() < *until {
+            return Ok(Some(t.clone()));
+        }
+    }
+    let at = p.get("oauth2_server_uri").cloned().unwrap_or_else(|| format!("{url}/v1/oauth/tokens"));
+    let form = [("grant_type", "client_credentials"), ("client_id", id), ("client_secret", pass), ("scope", p.get("oauth2_scope").map_or("catalog", String::as_str))];
+    let body = url::form_urlencoded::Serializer::new(String::new()).extend_pairs(form).finish();
+    let r = web().post(&at).header("content-type", "application/x-www-form-urlencoded").body(body).send().await.with_context(|| format!("asking {at} for a token"))?;
+    let status = r.status();
+    let body: serde_json::Value = r.json().await.unwrap_or_default();
+    ensure!(status.is_success(), "{at} gave no token ({status}): {}", body["error_description"].as_str().or(body["error"].as_str()).unwrap_or(""));
+    let t = body["access_token"].as_str().context("a token answer without access_token")?.to_string();
+    let life = body["expires_in"].as_u64().unwrap_or(3600).saturating_sub(60);
+    TOKENS.lock().unwrap().get_or_insert_default().insert(key, (t.clone(), std::time::Instant::now() + std::time::Duration::from_secs(life)));
+    Ok(Some(t))
+}
+
 // ---------------------------------------------------------------- secrets
 
 /// A secret as the catalog keeps it: its type and scope in the clear, its values sealed.
@@ -622,8 +745,9 @@ fn kind(t: &str) -> Result<(&'static [&'static str], &'static [&'static str])> {
         "gcs" => (&["key_id", "secret", "service_account_key", "endpoint", "provider", "scope"], &["gs", "gcs"]),
         "azure" => (&["connection_string", "account_name", "account_key", "sas_token", "tenant_id", "client_id", "client_secret", "endpoint", "use_emulator", "provider", "scope"], &["az", "azure", "abfs", "abfss"]),
         "http" => (&["bearer_token", "scope"], &["http", "https"]),
+        "iceberg" => (&["token", "client_id", "client_secret", "oauth2_server_uri", "oauth2_scope", "scope"], &["http", "https"]), // (a REST catalog)
         "generic" => (&[], &[]), // (any settings: for procedures, `pondra.secret(name)`)
-        t => bail!("secrets of TYPE {t}: s3, r2, gcs, azure, http or generic"),
+        t => bail!("secrets of TYPE {t}: s3, r2, gcs, azure, http, iceberg or generic"),
     })
 }
 
@@ -638,6 +762,9 @@ pub fn statement(sql: &str) -> Option<crate::write::Stmt> {
     }
     let mut p = Parser::new(&GenericDialect {}).try_with_sql(sql).ok()?;
     let invalid = |e: String| Some(crate::write::Stmt::Invalid(e));
+    if p.parse_keyword(Keyword::ATTACH) {
+        return attach_statement(&mut p);
+    }
     if p.parse_keyword(Keyword::DROP) {
         let _ = p.parse_one_of_keywords(&[Keyword::PERSISTENT, Keyword::TEMPORARY]);
         if !p.parse_keyword(Keyword::SECRET) {
@@ -683,6 +810,45 @@ pub fn statement(sql: &str) -> Option<crate::write::Stmt> {
         }
     }
     Some(crate::write::Stmt::Ddl(vec![Ddl::CreateSecret { name: name.value.to_lowercase(), params, replace, if_not_exists }]))
+}
+
+/// `ATTACH [DATABASE] [IF NOT EXISTS] 'url' [AS] name (TYPE delta | iceberg, ENDPOINT '…', …)`:
+/// another engine's tables. None: another lake (no TYPE, or TYPE pondra), as before.
+fn attach_statement(p: &mut datafusion::sql::sqlparser::parser::Parser) -> Option<crate::write::Stmt> {
+    use datafusion::sql::sqlparser::{keywords::Keyword, tokenizer::Token};
+    let usage = "ATTACH 's3://bucket/tables' AS name (TYPE delta), or ATTACH 'https://catalog' AS name (TYPE iceberg)";
+    let _ = p.parse_keyword(Keyword::DATABASE);
+    let _ = p.parse_keywords(&[Keyword::IF, Keyword::NOT, Keyword::EXISTS]);
+    let url = p.parse_literal_string().ok()?;
+    let _ = p.parse_keyword(Keyword::AS);
+    let name = p.parse_identifier().ok()?.value.to_lowercase();
+    if !p.consume_token(&Token::LParen) {
+        return None;
+    }
+    let mut options = BTreeMap::new();
+    loop {
+        let Ok(k) = p.parse_identifier() else { return Some(crate::write::Stmt::Invalid(usage.into())) };
+        let v = match p.peek_token().token {
+            Token::Comma | Token::RParen => "true".to_string(),
+            _ => match p.next_token().token {
+                Token::SingleQuotedString(s) | Token::Number(s, _) => s,
+                Token::Word(w) => w.value,
+                t => return Some(crate::write::Stmt::Invalid(format!("{}: a value, not {t} ({usage})", k.value))),
+            },
+        };
+        options.insert(k.value.to_lowercase(), v);
+        if p.consume_token(&Token::RParen) {
+            break;
+        }
+        if !p.consume_token(&Token::Comma) {
+            return Some(crate::write::Stmt::Invalid(usage.into()));
+        }
+    }
+    let kind = options.remove("type").unwrap_or_default().to_lowercase();
+    if kind.is_empty() || kind == "pondra" {
+        return None; // (a lake: `ddl::Attach`)
+    }
+    Some(crate::write::Stmt::Ddl(vec![crate::ddl::Ddl::AttachOutside { name, url, kind, options }]))
 }
 
 /// `COPY (query) TO 'url' (FORMAT parquet, PARTITION_BY (a, b), HEADER true, DELIMITER ';')` or
