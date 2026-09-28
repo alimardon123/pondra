@@ -354,7 +354,8 @@ class SparkSession:
 
     @property
     def udf(self):
-        raise NotImplementedError("Python UDFs don't run on the nodes: write the expression in SQL (F.expr), or register a function over Arrow Flight (POST /functions)")
+        """`spark.udf.register(name, f, returnType)`: a Python function for SQL and frames."""
+        return _UDFs(self)
 
     @property
     def read(self):
@@ -363,6 +364,52 @@ class SparkSession:
 
     def readStream(self, *_):
         raise NotImplementedError("Structured Streaming: a materialized view keeps a query up to date as rows arrive (df.to_view(…, materialized=True))")
+
+
+class _UDFs:
+    def __init__(self, spark):
+        self.spark = spark
+
+    def register(self, name, f, returnType=None):
+        """PySpark's `spark.udf.register`: `f` (a function, or a `udf`) as the lake's function
+        `name`, for `spark.sql` and every client; the UDF, for frames."""
+        u = f if isinstance(f, UserDefinedFunction) else UserDefinedFunction(f, returnType or "string")
+        u = UserDefinedFunction(u.func, returnType or u.returnType, name=name, pandas=u.pandas)
+        u._make(self.spark.con)
+        return u
+
+
+class UserDefinedFunction:
+    """PySpark's UDF (`F.udf`, `F.pandas_udf`, `spark.udf.register`): a Python function run on the
+    nodes, as the lake's own (`CREATE FUNCTION … LANGUAGE python`, ADR-027), made the first time
+    it is used. Its imports, helpers and constants go along (`@db.function`'s rules). A pandas UDF
+    is called once a batch with pandas Series."""
+
+    def __init__(self, func, returnType="string", name=None, pandas=False):
+        import hashlib
+        self.func, self.returnType, self.pandas = func, returnType, pandas
+        own = func.__name__ if func.__name__ != "<lambda>" else "udf_" + hashlib.sha1(func.__code__.co_code).hexdigest()[:10]
+        self.__name__ = name or own
+        self._made = None
+
+    def _make(self, con):
+        if self._made is con:
+            return
+        from ..client import _module_of
+        body = _module_of(self.func, lambda_name=self.__name__)
+        entry = self.func.__name__ if self.func.__name__ != "<lambda>" else self.__name__
+        if self.pandas:
+            body += f"\n\ndef __pandas_entry(*cols):\n    import pyarrow as pa\n    return pa.Array.from_pandas({entry}(*[c.to_pandas() for c in cols]))\n"
+            entry = "__pandas_entry"
+        n = self.func.__code__.co_argcount
+        params = {f"a{i + 1}": "ANY" for i in range(n)}
+        con.create_function(self.__name__, body, params=params, returns=_type(self.returnType), entry=entry, vectorized=self.pandas)
+        self._made = con
+
+    def __call__(self, *cols):
+        self._make(SparkSession._active.con if SparkSession._active else _client.current())
+        cs = [c if isinstance(c, Column) else _col(c) for c in cols]
+        return Column(f"{self.__name__}({', '.join(c.sql for c in cs)})", f"{self.__name__}({', '.join(c.name for c in cs)})")
 
 
 def _sql_from(con, query, caller, names, params):

@@ -475,6 +475,35 @@ def p_write_modes(spark, F, Window):
     return said + [spark.read.parquet(out).count(), spark.read.json(out + "-json").count()]
 
 
+def _slug(s):
+    import re
+    return re.sub(r"[^a-z]+", "-", (s or "").lower()).strip("-") + "!"
+
+
+def p_udf(spark, F, Window):
+    slug = F.udf(_slug, "string")
+    return spark.table("orders").where(F.col("id") <= 50).select("id", slug("item").alias("slug"))
+
+
+def p_udf_register_sql(spark, F, Window):
+    spark.udf.register("twice_qty", lambda q: None if q is None else q * 2, "long")
+    return spark.sql("SELECT id, twice_qty(qty) AS q2 FROM orders WHERE id <= 50")
+
+
+def p_pandas_udf(spark, F, Window):
+    import pandas as pd
+
+    @F.pandas_udf("double")
+    def with_tax(p: pd.Series) -> pd.Series:
+        return p * 1.25
+    return spark.table("orders").where(F.col("id") <= 50).select("id", with_tax("price").alias("gross"))
+
+
+def p_udf_group_by(spark, F, Window):
+    size = F.udf(lambda item: "long" if len(item) > 4 else "short", "string")
+    return spark.table("orders").groupBy(size("item").alias("size")).agg(F.count("*").alias("n"))
+
+
 PIPELINES = [
     ("select", False, "frame", p_select),
     ("selectExpr", False, "frame", p_select_expr),
@@ -527,6 +556,10 @@ PIPELINES = [
     ("write_parquet_partitionBy_modes", False, "frame", p_write_parquet_read_back),
     ("write_csv_header", False, "frame", p_write_csv_read_back),
     ("write_modes_error_ignore_append", None, "value", p_write_modes),
+    ("udf", False, "frame", p_udf),
+    ("udf_register_then_sql", False, "frame", p_udf_register_sql),
+    ("pandas_udf", False, "frame", p_pandas_udf),
+    ("udf_in_groupBy", False, "frame", p_udf_group_by),
 ]
 
 

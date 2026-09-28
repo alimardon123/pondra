@@ -10,7 +10,13 @@ const db = await local("lake");                       // a node on ./lake
 await db.sql("CREATE TABLE events (user VARCHAR, amount BIGINT)");
 await db.append("events", [{ user: "ann", amount: 5 }]); // exactly once
 console.log(await db.sql("SELECT user, sum(amount) AS total FROM events GROUP BY user"));
+await db.call("send_report", "2026-09-27");            // a stored procedure; what it printed: db.notices
+const run = await db.start("send_report", "2026-09-28"); // …started, not waited for (pondra.runs)
 await db.close();
 ```
+
+Functions and procedures written in SQL or Python (`CREATE FUNCTION`, `CREATE PROCEDURE … LANGUAGE
+python`) run on the node; `local()` gives the node a Python with the `pondra` package if this
+machine has one.
 
 `npx pondra` opens a SQL shell on `./lake`; `npx pondra serve --dir s3://bucket/lake` runs a node.

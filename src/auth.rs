@@ -60,6 +60,7 @@ impl Auth {
             "files" if method == "GET" => Role::Read, // (objects next to the tables: files.rs)
             "files" => Role::Write,
             "stats" => Role::None, // (a health check: load balancers and the tests poll it)
+            "secrets" => Role::None, // (a procedure's lent token only: `server::secret`)
             "sql" | "lookup" | "watch" | "mcp" | "v1" | "metrics" | "routines" => Role::Read, // (MCP writes are checked by `allows`; v1: the Iceberg REST catalog)
             "append" | "insert" => Role::Write,
             "cluster" if path.starts_with("/cluster/files") || path.starts_with("/cluster/commit") => Role::Write, // (writers on other machines)
@@ -79,19 +80,48 @@ impl Auth {
 }
 
 /// A token lent to a Python procedure for its calls back to the node (`routines::python`): the
-/// rights of whoever called it (and whether it may read files on this machine), until it ends.
+/// rights of whoever called it (and whether it may read files on this machine), until it ends;
+/// and the secrets it has read (`pondra.secret`), kept out of what it says.
 pub struct Lease(pub String);
 
-static LENT: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, (Role, bool)>>> = std::sync::LazyLock::new(Default::default);
+struct Lent {
+    role: Role,
+    files: bool,
+    secrets: Vec<String>,
+}
+
+static LENT: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, Lent>>> = std::sync::LazyLock::new(Default::default);
 
 pub fn lend(role: Role, files: bool) -> Lease {
     let token = format!("lease-{}", uuid::Uuid::new_v4().simple());
-    LENT.lock().unwrap().insert(token.clone(), (role, files));
+    LENT.lock().unwrap().insert(token.clone(), Lent { role, files, secrets: vec![] });
     Lease(token)
 }
 
 /// What a lent token allows, while its procedure runs.
-pub fn lent(token: Option<&str>) -> Option<(Role, bool)> { LENT.lock().unwrap().get(token?).copied() }
+pub fn lent(token: Option<&str>) -> Option<(Role, bool)> { LENT.lock().unwrap().get(token?).map(|l| (l.role, l.files)) }
+
+/// A secret's values, read by a lent token's procedure: kept, to be blanked out of its notices,
+/// its error and the run log. False: not a lent token (only a procedure's code reads a secret).
+pub fn revealed(token: Option<&str>, values: impl IntoIterator<Item = String>) -> bool {
+    let mut all = LENT.lock().unwrap();
+    let Some(l) = token.and_then(|t| all.get_mut(t)) else { return false };
+    l.secrets.extend(values.into_iter().filter(|v| v.len() >= 4)); // (a port number or `true` isn't worth hiding, and would blank out too much)
+    true
+}
+
+impl Lease {
+    /// `text` with every secret this procedure read replaced by `***`.
+    pub fn redact(&self, text: &str) -> String {
+        let all = LENT.lock().unwrap();
+        let Some(l) = all.get(&self.0) else { return text.to_string() };
+        let mut out = text.replace(&self.0, "***"); // (its token too)
+        for s in &l.secrets {
+            out = out.replace(s.as_str(), "***");
+        }
+        out
+    }
+}
 
 impl Drop for Lease {
     fn drop(&mut self) { LENT.lock().unwrap().remove(&self.0); }

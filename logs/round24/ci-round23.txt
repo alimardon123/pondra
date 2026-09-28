@@ -1,0 +1,29 @@
+The build workflow's run #17 on b5a8b69 (round 23), from the logs the owner sent: failed, 53 min.
+
+Build step (dist profile), each job:
+  linux-x64     15:18 -> 15:36  (17 min: 394 crates compiled; dependencies 8 min, the pondra crate 9 min)
+  linux-arm64   15:19 -> 15:32
+  macos-arm64   15:19 -> 15:45
+  macos-x64     15:19 -> 15:46
+  windows-x64   15:19 -> 15:52
+Every job restored a cache by its restore-key, and still compiled every crate: the Linux job
+had failed before, and rust-cache saves only after a job that passes, so its dist-profile
+dependencies were never kept; round 23 also changed object_store's features (gcp, azure, http)
+and added aws-lc-rs, tokio-rustls and rustls-platform-verifier. The pondra crate itself takes
+about 9 minutes in the dist profile (one codegen unit, thin LTO), cached or not; a --release
+build (16 codegen units, incremental) took 3-4 minutes before build.yml built what ships.
+
+The suite step (linux-x64): 15:38 -> 16:11, failed.
+  - pip install -r tools/requirements.txt: about a minute; npm install -g azurite: 19 s.
+  - Apache Kafka from archive.apache.org: most of the half hour (it took several minutes from
+    the sandbox too).
+  - harness.py outside: "Could not connect to the endpoint URL: http://127.0.0.1:8140/…": the
+    S3 simulator (sim_r2.py) needs moto's server (Flask), and requirements.txt had moto alone;
+    the sandbox had Flask from earlier rounds. harness.py waited 10 s for it, then went on.
+
+Round 24's build.yml and requirements:
+  - moto[server]; harness.py outside waits up to 60 s for the simulator and says why it stopped;
+  - Kafka from dlcdn.apache.org (archive.apache.org if not there), kept in the Actions cache;
+  - pip's downloads cached (setup-python, keyed by tools/requirements.txt);
+  - rust-cache with cache-on-failure: a failing job keeps what it compiled.
+The pondra crate's 9 minutes stay while build.yml builds the dist profile on every push.

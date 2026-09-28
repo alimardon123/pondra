@@ -1,0 +1,11 @@
+21:36:37 start functions
+21:37:45 functions exit=0
+21:37:45 start procedures
+21:38:26 procedures exit=0
+21:38:26 start failover
+21:39:29 failover exit=0
+21:39:29 start users
+21:40:00 users exit=0
+21:40:00 start crash
+21:51:49 crash exit=0
+21:51:49 SIM_DONE

@@ -26,7 +26,20 @@ import warnings
 from .frame import Frame, _literal, _quote, sql_type, trailing_order
 
 _names = itertools.count(1)
-_last = None  # the newest connection (what `%%sql` cells use)
+_last = None  # the newest connection (what `%%sql` cells and `pondra.sql` use)
+_current = None  # inside a routine: the connection lent its caller (the worker sets it for each call)
+_inside = None  # "function" while a worker runs a function: it has no connection
+
+
+def current():
+    """The connection `pondra.sql`, `pondra.table`, `pondra.call` and `pondra.secret` use: inside a
+    procedure, the one lent its caller (their rights, for as long as it runs); elsewhere, the
+    newest one made (`connect`, `local`), as `duckdb.sql` uses DuckDB's default connection."""
+    if _inside == "function":
+        raise RuntimeError("a function has no connection to the lake (a query may run it over millions of rows on every node): read the rows as its arguments, or do it in a procedure")
+    if (_current or _last) is None:
+        raise RuntimeError("no connection yet: pondra.connect(url) or pondra.local(dir) first")
+    return _current or _last
 
 
 def _has_arrow():
@@ -82,9 +95,10 @@ class Result:
 
 
 class Pondra:
-    def __init__(self, url="http://127.0.0.1:8080", token=None, producer=None, timeout=300, headers=None, job=None):
+    def __init__(self, url="http://127.0.0.1:8080", token=None, producer=None, timeout=300, headers=None, job=None, echo=True):
         global _last
         self.url, self.token, self.timeout = url.rstrip("/"), token, timeout
+        self.notices, self.echo = [], echo  # what the last statement's procedures printed; printed here too, unless echo=False
         self.producer = producer or f"py-{uuid.uuid4().hex[:12]}"  # exactly-once: one name, increasing seq
         self.seq = 0
         self._headers, self._job, self._jobs, self._temp = dict(headers or {}), job, itertools.count(1), {}
@@ -103,8 +117,21 @@ class Pondra:
         try:
             r = self._open(req, timeout=None if stream else self.timeout)
         except urllib.error.HTTPError as e:
+            self._heard(e.headers)
             raise RuntimeError(f"{e.code}: {e.read().decode(errors='replace')}") from None
-        return r if stream else r.read()
+        if stream:
+            return r
+        self._heard(r.headers)
+        return r.read()
+
+    def _heard(self, headers):
+        """What the statement's procedures printed (the node's `x-pondra-notices`): kept in
+        `notices`, and printed, as psql shows NOTICEs (inside a procedure: to its own caller)."""
+        said = headers.get("x-pondra-notices") if headers else None
+        self.notices = json.loads(said) if said else []
+        if self.echo:
+            for n in self.notices:
+                print(n)
 
     def _post(self, sql, params=None, sent=None, job=None, views=None, format=None):
         """Send statements: as they are; with `$name` parameters and frames by name (`views`: JSON);
@@ -141,10 +168,12 @@ class Pondra:
         Polars and Arrow data — are found where `sql` was called, or given by keyword as `{name}`;
         other keywords are `$name` parameters: `con.sql("SELECT * FROM {r} WHERE amount > $min",
         r=recent, min=100)`. `job`: a write retried with the same job is applied once."""
+        return self._sql(query, job, names, sys._getframe(1))
+
+    def _sql(self, query, job, names, caller):
         frames = {k: v for k, v in names.items() if _data(v) or isinstance(v, Frame)}
         params = {k: v for k, v in names.items() if k not in frames}
         text = re.sub(r"\{(\w+)\}", lambda m: m.group(1) if m.group(1) in frames else m.group(0), query)
-        caller = sys._getframe(1)
         scopes = ((frames, caller.f_locals, caller.f_globals),)
         if _is_query(text):
             f = Frame(self, text, params=params, scopes=scopes, order=trailing_order(text))
@@ -249,43 +278,82 @@ class Pondra:
                         return v
         return None
 
-    # ------------------------------------------------------------ procedures
+    # ------------------------------------------------------------ functions and procedures (ADR-027)
 
-    def call(self, name, *args, **kwargs):
-        """`CALL name(…)`: its rows (`Result`) or outcome."""
-        given = [_literal(a) for a in args] + [f"{k} => {_literal(v)}" for k, v in kwargs.items()]
-        return self._run(f"CALL {name}({', '.join(given)})")
+    def call(self, name, *args, wait=True, **kwargs):
+        """`CALL name(…)`: its rows (`Result`) or outcome. What it prints comes back as notices
+        (printed here, and in `notices`). `wait=False`: started on the node, not waited for (SQL's
+        `pondra.start`): a `Run`, whose row of `pondra.runs` says how it went."""
+        given = ", ".join([_literal(a) for a in args] + [f"{k} => {_literal(v)}" for k, v in kwargs.items()])
+        if wait:
+            return self._run(f"CALL {name}({given})")
+        out = self._run(f"SELECT pondra.start({_literal(name)}{', ' + given if given else ''})")
+        return Run(self, out.rows()[0]["run"])
 
-    def create_procedure(self, name, body=None, file=None, params=None, language="python", replace=True):
+    def secret(self, name):
+        """A secret's values (`CREATE SECRET name (TYPE generic, …)`), as a dict: only a procedure's
+        code reads them (its lent connection), and they are kept out of what it prints."""
+        return json.loads(self._call("GET", f"/secrets/{urllib.parse.quote(name)}"))
+
+    def create_function(self, name, body=None, file=None, params=None, returns=None, language="python", entry=None, vectorized=False, strict=False,
+                        volatility=None, packages=None, timeout=None, replace=True):
+        """A stored function from code (or a file of it), as `CREATE FUNCTION … LANGUAGE python`:
+        `params` maps each parameter to its SQL type (or a Python one), or to (type, default);
+        `returns` is a SQL type, or `TABLE (…)`, or a dict of columns and types (a table function).
+        The body is a function's body (Postgres's PL/Python form), or, with `entry`, a module whose
+        function of that name runs."""
+        body = open(file, encoding="utf-8").read() if file else body
+        if isinstance(returns, dict):
+            returns = "TABLE (" + ", ".join(f"{_quote(k)} {_sql_type_of(v) or 'VARIANT'}" for k, v in returns.items()) + ")"
+        with_ = {"entry": entry, "vectorized": vectorized or None, "packages": packages, "timeout": timeout}
+        words = " ".join(w for w in ["STRICT" if strict else "", (volatility or "").upper()] if w)
+        return self._run(f"CREATE {'OR REPLACE ' if replace else ''}FUNCTION {name}({_params(params)}) RETURNS {_sql_type_of(returns) or returns} "
+                         f"LANGUAGE {language} {words}{_with(with_)} AS {_dollar(body)}")
+
+    def create_procedure(self, name, body=None, file=None, params=None, language="python", entry=None, packages=None, timeout=None, replace=True):
         """A stored procedure from code (or a file of it): `params` maps each parameter to its SQL
         type, or to (type, default)."""
         body = open(file, encoding="utf-8").read() if file else body
-        tag = "$pondra$" if "$pondra$" not in body else f"$p{uuid.uuid4().hex[:8]}$"
-        ps = []
-        for k, t in (params or {}).items():
-            t, default = t if isinstance(t, tuple) else (t, inspect.Parameter.empty)
-            ps.append(f"{k} {sql_type(t)}" + ("" if default is inspect.Parameter.empty else f" DEFAULT {_literal(default)}"))
-        return self._run(f"CREATE {'OR REPLACE ' if replace else ''}PROCEDURE {name}({', '.join(ps)}) LANGUAGE {language} AS {tag}{body}{tag}")
+        return self._run(f"CREATE {'OR REPLACE ' if replace else ''}PROCEDURE {name}({_params(params)}) LANGUAGE {language}"
+                         f"{_with({'entry': entry, 'packages': packages, 'timeout': timeout})} AS {_dollar(body)}")
 
-    def procedure(self, fn=None, *, name=None, replace=True):
-        """A decorator: this Python function becomes a stored procedure, callable from SQL (`CALL`),
-        from any client, and here (`con.call`). Its first parameter is the connection it runs with;
-        the others are its parameters, their types from the annotations or the defaults."""
+    def function(self, fn=None, *, name=None, returns=None, vectorized=False, strict=False, volatility=None, packages=None, timeout=None, replace=True):
+        """A decorator: this Python function becomes one of the lake's functions, for SQL
+        (`SELECT slug(title) …`) and frames (`pondra.fn.slug(col("title"))`), on every node. Its
+        types come from its annotations (`returns=` says what it returns otherwise: a SQL type, or a
+        dict of columns for a table function); the imports, helper functions and constants it uses
+        from where it is defined go with it. It is handed back as it was: it still runs here."""
         def make(f):
             sig = inspect.signature(f)
+            params = {p.name: (_sql_type_of(p.annotation) or "ANY", p.default) for p in sig.parameters.values()}
+            ret = returns or _sql_type_of(sig.return_annotation)
+            if ret is None:
+                raise TypeError(f"{f.__name__}: say what it returns — an annotation (-> str) or @db.function(returns='DOUBLE'), or returns={{'col': int, …}} for a table")
+            self.create_function(name or f.__name__, _module_of(f), params=params, returns=ret, entry=f.__name__, vectorized=vectorized, strict=strict,
+                                 volatility=volatility, packages=packages, timeout=timeout, replace=replace)
+            return f
+        return make(fn) if fn else make
+
+    def procedure(self, fn=None, *, name=None, packages=None, timeout=None, replace=True):
+        """A decorator: this Python function becomes a stored procedure, callable from SQL (`CALL`),
+        from any client, and here (`db.call`), running on the node with its caller's rights:
+        `pondra.sql(…)` in it is the caller's connection. Its parameters' types come from the
+        annotations or the defaults (a parameter without either takes any value, as it comes); the
+        imports, helper functions and constants it uses from where it is defined go with it. (A
+        first parameter named `con` gets the connection, as in 0.22.) It is handed back as it was."""
+        def make(f):
+            ps = list(inspect.signature(f).parameters.values())
+            ps = ps[1:] if ps and ps[0].name == "con" else ps
             params = {}
-            for p in list(sig.parameters.values())[1:]:
-                t = p.annotation if p.annotation is not inspect.Parameter.empty else type(p.default) if p.default is not inspect.Parameter.empty else str
-                params[p.name] = (t, p.default)
-            src = textwrap.dedent(inspect.getsource(f))
-            src = re.sub(r"^@[^\n]*\n", "", src, flags=re.M)  # (its decorators)
-            body = f"{src}\n{f.__name__}(con, {', '.join(f'{p}={p}' for p in params)})\n"
-            self.create_procedure(name or f.__name__, body, params=params, replace=replace)
+            for p in ps:
+                t = _sql_type_of(p.annotation) or (_sql_type_of(type(p.default)) if p.default not in (inspect.Parameter.empty, None) else None)
+                params[p.name] = (t or "ANY", p.default)
+            self.create_procedure(name or f.__name__, _module_of(f), params=params, entry=f.__name__, packages=packages, timeout=timeout, replace=replace)
             return f
         return make(fn) if fn else make
 
     def routines(self):
-        """This lake's macros and procedures."""
+        """This lake's functions and procedures (SQL has them as `pondra.routines`)."""
         return json.loads(self._call("GET", "/routines"))
 
     # ------------------------------------------------------------ rows in, rows out
@@ -360,6 +428,154 @@ class Pondra:
 
     def __exit__(self, *_):
         self.close()
+
+
+class Run:
+    """A procedure started without waiting (`db.call(…, wait=False)`, SQL's `pondra.start`): its
+    `id`, and its row of `pondra.runs` — running, ok or failed; its notices and error."""
+
+    def __init__(self, db, id):
+        self.db, self.id = db, id
+
+    def status(self):
+        rows = self.db._run("SELECT * FROM pondra.runs WHERE id = $id", {"id": self.id}).rows()
+        return rows[0] if rows else {"id": self.id, "status": "starting"}
+
+    def wait(self, timeout=None, every=0.2):
+        """Its row once it has ended; a failed run raises its error."""
+        deadline = None if timeout is None else time.time() + timeout
+        while True:
+            row = self.status()
+            if row["status"] in ("ok", "failed"):
+                if row["status"] == "failed":
+                    raise RuntimeError(row.get("error"))
+                return row
+            if deadline is not None and time.time() > deadline:
+                raise TimeoutError(f"run {self.id} is still {row['status']}")
+            time.sleep(every)
+
+    def __repr__(self):
+        return f"<pondra Run {self.id}>"
+
+
+def _params(params):
+    """`name TYPE [DEFAULT value], …` from {name: type} or {name: (type, default)}."""
+    out = []
+    for k, t in (params or {}).items():
+        t, default = t if isinstance(t, tuple) else (t, inspect.Parameter.empty)
+        out.append(f"{k} {_sql_type_of(t) or t}" + ("" if default is inspect.Parameter.empty else f" DEFAULT {_literal(default)}"))
+    return ", ".join(out)
+
+
+def _with(options):
+    given = {k: v for k, v in options.items() if v not in (None, False, "")}
+    return (" WITH (" + ", ".join(f"{k} = {_literal(v if not isinstance(v, (list, tuple)) else ', '.join(v))}" for k, v in given.items()) + ")") if given else ""
+
+
+def _dollar(body):
+    tag = "$pondra$" if "$pondra$" not in body else f"$p{uuid.uuid4().hex[:8]}$"
+    return f"{tag}{body}{tag}"
+
+
+def _sql_type_of(t):
+    """A Python annotation's SQL type: str VARCHAR, int BIGINT, float DOUBLE, bool BOOLEAN, date
+    DATE, datetime TIMESTAMP, bytes BYTEA, Decimal DECIMAL, list[T] T[], dict VARIANT; a SQL type
+    as it is. None: no annotation, or one SQL has no type for (a pyarrow array: any value)."""
+    import typing
+    if t is None or t is inspect.Parameter.empty or t is inspect.Signature.empty:
+        return None
+    if isinstance(t, str):
+        return t
+    origin, args = typing.get_origin(t), typing.get_args(t)
+    if origin in (list, tuple, set) or t in (list, tuple, set):
+        inner = _sql_type_of(args[0]) if args else None
+        return f"{inner}[]" if inner else "VARIANT"
+    if origin is dict or t is dict:
+        return "VARIANT"
+    if args and type(None) in args:  # Optional[T]
+        rest = [a for a in args if a is not type(None)]
+        return _sql_type_of(rest[0]) if len(rest) == 1 else None
+    known = {str: "VARCHAR", int: "BIGINT", float: "DOUBLE", bool: "BOOLEAN", bytes: "BYTEA"}
+    if t in known:
+        return known[t]
+    import datetime
+    import decimal
+    return {datetime.datetime: "TIMESTAMP", datetime.date: "DATE", datetime.time: "TIME", decimal.Decimal: "DECIMAL(38, 10)"}.get(t)
+
+
+def _parses(src):
+    try:
+        import ast
+        ast.parse(src)
+        return True
+    except SyntaxError:
+        return False
+
+
+def _module_of(f, lambda_name="udf"):
+    """A function written in a notebook (or a file) as a module the node can run: the imports,
+    helper functions and constants it uses from where it is defined, then its own source (a lambda
+    as a def called `lambda_name`). Anything else it uses from there — a DataFrame, an open file, a
+    connection — is refused, with the fix."""
+    import ast
+    import builtins
+    import types
+    imports, consts, sources, done = [], [], [], set()
+
+    def const(v, depth=0):
+        if isinstance(v, (bool, int, str, bytes, type(None))) or isinstance(v, float) and v == v and abs(v) != float("inf"):
+            return True
+        if isinstance(v, (list, tuple, set, frozenset)) and depth < 8:
+            return all(const(x, depth + 1) for x in v)
+        return isinstance(v, dict) and depth < 8 and all(const(k, depth + 1) and const(x, depth + 1) for k, x in v.items())
+
+    def used(code):
+        names = set(code.co_names)
+        for c in code.co_consts:
+            if isinstance(c, types.CodeType):
+                names |= used(c)
+        return names
+
+    def visit(fn):
+        if fn.__closure__:
+            free = ", ".join(fn.__code__.co_freevars)
+            raise TypeError(f"{fn.__name__} uses {free} from the function it is defined in, which can't go with it to the node: define it at the top level, and pass {free} as an argument")
+        src = textwrap.dedent(inspect.getsource(fn))
+        if fn.__name__ == "<lambda>":  # (PySpark's `F.udf(lambda s: …)`: a def of the same)
+            text = src if _parses(src) else src.strip().rstrip(",").rstrip(")")
+            args = list(fn.__code__.co_varnames[:fn.__code__.co_argcount])
+            try:
+                node = next(n for n in ast.walk(ast.parse(text)) if isinstance(n, ast.Lambda) and [a.arg for a in n.args.args] == args)
+            except (StopIteration, SyntaxError):
+                raise TypeError("this lambda's source can't be read: write it as a def") from None
+            src = f"def {lambda_name}({ast.unparse(node.args)}):\n    return {ast.get_source_segment(text, node.body) or ast.unparse(node.body)}\n"
+        node = next(n for n in ast.parse(src).body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)))
+        signature = [node.args, node.returns] if node.returns else [node.args]  # (its annotations and defaults: read where it is defined)
+        names = used(fn.__code__) | {n.id for part in signature for n in ast.walk(part) if isinstance(n, ast.Name)}
+        for name in sorted(names):
+            if name in done or name not in fn.__globals__ or name in ("pondra", "plpy", "con", fn.__name__):
+                continue
+            done.add(name)
+            v = fn.__globals__[name]
+            mod = getattr(v, "__module__", None)
+            if isinstance(v, types.ModuleType):
+                imports.append(f"import {v.__name__}" + (f" as {name}" if v.__name__ != name else ""))
+            elif (inspect.isroutine(v) or inspect.isclass(v)) and mod and mod != fn.__module__ and getattr(sys.modules.get(mod), getattr(v, "__name__", ""), None) is v:
+                imports.append(f"from {mod} import {v.__name__}" + (f" as {name}" if v.__name__ != name else ""))
+            elif inspect.isfunction(v) and mod == fn.__module__:
+                visit(v)  # (a helper of the notebook's: its source, and what it uses)
+            elif inspect.isclass(v) and mod == fn.__module__:
+                sources.append(textwrap.dedent(inspect.getsource(v)))
+            elif const(v) and len(repr(v)) < 1 << 20:
+                consts.append(f"{name} = {v!r}")
+            elif name not in vars(builtins):
+                raise TypeError(f"{fn.__name__} uses {name}, a {type(v).__name__} from where it is defined, which can't go with it to the node: "
+                                f"pass it as an argument, or keep it in a table and read it there")
+        sources.append("\n".join(src.splitlines()[node.lineno - 1:]))  # (without its decorators)
+
+    visit(f)
+    head = "from __future__ import annotations  # (its annotations stay text: what they name needn't come along)\n"
+    return head + "\n".join(dict.fromkeys(imports)) + "\n" + "\n".join(consts) + "\n\n" + "\n\n".join(sources) + "\n"
 
 
 def connect(url="http://127.0.0.1:8080", token=None, **kw):

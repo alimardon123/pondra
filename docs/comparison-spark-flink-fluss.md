@@ -1,6 +1,6 @@
 # Pondra vs Spark, Flink, Fluss, Databricks Lakehouse//RT — and the single-node engines (round 12)
 
-**Date:** 2026-09-27 (Nexmark and schema rows: round 21; DataFrames and procedures: round 22) · **Machine:** one 2-vCPU, 7 GB sandbox VM, local disk (plus a real Cloudflare R2 bucket where marked); every engine ran alone
+**Date:** 2026-09-28 (Nexmark and schema rows: round 21; DataFrames and procedures: round 22; functions, procedures and tasks: round 24) · **Machine:** one 2-vCPU, 7 GB sandbox VM, local disk (plus a real Cloudflare R2 bucket where marked); every engine ran alone
 **Versions:**
 - Pondra (this prototype: Rust, Apache DataFusion 55)
 - Spark 4.2.0 (PySpark, `local[*]`)
@@ -363,9 +363,10 @@ from third-party summit recaps; check them before relying on them.
   declared in SQL too, and run incrementally.
 - **Types and SQL:** VARIANT with shredding, SQL scripting, pipe syntax.
 - **Clients and UDFs:** Spark Connect clients (Python, Go, Swift) and a JDBC driver;
-  Arrow-native Python UDFs; the Python data source API. Pondra's answer to UDFs is a function
-  that lives on an Arrow Flight server of yours: it gets a batch of arguments and returns a
-  column, so the model or library runs in that process and a slow one can't take a node down.
+  Arrow-native Python UDFs; the Python data source API. Pondra's answer (round 24) is Python
+  functions on warm workers beside every node, per row or vectorized over Arrow, and PySpark's
+  `udf` / `pandas_udf` names for them; a function on an Arrow Flight server of yours (a GPU, a
+  model) is still there for what shouldn't run on the nodes.
 
 **Databricks** (Data + AI Summit 2025 and 2026):
 
@@ -424,13 +425,15 @@ Round 22 took the other road to PySpark first: `pondra.spark`, PySpark's names i
 SQL (no Spark Connect server in the binary). It covers what most jobs use and says what it
 doesn't; Spark Connect stays the answer if Scala and Java jobs need to move.
 
-### Macros and procedures (round 22)
+### Functions, procedures and tasks (rounds 22 and 24)
 
 | | DuckDB | Snowflake | Databricks | Postgres | Pondra |
 |---|---|---|---|---|---|
-| SQL macros / SQL functions | `CREATE MACRO` (scalar, table) | SQL UDFs | SQL UDFs | SQL functions | `CREATE MACRO` (scalar, table), kept in the lake: every node and client has them |
-| Stored procedures | — | SQL (Snowflake Scripting), Python, Java, Scala | SQL procedures (2025), jobs | PL/pgSQL, PL/Python (superuser) | SQL and Python; `CALL` from SQL, Postgres, Python, JS, MCP |
-| Where Python runs | in process | Snowpark sandbox, in the warehouse | clusters | in the server process | beside the node (`--python`), a process per call, lent the caller's rights |
+| SQL functions | `CREATE MACRO` (scalar, table) | SQL UDFs | SQL UDFs | SQL functions | Postgres's `CREATE FUNCTION` (`RETURN`, `RETURNS TABLE`, `SETOF`, `$1`, `STRICT`) and DuckDB's `CREATE MACRO`, kept in the lake: every node and client has them |
+| Python functions | in process (Python API) | Python UDFs, vectorized UDFs, UDTFs | Python UDFs, pandas UDFs, UDTFs | PL/Python (untrusted) | `LANGUAGE python`: per row, vectorized (Arrow), table; packages per function; spread with the query |
+| Stored procedures | — | SQL (Snowflake Scripting), Python, Java, Scala | SQL procedures (2025), jobs | PL/pgSQL, PL/Python (superuser) | SQL and Python; `CALL` from SQL, Postgres (NOTICE), Python, JS, the shell, MCP; secrets; a run log |
+| Schedules | — | tasks (cron, intervals) | jobs | pg_cron (an extension) | `CREATE TASK … SCHEDULE` (cron with a time zone, intervals): each tick once through a failover |
+| Where Python runs | in process | Snowpark sandbox, in the warehouse | clusters | in the server process | warm workers beside each node (`--python`); a `CALL` in 2.4 ms, lent the caller's rights |
 | Who may make one | anyone | owner roles | owner/admin | superuser for untrusted languages | the admin token |
 
 ## Footprint and operations

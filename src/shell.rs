@@ -27,7 +27,7 @@ fn start(dir: &str) -> Result<(Child, String, String, std::path::PathBuf)> {
     let key = uuid::Uuid::new_v4().to_string();
     let here = std::env::current_dir()?.to_string_lossy().to_string(); // (its lakes: this one's databases)
     let node = Command::new(std::env::current_exe()?)
-        .args(["serve", "--dir", dir, "--addr", &format!("127.0.0.1:{port}"), "--stop-with-stdin", "--attach-found", &here])
+        .args(["serve", "--dir", dir, "--addr", &format!("127.0.0.1:{port}"), "--stop-with-stdin", "--attach-found", &here, "--python", "auto"])
         .env("PONDRA_OWNER_KEY", &key)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -58,9 +58,9 @@ pub async fn script(dir: &str, url: Option<&str>, token: Option<&str>, body: ser
             r = r.bearer_auth(t);
         }
         let r = r.send().await?;
-        let (ok, text) = (r.status().is_success(), r.text().await?);
-        anyhow::ensure!(ok, "{}", text.trim());
-        Ok(format!("{}\n", text.trim_end()))
+        let (ok, heard, text) = (r.status().is_success(), notices(r.headers()), r.text().await?);
+        anyhow::ensure!(ok, "{}{}", heard, text.trim());
+        Ok(format!("{heard}{}\n", text.trim_end()))
     };
     if let Some(url) = url {
         return send(reqwest::Client::new(), url.trim_end_matches('/').to_string(), String::new()).await;
@@ -72,6 +72,13 @@ pub async fn script(dir: &str, url: Option<&str>, token: Option<&str>, body: ser
     };
     stop(&mut node);
     r
+}
+
+/// What the procedures a statement called printed (`x-pondra-notices`), a line each, to print
+/// before its answer.
+fn notices(headers: &reqwest::header::HeaderMap) -> String {
+    let said: Vec<String> = headers.get("x-pondra-notices").and_then(|h| serde_json::from_slice(h.as_bytes()).ok()).unwrap_or_default();
+    said.iter().map(|n| format!("{n}\n")).collect()
 }
 
 /// `--name value` (or `--name=value`) pairs: numbers and true/false as such, the rest as text.
@@ -126,15 +133,18 @@ async fn session(dir: &str, base: &str, key: &str, node: &mut Child, log: &Path)
         for statement in statements.iter().filter(|s| !s.trim().is_empty()) {
             let at = Instant::now();
             let answer = match http.post(format!("{base}/sql?format=table")).header("x-pondra-owner", key).body(statement.trim().to_string()).send().await {
-                Ok(r) => Ok((r.status().is_success(), r.text().await.unwrap_or_default())),
+                Ok(r) => Ok((r.status().is_success(), notices(r.headers()), r.text().await.unwrap_or_default())),
                 Err(_) if node.try_wait()?.is_some() => bail!("the node stopped: {}", std::fs::read_to_string(log).unwrap_or_default()),
                 Err(e) => Err(e),
             };
             let took = at.elapsed(); // (the answer's time, not the terminal's: printing is timed apart)
             let mut out = std::io::stdout().lock();
             match answer {
-                Ok((true, body)) => writeln!(out, "{}", body.trim_end())?, // (one write: consoles are slow per call)
-                Ok((false, body)) => eprintln!("Error: {}", body.trim()),
+                Ok((true, heard, body)) => writeln!(out, "{heard}{}", body.trim_end())?, // (one write: consoles are slow per call)
+                Ok((false, heard, body)) => {
+                    write!(out, "{heard}")?;
+                    eprintln!("Error: {}", body.trim());
+                }
                 Err(e) => eprintln!("Error: {e}"),
             }
             out.flush()?;

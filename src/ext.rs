@@ -982,6 +982,15 @@ pub(crate) fn covering(secrets: &[(String, Secret)], url: &str) -> Option<(Strin
         .max_by_key(|(_, x)| x.scope.as_ref().map_or(0, |p| p.len() + 1)).cloned()
 }
 
+/// A secret's values by its name, for a procedure's code (`server::secret`): its settings, and
+/// `type` and `scope`.
+pub async fn reveal(lake: &Lake, name: &str) -> Result<BTreeMap<String, String>> {
+    let (name, s) = list(lake).await?.into_iter().find(|(n, _)| n == name).with_context(|| format!("no secret {name} (CREATE SECRET {name} (TYPE generic, …))"))?;
+    let mut values = open(&name, &s)?;
+    values.entry("type".into()).or_insert(s.kind.clone());
+    Ok(values)
+}
+
 /// A secret's values, opened with the nodes' key.
 fn open(name: &str, s: &Secret) -> Result<BTreeMap<String, String>> {
     let sealed = B64.decode(&s.sealed)?;

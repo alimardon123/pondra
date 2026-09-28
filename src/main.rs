@@ -36,6 +36,9 @@ mod query;
 mod read_delta;
 mod read_iceberg;
 mod ranges;
+mod pyfn;
+mod python;
+mod runs;
 mod sketch;
 mod skew;
 mod replica;
@@ -180,8 +183,9 @@ enum Cmd {
         /// node ends, however it ends (`pondra.local()` in Python and JavaScript, the shell).
         #[arg(long)]
         stop_with_stdin: bool,
-        /// Run Python procedures (`CREATE PROCEDURE … LANGUAGE python`) with this Python, which
-        /// has the `pondra` package. A procedure runs any code on this machine, so only an admin
+        /// Run Python functions and procedures (`LANGUAGE python`) with this Python, which has the
+        /// `pondra` package and pyarrow (`auto`: the first found), on warm workers beside the node,
+        /// gone after a minute idle. A routine runs any code on this machine, so only an admin
         /// token makes one, and a node without tokens takes this only when it listens on 127.0.0.1.
         #[arg(long)]
         python: Option<String>,
@@ -334,7 +338,11 @@ async fn main() -> anyhow::Result<()> {
                 };
                 Arc::new(log::Log::start(lake.clone(), Duration::from_millis(flush_ms), to))
             });
-            let app = server::App { lake: lake.clone(), cluster: cluster.clone(), log, seq, lock: Default::default(), retain_ms: retain_secs * 1000, results: Default::default(), replica: replica.clone(), auth, python };
+            python::init(python);
+            let app = server::App { lake: lake.clone(), cluster: cluster.clone(), log, seq, lock: Default::default(), retain_ms: retain_secs * 1000, results: Default::default(), replica: replica.clone(), auth };
+            if cluster.is_leader() && !cluster.reader {
+                runs::schedule(app.clone()); // (tasks: the leader runs their ticks)
+            }
             if let Some(pg_addr) = pg {
                 let a = app.clone();
                 tokio::spawn(async move { pg::serve(a, pg_addr).await.map_err(|e| eprintln!("postgres protocol: {e:#}")) });

@@ -36,9 +36,13 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true # (a failed run keeps what it compiled: the dist profile's dependencies take most of a cold build)
       - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
+          cache: pip
+          cache-dependency-path: tools/requirements.txt
       - uses: actions/setup-node@v5
         with:
           node-version: 22
@@ -80,6 +84,12 @@ jobs:
       # The suite, on this very binary (Linux): the quick correctness suite (upserts, split brain,
       # crashes, clients, Kafka, windows, sums, schemas, files on S3, lakes on GCS and Azure,
       # scale, Flight…), frames against Polars, then a cluster losing its leader twice.
+      - uses: actions/cache@v4 # (Apache Kafka for harness.py kafkas: archive.apache.org takes minutes)
+        if: matrix.platform == 'linux-x64'
+        id: kafka
+        with:
+          path: ~/kafka_2.13-4.3.1
+          key: kafka_2.13-4.3.1
       - name: The suite
         if: matrix.platform == 'linux-x64'
         env:
@@ -87,7 +97,9 @@ jobs:
         run: |
           pip install -r tools/requirements.txt
           npm install -g azurite   # (Azure's emulator: harness.py clouds)
-          curl -sSL https://archive.apache.org/dist/kafka/4.3.1/kafka_2.13-4.3.1.tgz | tar xz -C ~   # (Apache Kafka: harness.py kafkas)
+          if [ "${{ steps.kafka.outputs.cache-hit }}" != "true" ]; then
+            (curl -sSfL https://dlcdn.apache.org/kafka/4.3.1/kafka_2.13-4.3.1.tgz || curl -sSfL https://archive.apache.org/dist/kafka/4.3.1/kafka_2.13-4.3.1.tgz) | tar xz -C ~
+          fi
           python3 tools/harness.py all
           python3 tools/frames_check.py
           python3 tools/cluster.py failover --secs 30

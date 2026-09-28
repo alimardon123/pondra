@@ -4,7 +4,7 @@ Each builds a `Column` — its SQL, and the name PySpark would give its column (
 `(a + 1)`) — where PySpark's meaning differs from SQL's, the SQL says PySpark's (a string
 concatenation with a null is null, `dayofweek` counts from Sunday = 1, …).
 """
-from . import Column, _col, _lit
+from . import Column, UserDefinedFunction, _col, _lit
 
 
 def col(name):
@@ -29,6 +29,23 @@ def _f(name, *cols, sql=None, label=None):
     cs = [c if isinstance(c, Column) else _col(c) for c in cols]
     inner = ", ".join(c.sql for c in cs)
     return Column(f"{sql or name}({inner})", label or f"{name}({', '.join(c.name for c in cs)})")
+
+
+def udf(f=None, returnType="string", *, useArrow=None):
+    """PySpark's `udf`: a Python function run on the nodes, row by row (`@udf("int")`, `udf(f,
+    IntegerType())`, `@udf(returnType=…)`)."""
+    if f is None or isinstance(f, str) or hasattr(f, "simpleString"):
+        rt = returnType if f is None else f
+        return lambda g: UserDefinedFunction(g, rt)
+    return UserDefinedFunction(f, returnType)
+
+
+def pandas_udf(f=None, returnType=None, functionType=None):
+    """PySpark's `pandas_udf`: called once a batch with pandas Series, answering one (`@pandas_udf("double")`)."""
+    if f is None or isinstance(f, str) or hasattr(f, "simpleString"):
+        rt = returnType if f is None else f
+        return lambda g: UserDefinedFunction(g, rt, pandas=True)
+    return UserDefinedFunction(f, returnType, pandas=True)
 
 
 def when(condition, value):

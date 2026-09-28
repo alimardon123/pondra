@@ -71,7 +71,7 @@ Turning a format off deletes its metadata, so nobody reads a stale copy.
 
 | Path | Format | Who reads it | Changes? |
 |---|---|---|---|
-| `catalog/` | SlateDB (LSM of SSTs + WAL). Keys: `t/` tables, `s/` log segments, `d/` small segments' data, `p/` producer progress (and bulk-insert jobs; Kafka producers `kafka:{id}:{topic}`, consumer-group offsets `kafka-group:{group}:{topic}`, window and session emission `emit:{view}`, stream joins `join:{view}`, a view's filling `fill:{view}`), `v/` views (a view's `fill.upto`: the last commit its filling covers), `w/` a session view's bound (no open session starts before it), `k/` tasks, `r/` macros and procedures (their kind, parameters, language and body: ADR-023), `q/` stored views, `f/` functions over Arrow Flight, `ns/` schemas, `a/` attached lakes, `e/` secrets (sealed with `PONDRA_SECRET_KEY`, AES-256-GCM: ADR-026), `o/` catalogs attached from outside (Delta folders, Iceberg REST catalogs, Kafka clusters), `fd/` feeds (a view kept from a topic; its progress is producer `feed:{view}:{partition}` in `p/`), `x/` Delta state, `i/` Iceberg state, `m` the followers whose copies count (replicated acks), `n` next segment, `c` commit number | Pondra | new objects only; old ones compacted away |
+| `catalog/` | SlateDB (LSM of SSTs + WAL). Keys: `t/` tables, `s/` log segments, `d/` small segments' data, `p/` producer progress (and bulk-insert jobs; Kafka producers `kafka:{id}:{topic}`, consumer-group offsets `kafka-group:{group}:{topic}`, window and session emission `emit:{view}`, stream joins `join:{view}`, a view's filling `fill:{view}`), `v/` views (a view's `fill.upto`: the last commit its filling covers), `w/` a session view's bound (no open session starts before it), `k/` tasks, `r/` functions and procedures (their kind, parameters, language, body, result and options: ADR-023, ADR-027), `j/` tasks on a schedule and `jt/` their last tick (claimed, then done: ADR-027), `q/` stored views, `f/` functions over Arrow Flight, `ns/` schemas, `a/` attached lakes, `e/` secrets (sealed with `PONDRA_SECRET_KEY`, AES-256-GCM: ADR-026), `o/` catalogs attached from outside (Delta folders, Iceberg REST catalogs, Kafka clusters), `fd/` feeds (a view kept from a topic; its progress is producer `feed:{view}:{partition}` in `p/`), `x/` Delta state, `i/` Iceberg state, `m` the followers whose copies count (replicated acks), `n` next segment, `c` commit number | Pondra | new objects only; old ones compacted away |
 | `cluster/term/` | JSON: leader address and term (empty address: a `pondra sql` INSERT recording its files) | Pondra | one new object per election |
 | `cluster/alive/` | empty; its timestamp is what counts | Pondra | rewritten every 10 s by the leader; a one-off writer deletes its own when done |
 | `inbox/` | JSON requests (a flush as its binary body), JSON answers | the leader | each request deleted once answered; answers deleted by the writer (unclaimed ones after an hour) |
@@ -159,6 +159,10 @@ The same on local disk and on object storage:
   table feature), Iceberg with field ids by stored position and a name mapping to the stored names.
 - **Retention:** replaced files and consumed log objects are deleted after `--retain-secs`.
   Objects no commit ever referenced are deleted after a day.
+- **The run log** (`pondra.runs`, ADR-027) is a keyed table of the lake's own, `pondra$runs`
+  (a `$` in the name keeps it out of listings): a row per procedure call, keyed by run id,
+  written by every node as one producer each; rows go after `PONDRA_RUNS_DAYS` (30) by its
+  `started` column's TTL. It is made the first time a node has a line for it.
 - **Skipping data:**
   - every append-table file's column ranges (its first 32 columns), kept in the catalog or its
     manifest: a query skips whole manifests, then files, before opening any Parquet footer;

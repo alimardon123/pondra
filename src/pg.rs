@@ -119,7 +119,7 @@ impl Backend {
             return self.copy_out(copy?).await;
         }
         let role = self.app.auth.role_of_user(user);
-        if crate::routines::call_of(&sql).is_some() {
+        if crate::routines::runs_procedure(&sql) {
             let who = crate::routines::Who { role, files: false, depth: 0 };
             return match crate::routines::one(&self.app, &sql, who, None).await.map_err(user_error)? {
                 crate::routines::Outcome::Rows(batches) => {
@@ -145,6 +145,15 @@ impl Backend {
             None => self.schema(&sql).await?,
         };
         Ok(Response::Query(rows(&schema, batches, format)?))
+    }
+
+    /// `run`, the notices its procedures send (what they print) sent first: psql shows NOTICE.
+    async fn told<C: Sink<PgWireBackendMessage> + Unpin + Send>(&self, client: &mut C, user: &str, sql: &str, format: &Format) -> PgWireResult<Response> {
+        let (out, heard) = crate::routines::with_notices(self.run(user, sql, format)).await;
+        for n in heard {
+            let _ = client.send(PgWireBackendMessage::NoticeResponse(ErrorInfo::new("NOTICE".into(), "00000".into(), n).into())).await; // (a client gone: the answer fails too)
+        }
+        out
     }
 
     /// `COPY … TO STDOUT`: the rows, one COPY message each.
@@ -565,7 +574,7 @@ impl SimpleQueryHandler for Backend {
         for q in crate::routines::split(query).iter().map(|q| q.trim()) {
             out.push(match Copy::of(q) {
                 Some(Ok(c)) if !c.to => self.copy_in(client, &user, c).await?,
-                _ => self.run(&user, q, &Format::UnifiedText).await?,
+                _ => self.told(client, &user, q, &Format::UnifiedText).await?,
             });
         }
         Ok(out)
@@ -588,7 +597,7 @@ impl ExtendedQueryHandler for Backend {
             return self.copy_in(client, &user, c).await;
         }
         let inferred = self.param_types(&pg_dialect(&self.app.lake, &portal.statement.statement)).await;
-        self.run(&user, &bind(portal, &inferred)?, &portal.result_column_format).await
+        self.told(client, &user, &bind(portal, &inferred)?, &portal.result_column_format).await
     }
 
     async fn do_describe_statement<C>(&self, _client: &mut C, stmt: &StoredStatement<Self::Statement>) -> PgWireResult<DescribeStatementResponse>

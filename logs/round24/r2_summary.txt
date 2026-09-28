@@ -1,0 +1,5 @@
+21:52:11 start functions
+21:53:31 functions exit=0
+21:53:31 start procedures
+21:54:20 procedures exit=0
+21:54:20 R2_DONE

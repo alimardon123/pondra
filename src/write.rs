@@ -225,9 +225,12 @@ pub fn parse(sql: &str) -> Option<Stmt> {
     if let Some(s) = crate::ext::statement(sql) {
         return Some(s); // (CREATE SECRET: values of any kind; DROP SECRET)
     }
+    if let Some(s) = crate::routines::statement(sql) {
+        return Some(s); // (CREATE FUNCTION and PROCEDURE as Postgres writes them, CREATE TASK, DROP TASK, DROP MACRO)
+    }
     let parsed = match Parser::parse_sql(&GenericDialect {}, sql) {
         Ok(mut s) => s.pop()?,
-        Err(_) => return crate::routines::statement(sql), // (CREATE PROCEDURE, DROP MACRO)
+        Err(_) => return None,
     };
     Some(match parsed {
         Statement::CreateTable(c) => Stmt::Create(Box::new(c)),
@@ -628,8 +631,9 @@ pub async fn on_node(app: &crate::server::App, stmt: Stmt, job: Option<String>) 
 
 /// `on_node`; `files`: its SQL may read files on this machine (`FROM 'jan.csv'`: the shell's own
 /// node, `server::owner`).
-pub async fn on_node_as(app: &crate::server::App, stmt: Stmt, job: Option<String>, files: bool) -> Result<Value> {
-    crate::ext::listing(on_node_listed(app, stmt, job, files)).await // (files outside the lake: listed once a statement)
+#[inline(never)] // (its work on the heap, made here: `App::query_as`)
+pub fn on_node_as(app: &crate::server::App, stmt: Stmt, job: Option<String>, files: bool) -> futures::future::BoxFuture<'_, Result<Value>> {
+    Box::pin(crate::ext::listing(on_node_listed(app, stmt, job, files))) // (files outside the lake: listed once a statement)
 }
 
 async fn on_node_listed(app: &crate::server::App, stmt: Stmt, job: Option<String>, files: bool) -> Result<Value> {

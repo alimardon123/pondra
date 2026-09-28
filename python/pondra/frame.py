@@ -407,6 +407,24 @@ class _Then(Expr):
         return _Then(self.cases, expr(value))
 
 
+class _Functions:
+    """`pondra.fn.slug(col("title"))`: a call of one of the lake's functions (`CREATE FUNCTION`,
+    `@db.function`) — or any SQL function — in a frame's expression; `pondra.fn("ops.slug", x)`
+    for one in a schema. Arguments are expressions or values."""
+
+    def __call__(self, name, *args):
+        es = [a if isinstance(a, Expr) else None for a in args]
+        return Expr(f"{name}({', '.join(_sql(a) for a in args)})", next((e.name for e in es if e is not None), name.split(".")[-1]))
+
+    def __getattr__(self, name):
+        if name.startswith("__"):
+            raise AttributeError(name)
+        return lambda *args: self(name, *args)
+
+
+fn = _Functions()
+
+
 def coalesce(*exprs):
     es = [expr(e) for e in exprs]
     return Expr(f"coalesce({', '.join(e.sql for e in es)})", es[0].name)

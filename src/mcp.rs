@@ -151,7 +151,7 @@ async fn list(app: &App) -> Result<Value> {
 
 async fn query(app: &App, sql: &str) -> Result<Value> {
     let sql = &crate::routines::expand(&app.lake, sql).await?; // (macros: ADR-023)
-    ensure!(crate::write::parse(sql).is_none() && crate::routines::call_of(sql).is_none(), "this is a write: use the write tool");
+    ensure!(crate::write::parse(sql).is_none() && !crate::routines::runs_procedure(sql), "this is a write: use the write tool");
     let batches = app.query(sql, None).await?;
     let total: usize = batches.iter().map(RecordBatch::num_rows).sum();
     Ok(json!({"rows": rows(&batches)?, "total_rows": total}))
@@ -159,7 +159,7 @@ async fn query(app: &App, sql: &str) -> Result<Value> {
 
 async fn write(app: &App, role: Role, sql: &str, job: Option<&str>) -> Result<Value> {
     let sql = &crate::routines::expand(&app.lake, sql).await?;
-    if crate::routines::call_of(sql).is_some() {
+    if crate::routines::runs_procedure(sql) {
         return called(app, role, sql, job).await; // (CALL: a procedure may write)
     }
     let stmt = crate::write::parse(sql).ok_or_else(|| anyhow!("not a write (INSERT, UPDATE, DELETE, CREATE, DROP or CALL): use the query tool"))?;
@@ -167,13 +167,20 @@ async fn write(app: &App, role: Role, sql: &str, job: Option<&str>) -> Result<Va
     crate::write::on_node(app, stmt, job.map(String::from)).await
 }
 
-/// A procedure's answer, as a tool's.
+/// A procedure's answer, as a tool's: its rows or outcome, and what it printed (`notices`).
 async fn called(app: &App, role: Role, sql: &str, job: Option<&str>) -> Result<Value> {
     let who = crate::routines::Who { role, files: false, depth: 0 };
-    Ok(match crate::routines::one(app, sql, who, job.map(String::from)).await? {
-        crate::routines::Outcome::Rows(batches) => json!({"rows": rows(&batches)?}),
-        crate::routines::Outcome::Done(v) => v,
-    })
+    let (out, heard) = crate::routines::with_notices(crate::routines::one(app, sql, who, job.map(String::from))).await;
+    let mut v = match out {
+        Ok(crate::routines::Outcome::Rows(batches)) => json!({"rows": rows(&batches)?}),
+        Ok(crate::routines::Outcome::Done(v)) => v,
+        Err(e) if !heard.is_empty() => return Err(e.context(format!("it printed:\n{}", heard.join("\n")))),
+        Err(e) => return Err(e),
+    };
+    if !heard.is_empty() {
+        v["notices"] = json!(heard);
+    }
+    Ok(v)
 }
 
 /// Rows committed after `after`, in steps of doubling size until about `ROWS` are in hand.

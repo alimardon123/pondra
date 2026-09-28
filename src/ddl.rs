@@ -140,6 +140,9 @@ pub enum Ddl {
     CreateSecret { name: String, params: std::collections::BTreeMap<String, String>, replace: bool, if_not_exists: bool }, // (ADR-026: `ext.rs`)
     AttachOutside { name: String, url: String, kind: String, options: std::collections::BTreeMap<String, String> }, // another engine's tables (`ext.rs`)
     DropSecret { name: String, if_exists: bool },
+    CreateTask { name: String, task: crate::runs::Task, replace: bool }, // CREATE TASK … SCHEDULE … AS … (ADR-027: `runs.rs`)
+    DropTask { name: String, if_exists: bool },
+    RunLog, // the run log's table (`pondra.runs`), made when a node first has a line for it
 }
 
 /// What `ALTER TABLE` does to a column: rename it, drop it, or widen its type (a SQL type).
@@ -251,6 +254,9 @@ pub async fn apply(lake: &Lake, d: Ddl) -> Result<Value> {
         Ddl::DropRoutine { name, if_exists } => crate::routines::drop(lake, &name, if_exists).await,
         Ddl::CreateSecret { name, params, replace, if_not_exists } => crate::ext::create(lake, &name, params, replace, if_not_exists).await,
         Ddl::DropSecret { name, if_exists } => crate::ext::drop(lake, &name, if_exists).await,
+        Ddl::CreateTask { name, task, replace } => crate::runs::create_task(lake, &name, task, replace).await,
+        Ddl::DropTask { name, if_exists } => crate::runs::drop_task(lake, &name, if_exists).await,
+        Ddl::RunLog => crate::runs::create_log(lake).await,
         Ddl::AttachOutside { name, url, kind, options } => {
             ensure!(!has_schema(lake, &name).await?, "a schema here is called {name}: attach under another name");
             ensure!(lake.cat.get::<Attachment>(&attachment_key(&name)).await?.is_none(), "{name} is an attached lake: attach under another name");

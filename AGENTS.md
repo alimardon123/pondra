@@ -1,7 +1,7 @@
 # AGENTS.md — working on Pondra
 
 Read this first, then `README.md` (what it does), `docs/adr-005-every-node-writes.md` (why it
-works this way) and `docs/adr-026-read-and-write-anything.md` (the latest round).
+works this way) and `docs/adr-027-sql-and-python-as-one.md` (the latest round).
 `docs/prototype-status.md` has the measured numbers and what's left.
 
 ## What this is
@@ -18,7 +18,7 @@ The owner's design principles, which every change must respect:
 2. **As serverless as possible**: no always-on services besides the nodes themselves.
 3. **SPMD, not driver/executor** (Bodo-style): every node runs the same code on its slice.
 4. **No JVM, no Spark, no Flink, no Fluss needed.**
-5. **Short, simple, readable code** — without losing functionality. ~22,000 lines of Rust total (the Kafka protocol is 1,300 of them; other engines' formats, Kafka's client side and files anywhere, round 23, 4,650).
+5. **Short, simple, readable code** — without losing functionality. ~23,800 lines of Rust total (the Kafka protocol is 1,300 of them; other engines' formats, Kafka's client side and files anywhere, round 23, 4,650; Python functions, procedures on workers, the run log and tasks, round 24, 1,400).
    If a change makes a file much longer, look for the simpler shape first.
 6. **Scale-out is the point** (the owner, 2026-09-27): running across machines is what sets
    Pondra apart from single-node engines (DuckDB, Polars, Daft, Bodo) and makes it leaner than
@@ -29,11 +29,12 @@ The owner's design principles, which every change must respect:
 ## Layout
 
 ```
-src/      22,000 lines of Rust, one file per concern (see the table in README.md)
+src/      23,800 lines of Rust, one file per concern (see the table in README.md)
 python/   the Python client (pure Python, HTTP + Arrow; `local()` starts a node): `client.py`, frames
-          (`frame.py`, Polars' names), `spark/` (PySpark's names), `procedure.py` (runs a Python
-          procedure for a node), `magic.py` (`%%sql`), `__main__.py` (`python -m pondra`, and
-          `--add-to-path`); without pyarrow, rows come as JSON (ADR-024)
+          (`frame.py`, Polars' names), `spark/` (PySpark's names), `worker.py` (a node's warm
+          Python worker: functions' batches and procedures' calls, ADR-027), `plpy.py` (PL/Python's
+          `plpy`), `magic.py` (`%%sql`), `__main__.py` (`python -m pondra`, and `--add-to-path`);
+          without pyarrow, rows come as JSON (ADR-024)
 install.sh, install.ps1   the one-line installers each release carries (ADR-024)
 js/       the JavaScript client and the `pondra` npm package's files
 examples/ quickstart.ipynb (pip install to an as-of join, in the owner's notebook style)
@@ -244,13 +245,24 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
   frame goes into the query's `WITH`, pandas / Polars / Arrow data travel with the request as its
   own tables: `query::SENT`); a write that names a frame sends it as a view of the request
   (`routines::Expander` puts its query in place). A frame's sort is put in every step that keeps it.
-- **Macros, procedures, scripts** (round 22, `routines.rs`, catalog `r/`): macros are replaced by
-  their bodies in the syntax tree where SQL comes in (`routines::expand`: the doors, a
-  materialized view when made, stored views as read). `CALL` runs a procedure's statements as
-  its caller (`routines::one`), arguments worked out once; a Python one runs in `python -m
-  pondra.procedure` beside a node started with `--python`, with a token lent the caller's rights
-  (`auth::lend`). `POST /sql` takes several statements (`routines::statements`) and `$name`
-  parameters (`routines::bind`); MCP lists every procedure as a tool.
+- **Functions, procedures, scripts, tasks** (rounds 22 and 24, ADR-023 and ADR-027,
+  `routines.rs`, catalog `r/`). `CREATE FUNCTION` / `CREATE PROCEDURE` in Postgres's forms,
+  `LANGUAGE sql | python`; DuckDB's `CREATE MACRO` is a SQL function too.
+  - **SQL functions** are replaced by their bodies in the syntax tree where SQL comes in
+    (`routines::expand`: the doors, a materialized view when made, stored views as read), the
+    arguments cast to the parameters' types.
+  - **Python functions** are DataFusion async functions (`pyfn.rs`) whose batches go to the
+    node's warm workers (`python.rs`: `python -m pondra.worker` under `--python`, framed Arrow
+    over its standard input and output).
+  - **`CALL`** runs a procedure as its caller (`routines::one`), arguments worked out once. A
+    Python one runs on a worker with a connection back, lent the caller's rights
+    (`auth::lend`); what it prints goes back as notices (`routines::with_notices`), and its
+    secrets are blanked out of what it says.
+  - **Every call** is a row of `pondra.runs` (`runs.rs`: the hidden keyed table `pondra$runs`).
+    `SELECT pondra.start(…)` runs one without waiting. Tasks (`CREATE TASK … SCHEDULE`, catalog
+    `j/`, ticks `jt/`) run on the leader, each tick once.
+  - **`POST /sql`** takes several statements (`routines::statements`) and `$name` parameters
+    (`routines::bind`); MCP lists every procedure as a tool.
 - **Files and other engines' tables, anywhere** (round 23, ADR-026). A file, folder or glob
   (`'s3://b/*.parquet'`, `read_csv(…)`), another engine's table (`delta_scan`, `iceberg_scan`), a
   topic (`'kafka://brokers/topic'`) or a name under a catalog attached with `ATTACH … (TYPE delta
@@ -727,6 +739,57 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    `count(k)` counted the NULL folder's rows. `harness.py outside`: "Hive-style folders… (NULL's
    folder too)" fails without it. (Without statistics the join order went wrong: TPC-H over files
    took 20% longer.)
+107. **Python never runs inside a node** (ADR-027, `python.rs`). Functions and procedures run on
+   workers, `python -m pondra.worker`, beside the node. A worker that dies, runs past its time or
+   grows past `PONDRA_WORKER_MB` is stopped and replaced; only its request fails, with why.
+   `harness.py functions`: "a worker killed mid-query…" and "a batch past its time limit…" fail
+   with the Python inside, or with a worker left serving after its time.
+108. **A worker costs nothing when unused** (principle 6). Workers start when first asked for,
+   and stop after `PONDRA_WORKER_IDLE_SECS` idle (60); the reaper ends when none is left.
+   `harness.py functions`: "idle workers are gone…" (`/stats` `python_workers`).
+109. **A procedure called by a procedure takes no slot** (`python::Use::Procedure { nested }`): it
+   would wait for its caller's slot, which waits for it. Functions' batches have slots of their
+   own, so a procedure's query using a Python function never waits for a procedure's.
+   `harness.py functions`: "procedures calling procedures take no slot…" hangs without it
+   (`PONDRA_PROCEDURES=2`).
+110. **A function has no connection to the lake.** A query may run it over millions of rows on
+   every node, and a lent token belongs to a procedure's caller. `pondra.sql` in a function is
+   refused (`client._inside`), and a worker forgets the connection after each call
+   (`_current`, `_last`). `harness.py functions`: "a function has no connection…".
+111. **A secret goes only to a procedure's own code, and never out of it.** `GET /secrets/{name}`
+   answers only a lent token. What it hands out is replaced by `***` in that procedure's notices,
+   its error and the run log (`Lease::redact`), and so is the token. `harness.py functions`: "a
+   secret read by a procedure never shows…" fails without either.
+112. **A task's tick is committed before it runs, and marked done after its line is in the run
+   log** (`runs::due`, `jt/`; `Run::end` answers when written). A leader that finds a tick claimed
+   and not done runs it again, with the same job (`task:{name}:{tick}`) and run id, so its writes
+   land once and the log has it. `harness.py functions`: "a task through a leader failover: each
+   tick's writes once" (ticks == distinct jobs: a leader killed between a tick's end and its
+   line's write left one uncounted before the wait).
+113. **A query calling a volatile Python function is never answered from the result cache**
+   (`routines::volatile`; a Python function is volatile unless IMMUTABLE or STABLE). A query
+   reading a Python table function runs on one node (`routines::pinned`): each node would call
+   it. `harness.py functions`: "a volatile Python function isn't answered from the result
+   cache…" and "…a Python table function runs on one node" fail without them.
+114. **An async function works wherever SQL's own do** (`optimize::AsyncBelow`): in a GROUP BY,
+   an ORDER BY, a window or a COUNT(DISTINCT), a projection below computes it. A spread plan
+   lets `AsyncFuncExec` (`async_func`) split, so each node runs its own rows. `harness.py
+   functions`: "a Python function anywhere a SQL one goes…" and "…each node runs its rows
+   through its own workers" fail without them.
+115. **Procedures calling procedures don't grow the stack by a query each** (`App::query_as` and
+   `write::on_node_as` make their futures on the heap, `#[inline(never)]`). A query's future is
+   over 100 KB, and 16 nested SQL procedures overflowed a worker thread. `harness.py procedures`:
+   "procedures calling procedures stop 16 deep" killed the node without it.
+116. **What a procedure prints reaches its caller through every door**: the `x-pondra-notices`
+   header (and the Python and JavaScript clients, the shell, `pondra run`), a Postgres NOTICE,
+   and MCP's `notices`. `harness.py functions`: HTTP, Postgres, MCP, JavaScript and the shell,
+   each "sent to …".
+
+117. **A deterministic function's work is its distinct arguments** (`pyfn::distinct`): an
+   IMMUTABLE or STABLE Python function called per row gets each distinct argument tuple of a
+   batch once, and its answers are spread back to the rows; a volatile one, or a vectorized one
+   (it may look across rows), gets every row. `harness.py functions`: "an IMMUTABLE function gets
+   each distinct argument once a batch…" takes 1,000 s without it (past the batch's time limit).
 
 ## Tests: run these before and after any change
 
@@ -760,6 +823,7 @@ python3 tools/harness.py columns               # RENAME/DROP COLUMN, a name adde
 python3 tools/harness.py fills                 # views filled from existing rows while rows stream in, made again, through a leader restart
 python3 tools/harness.py dedup                 # a keyed table deduplicated by event time (order_by) vs a model; SELECT * without _deleted
 python3 tools/harness.py procedures            # macros, SQL and Python procedures, scripts, parameters, sent rows: rights, depth, 3 nodes, Postgres, MCP, pondra run
+python3 tools/harness.py functions             # CREATE FUNCTION (SQL, Python), workers, spread, notices at every door, mail (aiosmtpd), secrets, run log, tasks through failover, speed
 python3 tools/harness.py outside               # files on S3 and HTTP (moto): globs, CSV, JSON, Hive folders, spread, COPY … TO (spread too), secrets, who may read
 python3 tools/harness.py clouds                # GCS (sim_gcs.py) and Azure (Azurite) lakes and files: failover, COPY, a file changed beside a lake
 python3 tools/harness.py kafkas                # Apache Kafka 4 (~/kafka_2.13-*) and a Pondra node's port: topics as tables, COPY to a topic, feeds through kills, SASL
@@ -768,7 +832,7 @@ python3 tools/bench/files_tpch.py --data ~/tpch/sf1-bench        # TPC-H from fi
 python3 tools/files_s3_check.py                # files in a real bucket (R2): a glob, the cache by version, a file changed, COPY there
 python3 tools/slt_check.py --slt <datafusion>/datafusion/sqllogictest/test_files [--nodes 3]   # DataFusion's sqllogictest: pass rate, failures grouped (D1)
 python3 tools/frames_check.py                  # pondra.frame == Polars (26 pipelines); one question asked 10 ways; a sort kept through steps
-~/venv-spark/bin/python tools/spark_check.py   # pondra.spark == PySpark 4.0.1 (51 pipelines, files among them: values and column names)
+~/venv-spark/bin/python tools/spark_check.py   # pondra.spark == PySpark 4.0.1 (55 pipelines, files and UDFs among them: values and column names)
 python3 tools/bench/tpch_frames.py --data ~/tpch/sf1-bench   # TPC-H: SQL == frames == PySpark code, 22 of 22
 python3 tools/bench/nexmark.py [--bids 4000000] # Nexmark q1, q2, q5, q7, q11: Pondra (== DuckDB) and Flink 2.3 (venv-flink)
 python3 tools/smoke.py target/release/pondra   # what CI runs on Windows, macOS and Linux (stdlib only)
@@ -840,13 +904,13 @@ Practical notes for an agent working here:
 - Node stderr goes to `/tmp/pondra-<port>-<id>.stderr`; that's where "restarting to rejoin",
   "slow tiering" and panics show up.
 
-## State of the work (2026-09-28, round 23)
+## State of the work (2026-09-28, round 24)
 
 Everything in `docs/prototype-status.md` passes on local disk and on simulated R2. The round-11
 additions (manifests, partitions, shuffles, memory limits, Arrow Flight) also ran against real
 R2; round 12's are in `logs/round12/`, round 13's in `logs/round13/`, round 14's in
 `logs/round14/`, round 15's in `logs/round15/`, round 16's in `logs/round16/`, round 17's in `logs/round17/`,
-round 18's in `logs/round18/`, round 19's in `logs/round19/`, round 20's in `logs/round20/`, round 21's in `logs/round21/`, round 22's in `logs/round22/` and round 23's in `logs/round23/`.
+round 18's in `logs/round18/`, round 19's in `logs/round19/`, round 20's in `logs/round20/`, round 21's in `logs/round21/`, round 22's in `logs/round22/`, round 23's in `logs/round23/` and round 24's in `logs/round24/`.
 
 **Round 23 (ADR-026) read and wrote everything else:** files on S3, GCS, Azure, HTTPS and the
 owner's machine as tables (listed each statement, cached only by version, spread, their footers'
@@ -856,6 +920,39 @@ feeds; `CREATE SECRET`; lakes on GCS and Azure. TPC-H SF1 from files runs as fas
 lake's own tables (`logs/round23/files-tpch-sf1.txt`). D1 began: DataFusion's own sqllogictest
 files through Pondra (`tools/slt_check.py`, `logs/round23/slt-*.json`), which found `INSERT INTO t
 (columns)` missing and `CREATE TABLE t (a INT) AS VALUES` ignoring its names (both fixed).
+
+**Round 24 (ADR-027) made SQL and Python one.**
+
+- **Functions.** `CREATE FUNCTION` takes Postgres's forms, in SQL (expanded in place) or Python:
+  per row, vectorized, or a table. Python functions run on warm workers beside each node, spread
+  with their queries, and work in GROUP BY, ORDER BY and windows.
+- **Procedures** do anything Python can: mail, HTTP, files. They run as their caller, print
+  notices back through every door, read `CREATE SECRET`s that never show, and are logged in
+  `pondra.runs`.
+- **Tasks** run a statement on a schedule (`CREATE TASK … SCHEDULE`), each tick once through a
+  failover.
+- **The clients.** `@db.function` and `@db.procedure` take a notebook's function as it is: its
+  imports, helpers and constants go along. `pondra.sql` is the current connection. PySpark's
+  `udf`, `pandas_udf` and `udf.register` work.
+- **Speed.** A warm `CALL` takes 2.4 ms (0.15 s before). A Python function runs at 15M rows/s
+  vectorized and 6.6M rows/s per row, on this 2-vCPU sandbox.
+- **What the building found:**
+  - DataFusion can't run an async function in a GROUP BY, an ORDER BY or a window (a rule now
+    moves it below);
+  - spread plans refused `AsyncFuncExec`;
+  - nested SQL procedures overflowed the stack (a query's future is 120 KB; now on the heap).
+- **CI.** Round 23's build run failed after 53 minutes (`logs/round24/ci-round23.txt`):
+  - the suite's S3 simulator needs `moto[server]`, which the sandbox had and CI didn't;
+  - Apache Kafka from archive.apache.org took most of half an hour (now dlcdn, and cached);
+  - rust-cache saved nothing after a failing job, so the Linux job compiled all 394 crates
+    (now `cache-on-failure`).
+
+  The pondra crate itself takes about 9 minutes in the dist profile on every push.
+- **The owner's decisions for round 25** (`roadmap.md`):
+  - E9: Pondra's own `read_*` / `write_*` names everywhere, the tools' names as fallbacks;
+  - G8: other engines write Pondra's tables through its own Iceberg REST catalog (not Polaris
+    or Unity: JVM services, and the catalog must stay Pondra's);
+  - E10: function results cached with a lifetime.
 
 **R2 test buckets.** There are two:
 

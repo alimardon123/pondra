@@ -15,6 +15,7 @@
   harness.py fills               materialized views filled from the rows already there, every row once
   harness.py dedup               a keyed table deduplicated by event time (order_by) vs a model
   harness.py procedures          macros, procedures (SQL, Python), scripts, parameters: rights, depth, three nodes
+  harness.py functions           functions and procedures in SQL and Python: workers, notices, mail, secrets, run log, tasks, speed
   harness.py load    --secs 30   throughput, ack latency, freshness, catalog commit latency
   harness.py all                 quick run of everything
 """
@@ -212,10 +213,14 @@ def outside():
         with socket.socket() as s:
             if s.connect_ex(("127.0.0.1", port)) == 0:
                 raise RuntimeError(f"port {port} is already in use")
-    sim = subprocess.Popen([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "sim_r2.py"), "--port", str(s3p), "--zero"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    said = tempfile.TemporaryFile()  # (its errors, if it stops: a pipe nobody reads would fill and stop it)
+    sim = subprocess.Popen([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "sim_r2.py"), "--port", str(s3p), "--zero"], stdout=subprocess.DEVNULL, stderr=said)
     atexit.register(sim.kill)
     s3 = boto3.client("s3", endpoint_url=f"http://127.0.0.1:{s3p}", region_name="us-east-1", aws_access_key_id="k", aws_secret_access_key="s")
-    for _ in range(100):
+    for _ in range(600):  # (a first import of moto on a fresh machine takes a while)
+        if sim.poll() is not None:
+            said.seek(0)
+            raise RuntimeError(f"the S3 simulator (sim_r2.py) stopped: {said.read().decode(errors='replace')[-2000:]} (pip install -r tools/requirements.txt: moto[server])")
         try:
             s3.create_bucket(Bucket="ext")
             break
@@ -2864,9 +2869,320 @@ $$""")
     return f"macros, procedures (SQL and Python) and scripts on three nodes: all {len(checks)} checks pass"
 
 
+def functions():
+    """Functions and procedures in SQL and Python (ADR-027), on three nodes with tokens and
+    `--python`: Postgres's CREATE FUNCTION forms; Python functions per row, vectorized and as tables,
+    spread (one node == three, each node's rows through its own workers), a worker killed mid-query,
+    the time limit, no connection from a function, volatile ones not remembered, table functions on
+    one node; procedures that send mail through a local SMTP server from HTTP, Postgres (NOTICE),
+    MCP, JavaScript and the shell, answer nothing / rows / a frame, write once with a job, read a
+    secret that never shows; the run log, `pondra.start`, nested calls with few slots, idle workers
+    gone; a notebook's decorated functions; a task ticking through a leader failover; speed."""
+    import psycopg, statistics
+    from aiosmtpd.controller import Controller
+    from aiosmtpd.smtp import AuthResult
+    lake = new_lake()
+    here = os.path.dirname(os.path.abspath(__file__))
+    py = os.path.join(here, "..", "python")
+    env = {"PYTHONPATH": py, "PONDRA_WORKER_IDLE_SECS": "4", "PONDRA_PROCEDURES": "2", "PONDRA_SECRET_KEY": "harness-key-24"}
+    toks = dict(read_token="r-tok", write_token="w-tok", admin_token="a-tok")
+    nodes = [Node(lake, A.port + i, env=env, python=sys.executable, pg=f"127.0.0.1:{A.port + 10 + i}", **toks).start() for i in range(3)]
+    time.sleep(1)
+    def q(s, port=A.port, token="a-tok", path="/sql", headers=None, timeout=120):
+        return call(port, "POST", path, s.encode() if isinstance(s, str) else s, headers={"authorization": f"Bearer {token}", **(headers or {})}, timeout=timeout)
+    def told(s, port=A.port, token="a-tok", path="/sql"):
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=120)
+        c.request("POST", path, s.encode(), {"authorization": f"Bearer {token}"})
+        r = c.getresponse()
+        body = r.read()
+        return r.status, json.loads(r.getheader("x-pondra-notices") or "[]"), json.loads(body) if body[:1] in (b"{", b"[") else body
+    def err(s, **kw):
+        try:
+            q(s, **kw)
+            return ""
+        except Exception as e:
+            return str(e)
+    checks = {}
+    q("CREATE TABLE orders (id BIGINT, user VARCHAR, qty BIGINT, price DOUBLE)")
+    q("INSERT INTO orders SELECT value, 'u' || (value % 50), value % 7, (value % 1000) * 0.25 FROM generate_series(1, 300000)")
+    # SQL functions: Postgres's forms, Postgres's answers
+    q("CREATE FUNCTION add(integer, integer) RETURNS integer AS 'select $1 + $2;' LANGUAGE SQL IMMUTABLE")
+    q("CREATE FUNCTION half(x INT) RETURNS INT STRICT RETURN x / 2")
+    q("CREATE FUNCTION net(x DOUBLE PRECISION, rate DOUBLE PRECISION DEFAULT 0.2) RETURNS DOUBLE PRECISION RETURN x * (1 - rate)", port=A.port + 1)
+    q("CREATE FUNCTION big(n BIGINT) RETURNS TABLE (id BIGINT, qty INT) LANGUAGE sql AS $$ SELECT id, qty FROM orders WHERE qty >= n $$")
+    q("CREATE FUNCTION ids(n INT) RETURNS SETOF BIGINT LANGUAGE sql AS $$ SELECT id FROM orders WHERE id <= n ORDER BY id $$")
+    q("CREATE FUNCTION top_qty() RETURNS BIGINT LANGUAGE sql STABLE AS $$ SELECT max(qty) FROM orders $$")
+    checks["SQL functions: $1, STRICT, typed, defaults and named arguments, a query's value"] = \
+        q("SELECT add(1, 2) AS a, half(7) AS h, half(NULL) IS NULL AS n, net(10) AS x, net(10, rate => 0.5) AS y, top_qty() AS t") == [{"a": 3, "h": 3, "n": True, "x": 8.0, "y": 5.0, "t": 6}]
+    checks["RETURNS TABLE and SETOF: rows as declared, on three nodes == one == written out"] = \
+        q("SELECT count(*) AS n, min(qty) AS m FROM big(5)", path="/sql?spread=1") == q("SELECT count(*) AS n, min(qty) AS m FROM big(5)", path="/sql?spread=0") == q("SELECT count(*) AS n, min(qty) AS m FROM orders WHERE qty >= 5") \
+        and q("SELECT * FROM ids(3)") == [{"ids": 1}, {"ids": 2}, {"ids": 3}]
+    checks["CREATE FUNCTION errors say what is wrong"] = "LANGUAGE sql or python" in err("CREATE FUNCTION f(x INT) RETURNS INT LANGUAGE plperl AS $$ 1 $$") \
+        and "says what it returns" in err("CREATE FUNCTION f(x INT) LANGUAGE python AS $$ return x $$") and "SQL's own" in err("CREATE FUNCTION abs(x INT) RETURNS INT RETURN x") \
+        and "no parameter $2" in err("CREATE FUNCTION f(DOUBLE) RETURNS DOUBLE RETURN $1 + $2")
+    # Python functions
+    q("""CREATE FUNCTION slug(title VARCHAR) RETURNS VARCHAR LANGUAGE python AS $$
+    import re
+    return re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-") if title is not None else "none"
+$$""")
+    q("CREATE FUNCTION slug_strict(title VARCHAR) RETURNS VARCHAR LANGUAGE python STRICT AS $$ return title.upper() $$")
+    q("""CREATE FUNCTION twice(x BIGINT) RETURNS BIGINT LANGUAGE python WITH (vectorized = true) AS $$
+    import pyarrow.compute as pc
+    return pc.multiply(x, 2)
+$$""")
+    q("CREATE FUNCTION rates(cur VARCHAR, n INT DEFAULT 2) RETURNS TABLE (code VARCHAR, rate DOUBLE) LANGUAGE python AS $$ return [(f'{cur}{i}', i * 1.5) for i in range(n)] $$")
+    checks["Python functions: per row, NULLs, STRICT, vectorized, a table"] = \
+        q("SELECT slug('Hello, World!') AS a, slug(NULL) AS b, slug_strict(NULL) IS NULL AS c, slug_strict('x') AS d, twice(21) AS e") == [{"a": "hello-world", "b": "none", "c": True, "d": "X", "e": 42}] \
+        and q("SELECT * FROM rates('USD') ORDER BY code") == [{"code": "USD0", "rate": 0.0}, {"code": "USD1", "rate": 1.5}] and len(q("SELECT * FROM rates('EUR', n => 5)")) == 5
+    checks["SHOW USER FUNCTIONS: the lake's own, SQL and Python"] = [r["name"] for r in q("SHOW USER FUNCTIONS LIKE 's%'")] == ["slug", "slug_strict"] \
+        and {r["name"]: r["kind"] for r in q("SHOW USER FUNCTIONS")}.get("big") == "table function"
+    q("CREATE FUNCTION m7(x BIGINT) RETURNS BIGINT LANGUAGE python AS $$ return x % 7 $$")
+    placed = "SELECT m7(id) AS k, count(*) AS n, count(DISTINCT m7(id + 1)) AS d, max(sum(qty)) OVER (ORDER BY m7(id)) AS w FROM orders GROUP BY m7(id) ORDER BY m7(id) DESC"
+    written = placed.replace("m7(id)", "(id % 7)").replace("m7(id + 1)", "((id + 1) % 7)")
+    checks["a Python function anywhere a SQL one goes: GROUP BY, ORDER BY, COUNT(DISTINCT), a window"] = q(placed, path="/sql?spread=0") == q(written, path="/sql?spread=0")
+    q("CREATE FUNCTION slow_label(q BIGINT) RETURNS VARCHAR LANGUAGE python IMMUTABLE AS $$ import time; time.sleep(0.02); return f'q{q}' $$")
+    q("CREATE FUNCTION noise(q BIGINT) RETURNS DOUBLE LANGUAGE python AS $$ import random; return q + random.random() $$")
+    t0 = time.time()
+    labelled = q("SELECT slow_label(qty) AS l, count(*) AS n FROM orders WHERE id <= 50000 GROUP BY 1 ORDER BY 1", path="/sql?spread=0")
+    took = time.time() - t0
+    checks[f"an IMMUTABLE function gets each distinct argument once a batch ({took:.1f} s for 50,000 rows at 20 ms a call); a volatile one every row"] = took < 30 \
+        and labelled == q("SELECT 'q' || qty AS l, count(*) AS n FROM orders WHERE id <= 50000 GROUP BY 1 ORDER BY 1") \
+        and q("SELECT count(DISTINCT noise(qty)) AS n FROM orders WHERE id <= 5000", path="/sql?spread=0") == [{"n": 5000}]
+    q("CREATE FUNCTION score(qty BIGINT, price DOUBLE) RETURNS BIGINT LANGUAGE python AS $$ return qty * 10 + int(price) $$")
+    q("CREATE FUNCTION whose(x BIGINT) RETURNS BIGINT LANGUAGE python AS $$ import os; return os.getppid() $$")
+    spread = "SELECT user, sum(score(qty, price)) AS s, sum(twice(id)) AS t FROM orders GROUP BY user ORDER BY user"
+    checks["a spread query: three nodes == one node"] = q(spread, path="/sql?spread=1") == q(spread, path="/sql?spread=0")
+    checks["…each node runs its rows through its own workers"] = q("SELECT count(DISTINCT whose(id)) AS n FROM orders", path="/sql?spread=1") == [{"n": 3}]
+    q("CREATE FUNCTION where_() RETURNS TABLE (pid BIGINT) LANGUAGE python AS $$ import os; return [(os.getppid(),)] $$")
+    checks["a query reading a Python table function runs on one node"] = q("SELECT DISTINCT w.pid FROM orders o CROSS JOIN where_() w", path="/sql?spread=1") == [{"pid": nodes[0].p.pid}]
+    q("CREATE FUNCTION clock() RETURNS DOUBLE LANGUAGE python AS $$ import time; return time.time() $$")
+    q("CREATE FUNCTION clock_fixed() RETURNS DOUBLE LANGUAGE python IMMUTABLE AS $$ import time; return time.time() $$")
+    a, b = q("SELECT clock() AS t"), (time.sleep(0.01), q("SELECT clock() AS t"))[1]
+    c, d = q("SELECT clock_fixed() AS t"), (time.sleep(0.01), q("SELECT clock_fixed() AS t"))[1]
+    checks["a volatile Python function isn't answered from the result cache (an IMMUTABLE one is)"] = a != b and c == d
+    q("CREATE FUNCTION peek(x BIGINT) RETURNS BIGINT LANGUAGE python AS $$ return pondra.sql('SELECT 1 AS v').item() $$")
+    checks["a function has no connection to the lake"] = "has no connection" in err("SELECT peek(1) AS v")
+    q("CREATE FUNCTION nap(x BIGINT) RETURNS BIGINT LANGUAGE python WITH (timeout = 1, vectorized = true) AS $$ import time; time.sleep(30); return x $$")
+    t0 = time.time()
+    e = err("SELECT sum(nap(id)) AS s FROM orders WHERE id < 10", path="/sql?spread=0")
+    checks["a batch past its time limit stops its worker, and fails with why"] = "longer than 1 s" in e and time.time() - t0 < 10 and q("SELECT slug('A b') AS s") == [{"s": "a-b"}]
+    q("CREATE FUNCTION stuck(x BIGINT) RETURNS BIGINT LANGUAGE python WITH (vectorized = true) AS $$ import time; time.sleep(60); return x $$")
+    out = {}
+    worker = threading.Thread(target=lambda: out.update(e=err("SELECT sum(stuck(id)) AS s FROM orders WHERE id < 10", path="/sql?spread=0")))
+    worker.start()
+    time.sleep(2)
+    for pid in _workers(nodes[0].p.pid):
+        os.kill(pid, signal.SIGKILL)
+    worker.join(60)
+    checks["a worker killed mid-query: that query fails with why, the node and the next query go on"] = "worker ended" in out.get("e", "") and nodes[0].alive() and q("SELECT slug('C d') AS s") == [{"s": "c-d"}]
+    # procedures: mail through a local SMTP server, from every door
+    class Box:
+        mail = []
+        async def handle_DATA(self, server, session, envelope):
+            self.mail.append((envelope.mail_from, list(envelope.rcpt_tos), envelope.content.decode()))
+            return "250 OK"
+    box = Box()
+    def login(server, session, envelope, mechanism, data):
+        return AuthResult(success=data.login == b"bot@example.com" and data.password == b"pw-7f3a9c")
+    smtp = Controller(box, hostname="127.0.0.1", port=A.port + 40, authenticator=login, auth_require_tls=False)
+    smtp.start()
+    q(f"CREATE SECRET smtp (TYPE generic, host '127.0.0.1', port '{A.port + 40}', user 'bot@example.com', password 'pw-7f3a9c')")
+    q("""CREATE PROCEDURE send_report(day DATE, recipients VARCHAR[]) LANGUAGE python AS $$
+    import smtplib
+    from email.message import EmailMessage
+    top = pondra.sql("SELECT user, sum(qty) AS sold FROM orders WHERE id <= $n GROUP BY user ORDER BY sold DESC, user LIMIT 3", n=1000).to_pandas()
+    s = pondra.secret("smtp")
+    msg = EmailMessage()
+    msg["Subject"], msg["From"], msg["To"] = f"Top items {day}", s["user"], ", ".join(recipients)
+    msg.set_content(top.to_string(index=False))
+    with smtplib.SMTP(s["host"], int(s["port"])) as smtp:
+        smtp.login(s["user"], s["password"])
+        smtp.send_message(msg)
+    print(f"sent to {len(recipients)}")
+$$""")
+    status, heard, out = told("CALL send_report(DATE '2026-09-27', ['ann@example.com', 'bo@example.com'])", port=A.port + 2, token="r-tok")
+    top = q("SELECT user, sum(qty) AS sold FROM orders WHERE id <= 1000 GROUP BY user ORDER BY sold DESC, user LIMIT 3")
+    sent = box.mail[-1] if box.mail else ("", [], "")
+    checks["HTTP: a reader's CALL sends the mail (a secret's credentials); what it printed comes back"] = status == 200 and heard == ["sent to 2"] and out == {"called": "send_report"} \
+        and sent[1] == ["ann@example.com", "bo@example.com"] and "Top items 2026-09-27" in sent[2] and top[0]["user"] in sent[2]
+    said = []
+    with psycopg.connect(f"host=127.0.0.1 port={A.port + 11} user=reader password=r-tok dbname=lake", autocommit=True) as c:
+        c.add_notice_handler(lambda d: said.append(d.message_primary))
+        c.execute("CALL send_report(DATE '2026-09-28', ['pg@example.com'])")
+    checks["Postgres: the same CALL, its print a NOTICE"] = said == ["sent to 1"] and box.mail[-1][1] == ["pg@example.com"]
+    mcp = call(A.port, "POST", "/mcp", json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "send_report", "arguments": {"day": "2026-09-29", "recipients": ["mcp@example.com"]}}}).encode(),
+               headers={"authorization": "Bearer r-tok", "content-type": "application/json"})
+    checks["MCP: the procedure is a tool; its notices come with the answer"] = json.loads(mcp["result"]["content"][0]["text"]).get("notices") == ["sent to 1"] and box.mail[-1][1] == ["mcp@example.com"]
+    js = os.path.join(tempfile.mkdtemp(prefix="pondra-js-"), "call.mjs")
+    open(js, "w").write(f"""import {{ connect }} from {json.dumps(os.path.join(here, "..", "js", "index.js"))};
+const db = connect("http://127.0.0.1:{A.port + 1}", {{ token: "r-tok", onNotice: null }});
+const out = await db.call("send_report", "2026-09-30", ["js@example.com"]);
+console.log(JSON.stringify({{ out, notices: db.notices }}));""")
+    ran = subprocess.run(["node", js], capture_output=True, text=True, timeout=120)
+    checks["JavaScript: db.call, and db.notices"] = ran.returncode == 0 and json.loads(ran.stdout) == {"out": {"called": "send_report"}, "notices": ["sent to 1"]} and box.mail[-1][1] == ["js@example.com"]
+    # answers, exactly once, secrets
+    q("CREATE TABLE log (tag VARCHAR)")
+    q("CREATE PROCEDURE quiet() LANGUAGE python AS $$ x = 1 $$")
+    q("CREATE PROCEDURE rows_() LANGUAGE python AS $$ return [{'a': 1}, {'a': 2}] $$")
+    q("CREATE PROCEDURE frame_() LANGUAGE python AS $$ return pondra.table('orders').filter(pondra.col('id') <= 3).select('id').sort('id') $$")
+    checks["a procedure answers nothing, rows, or a frame (run on the node)"] = q("CALL quiet()") == {"called": "quiet"} and q("CALL rows_()") == [{"a": 1}, {"a": 2}] and q("CALL frame_()") == [{"id": 1}, {"id": 2}, {"id": 3}]
+    q("""CREATE PROCEDURE add_rows(tag VARCHAR) LANGUAGE python AS $$
+    pondra.sql(f"INSERT INTO log VALUES ('{tag}')")
+    pondra.sql(f"INSERT INTO log VALUES ('{tag}-2')")
+$$""")
+    for _ in range(3):
+        q("CALL add_rows('j')", path="/sql?job=job-24", token="w-tok")
+    checks["a CALL retried with its job: each of its writes once"] = q("SELECT count(*) AS n FROM log") == [{"n": 2}]
+    q("""CREATE PROCEDURE leak() LANGUAGE python AS $$
+    s = pondra.secret("smtp")
+    print("using", s["password"])
+    raise ValueError("refused: " + s["password"])
+$$""")
+    status, heard, out = told("CALL leak()")
+    time.sleep(1)
+    logged = json.dumps(q("SELECT * FROM pondra.runs WHERE routine = 'leak'"))
+    checks["a secret read by a procedure never shows: not in its notices, its error or the run log"] = status == 500 and "pw-7f3a9c" not in json.dumps([heard, str(out), logged]) \
+        and heard == ["using ***"] and "refused: ***" in str(out) and "***" in logged and "only a procedure's code" in err("SELECT 1") + str(_raises_text(lambda: call(A.port, "GET", "/secrets/smtp", headers={"authorization": "Bearer a-tok"})))
+    runs = q("SELECT routine, caller, status, args FROM pondra.runs WHERE routine = 'send_report' ORDER BY started")
+    checks["pondra.runs: every call, its caller, arguments and outcome"] = len(runs) == 4 and all(r["status"] == "ok" and r["caller"] == "read" for r in runs) and '"recipients":["pg@example.com"]' in runs[1]["args"]
+    started = q("SELECT pondra.start('quiet') AS r")[0]["r"]
+    checks["pondra.start: a run id at once, its outcome in pondra.runs"] = until(lambda: q(f"SELECT status FROM pondra.runs WHERE id = '{started}'"), [{"status": "ok"}], secs=20) == [{"status": "ok"}]
+    q("CREATE PROCEDURE deep(n BIGINT) LANGUAGE python AS $$ pondra.call('deep', n + 1) $$")
+    t0 = time.time()
+    checks["procedures calling procedures take no slot of their own (two here): 16 deep, not stuck"] = "16 deep" in err("CALL deep(0)", timeout=90) and time.time() - t0 < 60
+    # a notebook's functions, as they are
+    nb = os.path.join(tempfile.mkdtemp(prefix="pondra-nb-"), "notebook.py")
+    open(nb, "w").write(f"""import re, sys, json
+from datetime import date
+import pondra
+db = pondra.connect("http://127.0.0.1:{A.port}", token="a-tok")
+TAX = 0.25
+STOP = ["the", "a"]
+def words(t):
+    return [w for w in re.findall(r"[a-z]+", t.lower()) if w not in STOP]
+
+@db.function
+def tagline(title: str) -> str:
+    return "-".join(words(title)) + f"@{{TAX}}"
+
+@db.procedure
+def weekly(day: date, top: int = 2):
+    rows = pondra.sql("SELECT user, count(*) AS n FROM orders GROUP BY user ORDER BY n DESC, user LIMIT $k", k=top).rows()
+    print(f"week of {{day}}: {{len(rows)}}")
+    return rows
+
+import pandas as pd
+frame = pd.DataFrame({{"a": [1]}})
+try:
+    @db.function
+    def bad(x: int) -> int:
+        return x + len(frame)
+    refused = ""
+except TypeError as e:
+    refused = str(e)
+out = dict(sql=db.sql("SELECT tagline('The Quick Fox') AS t").item(), here=tagline("The Quick Fox"),
+           frame=db.table("orders").filter(pondra.col("id") == 1).select(pondra.fn.tagline(pondra.col("user")).alias("t")).item(),
+           call=db.call("weekly", date(2026, 9, 27)).rows(), heard=db.notices, refused=refused)
+print(json.dumps(out, default=str))
+""")
+    ran = subprocess.run([sys.executable, nb], capture_output=True, text=True, timeout=120, env={**os.environ, "PYTHONPATH": py})
+    got = json.loads(ran.stdout.strip().splitlines()[-1]) if ran.returncode == 0 else {}
+    checks["@db.function / @db.procedure: the notebook's imports, helper and constant go along; SQL, frames and here agree"] = got.get("sql") == got.get("here") == "quick-fox@0.25" \
+        and got.get("frame") == "u@0.25" and got.get("call") == q("SELECT user, count(*) AS n FROM orders GROUP BY user ORDER BY n DESC, user LIMIT 2") and got.get("heard") == ["week of 2026-09-27: 2"]
+    checks["…a DataFrame it uses is refused, with the fix"] = "pass it as an argument" in got.get("refused", "")
+    q("""CREATE FUNCTION pl_max(a INT, b INT) RETURNS INT LANGUAGE plpython3u AS $$
+    if a > b:
+        return a
+    return b
+$$""")
+    q("""CREATE PROCEDURE pl_count(min_id BIGINT) LANGUAGE plpython3u AS $$
+    plan = plpy.prepare("SELECT count(*) AS n FROM orders WHERE id > $1", ["bigint"])
+    rv = plpy.execute(plan, [min_id])
+    plpy.notice(f"{rv[0]['n']} orders")
+$$""")
+    checks["PL/Python as Postgres runs it: plpy.execute, plpy.notice"] = q("SELECT pl_max(3, 9) AS m") == [{"m": 9}] and told("CALL pl_count(299990)")[1] == ["10 orders"]
+    # speed
+    q("CREATE PROCEDURE ping(n BIGINT) LANGUAGE python AS $$ return n $$")
+    q("CALL ping(0)")
+    took = []
+    for i in range(100):
+        t0 = time.perf_counter()
+        q(f"CALL ping({i})")
+        took.append((time.perf_counter() - t0) * 1000)
+    call_ms = statistics.median(took)
+    q("CREATE FUNCTION plus1(x BIGINT) RETURNS BIGINT LANGUAGE python AS $$ return x + 1 $$")
+    rates = {}
+    for f in ("twice", "plus1"):
+        q(f"SELECT sum({f}(value)) AS s FROM generate_series(1, 10000)", path="/sql?spread=0")
+        t0 = time.perf_counter()
+        q(f"SELECT sum({f}(value)) AS s FROM generate_series(1, 1000000)", path="/sql?spread=0")
+        rates[f] = 1e6 / (time.perf_counter() - t0)
+    checks[f"a warm CALL takes under 10 ms (median {call_ms:.1f} ms); vectorized {rates['twice'] / 1e6:.1f}M rows/s, per row {rates['plus1'] / 1e6:.2f}M rows/s"] = call_ms < 10 and rates["twice"] > 5e6
+    # a task, through a leader failover
+    q("CREATE TABLE ticks (at TIMESTAMP)")
+    q("CREATE PROCEDURE mark() LANGUAGE sql AS $$ INSERT INTO ticks SELECT now() $$")
+    q("CREATE TASK tick SCHEDULE '1 second' AS CALL mark()")
+    time.sleep(4)
+    before = q("SELECT count(*) AS n FROM ticks")[0]["n"]
+    nodes[0].kill()
+    leader = None
+    deadline = time.time() + 60
+    while leader is None and time.time() < deadline:
+        for n in nodes[1:]:
+            try:
+                if call(n.port, "GET", "/stats", timeout=2)["role"] == "leader":
+                    leader = n
+            except Exception:
+                pass
+        time.sleep(0.5)
+    time.sleep(6)
+    q("DROP TASK tick", port=leader.port) if leader else None
+    time.sleep(2)  # (a tick under way when it was dropped ends, and its line is written)
+    after = q("SELECT count(*) AS n FROM ticks", port=leader.port)[0]["n"] if leader else 0
+    jobs = q("SELECT count(DISTINCT job) AS n FROM pondra.runs WHERE routine = 'tick' AND status = 'ok'", port=leader.port)[0]["n"] if leader else -1
+    checks[f"a task through a leader failover: each tick's writes once ({after} ticks, {jobs} runs), and on after it ({before} before)"] = leader is not None and after > before > 0 and after == jobs
+    time.sleep(8)
+    idle = [call(n.port, "GET", "/stats")["python_workers"] for n in nodes[1:]]
+    checks["idle workers are gone after PONDRA_WORKER_IDLE_SECS"] = idle == [0, 0]
+    for n in nodes:
+        n.kill()
+    # the shell: the same CALL, its print shown
+    shell = subprocess.run([BIN, lake], input="CALL send_report(DATE '2026-10-01', ['shell@example.com']);\n", capture_output=True, text=True, timeout=180, env={**os.environ, **env})
+    checks["the shell: CALL prints what the procedure printed"] = "sent to 1" in shell.stdout and box.mail[-1][1] == ["shell@example.com"]
+    smtp.stop()
+    ok = all(checks.values())
+    print(json.dumps({"functions": checks, "ok": ok}, indent=1))
+    if not ok:
+        print(out, ran.stdout[-2000:], ran.stderr[-3000:], shell.stdout[-1000:], shell.stderr[-2000:])
+        sys.exit(1)
+    return f"functions and procedures in SQL and Python on three nodes: all {len(checks)} checks pass"
+
+
+def _workers(parent):
+    """The Python workers a node started (`python -m pondra.worker` whose parent is it)."""
+    out = []
+    for d in os.listdir("/proc"):
+        try:
+            args = open(f"/proc/{d}/cmdline", "rb").read().split(b"\0")
+            ppid = int(open(f"/proc/{d}/stat").read().rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            continue
+        if ppid == parent and args[1:3] == [b"-m", b"pondra.worker"]:
+            out.append(int(d))
+    return out
+
+
+def _raises_text(f):
+    try:
+        f()
+        return ""
+    except Exception as e:
+        return str(e)
+
+
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    out = {t.__name__: t() for t in (upsert, deal, outside, clouds, kafkas, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, scale, flight, reader, crash)}
+    out = {t.__name__: t() for t in (upsert, deal, outside, clouds, kafkas, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, scale, flight, reader, crash)}
     A.secs = min(A.secs, 20)
     out["load"] = load()
     print(json.dumps(out, indent=1))
@@ -2874,7 +3190,7 @@ def all_tests():
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "scale", "flight", "load", "all"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "scale", "flight", "load", "all"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -2885,4 +3201,4 @@ if __name__ == "__main__":
     ap.add_argument("--secs", type=int, default=30)
     ap.add_argument("--flush-ms", type=int, default=250)
     A = ap.parse_args()
-    {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "scale": scale, "flight": flight, "load": load, "all": all_tests}[A.mode]()
+    {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "scale": scale, "flight": flight, "load": load, "all": all_tests}[A.mode]()

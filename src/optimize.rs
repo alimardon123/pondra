@@ -41,7 +41,76 @@ pub fn rules() -> Vec<Arc<dyn OptimizerRule + Send + Sync>> {
         rules.insert(at, Arc::new(JoinOrder)); // (after the filters are down: they say how big each input is)
     }
     rules.push(Arc::new(CheapFirst));
+    rules.push(Arc::new(AsyncBelow)); // (last: after COUNT(DISTINCT) became a GROUP BY)
     rules
+}
+
+/// DataFusion runs async functions — Python functions (`pyfn.rs`), Flight ones (`udf.rs`) — in
+/// projections, filters and aggregates' arguments. One in a GROUP BY, an ORDER BY or a window
+/// function (or a COUNT(DISTINCT …), which becomes a GROUP BY) is computed here by a projection
+/// below it, once a row, and the node above reads its column.
+#[derive(Debug)]
+struct AsyncBelow;
+
+impl OptimizerRule for AsyncBelow {
+    fn name(&self) -> &str {
+        "async_below"
+    }
+
+    fn apply_order(&self) -> Option<ApplyOrder> {
+        Some(ApplyOrder::BottomUp)
+    }
+
+    fn rewrite(&self, plan: LogicalPlan, _: &dyn OptimizerConfig) -> Result<Transformed<LogicalPlan>> {
+        match plan {
+            LogicalPlan::Aggregate(a) if a.group_expr.iter().any(is_async) && !a.group_expr.iter().any(|g| matches!(g, Expr::GroupingSet(_))) => {
+                let names: Vec<String> = a.group_expr.iter().map(|e| e.schema_name().to_string()).collect();
+                let (input, groups) = lift(a.input, a.group_expr)?;
+                let groups = groups.into_iter().zip(names).map(|(g, n)| if g.schema_name().to_string() == n { g } else { g.alias(n) }).collect();
+                Ok(Transformed::yes(LogicalPlan::Aggregate(Aggregate::try_new(Arc::new(input), groups, a.aggr_expr)?)))
+            }
+            LogicalPlan::Sort(s) if s.expr.iter().any(|e| is_async(&e.expr)) => {
+                let columns: Vec<Expr> = s.input.schema().columns().into_iter().map(Expr::Column).collect();
+                let (input, exprs) = lift(s.input, s.expr.iter().map(|e| e.expr.clone()).collect())?;
+                let expr = s.expr.into_iter().zip(exprs).map(|(e, x)| e.with_expr(x)).collect();
+                let sorted = LogicalPlan::Sort(datafusion::logical_expr::Sort { expr, input: Arc::new(input), fetch: s.fetch });
+                Ok(Transformed::yes(LogicalPlan::Projection(Projection::try_new(columns, Arc::new(sorted))?))) // (without the columns it sorted by)
+            }
+            LogicalPlan::Window(w) if w.window_expr.iter().any(is_async) => {
+                let columns: Vec<Expr> = w.input.schema().columns().into_iter().map(Expr::Column).collect();
+                let names: Vec<String> = w.window_expr.iter().map(|e| e.schema_name().to_string()).collect();
+                let (input, exprs) = lift(w.input, w.window_expr)?;
+                let exprs = exprs.into_iter().zip(&names).map(|(e, n)| if e.schema_name().to_string() == *n { e } else { e.alias(n) }).collect();
+                let window = LogicalPlan::Window(datafusion::logical_expr::Window::try_new(exprs, Arc::new(input))?);
+                let out = columns.into_iter().chain(names.iter().map(|n| Expr::Column(Column::from_name(n)))).collect::<Vec<_>>();
+                Ok(Transformed::yes(LogicalPlan::Projection(Projection::try_new(out, Arc::new(window))?)))
+            }
+            plan => Ok(Transformed::no(plan)),
+        }
+    }
+}
+
+fn is_async(e: &Expr) -> bool {
+    e.exists(|e| Ok(matches!(e, Expr::ScalarFunction(f) if f.func.as_async().is_some()))).unwrap_or(false)
+}
+
+/// `input` with each async call in `exprs` as a column of a projection over it (`__async_{i}`),
+/// and `exprs` reading those columns instead.
+fn lift(input: Arc<LogicalPlan>, exprs: Vec<Expr>) -> Result<(LogicalPlan, Vec<Expr>)> {
+    let mut lifted: Vec<Expr> = vec![];
+    let exprs = exprs.into_iter().map(|e| e.transform_down(|e| {
+        if !matches!(&e, Expr::ScalarFunction(f) if f.func.as_async().is_some()) {
+            return Ok(Transformed::no(e));
+        }
+        let at = lifted.iter().position(|l| *l == e).unwrap_or_else(|| {
+            lifted.push(e.clone());
+            lifted.len() - 1
+        });
+        Ok(Transformed::new(Expr::Column(Column::from_name(format!("__async_{at}"))), true, TreeNodeRecursion::Jump))
+    }).data()).collect::<Result<Vec<_>>>()?;
+    let mut columns: Vec<Expr> = input.schema().columns().into_iter().map(Expr::Column).collect();
+    columns.extend(lifted.into_iter().enumerate().map(|(i, e)| e.alias(format!("__async_{i}"))));
+    Ok((LogicalPlan::Projection(Projection::try_new(columns, input)?), exprs))
 }
 
 /// A join with a grouped subquery (`l_quantity < (SELECT 0.2 * avg(l_quantity) FROM lineitem WHERE

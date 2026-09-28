@@ -49,7 +49,7 @@ def wheel(binary, platform, out):
     wheel_file = "\n".join(["Wheel-Version: 1.0", "Generator: pondra tools/package.py", "Root-Is-Purelib: false"] + [f"Tag: py3-none-{t}" for t in tags.split(".")]) + "\n"
     src = os.path.join(ROOT, "python")
     client = sorted(os.path.relpath(os.path.join(d, f), src).replace(os.sep, "/") for d, _, fs in os.walk(os.path.join(src, "pondra")) for f in fs if f.endswith(".py"))
-    files = {**{p: open(os.path.join(src, p), "rb").read() for p in client},  # (the client, its frames, pondra.spark, the procedure runner)
+    files = {**{p: open(os.path.join(src, p), "rb").read() for p in client},  # (the client, its frames, pondra.spark, the worker and plpy)
              f"pondra-{v}.data/scripts/{exe}": open(binary, "rb").read(),
              f"pondra-{v}.dist-info/METADATA": meta.encode(), f"pondra-{v}.dist-info/WHEEL": wheel_file.encode(),
              **{f"pondra-{v}.dist-info/licenses/{n}": open(os.path.join(ROOT, n), "rb").read() for n in LICENSES}}

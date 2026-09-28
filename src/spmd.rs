@@ -895,6 +895,7 @@ fn spread(p: &Arc<dyn ExecutionPlan>, exchanges: &mut Vec<Exchange>) -> Option<S
     match p.name() {
         "DataSourceExec" | "EmptyExec" | "PlaceholderRowExec" => Some(Whole),
         "ProjectionExec" | "FilterExec" | "CoalesceBatchesExec" | "CooperativeExec" | "LocalLimitExec" => one,
+        "async_func" => one, // (AsyncFuncExec: a Python or Flight function, row by row: each node its own rows, through its own workers)
         // (within a node — and a limit within one node, over rows spread across them all, is wrong)
         "CoalescePartitionsExec" | "SortPreservingMergeExec" => (!has("fetch=")).then_some(one?),
         "RepartitionExec" => one,

@@ -1,17 +1,21 @@
-//! Macros, procedures and scripts: SQL — and Python — kept in the catalog under a name (`r/`), as
-//! stored views are (ADR-023).
+//! Functions, procedures and scripts: SQL — and Python — kept in the catalog under a name (`r/`),
+//! as stored views are (ADR-023, ADR-027).
 //!
-//! - **A macro** is an expression or a query with parameters, as DuckDB has them: `CREATE MACRO
-//!   net(x, rate := 0.2) AS x * (1 - rate)`, `CREATE MACRO recent(days) AS TABLE SELECT … WHERE ts
-//!   > now() - days * INTERVAL '1 day'`. Where SQL comes in (every door, and stored views as they
-//!   are read) a call is replaced by the body, the arguments in place of the parameters
-//!   (`expand`). After that it is plain SQL: it plans, spreads and is remembered like any other.
+//! - **A SQL function** (Postgres's `CREATE FUNCTION … RETURN expr` or `LANGUAGE sql AS $$ SELECT
+//!   … $$`, DuckDB's `CREATE MACRO`) is an expression or a query with parameters. Where SQL comes
+//!   in (every door, and stored views as they are read) a call is replaced by the body, the
+//!   arguments — cast to the parameters' types — in the parameters' places (`expand`). After that
+//!   it is plain SQL: it plans, spreads and is remembered like any other.
+//! - **A Python function** (`LANGUAGE python`) is a DataFusion function whose batches go to this
+//!   node's Python workers (`pyfn.rs`, `python.rs`): per row, a batch at once (`vectorized`), or,
+//!   returning a table, once per call.
 //! - **A procedure** is statements run in order (`LANGUAGE sql`) or a Python program (`LANGUAGE
 //!   python`), with typed parameters: `CALL load_day(DATE '2026-09-27')`. Its arguments are worked
 //!   out once; then each statement runs as if the caller had sent it, with the caller's rights. A
-//!   Python procedure runs in a Python process beside the node (`--python`) with a connection back
-//!   to it that has the caller's rights and no more (`auth::lend`); the value of its last line is
-//!   the answer: a frame (whose SQL then runs here), a table, a value, or nothing.
+//!   Python procedure runs on a warm worker beside the node with a connection back to it that has
+//!   the caller's rights and no more (`auth::lend`); what it prints goes to its caller as notices,
+//!   and the value it returns (or its last line's) is the answer: a frame (whose SQL then runs
+//!   here), a table, a value, or nothing. Every call is in the run log (`runs.rs`).
 //! - **A script** is several statements with `$name` parameters: a request to `POST /sql`, a file
 //!   `pondra run` sends, a procedure's body (`split`, `prepare`, then `one` each in turn).
 use crate::auth::Role;
@@ -31,38 +35,80 @@ use std::sync::{Arc, Mutex};
 
 pub fn key(name: &str) -> String { format!("r/{name}") }
 
-/// A macro or a procedure, as the catalog keeps it.
+/// A function or a procedure, as the catalog keeps it.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Routine {
     pub kind: Kind,
     pub params: Vec<Param>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub language: String, // a procedure's: sql or python
+    pub language: String, // sql or python; none: a macro (DuckDB's CREATE MACRO)
     pub body: String,
+    /// A function's result: a SQL type, or `TABLE (name type, …)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub returns: Option<String>,
+    #[serde(default, skip_serializing_if = "Options::is_empty")]
+    pub with: Options,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum Kind {
-    Macro,     // an expression
-    Table,     // a query (`AS TABLE`)
+    Macro,     // a function whose value is an expression's (a scalar function)
+    Table,     // a function whose value is a query's rows (a table function)
     Procedure, // statements, or a Python program
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Param {
-    pub name: String,
+    pub name: String, // (Postgres's unnamed parameters: 1, 2…, which the body calls $1, $2…)
     #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
-    pub ty: Option<String>, // (a procedure's arguments are cast to it)
+    pub ty: Option<String>, // (its arguments are cast to it)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default: Option<String>, // a SQL expression
 }
 
-fn what(k: Kind) -> &'static str {
-    match k {
-        Kind::Procedure => "procedure",
-        _ => "macro",
+/// Postgres's words for how a function behaves, and Pondra's options (`WITH (…)`).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct Options {
+    /// NULL in, NULL out, without running it (`STRICT`, `RETURNS NULL ON NULL INPUT`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub strict: bool,
+    /// immutable, stable or volatile. A query calling a volatile Python function isn't answered
+    /// from the result cache (a Python function is volatile unless it says otherwise).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volatility: Option<String>,
+    /// A Python function called once per batch with pyarrow arrays, not once per row.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub vectorized: bool,
+    /// Packages its Python needs (`requests, jinja2`): each node installs them once.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub packages: String,
+    /// The body is a module, and this function of it is what runs (the decorators' form).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub entry: String,
+    /// Seconds a call may take (a function's: each batch, 60 by default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<f64>,
+}
+
+impl Options {
+    fn is_empty(&self) -> bool { *self == Options::default() }
+}
+
+impl Routine {
+    pub fn python(&self) -> bool { self.language == "python" }
+
+    /// What SQL calls it: a function (a macro, if made as one) or a procedure.
+    pub fn what(&self) -> &'static str {
+        match (self.kind, self.language.is_empty()) {
+            (Kind::Procedure, _) => "procedure",
+            (_, true) => "macro",
+            _ => "function",
+        }
     }
+
+    /// Does a query calling it give the same answer every time (so it may be remembered)?
+    pub fn cacheable(&self) -> bool { !self.python() || matches!(self.with.volatility.as_deref(), Some("immutable" | "stable")) }
 }
 
 // ---------------------------------------------------------------- statements
@@ -70,100 +116,275 @@ fn what(k: Kind) -> &'static str {
 /// `CREATE [OR REPLACE] MACRO …`, as sqlparser reads it.
 pub fn of_macro(args: &Option<Vec<ast::MacroArg>>, def: &ast::MacroDefinition) -> Routine {
     let params = args.iter().flatten().map(|a| Param { name: ident(&a.name), ty: None, default: a.default_expr.as_ref().map(|e| e.to_string()) }).collect();
-    match def {
-        ast::MacroDefinition::Expr(e) => Routine { kind: Kind::Macro, params, language: String::new(), body: e.to_string() },
-        ast::MacroDefinition::Table(q) => Routine { kind: Kind::Table, params, language: String::new(), body: q.to_string() },
-    }
+    let (kind, body) = match def {
+        ast::MacroDefinition::Expr(e) => (Kind::Macro, e.to_string()),
+        ast::MacroDefinition::Table(q) => (Kind::Table, q.to_string()),
+    };
+    Routine { kind, params, language: String::new(), body, returns: None, with: Options::default() }
 }
 
-/// The statements sqlparser doesn't read as Pondra means them: `CREATE [OR REPLACE] PROCEDURE
-/// name(p type [DEFAULT e], …) LANGUAGE sql|python AS $$ … $$` (Postgres's form) and `DROP MACRO
-/// [TABLE] [IF EXISTS] name` (DuckDB's). None: neither; `Stmt::Invalid`: one, written wrong.
+/// The statements sqlparser doesn't read as Pondra means them: `CREATE [OR REPLACE] FUNCTION`
+/// and `CREATE [OR REPLACE] PROCEDURE` (Postgres's forms; DuckDB's `CREATE FUNCTION f(x) AS
+/// expr` too), `CREATE [OR REPLACE] TASK name SCHEDULE '…' AS statement`, `DROP TASK` and `DROP
+/// MACRO [TABLE] [IF EXISTS] name` (DuckDB's). None: none of them; `Stmt::Invalid`: one, written
+/// wrong, and why.
 pub fn statement(sql: &str) -> Option<Stmt> {
+    let head = sql.trim_start().get(..6)?.to_lowercase();
+    if head != "create" && !head.starts_with("drop") {
+        return None;
+    }
     let mut p = Parser::new(&GenericDialect {}).try_with_sql(sql).ok()?;
-    if p.parse_keywords(&[Keyword::DROP, Keyword::MACRO]) {
-        let _ = p.parse_keyword(Keyword::TABLE);
+    if p.parse_keyword(Keyword::DROP) {
+        let task = p.parse_keyword(Keyword::TASK);
+        if !task && !p.parse_keyword(Keyword::MACRO) {
+            return None;
+        }
+        let _ = !task && p.parse_keyword(Keyword::TABLE);
         let if_exists = p.parse_keywords(&[Keyword::IF, Keyword::EXISTS]);
         return Some(match p.parse_object_name(false) {
+            Ok(n) if task => Stmt::Ddl(vec![Ddl::DropTask { name: object(&n), if_exists }]),
             Ok(n) => Stmt::Ddl(vec![Ddl::DropRoutine { name: object(&n), if_exists }]),
-            Err(e) => Stmt::Invalid(format!("DROP MACRO: {e}")),
+            Err(e) => Stmt::Invalid(format!("DROP {}: {e}", if task { "TASK" } else { "MACRO" })),
         });
     }
     let create = p.parse_keyword(Keyword::CREATE);
     let replace = p.parse_keywords(&[Keyword::OR, Keyword::REPLACE]);
-    if !(create && p.parse_keyword(Keyword::PROCEDURE)) {
-        return None;
-    }
-    Some(procedure(&mut p).map_or_else(|e| Stmt::Invalid(format!("CREATE PROCEDURE: {e:#} (CREATE PROCEDURE name(p TYPE [DEFAULT …], …) LANGUAGE sql|python AS $$ … $$)")), |(name, routine)| Stmt::Ddl(vec![Ddl::CreateRoutine { name, routine, replace }])))
+    let what = p.parse_one_of_keywords(&[Keyword::FUNCTION, Keyword::PROCEDURE, Keyword::TASK]).filter(|_| create)?;
+    Some(match what {
+        Keyword::TASK => crate::runs::task(&mut p).map_or_else(|e| Stmt::Invalid(format!("CREATE TASK: {e:#} ({})", crate::runs::USAGE)), |(name, task)| Stmt::Ddl(vec![Ddl::CreateTask { name, task, replace }])),
+        k => {
+            let procedure = k == Keyword::PROCEDURE;
+            let usage = match procedure {
+                true => "CREATE PROCEDURE name(p TYPE [DEFAULT …], …) LANGUAGE sql|python AS $$ … $$",
+                false => "CREATE FUNCTION name(p TYPE, …) RETURNS TYPE RETURN expression, or … RETURNS TYPE|TABLE (c TYPE, …) LANGUAGE sql|python AS $$ … $$",
+            };
+            routine(&mut p, procedure).map_or_else(|e| Stmt::Invalid(format!("CREATE {}: {e:#} ({usage})", if procedure { "PROCEDURE" } else { "FUNCTION" })), |(name, routine)| Stmt::Ddl(vec![Ddl::CreateRoutine { name, routine, replace }]))
+        }
+    })
 }
 
-/// The rest of `CREATE PROCEDURE`: its name, parameters, language and body (either order).
-fn procedure(p: &mut Parser) -> Result<(String, Routine)> {
-    let name = object(&p.parse_object_name(false)?);
-    let mut params = vec![];
-    if p.consume_token(&Token::LParen) && !p.consume_token(&Token::RParen) {
-        params = p.parse_comma_separated(|p| {
-            let name = ident(&p.parse_identifier()?);
-            let ty = p.parse_data_type()?.to_string();
-            let default = match p.parse_keyword(Keyword::DEFAULT) || p.consume_token(&Token::Eq) {
-                true => Some(p.parse_expr()?.to_string()),
-                false => None,
-            };
-            Ok(Param { name, ty: Some(ty), default })
-        })?;
-        p.expect_token(&Token::RParen)?;
+/// A word sqlparser has no keyword for (`SCHEDULE`), if it is next.
+pub fn word(p: &mut Parser, w: &str) -> bool {
+    match p.peek_token().token {
+        Token::Word(x) if x.value.eq_ignore_ascii_case(w) => {
+            p.next_token();
+            true
+        }
+        _ => false,
     }
-    let (mut language, mut body) = (None, None);
+}
+
+/// A body: `$$ … $$` or `'…'`.
+pub fn text_of(p: &mut Parser) -> Result<Option<String>> {
+    Ok(match p.peek_token().token {
+        Token::DollarQuotedString(s) => {
+            p.next_token();
+            Some(s.value)
+        }
+        Token::SingleQuotedString(s) => {
+            p.next_token();
+            Some(s)
+        }
+        _ => None,
+    })
+}
+
+/// The rest of `CREATE FUNCTION` or `CREATE PROCEDURE`: its name, parameters, and the clauses
+/// that follow in any order — Postgres's, and `WITH (…)`.
+fn routine(p: &mut Parser, procedure: bool) -> Result<(String, Routine)> {
+    let name = object(&p.parse_object_name(false)?);
+    let params = params(p)?;
+    let mut r = Routine { kind: if procedure { Kind::Procedure } else { Kind::Macro }, params, language: String::new(), body: String::new(), returns: None, with: Options::default() };
+    let (mut body, mut expression) = (None, false);
     loop {
         if p.parse_keyword(Keyword::LANGUAGE) {
-            language = Some(p.parse_identifier()?.value.to_lowercase());
+            r.language = p.parse_identifier()?.value.to_lowercase();
+        } else if !procedure && p.parse_keyword(Keyword::RETURNS) {
+            if p.parse_keywords(&[Keyword::NULL, Keyword::ON, Keyword::NULL, Keyword::INPUT]) {
+                r.with.strict = true;
+            } else if p.parse_keyword(Keyword::TABLE) {
+                p.expect_token(&Token::LParen)?;
+                let cols = p.parse_comma_separated(|p| Ok(format!("{} {}", ast::Ident::with_quote('"', ident(&p.parse_identifier()?)), p.parse_data_type()?)))?;
+                p.expect_token(&Token::RParen)?;
+                (r.kind, r.returns) = (Kind::Table, Some(format!("TABLE ({})", cols.join(", "))));
+            } else if p.parse_keyword(Keyword::SETOF) {
+                let t = p.parse_data_type()?;
+                (r.kind, r.returns) = (Kind::Table, Some(format!("TABLE (\"{}\" {t})", crate::ddl::split(&name).1)));
+            } else {
+                r.returns = Some(p.parse_data_type()?.to_string());
+            }
+        } else if !procedure && p.parse_keyword(Keyword::RETURN) {
+            (body, expression) = (Some(p.parse_expr()?.to_string()), true);
         } else if p.parse_keyword(Keyword::AS) {
-            body = Some(match p.next_token().token {
-                Token::DollarQuotedString(s) => s.value,
-                Token::SingleQuotedString(s) => s,
-                t => bail!("the body is a string: AS $$ … $$, not {t}"),
-            });
+            body = match text_of(p)? {
+                Some(t) => Some(t),
+                None if procedure => bail!("the body is a string: AS $$ … $$"),
+                None if p.parse_keyword(Keyword::TABLE) => {
+                    r.kind = Kind::Table; // (DuckDB's: CREATE FUNCTION f(x) AS TABLE SELECT …)
+                    Some(p.parse_query()?.to_string())
+                }
+                None => {
+                    expression = true; // (DuckDB's: CREATE FUNCTION f(x) AS x + 1)
+                    Some(p.parse_expr()?.to_string())
+                }
+            };
+        } else if let Some(k) = p.parse_one_of_keywords(&[Keyword::IMMUTABLE, Keyword::STABLE, Keyword::VOLATILE]) {
+            r.with.volatility = Some(format!("{k:?}").to_lowercase());
+        } else if p.parse_keyword(Keyword::STRICT) {
+            r.with.strict = true;
+        } else if p.parse_keywords(&[Keyword::CALLED, Keyword::ON, Keyword::NULL, Keyword::INPUT]) {
+            r.with.strict = false;
+        } else if p.parse_keyword(Keyword::LEAKPROOF) || p.parse_keywords(&[Keyword::NOT, Keyword::LEAKPROOF]) {
+        } else if p.parse_keyword(Keyword::SECURITY) {
+            ensure!(p.parse_keyword(Keyword::INVOKER), "SECURITY DEFINER: a routine runs with its caller's rights (SECURITY INVOKER)");
+        } else if p.parse_keyword(Keyword::PARALLEL) {
+            p.parse_one_of_keywords(&[Keyword::SAFE, Keyword::RESTRICTED, Keyword::UNSAFE]).context("PARALLEL SAFE, RESTRICTED or UNSAFE")?;
+        } else if p.parse_one_of_keywords(&[Keyword::COST, Keyword::ROWS]).is_some() {
+            p.parse_number_value()?;
+        } else if p.parse_keyword(Keyword::WITH) {
+            options(p, &mut r.with)?;
         } else {
             break;
         }
     }
     let t = p.next_token().token;
     ensure!(matches!(t, Token::EOF | Token::SemiColon), "unexpected {t}");
-    let language = language.unwrap_or_else(|| "sql".into());
-    ensure!(["sql", "python"].contains(&language.as_str()), "LANGUAGE sql or python, not {language}");
-    Ok((name, Routine { kind: Kind::Procedure, params, language, body: body.context("no body: AS $$ … $$")? }))
+    r.body = body.context("no body: AS $$ … $$, or RETURN expression")?;
+    r.language = match r.language.as_str() {
+        "" | "sql" => "sql".into(),
+        "python" | "python3" | "plpython3u" | "plpythonu" | "plpython" => "python".into(),
+        l => bail!("LANGUAGE sql or python, not {l}"),
+    };
+    ensure!(!expression || r.language == "sql", "an expression's language is SQL: LANGUAGE python AS $$ … $$ for Python");
+    ensure!(procedure || r.returns.is_some() || r.language == "sql", "a Python function says what it returns: RETURNS TYPE, or RETURNS TABLE (c TYPE, …)");
+    ensure!(r.returns.as_deref().is_none_or(|t| !crate::pyfn::loose(Some(t)) || crate::pyfn::is_json(Some(t))), "RETURNS ANY: say the type it returns (VARIANT for any JSON value)");
+    ensure!(!r.with.vectorized || (r.python() && r.kind == Kind::Macro), "vectorized: a Python function returning a value (not a table, or a procedure)");
+    ensure!(r.python() || (r.with.packages.is_empty() && r.with.entry.is_empty()), "packages and entry: a Python routine's");
+    Ok((name, r))
 }
 
-/// Leader: keep a macro or procedure (`ddl::apply`).
+/// Parameters: `( [IN] [name] type [DEFAULT expr | = expr], … )`; a parameter without a name is
+/// called by its place (`$1`).
+fn params(p: &mut Parser) -> Result<Vec<Param>> {
+    if !p.consume_token(&Token::LParen) || p.consume_token(&Token::RParen) {
+        return Ok(vec![]);
+    }
+    let mut i = 0;
+    let params = p.parse_comma_separated(|p| {
+        i += 1;
+        if let Some(k) = p.parse_one_of_keywords(&[Keyword::IN, Keyword::OUT, Keyword::INOUT, Keyword::VARIADIC]) {
+            if k != Keyword::IN {
+                return Err(datafusion::sql::sqlparser::parser::ParserError::ParserError(format!("{k:?} parameters: return a table instead (RETURNS TABLE (…))")));
+            }
+        }
+        let unnamed = p.maybe_parse(|p| {
+            let t = p.parse_data_type()?;
+            match p.peek_token().token {
+                Token::Comma | Token::RParen | Token::Eq => Ok(t),
+                Token::Word(w) if w.keyword == Keyword::DEFAULT => Ok(t),
+                t => Err(datafusion::sql::sqlparser::parser::ParserError::ParserError(format!("{t}"))),
+            }
+        })?;
+        let (name, ty) = match unnamed {
+            Some(t) => (i.to_string(), t.to_string()),
+            None => (ident(&p.parse_identifier()?), p.parse_data_type()?.to_string()),
+        };
+        let default = match p.parse_keyword(Keyword::DEFAULT) || p.consume_token(&Token::Eq) {
+            true => Some(p.parse_expr()?.to_string()),
+            false => None,
+        };
+        Ok(Param { name, ty: Some(ty), default })
+    })?;
+    p.expect_token(&Token::RParen)?;
+    Ok(params)
+}
+
+/// `WITH (vectorized = true, packages = 'requests, jinja2', entry = 'f', timeout = 5)`.
+fn options(p: &mut Parser, o: &mut Options) -> Result<()> {
+    p.expect_token(&Token::LParen)?;
+    loop {
+        let k = p.parse_identifier()?.value.to_lowercase();
+        let v = match p.consume_token(&Token::Eq) {
+            true => match p.next_token().token {
+                Token::SingleQuotedString(s) | Token::Number(s, _) => s,
+                Token::Word(w) => w.value.to_lowercase(),
+                t => bail!("{k}: a value, not {t}"),
+            },
+            false => "true".into(),
+        };
+        let yes = || -> Result<bool> { Ok(v.parse::<bool>().with_context(|| format!("{k}: true or false"))?) };
+        match k.as_str() {
+            "vectorized" => o.vectorized = yes()?,
+            "strict" => o.strict = yes()?,
+            "packages" => o.packages = v.split(',').map(str::trim).filter(|s| !s.is_empty()).collect::<Vec<_>>().join(", "),
+            "entry" => o.entry = v.clone(),
+            "timeout" => o.timeout = Some(v.parse::<f64>().ok().filter(|s| *s > 0.0).context("timeout: seconds")?),
+            "volatility" => {
+                ensure!(["immutable", "stable", "volatile"].contains(&v.as_str()), "volatility: immutable, stable or volatile");
+                o.volatility = Some(v.clone());
+            }
+            _ => bail!("WITH ({k} …): vectorized, packages, entry, timeout, strict or volatility"),
+        }
+        if p.consume_token(&Token::RParen) {
+            return Ok(());
+        }
+        p.expect_token(&Token::Comma)?;
+    }
+}
+
+/// `TABLE (a BIGINT, "b" VARCHAR)` → its columns and their SQL types.
+pub fn columns_of(returns: &str) -> Result<Vec<(String, String)>> {
+    let inner = returns.trim().strip_prefix("TABLE").context("not a table")?.trim();
+    let mut p = Parser::new(&GenericDialect {}).try_with_sql(inner)?;
+    p.expect_token(&Token::LParen)?;
+    let cols = p.parse_comma_separated(|p| Ok((ident(&p.parse_identifier()?), p.parse_data_type()?.to_string())))?;
+    p.expect_token(&Token::RParen)?;
+    Ok(cols)
+}
+
+/// Leader: keep a function or procedure (`ddl::apply`).
 pub async fn create(lake: &Lake, name: &str, r: Routine, replace: bool) -> Result<Value> {
     let name = crate::ddl::new_name(lake, name).await?;
     if let Some(old) = lake.cat.get::<Routine>(&key(&name)).await? {
-        ensure!(replace, "{} {name} already exists (CREATE OR REPLACE {})", what(old.kind), what(r.kind).to_uppercase());
-        ensure!((old.kind == Kind::Procedure) == (r.kind == Kind::Procedure), "{name} is a {}", what(old.kind));
+        ensure!(replace, "{} {name} already exists (CREATE OR REPLACE {})", old.what(), r.what().to_uppercase());
+        ensure!((old.kind == Kind::Procedure) == (r.kind == Kind::Procedure), "{name} is a {}", old.what());
     }
-    check(lake, &name, &r)?;
+    check(lake, &name, &r).await?;
     lake.cat.commit(vec![(key(&name), json(&r))], &[]).await?;
-    Ok(j!({what(r.kind): name}))
+    Ok(j!({r.what(): name}))
 }
 
-/// A body that reads, parameters named once, and a macro that hides none of SQL's own functions.
-fn check(lake: &Lake, name: &str, r: &Routine) -> Result<()> {
+/// A body that reads, parameters named once, and a function that hides none of SQL's own.
+async fn check(lake: &Lake, name: &str, r: &Routine) -> Result<()> {
     for (i, p) in r.params.iter().enumerate() {
         ensure!(!r.params[..i].iter().any(|q| q.name == p.name), "{name}: two parameters called {}", p.name);
     }
     let short = crate::ddl::split(name).1;
     let state = lake.session().state();
+    let types = r.params.iter().filter_map(|p| p.ty.as_deref()).chain(r.returns.as_deref().filter(|t| !t.starts_with("TABLE"))).filter(|t| !crate::pyfn::loose(Some(t)) || crate::pyfn::is_json(Some(t)));
+    for t in types {
+        crate::pyfn::arrow_of(t).await.with_context(|| format!("{name}: the type {t}"))?;
+    }
+    if let Some(t) = r.returns.as_deref().filter(|t| t.starts_with("TABLE")) {
+        for (_, t) in columns_of(t)? {
+            crate::pyfn::arrow_of(&t).await.with_context(|| format!("{name}: the type {t}"))?;
+        }
+    }
     match r.kind {
         Kind::Macro => {
-            ensure!(!state.scalar_functions().contains_key(short) && !state.aggregate_functions().contains_key(short) && !state.window_functions().contains_key(short), "{short} is one of SQL's own functions: call the macro something else");
-            parse_expr(&r.body)?;
+            ensure!(!state.scalar_functions().contains_key(short) && !state.aggregate_functions().contains_key(short) && !state.window_functions().contains_key(short), "{short} is one of SQL's own functions: call yours something else");
+            if !r.python() {
+                places(r, &mut scalar_body(&r.body)?)?;
+            }
         }
         Kind::Table => {
-            ensure!(!state.table_functions().contains_key(short), "{short} is one of SQL's own table functions: call the macro something else");
-            parse_query(&r.body)?;
+            ensure!(!state.table_functions().contains_key(short), "{short} is one of SQL's own table functions: call yours something else");
+            if !r.python() {
+                places(r, &mut parse_query(query_text(&r.body))?)?;
+            }
         }
         Kind::Procedure if r.language == "sql" => {
-            let nulls = r.params.iter().map(|p| (p.name.clone(), Value::Null)).collect();
+            let nulls = r.params.iter().map(|p| (p.name.clone(), Value::Null)).chain((1..=r.params.len()).map(|i| (i.to_string(), Value::Null))).collect();
             for s in split(&r.body) {
                 if statement(&s).is_none() {
                     bind(&s, &nulls).with_context(|| format!("{name}: {}", s.trim()))?;
@@ -172,21 +393,45 @@ fn check(lake: &Lake, name: &str, r: &Routine) -> Result<()> {
         }
         Kind::Procedure => {}
     }
+    if r.python() && r.with.packages.is_empty() && crate::python::runs() {
+        // (compiled by a worker now, so a mistake is found when it's made, with its line; one
+        // with packages when it is first used: they are installed then, not under the DDL lock)
+        crate::python::ask(&r.with.packages, crate::python::Use::Procedure { nested: true }, j!({"op": "check", "name": name, "body": r.body, "entry": r.with.entry, "params": names(r)}), vec![], Some(std::time::Duration::from_secs(600)), &mut |_| {}).await.with_context(|| name.to_string())?;
+    }
     Ok(())
 }
+
+/// Every `$n` in a SQL function's body is one of its parameters (Postgres: "there is no parameter $2").
+fn places<T: VisitMut>(r: &Routine, body: &mut T) -> Result<()> {
+    let mut wrong = None;
+    let _ = visit_expressions_mut(body, |e| {
+        if let Expr::Value(v) = e {
+            if let ast::Value::Placeholder(p) = &v.value {
+                if p.strip_prefix('$').and_then(|n| n.parse::<usize>().ok()).is_some_and(|n| n == 0 || n > r.params.len()) {
+                    wrong = Some(p.clone());
+                }
+            }
+        }
+        ControlFlow::<()>::Continue(())
+    });
+    wrong.map_or(Ok(()), |p| bail!("there is no parameter {p}"))
+}
+
+/// Its parameters' names, in order.
+pub fn names(r: &Routine) -> Vec<&str> { r.params.iter().map(|p| p.name.as_str()).collect() }
 
 /// Leader: `DROP MACRO`, `DROP FUNCTION`, `DROP PROCEDURE`.
 pub async fn drop(lake: &Lake, name: &str, if_exists: bool) -> Result<Value> {
     let name = crate::ddl::local(lake, name).with_context(|| format!("{name}: not this lake's"))?;
     let Some(r) = lake.cat.get::<Routine>(&key(&name)).await? else {
-        ensure!(if_exists, "no macro or procedure {name}");
+        ensure!(if_exists, "no function or procedure {name}");
         return Ok(j!({"dropped": false}));
     };
     lake.cat.commit(vec![], &[key(&name)]).await?;
-    Ok(j!({what(r.kind): name, "dropped": true}))
+    Ok(j!({r.what(): name, "dropped": true}))
 }
 
-/// This lake's macros and procedures, by name: read again only after a commit (every query asks).
+/// This lake's functions and procedures, by name: read again only after a commit (every query asks).
 pub async fn listed(lake: &Lake) -> Result<Arc<HashMap<String, Routine>>> {
     type Seen = Mutex<HashMap<String, (u64, Arc<HashMap<String, Routine>>)>>;
     static SEEN: std::sync::LazyLock<Seen> = std::sync::LazyLock::new(Default::default);
@@ -260,13 +505,18 @@ fn parse_query(sql: &str) -> Result<ast::Query> { Ok(*Parser::new(&GenericDialec
 
 fn text(stmts: &[Statement]) -> String { stmts.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(";\n") }
 
-/// Every macro call in `sql` replaced by its body (a macro's own calls too, 16 deep at most).
-/// A statement that makes a macro, procedure or stored view keeps its calls: they are read when
-/// used (`query::stored_views`), so a macro changed later changes them too. A materialized view
-/// keeps the macros as they were when it was made: it has been adding up rows since.
+/// Every SQL function call in `sql` replaced by its body (a function's own calls too, 16 deep at
+/// most), and every Python function's call made whole: its arguments in their places, defaults
+/// filled in, under the name it is registered by (`pyfn.rs`). A statement that makes a function,
+/// procedure or stored view keeps its calls: they are read when used (`query::stored_views`), so
+/// a function changed later changes them too. A materialized view keeps the functions as they were
+/// when it was made: it has been adding up rows since.
 pub async fn expand(lake: &Lake, sql: &str) -> Result<String> { expand_with(lake, sql, &HashMap::new()).await }
 
 async fn expand_with(lake: &Lake, sql: &str, views: &HashMap<String, String>) -> Result<String> {
+    if let Some(q) = show(sql) {
+        return Ok(q);
+    }
     let all = listed(lake).await?;
     let outside = crate::ext::attached(lake).await?;
     let named = |n: &String| crate::ddl::mentions(sql, n);
@@ -283,6 +533,20 @@ async fn expand_with(lake: &Lake, sql: &str, views: &HashMap<String, String>) ->
         }
     }
     Ok(text(&stmts))
+}
+
+/// `SHOW USER FUNCTIONS`, `SHOW PROCEDURES`, `SHOW TASKS` (`[LIKE 'pattern']`): this lake's own,
+/// from `pondra.routines` and `pondra.tasks`, as Snowflake has them. (`SHOW FUNCTIONS` is every
+/// function a query may call, as DataFusion lists them: its own, and the Python ones.)
+fn show(sql: &str) -> Option<String> {
+    static SHOW: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?is)^\s*show\s+(user\s+functions|procedures|tasks)(?:\s+like\s+('(?:[^']|'')*'))?\s*;?\s*$").expect("a regex"));
+    let m = SHOW.captures(sql)?;
+    let like = m.get(2).map(|l| format!(" AND name LIKE {}", l.as_str())).unwrap_or_default();
+    Some(match m[1].split_whitespace().last().unwrap_or_default().to_lowercase().as_str() {
+        "functions" => format!("SELECT name, kind, language, arguments, returns, volatility FROM pondra.routines WHERE kind <> 'procedure'{like} ORDER BY name"),
+        "procedures" => format!("SELECT name, language, arguments FROM pondra.routines WHERE kind = 'procedure'{like} ORDER BY name"),
+        _ => format!("SELECT * FROM pondra.tasks WHERE true{like} ORDER BY name"),
+    })
 }
 
 /// A query that may start with FROM (DuckDB's `FROM t`, alone or as a subquery, a CTE or a view's).
@@ -307,6 +571,29 @@ fn select_star(body: &mut ast::SetExpr) {
     }
 }
 
+/// A scalar SQL function's body as an expression: an expression (`RETURN x * 2`), a query's one
+/// value (`AS $$ SELECT x * 2 $$`), or a scalar subquery (`AS $$ SELECT max(v) FROM t WHERE k =
+/// x $$`).
+fn scalar_body(body: &str) -> Result<Expr> {
+    let text = query_text(body);
+    let first = text.split(|c: char| !c.is_alphanumeric()).next().unwrap_or_default().to_lowercase();
+    if !["select", "with", "values"].contains(&first.as_str()) {
+        return parse_expr(text);
+    }
+    let q = parse_query(text)?;
+    if let ast::SetExpr::Select(s) = &*q.body {
+        if let [ast::SelectItem::UnnamedExpr(e) | ast::SelectItem::ExprWithAlias { expr: e, .. }] = &s.projection[..] {
+            if q.to_string() == format!("SELECT {}", s.projection[0]) {
+                return Ok(e.clone()); // (nothing but the value)
+            }
+        }
+    }
+    Ok(Expr::Subquery(Box::new(q)))
+}
+
+/// A body's statement without the `;` that may end it.
+fn query_text(body: &str) -> &str { body.trim().trim_end_matches(';').trim_end() }
+
 struct Expander<'a> {
     lake: &'a Lake,
     all: &'a HashMap<String, Routine>,
@@ -321,23 +608,51 @@ impl Expander<'_> {
         self.all.get(&name).filter(|r| r.kind == kind).map(|r| (name, r))
     }
 
-    /// The body with the arguments in its parameters' places, its own macro calls expanded.
-    fn call<T: VisitMut>(&self, name: &str, r: &Routine, args: &[FunctionArg], mut body: T) -> Result<T> {
-        ensure!(self.depth < 16, "{name}: macros calling macros 16 deep (a loop?)");
-        let values = arguments(name, r, args)?;
+    /// The body with the arguments in its parameters' places (`p`, or `$1`), cast to their types,
+    /// its own function calls expanded; and the arguments.
+    fn call<T: VisitMut>(&self, name: &str, r: &Routine, args: &[FunctionArg], mut body: T) -> Result<(T, Vec<Expr>)> {
+        ensure!(self.depth < 16, "{name}: functions calling functions 16 deep (a loop?)");
+        let values = typed(r, arguments(name, r, args)?)?;
         let _ = visit_expressions_mut(&mut body, |e| {
-            if let Expr::Identifier(i) = e {
-                if let Some(v) = values.get(&ident(i)) {
-                    *e = Expr::Nested(Box::new(v.clone()));
-                }
+            let v = match e {
+                Expr::Identifier(i) => values.get(&ident(i)),
+                Expr::Value(v) => match &v.value {
+                    ast::Value::Placeholder(p) => p.strip_prefix('$').and_then(|n| n.parse::<usize>().ok()).and_then(|n| r.params.get(n.wrapping_sub(1))).and_then(|p| values.get(&p.name)),
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some(v) = v {
+                *e = Expr::Nested(Box::new(v.clone()));
             }
             ControlFlow::<()>::Continue(())
         });
         match body.visit(&mut Expander { depth: self.depth + 1, ..*self }) {
             ControlFlow::Break(e) => Err(e),
-            ControlFlow::Continue(()) => Ok(body),
+            ControlFlow::Continue(()) => Ok((body, r.params.iter().map(|p| values[&p.name].clone()).collect())),
         }
     }
+}
+
+/// Each argument cast to its parameter's type, if it has one.
+fn typed(r: &Routine, values: HashMap<String, Expr>) -> Result<HashMap<String, Expr>> {
+    let ty: HashMap<&str, &str> = r.params.iter().filter(|p| !crate::pyfn::loose(p.ty.as_deref())).filter_map(|p| Some((p.name.as_str(), p.ty.as_deref()?))).collect();
+    values.into_iter().map(|(k, v)| Ok(match ty.get(k.as_str()) {
+        Some(t) => (k.clone(), parse_expr(&format!("CAST(({v}) AS {t})"))?),
+        None => (k, v),
+    })).collect()
+}
+
+/// A Python function's call as its DataFusion function takes it: every argument, in order, cast
+/// to its parameter's type, under the name it is registered by.
+fn whole(name: &str, r: &Routine, args: &[FunctionArg]) -> Result<(ast::ObjectName, Vec<FunctionArg>)> {
+    let values = typed(r, arguments(name, r, args)?)?;
+    let args = r.params.iter().map(|p| FunctionArg::Unnamed(FunctionArgExpr::Expr(values[&p.name].clone()))).collect();
+    let name = match r.kind {
+        Kind::Table => ast::Ident::new(name), // (DataFusion looks a table function up by its name as written)
+        _ => ast::Ident::with_quote('"', name),
+    };
+    Ok((ast::ObjectName::from(vec![name]), args))
 }
 
 impl VisitorMut for Expander<'_> {
@@ -355,7 +670,28 @@ impl VisitorMut for Expander<'_> {
             FunctionArguments::List(l) => l.args.clone(),
             _ => vec![],
         };
-        match parse_expr(&r.body).and_then(|body| self.call(&name, r, &args, body)) {
+        if r.python() {
+            return match whole(&name, r, &args) {
+                Ok((n, args)) => {
+                    f.name = n;
+                    f.args = FunctionArguments::List(ast::FunctionArgumentList { duplicate_treatment: None, args, clauses: vec![] });
+                    ControlFlow::Continue(())
+                }
+                Err(e) => ControlFlow::Break(e),
+            };
+        }
+        let expanded = scalar_body(&r.body).and_then(|body| self.call(&name, r, &args, body)).and_then(|(e, args)| {
+            let e = match &r.returns {
+                Some(t) => format!("CAST(({e}) AS {t})"),
+                None => e.to_string(),
+            };
+            let e = match (r.with.strict, args.is_empty()) {
+                (true, false) => format!("CASE WHEN {} THEN NULL ELSE {e} END", args.iter().map(|a| format!("({a}) IS NULL")).collect::<Vec<_>>().join(" OR ")),
+                _ => e,
+            };
+            parse_expr(&e)
+        });
+        match expanded {
             Ok(e) => *expr = Expr::Nested(Box::new(e)),
             Err(e) => return ControlFlow::Break(e),
         }
@@ -391,14 +727,36 @@ impl VisitorMut for Expander<'_> {
                 Ok(q) => q,
                 Err(e) => return ControlFlow::Break(e.context(format!("{name}"))),
             };
-            q.visit(&mut Expander { views: &NONE, depth: self.depth + 1, ..*self })?; // (its macros; its names are the lake's)
+            q.visit(&mut Expander { views: &NONE, depth: self.depth + 1, ..*self })?; // (its functions; its names are the lake's)
             let alias = alias.clone().or_else(|| Some(ast::TableAlias { explicit: true, name: ast::Ident::new(object(name)), columns: vec![], at: None }));
             *t = TableFactor::Derived { lateral: false, subquery: Box::new(q), alias, sample: None };
             return ControlFlow::Continue(());
         }
         let TableFactor::Table { name, alias, args: Some(args), .. } = t else { return ControlFlow::Continue(()) };
         let Some((found, r)) = self.find(name, Kind::Table) else { return ControlFlow::Continue(()) };
-        let q = match parse_query(&r.body).and_then(|body| self.call(&found, r, &args.args, body)) {
+        if r.python() {
+            return match whole(&found, r, &args.args) {
+                Ok((n, a)) => {
+                    (*name, args.args) = (n, a);
+                    if alias.is_none() {
+                        *alias = Some(ast::TableAlias { explicit: true, name: ast::Ident::new(crate::ddl::split(&found).1), columns: vec![], at: None });
+                    }
+                    ControlFlow::Continue(())
+                }
+                Err(e) => ControlFlow::Break(e),
+            };
+        }
+        let q = parse_query(query_text(&r.body)).and_then(|body| self.call(&found, r, &args.args, body)).and_then(|(q, _)| match &r.returns {
+            // (RETURNS TABLE: its columns, by place, as their types)
+            Some(ret) => {
+                let cols = columns_of(ret)?;
+                let quoted = |c: &str| ast::Ident::with_quote('"', c).to_string();
+                let select = cols.iter().map(|(c, t)| format!("CAST({} AS {t}) AS {}", quoted(c), quoted(c))).collect::<Vec<_>>().join(", ");
+                parse_query(&format!("SELECT {select} FROM ({q}) AS \"_f\"({})", cols.iter().map(|(c, _)| quoted(c)).collect::<Vec<_>>().join(", ")))
+            }
+            None => Ok(q),
+        });
+        let q = match q {
             Ok(q) => q,
             Err(e) => return ControlFlow::Break(e),
         };
@@ -547,7 +905,11 @@ pub async fn one(app: &App, sql: &str, who: Who, job: Option<String>) -> Result<
         return Ok(Outcome::Done(app.checkpoint().await?));
     }
     if let Some((name, args)) = call_of(sql) {
-        return Box::pin(call(app, &name, &args, who, job)).await;
+        let (local, r, row) = Box::pin(prepared(app, &name, &args, who)).await?;
+        return Box::pin(run(app, local, r, row, who, job, None)).await;
+    }
+    if let Some((name, args, column)) = start_of(sql) {
+        return start(app, &name, &args, &column, who, job).await;
     }
     if let Some(stmt) = crate::write::parse(sql) {
         app.auth.allows(who.role, &stmt)?;
@@ -566,7 +928,7 @@ pub async fn script(app: &App, sql: &str, params: &HashMap<String, Value>, views
     for (i, s) in all.iter().enumerate() {
         let s = prepare(&app.lake, s, params, views).await?;
         let job = job.as_ref().map(|j| if all.len() == 1 { j.clone() } else { format!("{j}:{i}") });
-        last = match one(app, &s, who, job).await {
+        last = match Box::pin(one(app, &s, who, job)).await {
             Err(e) if all.len() > 1 => return Err(e.context(format!("statement {}: {}", i + 1, short(&s)))),
             r => r?,
         };
@@ -593,16 +955,47 @@ pub fn call_of(sql: &str) -> Option<(String, Vec<FunctionArg>)> {
     }
 }
 
-/// Run a procedure. Its arguments are worked out once, as the caller (`CALL p(now())`: one moment
-/// for every statement), cast to their parameters' types.
-async fn call(app: &App, name: &str, args: &[FunctionArg], who: Who, job: Option<String>) -> Result<Outcome> {
+/// `SELECT pondra.start('name', …) [AS column]`: a procedure to start without waiting, its
+/// arguments, and the answer's column (`run`).
+pub fn start_of(sql: &str) -> Option<(String, Vec<FunctionArg>, String)> {
+    if !sql.to_lowercase().contains("pondra.start") {
+        return None;
+    }
+    let Statement::Query(q) = Parser::parse_sql(&GenericDialect {}, sql).ok()?.pop()? else { return None };
+    let ast::SetExpr::Select(s) = &*q.body else { return None };
+    let (f, column) = match &s.projection[..] {
+        [ast::SelectItem::UnnamedExpr(Expr::Function(f))] => (f, "run".to_string()),
+        [ast::SelectItem::ExprWithAlias { expr: Expr::Function(f), alias }] => (f, ident(alias)),
+        _ => return None,
+    };
+    let FunctionArguments::List(l) = &f.args else { return None };
+    let (Some((FunctionArg::Unnamed(FunctionArgExpr::Expr(first)), rest)), "pondra.start", true) = (l.args.split_first(), object(&f.name).as_str(), s.from.is_empty()) else { return None };
+    let mut first = first;
+    while let Expr::Nested(e) = first {
+        first = e; // (a parameter: `pondra.start($name, …)`)
+    }
+    match first {
+        Expr::Value(v) => match &v.value {
+            ast::Value::SingleQuotedString(name) => Some((name.clone(), rest.to_vec(), column)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Does `sql` run a procedure (`CALL`, `pondra.start`)? Then it goes to `one`, not to a query.
+pub fn runs_procedure(sql: &str) -> bool { call_of(sql).is_some() || start_of(sql).is_some() }
+
+/// A procedure and its arguments, worked out once, as the caller (`CALL p(now())`: one moment for
+/// every statement), cast to their parameters' types.
+async fn prepared(app: &App, name: &str, args: &[FunctionArg], who: Who) -> Result<(String, Routine, RecordBatch)> {
     ensure!(who.depth < 16, "{name}: procedures calling procedures 16 deep (a loop?)");
     let local = crate::ddl::local(&app.lake, name).with_context(|| format!("no procedure {name}"))?;
-    let r = app.lake.cat.get::<Routine>(&key(&local)).await?.filter(|r| r.kind == Kind::Procedure).with_context(|| format!("no procedure {name}"))?;
+    let r = listed(&app.lake).await?.get(&local).filter(|r| r.kind == Kind::Procedure).cloned().with_context(|| format!("no procedure {name}"))?;
     let values = arguments(name, &r, args)?;
     let select = r.params.iter().map(|p| match &p.ty {
-        Some(t) => format!("CAST(({}) AS {t}) AS \"{}\"", values[&p.name], p.name),
-        None => format!("({}) AS \"{}\"", values[&p.name], p.name),
+        Some(t) if !crate::pyfn::loose(Some(t)) => format!("CAST(({}) AS {t}) AS \"{}\"", values[&p.name], p.name),
+        _ => format!("({}) AS \"{}\"", values[&p.name], p.name), // (any value, as it is)
     });
     let row = match r.params.is_empty() {
         true => RecordBatch::new_empty(Arc::new(datafusion::arrow::datatypes::Schema::empty())),
@@ -611,11 +1004,42 @@ async fn call(app: &App, name: &str, args: &[FunctionArg], who: Who, job: Option
             datafusion::arrow::compute::concat_batches(&rows[0].schema(), &rows)?
         }
     };
+    Ok((local, r, row))
+}
+
+/// Run a procedure, logged (`pondra.runs`): its statements, or its Python on a worker.
+async fn run(app: &App, name: String, r: Routine, row: RecordBatch, who: Who, job: Option<String>, id: Option<String>) -> Result<Outcome> {
+    let log = crate::runs::Run::start(app, &name, who.role, job.as_deref(), &row, id);
     let inner = Who { depth: who.depth + 1, ..who };
-    match r.language.as_str() {
-        "python" => python(app, &local, &r, row, inner, job).await,
-        _ => Box::pin(script(app, &r.body, &values_of(&row)?, &HashMap::new(), inner, job)).await,
-    }
+    let mut heard = vec![];
+    let out = match r.python() {
+        true => Box::pin(python(app, &name, &r, row, inner, job, &mut heard)).await,
+        false => {
+            let mut values = values_of(&row)?;
+            for (i, p) in r.params.iter().enumerate() {
+                values.insert((i + 1).to_string(), values[&p.name].clone()); // ($1: the first)
+            }
+            Box::pin(script(app, &r.body, &values, &HashMap::new(), inner, job)).await
+        }
+    };
+    let _ = log.end(app, &out, heard); // (written a moment later: a call doesn't wait for its log)
+    out
+}
+
+/// `SELECT pondra.start('p', …)`: the procedure started, not waited for; its run's id, to look
+/// for in `pondra.runs`.
+fn start<'a>(app: &'a App, name: &'a str, args: &'a [FunctionArg], column: &'a str, who: Who, job: Option<String>) -> futures::future::BoxFuture<'a, Result<Outcome>> {
+    Box::pin(async move {
+        let (local, r, row) = Box::pin(prepared(app, name, args, who)).await?;
+        let id = crate::runs::new_id();
+        let (app2, id2) = (app.clone(), id.clone());
+        tokio::spawn(async move {
+            let _ = Box::pin(run(&app2, local, r, row, who, job, Some(id2))).await; // (its outcome: the run log's)
+        });
+        let ids = datafusion::arrow::array::StringArray::from(vec![id]);
+        let schema = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![datafusion::arrow::datatypes::Field::new(column, datafusion::arrow::datatypes::DataType::Utf8, false)]));
+        Ok(Outcome::Rows(vec![RecordBatch::try_new(schema, vec![Arc::new(ids)])?]))
+    })
 }
 
 /// The arguments as parameters for SQL: each value exactly, at its own type.
@@ -632,47 +1056,54 @@ fn values_of(row: &RecordBatch) -> Result<HashMap<String, Value>> {
     Ok(out)
 }
 
-/// A Python procedure: `python -m pondra.procedure` beside this node, handed its body, the
-/// arguments (Arrow) and a connection back here with the caller's rights; it answers with a JSON
-/// line saying what follows: rows (Arrow), a frame's SQL (run here), or nothing. What it prints
-/// goes to this node's log; if it fails, the end of it (the traceback) is the error.
-async fn python(app: &App, name: &str, r: &Routine, args: RecordBatch, who: Who, job: Option<String>) -> Result<Outcome> {
-    use tokio::io::AsyncWriteExt;
-    let exe = app.python.as_deref().with_context(|| format!("{name} is a Python procedure, and this node runs no Python: start it with --python <python>"))?;
+tokio::task_local! {
+    /// What the procedures a request calls print, for its caller (`with_notices`).
+    static NOTICES: Arc<Mutex<Vec<String>>>;
+}
+
+/// Run `f`, and collect the notices its procedures send (what they print): the Postgres port sends
+/// them as NOTICE, HTTP as the `x-pondra-notices` header, MCP with the tool's answer.
+pub async fn with_notices<F: std::future::Future>(f: F) -> (F::Output, Vec<String>) {
+    let heard = Arc::new(Mutex::new(vec![]));
+    let out = NOTICES.scope(heard.clone(), f).await;
+    let heard = std::mem::take(&mut *heard.lock().unwrap());
+    (out, heard)
+}
+
+/// A Python procedure, on a worker of this node's (`python.rs`): handed its body, the arguments
+/// (Arrow) and a connection back here with the caller's rights. Its notices come as it prints;
+/// then the answer: rows, a frame's SQL (run here), or nothing. Secrets it read are blanked out of
+/// what it says (notices, errors).
+async fn python(app: &App, name: &str, r: &Routine, args: RecordBatch, who: Who, job: Option<String>, heard: &mut Vec<String>) -> Result<Outcome> {
+    ensure!(crate::python::runs(), "{name} is a Python procedure, and this node runs no Python: start it with --python <python>");
     let lease = crate::auth::lend(who.role, who.files); // (ends when this does)
     let url = format!("http://{}", app.cluster.addr.replace("0.0.0.0", "127.0.0.1"));
-    let head = j!({"name": name, "body": r.body, "url": url, "token": lease.0, "depth": who.depth, "job": job});
-    let mut child = tokio::process::Command::new(exe)
-        .args(["-m", "pondra.procedure"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .with_context(|| format!("{name}: couldn't start {exe}"))?;
-    let mut input = serde_json::to_vec(&head)?;
-    input.push(b'\n');
-    input.extend(crate::query::ipc(&[args])?);
-    let mut stdin = child.stdin.take().expect("piped");
-    let writing = async move { stdin.write_all(&input).await }; // (while it reads: a pipe holds only so much)
-    let (wrote, out) = tokio::join!(writing, child.wait_with_output());
-    let out = out?;
-    let said = String::from_utf8_lossy(&out.stderr);
-    if !out.status.success() {
-        // (the error itself first, then the traceback's end)
-        let last = said.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or_default();
-        let tail: String = said.trim_end().chars().rev().take(3000).collect::<Vec<_>>().into_iter().rev().collect();
-        bail!("{name} failed: {}", if tail.is_empty() { format!("{} ({wrote:?})", out.status) } else { format!("{last}\n{tail}") });
-    }
-    if !said.trim().is_empty() {
-        eprintln!("procedure {name}: {}", said.trim_end());
-    }
-    let cut = out.stdout.iter().position(|b| *b == b'\n').context("no answer from the procedure")?;
-    let answer: Value = serde_json::from_slice(&out.stdout[..cut])?;
+    let json: Vec<bool> = r.params.iter().map(|p| crate::pyfn::is_json(p.ty.as_deref())).collect();
+    let head = j!({"op": "call", "name": name, "body": r.body, "entry": r.with.entry, "params": names(r), "json": json, "url": url, "token": lease.0, "depth": who.depth, "job": job});
+    let limit = r.with.timeout.map(std::time::Duration::from_secs_f64);
+    let kind = crate::python::Use::Procedure { nested: who.depth > 1 }; // (called by a procedure: it holds a worker already)
+    let mut notice = |n: String| {
+        let n = lease.redact(&n);
+        let _ = NOTICES.try_with(|all| all.lock().unwrap().push(n.clone()));
+        heard.push(n);
+    };
+    let (answer, parts) = crate::python::ask(&r.with.packages, kind, head, vec![crate::query::ipc(&[args])?], limit, &mut notice).await.map_err(|e| anyhow::anyhow!("{name}: {}", lease.redact(&format!("{e:#}"))))?;
     match answer["kind"].as_str() {
-        Some("rows") => Ok(Outcome::Rows(crate::query::read_ipc(&out.stdout[cut + 1..])?)),
+        Some("rows") => Ok(Outcome::Rows(crate::query::read_ipc(parts.first().context("no rows")?)?)),
         Some("sql") => Box::pin(one(app, answer["sql"].as_str().unwrap_or_default(), who, None)).await,
-        Some("error") => bail!("{name}: {}", answer["error"].as_str().unwrap_or_default()),
         _ => Ok(Outcome::Done(j!({"called": name}))),
     }
+}
+
+/// Does `sql` call a Python function that may answer differently each time (so its result mustn't
+/// be remembered)?
+pub async fn volatile(lake: &Lake, sql: &str) -> bool {
+    let Ok(all) = listed(lake).await else { return true };
+    all.iter().any(|(n, r)| r.kind != Kind::Procedure && !r.cacheable() && crate::ddl::mentions(sql, n))
+}
+
+/// Does `sql` read a Python table function? Then it runs on one node: each would call it.
+pub async fn pinned(lake: &Lake, sql: &str) -> bool {
+    let Ok(all) = listed(lake).await else { return false };
+    all.iter().any(|(n, r)| r.kind == Kind::Table && r.python() && crate::ddl::mentions(sql, n))
 }

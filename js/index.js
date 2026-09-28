@@ -7,7 +7,7 @@
 //   await db.sql("CREATE TABLE events (user VARCHAR, amount BIGINT)");
 //   await db.append("events", [{ user: "ann", amount: 5 }]);
 //   console.log(await db.sql("SELECT user, sum(amount) AS total FROM events WHERE amount > $min GROUP BY user", { min: 1 }));
-//   await db.call("load_day", "2026-09-27");             // a stored procedure
+//   await db.call("load_day", "2026-09-27");             // a stored procedure (what it prints: db.notices)
 //   for await (const row of db.watch("events")) { … }   // new rows as they commit
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
@@ -18,9 +18,11 @@ import { createServer } from "node:net";
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 export class Pondra {
-  constructor(url = "http://127.0.0.1:8080", { token } = {}) {
+  constructor(url = "http://127.0.0.1:8080", { token, onNotice = (n) => console.log(n) } = {}) {
     this.url = url.replace(/\/$/, "");
     this.token = token;
+    this.notices = []; // what the last statement's procedures printed
+    this.onNotice = onNotice; // (each one, as it comes back; null: keep them quiet)
     this.producer = `js-${randomUUID().slice(0, 12)}`; // exactly-once: one name, increasing seq
     this.seq = 0;
   }
@@ -29,6 +31,9 @@ export class Pondra {
   async request(method, path, body, type) {
     const headers = { ...(this.token && { authorization: `Bearer ${this.token}` }), ...(type && { "content-type": type }), ...(this.owner && { "x-pondra-owner": this.owner }) };
     const r = await fetch(this.url + path, { method, body, headers });
+    const said = r.headers.get("x-pondra-notices");
+    this.notices = said ? JSON.parse(said) : [];
+    if (this.onNotice) this.notices.forEach((n) => this.onNotice(n));
     if (!r.ok) throw new Error(`${r.status}: ${(await r.text()).slice(0, 500)}`);
     return r;
   }
@@ -48,6 +53,15 @@ export class Pondra {
   /** A stored procedure (`CREATE PROCEDURE`), called, as Python's `con.call`: `await db.call("load_day", "2026-09-27")`. */
   async call(name, ...args) {
     return this.sql(`CALL ${name}(${args.map((_, i) => `$p${i}`).join(", ")})`, Object.fromEntries(args.map((a, i) => [`p${i}`, a])));
+  }
+
+  /** A stored procedure started on the node, not waited for (SQL's `pondra.start`): its run's id,
+   * whose row of `pondra.runs` says how it went. */
+  async start(name, ...args) {
+    const given = args.map((_, i) => `, $p${i}`).join("");
+    const params = { name, ...Object.fromEntries(args.map((a, i) => [`p${i}`, a])) };
+    const [row] = await this.sql(`SELECT pondra.start($name${given})`, params);
+    return row.run;
   }
 
   /** `call`'s name up to 0.22. */
@@ -124,16 +138,17 @@ export const connect = (url, options) => new Pondra(url, options);
 
 /** Start a node on a lake here — a folder, or s3://bucket/prefix — and connect to it. It stops
  * when this process exits, or with `close()`; the lake stays. Its SQL may read files on this
- * machine (`SELECT * FROM 'jan.csv'`), as DuckDB's may. */
-export async function local(dir = "lake", { port, token, flags = [], timeoutMs = 120_000 } = {}) {
+ * machine (`SELECT * FROM 'jan.csv'`), as DuckDB's may; its Python functions and procedures run
+ * with a Python here that has the `pondra` package, if there is one (`python: false`: none). */
+export async function local(dir = "lake", { port, token, flags = [], timeoutMs = 120_000, python = true, onNotice } = {}) {
   port ??= await freePort();
   if (!dir.includes("://")) mkdirSync(dir, { recursive: true });
-  const args = ["serve", "--dir", dir, "--addr", `127.0.0.1:${port}`, "--stop-with-stdin", ...flags];
+  const args = ["serve", "--dir", dir, "--addr", `127.0.0.1:${port}`, "--stop-with-stdin", ...(python ? ["--python", "auto"] : []), ...flags];
   const owner = randomUUID().replaceAll("-", ""); // (with it, the node lets this process's SQL read files here)
   const node = spawn(binary(), args, { stdio: ["pipe", "ignore", "ignore"], env: { ...process.env, PONDRA_OWNER_KEY: owner } });
   let failed = null;
   node.on("error", (e) => (failed = e)); // (no binary, say)
-  const db = new Pondra(`http://127.0.0.1:${port}`, { token });
+  const db = new Pondra(`http://127.0.0.1:${port}`, { token, ...(onNotice !== undefined && { onNotice }) });
   db.process = node;
   db.owner = owner;
   process.on("exit", () => node.stdin.end());

@@ -1,0 +1,41 @@
+Session.login_data is deprecated and will be removed in version 2.0
+Session.login_data is deprecated and will be removed in version 2.0
+Session.login_data is deprecated and will be removed in version 2.0
+Session.login_data is deprecated and will be removed in version 2.0
+Session.login_data is deprecated and will be removed in version 2.0
+{
+ "functions": {
+  "SQL functions: $1, STRICT, typed, defaults and named arguments, a query's value": true,
+  "RETURNS TABLE and SETOF: rows as declared, on three nodes == one == written out": true,
+  "CREATE FUNCTION errors say what is wrong": true,
+  "Python functions: per row, NULLs, STRICT, vectorized, a table": true,
+  "SHOW USER FUNCTIONS: the lake's own, SQL and Python": true,
+  "a Python function anywhere a SQL one goes: GROUP BY, ORDER BY, COUNT(DISTINCT), a window": true,
+  "an IMMUTABLE function gets each distinct argument once a batch (0.6 s for 50,000 rows at 20 ms a call); a volatile one every row": true,
+  "a spread query: three nodes == one node": true,
+  "\u2026each node runs its rows through its own workers": true,
+  "a query reading a Python table function runs on one node": true,
+  "a volatile Python function isn't answered from the result cache (an IMMUTABLE one is)": true,
+  "a function has no connection to the lake": true,
+  "a batch past its time limit stops its worker, and fails with why": true,
+  "a worker killed mid-query: that query fails with why, the node and the next query go on": true,
+  "HTTP: a reader's CALL sends the mail (a secret's credentials); what it printed comes back": true,
+  "Postgres: the same CALL, its print a NOTICE": true,
+  "MCP: the procedure is a tool; its notices come with the answer": true,
+  "JavaScript: db.call, and db.notices": true,
+  "a procedure answers nothing, rows, or a frame (run on the node)": true,
+  "a CALL retried with its job: each of its writes once": true,
+  "a secret read by a procedure never shows: not in its notices, its error or the run log": true,
+  "pondra.runs: every call, its caller, arguments and outcome": true,
+  "pondra.start: a run id at once, its outcome in pondra.runs": true,
+  "procedures calling procedures take no slot of their own (two here): 16 deep, not stuck": true,
+  "@db.function / @db.procedure: the notebook's imports, helper and constant go along; SQL, frames and here agree": true,
+  "\u2026a DataFrame it uses is refused, with the fix": true,
+  "PL/Python as Postgres runs it: plpy.execute, plpy.notice": true,
+  "a warm CALL takes under 10 ms (median 2.2 ms); vectorized 16.8M rows/s, per row 6.61M rows/s": true,
+  "a task through a leader failover: each tick's writes once (5 ticks, 5 runs), and on after it (2 before)": true,
+  "idle workers are gone after PONDRA_WORKER_IDLE_SECS": true,
+  "the shell: CALL prints what the procedure printed": true
+ },
+ "ok": true
+}

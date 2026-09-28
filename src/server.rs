@@ -34,7 +34,6 @@ pub struct App {
     pub results: Arc<Results>,       // recent query results (see `Results`)
     pub replica: Option<Arc<crate::replica::ReplicaLog>>, // what this follower holds for the leader
     pub auth: Arc<crate::auth::Auth>,
-    pub python: Option<String>,      // the Python that runs Python procedures (`--python`)
 }
 
 /// Recent query results. By default a result is reused only at exactly the catalog version it
@@ -122,6 +121,7 @@ pub fn router(app: App) -> Router {
         .route("/watch/{name}", get(watch))
         .route("/functions", get(list_functions))
         .route("/routines", get(|State(app): State<App>| async move { Ok::<_, E>(Json(j!(*crate::routines::listed(&app.lake).await?))) }))
+        .route("/secrets/{name}", get(secret))
         .route("/stats", get(stats))
         .route("/metrics", get(|State(app): State<App>| async move { crate::metrics::render(&app).await.map_err(E) }))
         .route("/cluster/commit", post(commit))
@@ -327,16 +327,20 @@ impl App {
     }
 
     /// Run a query as rewritten (`asof::rewrite`: ASOF JOIN as DataFusion can plan it); `files`:
-    /// it may read files on this machine (`owner`).
-    pub async fn query_as(&self, query: &str, spread: Option<&str>, files: bool) -> anyhow::Result<Vec<RecordBatch>> {
-        crate::ext::listing(self.query_listed(query, spread, files)).await // (every door: files listed once a statement)
+    /// it may read files on this machine (`owner`). Its work — over 100 KB of it, planning and
+    /// running a query — is made on the heap, here: a caller waiting for it holds a pointer, so
+    /// procedures calling procedures 16 deep don't run out of stack.
+    #[inline(never)]
+    pub fn query_as<'a>(&'a self, query: &'a str, spread: Option<&'a str>, files: bool) -> futures::future::BoxFuture<'a, anyhow::Result<Vec<RecordBatch>>> {
+        Box::pin(crate::ext::listing(self.query_listed(query, spread, files))) // (every door: files listed once a statement)
     }
 
     async fn query_listed(&self, query: &str, spread: Option<&str>, files: bool) -> anyhow::Result<Vec<RecordBatch>> {
         use crate::metrics::{add, QUERIES, QUERY_ERRORS, QUERY_US, SPREAD};
         let start = std::time::Instant::now();
         let run = async {
-            let nodes = if spread == Some("0") || crate::query::sent() { vec![] } else { self.cluster.nodes() }; // (rows sent with a request are here only)
+            let here_only = spread == Some("0") || crate::query::sent() || crate::routines::pinned(&self.lake, query).await; // (rows sent with a request are here only; so is a Python table function's call)
+            let nodes = if here_only { vec![] } else { self.cluster.nodes() };
             match crate::spmd::query(&self.lake, &nodes, &self.cluster.addr, query, spread == Some("1")).await {
                 Ok(Some(batches)) => {
                     crate::guard::ran_spread(query, start.elapsed());
@@ -669,9 +673,45 @@ fn owner(headers: &axum::http::HeaderMap) -> bool {
 /// `POST /sql`: statements (SQL, or JSON with `$name` parameters, or that and tables of the
 /// caller's own: `routines::Request`), run in order; the last one's answer. A single query as it
 /// was sent may be answered from `Results`.
-async fn sql(State(app): State<App>, Query(p): Query<SqlParams>, role: axum::Extension<crate::auth::Role>, headers: axum::http::HeaderMap, body: Bytes) -> Result<Response, E> {
+async fn sql(State(app): State<App>, Query(p): Query<SqlParams>, role: axum::Extension<crate::auth::Role>, headers: axum::http::HeaderMap, body: Bytes) -> Response {
     let files = owner(&headers); // (the program that started this node: its files, and URLs no secret covers)
-    crate::ext::scope(files, sql_as(app, p, role, headers, body)).await
+    let (out, heard) = crate::routines::with_notices(crate::ext::scope(files, sql_as(app, p, role, headers, body))).await;
+    let mut r = out.unwrap_or_else(IntoResponse::into_response);
+    if let Some(h) = notices(&heard) {
+        r.headers_mut().insert("x-pondra-notices", h);
+    }
+    r
+}
+
+/// What the statement's procedures printed, for the caller: a JSON list of lines in a header (all
+/// of it in ASCII, the first 32 KB of it; the run log has the rest).
+fn notices(heard: &[String]) -> Option<axum::http::HeaderValue> {
+    if heard.is_empty() {
+        return None;
+    }
+    let (mut kept, mut size) = (vec![], 0);
+    for n in heard {
+        size += n.len() + 4;
+        if size > 32 << 10 {
+            kept.push("…".to_string());
+            break;
+        }
+        kept.push(n.clone());
+    }
+    let text = serde_json::to_string(&kept).ok()?;
+    let ascii: String = text.chars().map(|c| if c.is_ascii() && !c.is_ascii_control() { c.to_string() } else { c.encode_utf16(&mut [0; 2]).iter().map(|u| format!("\\u{u:04x}")).collect() }).collect();
+    axum::http::HeaderValue::from_str(&ascii).ok()
+}
+
+/// `GET /secrets/{name}`: a secret's values (`CREATE SECRET`), for a Python procedure's own code
+/// (`pondra.secret`) and nothing else: the token must be one lent to a procedure while it runs.
+/// The values are kept out of what that procedure says (its notices, its error, the run log).
+async fn secret(State(app): State<App>, Path(name): Path<String>, headers: axum::http::HeaderMap) -> Result<Json<Value>, E> {
+    let token = headers.get("authorization").and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer "));
+    ensure!(crate::auth::lent(token).is_some(), "only a procedure's code reads a secret: pondra.secret(name), in a Python procedure");
+    let values = crate::ext::reveal(&app.lake, &name.to_lowercase()).await?;
+    crate::auth::revealed(token, values.iter().filter(|(k, _)| *k != "type" && *k != "scope").map(|(_, v)| v.clone()));
+    Ok(Json(j!(values)))
 }
 
 async fn sql_as(app: App, p: SqlParams, role: axum::Extension<crate::auth::Role>, headers: axum::http::HeaderMap, body: Bytes) -> Result<Response, E> {
@@ -686,7 +726,7 @@ async fn sql_as(app: App, p: SqlParams, role: axum::Extension<crate::auth::Role>
     }
     if let ([one], true, true, true) = (&crate::routines::split(&req.sql)[..], req.params.is_empty(), req.tables.is_empty(), req.views.is_empty()) {
         let one = crate::routines::expand(&app.lake, one).await?;
-        if !crate::write::checkpoint(&one) && crate::routines::call_of(&one).is_none() && crate::write::parse(&one).is_none() {
+        if !crate::write::checkpoint(&one) && !crate::routines::runs_procedure(&one) && crate::write::parse(&one).is_none() {
             return Ok(query(&app, &p, &one, who.files).await?);
         }
     }
@@ -718,7 +758,8 @@ async fn query(app: &App, p: &SqlParams, query: &str, files: bool) -> anyhow::Re
     // Same query, same catalog version: same answer (unless it asks for the time or randomness,
     // or may read a file on this machine).
     let q = query.to_lowercase();
-    let volatile = files || !crate::ext::names(query).is_empty() || ["now()", "random(", "current_", "uuid(", "explain"].iter().any(|f| q.contains(f)); // (files outside the lake change on their own)
+    let volatile = files || !crate::ext::names(query).is_empty() || ["now()", "random(", "current_", "uuid(", "explain", "pondra.runs", "pondra.tasks"].iter().any(|f| q.contains(f)) // (files outside the lake change on their own)
+        || crate::routines::volatile(&app.lake, query).await; // (a Python function may answer differently each time)
     let Some(version) = app.lake.version_for(query).await.filter(|_| !volatile) else { return Ok(respond(run_sql(app, p, query, files).await?)) };
     let key = format!("{format}|{}|{query}", p.spread.as_deref().unwrap_or(""));
     let stale = p.stale_ms.filter(|_| p.after.is_none()).map(Duration::from_millis); // (read-your-writes wins)
@@ -823,7 +864,7 @@ async fn stats(State(app): State<App>) -> Json<Value> {
     let c = &app.cluster;
     let role = if c.reader { "reader" } else if app.seq.is_some() { "leader" } else { "follower" };
     let mut s = j!({"role": role, "leader": c.leader.addr, "term": c.leader.n, "nodes": c.nodes(),
-                    "hwm": *app.lake.hwm.borrow(), "shard_runs": c.shard_runs.load(std::sync::atomic::Ordering::Relaxed)});
+                    "hwm": *app.lake.hwm.borrow(), "shard_runs": c.shard_runs.load(std::sync::atomic::Ordering::Relaxed), "python_workers": crate::python::workers()});
     if let Some(seq) = &app.seq {
         s["untiered_rows"] = j!(app.lake.backlog.load(std::sync::atomic::Ordering::Relaxed));
         let mut ms = seq.commit_ms.lock().unwrap().clone();

@@ -256,7 +256,7 @@ The shim is a thin layer over `pondra.frame`: the same tree, PySpark's names and
   in-process library (round 23).
 - **Spark Connect in the binary** (option C) if Scala or Java Spark jobs need to move.
 - **Python UDFs on the nodes** through the Arrow Flight function server (`udf_server.py`), not in
-  the node's process.
+  the node's process. (Built instead in round 24: warm Python workers beside each node, below.)
 
 ## As built (round 22)
 
@@ -266,7 +266,7 @@ tested (`tools/frames_check.py`, `tools/spark_check.py`, `tools/bench/tpch_frame
 - **`con.table(name, at=commit)`** (time travel) and **`@pondra.function`** (a Python function
   callable from SQL) aren't built. Functions of your own are Arrow Flight servers (`POST
   /functions`), as before; a stored Python *procedure* (`@con.procedure`, ADR-023) covers the
-  jobs.
+  jobs. (`@db.function` came in round 24, below.)
 - **Pipelines of `.sql` and `.py` files** (`pondra run models/`) aren't built; `pondra run
   file.sql` and `con.run("file.sql", …)` are.
 - **The JavaScript client** has `$name` parameters, `run`, `call` and `view`, not the builder.
@@ -296,3 +296,68 @@ PySpark's; each is the SQL of ADR-026, so every client does the same:
 
 `frames_check.py` section 6 and `spark_check.py`'s seven file pipelines compare them with Polars
 and PySpark reading and writing the same files.
+
+## Round 24: functions and procedures from Python (ADR-027)
+
+A notebook's function becomes the lake's, and runs on every node beside the data. The same code
+still runs in the notebook:
+
+```python
+import re, pondra
+from datetime import date
+STOP = {"the", "a"}
+
+def words(t):
+    return [w for w in re.findall(r"[a-z]+", t.lower()) if w not in STOP]
+
+@db.function                                    # SELECT slug(title) FROM posts, on every node
+def slug(title: str) -> str:
+    return "-".join(words(title))
+
+@db.procedure                                   # CALL weekly(DATE '2026-09-27'), as its caller
+def weekly(day: date, top: int = 10):
+    rows = pondra.sql("SELECT user, count(*) AS n FROM orders GROUP BY user ORDER BY n DESC LIMIT $k", k=top).rows()
+    print(f"week of {day}: {len(rows)} users")   # a notice to whoever called it
+    return rows
+
+posts.with_columns(s=pondra.fn.slug(pondra.col("title")))   # a lake function in a frame
+db.call("weekly", date.today())                              # on the node; db.notices has what it printed
+db.call("weekly", date.today(), wait=False).wait()           # started, then waited for (pondra.runs)
+```
+
+- **What goes along:** the imports the function uses (`re`), the helpers it calls (`words`,
+  and theirs), and the constants it reads (`STOP`: numbers, strings, lists, dicts and sets of
+  them). The stored body is readable Python (`SHOW USER FUNCTIONS`, `pondra.routines`).
+- **What is refused,** when it's made, with the fix: anything else from the notebook (a
+  DataFrame, a connection) and a closure's variables.
+- **Types come from the annotations:**
+
+  | Python | SQL |
+  |---|---|
+  | `str` | VARCHAR |
+  | `int` | BIGINT |
+  | `float` | DOUBLE |
+  | `bool` | BOOLEAN |
+  | `date` | DATE |
+  | `datetime` | TIMESTAMP |
+  | `bytes` | BYTEA |
+  | `Decimal` | DECIMAL |
+  | `list[T]` | `T[]` |
+  | `dict` | VARIANT |
+
+  A parameter without one takes any value as it comes (`ANY`). A function needs its result's
+  type: an annotation, or `returns=` (a SQL type, or `{"col": type, …}` for a table function).
+- **More options:** `@db.function(vectorized=True)` is called once a batch with pyarrow arrays.
+  `strict=True` answers NULL for a NULL argument without calling. `volatility="immutable"` lets
+  its queries be remembered, `packages="…"` installs packages on each node, and `timeout=` sets
+  the seconds a batch may take.
+- **`db.create_function(name, body | file=…, params=…, returns=…)`** and
+  `db.create_procedure(…)` take code as text.
+- **`pondra.sql`, `pondra.table`, `pondra.call`, `pondra.secret`** use the current connection:
+  in a procedure, the one lent its caller; in a notebook, the newest one made. So code moves
+  between the two unchanged. `con` as a procedure's first parameter still gets the connection
+  (0.22's `@con.procedure`).
+- **PySpark's names** (`pondra.spark`): `F.udf(f, "int")` / `@F.udf("int")`,
+  `@F.pandas_udf("double")` (pandas Series in and out, once a batch), and `spark.udf.register(name,
+  f, returnType)` (then `spark.sql("SELECT name(…)")`). Each is a lake function, made when first
+  used; `spark_check.py`'s four UDF pipelines compare them with PySpark 4.0.1.

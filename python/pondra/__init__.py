@@ -1,6 +1,6 @@
 """Pondra from Python: SQL and frames over a lake, into pandas / Polars / Arrow; exactly-once
-appends, change feeds and key lookups; macros and procedures. Pure Python over a node's HTTP API;
-pyarrow for results. `pip install pondra` also installs the `pondra` binary itself.
+appends, change feeds and key lookups; functions and procedures in SQL or Python. Pure Python over
+a node's HTTP API; pyarrow for results. `pip install pondra` also installs the `pondra` binary.
 
     import pondra
     from pondra import col
@@ -14,16 +14,45 @@ pyarrow for results. `pip install pondra` also installs the `pondra` binary itse
     con.sql("SELECT * FROM top WHERE amount > $min", min=3).to_polars()   # SQL reads Python names
     for row in con.watch("events"): ...                         # new rows as they commit
 
+    @con.function                                               # a Python function for SQL and frames
+    def slug(title: str) -> str: ...
+    @con.procedure                                              # a procedure, run on the node as its caller
+    def nightly(day: date): pondra.sql("INSERT INTO daily SELECT … WHERE ts::DATE = $day", day=day)
+    pondra.sql("SELECT slug(title) FROM posts")                 # the newest connection (in a procedure: its caller's)
+
 `pondra.spark` has PySpark's names for the same frames; `%load_ext pondra` gives notebooks `%%sql`.
 Also over the Postgres protocol (`pondra serve --pg 0.0.0.0:5432`) with psycopg, SQLAlchemy, etc.
 """
-from .client import Pondra, Result, binary, connect, local
-from .frame import Expr, Frame, GroupBy, coalesce, col, concat, concat_str, lit, sql_expr, when
+from .client import Pondra, Result, Run, binary, connect, current, local
+from .frame import Expr, Frame, GroupBy, coalesce, col, concat, concat_str, fn, lit, sql_expr, when
 from .frame import all, count, first, last, len, max, mean, median, min, n_unique, sum  # noqa: A004 (Polars' names)
 
-__version__ = "0.23.0"
-__all__ = ["connect", "local", "Pondra", "Result", "Frame", "Expr", "GroupBy", "col", "lit", "when", "sql_expr", "coalesce", "concat", "concat_str",
+__version__ = "0.24.0"
+__all__ = ["connect", "local", "current", "sql", "table", "call", "secret", "fn", "Pondra", "Result", "Run", "Frame", "Expr", "GroupBy", "col", "lit", "when",
+           "sql_expr", "coalesce", "concat", "concat_str",
            "all", "count", "first", "last", "len", "max", "mean", "median", "min", "n_unique", "sum"]
+
+
+def sql(query, job=None, **names):
+    """SQL on the current connection (`current()`: in a procedure, its caller's; elsewhere the newest
+    made), as `duckdb.sql` runs on DuckDB's: code moves between a notebook and a procedure as it is."""
+    import sys
+    return current()._sql(query, job, names, sys._getframe(1))
+
+
+def table(name):
+    """A table of the current connection's lake, as a frame."""
+    return current().table(name)
+
+
+def call(name, *args, **kwargs):
+    """A procedure, called on the current connection (`Pondra.call`)."""
+    return current().call(name, *args, **kwargs)
+
+
+def secret(name):
+    """A secret's values, in a procedure (`Pondra.secret`)."""
+    return current().secret(name)
 
 
 def load_ipython_extension(ipython):

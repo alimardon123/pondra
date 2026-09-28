@@ -1,6 +1,6 @@
 # ADR-027: SQL and Python as one — functions and procedures (round 24)
 
-**Date:** 2026-09-28 · **Status:** proposed (for the owner) · **Follows:** ADR-023 (macros and procedures), ADR-025, ADR-026
+**Date:** 2026-09-28 · **Status:** accepted and built (round 24, 0.24.0) · **Follows:** ADR-023 (macros and procedures), ADR-025, ADR-026
 
 ## Context
 
@@ -271,3 +271,158 @@ send_report(date.today(), ["ann@example.com"])               # …or right here,
 - **Speed:** a `CALL` of a small procedure is under 10 ms warm (0.15 s in 0.22). A Python
   function over 1M rows runs at pyarrow's speed when vectorized; per row, the rate is measured and
   reported.
+
+## As built (round 24)
+
+All of the decision was built; where the building found a better shape, or a limit, it is here.
+
+**Where the code is.**
+
+| | |
+|---|---|
+| `src/routines.rs` | `CREATE FUNCTION` / `CREATE PROCEDURE` in Postgres's forms (and DuckDB's `CREATE FUNCTION f(x) AS expr`); SQL functions expanded in place, arguments cast to their types, `RETURNS` cast, `STRICT` as a `CASE`, `$1`; Python functions' calls made whole (every argument in place, cast); `CALL` and `SELECT pondra.start(…)`; notices (`with_notices`) |
+| `src/python.rs` | the worker pool: `python -m pondra.worker`, framed Arrow IPC over its standard input and output |
+| `src/pyfn.rs` | Python functions as DataFusion functions (per row, vectorized) and table functions |
+| `src/runs.rs` | the run log (`pondra.runs`), tasks and their ticks, `pondra.routines` / `pondra.tasks` |
+| `src/optimize.rs` | `AsyncBelow`: an async function in a GROUP BY, ORDER BY or window is computed by a projection below it |
+| `python/pondra/worker.py`, `plpy.py` | the worker; PL/Python's `plpy` |
+| `python/pondra/client.py` | `pondra.sql` and kin, `@db.function`, `@db.procedure`, `create_function`, `call(wait=False)`, notices, `Run` |
+| `python/pondra/spark/` | PySpark's `udf`, `pandas_udf`, `spark.udf.register` |
+
+**SQL functions.** A scalar body is an expression (`RETURN x * 2`), a query's one value (`AS $$
+SELECT x * 2 $$`: the expression itself), or a scalar subquery (`AS $$ SELECT max(v) FROM t $$`).
+A table body's columns are taken by place and cast to `RETURNS TABLE`'s; `SETOF t` is a table of
+one column named after the function. `IMMUTABLE`, `STABLE`, `VOLATILE`, `PARALLEL …`, `COST`,
+`ROWS`, `LEAKPROOF` and `SECURITY INVOKER` are accepted; `SECURITY DEFINER` is refused (a routine
+runs with its caller's rights, always), and so are `OUT` parameters (return a table). One
+difference from Postgres stays: a cast of 7.9 to `INT` truncates to 7 where Postgres rounds to 8
+(DataFusion's cast).
+
+**Python functions.**
+
+- **A call is made whole where SQL comes in:** named arguments and defaults put in place, each
+  argument cast to its parameter's type, then called by its registered name. So the DataFusion
+  function's signature is exact, and `slug(title => t)` works.
+- **Parameters of type `ANY`** (`anyelement`), and those of type `VARIANT` or `JSON`, take any
+  value as it comes, uncast (DataFusion has no such type to cast to). A VARIANT's JSON text
+  arrives as the value it holds. The decorators give an unannotated parameter `ANY`.
+- **Where DataFusion runs async functions.** It runs them in projections, filters and aggregates'
+  arguments, but not in a GROUP BY, an ORDER BY, a window or a COUNT(DISTINCT) (which becomes a
+  GROUP BY): "async functions should not be called directly". The rule `AsyncBelow` puts such a
+  call in a projection below that node; Flight functions (`udf.rs`) gain it too.
+- **An IMMUTABLE or STABLE function called per row gets each distinct argument once a batch**
+  (`pyfn::distinct`, from query.farm's caching of DuckDB's remote functions): the answers go
+  back to every row that had them. 50,000 rows of 7 values at 20 ms a call take 0.6 s, not
+  1,000 s. A volatile or vectorized function gets every row.
+- **Spreading.** A spread query's plan now lets `AsyncFuncExec` split (`spmd::spread`): each node
+  runs its own rows through its own workers. A node without `--python` fails its slice, and the
+  query runs again on the node it came to, as any failed spread does. A query reading a Python
+  table function runs on one node (`routines::pinned`); one calling a volatile Python function
+  isn't answered from the result cache (`routines::volatile`).
+- **A table function's arguments** are values, worked out once (DataFusion's simplifier folds
+  `current_date - 1`). It isn't called per row of another table (no LATERAL).
+
+**Procedures.**
+
+- **Workers.** A procedure runs on a warm worker. A procedure called by a procedure (depth > 1)
+  takes no slot of its own: it would wait for its caller's, forever. Slots are `PONDRA_PROCEDURES`
+  (four per core) for procedures and one per core for functions' batches.
+- **Warm calls.** `CALL ping(1)` of a Python procedure takes a median of 2.4 ms over HTTP
+  (0.15 s in 0.22).
+- **Packages** (`WITH (packages = …)`) are installed once per node and list, with uv if it is on
+  the PATH, else pip, into `<temp>/pondra-python/<hash of the list>`. That folder comes first on
+  the workers' `PYTHONPATH`, so the `--python` environment itself never changes. A routine with
+  packages is compiled when first used, not when made: installing them mustn't hold the DDL lock.
+- **The body.** Postgres's PL/Python form is the body of a function taking the parameters. Its
+  last line, if an expression, is returned, so 0.22's bodies run unchanged, and so do `print` and
+  `return`. The decorators' form is a module, whose `entry` function is called.
+- **`plpy`** has `execute` (with `prepare`'d plans and `$1` values), `notice` / `info` /
+  `warning`, `debug` / `log` (to the node's log), `error`, `fatal`, the `quote_*` functions, `SD`
+  and `GD`. `plpy.subtransaction` is refused: Pondra commits each statement on its own.
+- **Secrets.** `pondra.secret(name)` is `GET /secrets/{name}`, answered only for a token lent to a
+  running procedure. Every value it hands out (except `type` and `scope`) is replaced by `***` in
+  that procedure's notices, its error, and so in the run log; so is its lent token. The values
+  are kept at four characters and longer: a `port` of `25` would blank out every 25.
+- **Notices** go to:
+  - HTTP: the `x-pondra-notices` header, a JSON list of lines in ASCII, the first 32 KB;
+  - the Python client: printed and kept in `db.notices`. Inside a procedure it prints them in
+    turn, so a nested procedure's reach the outer caller;
+  - JavaScript: `db.notices`, and `onNotice` (default `console.log`);
+  - Postgres: `NoticeResponse`;
+  - MCP: `notices` in the tool's answer;
+  - the shell and `pondra run`: printed before the answer.
+- **Stack.** A query's future is over 100 KB. `App::query_as` and `write::on_node_as` now make
+  theirs on the heap (`#[inline(never)]`, boxed), so SQL procedures calling procedures 16 deep no
+  longer overflow a worker thread's stack. `harness.py procedures`, "…stop 16 deep", killed the
+  node before this.
+
+**The run log** is a keyed table of the lake's own, `pondra$runs` (hidden), made on first use by
+the leader (`Ddl::RunLog`). Each node's writer batches its lines (50 ms) as one producer, so they
+are exactly-once. Rows go after `PONDRA_RUNS_DAYS` (30). Columns:
+
+- `id`, `routine`;
+- `caller` (a role; `task:<name>` for a task's calls; `schedule` for a task's own run);
+- `node`, `job`, `args` (JSON);
+- `started`, `ended`;
+- `status` (`running`, `ok`, `failed`);
+- `notices`, `error` (each cut at 64 KB).
+
+A task's tick has the id `task-<name>-<tick>`, so a tick run again after a failover is one row,
+and a tick is marked done only once its line is written. A client's call doesn't wait for its
+line: a node killed within the writer's 50 ms can lose it.
+`SELECT pondra.start('p', …)` answers the run's id; `db.call(…, wait=False)` answers a `Run`
+(`status()`, `wait()`).
+
+**Tasks.**
+
+- **Schedules:** `'5 minutes'`, `'every 30 seconds'`, Snowflake's `'5 MINUTE'`, or cron with an
+  optional time zone (`'cron 0 2 * * * Europe/Berlin'`, `'USING CRON …'`, or the five fields
+  alone), through chrono-tz (arrow already builds it).
+- **Ticks:** intervals are aligned to the epoch. Ticks missed while no node led run once, as the
+  latest of them, as cron does. Overlapping ticks of one task wait: the next is taken once the
+  running one ends.
+- **Rights:** a task's statement runs as an admin (only an admin makes one).
+- **Listing:** `SHOW TASKS` and `pondra.tasks` give the last and next tick.
+
+**The decorators.**
+
+- **What goes along:** a function's module is `from __future__ import annotations`, the imports
+  it uses (modules, and names imported from modules), the notebook's constants it uses, the
+  helper functions and classes it uses (recursively), then its own source without its
+  decorators.
+- **What is refused:** a closure (a variable of an enclosing function), and anything else from
+  the notebook (a DataFrame, a connection), with the fix in the message.
+- **Lambdas** (PySpark's `udf(lambda …)`) become a `def`.
+- **PySpark:** `F.udf`, `F.pandas_udf` (a batch as pandas Series) and `spark.udf.register` make
+  lake functions; they are compared with PySpark 4.0.1 in `spark_check.py` (4 more pipelines).
+
+**Not built, or later.**
+
+- `information_schema.routines` and `SHOW FUNCTIONS` list DataFusion's functions and the Python
+  ones a session registers, not SQL functions (which are expanded away). `SHOW USER FUNCTIONS`
+  (Snowflake's words), `SHOW PROCEDURES`, `SHOW TASKS` and `pondra.routines` list the lake's own.
+  (Taking `SHOW FUNCTIONS` for the lake's own failed a record of DataFusion's
+  `information_schema.slt`.)
+- A SQL function's body naming `$3` with two parameters is refused when made ("there is no
+  parameter $3"), as Postgres does.
+- Notebooks in the catalog wait for round 25's console.
+
+**The tests.**
+
+- `harness.py functions` (31 checks):
+  - Postgres's forms, and `SHOW USER FUNCTIONS`;
+  - Python functions of each shape, and anywhere SQL goes; distinct arguments sent once;
+  - spread over three nodes (each node's own workers), and a table function on one node;
+  - the result cache and volatility, and no connection from a function;
+  - the time limit, and a worker killed mid-query;
+  - mail through `aiosmtpd` from HTTP, Postgres (NOTICE), MCP, JavaScript and the shell;
+  - answers, a job's exactly-once writes, and a secret never shown;
+  - the run log and `pondra.start`;
+  - nested procedures with two slots;
+  - a notebook's decorated functions (a helper, a constant, an import), and a DataFrame refused;
+  - PL/Python;
+  - speed;
+  - a task through a leader failover;
+  - idle workers gone.
+- `harness.py procedures` (0.22's 29 checks) still passes, and so do `frames_check.py` and
+  `spark_check.py` (with the four UDF pipelines).

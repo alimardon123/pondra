@@ -1,6 +1,6 @@
 # Prototype status: Pondra, a streamhouse in one binary
 
-**Date:** 2026-09-28 (round 23) · **Plan:** ADR-002 to ADR-027, `roadmap.md` · **Code:** `pondra.zip` / `pondra.bundle` (≈22,200 lines of Rust, plus Python and JavaScript clients, packaging, and test and benchmark tools)
+**Date:** 2026-09-28 (round 24) · **Plan:** ADR-002 to ADR-027, `roadmap.md` · **Code:** `pondra.zip` / `pondra.bundle` (≈23,800 lines of Rust, plus Python and JavaScript clients, packaging, and test and benchmark tools)
 **Name:** the prototype formerly called `lh` is now **Pondra**. The name is free on crates.io, PyPI and npm. A small personal-finance app uses it (pondra.app), a different category; run a trademark search before a public launch.
 
 ## Where it stands
@@ -14,6 +14,67 @@ One Rust binary replaces the Kafka + Flink + Spark + metastore + ZooKeeper stack
 - upsert and merge tables.
 
 Start more copies on the same bucket to scale out. The only state is object storage. There's no JVM, no database server and no coordination service.
+
+**Round 24 made SQL and Python one** (ADR-027): someone who works only in SQL or only in Python
+can do anything the other can.
+
+1. **`CREATE FUNCTION` in Postgres's forms:** `RETURN expr`, `LANGUAGE sql AS $$ SELECT … $$` (a
+   value, a scalar subquery, or `RETURNS TABLE` / `SETOF`), `$1`, typed arguments cast as
+   Postgres casts them, `DEFAULT`, `STRICT`, `IMMUTABLE`; DuckDB's `CREATE MACRO` is the same
+   thing. SQL functions are expanded where SQL comes in, so their queries spread as any other.
+2. **Python functions:** per row, vectorized (`WITH (vectorized = true)`: pyarrow in and out) or a
+   table (`RETURNS TABLE`), with `WITH (packages = …)` installed once per node, PL/Python's
+   `plpy`, a time limit per batch and no connection back. They run on warm workers beside every
+   node (one per core at most, gone when idle), anywhere SQL's own functions go (GROUP BY, ORDER
+   BY, windows), and a spread query runs each node's rows through its own workers. An IMMUTABLE
+   one gets each distinct argument once a batch (a thousand calls, not a million). A worker
+   killed mid-query fails that query with why, and the next one runs.
+3. **Procedures that do anything Python can:** send mail, call APIs, read files, as their caller
+   (`pondra.sql` is the caller's connection, lent for the call). `pondra.secret('smtp')` reads a
+   `CREATE SECRET` that never shows in notices, errors or the log. What a procedure prints comes
+   back as notices through every door: the shell, psql (NOTICE), HTTP, the Python and JavaScript
+   clients, MCP. `return` is optional.
+4. **A run log and schedules:** every call is a row of `pondra.runs` (caller, arguments, outcome,
+   notices, error); `SELECT pondra.start(…)` / `db.call(…, wait=False)` start one without
+   waiting; `CREATE TASK … SCHEDULE 'cron 0 2 * * * UTC' | '5 minutes' AS CALL …` runs on the
+   leader, each tick's writes once through a leader failover.
+5. **A notebook's function, as it is:** `@db.function` and `@db.procedure` take along the imports,
+   helpers and constants it uses, refuse a DataFrame with the fix, and hand the function back
+   unchanged; `pondra.fn.slug(col("title"))` in frames; PySpark's `udf`, `pandas_udf` and
+   `spark.udf.register` equal PySpark's (4 more `spark_check.py` pipelines).
+6. **Fast:** a warm `CALL` of a Python procedure takes 2.4 ms over HTTP (a Python process per
+   call took 0.15 s); a Python function runs over 1M rows at 15M rows/s vectorized and 6.6M rows/s
+   per row on this 2-vCPU sandbox.
+7. **What building it found:** DataFusion can't run an async function in a GROUP BY, ORDER BY,
+   window or COUNT(DISTINCT) (a planning rule now moves it below); spread plans refused async
+   functions (now they split); and SQL procedures calling procedures 16 deep overflowed a
+   thread's stack, a query's future being 120 KB (now made on the heap).
+8. **Tests** (`logs/round24/`):
+   - **Locally:**
+     - `harness.py all`: 34 tests, with the new `functions` (31 checks);
+     - `frames_check.py`: 26 pipelines, one question 11 ways;
+     - `spark_check.py`: 55 of 55, 4 of them UDFs;
+     - `formats_check.py`: 50 tables;
+     - `tpch_frames.py`: 22 of 22, three ways;
+     - `cluster.py`: failover 4 times, users, race and spread;
+     - `open_check.py`, `asof_check.py`, `stream_check.py`, `smoke.py`, `package_check.py`;
+     - `spread_tpch.py`: 22 of 22 spread.
+   - **DataFusion's sqllogictest:** 16,645 of 24,783 records (67.2%, as in round 23). Taking
+     `SHOW FUNCTIONS` for the lake's own and accepting `RETURN $2` with one parameter each cost
+     a record; both were changed to keep them.
+   - **Single-node TPC-H SF1, 2 vCPUs:**
+
+     | Engine | Time |
+     |---|---|
+     | Pondra | 1.91 s |
+     | DuckDB over the same Parquet | 3.17 s |
+     | DuckDB in its own format | 1.59 s |
+     | Polars | 3.72 s |
+     | Daft | 6.64 s |
+
+   - **On simulated R2:** `functions`, `procedures`, failover and users with replicated acks, and
+     two crash runs.
+   - **On real R2:** `functions` (a warm `CALL` 2.2 ms there too) and `procedures`.
 
 **Round 23 read and wrote everything else** (ADR-026): Pondra is a processing engine for data
 that isn't in its lake too.

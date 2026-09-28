@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """What `pip install pondra` gives, tried: the binary is found, a node starts on a new lake, and a
-table, an exactly-once append, a view, a query, a frame and a Python procedure work. Run where the
+table, an exactly-once append, a view, a query, a frame, a Python procedure and function work. Run where the
 wheel is installed (CI, and containers with old and new Linux).
 
 Without pyarrow (`pip install pondra` alone), what needs none: rows, one value and a text table
@@ -31,6 +31,12 @@ with pondra.local(lake, python=arrow) as db:
             return con.table("t").filter(pondra.col("v") == v).select(pondra.len().alias("n"))
 
         assert db.call("count_py", "b").rows() == [{"n": 1}] and db.sql("CALL count_py()").rows() == [{"n": 2}]
+
+        @db.function  # (a Python function, run by the node's workers: the package's pondra.worker)
+        def shout(v: str) -> str:
+            return v.upper() + "!"
+
+        assert db.sql("SELECT shout(v) AS s FROM t ORDER BY s LIMIT 1").rows() == [{"s": "A!"}]
     else:  # rows as JSON (a null is None), one value, a text table; tables say what they need
         assert db.sql("SELECT 1 AS a, NULL AS b UNION ALL SELECT 2, 'x' ORDER BY a").rows() == [{"a": 1, "b": None}, {"a": 2, "b": "x"}]
         assert db.table("t").select(pondra.len()).item() == 3

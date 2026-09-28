@@ -510,6 +510,7 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
     use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider, MemorySchemaProvider};
     let ctx = lake.session();
     crate::udf::register(lake, &ctx).await?; // the lake's own functions (`POST /functions/…`)
+    crate::pyfn::register(lake, &ctx).await?; // …and its Python functions (`CREATE FUNCTION … LANGUAGE python`)
     let listing = ["information_schema", "show tables", "show columns"].iter().any(|w| sql.to_lowercase().contains(w)); // (every table)
     let views = stored_views(lake, sql, listing).await?; // (their tables are wanted too)
     let text = views.iter().fold(sql.to_string(), |t, (_, s)| format!("{t} {s}"));
@@ -558,6 +559,20 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
             catalog.schema(s).expect("registered").register_table(t.to_string(), view)?;
         }
         ctx.register_catalog(ns, catalog);
+    }
+    if crate::runs::mentioned(&text) && default.schema("pondra").is_none() {
+        // (`pondra.runs`, `pondra.routines`, `pondra.tasks`; a schema of the lake's own called pondra wins)
+        use datafusion::catalog::SchemaProvider;
+        let system = Arc::new(MemorySchemaProvider::new());
+        for (name, table) in crate::runs::tables(lake).await? {
+            system.register_table(name.into(), table)?;
+        }
+        let runs = match lake.cat.get::<TableMeta>(&crate::store::table_key(crate::runs::TABLE)).await? {
+            Some(meta) => named(&ctx, table_view(lake, &ctx, crate::runs::TABLE, &sys(meta.clone()), upto).await?, &meta, false)?,
+            None => crate::runs::no_runs()?,
+        };
+        system.register_table("runs".into(), runs)?;
+        default.register_schema("pondra", system)?;
     }
     if let Ok(sent) = SENT.try_with(|t| t.clone()) {
         for (name, batches) in sent.iter() {

@@ -1,0 +1,13 @@
+21:24:59 start all
+21:32:13 all exit=0
+21:32:13 start frames
+21:32:17 frames exit=0
+21:32:17 start spark
+21:32:55 spark exit=0
+21:32:55 start failover
+21:34:01 failover exit=0
+21:34:01 start smoke
+21:34:02 smoke exit=0
+21:34:02 start package_check
+21:34:04 package_check exit=0
+21:34:04 SUITE2_DONE

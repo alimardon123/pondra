@@ -1,0 +1,210 @@
+== duckdb
+  duckdb            q1    0.185 s
+  duckdb            q2    0.032 s
+  duckdb            q3    0.124 s
+  duckdb            q4    0.104 s
+  duckdb            q5    0.160 s
+  duckdb            q6    0.086 s
+  duckdb            q7    0.146 s
+  duckdb            q8    0.194 s
+  duckdb            q9    0.299 s
+  duckdb            q10   0.178 s
+  duckdb            q11   0.023 s
+  duckdb            q12   0.106 s
+  duckdb            q13   0.184 s
+  duckdb            q14   0.137 s
+  duckdb            q15   0.073 s
+  duckdb            q16   0.037 s
+  duckdb            q17   0.136 s
+  duckdb            q18   0.259 s
+  duckdb            q19   0.168 s
+  duckdb            q20   0.135 s
+  duckdb            q21   0.359 s
+  duckdb            q22   0.043 s
+== duckdb-native
+  duckdb-native     q1    0.144 s
+  duckdb-native     q2    0.018 s
+  duckdb-native     q3    0.046 s
+  duckdb-native     q4    0.058 s
+  duckdb-native     q5    0.054 s
+  duckdb-native     q6    0.038 s
+  duckdb-native     q7    0.054 s
+  duckdb-native     q8    0.036 s
+  duckdb-native     q9    0.158 s
+  duckdb-native     q10   0.103 s
+  duckdb-native     q11   0.006 s
+  duckdb-native     q12   0.067 s
+  duckdb-native     q13   0.115 s
+  duckdb-native     q14   0.044 s
+  duckdb-native     q15   0.035 s
+  duckdb-native     q16   0.038 s
+  duckdb-native     q17   0.029 s
+  duckdb-native     q18   0.186 s
+  duckdb-native     q19   0.107 s
+  duckdb-native     q20   0.061 s
+  duckdb-native     q21   0.169 s
+  duckdb-native     q22   0.024 s
+== pondra
+  pondra            q1    0.125 s
+  pondra            q2    0.024 s
+  pondra            q3    0.053 s
+  pondra            q4    0.056 s
+  pondra            q5    0.090 s
+  pondra            q6    0.053 s
+  pondra            q7    0.076 s
+  pondra            q8    0.063 s
+  pondra            q9    0.170 s
+  pondra            q10   0.143 s
+  pondra            q11   0.018 s
+  pondra            q12   0.090 s
+  pondra            q13   0.094 s
+  pondra            q14   0.019 s
+  pondra            q15   0.034 s
+  pondra            q16   0.047 s
+  pondra            q17   0.112 s
+  pondra            q18   0.175 s
+  pondra            q19   0.118 s
+  pondra            q20   0.079 s
+  pondra            q21   0.250 s
+  pondra            q22   0.025 s
+== pondra-cold
+  pondra-cold       q1    0.207 s
+  pondra-cold       q2    0.040 s
+  pondra-cold       q3    0.120 s
+  pondra-cold       q4    0.086 s
+  pondra-cold       q5    0.157 s
+  pondra-cold       q6    0.082 s
+  pondra-cold       q7    0.152 s
+  pondra-cold       q8    0.157 s
+  pondra-cold       q9    0.223 s
+  pondra-cold       q10   0.214 s
+  pondra-cold       q11   0.033 s
+  pondra-cold       q12   0.133 s
+  pondra-cold       q13   0.159 s
+  pondra-cold       q14   0.076 s
+  pondra-cold       q15   0.124 s
+  pondra-cold       q16   0.060 s
+  pondra-cold       q17   0.169 s
+  pondra-cold       q18   0.288 s
+  pondra-cold       q19   0.154 s
+  pondra-cold       q20   0.126 s
+  pondra-cold       q21   0.408 s
+  pondra-cold       q22   0.038 s
+== polars
+  polars            q1    0.298 s
+  polars            q2    0.016 s
+  polars            q3    0.160 s
+  polars            q4    0.092 s
+  polars            q5    0.153 s
+  polars            q6    0.058 s
+  polars            q7    0.147 s
+  polars            q8    0.173 s
+  polars            q9    0.407 s
+  polars            q10   0.150 s
+  polars            q11   0.029 s
+  polars            q12   0.107 s
+  polars            q13   0.230 s
+  polars            q14   0.084 s
+  polars            q15   0.065 s
+  polars            q16   0.035 s
+  polars            q17   0.117 s
+  polars            q18   0.322 s
+  polars            q19   0.115 s
+  polars            q20   0.203 s
+  polars            q21   0.719 s
+  polars            q22   0.035 s
+== polars-streaming
+  polars-streaming  q1    0.277 s
+  polars-streaming  q2    0.024 s
+  polars-streaming  q3    0.146 s
+  polars-streaming  q4    0.134 s
+  polars-streaming  q5    0.175 s
+  polars-streaming  q6    0.055 s
+  polars-streaming  q7    0.134 s
+  polars-streaming  q8    0.150 s
+  polars-streaming  q9    0.316 s
+  polars-streaming  q10   0.150 s
+  polars-streaming  q11   0.028 s
+  polars-streaming  q12   0.097 s
+  polars-streaming  q13   0.171 s
+  polars-streaming  q14   0.072 s
+  polars-streaming  q15   0.058 s
+  polars-streaming  q16   0.036 s
+  polars-streaming  q17   0.107 s
+  polars-streaming  q18   0.221 s
+  polars-streaming  q19   0.106 s
+  polars-streaming  q20   0.133 s
+  polars-streaming  q21   0.535 s
+  polars-streaming  q22   0.032 s
+== daft
+  daft              q1    0.313 s
+  daft              q2    0.113 s
+  daft              q3    0.319 s
+  daft              q4    0.104 s
+  daft              q5    0.223 s
+  daft              q6    0.142 s
+  daft              q7    0.308 s
+  daft              q8    0.285 s
+  daft              q9    0.435 s
+  daft              q10   0.449 s
+  daft              q11   0.125 s
+  daft              q12   0.288 s
+  daft              q13   0.252 s
+  daft              q14   0.246 s
+  daft              q15   0.215 s
+  daft              q16   0.114 s
+  daft              q17   0.547 s
+  daft              q18   0.355 s
+  daft              q19   0.392 s
+  daft              q20   0.253 s
+  daft              q21   1.099 s
+  daft              q22   0.067 s
+== bodo
+  bodo              q1   11.139 s
+  bodo              q2    2.627 s
+  bodo              q3    6.116 s
+  bodo              q4    3.232 s
+  bodo              q5    3.863 s
+  bodo              q6    0.770 s
+  bodo              q7   11.192 s
+  bodo              q8  FAILED:   warnings.warn(
+  bodo              q9    9.279 s
+  bodo              q10  14.398 s
+  bodo              q11   0.659 s
+  bodo              q12   3.840 s
+  bodo              q13   2.787 s
+  bodo              q14   1.211 s
+  bodo              q15   3.449 s
+  bodo              q16   1.442 s
+  bodo              q17   1.086 s
+  bodo              q18   6.532 s
+  bodo              q19   2.788 s
+  bodo              q20   4.208 s
+  bodo              q21  10.525 s
+  bodo              q22   1.217 s
+
+            duckdbduckdb-native      pondra pondra-cold      polarspolars-streaming        daft        bodo
+q1          0.185      0.144      0.125      0.207      0.298      0.277      0.313     11.139
+q2          0.032      0.018      0.024      0.040      0.016      0.024      0.113      2.627
+q3          0.124      0.046      0.053      0.120      0.160      0.146      0.319      6.116
+q4          0.104      0.058      0.056      0.086      0.092      0.134      0.104      3.232!
+q5          0.160      0.054      0.090      0.157      0.153      0.175      0.223      3.863!
+q6          0.086      0.038      0.053      0.082      0.058      0.055      0.142      0.770!
+q7          0.146      0.054      0.076      0.152      0.147      0.134      0.308     11.192
+q8          0.194      0.036      0.063      0.157      0.173      0.150      0.285        FAIL
+q9          0.299      0.158      0.170      0.223      0.407      0.316      0.435      9.279!
+q10         0.178      0.103      0.143      0.214      0.150      0.150      0.449     14.398!
+q11         0.023      0.006      0.018      0.033      0.029      0.028      0.125      0.659
+q12         0.106      0.067      0.090      0.133      0.107      0.097      0.288      3.840
+q13         0.184      0.115      0.094      0.159      0.230      0.171      0.252      2.787
+q14         0.137      0.044      0.019      0.076      0.084      0.072      0.246      1.211!
+q15         0.073      0.035      0.034      0.124      0.065      0.058      0.215!      3.449
+q16         0.037      0.038      0.047      0.060      0.035      0.036      0.114      1.442
+q17         0.136      0.029      0.112      0.169      0.117      0.107      0.547      1.086
+q18         0.259      0.186      0.175      0.288      0.322      0.221      0.355      6.532
+q19         0.168      0.107      0.118      0.154      0.115      0.106      0.392      2.788
+q20         0.135      0.061      0.079      0.126      0.203      0.133      0.253      4.208!
+q21         0.359      0.169      0.250      0.408      0.719      0.535      1.099     10.525
+q22         0.043      0.024      0.025      0.038      0.035      0.032      0.067      1.217
+total         3.17        1.59        1.91        3.21        3.72        3.16        6.64         nan
+{"pondra_load_s": 14.2, "duckdb_load_s": 0.0, "duckdb_wall_s": 10.5, "duckdb-native_load_s": 2.4, "duckdb-native_wall_s": 7.9, "pondra_warm_s": 7.7, "pondra_wall_s": 6.7, "pondra-cold_wall_s": 10.9, "polars_wall_s": 12.7, "polars-streaming_wall_s": 10.5, "daft_wall_s": 38.7, "bodo_wall_s": 984.1}
