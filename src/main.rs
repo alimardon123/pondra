@@ -28,6 +28,8 @@ mod live;
 mod serve;
 mod shell;
 mod cluster;
+mod console;
+mod dbserver;
 mod log;
 mod manifest;
 mod metrics;
@@ -89,6 +91,10 @@ enum Cmd {
         /// Address other nodes reach this one at (also the listen address).
         #[arg(long, default_value = "127.0.0.1:8080")]
         addr: String,
+        /// Address other nodes reach this one at, if not `--addr`: behind `pondra server`,
+        /// `host:port/db/name` (the server passes it through).
+        #[arg(long)]
+        advertise: Option<String>,
         /// Read-only node: any number can run next to the single writer.
         #[arg(long)]
         reader: bool,
@@ -194,6 +200,42 @@ enum Cmd {
         #[arg(long)]
         python: Option<String>,
     },
+    /// Serve every lake in a folder as a database: Postgres clients pick one by name (`psql -d
+    /// sales`), HTTP clients by `/db/sales/…`, and the console is at `/`. Each database runs as a
+    /// node of its own, started when first used and stopped when idle (PONDRA_DATABASE_IDLE_SECS,
+    /// 600); `CREATE DATABASE` makes another. Flight and Kafka stay with `pondra serve`.
+    Server {
+        /// The folder of lakes (each subfolder holding one is a database).
+        #[arg(default_value = ".")]
+        folder: String,
+        /// Where HTTP clients, the console and other nodes reach the server.
+        #[arg(long, default_value = "127.0.0.1:8080")]
+        addr: String,
+        /// Speak the Postgres wire protocol here (e.g. 0.0.0.0:5432).
+        #[arg(long)]
+        pg: Option<String>,
+        /// The database a client that names none gets (default: `lake`, else the only one).
+        #[arg(long)]
+        default: Option<String>,
+        /// Tokens, as `pondra serve` takes them (and PONDRA_*_TOKEN): every database's node gets them.
+        #[arg(long)]
+        read_token: Option<String>,
+        #[arg(long)]
+        write_token: Option<String>,
+        #[arg(long)]
+        admin_token: Option<String>,
+        /// Python for functions and procedures, as `pondra serve --python`.
+        #[arg(long)]
+        python: Option<String>,
+        /// Each database's `--tier-secs`.
+        #[arg(long)]
+        tier_secs: Option<f64>,
+        /// (Not here: Flight and Kafka ports mean one lake. Use `pondra serve` for them.)
+        #[arg(long, hide = true)]
+        flight: Option<String>,
+        #[arg(long, hide = true)]
+        kafka: Option<String>,
+    },
     /// Print catalog entries whose keys start with `prefix` (t/ tables, s/ segments, p/ producers…).
     Catalog {
         #[arg(long)]
@@ -231,7 +273,7 @@ enum Cmd {
 
 /// Ctrl-C, SIGTERM (how schedulers and `kill` stop a process), or with `stdin`, standard input
 /// closing (on every OS alike, and even when the program that started this one was killed).
-async fn stopped(stdin: bool) {
+pub(crate) async fn stopped(stdin: bool) {
     let closed = async move {
         match stdin {
             true => drop(tokio::task::spawn_blocking(|| std::io::copy(&mut std::io::stdin(), &mut std::io::sink())).await),
@@ -260,7 +302,7 @@ async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let Some(cmd) = cli.cmd else { return shell::run(&cli.lake.unwrap_or_else(|| "lake".into())).await };
     match cmd {
-        Cmd::Serve { dir, addr, reader, flush_ms, tier_secs, task_ms, memory_gb, retain_secs, changelog_secs, backlog, cache_dir, cache_gb, ack, replicas, fsync, publish, pg, kafka, kafka_advertise, flight, read_token, write_token, admin_token, attach: attached, attach_found, stop_with_stdin, python } => {
+        Cmd::Serve { dir, addr, advertise, reader, flush_ms, tier_secs, task_ms, memory_gb, retain_secs, changelog_secs, backlog, cache_dir, cache_gb, ack, replicas, fsync, publish, pg, kafka, kafka_advertise, flight, read_token, write_token, admin_token, attach: attached, attach_found, stop_with_stdin, python } => {
             let env = |flag: Option<String>, var: &str| flag.or_else(|| std::env::var(var).ok()).filter(|t| !t.is_empty());
             let auth = Arc::new(auth::Auth::new(env(read_token, "PONDRA_READ_TOKEN"), env(write_token, "PONDRA_WRITE_TOKEN"), env(admin_token.clone(), "PONDRA_ADMIN_TOKEN")));
             if let Some(t) = env(admin_token, "PONDRA_ADMIN_TOKEN") {
@@ -282,6 +324,8 @@ async fn run() -> anyhow::Result<()> {
                 std::env::set_var("PONDRA_CACHE_DIR", d);
             }
             let (_, store, _) = store::open_store(&dir)?;
+            let listen = addr.clone();
+            let addr = advertise.unwrap_or(addr); // (how others reach it: its cluster name)
             let cluster = cluster::Cluster::join(&store, &addr, reader).await?;
             let leader = cluster.is_leader();
             if leader {
@@ -458,7 +502,7 @@ async fn run() -> anyhow::Result<()> {
             eprintln!("pondra {role} (term {}) serving {dir} on {addr}", cluster.leader.n);
             // No Nagle: a small answer goes out at once, not after the client's delayed ACK (the
             // Postgres, Kafka and Flight ports do the same).
-            let listener = axum::serve::ListenerExt::tap_io(tokio::net::TcpListener::bind(&addr).await?, |tcp| drop(tcp.set_nodelay(true)));
+            let listener = axum::serve::ListenerExt::tap_io(tokio::net::TcpListener::bind(&listen).await?, |tcp| drop(tcp.set_nodelay(true)));
             axum::serve(listener, server::router(app)).await?;
         }
         Cmd::Run { file, url, token, rest } => {
@@ -477,6 +521,20 @@ async fn run() -> anyhow::Result<()> {
             let body = serde_json::json!({"sql": sql, "params": shell::params(&params)?});
             let token = token.or_else(|| std::env::var("PONDRA_TOKEN").ok());
             print!("{}", shell::script(lake.as_deref().unwrap_or("lake"), url.as_deref(), token.as_deref(), body).await?);
+        }
+        Cmd::Server { folder, addr, pg, default, read_token, write_token, admin_token, python, tier_secs, flight, kafka } => {
+            anyhow::ensure!(flight.is_none() && kafka.is_none(), "a Flight or Kafka port means one lake: `pondra serve --dir <lake> --flight …` (or --kafka) serves one");
+            let env = |flag: Option<String>, var: &str| flag.or_else(|| std::env::var(var).ok()).filter(|t| !t.is_empty());
+            let (r, w, a) = (env(read_token, "PONDRA_READ_TOKEN"), env(write_token, "PONDRA_WRITE_TOKEN"), env(admin_token, "PONDRA_ADMIN_TOKEN"));
+            for (var, v) in [("PONDRA_READ_TOKEN", &r), ("PONDRA_WRITE_TOKEN", &w), ("PONDRA_ADMIN_TOKEN", &a)] {
+                if let Some(v) = v {
+                    std::env::set_var(var, v); // (each database's node takes them from here)
+                }
+            }
+            let auth = Arc::new(auth::Auth::new(r, w, a));
+            let local = ["127.0.0.1:", "localhost:", "[::1]:"].iter().any(|x| addr.starts_with(x));
+            anyhow::ensure!(python.is_none() || auth.on() || local, "--python lets whoever makes a procedure run code on this machine: set --admin-token, or listen on 127.0.0.1");
+            dbserver::serve(folder, addr, pg, default, dbserver::Options { python, tier_secs }, auth).await?;
         }
         Cmd::Catalog { dir, prefix } => {
             let lake = store::Lake::open(&dir, false, false).await?;

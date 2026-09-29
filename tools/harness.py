@@ -18,6 +18,7 @@
   harness.py functions           functions and procedures in SQL and Python: workers, notices, mail, secrets, run log, tasks, speed
   harness.py found               what writing the docs found (round 26), each fixed
   harness.py renames             ALTER TABLE | VIEW … RENAME TO: rows, files, copies, followers, views
+  harness.py server              pondra server: a folder of lakes as databases (Postgres, HTTP, joins, idle, restart)
   harness.py load    --secs 30   throughput, ack latency, freshness, catalog commit latency
   harness.py all                 quick run of everything
 """
@@ -4015,9 +4016,74 @@ def renames():
     return f"renames: ALTER TABLE | VIEW … RENAME TO, rows, files and copies kept, a follower, views by name: all {len(checks)} checks pass"
 
 
+def server():
+    """`pondra server` (ADR-030): three lakes in a folder, served as databases. psql and HTTP
+    reach each by name, and queries join across them; the console is at `/`; CREATE DATABASE
+    makes one and DROP DATABASE drops one; a database idle for PONDRA_DATABASE_IDLE_SECS stops,
+    and starts again when next used; another node joins a database's cluster through the server;
+    the server killed and started again serves the same databases; `--flight` is refused."""
+    import psycopg
+    folder = new_lake()  # (a folder of lakes, here)
+    for name, q in [("sales", "CREATE TABLE orders AS SELECT 1 AS id, 10.5 AS amount UNION ALL SELECT 2, 20.0"),
+                    ("crm", "CREATE TABLE customers AS SELECT 1 AS id, 'ann' AS name UNION ALL SELECT 2, 'bob'"), ("lake", "CREATE TABLE notes AS SELECT 'hi' AS text")]:
+        subprocess.run([BIN, "sql", "--dir", os.path.join(folder, name), q], check=True, capture_output=True)
+    port, pg = A.port, A.port + 10
+    env = {**os.environ, "PONDRA_DATABASE_IDLE_SECS": "3"}
+    def start():
+        p = subprocess.Popen([BIN, "server", folder, "--addr", f"127.0.0.1:{port}", "--pg", f"127.0.0.1:{pg}"], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        until(lambda: _try(lambda: call(port, "GET", "/databases") is not None), True, 30)
+        return p
+    srv = start()
+    dsn = lambda db: f"host=127.0.0.1 port={pg} dbname={db} user=u password=x"
+    def pq(db, s):
+        with psycopg.connect(dsn(db), autocommit=True) as c:
+            cur = c.execute(s)
+            return cur.fetchall() if cur.description else cur.statusmessage
+    running = lambda: {d["name"]: d["running"] for d in call(port, "GET", "/databases")}
+    checks = {}
+    checks["the folder's lakes are its databases, none running until used"] = running() == {"crm": False, "lake": False, "sales": False}
+    checks["psql and HTTP reach each database by name; no /db/ means the default (lake)"] = pq("sales", "SELECT sum(amount) FROM orders") == [(30.5,)] \
+        and call(port, "POST", "/db/crm/sql", b"SELECT name FROM customers ORDER BY id") == [{"name": "ann"}, {"name": "bob"}] and call(port, "POST", "/sql", b"SELECT text FROM notes") == [{"text": "hi"}]
+    checks["a query joins across databases (name.schema.table)"] = pq("sales", "SELECT c.name, o.amount FROM orders o JOIN crm.customers c ON c.id = o.id ORDER BY o.id") == [("ann", 10.5), ("bob", 20.0)]
+    checks["the console is at /"] = b"<html" in call(port, "GET", "/").lower() or b"<!doctype html" in call(port, "GET", "/").lower()
+    pq("sales", "CREATE DATABASE hr")
+    call(port, "POST", "/db/hr/sql", b"CREATE TABLE people AS SELECT 1 AS id")
+    missing = _raises_text(lambda: pq("nope", "SELECT 1"))
+    pq("sales", "DROP DATABASE crm")
+    checks["CREATE DATABASE makes one, DROP DATABASE drops it, folder and all; an unknown one is said so"] = "hr" in running() and "crm" not in running() \
+        and not os.path.exists(os.path.join(folder, "crm")) and 'database "nope" does not exist' in missing
+    idle = until(lambda: sum(running().values()), 0, 30)
+    checks["idle databases stop, and start again when used"] = idle == 0 and pq("hr", "SELECT count(*) FROM people") == [(1,)]
+    # Another node joins a database's cluster through the server (its node advertises host:port/db/sales).
+    pq("sales", "SELECT 1")
+    other = Node(os.path.join(folder, "sales"), port + 2).start()
+    joined = until(lambda: _try(lambda: call(port + 2, "GET", "/stats")["role"]), "follower", 20)
+    call(port + 2, "POST", "/sql", b"INSERT INTO orders VALUES (3, 5.0)")  # (forwarded to the leader, through the server)
+    checks["another node joins a database's cluster through the server, and writes through it"] = joined == "follower" and pq("sales", "SELECT count(*) FROM orders") == [(3,)]
+    other.kill()
+    srv.send_signal(signal.SIGKILL)
+    srv.wait()
+    until(lambda: _try(lambda: sql(port, "SELECT 1")) is None, True, 10)
+    srv = start()
+    checks["killed and started again, the server serves the same databases"] = sorted(running()) == ["hr", "lake", "sales"] and pq("sales", "SELECT count(*) FROM orders") == [(3,)]
+    refused = subprocess.run([BIN, "server", folder, "--addr", f"127.0.0.1:{port + 5}", "--flight", "127.0.0.1:1"], capture_output=True, text=True, timeout=30)
+    checks["--flight is refused by name (a Flight port means one lake)"] = refused.returncode != 0 and "one lake" in refused.stderr
+    srv.send_signal(signal.SIGTERM)
+    srv.wait(timeout=60)
+    time.sleep(1)
+    left = subprocess.run(["pgrep", "-x", "pondra"], capture_output=True, text=True).stdout.split()
+    checks["stopped, the server stops its databases' nodes"] = not [p for p in left if os.path.exists(f"/proc/{p}/cmdline") and folder in open(f"/proc/{p}/cmdline").read()]
+    ok = all(checks.values())
+    print(json.dumps({"server": checks, "ok": ok}, indent=1))
+    if not ok:
+        print(missing[:300], idle, joined)
+        sys.exit(1)
+    return f"server: a folder of lakes as databases over Postgres and HTTP, created, dropped, idle-stopped, joined, restarted: all {len(checks)} checks pass"
+
+
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    out = {t.__name__: t() for t in (upsert, deal, outside, clouds, kafkas, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, names, answers, writes, live, temps, across, found, renames, scale, flight, reader, crash)}
+    out = {t.__name__: t() for t in (upsert, deal, outside, clouds, kafkas, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, names, answers, writes, live, temps, across, found, renames, server, scale, flight, reader, crash)}
     A.secs = min(A.secs, 20)
     out["load"] = load()
     print(json.dumps(out, indent=1))
@@ -4025,7 +4091,7 @@ def all_tests():
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "names", "answers", "writes", "live", "temps", "across", "found", "renames", "scale", "flight", "load", "all"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "names", "answers", "writes", "live", "temps", "across", "found", "renames", "server", "scale", "flight", "load", "all"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -4036,4 +4102,4 @@ if __name__ == "__main__":
     ap.add_argument("--secs", type=int, default=30)
     ap.add_argument("--flush-ms", type=int, default=250)
     A = ap.parse_args()
-    {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "names": names, "answers": answers, "writes": writes, "live": live, "temps": temps, "across": across, "found": found, "renames": renames, "scale": scale, "flight": flight, "load": load, "all": all_tests}[A.mode]()
+    {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "names": names, "answers": answers, "writes": writes, "live": live, "temps": temps, "across": across, "found": found, "renames": renames, "server": server, "scale": scale, "flight": flight, "load": load, "all": all_tests}[A.mode]()

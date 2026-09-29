@@ -356,6 +356,7 @@ pub fn parse(sql: &str) -> Option<Stmt> {
             ast::ObjectType::Schema => Some(Ddl::DropSchema { name, if_exists, cascade }),
             ast::ObjectType::Table => Some(Ddl::DropTable { name, if_exists }),
             ast::ObjectType::View | ast::ObjectType::MaterializedView => Some(Ddl::DropView { name, if_exists }),
+            ast::ObjectType::Database => Some(Ddl::DropDatabase { name: name.to_lowercase(), if_exists }),
             _ => None,
         }).collect::<Option<Vec<_>>>()?),
         Statement::CreateView(v) if v.materialized => {

@@ -133,6 +133,7 @@ pub enum Ddl {
     Attach { name: String, dir: String },
     Detach { name: String, if_exists: bool },
     CreateDatabase { name: String, if_not_exists: bool, dir: Option<String> }, // a new lake (beside this one unless `dir`), attached
+    DropDatabase { name: String, if_exists: bool }, // `pondra server`'s: its node stopped, its folder deleted (ADR-030)
     AlterColumn { table: String, column: String, change: Change }, // ALTER TABLE … RENAME/DROP/ALTER COLUMN (ADR-022)
     RenameTable { name: String, to: String }, // ALTER TABLE | VIEW … RENAME TO (ADR-030)
     CreateRoutine { name: String, routine: crate::routines::Routine, replace: bool }, // CREATE MACRO, CREATE PROCEDURE (ADR-023)
@@ -260,6 +261,15 @@ pub async fn apply(lake: &Lake, d: Ddl) -> Result<Value> {
                 ensure!(if_not_exists, "a lake is at {dir} already: ATTACH '{dir}' AS {name} (or CREATE DATABASE IF NOT EXISTS {name})");
             }
             Box::pin(apply(lake, Ddl::Attach { name, dir })).await
+        }
+        Ddl::DropDatabase { name, if_exists } => {
+            let server = std::env::var("PONDRA_SERVER_URL").map_err(|_| anyhow::anyhow!("DROP DATABASE drops a database `pondra server` serves, folder and all; on a node, DETACH {name} (its folder stays)"))?;
+            ensure!(name != lake_name(lake), "this is database {name}: drop it from another one");
+            let r = crate::cluster::http().delete(format!("{server}/databases/{name}?if_exists={if_exists}")).send().await?;
+            let (ok, text) = (r.status().is_success(), r.text().await?);
+            ensure!(ok, "{text}");
+            lake.attached.write().unwrap().retain(|(n, _)| *n != name); // (its tables are gone from here too)
+            Ok(serde_json::from_str(&text)?)
         }
         Ddl::AlterColumn { table, column, change } => alter_column(lake, &table, &column, change).await,
         Ddl::RenameTable { name, to } => rename(lake, &name, &to).await,

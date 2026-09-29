@@ -115,6 +115,7 @@ pub fn router(app: App) -> Router {
         .route("/append/{name}", post(append))
         .route("/insert/{name}", post(insert))
         .route("/cluster/files", post(files))
+        .route("/", get(|| async { crate::console::page() }))
         .route("/sql", post(sql))
         .route("/mcp", post(crate::mcp::handle))
         .route("/files/{*path}", put(put_file).get(get_file))
