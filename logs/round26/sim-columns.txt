@@ -1,0 +1,46 @@
+{
+ "columns": {
+  "every node == the model": true,
+  "SELECT * has SQL's columns": true,
+  "spread over three nodes == one node": true,
+  "a keyed table: renamed, updated, looked up": true,
+  "the table renamed and back, its columns as they were": true,
+  "refused: a key column": true,
+  "refused: narrowing": true,
+  "refused: a column a view reads": true,
+  "refused: a partition column": true,
+  "refused: a clash": true,
+  "refused: a system column": true,
+  "Delta and Iceberg readers (by column id / physical name)": true
+ },
+ "rows": 1270,
+ "outside_readers": {
+  "duckdb/delta": [
+   1270,
+   750000776815,
+   450
+  ],
+  "duckdb/iceberg": [
+   1270,
+   750000776815,
+   450
+  ],
+  "pyiceberg": [
+   1270,
+   750000776815,
+   450
+  ],
+  "delta-rs": [
+   1270,
+   750000776815,
+   450
+  ],
+  "delta-rs pyarrow": "refused"
+ },
+ "expected": [
+  1270,
+  750000776815,
+  450
+ ],
+ "ok": true
+}

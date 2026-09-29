@@ -1,0 +1,28 @@
+{
+ "node": {
+  "the tree lists the lake's schemas, tables with their row counts, views and columns (with SQL types)": true,
+  "a SQL cell shows the rows with their types; timestamps and decimals as written": true,
+  "clicking a table shows its first rows": true,
+  "a Python cell runs on the node: what it printed, then its last expression as rows": true,
+  "errors in plain words: a SQL one, and a Python one at its line in the cell": true,
+  "a live cell shows a row INSERTed over HTTP (a decimal to its scale); off, its query ends": true,
+  "keys: Esc, B adds a cell, D D deletes it, Z brings it back; M makes it text; Shift+Enter renders it and starts a new cell": true,
+  "a notebook saved in the lake is valid for Jupyter (nbformat), SQL cells as %%sql": true,
+  "saved twice: two versions; the first, opened from the sidebar, is what was saved": true,
+  "a notebook downloaded is valid for Jupyter too": true,
+  "an .ipynb uploaded opens: its text rendered, its %%sql cell a SQL cell that runs": true,
+  "every request went to the node; no page errors": true
+ }
+}
+{
+ "tokens": {
+  "with tokens, the page asks for one, then shows the tables (and after a reload)": true
+ }
+}
+{
+ "server": {
+  "the server's console lists its databases; a cell runs in the one picked (/db/sales)": true,
+  "the server's console: every request went to the server; no page errors": true
+ }
+}
+{"checks": 15, "passed": 15, "ok": true}

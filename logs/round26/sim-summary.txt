@@ -1,0 +1,19 @@
+13:30:33 start renames
+13:30:48 renames exit=0
+13:30:48 start columns
+13:31:41 columns exit=0
+13:31:41 start found
+13:33:10 found exit=0
+13:33:10 start procedures
+13:33:49 procedures exit=0
+13:33:49 start schemas
+13:35:36 schemas exit=0
+13:35:36 start crash
+13:56:47 crash exit=0
+13:56:47 start failover
+13:58:01 failover exit=0
+13:58:01 start users
+13:58:30 users exit=0
+13:58:30 start race
+13:59:13 race exit=0
+13:59:13 SIM_DONE

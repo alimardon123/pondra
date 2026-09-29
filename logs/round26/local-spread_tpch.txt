@@ -1,0 +1,146 @@
+q1   shuffled          same=True    0.35s  
+q2   ranged, gathered  same=True    0.17s  
+q3   ranged, gathered  same=True    0.22s  
+q4   ranged, shuffled  same=True    0.18s  
+q5   ranged, shuffled  same=True    0.25s  
+q6   gathered          same=True    0.10s  
+q7   ranged, shuffled  same=True    0.27s  
+q8   ranged, shuffled  same=True    0.30s  
+q9   shuffled          same=True    0.62s  
+q10  ranged, shuffled  same=True    0.30s  
+q11  ranged, shuffled  same=True    0.10s  
+q12  ranged, shuffled  same=True    0.20s  
+q13  shuffled          same=True    0.31s  
+q14  gathered          same=True    0.14s  
+q15  shuffled          same=True    0.19s  
+q16  ranged, shuffled  same=True    0.14s  
+q17  shuffled          same=True    0.26s  
+q18  ranged, gathered  same=True    0.36s  
+q19  gathered          same=True    0.26s  
+q20  shuffled          same=True    0.40s  
+q21  ranged, shuffled  same=True    0.44s  
+q22  shuffled          same=True    0.16s  
+{
+ "nodes": 3,
+ "broadcast_mb": 64,
+ "spread": 22,
+ "shuffled": 16,
+ "ranged": 12,
+ "queries": {
+  "q1": {
+   "how": "shuffled",
+   "same": true,
+   "s": 0.35
+  },
+  "q2": {
+   "how": "ranged, gathered",
+   "same": true,
+   "s": 0.17
+  },
+  "q3": {
+   "how": "ranged, gathered",
+   "same": true,
+   "s": 0.22
+  },
+  "q4": {
+   "how": "ranged, shuffled",
+   "same": true,
+   "s": 0.18
+  },
+  "q5": {
+   "how": "ranged, shuffled",
+   "same": true,
+   "s": 0.25
+  },
+  "q6": {
+   "how": "gathered",
+   "same": true,
+   "s": 0.1
+  },
+  "q7": {
+   "how": "ranged, shuffled",
+   "same": true,
+   "s": 0.27
+  },
+  "q8": {
+   "how": "ranged, shuffled",
+   "same": true,
+   "s": 0.3
+  },
+  "q9": {
+   "how": "shuffled",
+   "same": true,
+   "s": 0.62
+  },
+  "q10": {
+   "how": "ranged, shuffled",
+   "same": true,
+   "s": 0.3
+  },
+  "q11": {
+   "how": "ranged, shuffled",
+   "same": true,
+   "s": 0.1
+  },
+  "q12": {
+   "how": "ranged, shuffled",
+   "same": true,
+   "s": 0.2
+  },
+  "q13": {
+   "how": "shuffled",
+   "same": true,
+   "s": 0.31
+  },
+  "q14": {
+   "how": "gathered",
+   "same": true,
+   "s": 0.14
+  },
+  "q15": {
+   "how": "shuffled",
+   "same": true,
+   "s": 0.19
+  },
+  "q16": {
+   "how": "ranged, shuffled",
+   "same": true,
+   "s": 0.14
+  },
+  "q17": {
+   "how": "shuffled",
+   "same": true,
+   "s": 0.26
+  },
+  "q18": {
+   "how": "ranged, gathered",
+   "same": true,
+   "s": 0.36
+  },
+  "q19": {
+   "how": "gathered",
+   "same": true,
+   "s": 0.26
+  },
+  "q20": {
+   "how": "shuffled",
+   "same": true,
+   "s": 0.4
+  },
+  "q21": {
+   "how": "ranged, shuffled",
+   "same": true,
+   "s": 0.44
+  },
+  "q22": {
+   "how": "shuffled",
+   "same": true,
+   "s": 0.16
+  }
+ },
+ "checks": {
+  "every answer across the nodes equals one node's": true,
+  "at least 22 of the 22 ran across the nodes": true
+ },
+ "ok": true
+}

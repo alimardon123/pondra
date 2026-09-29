@@ -1,0 +1,9 @@
+14:02:13 start renames
+14:03:02 renames exit=0
+14:03:02 start columns
+14:05:28 columns exit=0
+14:05:28 start procedures
+14:07:20 procedures exit=0
+14:07:20 start race
+14:08:19 race exit=0
+14:08:19 R2_DONE

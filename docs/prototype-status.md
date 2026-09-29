@@ -1,6 +1,6 @@
 # Prototype status: Pondra, a streamhouse in one binary
 
-**Date:** 2026-09-29 (round 25) · **Plan:** ADR-002 to ADR-029, `roadmap.md` · **Code:** `pondra.zip` / `pondra.bundle` (≈25,100 lines of Rust, plus Python and JavaScript clients, packaging, and test and benchmark tools)
+**Date:** 2026-09-29 (round 26) · **Plan:** ADR-002 to ADR-031, `roadmap.md` · **Code:** `pondra.zip` / `pondra.bundle` (≈27,800 lines of Rust, plus Python and JavaScript clients, a documentation website, packaging, and test and benchmark tools)
 **Name:** the prototype formerly called `lh` is now **Pondra**. The name is free on crates.io, PyPI and npm. A small personal-finance app uses it (pondra.app), a different category; run a trademark search before a public launch.
 
 ## Where it stands
@@ -14,6 +14,79 @@ One Rust binary replaces the Kafka + Flink + Spark + metastore + ZooKeeper stack
 - upsert and merge tables.
 
 Start more copies on the same bucket to scale out. The only state is object storage. There's no JVM, no database server and no coordination service.
+
+**Round 26 made Pondra something people can find their way around** (ADR-030): a documentation
+website, a console in the browser, a server of databases, and the Postgres catalog that dbt and BI
+tools read.
+
+1. **The documentation website** (`site/`, Starlight on GitHub Pages, published with each release
+   tag): 49 pages for users — start, guides by task, a reference page per door and feature,
+   concepts. **Every example runs in CI**: `tools/docs_check.py` ran 456 examples on 48 pages, each
+   page against a fresh node.
+2. **Writing it found 37 bugs**, and all are fixed, each with a check that fails without it:
+   - `NOT NULL` and `DEFAULT` are enforced on every door (they were accepted and ignored);
+   - `INSERT … ON CONFLICT`, `UPDATE … FROM`, `DELETE … USING` and `TRUNCATE` work;
+   - unknown `WITH` options, uncastable values and `CREATE EXTERNAL TABLE` are refused by name
+     (they were ignored, stored as NULL, or made an empty table);
+   - `TIMESTAMPTZ` is an instant in UTC; Parquet files carry Iceberg field ids (Polars'
+     `scan_iceberg`); reads on a follower see its own writes; a reader follows a new leader
+     within a second;
+   - the spread guard estimates what an aggregation moves by its groups, not its input rows. The
+     6-node bench had kept q1, q3, q4 and q12 on one node although spreading them was 1.5–2.6×
+     faster.
+3. **The console at `/`**, in the binary (one HTML file, no CDN):
+   - a tree of databases, schemas, tables (with row counts), views and columns;
+   - SQL cells with types and exact numbers; Python cells run on the node (`DO LANGUAGE python`);
+     text cells;
+   - a live switch, redrawn on each commit that changes the answer;
+   - notebooks saved in the lake as `.ipynb` versions, opened, downloaded and uploaded;
+   - Jupyter's keys, light and dark. `console_check.py` drives it in Chromium: 15 checks.
+4. **`pondra server`:** a folder of lakes as databases. Postgres clients pick one by name, HTTP by
+   `/db/{name}`. Each database is a node of its own, started on first use (about 70 ms here) and
+   stopped when idle. `CREATE DATABASE`, `DROP DATABASE`, and queries across databases.
+5. **dbt and BI tools** (`pg_catalog.rs`): dbt (seeds, views, tables, incremental models of three
+   kinds, a snapshot, tests, docs; run twice) gives the same rows as Postgres 16. psql's backslash
+   commands, SQLAlchemy, pgjdbc (DBeaver, Metabase), psqlODBC (Tableau, Excel), ADBC, and Npgsql
+   4.0 and 8 (Power BI's driver) work. `ALTER TABLE | VIEW … RENAME TO` keeps a table's files where
+   they are, so other engines keep reading them.
+6. **Found at the end,** by the docs sweep and the suite, and fixed:
+   - `pondra sql` didn't check `NOT NULL`;
+   - ADBC's Postgres driver couldn't read `pg_type`; Npgsql knew none of the types;
+   - SQLAlchemy's default schema listed every schema's tables;
+   - a time without seconds (`'2024-05-01 10:30'`) wasn't a timestamp;
+   - `to_timestamp` over a column failed once the session's time zone was set;
+   - tables were views to `information_schema`; a `files()` listing could be a remembered answer;
+   - a node on a lake whose first leader hadn't made its catalog stopped instead of waiting.
+7. **Tests** (`logs/round26/`):
+   - **Locally:** `harness.py all` (42 sections and a load run, with the new `found`, `renames` and `server`),
+     `frames_check.py`, `spark_check.py` (55 of 55), `formats_check.py` (52 tables),
+     `tpch_frames.py`, `clients_check.py` (24 checks: dbt against Postgres 16, psql,
+     SQLAlchemy, pgjdbc, psqlODBC, ADBC, Npgsql), `console_check.py` (15), `docs_check.py` (456
+     examples), `cluster.py` failover ×3, users, race and spread, `open_check.py`,
+     `asof_check.py`, `stream_check.py`, `spread_tpch.py` (22 of 22), `skew_check.py`,
+     `smoke.py`.
+   - **On simulated R2:** `renames`, `columns`, `found`, `procedures`, `schemas`, the crash run
+     (2 × 30,000 events, kill -9 and injected crashes: every event once, views exact), failover
+     (writes back 11.6 s after a leader kill), users (0 inconsistent reads) and race.
+   - **On real R2:** `renames`, `columns`, `procedures` and race.
+   - **DataFusion's sqllogictest:** 16,090 of 24,783 records (64.9%; round 25: 67.2%). The
+     difference is two decisions of this round, not regressions: `CREATE EXTERNAL TABLE` is
+     refused instead of making an empty Pondra table (about 380 records in files that went on to
+     use such a table), and `to_timestamp` returns `TIMESTAMPTZ`, as Postgres's does (about 200
+     records expect DataFusion's zoneless answer). Reading `CREATE EXTERNAL TABLE` as a named view
+     of the files would win the first back; it belongs to round 30's conformance work.
+   - **Single-node TPC-H SF1, 2 vCPUs** (this run's machine was slower for every engine):
+
+     | Engine | Total | Round 25 |
+     |---|---|---|
+     | Pondra, hot columns | **2.34 s** | 2.11 s |
+     | DuckDB, its own tables | 1.87 s | 1.65 s |
+     | Pondra, from files | 3.62 s | 3.46 s |
+     | Polars, streaming | 3.72 s | 3.36 s |
+     | DuckDB, from files | 4.18 s | 3.45 s |
+
+     Against DuckDB from the same files, Pondra took 0.56 of its time (round 25: 0.61), and from
+     its files 0.87 (1.00).
 
 **Round 25 gave Pondra one vocabulary and opened its tables to other engines' writes** (ADR-028):
 the names a user already knows work everywhere, and Spark or PyIceberg can append to a Pondra

@@ -176,9 +176,10 @@ kill -9 $(cat cluster/node1.pid)
 ```python
 import time
 
-for _ in range(30):                      # wait for the new leader
+for _ in range(30):                      # wait until both know the new leader
     time.sleep(1)
-    if any(role == "leader" for role, term in roles((8082, 8083)).values()):
+    now = roles((8082, 8083)).values()
+    if sorted(role for role, term in now) == ["follower", "leader"] and len({term for role, term in now}) == 1:
         break
 sorted(roles((8081, 8082, 8083)).values(), key=str)
 ```
@@ -187,7 +188,10 @@ sorted(roles((8081, 8082, 8083)).values(), key=str)
 [('down', None), ('follower', 2), ('leader', 2)]
 ```
 
-Node 1 was the leader. Now one of the other two is, on term 2, and nothing acknowledged was lost. Writes go through either node:
+Node 1 was the leader. Now one of the other two is, on term 2, and nothing acknowledged was lost.
+A write that reached a follower in the seconds before it learned of the new leader was answered
+with an error, not acknowledged: send it again (with the same `producer` and `seq`, or `job`, it
+is applied once). Writes go through either node:
 
 ```python
 alive = nodes[1:3]

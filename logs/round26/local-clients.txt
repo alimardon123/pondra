@@ -1,0 +1,53 @@
+{
+ "dbt": {
+  "dbt seed, run, snapshot and test, twice, and docs generate: every step succeeds on Pondra": true,
+  "\u2026and on Postgres 16 (the reference)": true,
+  "every model's and seed's rows as Postgres has them (views, tables, delete+insert, merge, append)": true,
+  "the snapshot's history as Postgres has it (each version, which is current)": true,
+  "docs generate's catalog has every model with its columns": true
+ }
+}
+{
+ "psql": {
+  "\\dt lists the tables on the search path (public), \\dt sales.* another schema's": true,
+  "\\d shows columns, Postgres's types, NOT NULL, defaults and the key": true,
+  "\\dv, \\dn, \\df, \\l, \\du": true,
+  "\\d of a table in a schema, and \\d+ of a view with its definition": true
+ }
+}
+{
+ "sqlalchemy": {
+  "psycopg2: schemas, tables, views": true,
+  "psycopg2: columns (types, nullable, defaults), the primary key, has_table": true,
+  "psycopg2: pandas to_sql (replace, append) and read_sql": true,
+  "psycopg: schemas, tables, views": true,
+  "psycopg: columns (types, nullable, defaults), the primary key, has_table": true,
+  "psycopg: pandas to_sql (replace, append) and read_sql": true
+ }
+}
+{
+ "jdbc": {
+  "pgjdbc: catalogs, schemas, tables and views": true,
+  "pgjdbc: columns (types, nullable, defaults), primary keys, functions": true,
+  "pgjdbc: a prepared query": true
+ }
+}
+{
+ "odbc": {
+  "psqlODBC: tables and views": true,
+  "psqlODBC: columns and the primary key": true,
+  "psqlODBC: a query with a parameter": true
+ }
+}
+{
+ "adbc": {
+  "ADBC (Postgres driver): Arrow rows with their types": true
+ }
+}
+{
+ "npgsql": {
+  "Npgsql 4.0.12: types loaded, databases, tables, views, columns; a query with a parameter; arrays and decimals": true,
+  "Npgsql 8.0.8: types loaded, databases, tables, views, columns; a query with a parameter; arrays and decimals": true
+ }
+}
+{"checks": 24, "passed": 24, "ok": true}

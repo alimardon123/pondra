@@ -141,7 +141,14 @@ def check_page(path, verbose):
                         py = subprocess.Popen([sys.executable, "-c", PY_RUNNER], cwd=work, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
                     py.stdin.write(json.dumps(code) + "\n")
                     py.stdin.flush()
-                    answer = json.loads(py.stdout.readline() or '{"ok": false, "error": "python exited"}')
+                    answer = None
+                    while answer is None:  # (a library writing to the real stdout, as DuckDB's progress bar does, isn't the answer)
+                        line = py.stdout.readline()
+                        try:
+                            got = json.loads(line or '{"ok": false, "error": "python exited"}')
+                        except json.JSONDecodeError:
+                            continue
+                        answer = got if isinstance(got, dict) and "ok" in got else None
                     if not answer["ok"]:
                         raise RuntimeError(answer.get("error", ""))
                     out = answer["out"]

@@ -450,8 +450,8 @@ bucket to its newest lakes.
 ## Not yet
 
 - A `LIMIT` inside a subquery over sliced data and order-preserving shuffles run on one node; a
-  join with a hot key on both sides shares out only one. Nothing has run on several machines yet
-  (`tools/cloud/` and `.github/workflows/cluster-bench.yml` are the kits).
+  join with a hot key on both sides shares out only one. Clusters have run on 3 and 6 GitHub
+  runners over the internet (`.github/workflows/cluster-bench.yml`), not yet in one data centre.
 - A query's own answer passes through the coordinator's memory once (an HTTP answer is one body,
   shared by identical queries); what the nodes send does not.
 - Files written in key order split tables by ranges across nodes but aren't declared as sorted
@@ -467,8 +467,9 @@ bucket to its newest lakes.
   a table made through the catalog (make it with `CREATE TABLE … WITH (publish = 'iceberg')`).
   Delta writers need Delta's catalog-managed commits, which aren't out yet.
 - A materialized view that is a session window or a stream join starts from its creation; others
-  are filled from the rows already there, in one go on the leader. `ALTER TABLE … RENAME TO`
-  (copy with `CREATE TABLE … AS`), narrowing a type, `search_path` and grants per schema.
+  are filled from the rows already there, in one go on the leader. Narrowing a type,
+  `search_path` and grants per schema; `CREATE EXTERNAL TABLE` (read files where they are, or
+  `ATTACH` them).
 - The owner has installed the Windows wheel from PyPI on a real machine; the macOS packages, and
   the installers on anything but CI's machines, haven't run elsewhere yet. No winget or Homebrew
   package. The node's JSON leaves out nulls (the Python client puts them back as None; the
@@ -476,15 +477,17 @@ bucket to its newest lakes.
 - Only `sum` over DOUBLE is order-independent; `avg`, `stddev` and friends over DOUBLE can still
   differ in their last bits from run to run.
 - Per-table grants, quotas and TLS (tokens are per role; put a TLS proxy in front, and keep a
-  cluster's nodes on a private network: they talk plain HTTP to each other); JDBC and BI tools
-  untested here.
+  cluster's nodes on a private network: they talk plain HTTP to each other). Power BI Desktop
+  itself hasn't run against Pondra (its drivers, Npgsql and psqlODBC, are tested).
+- The console: no completion or charts yet, and its Python cells don't share variables (each is
+  a `DO` block). `pondra server` serves a folder on its own disk, not one in a bucket.
 - Kafka: one partition per topic, no transactions; offsets are positions in the log (increasing,
   not dense). Consumer groups live in the leader's memory (members rejoin after a failover).
 - An approximate vector index (see the plan in `docs/comparison-spark-flink-fluss.md`).
 - Frames: the JavaScript client has parameters, `run` and `call`, not the frame builder;
   a sort inside `db.sql(…)`'s own SQL by an expression (not a column) ends at the next frame step.
   A folder of `.sql` and `.py` models run in order of what reads what (`pondra run models/`), and
-  notebooks kept in the lake, are next.
+  notebooks run as procedures or on a schedule, are next (the console keeps notebooks in the lake).
 - Functions and procedures: a Python table function takes values, not another table's rows (no
   LATERAL); `plpy.subtransaction` is refused (each statement commits on its own); a cast to an
   integer truncates where Postgres rounds; a task's ticks missed while no node led run once.

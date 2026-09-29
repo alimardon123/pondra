@@ -1,0 +1,10 @@
+{
+ "renames": {
+  "rows in the log before the rename are the renamed table's": true,
+  "the follower reads it by its new name, and the old one is gone": true,
+  "a view reads by name: the new table under the old name (dbt's rename-and-replace)": true,
+  "ALTER VIEW \u2026 RENAME TO": true,
+  "refused by name: a taken name, a table a materialized view follows, a materialized view": true
+ },
+ "ok": true
+}
