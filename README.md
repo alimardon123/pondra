@@ -1,6 +1,10 @@
 # Pondra: a streamhouse in one binary
 
-One Rust binary (~22,000 lines) that ingests streams, stores them as a lakehouse (Parquet files
+**Documentation: [alimardon123.github.io/pondra](https://alimardon123.github.io/pondra/)** — how to
+install it, load and query data, stream, run a cluster, and every statement, function, flag and
+endpoint, each example tested.
+
+One Rust binary (~28,000 lines) that ingests streams, stores them as a lakehouse (Parquet files
 plus a catalog, on object storage; Delta Lake and Iceberg metadata for other engines on request),
 keeps SQL views and streaming state up to date, answers SQL, and scales out by starting more
 copies of itself on the same bucket. It reads and writes what is outside it too: files on any
@@ -64,8 +68,11 @@ and hands the lake on at once, so the next one opens it straight away.
 ```bash
 cargo build --release
 
-# Local directory
+# Local directory; the console (SQL, Python and text cells, notebooks) is at http://127.0.0.1:8080/
 ./target/release/pondra serve --dir ./lake
+
+# A folder of lakes as databases: psql -d sales, or http://host:8080/db/sales/…
+./target/release/pondra server ./data --pg 0.0.0.0:5432
 
 # A cluster: the same command on each machine, same bucket. Every node takes writes and
 # queries; one of them (elected through the bucket) orders the commits; any can take over.
@@ -81,7 +88,7 @@ export AWS_ENDPOINT=https://<account>.r2.cloudflarestorage.com
 ./target/release/pondra sql --dir s3://my-bucket/lake "UPDATE users SET plan = 'pro' WHERE id = 7"
 
 # SQL from anything that speaks Postgres, and from Python:
-./target/release/pondra serve --dir ./lake --pg 0.0.0.0:5432      # psql -h localhost, psycopg, SQLAlchemy, BI tools
+./target/release/pondra serve --dir ./lake --pg 0.0.0.0:5432      # psql, psycopg, SQLAlchemy, dbt, DBeaver, Tableau, Excel
 pip install ./python && python -c "import pondra; print(pondra.connect('http://127.0.0.1:8080').sql('SELECT 1').to_pandas())"
 
 # Kafka producers and consumers (a topic is a table), and engines attaching the lake by URL:

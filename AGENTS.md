@@ -30,8 +30,13 @@ The owner's design principles, which every change must respect:
 ## Layout
 
 ```
-src/      25,100 lines of Rust, one file per concern (see the table in README.md); round 25 added
-          live.rs (live queries) and temp.rs (a session's temporary tables and views)
+src/      27,800 lines of Rust, one file per concern (see the table in README.md); round 25 added
+          live.rs (live queries) and temp.rs (a session's temporary tables and views); round 26
+          pg_catalog.rs (Postgres's catalog, for dbt and BI tools), dbserver.rs (`pondra server`),
+          defaults.rs (NOT NULL and DEFAULT) and console.rs + console.html (the console at /)
+site/     the documentation website (Starlight; ADR-030): site/STYLE.md says how pages are written,
+          site/PAGES.md what each covers; every example runs (tools/docs_check.py);
+          .github/workflows/pages.yml publishes it to GitHub Pages
 python/   the Python client (pure Python, HTTP + Arrow; `local()` starts a node): `client.py`, frames
           (`frame.py`, Polars' names), `spark/` (PySpark's names), `worker.py` (a node's warm
           Python worker: functions' batches and procedures' calls, ADR-027), `plpy.py` (PL/Python's
@@ -64,7 +69,9 @@ tools/    harness.py, cluster.py (tests), open_check.py (Delta + Iceberg readers
           cloud/ (a cluster on several machines; cloud/actions/ + .github/workflows/: on GitHub runners),
           bench/tpch-queries/ (the 22 TPC-H queries),
           r2_test.sh (run the suite against a real bucket), bench/ (vs Spark and Flink),
-          package.py (wheels, npm packages and the binary alone from a binary), try_packages.sh
+          clients_check.py (dbt against Postgres 16, psql, SQLAlchemy, pgjdbc, psqlODBC, ADBC and
+          Npgsql on the Postgres port), console_check.py (the console in headless Chromium), docs_check.py (every
+          example on the website), package.py (wheels, npm packages and the binary alone from a binary), try_packages.sh
           (them installed and tried as CI does on each OS: pip without and with pyarrow, npm, the
           installer; try_install.ps1 is Windows's), npm_publish.sh (the release's npm publish; CI dry-runs it), anywhere_check.py (the shell, local(),
           the packages, the notebook; old Linux in docker), bench/repeat.py (one query many times)
@@ -847,6 +854,41 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    are Polars' expressions, so Python's own must be reached as `builtins.all`, `builtins.len` and
    so on. `package_check.py` calls the display. `anywhere_check.py` fails on any error a notebook
    shows, because IPython turns a failed display into text and the cell still passes.
+129. **A table keeps its folder through a rename** (`TableMeta.folder`, `store::folder`): its files,
+   and its Delta and Iceberg copies, stay where they are, so other engines keep reading them. A new
+   table under a used name gets a folder of its own, `name__N` (not `~`: object_store
+   percent-encodes it, and the files would be written where no reader looks). `harness.py renames`.
+130. **NOT NULL and DEFAULT hold on every door** (`defaults.rs`): `check` in the log's `queue`, in
+   `change.rs`, `kafka.rs` and Flight; `checked` for a bulk INSERT's stream; and in
+   `write::prepare` for `pondra sql`, which writes its rows to the log itself. `harness.py found`:
+   "NOT NULL refused by name on every door…" and "pondra sql: NOT NULL refused…".
+131. **The Postgres port's catalog is the lake's** (`pg_catalog.rs`), with stable oids (a hash of
+   the name), `pg_type`'s functions under Postgres's own names (ADBC picks a type's binary format
+   by `typreceive`) and listed in `pg_proc`, a `regproc` column compared with `0` compared with
+   `-`, and joined to a function's `oid` joined by name (Npgsql learns the types that way).
+   Registered only for SQL that names the catalog (`wanted`), so other queries pay nothing.
+   `clients_check.py`: dbt's rows equal Postgres 16's; psql, SQLAlchemy, pgjdbc, psqlODBC, ADBC
+   and Npgsql 4.0 and 8.
+132. **A lake's table is a `BASE TABLE`** to `information_schema` (`query::Table`), and nothing
+   else changes: it passes every call through, its plan included, so DataFusion plans it as
+   before. `harness.py found`.
+133. **A time without seconds is a timestamp** (`query::seconds`): the `Seconds` optimizer rule
+   gives a literal DataFusion would cast its `:00` before it is folded, and `query::strict` does
+   the same for rows being written. `harness.py found`.
+134. **The console's answers are exact** (`server::typed`): rows as lists, so a join's repeated
+   column names survive; decimals, and integers past 2^53, as text. `harness.py found`,
+   `console_check.py` (a live answer's decimals to their scale).
+135. **A `files()` listing is never a remembered answer** (`server::query`'s volatile words): files
+   change without a catalog commit. `harness.py found`.
+136. **`DO` is an admin's, and its errors count lines from the code's first** (`routines::do_of`
+   drops the newline after `$$`; a DO block's errors carry no routine name). `harness.py
+   procedures`.
+137. **`pondra server` holds no lake.** Each database is a `pondra serve` child (`--advertise
+   host:port/db/name`, `--attach-found <folder>`, `--stop-with-stdin`, `PONDRA_SERVER_URL`); the
+   server routes Postgres by the startup message and HTTP by `/db/{name}`, and stops a database
+   idle for `PONDRA_DATABASE_IDLE_SECS`. `harness.py server`.
+138. **The console asks only the node that served it** (no CDN, fonts or other hosts; the page is
+   `include_str!`ed). `console_check.py`: "every request went to the node".
 
 ## Tests: run these before and after any change
 
@@ -968,13 +1010,40 @@ Practical notes for an agent working here:
 - Node stderr goes to `/tmp/pondra-<port>-<id>.stderr`; that's where "restarting to rejoin",
   "slow tiering" and panics show up.
 
-## State of the work (2026-09-29, round 25)
+## State of the work (2026-09-29, round 26)
 
 Everything in `docs/prototype-status.md` passes on local disk and on simulated R2. The round-11
 additions (manifests, partitions, shuffles, memory limits, Arrow Flight) also ran against real
 R2; round 12's are in `logs/round12/`, round 13's in `logs/round13/`, round 14's in
 `logs/round14/`, round 15's in `logs/round15/`, round 16's in `logs/round16/`, round 17's in `logs/round17/`,
-round 18's in `logs/round18/`, round 19's in `logs/round19/`, round 20's in `logs/round20/`, round 21's in `logs/round21/`, round 22's in `logs/round22/`, round 23's in `logs/round23/`, round 24's in `logs/round24/` and round 25's in `logs/round25/`.
+round 18's in `logs/round18/`, round 19's in `logs/round19/`, round 20's in `logs/round20/`, round 21's in `logs/round21/`, round 22's in `logs/round22/`, round 23's in `logs/round23/`, round 24's in `logs/round24/`, round 25's in `logs/round25/` and round 26's in `logs/round26/`.
+
+**Round 26 (ADR-030): the console, the server, dbt and BI, and the documentation website.**
+
+- **The website** (`site/`, Starlight, GitHub Pages through `pages.yml`): 49 pages for users —
+  start, guides, reference, concepts — every example run by `tools/docs_check.py` (456 of them,
+  in CI too). The owner must turn Pages on once (Settings → Pages → Source: GitHub Actions).
+- **Writing it found 37 bugs**, each fixed with a check (most in `harness.py found`): NOT NULL and
+  DEFAULT enforced, `INSERT … ON CONFLICT`, `UPDATE … FROM`, `DELETE … USING`, `TRUNCATE`, the
+  byte and JSON types, unknown options refused, uncastable values refused, TIMESTAMPTZ in UTC,
+  Iceberg field ids in Parquet, read-your-writes on followers, and the guard's estimate of what an
+  aggregation moves (the 6-node bench's q1/q3/q4/q12).
+- **Postgres's catalog** (`pg_catalog.rs`): dbt (seeds, models of every kind, snapshots, tests,
+  docs, run twice) gives the same rows as Postgres 16; psql's backslash commands, SQLAlchemy,
+  pgjdbc, psqlODBC, ADBC and Npgsql 4.0 and 8 (Power BI's driver) work. `ALTER TABLE | VIEW …
+  RENAME TO` (dbt's swap).
+- **`pondra server`** (`dbserver.rs`): a folder of lakes as databases, each a node started on use
+  and stopped when idle; `CREATE/DROP DATABASE`; queries across databases.
+- **The console at `/`** (`console.html`, one file, no CDN): a tree with row counts, SQL, Python
+  (`DO LANGUAGE python`) and text cells, live answers, notebooks as `.ipynb` versions in the lake,
+  Jupyter's keys, light and dark. `console_check.py` drives it in Chromium.
+- **Found at the end:** `pondra sql` didn't check NOT NULL; ADBC's Postgres driver couldn't read
+  `pg_type`; Npgsql (Power BI's driver) knew none of the types; a time without seconds wasn't a timestamp; tables listed as views in
+  `information_schema`; a `files()` listing could be a cached answer. All fixed (invariants
+  129–138).
+- **Not in this round:** a folder in a bucket for `pondra server` (local folders only), TLS,
+  completion in the console, Python cells sharing variables.
+
 
 **Round 23 (ADR-026) read and wrote everything else:** files on S3, GCS, Azure, HTTPS and the
 owner's machine as tables (listed each statement, cached only by version, spread, their footers'

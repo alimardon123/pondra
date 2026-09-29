@@ -2498,8 +2498,8 @@ def columns():
     ALTER COLUMN … TYPE (widening), while rows stream into two nodes and tiering runs; a writer
     still using a renamed column's old name has it left out, never taken for the column now stored
     under it. Against a model: every node, a query spread over three nodes, a bulk INSERT, UPDATE,
-    a keyed table and its lookups, Delta and Iceberg readers. Refused: key and partition columns,
-    columns a view reads, narrowing, RENAME TABLE (with the way round it)."""
+    a keyed table and its lookups, Delta and Iceberg readers; the table renamed and back. Refused:
+    key and partition columns, columns a view reads, narrowing."""
     lake = new_lake()
     ports = [A.port, A.port + 1, A.port + 2]
     nodes = [Node(lake, p, tier_secs=0.3, publish="delta,iceberg").start() for p in ports]
@@ -2575,10 +2575,10 @@ def columns():
         "a clash": _raises(lambda: q("ALTER TABLE events RENAME COLUMN user TO id")),
         "a system column": _raises(lambda: q("ALTER TABLE events RENAME COLUMN _row_id TO r")),
     }
-    try:
-        q("ALTER TABLE events RENAME TO events2"); refused["RENAME TABLE, with the way round it"] = False
-    except Exception as e:
-        refused["RENAME TABLE, with the way round it"] = "CREATE TABLE events2 AS SELECT" in str(e)
+    # (Round 26 renames tables: this one, with its renamed, dropped and widened columns, and back.)
+    q("ALTER TABLE events RENAME TO events_renamed")
+    renamed = q("SELECT count(*) AS n, sum(total) AS s FROM events_renamed")
+    q("ALTER TABLE events_renamed RENAME TO events")
     q("CHECKPOINT")
     want = sorted((i, r["total"], r["note"]) for i, r in model.items())
     total = sum(r["total"] or 0 for r in model.values())
@@ -2591,6 +2591,7 @@ def columns():
         "SELECT * has SQL's columns": list(q("SELECT * FROM events WHERE id = 1")[0]) == ["id", "user", "total"] or list(q("SELECT * FROM events WHERE id = 1")[0]) == ["id", "user", "total", "note"],
         "spread over three nodes == one node": spread == one and call(A.port, "POST", "/sql?spread=1", joined.encode()) == q(joined),
         "a keyed table: renamed, updated, looked up": lookup == [{"id": 1, "name": "ann", "points": 6}] and q("SELECT * FROM users ORDER BY id") == [{"id": 1, "points": 6}, {"id": 2, "points": 7}],
+        "the table renamed and back, its columns as they were": renamed == [{"n": len(model), "s": total}],
         **{f"refused: {k}": v for k, v in refused.items()},
     }
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))

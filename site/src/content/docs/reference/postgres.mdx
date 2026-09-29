@@ -275,6 +275,7 @@ These connect and query, run in this repository's tests or checked by hand:
 | ADBC (`adbc_driver_postgresql`) | Arrow results, through `COPY … TO STDOUT (FORMAT binary)` |
 | SQLAlchemy (`postgresql+psycopg2` and `postgresql+psycopg`) | the inspector: schemas, tables, views, columns, primary keys; pandas' `to_sql` and `read_sql` |
 | pgjdbc, psqlODBC | catalog calls and queries: DBeaver, DataGrip, Metabase, Tableau and Excel connect through them |
+| Npgsql 4.0 and 8 (.NET) | the types it loads on connecting, `GetSchema`, parameters, arrays and decimals: Power BI Desktop's PostgreSQL connector uses it |
 | dbt-postgres | seeds, models, snapshots and tests. See [dbt and BI tools](/pondra/guides/dbt-and-bi/) |
 
 ```python

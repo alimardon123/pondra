@@ -100,7 +100,20 @@ on an attached lake from any node, and temporary tables.
 - **Function answers reused** for a lifetime (`WITH (cache = '10 minutes')`).
 - **Temporary tables and views**, a session's own; changes to attached lakes from any node.
 
-Round 26 is next: the console, the server and the docs website (the owner, 2026-09-29).
+**Round 26 is done** (ADR-030, built):
+
+- **A documentation website** (Starlight, GitHub Pages): 49 pages, 456 examples, every one run in
+  CI. Writing it found 37 bugs, and all are fixed with checks.
+- **The console at `/`:** SQL, Python and text cells, live answers, and notebooks saved in the lake
+  as `.ipynb`, with Jupyter's keys.
+- **`pondra server`:** a folder of lakes as databases, each started on use and stopped when idle.
+- **Postgres's catalog:** dbt gives the same rows as Postgres 16; psql, SQLAlchemy, pgjdbc (DBeaver,
+  Metabase), psqlODBC (Tableau, Excel), Npgsql (Power BI) and ADBC work. `ALTER TABLE | VIEW … RENAME TO`, `ON
+  CONFLICT`, `UPDATE … FROM`, `DELETE … USING`, `TRUNCATE`, `NOT NULL` and `DEFAULT`.
+
+Left from it, for a later round: `pondra server` over a folder in a bucket; Power BI Desktop
+itself on Windows (its drivers, Npgsql and psqlODBC, are tested); completion and charts in the
+console.
 
 **Proposed, 2026-09-29: anyone's compute, one catalog** (ADR-029, the owner's direction: "total
 serverless and compute/storage separation"). It takes two rules from the first step one step
@@ -333,7 +346,7 @@ simulated R2 and real R2, an ADR, and a bundle.
 | 23 ✓ | Read and write anything (done: ADR-026) | G1–G5, secrets; D1 set up and measured | files, Delta and Iceberg anywhere read, joined and written, spread; GCS and Azure lakes; Kafka clusters in and out; `CREATE SECRET` |
 | 24 ✓ | SQL and Python as one (done: ADR-027) | H1–H6 | `CREATE FUNCTION` in SQL and Python; procedures that send mail from a SQL cell; decorators that take a notebook's function; schedules and a run log |
 | 25 ✓ | One vocabulary, open writes, live answers (done: ADR-028) | E9, E10, G8, B3, temporary tables, changes to attached lakes | `read_*`/`write_*` everywhere (the tools' names as fallbacks); Spark and PyIceberg append to Pondra's tables through its Iceberg catalog; live queries; function results reused; `CREATE TEMP TABLE`; `UPDATE`/`MERGE` on attached lakes from any node |
-| 26 | The console, the server and the docs (ADR-030) | A4, E1, E2, the server, E11 | a console at `/` with SQL and Python cells; a folder of lakes served as databases (`--server`); dbt and Power BI; a documentation website on GitHub Pages covering everything, each example tested |
+| 26 ✓ | The console, the server and the docs (done: ADR-030) | A4, E1, E2, the server, E11 | a console at `/` with SQL, Python and text cells; a folder of lakes served as databases (`pondra server`); dbt and BI tools through Postgres's catalog; a documentation website on GitHub Pages covering everything, each example tested |
 | 27 | Anyone's compute, phase 1 (ADR-029) | G9: appends as written, the id limit | other engines' appends cost the node only a commit; layout published for writers; tables made through the catalog |
 | 28 | Anyone's compute, phase 2 (ADR-029) | G9: changes as written | Spark's and PyIceberg's `DELETE`, `UPDATE`, `MERGE` and overwrites on Pondra's tables; deletes published as positions; keyed tables published every tier round |
 | 29 | Safe to share | E3, G6 | TLS, mutual TLS between nodes, users and grants down to a table, an audit log, quotas; Postgres and MySQL attached |

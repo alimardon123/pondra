@@ -1,0 +1,66 @@
+Picked up JAVA_TOOL_OPTIONS: -Djavax.net.ssl.trustStore=/root/.ccr/java-truststore.p12 -Djavax.net.ssl.trustStorePassword=changeit -Djavax.net.ssl.trustStoreType=PKCS12 -Dhttps.proxyHost=127.0.0.1 -Dhttps.proxyPort=32955 -Dhttp.nonProxyHosts=localhost|127.0.0.1|::1|127.*|0.*|::|169.254.*|api.anthropic.com|api-staging.anthropic.com|api-pr-preview.anthropic.com|mcp-proxy.anthropic.com|mcp-proxy-staging.anthropic.com|registry.npmjs.org|jsr.io|npm.jsr.io|pypi.org|files.pythonhosted.org|index.crates.io|proxy.golang.org|host.docker.internal|10.*|172.16.*|172.17.*|172.18.*|172.19.*|172.20.*|172.21.*|172.22.*|172.23.*|172.24.*|172.25.*|172.26.*|172.27.*|172.28.*|172.29.*|172.30.*|172.31.*|192.168.*|100.64.0.0/10|*.svc.cluster.local|*.svc.cluster.local -Djdk.http.auth.tunneling.disabledSchemes= -Djdk.http.auth.proxying.disabledSchemes=
+Picked up JAVA_TOOL_OPTIONS: -Djavax.net.ssl.trustStore=/root/.ccr/java-truststore.p12 -Djavax.net.ssl.trustStorePassword=changeit -Djavax.net.ssl.trustStoreType=PKCS12 -Dhttps.proxyHost=127.0.0.1 -Dhttps.proxyPort=32955 -Dhttp.nonProxyHosts=localhost|127.0.0.1|::1|127.*|0.*|::|169.254.*|api.anthropic.com|api-staging.anthropic.com|api-pr-preview.anthropic.com|mcp-proxy.anthropic.com|mcp-proxy-staging.anthropic.com|registry.npmjs.org|jsr.io|npm.jsr.io|pypi.org|files.pythonhosted.org|index.crates.io|proxy.golang.org|host.docker.internal|10.*|172.16.*|172.17.*|172.18.*|172.19.*|172.20.*|172.21.*|172.22.*|172.23.*|172.24.*|172.25.*|172.26.*|172.27.*|172.28.*|172.29.*|172.30.*|172.31.*|192.168.*|100.64.0.0/10|*.svc.cluster.local|*.svc.cluster.local -Djdk.http.auth.tunneling.disabledSchemes= -Djdk.http.auth.proxying.disabledSchemes=
+WARNING: Using incubator modules: jdk.incubator.vector
+Using Spark's default log4j profile: org/apache/spark/log4j2-defaults.properties
+26/09/29 06:39:04 WARN Utils: Your hostname, vm, resolves to a loopback address: 127.0.0.1; using 192.0.2.2 instead (on interface eth0)
+26/09/29 06:39:04 WARN Utils: Set SPARK_LOCAL_IP if you need to bind to another address
+Using Spark's default log4j profile: org/apache/spark/log4j2-defaults.properties
+Setting default log level to "WARN".
+To adjust logging level use sc.setLogLevel(newLevel). For SparkR, use setLogLevel(newLevel).
+26/09/29 06:39:06 WARN NativeCodeLoader: Unable to load native-hadoop library for your platform... using builtin-java classes where applicable
+{"name": "select", "equal": true, "names_equal": true}
+{"name": "selectExpr", "equal": true, "names_equal": true}
+{"name": "withColumn", "equal": true, "names_equal": true}
+{"name": "withColumns", "equal": true, "names_equal": true}
+{"name": "withColumnRenamed", "equal": true, "names_equal": true}
+{"name": "drop_unknown", "equal": true, "names_equal": true}
+{"name": "filter_column", "equal": true, "names_equal": true}
+{"name": "where_sql_string", "equal": true, "names_equal": true}
+{"name": "groupBy_agg", "equal": true, "names_equal": true}
+{"name": "groupBy_count", "equal": true, "names_equal": true}
+{"name": "orderBy_nulls_limit", "equal": true, "names_equal": true}
+{"name": "distinct", "equal": true, "names_equal": true}
+{"name": "dropDuplicates_subset", "equal": true, "names_equal": true}
+{"name": "union", "equal": true, "names_equal": true}
+{"name": "unionByName", "equal": true, "names_equal": true}
+{"name": "join_on_name", "equal": true, "names_equal": true}
+{"name": "join_on_names_list", "equal": true, "names_equal": true}
+{"name": "join_left", "equal": true, "names_equal": true}
+{"name": "join_right", "equal": true, "names_equal": true}
+{"name": "join_full_outer", "equal": true, "names_equal": true}
+{"name": "join_condition_alias", "equal": true, "names_equal": true}
+{"name": "join_left_semi", "equal": true, "names_equal": true}
+{"name": "join_left_anti", "equal": true, "names_equal": true}
+{"name": "cross_join", "equal": true, "names_equal": true}
+{"name": "na_fill", "equal": true, "names_equal": true}
+{"name": "na_drop", "equal": true, "names_equal": true}
+{"name": "when_otherwise", "equal": true, "names_equal": true}
+{"name": "coalesce", "equal": true, "names_equal": true}
+{"name": "predicates_isnull_isin_between_like_rlike", "equal": true, "names_equal": true}
+{"name": "concat_null_propagates", "equal": true, "names_equal": true}
+{"name": "concat_ws", "equal": true, "names_equal": true}
+{"name": "string_funcs", "equal": true, "names_equal": true}
+{"name": "regexp_replace", "equal": true, "names_equal": true}
+{"name": "substring", "equal": true, "names_equal": true}
+{"name": "date_parts", "equal": true, "names_equal": true}
+{"name": "date_trunc", "equal": true, "names_equal": true}
+{"name": "date_math", "equal": true, "names_equal": true}
+{"name": "window_ranks_lag_lead", "equal": true, "names_equal": true}
+{"name": "window_rows_between", "equal": true, "names_equal": true}
+{"name": "int_division_round", "equal": true, "names_equal": true}
+{"name": "spark_sql_tempview", "equal": true, "names_equal": true}
+{"name": "createDataFrame_tuples_schema", "equal": true, "names_equal": true}
+{"name": "write_saveAsTable_then_table", "equal": true, "names_equal": true}
+{"name": "count_first_collect_row_access", "equal": true, "names_equal": true}
+{"name": "read_csv_header_inferSchema", "equal": true, "names_equal": true}
+{"name": "read_csv_strings_no_header", "equal": true, "names_equal": true}
+{"name": "read_parquet_partition_folders", "equal": true, "names_equal": true}
+{"name": "read_json", "equal": true, "names_equal": true}
+{"name": "write_parquet_partitionBy_modes", "equal": true, "names_equal": true}
+{"name": "write_csv_header", "equal": true, "names_equal": true}
+{"name": "write_modes_error_ignore_append", "equal": true, "names_equal": true}
+{"name": "udf", "equal": true, "names_equal": true}
+{"name": "udf_register_then_sql", "equal": true, "names_equal": true}
+{"name": "pandas_udf", "equal": true, "names_equal": true}
+{"name": "udf_in_groupBy", "equal": true, "names_equal": true}
+{"equal": 55, "names_equal": 55, "total": 55}

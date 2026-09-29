@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Pondra as dbt and BI tools use it (ADR-030): its Postgres port, with Postgres's catalog.
 
-  clients_check.py [dbt,psql,sqlalchemy,jdbc,odbc,adbc] [--port 8870]
+  clients_check.py [dbt,psql,sqlalchemy,jdbc,odbc,adbc,npgsql] [--port 8870]
 
 - dbt: a project with seeds, a view, a table, incremental models (delete+insert, merge,
   append), a snapshot and data tests, run twice — the second time with changed seeds, so views
@@ -18,10 +18,13 @@
 - adbc: ADBC's Postgres driver (Arrow straight from the port): it reads pg_type first, then
   fetches rows of every kind (integers, text, doubles, timestamps with a zone, lists, decimals,
   booleans, dates) as Arrow.
+- npgsql: Npgsql 4.0 (what Power BI Desktop's PostgreSQL connector carries) and 8: it loads the
+  server's types on open (pg_type joined to pg_proc), then GetSchema's databases, tables, views
+  and columns, and queries with a parameter.
 
 Needs: dbt-postgres (`PONDRA_DBT`, else `dbt` on PATH), Postgres 16's binaries
 (`PONDRA_PG_BIN`, else /usr/lib/postgresql/16/bin), java and javac with pgjdbc's jar
-(`PGJDBC_JAR`, else fetched once), psqlODBC with pyodbc.
+(`PGJDBC_JAR`, else fetched once), psqlODBC with pyodbc, the .NET SDK (`dotnet`, with NuGet).
 """
 import argparse, json, os, re, shutil, subprocess, sys, tempfile, time
 
@@ -276,9 +279,70 @@ def adbc_check(pg):
     return checks, ({} if all(checks.values()) else {k: str(v)[:800] for k, v in got.items()})
 
 
+CSHARP = r"""
+using System;
+using System.Data;
+using Npgsql;
+
+// What Power BI's PostgreSQL connector does through Npgsql: open (Npgsql loads the server's types
+// from pg_type, joined to pg_proc), list the databases, tables, views and columns, and query.
+class P {
+    static readonly IFormatProvider Inv = System.Globalization.CultureInfo.InvariantCulture;
+    static string Rows(DataTable t, params string[] cols) {
+        var s = "";
+        foreach (DataRow r in t.Rows) { foreach (var c in cols) s += r[c] + "|"; s += ";"; }
+        return s;
+    }
+    static void Main(string[] a) {
+        using var c = new NpgsqlConnection(a[0]);
+        c.Open();
+        Console.WriteLine("databases=" + Rows(c.GetSchema("Databases"), "database_name"));
+        Console.WriteLine("tables=" + Rows(c.GetSchema("Tables"), "table_schema", "table_name", "table_type"));
+        Console.WriteLine("views=" + Rows(c.GetSchema("Views"), "table_schema", "table_name"));
+        Console.WriteLine("columns=" + Rows(c.GetSchema("Columns", new[] { null, null, "users" }), "column_name", "is_nullable"));
+        using (var cmd = new NpgsqlCommand("SELECT name, score, joined FROM users WHERE id = @id", c)) {
+            cmd.Parameters.AddWithValue("id", 1L);
+            using var rd = cmd.ExecuteReader();
+            rd.Read();
+            Console.WriteLine("row=" + rd.GetString(0) + "|" + rd.GetDouble(1).ToString(Inv) + "|" + rd.GetDateTime(2).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm", Inv));
+        }
+        using (var cmd = new NpgsqlCommand("SELECT tags, amount FROM events", c)) {
+            using var rd = cmd.ExecuteReader();
+            rd.Read();
+            Console.WriteLine("event=" + string.Join(",", (string[])rd.GetValue(0)) + "|" + rd.GetDecimal(1).ToString(Inv));
+        }
+    }
+}
+"""
+
+
+def npgsql_check(pg, work):
+    """Npgsql, the .NET driver: 4.0 (what Power BI Desktop's PostgreSQL connector carries) and 8.
+    Needs the .NET SDK (`dotnet`) and NuGet."""
+    checks, said = {}, {}
+    env = {**os.environ, "DOTNET_CLI_TELEMETRY_OPTOUT": "1", "DOTNET_NOLOGO": "1"}
+    for version in ("4.0.12", "8.0.8"):
+        proj = os.path.join(work, f"pgcheck{version.split('.')[0]}")
+        os.makedirs(proj, exist_ok=True)
+        with open(os.path.join(proj, "pgcheck.csproj"), "w") as f:
+            f.write('<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net8.0</TargetFramework><Nullable>disable</Nullable>'
+                    f'<NoWarn>NU1903;NU1902</NoWarn></PropertyGroup><ItemGroup><PackageReference Include="Npgsql" Version="{version}" /></ItemGroup></Project>')
+        with open(os.path.join(proj, "Program.cs"), "w") as f:
+            f.write(CSHARP)
+        built = subprocess.run(["dotnet", "build", "-c", "Release", "-o", "out"], cwd=proj, capture_output=True, text=True, env=env, timeout=600)
+        r = subprocess.run(["dotnet", "out/pgcheck.dll", f"Host=127.0.0.1;Port={pg};Username=u;Password={PASSWORD};Database=lake"], cwd=proj, capture_output=True, text=True, env=env, timeout=120)
+        got = dict(line.split("=", 1) for line in r.stdout.splitlines() if "=" in line)
+        checks[f"Npgsql {version}: types loaded, databases, tables, views, columns; a query with a parameter; arrays and decimals"] = built.returncode == 0 \
+            and got.get("databases") == "lake|;" and "public|users|BASE TABLE|;" in got.get("tables", "") and "public|big|;" in got.get("views", "") \
+            and "name|NO|;" in got.get("columns", "") and got.get("row") == "ann|1.5|2026-09-01T10:00" and got.get("event") == "a,b|12.50"
+        if not checks[f"Npgsql {version}: types loaded, databases, tables, views, columns; a query with a parameter; arrays and decimals"]:
+            said[version] = {"build": built.stdout[-800:], "out": r.stdout[-1500:], "err": r.stderr[-1500:]}
+    return checks, said
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("parts", nargs="?", default="dbt,psql,sqlalchemy,jdbc,odbc,adbc")
+    ap.add_argument("parts", nargs="?", default="dbt,psql,sqlalchemy,jdbc,odbc,adbc,npgsql")
     ap.add_argument("--port", type=int, default=8870)
     A = harness.A = ap.parse_args()
     A.s3, A.keep = False, False
@@ -294,7 +358,7 @@ def main():
         for part in A.parts.split(","):
             try:
                 checks, info = {"dbt": lambda: dbt_check(pg, work), "psql": lambda: psql_check(pg), "sqlalchemy": lambda: sqlalchemy_check(pg),
-                                "jdbc": lambda: jdbc_check(pg, work), "odbc": lambda: odbc_check(pg), "adbc": lambda: adbc_check(pg)}[part]()
+                                "jdbc": lambda: jdbc_check(pg, work), "odbc": lambda: odbc_check(pg), "adbc": lambda: adbc_check(pg), "npgsql": lambda: npgsql_check(pg, work)}[part]()
             except Exception as e:  # noqa: BLE001 (a part that couldn't run fails)
                 checks, info = {f"{part}: ran": False}, {"error": f"{type(e).__name__}: {str(e)[:1500]}"}
             results.update(checks)

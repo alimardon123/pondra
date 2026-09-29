@@ -25,7 +25,7 @@ pondra serve --dir lake --pg 0.0.0.0:5432 --admin-token "$TOKEN"
 
 ## What is tested
 
-Every release runs these tools against a node (`tools/clients_check.py`):
+These tools are run against a node before each release (`tools/clients_check.py`):
 
 | Tool | What is checked |
 |---|---|
@@ -34,6 +34,8 @@ Every release runs these tools against a node (`tools/clients_check.py`):
 | **SQLAlchemy** (psycopg 2 and 3) | the inspector: schemas, tables, views, columns, primary keys, view definitions; pandas' `to_sql` and `read_sql` |
 | **pgjdbc** (what DBeaver, DataGrip, Metabase and Tableau's JDBC connector use) | `DatabaseMetaData`: catalogs, schemas, tables, views, columns, primary keys, functions; prepared queries |
 | **psqlODBC** (what Tableau, Excel and Power BI's ODBC connector use) | tables, views, columns, primary keys; queries with parameters |
+| **Npgsql** 4.0 (what Power BI Desktop's PostgreSQL connector carries) and 8 | the types it loads on connecting, its schema of databases, tables, views and columns; queries with parameters, arrays and decimals |
+| **ADBC** (`adbc_driver_postgresql`) | Arrow results of every type |
 
 ## dbt
 
@@ -113,8 +115,8 @@ restart.
 
 <Aside type="caution" title="Limits">
 - **No TLS on the Postgres port yet** (planned). Keep it on a private network, or behind a tunnel.
-- **Power BI Desktop's PostgreSQL connector** (Npgsql) isn't tested here yet. Its ODBC connector
-  uses psqlODBC, which is.
+- **Power BI Desktop itself** runs only on Windows, so it isn't run here. Its PostgreSQL connector
+  talks through Npgsql 4.0, and its ODBC connector through psqlODBC: both are tested.
 - **Indexes:** a keyed table's primary key shows as an index. Pondra has no other indexes: it finds
   rows by the files' column ranges instead.
 - **Transactions:** `BEGIN` and `COMMIT` are accepted, and each statement commits on its own, so a

@@ -51,7 +51,9 @@ Turning a format off deletes its metadata, so nobody reads a stale copy.
 │                               Arrow IPC stream + ZSTD; smaller ones ride inside the catalog commit
 ├── files/                      objects put there with PUT /files/<path>: images, PDFs, models —
 │                               what a table's rows point at (files('…'), file_read(path))
-└── data/<table>/               one folder per table (views and task outputs are tables too)
+└── data/<folder>/              one folder per table (views and task outputs are tables too): its
+    │                           name when made, kept through a rename; a name used before gets
+    │                           `<name>__N` (the table's entry records it as `folder`)
     ├── <uuid>.parquet          the table's rows (Parquet, LZ4 by default — PONDRA_CODEC=zstd for
     │                           smaller files; keyed tables sorted by key, with
     │                           bloom filters on the key; `cluster_by` tables sorted by those columns;
@@ -160,6 +162,17 @@ The same on local disk and on object storage:
   again under a taken name is stored as `name~2`. Delta publishes such a table with column
   mapping by name (each field's `delta.columnMapping.id` and `physicalName`; the `columnMapping`
   table feature), Iceberg with field ids by stored position and a name mapping to the stored names.
+- **Tables renamed** (round 26, `ALTER TABLE … RENAME TO`): the entry moves to the new name and
+  keeps its `folder`, so the files, manifests and Delta and Iceberg copies stay where they are and
+  other engines keep reading them (Iceberg through the REST catalog by the new name). A table made
+  under a name whose folder is taken gets `<name>__N`. An entry without `folder` (every table made
+  before round 26) uses its name.
+- **`NOT NULL` and `DEFAULT`** (round 26): a table's entry lists its `not_null` columns (a key's
+  are among them) and its `defaults` (SQL expressions); every door checks and fills them.
+- **Iceberg field ids in Parquet** (round 26): a column's field id (its place among the stored
+  columns, from 1; system columns from 1,000,001) is in the schema of each Parquet file written
+  since, so readers
+  that resolve columns by id (Polars' `scan_iceberg`) read them.
 - **Retention:** replaced files and consumed log objects are deleted after `--retain-secs`.
   Objects no commit ever referenced are deleted after a day.
 - **The run log** (`pondra.runs`, ADR-027) is a keyed table of the lake's own, `pondra$runs`

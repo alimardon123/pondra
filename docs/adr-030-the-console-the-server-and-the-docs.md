@@ -1,6 +1,6 @@
 # ADR-030: The console, the server and the docs (round 26)
 
-**Date:** 2026-09-29 · **Status:** accepted (the owner's choice: all three in one round) · **Follows:** ADR-024 (nothing to set up), ADR-027 (SQL and Python as one), ADR-028 (one vocabulary)
+**Date:** 2026-09-29 · **Status:** accepted and built (the owner's choice: all three in one round) · **Follows:** ADR-024 (nothing to set up), ADR-027 (SQL and Python as one), ADR-028 (one vocabulary)
 
 ## Context
 
@@ -212,3 +212,49 @@ every door (psql too).
   feed and a stored view; refused while a materialized view follows it.
 - **The docs:** `docs_check.py` passes for every page, and the site builds in CI.
 - **Every new invariant** gets a test in `tools/` that fails without it.
+
+## As built (round 26)
+
+Built as decided, with these differences and details:
+
+- **The server:**
+  - `pondra serve --advertise host:port/db/name` is how a database's node names itself to its
+    cluster behind the server.
+  - The server's folder is on its own disk. A folder in a bucket (listing its lakes, making and
+    dropping them there) is left for a later round; until then, `pondra serve` per lake.
+  - `DROP DATABASE` runs from another database, as in Postgres. On a plain node it says to use
+    `DETACH`.
+  - A stopped database answered its first query in about 70 ms on local disk.
+- **The console** (`src/console.html`, about 1,000 lines, one file):
+  - SQL cells use `POST /sql?format=typed`: the columns with their types, rows as lists (a
+    join's repeated names survive), the first 10,000 rows, decimals and integers past 2^53 as
+    text.
+  - Python cells are `DO LANGUAGE python` blocks. Each runs on its own, so cells don't share
+    variables; a temporary table (the page's session) carries data between them.
+  - Notebooks are saved as `files/notebooks/<name>/<time>.ipynb`, a version per save, because a
+    file in the lake is never replaced. SQL cells are `%%sql` cells, and each answer keeps its
+    first 100 rows in the cell's outputs (`application/vnd.pondra.rows+json`, and a text table
+    for Jupyter and GitHub).
+  - Jupyter's keys. Not built: completion, charts.
+- **Postgres's catalog** (`src/pg_catalog.rs`, 1,100 lines): the tables and functions listed
+  above, `information_schema`'s `table_constraints` and `key_column_usage`, and a rewriter (on
+  the Postgres dialect's AST) for what DataFusion lacks: `COLLATE`, `LIKE … ESCAPE`,
+  `OPERATOR(…)`, casts to `reg*` types, `ARRAY(subquery)`, the correlated subqueries psql writes,
+  `generate_subscripts`, `_pg_expandarray` (pgjdbc) and `int2vector` subscripts (psqlODBC).
+  Tested: dbt (the same rows as Postgres 16, run twice), psql, SQLAlchemy with psycopg 2 and 3,
+  pgjdbc, psqlODBC, ADBC's Postgres driver, and Npgsql 4.0 (what Power BI Desktop's PostgreSQL
+  connector carries) and 8, through the .NET SDK. Npgsql loads the server's types by joining
+  `pg_proc` on a type's `typreceive`, so `pg_proc` lists the type functions and such a join is
+  made by name. Power BI Desktop itself (Windows only) is not run here.
+- **Renaming:** a table's entry records its `folder`, and a new table under a used name gets
+  `name__N` (object stores percent-encode `~`).
+- **The website:** 49 pages, 456 examples, all run by `docs_check.py` in CI. `pages.yml`
+  publishes it with each release tag (and by hand). A `python cell` block runs as the console
+  runs it. The README points to the site at its top and keeps its overview: GitHub's front page
+  is where most people land first.
+- **Writing the site found 37 bugs**, all fixed with checks (`harness.py found` and others).
+  Finishing it found six more: `pondra sql` didn't check `NOT NULL`, ADBC's Postgres driver
+  couldn't read `pg_type`, Npgsql knew none of the types, a time without seconds wasn't a
+  timestamp, tables were views to `information_schema`, and a `files()` listing could be a
+  remembered answer. AGENTS.md
+  invariants 129–138.

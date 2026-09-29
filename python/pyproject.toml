@@ -1,6 +1,6 @@
 [project]
 name = "pondra"
-version = "0.25.0"
+version = "0.26.0"
 description = "Pondra, a streamhouse in one binary: the binary, and a Python client (SQL into pandas/Polars/Arrow, exactly-once appends, change feeds)"
 requires-python = ">=3.9"
 license = "MIT OR Apache-2.0"

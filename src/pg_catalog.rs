@@ -46,6 +46,25 @@ const TYPES: &[PgType] = &[
     PgType(2249, "record", "record", -1, 'P', 2287),
 ];
 
+/// A type's input, output, receive or send function, by Postgres's own name (drivers such as ADBC's
+/// pick a type's binary format by its `typreceive`; newer types' names have an underscore).
+fn type_function(t: &PgType, f: &str) -> String {
+    match t.1 {
+        "json" | "jsonb" | "date" | "time" | "timestamp" | "timestamptz" | "interval" | "numeric" | "uuid" | "void" | "record" => format!("{}_{f}", t.1),
+        _ => format!("{}{f}", t.1),
+    }
+}
+
+/// Every type function `pg_type` names, as rows of `pg_proc` in `pg_catalog`: Npgsql joins
+/// `pg_proc` on a type's `typreceive` to learn which types are arrays (`array_recv`).
+fn type_functions() -> Vec<String> {
+    let mut all: Vec<String> = TYPES.iter().flat_map(|t| ["in", "out", "recv", "send"].map(|f| type_function(t, f))).collect();
+    all.extend(["array_in", "array_out", "array_recv", "array_send"].map(String::from));
+    all.sort();
+    all.dedup();
+    all
+}
+
 fn arrays() -> impl Iterator<Item = (u32, String, String, u32)> {
     TYPES.iter().filter(|t| t.5 != 0).map(|t| (t.5, format!("_{}", t.1), format!("{}[]", t.2), t.0))
 }
@@ -287,10 +306,7 @@ fn tables(l: &Lakes) -> Result<Vec<(&'static str, Arc<MemTable>)>> {
     // Types, and an array type for each.
     // (The functions by Postgres's own names: drivers such as ADBC's pick a type's binary format by
     // its `typreceive`. Newer types' names have an underscore.)
-    let fun = |t: &PgType, f: &str| match t.1 {
-        "json" | "jsonb" | "date" | "time" | "timestamp" | "timestamptz" | "interval" | "numeric" | "uuid" | "void" | "record" => s(format!("{}_{f}", t.1)),
-        _ => s(format!("{}{f}", t.1)),
-    };
+    let fun = |t: &PgType, f: &str| s(type_function(t, f));
     let mut types: Vec<Vec<ScalarValue>> = TYPES.iter().map(|t| vec![o(t.0), s(t.1), o(11), o(owner), i2(t.3), b(t.3 > 0 && t.3 <= 8), s(if t.4 == 'P' { "p" } else { "b" }), s(t.4.to_string()),
         b(false), b(true), s(","), o(0), o(0), o(t.5), fun(t, "in"), fun(t, "out"), fun(t, "recv"), fun(t, "send"), o(0), i4(-1), b(false), i4(0),
         o(if matches!(t.0, 25 | 1043 | 1042 | 19) { 100 } else { 0 }), n(), s("i"), s("p")]).collect();
@@ -338,7 +354,8 @@ fn tables(l: &Lakes) -> Result<Vec<(&'static str, Arc<MemTable>)>> {
             vec![o(*oid), s(name.clone()), o(schema_oid(schema)), o(owner), o(lang), f4(100.0), f4(if r.kind == Kind::Table { 1000.0 } else { 0.0 }), o(0), s("-"), s(kind), b(false), b(false), b(false),
                 b(r.kind == Kind::Table), s("v"), s("u"), i2(r.params.len() as i16), i2(r.params.iter().filter(|p| p.default.is_some()).count() as i16), o(rettype),
                 ScalarValue::List(ScalarValue::new_list_nullable(&args, &OID)), n(), n(), texts(&names), s(r.body.clone()), n(), n(), n()]
-        }).collect())?));
+        }).chain(type_functions().into_iter().map(|f| vec![o(oid("tf", &f)), s(f.clone()), o(11), o(10), o(12), f4(1.0), f4(0.0), o(0), s("-"), s("f"), b(false), b(false), b(true),
+            b(false), s("i"), s("s"), i2(1), i2(0), o(0), ScalarValue::List(ScalarValue::new_list_nullable(&[o(0)], &OID)), n(), n(), n(), s(f), n(), n(), n()])).collect())?));
     out.push(("pg_database", table(&[("oid", OID), ("datname", TEXT), ("datdba", OID), ("encoding", INT4), ("datlocprovider", TEXT), ("datistemplate", BOOL), ("datallowconn", BOOL),
         ("datconnlimit", INT4), ("datfrozenxid", OID), ("datminmxid", OID), ("dattablespace", OID), ("datcollate", TEXT), ("datctype", TEXT), ("daticulocale", TEXT), ("daticurules", TEXT),
         ("datcollversion", TEXT), ("datacl", list(TEXT))],
@@ -955,12 +972,14 @@ impl VisitorMut for Rewriter<'_> {
             ast::Expr::Collate { expr, .. } => Some((**expr).clone()),
             // `typreceive != 0` (ADBC's): a function (`regproc`) column against 0, Postgres's "none",
             // which as text is `-`.
+            // `pg_proc.oid = typ.typreceive` (Npgsql's): joined by the function's name, which is
+            // what the column holds.
             ast::Expr::BinaryOp { left, op: ast::BinaryOperator::Eq | ast::BinaryOperator::NotEq, right } if regproc(left) || regproc(right) => {
                 for side in [left, right] {
-                    if let ast::Expr::Value(v) = side.as_mut() {
-                        if matches!(&v.value, ast::Value::Number(n, _) if n == "0") {
-                            v.value = ast::Value::SingleQuotedString("-".into());
-                        }
+                    match side.as_mut() {
+                        ast::Expr::Value(v) if matches!(&v.value, ast::Value::Number(n, _) if n == "0") => v.value = ast::Value::SingleQuotedString("-".into()),
+                        ast::Expr::CompoundIdentifier(p) if p.last().is_some_and(|i| i.value.eq_ignore_ascii_case("oid")) => *p.last_mut().expect("a last part") = ast::Ident::new("proname"),
+                        _ => {}
                     }
                 }
                 None

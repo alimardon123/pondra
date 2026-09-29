@@ -222,8 +222,8 @@ Pondra hasn't been measured against Snowflake.
 - **Other databases.** Reading and writing Postgres or MySQL as attached databases, and streaming their
   changes in natively, are on the roadmap and not built. Debezium events through the Kafka port work.
 - **BI tools and JDBC.** dbt, psql, SQLAlchemy, pgjdbc and psqlODBC are tested against the Postgres
-  port ([dbt and BI tools](/pondra/guides/dbt-and-bi/)). Power BI Desktop's own PostgreSQL connector
-  isn't tested here.
+  port, and so is Npgsql, the driver in Power BI Desktop's PostgreSQL connector
+  ([dbt and BI tools](/pondra/guides/dbt-and-bi/)).
 - **Streaming.** No timers, CEP, or Top-N by event time, and one watermark per source.
 - **Maturity.** Pondra is new and hasn't run in production for years. Chaos tests across several
   machines, fuzzing and long soak runs are still on the plan.
