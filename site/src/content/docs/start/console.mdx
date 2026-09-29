@@ -1,6 +1,6 @@
 ---
 title: The console
-description: A web page for SQL, Python and notes that every Pondra node serves at /. Tables on the left, cells on the right, notebooks saved in the lake.
+description: A web page for SQL, Python and notes that every Pondra node serves at /. The lake on the left, cells in the middle, details and profiles on the right, notebooks saved in the lake.
 sidebar:
   order: 5
 setup: |
@@ -11,11 +11,12 @@ setup: |
 import { Aside } from '@astrojs/starlight/components';
 
 Every Pondra node serves a console at `/`. Open the node's address in a browser and you get the
-lake's tables on the left and notebook cells on the right: SQL, Python and text. There is nothing
+lake's tables and files on the left, notebook cells in the middle (SQL, Python and text), and on the
+right the details of whatever you pick. There is nothing
 to install. The page is part of the `pondra` binary, it works offline, and it sends requests only
 to the node that served it.
 
-![The console: the lake's tables on the left; a text cell, a SQL cell with its answer, and a Python cell with what it printed and the rows it returned.](../../../assets/console.png)
+![The console: the lake's tables and files on the left; a text cell, a SQL cell with its answer, and a Python cell with what it printed and the rows it returned; on the right, a table's details and each column's profile.](../../../assets/console.png)
 
 ## Open it
 
@@ -54,8 +55,35 @@ ORDER BY total DESC;
 - Decimals keep their digits (`1.50`), and integers too big for JavaScript arrive as text, so what
   you see is exactly what the lake holds.
 
-Click a table on the left to see its first 100 rows in a new cell. Click a column to put its name
-where you are typing.
+A long answer scrolls smoothly however many rows it has: the page draws only the rows in sight.
+Click a column's header to sort by it (again: the other way; a third time: as it came), and the
+details panel summarizes that column. **Explore** summarizes them all.
+
+## The lake, on the left
+
+- **Tables and views.** Each kind has its icon: a table a grid, a view the same grid drawn dashed, a
+  materialized view a grid with a solid header, and a view of files (`CREATE EXTERNAL TABLE`) a page
+  with a grid on it. Open one to see its columns: each has a glyph for its type (`#` numbers,
+  `T` text, a calendar for dates, a clock for times, braces for JSON-like values, brackets for
+  lists) and its SQL type on the right; a key column has a key.
+- **Click** a table or a view to see its details on the right. **Double-click** it for its first
+  100 rows in a new cell. Click a column to put its name where you are typing.
+- **Files** lists the lake's own files (`PUT /files/…`, `files()`) by folder. Click one for its size
+  and when it was written; double-click a CSV, JSON or Parquet file to read it as a table, in a new
+  cell. Whoever may read the lake may read its files this way.
+
+## The details panel
+
+The panel on the right (its button is at the top right) shows what you picked:
+
+| Picked | It shows |
+|---|---|
+| A table | rows, columns, key, partitioning, clustering, the formats it is published in, and its size in files; each column with its type, `NOT NULL` and default |
+| A view | its definition, and its columns |
+| **Profile** (a table's or a view's) | each column's share of NULLs, its distinct values (approximate), its least and greatest value, and a histogram (numbers, dates, times) or its five commonest values. It reads the whole table: the numbers are the table's, not a sample's |
+| A column of an answer | the same, from the rows the answer holds |
+| A file | its size, when it was written, and how SQL reads it |
+| Nothing | the lake: its tables, views, rows and size, and its cluster |
 
 ## Python cells
 

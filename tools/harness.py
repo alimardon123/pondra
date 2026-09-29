@@ -260,6 +260,16 @@ def external():
     checks["what it can't do, it says: INSERT into one file, UPDATE, Avro, gzip, no files, TEMPORARY, an option it doesn't read, INSERT into a view; others' files need the owner"] = \
         "view of a folder" in said["one file"] and "UPDATE" in said["update"] and "avro" in said["avro"] and "gzip" in said["gzip"] and "no files" in said["none"] \
         and "TEMP VIEW" in said["temp"] and "null_regex" in said["option"] and "is a view" in said["view"] and "program that started the node" in said["not owner"]
+    # The lake's own files (PUT /files/…) are the lake's: whoever reads the lake reads them as a
+    # table too, and nothing else of its folder (ADR-032); /objects says what each object is.
+    call(A.port, "PUT", "/files/reports/q1.csv", b"a,b\n1,x\n")
+    area = call(A.port, "GET", "/objects")["files"]
+    anyone = lambda s: call(A.port, "POST", "/sql", s.encode())
+    mine = anyone(f"SELECT * FROM read_csv('{area}reports/q1.csv')")
+    outside = [_raises_text(lambda: anyone(f"SELECT * FROM read_csv('{area}../catalog/x.csv')")), _raises_text(lambda: anyone(f"SELECT * FROM read_csv('{area[:-len('files/')]}other.csv')"))]
+    kinds = {o["name"]: o["kind"] for o in call(A.port, "GET", "/objects")["objects"]}
+    checks["the lake's own files read as a table by any reader, and nothing else of its folder; /objects says each object's kind"] = mine == [{"a": 1, "b": "x"}] \
+        and all("program that started the node" in e for e in outside) and kinds.get("ev") == "files" and kinds.get("v") == "view"
     node.kill()
     shutil.rmtree(here, ignore_errors=True)
     ok = all(checks.values())

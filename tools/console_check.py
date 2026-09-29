@@ -3,7 +3,11 @@
 
   console_check.py [--port 8890] [--show DIR]
 
-- node: the tree lists the lake's schemas, tables (with their row counts), views and columns; a
+- node: the tree lists the lake's schemas, tables, views (each kind its icon) and columns (each
+  type its glyph, a key's marked), with no bare numbers; a table picked shows its details (rows,
+  key, columns, a view's definition) and its profile, and Query (or a double-click) its first
+  rows; the lake's files are listed by folder, and one is read as a table; a long answer draws
+  only the rows in sight, sorts by a header's click, and its columns are summarized; a
   SQL cell and a Python cell run (what the code printed, and its last expression as rows);
   errors come back in plain words, a Python error at its line in the cell; a live cell shows a
   row INSERTed over HTTP, and its query ends when the switch is off; the keys (Esc, B, D D, Z,
@@ -73,7 +77,7 @@ class Page:
     def grid(self, c):
         """A cell's answer: its column names and its rows, as text."""
         heads = [h.split("\n")[0] for h in c.locator("thead th").all_inner_texts()[1:]]
-        rows = [[t.strip() for t in r.split("\t")[1:]] for r in c.locator("tbody tr").all_inner_texts()]
+        rows = [[t.strip() for t in r.split("\t")[1:]] for r in c.locator("tbody tr:not(.gap)").all_inner_texts()]
         return heads, rows
 
     def left(self):
@@ -99,36 +103,68 @@ def node_checks(browser, port, show):
     tree = p.locator("#tree")
     tree.locator(".row", has_text="people").wait_for(timeout=20000)
     people = tree.locator(".line", has_text="people")
-    counted = until(lambda: people.locator(".ct").inner_text(), "3")
     tree.locator(".line", has_text="sales").locator(".tw").click()
     tree.locator(".row", has_text="orders").wait_for(timeout=10000)
     people.locator(".tw").click()
     columns = tree.locator(".col:visible").all_inner_texts()
-    checks["the tree lists the lake's schemas, tables with their row counts, views and columns (with SQL types)"] = counted == "3" \
-        and tree.locator(".line", has_text="grown").locator(".ct").inner_text() == "view" \
-        and [c.split("\n")[0] for c in columns] == ["id", "name", "born", "at", "amt"] and "DECIMAL(10,2)" in columns[4] and "TIMESTAMP" in columns[3]
+    kinds = {r.inner_text().strip(): r.get_attribute("data-kind") for r in tree.locator(".row[data-kind]").all()}
+    checks["the tree lists the lake's schemas, tables and views (each kind its icon), columns with SQL types and glyphs, a key marked, no bare numbers"] = \
+        kinds == {"people": "table", "grown": "view", "orders": "table"} and [c.split("\n")[0] for c in columns] == ["id", "name", "born", "at", "amt"] \
+        and "DECIMAL(10,2)" in columns[4] and "TIMESTAMP" in columns[3] and tree.locator(".col:visible .tg").count() == 5 and tree.locator(".col:visible .kk").count() == 1 \
+        and not [t for t in tree.locator(".row:visible").all_inner_texts() if any(w.isdigit() for w in t.split())]
+    people.locator(".row").click()  # (its details, in the panel on the right)
+    detail = p.locator("#detail")
+    rows_shown = until(lambda: detail.locator("dd").first.inner_text(), "3")
+    facts = dict(zip(detail.locator("dt").all_inner_texts(), detail.locator("dd").all_inner_texts()))
+    checks["a table picked shows its details: rows, key, columns (a key's and NOT NULL marked)"] = rows_shown == "3" and facts.get("Key") == "id" \
+        and detail.locator(".pc").count() == 5 and "not null" in detail.locator(".pc", has_text="name").inner_text()
+    detail.locator("button", has_text="Profile").click()
+    profiled = until(lambda: detail.locator(".pc", has_text="born").locator(".nums").inner_text().startswith("67% null"), True)
+    charts = until(lambda: (detail.locator(".pc", has_text="amt").locator("svg rect").count(), detail.locator(".pc", has_text="name").locator(".bars .v").count()), (20, 3))
+    amt = detail.locator(".pc", has_text="amt").inner_text()
+    checks["Profile: each column's nulls, distinct values, range, and a histogram or its commonest values"] = profiled is True and "1.50 … 2.25" in amt and charts == (20, 3)
+    tree.locator(".row", has_text="grown").click()
+    checks["a view picked shows its definition"] = until(lambda: "born IS NOT NULL" in detail.locator(".defn").inner_text(), True) is True
 
     c = pg.run(0, "SELECT id, name, born, at, amt FROM people ORDER BY id")
     heads, rows = pg.grid(c)
     checks["a SQL cell shows the rows with their types; timestamps and decimals as written"] = heads == ["id", "name", "born", "at", "amt"] \
         and rows[0] == ["1", "Ann", "1990-01-02", "2024-01-01 10:00:00", "1.50"] and rows[1][2] == "NULL" and "3 rows" in c.locator(".meta").inner_text() \
         and "BIGINT" in c.locator("thead").inner_text()
-    tree.locator(".row", has_text="orders").click()  # (a table's first rows, in a new cell)
+    tree.locator(".row", has_text="orders").dblclick()  # (a table's first rows, in a new cell)
     peek = until(lambda: pg.grid(pg.cell(1))[1], [["1", "10.5"]])
-    checks["clicking a table shows its first rows"] = peek == [["1", "10.5"]] and "sales.orders" in pg.cell(1).locator("textarea").input_value()
+    checks["double-clicking a table shows its first rows"] = peek == [["1", "10.5"]] and "sales.orders" in pg.cell(1).locator("textarea").input_value()
+    call(port, "PUT", "/files/reports/q1.csv", b"a,b\n1,x\n2,y\n")
+    p.click("#refresh")
+    files = p.locator("#files")
+    files.locator(".row", has_text="reports").click()
+    files.locator(".row", has_text="q1.csv").wait_for(timeout=10000)
+    files.locator(".row", has_text="q1.csv").dblclick()  # (the lake's own file, read as a table: whoever reads the lake reads it)
+    read = until(lambda: pg.grid(pg.cell(2))[1], [["1", "x"], ["2", "y"]])
+    checks["the lake's files are listed by folder, and a data file is read as a table"] = read == [["1", "x"], ["2", "y"]]
+    long = pg.run(2, "SELECT value AS n, value % 7 AS m FROM range(0, 5000)")
+    drawn = long.locator("tbody tr:not(.gap)").count()
+    long.locator(".grid").evaluate("g => g.scrollTop = g.scrollHeight")
+    last = until(lambda: long.locator("tbody tr:not(.gap)").last.inner_text().split("\t")[1].strip(), "4999")
+    long.locator("th", has_text="m").click()
+    long.locator(".grid").evaluate("g => g.scrollTop = 0")
+    top = until(lambda: long.locator("tbody tr:not(.gap)").first.inner_text().split("\t")[2].strip(), "0")
+    m = detail.locator(".pc.on").inner_text()
+    checks["a long answer draws only the rows in sight, sorts by a header, and its column is summarized in the panel"] = drawn < 120 and last == "4999" and top == "0" \
+        and "7 distinct" in m and "0 … 6" in m
 
     p.click("[data-add=python]")
     p.keyboard.insert_text('for i in range(2):\n    print("hello", i)\ndb.sql("SELECT count(*) AS n FROM people")')
     p.keyboard.press("Control+Enter")
-    py = pg.cell(2)
+    py = pg.cell(3)
     py.locator("table").wait_for(timeout=60000)
     checks["a Python cell runs on the node: what it printed, then its last expression as rows"] = py.locator(".said").inner_text() == "hello 0\nhello 1" and pg.grid(py) == (["n"], [["3"]])
-    c = pg.run(2, "x = 1\n1 / 0")
+    c = pg.run(3, "x = 1\n1 / 0")
     python_error = c.locator(".err").inner_text()
     c = pg.run(1, "SELECT nope FROM people")
     sql_error = c.locator(".err").inner_text()
     checks["errors in plain words: a SQL one, and a Python one at its line in the cell"] = "nope" in sql_error and "ZeroDivisionError" in python_error and "line 2" in python_error
-    c = pg.run(2, "x * 10")  # (the cell before made x, then failed: x stays, as in a notebook)
+    c = pg.run(3, "x * 10")  # (the cell before made x, then failed: x stays, as in a notebook)
     shared = until(lambda: pg.grid(c), (["value"], [["10"]]))
     checks["Python cells share their variables (one namespace per page, as a notebook's kernel)"] = shared == (["value"], [["10"]])
 
@@ -210,7 +246,7 @@ def node_checks(browser, port, show):
         dark.shot(show, "console-dark.png")
         dark.ctx.close()
     checks["every request went to the node; no page errors"] = pg.left() == [] and pg.errors == [] and len(pg.seen) > 10
-    info = {"left": pg.left(), "errors": pg.errors, "sql_error": sql_error, "python_error": python_error, "counted": counted, "columns": columns}
+    info = {"left": pg.left(), "errors": pg.errors, "sql_error": sql_error, "python_error": python_error, "kinds": kinds, "columns": columns, "facts": facts}
     pg.ctx.close()
     return checks, info
 

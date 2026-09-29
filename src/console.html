@@ -47,25 +47,53 @@ header{display:flex;align-items:center;gap:8px;padding:8px 14px;border-bottom:1p
 .icon{border:0;background:transparent;border-radius:6px;padding:3px 6px;cursor:pointer;color:var(--muted);line-height:1;display:inline-flex;align-items:center}
 .icon:hover{background:var(--line);color:var(--ink)}
 #app{flex:1;display:flex;min-height:0}
-aside{width:290px;min-width:200px;max-width:50vw;border-right:1px solid var(--line);background:var(--panel);overflow:auto;padding:6px 6px 40px;resize:horizontal}
+#side{width:280px;min-width:200px;max-width:50vw;border-right:1px solid var(--line);background:var(--panel);overflow:auto;padding:6px 6px 40px;resize:horizontal}
 .sect{display:flex;align-items:center;justify-content:space-between;padding:12px 6px 4px 10px}
 .sect h2{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin:0;font-weight:600}
-.row{display:flex;align-items:center;gap:6px;width:100%;border:0;background:transparent;text-align:left;padding:3px 6px;border-radius:6px;cursor:pointer;font-size:13px;min-height:26px}
+.row{display:flex;align-items:center;gap:7px;width:100%;border:0;background:transparent;text-align:left;padding:2px 8px 2px 4px;border-radius:6px;cursor:pointer;font-size:13px;min-height:26px;color:inherit}
 .row:hover{background:var(--line)}
+.row.on{background:color-mix(in srgb,var(--accent) 15%,transparent)}
 .row.cur>.nm{font-weight:650}
 .line{display:flex;align-items:center}
 .line>.row{flex:1;min-width:0}
-.tw{width:18px;height:22px;flex:none;border:0;background:transparent;color:var(--faint);cursor:pointer;border-radius:5px;display:inline-flex;align-items:center;justify-content:center;padding:0}
+.tw{width:16px;height:22px;flex:none;border:0;background:transparent;color:var(--faint);cursor:pointer;border-radius:5px;display:inline-flex;align-items:center;justify-content:center;padding:0}
 .tw:hover{color:var(--ink);background:var(--line)}
 .tw svg{transition:transform .12s}.tw[aria-expanded=true] svg{transform:rotate(90deg)}
 .tw.none{visibility:hidden}
-.nm{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.ct{color:var(--faint);font-size:12px;font-variant-numeric:tabular-nums;white-space:nowrap}
-.ty{color:var(--faint);font:11.5px var(--mono);white-space:nowrap}
-.kids{padding-left:14px}
-.ic{color:var(--muted);width:15px;height:15px}
+.nm{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ct{color:var(--faint);font-size:11.5px;white-space:nowrap}
+.ty{color:var(--faint);font:11px var(--mono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:48%;text-align:right}
+.kids{margin-left:12px;padding-left:4px;border-left:1px solid var(--line)}
+.ic{color:var(--muted);width:15px;height:15px;display:inline-flex}
+.tg{color:var(--faint);width:14px;height:14px;display:inline-flex}
+.kk{color:var(--warn);width:12px;height:12px;display:inline-flex}
+.row.col{cursor:copy;min-height:24px}
 .empty{color:var(--faint);font-size:12px;padding:4px 12px}
-.col{cursor:copy}
+#detail{width:340px;min-width:260px;max-width:45vw;border-left:1px solid var(--line);background:var(--panel);overflow:auto;padding:14px 16px 60px;font-size:13px;resize:horizontal;direction:rtl}
+#detail>*{direction:ltr}
+.dh{display:flex;gap:10px;align-items:flex-start;margin-bottom:10px}
+.dh .ic{width:20px;height:20px;margin-top:2px;color:var(--accent)}
+.dn{font-weight:650;font-size:15px;overflow-wrap:anywhere;line-height:1.3}
+.dk{color:var(--muted);font-size:12px;margin-top:2px;overflow-wrap:anywhere}
+.acts2{display:flex;gap:6px;flex-wrap:wrap;margin:4px 0 14px}
+.acts2 .btn{padding:3px 9px;font-size:12px}
+.facts{display:grid;grid-template-columns:auto 1fr;gap:5px 14px;margin:0 0 16px;font-size:12.5px}
+.facts dt{color:var(--muted)}.facts dd{margin:0;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
+.dsect{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);font-weight:600;margin:14px 0 6px;display:flex;justify-content:space-between;align-items:center}
+.pc{padding:5px 6px;border-radius:7px}
+.pc.on{background:color-mix(in srgb,var(--accent) 12%,transparent)}
+.pc .line1{display:flex;gap:7px;align-items:center}
+.pc .nm{font-weight:550}
+.pc .sub{color:var(--faint);font-size:11.5px;margin:2px 0 0 21px}
+.ps{margin:4px 0 2px 21px;font-size:11.5px;color:var(--muted)}
+.ps .nums{display:flex;flex-wrap:wrap;gap:2px 10px;font-variant-numeric:tabular-nums}
+.ps svg{display:block;margin-top:5px}
+.bars{display:grid;grid-template-columns:minmax(0,1fr) 60px auto;gap:2px 8px;margin-top:5px;align-items:center}
+.bars .v{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--ink)}
+.bars .b{height:6px;border-radius:3px;background:var(--accent);opacity:.75}
+.bars .n{font-variant-numeric:tabular-nums;text-align:right}
+.defn{margin:0;padding:10px 12px;background:var(--card);border:1px solid var(--line);border-radius:8px;font:12px/1.55 var(--mono);white-space:pre-wrap;overflow-wrap:anywhere}
+.muted{color:var(--muted)}
 main{flex:1;overflow:auto;padding:22px 28px 140px;scroll-padding:90px}
 #cells{max-width:1120px;margin:0 auto;display:flex;flex-direction:column;gap:14px}
 .cell{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow);position:relative;outline:none}
@@ -104,9 +132,15 @@ main{flex:1;overflow:auto;padding:22px 28px 140px;scroll-padding:90px}
 .said{font:13px/1.5 var(--mono);white-space:pre-wrap;margin:0 0 8px;max-height:380px;overflow:auto}
 .done{font-size:13px;color:var(--ok)}
 .grid{overflow:auto;max-height:520px;max-width:100%;border:1px solid var(--line);border-radius:8px;display:inline-block;vertical-align:top}
+.grid.v{display:block;width:fit-content}
+.grid.v table{table-layout:fixed}
+.grid.v td{height:28px;padding-top:0;padding-bottom:0;line-height:27px}
+tr.gap td{padding:0;border:0}
 table{border-collapse:separate;border-spacing:0;font-size:13px}
 th,td{padding:5px 12px;border-bottom:1px solid var(--line);text-align:left;white-space:nowrap;max-width:440px;overflow:hidden;text-overflow:ellipsis;vertical-align:top}
-th{position:sticky;top:0;background:var(--panel);font-weight:600;z-index:1}
+th{position:sticky;top:0;background:var(--panel);font-weight:600;z-index:1;cursor:pointer;user-select:none}
+th:hover{background:var(--line)}th.on{box-shadow:inset 0 -2px 0 var(--accent)}
+th .srt{color:var(--accent);font-size:9px;margin-left:4px;vertical-align:1px}
 th small{display:block;font:11px var(--mono);color:var(--faint);font-weight:400}
 .num{text-align:right;font-variant-numeric:tabular-nums}
 td.pre{white-space:pre;max-width:none;font:12px/1.5 var(--mono)}
@@ -137,7 +171,8 @@ kbd{font:12px var(--mono);border:1px solid var(--line2);border-bottom-width:2px;
 .keys h4{grid-column:1/-1;margin:10px 0 0;font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em}
 #toast{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);background:var(--ink);color:var(--bg);padding:8px 14px;border-radius:8px;font-size:13px;opacity:0;transition:opacity .2s;pointer-events:none;max-width:80vw;z-index:9}
 #toast.on{opacity:.95}#toast.bad{background:var(--err);color:#fff}
-@media (max-width:760px){aside{display:none}main{padding:12px 10px 100px}header{flex-wrap:wrap}.hide-narrow{display:none}}
+@media (max-width:1180px){#detail{position:fixed;right:0;top:50px;bottom:0;z-index:5;box-shadow:-10px 0 30px rgba(0,0,0,.14)}}
+@media (max-width:760px){#side,#detail{display:none}main{padding:12px 10px 100px}header{flex-wrap:wrap}.hide-narrow{display:none}}
 </style>
 </head>
 <body>
@@ -153,12 +188,15 @@ kbd{font:12px var(--mono);border:1px solid var(--line2);border-bottom-width:2px;
   <button class="btn hide-narrow" id="uploadBtn" title="Open an .ipynb from this computer">Upload</button>
   <input type="file" id="upload" accept=".ipynb,application/json" hidden>
   <button class="icon" id="tokenBtn" title="Token" aria-label="Token"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="8" cy="15" r="4"/><path d="M10.8 12.2 20 3M17 6l3 3M14 9l2 2"/></svg></button>
+  <button class="icon" id="panelBtn" title="Details panel" aria-label="Details panel" aria-pressed="false"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M15 4v16"/></svg></button>
   <button class="icon" id="helpBtn" title="Keys (?)" aria-label="Keys"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="2" y="6" width="20" height="13" rx="2"/><path d="M6 10h.01M10 10h.01M14 10h.01M18 10h.01M7 15h10"/></svg></button>
 </header>
 <div id="app">
-  <aside aria-label="Catalog">
+  <aside id="side" aria-label="Catalog">
     <div class="sect"><h2 id="treeTitle">Database</h2><span><button class="icon" id="newdb" title="New database" aria-label="New database" hidden>+</button><button class="icon" id="refresh" title="Refresh" aria-label="Refresh"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7"/></svg></button></span></div>
     <div id="tree" class="tree" role="tree"></div>
+    <div class="sect"><h2>Files</h2></div>
+    <div id="files" role="tree"></div>
     <div class="sect"><h2>Notebooks</h2><button class="icon" id="newnb" title="New notebook" aria-label="New notebook">+</button></div>
     <div id="notebooks"></div>
   </aside>
@@ -171,6 +209,7 @@ kbd{font:12px var(--mono);border:1px solid var(--line2);border-bottom-width:2px;
     </div>
     <div class="hint"><kbd>Ctrl</kbd>+<kbd>Enter</kbd> runs a cell · <kbd>Shift</kbd>+<kbd>Enter</kbd> runs it and moves on · <kbd>Esc</kbd> then <kbd>?</kbd> lists every key</div>
   </main>
+  <aside id="detail" aria-label="Details" hidden></aside>
 </div>
 <dialog id="tokenDlg"><form method="dialog">
   <h3>Token</h3>
@@ -199,7 +238,7 @@ kbd{font:12px var(--mono);border:1px solid var(--line2);border-bottom-width:2px;
     <kbd>Ctrl S</kbd><span>Save the notebook in the lake</span>
     <kbd>?</kbd><span>These keys</span>
   </div>
-  <p>A Python cell runs on the node, as <code>DO LANGUAGE python</code>: <code>db</code> is the connection, <code>print</code> shows here, and a last expression that is a frame or a table comes back as rows. Each cell runs on its own; keep what later cells need in a table (a temporary one is this page's own).</p>
+  <p>A Python cell runs on the node, as <code>DO LANGUAGE python</code>: <code>db</code> is the connection, <code>print</code> shows here, and a last expression that is a frame or a table comes back as rows. The page's cells share their variables, as a notebook's do.</p>
   <div class="acts"><button class="btn primary" value="ok">Close</button></div>
 </form></dialog>
 <div id="toast" role="status"></div>
@@ -242,18 +281,38 @@ const ICONS = {
   chev: '<path d="m9 6 6 6-6 6"/>',
   db: '<ellipse cx="12" cy="6" rx="8" ry="3"/><path d="M4 6v12c0 1.7 3.6 3 8 3s8-1.3 8-3V6M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/>',
   schema: '<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>',
-  table: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 10h18M9 10v10"/>',
-  view: '<path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>',
-  col: '<path d="M8 6h8M8 12h8M8 18h5"/>',
+  folder: '<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>',
+  table: '<rect x="3" y="4.5" width="18" height="15" rx="2"/><path d="M3 9.5h18M3 14.5h18M9.5 9.5v10"/>',
+  view: '<rect x="3" y="4.5" width="18" height="15" rx="2" stroke-dasharray="2.6 2.4"/><path d="M3 9.5h18M9.5 9.5v10"/>',
+  matview: '<rect x="3" y="4.5" width="18" height="15" rx="2"/><path d="M3 9.5h18M3 14.5h18M9.5 9.5v10"/><path d="M5 4.5h14a2 2 0 0 1 2 2v3H3v-3a2 2 0 0 1 2-2z" fill="currentColor"/>',
+  files: '<path d="M6 3h8l5 5v13H6z"/><path d="M14 3v5h5M9 12.5h7M9 16.5h7M12 12.5v6"/>',
+  file: '<path d="M6 3h8l5 5v13H6z"/><path d="M14 3v5h5"/>',
   book: '<path d="M4 5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2z"/><path d="M4 21V5"/>',
   clock: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
+  key: '<circle cx="8" cy="15" r="4"/><path d="M10.8 12.2 20 3M17 6l3 3M14 9l2 2"/>',
+  play: '<path d="M7 5v14l11-7z"/>',
+  down: '<path d="M12 4v12m-5-5 5 5 5-5M5 20h14"/>',
+  copy: '<rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/>',
+  chart: '<path d="M4 20V11M10 20V5M16 20v-6M21 20H3"/>',
+  t_num: '<path d="M9.5 4 7.5 20M16.5 4l-2 16M4.5 9h15M3.5 15h15"/>',
+  t_text: '<path d="M5 7V5h14v2M12 5v14M9 19h6"/>',
+  t_date: '<rect x="3.5" y="5" width="17" height="15" rx="2"/><path d="M3.5 10h17M8 3v4M16 3v4"/>',
+  t_time: '<circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/>',
+  t_bool: '<rect x="2.5" y="7" width="19" height="10" rx="5"/><circle cx="16.5" cy="12" r="2.6"/>',
+  t_json: '<path d="M8 4C6 4 5.5 5 5.5 7v2c0 1.2-.8 3-2.5 3 1.7 0 2.5 1.8 2.5 3v2c0 2 .5 3 2.5 3M16 4c2 0 2.5 1 2.5 3v2c0 1.2.8 3 2.5 3-1.7 0-2.5 1.8-2.5 3v2c0 2-.5 3-2.5 3"/>',
+  t_list: '<path d="M8.5 4H5v16h3.5M15.5 4H19v16h-3.5"/>',
+  t_bin: '<rect x="4" y="5" width="6" height="14" rx="3"/><path d="M14.5 7.5 17.5 5v14"/>',
+  t_other: '<circle cx="12" cy="12" r="3.5"/>',
 };
-const icon = (name, cls = 'ic') => h('span', { class: cls, 'aria-hidden': 'true', html: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${ICONS[name]}</svg>` });
+const icon = (name, cls = 'ic', size = { tg: 14, kk: 12 }[cls] || 15) => h('span', { class: cls, 'aria-hidden': 'true', html: `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${ICONS[name]}</svg>` });
+/** A column type's glyph: numbers, text, dates, times, true/false, lists, JSON-like, bytes. */
+const typeIcon = (t = '') => /^(U?Int|Float|Decimal)/.test(t) ? 't_num' : /^(Utf8|LargeUtf8|Utf8View|Dictionary)/.test(t) ? 't_text' : /^Date/.test(t) ? 't_date' : /^(Timestamp|Time|Duration|Interval)/.test(t) ? 't_time'
+  : /^Boolean/.test(t) ? 't_bool' : /\[\]$|^(Large|FixedSize)?List/.test(t) ? 't_list' : /^(Struct|Map)/.test(t) ? 't_json' : /Binary/.test(t) ? 't_bin' : 't_other';
 
 // ------------------------------------------------------------------ the page's state
 const MODE = document.documentElement.dataset.mode; // node: one lake; server: a folder's databases (`pondra serve <folder>`)
 const SESSION = [...crypto.getRandomValues(new Uint8Array(12))].map(b => b.toString(16).padStart(2, '0')).join(''); // (this page's temporary tables)
-const S = { db: null, lake: null, cells: [], sel: null, name: 'untitled', version: null, dirty: false, runs: 0, open: new Set(), trash: null, last: null };
+const S = { db: null, lake: null, cells: [], sel: null, name: 'untitled', version: null, dirty: false, runs: 0, open: new Set(), trash: null, last: null, pick: null, objects: null, info: null, filesAt: '' };
 const base = () => MODE === 'server' && S.db ? '/db/' + encodeURIComponent(S.db) : '';
 
 // ------------------------------------------------------------------ talking to the node
@@ -379,39 +438,90 @@ function markdown(src) {
 }
 
 // ------------------------------------------------------------------ answers
-const SHOWN = 200; // rows drawn at once (more on a click)
+const ROW_H = 28; // a row's height in a long answer: only the rows in sight are drawn
 function doneText(v) {
   if (v == null || typeof v !== 'object') return v == null ? 'Done.' : String(v);
   const entries = Object.entries(v).filter(([k]) => k !== 'called' || v.called !== 'do');
   if (!entries.length) return v.called === 'do' ? '' : 'Done.';
   return entries.map(([k, x]) => `${k.replace(/_/g, ' ')} ${typeof x === 'string' ? x : JSON.stringify(x)}`).join(' · ');
 }
-function cellOf(v, num, time, scale) {
-  if (v == null) return h('td', { class: num ? 'num' : null }, h('span', { class: 'null' }, 'NULL'));
+/** A value as the grid, the CSV and the column explorer write it. */
+function shown(v, time, scale) {
+  if (v == null) return null;
   let s = typeof v === 'object' ? JSON.stringify(v) : typeof v === 'number' && scale != null ? v.toFixed(scale) : String(v); // (a live answer's decimals: numbers)
-  if (time) s = s.replace(/^(\d{4}-\d\d-\d\d)T/, '$1 ');
+  return time ? s.replace(/^(\d{4}-\d\d-\d\d)T/, '$1 ') : s;
+}
+function cellOf(s, num) {
+  if (s == null) return h('td', { class: num ? 'num' : null }, h('span', { class: 'null' }, 'NULL'));
   const td = h('td', { class: s.includes('\n') ? 'pre' : num ? 'num' : null }, s.length > 5000 ? s.slice(0, 5000) + '…' : s);
   if (s.length > 50 && !s.includes('\n')) td.title = s.slice(0, 4000);
   return td;
 }
-function grid(r) {
-  const cols = r.columns, all = r.rows, nums = cols.map(c => numeric(c.type)), times = cols.map(c => /^Timestamp/.test(c.type || '')), scales = cols.map(c => +((c.type || '').match(/^Decimal\d*\(\d+,\s*(\d+)\)/)?.[1] ?? NaN));
+let measurer;
+const textWidth = s => { measurer ||= document.createElement('canvas').getContext('2d'); measurer.font = '13px ' + getComputedStyle(document.body).fontFamily; return measurer.measureText(s).width; };
+/** Rows in a grid: sortable by a header's click (which also shows that column in the details
+ * panel); a long answer draws only the rows in sight, so ten thousand scroll as smoothly as ten. */
+function grid(r, cell) {
+  const cols = r.columns, all = r.rows;
   if (!cols.length) return h('div', { class: 'done' }, 'No columns.');
-  const body = h('tbody');
-  const table = h('table', {}, h('thead', {}, h('tr', {}, h('th', { class: 'i' }, ''), cols.map((c, i) => h('th', { class: nums[i] ? 'num' : null, title: c.type }, c.name, h('small', {}, sqlType(c.type)))))), body);
-  let drawn = 0;
+  const nums = cols.map(c => numeric(c.type)), times = cols.map(c => /^Timestamp/.test(c.type || '')), scales = cols.map(c => { const s = +((c.type || '').match(/^Decimal\d*\(\d+,\s*(\d+)\)/)?.[1] ?? NaN); return Number.isNaN(s) ? null : s; });
+  const text = (row, i) => shown(row[i], times[i], scales[i]);
+  const multi = all.slice(0, 200).some(row => row.some(v => typeof v === 'string' && v.includes('\n')));
+  const virtual = !multi && all.length > 60;
+  let order = all.map((_, i) => i), sort = null;
+  const heads = cols.map((c, i) => h('th', { class: nums[i] ? 'num' : null, title: `${c.type}: click to sort, and to see this column in the details panel`, onclick: () => sortBy(i) }, c.name, h('span', { class: 'srt' }), h('small', {}, sqlType(c.type))));
+  const body = h('tbody'), box = h('div', { class: 'grid' + (virtual ? ' v' : '') });
+  const table = h('table', {}, h('thead', {}, h('tr', {}, h('th', { class: 'i' }, ''), heads)), body);
+  if (virtual) {
+    const sample = all.slice(0, 300), widths = cols.map((c, i) => Math.min(440, Math.max(64, textWidth(c.name) * 1.08 + 38, textWidth(sqlType(c.type)) * .9 + 30, ...sample.map(row => textWidth(text(row, i) ?? 'NULL') + 26))));
+    const iw = textWidth(count(all.length)) + 24;
+    table.prepend(h('colgroup', {}, h('col', { style: `width:${iw}px` }), widths.map(w => h('col', { style: `width:${Math.ceil(w)}px` }))));
+    table.style.width = Math.ceil(iw + widths.reduce((a, b) => a + b, 0)) + 'px';
+  }
+  const rowOf = k => { const row = all[order[k]]; return h('tr', {}, h('td', { class: 'i' }, String(order[k] + 1)), row.map((_, i) => cellOf(text(row, i), nums[i]))); };
+  const gap = px => h('tr', { class: 'gap', 'aria-hidden': 'true' }, h('td', { colspan: cols.length + 1, style: `height:${px}px` }));
+  let drawn = 0, frame = 0;
   const more = h('button', { class: 'btn', onclick: () => draw() });
   function draw() {
-    const end = Math.min(all.length, drawn + (drawn ? 1000 : SHOWN)), frag = document.createDocumentFragment();
-    for (; drawn < end; drawn++) frag.append(h('tr', {}, h('td', { class: 'i' }, String(drawn + 1)), all[drawn].map((v, i) => cellOf(v, nums[i], times[i], Number.isNaN(scales[i]) ? null : scales[i]))));
+    if (virtual) {
+      const top = box.scrollTop, seen = box.clientHeight || 520, from = Math.max(0, Math.floor(top / ROW_H) - 12), to = Math.min(all.length, Math.ceil((top + seen) / ROW_H) + 12);
+      const frag = document.createDocumentFragment();
+      frag.append(gap(from * ROW_H));
+      for (let k = from; k < to; k++) frag.append(rowOf(k));
+      frag.append(gap((all.length - to) * ROW_H));
+      body.replaceChildren(frag);
+      more.hidden = true;
+      return;
+    }
+    const end = Math.min(all.length, drawn + (drawn ? 1000 : 200)), frag = document.createDocumentFragment();
+    for (; drawn < end; drawn++) frag.append(rowOf(drawn));
     body.append(frag);
     more.textContent = `Show ${count(Math.min(1000, all.length - drawn))} more`;
     more.hidden = drawn >= all.length;
   }
+  function sortBy(i) {
+    const dir = sort?.i === i ? (sort.dir === 1 ? -1 : 0) : 1;
+    sort = dir ? { i, dir } : null;
+    order = all.map((_, k) => k);
+    if (sort) {
+      const key = v => v == null ? null : nums[i] ? Number(v) : String(v);
+      order.sort((a, b) => { const x = key(all[a][i]), y = key(all[b][i]); return x === y ? a - b : x == null ? 1 : y == null ? -1 : (x < y ? -1 : 1) * dir; });
+    }
+    heads.forEach((th, k) => { th.querySelector('.srt').textContent = sort?.i === k ? (sort.dir === 1 ? '▲' : '▼') : ''; th.classList.toggle('on', sort?.i === k); });
+    body.replaceChildren(); drawn = 0; draw();
+    explore(r, i, cell);
+  }
+  box.append(table);
+  if (virtual) {
+    box.style.height = Math.min(520, 34 + all.length * ROW_H) + 'px';
+    box.addEventListener('scroll', () => { if (!frame) frame = requestAnimationFrame(() => { frame = 0; draw(); }); });
+    requestAnimationFrame(draw);
+  }
   draw();
   const csv = h('button', { class: 'btn', title: 'The rows here, as CSV', onclick: () => saveAs(toCsv(r), 'text/csv', `${S.name || 'rows'}.csv`) }, 'CSV');
+  const look = h('button', { class: 'btn', title: 'Each column: its nulls, distinct values, range and spread, in the details panel', onclick: () => explore(r, 0, cell) }, 'Explore');
   const said = r.total > all.length ? `${count(all.length)} of ${count(r.total)} rows here` : `${count(r.total)} row${r.total === 1 ? '' : 's'}`;
-  return h('div', {}, h('div', { class: 'grid' }, table), h('div', { class: 'meta' }, h('span', { class: 'n-rows' }, said), more, csv));
+  return h('div', {}, box, h('div', { class: 'meta' }, h('span', { class: 'n-rows' }, said), more, look, csv));
 }
 function toCsv(r) {
   const field = v => { const s = v == null ? '' : typeof v === 'object' ? JSON.stringify(v) : String(v); return /[",\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; };
@@ -514,7 +624,7 @@ class Cell {
     this.out.replaceChildren();
     if (r.notices?.length) this.out.append(h('pre', { class: 'said' }, r.notices.join('\n')));
     if (r.kind === 'error') this.out.append(h('pre', { class: 'err' }, r.message));
-    else if (r.kind === 'rows') this.out.append(grid(r));
+    else if (r.kind === 'rows') this.out.append(grid(r, this));
     else if (r.kind === 'text') this.out.append(h('pre', { class: 'said' }, r.text));
     else if (r.kind === 'done') { const d = doneText(r.value) || (r.notices?.length ? '' : 'Done.'); if (d && !(d === 'Done.' && r.notices?.length)) this.out.append(h('div', { class: 'done' }, d)); }
     if (saved) this.out.append(h('div', { class: 'meta' }, h('span', { class: 'badge', title: 'As it was when the notebook was saved: run the cell for the answer now' }, 'saved')));
@@ -807,7 +917,8 @@ async function notebooks() {
 // ------------------------------------------------------------------ the catalog
 function twisty(key, kids, any = true, load) {
   const b = h('button', { class: 'tw' + (any ? '' : ' none'), 'aria-expanded': String(!kids.hidden), 'aria-label': 'Open', tabindex: any ? null : '-1', html: `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">${ICONS.chev}</svg>` });
-  b.onclick = () => {
+  b.onclick = e => {
+    e?.stopPropagation();
     kids.hidden = !kids.hidden;
     b.setAttribute('aria-expanded', String(!kids.hidden));
     kids.hidden ? S.open.delete(key) : S.open.add(key);
@@ -816,19 +927,27 @@ function twisty(key, kids, any = true, load) {
   if (!kids.hidden) load?.();
   return b;
 }
+/** A line of the tree: its twisty (or room for one), and a row that picks it. */
+function line(tw, attrs, ...kids) { return h('div', { class: 'line' }, tw || h('span', { class: 'tw none' }), h('button', { class: 'row', ...attrs }, ...kids)); }
+const KIND = { table: ['table', 'table'], view: ['view', 'view'], 'materialized view': ['matview', 'materialized view'], files: ['files', 'view of files'] };
 async function catalog() {
-  const [tables, columns] = await Promise.all([
+  const [tables, columns, objects] = await Promise.all([
     rows(`SELECT table_catalog AS c, table_schema AS s, table_name AS t, table_type AS k FROM information_schema.tables WHERE table_schema <> 'information_schema' AND table_schema NOT IN (SELECT catalog_name FROM information_schema.schemata) ORDER BY 1, 2, 3`),
     rows(`SELECT table_catalog AS c, table_schema AS s, table_name AS t, column_name AS n, data_type AS d FROM information_schema.columns WHERE table_schema <> 'information_schema' ORDER BY 1, 2, 3, ordinal_position`),
+    call('/objects').then(r => r.json(), () => ({ objects: [] })),
   ]);
+  S.filesAt = objects.files;
+  const about = new Map(objects.objects.map(o => [`${o.catalog}\u0000${o.schema}\u0000${o.name}`, o]));
   const lakes = new Map(), find = new Map();
   for (const t of tables) {
     const schemas = lakes.get(t.c) || lakes.set(t.c, new Map()).get(t.c);
     const list = schemas.get(t.s) || schemas.set(t.s, []).get(t.s);
-    const table = { ...t, columns: [] };
-    list.push(table); find.set(`${t.c}\u0000${t.s}\u0000${t.t}`, table);
+    const k = `${t.c}\u0000${t.s}\u0000${t.t}`;
+    const table = { ...t, columns: [], o: about.get(k) || { kind: t.k === 'VIEW' ? 'view' : 'table' }, q: qualified(t.c, t.s, t.t), key: 'o:' + k };
+    list.push(table); find.set(k, table);
   }
   for (const c of columns) find.get(`${c.c}\u0000${c.s}\u0000${c.t}`)?.columns.push(c);
+  S.objects = [...find.values()];
   return lakes;
 }
 function lakeNode(name, schemas, current, note) {
@@ -843,36 +962,25 @@ function lakeNode(name, schemas, current, note) {
   const tw = twisty(key, kids, !!schemas);
   tw.addEventListener('click', () => kids.hidden ? S.open.add('closed:' + key) : S.open.delete('closed:' + key));
   const pick = () => { if (MODE === 'server' && name !== S.db) use(name); else tw.click(); };
-  return h('div', { role: 'treeitem' }, h('div', { class: 'line' }, tw,
-    h('button', { class: 'row' + (current ? ' cur' : ''), title: MODE === 'server' && !current ? `Use database ${name}` : name, onclick: pick }, icon('db'), h('span', { class: 'nm' }, name), note ? h('span', { class: 'ct' }, note) : null)), kids);
+  const row = line(tw, { class: 'row' + (current ? ' cur' : ''), title: MODE === 'server' && !current ? `Use database ${name}` : name, onclick: pick }, icon('db'), h('span', { class: 'nm' }, name), note ? h('span', { class: 'ct' }, note) : null);
+  return h('div', { role: 'treeitem' }, row, kids);
 }
 function schemaNode(lake, schema, tables, only) {
   const key = `s:${lake}.${schema}`;
   if ((only || schema === 'public') && !S.open.has('closed:' + key)) S.open.add(key);
   const kids = h('div', { class: 'kids', role: 'group', hidden: !S.open.has(key) }, tables.map(t => tableNode(t)));
-  let counted = false;
-  const tw = twisty(key, kids, true, () => { if (!counted) { counted = true; counts(tables); } });
+  const tw = twisty(key, kids, true);
   tw.addEventListener('click', () => kids.hidden ? S.open.add('closed:' + key) : S.open.delete('closed:' + key));
-  return h('div', { role: 'treeitem' }, h('div', { class: 'line' }, tw, h('button', { class: 'row', onclick: () => tw.click() }, icon('schema'), h('span', { class: 'nm' }, schema), h('span', { class: 'ct' }, String(tables.length)))), kids);
+  return h('div', { role: 'treeitem' }, line(tw, { title: `schema ${schema}`, onclick: () => tw.click() }, icon('schema'), h('span', { class: 'nm' }, schema)), kids);
 }
 function tableNode(t) {
-  const key = `t:${t.c}.${t.s}.${t.t}`, view = t.k === 'VIEW';
-  t.q = qualified(t.c, t.s, t.t);
-  t.ct = h('span', { class: 'ct', title: view ? 'a view' : '' }, view ? 'view' : '');
-  const kids = h('div', { class: 'kids', role: 'group', hidden: !S.open.has(key) }, t.columns.map(c =>
-    h('button', { class: 'row col', title: `${c.n}: ${sqlType(c.d)} (${c.d}). Click: put the name in the cell`, onclick: () => put(ident(c.n)) }, icon('col'), h('span', { class: 'nm' }, c.n), h('span', { class: 'ty' }, sqlType(c.d)))));
-  return h('div', { role: 'treeitem' }, h('div', { class: 'line' }, twisty(key, kids, t.columns.length > 0),
-    h('button', { class: 'row', title: `${t.q}: see its first rows`, onclick: () => peek(t.q) }, icon(view ? 'view' : 'table'), h('span', { class: 'nm' }, t.t), t.ct)), kids);
-}
-async function counts(tables) {
-  const base = tables.filter(t => t.k !== 'VIEW').slice(0, 50);
-  if (!base.length) return;
-  const show = (t, n) => { t.ct.textContent = short(Number(n)); t.ct.title = `${count(n)} rows`; };
-  try {
-    for (const r of await rows(base.map((t, i) => `SELECT ${i} AS i, count(*) AS n FROM ${t.q}`).join(' UNION ALL '))) show(base[r.i], r.n);
-  } catch {
-    for (const t of base) rows(`SELECT count(*) AS n FROM ${t.q}`).then(r => show(t, r[0].n), () => { t.ct.textContent = '?'; t.ct.title = 'could not count it'; });
-  }
+  const [ic, word] = KIND[t.o.kind] || KIND.table, keyed = new Set(t.o.key || []);
+  const kids = h('div', { class: 'kids', role: 'group', hidden: !S.open.has(t.key) }, t.columns.map(c =>
+    line(null, { class: 'row col', title: `${c.n}: ${sqlType(c.d)} (${c.d}). Click: put the name in the cell`, onclick: () => put(ident(c.n)) },
+      icon(typeIcon(c.d), 'tg'), h('span', { class: 'nm' }, c.n), keyed.has(c.n) ? icon('key', 'kk') : null, h('span', { class: 'ty' }, sqlType(c.d)))));
+  const row = line(twisty(t.key, kids, t.columns.length > 0), { title: `${t.q}: a ${word}. Click: its details; double-click: its first rows`, 'data-key': t.key, 'data-kind': t.o.kind, onclick: () => pick({ type: 'object', t }), ondblclick: () => peek(t.q) },
+    icon(ic), h('span', { class: 'nm' }, t.t));
+  return h('div', { role: 'treeitem' }, row, kids);
 }
 function put(text) {
   const c = S.last && S.cells.includes(S.last) ? S.last : S.sel;
@@ -899,21 +1007,209 @@ async function tree() {
     try { lakes = S.db ? await catalog() : null; } catch (e) { toast(e.message, true); }
     box.replaceChildren(...dbs.map(d => lakeNode(d.name, d.name === S.db ? lakes?.get(d.name) || new Map() : null, d.name === S.db, d.name === S.db ? null : d.running ? 'running' : '')));
     if (!dbs.length) box.append(h('div', { class: 'empty' }, 'No databases yet: + makes one.'));
-    return;
+  } else {
+    let lakes;
+    try { lakes = await catalog(); } catch (e) {
+      box.replaceChildren(h('div', { class: 'empty' }, e.status === 401 ? 'A token is needed to see the tables.' : e.message));
+      return;
+    }
+    const names = [S.lake, ...[...lakes.keys()].filter(n => n !== S.lake).sort()].filter(Boolean);
+    box.replaceChildren(...names.map(n => lakeNode(n, lakes.get(n) || new Map(), n === S.lake, n === S.lake ? null : 'attached')));
   }
-  let lakes;
-  try { lakes = await catalog(); } catch (e) {
-    box.replaceChildren(h('div', { class: 'empty' }, e.status === 401 ? 'A token is needed to see the tables.' : e.message));
-    return;
-  }
-  const names = [S.lake, ...[...lakes.keys()].filter(n => n !== S.lake).sort()].filter(Boolean);
-  box.replaceChildren(...names.map(n => lakeNode(n, lakes.get(n) || new Map(), n === S.lake, n === S.lake ? null : 'attached')));
+  if (S.pick?.type === 'object') S.pick.t = S.objects?.find(t => t.key === S.pick.t.key) || S.pick.t; // (as it is now)
+  mark(); detail();
 }
+
+// ------------------------------------------------------------------ the lake's files
+const DATA = /\.(parquet|pq|csv|tsv|json|jsonl|ndjson)$/i;
+async function files() {
+  const box = $('#files');
+  let list;
+  try { list = await rows(`SELECT path, size, written FROM files() ORDER BY path`); } catch (e) {
+    box.replaceChildren(h('div', { class: 'empty' }, e.status === 401 ? 'A token is needed to list them.' : e.message));
+    return;
+  }
+  list = list.filter(f => !f.path.startsWith('files/notebooks/')); // (the notebooks are listed below)
+  if (!list.length) { box.replaceChildren(h('div', { class: 'empty' }, 'None yet (PUT /files/… adds one).')); return; }
+  const root = { dirs: new Map(), files: [] };
+  for (const f of list) {
+    const parts = f.path.replace(/^files\//, '').split('/');
+    let d = root;
+    for (const p of parts.slice(0, -1)) d = d.dirs.get(p) || d.dirs.set(p, { dirs: new Map(), files: [] }).get(p);
+    d.files.push({ ...f, name: parts.at(-1), rel: parts.join('/'), key: 'file:' + f.path });
+  }
+  const render = (d, at) => [
+    ...[...d.dirs.keys()].sort().map(n => {
+      const key = 'dir:' + at + n, kids = h('div', { class: 'kids', role: 'group', hidden: !S.open.has(key) }, render(d.dirs.get(n), at + n + '/'));
+      const tw = twisty(key, kids);
+      return h('div', { role: 'treeitem' }, line(tw, { onclick: () => tw.click() }, icon('folder'), h('span', { class: 'nm' }, n)), kids);
+    }),
+    ...d.files.map(f => line(null, { title: `files/${f.rel}: click for its details${DATA.test(f.name) ? ', double-click to query it' : ''}`, 'data-key': f.key, onclick: () => pick({ type: 'file', f }), ondblclick: () => DATA.test(f.name) && peek(fileSql(f)) },
+      icon(DATA.test(f.name) ? 'files' : 'file'), h('span', { class: 'nm' }, f.name), h('span', { class: 'ct' }, bytes(f.size)))),
+  ];
+  box.replaceChildren(...render(root, ''));
+  mark();
+}
+const bytes = n => n == null ? '' : n < 1024 ? `${n} B` : n < 1048576 ? `${(n / 1024).toFixed(1)} KB` : n < 1073741824 ? `${(n / 1048576).toFixed(1)} MB` : `${(n / 1073741824).toFixed(2)} GB`;
+/** A lake's file as SQL reads it (whoever reads the lake reads its files). */
+const fileSql = f => `read_${/\.(csv|tsv)$/i.test(f.name) ? 'csv' : /\.(json|jsonl|ndjson)$/i.test(f.name) ? 'json' : 'parquet'}('${(S.filesAt + f.rel).replace(/'/g, "''")}')`;
+
+// ------------------------------------------------------------------ the details panel
+function pick(p) {
+  S.pick = p; mark();
+  if ($('#detail').hidden) panel(true);
+  detail();
+}
+function mark() {
+  const key = S.pick?.type === 'object' ? S.pick.t.key : S.pick?.type === 'file' ? S.pick.f.key : null;
+  document.querySelectorAll('aside .row.on').forEach(r => r.classList.remove('on'));
+  if (key) document.querySelectorAll(`aside .row[data-key="${CSS.escape(key)}"]`).forEach(r => r.classList.add('on'));
+}
+function panel(open) {
+  $('#detail').hidden = !open;
+  $('#panelBtn').setAttribute('aria-pressed', String(open));
+  store.set('pondra.panel', open ? 'open' : 'closed');
+  if (open) detail();
+}
+const facts = pairs => h('dl', { class: 'facts' }, pairs.filter(([, v]) => v != null && v !== '' && !(Array.isArray(v) && !v.length)).flatMap(([k, v]) => [h('dt', {}, k), h('dd', {}, Array.isArray(v) ? v.join(', ') : v)]));
+const act = (ic, label, title, fn) => h('button', { class: 'btn', title, onclick: fn }, icon(ic), label);
+function detail() {
+  const box = $('#detail');
+  if (box.hidden) return;
+  const p = S.pick;
+  box.replaceChildren(...(p?.type === 'object' ? objectDetail(p.t) : p?.type === 'file' ? fileDetail(p.f) : p?.type === 'result' ? resultDetail(p) : summary()).filter(Boolean));
+}
+function summary() {
+  const objs = S.objects || [], by = k => objs.filter(t => t.c === home() && t.o.kind === k).length;
+  const tabled = objs.filter(t => t.c === home() && t.o.rows != null);
+  const s = S.info || {};
+  return [h('div', { class: 'dh' }, icon('db'), h('div', {}, h('div', { class: 'dn' }, home() || 'Pondra'), h('div', { class: 'dk' }, MODE === 'server' ? 'a database' : 'this lake'))),
+    facts([['Tables', count(by('table'))], ['Views', count(by('view') + by('files'))], ['Materialized', by('materialized view') ? count(by('materialized view')) : null],
+      ['Rows in files', count(tabled.reduce((a, t) => a + (t.o.rows || 0), 0))], ['Size in files', bytes(tabled.reduce((a, t) => a + (t.o.bytes || 0), 0))],
+      ['Nodes', s.nodes ? String(s.nodes.length) : null], ['This node', s.role], ['Leader', s.leader], ['Commits', s.hwm != null ? count(s.hwm) : null]]),
+    h('p', { class: 'muted' }, 'Pick a table, a view or a file on the left, or a column of an answer, to see it here.')];
+}
+function objectDetail(t) {
+  const o = t.o, [ic, word] = KIND[o.kind] || KIND.table, stored = o.kind === 'table' || o.kind === 'materialized view';
+  const counted = h('span', { class: 'muted' }, '…');
+  rows(`SELECT count(*) AS n FROM ${t.q}`).then(r => counted.textContent = count(r[0].n), e => counted.textContent = e.message.split('\n')[0].slice(0, 120));
+  const keyed = new Set(o.key || []), nn = new Set(o.not_null || []);
+  const cols = t.columns.map(c => {
+    const flags = [keyed.has(c.n) ? 'key' : null, nn.has(c.n) && !keyed.has(c.n) ? 'not null' : null, o.defaults?.[c.n] ? `default ${o.defaults[c.n]}` : null].filter(Boolean);
+    const box = h('div', { class: 'pc', 'data-col': c.n }, h('div', { class: 'line1' }, icon(typeIcon(c.d), 'tg'), h('span', { class: 'nm' }, c.n), keyed.has(c.n) ? icon('key', 'kk') : null, h('span', { class: 'ty' }, sqlType(c.d))),
+      flags.length ? h('div', { class: 'sub' }, flags.join(' · ')) : null, h('div', { class: 'ps' }));
+    return box;
+  });
+  const profileBtn = act('chart', 'Profile', 'Each column: nulls, distinct values, range and spread (reads the whole table)', () => profile(t, cols, profileBtn));
+  return [h('div', { class: 'dh' }, icon(ic), h('div', {}, h('div', { class: 'dn' }, t.t), h('div', { class: 'dk' }, `${word} · ${t.c}.${t.s}`))),
+    h('div', { class: 'acts2' }, act('play', 'Query', 'Its first rows, in a new cell (or double-click it)', () => peek(t.q)), profileBtn, act('copy', 'Name', `Copy ${t.q}`, () => navigator.clipboard?.writeText(t.q).then(() => toast(`Copied ${t.q}`)))),
+    facts([['Rows', counted], ['Columns', String(t.columns.length)], ['Key', o.key], ['Partitioned by', o.partition], ['Clustered by', o.cluster],
+      ['Published as', o.publish], ['Rows kept', o.ttl], ['In files', stored ? `${bytes(o.bytes)} · ${count(o.files || 0)} file${o.files === 1 ? '' : 's'}` : null]]),
+    o.sql ? h('div', { class: 'dsect' }, o.kind === 'files' ? 'Reads' : 'Definition') : null, o.sql ? h('pre', { class: 'defn', html: highlight(o.sql, 'sql') }) : null,
+    h('div', { class: 'dsect' }, 'Columns'), ...cols];
+}
+function fileDetail(f) {
+  const data = DATA.test(f.name);
+  return [h('div', { class: 'dh' }, icon(data ? 'files' : 'file'), h('div', {}, h('div', { class: 'dn' }, f.name), h('div', { class: 'dk' }, 'files/' + f.rel))),
+    h('div', { class: 'acts2' }, data ? act('play', 'Query', 'Read it as a table, in a new cell (or double-click it)', () => peek(fileSql(f))) : null,
+      act('down', 'Download', 'Download it', async () => { try { const r = await call('/files/' + f.rel.split('/').map(encodeURIComponent).join('/')); saveAs(await r.blob(), 'application/octet-stream', f.name); } catch (e) { toast(e.message, true); } })),
+    facts([['Size', bytes(f.size)], ['Written', f.written ? utc(f.written).toLocaleString() : null], ['In SQL', data ? fileSql(f) : `file_read('${f.path}')`]])];
+}
+
+// ------------------------------------------------------------------ profiles: a table's (SQL) and an answer's (here)
+/** A column's summary: its values, nulls, distinct values, least and greatest, and a histogram
+ * (numbers, dates, times) or its commonest values (the rest). */
+function summarize(values, type) {
+  const vals = values.filter(v => v != null), distinct = new Set(vals.map(v => typeof v === 'object' ? JSON.stringify(v) : v));
+  const s = { n: values.length, nulls: values.length - vals.length, distinct: distinct.size, exact: true };
+  const at = spread(type);
+  if (at) {
+    const xs = vals.map(at).filter(Number.isFinite);
+    if (xs.length) {
+      const lo = Math.min(...xs), hi = Math.max(...xs), hist = Array(20).fill(0);
+      for (const x of xs) hist[hi === lo ? 0 : Math.min(19, Math.floor((x - lo) / (hi - lo) * 20))]++;
+      Object.assign(s, { min: vals[xs.indexOf(lo)], max: vals[xs.indexOf(hi)], hist });
+    }
+  } else if (vals.length) {
+    const n = new Map();
+    for (const v of vals) { const k = typeof v === 'object' ? JSON.stringify(v) : String(v); n.set(k, (n.get(k) || 0) + 1); }
+    s.top = [...n].sort((a, b) => b[1] - a[1]).slice(0, 5).map(([v, c]) => ({ v, n: c }));
+    if (/^(Utf8|LargeUtf8|Utf8View)/.test(type || '')) { const sorted = [...n.keys()].sort(); Object.assign(s, { min: sorted[0], max: sorted.at(-1) }); }
+  }
+  return s;
+}
+/** Where a value of this type sits on a line (a histogram's): numbers as they are, dates and times by their instant. */
+const spread = t => numeric(t) ? v => Number(v) : /^(Date|Timestamp)/.test(t || '') ? v => Date.parse(/[zZ]|[+-]\d\d:?\d\d$/.test(v) ? v : String(v).replace(' ', 'T') + (String(v).length > 10 ? 'Z' : 'T00:00:00Z')) : null;
+function statView(s, type) {
+  const pct = n => s.n ? `${(100 * n / s.n).toFixed(n && n < s.n / 100 ? 1 : 0)}%` : '0%';
+  const val = v => { const x = typeof v === 'object' ? JSON.stringify(v) : String(v); return x.length > 28 ? x.slice(0, 27) + '…' : x; };
+  const nums = h('div', { class: 'nums' }, h('span', {}, `${pct(s.nulls)} null`), h('span', {}, `${s.exact ? '' : '≈ '}${count(s.distinct)} distinct`), s.min != null ? h('span', {}, `${val(s.min)} … ${val(s.max)}`) : null);
+  const kids = [nums];
+  if (s.hist) {
+    const top = Math.max(...s.hist, 1), w = 12, g = 2;
+    kids.push(h('div', { html: `<svg width="100%" height="30" preserveAspectRatio="none" viewBox="0 0 ${s.hist.length * (w + g)} 30" role="img" aria-label="histogram">${s.hist.map((c, i) => `<rect x="${i * (w + g)}" y="${30 - Math.max(c ? 2 : 0, 30 * c / top)}" width="${w}" height="${Math.max(c ? 2 : 0, 30 * c / top)}" rx="1.5" fill="var(--accent)" opacity=".75"><title>${count(c)}</title></rect>`).join('')}</svg>` }));
+  } else if (s.top?.length) {
+    const top = s.top[0].n;
+    kids.push(h('div', { class: 'bars' }, s.top.flatMap(t => [h('span', { class: 'v', title: t.v }, t.v), h('span', {}, h('div', { class: 'b', style: `width:${Math.max(4, 100 * t.n / top)}%` })), h('span', { class: 'n' }, count(t.n))])));
+  }
+  return kids;
+}
+/** A table's columns profiled where it is: one pass for every column's counts and range, then a
+ * histogram or the commonest values of each (at most 24 columns). */
+async function profile(t, boxes, btn) {
+  const cols = t.columns.slice(0, 24), q = ident, simple = c => !/^(List|LargeList|FixedSizeList|Struct|Map|Binary|LargeBinary|BinaryView)|\[\]$/.test(c.d);
+  btn.disabled = true; btn.lastChild.textContent = 'Profiling…';
+  try {
+    const parts = cols.flatMap((c, i) => [`count(${q(c.n)}) AS "v${i}"`, simple(c) ? `approx_distinct(${q(c.n)}) AS "d${i}"` : `NULL AS "d${i}"`,
+      simple(c) ? `CAST(min(${q(c.n)}) AS VARCHAR) AS "lo${i}"` : `NULL AS "lo${i}"`, simple(c) ? `CAST(max(${q(c.n)}) AS VARCHAR) AS "hi${i}"` : `NULL AS "hi${i}"`]);
+    const [a] = await rows(`SELECT count(*) AS n, ${parts.join(', ')} FROM ${t.q}`);
+    const stats = cols.map((c, i) => ({ n: Number(a.n), nulls: Number(a.n) - Number(a['v' + i]), distinct: Number(a['d' + i] ?? 0), exact: false, min: a['lo' + i], max: a['hi' + i] }));
+    const show = i => { const box = boxes[i]?.querySelector('.ps'); if (box) box.replaceChildren(...statView(stats[i], cols[i].d)); };
+    cols.forEach((_, i) => show(i));
+    let next = 0;
+    const one = async () => {
+      for (let i; (i = next++) < cols.length;) {
+        const c = cols[i], at = spread(c.d), s = stats[i];
+        if (!simple(c) || s.n === s.nulls) continue;
+        if (at && s.min != null) {
+          const lo = at(s.min), hi = at(s.max);
+          if (!Number.isFinite(lo) || !Number.isFinite(hi)) continue;
+          const x = numeric(c.d) ? `CAST(${q(c.n)} AS DOUBLE)` : `CAST(date_part('epoch', CAST(${q(c.n)} AS TIMESTAMP)) AS DOUBLE) * 1000`;
+          const b = hi === lo ? '0' : `least(19, CAST(floor((${x} - ${lo}) / ${(hi - lo) / 20}) AS BIGINT))`;
+          const hist = Array(20).fill(0);
+          for (const r of await rows(`SELECT ${b} AS b, count(*) AS n FROM ${t.q} WHERE ${q(c.n)} IS NOT NULL GROUP BY 1`)) hist[Math.max(0, Math.min(19, Number(r.b)))] += Number(r.n);
+          s.hist = hist;
+        } else if (!at) {
+          s.top = (await rows(`SELECT CAST(${q(c.n)} AS VARCHAR) AS v, count(*) AS n FROM ${t.q} WHERE ${q(c.n)} IS NOT NULL GROUP BY 1 ORDER BY 2 DESC, 1 LIMIT 5`)).map(r => ({ v: r.v, n: Number(r.n) }));
+        }
+        show(i);
+      }
+    };
+    await Promise.all([one(), one(), one()]);
+  } catch (e) { toast('Could not profile it: ' + e.message, true); }
+  btn.disabled = false; btn.lastChild.textContent = 'Profile';
+}
+/** An answer's columns, summarized here from the rows it holds. */
+function explore(r, i, cell) { pick({ type: 'result', r, i, cell }); }
+function resultDetail(p) {
+  const { r, i, cell } = p, times = r.columns.map(c => /^Timestamp/.test(c.type || ''));
+  const out = [h('div', { class: 'dh' }, icon('chart'), h('div', {}, h('div', { class: 'dn' }, cell?.count ? `Answer [${cell.count}]` : 'Answer'), h('div', { class: 'dk' }, `${count(r.rows.length)} row${r.rows.length === 1 ? '' : 's'}${r.total > r.rows.length ? ` of ${count(r.total)} (the ones here)` : ''} · ${r.columns.length} column${r.columns.length === 1 ? '' : 's'}`))),
+    h('div', { class: 'dsect' }, 'Columns')];
+  r.columns.forEach((c, k) => {
+    const s = summarize(r.rows.map(row => times[k] && row[k] != null ? String(row[k]).replace(/^(\d{4}-\d\d-\d\d)T/, '$1 ') : row[k]), c.type);
+    const box = h('div', { class: 'pc' + (k === i ? ' on' : ''), 'data-col': c.name }, h('div', { class: 'line1' }, icon(typeIcon(c.type), 'tg'), h('span', { class: 'nm' }, c.name), h('span', { class: 'ty' }, sqlType(c.type))), h('div', { class: 'ps' }, ...statView(s, c.type)));
+    out.push(box);
+    if (k === i) requestAnimationFrame(() => box.scrollIntoView({ block: 'nearest' }));
+  });
+  return out;
+}
+
 async function stats() {
   const where = $('#where');
   try {
     const s = await (await call('/stats')).json();
-    S.lake = s.lake;
+    S.lake = s.lake; S.info = s;
+    if (!S.pick) detail();
     const nodes = s.nodes || [], who = MODE === 'server' ? S.db : s.lake;
     where.innerHTML = `<span class="dot"></span><b>${esc(who || '')}</b> · ${esc(s.role)} · ${nodes.length} node${nodes.length === 1 ? '' : 's'}${s.live_queries ? ` · ${s.live_queries} live` : ''}`;
     where.title = `This database's cluster: ${nodes.join(', ')}. Its leader is ${s.leader}; commits so far: ${s.hwm}.`;
@@ -926,13 +1222,14 @@ async function use(db) {
   for (const c of S.cells) c.stopLive();
   S.db = db;
   await stats();
-  await Promise.all([tree(), notebooks()]);
+  S.pick = null;
+  await Promise.all([tree(), files(), notebooks()]);
   saved();
   toast(`Cells now run in database ${db}`);
 }
 let pending;
 const later = f => { clearTimeout(pending); pending = setTimeout(f, 250); };
-const refresh = () => Promise.all([stats(), tree(), notebooks()]);
+const refresh = () => Promise.all([stats(), tree(), files(), notebooks()]);
 
 // ------------------------------------------------------------------ tokens
 function askToken(why) {
@@ -954,6 +1251,7 @@ $('#tokenDlg').addEventListener('close', () => {
 // ------------------------------------------------------------------ the page
 $('#tokenBtn').onclick = () => askToken('The token this node was started with');
 $('#helpBtn').onclick = () => $('#helpDlg').showModal();
+$('#panelBtn').onclick = () => panel($('#detail').hidden);
 $('#save').onclick = save;
 $('#runall').onclick = runAll;
 $('#download').onclick = () => saveAs(JSON.stringify(notebook(), null, 1) + '\n', 'application/x-ipynb+json', (cleanName(S.name) || 'notebook') + '.ipynb');
@@ -993,8 +1291,9 @@ addEventListener('pagehide', () => {
   blank();
   if (MODE === 'server') await tree();
   await stats();
+  panel(store.get('pondra.panel') ? store.get('pondra.panel') === 'open' : innerWidth >= 1180);
   if (MODE !== 'server') await tree();
-  await notebooks();
+  await Promise.all([files(), notebooks()]);
   const wanted = hash.get('notebook');
   if (wanted) {
     const vs = await rows(`SELECT path FROM files('notebooks/${wanted.replace(/'/g, "''")}/') ORDER BY path DESC LIMIT 1`).catch(() => []);

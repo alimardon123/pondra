@@ -415,11 +415,17 @@ pub async fn prime(lake: &Lake, tables: &[(String, TableMeta)]) -> Result<()> {
 /// node. A URL: with the secret whose scope covers it (an admin made it: the grant), or, if none
 /// does, only that program again, with the node's own credentials.
 pub async fn check(lake: &Lake, spec: &Spec) -> Result<()> {
-    if owner() {
-        return Ok(());
+    if owner() || spec.urls.iter().all(|u| own_file(lake, u)) {
+        return Ok(()); // (the lake's own files: whoever reads the lake reads them, as GET /files/… does)
     }
     let secrets = list(lake).await?;
     spec.urls.iter().try_for_each(|u| allowed(&secrets, u))
+}
+
+/// Is `u` in the lake's own files (`PUT /files/…`, `files()`)? Written out whole, with no `..`.
+fn own_file(lake: &Lake, u: &str) -> bool {
+    let area = format!("{}/files/", lake.url.trim_end_matches('/'));
+    u.starts_with(&area) && !u[area.len()..].split('/').any(|p| p == ".." || p == ".")
 }
 
 fn allowed(secrets: &[(String, Secret)], u: &str) -> Result<()> {

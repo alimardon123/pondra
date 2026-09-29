@@ -248,6 +248,7 @@ token is refused.
 | Method and path | Role | Meaning |
 |---|---|---|
 | `GET /stats` | none | health and position, as JSON |
+| `GET /objects` | read | each table and view of this lake and the lakes attached to it: `catalog`, `schema`, `name`, `kind` (`table`, `view`, `materialized view`, or `files` for [a view of files](/pondra/reference/sql/)), and for a table its `rows` and `bytes` in files, `files`, `key`, `partition`, `cluster`, `publish`, `not_null`, `defaults`; for a view its `sql`. Also `files`: where the lake's own files are, for `read_csv('…')`. What the console's catalog shows |
 | `GET /metrics` | read | Prometheus metrics, as text |
 | `POST /tier` | admin | write the log into Parquet now: `{"rows_tiered": N}` |
 | `DELETE /sessions/{id}` | read | end a session: its temporary tables and views go, and so does its Python: `{"ended": true}` |

@@ -154,6 +154,11 @@ id  n
 1   5
 ```
 
+A CSV, JSON or Parquet file among them reads as a table too, by its whole location (`GET /objects`
+says where the lake's files are). Whoever may read the lake may read its files this way, as `GET
+/files/…` and `file_read` do; nothing else of the lake's folder. The console does it when you
+double-click one.
+
 <Aside type="caution">
 A path that exists can't be written again: `PUT` returns an error that names the path, so upload a new
 version under a new name. `file_read` of a path that isn't there is `NULL`. `file_read` returns files up
