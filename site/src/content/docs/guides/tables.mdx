@@ -46,8 +46,9 @@ The column types are:
 | Decimals | `FLOAT` (or `REAL`), `DOUBLE`, `DECIMAL(10, 2)` |
 | Text | `VARCHAR` (or `TEXT`, `STRING`) |
 | True and false | `BOOLEAN` |
-| Dates and times | `DATE`, `TIME`, `TIMESTAMP`, `TIMESTAMPTZ` |
-| Bytes | `BYTEA` |
+| Dates and times | `DATE`, `TIME`, `TIMESTAMP` (a wall-clock time), `TIMESTAMPTZ` (an instant, shown in UTC) |
+| Bytes | `BYTEA` (or `BINARY`, `VARBINARY`, `BLOB`) |
+| JSON text | `JSON` (or `VARIANT`), read with `json_get` and `->` |
 | Lists | `FLOAT[]`, `INT[]`, `VARCHAR[]` (a list of one type; `FLOAT[]` holds embeddings) |
 
 `CREATE TABLE IF NOT EXISTS` does nothing when the table is already there with the same columns. To
@@ -58,15 +59,58 @@ INSERT INTO orders VALUES (1, 'tea', 2, 7.0, TIMESTAMP '2026-09-27 10:00:00'), (
 CREATE TABLE tea_orders AS SELECT * FROM orders WHERE item = 'tea';
 ```
 
-<Aside type="caution">
-`NOT NULL` and `DEFAULT` are accepted in a column definition but not enforced yet: a `NULL` goes in,
-and a column left out of an `INSERT` is `NULL`, not its default.
-</Aside>
+A value that doesn't fit its column is refused, and the error names the value: `'abc'` into a
+`BIGINT` is an error, never a `NULL`. Types are in [SQL statements](/pondra/reference/sql/#types).
+
+### Require a value: `NOT NULL` and `DEFAULT`
+
+`NOT NULL` refuses a row that gives the column no value. `DEFAULT` fills in a column a row leaves out.
+Both hold on every door: `INSERT`, `POST /append`, `COPY`, Arrow Flight, Kafka, and `INSERT … SELECT`.
+
+```sql
+CREATE TABLE accounts (
+  id BIGINT PRIMARY KEY,
+  email VARCHAR NOT NULL,
+  plan VARCHAR DEFAULT 'free',
+  made TIMESTAMP DEFAULT now()
+);
+INSERT INTO accounts (id, email) VALUES (1, 'ann@example.com'), (2, 'bo@example.com');
+SELECT id, email, plan FROM accounts ORDER BY id;
+```
+
+```text
++----+-----------------+------+
+| id | email           | plan |
++----+-----------------+------+
+| 1  | ann@example.com | free |
+| 2  | bo@example.com  | free |
++----+-----------------+------+
+```
+
+A row that breaks a rule is refused, and the error names the column:
+
+```python
+try:
+    db.sql("INSERT INTO accounts (id) VALUES (3)")
+except RuntimeError as e:
+    print(e)
+```
+
+```text
+500: accounts.email is NOT NULL, and a row gives it no value
+```
+
+- Each row gets its own default, so `DEFAULT now()` is the time of that row.
+- A key's columns are `NOT NULL` too. A table made by an older release keeps its old rules.
+- A JSON row sent to `/append` or Kafka without the column takes the default. A row with an explicit
+  `null` keeps the null (and is refused if the column is `NOT NULL`).
+- A `DEFAULT` that can't be cast to the column's type is refused when you create the table.
 
 ## Choose what kind of table it is
 
 Without options, a table is an **append table**: every row you write stays, and a query sees them
-all. Three options change that.
+all. Three options change that. An option name Pondra doesn't know is refused, and the error names
+it, so a misspelt `cluser_by` never quietly does nothing.
 
 ### A keyed table: `PRIMARY KEY`
 
@@ -95,7 +139,8 @@ JavaScript, `GET /lookup/users/2` over HTTP. `WITH (key = 'id')` says the same a
 ### A merge table: `merge`
 
 A merge table has a key and combines the rows that share it, with `sum`, `count`, `min` or `max` per
-column. You only `INSERT` into it.
+column. Every column except the key needs a function: `CREATE` refuses a table that leaves one out.
+You only `INSERT` into it.
 
 ```sql
 CREATE TABLE totals (user VARCHAR PRIMARY KEY, n BIGINT, total DOUBLE) WITH (merge = 'n:sum,total:sum');
@@ -181,7 +226,7 @@ metadata
 
 The table's folder, `lake/data/shipments`, is the Delta table (its `_delta_log`) and the Iceberg
 table (its `metadata`), beside the Parquet files they both point at. `CHECKPOINT` tiers every table's newest rows into Parquet now; otherwise it happens
-within a few seconds. [Other engines](/pondra/guides/other-engines/) shows how to read them.
+within `--tier-secs` (10 seconds by default). [Other engines](/pondra/guides/other-engines/) shows how to read them.
 
 ## Group tables in schemas
 
@@ -200,8 +245,8 @@ Flight SQL, the Iceberg catalog and MCP all list the schemas.
 
 ## Use other lakes as databases
 
-A lake is a database, and other lakes can be databases next to it. `CREATE DATABASE` makes a new lake
-in a folder beside this one and attaches it:
+A lake is a database, and other lakes can be databases next to it. On a plain node, `CREATE DATABASE`
+makes a new lake in a folder beside this one and attaches it:
 
 ```sql
 CREATE DATABASE archive;
@@ -221,6 +266,9 @@ INSERT INTO crm.customers VALUES (2, 'bob');
 SELECT * FROM crm.customers ORDER BY id;
 DETACH crm;
 ```
+
+Under [`pondra server`](/pondra/guides/server/), which serves a folder of lakes, `CREATE DATABASE`
+makes a new served database instead, and `DROP DATABASE` drops one, its folder and all.
 
 An attachment is kept in the lake, so every node of a cluster sees it and a restarted node attaches it
 again. Reads join across lakes as one query. `INSERT`, `UPDATE`, `DELETE` and `MERGE` on an attached
@@ -265,8 +313,39 @@ Some changes aren't possible, and the error says what to do instead:
 - A column's type can only widen: a smaller integer to a bigger one, `FLOAT` to `DOUBLE`, a `DECIMAL`
   to more digits.
 - `partition_by` can't change, because each file holds one partition.
-- `ALTER TABLE … RENAME TO` isn't supported: a table's name is where its files live. Make a copy with
-  `CREATE TABLE new_name AS SELECT * FROM old_name`, then drop the old one.
+- `ADD COLUMN … NOT NULL` and `ADD COLUMN … DEFAULT` are refused: the rows already there would need a
+  value, and no file is rewritten. Add the column, then `UPDATE` it.
+
+## Rename a table
+
+`ALTER TABLE … RENAME TO` changes a table's name in place. No file is rewritten, and rows still in the
+log stay the table's.
+
+```sql
+CREATE TABLE trips (id BIGINT, city VARCHAR);
+INSERT INTO trips VALUES (1, 'Tashkent'), (2, 'Samarkand');
+ALTER TABLE trips RENAME TO journeys;
+SELECT count(*) AS n FROM journeys;
+```
+
+```text
++---+
+| n |
++---+
+| 2 |
++---+
+```
+
+- A table published as Delta or Iceberg stays readable by other engines, under its new name in the
+  Iceberg catalog.
+- A [stored view](#views) reads a table by name, so after `RENAME TO` it reads whatever takes the old
+  name next. That is how to swap a table in: rename the old one away, then create the new one with the
+  old name.
+- The rename is refused, with the name, when the new name is taken and when a materialized view or a
+  task follows the table. Drop those first.
+
+`ALTER VIEW old_name RENAME TO new_name` renames a stored view. A materialized view isn't renamed:
+drop it and create it again under the new name.
 
 ## Views
 
@@ -278,17 +357,20 @@ CREATE VIEW big_orders AS SELECT * FROM orders WHERE amount > 5;
 SELECT * FROM big_orders;
 ```
 
-`CREATE OR REPLACE VIEW` changes a view. A materialized view, which is kept up to date as rows arrive,
-is in [Streaming](/pondra/guides/streaming/).
+`CREATE OR REPLACE VIEW` changes a view, and `ALTER VIEW … RENAME TO` renames it. A materialized view,
+which is kept up to date as rows arrive, is in [Streaming](/pondra/guides/streaming/).
 
 ## Drop things
 
 ```sql
+TRUNCATE journeys;
 DROP VIEW big_orders;
 DROP TABLE tea_orders;
 DROP TABLE IF EXISTS sessions;
 DROP SCHEMA sales CASCADE;
 ```
+
+`TRUNCATE` empties a table and keeps it. `DROP TABLE` removes it.
 
 - `DROP TABLE` is refused while a view or task reads the table: drop those first.
 - `DROP SCHEMA` is refused for a schema that holds anything, unless you add `CASCADE`, which drops its

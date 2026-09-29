@@ -5,7 +5,7 @@ sidebar:
   order: 4
 ---
 
-import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+import { Tabs, TabItem } from '@astrojs/starlight/components';
 
 Pondra reads and writes with one set of names: `read_<format>` to read and `write_<format>` to
 write. The names that Polars, DuckDB and PySpark users know work too, as **fallbacks**, and give
@@ -189,7 +189,5 @@ True
 [{'n': 2}]
 ```
 
-<Aside type="caution">
-Give the CSV delimiter and header to a frame as `separator=` and `has_header=`. A `delim=` or
-`header=` keyword is dropped without an error.
-</Aside>
+A frame takes the CSV delimiter and header by Polars' names, `separator=` and `has_header=`, or by
+SQL's, `delim=` and `header=`. If you give both, Polars' win.

@@ -1,0 +1,122 @@
+---
+title: dbt and BI tools
+description: Point dbt, DBeaver, Tableau, Metabase, Excel or any Postgres tool at Pondra's Postgres port. They find a Postgres database, with Postgres's catalog.
+sidebar:
+  order: 16
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components';
+
+Pondra's Postgres port answers the catalog queries that dbt and BI tools send: `pg_catalog`,
+`information_schema`, `\d` in psql, JDBC's and ODBC's metadata calls. So these tools connect to a
+lake as they would to Postgres. Start a node with a Postgres port, and give the tool its address:
+
+```bash norun
+pondra serve --dir lake --pg 0.0.0.0:5432 --admin-token "$TOKEN"
+```
+
+| Setting | Value |
+|---|---|
+| Host, port | the node's `--pg` address, such as `host:5432` |
+| Database | the lake's name (the folder's, such as `lake`), or a database of [`pondra server`](/pondra/guides/server/) |
+| User | `admin`, `writer` or `reader`: which token the password is |
+| Password | that token (a node with no tokens takes any password) |
+| SSL | off: the port doesn't speak TLS yet |
+
+## What is tested
+
+Every release runs these tools against a node (`tools/clients_check.py`):
+
+| Tool | What is checked |
+|---|---|
+| **dbt** (dbt-postgres 1.11, dbt-core 1.12) | seeds, a view, a table, incremental models (`delete+insert`, `merge`, `append`), a snapshot, data tests and `dbt docs generate`, run twice; every model's rows equal Postgres 16's |
+| **psql** | `\dt`, `\d` (types, `NOT NULL`, defaults, the primary key), `\dv`, `\dn`, `\df`, `\l`, `\du`, `\d+` of a view |
+| **SQLAlchemy** (psycopg 2 and 3) | the inspector: schemas, tables, views, columns, primary keys, view definitions; pandas' `to_sql` and `read_sql` |
+| **pgjdbc** (what DBeaver, DataGrip, Metabase and Tableau's JDBC connector use) | `DatabaseMetaData`: catalogs, schemas, tables, views, columns, primary keys, functions; prepared queries |
+| **psqlODBC** (what Tableau, Excel and Power BI's ODBC connector use) | tables, views, columns, primary keys; queries with parameters |
+
+## dbt
+
+Use the `dbt-postgres` adapter. A profile:
+
+```yaml
+# ~/.dbt/profiles.yml
+shop:
+  target: dev
+  outputs:
+    dev:
+      type: postgres
+      host: localhost
+      port: 5432
+      user: admin
+      password: "{{ env_var('PONDRA_TOKEN') }}"
+      dbname: lake
+      schema: analytics
+      threads: 1
+```
+
+Then run dbt as usual:
+
+```bash norun
+pip install dbt-postgres
+dbt seed && dbt run && dbt snapshot && dbt test
+dbt docs generate
+```
+
+- **Models:** views, tables and incremental models, with the `delete+insert`, `merge` and `append`
+  strategies. A second `dbt run` replaces views and tables the way dbt does on Postgres (it builds a
+  new one and renames it into place, with `ALTER … RENAME`).
+- **Seeds, snapshots and tests** work as on Postgres. (Snapshots are tested with the `check`
+  strategy.)
+- **Schemas** are Pondra's schemas: dbt's `analytics` is `lake.analytics`, and other clients read
+  `analytics.customer_totals` too.
+- **Rights:** dbt makes schemas and tables, so it needs the admin token (user `admin`).
+
+What you build with dbt is a lake like any other. Its tables can be [published as Delta or
+Iceberg](/pondra/guides/other-engines/), queried over HTTP, or kept current with
+[materialized views](/pondra/guides/streaming/) that dbt doesn't need to rebuild.
+
+## BI tools
+
+<Steps>
+
+1. **Start the node** with `--pg`, as above. For a tool on another machine, give the node a token
+   (`--read-token` is enough for dashboards) and listen on an address the tool can reach.
+
+2. **Add a PostgreSQL connection** in the tool, with the settings in the table at the top. Turn SSL
+   off, or set it to *prefer* or *allow*.
+
+3. **Browse and query.** The tool lists the lake's schemas, tables, views and columns, with
+   Postgres's type names (`bigint`, `character varying`, `timestamp with time zone`, arrays as
+   `integer[]`), and a keyed table's primary key.
+
+</Steps>
+
+Queries run as Pondra runs any query: over the lake's Parquet files and its newest rows, and spread
+over the cluster when that is faster. A dashboard on a table that streams in sees each row as soon
+as its write is acknowledged.
+
+## What the catalog holds
+
+The port answers from the lake's own catalog:
+
+- `pg_namespace`, `pg_class`, `pg_attribute`, `pg_type` (arrays too), `pg_index`, `pg_constraint`,
+  `pg_tables`, `pg_views`, `pg_matviews`, `pg_proc`, `pg_database`, `pg_roles` and the other tables
+  these tools read;
+- `information_schema.tables`, `columns`, `views`, `schemata`, `routines`, `table_constraints` and
+  `key_column_usage`;
+- functions such as `format_type`, `pg_get_viewdef`, `pg_get_constraintdef`, `pg_table_is_visible`,
+  `current_schema()` and `version()`.
+
+Objects get stable ids (`oid`s), so a tool that caches them finds the same table again after a
+restart.
+
+<Aside type="caution" title="Limits">
+- **No TLS on the Postgres port yet** (planned). Keep it on a private network, or behind a tunnel.
+- **Power BI Desktop's PostgreSQL connector** (Npgsql) isn't tested here yet. Its ODBC connector
+  uses psqlODBC, which is.
+- **Indexes:** a keyed table's primary key shows as an index. Pondra has no other indexes: it finds
+  rows by the files' column ranges instead.
+- **Transactions:** `BEGIN` and `COMMIT` are accepted, and each statement commits on its own, so a
+  failed statement doesn't undo the ones before it.
+</Aside>

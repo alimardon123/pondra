@@ -37,6 +37,8 @@ HTTP on 8080, Postgres on 5432, Kafka on 9092, Flight on 8815, and Python functi
   import pondra
   db = pondra.connect("http://localhost:8080")
   ```
+- **`python cell` blocks** are the console's Python cells: they run on the node, as
+  `DO LANGUAGE python`, with `db` and `pondra` already there (no connect).
 - **`js` blocks** run on their own, as ES modules: `import { connect } from "pondra";` and top-level
   `await`.
 - **`bash` blocks** run in a fresh folder, with `pondra` on `PATH`.

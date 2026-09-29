@@ -87,7 +87,10 @@ Without pyarrow the client still runs SQL and returns rows as Python dicts:
   so dates and times are text.
 - **Needs pyarrow:** `.collect()`, `.to_arrow()`, `.to_pandas()`, `.to_polars()`. They raise an
   `ImportError` that says so.
-- **Python functions and procedures** run on pyarrow too, so a node that runs them needs it.
+- **Python functions and procedures** run on pyarrow too, so a node that runs them needs it. A node
+  started with `--python auto` that finds no Python with the `pondra` package and pyarrow says so: `no
+  Python with the pondra package and pyarrow was found (pip install pondra pyarrow; or --python
+  <python>)`.
 
 ## Node
 
@@ -119,7 +122,9 @@ pondra 0.25.0
 ```
 
 Then open a SQL shell with `pondra` (see [The shell](/pondra/start/shell/)), or write your first
-table in [Your first lake](/pondra/start/first-lake/).
+table in [Your first lake](/pondra/start/first-lake/). Every node also serves a web page for SQL and
+Python at its address: start one with `pondra serve --dir lake` and open `http://localhost:8080` for
+[the console](/pondra/start/console/).
 
 ## Which systems
 

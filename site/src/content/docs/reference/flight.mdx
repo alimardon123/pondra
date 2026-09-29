@@ -5,8 +5,6 @@ sidebar:
   order: 10
 ---
 
-import { Aside } from '@astrojs/starlight/components';
-
 A node speaks Arrow Flight on the address you give `--flight`. Arrow goes in and comes out as
 Arrow, with nothing parsed or converted on the way. Two kinds of client use it:
 
@@ -29,14 +27,15 @@ checked here.
 |---|---|
 | `CommandStatementQuery` | runs a query. A write statement sent this way (as a DB-API `execute` does) runs at once and answers one row: `rows`, the number of rows it wrote |
 | `CommandStatementUpdate` | runs a write statement (`CREATE`, `ALTER`, `DROP`, `INSERT`, `UPDATE`, `DELETE`) and answers with the row count. Needs the `write` role |
-| `CommandStatementIngest` | bulk load: appends Arrow batches to a table. A table that does not exist is created from the batches' schema, which needs the `admin` role. `db_schema_name` picks the schema |
+| `CommandStatementIngest` | bulk load: Arrow batches into a table, in one of four [modes](#bulk-ingest). A table that does not exist is created from the batches' schema, which needs the `admin` role. `db_schema_name` picks the schema |
 | `CommandGetCatalogs` | one catalog: the lake's name |
 | `CommandGetDbSchemas` | the lake's schemas |
 | `CommandGetTables` | tables (type `TABLE`) and views (type `VIEW`), with their columns if the client asks |
+| `CommandGetTableTypes` | the two types: `TABLE` and `VIEW` |
 | `CommandGetSqlInfo` | the server's name (`Pondra`), version, Arrow version (1.3), that it is not read-only, and that it has no transactions |
 
-Anything else answers `Unimplemented`: prepared statements (so bound parameters too),
-`GetTableTypes`, keys and transactions. Put values in the SQL text instead. A statement's writes
+Anything else answers `Unimplemented`: prepared statements (so bound parameters too), keys and
+transactions. Put values in the SQL text instead. A statement's writes
 and queries follow the same [roles](/pondra/reference/http/#roles) as HTTP.
 
 ```python
@@ -64,7 +63,16 @@ A write's answer is one row, `rows`, so `fetchall()` gives `[(2,)]`. `cur.rowcou
 ### Bulk ingest
 
 `adbc_ingest` sends Arrow data as one stream, without turning it into SQL. It answers the number of
-rows loaded. Use a new cursor for each ingest: ADBC keeps the target table on the cursor, and a
+rows loaded. Its `mode` says what to do about the table:
+
+| `mode` | The table exists | The table is missing |
+|---|---|---|
+| `create` (the default) | refused, `users exists (mode create)` | made from the batches |
+| `append` | the rows are appended | refused, `no table … (mode append)` |
+| `create_append` | the rows are appended | made from the batches |
+| `replace` | the table is replaced by one made from the batches | made from the batches |
+
+Use a new cursor for each ingest: ADBC keeps the target table on the cursor, and a
 later `execute` on it fails with `must set IngestTargetTable before bulk ingestion`.
 
 ```python
@@ -83,11 +91,17 @@ with conn.cursor() as cur:
 {'name': ['ann', 'bo', 'cy']}
 ```
 
-<Aside type="caution">
-The `mode` is not read. Every ingest creates the table if it is missing and then appends, so
-`mode="create"` on a table that exists appends to it, `mode="replace"` does not replace it, and
-`mode="append"` on a missing table creates it. Drop a table with SQL to start over.
-</Aside>
+Add more rows to it with `append`:
+
+```python
+more = pa.table({"id": [4], "name": ["di"]})
+with conn.cursor() as cur:
+    print(cur.adbc_ingest("users", more, mode="append"))
+```
+
+```text
+1
+```
 
 ### Catalog
 
@@ -97,6 +111,7 @@ for schema in objects[0]["catalog_db_schemas"]:
     print(schema["db_schema_name"], [(t["table_name"], t["table_type"]) for t in schema["db_schema_tables"]])
 print(conn.adbc_get_table_schema("events"))
 print(conn.adbc_get_info()["vendor_name"])
+print(sorted(conn.adbc_get_table_types()))
 ```
 
 ```text
@@ -105,6 +120,7 @@ user_id: int64
 action: string
 amount: double
 Pondra
+['TABLE', 'VIEW']
 ```
 
 ## Write with DoPut
@@ -114,12 +130,16 @@ descriptor is a path:
 
 | Path | Meaning |
 |---|---|
-| `[table]` | append the batches. A retry after a lost answer is applied twice |
+| `[table]` | append the batches. Every send is applied, so a retry after a lost answer writes the rows twice: at least once |
 | `[table, producer, first seq]` | exactly once. The producer names the writer, and the batch number `i` of the stream (from 0) is sequence number `first seq + i`. A batch whose number was already applied is skipped |
 
 The table must exist (`no table x` if not), and the `write` role is needed. Columns are matched by
-name and cast to the table's types. A column a batch leaves out is null, and a column the table
-does not have is dropped.
+name and cast to the table's types. A column a batch leaves out takes its `DEFAULT`, or is null if it
+has none, and a column the table does not have is dropped. A column that is `NOT NULL` and gets no
+value refuses the batch.
+
+A value that cannot be cast to its column's type (the text `'abc'` for a `BIGINT`) refuses the batch,
+and the error names the value. Nothing is written.
 
 Every batch is answered with its ack, as JSON in the `app_metadata` of a `PutResult`, as soon as
 it is committed:
@@ -134,15 +154,8 @@ it is committed:
 
 Read one ack for each batch you wrote. To retry, send the same descriptor with the same batches.
 
-<Aside type="caution">
-A value that cannot be cast to its column's type (the text `'abc'` for a `BIGINT`) is written as
-null, and the batch is acked as normal. Check the types before you send.
-</Aside>
-
-<Aside type="caution">
-Sequence numbers start at 1. A batch with sequence number 0 or less counts as already applied: it
-is answered with `"duplicate": true` and its rows are not written.
-</Aside>
+Sequence numbers start at 1. A `first seq` of 0 is refused, and the error says so: 0 would be taken
+for a batch already written.
 
 ```python
 import json
@@ -289,7 +302,9 @@ for [HTTP](/pondra/reference/http/#roles). Send it in one of two ways:
 
 A call with no token, or a token with too few rights, fails with `this needs a token with more
 rights`. A handshake with a token the server does not know fails with `wrong token`. A write
-statement over Flight SQL from a token that may not write fails with `this token may not write`.
+statement over Flight SQL from a token that may not write fails with `this token may not write`, and
+`DROP TABLE` or other DDL from a `write` token fails with `this token may not change the lake's
+tables, views, schemas or routines (an admin token does)`.
 
 ```python norun
 import os
@@ -304,16 +319,18 @@ options = flight.FlightCallOptions(headers=[client.authenticate_basic_token("wri
 # options = flight.FlightCallOptions(headers=[(b"authorization", f"Bearer {token}".encode())])
 print(client.do_get(flight.Ticket(b'{"sql": "SELECT 1 AS one"}'), options=options).read_all())
 
-# ADBC: the header
+# ADBC: the header, or the user name and password (the password is the token)
 conn = flightsql.connect(
     "grpc://db.example.com:8815",
     db_kwargs={"adbc.flight.sql.authorization_header": f"Bearer {token}"},
     autocommit=True,
 )
+conn = flightsql.connect(
+    "grpc://db.example.com:8815",
+    db_kwargs={"username": "writer", "password": token},
+    autocommit=True,
+)
 ```
 
-<Aside type="caution">
-ADBC's `username` and `password` options send the token in the handshake, and the node refuses it
-with `wrong token` unless `username:token` is a multiple of 3 characters long: ADBC leaves the
-padding off its base64, and the node insists on it. Use the header option above until that is fixed.
-</Aside>
+ADBC's `username` and `password` options send the token in the handshake. The node reads their base64
+with or without padding.

@@ -11,7 +11,7 @@ Python and in SQL files."
 
 - **One engine, one meaning.** A DataFrame is another way to write a query, not another engine.
   Whatever SQL can do on a lake — spread across nodes, the guard, remembered answers, system
-  columns, changed rows, attached lakes, time travel with `upto` — a DataFrame does the same way,
+  columns, changed rows, attached lakes — a DataFrame does the same way,
   because it becomes the same query.
 - **Two dialects, one tree.** A Polars-style lazy API (`pondra.frame`) for new code, and a
   PySpark-shaped one (`pondra.spark`) so a PySpark job moves by changing its imports. Both build
@@ -160,7 +160,7 @@ top.explain()            # Pondra's plan, and whether it would spread
 | Aggregation | `group_by(…).agg(…)`, `sum/mean/min/max/count/n_unique/first/last/quantile`, `pondra.len()` | `GROUP BY` (`sum` over DOUBLE stays order-independent: `fsum.rs`) |
 | Joins | `join(other, on=, left_on=, right_on=, how="inner/left/right/full/semi/anti/cross")`, `join_asof(other, on=, by=, strategy="backward/forward")` | `JOIN`; `ASOF JOIN` (`asof.rs`) |
 | Sets | `pondra.concat([a, b])`, `union`, `intersect`, `except_` | `UNION ALL` / `UNION` / `INTERSECT` / `EXCEPT` |
-| Time | `con.table(name, at=commit)` | the table as of that commit (`upto`) |
+| Time | `con.table(name, at=commit)` | **not built yet** (see "As built" below): it would read the table as of that commit |
 
 Writes and streams are the same verbs SQL has, so they keep SQL's guarantees (the leader
 records them; a job id makes a retry a no-op):
@@ -270,7 +270,8 @@ tested (`tools/frames_check.py`, `tools/spark_check.py`, `tools/bench/tpch_frame
 - **Pipelines of `.sql` and `.py` files** (`pondra run models/`) aren't built; `pondra run
   file.sql` and `con.run("file.sql", …)` are.
 - **The JavaScript client** has `$name` parameters, `run`, `call` and `view`, not the builder.
-- **`sample(n)`** is `ORDER BY random() LIMIT n` (DataFusion ignores `TABLESAMPLE`).
+- **`sample(n)`** is `ORDER BY random() LIMIT n` (DataFusion ignores `TABLESAMPLE`). With `seed=` it
+  orders by a hash of the seed and each row's values, so the same rows come every time.
 - **Rows sent with a query** go in the request itself (`application/vnd.pondra.request`), and a
   write that names a frame sends it as a view the node puts in place.
 - **Frames learn their columns** (for `with_columns`, `rename`, joins) with one `LIMIT 0` query,

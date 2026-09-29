@@ -15,7 +15,7 @@ Where another engine is ahead, the page says so.
 
 - **The machine:** one 2-vCPU virtual machine with 7 GB of memory (8 GB for the single-node TPC-H runs),
   on local disk. Where a number says R2, it used a real Cloudflare R2 bucket. Every engine ran alone.
-- **The engines:** Pondra's prototype, built on Apache DataFusion 55; Spark 4.2.0 (PySpark,
+- **The engines:** Pondra, built on Apache DataFusion 55; Spark 4.2.0 (PySpark,
   `local[*]`); Flink 2.3.0 (PyFlink, a local MiniCluster, parallelism 2); DuckDB 1.5.5; Polars 1.44.2;
   Daft; and Bodo. Each single-node engine ran its own published TPC-H code.
 - **Same data, same answers:** every engine read the same data with the same SQL, and the answers were
@@ -188,8 +188,8 @@ that need more spill to disk.
 
 <Aside type="caution">
 This is the part with the least evidence. Pondra has been tested as several processes on one machine,
-and on three GitHub-hosted machines joined over the public internet. Nothing has run on a cluster in
-one data centre yet.
+and on three and six GitHub-hosted machines joined over the public internet. Nothing has run on a
+cluster in one data centre yet.
 </Aside>
 
 - **On one machine, simulated R2:** where I/O latency dominates, 3 nodes ran 8 of 9 queries 1.2 to 4.3
@@ -204,9 +204,21 @@ one data centre yet.
   |---|---|---|---|
   | Round 19's run | 15.7 s | 18.0 s (5 queries spread) | 39.5 s |
   | Round 21's run | 21.7 s | 21.5 s (3 queries spread, 9 MB moved) | 38.9 s |
+  | 0.24.0, 3 nodes | 23.8 s | 24.1 s (7 queries spread) | 49.5 s |
+  | 0.24.0, 6 nodes | 24.9 s | 22.4 s (6 queries spread) | 29.0 s |
 
-  A cluster on a slow network is no slower than one node. It isn't faster either. Whether more machines
-  make Pondra faster is what the next multi-machine benchmark has to show.
+- **Six nodes** (GitHub runners with 4 vCPUs each, links of 32 to 54 ms and 52 to 89 MB/s): the
+  cluster ran TPC-H 10% faster than one node, with every answer the same. The queries it spread got
+  faster: q21 took 1.30 s instead of 2.95 s, q19 0.65 s instead of 1.00 s, and q6 0.26 s instead of
+  0.57 s. Spreading every query was slower overall (29.0 s), because the slow links make the small
+  queries pay more than they gain.
+- **What the cluster missed:** spread anyway, q1 took 1.04 s instead of 2.69 s, q3 0.47 s instead of
+  0.90 s, and q12 0.36 s instead of 0.87 s, but the cluster kept them on one node. It had estimated the
+  rows their aggregations move by the rows they read, not by the few groups they send. 0.26 estimates
+  them by their groups, and the next run will show it.
+
+  A cluster on the public internet is a hard case for spreading: its links take 30 to 50 ms and carry
+  under 100 MB/s, where a data centre's take under a millisecond and carry 1 GB/s or more.
 
 ## Other numbers
 

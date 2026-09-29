@@ -183,7 +183,7 @@ and the text `this needs a token with more rights`. What a tool may do depends o
 |---|---|
 | `read` | `list_tables`, `query`, `changes` |
 | `write` | also `write` with `INSERT`, `UPDATE`, `DELETE` and `CALL`. A `read` token is refused with `this token may not write` |
-| `admin` | also `write` with `CREATE` and `DROP`. A `write` token is refused with `this token may not create tables` |
+| `admin` | also `write` with `CREATE`, `ALTER` and `DROP`, and the other statements that change the lake's tables, views, schemas or routines. A `write` token is refused with `this token may not change the lake's tables, views, schemas or routines (an admin token does)` |
 
 A procedure runs with the rights of the agent's token: a `read` token that calls one which writes
 is refused by the procedure's own statements.

@@ -285,8 +285,14 @@ fn tables(l: &Lakes) -> Result<Vec<(&'static str, Arc<MemTable>)>> {
         ("attacl", list(TEXT)), ("attoptions", list(TEXT))], attrs)?));
     out.push(("pg_attrdef", table(&[("oid", OID), ("adrelid", OID), ("adnum", INT2), ("adbin", TEXT)], defs)?));
     // Types, and an array type for each.
+    // (The functions by Postgres's own names: drivers such as ADBC's pick a type's binary format by
+    // its `typreceive`. Newer types' names have an underscore.)
+    let fun = |t: &PgType, f: &str| match t.1 {
+        "json" | "jsonb" | "date" | "time" | "timestamp" | "timestamptz" | "interval" | "numeric" | "uuid" | "void" | "record" => s(format!("{}_{f}", t.1)),
+        _ => s(format!("{}{f}", t.1)),
+    };
     let mut types: Vec<Vec<ScalarValue>> = TYPES.iter().map(|t| vec![o(t.0), s(t.1), o(11), o(owner), i2(t.3), b(t.3 > 0 && t.3 <= 8), s(if t.4 == 'P' { "p" } else { "b" }), s(t.4.to_string()),
-        b(false), b(true), s(","), o(0), o(0), o(t.5), s(format!("{}in", t.1)), s(format!("{}out", t.1)), s(format!("{}recv", t.1)), s(format!("{}send", t.1)), o(0), i4(-1), b(false), i4(0),
+        b(false), b(true), s(","), o(0), o(0), o(t.5), fun(t, "in"), fun(t, "out"), fun(t, "recv"), fun(t, "send"), o(0), i4(-1), b(false), i4(0),
         o(if matches!(t.0, 25 | 1043 | 1042 | 19) { 100 } else { 0 }), n(), s("i"), s("p")]).collect();
     types.extend(arrays().map(|(oid, name, _, elem)| vec![o(oid), s(name), o(11), o(owner), i2(-1), b(false), s("b"), s("A"), b(false), b(true), s(","), o(0), o(elem), o(0), s("array_in"),
         s("array_out"), s("array_recv"), s("array_send"), o(0), i4(-1), b(false), i4(0), o(0), n(), s("i"), s("x")]));
@@ -736,6 +742,16 @@ fn is_pg_table(name: &str) -> bool { CATALOG.iter().any(|(n, _)| *n == name) }
 
 /// The catalog's true/false columns (`indisprimary`, `attnotnull`…), which clients compare to
 /// `'t'` and `'f'` as Postgres lets them.
+/// A column that names a function (Postgres's `regproc`), kept here as its name.
+fn regproc(e: &ast::Expr) -> bool {
+    let name = match e {
+        ast::Expr::Identifier(i) => i.value.to_lowercase(),
+        ast::Expr::CompoundIdentifier(p) => p.last().map(|i| i.value.to_lowercase()).unwrap_or_default(),
+        _ => return false,
+    };
+    matches!(name.as_str(), "typinput" | "typoutput" | "typreceive" | "typsend" | "typmodin" | "typmodout" | "typanalyze" | "aggfnoid" | "oprcode")
+}
+
 fn boolean(e: &ast::Expr) -> bool {
     static NAMES: std::sync::LazyLock<std::collections::HashSet<String>> = std::sync::LazyLock::new(|| {
         let empty = Lakes { database: String::new(), databases: vec![], user: String::new(), schemas: vec![], rels: vec![], routines: vec![] };
@@ -937,6 +953,18 @@ impl VisitorMut for Rewriter<'_> {
     fn post_visit_expr(&mut self, e: &mut ast::Expr) -> ControlFlow<()> {
         let replaced = match e {
             ast::Expr::Collate { expr, .. } => Some((**expr).clone()),
+            // `typreceive != 0` (ADBC's): a function (`regproc`) column against 0, Postgres's "none",
+            // which as text is `-`.
+            ast::Expr::BinaryOp { left, op: ast::BinaryOperator::Eq | ast::BinaryOperator::NotEq, right } if regproc(left) || regproc(right) => {
+                for side in [left, right] {
+                    if let ast::Expr::Value(v) = side.as_mut() {
+                        if matches!(&v.value, ast::Value::Number(n, _) if n == "0") {
+                            v.value = ast::Value::SingleQuotedString("-".into());
+                        }
+                    }
+                }
+                None
+            }
             // `i.indisprimary = 't'`: the text as the true or false it means.
             ast::Expr::BinaryOp { left, op: ast::BinaryOperator::Eq | ast::BinaryOperator::NotEq, right } if boolean(left) || boolean(right) => {
                 for side in [left, right] {

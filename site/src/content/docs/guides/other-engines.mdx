@@ -40,10 +40,11 @@ lake/data/events/
 
 Other engines see a table **as of the last tiering round**: about 30 ms after a write on local
 disk, and a few seconds on object storage. `--tier-secs` (default 10) is how often a busy table is
-tiered at most; Pondra's own queries always see every commit at once.
+tiered at most; Pondra's own queries always see every commit at once. `CHECKPOINT` tiers every table
+now, so an engine sees the rows without waiting for the next round:
 
-```bash
-sleep 2   # this page's node tiers every second
+```sql
+CHECKPOINT;
 ```
 
 ## Read with Delta readers
@@ -102,6 +103,12 @@ of its own.
     catalog.load_table("default.events").scan().to_pandas()
     ```
   </TabItem>
+  <TabItem label="Polars">
+    ```python
+    import polars as pl
+    pl.scan_iceberg("lake/data/events").group_by("user").agg(pl.col("amount").sum()).sort("user").collect()
+    ```
+  </TabItem>
   <TabItem label="Spark">
     ```bash norun
     spark-sql \
@@ -125,11 +132,8 @@ duckdb.sql(f"SELECT count(*) FROM iceberg_scan('lake/data/events/metadata/v{vers
 With tokens on, give the catalog the read token: `load_catalog(…, token="…")` in PyIceberg, and
 in DuckDB `CREATE SECRET t (TYPE iceberg, TOKEN '…')` with `SECRET t` in the `ATTACH`.
 
-<Aside type="caution">
-Polars 1.44's own Iceberg reader (`pl.scan_iceberg`) stops with `failed to load 'PARQUET:field_id'`
-when it reads columns of a Pondra table, because Pondra's Parquet files don't carry Iceberg field
-ids. Polars reads the Delta copy, and PyIceberg, DuckDB, Spark and Trino read the Iceberg one.
-</Aside>
+Polars' `scan_iceberg` and other Iceberg readers that need field ids work too, because the table's
+Parquet files carry them.
 
 ## Append from another engine
 
@@ -204,6 +208,8 @@ Iceberg to Pondra, not Delta.
   `CHECKPOINT` to bring them up to date.
 - **Schema changes follow.** `ADD COLUMN`, renames and drops reach Delta (column mapping) and
   Iceberg (field ids) without rewriting files.
+- **A table rename** (`ALTER TABLE … RENAME TO`) keeps the Delta and Iceberg copies readable: the
+  table's folder stays where it is, and the Iceberg catalog lists the table by its new name.
 - **Plain Parquet readers** can read `data/<table>/*.parquet`, but they see replaced files and, for
   keyed tables, old versions of a key. Only the Delta log, the Iceberg metadata or Pondra itself
   gives the right answer.

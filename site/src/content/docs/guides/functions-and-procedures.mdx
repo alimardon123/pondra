@@ -139,7 +139,9 @@ A function may run over millions of rows on every node, so it has limits: it has
 back to the lake** (pass rows in as arguments, or use a procedure), a **time limit** per batch, and
 a worker over its memory limit (`PONDRA_WORKER_MB`, 2048) is replaced. A table function takes
 values, not another table's rows: there is no `LATERAL`. The node needs Python:
-`pondra serve --python auto` (a node from `local()` has it).
+`pondra serve --python auto` (a node from `local()` has it). `auto` looks for a Python with the `pondra`
+package and `pyarrow`. If the machine has none, a call says so: `no Python with the pondra package and
+pyarrow was found (pip install pondra pyarrow; or --python <python>)`.
 </Aside>
 
 ## Functions from a notebook or a file
@@ -351,6 +353,58 @@ ok
 
 `db.create_procedure("job", file="job.py", params={"day": "DATE"})` stores a file's text instead, so
 every node runs the same code whatever is on its disk.
+
+## Run code once: DO
+
+`DO` runs a block of code once and stores nothing: no name, no routine to `CALL` later. It is Postgres's
+anonymous code block, and it is what the [console](/pondra/start/console/)'s Python cells run. Give the
+language, then the code between `$$`:
+
+```sql
+DO LANGUAGE python $$
+rows = db.sql("SELECT item, count(*) AS n FROM sales GROUP BY item ORDER BY item").rows()
+print(len(rows), "items")
+rows
+$$;
+```
+
+The block prints `2 items` as a notice, and its last line, `rows`, comes back as the answer. A SQL
+block runs its statements in order and answers with the last one:
+
+```sql
+DO LANGUAGE sql $$
+  CREATE TABLE best (item VARCHAR, n BIGINT);
+  INSERT INTO best SELECT item, count(*) FROM sales GROUP BY item;
+  SELECT * FROM best ORDER BY item
+$$;
+```
+
+- **Rights.** A block runs with its caller's rights, and only an admin may run one, since the code is
+  arbitrary. Python needs a node started with `--python`.
+- **The language** may come after the code, as Postgres allows: `DO $$ … $$ LANGUAGE python`.
+- **`db` and `pondra`.** In a Python block, `db` is the connection (the caller's), and `pondra` is
+  the module.
+- **Notices.** What Python prints comes back as notices, the same as a procedure's: `NOTICE` in
+  Postgres clients, the `x-pondra-notices` header over HTTP, `db.notices` in the clients.
+- **Rows.** The block's last expression, if it is a frame, an Arrow table or a pandas or Polars
+  DataFrame, a list of dicts, or a single value, comes back as rows. A block with nothing to return
+  answers `{"called": "do"}`, and Postgres's command tag is `DO`.
+- **Errors** name the line in the block.
+
+```python
+try:
+    db.sql("DO LANGUAGE python $$\nx = 1\n1 / 0\n$$")
+except RuntimeError as e:
+    print(e)
+```
+
+```text
+500: ZeroDivisionError: division by zero
+  line 2: 1 / 0
+```
+
+Use a procedure when you will run the code again or want it on a schedule. `DO` is for the one-off:
+a fix-up, an experiment, a cell of a notebook.
 
 ## Start a call without waiting
 

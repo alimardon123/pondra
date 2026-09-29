@@ -98,7 +98,8 @@ WITH _2 AS (SELECT * FROM orders WHERE ("qty" > 1)),
 SELECT * FROM _4 ORDER BY "spent" DESC NULLS FIRST
 ```
 
-To see the plan, run `EXPLAIN` on it: `db.sql("EXPLAIN " + top.sql).rows()`.
+To see the plan, call `top.explain()`. It works on a frame of any number of steps, and says whether the
+query would spread over the nodes.
 
 ## Expressions
 
@@ -126,8 +127,8 @@ db.table("orders").with_columns(
 
 Joins take `on=` (or `left_on` and `right_on`) and `how` (`inner`, `left`, `right`, `full`, `semi`,
 `anti`, `cross`). `join_asof` is an [as-of join](/pondra/guides/streaming/#as-of-joins).
-`pondra.concat([a, b])` stacks frames; `unique`, `limit`, `drop_nulls`, `fill_null`, `rename`,
-`cast` and `drop` are there too.
+`pondra.concat([a, b])` stacks frames; `union`, `intersect` and `except_` are SQL's set operations;
+`unique`, `limit`, `drop_nulls`, `fill_null`, `rename`, `cast` and `drop` are there too.
 
 ```sql
 CREATE TABLE people (user VARCHAR, city VARCHAR);
@@ -263,7 +264,7 @@ rounds halves to even, and `n_unique` counts null as a value.
 
 - A frame that has a sort keeps it through the steps after it, until a step groups, joins or drops
   the sort column, as in Polars.
-- `sample(n)` is `ORDER BY random() LIMIT n`.
+- `sample(n)` picks different rows each time. Give `seed=` and it picks the same ones every time.
 - The JavaScript client has parameters, `run` and `call`, but no frame builder.
 
 </Aside>

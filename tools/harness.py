@@ -3976,6 +3976,14 @@ def found():
         empty.returncode == 1 and "holds no lake yet" in empty.stderr and made.returncode == 0 and more.returncode == 0 \
         and "| 3 | 6 |" in cli("fresh", "SELECT count(*) AS n, sum(a) AS s FROM t").stdout \
         and wrong.returncode == 1 and "nope" in wrong.stderr and not any("backtrace" in e.lower() for e in (empty.stderr, wrong.stderr))
+    # `pondra sql` refuses a row without a NOT NULL column, as a node does (it writes to the log
+    # itself), and fills a DEFAULT.
+    cli("fresh", "CREATE TABLE needs (id BIGINT, email VARCHAR NOT NULL, plan VARCHAR DEFAULT 'free')")
+    missing = cli("fresh", "INSERT INTO needs (id) VALUES (1)")
+    given = cli("fresh", "INSERT INTO needs (id, email) VALUES (2, 'a@b')")
+    checks["pondra sql: NOT NULL refused, DEFAULT filled (its own writes to the log)"] = missing.returncode == 1 and "needs.email is NOT NULL" in missing.stderr \
+        and given.returncode == 0 and "| 2  | a@b   | free |" in cli("fresh", "SELECT id, email, plan FROM needs").stdout
+    seen["cli_not_null"] = [missing.stdout + missing.stderr[-300:], given.stdout + given.stderr[-300:]]
     shutil.rmtree(work, ignore_errors=True)
     # What the console found (round 26): a time without seconds is a timestamp, as in Postgres
     # (INSERT, CAST, TIMESTAMP '…', a comparison); a table is a BASE TABLE to information_schema;

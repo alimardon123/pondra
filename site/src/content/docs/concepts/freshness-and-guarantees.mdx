@@ -15,9 +15,13 @@ tell you the shape, not what your hardware will do.
 
 A batch you write is applied once, even if you send it twice. The rules for a **producer**:
 
-- It has its own name and sends batches in order, with an increasing `seq`, one request in flight.
+- It has its own name and sends batches in order, with an increasing `seq` that counts from 1 (a `seq`
+  of 0 is refused), one request in flight.
 - It sends to any node, and retries, on any node, until it is acknowledged.
 - A retry of a batch that already committed comes back as `"duplicate": true`, and adds nothing.
+
+An append with no producer name has no `seq` to recognise a repeat by, so it is applied each time it is
+sent: at least once, like a Kafka producer that isn't idempotent.
 
 The Python and JavaScript clients do this for you: `db.append` keeps a producer name and a `seq`, and
 retries with the same one. With plain HTTP you do it yourself:
@@ -230,7 +234,8 @@ and its last windows and sessions wait for more rows.
 
 A query reads the Parquet files and the log tail as one snapshot, so it never sees half a commit. A
 node's view of the catalog never goes back in time: after a gap in the leader's stream it falls back
-to the bucket's view, checked before and after every read. In the consistency tests, with 64 writers
+to the bucket's view, checked before and after every read. A follower shows a client its own writes:
+a `SELECT` sent to a follower after that client's `INSERT`, `UPDATE` or `DELETE` there sees the change. In the consistency tests, with 64 writers
 and 16 readers, there were no torn reads and no lost or duplicated batches.
 
 - **The result cache.** A repeated query is answered from a cache until the next commit changes what
@@ -242,9 +247,10 @@ and 16 readers, there were no torn reads and no lost or duplicated batches.
 
 ## Crashes, failover and full shutdown
 
-- **A node killed.** Producers retry on another node, and a retried batch is recognised.
+- **A node killed.** Producers retry on another node, and a retried batch (one with a producer name and
+  a `seq`) is recognised.
 - **The leader killed.** Another node takes over. The catalog fences the old leader, so it can't write
-  once it is replaced.
+  once it is replaced. A reader node follows the new leader within about a second.
 - **Everything stopped.** The first node started on the lake leads at once. A lake with nothing
   running still answers `pondra sql`.
 - **The test.** The repository's `tools/harness.py crash` kills the process with `kill -9` and injects
@@ -262,8 +268,10 @@ What Pondra does not promise yet:
 - Row ids and Kafka offsets are built from commit numbers shifted by 32 bits. With a steady 500
   commits a second on local disk, Kafka offsets turn negative after about 50 days and row ids repeat
   after about 100. On R2 that is years away. ADR-029 (proposed) plans the fix in its first phase.
-- Pondra is a prototype. Chaos tests on real clusters, fuzzing and long soak runs are still on the
-  plan.
+- Pondra is new: its first release was in 2026. It has a large test suite (crash, failover and chaos
+  tests on one machine and on object storage) and benchmarks, but it hasn't yet run for years in
+  production as Spark, Flink or Postgres have. Chaos tests across several machines, fuzzing and long
+  soak runs are still on the plan.
 </Aside>
 
 ## Design notes

@@ -1,6 +1,6 @@
 ---
 title: Change rows
-description: UPDATE, DELETE and MERGE on any table, a row's system columns, exactly-once changes, the change feed, and temporary tables.
+description: UPDATE, DELETE, MERGE and INSERT … ON CONFLICT on any table, a row's system columns, exactly-once changes, the change feed, and temporary tables.
 sidebar:
   order: 5
 ---
@@ -49,6 +49,79 @@ print(db.sql("UPDATE orders SET status = 'packed' WHERE id = 2"))
 A change is one commit, made by the lake's leader from one snapshot. It applies all or not at all, and
 two changes to the same rows from different nodes at once don't lose either. You can send the statement
 to any node.
+
+## Update or delete with another table
+
+`UPDATE … FROM` and `DELETE … USING` join the table to another one, as in Postgres:
+
+```sql
+CREATE TABLE parcels (id BIGINT, status VARCHAR);
+INSERT INTO parcels VALUES (1, 'sent'), (2, 'sent'), (3, 'sent');
+CREATE TABLE scans (id BIGINT, event VARCHAR);
+INSERT INTO scans VALUES (1, 'delivered'), (3, 'lost'), (3, 'lost');
+
+UPDATE parcels SET status = s.event FROM scans s WHERE parcels.id = s.id AND s.event = 'delivered';
+DELETE FROM parcels USING scans s WHERE parcels.id = s.id AND s.event = 'lost';
+SELECT * FROM parcels ORDER BY id;
+```
+
+```text
++----+-----------+
+| id | status    |
++----+-----------+
+| 1  | delivered |
+| 2  | sent      |
++----+-----------+
+```
+
+Parcel 3 matches two scans and is deleted once.
+
+## Insert or update on a key
+
+On a keyed table, `INSERT … ON CONFLICT (key)` decides what a row does when its key is already there:
+`DO NOTHING` skips it, and `DO UPDATE SET` changes the row that is there. In `SET`, the table's name is
+the row that is there and `excluded` is the row you sent.
+
+```sql
+CREATE TABLE visits (page VARCHAR PRIMARY KEY, n BIGINT);
+INSERT INTO visits VALUES ('home', 1), ('docs', 1);
+INSERT INTO visits VALUES ('home', 1), ('blog', 1) ON CONFLICT (page) DO UPDATE SET n = visits.n + excluded.n;
+INSERT INTO visits VALUES ('docs', 99) ON CONFLICT (page) DO NOTHING;
+SELECT * FROM visits ORDER BY page;
+```
+
+```text
++------+---+
+| page | n |
++------+---+
+| blog | 1 |
+| docs | 1 |
+| home | 2 |
++------+---+
+```
+
+Without `ON CONFLICT`, an `INSERT` into a keyed table replaces the row. `MERGE` does the same jobs and
+more. MySQL's `ON DUPLICATE KEY UPDATE` is refused, with the Postgres form to use instead.
+
+## Empty a table
+
+`TRUNCATE t` deletes every row and keeps the table, its columns and its options. To remove the table
+too, use `DROP TABLE`.
+
+```sql
+CREATE TABLE scratch (a BIGINT);
+INSERT INTO scratch VALUES (1), (2);
+TRUNCATE scratch;
+SELECT count(*) AS n FROM scratch;
+```
+
+```text
++---+
+| n |
++---+
+| 0 |
++---+
+```
 
 ## Merge rows from another table
 
@@ -264,9 +337,10 @@ seconds as a replayable feed. Without it, the log is kept for `--retain-secs` (6
 
 ## Views follow
 
-A materialized view that adds up (`sum` and `count`, grouped) takes the old rows back and adds the new
-ones in the same commit as the change. Give it a `count(*)`, so it knows when a group has no rows left
-and drops it.
+A materialized view that only filters or projects a table follows `UPDATE` and `DELETE` of it: a row
+that changes is changed in the view, a row that no longer matches leaves it, and one that starts to match joins it. A view that adds up
+(`sum` and `count`, grouped) takes the old rows back and adds the new ones in the same commit as the
+change. Give it a `count(*)`, so it knows when a group has no rows left and drops it.
 
 ```sql
 CREATE MATERIALIZED VIEW qty_by_item AS SELECT item, sum(qty) AS n, count(*) AS orders FROM orders GROUP BY item;
@@ -283,7 +357,14 @@ SELECT * FROM qty_by_item ORDER BY item;
 +------+---+--------+
 ```
 
-`cake` has no orders left, so its group is gone.
+`cake` has no orders left, so its group is gone. A view of a filter follows in the same way:
+
+```sql
+CREATE MATERIALIZED VIEW tea_orders AS SELECT id, qty FROM orders WHERE item = 'tea';
+UPDATE orders SET qty = 9 WHERE id = 1;
+```
+
+`tea_orders` now holds order 1 with `qty` 9. Change an order's `item` and it leaves the view or joins it.
 
 Some views can't take a row back: one that keeps a `min` or `max`, one that emits windows or sessions,
 one that joins another table, and streaming tasks. While one of them reads a table, a change to the

@@ -23,7 +23,8 @@ than `--addr`'s host, add `--kafka-advertise host:port`. The examples below use 
 
 Make the table first: a topic that isn't a table isn't there, and a producer to it times out. Each
 record's value is a JSON row. If the table has `_key` or `_timestamp` columns, they get the record's
-key and timestamp.
+key and timestamp. A column the row leaves out takes its `DEFAULT` (null if it has none), and a row
+with no value for a `NOT NULL` column is refused with `INVALID_RECORD`.
 
 ```sql
 CREATE TABLE events (user VARCHAR, amount BIGINT, _key VARCHAR, _timestamp TIMESTAMP);
@@ -63,10 +64,15 @@ producers work the same as librdkafka's.
 ## Debezium and change events
 
 Debezium change events become upserts and deletes on a table with a primary key, with or without
-Kafka Connect's `schema` wrapper: `after` is the new row, and a delete removes the key. A record with a
+Kafka Connect's `schema` wrapper (a `payload` alone works too): `after` is the new row, and a delete
+removes the key. A record with a
 null value (a tombstone) removes its key too. The record key is a JSON object of the key columns, or
 a plain value for a one-column key. So Debezium into Pondra keeps a Postgres or MySQL table's
 current state with nothing in between.
+
+A delete needs a key to name the row, so a Debezium delete for a table **without** a primary key is
+refused: the record fails with `INVALID_RECORD`, and the node logs why. Appending the `before` row
+instead would bring the deleted row back. Make the table with the source's `PRIMARY KEY`.
 
 ```sql
 CREATE TABLE users (id BIGINT PRIMARY KEY, name VARCHAR, score DOUBLE);

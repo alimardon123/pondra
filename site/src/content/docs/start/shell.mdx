@@ -80,7 +80,23 @@ SQL
 ```
 
 Writes print a one-line outcome, queries print a table. The last statement runs even without its `;`.
-A file works the same way: `pondra shop < setup.sql`.
+A file works the same way: `pondra shop < setup.sql`. A statement that fails prints its error and the
+script goes on with the next one, then the shell exits with an error status, so a script or a CI job
+can tell:
+
+```bash
+printf 'SELECT nope FROM missing;\nSELECT 1 AS one' | pondra scratch || echo "exit status: $?"
+```
+
+```text
+Error: Error during planning: table 'scratch.public.missing' not found
++-----+
+| one |
++-----+
+| 1   |
++-----+
+exit status: 1
+```
 
 ## Use the lakes beside yours as databases
 
@@ -187,15 +203,17 @@ pondra run report.sql daily --day 2026-09-27 --min 5
 - The last statement's answer is printed. A failing statement stops the run with its error, and the
   command exits with an error status.
 
-To run the file on a node that is already running, add `--url` before the file name, and a lake name
-(any name: it isn't used) before the parameters:
+To run the file on a node that is already running, give `--url` instead of the lake. It and the
+parameters may come in any order:
 
 ```bash
 cat > today.sql <<'SQL'
 SELECT item, amount FROM sales WHERE day = $day
 SQL
-pondra run --url http://localhost:8080 today.sql lake --day 2026-09-28
+pondra run today.sql --url http://localhost:8080 --day 2026-09-28
 ```
+
+A lake and `--url` together are refused: a script runs on one or the other.
 
 ```text
 +------+--------+

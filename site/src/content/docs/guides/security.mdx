@@ -15,8 +15,8 @@ and the Iceberg REST catalog.
 | Role | May |
 |---|---|
 | **read** | query: `SELECT`, key lookups, `watch` and `live`, MCP reads, the Iceberg catalog's reads, metrics, and `GET /files` |
-| **write** | read, and write rows: `INSERT`, `UPDATE`, `DELETE`, `MERGE`, appends, Kafka produce, Flight `DoPut`, `PUT /files` and other engines' Iceberg appends |
-| **admin** | write, and change what exists: tables, views, tasks, functions, procedures and secrets |
+| **write** | read, and write rows: `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `TRUNCATE`, appends, Kafka produce, Flight `DoPut`, `PUT /files` and other engines' Iceberg appends |
+| **admin** | write, and change what exists: tables, views, schemas, tasks, functions, procedures and secrets, and run `DO` blocks |
 
 With tokens on, a request with no token or a wrong one is refused (`401`). Only `GET /stats`, a
 health check, stays open.
@@ -175,7 +175,7 @@ for label, headers in [("no token", {}), ("wrong token", {"Authorization": "Bear
 read  SELECT count(*) AS n FROM notes               [{'n': 2}]
 read  INSERT INTO notes VALUES (3, 'from a reader') this token may not write
 write INSERT INTO notes VALUES (3, 'from a writer') ok
-write CREATE TABLE more (id BIGINT)                 this token may not create tables
+write CREATE TABLE more (id BIGINT)                 this token may not change the lake's tables, views, schemas or routines (an admin token does)
 admin CREATE TABLE more (id BIGINT)                 ok
 no token    401
 wrong token 401
@@ -183,7 +183,8 @@ wrong token 401
 
 ## Code runs as its caller
 
-A Python function or procedure runs code on the node's machine, so **only an admin makes one**. A
+A Python function or procedure runs code on the node's machine, so **only an admin makes one**, and
+only an admin runs a `DO` block, which is code run once. A
 procedure then runs with the rights of whoever calls it, not of whoever wrote it: a reader can call a
 procedure that writes, and the write is refused.
 
@@ -199,7 +200,7 @@ print(attempt("write", "CALL add_note('by a writer')"))
 ```
 
 ```text
-this token may not create tables
+this token may not change the lake's tables, views, schemas or routines (an admin token does)
 add_note: RuntimeError: 500: this token may not write
   line 2: pondra.sql("INSERT INTO notes VALUES (100, $text)", text=text)
 [{'add_note': 'added'}]

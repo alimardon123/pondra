@@ -5,8 +5,6 @@ sidebar:
   order: 3
 ---
 
-import { Aside } from '@astrojs/starlight/components';
-
 Options go in a `WITH (name = value, …)` clause. A value is a quoted string or a number, and a
 list is one string with commas: `cluster_by = 'user_id, url'`. Names aren't case sensitive.
 
@@ -27,6 +25,8 @@ list is one string with commas: `cluster_by = 'user_id, url'`. Names aren't case
 | `merge` | `'col:func, …'` with `func` one of `sum`, `count`, `min`, `max` | merge | how each non-key column combines |
 | `ttl` | `'column:seconds'` | keyed | a row whose timestamp or date column is older than that many seconds is gone |
 | `order_by` | `'column'` | keyed | the row with the greatest value of this column wins, not the last to arrive |
+
+An option name that isn't in this table is refused when you `CREATE` the table, and the error names it.
 
 `ALTER TABLE t SET (…)` changes `publish`, `cluster_by`, `ttl` and `order_by` later. Files written
 from then on follow them, and files written before keep their order until they are merged.
@@ -81,17 +81,13 @@ eu      8.0     2  5.0
 us      2.0     1  2.0
 ```
 
-<Aside type="caution">
-`CREATE TABLE` ignores an option name it doesn't know, so `cluser_by` is accepted and does
-nothing. A merge table with a non-key column that has no function is accepted too, and then fails
-when you read it with a planner error about `GROUP BY`. Name every non-key column in `merge`.
-</Aside>
-
 What Pondra refuses, by option:
 
 | You write | Error |
 |---|---|
+| an option name the table doesn't take, such as `cluser_by` | `CREATE TABLE … WITH (cluser_by = …): tables take publish, cluster_by, partition_by, ttl, order_by, merge` |
 | `merge` without a key | `a merge table needs a key` |
+| a merge table with a non-key column left out of `merge` | `a merge table combines every column but its key: s needs a merge function too` |
 | `merge = 'b:avg'` | `merge functions: sum, count, min, max` |
 | `publish = 'parquet'` | `publish formats: delta, iceberg` |
 | `cluster_by` on a column the table lacks | `cluster_by: columns of the table` |

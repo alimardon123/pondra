@@ -23,17 +23,15 @@ INSERT INTO orders (id, item) VALUES (3, 'pie');
 INSERT INTO orders SELECT 10000 + value, 'bulk', 1, 1.5 FROM generate_series(1, 1000);
 ```
 
-- A column list fills only those columns; the rest are `NULL`.
+- A column list fills only those columns; the rest take their `DEFAULT`, or `NULL` if they have none. A
+  `NOT NULL` column that gets no value refuses the row (see [Tables](/pondra/guides/tables/#require-a-value-not-null-and-default)).
+- A value that doesn't fit its column, such as `'abc'` for a `BIGINT`, is refused with an error that
+  names the value. It is never stored as `NULL`.
 - The `SELECT` can read any table, view, or file (see below). `INSERT INTO new_table SELECT …` makes the
   table when it isn't there yet; `CREATE TABLE … AS SELECT` does the same with the name first.
 - Many small `INSERT … VALUES` statements don't make many small files: the rows are gathered into one
   file per table each time the lake tiers its newest rows to Parquet.
 - Into a keyed table, `INSERT` is an upsert (see [Tables](/pondra/guides/tables/)).
-
-<Aside type="caution">
-`INSERT … VALUES` stores `NULL` for a literal that isn't the column's type: `VALUES ('abc', …)` into a
-`BIGINT` column writes a `NULL`. `INSERT … SELECT` and `append` refuse such a value with an error.
-</Aside>
 
 ## Append rows from code
 
@@ -89,6 +87,15 @@ So a producer whose answer got lost simply sends the same batch again, to any no
 acknowledged. The Python and JavaScript clients do this for you: one producer name per connection, an
 increasing `seq`, and retries with a growing pause. If you write your own producer, send batches in
 order, one request in flight at a time.
+
+`seq` counts from 1. A `seq` of 0 is refused, and the error says so, because 0 would be taken for a
+batch already written. Arrow Flight has the same rule.
+
+<Aside type="caution">
+An append with no `producer` is applied every time it is sent. Send it again after a lost answer and
+the rows are there twice: that is at least once, like a Kafka producer that isn't idempotent. Give
+the append a `producer` and a `seq` when a repeat must not count.
+</Aside>
 
 ## Load a batch once with a job
 
@@ -150,10 +157,27 @@ buckets, on HTTPS and in other engines' tables are in [Files and other lakes](/p
 <Aside type="caution">
 A node started with `pondra serve` never reads its own disk for a client's SQL, whoever asks: it refuses
 `FROM 'more.csv'` with "a file on the node's machine". Only the program that started a node (the shell,
-`local()` in Python or JavaScript) and `pondra sql` read your files. `pondra sql` reads a file named
-like `'more.parquet'`, but not yet `read_csv(…)` or `read_json(…)` in an `INSERT` or `CREATE TABLE … AS`:
-use the shell for those.
+`local()` in Python or JavaScript) and `pondra sql` read your files.
 </Aside>
+
+`pondra sql` reads files and `read_csv(…)`, `read_parquet(…)` and `read_json(…)` in `INSERT … SELECT` and
+`CREATE TABLE … AS`, as the shell does:
+
+```bash
+pondra sql --dir lake "CREATE TABLE orders_csv AS SELECT * FROM read_csv('more.csv', header => true)"
+pondra sql --dir lake "SELECT count(*) AS n FROM orders_csv"
+```
+
+```text
+{"rows":2}
++---+
+| n |
++---+
+| 2 |
++---+
+```
+
+On a folder that holds no lake yet, a query says so and a write makes the lake.
 
 ## Load a DataFrame
 

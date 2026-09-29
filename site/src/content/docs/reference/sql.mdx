@@ -5,7 +5,7 @@ sidebar:
   order: 1
 ---
 
-import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+import { Tabs, TabItem } from '@astrojs/starlight/components';
 
 This page lists every statement a Pondra node runs, grouped by what it changes. Queries use
 [Apache DataFusion's SQL](https://datafusion.apache.org/user-guide/sql/index.html), which is close to
@@ -27,19 +27,26 @@ Columns take these types. A list is written `type[]`, such as `FLOAT[]` for an e
 | `DECIMAL(p, s)` | | exact numbers; `0.07` in SQL is a decimal |
 | `VARCHAR` | `TEXT`, `STRING` | text |
 | `BOOLEAN` | | true or false |
-| `DATE`, `TIME`, `TIMESTAMP` | | timestamps are kept in microseconds |
-| `BYTEA` | | bytes |
+| `DATE`, `TIME`, `TIMESTAMP` | | `TIMESTAMP` is a wall-clock time with no zone, kept in microseconds |
+| `TIMESTAMPTZ` | `TIMESTAMP WITH TIME ZONE` | an instant, kept and shown in UTC with its zone: `2026-09-29T05:00:00Z` |
+| `BYTEA` | `BINARY`, `VARBINARY`, `BLOB` | bytes |
+| `JSON` | `VARIANT` | JSON text, read with `json_get` and `->` (see [functions](/pondra/reference/functions/)) |
 | `type[]` | | a list of one type |
 
-JSON text lives in a `VARCHAR` column and is read with `json_get` and `->`
-(see [functions](/pondra/reference/functions/)).
+A `TIMESTAMPTZ` written with an offset (`'2026-09-29 10:00:00+05'`) is stored as the instant it names,
+so it reads back as `2026-09-29T05:00:00Z`. A time may leave out its seconds, as in Postgres and
+DuckDB: `'2024-05-01 10:30'` is a timestamp in `INSERT`, `CAST`, `TIMESTAMP '…'` and comparisons.
+
+A value that doesn't cast to its column's type is refused, and the error names the value: `'abc'` into
+a `BIGINT` is an error, never a `NULL`. `substr`, `substring(b FROM 2 FOR 1)` and `byte_length` work
+on bytes as they do on text. A `CAST` to bytes takes `BYTEA` only.
 
 ## Queries
 
 | Form | Meaning |
 |---|---|
 | `SELECT … FROM t` | any DataFusion query: joins, `WITH`, windows, `VALUES`, sub-queries |
-| `FROM t [SELECT …]` | DuckDB's form: the `FROM` first |
+| `FROM t [SELECT …] [WHERE …] [GROUP BY …] [ORDER BY …] [LIMIT n]` | DuckDB's form: the `FROM` first, then any clauses |
 | `$name` | a parameter, bound by the node and never pasted into the text |
 | `FROM a ASOF JOIN b MATCH_CONDITION (a.ts >= b.ts) ON a.k = b.k` | each row gets the other table's row as it was at that moment (`>=`, `>`, `<=`, `<`) |
 | `EXPLAIN SELECT …` | the plan, and whether it would spread over the nodes |
@@ -54,6 +61,7 @@ CREATE TABLE quotes (ts TIMESTAMP, sym VARCHAR, bid DOUBLE);
 INSERT INTO trades VALUES (TIMESTAMP '2026-09-28 10:00:05', 'ABC', 10.1);
 INSERT INTO quotes VALUES (TIMESTAMP '2026-09-28 10:00:00', 'ABC', 10.0), (TIMESTAMP '2026-09-28 10:00:09', 'ABC', 10.2);
 FROM orders SELECT item, sum(amount) AS total GROUP BY item ORDER BY total DESC;
+FROM orders WHERE item = 'tea' ORDER BY id;
 SELECT t.ts, t.px, q.bid FROM trades t ASOF JOIN quotes q MATCH_CONDITION (t.ts >= q.ts) ON t.sym = q.sym;
 SHOW TABLES;
 ```
@@ -81,29 +89,50 @@ A parameter goes with the request, in JSON. The Python and JavaScript clients do
 
 | Statement | Syntax |
 |---|---|
-| Create | `CREATE TABLE [IF NOT EXISTS] t (column type [PRIMARY KEY], … [, PRIMARY KEY (column, …)]) [WITH (option = 'value', …)]` |
+| Create | `CREATE TABLE [IF NOT EXISTS] t (column type [NOT NULL] [DEFAULT expression] [PRIMARY KEY], … [, PRIMARY KEY (column, …)]) [WITH (option = 'value', …)]` |
 | Create from a query | `CREATE TABLE t AS SELECT …`, or `CREATE TABLE t (a INT, b VARCHAR) AS VALUES …` |
 | Add a column | `ALTER TABLE t ADD COLUMN [IF NOT EXISTS] c type` |
 | Rename a column | `ALTER TABLE t RENAME COLUMN a TO b` |
+| Rename a table | `ALTER TABLE t RENAME TO u` |
 | Drop a column | `ALTER TABLE t DROP COLUMN [IF EXISTS] c` |
 | Widen a column | `ALTER TABLE t ALTER COLUMN c TYPE BIGINT` |
 | Change options | `ALTER TABLE t SET (publish = 'delta', cluster_by = 'user', ttl = 'ts:3600', order_by = 'ts')` |
+| Empty | `TRUNCATE [TABLE] t` |
 | Drop | `DROP TABLE [IF EXISTS] t [, t2 …]` |
 
 A table without a primary key is an append table. With a key, a new row replaces the old one with the
 same key. The options are on [table options](/pondra/reference/table-options/). An `ALTER TABLE`
 rewrites no file: old rows read a new column as null.
 
+`NOT NULL` and `DEFAULT` are enforced on every door: `INSERT`, `POST /append`, `COPY`, Flight,
+Kafka, a bulk `INSERT … SELECT` and `pondra sql`. A key's columns are `NOT NULL` too; a table made by an older
+release keeps its old rules. A row that leaves a column out gets its default, each row its own
+(`DEFAULT now()` is the time of each row). A JSON row sent to `/append` or Kafka without the column
+takes the default; an explicit `null` stays null, and is refused if the column is `NOT NULL`. A
+`DEFAULT` that doesn't cast to the column's type is refused at `CREATE`.
+
+`ALTER TABLE … ADD COLUMN … NOT NULL` and `… DEFAULT` are refused, because the rows already there
+would need a value and no file is rewritten. Add the column, then `UPDATE` it.
+
+`RENAME TO` changes the name in place: no file is rewritten, rows still in the log stay the table's,
+and its Delta and Iceberg copies stay readable. A stored view reads a table by name, so after a rename
+it reads whatever takes the old name next. It is refused when the new name is taken, when a
+materialized view or a task follows the table, and for a materialized view.
+
 ```sql
 CREATE TABLE users (id BIGINT PRIMARY KEY, name VARCHAR, plan VARCHAR);
 CREATE TABLE clicks (ts TIMESTAMP, user VARCHAR, url VARCHAR) WITH (cluster_by = 'user', partition_by = 'day(ts)');
 CREATE TABLE big_orders AS SELECT * FROM orders WHERE amount > 4;
+CREATE TABLE accounts (id BIGINT PRIMARY KEY, email VARCHAR NOT NULL, plan VARCHAR DEFAULT 'free', made TIMESTAMP DEFAULT now());
+INSERT INTO accounts (id, email) VALUES (1, 'ann@example.com');
 ALTER TABLE users ADD COLUMN age INT;
 ALTER TABLE users RENAME COLUMN age TO years;
 ALTER TABLE users ALTER COLUMN years TYPE BIGINT;
 ALTER TABLE users DROP COLUMN years;
 ALTER TABLE clicks SET (publish = 'delta');
-DROP TABLE big_orders;
+ALTER TABLE big_orders RENAME TO large_orders;
+DROP TABLE large_orders;
+TRUNCATE accounts;
 ```
 
 ## Rows
@@ -111,14 +140,17 @@ DROP TABLE big_orders;
 | Statement | Syntax |
 |---|---|
 | Insert | `INSERT INTO t [(column, …)] VALUES (…), …` or `INSERT INTO t [(column, …)] SELECT …` |
-| Update | `UPDATE t SET column = expression [, …] [WHERE condition]` |
-| Delete | `DELETE FROM t [WHERE condition]` |
+| Insert, on a key that exists | `INSERT … ON CONFLICT (key) DO NOTHING`, or `… ON CONFLICT (key) DO UPDATE SET column = t.column + excluded.column` (Postgres's) |
+| Update | `UPDATE t SET column = expression [, …] [FROM other o] [WHERE condition]` |
+| Delete | `DELETE FROM t [USING other o] [WHERE condition]` |
 | Merge | `MERGE INTO t [AS x] USING source [AS s] ON condition WHEN [NOT] MATCHED [BY SOURCE] [AND condition] THEN UPDATE SET … \| DELETE \| INSERT (…) VALUES (…)` |
 
 `UPDATE`, `DELETE` and `MERGE` work on every table, keyed or not. Each is one commit from one snapshot:
 it applies all or nothing, and a `job` id makes a retry a no-op. A row keeps its `_row_id` through a
 change. `MERGE` answers with the rows `updated`, `deleted` and `inserted`; a target row that matches
-two source rows is an error.
+two source rows is an error. `UPDATE … FROM` and `DELETE … USING` join the table to another one, and
+`ON CONFLICT` answers as `MERGE` does. In `DO UPDATE SET`, `t.column` is the row that is there and
+`excluded.column` is the row you sent. MySQL's `ON DUPLICATE KEY UPDATE` is refused by name.
 
 ```sql
 INSERT INTO users VALUES (1, 'ann', 'free'), (2, 'bo', 'pro'), (3, 'cy', 'free');
@@ -130,7 +162,16 @@ USING (SELECT 4 AS id, 'di' AS name, 'pro' AS plan UNION ALL SELECT 2, 'bo', 'fr
 ON t.id = s.id
 WHEN MATCHED THEN UPDATE SET plan = s.plan
 WHEN NOT MATCHED THEN INSERT (id, name, plan) VALUES (s.id, s.name, s.plan);
+INSERT INTO users VALUES (4, 'dee', 'free') ON CONFLICT (id) DO NOTHING;
+CREATE TABLE visits (id BIGINT PRIMARY KEY, n BIGINT);
+INSERT INTO visits VALUES (1, 1), (2, 1);
+INSERT INTO visits VALUES (2, 1), (3, 1) ON CONFLICT (id) DO UPDATE SET n = visits.n + excluded.n;
+CREATE TABLE upgrades (id BIGINT, plan VARCHAR);
+INSERT INTO upgrades VALUES (1, 'team'), (3, 'gone');
+UPDATE users SET plan = u.plan FROM upgrades u WHERE users.id = u.id AND u.plan <> 'gone';
+DELETE FROM users USING upgrades u WHERE users.id = u.id AND u.plan = 'gone';
 SELECT * FROM users ORDER BY id;
+SELECT * FROM visits ORDER BY id;
 ```
 
 ## Schemas and other lakes
@@ -139,7 +180,7 @@ SELECT * FROM users ORDER BY id;
 |---|---|
 | Create a schema | `CREATE SCHEMA [IF NOT EXISTS] s` |
 | Drop a schema | `DROP SCHEMA [IF EXISTS] s [CASCADE]` |
-| Make a new lake | `CREATE DATABASE [IF NOT EXISTS] name [LOCATION 'dir']`: a lake beside this one, attached |
+| Make a new lake | `CREATE DATABASE [IF NOT EXISTS] name [LOCATION 'dir']`: a lake beside this one, attached. Under [`pondra server`](/pondra/guides/server/) it makes a new served database, and `DROP DATABASE name` drops one, folder and all |
 | Attach a lake | `ATTACH 'dir' AS name`; `ATTACH 'url' AS name (TYPE delta \| iceberg \| kafka, …)` for other engines |
 | Detach | `DETACH [IF EXISTS] name` |
 
@@ -167,6 +208,7 @@ DROP SCHEMA sales CASCADE;
 | Stored view | `CREATE [OR REPLACE] VIEW v AS SELECT …`: a query run over the tables as they are when read |
 | Materialized view | `CREATE MATERIALIZED VIEW v [WITH (option = value, …)] AS SELECT … FROM t …`: kept up to date as rows arrive |
 | Temporary | `CREATE TEMP TABLE t AS SELECT …`, `CREATE TEMP VIEW v AS SELECT …`: a session's own |
+| Rename | `ALTER VIEW v RENAME TO w`: a stored view, not a materialized one |
 | Drop | `DROP VIEW [IF EXISTS] v`, `DROP MATERIALIZED VIEW [IF EXISTS] v` |
 
 A materialized view is filled from the rows already in its table, then follows every new row. Its
@@ -187,7 +229,8 @@ print(db.sql("SELECT o.item FROM orders o JOIN picked USING (id)").rows())
 ```
 
 ```sql
-DROP VIEW tea_orders;
+ALTER VIEW tea_orders RENAME TO tea_only;
+DROP VIEW tea_only;
 DROP MATERIALIZED VIEW spend_by_item;
 ```
 
@@ -201,13 +244,17 @@ DROP MATERIALIZED VIEW spend_by_item;
 | Macro | `CREATE [OR REPLACE] MACRO m(x) AS expression` (DuckDB's) |
 | Procedure | `CREATE [OR REPLACE] PROCEDURE p(x type [DEFAULT v], …) LANGUAGE sql \| python AS $$ … $$` |
 | Call | `CALL p(args)` or `CALL p(name => value)` |
+| Run code once | `DO LANGUAGE python \| sql $$ … $$` (the language may come after the code, as in Postgres) |
 | Start | `SELECT pondra.start('p', args)`: runs it without waiting, and answers with the run's id |
 | Task | `CREATE [OR REPLACE] TASK t SCHEDULE '5 minutes' \| 'cron 0 2 * * * UTC' AS CALL p(…)` |
 | Drop | `DROP FUNCTION [IF EXISTS] f`, `DROP PROCEDURE …`, `DROP MACRO …`, `DROP TASK [IF EXISTS] t` |
 | List | `SHOW USER FUNCTIONS`, `SHOW PROCEDURES`, `SHOW TASKS` (each takes `LIKE 'pattern'`) |
 
-Inside a SQL procedure, a parameter is `$name`. Python functions and procedures need a node started
-with `--python`. Functions, procedures and tasks are kept in the lake, so every node and client has
+Inside a SQL procedure, a parameter is `$name`. `DO` runs a block of code once, with the caller's
+rights: it needs an admin token, and Python needs a node started with `--python`. What the block prints
+comes back as notices, and its last expression, if it is a frame, table, list of dicts or value, comes
+back as rows (see [Functions and procedures](/pondra/guides/functions-and-procedures/#run-code-once-do)).
+Python functions and procedures need a node started with `--python`. Functions, procedures and tasks are kept in the lake, so every node and client has
 them. Every call of a procedure is a row of `pondra.runs`
 (see [system columns](/pondra/reference/system-columns/)).
 
@@ -221,6 +268,7 @@ CREATE PROCEDURE log_order(item VARCHAR, qty BIGINT DEFAULT 1) LANGUAGE sql AS $
 $$;
 CALL log_order('scone');
 CALL log_order(item => 'bun', qty => 3);
+DO LANGUAGE sql $$ INSERT INTO orders VALUES (101, 'roll', 1, 2.0); SELECT count(*) AS orders FROM orders $$;
 CREATE TASK hourly_scone SCHEDULE '60 minutes' AS CALL log_order('scone');
 SELECT net(10.0) AS net, slug('Hello World') AS slug, double_it(4) AS four;
 SHOW USER FUNCTIONS;
@@ -253,7 +301,12 @@ pondra sql --dir scratch "INSERT INTO t VALUES (1, 'eu'), (2, 'us')"
 pondra sql --dir scratch "COPY (SELECT * FROM t) TO 'out.parquet'"
 pondra sql --dir scratch "COPY (SELECT * FROM t) TO 'by_region/' (FORMAT csv, PARTITION_BY (region), HEADER true)"
 pondra sql --dir scratch "SELECT count(*) AS n FROM 'out.parquet'"
+pondra sql --dir scratch "CREATE TABLE t_copy AS SELECT * FROM 'out.parquet'"
+pondra sql --dir scratch "INSERT INTO t_copy SELECT * FROM read_parquet('out.parquet')"
 ```
+
+`pondra sql` reads those files in `CREATE TABLE … AS` and `INSERT … SELECT` too. On a folder with no lake
+yet, a query says so and a write makes one.
 
 ```sql
 CREATE SECRET sales (TYPE s3, KEY_ID 'your-key-id', SECRET 'your-secret', REGION 'eu-west-1', SCOPE 's3://my-bucket');
@@ -277,21 +330,23 @@ Pondra refuses these by name, so a statement never runs and quietly does somethi
 
 | Statement | What happens |
 |---|---|
-| `ALTER TABLE t RENAME TO u` | refused; run `CREATE TABLE u AS SELECT * FROM t`, then `DROP TABLE t` |
+| `ALTER TABLE t RENAME TO u` when `u` is taken, or when a materialized view or a task follows `t` | refused, with the name |
+| `ALTER VIEW v RENAME TO w` of a materialized view | refused; `DROP` it, and `CREATE` it under the new name |
+| `ALTER TABLE t ADD COLUMN c … NOT NULL` or `… DEFAULT` | refused; no file is rewritten, so add the column, then `UPDATE` it |
+| a `NOT NULL` column given no value, or a `DEFAULT` that doesn't cast | refused, naming the column |
+| a value that doesn't cast to its column's type (`'abc'` into a `BIGINT`) | refused, naming the value; never stored as `NULL` |
+| `INSERT … ON DUPLICATE KEY UPDATE` | refused: it is MySQL's; write `ON CONFLICT (…) DO UPDATE SET …` or `MERGE` |
+| `CREATE TABLE … WITH (…)` with an option name Pondra doesn't know | refused, with the name; see [table options](/pondra/reference/table-options/) |
+| `CREATE EXTERNAL TABLE` | refused; read files in a query (`SELECT * FROM 'file.parquet'`) or make the table with `CREATE TABLE … AS SELECT` |
+| a merge table with a non-key column that has no merge function | refused at `CREATE` (`s needs a merge function`) |
 | `ALTER TABLE t SET (partition_by = …)` | refused; each file holds one partition |
 | `UPDATE` or `DELETE` on a merge table | refused; `INSERT` into it instead, and the key's rows combine |
 | `UPDATE` that sets a key column | refused; the key names the row |
 | a column called `_row_id`, `_version`, `_created_at` or `_updated_at` | refused: every table has them already |
 | `DROP TABLE` while a view or task reads the table | refused; drop the view or task first |
 | a change to a table a window, session, join or min/max view follows | refused, with the view's name, because such a view cannot take a row back |
-| `TRUNCATE`, `CREATE INDEX`, `GRANT` | not supported; `DELETE FROM t` empties a table |
+| `CREATE INDEX`, `GRANT` | not supported |
 | `BEGIN`, `COMMIT`, `SET` over HTTP | not supported: every statement commits on its own (the Postgres door accepts and ignores them) |
 | `COPY … TO` a path on the node's machine | refused unless the program that started the node sends it |
 | `COPY … TO` a folder inside a lake | refused; a lake's files are its own |
 | Python functions and procedures on a node started without `--python` | refused, with the flag to use |
-
-<Aside type="caution">
-`CREATE TABLE … WITH (…)` ignores an option name it doesn't know, so check the spelling against
-[table options](/pondra/reference/table-options/). `INSERT … ON CONFLICT` is accepted but the clause is
-ignored: use a keyed table (`PRIMARY KEY`) or `MERGE` for upserts.
-</Aside>

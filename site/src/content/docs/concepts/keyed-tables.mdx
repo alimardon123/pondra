@@ -55,7 +55,9 @@ SELECT * FROM users ORDER BY id;
 +----+------+------+
 ```
 
-Key 1 has one row, not two.
+Key 1 has one row, not two. A key's columns are `NOT NULL`: a row without its key is refused. To keep
+the row that is there instead of replacing it, or to add to it, use
+[`INSERT … ON CONFLICT`](/pondra/guides/change-rows/#insert-or-update-on-a-key).
 
 ## Change and delete rows
 
@@ -125,7 +127,8 @@ Measured with 2 million keys on one 2-vCPU machine, with the load generator on t
 ## Add up numbers: merge tables
 
 Give a keyed table `merge` and the rows for a key combine instead of replacing each other. Each
-listed column takes `sum`, `count`, `min` or `max`.
+column except the key takes `sum`, `count`, `min` or `max`, and `CREATE` refuses a table that leaves one
+out.
 
 ```sql
 CREATE TABLE spend (user VARCHAR PRIMARY KEY, total BIGINT, n BIGINT) WITH (merge = 'total:sum,n:sum');

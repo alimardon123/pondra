@@ -129,14 +129,14 @@ def node_checks(browser, port, show):
     sql_error = c.locator(".err").inner_text()
     checks["errors in plain words: a SQL one, and a Python one at its line in the cell"] = "nope" in sql_error and "ZeroDivisionError" in python_error and "line 2" in python_error
 
-    live = pg.run(1, "SELECT count(*) AS n FROM people")
+    live = pg.run(1, "SELECT count(*) AS n, sum(amt) AS amt FROM people")
     live.locator("label.live").click()
-    started = until(lambda: "live" in live.locator(".st").inner_text() and call(port, "GET", "/stats")["live_queries"] == 1, True)
-    sql(port, "INSERT INTO people (id, name) VALUES (4, 'Di')")
-    updated = until(lambda: pg.grid(live)[1], [["4"]])
+    started = until(lambda: live.locator(".st .dot").count() == 1 and call(port, "GET", "/stats")["live_queries"] == 1, True)
+    sql(port, "INSERT INTO people (id, name, amt) VALUES (4, 'Di', 0.25)")
+    updated = until(lambda: pg.grid(live)[1], [["4", "4.00"]])
     live.locator("label.live").click()
     ended = until(lambda: call(port, "GET", "/stats")["live_queries"], 0)
-    checks["a live cell shows a row INSERTed over HTTP; off, its query ends"] = started is True and updated == [["4"]] and ended == 0
+    checks["a live cell shows a row INSERTed over HTTP (a decimal to its scale); off, its query ends"] = started is True and updated == [["4", "4.00"]] and ended == 0
 
     n = pg.cells().count()
     pg.cell(0).locator("textarea").click()

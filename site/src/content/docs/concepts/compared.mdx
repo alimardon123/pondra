@@ -8,8 +8,8 @@ sidebar:
 import { Aside } from '@astrojs/starlight/components';
 
 Pondra puts a stream log, a lakehouse and a SQL engine in one binary, to replace Kafka, Flink, Spark
-and a metastore for the common jobs. It is a prototype. This page puts it next to the tools you may be
-choosing between, says what each one is, and says where each one is stronger. The numbers are in
+and a metastore for the common jobs. It is new, and it doesn't replace them all. This page puts it next
+to the tools you may be choosing between, says what each one is, and says where each one is stronger. The numbers are in
 [Performance](/pondra/concepts/performance/).
 
 ## The short answer
@@ -29,7 +29,9 @@ At cluster scale, and in breadth, it is not there yet:
   centre.
 - **Streaming features:** Flink has timers, CEP and a watermark per partition. Pondra doesn't.
 - **Ecosystem:** Spark and Databricks have hundreds of connectors and mature governance.
-- **Maturity:** Pondra is a prototype.
+- **Maturity:** Pondra is new: its first release was in 2026. It has a large test suite (crash,
+  failover and chaos tests on one machine and on object storage) and benchmarks, but it hasn't yet run
+  for years in production as Spark, Flink or Postgres have.
 
 Pondra's own notes put the realistic claim like this: it can beat them for the common case (small to
 mid-size clusters, up to terabytes a day, SQL-shaped work) and take far less to run. The gaps are
@@ -219,9 +221,12 @@ Pondra hasn't been measured against Snowflake.
   Kafka sinks are not covered.
 - **Other databases.** Reading and writing Postgres or MySQL as attached databases, and streaming their
   changes in natively, are on the roadmap and not built. Debezium events through the Kafka port work.
-- **BI tools and JDBC** were not tested here.
+- **BI tools and JDBC.** dbt, psql, SQLAlchemy, pgjdbc and psqlODBC are tested against the Postgres
+  port ([dbt and BI tools](/pondra/guides/dbt-and-bi/)). Power BI Desktop's own PostgreSQL connector
+  isn't tested here.
 - **Streaming.** No timers, CEP, or Top-N by event time, and one watermark per source.
-- **Maturity.** Pondra is a prototype.
+- **Maturity.** Pondra is new and hasn't run in production for years. Chaos tests across several
+  machines, fuzzing and long soak runs are still on the plan.
 </Aside>
 
 ## Where to read more

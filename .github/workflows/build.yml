@@ -83,8 +83,8 @@ jobs:
 
       # The suite, on this very binary (Linux): the quick correctness suite (upserts, split brain,
       # crashes, clients, Kafka, windows, sums, schemas, files on S3, lakes on GCS and Azure,
-      # scale, Flight…), frames against Polars, the console in Chromium, then a cluster losing its
-      # leader twice.
+      # scale, Flight…), frames against Polars, the console in Chromium, every example on the
+      # website, then a cluster losing its leader twice.
       - uses: actions/cache@v5 # (Apache Kafka for harness.py kafkas: archive.apache.org takes minutes)
         if: matrix.platform == 'linux-x64'
         id: kafka
@@ -105,4 +105,5 @@ jobs:
           python3 tools/frames_check.py
           python3 -m playwright install --with-deps chromium
           python3 tools/console_check.py
+          python3 tools/docs_check.py   # (every example on the website runs)
           python3 tools/cluster.py failover --secs 30

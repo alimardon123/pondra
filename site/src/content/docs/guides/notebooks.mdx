@@ -12,6 +12,10 @@ node somewhere else, SQL cells that see your variables, and frames that display 
 nothing to configure. `pip install pondra` brings the client and the `pondra` binary, and
 `pip install jupyterlab` brings the notebook if you don't have one.
 
+You don't need Jupyter to try this. Every node serves [a console](/pondra/start/console/) at its
+address, with SQL and Python cells, and it saves what you write as a Jupyter notebook (`.ipynb`) in the
+lake. Download one and Jupyter, VS Code and GitHub open it.
+
 ## Start a node from a cell
 
 `pondra.local(folder)` starts a node on a lake in that folder, here, and connects to it. It stops when

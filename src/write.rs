@@ -1166,6 +1166,7 @@ async fn prepare(query: &Lake, target: &Arc<Lake>, table: &str, stmt: &Stmt, job
         (Some(m), _) if log => {
             let sql = rows_sql(&m, stmt)?;
             let batch = rows(&open(session(query, &sql, "").await?), &m, &sql).await?;
+            crate::defaults::check(&m, table, &batch)?; // (NOT NULL: as a node's own log checks its rows)
             let (ack, _) = tokio::sync::oneshot::channel();
             let append = Append { table: table.into(), src: Src { producer: format!("sql:{job}"), seq: 1, prev: None }, batch, ack };
             Ok(Some(Request::Flush(encode_flush(&pack(target, &[append]).await?)?.into())))

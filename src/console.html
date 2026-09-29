@@ -383,16 +383,16 @@ function doneText(v) {
   if (!entries.length) return v.called === 'do' ? '' : 'Done.';
   return entries.map(([k, x]) => `${k.replace(/_/g, ' ')} ${typeof x === 'string' ? x : JSON.stringify(x)}`).join(' · ');
 }
-function cellOf(v, num, time) {
+function cellOf(v, num, time, scale) {
   if (v == null) return h('td', { class: num ? 'num' : null }, h('span', { class: 'null' }, 'NULL'));
-  let s = typeof v === 'object' ? JSON.stringify(v) : String(v);
+  let s = typeof v === 'object' ? JSON.stringify(v) : typeof v === 'number' && scale != null ? v.toFixed(scale) : String(v); // (a live answer's decimals: numbers)
   if (time) s = s.replace(/^(\d{4}-\d\d-\d\d)T/, '$1 ');
   const td = h('td', { class: s.includes('\n') ? 'pre' : num ? 'num' : null }, s.length > 5000 ? s.slice(0, 5000) + '…' : s);
   if (s.length > 50 && !s.includes('\n')) td.title = s.slice(0, 4000);
   return td;
 }
 function grid(r) {
-  const cols = r.columns, all = r.rows, nums = cols.map(c => numeric(c.type)), times = cols.map(c => /^Timestamp/.test(c.type || ''));
+  const cols = r.columns, all = r.rows, nums = cols.map(c => numeric(c.type)), times = cols.map(c => /^Timestamp/.test(c.type || '')), scales = cols.map(c => +((c.type || '').match(/^Decimal\d*\(\d+,\s*(\d+)\)/)?.[1] ?? NaN));
   if (!cols.length) return h('div', { class: 'done' }, 'No columns.');
   const body = h('tbody');
   const table = h('table', {}, h('thead', {}, h('tr', {}, h('th', { class: 'i' }, ''), cols.map((c, i) => h('th', { class: nums[i] ? 'num' : null, title: c.type }, c.name, h('small', {}, sqlType(c.type)))))), body);
@@ -400,7 +400,7 @@ function grid(r) {
   const more = h('button', { class: 'btn', onclick: () => draw() });
   function draw() {
     const end = Math.min(all.length, drawn + (drawn ? 1000 : SHOWN)), frag = document.createDocumentFragment();
-    for (; drawn < end; drawn++) frag.append(h('tr', {}, h('td', { class: 'i' }, String(drawn + 1)), all[drawn].map((v, i) => cellOf(v, nums[i], times[i]))));
+    for (; drawn < end; drawn++) frag.append(h('tr', {}, h('td', { class: 'i' }, String(drawn + 1)), all[drawn].map((v, i) => cellOf(v, nums[i], times[i], Number.isNaN(scales[i]) ? null : scales[i]))));
     body.append(frag);
     more.textContent = `Show ${count(Math.min(1000, all.length - drawn))} more`;
     more.hidden = drawn >= all.length;
@@ -429,7 +429,7 @@ class Cell {
     this.id = /^[A-Za-z0-9_-]{1,64}$/.test(o.id || '') ? o.id : newId();
     this.kind = o.kind || 'sql';
     this.result = null; this.count = null; this.ctl = null; this.stream = null;
-    this.kindSel = h('select', { class: 'kind', 'aria-label': 'Kind of cell', title: 'SQL, Python or text (S, P, M)', onchange: e => this.setKind(e.target.value) },
+    this.kindSel = h('select', { class: 'kind', 'aria-label': 'Kind of cell', title: 'SQL, Python or text (S, P, M)', onchange: e => { this.setKind(e.target.value); this.edit(); } },
       h('option', { value: 'sql' }, 'SQL'), h('option', { value: 'python' }, 'Python'), h('option', { value: 'markdown' }, 'Text'));
     this.runBtn = h('button', { class: 'run', title: 'Run (Ctrl+Enter)', onclick: () => this.ctl ? this.ctl.abort() : this.run() }, 'Run');
     this.liveBox = h('input', { type: 'checkbox', onchange: () => this.setLive(this.liveBox.checked) });
@@ -527,7 +527,7 @@ class Cell {
   async startLive() {
     this.stopLive();
     const ctl = this.stream = new AbortController(), cols = this.result.columns, first = this.result;
-    this.status.className = 'st'; this.status.innerHTML = '<span class="dot"></span>live';
+    this.status.className = 'st'; this.status.innerHTML = '<span class="dot"></span>waiting for changes';
     try {
       const r = await call('/live?sql=' + encodeURIComponent(this.src.trim()), { signal: ctl.signal });
       const reader = r.body.getReader(), dec = new TextDecoder();
@@ -559,7 +559,7 @@ class Cell {
       this.show(r);
       if (!opening) this.out.querySelector('.grid')?.classList.add('flash'); // (what changed since)
     }
-    this.status.className = 'st'; this.status.innerHTML = `<span class="dot"></span>live · commit ${esc(m.at)} · ${new Date().toLocaleTimeString()}`;
+    this.status.className = 'st'; this.status.innerHTML = `<span class="dot"></span>updated ${new Date().toLocaleTimeString()} (commit ${esc(m.at)})`;
   }
 }
 

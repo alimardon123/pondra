@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Pondra as dbt and BI tools use it (ADR-030): its Postgres port, with Postgres's catalog.
 
-  clients_check.py [dbt,psql,sqlalchemy,jdbc,odbc] [--port 8870]
+  clients_check.py [dbt,psql,sqlalchemy,jdbc,odbc,adbc] [--port 8870]
 
 - dbt: a project with seeds, a view, a table, incremental models (delete+insert, merge,
   append), a snapshot and data tests, run twice — the second time with changed seeds, so views
@@ -15,6 +15,9 @@
   catalogs, schemas, tables, columns, primary keys, then a query.
 - odbc: psqlODBC's catalog functions through pyodbc (what Tableau and Excel call): tables,
   columns, primary keys, then a query.
+- adbc: ADBC's Postgres driver (Arrow straight from the port): it reads pg_type first, then
+  fetches rows of every kind (integers, text, doubles, timestamps with a zone, lists, decimals,
+  booleans, dates) as Arrow.
 
 Needs: dbt-postgres (`PONDRA_DBT`, else `dbt` on PATH), Postgres 16's binaries
 (`PONDRA_PG_BIN`, else /usr/lib/postgresql/16/bin), java and javac with pgjdbc's jar
@@ -252,9 +255,30 @@ def odbc_check(pg):
     return checks, ({} if all(checks.values()) else {"tables": tables, "columns": cols, "keys": keys, "one": one})
 
 
+def adbc_check(pg):
+    """ADBC's Postgres driver: it reads pg_type first (a type's binary format by its receive
+    function's name), then fetches Arrow through COPY … TO STDOUT (FORMAT binary). NUMERIC comes
+    as its digits (text), as the driver gives it from Postgres."""
+    import adbc_driver_postgresql.dbapi as adbc
+    with adbc.connect(f"postgresql://u:{PASSWORD}@127.0.0.1:{pg}/lake") as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT id, name, score, joined FROM users ORDER BY id")
+        t = cur.fetch_arrow_table()
+        cur.execute("SELECT user_id, amount, at, tags, CAST(amount AS DECIMAL(10, 2)) AS exact, amount > 10 AS big, CAST(at AS DATE) AS day FROM events")
+        e = cur.fetch_arrow_table()
+    got = {"users": t.to_pylist(), "types": [str(f.type) for f in t.schema], "events": e.to_pylist(), "event_types": [str(f.type) for f in e.schema]}
+    import datetime as dt
+    checks = {
+        "ADBC (Postgres driver): Arrow rows with their types": got["users"][0]["name"] == "ann" and got["users"][1]["score"] == 2.5 and got["types"][:3] == ["int64", "string", "double"]
+            and got["users"][0]["joined"] == dt.datetime(2026, 9, 1, 10, tzinfo=dt.timezone.utc) and got["events"][0]["tags"] == ["a", "b"]
+            and got["events"][0]["exact"] == "12.50" and got["events"][0]["big"] is True and got["events"][0]["day"] == dt.date(2026, 9, 1),
+    }
+    return checks, ({} if all(checks.values()) else {k: str(v)[:800] for k, v in got.items()})
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("parts", nargs="?", default="dbt,psql,sqlalchemy,jdbc,odbc")
+    ap.add_argument("parts", nargs="?", default="dbt,psql,sqlalchemy,jdbc,odbc,adbc")
     ap.add_argument("--port", type=int, default=8870)
     A = harness.A = ap.parse_args()
     A.s3, A.keep = False, False
@@ -270,7 +294,7 @@ def main():
         for part in A.parts.split(","):
             try:
                 checks, info = {"dbt": lambda: dbt_check(pg, work), "psql": lambda: psql_check(pg), "sqlalchemy": lambda: sqlalchemy_check(pg),
-                                "jdbc": lambda: jdbc_check(pg, work), "odbc": lambda: odbc_check(pg)}[part]()
+                                "jdbc": lambda: jdbc_check(pg, work), "odbc": lambda: odbc_check(pg), "adbc": lambda: adbc_check(pg)}[part]()
             except Exception as e:  # noqa: BLE001 (a part that couldn't run fails)
                 checks, info = {f"{part}: ran": False}, {"error": f"{type(e).__name__}: {str(e)[:1500]}"}
             results.update(checks)

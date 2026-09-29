@@ -5,8 +5,6 @@ sidebar:
   order: 6
 ---
 
-import { Aside } from '@astrojs/starlight/components';
-
 A **frame** is a query that hasn't run yet, in Polars' style. You make one with `db.table`,
 `db.sql` or `db.read_csv`, chain methods on it, and ask for the rows. The whole chain is one SQL
 statement, run by the node: `frame.sql` shows it. The methods use Polars' names, so Polars code
@@ -93,7 +91,7 @@ item LIKE 't%'")`, `with_columns("qty * amount AS total")`, `agg("sum(amount) AS
 | `sort(by, *more, descending=False, nulls_last=False)` | order the rows; `descending` and `nulls_last` take a list for one flag per key |
 | `limit(n=5)` | the first `n` rows. Also `head` |
 | `unique(subset=None, keep="any")` | distinct rows, or one row per value of the `subset` columns |
-| `sample(n=None, fraction=None, seed=None)` | `n` random rows (`ORDER BY random() LIMIT n`), or each row with probability `fraction`. `seed` is not used |
+| `sample(n=None, fraction=None, seed=None)` | `n` random rows, or about `fraction` of them. With a `seed` you get the same rows every time (they are picked by a hash of the seed and each row's values, so rows with identical values are picked together) |
 | `fill_null(value)` | replace nulls in every column of the value's kind: numbers, text, booleans, dates |
 | `drop_nulls(subset=None)` | drop rows with a null in the `subset` columns, or in any column |
 
@@ -160,6 +158,32 @@ print(orders.join(users, left_on="user_id", right_on="id", how="anti").select("i
 [{'id': 4}]
 ```
 
+## Set operations
+
+Two frames with the same columns combine as SQL's set operations do.
+
+| Method | Meaning |
+|---|---|
+| `union(other, distinct=True)` | the rows of both, each once (`UNION`). `distinct=False` keeps repeats (`UNION ALL`, as `pondra.concat` does) |
+| `intersect(other)` | the rows in both (`INTERSECT`) |
+| `except_(other)` | the rows of this frame that aren't in `other` (`EXCEPT`) |
+
+```python
+tea = orders.filter(col("item") == "tea").select("id")
+many = orders.filter(col("qty") > 1).select("id")
+print(tea.union(many).sort("id").rows())
+print(tea.intersect(many).rows())
+print(tea.except_(many).rows())
+print(orders.sample(n=2, seed=7).sort("id").rows() == orders.sample(n=2, seed=7).sort("id").rows())
+```
+
+```text
+[{'id': 1}, {'id': 3}, {'id': 4}, {'id': 5}]
+[{'id': 1}]
+[{'id': 3}]
+True
+```
+
 ## Results
 
 Nothing runs until you ask for rows.
@@ -172,7 +196,7 @@ Nothing runs until you ask for rows.
 | `rows()` | a list of dicts. Works without pyarrow |
 | `item()` | the one value of a one-row, one-column answer |
 | `show(n=20)` | print the first `n` rows as a text table |
-| `explain()` | Pondra's plan, and whether it would spread over the nodes |
+| `explain()` | Pondra's plan, and whether it would spread over the nodes. It works on a frame of any number of steps |
 | `watch()` | for a table or materialized view: its new rows as they commit |
 
 ```python
@@ -261,9 +285,17 @@ that take an expression take a plain value or a SQL string too.
 | `fn.name(*args)` | call any SQL function, or one of the lake's own: `pondra.fn.slug(col("title"))`. `pondra.fn("ops.slug", x)` for a function in a schema |
 | `sum(name)`, `mean`, `min`, `max`, `count`, `n_unique`, `median`, `first`, `last` | the aggregate of a column, by name: `pondra.sum("amount")` |
 
-Operators: `+ - * %`, `/` (always a true division, as a float), `//` (floor of that division, also
-a float), `**`, `== != < <= > >=`, `&`, `|`, `~`, `abs()` and `-x`. A Python comparison needs
+Operators: `+ - * %`, `/` (always a true division, as a float), `//` (floor division: whole numbers
+give whole numbers, as in Polars, and floats give a float), `**`, `== != < <= > >=`, `&`, `|`, `~`, `abs()` and `-x`. A Python comparison needs
 parentheses around each side of `&` and `|`.
+
+```python
+print(orders.select("id", half=col("qty") // 2).sort("id").limit(3).rows())
+```
+
+```text
+[{'id': 1, 'half': 1}, {'id': 2, 'half': 0}, {'id': 3, 'half': 0}]
+```
 
 | Method | Meaning |
 |---|---|
@@ -370,8 +402,3 @@ parts.limit(3).show()
 | TEA   | 2026-09-02 | 9    |
 +-------+------------+------+
 ```
-
-<Aside type="caution">
-`//` on whole numbers gives a float (`col("qty") // 2` is `0.0`, not `0`), where Polars gives a
-whole number. `cast` the result to `BIGINT` if you need one.
-</Aside>

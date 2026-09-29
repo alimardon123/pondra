@@ -5,8 +5,6 @@ sidebar:
   order: 5
 ---
 
-import { Aside } from '@astrojs/starlight/components';
-
 The `pondra` package talks to a node over HTTP. `pondra.connect` reaches a node that is running,
 and `pondra.local` starts one on a folder and connects to it. A connection, called `db` on this
 page, runs SQL, writes rows, makes views, and calls functions and procedures. A query comes back as
@@ -104,7 +102,7 @@ They are SQL's `read_*` functions: see [names](/pondra/reference/names/) for the
 | Method | Meaning |
 |---|---|
 | `db.read_parquet(source, hive_partitioning=None, **options)` | Parquet files |
-| `db.read_csv(source, separator=None, has_header=None, hive_partitioning=None, **options)` | CSV files |
+| `db.read_csv(source, separator=None, has_header=None, hive_partitioning=None, **options)` | CSV files. Options by SQL's names (`delim=`, `header=`) work too |
 | `db.read_json(source, hive_partitioning=None, **options)` | newline-delimited JSON |
 | `db.read_delta(source, version=None)` | a Delta table, at its latest version or `version` |
 | `db.read_iceberg(source, snapshot_id=None, version=None, allow_moved_paths=None)` | an Iceberg table: its folder or a metadata file |
@@ -332,11 +330,8 @@ with pondra.connect("http://localhost:8080") as session:
     print(session.sql("SELECT 1 AS one").rows())
 ```
 
-<Aside type="caution">
-`db.read_csv(path, delim=";")` and `header=` don't reach the file: for a frame, the CSV options
-are `separator=` and `has_header=`. The same options work by their SQL names in `db.sql("SELECT *
-FROM read_csv('a.csv', delim => ';')")`.
-</Aside>
+`db.read_csv` takes its options by Polars' names (`separator=`, `has_header=`) or by SQL's
+(`delim=`, `header=`): `db.read_csv("a.csv", delim=";", header=True)`. If you give both, Polars' win.
 
 ## Module functions
 

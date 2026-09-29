@@ -3,7 +3,7 @@ title: Pondra
 description: A streamhouse in one binary. SQL, Python and streaming over a lake on your disk or in a bucket.
 template: splash
 hero:
-  tagline: One binary for streams, tables and SQL. Load data, keep views current as rows arrive, and query with SQL, Python or JavaScript, on your disk or in any bucket.
+  tagline: One binary for streams, tables and SQL, on one machine or many. Load data, keep views current as rows arrive, and query with SQL, Python or JavaScript, on your disk or in any bucket.
   actions:
     - text: Get started
       link: /pondra/start/install/
@@ -22,8 +22,38 @@ import { Card, CardGrid } from '@astrojs/starlight/components';
 Pondra is one program that takes in streams of rows, stores them as tables in a folder or a bucket
 (Parquet files plus a small catalog), and answers SQL. Materialized views, keyed tables and event-time
 windows keep results current as rows arrive, and other engines can read the tables as Delta Lake or
-Iceberg. Object storage is the only state, so there is no Kafka, Flink, Spark, JVM or metastore to run:
-start another copy on the same bucket and it joins the first.
+Iceberg. Object storage is the only state, so there is no Kafka, Flink, Spark, JVM or metastore to run.
+
+## Start with one machine, grow to many
+
+The same binary that runs on your laptop runs a cluster. Start another copy on the same bucket and it
+joins the first. There is nothing else to set up: the nodes find each other, and pick a leader,
+through the bucket.
+
+<CardGrid>
+  <Card title="Every node works" icon="rocket">
+    Every node takes writes and answers queries, and runs its share of the streaming tasks and of big
+    queries. Add read-only nodes for dashboards, as many as you like.
+  </Card>
+  <Card title="Queries spread when it pays" icon="random">
+    A big query runs on every node at once, each on its slice of the data, with the rows exchanged
+    between them. A node first weighs what spreading would move against the time it would save, so a
+    small query stays on one node.
+  </Card>
+  <Card title="A node can stop" icon="approve-check">
+    If the leader stops, another node takes over within seconds, and every write that was
+    acknowledged is kept. Tested by killing leaders during writes, and by crashing nodes at random
+    points.
+  </Card>
+  <Card title="Fast on one machine, too" icon="seti:rust">
+    Pondra is written in Rust on Apache DataFusion. On one 2-vCPU machine it ran TPC-H's 22 queries at
+    scale factor 10 from Parquet in 38.0 s, the fastest of the engines measured there (DuckDB: 39.8 s).
+    [Performance](/pondra/concepts/performance/)
+  </Card>
+</CardGrid>
+
+[Clusters](/pondra/guides/clusters/) shows how to start one, and [how Pondra
+works](/pondra/concepts/how-it-works/) explains why it needs no coordinator.
 
 ## What you can do
 
@@ -72,6 +102,14 @@ start another copy on the same bucket and it joins the first.
     Vector search, `ai_complete` and `ai_embed`, files in the lake, and an MCP server for agents.
     [AI and files](/pondra/guides/ai-and-files/)
   </Card>
+  <Card title="Work in the browser" icon="laptop">
+    Every node serves a console: SQL, Python and text cells, answers that stay live, and notebooks
+    saved in the lake. [The console](/pondra/start/console/)
+  </Card>
+  <Card title="Connect your tools" icon="setting">
+    dbt, DBeaver, Tableau, Metabase and Excel see a Postgres database, and a server holds many.
+    [dbt and BI tools](/pondra/guides/dbt-and-bi/), [A server of databases](/pondra/guides/server/)
+  </Card>
   <Card title="Use it from notebooks, and lock it down" icon="notes">
     Jupyter with `%%sql` cells, and read, write and admin tokens on every door.
     [Notebooks](/pondra/guides/notebooks/), [Security](/pondra/guides/security/)
@@ -90,9 +128,10 @@ For the common jobs, `pondra` takes the place of a stack:
 | **A metastore** (Hive, Polaris, Unity) | The catalog of tables | A catalog inside the bucket, and an Iceberg REST catalog on every node |
 | **ZooKeeper** | Picking a leader | A leader elected through the bucket |
 
-It is a prototype, and it replaces them for the common jobs, not all of them.
-[Pondra compared](/pondra/concepts/compared/) says where Spark, Flink, Fluss, DuckDB, Databricks and
-Snowflake are stronger.
+It replaces them for the common jobs, not all of them. Pondra is new: it has a large test suite
+(crashes, failovers and clients, on local disk and on object storage) and published benchmarks, but it
+hasn't run for years in production as they have. [Pondra compared](/pondra/concepts/compared/) says
+where Spark, Flink, Fluss, DuckDB, Databricks and Snowflake are stronger.
 
 ## Try it in 30 seconds
 

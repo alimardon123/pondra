@@ -64,8 +64,8 @@ How a record becomes a row:
 
 | The record | The row |
 |---|---|
-| a value that is a JSON object | its fields, by column name. A field the table does not have is dropped, and a column the object leaves out is null |
-| a value that is not a JSON object, or a field of the wrong type | refused, with `INVALID_RECORD` and the reason (`failed to parse "abc" as Int64`). Nothing of the batch is written |
+| a value that is a JSON object | its fields, by column name. A field the table does not have is dropped. A column the object leaves out takes its `DEFAULT`, or is null if it has none; an explicit `null` stays null |
+| a value that is not a JSON object, a field of the wrong type, or no value for a `NOT NULL` column | refused, with `INVALID_RECORD`, and the node logs the reason (`failed to parse "abc" as Int64`, `keyed.name is NOT NULL`). Nothing of the batch is written |
 | a table with a `_key` column | the record's key (as text) goes in `_key` |
 | a table with a `_timestamp` column | the record's timestamp goes in `_timestamp`, to the millisecond. A batch the producer marked as log-append time gets the time it arrived |
 | a table with a `_value` column | the record's value as it is, in any format. The record is not read as JSON. The other columns are null, except `_key` and `_timestamp` |
@@ -95,13 +95,13 @@ SELECT _key, _value FROM notes;
 
 ### Change data
 
-A value that is a Debezium change event is unwrapped, with or without Kafka Connect's
-`schema` and `payload` envelope. The `op` decides the row:
+A value that is a Debezium change event is unwrapped, with or without Kafka Connect's envelope: a
+`schema` and a `payload`, or a `payload` alone. The `op` decides the row:
 
 | `op` | Becomes |
 |---|---|
 | `c` (create), `r` (snapshot read), `u` (update) | an upsert of `after` |
-| `d` (delete) | a delete of `before`'s key, in a keyed table. A table without a key gets the `before` row appended, as it would any row |
+| `d` (delete) | a delete of `before`'s key, in a keyed table. A table without a key refuses the record (`INVALID_RECORD`, and the node logs why), because appending the `before` row would bring the deleted row back |
 | any other (a truncate) | skipped |
 
 A tombstone, a record whose value is null, deletes the row for its key in a keyed table. The key is a JSON object

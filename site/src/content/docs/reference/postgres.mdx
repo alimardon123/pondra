@@ -5,11 +5,16 @@ sidebar:
   order: 9
 ---
 
-import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+import { Tabs, TabItem } from '@astrojs/starlight/components';
 
 A node speaks the Postgres wire protocol on the address you give `--pg`. `psql`, drivers (psycopg,
 asyncpg, JDBC, Go, Node) and BI tools connect to it as they would to Postgres. Queries and writes
 run exactly as `POST /sql` runs them, so anything SQL does works here.
+
+The port also answers Postgres's catalog (`pg_catalog` and `information_schema`), so psql's `\dt`, `\d`,
+`\dv`, `\dn`, `\df`, `\l` and `\du` work, and so do SQLAlchemy's inspector, pgjdbc (DBeaver, DataGrip,
+Metabase), psqlODBC (Tableau, Excel) and dbt-postgres. [dbt and BI tools](/pondra/guides/dbt-and-bi/) has
+the settings.
 
 ```bash norun
 pondra serve --dir lake --pg 127.0.0.1:5432
@@ -20,7 +25,7 @@ pondra serve --dir lake --pg 127.0.0.1:5432
 | Setting | Value |
 |---|---|
 | host, port | the address of `--pg` |
-| database | any name. `SELECT current_database()` gives the lake's name |
+| database | any name on a node that serves one lake. `SELECT current_database()` gives the lake's name. Under [`pondra server`](/pondra/guides/server/), the database in the connection picks the lake |
 | user, password | with no tokens set, anything. With tokens, the user picks the role (`reader`, `writer` or `admin`) and the password is that role's token |
 | SSL | not offered yet: use `sslmode=disable`, or `prefer` |
 
@@ -54,7 +59,7 @@ psql "postgresql://reader:$READ_TOKEN@db.example.com:5432/lake"
 </Tabs>
 
 ```text
-CREATE 0
+CREATE TABLE
 INSERT 0 2
  item | total 
 ------+-------
@@ -74,6 +79,7 @@ sends them works, but there is no transaction to roll back.
 | a query | rows, as text or binary, whichever the client asks for |
 | `CREATE`, `ALTER`, `DROP`, `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `COPY … TO 'url'` | the same as over HTTP, answered with a command tag such as `INSERT 0 2` |
 | `CALL p(…)` | the procedure's rows, or `CALL`. What it prints comes as `NOTICE` messages, which psql shows |
+| `DO LANGUAGE python \| sql $$ … $$` | the block's rows, or the tag `DO`. What Python prints comes as `NOTICE` messages. It needs an admin, and Python needs a node started with `--python` |
 | `SET`, `RESET`, `BEGIN`, `START`, `COMMIT`, `END`, `ROLLBACK`, `DISCARD`, `DEALLOCATE`, `CLOSE` | accepted, and ignored |
 | `SHOW server_version`, `standard_conforming_strings`, `transaction_isolation`, `client_encoding` | a fixed answer |
 | `SHOW TABLES` | the lake's tables and views, and the `information_schema` views |
@@ -108,6 +114,30 @@ psql "postgresql://admin@localhost:5432/lake" -c "SHOW TABLES" -c "DESCRIBE orde
 (4 rows)
 ```
 
+## DO blocks
+
+`DO` runs a block of code once, as Postgres's does. The language is `python` or `sql`, before the
+code or after it. What Python prints comes back as `NOTICE` messages, and the command tag is `DO`.
+A block needs an admin, and Python needs a node started with `--python`. The connection inside it is
+`db`.
+
+```bash
+psql "postgresql://admin@localhost:5432/lake" <<'EOF'
+DO LANGUAGE python $$
+n = db.sql("SELECT count(*) FROM orders").item()
+print("orders:", n)
+$$;
+EOF
+```
+
+```text
+NOTICE:  orders: 4
+DO
+```
+
+See [Functions and procedures](/pondra/guides/functions-and-procedures/#run-code-once-do) for what a
+block can return, and how it fails.
+
 ## Parameters
 
 A driver's `$1`, `$2` (or `%s`) parameters are bound into the statement as literals: numbers as
@@ -138,14 +168,14 @@ A column comes to the client as the Postgres type closest to its type in the lak
 | `DOUBLE` | `float8` |
 | `DECIMAL(p, s)` | `numeric` |
 | `DATE` | `date` |
+| `TIME` | `time` |
 | `TIMESTAMP` | `timestamp`, in microseconds, without a time zone |
-| `BINARY` | `bytea` |
-| `VARCHAR`, and every other type (arrays, structs, `VARIANT`) | `varchar`, as text |
+| `TIMESTAMPTZ` | `timestamptz`: an instant, sent in UTC |
+| `BYTEA`, `BINARY`, `VARBINARY`, `BLOB` | `bytea` |
+| a list (`VARCHAR[]`, `INT[]`, `FLOAT[]`) | a Postgres array, in text and binary format: a `VARCHAR[]` column shows as `character varying[]` |
+| `VARCHAR`, and every other type (structs, `JSON`, `VARIANT`) | `varchar`, as text |
 
-<Aside type="caution">
-A `TIMESTAMPTZ` reaches the client as a `timestamp` with no zone, and an array or struct as its
-text. Cast in the query if a driver needs another type.
-</Aside>
+A struct reaches the client as its text. Cast in the query if a driver needs another type.
 
 ## COPY
 
@@ -172,7 +202,7 @@ cat orders.csv
 
 ```text
 COPY 2
-COPY 5
+COPY 4
 id,item
 1,tea
 2,cake
@@ -180,7 +210,8 @@ id,item
 4,scone
 ```
 
-The count after `COPY … TO` includes the header line: it says 5 for 4 rows.
+The count after `COPY … TO` is the number of rows: it says 4 for 4 rows, and the header line isn't
+counted.
 
 In Python, with psycopg:
 
@@ -197,9 +228,31 @@ with psycopg.connect("host=localhost port=5432 user=admin dbname=lake", autocomm
 
 ## The catalog
 
-Drivers look at a little of Postgres's catalog when they connect. Pondra answers for `pg_type`,
-`pg_class`, `pg_namespace`, `pg_attribute` and `pg_database`, and for `information_schema`, with the
-lake's tables, views and schemas. That is enough for the drivers below and for most BI tools.
+Drivers and tools look at Postgres's catalog when they connect and when you browse. Pondra answers
+`pg_catalog` (`pg_type`, `pg_class`, `pg_namespace`, `pg_attribute`, `pg_index`, `pg_constraint`,
+`pg_proc`, `pg_database`, `pg_roles` and the other tables they read) and `information_schema`, with the
+lake's tables, views, schemas, functions and keys. That is what psql's backslash commands, SQLAlchemy,
+JDBC, ODBC and dbt read:
+
+```bash
+psql "postgresql://admin@localhost:5432/lake" -c '\dt' -c '\d orders'
+```
+
+```text
+        List of relations
+ Schema |  Name  | Type  | Owner 
+--------+--------+-------+-------
+ public | orders | table | admin
+(1 row)
+
+                        Table "public.orders"
+ Column |            Type             | Collation | Nullable | Default 
+--------+-----------------------------+-----------+----------+---------
+ id     | bigint                      |           |          | 
+ item   | character varying           |           |          | 
+ amount | double precision            |           |          | 
+ ts     | timestamp without time zone |           |          | 
+```
 
 ```python
 with psycopg.connect("host=localhost port=5432 user=admin dbname=lake", autocommit=True) as conn:
@@ -216,16 +269,13 @@ These connect and query, run in this repository's tests or checked by hand:
 
 | Driver | Notes |
 |---|---|
-| `psql` | queries, `\copy`, `CALL`. Not `\dt`, `\d table` or `\l`: use `SHOW TABLES` and `DESCRIBE table` |
+| `psql` | queries, `\copy`, `CALL`, `DO`, and the backslash commands `\dt`, `\d`, `\dv`, `\dn`, `\df`, `\l` and `\du` |
 | psycopg 3 and psycopg 2 | `autocommit=True`; `cursor.copy` works |
 | asyncpg | queries and parameters |
 | ADBC (`adbc_driver_postgresql`) | Arrow results, through `COPY … TO STDOUT (FORMAT binary)` |
-| pandas | `pandas.read_sql` on a psycopg connection, or a SQLAlchemy engine on `postgresql+psycopg2` |
-
-<Aside type="caution">
-SQLAlchemy's `postgresql+psycopg` dialect (psycopg 3) fails on connect with
-`Invalid function 'to_regtype'`. Use `postgresql+psycopg2`, or pass a psycopg connection to pandas.
-</Aside>
+| SQLAlchemy (`postgresql+psycopg2` and `postgresql+psycopg`) | the inspector: schemas, tables, views, columns, primary keys; pandas' `to_sql` and `read_sql` |
+| pgjdbc, psqlODBC | catalog calls and queries: DBeaver, DataGrip, Metabase, Tableau and Excel connect through them |
+| dbt-postgres | seeds, models, snapshots and tests. See [dbt and BI tools](/pondra/guides/dbt-and-bi/) |
 
 ```python
 import adbc_driver_postgresql.dbapi as adbc

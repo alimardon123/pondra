@@ -23,7 +23,7 @@ read.
 |---|---|
 | read | run queries, look up keys, watch, live queries, read files, the Iceberg catalog |
 | write | also append rows, insert, put files, and write with `POST /sql` |
-| admin | also create tables, views, tasks and functions, run DDL (`CREATE`, `ALTER`, `DROP`, `COPY … TO`) in `POST /sql`, and tier |
+| admin | also create tables, views, tasks and functions, run DDL (`CREATE`, `ALTER`, `DROP`, `COPY … TO`) and `DO` blocks in `POST /sql`, and tier |
 
 A request without enough rights is answered `401` with `this needs a token with more rights`. Any
 other error is `500` with its message as plain text.
@@ -45,7 +45,7 @@ query) and `tables` are for clients that send frames and data along; the clients
 
 | Query parameter | Meaning |
 |---|---|
-| `format` | `json` (the default), `table` (a text table) or `arrow` (an Arrow IPC stream, for pandas, Polars and DuckDB) |
+| `format` | `json` (the default), `table` (a text table), `arrow` (an Arrow IPC stream, for pandas, Polars and DuckDB) or `typed` (below) |
 | `after` | wait until this node has seen this log segment (from an append's `seg`), for reading your own writes |
 | `spread` | `1` runs the query across the cluster even for small tables, `0` only here |
 | `stale_ms` | accept a remembered answer up to this many milliseconds old |
@@ -55,8 +55,14 @@ A query answers a JSON array of rows, one object each. A column that is null in 
 of its object. A statement that isn't a query answers a JSON object, such as `{"rows": 2}` or
 `{"table": "t", "publish": []}`. Several statements in one request run in order.
 
-The header `x-pondra-notices` on an answer carries what procedures printed, as a JSON list of
-lines. Send `x-pondra-session: <id>` to use temporary tables that only that id sees.
+`format=typed` is what [the console](/pondra/start/console/) uses: `{"columns": [{"name", "type"}],
+"rows": [[…], …], "total": N}`. Each row is a list in the columns' order, so two columns may share a
+name (a join's). It holds the first 10,000 rows, and `total` says how many there were. Decimals come
+as text with all their digits (`"1.50"`), and so do integers past 2^53, which JavaScript can't hold
+exactly.
+
+The header `x-pondra-notices` on an answer carries what procedures and `DO` blocks printed, as a
+JSON list of lines. Send `x-pondra-session: <id>` to use temporary tables that only that id sees.
 
 ```bash
 curl -s -X POST http://localhost:8080/sql -d "CREATE TABLE events (user VARCHAR, amount BIGINT)"
@@ -88,10 +94,11 @@ curl -s -X POST 'http://localhost:8080/sql?format=table' -d "SELECT * FROM event
 
 `POST /append/{table}?producer=NAME&seq=N[&prev=M]`: the body is newline-delimited JSON, one row
 per line, or an Arrow IPC stream with `Content-Type: application/vnd.apache.arrow.stream`. A
-column left out is null. `producer` names the writer and `seq` counts its appends, so a retry with
-the same `producer` and `seq` is recognised and not applied twice. `prev` is a compare-and-swap:
-the append applies only if the producer's last `seq` is `prev`. Count from 1: a `seq` of 0 or less
-counts as already applied, so its rows are not written. The answer is:
+column left out takes its `DEFAULT`, or null. `producer` names the writer and `seq` counts its
+appends, from 1, so a retry with the same `producer` and `seq` is recognised and not applied twice.
+`prev` is a compare-and-swap: the append applies only if the producer's last `seq` is `prev`.
+Without `producer`, an append is applied each time it is sent (at least once), as a Kafka
+producer that isn't idempotent. The answer is:
 
 | Field | Meaning |
 |---|---|
@@ -243,8 +250,9 @@ token is refused.
 | `GET /metrics` | read | Prometheus metrics, as text |
 | `POST /tier` | admin | write the log into Parquet now: `{"rows_tiered": N}` |
 | `DELETE /sessions/{id}` | read | end a session's temporary tables and views: `{"ended": true}` |
+| `GET /` | none | [the console](/pondra/start/console/): a web page, with no data in it until you use it |
 
-`GET /stats` needs no token, so a load balancer can poll it. It answers `role` (`leader`,
+`GET /stats` needs no token, so a load balancer can poll it. It answers `lake` (its name), `role` (`leader`,
 `follower` or `reader`), `leader` (its address), `term`, `nodes`, `hwm` (the newest commit),
 `shard_runs`, `python_workers` and `live_queries`. On the leader it also has `untiered_rows`,
 `commits`, `commit_ms_p50` and `commit_ms_p95`.
@@ -256,12 +264,25 @@ curl -s -X POST http://localhost:8080/tier
 ```
 
 ```text
-{"role":"leader","leader":"127.0.0.1:8080","term":1,"nodes":["127.0.0.1:8080"],"hwm":7,"shard_runs":1,"python_workers":0,"live_queries":0,"untiered_rows":0,"commits":9,"commit_ms_p50":1.69,"commit_ms_p95":2.98}
+{"lake":"lake","role":"leader","leader":"127.0.0.1:8080","term":1,"nodes":["127.0.0.1:8080"],"hwm":7,"shard_runs":1,"python_workers":0,"live_queries":0,"untiered_rows":0,"commits":9,"commit_ms_p50":1.69,"commit_ms_p95":2.98}
 # HELP pondra_role 1 for this node's role
 # TYPE pondra_role gauge
 pondra_role{role="leader"} 1
 {"rows_tiered":0}
 ```
+
+## pondra server
+
+[`pondra server`](/pondra/guides/server/) answers on one port for every database in its folder:
+
+| Method and path | Role | Meaning |
+|---|---|---|
+| `/db/{name}/…` | as on a node | database `name`'s whole API: `POST /db/sales/sql`, `GET /db/sales/stats`, … |
+| any other path | as on a node | the default database's (`--default`) |
+| `GET /databases` | read | the databases: `[{"name", "running", "default"}]` |
+| `POST /databases` | admin | make one: `{"name": "hr"}`, as `CREATE DATABASE hr` |
+| `DELETE /databases/{name}` | admin | drop one, folder and all, as `DROP DATABASE`; `?if_exists=true` is quiet about one that isn't there |
+| `GET /` | none | the console, listing every database |
 
 ## Other doors on the same port
 

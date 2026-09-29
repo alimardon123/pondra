@@ -148,7 +148,7 @@ outcome. The same goes for a `.sql` file, with `$name` parameters filled from th
     CREATE OR REPLACE VIEW day_totals AS SELECT date_trunc('day', ts) AS day, sum(amount) AS total FROM orders GROUP BY 1;
     SELECT * FROM day_totals WHERE total >= $min ORDER BY day;
     SQL
-    pondra run --url http://localhost:8080 daily.sql lake --min 12
+    pondra run daily.sql --url http://localhost:8080 --min 12
     ```
 
     ```text
@@ -162,8 +162,8 @@ outcome. The same goes for a `.sql` file, with `$name` parameters filled from th
 </Tabs>
 
 `db.run` also takes the name of a `.sql` file, and in JavaScript `db.run("daily.sql", { min: 12 })` does
-the same. `pondra run` without `--url` starts a node on the lake for the run; the
-[shell page](/pondra/start/shell/) has its options.
+the same. `pondra run daily.sql lake --min 12` starts a node on the lake for the run instead; give a
+lake or `--url`, not both. The [shell page](/pondra/start/shell/) has its options.
 
 ## Get the answer as rows, a DataFrame or Arrow
 

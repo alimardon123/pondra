@@ -71,7 +71,8 @@ roles()
 
 Every node takes writes, so point producers and clients at any of them, or at a name that reaches
 all. A follower does the work of the write and the leader only records where it went. A write is
-visible on every node a few milliseconds after it is acknowledged.
+visible on every node a few milliseconds after it is acknowledged, and a follower shows its own
+client's writes at once: a `SELECT` after an `INSERT` on the same node sees the row.
 
 ```python
 import pondra
@@ -198,8 +199,7 @@ alive[1].sql("INSERT INTO events VALUES (30002, 'u2', 3.0)")
 [30002, 30002]
 ```
 
-A reader keeps reading the old leader's view for several seconds after a failover, so for those
-seconds it doesn't show the newest writes. Read from a follower when you need the latest.
+A reader node follows the new leader within about a second after a failover.
 
 Stop what is left when you're done:
 
@@ -213,6 +213,9 @@ kill $(cat cluster/node2.pid cluster/node3.pid cluster/reader.pid)
   (`--attach sales=s3://my-bucket/sales`, or `ATTACH` in SQL), which is how one lake's commit
   rate is split over several. A write to `sales.orders` is recorded by that lake's leader. See
   [tables](/pondra/guides/tables/).
+- **Many lakes on one machine** can share a port with [`pondra server`](/pondra/guides/server/), which
+  serves a folder of lakes as databases. Each database can lead a cluster of its own
+  ([clusters behind the server](/pondra/guides/server/#clusters-behind-the-server)).
 - **Laptops** can join with `pondra serve` or `--reader` and leave again. After a full shutdown the
   first node started leads at once.
 - **Streaming tasks** with `shards` are dealt to the live nodes, and move when membership changes

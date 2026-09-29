@@ -1,0 +1,167 @@
+---
+title: A server of databases
+description: pondra server serves every lake in a folder as a database. Postgres clients pick one by name, HTTP clients by /db/name, and each starts when first used.
+sidebar:
+  order: 17
+---
+
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+
+`pondra server` serves a folder of lakes, one database per lake, behind one HTTP port and one
+Postgres port. A Postgres client picks a database by name (`psql -d sales`), as it would on
+Postgres. An HTTP client adds `/db/sales` to its URL. Use it when one machine holds several lakes
+and you don't want a port, a process and a service for each.
+
+```bash norun
+pondra server data --addr 0.0.0.0:8080 --pg 0.0.0.0:5432 --admin-token "$TOKEN"
+```
+
+Each lake in `data` (`data/sales`, `data/crm`, …) is a database. The console at
+`http://host:8080/` lists them all.
+
+## Try it
+
+Make two lakes in a folder, serve the folder, and ask one database about the other:
+
+```bash
+pondra sql --dir data/sales "CREATE TABLE orders AS SELECT 1 AS id, 10.5 AS amount UNION ALL SELECT 2, 20.0"
+pondra sql --dir data/crm "CREATE TABLE customers AS SELECT 1 AS id, 'ann' AS name UNION ALL SELECT 2, 'bob'"
+
+pondra server data --addr 127.0.0.1:8088 &
+until curl -s 127.0.0.1:8088/databases > /dev/null; do sleep 0.2; done
+
+curl -s 127.0.0.1:8088/databases
+curl -s 127.0.0.1:8088/db/sales/sql -d "SELECT c.name, o.amount FROM orders o JOIN crm.customers c ON c.id = o.id ORDER BY o.id"
+kill %1
+```
+
+```text
+[{"name":"crm","running":false,"default":false},{"name":"sales","running":false,"default":false}]
+[{"name":"ann","amount":10.5},{"name":"bob","amount":20.0}]
+```
+
+Neither database ran until the query named `sales`. Open `http://127.0.0.1:8088/` while the server
+runs and the console lists both.
+
+## How it works
+
+The server holds no lake itself. Each database runs as a node of its own, a `pondra serve` that
+the server starts as a child process the first time a connection or a request names it. The server
+passes that database's traffic through to its node:
+
+- Postgres connections by the database in their startup message;
+- HTTP requests under `/db/{name}/…`, which is that database's whole API.
+
+A database that nobody has used for `PONDRA_DATABASE_IDLE_SECS` (600 seconds) and that has nothing
+left to tier stops. The next query starts it again: on a local disk here the first answer took
+about 70 ms, and the ones after it about 1 ms. So a database nobody uses costs nothing, and each one
+keeps everything a node does: leading its cluster, tiering, views, tasks and recovery after a
+crash.
+
+## Connect
+
+<Tabs syncKey="lang">
+  <TabItem label="Python">
+    ```python norun
+    import pondra
+
+    sales = pondra.connect("http://host:8080/db/sales", token=TOKEN)
+    sales.sql("SELECT sum(amount) FROM orders").item()
+    ```
+  </TabItem>
+  <TabItem label="JavaScript">
+    ```js norun
+    import { connect } from "pondra";
+
+    const sales = connect("http://host:8080/db/sales", { token: TOKEN });
+    console.log(await sales.sql("SELECT sum(amount) AS total FROM orders"));
+    ```
+  </TabItem>
+  <TabItem label="Shell">
+    ```bash norun
+    curl -H "Authorization: Bearer $TOKEN" host:8080/db/sales/sql -d 'SELECT sum(amount) FROM orders'
+    ```
+  </TabItem>
+  <TabItem label="psql">
+    ```bash norun
+    PGPASSWORD="$TOKEN" psql -h host -p 5432 -U admin -d sales
+    ```
+  </TabItem>
+</Tabs>
+
+- A request without `/db/` goes to the default database: `--default`, else `lake`, else the only
+  one. So a client written for `pondra serve` works unchanged.
+- The Postgres user says which token the password is (`admin`, `writer`, or any other name for the
+  read token), as on [`pondra serve`](/pondra/reference/postgres/).
+- An unknown database is an error with Postgres's own code (`3D000`, `database "nope" does not
+  exist`), so tools report it the usual way.
+
+## Make and drop databases
+
+From any database, in SQL:
+
+```sql norun
+CREATE DATABASE hr;
+DROP DATABASE hr;
+```
+
+- `CREATE DATABASE hr` makes the lake `data/hr` and serves it. `POST /databases` with
+  `{"name": "hr"}` does the same over HTTP, and the console's **+** does it too.
+- `DROP DATABASE hr` stops its node and deletes its folder, as Postgres drops a database's files. It
+  needs an admin token, and you run it from another database, as in Postgres. `DROP DATABASE IF
+  EXISTS` is quiet about one that isn't there. On a node that `pondra serve` started, there is no
+  server to drop it from, so it says to use `DETACH` instead.
+- `GET /databases` lists them, with whether each is running and which is the default:
+
+```json
+[{"name": "crm", "running": false, "default": false}, {"name": "sales", "running": true, "default": true}]
+```
+
+## Query across databases
+
+Every database sees the others as `name.schema.table`, so one query can join them:
+
+```sql norun
+SELECT c.name, sum(o.amount) AS spent
+FROM orders o
+JOIN crm.customers c ON c.id = o.customer_id
+GROUP BY c.name;
+```
+
+The query runs on the node of the database you are connected to, and reads the other lake's files
+directly. No data moves between nodes first.
+
+## Clusters behind the server
+
+A database's node can lead a cluster. It advertises itself as `host:8080/db/sales`, so a node on
+another machine joins that database's cluster through the server:
+
+```bash norun
+pondra serve --dir /shared/data/sales --addr 10.0.0.6:8080
+```
+
+For a lake in a bucket, run `pondra serve --dir s3://bucket/sales` on as many machines as you like;
+[Clusters](/pondra/guides/clusters/) explains how the nodes share the work.
+
+## Options
+
+| Option | What it does |
+|---|---|
+| `FOLDER` | The folder of lakes (default `.`). Each subfolder that holds a lake is a database. |
+| `--addr` | Where HTTP clients, the console and other nodes reach the server (default `127.0.0.1:8080`) |
+| `--pg` | Speak the Postgres protocol here, such as `0.0.0.0:5432` |
+| `--default` | The database a client that names none gets (default `lake`, else the only one) |
+| `--read-token`, `--write-token`, `--admin-token` | Tokens, as `pondra serve` takes them. Every database's node gets them |
+| `--python` | Python for functions, procedures and the console's Python cells, as `pondra serve --python` |
+| `--tier-secs` | Each database's `--tier-secs` |
+
+`PONDRA_DATABASE_IDLE_SECS` sets how long an unused database runs (600 seconds by default).
+
+<Aside type="caution" title="What stays with pondra serve">
+- **Flight and Kafka ports.** A Flight or Kafka port means one lake, so the server refuses
+  `--flight` and `--kafka`. Serve a lake that needs them with `pondra serve`.
+- **A folder in a bucket.** The server's folder is on this machine's disk. For lakes in a bucket,
+  start a `pondra serve` per lake.
+- **TLS.** Neither port speaks TLS yet. Put the server behind a proxy that does, or keep it on a
+  private network.
+</Aside>

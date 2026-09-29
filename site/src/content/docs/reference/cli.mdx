@@ -1,6 +1,6 @@
 ---
 title: Command line
-description: The pondra command, its SQL shell, and every serve, sql, run and catalog option with its default.
+description: The pondra command, its SQL shell, and every serve, server, sql, run and catalog option with its default.
 sidebar:
   order: 14
 ---
@@ -8,18 +8,18 @@ sidebar:
 import { Aside } from '@astrojs/starlight/components';
 
 `pondra` is one binary. On its own it opens a SQL shell on a lake. `pondra serve` runs a node,
-`pondra sql` and `pondra run` run SQL, and `pondra catalog` prints what the lake's catalog holds.
+`pondra server` serves a folder of lakes as databases, `pondra sql` and `pondra run` run SQL, and
+`pondra catalog` prints what the lake's catalog holds.
 
 | Command | Does |
 |---|---|
 | `pondra [LAKE]` | a SQL shell on a lake (`./lake` if you name none) |
 | `pondra serve --dir LAKE` | run a node |
+| `pondra server [FOLDER]` | serve every lake in a folder as a database |
 | `pondra sql --dir LAKE "SQL"` | run one statement against the lake, with no server |
 | `pondra run FILE LAKE` | run a SQL file, its `$name` parameters taking the values you pass |
 | `pondra catalog --dir LAKE PREFIX` | print catalog entries |
 | `pondra --version`, `pondra --help` | the version, and help for any command |
-
-`pondra server` is coming in version 0.26.
 
 A lake is a folder or an object-store prefix (`s3://bucket/prefix`). Credentials and the endpoint
 come from the `AWS_*` environment variables: see [environment](/pondra/reference/environment/).
@@ -78,7 +78,8 @@ The second line starts a second node on the same lake. It follows the first.
 | Flag | Default | Meaning |
 |---|---|---|
 | `--dir DIR` | required | the lake: a folder, or `s3://bucket/prefix` (credentials and endpoint from the `AWS_*` variables) |
-| `--addr ADDR` | `127.0.0.1:8080` | the address other nodes reach this one at. It is also the address the HTTP API listens on |
+| `--addr ADDR` | `127.0.0.1:8080` | the address the HTTP API and [the console](/pondra/start/console/) listen on, and other nodes reach this one at |
+| `--advertise ADDR` | `--addr` | the address other nodes reach this one at, when it isn't `--addr`: behind `pondra server`, `host:port/db/name` |
 | `--reader` | off | a read-only node: SQL only, never leads. Any number can run beside the writer |
 | `--python PYTHON` | none | run Python functions and procedures (`LANGUAGE python`) with this Python, which has the `pondra` package and pyarrow. `auto` takes the first one found. Routines run on warm workers beside the node, gone after a minute idle |
 | `--stop-with-stdin` | off | stop, as on Ctrl-C, when standard input closes: when the program that started the node ends, however it ends |
@@ -151,6 +152,30 @@ pondra serve --dir s3://my-bucket/lake --addr 10.0.0.5:8080 \
   --pg 0.0.0.0:5432 --kafka 0.0.0.0:9092 --kafka-advertise 10.0.0.5:9092 --flight 0.0.0.0:8815 \
   --ack replicated --attach sales=s3://my-bucket/sales
 ```
+
+## pondra server
+
+`pondra server FOLDER` serves every lake in the folder as a database, behind one HTTP port and one
+Postgres port. Postgres clients pick a database by name, HTTP clients add `/db/{name}` to the URL,
+and the console at `/` lists them all. Each database runs as a node of its own, started when first
+used and stopped when idle. See [A server of databases](/pondra/guides/server/).
+
+```bash norun
+pondra server data --addr 0.0.0.0:8080 --pg 0.0.0.0:5432
+```
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `FOLDER` | `.` | the folder of lakes, on this machine: each subfolder that holds one is a database |
+| `--addr ADDR` | `127.0.0.1:8080` | where HTTP clients, the console and other nodes reach the server |
+| `--pg ADDR` | off | speak the Postgres protocol here, such as `0.0.0.0:5432` |
+| `--default NAME` | `lake`, else the only one | the database for a client that names none (HTTP without `/db/`, Postgres without a database) |
+| `--read-token`, `--write-token`, `--admin-token` | none | tokens, as `pondra serve` takes them (and `PONDRA_*_TOKEN`): every database's node gets them |
+| `--python PYTHON` | none | Python for functions, procedures and the console's Python cells, as `pondra serve --python` |
+| `--tier-secs SECS` | `10` | each database's `--tier-secs` |
+
+`PONDRA_DATABASE_IDLE_SECS` (600) is how long a database's node runs with nothing to do. The server
+refuses `--flight` and `--kafka`: those ports mean one lake, so serve such a lake with `pondra serve`.
 
 ## pondra sql
 

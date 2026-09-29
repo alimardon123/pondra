@@ -68,7 +68,7 @@ message names the SQL that does it:
 | `DELETE /v1/namespaces/{ns}` | `DROP SCHEMA` |
 | `POST /v1/namespaces/{ns}/tables` | `CREATE TABLE … WITH (publish = 'iceberg')` |
 | `DELETE /v1/namespaces/{ns}/tables/{table}` | `DROP TABLE` |
-| `POST /v1/tables/rename` | `ALTER TABLE … RENAME` |
+| `POST /v1/tables/rename` | `ALTER TABLE … RENAME TO` |
 | `POST /v1/transactions/commit` | a change to several tables at once |
 
 Errors come in the REST API's shape, `{"error": {"message": …, "type": …, "code": …}}`. A client
@@ -112,8 +112,9 @@ print(table.scan().to_arrow().sort_by("id").to_pydict())
 {'id': [1, 2], 'kind': ['view', 'buy'], 'amount': [0.0, 9.5]}
 ```
 
-A table is Iceberg format 2. Its Parquet files carry no Iceberg field ids, so the table's columns
-are mapped by name.
+A table is Iceberg format 2. Its Parquet files carry Iceberg field ids, so readers that need them, such
+as Polars' `scan_iceberg`, read the table too. After `ALTER TABLE … RENAME TO`, the catalog lists the
+table under its new name.
 
 ## Appending
 

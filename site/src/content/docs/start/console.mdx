@@ -1,0 +1,174 @@
+---
+title: The console
+description: A web page for SQL, Python and notes that every Pondra node serves at /. Tables on the left, cells on the right, notebooks saved in the lake.
+sidebar:
+  order: 5
+setup: |
+  CREATE TABLE sales (day DATE, item VARCHAR, region VARCHAR, amount DOUBLE);
+  INSERT INTO sales VALUES (DATE '2026-09-27', 'tea', 'eu', 7.0), (DATE '2026-09-27', 'cake', 'us', 4.5), (DATE '2026-09-28', 'tea', 'us', 3.5);
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Every Pondra node serves a console at `/`. Open the node's address in a browser and you get the
+lake's tables on the left and notebook cells on the right: SQL, Python and text. There is nothing
+to install. The page is part of the `pondra` binary, it works offline, and it sends requests only
+to the node that served it.
+
+![The console: the lake's tables on the left; a text cell, a SQL cell with its answer, and a Python cell with what it printed and the rows it returned.](../../../assets/console.png)
+
+## Open it
+
+Start a node and open its address:
+
+```bash norun
+pondra serve --dir lake        # then open http://localhost:8080
+```
+
+- **The shell** starts a node too. Its first line says where: `Pondra 0.26.0 on lake, also at
+  http://127.0.0.1:37957`. Open that address while the shell runs.
+- **`pondra server`** serves a folder of lakes, and its console lists every database. See
+  [A server of databases](/pondra/guides/server/).
+- **On another machine**, start the node with tokens (`--admin-token`, see
+  [Security](/pondra/guides/security/)). The console asks for a token the first time, and your browser
+  keeps it.
+
+## SQL cells
+
+Type SQL and press **Ctrl+Enter** (**⌘+Enter** on a Mac). The answer shows below the cell: the rows,
+each column's type, how many rows there are, and how long it took.
+
+```sql
+SELECT item, count(*) AS sales, sum(amount) AS total
+FROM sales
+GROUP BY item
+ORDER BY total DESC;
+```
+
+- A cell may hold several statements. They run in order, and the cell shows the last one's answer.
+- A statement that changes something (`INSERT`, `CREATE TABLE`) shows what it did, such as
+  `rows 3`, and the tables on the left update.
+- Errors come back in plain words, such as `No field named nope. Did you mean 'sales.item'?`.
+- The console shows the first 10,000 rows of an answer, and the **CSV** button saves them. To export
+  more, use [`COPY … TO`](/pondra/guides/files-and-other-lakes/).
+- Decimals keep their digits (`1.50`), and integers too big for JavaScript arrive as text, so what
+  you see is exactly what the lake holds.
+
+Click a table on the left to see its first 100 rows in a new cell. Click a column to put its name
+where you are typing.
+
+## Python cells
+
+A Python cell runs on the node, next to the data. `db` is the connection. What the code prints shows
+under the cell, and its last line, if it is an expression, comes back as rows: a
+[frame](/pondra/guides/dataframes/), a pandas or Polars DataFrame, an Arrow table, a list of dicts,
+or one value.
+
+```python cell
+by_region = db.table("sales").group_by("region").agg(pondra.col("amount").sum().alias("total"))
+print("regions:", len(by_region.rows()))
+by_region.sort("total", descending=True)
+```
+
+The node runs a Python cell as Postgres's anonymous code block, `DO LANGUAGE python`. You can send
+the same block from psql or any client:
+
+```sql
+DO LANGUAGE python $$
+print("tea sold:", db.sql("SELECT count(*) FROM sales WHERE item = 'tea'").item())
+$$;
+```
+
+- The node needs Python: start it with `--python auto` (the Python that has the `pondra` package) or
+  `--python /path/to/python`. `pondra.local()` does this for you.
+- A Python cell needs an admin token, since it runs code on the node. With no tokens set, the node
+  listens only on `127.0.0.1`, and anyone who can reach it is its admin.
+- Each cell runs on its own, so a variable made in one cell isn't there in the next. Keep what later
+  cells need in a table. A [temporary table](/pondra/guides/change-rows/) is the page's own and goes
+  when you close it.
+- A Python error names its line in the cell: `ZeroDivisionError: division by zero, line 2: 1 / 0`.
+
+## Text cells
+
+Text cells hold Markdown: headings, lists, **bold**, *italics*, `code`, links and code blocks. Press
+**Shift+Enter** to show the text, and double-click it to edit.
+
+## Live answers
+
+A SQL cell's **Live** switch keeps its answer current. The node sends the answer again each time a
+commit changes a table the query reads, and the console redraws it. Nothing runs while nothing
+changes. Turn the switch off and the query stops.
+
+```sql
+SELECT region, sum(amount) AS total FROM sales GROUP BY region ORDER BY region;
+```
+
+With **Live** on, an `INSERT` into `sales` from anywhere (another cell, psql, a Kafka producer, a
+program appending over HTTP) shows in the cell within a fraction of a second. The console uses
+[`/live`](/pondra/guides/query/), which any HTTP client can use too.
+
+## Notebooks
+
+**Ctrl+S** saves the notebook in the lake, under the name at the top of the page:
+
+- Each save is a new version, `files/notebooks/<name>/<time>.ipynb`. A file in the lake is never
+  replaced, so every version stays.
+- The **Notebooks** list on the left opens the latest version, and the arrow beside a notebook lists
+  every version.
+- Everyone who can read the lake can open them. They are files like any other, so you can list them
+  in SQL:
+
+```sql
+SELECT path, size, written FROM files('notebooks/') ORDER BY written DESC;
+```
+
+A notebook is a Jupyter notebook (`.ipynb`, format 4.5). SQL cells are saved as `%%sql` cells,
+Python cells as code cells, and text as Markdown. Each answer is kept with its cell (the first 100
+rows) and shown, marked **saved**, until you run the cell again.
+
+- **Download** saves the notebook to your computer. Jupyter, VS Code and GitHub open it as it is. In
+  Jupyter, `%load_ext pondra` makes the `%%sql` cells run (see [Notebooks](/pondra/guides/notebooks/)).
+- **Upload** opens an `.ipynb` from your computer, from Jupyter or anywhere else. **Ctrl+S** then
+  keeps it in the lake.
+
+## Keys
+
+The console follows Jupyter's keys. In a cell:
+
+| Keys | What they do |
+|---|---|
+| **Ctrl+Enter** | Run the cell |
+| **Shift+Enter** | Run it, then go to the next cell (a new one at the end) |
+| **Alt+Enter** | Run it, then add a cell below |
+| **Ctrl+Shift+Enter** | Run every cell, in order (it stops at one that fails) |
+| **Tab**, **Shift+Tab** | Indent, and back |
+| **Esc** | Leave the cell, for the keys below |
+
+After **Esc**, on the selected cell:
+
+| Keys | What they do |
+|---|---|
+| **Enter** | Edit it |
+| **↑** **↓** (or **K** **J**) | Go to the cell above or below |
+| **A**, **B** | Add a cell above, below |
+| **D D** | Delete it. **Z** brings it back |
+| **S**, **P**, **M** | Make it SQL, Python or text |
+| **L** | Turn Live on or off |
+| **?** | Show these keys |
+
+**Ctrl+S** saves from anywhere on the page.
+
+## The cluster at a glance
+
+The top of the page says where the cells run: the database, this node's role (leader, follower or
+reader), how many nodes the lake's cluster has, and how many live queries are open. Hover over it for
+the nodes' addresses. A query the node spreads over the cluster runs from the console like any
+other: see [Clusters](/pondra/guides/clusters/).
+
+The page follows your system's light or dark setting.
+
+<Aside type="caution" title="Not in the console yet">
+- Completion of table and column names as you type.
+- Charts. For now, a Python cell can return rows, and the CSV button hands them to a chart tool.
+- Python cells that share variables. Each runs as its own `DO` block on the node.
+</Aside>

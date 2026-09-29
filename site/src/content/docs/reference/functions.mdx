@@ -14,7 +14,8 @@ yourself, see [`CREATE FUNCTION`](/pondra/reference/sql/#functions-procedures-an
 
 ## JSON
 
-A JSON document is a `VARCHAR` column. Each function takes the document, then a path: keys for
+A JSON document is a `VARCHAR` column, or a `JSON` (or `VARIANT`) column, which holds JSON text.
+Each function takes the document, then a path: keys for
 objects and positions for arrays. A path that isn't there gives `NULL`.
 
 | Function | Returns |
@@ -129,8 +130,8 @@ stored under `files/`, and a path that exists can't be written again.
 | Function | Returns |
 |---|---|
 | `files()` | a table of every file: `path`, `size`, `written` |
-| `files('files/dir/')` | the same, for the paths that start with the prefix |
-| `file_read(path)` | the file's bytes as `BINARY`, or `NULL` if there is no such file |
+| `files('dir/')` | the same, for the paths that start with the prefix. `files('files/dir/')` is the same |
+| `file_read(path)` | the file's bytes as `BINARY`, or `NULL` if there is no such file. `file_read('files/dir/a.txt')` is the same as `file_read('dir/a.txt')` |
 | `byte_length(bytes)` | the number of bytes in a `BINARY` value, as a `BIGINT` |
 
 ```bash
@@ -139,7 +140,7 @@ curl -s -X PUT http://localhost:8080/files/docs/hello.txt --data-binary 'hello w
 
 ```sql
 SELECT path, size, byte_length(file_read(path)) AS bytes, CAST(file_read(path) AS VARCHAR) AS text
-FROM files('files/docs/');
+FROM files('docs/');
 ```
 
 ```text
@@ -147,16 +148,18 @@ path                  size  bytes  text
 files/docs/hello.txt  11    11     hello world
 ```
 
-The prefix is the path in the lake, so it starts with `files/`. `files('docs/')` finds nothing.
+A file's `path` in the answer starts with `files/`, the folder it is kept in. A prefix or a path you give
+may start with `files/` or not.
 
 ## Binary data
 
-A `BINARY` value is what `file_read` gives, and what a `BINARY` column holds. These functions
-take it:
+A `BINARY` value is what `file_read` gives, and what a `BINARY` column holds (`BYTEA`, `VARBINARY`
+and `BLOB` are the same type). These functions take it:
 
 | Function | Returns |
 |---|---|
 | `byte_length(b)` | the number of bytes |
+| `substr(b, start, len)`, `substring(b FROM start FOR len)` | that part of the bytes, counting from 1 |
 | `sha256(b)` | the SHA-256 digest, as `BINARY` |
 | `md5(b)` | the MD5 digest, as hex text |
 | `encode(b, 'hex' \| 'base64' \| 'base64pad')` | the bytes as text |
@@ -173,9 +176,20 @@ md5                               sha256
 5eb63bbbe01eeed093cb22bb8f5acdc3  b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9
 ```
 
+```sql
+SELECT CAST(substr(file_read(path), 1, 5) AS VARCHAR) AS word, byte_length(substring(file_read(path) FROM 7)) AS rest
+FROM files('files/docs/');
+```
+
+```text
+word   rest
+hello  5
+```
+
 <Aside type="caution">
-`BINARY` isn't a type you can name in `CREATE TABLE` or `CAST`, and string functions such as
-`substr` don't take it. `CAST(b AS VARCHAR)` first, then use the string function.
+`CAST(x AS BYTEA)` makes bytes. `BINARY`, `VARBINARY` and `BLOB` name a column's type in `CREATE
+TABLE`, but a `CAST` takes only `BYTEA`. Other string functions don't take bytes: `CAST(b AS VARCHAR)`
+first, then use the string function.
 </Aside>
 
 ## Files outside the lake
@@ -273,10 +287,10 @@ A function can also run in a process of your own, as an Arrow Flight server: Pon
 rows as one batch, and reads one column back. Register it with `POST /functions/<name>`, with the
 server's address, the argument types and the return type. `GET /functions` lists them, and
 `DELETE /functions/<name>` takes one away. The definition is kept in the lake, so every node has
-the function, within a second of your `POST`.
+the function as soon as your `POST` is answered, and loses it as soon as you `DELETE` it.
 
 ```python
-import json, threading, time, urllib.request
+import json, threading, urllib.request
 import pyarrow as pa
 import pyarrow.flight as fl
 
@@ -293,7 +307,6 @@ threading.Thread(target=server.serve, daemon=True).start()
 body = {"flight": f"http://127.0.0.1:{server.port}", "args": ["Utf8"], "returns": "Utf8"}
 urllib.request.urlopen(urllib.request.Request("http://localhost:8080/functions/shout", data=json.dumps(body).encode(), method="POST"))
 
-time.sleep(1.1)   # a node re-reads its function list once a second
 db = pondra.connect("http://localhost:8080")
 print(db.sql("SELECT shout('tea') AS s").rows())
 ```

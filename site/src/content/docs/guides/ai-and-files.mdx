@@ -110,10 +110,11 @@ hello
 ```
 
 `files('prefix')` lists what is there, and `file_read(path)` gives one file's bytes as a `BINARY`
-value. The prefix is the path in the lake, so it starts with `files/`.
+value. A prefix or path may start with `files/`, the folder the lake keeps files in, or leave it out:
+`files('docs/')` and `files('files/docs/')` list the same files.
 
 ```sql
-SELECT path, size FROM files('files/docs/') ORDER BY path;
+SELECT path, size FROM files('docs/') ORDER BY path;
 ```
 
 ```text
@@ -122,8 +123,8 @@ files/docs/hello.txt  5
 files/docs/notes.txt  21
 ```
 
-Keep a table of your files, and work with the bytes in SQL. `byte_length`, `sha256`, `md5`, `encode`
-and `decode` take bytes, and `CAST(bytes AS VARCHAR)` reads them as text:
+Keep a table of your files, and work with the bytes in SQL. `byte_length`, `substr`, `sha256`, `md5`,
+`encode` and `decode` take bytes, and `CAST(bytes AS VARCHAR)` reads them as text:
 
 ```sql
 CREATE TABLE documents AS
@@ -139,8 +140,8 @@ files/docs/hello.txt  5      hello
 files/docs/notes.txt  21     a second, longer file
 ```
 
-To keep bytes in a column of their own, declare it `BYTEA` and fill it with `file_read`, `decode`,
-or a `bytes` value from Python:
+To keep bytes in a column of their own, declare it `BYTEA` (`BINARY`, `VARBINARY` and `BLOB` mean the
+same) and fill it with `file_read`, `decode`, or a `bytes` value from Python:
 
 ```sql
 CREATE TABLE blobs (id BIGINT, raw BYTEA);
@@ -154,11 +155,10 @@ id  n
 ```
 
 <Aside type="caution">
-A path that exists can't be written again: `PUT` returns an error, so upload a new version under a new
-name. `file_read` of a path that isn't there is `NULL`, and `files('docs/')` without the `files/`
-finds nothing. `file_read` returns files up to 256 MB, eight at a time. `BINARY` is not a name
-`CREATE TABLE` takes (write `BYTEA`), and string functions such as `substr` need a `CAST(… AS VARCHAR)`
-first. `file_read` can't sit inside `VALUES (…)`: use `INSERT … SELECT`.
+A path that exists can't be written again: `PUT` returns an error that names the path, so upload a new
+version under a new name. `file_read` of a path that isn't there is `NULL`. `file_read` returns files up
+to 256 MB, eight at a time. String functions other than `substr` and `byte_length` need a
+`CAST(… AS VARCHAR)` first.
 </Aside>
 
 ## Models in SQL
@@ -203,7 +203,7 @@ This server is a function `caption` of bytes. In real life it is a program you r
 it starts in a thread so the page is self-contained:
 
 ```python
-import threading, time
+import threading
 import pyarrow as pa
 import pyarrow.flight as flight
 import requests
@@ -222,7 +222,6 @@ threading.Thread(target=server.serve, daemon=True).start()
 
 reply = requests.post("http://localhost:8080/functions/caption",
                       json={"flight": f"http://127.0.0.1:{server.port}", "args": ["Binary"], "returns": "Utf8"})
-time.sleep(1.1)          # queries see a new function within a second
 reply.json()
 ```
 
@@ -230,11 +229,12 @@ reply.json()
 {'function': 'caption'}
 ```
 
-The function is in the lake's catalog, so it works on every node, in any query:
+The function is in the lake's catalog, so it works on every node, in any query, as soon as it is made
+(and stops working as soon as `DELETE /functions/caption` drops it). It can take another function's
+answer, such as `file_read`:
 
 ```sql
-WITH docs AS (SELECT path, file_read(path) AS bytes FROM files('files/docs/'))
-SELECT path, caption(bytes) AS caption FROM docs ORDER BY path;
+SELECT path, caption(file_read(path)) AS caption FROM files('docs/') ORDER BY path;
 ```
 
 ```text
@@ -247,19 +247,14 @@ files/docs/notes.txt  a file of 21 bytes
 be reachable from every node. For code that doesn't need its own process,
 [Python functions](/pondra/guides/functions-and-procedures/) run on the nodes and need nothing set up.
 
-<Aside type="caution">
-`file_read`, `ai_complete`, `ai_embed` and Flight functions can't take each other's results in one
-expression: `caption(file_read(path))` stops with `async functions should not be called directly`.
-Name the inner call first, in a `WITH` as above, and the query runs.
-</Aside>
-
 ## JSON in a column
 
-Keep a JSON document in a `VARCHAR` column and read it where it lies. Each function takes the document
-and a path: keys for objects, positions for arrays.
+Keep a JSON document in a `JSON` column (`VARIANT` is the same, and a `VARCHAR` column works too) and
+read it where it lies. Each function takes the document and a path: keys for objects, positions for
+arrays.
 
 ```sql
-CREATE TABLE events (id BIGINT, payload VARCHAR);
+CREATE TABLE events (id BIGINT, payload JSON);
 INSERT INTO events VALUES
   (1, '{"user": {"name": "ann", "tags": ["a", "b"]}, "amount": 4.5, "ok": true}'),
   (2, '{"user": {"name": "bo", "tags": []}, "amount": 2.0, "ok": false}');
@@ -287,7 +282,6 @@ when you don't know the type. The [functions reference](/pondra/reference/functi
 full list. A [Kafka](/pondra/guides/kafka/) topic's values, and a Debezium feed, are read the same way.
 
 <Aside type="caution">
-`VARIANT` is a name that Python functions and the JSON table API take, and it is stored as this same
-JSON text. `CREATE TABLE` doesn't take it, so declare the column `VARCHAR`. Documents are parsed
-when read, so a filter on a field reads and parses each document.
+A `JSON` or `VARIANT` column holds JSON text, as a `VARCHAR` column does. Documents are parsed when
+read, so a filter on a field reads and parses each document.
 </Aside>
