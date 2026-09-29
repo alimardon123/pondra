@@ -59,6 +59,7 @@ impl Auth {
         match first {
             "files" if method == "GET" => Role::Read, // (objects next to the tables: files.rs)
             "files" => Role::Write,
+            "" => Role::None,      // (the console's page: it holds no data, and asks for a token)
             "stats" => Role::None, // (a health check: load balancers and the tests poll it)
             "secrets" => Role::None, // (a procedure's lent token only: `server::secret`)
             "v1" if method == "POST" => Role::Write, // (another engine's append: ADR-028)

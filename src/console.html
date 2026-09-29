@@ -1,1 +1,1005 @@
-<!doctype html><meta charset="utf-8"><title>Pondra</title><p>The console is being built.</p>
+<!doctype html>
+<html lang="en" data-mode="node">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Pondra</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='14' fill='%232563eb'/%3E%3Cpath d='M7 17c3-3 6-3 9 0s6 3 9 0' stroke='white' stroke-width='2.6' fill='none' stroke-linecap='round'/%3E%3Cpath d='M10 22c2-1.6 4-1.6 6 0s4 1.6 6 0' stroke='white' stroke-width='2' fill='none' stroke-linecap='round' opacity='.7'/%3E%3C/svg%3E">
+<!-- The console (ADR-030): this one file, served by the node. No CDN, no fonts, nothing from
+     anywhere else: every request it makes goes to the node (or the server) that served it. -->
+<style>
+:root{
+  --bg:#fafaf9;--panel:#f4f4f2;--card:#fff;--ink:#1c1c1e;--muted:#6e6e73;--faint:#a1a1a6;--line:#e7e7e3;--line2:#d7d7d2;
+  --accent:#2563eb;--accent-soft:#e9f0ff;--ok:#15803d;--err:#b42318;--err-soft:#fdeeec;--warn:#b45309;
+  --sel:#cfdcff;--kw:#7c3aed;--str:#0f766e;--num:#b45309;--com:#8e8e93;--fn:#2563eb;
+  --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;
+  --sans:system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+  --on-accent:#fff;--radius:10px;--shadow:0 1px 2px rgba(0,0,0,.04),0 1px 1px rgba(0,0,0,.03)
+}
+@media (prefers-color-scheme:dark){:root{
+  --bg:#111113;--panel:#161618;--card:#1b1b1e;--ink:#ececf0;--muted:#9d9da6;--faint:#6b6b74;--line:#28282c;--line2:#36363c;
+  --accent:#7aa2ff;--accent-soft:#1d2842;--ok:#4ade80;--err:#ff8a80;--err-soft:#3a1d1b;--warn:#fbbf24;
+  --sel:#2d3d66;--kw:#c4a5ff;--str:#5eead4;--num:#fdba74;--com:#76767f;--fn:#8fb3ff;--on-accent:#0b1220;--shadow:none
+}}
+*{box-sizing:border-box}
+[hidden]{display:none!important}
+html,body{height:100%;margin:0}
+body{background:var(--bg);color:var(--ink);font:14px/1.45 var(--sans);display:flex;flex-direction:column;overflow:hidden}
+button,select,input{font:inherit;color:inherit}
+svg{flex:none}
+header{display:flex;align-items:center;gap:8px;padding:8px 14px;border-bottom:1px solid var(--line);background:var(--panel);min-height:50px}
+.brand{display:flex;align-items:center;gap:8px;font-weight:650;letter-spacing:-.01em;margin-right:4px}
+.pill{font-size:12px;color:var(--muted);border:1px solid var(--line2);border-radius:999px;padding:2px 10px;white-space:nowrap;max-width:40vw;overflow:hidden;text-overflow:ellipsis}
+.pill b{color:var(--ink);font-weight:600}
+.dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--ok);margin-right:6px;vertical-align:1px}
+.dot.off{background:var(--err)}
+#nbname{font-weight:600;border:1px solid transparent;background:transparent;border-radius:6px;padding:4px 8px;width:24ch;min-width:90px}
+#nbname:hover{border-color:var(--line2)}#nbname:focus{outline:none;border-color:var(--accent);background:var(--card)}
+#dirty{color:var(--warn);font-size:12px;min-width:52px}
+.spacer{flex:1}
+.btn{border:1px solid var(--line2);background:var(--card);border-radius:7px;padding:4px 11px;cursor:pointer;font-size:13px;display:inline-flex;align-items:center;gap:6px;white-space:nowrap}
+.btn:hover{border-color:var(--faint)}.btn.primary{background:var(--accent);border-color:var(--accent);color:var(--on-accent)}
+.btn:focus-visible,.icon:focus-visible,.row:focus-visible,.cell:focus-visible,.run:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+.icon{border:0;background:transparent;border-radius:6px;padding:3px 6px;cursor:pointer;color:var(--muted);line-height:1;display:inline-flex;align-items:center}
+.icon:hover{background:var(--line);color:var(--ink)}
+#app{flex:1;display:flex;min-height:0}
+aside{width:290px;min-width:200px;max-width:50vw;border-right:1px solid var(--line);background:var(--panel);overflow:auto;padding:6px 6px 40px;resize:horizontal}
+.sect{display:flex;align-items:center;justify-content:space-between;padding:12px 6px 4px 10px}
+.sect h2{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin:0;font-weight:600}
+.row{display:flex;align-items:center;gap:6px;width:100%;border:0;background:transparent;text-align:left;padding:3px 6px;border-radius:6px;cursor:pointer;font-size:13px;min-height:26px}
+.row:hover{background:var(--line)}
+.row.cur>.nm{font-weight:650}
+.line{display:flex;align-items:center}
+.line>.row{flex:1;min-width:0}
+.tw{width:18px;height:22px;flex:none;border:0;background:transparent;color:var(--faint);cursor:pointer;border-radius:5px;display:inline-flex;align-items:center;justify-content:center;padding:0}
+.tw:hover{color:var(--ink);background:var(--line)}
+.tw svg{transition:transform .12s}.tw[aria-expanded=true] svg{transform:rotate(90deg)}
+.tw.none{visibility:hidden}
+.nm{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ct{color:var(--faint);font-size:12px;font-variant-numeric:tabular-nums;white-space:nowrap}
+.ty{color:var(--faint);font:11.5px var(--mono);white-space:nowrap}
+.kids{padding-left:14px}
+.ic{color:var(--muted);width:15px;height:15px}
+.empty{color:var(--faint);font-size:12px;padding:4px 12px}
+.col{cursor:copy}
+main{flex:1;overflow:auto;padding:22px 28px 140px;scroll-padding:90px}
+#cells{max-width:1120px;margin:0 auto;display:flex;flex-direction:column;gap:14px}
+.cell{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow);position:relative;outline:none}
+.cell.sel{border-color:color-mix(in srgb,var(--accent) 55%,var(--line))}
+.cell.sel::before{content:"";position:absolute;left:-1px;top:-1px;bottom:-1px;width:3px;background:var(--accent);border-radius:var(--radius) 0 0 var(--radius)}
+.cell.editing{box-shadow:0 0 0 3px var(--accent-soft)}
+.bar{display:flex;align-items:center;gap:8px;padding:7px 8px 0 12px;font-size:12px;color:var(--muted);min-height:32px}
+.kind{border:1px solid var(--line2);background:transparent;border-radius:6px;font:600 11px var(--sans);padding:2px 3px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;cursor:pointer}
+.bar .n{font:12px var(--mono);color:var(--faint);min-width:30px}
+.st{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.st.bad{color:var(--err)}
+.tools{margin-left:auto;display:flex;gap:1px;opacity:0;transition:opacity .1s}
+.cell:hover .tools,.cell.sel .tools,.tools:focus-within{opacity:1}
+.live{display:inline-flex;align-items:center;gap:6px;cursor:pointer;user-select:none;position:relative}
+.switch{width:28px;height:16px;border-radius:999px;background:var(--line2);position:relative;transition:background .15s;flex:none}
+.switch::after{content:"";position:absolute;top:2px;left:2px;width:12px;height:12px;border-radius:50%;background:#fff;transition:left .15s}
+.live input{position:absolute;opacity:0;width:1px;height:1px}
+.live input:checked+.switch{background:var(--ok)}.live input:checked+.switch::after{left:14px}
+.live input:focus-visible+.switch{outline:2px solid var(--accent);outline-offset:1px}
+.run{border:0;background:var(--accent);color:var(--on-accent);border-radius:6px;padding:3px 10px;font-size:12px;cursor:pointer;font-weight:600;display:inline-flex;gap:5px;align-items:center}
+.run.stop{background:var(--err)}
+.pulse{animation:pulse 1.2s infinite}@keyframes pulse{50%{opacity:.35}}
+.ed{position:relative;margin-top:4px}
+.ed pre,.ed textarea{margin:0;padding:8px 14px 12px;font:13px/1.6 var(--mono);white-space:pre;tab-size:4;border:0;letter-spacing:0;word-spacing:0;overflow-wrap:normal}
+.ed pre{position:absolute;inset:0;overflow:hidden;pointer-events:none}
+.ed textarea{display:block;width:100%;min-height:43px;resize:none;background:transparent;color:transparent;-webkit-text-fill-color:transparent;caret-color:var(--ink);overflow-x:auto;overflow-y:hidden;outline:none}
+.ed textarea::selection{background:var(--sel)}
+.ed textarea::placeholder{color:var(--faint);-webkit-text-fill-color:var(--faint)}
+.k{color:var(--kw)}.s{color:var(--str)}.c{color:var(--com);font-style:italic}.f{color:var(--fn)}.nu{color:var(--num)}
+.out:empty{display:none}
+.out{border-top:1px solid var(--line);padding:10px 14px 12px;min-width:0}
+.meta{font-size:12px;color:var(--muted);display:flex;gap:10px;align-items:center;margin-top:8px;flex-wrap:wrap}
+.meta .btn{padding:1px 8px;font-size:12px}
+.badge{font-size:11px;color:var(--warn);border:1px solid currentColor;border-radius:4px;padding:0 5px}
+.err{color:var(--err);background:var(--err-soft);border-radius:8px;padding:10px 12px;font:13px/1.5 var(--mono);white-space:pre-wrap;margin:0;overflow:auto;max-height:420px}
+.said{font:13px/1.5 var(--mono);white-space:pre-wrap;margin:0 0 8px;max-height:380px;overflow:auto}
+.done{font-size:13px;color:var(--ok)}
+.grid{overflow:auto;max-height:520px;max-width:100%;border:1px solid var(--line);border-radius:8px;display:inline-block;vertical-align:top}
+table{border-collapse:separate;border-spacing:0;font-size:13px}
+th,td{padding:5px 12px;border-bottom:1px solid var(--line);text-align:left;white-space:nowrap;max-width:440px;overflow:hidden;text-overflow:ellipsis;vertical-align:top}
+th{position:sticky;top:0;background:var(--panel);font-weight:600;z-index:1}
+th small{display:block;font:11px var(--mono);color:var(--faint);font-weight:400}
+.num{text-align:right;font-variant-numeric:tabular-nums}
+td.pre{white-space:pre;max-width:none;font:12px/1.5 var(--mono)}
+.null{color:var(--faint);font-style:italic;font-size:12px}
+td.i,th.i{color:var(--faint);text-align:right;font:11.5px var(--mono);user-select:none;padding-right:8px;padding-left:10px}
+tr:last-child td{border-bottom:0}
+tbody tr:hover td{background:var(--accent-soft)}
+.flash tbody td{animation:flash 1s}
+@keyframes flash{from{background:var(--accent-soft)}to{background:transparent}}
+.md{padding:4px 18px 10px;line-height:1.6;overflow-wrap:anywhere}
+.md h1{font-size:1.55em;margin:.35em 0;letter-spacing:-.01em}.md h2{font-size:1.28em;margin:.45em 0}.md h3{font-size:1.1em;margin:.5em 0}
+.md code{font:12.5px var(--mono);background:var(--panel);padding:1px 5px;border-radius:4px}
+.md pre{background:var(--panel);padding:10px 12px;border-radius:8px;overflow:auto}.md pre code{background:none;padding:0}
+.md a{color:var(--accent)}.md blockquote{border-left:3px solid var(--line2);margin:0;padding-left:12px;color:var(--muted)}
+.md .hint{color:var(--faint)}
+.cell[data-kind=markdown]:not(.editing) .ed,.cell:not([data-kind=markdown]) .md{display:none}
+.cell[data-kind=markdown].editing .md{display:none}
+.cell[data-kind=markdown] .run{display:none}
+.add{display:flex;gap:8px;justify-content:center;margin-top:18px}
+.hint{color:var(--faint);font-size:12px;text-align:center;margin-top:12px}
+dialog{border:1px solid var(--line2);border-radius:12px;background:var(--card);color:var(--ink);padding:20px 22px;max-width:560px;width:calc(100% - 40px);box-shadow:0 20px 50px rgba(0,0,0,.25)}
+dialog::backdrop{background:rgba(0,0,0,.35)}
+dialog h3{margin:0 0 6px}dialog p{color:var(--muted);margin:6px 0 12px}
+dialog input{width:100%;font:14px var(--mono);padding:8px 10px;border:1px solid var(--line2);border-radius:8px;background:var(--bg)}
+.acts{display:flex;flex-direction:row-reverse;gap:8px;margin-top:14px} /* (the first button is Enter's) */
+kbd{font:12px var(--mono);border:1px solid var(--line2);border-bottom-width:2px;border-radius:5px;padding:0 5px;background:var(--panel);white-space:nowrap}
+.keys{display:grid;grid-template-columns:auto 1fr;gap:6px 16px;font-size:13px;align-items:baseline}
+.keys h4{grid-column:1/-1;margin:10px 0 0;font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em}
+#toast{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);background:var(--ink);color:var(--bg);padding:8px 14px;border-radius:8px;font-size:13px;opacity:0;transition:opacity .2s;pointer-events:none;max-width:80vw;z-index:9}
+#toast.on{opacity:.95}#toast.bad{background:var(--err);color:#fff}
+@media (max-width:760px){aside{display:none}main{padding:12px 10px 100px}header{flex-wrap:wrap}.hide-narrow{display:none}}
+</style>
+</head>
+<body>
+<header>
+  <div class="brand"><svg width="22" height="22" viewBox="0 0 32 32" aria-hidden="true"><circle cx="16" cy="16" r="14" fill="#2563eb"/><path d="M7 17c3-3 6-3 9 0s6 3 9 0" stroke="#fff" stroke-width="2.6" fill="none" stroke-linecap="round"/><path d="M10 22c2-1.6 4-1.6 6 0s4 1.6 6 0" stroke="#fff" stroke-width="2" fill="none" stroke-linecap="round" opacity=".7"/></svg>Pondra</div>
+  <span id="where" class="pill" title="">connecting…</span>
+  <input id="nbname" value="untitled" aria-label="Notebook name" spellcheck="false">
+  <span id="dirty" aria-live="polite"></span>
+  <span class="spacer"></span>
+  <button class="btn" id="runall" title="Run every cell, in order (Ctrl+Shift+Enter)">Run all</button>
+  <button class="btn" id="save" title="Save to the lake, as a new version (Ctrl+S)">Save</button>
+  <button class="btn hide-narrow" id="download" title="Download as .ipynb (Jupyter reads it)">Download</button>
+  <button class="btn hide-narrow" id="uploadBtn" title="Open an .ipynb from this computer">Upload</button>
+  <input type="file" id="upload" accept=".ipynb,application/json" hidden>
+  <button class="icon" id="tokenBtn" title="Token" aria-label="Token"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="8" cy="15" r="4"/><path d="M10.8 12.2 20 3M17 6l3 3M14 9l2 2"/></svg></button>
+  <button class="icon" id="helpBtn" title="Keys (?)" aria-label="Keys"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="2" y="6" width="20" height="13" rx="2"/><path d="M6 10h.01M10 10h.01M14 10h.01M18 10h.01M7 15h10"/></svg></button>
+</header>
+<div id="app">
+  <aside aria-label="Catalog">
+    <div class="sect"><h2 id="treeTitle">Database</h2><span><button class="icon" id="newdb" title="New database" aria-label="New database" hidden>+</button><button class="icon" id="refresh" title="Refresh" aria-label="Refresh"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7"/></svg></button></span></div>
+    <div id="tree" class="tree" role="tree"></div>
+    <div class="sect"><h2>Notebooks</h2><button class="icon" id="newnb" title="New notebook" aria-label="New notebook">+</button></div>
+    <div id="notebooks"></div>
+  </aside>
+  <main id="main">
+    <div id="cells" aria-label="Cells"></div>
+    <div class="add">
+      <button class="btn" data-add="sql">+ SQL</button>
+      <button class="btn" data-add="python">+ Python</button>
+      <button class="btn" data-add="markdown">+ Text</button>
+    </div>
+    <div class="hint"><kbd>Ctrl</kbd>+<kbd>Enter</kbd> runs a cell · <kbd>Shift</kbd>+<kbd>Enter</kbd> runs it and moves on · <kbd>Esc</kbd> then <kbd>?</kbd> lists every key</div>
+  </main>
+</div>
+<dialog id="tokenDlg"><form method="dialog">
+  <h3>Token</h3>
+  <p id="tokenWhy">The token this node was started with (<code>--token</code>). It is kept in this browser only.</p>
+  <input id="tokenIn" type="password" autocomplete="off" spellcheck="false" placeholder="token">
+  <div class="acts"><button class="btn primary" value="ok">Use it</button><button class="btn" value="cancel">Cancel</button><button class="btn" value="clear">Forget it</button></div>
+</form></dialog>
+<dialog id="helpDlg"><form method="dialog">
+  <h3>Keys</h3>
+  <div class="keys">
+    <h4>In a cell</h4>
+    <kbd>Ctrl Enter</kbd><span>Run it</span>
+    <kbd>Shift Enter</kbd><span>Run it and go to the next cell</span>
+    <kbd>Alt Enter</kbd><span>Run it and add a cell below</span>
+    <kbd>Ctrl Shift Enter</kbd><span>Run every cell</span>
+    <kbd>Tab</kbd> <span>Indent (<kbd>Shift Tab</kbd>: back)</span>
+    <kbd>Esc</kbd><span>Leave the cell: the keys below then work</span>
+    <h4>On a cell (after Esc)</h4>
+    <kbd>Enter</kbd><span>Edit it</span>
+    <kbd>↑ ↓</kbd> <span>The cell above, below (or <kbd>K</kbd> <kbd>J</kbd>)</span>
+    <kbd>A</kbd> <kbd>B</kbd><span>Add a cell above, below</span>
+    <kbd>D D</kbd><span>Delete it (<kbd>Z</kbd> brings it back)</span>
+    <kbd>S</kbd> <kbd>P</kbd> <kbd>M</kbd><span>Make it SQL, Python, text</span>
+    <kbd>L</kbd><span>Live on or off: its answer again after each commit that changes it</span>
+    <h4>Anywhere</h4>
+    <kbd>Ctrl S</kbd><span>Save the notebook in the lake</span>
+    <kbd>?</kbd><span>These keys</span>
+  </div>
+  <p>A Python cell runs on the node, as <code>DO LANGUAGE python</code>: <code>db</code> is the connection, <code>print</code> shows here, and a last expression that is a frame or a table comes back as rows. Each cell runs on its own; keep what later cells need in a table (a temporary one is this page's own).</p>
+  <div class="acts"><button class="btn primary" value="ok">Close</button></div>
+</form></dialog>
+<div id="toast" role="status"></div>
+<script>
+'use strict';
+// ------------------------------------------------------------------ small things
+const $ = (s, el = document) => el.querySelector(s);
+function h(tag, attrs = {}, ...kids) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (v == null || v === false) continue;
+    if (k === 'class') e.className = v;
+    else if (k.startsWith('on')) e.addEventListener(k.slice(2), v);
+    else if (k === 'html') e.innerHTML = v;
+    else e.setAttribute(k, v === true ? '' : v);
+  }
+  for (const k of kids.flat()) if (k != null && k !== false) e.append(k);
+  return e;
+}
+const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+const store = {
+  get(k) { try { return localStorage.getItem(k); } catch { return null; } },
+  set(k, v) { try { v == null ? localStorage.removeItem(k) : localStorage.setItem(k, v); } catch { /* (private windows) */ } },
+};
+const secs = ms => ms < 1000 ? `${Math.round(ms)} ms` : ms < 60000 ? `${(ms / 1000).toFixed(ms < 10000 ? 2 : 1)} s` : `${Math.floor(ms / 60000)} min ${Math.round(ms % 60000 / 1000)} s`;
+const count = n => Number(n).toLocaleString('en-US');
+const short = n => n >= 1e9 ? (n / 1e9).toFixed(1) + 'B' : n >= 1e6 ? (n / 1e6).toFixed(1) + 'M' : n >= 1e4 ? (n / 1e3).toFixed(1) + 'K' : count(n);
+const utc = t => new Date(/[zZ]|[+-]\d\d:?\d\d$/.test(t) ? t : t + 'Z');
+function ago(t) {
+  const s = (Date.now() - utc(t)) / 1000;
+  return s < 60 ? 'now' : s < 3600 ? `${Math.floor(s / 60)} min` : s < 86400 ? `${Math.floor(s / 3600)} h` : s < 86400 * 30 ? `${Math.floor(s / 86400)} d` : utc(t).toISOString().slice(0, 10);
+}
+let toastTimer;
+function toast(msg, bad) {
+  const t = $('#toast');
+  t.textContent = msg; t.className = 'on' + (bad ? ' bad' : '');
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => t.className = '', bad ? 6000 : 2600);
+}
+const ICONS = {
+  chev: '<path d="m9 6 6 6-6 6"/>',
+  db: '<ellipse cx="12" cy="6" rx="8" ry="3"/><path d="M4 6v12c0 1.7 3.6 3 8 3s8-1.3 8-3V6M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/>',
+  schema: '<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>',
+  table: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 10h18M9 10v10"/>',
+  view: '<path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>',
+  col: '<path d="M8 6h8M8 12h8M8 18h5"/>',
+  book: '<path d="M4 5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2z"/><path d="M4 21V5"/>',
+  clock: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
+};
+const icon = (name, cls = 'ic') => h('span', { class: cls, 'aria-hidden': 'true', html: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${ICONS[name]}</svg>` });
+
+// ------------------------------------------------------------------ the page's state
+const MODE = document.documentElement.dataset.mode; // node: one lake; server: `pondra server`'s databases
+const SESSION = [...crypto.getRandomValues(new Uint8Array(12))].map(b => b.toString(16).padStart(2, '0')).join(''); // (this page's temporary tables)
+const S = { db: null, lake: null, cells: [], sel: null, name: 'untitled', version: null, dirty: false, runs: 0, open: new Set(), trash: null, last: null };
+const base = () => MODE === 'server' && S.db ? '/db/' + encodeURIComponent(S.db) : '';
+
+// ------------------------------------------------------------------ talking to the node
+class Failure extends Error { constructor(message, status) { super(message); this.status = status; } }
+
+async function call(path, { method = 'GET', body, headers = {}, signal, root = false } = {}) {
+  const hd = { 'x-pondra-session': SESSION, ...headers };
+  const token = store.get('pondra.token');
+  if (token) hd.authorization = 'Bearer ' + token;
+  let r;
+  try {
+    r = await fetch((root ? '' : base()) + path, { method, body, headers: hd, signal });
+  } catch (e) {
+    if (e.name === 'AbortError') throw e;
+    throw new Failure(`The node did not answer (${e.message}). Is it still running?`, 0);
+  }
+  if (r.ok) return r;
+  const text = (await r.text()).trim() || `${r.status} ${r.statusText}`;
+  if (r.status === 401) askToken(text);
+  throw new Failure(text, r.status);
+}
+
+/** A statement's answer: rows (the columns with their types) or what it did, and what it printed. */
+async function run(sql, signal) {
+  const r = await call('/sql?format=typed', { method: 'POST', body: sql, headers: { 'content-type': 'text/plain; charset=utf-8' }, signal });
+  let notices = [];
+  try { notices = JSON.parse(r.headers.get('x-pondra-notices') || '[]'); } catch { /* (none) */ }
+  const v = await r.json();
+  if (v && Array.isArray(v.columns) && Array.isArray(v.rows)) return { kind: 'rows', columns: v.columns, rows: v.rows, total: v.total ?? v.rows.length, notices };
+  return { kind: 'done', value: v, notices };
+}
+
+/** A query's rows as objects (the console's own queries). */
+async function rows(sql) {
+  const r = await run(sql);
+  return r.kind === 'rows' ? r.rows.map(a => Object.fromEntries(r.columns.map((c, i) => [c.name, a[i]]))) : [];
+}
+
+const RESERVED = new Set('ALL AND ANY ARRAY AS ASC BETWEEN BY CASE CAST CHECK COLUMN CREATE CROSS DEFAULT DELETE DESC DISTINCT DO ELSE END EXCEPT FALSE FETCH FOR FROM FULL GRANT GROUP HAVING IN INNER INSERT INTERSECT INTO IS JOIN LEFT LIKE LIMIT NATURAL NOT NULL OFFSET ON OR ORDER OUTER RIGHT SELECT SET TABLE THEN TO TRUE UNION UNIQUE UPDATE USER USING VALUES VIEW WHEN WHERE WINDOW WITH'.split(' '));
+const ident = s => /^[a-z_][a-z0-9_]*$/.test(s) && !RESERVED.has(s.toUpperCase()) ? s : '"' + s.replace(/"/g, '""') + '"';
+/** A table's name as a query here writes it: `t`, `schema.t`, or `lake.schema.t` for an attached lake's. */
+const home = () => S.lake || S.db; // (a server's database is the lake of that name)
+const qualified = (c, s, t) => [c !== home() ? c : null, c !== home() || s !== 'public' ? s : null, t].filter(Boolean).map(ident).join('.');
+
+/** A Python cell as the node runs it: Postgres's anonymous code block. */
+function doBlock(code) {
+  let tag = 'pondra';
+  while (code.includes('$' + tag + '$')) tag += '_';
+  return `DO LANGUAGE python $${tag}$\n${code}\n$${tag}$`;
+}
+
+/** Arrow's name for a type, as SQL names it. */
+function sqlType(t = '') {
+  const b = (t.match(/^\w+/) || [t])[0];
+  if (t.endsWith('[]')) return sqlType(t.slice(0, -2)) + '[]';
+  if (b === 'Timestamp') return /,/.test(t) && !/None\)/.test(t) ? 'TIMESTAMPTZ' : 'TIMESTAMP';
+  if (/^Decimal/.test(b)) { const p = t.match(/\((\d+),\s*(-?\d+)\)/); return p ? `DECIMAL(${p[1]},${p[2]})` : 'DECIMAL'; }
+  if (/^(Large|FixedSize)?List/.test(b)) { const i = t.match(/\((?:nullable |non-null )?(?:Field \{[^}]*data_type: )?(\w+[^,)]*)/); return (i ? sqlType(i[1]) : '') + '[]'; }
+  const m = { Int8: 'TINYINT', Int16: 'SMALLINT', Int32: 'INT', Int64: 'BIGINT', UInt8: 'UTINYINT', UInt16: 'USMALLINT', UInt32: 'UINT', UInt64: 'UBIGINT', Float16: 'HALF', Float32: 'REAL', Float64: 'DOUBLE', Utf8: 'VARCHAR', LargeUtf8: 'VARCHAR', Utf8View: 'VARCHAR', Boolean: 'BOOLEAN', Date32: 'DATE', Date64: 'DATE', Binary: 'BYTEA', LargeBinary: 'BYTEA', BinaryView: 'BYTEA', FixedSizeBinary: 'BYTEA', Null: 'NULL', Time32: 'TIME', Time64: 'TIME', Interval: 'INTERVAL', Duration: 'INTERVAL', Struct: 'STRUCT', Map: 'MAP', Dictionary: 'VARCHAR' };
+  return m[b] || t;
+}
+const numeric = t => /^(U?Int|Float|Decimal)/.test(t || '');
+
+// ------------------------------------------------------------------ highlighting
+const SQL_KW = new Set(('SELECT FROM WHERE GROUP BY ORDER HAVING LIMIT OFFSET JOIN LEFT RIGHT FULL INNER OUTER CROSS NATURAL ON USING AS AND OR NOT NULL IS IN EXISTS BETWEEN LIKE ILIKE SIMILAR CASE WHEN THEN ELSE END DISTINCT ALL UNION INTERSECT EXCEPT WITH RECURSIVE INSERT INTO VALUES UPDATE SET DELETE CREATE TABLE VIEW MATERIALIZED REPLACE DROP ALTER ADD COLUMN RENAME TO IF PRIMARY KEY DEFAULT TRUE FALSE ASC DESC NULLS FIRST LAST OVER PARTITION ROWS RANGE UNBOUNDED PRECEDING FOLLOWING CURRENT ROW FILTER WITHIN CAST TRY_CAST INTERVAL DATE TIMESTAMP TIMESTAMPTZ TIME BIGINT INT INTEGER SMALLINT TINYINT DOUBLE PRECISION FLOAT REAL DECIMAL NUMERIC VARCHAR TEXT CHAR BOOLEAN BYTEA BINARY JSON EXPLAIN ANALYZE SHOW DESCRIBE CALL DO LANGUAGE FUNCTION PROCEDURE RETURNS RETURN BEGIN COMMIT ROLLBACK MERGE MATCHED SCHEMA DATABASE ATTACH DETACH COPY TEMP TEMPORARY SECRET TASK QUALIFY LATERAL UNNEST ANY SOME ARRAY STRUCT MAP AT OF FOR TRUNCATE GRANT REVOKE WINDOW FETCH NEXT ONLY UNIQUE REFERENCES CHECK CONSTRAINT INDEX OPTIMIZE VACUUM INSTALL LOAD').split(' '));
+const PY_KW = new Set('False None True and as assert async await break class continue def del elif else except finally for from global if import in is lambda nonlocal not or pass raise return try while with yield match case'.split(' '));
+const SQL_RE = /(--[^\n]*|\/\*[\s\S]*?(?:\*\/|$))|('(?:[^']|'')*'?)|("(?:[^"]|"")*"?)|(\b\d+(?:\.\d+)?(?:[eE][+-]?\d+)?\b)|([A-Za-z_][\w$]*)/g;
+const PY_RE = /(#[^\n]*)|([rRbBfFuU]{0,2}(?:"""[\s\S]*?(?:"""|$)|'''[\s\S]*?(?:'''|$)|"(?:[^"\\\n]|\\.)*"?|'(?:[^'\\\n]|\\.)*'?))|(\x00)|(\b\d[\d_]*(?:\.\d+)?(?:[eE][+-]?\d+)?\b)|([A-Za-z_]\w*)/g;
+function highlight(text, kind) {
+  if (kind === 'markdown') return esc(text) + '\n';
+  const [re, kw, up] = kind === 'python' ? [PY_RE, PY_KW, false] : [SQL_RE, SQL_KW, true];
+  let out = '', last = 0;
+  for (const m of text.matchAll(re)) {
+    const t = m[0];
+    const cls = m[1] ? 'c' : m[2] ? 's' : m[4] ? 'nu' : m[5] ? (kw.has(up ? t.toUpperCase() : t) ? 'k' : /^\s*\(/.test(text.slice(m.index + t.length, m.index + t.length + 3)) ? 'f' : '') : '';
+    out += esc(text.slice(last, m.index)) + (cls ? `<span class="${cls}">${esc(t)}</span>` : esc(t));
+    last = m.index + t.length;
+  }
+  return out + esc(text.slice(last)) + '\n'; // (a last empty line keeps its height)
+}
+
+// ------------------------------------------------------------------ text cells
+function markdown(src) {
+  const inline = s => {
+    const codes = [];
+    s = esc(s).replace(/`([^`]+)`/g, (_, c) => (codes.push(c), `\u0000${codes.length - 1}\u0000`));
+    s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>').replace(/(^|[^*\w])\*([^*\s][^*]*?)\*(?!\w)/g, '$1<em>$2</em>')
+      .replace(/(^|[^\w])_([^_\s][^_]*?)_(?!\w)/g, '$1<em>$2</em>')
+      .replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (_, text, url) => /^(https?:|mailto:|#|\/|\.)/i.test(url.replace(/&amp;/g, '&')) ? `<a href="${url}" target="_blank" rel="noopener noreferrer">${text}</a>` : text);
+    return s.replace(/\u0000(\d+)\u0000/g, (_, i) => `<code>${codes[i]}</code>`);
+  };
+  const lines = src.replace(/\r/g, '').split('\n'), item = /^\s*([-*+]|\d+[.)])\s+/, block = /^(```|#{1,6}\s|>|\s*([-*+]|\d+[.)])\s+|\s*(---|\*\*\*|___)\s*$)/;
+  let html = '', i = 0;
+  while (i < lines.length) {
+    const l = lines[i];
+    let m;
+    if (/^```/.test(l)) {
+      const code = [];
+      for (i++; i < lines.length && !/^```/.test(lines[i]); i++) code.push(lines[i]);
+      i++;
+      html += `<pre><code>${esc(code.join('\n'))}</code></pre>`;
+    } else if ((m = l.match(/^(#{1,6})\s+(.*)$/))) {
+      html += `<h${m[1].length}>${inline(m[2])}</h${m[1].length}>`; i++;
+    } else if (item.test(l)) {
+      const tag = /^\s*\d/.test(l) ? 'ol' : 'ul', items = [];
+      while (i < lines.length && item.test(lines[i])) items.push(lines[i++].replace(item, ''));
+      html += `<${tag}>${items.map(x => `<li>${inline(x)}</li>`).join('')}</${tag}>`;
+    } else if (/^>/.test(l)) {
+      const quote = [];
+      while (i < lines.length && /^>/.test(lines[i])) quote.push(lines[i++].replace(/^>\s?/, ''));
+      html += `<blockquote>${inline(quote.join(' '))}</blockquote>`;
+    } else if (/^\s*(---|\*\*\*|___)\s*$/.test(l)) {
+      html += '<hr>'; i++;
+    } else if (!l.trim()) {
+      i++;
+    } else {
+      const para = [];
+      do para.push(lines[i++]); while (i < lines.length && lines[i].trim() && !block.test(lines[i]));
+      html += `<p>${inline(para.join('\n')).replace(/\n/g, ' ')}</p>`;
+    }
+  }
+  return html || '<p class="hint">Empty text. Double-click to write (Markdown).</p>';
+}
+
+// ------------------------------------------------------------------ answers
+const SHOWN = 200; // rows drawn at once (more on a click)
+function doneText(v) {
+  if (v == null || typeof v !== 'object') return v == null ? 'Done.' : String(v);
+  const entries = Object.entries(v).filter(([k]) => k !== 'called' || v.called !== 'do');
+  if (!entries.length) return v.called === 'do' ? '' : 'Done.';
+  return entries.map(([k, x]) => `${k.replace(/_/g, ' ')} ${typeof x === 'string' ? x : JSON.stringify(x)}`).join(' · ');
+}
+function cellOf(v, num, time) {
+  if (v == null) return h('td', { class: num ? 'num' : null }, h('span', { class: 'null' }, 'NULL'));
+  let s = typeof v === 'object' ? JSON.stringify(v) : String(v);
+  if (time) s = s.replace(/^(\d{4}-\d\d-\d\d)T/, '$1 ');
+  const td = h('td', { class: s.includes('\n') ? 'pre' : num ? 'num' : null }, s.length > 5000 ? s.slice(0, 5000) + '…' : s);
+  if (s.length > 50 && !s.includes('\n')) td.title = s.slice(0, 4000);
+  return td;
+}
+function grid(r) {
+  const cols = r.columns, all = r.rows, nums = cols.map(c => numeric(c.type)), times = cols.map(c => /^Timestamp/.test(c.type || ''));
+  if (!cols.length) return h('div', { class: 'done' }, 'No columns.');
+  const body = h('tbody');
+  const table = h('table', {}, h('thead', {}, h('tr', {}, h('th', { class: 'i' }, ''), cols.map((c, i) => h('th', { class: nums[i] ? 'num' : null, title: c.type }, c.name, h('small', {}, sqlType(c.type)))))), body);
+  let drawn = 0;
+  const more = h('button', { class: 'btn', onclick: () => draw() });
+  function draw() {
+    const end = Math.min(all.length, drawn + (drawn ? 1000 : SHOWN)), frag = document.createDocumentFragment();
+    for (; drawn < end; drawn++) frag.append(h('tr', {}, h('td', { class: 'i' }, String(drawn + 1)), all[drawn].map((v, i) => cellOf(v, nums[i], times[i]))));
+    body.append(frag);
+    more.textContent = `Show ${count(Math.min(1000, all.length - drawn))} more`;
+    more.hidden = drawn >= all.length;
+  }
+  draw();
+  const csv = h('button', { class: 'btn', title: 'The rows here, as CSV', onclick: () => saveAs(toCsv(r), 'text/csv', `${S.name || 'rows'}.csv`) }, 'CSV');
+  const said = r.total > all.length ? `${count(all.length)} of ${count(r.total)} rows here` : `${count(r.total)} row${r.total === 1 ? '' : 's'}`;
+  return h('div', {}, h('div', { class: 'grid' }, table), h('div', { class: 'meta' }, h('span', { class: 'n-rows' }, said), more, csv));
+}
+function toCsv(r) {
+  const field = v => { const s = v == null ? '' : typeof v === 'object' ? JSON.stringify(v) : String(v); return /[",\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; };
+  return [r.columns.map(c => c.name), ...r.rows].map(row => row.map(field).join(',')).join('\r\n') + '\r\n';
+}
+function saveAs(text, type, name) {
+  const a = h('a', { href: URL.createObjectURL(new Blob([text], { type })), download: name });
+  document.body.append(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+}
+
+// ------------------------------------------------------------------ cells
+let made = 0;
+const newId = () => 'c' + Date.now().toString(36) + (made++).toString(36); // (nbformat's cell ids)
+
+class Cell {
+  constructor(o = {}) {
+    this.id = /^[A-Za-z0-9_-]{1,64}$/.test(o.id || '') ? o.id : newId();
+    this.kind = o.kind || 'sql';
+    this.result = null; this.count = null; this.ctl = null; this.stream = null;
+    this.kindSel = h('select', { class: 'kind', 'aria-label': 'Kind of cell', title: 'SQL, Python or text (S, P, M)', onchange: e => this.setKind(e.target.value) },
+      h('option', { value: 'sql' }, 'SQL'), h('option', { value: 'python' }, 'Python'), h('option', { value: 'markdown' }, 'Text'));
+    this.runBtn = h('button', { class: 'run', title: 'Run (Ctrl+Enter)', onclick: () => this.ctl ? this.ctl.abort() : this.run() }, 'Run');
+    this.liveBox = h('input', { type: 'checkbox', onchange: () => this.setLive(this.liveBox.checked) });
+    this.liveEl = h('label', { class: 'live', title: 'Live: the answer again each time a commit changes what it reads (L)' }, this.liveBox, h('span', { class: 'switch' }), 'Live');
+    this.num = h('span', { class: 'n' });
+    this.status = h('span', { class: 'st', 'aria-live': 'polite' });
+    const tool = (label, title, fn) => h('button', { class: 'icon', title, 'aria-label': title, onclick: fn }, label);
+    this.bar = h('div', { class: 'bar' }, this.num, this.kindSel, this.runBtn, this.liveEl, this.status,
+      h('span', { class: 'tools' }, tool('↑', 'Move up', () => move(this, -1)), tool('↓', 'Move down', () => move(this, 1)),
+        tool('+', 'Add a cell below (B)', () => add({ kind: this.kind === 'markdown' ? 'sql' : this.kind }, this, true).edit()), tool('✕', 'Delete (D D)', () => remove(this))));
+    this.pre = h('pre', { 'aria-hidden': 'true' });
+    this.ta = h('textarea', { spellcheck: 'false', autocapitalize: 'off', autocomplete: 'off', 'aria-label': 'Code', rows: '1', wrap: 'off' });
+    this.md = h('div', { class: 'md', ondblclick: () => this.edit() });
+    this.out = h('div', { class: 'out' });
+    this.el = h('section', { class: 'cell', tabindex: '-1', 'data-kind': this.kind }, this.bar, h('div', { class: 'ed' }, this.pre, this.ta), this.md, this.out);
+    this.el.cell = this;
+    this.ta.value = o.src || '';
+    this.ta.addEventListener('input', () => { this.paint(); changed(); });
+    this.ta.addEventListener('scroll', () => { this.pre.scrollLeft = this.ta.scrollLeft; });
+    this.ta.addEventListener('keydown', e => editing(e, this));
+    this.ta.addEventListener('focus', () => { select(this); this.el.classList.add('editing'); S.last = this; });
+    this.ta.addEventListener('blur', () => { if (this.kind === 'markdown') { this.md.innerHTML = markdown(this.ta.value); } this.el.classList.remove('editing'); });
+    this.el.addEventListener('mousedown', e => { if (!e.target.closest('textarea,button,select,input,a,label')) select(this); });
+    this.setKind(this.kind, true);
+    if (o.live) { this.liveBox.checked = true; this.status.textContent = 'live once run'; }
+    if (o.out) this.show(o.out, true);
+  }
+  get src() { return this.ta.value; }
+  setKind(k, quiet) {
+    this.kind = k; this.el.dataset.kind = k; this.kindSel.value = k;
+    this.liveEl.hidden = k !== 'sql';
+    if (k !== 'sql') { this.stopLive(); this.liveBox.checked = false; }
+    this.ta.placeholder = { sql: 'SELECT …', python: 'db.sql("SELECT …")      # runs on the node', markdown: 'Text, in Markdown' }[k];
+    if (k === 'markdown') this.md.innerHTML = markdown(this.ta.value);
+    this.paint();
+    if (!quiet) changed();
+  }
+  paint() {
+    this.pre.innerHTML = highlight(this.ta.value, this.kind);
+    this.ta.style.height = 'auto';
+    this.ta.style.height = (this.ta.scrollHeight + 2) + 'px';
+  }
+  edit() {
+    this.el.classList.add('editing');
+    this.paint();
+    this.ta.focus({ preventScroll: true });
+    this.el.scrollIntoView({ block: 'nearest' });
+  }
+  async run() {
+    if (this.kind === 'markdown') { this.md.innerHTML = markdown(this.ta.value); this.ta.blur(); this.el.focus({ preventScroll: true }); return { kind: 'done' }; }
+    const text = this.src.trim();
+    if (!text) return { kind: 'done' };
+    this.stopLive();
+    this.ctl?.abort();
+    const ctl = this.ctl = new AbortController(), t0 = performance.now();
+    this.count = ++S.runs; this.num.textContent = `[${this.count}]`;
+    this.runBtn.textContent = 'Stop'; this.runBtn.classList.add('stop'); this.runBtn.title = 'Stop waiting for it';
+    this.status.className = 'st pulse'; this.status.textContent = 'running…';
+    const tick = setInterval(() => { this.status.textContent = 'running… ' + secs(performance.now() - t0); }, 250);
+    let r;
+    try {
+      r = await run(this.kind === 'python' ? doBlock(text) : text, ctl.signal);
+    } catch (e) {
+      r = { kind: 'error', message: e.name === 'AbortError' ? 'Stopped waiting. (A statement already on its way may still finish on the node.)' : e.message, notices: [] };
+    } finally {
+      clearInterval(tick);
+      if (this.ctl === ctl) this.ctl = null;
+      this.runBtn.textContent = 'Run'; this.runBtn.classList.remove('stop'); this.runBtn.title = 'Run (Ctrl+Enter)';
+    }
+    r.ms = performance.now() - t0;
+    this.show(r);
+    if (r.kind === 'rows' && this.kind === 'sql' && this.liveBox.checked) this.startLive();
+    if (r.kind === 'done' || this.kind === 'python') later(refresh);
+    changed(true);
+    return r;
+  }
+  show(r, saved) {
+    this.result = r;
+    this.out.replaceChildren();
+    if (r.notices?.length) this.out.append(h('pre', { class: 'said' }, r.notices.join('\n')));
+    if (r.kind === 'error') this.out.append(h('pre', { class: 'err' }, r.message));
+    else if (r.kind === 'rows') this.out.append(grid(r));
+    else if (r.kind === 'text') this.out.append(h('pre', { class: 'said' }, r.text));
+    else if (r.kind === 'done') { const d = doneText(r.value) || (r.notices?.length ? '' : 'Done.'); if (d && !(d === 'Done.' && r.notices?.length)) this.out.append(h('div', { class: 'done' }, d)); }
+    if (saved) this.out.append(h('div', { class: 'meta' }, h('span', { class: 'badge', title: 'As it was when the notebook was saved: run the cell for the answer now' }, 'saved')));
+    this.status.className = 'st' + (r.kind === 'error' ? ' bad' : '');
+    this.status.textContent = saved ? '' : r.kind === 'error' ? `failed · ${secs(r.ms)}` : secs(r.ms);
+  }
+  setLive(on) {
+    this.liveBox.checked = on;
+    if (on) this.run(); else { this.stopLive(); this.status.textContent = ''; }
+    changed();
+  }
+  stopLive() { if (this.stream) { this.stream.abort(); this.stream = null; } }
+  async startLive() {
+    this.stopLive();
+    const ctl = this.stream = new AbortController(), cols = this.result.columns, first = this.result;
+    this.status.className = 'st'; this.status.innerHTML = '<span class="dot"></span>live';
+    try {
+      const r = await call('/live?sql=' + encodeURIComponent(this.src.trim()), { signal: ctl.signal });
+      const reader = r.body.getReader(), dec = new TextDecoder();
+      let buf = '', seen = 0;
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        for (let i; (i = buf.indexOf('\n')) >= 0;) {
+          const line = buf.slice(0, i).trim();
+          buf = buf.slice(i + 1);
+          if (line) this.liveAnswer(JSON.parse(line), cols, first, !(seen++));
+        }
+      }
+      if (this.stream === ctl) throw new Failure('the node closed the live query');
+    } catch (e) {
+      if (e.name === 'AbortError' || this.stream !== ctl) return;
+      this.stream = null; this.liveBox.checked = false;
+      this.status.className = 'st bad'; this.status.textContent = 'live stopped';
+      this.out.prepend(h('pre', { class: 'err' }, e.message));
+    }
+  }
+  liveAnswer(m, cols, first, opening) {
+    if (m.error) throw new Failure(m.error);
+    const names = cols.length ? cols.map(c => c.name) : Object.keys(m.rows[0] || {});
+    const columns = cols.length ? cols : names.map(n => ({ name: n, type: '' }));
+    const r = { kind: 'rows', columns, rows: m.rows.slice(0, 10000).map(o => names.map(n => o[n] ?? null)), total: m.rows.length, notices: [], ms: first.ms };
+    if (JSON.stringify(r.rows) !== JSON.stringify(this.result.rows)) {
+      this.show(r);
+      if (!opening) this.out.querySelector('.grid')?.classList.add('flash'); // (what changed since)
+    }
+    this.status.className = 'st'; this.status.innerHTML = `<span class="dot"></span>live · commit ${esc(m.at)} · ${new Date().toLocaleTimeString()}`;
+  }
+}
+
+function select(c, focus) {
+  if (!c) return;
+  if (S.sel && S.sel !== c) S.sel.el.classList.remove('sel');
+  S.sel = c; c.el.classList.add('sel');
+  if (focus) { c.el.focus({ preventScroll: true }); c.el.scrollIntoView({ block: 'nearest' }); }
+}
+function add(o, near, below = true) {
+  const c = new Cell(o), i = near ? S.cells.indexOf(near) + (below ? 1 : 0) : S.cells.length;
+  S.cells.splice(i, 0, c);
+  $('#cells').insertBefore(c.el, S.cells[i + 1]?.el || null);
+  c.paint(); // (its height, now that it is on the page)
+  changed();
+  return c;
+}
+function remove(c) {
+  c.stopLive(); c.ctl?.abort();
+  const i = S.cells.indexOf(c);
+  S.cells.splice(i, 1); c.el.remove();
+  S.trash = { c, i };
+  if (!S.cells.length) add({});
+  select(S.cells[Math.min(i, S.cells.length - 1)], true);
+  changed();
+}
+function restore() {
+  if (!S.trash) return;
+  const { c, i } = S.trash;
+  S.trash = null;
+  S.cells.splice(Math.min(i, S.cells.length), 0, c);
+  $('#cells').insertBefore(c.el, S.cells[i + 1]?.el || null);
+  select(c, true); changed();
+}
+function move(c, d) {
+  const i = S.cells.indexOf(c), j = i + d;
+  if (j < 0 || j >= S.cells.length) return;
+  S.cells.splice(i, 1); S.cells.splice(j, 0, c);
+  $('#cells').insertBefore(c.el, S.cells[j + 1]?.el || null);
+  c.el.scrollIntoView({ block: 'nearest' }); changed();
+}
+function next(c) {
+  const i = S.cells.indexOf(c), made = !S.cells[i + 1];
+  const n = S.cells[i + 1] || add({ kind: c.kind === 'markdown' ? 'sql' : c.kind });
+  select(n, true);
+  if (made) n.edit(); // (as Jupyter: a new cell is for typing in)
+}
+async function runAll() {
+  for (const c of S.cells) {
+    select(c, true);
+    const r = await c.run();
+    if (r?.kind === 'error') { toast('Stopped at a cell that failed', true); return; }
+  }
+}
+
+// ------------------------------------------------------------------ keys
+function insert(ta, s) {
+  if (document.execCommand('insertText', false, s)) return; // (so Ctrl+Z undoes it)
+  ta.setRangeText(s, ta.selectionStart, ta.selectionEnd, 'end');
+  ta.dispatchEvent(new Event('input'));
+}
+function indent(ta, back) {
+  const v = ta.value, a = ta.selectionStart, b = ta.selectionEnd;
+  if (!back && a === b) return insert(ta, '    ');
+  const start = v.lastIndexOf('\n', a - 1) + 1, end = b > a && v[b - 1] === '\n' ? b - 1 : b;
+  const stop = v.indexOf('\n', end) < 0 ? v.length : v.indexOf('\n', end);
+  const lines = v.slice(start, stop).split('\n').map(l => back ? l.replace(/^( {1,4}|\t)/, '') : '    ' + l).join('\n');
+  ta.setSelectionRange(start, stop); insert(ta, lines); ta.setSelectionRange(start, start + lines.length);
+}
+function editing(e, c) {
+  const mod = e.ctrlKey || e.metaKey;
+  if (e.key === 'Enter' && (mod || e.shiftKey || e.altKey)) {
+    e.preventDefault();
+    if (mod && e.shiftKey) return runAll();
+    if (mod) return c.run();
+    if (e.shiftKey) { c.run(); return next(c); }
+    c.run(); return add({ kind: c.kind === 'markdown' ? 'sql' : c.kind }, c, true).edit();
+  }
+  if (e.key === 'Escape') { e.preventDefault(); c.ta.blur(); c.el.focus({ preventScroll: true }); return; }
+  if (e.key === 'Tab' && !mod && !e.altKey) { e.preventDefault(); indent(c.ta, e.shiftKey); return; }
+  if (e.key === 'Backspace' && !mod && c.ta.selectionStart === c.ta.selectionEnd) {
+    const v = c.ta.value, a = c.ta.selectionStart, before = v.slice(v.lastIndexOf('\n', a - 1) + 1, a);
+    if (before.length && /^ +$/.test(before)) { e.preventDefault(); c.ta.setSelectionRange(a - ((before.length - 1) % 4 + 1), a); insert(c.ta, ''); }
+    return;
+  }
+  if (e.key === 'Enter' && !e.isComposing) {
+    const v = c.ta.value, a = c.ta.selectionStart, line = v.slice(v.lastIndexOf('\n', a - 1) + 1, a);
+    let ind = line.match(/^[ \t]*/)[0];
+    if (c.kind === 'python' && /:\s*(#.*)?$/.test(line)) ind += '    ';
+    if (ind) { e.preventDefault(); insert(c.ta, '\n' + ind); }
+  }
+}
+let lastKey = '';
+document.addEventListener('keydown', e => {
+  const mod = e.ctrlKey || e.metaKey, t = e.target, c = S.sel;
+  if (mod && e.key.toLowerCase() === 's') { e.preventDefault(); save(); return; }
+  if (t.closest?.('textarea,input,select,dialog,button,a,label,summary')) return; // (typing, or a control's own key)
+  if (e.key === '?') { e.preventDefault(); $('#helpDlg').showModal(); return; }
+  if (!c || (t !== document.body && !t.closest?.('.cell,main'))) return;
+  if (e.altKey || (mod && e.key !== 'Enter')) return;
+  const key = e.key.length === 1 ? e.key.toLowerCase() : e.key, prev = lastKey;
+  lastKey = key;
+  const go = d => { const n = S.cells[S.cells.indexOf(c) + d]; if (n) select(n, true); };
+  const acts = {
+    Enter: () => mod && e.shiftKey ? runAll() : mod ? c.run() : e.shiftKey ? (c.run(), next(c)) : c.edit(),
+    ArrowUp: () => go(-1), k: () => go(-1), ArrowDown: () => go(1), j: () => go(1),
+    a: () => select(add({ kind: c.kind === 'markdown' ? 'sql' : c.kind }, c, false), true),
+    b: () => select(add({ kind: c.kind === 'markdown' ? 'sql' : c.kind }, c, true), true),
+    d: () => { if (prev === 'd') { lastKey = ''; remove(c); } },
+    z: () => restore(),
+    s: () => c.setKind('sql'), p: () => c.setKind('python'), m: () => c.setKind('markdown'),
+    l: () => { if (c.kind === 'sql') c.setLive(!c.liveBox.checked); },
+  };
+  if (acts[key]) { e.preventDefault(); acts[key](); }
+});
+
+// ------------------------------------------------------------------ notebooks (.ipynb)
+const lines = s => s.split(/(?<=\n)/);
+function textTable(columns, rows, total) {
+  const cells = [columns.map(c => c.name), ...rows.map(r => r.map(v => { const s = v == null ? 'NULL' : typeof v === 'object' ? JSON.stringify(v) : String(v); return s.length > 60 ? s.slice(0, 59) + '…' : s.replace(/\n/g, ' '); }))];
+  const w = columns.map((_, i) => Math.max(...cells.map(r => r[i].length)));
+  const fmt = r => r.map((s, i) => numeric(columns[i].type) ? s.padStart(w[i]) : s.padEnd(w[i])).join(' | ').trimEnd();
+  return [fmt(cells[0]), w.map(n => '-'.repeat(n)).join('-+-'), ...cells.slice(1).map(fmt), `(${count(total)} row${total === 1 ? '' : 's'})`].join('\n');
+}
+const KEPT = 100; // rows a saved notebook keeps of each answer
+function outputs(c) {
+  const r = c.result, out = [];
+  if (!r || c.kind === 'markdown') return out;
+  const n = c.count ?? null;
+  if (r.notices?.length) out.push({ output_type: 'stream', name: 'stdout', text: lines(r.notices.join('\n') + '\n') });
+  if (r.kind === 'error') out.push({ output_type: 'error', ename: 'Error', evalue: r.message, traceback: r.message.split('\n') });
+  if (r.kind === 'rows') {
+    const kept = r.rows.slice(0, KEPT);
+    out.push({ output_type: 'execute_result', execution_count: n, metadata: {}, data: { 'text/plain': lines(textTable(r.columns, kept, r.total)), 'application/vnd.pondra.rows+json': { columns: r.columns, rows: kept, total: r.total } } });
+  }
+  const said = r.kind === 'text' ? r.text : r.kind === 'done' ? doneText(r.value) : '';
+  if (said) out.push({ output_type: 'execute_result', execution_count: n, metadata: {}, data: { 'text/plain': lines(said) } });
+  return out;
+}
+function notebook() {
+  return {
+    cells: S.cells.map(c => c.kind === 'markdown'
+      ? { cell_type: 'markdown', id: c.id, metadata: {}, source: lines(c.src) }
+      : { cell_type: 'code', id: c.id, metadata: c.kind === 'sql' && c.liveBox.checked ? { pondra: { live: true } } : {}, execution_count: c.result ? c.count ?? null : null, source: lines(c.kind === 'sql' ? '%%sql\n' + c.src : c.src), outputs: outputs(c) }),
+    metadata: { kernelspec: { name: 'python3', display_name: 'Python 3', language: 'python' }, language_info: { name: 'python' }, pondra: { database: S.db || S.lake } },
+    nbformat: 4, nbformat_minor: 5,
+  };
+}
+function savedAnswer(outs) {
+  const text = x => Array.isArray(x) ? x.join('') : String(x ?? '');
+  const r = { kind: 'none', notices: [] };
+  for (const o of outs || []) {
+    if (o.output_type === 'stream') r.notices.push(text(o.text).replace(/\n$/, ''));
+    else if (o.output_type === 'error') Object.assign(r, { kind: 'error', message: o.evalue || o.ename || 'error' });
+    else if (o.data?.['application/vnd.pondra.rows+json']?.columns) { const d = o.data['application/vnd.pondra.rows+json']; Object.assign(r, { kind: 'rows', columns: d.columns, rows: d.rows || [], total: d.total ?? (d.rows || []).length }); }
+    else if (o.data?.['text/plain'] != null) Object.assign(r, { kind: 'text', text: text(o.data['text/plain']) });
+  }
+  return r.kind === 'none' && !r.notices.length ? null : r.kind === 'none' ? { ...r, kind: 'done', value: null } : r;
+}
+function cellsOf(nb) {
+  if (!nb || !Array.isArray(nb.cells)) throw new Error('this is not a notebook (.ipynb): it has no cells');
+  return nb.cells.map(c => {
+    const src = Array.isArray(c.source) ? c.source.join('') : String(c.source ?? '');
+    if (c.cell_type !== 'code') return { kind: 'markdown', src, id: c.id };
+    const magic = src.match(/^%%sql[^\n]*(\n|$)/);
+    return { kind: magic ? 'sql' : 'python', src: magic ? src.slice(magic[0].length) : src, id: c.id, live: !!c.metadata?.pondra?.live, out: savedAnswer(c.outputs) };
+  });
+}
+function load(nb, name, version) {
+  const cells = cellsOf(nb);
+  for (const c of S.cells) { c.stopLive(); c.ctl?.abort(); }
+  S.cells = []; $('#cells').replaceChildren();
+  for (const c of cells.length ? cells : [{}]) add(c);
+  S.name = name; S.version = version; $('#nbname').value = name;
+  select(S.cells[0]);
+  saved();
+}
+const cleanName = s => s.trim().replace(/\.ipynb$/i, '').replace(/[^\w.-]+/g, '-').replace(/^[.-]+|-+$/g, '').slice(0, 80);
+const stampOf = () => new Date().toISOString().replace(/[:.]/g, '-');
+async function save() {
+  const name = cleanName($('#nbname').value);
+  if (!name) { toast('Give the notebook a name first', true); $('#nbname').focus(); return; }
+  S.name = name; $('#nbname').value = name;
+  const version = stampOf(), path = `notebooks/${name}/${version}.ipynb`;
+  try {
+    await call('/files/' + path.split('/').map(encodeURIComponent).join('/'), { method: 'PUT', body: JSON.stringify(notebook(), null, 1) + '\n', headers: { 'content-type': 'application/x-ipynb+json' } });
+    S.version = version; saved();
+    toast(`Saved in the lake: files/${path}`);
+    notebooks();
+  } catch (e) {
+    toast('Not saved: ' + e.message, true);
+  }
+}
+async function openSaved(name, version) {
+  if (S.dirty && !confirm('Open another notebook? This one has changes that are not saved.')) return;
+  try {
+    const r = await call(`/files/notebooks/${encodeURIComponent(name)}/${encodeURIComponent(version)}.ipynb`);
+    load(JSON.parse(await r.text()), name, version);
+    notebooks();
+  } catch (e) { toast(`Could not open ${name}: ${e.message}`, true); }
+}
+function changed(ran) {
+  if (!ran) S.dirty = true;
+  if (S.dirty) { $('#dirty').textContent = 'unsaved'; document.title = `• ${S.name} · Pondra`; }
+}
+function saved() {
+  S.dirty = false; $('#dirty').textContent = '';
+  document.title = `${S.name} · Pondra`;
+  const p = new URLSearchParams();
+  if (S.db && MODE === 'server') p.set('db', S.db);
+  if (S.version) p.set('notebook', S.name);
+  history.replaceState(null, '', p.size ? '#' + p : location.pathname);
+}
+function blank() {
+  load({ cells: [] }, 'untitled', null);
+  S.cells[0].edit();
+}
+
+async function notebooks() {
+  const box = $('#notebooks');
+  let files;
+  try { files = await rows(`SELECT path, written FROM files('notebooks/') ORDER BY path`); } catch (e) {
+    box.replaceChildren(h('div', { class: 'empty' }, e.status === 401 ? 'A token is needed to list them.' : e.message));
+    return;
+  }
+  const by = new Map();
+  for (const f of files) {
+    const m = f.path.match(/^files\/notebooks\/([^/]+)\/([^/]+)\.ipynb$/);
+    if (m) (by.get(m[1]) || by.set(m[1], []).get(m[1])).push({ version: m[2], written: f.written });
+  }
+  if (!by.size) { box.replaceChildren(h('div', { class: 'empty' }, 'None saved yet: Ctrl+S saves this one.')); return; }
+  box.replaceChildren(...[...by.keys()].sort().map(name => {
+    const vs = by.get(name).sort((a, b) => a.version < b.version ? 1 : -1), key = 'nb:' + name;
+    const kids = h('div', { class: 'kids', hidden: !S.open.has(key) }, vs.map(v => h('button', { class: 'row' + (name === S.name && v.version === S.version ? ' cur' : ''), title: 'Open this version', onclick: () => openSaved(name, v.version) }, icon('clock'), h('span', { class: 'nm' }, utc(v.written).toLocaleString()))));
+    const tw = twisty(key, kids, vs.length > 1);
+    return h('div', { role: 'treeitem' }, h('div', { class: 'line' }, tw,
+      h('button', { class: 'row' + (name === S.name ? ' cur' : ''), title: `Open (${vs.length} version${vs.length > 1 ? 's' : ''}; the latest saved ${utc(vs[0].written).toLocaleString()})`, onclick: () => openSaved(name, vs[0].version) },
+        icon('book'), h('span', { class: 'nm' }, name), h('span', { class: 'ct' }, ago(vs[0].written)))), kids);
+  }));
+}
+
+// ------------------------------------------------------------------ the catalog
+function twisty(key, kids, any = true, load) {
+  const b = h('button', { class: 'tw' + (any ? '' : ' none'), 'aria-expanded': String(!kids.hidden), 'aria-label': 'Open', tabindex: any ? null : '-1', html: `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">${ICONS.chev}</svg>` });
+  b.onclick = () => {
+    kids.hidden = !kids.hidden;
+    b.setAttribute('aria-expanded', String(!kids.hidden));
+    kids.hidden ? S.open.delete(key) : S.open.add(key);
+    if (!kids.hidden) load?.();
+  };
+  if (!kids.hidden) load?.();
+  return b;
+}
+async function catalog() {
+  const [tables, columns] = await Promise.all([
+    rows(`SELECT table_catalog AS c, table_schema AS s, table_name AS t, table_type AS k FROM information_schema.tables WHERE table_schema <> 'information_schema' AND table_schema NOT IN (SELECT catalog_name FROM information_schema.schemata) ORDER BY 1, 2, 3`),
+    rows(`SELECT table_catalog AS c, table_schema AS s, table_name AS t, column_name AS n, data_type AS d FROM information_schema.columns WHERE table_schema <> 'information_schema' ORDER BY 1, 2, 3, ordinal_position`),
+  ]);
+  const lakes = new Map(), find = new Map();
+  for (const t of tables) {
+    const schemas = lakes.get(t.c) || lakes.set(t.c, new Map()).get(t.c);
+    const list = schemas.get(t.s) || schemas.set(t.s, []).get(t.s);
+    const table = { ...t, columns: [] };
+    list.push(table); find.set(`${t.c}\u0000${t.s}\u0000${t.t}`, table);
+  }
+  for (const c of columns) find.get(`${c.c}\u0000${c.s}\u0000${c.t}`)?.columns.push(c);
+  return lakes;
+}
+function lakeNode(name, schemas, current, note) {
+  const key = 'db:' + name;
+  if (current && !S.open.has('closed:' + key)) S.open.add(key);
+  const kids = h('div', { class: 'kids', role: 'group', hidden: !S.open.has(key) });
+  if (schemas) {
+    const names = [...schemas.keys()].sort((a, b) => (a !== 'public') - (b !== 'public') || a.localeCompare(b));
+    kids.append(...names.map(s => schemaNode(name, s, schemas.get(s), names.length === 1)));
+    if (!names.length) kids.append(h('div', { class: 'empty' }, 'No tables yet.'));
+  }
+  const tw = twisty(key, kids, !!schemas);
+  tw.addEventListener('click', () => kids.hidden ? S.open.add('closed:' + key) : S.open.delete('closed:' + key));
+  const pick = () => { if (MODE === 'server' && name !== S.db) use(name); else tw.click(); };
+  return h('div', { role: 'treeitem' }, h('div', { class: 'line' }, tw,
+    h('button', { class: 'row' + (current ? ' cur' : ''), title: MODE === 'server' && !current ? `Use database ${name}` : name, onclick: pick }, icon('db'), h('span', { class: 'nm' }, name), note ? h('span', { class: 'ct' }, note) : null)), kids);
+}
+function schemaNode(lake, schema, tables, only) {
+  const key = `s:${lake}.${schema}`;
+  if ((only || schema === 'public') && !S.open.has('closed:' + key)) S.open.add(key);
+  const kids = h('div', { class: 'kids', role: 'group', hidden: !S.open.has(key) }, tables.map(t => tableNode(t)));
+  let counted = false;
+  const tw = twisty(key, kids, true, () => { if (!counted) { counted = true; counts(tables); } });
+  tw.addEventListener('click', () => kids.hidden ? S.open.add('closed:' + key) : S.open.delete('closed:' + key));
+  return h('div', { role: 'treeitem' }, h('div', { class: 'line' }, tw, h('button', { class: 'row', onclick: () => tw.click() }, icon('schema'), h('span', { class: 'nm' }, schema), h('span', { class: 'ct' }, String(tables.length)))), kids);
+}
+function tableNode(t) {
+  const key = `t:${t.c}.${t.s}.${t.t}`, view = t.k === 'VIEW';
+  t.q = qualified(t.c, t.s, t.t);
+  t.ct = h('span', { class: 'ct', title: view ? 'a view' : '' }, view ? 'view' : '');
+  const kids = h('div', { class: 'kids', role: 'group', hidden: !S.open.has(key) }, t.columns.map(c =>
+    h('button', { class: 'row col', title: `${c.n}: ${sqlType(c.d)} (${c.d}). Click: put the name in the cell`, onclick: () => put(ident(c.n)) }, icon('col'), h('span', { class: 'nm' }, c.n), h('span', { class: 'ty' }, sqlType(c.d)))));
+  return h('div', { role: 'treeitem' }, h('div', { class: 'line' }, twisty(key, kids, t.columns.length > 0),
+    h('button', { class: 'row', title: `${t.q}: see its first rows`, onclick: () => peek(t.q) }, icon(view ? 'view' : 'table'), h('span', { class: 'nm' }, t.t), t.ct)), kids);
+}
+async function counts(tables) {
+  const base = tables.filter(t => t.k !== 'VIEW').slice(0, 50);
+  if (!base.length) return;
+  const show = (t, n) => { t.ct.textContent = short(Number(n)); t.ct.title = `${count(n)} rows`; };
+  try {
+    for (const r of await rows(base.map((t, i) => `SELECT ${i} AS i, count(*) AS n FROM ${t.q}`).join(' UNION ALL '))) show(base[r.i], r.n);
+  } catch {
+    for (const t of base) rows(`SELECT count(*) AS n FROM ${t.q}`).then(r => show(t, r[0].n), () => { t.ct.textContent = '?'; t.ct.title = 'could not count it'; });
+  }
+}
+function put(text) {
+  const c = S.last && S.cells.includes(S.last) ? S.last : S.sel;
+  if (!c || c.kind === 'markdown') return;
+  c.edit(); insert(c.ta, text);
+}
+function peek(q) {
+  const empty = S.sel && !S.sel.src.trim() && S.sel.kind === 'sql' ? S.sel : null;
+  const c = empty || add({ kind: 'sql' }, S.sel, true);
+  c.ta.value = `SELECT * FROM ${q} LIMIT 100`; c.paint(); changed();
+  select(c, true); c.run();
+}
+
+async function tree() {
+  const box = $('#tree');
+  if (MODE === 'server') {
+    let dbs;
+    try { dbs = await (await call('/databases', { root: true })).json(); } catch (e) {
+      box.replaceChildren(h('div', { class: 'empty' }, e.status === 401 ? 'A token is needed to list the databases.' : e.message));
+      return;
+    }
+    if (!S.db || !dbs.some(d => d.name === S.db)) S.db = (dbs.find(d => d.default) || dbs[0])?.name || null;
+    let lakes = null;
+    try { lakes = S.db ? await catalog() : null; } catch (e) { toast(e.message, true); }
+    box.replaceChildren(...dbs.map(d => lakeNode(d.name, d.name === S.db ? lakes?.get(d.name) || new Map() : null, d.name === S.db, d.name === S.db ? null : d.running ? 'running' : '')));
+    if (!dbs.length) box.append(h('div', { class: 'empty' }, 'No databases yet: + makes one.'));
+    return;
+  }
+  let lakes;
+  try { lakes = await catalog(); } catch (e) {
+    box.replaceChildren(h('div', { class: 'empty' }, e.status === 401 ? 'A token is needed to see the tables.' : e.message));
+    return;
+  }
+  const names = [S.lake, ...[...lakes.keys()].filter(n => n !== S.lake).sort()].filter(Boolean);
+  box.replaceChildren(...names.map(n => lakeNode(n, lakes.get(n) || new Map(), n === S.lake, n === S.lake ? null : 'attached')));
+}
+async function stats() {
+  const where = $('#where');
+  try {
+    const s = await (await call('/stats')).json();
+    S.lake = s.lake;
+    const nodes = s.nodes || [], who = MODE === 'server' ? S.db : s.lake;
+    where.innerHTML = `<span class="dot"></span><b>${esc(who || '')}</b> · ${esc(s.role)} · ${nodes.length} node${nodes.length === 1 ? '' : 's'}${s.live_queries ? ` · ${s.live_queries} live` : ''}`;
+    where.title = `This database's cluster: ${nodes.join(', ')}. Its leader is ${s.leader}; commits so far: ${s.hwm}.`;
+  } catch (e) {
+    where.innerHTML = '<span class="dot off"></span>not reachable';
+    where.title = e.message;
+  }
+}
+async function use(db) {
+  for (const c of S.cells) c.stopLive();
+  S.db = db;
+  await stats();
+  await Promise.all([tree(), notebooks()]);
+  saved();
+  toast(`Cells now run in database ${db}`);
+}
+let pending;
+const later = f => { clearTimeout(pending); pending = setTimeout(f, 250); };
+const refresh = () => Promise.all([stats(), tree(), notebooks()]);
+
+// ------------------------------------------------------------------ tokens
+function askToken(why) {
+  const d = $('#tokenDlg');
+  if (d.open) return;
+  $('#tokenWhy').textContent = `${why}. The token is kept in this browser only.`;
+  $('#tokenIn').value = store.get('pondra.token') || '';
+  d.returnValue = '';
+  d.showModal();
+}
+$('#tokenDlg').addEventListener('close', () => {
+  const v = $('#tokenDlg').returnValue;
+  if (v === 'ok' && $('#tokenIn').value.trim()) store.set('pondra.token', $('#tokenIn').value.trim());
+  else if (v === 'clear') store.set('pondra.token', null);
+  else return;
+  refresh();
+});
+
+// ------------------------------------------------------------------ the page
+$('#tokenBtn').onclick = () => askToken('The token this node was started with');
+$('#helpBtn').onclick = () => $('#helpDlg').showModal();
+$('#save').onclick = save;
+$('#runall').onclick = runAll;
+$('#download').onclick = () => saveAs(JSON.stringify(notebook(), null, 1) + '\n', 'application/x-ipynb+json', (cleanName(S.name) || 'notebook') + '.ipynb');
+$('#uploadBtn').onclick = () => $('#upload').click();
+$('#upload').onchange = async e => {
+  const f = e.target.files[0];
+  e.target.value = '';
+  if (!f || (S.dirty && !confirm('Open another notebook? This one has changes that are not saved.'))) return;
+  try {
+    load(JSON.parse(await f.text()), cleanName(f.name) || 'uploaded', null);
+    changed();
+    toast(`Opened ${f.name}: Ctrl+S keeps it in the lake`);
+  } catch (err) { toast(`Could not open ${f.name}: ${err.message}`, true); }
+};
+$('#nbname').addEventListener('change', e => { S.name = cleanName(e.target.value) || 'untitled'; e.target.value = S.name; S.version = null; changed(); });
+$('#nbname').addEventListener('keydown', e => { if (e.key === 'Enter') e.target.blur(); });
+$('#newnb').onclick = () => { if (!S.dirty || confirm('Start a new notebook? This one has changes that are not saved.')) blank(); };
+$('#refresh').onclick = refresh;
+$('#newdb').onclick = async () => {
+  const name = (prompt('A name for the new database (letters, digits and _):') || '').trim().toLowerCase();
+  if (!name) return;
+  try {
+    await call('/databases', { method: 'POST', body: JSON.stringify({ name }), headers: { 'content-type': 'application/json' }, root: true });
+    await use(name);
+  } catch (e) { toast(e.message, true); }
+};
+document.querySelectorAll('[data-add]').forEach(b => b.onclick = () => add({ kind: b.dataset.add }).edit());
+addEventListener('beforeunload', e => { if (S.dirty && S.cells.some(c => c.src.trim())) { e.preventDefault(); e.returnValue = ''; } });
+addEventListener('pagehide', () => {
+  const token = store.get('pondra.token');
+  fetch(base() + '/sessions/' + SESSION, { method: 'DELETE', keepalive: true, headers: token ? { authorization: 'Bearer ' + token } : {} }).catch(() => {}); // (this page's temporary tables)
+});
+
+(async function start() {
+  const hash = new URLSearchParams(location.hash.slice(1));
+  if (MODE === 'server') { $('#treeTitle').textContent = 'Databases'; $('#newdb').hidden = false; S.db = hash.get('db'); }
+  blank();
+  if (MODE === 'server') await tree();
+  await stats();
+  if (MODE !== 'server') await tree();
+  await notebooks();
+  const wanted = hash.get('notebook');
+  if (wanted) {
+    const vs = await rows(`SELECT path FROM files('notebooks/${wanted.replace(/'/g, "''")}/') ORDER BY path DESC LIMIT 1`).catch(() => []);
+    const v = vs[0]?.path.match(/\/([^/]+)\.ipynb$/);
+    if (v) await openSaved(wanted, v[1]);
+  }
+  setInterval(() => { if (document.visibilityState === 'visible') stats(); }, 15000);
+})();
+</script>
+</body>
+</html>

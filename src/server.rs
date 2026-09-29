@@ -689,7 +689,7 @@ async fn lookup(State(app): State<App>, Path((name, key)): Path<(String, String)
 
 #[derive(Deserialize)]
 struct SqlParams {
-    format: Option<String>, // json (default), table (text), arrow (Arrow IPC stream)
+    format: Option<String>, // json (default), table (text), arrow (Arrow IPC stream), typed (columns and types, then rows: the console's)
     after: Option<u64>,     // read-your-writes: first wait until this node has seen segment `after` (from an ack)
     spread: Option<String>, // "1": run across the cluster even for small tables; "0": only here
     stale_ms: Option<u64>,  // accept a cached result up to this old (see `Results`)
@@ -794,7 +794,7 @@ async fn query(app: &App, p: &SqlParams, query: &str, files: bool) -> anyhow::Re
     // Same query, same catalog version: same answer (unless it asks for the time or randomness,
     // or may read a file on this machine).
     let q = query.to_lowercase();
-    let volatile = files || !crate::ext::names(query).is_empty() || ["now()", "random(", "current_", "uuid(", "explain", "pondra.runs", "pondra.tasks"].iter().any(|f| q.contains(f)) // (files outside the lake change on their own)
+    let volatile = files || !crate::ext::names(query).is_empty() || ["now()", "random(", "current_", "uuid(", "explain", "pondra.runs", "pondra.tasks", "files("].iter().any(|f| q.contains(f)) // (files outside the lake change on their own; `files()` lists objects put since)
         || crate::temp::mentioned(query) // (the session's temporary tables change without a commit)
         || crate::routines::volatile(&app.lake, query).await; // (a Python function may answer differently each time)
     let Some(version) = app.lake.version_for(query).await.filter(|_| !volatile) else { return Ok(respond(run_sql(app, p, query, files).await?)) };
@@ -837,6 +837,7 @@ async fn run_sql(app: &App, p: &SqlParams, query: &str, files: bool) -> anyhow::
 pub fn render(batches: &[RecordBatch], format: Option<&str>) -> anyhow::Result<bytes::Bytes> {
     Ok(bytes::Bytes::from(match format {
         Some("table") => pretty_format_batches(batches)?.to_string().into_bytes(),
+        Some("typed") => typed(batches)?,
         Some("arrow") => crate::query::ipc(batches)?,
         _ => {
             let mut w = arrow_json::ArrayWriter::new(Vec::new());
@@ -845,6 +846,45 @@ pub fn render(batches: &[RecordBatch], format: Option<&str>) -> anyhow::Result<b
             w.into_inner()
         }
     }))
+}
+
+/// The console's answer (`?format=typed`, `console.html`): the columns with their types, the
+/// first `SHOWN` rows as lists in the columns' order (two columns may share a name: a join's), and
+/// how many rows there were.
+fn typed(batches: &[RecordBatch]) -> anyhow::Result<Vec<u8>> {
+    const SHOWN: usize = 10_000;
+    let columns: Vec<Value> = batches.first().map(|b| b.schema().fields().iter().map(|f| j!({"name": f.name(), "type": crate::query::type_name(f.data_type())})).collect()).unwrap_or_default();
+    let mut w = arrow_json::ArrayWriter::new(Vec::new());
+    let mut left = SHOWN;
+    for b in batches.iter().filter(|b| b.num_rows() > 0) {
+        let b = b.slice(0, left.min(b.num_rows()));
+        left -= b.num_rows();
+        let exact: Vec<datafusion::arrow::array::ArrayRef> = b.columns().iter().map(exact).collect::<Result<_, _>>()?;
+        let numbered: Vec<_> = b.schema().fields().iter().zip(&exact).enumerate().map(|(i, (f, c))| f.as_ref().clone().with_name(i.to_string()).with_data_type(c.data_type().clone())).collect(); // (unique keys)
+        w.write(&RecordBatch::try_new(Arc::new(datafusion::arrow::datatypes::Schema::new(numbered)), exact)?)?;
+        if left == 0 {
+            break;
+        }
+    }
+    w.finish()?;
+    let objects: Vec<serde_json::Map<String, Value>> = serde_json::from_slice(&w.into_inner()).unwrap_or_default();
+    let rows: Vec<Value> = objects.into_iter().map(|mut o| Value::Array((0..columns.len()).map(|i| o.remove(&i.to_string()).unwrap_or(Value::Null)).collect())).collect();
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    Ok(serde_json::to_vec(&j!({"columns": columns, "rows": rows, "total": total}))?)
+}
+
+/// A column as JavaScript can hold it exactly: decimals as their digits (`1.50`), and 64-bit
+/// integers past 2^53 as text.
+fn exact(c: &datafusion::arrow::array::ArrayRef) -> anyhow::Result<datafusion::arrow::array::ArrayRef> {
+    use datafusion::arrow::{array::AsArray, compute, datatypes::{DataType, Int64Type, UInt64Type}};
+    const SAFE: i64 = (1 << 53) - 1;
+    let text = match c.data_type() {
+        DataType::Decimal32(..) | DataType::Decimal64(..) | DataType::Decimal128(..) | DataType::Decimal256(..) => true,
+        DataType::Int64 => compute::min(c.as_primitive::<Int64Type>()).is_some_and(|m| m < -SAFE) || compute::max(c.as_primitive::<Int64Type>()).is_some_and(|m| m > SAFE),
+        DataType::UInt64 => compute::max(c.as_primitive::<UInt64Type>()).is_some_and(|m| m > SAFE as u64),
+        _ => false,
+    };
+    Ok(if text { compute::cast(c, &DataType::Utf8)? } else { c.clone() })
 }
 
 #[derive(Deserialize)]
@@ -900,7 +940,7 @@ async fn tier_now(State(app): State<App>) -> Result<Json<Value>, E> {
 async fn stats(State(app): State<App>) -> Json<Value> {
     let c = &app.cluster;
     let role = if c.reader { "reader" } else if app.seq.is_some() { "leader" } else { "follower" };
-    let mut s = j!({"role": role, "leader": c.leader.addr, "term": c.leader.n, "nodes": c.nodes(),
+    let mut s = j!({"lake": crate::ddl::lake_name(&app.lake), "role": role, "leader": c.leader.addr, "term": c.leader.n, "nodes": c.nodes(),
                     "hwm": *app.lake.hwm.borrow(), "shard_runs": c.shard_runs.load(std::sync::atomic::Ordering::Relaxed), "python_workers": crate::python::workers(),
                     "live_queries": crate::live::OPEN.load(std::sync::atomic::Ordering::Relaxed)});
     if let Some(seq) = &app.seq {

@@ -144,7 +144,8 @@ def _arg(p, i):
 def scope(name, con=None):
     import pondra
     from pondra import plpy
-    return {"__name__": f"pondra_{name.replace('.', '_')}", "__builtins__": __builtins__, "pondra": pondra, "plpy": plpy, "con": _NoConnection() if con is None else con,
+    con = _NoConnection() if con is None else con
+    return {"__name__": f"pondra_{name.replace('.', '_')}", "__builtins__": __builtins__, "pondra": pondra, "plpy": plpy, "con": con, "db": con,  # (`db`: a console cell's name for it)
             "SD": {}, "GD": plpy.GD}
 
 

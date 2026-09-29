@@ -135,7 +135,7 @@ impl Backend {
                     let schema = batches.first().map(|b| b.schema()).unwrap_or_else(|| Arc::new(datafusion::arrow::datatypes::Schema::empty()));
                     Ok(Response::Query(rows(&schema, batches, format)?))
                 }
-                crate::routines::Outcome::Done(_) => Ok(Response::Execution(Tag::new("CALL"))),
+                crate::routines::Outcome::Done(_) => Ok(Response::Execution(Tag::new(if crate::routines::do_of(&sql).is_some() { "DO" } else { "CALL" }))),
             };
         }
         if let Some(stmt) = crate::write::parse(&sql) {

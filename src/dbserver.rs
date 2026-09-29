@@ -190,7 +190,7 @@ pub async fn serve(folder: String, addr: String, pg: Option<String>, default: Op
         });
     }
     let app = Router::new()
-        .route("/", get(|| async { crate::console::page() }))
+        .route("/", get(|| async { crate::console::server_page() }))
         .route("/databases", get(list).post(create))
         .route("/databases/{name}", axum::routing::delete(drop_db))
         .route("/db/{name}", any(|State(s): State<Shared>, Path(name): Path<String>, req: Request| async move { route(&s, &name, "/", req).await }))

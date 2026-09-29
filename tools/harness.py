@@ -2893,6 +2893,26 @@ $$""")
     checks["…go with it (DROP SCHEMA … CASCADE)"] = "ops" not in json.dumps(call(A.port, "GET", "/routines", headers={"authorization": "Bearer r-tok"}))
     q("DROP MACRO big"); q("DROP PROCEDURE twice")
     checks["DROP MACRO, DROP PROCEDURE"] = err("CALL twice(1)").endswith("no procedure twice'") or "no procedure twice" in err("CALL twice(1)")
+    # DO (ADR-030): a console's Python cell, from every door, as an admin. What it prints comes
+    # back as notices; its last expression, a frame here, as rows; an error at the code's line.
+    import urllib.request
+    block = 'DO LANGUAGE python $pondra$\nfor i in range(2):\n    print("said", i)\ndb.table("orders").select("id").sort("id").limit(1)\n$pondra$'
+    r = urllib.request.urlopen(urllib.request.Request(f"http://127.0.0.1:{A.port}/sql", block.encode(), headers={"authorization": "Bearer a-tok"}), timeout=120)
+    said, answer = json.loads(r.headers.get("x-pondra-notices") or "[]"), json.loads(r.read())
+    first = q("SELECT min(id) AS id FROM orders")[0]["id"]
+    checks["DO LANGUAGE python over HTTP: what it printed as notices, its last expression (a frame) as rows"] = said == ["said 0", "said 1"] and answer == [{"id": first}]
+    heard = []
+    with psycopg.connect(f"host=127.0.0.1 port={A.port + 11} user=admin password=a-tok dbname=lake", autocommit=True) as c:
+        c.add_notice_handler(lambda d: heard.append(d.message_primary))
+        cur = c.execute("DO $$\nprint('from psql')\n$$ LANGUAGE python")
+        checks["DO over Postgres: NOTICE, tag DO (the language after the code, as Postgres allows)"] = heard == ["from psql"] and cur.statusmessage == "DO"
+    before = q("SELECT count(*) AS n FROM orders")[0]["n"]
+    q("DO LANGUAGE sql $$ INSERT INTO orders VALUES (900, 'do', 1, 1.0); INSERT INTO orders VALUES (901, 'do', 1, 1.0) $$")
+    checks["DO LANGUAGE sql: its statements, in order"] = q("SELECT count(*) AS n FROM orders")[0]["n"] == before + 2
+    broken = err("DO LANGUAGE python $$\nx = 1\n1 / 0\n$$")
+    checks["DO: only an admin runs one; an error at the line in its code; other languages said so"] = "admin" in err(block, token="w-tok") \
+        and "ZeroDivisionError" in broken and "line 2: 1 / 0" in broken and not broken.split("ZeroDivisionError")[0].strip(" :'\"").endswith("do") \
+        and "LANGUAGE python" in err("DO $$ BEGIN END $$")
     for n in nodes:
         n.kill()
     # a node on another address with --python and no tokens refuses to start; `pondra run` runs a file
@@ -3712,7 +3732,8 @@ def found():
     CREATE FUNCTION; COPY's count with a header; a write token's message; PUT /files twice
     without the node's paths; files() and file_read() with or without `files/`; a Flight function
     callable as soon as it is made, and gone as soon as it is dropped; ADBC's handshake without
-    padding, its ingest modes and table types; `pondra run`'s flags anywhere."""
+    padding, its ingest modes and table types; `pondra run`'s flags anywhere. And what the console
+    found: a time without seconds, BASE TABLE, exact numbers, files() after PUT."""
     import datetime as dt, psycopg, pyarrow as pa, pyarrow.flight as fl
     import adbc_driver_flightsql.dbapi as adbc
     lake, guarded = new_lake(), new_lake()
@@ -3956,6 +3977,26 @@ def found():
         and "| 3 | 6 |" in cli("fresh", "SELECT count(*) AS n, sum(a) AS s FROM t").stdout \
         and wrong.returncode == 1 and "nope" in wrong.stderr and not any("backtrace" in e.lower() for e in (empty.stderr, wrong.stderr))
     shutil.rmtree(work, ignore_errors=True)
+    # What the console found (round 26): a time without seconds is a timestamp, as in Postgres
+    # (INSERT, CAST, TIMESTAMP '…', a comparison); a table is a BASE TABLE to information_schema;
+    # the console's answers keep decimals and big integers exact; a files() listing is never an
+    # answer remembered from before the last PUT /files.
+    q("CREATE TABLE meets (id BIGINT, at TIMESTAMP, tz TIMESTAMPTZ)")
+    q("INSERT INTO meets VALUES (1, '2024-05-01 10:30', '2024-05-01T10:30+02'), (2, '2024-05-01 11:00:15', NULL)")
+    checks["a time without seconds is a timestamp: INSERT, CAST, TIMESTAMP '…', a comparison"] = \
+        q("SELECT id, at, tz FROM meets ORDER BY id") == [{"id": 1, "at": "2024-05-01T10:30:00", "tz": "2024-05-01T08:30:00Z"}, {"id": 2, "at": "2024-05-01T11:00:15"}] \
+        and q("SELECT CAST('2024-05-01 10:30' AS TIMESTAMP) AS a, TIMESTAMP '2024-05-01 10:30' AS b") == [{"a": "2024-05-01T10:30:00", "b": "2024-05-01T10:30:00"}] \
+        and q("SELECT count(*) AS n FROM meets WHERE at >= '2024-05-01 10:31'") == [{"n": 1}]
+    q("CREATE VIEW meets_v AS SELECT id FROM meets")
+    kinds = {r["table_name"]: r["table_type"] for r in q("SELECT table_name, table_type FROM information_schema.tables WHERE table_name LIKE 'meets%'")}
+    checks["information_schema: a table is a BASE TABLE, a view a VIEW"] = kinds == {"meets": "BASE TABLE", "meets_v": "VIEW"}
+    typed = call(port, "POST", "/sql?format=typed", b"SELECT CAST(1.5 AS DECIMAL(10,2)) AS d, 9007199254740993 AS big, 7 AS small")
+    checks["format=typed: decimals and integers past 2^53 exact (as text), others as numbers"] = typed["rows"] == [["1.50", "9007199254740993", 7]] \
+        and [c["type"] for c in typed["columns"]] == ["Decimal128(10, 2)", "Int64", "Int64"] and typed["total"] == 1
+    listing = lambda: [r["path"] for r in q("SELECT path FROM files('listed/')")]
+    first = listing()
+    call(port, "PUT", "/files/listed/a.txt", b"a")
+    checks["files() after PUT /files lists the new file (never a remembered answer)"] = first == [] and listing() == ["files/listed/a.txt"]
     node.kill(); locked.kill()
     ok = all(checks.values())
     print(json.dumps({"found": checks, "ok": ok}, indent=1))

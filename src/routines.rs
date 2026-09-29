@@ -926,6 +926,17 @@ pub async fn one(app: &App, sql: &str, who: Who, job: Option<String>) -> Result<
     if let Some((name, args, column)) = start_of(sql) {
         return start(app, &name, &args, &column, who, job).await;
     }
+    if let Some((language, body)) = do_of(sql) {
+        // A procedure made, called once and forgotten, as its caller: an admin's, as making one is.
+        ensure!(who.role >= Role::Admin, "DO runs code on the node: it needs an admin token, as making a procedure does");
+        let r = match language.as_str() {
+            "python" => Routine { kind: Kind::Procedure, params: vec![], language, body, returns: None, with: Options::default() },
+            "sql" => Routine { kind: Kind::Procedure, params: vec![], language, body, returns: None, with: Options::default() },
+            l => bail!("DO LANGUAGE {l}: Pondra's code blocks are LANGUAGE python (a console's Python cell) or LANGUAGE sql"),
+        };
+        let none = RecordBatch::try_new_with_options(Arc::new(datafusion::arrow::datatypes::Schema::empty()), vec![], &datafusion::arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(1)))?;
+        return Box::pin(run(app, "do".into(), r, none, who, job, None)).await;
+    }
     if let Some(stmt) = crate::write::parse(sql) {
         app.auth.allows(who.role, &stmt)?;
         return Ok(Outcome::Done(crate::write::on_node_as(app, stmt, job, who.files).await?));
@@ -999,7 +1010,18 @@ pub fn start_of(sql: &str) -> Option<(String, Vec<FunctionArg>, String)> {
 }
 
 /// Does `sql` run a procedure (`CALL`, `pondra.start`)? Then it goes to `one`, not to a query.
-pub fn runs_procedure(sql: &str) -> bool { call_of(sql).is_some() || start_of(sql).is_some() }
+pub fn runs_procedure(sql: &str) -> bool { call_of(sql).is_some() || start_of(sql).is_some() || do_of(sql).is_some() }
+
+/// `DO LANGUAGE python $$ … $$` (Postgres's anonymous code block; the language may come after
+/// the code): (language, body). What a console's Python cell sends (ADR-030).
+pub fn do_of(sql: &str) -> Option<(String, String)> {
+    static DO: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"(?is)^DO\s+(?:LANGUAGE\s+(\w+)\s+)?\$(\w*)\$(.*)\$(\w*)\$\s*(?:LANGUAGE\s+(\w+))?\s*;?\s*$").expect("a regex")
+    });
+    let c = DO.captures(crate::write::first_word(sql))?;
+    let body = c[3].strip_prefix("\r\n").or_else(|| c[3].strip_prefix('\n')).unwrap_or(&c[3]); // (line 1 is the code's first line)
+    (c[2] == c[4]).then(|| (c.get(1).or(c.get(5)).map_or("plpgsql", |m| m.as_str()).to_lowercase(), body.to_string()))
+}
 
 /// A procedure and its arguments, worked out once, as the caller (`CALL p(now())`: one moment for
 /// every statement), cast to their parameters' types.
@@ -1090,7 +1112,10 @@ pub async fn with_notices<F: std::future::Future>(f: F) -> (F::Output, Vec<Strin
 /// then the answer: rows, a frame's SQL (run here), or nothing. Secrets it read are blanked out of
 /// what it says (notices, errors).
 async fn python(app: &App, name: &str, r: &Routine, args: RecordBatch, who: Who, job: Option<String>, heard: &mut Vec<String>) -> Result<Outcome> {
-    crate::python::ready(&format!("{name} is a Python procedure"))?;
+    crate::python::ready(&match name {
+        "do" => "DO LANGUAGE python (a console's Python cell) runs Python on the node".to_string(),
+        _ => format!("{name} is a Python procedure"),
+    })?;
     let lease = crate::auth::lend(who.role, who.files); // (ends when this does)
     let url = format!("http://{}", app.cluster.addr.replace("0.0.0.0", "127.0.0.1"));
     let json: Vec<bool> = r.params.iter().map(|p| crate::pyfn::is_json(p.ty.as_deref())).collect();
@@ -1102,7 +1127,8 @@ async fn python(app: &App, name: &str, r: &Routine, args: RecordBatch, who: Who,
         let _ = NOTICES.try_with(|all| all.lock().unwrap().push(n.clone()));
         heard.push(n);
     };
-    let (answer, parts) = crate::python::ask(&r.with.packages, kind, head, vec![crate::query::ipc(&[args])?], limit, &mut notice).await.map_err(|e| anyhow::anyhow!("{name}: {}", lease.redact(&format!("{e:#}"))))?;
+    let whose = if name == "do" { String::new() } else { format!("{name}: ") }; // (a DO block has no name)
+    let (answer, parts) = crate::python::ask(&r.with.packages, kind, head, vec![crate::query::ipc(&[args])?], limit, &mut notice).await.map_err(|e| anyhow::anyhow!("{whose}{}", lease.redact(&format!("{e:#}"))))?;
     match answer["kind"].as_str() {
         Some("rows") => Ok(Outcome::Rows(crate::query::read_ipc(parts.first().context("no rows")?)?)),
         Some("sql") => Box::pin(one(app, answer["sql"].as_str().unwrap_or_default(), who, None)).await,

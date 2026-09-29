@@ -43,9 +43,40 @@ pub fn rules() -> Vec<Arc<dyn OptimizerRule + Send + Sync>> {
     if std::env::var("PONDRA_JOIN_ORDER").as_deref() != Ok("0") {
         rules.insert(at, Arc::new(JoinOrder)); // (after the filters are down: they say how big each input is)
     }
+    rules.insert(0, Arc::new(Seconds)); // (before a literal is folded into a timestamp)
     rules.push(Arc::new(CheapFirst));
     rules.push(Arc::new(AsyncBelow)); // (last: after COUNT(DISTINCT) became a GROUP BY)
     rules
+}
+
+/// `CAST('2024-05-01 10:30' AS TIMESTAMP)`, `TIMESTAMP '…'`, `ts > '2024-05-01 10:30'`: text
+/// that DataFusion will parse as a timestamp, given its seconds if it has none (`query::seconds`),
+/// before the literal is folded.
+#[derive(Debug)]
+struct Seconds;
+
+impl OptimizerRule for Seconds {
+    fn name(&self) -> &str { "pondra_seconds" }
+    fn apply_order(&self) -> Option<ApplyOrder> { Some(ApplyOrder::TopDown) }
+    fn supports_rewrite(&self) -> bool { true }
+    fn rewrite(&self, plan: LogicalPlan, _: &dyn OptimizerConfig) -> Result<Transformed<LogicalPlan>> {
+        use datafusion::common::ScalarValue;
+        let fixed = |e: &Expr| match e {
+            Expr::Literal(ScalarValue::Utf8(Some(s)) | ScalarValue::Utf8View(Some(s)) | ScalarValue::LargeUtf8(Some(s)), _) => crate::query::seconds(s).map(|s| Box::new(Expr::Literal(ScalarValue::Utf8(Some(s)), None))),
+            _ => None,
+        };
+        plan.map_expressions(|e| e.transform_up(|e| Ok(match e {
+            Expr::Cast(mut c) if matches!(c.field.data_type(), DataType::Timestamp(..)) => match fixed(&c.expr) {
+                Some(l) => { c.expr = l; Transformed::yes(Expr::Cast(c)) }
+                None => Transformed::no(Expr::Cast(c)),
+            },
+            Expr::TryCast(mut c) if matches!(c.field.data_type(), DataType::Timestamp(..)) => match fixed(&c.expr) {
+                Some(l) => { c.expr = l; Transformed::yes(Expr::TryCast(c)) }
+                None => Transformed::no(Expr::TryCast(c)),
+            },
+            e => Transformed::no(e),
+        })))
+    }
 }
 
 /// DataFusion runs async functions — Python functions (`pyfn.rs`), Flight ones (`udf.rs`) — in

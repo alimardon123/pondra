@@ -84,8 +84,33 @@ pub fn strict(c: &ArrayRef, t: &DataType) -> Result<ArrayRef> {
     if c.data_type() == t {
         return Ok(c.clone());
     }
+    let c = match (c.data_type(), t) {
+        (DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8, DataType::Timestamp(..)) => with_seconds(c)?, // ('… 10:00')
+        _ => c.clone(),
+    };
     let options = datafusion::arrow::compute::CastOptions { safe: false, ..Default::default() };
-    Ok(datafusion::arrow::compute::cast_with_options(c, t, &options)?)
+    Ok(datafusion::arrow::compute::cast_with_options(&c, t, &options)?)
+}
+
+/// A time of day without seconds (`'2024-05-01 10:30'`, `'…T10:30+02'`), with them (`10:30:00`):
+/// Postgres, DuckDB, Snowflake and Spark read the first as the second; Arrow's parser wants the
+/// seconds. None: `s` is something else, left as it is.
+pub fn seconds(s: &str) -> Option<String> {
+    static HHMM: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"^(\s*\d{4}-\d{1,2}-\d{1,2}[T ]\d{1,2}:\d{2})(\s*(?:[Zz]|[+-]\d{1,2}(?::?\d{2})?|[A-Za-z][\w/+-]*)?\s*)$").expect("a regex")
+    });
+    HHMM.captures(s).map(|c| format!("{}:00{}", &c[1], &c[2]))
+}
+
+/// Text meant as timestamps, the ones without seconds given them (`seconds`).
+fn with_seconds(c: &ArrayRef) -> Result<ArrayRef> {
+    use datafusion::arrow::array::{AsArray, StringArray};
+    let text = datafusion::arrow::compute::cast(c, &DataType::Utf8)?;
+    let text = text.as_string::<i32>();
+    if !text.iter().flatten().any(|s| seconds(s).is_some()) {
+        return Ok(c.clone());
+    }
+    Ok(Arc::new(text.iter().map(|s| s.map(|s| seconds(s).unwrap_or_else(|| s.to_string()))).collect::<StringArray>()) as ArrayRef)
 }
 
 /// Rows of `table` from committed segments in (after, upto]; `None` = up to the latest; under
@@ -290,12 +315,34 @@ async fn upsert_view(lake: &Lake, ctx: &SessionContext, name: &str, meta: &Table
 pub fn named(ctx: &SessionContext, provider: Arc<dyn TableProvider>, meta: &TableMeta, deleted: bool) -> Result<Arc<dyn TableProvider>> {
     let hide = !deleted && !meta.key.is_empty() && meta.columns.iter().any(|(c, _)| c == "_deleted");
     if !meta.mapped() && !hide {
-        return Ok(provider);
+        return Ok(Arc::new(Table(provider)));
     }
     let df = ctx.read_table(provider)?;
     let shown = |c: &String| !meta.dropped.contains(c) && !(hide && c == "_deleted");
     let keep: Vec<Expr> = df.schema().fields().iter().filter(|f| shown(f.name())).map(|f| datafusion::prelude::ident(f.name()).alias(meta.name_of(f.name()))).collect();
-    Ok(df.select(keep)?.into_view())
+    Ok(Arc::new(Table(df.select(keep)?.into_view())))
+}
+
+/// A lake's table as clients list it (`information_schema.tables`, the shell's `.tables`, the
+/// console): a `BASE TABLE`, though it is planned as the query over its files and log it is (every
+/// call is `inner`'s, its plan included).
+#[derive(Debug)]
+pub struct Table(pub Arc<dyn TableProvider>);
+
+#[async_trait::async_trait]
+impl TableProvider for Table {
+    fn schema(&self) -> SchemaRef { self.0.schema() }
+    fn table_type(&self) -> datafusion::datasource::TableType { datafusion::datasource::TableType::Base }
+    fn constraints(&self) -> Option<&datafusion::common::Constraints> { self.0.constraints() }
+    fn get_logical_plan(&self) -> Option<std::borrow::Cow<'_, datafusion::logical_expr::LogicalPlan>> { self.0.get_logical_plan() }
+    fn get_column_default(&self, column: &str) -> Option<&Expr> { self.0.get_column_default(column) }
+    fn statistics(&self) -> Option<datafusion::common::Statistics> { self.0.statistics() }
+    fn supports_filters_pushdown(&self, filters: &[&Expr]) -> datafusion::error::Result<Vec<datafusion::logical_expr::TableProviderFilterPushDown>> {
+        self.0.supports_filters_pushdown(filters)
+    }
+    async fn scan(&self, state: &dyn datafusion::catalog::Session, projection: Option<&Vec<usize>>, filters: &[Expr], limit: Option<usize>) -> datafusion::error::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+        self.0.scan(state, projection, filters, limit).await
+    }
 }
 
 /// Does a query (with the stored views it reads) name a keyed table's `_deleted` (`named`)?
