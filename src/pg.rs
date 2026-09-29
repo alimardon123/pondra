@@ -117,7 +117,10 @@ impl Backend {
     /// Run one statement the way `POST /sql` does, for a client whose role comes from its user name.
     async fn run(&self, user: &str, sql: &str, format: &Format) -> PgWireResult<Response> {
         let sql = crate::routines::expand(&self.app.lake, sql).await.map_err(user_error)?; // (macros: ADR-023)
-        let sql = crate::asof::rewrite(&pg_dialect(&self.app.lake, &sql)).map_err(user_error)?.into_owned();
+        let sql = crate::asof::rewrite(&pg_dialect(&self.app.lake, &sql, user)).map_err(user_error)?.into_owned();
+        if std::env::var_os("PONDRA_DEBUG_PG").is_some() {
+            eprintln!("pg {user}: {sql}");
+        }
         if let Some(r) = session_command(&sql) {
             return Ok(r);
         }
@@ -137,18 +140,33 @@ impl Backend {
         }
         if let Some(stmt) = crate::write::parse(&sql) {
             self.app.auth.allows(role, &stmt).map_err(user_error)?;
-            let tag = sql.split_whitespace().next().unwrap_or("OK").to_uppercase();
+            let tag = command_tag(&sql, &stmt);
             let v = crate::write::on_node(&self.app, stmt, None).await.map_err(user_error)?;
             let rows = v["rows"].as_u64().unwrap_or(0) as usize;
-            return Ok(Response::Execution(if tag == "INSERT" { Tag::new("INSERT").with_oid(0).with_rows(rows) } else { Tag::new(&tag).with_rows(rows) }));
+            return Ok(Response::Execution(match tag.as_str() {
+                "INSERT" => Tag::new("INSERT").with_oid(0).with_rows(rows),
+                "SELECT" | "UPDATE" | "DELETE" | "MERGE" | "COPY" => Tag::new(&tag).with_rows(rows),
+                _ => Tag::new(&tag),
+            }));
         }
-        let batches = match sql.contains("pg_") {
-            true => self.session(&sql).await?.sql_with_options(&sql, read_only()).await.map_err(|e| user_error(e.into()))?.collect().await.map_err(|e| user_error(e.into()))?,
+        let catalog = crate::pg_catalog::wanted(&sql);
+        let batches = match catalog {
+            true => match async { self.session(&sql, user).await?.sql_with_options(&sql, read_only()).await.map_err(|e| user_error(e.into()))?.collect().await.map_err(|e| user_error(e.into())) }.await {
+                Ok(b) => b,
+                // (over catalog tables that are always empty: no rows, whatever DataFusion made of it)
+                Err(e) => match crate::pg_catalog::empty_answer(&sql) {
+                    Some(names) => {
+                        let schema = Schema::new(names.into_iter().map(|n| datafusion::arrow::datatypes::Field::new(n, DataType::Utf8, true)).collect::<Vec<_>>());
+                        return Ok(Response::Query(rows(&schema, vec![], format)?));
+                    }
+                    None => return Err(e),
+                },
+            },
             false => self.app.query(&sql, None).await.map_err(user_error)?,
         };
         let schema = match batches.first() {
             Some(b) => b.schema(),
-            None => self.schema(&sql).await?,
+            None => self.schema(&sql, user).await?,
         };
         Ok(Response::Query(rows(&schema, batches, format)?))
     }
@@ -172,7 +190,7 @@ impl Backend {
         let batches = self.app.query(&sql, None).await.map_err(user_error)?;
         let schema = match batches.first() {
             Some(b) => b.schema(),
-            None => self.schema(&sql).await?,
+            None => self.schema(&sql, "").await?,
         };
         let format = if c.format == "binary" { FieldFormat::Binary } else { FieldFormat::Text };
         let (info, types) = fields(&schema, &|_| format);
@@ -259,49 +277,65 @@ impl Backend {
     }
 
     /// A query's result columns, without running it.
-    async fn schema(&self, sql: &str) -> PgWireResult<Arc<Schema>> {
+    async fn schema(&self, sql: &str, user: &str) -> PgWireResult<Arc<Schema>> {
         let sql = crate::asof::rewrite(sql).map_err(user_error)?;
-        let df = self.session(&sql).await?.sql_with_options(&sql, read_only()).await.map_err(|e| user_error(e.into()))?;
+        let df = self.session(&sql, user).await?.sql_with_options(&sql, read_only()).await.map_err(|e| user_error(e.into()))?;
         Ok(Arc::new(df.schema().as_arrow().clone()))
     }
 
-    /// A session for `sql`, with the little of Postgres's catalog that drivers look at on connect
-    /// (types, namespaces, the tables) when it asks for it.
-    async fn session(&self, sql: &str) -> PgWireResult<datafusion::prelude::SessionContext> {
+    /// A session for `sql`; with Postgres's catalog, its functions and its `information_schema`
+    /// when it reads them (`pg_catalog.rs`).
+    async fn session(&self, sql: &str, user: &str) -> PgWireResult<datafusion::prelude::SessionContext> {
         let ctx = crate::query::session(&self.app.lake, sql, "").await.map_err(user_error)?;
-        if sql.contains("pg_") {
-            let lake = &self.app.lake;
-            let schemas = crate::ddl::schemas(lake).await.map_err(user_error)?; // (public first: oid 2200, as in Postgres)
-            let oid = |schema: &str| schemas.iter().position(|s| s == schema).map_or(2200, |i| if i == 0 { 2200 } else { 30000 + i });
-            let tables = lake.cat.scan::<crate::store::TableMeta>("t/", "t0").await.map_err(user_error)?.into_iter().filter(|(k, _)| !crate::sys::hidden(k)).map(|(k, _)| (k, 'r'));
-            let views = lake.cat.scan::<crate::ddl::StoredView>("q/", "q0").await.map_err(user_error)?.into_iter().map(|(k, _)| (k, 'v'));
-            let classes = tables.chain(views).enumerate().map(|(i, (k, kind))| format!("({}, '{}', {}, '{kind}')", 16384 + i, crate::ddl::split(&k[2..]).1, oid(crate::ddl::split(&k[2..]).0))).collect::<Vec<_>>();
-            let namespaces = schemas.iter().map(|s| format!(", ({}, '{s}')", oid(s))).collect::<String>();
-            // (with each type's binary receive function: what the ADBC driver knows a type by)
-            let types = [(16, "bool", "boolrecv"), (17, "bytea", "bytearecv"), (20, "int8", "int8recv"), (21, "int2", "int2recv"), (23, "int4", "int4recv"), (25, "text", "textrecv"), (700, "float4", "float4recv"),
-                         (701, "float8", "float8recv"), (1043, "varchar", "varcharrecv"), (1082, "date", "date_recv"), (1114, "timestamp", "timestamp_recv"), (1700, "numeric", "numeric_recv")];
-            let types = types.iter().map(|(o, n, r)| format!("({o}, '{n}', 0, 11, 'b', 0, '{r}', '{}', 0, 0)", r.replace("recv", "send"))).collect::<Vec<_>>();
-            for view in [
-                format!("pg_type AS SELECT * FROM (VALUES {}) AS t(oid, typname, typarray, typnamespace, typtype, typrelid, typreceive, typsend, typbasetype, typelem)", types.join(", ")),
-                "pg_attribute AS SELECT * FROM (VALUES (0, '', 0, 0, false)) AS t(attrelid, attname, atttypid, attnum, attisdropped) WHERE attrelid > 0".to_string(),
-                format!("pg_namespace AS SELECT * FROM (VALUES (11, 'pg_catalog'){namespaces}) AS t(oid, nspname)"),
-                format!("pg_class AS SELECT * FROM (VALUES (0, '', 0, ''){}) AS t(oid, relname, relnamespace, relkind) WHERE oid > 0", classes.iter().map(|c| format!(", {c}")).collect::<String>()),
-                format!("pg_database AS SELECT * FROM (VALUES (1, '{}')) AS t(oid, datname)", crate::ddl::lake_name(lake)),
-            ] {
-                ctx.sql(&format!("CREATE VIEW {view}")).await.map_err(|e| user_error(e.into()))?;
-            }
+        if crate::pg_catalog::wanted(sql) {
+            crate::pg_catalog::register(&ctx, &self.app.lake, if user.is_empty() { "pondra" } else { user }, sql).await.map_err(user_error)?;
         }
         Ok(ctx)
     }
 }
 
 /// psql, JDBC and SQLAlchemy ask for a few Postgres-only things on connect.
-fn pg_dialect(lake: &crate::store::Lake, sql: &str) -> String {
-    let sql = sql.trim().trim_end_matches(';').replace("pg_catalog.", "");
+fn pg_dialect(lake: &crate::store::Lake, sql: &str, user: &str) -> String {
+    let sql = sql.trim().trim_end_matches(';');
+    let sql = match crate::pg_catalog::wanted(sql) {
+        true => crate::pg_catalog::rewrite(sql, user),
+        false => sql.to_string(),
+    };
     let sql = if sql.eq_ignore_ascii_case("select version()") { "SELECT version() AS version".into() } else { sql }; // (the column's name in Postgres)
     // (the ADBC driver's list of types: receive functions are names here, not function ids)
     let sql = sql.replace("(typreceive != 0 OR typsend != 0)", "true").replace("typreceive::TEXT", "typreceive");
     sql.replace("current_schema()", "'public'").replace("CURRENT_SCHEMA()", "'public'").replace("current_database()", &format!("'{}'", crate::ddl::lake_name(lake))).replace("version()", "'PostgreSQL 16.0 (Pondra on Apache DataFusion)'")
+}
+
+/// The command tag Postgres answers a write with: `INSERT 0 3`, `UPDATE 2`, `SELECT 5` for a
+/// CREATE TABLE … AS, `CREATE VIEW`, `DROP TABLE`, `ALTER TABLE` (what clients show, and dbt logs).
+fn command_tag(sql: &str, stmt: &crate::write::Stmt) -> String {
+    use crate::write::Stmt;
+    let words: Vec<String> = crate::write::first_word(sql).split_whitespace().take(6).map(|w| w.to_uppercase()).collect();
+    match stmt {
+        Stmt::Insert(..) | Stmt::InsertInto(..) => return "INSERT".into(),
+        Stmt::Update(..) => return "UPDATE".into(),
+        Stmt::Delete(..) if words.first().is_some_and(|w| w == "TRUNCATE") => return "TRUNCATE TABLE".into(),
+        Stmt::Delete(..) => return "DELETE".into(),
+        Stmt::Merge(_) if words.first().is_some_and(|w| w == "MERGE") => return "MERGE".into(),
+        Stmt::Merge(_) if words.first().is_some_and(|w| w == "INSERT") => return "INSERT".into(),
+        Stmt::Merge(_) => return words.first().cloned().unwrap_or_default(),
+        Stmt::Create(c) if c.query.is_some() => return "SELECT".into(),
+        _ => {}
+    }
+    let skip = ["OR", "REPLACE", "TEMP", "TEMPORARY", "UNLOGGED", "GLOBAL", "LOCAL", "IF", "NOT", "EXISTS"];
+    match words.first().map(String::as_str) {
+        Some(verb @ ("CREATE" | "DROP" | "ALTER")) => {
+            let mut rest = words[1..].iter().filter(|w| !skip.contains(&w.as_str()));
+            match rest.next().map(String::as_str) {
+                Some("MATERIALIZED") => format!("{verb} MATERIALIZED VIEW"),
+                Some(obj) => format!("{verb} {obj}"),
+                None => verb.to_string(),
+            }
+        }
+        Some(w) => w.to_string(),
+        None => "OK".into(),
+    }
 }
 
 /// Session settings and transactions: accepted (every statement commits on its own).
@@ -362,7 +396,8 @@ fn pg_type(t: &DataType, format: FieldFormat) -> (Type, DataType) {
         DataType::Boolean => (Type::BOOL, DataType::Boolean),
         DataType::Int8 | DataType::Int16 | DataType::UInt8 => (Type::INT2, DataType::Int16),
         DataType::Int32 | DataType::UInt16 => (Type::INT4, DataType::Int32),
-        DataType::Int64 | DataType::UInt32 | DataType::UInt64 => (Type::INT8, DataType::Int64),
+        DataType::UInt32 => (Type::OID, DataType::UInt32), // (the catalog's oids: `pg_catalog.rs`)
+        DataType::Int64 | DataType::UInt64 => (Type::INT8, DataType::Int64),
         DataType::Float32 => (Type::FLOAT4, DataType::Float32),
         DataType::Float64 => (Type::FLOAT8, DataType::Float64),
         DataType::Decimal128(..) => (Type::NUMERIC, t.clone()), // (`Numeric`: text or binary)
@@ -372,8 +407,29 @@ fn pg_type(t: &DataType, format: FieldFormat) -> (Type, DataType) {
         DataType::Timestamp(_, Some(_)) => (Type::TIMESTAMPTZ, DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into()))), // (an instant: sent in UTC)
         DataType::Timestamp(..) => (Type::TIMESTAMP, DataType::Timestamp(TimeUnit::Microsecond, None)),
         DataType::Binary | DataType::LargeBinary | DataType::BinaryView => (Type::BYTEA, DataType::Binary),
+        // Lists as Postgres's arrays (drivers give them as lists); of other things, as text.
+        DataType::List(f) | DataType::LargeList(f) | DataType::FixedSizeList(f, _) => {
+            let of = |t: DataType| DataType::List(Arc::new(datafusion::arrow::datatypes::Field::new("item", t, true)));
+            match f.data_type() {
+                DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8 => (Type::VARCHAR_ARRAY, of(DataType::Utf8)),
+                DataType::Int8 | DataType::Int16 | DataType::UInt8 => (Type::INT2_ARRAY, of(DataType::Int16)),
+                DataType::Int32 | DataType::UInt16 => (Type::INT4_ARRAY, of(DataType::Int32)),
+                DataType::Int64 | DataType::UInt64 => (Type::INT8_ARRAY, of(DataType::Int64)),
+                DataType::UInt32 => (Type::OID_ARRAY, of(DataType::UInt32)),
+                DataType::Float16 | DataType::Float32 => (Type::FLOAT4_ARRAY, of(DataType::Float32)),
+                DataType::Float64 => (Type::FLOAT8_ARRAY, of(DataType::Float64)),
+                DataType::Boolean => (Type::BOOL_ARRAY, of(DataType::Boolean)),
+                _ => (Type::VARCHAR, DataType::Utf8),
+            }
+        }
         _ => (Type::VARCHAR, DataType::Utf8),
     }
+}
+
+/// Item `i` of a list column, as a Vec of its element type (an array's value).
+fn items<T: datafusion::arrow::datatypes::ArrowPrimitiveType>(c: &ArrayRef, i: usize) -> Vec<Option<T::Native>> {
+    let v = c.as_list::<i32>().value(i);
+    v.as_primitive::<T>().iter().collect()
 }
 
 /// Value `i` of column `c` into a row being encoded (a result row, or a COPY row).
@@ -386,12 +442,24 @@ macro_rules! encode {
             DataType::Int16 => row.encode_field(&c.as_primitive::<Int16Type>().value(i)),
             DataType::Int32 => row.encode_field(&c.as_primitive::<Int32Type>().value(i)),
             DataType::Int64 => row.encode_field(&c.as_primitive::<Int64Type>().value(i)),
+            DataType::UInt32 => row.encode_field(&c.as_primitive::<datafusion::arrow::datatypes::UInt32Type>().value(i)),
             DataType::Float32 => row.encode_field(&c.as_primitive::<Float32Type>().value(i)),
             DataType::Float64 => row.encode_field(&c.as_primitive::<Float64Type>().value(i)),
             DataType::Date32 => row.encode_field(&c.as_primitive::<Date32Type>().value_as_date(i)),
             DataType::Timestamp(_, Some(_)) => row.encode_field(&c.as_primitive::<TimestampMicrosecondType>().value_as_datetime(i).map(|t| t.and_utc())),
             DataType::Timestamp(..) => row.encode_field(&c.as_primitive::<TimestampMicrosecondType>().value_as_datetime(i)),
             DataType::Binary => row.encode_field(&c.as_binary::<i32>().value(i)),
+            DataType::List(f) => match f.data_type() {
+                DataType::Utf8 => row.encode_field(&c.as_list::<i32>().value(i).as_string::<i32>().iter().map(|v| v.map(str::to_string)).collect::<Vec<_>>()),
+                DataType::Int16 => row.encode_field(&items::<Int16Type>(c, i)),
+                DataType::Int32 => row.encode_field(&items::<Int32Type>(c, i)),
+                DataType::Int64 => row.encode_field(&items::<Int64Type>(c, i)),
+                DataType::UInt32 => row.encode_field(&items::<datafusion::arrow::datatypes::UInt32Type>(c, i)),
+                DataType::Float32 => row.encode_field(&items::<Float32Type>(c, i)),
+                DataType::Float64 => row.encode_field(&items::<Float64Type>(c, i)),
+                DataType::Boolean => row.encode_field(&c.as_list::<i32>().value(i).as_boolean().iter().collect::<Vec<_>>()),
+                _ => row.encode_field(&None::<i32>),
+            },
             DataType::Decimal128(..) => row.encode_field(&Numeric(c.as_primitive::<datafusion::arrow::datatypes::Decimal128Type>().value_as_string(i))),
             _ => row.encode_field(&c.as_string::<i32>().value(i)),
         }
@@ -611,7 +679,7 @@ impl ExtendedQueryHandler for Backend {
         if let Some(Ok(c)) = Copy::of(&portal.statement.statement).filter(|c| c.as_ref().is_ok_and(|c| !c.to)) {
             return self.copy_in(client, &user, c).await;
         }
-        let inferred = crate::temp::SESSION.scope(Some(self.session.clone()), self.param_types(&pg_dialect(&self.app.lake, &portal.statement.statement))).await;
+        let inferred = crate::temp::SESSION.scope(Some(self.session.clone()), self.param_types(&pg_dialect(&self.app.lake, &portal.statement.statement, ""))).await;
         self.told(client, &user, &bind(portal, &inferred)?, &portal.result_column_format).await
     }
 
@@ -619,7 +687,7 @@ impl ExtendedQueryHandler for Backend {
     where
         C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
     {
-        let sql = pg_dialect(&self.app.lake, &stmt.statement);
+        let sql = pg_dialect(&self.app.lake, &stmt.statement, "");
         crate::temp::SESSION.scope(Some(self.session.clone()), async { Ok(DescribeStatementResponse::new(self.param_types(&sql).await, self.describe(&sql, &Format::UnifiedText).await?)) }).await // (its temporary tables too)
     }
 
@@ -628,8 +696,8 @@ impl ExtendedQueryHandler for Backend {
         C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
     {
         crate::temp::SESSION.scope(Some(self.session.clone()), async {
-            let inferred = self.param_types(&pg_dialect(&self.app.lake, &portal.statement.statement)).await;
-            Ok(DescribePortalResponse::new(self.describe(&pg_dialect(&self.app.lake, &bind(portal, &inferred)?), &portal.result_column_format).await?))
+            let inferred = self.param_types(&pg_dialect(&self.app.lake, &portal.statement.statement, "")).await;
+            Ok(DescribePortalResponse::new(self.describe(&pg_dialect(&self.app.lake, &bind(portal, &inferred)?, ""), &portal.result_column_format).await?))
         })
         .await
     }
@@ -642,7 +710,7 @@ impl Backend {
         let n = (1..).take_while(|i| sql.contains(&format!("${i}"))).count();
         let mut types = vec![Type::VARCHAR; n];
         if n > 0 && session_command(sql).is_none() && crate::write::parse(sql).is_none() && Copy::of(sql).is_none() {
-            let plan = async { self.session(sql).await.ok()?.sql_with_options(&crate::asof::rewrite(sql).ok()?, read_only()).await.ok() }.await;
+            let plan = async { self.session(sql, "").await.ok()?.sql_with_options(&crate::asof::rewrite(sql).ok()?, read_only()).await.ok() }.await;
             for (name, t) in plan.and_then(|df| df.logical_plan().get_parameter_types().ok()).unwrap_or_default() {
                 if let (Some(i @ 1..), Some(t)) = (name.trim_start_matches('$').parse::<usize>().ok(), t) {
                     if i <= n {
@@ -660,7 +728,7 @@ impl Backend {
             return Ok(vec![]); // (a COPY's columns come with its data)
         }
         let probe = (1..).take_while(|i| sql.contains(&format!("${i}"))).fold(sql.to_string(), |q, i| q.replace(&format!("${i}"), "NULL"));
-        let schema = self.schema(&probe).await?;
+        let schema = self.schema(&probe, "").await?;
         Ok(schema.fields().iter().enumerate().map(|(i, f)| FieldInfo::new(f.name().clone(), None, None, pg_type(f.data_type(), format.format_for(i)).0, format.format_for(i))).collect())
     }
 }

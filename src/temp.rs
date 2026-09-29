@@ -41,6 +41,15 @@ pub fn of(headers: &axum::http::HeaderMap) -> Option<String> {
 
 pub fn current() -> Option<String> { SESSION.try_with(|s| s.clone()).ok().flatten() }
 
+/// The current session's temporary tables (name, columns) and views (name, SQL), as Postgres's
+/// catalog lists them (`pg_catalog.rs`).
+pub fn listed() -> (Vec<(String, Vec<(String, String)>)>, Vec<(String, String)>) {
+    let Some(s) = current() else { return Default::default() };
+    let all = SESSIONS.lock().unwrap();
+    let Some(x) = all.get(&s) else { return Default::default() };
+    (x.tables.iter().map(|(n, t)| (n.clone(), t.columns.clone())).collect(), x.views.iter().map(|(n, v)| (n.clone(), v.clone())).collect())
+}
+
 const NO_SESSION: &str = "a temporary table or view is a session's: a Postgres connection's, or the Python or JavaScript client's (over HTTP, send x-pondra-session: <id>)";
 
 struct Table {

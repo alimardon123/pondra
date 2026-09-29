@@ -311,7 +311,7 @@ pub async fn seal(lake: &Lake, table: &str, meta: &mut TableMeta) -> Result<bool
     if !meta.key.is_empty() || meta.files.len() <= INLINE {
         return Ok(false);
     }
-    let (dir, schema) = (format!("data/{table}/_manifests"), crate::query::schema(&crate::sys::with_sys(meta).columns)?);
+    let (dir, schema) = (format!("data/{}/_manifests", meta.folder(table)), crate::query::schema(&crate::sys::with_sys(meta).columns)?);
     meta.files.sort_by_key(|f| f.ord);
     let mut sealing: Vec<DataFile> = meta.files.drain(..meta.files.len() - SEAL).collect();
     sealing.sort_by(|a, b| (&a.part, a.ord).cmp(&(&b.part, b.ord))); // (a manifest covers few partitions)
@@ -353,7 +353,8 @@ pub async fn unseal(lake: &Lake, table: &str, meta: &mut TableMeta, mut list: Ve
     let old = meta.sealed.take();
     if !list.is_empty() {
         let (files, rows, bytes) = list.iter().fold((0, 0, 0), |(f, r, b), m| (f + m.files, r + m.rows, b + m.bytes));
-        meta.sealed = Some(Sealed { list: put(lake, &format!("data/{table}/_manifests"), &list).await?, files, rows, bytes });
+        let dir = format!("data/{}/_manifests", meta.folder(table));
+        meta.sealed = Some(Sealed { list: put(lake, &dir, &list).await?, files, rows, bytes });
     }
     meta.garbage.extend(old.map(|o| (o.list, now)));
     Ok(())

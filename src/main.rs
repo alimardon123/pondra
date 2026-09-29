@@ -34,6 +34,7 @@ mod metrics;
 mod optimize;
 mod mcp;
 mod pg;
+mod pg_catalog;
 mod query;
 mod read_delta;
 mod read_iceberg;

@@ -134,7 +134,7 @@ pub enum Ddl {
     Detach { name: String, if_exists: bool },
     CreateDatabase { name: String, if_not_exists: bool, dir: Option<String> }, // a new lake (beside this one unless `dir`), attached
     AlterColumn { table: String, column: String, change: Change }, // ALTER TABLE … RENAME/DROP/ALTER COLUMN (ADR-022)
-    RenameTable { name: String, to: String }, // (not yet: refused with the way round it)
+    RenameTable { name: String, to: String }, // ALTER TABLE | VIEW … RENAME TO (ADR-030)
     CreateRoutine { name: String, routine: crate::routines::Routine, replace: bool }, // CREATE MACRO, CREATE PROCEDURE (ADR-023)
     DropRoutine { name: String, if_exists: bool },
     CreateSecret { name: String, params: std::collections::BTreeMap<String, String>, replace: bool, if_not_exists: bool }, // (ADR-026: `ext.rs`)
@@ -156,6 +156,21 @@ pub enum Change {
 
 /// Leader: carry one out (under the lake's lock).
 pub async fn apply(lake: &Lake, d: Ddl) -> Result<Value> {
+    // (this lake's own three-part names, as dbt writes them: `"lake"."schema"."t"` is `schema.t`)
+    let here = |n: String| match n.split('.').collect::<Vec<_>>()[..] {
+        [l, s, t] if l == lake_name(lake) => join(s, t),
+        _ => n,
+    };
+    let d = match d {
+        Ddl::DropTable { name, if_exists } => Ddl::DropTable { name: here(name), if_exists },
+        Ddl::CreateView { name, sql, replace } => Ddl::CreateView { name: here(name), sql, replace },
+        Ddl::CreateMaterialized { name, sql, options } => Ddl::CreateMaterialized { name: here(name), sql, options },
+        Ddl::DropView { name, if_exists } => Ddl::DropView { name: here(name), if_exists },
+        Ddl::RenameTable { name, to } => Ddl::RenameTable { name: here(name), to },
+        Ddl::CreateRoutine { name, routine, replace } => Ddl::CreateRoutine { name: here(name), routine, replace },
+        Ddl::DropRoutine { name, if_exists } => Ddl::DropRoutine { name: here(name), if_exists },
+        d => d,
+    };
     match d {
         Ddl::CreateSchema { name, if_not_exists } => {
             check(&name)?;
@@ -247,9 +262,7 @@ pub async fn apply(lake: &Lake, d: Ddl) -> Result<Value> {
             Box::pin(apply(lake, Ddl::Attach { name, dir })).await
         }
         Ddl::AlterColumn { table, column, change } => alter_column(lake, &table, &column, change).await,
-        // A table's name is where its files, log rows, Delta and Iceberg copies and Kafka topic are:
-        // renaming one is a new table (ADR-022).
-        Ddl::RenameTable { name, to } => bail!("ALTER TABLE … RENAME TO isn't supported yet: a table's name is where its files, log and Delta and Iceberg copies live. CREATE TABLE {to} AS SELECT * FROM {name}; then DROP TABLE {name}; does it"),
+        Ddl::RenameTable { name, to } => rename(lake, &name, &to).await,
         Ddl::CreateRoutine { name, routine, replace } => crate::routines::create(lake, &name, routine, replace).await,
         Ddl::DropRoutine { name, if_exists } => crate::routines::drop(lake, &name, if_exists).await,
         Ddl::CreateSecret { name, params, replace, if_not_exists } => crate::ext::create(lake, &name, params, replace, if_not_exists).await,
@@ -487,6 +500,82 @@ async fn drop_table(lake: &Lake, name: &str, if_exists: bool) -> Result<Value> {
     }
     lake.cat.commit(vec![], &[table_key(name), table_key(&crate::sys::deleted(name))]).await?; // (and its replaced rows)
     Ok(j!({"table": name, "dropped": true}))
+}
+
+/// `ALTER TABLE | VIEW name RENAME TO to` (ADR-030). A stored view's entry moves. A table's
+/// entries move in one commit — its own, its replaced rows' table, its Delta and Iceberg states —
+/// and its files stay where they are: the table keeps its folder (`TableMeta::folder`). Its rows
+/// still in the log go to files first, so none is left under the old name. Refused while a
+/// materialized view or a task follows the table; stored views read by name, so a view of the
+/// old name reads whatever takes that name next (dbt's rename-and-replace).
+async fn rename(lake: &Lake, name: &str, to: &str) -> Result<Value> {
+    let name = local(lake, name).ok_or_else(|| anyhow::anyhow!("{name} is an attached lake's: rename it from a node of that lake"))?;
+    let to = match to.split('.').collect::<Vec<_>>()[..] {
+        [t] => join(split(&name).0, t), // (Postgres: the same schema)
+        _ => local(lake, to).ok_or_else(|| anyhow::anyhow!("{to}: a table is renamed within its lake"))?,
+    };
+    let to = new_name(lake, &to).await?;
+    let taken = lake.cat.get::<TableMeta>(&table_key(&to)).await?.is_some() || lake.cat.get::<StoredView>(&query_key(&to)).await?.is_some()
+        || lake.cat.get::<Value>(&crate::views::view_key(&to)).await?.is_some();
+    ensure!(!taken, "{to} exists already");
+    if let Some(v) = lake.cat.get::<StoredView>(&query_key(&name)).await? {
+        lake.cat.commit(vec![(query_key(&to), json(&v))], &[query_key(&name)]).await?;
+        return Ok(j!({"view": name, "renamed": to}));
+    }
+    ensure!(lake.cat.get::<Value>(&crate::views::view_key(&name)).await?.is_none(), "{name} is a materialized view: they aren't renamed yet (DROP it, and CREATE it under the new name)");
+    let owner = name.strip_suffix("_final").unwrap_or(&name);
+    ensure!(!crate::sys::hidden(&name) && lake.cat.get::<Value>(&crate::views::view_key(owner)).await?.is_none(), "{name} is part of materialized view {owner}");
+    ensure!(lake.cat.get::<TableMeta>(&table_key(&name)).await?.is_some(), "no table or view {name}");
+    let followers: Vec<String> = readers(lake, &name).await?.into_iter().filter(|r| !r.starts_with("view ")).collect();
+    ensure!(followers.is_empty(), "{name} is followed by {}: they follow it by name, so drop them first", followers.join(", "));
+    // Its rows in the log go to files, so none is left under the old name (new ones may come:
+    // then again).
+    for _ in 0..10 {
+        loop {
+            let (_, done) = crate::tier::tier_table(lake, &name, lake.visible(), &["here".to_string()], "here").await?;
+            if done {
+                break;
+            }
+        }
+        let meta: TableMeta = lake.cat.get(&table_key(&name)).await?.ok_or_else(|| anyhow::anyhow!("no table {name}"))?;
+        let upto = lake.visible();
+        let late = lake.cat.scan::<crate::store::Segment>(&crate::store::seg_key(meta.tiered + 1), &crate::store::seg_key(upto + 1)).await?.iter().any(|(_, s)| s.parts.contains_key(&name));
+        if late {
+            continue;
+        }
+        let mut puts = vec![];
+        let mut gone = vec![table_key(&name)];
+        let moved = |mut m: TableMeta, n: &str| {
+            m.folder = Some(m.folder(n).to_string());
+            m
+        };
+        puts.push((table_key(&to), json(&moved(meta, &name))));
+        let (old_deleted, new_deleted) = (crate::sys::deleted(&name), crate::sys::deleted(&to));
+        if let Some(d) = lake.cat.get::<TableMeta>(&table_key(&old_deleted)).await? {
+            puts.push((table_key(&new_deleted), json(&moved(d, &old_deleted))));
+            gone.push(table_key(&old_deleted));
+        }
+        for state in ["x", "i"] {
+            if let Some(v) = lake.cat.get::<Value>(&format!("{state}/{name}")).await? {
+                puts.push((format!("{state}/{to}"), json(&v)));
+                gone.push(format!("{state}/{name}"));
+            }
+        }
+        lake.cat.commit(puts, &gone).await?;
+        return Ok(j!({"table": name, "renamed": to}));
+    }
+    bail!("{name} kept taking rows while it was renamed: try again when its writers pause")
+}
+
+/// A folder under `data/` for a new table: its name's, unless another table has that one (a
+/// renamed table keeps its folder): then `name__2`, `name__3`… (characters a bucket's paths
+/// take as they are).
+pub async fn free_folder(lake: &Lake, name: &str) -> Result<Option<String>> {
+    let used: std::collections::HashSet<String> = lake.cat.scan::<TableMeta>("t/", "t0").await?.into_iter().map(|(k, m)| m.folder(&k[2..]).to_string()).collect();
+    Ok(match used.contains(name) {
+        false => None,
+        true => (2..).map(|i| format!("{name}__{i}")).find(|f| !used.contains(f)),
+    })
 }
 
 /// What reads or writes table `name` by its columns: views, stored views, tasks.

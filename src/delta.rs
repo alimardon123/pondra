@@ -96,9 +96,10 @@ pub async fn publishable(lake: &Lake, meta: &TableMeta) -> Result<Option<Parts>>
 
 /// Stop publishing a table in `format`: its metadata goes, so no engine reads a stale copy.
 pub async fn unpublish(lake: &Lake, table: &str, format: &str) -> Result<()> {
+    let folder = crate::store::folder_of(lake, table).await?;
     let (dir, state) = match format {
-        "delta" => (format!("data/{table}/_delta_log"), format!("x/{table}")),
-        _ => (format!("data/{table}/metadata"), format!("i/{table}")),
+        "delta" => (format!("data/{folder}/_delta_log"), format!("x/{table}")),
+        _ => (format!("data/{folder}/metadata"), format!("i/{table}")),
     };
     lake.cat.commit(vec![], &[state]).await?;
     let objects: Vec<_> = futures::TryStreamExt::try_collect(lake.store.list(Some(&Path::from(dir)))).await?;
@@ -118,7 +119,7 @@ pub fn decimal(t: &str) -> Option<(u8, i8)> {
 /// The table's next Delta commit, if its files changed; returns the new publish state to record.
 async fn publish(lake: &Lake, table: &str, meta: &TableMeta) -> Result<Option<(String, Vec<u8>)>> {
     let Some(parts) = publishable(lake, meta).await? else { return Ok(None) };
-    let (dir, key) = (format!("data/{table}/"), format!("x/{table}"));
+    let (dir, key) = (format!("data/{}/", meta.folder(table)), format!("x/{table}"));
     let mut state: Published = lake.cat.get(&key).await?.unwrap_or_default();
     // (once a column was renamed or dropped, Delta's column mapping stays on: it can't be turned off)
     let mapped = meta.mapped() || state.schema.contains(MAPPING_ID);

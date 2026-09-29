@@ -17,6 +17,7 @@
   harness.py procedures          macros, procedures (SQL, Python), scripts, parameters: rights, depth, three nodes
   harness.py functions           functions and procedures in SQL and Python: workers, notices, mail, secrets, run log, tasks, speed
   harness.py found               what writing the docs found (round 26), each fixed
+  harness.py renames             ALTER TABLE | VIEW … RENAME TO: rows, files, copies, followers, views
   harness.py load    --secs 30   throughput, ack latency, freshness, catalog commit latency
   harness.py all                 quick run of everything
 """
@@ -3963,9 +3964,60 @@ def found():
     return f"found: what writing the docs found, fixed: all {len(checks)} checks pass"
 
 
+def renames():
+    """ALTER TABLE | VIEW … RENAME TO (ADR-030), on two nodes: rows still in the log stay the
+    table's; its files stay in the folder it keeps, and its Delta and Iceberg copies stay there
+    for other engines (PyIceberg through the catalog by its new name); the follower reads it by
+    its new name; a stored view reads by name, so it reads whatever takes the name next (dbt's
+    rename-and-replace); a new table under the old name gets a folder of its own. Refused by
+    name: a name that is taken, a table a materialized view or a task follows, a materialized
+    view."""
+    import deltalake
+    from pyiceberg.catalog import load_catalog
+    lake = new_lake()
+    a = Node(lake, A.port, tier_secs=600).start()  # (tiering far off: new rows wait in the log)
+    b = Node(lake, A.port + 1, tier_secs=600).start()
+    q = lambda s, port=A.port: sql(port, s)
+    q("CREATE TABLE events (id BIGINT, v VARCHAR) WITH (publish = 'delta,iceberg')")
+    q("INSERT INTO events VALUES (1, 'a'), (2, 'b')")
+    q("CHECKPOINT")
+    q("INSERT INTO events VALUES (3, 'c')")  # (in the log only)
+    q("CREATE VIEW recent AS SELECT * FROM events WHERE id > 1")
+    renamed = q("ALTER TABLE events RENAME TO events_old")
+    checks = {"rows in the log before the rename are the renamed table's": q("SELECT count(*) AS n FROM events_old") == [{"n": 3}],
+              "the follower reads it by its new name, and the old one is gone": until(lambda: _try(lambda: sql(A.port + 1, "SELECT count(*) AS n FROM events_old")), [{"n": 3}], 15) == [{"n": 3}]
+                  and bool(_raises_text(lambda: sql(A.port + 1, "SELECT * FROM events")))}
+    q("CREATE TABLE events (id BIGINT, v VARCHAR) WITH (publish = 'delta')")
+    q("INSERT INTO events VALUES (10, 'z')")
+    checks["a view reads by name: the new table under the old name (dbt's rename-and-replace)"] = q("SELECT id FROM recent") == [{"id": 10}]
+    q("CHECKPOINT")
+    if not A.s3:
+        folders = sorted(os.listdir(os.path.join(lake, "data")))
+        old = deltalake.DeltaTable(os.path.join(lake, "data", "events")).to_pyarrow_table().num_rows
+        cat = load_catalog("pondra", type="rest", uri=f"http://127.0.0.1:{A.port}")
+        by_rest = cat.load_table("default.events_old").scan().to_arrow().num_rows
+        checks["its files, Delta and Iceberg copies stay in its folder; a new table under the old name has a folder of its own"] = \
+            {"events", "events__2"} <= set(folders) and old == 3 and by_rest == 3
+    q("ALTER VIEW recent RENAME TO recent_events")
+    checks["ALTER VIEW … RENAME TO"] = q("SELECT id FROM recent_events") == [{"id": 10}] and bool(_raises_text(lambda: q("SELECT * FROM recent")))
+    q("CREATE MATERIALIZED VIEW per_v AS SELECT v, count(*) AS n FROM events GROUP BY v")
+    refused = {"a taken name": _raises_text(lambda: q("ALTER TABLE events RENAME TO events_old")),
+               "a table a materialized view follows": _raises_text(lambda: q("ALTER TABLE events RENAME TO events_new")),
+               "a materialized view": _raises_text(lambda: q("ALTER VIEW per_v RENAME TO per_v2"))}
+    checks["refused by name: " + ", ".join(refused)] = "exists already" in refused["a taken name"] and "materialized view per_v" in refused["a table a materialized view follows"] \
+        and "materialized view" in refused["a materialized view"] and q("SELECT count(*) AS n FROM events") == [{"n": 1}]
+    a.kill(); b.kill()
+    ok = all(checks.values())
+    print(json.dumps({"renames": checks, "ok": ok}, indent=1))
+    if not ok:
+        print(renamed, {k: v[:300] for k, v in refused.items()})
+        sys.exit(1)
+    return f"renames: ALTER TABLE | VIEW … RENAME TO, rows, files and copies kept, a follower, views by name: all {len(checks)} checks pass"
+
+
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    out = {t.__name__: t() for t in (upsert, deal, outside, clouds, kafkas, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, names, answers, writes, live, temps, across, found, scale, flight, reader, crash)}
+    out = {t.__name__: t() for t in (upsert, deal, outside, clouds, kafkas, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, names, answers, writes, live, temps, across, found, renames, scale, flight, reader, crash)}
     A.secs = min(A.secs, 20)
     out["load"] = load()
     print(json.dumps(out, indent=1))
@@ -3973,7 +4025,7 @@ def all_tests():
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "names", "answers", "writes", "live", "temps", "across", "found", "scale", "flight", "load", "all"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "names", "answers", "writes", "live", "temps", "across", "found", "renames", "scale", "flight", "load", "all"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -3984,4 +4036,4 @@ if __name__ == "__main__":
     ap.add_argument("--secs", type=int, default=30)
     ap.add_argument("--flush-ms", type=int, default=250)
     A = ap.parse_args()
-    {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "names": names, "answers": answers, "writes": writes, "live": live, "temps": temps, "across": across, "found": found, "scale": scale, "flight": flight, "load": load, "all": all_tests}[A.mode]()
+    {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "names": names, "answers": answers, "writes": writes, "live": live, "temps": temps, "across": across, "found": found, "renames": renames, "scale": scale, "flight": flight, "load": load, "all": all_tests}[A.mode]()

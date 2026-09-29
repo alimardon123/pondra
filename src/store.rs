@@ -68,6 +68,11 @@ pub struct TableMeta {
     /// Columns dropped (their stored names): older files still hold them; nothing reads them again.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dropped: Vec<String>,
+    /// Where its files, manifests and Delta and Iceberg copies are: `data/{folder}/`. None: its
+    /// name, as for every table before round 26; a renamed table keeps the folder it had
+    /// (`ALTER TABLE … RENAME TO`, ADR-030).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub folder: Option<String>,
     /// Columns a write must give a value (`NOT NULL`; a key's columns are too, for tables made
     /// from round 26 on), by stored name (`defaults.rs`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -93,6 +98,9 @@ impl TableMeta {
 
     /// A stored column's name in SQL.
     pub fn name_of<'a>(&'a self, stored: &'a str) -> &'a str { self.names.get(stored).map_or(stored, String::as_str) }
+
+    /// The folder under `data/` its files are in (`name`'s, unless it was renamed).
+    pub fn folder<'a>(&'a self, name: &'a str) -> &'a str { self.folder.as_deref().unwrap_or(name) }
 
     /// The columns SQL sees, as (stored name, name in SQL, type): all but the dropped.
     pub fn live(&self) -> impl Iterator<Item = (&str, &str, &str)> {
@@ -215,6 +223,11 @@ pub struct Segment {
 }
 
 pub fn table_key(t: &str) -> String { format!("t/{t}") }
+
+/// The folder table `t`'s files are in, under `data/` (its name, unless it was renamed).
+pub async fn folder_of(lake: &Lake, t: &str) -> Result<String> {
+    Ok(lake.cat.get::<TableMeta>(&table_key(t)).await?.and_then(|m| m.folder).unwrap_or_else(|| t.to_string()))
+}
 pub fn seg_key(n: u64) -> String { format!("s/{n:020}") }
 pub fn producer_key(p: &str) -> String { format!("p/{p}") }
 pub fn data_key(seg: u64) -> String { format!("d/{seg:020}") } // small segments live inside the catalog

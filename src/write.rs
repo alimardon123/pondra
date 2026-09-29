@@ -97,7 +97,10 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
     let meta = match lake.cat.get::<TableMeta>(&table_key(name)).await? {
         // (A new table reads the log from now on: a table of this name dropped earlier left rows
         // in segments that aren't expired yet.)
-        None => TableMeta { columns, key, merge, publish: publish.unwrap_or_else(default_publish), cluster: cluster.unwrap_or_default(), ttl, partition, order, not_null, defaults, tiered: lake.visible(), ids: true, ..Default::default() },
+        None => {
+            let folder = crate::ddl::free_folder(lake, name).await?; // (a renamed table may still have this name's folder)
+            TableMeta { columns, key, merge, publish: publish.unwrap_or_else(default_publish), cluster: cluster.unwrap_or_default(), ttl, partition, order, not_null, defaults, folder, tiered: lake.visible(), ids: true, ..Default::default() }
+        }
         Some(mut m) => {
             // (the spec names columns as SQL does; the table keeps its stored names: ADR-022)
             let l = m.logical();
@@ -251,6 +254,14 @@ pub fn parse(sql: &str) -> Option<Stmt> {
     if let Some(s) = crate::routines::statement(sql) {
         return Some(s); // (CREATE FUNCTION and PROCEDURE as Postgres writes them, CREATE TASK, DROP TASK, DROP MACRO)
     }
+    // `ALTER VIEW v RENAME TO w` (dbt's): the parser takes only ALTER VIEW … AS.
+    static VIEW_RENAME: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r#"(?is)^\s*ALTER\s+(MATERIALIZED\s+)?VIEW\s+(IF\s+EXISTS\s+)?([\w."-]+)\s+RENAME\s+TO\s+([\w."-]+)\s*;?\s*$"#).expect("a regex")
+    });
+    if let Some(c) = VIEW_RENAME.captures(first_word(sql)) {
+        let name = |s: &str| s.split('.').map(|p| if p.starts_with('"') { p.trim_matches('"').to_string() } else { p.to_lowercase() }).collect::<Vec<_>>().join(".");
+        return Some(Stmt::Ddl(vec![Ddl::RenameTable { name: name(&c[3]), to: name(&c[4]) }]));
+    }
     let parsed = match Parser::parse_sql(&GenericDialect {}, sql) {
         Ok(mut s) => s.pop()?,
         Err(_) => return None,
@@ -312,7 +323,12 @@ pub fn parse(sql: &str) -> Option<Stmt> {
             [ast::AlterTableOperation::RenameColumn { old_column_name: from, new_column_name: to }] => alter(&a, from, Change::Rename(ident(to))),
             [ast::AlterTableOperation::DropColumn { column_names, if_exists, .. }] => Stmt::Ddl(column_names.iter().map(|c| Ddl::AlterColumn { table: object(&a.name), column: ident(c), change: Change::Drop { if_exists: *if_exists } }).collect()),
             [ast::AlterTableOperation::AlterColumn { column_name: c, op: ast::AlterColumnOperation::SetDataType { data_type, .. } }] => alter(&a, c, Change::Type(data_type.to_string())),
-            [ast::AlterTableOperation::RenameTable { table_name }] => Stmt::Ddl(vec![Ddl::RenameTable { name: object(&a.name), to: table_name.to_string().trim_start_matches("TO ").trim_start_matches("AS ").to_string() }]),
+            [ast::AlterTableOperation::RenameTable { table_name }] => {
+                let to = table_name.to_string();
+                let to = to.trim_start_matches("TO ").trim_start_matches("AS ");
+                let to = to.split('.').map(|p| if p.starts_with('"') { p.trim_matches('"').to_string() } else { p.to_lowercase() }).collect::<Vec<_>>().join(".");
+                Stmt::Ddl(vec![Ddl::RenameTable { name: object(&a.name), to }])
+            }
             [ast::AlterTableOperation::SetOptionsParens { options } | ast::AlterTableOperation::SetTblProperties { table_properties: options }] => Stmt::SetOptions(object(&a.name), options.iter().map(|o| match o {
                 ast::SqlOption::KeyValue { key, value } => Some((key.value.to_lowercase(), value.to_string().trim_matches('\'').to_string())),
                 _ => None,

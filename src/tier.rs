@@ -646,14 +646,16 @@ pub async fn write_file(lake: &Lake, table: &str, batches: &[RecordBatch], keys:
     if rows == 0 {
         return Ok(None);
     }
-    let ids = field_ids(lake.cat.get::<TableMeta>(&table_key(table)).await?.as_ref(), &batches[0].schema());
+    let meta = lake.cat.get::<TableMeta>(&table_key(table)).await?;
+    let ids = field_ids(meta.as_ref(), &batches[0].schema());
+    let folder = meta.as_ref().map_or(table, |m| m.folder(table));
     let mut buf = vec![];
     let mut w = writer(&mut buf, &batches[0].clone().with_schema(ids.clone())?, keys)?;
     for b in batches {
         w.write(&b.clone().with_schema(ids.clone())?)?;
     }
     let footer = w.close()?; // (its statistics: the file's min and max, without a second pass)
-    let (path, bytes) = (format!("data/{table}/{}.parquet", uuid::Uuid::new_v4()), buf.len() as u64);
+    let (path, bytes) = (format!("data/{folder}/{}.parquet", uuid::Uuid::new_v4()), buf.len() as u64);
     lake.put(&path, buf).await?;
     maybe_crash("after_parquet_put");
     let (stats, nulls, sketch) = match stats {

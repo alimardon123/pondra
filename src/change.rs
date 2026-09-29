@@ -65,7 +65,7 @@ enum Action {
 pub fn merge_of(m: &ast::Merge) -> Option<Merge> {
     let ast::TableFactor::Table { name, alias, .. } = &m.table else { return None };
     let target = crate::write::object(name);
-    let alias = alias.as_ref().map(|a| a.name.value.clone()).unwrap_or_else(|| target.rsplit('.').next().unwrap_or(&target).to_string());
+    let alias = alias.as_ref().map(|a| crate::write::ident(&a.name)).unwrap_or_else(|| target.rsplit('.').next().unwrap_or(&target).to_string()); // (unquoted: lower case, as SQL reads it)
     let column = |o: &ast::ObjectName| o.0.last().and_then(|p| p.as_ident()).map(|i| if i.quote_style.is_some() { i.value.clone() } else { i.value.to_lowercase() });
     let mut clauses = vec![];
     for c in &m.clauses {

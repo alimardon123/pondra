@@ -62,7 +62,7 @@ pub async fn publish(lake: &Lake, table: &str, meta: &TableMeta, named: Option<&
     if st.uuid.is_empty() {
         st.uuid = uuid::Uuid::new_v4().to_string();
     }
-    let (dir, now, mut v) = (format!("data/{table}/metadata"), crate::log::now_ms(), st.version + 1);
+    let (dir, now, mut v) = (format!("data/{}/metadata", meta.folder(table)), crate::log::now_ms(), st.version + 1);
     // (a version already there was written by an attempt that crashed before recording it: it's
     // never overwritten, so this one takes the next number)
     while lake.store.head(&Path::from(format!("{dir}/v{v}.metadata.json"))).await.is_ok() {
@@ -110,7 +110,7 @@ pub async fn publish(lake: &Lake, table: &str, meta: &TableMeta, named: Option<&
     }
     st.snapshots.push((snapshot, list));
     let gone: Vec<(Value, String)> = st.snapshots.drain(..st.snapshots.len().saturating_sub(HISTORY)).collect();
-    let body = metadata(lake, table, &st.uuid, v, now, &schema, &meta.columns, &st.snapshots);
+    let body = metadata(lake, meta.folder(table), &st.uuid, v, now, &schema, &meta.columns, &st.snapshots);
     // Written once, never overwritten; if it's there, an attempt that crashed wrote it, and this
     // one's objects are garbage the next round's version replaces.
     lake.put(&format!("{dir}/v{v}.metadata.json"), body.to_string().into_bytes()).await?;
@@ -162,7 +162,7 @@ async fn write_manifest(lake: &Lake, dir: &str, schema: &Value, v: u64, id: i64,
 
 /// The table metadata file (format v2): one unpartitioned spec, no sort order, the snapshots kept.
 #[allow(clippy::too_many_arguments)]
-fn metadata(lake: &Lake, table: &str, uuid: &str, v: u64, now: u64, schema: &Value, columns: &[(String, String)], snapshots: &[(Value, String)]) -> Value {
+fn metadata(lake: &Lake, folder: &str, uuid: &str, v: u64, now: u64, schema: &Value, columns: &[(String, String)], snapshots: &[(Value, String)]) -> Value {
     // A list's elements need a mapping of their own: arrow-rs writes them as `item` (parquet-mr as `element`).
     let mut names: Vec<Value> = columns.iter().enumerate().map(|(i, (c, t))| match t.ends_with("[]") {
         true => json!({"field-id": i + 1, "names": [c], "fields": [{"field-id": columns.len() + i + 1, "names": ["item", "element"]}]}),
@@ -175,7 +175,7 @@ fn metadata(lake: &Lake, table: &str, uuid: &str, v: u64, now: u64, schema: &Val
     let older = &snapshots[..snapshots.len() - 1];
     let current = &snapshots[snapshots.len() - 1].0["snapshot-id"];
     json!({
-        "format-version": 2, "table-uuid": uuid, "location": lake.full(&format!("data/{table}")),
+        "format-version": 2, "table-uuid": uuid, "location": lake.full(&format!("data/{folder}")),
         "last-sequence-number": v, "last-updated-ms": now, "last-column-id": 2 * columns.len(), // (list elements take ids after the columns')
         "current-schema-id": 0, "schemas": [schema],
         "default-spec-id": 0, "partition-specs": [{"spec-id": 0, "fields": []}], "last-partition-id": 999,
@@ -184,7 +184,7 @@ fn metadata(lake: &Lake, table: &str, uuid: &str, v: u64, now: u64, schema: &Val
         "current-snapshot-id": current, "refs": {"main": {"snapshot-id": current, "type": "branch"}},
         "snapshots": snapshots.iter().map(|(s, _)| s).collect::<Vec<_>>(),
         "snapshot-log": snapshots.iter().map(|(s, _)| json!({"snapshot-id": s["snapshot-id"], "timestamp-ms": s["timestamp-ms"]})).collect::<Vec<_>>(),
-        "metadata-log": older.iter().map(|(s, _)| json!({"metadata-file": lake.full(&format!("data/{table}/metadata/v{}.metadata.json", s["sequence-number"])), "timestamp-ms": s["timestamp-ms"]})).collect::<Vec<_>>(),
+        "metadata-log": older.iter().map(|(s, _)| json!({"metadata-file": lake.full(&format!("data/{folder}/metadata/v{}.metadata.json", s["sequence-number"])), "timestamp-ms": s["timestamp-ms"]})).collect::<Vec<_>>(),
     })
 }
 
@@ -418,7 +418,7 @@ async fn load(axum::extract::State(app): axum::extract::State<crate::server::App
 /// A table's current version, as the catalog answers it (`metadata-location`, `metadata`).
 async fn loaded(lake: &Lake, table: &str) -> Result<Value> {
     let st: Published = lake.cat.get(&format!("i/{table}")).await?.filter(|p: &Published| p.version > 0).context("not published")?;
-    let path = format!("data/{table}/metadata/v{}.metadata.json", st.version);
+    let path = format!("data/{}/metadata/v{}.metadata.json", crate::store::folder_of(lake, table).await?, st.version);
     let metadata: Value = serde_json::from_slice(&lake.object(&path).await?)?;
     Ok(json!({"metadata-location": lake.full(&path), "metadata": metadata, "config": {}}))
 }
@@ -559,9 +559,10 @@ async fn parse(lake: &Lake, table: &str, meta: &Value, asked: &Value) -> Result<
     if !s["schema-id"].is_null() && s["schema-id"] != meta["current-schema-id"] {
         return Err(conflict(format!("the snapshot's schema: {CONFLICT}")));
     }
+    let home = crate::store::folder_of(lake, table).await.map_err(|e| bad(format!("{e:#}")))?; // (its files' folder: its name, unless it was renamed)
     let under = |uri: &Value, folder: &str| -> Result<String, Refusal> {
         let uri = uri.as_str().unwrap_or_default();
-        inside(lake, uri).filter(|p| p.starts_with(&format!("data/{table}/{folder}/"))).ok_or_else(|| bad(format!("{uri}: not in {table}'s {folder} folder")))
+        inside(lake, uri).filter(|p| p.starts_with(&format!("data/{home}/{folder}/"))).ok_or_else(|| bad(format!("{uri}: not in {table}'s {folder} folder")))
     };
     let get = |path: String| async move {
         let bytes = lake.store.get(&Path::from(path.as_str())).await.map_err(|e| bad(format!("{path}: {e}")))?.bytes().await.map_err(|e| bad(format!("{path}: {e}")))?;
