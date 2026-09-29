@@ -27,4 +27,5 @@ aiosmtpd==1.4.6  # (a local SMTP server: harness.py functions sends it mail from
 ipython==9.17.1
 playwright==1.56.0  # (tools/console_check.py: headless Chromium; `python3 -m playwright install chromium`)
 nbformat==5.11.1  # (the console's notebooks, read as Jupyter reads them)
+matplotlib==3.10.9  # (tools/console_check.py: a Python cell's figure, drawn as a picture)
 PyYAML==6.0.3  # (tools/docs_check.py reads the pages' frontmatter)

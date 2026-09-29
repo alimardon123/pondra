@@ -179,15 +179,17 @@ def node_checks(browser, port, show):
     checks["Python cells share their variables (one namespace per page, as a notebook's kernel)"] = shared == (["value"], [["10"]])
     fig = pg.run(3, "import matplotlib.pyplot as plt\nfig, ax = plt.subplots(figsize=(4, 2))\nax.plot([1, 3, 2])\nfig")
     drawn = until(lambda: fig.locator("img.fig").count() == 1 and fig.locator("img.fig").evaluate("i => i.complete && i.naturalWidth") > 100, True)
+    fig_said = fig.locator(".out").inner_text()[:300]  # (why, if it drew nothing: matplotlib missing says so)
     checks["a figure a Python cell returns (matplotlib) shows as a picture"] = drawn is True and fig.locator("img.fig").get_attribute("src").startswith("data:image/png;base64,")
     p.locator("#tabs button", has_text="Variables").click()
-    names = until(lambda: p.locator("#detail .var .nm").all_inner_texts(), ["ax", "fig", "i", "x"])
-    x_type = p.locator("#detail .var", has_text="x").last.locator(".ty").inner_text() if names == ["ax", "fig", "i", "x"] else ""
+    want = ["ax", "fig", "i", "x"] if drawn is True else ["i", "x"]  # (the figure's failing is its own check's)
+    names = until(lambda: p.locator("#detail .var .nm").all_inner_texts(), want)
+    x_type = p.locator("#detail .var", has_text="x").last.locator(".ty").inner_text() if names == want else ""
     p.locator("#detail button", has_text="Restart").click()
     emptied = until(lambda: p.locator("#detail .var").count(), 0)
     gone = pg.run(3, "x").locator(".err").inner_text()
     p.locator("#tabs button", has_text="Details").click()
-    checks["the Variables tab lists the page's Python names with their types; Restart empties them"] = names == ["ax", "fig", "i", "x"] and x_type.startswith("int") \
+    checks["the Variables tab lists the page's Python names with their types; Restart empties them"] = names == want and x_type.startswith("int") \
         and emptied == 0 and "NameError" in gone
     ta = pg.cell(0).locator("textarea")
     ta.fill("SELECT * FROM peo")
@@ -301,7 +303,7 @@ def node_checks(browser, port, show):
         dark.shot(show, "console-dark.png")
         dark.ctx.close()
     checks["every request went to the node; no page errors"] = pg.left() == [] and pg.errors == [] and len(pg.seen) > 10
-    info = {"outline": p.locator("#outline").text_content(), "left": pg.left(), "errors": pg.errors, "sql_error": sql_error, "python_error": python_error, "kinds": kinds, "columns": columns, "facts": facts}
+    info = {"figure": fig_said, "outline": p.locator("#outline").text_content(), "left": pg.left(), "errors": pg.errors, "sql_error": sql_error, "python_error": python_error, "kinds": kinds, "columns": columns, "facts": facts}
     pg.ctx.close()
     return checks, info
 
