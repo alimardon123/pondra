@@ -68,6 +68,14 @@ pub struct TableMeta {
     /// Columns dropped (their stored names): older files still hold them; nothing reads them again.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dropped: Vec<String>,
+    /// Columns a write must give a value (`NOT NULL`; a key's columns are too, for tables made
+    /// from round 26 on), by stored name (`defaults.rs`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub not_null: Vec<String>,
+    /// A column's value when a write leaves it out (`DEFAULT expr`): stored name -> the SQL
+    /// expression, worked out for each row as it is written (`defaults.rs`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub defaults: BTreeMap<String, String>,
     /// Not the lake's: files outside it a query reads as a table (`ext.rs`), never in the catalog.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ext: Option<crate::ext::Spec>,
@@ -114,6 +122,8 @@ impl TableMeta {
             ttl: self.ttl.as_ref().map(|(c, s)| (n(c), *s)),
             order: self.order.as_ref().map(n),
             partition,
+            not_null: self.not_null.iter().filter(|c| !self.dropped.contains(c)).map(n).collect(),
+            defaults: self.defaults.iter().filter(|(c, _)| !self.dropped.contains(c)).map(|(c, e)| (n(c), e.clone())).collect(),
             names: BTreeMap::new(),
             dropped: vec![],
             ..self.clone()
@@ -404,7 +414,17 @@ impl Lake {
         // reads — the leader's, a new node's, a reader's without a live leader — are local.
         let cache = disk.as_ref().map(|d| d.dir.with_extension("catalog"));
         let cache = ObjectStoreCacheOptions { root_folder: cache, max_cache_size_bytes: Some(2 << 30), cache_on_flush: true, cache_on_compaction: true, ..Default::default() };
-        let cat = if writer { Catalog::writer(store.clone(), cache).await? } else { Catalog::reader(store.clone(), streamed, cache).await? };
+        let cat = match writer {
+            true => Catalog::writer(store.clone(), cache).await?,
+            false => match Catalog::reader(store.clone(), streamed, cache).await {
+                Ok(cat) => cat,
+                // (no catalog at all: say so, rather than the database's own words for it)
+                Err(e) => match futures::StreamExt::next(&mut store.list(Some(&object_store::path::Path::from("catalog/manifest")))).await {
+                    None => anyhow::bail!("{url} holds no lake yet: start one there (`pondra {url}`, or `pondra serve --dir {url}`), or make a table in it"),
+                    Some(_) => return Err(e),
+                },
+            },
+        };
         let hwm = watch::Sender::new(cat.get::<u64>("n").await?.unwrap_or(1) - 1);
         let lake = Arc::new_cyclic(|me| Lake { url, store, cat, hwm, backlog: Default::default(), rt, tail: Mutex::new((lru::LruCache::unbounded(), 0)), disk, groups: crate::serve::Groups::new(cache_mb() << 19), hot: Arc::new(crate::hot::Hot::new()), attached: Default::default(), ids: Default::default(), cached: cached_store, me: me.clone() });
         lake.hot.watch(); // the decoded columns give memory back when the node needs it
@@ -591,7 +611,8 @@ impl Lake {
         let config = crate::optimize::config(SessionConfig::new().with_information_schema(true).with_target_partitions(partitions)
             .with_default_catalog_and_schema(crate::ddl::lake_name(self), crate::ddl::PUBLIC));
         let state = SessionStateBuilder::new().with_config(config).with_runtime_env(self.rt.clone()).with_default_features();
-        let state = state.with_optimizer_rules(crate::optimize::rules()).with_physical_optimizer_rules(crate::optimize::physical_rules());
+        let mut state = state.with_optimizer_rules(crate::optimize::rules()).with_physical_optimizer_rules(crate::optimize::physical_rules());
+        state.expr_planners().get_or_insert_with(Vec::new).insert(0, crate::files::planner()); // (SUBSTRING of bytes too)
         let mut ctx = SessionContext::new_with_state(state.build());
         datafusion_functions_json::register_all(&mut ctx).expect("JSON functions register"); // json_get(…), ->, ->>
         crate::files::register(&ctx, self.arc()); // files('…'), file_read(path)

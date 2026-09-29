@@ -23,7 +23,7 @@ use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::flight_service_server::{FlightService, FlightServiceServer};
 use arrow_flight::sql::metadata::{SqlInfoData, SqlInfoDataBuilder};
 use arrow_flight::sql::server::{FlightSqlService, PeekableFlightDataStream};
-use arrow_flight::sql::{Any, CommandGetCatalogs, CommandGetDbSchemas, CommandGetSqlInfo, CommandGetTables, CommandStatementIngest, CommandStatementQuery, CommandStatementUpdate, ProstMessageExt, SqlInfo, TicketStatementQuery};
+use arrow_flight::sql::{Any, CommandGetCatalogs, CommandGetDbSchemas, CommandGetSqlInfo, CommandGetTableTypes, CommandGetTables, CommandStatementIngest, CommandStatementQuery, CommandStatementUpdate, ProstMessageExt, SqlInfo, TicketStatementQuery};
 use arrow_flight::{Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightEndpoint, FlightInfo, HandshakeRequest, HandshakeResponse, PollInfo, PutResult, SchemaResult, Ticket};
 use datafusion::arrow::datatypes::{Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
@@ -43,7 +43,7 @@ pub async fn serve(app: App, addr: String) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn status(e: impl std::fmt::Display) -> Status { Status::internal(format!("{e:#}")) }
+fn status(e: impl Into<anyhow::Error>) -> Status { Status::internal(crate::ext::said(&e.into())) }
 
 /// The caller's role, from its bearer token; refused below `need`.
 fn allowed<T>(app: &App, req: &Request<T>, need: Role) -> Result<Role, Status> {
@@ -90,6 +90,9 @@ async fn write(app: &App, role: Role, sql: &str) -> Result<i64, Status> {
 /// answered with its ack when committed. `producer` + `first`: batch i is seq `first + i`.
 fn append(app: &App, table: String, producer: String, first: u64, batches: impl Stream<Item = Result<RecordBatch, Status>> + Send + 'static) -> Result<Out<PutResult>, Status> {
     let log = app.log.clone().ok_or_else(|| Status::failed_precondition("read-only node"))?;
+    if !producer.is_empty() && first == 0 {
+        return Err(Status::invalid_argument(crate::log::SEQ_FROM_1)); // (0 is "nothing yet": its batch would be taken for a retry)
+    }
     let (lake, again, table2) = (app.lake.clone(), log.clone(), table.clone());
     type Queued = Pin<Box<dyn std::future::Future<Output = anyhow::Result<crate::log::Ack>> + Send>>;
     let (acks_tx, mut acks_rx) = tokio::sync::mpsc::channel::<Result<(Queued, RecordBatch, crate::log::Src), Status>>(256);
@@ -97,13 +100,24 @@ fn append(app: &App, table: String, producer: String, first: u64, batches: impl 
     tokio::spawn(async move {
         let mut batches = std::pin::pin!(batches);
         let meta: Option<TableMeta> = lake.cat.get(&table_key(&table)).await.ok().flatten();
-        let Some(schema) = meta.and_then(|m| crate::query::schema(&m.logical().columns).ok()) else { // (SQL's names: ADR-022)
+        let Some((meta, schema)) = meta.and_then(|m| Some((m.clone(), crate::query::schema(&m.logical().columns).ok()?))) else { // (SQL's names: ADR-022)
             let _ = acks_tx.send(Err(Status::not_found(format!("no table {table}")))).await;
             return;
         };
+        // (a column the batch leaves out: its DEFAULT)
+        let (m, sch) = (&meta, &schema);
+        let conformed = |b: RecordBatch| async move {
+            let given: Vec<String> = b.schema().fields().iter().map(|f| f.name().clone()).collect();
+            let rows = crate::query::conform(&b, sch)?;
+            crate::defaults::fill(m, rows, |c| (!given.iter().any(|g| g == c)).then(|| crate::defaults::all(b.num_rows()))).await
+        };
         let mut i = 0;
         while let Some(b) = batches.next().await {
-            let queued = match b.and_then(|b| crate::query::conform(&b, &schema).map_err(status)) {
+            let b = match b {
+                Ok(b) => conformed(b).await.map_err(status),
+                Err(e) => Err(e),
+            };
+            let queued = match b {
                 Ok(b) => {
                     let (seq, prev) = if producer.is_empty() { (0, None) } else { (first + i, (i > 0).then(|| first + i - 1)) };
                     let src = crate::log::Src { producer: producer.clone(), seq, prev };
@@ -219,6 +233,12 @@ static INFO: LazyLock<SqlInfoData> = LazyLock::new(|| {
 });
 
 /// A statement's FlightInfo: its schema, and a ticket to fetch it.
+/// The kinds of table `CommandGetTables` lists.
+fn table_types() -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![datafusion::arrow::datatypes::Field::new("table_type", datafusion::arrow::datatypes::DataType::Utf8, false)]));
+    RecordBatch::try_new(schema, vec![Arc::new(datafusion::arrow::array::StringArray::from(vec!["TABLE", "VIEW"]))]).expect("a batch")
+}
+
 fn info(schema: &Schema, ticket: Vec<u8>, descriptor: FlightDescriptor) -> Result<Response<FlightInfo>, Status> {
     let info = FlightInfo::new().try_with_schema(schema).map_err(status)?.with_endpoint(FlightEndpoint::new().with_ticket(Ticket::new(ticket))).with_descriptor(descriptor);
     Ok(Response::new(info))
@@ -234,7 +254,9 @@ impl FlightSqlService for Sql {
     async fn do_handshake(&self, req: Request<Streaming<HandshakeRequest>>) -> Result<Response<Out<HandshakeResponse>>, Status> {
         use base64::Engine;
         let basic = req.metadata().get("authorization").and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Basic "));
-        let token = basic.and_then(|b| base64::engine::general_purpose::STANDARD.decode(b).ok()).and_then(|b| String::from_utf8(b).ok()).and_then(|up| up.split_once(':').map(|(_, p)| p.to_string()));
+        // (padding optional: ADBC's driver sends none)
+        let lenient = base64::engine::GeneralPurpose::new(&base64::alphabet::STANDARD, base64::engine::GeneralPurposeConfig::new().with_decode_padding_mode(base64::engine::DecodePaddingMode::Indifferent));
+        let token = basic.and_then(|b| lenient.decode(b).ok()).and_then(|b| String::from_utf8(b).ok()).and_then(|up| up.split_once(':').map(|(_, p)| p.to_string()));
         if self.0.auth.role(token.as_deref()) == Role::None {
             return Err(Status::unauthenticated("wrong token"));
         }
@@ -283,7 +305,23 @@ impl FlightSqlService for Sql {
             _ => cmd.table.clone(),
         };
         let mut batches = arrow_flight::decode::FlightRecordBatchStream::new_from_flight_data(req.into_inner().map_err(Into::into)).map_err(Status::from).peekable();
-        let exists = self.0.lake.cat.get::<TableMeta>(&table_key(&table)).await.map_err(status)?.is_some();
+        let mut exists = self.0.lake.cat.get::<TableMeta>(&table_key(&table)).await.map_err(status)?.is_some();
+        // ADBC's modes: create (fail if there), append (fail if not), replace, create_append.
+        use arrow_flight::sql::{TableExistsOption as IfThere, TableNotExistOption as IfNot};
+        let options = cmd.table_definition_options.unwrap_or_default();
+        match (exists, IfThere::try_from(options.if_exists), IfNot::try_from(options.if_not_exist)) {
+            (true, Ok(IfThere::Fail), _) => return Err(Status::already_exists(format!("{table} exists (mode create): append to it, or replace it"))),
+            (true, Ok(IfThere::Replace), _) => {
+                if role < Role::Admin {
+                    return Err(Status::permission_denied("replacing a table needs the admin token"));
+                }
+                let drop = crate::write::parse(&format!("DROP TABLE {}", crate::write::sql_name(&table))).ok_or_else(|| Status::internal("DROP TABLE"))?;
+                crate::write::on_node(&self.0, drop, None).await.map_err(status)?;
+                exists = false;
+            }
+            (false, _, Ok(IfNot::Fail)) => return Err(Status::not_found(format!("no table {table} (mode append): create it first, or use create_append"))),
+            _ => {}
+        }
         if !exists {
             // ADBC's create modes: a table from the stream's schema (strings as Utf8, times in µs).
             if role < Role::Admin {
@@ -352,6 +390,16 @@ impl FlightSqlService for Sql {
             b.append(crate::ddl::lake_name(&self.0.lake), schema);
         }
         Ok(Response::new(send(b.schema(), vec![b.build().map_err(status)?])))
+    }
+
+    async fn get_flight_info_table_types(&self, q: CommandGetTableTypes, req: Request<FlightDescriptor>) -> Result<Response<FlightInfo>, Status> {
+        info(&table_types().schema(), q.as_any().encode_to_vec(), req.into_inner())
+    }
+
+    async fn do_get_table_types(&self, _: CommandGetTableTypes, req: Request<Ticket>) -> Result<Response<Out<FlightData>>, Status> {
+        allowed(&self.0, &req, Role::Read)?;
+        let types = table_types();
+        Ok(Response::new(send(types.schema(), vec![types])))
     }
 
     async fn get_flight_info_tables(&self, q: CommandGetTables, req: Request<FlightDescriptor>) -> Result<Response<FlightInfo>, Status> {

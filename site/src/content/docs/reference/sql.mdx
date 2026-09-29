@@ -1,0 +1,297 @@
+---
+title: SQL statements
+description: Every SQL statement Pondra takes, with its syntax and an example, and the ones it refuses.
+sidebar:
+  order: 1
+---
+
+import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+
+This page lists every statement a Pondra node runs, grouped by what it changes. Queries use
+[Apache DataFusion's SQL](https://datafusion.apache.org/user-guide/sql/index.html), which is close to
+PostgreSQL. Use the page to look up a statement's form; the guides show how to use them together.
+
+A node takes SQL on every door: `POST /sql`, the shell, `pondra sql`, Postgres, Flight SQL, MCP and
+the Python and JavaScript clients. One request may hold several statements separated by `;`. They run
+in order, and the answer is the last one's: rows for a query, a small JSON outcome such as
+`{"rows": 2}` for a write.
+
+## Types
+
+Columns take these types. A list is written `type[]`, such as `FLOAT[]` for an embedding.
+
+| Type | Also written | Holds |
+|---|---|---|
+| `TINYINT`, `SMALLINT`, `INT`, `BIGINT` | | 8, 16, 32 and 64-bit integers |
+| `REAL`, `DOUBLE` | | 32 and 64-bit floating point |
+| `DECIMAL(p, s)` | | exact numbers; `0.07` in SQL is a decimal |
+| `VARCHAR` | `TEXT`, `STRING` | text |
+| `BOOLEAN` | | true or false |
+| `DATE`, `TIME`, `TIMESTAMP` | | timestamps are kept in microseconds |
+| `BYTEA` | | bytes |
+| `type[]` | | a list of one type |
+
+JSON text lives in a `VARCHAR` column and is read with `json_get` and `->`
+(see [functions](/pondra/reference/functions/)).
+
+## Queries
+
+| Form | Meaning |
+|---|---|
+| `SELECT … FROM t` | any DataFusion query: joins, `WITH`, windows, `VALUES`, sub-queries |
+| `FROM t [SELECT …]` | DuckDB's form: the `FROM` first |
+| `$name` | a parameter, bound by the node and never pasted into the text |
+| `FROM a ASOF JOIN b MATCH_CONDITION (a.ts >= b.ts) ON a.k = b.k` | each row gets the other table's row as it was at that moment (`>=`, `>`, `<=`, `<`) |
+| `EXPLAIN SELECT …` | the plan, and whether it would spread over the nodes |
+| `DESCRIBE t`, `SHOW TABLES`, `SHOW COLUMNS FROM t` | what the lake holds |
+| `SELECT … FROM 'file.parquet'` | a file or URL as a table (see [names](/pondra/reference/names/)) |
+
+```sql
+CREATE TABLE orders (id BIGINT, item VARCHAR, qty INT, amount DOUBLE);
+INSERT INTO orders VALUES (1, 'tea', 2, 7.0), (2, 'cake', 1, 4.5), (3, 'tea', 1, 3.5);
+CREATE TABLE trades (ts TIMESTAMP, sym VARCHAR, px DOUBLE);
+CREATE TABLE quotes (ts TIMESTAMP, sym VARCHAR, bid DOUBLE);
+INSERT INTO trades VALUES (TIMESTAMP '2026-09-28 10:00:05', 'ABC', 10.1);
+INSERT INTO quotes VALUES (TIMESTAMP '2026-09-28 10:00:00', 'ABC', 10.0), (TIMESTAMP '2026-09-28 10:00:09', 'ABC', 10.2);
+FROM orders SELECT item, sum(amount) AS total GROUP BY item ORDER BY total DESC;
+SELECT t.ts, t.px, q.bid FROM trades t ASOF JOIN quotes q MATCH_CONDITION (t.ts >= q.ts) ON t.sym = q.sym;
+SHOW TABLES;
+```
+
+A parameter goes with the request, in JSON. The Python and JavaScript clients do this for you:
+
+<Tabs syncKey="lang">
+  <TabItem label="Python">
+    ```python
+    import pondra
+    db = pondra.connect("http://localhost:8080")
+    print(db.sql("SELECT item, qty FROM orders WHERE amount > $min ORDER BY id", min=4).rows())
+    ```
+  </TabItem>
+  <TabItem label="JavaScript">
+    ```js
+    import { connect } from "pondra";
+    const db = connect("http://localhost:8080");
+    console.log(await db.sql("SELECT item, qty FROM orders WHERE amount > $min ORDER BY id", { min: 4 }));
+    ```
+  </TabItem>
+</Tabs>
+
+## Tables
+
+| Statement | Syntax |
+|---|---|
+| Create | `CREATE TABLE [IF NOT EXISTS] t (column type [PRIMARY KEY], … [, PRIMARY KEY (column, …)]) [WITH (option = 'value', …)]` |
+| Create from a query | `CREATE TABLE t AS SELECT …`, or `CREATE TABLE t (a INT, b VARCHAR) AS VALUES …` |
+| Add a column | `ALTER TABLE t ADD COLUMN [IF NOT EXISTS] c type` |
+| Rename a column | `ALTER TABLE t RENAME COLUMN a TO b` |
+| Drop a column | `ALTER TABLE t DROP COLUMN [IF EXISTS] c` |
+| Widen a column | `ALTER TABLE t ALTER COLUMN c TYPE BIGINT` |
+| Change options | `ALTER TABLE t SET (publish = 'delta', cluster_by = 'user', ttl = 'ts:3600', order_by = 'ts')` |
+| Drop | `DROP TABLE [IF EXISTS] t [, t2 …]` |
+
+A table without a primary key is an append table. With a key, a new row replaces the old one with the
+same key. The options are on [table options](/pondra/reference/table-options/). An `ALTER TABLE`
+rewrites no file: old rows read a new column as null.
+
+```sql
+CREATE TABLE users (id BIGINT PRIMARY KEY, name VARCHAR, plan VARCHAR);
+CREATE TABLE clicks (ts TIMESTAMP, user VARCHAR, url VARCHAR) WITH (cluster_by = 'user', partition_by = 'day(ts)');
+CREATE TABLE big_orders AS SELECT * FROM orders WHERE amount > 4;
+ALTER TABLE users ADD COLUMN age INT;
+ALTER TABLE users RENAME COLUMN age TO years;
+ALTER TABLE users ALTER COLUMN years TYPE BIGINT;
+ALTER TABLE users DROP COLUMN years;
+ALTER TABLE clicks SET (publish = 'delta');
+DROP TABLE big_orders;
+```
+
+## Rows
+
+| Statement | Syntax |
+|---|---|
+| Insert | `INSERT INTO t [(column, …)] VALUES (…), …` or `INSERT INTO t [(column, …)] SELECT …` |
+| Update | `UPDATE t SET column = expression [, …] [WHERE condition]` |
+| Delete | `DELETE FROM t [WHERE condition]` |
+| Merge | `MERGE INTO t [AS x] USING source [AS s] ON condition WHEN [NOT] MATCHED [BY SOURCE] [AND condition] THEN UPDATE SET … \| DELETE \| INSERT (…) VALUES (…)` |
+
+`UPDATE`, `DELETE` and `MERGE` work on every table, keyed or not. Each is one commit from one snapshot:
+it applies all or nothing, and a `job` id makes a retry a no-op. A row keeps its `_row_id` through a
+change. `MERGE` answers with the rows `updated`, `deleted` and `inserted`; a target row that matches
+two source rows is an error.
+
+```sql
+INSERT INTO users VALUES (1, 'ann', 'free'), (2, 'bo', 'pro'), (3, 'cy', 'free');
+INSERT INTO users (id, name) SELECT id + 10, 'guest' FROM users;
+UPDATE users SET plan = 'pro' WHERE name = 'ann';
+DELETE FROM users WHERE name = 'guest';
+MERGE INTO users AS t
+USING (SELECT 4 AS id, 'di' AS name, 'pro' AS plan UNION ALL SELECT 2, 'bo', 'free') AS s
+ON t.id = s.id
+WHEN MATCHED THEN UPDATE SET plan = s.plan
+WHEN NOT MATCHED THEN INSERT (id, name, plan) VALUES (s.id, s.name, s.plan);
+SELECT * FROM users ORDER BY id;
+```
+
+## Schemas and other lakes
+
+| Statement | Syntax |
+|---|---|
+| Create a schema | `CREATE SCHEMA [IF NOT EXISTS] s` |
+| Drop a schema | `DROP SCHEMA [IF EXISTS] s [CASCADE]` |
+| Make a new lake | `CREATE DATABASE [IF NOT EXISTS] name [LOCATION 'dir']`: a lake beside this one, attached |
+| Attach a lake | `ATTACH 'dir' AS name`; `ATTACH 'url' AS name (TYPE delta \| iceberg \| kafka, …)` for other engines |
+| Detach | `DETACH [IF EXISTS] name` |
+
+A table is `t` (in schema `public`), `s.t`, or `lake.s.t`. Names are letters, digits, `_` and `-`.
+
+```sql
+CREATE SCHEMA sales;
+CREATE TABLE sales.regions (code VARCHAR, name VARCHAR);
+INSERT INTO sales.regions VALUES ('eu', 'Europe');
+CREATE DATABASE archive;
+CREATE TABLE archive.public.old_orders (id BIGINT, item VARCHAR);
+INSERT INTO archive.old_orders VALUES (0, 'scone');
+SELECT item FROM archive.old_orders UNION ALL SELECT item FROM orders;
+DETACH archive;
+ATTACH 'archive' AS old;
+SELECT * FROM old.old_orders;
+DETACH old;
+DROP SCHEMA sales CASCADE;
+```
+
+## Views
+
+| Statement | Syntax |
+|---|---|
+| Stored view | `CREATE [OR REPLACE] VIEW v AS SELECT …`: a query run over the tables as they are when read |
+| Materialized view | `CREATE MATERIALIZED VIEW v [WITH (option = value, …)] AS SELECT … FROM t …`: kept up to date as rows arrive |
+| Temporary | `CREATE TEMP TABLE t AS SELECT …`, `CREATE TEMP VIEW v AS SELECT …`: a session's own |
+| Drop | `DROP VIEW [IF EXISTS] v`, `DROP MATERIALIZED VIEW [IF EXISTS] v` |
+
+A materialized view is filled from the rows already in its table, then follows every new row. Its
+options make windows, sessions and stream joins: see [table options](/pondra/reference/table-options/).
+A temporary table lives in the memory of the node a session talks to, and ends with the session (a
+Postgres connection, or a Python or JavaScript client until `close()`).
+
+```sql
+CREATE VIEW tea_orders AS SELECT * FROM orders WHERE item = 'tea';
+CREATE MATERIALIZED VIEW spend_by_item AS SELECT item, sum(amount) AS total, count(*) AS n FROM orders GROUP BY item;
+INSERT INTO orders VALUES (4, 'cake', 3, 13.5);
+SELECT * FROM spend_by_item ORDER BY item;
+```
+
+```python
+db.sql("CREATE TEMP TABLE picked AS SELECT id FROM orders WHERE qty > 1")
+print(db.sql("SELECT o.item FROM orders o JOIN picked USING (id)").rows())
+```
+
+```sql
+DROP VIEW tea_orders;
+DROP MATERIALIZED VIEW spend_by_item;
+```
+
+## Functions, procedures and tasks
+
+| Statement | Syntax |
+|---|---|
+| SQL function | `CREATE [OR REPLACE] FUNCTION f(x type [DEFAULT v], …) RETURNS type RETURN expression` |
+| Table function | `CREATE FUNCTION f(…) RETURNS TABLE (c type, …) LANGUAGE sql AS $$ SELECT … $$` |
+| Python function | `CREATE FUNCTION f(x type) RETURNS type LANGUAGE python [WITH (…)] AS $$ … $$` |
+| Macro | `CREATE [OR REPLACE] MACRO m(x) AS expression` (DuckDB's) |
+| Procedure | `CREATE [OR REPLACE] PROCEDURE p(x type [DEFAULT v], …) LANGUAGE sql \| python AS $$ … $$` |
+| Call | `CALL p(args)` or `CALL p(name => value)` |
+| Start | `SELECT pondra.start('p', args)`: runs it without waiting, and answers with the run's id |
+| Task | `CREATE [OR REPLACE] TASK t SCHEDULE '5 minutes' \| 'cron 0 2 * * * UTC' AS CALL p(…)` |
+| Drop | `DROP FUNCTION [IF EXISTS] f`, `DROP PROCEDURE …`, `DROP MACRO …`, `DROP TASK [IF EXISTS] t` |
+| List | `SHOW USER FUNCTIONS`, `SHOW PROCEDURES`, `SHOW TASKS` (each takes `LIKE 'pattern'`) |
+
+Inside a SQL procedure, a parameter is `$name`. Python functions and procedures need a node started
+with `--python`. Functions, procedures and tasks are kept in the lake, so every node and client has
+them. Every call of a procedure is a row of `pondra.runs`
+(see [system columns](/pondra/reference/system-columns/)).
+
+```sql
+CREATE FUNCTION net(x DOUBLE, rate DOUBLE DEFAULT 0.2) RETURNS DOUBLE RETURN x * (1 - rate);
+CREATE FUNCTION slug(t VARCHAR) RETURNS VARCHAR LANGUAGE python AS $$ return t.lower().replace(' ', '-') $$;
+CREATE MACRO double_it(x) AS x * 2;
+CREATE PROCEDURE log_order(item VARCHAR, qty BIGINT DEFAULT 1) LANGUAGE sql AS $$
+  INSERT INTO orders VALUES (100, $item, $qty, 1.0);
+  SELECT count(*) AS orders FROM orders;
+$$;
+CALL log_order('scone');
+CALL log_order(item => 'bun', qty => 3);
+CREATE TASK hourly_scone SCHEDULE '60 minutes' AS CALL log_order('scone');
+SELECT net(10.0) AS net, slug('Hello World') AS slug, double_it(4) AS four;
+SHOW USER FUNCTIONS;
+SHOW PROCEDURES;
+SHOW TASKS;
+DROP TASK hourly_scone;
+DROP PROCEDURE log_order;
+DROP FUNCTION net;
+DROP FUNCTION slug;
+DROP MACRO double_it;
+```
+
+## Files and secrets
+
+| Statement | Syntax |
+|---|---|
+| Write files | `COPY (SELECT …) TO 'url' (FORMAT parquet \| csv \| json \| delta \| iceberg, PARTITION_BY (col, …), APPEND \| OVERWRITE, HEADER true, DELIMITER ';', COMPRESSION zstd, ROW_GROUP_SIZE n)` |
+| Write a topic | `COPY (SELECT …) TO 'kafka://brokers/topic' (FORMAT json, KEY col)` |
+| Make a secret | `CREATE [OR REPLACE] SECRET [IF NOT EXISTS] name (TYPE s3 \| r2 \| gcs \| azure \| http \| iceberg \| kafka \| generic, KEY value, …, SCOPE 'url')` |
+| Drop a secret | `DROP SECRET [IF EXISTS] name` |
+
+`COPY table TO …` is short for `COPY (SELECT * FROM table) TO …`. A URL needs a secret whose `SCOPE`
+covers it, and only an admin may write files. A path on a machine is written only by the program that
+started the node: the shell, `local()`, or `pondra sql`. Secrets are sealed with `PONDRA_SECRET_KEY`;
+`SELECT * FROM secrets()` lists their names and scopes, never their values.
+
+```bash
+pondra sql --dir scratch "CREATE TABLE t (a BIGINT, region VARCHAR)"
+pondra sql --dir scratch "INSERT INTO t VALUES (1, 'eu'), (2, 'us')"
+pondra sql --dir scratch "COPY (SELECT * FROM t) TO 'out.parquet'"
+pondra sql --dir scratch "COPY (SELECT * FROM t) TO 'by_region/' (FORMAT csv, PARTITION_BY (region), HEADER true)"
+pondra sql --dir scratch "SELECT count(*) AS n FROM 'out.parquet'"
+```
+
+```sql
+CREATE SECRET sales (TYPE s3, KEY_ID 'your-key-id', SECRET 'your-secret', REGION 'eu-west-1', SCOPE 's3://my-bucket');
+SELECT * FROM secrets();
+DROP SECRET sales;
+```
+
+## Maintenance
+
+| Statement | Meaning |
+|---|---|
+| `CHECKPOINT` | tier every table's log into Parquet now, and write the catalog down, so other engines read what is current |
+
+```sql
+CHECKPOINT;
+```
+
+## Refused
+
+Pondra refuses these by name, so a statement never runs and quietly does something else:
+
+| Statement | What happens |
+|---|---|
+| `ALTER TABLE t RENAME TO u` | refused; run `CREATE TABLE u AS SELECT * FROM t`, then `DROP TABLE t` |
+| `ALTER TABLE t SET (partition_by = …)` | refused; each file holds one partition |
+| `UPDATE` or `DELETE` on a merge table | refused; `INSERT` into it instead, and the key's rows combine |
+| `UPDATE` that sets a key column | refused; the key names the row |
+| a column called `_row_id`, `_version`, `_created_at` or `_updated_at` | refused: every table has them already |
+| `DROP TABLE` while a view or task reads the table | refused; drop the view or task first |
+| a change to a table a window, session, join or min/max view follows | refused, with the view's name, because such a view cannot take a row back |
+| `TRUNCATE`, `CREATE INDEX`, `GRANT` | not supported; `DELETE FROM t` empties a table |
+| `BEGIN`, `COMMIT`, `SET` over HTTP | not supported: every statement commits on its own (the Postgres door accepts and ignores them) |
+| `COPY … TO` a path on the node's machine | refused unless the program that started the node sends it |
+| `COPY … TO` a folder inside a lake | refused; a lake's files are its own |
+| Python functions and procedures on a node started without `--python` | refused, with the flag to use |
+
+<Aside type="caution">
+`CREATE TABLE … WITH (…)` ignores an option name it doesn't know, so check the spelling against
+[table options](/pondra/reference/table-options/). `INSERT … ON CONFLICT` is accepted but the clause is
+ignored: use a keyed table (`PRIMARY KEY`) or `MERGE` for upserts.
+</Aside>

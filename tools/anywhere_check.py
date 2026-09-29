@@ -41,7 +41,7 @@ def shell_checks(work):
     return {
         "a piped shell writes and queries a lake": first.returncode == 0 and "| a | 1 |" in first.stdout and "| b | 1 |" in first.stdout,
         "a second shell on the same lake starts at once (the first handed the lake on)": again.returncode == 0 and "| 3 " in again.stdout and again_s < 8,
-        "statements end at a ; outside strings and comments; errors don't end the session": third.returncode == 0 and "| n; |" in third.stdout and "| 5 " in third.stdout
+        "statements end at a ; outside strings and comments; errors don't end the session, and a script with one exits 1": third.returncode == 1 and "| n; |" in third.stdout and "| 5 " in third.stdout
                                                                                            and "Error:" in third.stderr and "| m |" in third.stdout,
     }, {"first_shell_s": round(first_s, 2), "second_shell_s": round(again_s, 2), "stderr": (first.stderr + again.stderr + third.stderr)[-400:], "third": third.stdout[-400:]}
 

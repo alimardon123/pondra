@@ -24,12 +24,16 @@ pub fn init(exe: Option<String>) { let _ = EXE.set(exe); }
 /// Does this node run Python (`--python`)?
 pub fn runs() -> bool { exe().is_ok() }
 
+/// Ready to run `what` (a routine's name and kind), or why not: no `--python`, or none found
+/// with the pondra package (`--python auto`).
+pub fn ready(what: &str) -> Result<()> { exe().map(|_| ()).with_context(|| format!("{what}, so this node needs Python")) }
+
 /// The Python: `--python`'s, or with `--python auto` (the shell's) the first found with the
 /// `pondra` package and pyarrow — `$PONDRA_PYTHON`, the one beside this binary (pip put it
 /// there), `python3`, `python` — looked for once, when first needed.
 fn exe() -> Result<&'static str> {
     static FOUND: OnceLock<Option<String>> = OnceLock::new();
-    let given = EXE.get().and_then(|e| e.as_deref()).context("this node runs no Python: start it with --python <python>")?;
+    let given = EXE.get().and_then(|e| e.as_deref()).context("it was started without --python (start it with --python <python>, or --python auto)")?;
     if given != "auto" {
         return Ok(given);
     }

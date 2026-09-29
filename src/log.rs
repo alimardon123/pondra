@@ -95,7 +95,11 @@ pub struct Append {
 
 pub struct Log {
     tx: mpsc::Sender<Append>,
+    lake: Arc<Lake>,
 }
+
+/// A producer's batches are numbered from 1: its last seq is 0 until one commits.
+pub const SEQ_FROM_1: &str = "a producer's batches count from seq=1 (seq 0 would be taken for a batch already written)";
 
 /// Where flushes go: the sequencer in this process (the leader), or the leader over HTTP.
 pub enum To {
@@ -143,6 +147,7 @@ async fn stamp(lake: &Lake, to: &To, pending: &mut [Append]) -> Result<()> {
 impl Log {
     pub fn start(lake: Arc<Lake>, flush: Duration, to: To) -> Log {
         let (tx, mut rx) = mpsc::channel::<Append>(100_000);
+        let me = lake.clone();
         let (to, slots) = (Arc::new(to), Arc::new(tokio::sync::Semaphore::new(FLUSHES_IN_FLIGHT)));
         tokio::spawn(async move {
             let (mut last, mut turn) = (tokio::time::Instant::now(), None);
@@ -163,7 +168,7 @@ impl Log {
                 });
             }
         });
-        Log { tx }
+        Log { tx, lake: me }
     }
 
     /// Append and wait for the ack (the write is committed).
@@ -174,6 +179,9 @@ impl Log {
     /// Queue rows now and get their ack later: rows queued one after another commit in that
     /// order, so a client can have several batches in flight (the Kafka protocol does).
     pub async fn queue(&self, table: String, src: Src, batch: RecordBatch) -> Result<impl std::future::Future<Output = Result<Ack>> + use<>> {
+        if let Some(m) = self.lake.cat.get::<TableMeta>(&table_key(&table)).await? {
+            crate::defaults::check(&m, &table, &batch)?; // (NOT NULL, whichever door the rows came in by)
+        }
         let (ack, rx) = oneshot::channel();
         crate::metrics::add(&crate::metrics::ROWS_IN, batch.num_rows() as u64);
         self.tx.send(Append { table, src, batch, ack }).await.map_err(|_| anyhow!("log closed"))?;

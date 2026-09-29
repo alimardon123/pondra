@@ -110,8 +110,11 @@ class Expr:
     def __rtruediv__(self, o):
         return Expr(f"(CAST({expr(o).sql} AS DOUBLE) / {self.sql})", expr(o).name or self.name)
 
-    def __floordiv__(self, o):
-        return Expr(f"floor(CAST({self.sql} AS DOUBLE) / {expr(o).sql})", self.name)
+    def __floordiv__(self, o):  # (Polars: toward minus infinity, an integer for integers)
+        return _floordiv(self, expr(o), self.name)
+
+    def __rfloordiv__(self, o):
+        return _floordiv(expr(o), self, expr(o).name or self.name)
 
     def alias(self, name):
         return Expr(self.sql, name, self._over)
@@ -430,6 +433,12 @@ def coalesce(*exprs):
     return Expr(f"coalesce({', '.join(e.sql for e in es)})", es[0].name)
 
 
+def _floordiv(a, b, name):
+    """a // b as Python and Polars have it: rounded toward minus infinity, and of a's and b's type
+    (a - a mod b, the modulo taking b's sign, is an exact multiple of b)."""
+    return Expr(f"(({a.sql}) - ((({a.sql}) % ({b.sql})) + ({b.sql})) % ({b.sql})) / ({b.sql})", name)
+
+
 def concat_str(exprs, separator=""):
     es = [expr(e) for e in exprs]
     return Expr(f"concat_ws({_literal(separator)}, {', '.join(e.sql for e in es)})", es[0].name)
@@ -512,9 +521,18 @@ class Frame:
 
     def _repr_html_(self):  # (a notebook shows the first rows, as DuckDB's relations do)
         import importlib.util
+        first = self._first(20)
         if not builtins.all(importlib.util.find_spec(m) for m in ("pyarrow", "pandas")):  # (`all` here is Polars' all())
-            return "<pre>" + html.escape(self._con._frame_rows(self.limit(20), format="table")) + "</pre>"
-        return self.limit(20).collect().to_pandas()._repr_html_()
+            return "<pre>" + html.escape(self._con._frame_rows(first, format="table")) + "</pre>"
+        return first.collect().to_pandas()._repr_html_()
+
+    def _statement(self):
+        """Is this a statement rather than a query (`EXPLAIN …`, `SHOW …`)? It runs as it is:
+        nothing can be built on it."""
+        return re.match(r"(?is)\s*(?:(?:--[^\n]*\n|/\*.*?\*/)\s*)*(EXPLAIN|SHOW|DESCRIBE)\b", self._query) is not None and not self._ctes
+
+    def _first(self, n):
+        return self if self._statement() else self.limit(n)
 
     @property
     def schema(self):
@@ -621,9 +639,19 @@ class Frame:
         return self._step(lambda r: f"SELECT DISTINCT ON ({keys}) * FROM {r}")
 
     def sample(self, n=None, fraction=None, seed=None):
+        """`n` rows, or about `fraction` of them, at random; with a `seed`, the same ones every time
+        (chosen by a hash of the seed and each row's values)."""
+        if seed is None:
+            pick = "random()"
+        else:
+            values = ", ".join(f"CAST({_quote(c)} AS VARCHAR)" for c in self.columns)
+            pick = f"md5(concat_ws('|', {_literal(str(seed))}, {values}))"
         if n is not None:
-            return self._step(lambda r: f"SELECT * FROM {r} ORDER BY random() LIMIT {int(n)}")
-        return self._step(lambda r: f"SELECT * FROM {r} WHERE random() < {float(fraction)}", self._kept())
+            return self._step(lambda r: f"SELECT * FROM {r} ORDER BY {pick} LIMIT {int(n)}")
+        if seed is None:
+            return self._step(lambda r: f"SELECT * FROM {r} WHERE random() < {float(fraction)}", self._kept())
+        cut = format(builtins.min(int(float(fraction) * 16 ** 8), 16 ** 8 - 1), "08x")  # (the hash's first 8 hex digits, as a number below the fraction's)
+        return self._step(lambda r: f"SELECT * FROM {r} WHERE substr({pick}, 1, 8) < {_literal(cut)}", self._kept())
 
     def fill_null(self, value):
         """Nulls in every column of the value's kind (numbers, text, true/false, dates) become it."""
@@ -665,6 +693,24 @@ class Frame:
         kind = {"inner": "JOIN", "left": "LEFT JOIN", "right": "RIGHT JOIN", "full": "FULL JOIN", "outer": "FULL JOIN", "cross": "CROSS JOIN"}[how]
         on_ = "" if how == "cross" else f" ON {cond}"
         return self._with(f"SELECT {', '.join(left + right)} FROM {lr} AS {l} {kind} {rr} AS {r}{on_}", ctes, **kw)
+
+    def union(self, other, distinct=True):
+        """The rows of both, each once (SQL's `UNION`); `distinct=False` keeps repeats (`UNION ALL`,
+        as `pondra.concat` does)."""
+        return self._set(other, "UNION" if distinct else "UNION ALL")
+
+    def intersect(self, other):
+        """The rows in both (SQL's `INTERSECT`)."""
+        return self._set(other, "INTERSECT")
+
+    def except_(self, other):
+        """The rows not in `other` (SQL's `EXCEPT`)."""
+        return self._set(other, "EXCEPT")
+
+    def _set(self, other, op):
+        ctes, kw = self._joined(other)
+        lr, rr = self._as_rel(ctes), other._as_rel(ctes)
+        return self._with(f"SELECT * FROM {lr} {op} SELECT * FROM {rr}", ctes, **kw)
 
     def join_asof(self, other, on=None, left_on=None, right_on=None, by=None, by_left=None, by_right=None, strategy="backward", suffix="_right"):
         """Each row with the right side's nearest earlier (backward) or later (forward) row by `on`,
@@ -709,11 +755,12 @@ class Frame:
 
     def show(self, n=20):
         """Its first `n` rows, as a text table."""
-        print(self._con._frame_rows(self.limit(n), format="table"))
+        print(self._con._frame_rows(self._first(n), format="table"))
 
     def explain(self):
         """Pondra's plan for it, and whether it would spread over the nodes."""
-        return "\n".join(str(r["plan"]) for r in self._with("EXPLAIN " + self.sql).rows())
+        plan = self if self._statement() else Frame(self._con, "EXPLAIN " + self.sql, params=self._params, sent=self._sent)
+        return "\n".join(str(r["plan"]) for r in plan.rows())
 
     def watch(self):
         """A table's (or materialized view's) new rows as they commit."""

@@ -1,0 +1,236 @@
+---
+title: Command line
+description: The pondra command, its SQL shell, and every serve, sql, run and catalog option with its default.
+sidebar:
+  order: 14
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+`pondra` is one binary. On its own it opens a SQL shell on a lake. `pondra serve` runs a node,
+`pondra sql` and `pondra run` run SQL, and `pondra catalog` prints what the lake's catalog holds.
+
+| Command | Does |
+|---|---|
+| `pondra [LAKE]` | a SQL shell on a lake (`./lake` if you name none) |
+| `pondra serve --dir LAKE` | run a node |
+| `pondra sql --dir LAKE "SQL"` | run one statement against the lake, with no server |
+| `pondra run FILE LAKE` | run a SQL file, its `$name` parameters taking the values you pass |
+| `pondra catalog --dir LAKE PREFIX` | print catalog entries |
+| `pondra --version`, `pondra --help` | the version, and help for any command |
+
+`pondra server` is coming in version 0.26.
+
+A lake is a folder or an object-store prefix (`s3://bucket/prefix`). Credentials and the endpoint
+come from the `AWS_*` environment variables: see [environment](/pondra/reference/environment/).
+
+## The shell
+
+`pondra` opens a shell on `./lake`, and `pondra some/folder` or `pondra s3://bucket/prefix` opens
+another. The shell runs a node on the lake, in the background, so views, tasks and windows keep
+running while it is open and other nodes can join. When it ends, the lake is left as any node
+leaves it. Because this is your own node, its SQL may read files on your machine
+(`SELECT * FROM 'jan.csv'`). Other lakes in the current folder are attached as databases.
+
+Statements end with `;`. A line can be one of:
+
+| Line | Does |
+|---|---|
+| `.tables` | the tables and views of every lake, with their kind |
+| `.databases` | this lake and the ones attached to it |
+| `.quit`, `.exit`, `\q` | leave |
+
+Answers print as a table. On a terminal the shell also shows how long each statement took. The
+shell reads standard input, so it takes a script too:
+
+```bash
+printf 'CREATE TABLE orders (id BIGINT, amount DOUBLE);\nINSERT INTO orders VALUES (1, 7.5), (2, 4.5);\nSELECT sum(amount) AS total FROM orders;\n' | pondra shell-lake
+```
+
+```text
+{"table":"orders","publish":[]}
+{"rows":2}
++-------+
+| total |
++-------+
+| 12.0  |
++-------+
+```
+
+A statement that fails prints `Error: …` on standard error and the shell goes on.
+
+## pondra serve
+
+`pondra serve --dir LAKE` runs a node and stays up until Ctrl-C or SIGTERM. Nodes started on the
+same lake form a cluster: the first leads (ingest, tiering, commits), and the rest follow (SQL,
+task shards, writes forwarded to the leader) and take over if the leader dies. A node that is
+stopped hands over at once, and every write it acknowledged is already durable.
+
+```bash norun
+pondra serve --dir lake
+pondra serve --dir lake --addr 127.0.0.1:8081
+```
+
+The second line starts a second node on the same lake. It follows the first.
+
+### Where and how
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--dir DIR` | required | the lake: a folder, or `s3://bucket/prefix` (credentials and endpoint from the `AWS_*` variables) |
+| `--addr ADDR` | `127.0.0.1:8080` | the address other nodes reach this one at. It is also the address the HTTP API listens on |
+| `--reader` | off | a read-only node: SQL only, never leads. Any number can run beside the writer |
+| `--python PYTHON` | none | run Python functions and procedures (`LANGUAGE python`) with this Python, which has the `pondra` package and pyarrow. `auto` takes the first one found. Routines run on warm workers beside the node, gone after a minute idle |
+| `--stop-with-stdin` | off | stop, as on Ctrl-C, when standard input closes: when the program that started the node ends, however it ends |
+
+<Aside type="caution">
+A Python routine runs any code on the machine. `--python` is refused unless you set tokens (only
+an admin token can make a routine) or the node listens on `127.0.0.1`, `localhost` or `[::1]`.
+</Aside>
+
+### Doors
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--pg ADDR` | off | also speak the Postgres protocol here, such as `0.0.0.0:5432`: [Postgres port](/pondra/reference/postgres/) |
+| `--kafka ADDR` | off | also speak the Kafka protocol here, such as `0.0.0.0:9092`: [Kafka protocol](/pondra/reference/kafka-protocol/) |
+| `--kafka-advertise HOST:PORT` | the host of `--addr`, the port of `--kafka` | where Kafka clients are told to connect to this node |
+| `--flight ADDR` | off | also speak Arrow Flight and Flight SQL here, such as `0.0.0.0:8815`: [Arrow Flight](/pondra/reference/flight/) |
+
+The HTTP API, `/mcp` and the Iceberg REST catalog are on `--addr`.
+
+### Access tokens
+
+| Flag | Environment | Meaning |
+|---|---|---|
+| `--read-token TOKEN` | `PONDRA_READ_TOKEN` | reading needs any token |
+| `--write-token TOKEN` | `PONDRA_WRITE_TOKEN` | writing rows needs this one or the admin token |
+| `--admin-token TOKEN` | `PONDRA_ADMIN_TOKEN` | creating tables, views, tasks and functions needs this one |
+
+Give every node the same tokens. With none set there are no checks. A flag beats its environment
+variable. See [HTTP](/pondra/reference/http/#roles) for what each role may do. Prefer the
+environment: a flag shows in the process list.
+
+### Writes and the log
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--ack durable\|replicated` | `durable` | when a write is acknowledged. `durable`: once it is in the bucket (a millisecond on local disk, hundreds on S3 or R2). `replicated`: once `--replicas` nodes hold it, which takes milliseconds on any storage. Give every node the same setting |
+| `--replicas N` | `2` | with `--ack replicated`: how many nodes hold a write before it is acknowledged (the leader is one). Until enough followers are up, writes are acknowledged once durable |
+| `--fsync` | off | with `--ack replicated`: followers flush each copy to disk before acknowledging it, so an acknowledged write survives a power loss of a follower too. It costs a disk flush per change |
+| `--flush-ms N` | `0` | the least number of milliseconds between a node's flushes. `0` flushes as soon as the last flush is committed, and what queued up meanwhile goes together: the lowest latency |
+| `--backlog N` | `10000000` | rows allowed to wait in the log for tiering before commits pause. Lower it for less memory, raise it to absorb longer bursts |
+
+### Tiering and retention
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--tier-secs SECS` | `10` | tiering starts as soon as rows commit, at most once per this many seconds (fractions are fine). It decides how soon new rows are Parquet, and a Delta or Iceberg version other engines can read. Pondra's own reads see every commit at once. `0` tiers only on `POST /tier`. A table with a million rows waiting is tiered within a second anyway |
+| `--task-ms N` | `1000` | streaming tasks run as soon as new rows commit, and at least this often (in milliseconds) |
+| `--retain-secs N` | `60` | how long to keep consumed log segments and replaced files before deleting them |
+| `--changelog-secs N` | `0` | keep the log this many seconds as a change feed: `/watch/{table}?after=N` and Kafka consumers can replay every change since then. `0`: only `--retain-secs` |
+| `--publish FORMATS` | none | open formats new tables are also published in, for engines that do not know Pondra: `delta`, `iceberg` or `delta,iceberg`. A table can set its own with `publish` |
+
+### Memory and cache
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--memory-gb GB` | a third of the machine's | memory for queries (also `PONDRA_MEMORY_GB`). A sort, join or aggregation that needs more spills to the temp directory |
+| `--cache-dir DIR` | `<temp dir>/pondra-cache` | for a lake on object storage: where the node keeps its local SSD copy of recent objects |
+| `--cache-gb GB` | `20`, or a quarter of the free disk if that is less | the size of that SSD tier. `0` turns it off |
+
+### Other lakes
+
+| Flag | Meaning |
+|---|---|
+| `--attach NAME=DIR` | read another lake as `name.table`, and write to it through its own leader. Repeat it for more. Several clusters, each leading its own lake, can share one bucket this way |
+| `--attach-found FOLDER` | for as long as the node runs, attach the lakes in this folder (its subfolders that hold one) under their folder names. Nothing is saved in the catalog. The shell passes its own folder |
+
+```bash norun
+pondra serve --dir s3://my-bucket/lake --addr 10.0.0.5:8080 \
+  --pg 0.0.0.0:5432 --kafka 0.0.0.0:9092 --kafka-advertise 10.0.0.5:9092 --flight 0.0.0.0:8815 \
+  --ack replicated --attach sales=s3://my-bucket/sales
+```
+
+## pondra sql
+
+`pondra sql --dir LAKE "SQL"` runs one statement against the lake, with no server. A query reads
+the lake (and files on this machine: `SELECT * FROM 'x.parquet'`) and prints its rows as a table.
+A write (`CREATE`, `INSERT`, `UPDATE`, `DELETE`) runs here too: the leader records it over HTTP,
+or through the bucket if this machine cannot reach the leader, or this process does if nobody
+leads. A write prints its outcome as JSON.
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--dir DIR` | required | the lake |
+| `--attach NAME=DIR` | none | another lake to read as `name.table`. Repeat it for more |
+
+```bash
+pondra sql --dir shell-lake "SELECT id, amount * 2 AS double_amount FROM orders ORDER BY id"
+pondra sql --dir shell-lake "INSERT INTO orders VALUES (3, 1.0)"
+```
+
+```text
++----+---------------+
+| id | double_amount |
++----+---------------+
+| 1  | 15.0          |
+| 2  | 9.0           |
++----+---------------+
+{"committed":true}
+```
+
+<Aside type="caution">
+`pondra sql --dir NEW "SELECT 1"` on a folder that is not a lake yet fails with `failed to find
+latest transactional object (e.g. manifest) version`. Make the lake first with the shell, or with
+any statement that creates a table.
+</Aside>
+
+## pondra run
+
+`pondra run FILE LAKE` runs a SQL file: its statements in order, and `$name` in them takes the
+value of `--name` on the command line. With a lake, it starts a node for the file, and stops it
+when the file is done. With `--url` it runs the file on a node that is already running.
+Numbers and `true` or `false` are passed as such, and anything else as text. The last statement's
+rows print as a table.
+
+| Option | Default | Meaning |
+|---|---|---|
+| `FILE` | required | the SQL file |
+| `LAKE` | `lake` | the lake, unless `--url` |
+| `--url URL` | none | run on the node at this URL |
+| `--token TOKEN` | `PONDRA_TOKEN` | a token for that node |
+| `--NAME VALUE` | none | the file's parameters, after `LAKE` |
+
+```bash
+printf 'SELECT count(*) AS orders, $day AS day FROM orders;\n' > report.sql
+pondra run report.sql shell-lake --day 2026-09-27
+```
+
+```text
++--------+------------+
+| orders | day        |
++--------+------------+
+| 3      | 2026-09-27 |
++--------+------------+
+```
+
+<Aside type="caution">
+Parameters are read only after `LAKE`, so with `--url` you still give a lake first, as in
+`pondra run report.sql lake --url http://localhost:8080 --day 2026-09-27`. Without it,
+`--day` fails with `unexpected argument '--day' found`.
+</Aside>
+
+## pondra catalog
+
+`pondra catalog --dir LAKE PREFIX` prints the catalog's entries whose keys start with `PREFIX`: `t/`
+for tables, `s/` for log segments, `p/` for producers. It is for looking inside a lake, and what
+it prints is the lake's own format: see [the lake format](/pondra/concepts/lake-format/).
+
+```bash
+pondra catalog --dir shell-lake t/ | cut -c1-40
+```
+
+```text
+t/orders {"columns":[["id","Int64"],["am
+```

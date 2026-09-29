@@ -1,0 +1,411 @@
+---
+title: Streaming
+description: Views that stay current, event-time windows, sessions, stream joins, as-of joins, tasks, and live queries.
+sidebar:
+  order: 6
+---
+
+import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+
+Streaming in Pondra is SQL that keeps running. A **materialized view** is a query the node keeps
+up to date as rows arrive, in the same commit as the rows, so a read never lags behind the
+table. Windows, sessions, stream joins and as-of joins are options of the same statement. Use
+this page when you'd otherwise reach for a Flink job.
+
+## Keep a query up to date
+
+Make a table with a few rows in it. A view can start from rows that are already there.
+
+```sql
+CREATE TABLE clicks (user VARCHAR, page VARCHAR, ts TIMESTAMP, amount BIGINT);
+INSERT INTO clicks VALUES
+  ('ann', 'home', '2026-09-29 10:00:05', 1),
+  ('bob', 'home', '2026-09-29 10:00:40', 2),
+  ('ann', 'cart', '2026-09-29 10:01:10', 3);
+```
+
+<Tabs syncKey="lang">
+  <TabItem label="SQL">
+    ```sql
+    CREATE MATERIALIZED VIEW IF NOT EXISTS spend AS
+      SELECT user, count(*) AS n, sum(amount) AS total FROM clicks GROUP BY user;
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    import pondra
+    db = pondra.connect("http://localhost:8080")
+    db.view("spend", "SELECT user, count(*) AS n, sum(amount) AS total FROM clicks GROUP BY user", materialized=True)
+    ```
+  </TabItem>
+  <TabItem label="JavaScript">
+    ```js
+    import { connect } from "pondra";
+    const db = connect("http://localhost:8080");
+    await db.view("spend", "SELECT user, count(*) AS n, sum(amount) AS total FROM clicks GROUP BY user", { materialized: true });
+    ```
+  </TabItem>
+</Tabs>
+
+Now write more rows. The view already has them when the write is acknowledged:
+
+```sql
+INSERT INTO clicks VALUES ('ann', 'checkout', '2026-09-29 10:02:00', 5);
+SELECT * FROM spend ORDER BY user;
+```
+
+```text
+user  n  total
+ann   3  9
+bob   1  2
+```
+
+A view without `GROUP BY` (a filter, a projection, a join) appends its rows to its own table. A
+view with `GROUP BY` keeps one running row per group, and any number of nodes add to it at once.
+
+<Aside type="caution">
+A grouped view keeps `sum`, `count`, `min` and `max`. `avg` and `count(DISTINCT …)` are refused,
+because they can't be combined from partial results: keep `sum` and `count` and divide when you
+read. A view that keeps a `min` or `max`, joins another table, or is a window, session or stream
+join can't take a row back, so an `UPDATE` or `DELETE` on its source is refused while it exists.
+`DROP MATERIALIZED VIEW name` first, or change a copy of the table. To change a view's query,
+drop it and make it again: `CREATE OR REPLACE` doesn't replace a materialized view.
+</Aside>
+
+### From a frame
+
+A [frame](/pondra/guides/dataframes/) becomes a view the same way:
+
+```python
+from pondra import col
+by_page = db.table("clicks").group_by("page").agg(pondra.len().alias("views"))
+by_page.to_view("views_by_page", materialized=True)
+db.sql("SELECT * FROM views_by_page ORDER BY page").rows()
+```
+
+## Event-time windows
+
+A window view groups by `date_bin(…)` of an event-time column. The view itself updates live,
+open windows and all. Each window is also written **once, final,** to a table named
+`<view>_final` when the stream has moved past its end. That table is a stream of its own: a view,
+a task or a Kafka consumer can follow it.
+
+Make the table and the view *before* the rows arrive: windows already closed when a view is made
+are not written to `_final`.
+
+```sql
+CREATE TABLE taps (user VARCHAR, ts TIMESTAMP);
+```
+
+<Tabs syncKey="lang">
+  <TabItem label="SQL">
+    ```sql
+    CREATE MATERIALIZED VIEW per_minute
+      WITH (window = 'w', size_secs = 60, lateness_secs = 10) AS
+      SELECT date_bin(INTERVAL '1 minute', ts) AS w, user, count(*) AS n
+      FROM taps GROUP BY 1, 2;
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    db.view("per_minute",
+            "SELECT date_bin(INTERVAL '1 minute', ts) AS w, user, count(*) AS n FROM taps GROUP BY 1, 2",
+            materialized=True, window="w", size_secs=60, lateness_secs=10)
+    ```
+  </TabItem>
+  <TabItem label="JavaScript">
+    ```js
+    import { connect } from "pondra";
+    const db = connect("http://localhost:8080");
+    await db.view("per_minute",
+      "SELECT date_bin(INTERVAL '1 minute', ts) AS w, user, count(*) AS n FROM taps GROUP BY 1, 2",
+      { materialized: true, window: "w", size_secs: 60, lateness_secs: 10 });
+    ```
+  </TabItem>
+</Tabs>
+
+`lateness_secs` is how far out of order rows may arrive. The **watermark** is the newest event time
+in the stream less that lateness; a window closes when the watermark passes its end. A row that
+arrives before then counts, however out of order it is.
+
+```sql
+INSERT INTO taps VALUES
+  ('ann', '2026-09-29 10:00:05'), ('ann', '2026-09-29 10:00:35'), ('bob', '2026-09-29 10:00:50'),
+  ('ann', '2026-09-29 10:01:20'), ('bob', '2026-09-29 10:01:40'),
+  ('bob', '2026-09-29 10:02:30');
+```
+
+The leader looks for closed windows twice a second, so give it a moment:
+
+```bash
+sleep 2
+```
+
+```sql
+SELECT w, user, n FROM per_minute_final ORDER BY w, user;
+```
+
+```text
+w                    user  n
+2026-09-29T10:00:00  ann   2
+2026-09-29T10:00:00  bob   1
+2026-09-29T10:01:00  ann   1
+2026-09-29T10:01:00  bob   1
+```
+
+The 10:02 window is still open. The newest row is 10:02:30, so the watermark is 10:02:20, before the
+window's end at 10:03:00; it is in `per_minute` only. A row that arrives after its window was
+emitted still updates `per_minute`, but not `per_minute_final`.
+
+### Sliding windows
+
+Add `slide_secs` for a window of `size_secs` that starts every `slide_secs`. `date_bin` by the slide
+and Pondra combines the panes, so a row is added once, not once per window it falls in:
+
+```sql
+CREATE TABLE pings (user VARCHAR, ts TIMESTAMP);
+CREATE MATERIALIZED VIEW per_five
+  WITH (window = 'w', size_secs = 300, slide_secs = 60) AS
+  SELECT date_bin(INTERVAL '1 minute', ts) AS w, user, count(*) AS n FROM pings GROUP BY 1, 2;
+```
+
+This makes a 5-minute window every minute. `slide_secs` must divide `size_secs`.
+
+## Session windows
+
+A session is one key's rows with no gap of `gap_secs` between them. The view's query groups by
+the key; Pondra adds `session_start` and `session_end` (the last row plus the gap). Each session
+is emitted once, whole, when the watermark passes its end.
+
+```sql
+CREATE TABLE visits (user VARCHAR, ts TIMESTAMP, amount BIGINT);
+CREATE MATERIALIZED VIEW sessions
+  WITH (session = 'ts', gap_secs = 30, lateness_secs = 5) AS
+  SELECT user, count(*) AS n, sum(amount) AS spent FROM visits GROUP BY user;
+INSERT INTO visits VALUES
+  ('ann', '2026-09-29 10:00:00', 2), ('ann', '2026-09-29 10:00:10', 2), ('ann', '2026-09-29 10:00:20', 2),
+  ('bob', '2026-09-29 10:00:00', 2), ('bob', '2026-09-29 10:00:25', 2),
+  ('bob', '2026-09-29 10:02:00', 2),
+  ('cy',  '2026-09-29 10:05:00', 2);
+```
+
+```bash
+sleep 2
+```
+
+```sql
+SELECT user, n, spent, session_start, session_end FROM sessions ORDER BY user, session_start;
+```
+
+```text
+user  n  spent  session_start        session_end
+ann   3  6      2026-09-29T10:00:00  2026-09-29T10:00:50
+bob   2  4      2026-09-29T10:00:00  2026-09-29T10:00:55
+bob   1  2      2026-09-29T10:02:00  2026-09-29T10:02:30
+```
+
+Bob's rows at 10:00:25 and 10:02:00 are more than 30 seconds apart, so they are two sessions. Cy's
+row moved the watermark to 10:04:55, which closed everything before it.
+
+<Aside type="caution">
+A session view starts from the moment it is created; rows already in the table are not part of
+it.
+</Aside>
+
+## Join two streams
+
+`join = 'streams'` pairs a row of either table with the other table's rows when it arrives and
+with those that arrive after it, each pair once, in whichever order they come. `within_secs`
+bounds how far apart in time a pair may be, so only that much of the other table is read.
+
+```sql
+CREATE TABLE orders (id BIGINT, amount DOUBLE, ts TIMESTAMP);
+CREATE TABLE payments (order_id BIGINT, paid DOUBLE, ts TIMESTAMP);
+CREATE MATERIALIZED VIEW paid WITH (join = 'streams', time = 'ts', within_secs = 600) AS
+  SELECT o.id, o.amount, p.paid
+  FROM orders o JOIN payments p
+    ON o.id = p.order_id AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '10 minutes';
+INSERT INTO payments VALUES (1, 9.5, '2026-09-29 10:00:30');
+INSERT INTO orders VALUES (1, 9.5, '2026-09-29 10:00:00'), (2, 4.0, '2026-09-29 10:00:10');
+INSERT INTO payments VALUES (2, 4.0, '2026-09-29 10:03:00'), (3, 1.0, '2026-09-29 10:30:00');
+```
+
+```bash
+sleep 2
+```
+
+```sql
+SELECT * FROM paid ORDER BY id;
+```
+
+```text
+id  amount  paid
+1   9.5     9.5
+2   4.0     4.0
+```
+
+Payment 1 arrived before its order and still paired with it. Payment 3 has no order.
+
+<Aside type="caution">
+Stream joins run on the leader alone, and start from the moment the view is made.
+</Aside>
+
+## Keep the newest row by event time
+
+A keyed table with `order_by` keeps, for each key, the row with the latest event time, not the last
+row to arrive. This is Flink's deduplication by event time.
+
+```sql
+CREATE TABLE latest (k BIGINT PRIMARY KEY, ts BIGINT, v VARCHAR) WITH (order_by = 'ts');
+INSERT INTO latest VALUES (1, 100, 'new');
+INSERT INTO latest VALUES (1, 50, 'old');
+SELECT * FROM latest;
+```
+
+```text
+k  ts   v
+1  100  new
+```
+
+## As-of joins
+
+`ASOF JOIN` gives each row the other table's row as it was at that moment: the latest quote at
+or before each trade. `MATCH_CONDITION` takes `>=`, `>`, `<=` or `<`; a row with no match gets
+NULLs.
+
+```sql
+CREATE TABLE quotes (sym VARCHAR, ts TIMESTAMP, price DOUBLE);
+CREATE TABLE trades (id BIGINT, sym VARCHAR, ts TIMESTAMP, qty BIGINT);
+INSERT INTO quotes VALUES
+  ('ABC', '2026-09-29 09:30:00', 10.0), ('ABC', '2026-09-29 09:31:00', 11.0), ('ABC', '2026-09-29 09:32:00', 12.0);
+INSERT INTO trades VALUES
+  (1, 'ABC', '2026-09-29 09:30:30', 5), (2, 'ABC', '2026-09-29 09:31:45', 2), (3, 'XYZ', '2026-09-29 09:31:45', 2);
+SELECT t.id, t.qty, q.price, t.qty * q.price AS value
+FROM trades t ASOF JOIN quotes q MATCH_CONDITION (t.ts >= q.ts) ON t.sym = q.sym
+ORDER BY t.id;
+```
+
+```text
+id  qty  price  value
+1   5    10.0   50.0
+2   2    11.0   22.0
+3   2    NULL   NULL
+```
+
+Put the same query in a materialized view and each new trade is priced as of its own event time,
+even when it arrives after a newer quote:
+
+```sql
+CREATE MATERIALIZED VIEW priced AS
+  SELECT t.id, t.qty, q.price, t.qty * q.price AS value
+  FROM trades t ASOF JOIN quotes q MATCH_CONDITION (t.ts >= q.ts) ON t.sym = q.sym;
+```
+
+<Aside type="caution">
+A quote that arrives after a trade of its time doesn't reach that trade. A keyed table keeps only
+its latest row per key, so an as-of join against one gives the latest, not the row of that
+moment: keep a table's history as rows for that.
+</Aside>
+
+## Tasks: any streaming SQL
+
+A view covers filters, joins and aggregates. A **task** runs any SQL over the new rows of a table
+whenever some commit, and appends the result to a target table, exactly once. The SQL may read the
+target too, which is how a task keeps state. Tasks are made with HTTP:
+
+```bash
+curl -s -X POST localhost:8080/tables/totals \
+  -d '{"columns": [["user", "Utf8"], ["total", "Int64"], ["n", "Int64"]], "key": ["user"]}'
+curl -s -X POST localhost:8080/tasks/running_totals -d '{
+  "source": "clicks", "target": "totals", "key": ["user"],
+  "sql": "SELECT c.user, coalesce(max(t.total), 0) + sum(c.amount) AS total, coalesce(max(t.n), 0) + count(*) AS n FROM clicks c LEFT JOIN totals t ON c.user = t.user GROUP BY c.user"
+}'
+```
+
+The task runs over each commit's new rows and writes one row per user to `totals`, so `totals`
+holds each user's running total. Make a task before the rows it should see arrive. Add
+`"shards": 4, "shard_by": "user"` to spread the state over the nodes by the hash of a column.
+
+<Aside type="caution">
+A task's target must have exactly the columns the SQL returns, so make a keyed target with
+`POST /tables` as above (a keyed table made in SQL has an extra hidden column). If the target
+doesn't exist, the task makes it from the query's output. A task can't be dropped yet, and it
+sees new rows only, so a table's rows can't be changed while a task follows it.
+</Aside>
+
+## Follow new rows
+
+`watch` streams a table's new rows the moment they commit, including a keyed table's upserts and
+deletes. `changes` adds every `UPDATE` and `DELETE`, each row with its `_change_type`.
+
+<Tabs syncKey="lang">
+  <TabItem label="Python">
+    ```python
+    import threading
+    feed = db.watch("clicks")
+    threading.Timer(0.3, lambda: db.append("clicks", [{"user": "cy", "page": "home", "ts": "2026-09-29T10:03:00", "amount": 4}])).start()
+    print(next(feed))
+    ```
+  </TabItem>
+  <TabItem label="JavaScript">
+    ```js
+    import { connect } from "pondra";
+    const db = connect("http://localhost:8080");
+    const feed = db.watch("clicks");
+    setTimeout(() => db.append("clicks", [{ user: "dee", page: "home", ts: "2026-09-29T10:04:00", amount: 1 }]), 300);
+    console.log((await feed.next()).value);
+    await feed.return();
+    ```
+  </TabItem>
+  <TabItem label="Shell">
+    ```bash norun
+    curl -N "localhost:8080/watch/clicks"                 # new rows, as they commit (NDJSON)
+    curl -N "localhost:8080/watch/clicks?changes=true"    # every change
+    curl -N "localhost:8080/watch/clicks?after=1234"      # replay from a position first
+    ```
+  </TabItem>
+</Tabs>
+
+A replay with `after` goes back as far as the node keeps its log: start it with
+`--changelog-secs 86400` to keep a day.
+
+### Live queries
+
+A **live query** sends its answer now and again within milliseconds of each commit that changes
+it. It isn't sent again when the answer comes out the same, and commits to other tables don't wake it.
+Nothing runs on the node once the client goes away.
+
+<Tabs syncKey="lang">
+  <TabItem label="Python">
+    ```python
+    live = db.live("SELECT count(*) AS n FROM clicks")
+    print(next(live))                       # the answer now
+    db.append("clicks", [{"user": "eve", "page": "cart", "ts": "2026-09-29T10:05:00", "amount": 2}])
+    print(next(live))                       # and again after the commit
+    live.close()
+    ```
+  </TabItem>
+  <TabItem label="JavaScript">
+    ```js
+    import { connect } from "pondra";
+    const db = connect("http://localhost:8080");
+    const live = db.live("SELECT count(*) AS n FROM clicks");
+    console.log((await live.next()).value);
+    await db.append("clicks", [{ user: "fay", page: "cart", ts: "2026-09-29T10:06:00", amount: 2 }]);
+    console.log((await live.next()).value);
+    await live.return();
+    ```
+  </TabItem>
+</Tabs>
+
+In an app, loop over it: `for rows in db.live(sql): redraw(rows)`, or
+`for await (const rows of db.live(sql))` in JavaScript. The Postgres port can't push an answer, so
+it has no live queries.
+
+## What streaming doesn't do yet
+
+- There is one watermark per source table, not per partition or node. A source that goes quiet
+  holds it: its last windows and sessions wait for more rows.
+- Top-N by event time, timers and `MATCH_RECOGNIZE` don't exist.
+- Late rows are left out of `_final` and of sessions already emitted; there's no side output for
+  them.

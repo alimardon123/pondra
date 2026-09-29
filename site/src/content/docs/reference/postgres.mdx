@@ -1,0 +1,241 @@
+---
+title: Postgres port
+description: Connect psql, drivers and BI tools to a Pondra node over the Postgres wire protocol, with the types, COPY and the users.
+sidebar:
+  order: 9
+---
+
+import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+
+A node speaks the Postgres wire protocol on the address you give `--pg`. `psql`, drivers (psycopg,
+asyncpg, JDBC, Go, Node) and BI tools connect to it as they would to Postgres. Queries and writes
+run exactly as `POST /sql` runs them, so anything SQL does works here.
+
+```bash norun
+pondra serve --dir lake --pg 127.0.0.1:5432
+```
+
+## Connect
+
+| Setting | Value |
+|---|---|
+| host, port | the address of `--pg` |
+| database | any name. `SELECT current_database()` gives the lake's name |
+| user, password | with no tokens set, anything. With tokens, the user picks the role (`reader`, `writer` or `admin`) and the password is that role's token |
+| SSL | not offered yet: use `sslmode=disable`, or `prefer` |
+
+`SELECT version()` answers `PostgreSQL 16.0 (Pondra on Apache DataFusion)`, and `SHOW server_version` answers `16.0`.
+
+The roles are the same as for [HTTP](/pondra/reference/http/#roles): `reader` may query, `writer` may
+also insert, update, delete and copy in, and `admin` may also create tables and other objects.
+
+```bash norun
+psql "postgresql://reader:$READ_TOKEN@db.example.com:5432/lake"
+```
+
+<Tabs syncKey="lang">
+  <TabItem label="psql">
+    ```bash
+    psql "postgresql://admin@localhost:5432/lake" <<'EOF'
+    CREATE TABLE orders (id BIGINT, item VARCHAR, amount DOUBLE, ts TIMESTAMP);
+    INSERT INTO orders VALUES (1, 'tea', 7.5, TIMESTAMP '2026-09-01 10:00:00'), (2, 'cake', 4.5, TIMESTAMP '2026-09-01 11:30:00');
+    SELECT item, sum(amount) AS total FROM orders GROUP BY item ORDER BY item;
+    EOF
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    import psycopg
+
+    with psycopg.connect("host=localhost port=5432 user=admin dbname=lake", autocommit=True) as conn:
+        print(conn.execute("SELECT item, sum(amount) AS total FROM orders GROUP BY item ORDER BY item").fetchall())
+    ```
+  </TabItem>
+</Tabs>
+
+```text
+CREATE 0
+INSERT 0 2
+ item | total 
+------+-------
+ cake |   4.5
+ tea  |   7.5
+(2 rows)
+```
+
+Use `autocommit=True` in a driver that starts transactions (psycopg does): every statement commits
+on its own. `BEGIN`, `COMMIT`, `ROLLBACK` and `SET` are accepted and do nothing, so a driver that
+sends them works, but there is no transaction to roll back.
+
+## What runs
+
+| You send | Result |
+|---|---|
+| a query | rows, as text or binary, whichever the client asks for |
+| `CREATE`, `ALTER`, `DROP`, `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `COPY … TO 'url'` | the same as over HTTP, answered with a command tag such as `INSERT 0 2` |
+| `CALL p(…)` | the procedure's rows, or `CALL`. What it prints comes as `NOTICE` messages, which psql shows |
+| `SET`, `RESET`, `BEGIN`, `START`, `COMMIT`, `END`, `ROLLBACK`, `DISCARD`, `DEALLOCATE`, `CLOSE` | accepted, and ignored |
+| `SHOW server_version`, `standard_conforming_strings`, `transaction_isolation`, `client_encoding` | a fixed answer |
+| `SHOW TABLES` | the lake's tables and views, and the `information_schema` views |
+| `DESCRIBE t` | its columns and types, with Arrow's type names |
+
+A connection is a session: `CREATE TEMP TABLE` and temporary views are the connection's own, and
+end when it closes. A request with several statements, separated by `;`, runs them in order.
+
+```bash
+psql "postgresql://admin@localhost:5432/lake" -c "SHOW TABLES" -c "DESCRIBE orders"
+```
+
+```text
+ table_catalog |    table_schema    | table_name  | table_type 
+---------------+--------------------+-------------+------------
+ lake          | public             | orders      | BASE TABLE
+ lake          | information_schema | tables      | VIEW
+ lake          | information_schema | views       | VIEW
+ lake          | information_schema | columns     | VIEW
+ lake          | information_schema | df_settings | VIEW
+ lake          | information_schema | schemata    | VIEW
+ lake          | information_schema | routines    | VIEW
+ lake          | information_schema | parameters  | VIEW
+(8 rows)
+
+ column_name | data_type     | is_nullable 
+-------------+---------------+-------------
+ id          | Int64         | YES
+ item        | Utf8View      | YES
+ amount      | Float64       | YES
+ ts          | Timestamp(µs) | YES
+(4 rows)
+```
+
+## Parameters
+
+A driver's `$1`, `$2` (or `%s`) parameters are bound into the statement as literals: numbers as
+they are, anything else quoted. A parameter's type is what the client says, or what the query
+implies (`WHERE id = $1` takes `id`'s type). Arrays of `real`, `double precision`, `integer` and
+`bigint` are bound as arrays, for vector search.
+
+```python
+with psycopg.connect("host=localhost port=5432 user=admin dbname=lake", autocommit=True) as conn:
+    print(conn.execute("SELECT id, item FROM orders WHERE amount > %s AND item = %s", (5, "tea")).fetchall())
+```
+
+```text
+[(1, 'tea')]
+```
+
+## Types
+
+A column comes to the client as the Postgres type closest to its type in the lake.
+
+| In the lake | Postgres type |
+|---|---|
+| `BOOLEAN` | `bool` |
+| `TINYINT`, `SMALLINT` | `int2` |
+| `INT` | `int4` |
+| `BIGINT` | `int8` |
+| `REAL` | `float4` |
+| `DOUBLE` | `float8` |
+| `DECIMAL(p, s)` | `numeric` |
+| `DATE` | `date` |
+| `TIMESTAMP` | `timestamp`, in microseconds, without a time zone |
+| `BINARY` | `bytea` |
+| `VARCHAR`, and every other type (arrays, structs, `VARIANT`) | `varchar`, as text |
+
+<Aside type="caution">
+A `TIMESTAMPTZ` reaches the client as a `timestamp` with no zone, and an array or struct as its
+text. Cast in the query if a driver needs another type.
+</Aside>
+
+## COPY
+
+`COPY … TO STDOUT` sends a table or a query, in text, CSV or binary. `COPY table FROM STDIN` loads
+text or CSV into a table, one batch at a time, through the log. `psql`'s `\copy` and psycopg's
+`cursor.copy` both work.
+
+| | `COPY … TO STDOUT` | `COPY … FROM STDIN` |
+|---|---|---|
+| source or target | a table, columns of it, or `(query)` | a table, with a column list if you like |
+| `FORMAT` | `text` (default), `csv`, `binary` | `text` (default), `csv` |
+| options | `HEADER`, `DELIMITER`, `NULL` | `HEADER`, `DELIMITER`, `NULL` |
+
+The default `NULL` is `\N` in text and empty in CSV. `COPY` into a lake you attached is refused:
+`INSERT INTO` it instead. A column you leave out is null. `COPY … TO 'url'` (with a quoted URL, not
+`STDOUT`) is not this: it is the [files statement](/pondra/reference/sql/#files-and-secrets).
+
+```bash
+printf 'id,item,amount\n3,juice,2.5\n4,scone,3\n' > more.csv
+psql "postgresql://admin@localhost:5432/lake" -c "\copy orders (id, item, amount) FROM 'more.csv' WITH (FORMAT csv, HEADER)"
+psql "postgresql://admin@localhost:5432/lake" -c "\copy (SELECT id, item FROM orders ORDER BY id) TO 'orders.csv' CSV HEADER"
+cat orders.csv
+```
+
+```text
+COPY 2
+COPY 5
+id,item
+1,tea
+2,cake
+3,juice
+4,scone
+```
+
+The count after `COPY … TO` includes the header line: it says 5 for 4 rows.
+
+In Python, with psycopg:
+
+```python
+with psycopg.connect("host=localhost port=5432 user=admin dbname=lake", autocommit=True) as conn:
+    with conn.cursor().copy("COPY orders (id, item, amount) FROM STDIN") as copy:
+        copy.write_row((5, "bun", 1.5))
+    print(conn.execute("SELECT count(*) FROM orders").fetchone())
+```
+
+```text
+(5,)
+```
+
+## The catalog
+
+Drivers look at a little of Postgres's catalog when they connect. Pondra answers for `pg_type`,
+`pg_class`, `pg_namespace`, `pg_attribute` and `pg_database`, and for `information_schema`, with the
+lake's tables, views and schemas. That is enough for the drivers below and for most BI tools.
+
+```python
+with psycopg.connect("host=localhost port=5432 user=admin dbname=lake", autocommit=True) as conn:
+    print(conn.execute("SELECT table_name FROM information_schema.tables WHERE table_name = 'orders'").fetchall())
+```
+
+```text
+[('orders',)]
+```
+
+## Drivers
+
+These connect and query, run in this repository's tests or checked by hand:
+
+| Driver | Notes |
+|---|---|
+| `psql` | queries, `\copy`, `CALL`. Not `\dt`, `\d table` or `\l`: use `SHOW TABLES` and `DESCRIBE table` |
+| psycopg 3 and psycopg 2 | `autocommit=True`; `cursor.copy` works |
+| asyncpg | queries and parameters |
+| ADBC (`adbc_driver_postgresql`) | Arrow results, through `COPY … TO STDOUT (FORMAT binary)` |
+| pandas | `pandas.read_sql` on a psycopg connection, or a SQLAlchemy engine on `postgresql+psycopg2` |
+
+<Aside type="caution">
+SQLAlchemy's `postgresql+psycopg` dialect (psycopg 3) fails on connect with
+`Invalid function 'to_regtype'`. Use `postgresql+psycopg2`, or pass a psycopg connection to pandas.
+</Aside>
+
+```python
+import adbc_driver_postgresql.dbapi as adbc
+
+with adbc.connect("postgresql://admin@localhost:5432/lake") as conn:
+    cur = conn.cursor()
+    cur.execute("SELECT id, item FROM orders ORDER BY id LIMIT 2")
+    print(cur.fetch_arrow_table().to_pydict())
+```
+
+```text
+{'id': [1, 2], 'item': ['tea', 'cake']}
+```

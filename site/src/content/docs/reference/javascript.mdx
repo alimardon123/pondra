@@ -1,0 +1,215 @@
+---
+title: JavaScript client
+description: The pondra npm package, with every method of a connection, its arguments, what it returns and an example.
+sidebar:
+  order: 7
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+The `pondra` package is a small client for a node's HTTP API. It has no dependencies and runs on
+Node 18 or later, or on any runtime with `fetch`. It is an ES module. `connect` reaches a node that
+is running, and `local` starts one on a folder and connects to it. JavaScript has no frames: SQL is
+its API, so files and other engines' tables are SQL's `read_*` functions and `COPY … TO`. See
+[names](/pondra/reference/names/).
+
+```js
+import { connect } from "pondra";
+
+const db = connect("http://localhost:8080");
+console.log(await db.sql("SELECT 1 AS one"));
+```
+
+```text
+[ { one: 1 } ]
+```
+
+## Connect
+
+| Call | Meaning |
+|---|---|
+| `connect(url = "http://127.0.0.1:8080", { token, onNotice })` | a connection to a node |
+| `await local(dir = "lake", { port, token, flags, timeoutMs, python, onNotice })` | start a node on a lake here (a folder or `s3://bucket/prefix`) and connect to it |
+| `binary()` | the path of the `pondra` executable: `$PONDRA_BIN`, or the one npm installed for this platform |
+
+| Option | Default | Meaning |
+|---|---|---|
+| `token` | none | sent as `Authorization: Bearer …`; the token's role decides what the connection may do |
+| `onNotice` | `console.log` | called with each line a procedure printed. `null` keeps them quiet |
+| `port` | a free port | the port `local`'s node listens on (`127.0.0.1`) |
+| `flags` | `[]` | more `pondra serve` options, such as `["--memory-gb", "2"]` |
+| `timeoutMs` | 120000 | how long `local` waits for the node to start |
+| `python` | `true` | give the node a Python, for Python functions and procedures, if this machine has one with the `pondra` package (`--python auto`); `false` for none |
+
+`local` stops its node on `db.close()` or when the process exits, and the lake stays. Because this
+program started the node, its SQL may read and write files on this machine
+(`SELECT * FROM read_csv('jan.csv')`).
+
+```js
+import { local } from "pondra";
+
+const db = await local("scratch");
+console.log(await db.sql("SELECT 1 AS one"));
+await db.close();
+```
+
+## Queries
+
+| Method | Returns |
+|---|---|
+| `await db.sql(query, params)` | a query's rows, as an array of objects. For other statements (`CREATE`, `INSERT`, `UPDATE`, `DELETE`, `CALL`, several at once), the last one's outcome. `params` gives values for `$name` in the query |
+| `await db.run(file, params = {})` | a `.sql` file's statements in order, or SQL text, with `$name` taking `params.name` |
+
+A parameter is a JSON value: a number, string, boolean, `null` or an array.
+
+```js
+import { connect } from "pondra";
+
+const db = connect("http://localhost:8080");
+await db.sql("CREATE TABLE orders (id BIGINT, item VARCHAR, amount DOUBLE)");
+console.log(await db.append("orders", [{ id: 1, item: "tea", amount: 7.0 }, { id: 2, item: "cake", amount: 4.5 }]));
+console.log(await db.sql("SELECT item, sum(amount) AS total FROM orders WHERE amount > $min GROUP BY item ORDER BY item", { min: 1 }));
+console.log(await db.run("SELECT $x + 1 AS y", { x: 41 }));
+```
+
+```text
+{ seg: 2, duplicate: false, conflict: false, row: 0, ms: 0 }
+[ { item: 'cake', total: 4.5 }, { item: 'tea', total: 7 } ]
+[ { y: 42 } ]
+```
+
+## Writing rows
+
+| Method | Returns |
+|---|---|
+| `await db.append(table, rows, retries = 10)` | appends an array of objects exactly once: a retry after a lost answer is recognised and not applied twice. Answers with `{ seg, duplicate, conflict, row, ms }`. An error the node refuses with (an HTTP status) is not retried |
+| `await db.lookup(table, key)` | the current row of one key of a keyed table, or `null` |
+
+Other writes are SQL: `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `COPY`.
+
+```js
+import { connect } from "pondra";
+
+const db = connect("http://localhost:8080");
+await db.sql("CREATE TABLE users (id BIGINT PRIMARY KEY, name VARCHAR)");
+await db.append("users", [{ id: 7, name: "ann" }]);
+console.log(await db.lookup("users", 7), await db.lookup("users", 8));
+```
+
+```text
+{ id: 7, name: 'ann' } null
+```
+
+## Procedures
+
+| Method | Returns |
+|---|---|
+| `await db.call(name, ...args)` | `CALL name(…)`: its rows or outcome. What the procedure printed is in `db.notices`, and goes to `onNotice` |
+| `await db.start(name, ...args)` | starts the procedure on the node without waiting, and answers with the run's id. The run's row in `pondra.runs` says how it went |
+| `await db.callProcedure(name, ...args)` | the same as `call`, from 0.22 |
+
+The arguments are passed by position. A function is called from SQL.
+
+```js
+import { connect } from "pondra";
+
+const db = connect("http://localhost:8080");
+await db.sql("CREATE PROCEDURE report(day VARCHAR) LANGUAGE sql AS $$ SELECT count(*) AS n, $day AS day FROM orders; $$");
+console.log(await db.call("report", "2026-09-27"));
+const run = await db.start("report", "2026-09-28");
+console.log(typeof run);
+```
+
+```text
+[ { n: 2, day: '2026-09-27' } ]
+string
+```
+
+## Views
+
+`await db.view(name, sql, { materialized, replace = true, ...options })` makes a view others read
+by name.
+
+| Option | Meaning |
+|---|---|
+| `materialized: true` | keep it up to date with each new row (`CREATE MATERIALIZED VIEW`) instead of running the query when it is read |
+| `replace` | for a stored view, `false` refuses to replace one that exists |
+| other options | the options of a materialized view: `window`, `size_secs`, `slide_secs`, `lateness_secs`, `session`, `gap_secs`, `join`, `time`, `within_secs`. They need `materialized: true`. See [table options](/pondra/reference/table-options/#materialized-views) |
+
+```js
+import { connect } from "pondra";
+
+const db = connect("http://localhost:8080");
+console.log(await db.view("big_orders", "SELECT * FROM orders WHERE amount > 5"));
+console.log(await db.view("spend", "SELECT item, sum(amount) AS total FROM orders GROUP BY item", { materialized: true }));
+```
+
+```text
+{ view: 'big_orders' }
+{ view: 'spend', materialized: true }
+```
+
+## Following changes
+
+| Method | Yields |
+|---|---|
+| `db.watch(table, { after, changes })` | an async generator of a table's new rows as they commit, one object each. For a keyed table, every upsert and delete. `after` replays from that position first. `changes: true` also yields UPDATE's and DELETE's rows, each with `_change_type`, `_row_id` and `_version` |
+| `db.live(sql, { params, everyMs })` | an async generator of a query's answer now, and again each time a commit changes it: an array of rows each time. An answer that comes out the same isn't sent again. A busy table is queried at most every `everyMs` (default 100) |
+
+After an answer, `db.position` is the commit it is as of. Both run until you leave the loop: a
+`break` ends the stream on the node.
+
+```js
+import { connect } from "pondra";
+
+const db = connect("http://localhost:8080");
+for await (const row of db.watch("orders", { after: 0 })) {
+  console.log(row);
+  break;
+}
+for await (const rows of db.live("SELECT count(*) AS n FROM orders")) {
+  console.log(rows);
+  break;
+}
+```
+
+```text
+{ id: 1, item: 'tea', amount: 7 }
+[ { n: 2 } ]
+```
+
+## Members
+
+| Member | Meaning |
+|---|---|
+| `db.url`, `db.token` | where the node is, and the token in use |
+| `db.notices` | what the last statement's procedures printed, as an array of strings |
+| `db.onNotice` | the function each notice goes to |
+| `db.producer`, `db.seq` | the name `append` writes under, and its last sequence number |
+| `db.session` | this connection's session id: its temporary tables and views live under it |
+| `db.position` | the commit the last `live` answer is as of |
+| `await db.request(method, path, body, type)` | one HTTP request to the node, as the methods above make them. Answers the `fetch` response, and throws on an error status with the text `status: message` |
+
+## Close
+
+`await db.close(timeoutMs = 15000)` ends the connection's session, so its temporary tables and
+views go, and stops the node `local` started. It waits for the node to stop, and kills it after
+`timeoutMs`.
+
+```js
+import { connect } from "pondra";
+
+const db = connect("http://localhost:8080");
+await db.sql("CREATE TEMP TABLE picked AS SELECT * FROM orders WHERE amount > 5");
+console.log(await db.sql("SELECT count(*) AS n FROM picked"));
+await db.close();
+```
+
+```text
+[ { n: 1 } ]
+```
+
+<Aside type="caution">
+`for await` over `watch` or `live` holds a connection to the node until you leave the loop. Always
+`break` out of it, or the process stays alive.
+</Aside>

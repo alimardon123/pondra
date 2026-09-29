@@ -1,0 +1,303 @@
+---
+title: Tables
+description: Create tables with CREATE TABLE and its options, group them in schemas and databases, change their columns, and drop them.
+sidebar:
+  order: 1
+---
+
+import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+
+A table is Parquet files plus a log of the newest rows, in your lake. You make one with `CREATE
+TABLE`, and its options decide what kind of table it is: rows that pile up, rows that replace each
+other by key, or rows that add up per key.
+
+## Create a table
+
+<Tabs syncKey="lang">
+  <TabItem label="SQL">
+    ```sql
+    CREATE TABLE orders (id BIGINT, item VARCHAR, qty INT, amount DOUBLE, ts TIMESTAMP);
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    import pondra
+    db = pondra.connect("http://localhost:8080")
+    db.sql("CREATE TABLE IF NOT EXISTS orders (id BIGINT, item VARCHAR, qty INT, amount DOUBLE, ts TIMESTAMP)")
+    ```
+  </TabItem>
+  <TabItem label="JavaScript">
+    ```js
+    import { connect } from "pondra";
+    const db = connect("http://localhost:8080");
+    await db.sql("CREATE TABLE IF NOT EXISTS orders (id BIGINT, item VARCHAR, qty INT, amount DOUBLE, ts TIMESTAMP)");
+    ```
+  </TabItem>
+</Tabs>
+
+Every statement on this page runs the same way from SQL, Python (`db.sql(...)`), JavaScript
+(`await db.sql(...)`), the [shell](/pondra/start/shell/) and Postgres clients.
+
+The column types are:
+
+| Kind | Types |
+|---|---|
+| Whole numbers | `TINYINT`, `SMALLINT`, `INT`, `BIGINT` |
+| Decimals | `FLOAT` (or `REAL`), `DOUBLE`, `DECIMAL(10, 2)` |
+| Text | `VARCHAR` (or `TEXT`, `STRING`) |
+| True and false | `BOOLEAN` |
+| Dates and times | `DATE`, `TIME`, `TIMESTAMP`, `TIMESTAMPTZ` |
+| Bytes | `BYTEA` |
+| Lists | `FLOAT[]`, `INT[]`, `VARCHAR[]` (a list of one type; `FLOAT[]` holds embeddings) |
+
+`CREATE TABLE IF NOT EXISTS` does nothing when the table is already there with the same columns. To
+make a table from a query, use `CREATE TABLE … AS SELECT`; the columns are the query's:
+
+```sql
+INSERT INTO orders VALUES (1, 'tea', 2, 7.0, TIMESTAMP '2026-09-27 10:00:00'), (2, 'cake', 1, 4.5, TIMESTAMP '2026-09-27 11:00:00');
+CREATE TABLE tea_orders AS SELECT * FROM orders WHERE item = 'tea';
+```
+
+<Aside type="caution">
+`NOT NULL` and `DEFAULT` are accepted in a column definition but not enforced yet: a `NULL` goes in,
+and a column left out of an `INSERT` is `NULL`, not its default.
+</Aside>
+
+## Choose what kind of table it is
+
+Without options, a table is an **append table**: every row you write stays, and a query sees them
+all. Three options change that.
+
+### A keyed table: `PRIMARY KEY`
+
+With a key, `INSERT` is an upsert: a new row replaces the row with the same key. `UPDATE` and
+`DELETE` find rows by key.
+
+```sql
+CREATE TABLE users (id BIGINT PRIMARY KEY, name VARCHAR, plan VARCHAR);
+INSERT INTO users VALUES (1, 'ann', 'free'), (2, 'bob', 'free');
+INSERT INTO users VALUES (2, 'bob', 'pro');
+DELETE FROM users WHERE id = 1;
+SELECT * FROM users;
+```
+
+```text
++----+------+------+
+| id | name | plan |
++----+------+------+
+| 2  | bob  | pro  |
++----+------+------+
+```
+
+Keyed tables answer a lookup of one key without planning a query: `db.lookup("users", 2)` in Python and
+JavaScript, `GET /lookup/users/2` over HTTP. `WITH (key = 'id')` says the same as `PRIMARY KEY`.
+
+### A merge table: `merge`
+
+A merge table has a key and combines the rows that share it, with `sum`, `count`, `min` or `max` per
+column. You only `INSERT` into it.
+
+```sql
+CREATE TABLE totals (user VARCHAR PRIMARY KEY, n BIGINT, total DOUBLE) WITH (merge = 'n:sum,total:sum');
+INSERT INTO totals VALUES ('ann', 1, 5.0), ('bob', 1, 2.0);
+INSERT INTO totals VALUES ('ann', 1, 7.0);
+SELECT * FROM totals ORDER BY user;
+```
+
+```text
++------+---+-------+
+| user | n | total |
++------+---+-------+
+| ann  | 2 | 12.0  |
+| bob  | 1 | 2.0   |
++------+---+-------+
+```
+
+### Latest by event time: `order_by`
+
+On a keyed table, `order_by` makes the row with the latest event time current, not the last one to
+arrive. A late row doesn't replace a newer one.
+
+```sql
+CREATE TABLE positions (vehicle VARCHAR PRIMARY KEY, ts TIMESTAMP, lat DOUBLE, lon DOUBLE) WITH (order_by = 'ts');
+INSERT INTO positions VALUES ('v1', TIMESTAMP '2026-09-27 10:05:00', 41.30, 69.28);
+INSERT INTO positions VALUES ('v1', TIMESTAMP '2026-09-27 10:01:00', 41.20, 69.20);
+SELECT * FROM positions;
+```
+
+```text
++---------+---------------------+------+-------+
+| vehicle | ts                  | lat  | lon   |
++---------+---------------------+------+-------+
+| v1      | 2026-09-27T10:05:00 | 41.3 | 69.28 |
++---------+---------------------+------+-------+
+```
+
+### Expire old rows: `ttl`
+
+On a keyed table, `ttl = 'column:seconds'` hides the rows whose timestamp column is older than that
+many seconds, and a full compaction of the table deletes them.
+
+```sql
+CREATE TABLE sessions (sid VARCHAR PRIMARY KEY, last_seen TIMESTAMP, page VARCHAR) WITH (ttl = 'last_seen:86400');
+```
+
+## Lay out the files
+
+Two options decide how a table's files are written, and they combine with a key.
+
+- **`partition_by`** keeps one partition in each file: a column (`'region'`), or the year, month, day or
+  hour of a timestamp (`'day(ts)'`). A filter on it skips every other partition's files.
+- **`cluster_by`** sorts each file by one or more columns, so a filter on them skips most of a file.
+  With two or more columns the rows follow a Hilbert curve, so a filter on any one of them still skips
+  most of a file.
+
+```sql
+CREATE TABLE events (id BIGINT, user VARCHAR, amount DOUBLE, ts TIMESTAMP)
+  WITH (partition_by = 'day(ts)', cluster_by = 'user');
+```
+
+`partition_by` is fixed once the table is made. `cluster_by` can change later (see `ALTER TABLE` below).
+
+## Publish a table for other engines
+
+`publish` also keeps a table as a Delta Lake and/or an Iceberg table, so Spark, DuckDB, Polars and
+others read it without going through Pondra:
+
+```sql
+CREATE TABLE shipments (id BIGINT, city VARCHAR) WITH (publish = 'delta,iceberg');
+INSERT INTO shipments VALUES (1, 'Tashkent');
+CHECKPOINT;
+```
+
+```bash
+ls lake/data/shipments | grep -v parquet
+```
+
+```text
+_delta_log
+metadata
+```
+
+The table's folder, `lake/data/shipments`, is the Delta table (its `_delta_log`) and the Iceberg
+table (its `metadata`), beside the Parquet files they both point at. `CHECKPOINT` tiers every table's newest rows into Parquet now; otherwise it happens
+within a few seconds. [Other engines](/pondra/guides/other-engines/) shows how to read them.
+
+## Group tables in schemas
+
+A table belongs to a schema, `public` unless you name one. Its full name is `lake.schema.table`,
+where the lake's name is its folder's (`./lake` is `lake`).
+
+```sql
+CREATE SCHEMA sales;
+CREATE TABLE sales.orders (id BIGINT, region VARCHAR, amount DOUBLE);
+INSERT INTO sales.orders VALUES (1, 'eu', 5.0), (2, 'us', 7.5);
+SELECT * FROM lake.sales.orders WHERE region = 'eu';
+```
+
+`orders` alone means `public.orders`. Names may hold letters, digits, `_` and `-`. Postgres clients,
+Flight SQL, the Iceberg catalog and MCP all list the schemas.
+
+## Use other lakes as databases
+
+A lake is a database, and other lakes can be databases next to it. `CREATE DATABASE` makes a new lake
+in a folder beside this one and attaches it:
+
+```sql
+CREATE DATABASE archive;
+CREATE TABLE archive.public.old_orders AS SELECT * FROM sales.orders;
+SELECT o.id, o.amount FROM archive.old_orders o JOIN sales.orders s USING (id) ORDER BY o.id;
+```
+
+To attach a lake that already exists, give its folder or bucket URL. `DETACH` lets go of it again:
+
+```bash
+echo "CREATE TABLE customers (id BIGINT, name VARCHAR); INSERT INTO customers VALUES (1, 'ann')" | pondra crm
+```
+
+```sql
+ATTACH 'crm' AS crm;
+INSERT INTO crm.customers VALUES (2, 'bob');
+SELECT * FROM crm.customers ORDER BY id;
+DETACH crm;
+```
+
+An attachment is kept in the lake, so every node of a cluster sees it and a restarted node attaches it
+again. Reads join across lakes as one query. `INSERT`, `UPDATE`, `DELETE` and `MERGE` on an attached
+lake go to that lake's own leader. A statement that writes to two lakes is two commits, not one
+transaction. A lake in a bucket is attached the same way: `ATTACH 's3://my-bucket/sales' AS sales`.
+
+## Change a table's columns
+
+`ALTER TABLE` changes columns while rows keep arriving. No file is rewritten: the lake remembers each
+column's stored name, old rows read a new column as `NULL`, and Delta and Iceberg readers follow.
+
+```sql
+CREATE TABLE readings (sensor VARCHAR, value INT, note VARCHAR);
+INSERT INTO readings VALUES ('s1', 20, 'first'), ('s2', 21, 'second');
+ALTER TABLE readings ADD COLUMN unit VARCHAR;
+ALTER TABLE readings RENAME COLUMN value TO celsius;
+ALTER TABLE readings ALTER COLUMN celsius TYPE BIGINT;
+ALTER TABLE readings DROP COLUMN note;
+INSERT INTO readings VALUES ('s3', 5000000000, 'C');
+SELECT * FROM readings ORDER BY sensor;
+```
+
+```text
++--------+------------+------+
+| sensor | celsius    | unit |
++--------+------------+------+
+| s1     | 20         |      |
+| s2     | 21         |      |
+| s3     | 5000000000 | C    |
++--------+------------+------+
+```
+
+`SET` changes a table's options: `publish`, `cluster_by`, and on keyed tables `ttl` and `order_by`.
+Files written from then on follow them.
+
+```sql
+ALTER TABLE events SET (publish = 'delta', cluster_by = 'user,amount');
+```
+
+Some changes aren't possible, and the error says what to do instead:
+
+- A column's type can only widen: a smaller integer to a bigger one, `FLOAT` to `DOUBLE`, a `DECIMAL`
+  to more digits.
+- `partition_by` can't change, because each file holds one partition.
+- `ALTER TABLE … RENAME TO` isn't supported: a table's name is where its files live. Make a copy with
+  `CREATE TABLE new_name AS SELECT * FROM old_name`, then drop the old one.
+
+## Views
+
+`CREATE VIEW` stores a query. It runs over the tables as they are when the view is read, and it
+spreads over a cluster like any query. A view can read other views.
+
+```sql
+CREATE VIEW big_orders AS SELECT * FROM orders WHERE amount > 5;
+SELECT * FROM big_orders;
+```
+
+`CREATE OR REPLACE VIEW` changes a view. A materialized view, which is kept up to date as rows arrive,
+is in [Streaming](/pondra/guides/streaming/).
+
+## Drop things
+
+```sql
+DROP VIEW big_orders;
+DROP TABLE tea_orders;
+DROP TABLE IF EXISTS sessions;
+DROP SCHEMA sales CASCADE;
+```
+
+- `DROP TABLE` is refused while a view or task reads the table: drop those first.
+- `DROP SCHEMA` is refused for a schema that holds anything, unless you add `CASCADE`, which drops its
+  views and then its tables. `public` can't be dropped.
+- A dropped table's files stay in the bucket for a day, and are then deleted. A new table with the
+  same name starts empty.
+
+List what you have with the shell's `.tables`, or with SQL:
+
+```sql
+SELECT table_name FROM information_schema.tables WHERE table_catalog = 'lake' AND table_schema = 'public' ORDER BY 1;
+```

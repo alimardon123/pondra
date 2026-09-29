@@ -1,0 +1,136 @@
+---
+title: Install
+description: Install Pondra with a one-line installer, pip, npm or a plain binary, on Linux, macOS or Windows.
+sidebar:
+  order: 1
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Pondra is one program. Install it once and you have the SQL shell and the server; with pip or npm you
+get the Python or JavaScript client as well. It needs no admin rights and nothing else installed:
+no database, no Java.
+
+| You have | Run | Then |
+|---|---|---|
+| Linux, macOS | `curl -fsSL https://github.com/alimardon123/pondra/releases/latest/download/install.sh \| sh` | `pondra` |
+| Windows | `irm https://github.com/alimardon123/pondra/releases/latest/download/install.ps1 \| iex` | `pondra` |
+| Python | `pip install pondra` | `pondra`, `python -m pondra`, or `import pondra` |
+| Node | `npm install -g pondra` (or `npm install pondra` in a project) | `pondra`, or `npx pondra` with no install |
+
+## Linux and macOS
+
+```bash norun
+curl -fsSL https://github.com/alimardon123/pondra/releases/latest/download/install.sh | sh
+```
+
+The script downloads the binary for your machine into `~/.local/bin` and puts that folder on your
+`PATH`, once, in your shell's startup file (`.zshrc`, `.bashrc`, `.bash_profile` on macOS, or
+`.profile`). A piped script can't change the terminal it runs in, so open a new terminal, or run the
+`export PATH=…` line it prints.
+
+Three environment variables change what it does: `PONDRA_VERSION` (a release such as `0.25.0`
+instead of the latest), `PONDRA_INSTALL` (another folder), and `PONDRA_ARCHIVE` (a file or URL of
+your own build).
+
+## Windows
+
+In PowerShell:
+
+```powershell norun
+irm https://github.com/alimardon123/pondra/releases/latest/download/install.ps1 | iex
+```
+
+This puts `pondra.exe` in `%LOCALAPPDATA%\Programs\pondra` and adds that folder to your user `Path`,
+for this terminal and the ones you open next. `$env:PONDRA_VERSION`, `$env:PONDRA_INSTALL` and
+`$env:PONDRA_ARCHIVE` work as above.
+
+If you prefer Linux tools on Windows, install WSL2 (`wsl --install`) and use the Linux line above.
+
+## Python
+
+```bash norun
+pip install pondra
+```
+
+The package holds two things: the Python client (plain Python, no dependencies) and the `pondra`
+program, which pip puts next to Python. `import pondra` gives you the client, and `pondra.local()`
+starts a node for you.
+
+If your terminal says `pondra` isn't found, pip put it in a folder that isn't on your `PATH`. This
+happens with user installs into a Python installed for everyone, on Windows and macOS.
+`python -m pondra` runs the same program from wherever pip put it, with the same arguments:
+
+```bash
+python -m pondra --version
+```
+
+```text
+pondra 0.25.0
+```
+
+To fix it for good, run `python -m pondra --add-to-path` once. It does what the installers do:
+adds the folder to your `PATH`, and tells you where.
+
+### pyarrow is optional
+
+pandas, Polars and Arrow results need [pyarrow](https://arrow.apache.org/docs/python/). Add it when
+you want them:
+
+```bash norun
+pip install "pondra[arrow]"      # the same as: pip install pondra pyarrow
+```
+
+Without pyarrow the client still runs SQL and returns rows as Python dicts:
+
+- **Works:** `sql(...).rows()`, `.item()`, `.show()`, and a procedure's answer. Rows come as JSON,
+  so dates and times are text.
+- **Needs pyarrow:** `.collect()`, `.to_arrow()`, `.to_pandas()`, `.to_polars()`. They raise an
+  `ImportError` that says so.
+- **Python functions and procedures** run on pyarrow too, so a node that runs them needs it.
+
+## Node
+
+```bash norun
+npm install -g pondra        # the pondra command
+npm install pondra           # or the JavaScript client, in a project
+npx pondra                   # or run it once, with no install
+```
+
+The package holds the JavaScript client (Node 18 or newer, no dependencies). The program itself
+comes from a platform package (`pondra-linux-x64`, `pondra-linux-arm64`, `pondra-macos-x64`,
+`pondra-macos-arm64`, `pondra-windows-x64`); npm installs only the one that fits your machine.
+
+## The plain binary
+
+Every [release](https://github.com/alimardon123/pondra/releases) has the program alone for each
+platform, as `pondra-<platform>.tar.gz` (Linux, macOS) or `.zip` (Windows), with `<platform>` one of
+`linux-x64`, `linux-arm64`, `macos-x64`, `macos-arm64`, `windows-x64`. Unpack it and put `pondra`
+anywhere. To build it yourself, install [Rust](https://rustup.rs) and run `cargo build --release`.
+
+## Check that it runs
+
+```bash
+pondra --version
+```
+
+```text
+pondra 0.25.0
+```
+
+Then open a SQL shell with `pondra` (see [The shell](/pondra/start/shell/)), or write your first
+table in [Your first lake](/pondra/start/first-lake/).
+
+## Which systems
+
+- **Linux:** any distribution with glibc 2.17 or newer, which is anything from 2014 on. Tested on
+  CentOS 7 and Ubuntu 22.04, the base of most cloud notebooks. x86-64 and ARM.
+- **macOS:** Intel and Apple silicon.
+- **Windows:** the installer, pip and npm packages, or WSL2.
+
+<Aside type="caution">
+Every release builds each package on its own platform and tries it there before publishing. Beyond
+that, the Windows package from PyPI has been installed on a real machine; the macOS packages and the
+installers have run only on the release's own machines so far. There is no winget or Homebrew
+package yet, and no build for Alpine (musl) or 32-bit ARM.
+</Aside>

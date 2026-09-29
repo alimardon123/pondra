@@ -217,8 +217,10 @@ class Pondra:
         return self._scan("read_parquet", source, dict(options, hive_partitioning=hive_partitioning))
 
     def read_csv(self, source, separator=None, has_header=None, hive_partitioning=None, **options):
-        """CSV files as a frame (SQL's `read_csv`; Polars' `scan_csv` is the same)."""
-        return self._scan("read_csv", source, dict(options, delim=separator, header=has_header, hive_partitioning=hive_partitioning))
+        """CSV files as a frame (SQL's `read_csv`; Polars' `scan_csv` is the same). SQL's option
+        names work too (`delim=`, `header=`); Polars' (`separator=`, `has_header=`) win if both."""
+        polars = {"delim": separator, "header": has_header, "hive_partitioning": hive_partitioning}
+        return self._scan("read_csv", source, {**options, **{k: v for k, v in polars.items() if v is not None}})
 
     def read_json(self, source, hive_partitioning=None, **options):
         """JSON lines as a frame (SQL's `read_json`; Polars' `scan_ndjson` and `read_ndjson` are the same)."""

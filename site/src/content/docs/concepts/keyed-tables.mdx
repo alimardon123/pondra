@@ -1,0 +1,317 @@
+---
+title: Keyed tables
+description: Tables with a PRIMARY KEY that keep one current row per key, and the merge, TTL and event-time options that go with them.
+sidebar:
+  order: 3
+---
+
+import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+
+A table with a `PRIMARY KEY` keeps one current row per key: write a key again and its row is
+replaced. Use one for the latest state of things (users, devices, prices, counters). A table without
+a key is an **append table**: it keeps every row you write.
+
+## Make one, and write a key again
+
+```sql
+CREATE TABLE users (id BIGINT PRIMARY KEY, name VARCHAR, plan VARCHAR);
+INSERT INTO users VALUES (1, 'ann', 'free'), (2, 'bob', 'free');
+```
+
+Writing key 1 again is an upsert, from SQL or from a client's `append`:
+
+<Tabs syncKey="lang">
+  <TabItem label="SQL">
+    ```sql
+    INSERT INTO users VALUES (1, 'ann', 'pro');
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    import pondra
+    db = pondra.connect("http://localhost:8080")
+    db.append("users", [{"id": 1, "name": "ann", "plan": "pro"}])
+    ```
+  </TabItem>
+  <TabItem label="JavaScript">
+    ```js
+    import { connect } from "pondra";
+    const db = connect("http://localhost:8080");
+    await db.append("users", [{ id: 1, name: "ann", plan: "pro" }]);
+    ```
+  </TabItem>
+</Tabs>
+
+```sql
+SELECT * FROM users ORDER BY id;
+```
+
+```text
++----+------+------+
+| id | name | plan |
++----+------+------+
+| 1  | ann  | pro  |
+| 2  | bob  | free |
++----+------+------+
+```
+
+Key 1 has one row, not two.
+
+## Change and delete rows
+
+`UPDATE`, `DELETE` and `MERGE` work on keyed tables as on any table. A deleted key leaves a marker
+that hides its older rows. `SELECT *` leaves the marker's `_deleted` column out unless you name it.
+
+```sql
+DELETE FROM users WHERE id = 2;
+UPDATE users SET plan = 'team' WHERE id = 1;
+SELECT * FROM users;
+```
+
+```text
++----+------+------+
+| id | name | plan |
++----+------+------+
+| 1  | ann  | team |
++----+------+------+
+```
+
+[Change rows](/pondra/guides/change-rows/) covers `MERGE` and the change feed.
+
+## Look up one key
+
+A lookup by key skips SQL planning. It reads the log tail, then the files newest first, each narrowed
+to one cached row group that is sorted by key.
+
+<Tabs syncKey="lang">
+  <TabItem label="SQL">
+    ```sql
+    SELECT * FROM users WHERE id = 1;
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    print(db.lookup("users", 1))
+    ```
+  </TabItem>
+  <TabItem label="JavaScript">
+    ```js
+    import { connect } from "pondra";
+    const db = connect("http://localhost:8080");
+    console.log(await db.lookup("users", 1));
+    ```
+  </TabItem>
+  <TabItem label="Shell">
+    ```bash
+    curl -s localhost:8080/lookup/users/1
+    ```
+  </TabItem>
+</Tabs>
+
+Each one returns key 1's row: `ann`, on the `team` plan. From `curl` it is JSON:
+
+```text
+{"id":1,"name":"ann","plan":"team"}
+```
+
+Measured with 2 million keys on one 2-vCPU machine, with the load generator on the same machine:
+
+| `/lookup` | Median, one client | Throughput, 32 to 64 clients |
+|---|---|---|
+| On the leader, local disk | 0.22 ms | 20,000 a second (p99 7.4 ms) |
+| On a read-only node, local disk | 0.14 ms | 35,600 a second (p99 6.4 ms) |
+| On a read-only node, Cloudflare R2 (500,000 keys) | 0.14 ms | 31,800 a second (p99 4.0 ms) |
+
+## Add up numbers: merge tables
+
+Give a keyed table `merge` and the rows for a key combine instead of replacing each other. Each
+listed column takes `sum`, `count`, `min` or `max`.
+
+```sql
+CREATE TABLE spend (user VARCHAR PRIMARY KEY, total BIGINT, n BIGINT) WITH (merge = 'total:sum,n:sum');
+INSERT INTO spend VALUES ('ann', 5, 1), ('bob', 3, 1);
+INSERT INTO spend VALUES ('ann', 7, 1);
+SELECT * FROM spend ORDER BY user;
+```
+
+```text
++------+-------+---+
+| user | total | n |
++------+-------+---+
+| ann  | 12    | 2 |
+| bob  | 3     | 1 |
++------+-------+---+
+```
+
+A materialized view with `GROUP BY` is a merge table. It keeps one row of running totals per key,
+and any number of nodes can update it at once, with no shuffle between them.
+
+```sql
+CREATE TABLE clicks (user VARCHAR, amount BIGINT);
+CREATE MATERIALIZED VIEW per_user AS
+  SELECT user, sum(amount) AS total, count(*) AS n FROM clicks GROUP BY user;
+INSERT INTO clicks VALUES ('ann', 5), ('bob', 3), ('ann', 7);
+SELECT * FROM per_user ORDER BY user;
+```
+
+```text
++------+-------+---+
+| user | total | n |
++------+-------+---+
+| ann  | 12    | 2 |
+| bob  | 3     | 1 |
++------+-------+---+
+```
+
+[Streaming](/pondra/guides/streaming/) has the views that group by time windows.
+
+## Expire rows with a TTL
+
+`ttl = 'column:seconds'` hides rows whose timestamp column is older than that many seconds. A full
+compaction deletes them from the files.
+
+```sql
+CREATE TABLE sessions (id VARCHAR PRIMARY KEY, seen TIMESTAMP, who VARCHAR) WITH (ttl = 'seen:3600');
+INSERT INTO sessions VALUES ('a', now(), 'ann'), ('b', TIMESTAMP '2020-01-01 00:00:00', 'bob');
+SELECT id, who FROM sessions ORDER BY id;
+```
+
+```text
++----+-----+
+| id | who |
++----+-----+
+| a  | ann |
++----+-----+
+```
+
+Change it later with `ALTER TABLE sessions SET (ttl = 'seen:7200')`.
+
+## Keep the latest event, not the last to arrive
+
+By default the last row written for a key wins. With `order_by`, the row with the greatest value in
+that column wins, however late it arrives. This is what Flink calls deduplication by event time.
+
+```sql
+CREATE TABLE readings (sensor VARCHAR PRIMARY KEY, ts TIMESTAMP, temp DOUBLE) WITH (order_by = 'ts');
+INSERT INTO readings VALUES ('s1', TIMESTAMP '2026-09-29 10:00:00', 20.0);
+INSERT INTO readings VALUES ('s1', TIMESTAMP '2026-09-29 09:00:00', 18.0);
+SELECT * FROM readings;
+```
+
+```text
++--------+---------------------+------+
+| sensor | ts                  | temp |
++--------+---------------------+------+
+| s1     | 2026-09-29T10:00:00 | 20.0 |
++--------+---------------------+------+
+```
+
+The 09:00 row arrived last, but the 10:00 row is current. Reads, folds, compactions and deletes all
+follow the same rule. A read costs more: 200,000 keys spread over five generations of files and the
+log read in 0.14 s, where reading by arrival takes 0.03 s.
+
+## How the files are kept
+
+A keyed table is a small log-structured merge tree. Each tiering round writes one new file with the
+newest version of every key it saw, and a read takes the newest version of each key across the files
+and the log tail:
+
+```text
+newest   log tail    a=5
+         file 3      b=9   c=1
+         file 2      a=4   b=2
+oldest   file 1      a=1   c=0   d=7
+
+a read   a=5   b=9   c=1   d=7
+```
+
+Files are written sorted by key, with a Bloom filter on the key and small row groups, so a lookup
+opens one row group instead of a file.
+
+When 8 files pile up, the newest run of files of similar size is merged: going back while each older
+file is at most twice the size of what is newer. Delete markers stay, so the merged file still hides
+the older versions. Only when the run reaches the oldest file is the whole table rewritten, and that
+is when deleted rows and rows past their TTL disappear. A table with one file and nothing newer in
+the log already has one row per key, so it reads like plain Parquet.
+
+The cost of a round follows the new rows, not the table's size. On a table of 2 million keys with 60
+rounds of updates, this writes 3 times less than rewriting the table every round. In the keyed
+benchmark (`tools/keyed_bench.py`), 17.9 MB were written against 53.4 MB for full rewrites.
+
+Three rounds of updating 1,000 keys leave three files and 1,000 rows:
+
+```sql
+CREATE TABLE counters (id BIGINT PRIMARY KEY, n BIGINT);
+INSERT INTO counters SELECT x AS id, 1 AS n FROM generate_series(1, 1000) t(x);
+CHECKPOINT;
+INSERT INTO counters SELECT x AS id, 2 AS n FROM generate_series(1, 1000) t(x);
+CHECKPOINT;
+INSERT INTO counters SELECT x AS id, 3 AS n FROM generate_series(1, 1000) t(x);
+CHECKPOINT;
+SELECT count(*) AS keys, min(n) AS lowest FROM counters;
+```
+
+```text
++------+--------+
+| keys | lowest |
++------+--------+
+| 1000 | 3      |
++------+--------+
+```
+
+```bash
+ls lake/data/counters | wc -l
+```
+
+```text
+3
+```
+
+## Partition and cluster a keyed table
+
+A key goes together with `partition_by` and `cluster_by`. Each tiering round writes a file per
+partition, sorted by the cluster columns and then the key. A newer row for a key hides an older one
+in any partition, so a row that moves to another day still has one current version.
+
+```sql
+CREATE TABLE visits (id BIGINT PRIMARY KEY, user VARCHAR, ts TIMESTAMP, page VARCHAR)
+  WITH (partition_by = 'day(ts)', cluster_by = 'user');
+INSERT INTO visits VALUES (1, 'ann', TIMESTAMP '2026-09-28 10:00:00', '/a'), (2, 'bob', TIMESTAMP '2026-09-28 11:00:00', '/b');
+INSERT INTO visits VALUES (1, 'ann', TIMESTAMP '2026-09-29 09:00:00', '/c');
+SELECT id, page FROM visits ORDER BY id;
+```
+
+```text
++----+------+
+| id | page |
++----+------+
+| 1  | /c   |
+| 2  | /b   |
++----+------+
+```
+
+Row 1 moved from the 28th to the 29th and is still one row.
+
+## Other engines and keyed tables
+
+A keyed table publishes to Delta and Iceberg when one file holds one row per key, which is after a
+full compaction. Other engines see the table as of its last full compaction, which comes when 8
+tiering rounds pile up. `CHECKPOINT` compacts a published keyed table so they see it as it is now.
+
+<Aside type="caution">
+- A change (`UPDATE`, `DELETE`, `MERGE`) to a table is refused while a view follows it that can't take
+  a row back: a window or session view that emits once, a view that keeps a `min` or `max`, a join, or
+  a streaming task. Views that add up (`sum`, `count`) do take rows back.
+- An `ASOF JOIN` looks up a table's rows. A keyed table keeps only its latest row per key, so the
+  join gives the latest row, not the one from that moment. Keep a table's history as an append table.
+- Other engines can't append to a keyed table through the Iceberg REST catalog. It is refused by name.
+- Pondra's own reads of a keyed table don't prune by partition yet: a newer row in another partition
+  may hide an older one. Outside engines reading the compacted table do prune.
+</Aside>
+
+## Design notes
+
+[ADR-006](https://github.com/alimardon123/pondra/blob/main/docs/adr-006-serving-and-lsm.md) explains
+the merge tree and the serving reads.
+[ADR-021](https://github.com/alimardon123/pondra/blob/main/docs/adr-021-fewer-objects-and-streams.md)
+covers keys with `partition_by` and `cluster_by`.

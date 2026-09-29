@@ -1,0 +1,340 @@
+---
+title: Change rows
+description: UPDATE, DELETE and MERGE on any table, a row's system columns, exactly-once changes, the change feed, and temporary tables.
+sidebar:
+  order: 5
+---
+
+import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+
+Every table takes `UPDATE`, `DELETE` and `MERGE`, not only keyed ones. Nothing is rewritten when a row
+changes: the new version is written like any new row, and the old one is hidden from every read.
+Materialized views, live queries and the change feed follow along.
+
+```sql
+CREATE TABLE orders (id BIGINT, item VARCHAR, qty INT, status VARCHAR);
+INSERT INTO orders VALUES (1, 'tea', 2, 'new'), (2, 'cake', 1, 'new'), (3, 'tea', 1, 'new'), (4, 'pie', 3, 'new');
+```
+
+## Update and delete rows
+
+```sql
+UPDATE orders SET status = 'shipped', qty = qty + 1 WHERE item = 'tea';
+DELETE FROM orders WHERE id = 4;
+SELECT * FROM orders ORDER BY id;
+```
+
+```text
++----+------+-----+---------+
+| id | item | qty | status  |
++----+------+-----+---------+
+| 1  | tea  | 3   | shipped |
+| 2  | cake | 1   | new     |
+| 3  | tea  | 2   | shipped |
++----+------+-----+---------+
+```
+
+`UPDATE` and `DELETE` answer with what they did. In Python that is a dict:
+
+```python
+import pondra
+db = pondra.connect("http://localhost:8080")
+print(db.sql("UPDATE orders SET status = 'packed' WHERE id = 2"))
+```
+
+```text
+{'rows': 1, 'updated': 1, 'deleted': 0, 'inserted': 0}
+```
+
+A change is one commit, made by the lake's leader from one snapshot. It applies all or not at all, and
+two changes to the same rows from different nodes at once don't lose either. You can send the statement
+to any node.
+
+## Merge rows from another table
+
+`MERGE` lines a source up against a table and decides for each row: change it, delete it, or add it.
+
+```sql
+CREATE TABLE stock (sku VARCHAR, qty INT, note VARCHAR);
+INSERT INTO stock VALUES ('tea', 10, ''), ('cake', 5, ''), ('pie', 2, ''), ('jam', 8, '');
+CREATE TABLE deliveries (sku VARCHAR, qty INT);
+INSERT INTO deliveries VALUES ('tea', 5), ('cake', -5), ('pie', 20), ('milk', 12);
+
+MERGE INTO stock t USING deliveries s ON t.sku = s.sku
+  WHEN MATCHED AND t.qty + s.qty <= 0 THEN DELETE
+  WHEN MATCHED THEN UPDATE SET qty = t.qty + s.qty
+  WHEN NOT MATCHED THEN INSERT (sku, qty, note) VALUES (s.sku, s.qty, 'new')
+  WHEN NOT MATCHED BY SOURCE AND t.qty < 10 THEN UPDATE SET note = 'no delivery';
+```
+
+`MERGE` answers with how many rows it updated, deleted and inserted:
+
+```text
+{"rows":5,"updated":3,"deleted":1,"inserted":1}
+```
+
+`tea` and `pie` got their delivery, `cake` came to 0 and is gone, `milk` is new, and `jam` had no delivery
+and was low.
+
+```sql
+SELECT * FROM stock ORDER BY sku;
+```
+
+```text
++------+-----+-------------+
+| sku  | qty | note        |
++------+-----+-------------+
+| jam  | 8   | no delivery |
+| milk | 12  | new         |
+| pie  | 22  |             |
+| tea  | 15  |             |
++------+-----+-------------+
+```
+
+The three kinds of `WHEN`:
+
+| Clause | Which rows | Can do |
+|---|---|---|
+| `WHEN MATCHED` | target rows with a source row | `UPDATE SET …`, `DELETE` |
+| `WHEN NOT MATCHED` | source rows with no target row | `INSERT` |
+| `WHEN NOT MATCHED BY SOURCE` | target rows with no source row | `UPDATE SET …`, `DELETE` |
+
+Add `AND condition` to a clause to narrow it. A row takes the first clause of its kind whose condition
+holds. `INSERT` without a column list takes the table's columns in order.
+
+The source can be a table, a view, a subquery or a `VALUES` list:
+
+```sql
+MERGE INTO stock t USING (VALUES ('tea', 1), ('fig', 4)) AS s(sku, qty) ON t.sku = s.sku
+  WHEN MATCHED THEN UPDATE SET qty = t.qty + s.qty
+  WHEN NOT MATCHED THEN INSERT VALUES (s.sku, s.qty, 'from a list');
+```
+
+In the [shell](/pondra/start/shell/) it can be a file on your machine, which is how you apply a CSV of
+changes:
+
+```bash
+printf 'sku,qty\ntea,1\nplum,3\n' > changes.csv
+pondra lake <<'SQL'
+MERGE INTO stock t USING 'changes.csv' s ON t.sku = s.sku
+  WHEN MATCHED THEN UPDATE SET qty = t.qty + s.qty
+  WHEN NOT MATCHED THEN INSERT VALUES (s.sku, s.qty, 'from a file')
+SQL
+```
+
+```text
+{"rows":2,"updated":1,"deleted":0,"inserted":1}
+```
+
+A target row that matches two source rows is an error, not a guess:
+
+```python
+try:
+    db.sql("""MERGE INTO stock t USING (SELECT 'tea' AS sku, 1 AS qty UNION ALL SELECT 'tea', 2) s ON t.sku = s.sku
+              WHEN MATCHED THEN UPDATE SET qty = s.qty""")
+except Exception as e:
+    print(e)
+```
+
+```text
+500: MERGE: a row of stock matches more than one source row
+```
+
+## System columns
+
+Every row carries four columns of its own. `SELECT *` leaves them out, and naming one brings it in.
+
+| Column | What it is |
+|---|---|
+| `_row_id` | Which row it is, from its `INSERT` on. An `UPDATE` or `MERGE` keeps it. |
+| `_version` | The commit that wrote this version of the row. |
+| `_created_at` | When the row's first version was committed. Kept through changes. |
+| `_updated_at` | When this version was committed. |
+
+```python
+before = db.sql("SELECT _row_id, _version FROM stock WHERE sku = 'milk'").rows()[0]
+db.sql("UPDATE stock SET qty = qty + 1 WHERE sku = 'milk'")
+after = db.sql("SELECT _row_id, _version, _created_at, _updated_at FROM stock WHERE sku = 'milk'").rows()[0]
+print(after["_row_id"] == before["_row_id"], after["_version"] > before["_version"], after["_updated_at"] > after["_created_at"])
+```
+
+```text
+True True True
+```
+
+Use `_row_id` to name a row when a table has no key of its own. Their names are reserved: `CREATE TABLE`
+refuses a column called `_row_id`.
+
+## Change rows exactly once
+
+A job id makes a change safe to retry. The node remembers it, and a second statement with the same id
+does nothing:
+
+<Tabs syncKey="lang">
+  <TabItem label="Python">
+    ```python
+    bump = "UPDATE stock SET qty = qty + 100 WHERE sku = 'pie'"
+    print(db.sql(bump, job="restock-2026-09-28"))
+    print(db.sql(bump, job="restock-2026-09-28"))    # a retry: nothing changes
+    print(db.sql("SELECT qty FROM stock WHERE sku = 'pie'").rows())
+    ```
+
+    ```text
+    {'rows': 1, 'updated': 1, 'deleted': 0, 'inserted': 0}
+    {'duplicate': True}
+    [{'qty': 122}]
+    ```
+  </TabItem>
+  <TabItem label="Shell">
+    ```bash
+    bump="UPDATE stock SET qty = qty + 100 WHERE sku = 'jam'"
+    for attempt in 1 2; do
+      curl -s -w '\n' -X POST "http://localhost:8080/sql?job=restock-jam-2026-09-28" -d "$bump"
+    done
+    ```
+
+    ```text
+    {"rows":1,"updated":1,"deleted":0,"inserted":0}
+    {"duplicate":true}
+    ```
+  </TabItem>
+</Tabs>
+
+The second answer is `duplicate`, and the quantity went up by 100 once.
+
+## Follow the changes
+
+`GET /watch/orders?changes=true` streams every change to a table as it commits, as JSON lines. Each row
+comes with its system columns and a `_change_type`:
+
+| `_change_type` | When |
+|---|---|
+| `insert` | A row is added. |
+| `update_preimage` | The row as it was before an `UPDATE`. |
+| `update_postimage` | The row as it is after it. |
+| `delete` | A row is deleted. |
+
+A keyed table's changes are `upsert` and `delete`. The clients wrap the route, and `after=0` replays what
+the node still holds first:
+
+<Tabs syncKey="lang">
+  <TabItem label="Python">
+    ```python
+    import itertools
+
+    db.sql("CREATE TABLE notes (id BIGINT, qty INT)")
+    db.sql("INSERT INTO notes VALUES (1, 1), (2, 2)")
+    db.sql("UPDATE notes SET qty = 20 WHERE id = 2")
+    db.sql("DELETE FROM notes WHERE id = 1")
+
+    for row in itertools.islice(db.watch("notes", after=0, changes=True), 5):
+        print(row["_change_type"], row["id"], row["qty"])
+    ```
+  </TabItem>
+  <TabItem label="JavaScript">
+    ```js
+    import { connect } from "pondra";
+    const db = connect("http://localhost:8080");
+
+    await db.sql("CREATE TABLE notes_js (id BIGINT, qty INT)");
+    await db.sql("INSERT INTO notes_js VALUES (1, 1), (2, 2)");
+    await db.sql("UPDATE notes_js SET qty = 20 WHERE id = 2");
+    await db.sql("DELETE FROM notes_js WHERE id = 1");
+
+    let n = 0;
+    for await (const row of db.watch("notes_js", { after: 0, changes: true })) {
+      console.log(row._change_type, row.id, row.qty);
+      if (++n === 5) break;
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+```text
+insert 1 1
+insert 2 2
+update_preimage 2 2
+update_postimage 2 20
+delete 1 1
+```
+
+`db.position` is the commit the watcher has reached; pass it as `after` to carry on where it stopped.
+How far back `after` reaches is set by `pondra serve --changelog-secs`, which keeps the log that many
+seconds as a replayable feed. Without it, the log is kept for `--retain-secs` (60 seconds).
+
+## Views follow
+
+A materialized view that adds up (`sum` and `count`, grouped) takes the old rows back and adds the new
+ones in the same commit as the change. Give it a `count(*)`, so it knows when a group has no rows left
+and drops it.
+
+```sql
+CREATE MATERIALIZED VIEW qty_by_item AS SELECT item, sum(qty) AS n, count(*) AS orders FROM orders GROUP BY item;
+UPDATE orders SET qty = 5 WHERE id = 1;
+DELETE FROM orders WHERE item = 'cake';
+SELECT * FROM qty_by_item ORDER BY item;
+```
+
+```text
++------+---+--------+
+| item | n | orders |
++------+---+--------+
+| tea  | 7 | 2      |
++------+---+--------+
+```
+
+`cake` has no orders left, so its group is gone.
+
+Some views can't take a row back: one that keeps a `min` or `max`, one that emits windows or sessions,
+one that joins another table, and streaming tasks. While one of them reads a table, a change to the
+table is refused, with the reason. Drop the view, or make it one that adds up.
+
+```python
+db.sql("CREATE MATERIALIZED VIEW biggest AS SELECT item, max(qty) AS most FROM orders GROUP BY item")
+try:
+    db.sql("UPDATE orders SET qty = 1 WHERE id = 3")
+except Exception as e:
+    print(e)
+db.sql("DROP VIEW biggest")
+```
+
+```text
+500: orders's rows can't change while these follow it: view biggest (keeps a min or max). Drop them first, or change a copy of the table
+```
+
+## Temporary tables
+
+`CREATE TEMP TABLE` makes a table only your connection sees, held in the node's memory. It takes
+`INSERT`, `UPDATE`, `DELETE` and `MERGE`, and joins with the lake's tables. It is gone when you close the
+connection.
+
+```python
+db.sql("CREATE TEMP TABLE picks AS SELECT sku, qty FROM stock WHERE qty > 10")
+db.sql("UPDATE picks SET qty = 0 WHERE sku = 'tea'")
+print(db.sql("SELECT s.sku, s.qty AS in_stock, p.qty AS picked FROM stock s JOIN picks p USING (sku) ORDER BY s.sku").rows())
+db.close()
+```
+
+```text
+[{'sku': 'jam', 'in_stock': 108, 'picked': 108}, {'sku': 'milk', 'in_stock': 13, 'picked': 13}, {'sku': 'pie', 'in_stock': 122, 'picked': 122}, {'sku': 'tea', 'in_stock': 17, 'picked': 0}]
+```
+
+The change to `picks` left `stock` alone: `tea` is 0 in the copy and 17 in the table. JavaScript's
+`await db.sql(…)` and `await db.close()` do the same, and so does a `psql` session until it ends.
+
+## What to know
+
+<Aside type="caution">
+- Nothing is rewritten when a row changes, so its old version stays in its file until a purge rewrites
+  the file (once 100,000 changed rows wait, or a tenth of the table; every few seconds for a table that
+  publishes Delta or Iceberg). Queries never see old versions. Delta and Iceberg readers see a change
+  after that purge.
+- Kafka consumers of a table see an `UPDATE`'s new rows but not its deletes.
+- A statement that changes tables in two lakes is two commits, not one transaction.
+- Tables made before version 0.19 have rows without ids. Their keyed tables change as before; change an
+  older append table after `CREATE TABLE t2 AS SELECT * FROM t`.
+</Aside>
+
+A change costs what reading its rows costs, plus one commit. On a table of 10 million rows in Parquet
+on a 2-vCPU machine, `UPDATE … WHERE id = 12345` took 0.024 s, an update of 100,000 rows 0.26 s, and a
+`MERGE` of 100,000 rows 0.9 to 1.2 s.

@@ -1,0 +1,294 @@
+---
+title: HTTP API
+description: Every HTTP endpoint of a Pondra node, with its method, path, role, parameters, body and answer.
+sidebar:
+  order: 8
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Every node answers HTTP on its `--addr` (default `127.0.0.1:8080`). The Python and JavaScript
+clients, the shell and the console all use these endpoints, and so can `curl`. Any node takes any
+request. A request that changes a table, view, task or function goes to the leader, and a
+follower forwards it there.
+
+## Roles
+
+A node started without tokens is open. With `--read-token`, `--write-token` and `--admin-token`
+(or the `PONDRA_*_TOKEN` variables), a request carries `Authorization: Bearer <token>`, and the
+token's role decides what it may do. A role covers the ones before it: admin, then write, then
+read.
+
+| Role | May |
+|---|---|
+| read | run queries, look up keys, watch, live queries, read files, the Iceberg catalog |
+| write | also append rows, insert, put files, and write with `POST /sql` |
+| admin | also create tables, views, tasks and functions, run DDL (`CREATE`, `ALTER`, `DROP`, `COPY … TO`) in `POST /sql`, and tier |
+
+A request without enough rights is answered `401` with `this needs a token with more rights`. Any
+other error is `500` with its message as plain text.
+
+```bash norun
+curl -s -H "Authorization: Bearer $PONDRA_TOKEN" -X POST http://localhost:8080/sql -d "SELECT 1"
+```
+
+## Run SQL
+
+| Method and path | Role | Meaning |
+|---|---|---|
+| `POST /sql` | read (write and admin for statements that change things) | run one or more statements; answer with the last one's rows or outcome |
+
+The body is SQL text. To send parameters, send JSON with `Content-Type: application/json`:
+`{"sql": "…", "params": {"min": 5}}`. Parameters are `$name` in the SQL; a value is JSON, or
+`{"sql": "DATE '2026-09-27'"}` for one that JSON has no type for. `views` (a map of a name to a
+query) and `tables` are for clients that send frames and data along; the clients build them.
+
+| Query parameter | Meaning |
+|---|---|
+| `format` | `json` (the default), `table` (a text table) or `arrow` (an Arrow IPC stream, for pandas, Polars and DuckDB) |
+| `after` | wait until this node has seen this log segment (from an append's `seg`), for reading your own writes |
+| `spread` | `1` runs the query across the cluster even for small tables, `0` only here |
+| `stale_ms` | accept a remembered answer up to this many milliseconds old |
+| `job` | for a write: a retry with the same job id is applied once |
+
+A query answers a JSON array of rows, one object each. A column that is null in a row is left out
+of its object. A statement that isn't a query answers a JSON object, such as `{"rows": 2}` or
+`{"table": "t", "publish": []}`. Several statements in one request run in order.
+
+The header `x-pondra-notices` on an answer carries what procedures printed, as a JSON list of
+lines. Send `x-pondra-session: <id>` to use temporary tables that only that id sees.
+
+```bash
+curl -s -X POST http://localhost:8080/sql -d "CREATE TABLE events (user VARCHAR, amount BIGINT)"
+curl -s -X POST http://localhost:8080/sql -d "INSERT INTO events VALUES ('ann', 5), ('bo', 7)"
+curl -s -X POST http://localhost:8080/sql -d "SELECT user, sum(amount) AS total FROM events GROUP BY user ORDER BY user"
+curl -s -X POST http://localhost:8080/sql -H 'content-type: application/json' -d '{"sql": "SELECT * FROM events WHERE amount > $min", "params": {"min": 5}}'
+curl -s -X POST 'http://localhost:8080/sql?format=table' -d "SELECT * FROM events ORDER BY user"
+```
+
+```text
+{"table":"events","publish":[]}
+{"rows":2}
+[{"user":"ann","total":5},{"user":"bo","total":7}]
+[{"user":"bo","amount":7}]
++------+--------+
+| user | amount |
++------+--------+
+| ann  | 5      |
+| bo   | 7      |
++------+--------+
+```
+
+## Write rows
+
+| Method and path | Role | Meaning |
+|---|---|---|
+| `POST /append/{table}` | write | append rows exactly once |
+| `POST /insert/{table}` | write | run a query and write its rows as files, in bulk |
+
+`POST /append/{table}?producer=NAME&seq=N[&prev=M]`: the body is newline-delimited JSON, one row
+per line, or an Arrow IPC stream with `Content-Type: application/vnd.apache.arrow.stream`. A
+column left out is null. `producer` names the writer and `seq` counts its appends, so a retry with
+the same `producer` and `seq` is recognised and not applied twice. `prev` is a compare-and-swap:
+the append applies only if the producer's last `seq` is `prev`. Count from 1: a `seq` of 0 or less
+counts as already applied, so its rows are not written. The answer is:
+
+| Field | Meaning |
+|---|---|
+| `seg` | the log segment that holds the rows |
+| `duplicate` | true if this `seq` was already applied, so nothing was written |
+| `conflict` | true if `prev` didn't match: read again and retry |
+| `row` | where the rows start among the table's rows in `seg` |
+| `ms` | the commit time, for a reservation |
+
+`POST /insert/{table}?job=ID`: the body is a query, such as `SELECT * FROM events`. The node runs
+it and writes the rows as Parquet, and the table is made if it doesn't exist. The answer is
+`{"rows": N}`, or `{"duplicate": true}` if this `job` was already applied.
+
+```bash
+curl -s -X POST 'http://localhost:8080/append/events?producer=p1&seq=1' -H 'content-type: application/x-ndjson' --data-binary $'{"user":"cy","amount":3}\n{"user":"di","amount":4}\n'
+curl -s -X POST 'http://localhost:8080/append/events?producer=p1&seq=1' --data-binary $'{"user":"cy","amount":3}\n'
+curl -s -X POST 'http://localhost:8080/insert/events_copy?job=copy-1' -d "SELECT * FROM events"
+curl -s -X POST 'http://localhost:8080/insert/events_copy?job=copy-1' -d "SELECT * FROM events"
+```
+
+```text
+{"seg":3,"duplicate":false,"conflict":false,"row":0,"ms":0}
+{"seg":0,"duplicate":true,"conflict":false,"row":0,"ms":0}
+{"rows":4}
+{"duplicate":true}
+```
+
+## Tables, views and tasks
+
+| Method and path | Role | Meaning |
+|---|---|---|
+| `POST /tables/{name}` | admin | make a table from a JSON definition, or change an existing one (add columns at the end, `publish`, `cluster_by`, `ttl`, `order_by`) |
+| `POST /views/{name}` | admin | make a materialized view; the body is its query, and its options are query parameters |
+| `POST /tasks/{name}` | admin | make a task that runs a query over a source table into a target, as it arrives |
+
+The body of `POST /tables/{name}` is either a list of `[name, type]` pairs, with Arrow's type names
+(`Utf8`, `Int64`, `Float64`, `Boolean`, `Timestamp(Microsecond, None)`), or an object with
+`columns` and the options: `key` (a list), `merge` (an object of column to function), `publish`
+and `cluster_by` (lists), `partition_by`, `ttl` and `order_by` (strings). See
+[table options](/pondra/reference/table-options/#the-same-options-over-http). The answer is
+`{"table": name, "publish": […]}`.
+
+`POST /views/{name}?window=w&size_secs=60&lateness_secs=10` takes any of the options of
+[`CREATE MATERIALIZED VIEW`](/pondra/reference/table-options/#materialized-views) as query
+parameters. The answer is `{"view": name, "materialized": true}`.
+
+`POST /tasks/{name}` takes JSON: `source` and `target` (table names), `sql` (the query over the
+source), `key` (the target's primary key, to make it an upsert table), `shards` (default 1) and
+`shard_by` (a column, needed when `shards` is more than 1). The answer is `{"task": name}`.
+
+```bash
+curl -s -X POST http://localhost:8080/tables/points -d '{"columns": [["id", "Int64"], ["label", "Utf8"]], "key": ["id"]}'
+curl -s -X POST http://localhost:8080/tables/ticks -d '[["ts", "Timestamp(Microsecond, None)"], ["amount", "Float64"]]'
+curl -s -X POST 'http://localhost:8080/views/spend?window=w&size_secs=3600' -d "SELECT date_bin(INTERVAL '1 hour', ts) AS w, sum(amount) AS total FROM ticks GROUP BY 1"
+curl -s -X POST http://localhost:8080/tasks/per_user -d '{"source": "events", "target": "per_user", "sql": "SELECT user, sum(amount) AS total FROM events GROUP BY user", "key": ["user"]}'
+```
+
+```text
+{"table":"points","publish":[]}
+{"table":"ticks","publish":[]}
+{"view":"spend","materialized":true}
+{"task":"per_user"}
+```
+
+## Read and follow
+
+| Method and path | Role | Meaning |
+|---|---|---|
+| `GET /lookup/{table}/{key}` | read | the current row of one key of a keyed table |
+| `GET /watch/{table}` | read | a stream of a table's new rows as they commit |
+| `GET /live?sql=…` or `POST /live` | read | a stream of a query's answer, again each time a commit changes it |
+
+`GET /lookup/{table}/{key}` answers a JSON array with the row, or `[]`. A composite key is the
+values, comma-separated, in the key's column order. It is an error for a table with no key.
+
+`GET /watch/{table}` streams newline-delimited JSON, one row per line, for as long as you keep the
+connection open. Its parameters: `after=N` (replay from this position; the default is from now on,
+and a replay goes as far back as the log is kept), `marks=true` (after each batch of rows, a line
+`{"_after": N}`: resume with `?after=N`) and `changes=true` (the change feed: UPDATE's and DELETE's
+rows too, each with `_change_type`, `_row_id`, `_version`, `_created_at` and `_updated_at`).
+
+`/live` answers a query now, and again each time a commit changes a table it reads, as lines of
+`{"at": COMMIT, "rows": […]}`. `GET /live?sql=…` takes the query in the URL, and `POST /live`
+takes a body as `POST /sql` does, with `$name` parameters. `every_ms` sets the shortest time between
+queries on a busy table (default 100). An answer that comes out the same isn't sent again. A line
+`{"error": …}` ends the stream. The query runs while the connection is open, and stops when it
+closes.
+
+```bash
+curl -s http://localhost:8080/lookup/points/1
+curl -s --max-time 2 'http://localhost:8080/watch/events?after=0&marks=true' || true
+curl -s --max-time 2 -G http://localhost:8080/live --data-urlencode 'sql=SELECT count(*) AS n FROM events' || true
+```
+
+```text
+[]
+{"user":"ann","amount":5}
+{"user":"bo","amount":7}
+{"user":"cy","amount":3}
+{"user":"di","amount":4}
+{"_after":6}
+{"at":7,"rows":[{"n":4}]}
+```
+
+## Files
+
+| Method and path | Role | Meaning |
+|---|---|---|
+| `PUT /files/{path}` | write | store the body as an object in the lake, at `files/{path}` |
+| `GET /files/{path}` | read | the object's bytes |
+
+An object is never overwritten: a `PUT` to a path that exists is an error. The answer to `PUT` is
+`{"path": "files/{path}", "bytes": N}`. Read them from SQL with `files()` and `file_read()`, see
+[functions](/pondra/reference/functions/#files).
+
+```bash
+curl -s -X PUT http://localhost:8080/files/notes/a.txt --data-binary 'hello'
+curl -s http://localhost:8080/files/notes/a.txt
+```
+
+```text
+{"path":"files/notes/a.txt","bytes":5}
+hello
+```
+
+## Functions, routines and secrets
+
+| Method and path | Role | Meaning |
+|---|---|---|
+| `POST /functions/{name}` | admin | register a function run by your own Arrow Flight server |
+| `DELETE /functions/{name}` | admin | remove it |
+| `GET /functions` | admin | the lake's registered Flight functions, as an object by name |
+| `GET /routines` | read | the lake's SQL and Python functions and procedures, as an object by name |
+| `GET /secrets/{name}` | none | a secret's values: only for the token a running Python procedure is lent |
+
+The body of `POST /functions/{name}` is `{"flight": "http://host:port", "args": ["Utf8"], "returns":
+"Utf8", "rows": N}`, where `rows` is optional. See
+[functions](/pondra/reference/functions/#functions-you-bring). The answer is `{"function": name}`,
+and `{"dropped": name}` for `DELETE`.
+
+`GET /secrets/{name}` is what `pondra.secret(name)` calls inside a Python procedure. Any other
+token is refused.
+
+## The server
+
+| Method and path | Role | Meaning |
+|---|---|---|
+| `GET /stats` | none | health and position, as JSON |
+| `GET /metrics` | read | Prometheus metrics, as text |
+| `POST /tier` | admin | write the log into Parquet now: `{"rows_tiered": N}` |
+| `DELETE /sessions/{id}` | read | end a session's temporary tables and views: `{"ended": true}` |
+
+`GET /stats` needs no token, so a load balancer can poll it. It answers `role` (`leader`,
+`follower` or `reader`), `leader` (its address), `term`, `nodes`, `hwm` (the newest commit),
+`shard_runs`, `python_workers` and `live_queries`. On the leader it also has `untiered_rows`,
+`commits`, `commit_ms_p50` and `commit_ms_p95`.
+
+```bash
+curl -s http://localhost:8080/stats
+curl -s http://localhost:8080/metrics | head -3
+curl -s -X POST http://localhost:8080/tier
+```
+
+```text
+{"role":"leader","leader":"127.0.0.1:8080","term":1,"nodes":["127.0.0.1:8080"],"hwm":7,"shard_runs":1,"python_workers":0,"live_queries":0,"untiered_rows":0,"commits":9,"commit_ms_p50":1.69,"commit_ms_p95":2.98}
+# HELP pondra_role 1 for this node's role
+# TYPE pondra_role gauge
+pondra_role{role="leader"} 1
+{"rows_tiered":0}
+```
+
+## Other doors on the same port
+
+| Path | Role | What it is |
+|---|---|---|
+| `POST /mcp` | read (writes need more) | the MCP server: see [MCP](/pondra/reference/mcp/) |
+| `/v1/...` | read; write for `POST` | the Iceberg REST catalog: see [Iceberg REST](/pondra/reference/iceberg-rest/) |
+
+## Between nodes
+
+Nodes in a cluster call each other on these paths. You don't call them, but they are why a
+firewall between nodes must let HTTP through. They need an admin token, except `commit` and
+`files`, which need a write token, and `leader`, which needs none.
+
+| Path | Meaning |
+|---|---|
+| `POST /cluster/commit` | a follower's flush, to be sequenced by the leader |
+| `POST /cluster/files` | record the files an `INSERT` wrote, on the leader |
+| `POST /cluster/ddl`, `/cluster/change`, `/cluster/iceberg` | forward a schema change, an `UPDATE`, `DELETE` or `MERGE`, or another engine's Iceberg append to the leader |
+| `POST /cluster/stage`, `/cluster/copy`, `/cluster/job` | this node's share of a spread query, `COPY … TO`, or the leader's data work |
+| `GET /cluster/shuffle` | a shuffle bucket this node keeps for another node |
+| `GET /cluster/log`, `/cluster/replica`, `POST /cluster/ack` | the commit stream, and replicated commits |
+| `POST /cluster/beat` | a heartbeat |
+| `GET /cluster/leader`, `/cluster/kafka` | who leads, and where the Kafka port is |
+| `GET /cluster/probe` | measure the link between two nodes |
+
+<Aside type="caution">
+A request body is limited to 1 GiB. The body of an append or an insert must fit in memory on
+the node that takes it, so send big loads in batches.
+</Aside>

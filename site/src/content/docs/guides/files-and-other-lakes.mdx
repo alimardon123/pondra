@@ -1,0 +1,320 @@
+---
+title: Files and other lakes
+description: Read and write Parquet, CSV, JSON, Delta and Iceberg on disk, in buckets or over HTTPS, and attach other engines' tables.
+sidebar:
+  order: 4
+---
+
+import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+
+Files, other engines' tables and Kafka topics are tables wherever SQL takes one. You can query them,
+join them with your own tables, copy them into the lake, and write query results back out to them, in
+SQL, Python, PySpark and JavaScript.
+
+The examples read and write files in the current folder. Only programs that run on your machine may do
+that, so they use the [shell](/pondra/start/shell/) (`pondra files` opens a lake named `files`) and
+`local()`, which starts a node for your program. A node from `pondra serve` refuses to read its own
+disk for a client's SQL, whoever asks. Files in buckets and on HTTPS work through any node (below).
+
+## Files to read
+
+This makes an `orders` table and writes it out as a folder of Parquet files split by region, a CSV file
+and a JSON lines file. `COPY … TO` is explained under [Write files](#write-files).
+
+```bash
+pondra files <<'SQL'
+CREATE TABLE orders (id BIGINT, region VARCHAR, item VARCHAR, amount DOUBLE, day DATE);
+INSERT INTO orders VALUES
+  (1, 'eu', 'tea',  7.0, DATE '2026-09-27'), (2, 'us', 'cake', 4.5, DATE '2026-09-27'),
+  (3, 'eu', 'pie',  9.0, DATE '2026-09-28'), (4, 'us', 'tea',  3.5, DATE '2026-09-28');
+COPY (SELECT * FROM orders) TO 'export/orders/' (FORMAT parquet, PARTITION_BY (region));
+COPY (SELECT * FROM orders WHERE region = 'eu') TO 'export/eu.csv' (FORMAT csv, HEADER true);
+COPY (SELECT * FROM orders) TO 'export/orders.json' (FORMAT json)
+SQL
+```
+
+## Read files
+
+Name a file, a folder, a glob or a list where SQL takes a table. Reading is `read_parquet`, `read_csv`
+and `read_json`, in SQL and in every client.
+
+<Tabs syncKey="lang">
+  <TabItem label="Shell">
+    ```bash
+    pondra files <<'SQL'
+    SELECT region, count(*) AS orders, sum(amount) AS total
+    FROM read_parquet('export/orders/', hive_partitioning => true)
+    GROUP BY region ORDER BY region
+    SQL
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    import pondra
+    from pondra import col
+
+    db = pondra.local("pylake")     # a node on ./pylake, started by this program
+    orders = db.read_parquet("export/orders/", hive_partitioning=True)
+    print(orders.group_by("region").agg(col("amount").sum().alias("total")).sort("region").rows())
+    ```
+  </TabItem>
+  <TabItem label="PySpark">
+    ```python
+    from pondra.spark import SparkSession, functions as F
+
+    spark = SparkSession(db)
+    df = spark.read.parquet("export/orders/")
+    print(df.groupBy("region").agg(F.sum("amount").alias("total")).orderBy("region").collect())
+    ```
+  </TabItem>
+  <TabItem label="JavaScript">
+    ```js
+    import { local } from "pondra";
+
+    const db = await local("jslake");
+    console.log(await db.sql("SELECT region, sum(amount) AS total FROM read_parquet('export/orders/', hive_partitioning => true) GROUP BY region ORDER BY region"));
+    await db.close();
+    ```
+  </TabItem>
+</Tabs>
+
+```text
++--------+--------+-------+
+| region | orders | total |
++--------+--------+-------+
+| eu     | 2      | 16.0  |
+| us     | 2      | 8.0   |
++--------+--------+-------+
+```
+
+In Python, `db.read_parquet`, `read_csv`, `read_json` return frames; Polars' `scan_parquet`, `scan_csv`
+and `scan_ndjson` are the same functions, and DuckDB's `parquet_scan`, `read_csv_auto` and
+`read_json_auto` work in SQL. [Names](/pondra/reference/names/) lists them all.
+
+### What you can name
+
+| To read | Write |
+|---|---|
+| One file | `'orders.parquet'`, or `read_parquet('orders.parquet')`. A bare name picks its format by extension: `.parquet`, `.csv`, `.tsv`, `.json`, `.jsonl`, `.ndjson` |
+| A folder | `read_parquet('export/orders/')`: every file in it |
+| A glob | `'export/orders/**/*.parquet'`: `**` goes through subfolders, `*` matches within a name |
+| A list | `read_parquet(['jan.parquet', 'feb.parquet'])` |
+| Hive folders | `read_parquet('export/orders/', hive_partitioning => true)`: `region=eu/` folders become a `region` column |
+
+CSV takes `delim => ';'` and `header => false` (the first line is the header by default). Named
+arguments use `=>`. Files added to a folder, or changed under their name, are read as they are by the
+next statement: nothing is cached from before.
+
+<Aside type="caution">
+A `*` in the middle of a path (`export/orders/*/*.parquet`) matches nothing yet. Use `**`:
+`export/orders/**/*.parquet`.
+</Aside>
+
+## Copy files into the lake
+
+Because a file is a table, everything that reads a table can read one:
+
+```bash
+pondra files <<'SQL'
+CREATE TABLE eu_orders AS SELECT * FROM 'export/eu.csv';
+INSERT INTO eu_orders SELECT * FROM read_json('export/orders.json') WHERE region = 'eu';
+SELECT count(*) AS n FROM eu_orders
+SQL
+```
+
+```text
+{"rows":2}
+{"rows":2}
++---+
+| n |
++---+
+| 4 |
++---+
+```
+
+[Load data](/pondra/guides/load-data/) has more on loading.
+
+## Files in buckets and over HTTPS
+
+The same names work on `s3://` (AWS, R2, MinIO and anything S3-compatible), `gs://`, `az://` or
+`abfss://`, and `http(s)://`, through any node, and a glob's files are shared out over the nodes of a
+cluster as a table's are. A node reads a URL with the **secret** that covers it. An admin makes one, and
+the credentials never appear in SQL that queries run:
+
+```sql
+CREATE SECRET sales_s3 (TYPE s3, KEY_ID 'my-key-id', SECRET 'my-secret', REGION 'eu-west-1', SCOPE 's3://my-bucket');
+SELECT * FROM secrets();
+```
+
+```text
++----------+------+----------------+
+| name     | type | scope          |
++----------+------+----------------+
+| sales_s3 | s3   | s3://my-bucket |
++----------+------+----------------+
+```
+
+`CREATE SECRET` takes `TYPE s3` (or `r2`), `gcs`, `azure`, `http` (a bearer token), `iceberg` (a REST
+catalog), `kafka` or `generic`. A secret's `SCOPE` is the URL prefix it covers, and a URL uses the secret
+with the longest matching scope. A URL no secret covers is refused, except to the program that started
+the node (the shell, `local()`), which reads it with the node's own environment (`AWS_*`, Google's and
+Azure's). Secrets are kept in the lake encrypted, with a key only the nodes hold (`PONDRA_SECRET_KEY`, or
+a file beside the node). SQL can list a secret's name, type and scope, and never its values.
+
+```sql
+DROP SECRET sales_s3;
+```
+
+With a secret in place, reading is the same as for local files:
+
+```sql norun
+SELECT region, sum(amount) FROM 's3://my-bucket/2026/*.parquet' GROUP BY region;
+SELECT * FROM read_csv('gs://my-drop/orders_*.csv', delim => ';');
+SELECT day, count(*) FROM read_parquet('az://lake/events/', hive_partitioning => true) GROUP BY day;
+SELECT * FROM read_json('https://example.com/feed.ndjson');
+```
+
+## Other engines' tables
+
+Delta Lake and Iceberg tables written by Spark, Databricks, delta-rs, PyIceberg or Trino are read as
+they are, including deletion vectors, column mapping, checkpoints, and Iceberg's position and equality
+deletes. A feature Pondra doesn't read is refused by name, never read wrongly.
+
+```bash
+pondra files <<'SQL'
+COPY (SELECT id, item, amount FROM orders) TO 'lakehouse/orders_delta/' (FORMAT delta);
+COPY (SELECT id + 100 AS id, item, amount FROM orders) TO 'lakehouse/orders_delta/' (FORMAT delta, APPEND);
+SELECT count(*) AS rows_now FROM read_delta('lakehouse/orders_delta/');
+SELECT count(*) AS rows_v1 FROM read_delta('lakehouse/orders_delta/', version => 1)
+SQL
+```
+
+```text
+{"rows":4,"version":1}
+{"rows":4,"version":2}
++----------+
+| rows_now |
++----------+
+| 8        |
++----------+
++---------+
+| rows_v1 |
++---------+
+| 4       |
++---------+
+```
+
+`read_iceberg('folder')` does the same for an Iceberg table (its folder, or a metadata file), and takes
+`snapshot_from_id` or `version` for an older state. In Python they are `db.read_delta(path)` and
+`db.read_iceberg(path)`; in PySpark, `spark.read.format("delta").load(path)`. DuckDB's `delta_scan` and
+`iceberg_scan` work too.
+
+To use a whole warehouse, attach it: a folder of Delta or Iceberg tables laid out as
+`<folder>/<schema>/<table>`, or an Iceberg REST catalog. Its tables are `name.schema.table`, and you can
+join them with your own.
+
+```bash
+pondra files <<'SQL'
+COPY (SELECT id, item, amount FROM orders) TO 'warehouse/sales/orders/' (FORMAT delta);
+ATTACH 'warehouse' AS wh (TYPE delta);
+SELECT o.id, o.item, r.region FROM wh.sales.orders o JOIN orders r USING (id) ORDER BY o.id;
+INSERT INTO wh.sales.orders SELECT 10 AS id, 'juice' AS item, 2.5 AS amount;
+SELECT count(*) AS n FROM wh.sales.orders;
+DETACH wh
+SQL
+```
+
+```text
+{"rows":4,"version":1}
+{"attached":"wh","type":"delta","url":"warehouse"}
++----+------+--------+
+| id | item | region |
++----+------+--------+
+| 1  | tea  | eu     |
+| 2  | cake | us     |
+| 3  | pie  | eu     |
+| 4  | tea  | us     |
++----+------+--------+
+{"rows":1,"version":2}
++---+
+| n |
++---+
+| 5 |
++---+
+{"detached":"wh"}
+```
+
+`INSERT` into an attached Delta table is a Delta commit, and into an Iceberg table an Iceberg commit
+(through its catalog for a REST catalog), exactly-once with a job id. A REST catalog is attached with its
+URL and a secret:
+
+```sql norun
+ATTACH 'https://catalog.example.com/api/catalog' AS pol (TYPE iceberg, SECRET polaris);
+SELECT * FROM pol.sales.orders o JOIN orders p ON o.id = p.id;
+```
+
+<Aside type="caution">
+`UPDATE`, `DELETE` and `MERGE` into another engine's table aren't supported yet, and `INSERT` writes
+Iceberg v2 tables only (v1 and v3 are read, not written). Attaching Postgres and MySQL databases isn't
+built yet.
+</Aside>
+
+## Write files
+
+`COPY (query) TO 'path' (FORMAT …)` writes a query's rows outside the lake: `parquet`, `csv`, `json`
+(lines), `delta` or `iceberg`. A path that ends in `/` is a folder. Anything else is one file.
+
+```bash
+pondra files <<'SQL'
+COPY (SELECT * FROM orders WHERE amount > 4) TO 'out/big.parquet' (FORMAT parquet, COMPRESSION zstd);
+COPY orders TO 'out/orders.csv' (FORMAT csv, HEADER true, DELIMITER ';');
+COPY (SELECT * FROM orders) TO 'out/by_day/' (FORMAT parquet, PARTITION_BY (day));
+COPY (SELECT * FROM orders WHERE id = 1) TO 'out/by_day/' (FORMAT parquet, OVERWRITE)
+SQL
+```
+
+```text
+{"copied":3,"to":"out/big.parquet"}
+{"copied":4,"to":"out/orders.csv"}
+{"copied":4,"to":"out/by_day/"}
+{"copied":1,"to":"out/by_day/"}
+```
+
+- `PARTITION_BY` writes Hive-style folders (`day=2026-09-27/`).
+- A folder that already holds files is refused unless you say `OVERWRITE` (replace them) or `APPEND`.
+  For `delta` and `iceberg`, an empty folder gets a new table, and one that holds a table takes `APPEND`
+  or `OVERWRITE`.
+- On a cluster, a big result written to a folder is written by every node, each its own share's files.
+
+In Python, frames write with `write_parquet`, `write_csv`, `write_json`, `write_delta` and
+`write_iceberg` (Polars' `sink_*` are the same), and PySpark's writer works as usual:
+
+<Tabs syncKey="lang">
+  <TabItem label="Python">
+    ```python
+    big = orders.filter(col("amount") > 4)
+    big.write_parquet("out/big/")
+    big.write_delta("out/big_delta", mode="overwrite")
+    print(db.read_delta("out/big_delta").rows())
+    ```
+  </TabItem>
+  <TabItem label="PySpark">
+    ```python
+    df.filter("amount > 4").write.mode("overwrite").format("delta").save("out/spark_delta")
+    df.write.partitionBy("region").mode("overwrite").parquet("out/spark_parts/")
+    ```
+  </TabItem>
+</Tabs>
+
+A Delta or Iceberg folder written this way is a table that Spark, DuckDB, delta-rs and PyIceberg read.
+
+## Kafka topics
+
+A Kafka cluster is attached like a warehouse, with a `kafka` secret if it needs credentials. Its topics
+are tables, and `COPY … TO` writes rows to a topic. [Kafka](/pondra/guides/kafka/) has the rest.
+
+```sql norun
+ATTACH 'kafka://broker1:9092,broker2:9092' AS k (TYPE kafka, SECRET kafka_prod);
+SELECT * FROM k.orders LIMIT 10;
+COPY alerts TO 'kafka://broker1:9092/alerts' (FORMAT json, KEY id);
+```

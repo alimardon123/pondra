@@ -1,0 +1,195 @@
+---
+title: Names for reading and writing
+description: The one vocabulary for reading and writing files and tables in SQL, Python, PySpark and JavaScript, with the fallbacks from other tools.
+sidebar:
+  order: 4
+---
+
+import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+
+Pondra reads and writes with one set of names: `read_<format>` to read and `write_<format>` to
+write. The names that Polars, DuckDB and PySpark users know work too, as **fallbacks**, and give
+the same answers. Every client turns into the same SQL, so what works in one works in all.
+
+## Reading
+
+| You read | SQL | Python | PySpark | Fallbacks |
+|---|---|---|---|---|
+| Parquet files | `read_parquet` | `db.read_parquet`, `pondra.read_parquet` | `spark.read.parquet` | `parquet_scan`, `db.scan_parquet`, `pondra.scan_parquet` |
+| CSV files | `read_csv` | `db.read_csv`, `pondra.read_csv` | `spark.read.csv` | `read_csv_auto`, `db.scan_csv`, `pondra.scan_csv` |
+| JSON lines | `read_json` | `db.read_json`, `pondra.read_json` | `spark.read.json` | `read_json_auto`, `read_ndjson`, `db.scan_ndjson`, `db.read_ndjson`, `pondra.scan_ndjson`, `pondra.read_ndjson` |
+| A Delta table | `read_delta` | `db.read_delta`, `pondra.read_delta` | `spark.read.format("delta").load` | `delta_scan`, `db.scan_delta`, `pondra.scan_delta` |
+| An Iceberg table | `read_iceberg` | `db.read_iceberg`, `pondra.read_iceberg` | `spark.read.format("iceberg").load` | `iceberg_scan`, `db.scan_iceberg`, `pondra.scan_iceberg` |
+| A lake's table | `FROM t` | `db.table`, `pondra.table` | `spark.table`, `spark.read.table` | |
+
+## Writing
+
+| You write | SQL | Python (on a frame) | PySpark | Fallbacks |
+|---|---|---|---|---|
+| Parquet files | `COPY … TO (FORMAT parquet)` | `frame.write_parquet` | `df.write.parquet` | `frame.sink_parquet` |
+| CSV files | `COPY … TO (FORMAT csv)` | `frame.write_csv` | `df.write.csv` | `frame.sink_csv` |
+| JSON lines | `COPY … TO (FORMAT json)` | `frame.write_json` | `df.write.json` | `frame.sink_ndjson`, `frame.write_ndjson` |
+| A Delta table | `COPY … TO (FORMAT delta)` | `frame.write_delta` | `df.write.format("delta").save`, `df.write.delta` | |
+| An Iceberg table | `COPY … TO (FORMAT iceberg)` | `frame.write_iceberg` | `df.write.format("iceberg").save` | |
+| A lake's table | `INSERT INTO t …`, `CREATE TABLE t AS …` | `frame.write_table`, `db.write_table` | `df.write.saveAsTable`, `df.write.insertInto` | |
+
+`db` is a connection (`pondra.connect(url)` or `pondra.local(dir)`), and `pondra.read_*` uses the
+connection Python code has inside a Pondra function or procedure. A `frame` is what `db.table`
+and `db.read_*` return. See the [Python](/pondra/reference/python/) and
+[frames](/pondra/reference/frames/) references.
+
+**JavaScript** has no frames: SQL is its API. Read and write with the SQL names,
+`db.sql("SELECT * FROM read_parquet('…')")` and `db.sql("COPY … TO '…'")`.
+
+## What a name takes
+
+A source is a path, a glob (`sales/*.parquet`), a folder, a list of them, or a URL (`s3://`,
+`gs://`, `az://`, `https://`). A URL needs a [secret](/pondra/reference/sql/#files-and-secrets)
+whose scope covers it, unless the node is yours. A path on the node's machine is read and written
+only by the program that started the node: the shell, `pondra.local()` or `pondra sql`.
+
+Options come by name. The same option has each tool's spelling:
+
+| Option | SQL | Python | PySpark |
+|---|---|---|---|
+| CSV delimiter | `delim => ';'` (or `sep`, `delimiter`) | `separator=';'` | `.option("sep", ";")` |
+| CSV header row (default true) | `header => false` | `has_header=False` | `.option("header", True)` |
+| Folders named `k=v` are columns | `hive_partitioning => true` | `hive_partitioning=True` | on by default |
+| Combine files with different columns | `union_by_name => true` | `union_by_name=True` | |
+| Delta version | `version => 3` | `version=3` | |
+| Iceberg snapshot | `snapshot_from_id => 123` | `snapshot_id=123` | |
+
+Writing takes `PARTITION_BY (col, …)`, `APPEND` or `OVERWRITE`, `HEADER`, `DELIMITER`,
+`COMPRESSION` and `ROW_GROUP_SIZE` in SQL. Spark's modes are `df.write.mode("overwrite")` and
+`"append"`, and `partitionBy(…)` picks the partition columns. A folder that already holds a Delta
+or Iceberg table takes `mode="append"` or `"overwrite"`; the default, `"error"`, refuses.
+
+## Read a file
+
+First, a file to read and a lake to work in:
+
+```bash
+printf 'id,name\n1,tea\n2,cake\n' > sales.csv
+pondra sql --dir scratch "CREATE TABLE menu (id BIGINT, name VARCHAR)"
+```
+
+<Tabs syncKey="lang">
+  <TabItem label="SQL">
+    ```bash
+    pondra sql --dir scratch "SELECT * FROM read_csv('sales.csv')"
+    ```
+
+    ```text
+    +----+------+
+    | id | name |
+    +----+------+
+    | 1  | tea  |
+    | 2  | cake |
+    +----+------+
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    import pondra
+    db = pondra.local("scratch")
+    print(db.read_csv("sales.csv").rows())
+    ```
+
+    ```text
+    [{'id': 1, 'name': 'tea'}, {'id': 2, 'name': 'cake'}]
+    ```
+  </TabItem>
+  <TabItem label="PySpark">
+    ```python
+    from pondra.spark import SparkSession
+    spark = SparkSession.builder.master("local[*]").getOrCreate()
+    spark.read.option("header", True).csv("sales.csv").show()
+    ```
+
+    ```text
+    id name
+     1  tea
+     2 cake
+    ```
+  </TabItem>
+  <TabItem label="JavaScript">
+    ```js
+    import { local } from "pondra";
+    const js = await local("js-lake");
+    console.log(await js.sql("SELECT * FROM read_csv('sales.csv')"));
+    await js.close();
+    ```
+
+    ```text
+    [ { id: 1, name: 'tea' }, { id: 2, name: 'cake' } ]
+    ```
+  </TabItem>
+</Tabs>
+
+## Write a file
+
+<Tabs syncKey="lang">
+  <TabItem label="SQL">
+    ```bash
+    pondra sql --dir scratch "COPY (SELECT * FROM read_csv('sales.csv')) TO 'sales_sql.parquet' (FORMAT parquet)"
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    db.read_csv("sales.csv").write_parquet("sales_py.parquet")
+    print(db.read_parquet("sales_py.parquet").rows())
+    db.close()
+    ```
+
+    ```text
+    [{'id': 1, 'name': 'tea'}, {'id': 2, 'name': 'cake'}]
+    ```
+  </TabItem>
+  <TabItem label="PySpark">
+    ```python
+    df = spark.read.option("header", True).csv("sales.csv")
+    df.write.mode("overwrite").parquet("sales_spark")
+    print(spark.read.parquet("sales_spark").count())
+    spark.stop()
+    ```
+
+    ```text
+    2
+    ```
+  </TabItem>
+  <TabItem label="JavaScript">
+    ```js
+    import { local } from "pondra";
+    const js = await local("js-lake");
+    await js.sql("COPY (SELECT * FROM read_csv('sales.csv')) TO 'sales_js.parquet' (FORMAT parquet)");
+    console.log(await js.sql("SELECT count(*) AS n FROM read_parquet('sales_js.parquet')"));
+    await js.close();
+    ```
+
+    ```text
+    [ { n: 2 } ]
+    ```
+  </TabItem>
+</Tabs>
+
+## Fallbacks give the same answer
+
+`scan_csv` is `read_csv` under Polars' name, and `parquet_scan` is `read_parquet` under DuckDB's:
+
+```python
+db = pondra.local("scratch")
+same = db.scan_csv("sales.csv").rows() == db.read_csv("sales.csv").rows()
+print(same)
+print(db.sql("SELECT count(*) AS n FROM parquet_scan('sales_py.parquet')").rows())
+db.close()
+```
+
+```text
+True
+[{'n': 2}]
+```
+
+<Aside type="caution">
+Give the CSV delimiter and header to a frame as `separator=` and `has_header=`. A `delim=` or
+`header=` keyword is dropped without an error.
+</Aside>

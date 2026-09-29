@@ -1,0 +1,91 @@
+---
+title: Your first lake
+description: Make a lake, write rows, query them, and keep a view up to date, from SQL, Python or JavaScript.
+sidebar:
+  order: 2
+---
+
+import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+
+A **lake** is a folder: on your disk, or a prefix in an S3, R2, GCS or Azure bucket. Pondra keeps
+your tables there as Parquet files, plus a log of the newest rows. There is no database server to
+install: one `pondra` process on the lake answers SQL, Python and JavaScript.
+
+## Start a node
+
+```bash norun
+pondra serve --dir lake --addr 127.0.0.1:8080
+```
+
+Or let your code start one for you, in the background, and stop it when you're done:
+
+<Tabs syncKey="lang">
+  <TabItem label="Python">
+    ```python norun
+    import pondra
+    db = pondra.local("lake")   # starts a node on ./lake
+    ```
+  </TabItem>
+  <TabItem label="JavaScript">
+    ```js norun
+    import { local } from "pondra";
+    const db = await local("lake");
+    ```
+  </TabItem>
+</Tabs>
+
+The examples below talk to a node at `localhost:8080`.
+
+## Make a table and write rows
+
+<Tabs syncKey="lang">
+  <TabItem label="SQL">
+    ```sql
+    CREATE TABLE orders (id BIGINT, item VARCHAR, qty INT, amount DOUBLE);
+    INSERT INTO orders VALUES (1, 'tea', 2, 7.0), (2, 'cake', 1, 4.5), (3, 'tea', 1, 3.5);
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    import pondra
+    db = pondra.connect("http://localhost:8080")
+    db.sql("CREATE TABLE IF NOT EXISTS orders (id BIGINT, item VARCHAR, qty INT, amount DOUBLE)")
+    db.append("orders", [{"id": 4, "item": "coffee", "qty": 1, "amount": 3.0}])
+    ```
+  </TabItem>
+  <TabItem label="JavaScript">
+    ```js
+    import { connect } from "pondra";
+    const db = connect("http://localhost:8080");
+    await db.sql("CREATE TABLE IF NOT EXISTS orders (id BIGINT, item VARCHAR, qty INT, amount DOUBLE)");
+    await db.append("orders", [{ id: 5, item: "juice", qty: 2, amount: 5.0 }]);
+    ```
+  </TabItem>
+</Tabs>
+
+## Query it
+
+<Tabs syncKey="lang">
+  <TabItem label="SQL">
+    ```sql
+    SELECT item, sum(qty) AS items, sum(amount) AS total FROM orders GROUP BY item ORDER BY total DESC;
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    print(db.sql("SELECT item, sum(qty) AS items FROM orders GROUP BY item ORDER BY item").rows())
+    ```
+  </TabItem>
+  <TabItem label="JavaScript">
+    ```js
+    import { connect } from "pondra";
+    const db = connect("http://localhost:8080");
+    console.log(await db.sql("SELECT count(*) AS n FROM orders"));
+    ```
+  </TabItem>
+</Tabs>
+
+<Aside>
+A write is visible to every query as soon as it is acknowledged, on every node. There's nothing
+to refresh.
+</Aside>

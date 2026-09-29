@@ -138,6 +138,7 @@ pub fn router(app: App) -> Router {
         .route("/cluster/ack", post(ack))
         .route("/cluster/replica", get(replica))
         .route("/cluster/leader", get(|State(app): State<App>| async move { Json(app.cluster.leader_status()) }))
+        .route("/cluster/visible", get(|State(app): State<App>| async move { Json(app.lake.visible()) })) // (a follower's read-your-writes: `write::seen_here`)
         .route("/cluster/kafka", get(|| async { Json(crate::kafka::me()) }))
         .merge(crate::iceberg::rest())
         .layer(axum::extract::DefaultBodyLimit::max(1 << 30)) // batches up to 1 GiB
@@ -154,11 +155,13 @@ async fn create_function(State(app): State<App>, Path(name): Path<String>, body:
         crate::query::dtype(t)?;
     }
     app.lake.cat.commit(vec![(crate::udf::key(&name), serde_json::to_vec(&udf)?)], &[]).await?;
+    crate::udf::forget(&app.lake);
     Ok(Json(j!({"function": name})))
 }
 
 async fn drop_function(State(app): State<App>, Path(name): Path<String>) -> Result<Json<Value>, E> {
     app.lake.cat.commit(vec![], &[crate::udf::key(&name)]).await?;
+    crate::udf::forget(&app.lake);
     Ok(Json(j!({"dropped": name})))
 }
 
@@ -166,14 +169,17 @@ async fn drop_function(State(app): State<App>, Path(name): Path<String>) -> Resu
 /// for `files('…')` to list and `file_read(path)` to read (see `files.rs`). Objects are never
 /// overwritten: a path that exists is an error.
 async fn put_file(State(app): State<App>, Path(path): Path<String>, body: Bytes) -> Result<Json<Value>, E> {
-    let (path, bytes) = (format!("files/{}", path.trim_start_matches('/')), body.len());
-    app.lake.put(&path, body.to_vec()).await?;
+    let (path, bytes) = (crate::files::under_files(&path), body.len());
+    if let Err(e) = app.lake.put(&path, body.to_vec()).await {
+        let there = format!("{e:#}").contains("already exists");
+        return Err(E(if there { anyhow::anyhow!("{path} is there already: a file in the lake is never replaced (put it under another name)") } else { e }));
+    }
     Ok(Json(j!({"path": path, "bytes": bytes})))
 }
 
 /// `GET /files/<path>`: that object's bytes.
 async fn get_file(State(app): State<App>, Path(path): Path<String>) -> Result<Response, E> {
-    let bytes = app.lake.object(&format!("files/{}", path.trim_start_matches('/'))).await?;
+    let bytes = app.lake.object(&crate::files::under_files(&path)).await?;
     Ok(([("content-type", "application/octet-stream")], bytes).into_response())
 }
 
@@ -533,7 +539,9 @@ async fn create_table(State(app): State<App>, Path(name): Path<String>, body: St
 
 #[derive(Deserialize)]
 struct AppendParams {
-    producer: String,
+    #[serde(default)]
+    producer: String, // (none: at least once, as a Kafka producer that isn't idempotent)
+    #[serde(default)]
     seq: u64,
     prev: Option<u64>, // compare-and-swap on the producer's last seq
 }
@@ -541,18 +549,32 @@ struct AppendParams {
 /// Body: NDJSON rows, or an Arrow IPC stream (content-type application/vnd.apache.arrow.stream).
 async fn append(State(app): State<App>, Path(name): Path<String>, Query(p): Query<AppendParams>, headers: HeaderMap, body: Bytes) -> Result<Json<Ack>, E> {
     let log = app.log()?;
+    if !p.producer.is_empty() && p.seq == 0 {
+        return Err(E(anyhow::anyhow!(crate::log::SEQ_FROM_1))); // (0 is "nothing yet": its batch would be taken for a retry)
+    }
     let meta: TableMeta = app.lake.cat.get(&table_key(&name)).await?.ok_or_else(|| anyhow::anyhow!("no table {name}"))?;
     let schema = schema(&meta.logical().columns)?; // (rows come under SQL's names; the log keeps stored ones: ADR-022)
     let arrow = headers.get("content-type").is_some_and(|v| v.as_bytes().starts_with(b"application/vnd.apache.arrow"));
-    let batches = if arrow {
+    let (batches, given) = if arrow {
         // Columns by name, cast to the table's types (pandas, Polars and Arrow differ in string
-        // types); a column left out is null (as in JSON), e.g. `_deleted`, or one added since.
-        let ipc = StreamReader::try_new(&body[..], None)?.collect::<Result<Vec<_>, _>>()?;
-        ipc.iter().map(|b| crate::query::conform(b, &schema)).collect::<anyhow::Result<Vec<_>>>()?
+        // types); a column left out takes its DEFAULT, or is null (as in JSON), e.g. `_deleted`,
+        // or one added since.
+        let ipc = StreamReader::try_new(&body[..], None)?;
+        let given: Vec<String> = ipc.schema().fields().iter().map(|f| f.name().clone()).collect();
+        let ipc = ipc.collect::<Result<Vec<_>, _>>()?;
+        (ipc.iter().map(|b| crate::query::conform(b, &schema)).collect::<anyhow::Result<Vec<_>>>()?, Some(given))
     } else {
-        arrow_json::ReaderBuilder::new(schema.clone()).build(&body[..])?.collect::<Result<Vec<_>, _>>()?
+        (arrow_json::ReaderBuilder::new(schema.clone()).build(&body[..])?.collect::<Result<Vec<_>, _>>()?, None)
     };
     let batch = concat_batches(&schema, &batches)?;
+    let batch = match (crate::defaults::any(&meta), given) {
+        (false, _) => batch,
+        (true, Some(given)) => crate::defaults::fill(&meta, batch.clone(), |c| (!given.iter().any(|g| g == c)).then(|| crate::defaults::all(batch.num_rows()))).await?,
+        (true, None) => {
+            let absent = crate::defaults::absent_keys(&meta, &body)?; // (a JSON row without the key)
+            crate::defaults::fill(&meta, batch, |c| absent.get(c).cloned()).await?
+        }
+    };
     Ok(Json(log.append(name, Src { producer: p.producer, seq: p.seq, prev: p.prev }, batch).await?))
 }
 
@@ -804,7 +826,7 @@ async fn run_sql(app: &App, p: &SqlParams, query: &str, files: bool) -> anyhow::
         true => app.query_as(&crate::asof::rewrite(query)?, Some("0"), true).await?, // (a file here: this node only)
         false => app.query(query, p.spread.as_deref()).await?,
     };
-    let explained = query.trim_start().get(..7).is_some_and(|w| w.eq_ignore_ascii_case("explain"));
+    let explained = crate::write::first_word(query).get(..7).is_some_and(|w| w.eq_ignore_ascii_case("explain"));
     let batches = if explained { crate::ext::readable_rows(batches)? } else { batches }; // (files as SQL named them)
     render(&batches, p.format.as_deref())
 }
@@ -908,5 +930,5 @@ impl<T: Into<anyhow::Error>> From<T> for E {
     fn from(e: T) -> Self { E(e.into()) }
 }
 impl IntoResponse for E {
-    fn into_response(self) -> Response { (StatusCode::INTERNAL_SERVER_ERROR, crate::ext::readable(&format!("{:#}", self.0))).into_response() }
+    fn into_response(self) -> Response { (StatusCode::INTERNAL_SERVER_ERROR, crate::ext::said(&self.0)).into_response() }
 }

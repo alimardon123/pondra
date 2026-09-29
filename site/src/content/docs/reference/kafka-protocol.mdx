@@ -1,0 +1,329 @@
+---
+title: Kafka protocol
+description: Write to tables with Kafka producers and read their log with Kafka consumers, over the Kafka protocol on any node.
+sidebar:
+  order: 11
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+A node speaks the Kafka protocol on the address you give `--kafka`. Kafka producers, consumers and
+consumer groups (librdkafka in Python, Go, .NET and C; kafka-python; the Java client; Debezium)
+talk to it as they would to a broker. A **topic is a table**, with one partition. You make a topic
+with `CREATE TABLE`, and every record is a row.
+
+```bash norun
+pondra serve --dir lake --kafka 0.0.0.0:9092 --kafka-advertise kafka.example.com:9092
+```
+
+| Flag | Meaning |
+|---|---|
+| `--kafka ADDR` | listen for Kafka clients here, such as `0.0.0.0:9092` |
+| `--kafka-advertise HOST:PORT` | where clients are told to connect to this node. Default: the host of `--addr` and the port of `--kafka` |
+| `--changelog-secs N` | how many seconds of log consumers can read back. Default `0`: only `--retain-secs` (60) |
+
+<Aside type="caution">
+`--addr` defaults to `127.0.0.1:8080`. If the node listens on `0.0.0.0` or a name clients cannot
+reach, set `--kafka-advertise`: a client connects to the address in the broker list it gets back,
+not to the one it started from.
+</Aside>
+
+Every node answers for every topic and lists itself as the partition's leader, so a client spreads
+over the nodes by the addresses it starts from. Every node takes every write. Run `--kafka` on
+every node: consumer groups are coordinated by the leader, and the other nodes send their clients
+there.
+
+## Produce
+
+The topic must exist: it is a table, and a record for a name that is not a table is refused with
+`UNKNOWN_TOPIC_OR_PARTITION`. Use the address in `bootstrap.servers`.
+
+```sql
+CREATE TABLE orders (id BIGINT, item VARCHAR, amount DOUBLE);
+```
+
+```python
+import json
+from kafka import KafkaProducer
+
+producer = KafkaProducer(bootstrap_servers="localhost:9092")
+for row in ({"id": 1, "item": "tea", "amount": 7.5}, {"id": 2, "item": "cake", "amount": 4.5}):
+    producer.send("orders", json.dumps(row).encode())
+producer.flush()
+```
+
+```sql
+SELECT * FROM orders ORDER BY id;
+```
+
+```text
+[{"id":1,"item":"tea","amount":7.5},{"id":2,"item":"cake","amount":4.5}]
+```
+
+How a record becomes a row:
+
+| The record | The row |
+|---|---|
+| a value that is a JSON object | its fields, by column name. A field the table does not have is dropped, and a column the object leaves out is null |
+| a value that is not a JSON object, or a field of the wrong type | refused, with `INVALID_RECORD` and the reason (`failed to parse "abc" as Int64`). Nothing of the batch is written |
+| a table with a `_key` column | the record's key (as text) goes in `_key` |
+| a table with a `_timestamp` column | the record's timestamp goes in `_timestamp`, to the millisecond. A batch the producer marked as log-append time gets the time it arrived |
+| a table with a `_value` column | the record's value as it is, in any format. The record is not read as JSON. The other columns are null, except `_key` and `_timestamp` |
+| a Debezium change event | the row the event carries: see below |
+| a null or empty value (a tombstone) | a delete of its key, in a keyed table. In any other table it is skipped |
+| headers | not kept |
+
+`_key` and `_timestamp` can sit beside ordinary columns. A `_value` table keeps text, Avro or
+Protobuf bytes untouched, and the [JSON functions](/pondra/reference/functions/#json) read them:
+
+```sql
+CREATE TABLE notes (_key VARCHAR, _timestamp TIMESTAMP, _value VARCHAR);
+```
+
+```python
+producer.send("notes", key=b"n1", value=b"plain text, not json")
+producer.flush()
+```
+
+```sql
+SELECT _key, _value FROM notes;
+```
+
+```text
+[{"_key":"n1","_value":"plain text, not json"}]
+```
+
+### Change data
+
+A value that is a Debezium change event is unwrapped, with or without Kafka Connect's
+`schema` and `payload` envelope. The `op` decides the row:
+
+| `op` | Becomes |
+|---|---|
+| `c` (create), `r` (snapshot read), `u` (update) | an upsert of `after` |
+| `d` (delete) | a delete of `before`'s key, in a keyed table. A table without a key gets the `before` row appended, as it would any row |
+| any other (a truncate) | skipped |
+
+A tombstone, a record whose value is null, deletes the row for its key in a keyed table. The key is a JSON object
+of the key columns, `{"id": 1}`, or for a table with one key column the bare value, `1`. With
+these, a Postgres or MySQL table's current state lands in a keyed table with nothing in between.
+
+```sql
+CREATE TABLE users (id BIGINT PRIMARY KEY, name VARCHAR, plan VARCHAR);
+```
+
+```python
+from confluent_kafka import Producer
+
+def event(op, before, after):
+    return json.dumps({"op": op, "before": before, "after": after}).encode()
+
+producer = Producer({"bootstrap.servers": "localhost:9092"})
+producer.produce("users", key=b'{"id": 1}', value=event("c", None, {"id": 1, "name": "ann", "plan": "free"}))
+producer.produce("users", key=b'{"id": 2}', value=event("c", None, {"id": 2, "name": "bo", "plan": "free"}))
+producer.produce("users", key=b'{"id": 1}', value=event("u", {"id": 1}, {"id": 1, "name": "ann", "plan": "pro"}))
+producer.produce("users", key=b'{"id": 2}', value=None)
+producer.flush(10)
+```
+
+```sql
+SELECT * FROM users ORDER BY id;
+```
+
+```text
+[{"id":1,"name":"ann","plan":"pro"}]
+```
+
+### Exactly once
+
+An idempotent producer (`enable.idempotence=true`) writes each batch once. Its producer id and
+batch sequence become a Pondra producer named `kafka:ID:topic` and its sequence number, so a batch
+the client resends after a lost answer is answered as a success and not applied twice. A batch
+that arrives ahead of the one before it gets `OUT_OF_ORDER_SEQUENCE_NUMBER`, and the client sends
+it again. A producer that is not idempotent is at-least-once, as with Kafka.
+
+Also supported: gzip, snappy, lz4 and zstd batches, and `acks` of 0, 1 and `all`. Both 1 and `all`
+mean Pondra's own ack: the write is durable, or replicated if the node runs with `--ack replicated`.
+Many batches can be in flight on one connection. Transactions (`transactional.id`) are refused.
+
+## Consume
+
+A consumer reads a table's log: its rows in the order they were committed, for as long as the log
+keeps them. A record's value is the row as JSON. A keyed table's key is its key columns, as
+`{"id": 1}`, and a delete arrives as a tombstone, a record with a null value.
+
+```python
+from kafka import KafkaConsumer
+
+consumer = KafkaConsumer("users", bootstrap_servers="localhost:9092", group_id=None,
+                         auto_offset_reset="earliest", consumer_timeout_ms=3000)
+for message in consumer:
+    print(message.key, message.value)
+consumer.close()
+```
+
+```text
+b'{"id":1}' b'{"id":1,"name":"ann","plan":"free"}'
+b'{"id":2}' b'{"id":2,"name":"bo","plan":"free"}'
+b'{"id":1}' b'{"id":1,"name":"ann","plan":"pro"}'
+b'{"id":2}' None
+```
+
+Each commit's rows for a table arrive as one batch, stamped with the commit's time. A fetch with
+nothing new waits for the next commit, up to the client's `fetch.max.wait.ms`.
+
+<Aside type="caution">
+A consumer reads only what the log still holds. The log keeps a segment for `--retain-secs`
+(default 60) after its rows are in the lake, or for `--changelog-secs` if that is longer. To replay
+a day, start the node with `--changelog-secs 86400`. An offset older than the oldest segment starts
+at the oldest one.
+</Aside>
+
+### Offsets
+
+A record's offset is its position in the log: `(segment << 32) + row`, the segment the commit made
+and the row within it. Offsets rise, but they are not one apart, so the gap between two offsets is
+not a count of records. The offset a producer gets back is the offset a consumer reads.
+
+```python
+producer = KafkaProducer(bootstrap_servers="localhost:9092")
+sent = producer.send("orders", json.dumps({"id": 3, "item": "bun", "amount": 1.5}).encode()).get(timeout=10)
+consumer = KafkaConsumer("orders", bootstrap_servers="localhost:9092", group_id=None, consumer_timeout_ms=3000,
+                         auto_offset_reset="earliest")
+offsets = [message.offset for message in consumer]
+consumer.close()
+segment, row = divmod(sent.offset, 2**32)
+print(sent.offset in offsets, row)
+```
+
+```text
+True 0
+```
+
+`ListOffsets` answers three questions: the earliest (`-2`) is the oldest segment still kept, the
+latest (`-1`) is the next one to be written, and a time is the first segment committed at or after
+it. So `auto_offset_reset`, `seek_to_end` and `offsets_for_times` work as with Kafka.
+
+### Consumer groups
+
+The leader coordinates groups: members join, the group's own leader assigns the partitions, and a
+member that joins, leaves or goes quiet past its session timeout starts a new generation. A topic
+has one partition, so one member of a group reads it. Committed offsets are kept in the lake, as a
+producer's progress, and survive a new leader; the members then join again. A commit never moves
+an offset back.
+
+```sql
+CREATE TABLE ticks (n BIGINT);
+```
+
+```python
+import time
+from confluent_kafka import Consumer
+
+producer = Producer({"bootstrap.servers": "localhost:9092"})
+for n in range(5):
+    producer.produce("ticks", json.dumps({"n": n}).encode())
+producer.flush(10)
+
+def read(group, count):
+    consumer = Consumer({"bootstrap.servers": "localhost:9092", "group.id": group,
+                         "auto.offset.reset": "earliest", "enable.auto.commit": False})
+    consumer.subscribe(["ticks"])
+    seen, deadline = [], time.time() + 20
+    while len(seen) < count and time.time() < deadline:
+        message = consumer.poll(1.0)
+        if message is not None and not message.error():
+            seen.append(json.loads(message.value())["n"])
+    consumer.commit(asynchronous=False)
+    consumer.close()
+    return seen
+
+print(read("reports", 3))
+print(read("reports", 2))
+print(read("audit", 5))
+```
+
+```text
+[0, 1, 2]
+[3, 4]
+[0, 1, 2, 3, 4]
+```
+
+## Requests
+
+| Request | Versions |
+|---|---|
+| Produce | 3 to 8 |
+| Fetch | 4 to 11 |
+| ListOffsets | 1 to 5 |
+| Metadata | 1 to 8 |
+| ApiVersions | 0 to 3 |
+| InitProducerId | 0 to 1 |
+| SaslHandshake | 1 |
+| SaslAuthenticate | 0 to 1 |
+| FindCoordinator | 0 to 2 |
+| JoinGroup | 0 to 5 |
+| SyncGroup, Heartbeat, LeaveGroup | 0 to 3 |
+| OffsetCommit | 2 to 7 |
+| OffsetFetch | 1 to 5 |
+
+A client asks for the versions it can use with `ApiVersions`, and current clients still speak these
+(Kafka 4's talk to brokers as old as 2.1). Anything else, such as `CreateTopics` or the admin
+requests, closes the connection: make a topic with `CREATE TABLE`. `Metadata` lists every table
+except the system tables as a topic with one partition. Not supported: transactions, more than one
+partition per topic, and the protocol's newer "flexible" request versions.
+
+The librdkafka and kafka-python clients are the ones tested here. The Java client is not tested in
+this repository.
+
+## Errors
+
+| Code | Name | When |
+|---|---|---|
+| 1 | `OFFSET_OUT_OF_RANGE` | a fetch beyond the end of the log |
+| 3 | `UNKNOWN_TOPIC_OR_PARTITION` | the name is not a table, or the partition is not 0 |
+| 29 | `TOPIC_AUTHORIZATION_FAILED` | a produce from a `reader` token |
+| 35 | `UNSUPPORTED_VERSION` | an `ApiVersions` request newer than the node's |
+| 44 | `POLICY_VIOLATION` | the node cannot take the write: it is a read-only node, or the commit failed |
+| 45 | `OUT_OF_ORDER_SEQUENCE_NUMBER` | an idempotent batch arrived ahead of its predecessor. The client resends |
+| 53 | `TRANSACTIONAL_ID_AUTHORIZATION_FAILED` | `transactional.id` was set: transactions are not supported |
+| 58 | `SASL_AUTHENTICATION_FAILED` | a wrong user name or password |
+| 87 | `INVALID_RECORD` | a value that is not a row of the table. The message says why |
+
+kafka-python reports an unknown topic as `KafkaTimeoutError: Failed to update metadata`, because it
+keeps asking for the topic's metadata until its timeout.
+
+## Tokens
+
+With no tokens set, anyone may connect and do anything. With tokens, a client logs in with
+SASL/PLAIN. The user name picks the role, `reader`, `writer` or `admin`, and the password is that
+role's token, as for [Postgres](/pondra/reference/postgres/#connect). A `reader` may consume and
+not produce. A client that does not log in, or logs in with a wrong password, cannot connect: its
+first request is refused and the connection closes. There is no TLS, so use `SASL_PLAINTEXT`.
+
+```python norun
+import os
+from kafka import KafkaProducer
+
+producer = KafkaProducer(
+    bootstrap_servers="kafka.example.com:9092",
+    security_protocol="SASL_PLAINTEXT",
+    sasl_mechanism="PLAIN",
+    sasl_plain_username="writer",
+    sasl_plain_password=os.environ["PONDRA_WRITE_TOKEN"],
+)
+```
+
+```properties
+# librdkafka clients take the same settings, with these names; the Java client:
+bootstrap.servers=kafka.example.com:9092
+security.protocol=SASL_PLAINTEXT
+sasl.mechanism=PLAIN
+sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username="writer" password="<write token>";
+```
+
+## Other clusters
+
+To read another Kafka cluster's topics as tables, or write a query's rows to one, Pondra is the
+client, not the broker. See [a topic as a table](/pondra/reference/table-options/#a-topic-as-a-table)
+and the `kafka` secret in [SQL](/pondra/reference/sql/#files-and-secrets).

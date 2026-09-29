@@ -1,0 +1,104 @@
+---
+title: Design notes
+description: The architecture decision records behind Pondra, one line each, with links to the full text on GitHub.
+sidebar:
+  order: 7
+---
+
+Each design note records one decision and the reasons for it. You don't need them to use Pondra: the
+other pages say what it does. Read them when you want to know why. They are in the repository's
+[`docs/`](https://github.com/alimardon123/pondra/tree/main/docs) folder, and each link below opens
+the full text on GitHub. The status is as each note says it.
+
+Some notes were written as proposals and then built on by later ones, and still say "Proposed".
+
+## Where it started
+
+Why Pondra is one binary on object storage.
+
+| Note | What it decides | Status |
+|---|---|---|
+| [ADR-001](https://github.com/alimardon123/pondra/blob/main/docs/adr-001-lakehouse.md) | The first study: a lakehouse on DuckLake, with snapshots published for readers that need only the bucket, and the alternatives it weighed | Proposed |
+| [ADR-002](https://github.com/alimardon123/pondra/blob/main/docs/adr-002-streamhouse-single-binary.md) | Why one binary instead of Fluss, Flink and Kafka: the streamhouse design and its size and speed budgets | Proposed |
+| [ADR-003](https://github.com/alimardon123/pondra/blob/main/docs/adr-003-serverless-spmd.md) | Why serverless, and why every node runs the same plan on its share (SPMD) instead of a driver and executors | Proposed |
+| [ADR-004](https://github.com/alimardon123/pondra/blob/main/docs/adr-004-cluster.md) | Cluster mode: the leader is elected through the bucket, the old leader is fenced, tasks keep their state in the lake | Accepted, built (round 3) |
+| [ADR-005](https://github.com/alimardon123/pondra/blob/main/docs/adr-005-every-node-writes.md) | Every node takes writes and the leader only orders commits; views, push and queries across nodes | Accepted, built (round 4) |
+
+## Tables, reads and formats
+
+How rows are stored, read fast, and shared with other engines.
+
+| Note | What it decides | Status |
+|---|---|---|
+| [ADR-006](https://github.com/alimardon123/pondra/blob/main/docs/adr-006-serving-and-lsm.md) | Keyed tables as a merge tree, and key lookups as a first-class path | Accepted, built (round 5) |
+| [ADR-007](https://github.com/alimardon123/pondra/blob/main/docs/adr-007-open-lake-and-first-reads.md) | A lake other engines can read (Delta), tiering as rows commit, the SSD tier, and the catalog in every node's memory | Accepted, built (round 6) |
+| [ADR-008](https://github.com/alimardon123/pondra/blob/main/docs/adr-008-serving-reads.md) | Key lookups without SQL planning, keyed tables read as anti-joins, and the result cache | Accepted, built (round 7) |
+| [ADR-009](https://github.com/alimardon123/pondra/blob/main/docs/adr-009-native-first.md) | Native format first, Delta and Iceberg on request, millisecond acknowledgements without S3 Express, writes from any machine, `cluster_by` | Accepted, built (round 8) |
+
+## Doors: how you get in
+
+The protocols, clients and installers.
+
+| Note | What it decides | Status |
+|---|---|---|
+| [ADR-010](https://github.com/alimardon123/pondra/blob/main/docs/adr-010-anywhere.md) | Everyone writes: the bucket inbox, attached lakes, SQL writes, the Postgres protocol, the Python client, MCP and tokens | Accepted, built (round 9) |
+| [ADR-011](https://github.com/alimardon123/pondra/blob/main/docs/adr-011-open-doors.md) | The Kafka protocol, an Iceberg REST catalog, `ALTER TABLE ADD COLUMN`, JSON functions and event-time windows | Accepted, built (round 10) |
+| [ADR-018](https://github.com/alimardon123/pondra/blob/main/docs/adr-018-install-anywhere.md) | Install anywhere: a glibc 2.17 Linux binary, pip and npm, the SQL shell, `local()`, and sums that add up the same in any order | Accepted, built (round 17) |
+| [ADR-024](https://github.com/alimardon123/pondra/blob/main/docs/adr-024-nothing-to-set-up.md) | Nothing to set up: one-line installers, `python -m pondra`, and rows without pyarrow | Built (0.22.1) |
+
+## Scale and speed
+
+Bigger tables, faster queries, and queries across nodes.
+
+| Note | What it decides | Status |
+|---|---|---|
+| [ADR-012](https://github.com/alimardon123/pondra/blob/main/docs/adr-012-toward-petabytes.md) | Table metadata that stays small, partitions, memory limits and spilling, shuffles between nodes, Arrow Flight | Accepted, built (round 11) |
+| [ADR-013](https://github.com/alimardon123/pondra/blob/main/docs/adr-013-one-node-first-and-anything-in-a-column.md) | What made one node fast, files and bytes and vectors as column types, models in SQL, and functions of your own | Accepted, built (round 12) |
+| [ADR-014](https://github.com/alimardon123/pondra/blob/main/docs/adr-014-shuffles-that-fit-on-disk-and-a-join-order-of-its-own.md) | Shuffles that fit on disk, steps that can be retried, and a join order chosen from the catalog | Accepted, built (round 13) |
+| [ADR-015](https://github.com/alimardon123/pondra/blob/main/docs/adr-015-any-query-across-the-nodes.md) | Any query across the nodes, and the same answer every time | Accepted, built (round 14) |
+| [ADR-016](https://github.com/alimardon123/pondra/blob/main/docs/adr-016-data-that-knows-where-it-is.md) | Tables split by the ranges of a key, hot keys shared out, and distinct values counted for the join order | Accepted, built (round 15) |
+| [ADR-017](https://github.com/alimardon123/pondra/blob/main/docs/adr-017-streams-on-their-own-time.md) | Watermarks taken from the data, session windows, and point-in-time joins (`ASOF JOIN`) | Accepted, built (round 16) |
+
+## A database you can shape
+
+Names, DDL, changing rows, and streams.
+
+| Note | What it decides | Status |
+|---|---|---|
+| [ADR-019](https://github.com/alimardon123/pondra/blob/main/docs/adr-019-a-database-you-can-shape.md) | Schemas and three-part names, DDL in SQL, stored and materialized views, and other lakes attached as databases | Accepted, built (round 18) |
+| [ADR-020](https://github.com/alimardon123/pondra/blob/main/docs/adr-020-change-any-row.md) | `UPDATE`, `DELETE` and `MERGE` on every table, system columns, a change feed, and a cluster never slower than one node | Accepted, built (round 19) |
+| [ADR-021](https://github.com/alimardon123/pondra/blob/main/docs/adr-021-fewer-objects-and-streams.md) | Far fewer objects in the bucket, a key with `partition_by` and `cluster_by`, Hilbert clustering, `COPY`, stream joins and sliding windows | Accepted, built (round 20) |
+| [ADR-022](https://github.com/alimardon123/pondra/blob/main/docs/adr-022-columns-views-and-frames.md) | Renaming and dropping columns with no file rewritten, views that start full, the latest row by event time, and the DataFrame API designed | Accepted, built (round 21) |
+
+## SQL, Python and the outside world
+
+One vocabulary, and reading and writing everything else.
+
+| Note | What it decides | Status |
+|---|---|---|
+| [ADR-023](https://github.com/alimardon123/pondra/blob/main/docs/adr-023-frames-and-procedures.md) | Frames with Polars' and PySpark's names, macros and procedures: SQL and Python as one language | Accepted, built (round 22) |
+| [ADR-025](https://github.com/alimardon123/pondra/blob/main/docs/adr-025-one-name-one-meaning.md) | One name, one meaning: SQL's words are the clients' names | Built (0.23.0) |
+| [ADR-026](https://github.com/alimardon123/pondra/blob/main/docs/adr-026-read-and-write-anything.md) | Read and write anything: files, Delta and Iceberg tables and Kafka clusters anywhere, and `CREATE SECRET` | Accepted, built (round 23) |
+| [ADR-027](https://github.com/alimardon123/pondra/blob/main/docs/adr-027-sql-and-python-as-one.md) | `CREATE FUNCTION` in Postgres's forms, procedures that do anything Python can, warm workers, schedules and a run log | Accepted, built (round 24) |
+| [ADR-028](https://github.com/alimardon123/pondra/blob/main/docs/adr-028-one-vocabulary-and-open-writes.md) | `read_*` and `write_*` everywhere, other engines appending through the Iceberg REST catalog, live queries, temporary tables | Accepted, built (round 25) |
+
+## Next
+
+Decisions made and not yet built.
+
+| Note | What it decides | Status |
+|---|---|---|
+| [ADR-029](https://github.com/alimardon123/pondra/blob/main/docs/adr-029-anyones-compute-one-catalog.md) | Anyone's compute, one catalog: other engines write with their own compute and Pondra only commits their files | Proposed |
+| [ADR-030](https://github.com/alimardon123/pondra/blob/main/docs/adr-030-the-console-the-server-and-the-docs.md) | The web console, `pondra server`, Postgres as dbt and BI tools use it, and this documentation site | Accepted (round 26) |
+| [ADR-031](https://github.com/alimardon123/pondra/blob/main/docs/adr-031-extensions.md) | Extensions: DuckDB-style `INSTALL` and `LOAD`, as WebAssembly components | Proposed |
+
+## Other documents
+
+| Document | What it is |
+|---|---|
+| [`prototype-status.md`](https://github.com/alimardon123/pondra/blob/main/docs/prototype-status.md) | Where the prototype stands, round by round: what it does, every measured number, and what is missing |
+| [`roadmap.md`](https://github.com/alimardon123/pondra/blob/main/docs/roadmap.md) | What is left and in what order |
+| [`lake-format.md`](https://github.com/alimardon123/pondra/blob/main/docs/lake-format.md) | The lake on disk and in the bucket, in full. [The lake format](/pondra/concepts/lake-format/) is the short version |
+| [`comparison-spark-flink-fluss.md`](https://github.com/alimardon123/pondra/blob/main/docs/comparison-spark-flink-fluss.md) | Head to head with Spark, Flink, Fluss, Lakehouse//RT and the single-node engines, with sources. [Pondra compared](/pondra/concepts/compared/) is the short version |
+| [`dataframe-api.md`](https://github.com/alimardon123/pondra/blob/main/docs/dataframe-api.md) | The DataFrame API's design, and the table of names |
+| [`README.md`](https://github.com/alimardon123/pondra/blob/main/docs/README.md) | The order to read the documents in |

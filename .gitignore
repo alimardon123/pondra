@@ -3,3 +3,6 @@
 __pycache__/
 *.pyc
 *.stderr
+/site/node_modules
+/site/dist
+/site/.astro

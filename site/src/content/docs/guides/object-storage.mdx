@@ -1,0 +1,244 @@
+---
+title: Object storage
+description: Run a lake on S3, R2, MinIO, Google Cloud Storage or Azure, with the credentials, the local SSD cache, the request costs and how fresh each reader is.
+sidebar:
+  order: 14
+---
+
+import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+
+A lake is a folder, and a folder can be a bucket. `--dir s3://bucket/prefix` is the only change from a
+local lake: the layout is the same, so you can copy a lake between disk and a bucket with any sync
+tool while its nodes are stopped, and it opens as it was. The bucket is the platform and the binary
+is compute anyone brings: nodes, laptops and `pondra sql` all read and write the same lake.
+
+## Point a node at a bucket
+
+A node reads its credentials from the environment, the way each cloud's own tools do, so they never
+appear on the command line or in SQL.
+
+<Tabs syncKey="cloud">
+  <TabItem label="AWS S3">
+    ```bash norun
+    export AWS_ACCESS_KEY_ID=… AWS_SECRET_ACCESS_KEY=… AWS_REGION=us-east-1
+    pondra serve --dir s3://my-bucket/lake --addr 10.0.0.1:8080
+    ```
+  </TabItem>
+  <TabItem label="Cloudflare R2">
+    ```bash norun
+    export AWS_ACCESS_KEY_ID=… AWS_SECRET_ACCESS_KEY=… AWS_REGION=auto
+    export AWS_ENDPOINT=https://<account-id>.r2.cloudflarestorage.com
+    pondra serve --dir s3://my-bucket/lake --addr 10.0.0.1:8080
+    ```
+  </TabItem>
+  <TabItem label="MinIO">
+    ```bash norun
+    export AWS_ACCESS_KEY_ID=… AWS_SECRET_ACCESS_KEY=… AWS_REGION=us-east-1
+    export AWS_ENDPOINT=http://minio.internal:9000
+    pondra serve --dir s3://my-bucket/lake --addr 10.0.0.1:8080
+    ```
+  </TabItem>
+  <TabItem label="Google Cloud">
+    ```bash norun
+    export GOOGLE_SERVICE_ACCOUNT=/path/to/service-account.json
+    pondra serve --dir gs://my-bucket/lake --addr 10.0.0.1:8080
+    ```
+  </TabItem>
+  <TabItem label="Azure">
+    ```bash norun
+    export AZURE_STORAGE_ACCOUNT_NAME=… AZURE_STORAGE_ACCOUNT_KEY=…
+    pondra serve --dir az://my-container/lake --addr 10.0.0.1:8080
+    ```
+  </TabItem>
+</Tabs>
+
+Run the same command on more machines to make a [cluster](/pondra/guides/clusters/). The store needs
+**conditional writes** (put-if-absent), which is how nodes elect a leader: S3, R2, MinIO, GCS and
+Azure have them. `abfs://` and `abfss://` URLs work for Azure too.
+
+A node needs to read, write, list and delete under its prefix. A `--reader` node and `pondra sql`
+queries write nothing, so read-only credentials are enough for them. Data in **other** buckets is read
+with a `CREATE SECRET` instead (see [files and other lakes](/pondra/guides/files-and-other-lakes/)).
+
+<Aside type="caution">
+Cloudflare R2 is tested against real buckets. S3-compatible servers, Google Cloud Storage and
+Azure are tested against emulators (MinIO's protocol, a simulated GCS, Azurite), so try your own
+bucket with a scratch prefix first. Give each lake its own prefix: two clusters on one prefix would
+fight over the same leader.
+</Aside>
+
+## Try it without a cloud account
+
+MinIO in a container is the usual stand-in for a bucket. Here it is moto's S3 server, which pip
+installs: any S3-compatible endpoint behaves the same.
+
+```bash norun
+pip install 'moto[server]'
+```
+
+Start the fake bucket, make a bucket in it, and keep the settings in a file so each command sees the
+same ones:
+
+```bash
+nohup moto_server -p 9450 > s3.log 2>&1 &
+echo $! > s3.pid
+until curl -s localhost:9450/ > /dev/null; do sleep 0.3; done
+curl -s -X PUT localhost:9450/my-bucket
+
+cat > s3.env <<'EOF'
+export AWS_ACCESS_KEY_ID=demo AWS_SECRET_ACCESS_KEY=demo AWS_REGION=us-east-1
+export AWS_ENDPOINT=http://127.0.0.1:9450
+EOF
+```
+
+Now a node on `s3://my-bucket/lake`, with its SSD cache in a folder here:
+
+```bash
+. ./s3.env
+nohup pondra serve --dir s3://my-bucket/lake --addr 127.0.0.1:8085 --cache-dir cache --tier-secs 1 > node.log 2>&1 &
+echo $! > node.pid
+until curl -sf localhost:8085/stats > /dev/null; do sleep 0.3; done
+```
+
+It is a node like any other: write and read through the clients.
+
+```python
+import pondra
+
+db = pondra.connect("http://localhost:8085")
+db.sql("CREATE TABLE events (id BIGINT, user VARCHAR, amount DOUBLE)")
+db.sql("INSERT INTO events SELECT i, 'u' || (i % 3), i * 1.5 FROM generate_series(1, 10000) t(i)")
+db.sql("SELECT user, count(*) AS n FROM events GROUP BY user ORDER BY user").rows()
+```
+
+```text
+[{'user': 'u0', 'n': 3333}, {'user': 'u1', 'n': 3334}, {'user': 'u2', 'n': 3333}]
+```
+
+The rows are objects in the bucket. Tiering has turned them into a Parquet file under
+`data/events/`, next to the catalog and the leader's election marks:
+
+```python
+import time
+import boto3
+
+time.sleep(2)                                   # a tiering round, on this node's --tier-secs 1
+s3 = boto3.client("s3", endpoint_url="http://localhost:9450", region_name="us-east-1",
+                  aws_access_key_id="demo", aws_secret_access_key="demo")
+keys = [o["Key"] for o in s3.list_objects_v2(Bucket="my-bucket", Prefix="lake/")["Contents"]]
+sorted({key.split("/")[1] for key in keys}), [key for key in keys if key.endswith(".parquet")] != []
+```
+
+```text
+(['catalog', 'cluster', 'data'], True)
+```
+
+**No node needed.** Any machine with the binary and the bucket's credentials reads the lake
+directly, and its writes do their own work while the leader records them:
+
+```bash
+. ./s3.env
+pondra sql --dir s3://my-bucket/lake "SELECT count(*) AS n FROM events"
+pondra sql --dir s3://my-bucket/lake "INSERT INTO events VALUES (10001, 'u1', 1.5)"
+```
+
+```text
++-------+
+| n     |
++-------+
+| 10000 |
++-------+
+{"committed":true}
+```
+
+Opening a lake's catalog is about twenty sequential requests, so a serverless query has a floor: 30
+ms on local disk and a few seconds on R2 from far away. A running node keeps the catalog in memory.
+
+## The SSD cache
+
+Parquet files never change, so a node keeps copies of the ones it reads on its own disk and reads
+them from there the next time, instead of paying a round trip and a request for each. The cache
+holds recent objects and the catalog's tables, is only for lakes on object storage, and can be
+deleted at any time. `--cache-dir` says where (default: a folder in the temp directory) and
+`--cache-gb` how much (default 20, or a quarter of the free disk if that is less; 0 turns it off).
+
+```python
+from pathlib import Path
+
+sorted(str(p.relative_to("cache")).rsplit("/", 1)[0] for p in Path("cache").rglob("*.parquet"))
+```
+
+```text
+['my-bucket_lake/data/events']
+```
+
+A node also keeps decoded columns in memory for the tables it queries most, so a repeated query
+reads neither the bucket nor the file. See [performance](/pondra/concepts/performance/).
+
+## What a request costs
+
+A bucket bills and rate-limits most for writes, lists and deletes, and a node counts them:
+`GET /metrics` has `pondra_object_requests_total` for each. What a node asks of the bucket:
+
+- **A small write** is about one object write. Flushes up to 64 KB ride inside the catalog commit, so a
+  typical insert makes no data object at all. That is also the write's latency: one object write,
+  0.3 to 0.7 s on R2, and less on local disk or S3 Express One Zone.
+- **A query** is no writes, no lists and no deletes: reads only, and none for what the cache holds.
+- **Tiering** turns new rows into Parquet at most every `--tier-secs` (default 10), a few writes per
+  busy table. A larger number is fewer requests and older data for other engines.
+- **A running leader** writes one small object every 10 s to say it's alive, and looks at the inbox
+  bell once a second with a `HEAD`, a cheap kind of request. An idle lake costs about 8,600 writes a
+  day, and a list now and then.
+- **Compaction** merges small files (eight into one) and deletes the old ones after
+  `--retain-secs` (60 by default).
+
+```python
+import re
+import requests
+
+def object_requests():
+    text = requests.get("http://localhost:8085/metrics").text
+    return {op: int(n) for op, n in re.findall(r'pondra_object_requests_total\{op="(\w+)"\} (\d+)', text)}
+
+before = object_requests()
+db.sql("INSERT INTO events VALUES (10002, 'u2', 3.0)")
+after = object_requests()
+{op: after[op] - before[op] for op in after}
+```
+
+```text
+{'write': 1, 'list': 0, 'delete': 0}
+```
+
+The commit is one write. Now and then a second shows up, when the node's own housekeeping lands in
+the same moment. The counter is per process, so add the nodes up. With `--ack replicated` the ack comes from
+followers in about 4 ms whatever the storage, and the bucket gets the write a moment later in the
+same catalog commit, so it costs latency, not requests. See [clusters](/pondra/guides/clusters/#failover).
+
+## How fresh is it
+
+| A reader | Sees a write | Note |
+|---|---|---|
+| A node (`pondra serve`, `--reader`) | milliseconds after the ack | its catalog follows the leader's commit stream |
+| `pondra sql`, no node | once it is in the bucket | every acknowledged write with `--ack durable` |
+| Delta and Iceberg readers | after the next tiering round | about 30 ms on local disk, 3 to 4 s on a nearby R2 bucket, 7 to 10 s on a far one |
+
+An acknowledged write is durable in the default mode: it is in the bucket when the ack returns. The
+numbers for R2 are the project's own measurements from a machine in North America (one writer:
+299 ms median and 732 ms at p99 for `durable`, 4 ms for `replicated`). Yours depend on the bucket's
+distance, so measure before you plan around them.
+
+<Aside type="caution">
+A lake's commits go through one leader, and its acknowledgement waits for one object-store write.
+On a far bucket that is a second or more per acknowledged batch, so batch your writes and use more
+producers rather than more small inserts, or use `--ack replicated`, which survives any one node
+failing but not the leader and every holder failing in the same moment.
+</Aside>
+
+Stop the node and the fake bucket when you're done:
+
+```bash
+kill $(cat node.pid)
+sleep 1
+kill $(cat s3.pid)
+```

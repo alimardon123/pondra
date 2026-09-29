@@ -136,7 +136,15 @@ impl Cluster {
         tokio::spawn(async move {
             let mut gone = 0;
             loop {
-                tokio::time::sleep(Duration::from_secs(15)).await;
+                // While the leader's commit stream is down, look for a new leader every second
+                // (it is elected within the lease), not every fifteen: the reads are fresh again
+                // about as soon as the followers' are. (A few bucket reads a second, only then.)
+                for _ in 0..15 {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    if STREAM_DOWN.load(std::sync::atomic::Ordering::Relaxed) && matches!(latest(&store).await, Ok(Some(t)) if t.n != self.leader.n) {
+                        restart("another leads");
+                    }
+                }
                 // Following a leader that has been gone for two checks: reopen reading the
                 // catalog's WAL as well, or what it committed in its last seconds (not yet in the
                 // files our view reads) would stay invisible until a new leader appears.
@@ -176,6 +184,9 @@ impl Cluster {
 /// reconnect; meanwhile our own catalog view keeps us correct, just a little behind. A follower
 /// (`replica`) of a leader that replicates commits also keeps every change on local disk and
 /// says so: that is what lets the leader acknowledge a write before the bucket has it.
+/// Is the leader's commit stream down (`mirror`)? A read-only node then looks for a new leader.
+static STREAM_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 pub fn mirror(lake: Arc<Lake>, leader: String, me: String, replica: Option<Arc<ReplicaLog>>) {
     // Acks, coalesced: however many changes arrive meanwhile, one request says "up to here".
     let (held, mut to_ack) = tokio::sync::watch::channel((0u64, 0u64, 0u64)); // term, first, last
@@ -190,7 +201,8 @@ pub fn mirror(lake: Arc<Lake>, leader: String, me: String, replica: Option<Arc<R
     tokio::spawn(async move {
         let mut last = 0; // the last change we got (a reconnect replays some we have)
         loop {
-            if let Ok(r) = http().get(format!("http://{leader}/cluster/log")).send().await {
+            if let Ok(r) = http().get(format!("http://{leader}/cluster/log")).send().await.and_then(|r| r.error_for_status()) {
+                STREAM_DOWN.store(false, std::sync::atomic::Ordering::Relaxed);
                 let (mut body, mut buf, mut term) = (r.bytes_stream(), bytes::BytesMut::new(), None);
                 while let Some(Ok(chunk)) = body.next().await {
                     buf.extend_from_slice(&chunk);
@@ -218,6 +230,7 @@ pub fn mirror(lake: Arc<Lake>, leader: String, me: String, replica: Option<Arc<R
                     }
                 }
             }
+            STREAM_DOWN.store(true, std::sync::atomic::Ordering::Relaxed);
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
     });

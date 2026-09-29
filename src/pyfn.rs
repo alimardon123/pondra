@@ -103,7 +103,7 @@ fn head(name: &str, r: &Routine, table: bool) -> serde_json::Value {
 
 /// Rows through a worker: the arguments' batch out, the answer back (as `out`'s columns).
 async fn ask(name: &str, r: &Routine, table: bool, args: RecordBatch, out: SchemaRef) -> Result<Vec<RecordBatch>> {
-    anyhow::ensure!(crate::python::runs(), "{name} is a Python function, and this node runs no Python: start it with --python <python>");
+    crate::python::ready(&format!("{name} is a Python function"))?;
     let limit = std::time::Duration::from_secs_f64(r.with.timeout.unwrap_or(60.0));
     let parts = vec![crate::query::ipc(&[args])?, crate::query::ipc(&[RecordBatch::new_empty(out)])?];
     let mut log = |n: String| eprintln!("function {name}: {n}");

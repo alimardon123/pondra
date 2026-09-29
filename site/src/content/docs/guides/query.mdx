@@ -1,0 +1,277 @@
+---
+title: Query
+description: Run SQL against a lake from SQL, Python, JavaScript or psql, with parameters, scripts, formats, EXPLAIN and queries spread over nodes.
+sidebar:
+  order: 3
+---
+
+import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+
+Pondra's SQL is [Apache DataFusion's](https://datafusion.apache.org/user-guide/sql/index.html): the
+Postgres-style SQL you know, with joins, subqueries, CTEs, window functions and the usual functions,
+plus a few DuckDB conveniences (`FROM t`, `SELECT * EXCLUDE (…)`, `GROUP BY ALL`). Pondra adds its own
+statements (`MERGE`, `ASOF JOIN`, `CREATE MATERIALIZED VIEW`) and functions, which the other guides cover.
+
+Here is some data for the examples:
+
+```sql
+CREATE TABLE orders (id BIGINT, user_id BIGINT, item VARCHAR, qty INT, amount DOUBLE, ts TIMESTAMP);
+INSERT INTO orders VALUES
+  (1, 1, 'tea',  2, 7.0, TIMESTAMP '2026-09-27 09:00:00'),
+  (2, 2, 'cake', 1, 4.5, TIMESTAMP '2026-09-27 10:30:00'),
+  (3, 1, 'tea',  1, 3.5, TIMESTAMP '2026-09-28 08:15:00'),
+  (4, 3, 'pie',  2, 9.0, TIMESTAMP '2026-09-28 12:00:00');
+CREATE TABLE users (id BIGINT PRIMARY KEY, name VARCHAR, city VARCHAR);
+INSERT INTO users VALUES (1, 'ann', 'Tashkent'), (2, 'bob', 'Paris'), (3, 'cy', 'Rome');
+```
+
+## Run a query
+
+<Tabs syncKey="lang">
+  <TabItem label="SQL">
+    ```sql
+    SELECT item, sum(qty) AS items, sum(amount) AS total FROM orders GROUP BY item ORDER BY total DESC;
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    import pondra
+    db = pondra.connect("http://localhost:8080")
+    print(db.sql("SELECT item, sum(qty) AS items FROM orders GROUP BY item ORDER BY item").rows())
+    ```
+  </TabItem>
+  <TabItem label="JavaScript">
+    ```js
+    import { connect } from "pondra";
+    const db = connect("http://localhost:8080");
+    console.log(await db.sql("SELECT item, sum(qty) AS items FROM orders GROUP BY item ORDER BY item"));
+    ```
+  </TabItem>
+  <TabItem label="psql">
+    ```bash
+    psql -h localhost -p 5432 -c "SELECT item, sum(qty) AS items FROM orders GROUP BY item ORDER BY item"
+    ```
+  </TabItem>
+</Tabs>
+
+`psql` needs the Postgres port (`pondra serve --pg 0.0.0.0:5432`); so do psycopg, SQLAlchemy and
+other Postgres clients.
+
+## What a query sees
+
+A query reads the lake's Parquet files and the newest rows, which have not become Parquet yet, as one
+snapshot: everything committed up to one moment, never half of a commit. A write is in the answer as
+soon as it is acknowledged, on any node. So there is nothing to refresh, and no difference between "old"
+and "new" rows.
+
+Tables join across schemas and attached lakes as one query, keyed tables included:
+
+```sql
+SELECT u.name, o.item, o.amount,
+       rank() OVER (PARTITION BY u.name ORDER BY o.amount DESC) AS rank
+FROM orders o JOIN users u ON u.id = o.user_id
+ORDER BY u.name, rank;
+```
+
+```text
++------+------+--------+------+
+| name | item | amount | rank |
++------+------+--------+------+
+| ann  | tea  | 7.0    | 1    |
+| ann  | tea  | 3.5    | 2    |
+| bob  | cake | 4.5    | 1    |
+| cy   | pie  | 9.0    | 1    |
++------+------+--------+------+
+```
+
+`FROM orders` alone means `SELECT * FROM orders`, and `FROM orders SELECT item, qty` picks columns.
+`FROM orders WHERE …` is not accepted: write the `SELECT *`.
+
+## Parameters
+
+Write `$name` in the SQL and pass the values separately. The node binds each value; it is never pasted
+into the text, so a value can't change the statement.
+
+<Tabs syncKey="lang">
+  <TabItem label="Python">
+    ```python
+    print(db.sql("SELECT item, sum(qty) AS n FROM orders WHERE amount >= $min GROUP BY item ORDER BY item", min=4).rows())
+    ```
+  </TabItem>
+  <TabItem label="JavaScript">
+    ```js
+    import { connect } from "pondra";
+    const db = connect("http://localhost:8080");
+    console.log(await db.sql("SELECT item, sum(qty) AS n FROM orders WHERE amount >= $min GROUP BY item ORDER BY item", { min: 4 }));
+    ```
+  </TabItem>
+  <TabItem label="Shell">
+    ```bash
+    curl -s -X POST http://localhost:8080/sql -H 'content-type: application/json' \
+      -d '{"sql": "SELECT item, sum(qty) AS n FROM orders WHERE amount >= $min GROUP BY item ORDER BY item", "params": {"min": 4}}'
+    ```
+  </TabItem>
+</Tabs>
+
+Each gives the same three rows, in its own format. Python's:
+
+```text
+[{'item': 'cake', 'n': 1}, {'item': 'pie', 'n': 2}, {'item': 'tea', 'n': 2}]
+```
+
+In Python, keyword arguments that name a frame or a pandas, Polars or Arrow table are that data in the
+SQL (`{name}`); every other keyword is a `$name` parameter. Over psql, drivers use their own `$1`
+placeholders.
+
+## Run a script
+
+`POST /sql` takes several statements, runs them in order, and answers with the last one's rows or
+outcome. The same goes for a `.sql` file, with `$name` parameters filled from the arguments:
+
+<Tabs syncKey="lang">
+  <TabItem label="Python">
+    ```python
+    script = """
+    CREATE OR REPLACE VIEW day_totals AS SELECT date_trunc('day', ts) AS day, sum(amount) AS total FROM orders GROUP BY 1;
+    SELECT * FROM day_totals WHERE total >= $min ORDER BY day;
+    """
+    print(db.run(script, min=12).rows())
+    ```
+
+    ```text
+    [{'day': datetime.datetime(2026, 9, 28, 0, 0), 'total': 12.5}]
+    ```
+  </TabItem>
+  <TabItem label="Shell">
+    ```bash
+    cat > daily.sql <<'SQL'
+    CREATE OR REPLACE VIEW day_totals AS SELECT date_trunc('day', ts) AS day, sum(amount) AS total FROM orders GROUP BY 1;
+    SELECT * FROM day_totals WHERE total >= $min ORDER BY day;
+    SQL
+    pondra run --url http://localhost:8080 daily.sql lake --min 12
+    ```
+
+    ```text
+    +---------------------+-------+
+    | day                 | total |
+    +---------------------+-------+
+    | 2026-09-28T00:00:00 | 12.5  |
+    +---------------------+-------+
+    ```
+  </TabItem>
+</Tabs>
+
+`db.run` also takes the name of a `.sql` file, and in JavaScript `db.run("daily.sql", { min: 12 })` does
+the same. `pondra run` without `--url` starts a node on the lake for the run; the
+[shell page](/pondra/start/shell/) has its options.
+
+## Get the answer as rows, a DataFrame or Arrow
+
+`db.sql(...)` in Python gives a lazy frame: it runs when you ask for the rows.
+
+```python
+frame = db.sql("SELECT id, item, amount FROM orders ORDER BY id")
+print(frame.rows()[:2])       # a list of dicts
+frame.show()                  # a text table
+frame.to_pandas()             # a pandas DataFrame (needs pyarrow)
+frame.to_polars()             # a Polars DataFrame
+frame.to_arrow()              # a pyarrow Table
+```
+
+```text
+[{'id': 1, 'item': 'tea', 'amount': 7.0}, {'id': 2, 'item': 'cake', 'amount': 4.5}]
++----+------+--------+
+| id | item | amount |
++----+------+--------+
+| 1  | tea  | 7.0    |
+| 2  | cake | 4.5    |
+| 3  | tea  | 3.5    |
+| 4  | pie  | 9.0    |
++----+------+--------+
+```
+
+Over HTTP, `format` picks the answer's shape: `json` (the default: an array of row objects, with
+nulls left out), `table` (text, as the shell prints it), or `arrow` (an Arrow IPC stream, which
+pyarrow, Polars and DuckDB read directly).
+
+```bash
+curl -s -X POST "http://localhost:8080/sql?format=table" -d "SELECT item, qty FROM orders ORDER BY id LIMIT 2"
+curl -s -X POST "http://localhost:8080/sql?format=arrow" -d "SELECT item, qty FROM orders ORDER BY id" \
+  | python3 -c "import sys, pyarrow.ipc as ipc; print(ipc.open_stream(sys.stdin.buffer).read_all().to_pydict())"
+```
+
+```text
++------+-----+
+| item | qty |
++------+-----+
+| tea  | 2   |
+| cake | 1   |
++------+-----+
+{'item': ['tea', 'cake', 'tea', 'pie'], 'qty': [2, 1, 1, 2]}
+```
+
+## Repeated queries
+
+A node remembers a query's answer until the next commit to the tables it reads, so a dashboard that asks
+the same thing every second costs one computation per change. Queries that ask for the time or randomness
+(`now()`, `random()`), read files outside the lake, call a Python function, or read a temporary table are
+never remembered.
+
+If a slightly old answer is fine, say how old with `stale_ms`, and a cached answer up to that many
+milliseconds old is returned even after newer commits:
+
+```bash
+curl -s -X POST "http://localhost:8080/sql?stale_ms=5000" -d "SELECT count(*) AS n FROM orders"
+```
+
+```text
+[{"n":4}]
+```
+
+## Explain a query
+
+`EXPLAIN` shows the plan, and `EXPLAIN ANALYZE` runs the query and adds what each step cost:
+
+```python
+for row in db.sql("EXPLAIN SELECT item, sum(qty) FROM orders GROUP BY item").rows():
+    print(row["plan_type"])
+    print(row["plan"])
+```
+
+```text
+logical_plan
+Aggregate: groupBy=[[orders.item]], aggr=[[sum(CAST(orders.qty AS Int64))]]
+  TableScan: orders projection=[item, qty]
+physical_plan
+AggregateExec: mode=FinalPartitioned, gby=[item@0 as item], aggr=[sum(orders.qty)]
+  RepartitionExec: partitioning=Hash([item@0], 2), input_partitions=1
+    AggregateExec: mode=Partial, gby=[item@0 as item], aggr=[sum(orders.qty)]
+      DataSourceExec: partitions=1, partition_sizes=[1]
+```
+
+## Queries across several nodes
+
+With several nodes on one lake, a query over a big table runs on all of them: each node reads its share
+of the files, and the coordinator collects the answers. You don't ask for it. The node that receives the
+query first compares what spreading would move over the network with the time the query takes on one
+node, and spreads it only when that pays. `?spread=1` spreads a query anyway and `?spread=0` keeps it on
+one node:
+
+```bash
+curl -s -X POST "http://localhost:8080/sql?spread=0" -d "SELECT count(*) AS n FROM orders"
+```
+
+```text
+[{"n":4}]
+```
+
+Answers are the same on one node and on many, including sums over `DOUBLE`, which add up exactly. Queries
+that need more memory than `--memory-gb` allows (a third of the machine's by default) spill to disk.
+[Clusters](/pondra/guides/clusters/) covers running several nodes.
+
+<Aside type="caution">
+Spreading has been tested with several nodes on one machine, where every answer equals a single node's.
+Across a real network the gain depends on the link between the nodes, which is why the check above
+exists. Two shapes still run on one node: a `LIMIT` inside a subquery over sliced data, and
+order-preserving shuffles.
+</Aside>

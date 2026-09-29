@@ -59,7 +59,7 @@ pub fn conform(b: &RecordBatch, s: &SchemaRef) -> Result<RecordBatch> {
         return Ok(b.clone());
     }
     let columns = s.fields().iter().map(|f| match b.column_by_name(f.name()) {
-        Some(c) => Ok(datafusion::arrow::compute::cast(c, f.data_type())?),
+        Some(c) => Ok(strict(c, f.data_type())?),
         None => Ok(datafusion::arrow::array::new_null_array(f.data_type(), b.num_rows())),
     });
     Ok(RecordBatch::try_new(s.clone(), columns.collect::<Result<Vec<_>>>()?)?)
@@ -68,10 +68,24 @@ pub fn conform(b: &RecordBatch, s: &SchemaRef) -> Result<RecordBatch> {
 /// A query's rows as `s`'s columns, by position, cast to its types: a view's or a task's output
 /// into its table (strings a query reads from files are views; the table holds plain ones).
 pub fn cast_as(b: &RecordBatch, s: &SchemaRef) -> Result<RecordBatch> {
-    anyhow::ensure!(b.num_columns() == s.fields().len(), "{} columns for a table of {}", b.num_columns(), s.fields().len());
-    let columns = b.columns().iter().zip(s.fields()).map(|(c, f)| datafusion::arrow::compute::cast(c, f.data_type()));
+    // (a keyed table made in SQL has a `_deleted` column last, which a query's rows leave out)
+    let marker = s.fields().last().is_some_and(|f| f.name() == "_deleted") && b.num_columns() + 1 == s.fields().len();
+    anyhow::ensure!(b.num_columns() == s.fields().len() || marker, "{} columns for a table of {}", b.num_columns(), s.fields().len());
+    let mut columns = b.columns().iter().zip(s.fields()).map(|(c, f)| strict(c, f.data_type())).collect::<Result<Vec<_>>>()?;
+    if marker {
+        columns.push(datafusion::arrow::array::new_null_array(&DataType::Boolean, b.num_rows()));
+    }
     let options = datafusion::arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(b.num_rows()));
-    Ok(RecordBatch::try_new_with_options(s.clone(), columns.collect::<Result<Vec<_>, _>>()?, &options)?)
+    Ok(RecordBatch::try_new_with_options(s.clone(), columns, &options)?)
+}
+
+/// A column as type `t`, or an error saying which value wouldn't go (never a quiet NULL).
+pub fn strict(c: &ArrayRef, t: &DataType) -> Result<ArrayRef> {
+    if c.data_type() == t {
+        return Ok(c.clone());
+    }
+    let options = datafusion::arrow::compute::CastOptions { safe: false, ..Default::default() };
+    Ok(datafusion::arrow::compute::cast_with_options(c, t, &options)?)
 }
 
 /// Rows of `table` from committed segments in (after, upto]; `None` = up to the latest; under
@@ -391,7 +405,10 @@ impl TableProvider for Pruned {
         let df = df.select_columns(&projection.unwrap_or(&all).iter().map(|&i| self.schema.field(i).name().as_str()).collect::<Vec<_>>())?;
         let plan = df.create_physical_plan().await?;
         let Some((rows, bytes)) = self.share else { return Ok(plan) };
-        Ok(Arc::new(crate::spmd::ShareExec::new(plan, &self.name, rows, bytes, self.range.as_ref().map(|r| r.column.clone()))?))
+        // (with each column's distinct values and range, from the catalog: an aggregate over a
+        // slice then knows it puts out a few groups, not a row per row — `guard.rs` weighs that)
+        let columns = self.statistics().map(|s| projection.unwrap_or(&all).iter().map(|&i| s.column_statistics[i].clone()).collect());
+        Ok(Arc::new(crate::spmd::ShareExec::new(plan, &self.name, rows, bytes, self.range.as_ref().map(|r| r.column.clone()), columns)?))
     }
 }
 

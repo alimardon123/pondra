@@ -1,0 +1,212 @@
+---
+title: Other engines
+description: Publish tables as Delta Lake and Iceberg so DuckDB, Polars, Spark and others read them, and let engines append through the Iceberg REST catalog.
+sidebar:
+  order: 10
+---
+
+import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+
+A Pondra table can also be a **Delta Lake** table and an **Iceberg** table, in the same folder as
+its Parquet files. Spark, Databricks, DuckDB, Polars, delta-rs, PyIceberg, Trino and Athena read
+them without knowing Pondra. Engines can also attach the node's **Iceberg REST catalog** by URL
+and append to a table. Use this page to hand a table to a team that uses other tools.
+
+## Publish a table
+
+Publishing is per table, in `CREATE TABLE`. Pondra keeps the Delta log and the Iceberg metadata
+current as the table changes.
+
+```sql
+CREATE TABLE events (user VARCHAR, amount BIGINT, ts TIMESTAMP) WITH (publish = 'delta,iceberg');
+INSERT INTO events VALUES
+  ('ann', 5, '2026-09-29 10:00:00'),
+  ('bob', 7, '2026-09-29 10:01:00'),
+  ('ann', 2, '2026-09-29 10:02:00');
+```
+
+`publish` is `'delta'`, `'iceberg'` or both. Change it later with
+`ALTER TABLE events SET (publish = 'delta')`; turning a format off deletes its metadata, so nobody
+reads a stale copy. `pondra serve --publish delta,iceberg` publishes every new table by default.
+
+The table is a folder at `<lake>/data/<table>`, on disk or in a bucket:
+
+```text
+lake/data/events/
+  <uuid>.parquet
+  _delta_log/00000000000000000000.json …     the Delta table
+  metadata/v1.metadata.json …                the Iceberg table
+```
+
+Other engines see a table **as of the last tiering round**: about 30 ms after a write on local
+disk, and a few seconds on object storage. `--tier-secs` (default 10) is how often a busy table is
+tiered at most; Pondra's own queries always see every commit at once.
+
+```bash
+sleep 2   # this page's node tiers every second
+```
+
+## Read with Delta readers
+
+These read `lake/data/events` directly:
+
+<Tabs syncKey="engine">
+  <TabItem label="DuckDB">
+    ```python
+    import duckdb
+    duckdb.sql("SELECT user, sum(amount) AS total FROM delta_scan('lake/data/events') GROUP BY user ORDER BY user").fetchall()
+    ```
+  </TabItem>
+  <TabItem label="Polars">
+    ```python
+    import polars as pl
+    pl.scan_delta("lake/data/events").group_by("user").agg(pl.col("amount").sum()).sort("user").collect()
+    ```
+  </TabItem>
+  <TabItem label="delta-rs">
+    ```python
+    from deltalake import DeltaTable
+    DeltaTable("lake/data/events").to_pandas()
+    ```
+  </TabItem>
+  <TabItem label="Spark">
+    ```python norun
+    spark.read.format("delta").load("s3://my-bucket/lake/data/events").groupBy("user").sum("amount").show()
+    ```
+  </TabItem>
+</Tabs>
+
+A lake in a bucket is the same with the bucket's path and that engine's own credentials:
+`delta_scan('s3://my-bucket/lake/data/events')`.
+
+## Read with Iceberg readers
+
+Attach the node's REST catalog and the tables are found by name, with no paths. The namespace
+`default` is the lake's `public` schema; each other schema, and each attached lake, is a namespace
+of its own.
+
+<Tabs syncKey="engine">
+  <TabItem label="DuckDB">
+    ```python
+    import duckdb
+    con = duckdb.connect()
+    con.execute("ATTACH 'pondra' AS lake (TYPE iceberg, ENDPOINT 'http://localhost:8080', AUTHORIZATION_TYPE 'none')")
+    con.execute("SELECT user, sum(amount) AS total FROM lake.default.events GROUP BY user ORDER BY user").fetchall()
+    ```
+  </TabItem>
+  <TabItem label="PyIceberg">
+    ```python
+    from pyiceberg.catalog import load_catalog
+    catalog = load_catalog("pondra", type="rest", uri="http://localhost:8080")
+    print(catalog.list_tables("default"))
+    catalog.load_table("default.events").scan().to_pandas()
+    ```
+  </TabItem>
+  <TabItem label="Spark">
+    ```bash norun
+    spark-sql \
+      --conf spark.sql.catalog.lake=org.apache.iceberg.spark.SparkCatalog \
+      --conf spark.sql.catalog.lake.type=rest \
+      --conf spark.sql.catalog.lake.uri=http://node:8080 \
+      -e "SELECT user, sum(amount) FROM lake.default.events GROUP BY user"
+    ```
+  </TabItem>
+</Tabs>
+
+You can also point a reader at the table's metadata file. Its number is in
+`metadata/version-hint.text`:
+
+```python
+import duckdb
+version = open("lake/data/events/metadata/version-hint.text").read().strip()
+duckdb.sql(f"SELECT count(*) FROM iceberg_scan('lake/data/events/metadata/v{version}.metadata.json')").fetchall()
+```
+
+With tokens on, give the catalog the read token: `load_catalog(…, token="…")` in PyIceberg, and
+in DuckDB `CREATE SECRET t (TYPE iceberg, TOKEN '…')` with `SECRET t` in the `ATTACH`.
+
+<Aside type="caution">
+Polars 1.44's own Iceberg reader (`pl.scan_iceberg`) stops with `failed to load 'PARQUET:field_id'`
+when it reads columns of a Pondra table, because Pondra's Parquet files don't carry Iceberg field
+ids. Polars reads the Delta copy, and PyIceberg, DuckDB, Spark and Trino read the Iceberg one.
+</Aside>
+
+## Append from another engine
+
+Through the REST catalog, other engines **append** to a table. The node takes the files the commit
+adds and makes their rows the table's own, as a bulk `INSERT` would: with row ids, the table's
+layout, views and the Delta copy following. So this is Pondra's catalog, not a second one.
+
+```python
+import datetime as dt
+import pyarrow as pa
+from pyiceberg.catalog import load_catalog
+
+catalog = load_catalog("pondra", type="rest", uri="http://localhost:8080")
+rows = pa.table({
+    "user": ["cy"],
+    "amount": pa.array([9], pa.int64()),
+    "ts": pa.array([dt.datetime(2026, 9, 29, 11, 0)], pa.timestamp("us")),
+})
+catalog.load_table("default.events").append(rows)
+```
+
+```sql
+SELECT user, amount FROM events ORDER BY ts;
+```
+
+```text
+user  amount
+ann   5
+bob   7
+ann   2
+cy    9
+```
+
+Spark does the same through the catalog: `INSERT INTO lake.default.events SELECT …` or
+`df.writeTo("lake.default.events").append()`.
+
+Each commit lands once: a writer whose snapshot is stale gets `409` and retries on top of the new
+version, and a commit sent twice is applied once. Anything else is refused by name:
+
+```python
+try:
+    catalog.load_table("default.events").delete("user = 'cy'")
+except Exception as e:
+    print(e)
+```
+
+```text
+BadRequestException: a snapshot that does overwrite: other engines append; deletes and overwrites go through Pondra's SQL (DELETE, UPDATE, MERGE)
+```
+
+**Refused:** deletes and overwrites (use `DELETE`, `UPDATE`, `MERGE` in Pondra), schema changes
+(`ALTER TABLE`), appends to keyed tables, and creating a table through the catalog (make it with
+`CREATE TABLE … WITH (publish = 'iceberg')`).
+
+<Aside type="caution">
+Write through Pondra or through the REST catalog, never into the `_delta_log` or `metadata` folders
+yourself: Pondra's catalog is the truth, and a version it didn't write is overwritten by its next.
+Delta writers need Delta's catalog-managed commits, which Delta doesn't have yet, so engines write
+Iceberg to Pondra, not Delta.
+</Aside>
+
+## What other engines see
+
+- **The latest version, plus a little history:** 100 Delta versions and 100 Iceberg snapshots.
+  Files replaced by compaction are deleted after `--retain-secs` (60 by default), so time travel
+  further back than that fails.
+- **Column types:** integers, floats, strings, booleans, dates, timestamps, binary, decimals and
+  float arrays (vector columns) publish. A table with a column of another type isn't published in
+  that format.
+- **Keyed tables** publish when a file holds one row per key, which is after each compaction (every
+  8 files, or `CHECKPOINT`). Other engines see a keyed table as of its last compaction; run
+  `CHECKPOINT` to bring them up to date.
+- **Schema changes follow.** `ADD COLUMN`, renames and drops reach Delta (column mapping) and
+  Iceberg (field ids) without rewriting files.
+- **Plain Parquet readers** can read `data/<table>/*.parquet`, but they see replaced files and, for
+  keyed tables, old versions of a key. Only the Delta log, the Iceberg metadata or Pondra itself
+  gives the right answer.
+
+To go the other way, reading other engines' tables from Pondra, see
+[files and other lakes](/pondra/guides/files-and-other-lakes/).

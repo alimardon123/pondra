@@ -1,0 +1,145 @@
+---
+title: Pondra
+description: A streamhouse in one binary. SQL, Python and streaming over a lake on your disk or in a bucket.
+template: splash
+hero:
+  tagline: One binary for streams, tables and SQL. Load data, keep views current as rows arrive, and query with SQL, Python or JavaScript, on your disk or in any bucket.
+  actions:
+    - text: Get started
+      link: /pondra/start/install/
+      icon: right-arrow
+    - text: Your first lake
+      link: /pondra/start/first-lake/
+      variant: secondary
+    - text: GitHub
+      link: https://github.com/alimardon123/pondra
+      icon: external
+      variant: minimal
+---
+
+import { Card, CardGrid } from '@astrojs/starlight/components';
+
+Pondra is one program that takes in streams of rows, stores them as tables in a folder or a bucket
+(Parquet files plus a small catalog), and answers SQL. Materialized views, keyed tables and event-time
+windows keep results current as rows arrive, and other engines can read the tables as Delta Lake or
+Iceberg. Object storage is the only state, so there is no Kafka, Flink, Spark, JVM or metastore to run:
+start another copy on the same bucket and it joins the first.
+
+## What you can do
+
+<CardGrid>
+  <Card title="Make tables" icon="add-document">
+    Append tables, keyed tables that upsert, merge tables, TTL, schemas and views.
+    [Tables](/pondra/guides/tables/)
+  </Card>
+  <Card title="Load data" icon="cloud-download">
+    `INSERT`, exactly-once `append`, `COPY`, CSV, Parquet and JSON, pandas, Polars and Arrow.
+    [Load data](/pondra/guides/load-data/)
+  </Card>
+  <Card title="Query" icon="magnifier">
+    SQL over HTTP, Postgres drivers and Arrow Flight, joins, parameters and live queries.
+    [Query](/pondra/guides/query/)
+  </Card>
+  <Card title="Read files and other lakes" icon="open-book">
+    Parquet, CSV and JSON on S3, GCS, Azure and HTTPS, and other engines' Delta and Iceberg tables.
+    [Files and other lakes](/pondra/guides/files-and-other-lakes/)
+  </Card>
+  <Card title="Change rows" icon="pencil">
+    `UPDATE`, `DELETE` and `MERGE`, system columns, and a feed of every change.
+    [Change rows](/pondra/guides/change-rows/)
+  </Card>
+  <Card title="Stream" icon="random">
+    Views kept current on every commit, event-time windows, stream joins and point-in-time joins.
+    [Streaming](/pondra/guides/streaming/)
+  </Card>
+  <Card title="Use DataFrames" icon="laptop">
+    Polars' method names, or PySpark's, over one SQL statement.
+    [DataFrames](/pondra/guides/dataframes/), [PySpark](/pondra/guides/pyspark/)
+  </Card>
+  <Card title="Write functions and procedures" icon="puzzle">
+    SQL and Python functions, stored procedures, and tasks on a schedule.
+    [Functions and procedures](/pondra/guides/functions-and-procedures/)
+  </Card>
+  <Card title="Share with other engines" icon="external">
+    Publish Delta and Iceberg, let Spark or PyIceberg append, and speak the Kafka protocol.
+    [Other engines](/pondra/guides/other-engines/), [Kafka](/pondra/guides/kafka/)
+  </Card>
+  <Card title="Run a cluster" icon="server">
+    Several nodes on one bucket, on S3, R2, MinIO, GCS or Azure.
+    [Clusters](/pondra/guides/clusters/), [Object storage](/pondra/guides/object-storage/)
+  </Card>
+  <Card title="Work with AI and files" icon="star">
+    Vector search, `ai_complete` and `ai_embed`, files in the lake, and an MCP server for agents.
+    [AI and files](/pondra/guides/ai-and-files/)
+  </Card>
+  <Card title="Use it from notebooks, and lock it down" icon="notes">
+    Jupyter with `%%sql` cells, and read, write and admin tokens on every door.
+    [Notebooks](/pondra/guides/notebooks/), [Security](/pondra/guides/security/)
+  </Card>
+</CardGrid>
+
+## One binary replaces
+
+For the common jobs, `pondra` takes the place of a stack:
+
+| Instead of running | For | Pondra has |
+|---|---|---|
+| **Kafka** | Ingesting events, topics, consumers | `append` with exactly-once batches, and a Kafka port: producers, consumers and Debezium change events |
+| **Flink** | Streaming SQL: windows, joins, deduplication | Materialized views, event-time windows, stream joins, `ASOF JOIN` and tasks |
+| **Spark** | Batch SQL, ELT and DataFrames | SQL that can spread over several nodes, `pondra.frame`, and PySpark's names in `pondra.spark` |
+| **A metastore** (Hive, Polaris, Unity) | The catalog of tables | A catalog inside the bucket, and an Iceberg REST catalog on every node |
+| **ZooKeeper** | Picking a leader | A leader elected through the bucket |
+
+It is a prototype, and it replaces them for the common jobs, not all of them.
+[Pondra compared](/pondra/concepts/compared/) says where Spark, Flink, Fluss, DuckDB, Databricks and
+Snowflake are stronger.
+
+## Try it in 30 seconds
+
+Install Pondra with pip (other ways are on the [install page](/pondra/start/install/)), and start the
+shell on a folder called `lake`:
+
+```bash norun
+pip install pondra
+pondra
+```
+
+Then type SQL. This makes a table and a view that keeps its totals current, writes three rows, and
+reads the totals:
+
+```sql
+CREATE TABLE events (user VARCHAR, amount BIGINT);
+CREATE MATERIALIZED VIEW totals AS SELECT user, sum(amount) AS total FROM events GROUP BY user;
+INSERT INTO events VALUES ('ann', 5), ('bob', 3), ('ann', 7);
+SELECT * FROM totals ORDER BY user;
+```
+
+```text
++------+-------+
+| user | total |
++------+-------+
+| ann  | 12    |
+| bob  | 3     |
++------+-------+
+```
+
+Write another row and the view has it already:
+
+```sql
+INSERT INTO events VALUES ('bob', 4);
+SELECT * FROM totals ORDER BY user;
+```
+
+```text
++------+-------+
+| user | total |
++------+-------+
+| ann  | 12    |
+| bob  | 7     |
++------+-------+
+```
+
+The folder `lake` now holds your tables. Stop Pondra, copy the folder to a bucket, and it opens there as
+it was.
+[How Pondra works](/pondra/concepts/how-it-works/) explains what is in it, and
+[Your first lake](/pondra/start/first-lake/) does the same from Python and JavaScript.

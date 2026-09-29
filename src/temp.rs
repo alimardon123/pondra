@@ -240,7 +240,10 @@ async fn create(app: &App, s: &str, c: &ast::CreateTable, files: bool) -> Result
 async fn insert(app: &App, s: &str, name: &str, names: Option<&[String]>, query: &str, files: bool) -> Result<Value> {
     let columns = SESSIONS.lock().unwrap().get(s).and_then(|x| x.tables.get(name)).map(|t| t.columns.clone()).with_context(|| format!("no temporary table {name}"))?;
     let query = match names {
-        Some(n) => crate::write::rows_for(name, &columns.iter().map(|(c, _)| c.clone()).collect::<Vec<_>>(), n, query)?,
+        Some(n) => {
+            let all: Vec<String> = columns.iter().map(|(c, _)| c.clone()).collect();
+            crate::write::rows_for(name, &all, if n.is_empty() { &all } else { n }, query, &|_| None)? // (no names: `VALUES (1, DEFAULT)`)
+        }
         None => query.to_string(),
     };
     let ctx = crate::query::session(&app.lake, &query, "").await?;

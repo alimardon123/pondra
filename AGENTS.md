@@ -1062,6 +1062,15 @@ round: the engine first (this), then the console and `--server` (round 26).
   purpose, after a green run there.
 - **The cluster bench:** the owner runs it on `main` (v0.24.0) at 3 and then 6 nodes, as round
   25's baseline, and again once round 25 is pushed.
+- **The owner's decisions after round 25 (2026-09-29):**
+  - Round 26 is the console, `--server`, dbt and BI **and a documentation website**, together.
+    The site uses Starlight on GitHub Pages, with every example tested. The owner: "even I can't
+    know exactly what things we have and how to use the product full power."
+  - ADR-029 comes after that: phase 1 in round 27, phase 2 in round 28. Security moves to round
+    29.
+  - "Our extension framework" means DuckDB-style `INSTALL`/`LOAD`. Nothing was designed before;
+    ADR-031 (proposed) designs it, and its round is still open.
+  - pyarrow stays optional ("we might make it required in the future, but not now").
 
 **R2 test buckets.** There are two:
 

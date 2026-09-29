@@ -1,0 +1,310 @@
+---
+title: Performance
+description: What Pondra measured against Spark, Flink, DuckDB and others, on what machine, and how to measure it yourself.
+sidebar:
+  order: 5
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Every number on this page comes from Pondra's own status report and comparison notes, with what was
+measured and on what machine. Read them as ratios and shapes: your hardware will give other times.
+Where another engine is ahead, the page says so.
+
+## How the numbers were taken
+
+- **The machine:** one 2-vCPU virtual machine with 7 GB of memory (8 GB for the single-node TPC-H runs),
+  on local disk. Where a number says R2, it used a real Cloudflare R2 bucket. Every engine ran alone.
+- **The engines:** Pondra's prototype, built on Apache DataFusion 55; Spark 4.2.0 (PySpark,
+  `local[*]`); Flink 2.3.0 (PyFlink, a local MiniCluster, parallelism 2); DuckDB 1.5.5; Polars 1.44.2;
+  Daft; and Bodo. Each single-node engine ran its own published TPC-H code.
+- **Same data, same answers:** every engine read the same data with the same SQL, and the answers were
+  checked against DuckDB's, or by row counts where noted.
+- **Not run here:** Fluss and Databricks' Lakehouse//RT can't run on this machine. They are compared
+  with their published numbers.
+
+## SQL on one machine
+
+### TPC-H against DuckDB, Polars, Daft and Bodo
+
+All 22 queries at scale factor 1 (SF1: 6 million lineitem rows) and scale factor 10 (SF10: 60 million),
+on one 2-vCPU, 8 GB machine. Best of three runs. Pondra read its own lake, loaded with one `INSERT` per
+table. The others read the same Parquet files.
+
+**From files, every query** (nothing loaded into memory first):
+
+| | SF1 | SF10 |
+|---|---|---|
+| **Pondra** (`PONDRA_HOT_GB=0`) | **3.19 s** | **38.0 s** |
+| DuckDB 1.5.5 | 3.36 s | 39.8 s |
+| Polars 1.44.2, in-memory engine | 3.78 s | query 9 ran out of memory |
+| Polars, streaming engine | 3.18 s | 42.8 s |
+| Daft | 6.11 s | 89.0 s |
+
+Bodo was run too. Eight of its 21 answers differed from DuckDB's and one query crashed, so its times
+aren't a comparison.
+
+**From memory** (the load is not in the times):
+
+| | SF1 | SF10 |
+|---|---|---|
+| **Pondra**, with hot columns kept decoded (1.5 GB) | 1.96 s | 35.9 s |
+| DuckDB, its own tables | **1.80 s** | needs about 7 GB of temporary space beyond this machine's memory: no room |
+
+Reading Parquet, Pondra was the fastest of the five at SF10, and level with Polars' streaming engine at
+SF1 (3.19 s against 3.18 s is a tie, not a lead). It is the only one that also ingests, serves and
+scales out. DuckDB stays about 9% ahead when both hold the data in memory at SF1. At SF10 DuckDB
+couldn't hold it here at all, while Pondra's cache takes what fits and gives it back when queries need
+the memory.
+
+A later recheck (round 25, SF1, 2 vCPUs) kept the same standing:
+
+| Engine | Time for all 22 queries |
+|---|---|
+| Pondra | 2.11 s |
+| DuckDB over the same Parquet | 3.45 s |
+| **DuckDB in its own format** | **1.65 s** |
+| Polars | 3.80 s |
+| Daft | 6.98 s |
+
+DuckDB in its own format is still ahead of Pondra. Pondra's ratio to DuckDB over the same Parquet was
+0.61, against 0.60 the round before.
+
+### TPC-H against Spark
+
+The 22 queries at SF1 on the same Parquet files, best of two runs (round 7). Pondra's runs went over
+HTTP and returned JSON, and each run was a new query, so the result cache never answered. All three
+engines returned the same row counts for every query.
+
+| | Pondra | Spark 4.2 | DuckDB 1.5.5 |
+|---|---|---|---|
+| All 22 queries | **5.9 s** | 58.5 to 65.2 s | **3.8 s** |
+| Fastest and slowest query | 0.06 and 0.60 s | 0.6 and 6.8 s | 0.04 and 0.47 s |
+| Per query against Spark | 3 to 23 times faster (median about 11) | 1 | |
+
+That is about 10 times faster than Spark on this machine. DuckDB is 1.5 times faster than Pondra
+here. Flink couldn't take part: PyFlink has no Parquet reader in this setup.
+
+### Batch: 20 million rows, write then six queries
+
+Seconds, first run of Pondra, uncached.
+
+| | Pondra | Spark | Flink ¹ |
+|---|---|---|---|
+| Generate and write 20 M rows | **3.3** (Parquet, ZSTD) | 7.3 | 10.5 |
+| Q1: `count`, `sum`, `avg` | **0.05** | 0.70 | 5.2 |
+| Q2: filter, group by 1,000 | **0.14** | 0.93 | 6.5 |
+| Q3: group by 1 M users, top 10 | **0.59** | 2.20 | 8.9 |
+| Q4: `count(DISTINCT user)` | **0.51** | 1.75 | 7.5 |
+| Q5: join with a dimension | **0.26** | 2.30 | 9.4 |
+| Q6: time buckets | **0.25** | 0.52 | 4.7 |
+| Peak memory | **293 MB** | 1.5 GB | 3.1 GB |
+
+¹ Flink wrote and read CSV, because no Parquet format jar was available, so its batch numbers are
+pessimistic.
+
+Asked a second time, each of these queries returns in about 1 ms from the result cache, until the table
+changes.
+
+## Streaming
+
+10 million events, on the same machine.
+
+| Workload | Pondra | Spark Structured Streaming | Flink |
+|---|---|---|---|
+| Keyed running aggregation (100,000 keys) | 4.2 s end to end (2.4 M/s): over HTTP, stored durably, aggregated by a view, queryable | **3.9 s**, from an in-memory backlog, `noop` sink | 13.3 s (0.75 M/s), in-memory source, `blackhole` sink |
+| Stateless ETL (project and filter) | 4.1 s end to end (2.4 M/s), output durable | 5.2 s, `noop` sink | **4.0 s**, `blackhole` sink |
+
+Spark and Flink generated their input in memory and threw their output away. Pondra took its input over
+HTTP and committed the results durably, so this comparison is tilted against Pondra. Spark was still
+faster on the keyed aggregation, and Flink on stateless ETL.
+
+More streaming numbers:
+
+- **Sustained:** 60 seconds, durable, 8 producers, one node: 2.7 million events a second, and an event
+  was visible in the aggregate 0.23 s after its acknowledgement (median). Spark and Flink need Kafka or
+  Fluss and checkpoints to do this, so they weren't run on it.
+- **A 3-node cluster,** producers writing to the followers: 4.3 to 4.6 million events a second, durable
+  and exactly-once. The leader used 26 to 28% of the CPU.
+- **Nexmark** (queries q1, q2, q5, q7, q11, over 10 million bids): Pondra took 8.7 to 10.9 s and Flink
+  2.3 took 24.3 to 25.0 s, on the same 2 vCPUs. Over 4 million bids it was 3.8 to 5.1 s against 11.0 to
+  11.2 s. Pondra took the bids over HTTP and wrote every view to the lake, and its answers equal
+  DuckDB's. Flink generated the bids in its own process, into blackhole sinks.
+
+Flink has timers, CEP, Top-N and very large keyed state that Pondra doesn't. See
+[Pondra compared](/pondra/concepts/compared/).
+
+## Ingest and serving
+
+| Path | Measured |
+|---|---|
+| Arrow Flight in, exactly-once | 15.7 million rows a second on one node |
+| Arrow Flight out | 9.1 million rows a second on one node |
+| Kafka protocol, 3 nodes, 4 librdkafka producers, one 2-vCPU machine | 776,000 events a second durable, 796,000 replicated, every event exactly once |
+| Durable ingest through one node, no view | 5.5 million events a second, at 1.3 GB |
+
+Key lookups and dashboard queries, with 2 million keys (500,000 on R2), the load generator on the same
+2-vCPU machine:
+
+| | Local disk, leader | Local disk, read-only node | Real R2, read-only node |
+|---|---|---|---|
+| `/lookup`, 1 client | 0.22 ms median | 0.14 ms | 0.14 ms |
+| `/lookup`, 32 to 64 clients | 20,000 a second (p99 7.4 ms) | 35,600 a second (p99 6.4 ms) | 31,800 a second (p99 4.0 ms) |
+| SQL point query, 64 clients | 15,800 a second | 21,100 a second | 18,400 a second (32 clients) |
+| Dashboard aggregate, a new query each time | 6 to 42 ms | 43 ms | 17 ms |
+| The same dashboard, 32 clients | 23,300 a second (p99 5 ms) | 21,300 a second | 19,500 a second |
+| The same, while writes land every few ms (exact) | 230 a second | 842 a second | 12,400 a second |
+| The same, with `stale_ms=1000` | 10,900 a second | 12,400 a second | 17,100 a second |
+
+Databricks' Lakehouse//RT publishes "as low as 10 ms on smaller datasets" and "sub-100 millisecond
+latency at 12,000 queries per second on standard analytical benchmarks", read-only, in beta. Pondra is
+ahead on point reads, repeated dashboards and freshness: it serves rows milliseconds old, and it takes
+the writes itself. Lakehouse//RT is ahead on new, heavy analytical queries at high concurrency, which it
+claims to do on a cluster in under 100 ms. Pondra runs a new TPC-H query in 60 to 600 ms on two cores.
+
+## Small on disk and in memory
+
+| | Pondra | Spark 4.2 | Flink 2.3 |
+|---|---|---|---|
+| What you install | One binary of about 100 MB (96.7 MB in round 17, 101.2 MB in round 23, 34 MB compressed) | 485 MB of PySpark and a JVM | 353 MB of PyFlink and a JVM |
+| Start to first query | 0.02 to 0.07 s | 4.1 s | 5.2 to 5.4 s |
+| Idle memory | 44 to 49 MB | | |
+| Peak memory in the batch and streaming runs | 293 to 609 MB (1.3 GB at 2.7 M events a second sustained) | 0.7 to 1.5 GB | 1.2 to 3.1 GB |
+
+Memory under saturation is bounded by how many rows may wait in the log for tiering (`--backlog`,
+10 million rows by default). One node, 8 producers, 60 seconds, a 100,000-key aggregating view:
+
+| `--backlog` | Throughput | Acknowledged to visible in the view (median / p99) | Peak memory |
+|---|---|---|---|
+| 10 M (default) | 2.84 M events a second | 205 ms / 730 ms | 1.8 GB |
+| 2 M | 784,000 events a second | 49 ms / 234 ms | 1.4 GB |
+| 500,000 | 33,000 events a second | 18 ms / 36 ms | 0.35 GB |
+
+Lower it for less memory and lower latency. Raise it to absorb longer bursts. Queries have their own
+budget, `--memory-gb` (a third of the machine's memory by default), and sorts, aggregations and joins
+that need more spill to disk.
+
+## More than one machine
+
+<Aside type="caution">
+This is the part with the least evidence. Pondra has been tested as several processes on one machine,
+and on three GitHub-hosted machines joined over the public internet. Nothing has run on a cluster in
+one data centre yet.
+</Aside>
+
+- **On one machine, simulated R2:** where I/O latency dominates, 3 nodes ran 8 of 9 queries 1.2 to 4.3
+  times faster than one.
+- **Three GitHub runners over the public internet** (TPC-H SF10, links of 17 to 54 ms and 51 to 150
+  MB/s): every answer equal to one node's, but a cluster that spread every query took 46.6 s against 23.1
+  s for one node, because the shuffles cost about 15 ms per MB moved.
+- **Since then, a query spreads only when it pays.** It compares what its plan would move, at the
+  measured speed of the slowest link, with the time it would save. On the next runs:
+
+  | | One node | As the cluster decides | Spread anyway |
+  |---|---|---|---|
+  | Round 19's run | 15.7 s | 18.0 s (5 queries spread) | 39.5 s |
+  | Round 21's run | 21.7 s | 21.5 s (3 queries spread, 9 MB moved) | 38.9 s |
+
+  A cluster on a slow network is no slower than one node. It isn't faster either. Whether more machines
+  make Pondra faster is what the next multi-machine benchmark has to show.
+
+## Other numbers
+
+- **`cluster_by`:** with 8 million rows and 100,000 users on local disk, a query for one user ran 6.4
+  times faster and a range 11 times faster. A full scan ran at 0.6 times the speed.
+- **Two `cluster_by` columns** (Hilbert order), 4 million rows from Parquet: a filter on the second
+  column took 11.4 ms, against 21.9 ms unclustered and 23.3 ms sorted by the first column alone.
+- **A table of a million files** commits an entry of about 20 KB. A query over today skips 1,000,006 of
+  them in 12.9 ms.
+- **Tiering 8 million rows** takes 1.10 to 1.16 s. A bulk `INSERT` of 6 million rows from `pondra sql`
+  takes 1.3 s.
+- **A frame is one SQL statement:** over 10 million rows, 0.063 s against 0.065 s for the same SQL
+  written by hand.
+- **Python functions,** over 1 million rows: 15 million rows a second vectorized and 6.6 million rows a
+  second per row. A warm `CALL` of a Python procedure takes 2.4 ms over HTTP.
+- **SQL conformance:** 16,646 of 24,783 records (67.2%) of DataFusion's own sqllogictest pass through
+  Pondra on one node.
+
+## Measure it yourself
+
+Time your own data and your own hardware. Make a table with 2 million rows:
+
+```sql
+CREATE TABLE trips (id BIGINT, zone BIGINT, fare DOUBLE);
+INSERT INTO trips SELECT x AS id, x % 500 AS zone, (x % 97) * 0.5 AS fare FROM generate_series(1, 2000000) t(x);
+```
+
+Then time a query. Ask it twice: the second answer comes from the result cache, until the table
+changes. For a fair time, change the query each time, as this does with `id > n`:
+
+```python
+import time
+import pondra
+
+db = pondra.connect("http://localhost:8080")
+
+def milliseconds(sql):
+    start = time.perf_counter()
+    db.sql(sql).rows()
+    return (time.perf_counter() - start) * 1000
+
+query = "SELECT zone, sum(fare) AS total FROM trips WHERE id > {n} GROUP BY zone ORDER BY total DESC LIMIT 5"
+print(f"a new query:  {milliseconds(query.format(n=1)):7.1f} ms")
+print(f"a new query:  {milliseconds(query.format(n=2)):7.1f} ms")
+print(f"asked again:  {milliseconds(query.format(n=2)):7.1f} ms  (result cache)")
+```
+
+Write speed is the time to an acknowledgement. Lookups need a keyed table:
+
+```python
+import statistics
+
+db.sql("CREATE TABLE pings (n BIGINT)")
+db.sql("CREATE TABLE accounts (id BIGINT PRIMARY KEY, balance BIGINT)")
+db.sql("INSERT INTO accounts SELECT x AS id, 0 AS balance FROM generate_series(1, 100000) t(x)")
+db.sql("CHECKPOINT")
+
+def median_ms(work, times=200):
+    samples = []
+    for n in range(1, times + 1):
+        start = time.perf_counter()
+        work(n)
+        samples.append((time.perf_counter() - start) * 1000)
+    return statistics.median(samples)
+
+ack = median_ms(lambda n: db.append("pings", [{"n": n}]))
+lookup = median_ms(lambda n: db.lookup("accounts", n))
+print(f"append acknowledged: {ack:.2f} ms median")
+print(f"key lookup:          {lookup:.2f} ms median")
+```
+
+A node counts what it does. `pondra_object_requests_total` counts the writes, lists and deletes the
+lake's store was asked for, which is what a bucket bills:
+
+```bash
+curl -s localhost:8080/metrics | grep -E '^pondra_(queries_total|rows_in_total|object_requests_total)'
+```
+
+`EXPLAIN` shows a query's plan, and whether it spreads over the nodes:
+
+```sql
+EXPLAIN SELECT zone, sum(fare) FROM trips GROUP BY zone;
+```
+
+The repository has the benchmarks behind this page. Each prints its own numbers:
+
+```bash norun
+python3 tools/bench/tpch.py --data sf1        # TPC-H on Pondra, DuckDB and Spark
+python3 tools/bench/singlenode.py             # TPC-H against DuckDB, Polars, Daft and Bodo
+ENGINES=pondra,spark,flink python3 tools/bench/run.py batch 20000000   # batch, streaming and ETL
+python3 tools/bench/nexmark.py                # Nexmark q1, q2, q5, q7, q11, Pondra and Flink
+python3 tools/serve_bench.py --keys 2000000   # point lookups and dashboards: p50, p99, QPS
+python3 tools/freshness.py                    # who sees a write when
+python3 tools/kafka_bench.py                  # Kafka ingest throughput and latency
+python3 tools/cloud/bench.py --nodes …        # a cluster on several machines
+```
+
+They live in [`tools/`](https://github.com/alimardon123/pondra/tree/main/tools) in the repository.
+[Freshness and guarantees](/pondra/concepts/freshness-and-guarantees/) has the write and freshness
+numbers, and [the status report](https://github.com/alimardon123/pondra/blob/main/docs/prototype-status.md)
+has every round's measurements.

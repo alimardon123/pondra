@@ -21,7 +21,8 @@ use datafusion::sql::sqlparser::ast;
 use serde_json::{json as j, Value};
 use std::sync::Arc;
 
-/// `MERGE INTO t [AS a] USING s ON … WHEN …`, as SQL pieces.
+/// `MERGE INTO t [AS a] USING s ON … WHEN …`, as SQL pieces. Postgres's `UPDATE … FROM`,
+/// `DELETE … USING` and `INSERT … ON CONFLICT` are carried out as one too (`write::parse`).
 pub struct Merge {
     pub sql: String,    // the statement as written
     pub target: String, // as SQL names it (`write::object`)
@@ -29,6 +30,16 @@ pub struct Merge {
     source: String, // the table or subquery, with its alias, as written
     on: String,
     clauses: Vec<Clause>,
+    semi: bool, // DELETE … USING: a row matching several source rows is deleted once, not refused
+    upsert: Option<Upsert>, // INSERT … ON CONFLICT: its clauses once the table's columns are known
+}
+
+/// `INSERT INTO t [(columns)] query ON CONFLICT [(on)] DO NOTHING | DO UPDATE SET … [WHERE …]`.
+pub struct Upsert {
+    pub columns: Vec<String>,                               // none: the table's, in order
+    pub query: String,                                      // the rows
+    pub on: Vec<String>,                                    // none: the table's key
+    pub update: Option<(Vec<(String, String)>, Option<String>)>, // DO UPDATE's column = expression, WHERE (None: DO NOTHING)
 }
 
 struct Clause {
@@ -76,7 +87,48 @@ pub fn merge_of(m: &ast::Merge) -> Option<Merge> {
         };
         clauses.push(Clause { kind, when: c.predicate.as_ref().map(|p| p.to_string()), action });
     }
-    Some(Merge { sql: m.to_string(), target, alias, source: m.source.to_string(), on: m.on.to_string(), clauses })
+    Some(Merge { sql: m.to_string(), target, alias, source: m.source.to_string(), on: m.on.to_string(), clauses, semi: false, upsert: None })
+}
+
+/// `UPDATE t [AS a] SET … FROM s WHERE …` and `DELETE FROM t [AS a] USING s WHERE …` as the MERGE
+/// they are (`semi`: a DELETE's, which a row matching two source rows doesn't refuse); `sql`: the
+/// statement as written, which the leader parses again.
+pub fn merge_from(target: &ast::TableFactor, source: &ast::TableFactor, cond: Option<&ast::Expr>, action: &str, semi: bool, sql: String) -> Option<Merge> {
+    use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
+    let on = cond.map_or("true".to_string(), |c| c.to_string());
+    let merge = format!("MERGE INTO {target} USING {source} ON {on} WHEN MATCHED THEN {action}");
+    let ast::Statement::Merge(m) = Parser::parse_sql(&GenericDialect {}, &merge).ok()?.pop()? else { return None };
+    Some(Merge { sql, semi, ..merge_of(&m)? })
+}
+
+/// `INSERT … ON CONFLICT`, to be made a MERGE once the table is known (`Upsert::merge`).
+pub fn upsert_of(target: String, upsert: Upsert, sql: String) -> Merge {
+    let alias = target.rsplit('.').next().unwrap_or(&target).to_string();
+    Merge { sql, target, alias, source: String::new(), on: String::new(), clauses: vec![], semi: false, upsert: Some(upsert) }
+}
+
+impl Upsert {
+    /// The MERGE this is, for a table of these columns: a row whose `on` columns match one of the
+    /// table's updates it (DO UPDATE) or is skipped (DO NOTHING); the others are inserted.
+    fn merge(&self, meta: &TableMeta, m: &Merge) -> Result<Merge> {
+        let columns: Vec<String> = match self.columns.is_empty() {
+            true => meta.columns.iter().map(|(c, _)| c.clone()).filter(|c| c != "_deleted").collect(),
+            false => self.columns.clone(),
+        };
+        let on = if self.on.is_empty() { meta.key.clone() } else { self.on.clone() };
+        ensure!(!on.is_empty(), "INSERT … ON CONFLICT: name the columns a conflict is on (ON CONFLICT (id) …), or give {} a PRIMARY KEY", m.target);
+        ensure!(on.iter().all(|c| columns.contains(c)), "INSERT … ON CONFLICT ({}): the rows must give those columns", on.join(", "));
+        let (a, x) = (q(&m.alias), "excluded");
+        let source = format!("({}) AS {x} ({})", self.query, columns.iter().map(|c| q(c)).collect::<Vec<_>>().join(", "));
+        let on_sql = on.iter().map(|c| format!("{a}.{} = {x}.{}", q(c), q(c))).collect::<Vec<_>>().join(" AND ");
+        let insert = Clause { kind: Kind::NotMatched, when: None, action: Action::Insert(columns.clone(), columns.iter().map(|c| format!("{x}.{}", q(c))).collect()) };
+        let mut clauses = vec![];
+        if let Some((set, when)) = &self.update {
+            clauses.push(Clause { kind: Kind::Matched, when: when.clone(), action: Action::Update(set.clone()) });
+        }
+        clauses.push(insert);
+        Ok(Merge { sql: m.sql.clone(), target: m.target.clone(), alias: m.alias.clone(), source, on: on_sql, clauses, semi: false, upsert: None })
+    }
 }
 
 fn q(c: &str) -> String { format!("\"{}\"", c.replace('"', "\"\"")) }
@@ -194,17 +246,30 @@ fn part(all: &RecordBatch, meta: &TableMeta, prefix: &str, ids: bool) -> Result<
 }
 
 async fn merge(lake: &Lake, table: &str, meta: &TableMeta, m: &Merge, upto: u64) -> Result<(Vec<RecordBatch>, Vec<RecordBatch>)> {
+    let what = if m.upsert.is_some() { "INSERT … ON CONFLICT" } else { "MERGE" };
+    let built;
+    let m = match &m.upsert {
+        Some(u) => {
+            built = u.merge(meta, m)?;
+            &built
+        }
+        None => m,
+    };
     let (t, a, s, on) = (format!("{} AS {}", crate::write::sql_name(table), q(&m.alias)), q(&m.alias), &m.source, &m.on);
-    // Each target row takes at most one source row (else which one's values?).
-    let twice = format!("SELECT {a}.{} FROM {t} JOIN {s} ON {on} GROUP BY 1 HAVING count(*) > 1 LIMIT 1", q(ROW_ID));
-    let ctx = session(lake, &twice, upto).await?;
-    ensure!(ctx.sql(&twice).await?.count().await? == 0, "MERGE: a row of {table} matches more than one source row");
+    // Each target row takes at most one source row (else which one's values?). A DELETE … USING
+    // deletes a row once however many match it, as Postgres does.
+    if !m.semi {
+        let twice = format!("SELECT {a}.{} FROM {t} JOIN {s} ON {on} GROUP BY 1 HAVING count(*) > 1 LIMIT 1", q(ROW_ID));
+        let ctx = session(lake, &twice, upto).await?;
+        ensure!(ctx.sql(&twice).await?.count().await? == 0, "{what}: a row of {table} matches more than one source row");
+    }
     let (mut old, mut new) = (vec![], vec![]);
     for (i, c) in m.clauses.iter().enumerate() {
         // A row takes the first clause of its kind whose condition holds.
         let earlier: Vec<String> = m.clauses[..i].iter().filter(|e| e.kind == c.kind).map(|e| format!(" AND NOT coalesce(({}), false)", e.when.as_deref().unwrap_or("true"))).collect();
         let when = format!("coalesce(({}), false){}", c.when.as_deref().unwrap_or("true"), earlier.concat());
         let rest = match c.kind {
+            Kind::Matched if m.semi => format!("FROM {t} WHERE EXISTS (SELECT 1 FROM {s} WHERE {on}) AND {when}"),
             Kind::Matched => format!("FROM {t} JOIN {s} ON {on} WHERE {when}"),
             Kind::NotMatched => format!("FROM {s} WHERE NOT EXISTS (SELECT 1 FROM {t} WHERE {on}) AND {when}"),
             Kind::NotMatchedBySource => format!("FROM {t} WHERE NOT EXISTS (SELECT 1 FROM {s} WHERE {on}) AND {when}"),
@@ -253,6 +318,9 @@ async fn commit(lake: &Lake, seq: &Sequencer, table: &str, meta: &TableMeta, old
         None => None,
     };
     let new = one(new, ids.clone())?;
+    if let Some(n) = &new {
+        crate::defaults::check(meta, table, n)?; // (an UPDATE may not empty a NOT NULL column)
+    }
     let inserted = new.as_ref().and_then(|n| Some(n.column_by_name(ROW_ID)?.null_count())).unwrap_or(0); // (new rows: no id yet)
     let src = |p: &str| Src { producer: format!("sql:{job}{p}"), seq: 1, prev: None };
     let append = |table: &str, batch: RecordBatch, src: Src| Append { table: table.into(), src, batch, ack: tokio::sync::oneshot::channel().0 };

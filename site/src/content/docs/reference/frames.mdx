@@ -1,0 +1,377 @@
+---
+title: Frames
+description: Every method of a frame and every expression function, grouped, with Polars' names and an example for each group.
+sidebar:
+  order: 6
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+A **frame** is a query that hasn't run yet, in Polars' style. You make one with `db.table`,
+`db.sql` or `db.read_csv`, chain methods on it, and ask for the rows. The whole chain is one SQL
+statement, run by the node: `frame.sql` shows it. The methods use Polars' names, so Polars code
+moves over with few changes. For PySpark's names, see
+[`pondra.spark`](/pondra/guides/pyspark/).
+
+The examples on this page use two tables:
+
+```sql
+CREATE TABLE orders (id BIGINT, user_id BIGINT, item VARCHAR, qty INT, amount DOUBLE, ts TIMESTAMP);
+INSERT INTO orders VALUES
+  (1, 1, 'tea', 2, 7.0, TIMESTAMP '2026-09-01 10:00:00'),
+  (2, 1, 'cake', 1, 4.5, TIMESTAMP '2026-09-01 11:30:00'),
+  (3, 2, 'tea', 1, 3.5, TIMESTAMP '2026-09-02 09:15:00'),
+  (4, 3, 'coffee', 3, 9.0, TIMESTAMP '2026-09-02 14:45:00'),
+  (5, 2, 'cake', 2, 9.0, TIMESTAMP '2026-09-03 08:00:00');
+CREATE TABLE users (id BIGINT, name VARCHAR);
+INSERT INTO users VALUES (1, 'ann'), (2, 'bo'), (4, 'cy');
+```
+
+```python
+import pondra
+from pondra import col, lit, when
+
+db = pondra.connect("http://localhost:8080")
+orders = db.table("orders")
+users = db.table("users")
+
+top = (orders
+       .filter(col("amount") > 3)
+       .with_columns((col("amount") * 0.9).alias("net"))
+       .group_by("item")
+       .agg(col("net").sum().alias("total"), pondra.len().alias("n"))
+       .sort("total", descending=True)
+       .limit(2))
+print(top.sql)
+top.show()
+```
+
+```text
+WITH _2 AS (SELECT * FROM orders WHERE ("amount" > 3)),
+     _3 AS (SELECT *, ("amount" * CAST('0.9' AS DOUBLE)) AS "net" FROM _2),
+     _4 AS (SELECT "item", sum("net") AS "total", count(*) AS "n" FROM _3 GROUP BY 1)
+SELECT * FROM _4 ORDER BY "total" DESC NULLS FIRST LIMIT 2
++------+--------------------+---+
+| item | total              | n |
++------+--------------------+---+
+| cake | 12.149999999999999 | 2 |
+| tea  | 9.45               | 2 |
++------+--------------------+---+
+```
+
+A string that isn't a plain column name is SQL, so you can mix the two: `filter("amount > 5 AND
+item LIKE 't%'")`, `with_columns("qty * amount AS total")`, `agg("sum(amount) AS s")`.
+
+## Sources
+
+| Call | Meaning |
+|---|---|
+| `db.table(name)` | a table or view |
+| `db.sql(query, **names)` | a query. Names in it can be frames or pandas, Polars and Arrow data |
+| `db.read_parquet`, `db.read_csv`, `db.read_json`, `db.read_delta`, `db.read_iceberg` | files and other engines' tables, see [names](/pondra/reference/names/) |
+| `db.from_arrow(data)` | rows of this machine (also `from_pandas`, `from_polars`, `from_rows`) |
+| `pondra.concat(frames, how="vertical")` | frames one after another: by position (`"vertical"`), or by name with missing columns null (`"diagonal"`) |
+
+## Properties
+
+| Member | Meaning |
+|---|---|
+| `frame.sql` | the one SQL statement the frame is: each step is a CTE |
+| `frame.columns` | the column names |
+| `frame.schema` | a pyarrow schema. The statement is planned, not run |
+
+## Rows and columns
+
+| Method | Meaning |
+|---|---|
+| `select(*exprs, **named)` | pick or compute columns. A string is a column name, or SQL if it isn't a plain name |
+| `with_columns(*exprs, **named)` | add columns, or replace those with the same name. A SQL snippet needs `AS name`. Also `with_column` |
+| `filter(*predicates)` | keep the rows where every predicate holds. Also `where` |
+| `drop(*columns)` | remove columns |
+| `rename(mapping)` | rename columns: `{"old": "new"}` |
+| `cast(dtypes)` | change types: `{"qty": "BIGINT"}`. A type is SQL's name, a Python type (`int`, `float`, `str`) or a Polars-style name (`int64`, `float64`, `utf8`) |
+| `sort(by, *more, descending=False, nulls_last=False)` | order the rows; `descending` and `nulls_last` take a list for one flag per key |
+| `limit(n=5)` | the first `n` rows. Also `head` |
+| `unique(subset=None, keep="any")` | distinct rows, or one row per value of the `subset` columns |
+| `sample(n=None, fraction=None, seed=None)` | `n` random rows (`ORDER BY random() LIMIT n`), or each row with probability `fraction`. `seed` is not used |
+| `fill_null(value)` | replace nulls in every column of the value's kind: numbers, text, booleans, dates |
+| `drop_nulls(subset=None)` | drop rows with a null in the `subset` columns, or in any column |
+
+```python
+print(orders.select("id", "item", double=col("qty") * 2).sort("id").limit(2).rows())
+print(orders.drop("ts", "user_id").rename({"qty": "quantity"}).cast({"quantity": "BIGINT"}).sort("id").head(2).rows())
+print(orders.unique(["item"]).sort("item").select("item").rows())
+```
+
+```text
+[{'id': 1, 'item': 'tea', 'double': 4}, {'id': 2, 'item': 'cake', 'double': 2}]
+[{'id': 1, 'item': 'tea', 'quantity': 2, 'amount': 7.0}, {'id': 2, 'item': 'cake', 'quantity': 1, 'amount': 4.5}]
+[{'item': 'cake'}, {'item': 'coffee'}, {'item': 'tea'}]
+```
+
+A sort is kept through the steps after it that keep the order, so `sort(...).select(...)` stays
+sorted.
+
+## Aggregation
+
+`group_by(*keys, maintain_order=False)` gives a `GroupBy`.
+
+| Method | Meaning |
+|---|---|
+| `group_by(...).agg(*aggs, **named)` | one row per key, with the aggregates. A string is SQL: `agg("sum(amount) AS s")` |
+| `group_by(...).len(name="len")` | the number of rows in each group |
+| `pondra.len()` | `count(*)`, for `agg` or `select` |
+
+```python
+print(orders.group_by("item").len().sort("item").rows())
+per_day = orders.group_by(col("ts").dt.truncate("1d").alias("day")).agg(
+    pondra.sum("amount").alias("total"), "count(*) AS n")
+per_day.sort("day").show()
+```
+
+```text
+[{'item': 'cake', 'len': 2}, {'item': 'coffee', 'len': 1}, {'item': 'tea', 'len': 2}]
++---------------------+-------+---+
+| day                 | total | n |
++---------------------+-------+---+
+| 2026-09-01T00:00:00 | 11.5  | 2 |
+| 2026-09-02T00:00:00 | 12.5  | 2 |
+| 2026-09-03T00:00:00 | 9.0   | 1 |
++---------------------+-------+---+
+```
+
+`sum` over `DOUBLE` gives the same answer in any order, as in [SQL](/pondra/reference/functions/#exact-sums).
+
+## Joins
+
+| Method | Meaning |
+|---|---|
+| `join(other, on=None, how="inner", left_on=None, right_on=None, suffix="_right")` | join two frames. `how` is `inner`, `left`, `right`, `full` (or `outer`), `cross`, `semi` or `anti`. The key comes once for `inner`, `left` and `right`; `full` and `cross` keep both. A column of the right side with the same name as one on the left gets `suffix` |
+| `join_asof(other, on=None, left_on=None, right_on=None, by=None, by_left=None, by_right=None, strategy="backward", suffix="_right")` | each row with the right side's nearest earlier (`"backward"`) or later (`"forward"`) row by `on`, within `by`. This is SQL's `ASOF JOIN` |
+
+```python
+joined = orders.join(users, left_on="user_id", right_on="id", how="left")
+print(joined.sort("id").select("id", "name").rows())
+print(orders.join(users, left_on="user_id", right_on="id", how="anti").select("id").rows())
+```
+
+```text
+[{'id': 1, 'name': 'ann'}, {'id': 2, 'name': 'ann'}, {'id': 3, 'name': 'bo'}, {'id': 4, 'name': None}, {'id': 5, 'name': 'bo'}]
+[{'id': 4}]
+```
+
+## Results
+
+Nothing runs until you ask for rows.
+
+| Method | Meaning |
+|---|---|
+| `collect()` | a pyarrow Table. Also `to_arrow()` |
+| `to_pandas()` | a pandas DataFrame |
+| `to_polars()` | a Polars DataFrame |
+| `rows()` | a list of dicts. Works without pyarrow |
+| `item()` | the one value of a one-row, one-column answer |
+| `show(n=20)` | print the first `n` rows as a text table |
+| `explain()` | Pondra's plan, and whether it would spread over the nodes |
+| `watch()` | for a table or materialized view: its new rows as they commit |
+
+```python
+print(orders.select(pondra.len().alias("n")).item())
+print(orders.explain().splitlines()[0])
+```
+
+```text
+5
+TableScan: orders projection=[id, user_id, item, qty, amount, ts]
+```
+
+## Back to SQL, and writes
+
+| Method | Meaning |
+|---|---|
+| `to_view(name, temporary=False, materialized=False, replace=None, **options)` | save the frame as a view others read by name. `materialized=True` keeps it up to date, and `options` are a materialized view's: `window`, `size_secs`, and the rest of [table options](/pondra/reference/table-options/#materialized-views). `temporary=True` keeps it to this connection |
+| `write_table(name, mode="create")` | rows into a table: `create` (`CREATE TABLE … AS`), `append` (`INSERT … SELECT`), `overwrite` (a new table in its place) |
+| `write_parquet(path, partition_by=None, mode=None)` | Parquet files: a file, or a folder if `path` ends in `/` or `partition_by` names columns |
+| `write_csv(path, separator=None, include_header=True, partition_by=None, mode=None)` | CSV files |
+| `write_json(path, partition_by=None, mode=None)` | JSON lines |
+| `write_delta(target, mode="error")` | a Delta table in a folder |
+| `write_iceberg(target, mode="error")` | an Iceberg table in a folder |
+| `update(set, where=None)` | `UPDATE` the table this frame is (`db.table(name)`) |
+| `delete(where=None)` | `DELETE` from it |
+| `merge(source, on, source_alias="s", target_alias="t")` | `MERGE`, built as Delta Lake's builder is |
+
+`sink_parquet`, `sink_csv`, `sink_ndjson` and `write_ndjson` are Polars' names for the file
+writers. For the files, `mode` is `"append"` or `"overwrite"`; without it the folder must be empty.
+For Delta and Iceberg, `mode` is `"error"` (refuse if the folder holds a table), `"append"`,
+`"overwrite"` or `"ignore"`. A path on this machine is written only by a node that
+`pondra.local` started; a URL needs an admin token and a secret.
+
+`update`, `delete` and `merge` change a table, so call them on `db.table(name)`. The `merge`
+builder has these steps, then `run()`:
+
+| Step | Meaning |
+|---|---|
+| `when_matched_update(set=None, predicate=None)` | update matched rows: `{"amount": col("s.amount")}` (`s` is the source, `t` the target) |
+| `when_matched_update_all(predicate=None)` | update every column the source shares |
+| `when_matched_delete(predicate=None)` | delete matched rows |
+| `when_not_matched_insert(values=None, predicate=None)` | insert unmatched source rows; without `values`, every column the two share. Also `when_not_matched_insert_all` |
+| `when_not_matched_by_source_delete(predicate=None)` | delete target rows the source doesn't have |
+| `run()` | run it. Also `execute()` |
+
+```python
+big = orders.filter(col("amount") > 5).to_view("big_orders")
+print(big.sort("id").select("id").rows())
+
+print(orders.write_table("orders_copy"))
+copy = db.table("orders_copy")
+print(copy.update({"qty": col("qty") + 1}, where=col("id") == 1))
+print(copy.delete(where=col("id") == 5))
+changes = db.from_arrow([{"id": 1, "amount": 100.0}, {"id": 9, "amount": 1.0}])
+print(copy.merge(changes, on="id")
+          .when_matched_update({"amount": col("s.amount")})
+          .when_not_matched_insert({"id": col("s.id"), "amount": col("s.amount")})
+          .run())
+print(copy.sort("id").select("id", "qty", "amount").rows())
+```
+
+```text
+[{'id': 1}, {'id': 4}, {'id': 5}]
+{'rows': 5}
+{'rows': 1, 'updated': 1, 'deleted': 0, 'inserted': 0}
+{'rows': 1, 'updated': 0, 'deleted': 1, 'inserted': 0}
+{'rows': 2, 'updated': 1, 'deleted': 0, 'inserted': 1}
+[{'id': 1, 'qty': 3, 'amount': 100.0}, {'id': 2, 'qty': 1, 'amount': 4.5}, {'id': 3, 'qty': 1, 'amount': 3.5}, {'id': 4, 'qty': 3, 'amount': 9.0}, {'id': 9, 'qty': None, 'amount': 1.0}]
+```
+
+## Expressions
+
+An expression is a column or a computation on columns. `col("amount") * 0.9` is one. Methods
+that take an expression take a plain value or a SQL string too.
+
+| Function | Meaning |
+|---|---|
+| `col(name)` | a column: `col("amount")`, `col("s.amount")` for a column of the table called `s`, `col("*")` for all |
+| `lit(value)` | a constant |
+| `sql_expr(sql)` | a SQL expression as it is, with `AS name` if you want a name |
+| `when(condition).then(value).otherwise(value)` | `CASE WHEN`; chain more `.when(…).then(…)` before `.otherwise` |
+| `coalesce(*exprs)` | the first that isn't null |
+| `concat_str(exprs, separator="")` | join text |
+| `all()` | every column, `col("*")` |
+| `len()` | `count(*)` |
+| `fn.name(*args)` | call any SQL function, or one of the lake's own: `pondra.fn.slug(col("title"))`. `pondra.fn("ops.slug", x)` for a function in a schema |
+| `sum(name)`, `mean`, `min`, `max`, `count`, `n_unique`, `median`, `first`, `last` | the aggregate of a column, by name: `pondra.sum("amount")` |
+
+Operators: `+ - * %`, `/` (always a true division, as a float), `//` (floor of that division, also
+a float), `**`, `== != < <= > >=`, `&`, `|`, `~`, `abs()` and `-x`. A Python comparison needs
+parentheses around each side of `&` and `|`.
+
+| Method | Meaning |
+|---|---|
+| `alias(name)` | name the result |
+| `cast(dtype)` | change the type |
+| `is_null()`, `is_not_null()`, `is_nan()` | tests |
+| `is_in(values)` | in a list, or in a frame's first column |
+| `is_between(lower, upper, closed="both")` | a range; `closed` is `both`, `left`, `right` or `none` |
+| `fill_null(value)`, `fill_nan(value)` | replace nulls or NaNs |
+| `not_()` | logical not |
+| `abs()`, `sqrt()`, `exp()`, `log(base=e)`, `floor()`, `ceil()` | math |
+| `round(decimals=0, mode="half_to_even")` | Polars' rounding: a half goes to the even neighbour, where SQL's `round` goes away from zero |
+| `clip(lower=None, upper=None)` | limit to a range; null stays null |
+| `sum()`, `mean()`, `min()`, `max()`, `count()`, `median()`, `first()`, `last()` | aggregates |
+| `n_unique()` | distinct values, counting null as a value, as Polars does |
+| `std(ddof=1)`, `var(ddof=1)` | sample statistics; `ddof=0` for the population's |
+| `quantile(q)` | an approximate quantile |
+| `any()`, `all()` | boolean aggregates |
+
+```python
+print(orders.filter(col("item").is_in(["tea", "cake"]), col("amount").is_between(4, 8)).select("id").sort("id").rows())
+print(orders.with_columns(size=when(col("qty") > 1).then("big").otherwise("small")).sort("id").select("id", "size").limit(2).rows())
+print(orders.select(pondra.sum("amount").alias("total"), pondra.mean("amount").alias("mean"), pondra.n_unique("item").alias("items")).rows())
+```
+
+```text
+[{'id': 1}, {'id': 2}]
+[{'id': 1, 'size': 'big'}, {'id': 2, 'size': 'small'}]
+[{'total': 33.0, 'mean': 6.6, 'items': 3}]
+```
+
+### Windows
+
+`over(partition_by=None, order_by=None, descending=False)` computes an expression per group of
+rows, as SQL's `OVER (PARTITION BY … ORDER BY …)`. These methods are for it:
+
+| Method | Meaning |
+|---|---|
+| `shift(n=1)` | the value `n` rows before (`n` negative: after) |
+| `cum_sum()` | the running total, in the `order_by` order |
+| `rank(method="average", descending=False)` | rank by the column's values. `method` is `average`, `min`, `max`, `dense` or `ordinal` |
+
+```python
+window = orders.with_columns(
+    prev=col("amount").shift(1).over(order_by="id"),
+    running=col("amount").cum_sum().over(order_by="id"),
+    rank=col("amount").rank("dense", descending=True).over("item"),
+)
+window.sort("id").select("id", "prev", "running", "rank").show()
+```
+
+```text
++----+------+---------+------+
+| id | prev | running | rank |
++----+------+---------+------+
+| 1  |      | 7.0     | 1    |
+| 2  | 7.0  | 11.5    | 2    |
+| 3  | 4.5  | 15.0    | 2    |
+| 4  | 3.5  | 24.0    | 1    |
+| 5  | 9.0  | 33.0    | 1    |
++----+------+---------+------+
+```
+
+### Text: `.str`
+
+| Method | Meaning |
+|---|---|
+| `to_lowercase()`, `to_uppercase()` | change case |
+| `len_chars()`, `len_bytes()` | length |
+| `contains(pattern, literal=False)` | a regular expression matches; `literal=True` for plain text |
+| `starts_with(prefix)`, `ends_with(suffix)` | test |
+| `replace(pattern, value, literal=False)`, `replace_all(...)` | replace the first match, or every match |
+| `slice(offset, length=None)` | part of the text, from 0 |
+| `strip_chars(characters=None)` | trim whitespace, or the given characters |
+| `split(by)` | split into a list |
+| `to_date(format=None)`, `to_datetime(format=None)` | parse text as a date or timestamp |
+
+### Dates and times: `.dt`
+
+| Method | Meaning |
+|---|---|
+| `year()`, `month()`, `day()`, `hour()`, `minute()`, `second()`, `quarter()`, `ordinal_day()` | a part, as a whole number |
+| `weekday()` | Monday is 1, Sunday is 7 |
+| `date()` | the date part |
+| `truncate(every)` | round down to the start of `every`: `"1h"`, `"15m"`, `"1d"`, `"1mo"`. Units are `us ms s m h d w mo q y` |
+| `strftime(format)` | format as text |
+| `epoch(time_unit="us")` | since 1970: `"s"`, `"ms"`, `"us"` or `"ns"` |
+
+```python
+parts = orders.select(
+    col("item").str.to_uppercase().alias("upper"),
+    col("ts").dt.strftime("%Y-%m-%d").alias("day"),
+    col("ts").dt.hour().alias("hour"),
+).sort("day", "hour")
+parts.limit(3).show()
+```
+
+```text
++-------+------------+------+
+| upper | day        | hour |
++-------+------------+------+
+| TEA   | 2026-09-01 | 10   |
+| CAKE  | 2026-09-01 | 11   |
+| TEA   | 2026-09-02 | 9    |
++-------+------------+------+
+```
+
+<Aside type="caution">
+`//` on whole numbers gives a float (`col("qty") // 2` is `0.0`, not `0`), where Polars gives a
+whole number. `cast` the result to `BIGINT` if you need one.
+</Aside>

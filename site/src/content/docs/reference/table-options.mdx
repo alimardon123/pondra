@@ -1,0 +1,328 @@
+---
+title: Table options
+description: Every option of CREATE TABLE, CREATE MATERIALIZED VIEW and CREATE FUNCTION, with its values, its default and an example.
+sidebar:
+  order: 3
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Options go in a `WITH (name = value, …)` clause. A value is a quoted string or a number, and a
+list is one string with commas: `cluster_by = 'user_id, url'`. Names aren't case sensitive.
+
+## Tables
+
+`CREATE TABLE t (…) WITH (…)`. Which kind of table you get depends on the key:
+
+- **Append table**: no key. Every row is kept.
+- **Keyed table** (upsert table): a `PRIMARY KEY`. A new row with an existing key replaces the old one.
+- **Merge table**: a key and `merge`. Rows with the same key combine.
+
+| Option | Value | For | Meaning |
+|---|---|---|---|
+| `PRIMARY KEY (a, b)` | columns | keyed, merge | the key, as a column or table constraint; not a `WITH` option |
+| `publish` | `'delta'`, `'iceberg'` or `'delta,iceberg'` | all | also write the table as Delta Lake or Iceberg, for other engines. Default: none, or what `--publish` says |
+| `cluster_by` | `'col'` or `'col1, col2'` | all | sort every file by these columns, so a filter on them skips most of a file; two or more follow a Hilbert curve |
+| `partition_by` | `'col'`, or `'year(col)'`, `'month(col)'`, `'day(col)'`, `'hour(col)'` | all | keep one partition per file; the unit forms need a timestamp or date column |
+| `merge` | `'col:func, …'` with `func` one of `sum`, `count`, `min`, `max` | merge | how each non-key column combines |
+| `ttl` | `'column:seconds'` | keyed | a row whose timestamp or date column is older than that many seconds is gone |
+| `order_by` | `'column'` | keyed | the row with the greatest value of this column wins, not the last to arrive |
+
+`ALTER TABLE t SET (…)` changes `publish`, `cluster_by`, `ttl` and `order_by` later. Files written
+from then on follow them, and files written before keep their order until they are merged.
+`partition_by` can't change, because each file holds one partition. `merge` can't change either.
+
+### Append table
+
+```sql
+CREATE TABLE clicks (ts TIMESTAMP, user_id BIGINT, url VARCHAR)
+WITH (publish = 'delta,iceberg', cluster_by = 'user_id', partition_by = 'day(ts)');
+INSERT INTO clicks VALUES (TIMESTAMP '2026-01-01 10:00:00', 1, '/a'), (TIMESTAMP '2026-01-02 10:00:00', 2, '/b');
+SELECT count(*) AS n FROM clicks;
+ALTER TABLE clicks SET (cluster_by = 'user_id, url', publish = 'iceberg');
+```
+
+### Keyed table
+
+`order_by` lets rows arrive out of order: below, the row with the later `seen` stays, even though
+the older one is written last. `ttl` drops a row an hour after its `seen`.
+
+```sql
+CREATE TABLE sessions (user_id BIGINT PRIMARY KEY, seen TIMESTAMP, page VARCHAR)
+WITH (order_by = 'seen', ttl = 'seen:3600');
+INSERT INTO sessions VALUES (1, now(), '/home');
+INSERT INTO sessions VALUES (1, TIMESTAMP '2000-01-01 00:00:00', '/old');
+SELECT user_id, page FROM sessions;
+```
+
+```text
+user_id  page
+1        /home
+```
+
+A keyed table also has a hidden `_deleted` column, so `DELETE` works. `SELECT *` leaves it out.
+
+### Merge table
+
+Every column that isn't part of the key needs a function. `sum` and `count` both add: each row
+you write carries its own count, as `count(*)` does in a view's `GROUP BY`.
+
+```sql
+CREATE TABLE totals (region VARCHAR PRIMARY KEY, amount DOUBLE, n BIGINT, biggest DOUBLE)
+WITH (merge = 'amount:sum, n:count, biggest:max');
+INSERT INTO totals VALUES ('eu', 5.0, 1, 5.0);
+INSERT INTO totals VALUES ('eu', 3.0, 1, 3.0), ('us', 2.0, 1, 2.0);
+SELECT * FROM totals ORDER BY region;
+```
+
+```text
+region  amount  n  biggest
+eu      8.0     2  5.0
+us      2.0     1  2.0
+```
+
+<Aside type="caution">
+`CREATE TABLE` ignores an option name it doesn't know, so `cluser_by` is accepted and does
+nothing. A merge table with a non-key column that has no function is accepted too, and then fails
+when you read it with a planner error about `GROUP BY`. Name every non-key column in `merge`.
+</Aside>
+
+What Pondra refuses, by option:
+
+| You write | Error |
+|---|---|
+| `merge` without a key | `a merge table needs a key` |
+| `merge = 'b:avg'` | `merge functions: sum, count, min, max` |
+| `publish = 'parquet'` | `publish formats: delta, iceberg` |
+| `cluster_by` on a column the table lacks | `cluster_by: columns of the table` |
+| `partition_by = 'week(ts)'` | `partition_by: a column, or year/month/day/hour(a timestamp column)` |
+| `ttl` on a table with no key, or a column that isn't a timestamp or date | `ttl: a timestamp or date column of a keyed table` |
+| `order_by` naming a key column | `order_by: a column of the table, not its key` |
+| `ALTER TABLE t SET (partition_by = …)` | `partition_by can't change` |
+
+## Materialized views
+
+`CREATE MATERIALIZED VIEW v [WITH (…)] AS SELECT …`. Without options, the view is kept current
+with every row its table takes in. The options make it emit what is final: windows, sessions, and
+joins of two streams. Time is in seconds. An option the view doesn't know is an error that lists
+the ones it does.
+
+| Option | Value | Default | Meaning |
+|---|---|---|---|
+| `window` | column name | | the view's window-start column, made by `date_bin(…)` in `GROUP BY`; each window goes to `{view}_final` once, when it is final |
+| `size_secs` | seconds | 60 | how long a window is |
+| `slide_secs` | seconds | none | a new window every this many seconds: a divisor of `size_secs`, less than it. Make the view's `date_bin` this long |
+| `lateness_secs` | seconds | 0 | how far out of order a row may arrive and still count |
+| `session` | column name | | the source's event-time column: the view groups each key's rows into sessions |
+| `gap_secs` | seconds | 1800 | a session ends when its key has no row for this long |
+| `join` | `'streams'` | | pair rows of two tables as they arrive on either side |
+| `time` | `'col'` or `'col1, col2'` | | the event-time column both tables have, or one for each table |
+| `within_secs` | seconds | none | pair a row only with rows this close to it in time; needs `time` |
+| `start` | `'earliest'` or `'latest'` | `'earliest'` | for a view over a Kafka topic: where to start reading |
+
+A window closes when the **watermark** passes its end. The watermark is the newest event time in
+the source, less `lateness_secs`. A row that arrives after its window closed still updates the
+view, but not what was emitted.
+
+### Tumbling and sliding windows
+
+```sql
+CREATE TABLE readings (ts TIMESTAMP, sensor VARCHAR, temp DOUBLE);
+CREATE MATERIALIZED VIEW per_minute WITH (window = 'w', size_secs = 60, lateness_secs = 10) AS
+  SELECT date_bin(INTERVAL '1 minute', ts) AS w, sensor, sum(temp) AS total, count(*) AS n
+  FROM readings GROUP BY 1, 2;
+INSERT INTO readings VALUES
+  (TIMESTAMP '2026-01-01 10:00:05', 'a', 20.0), (TIMESTAMP '2026-01-01 10:00:40', 'a', 22.0),
+  (TIMESTAMP '2026-01-01 10:01:30', 'a', 30.0), (TIMESTAMP '2026-01-01 10:03:00', 'a', 25.0);
+SELECT * FROM per_minute ORDER BY w;
+```
+
+The view has a row for every window, still open or not. `per_minute_final` has the ones that are
+final, a moment after the watermark passes them: here the first two, because the 10:03 row moved
+the watermark past them.
+
+```bash
+sleep 5   # windows close a moment after the watermark passes them
+```
+
+```sql
+SELECT w, sensor, total, n FROM per_minute_final ORDER BY w;
+```
+
+```text
+w                    sensor  total  n
+2026-01-01T10:00:00  a       42.0   2
+2026-01-01T10:01:00  a       30.0   1
+```
+
+A view can't take `avg`, because partial results can't be combined. Use `sum` and `count`, and
+divide when you read.
+
+For sliding windows, add `slide_secs`, and make the view's `date_bin` that long. This makes a
+five-minute window every minute, and each row is added once, not once per window:
+
+```sql
+CREATE TABLE visits (ts TIMESTAMP, visitor VARCHAR);
+CREATE MATERIALIZED VIEW per_five WITH (window = 'w', size_secs = 300, slide_secs = 60) AS
+  SELECT date_bin(INTERVAL '1 minute', ts) AS w, visitor, count(*) AS n
+  FROM visits GROUP BY 1, 2;
+```
+
+### Session windows
+
+A session is one key's rows with no gap of `gap_secs` between them. The view gets a row for each
+session, once, with `session_start` and `session_end` (the last row plus the gap). The view's
+`GROUP BY` columns are the keys.
+
+```sql
+CREATE TABLE pageviews (visitor VARCHAR, ts TIMESTAMP, amount BIGINT);
+CREATE MATERIALIZED VIEW visitor_sessions WITH (session = 'ts', gap_secs = 30, lateness_secs = 5) AS
+  SELECT visitor, count(*) AS n, sum(amount) AS spent FROM pageviews GROUP BY visitor;
+INSERT INTO pageviews VALUES
+  ('a', TIMESTAMP '2026-01-01 10:00:00', 2), ('a', TIMESTAMP '2026-01-01 10:00:10', 3),
+  ('a', TIMESTAMP '2026-01-01 10:05:00', 1), ('b', TIMESTAMP '2026-01-01 10:10:00', 1);
+```
+
+```bash
+sleep 5   # sessions close a moment after the watermark passes them
+```
+
+```sql
+SELECT visitor, n, spent, session_start, session_end FROM visitor_sessions ORDER BY visitor, session_start;
+```
+
+```text
+visitor  n  spent  session_start        session_end
+a        2  5      2026-01-01T10:00:00  2026-01-01T10:00:40
+a        1  1      2026-01-01T10:05:00  2026-01-01T10:05:30
+```
+
+The rows at 10:05 and 10:10 closed the sessions before them: `b`'s session is still open.
+
+A row that falls inside a session already emitted is late, and is left out.
+
+### Stream joins
+
+A row of either table pairs with the other table's rows when it arrives, and with those that
+arrive after it. Each pair is made once. `within_secs` bounds how far apart in time two rows may be.
+
+```sql
+CREATE TABLE orders (id BIGINT, amount DOUBLE, ts TIMESTAMP);
+CREATE TABLE payments (order_id BIGINT, paid DOUBLE, ts TIMESTAMP);
+CREATE MATERIALIZED VIEW paid WITH (join = 'streams', time = 'ts', within_secs = 600) AS
+  SELECT o.id, o.amount, p.paid
+  FROM orders o JOIN payments p ON o.id = p.order_id AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '10 minutes';
+INSERT INTO orders VALUES (1, 9.5, TIMESTAMP '2026-01-01 10:00:00');
+INSERT INTO payments VALUES (1, 9.5, TIMESTAMP '2026-01-01 10:02:00');
+```
+
+```bash
+sleep 5   # the leader pairs rows just after each commit
+```
+
+```sql
+SELECT id, amount, paid FROM paid;
+```
+
+```text
+id  amount  paid
+1   9.5     9.5
+```
+
+### A topic as a table
+
+A view over another Kafka cluster's topic (a lake attached with `TYPE kafka`) is filled from the
+records as they arrive, once each, and survives restarts. It takes one option, `start`. The
+cluster needs a secret for its address. This example reads the node's own Kafka port, as a
+cluster you could have anywhere.
+
+```sql
+CREATE TABLE menu (id BIGINT, name VARCHAR);
+INSERT INTO menu VALUES (1, 'tea'), (2, 'cake');
+CREATE SECRET local_kafka (TYPE kafka, SECURITY_PROTOCOL 'PLAINTEXT', SCOPE 'kafka://127.0.0.1:9092');
+ATTACH 'kafka://127.0.0.1:9092' AS k (TYPE kafka);
+CREATE MATERIALIZED VIEW menu_in WITH (start = 'earliest') AS
+  SELECT json_get_int(value, 'id') AS id, json_get_str(value, 'name') AS name FROM k.menu;
+```
+
+```bash
+sleep 10   # the feed reads the topic in the background
+```
+
+```sql
+SELECT id, name FROM menu_in ORDER BY id;
+```
+
+```text
+id  name
+1   tea
+2   cake
+```
+
+## Functions and procedures
+
+`CREATE FUNCTION f(…) RETURNS type LANGUAGE python WITH (…) AS $$ … $$`. Procedures take
+`packages`, `entry` and `timeout`. The Postgres words `STRICT`, `IMMUTABLE`, `STABLE` and
+`VOLATILE` work too, in place of `strict` and `volatility`. A SQL function takes no options.
+
+| Option | Value | Default | Meaning |
+|---|---|---|---|
+| `vectorized` | `true` | `false` | call the function once per batch, with `pyarrow` arrays in and out, not once per row |
+| `strict` | `true` | `false` | a `NULL` argument gives `NULL` without calling it |
+| `volatility` | `'immutable'`, `'stable'` or `'volatile'` | `'volatile'` | a query calling a volatile Python function is never answered from the result cache |
+| `packages` | `'requests, jinja2'` | none | packages the code needs; each node installs them once |
+| `entry` | function name | none | the body is a module, and this function of it runs |
+| `timeout` | seconds | 60 for a function; none for a procedure | how long one call (a function: one batch) may take before its worker is stopped |
+| `cache` | `'10 minutes'`, `'30 seconds'` | none | reuse an answer for the same arguments this long, so an API or a model isn't called again |
+
+`vectorized`, `cache` and `strict` are for functions only. A Python function says what it returns,
+in `RETURNS type` or `RETURNS TABLE (…)`.
+
+```sql
+CREATE FUNCTION double_all(x BIGINT) RETURNS BIGINT LANGUAGE python WITH (vectorized = true) AS $$
+import pyarrow.compute as pc
+return pc.multiply(x, 2)
+$$;
+
+CREATE FUNCTION shout(t VARCHAR) RETURNS VARCHAR LANGUAGE python WITH (entry = 'loud', strict = true) AS $$
+def loud(t):
+    return t.upper() + '!'
+$$;
+
+CREATE FUNCTION quick(n BIGINT) RETURNS BIGINT LANGUAGE python WITH (timeout = 1) AS $$
+import time
+time.sleep(n)
+return n
+$$;
+
+CREATE FUNCTION stamp() RETURNS DOUBLE LANGUAGE python WITH (cache = '1 minute') AS $$
+import time
+return time.time()
+$$;
+
+SELECT double_all(21) AS v, shout('tea') AS s, shout(NULL) AS n, quick(0) AS q, stamp() = stamp() AS same;
+```
+
+```text
+v   s     n     q  same
+42  TEA!  NULL  0  true
+```
+
+`quick(3)` would stop at one second with `it took longer than 1 s, its limit (the worker was
+stopped)`.
+
+## The same options over HTTP
+
+`POST /tables/{name}` takes a table as JSON, with the same options as keys: `columns` (pairs of a
+name and an Arrow type), `key` (a list), `merge` (an object of column to function), `publish` and
+`cluster_by` (lists), `partition_by`, `ttl` and `order_by` (strings).
+`POST /views/{name}` takes the view's SQL as the body and its options as query parameters. See
+[HTTP](/pondra/reference/http/).
+
+```bash
+curl -s -X POST localhost:8080/tables/points -d '{"columns": [["id", "Int64"], ["seen", "Timestamp(Microsecond, None)"], ["label", "Utf8"]], "key": ["id"], "order_by": "seen", "publish": ["iceberg"]}'
+curl -s -X POST 'localhost:8080/views/readings_per_hour?window=w&size_secs=3600' -d "SELECT date_bin(INTERVAL '1 hour', ts) AS w, sum(temp) AS total FROM readings GROUP BY 1"
+```
+
+From Python, `db.view("name", "SELECT …", materialized=True, window="w", size_secs=60)` sends the
+same options.

@@ -1,0 +1,197 @@
+---
+title: Notebooks
+description: Use Pondra in Jupyter with a node of your own, SQL cells, frames that display as tables, and pandas and Polars on either side.
+sidebar:
+  order: 15
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+In a notebook, Pondra is the [Python client](/pondra/guides/dataframes/): a lake on your laptop or a
+node somewhere else, SQL cells that see your variables, and frames that display as tables. There is
+nothing to configure. `pip install pondra` brings the client and the `pondra` binary, and
+`pip install jupyterlab` brings the notebook if you don't have one.
+
+## Start a node from a cell
+
+`pondra.local(folder)` starts a node on a lake in that folder, here, and connects to it. It stops when
+the kernel does or when you call `close()`, and the lake stays. The first cell of most notebooks:
+
+```python
+import pondra
+
+db = pondra.local("notebook-lake")
+```
+
+`pondra.local()` on its own uses `./lake`. To use a node that is already running, on a server or in a
+cluster, connect to it instead: `pondra.connect("http://host:8080", token=…)`. Either way the rest of the
+notebook is the same. Python [functions and procedures](/pondra/guides/functions-and-procedures/) run
+with the notebook's own Python.
+
+Make some data. Put a frame in the last line of a cell and the notebook shows its first rows as a
+table. Nothing runs until then, so a frame is cheap to build up:
+
+```python
+db.sql("CREATE TABLE orders (id BIGINT, user VARCHAR, item VARCHAR, qty INT, price DOUBLE)")
+db.sql("""INSERT INTO orders VALUES
+  (1, 'ann', 'tea', 2, 3.5), (2, 'bob', 'cake', 1, 4.5), (3, 'ann', 'tea', 1, 3.5), (4, 'cy', 'coffee', 3, 3.0)""")
+
+db.table("orders").sort("id")
+```
+
+```text
+   id user    item  qty  price
+0   1  ann     tea    2    3.5
+1   2  bob    cake    1    4.5
+2   3  ann     tea    1    3.5
+3   4   cy  coffee    3    3.0
+```
+
+## SQL cells
+
+`%load_ext pondra` adds `%%sql`, which runs the cell as SQL on your newest connection and shows the
+answer as a frame:
+
+```python norun
+%load_ext pondra
+```
+
+```python norun
+%%sql
+SELECT user, sum(qty * price) AS spent FROM orders GROUP BY user ORDER BY spent DESC
+```
+
+```text
+  user  spent
+0  ann   10.5
+1   cy    9.0
+2  bob    4.5
+```
+
+To keep the answer instead of showing it, name it with `<<`: it becomes a frame in a Python variable
+that later cells, SQL or Python, can use. A one-line query is `%sql`:
+
+```python norun
+%%sql top <<
+SELECT user, sum(qty * price) AS spent FROM orders GROUP BY user ORDER BY spent DESC
+```
+
+```python norun
+top.filter("spent > 5").to_pandas()
+```
+
+```text
+  user  spent
+0  ann   10.5
+1   cy    9.0
+```
+
+```python norun
+%sql SELECT count(*) AS n FROM orders
+```
+
+<Aside type="caution">
+A `%%sql` cell needs a connection made first, by `pondra.local(…)` or `pondra.connect(…)`. Without one
+it stops with `no connection yet: pondra.local(…) or pondra.connect(…) first`.
+</Aside>
+
+## Your variables are tables
+
+SQL cells and `db.sql` can read what the notebook holds, by name. A pandas, Polars or Arrow table is
+sent along for that query only, and a frame is part of the same statement, so it still runs on the
+node's data. A table in the lake wins over a variable of the same name.
+
+```python
+import pandas as pd
+
+targets = pd.DataFrame({"user": ["ann", "bob", "cy"], "target": [10, 5, 20]})
+db.sql("""SELECT o.user, sum(o.qty * o.price) AS spent, t.target
+          FROM orders o JOIN targets t USING (user)
+          GROUP BY o.user, t.target ORDER BY o.user""").to_pandas()
+```
+
+```text
+  user  spent  target
+0  ann   10.5      10
+1  bob    4.5       5
+2   cy    9.0      20
+```
+
+The same in a cell is `%%sql` with that SQL. Results go the other way with `to_pandas()`,
+`to_polars()`, `collect()` (a pyarrow table) and `rows()`, and data goes in with `db.append(table,
+data)` (pandas, Polars, Arrow or a list of dicts) and `db.write_table(name, data)`:
+
+```python
+import polars as pl
+
+more = pl.DataFrame({"id": [5], "user": ["bob"], "item": ["tea"], "qty": [2], "price": [3.5]})
+db.append("orders", more)
+db.table("orders").group_by("user").agg(pondra.col("qty").sum().alias("items")).sort("user").to_polars()
+```
+
+```text
+shape: (3, 2)
+┌──────┬───────┐
+│ user ┆ items │
+│ ---  ┆ ---   │
+│ str  ┆ i64   │
+╞══════╪═══════╡
+│ ann  ┆ 3     │
+│ bob  ┆ 3     │
+│ cy   ┆ 3     │
+└──────┴───────┘
+```
+
+## Functions from a cell
+
+A function defined in a cell becomes a function in the lake, for SQL and frames, when it has
+`@db.function`. A notebook keeps a cell's source, so its imports, helper functions and constants
+go with it:
+
+```python norun
+@db.function
+def shout(text: str) -> str:
+    return text.upper() + "!"
+```
+
+```python norun
+%sql SELECT id, shout(item) AS item FROM orders ORDER BY id
+```
+
+See [functions and procedures](/pondra/guides/functions-and-procedures/) for the options
+(`vectorized`, `cache`, `packages`), and note that it needs the node's Python: `pondra.local()`
+passes the notebook's own.
+
+## Run a notebook's cells in a script
+
+IPython runs the same cells outside a browser, which is how to keep a notebook's SQL honest in a
+test or a scheduled job. This runs the cells above, magics and all:
+
+```python
+from IPython.core.interactiveshell import InteractiveShell
+
+shell = InteractiveShell.instance()
+shell.user_ns.update(db=db, pondra=pondra)
+
+cells = [
+    "%load_ext pondra",
+    "%%sql top <<\nSELECT user, sum(qty * price) AS spent FROM orders GROUP BY user ORDER BY spent DESC",
+    "@db.function\ndef shout(text: str) -> str:\n    return text.upper() + '!'",
+    "%sql SELECT id, shout(item) AS item FROM orders ORDER BY id",
+]
+for source in cells:
+    run = shell.run_cell(source)
+    run.raise_error()
+shell.user_ns["top"].rows(), run.result.rows()
+```
+
+```text
+([{'user': 'bob', 'spent': 11.5}, {'user': 'ann', 'spent': 10.5}, {'user': 'cy', 'spent': 9.0}],
+ [{'id': 1, 'item': 'TEA!'}, {'id': 2, 'item': 'CAKE!'}, {'id': 3, 'item': 'TEA!'}, {'id': 4, 'item': 'COFFEE!'}, {'id': 5, 'item': 'TEA!'}])
+```
+
+Stop the node when you're done, or let the kernel end:
+
+```python
+db.close()
+```

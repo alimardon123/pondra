@@ -1,0 +1,411 @@
+---
+title: Functions and procedures
+description: Write your own SQL and Python functions, procedures that do anything, and tasks that run them on a schedule.
+sidebar:
+  order: 9
+---
+
+import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+
+A **function** goes inside a query: `SELECT slug(title) FROM posts`. A **procedure** is a job you
+`CALL`, and it may change tables, call an API or send mail. Both are written in SQL or Python and
+kept in the lake, so every node and every client has them. Postgres's words are used throughout
+(`CREATE FUNCTION`, `CREATE PROCEDURE`, `CALL`).
+
+Have a table to work with:
+
+```sql
+CREATE TABLE sales (id BIGINT, item VARCHAR, price DOUBLE, ts TIMESTAMP);
+INSERT INTO sales VALUES
+  (1, 'tea',  3.5, '2026-09-28 09:00:00'),
+  (2, 'cake', 4.5, '2026-09-29 10:00:00'),
+  (3, 'tea',  3.5, '2026-09-29 11:00:00');
+```
+
+## SQL functions
+
+A SQL function is an expression, or a query that returns a table. Its body replaces the call
+wherever SQL comes in, so a query that uses it plans and spreads over the nodes like any other.
+
+```sql
+CREATE FUNCTION net(x DOUBLE, rate DOUBLE DEFAULT 0.2) RETURNS DOUBLE RETURN x * (1 - rate);
+
+CREATE FUNCTION on_day(d DATE) RETURNS TABLE (id BIGINT, item VARCHAR) LANGUAGE sql
+  AS $$ SELECT id, item FROM sales WHERE ts::DATE = d $$;
+
+SELECT item, net(price) AS net, net(price, rate => 0.5) AS half FROM sales ORDER BY id;
+SELECT * FROM on_day(DATE '2026-09-29');
+```
+
+`STRICT` (NULL in, NULL out), `IMMUTABLE`, `STABLE` and `VOLATILE` are accepted, and so are `$1`-style
+parameters. DuckDB's `CREATE MACRO net(x, rate := 0.2) AS x * (1 - rate)` is the same thing under
+its own name. `DROP FUNCTION name` removes one.
+
+A stored view reads a function as it is now; a materialized view keeps the function as it was when
+the view was made.
+
+## Python functions
+
+`LANGUAGE python` takes the body of a function whose parameters are the names you declared.
+
+<Tabs syncKey="lang">
+  <TabItem label="SQL">
+    ```sql
+    CREATE OR REPLACE FUNCTION slug(title VARCHAR) RETURNS VARCHAR LANGUAGE python AS $$
+        import re
+        return re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
+    $$;
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    import pondra
+    db = pondra.connect("http://localhost:8080")
+    db.create_function("slug", """
+    import re
+    return re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
+    """, params={"title": "VARCHAR"}, returns="VARCHAR")
+    ```
+  </TabItem>
+</Tabs>
+
+Then use it anywhere a function goes:
+
+<Tabs syncKey="lang">
+  <TabItem label="SQL">
+    ```sql
+    SELECT slug('Hello, World!') AS s, slug(item || ' ' || id) AS tag FROM sales ORDER BY id;
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    db.sql("SELECT slug('Hello, World!') AS s").rows()
+    ```
+  </TabItem>
+  <TabItem label="Frames">
+    ```python
+    from pondra import col
+    db.table("sales").select(tag=pondra.fn.slug(col("item"))).limit(2).rows()
+    ```
+  </TabItem>
+</Tabs>
+
+It runs on warm Python workers beside every node, each node on its own rows. There are three
+shapes. The default is one call per row. `vectorized = true` is one call per batch, with pyarrow
+arrays in and out: the fast shape for maths. A table function returns a list of tuples, a
+DataFrame or an Arrow table.
+
+```sql
+CREATE FUNCTION gross(price DOUBLE) RETURNS DOUBLE LANGUAGE python WITH (vectorized = true) AS $$
+    import pyarrow.compute as pc
+    return pc.multiply(price, 1.2)
+$$;
+
+CREATE FUNCTION countdown(n BIGINT) RETURNS TABLE (i BIGINT, label VARCHAR) LANGUAGE python AS $$
+    return [(k, f"step {k}") for k in range(n, 0, -1)]
+$$;
+
+SELECT id, gross(price) AS gross FROM sales ORDER BY id;
+SELECT * FROM countdown(3);
+```
+
+Options go in `WITH (…)`:
+
+| Option | Does |
+|---|---|
+| `vectorized = true` | called once a batch with pyarrow arrays |
+| `cache = '10 minutes'` | reuses an answer for the same arguments: an API or a model is called once, not once per query |
+| `packages = 'requests, jinja2'` | each node installs them once, apart from the `--python` environment |
+| `timeout = 30` | seconds a batch may take (60 by default) |
+
+`STRICT` answers NULL for a NULL argument without calling. An `IMMUTABLE` or `STABLE` function
+gets each distinct argument once a batch.
+
+```sql
+CREATE FUNCTION slow_double(x BIGINT) RETURNS BIGINT LANGUAGE python WITH (cache = '10 minutes') AS $$
+    import time
+    time.sleep(0.5)
+    return x * 2
+$$;
+SELECT slow_double(5) AS a;
+SELECT slow_double(5) AS a;
+```
+
+The second call takes no half second. Each node keeps its own answers in memory (up to
+`PONDRA_FUNCTION_CACHE_MB`, 256), and only a call that succeeded is kept.
+
+<Aside type="caution">
+A function may run over millions of rows on every node, so it has limits: it has **no connection
+back to the lake** (pass rows in as arguments, or use a procedure), a **time limit** per batch, and
+a worker over its memory limit (`PONDRA_WORKER_MB`, 2048) is replaced. A table function takes
+values, not another table's rows: there is no `LATERAL`. The node needs Python:
+`pondra serve --python auto` (a node from `local()` has it).
+</Aside>
+
+## Functions from a notebook or a file
+
+`@db.function` turns a Python function into the lake's, with its types from its annotations. What
+it uses from where it's defined goes with it: imports, helper functions, and simple constants
+(numbers, strings, lists, dicts and sets of them). The decorator hands the function back, so it
+still runs here. It needs the function's source, so write it in a notebook or a `.py` file:
+
+```bash
+cat > fns.py <<'EOF'
+import re
+import pondra
+
+db = pondra.connect("http://localhost:8080")
+STOP = {"the", "a"}
+
+def words(t):
+    return [w for w in re.findall(r"[a-z]+", t.lower()) if w not in STOP]
+
+@db.function                         # SELECT tagline(title) FROM posts, on every node
+def tagline(title: str) -> str:
+    return "-".join(words(title))
+
+print(db.sql("SELECT tagline('The Big Tea Party') AS t").rows())
+print(tagline("The Big Tea Party"))  # and here: the same code
+EOF
+python3 fns.py
+```
+
+```text
+[{'t': 'big-tea-party'}]
+big-tea-party
+```
+
+| Python | SQL |
+|---|---|
+| `str` | `VARCHAR` |
+| `int` | `BIGINT` |
+| `float` | `DOUBLE` |
+| `bool` | `BOOLEAN` |
+| `date` / `datetime` | `DATE` / `TIMESTAMP` |
+| `bytes` | `BYTEA` |
+| `Decimal` | `DECIMAL` |
+| `list[T]` | `T[]` |
+| `dict` | `VARIANT` |
+
+A parameter without an annotation takes any value as it comes. A function needs its result's
+type: an annotation, or `returns=` (a SQL type, or `{"col": int, …}` for a table function).
+`@db.function(vectorized=True, cache="10 minutes", packages="requests")` takes the options above.
+Anything else the function uses from the notebook, such as a DataFrame or an open connection, is
+refused when you define it, with the fix in the message.
+
+## Procedures
+
+A procedure is a script you call. In SQL it's statements; in Python it's anything Python can do.
+It runs with **its caller's rights**, so a reader's `CALL` of a procedure that writes is refused at
+the write.
+
+```sql
+CREATE PROCEDURE load_day(day DATE, min_price DOUBLE DEFAULT 0) LANGUAGE sql AS $$
+    DELETE FROM daily WHERE d = $day;
+    INSERT INTO daily
+      SELECT ts::DATE, item, count(*) FROM sales WHERE ts::DATE = $day AND price >= $min_price GROUP BY 1, 2;
+$$;
+```
+
+Make the table it fills, then call it:
+
+```sql
+CREATE TABLE daily (d DATE, item VARCHAR, n BIGINT);
+```
+
+<Tabs syncKey="lang">
+  <TabItem label="SQL">
+    ```sql
+    CALL load_day(DATE '2026-09-29');
+    CALL load_day(DATE '2026-09-29', min_price => 4);
+    SELECT * FROM daily;
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    from datetime import date
+    db.call("load_day", date(2026, 9, 29))
+    db.call("load_day", date(2026, 9, 29), min_price=4)
+    db.sql("SELECT * FROM daily").rows()
+    ```
+  </TabItem>
+  <TabItem label="JavaScript">
+    ```js
+    import { connect } from "pondra";
+    const db = connect("http://localhost:8080");
+    await db.call("load_day", "2026-09-29");
+    console.log(await db.sql("SELECT * FROM daily"));
+    ```
+  </TabItem>
+  <TabItem label="psql">
+    ```bash norun
+    psql -h localhost -p 5432 -c "CALL load_day(DATE '2026-09-29')"
+    ```
+  </TabItem>
+</Tabs>
+
+The answer is the last statement's rows, or a write's outcome. The arguments are worked out once, as
+the caller, and cast to their declared types. With a `job` id (`POST /sql?job=…`, or `job=` in
+Python) a retried call applies its writes once.
+
+### Python procedures
+
+The body is Python, run on the node's workers. `return` is optional. What it prints comes back to
+the caller as **notices**: the shell prints them, psql shows `NOTICE`, HTTP sends them in the
+`x-pondra-notices` header, and the clients keep them in `db.notices`.
+
+`pondra.sql(…)` inside it is the caller's connection: their rights, for as long as the call runs.
+`pondra.secret("name")` reads a secret (below).
+
+```sql
+CREATE PROCEDURE top_items(k BIGINT DEFAULT 2) LANGUAGE python AS $$
+    rows = pondra.sql("SELECT item, count(*) AS n FROM sales GROUP BY item ORDER BY n DESC LIMIT $k", k=k).rows()
+    print(f"{len(rows)} items, best: {rows[0]['item']}")
+    return rows
+$$;
+CALL top_items(1);
+```
+
+```python
+db.call("top_items", 1).rows(), db.notices
+```
+
+```text
+([{'item': 'tea', 'n': 2}], ['1 items, best: tea'])
+```
+
+Mail, HTTP calls, files and cloud SDKs are all fair game, which is why only an admin can make
+a procedure, and a node runs Python only when started with `--python`. A node with no tokens takes
+`--python` only on 127.0.0.1.
+
+```sql norun
+CREATE SECRET smtp (TYPE generic, HOST 'smtp.example.com', USER 'reports@example.com', PASSWORD '…');
+
+CREATE PROCEDURE send_report(day DATE, to_addr VARCHAR) LANGUAGE python AS $$
+    import smtplib
+    from email.message import EmailMessage
+    top = pondra.sql("SELECT item, sum(price) AS revenue FROM sales WHERE ts::DATE = $day GROUP BY item", day=day).to_pandas()
+    s = pondra.secret("smtp")
+    msg = EmailMessage()
+    msg["Subject"], msg["From"], msg["To"] = f"Revenue {day}", s["user"], to_addr
+    msg.set_content(top.to_string(index=False))
+    with smtplib.SMTP_SSL(s["host"]) as smtp:
+        smtp.login(s["user"], s["password"])
+        smtp.send_message(msg)
+    print("sent to", to_addr)
+$$;
+```
+
+### Secrets
+
+A secret keeps credentials out of the code. Only an admin makes one, and SQL can list its name and
+type but never read its values back. A procedure reads them, and every value of four characters or
+more is replaced by `***` in its notices, its errors and the run log:
+
+```sql
+CREATE SECRET smtp (TYPE generic, HOST 'smtp.example.com', USER 'reports@example.com', PASSWORD 'not-a-real-password');
+CREATE PROCEDURE who() LANGUAGE python AS $$
+    s = pondra.secret("smtp")
+    print("host", s["host"], "user", s["user"])
+$$;
+CALL who();
+```
+
+```text
+host *** user ***
+```
+
+Secrets are sealed in the lake with `PONDRA_SECRET_KEY`; see [security](/pondra/guides/security/).
+
+### From a notebook: `@db.procedure`
+
+As with functions, write it in a notebook or a file. The first parameter needs no connection:
+`pondra.sql` is the caller's.
+
+```bash
+cat > jobs.py <<'EOF'
+from datetime import date
+import pondra
+
+db = pondra.connect("http://localhost:8080")
+
+@db.procedure                          # CALL weekly(DATE '2026-09-29'), as its caller
+def weekly(day: date, top: int = 2):
+    rows = pondra.sql("SELECT item, count(*) AS n FROM sales GROUP BY item ORDER BY n DESC LIMIT $k", k=top).rows()
+    print(f"week of {day}: {len(rows)} items")     # a notice to whoever called it
+    return rows
+
+db.call("weekly", date(2026, 9, 29))                # on the node
+print(db.notices)
+run = db.call("weekly", date(2026, 9, 29), wait=False)   # started, not waited for
+print(run.wait()["status"])
+EOF
+python3 jobs.py
+```
+
+```text
+week of 2026-09-29: 2 items
+['week of 2026-09-29: 2 items']
+ok
+```
+
+`db.create_procedure("job", file="job.py", params={"day": "DATE"})` stores a file's text instead, so
+every node runs the same code whatever is on its disk.
+
+## Start a call without waiting
+
+`SELECT pondra.start('name', args…)` starts a procedure on the node and answers a run id at once.
+`db.call(…, wait=False)` gives a `Run` whose `wait()` returns its row of `pondra.runs`, or raises
+its error; JavaScript's `db.start(name, …args)` gives the id.
+
+```sql
+SELECT pondra.start('top_items', 1) AS run;
+```
+
+## Run on a schedule
+
+A **task** is a statement on a timer. The leader runs each tick once, and a failover neither skips
+nor repeats one.
+
+```sql
+CREATE TASK refresh SCHEDULE '5 minutes' AS CALL load_day(current_date - 1);
+CREATE TASK nightly SCHEDULE 'cron 0 2 * * * UTC' AS CALL load_day(current_date - 1);
+SHOW TASKS;
+```
+
+A schedule is `'5 minutes'`, `'every 30 seconds'`, or cron with an optional time zone
+(`'cron 0 2 * * * Europe/Berlin'`). Ticks missed while no node led run once, as the latest of them.
+`SHOW TASKS` (or the table `pondra.tasks`) gives each task's last and next tick, and
+`DROP TASK name` stops one. A task's statement runs as an admin.
+
+```sql
+DROP TASK refresh;
+DROP TASK nightly;
+```
+
+## See what ran
+
+Every procedure call is a row of `pondra.runs`: routine, caller, node, arguments, start, end, status
+(`running`, `ok`, `failed`), notices and error. Rows go after 30 days (`PONDRA_RUNS_DAYS`).
+
+```sql
+SELECT routine, caller, status, notices FROM pondra.runs ORDER BY started DESC LIMIT 3;
+```
+
+`SHOW USER FUNCTIONS`, `SHOW PROCEDURES` and the table `pondra.routines` list the lake's own routines
+with their code.
+
+<Aside type="caution">
+
+- A Python function can't see the lake; a procedure can, but its work is a call, not a query
+  expression.
+- A `plpy` module is there, so PL/Python code from Postgres runs as it is, except
+  `plpy.subtransaction`: each statement commits on its own.
+- A cast to an integer truncates (7.9 becomes 7), where Postgres rounds.
+- `SECURITY DEFINER` and `OUT` parameters are refused: a routine always runs with its caller's
+  rights, and returns a table instead.
+- Mail and HTTP calls are outside the lake. A retried call sends again unless the procedure checks
+  `pondra.runs`.
+- A task's ticks missed while no node led run once.
+
+</Aside>

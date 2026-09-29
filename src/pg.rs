@@ -110,7 +110,7 @@ impl AuthSource for Tokens {
 }
 
 fn user_error(e: anyhow::Error) -> PgWireError {
-    PgWireError::UserError(Box::new(ErrorInfo::new("ERROR".into(), "XX000".into(), format!("{e:#}"))))
+    PgWireError::UserError(Box::new(ErrorInfo::new("ERROR".into(), "XX000".into(), crate::ext::said(&e))))
 }
 
 impl Backend {
@@ -181,17 +181,23 @@ impl Backend {
             "csv" => CopyEncoder::new_csv(info.clone(), CopyCsvOptions { delimiter: c.delimiter.unwrap_or(',').to_string().as_str().into(), null_string: c.null.clone().unwrap_or_default().as_str().into(), ..Default::default() }),
             _ => CopyEncoder::new_text(info.clone(), CopyTextOptions { delimiter: c.delimiter.unwrap_or('\t').to_string().as_str().into(), null_string: c.null.clone().unwrap_or("\\N".into()).as_str().into() }),
         };
-        let header = (c.header && c.format == "csv").then(|| {
+        let mut header = (c.header && c.format == "csv").then(|| {
             let names = schema.fields().iter().map(|f| f.name().as_str()).collect::<Vec<_>>().join(&c.delimiter.unwrap_or(',').to_string());
-            Ok(CopyData::new(bytes::Bytes::from(names + "\n")))
+            bytes::Bytes::from(names + "\n")
         });
-        let rows = batches.into_iter().flat_map(move |b| each_row(&b, &types, |cols, i| {
+        let mut rows = batches.into_iter().flat_map(move |b| each_row(&b, &types, |cols, i| {
             for col in cols {
                 encode!(&mut enc, col, i)?;
             }
             Ok(enc.take_copy())
         }));
-        let data = stream::iter(header.into_iter().chain(rows));
+        // The header goes in with the first row: COPY's count is of messages, and it isn't a row.
+        let first = match (header.take(), rows.next()) {
+            (Some(h), Some(Ok(row))) => Some(Ok(CopyData::new([h, row.data].concat().into()))),
+            (Some(h), None) => Some(Ok(CopyData::new(h))),
+            (_, row) => row,
+        };
+        let data = stream::iter(first.into_iter().chain(rows));
         Ok(Response::CopyOut(CopyResponse::new(if c.format == "binary" { 1 } else { 0 }, schema.fields().len(), data)))
     }
 
@@ -240,9 +246,10 @@ impl Backend {
         }
         let batches = reader.build(std::io::Cursor::new(chunk)).map_err(|e| err(e.into()))?.collect::<Result<Vec<_>, _>>().map_err(|e| err(e.into()))?;
         for b in batches {
-            // the table's columns in its order, those not given null
+            // the table's columns in its order, those not given their DEFAULT, or null
             let cols = table.fields().iter().map(|f| b.column_by_name(f.name()).cloned().unwrap_or_else(|| datafusion::arrow::array::new_null_array(f.data_type(), b.num_rows()))).collect();
             let b = RecordBatch::try_new(table.clone(), cols).map_err(|e| err(e.into()))?;
+            let b = crate::defaults::fill(&meta, b.clone(), |c| (!given.iter().any(|g| g == c)).then(|| crate::defaults::all(b.num_rows()))).await.map_err(err)?;
             p.rows += b.num_rows() as u64;
             p.seq += 1;
             let src = crate::log::Src { producer: format!("copy:{}", p.job), seq: p.seq, prev: None };
@@ -362,6 +369,7 @@ fn pg_type(t: &DataType, format: FieldFormat) -> (Type, DataType) {
         DataType::Decimal256(..) if format == FieldFormat::Text => (Type::NUMERIC, DataType::Utf8),
         DataType::Decimal256(..) => (Type::FLOAT8, DataType::Float64),
         DataType::Date32 | DataType::Date64 => (Type::DATE, DataType::Date32),
+        DataType::Timestamp(_, Some(_)) => (Type::TIMESTAMPTZ, DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into()))), // (an instant: sent in UTC)
         DataType::Timestamp(..) => (Type::TIMESTAMP, DataType::Timestamp(TimeUnit::Microsecond, None)),
         DataType::Binary | DataType::LargeBinary | DataType::BinaryView => (Type::BYTEA, DataType::Binary),
         _ => (Type::VARCHAR, DataType::Utf8),
@@ -381,6 +389,7 @@ macro_rules! encode {
             DataType::Float32 => row.encode_field(&c.as_primitive::<Float32Type>().value(i)),
             DataType::Float64 => row.encode_field(&c.as_primitive::<Float64Type>().value(i)),
             DataType::Date32 => row.encode_field(&c.as_primitive::<Date32Type>().value_as_date(i)),
+            DataType::Timestamp(_, Some(_)) => row.encode_field(&c.as_primitive::<TimestampMicrosecondType>().value_as_datetime(i).map(|t| t.and_utc())),
             DataType::Timestamp(..) => row.encode_field(&c.as_primitive::<TimestampMicrosecondType>().value_as_datetime(i)),
             DataType::Binary => row.encode_field(&c.as_binary::<i32>().value(i)),
             DataType::Decimal128(..) => row.encode_field(&Numeric(c.as_primitive::<datafusion::arrow::datatypes::Decimal128Type>().value_as_string(i))),
@@ -450,7 +459,7 @@ impl Copy {
     /// `sql` as a COPY to STDOUT or from STDIN (None: not a COPY).
     fn of(sql: &str) -> Option<PgWireResult<Copy>> {
         use datafusion::sql::sqlparser::ast::{CopyLegacyCsvOption, CopyLegacyOption, CopyOption, CopySource, CopyTarget, Statement};
-        if !sql.trim_start().get(..4).is_some_and(|w| w.eq_ignore_ascii_case("copy")) {
+        if !crate::write::first_word(sql).get(..4).is_some_and(|w| w.eq_ignore_ascii_case("copy")) {
             return None;
         }
         if matches!(crate::ext::statement(sql), Some(crate::write::Stmt::CopyTo(..))) {

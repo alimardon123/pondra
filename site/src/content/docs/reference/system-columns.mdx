@@ -1,0 +1,200 @@
+---
+title: System columns and tables
+description: The columns every row has, the change feed's change types, and the pondra.runs, pondra.routines and pondra.tasks tables.
+sidebar:
+  order: 16
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Every row carries its identity and its history in system columns, and the `pondra` schema holds
+what procedures did and what is on a schedule. You read both with ordinary SQL.
+
+## Columns
+
+| Column | Type | Meaning |
+|---|---|---|
+| `_row_id` | `BIGINT` | which row this is, from its `INSERT` on. An `UPDATE` or `MERGE` keeps it. A new row gets a new one: an `INSERT`, and an upsert that replaces a keyed table's row |
+| `_version` | `BIGINT` | the commit that wrote this version of the row: a sequence number for the whole lake |
+| `_created_at` | `TIMESTAMP` (UTC) | when the row's first version was committed |
+| `_updated_at` | `TIMESTAMP` (UTC) | when this version was committed |
+| `_deleted` | `BOOLEAN` | on keyed tables only: the delete marker. See [keyed tables](#keyed-tables) |
+| `_change_type` | `VARCHAR` | in the change feed only. See [the change feed](#the-change-feed) |
+
+`SELECT *` leaves the system columns out, and so does `DESCRIBE`. A query that names one gets it:
+`SELECT _row_id, * FROM t`. `SELECT *, _row_id FROM t` shows the table's columns and `_row_id`
+once. Over a join, `*` shows each table's system columns as well.
+
+An `UPDATE` writes a new version of the row: it keeps `_row_id` and `_created_at`, and takes a new
+`_version` and `_updated_at`. Nothing is rewritten in place. The old version stays in its file
+until a later rewrite drops it, and reads leave it out.
+
+```sql
+CREATE TABLE tickets (id BIGINT, status VARCHAR);
+INSERT INTO tickets VALUES (1, 'open'), (2, 'open');
+CREATE TABLE tickets_before AS
+  SELECT id, _row_id AS row_id, _version AS version, _created_at AS created FROM tickets;
+UPDATE tickets SET status = 'closed' WHERE id = 1;
+SELECT t.id, t.status,
+       t._row_id = b.row_id AS same_row,
+       t._version > b.version AS newer,
+       t._created_at = b.created AS same_created
+FROM tickets t JOIN tickets_before b ON t.id = b.id
+ORDER BY t.id;
+```
+
+```text
+[{"id":1,"status":"closed","same_row":true,"newer":true,"same_created":true},{"id":2,"status":"open","same_row":true,"newer":false,"same_created":true}]
+```
+
+Ticket 1 is the same row with a newer version, and ticket 2 did not change. In a merge table, or a
+view that groups, a row combines many: its `_row_id` and `_created_at` are the first row's, and its
+`_version` and `_updated_at` the last commit's.
+
+## Keyed tables
+
+A keyed table (`PRIMARY KEY`) has a `_deleted` column as well. A `DELETE` does not remove the row:
+it adds a row for the key with `_deleted` true, and reads leave out keys whose newest row is a
+delete. `_deleted` is null for a row that was only inserted, and false for an `UPDATE`'s new row.
+Reads leave the column out unless a query names it (`SELECT *, _deleted FROM t`), and you never see
+a deleted key there, so its value is null in what you read. It shows up when you follow the table:
+in the stream from `/watch`, in a [Flight log stream](/pondra/reference/flight/#the-log-as-a-stream),
+and in the rows [Kafka](/pondra/reference/kafka-protocol/#consume) consumers get as tombstones.
+
+```sql
+CREATE TABLE accounts (id BIGINT PRIMARY KEY, name VARCHAR);
+INSERT INTO accounts VALUES (1, 'ann'), (2, 'bo');
+DELETE FROM accounts WHERE id = 2;
+```
+
+```bash
+curl -s --max-time 2 'http://localhost:8080/watch/accounts?after=0' || true
+```
+
+```text
+{"id":1,"name":"ann"}
+{"id":2,"name":"bo"}
+{"id":2,"name":"bo","_deleted":true}
+```
+
+## The change feed
+
+`/watch/{table}?changes=true` (and `changes=True` in `db.watch`, `changes: true` in JavaScript, and
+the MCP `changes` tool) sends every change to a table commit by commit, old versions first, each row
+with its system columns and a `_change_type`:
+
+| `_change_type` | On | Is |
+|---|---|---|
+| `insert` | append tables | a new row |
+| `update_preimage` | append tables | the row as it was before an `UPDATE` or `MERGE` |
+| `update_postimage` | append tables | the row as it is after it |
+| `delete` | all tables | the row a `DELETE` removed. On a keyed table it is the marker, with `_deleted` true |
+| `upsert` | keyed tables | a new version of a key: an insert, or an update |
+
+```python
+import pondra
+
+db = pondra.connect("http://localhost:8080")
+seen = []
+for row in db.watch("tickets", after=0, changes=True):
+    seen.append((row["id"], row["status"], row["_change_type"]))
+    if len(seen) == 4:
+        break
+print(seen)
+```
+
+```text
+[(1, 'open', 'insert'), (2, 'open', 'insert'), (1, 'open', 'update_preimage'), (1, 'closed', 'update_postimage')]
+```
+
+## The run log
+
+`pondra.runs` has a row for each call of a stored procedure, from any node, and it outlives the
+nodes. It is written as the call starts (`running`) and again as it ends, in batches, so a call
+never waits for its log, and it shows in the table within about a second. A row stays for 30
+days (`PONDRA_RUNS_DAYS`, see [environment](/pondra/reference/environment/)). A procedure that
+does not exist is refused before it starts, and has no row.
+
+| Column | Type | Meaning |
+|---|---|---|
+| `id` | `VARCHAR` | the run's id. `db.start(…)` answers it |
+| `routine` | `VARCHAR` | the procedure's name |
+| `caller` | `VARCHAR` | who called: the token's role (`admin`, `write`, `read`), or `task:NAME` for a scheduled task |
+| `node` | `VARCHAR` | the address of the node that ran it |
+| `job` | `VARCHAR` | the job id the call was given, or null |
+| `args` | `VARCHAR` | the arguments as JSON, `{"day": "2026-09-27"}` |
+| `started` | `TIMESTAMP` (UTC) | when it started |
+| `ended` | `TIMESTAMP` (UTC) | when it ended. Null while it runs |
+| `status` | `VARCHAR` | `running`, `ok` or `failed` |
+| `notices` | `VARCHAR` | what it printed, up to 64 KB |
+| `error` | `VARCHAR` | why it failed, up to 64 KB |
+
+```sql
+CREATE PROCEDURE report(day VARCHAR) LANGUAGE sql AS $$
+-- Count the tickets
+SELECT count(*) AS n, $day AS day FROM tickets;
+$$;
+CALL report('2026-09-27');
+```
+
+```bash
+sleep 2
+```
+
+```sql
+SELECT routine, caller, status, args FROM pondra.runs WHERE routine = 'report' AND caller = 'admin';
+```
+
+```text
+[{"routine":"report","caller":"admin","status":"ok","args":"{\"day\":\"2026-09-27\"}"}]
+```
+
+## Routines and tasks
+
+`pondra.routines` and `pondra.tasks` list what is in the catalog as they are now. `SHOW FUNCTIONS`,
+`SHOW PROCEDURES` and `SHOW TASKS` read them.
+
+`pondra.routines`:
+
+| Column | Meaning |
+|---|---|
+| `name` | the routine's name |
+| `kind` | `function`, `table function` or `procedure` |
+| `language` | `sql` or `python` |
+| `arguments` | its parameters, `day VARCHAR` |
+| `returns` | its return type, or null |
+| `volatility` | `immutable`, `stable` or `volatile` |
+| `options` | its options as JSON, or null: see [table options](/pondra/reference/table-options/#functions-and-procedures) |
+| `body` | its code |
+
+`pondra.tasks`:
+
+| Column | Meaning |
+|---|---|
+| `name` | the task's name |
+| `schedule` | `5 minutes`, or `cron 0 2 * * * UTC` |
+| `statement` | what it runs, a `CALL` |
+| `last_tick` | when it last ran |
+| `next_tick` | when it runs next |
+
+```sql
+CREATE TASK nightly SCHEDULE 'cron 0 2 * * * UTC' AS CALL report('2026-09-27');
+SELECT name, schedule, statement FROM pondra.tasks;
+```
+
+```text
+[{"name":"nightly","schedule":"cron 0 2 * * * UTC","statement":"CALL report('2026-09-27')"}]
+```
+
+```sql
+SELECT name, kind, language, arguments FROM pondra.routines WHERE name = 'report';
+```
+
+```text
+[{"name":"report","kind":"procedure","language":"sql","arguments":"day VARCHAR"}]
+```
+
+<Aside type="caution">
+A schema of your own that is called `pondra` takes the name: `pondra.runs` then means its `runs`
+table. The three system tables are read-only: a write to one fails with `no schema pondra`.
+</Aside>

@@ -16,6 +16,7 @@
   harness.py dedup               a keyed table deduplicated by event time (order_by) vs a model
   harness.py procedures          macros, procedures (SQL, Python), scripts, parameters: rights, depth, three nodes
   harness.py functions           functions and procedures in SQL and Python: workers, notices, mail, secrets, run log, tasks, speed
+  harness.py found               what writing the docs found (round 26), each fixed
   harness.py load    --secs 30   throughput, ack latency, freshness, catalog commit latency
   harness.py all                 quick run of everything
 """
@@ -774,9 +775,26 @@ def reader():
             time.sleep(0.02)
         lat.append(time.time() - t)
         time.sleep(random.uniform(0, 0.3))
-    w.kill(); r.kill()
-    print(f"reader: send -> visible on a separate read-only node: p50 {pct(lat, .5)} ms, p99 {pct(lat, .99)} ms")
-    return f"freshness on a separate read-only node: p50 {pct(lat, .5)} ms, p99 {pct(lat, .99)} ms"
+    # After a failover: the reader finds the new leader while its stream is down (every second,
+    # not every fifteen), so a write the new leader acks is soon visible there too.
+    f = Node(lake, A.port + 2, flush_ms=100).start()
+    time.sleep(2)  # (the follower has heard the leader)
+    w.kill()
+    deadline, acked = time.time() + 60, None
+    while acked is None and time.time() < deadline:
+        try:
+            call(A.port + 2, "POST", "/append/events?producer=r&seq=100", rows("r", 100, 10), timeout=5)
+            acked = time.time()
+        except Exception:
+            time.sleep(0.2)
+    seen = until(lambda: _try(lambda: sql(A.port + 1, "SELECT count(*) AS c FROM events WHERE seq = 100")[0]["c"]), 10, 30)
+    after = time.time() - acked if acked and seen == 10 else None
+    f.kill(); r.kill()
+    print(f"reader: send -> visible on a separate read-only node: p50 {pct(lat, .5)} ms, p99 {pct(lat, .99)} ms; after a failover, {after and round(after, 1)} s after the new leader's ack")
+    if after is None or after > 5:
+        print("reader: after a failover, a write the new leader acked took too long to reach the reader (more than 5 s)")
+        sys.exit(1)
+    return f"freshness on a separate read-only node: p50 {pct(lat, .5)} ms, p99 {pct(lat, .99)} ms; after a failover {after:.1f} s"
 
 
 def insert():
@@ -1014,6 +1032,19 @@ def kafka():
     p.produce("lines", key=b"k2", value=b'{"event": "click", "n": 3}')
     assert p.flush(30) == 0
     checks["Debezium events and tombstones"] = sql_("SELECT id, name, score FROM users ORDER BY id") == [{"id": 1, "name": "ann", "score": 11.0}, {"id": 3, "name": "cy", "score": 3.0}]
+    # The payload alone, without Kafka Connect's schema beside it; a delete for a table without a key
+    # refused by name (it can't know which row went), not appended as a row.
+    sql_("CREATE TABLE plain (id BIGINT, name VARCHAR)")
+    sql_("CREATE TABLE people (id BIGINT PRIMARY KEY, name VARCHAR)")
+    p.produce("people", key=json.dumps({"id": 5}), value=json.dumps({"payload": {"op": "c", "before": None, "after": {"id": 5, "name": "eve"}}}))
+    p.produce("plain", value=json.dumps({"op": "c", "before": None, "after": {"id": 1, "name": "a"}}))
+    assert p.flush(30) == 0
+    failed = []
+    p.produce("plain", value=json.dumps({"op": "d", "before": {"id": 1, "name": "a"}, "after": None}), on_delivery=lambda e, m: failed.append(e))
+    p.flush(30)
+    checks["a payload without its schema; a delete for a table without a key refused by name"] = \
+        sql_("SELECT name FROM people WHERE id = 5") == [{"name": "eve"}] and sql_("SELECT id, name FROM plain") == [{"id": 1, "name": "a"}] \
+        and len(failed) == 1 and failed[0] is not None and failed[0].code() == ck.KafkaError.INVALID_RECORD and "PRIMARY KEY" in open(node.log).read()
     checks["raw values (_value), queried as JSON"] = sql_("SELECT _key, _value FROM lines ORDER BY _key")[0] == {"_key": "k1", "_value": "plain text, not JSON"} and \
         sql_("SELECT _value->>'event' AS e, json_get_int(_value, 'n') AS n FROM lines WHERE _key = 'k2'") == [{"e": "click", "n": 3}]
     # consumers: kafka-python and librdkafka read the log back from the beginning
@@ -2069,7 +2100,7 @@ def guard():
     lake = new_lake()
     small = {"PONDRA_SPREAD_MB": "1"}  # (tables this small are left on one node by size alone)
     slow = Node(lake, A.port, env={"PONDRA_LINK": "40,60", **small}).start()
-    fast = Node(lake, A.port + 1, env={"PONDRA_LINK": "0.2,5000", **small}).start()
+    fast = Node(lake, A.port + 1, env={"PONDRA_LINK": "0.2,5000", "PONDRA_DEBUG_SPREAD": "1", **small}).start()
     third = Node(lake, A.port + 2, env=small).start()
     n = itertools.count()  # (a comment makes each ask new to the result cache; the guard knows it as the same query)
     q = lambda s, port, spread=None: call(port, "POST", "/sql" + ("" if spread is None else f"?spread={spread}"), f"{s} -- {next(n)}".encode(), timeout=300)
@@ -2098,6 +2129,14 @@ def guard():
         forced = q(s, slow.port, 1)
         runs["forced"] = (forced == q(s, fast.port, 0), spreads(slow.port) > before, metrics_of(slow.port)["pondra_shuffled_queries_total"] > shuffles)
         out[s[:40]] = runs
+    # An aggregate of a few groups moves a few rows: a slice knows its columns' distinct values
+    # (the catalog's sketches), so the estimate says so. (The cluster bench's q1 stayed on one node
+    # when the estimate was the whole table's rows.)
+    import re
+    for _ in range(2):
+        q("SELECT p, count(*) AS n, sum(v) AS s FROM f GROUP BY p", fast.port)
+    said = [l for l in open(fast.log) if l.startswith("spread: here")]
+    few_mb = float(re.search(r"\(([\d.]+) MB", said[-1]).group(1)) if said else None
     # A node on the real network (no PONDRA_LINK): once a query ran both ways, the faster way wins.
     learned = []
     for s in queries:
@@ -2115,9 +2154,10 @@ def guard():
               "over a slow network, queries that would shuffle stay on one node": not any(r["slow"][1] for r in out.values() if r["forced"][2]) and any(r["forced"][2] for r in out.values()),
               "over a fast one, they spread": all(r["fast"][1] for r in out.values()),
               "?spread=1 spreads anyway": all(r["forced"][1] for r in out.values()),
-              "a query that ran both ways goes the faster way": all(learned)}
+              "a query that ran both ways goes the faster way": all(learned),
+              "an aggregate of a few groups is known to move little (under 1 MB)": few_mb is not None and few_mb < 1}
     ok = all(checks.values())
-    print(json.dumps({"guard": checks, "ok": ok, "learned": learned}, indent=1))
+    print(json.dumps({"guard": checks, "ok": ok, "learned": learned, "few_groups_mb": few_mb}, indent=1))
     if not ok:
         print(out)
         sys.exit(1)
@@ -3657,9 +3697,275 @@ def across():
     return f"across: changes to an attached lake from any node: all {len(checks)} checks pass"
 
 
+# ---------------------------------------------------------------- round 26 (ADR-030)
+
+def found():
+    """What writing the docs found (round 26), each fixed: a filtered materialized view follows
+    UPDATE and DELETE; a producer's seq 0 refused (HTTP, Flight); a merge table that leaves a
+    column unmerged, an unknown WITH option and CREATE EXTERNAL TABLE refused at once; a value
+    that doesn't cast refused (INSERT, DoPut), not stored as NULL; a task into a keyed table made
+    in SQL; NOT NULL and DEFAULT on every door; INSERT … ON CONFLICT, UPDATE … FROM, DELETE …
+    USING, TRUNCATE; BINARY, VARBINARY,
+    BLOB, VARIANT, JSON columns and substr on bytes; FROM-first with WHERE; a comment before
+    CREATE FUNCTION; COPY's count with a header; a write token's message; PUT /files twice
+    without the node's paths; files() and file_read() with or without `files/`; a Flight function
+    callable as soon as it is made, and gone as soon as it is dropped; ADBC's handshake without
+    padding, its ingest modes and table types; `pondra run`'s flags anywhere."""
+    import datetime as dt, psycopg, pyarrow as pa, pyarrow.flight as fl
+    import adbc_driver_flightsql.dbapi as adbc
+    lake, guarded = new_lake(), new_lake()
+    port, fport, pgport = A.port, A.port + 30, A.port + 10
+    py = {"PYTHONPATH": os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "python")}
+    node = Node(lake, port, env=py, python="auto", pg=f"127.0.0.1:{pgport}", flight=f"127.0.0.1:{fport}", kafka=f"127.0.0.1:{port + 20}", tier_secs=0.5).start()
+    locked = Node(guarded, port + 1, env={"PYTHONPATH": ""}, python="auto", flight=f"127.0.0.1:{fport + 1}", read_token="r", write_token="w", admin_token="a").start()
+    q = lambda s: sql(port, s)
+    fails = lambda s: _raises_text(lambda: q(s))
+    checks, seen = {}, {}
+    # A materialized view of a filter follows UPDATE and DELETE of its table (ADR-020).
+    q("CREATE TABLE orders (id BIGINT, region VARCHAR, amount BIGINT)")
+    q("INSERT INTO orders VALUES (1, 'eu', 10), (2, 'us', 20), (3, 'eu', 30)")
+    q("CREATE MATERIALIZED VIEW eu AS SELECT id, amount FROM orders WHERE region = 'eu'")
+    q("UPDATE orders SET amount = 99 WHERE id = 1")
+    q("DELETE FROM orders WHERE id = 3")
+    q("INSERT INTO orders VALUES (4, 'eu', 40)")
+    want = [{"id": 1, "amount": 99}, {"id": 4, "amount": 40}]
+    seen["view"] = until(lambda: q("SELECT id, amount FROM eu ORDER BY id"), want, 15)
+    checks["a filtered materialized view follows UPDATE and DELETE of its table"] = seen["view"] == want
+    # A producer's batches count from seq=1: seq 0 would be taken for one already written.
+    q("CREATE TABLE ev (user VARCHAR, n BIGINT)")
+    zero = _raises_text(lambda: call(port, "POST", "/append/ev?producer=p&seq=0", b'{"user": "a", "n": 1}\n'))
+    call(port, "POST", "/append/ev?producer=p&seq=1", b'{"user": "a", "n": 1}\n')
+    schema = pa.schema([("user", pa.string()), ("n", pa.int64())])
+    client = fl.FlightClient(f"grpc://127.0.0.1:{fport}")
+    def put(path, table):
+        w, r = client.do_put(fl.FlightDescriptor.for_path(*path), table.schema)
+        w.write_table(table)
+        w.done_writing()
+        while r.read() is not None:
+            pass
+        w.close()
+    flight_zero = _raises_text(lambda: put(["ev", "f", "0"], pa.table({"user": ["b"], "n": pa.array([2], pa.int64())}, schema=schema)))
+    checks["seq 0 refused, by HTTP and by Flight, and nothing written"] = "seq=1" in zero and "seq=1" in flight_zero and q("SELECT count(*) AS n FROM ev") == [{"n": 1}]
+    # Refused when made, not when first used.
+    seen["merge"] = fails("CREATE TABLE totals (k VARCHAR PRIMARY KEY, n BIGINT, s BIGINT) WITH (merge = 'n:sum')")
+    seen["option"] = fails("CREATE TABLE w (a BIGINT) WITH (colour = 'red')")
+    seen["external"] = fails("CREATE EXTERNAL TABLE x STORED AS CSV LOCATION 'x.csv'")
+    checks["refused at CREATE: a merge table leaving a column unmerged, an unknown WITH option, CREATE EXTERNAL TABLE"] = \
+        "s needs a merge function" in seen["merge"] and "colour" in seen["option"] and bool(seen["external"]) and "totals" not in json.dumps(q("SHOW TABLES")) \
+        and call(port, "POST", "/tier", timeout=60) is not None
+    # A value that doesn't cast is refused, as INSERT … SELECT and append refuse it.
+    seen["cast"] = fails("INSERT INTO ev VALUES ('x', 'abc')")
+    bad = pa.table({"user": ["c"], "n": ["abc"]})
+    seen["flight_cast"] = _raises_text(lambda: put(["ev"], bad))
+    checks["a value that doesn't cast is refused (INSERT … VALUES, DoPut), not stored as NULL"] = "abc" in seen["cast"] and "abc" in seen["flight_cast"] \
+        and q("SELECT count(*) AS n FROM ev") == [{"n": 1}]
+    # A task into a keyed table made in SQL (it has a hidden `_deleted` column).
+    q("CREATE TABLE src (id BIGINT, v VARCHAR)")
+    q("CREATE TABLE latest (id BIGINT PRIMARY KEY, v VARCHAR)")
+    call(port, "POST", "/tasks/latest_of", json.dumps({"source": "src", "target": "latest", "sql": "SELECT id, v FROM src"}).encode())
+    q("INSERT INTO src VALUES (1, 'a'), (2, 'b'), (1, 'c')")
+    want = [{"id": 1, "v": "c"}, {"id": 2, "v": "b"}]
+    checks["a task into a keyed table made in SQL"] = until(lambda: q("SELECT id, v FROM latest ORDER BY id"), want, 15) == want
+    # INSERT … ON CONFLICT (Postgres), UPDATE … FROM, DELETE … USING, TRUNCATE.
+    q("CREATE TABLE users (id BIGINT PRIMARY KEY, name VARCHAR, visits BIGINT)")
+    q("INSERT INTO users VALUES (1, 'ann', 1), (2, 'bob', 1)")
+    q("INSERT INTO users VALUES (1, 'ANN', 1), (3, 'cy', 1) ON CONFLICT (id) DO NOTHING")
+    q("INSERT INTO users VALUES (2, 'bob', 1), (4, 'dee', 1) ON CONFLICT (id) DO UPDATE SET visits = users.visits + excluded.visits")
+    upserted = q("SELECT id, name, visits FROM users ORDER BY id")
+    q("CREATE TABLE stock (id BIGINT, qty BIGINT)")
+    q("CREATE TABLE counted (id BIGINT, qty BIGINT)")
+    q("INSERT INTO stock VALUES (1, 5), (2, 6), (3, 7)")
+    q("INSERT INTO counted VALUES (1, 50), (2, 60), (2, 61)")
+    q("UPDATE stock SET qty = c.qty FROM counted c WHERE stock.id = c.id AND c.qty < 60")
+    q("DELETE FROM stock USING counted c WHERE stock.id = c.id AND c.qty >= 60")  # (id 2 matches twice: deleted once)
+    moved = q("SELECT id, qty FROM stock ORDER BY id")
+    q("TRUNCATE counted")
+    checks["INSERT … ON CONFLICT DO NOTHING / DO UPDATE, UPDATE … FROM, DELETE … USING, TRUNCATE"] = \
+        upserted == [{"id": 1, "name": "ann", "visits": 1}, {"id": 2, "name": "bob", "visits": 2}, {"id": 3, "name": "cy", "visits": 1}, {"id": 4, "name": "dee", "visits": 1}] \
+        and moved == [{"id": 1, "qty": 50}, {"id": 3, "qty": 7}] and q("SELECT count(*) AS n FROM counted") == [{"n": 0}] \
+        and "ON DUPLICATE KEY" in fails("INSERT INTO users VALUES (1, 'x', 1) ON DUPLICATE KEY UPDATE visits = 2")
+    # The types the README names.
+    q("CREATE TABLE blobs (b BINARY, v VARBINARY, l BLOB, j VARIANT, js JSON)")
+    q("""INSERT INTO blobs VALUES (X'010203', X'04', X'05', '{"a": 1}', '[1, 2]')""")
+    seen["bytes"] = q("SELECT byte_length(b) AS n, encode(substr(b, 2), 'hex') AS tail, encode(substr(b, 1, 1), 'hex') AS head, "
+                      "encode(substring(b FROM 2 FOR 1), 'hex') AS mid, json_get_int(j, 'a') AS a, substr('hello', 2, 3) AS text FROM blobs")
+    checks["BINARY, VARBINARY, BLOB, VARIANT and JSON columns; substr on bytes and on text"] = \
+        seen["bytes"] == [{"n": 3, "tail": "0203", "head": "01", "mid": "02", "a": 1, "text": "ell"}]
+    # FROM first, with clauses after; a comment before CREATE FUNCTION.
+    q("-- doubles a number\n/* (for the docs) */ CREATE FUNCTION twice(x BIGINT) RETURNS BIGINT AS 'x * 2'")
+    checks["FROM-first with WHERE and ORDER BY; a comment before CREATE FUNCTION"] = \
+        q("FROM orders WHERE region = 'eu' ORDER BY id") == [{"id": 1, "region": "eu", "amount": 99}, {"id": 4, "region": "eu", "amount": 40}] \
+        and q("SELECT twice(21) AS n") == [{"n": 42}]
+    # COPY … TO STDOUT with a header counts the rows, not the header.
+    with psycopg.connect(f"host=127.0.0.1 port={pgport} dbname=pondra user=u", autocommit=True) as c:
+        cur = c.cursor()
+        with cur.copy("COPY (SELECT id FROM orders ORDER BY id) TO STDOUT WITH (FORMAT csv, HEADER)") as cp:
+            text = b"".join(bytes(b) for b in cp).decode()
+        checks["COPY … TO STDOUT with HEADER: the header, then the rows, counted"] = text.split() == ["id", "1", "2", "4"] and cur.rowcount == 3
+    # TIMESTAMPTZ: an instant, kept and shown in UTC with its zone; TIMESTAMP: a wall-clock time.
+    q("CREATE TABLE times (at TIMESTAMPTZ, local TIMESTAMP)")
+    q("INSERT INTO times VALUES ('2026-09-29 10:00:00+05', '2026-09-29 10:00:00')")
+    with psycopg.connect(f"host=127.0.0.1 port={pgport} dbname=pondra user=u", autocommit=True) as c:
+        seen["timestamptz"] = [c.execute("SELECT at, local FROM times").fetchone(), c.cursor(binary=True).execute("SELECT at FROM times").fetchone()]
+    utc = dt.datetime(2026, 9, 29, 5, tzinfo=dt.timezone.utc)
+    checks["TIMESTAMPTZ is an instant, shown in UTC with its zone (JSON, Postgres text and binary); TIMESTAMP has none"] = \
+        q("SELECT at, local FROM times") == [{"at": "2026-09-29T05:00:00Z", "local": "2026-09-29T10:00:00"}] \
+        and seen["timestamptz"][0] == (utc, dt.datetime(2026, 9, 29, 10)) and seen["timestamptz"][1] == (utc,)
+    # Tokens: what a write token may not do, said as it is.
+    as_ = lambda t, s: call(port + 1, "POST", "/sql", s.encode(), headers={"authorization": f"Bearer {t}"})
+    as_("a", "CREATE TABLE kept (a BIGINT)")
+    seen["drop"] = _raises_text(lambda: as_("w", "DROP TABLE kept"))
+    checks["a write token's DROP TABLE is refused as a change to the lake's tables"] = "may not change the lake's tables" in seen["drop"]
+    # Files: a second PUT to a path says so without the node's own paths; `files/` or not.
+    put_file = lambda p, b: call(port, "PUT", f"/files/{p}", b)
+    put_file("photos/a.txt", b"hello")
+    seen["again"] = _raises_text(lambda: put_file("photos/a.txt", b"again"))
+    listed = lambda p: [r["path"] for r in q(f"SELECT path FROM files('{p}')")]
+    checks["PUT /files twice: refused by name, no server path; files() and file_read() with or without files/"] = \
+        "photos/a.txt is there already" in seen["again"] and lake not in seen["again"] and "/tmp" not in seen["again"] \
+        and listed("photos/") == listed("files/photos/") == ["files/photos/a.txt"] \
+        and q("SELECT byte_length(file_read('photos/a.txt')) AS a, byte_length(file_read('files/photos/a.txt')) AS b") == [{"a": 5, "b": 5}]
+    # An async call in another's arguments (Python functions, file_read): in SELECT, WHERE, GROUP
+    # BY and INSERT … VALUES. A node told `--python auto` that finds no Python with pondra says so.
+    q("CREATE FUNCTION up(s VARCHAR) RETURNS VARCHAR LANGUAGE python AS $$\n    return s.upper()\n$$")
+    q("CREATE FUNCTION rev(s VARCHAR) RETURNS VARCHAR LANGUAGE python AS $$\n    return s[::-1]\n$$")
+    q("CREATE TABLE words (s VARCHAR)")
+    q("INSERT INTO words VALUES ('ab'), ('cd')")
+    q("CREATE TABLE kept_files (s VARCHAR, b BYTEA)")
+    q("INSERT INTO kept_files VALUES (up('x'), file_read('photos/a.txt')), ('y', NULL)")
+    seen["nested"] = [q("SELECT rev(up(s)) AS a FROM words ORDER BY a"), q("SELECT rev(up(rev(s))) AS a FROM words ORDER BY a"), q("SELECT s FROM words WHERE rev(up(s)) = 'BA'"),
+                      q("SELECT rev(up(s)) AS a, count(*) AS n FROM words GROUP BY rev(up(s)) ORDER BY a"), q("SELECT up(CAST(file_read('photos/a.txt') AS VARCHAR)) AS a"),
+                      q("SELECT s, byte_length(b) AS n FROM kept_files ORDER BY s")]
+    as_("a", "CREATE FUNCTION up(s VARCHAR) RETURNS VARCHAR LANGUAGE python AS $$\n    return s.upper()\n$$")
+    seen["no python"] = _raises_text(lambda: as_("r", "SELECT up('a') AS a"))
+    checks["async calls inside async calls (Python functions, file_read) in SELECT, WHERE, GROUP BY, INSERT … VALUES; no Python found, said so"] = \
+        seen["nested"] == [[{"a": "BA"}, {"a": "DC"}], [{"a": "AB"}, {"a": "CD"}], [{"s": "ab"}], [{"a": "BA", "n": 1}, {"a": "DC", "n": 1}], [{"a": "HELLO"}], [{"s": "X", "n": 5}, {"s": "y"}]] \
+        and "no Python with the pondra package" in seen["no python"]
+    # A function served over Flight: callable as soon as it's made, gone as soon as it's dropped.
+    server = subprocess.Popen([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "udf_server.py"), "--port", str(fport + 5)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        until(lambda: _raises(lambda: fl.FlightClient(f"grpc://127.0.0.1:{fport + 5}").list_actions()), False, 20)
+        q("SELECT 1")  # (the node has its functions cached now)
+        call(port, "POST", "/functions/shout", json.dumps({"flight": f"http://127.0.0.1:{fport + 5}", "args": ["Utf8"], "returns": "Utf8"}).encode())
+        made = _try(lambda: q("SELECT shout('hi') AS s"))
+        call(port, "DELETE", "/functions/shout")
+        gone = fails("SELECT shout('hi') AS s")
+    finally:
+        server.kill()
+    checks["a Flight function is callable as soon as it is made, and gone once dropped"] = made == [{"s": "HI"}] and "shout" in gone
+    # ADBC: a handshake without base64 padding ("reader:r" is 8 bytes), ingest modes, table types.
+    shaken = adbc.connect(f"grpc://127.0.0.1:{fport + 1}", db_kwargs={"username": "reader", "password": "r"})
+    cur = shaken.cursor(); cur.execute("SELECT count(*) AS n FROM kept"); seen["handshake"] = cur.fetchone(); cur.close(); shaken.close()
+    conn = adbc.connect(f"grpc://127.0.0.1:{fport}")
+    table = lambda lo, hi: pa.table({"k": pa.array(range(lo, hi), pa.int64())})
+    def ingest(mode, lo, hi, name="ing"):
+        c = conn.cursor()
+        try:
+            return c.adbc_ingest(name, table(lo, hi), mode=mode)
+        finally:
+            c.close()
+    ingest("create", 0, 3)
+    modes = {"create again": _raises_text(lambda: ingest("create", 0, 3)), "append to none": _raises_text(lambda: ingest("append", 0, 3, "none"))}
+    ingest("append", 3, 5)
+    ingest("create_append", 5, 6)
+    ingest("create_append", 0, 2, "fresh")
+    appended = q("SELECT count(*) AS n, sum(k) AS s FROM ing")
+    ingest("replace", 100, 102)
+    replaced = q("SELECT count(*) AS n, sum(k) AS s FROM ing")
+    types = conn.adbc_get_table_types()
+    conn.close()
+    checks["ADBC: username/password (unpadded base64), ingest create/append/create_append/replace, table types"] = seen["handshake"] == (0,) \
+        and all(modes.values()) and appended == [{"n": 6, "s": 15}] and replaced == [{"n": 2, "s": 201}] \
+        and q("SELECT count(*) AS n FROM fresh") == [{"n": 2}] and sorted(types) == ["TABLE", "VIEW"]
+    # NOT NULL and DEFAULT, on every door: a default for each row a write leaves the column out of.
+    import confluent_kafka as ck
+    q("CREATE TABLE acct (id BIGINT PRIMARY KEY, name VARCHAR NOT NULL, status VARCHAR DEFAULT 'new', made TIMESTAMP DEFAULT now(), tag VARCHAR DEFAULT uuid(), n BIGINT DEFAULT 1 + 1)")
+    q("INSERT INTO acct (id, name) VALUES (1, 'ann')")
+    q("INSERT INTO acct VALUES (2, 'bob', DEFAULT, DEFAULT, DEFAULT, 7)")
+    q("INSERT INTO acct (id, name, status) SELECT 3, 'cy', 'old'")
+    call(port, "POST", "/append/acct", b'{"id": 4, "name": "dee"}\n{"id": 5, "name": "eve", "status": null}\n')  # (no producer: at least once)
+    with psycopg.connect(f"host=127.0.0.1 port={pgport} dbname=pondra user=u", autocommit=True) as c:
+        with c.cursor().copy("COPY acct (id, name) FROM STDIN") as cp:
+            cp.write(b"6\tfay\n")
+    put(["acct"], pa.table({"id": pa.array([7], pa.int64()), "name": ["gus"]}))
+    kp = ck.Producer({"bootstrap.servers": f"127.0.0.1:{port + 20}"})
+    kp.produce("acct", key=b"8", value=json.dumps({"id": 8, "name": "hal"}))
+    assert kp.flush(20) == 0
+    kafka_refused = []
+    kp.produce("acct", key=b"9", value=json.dumps({"id": 9}), on_delivery=lambda e, m: kafka_refused.append(e))
+    kp.flush(20)
+    null_refused = {
+        "INSERT": fails("INSERT INTO acct (id) VALUES (9)"), "a NULL key": fails("INSERT INTO acct (id, name) VALUES (NULL, 'x')"),
+        "UPDATE": fails("UPDATE acct SET name = NULL WHERE id = 1"), "append": _raises_text(lambda: call(port, "POST", "/append/acct", b'{"id": 9}\n')),
+        "Flight": _raises_text(lambda: put(["acct"], pa.table({"id": pa.array([9], pa.int64())}))),
+        "Kafka": "acct.name is NOT NULL" if kafka_refused and kafka_refused[0] is not None and "acct.name is NOT NULL" in open(node.log).read() else "",
+    }
+    seen["defaults"] = q("SELECT id, name, status, made IS NOT NULL AS made, length(tag) AS tag, n FROM acct ORDER BY id")
+    row = lambda i, name, status="new", n=2: {"id": i, "name": name, **({"status": status} if status else {}), "made": True, "tag": 36, "n": n}
+    q("CREATE TABLE big (id BIGINT, v VARCHAR DEFAULT 'd', w BIGINT NOT NULL)")
+    q("INSERT INTO big SELECT value, 'x', value FROM range(0, 5)")  # (the same column twice: by position)
+    q("INSERT INTO big (id, w) SELECT value, value FROM range(10, 12)")
+    null_refused["bulk INSERT"] = fails("INSERT INTO big SELECT value FROM range(0, 5)")
+    checks["DEFAULT for a column a write leaves out (INSERT, DEFAULT, append, COPY, Flight, Kafka, bulk INSERT), each row its own"] = \
+        seen["defaults"] == [row(1, "ann"), row(2, "bob", n=7), row(3, "cy", "old"), row(4, "dee"), row(5, "eve", None), row(6, "fay"), row(7, "gus"), row(8, "hal")] \
+        and q("SELECT count(DISTINCT tag) AS n FROM acct") == [{"n": 8}] and q("SELECT v, count(*) AS n FROM big GROUP BY v ORDER BY v") == [{"v": "d", "n": 2}, {"v": "x", "n": 5}]
+    checks["NOT NULL refused by name on every door (a key's columns too); a bad DEFAULT refused at CREATE; ADD COLUMN … DEFAULT refused"] = \
+        all("is NOT NULL" in v for v in null_refused.values()) and "acct.id is NOT NULL" in null_refused["a NULL key"] and q("SELECT count(*) AS n FROM acct") == [{"n": 8}] \
+        and "Cannot cast" in fails("CREATE TABLE bad (a BIGINT DEFAULT 'abc')") and "nope" in fails("CREATE TABLE bad (a BIGINT DEFAULT nope())") \
+        and "rows already there" in fails("ALTER TABLE acct ADD COLUMN z BIGINT DEFAULT 3")
+    # Read your writes on a follower: each statement sees the one before it (a script's INSERT, then
+    # its SELECT; an UPDATE; a table made, then filled), as on the leader.
+    follower = Node(lake, port + 2).start()
+    fq = lambda s: sql(port + 2, s)
+    fq("CREATE TABLE ryw (i BIGINT)")
+    counts, scripts = [], []
+    for i in range(1, 41):
+        fq(f"INSERT INTO ryw VALUES ({i})")
+        counts.append(fq("SELECT count(*) AS n FROM ryw")[0]["n"] == 2 * i - 1)
+        out = call(port + 2, "POST", "/sql", f"INSERT INTO ryw VALUES ({-i}); SELECT count(*) AS n FROM ryw".encode())
+        scripts.append(json.dumps(out).count(f'"n": {2 * i}') == 1 or json.dumps(out).count(f'"n":{2 * i}') == 1)
+    fq("UPDATE ryw SET i = 0 WHERE i < 0")
+    changed = fq("SELECT count(*) AS n FROM ryw WHERE i = 0")
+    follower.kill()
+    seen["ryw"] = [sum(counts), sum(scripts), changed]
+    checks["read your writes on a follower: an INSERT then a SELECT, one request or two, and an UPDATE (40 times)"] = all(counts) and all(scripts) and changed == [{"n": 40}]
+    # `pondra run FILE`: the lake or --url, then parameters, in any order.
+    work = tempfile.mkdtemp(prefix="pondra-run-")
+    with open(os.path.join(work, "day.sql"), "w") as f:
+        f.write("SELECT $day AS d;\n")
+    run = lambda *a: subprocess.run([BIN, "run", os.path.join(work, "day.sql"), *a], capture_output=True, text=True, timeout=120)
+    by_url, url_last, both = run("--day", "x1", "--url", f"http://127.0.0.1:{port}"), run("--url", f"http://127.0.0.1:{port}", "--day", "x2"), run(os.path.join(work, "l"), "--day", "x3", "--url", f"http://127.0.0.1:{port}")
+    checks["pondra run: --url and parameters in any order; a lake and --url together refused"] = "x1" in by_url.stdout and "x2" in url_last.stdout \
+        and both.returncode != 0 and "not both" in both.stderr
+    # `pondra sql`: a folder with no lake said so (no backtrace, even with RUST_BACKTRACE set); a
+    # write makes the lake; files and read_*() in CREATE TABLE … AS and INSERT, as a node takes them.
+    with open(os.path.join(work, "o.ndjson"), "w") as f:
+        f.write('{"a": 1, "b": "x"}\n{"a": 2, "b": "y"}\n')
+    with open(os.path.join(work, "o.csv"), "w") as f:
+        f.write("a,b\n3,z\n")
+    cli = lambda d, s: subprocess.run([BIN, "sql", "--dir", os.path.join(work, d), s], capture_output=True, text=True, timeout=120, cwd=work, env={**os.environ, "RUST_BACKTRACE": "1"})
+    empty = cli("empty", "SELECT 1")
+    made = cli("fresh", "CREATE TABLE t AS SELECT * FROM 'o.ndjson'")
+    more = cli("fresh", "INSERT INTO t SELECT * FROM read_csv('o.csv')")
+    wrong = cli("fresh", "SELECT nope FROM t")
+    seen["cli"] = [empty.stderr[-300:], made.stdout + made.stderr[-300:], more.stdout + more.stderr[-300:], wrong.stderr[-300:]]
+    checks["pondra sql: no lake there said so; a write makes one; files in CTAS and INSERT; errors without backtraces"] = \
+        empty.returncode == 1 and "holds no lake yet" in empty.stderr and made.returncode == 0 and more.returncode == 0 \
+        and "| 3 | 6 |" in cli("fresh", "SELECT count(*) AS n, sum(a) AS s FROM t").stdout \
+        and wrong.returncode == 1 and "nope" in wrong.stderr and not any("backtrace" in e.lower() for e in (empty.stderr, wrong.stderr))
+    shutil.rmtree(work, ignore_errors=True)
+    node.kill(); locked.kill()
+    ok = all(checks.values())
+    print(json.dumps({"found": checks, "ok": ok}, indent=1))
+    if not ok:
+        print(json.dumps({k: (v if not isinstance(v, str) else v[:400]) for k, v in seen.items()}, default=str, indent=1), {k: v[:200] for k, v in null_refused.items()}, zero[:300], flight_zero[:300], upserted, moved, modes, appended, replaced, types, by_url.stdout + by_url.stderr, url_last.stdout, both.stderr[:300])
+        sys.exit(1)
+    return f"found: what writing the docs found, fixed: all {len(checks)} checks pass"
+
+
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    out = {t.__name__: t() for t in (upsert, deal, outside, clouds, kafkas, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, names, answers, writes, live, temps, across, scale, flight, reader, crash)}
+    out = {t.__name__: t() for t in (upsert, deal, outside, clouds, kafkas, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, names, answers, writes, live, temps, across, found, scale, flight, reader, crash)}
     A.secs = min(A.secs, 20)
     out["load"] = load()
     print(json.dumps(out, indent=1))
@@ -3667,7 +3973,7 @@ def all_tests():
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "names", "answers", "writes", "live", "temps", "across", "scale", "flight", "load", "all"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "names", "answers", "writes", "live", "temps", "across", "found", "scale", "flight", "load", "all"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -3678,4 +3984,4 @@ if __name__ == "__main__":
     ap.add_argument("--secs", type=int, default=30)
     ap.add_argument("--flush-ms", type=int, default=250)
     A = ap.parse_args()
-    {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "names": names, "answers": answers, "writes": writes, "live": live, "temps": temps, "across": across, "scale": scale, "flight": flight, "load": load, "all": all_tests}[A.mode]()
+    {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "names": names, "answers": answers, "writes": writes, "live": live, "temps": temps, "across": across, "found": found, "scale": scale, "flight": flight, "load": load, "all": all_tests}[A.mode]()

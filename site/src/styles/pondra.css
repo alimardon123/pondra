@@ -1,0 +1,12 @@
+/* Pondra's colours: a pond's teal as the accent, in light and dark. */
+:root {
+  --sl-color-accent-low: #0b2f2e;
+  --sl-color-accent: #1aa6a0;
+  --sl-color-accent-high: #b8f0ec;
+  --sl-content-width: 50rem;
+}
+:root[data-theme='light'] {
+  --sl-color-accent-low: #cdf3f0;
+  --sl-color-accent: #0f7f7a;
+  --sl-color-accent-high: #0a403d;
+}

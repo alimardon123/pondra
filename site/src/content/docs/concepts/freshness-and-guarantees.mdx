@@ -1,0 +1,274 @@
+---
+title: Freshness and guarantees
+description: When a write is safe, what exactly-once covers, and how soon each kind of reader sees a write.
+sidebar:
+  order: 4
+---
+
+import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+
+This page says what Pondra promises about your writes, and how soon each reader sees them. The
+numbers were measured on a 2-vCPU test machine, with real Cloudflare R2 buckets where marked. They
+tell you the shape, not what your hardware will do.
+
+## Exactly once
+
+A batch you write is applied once, even if you send it twice. The rules for a **producer**:
+
+- It has its own name and sends batches in order, with an increasing `seq`, one request in flight.
+- It sends to any node, and retries, on any node, until it is acknowledged.
+- A retry of a batch that already committed comes back as `"duplicate": true`, and adds nothing.
+
+The Python and JavaScript clients do this for you: `db.append` keeps a producer name and a `seq`, and
+retries with the same one. With plain HTTP you do it yourself:
+
+```sql
+CREATE TABLE events (user VARCHAR, amount BIGINT);
+```
+
+```bash
+printf '{"user":"ann","amount":5}\n{"user":"bob","amount":3}\n' > batch.ndjson
+for attempt in 1 2; do
+  curl -s -X POST "localhost:8080/append/events?producer=shop&seq=1" --data-binary @batch.ndjson | grep -o '"duplicate":[a-z]*'
+done
+```
+
+```text
+"duplicate":false
+"duplicate":true
+```
+
+```sql
+SELECT count(*) AS rows_written FROM events;
+```
+
+```text
++--------------+
+| rows_written |
++--------------+
+| 2            |
++--------------+
+```
+
+The batch went in once. A SQL write is made exactly-once with a **job** id: send the same job again
+and it is applied once.
+
+<Tabs syncKey="lang">
+  <TabItem label="Python">
+    ```python
+    import pondra
+    db = pondra.connect("http://localhost:8080")
+    db.sql("INSERT INTO events VALUES ('cy', 9)", job="load-2026-09-29")
+    print(db.sql("INSERT INTO events VALUES ('cy', 9)", job="load-2026-09-29"))
+    ```
+
+    ```text
+    {'duplicate': True}
+    ```
+  </TabItem>
+  <TabItem label="Shell">
+    ```bash
+    for attempt in 1 2; do
+      curl -s -X POST "localhost:8080/sql?job=load-b" --data-binary "INSERT INTO events VALUES ('dee', 1)"; echo
+    done
+    ```
+
+    ```text
+    {"rows":1}
+    {"duplicate":true}
+    ```
+  </TabItem>
+</Tabs>
+
+The same idea covers the rest:
+
+- **`pondra sql`** takes its job id from `PONDRA_JOB` and keeps it across a restart.
+- **Materialized views** take every source row once, even with rows streaming into several nodes
+  while the view is made, or the leader killed meanwhile.
+- **Streaming tasks** commit their output and their progress together, only if the progress is
+  unchanged, so a restart neither loses a row nor repeats one.
+- **Windows and sessions** are emitted once, when the watermark passes them.
+- **Kafka producers** are exactly-once when they are idempotent.
+
+## When a write is acknowledged
+
+`--ack` says when the node tells you a write is safe. Give every node the same value.
+
+| | `--ack durable` (default) | `--ack replicated` |
+|---|---|---|
+| Acknowledged when | The commit is in the bucket: one object-store write | `--replicas` nodes hold it (default 2: the leader in memory, a follower on its local disk). The bucket gets it a moment later |
+| Local disk | 4 ms | Not measured separately |
+| Cloudflare R2, near bucket | 300 ms median (458 ms worst of 8 to 10) | 2 ms median (5 ms worst) |
+| Cloudflare R2, far bucket | 723 ms median (1,000 ms worst) | 2 ms median (4 ms worst) |
+| It survives | Anything: it is in the bucket | Any one node dying, the leader included |
+| It does not survive | | The leader and every holder dying in the same moment, before the bucket has the write (one bucket write: 0.3 to 0.7 s on R2) |
+
+```bash norun
+pondra serve --dir s3://my-bucket/lake --ack replicated --addr 10.0.0.1:8080
+```
+
+<Aside type="caution">
+With `--ack replicated`, a follower's copy is in its page cache. It survives a process crash, not a
+power loss. `--fsync` makes followers flush each copy to disk first: 4 ms median and 9 ms at p99 in
+that test. Acknowledged commits can be at most 256 ahead of the bucket, and if the bucket stalls,
+acknowledgements wait for it.
+</Aside>
+
+A new leader recovers before it takes writes. It asks every follower that counted for what it holds
+beyond the bucket, and commits those changes again. Kill to writes acknowledged again took 10 to 13
+seconds on simulated R2 (10.9 s in `durable` mode), and 14 to 16 seconds on real R2 with replicated
+acks. With the nodes on one machine, another node takes over after 4.5 to 5.3 seconds when the
+leader dies.
+
+## Who sees a write, and when
+
+<figure>
+<div style={{overflowX: "auto"}}>
+<svg style={{minWidth: "660px"}} viewBox="0 0 810 340" width="100%" role="img" aria-labelledby="fresh-t" font-family="system-ui, sans-serif" font-size="13" fill="currentColor">
+<title id="fresh-t">Median time from a write being acknowledged to each reader seeing it, on local disk and on a real Cloudflare R2 bucket, on a log scale from 1 millisecond to 10 seconds.</title>
+<circle cx="258" cy="18" r="5"/><text x="270" y="22" font-size="12">local disk</text>
+<rect x="353" y="13" width="10" height="10" fill="none" stroke="currentColor" stroke-width="2"/><text x="370" y="22" font-size="12">real R2, near bucket, default ack</text>
+<path d="M630,24 L636,13 L642,24 z"/><text x="648" y="22" font-size="12">R2, replicated ack</text>
+<line x1="250.0" y1="40" x2="250.0" y2="292" stroke="currentColor" stroke-opacity="0.15"/>
+<text x="250.0" y="314" text-anchor="middle" font-size="12" fill-opacity="0.8">1 ms</text>
+<line x1="370.0" y1="40" x2="370.0" y2="292" stroke="currentColor" stroke-opacity="0.15"/>
+<text x="370.0" y="314" text-anchor="middle" font-size="12" fill-opacity="0.8">10 ms</text>
+<line x1="490.0" y1="40" x2="490.0" y2="292" stroke="currentColor" stroke-opacity="0.15"/>
+<text x="490.0" y="314" text-anchor="middle" font-size="12" fill-opacity="0.8">100 ms</text>
+<line x1="610.0" y1="40" x2="610.0" y2="292" stroke="currentColor" stroke-opacity="0.15"/>
+<text x="610.0" y="314" text-anchor="middle" font-size="12" fill-opacity="0.8">1 s</text>
+<line x1="730.0" y1="40" x2="730.0" y2="292" stroke="currentColor" stroke-opacity="0.15"/>
+<text x="730.0" y="314" text-anchor="middle" font-size="12" fill-opacity="0.8">10 s</text>
+<line x1="250" y1="292" x2="730" y2="292" stroke="currentColor" stroke-opacity="0.5"/>
+<text x="240" y="76" text-anchor="end">Write acknowledged</text>
+<line x1="250" y1="72" x2="730" y2="72" stroke="currentColor" stroke-opacity="0.08"/>
+<circle cx="322.2" cy="72" r="5"/>
+<text x="322.2" y="94" text-anchor="middle" font-size="11">4 ms</text>
+<rect x="542.3" y="67" width="10" height="10" fill="none" stroke="currentColor" stroke-width="2"/>
+<text x="547.3" y="61" text-anchor="middle" font-size="11">300 ms</text>
+<path d="M280.1,77 L286.1,66 L292.1,77 z"/>
+<text x="286.1" y="61" text-anchor="middle" font-size="11">2 ms</text>
+<text x="240" y="124" text-anchor="end">Another node can read it</text>
+<line x1="250" y1="120" x2="730" y2="120" stroke="currentColor" stroke-opacity="0.08"/>
+<circle cx="391.1" cy="120" r="5"/>
+<text x="391.1" y="142" text-anchor="middle" font-size="11">15 ms</text>
+<rect x="365.0" y="115" width="10" height="10" fill="none" stroke="currentColor" stroke-width="2"/>
+<text x="370.0" y="109" text-anchor="middle" font-size="11">10 ms</text>
+<text x="240" y="172" text-anchor="end">A new pondra sql process</text>
+<line x1="250" y1="168" x2="730" y2="168" stroke="currentColor" stroke-opacity="0.08"/>
+<circle cx="433.8" cy="168" r="5"/>
+<text x="433.8" y="190" text-anchor="middle" font-size="11">34 ms</text>
+<rect x="664.0" y="163" width="10" height="10" fill="none" stroke="currentColor" stroke-width="2"/>
+<text x="669.0" y="157" text-anchor="middle" font-size="11">3.1 s</text>
+<text x="240" y="220" text-anchor="end">A Delta reader (delta-rs)</text>
+<line x1="250" y1="216" x2="730" y2="216" stroke="currentColor" stroke-opacity="0.08"/>
+<circle cx="436.8" cy="216" r="5"/>
+<text x="436.8" y="238" text-anchor="middle" font-size="11">36 ms</text>
+<rect x="667.2" y="211" width="10" height="10" fill="none" stroke="currentColor" stroke-width="2"/>
+<text x="672.2" y="205" text-anchor="middle" font-size="11">3.3 s</text>
+<text x="240" y="268" text-anchor="end">An Iceberg reader (PyIceberg)</text>
+<line x1="250" y1="264" x2="730" y2="264" stroke="currentColor" stroke-opacity="0.08"/>
+<circle cx="429.0" cy="264" r="5"/>
+<text x="429.0" y="286" text-anchor="middle" font-size="11">31 ms</text>
+<rect x="675.9" y="259" width="10" height="10" fill="none" stroke="currentColor" stroke-width="2"/>
+<text x="680.9" y="253" text-anchor="middle" font-size="11">3.9 s</text>
+</svg>
+</div>
+<figcaption>Median time from the acknowledgement to the first read that sees the row, on a log scale. Delta and Iceberg readers were measured at <code>--tier-secs 2</code>.</figcaption>
+</figure>
+
+Pondra's own readers see a write quickly. Other engines see it after the next tiering round.
+
+**How it was measured.** One row is written per probe, after a quiet spell, and every reader polls at
+once, each in its own process. The time is from the acknowledgement to the first read that sees the
+row. The setup is 3 processes on one 2-vCPU machine, with two real R2 buckets: a near one (Eastern
+North America, about 290 ms per write from there) and a far one (about 670 ms). Each cell is the
+median, with the worst of 8 to 10 probes in brackets. Where a cell has two numbers, they are `durable`
+and `--ack replicated`.
+
+| Reader | Local disk | Real R2, near | Real R2, far |
+|---|---|---|---|
+| **Write acknowledged** | 4 ms | 300 ms (458) / **2 ms** (5) | 723 ms (1,000) / **2 ms** (4) |
+| **Another node** | 15 ms | 10 ms (56) / 13 ms (16) | 17 ms (28) / 9 ms (27) |
+| **A read-only node** | 15 ms | 11 ms (56) / 13 ms (16) | 13 ms (32) / 14 ms (29) |
+| **A new `pondra sql` process** | 34 ms | 3.1 s / 2.9 s | 5.8 s / 5.5 s |
+| **Delta** (delta-rs) | 36 ms | 3.3 s (4.3) / 3.6 s (5.1) | 7.1 s (9.4) / 7.2 s (9.1) |
+| **Iceberg** (PyIceberg) | 31 ms | 3.9 s (5.8) / 4.0 s (7.7) | 10.0 s (11.3) / 9.7 s (12.2) |
+
+- **Nodes** get every commit streamed from the leader, so they see a write about 10 to 15 ms after
+  the acknowledgement. The pollers were competing for two cores: a node alone sees it in about 5 ms.
+- **`pondra sql`** sees every write already in the bucket, so it is fresh, but it is not fast on
+  far-away storage: it spends about 20 sequential requests opening the catalog. For reads that are
+  fast and fresh, join with `pondra serve --reader`. With `--ack replicated`, `pondra sql` can be up
+  to one bucket write behind the acknowledgements.
+- **Delta and Iceberg readers** see the table as of the last tiering round: a few sequential round
+  trips to the bucket, and Iceberg needs two more than Delta. A published keyed table shows as of its
+  last full compaction. The default `--tier-secs` is now 10, so these can be up to 10 seconds
+  further behind than measured here. `--tier-secs 0.5` brings them closer, for more object-store
+  writes.
+
+Other ways to see a change as it happens:
+
+| Way | How soon | Notes |
+|---|---|---|
+| `GET /watch/{table}`: new rows as NDJSON | As the rows commit | The node pushes them: nothing to poll |
+| `db.live(sql)`, `GET /live`: the answer now, and again after each commit that changes it | 9 to 19 ms after the statement on local disk. 0.4 to 0.5 s on R2, which includes the commit's own round trip | Nothing runs once the client goes |
+| A Kafka consumer on another node | 1 ms median, 2 ms at p99, after the producer sent, with replicated acks | 3 nodes, 4 librdkafka producers, one 2-vCPU machine |
+| A table's log as an Arrow Flight stream | Each new commit in 2.6 ms | |
+| A materialized view's row on another node | About 5 ms after the event | A view's row commits with the rows it comes from |
+| A stream-join pair | 14 ms median after the second row's acknowledgement (24 ms at worst) | |
+
+A window view's `_final` table gets each window once, when the watermark passes its end. The
+watermark is the newest event time in the stream, less the lateness you allow.
+
+<Aside type="caution">
+There is one watermark per source, not per partition or per node. A source that goes quiet holds it,
+and its last windows and sessions wait for more rows.
+</Aside>
+
+## What a query sees
+
+A query reads the Parquet files and the log tail as one snapshot, so it never sees half a commit. A
+node's view of the catalog never goes back in time: after a gap in the leader's stream it falls back
+to the bucket's view, checked before and after every read. In the consistency tests, with 64 writers
+and 16 readers, there were no torn reads and no lost or duplicated batches.
+
+- **The result cache.** A repeated query is answered from a cache until the next commit changes what
+  it reads. `stale_ms=N` in a request accepts an answer up to N milliseconds old. With writes landing
+  every few milliseconds, one dashboard query ran 230 times a second exact and 10,900 times a second
+  with `stale_ms=1000` (on the leader, local disk).
+- **Spread queries** give the same answers as one node, every run. All 22 TPC-H queries did.
+- **`sum` over `DOUBLE`** gives the same answer in any order, on any number of nodes.
+
+## Crashes, failover and full shutdown
+
+- **A node killed.** Producers retry on another node, and a retried batch is recognised.
+- **The leader killed.** Another node takes over. The catalog fences the old leader, so it can't write
+  once it is replaced.
+- **Everything stopped.** The first node started on the lake leads at once. A lake with nothing
+  running still answers `pondra sql`.
+- **The test.** The repository's `tools/harness.py crash` kills the process with `kill -9` and injects
+  crashes at chosen points. It found no lost and no duplicated rows across the runs, including
+  leader failover and a split brain.
+
+<Aside type="caution">
+What Pondra does not promise yet:
+
+- A write to two lakes is two commits, not one transaction.
+- Only `sum` over `DOUBLE` is order-independent. `avg`, `stddev` and the like can differ in their last
+  bits from run to run.
+- Kafka topics have one partition, and there are no Kafka transactions. Consumer groups live in the
+  leader's memory, and members rejoin after a failover.
+- Row ids and Kafka offsets are built from commit numbers shifted by 32 bits. With a steady 500
+  commits a second on local disk, Kafka offsets turn negative after about 50 days and row ids repeat
+  after about 100. On R2 that is years away. ADR-029 (proposed) plans the fix in its first phase.
+- Pondra is a prototype. Chaos tests on real clusters, fuzzing and long soak runs are still on the
+  plan.
+</Aside>
+
+## Design notes
+
+[ADR-009](https://github.com/alimardon123/pondra/blob/main/docs/adr-009-native-first.md) has the
+replicated acknowledgement and its safety rules.
+[ADR-005](https://github.com/alimardon123/pondra/blob/main/docs/adr-005-every-node-writes.md)
+covers how every node writes and how views stay exactly-once.

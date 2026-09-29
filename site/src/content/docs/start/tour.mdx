@@ -1,0 +1,240 @@
+---
+title: A ten-minute tour
+description: A table, a keyed table, a view that stays current, a frame, a Python function, a live query, a Parquet file in and an export out.
+sidebar:
+  order: 4
+---
+
+import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+
+This tour touches most of what Pondra does, one small step at a time. Each step is a few lines you can
+paste and run, and each builds on the ones before it. The guides go deeper on every step.
+
+Start a node on a lake in the current folder, with Python functions on (step 5). `pondra.local()`
+and the [shell](/pondra/start/shell/) turn them on for you.
+
+```bash norun
+pondra serve --dir lake --addr 127.0.0.1:8080 --python auto
+```
+
+Then connect from Python:
+
+```python
+import pondra
+db = pondra.connect("http://localhost:8080")
+```
+
+## 1. A table
+
+An append table takes rows from SQL, or from a client's `append`, which is exactly-once: a retry
+after a lost answer is recognised and not applied twice.
+
+```sql
+CREATE TABLE orders (id BIGINT, item VARCHAR, qty INT, amount DOUBLE);
+INSERT INTO orders VALUES (1, 'tea', 2, 7.0), (2, 'cake', 1, 4.5), (3, 'tea', 1, 3.5);
+```
+
+```python
+db.append("orders", [{"id": 4, "item": "coffee", "qty": 1, "amount": 3.0}])
+print(db.sql("SELECT item, sum(qty) AS items FROM orders GROUP BY item ORDER BY item").rows())
+```
+
+```text
+[{'item': 'cake', 'items': 1}, {'item': 'coffee', 'items': 1}, {'item': 'tea', 'items': 3}]
+```
+
+A write is visible to every query as soon as it is acknowledged.
+
+## 2. A keyed table
+
+Give a table a `PRIMARY KEY` and `INSERT` becomes an upsert: one current row per key.
+
+```sql
+CREATE TABLE customers (id BIGINT PRIMARY KEY, name VARCHAR, city VARCHAR);
+INSERT INTO customers VALUES (1, 'ann', 'Tashkent'), (2, 'bob', 'Paris');
+INSERT INTO customers VALUES (2, 'bob', 'Rome');
+```
+
+```python
+print(db.lookup("customers", 2))                                   # one key, without SQL planning
+print(db.sql("SELECT * FROM customers ORDER BY id").rows())
+```
+
+```text
+{'id': 2, 'name': 'bob', 'city': 'Rome'}
+[{'id': 1, 'name': 'ann', 'city': 'Tashkent'}, {'id': 2, 'name': 'bob', 'city': 'Rome'}]
+```
+
+## 3. A view that stays current
+
+A materialized view is a query whose answer Pondra keeps up to date. It starts from the rows already
+in `orders`, and each new batch of rows updates it in the same commit.
+
+```sql
+CREATE MATERIALIZED VIEW sales_by_item AS
+  SELECT item, sum(qty) AS items, sum(amount) AS total FROM orders GROUP BY item;
+```
+
+```python
+db.append("orders", [{"id": 5, "item": "tea", "qty": 10, "amount": 35.0}])
+print(db.sql("SELECT * FROM sales_by_item ORDER BY item").rows())
+```
+
+```text
+[{'item': 'cake', 'items': 1, 'total': 4.5}, {'item': 'coffee', 'items': 1, 'total': 3.0}, {'item': 'tea', 'items': 13, 'total': 45.5}]
+```
+
+There is nothing to refresh and no job to schedule: the `tea` row already counts the order you just
+appended.
+
+## 4. A frame
+
+A frame is a query written in Python, with Polars' names. Nothing runs until you ask for rows, and
+then it runs as one SQL statement.
+
+```python
+from pondra import col
+
+top = (db.table("orders")
+         .group_by("item")
+         .agg(col("amount").sum().alias("total"))
+         .sort("total", descending=True))
+print(top.rows())
+print(db.sql("SELECT item FROM top WHERE total > $min", min=5).rows())   # SQL reads Python by name
+```
+
+```text
+[{'item': 'tea', 'total': 45.5}, {'item': 'cake', 'total': 4.5}, {'item': 'coffee', 'total': 3.0}]
+[{'item': 'tea'}]
+```
+
+`top.sql` is the statement the frame runs. SQL and frames mix in both directions: `db.sql(...)` gives
+back a frame, and SQL names the frames and pandas, Polars or Arrow data in your program by their
+variable names.
+
+## 5. A Python function
+
+A function written in Python is kept in the lake, and any query can call it, on every node.
+
+```sql
+CREATE FUNCTION slug(t VARCHAR) RETURNS VARCHAR LANGUAGE python AS $$
+import re
+return re.sub(r'[^a-z0-9]+', '-', t.lower()).strip('-')
+$$;
+SELECT item, slug(item || ' special!') AS tag FROM orders GROUP BY item ORDER BY item;
+```
+
+```text
++--------+----------------+
+| item   | tag            |
++--------+----------------+
+| cake   | cake-special   |
+| coffee | coffee-special |
+| tea    | tea-special    |
++--------+----------------+
+```
+
+In a script or notebook you can write it as a plain `def` under `@db.function` instead.
+
+## 6. A live query
+
+`live` gives a query's answer now, and again each time a commit changes it. Nothing runs on the node
+once you stop listening.
+
+<Tabs syncKey="lang">
+  <TabItem label="Python">
+    ```python
+    import threading
+
+    # an order comes in half a second from now
+    threading.Timer(0.5, lambda: db.sql("INSERT INTO orders VALUES (6, 'coffee', 2, 6.0)")).start()
+
+    for i, rows in enumerate(db.live("SELECT item, sum(qty) AS items FROM orders GROUP BY item ORDER BY item")):
+        print(i, rows)
+        if i == 1:
+            break
+    ```
+  </TabItem>
+  <TabItem label="JavaScript">
+    ```js
+    import { connect } from "pondra";
+    const db = connect("http://localhost:8080");
+
+    // an order comes in half a second from now
+    setTimeout(() => db.sql("INSERT INTO orders VALUES (7, 'juice', 1, 2.5)"), 500);
+
+    let i = 0;
+    for await (const rows of db.live("SELECT item, sum(qty) AS items FROM orders GROUP BY item ORDER BY item")) {
+      console.log(i++, rows);
+      if (i === 2) break;
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+```text
+0 [{'item': 'cake', 'items': 1}, {'item': 'coffee', 'items': 1}, {'item': 'tea', 'items': 13}]
+1 [{'item': 'cake', 'items': 1}, {'item': 'coffee', 'items': 3}, {'item': 'tea', 'items': 13}]
+```
+
+## 7. Read a Parquet file
+
+Make a small Parquet file, then read it with SQL. Files on your machine are read by programs on your
+machine, so this uses `pondra sql`, which needs no node of its own: it works on the same lake the node
+has open.
+
+```python
+import pyarrow as pa, pyarrow.parquet as pq
+
+pq.write_table(pa.table({"city": ["Tashkent", "Paris", "Rome"], "visitors": [120, 340, 95]}), "visitors.parquet")
+```
+
+```bash
+pondra sql --dir lake "SELECT city, visitors FROM 'visitors.parquet' ORDER BY visitors DESC"
+pondra sql --dir lake "CREATE TABLE visitors AS SELECT * FROM 'visitors.parquet'"
+```
+
+```text
++----------+----------+
+| city     | visitors |
++----------+----------+
+| Paris    | 340      |
+| Tashkent | 120      |
+| Rome     | 95       |
++----------+----------+
+{"rows":3}
+```
+
+The second statement copied the file's rows into a table, so now the node, your Python and every
+other client can query `visitors`.
+
+## 8. Write a file
+
+`COPY … TO` writes a query's rows to a file. Read it back, or hand it to any other tool.
+
+```bash
+pondra sql --dir lake "COPY (SELECT c.city, v.visitors FROM customers c JOIN visitors v USING (city)) TO 'busy.parquet' (FORMAT parquet)"
+pondra sql --dir lake "SELECT * FROM 'busy.parquet' ORDER BY city"
+```
+
+```text
+{"copied":2,"to":"busy.parquet"}
++----------+----------+
+| city     | visitors |
++----------+----------+
+| Rome     | 95       |
+| Tashkent | 120      |
++----------+----------+
+```
+
+<Aside>
+`COPY` also writes CSV, JSON lines, Delta and Iceberg tables, partitioned folders, and Kafka topics,
+and reads them all back. See [Files and other lakes](/pondra/guides/files-and-other-lakes/).
+</Aside>
+
+## Where to next
+
+- [Tables](/pondra/guides/tables/): every option of `CREATE TABLE`, schemas and databases, `ALTER TABLE`.
+- [Load data](/pondra/guides/load-data/) and [Query](/pondra/guides/query/).
+- [Change rows](/pondra/guides/change-rows/): `UPDATE`, `DELETE` and `MERGE`.
+- [Streaming](/pondra/guides/streaming/): windows, sessions and stream joins over views like step 3.

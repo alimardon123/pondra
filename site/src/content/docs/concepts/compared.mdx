@@ -1,0 +1,232 @@
+---
+title: Pondra compared
+description: Where Pondra fits next to Spark, Flink, Fluss, DuckDB, Databricks and Snowflake, and where each of them is the better choice.
+sidebar:
+  order: 6
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Pondra puts a stream log, a lakehouse and a SQL engine in one binary, to replace Kafka, Flink, Spark
+and a metastore for the common jobs. It is a prototype. This page puts it next to the tools you may be
+choosing between, says what each one is, and says where each one is stronger. The numbers are in
+[Performance](/pondra/concepts/performance/).
+
+## The short answer
+
+Per machine, in the main areas, Pondra measured ahead of Spark and Flink:
+
+- **Batch SQL:** TPC-H SF1 ran about 10 times faster than Spark (5.9 s against 58 to 65 s for all 22
+  queries, same answers).
+- **Stateful streaming:** about 3 times Flink's throughput on a keyed aggregation.
+- **Latency:** a change shows up on another node in about 5 ms. Writes are acknowledged in 2 to 4 ms on
+  R2 with `--ack replicated`.
+
+At cluster scale, and in breadth, it is not there yet:
+
+- **Scale:** Spark and Flink are proven on thousands of machines. Pondra has run on several processes
+  on one machine and on three machines over the internet, and nothing has run on a cluster in one data
+  centre.
+- **Streaming features:** Flink has timers, CEP and a watermark per partition. Pondra doesn't.
+- **Ecosystem:** Spark and Databricks have hundreds of connectors and mature governance.
+- **Maturity:** Pondra is a prototype.
+
+Pondra's own notes put the realistic claim like this: it can beat them for the common case (small to
+mid-size clusters, up to terabytes a day, SQL-shaped work) and take far less to run. The gaps are
+engineering work with a known shape. The biggest open risk is scale-out, and only a multi-machine
+benchmark can retire it.
+
+## At a glance
+
+| | What it is | Pick it over Pondra when | Pick Pondra when |
+|---|---|---|---|
+| **Spark** | A distributed batch and streaming engine, with DataFrame APIs in Python, Scala, Java and R | You need thousands of machines, Scala or Java jobs, hundreds of connectors, or a managed platform | The work is SQL-shaped, one small cluster does it, and you don't want a JVM cluster |
+| **Flink** | A stateful stream processor | You need timers, CEP, Top-N by event time, a watermark per partition or very large keyed state | SQL views, windows, joins and deduplication cover it, and you want no checkpoints and no Kafka underneath |
+| **Fluss** | Streaming storage: a columnar log and primary-key tables, tiered to a lake | You want its proven scale and its Flink integration | You want the same ideas without ZooKeeper, TabletServers and a Flink tiering job |
+| **DuckDB** (and Polars, Daft) | An analytical engine in your process | You want an embedded engine with a mature ecosystem, or its own format's speed | You also need ingest, streaming and serving, or more than one machine |
+| **Databricks** | A managed lakehouse platform | You want a managed platform, Unity Catalog governance, notebooks, ML and AI tools | You want to run it yourself, cheaply, from one binary |
+| **Snowflake** | A managed cloud data warehouse | You want a managed warehouse with mature governance | You want open files in your own bucket, and streaming |
+
+## Spark
+
+Spark is a distributed engine for batch and streaming jobs, with DataFrame APIs in Python, Scala, Java
+and R.
+
+**Where Spark is stronger:**
+
+- It is proven on thousands of machines, with shuffles, spilling and skew handling.
+- It has hundreds of connectors, notebooks, and Spark Connect clients in several languages.
+- Real-Time Mode gives millisecond streaming latency. It became generally available in 4.1, for
+  stateless Scala queries first.
+- Scala and Java jobs run as they are. Pondra has no Scala or Java API, and no Spark Connect server.
+
+**Where Pondra fits:**
+
+- On the same machine, TPC-H SF1 took 5.9 s against Spark's 58.5 to 65.2 s, and a 20-million-row batch
+  ran 2 to 14 times faster, with 293 MB of peak memory against 1.5 GB.
+- One binary of about 100 MB, against 485 MB of PySpark and a JVM. It starts a first query in 0.02 to
+  0.07 s, where Spark takes 4.1 s.
+- `pondra.spark` takes a PySpark job by changing its imports. 55 of 55 test pipelines give PySpark 4's
+  own answers and column names. [PySpark](/pondra/guides/pyspark/) says what differs.
+- Views and tasks are declared in SQL and run incrementally, as Spark's declarative pipelines do.
+
+If you want PySpark and Spark SQL to run unchanged, [Sail (LakeSail)](https://github.com/lakehq/sail) is
+a Rust replacement for Spark built on the same DataFusion engine. It replaces Spark. Pondra replaces the
+stack around it too: ingest, exactly-once streaming, views, keyed tables, serving and a catalog in the
+bucket.
+
+## Flink
+
+Flink is a stateful stream processor.
+
+**Where Flink is stronger:**
+
+- Timers, pattern matching (CEP, `MATCH_RECOGNIZE`), Top-N by event time, a watermark per partition,
+  and very large keyed state. Pondra has none of the first three, and one watermark per source.
+- The DataStream API, and years in production at scale.
+- Newer SQL: materialized tables with a declared freshness, `ML_PREDICT`, `VECTOR_SEARCH`, Flink Agents.
+
+**Where Pondra fits:**
+
+- Streaming SQL that is part of the same engine: a materialized view is kept current on every commit,
+  filled from the rows already there. Event-time tumbling, sliding and session windows are emitted once.
+  Two streams join with each pair once, `ASOF JOIN` looks a table up as it was, and `order_by`
+  deduplicates by event time.
+- About 3 times Flink's throughput on a keyed aggregation of 10 million events (4.2 s end to end,
+  durable, over HTTP, against 13.3 s), and on the Nexmark queries q1, q2, q5, q7 and q11, 10 million
+  bids in 8.7 to 10.9 s against Flink 2.3's 24.3 to 25.0 s. Flink generated its input in process,
+  and Pondra took its over HTTP.
+- A change is visible on another node in 5 ms. Flink's exactly-once results become visible at a
+  checkpoint.
+- No JVM, checkpoints, or Kafka or Fluss underneath.
+
+Pondra's stream joins run on the leader alone.
+
+## Fluss
+
+Apache Fluss is streaming storage for analytics: a columnar log and primary-key tables with changelogs
+and lookups, whose lake tables a tiering service writes to Paimon, Iceberg or Lance. It became an Apache
+top-level project in August 2026 and released 1.0 on 2026-09-21. You pair it with Flink.
+
+**Where Fluss is stronger:**
+
+- It runs at scale: Alibaba reports 3 PB and more, 40 GB/s of ingest and 500,000 queries a second on
+  one table. RedNote, JD.com and Ant Group run it too.
+- It is a top-level Apache project at 1.0, with clients in Java, Rust, Python and C++.
+- Its integration with Flink is deep: delta joins cut one Alibaba team's Flink state from about 100 TB
+  to almost nothing.
+
+**Where Pondra fits:**
+
+- **One process to run.** Fluss is a CoordinatorServer, TabletServers, ZooKeeper and a Flink tiering
+  job, all on the JVM. Pondra is one binary, and object storage is its only state.
+- **Like for like, the fast paths match.** Pondra's nodes see a write 10 to 15 ms after the
+  acknowledgement, as Fluss's TabletServers serve theirs in milliseconds.
+- **The lake tables don't.** Pondra's Delta and Iceberg versions trail the acknowledgement by 3 to 10
+  seconds on R2. Fluss's lake tables trail by 3 minutes by default. Fluss can be set lower, and so can
+  Pondra.
+- Pondra already has the Postgres protocol and MCP, which are on Fluss's roadmap.
+
+Fluss's roadmap moves toward Pondra's design: writes straight to S3 with diskless servers, and no
+ZooKeeper.
+
+## DuckDB, Polars and Daft
+
+DuckDB is an analytical database that runs inside your process, on one machine. MotherDuck runs it
+as a service.
+
+**Where DuckDB is stronger:**
+
+- It is the reference for single-machine SQL, with a mature ecosystem and extensions.
+- On data in memory, DuckDB was about 9% ahead at SF1: 1.80 s against Pondra's 1.96 s. In its own
+  format it took 1.65 s against Pondra's 2.11 s in the newest recheck.
+- It is small, about 20 MB for its command line, against about 100 MB for Pondra.
+
+**Where Pondra fits:**
+
+- Reading Parquet files, Pondra was the fastest of five at SF10 (38.0 s, against DuckDB's 39.8 s), and
+  level with Polars' streaming engine at SF1. Polars' streaming engine took 3.18 s to Pondra's 3.19 s.
+  Daft took 6.11 s.
+- It also ingests, streams, serves and spreads a query over machines.
+- It speaks their words. `read_parquet`, `delta_scan`, `CREATE MACRO` and `ASOF JOIN` work as in
+  DuckDB, and `pondra.frame` uses Polars' method names.
+
+DuckDB is also a reader of Pondra's tables: it reads the Delta and Iceberg tables Pondra publishes, and
+attaches Pondra's Iceberg REST catalog.
+
+## Databricks
+
+Databricks is a managed lakehouse platform: Spark, Delta Lake, Unity Catalog, SQL warehouses, and ML and
+AI tools.
+
+**Where Databricks is stronger:**
+
+- It is a managed platform, with notebooks, jobs, Agent Bricks and Genie, and governance through Unity
+  Catalog (attribute-based access control).
+- **Lakehouse//RT** (beta) is ahead on new, heavy analytical queries at high concurrency. Databricks
+  claims sub-100 ms at 12,000 queries a second on a cluster. Pondra runs a new TPC-H query in 60 to 600
+  ms on two cores.
+- Lakebase gives it a serverless Postgres next to the lakehouse. It has Zerobus for direct ingestion.
+  Its newest items are collected partly from third-party summit recaps, so check them.
+
+**Where Pondra fits:**
+
+- Point reads and repeated dashboards: a key lookup takes 0.14 to 0.22 ms and 20,000 to 36,000 a second
+  run on two cores, where Lakehouse//RT publishes 10 ms and 12,000 queries a second on a cluster.
+- Rows a few milliseconds old, and it takes the writes itself.
+- It runs anywhere you can run a binary, with no cloud account: on your disk or in any bucket.
+- Spark 4 reads the Delta and Iceberg tables Pondra publishes, and gets Pondra's answers. Databricks'
+  own runtime hasn't been tried.
+
+## Snowflake
+
+Snowflake is a managed cloud data warehouse.
+
+**Where Snowflake is stronger:**
+
+- It is a managed warehouse with mature governance.
+- It has added Snowflake Postgres (generally available in February 2026), Openflow for ingestion,
+  Snowpipe Streaming's high-performance architecture, Cortex AISQL, a managed Iceberg catalog with
+  Iceberg v3, and dynamic tables.
+
+**Where Pondra fits:**
+
+- `database.schema.table` names work: a lake is a database, and other lakes attach as databases.
+- Tasks with `CREATE TASK … SCHEDULE`, stored procedures in SQL and Python, and Python functions follow
+  Snowflake's ideas. The table below sets them side by side.
+- The tables are open files in your own bucket, and Iceberg and Delta readers can use them.
+
+Pondra hasn't been measured against Snowflake.
+
+### Functions, procedures and tasks
+
+| | DuckDB | Snowflake | Databricks | Pondra |
+|---|---|---|---|---|
+| SQL functions | `CREATE MACRO` | SQL UDFs | SQL UDFs | Postgres's `CREATE FUNCTION` and DuckDB's `CREATE MACRO`, kept in the lake |
+| Python functions | In process | Python UDFs, vectorized UDFs, UDTFs | Python UDFs, pandas UDFs, UDTFs | `LANGUAGE python`: per row, vectorized, or a table |
+| Stored procedures | None | SQL, Python, Java, Scala | SQL procedures, jobs | SQL and Python, called from SQL, Postgres, Python, JavaScript, the shell and MCP |
+| Schedules | None | Tasks | Jobs | `CREATE TASK … SCHEDULE` |
+| Who may make one | Anyone | Owner roles | Owner or admin | The admin token |
+
+## What Pondra doesn't have yet
+
+<Aside type="caution">
+- **Evidence at scale.** The multi-machine runs so far were on one machine and on three machines over
+  the internet, where a cluster was no faster than one node.
+- **Governance.** Read, write and admin tokens on every door. No TLS and no per-table grants yet: put a
+  TLS proxy in front, and keep a cluster's nodes on a private network.
+- **Kafka.** One partition per topic and no transactions, so Kafka Streams and Flink's exactly-once
+  Kafka sinks are not covered.
+- **Other databases.** Reading and writing Postgres or MySQL as attached databases, and streaming their
+  changes in natively, are on the roadmap and not built. Debezium events through the Kafka port work.
+- **BI tools and JDBC** were not tested here.
+- **Streaming.** No timers, CEP, or Top-N by event time, and one watermark per source.
+- **Maturity.** Pondra is a prototype.
+</Aside>
+
+## Where to read more
+
+[Performance](/pondra/concepts/performance/) has every number behind this page.
+[The comparison notes](https://github.com/alimardon123/pondra/blob/main/docs/comparison-spark-flink-fluss.md)
+have the item-by-item comparison with Fluss 1.0, what Fluss, Flink, Spark, Databricks and Snowflake are
+building next, the plan for each gap, and the sources.

@@ -646,10 +646,11 @@ pub async fn write_file(lake: &Lake, table: &str, batches: &[RecordBatch], keys:
     if rows == 0 {
         return Ok(None);
     }
+    let ids = field_ids(lake.cat.get::<TableMeta>(&table_key(table)).await?.as_ref(), &batches[0].schema());
     let mut buf = vec![];
-    let mut w = writer(&mut buf, &batches[0], keys)?;
+    let mut w = writer(&mut buf, &batches[0].clone().with_schema(ids.clone())?, keys)?;
     for b in batches {
-        w.write(b)?;
+        w.write(&b.clone().with_schema(ids.clone())?)?;
     }
     let footer = w.close()?; // (its statistics: the file's min and max, without a second pass)
     let (path, bytes) = (format!("data/{table}/{}.parquet", uuid::Uuid::new_v4()), buf.len() as u64);
@@ -661,6 +662,31 @@ pub async fn write_file(lake: &Lake, table: &str, batches: &[RecordBatch], keys:
     };
     let sys = batches[0].schema().index_of(crate::sys::ROW_ID).is_ok();
     Ok(Some(DataFile { path, rows: rows as u64, bytes, ord: 0, whole: false, stats, part: String::new(), nulls, sketch, sys, outside: None }))
+}
+
+/// The columns as Iceberg knows them (`iceberg.rs`), each with its field id: a column's place
+/// among the stored ones (a renamed column keeps it), the rows' system columns 1,000,001 on.
+/// Readers that match a file's columns to the table's by id (Polars' `scan_iceberg`) need them.
+fn field_ids(meta: Option<&TableMeta>, schema: &datafusion::arrow::datatypes::SchemaRef) -> datafusion::arrow::datatypes::SchemaRef {
+    use datafusion::parquet::arrow::PARQUET_FIELD_ID_META_KEY as ID;
+    // (a table an INSERT makes: its columns will be these, in this order)
+    let columns: Vec<String> = match meta {
+        Some(m) => m.columns.iter().map(|(c, _)| c.clone()).collect(),
+        None => schema.fields().iter().map(|f| f.name().clone()).filter(|c| !crate::sys::NAMES.contains(&c.as_str())).collect(),
+    };
+    let id = |name: &str| match columns.iter().position(|c| c == name) {
+        Some(i) => Some(i + 1),
+        None => crate::sys::NAMES.iter().position(|c| *c == name).map(|i| 1_000_001 + i),
+    };
+    let fields: Vec<_> = schema.fields().iter().map(|f| match id(f.name()) {
+        Some(i) => {
+            let mut m = f.metadata().clone();
+            m.insert(ID.to_string(), i.to_string());
+            std::sync::Arc::new(f.as_ref().clone().with_metadata(m))
+        }
+        None => f.clone(),
+    }).collect();
+    std::sync::Arc::new(datafusion::arrow::datatypes::Schema::new_with_metadata(fields, schema.metadata().clone()))
 }
 
 /// Stream a query result into Parquet files of up to `max_rows` each (bulk INSERT … SELECT).

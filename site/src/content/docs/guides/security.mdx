@@ -1,0 +1,286 @@
+---
+title: Security
+description: Turn on read, write and admin tokens for every door, see what each one may do, and keep secrets, code and the network in their place.
+sidebar:
+  order: 16
+---
+
+import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+
+A node with no tokens lets everyone do everything, which is right for a lake on your laptop or on a
+private network. To share it, start the node with **tokens**. There are three, one for each role, and
+every door checks them: HTTP, the Python and JavaScript clients, Postgres, Kafka, Arrow Flight, MCP
+and the Iceberg REST catalog.
+
+| Role | May |
+|---|---|
+| **read** | query: `SELECT`, key lookups, `watch` and `live`, MCP reads, the Iceberg catalog's reads, metrics, and `GET /files` |
+| **write** | read, and write rows: `INSERT`, `UPDATE`, `DELETE`, `MERGE`, appends, Kafka produce, Flight `DoPut`, `PUT /files` and other engines' Iceberg appends |
+| **admin** | write, and change what exists: tables, views, tasks, functions, procedures and secrets |
+
+With tokens on, a request with no token or a wrong one is refused (`401`). Only `GET /stats`, a
+health check, stays open.
+
+## Turn tokens on
+
+Make three random tokens and one key for secrets (below), and start a node with them in its
+environment. A token given as a flag would show in the process list, so use the environment. Every
+node of a cluster needs the same three. This page's node listens on 8086, with Postgres on 5486,
+Kafka on 9486 and Flight on 8816.
+
+```bash
+cat > tokens.env <<EOF
+export PONDRA_READ_TOKEN=$(python3 -c "import secrets; print(secrets.token_urlsafe(16))")
+export PONDRA_WRITE_TOKEN=$(python3 -c "import secrets; print(secrets.token_urlsafe(16))")
+export PONDRA_ADMIN_TOKEN=$(python3 -c "import secrets; print(secrets.token_urlsafe(16))")
+export PONDRA_SECRET_KEY=$(python3 -c "import secrets; print(secrets.token_hex(32))")
+EOF
+
+. ./tokens.env
+nohup pondra serve --dir secure-lake --addr 127.0.0.1:8086 --pg 127.0.0.1:5486 \
+  --kafka 127.0.0.1:9486 --flight 127.0.0.1:8816 --python auto > secure.log 2>&1 &
+echo $! > secure.pid
+until curl -sf localhost:8086/stats > /dev/null; do sleep 0.3; done
+```
+
+The rest of this page reads the tokens from that file. In your own code they come from wherever you
+keep secrets.
+
+```python
+import re
+import pondra
+
+tokens = {role.lower(): token for role, token in
+          re.findall(r"export PONDRA_(READ|WRITE|ADMIN)_TOKEN=(\S+)", open("tokens.env").read())}
+
+def connect(role):
+    return pondra.connect("http://localhost:8086", token=tokens[role])
+
+connect("admin").sql("CREATE TABLE notes (id BIGINT, body VARCHAR)")
+connect("write").sql("INSERT INTO notes VALUES (1, 'first')")
+connect("read").sql("SELECT * FROM notes").rows()
+```
+
+```text
+[{'id': 1, 'body': 'first'}]
+```
+
+## A token at every door
+
+Each client sends the token its own way, and it means the same thing everywhere.
+
+<Tabs syncKey="lang">
+  <TabItem label="Python">
+    ```python
+    pondra.connect("http://localhost:8086", token=tokens["read"]).sql("SELECT count(*) AS n FROM notes").rows()
+    ```
+  </TabItem>
+  <TabItem label="JavaScript">
+    ```js
+    import { readFileSync } from "node:fs";
+    import { connect } from "pondra";
+
+    const token = readFileSync("tokens.env", "utf8").match(/PONDRA_READ_TOKEN=(\S+)/)[1];
+    const db = connect("http://localhost:8086", { token });
+    console.log(await db.sql("SELECT count(*) AS n FROM notes"));
+    ```
+  </TabItem>
+  <TabItem label="psql">
+    Over Postgres the **user name** picks the role (`reader`, `writer` or `admin`) and the password is
+    that role's token.
+    ```bash
+    . ./tokens.env
+    PGPASSWORD=$PONDRA_READ_TOKEN psql -h localhost -p 5486 -U reader -c "SELECT count(*) AS n FROM notes"
+    ```
+  </TabItem>
+</Tabs>
+
+```text
+[{'n': 1}]
+```
+
+**Arrow Flight** takes a handshake with the token as the password, as ADBC and pyarrow's
+`authenticate_basic_token` send it:
+
+```python
+import json
+import pyarrow.flight as flight
+
+client = flight.FlightClient("grpc://localhost:8816")
+header = client.authenticate_basic_token("reader", tokens["read"])
+ticket = flight.Ticket(json.dumps({"sql": "SELECT count(*) AS n FROM notes"}).encode())
+client.do_get(ticket, flight.FlightCallOptions(headers=[header])).read_all().to_pylist()
+```
+
+```text
+[{'n': 1}]
+```
+
+**Kafka** takes SASL/PLAIN: the user name is the role and the password is its token. A reader that
+tries to produce is refused. This prints what each producer's delivery report said:
+
+```python
+import json
+from confluent_kafka import Producer
+
+def produce(user, token):
+    outcome = []
+    producer = Producer({"bootstrap.servers": "localhost:9486", "security.protocol": "SASL_PLAINTEXT",
+                         "sasl.mechanisms": "PLAIN", "sasl.username": user, "sasl.password": token})
+    producer.produce("notes", value=json.dumps({"id": 2, "body": "via kafka"}),
+                     on_delivery=lambda error, message: outcome.append(error))
+    producer.flush(10)
+    return outcome[0]
+
+produce("writer", tokens["write"]), produce("reader", tokens["read"])
+```
+
+```text
+(None, KafkaError{code=TOPIC_AUTHORIZATION_FAILED,val=29,str="Broker: Topic authorization failed"})
+```
+
+The writer's `None` is success. MCP takes the same `Authorization: Bearer` header, so an AI agent has the rights of its token: give it a
+read token and it can look but not write. The Iceberg REST catalog takes the token as its `token`
+(PyIceberg) or an `iceberg` secret (DuckDB): see [other engines](/pondra/guides/other-engines/).
+`pondra run --url …` and a `pondra sql` write, which the leader records, send `PONDRA_TOKEN`.
+
+## What each role is refused
+
+Try each role on each kind of statement:
+
+```python
+import requests
+
+def attempt(role, statement):
+    try:
+        result = connect(role).sql(statement)
+        return result.rows() if hasattr(result, "rows") else "ok"
+    except RuntimeError as error:
+        return str(error).split(": ", 1)[1]
+
+for role, statement in [
+    ("read", "SELECT count(*) AS n FROM notes"),
+    ("read", "INSERT INTO notes VALUES (3, 'from a reader')"),
+    ("write", "INSERT INTO notes VALUES (3, 'from a writer')"),
+    ("write", "CREATE TABLE more (id BIGINT)"),
+    ("admin", "CREATE TABLE more (id BIGINT)"),
+]:
+    print(f"{role:5} {statement:45} {attempt(role, statement)}")
+
+for label, headers in [("no token", {}), ("wrong token", {"Authorization": "Bearer not-a-token"})]:
+    print(f"{label:11} {requests.post('http://localhost:8086/sql', data='SELECT 1', headers=headers).status_code}")
+```
+
+```text
+read  SELECT count(*) AS n FROM notes               [{'n': 2}]
+read  INSERT INTO notes VALUES (3, 'from a reader') this token may not write
+write INSERT INTO notes VALUES (3, 'from a writer') ok
+write CREATE TABLE more (id BIGINT)                 this token may not create tables
+admin CREATE TABLE more (id BIGINT)                 ok
+no token    401
+wrong token 401
+```
+
+## Code runs as its caller
+
+A Python function or procedure runs code on the node's machine, so **only an admin makes one**. A
+procedure then runs with the rights of whoever calls it, not of whoever wrote it: a reader can call a
+procedure that writes, and the write is refused.
+
+```python
+connect("admin").sql("""CREATE PROCEDURE add_note(text VARCHAR) LANGUAGE python AS $$
+    pondra.sql("INSERT INTO notes VALUES (100, $text)", text=text)
+    return "added"
+$$""")
+
+print(attempt("write", "CREATE PROCEDURE sneaky() LANGUAGE python AS $$ return 1 $$"))
+print(attempt("read", "CALL add_note('by a reader')"))
+print(attempt("write", "CALL add_note('by a writer')"))
+```
+
+```text
+this token may not create tables
+add_note: RuntimeError: 500: this token may not write
+  line 2: pondra.sql("INSERT INTO notes VALUES (100, $text)", text=text)
+[{'add_note': 'added'}]
+```
+
+That makes a procedure a way to hand out a narrow power: a reader can't insert, but an admin can write
+a procedure and let readers call it. It can only do what its caller may. Functions have no connection
+back to the lake at all. See [functions and procedures](/pondra/guides/functions-and-procedures/).
+
+Since a procedure's code is the node's own, `--python` is guarded. A node without an admin token
+refuses it unless it listens on `127.0.0.1` (`pondra.local()` passes its own):
+
+```bash
+timeout 20 pondra serve --dir open-lake --addr 0.0.0.0:8087 --python auto 2>&1 | head -1
+```
+
+```text
+Error: --python lets whoever makes a procedure run code on this machine: set --admin-token, or listen on 127.0.0.1
+```
+
+## Secrets
+
+A password or key for something else, such as a bucket, a Kafka cluster or an SMTP server, goes in a
+**secret**. Only an admin makes one. It is kept in the lake encrypted with AES-256-GCM, and SQL can list
+its name, type and scope, never its values:
+
+```python
+connect("admin").sql("CREATE SECRET mail (TYPE generic, HOST 'smtp.example.com', PASSWORD 'not-a-real-password')")
+connect("read").sql("SELECT * FROM secrets()").rows()
+```
+
+```text
+[{'name': 'mail', 'type': 'generic', 'scope': None}]
+```
+
+Only the code of a procedure reads the values, with `pondra.secret("mail")`, and any of them the
+procedure prints or fails with is blanked out (`***`) in its notices, errors and run log. A URL a query
+reads (`s3://…`, `https://…`) uses the secret whose scope covers it, and a URL no secret covers is
+refused.
+
+The encryption key is `PONDRA_SECRET_KEY`, and **every node of a cluster needs the same one**: a node
+with another key stops with `was sealed with another key`. Without it a node makes a key for its
+machine at `~/.pondra/secret.key`, which is enough for nodes that share that file.
+
+## What a node's SQL can't touch
+
+Whatever the token, SQL sent to a node never reads or writes the node's own disk: no `COPY … TO` to a
+path, no `SELECT * FROM 'notes.parquet'`. Only the program that started a node (the shell,
+`pondra.local()`) does that, by a key only it knows.
+
+```python
+print(attempt("admin", "SELECT * FROM 'notes.parquet'"))
+```
+
+```text
+notes.parquet is a file on the node's machine: only the program that started the node (the shell, local()) reads those
+```
+
+A file in a bucket or at a URL needs a secret that covers it, and that is how a node reads other
+people's data: see [files and other lakes](/pondra/guides/files-and-other-lakes/).
+
+## What tokens don't do
+
+<Aside type="caution">
+
+- **Tokens guard nodes, not the bucket.** With the bucket's own credentials anyone runs `pondra sql
+  --dir s3://…` and reads the lake with no node at all, so give people read-only bucket keys, and
+  keep the keys as secret as the data.
+- **There is no TLS yet.** Tokens, and the data with them, cross the wire as plain text on HTTP,
+  Postgres, Kafka and Flight, so put a TLS proxy in front of the ports clients use, or keep them on a
+  private network. A cluster's nodes talk plain HTTP to each other with the admin token, so keep
+  them on a private network.
+- **Roles are per node, not per table.** A read token reads everything. Per-table grants, users, a
+  mutual-TLS cluster, an audit log and quotas are planned together (round 29 on the roadmap), before
+  other people's data goes in.
+- **The token is the whole login.** Rotate one by restarting every node with the new values.
+
+</Aside>
+
+Stop the node when you're done:
+
+```bash
+kill $(cat secure.pid)
+```

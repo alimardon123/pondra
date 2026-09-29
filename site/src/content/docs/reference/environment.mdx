@@ -1,0 +1,140 @@
+---
+title: Environment variables
+description: Every environment variable Pondra reads, with what it does and its default.
+sidebar:
+  order: 15
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Set these in the environment of the process that runs `pondra` (or the client that starts a node).
+Most have a flag as well, and the flag wins. The ones you are likely to need are the tokens, the
+memory and cache sizes, the AI endpoint, and `PONDRA_SECRET_KEY`. The rest tune how queries spread
+across nodes and how the node cleans up after itself.
+
+A number that is left unset, or set to something that is not a number, takes its default.
+
+## Access
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `PONDRA_READ_TOKEN` | none | the read token, when `--read-token` is not given. Reading needs any token |
+| `PONDRA_WRITE_TOKEN` | none | the write token, when `--write-token` is not given |
+| `PONDRA_ADMIN_TOKEN` | none | the admin token, when `--admin-token` is not given. A node also sends it when it calls other nodes |
+| `PONDRA_TOKEN` | none | the token a program presents: `pondra run` (`--token`), a write made with `pondra sql`, and a node's calls to other nodes, which use it before the admin token |
+| `PONDRA_SECRET_KEY` | one made for the machine | the key [secrets](/pondra/reference/sql/#files-and-secrets) are sealed with. Every node of a cluster needs the same one. Without it, a key is made in `~/.pondra/secret.key` (from `HOME` or `USERPROFILE`), which is enough for nodes that share that machine's home |
+
+An empty value counts as not set. See [HTTP](/pondra/reference/http/#roles) for what each token may do.
+
+```bash norun
+PONDRA_ADMIN_TOKEN="$ADMIN" PONDRA_WRITE_TOKEN="$WRITE" PONDRA_READ_TOKEN="$READ" \
+PONDRA_SECRET_KEY="$SECRET" pondra serve --dir lake
+```
+
+## Finding things
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `PONDRA_BIN` | the binary the package installed, or the one on `PATH` | the `pondra` executable that the Python and JavaScript clients start with `local()` |
+| `PONDRA_PYTHON` | none | the first Python that `--python auto` tries. It needs the `pondra` package and pyarrow. `auto` then tries the Pythons beside the `pondra` binary, then `python3` and `python` |
+
+## Memory and disk
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `PONDRA_MEMORY_GB` | a third of the machine's memory | memory for queries, when `--memory-gb` is not given. A sort, join or aggregation that needs more spills to disk |
+| `PONDRA_CACHE_DIR` | `<temp dir>/pondra-cache` | where a node keeps its local SSD copy of a lake's recent objects, what a shuffle spills, and a follower's copy of the log with `--ack replicated`. The same as `--cache-dir` |
+| `PONDRA_CACHE_GB` | 20, or a quarter of the free disk if that is less | the size of that SSD copy. `0` turns it off. The same as `--cache-gb` |
+| `PONDRA_CACHE_MB` | `1024` | the query read cache in memory |
+| `PONDRA_HOT_GB` | a quarter of the query memory | the most the cache of hot columns may hold |
+| `PONDRA_FILES_CACHE_MB` | `512` | the memory cache for files read from outside the lake, such as attached Delta and Iceberg tables and URLs |
+| `PONDRA_FUNCTION_CACHE_MB` | `256` | the memory for answers a function keeps with `cache = '…'` |
+| `PONDRA_TEMP_MB` | `1024` | the memory all temporary tables on a node may hold together. A change past it is refused |
+| `PONDRA_SESSION_IDLE_SECS` | `3600` | a session idle this long ends, and its temporary tables go |
+| `PONDRA_CODEC` | `lz4` | how data files are compressed: `lz4` (fastest to read), `zstd` (smaller files), `snappy` or `none` |
+
+## Queries across nodes
+
+A query is spread over the nodes of a cluster when that is cheaper than running it on one.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `PONDRA_CORES` | this machine's cores | the number of cores a node counts: a query runs one partition for each. Set it to stand for another machine's count |
+| `PONDRA_SPREAD_MB` | `256` | tables smaller than this are not spread over nodes |
+| `PONDRA_BROADCAST_MB` | `64` | in a shuffle, tables smaller than this are read whole by every node, so a join broadcasts them. `0` slices every table |
+| `PONDRA_SKEW_MB` | `64` | a partition bigger than this, and than twice the average, is shared out among nodes |
+| `PONDRA_SPILL_MB` | `64` | rows a shuffle holds in memory before they go to disk |
+| `PONDRA_LINK` | measured | the network between nodes as `ms,MB/s` (`0.5,1000`), instead of measuring it every 10 minutes |
+| `PONDRA_JOIN_ORDER` | `2` | how much cheaper a new join order must look before it is taken. `0` turns join reordering off |
+| `PONDRA_SQL_OPTIONS` | none | DataFusion settings, `key=value` separated by commas, applied after Pondra's own defaults |
+
+## Housekeeping
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `PONDRA_GC_SECS` | `60` | how often the catalog's write-ahead-log objects and old manifests are cleared, and how old they must be |
+| `PONDRA_RUNS_DAYS` | `30` | how many days the run log, `pondra.runs`, keeps. Read when the log is first made |
+| `PONDRA_PURGE_ROWS` | `100000` | after `UPDATE`, `DELETE` and `MERGE` on an append table, its files are rewritten without the old rows once this many, or a tenth of the table, are waiting. A table that publishes a format is rewritten every round |
+| `PONDRA_INLINE_KB` | `64`, or `1024` with `--ack replicated` and `--replicas` above 1 | a write smaller than this is carried inside the commit. A bigger one is written as its own object first |
+
+## Python workers
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `PONDRA_PROCEDURES` | four times the cores | how many Python procedures a node runs at once. Functions run one for each core |
+| `PONDRA_WORKER_MB` | `2048` | a Python worker that has grown past this many MB is stopped after its job |
+| `PONDRA_WORKER_IDLE_SECS` | `60` | a Python worker idle this long is stopped |
+
+## AI functions
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `PONDRA_AI_URL` | `http://127.0.0.1:11434/v1` | the OpenAI-compatible endpoint that [`ai_complete` and `ai_embed`](/pondra/reference/functions/#models) call |
+| `PONDRA_AI_KEY` | none | sent as a bearer token to that endpoint, if it wants one |
+| `PONDRA_AI_MODEL` | `llama3.2` | the model `ai_complete` uses when the call names none |
+| `PONDRA_EMBED_MODEL` | `nomic-embed-text` | the model `ai_embed` uses when the call names none |
+
+## Writes with `pondra sql`
+
+`PONDRA_JOB` is the id of a write made with `pondra sql`. A write repeated with the same id is
+applied once and answers `{"duplicate":true}`. Left unset, each write gets an id of its own.
+
+```bash
+pondra sql --dir jobs-lake "CREATE TABLE loads (n BIGINT)"
+PONDRA_JOB=load-1 pondra sql --dir jobs-lake "INSERT INTO loads VALUES (1), (2)"
+PONDRA_JOB=load-1 pondra sql --dir jobs-lake "INSERT INTO loads VALUES (1), (2)"
+pondra sql --dir jobs-lake "SELECT count(*) AS n FROM loads"
+```
+
+```text
+{"table":"loads","publish":[]}
+{"committed":true}
+{"duplicate":true}
++---+
+| n |
++---+
+| 2 |
++---+
+```
+
+## Object stores
+
+A lake on object storage reads its credentials and endpoint from the environment, as each cloud's
+own tools do: `AWS_*` for `s3://` (`AWS_ENDPOINT` for R2 and MinIO), `GOOGLE_*` for `gs://`, and
+`AZURE_*` for `az://`, `abfs://` and `abfss://`. Pondra does not read them any other way.
+
+## Set by Pondra
+
+Do not set these. Pondra sets them for its own processes, and some are copies of flags.
+
+| Variable | Set by | Meaning |
+|---|---|---|
+| `PONDRA_OWNER_KEY` | the shell, `pondra.local()` and `local()` in JavaScript | a random key that lets the program that started a node read files on this machine through it. Nobody else may |
+| `PONDRA_PUBLISH`, `PONDRA_CHANGELOG_SECS`, `PONDRA_FSYNC`, `PONDRA_REPLICAS` | `pondra serve`, from `--publish`, `--changelog-secs`, `--fsync`, `--ack` and `--replicas` | the flags' values, for the rest of the node. Setting them in the environment has no effect: `serve` overwrites them. Use the flags |
+| `PONDRA_TRIES` | `pondra sql` | how many times a write has started over after another node took the lake |
+
+<Aside type="caution">
+`PONDRA_CRASH`, `PONDRA_DROP_BEATS`, `PONDRA_NO_DIRECT` and `PONDRA_DEBUG_SPREAD` are for tests and
+debugging. `PONDRA_CRASH` aborts the process at chosen points, at random, to test recovery. Never
+set it on a node that matters.
+</Aside>

@@ -177,6 +177,20 @@ pub fn names(sql: &str) -> Vec<String> {
 
 /// Text (an error, a plan) with each table of files named as SQL named it: `'s3://…'`, or
 /// `read_csv('…', delim => ';')`, not its internal name.
+/// An error in words for whoever sent the statement: its causes after it, each said once
+/// (DataFusion repeats a cause's words in its own), files named as SQL named them.
+pub fn said(e: &anyhow::Error) -> String {
+    let mut out = String::new();
+    for c in e.chain().map(|c| c.to_string()) {
+        let c = c.strip_prefix("External error: ").map(str::to_string).unwrap_or(c); // (DataFusion's wrapping of ours)
+        if !out.contains(c.trim()) {
+            out += if out.is_empty() { "" } else { ": " };
+            out += &c;
+        }
+    }
+    readable(&out)
+}
+
 pub fn readable(text: &str) -> String {
     static NAMES: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r#""?(ext:[A-Za-z0-9_-]+)"?"#).expect("a regex"));
     NAMES.replace_all(text, |c: &regex::Captures| {

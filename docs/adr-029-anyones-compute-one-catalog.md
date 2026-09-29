@@ -1,6 +1,6 @@
 # ADR-029: Anyone's compute, one catalog
 
-**Date:** 2026-09-29 · **Status:** proposed (the round is the owner's choice) · **Builds on:** ADR-001 (readers who need only the bucket), ADR-002 (the streamhouse), ADR-003 (serverless) · **Follows:** ADR-028 (other engines append, G8), ADR-020 (system columns)
+**Date:** 2026-09-29 · **Status:** proposed; phases 1 and 2 in rounds 27 and 28 (the owner, 2026-09-29) · **Builds on:** ADR-001 (readers who need only the bucket), ADR-002 (the streamhouse), ADR-003 (serverless) · **Follows:** ADR-028 (other engines append, G8), ADR-020 (system columns)
 
 ## Context
 
@@ -307,5 +307,5 @@ freshness between nodes are all unchanged. Outside commits join the same order:
   renamed. Delta readers match columns by physical name, and the file uses the new name. Either
   maintenance rewrites those files before they are published to Delta, or Delta is published
   with column mapping by id. Decided in phase 1.
-- **Which round.** Phase 1 fits before or after the console (round 26), and phase 2 right after
-  it. It's the owner's choice.
+- **Which round: decided.** Phase 1 is round 27 and phase 2 is round 28, after round 26's console,
+  server and docs (the owner, 2026-09-29).

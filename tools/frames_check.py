@@ -13,6 +13,8 @@
    `materialized=True`; `db.write_table` is a frame's `write_table` (ADR-025).
 6. Files as frames (ADR-026): `scan_parquet/csv/ndjson` == Polars' own, and `sink_*` written
    files Polars reads back, a folder by `partition_by` too.
+7. What writing the docs found (round 26): `//`'s types, `sample(seed=)`, the set operations,
+   `explain()` and `show()`, `read_csv`'s SQL option names.
 
   frames_check.py [--only name,…] [--port 8830]      (pondra.spark vs PySpark: spark_check.py)
 """
@@ -113,6 +115,8 @@ def pipelines():
         lambda o, u, q: pl.concat([o.select("id", "user").limit(0), pl.concat([u.select("user"), o.select("user", "id").filter(pl.col("id") < 5)], how="diagonal")], how="diagonal"))
     add("division, floor division, modulo", lambda c, o, u, q: o.filter(col("qty") > 0).select("id", (col("id") / col("qty")).alias("d"), (col("id") % col("qty")).alias("m"), (col("price") // 3).alias("f")),
         lambda o, u, q: o.filter(pl.col("qty") > 0).select("id", (pl.col("id") / pl.col("qty")).alias("d"), (pl.col("id") % pl.col("qty")).alias("m"), (pl.col("price") // 3).alias("f")))
+    add("floor division, negatives too (rounded down; integers stay integers)", lambda c, o, u, q: o.filter(col("qty") > 0).select("id", (col("id") // col("qty")).alias("a"), ((-col("id")) // col("qty")).alias("b"), (col("price") // -3).alias("c"), (100 // col("qty")).alias("d")),
+        lambda o, u, q: o.filter(pl.col("qty") > 0).select("id", (pl.col("id") // pl.col("qty")).alias("a"), ((-pl.col("id")) // pl.col("qty")).alias("b"), (pl.col("price") // -3).alias("c"), (100 // pl.col("qty")).alias("d")))
     add("round, abs, sqrt, clip", lambda c, o, u, q: o.select("id", col("price").round(1).alias("r"), (-col("price")).abs().alias("a"), col("price").sqrt().alias("s"), col("price").clip(5, 30).alias("c")),
         lambda o, u, q: o.select("id", pl.col("price").round(1).alias("r"), (-pl.col("price")).abs().alias("a"), pl.col("price").sqrt().alias("s"), pl.col("price").clip(5, 30).alias("c")))
     add("SQL snippets inside frame methods", lambda c, o, u, q: o.filter("qty > 2 AND item LIKE 't%'").with_columns("qty * price AS total").group_by("item").agg("sum(total) AS revenue", "count(*) AS n"),
@@ -310,6 +314,38 @@ def files(con, tmp):
     return checks
 
 
+def found(con, tmp):
+    """What writing the docs found (round 26): `//` on integers gives integers; `sample(seed=)`
+    picks the same rows again; `union`, `intersect`, `except_`; `explain()` of a frame of several
+    steps and `show()` of an EXPLAIN; `read_csv` with SQL's option names (`delim`, `header`)."""
+    o = con.table("orders")
+    checks = {}
+    t = o.filter(col("qty") > 0).select((col("id") // col("qty")).alias("q"), (col("price") // 2).alias("f")).collect()
+    checks["// of integers is an integer, of floats a float (Polars' types)"] = str(t.schema.field("q").type) == "int64" and str(t.schema.field("f").type) == "double"
+    pick = lambda **k: o.sample(**k).sort("id").rows()
+    many = o.sample(fraction=0.1, seed=7).select(pondra.len()).item()
+    checks["sample(seed=): the same rows every time, others for another seed; about the fraction"] = \
+        pick(n=10, seed=7) == pick(n=10, seed=7) and len(pick(n=10, seed=7)) == 10 and pick(n=10, seed=7) != pick(n=10, seed=8) \
+        and pick(fraction=0.1, seed=7) == pick(fraction=0.1, seed=7) and 200 < many < 400
+    a, b = o.filter(col("qty") > 5).select("user", "item"), o.filter(col("item") == "tea").select("user", "item")
+    rows = lambda f: {tuple(r.values()) for r in f.rows()}
+    checks["union, union(distinct=False), intersect, except_ (SQL's sets)"] = rows(a.union(b)) == rows(a) | rows(b) and rows(a.intersect(b)) == rows(a) & rows(b) \
+        and rows(a.except_(b)) == rows(a) - rows(b) and len(a.union(b, distinct=False).rows()) == len(a.rows()) + len(b.rows())
+    m = o.filter(col("qty") > 3).group_by("user").agg(col("qty").sum().alias("s")).sort("s")
+    import contextlib, io
+    shown = io.StringIO()
+    with contextlib.redirect_stdout(shown):
+        con.sql("EXPLAIN SELECT 1").show()
+    checks["explain() of a frame of several steps; show() and explain() of an EXPLAIN"] = "Aggregate" in m.explain() and "plan_type" in shown.getvalue() \
+        and "EmptyRelation" in con.sql("EXPLAIN SELECT 1").explain()
+    path = os.path.join(tmp, "semi.csv")
+    with open(path, "w") as f:
+        f.write("1;x\n2;y\n")
+    checks["read_csv(delim=, header=): SQL's option names kept"] = con.read_csv(path, delim=";", header=False).select(pondra.len()).item() == 2 \
+        and con.read_csv(path, separator=";", has_header=False).columns == con.read_csv(path, delim=";", header=False).columns
+    return checks
+
+
 def _made_again(con, name):
     """Is `name` a materialized view? Making another under its name says it exists already; a
     stored view of that name is refused as one ("is a (stored) view")."""
@@ -360,6 +396,9 @@ def main():
         print(json.dumps({"names": named}, ensure_ascii=False), flush=True)
         filed = files(con, tmp)
         print(json.dumps({"files": filed}, ensure_ascii=False), flush=True)
+        fixed = found(con, tmp)
+        print(json.dumps({"found": fixed}, ensure_ascii=False), flush=True)
+        kept.update(fixed)
         kept.update(wrote)
         kept.update(named)
         kept.update(filed)

@@ -1,0 +1,356 @@
+---
+title: Python client
+description: The pondra Python package, with every method of a connection, its signature, what it returns and an example.
+sidebar:
+  order: 5
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+The `pondra` package talks to a node over HTTP. `pondra.connect` reaches a node that is running,
+and `pondra.local` starts one on a folder and connects to it. A connection, called `db` on this
+page, runs SQL, writes rows, makes views, and calls functions and procedures. A query comes back as
+a **frame**, which the [frames reference](/pondra/reference/frames/) covers.
+
+```python
+import pondra
+db = pondra.connect("http://localhost:8080")
+```
+
+## Connect
+
+| Call | Meaning |
+|---|---|
+| `pondra.connect(url="http://127.0.0.1:8080", token=None, **options)` | a connection to a node |
+| `pondra.local(dir="lake", port=None, token=None, flags=(), timeout=120, python=True)` | start a node on a lake here (a folder or `s3://bucket/prefix`) and connect to it |
+| `pondra.current()` | the connection `pondra.sql` and its kin use |
+| `pondra.binary()` | the path of the `pondra` executable: `$PONDRA_BIN`, the one pip installed, or the one on `PATH` |
+
+`connect` takes these options:
+
+| Option | Default | Meaning |
+|---|---|---|
+| `token` | none | sent as `Authorization: Bearer …`; the token's role decides what the connection may do |
+| `producer` | random | the name `append` writes under, for exactly-once |
+| `timeout` | 300 | seconds to wait for an answer |
+| `headers` | none | extra headers for every request |
+| `job` | none | a job id: the connection's writes are numbered under it, so a retry is applied once |
+| `echo` | `True` | print what procedures print (their notices) as well as keep them in `db.notices` |
+
+`local` starts `pondra serve` on a free port. It stops with `db.close()`, or when Python exits, and
+the lake stays. Because this program started the node, the node's SQL may read and write files on
+this machine (`read_csv('jan.csv')`). `flags` are more `pondra serve` options, such as
+`["--memory-gb", "2"]`. `python=False` starts the node without Python functions.
+
+```python norun
+db = pondra.connect("https://lake.example.com", token="your-token")
+```
+
+```python
+local = pondra.local("scratch", flags=["--memory-gb", "2"])
+print(local.sql("SELECT 1 AS one").rows())
+local.close()
+```
+
+```text
+[{'one': 1}]
+```
+
+## Queries
+
+| Method | Meaning |
+|---|---|
+| `db.sql(query, job=None, **names)` | a query as a frame, run when you ask for its rows. Other statements (writes, DDL, `CALL`, several at once) run now and give a `Result` or the outcome |
+| `db.table(name)` | a table or view as a frame |
+| `db.run(file, job=None, **params)` | a `.sql` file's statements, or the SQL text itself, in order; the last one's rows or outcome |
+| `db.from_arrow(data, name=None)` | rows of this machine as a frame: a pyarrow, pandas or Polars table, or a list of dicts. Also `from_pandas`, `from_polars`, `from_rows` |
+
+In `sql` and `run`, a keyword argument is a `$name` parameter in the query. A keyword whose value
+is a frame, or pandas, Polars or Arrow data, is a table by that name, written `{name}` or plain.
+Pondra also finds Python names in the code that called it: a DataFrame called `extra` is the table
+`extra`. `job`: a write retried with the same job is applied once.
+
+```python
+db.sql("CREATE TABLE IF NOT EXISTS orders (id BIGINT, item VARCHAR, qty INT, amount DOUBLE)")
+db.append("orders", [{"id": 1, "item": "tea", "qty": 2, "amount": 7.0},
+                     {"id": 2, "item": "cake", "qty": 1, "amount": 4.5}])
+
+print(db.sql("SELECT * FROM orders WHERE amount > $min ORDER BY id", min=5).rows())
+
+import pandas as pd
+extra = pd.DataFrame({"id": [3], "item": ["tea"], "qty": [1], "amount": [3.5]})
+print(db.sql("INSERT INTO orders SELECT * FROM extra"))
+print(db.sql("SELECT count(*) AS n FROM orders").item())
+print(db.run("SELECT $x + 1 AS y", x=41).rows())
+```
+
+```text
+[{'id': 1, 'item': 'tea', 'qty': 2, 'amount': 7.0}]
+{'rows': 1}
+3
+[{'y': 42}]
+```
+
+A statement that writes or changes the lake returns a dict, such as `{'rows': 1}`. A query returns
+a frame, and nothing runs until you call `rows()`, `collect()`, `to_pandas()`, `to_polars()`,
+`item()` or `show()` on it.
+
+## Files and other lakes
+
+These make a frame over files, a folder, a glob (or a list of them), or another engine's table.
+They are SQL's `read_*` functions: see [names](/pondra/reference/names/) for the fallbacks and
+[functions](/pondra/reference/functions/#files-outside-the-lake) for the options.
+
+| Method | Meaning |
+|---|---|
+| `db.read_parquet(source, hive_partitioning=None, **options)` | Parquet files |
+| `db.read_csv(source, separator=None, has_header=None, hive_partitioning=None, **options)` | CSV files |
+| `db.read_json(source, hive_partitioning=None, **options)` | newline-delimited JSON |
+| `db.read_delta(source, version=None)` | a Delta table, at its latest version or `version` |
+| `db.read_iceberg(source, snapshot_id=None, version=None, allow_moved_paths=None)` | an Iceberg table: its folder or a metadata file |
+
+`scan_parquet`, `scan_csv`, `scan_delta`, `scan_iceberg`, `scan_ndjson` and `read_ndjson` are the
+same methods under Polars' names.
+
+A path on this machine is read only by a node that `pondra.local` started. A URL (`s3://`, `gs://`,
+`az://`, `https://`) needs a [secret](/pondra/reference/sql/#files-and-secrets) whose scope covers
+it.
+
+```bash
+printf 'id;name\n1;tea\n2;cake\n' > sales.csv
+```
+
+```python
+db_files = pondra.local("scratch")
+print(db_files.read_csv("sales.csv", separator=";").rows())
+db_files.close()
+```
+
+```text
+[{'id': 1, 'name': 'tea'}, {'id': 2, 'name': 'cake'}]
+```
+
+## Writing rows
+
+| Method | Meaning |
+|---|---|
+| `db.append(table, data, retries=10)` | append rows exactly once: a list of dicts, or a pandas, Polars or Arrow table. A retry after a lost answer is recognised and not applied twice |
+| `db.write_table(name, data, mode="create")` | rows into a table: `data` is a frame, SQL text, or pandas, Polars or Arrow data (or a list of dicts). `mode` is `"create"`, `"append"` or `"overwrite"` |
+| `db.lookup(table, key)` | the current row of one key of a keyed table, or `None` |
+
+`append` answers with a dict: `seg` (the log segment), `duplicate` (true if this was a retry that
+was already applied), `conflict`, `row` and `ms`. Each connection numbers its appends. A composite
+key is written as comma-separated values in the key's column order.
+
+```python
+print(db.write_table("orders_copy", db.table("orders")))
+print(db.write_table("orders_copy", [{"id": 9, "item": "juice", "qty": 1, "amount": 2.0}], mode="append"))
+
+db.sql("CREATE TABLE users (id BIGINT PRIMARY KEY, name VARCHAR)")
+db.append("users", [{"id": 7, "name": "ann"}])
+print(db.lookup("users", 7), db.lookup("users", 8))
+```
+
+```text
+{'rows': 3}
+{'rows': 1}
+{'id': 7, 'name': 'ann'} None
+```
+
+## Views
+
+`db.view(name, query, materialized=None, temporary=False, replace=None, **options)` makes a view
+others read by name, and returns it as a frame. `query` is SQL or a frame.
+
+| Argument | Meaning |
+|---|---|
+| `materialized=True` | keep it up to date with each new row (`CREATE MATERIALIZED VIEW`) instead of running the query when it is read |
+| `temporary=True` | the view is this connection's only, until `close()` |
+| `replace` | for a stored view, `False` refuses to replace one that exists |
+| `**options` | the options of a materialized view: `window`, `size_secs`, `slide_secs`, `lateness_secs`, `session`, `gap_secs`, `join`, `time`, `within_secs`. See [table options](/pondra/reference/table-options/#materialized-views) |
+
+```python
+db.view("big_orders", "SELECT * FROM orders WHERE amount > 5")
+spend = db.view("spend", "SELECT item, sum(qty) AS qty FROM orders GROUP BY item", materialized=True)
+print(spend.sort("item").rows())
+```
+
+```text
+[{'item': 'cake', 'qty': 1}, {'item': 'tea', 'qty': 3}]
+```
+
+## Functions and procedures
+
+| Method | Meaning |
+|---|---|
+| `db.call(name, *args, wait=True, **kwargs)` | `CALL name(…)`: its rows or outcome. Arguments by position or by name. `wait=False` starts it without waiting and gives a `Run` |
+| `db.create_function(name, body=None, file=None, params=None, returns=None, language="python", entry=None, vectorized=False, strict=False, volatility=None, packages=None, timeout=None, cache=None, replace=True)` | a stored function from code (or a file of it) |
+| `db.create_procedure(name, body=None, file=None, params=None, language="python", entry=None, packages=None, timeout=None, replace=True)` | a stored procedure from code (or a file of it) |
+| `@db.function` | a decorator: this Python function becomes one of the lake's functions, for SQL and frames, on every node |
+| `@db.procedure` | a decorator: this Python function becomes a stored procedure |
+| `db.secret(name)` | a secret's values as a dict; only a procedure's code may read them |
+| `db.routines()` | the lake's functions and procedures, as a dict by name |
+
+`params` maps each parameter to its SQL type, or to a pair of a type and a default. `returns` is a
+SQL type, `TABLE (…)`, or a dict of column names and Python types for a table function. The
+options are those of [`CREATE FUNCTION`](/pondra/reference/table-options/#functions-and-procedures).
+A body is a function body, as in PL/Python; with `entry`, it is a module and the function of that
+name runs.
+
+The decorators read the function's source, so use them in a file, not at a prompt. They take the
+same options as `create_function` (`@db.function(cache="10 minutes")`), and `name=` to pick another
+name. The types come from the annotations. The imports, helper functions and constants the
+function uses come along. A decorated function is handed back as it was, so it still runs here.
+
+Inside a procedure, `pondra.sql(…)`, `pondra.table(…)`, `pondra.call(…)` and `pondra.secret(…)`
+use the connection its caller lent it, with the caller's rights. A function has no connection:
+`pondra.sql` in it raises an error, because a query may run it over millions of rows.
+
+```bash
+cat > jobs.py <<'EOF'
+import re
+from datetime import date
+import pondra
+
+db = pondra.connect("http://localhost:8080")
+db.sql("CREATE TABLE sales (day DATE, item VARCHAR, qty INT)")
+db.sql("INSERT INTO sales VALUES (DATE '2026-09-27', 'tea', 2), (DATE '2026-09-27', 'cake', 1), (DATE '2026-09-28', 'tea', 5)")
+
+@db.function
+def slug(title: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
+
+@db.procedure
+def report(day: date, top: int = 1):
+    rows = pondra.sql("SELECT item, sum(qty) AS sold FROM sales WHERE day = $day GROUP BY item ORDER BY sold DESC LIMIT $top", day=day, top=top).rows()
+    print(f"{day}: {len(rows)} item(s)")
+    return rows
+
+print(db.sql("SELECT slug('Hello, World!') AS s").rows())
+print(slug("Hello, World!"))
+print(db.call("report", date(2026, 9, 27)).rows())
+print(db.notices)
+EOF
+python jobs.py
+```
+
+```text
+[{'s': 'hello-world'}]
+hello-world
+2026-09-27: 1 item(s)
+[{'item': 'tea', 'sold': 2}]
+['2026-09-27: 1 item(s)']
+```
+
+The first `2026-09-27: 1 item(s)` line is the notice, printed as it came back. Pass `echo=False` to
+`connect` to keep it in `db.notices` only.
+
+`create_function` and `create_procedure` take code as a string:
+
+```python
+db.create_function("twice", "return x * 2", params={"x": "BIGINT"}, returns="BIGINT")
+db.create_function("pairs", "return [(1, 'a'), (2, 'b')]", returns={"n": int, "s": str})
+print(db.sql("SELECT twice(4) AS v").rows(), db.sql("SELECT * FROM pairs() ORDER BY n").rows())
+
+db.sql("CREATE SECRET api (TYPE generic, token 'placeholder')")
+db.create_procedure("peek", "print(sorted(pondra.secret('api')))\nreturn [{'keys': 2}]")
+print(db.call("peek").rows())
+```
+
+```text
+[{'v': 8}] [{'n': 1, 's': 'a'}, {'n': 2, 's': 'b'}]
+['token', 'type']
+[{'keys': 2}]
+```
+
+### Runs
+
+`db.call(name, …, wait=False)` starts a procedure and returns a `Run` at once. The run's row in
+`pondra.runs` says how it went.
+
+| Member | Meaning |
+|---|---|
+| `run.id` | the run's id |
+| `run.status()` | its row of `pondra.runs`, or a stand-in while it starts |
+| `run.wait(timeout=None, every=0.2)` | poll until it ends, then give the row; raises the run's error if it failed, and `TimeoutError` after `timeout` seconds |
+
+```python
+run = db.call("peek", wait=False)
+print(run.wait()["status"])
+```
+
+```text
+ok
+```
+
+## Following changes
+
+| Method | Meaning |
+|---|---|
+| `db.watch(table, after=None, changes=False)` | a generator of a table's new rows as they commit, one dict each. For a keyed table, every upsert and delete. `after` replays from that position first. `changes=True` also yields UPDATE's and DELETE's rows, each with `_change_type`, `_row_id` and `_version` |
+| `db.live(query, every_ms=None, **params)` | a generator of a query's answer now, and again each time a commit changes it: a list of dicts each time. A busy table is queried at most every `every_ms` (default 100) |
+
+After a row or an answer, `db.position` is where to resume. Both run until you stop them: `break`
+out of the loop, or call `.close()` on the generator.
+
+```python
+for row in db.watch("orders", after=0):
+    print(row)
+    break
+
+for rows in db.live("SELECT count(*) AS n FROM orders"):
+    print(rows)
+    break
+```
+
+```text
+{'id': 1, 'item': 'tea', 'qty': 2, 'amount': 7.0}
+[{'n': 3}]
+```
+
+## Results
+
+`db.sql` of a statement that returns rows at once (a `CALL`, or a script's last query) gives a
+`Result`.
+
+| Method | Meaning |
+|---|---|
+| `result.rows()` | the rows, as a list of dicts |
+| `result.to_arrow()`, `result.collect()` | a pyarrow Table |
+| `result.to_pandas()`, `result.to_polars()` | a pandas or Polars DataFrame |
+
+Without pyarrow installed, rows come as the node's JSON, dates and times as text, and `rows()`,
+`item()` and `show()` still work. Tables (`collect()`, `to_pandas()`) need `pip install pyarrow`.
+
+## Close
+
+`db.close()` ends the connection's session, so its temporary tables and views go, and stops the
+node `pondra.local` started. A connection is a context manager:
+
+```python
+with pondra.connect("http://localhost:8080") as session:
+    print(session.sql("SELECT 1 AS one").rows())
+```
+
+<Aside type="caution">
+`db.read_csv(path, delim=";")` and `header=` don't reach the file: for a frame, the CSV options
+are `separator=` and `has_header=`. The same options work by their SQL names in `db.sql("SELECT *
+FROM read_csv('a.csv', delim => ';')")`.
+</Aside>
+
+## Module functions
+
+`pondra.sql`, `pondra.table`, `pondra.read_parquet`, `pondra.read_csv`, `pondra.read_json`,
+`pondra.read_delta`, `pondra.read_iceberg`, `pondra.call` and `pondra.secret` do what the
+connection's methods do, on the current connection: the newest one made, or inside a procedure the
+one its caller lent. Code moves between a notebook and a procedure as it is, as `duckdb.sql` runs
+on DuckDB's default connection.
+
+```python
+db = pondra.connect("http://localhost:8080")
+print(pondra.sql("SELECT count(*) AS n FROM orders").rows())
+```
+
+```text
+[{'n': 3}]
+```

@@ -360,7 +360,10 @@ fn ready(o: Outcome) -> BoxFuture<'static, Outcome> { async move { o }.boxed() }
 /// exactly-once: its (producer id, sequence) become a Pondra producer and seq, and `prev` makes
 /// a batch that overtook its predecessor fail (OUT_OF_ORDER_SEQUENCE; the client resends it).
 async fn queue(app: &App, table: &str, meta: &TableMeta, records: &[u8]) -> BoxFuture<'static, Outcome> {
-    let invalid = |e: anyhow::Error| ready((INVALID_RECORD, -1, Some(format!("{e:#}"))));
+    let invalid = |e: anyhow::Error| {
+        eprintln!("kafka: a record for {table} refused: {e:#}"); // (librdkafka shows only the code; this says why)
+        ready((INVALID_RECORD, -1, Some(format!("{e:#}"))))
+    };
     let log = match app.log() {
         Ok(log) => log,
         Err(e) => return ready((POLICY_VIOLATION, -1, Some(e.to_string()))),
@@ -372,9 +375,20 @@ async fn queue(app: &App, table: &str, meta: &TableMeta, records: &[u8]) -> BoxF
     let mut acks = vec![];
     for b in batches {
         let rows = match to_rows(meta, &b.recs) {
-            Ok(rows) => rows,
+            Ok((rows, lines)) if crate::defaults::any(meta) => {
+                // (a JSON row without a key takes its column's DEFAULT)
+                let filled = async { crate::defaults::fill(meta, rows, |c| crate::defaults::absent_keys(meta, &lines).ok()?.remove(c)).await };
+                match filled.await {
+                    Ok(rows) => rows,
+                    Err(e) => return invalid(e),
+                }
+            }
+            Ok((rows, _)) => rows,
             Err(e) => return invalid(e),
         };
+        if let Err(e) = crate::defaults::check(meta, table, &rows) {
+            return invalid(e); // (NOT NULL: said as a bad record, which a producer doesn't retry)
+        }
         let src = match b.producer_id >= 0 && b.base_seq >= 0 {
             true => {
                 let (base, count) = (b.base_seq as u64, b.recs.len() as u64);
@@ -481,7 +495,7 @@ fn unsnappy(data: &[u8]) -> Result<Vec<u8>> {
 }
 
 /// Records as rows of the table: each value a JSON row (see the module comment).
-fn to_rows(meta: &TableMeta, recs: &[Rec]) -> Result<RecordBatch> {
+fn to_rows(meta: &TableMeta, recs: &[Rec]) -> Result<(RecordBatch, Vec<u8>)> {
     let schema = schema(&meta.columns)?;
     let raw = schema.index_of("_value").is_ok();
     // Tombstones and change events are rewritten one by one; plain JSON rows go straight through.
@@ -525,19 +539,24 @@ fn to_rows(meta: &TableMeta, recs: &[Rec]) -> Result<RecordBatch> {
             _ => cast(&c, f.data_type())?,
         })
     });
-    Ok(RecordBatch::try_new(schema.clone(), columns.collect::<Result<Vec<ArrayRef>>>()?)?)
+    Ok((RecordBatch::try_new(schema.clone(), columns.collect::<Result<Vec<ArrayRef>>>()?)?, lines))
 }
 
 /// A Debezium change event, or Kafka Connect's JSON with its schema alongside?
 fn envelope(value: Option<&[u8]>) -> bool {
     let Some(Value::Object(v)) = value.and_then(|v| serde_json::from_slice(v).ok()) else { return false };
-    (v.contains_key("schema") && v.contains_key("payload")) || (v.contains_key("op") && (v.contains_key("after") || v.contains_key("before")))
+    wrapped(&v) || (v.contains_key("op") && (v.contains_key("after") || v.contains_key("before")))
+}
+
+/// Kafka Connect's JSON: `{"schema": …, "payload": …}`, or the payload alone under its name.
+fn wrapped(v: &serde_json::Map<String, Value>) -> bool {
+    v.contains_key("payload") && v.keys().all(|k| k == "payload" || k == "schema")
 }
 
 /// A record as the JSON row to write, None to skip it. Debezium's `after` is the new row, a
 /// delete marks `before` deleted; a null value (a tombstone) deletes the key from a keyed table.
 fn row(meta: &TableMeta, key: Option<&[u8]>, value: Option<&[u8]>) -> Result<Option<Value>> {
-    let unwrap = |mut v: Value| if v.get("schema").is_some() && v.get("payload").is_some() { v["payload"].take() } else { v };
+    let unwrap = |mut v: Value| if v.as_object().is_some_and(wrapped) { v["payload"].take() } else { v };
     let deleted = |mut v: Value| {
         if let Some(o) = v.as_object_mut() {
             o.insert("_deleted".into(), true.into());
@@ -548,9 +567,12 @@ fn row(meta: &TableMeta, key: Option<&[u8]>, value: Option<&[u8]>) -> Result<Opt
         Some(v) => serde_json::from_slice(v)?,
         None => Value::Null,
     });
+    let keyed = !meta.key.is_empty() && meta.columns.iter().any(|(c, _)| c == "_deleted");
     if let Some(op) = v.get("op").and_then(Value::as_str).map(String::from).filter(|_| v.get("after").is_some() || v.get("before").is_some()) {
         v = match op.as_str() {
             "c" | "u" | "r" => v["after"].take(),
+            // (a table without a key can't tell which row went: appending `before` would bring it back)
+            "d" if !keyed => bail!("a change event deletes a row, and only a table with a key knows which: create this table with a PRIMARY KEY (the source's)"),
             "d" => deleted(v["before"].take()),
             _ => return Ok(None), // (a truncate)
         };
@@ -558,7 +580,6 @@ fn row(meta: &TableMeta, key: Option<&[u8]>, value: Option<&[u8]>) -> Result<Opt
     if !v.is_null() {
         return Ok(Some(v));
     }
-    let keyed = !meta.key.is_empty() && meta.columns.iter().any(|(c, _)| c == "_deleted");
     let Some(key) = key.filter(|_| keyed) else { return Ok(None) }; // (nothing to delete)
     let k = unwrap(serde_json::from_slice(key).unwrap_or_else(|_| Value::String(String::from_utf8_lossy(key).into())));
     Ok(Some(deleted(match k {

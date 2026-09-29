@@ -1,0 +1,293 @@
+---
+title: Vectors, files and models
+description: Search by meaning with vector columns, keep files next to your tables, call models from SQL, read JSON, and run your own model behind Arrow Flight.
+sidebar:
+  order: 12
+---
+
+import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+
+A column can hold more than numbers and text. Pondra has **vector columns** for "most like this"
+searches, **files** that live in the lake beside the tables, **models** you call from SQL, and
+**JSON** you read in place. Nothing here needs another service: the binary carries the functions,
+and your models stay wherever you run them.
+
+## Search by meaning
+
+A vector is a `FLOAT[]` column. To search, sort by how close each vector is to the one you have.
+Start with a table of notes:
+
+```sql
+CREATE TABLE notes (id BIGINT, body VARCHAR, v FLOAT[]);
+INSERT INTO notes (id, body) VALUES
+  (1, 'green tea with honey'),
+  (2, 'chocolate cake recipe'),
+  (3, 'black tea and lemon');
+```
+
+The vectors come from a model: `ai_embed` calls one from SQL (below), or you compute them anywhere and
+write them like any other column. This page uses a tiny stand-in that counts four words, so the
+example runs without a model. A real `embed` has the same shape and a model in its body.
+
+```sql
+CREATE OR REPLACE FUNCTION embed(t VARCHAR) RETURNS FLOAT[] LANGUAGE python AS $$
+    words = t.lower().split()
+    return [float(words.count(w)) for w in ("tea", "cake", "coffee", "lemon")]
+$$;
+UPDATE notes SET v = embed(body);
+```
+
+Now "most like this" is an `ORDER BY`. `cosine_similarity` is 1 for the same direction and 0 for
+unrelated; `l2_distance` and `dot_product` are there too.
+
+<Tabs syncKey="lang">
+  <TabItem label="SQL">
+    ```sql
+    SELECT id, body, cosine_similarity(v, embed('tea please')) AS score
+    FROM notes ORDER BY score DESC LIMIT 2;
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    import pondra
+    db = pondra.connect("http://localhost:8080")
+
+    query = db.sql("SELECT embed('tea please') AS q").item()      # a list of floats
+    db.sql("SELECT id, body, cosine_similarity(v, $q) AS score FROM notes ORDER BY score DESC LIMIT 2",
+           q=query).rows()
+    ```
+  </TabItem>
+</Tabs>
+
+```text
+id  body                  score
+1   green tea with honey  1.0
+3   black tea and lemon   0.7071067811865475
+```
+
+A vector from Python goes in as a parameter, and a table of vectors from pyarrow, numpy or pandas is
+written as any table is:
+
+```python
+import pyarrow as pa
+
+db.append("notes", pa.table({
+    "id": [4],
+    "body": ["iced tea"],
+    "v": pa.array([[1.0, 0.0, 0.0, 0.0]], pa.list_(pa.float32())),
+}))
+db.sql("SELECT count(*) AS n FROM notes").item()
+```
+
+```text
+4
+```
+
+Vector columns publish to Delta and Iceberg as `array` and `list`, so other engines read them back
+(see [other engines](/pondra/guides/other-engines/)).
+
+<Aside type="caution">
+There is no vector index yet. A search is exact and compares every vector the `WHERE` leaves, so
+filter first (by date, by customer) when you can.
+</Aside>
+
+## Files next to your tables
+
+Put an image, a PDF, an audio clip or a model in the lake with `PUT`, and the bytes sit beside the
+tables. A table's row keeps the path; a query reads the bytes only where it needs them.
+
+```bash
+printf 'hello' > hello.txt
+curl -s -X PUT localhost:8080/files/docs/hello.txt --data-binary @hello.txt
+curl -s -X PUT localhost:8080/files/docs/notes.txt --data-binary 'a second, longer file'
+curl -s localhost:8080/files/docs/hello.txt
+```
+
+```text
+{"path":"files/docs/hello.txt","bytes":5}
+{"path":"files/docs/notes.txt","bytes":21}
+hello
+```
+
+`files('prefix')` lists what is there, and `file_read(path)` gives one file's bytes as a `BINARY`
+value. The prefix is the path in the lake, so it starts with `files/`.
+
+```sql
+SELECT path, size FROM files('files/docs/') ORDER BY path;
+```
+
+```text
+path                  size
+files/docs/hello.txt  5
+files/docs/notes.txt  21
+```
+
+Keep a table of your files, and work with the bytes in SQL. `byte_length`, `sha256`, `md5`, `encode`
+and `decode` take bytes, and `CAST(bytes AS VARCHAR)` reads them as text:
+
+```sql
+CREATE TABLE documents AS
+SELECT path, size, encode(sha256(file_read(path)), 'hex') AS sha FROM files('files/docs/');
+
+SELECT path, byte_length(file_read(path)) AS bytes, CAST(file_read(path) AS VARCHAR) AS text
+FROM documents ORDER BY path;
+```
+
+```text
+path                  bytes  text
+files/docs/hello.txt  5      hello
+files/docs/notes.txt  21     a second, longer file
+```
+
+To keep bytes in a column of their own, declare it `BYTEA` and fill it with `file_read`, `decode`,
+or a `bytes` value from Python:
+
+```sql
+CREATE TABLE blobs (id BIGINT, raw BYTEA);
+INSERT INTO blobs SELECT 1, file_read(path) FROM files('files/docs/') WHERE path LIKE '%hello%';
+SELECT id, byte_length(raw) AS n FROM blobs;
+```
+
+```text
+id  n
+1   5
+```
+
+<Aside type="caution">
+A path that exists can't be written again: `PUT` returns an error, so upload a new version under a new
+name. `file_read` of a path that isn't there is `NULL`, and `files('docs/')` without the `files/`
+finds nothing. `file_read` returns files up to 256 MB, eight at a time. `BINARY` is not a name
+`CREATE TABLE` takes (write `BYTEA`), and string functions such as `substr` need a `CAST(… AS VARCHAR)`
+first. `file_read` can't sit inside `VALUES (…)`: use `INSERT … SELECT`.
+</Aside>
+
+## Models in SQL
+
+`ai_complete` and `ai_embed` call any OpenAI-compatible endpoint: your own vLLM or Ollama, or a
+hosted one. Pondra carries no model, so the binary stays small and the GPU stays outside it. Start
+the node with the endpoint's address:
+
+```bash norun
+PONDRA_AI_URL=http://localhost:11434/v1 pondra serve --dir lake
+```
+
+```sql norun
+SELECT id, ai_complete('Summarize in five words: ' || body) AS summary FROM tickets;
+
+UPDATE tickets SET v = ai_embed(body) WHERE v IS NULL;
+
+SELECT id, body FROM tickets
+ORDER BY cosine_similarity(v, ai_embed('printer problems')) DESC LIMIT 5;
+```
+
+A second argument names the model: `ai_complete(prompt, 'llama3.2')`. Eight rows are in flight at a time,
+and a row whose call fails is `NULL`, so one bad row doesn't lose the query. The
+[reference](/pondra/reference/functions/#models) lists the settings (`PONDRA_AI_KEY` and the default
+models).
+
+<Aside type="caution">
+With no endpoint listening, every row comes back `NULL` and the query still succeeds. If a model
+function is `NULL` for every row, check `PONDRA_AI_URL` first. A model call costs what the endpoint
+charges, for every row the query reaches, so put a `WHERE` and a `LIMIT` before it, and save an
+embedding with `UPDATE` rather than computing it in each search.
+</Aside>
+
+## Your own model behind Arrow Flight
+
+For a model that must stay loaded, or run on a GPU, register a process of your own as a function.
+Pondra sends it the rows it has as one Arrow batch (the arguments are columns `arg0`, `arg1`, …) and
+reads back one column of the same length. A crash or a slow batch in that process can't take a node
+down, and the binary carries none of it.
+
+This server is a function `caption` of bytes. In real life it is a program you run on its own; here
+it starts in a thread so the page is self-contained:
+
+```python
+import threading, time
+import pyarrow as pa
+import pyarrow.flight as flight
+import requests
+
+class Caption(flight.FlightServerBase):
+    def do_exchange(self, context, descriptor, reader, writer):
+        args = reader.read_all()
+        out = pa.array([None if b is None else f"a file of {len(b)} bytes" for b in args.column("arg0").to_pylist()])
+        answer = pa.table({"out": out})
+        writer.begin(answer.schema)
+        writer.write_table(answer)
+        writer.close()
+
+server = Caption("grpc://127.0.0.1:0")
+threading.Thread(target=server.serve, daemon=True).start()
+
+reply = requests.post("http://localhost:8080/functions/caption",
+                      json={"flight": f"http://127.0.0.1:{server.port}", "args": ["Binary"], "returns": "Utf8"})
+time.sleep(1.1)          # queries see a new function within a second
+reply.json()
+```
+
+```text
+{'function': 'caption'}
+```
+
+The function is in the lake's catalog, so it works on every node, in any query:
+
+```sql
+WITH docs AS (SELECT path, file_read(path) AS bytes FROM files('files/docs/'))
+SELECT path, caption(bytes) AS caption FROM docs ORDER BY path;
+```
+
+```text
+path                  caption
+files/docs/hello.txt  a file of 5 bytes
+files/docs/notes.txt  a file of 21 bytes
+```
+
+`GET /functions` lists these functions and `DELETE /functions/caption` removes one. The server has to
+be reachable from every node. For code that doesn't need its own process,
+[Python functions](/pondra/guides/functions-and-procedures/) run on the nodes and need nothing set up.
+
+<Aside type="caution">
+`file_read`, `ai_complete`, `ai_embed` and Flight functions can't take each other's results in one
+expression: `caption(file_read(path))` stops with `async functions should not be called directly`.
+Name the inner call first, in a `WITH` as above, and the query runs.
+</Aside>
+
+## JSON in a column
+
+Keep a JSON document in a `VARCHAR` column and read it where it lies. Each function takes the document
+and a path: keys for objects, positions for arrays.
+
+```sql
+CREATE TABLE events (id BIGINT, payload VARCHAR);
+INSERT INTO events VALUES
+  (1, '{"user": {"name": "ann", "tags": ["a", "b"]}, "amount": 4.5, "ok": true}'),
+  (2, '{"user": {"name": "bo", "tags": []}, "amount": 2.0, "ok": false}');
+
+SELECT id,
+       json_get_str(payload, 'user', 'name') AS name,
+       json_get_str(payload, 'user', 'tags', 0) AS first_tag,
+       json_get_float(payload, 'amount') AS amount,
+       json_length(payload, 'user', 'tags') AS tags
+FROM events
+WHERE json_contains(payload, 'user')
+ORDER BY id;
+```
+
+```text
+id  name  first_tag  amount  tags
+1   ann   a          4.5     2
+2   bo    NULL       2.0     0
+```
+
+`payload ->> 'amount'` reads any value as text, and `->` steps into a nested one. A path that isn't
+there is `NULL`. The typed getters (`json_get_str`, `json_get_int`, `json_get_float`,
+`json_get_bool`) don't convert, so a number read with `json_get_str` is `NULL`: use `->>` and `CAST`
+when you don't know the type. The [functions reference](/pondra/reference/functions/#json) has the
+full list. A [Kafka](/pondra/guides/kafka/) topic's values, and a Debezium feed, are read the same way.
+
+<Aside type="caution">
+`VARIANT` is a name that Python functions and the JSON table API take, and it is stored as this same
+JSON text. `CREATE TABLE` doesn't take it, so declare the column `VARCHAR`. Documents are parsed
+when read, so a filter on a field reads and parses each document.
+</Aside>

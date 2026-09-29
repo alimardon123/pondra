@@ -12,6 +12,7 @@ mod copy;
 mod guard;
 mod hilbert;
 mod ddl;
+mod defaults;
 mod delta;
 mod ext;
 mod feeds;
@@ -215,16 +216,15 @@ enum Cmd {
     /// already running (`--url http://host:8080`).
     Run {
         file: String,
-        /// The lake (a folder or s3://bucket/prefix; default ./lake), unless `--url`.
-        lake: Option<String>,
         #[arg(long)]
         url: Option<String>,
         /// A token for that node (also PONDRA_TOKEN).
         #[arg(long)]
         token: Option<String>,
-        /// The file's parameters: `--name value` …
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
-        params: Vec<String>,
+        /// The lake (a folder or s3://bucket/prefix; default ./lake), unless `--url`; then the file's
+        /// parameters, `--name value` … (`--url` and `--token` may come among them too).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, value_name = "LAKE] [--NAME VALUE")]
+        rest: Vec<String>,
     },
 }
 
@@ -247,7 +247,15 @@ async fn stopped(stdin: bool) {
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() {
+    // An error is said in words, its causes after it: a backtrace (RUST_BACKTRACE) is for panics.
+    if let Err(e) = run().await {
+        eprintln!("Error: {}", ext::said(&e));
+        std::process::exit(1);
+    }
+}
+
+async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let Some(cmd) = cli.cmd else { return shell::run(&cli.lake.unwrap_or_else(|| "lake".into())).await };
     match cmd {
@@ -452,7 +460,18 @@ async fn main() -> anyhow::Result<()> {
             let listener = axum::serve::ListenerExt::tap_io(tokio::net::TcpListener::bind(&addr).await?, |tcp| drop(tcp.set_nodelay(true)));
             axum::serve(listener, server::router(app)).await?;
         }
-        Cmd::Run { file, lake, url, token, params } => {
+        Cmd::Run { file, url, token, rest } => {
+            // (the lake first if it is there; `--url` and `--token` wherever they are; the rest parameters)
+            let (mut lake, mut url, mut token, mut params, mut it) = (None, url, token, vec![], rest.into_iter());
+            while let Some(a) = it.next() {
+                match a.as_str() {
+                    "--url" => url = it.next(),
+                    "--token" => token = it.next(),
+                    _ if !a.starts_with("--") && lake.is_none() && params.is_empty() => lake = Some(a),
+                    _ => params.push(a),
+                }
+            }
+            anyhow::ensure!(lake.is_none() || url.is_none(), "run a script on a lake folder or on a node (--url), not both");
             let sql = std::fs::read_to_string(&file).map_err(|e| anyhow::anyhow!("{file}: {e}"))?;
             let body = serde_json::json!({"sql": sql, "params": shell::params(&params)?});
             let token = token.or_else(|| std::env::var("PONDRA_TOKEN").ok());
@@ -480,22 +499,27 @@ async fn main() -> anyhow::Result<()> {
             }
             let _ = attached;
         }
-        Cmd::Sql { dir, query, attach: attached } => match write::parse(&query) {
-            Some(stmt) => println!("{}", write::from_cli(&dir, stmt).await?),
-            None => {
-                let lake = store::Lake::open(&dir, false, false).await?;
-                for spec in &attached {
-                    attach(&lake, spec, "", false).await?;
-                }
-                ddl::sync(&lake, "", false).await?;
-                let run = async {
-                    let query = routines::expand(&lake, &query).await?;
-                    anyhow::Ok(query::session(&lake, &query, "").await?.enable_url_table().sql(&query).await?.collect().await?)
-                };
-                let batches = ext::scope(true, run).await?; // (its user's own machine: its files, its credentials)
-                println!("{}", pretty_format_batches(&batches)?);
+        Cmd::Sql { dir, query, attach: attached } => {
+            // As a node takes SQL: functions and files (`read_csv(…)`, `'x.parquet'`) expanded, then
+            // a write or a query. A write to a folder with no lake yet makes one.
+            let lake = match write::parse(&query) {
+                Some(_) => write::made(&dir).await?,
+                None => store::Lake::open(&dir, false, false).await?,
+            };
+            for spec in &attached {
+                attach(&lake, spec, "", false).await?;
             }
-        },
+            ddl::sync(&lake, "", false).await?;
+            let query = routines::expand(&lake, &query).await?;
+            match write::parse(&query) {
+                Some(stmt) => println!("{}", ext::scope(true, write::from_cli(&dir, stmt)).await?), // (its user's own machine: its files, its credentials)
+                None => {
+                    let run = async { anyhow::Ok(query::session(&lake, &query, "").await?.enable_url_table().sql(&query).await?.collect().await?) };
+                    let batches = ext::scope(true, run).await?;
+                    println!("{}", pretty_format_batches(&batches)?);
+                }
+            }
+        }
     }
     Ok(())
 }

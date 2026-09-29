@@ -13,7 +13,10 @@ pub async fn run(dir: &str) -> Result<()> {
     let (mut node, base, key, log) = start(dir)?;
     let r = session(dir, &base, &key, &mut node, &log).await;
     stop(&mut node); // (whatever happened: the node never outlives the shell)
-    r
+    if r? {
+        std::process::exit(1); // (a script piped in had a statement fail: say so, as DuckDB's shell does)
+    }
+    Ok(())
 }
 
 /// A node on `dir`, here, for this program alone: it, its address, the key that lets this program's
@@ -104,7 +107,9 @@ async fn databases(http: &reqwest::Client, base: &str) -> Result<Vec<String>> {
     Ok(rows.iter().filter_map(|r| r["database"].as_str().map(str::to_string)).collect())
 }
 
-async fn session(dir: &str, base: &str, key: &str, node: &mut Child, log: &Path) -> Result<()> {
+/// The shell's statements, until its input ends; true if one failed while reading a script (not a
+/// terminal: there, an error is just the answer).
+async fn session(dir: &str, base: &str, key: &str, node: &mut Child, log: &Path) -> Result<bool> {
     let http = up(base, node, log).await?;
     let tty = std::io::stdin().is_terminal();
     if tty {
@@ -112,7 +117,7 @@ async fn session(dir: &str, base: &str, key: &str, node: &mut Child, log: &Path)
         let others = if others.len() > 1 { format!(" Databases: {}.", others.join(", ")) } else { String::new() };
         eprintln!("Pondra {} on {dir}, also at {base}.{others} End each statement with ;  .tables and .databases list them, .quit leaves.", env!("CARGO_PKG_VERSION"));
     }
-    let mut sql = String::new();
+    let (mut sql, mut failed) = (String::new(), false);
     loop {
         if tty {
             eprint!("{}", if sql.is_empty() { "pondra> " } else { "   ...> " });
@@ -144,8 +149,12 @@ async fn session(dir: &str, base: &str, key: &str, node: &mut Child, log: &Path)
                 Ok((false, heard, body)) => {
                     write!(out, "{heard}")?;
                     eprintln!("Error: {}", body.trim());
+                    failed = true;
                 }
-                Err(e) => eprintln!("Error: {e}"),
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    failed = true;
+                }
             }
             out.flush()?;
             if tty {
@@ -156,7 +165,7 @@ async fn session(dir: &str, base: &str, key: &str, node: &mut Child, log: &Path)
             break;
         }
     }
-    Ok(())
+    Ok(failed && !tty)
 }
 
 /// Stop the node by closing its input (`--stop-with-stdin`): it hands the lake on at once, rather

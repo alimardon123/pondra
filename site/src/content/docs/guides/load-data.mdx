@@ -1,0 +1,222 @@
+---
+title: Load data
+description: Put rows into tables with INSERT, append, files, DataFrames and Postgres COPY, and load them exactly once.
+sidebar:
+  order: 2
+---
+
+import { Tabs, TabItem, Aside, LinkCard } from '@astrojs/starlight/components';
+
+There are four ways to put rows into a table: SQL (`INSERT`), a client's `append` for streams of small
+batches, files and DataFrames for bulk loads, and Postgres tools' `COPY`. Whichever you use, a write is
+visible to every query as soon as it is acknowledged.
+
+## Insert rows with SQL
+
+`INSERT … VALUES` is for a few rows, and `INSERT … SELECT` is for a bulk load: it writes Parquet
+files directly, and the node that receives the statement does the work.
+
+```sql
+CREATE TABLE orders (id BIGINT, item VARCHAR, qty INT, amount DOUBLE);
+INSERT INTO orders VALUES (1, 'tea', 2, 7.0), (2, 'cake', 1, 4.5);
+INSERT INTO orders (id, item) VALUES (3, 'pie');
+INSERT INTO orders SELECT 10000 + value, 'bulk', 1, 1.5 FROM generate_series(1, 1000);
+```
+
+- A column list fills only those columns; the rest are `NULL`.
+- The `SELECT` can read any table, view, or file (see below). `INSERT INTO new_table SELECT …` makes the
+  table when it isn't there yet; `CREATE TABLE … AS SELECT` does the same with the name first.
+- Many small `INSERT … VALUES` statements don't make many small files: the rows are gathered into one
+  file per table each time the lake tiers its newest rows to Parquet.
+- Into a keyed table, `INSERT` is an upsert (see [Tables](/pondra/guides/tables/)).
+
+<Aside type="caution">
+`INSERT … VALUES` stores `NULL` for a literal that isn't the column's type: `VALUES ('abc', …)` into a
+`BIGINT` column writes a `NULL`. `INSERT … SELECT` and `append` refuse such a value with an error.
+</Aside>
+
+## Append rows from code
+
+`append` is for streams: rows arrive in small batches, from many producers, and nothing may be lost or
+counted twice. Give it a list of rows.
+
+<Tabs syncKey="lang">
+  <TabItem label="Python">
+    ```python
+    import pondra
+    db = pondra.connect("http://localhost:8080")
+    db.append("orders", [{"id": 4, "item": "coffee", "qty": 1, "amount": 3.0},
+                         {"id": 5, "item": "juice", "qty": 2, "amount": 5.0}])
+    ```
+  </TabItem>
+  <TabItem label="JavaScript">
+    ```js
+    import { connect } from "pondra";
+    const db = connect("http://localhost:8080");
+    await db.append("orders", [{ id: 6, item: "tea", qty: 1, amount: 3.5 }]);
+    ```
+  </TabItem>
+  <TabItem label="Shell">
+    ```bash
+    curl -s -X POST "http://localhost:8080/append/orders?producer=shop-1&seq=1" \
+      -H 'content-type: application/x-ndjson' \
+      -d '{"id": 7, "item": "cake", "qty": 3, "amount": 13.5}'
+    ```
+  </TabItem>
+</Tabs>
+
+Python's `append` also takes a pandas, Polars or Arrow table. Arrow tables go over HTTP as an Arrow
+stream (`application/vnd.apache.arrow.stream`), and JSON rows as one JSON object per line.
+
+### Why an append is exactly-once
+
+Each producer has a name and numbers its batches with an increasing `seq`. A node that has already
+committed a batch answers a repeat of it with `"duplicate": true` and writes nothing:
+
+```bash
+row='{"id": 8, "item": "pie", "qty": 1, "amount": 4.0}'
+for attempt in 1 2; do
+  curl -s -w '\n' -X POST "http://localhost:8080/append/orders?producer=shop-2&seq=1" -H 'content-type: application/x-ndjson' -d "$row"
+done
+```
+
+```text
+{"seg":8,"duplicate":false,"conflict":false,"row":0,"ms":0}
+{"seg":0,"duplicate":true,"conflict":false,"row":0,"ms":0}
+```
+
+So a producer whose answer got lost simply sends the same batch again, to any node, until it is
+acknowledged. The Python and JavaScript clients do this for you: one producer name per connection, an
+increasing `seq`, and retries with a growing pause. If you write your own producer, send batches in
+order, one request in flight at a time.
+
+## Load a batch once with a job
+
+Give a write a **job id** and a retry of it changes nothing. This is how you make a nightly load safe to
+run twice:
+
+```python
+load = "INSERT INTO orders SELECT 20000 + value, 'nightly', 1, 2.0 FROM generate_series(1, 50)"
+print(db.sql(load, job="load-2026-09-27"))
+print(db.sql(load, job="load-2026-09-27"))    # a retry: nothing is written
+```
+
+```text
+{'rows': 50}
+{'duplicate': True}
+```
+
+Over HTTP the job id is a query parameter, `POST /sql?job=load-2026-09-27`. `POST
+/insert/orders?job=…` with a `SELECT` as the body does the same for a bulk insert.
+
+## Load files
+
+Name a file wherever SQL takes a table. Parquet, CSV and JSON lines are read by their extension, or with
+`read_parquet`, `read_csv` and `read_json`, which take options such as `header => true`.
+
+```python
+import pyarrow as pa, pyarrow.parquet as pq
+
+pq.write_table(pa.table({"id": [201, 202], "item": ["tea", "cake"], "qty": [2, 1], "amount": [7.0, 4.5]}), "more.parquet")
+```
+
+```bash
+printf 'id,item,qty,amount\n203,pie,1,4.0\n204,juice,2,5.0\n' > more.csv
+printf '{"id":205,"item":"coffee","qty":1,"amount":3.0}\n' > more.json
+pondra lake <<'SQL'
+INSERT INTO orders SELECT * FROM 'more.parquet';
+INSERT INTO orders SELECT * FROM read_csv('more.csv', header => true);
+INSERT INTO orders SELECT * FROM read_json('more.json')
+SQL
+pondra sql --dir lake "SELECT count(*) AS loaded FROM orders WHERE id BETWEEN 201 AND 205"
+```
+
+```text
+{"rows":2}
+{"rows":2}
+{"rows":1}
++--------+
+| loaded |
++--------+
+| 5      |
++--------+
+```
+
+`pondra lake` opens a [shell](/pondra/start/shell/) on the lake, which is what lets the statements read
+files on your machine. It works while a node runs on the same lake: the shell joins it for the moment.
+`pondra sql --dir lake` reads the lake straight from the folder, with no node of its own. Files in
+buckets, on HTTPS and in other engines' tables are in [Files and other lakes](/pondra/guides/files-and-other-lakes/).
+
+<Aside type="caution">
+A node started with `pondra serve` never reads its own disk for a client's SQL, whoever asks: it refuses
+`FROM 'more.csv'` with "a file on the node's machine". Only the program that started a node (the shell,
+`local()` in Python or JavaScript) and `pondra sql` read your files. `pondra sql` reads a file named
+like `'more.parquet'`, but not yet `read_csv(…)` or `read_json(…)` in an `INSERT` or `CREATE TABLE … AS`:
+use the shell for those.
+</Aside>
+
+## Load a DataFrame
+
+From Python, hand pandas, Polars or Arrow data to `write_table`. `mode` is `create` (the default: make
+the table from the data), `append`, or `overwrite` (a new table in its place).
+
+```python
+import pandas as pd
+
+trips = pd.DataFrame({"city": ["Tashkent", "Paris"], "km": [12.5, 7.0]})
+db.write_table("trips", trips)
+db.write_table("trips", pd.DataFrame({"city": ["Rome"], "km": [3.2]}), mode="append")
+print(db.sql("SELECT city, km FROM trips ORDER BY city").rows())
+```
+
+```text
+[{'city': 'Paris', 'km': 7.0}, {'city': 'Rome', 'km': 3.2}, {'city': 'Tashkent', 'km': 12.5}]
+```
+
+The same method takes a frame or a SQL string, so `db.write_table("trips_copy", db.table("trips"))`
+copies a table. A pandas file you read yourself (`pd.read_csv("more.csv")`) loads the same way, from
+any machine that can reach the node.
+
+## Load with Postgres tools
+
+With the Postgres port on (`pondra serve --pg 0.0.0.0:5432`), `COPY … FROM STDIN` in text or CSV format
+loads rows from psql, psycopg, and anything else that speaks the protocol:
+
+```bash
+printf '300,tea,2,7.0\n301,cake,1,4.5\n' | psql -h localhost -p 5432 -c "COPY orders FROM STDIN (FORMAT csv)"
+```
+
+```text
+COPY 2
+```
+
+psql's `\copy orders FROM 'file.csv' WITH (FORMAT csv, HEADER true)` reads a file on your machine and
+sends it the same way. In Python with psycopg 3:
+
+```python
+import psycopg
+
+with psycopg.connect("host=localhost port=5432 dbname=lake", autocommit=True) as conn:
+    with conn.cursor() as cur, cur.copy("COPY orders FROM STDIN") as copy:
+        copy.write_row((302, "pie", 1, 4.0))
+        copy.write_row((303, "juice", 2, 5.0))
+```
+
+## Other ways in
+
+- **Kafka producers** write to tables over the Kafka port: a topic is a table. See
+  [Kafka](/pondra/guides/kafka/).
+- **Arrow Flight and ADBC** load Arrow batches exactly-once, and `adbc_ingest` creates tables. See
+  [the Flight reference](/pondra/reference/flight/).
+- **Another engine** (Spark, PyIceberg, Trino) can append to a table that publishes Iceberg. See
+  [Other engines](/pondra/guides/other-engines/).
+
+## When is a write visible?
+
+<Aside>
+A write is acknowledged once it is durable: in the object store, which is a millisecond on local disk
+and 0.25 to 0.7 seconds on S3 or R2. From then on every query on every node sees it, and materialized
+views already include it. `pondra serve --ack replicated` acknowledges after two nodes hold the write
+instead (about 4 ms on any storage), at the price of a small window described in
+[Freshness and guarantees](/pondra/concepts/freshness-and-guarantees/).
+</Aside>

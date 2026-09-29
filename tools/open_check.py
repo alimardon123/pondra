@@ -66,7 +66,7 @@ def iceberg_readers(lake, table, port=None):
         import polars as pl
         from pyiceberg.table import StaticTable  # (metadata through PyIceberg's fsspec IO, data through Polars' own reader)
         t = StaticTable.from_metadata(iceberg_metadata(lake, table), properties=iceberg_props(lake))
-        out["polars"] = pl.scan_iceberg(t, storage_options=s3_opts() if s3 else None).select(pl.len()).collect().item()
+        out["polars"] = pl.scan_iceberg(t, storage_options=s3_opts() if s3 else None).collect().height  # (every column: Polars finds them by their Parquet field ids)
     except Exception as e:
         out["polars"] = f"error: {str(e)[:160]}"
     try:

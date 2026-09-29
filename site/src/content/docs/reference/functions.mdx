@@ -1,0 +1,307 @@
+---
+title: SQL functions
+description: The functions Pondra adds to DataFusion's standard ones, for JSON, vectors, files, binary data, models and routines.
+sidebar:
+  order: 2
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Pondra's SQL is [Apache DataFusion's](https://datafusion.apache.org/user-guide/sql/scalar_functions.html),
+so every function in DataFusion's lists works here: strings, math, dates, arrays, `regexp_*`,
+`window` functions and aggregates. This page lists what Pondra adds. For the functions you make
+yourself, see [`CREATE FUNCTION`](/pondra/reference/sql/#functions-procedures-and-tasks).
+
+## JSON
+
+A JSON document is a `VARCHAR` column. Each function takes the document, then a path: keys for
+objects and positions for arrays. A path that isn't there gives `NULL`.
+
+| Function | Returns |
+|---|---|
+| `json_get_str(doc, path…)` | the string at the path |
+| `json_get_int(doc, path…)` | the whole number |
+| `json_get_float(doc, path…)` | the number as a `DOUBLE` |
+| `json_get_bool(doc, path…)` | the boolean |
+| `json_get_array(doc, path…)` | the array |
+| `json_get_json(doc, path…)` | the value as JSON text |
+| `json_get(doc, path…)` | the value, in whatever type it has |
+| `json_as_text(doc, path…)` | the value as text, whatever its type |
+| `json_contains(doc, path…)` | true if the path exists |
+| `json_length(doc, path…)` | the length of the array or object |
+| `json_object_keys(doc, path…)` | the keys of the object |
+| `doc -> path` | the same as `json_get`; chain it: `doc -> 'a' -> 'b'` |
+| `doc ->> path` | the same as `json_as_text` |
+
+```sql
+CREATE TABLE events (id BIGINT, payload VARCHAR);
+INSERT INTO events VALUES
+  (1, '{"user": {"name": "ann"}, "amount": 4.5, "tags": ["a", "b"]}'),
+  (2, '{"user": {"name": "bo"}, "amount": 2.0, "tags": []}');
+
+SELECT id,
+       json_get_str(payload, 'user', 'name') AS name,
+       payload ->> 'amount' AS amount,
+       json_length(payload, 'tags') AS tags
+FROM events
+WHERE json_contains(payload, 'user')
+ORDER BY id;
+```
+
+```text
+id  name  amount  tags
+1   ann   4.5     2
+2   bo    2.0     0
+```
+
+<Aside type="caution">
+The typed getters don't convert: `json_get_str` on a number is `NULL`, and `json_get_int` on
+`4.5` is `NULL`. Use `json_get_float` for any number, or `->>` to read anything as text and
+`CAST` it. `->` and `json_get` give a value that shows as `{int=7}`; use it to go deeper into a
+document, and finish with `->>` or a typed getter.
+</Aside>
+
+## Vectors
+
+A vector is a `FLOAT[]` column. The three distance functions take two vectors of the same length
+and give a `DOUBLE`. If the lengths differ, or either side is `NULL`, the answer is `NULL`.
+
+| Function | Meaning |
+|---|---|
+| `cosine_similarity(a, b)` | 1 for the same direction, 0 for unrelated, -1 for opposite |
+| `l2_distance(a, b)` | Euclidean distance: 0 for the same vector |
+| `dot_product(a, b)` | the sum of the products of each pair of numbers |
+
+DataFusion's own `cosine_distance`, `array_distance` and `inner_product` work on the same columns.
+An array literal, `[1.0, 0.0, 0.0]`, is a vector, so "most like this" is an `ORDER BY`:
+
+```sql
+CREATE TABLE docs (id BIGINT, title VARCHAR, v FLOAT[]);
+INSERT INTO docs VALUES
+  (1, 'tea', [1.0, 0.0, 0.0]),
+  (2, 'cake', [0.0, 1.0, 0.0]),
+  (3, 'coffee', [0.9, 0.1, 0.0]);
+
+SELECT title, cosine_similarity(v, [1.0, 0.0, 0.0]) AS score
+FROM docs ORDER BY score DESC LIMIT 2;
+```
+
+```text
+title   score
+tea     1.0
+coffee  0.9938837341719244
+```
+
+There is no vector index yet, so a search reads every row.
+
+## Models
+
+`ai_complete` and `ai_embed` call an OpenAI-compatible endpoint: your own Ollama or vLLM, or a
+hosted one. Pondra carries no model.
+
+| Function | Returns |
+|---|---|
+| `ai_complete(prompt [, model])` | the model's answer, as text |
+| `ai_embed(text [, model])` | the embedding, as a `FLOAT[]` to store in a column |
+
+The node reads where to call from `PONDRA_AI_URL` (default `http://127.0.0.1:11434/v1`),
+`PONDRA_AI_KEY` (if the endpoint wants a key), and the default models `PONDRA_AI_MODEL`
+(`llama3.2`) and `PONDRA_EMBED_MODEL` (`nomic-embed-text`). See
+[environment variables](/pondra/reference/environment/). Eight rows are sent at a time, and a row
+whose call fails is `NULL`, so one bad row doesn't lose the query.
+
+```sql norun
+SELECT id, ai_complete('Summarize in five words: ' || body) AS summary FROM tickets;
+UPDATE tickets SET v = ai_embed(body) WHERE v IS NULL;
+```
+
+<Aside type="caution">
+With no endpoint listening, every row is `NULL` and the query still succeeds. If a model function
+answers `NULL` for every row, check `PONDRA_AI_URL` first.
+</Aside>
+
+## Files
+
+A file is an object in the lake, next to the tables: an image, a PDF, a model. Upload it with
+`PUT /files/<path>` (see [HTTP](/pondra/reference/http/)), then list and read it in SQL. Files are
+stored under `files/`, and a path that exists can't be written again.
+
+| Function | Returns |
+|---|---|
+| `files()` | a table of every file: `path`, `size`, `written` |
+| `files('files/dir/')` | the same, for the paths that start with the prefix |
+| `file_read(path)` | the file's bytes as `BINARY`, or `NULL` if there is no such file |
+| `byte_length(bytes)` | the number of bytes in a `BINARY` value, as a `BIGINT` |
+
+```bash
+curl -s -X PUT http://localhost:8080/files/docs/hello.txt --data-binary 'hello world'
+```
+
+```sql
+SELECT path, size, byte_length(file_read(path)) AS bytes, CAST(file_read(path) AS VARCHAR) AS text
+FROM files('files/docs/');
+```
+
+```text
+path                  size  bytes  text
+files/docs/hello.txt  11    11     hello world
+```
+
+The prefix is the path in the lake, so it starts with `files/`. `files('docs/')` finds nothing.
+
+## Binary data
+
+A `BINARY` value is what `file_read` gives, and what a `BINARY` column holds. These functions
+take it:
+
+| Function | Returns |
+|---|---|
+| `byte_length(b)` | the number of bytes |
+| `sha256(b)` | the SHA-256 digest, as `BINARY` |
+| `md5(b)` | the MD5 digest, as hex text |
+| `encode(b, 'hex' \| 'base64' \| 'base64pad')` | the bytes as text |
+| `decode(text, 'hex' \| 'base64' \| 'base64pad')` | the text as bytes |
+| `CAST(b AS VARCHAR)` | the bytes read as UTF-8 text |
+
+```sql
+SELECT md5(file_read(path)) AS md5, encode(sha256(file_read(path)), 'hex') AS sha256
+FROM files('files/docs/');
+```
+
+```text
+md5                               sha256
+5eb63bbbe01eeed093cb22bb8f5acdc3  b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9
+```
+
+<Aside type="caution">
+`BINARY` isn't a type you can name in `CREATE TABLE` or `CAST`, and string functions such as
+`substr` don't take it. `CAST(b AS VARCHAR)` first, then use the string function.
+</Aside>
+
+## Files outside the lake
+
+Table functions read files in place, and give a table. Their names, and the DuckDB names that mean
+the same, are on the [names page](/pondra/reference/names/).
+
+| Function | Reads |
+|---|---|
+| `read_parquet(url…)` | Parquet files |
+| `read_csv(url…)` | CSV files |
+| `read_json(url…)` | newline-delimited JSON |
+| `read_delta(url)` | a Delta Lake table |
+| `read_iceberg(url)` | an Iceberg table |
+
+A URL is a path, a glob (`sales/*.csv`), a list (`['a.csv', 'b.csv']`) or an `s3://`, `gs://`,
+`az://` or `https://` address. Options come by name, after the URLs:
+
+| Function | Options |
+|---|---|
+| `read_parquet`, `read_json` | `hive_partitioning`, `union_by_name` |
+| `read_csv` | `header` (default `true`: the first line names the columns), `delim` (or `sep`, `delimiter`), `quote`, `escape`, `hive_partitioning`, `union_by_name` |
+| `read_delta` | `version` |
+| `read_iceberg` | `version`, `snapshot_from_id`, `snapshot_from_timestamp`, `allow_moved_paths` |
+
+An option Pondra doesn't know is an error that lists the ones it does. A bare quoted name in
+`FROM` (`FROM 'sales.csv'`) picks the reader from the file's extension.
+
+A path on the node's machine is read only by the program that started the node: the shell,
+`pondra.local()` or `pondra sql`. A query over HTTP is refused.
+
+```bash
+printf 'id,name\n1,tea\n2,cake\n' > sales.csv
+```
+
+```python
+import pondra
+db = pondra.local("scratch")
+print(db.sql("SELECT * FROM read_csv('sales.csv', header => true) ORDER BY id").rows())
+db.close()
+```
+
+```text
+[{'id': 1, 'name': 'tea'}, {'id': 2, 'name': 'cake'}]
+```
+
+## Secrets
+
+| Function | Returns |
+|---|---|
+| `secrets()` | a table of the lake's secrets: their names, types and scopes, never their values |
+
+```sql
+SELECT * FROM secrets();
+```
+
+## Routines
+
+| Function | Meaning |
+|---|---|
+| `pondra.start('name', arg…)` | run a procedure without waiting, and answer with its run's id |
+
+`CALL p(args)` waits for the procedure to finish. `pondra.start` returns at once with an id you
+can find in `pondra.runs` (see [system columns](/pondra/reference/system-columns/)). Add `AS name`
+to name the column.
+
+```sql
+CREATE TABLE stamps (n BIGINT);
+CREATE PROCEDURE stamp() LANGUAGE sql AS $$ INSERT INTO stamps VALUES (1); $$;
+SELECT pondra.start('stamp') AS run_id;
+```
+
+Code inside a Python function or procedure has more: `pondra.sql`, `pondra.call` and
+`pondra.secret`. They are in the [Python reference](/pondra/reference/python/).
+
+## Exact sums
+
+`sum` over `DOUBLE` gives the same answer whatever the order the rows arrive in, and on any number
+of nodes: the exact total, rounded once. Ordinary floating-point addition can differ in its last
+digits from one run to the next. Sums of integers and decimals, and `sum(DISTINCT …)`, are
+DataFusion's own.
+
+```sql
+SELECT sum(x) AS total FROM (VALUES (0.1), (0.2), (0.3)) AS t(x);
+```
+
+```text
+total
+0.6
+```
+
+## Functions you bring
+
+A function can also run in a process of your own, as an Arrow Flight server: Pondra sends it the
+rows as one batch, and reads one column back. Register it with `POST /functions/<name>`, with the
+server's address, the argument types and the return type. `GET /functions` lists them, and
+`DELETE /functions/<name>` takes one away. The definition is kept in the lake, so every node has
+the function, within a second of your `POST`.
+
+```python
+import json, threading, time, urllib.request
+import pyarrow as pa
+import pyarrow.flight as fl
+
+class Shout(fl.FlightServerBase):
+    def do_exchange(self, context, descriptor, reader, writer):
+        column = reader.read_all().column(0).to_pylist()
+        answer = pa.table({"out": [None if v is None else v.upper() for v in column]})
+        writer.begin(answer.schema)
+        writer.write_table(answer)
+
+server = Shout("grpc://127.0.0.1:0")   # port 0: any free port
+threading.Thread(target=server.serve, daemon=True).start()
+
+body = {"flight": f"http://127.0.0.1:{server.port}", "args": ["Utf8"], "returns": "Utf8"}
+urllib.request.urlopen(urllib.request.Request("http://localhost:8080/functions/shout", data=json.dumps(body).encode(), method="POST"))
+
+time.sleep(1.1)   # a node re-reads its function list once a second
+db = pondra.connect("http://localhost:8080")
+print(db.sql("SELECT shout('tea') AS s").rows())
+```
+
+```text
+[{'s': 'TEA'}]
+```
+
+The arguments arrive as columns `arg0`, `arg1`, and so on. The types are Arrow's names: `Utf8`,
+`Int64`, `Float64`, `Binary`, `Float32[]`. A function returns one column with as many values as
+it got rows. An optional `"rows": n` in the body sets how many rows go in each call.

@@ -1,0 +1,269 @@
+---
+title: DataFrames
+description: Query a lake with Polars-style frames in Python, mix them with SQL, and save them as views and tables.
+sidebar:
+  order: 7
+---
+
+import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+
+A **frame** is a query written as method calls, with Polars' names. Nothing runs until you ask
+for rows. Each step becomes a step of one SQL statement, so a frame runs, spreads over the nodes
+and is remembered exactly as its SQL would be. Frames are for Python; JavaScript writes SQL.
+
+## Make a frame
+
+Start with a table:
+
+```sql
+CREATE TABLE orders (id BIGINT, user VARCHAR, item VARCHAR, qty INT, price DOUBLE, ts TIMESTAMP);
+INSERT INTO orders VALUES
+  (1, 'ann', 'tea',    2, 3.5, '2026-09-01 09:00:00'),
+  (2, 'bob', 'cake',   1, 4.5, '2026-09-01 10:30:00'),
+  (3, 'ann', 'tea',    1, 3.5, '2026-09-02 08:15:00'),
+  (4, 'cy',  'coffee', 3, 3.0, '2026-09-02 12:00:00'),
+  (5, 'bob', 'tea',    4, 3.5, '2026-09-03 16:45:00');
+```
+
+`db.table` gives a frame. `filter`, `with_columns`, `group_by(…).agg(…)` and `sort` each return a
+new one:
+
+<Tabs syncKey="lang">
+  <TabItem label="SQL">
+    ```sql
+    SELECT user, sum(qty * price) AS spent, count(*) AS n
+    FROM orders WHERE qty > 1 GROUP BY user ORDER BY spent DESC;
+    ```
+  </TabItem>
+  <TabItem label="Frames">
+    ```python
+    import pondra
+    from pondra import col
+
+    db = pondra.connect("http://localhost:8080")
+    top = (db.table("orders")
+           .filter(col("qty") > 1)
+           .with_columns((col("qty") * col("price")).alias("total"))
+           .group_by("user")
+           .agg(col("total").sum().alias("spent"), pondra.len().alias("n"))
+           .sort("spent", descending=True))
+    top.to_pandas()
+    ```
+  </TabItem>
+  <TabItem label="PySpark">
+    ```python
+    from pondra.spark import SparkSession, functions as F
+
+    spark = SparkSession.builder.remote("pondra://localhost:8080").getOrCreate()
+    (spark.table("orders").where(F.col("qty") > 1)
+          .groupBy("user")
+          .agg(F.sum(F.col("qty") * F.col("price")).alias("spent"), F.count("*").alias("n"))
+          .orderBy(F.desc("spent")).show())
+    ```
+  </TabItem>
+</Tabs>
+
+```text
+user  spent  n
+bob   14.0   1
+cy     9.0   1
+ann    7.0   1
+```
+
+(The `pondra.spark` tab is [PySpark's names](/pondra/guides/pyspark/) over the same frames.)
+
+## Get the rows
+
+A frame is lazy. These ask for its rows, and each runs the statement again:
+
+| Call | Gives |
+|---|---|
+| `top.to_pandas()` | a pandas DataFrame |
+| `top.to_polars()` | a Polars DataFrame |
+| `top.collect()` | a pyarrow Table |
+| `top.rows()` | a list of dicts |
+| `top.item()` | the one value of a one-row, one-column frame |
+| `top.show()` | prints the first rows as a table |
+
+`top.sql` is the statement a frame becomes. It's readable and you can paste it into any SQL client:
+
+```python
+print(top.sql)
+```
+
+```text
+WITH _2 AS (SELECT * FROM orders WHERE ("qty" > 1)),
+     _3 AS (SELECT *, ("qty" * "price") AS "total" FROM _2),
+     _4 AS (SELECT "user", sum("total") AS "spent", count(*) AS "n" FROM _3 GROUP BY 1)
+SELECT * FROM _4 ORDER BY "spent" DESC NULLS FIRST
+```
+
+To see the plan, run `EXPLAIN` on it: `db.sql("EXPLAIN " + top.sql).rows()`.
+
+## Expressions
+
+`col`, `lit`, arithmetic, comparisons, `&`, `|` and `~` build expressions. Strings, dates, windows
+and `when` work as in Polars:
+
+```python
+from pondra import lit, when
+
+db.table("orders").with_columns(
+    size=when(col("qty") > 2).then(lit("big")).otherwise(lit("small")),
+    name=col("user").str.to_uppercase(),
+    day=col("ts").dt.date(),
+    spent_so_far=(col("qty") * col("price")).cum_sum().over("user", order_by="ts"),
+).select("id", "name", "size", "day", "spent_so_far").sort("id").rows()
+```
+
+```text
+[{'id': 1, 'name': 'ANN', 'size': 'small', 'day': datetime.date(2026, 9, 1), 'spent_so_far': 7.0},
+ {'id': 2, 'name': 'BOB', 'size': 'small', 'day': datetime.date(2026, 9, 1), 'spent_so_far': 4.5},
+ {'id': 3, 'name': 'ANN', 'size': 'small', 'day': datetime.date(2026, 9, 2), 'spent_so_far': 10.5},
+ {'id': 4, 'name': 'CY', 'size': 'big', 'day': datetime.date(2026, 9, 2), 'spent_so_far': 9.0},
+ {'id': 5, 'name': 'BOB', 'size': 'big', 'day': datetime.date(2026, 9, 3), 'spent_so_far': 18.5}]
+```
+
+Joins take `on=` (or `left_on` and `right_on`) and `how` (`inner`, `left`, `right`, `full`, `semi`,
+`anti`, `cross`). `join_asof` is an [as-of join](/pondra/guides/streaming/#as-of-joins).
+`pondra.concat([a, b])` stacks frames; `unique`, `limit`, `drop_nulls`, `fill_null`, `rename`,
+`cast` and `drop` are there too.
+
+```sql
+CREATE TABLE people (user VARCHAR, city VARCHAR);
+INSERT INTO people VALUES ('ann', 'Oslo'), ('bob', 'Lima');
+```
+
+```python
+by_city = (db.table("orders")
+           .join(db.table("people"), on="user", how="left")
+           .group_by("city").agg(col("qty").sum().alias("items"))
+           .sort("items", descending=True))
+by_city.rows()
+```
+
+```text
+[{'city': 'Lima', 'items': 5}, {'city': None, 'items': 3}, {'city': 'Oslo', 'items': 3}]
+```
+
+## SQL wherever it's shorter
+
+Any method takes SQL text in place of an expression, so a `CASE` or a date function needn't be
+rewritten as calls:
+
+```python
+(db.table("orders")
+   .filter("qty > 1 AND item LIKE 't%'")
+   .with_columns("qty * price AS total", size="CASE WHEN qty > 2 THEN 'big' ELSE 'small' END")
+   .group_by("item").agg("sum(total) AS revenue", "count(*) AS n")
+   .rows())
+```
+
+`pondra.sql_expr("…")` makes an expression from a snippet to use in the calls above.
+
+## Use SQL and frames together
+
+You don't decide up front which to use. Both give the same kind of result, and either can start
+from the other.
+
+**`db.sql(query)` is a frame.** It runs when you ask for rows, so you can keep going in Python:
+
+```python
+big = db.sql("SELECT * FROM orders WHERE qty > 1")
+big.group_by("user").agg(col("qty").sum().alias("items")).sort("user").rows()
+```
+
+**SQL reads Python by name.** A name in your SQL that isn't a table is looked up in your Python
+variables. A frame becomes part of the same statement, so it still runs on the node's data. A
+pandas, Polars or Arrow table is sent along with the query for that query only.
+
+```python
+import pandas as pd
+
+recent = db.table("orders").filter(col("qty") > 1)
+targets = pd.DataFrame({"user": ["ann", "bob", "cy"], "target": [10, 20, 30]})
+db.sql("""SELECT r.user, sum(r.qty * r.price) AS spent, t.target
+          FROM recent r JOIN targets t USING (user)
+          GROUP BY r.user, t.target ORDER BY r.user""").rows()
+```
+
+A table in the lake wins over a Python variable of the same name. To name things yourself, pass
+frames by keyword and use `{name}` in the SQL; other keywords are `$name` parameters, bound by
+the node and never pasted into the text:
+
+```python
+db.sql("SELECT id, user, qty FROM {r} WHERE qty > $min ORDER BY id", r=recent, min=2).rows()
+```
+
+## Save a frame
+
+<Tabs syncKey="lang">
+  <TabItem label="Frames">
+    ```python
+    recent.to_view("recent_orders")                                   # CREATE OR REPLACE VIEW
+    recent.write_table("big_orders")                                  # CREATE TABLE … AS SELECT
+    db.table("orders").filter(col("qty") == 1).write_table("big_orders", mode="append")
+    db.sql("SELECT (SELECT count(*) FROM recent_orders) AS in_view, (SELECT count(*) FROM big_orders) AS in_table").rows()
+    ```
+  </TabItem>
+  <TabItem label="SQL">
+    ```sql
+    CREATE OR REPLACE VIEW recent_orders AS SELECT * FROM orders WHERE qty > 1;
+    ```
+  </TabItem>
+</Tabs>
+
+A view made from a frame is a view like any other: SQL files, psql and BI tools read it by name.
+`to_view(name, temporary=True)` keeps it to your connection, `materialized=True` keeps it up to
+date as rows arrive (see [streaming](/pondra/guides/streaming/)), and `write_table` takes
+`mode="create"`, `"append"` or `"overwrite"`. A frame of data that lives only in Python
+(`db.from_arrow(...)`) can't become a view; write it to a table first.
+
+`write_parquet`, `write_csv`, `write_json`, `write_delta` and `write_iceberg` write files and
+other engines' tables, and `db.read_parquet(url)` and its kin read them:
+see [files and other lakes](/pondra/guides/files-and-other-lakes/).
+
+## Change rows
+
+A frame of a table can also change it, with the same guarantees as `UPDATE`, `DELETE` and `MERGE`.
+Values in `update` are expressions, so wrap a string in `lit`:
+
+```python
+people = db.table("people")
+people.update({"city": lit("Bergen")}, where=col("user") == "ann")
+new = db.from_arrow([{"user": "cy", "city": "Rome"}, {"user": "bob", "city": "Lima"}])
+(people.merge(new, on="user")
+       .when_matched_update({"city": col("s.city")})
+       .when_not_matched_insert()
+       .run())
+people.delete(where=col("user") == "bob")
+people.sort("user").rows()
+```
+
+```text
+[{'user': 'ann', 'city': 'Bergen'}, {'user': 'cy', 'city': 'Rome'}]
+```
+
+`merge` takes Delta Lake's builder names (`when_matched_update`, `when_matched_delete`,
+`when_not_matched_insert`, `when_not_matched_by_source_delete`); `s` is the source and `t` the
+target. See [changing rows](/pondra/guides/change-rows/).
+
+## In a notebook
+
+With `%load_ext pondra`, a cell can be SQL that names your frames and returns a frame. See
+[notebooks](/pondra/guides/notebooks/).
+
+## Where frames differ from Polars
+
+Frames give Polars' answers where SQL would give another, by writing the difference into the SQL:
+nulls sort first in a sort unless you pass `nulls_last=True`, `/` is a float division, `round`
+rounds halves to even, and `n_unique` counts null as a value.
+
+<Aside type="caution">
+
+- A frame that has a sort keeps it through the steps after it, until a step groups, joins or drops
+  the sort column, as in Polars.
+- `sample(n)` is `ORDER BY random() LIMIT n`.
+- The JavaScript client has parameters, `run` and `call`, but no frame builder.
+
+</Aside>

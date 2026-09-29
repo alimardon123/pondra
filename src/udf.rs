@@ -44,10 +44,14 @@ pub async fn register(lake: &Lake, ctx: &SessionContext) -> Result<()> {
     Ok(())
 }
 
+type Cache = Mutex<HashMap<String, (std::time::Instant, Arc<Vec<(String, Udf)>>)>>;
+static SEEN: OnceLock<Cache> = OnceLock::new();
+
+/// A function made or dropped here: the next query sees it (other nodes, within a second).
+pub fn forget(lake: &Lake) { SEEN.get_or_init(Default::default).lock().unwrap().remove(&lake.url); }
+
 /// The lake's functions, as of a moment ago.
 async fn listed(lake: &Lake) -> Result<Arc<Vec<(String, Udf)>>> {
-    type Cache = Mutex<HashMap<String, (std::time::Instant, Arc<Vec<(String, Udf)>>)>>;
-    static SEEN: OnceLock<Cache> = OnceLock::new();
     let seen = SEEN.get_or_init(Default::default);
     if let Some((at, fns)) = seen.lock().unwrap().get(&lake.url) {
         if at.elapsed() < std::time::Duration::from_secs(1) {

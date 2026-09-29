@@ -132,7 +132,7 @@ pub fn of_macro(args: &Option<Vec<ast::MacroArg>>, def: &ast::MacroDefinition) -
 /// MACRO [TABLE] [IF EXISTS] name` (DuckDB's). None: none of them; `Stmt::Invalid`: one, written
 /// wrong, and why.
 pub fn statement(sql: &str) -> Option<Stmt> {
-    let head = sql.trim_start().get(..6)?.to_lowercase();
+    let head = crate::write::first_word(sql).get(..6)?.to_lowercase();
     if head != "create" && !head.starts_with("drop") {
         return None;
     }
@@ -532,7 +532,14 @@ async fn expand_with(lake: &Lake, sql: &str, views: &HashMap<String, String>) ->
         && !outside.iter().any(|(n, _)| named(n)) {
         return Ok(sql.to_string());
     }
-    let Ok(mut stmts) = Parser::parse_sql(&GenericDialect {}, sql) else { return Ok(sql.to_string()) };
+    // DuckDB's `FROM t WHERE …` (FROM first, with clauses after it): `SELECT * FROM t WHERE …`.
+    static LEADING_FROM: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"(?is)^\s*(?:(?:--[^\n]*\n|/\*.*?\*/)\s*)*from\b").expect("a regex"));
+    let parsed = Parser::parse_sql(&GenericDialect {}, sql).or_else(|e| match LEADING_FROM.is_match(sql) {
+        true => Parser::parse_sql(&GenericDialect {}, &format!("SELECT * {sql}")),
+        false => Err(e),
+    });
+    let Ok(mut stmts) = parsed else { return Ok(sql.to_string()) };
     for s in stmts.iter_mut() {
         if !matches!(s, Statement::CreateMacro { .. } | Statement::CreateView(ast::CreateView { materialized: false, .. })) {
             if let ControlFlow::Break(e) = s.visit(&mut Expander { lake, all: &all, views, outside: &outside, depth: 0 }) {
@@ -951,7 +958,7 @@ fn short(s: &str) -> String {
 
 /// `CALL name(…)`: the procedure's name and arguments, if `sql` is one.
 pub fn call_of(sql: &str) -> Option<(String, Vec<FunctionArg>)> {
-    if !sql.trim_start().get(..4)?.eq_ignore_ascii_case("call") {
+    if !crate::write::first_word(sql).get(..4)?.eq_ignore_ascii_case("call") {
         return None;
     }
     match Parser::parse_sql(&GenericDialect {}, sql).ok()?.pop()? {
@@ -1083,7 +1090,7 @@ pub async fn with_notices<F: std::future::Future>(f: F) -> (F::Output, Vec<Strin
 /// then the answer: rows, a frame's SQL (run here), or nothing. Secrets it read are blanked out of
 /// what it says (notices, errors).
 async fn python(app: &App, name: &str, r: &Routine, args: RecordBatch, who: Who, job: Option<String>, heard: &mut Vec<String>) -> Result<Outcome> {
-    ensure!(crate::python::runs(), "{name} is a Python procedure, and this node runs no Python: start it with --python <python>");
+    crate::python::ready(&format!("{name} is a Python procedure"))?;
     let lease = crate::auth::lend(who.role, who.files); // (ends when this does)
     let url = format!("http://{}", app.cluster.addr.replace("0.0.0.0", "127.0.0.1"));
     let json: Vec<bool> = r.params.iter().map(|p| crate::pyfn::is_json(p.ty.as_deref())).collect();

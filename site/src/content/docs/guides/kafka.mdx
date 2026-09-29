@@ -1,0 +1,271 @@
+---
+title: Kafka
+description: Produce to and consume from tables with Kafka clients, ingest Debezium change events, and read or write other Kafka clusters from SQL.
+sidebar:
+  order: 11
+---
+
+import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+
+Every node can speak the Kafka protocol. **A topic is a table**: producers write rows, consumers
+read the table's log. Use it to point existing Kafka producers, Debezium and consumers at Pondra
+without changing them. Pondra can also read and write topics on other Kafka clusters from SQL.
+
+```bash norun
+pondra serve --dir lake --kafka 0.0.0.0:9092
+```
+
+Clients use `bootstrap.servers=host:9092`. If clients must reach the node at a different address
+than `--addr`'s host, add `--kafka-advertise host:port`. The examples below use a node with
+`--kafka` on `localhost:9092`.
+
+## Produce to a table
+
+Make the table first: a topic that isn't a table isn't there, and a producer to it times out. Each
+record's value is a JSON row. If the table has `_key` or `_timestamp` columns, they get the record's
+key and timestamp.
+
+```sql
+CREATE TABLE events (user VARCHAR, amount BIGINT, _key VARCHAR, _timestamp TIMESTAMP);
+```
+
+```python
+import json
+from confluent_kafka import Producer
+
+producer = Producer({"bootstrap.servers": "localhost:9092", "enable.idempotence": True})
+for i in range(5):
+    producer.produce("events", key=f"u{i % 2}", value=json.dumps({"user": f"u{i % 2}", "amount": i}))
+producer.flush(10)
+```
+
+```sql
+SELECT user, amount, _key FROM events ORDER BY amount;
+```
+
+```text
+user  amount  _key
+u0    0       u0
+u1    1       u1
+u0    2       u0
+u1    3       u1
+u0    4       u0
+```
+
+The rows are in the table when the producer's acknowledgement comes back, and every other client
+sees them: SQL, views, Delta and Iceberg readers.
+
+An **idempotent producer** (`enable.idempotence`) is exactly-once: a batch that is retried is
+recognised and applied once. Other producers are at-least-once, as in Kafka. Records may be
+compressed with gzip, snappy, lz4 or zstd, and `acks` 0, 1 and `all` all mean Pondra's ack. kafka-python
+producers work the same as librdkafka's.
+
+## Debezium and change events
+
+Debezium change events become upserts and deletes on a table with a primary key, with or without
+Kafka Connect's `schema` wrapper: `after` is the new row, and a delete removes the key. A record with a
+null value (a tombstone) removes its key too. The record key is a JSON object of the key columns, or
+a plain value for a one-column key. So Debezium into Pondra keeps a Postgres or MySQL table's
+current state with nothing in between.
+
+```sql
+CREATE TABLE users (id BIGINT PRIMARY KEY, name VARCHAR, score DOUBLE);
+```
+
+```python
+def change(op, before, after):
+    return json.dumps({"op": op, "before": before, "after": after, "source": {"db": "shop"}})
+
+producer.produce("users", key=json.dumps({"id": 1}), value=change("c", None, {"id": 1, "name": "ann", "score": 1.0}))
+producer.produce("users", key=json.dumps({"id": 2}), value=change("c", None, {"id": 2, "name": "bob", "score": 2.0}))
+producer.produce("users", key=json.dumps({"id": 1}), value=change("u", {"id": 1}, {"id": 1, "name": "ann", "score": 10.0}))
+producer.produce("users", key=json.dumps({"id": 2}), value=change("d", {"id": 2, "name": "bob", "score": 2.0}, None))
+producer.produce("users", key=json.dumps({"id": 2}), value=None)     # Debezium's tombstone after a delete
+producer.flush(10)
+```
+
+```sql
+SELECT * FROM users ORDER BY id;
+```
+
+```text
+id  name  score
+1   ann   10.0
+```
+
+## Raw values
+
+A table with a `_value` column takes each record's value as it is, in any format: text, Avro or
+Protobuf bytes. Query JSON in it with the JSON functions.
+
+```sql
+CREATE TABLE lines (_key VARCHAR, _value VARCHAR, _timestamp TIMESTAMP);
+```
+
+```python
+producer.produce("lines", key=b"k1", value=b"plain text, not JSON")
+producer.produce("lines", key=b"k2", value=b'{"event": "click", "n": 3}')
+producer.flush(10)
+```
+
+```sql
+SELECT _key, _value->>'event' AS event, json_get_int(_value, 'n') AS n FROM lines ORDER BY _key;
+```
+
+```text
+_key  event  n
+k1    NULL   NULL
+k2    click  3
+```
+
+## Consume a table
+
+A consumer reads a table's log as records, as far back as the node keeps it. That is `--retain-secs`
+(60 by default), or `--changelog-secs` if longer: start the node with `--changelog-secs 86400` to
+keep a day. A record's offset is its position in the log: offsets increase but aren't dense, so the
+difference between two isn't a count of records. A keyed table's records carry the key as JSON, and
+its deletes arrive as tombstones.
+
+<Tabs syncKey="client">
+  <TabItem label="confluent-kafka">
+    ```python
+    from confluent_kafka import Consumer
+
+    consumer = Consumer({"bootstrap.servers": "localhost:9092", "group.id": "billing",
+                         "auto.offset.reset": "earliest", "enable.auto.commit": False})
+    consumer.subscribe(["users"])
+    seen = []
+    while len(seen) < 5:
+        message = consumer.poll(5.0)
+        if message is None:
+            break
+        if message.error() is None:
+            seen.append((message.key(), message.value()))
+    consumer.commit()
+    consumer.close()
+    seen
+    ```
+  </TabItem>
+  <TabItem label="kafka-python">
+    ```python
+    import kafka
+
+    consumer = kafka.KafkaConsumer("users", bootstrap_servers="localhost:9092", group_id=None,
+                                   auto_offset_reset="earliest", consumer_timeout_ms=3000)
+    [(m.key, m.value) for m in consumer]
+    ```
+  </TabItem>
+</Tabs>
+
+```text
+[(b'{"id":1}', b'{"id":1,"name":"ann","score":1.0}'),
+ (b'{"id":2}', b'{"id":2,"name":"bob","score":2.0}'),
+ (b'{"id":1}', b'{"id":1,"name":"ann","score":10.0}'),
+ (b'{"id":2}', None),
+ (b'{"id":2}', None)]
+```
+
+Each value is a row as the table stores it, not Debezium's envelope, and the two `None` values are
+the tombstones for the delete of `id` 2.
+
+**Consumer groups** work: the leader coordinates them, and the offsets a group commits are kept in
+the lake, so a group that resumes on another node starts exactly where it left off. Fetches wait for
+the next commit, so a consumer sees a new row within a few milliseconds.
+
+<Aside type="caution">
+A topic has **one partition**, and there are no transactions (`transactional.id` is refused). Group
+membership lives in the leader's memory: after a failover, members rejoin. The Java client is
+untested; librdkafka (confluent-kafka) and kafka-python are tested.
+</Aside>
+
+## Tokens
+
+With tokens on, Kafka clients authenticate with SASL/PLAIN: the user name picks the role (`reader`,
+`writer` or `admin`) and the password is that role's token. A reader that tries to produce gets
+`TOPIC_AUTHORIZATION_FAILED`.
+
+```python norun
+Producer({"bootstrap.servers": "node:9092", "security.protocol": "SASL_PLAINTEXT",
+          "sasl.mechanisms": "PLAIN", "sasl.username": "writer", "sasl.password": "<write token>"})
+```
+
+The Kafka port speaks plain text, so keep it on a private network or behind a TLS proxy.
+
+## Other Kafka clusters
+
+Pondra is also a Kafka *client*. A topic on any cluster is a table:
+
+```sql norun
+CREATE SECRET kafka_prod (TYPE kafka, SECURITY_PROTOCOL 'SASL_SSL', SASL_MECHANISM 'PLAIN',
+                          USERNAME '…', PASSWORD '…', SCOPE 'kafka://broker1:9092');
+
+SELECT * FROM 'kafka://broker1:9092,broker2:9092/orders' LIMIT 10;
+ATTACH 'kafka://broker1:9092,broker2:9092' AS k (TYPE kafka, SECRET kafka_prod);
+SELECT * FROM k.orders LIMIT 10;
+```
+
+Each row has `_partition`, `_offset`, `_timestamp`, `key` and `value`, and a query is spread over the
+cluster's partitions. `SECURITY_PROTOCOL` is `PLAINTEXT`, `SSL`, `SASL_PLAINTEXT` or `SASL_SSL`;
+`SASL_MECHANISM` is `PLAIN`, `SCRAM-SHA-256` or `SCRAM-SHA-512`. A URL needs a secret that covers
+it, and only an admin makes one.
+
+You can try all of this without another cluster: Pondra's own Kafka port is a Kafka cluster.
+
+```sql
+CREATE SECRET this_node (TYPE kafka, SECURITY_PROTOCOL 'PLAINTEXT', SCOPE 'kafka://localhost:9092');
+ATTACH 'kafka://localhost:9092' AS k (TYPE kafka);
+SELECT _partition, json_get_str(value, 'user') AS user, json_get_int(value, 'amount') AS amount
+FROM k.events ORDER BY amount LIMIT 3;
+```
+
+```text
+_partition  user  amount
+0           u0    0
+0           u1    1
+0           u0    2
+```
+
+### Write to a topic
+
+`COPY … TO` writes rows as records, with Kafka's own key partitioning by the column you name:
+
+```sql
+CREATE TABLE alerts (id BIGINT, msg VARCHAR, level VARCHAR);
+COPY (SELECT 1 AS id, 'disk full' AS msg, 'high' AS level UNION ALL SELECT 2, 'slow query', 'low')
+  TO 'kafka://localhost:9092/alerts' (FORMAT json, KEY id);
+SELECT id, msg FROM alerts ORDER BY id;
+```
+
+### Keep a table fed from a topic
+
+A materialized view over a Kafka source is a **feed**: rows arrive as records are produced, each
+record once, through restarts and leader changes. The offsets read are committed with the rows, so
+this is exactly-once without Kafka's transactions.
+
+```sql
+CREATE MATERIALIZED VIEW orders_in AS
+  SELECT json_get_str(value, 'user') AS user, json_get_int(value, 'amount') AS amount
+  FROM k.events;
+```
+
+A feed reads the topic from its first record and then follows it. The first records take a few
+seconds to arrive after the view is made, and each new one about a second.
+
+```bash
+sleep 10  # the feed's first round
+```
+
+```sql
+SELECT user, amount FROM orders_in ORDER BY amount;
+```
+
+```text
+user  amount
+u0    0
+u1    1
+u0    2
+u1    3
+u0    4
+```
+
+Each topic partition is a shard, dealt to the nodes.

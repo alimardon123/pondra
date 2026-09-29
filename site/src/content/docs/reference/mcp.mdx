@@ -1,0 +1,189 @@
+---
+title: MCP
+description: Let AI agents list tables, query, write and follow changes on a node over the Model Context Protocol, with the same tokens as everyone else.
+sidebar:
+  order: 13
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Every node answers the Model Context Protocol (MCP) at `POST /mcp`, on the same port as HTTP. An AI
+agent (Claude, Cursor, or any MCP client) lists the tables, queries them, writes, and follows what
+changed. It needs no flag. It is JSON-RPC 2.0 over MCP's streamable HTTP transport, and every
+answer is plain JSON: each tool answers at once, so there is no event stream.
+
+## Connect
+
+Give the client the node's URL, `http://HOST:8080/mcp`. With tokens set, also give it a header,
+`Authorization: Bearer TOKEN`: see [tokens](#tokens).
+
+<Aside type="caution">
+Use a `read` token for an agent that should only look. An agent with a `write` token can insert,
+update and delete, and one with an `admin` token can create and drop tables.
+</Aside>
+
+```bash norun
+# Claude Code
+claude mcp add --transport http pondra http://127.0.0.1:8080/mcp
+
+# with tokens on
+claude mcp add --transport http pondra https://node.example.com/mcp --header "Authorization: Bearer $PONDRA_READ_TOKEN"
+```
+
+Clients that read a settings file take the same two things, a URL and a header. For Cursor, in
+`mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "pondra": {
+      "url": "https://node.example.com/mcp",
+      "headers": { "Authorization": "Bearer <read token>" }
+    }
+  }
+}
+```
+
+Claude Desktop's settings file starts local programs, so it reaches a remote server through a
+bridge such as `mcp-remote`:
+
+```json
+{
+  "mcpServers": {
+    "pondra": {
+      "command": "npx",
+      "args": ["mcp-remote", "https://node.example.com/mcp", "--header", "Authorization: Bearer <read token>"]
+    }
+  }
+}
+```
+
+This repository tests the node with the official MCP SDK for Python. The commands and settings
+above are as those clients document them, and are not run here.
+
+## Tools
+
+`tools/list` gives four tools, and then one for each stored procedure.
+
+| Tool | Arguments | Does |
+|---|---|---|
+| `list_tables` | none | every table and view: its name (`schema.table` outside `public`, `lake.table` for an attached lake), its columns and their types, its kind, and a view's SQL. The kind is `append`, `upsert` (a primary key: the newest row per key wins), `merge` (rows per key combine, as `sum`) or `view` |
+| `query` | `sql` | runs one query and answers `{"rows": […], "total_rows": N}`: the first 1000 rows, and the count of all. A statement that writes is refused: `this is a write: use the write tool` |
+| `write` | `sql`, `job` (optional) | runs `INSERT`, `UPDATE`, `DELETE`, `CREATE`, `DROP` or `CALL`. It is committed and durable when it answers. `job` is an id for the write: sent again with the same id, it is applied once |
+| `changes` | `table`, `after` (optional) | what was committed to a table after a position: every insert, update and delete, about 1000 rows at a time, and the `position` to ask from next |
+
+`list_tables` names column types as Arrow does (`Int64`, `Utf8`). `write` answers what the same
+statement answers over [HTTP](/pondra/reference/http/#run-sql): `{"rows": 1}` for an `INSERT`, or
+the table for a `CREATE`.
+
+`changes` takes `after` as a position from an earlier call: `0` for as far back as the log is
+kept, and left out for from now. Each row carries `_change_type`, `_row_id` and `_version`: see
+[system columns](/pondra/reference/system-columns/). On a keyed table the change type is `upsert`.
+
+### Procedures as tools
+
+A stored procedure is a tool of its own. What the owner of a lake wrote for a job becomes
+something an agent can do, with the rights of the agent's token.
+
+| Part | Comes from |
+|---|---|
+| name | the procedure's name. A `.` becomes `__`, and a name that is one of the four tools above gets `call_` in front |
+| arguments | the procedure's parameters. `BIGINT`, `INT` and the other whole numbers are `integer`, `DOUBLE`, `REAL` and `DECIMAL` are `number`, `BOOLEAN` is `boolean`, anything else is `string`. A parameter with a default is optional |
+| description | the first line of the body, if it is a comment (`--` or `#`) |
+
+The tool runs `CALL name(k => v, …)`. Its answer is the procedure's rows, or its outcome, and
+`notices`, what it printed.
+
+```sql
+CREATE TABLE notes (id BIGINT PRIMARY KEY, body VARCHAR);
+
+CREATE PROCEDURE add_note(id BIGINT, body VARCHAR DEFAULT 'none') LANGUAGE sql AS $$
+-- Add a note to the notes table
+INSERT INTO notes VALUES ($id, $body);
+$$;
+```
+
+## The wire
+
+Every request is a JSON-RPC message in a `POST`. A `GET` answers `405`.
+
+| Method | Answers |
+|---|---|
+| `initialize` | the protocol version the client asked for, `capabilities` of `{"tools": {}}`, `serverInfo` (`pondra` and its version), and `instructions` that tell the agent to start with `list_tables` |
+| `ping` | `{}` |
+| `tools/list` | the tools, each with its `inputSchema`, a description, and `annotations`: `query`, `list_tables` and `changes` are read-only, and `write` is not |
+| `tools/call` | `{"content": [{"type": "text", "text": …}], "isError": false}`. The text is JSON |
+| a message with no `id` (a notification) | `202`, with no body |
+| any other method | the error `-32601`, `no method NAME` |
+| a body that is not JSON | the error `-32700`, `not JSON` |
+
+A tool that fails is not a protocol error: it answers with `"isError": true` and the reason as the
+text, which the agent can read and act on (`no tool nosuch`, `this token may not write`, or the
+SQL error).
+
+```bash
+mcp() {
+  curl -s -X POST localhost:8080/mcp -H 'content-type: application/json' -d "$1"
+  echo
+}
+mcp '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl","version":"1"}}}' | python3 -c "import json, sys; r = json.load(sys.stdin)['result']; print(r['protocolVersion'], r['serverInfo']['name'], sorted(r))"
+mcp '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' | python3 -c "import json, sys; print([t['name'] for t in json.load(sys.stdin)['result']['tools']])"
+mcp '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"write","arguments":{"sql":"INSERT INTO notes VALUES (1, '"'"'hello agent'"'"')","job":"notes-1"}}}'
+mcp '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"add_note","arguments":{"id":2}}}'
+mcp '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"query","arguments":{"sql":"SELECT * FROM notes ORDER BY id"}}}'
+mcp '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"query","arguments":{"sql":"DELETE FROM notes"}}}'
+```
+
+```text
+2025-06-18 pondra ['capabilities', 'instructions', 'protocolVersion', 'serverInfo']
+['list_tables', 'query', 'write', 'changes', 'add_note']
+{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"{\"rows\":1}"}],"isError":false}}
+{"jsonrpc":"2.0","id":4,"result":{"content":[{"type":"text","text":"{\"rows\":1}"}],"isError":false}}
+{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text":"{\"rows\":[{\"id\":1,\"body\":\"hello agent\"},{\"id\":2,\"body\":\"none\"}],\"total_rows\":2}"}],"isError":false}}
+{"jsonrpc":"2.0","id":6,"result":{"content":[{"type":"text","text":"this is a write: use the write tool"}],"isError":true}}
+```
+
+## With the Python SDK
+
+The official SDK does the handshake and the framing. `call_tool` answers the tool's text in
+`content[0].text`.
+
+```python
+import asyncio
+import json
+from mcp import ClientSession
+from mcp.client.streamable_http import streamablehttp_client
+
+async def main():
+    async with streamablehttp_client("http://localhost:8080/mcp") as (read, write, _):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            tools = await session.list_tools()
+            print([tool.name for tool in tools.tools])
+            count = await session.call_tool("query", {"sql": "SELECT count(*) AS n FROM notes"})
+            print(json.loads(count.content[0].text))
+            feed = await session.call_tool("changes", {"table": "notes", "after": 0})
+            print([(row["id"], row["_change_type"]) for row in json.loads(feed.content[0].text)["rows"]])
+
+asyncio.run(main())
+```
+
+```text
+['list_tables', 'query', 'write', 'changes', 'add_note']
+{'rows': [{'n': 2}], 'total_rows': 1}
+[(1, 'upsert'), (2, 'upsert')]
+```
+
+## Tokens
+
+The endpoint needs at least the `read` token. A request without one, or with a wrong one, gets `401`
+and the text `this needs a token with more rights`. What a tool may do depends on the role:
+
+| Role | May |
+|---|---|
+| `read` | `list_tables`, `query`, `changes` |
+| `write` | also `write` with `INSERT`, `UPDATE`, `DELETE` and `CALL`. A `read` token is refused with `this token may not write` |
+| `admin` | also `write` with `CREATE` and `DROP`. A `write` token is refused with `this token may not create tables` |
+
+A procedure runs with the rights of the agent's token: a `read` token that calls one which writes
+is refused by the procedure's own statements.

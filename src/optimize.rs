@@ -15,11 +15,14 @@ use std::sync::Arc;
 /// Engine settings, before the user's own (`PONDRA_SQL_OPTIONS`, DataFusion's names):
 /// - `0.06 + 0.01` is the exact decimal 0.07, as in the SQL standard (and DuckDB, Postgres), not a
 ///   float a hair below it;
+/// - `TIMESTAMPTZ` (`TIMESTAMP WITH TIME ZONE`) is an instant, kept and shown in UTC, as
+///   Postgres keeps it; `TIMESTAMP` stays a wall-clock time without a zone;
 /// - a join whose smaller side is under 32 MB builds one hash table that every thread probes,
 ///   instead of shuffling both sides by key.
 pub fn config(mut config: SessionConfig) -> SessionConfig {
     let user = std::env::var("PONDRA_SQL_OPTIONS").unwrap_or_default();
     let defaults = "datafusion.sql_parser.parse_float_as_decimal=true,\
+        datafusion.execution.time_zone=+00:00,\
         datafusion.optimizer.hash_join_single_partition_threshold=33554432,\
         datafusion.optimizer.hash_join_single_partition_threshold_rows=1048576";
     for (k, v) in defaults.split(',').chain(user.split(',')).filter_map(|kv| kv.trim().split_once('=')) {
@@ -85,9 +88,77 @@ impl OptimizerRule for AsyncBelow {
                 let out = columns.into_iter().chain(names.iter().map(|n| Expr::Column(Column::from_name(n)))).collect::<Vec<_>>();
                 Ok(Transformed::yes(LogicalPlan::Projection(Projection::try_new(out, Arc::new(window))?)))
             }
+            // An async call in another's arguments (`caption(file_read(path))`): the inner one first,
+            // below, as a column (DataFusion computes an async call's arguments as they are).
+            LogicalPlan::Projection(p) if p.expr.iter().any(nested) => {
+                let names: Vec<String> = p.expr.iter().map(|e| e.schema_name().to_string()).collect();
+                let (input, exprs) = unnest(p.input, p.expr)?;
+                let exprs = exprs.into_iter().zip(names).map(|(e, n)| if e.schema_name().to_string() == n { e } else { e.alias(n) }).collect();
+                Ok(Transformed::yes(LogicalPlan::Projection(Projection::try_new(exprs, Arc::new(input))?)))
+            }
+            LogicalPlan::Filter(f) if nested(&f.predicate) => {
+                let columns: Vec<Expr> = f.input.schema().columns().into_iter().map(Expr::Column).collect();
+                let (input, mut predicate) = unnest(f.input, vec![f.predicate])?;
+                let filtered = LogicalPlan::Filter(Filter::try_new(predicate.remove(0), Arc::new(input))?);
+                Ok(Transformed::yes(LogicalPlan::Projection(Projection::try_new(columns, Arc::new(filtered))?))) // (without the computed columns)
+            }
+            // `VALUES ('x', file_read('a.png'))` (an INSERT's): each row a projection of one row,
+            // which runs async calls, and the rows put together.
+            LogicalPlan::Values(v) if v.values.iter().flatten().any(is_async) => {
+                let fields = v.schema.fields().clone();
+                let mut rows = v.values.into_iter().map(|row| {
+                    let exprs = row.into_iter().zip(fields.iter()).map(|(e, f)| datafusion::prelude::cast(e, f.data_type().clone()).alias(f.name()));
+                    LogicalPlanBuilder::empty(true).project(exprs)?.build()
+                });
+                let mut all = LogicalPlanBuilder::from(rows.next().expect("a row")?);
+                for r in rows {
+                    all = all.union(r?)?;
+                }
+                Ok(Transformed::yes(all.build()?))
+            }
             plan => Ok(Transformed::no(plan)),
         }
     }
+}
+
+/// Is there an async call with another async call in its arguments?
+fn nested(e: &Expr) -> bool {
+    e.exists(|e| Ok(matches!(e, Expr::ScalarFunction(f) if f.func.as_async().is_some() && f.args.iter().any(is_async)))).unwrap_or(false)
+}
+
+/// `input` with the async calls inside other async calls' arguments computed by a projection
+/// over it (`__async_n{i}`, numbered across the plan), and `exprs` reading them instead; calls
+/// nested deeper are unnested in that projection in turn.
+fn unnest(input: Arc<LogicalPlan>, exprs: Vec<Expr>) -> Result<(LogicalPlan, Vec<Expr>)> {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let mut lifted: Vec<Expr> = vec![];
+    let exprs = exprs.into_iter().map(|e| e.transform_down(|e| {
+        let Expr::ScalarFunction(f) = &e else { return Ok(Transformed::no(e)) };
+        if f.func.as_async().is_none() || !f.args.iter().any(is_async) {
+            return Ok(Transformed::no(e));
+        }
+        let args = f.args.iter().cloned().map(|a| a.transform_down(|a| match &a {
+            Expr::ScalarFunction(g) if g.func.as_async().is_some() => {
+                let name = format!("__async_n{}", NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+                lifted.push(a.clone().alias(&name));
+                Ok(Transformed::new(Expr::Column(Column::from_name(name)), true, TreeNodeRecursion::Jump))
+            }
+            _ => Ok(Transformed::no(a)),
+        }).data()).collect::<Result<Vec<_>>>()?;
+        let call = Expr::ScalarFunction(datafusion::logical_expr::expr::ScalarFunction::new_udf(f.func.clone(), args));
+        Ok(Transformed::new(call, true, TreeNodeRecursion::Jump))
+    }).data()).collect::<Result<Vec<_>>>()?;
+    let mut columns: Vec<Expr> = input.schema().columns().into_iter().map(Expr::Column).collect();
+    columns.extend(lifted);
+    let below = Projection::try_new(columns, input)?;
+    let below = match below.expr.iter().any(nested) {
+        true => {
+            let (deeper, inner) = unnest(below.input, below.expr)?; // (the lifted calls keep their names: aliases)
+            Projection::try_new(inner, Arc::new(deeper))?
+        }
+        false => below,
+    };
+    Ok((LogicalPlan::Projection(below), exprs))
 }
 
 fn is_async(e: &Expr) -> bool {

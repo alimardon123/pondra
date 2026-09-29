@@ -573,7 +573,9 @@ pub async fn fill_all(lake: &Lake, seq: &crate::log::Sequencer, log: &crate::log
             continue;
         };
         // The source as it was at `upto`: its rows (and changes) from then, none from after.
-        let sql = format!("SELECT *, \"{}\", \"{}\" FROM {} WHERE \"{}\" <= {upto}", crate::sys::ROW_ID, crate::sys::CREATED, crate::write::sql_name(&v.source), crate::sys::VERSION);
+        // (with each row's `_version`: a row-by-row view's row keeps its source row's, so a change
+        // of that row later takes this one back — `{view}$deleted` names the source's version)
+        let sql = format!("SELECT *, \"{}\", \"{}\", \"{v2}\" FROM {} WHERE \"{v2}\" <= {upto}", crate::sys::ROW_ID, crate::sys::CREATED, crate::write::sql_name(&v.source), v2 = crate::sys::VERSION);
         let rows = session_at(lake, &sql, "", Some(upto)).await?.sql(&crate::asof::rewrite(&sql)?).await?.collect().await?;
         let meta: TableMeta = lake.cat.get(&table_key(name)).await?.context("view without table")?;
         let out = match rows.iter().any(|b| b.num_rows() > 0) {
@@ -586,7 +588,8 @@ pub async fn fill_all(lake: &Lake, seq: &crate::log::Sequencer, log: &crate::log
 }
 
 /// A view's rows of `rows`, in its table's columns; a row-by-row view's with their source rows'
-/// `_row_id` and `_created_at` after them (and `old`: `_old_version`, as `{view}$deleted` holds).
+/// `_row_id` and `_created_at` after them (and `old`: `_old_version`, as `{view}$deleted` holds;
+/// rows that have a `_version`, as a view's filling reads them: that too, which the log keeps).
 async fn view_rows(lake: &Lake, v: &View, meta: &TableMeta, rows: &[RecordBatch], old: bool) -> Result<RecordBatch> {
     use crate::query::{cast_as, schema};
     if !v.ids {
@@ -595,6 +598,8 @@ async fn view_rows(lake: &Lake, v: &View, meta: &TableMeta, rows: &[RecordBatch]
     let mut ids = vec![(crate::sys::ROW_ID.to_string(), "Int64".to_string()), crate::sys::columns()[2].clone()];
     if old {
         ids.push(("_old_version".into(), "Int64".into()));
+    } else if rows.first().is_some_and(|b| b.schema().index_of(crate::sys::VERSION).is_ok()) {
+        ids.push((crate::sys::VERSION.into(), "Int64".into()));
     }
     let src: TableMeta = lake.cat.get::<TableMeta>(&table_key(&v.source)).await?.with_context(|| format!("no table {}", v.source))?.logical();
     let sql = crate::asof::rewrite(&v.sql)?;

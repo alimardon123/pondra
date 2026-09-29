@@ -1,0 +1,223 @@
+---
+title: PySpark
+description: Run PySpark code on Pondra by changing its imports to pondra.spark, and see what differs.
+sidebar:
+  order: 8
+---
+
+import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+
+`pondra.spark` is PySpark's names over Pondra's [frames](/pondra/guides/dataframes/). A PySpark job
+moves to Pondra by changing its imports. There is no JVM and no Spark in it: each DataFrame is one
+SQL statement that a Pondra node runs.
+
+```python
+from pondra.spark import SparkSession, functions as F, Window   # was: from pyspark.sql import …
+```
+
+## Connect
+
+`.remote()` takes a node's address. `.master("local[*]")` starts a node on a lake here, the way
+`pondra.local()` does (`.config("spark.pondra.lake", "path")` names the folder, default `./lake`).
+
+<Tabs>
+  <TabItem label="A node">
+    ```python
+    from pondra.spark import SparkSession, functions as F, Window
+
+    spark = SparkSession.builder.remote("pondra://localhost:8080").getOrCreate()
+    ```
+  </TabItem>
+  <TabItem label="A lake here">
+    ```python norun
+    spark = SparkSession.builder.master("local[*]").getOrCreate()
+    ```
+  </TabItem>
+</Tabs>
+
+A token goes in as `.config("spark.pondra.token", "…")`.
+
+## Make a table and query it
+
+`createDataFrame` takes rows and column names. `write.saveAsTable` makes a lake table.
+
+```python
+orders = spark.createDataFrame(
+    [(1, "ann", "tea", 2, 3.5), (2, "bob", "cake", 1, 4.5), (3, "ann", "tea", 1, 3.5), (4, "cy", "coffee", 3, 3.0)],
+    ["id", "user", "item", "qty", "price"])
+orders.write.mode("overwrite").saveAsTable("orders")
+
+top = (spark.table("orders")
+       .where(F.col("qty") > 0)
+       .withColumn("total", F.col("qty") * F.col("price"))
+       .groupBy("user")
+       .agg(F.sum("total").alias("spent"), F.count("*").alias("n"))
+       .orderBy(F.desc("spent")))
+top.show()
+```
+
+```text
+user  spent  n
+ ann   10.5  2
+  cy    9.0  1
+ bob    4.5  1
+```
+
+`toPandas()`, `toArrow()`, `collect()` (a list of `Row`), `count()`, `first()` and `take(n)` give the
+rows. The same job is one statement: `spark.sql("SELECT …")` runs SQL, and a DataFrame's
+temporary view is a name that SQL can read:
+
+```python
+top.createOrReplaceTempView("top")
+spark.sql("SELECT user FROM top WHERE spent > 5 ORDER BY user").toPandas()
+```
+
+Windows and column functions are PySpark's:
+
+```python
+w = Window.partitionBy("user").orderBy("id")
+(spark.table("orders")
+      .withColumn("nth", F.row_number().over(w))
+      .withColumn("prev_qty", F.lag("qty").over(w))
+      .orderBy("id").toPandas())
+```
+
+```text
+   id user    item  qty  price  nth  prev_qty
+0   1  ann     tea    2    3.5    1       NaN
+1   2  bob    cake    1    4.5    1       NaN
+2   3  ann     tea    1    3.5    2       2.0
+3   4   cy  coffee    3    3.0    1       NaN
+```
+
+## What's covered
+
+- **Session:** `sql`, `table`, `range`, `createDataFrame`, `read`, `catalog.listTables`, `udf.register`.
+- **DataFrame:** `select`, `selectExpr`, `filter`/`where`, `withColumn(s)`, `withColumnRenamed`, `drop`,
+  `groupBy` with `agg`/`count`/`sum`/`avg`/`min`/`max`, `orderBy`/`sort`, `limit`, `join`,
+  `crossJoin`, `union`, `unionByName`, `distinct`, `dropDuplicates`, `na.fill`/`na.drop`, `alias`,
+  `show`, `count`, `first`, `head`, `take`, `printSchema`, `explain`, `createOrReplaceTempView`.
+  `cache()` and `repartition()` do nothing: the lake is the cache.
+- **`functions`:** `col`, `lit`, `expr`, `when`/`otherwise`, `coalesce`, aggregates (`sum`, `avg`,
+  `count`, `countDistinct`, `min`, `max`, `first`, `last`, `stddev`, `collect_list`), string, math and
+  date functions (`date_trunc`, `to_date`, `datediff`, `concat`, `regexp_replace`, `substring`…),
+  and the ranking and offset functions (`row_number`, `rank`, `dense_rank`, `lag`, `lead`).
+- **Writers:** `mode`, `format`, `partitionBy`, `saveAsTable`, `insertInto`, `parquet`, `csv`,
+  `json`, `save`, and `delta`.
+
+## Read and write files
+
+`spark.read` and `df.write` are Pondra's [files and other lakes](/pondra/guides/files-and-other-lakes/)
+with Spark's spelling. A URL needs a secret that covers it, or a node started for you (`local[*]`),
+which may also read your own paths.
+
+```python norun
+df = spark.read.parquet("s3://my-bucket/events/")
+df = spark.read.option("header", "true").csv("s3://my-bucket/raw/*.csv")
+sales = spark.read.format("delta").load("s3://my-bucket/warehouse/sales")
+top.write.mode("overwrite").partitionBy("user").parquet("s3://my-bucket/exports/top")
+top.write.mode("append").format("delta").save("s3://my-bucket/warehouse/top")
+```
+
+`mode` is `"error"` (the default), `"append"`, `"overwrite"` or `"ignore"`.
+
+## Update and merge
+
+`DeltaTable` builds `UPDATE`, `DELETE` and `MERGE` as Delta on Spark does:
+
+```python
+from pondra.spark import DeltaTable
+
+spark.createDataFrame([("ann", "Oslo"), ("bob", "Lima")], ["user", "city"]).write.saveAsTable("people")
+updates = spark.createDataFrame([("bob", "Rome"), ("cy", "Paris")], ["user", "city"])
+(DeltaTable.forName(spark, "people").alias("t")
+    .merge(updates.alias("s"), "t.user = s.user")
+    .whenMatchedUpdate(set={"city": "s.city"})
+    .whenNotMatchedInsertAll()
+    .execute())
+DeltaTable.forName(spark, "people").delete("user = 'ann'")
+spark.table("people").orderBy("user").toPandas()
+```
+
+```text
+  user   city
+0  bob   Rome
+1   cy  Paris
+```
+
+## Python functions
+
+`F.udf`, `F.pandas_udf` and `spark.udf.register` make the lake's own [Python
+functions](/pondra/guides/functions-and-procedures/), which run on every node beside the data. Each is
+made when first used, and its imports, helper functions and constants go with it. Write it in a
+file or notebook, where Python can read its source:
+
+```bash
+cat > udfs.py <<'EOF'
+import re
+from pondra.spark import SparkSession, functions as F
+
+spark = SparkSession.builder.remote("pondra://localhost:8080").getOrCreate()
+
+@F.udf("string")
+def shout(s):
+    return re.sub(r"[aeiou]", "*", s.upper())
+
+@F.pandas_udf("double")                   # called once a batch, with pandas Series
+def with_tax(price):
+    return price * 1.2
+
+spark.udf.register("half", lambda x: x / 2.0, "double")
+
+(spark.table("orders")
+      .select("id", shout("item").alias("loud"), with_tax("price").alias("gross"))
+      .orderBy("id").show())
+spark.sql("SELECT id, half(price) AS h FROM orders ORDER BY id").show()
+EOF
+python3 udfs.py
+```
+
+```text
+ id   loud  gross
+  1    TEA    4.2
+  2   CAKE    5.4
+  3    TEA    4.2
+  4 COFFEE    3.6
+ id    h
+  1 1.75
+  2 2.25
+  3 1.75
+  4 1.50
+```
+
+The node needs Python for this: `pondra serve --python auto` (a node from `local()` has it).
+
+## Streaming
+
+Structured Streaming's `readStream` isn't there. A materialized view keeps a query up to date as
+rows arrive, and a DataFrame becomes one with `to_view`:
+
+```python
+spark.table("orders").groupBy("user").agg(F.sum("qty").alias("items")).to_view("items_by_user", materialized=True)
+spark.sql("SELECT * FROM items_by_user ORDER BY user").toPandas()
+```
+
+See [streaming](/pondra/guides/streaming/) for windows, sessions and stream joins.
+
+## Where it differs from PySpark
+
+Where PySpark's meaning differs from SQL's, the SQL says PySpark's: ascending sorts put nulls first,
+`/` divides as doubles, columns are named as PySpark names them (`sum(amount)`, `(price / 2)`),
+column names match whatever their case, and `concat` with a null is null.
+
+<Aside type="caution">
+
+- What isn't covered raises `NotImplementedError` naming the way round: RDDs (use DataFrame methods
+  or `spark.sql`), `pivot` (write a `CASE WHEN`), `readStream` (a materialized view),
+  `DeltaTable.forPath` (a Pondra table goes by name).
+- There is no Scala or Java client, no `SparkContext`, and no Spark Connect server.
+- `printSchema()` and `dtypes` show Arrow's type names (`int64`, `string_view`), not Spark's.
+- A UDF runs in Python on the nodes with the imports, helpers and constants it uses. Anything
+  else from your notebook (a DataFrame, a connection) is refused with the fix in the message.
+
+</Aside>

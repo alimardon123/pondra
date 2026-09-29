@@ -1387,12 +1387,18 @@ pub struct ShareExec {
 }
 
 impl ShareExec {
-    pub fn new(input: Arc<dyn ExecutionPlan>, table: &str, rows: u64, bytes: u64, range: Option<String>) -> datafusion::error::Result<ShareExec> {
+    pub fn new(input: Arc<dyn ExecutionPlan>, table: &str, rows: u64, bytes: u64, range: Option<String>, columns: Option<Vec<datafusion::common::ColumnStatistics>>) -> datafusion::error::Result<ShareExec> {
         let input = match input.output_partitioning().partition_count() < 2 {
             true => datafusion::physical_plan::union::UnionExec::try_new(vec![input.clone(), Arc::new(datafusion::physical_plan::empty::EmptyExec::new(input.schema()))])?,
             false => input,
         };
-        Ok(ShareExec { range, ..ShareExec::of(input, table, rows, bytes, false) })
+        let mut share = ShareExec { range, ..ShareExec::of(input, table, rows, bytes, false) };
+        if let Some(c) = columns.filter(|c| c.len() == share.input.schema().fields().len()) {
+            let mut stats = share.stats.as_ref().clone();
+            stats.column_statistics = c;
+            share.stats = Arc::new(stats);
+        }
+        Ok(share)
     }
 
     fn of(input: Arc<dyn ExecutionPlan>, table: &str, rows: u64, bytes: u64, whole: bool) -> ShareExec {

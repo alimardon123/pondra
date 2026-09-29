@@ -1,0 +1,319 @@
+---
+title: Arrow Flight
+description: Query, write and stream tables over Arrow Flight and Flight SQL, with ADBC, pyarrow and any Flight client.
+sidebar:
+  order: 10
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+A node speaks Arrow Flight on the address you give `--flight`. Arrow goes in and comes out as
+Arrow, with nothing parsed or converted on the way. Two kinds of client use it:
+
+- **Flight SQL** drivers (ADBC and other Flight SQL clients) run SQL, load Arrow data and list tables.
+- **Plain Flight** clients (pyarrow, or any Flight client) write batches to a table with `DoPut`,
+  read a query's result with `DoGet`, and read a table's log as a stream.
+
+```bash norun
+pondra serve --dir lake --flight 0.0.0.0:8815
+```
+
+The port has no TLS: connect with `grpc://host:8815`. A request can be as large as 1 GiB.
+
+## Flight SQL
+
+Use the `grpc://` address with any Flight SQL driver. ADBC (`adbc_driver_flightsql`) is the one
+checked here.
+
+| Command | What it does |
+|---|---|
+| `CommandStatementQuery` | runs a query. A write statement sent this way (as a DB-API `execute` does) runs at once and answers one row: `rows`, the number of rows it wrote |
+| `CommandStatementUpdate` | runs a write statement (`CREATE`, `ALTER`, `DROP`, `INSERT`, `UPDATE`, `DELETE`) and answers with the row count. Needs the `write` role |
+| `CommandStatementIngest` | bulk load: appends Arrow batches to a table. A table that does not exist is created from the batches' schema, which needs the `admin` role. `db_schema_name` picks the schema |
+| `CommandGetCatalogs` | one catalog: the lake's name |
+| `CommandGetDbSchemas` | the lake's schemas |
+| `CommandGetTables` | tables (type `TABLE`) and views (type `VIEW`), with their columns if the client asks |
+| `CommandGetSqlInfo` | the server's name (`Pondra`), version, Arrow version (1.3), that it is not read-only, and that it has no transactions |
+
+Anything else answers `Unimplemented`: prepared statements (so bound parameters too),
+`GetTableTypes`, keys and transactions. Put values in the SQL text instead. A statement's writes
+and queries follow the same [roles](/pondra/reference/http/#roles) as HTTP.
+
+```python
+import adbc_driver_flightsql.dbapi as flightsql
+
+conn = flightsql.connect("grpc://localhost:8815", autocommit=True)
+
+with conn.cursor() as cur:
+    cur.execute("CREATE TABLE events (user_id BIGINT, action VARCHAR, amount DOUBLE)")
+with conn.cursor() as cur:
+    cur.execute("INSERT INTO events VALUES (1, 'view', 0.0), (2, 'buy', 9.5)")
+    print(cur.fetchall())
+with conn.cursor() as cur:
+    cur.execute("SELECT action, sum(amount) AS total FROM events GROUP BY action ORDER BY action")
+    print(cur.fetch_arrow_table().to_pydict())
+```
+
+```text
+[(2,)]
+{'action': ['buy', 'view'], 'total': [9.5, 0.0]}
+```
+
+A write's answer is one row, `rows`, so `fetchall()` gives `[(2,)]`. `cur.rowcount` stays `-1`.
+
+### Bulk ingest
+
+`adbc_ingest` sends Arrow data as one stream, without turning it into SQL. It answers the number of
+rows loaded. Use a new cursor for each ingest: ADBC keeps the target table on the cursor, and a
+later `execute` on it fails with `must set IngestTargetTable before bulk ingestion`.
+
+```python
+import pyarrow as pa
+
+users = pa.table({"id": [1, 2, 3], "name": ["ann", "bo", "cy"]})
+with conn.cursor() as cur:
+    print(cur.adbc_ingest("users", users, mode="create"))
+with conn.cursor() as cur:
+    cur.execute("SELECT name FROM users ORDER BY id")
+    print(cur.fetch_arrow_table().to_pydict())
+```
+
+```text
+3
+{'name': ['ann', 'bo', 'cy']}
+```
+
+<Aside type="caution">
+The `mode` is not read. Every ingest creates the table if it is missing and then appends, so
+`mode="create"` on a table that exists appends to it, `mode="replace"` does not replace it, and
+`mode="append"` on a missing table creates it. Drop a table with SQL to start over.
+</Aside>
+
+### Catalog
+
+```python
+objects = conn.adbc_get_objects(depth="tables", table_name_filter="events").read_all().to_pylist()
+for schema in objects[0]["catalog_db_schemas"]:
+    print(schema["db_schema_name"], [(t["table_name"], t["table_type"]) for t in schema["db_schema_tables"]])
+print(conn.adbc_get_table_schema("events"))
+print(conn.adbc_get_info()["vendor_name"])
+```
+
+```text
+public [('events', 'TABLE')]
+user_id: int64
+action: string
+amount: double
+Pondra
+```
+
+## Write with DoPut
+
+`DoPut` appends the batches of a stream to a table, through the log, as `POST /append` does. The
+descriptor is a path:
+
+| Path | Meaning |
+|---|---|
+| `[table]` | append the batches. A retry after a lost answer is applied twice |
+| `[table, producer, first seq]` | exactly once. The producer names the writer, and the batch number `i` of the stream (from 0) is sequence number `first seq + i`. A batch whose number was already applied is skipped |
+
+The table must exist (`no table x` if not), and the `write` role is needed. Columns are matched by
+name and cast to the table's types. A column a batch leaves out is null, and a column the table
+does not have is dropped.
+
+Every batch is answered with its ack, as JSON in the `app_metadata` of a `PutResult`, as soon as
+it is committed:
+
+| Field | Meaning |
+|---|---|
+| `rows` | the rows in the batch |
+| `seg` | the log position (segment) it was committed at. `0` for a duplicate |
+| `duplicate` | true if this producer had already committed that sequence number, so nothing was written |
+| `conflict` | true if the batch was refused as out of order. The server retries these itself, so you see `false` |
+| `row`, `ms` | the batch's first row in the segment, and the commit's time in milliseconds |
+
+Read one ack for each batch you wrote. To retry, send the same descriptor with the same batches.
+
+<Aside type="caution">
+A value that cannot be cast to its column's type (the text `'abc'` for a `BIGINT`) is written as
+null, and the batch is acked as normal. Check the types before you send.
+</Aside>
+
+<Aside type="caution">
+Sequence numbers start at 1. A batch with sequence number 0 or less counts as already applied: it
+is answered with `"duplicate": true` and its rows are not written.
+</Aside>
+
+```python
+import json
+import pyarrow.flight as flight
+
+client = flight.FlightClient("grpc://localhost:8815")
+
+def put(path, *tables):
+    writer, reader = client.do_put(flight.FlightDescriptor.for_path(*path), tables[0].schema)
+    for table in tables:
+        writer.write_table(table)
+    writer.done_writing()
+    acks = [json.loads(reader.read().to_pybytes()) for _ in tables]
+    writer.close()
+    return [(a["rows"], a["duplicate"]) for a in acks]
+
+batch = pa.table({"user_id": [3, 4], "action": ["buy", "view"], "amount": [4.0, 0.0]})
+print(put(["events"], batch))
+print(put(["events", "shop-1", "1"], batch, batch))
+print(put(["events", "shop-1", "1"], batch, batch))
+print(put(["events", "shop-1", "3"], batch))
+```
+
+```text
+[(2, False)]
+[(2, False), (2, False)]
+[(2, True), (2, True)]
+[(2, False)]
+```
+
+The second call sends two batches as `shop-1` 1 and 2. The third repeats them, and both are
+recognised. The fourth continues at 3.
+
+## Read with DoGet
+
+`DoGet` takes a ticket. A plain Flight ticket is JSON, and it is one of two kinds:
+
+| Ticket | Answers |
+|---|---|
+| `{"sql": "SELECT …"}` | a query's result. It is computed in full, then sent |
+| `{"table": "events", …}` | the table's log as a stream. See [the log](#the-log-as-a-stream) |
+
+Flight SQL clients get the same from `CommandStatementQuery`. Both need the `read` role.
+
+```python
+def get(ticket):
+    return client.do_get(flight.Ticket(json.dumps(ticket)))
+
+print(get({"sql": "SELECT action, count(*) AS n FROM events GROUP BY action ORDER BY action"}).read_all().to_pydict())
+```
+
+```text
+{'action': ['buy', 'view'], 'n': [5, 5]}
+```
+
+## The log as a stream
+
+A ticket with `table` reads a table's log as a columnar stream, only the columns you ask for. It is
+the rows in the order they were committed, not the table's current state: an update or delete is a
+row of its own.
+
+| Field | Default | Meaning |
+|---|---|---|
+| `table` | required | the table to read |
+| `after` | now | send the rows committed after this log position. `0` is everything. Left out, only new commits are sent |
+| `columns` | all | the columns to send, by name. An unknown one is refused: `no column x` |
+| `follow` | `true` | keep the stream open and send every new commit as it lands. `false` sends what is there and ends |
+
+After the rows of a commit comes a message with no data and only `app_metadata`: `{"after": N}`.
+It is where to resume: pass it as `after` in a later ticket to get what came after. A position
+from an ack's `seg` works too. A keyed table's stream has one more column, `_deleted`: `true` for a
+delete, `false` for an update, and null for a row that was only appended.
+
+```python
+stream = get({"table": "events", "after": 0, "columns": ["user_id", "amount"], "follow": False})
+for chunk in stream:
+    if chunk.data is not None:
+        print(chunk.data.to_pydict())
+    else:
+        print(json.loads(chunk.app_metadata.to_pybytes()))
+```
+
+```text
+{'user_id': [1, 2], 'amount': [0.0, 9.5]}
+{'user_id': [3, 4], 'amount': [4.0, 0.0]}
+{'user_id': [3, 4], 'amount': [4.0, 0.0]}
+{'user_id': [3, 4], 'amount': [4.0, 0.0]}
+{'user_id': [3, 4], 'amount': [4.0, 0.0]}
+{'after': 6}
+```
+
+With `follow` on, the stream stays open, so read it in a loop and stop when you have enough.
+`cancel()` ends it.
+
+```python
+import threading, time
+
+def later():
+    time.sleep(0.5)
+    put(["events", "shop-2", "1"], pa.table({"user_id": [9], "action": ["buy"], "amount": [1.0]}))
+
+stream = get({"table": "events", "columns": ["user_id", "amount"]})
+threading.Thread(target=later).start()
+print(stream.read_chunk().data.to_pydict())
+print(json.loads(stream.read_chunk().app_metadata.to_pybytes()))
+stream.cancel()
+```
+
+```text
+{'user_id': [9], 'amount': [1.0]}
+{'after': 7}
+```
+
+## Describe and list
+
+| Call | Answers |
+|---|---|
+| `GetFlightInfo` with a command of `{"sql": …}` or `{"table": …}` | the schema of that query or log stream, and a ticket (the same JSON) to read it with |
+| `ListFlights` | one entry for each table: its schema, a path descriptor of `[table]` and a ticket of `{"sql": "SELECT * FROM table"}`. Views are not listed |
+
+Both need the `read` role.
+
+```python
+for info in client.list_flights():
+    print(info.descriptor.path, info.schema.names)
+info = client.get_flight_info(flight.FlightDescriptor.for_command(json.dumps({"sql": "SELECT count(*) AS n FROM events"})))
+print(info.schema.names, info.endpoints[0].ticket.ticket)
+```
+
+```text
+[b'events'] ['user_id', 'action', 'amount']
+[b'users'] ['id', 'name']
+['n'] b'{"sql": "SELECT count(*) AS n FROM events"}'
+```
+
+## Tokens
+
+With no tokens set, anyone may do anything. With tokens, the role comes from a token, as it does
+for [HTTP](/pondra/reference/http/#roles). Send it in one of two ways:
+
+- a header `authorization: Bearer <token>` on every call, or
+- a handshake with basic authentication whose password is the token. The user name is ignored. The
+  server answers with the header to send on the calls that follow.
+
+A call with no token, or a token with too few rights, fails with `this needs a token with more
+rights`. A handshake with a token the server does not know fails with `wrong token`. A write
+statement over Flight SQL from a token that may not write fails with `this token may not write`.
+
+```python norun
+import os
+import pyarrow.flight as flight
+import adbc_driver_flightsql.dbapi as flightsql
+
+token = os.environ["PONDRA_TOKEN"]
+
+# pyarrow: the handshake, or the header itself
+client = flight.FlightClient("grpc://db.example.com:8815")
+options = flight.FlightCallOptions(headers=[client.authenticate_basic_token("writer", token)])
+# options = flight.FlightCallOptions(headers=[(b"authorization", f"Bearer {token}".encode())])
+print(client.do_get(flight.Ticket(b'{"sql": "SELECT 1 AS one"}'), options=options).read_all())
+
+# ADBC: the header
+conn = flightsql.connect(
+    "grpc://db.example.com:8815",
+    db_kwargs={"adbc.flight.sql.authorization_header": f"Bearer {token}"},
+    autocommit=True,
+)
+```
+
+<Aside type="caution">
+ADBC's `username` and `password` options send the token in the handshake, and the node refuses it
+with `wrong token` unless `username:token` is a multiple of 3 characters long: ADBC leaves the
+padding off its base64, and the node insists on it. Use the header option above until that is fixed.
+</Aside>

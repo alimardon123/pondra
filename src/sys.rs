@@ -228,8 +228,14 @@ pub fn derive(b: &RecordBatch, seg: u64, pos: u64, ms: u64) -> Result<RecordBatc
         Some(c) => Arc::new(c.as_primitive::<TimestampMicrosecondType>().iter().map(|v| v.or(Some(us))).collect::<TimestampMicrosecondArray>().with_timezone("UTC")),
         None => now.clone(),
     };
+    // (a version the rows carry whole is theirs: a view's filling keeps its source rows', so a
+    // later change of one names the view's row too; everything else gets its segment's)
+    let version: ArrayRef = match keep(VERSION, &DataType::Int64)? {
+        Some(c) if c.null_count() == 0 => c,
+        _ => Arc::new(Int64Array::from(vec![seg as i64; n])),
+    };
     let b = set(b, ROW_ID, ids)?;
-    let b = set(&b, VERSION, Arc::new(Int64Array::from(vec![seg as i64; n])))?;
+    let b = set(&b, VERSION, version)?;
     let b = set(&b, CREATED, created)?;
     set(&b, UPDATED, now)
 }

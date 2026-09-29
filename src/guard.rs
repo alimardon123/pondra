@@ -26,6 +26,10 @@ pub struct Link {
 
 const PROBE: usize = 8 << 20; // bytes a link is measured with
 const WIRE: f64 = 3.0; // Arrow as a shuffle sends it (ZSTD) is about a third of its size in memory
+/// Round trips a shuffle step costs besides its bytes: its plan to every node, buckets written and
+/// fetched from each, word of each node's end. Between GitHub's runners a step took about 0.7 s
+/// at 17–54 ms apart, some 20 round trips; in one data centre that is a few milliseconds.
+const ROUND_TRIPS: f64 = 20.0;
 
 static LINKS: LazyLock<Mutex<HashMap<String, (Link, Instant)>>> = LazyLock::new(Default::default);
 static HERE: Mutex<Option<f64>> = Mutex::new(None); // bytes of tables read per second, one node
@@ -123,7 +127,7 @@ pub fn pays(sql: &str, link: Link, moved: u64, steps: usize, bytes: u64, n: usiz
     }
     let Some(here) = known.or_else(|| HERE.lock().unwrap().map(|rate| bytes as f64 / rate)) else { return false };
     let saved = here * (1.0 - 1.0 / n as f64);
-    let cost = link.rtt * (2.0 + 3.0 * steps as f64) + moved as f64 / WIRE / link.rate;
+    let cost = link.rtt * (2.0 + ROUND_TRIPS * steps as f64) + moved as f64 / WIRE / link.rate;
     if std::env::var_os("PONDRA_DEBUG_SPREAD").is_some() {
         eprintln!("spread: here ~{here:.3}s, spread saves ~{saved:.3}s, costs ~{cost:.3}s ({:.1} MB in {steps} steps; {link:?})", moved as f64 / 1e6);
     }
