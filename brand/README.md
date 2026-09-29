@@ -6,7 +6,7 @@ changes every place:
 | File | What it is | Where it goes |
 |---|---|---|
 | `mark.svg` | The mark: one colour (`color`, drawn with `currentColor`), lighter on a dark background | The console's header and browser-tab icon (built into the binary, `src/console.rs`); the docs site's header and favicon (`site/astro.config.mjs`); the READMEs and package pages, through the docs site |
-| `colors.css` | The mark's colours and the accent, on light and dark | The docs site's accent (`site/src/styles/pondra.css`) and the console's (`src/console.html`) |
+| `colors.css` | The mark's colours and the accent, on light and dark | The docs site's accent (`site/src/styles/pondra.css`) and the console's (`src/console/console.css`) |
 
 To change the logo, replace `mark.svg`: keep `class="pondra-mark"` and `color="…"` on its root, draw
 with `currentColor`, and keep the one `<style>` that lightens it on dark backgrounds. Then run

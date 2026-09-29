@@ -352,6 +352,31 @@ async fn has_catalog(dir: &str) -> Result<bool> {
     Ok(futures::StreamExt::next(&mut store.list(Some(&object_store::path::Path::from("catalog")))).await.transpose()?.is_some())
 }
 
+/// The lakes in a folder, or under a bucket's prefix: (name, where), each a subfolder that holds
+/// one, by name (ADR-030, ADR-032: a folder of databases, the shell's lakes side by side).
+pub async fn lakes_in(folder: &str) -> Result<Vec<(String, String)>> {
+    let folder = folder.trim_end_matches('/');
+    let names: Vec<String> = match folder.contains("://") {
+        false => std::fs::read_dir(folder).into_iter().flatten().flatten().filter(|e| e.path().join("catalog").is_dir())
+            .filter_map(|e| e.file_name().to_str().map(str::to_string)).collect(),
+        true => {
+            let store = crate::store::open_store(folder)?.1;
+            let listed = store.list_with_delimiter(None).await?;
+            let mut out = vec![];
+            for p in listed.common_prefixes {
+                let Some(name) = p.filename().map(str::to_string) else { continue };
+                if futures::StreamExt::next(&mut store.list(Some(&p.clone().join("catalog")))).await.transpose()?.is_some() {
+                    out.push(name);
+                }
+            }
+            out
+        }
+    };
+    let mut out: Vec<(String, String)> = names.into_iter().filter(|n| check(n).is_ok()).map(|n| (n.clone(), format!("{folder}/{n}"))).collect();
+    out.sort();
+    Ok(out)
+}
+
 /// Lake `name` in the folder (or prefix) this lake's is in.
 fn beside(url: &str, name: &str) -> String {
     match url.contains("://") {
@@ -396,11 +421,13 @@ pub async fn attach(home: &Lake, name: &str, dir: &str, me: &str, follow: bool, 
 /// name the catalog attaches (that ATTACH says where), a schema's name here, and a lake that won't
 /// open (said on the log). The names attached.
 pub async fn attach_found(home: &Lake, folder: &str, me: &str) -> Vec<String> {
-    let mut dirs: Vec<_> = std::fs::read_dir(folder).into_iter().flatten().flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
-    dirs.sort();
+    let lakes = lakes_in(folder).await.unwrap_or_else(|e| {
+        eprintln!("listing the lakes in {folder}: {e:#}");
+        vec![]
+    });
     let mut found = vec![];
-    for path in dirs {
-        let (Some(name), Ok(dir)) = (path.file_name().and_then(|n| n.to_str()).map(str::to_lowercase), full(&path.to_string_lossy())) else { continue };
+    for (name, dir) in lakes {
+        let (name, Ok(dir)) = (name.to_lowercase(), full(&dir)) else { continue };
         let taken = dir == home.url || check(&name).is_err() || name == lake_name(home)
             || home.attached.read().unwrap().iter().any(|(n, _)| *n == name)
             || !matches!(home.cat.get::<Attachment>(&attachment_key(&name)).await, Ok(None))

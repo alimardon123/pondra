@@ -11,7 +11,8 @@ A message is frames, each its length (4 bytes, little-endian) and its bytes: a J
   `{"kind": "sql", "sql": …}` (a frame: the node runs it) or `{"kind": "none"}`.
 - `cell`: a session's code (a console cell, a DO block sent in a session) on the worker the node
   keeps for that session, in the session's namespace: what one cell makes, the next one sees.
-  Answered as `call` is.
+  Answered as `call` is, or with the figures it drew (`{"kind": "images"}`: PNG, as Jupyter shows
+  them). `vars`: what that namespace holds, for the console's panel.
 
 A failure answers `{"error": "…"}`, and the worker goes on. A body is compiled once per worker, and
 what it imports stays imported: that is why a call takes milliseconds, not a Python start.
@@ -33,6 +34,7 @@ _out = None  # the answers' channel
 
 def main():
     global _out
+    os.environ.setdefault("MPLBACKEND", "Agg")  # (figures are drawn to PNG: no window on the node)
     _out = os.fdopen(os.dup(1), "wb")
     os.dup2(2, 1)  # (anything else written to standard output goes to the node's log)
     sys.stdout = Notices()
@@ -46,7 +48,7 @@ def main():
         msg = json.loads(_exact(inp, struct.unpack("<I", n)[0]))
         head, parts = msg["head"], [_exact(inp, struct.unpack("<I", _exact(inp, 4))[0]) for _ in range(msg["parts"])]
         try:
-            answer, parts = {"apply": apply, "call": call, "check": check, "cell": cell}[head["op"]](head, parts)
+            answer, parts = {"apply": apply, "call": call, "check": check, "cell": cell, "vars": variables}[head["op"]](head, parts)
         except BaseException as e:  # (a routine's `sys.exit()` too: the worker stays)
             answer, parts = {"error": failure(e, head)}, []
         send(answer, parts)
@@ -375,8 +377,61 @@ def cell(head, parts):
         client._current = client._last = None
     if value is not None:
         g["_"] = value  # (the last answer, as Python's shell keeps it)
+    images = figures(value)
+    if images:
+        return {"kind": "images", "images": images}, []
     kind, data = reply(value, "cell")
     return kind, [data] if data else []
+
+
+def figures(value):
+    """What a cell drew, as PNG in base64: the figure or image it ends with, else the figures
+    pyplot has open (then closed, as Jupyter's inline backend does) when it ends with nothing or
+    with what drew them. None when it drew nothing, or ends with rows (they are its answer)."""
+    import base64
+    def png(fig):
+        out = io.BytesIO()
+        fig.savefig(out, format="png", bbox_inches="tight", dpi=110) if hasattr(fig, "savefig") else fig.save(out, format="PNG")
+        return base64.b64encode(out.getvalue()).decode()
+    plt = sys.modules.get("matplotlib.pyplot")
+    image = hasattr(value, "save") and hasattr(value, "mode") and hasattr(value, "size")  # (a PIL image)
+    if value is not None and (hasattr(value, "savefig") or image):
+        if plt and hasattr(value, "savefig"):
+            plt.close(value)
+        return [png(value)]
+    drew = lambda x: type(x).__module__.split(".")[0] in ("matplotlib", "seaborn")
+    if plt is None or not (value is None or drew(value) or isinstance(value, (list, tuple)) and value and all(map(drew, value))):
+        return None
+    out = [png(plt.figure(n)) for n in plt.get_fignums()]
+    plt.close("all")
+    return out or None
+
+
+def variables(head, _):
+    """What a session's namespace holds: its own names (not the ones the worker put there, nor
+    modules), each with its type, its size (length, shape, rows) and a short look at it."""
+    import types
+    g = _sessions.get(head["session"]) or {}
+    skip = {"pondra", "plpy", "con", "db", "SD", "GD", "__builtins__", "__name__", "__pondra_con__"}
+    out = []
+    for k, v in g.items():
+        if k in skip or k.startswith("_") or isinstance(v, types.ModuleType):  # (`_`, the last answer, as Jupyter's own)
+            continue
+        t = type(v)
+        size = ""
+        try:
+            shape = getattr(v, "shape", None)
+            size = "×".join(map(str, shape)) if isinstance(shape, tuple) else str(len(v)) if hasattr(v, "__len__") and not isinstance(v, str) else ""
+        except Exception:  # noqa: BLE001 (a size it won't say)
+            pass
+        cols = getattr(v, "column_names", None) or getattr(v, "columns", None) if t.__module__.split(".")[0] in ("pandas", "polars", "pyarrow") else None
+        try:
+            look = f"columns: {', '.join(map(str, list(cols)[:24]))}" if cols is not None and not callable(cols) \
+                else repr(v) if not callable(v) else f"{k}{inspect.signature(v)}" if not isinstance(v, type) else f"class {k}"
+        except Exception as e:  # noqa: BLE001
+            look = f"<{type(e).__name__}>"
+        out.append({"name": k, "type": f"{t.__module__}.{t.__qualname__}".replace("builtins.", ""), "size": size, "look": " ".join(look.split())[:160]})
+    return {"variables": sorted(out, key=lambda v: v["name"])}, []
 
 
 def reply(value, name):

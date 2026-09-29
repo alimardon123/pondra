@@ -9,20 +9,25 @@
   rows; the lake's files are listed by folder, and one is read as a table; a long answer draws
   only the rows in sight, sorts by a header's click, and its columns are summarized; a
   SQL cell and a Python cell run (what the code printed, and its last expression as rows);
-  errors come back in plain words, a Python error at its line in the cell; a live cell shows a
-  row INSERTed over HTTP, and its query ends when the switch is off; the keys (Esc, B, D D, Z,
-  Shift+Enter); a notebook saved in the lake (twice: two versions) and opened again is the one
+  errors come back in plain words, a Python error at its line in the cell; Python cells share
+  their variables, a figure shows as a picture, the Variables tab lists them, and Restart empties
+  them; a name completes with Tab; a live cell shows a row INSERTed over HTTP, and its query ends
+  when the switch is off; the keys (Esc, B, D D, Z, O, Shift+Enter, ?); text cells' headings make
+  the outline; a notebook saved in the lake (twice: two versions) and opened again is the one
   saved, and Jupyter's nbformat validates it; so does the one downloaded; an .ipynb uploaded
   opens, its text rendered and its %%sql cell run.
 - tokens: a node with tokens serves the page, which asks for one; given it, the tables show,
   and after a reload too (the browser keeps it).
 - server: `pondra serve <folder of lakes>`'s console lists its databases, and a cell runs in the one picked.
+- extensions: a node given PONDRA_CONSOLE_EXTENSIONS (examples/console-extension.js) serves it, and
+  its section, panel tab, view of an answer and menu action show beside the console's own; the
+  console's files answer 304 to a browser that has them.
 - every request the page made went to the node (or server) that served it.
 
 --show DIR keeps screenshots, light and dark.
 Needs: playwright (Chromium at PLAYWRIGHT_BROWSERS_PATH) and nbformat.
 """
-import argparse, json, os, shutil, subprocess, sys, tempfile, time
+import argparse, json, os, shutil, subprocess, sys, tempfile, time, urllib.error, urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -79,6 +84,11 @@ class Page:
         heads = [h.split("\n")[0] for h in c.locator("thead th").all_inner_texts()[1:]]
         rows = [[t.strip() for t in r.split("\t")[1:]] for r in c.locator("tbody tr:not(.gap)").all_inner_texts()]
         return heads, rows
+
+    def menu(self, item):
+        """Pick `item` in the top bar's ⋯ menu."""
+        self.p.click("#moreBtn")
+        self.p.locator("#menu button", has_text=item).click()
 
     def left(self):
         """Requests that went anywhere but the node that served the page."""
@@ -167,6 +177,31 @@ def node_checks(browser, port, show):
     c = pg.run(3, "x * 10")  # (the cell before made x, then failed: x stays, as in a notebook)
     shared = until(lambda: pg.grid(c), (["value"], [["10"]]))
     checks["Python cells share their variables (one namespace per page, as a notebook's kernel)"] = shared == (["value"], [["10"]])
+    fig = pg.run(3, "import matplotlib.pyplot as plt\nfig, ax = plt.subplots(figsize=(4, 2))\nax.plot([1, 3, 2])\nfig")
+    drawn = until(lambda: fig.locator("img.fig").count() == 1 and fig.locator("img.fig").evaluate("i => i.complete && i.naturalWidth") > 100, True)
+    checks["a figure a Python cell returns (matplotlib) shows as a picture"] = drawn is True and fig.locator("img.fig").get_attribute("src").startswith("data:image/png;base64,")
+    p.locator("#tabs button", has_text="Variables").click()
+    names = until(lambda: p.locator("#detail .var .nm").all_inner_texts(), ["ax", "fig", "i", "x"])
+    x_type = p.locator("#detail .var", has_text="x").last.locator(".ty").inner_text() if names == ["ax", "fig", "i", "x"] else ""
+    p.locator("#detail button", has_text="Restart").click()
+    emptied = until(lambda: p.locator("#detail .var").count(), 0)
+    gone = pg.run(3, "x").locator(".err").inner_text()
+    p.locator("#tabs button", has_text="Details").click()
+    checks["the Variables tab lists the page's Python names with their types; Restart empties them"] = names == ["ax", "fig", "i", "x"] and x_type.startswith("int") \
+        and emptied == 0 and "NameError" in gone
+    ta = pg.cell(0).locator("textarea")
+    ta.fill("SELECT * FROM peo")
+    ta.press("End")
+    ta.press("Tab")  # (one name fits: it is written)
+    one = ta.input_value()
+    ta.fill("SELECT na")
+    ta.press("End")
+    ta.press("Tab")  # (several fit: a list, the table's column first)
+    listed = until(lambda: p.locator("#complete").is_visible() and p.locator("#complete [role=option]").count() > 1, True)
+    ta.press("Enter")
+    checks["Tab completes a table's name, and lists the choices when several fit (a column first)"] = one == "SELECT * FROM people" and listed is True \
+        and ta.input_value() == "SELECT name" and p.locator("#complete").is_hidden()
+    c = pg.run(0, "SELECT id, name, born, at, amt FROM people ORDER BY id")
 
     live = pg.run(1, "SELECT count(*) AS n, sum(amt) AS amt FROM people")
     live.locator("label.live").click()
@@ -198,6 +233,23 @@ def node_checks(browser, port, show):
     typing = p.evaluate("document.activeElement.tagName")
     checks["keys: Esc, B adds a cell, D D deletes it, Z brings it back; M makes it text; Shift+Enter renders it and starts a new cell"] = \
         (added, deleted, back) == (n + 1, n, n + 1) and rendered == "Findings" and typing == "TEXTAREA" and pg.cells().count() == n + 3
+    outline = p.locator("#outline .row")
+    headed = until(lambda: outline.all_inner_texts(), ["Findings"])
+    pg.cell(0).locator("textarea").click()
+    outline.first.click()
+    checks["a text cell's headings make the outline, and one clicked selects its cell"] = headed == ["Findings"] \
+        and until(lambda: "sel" in pg.cell(pg.cells().count() - 2).get_attribute("class"), True) is True
+    pg.cell(0).locator("textarea").click()
+    p.keyboard.press("Escape")
+    p.keyboard.press("o")
+    folded = "folded" in pg.cell(0).get_attribute("class") and pg.cell(0).locator("table").is_hidden() and pg.cell(0).locator("textarea").is_visible()
+    pg.cell(0).locator(".out").click()
+    shown = "folded" not in pg.cell(0).get_attribute("class") and pg.cell(0).locator("table").is_visible()
+    p.keyboard.press("Escape")
+    p.keyboard.press("?")
+    keys = until(lambda: p.locator("#helpDlg").get_attribute("open") is not None and p.locator("#keys kbd").count() > 20, True)
+    p.keyboard.press("Escape")
+    checks["O hides a cell's output (its code stays) and a click shows it; ? lists every key"] = folded and shown and keys is True
 
     p.fill("#nbname", "report")
     p.press("#nbname", "Enter")
@@ -207,10 +259,10 @@ def node_checks(browser, port, show):
     saved = call(port, "GET", "/" + listed()[0]) if one == 1 else None  # (JSON: read as such)
     nb = nbformat.reads(json.dumps(saved), as_version=4) if saved else None
     valid = _try(lambda: nbformat.validate(nb) is None)
-    page_cells = p.evaluate("S.cells.map(c => [c.kind, c.src])")
+    page_cells = p.evaluate("pondra.state.cells.map(c => [c.kind, c.src])")
     as_saved = [["markdown" if c.cell_type == "markdown" else "sql" if c.source.startswith("%%sql") else "python", c.source.removeprefix("%%sql\n")] for c in nb.cells] if nb else []
     checks["a notebook saved in the lake is valid for Jupyter (nbformat), SQL cells as %%sql"] = one == 1 and valid is True and as_saved == page_cells \
-        and any(c.source.startswith("%%sql\n") for c in nb.cells) and not p.locator("#dirty").inner_text()
+        and any(c.source.startswith("%%sql\n") for c in nb.cells) and p.locator("#dirty").is_hidden()
     pg.cell(0).locator("textarea").fill("SELECT 'changed' AS v")
     p.keyboard.press("Control+s")
     two = until(lambda: len(listed()), 2)
@@ -219,11 +271,11 @@ def node_checks(browser, port, show):
     until(lambda: nbs.locator(".tw").first.is_visible(), True)
     nbs.locator(".tw").first.click()  # (its versions)
     nbs.locator(".kids .row").last.click()  # (the first one saved)
-    reopened = until(lambda: p.evaluate("S.cells.map(c => [c.kind, c.src])"), page_cells)
+    reopened = until(lambda: p.evaluate("pondra.state.cells.map(c => [c.kind, c.src])"), page_cells)
     checks["saved twice: two versions; the first, opened from the sidebar, is what was saved"] = two == 2 and reopened == page_cells
 
     with p.expect_download() as d:
-        p.click("#download")
+        pg.menu("Download")
     downloaded = open(d.value.path()).read()
     checks["a notebook downloaded is valid for Jupyter too"] = _try(lambda: nbformat.validate(nbformat.reads(downloaded, as_version=4)) is None) is True
 
@@ -231,11 +283,14 @@ def node_checks(browser, port, show):
                                          nbformat.v4.new_code_cell("print('from python')")])
     path = os.path.join(tempfile.mkdtemp(prefix="pondra-console-"), "from-jupyter.ipynb")
     nbformat.write(up, path)
-    p.set_input_files("#upload", path)
-    until(lambda: p.evaluate("S.cells.map(c => c.kind)"), ["markdown", "sql", "python"])
-    kinds = p.evaluate("S.cells.map(c => c.kind)")
+    with p.expect_file_chooser() as chooser:
+        pg.menu("Open an .ipynb")
+    chooser.value.set_files(path)
+    until(lambda: p.evaluate("pondra.state.cells.map(c => c.kind)"), ["markdown", "sql", "python"])
+    kinds = p.evaluate("pondra.state.cells.map(c => c.kind)")
     c = pg.run(1, "SELECT 42 AS answer")
-    checks["an .ipynb uploaded opens: its text rendered, its %%sql cell a SQL cell that runs"] = kinds == ["markdown", "sql", "python"] \
+    checks["an .ipynb uploaded opens: its text rendered (its heading the outline), its %%sql cell a SQL cell that runs"] = kinds == ["markdown", "sql", "python"] \
+        and until(lambda: p.locator("#outline").text_content(), "From Jupyter") == "From Jupyter" \
         and pg.cell(0).locator(".md h1").inner_text() == "From Jupyter" and pg.grid(c) == (["answer"], [["42"]]) and p.input_value("#nbname") == "from-jupyter"
 
     if show:
@@ -246,7 +301,7 @@ def node_checks(browser, port, show):
         dark.shot(show, "console-dark.png")
         dark.ctx.close()
     checks["every request went to the node; no page errors"] = pg.left() == [] and pg.errors == [] and len(pg.seen) > 10
-    info = {"left": pg.left(), "errors": pg.errors, "sql_error": sql_error, "python_error": python_error, "kinds": kinds, "columns": columns, "facts": facts}
+    info = {"outline": p.locator("#outline").text_content(), "left": pg.left(), "errors": pg.errors, "sql_error": sql_error, "python_error": python_error, "kinds": kinds, "columns": columns, "facts": facts}
     pg.ctx.close()
     return checks, info
 
@@ -254,7 +309,7 @@ def node_checks(browser, port, show):
 def token_checks(browser, port):
     token = "console-check-admin-token"
     lake = tempfile.mkdtemp(prefix="pondra-")
-    node = Node(lake, port, admin_token=token).start()
+    node = Node(lake, port, admin_token=token, read_token="console-check-reader").start()
     try:
         harness.call(port, "POST", "/sql", b"CREATE TABLE secret_things AS SELECT 1 AS id", headers={"authorization": f"Bearer {token}"})
         pg = Page(browser, f"http://127.0.0.1:{port}/")
@@ -265,8 +320,15 @@ def token_checks(browser, port):
         shown = until(lambda: pg.p.locator("#tree .row", has_text="secret_things").count(), 1)
         pg.p.reload()
         again = until(lambda: pg.p.locator("#tree .row", has_text="secret_things").count(), 1)
+        def python_of(who):
+            try:
+                return harness.call(port, "GET", "/sessions/some-page/python", headers={"authorization": f"Bearer {who}"})
+            except Exception as e:  # noqa: BLE001 (refused: what it said)
+                return str(e)
         checks = {"with tokens, the page asks for one, then shows the tables (and after a reload)": asked is True and hidden and shown == 1 and again == 1
-                  and pg.p.locator("#tokenDlg").get_attribute("open") is None}
+                  and pg.p.locator("#tokenDlg").get_attribute("open") is None,
+                  "a session's Python variables are an admin's to read, as DO is": "admin" in str(python_of("console-check-reader"))
+                  and python_of(token) == {"running": False, "variables": []}}
         pg.ctx.close()
         return checks, {}
     finally:
@@ -300,6 +362,46 @@ def server_checks(browser, port):
         shutil.rmtree(folder, ignore_errors=True)
 
 
+def ext_checks(browser, port):
+    """An extension (examples/console-extension.js) given to a node: served, loaded, and what it
+    registers shows beside the console's own."""
+    lake = tempfile.mkdtemp(prefix="pondra-")
+    ext = os.path.join(HERE, "..", "examples", "console-extension.js")
+    node = Node(lake, port, env={"PONDRA_CONSOLE_EXTENSIONS": os.path.abspath(ext)}).start()
+    try:
+        sql(port, "CREATE TABLE things AS SELECT * FROM (VALUES (1, 'a'), (2, 'b'), (3, 'c')) v(id, name)")
+        served = urllib.request.urlopen(f"http://127.0.0.1:{port}/console/ext/0.js").read().decode() == open(ext, encoding="utf-8").read()
+        first = urllib.request.urlopen(f"http://127.0.0.1:{port}/console/console.js")
+        tag = first.headers["etag"]
+        try:
+            again = urllib.request.urlopen(urllib.request.Request(f"http://127.0.0.1:{port}/console/console.js", headers={"if-none-match": tag})).status
+        except urllib.error.HTTPError as e:
+            again = e.code
+        pg = Page(browser, f"http://127.0.0.1:{port}/")
+        p = pg.p
+        p.locator("#tree .row", has_text="things").wait_for(timeout=20000)
+        section = p.locator("#historyTitle").text_content() == "History" and p.locator("#history .empty").count() == 1
+        c = pg.run(0, "SELECT count(*) AS n FROM things")
+        figure = c.locator(".ext-figure").inner_text().split("\n")
+        history = until(lambda: p.locator("#history .row").all_inner_texts(), ["SELECT count(*) AS n FROM things"])
+        p.locator("#tree .row", has_text="things").click()
+        p.locator("#tabs button", has_text="Sample").click()
+        sample = until(lambda: p.locator("#detail pre.said").count(), 3)
+        p.click("#moreBtn")
+        action = p.locator("#menu button", has_text="Copy a link to this notebook").count() == 1
+        p.keyboard.press("Escape")
+        checks = {"an extension is served (/console/ext/0.js), and its section, panel tab, view of an answer and menu action show beside the console's own":
+                  served and section and figure == ["3", "n"] and history == ["SELECT count(*) AS n FROM things"] and sample == 3 and action,
+                  "the console's files carry a tag, and a browser that has them gets 304": bool(tag) and again == 304,
+                  "with an extension: every request went to the node; no page errors": pg.left() == [] and pg.errors == []}
+        info = {"served": served, "section": section, "action": action, "figure": figure, "history": history, "sample": sample, "etag": tag, "again": again, "errors": pg.errors}
+        pg.ctx.close()
+        return checks, info
+    finally:
+        node.kill()
+        shutil.rmtree(lake, ignore_errors=True)
+
+
 def _try(f):
     try:
         return f()
@@ -311,6 +413,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8890)
     ap.add_argument("--show", help="keep screenshots here")
+    ap.add_argument("--only", help="run only these parts (node, tokens, server, extensions), separated by commas")
     A = harness.A = ap.parse_args()
     A.s3, A.keep = False, False
     if A.show:
@@ -321,7 +424,10 @@ def main():
     try:
         with sync_playwright() as pw:
             browser = pw.chromium.launch()
-            for part, f in [("node", lambda: node_checks(browser, A.port, A.show)), ("tokens", lambda: token_checks(browser, A.port + 1)), ("server", lambda: server_checks(browser, A.port + 2))]:
+            for part, f in [("node", lambda: node_checks(browser, A.port, A.show)), ("tokens", lambda: token_checks(browser, A.port + 1)), ("server", lambda: server_checks(browser, A.port + 2)),
+                            ("extensions", lambda: ext_checks(browser, A.port + 3))]:
+                if A.only and part not in A.only.split(","):
+                    continue
                 try:
                     checks, info = f()
                 except Exception as e:  # noqa: BLE001 (a part that couldn't run fails)

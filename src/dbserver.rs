@@ -40,7 +40,37 @@ struct Node {
     http: u16,
     pg: u16,
     child: tokio::process::Child,
-    used: Instant,
+    activity: Arc<Activity>,
+}
+
+/// What reaches a database's node: the connections and requests in flight, and when the last one
+/// ended. A node is idle only when none is in flight (a statement running longer than
+/// `PONDRA_DATABASE_IDLE_SECS` isn't cut off), counted from when the last one ended.
+struct Activity {
+    busy: std::sync::atomic::AtomicUsize,
+    last: std::sync::Mutex<Instant>,
+}
+
+/// A connection or request in flight to a database's node, from when it is routed until its
+/// answer has gone (a Postgres connection: until it closes).
+struct Busy(Arc<Activity>);
+
+impl Busy {
+    fn new(a: &Arc<Activity>) -> Busy {
+        a.busy.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Busy(a.clone())
+    }
+}
+
+impl Drop for Busy {
+    fn drop(&mut self) {
+        *self.0.last.lock().unwrap() = Instant::now();
+        self.0.busy.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl Activity {
+    fn idle(&self) -> bool { self.busy.load(std::sync::atomic::Ordering::SeqCst) == 0 && self.last.lock().unwrap().elapsed() >= idle() }
 }
 
 struct Server {
@@ -60,21 +90,30 @@ fn idle() -> Duration { Duration::from_secs(std::env::var("PONDRA_DATABASE_IDLE_
 /// Does `path` hold lakes rather than be one (`pondra serve data`: each a database)? Not when it
 /// holds one itself, or is new or empty (it becomes a lake).
 pub async fn holds_lakes(path: &str) -> anyhow::Result<bool> {
-    if crate::ext::scheme(path).is_some_and(|s| s != "file") {
-        return Ok(false); // (a bucket's prefix: one lake)
-    }
-    Ok(!std::path::Path::new(path).join("catalog").is_dir() && !databases(path).is_empty())
+    Ok(!is_lake(path).await? && !databases(path).await.is_empty())
 }
 
+/// Is there a lake at `dir` (a folder, or a bucket's prefix)?
+pub async fn is_lake(dir: &str) -> Result<bool> {
+    if !dir.contains("://") {
+        return Ok(std::path::Path::new(dir).join("catalog").is_dir());
+    }
+    let store = crate::store::open_store(dir)?.1;
+    Ok(futures::StreamExt::next(&mut store.list(Some(&object_store::path::Path::from("catalog")))).await.transpose()?.is_some())
+}
+
+/// Where database `name` is: a subfolder, or a prefix under the bucket's.
+fn place(folder: &str, name: &str) -> String { format!("{}/{name}", folder.trim_end_matches('/')) }
+
 /// The lakes in the folder: its subfolders that hold one, by name.
-fn databases(folder: &str) -> Vec<String> {
-    let mut out: Vec<String> = std::fs::read_dir(folder).into_iter().flatten().flatten()
-        .filter(|e| e.path().join("catalog").is_dir())
-        .filter_map(|e| e.file_name().to_str().map(str::to_string))
-        .filter(|n| crate::ddl::check(n).is_ok())
-        .collect();
-    out.sort();
-    out
+async fn databases(folder: &str) -> Vec<String> {
+    match crate::ddl::lakes_in(folder).await {
+        Ok(all) => all.into_iter().map(|(n, _)| n).collect(),
+        Err(e) => {
+            eprintln!("listing the databases in {folder}: {e:#}");
+            vec![]
+        }
+    }
 }
 
 /// A port nobody listens on (the OS picks it).
@@ -82,36 +121,35 @@ fn free_port() -> Result<u16> { Ok(std::net::TcpListener::bind("127.0.0.1:0")?.l
 
 impl Server {
     /// The database a request without `/db/` means.
-    fn default_db(&self) -> String {
-        let all = databases(&self.folder);
+    async fn default_db(&self) -> String {
+        let all = databases(&self.folder).await;
         self.default.clone().or_else(|| all.iter().find(|d| *d == "lake").cloned()).or_else(|| (all.len() == 1).then(|| all[0].clone())).unwrap_or_else(|| "lake".into())
     }
 
-    /// The node of database `name`, started if it isn't running: (HTTP port, Postgres port).
+    /// The node of database `name`, started if it isn't running: its HTTP port, its Postgres
+    /// port, and the mark of this use (it isn't stopped until that is dropped).
     /// `create`: make the lake if there is none (the default database, on first use).
-    async fn node(&self, name: &str, create: bool) -> Result<(u16, u16)> {
+    async fn node(&self, name: &str, create: bool) -> Result<(u16, u16, Busy)> {
         crate::ddl::check(name)?;
         if let Some(n) = self.nodes.lock().await.get_mut(name) {
             if n.child.try_wait()?.is_none() {
-                n.used = Instant::now();
-                return Ok((n.http, n.pg));
+                return Ok((n.http, n.pg, Busy::new(&n.activity)));
             }
         }
         let _one = self.starting.lock().await;
         if let Some(n) = self.nodes.lock().await.get_mut(name) {
             if n.child.try_wait()?.is_none() {
-                n.used = Instant::now();
-                return Ok((n.http, n.pg)); // (another request started it meanwhile)
+                return Ok((n.http, n.pg, Busy::new(&n.activity))); // (another request started it meanwhile)
             }
         }
-        let dir = std::path::Path::new(&self.folder).join(name);
-        if !dir.join("catalog").is_dir() && !create {
+        let dir = place(&self.folder, name);
+        if !create && !is_lake(&dir).await? {
             bail!("database \"{name}\" does not exist (CREATE DATABASE {name})");
         }
         let (http, pg) = (free_port()?, free_port()?);
         let exe = std::env::current_exe()?;
         let mut cmd = tokio::process::Command::new(exe);
-        cmd.args(["serve", "--dir", &dir.to_string_lossy(), "--addr", &format!("127.0.0.1:{http}"), "--pg", &format!("127.0.0.1:{pg}"), "--attach-found", &self.folder,
+        cmd.args(["serve", "--dir", &dir, "--addr", &format!("127.0.0.1:{http}"), "--pg", &format!("127.0.0.1:{pg}"), "--attach-found", &self.folder,
                   "--advertise", &format!("{}/db/{name}", self.addr), "--stop-with-stdin"]);
         if let Some(p) = &self.options.python {
             cmd.args(["--python", p]);
@@ -137,19 +175,26 @@ impl Server {
             anyhow::ensure!(started.elapsed() < Duration::from_secs(120), "the node of database {name} didn't start in two minutes");
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        self.nodes.lock().await.insert(name.to_string(), Node { http, pg, child, used: Instant::now() });
-        Ok((http, pg))
+        let activity = Arc::new(Activity { busy: Default::default(), last: std::sync::Mutex::new(Instant::now()) });
+        let busy = Busy::new(&activity);
+        self.nodes.lock().await.insert(name.to_string(), Node { http, pg, child, activity });
+        Ok((http, pg, busy))
     }
 
     /// Stop the nodes nobody used lately, once they have nothing left to tier.
     async fn reap(&self) {
-        let idle: Vec<(String, u16)> = self.nodes.lock().await.iter().filter(|(_, n)| n.used.elapsed() >= idle()).map(|(k, n)| (k.clone(), n.http)).collect();
+        let idle: Vec<(String, u16)> = self.nodes.lock().await.iter().filter(|(_, n)| n.activity.idle()).map(|(k, n)| (k.clone(), n.http)).collect();
         for (name, http) in idle {
             let stats: Option<Value> = async { crate::cluster::http().get(format!("http://127.0.0.1:{http}/stats")).send().await.ok()?.json().await.ok() }.await;
             if stats.as_ref().and_then(|s| s["untiered_rows"].as_u64()).unwrap_or(0) > 0 {
                 continue; // (it tiers first: another look next time)
             }
-            if let Some(mut n) = self.nodes.lock().await.remove(&name) {
+            let mut nodes = self.nodes.lock().await;
+            if !nodes.get(&name).is_some_and(|n| n.activity.idle()) {
+                continue; // (used again meanwhile)
+            }
+            if let Some(mut n) = nodes.remove(&name) {
+                drop(nodes);
                 drop(n.child.stdin.take()); // (stops as on Ctrl-C: the next node leads at once)
                 let _ = tokio::time::timeout(Duration::from_secs(20), n.child.wait()).await;
             }
@@ -160,8 +205,8 @@ impl Server {
     /// leads that lake).
     async fn drop_db(&self, name: &str, if_exists: bool) -> Result<Value> {
         crate::ddl::check(name)?;
-        let dir = std::path::Path::new(&self.folder).join(name);
-        if !dir.join("catalog").is_dir() {
+        let dir = place(&self.folder, name);
+        if !is_lake(&dir).await? {
             anyhow::ensure!(if_exists, "database \"{name}\" does not exist");
             return Ok(j!({"database": name, "dropped": false}));
         }
@@ -169,19 +214,32 @@ impl Server {
             drop(n.child.stdin.take());
             let _ = tokio::time::timeout(Duration::from_secs(20), n.child.wait()).await;
         }
-        let store = crate::store::open_store(&dir.to_string_lossy())?.1;
+        let store = crate::store::open_store(&dir)?.1;
         if let Some(t) = crate::cluster::latest(&store).await? {
             anyhow::ensure!(!crate::cluster::alive(&store, &t).await, "another process leads database {name} ({}): stop it first", if t.addr.is_empty() { "a pondra sql" } else { &t.addr });
         }
-        std::fs::remove_dir_all(&dir).with_context(|| format!("deleting {}", dir.display()))?;
+        match dir.contains("://") {
+            false => std::fs::remove_dir_all(&dir).with_context(|| format!("deleting {dir}"))?,
+            true => {
+                // (a bucket's prefix: every object under it, as a folder's files are deleted)
+                use futures::{StreamExt, TryStreamExt};
+                let listed = store.list(None).map_ok(|o| o.location).boxed();
+                store.delete_stream(listed).try_collect::<Vec<_>>().await.with_context(|| format!("deleting {dir}"))?;
+            }
+        }
         Ok(j!({"database": name, "dropped": true}))
     }
 }
 
 /// Run the server until stopped.
 pub async fn serve(folder: String, addr: String, pg: Option<String>, default: Option<String>, options: Options, auth: Arc<Auth>) -> Result<()> {
-    std::fs::create_dir_all(&folder)?;
-    let folder = std::fs::canonicalize(&folder)?.to_string_lossy().to_string();
+    let folder = match folder.contains("://") {
+        true => folder.trim_end_matches('/').to_string(), // (a bucket's prefix)
+        false => {
+            std::fs::create_dir_all(&folder)?;
+            std::fs::canonicalize(&folder)?.to_string_lossy().to_string()
+        }
+    };
     let server: Shared = Arc::new(Server { folder: folder.clone(), addr: addr.clone(), default, options, auth, nodes: Default::default(), starting: Default::default() });
     let s = server.clone();
     tokio::spawn(async move {
@@ -206,13 +264,14 @@ pub async fn serve(folder: String, addr: String, pg: Option<String>, default: Op
     }
     let app = Router::new()
         .route("/", get(|| async { crate::console::server_page() }))
+        .route("/console/{*file}", get(crate::console::file))
         .route("/databases", get(list).post(create))
         .route("/databases/{name}", axum::routing::delete(drop_db))
         .route("/db/{name}", any(|State(s): State<Shared>, Path(name): Path<String>, req: Request| async move { route(&s, &name, "/", req).await }))
         .route("/db/{name}/{*rest}", any(|State(s): State<Shared>, Path((name, rest)): Path<(String, String)>, req: Request| async move { route(&s, &name, &format!("/{rest}"), req).await }))
         .fallback(|State(s): State<Shared>, req: Request| async move {
             let path = req.uri().path().to_string();
-            let db = s.default_db();
+            let db = s.default_db().await;
             route(&s, &db, &path, req).await
         })
         .with_state(server.clone());
@@ -243,8 +302,8 @@ async fn list(State(s): State<Shared>, req: Request) -> Response {
         return (StatusCode::UNAUTHORIZED, "this needs a token").into_response();
     }
     let running: Vec<String> = s.nodes.lock().await.keys().cloned().collect();
-    let default = s.default_db();
-    Json(databases(&s.folder).into_iter().map(|d| j!({"name": d, "running": running.contains(&d), "default": d == default})).collect::<Vec<_>>()).into_response()
+    let default = s.default_db().await;
+    Json(databases(&s.folder).await.into_iter().map(|d| j!({"name": d, "running": running.contains(&d), "default": d == default})).collect::<Vec<_>>()).into_response()
 }
 
 /// `POST /databases` `{"name": "x"}`: a new, empty lake in the folder (what `CREATE DATABASE x` does).
@@ -274,8 +333,8 @@ async fn drop_db(State(s): State<Shared>, Path(name): Path<String>, req: Request
 /// A request for database `name`, passed to its node (the answer streamed back as it comes).
 async fn route(s: &Server, name: &str, path: &str, req: Request) -> Response {
     let name = name.to_lowercase();
-    let create = name == s.default_db() && databases(&s.folder).is_empty();
-    let (http, _) = match s.node(&name, create).await {
+    let create = name == s.default_db().await && databases(&s.folder).await.is_empty();
+    let (http, _, busy) = match s.node(&name, create).await {
         Ok(p) => p,
         Err(e) => return error(StatusCode::NOT_FOUND, e),
     };
@@ -292,7 +351,11 @@ async fn route(s: &Server, name: &str, path: &str, req: Request) -> Response {
             for (k, v) in res.headers().iter().filter(|(k, _)| !matches!(k.as_str(), "content-length" | "transfer-encoding" | "connection")) {
                 resp = resp.header(k, v);
             }
-            resp.body(Body::from_stream(res.bytes_stream())).unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
+            let answer = futures::StreamExt::map(res.bytes_stream(), move |chunk| {
+                let _ = &busy; // (in use until the whole answer has gone: a live query's for as long as it runs)
+                chunk
+            });
+            resp.body(Body::from_stream(answer)).unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
         }
         Err(e) => error(StatusCode::BAD_GATEWAY, e.into()),
     }
@@ -317,11 +380,12 @@ async fn postgres(s: &Server, mut client: tokio::net::TcpStream) -> Result<()> {
     };
     let params: Vec<String> = startup[8..].split(|b| *b == 0).map(|p| String::from_utf8_lossy(p).to_string()).collect();
     let param = |k: &str| params.chunks(2).find(|p| p.len() == 2 && p[0] == k).map(|p| p[1].clone());
-    let name = param("database").or_else(|| param("user")).unwrap_or_else(|| s.default_db()).to_lowercase();
-    let known = databases(&s.folder);
-    let create = name == s.default_db() && known.is_empty();
-    let pg = match s.node(&name, create).await {
-        Ok((_, pg)) => pg,
+    let fallback = s.default_db().await;
+    let name = param("database").or_else(|| param("user")).unwrap_or_else(|| fallback.clone()).to_lowercase();
+    let known = databases(&s.folder).await;
+    let create = name == fallback && known.is_empty();
+    let (pg, _busy) = match s.node(&name, create).await {
+        Ok((_, pg, busy)) => (pg, busy),
         Err(e) => {
             let text = format!("{e:#}");
             let code = if text.contains("does not exist") { "3D000" } else { "XX000" };
@@ -335,8 +399,5 @@ async fn postgres(s: &Server, mut client: tokio::net::TcpStream) -> Result<()> {
     node.set_nodelay(true)?;
     node.write_all(&startup).await?;
     tokio::io::copy_bidirectional(&mut client, &mut node).await?;
-    if let Some(n) = s.nodes.lock().await.get_mut(&name) {
-        n.used = Instant::now();
-    }
     Ok(())
 }

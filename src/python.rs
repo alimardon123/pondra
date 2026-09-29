@@ -351,6 +351,17 @@ pub async fn ask_session(session: &str, head: Value, parts: Vec<Vec<u8>>, limit:
     }
 }
 
+/// The variables a session's worker holds: name, type, size and a short look at each, or none if
+/// it has no worker yet; `busy` while a cell runs (nothing waits for it).
+pub async fn variables(session: &str) -> Result<Value> {
+    let Some(slot) = KERNELS.lock().unwrap().get(session).map(|k| k.0.clone()) else { return Ok(json!({"running": false, "variables": []})) };
+    let Ok(mut kernel) = slot.try_lock() else { return Ok(json!({"running": true, "busy": true, "variables": []})) };
+    let Some(k) = kernel.as_mut() else { return Ok(json!({"running": false, "variables": []})) };
+    send(&mut k.worker, &json!({"op": "vars", "session": session}), &[]).await?;
+    let (head, _) = recv(&mut k.worker).await?;
+    Ok(json!({"running": true, "busy": false, "variables": head["variables"]}))
+}
+
 /// A session ended: its worker stops (once a cell it runs is done).
 pub fn end_session(session: &str) -> bool { KERNELS.lock().unwrap().remove(session).is_some() }
 

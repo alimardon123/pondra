@@ -1,249 +1,22 @@
-<!doctype html>
-<html lang="en" data-mode="node">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="color-scheme" content="light dark">
-<title>Pondra</title>
-<link rel="icon" href="{{favicon}}"><!-- (brand/mark.svg: console.rs) -->
-<!-- The console (ADR-030): this one file, served by the node. No CDN, no fonts, nothing from
-     anywhere else: every request it makes goes to the node (or the server) that served it. -->
-<style>
-/*{{colors}}*/
-:root{
-  --bg:#fafaf9;--panel:#f4f4f2;--card:#fff;--ink:#1c1c1e;--muted:#6e6e73;--faint:#a1a1a6;--line:#e7e7e3;--line2:#d7d7d2;
-  --accent:var(--pondra-accent);--accent-soft:var(--pondra-accent-soft);--ok:#15803d;--err:#b42318;--err-soft:#fdeeec;--warn:#b45309;
-  --sel:color-mix(in srgb,var(--pondra-accent) 22%,#fff);--kw:#7c3aed;--str:#0f766e;--num:#b45309;--com:#8e8e93;--fn:#2563eb;
-  --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;
-  --sans:system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
-  --on-accent:#fff;--radius:10px;--shadow:0 1px 2px rgba(0,0,0,.04),0 1px 1px rgba(0,0,0,.03)
-}
-@media (prefers-color-scheme:dark){:root{
-  --bg:#111113;--panel:#161618;--card:#1b1b1e;--ink:#ececf0;--muted:#9d9da6;--faint:#6b6b74;--line:#28282c;--line2:#36363c;
-  --accent:var(--pondra-accent-dark);--accent-soft:var(--pondra-accent-soft-dark);--ok:#4ade80;--err:#ff8a80;--err-soft:#3a1d1b;--warn:#fbbf24;
-  --sel:color-mix(in srgb,var(--pondra-accent-dark) 30%,#111113);--kw:#c4a5ff;--str:#5eead4;--num:#fdba74;--com:#76767f;--fn:#8fb3ff;--on-accent:#06201b;--shadow:none
-}}
-*{box-sizing:border-box}
-[hidden]{display:none!important}
-html,body{height:100%;margin:0}
-body{background:var(--bg);color:var(--ink);font:14px/1.45 var(--sans);display:flex;flex-direction:column;overflow:hidden}
-button,select,input{font:inherit;color:inherit}
-svg{flex:none}
-header{display:flex;align-items:center;gap:8px;padding:8px 14px;border-bottom:1px solid var(--line);background:var(--panel);min-height:50px}
-.brand{display:flex;align-items:center;gap:8px;font-weight:650;letter-spacing:-.01em;margin-right:4px}
-.brand .pondra-mark{height:19px;width:auto;color:var(--pondra-mark)}
-@media (prefers-color-scheme:dark){.brand .pondra-mark{color:var(--pondra-mark-dark)}}
-.pill{font-size:12px;color:var(--muted);border:1px solid var(--line2);border-radius:999px;padding:2px 10px;white-space:nowrap;max-width:40vw;overflow:hidden;text-overflow:ellipsis}
-.pill b{color:var(--ink);font-weight:600}
-.dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--ok);margin-right:6px;vertical-align:1px}
-.dot.off{background:var(--err)}
-#nbname{font-weight:600;border:1px solid transparent;background:transparent;border-radius:6px;padding:4px 8px;width:24ch;min-width:90px}
-#nbname:hover{border-color:var(--line2)}#nbname:focus{outline:none;border-color:var(--accent);background:var(--card)}
-#dirty{color:var(--warn);font-size:12px;min-width:52px}
-.spacer{flex:1}
-.btn{border:1px solid var(--line2);background:var(--card);border-radius:7px;padding:4px 11px;cursor:pointer;font-size:13px;display:inline-flex;align-items:center;gap:6px;white-space:nowrap}
-.btn:hover{border-color:var(--faint)}.btn.primary{background:var(--accent);border-color:var(--accent);color:var(--on-accent)}
-.btn:focus-visible,.icon:focus-visible,.row:focus-visible,.cell:focus-visible,.run:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
-.icon{border:0;background:transparent;border-radius:6px;padding:3px 6px;cursor:pointer;color:var(--muted);line-height:1;display:inline-flex;align-items:center}
-.icon:hover{background:var(--line);color:var(--ink)}
-#app{flex:1;display:flex;min-height:0}
-#side{width:280px;min-width:200px;max-width:50vw;border-right:1px solid var(--line);background:var(--panel);overflow:auto;padding:6px 6px 40px;resize:horizontal}
-.sect{display:flex;align-items:center;justify-content:space-between;padding:12px 6px 4px 10px}
-.sect h2{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin:0;font-weight:600}
-.row{display:flex;align-items:center;gap:7px;width:100%;border:0;background:transparent;text-align:left;padding:2px 8px 2px 4px;border-radius:6px;cursor:pointer;font-size:13px;min-height:26px;color:inherit}
-.row:hover{background:var(--line)}
-.row.on{background:color-mix(in srgb,var(--accent) 15%,transparent)}
-.row.cur>.nm{font-weight:650}
-.line{display:flex;align-items:center}
-.line>.row{flex:1;min-width:0}
-.tw{width:16px;height:22px;flex:none;border:0;background:transparent;color:var(--faint);cursor:pointer;border-radius:5px;display:inline-flex;align-items:center;justify-content:center;padding:0}
-.tw:hover{color:var(--ink);background:var(--line)}
-.tw svg{transition:transform .12s}.tw[aria-expanded=true] svg{transform:rotate(90deg)}
-.tw.none{visibility:hidden}
-.nm{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.ct{color:var(--faint);font-size:11.5px;white-space:nowrap}
-.ty{color:var(--faint);font:11px var(--mono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:48%;text-align:right}
-.kids{margin-left:12px;padding-left:4px;border-left:1px solid var(--line)}
-.ic{color:var(--muted);width:15px;height:15px;display:inline-flex}
-.tg{color:var(--faint);width:14px;height:14px;display:inline-flex}
-.kk{color:var(--warn);width:12px;height:12px;display:inline-flex}
-.row.col{cursor:copy;min-height:24px}
-.empty{color:var(--faint);font-size:12px;padding:4px 12px}
-#detail{width:340px;min-width:260px;max-width:45vw;border-left:1px solid var(--line);background:var(--panel);overflow:auto;padding:14px 16px 60px;font-size:13px;resize:horizontal;direction:rtl}
-#detail>*{direction:ltr}
-.dh{display:flex;gap:10px;align-items:flex-start;margin-bottom:10px}
-.dh .ic{width:20px;height:20px;margin-top:2px;color:var(--accent)}
-.dn{font-weight:650;font-size:15px;overflow-wrap:anywhere;line-height:1.3}
-.dk{color:var(--muted);font-size:12px;margin-top:2px;overflow-wrap:anywhere}
-.acts2{display:flex;gap:6px;flex-wrap:wrap;margin:4px 0 14px}
-.acts2 .btn{padding:3px 9px;font-size:12px}
-.facts{display:grid;grid-template-columns:auto 1fr;gap:5px 14px;margin:0 0 16px;font-size:12.5px}
-.facts dt{color:var(--muted)}.facts dd{margin:0;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
-.dsect{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);font-weight:600;margin:14px 0 6px;display:flex;justify-content:space-between;align-items:center}
-.pc{padding:5px 6px;border-radius:7px}
-.pc.on{background:color-mix(in srgb,var(--accent) 12%,transparent)}
-.pc .line1{display:flex;gap:7px;align-items:center}
-.pc .nm{font-weight:550}
-.pc .sub{color:var(--faint);font-size:11.5px;margin:2px 0 0 21px}
-.ps{margin:4px 0 2px 21px;font-size:11.5px;color:var(--muted)}
-.ps .nums{display:flex;flex-wrap:wrap;gap:2px 10px;font-variant-numeric:tabular-nums}
-.ps svg{display:block;margin-top:5px}
-.bars{display:grid;grid-template-columns:minmax(0,1fr) 60px auto;gap:2px 8px;margin-top:5px;align-items:center}
-.bars .v{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--ink)}
-.bars .b{height:6px;border-radius:3px;background:var(--accent);opacity:.75}
-.bars .n{font-variant-numeric:tabular-nums;text-align:right}
-.defn{margin:0;padding:10px 12px;background:var(--card);border:1px solid var(--line);border-radius:8px;font:12px/1.55 var(--mono);white-space:pre-wrap;overflow-wrap:anywhere}
-.muted{color:var(--muted)}
-main{flex:1;overflow:auto;padding:22px 28px 140px;scroll-padding:90px}
-#cells{max-width:1120px;margin:0 auto;display:flex;flex-direction:column;gap:14px}
-.cell{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow);position:relative;outline:none}
-.cell.sel{border-color:color-mix(in srgb,var(--accent) 55%,var(--line))}
-.cell.sel::before{content:"";position:absolute;left:-1px;top:-1px;bottom:-1px;width:3px;background:var(--accent);border-radius:var(--radius) 0 0 var(--radius)}
-.cell.editing{box-shadow:0 0 0 3px var(--accent-soft)}
-.bar{display:flex;align-items:center;gap:8px;padding:7px 8px 0 12px;font-size:12px;color:var(--muted);min-height:32px}
-.kind{border:1px solid var(--line2);background:transparent;border-radius:6px;font:600 11px var(--sans);padding:2px 3px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;cursor:pointer}
-.bar .n{font:12px var(--mono);color:var(--faint);min-width:30px}
-.st{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.st.bad{color:var(--err)}
-.tools{margin-left:auto;display:flex;gap:1px;opacity:0;transition:opacity .1s}
-.cell:hover .tools,.cell.sel .tools,.tools:focus-within{opacity:1}
-.live{display:inline-flex;align-items:center;gap:6px;cursor:pointer;user-select:none;position:relative}
-.switch{width:28px;height:16px;border-radius:999px;background:var(--line2);position:relative;transition:background .15s;flex:none}
-.switch::after{content:"";position:absolute;top:2px;left:2px;width:12px;height:12px;border-radius:50%;background:#fff;transition:left .15s}
-.live input{position:absolute;opacity:0;width:1px;height:1px}
-.live input:checked+.switch{background:var(--ok)}.live input:checked+.switch::after{left:14px}
-.live input:focus-visible+.switch{outline:2px solid var(--accent);outline-offset:1px}
-.run{border:0;background:var(--accent);color:var(--on-accent);border-radius:6px;padding:3px 10px;font-size:12px;cursor:pointer;font-weight:600;display:inline-flex;gap:5px;align-items:center}
-.run.stop{background:var(--err)}
-.pulse{animation:pulse 1.2s infinite}@keyframes pulse{50%{opacity:.35}}
-.ed{position:relative;margin-top:4px}
-.ed pre,.ed textarea{margin:0;padding:8px 14px 12px;font:13px/1.6 var(--mono);white-space:pre;tab-size:4;border:0;letter-spacing:0;word-spacing:0;overflow-wrap:normal}
-.ed pre{position:absolute;inset:0;overflow:hidden;pointer-events:none}
-.ed textarea{display:block;width:100%;min-height:43px;resize:none;background:transparent;color:transparent;-webkit-text-fill-color:transparent;caret-color:var(--ink);overflow-x:auto;overflow-y:hidden;outline:none}
-.ed textarea::selection{background:var(--sel)}
-.ed textarea::placeholder{color:var(--faint);-webkit-text-fill-color:var(--faint)}
-.k{color:var(--kw)}.s{color:var(--str)}.c{color:var(--com);font-style:italic}.f{color:var(--fn)}.nu{color:var(--num)}
-.out:empty{display:none}
-.out{border-top:1px solid var(--line);padding:10px 14px 12px;min-width:0}
-.meta{font-size:12px;color:var(--muted);display:flex;gap:10px;align-items:center;margin-top:8px;flex-wrap:wrap}
-.meta .btn{padding:1px 8px;font-size:12px}
-.badge{font-size:11px;color:var(--warn);border:1px solid currentColor;border-radius:4px;padding:0 5px}
-.err{color:var(--err);background:var(--err-soft);border-radius:8px;padding:10px 12px;font:13px/1.5 var(--mono);white-space:pre-wrap;margin:0;overflow:auto;max-height:420px}
-.said{font:13px/1.5 var(--mono);white-space:pre-wrap;margin:0 0 8px;max-height:380px;overflow:auto}
-.done{font-size:13px;color:var(--ok)}
-.grid{overflow:auto;max-height:520px;max-width:100%;border:1px solid var(--line);border-radius:8px;display:inline-block;vertical-align:top}
-.grid.v{display:block;width:fit-content}
-.grid.v table{table-layout:fixed}
-.grid.v td{height:28px;padding-top:0;padding-bottom:0;line-height:27px}
-tr.gap td{padding:0;border:0}
-table{border-collapse:separate;border-spacing:0;font-size:13px}
-th,td{padding:5px 12px;border-bottom:1px solid var(--line);text-align:left;white-space:nowrap;max-width:440px;overflow:hidden;text-overflow:ellipsis;vertical-align:top}
-th{position:sticky;top:0;background:var(--panel);font-weight:600;z-index:1;cursor:pointer;user-select:none}
-th:hover{background:var(--line)}th.on{box-shadow:inset 0 -2px 0 var(--accent)}
-th .srt{color:var(--accent);font-size:9px;margin-left:4px;vertical-align:1px}
-th small{display:block;font:11px var(--mono);color:var(--faint);font-weight:400}
-.num{text-align:right;font-variant-numeric:tabular-nums}
-td.pre{white-space:pre;max-width:none;font:12px/1.5 var(--mono)}
-.null{color:var(--faint);font-style:italic;font-size:12px}
-td.i,th.i{color:var(--faint);text-align:right;font:11.5px var(--mono);user-select:none;padding-right:8px;padding-left:10px}
-tr:last-child td{border-bottom:0}
-tbody tr:hover td{background:var(--accent-soft)}
-.flash tbody td{animation:flash 1s}
-@keyframes flash{from{background:var(--accent-soft)}to{background:transparent}}
-.md{padding:4px 18px 10px;line-height:1.6;overflow-wrap:anywhere}
-.md h1{font-size:1.55em;margin:.35em 0;letter-spacing:-.01em}.md h2{font-size:1.28em;margin:.45em 0}.md h3{font-size:1.1em;margin:.5em 0}
-.md code{font:12.5px var(--mono);background:var(--panel);padding:1px 5px;border-radius:4px}
-.md pre{background:var(--panel);padding:10px 12px;border-radius:8px;overflow:auto}.md pre code{background:none;padding:0}
-.md a{color:var(--accent)}.md blockquote{border-left:3px solid var(--line2);margin:0;padding-left:12px;color:var(--muted)}
-.md .hint{color:var(--faint)}
-.cell[data-kind=markdown]:not(.editing) .ed,.cell:not([data-kind=markdown]) .md{display:none}
-.cell[data-kind=markdown].editing .md{display:none}
-.cell[data-kind=markdown] .run{display:none}
-.add{display:flex;gap:8px;justify-content:center;margin-top:18px}
-.hint{color:var(--faint);font-size:12px;text-align:center;margin-top:12px}
-dialog{border:1px solid var(--line2);border-radius:12px;background:var(--card);color:var(--ink);padding:20px 22px;max-width:560px;width:calc(100% - 40px);box-shadow:0 20px 50px rgba(0,0,0,.25)}
-dialog::backdrop{background:rgba(0,0,0,.35)}
-dialog h3{margin:0 0 6px}dialog p{color:var(--muted);margin:6px 0 12px}
-dialog input{width:100%;font:14px var(--mono);padding:8px 10px;border:1px solid var(--line2);border-radius:8px;background:var(--bg)}
-.acts{display:flex;flex-direction:row-reverse;gap:8px;margin-top:14px} /* (the first button is Enter's) */
-kbd{font:12px var(--mono);border:1px solid var(--line2);border-bottom-width:2px;border-radius:5px;padding:0 5px;background:var(--panel);white-space:nowrap}
-.keys{display:grid;grid-template-columns:auto 1fr;gap:6px 16px;font-size:13px;align-items:baseline}
-.keys h4{grid-column:1/-1;margin:10px 0 0;font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em}
-#toast{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);background:var(--ink);color:var(--bg);padding:8px 14px;border-radius:8px;font-size:13px;opacity:0;transition:opacity .2s;pointer-events:none;max-width:80vw;z-index:9}
-#toast.on{opacity:.95}#toast.bad{background:var(--err);color:#fff}
-@media (max-width:1180px){#detail{position:fixed;right:0;top:50px;bottom:0;z-index:5;box-shadow:-10px 0 30px rgba(0,0,0,.14)}}
-@media (max-width:760px){#side,#detail{display:none}main{padding:12px 10px 100px}header{flex-wrap:wrap}.hide-narrow{display:none}}
-</style>
-</head>
-<body>
-<header>
-  <div class="brand">{{mark}}Pondra</div>
-  <span id="where" class="pill" title="">connecting…</span>
-  <input id="nbname" value="untitled" aria-label="Notebook name" spellcheck="false">
-  <span id="dirty" aria-live="polite"></span>
-  <span class="spacer"></span>
-  <button class="btn" id="runall" title="Run every cell, in order (Ctrl+Shift+Enter)">Run all</button>
-  <button class="btn" id="save" title="Save to the lake, as a new version (Ctrl+S)">Save</button>
-  <button class="btn hide-narrow" id="download" title="Download as .ipynb (Jupyter reads it)">Download</button>
-  <button class="btn hide-narrow" id="uploadBtn" title="Open an .ipynb from this computer">Upload</button>
-  <input type="file" id="upload" accept=".ipynb,application/json" hidden>
-  <button class="icon" id="tokenBtn" title="Token" aria-label="Token"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="8" cy="15" r="4"/><path d="M10.8 12.2 20 3M17 6l3 3M14 9l2 2"/></svg></button>
-  <button class="icon" id="panelBtn" title="Details panel" aria-label="Details panel" aria-pressed="false"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M15 4v16"/></svg></button>
-  <button class="icon" id="helpBtn" title="Keys (?)" aria-label="Keys"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="2" y="6" width="20" height="13" rx="2"/><path d="M6 10h.01M10 10h.01M14 10h.01M18 10h.01M7 15h10"/></svg></button>
-</header>
-<div id="app">
-  <aside id="side" aria-label="Catalog">
-    <div class="sect"><h2 id="treeTitle">Database</h2><span><button class="icon" id="newdb" title="New database" aria-label="New database" hidden>+</button><button class="icon" id="refresh" title="Refresh" aria-label="Refresh"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7"/></svg></button></span></div>
-    <div id="tree" class="tree" role="tree"></div>
-    <div class="sect"><h2>Files</h2></div>
-    <div id="files" role="tree"></div>
-    <div class="sect"><h2>Notebooks</h2><button class="icon" id="newnb" title="New notebook" aria-label="New notebook">+</button></div>
-    <div id="notebooks"></div>
-  </aside>
-  <main id="main">
-    <div id="cells" aria-label="Cells"></div>
-    <div class="add">
-      <button class="btn" data-add="sql">+ SQL</button>
-      <button class="btn" data-add="python">+ Python</button>
-      <button class="btn" data-add="markdown">+ Text</button>
-    </div>
-    <div class="hint"><kbd>Ctrl</kbd>+<kbd>Enter</kbd> runs a cell · <kbd>Shift</kbd>+<kbd>Enter</kbd> runs it and moves on · <kbd>Esc</kbd> then <kbd>?</kbd> lists every key</div>
-  </main>
-  <aside id="detail" aria-label="Details" hidden></aside>
-</div>
-<dialog id="tokenDlg"><form method="dialog">
-  <h3>Token</h3>
-  <p id="tokenWhy">The token this node was started with (<code>--token</code>). It is kept in this browser only.</p>
-  <input id="tokenIn" type="password" autocomplete="off" spellcheck="false" placeholder="token">
-  <div class="acts"><button class="btn primary" value="ok">Use it</button><button class="btn" value="cancel">Cancel</button><button class="btn" value="clear">Forget it</button></div>
-</form></dialog>
-<dialog id="helpDlg"><form method="dialog">
-  <h3>Keys</h3>
-  <div class="keys">
-    <h4>In a cell</h4>
-    <kbd>Ctrl Enter</kbd><span>Run it</span>
-    <kbd>Shift Enter</kbd><span>Run it and go to the next cell</span>
-    <kbd>Alt Enter</kbd><span>Run it and add a cell below</span>
-    <kbd>Ctrl Shift Enter</kbd><span>Run every cell</span>
-    <kbd>Tab</kbd> <span>Indent (<kbd>Shift Tab</kbd>: back)</span>
-    <kbd>Esc</kbd><span>Leave the cell: the keys below then work</span>
-    <h4>On a cell (after Esc)</h4>
-    <kbd>Enter</kbd><span>Edit it</span>
-    <kbd>↑ ↓</kbd> <span>The cell above, below (or <kbd>K</kbd> <kbd>J</kbd>)</span>
-    <kbd>A</kbd> <kbd>B</kbd><span>Add a cell above, below</span>
-    <kbd>D D</kbd><span>Delete it (<kbd>Z</kbd> brings it back)</span>
-    <kbd>S</kbd> <kbd>P</kbd> <kbd>M</kbd><span>Make it SQL, Python, text</span>
-    <kbd>L</kbd><span>Live on or off: its answer again after each commit that changes it</span>
-    <h4>Anywhere</h4>
-    <kbd>Ctrl S</kbd><span>Save the notebook in the lake</span>
-    <kbd>?</kbd><span>These keys</span>
-  </div>
-  <p>A Python cell runs on the node, as <code>DO LANGUAGE python</code>: <code>db</code> is the connection, <code>print</code> shows here, and a last expression that is a frame or a table comes back as rows. The page's cells share their variables, as a notebook's do.</p>
-  <div class="acts"><button class="btn primary" value="ok">Close</button></div>
-</form></dialog>
-<div id="toast" role="status"></div>
-<script>
-'use strict';
+// The console (ADR-030, ADR-032): Pondra's notebook for SQL, Python and text, served by every node.
+//
+// This module is the core and its API, `window.pondra` (exported as `pondra`). Everything the page
+// shows is registered through that API — the catalog's sections, the details panel's tabs, the
+// kinds of cell, the views of an answer, the top bar's actions, the places of the rail, commands
+// and keys — the built-in ones as any extension's would be. So a build of the console for a bigger
+// platform keeps this one and adds to it:
+//
+//   pondra.register.section({ id: 'jobs', title: 'Jobs', render: box => box.append(…) })
+//   pondra.register.panel({ id: 'lineage', title: 'Lineage', render: (box, picked) => … })
+//   pondra.register.renderer({ id: 'map', match: r => …, render: (r, cell) => element })
+//   pondra.register.action({ id: 'share', label: 'Share', run: () => … })
+//   pondra.register.nav({ id: 'home', label: 'Home', icon: '<path …/>', run: () => … })
+//   pondra.configure({ fetch, token, headers })   // (its own gateway and sign-in)
+//   pondra.on('pick', picked => …)                 // (and 'run', 'ran', 'refresh', 'start')
+//
+// No framework and nothing from elsewhere: it loads in one request from the node, and draws only
+// what is on screen.
+
 // ------------------------------------------------------------------ small things
 const $ = (s, el = document) => el.querySelector(s);
 function h(tag, attrs = {}, ...kids) {
@@ -303,28 +76,78 @@ const ICONS = {
   t_list: '<path d="M8.5 4H5v16h3.5M15.5 4H19v16h-3.5"/>',
   t_bin: '<rect x="4" y="5" width="6" height="14" rx="3"/><path d="M14.5 7.5 17.5 5v14"/>',
   t_other: '<circle cx="12" cy="12" r="3.5"/>',
+  dots: '<circle cx="5" cy="12" r="1.3" fill="currentColor"/><circle cx="12" cy="12" r="1.3" fill="currentColor"/><circle cx="19" cy="12" r="1.3" fill="currentColor"/>',
+  plus: '<path d="M12 5v14M5 12h14"/>',
+  refresh: '<path d="M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7"/>',
+  panel: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M15 4v16"/>',
+  up: '<path d="M12 20V8m-5 5 5-5 5 5M5 4h14"/>',
+  clear: '<path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13"/>',
+  restart: '<path d="M4 12a8 8 0 1 0 2.3-5.7M4 4v5h5"/>',
+  keyboard: '<rect x="2" y="6" width="20" height="13" rx="2"/><path d="M6 10h.01M10 10h.01M14 10h.01M18 10h.01M7 15h10"/>',
+  var: '<path d="M7 4C5 4 4.5 5 4.5 7v3c0 1-.7 2-2 2 1.3 0 2 1 2 2v3c0 2 .5 3 2.5 3M17 4c2 0 2.5 1 2.5 3v3c0 1 .7 2 2 2-1.3 0-2 1-2 2v3c0 2-.5 3-2.5 3M9 9l6 6M15 9l-6 6"/>',
+  arrowUp: '<path d="M12 19V5m-6 6 6-6 6 6"/>',
+  arrowDown: '<path d="M12 5v14m-6-6 6 6 6-6"/>',
+  trash: '<path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13"/>',
+  eye: '<path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>',
+  stop: '<rect x="6" y="6" width="12" height="12" rx="2"/>',
 };
 const icon = (name, cls = 'ic', size = { tg: 14, kk: 12 }[cls] || 15) => h('span', { class: cls, 'aria-hidden': 'true', html: `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${ICONS[name]}</svg>` });
 /** A column type's glyph: numbers, text, dates, times, true/false, lists, JSON-like, bytes. */
 const typeIcon = (t = '') => /^(U?Int|Float|Decimal)/.test(t) ? 't_num' : /^(Utf8|LargeUtf8|Utf8View|Dictionary)/.test(t) ? 't_text' : /^Date/.test(t) ? 't_date' : /^(Timestamp|Time|Duration|Interval)/.test(t) ? 't_time'
   : /^Boolean/.test(t) ? 't_bool' : /\[\]$|^(Large|FixedSize)?List/.test(t) ? 't_list' : /^(Struct|Map)/.test(t) ? 't_json' : /Binary/.test(t) ? 't_bin' : 't_other';
 
+
+// ------------------------------------------------------------------ the API: registries and events
+const hooks = new Map();
+/** Call `fn` on an event: 'start', 'pick' (what the details panel shows), 'run' (a cell starts),
+ * 'ran' (it answered), 'refresh' (the catalog was read again), 'changed' (the notebook). */
+function on(event, fn) { (hooks.get(event) || hooks.set(event, []).get(event)).push(fn); }
+function emit(event, ...args) { for (const fn of hooks.get(event) || []) { try { fn(...args); } catch (e) { console.error(`pondra: ${event}:`, e); } } }
+const R = { sections: [], panels: [], kinds: new Map(), renderers: [], actions: [], nav: [], commands: new Map(), keys: [] };
+let drawing = 0;
+/** Draw the regions again once (after registrations: an extension adds after the core starts). */
+function redraw() { if (!drawing) drawing = requestAnimationFrame(() => { drawing = 0; if (started) { drawActions(); drawSide(); drawTabs(); drawRail(); drawKeys(); } }); }
+const byOrder = (a, b) => (a.order ?? 50) - (b.order ?? 50);
+const register = {
+  /** A section of the left side: `{ id, title, render(box), tools?: [{ icon, title, run }], order }`.
+   * `render` fills its box, again on each refresh. */
+  section(o) { R.sections = R.sections.filter(x => x.id !== o.id).concat(o).sort(byOrder); redraw(); },
+  /** A tab of the details panel: `{ id, title, render(box, picked), order }`. */
+  panel(o) { R.panels = R.panels.filter(x => x.id !== o.id).concat(o).sort(byOrder); redraw(); },
+  /** A kind of cell: `{ id, label, placeholder, language ('sql' | 'python' | 'markdown'), run(text, signal) → answer, live?, complete? }`. */
+  cellKind(o) { R.kinds.set(o.id, o); redraw(); },
+  /** A view of an answer: `{ id, match(answer) → bool, render(answer, cell) → element, order }`: the first that matches draws it. */
+  renderer(o) { R.renderers = R.renderers.filter(x => x.id !== o.id).concat(o).sort(byOrder); },
+  /** An action of the top bar: `{ id, label?, icon?, title, run(), primary?, menu? (in the ⋯ menu), order }`. */
+  action(o) { R.actions = R.actions.filter(x => x.id !== o.id).concat(o).sort(byOrder); redraw(); },
+  /** A place in the rail at the far left (the rail shows once there is one): `{ id, label, icon (SVG paths), run(), order }`. */
+  nav(o) { R.nav = R.nav.filter(x => x.id !== o.id).concat(o).sort(byOrder); redraw(); },
+  /** A command, by name, for keys and menus: `{ id, title, run() }`. */
+  command(o) { R.commands.set(o.id, o); },
+  /** A key on a cell (after Esc): `{ keys: 'd d', title, run(cell), group }`; listed under ?. */
+  key(o) { R.keys = R.keys.filter(x => x.keys !== o.keys).concat(o); redraw(); },
+};
+/** How the page reaches the node: `fetch`, the token, extra headers (an enterprise build's
+ * gateway and sign-in replace them). */
+const T = { fetch: (url, init) => fetch(url, init), token: () => store.get('pondra.token'), headers: () => ({}) };
+function configure(o) { Object.assign(T, o); }
+
 // ------------------------------------------------------------------ the page's state
-const MODE = document.documentElement.dataset.mode; // node: one lake; server: a folder's databases (`pondra serve <folder>`)
+const MODE = document.documentElement.dataset.mode; // lake: one lake (`serve --lake`); lakes: a folder of lakes, its databases (`serve --lakes`)
 const SESSION = [...crypto.getRandomValues(new Uint8Array(12))].map(b => b.toString(16).padStart(2, '0')).join(''); // (this page's temporary tables)
-const S = { db: null, lake: null, cells: [], sel: null, name: 'untitled', version: null, dirty: false, runs: 0, open: new Set(), trash: null, last: null, pick: null, objects: null, info: null, filesAt: '' };
-const base = () => MODE === 'server' && S.db ? '/db/' + encodeURIComponent(S.db) : '';
+const S = { db: null, lake: null, cells: [], sel: null, name: 'untitled', version: null, dirty: false, runs: 0, open: new Set(), trash: null, last: null, pick: null, objects: null, info: null, filesAt: '', tab: 'details', py: 'none', vars: [], place: null };
+const base = () => MODE === 'lakes' && S.db ? '/db/' + encodeURIComponent(S.db) : '';
 
 // ------------------------------------------------------------------ talking to the node
 class Failure extends Error { constructor(message, status) { super(message); this.status = status; } }
 
 async function call(path, { method = 'GET', body, headers = {}, signal, root = false } = {}) {
-  const hd = { 'x-pondra-session': SESSION, ...headers };
-  const token = store.get('pondra.token');
+  const hd = { 'x-pondra-session': SESSION, ...T.headers(), ...headers };
+  const token = T.token();
   if (token) hd.authorization = 'Bearer ' + token;
   let r;
   try {
-    r = await fetch((root ? '' : base()) + path, { method, body, headers: hd, signal });
+    r = await T.fetch((root ? '' : base()) + path, { method, body, headers: hd, signal });
   } catch (e) {
     if (e.name === 'AbortError') throw e;
     throw new Failure(`The node did not answer (${e.message}). Is it still running?`, 0);
@@ -543,45 +366,55 @@ class Cell {
     this.kind = o.kind || 'sql';
     this.result = null; this.count = null; this.ctl = null; this.stream = null;
     this.kindSel = h('select', { class: 'kind', 'aria-label': 'Kind of cell', title: 'SQL, Python or text (S, P, M)', onchange: e => { this.setKind(e.target.value); this.edit(); } },
-      h('option', { value: 'sql' }, 'SQL'), h('option', { value: 'python' }, 'Python'), h('option', { value: 'markdown' }, 'Text'));
-    this.runBtn = h('button', { class: 'run', title: 'Run (Ctrl+Enter)', onclick: () => this.ctl ? this.ctl.abort() : this.run() }, 'Run');
+      [...R.kinds.values()].map(k => h('option', { value: k.id }, k.label)));
+    this.runBtn = h('button', { class: 'run', title: 'Run (Ctrl+Enter)', onclick: () => this.ctl ? this.ctl.abort() : this.run() });
+    this.idle();
     this.liveBox = h('input', { type: 'checkbox', onchange: () => this.setLive(this.liveBox.checked) });
     this.liveEl = h('label', { class: 'live', title: 'Live: the answer again each time a commit changes what it reads (L)' }, this.liveBox, h('span', { class: 'switch' }), 'Live');
     this.num = h('span', { class: 'n' });
     this.status = h('span', { class: 'st', 'aria-live': 'polite' });
-    const tool = (label, title, fn) => h('button', { class: 'icon', title, 'aria-label': title, onclick: fn }, label);
+    const tool = (ic, title, fn) => h('button', { class: 'icon', title, 'aria-label': title, onclick: fn }, icon(ic));
+    const i = () => S.cells.indexOf(this);
     this.bar = h('div', { class: 'bar' }, this.num, this.kindSel, this.runBtn, this.liveEl, this.status,
-      h('span', { class: 'tools' }, tool('↑', 'Move up', () => move(this, -1)), tool('↓', 'Move down', () => move(this, 1)),
-        tool('+', 'Add a cell below (B)', () => add({ kind: this.kind === 'markdown' ? 'sql' : this.kind }, this, true).edit()), tool('✕', 'Delete (D D)', () => remove(this))));
+      h('span', { class: 'tools' }, tool('arrowUp', 'Move up', () => move(this, -1)), tool('arrowDown', 'Move down', () => move(this, 1)),
+        tool('plus', 'Add a cell below (B)', () => add({ kind: this.kind === 'markdown' ? 'sql' : this.kind }, this, true).edit()),
+        tool('dots', 'More', e => menu(e.currentTarget, [{ label: 'Run the cells above', icon: 'arrowUp', run: () => runSome(0, i()) }, { label: 'Run this and the cells below', icon: 'arrowDown', run: () => runSome(i()) }, '-',
+          { label: this.el.classList.contains('folded') ? 'Show the output' : 'Hide the output', icon: 'eye', keys: 'O', run: () => this.fold() }, { label: 'Clear the output', icon: 'clear', run: () => this.clear() }, '-',
+          { label: 'Delete the cell', icon: 'trash', keys: 'D D', run: () => remove(this) }]))));
     this.pre = h('pre', { 'aria-hidden': 'true' });
     this.ta = h('textarea', { spellcheck: 'false', autocapitalize: 'off', autocomplete: 'off', 'aria-label': 'Code', rows: '1', wrap: 'off' });
     this.md = h('div', { class: 'md', ondblclick: () => this.edit() });
-    this.out = h('div', { class: 'out' });
+    this.out = h('div', { class: 'out', onclick: () => { if (this.el.classList.contains('folded')) this.fold(false); } });
     this.el = h('section', { class: 'cell', tabindex: '-1', 'data-kind': this.kind }, this.bar, h('div', { class: 'ed' }, this.pre, this.ta), this.md, this.out);
     this.el.cell = this;
     this.ta.value = o.src || '';
-    this.ta.addEventListener('input', () => { this.paint(); changed(); });
+    this.ta.addEventListener('input', () => { this.paint(); changed(); if (cm?.c === this) complete(this); });
     this.ta.addEventListener('scroll', () => { this.pre.scrollLeft = this.ta.scrollLeft; });
     this.ta.addEventListener('keydown', e => editing(e, this));
     this.ta.addEventListener('focus', () => { select(this); this.el.classList.add('editing'); S.last = this; });
-    this.ta.addEventListener('blur', () => { if (this.kind === 'markdown') { this.md.innerHTML = markdown(this.ta.value); } this.el.classList.remove('editing'); });
+    this.ta.addEventListener('blur', () => { if (this.kind === 'markdown') { this.md.innerHTML = markdown(this.ta.value); } this.el.classList.remove('editing'); this.ta.scrollLeft = 0; if (cm?.c === this) closeComplete(); });
     this.el.addEventListener('mousedown', e => { if (!e.target.closest('textarea,button,select,input,a,label')) select(this); });
     this.setKind(this.kind, true);
     if (o.live) { this.liveBox.checked = true; this.status.textContent = 'live once run'; }
     if (o.out) this.show(o.out, true);
   }
   get src() { return this.ta.value; }
+  get type() { return R.kinds.get(this.kind) || R.kinds.get('sql'); }
+  idle() { this.runBtn.replaceChildren(icon('play'), 'Run'); this.runBtn.classList.remove('stop'); this.runBtn.title = 'Run (Ctrl+Enter)'; }
+  fold(on = !this.el.classList.contains('folded')) { this.el.classList.toggle('folded', on); }
+  clear() { this.stopLive(); this.result = null; this.out.replaceChildren(); this.status.textContent = ''; changed(); }
   setKind(k, quiet) {
-    this.kind = k; this.el.dataset.kind = k; this.kindSel.value = k;
-    this.liveEl.hidden = k !== 'sql';
-    if (k !== 'sql') { this.stopLive(); this.liveBox.checked = false; }
-    this.ta.placeholder = { sql: 'SELECT …', python: 'db.sql("SELECT …")      # runs on the node', markdown: 'Text, in Markdown' }[k];
+    this.kind = R.kinds.has(k) ? k : 'sql'; k = this.kind; this.el.dataset.kind = k; this.kindSel.value = k;
+    this.liveEl.hidden = !this.type.live;
+    if (!this.type.live) { this.stopLive(); this.liveBox.checked = false; }
+    this.ta.placeholder = this.type.placeholder || '';
+    if (k === 'python') kernel();
     if (k === 'markdown') this.md.innerHTML = markdown(this.ta.value);
     this.paint();
     if (!quiet) changed();
   }
   paint() {
-    this.pre.innerHTML = highlight(this.ta.value, this.kind);
+    this.pre.innerHTML = highlight(this.ta.value, this.type.language || this.kind);
     this.ta.style.height = 'auto';
     this.ta.style.height = (this.ta.scrollHeight + 2) + 'px';
   }
@@ -592,41 +425,41 @@ class Cell {
     this.el.scrollIntoView({ block: 'nearest' });
   }
   async run() {
-    if (this.kind === 'markdown') { this.md.innerHTML = markdown(this.ta.value); this.ta.blur(); this.el.focus({ preventScroll: true }); return { kind: 'done' }; }
+    if (!this.type.run) { this.md.innerHTML = markdown(this.ta.value); this.ta.blur(); this.el.focus({ preventScroll: true }); return { kind: 'done' }; }
     const text = this.src.trim();
     if (!text) return { kind: 'done' };
     this.stopLive();
     this.ctl?.abort();
     const ctl = this.ctl = new AbortController(), t0 = performance.now();
     this.count = ++S.runs; this.num.textContent = `[${this.count}]`;
-    this.runBtn.textContent = 'Stop'; this.runBtn.classList.add('stop'); this.runBtn.title = 'Stop waiting for it';
+    this.runBtn.replaceChildren(icon('stop'), 'Stop'); this.runBtn.classList.add('stop'); this.runBtn.title = 'Stop waiting for it';
+    emit('run', this);
     this.status.className = 'st pulse'; this.status.textContent = 'running…';
     const tick = setInterval(() => { this.status.textContent = 'running… ' + secs(performance.now() - t0); }, 250);
     let r;
     try {
-      r = await run(this.kind === 'python' ? doBlock(text) : text, ctl.signal);
+      r = await this.type.run(text, ctl.signal);
     } catch (e) {
       r = { kind: 'error', message: e.name === 'AbortError' ? 'Stopped waiting. (A statement already on its way may still finish on the node.)' : e.message, notices: [] };
     } finally {
       clearInterval(tick);
       if (this.ctl === ctl) this.ctl = null;
-      this.runBtn.textContent = 'Run'; this.runBtn.classList.remove('stop'); this.runBtn.title = 'Run (Ctrl+Enter)';
+      this.idle();
     }
     r.ms = performance.now() - t0;
     this.show(r);
-    if (r.kind === 'rows' && this.kind === 'sql' && this.liveBox.checked) this.startLive();
+    if (r.kind === 'rows' && this.type.live && this.liveBox.checked) this.startLive();
     if (r.kind === 'done' || this.kind === 'python') later(refresh);
     changed(true);
+    emit('ran', this, r);
     return r;
   }
   show(r, saved) {
     this.result = r;
     this.out.replaceChildren();
     if (r.notices?.length) this.out.append(h('pre', { class: 'said' }, r.notices.join('\n')));
-    if (r.kind === 'error') this.out.append(h('pre', { class: 'err' }, r.message));
-    else if (r.kind === 'rows') this.out.append(grid(r, this));
-    else if (r.kind === 'text') this.out.append(h('pre', { class: 'said' }, r.text));
-    else if (r.kind === 'done') { const d = doneText(r.value) || (r.notices?.length ? '' : 'Done.'); if (d && !(d === 'Done.' && r.notices?.length)) this.out.append(h('div', { class: 'done' }, d)); }
+    const view = R.renderers.find(v => { try { return v.match(r); } catch { return false; } });
+    if (view) { const el = view.render(r, this); if (el) this.out.append(el); }
     if (saved) this.out.append(h('div', { class: 'meta' }, h('span', { class: 'badge', title: 'As it was when the notebook was saved: run the cell for the answer now' }, 'saved')));
     this.status.className = 'st' + (r.kind === 'error' ? ' bad' : '');
     this.status.textContent = saved ? '' : r.kind === 'error' ? `failed · ${secs(r.ms)}` : secs(r.ms);
@@ -720,13 +553,7 @@ function next(c) {
   select(n, true);
   if (made) n.edit(); // (as Jupyter: a new cell is for typing in)
 }
-async function runAll() {
-  for (const c of S.cells) {
-    select(c, true);
-    const r = await c.run();
-    if (r?.kind === 'error') { toast('Stopped at a cell that failed', true); return; }
-  }
-}
+const runAll = () => runSome(0);
 
 // ------------------------------------------------------------------ keys
 function insert(ta, s) {
@@ -744,6 +571,14 @@ function indent(ta, back) {
 }
 function editing(e, c) {
   const mod = e.ctrlKey || e.metaKey;
+  if (cm?.c === c) {
+    const n = cm.list.length, go = { ArrowDown: 1, ArrowUp: -1 }[e.key];
+    if (go) { e.preventDefault(); cm.on = (cm.on + go + n) % n; drawComplete(); return; }
+    if (e.key === 'Enter' || e.key === 'Tab') { e.preventDefault(); accept(); return; }
+    if (e.key === 'Escape') { e.preventDefault(); closeComplete(); return; }
+  }
+  if (e.key === ' ' && e.ctrlKey) { e.preventDefault(); complete(c, true); return; }
+  if (e.key === 'Tab' && !mod && !e.altKey && !e.shiftKey && c.ta.selectionStart === c.ta.selectionEnd && /[\w.$"]$/.test(c.ta.value.slice(0, c.ta.selectionStart)) && complete(c)) { e.preventDefault(); if (cm.list.length === 1) accept(); return; }
   if (e.key === 'Enter' && (mod || e.shiftKey || e.altKey)) {
     e.preventDefault();
     if (mod && e.shiftKey) return runAll();
@@ -784,9 +619,13 @@ document.addEventListener('keydown', e => {
     d: () => { if (prev === 'd') { lastKey = ''; remove(c); } },
     z: () => restore(),
     s: () => c.setKind('sql'), p: () => c.setKind('python'), m: () => c.setKind('markdown'),
-    l: () => { if (c.kind === 'sql') c.setLive(!c.liveBox.checked); },
+    l: () => { if (c.type.live) c.setLive(!c.liveBox.checked); },
+    o: () => c.fold(),
+    0: () => { if (prev === '0') { lastKey = ''; if (confirm('Restart Python? Its variables go.')) restart(); } },
   };
-  if (acts[key]) { e.preventDefault(); acts[key](); }
+  if (acts[key]) { e.preventDefault(); acts[key](); return; }
+  const mine = R.keys.find(k => k.run && k.keys.toLowerCase() === key);
+  if (mine) { e.preventDefault(); mine.run(c); }
 });
 
 // ------------------------------------------------------------------ notebooks (.ipynb)
@@ -808,7 +647,8 @@ function outputs(c) {
     const kept = r.rows.slice(0, KEPT);
     out.push({ output_type: 'execute_result', execution_count: n, metadata: {}, data: { 'text/plain': lines(textTable(r.columns, kept, r.total)), 'application/vnd.pondra.rows+json': { columns: r.columns, rows: kept, total: r.total } } });
   }
-  const said = r.kind === 'text' ? r.text : r.kind === 'done' ? doneText(r.value) : '';
+  for (const b of r.kind === 'done' && Array.isArray(r.value?.images) ? r.value.images : []) out.push({ output_type: 'display_data', metadata: {}, data: { 'image/png': b, 'text/plain': ['<Figure>'] } });
+  const said = r.kind === 'text' ? r.text : r.kind === 'done' && !r.value?.images ? doneText(r.value) : '';
   if (said) out.push({ output_type: 'execute_result', execution_count: n, metadata: {}, data: { 'text/plain': lines(said) } });
   return out;
 }
@@ -827,6 +667,7 @@ function savedAnswer(outs) {
   for (const o of outs || []) {
     if (o.output_type === 'stream') r.notices.push(text(o.text).replace(/\n$/, ''));
     else if (o.output_type === 'error') Object.assign(r, { kind: 'error', message: o.evalue || o.ename || 'error' });
+    else if (o.data?.['image/png']) { const v = r.kind === 'done' && r.value?.images ? r.value : { images: [] }; v.images.push(text(o.data['image/png']).replace(/\s/g, '')); Object.assign(r, { kind: 'done', value: v }); }
     else if (o.data?.['application/vnd.pondra.rows+json']?.columns) { const d = o.data['application/vnd.pondra.rows+json']; Object.assign(r, { kind: 'rows', columns: d.columns, rows: d.rows || [], total: d.total ?? (d.rows || []).length }); }
     else if (o.data?.['text/plain'] != null) Object.assign(r, { kind: 'text', text: text(o.data['text/plain']) });
   }
@@ -847,6 +688,8 @@ function load(nb, name, version) {
   S.cells = []; $('#cells').replaceChildren();
   for (const c of cells.length ? cells : [{}]) add(c);
   S.name = name; S.version = version; $('#nbname').value = name;
+  if (S.pick?.type === 'result') { S.pick = null; detail(); } // (an answer of the notebook left)
+  reoutline(0);
   select(S.cells[0]);
   saved();
 }
@@ -876,13 +719,15 @@ async function openSaved(name, version) {
 }
 function changed(ran) {
   if (!ran) S.dirty = true;
-  if (S.dirty) { $('#dirty').textContent = 'unsaved'; document.title = `• ${S.name} · Pondra`; }
+  if (S.dirty) { $('#dirty').hidden = false; document.title = `• ${S.name} · Pondra`; }
+  reoutline();
+  emit('changed');
 }
 function saved() {
-  S.dirty = false; $('#dirty').textContent = '';
+  S.dirty = false; $('#dirty').hidden = true;
   document.title = `${S.name} · Pondra`;
   const p = new URLSearchParams();
-  if (S.db && MODE === 'server') p.set('db', S.db);
+  if (S.db && MODE === 'lakes') p.set('db', S.db);
   if (S.version) p.set('notebook', S.name);
   history.replaceState(null, '', p.size ? '#' + p : location.pathname);
 }
@@ -961,8 +806,8 @@ function lakeNode(name, schemas, current, note) {
   }
   const tw = twisty(key, kids, !!schemas);
   tw.addEventListener('click', () => kids.hidden ? S.open.add('closed:' + key) : S.open.delete('closed:' + key));
-  const pick = () => { if (MODE === 'server' && name !== S.db) use(name); else tw.click(); };
-  const row = line(tw, { class: 'row' + (current ? ' cur' : ''), title: MODE === 'server' && !current ? `Use database ${name}` : name, onclick: pick }, icon('db'), h('span', { class: 'nm' }, name), note ? h('span', { class: 'ct' }, note) : null);
+  const pick = () => { if (MODE === 'lakes' && name !== S.db) use(name); else tw.click(); };
+  const row = line(tw, { class: 'row' + (current ? ' cur' : ''), title: MODE === 'lakes' && !current ? `Use database ${name}` : name, onclick: pick }, icon('db'), h('span', { class: 'nm' }, name), note ? h('span', { class: 'ct' }, note) : null);
   return h('div', { role: 'treeitem' }, row, kids);
 }
 function schemaNode(lake, schema, tables, only) {
@@ -996,7 +841,7 @@ function peek(q) {
 
 async function tree() {
   const box = $('#tree');
-  if (MODE === 'server') {
+  if (MODE === 'lakes') {
     let dbs;
     try { dbs = await (await call('/databases', { root: true })).json(); } catch (e) {
       box.replaceChildren(h('div', { class: 'empty' }, e.status === 401 ? 'A token is needed to list the databases.' : e.message));
@@ -1055,35 +900,13 @@ const bytes = n => n == null ? '' : n < 1024 ? `${n} B` : n < 1048576 ? `${(n / 
 const fileSql = f => `read_${/\.(csv|tsv)$/i.test(f.name) ? 'csv' : /\.(json|jsonl|ndjson)$/i.test(f.name) ? 'json' : 'parquet'}('${(S.filesAt + f.rel).replace(/'/g, "''")}')`;
 
 // ------------------------------------------------------------------ the details panel
-function pick(p) {
-  S.pick = p; mark();
-  if ($('#detail').hidden) panel(true);
-  detail();
-}
-function mark() {
-  const key = S.pick?.type === 'object' ? S.pick.t.key : S.pick?.type === 'file' ? S.pick.f.key : null;
-  document.querySelectorAll('aside .row.on').forEach(r => r.classList.remove('on'));
-  if (key) document.querySelectorAll(`aside .row[data-key="${CSS.escape(key)}"]`).forEach(r => r.classList.add('on'));
-}
-function panel(open) {
-  $('#detail').hidden = !open;
-  $('#panelBtn').setAttribute('aria-pressed', String(open));
-  store.set('pondra.panel', open ? 'open' : 'closed');
-  if (open) detail();
-}
 const facts = pairs => h('dl', { class: 'facts' }, pairs.filter(([, v]) => v != null && v !== '' && !(Array.isArray(v) && !v.length)).flatMap(([k, v]) => [h('dt', {}, k), h('dd', {}, Array.isArray(v) ? v.join(', ') : v)]));
 const act = (ic, label, title, fn) => h('button', { class: 'btn', title, onclick: fn }, icon(ic), label);
-function detail() {
-  const box = $('#detail');
-  if (box.hidden) return;
-  const p = S.pick;
-  box.replaceChildren(...(p?.type === 'object' ? objectDetail(p.t) : p?.type === 'file' ? fileDetail(p.f) : p?.type === 'result' ? resultDetail(p) : summary()).filter(Boolean));
-}
 function summary() {
   const objs = S.objects || [], by = k => objs.filter(t => t.c === home() && t.o.kind === k).length;
   const tabled = objs.filter(t => t.c === home() && t.o.rows != null);
   const s = S.info || {};
-  return [h('div', { class: 'dh' }, icon('db'), h('div', {}, h('div', { class: 'dn' }, home() || 'Pondra'), h('div', { class: 'dk' }, MODE === 'server' ? 'a database' : 'this lake'))),
+  return [h('div', { class: 'dh' }, icon('db'), h('div', {}, h('div', { class: 'dn' }, home() || 'Pondra'), h('div', { class: 'dk' }, MODE === 'lakes' ? 'a database' : 'this lake'))),
     facts([['Tables', count(by('table'))], ['Views', count(by('view') + by('files'))], ['Materialized', by('materialized view') ? count(by('materialized view')) : null],
       ['Rows in files', count(tabled.reduce((a, t) => a + (t.o.rows || 0), 0))], ['Size in files', bytes(tabled.reduce((a, t) => a + (t.o.bytes || 0), 0))],
       ['Nodes', s.nodes ? String(s.nodes.length) : null], ['This node', s.role], ['Leader', s.leader], ['Commits', s.hwm != null ? count(s.hwm) : null]]),
@@ -1210,7 +1033,7 @@ async function stats() {
     const s = await (await call('/stats')).json();
     S.lake = s.lake; S.info = s;
     if (!S.pick) detail();
-    const nodes = s.nodes || [], who = MODE === 'server' ? S.db : s.lake;
+    const nodes = s.nodes || [], who = MODE === 'lakes' ? S.db : s.lake;
     where.innerHTML = `<span class="dot"></span><b>${esc(who || '')}</b> · ${esc(s.role)} · ${nodes.length} node${nodes.length === 1 ? '' : 's'}${s.live_queries ? ` · ${s.live_queries} live` : ''}`;
     where.title = `This database's cluster: ${nodes.join(', ')}. Its leader is ${s.leader}; commits so far: ${s.hwm}.`;
   } catch (e) {
@@ -1223,13 +1046,165 @@ async function use(db) {
   S.db = db;
   await stats();
   S.pick = null;
-  await Promise.all([tree(), files(), notebooks()]);
+  await Promise.all(R.sections.map(refreshSection));
   saved();
   toast(`Cells now run in database ${db}`);
 }
 let pending;
 const later = f => { clearTimeout(pending); pending = setTimeout(f, 250); };
-const refresh = () => Promise.all([stats(), tree(), files(), notebooks()]);
+async function refresh() { await stats(); await Promise.all(R.sections.map(refreshSection)); emit('refresh'); }
+
+
+// ------------------------------------------------------------------ the page's regions
+let started = false;
+/** A menu at `at` (an element or a point): items `{ label, icon?, keys?, run }`, or '-' for a line. */
+function menu(at, items) {
+  const m = $('#menu');
+  m.replaceChildren(...items.filter(Boolean).map(i => i === '-' ? h('div', { class: 'sep' }) : h('button', { role: 'menuitem', onclick: () => { m.hidden = true; i.run(); } }, i.icon ? icon(i.icon) : null, i.label, i.keys ? h('kbd', {}, i.keys) : null)));
+  m.hidden = false;
+  const r = at.getBoundingClientRect ? at.getBoundingClientRect() : { left: at.x, right: at.x, bottom: at.y, top: at.y };
+  m.style.top = Math.min(innerHeight - m.offsetHeight - 8, r.bottom + 4) + 'px';
+  m.style.left = Math.max(8, Math.min(innerWidth - m.offsetWidth - 8, r.right - m.offsetWidth)) + 'px';
+  m.querySelector('button')?.focus();
+}
+addEventListener('mousedown', e => { if (!e.target.closest('#menu')) $('#menu').hidden = true; });
+addEventListener('keydown', e => { if (e.key === 'Escape' && !$('#menu').hidden) { $('#menu').hidden = true; e.stopPropagation(); } }, true);
+function drawActions() {
+  const box = $('#actions'), menued = R.actions.filter(a => a.menu);
+  box.replaceChildren(...R.actions.filter(a => !a.menu && !a.hidden?.()).map(a => h('button', { class: a.label ? 'btn' + (a.primary ? ' primary' : '') : 'icon', id: a.id + 'Btn', title: a.title, 'aria-label': a.title, 'aria-pressed': a.pressed ? String(a.pressed()) : null, onclick: e => a.run(e) }, a.icon ? icon(a.icon) : null, a.label || null)),
+    menued.length ? h('button', { class: 'icon', id: 'moreBtn', title: 'More', 'aria-label': 'More', onclick: e => menu(e.currentTarget, menued.filter(a => !a.hidden?.()).flatMap(a => [a.sep ? '-' : null, { label: a.title, icon: a.icon, keys: a.keys, run: a.run }])) }, icon('dots')) : null);
+}
+function drawSide() {
+  $('#side').replaceChildren(...R.sections.flatMap(s => {
+    s.box ||= h('div', { id: s.id, role: 'tree' });
+    const tools = (s.tools || []).filter(t => !t.hidden?.()).map(t => h('button', { class: 'icon', title: t.title, 'aria-label': t.title, id: t.domId || null, onclick: t.run }, icon(t.icon)));
+    return [h('div', { class: 'sect' }, h('h2', { id: s.id + 'Title' }, typeof s.title === 'function' ? s.title() : s.title), h('span', {}, tools)), s.box];
+  }));
+  return Promise.all(R.sections.filter(s => !s.drawn).map(s => { s.drawn = true; return refreshSection(s); }));
+}
+async function refreshSection(s) { try { await s.render(s.box); } catch (e) { s.box.replaceChildren(h('div', { class: 'empty' }, e.status === 401 ? 'A token is needed to see this.' : e.message)); } }
+function drawTabs() {
+  if (!R.panels.some(p => p.id === S.tab)) S.tab = R.panels[0]?.id;
+  $('#tabs').replaceChildren(...R.panels.map(p => h('button', { class: 'tab', role: 'tab', 'aria-selected': String(p.id === S.tab), onclick: () => { S.tab = p.id; drawTabs(); detail(); } }, p.title)));
+  $('#tabs').hidden = R.panels.length < 2;
+}
+function drawRail() {
+  $('#rail').hidden = !R.nav.length;
+  $('#rail').replaceChildren(...R.nav.map(n => h('button', { class: 'icon' + (S.place === n.id ? ' on' : ''), title: n.label, 'aria-label': n.label, onclick: () => { S.place = n.id; drawRail(); n.run(); }, html: `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">${n.icon || ICONS.dots}</svg><span>${esc(n.label)}</span>` })));
+}
+function drawKeys() {
+  const groups = [...new Set(R.keys.map(k => k.group))];
+  $('#keys').replaceChildren(...groups.flatMap(g => [h('h4', {}, g), ...R.keys.filter(k => k.group === g).flatMap(k => [h('span', {}, ...k.keys.split(' ').map(x => h('kbd', {}, x))), h('span', {}, k.title)])]));
+}
+/** The details panel: the current tab's view of what was picked. */
+function detail() {
+  const box = $('#detail');
+  if ($('#panel').hidden) return;
+  const p = R.panels.find(x => x.id === S.tab);
+  if (!p) return box.replaceChildren();
+  box.replaceChildren();
+  const n = ++detailed; // (a slow answer for an earlier pick never covers a later one's)
+  Promise.resolve(p.render(box, S.pick)).then(kids => { if (n === detailed && Array.isArray(kids)) box.replaceChildren(...kids.filter(Boolean)); }, e => { if (n === detailed) box.replaceChildren(h('pre', { class: 'err' }, e.message)); });
+}
+let detailed = 0;
+function panel(open) {
+  $('#panel').hidden = !open;
+  store.set('pondra.panel', open ? 'open' : 'closed');
+  drawActions();
+  if (open) detail();
+}
+function pick(p, tab) {
+  S.pick = p; mark();
+  if (tab) { S.tab = tab; drawTabs(); }
+  else if (S.tab !== 'details' && R.panels.some(x => x.id === 'details')) { S.tab = 'details'; drawTabs(); }
+  if ($('#panel').hidden) panel(true); else detail();
+  emit('pick', p);
+}
+function mark() {
+  const key = S.pick?.type === 'object' ? S.pick.t.key : S.pick?.type === 'file' ? S.pick.f.key : null;
+  document.querySelectorAll('#side .row.on').forEach(r => r.classList.remove('on'));
+  if (key) document.querySelectorAll(`#side .row[data-key="${CSS.escape(key)}"]`).forEach(r => r.classList.add('on'));
+}
+
+// ------------------------------------------------------------------ the page's Python (a session's, on the node)
+/** Where this page's Python is: none yet, idle, busy. The pill says so, and restarts it. */
+function kernel(state) {
+  if (state) S.py = state;
+  const k = $('#kernel');
+  k.hidden = S.py === 'none' && !S.cells.some(c => c.kind === 'python');
+  k.replaceChildren(h('span', { class: 'dot ' + (S.py === 'busy' ? 'busy' : S.py === 'idle' ? '' : 'idle') }), 'Python ', h('b', {}, S.py === 'none' ? 'not started' : S.py));
+  k.title = 'This page\'s Python, on the node: its cells share their variables. Click for Restart and Variables';
+}
+async function restart() {
+  try { await call(`/sessions/${SESSION}/python`, { method: 'DELETE' }); } catch (e) { toast(e.message, true); return; }
+  kernel('none'); S.vars = []; toast('Python restarted: its variables are gone'); if (S.tab === 'variables') detail();
+}
+
+// ------------------------------------------------------------------ outline and variables
+function outline(box) {
+  const heads = S.cells.flatMap(c => c.kind !== 'markdown' ? [] : [...c.src.matchAll(/^(#{1,3})\s+(.+)$/gm)].map(m => ({ c, level: m[1].length, text: m[2].replace(/[*_`]/g, '') })));
+  box.replaceChildren(...heads.length ? heads.map(x => line(null, { class: 'row h' + x.level, title: x.text, onclick: () => { select(x.c, true); x.c.el.scrollIntoView({ block: 'start', behavior: 'smooth' }); } }, h('span', { class: 'nm' }, x.text)))
+    : [h('div', { class: 'empty' }, 'Headings of text cells (# …) show here.')]);
+}
+let outlined = 0;
+const reoutline = (ms = 150) => { clearTimeout(outlined); outlined = setTimeout(() => { const s = R.sections.find(x => x.id === 'outline'); if (s?.box) outline(s.box); }, ms); };
+/** The page's Python variables, as its kernel holds them now (for the tab, and for completion). */
+async function readVars() { const v = await (await call(`/sessions/${SESSION}/python`)).json(); S.vars = v.variables || []; return v; }
+async function variables(box) {
+  box.replaceChildren(h('div', { class: 'muted' }, 'Reading…'));
+  let v;
+  try { v = await readVars(); } catch (e) { return [h('pre', { class: 'err' }, e.message)]; }
+  const head = h('div', { class: 'dh' }, icon('var'), h('div', {}, h('div', { class: 'dn' }, 'Variables'), h('div', { class: 'dk' }, v.busy ? 'a cell is running: they show when it is done' : v.running ? `${S.vars.length} in this page's Python` : 'no Python yet: a Python cell starts it')));
+  const acts = h('div', { class: 'acts2' }, act('restart', 'Restart', 'Stop this page\'s Python: its variables go (its temporary tables stay)', restart), act('refresh', 'Refresh', 'Read them again', () => detail()));
+  return [head, acts, ...S.vars.map(x => h('div', { class: 'var' }, h('div', { class: 'line1' }, h('span', { class: 'nm' }, x.name), h('span', { class: 'ty' }, x.type + (x.size ? ` · ${x.size}` : ''))), h('div', { class: 'look' }, x.look)))];
+}
+
+// ------------------------------------------------------------------ completion
+const FUNCS = 'abs avg ceil coalesce concat count date_bin date_part date_trunc extract floor greatest least length lower ltrim max min now nullif regexp_replace replace round row_number rank dense_rank lag lead first_value last_value split_part stddev strpos substr sum to_char to_date to_timestamp trim upper approx_distinct approx_percentile_cont median array_agg string_agg json_get json_get_str cosine_distance read_parquet read_csv read_json files file_read range generate_series'.split(' ');
+let cm = null; // (the completion open now: its cell, where the word starts, the choices, the one on)
+/** Names that complete what is typed before the caret: the tables and columns the lake has (those
+ * of the tables the cell names first), SQL's words and functions; in Python, the page's variables. */
+function complete(c, force) {
+  const ta = c.ta, at = ta.selectionStart, before = ta.value.slice(0, at), m = before.match(/[\w.$"]*$/), word = m[0].replace(/"/g, '');
+  if (!word && !force) return false;
+  const low = word.toLowerCase(), seen = new Set(), all = [];
+  const push = (text, ty, rank) => { if (!seen.has(text) && text.toLowerCase().startsWith(low) && text.toLowerCase() !== low) { seen.add(text); all.push({ text, ty, rank }); } };
+  if (c.kind === 'sql') {
+    const named = (S.objects || []).filter(t => new RegExp(`\\b${t.t.replace(/[^\w]/g, '')}\\b`, 'i').test(ta.value));
+    for (const t of named) for (const col of t.columns) push(ident(col.n), sqlType(col.d), 0);
+    for (const t of S.objects || []) push(t.q, t.o.kind, 1);
+    for (const t of S.objects || []) for (const col of t.columns) push(ident(col.n), sqlType(col.d), 2);
+    for (const f of FUNCS) push(f + '(', 'function', 3);
+    for (const k of SQL_KW) push(/[a-z]/.test(word) ? k.toLowerCase() : k, '', 4);
+  } else if (c.kind === 'python') {
+    for (const v of S.vars || []) push(v.name, v.type, 0);
+    for (const x of ['db.sql(', 'db.table(', 'db.tables()', 'db.insert(', 'pondra.col(', 'print(']) push(x, '', 1);
+    for (const k of PY_KW) push(k, '', 2);
+  } else return false;
+  all.sort((a, b) => a.rank - b.rank || a.text.length - b.text.length || a.text.localeCompare(b.text));
+  if (!all.length) { closeComplete(); return false; }
+  cm = { c, from: at - m[0].length, list: all.slice(0, 50), on: 0 };
+  drawComplete();
+  return true;
+}
+function drawComplete() {
+  const box = $('#complete'), { c, list, on, from } = cm;
+  box.replaceChildren(...list.map((x, i) => h('div', { class: i === on ? 'on' : null, role: 'option', onmousedown: e => { e.preventDefault(); cm.on = i; accept(); } }, h('span', {}, x.text), x.ty ? h('span', { class: 'ty' }, x.ty) : null)));
+  const ta = c.ta, style = getComputedStyle(ta), lineH = parseFloat(style.lineHeight), before = ta.value.slice(0, from), row = before.split('\n').length - 1, col = before.length - before.lastIndexOf('\n') - 1;
+  measurer ||= document.createElement('canvas').getContext('2d'); measurer.font = style.font;
+  const r = ta.getBoundingClientRect(), x = r.left + parseFloat(style.paddingLeft) + col * measurer.measureText('0').width - ta.scrollLeft, y = r.top + parseFloat(style.paddingTop) + (row + 1) * lineH;
+  box.hidden = false;
+  box.style.left = Math.min(innerWidth - box.offsetWidth - 8, x) + 'px';
+  box.style.top = (y + box.offsetHeight > innerHeight - 8 ? y - lineH - box.offsetHeight : y + 2) + 'px';
+  box.children[on]?.scrollIntoView({ block: 'nearest' });
+}
+function accept() {
+  const { c, from, list, on } = cm, ta = c.ta;
+  ta.setSelectionRange(from, ta.selectionStart);
+  insert(ta, list[on].text);
+  closeComplete();
+}
+function closeComplete() { cm = null; $('#complete').hidden = true; }
 
 // ------------------------------------------------------------------ tokens
 function askToken(why) {
@@ -1248,52 +1223,112 @@ $('#tokenDlg').addEventListener('close', () => {
   refresh();
 });
 
-// ------------------------------------------------------------------ the page
-$('#tokenBtn').onclick = () => askToken('The token this node was started with');
-$('#helpBtn').onclick = () => $('#helpDlg').showModal();
-$('#panelBtn').onclick = () => panel($('#detail').hidden);
-$('#save').onclick = save;
-$('#runall').onclick = runAll;
-$('#download').onclick = () => saveAs(JSON.stringify(notebook(), null, 1) + '\n', 'application/x-ipynb+json', (cleanName(S.name) || 'notebook') + '.ipynb');
-$('#uploadBtn').onclick = () => $('#upload').click();
-$('#upload').onchange = async e => {
-  const f = e.target.files[0];
-  e.target.value = '';
-  if (!f || (S.dirty && !confirm('Open another notebook? This one has changes that are not saved.'))) return;
-  try {
-    load(JSON.parse(await f.text()), cleanName(f.name) || 'uploaded', null);
-    changed();
-    toast(`Opened ${f.name}: Ctrl+S keeps it in the lake`);
-  } catch (err) { toast(`Could not open ${f.name}: ${err.message}`, true); }
-};
-$('#nbname').addEventListener('change', e => { S.name = cleanName(e.target.value) || 'untitled'; e.target.value = S.name; S.version = null; changed(); });
-$('#nbname').addEventListener('keydown', e => { if (e.key === 'Enter') e.target.blur(); });
-$('#newnb').onclick = () => { if (!S.dirty || confirm('Start a new notebook? This one has changes that are not saved.')) blank(); };
-$('#refresh').onclick = refresh;
-$('#newdb').onclick = async () => {
+// ------------------------------------------------------------------ what the core registers (as an extension would)
+function upload() {
+  const input = h('input', { type: 'file', accept: '.ipynb,application/json', hidden: true });
+  input.onchange = async () => {
+    const f = input.files[0];
+    input.remove();
+    if (!f || (S.dirty && !confirm('Open another notebook? This one has changes that are not saved.'))) return;
+    try {
+      load(JSON.parse(await f.text()), cleanName(f.name) || 'uploaded', null);
+      changed();
+      toast(`Opened ${f.name}: Ctrl+S keeps it in the lake`);
+    } catch (err) { toast(`Could not open ${f.name}: ${err.message}`, true); }
+  };
+  document.body.append(input); input.click();
+}
+const fresh = () => { if (!S.dirty || confirm('Start a new notebook? This one has changes that are not saved.')) blank(); };
+function clearOutputs() { for (const c of S.cells) { c.stopLive(); c.result = null; c.count = null; c.num.textContent = ''; c.out.replaceChildren(); c.status.textContent = ''; } changed(); }
+async function runSome(from, to) {
+  for (const c of S.cells.slice(from, to)) {
+    select(c, true);
+    const r = await c.run();
+    if (r?.kind === 'error') { toast('Stopped at a cell that failed', true); return; }
+  }
+}
+function core() {
+  register.cellKind({ id: 'sql', label: 'SQL', language: 'sql', placeholder: 'SELECT …', live: true, run: (text, signal) => run(text, signal) });
+  register.cellKind({ id: 'python', label: 'Python', language: 'python', placeholder: 'db.sql("SELECT …")      # runs on the node; cells share variables', run: async (text, signal) => { kernel('busy'); try { return await run(doBlock(text), signal); } finally { kernel('idle'); readVars().then(() => S.tab === 'variables' && !$('#panel').hidden && detail(), () => {}); } } });
+  register.cellKind({ id: 'markdown', label: 'Text', language: 'markdown', placeholder: 'Text, in Markdown' });
+  register.renderer({ id: 'error', order: 10, match: r => r.kind === 'error', render: r => h('pre', { class: 'err' }, r.message) });
+  register.renderer({ id: 'rows', order: 20, match: r => r.kind === 'rows', render: (r, cell) => grid(r, cell) });
+  register.renderer({ id: 'figures', order: 30, match: r => r.kind === 'done' && Array.isArray(r.value?.images), render: r => h('div', {}, r.value.images.map(b => h('img', { class: 'fig', alt: 'a figure the cell drew', src: 'data:image/png;base64,' + b }))) });
+  register.renderer({ id: 'text', order: 40, match: r => r.kind === 'text', render: r => h('pre', { class: 'said' }, r.text) });
+  register.renderer({ id: 'done', order: 90, match: r => r.kind === 'done', render: r => { const d = doneText(r.value) || (r.notices?.length ? '' : 'Done.'); return d && !(d === 'Done.' && r.notices?.length) ? h('div', { class: 'done' }, d) : null; } });
+  register.section({ id: 'tree', order: 10, title: () => MODE === 'lakes' ? 'Databases' : 'Database', render: () => tree(), tools: [
+    { icon: 'plus', title: 'New database', domId: 'newdb', hidden: () => MODE !== 'lakes', run: newDatabase },
+    { icon: 'refresh', title: 'Refresh', domId: 'refresh', run: () => refresh() }] });
+  register.section({ id: 'files', order: 20, title: 'Files', render: () => files() });
+  register.section({ id: 'outline', order: 30, title: 'Outline', render: box => outline(box) });
+  register.section({ id: 'notebooks', order: 40, title: 'Notebooks', render: () => notebooks(), tools: [{ icon: 'plus', title: 'New notebook', domId: 'newnb', run: fresh }] });
+  register.panel({ id: 'details', order: 10, title: 'Details', render: (box, p) => p?.type === 'object' ? objectDetail(p.t) : p?.type === 'file' ? fileDetail(p.f) : p?.type === 'result' ? resultDetail(p) : summary() });
+  register.panel({ id: 'variables', order: 20, title: 'Variables', render: box => variables(box) });
+  register.action({ id: 'runall', order: 10, label: 'Run all', primary: true, title: 'Run every cell, in order (Ctrl+Shift+Enter)', run: () => runSome(0) });
+  register.action({ id: 'save', order: 20, label: 'Save', title: 'Save to the lake, as a new version (Ctrl+S)', run: save });
+  register.action({ id: 'panel', order: 80, icon: 'panel', title: 'Details panel', pressed: () => !$('#panel').hidden, run: () => panel($('#panel').hidden) });
+  register.action({ id: 'new', order: 100, menu: true, icon: 'plus', title: 'New notebook', run: fresh });
+  register.action({ id: 'download', order: 110, menu: true, icon: 'down', title: 'Download as .ipynb', run: () => saveAs(JSON.stringify(notebook(), null, 1) + '\n', 'application/x-ipynb+json', (cleanName(S.name) || 'notebook') + '.ipynb') });
+  register.action({ id: 'upload', order: 120, menu: true, icon: 'up', title: 'Open an .ipynb…', run: upload });
+  register.action({ id: 'clear', order: 130, menu: true, sep: true, icon: 'clear', title: 'Clear every output', run: clearOutputs });
+  register.action({ id: 'restart', order: 140, menu: true, icon: 'restart', title: 'Restart Python', keys: '0 0', run: restart });
+  register.action({ id: 'token', order: 150, menu: true, sep: true, icon: 'key', title: 'Token…', run: () => askToken('The token this node was started with') });
+  register.action({ id: 'keys', order: 160, menu: true, icon: 'keyboard', title: 'Keys', keys: '?', run: () => $('#helpDlg').showModal() });
+  const cellKey = (keys, title, fn) => register.key({ keys, title, run: fn, group: 'On a cell (after Esc)' });
+  for (const [keys, title] of [['Ctrl Enter', 'Run it'], ['Shift Enter', 'Run it and go to the next cell'], ['Alt Enter', 'Run it and add a cell below'], ['Ctrl Shift Enter', 'Run every cell'], ['Tab', 'Complete a name (or indent)'], ['Ctrl Space', 'Complete a name'], ['Esc', 'Leave the cell: the keys below then work']]) register.key({ keys, title, group: 'In a cell' });
+  cellKey('Enter', 'Edit it', c => c.edit());
+  cellKey('↑ ↓', 'The cell above, below (or K J)');
+  cellKey('A B', 'Add a cell above, below');
+  cellKey('D D', 'Delete it (Z brings it back)');
+  cellKey('S P M', 'Make it SQL, Python, text');
+  cellKey('L', 'Live on or off: its answer again after each commit that changes it');
+  cellKey('O', 'Hide or show its output');
+  cellKey('0 0', 'Restart Python: its variables go');
+  register.key({ keys: 'Ctrl S', title: 'Save the notebook in the lake', group: 'Anywhere' });
+  register.key({ keys: '?', title: 'These keys', group: 'Anywhere' });
+}
+async function newDatabase() {
   const name = (prompt('A name for the new database (letters, digits and _):') || '').trim().toLowerCase();
   if (!name) return;
   try {
     await call('/databases', { method: 'POST', body: JSON.stringify({ name }), headers: { 'content-type': 'application/json' }, root: true });
     await use(name);
   } catch (e) { toast(e.message, true); }
+}
+
+// ------------------------------------------------------------------ the page
+const pondra = {
+  state: S, session: SESSION, mode: MODE,
+  api: { call, run, rows, base, sql: run },
+  ui: { h, icon, icons: ICONS, line, button: act, toast, menu, pick, detail, panel, refresh: () => refresh(), add: o => add(o), cells: () => S.cells.slice(),
+    notebook: () => notebook(), open: (nb, name) => { load(nb, cleanName(name || '') || 'untitled', null); changed(); } },
+  register, on, emit, configure,
 };
+window.pondra = pondra;
+export { pondra };
+
+$('#nbname').addEventListener('change', e => { S.name = cleanName(e.target.value) || 'untitled'; e.target.value = S.name; S.version = null; changed(); });
+$('#nbname').addEventListener('keydown', e => { if (e.key === 'Enter') e.target.blur(); });
+$('#kernel').onclick = e => menu(e.currentTarget, [{ label: 'Variables', icon: 'var', run: () => pick(S.pick, 'variables') }, { label: 'Restart Python', icon: 'restart', keys: '0 0', run: restart }]);
 document.querySelectorAll('[data-add]').forEach(b => b.onclick = () => add({ kind: b.dataset.add }).edit());
 addEventListener('beforeunload', e => { if (S.dirty && S.cells.some(c => c.src.trim())) { e.preventDefault(); e.returnValue = ''; } });
 addEventListener('pagehide', () => {
-  const token = store.get('pondra.token');
-  fetch(base() + '/sessions/' + SESSION, { method: 'DELETE', keepalive: true, headers: token ? { authorization: 'Bearer ' + token } : {} }).catch(() => {}); // (this page's temporary tables)
+  const token = T.token();
+  T.fetch(base() + '/sessions/' + SESSION, { method: 'DELETE', keepalive: true, headers: { ...T.headers(), ...(token ? { authorization: 'Bearer ' + token } : {}) } }).catch(() => {}); // (this page's temporary tables, and its Python)
 });
 
-(async function start() {
+async function start() {
   const hash = new URLSearchParams(location.hash.slice(1));
-  if (MODE === 'server') { $('#treeTitle').textContent = 'Databases'; $('#newdb').hidden = false; S.db = hash.get('db'); }
+  if (MODE === 'lakes') S.db = hash.get('db');
+  core();
+  drawActions(); drawTabs(); drawRail(); drawKeys(); kernel();
   blank();
-  if (MODE === 'server') await tree();
-  await stats();
-  panel(store.get('pondra.panel') ? store.get('pondra.panel') === 'open' : innerWidth >= 1180);
-  if (MODE !== 'server') await tree();
-  await Promise.all([files(), notebooks()]);
+  $('#panel').hidden = !(store.get('pondra.panel') ? store.get('pondra.panel') === 'open' : innerWidth >= 1180);
+  // (extensions, loaded after this module, register meanwhile: drawn with the core's from here on)
+  if (MODE === 'lakes') { await drawSide(); await stats(); } // (the tree picks the database /stats is asked of)
+  else { await stats(); drawSide(); }                        // (the tree puts the node's own lake first)
+  started = true;
+  drawActions(); drawTabs(); drawRail(); drawKeys(); drawSide();
   const wanted = hash.get('notebook');
   if (wanted) {
     const vs = await rows(`SELECT path FROM files('notebooks/${wanted.replace(/'/g, "''")}/') ORDER BY path DESC LIMIT 1`).catch(() => []);
@@ -1301,7 +1336,6 @@ addEventListener('pagehide', () => {
     if (v) await openSaved(wanted, v[1]);
   }
   setInterval(() => { if (document.visibilityState === 'visible') stats(); }, 15000);
-})();
-</script>
-</body>
-</html>
+  emit('start', pondra);
+}
+start();

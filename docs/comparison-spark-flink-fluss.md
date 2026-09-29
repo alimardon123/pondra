@@ -425,6 +425,66 @@ Round 22 took the other road to PySpark first: `pondra.spark`, PySpark's names i
 SQL (no Spark Connect server in the binary). It covers what most jobs use and says what it
 doesn't; Spark Connect stays the answer if Scala and Java jobs need to move.
 
+### GizmoData and Duckle, the owner's finds (2026-09-29)
+
+Both build on DuckDB. Neither was run here. What follows is from their sites and repositories as
+read on 2026-09-29, and the benchmark numbers are the vendor's own.
+
+**GizmoData**
+
+[GizmoData](https://gizmodata.com/) positions itself closest to Pondra: "a lightweight, cheap
+Snowflake/Databricks".
+
+- **GizmoSQL** is DuckDB (or SQLite) served over Arrow Flight SQL, as a static C++ binary.
+  - The core is Apache-2.0, with TLS and JWT.
+  - OIDC sign-in, audit, per-catalog permissions and statement queuing are a paid tier: $300 per
+    vCPU a year, $1,500 minimum.
+  - It publishes TPC-H at 1 TB as a price per run ($0.17 against Snowflake's $2.76). The site
+    and the repository give different times for that run (80 s and 161 s), and neither gives
+    the full method.
+- **GizmoData Cloud** is the managed version:
+  - a SQL editor and Python notebooks;
+  - DuckLake catalogs;
+  - from $29 a month;
+  - also deployed in the customer's own cloud with Terraform and Helm.
+- **GizmoEdge** is a coordinator with DuckDB workers. Its licence isn't stated.
+
+**Duckle**
+
+[Duckle](https://github.com/slothflowlabs/duckle) (MIT OR Apache-2.0, public beta) is an ETL
+studio, not an engine.
+
+- A desktop app: Tauri with React.
+- A visual pipeline canvas that compiles to SQL and runs through the DuckDB command-line program.
+- Workspaces kept as plain files.
+- An MCP server (`run_pipeline`, `read_run_logs`).
+- It is single-machine by design.
+- Its web panel ships without authentication, and two recent releases fixed seven security
+  advisories.
+
+| | GizmoSQL / Cloud | Duckle | Pondra |
+|---|---|---|---|
+| Engine | DuckDB (C++), one process; GizmoEdge: DuckDB workers under a coordinator | DuckDB's command-line program | DataFusion (Rust), SPMD nodes, any node coordinates |
+| Catalog | DuckDB files, DuckLake (needs a database) | the pipeline's files | SlateDB in the bucket; Delta and Iceberg published and taken in |
+| Streaming | none | CDC components, batch runs | the log, Kafka's protocol in and out, materialized views, windows, live queries |
+| Doors | Flight SQL, JDBC, ADBC, dbt, MCP | a desktop app, a runner | Postgres, Flight SQL, Kafka, HTTP, Python, JavaScript, MCP, Iceberg REST |
+| Licence | Apache-2.0 core, paid enterprise tier | MIT OR Apache-2.0 | MIT OR Apache-2.0 |
+
+What Pondra takes from them:
+
+- **A price per benchmark run as the headline,** with the full, reproducible method GizmoData's
+  lacks.
+- **The open-core line:** the engine free; sign-in, audit and operations paid, if a company comes.
+- **Bring-your-own-cloud** by Terraform and Helm.
+- **Plain-file workspaces and run logs** (ADR-033).
+- **A test that GizmoSQL's Flight SQL, JDBC and ADBC drivers and dbt adapter work against
+  Pondra's Flight SQL port.**
+- **Duckle's security record as a warning:** a web console needs authentication and escaping
+  before anyone exposes it.
+
+Neither is a dependency. Each would add a second, C++ engine, and GizmoData's paid parts are
+closed.
+
 ### Functions, procedures and tasks (rounds 22 and 24)
 
 | | DuckDB | Snowflake | Databricks | Postgres | Pondra |

@@ -50,8 +50,9 @@ PONDRA_SECRET_KEY="$SECRET" pondra serve lake
 | `PONDRA_FILES_CACHE_MB` | `512` | the memory cache for files read from outside the lake, such as attached Delta and Iceberg tables and URLs |
 | `PONDRA_FUNCTION_CACHE_MB` | `256` | the memory for answers a function keeps with `cache = '…'` |
 | `PONDRA_TEMP_MB` | `1024` | the memory all temporary tables on a node may hold together. A change past it is refused |
+| `PONDRA_CONSOLE_EXTENSIONS` | none | scripts the console loads after its own, separated as `PATH` is: an [extension](/pondra/start/console/#extend-it) adds sections, tabs, views of answers and actions. Served at `/console/ext/{n}.js` |
 | `PONDRA_SESSION_IDLE_SECS` | `3600` | a session idle this long ends. Its temporary tables go, and so does its [Python](/pondra/guides/functions-and-procedures/#cells-that-share-variables), with the variables its `DO LANGUAGE python` blocks made |
-| `PONDRA_DATABASE_IDLE_SECS` | `600` | serving a [folder of lakes](/pondra/guides/server/): a database's node that nothing has used for this long, and that has nothing left to tier, stops. The next query starts it again |
+| `PONDRA_DATABASE_IDLE_SECS` | `600` | serving a [folder of lakes](/pondra/guides/server/): a database's node with no connection open and no request on its way, that nothing has used for this long, and that has nothing left to tier, stops. The next query starts it again |
 | `PONDRA_CODEC` | `lz4` | how data files are compressed: `lz4` (fastest to read), `zstd` (smaller files), `snappy` or `none` |
 
 ## Queries across nodes

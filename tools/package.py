@@ -38,12 +38,13 @@ def wheel(binary, platform, out):
     v, tags = version(), PLATFORMS[platform][0]
     name = f"pondra-{v}-py3-none-{tags}.whl"
     exe = "pondra.exe" if platform.startswith("windows") else "pondra"
-    readme = open(os.path.join(ROOT, "README.md"), encoding="utf-8").read().split("\n## ")[0]
+    readme = open(os.path.join(ROOT, "python", "README.md"), encoding="utf-8").read()  # (PyPI's page: short, its own)
     meta = "\n".join([
         "Metadata-Version: 2.4", "Name: pondra", f"Version: {v}",
         "Summary: Pondra, a streamhouse in one binary: the binary, and a Python client", "Author: Alimardon",
         "License-Expression: MIT OR Apache-2.0", "License-File: LICENSE-APACHE", "License-File: LICENSE-MIT",
-        "Project-URL: Repository, https://github.com/alimardon123/pondra",
+        "Project-URL: Documentation, https://alimardon123.github.io/pondra/", "Project-URL: Repository, https://github.com/alimardon123/pondra",
+        "Keywords: lakehouse,streaming,sql,dataframe,iceberg,delta,kafka,datafusion",
         "Requires-Python: >=3.9", "Provides-Extra: arrow", 'Requires-Dist: pyarrow; extra == "arrow"',
         "Description-Content-Type: text/markdown", "", readme])
     wheel_file = "\n".join(["Wheel-Version: 1.0", "Generator: pondra tools/package.py", "Root-Is-Purelib: false"] + [f"Tag: py3-none-{t}" for t in tags.split(".")]) + "\n"

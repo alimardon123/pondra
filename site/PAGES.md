@@ -35,7 +35,7 @@ leave them out.
 | `notebooks.mdx` | Jupyter with `pondra.local()`, `%load_ext pondra` and `%%sql`, frames' display, pandas/Polars interop | ADR-023, the notebook |
 | `security.mdx` | read/write/admin tokens on every door, `--python` rules, secrets (sealed with `PONDRA_SECRET_KEY`), what's next (grants, TLS: round 29) | ADR-010, ADR-026, ADR-027 |
 | `dbt-and-bi.mdx` ★ | dbt and BI tools | |
-| `server.mdx` ★ | `pondra server` | |
+| `server.mdx` ★ | `pondra serve` on a folder of lakes (`--lakes`), local or in a bucket | ADR-030, ADR-032 |
 
 ## Reference (`reference/`)
 

@@ -22,7 +22,7 @@ console at `http://host:8080/` lists them all.
 `pondra serve data` looks at the folder to decide what it is. If `data` holds a lake (it has a
 `catalog/` folder), it serves that one lake. If its subfolders hold lakes, it serves each as a
 database, as here. If `data` is new or empty, it makes a lake there. For a service, say which you
-mean: `pondra serve --databases /srv/data` serves exactly this folder of lakes and guesses nothing.
+mean: `pondra serve --lakes /srv/data` serves exactly this folder of lakes and guesses nothing.
 [The command line](/pondra/reference/cli/#what-path-holds) has the rules.
 
 ## Try it
@@ -58,9 +58,10 @@ or a request names it. The process passes that database's traffic through to its
 - Postgres connections by the database in their startup message;
 - HTTP requests under `/db/{name}/…`, which is that database's whole API.
 
-A database that nobody has used for `PONDRA_DATABASE_IDLE_SECS` (600 seconds) and that has nothing
-left to tier stops. The next query starts it again: on a local disk here the first answer took
-about 70 ms, and the ones after it about 1 ms. So a database nobody uses costs nothing, and each one
+A database stops once no connection to it is open, no request is on its way, nothing has come for
+`PONDRA_DATABASE_IDLE_SECS` (600 seconds), and it has nothing left to tier. A statement that runs
+longer than that, or a connection a BI tool keeps open, keeps it running. The next query starts it
+again: on a local disk here the first answer took about 70 ms, and the ones after it about 1 ms. So a database nobody uses costs nothing, and each one
 keeps everything a node does: leading its cluster, tiering, views, tasks and recovery after a
 crash.
 
@@ -149,6 +150,22 @@ pondra serve /shared/data/sales --addr 10.0.0.6:8080
 For a lake in a bucket, run `pondra serve s3://bucket/sales` on as many machines as you like;
 [Clusters](/pondra/guides/clusters/) explains how the nodes share the work.
 
+## A folder in a bucket
+
+The folder of lakes can be a bucket's prefix, as a lake can:
+
+```bash norun
+pondra serve --lakes s3://bucket/data --addr 0.0.0.0:8080 --pg 0.0.0.0:5432 --admin-token "$TOKEN"
+```
+
+Each lake under the prefix (`s3://bucket/data/sales`, …) is a database, `CREATE DATABASE hr` makes
+`s3://bucket/data/hr`, and `DROP DATABASE` deletes that prefix's objects. The server lists the
+prefix to find its databases, a few requests each time it is asked (`/databases`, the console, a
+connection that names a database it hasn't started). On R2 or S3 that takes a moment, so name
+the folder with `--lakes` rather than have it looked at, and keep the prefix for lakes. The server
+and each database's node read the bucket's credentials from the environment, as a node of
+[a lake in a bucket](/pondra/guides/object-storage/) does.
+
 ## Options
 
 The options of `pondra serve` that matter for a folder of lakes.
@@ -157,7 +174,7 @@ The options of `pondra serve` that matter for a folder of lakes.
 | Option | What it does |
 |---|---|
 | `PATH` | The folder of lakes (default the current folder). Each subfolder that holds a lake is a database. |
-| `--databases FOLDER` | Exactly this folder of lakes, for scripts and services. Nothing is guessed |
+| `--lakes FOLDER` | Exactly this folder of lakes, for scripts and services. Nothing is guessed |
 | `--addr` | Where HTTP clients, the console and other nodes reach the server (default `127.0.0.1:8080`) |
 | `--pg` | Speak the Postgres protocol here, such as `0.0.0.0:5432` |
 | `--default NAME` | The database a client that names none gets (default `lake`, else the only one) |
@@ -176,8 +193,6 @@ node, not for all of them together.
   `--attach-found` too, each with a message that names the flag. Routing them to many databases
   (Kafka by topic, such as `sales.orders`, and Flight by the database the client names) is planned
   for the next round. Serve such a lake on its own: `pondra serve data/sales --flight 0.0.0.0:8815`.
-- **A folder in a bucket.** The folder of lakes is on this machine's disk. For lakes in a bucket,
-  start a `pondra serve` per lake.
 - **Per-database settings and access.** `ALTER DATABASE sales SET …` and grants per database are
   planned with the security round. Today the tokens are the same for every database.
 - **TLS.** Neither port speaks TLS yet. Put the server behind a proxy that does, or keep it on a

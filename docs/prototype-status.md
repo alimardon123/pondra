@@ -1,6 +1,6 @@
 # Prototype status: Pondra, a streamhouse in one binary
 
-**Date:** 2026-09-29 (round 26) · **Plan:** ADR-002 to ADR-031, `roadmap.md` · **Code:** `pondra.zip` / `pondra.bundle` (≈27,800 lines of Rust, plus Python and JavaScript clients, a documentation website, packaging, and test and benchmark tools)
+**Date:** 2026-09-29 (round 26 and its continuation) · **Plan:** ADR-002 to ADR-033, `roadmap.md` · **Code:** `pondra.zip` / `pondra.bundle` (≈27,800 lines of Rust, plus Python and JavaScript clients, a documentation website, packaging, and test and benchmark tools)
 **Name:** the prototype formerly called `lh` is now **Pondra**. The name is free on crates.io, PyPI and npm. A small personal-finance app uses it (pondra.app), a different category; run a trademark search before a public launch.
 
 ## Where it stands
@@ -14,6 +14,63 @@ One Rust binary replaces the Kafka + Flink + Spark + metastore + ZooKeeper stack
 - upsert and merge tables.
 
 Start more copies on the same bucket to scale out. The only state is object storage. There's no JVM, no database server and no coordination service.
+
+**Round 26's continuation** (ADR-032), before the tag, took the owner's asks after seeing the
+round:
+
+1. **Files by name:** `CREATE EXTERNAL TABLE` is a stored view of files (CSV, Parquet, JSON; a
+   folder's partition keys declared). `INSERT` into a view of a folder writes a new file there.
+   `to_timestamp` answers a zoneless `TIMESTAMP`, as DataFusion's does. With the test data
+   DataFusion's files read now in place, **DataFusion's sqllogictest went from 16,090 to 18,462 of
+   24,783 records (64.9% to 74.5%)**. No file lost a record. The most gained:
+   - `timestamps` (561 to 764 of 831);
+   - `sort_pushdown` (124 to 326);
+   - `aggregate` (1,104 to 1,257);
+   - `push_down_filter_parquet` (2 to 133);
+   - `window` (292 to 401).
+2. **A page's Python cells share a worker**, as a notebook's kernel:
+   - variables, imports and frames carry from cell to cell;
+   - figures (matplotlib, seaborn, Pillow) come back as pictures;
+   - `GET`/`DELETE /sessions/{id}/python` list the variables and restart it.
+3. **One serve command.**
+   - `pondra serve PATH` serves a lake, or a folder whose lakes are databases.
+   - `--lake` and `--lakes` say exactly which, for services, and refuse the other.
+   - `pondra server` is gone (never released).
+   - The folder can be a bucket prefix (`CREATE`/`DROP DATABASE` there too).
+   - A database's node stays up while a connection is open or a request is in flight (a 14 s
+     `CREATE DATABASE` on simulated R2 found this).
+4. **The brand in one place:** `brand/mark.svg` and `brand/colors.css`, used by the console and the
+   docs site, and `tools/brand_check.py` fails on any copy.
+5. **The console, rebuilt as a core to build on** (`src/console/`: 115 KB, 35 KB compressed, no
+   framework).
+   - **Everything it shows is registered** through `window.pondra`: sections, panel tabs, kinds
+     of cell, views of answers, actions, a rail, keys, events, and how it reaches the node. The
+     core's own parts go through it too. Extensions load from `PONDRA_CONSOLE_EXTENSIONS`, and
+     `examples/console-extension.js` shows all four kinds.
+   - **Left side:**
+     - the tree, with an icon for each kind and a glyph for each column's type;
+     - the lake's files;
+     - an outline;
+     - notebooks.
+   - **Details panel:**
+     - a table's facts, a view's definition, a file;
+     - profiles over the whole table;
+     - an answer's columns;
+     - the Python variables, with Restart.
+   - **Answers:** a grid that draws only the rows in sight.
+   - **Jupyter's working set:**
+     - Tab completion (tables, the named tables' columns first, functions, Python's variables);
+     - run above and below;
+     - hide or clear an output;
+     - a kernel badge.
+6. **Tests** (`logs/round26/`):
+   - `harness.py all` (403 checks, with `external` and the server's new ones),
+     `console_check.py` (30), `docs_check.py` (465 examples on 48 pages), `frames_check.py`,
+     failover, race, `brand_check.py`, and sqllogictest, locally;
+   - `server`, `external`, `procedures` and `found` on simulated R2;
+   - `server` and `external` on real R2.
+7. **Proposed, not built:** the server's catalog (ADR-032 §9), a workspace of files, runs and
+   parameters (ADR-033). **Decided:** backward compatibility from 1.0 on, not before.
 
 **Round 26 made Pondra something people can find their way around** (ADR-030): a documentation
 website, a console in the browser, a server of databases, and the Postgres catalog that dbt and BI

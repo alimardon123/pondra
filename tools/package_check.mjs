@@ -1,9 +1,14 @@
 // What `npm install pondra` gives, tried: the binary for this platform is found, a node starts on
 // a new lake, and a table, an exactly-once append, a view, a query, parameters and a procedure work.
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, readFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { local } from "pondra";
+
+// The package's page on npm: its own short README (install, an example, what it does, the docs).
+const readme = readFileSync(join(dirname(createRequire(import.meta.url).resolve("pondra")), "README.md"), "utf8");
+if (!readme.includes("npm install pondra") || !readme.includes("alimardon123.github.io/pondra")) throw new Error("the package's README isn't its page");
 
 const db = await local(join(mkdtempSync(join(tmpdir(), "pondra-check-")), "lake"));
 try {

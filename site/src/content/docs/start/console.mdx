@@ -1,6 +1,6 @@
 ---
 title: The console
-description: A web page for SQL, Python and notes that every Pondra node serves at /. The lake on the left, cells in the middle, details and profiles on the right, notebooks saved in the lake.
+description: A web page for SQL, Python and notes that every Pondra node serves at /. The lake on the left, cells in the middle, details, profiles and variables on the right, notebooks saved in the lake, and room for extensions.
 sidebar:
   order: 5
 setup: |
@@ -12,9 +12,9 @@ import { Aside } from '@astrojs/starlight/components';
 
 Every Pondra node serves a console at `/`. Open the node's address in a browser and you get the
 lake's tables and files on the left, notebook cells in the middle (SQL, Python and text), and on the
-right the details of whatever you pick. There is nothing
-to install. The page is part of the `pondra` binary, it works offline, and it sends requests only
-to the node that served it.
+right the details of whatever you pick and your Python variables. There is nothing to install. The
+page is part of the `pondra` binary (about 115 KB, 35 KB compressed), it works offline, and it sends requests only to
+the node that served it.
 
 ![The console: the lake's tables and files on the left; a text cell, a SQL cell with its answer, and a Python cell with what it printed and the rows it returned; on the right, a table's details and each column's profile.](../../../assets/console.png)
 
@@ -28,16 +28,19 @@ pondra serve lake        # then open http://localhost:8080
 
 - **The shell** starts a node too. Its first line says where: `Pondra 0.26.0 on lake, also at
   http://127.0.0.1:37957`. Open that address while the shell runs.
-- **`pondra serve data`** on a folder of lakes serves each as a database, and its console lists
-  them all. See [Many databases](/pondra/guides/server/).
+- **`pondra serve --lakes data`** serves each lake in a folder as a database, and its console
+  lists them all. See [Many databases](/pondra/guides/server/).
 - **On another machine**, start the node with tokens (`--admin-token`, see
   [Security](/pondra/guides/security/)). The console asks for a token the first time, and your browser
   keeps it.
 
 ## SQL cells
 
-Type SQL and press **Ctrl+Enter** (**⌘+Enter** on a Mac). The answer shows below the cell: the rows,
-each column's type, how many rows there are, and how long it took.
+Type SQL and press **Ctrl+Enter** (**⌘+Enter** on a Mac), or click the cell's **Run**. The answer
+shows below the cell: the rows, each column's type, how many rows there are, and how long it took.
+**Tab** completes a name: a table's, a column's (the columns of the tables the cell names come
+first), a function's or a SQL word. When several fit, it lists them; **↑** **↓** and **Enter**
+pick one.
 
 ```sql
 SELECT item, count(*) AS sales, sum(amount) AS total
@@ -131,10 +134,44 @@ $$;
   do: see [Functions and procedures](/pondra/guides/functions-and-procedures/#cells-that-share-variables).
 - A Python error names its line in the cell: `ZeroDivisionError: division by zero, line 2: 1 / 0`.
 
+### Figures
+
+A figure shows under the cell as a picture: a matplotlib figure (or seaborn's) that the cell ends
+with, or draws with `pyplot`, and a Pillow image.
+
+```python cell norun
+import matplotlib.pyplot as plt
+by_day = db.sql("SELECT day, sum(amount) AS total FROM sales GROUP BY day ORDER BY day").to_pandas()
+fig, ax = plt.subplots(figsize=(7, 2.5))
+ax.plot(by_day["day"], by_day["total"])
+fig
+```
+
+The node needs matplotlib (or Pillow) in its Python for this: `pip install matplotlib`.
+
+### Variables
+
+The **Variables** tab of the panel on the right lists what this page's Python holds: each name,
+its type, its size (a frame's rows and columns, a list's length) and a short look at it (a
+frame's columns). **Tab** in a Python cell completes these names.
+
+The **Python** badge at the top says whether a cell is running. Click it, or press **0 0** on a cell
+after **Esc**, to **restart** Python: its variables go, and the next cell starts afresh (temporary
+tables stay, since they are SQL's).
+
 ## Text cells
 
 Text cells hold Markdown: headings, lists, **bold**, *italics*, `code`, links and code blocks. Press
-**Shift+Enter** to show the text, and double-click it to edit.
+**Shift+Enter** to show the text, and double-click it to edit. Their headings make the **Outline**
+on the left: click one to go to its cell.
+
+## A cell's menu
+
+The **⋯** at a cell's top right (it shows when you point at the cell) runs the cells above it, or
+this one and those below; hides its output (**O**: its code stays, and a click on the output
+brings it back); clears its output; and deletes it. The **⋯** at the top right of the page
+starts a new notebook, downloads or opens an `.ipynb`, clears every output, restarts Python, sets
+the token and lists the keys.
 
 ## Live answers
 
@@ -184,7 +221,9 @@ The console follows Jupyter's keys. In a cell:
 | **Shift+Enter** | Run it, then go to the next cell (a new one at the end) |
 | **Alt+Enter** | Run it, then add a cell below |
 | **Ctrl+Shift+Enter** | Run every cell, in order (it stops at one that fails) |
-| **Tab**, **Shift+Tab** | Indent, and back |
+| **Tab** | Complete a name (after a letter), or indent |
+| **Shift+Tab** | Indent back |
+| **Ctrl+Space** | List the names that fit here |
 | **Esc** | Leave the cell, for the keys below |
 
 After **Esc**, on the selected cell:
@@ -197,6 +236,8 @@ After **Esc**, on the selected cell:
 | **D D** | Delete it. **Z** brings it back |
 | **S**, **P**, **M** | Make it SQL, Python or text |
 | **L** | Turn Live on or off |
+| **O** | Hide its output, or show it again |
+| **0 0** | Restart Python |
 | **?** | Show these keys |
 
 **Ctrl+S** saves from anywhere on the page.
@@ -210,7 +251,47 @@ other: see [Clusters](/pondra/guides/clusters/).
 
 The page follows your system's light or dark setting.
 
-<Aside type="caution" title="Not in the console yet">
-- Completion of table and column names as you type.
-- Charts. For now, a Python cell can return rows, and the CSV button hands them to a chart tool.
-</Aside>
+## Extend it
+
+The console is built to be added to: its own sections, tabs, kinds of cell and actions are
+registered through the same small API an extension uses, `window.pondra`. Give a node the scripts
+in `PONDRA_CONSOLE_EXTENSIONS` (separated as `PATH` is), and the page loads them after its own:
+
+```bash norun
+PONDRA_CONSOLE_EXTENSIONS=./history.js pondra serve lake
+```
+
+```js norun
+const { register, on, ui, api } = window.pondra;
+
+// A section on the left.
+register.section({ id: 'history', title: 'History', render: box => box.append(ui.h('div', {}, '…')) });
+// A tab of the panel on the right: what was picked on the left.
+register.panel({ id: 'sample', title: 'Sample', render: async (box, picked) =>
+  picked?.type === 'object' ? (await api.rows(`SELECT * FROM ${picked.t.q} LIMIT 5`)).map(r => ui.h('pre', {}, JSON.stringify(r))) : [] });
+// A view of an answer: the first one that matches draws it.
+register.renderer({ id: 'figure', order: 15, match: r => r.kind === 'rows' && r.rows.length === 1, render: r => ui.h('b', {}, String(r.rows[0][0])) });
+// An action: a button at the top, or an item of its ⋯ menu.
+register.action({ id: 'share', menu: true, icon: 'copy', title: 'Share', run: () => ui.toast('Shared') });
+// Events: 'start', 'run', 'ran', 'pick', 'refresh', 'changed'.
+on('ran', (cell, answer) => console.log(cell.src, answer.kind));
+```
+
+| `register.` | Adds |
+|---|---|
+| `section({ id, title, render(box), tools, order })` | a section of the left side |
+| `panel({ id, title, render(box, picked), order })` | a tab of the panel on the right |
+| `cellKind({ id, label, language, placeholder, run(text, signal) })` | a kind of cell |
+| `renderer({ id, match(answer), render(answer, cell), order })` | a view of an answer |
+| `action({ id, label or icon, title, run(), primary, menu, order })` | a button at the top, or a ⋯ menu item |
+| `nav({ id, label, icon, run() })` | a place in a rail at the far left (it shows once one is added) |
+| `key({ keys, title, run(cell), group })` | a key on a cell, listed under **?** |
+
+`pondra.configure({ fetch, token, headers })` changes how the page reaches the node, for a
+gateway or a sign-in of your own. `pondra.api` runs SQL (`run`, `rows`, `call`), and `pondra.ui`
+holds the page's own pieces (`h`, `icon`, `line`, `button`, `toast`, `menu`, `pick`, `add`), so an
+extension looks like the rest of the page. `pondra.ui.notebook()` gives the notebook as `.ipynb`
+JSON and `pondra.ui.open(nb, name)` opens one, for an extension that keeps notebooks elsewhere. A whole example is in the repository:
+[`examples/console-extension.js`](https://github.com/alimardon123/pondra/blob/main/examples/console-extension.js).
+The console's files are at `/console/console.js` and `/console/console.css`, and an extension at
+`/console/ext/0.js`, `1.js`, …; the browser keeps them until they change.

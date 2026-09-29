@@ -2,10 +2,12 @@
 name = "pondra"
 version = "0.26.0"
 description = "Pondra, a streamhouse in one binary: the binary, and a Python client (SQL into pandas/Polars/Arrow, exactly-once appends, change feeds)"
+readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT OR Apache-2.0"
 authors = [{ name = "Alimardon" }]
-urls = { Repository = "https://github.com/alimardon123/pondra" }
+urls = { Documentation = "https://alimardon123.github.io/pondra/", Repository = "https://github.com/alimardon123/pondra" }
+keywords = ["lakehouse", "streaming", "sql", "dataframe", "iceberg", "delta", "kafka", "datafusion"]
 dependencies = []
 
 [project.optional-dependencies]

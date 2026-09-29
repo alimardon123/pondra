@@ -97,10 +97,10 @@ For scripts and services (systemd, Docker), name what you mean, and nothing is g
 
 ```bash norun
 pondra serve --lake /srv/lake
-pondra serve --databases /srv/data
+pondra serve --lakes /srv/data
 ```
 
-`--lake` serves exactly this lake, and makes it if it is missing (`--dir` is the same, for older scripts). `--databases` serves exactly this
+`--lake` serves exactly this lake, and makes it if it is missing (`--dir` is the same, for older scripts). `--lakes` serves exactly this
 folder of lakes. Use these two in anything that starts a node unattended.
 
 ### Where and how
@@ -109,7 +109,7 @@ folder of lakes. Use these two in anything that starts a node unattended.
 |---|---|---|
 | `PATH` | the current folder | the lake (a folder, or `s3://bucket/prefix`, its credentials and endpoint from the `AWS_*` variables), or a folder of lakes |
 | `--lake LAKE` | none | exactly this lake, made if it is missing, and nothing guessed. For scripts and services (`--dir` is the same) |
-| `--databases FOLDER` | none | exactly this folder of lakes, each a database. For scripts and services |
+| `--lakes FOLDER` | none | exactly this folder of lakes, each a database. For scripts and services. `--lake` on a folder of lakes, or `--lakes` on a lake, is refused and says which you meant |
 | `--default NAME` | `lake`, else the only one | serving a folder of lakes: the database a client that names none gets (HTTP without `/db/`, Postgres without a database) |
 | `--addr ADDR` | `127.0.0.1:8080` | the address the HTTP API and [the console](/pondra/start/console/) listen on, and other nodes reach this one at |
 | `--advertise ADDR` | `--addr` | the address other nodes reach this one at, when it isn't `--addr`. A database's node, behind the process that serves its folder, is `host:port/db/name` |

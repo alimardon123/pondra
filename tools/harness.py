@@ -269,7 +269,7 @@ def external():
     outside = [_raises_text(lambda: anyone(f"SELECT * FROM read_csv('{area}../catalog/x.csv')")), _raises_text(lambda: anyone(f"SELECT * FROM read_csv('{area[:-len('files/')]}other.csv')"))]
     kinds = {o["name"]: o["kind"] for o in call(A.port, "GET", "/objects")["objects"]}
     checks["the lake's own files read as a table by any reader, and nothing else of its folder; /objects says each object's kind"] = mine == [{"a": 1, "b": "x"}] \
-        and all("program that started the node" in e for e in outside) and kinds.get("ev") == "files" and kinds.get("v") == "view"
+        and all(("program that started the node" if not A.s3 else "no secret covers") in e for e in outside) and kinds.get("ev") == "files" and kinds.get("v") == "view"
     node.kill()
     shutil.rmtree(here, ignore_errors=True)
     ok = all(checks.values())
@@ -4166,11 +4166,13 @@ def renames():
 
 
 def server():
-    """`pondra serve <folder>` (ADR-030, ADR-032): three lakes in a folder, served as databases —
-    found as such, or named so (`--databases`). psql and HTTP reach each by name, and queries join
+    """`pondra serve <folder>` (ADR-030, ADR-032): three lakes in a folder (with --s3, under a bucket's
+    prefix), served as databases —
+    found as such, or named so (`--lakes`). psql and HTTP reach each by name, and queries join
     across them; the console is at `/`; CREATE DATABASE makes one and DROP DATABASE drops one; a
     database idle for PONDRA_DATABASE_IDLE_SECS stops, and starts again when next used; each
-    database's node gets `pondra serve`'s options; another node joins a database's cluster through
+    database's node gets `pondra serve`'s options; a connection open (or a request in flight)
+    keeps its database's node running; another node joins a database's cluster through
     the server; the server killed and started again serves the same databases; `--flight` is
     refused, and a folder that holds other things than lakes isn't made one."""
     import psycopg
@@ -4205,9 +4207,15 @@ def server():
     missing = _raises_text(lambda: pq("nope", "SELECT 1"))
     pq("sales", "DROP DATABASE crm")
     checks["CREATE DATABASE makes one, DROP DATABASE drops it, folder and all; an unknown one is said so"] = "hr" in running() and "crm" not in running() \
-        and not os.path.exists(os.path.join(folder, "crm")) and 'database "nope" does not exist' in missing
+        and not lake_objects(folder, "crm/") and 'database "nope" does not exist' in missing
     idle = until(lambda: sum(running().values()), 0, 30)
     checks["idle databases stop, and start again when used"] = idle == 0 and pq("hr", "SELECT count(*) FROM people") == [(1,)]
+    with psycopg.connect(dsn("hr"), autocommit=True) as held:  # (open past the idle time: its node stays)
+        held.execute("SELECT 1")
+        time.sleep(7)
+        kept = held.execute("SELECT count(*) FROM people").fetchall() == [(1,)] and running().get("hr") is True
+    let_go = until(lambda: running().get("hr"), False, 30)
+    checks["a database with a connection open isn't stopped, however long it is idle; closed, it stops"] = kept and let_go is False
     # Another node joins a database's cluster through the server (its node advertises host:port/db/sales).
     pq("sales", "SELECT 1")
     other = Node(os.path.join(folder, "sales"), port + 2).start()
@@ -4218,7 +4226,7 @@ def server():
     srv.send_signal(signal.SIGKILL)
     srv.wait()
     until(lambda: _try(lambda: sql(port, "SELECT 1")) is None, True, 10)
-    srv = start(["--databases", folder])  # (named so, nothing guessed: for services)
+    srv = start(["--lakes", folder])  # (named so, nothing guessed: for services)
     checks["killed and started again, the server serves the same databases"] = sorted(running()) == ["hr", "lake", "sales"] and pq("sales", "SELECT count(*) FROM orders") == [(3,)]
     refused = subprocess.run([BIN, "serve", folder, "--addr", f"127.0.0.1:{port + 5}", "--flight", "127.0.0.1:1"], capture_output=True, text=True, timeout=30)
     checks["--flight is refused by name (a Flight port is one lake's)"] = refused.returncode != 0 and "one lake" in refused.stderr
@@ -4226,6 +4234,10 @@ def server():
     open(os.path.join(other, "notes.txt"), "w").write("mine")
     kept = subprocess.run([BIN, "serve", other, "--addr", f"127.0.0.1:{port + 6}"], capture_output=True, text=True, timeout=30)
     bare = subprocess.run([BIN, "serve", "--addr", f"127.0.0.1:{port + 7}"], capture_output=True, text=True, timeout=30, cwd=other)
+    mixed = [subprocess.run([BIN, "serve", "--lake", folder, "--addr", f"127.0.0.1:{port + 8}"], capture_output=True, text=True, timeout=30),
+             subprocess.run([BIN, "serve", "--lakes", os.path.join(folder, "sales"), "--addr", f"127.0.0.1:{port + 9}"], capture_output=True, text=True, timeout=30)]
+    checks["--lake on a folder of lakes, or --lakes on a lake, is refused and says which was meant"] = all(m.returncode != 0 for m in mixed) \
+        and "--lakes" in mixed[0].stderr and "--lake " in mixed[1].stderr
     checks["a folder holding other things isn't made a lake, and nor is this folder unless named"] = kept.returncode != 0 and "other things" in kept.stderr \
         and not os.path.exists(os.path.join(other, "catalog")) and bare.returncode != 0 and "no lake in this folder" in bare.stderr
     shutil.rmtree(other, ignore_errors=True)

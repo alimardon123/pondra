@@ -6,8 +6,13 @@ wheel is installed (CI, and containers with old and new Linux).
 Without pyarrow (`pip install pondra` alone), what needs none: rows, one value and a text table
 as JSON and text; SQL procedures; `python -m pondra` (the binary wherever pip put it) and
 `python -m pondra --add-to-path` (with a home of its own; on Windows only in CI: it sets your PATH)."""
-import importlib.util, os, subprocess, sys, tempfile
+import importlib.metadata, importlib.util, os, subprocess, sys, tempfile
 import pondra
+
+# The package's page on PyPI: its own short README (install, an example, what it does, the docs).
+about = importlib.metadata.metadata("pondra")
+about = about.get("Description") or about.get_payload() or ""
+assert "pip install pondra" in about and "alimardon123.github.io/pondra" in about, "the package's description isn't its page"
 
 arrow = importlib.util.find_spec("pyarrow") is not None
 lake = os.path.join(tempfile.mkdtemp(prefix="pondra-check-"), "lake")

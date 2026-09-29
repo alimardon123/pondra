@@ -1144,6 +1144,7 @@ async fn python(app: &App, name: &str, r: &Routine, args: RecordBatch, who: Who,
     let (answer, parts) = asked.map_err(|e| anyhow::anyhow!("{whose}{}", lease.redact(&format!("{e:#}"))))?;
     match answer["kind"].as_str() {
         Some("rows") => Ok(Outcome::Rows(crate::query::read_ipc(parts.first().context("no rows")?)?)),
+        Some("images") => Ok(Outcome::Done(j!({"called": name, "images": answer["images"]}))), // (a cell's figures, as PNG: the console shows them)
         Some("sql") => Box::pin(one(app, answer["sql"].as_str().unwrap_or_default(), who, None)).await,
         _ => Ok(Outcome::Done(j!({"called": name}))),
     }

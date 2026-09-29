@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en" data-mode="lake">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Pondra</title>
+<link rel="icon" href="{{favicon}}"><!-- (brand/mark.svg: console.rs) -->
+<link rel="stylesheet" href="/console/console.css">
+<!-- The console (ADR-030, ADR-032): this page, console.css and console.js, all served by the node
+     (or the server). No CDN, no fonts, nothing from anywhere else. console.js is the core and its
+     API, `window.pondra`: what extensions (and an enterprise build) add their sections, panels,
+     cell kinds, answers' views and actions through. -->
+</head>
+<body>
+<header id="top">
+  <div class="brand">{{mark}}<span>Pondra</span></div>
+  <span id="where" class="pill" title="">connecting…</span>
+  <div class="nb"><input id="nbname" value="untitled" aria-label="Notebook name" spellcheck="false"><span id="dirty" title="Not saved" hidden></span></div>
+  <span class="spacer"></span>
+  <span id="kernel" class="pill kernel" hidden></span>
+  <div id="actions" class="actions"></div>
+</header>
+<div id="app">
+  <nav id="rail" aria-label="Places" hidden></nav>
+  <aside id="side" aria-label="Catalog"></aside>
+  <main id="main">
+    <div id="cells" aria-label="Cells"></div>
+    <div class="add">
+      <button class="btn ghost" data-add="sql">+ SQL</button>
+      <button class="btn ghost" data-add="python">+ Python</button>
+      <button class="btn ghost" data-add="markdown">+ Text</button>
+    </div>
+    <div class="hint"><kbd>Ctrl</kbd> <kbd>Enter</kbd> runs a cell · <kbd>Tab</kbd> completes a name · <kbd>Esc</kbd> then <kbd>?</kbd> lists every key</div>
+  </main>
+  <aside id="panel" aria-label="Details" hidden><div id="tabs" role="tablist"></div><div id="detail"></div></aside>
+</div>
+<dialog id="tokenDlg"><form method="dialog">
+  <h3>Token</h3>
+  <p id="tokenWhy">The token this node was started with. It is kept in this browser only.</p>
+  <input id="tokenIn" type="password" autocomplete="off" spellcheck="false" placeholder="token">
+  <div class="acts"><button class="btn primary" value="ok">Use it</button><button class="btn" value="cancel">Cancel</button><button class="btn" value="clear">Forget it</button></div>
+</form></dialog>
+<dialog id="helpDlg"><form method="dialog">
+  <h3>Keys</h3>
+  <div class="keys" id="keys"></div>
+  <p>A Python cell runs on the node, as <code>DO LANGUAGE python</code>: <code>db</code> is the connection, <code>print</code> shows here, a figure (matplotlib) or an image shows as a picture, and a last expression that is a frame or a table comes back as rows. The page's cells share their variables, as a notebook's do.</p>
+  <div class="acts"><button class="btn primary" value="ok">Close</button></div>
+</form></dialog>
+<div id="menu" class="menu" role="menu" hidden></div>
+<div id="complete" class="complete" role="listbox" hidden></div>
+<div id="toast" role="status"></div>
+<script type="module" src="/console/console.js"></script>
+<!--{{extensions}}-->
+</body>
+</html>

@@ -252,7 +252,10 @@ token is refused.
 | `GET /metrics` | read | Prometheus metrics, as text |
 | `POST /tier` | admin | write the log into Parquet now: `{"rows_tiered": N}` |
 | `DELETE /sessions/{id}` | read | end a session: its temporary tables and views go, and so does its Python: `{"ended": true}` |
+| `GET /sessions/{id}/python` | admin | the session's Python (a console page's cells): `{"running", "busy", "variables": [{"name", "type", "size", "look"}]}` |
+| `DELETE /sessions/{id}/python` | admin | restart it: its variables go, its temporary tables stay |
 | `GET /` | none | [the console](/pondra/start/console/): a web page, with no data in it until you use it |
+| `GET /console/console.js`, `/console/console.css`, `/console/ext/{n}.js` | none | the console's script and style, and the extensions the node was given (`PONDRA_CONSOLE_EXTENSIONS`); each with an `ETag`, `304` when unchanged |
 
 `GET /stats` needs no token, so a load balancer can poll it. It answers `lake` (its name), `role` (`leader`,
 `follower` or `reader`), `leader` (its address), `term`, `nodes`, `hwm` (the newest commit),

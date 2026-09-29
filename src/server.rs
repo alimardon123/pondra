@@ -123,6 +123,8 @@ pub fn router(app: App) -> Router {
         .route("/watch/{name}", get(watch))
         .route("/live", get(crate::live::live).post(crate::live::live))
         .route("/sessions/{id}", axum::routing::delete(|Path(id): Path<String>| async move { Json(j!({"ended": crate::temp::end(&id)})) }))
+        .route("/sessions/{id}/python", get(session_python).delete(session_python))
+        .route("/console/{*file}", get(crate::console::file))
         .route("/functions", get(list_functions))
         .route("/routines", get(|State(app): State<App>| async move { Ok::<_, E>(Json(j!(*crate::routines::listed(&app.lake).await?))) }))
         .route("/secrets/{name}", get(secret))
@@ -183,6 +185,19 @@ async fn put_file(State(app): State<App>, Path(path): Path<String>, body: Bytes)
 async fn get_file(State(app): State<App>, Path(path): Path<String>) -> Result<Response, E> {
     let bytes = app.lake.object(&crate::files::under_files(&path)).await?;
     Ok(([("content-type", "application/octet-stream")], bytes).into_response())
+}
+
+/// `GET /sessions/{id}/python`: the variables a session's Python holds, as the console's panel
+/// lists them (none, if it has none yet); `DELETE`: stop it (its variables go; the session's
+/// temporary tables stay), as a notebook's kernel is restarted. An admin's, as Python is.
+async fn session_python(method: axum::http::Method, Path(id): Path<String>, role: axum::Extension<crate::auth::Role>) -> Result<Json<Value>, E> {
+    if *role < crate::auth::Role::Admin {
+        return Err(E(anyhow::anyhow!("a session's Python is an admin's, as DO is")));
+    }
+    Ok(Json(match method {
+        axum::http::Method::DELETE => j!({"restarted": crate::python::end_session(&id)}),
+        _ => crate::python::variables(&id).await?,
+    }))
 }
 
 /// `GET /functions`: the lake's own functions, by name.
@@ -849,7 +864,7 @@ pub fn render(batches: &[RecordBatch], format: Option<&str>) -> anyhow::Result<b
     }))
 }
 
-/// The console's answer (`?format=typed`, `console.html`): the columns with their types, the
+/// The console's answer (`?format=typed`, `console/console.js`): the columns with their types, the
 /// first `SHOWN` rows as lists in the columns' order (two columns may share a name: a join's), and
 /// how many rows there were.
 fn typed(batches: &[RecordBatch]) -> anyhow::Result<Vec<u8>> {

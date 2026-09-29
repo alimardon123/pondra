@@ -99,7 +99,7 @@ enum Cmd {
         #[arg(long = "lake", alias = "dir", value_name = "LAKE", conflicts_with_all = ["path", "databases"])]
         dir: Option<String>,
         /// For scripts and services, nothing guessed: exactly this folder of lakes, each a database.
-        #[arg(long, value_name = "FOLDER", conflicts_with = "path")]
+        #[arg(long = "lakes", alias = "databases", value_name = "FOLDER", conflicts_with = "path")]
         databases: Option<String>,
         /// Serving a folder of lakes: the database a client that names none gets (default: `lake`,
         /// else the only one).
@@ -286,8 +286,15 @@ async fn run() -> anyhow::Result<()> {
         Cmd::Serve { path, dir, databases, default, addr, advertise, reader, flush_ms, tier_secs, task_ms, memory_gb, retain_secs, changelog_secs, backlog, cache_dir, cache_gb, ack, replicas, fsync, publish, pg, kafka, kafka_advertise, flight, read_token, write_token, admin_token, attach: attached, attach_found, stop_with_stdin, python } => {
             // A lake, or a folder of lakes (each a database: `dbserver.rs`), by what the path holds.
             let (dir, many) = match (dir, databases) {
-                (Some(d), _) => (d, false),
-                (None, Some(f)) => (f, true),
+                (Some(d), _) => {
+                    // (one letter from --lakes: a mix-up is said, never served)
+                    anyhow::ensure!(!dbserver::holds_lakes(&d).await?, "{d} holds lakes, each a database: serve them with --lakes {d} (or one of them: --lake {d}/<name>)");
+                    (d, false)
+                }
+                (None, Some(f)) => {
+                    anyhow::ensure!(!dbserver::is_lake(&f).await?, "{f} is a lake: serve it with --lake {f} (--lakes is for a folder of lakes)");
+                    (f, true)
+                }
                 (None, None) => {
                     let given = path.is_some();
                     let p = path.unwrap_or_else(|| ".".into());

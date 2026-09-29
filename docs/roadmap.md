@@ -1,10 +1,11 @@
-# Pondra: what's left, and in what order (after round 25)
+# Pondra: what's left, and in what order (after round 26)
 
 **Date:** 2026-09-28 · **Status:** proposed; the order in "The rounds" is what I recommend, the
 decisions in "What only you can decide" are yours · **Builds on:** ADR-002 to ADR-017,
 `prototype-status.md`, `comparison-spark-flink-fluss.md`
 
-**Progress (2026-09-29):** rounds 17 to 25 are done (ADR-018 to ADR-028).
+**Progress (2026-09-29):** rounds 17 to 26 are done (ADR-018 to ADR-030, and ADR-032 for round
+26's continuation).
 
 - **Round 17** made Pondra install anywhere: a glibc 2.17 Linux binary, pip and npm packages
   (built, not published), a SQL shell, and both flaky tests fixed.
@@ -111,9 +112,21 @@ on an attached lake from any node, and temporary tables.
   Metabase), psqlODBC (Tableau, Excel), Npgsql (Power BI) and ADBC work. `ALTER TABLE | VIEW … RENAME TO`, `ON
   CONFLICT`, `UPDATE … FROM`, `DELETE … USING`, `TRUNCATE`, `NOT NULL` and `DEFAULT`.
 
-Left from it, for a later round: `pondra server` over a folder in a bucket; Power BI Desktop
-itself on Windows (its drivers, Npgsql and psqlODBC, are tested); completion and charts in the
-console.
+**Round 26, continued** (ADR-032, built before the tag): `CREATE EXTERNAL TABLE` as a view of
+files and `to_timestamp` as DataFusion's (sqllogictest 64.9% to 74.5%, with DataFusion's test data
+in place); a page's
+Python cells sharing a worker, with figures and a Variables tab; one serve command (`pondra serve
+PATH`, `--lake`, `--lakes`) over a local folder or a bucket prefix, `pondra server` gone; the logo
+and colours in `brand/`; the console rebuilt as a core with an extension API, a details panel,
+profiles, completion and an outline.
+
+Left from it: Power BI Desktop itself on Windows (its drivers, Npgsql and psqlODBC, are tested);
+charts of SQL answers without Python.
+
+**Backward compatibility** (the owner, 2026-09-29): promised from the production-ready release
+(1.0) on: the lake's format, SQL, the HTTP API, the clients and the command line stay compatible,
+and a breaking change needs a deprecation release first. Until 1.0, names and formats may change
+when that makes the product better, each change in its ADR and the release notes.
 
 **Proposed, 2026-09-29: anyone's compute, one catalog** (ADR-029, the owner's direction: "total
 serverless and compute/storage separation"). It takes two rules from the first step one step
@@ -208,7 +221,7 @@ it runs one partition at a time, because its parallel execution needs a Tokio ru
 browser Pondra would read a published snapshot of the lake (the list of files and log segments),
 not the catalog.
 
-## Everything still open, in nine tracks
+## Everything still open, in ten tracks
 
 Size: **S** = part of a round, **M** = about one round, **L** = more than one.
 
@@ -330,6 +343,18 @@ table's slices.
 |---|---|---|---|---|
 | I1 | DuckDB-style `INSTALL name; LOAD name;`: third parties add functions, table functions, file formats and connectors without rebuilding Pondra, as WebAssembly components (sandboxed, one build for every platform), from a registry or a file | A small binary that still grows with its users' needs | L | An extension written outside the repo adds a function and a format, loads on all five platforms, spreads with queries, and can't reach what it wasn't granted |
 
+### J. The platform on top (the owner, 2026-09-29; proposed, after the base binary)
+
+The owner's order: the base binary first (parity with what it is compared with, SQL, Python and
+JavaScript as one, the streamhouse, and the comparisons with Spark, Flink, Fluss and DuckDB), and
+the platform after.
+
+| # | Item | Why | Size | Proof |
+|---|---|---|---|---|
+| J1 | The server's catalog (ADR-032 §9): databases anywhere by name, attachments, secrets, users and extensions for every database of a server | Users live above the databases (round 29 needs it); no listing per connection | M | Databases in two buckets served as one server; listing costs no request; a user made once reaches every database |
+| J2 | A workspace (ADR-033): `.sql`, `.py` and notebooks as versioned files, edited in the console, run with parameters from every door (`CALL run(…)`), recorded in the run log, scheduled | ETL without another tool; SQL and Python calling each other | M–L | A SQL file and a Python file chained with parameters, from SQL, Python, JavaScript and the console; a schedule runs a notebook; the run log names each version |
+| J3 | Dashboards and reports: a notebook with parameters shown read-only | What a team shares | M | A report with inputs, refreshed by a schedule |
+
 ## The rounds
 
 Each round is about one session like the last sixteen, ending with tests on local disk,
@@ -346,14 +371,14 @@ simulated R2 and real R2, an ADR, and a bundle.
 | 23 ✓ | Read and write anything (done: ADR-026) | G1–G5, secrets; D1 set up and measured | files, Delta and Iceberg anywhere read, joined and written, spread; GCS and Azure lakes; Kafka clusters in and out; `CREATE SECRET` |
 | 24 ✓ | SQL and Python as one (done: ADR-027) | H1–H6 | `CREATE FUNCTION` in SQL and Python; procedures that send mail from a SQL cell; decorators that take a notebook's function; schedules and a run log |
 | 25 ✓ | One vocabulary, open writes, live answers (done: ADR-028) | E9, E10, G8, B3, temporary tables, changes to attached lakes | `read_*`/`write_*` everywhere (the tools' names as fallbacks); Spark and PyIceberg append to Pondra's tables through its Iceberg catalog; live queries; function results reused; `CREATE TEMP TABLE`; `UPDATE`/`MERGE` on attached lakes from any node |
-| 26 ✓ | The console, the server and the docs (done: ADR-030) | A4, E1, E2, the server, E11 | a console at `/` with SQL, Python and text cells; a folder of lakes served as databases (`pondra server`); dbt and BI tools through Postgres's catalog; a documentation website on GitHub Pages covering everything, each example tested |
+| 26 ✓ | The console, the server and the docs (done: ADR-030, ADR-032) | A4, E1, E2, the server, E11 | a console at `/` with SQL, Python and text cells, built to be extended; a folder of lakes (local or in a bucket) served as databases (`pondra serve --lakes`); dbt and BI tools through Postgres's catalog; a documentation website on GitHub Pages covering everything, each example tested |
 | 27 | Anyone's compute, phase 1 (ADR-029) | G9: appends as written, the id limit | other engines' appends cost the node only a commit; layout published for writers; tables made through the catalog |
 | 28 | Anyone's compute, phase 2 (ADR-029) | G9: changes as written | Spark's and PyIceberg's `DELETE`, `UPDATE`, `MERGE` and overwrites on Pondra's tables; deletes published as positions; keyed tables published every tier round |
 | 29 | Safe to share | E3, G6 | TLS, mutual TLS between nodes, users and grants down to a table, an audit log, quotas; Postgres and MySQL attached |
 | 30 | Production-ready SQL and frames | D1 to its end, D2, TPC-DS | sqllogictest passing (every exception named), TPC-DS's 99 queries == DuckDB, random queries 1 node == 3 == DuckDB, Polars and PySpark coverage published |
 | 31 | Scale, proven (an ADR of its own: burst) | C1 in one data centre, C2, C4, burst functions | 1 → 3 → 6 machines in one zone; SF100 against Spark; a 24-hour soak; serverless bursts for a big query |
 | 32 | In-process and in the browser | B1, B2, B4 | `pondra.open(…)` without a server; a lake queried in a web page (WebAssembly) |
-| 33+ | Depth | G7, H7, E4, I1 (extensions, when the owner places it), F by evidence | sinks, notebooks in the catalog, `INSTALL`/`LOAD` extensions, streaming depth, what users show matters |
+| 33+ | Depth, then the platform | G7, H7, E4, I1 (extensions, when the owner places it), F by evidence; J1 (before round 29 if users need it), J2, J3 | sinks, `INSTALL`/`LOAD` extensions, streaming depth, what users show matters; the server's catalog, a workspace of files and runs, reports |
 
 **Every round, whatever its theme** (the owner's rules: nothing half-done, performance only goes
 up, scale-out is the point):
@@ -420,6 +445,11 @@ Why this order:
    - "our extension framework" means DuckDB-style `INSTALL`/`LOAD`: ADR-031, proposed.
 5. **When extensions come (ADR-031).** Their round is still open. They could go after anyone's
    compute (round 29, pushing security to 30), or with depth (33+).
+6. **The plural's name.** `pondra serve --lakes` is built. "Lake hub" (or another word) could name
+   the mode in the docs and the console; the flag can stay.
+7. **The server's catalog (J1) and the workspace (J2).** Proposed in ADR-032 §9 and ADR-033. The
+   owner put the base binary first; J1 may need to come before round 29, since users live above
+   the databases.
 
 ## What not to do yet
 

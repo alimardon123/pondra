@@ -32,8 +32,11 @@ The owner's design principles, which every change must respect:
 ```
 src/      27,800 lines of Rust, one file per concern (see the table in README.md); round 25 added
           live.rs (live queries) and temp.rs (a session's temporary tables and views); round 26
-          pg_catalog.rs (Postgres's catalog, for dbt and BI tools), dbserver.rs (`pondra server`),
-          defaults.rs (NOT NULL and DEFAULT) and console.rs + console.html (the console at /)
+          pg_catalog.rs (Postgres's catalog, for dbt and BI tools), dbserver.rs (`pondra serve
+          --lakes`: a folder of lakes as databases), defaults.rs (NOT NULL and DEFAULT), ext.rs
+          (files read by name: `read_*`, `CREATE EXTERNAL TABLE`) and console.rs + console/ (the
+          console at /: index.html, console.css, console.js with its extension API, ADR-032)
+brand/    the logo (mark.svg) and colours (colors.css): the only copies; tools/brand_check.py
 site/     the documentation website (Starlight; ADR-030): site/STYLE.md says how pages are written,
           site/PAGES.md what each covers; every example runs (tools/docs_check.py);
           .github/workflows/pages.yml publishes it to GitHub Pages
@@ -44,7 +47,8 @@ python/   the Python client (pure Python, HTTP + Arrow; `local()` starts a node)
           without pyarrow, rows come as JSON (ADR-024)
 install.sh, install.ps1   the one-line installers each release carries (ADR-024)
 js/       the JavaScript client and the `pondra` npm package's files
-examples/ quickstart.ipynb (pip install to an as-of join, in the owner's notebook style)
+examples/ quickstart.ipynb (pip install to an as-of join, in the owner's notebook style),
+          console-extension.js (what a console extension adds: a section, a tab, a view, an action)
 tools/    harness.py, cluster.py (tests), open_check.py (Delta + Iceberg readers == Pondra),
           keyed_bench.py (compaction cost), clean_bucket.py (keep a bucket to its newest lakes),
           kafka_bench.py (Kafka clients: throughput, latency), mcp_client.py (the MCP SDK),
@@ -886,12 +890,49 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
 136. **`DO` is an admin's, and its errors count lines from the code's first** (`routines::do_of`
    drops the newline after `$$`; a DO block's errors carry no routine name). `harness.py
    procedures`.
-137. **`pondra server` holds no lake.** Each database is a `pondra serve` child (`--advertise
-   host:port/db/name`, `--attach-found <folder>`, `--stop-with-stdin`, `PONDRA_SERVER_URL`); the
-   server routes Postgres by the startup message and HTTP by `/db/{name}`, and stops a database
-   idle for `PONDRA_DATABASE_IDLE_SECS`. `harness.py server`.
-138. **The console asks only the node that served it** (no CDN, fonts or other hosts; the page is
-   `include_str!`ed). `console_check.py`: "every request went to the node".
+137. **A folder of lakes' server holds no lake.** Each database is a `pondra serve` child
+   (`--advertise host:port/db/name`, `--attach-found <folder>`, `--stop-with-stdin`,
+   `PONDRA_SERVER_URL`); the server routes Postgres by the startup message and HTTP by
+   `/db/{name}`. `harness.py server` (local, `--s3`).
+138. **The console asks only the node that served it** (no CDN, fonts or other hosts; its files are
+   `include_str!`ed; extensions are the node's own files). `console_check.py`: "every request went
+   to the node", with and without an extension.
+139. **A view of files is a view** (`StoredView.external`, `ext.rs`): `CREATE EXTERNAL TABLE` stores
+   `SELECT … FROM read_*(…)`, copies nothing, and `INSERT` into one over a folder is `COPY … TO
+   folder/ (APPEND true, …)`, from a node and from `pondra sql` (`write::from_cli` calls
+   `view_write` too); an `INSERT` into any other view is refused, never a table made. A folder's
+   keys are declared (`hive_types`), so an empty folder has its columns. The `ext:` tables such
+   views read are deregistered in listing sessions. `harness.py external`.
+140. **`to_timestamp` answers a TIMESTAMP with no zone** (`optimize::register_zoned` re-makes
+   DataFusion's function with `naive()` config, and again in `with_updated_config`), whatever the
+   session's zone; text naming a zone is converted to UTC. `harness.py found`.
+141. **A session's `DO` blocks share one worker** (`python::KERNELS`): only a `DO` with a session at
+   depth 1 goes to it (`routines::python`); it ends with the session (`temp::end`), idle after
+   `PONDRA_SESSION_IDLE_SECS`, or past `PONDRA_WORKER_MB`; another session, and a block with none,
+   share nothing. Its variables (`GET`) and restart (`DELETE /sessions/{id}/python`) are an
+   admin's. `harness.py procedures`; `console_check.py` (Variables, Restart, the admin check).
+142. **`pondra serve PATH` guesses only the unambiguous** (`main.rs`): a folder holding other things
+   is never made a lake, the current folder only when named; `--lake` on a folder of lakes and
+   `--lakes` on a lake are refused with the command meant; one lake's options (`--flight`,
+   `--kafka`, `--attach`, `--advertise`, `--attach-found`) are refused with `--lakes`, and every
+   other reaches each database's node (`Options.node`). `harness.py server`.
+143. **A database's node isn't stopped while in use** (`dbserver::Busy`): an open Postgres
+   connection or an HTTP request (until its answer's last byte) holds it; idle time counts from
+   when the last one ended; `reap` checks again under the lock before it stops one. `harness.py
+   server`: "a database with a connection open isn't stopped…" (on simulated R2, `CREATE DATABASE`
+   through psql took longer than the idle time and lost its node before this).
+144. **The brand has one source** (`brand/`): nothing else draws the mark or is a logo or favicon;
+   the console and the site take it from there. `tools/brand_check.py` (the repository, `--node`,
+   `--site`).
+145. **Everything the console shows is registered** (`console.js`: `register.*`), the core's own
+   parts as an extension's; registrations made while the page starts are drawn with the core's
+   (`started` is set after the first drawing). `console_check.py`: the extension's section, tab,
+   view and action.
+146. **The console's files are tagged by their contents** (`console::file`: a hash, `no-cache`,
+   `304` on a match), so a new binary's console is never a stale one. `console_check.py`.
+147. **A lake's own files are readable by its readers** (`ext::own_file`), and `GET /objects` reads
+   the catalog only (no query). `harness.py external`, `console_check.py` (a file read as a
+   table).
 
 ## Tests: run these before and after any change
 
@@ -1021,6 +1062,16 @@ R2; round 12's are in `logs/round12/`, round 13's in `logs/round13/`, round 14's
 `logs/round14/`, round 15's in `logs/round15/`, round 16's in `logs/round16/`, round 17's in `logs/round17/`,
 round 18's in `logs/round18/`, round 19's in `logs/round19/`, round 20's in `logs/round20/`, round 21's in `logs/round21/`, round 22's in `logs/round22/`, round 23's in `logs/round23/`, round 24's in `logs/round24/`, round 25's in `logs/round25/` and round 26's in `logs/round26/`.
 
+**Round 26, continued (ADR-032), before the tag:** `CREATE EXTERNAL TABLE` as a view of files;
+`to_timestamp` as DataFusion answers it; a page's Python cells sharing a worker (variables,
+figures, restart); `pondra serve PATH` / `--lake` / `--lakes` in place of `pondra server`, over a
+local folder or a bucket prefix, a database kept up while in use; the brand in `brand/`; the
+console rebuilt as a core with an extension API (`window.pondra`, `PONDRA_CONSOLE_EXTENSIONS`),
+a details panel, profiles, a virtual grid, completion, variables, figures, an outline. Proposed:
+the server's catalog (ADR-032 §9) and a workspace of files, runs and parameters (ADR-033).
+Backward compatibility is promised from the production-ready release (1.0) on, not before
+(ADR-032 §8).
+
 **Round 26 (ADR-030): the console, the server, dbt and BI, and the documentation website.**
 
 - **The website** (`site/`, Starlight, GitHub Pages through `pages.yml`): 49 pages for users —
@@ -1035,9 +1086,10 @@ round 18's in `logs/round18/`, round 19's in `logs/round19/`, round 20's in `log
   docs, run twice) gives the same rows as Postgres 16; psql's backslash commands, SQLAlchemy,
   pgjdbc, psqlODBC, ADBC and Npgsql 4.0 and 8 (Power BI's driver) work. `ALTER TABLE | VIEW …
   RENAME TO` (dbt's swap).
-- **`pondra server`** (`dbserver.rs`): a folder of lakes as databases, each a node started on use
-  and stopped when idle; `CREATE/DROP DATABASE`; queries across databases.
-- **The console at `/`** (`console.html`, one file, no CDN): a tree with row counts, SQL, Python
+- **A folder of lakes as databases** (`dbserver.rs`; `pondra server` then, `pondra serve --lakes`
+  now): each a node started on use and stopped when idle; `CREATE/DROP DATABASE`; queries across
+  databases.
+- **The console at `/`** (then `console.html`, one file, no CDN): a tree with row counts, SQL, Python
   (`DO LANGUAGE python`) and text cells, live answers, notebooks as `.ipynb` versions in the lake,
   Jupyter's keys, light and dark. `console_check.py` drives it in Chromium.
 - **Found at the end:** `pondra sql` didn't check NOT NULL; ADBC's Postgres driver couldn't read
@@ -1047,8 +1099,8 @@ round 18's in `logs/round18/`, round 19's in `logs/round19/`, round 20's in `log
   matches it, `Lake::NO_LAKE`); a time without seconds wasn't a timestamp; tables listed as views in
   `information_schema`; a `files()` listing could be a cached answer. All fixed (invariants
   129–138).
-- **Not in this round:** a folder in a bucket for `pondra server` (local folders only), TLS,
-  completion in the console, Python cells sharing variables.
+- **Not in this round:** TLS. (A folder in a bucket, completion in the console and Python cells
+  sharing variables came in its continuation, ADR-032.)
 
 
 **Round 23 (ADR-026) read and wrote everything else:** files on S3, GCS, Azure, HTTPS and the
@@ -1410,3 +1462,10 @@ The owner decides whether to link their Windows laptop, and when to publish.
 - No new dependencies without a real reason; no new always-on services, ever.
 - Every new invariant gets a test in `tools/` that would fail without it.
 - Docs live in `docs/`; a design change means a new ADR, not an edit to an old one.
+- Backward compatibility is promised from the production-ready release (1.0) on (ADR-032 §8): the
+  lake's format, SQL, the HTTP API, the clients and the command line. Before 1.0, change what makes
+  the product better, and write each change in its ADR and the release notes.
+- The owner's priorities, for every change: performance, simplicity, ease of use, ergonomics,
+  a beautiful result, scalability, power, and versatility.
+- The logo and colours come from `brand/` only; the console is extended through its registry
+  (`window.pondra`), never by editing a copy of it.

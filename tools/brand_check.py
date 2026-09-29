@@ -8,8 +8,9 @@
 It fails if:
   - brand/mark.svg's two colours (on light, and its dark `<style>`) aren't brand/colors.css's;
   - a file in the repository other than brand/mark.svg draws the mark or is a logo or favicon;
-  - the console's page doesn't take its mark, icon and colours from brand/ (`{{mark}}`,
-    `{{favicon}}`, `/*{{colors}}*/`), or the page a node serves doesn't hold them exactly;
+  - the console's page and style sheet don't take its mark, icon and colours from brand/ (`{{mark}}`,
+    `{{favicon}}` in src/console/index.html, `/*{{colors}}*/` in console.css), or what a node serves
+    doesn't hold them exactly;
   - the docs site doesn't make its header's marks and favicon from brand/, or the built site's
     aren't brand/mark.svg (its favicon as it is, its header's light and dark in colors.css's).
 """
@@ -54,10 +55,12 @@ def repository(checks):
     checks["no copy of the mark, and no other logo or favicon, anywhere else in the repository"] = not copies
     if copies:
         print("copies:", copies, file=sys.stderr)
-    page = open(os.path.join(ROOT, "src", "console.html"), encoding="utf-8").read()
+    page = open(os.path.join(ROOT, "src", "console", "index.html"), encoding="utf-8").read()
+    css = open(os.path.join(ROOT, "src", "console", "console.css"), encoding="utf-8").read()
     rs = open(os.path.join(ROOT, "src", "console.rs"), encoding="utf-8").read()
-    checks["the console's page takes its mark, icon and colours from brand/"] = all(p in page for p in ("{{mark}}", "{{favicon}}", "/*{{colors}}*/")) \
-        and 'include_str!("../brand/mark.svg")' in rs and 'include_str!("../brand/colors.css")' in rs and "<svg" not in page.split('class="brand"', 1)[1][:80]
+    checks["the console's page takes its mark, icon and colours from brand/"] = "{{mark}}" in page and "{{favicon}}" in page \
+        and css.startswith("/*{{colors}}*/") and 'include_str!("../brand/mark.svg")' in rs and 'include_str!("../brand/colors.css")' in rs \
+        and "<svg" not in page.split('class="brand"', 1)[1][:80]
     astro = open(os.path.join(ROOT, "site", "astro.config.mjs"), encoding="utf-8").read()
     checks["the docs site makes its header's marks and favicon from brand/, and its accent from colors.css"] = "brand('mark.svg')" in astro and "brand('colors.css')" in astro \
         and "'../brand/colors.css'" in astro and "public/favicon.svg" in astro and "mark-light.svg" in astro and "mark-dark.svg" in astro
@@ -78,8 +81,9 @@ def node(checks):
                 time.sleep(0.1)
         icon = re.search(r'<link rel="icon" href="data:image/svg\+xml,([^"]*)"', html or "")
         shown = urllib.parse.unquote(icon.group(1)) if icon else ""
+        css = urllib.request.urlopen(f"http://127.0.0.1:{port}/console/console.css", timeout=5).read().decode() if html else ""
         checks["a node's console shows brand/mark.svg in its header and as its icon, and colors.css's colours"] = bool(html) and MARK.strip() in html \
-            and shown.replace("'", '"') == MARK.replace("'", '"') and COLORS.strip() in html and "{{" not in html
+            and shown.replace("'", '"') == MARK.replace("'", '"') and COLORS.strip() in css and "{{" not in html + css
     finally:
         p.terminate()
         p.wait(10)
