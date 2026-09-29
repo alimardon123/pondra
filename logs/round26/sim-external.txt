@@ -1,0 +1,17 @@
+=== simulated R2 (PUT p50 ~197 ms, GET p50 ~100 ms): harness.py external --s3
+{
+ "external": {
+  "CSV: declared columns by position, typed as declared, a relative LOCATION where the node runs": true,
+  "Parquet: a folder's files, declared columns by name, one they don't hold NULL (and IS NULL finds it)": true,
+  "JSON: declared columns by name, others left out": true,
+  "a view of a folder: empty before its files; INSERT writes a new file there, from a node and from pondra sql": true,
+  "PARTITIONED BY: its keys' folders, typed as declared, made by INSERT": true,
+  "information_schema lists each as a VIEW, and not the tables of files they read": true,
+  "an existing name: refused, kept with IF NOT EXISTS, replaced with OR REPLACE": true,
+  "DROP TABLE drops it; its file stays": true,
+  "what it can't do, it says: INSERT into one file, UPDATE, Avro, gzip, no files, TEMPORARY, an option it doesn't read, INSERT into a view; others' files need the owner": true,
+  "the lake's own files read as a table by any reader, and nothing else of its folder; /objects says each object's kind": true
+ },
+ "ok": true
+}
+exit 0

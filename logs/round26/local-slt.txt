@@ -1,9 +1,9 @@
-[1/504] agg_func_substitute.slt: 0/5
-[2/504] aggregate.slt: 1104/1405
+[1/504] agg_func_substitute.slt: 2/5
+[2/504] aggregate.slt: 1257/1405
 [3/504] aggregate_any_value.slt: 5/6
 [4/504] aggregate_memory_spill.slt: 7/21
-[5/504] aggregate_repartition.slt: 0/11
-[6/504] aggregate_skip_partial.slt: 11/88
+[5/504] aggregate_repartition.slt: 6/11
+[6/504] aggregate_skip_partial.slt: 63/88
 [7/504] aggregates_simplify.slt: 36/38
 [8/504] aggregates_topk.slt: 77/98
 [9/504] alias.slt: 16/16
@@ -11,7 +11,7 @@
 [11/504] array/array_any_match.slt: 2/20
 [12/504] array/array_any_value.slt: 151/151
 [13/504] array/array_append.slt: 160/169
-[14/504] array/array_cast.slt: 141/150
+[14/504] array/array_cast.slt: 148/150
 [15/504] array/array_concat.slt: 181/181
 [16/504] array/array_distinct.slt: 166/166
 [17/504] array/array_element.slt: 171/171
@@ -33,7 +33,7 @@
 [33/504] array/array_repeat.slt: 154/154
 [34/504] array/array_replace.slt: 202/202
 [35/504] array/array_resize.slt: 151/152
-[36/504] array/array_reverse.slt: 151/158
+[36/504] array/array_reverse.slt: 156/158
 [37/504] array/array_slice.slt: 200/200
 [38/504] array/array_sort.slt: 158/160
 [39/504] array/array_to_string.slt: 166/174
@@ -44,7 +44,7 @@
 [44/504] array/make_array.slt: 145/145
 [45/504] array/string_to_array.slt: 156/156
 [46/504] array_add.slt: 31/31
-[47/504] array_agg.slt: 67/84
+[47/504] array_agg.slt: 81/84
 [48/504] array_agg_sliding_window.slt: 49/49
 [49/504] array_avg.slt: 23/23
 [50/504] array_normalize.slt: 20/20
@@ -65,18 +65,18 @@
 [65/504] cast.slt: 14/20
 [66/504] cast_extension_type_metadata.slt: 0/6
 [67/504] cast_to_type.slt: 60/62
-[68/504] clickbench.slt: 0/98
-[69/504] clickbench_extended.slt: 0/9
+[68/504] clickbench.slt: 51/98
+[69/504] clickbench_extended.slt: 8/9
 [70/504] coalesce.slt: 60/63
-[71/504] copy.slt: 13/96
+[71/504] copy.slt: 43/96
 [72/504] cosine_distance.slt: 23/23
 [73/504] count_star_rule.slt: 9/11
-[74/504] create_external_table.slt: 29/56
+[74/504] create_external_table.slt: 45/56
 [75/504] create_function.slt: 6/8
 [76/504] cse.slt: 12/12
-[77/504] csv_files.slt: 9/69
-[78/504] cte.slt: 66/115
-[79/504] date_bin_errors.slt: 9/11
+[77/504] csv_files.slt: 37/69
+[78/504] cte.slt: 85/115
+[79/504] date_bin_errors.slt: 11/11
 [80/504] datetime/arith_date_date.slt: 2/2
 [81/504] datetime/arith_date_integer.slt: 15/18
 [82/504] datetime/arith_date_interval.slt: 9/9
@@ -95,141 +95,141 @@
 [95/504] datetime/dates.slt: 62/68
 [96/504] datetime/interval.slt: 47/95
 [97/504] datetime/interval_mysql.slt: 1/10
-[98/504] datetime/timestamps.slt: 561/831
-[99/504] ddl.slt: 103/206
-[100/504] decimal.slt: 95/167
+[98/504] datetime/timestamps.slt: 764/831
+[99/504] ddl.slt: 150/206
+[100/504] decimal.slt: 156/167
 [101/504] delete.slt: 3/13
-[102/504] describe.slt: 16/26
-[103/504] dictionary.slt: 43/53
+[102/504] describe.slt: 22/26
+[103/504] dictionary.slt: 49/53
 [104/504] dictionary_struct.slt: 1/14
-[105/504] distinct_on.slt: 19/46
-[106/504] dml_delete.slt: 29/40
-[107/504] dml_update.slt: 44/56
-[108/504] dynamic_file.slt: 2/24
-[109/504] dynamic_filter_pushdown_config.slt: 15/110
-[110/504] dynamic_row_group_pruning.slt: 6/39
+[105/504] distinct_on.slt: 37/46
+[106/504] dml_delete.slt: 30/40
+[107/504] dml_update.slt: 45/56
+[108/504] dynamic_file.slt: 10/24
+[109/504] dynamic_filter_pushdown_config.slt: 45/110
+[110/504] dynamic_row_group_pruning.slt: 16/39
 [111/504] eliminate_outer_join.slt: 47/90
 [112/504] encoding.slt: 28/38
-[113/504] encrypted_parquet.slt: 2/10
-[114/504] errors.slt: 34/35
-[115/504] explain.slt: 45/80
-[116/504] explain_analyze.slt: 10/109
-[117/504] explain_tree.slt: 12/92
-[118/504] expr.slt: 403/449
-[119/504] file_row_index.slt: 2/23
-[120/504] filter_without_sort_exec.slt: 0/15
+[113/504] encrypted_parquet.slt: 6/10
+[114/504] errors.slt: 35/35
+[115/504] explain.slt: 50/80
+[116/504] explain_analyze.slt: 25/109
+[117/504] explain_tree.slt: 27/92
+[118/504] expr.slt: 405/449
+[119/504] file_row_index.slt: 18/23
+[120/504] filter_without_sort_exec.slt: 6/15
 [121/504] first_last_nested.slt: 7/7
 [122/504] float16.slt: 3/9
 [123/504] floor_preimage.slt: 19/35
 [124/504] functional_dependencies.slt: 17/36
-[125/504] functions.slt: 247/269
-[126/504] group.slt: 19/37
-[127/504] group_by.slt: 497/638
-[128/504] grouping.slt: 28/34
-[129/504] grouping_set_repartition.slt: 0/12
+[125/504] functions.slt: 252/269
+[126/504] group.slt: 37/37
+[127/504] group_by.slt: 536/638
+[128/504] grouping.slt: 34/34
+[129/504] grouping_set_repartition.slt: 9/12
 [130/504] ident_normalization.slt: 14/34
-[131/504] identifiers.slt: 6/19
+[131/504] identifiers.slt: 19/19
 [132/504] imdb.slt: 176/176
 [133/504] in_list.slt: 29/38
-[134/504] information_schema.slt: 35/108
+[134/504] information_schema.slt: 41/108
 [135/504] information_schema_columns.slt: 2/10
 [136/504] information_schema_multiple_catalogs.slt: 6/24
 [137/504] information_schema_table_types.slt: 4/7
 [138/504] inner_product.slt: 26/26
-[139/504] input_file_name.slt: 1/14
-[140/504] insert.slt: 35/67
-[141/504] insert_to_external.slt: 12/98
+[139/504] input_file_name.slt: 11/14
+[140/504] insert.slt: 61/67
+[141/504] insert_to_external.slt: 66/98
 [142/504] insert_values_placeholders.slt: 2/2
-[143/504] intersection.slt: 2/5
+[143/504] intersection.slt: 5/5
 [144/504] issue_17138.slt: 6/6
-[145/504] join_disable_repartition_joins.slt: 200/224
+[145/504] join_disable_repartition_joins.slt: 202/224
 [146/504] join_is_not_distinct_from.slt: 27/32
 [147/504] join_limit_pushdown.slt: 25/32
 [148/504] join_lists.slt: 6/6
 [149/504] join_only.slt: 200/218
-[150/504] joins.slt: 331/676
-[151/504] json.slt: 2/20
+[150/504] joins.slt: 359/676
+[151/504] json.slt: 13/20
 [152/504] lateral_join.slt: 75/77
 [153/504] lead_lag_extreme_offsets.slt: 10/10
-[154/504] limit.slt: 44/98
-[155/504] limit_pruning.slt: 4/18
+[154/504] limit.slt: 79/98
+[155/504] limit_pruning.slt: 11/18
 [156/504] limit_single_row_batches.slt: 3/7
 [157/504] list_view.slt: 4/4
-[158/504] listing_table_partitions.slt: 0/21
-[159/504] listing_table_statistics.slt: 0/9
-[160/504] map.slt: 179/197
-[161/504] math.slt: 186/214
+[158/504] listing_table_partitions.slt: 13/21
+[159/504] listing_table_statistics.slt: 4/9
+[160/504] map.slt: 192/197
+[161/504] math.slt: 195/214
 [162/504] merge_into.slt: 21/35
 [163/504] metadata.slt: 5/55
 [164/504] min_max/fixed_size_list.slt: 14/14
 [165/504] min_max/large_list.slt: 42/42
 [166/504] min_max/list.slt: 42/42
 [167/504] misc.slt: 5/5
-[168/504] monotonic_projection_test.slt: 0/26
+[168/504] monotonic_projection_test.slt: 16/26
 [169/504] named_arguments.slt: 35/40
 [170/504] negative_zero.slt: 20/24
 [171/504] nested_loop_join_spill.slt: 4/11
-[172/504] null_aware_anti_join.slt: 66/83
+[172/504] null_aware_anti_join.slt: 73/83
 [173/504] nullif.slt: 28/28
 [174/504] nvl.slt: 18/18
 [175/504] nvl2.slt: 9/9
 [176/504] operator.slt: 11/25
-[177/504] optimizer_group_by_constant.slt: 0/11
+[177/504] optimizer_group_by_constant.slt: 1/11
 [178/504] options.slt: 18/44
-[179/504] order.slt: 74/188
+[179/504] order.slt: 118/188
 [180/504] ordered_aggregate_spill.slt: 6/37
-[181/504] parquet.slt: 6/126
-[182/504] parquet_cdc.slt: 4/26
+[181/504] parquet.slt: 69/126
+[182/504] parquet_cdc.slt: 9/26
 [183/504] parquet_cdc_config.slt: 1/10
-[184/504] parquet_filter_pushdown.slt: 2/133
-[185/504] parquet_max_row_group_bytes.slt: 2/27
-[186/504] parquet_metadata_functions.slt: 0/11
-[187/504] parquet_nested_schema_pruning.slt: 1/64
-[188/504] parquet_sorted_statistics.slt: 1/25
-[189/504] parquet_statistics.slt: 0/26
-[190/504] pg_compat/pg_compat_null.slt: 0/5
-[191/504] pg_compat/pg_compat_simple.slt: 7/15
+[184/504] parquet_filter_pushdown.slt: 77/133
+[185/504] parquet_max_row_group_bytes.slt: 7/27
+[186/504] parquet_metadata_functions.slt: 4/11
+[187/504] parquet_nested_schema_pruning.slt: 49/64
+[188/504] parquet_sorted_statistics.slt: 13/25
+[189/504] parquet_statistics.slt: 11/26
+[190/504] pg_compat/pg_compat_null.slt: 5/5
+[191/504] pg_compat/pg_compat_simple.slt: 15/15
 [192/504] pg_compat/pg_compat_type_coercion.slt: 7/7
 [193/504] pg_compat/pg_compat_types.slt: 20/20
-[194/504] pg_compat/pg_compat_union.slt: 1/7
-[195/504] pg_compat/pg_compat_window.slt: 0/14
+[194/504] pg_compat/pg_compat_union.slt: 7/7
+[195/504] pg_compat/pg_compat_window.slt: 14/14
 [196/504] pipe_operator.slt: 15/15
-[197/504] predicates.slt: 73/141
+[197/504] predicates.slt: 102/141
 [198/504] prepare.slt: 25/110
-[199/504] preserve_file_partitioning.slt: 0/72
-[200/504] projection.slt: 15/34
-[201/504] projection_pushdown.slt: 4/177
+[199/504] preserve_file_partitioning.slt: 37/72
+[200/504] projection.slt: 30/34
+[201/504] projection_pushdown.slt: 101/177
 [202/504] propagate_empty_relation_outer_join.slt: 12/20
 [203/504] push_down_filter_outer_joins.slt: 18/33
-[204/504] push_down_filter_parquet.slt: 2/211
-[205/504] push_down_filter_regression.slt: 0/87
+[204/504] push_down_filter_parquet.slt: 133/211
+[205/504] push_down_filter_regression.slt: 46/87
 [206/504] push_down_filter_unnest.slt: 12/20
 [207/504] push_down_topk_through_join.slt: 39/88
 [208/504] pwmj.slt: 16/25
 [209/504] qualify.slt: 24/26
 [210/504] range_partitioning.slt: 0/171
-[211/504] references.slt: 10/14
+[211/504] references.slt: 13/14
 [212/504] regexp/regexp_count.slt: 46/46
 [213/504] regexp/regexp_instr.slt: 35/35
 [214/504] regexp/regexp_like.slt: 47/51
 [215/504] regexp/regexp_match.slt: 34/34
 [216/504] regexp/regexp_replace.slt: 29/29
-[217/504] repartition.slt: 4/19
-[218/504] repartition_scan.slt: 0/36
-[219/504] repartition_subset_satisfaction.slt: 0/36
+[217/504] repartition.slt: 9/19
+[218/504] repartition_scan.slt: 16/36
+[219/504] repartition_subset_satisfaction.slt: 17/36
 [220/504] run_end_encoded.slt: 5/5
 [221/504] same_column_name_cross_join.slt: 10/10
-[222/504] scalar.slt: 300/328
-[223/504] schema_evolution.slt: 0/24
-[224/504] schema_evolution_nested.slt: 0/11
-[225/504] select.slt: 213/248
+[222/504] scalar.slt: 309/328
+[223/504] schema_evolution.slt: 24/24
+[224/504] schema_evolution_nested.slt: 8/11
+[225/504] select.slt: 230/248
 [226/504] set_variable.slt: 44/185
 [227/504] simplify_expr.slt: 31/47
 [228/504] simplify_predicates.slt: 2/27
 [229/504] slt_features.slt: 0/9
 [230/504] sort_merge_join.slt: 82/93
 [231/504] sort_merge_join_spill.slt: 24/46
-[232/504] sort_pushdown.slt: 124/426
+[232/504] sort_pushdown.slt: 326/426
 [233/504] spark/aggregate/avg.slt: 5/6
 [234/504] spark/aggregate/collect.slt: 0/15
 [235/504] spark/aggregate/collect_window.slt: 20/42
@@ -474,7 +474,7 @@
 [474/504] spark/xml/xpath.slt: 0/0
 [475/504] spark/xml/xpath_boolean.slt: 0/0
 [476/504] spark/xml/xpath_string.slt: 0/0
-[477/504] statistics_registry.slt: 0/24
+[477/504] statistics_registry.slt: 11/24
 [478/504] string/concat.slt: 22/22
 [479/504] string/dictionary_utf8.slt: 111/112
 [480/504] string/large_string.slt: 110/111
@@ -484,48 +484,48 @@
 [484/504] string_numeric_coercion.slt: 86/88
 [485/504] strings.slt: 17/22
 [486/504] struct.slt: 132/268
-[487/504] subquery.slt: 177/277
-[488/504] subquery_sort.slt: 0/16
+[487/504] subquery.slt: 194/277
+[488/504] subquery_sort.slt: 7/16
 [489/504] table_functions.slt: 92/93
-[490/504] to_timestamp_timezone.slt: 3/34
-[491/504] topk.slt: 5/31
+[490/504] to_timestamp_timezone.slt: 9/34
+[491/504] topk.slt: 16/31
 [492/504] tpch/tpch.slt: 0/1
 [493/504] truncate.slt: 5/12
 [494/504] type_coercion.slt: 50/63
-[495/504] union.slt: 55/88
+[495/504] union.slt: 70/88
 [496/504] union_by_name.slt: 41/41
 [497/504] union_function.slt: 10/16
-[498/504] unnest.slt: 146/176
+[498/504] unnest.slt: 165/176
 [499/504] update.slt: 11/18
-[500/504] wildcard.slt: 14/18
-[501/504] window.slt: 292/519
-[502/504] window_limits.slt: 0/73
-[503/504] window_topk_pushdown.slt: 0/12
+[500/504] wildcard.slt: 18/18
+[501/504] window.slt: 401/519
+[502/504] window_limits.slt: 31/73
+[503/504] window_topk_pushdown.slt: 3/12
 [504/504] window_topn.slt: 46/100
 
-16090 of 24783 records pass (64.9%), 504 files, 1 node(s)
-  2168  Error during planning: table … not found"
-  1804  Error during planning: Invalid function ….
-  1612  answer differs
+18462 of 24783 records pass (74.5%), 504 files, 1 node(s)
+  2053  answer differs
+  1805  Error during planning: Invalid function ….
   1055  Error during planning: Statement not supported: SetVariable'
-   271  Error during planning: DDL not supported: CreateExternalTable'
+   353  Error during planning: table … not found"
    259  Error during planning: Statement not supported: ResetVariable'
-   222  CREATE EXTERNAL TABLE isn…s3://\xe2\x80\xa6/*.parquet…\xe2\x80\xa6' AS name (TYPE delta | iceberg)"
-    56  an error was expected
+    70  an error was expected
     40  Execution error: date_part requires non-empty constant string'
     34  SQL error: ParserError(…): sql parser error: Expected: \… or \… after column definition, found: ( at Line: N, Column: N'
+    32  [<class …>]
     32  Error during planning: Statement not supported: Execute'
     28  Schema error: No field named x.'
-    27  [<class …>]
     25  Error during planning: Statement not supported: Prepare'
     23  Schema error: No field named v.'
     22  Optimizer rule … failed
     22  Schema error: No field named v.
     22  Error during planning: Statement not supported: Deallocate'
-    21  no table t'
     19  SQL error: ParserError(…): sql parser error: Expected: ), found: ( at Line: N, Column: N'
-    14  Schema error: No field named a.
-    12  no table aggregate_test_100'
+    17  Error during planning: Column in SELECT must be in GROUP BY or an aggregate function: While expanding wildcard, column … must appear in the 
+    13  files stored as arrow: Pondra reads Parquet, CSV and JSON (a value a line)'
+    11  files stored as avro: Pondra reads Parquet, CSV and JSON (a value a line)'
     11  Error during planning: Internal error: Function … failed to match any signature, errors: Error during planning: Function … requires Decimal,
-    10  no table test_table'
      9  Error during planning: Failed to coerce arguments to satisfy a call to … function: coercion from LargeList(Float64), Decimal128(N, N) to the
+     9  Error during planning: DML not supported: Insert Into'
+     8  Schema error: No field named a.
+     8  Error during planning: DML not supported: COPY'

@@ -1,22 +1,34 @@
 {
  "node": {
-  "the tree lists the lake's schemas, tables with their row counts, views and columns (with SQL types)": true,
+  "the tree lists the lake's schemas, tables and views (each kind its icon), columns with SQL types and glyphs, a key marked, no bare numbers": true,
+  "a table picked shows its details: rows, key, columns (a key's and NOT NULL marked)": true,
+  "Profile: each column's nulls, distinct values, range, and a histogram or its commonest values": true,
+  "a view picked shows its definition": true,
   "a SQL cell shows the rows with their types; timestamps and decimals as written": true,
-  "clicking a table shows its first rows": true,
+  "double-clicking a table shows its first rows": true,
+  "the lake's files are listed by folder, and a data file is read as a table": true,
+  "a long answer draws only the rows in sight, sorts by a header, and its column is summarized in the panel": true,
   "a Python cell runs on the node: what it printed, then its last expression as rows": true,
   "errors in plain words: a SQL one, and a Python one at its line in the cell": true,
+  "Python cells share their variables (one namespace per page, as a notebook's kernel)": true,
+  "a figure a Python cell returns (matplotlib) shows as a picture": true,
+  "the Variables tab lists the page's Python names with their types; Restart empties them": true,
+  "Tab completes a table's name, and lists the choices when several fit (a column first)": true,
   "a live cell shows a row INSERTed over HTTP (a decimal to its scale); off, its query ends": true,
   "keys: Esc, B adds a cell, D D deletes it, Z brings it back; M makes it text; Shift+Enter renders it and starts a new cell": true,
+  "a text cell's headings make the outline, and one clicked selects its cell": true,
+  "O hides a cell's output (its code stays) and a click shows it; ? lists every key": true,
   "a notebook saved in the lake is valid for Jupyter (nbformat), SQL cells as %%sql": true,
   "saved twice: two versions; the first, opened from the sidebar, is what was saved": true,
   "a notebook downloaded is valid for Jupyter too": true,
-  "an .ipynb uploaded opens: its text rendered, its %%sql cell a SQL cell that runs": true,
+  "an .ipynb uploaded opens: its text rendered (its heading the outline), its %%sql cell a SQL cell that runs": true,
   "every request went to the node; no page errors": true
  }
 }
 {
  "tokens": {
-  "with tokens, the page asks for one, then shows the tables (and after a reload)": true
+  "with tokens, the page asks for one, then shows the tables (and after a reload)": true,
+  "a session's Python variables are an admin's to read, as DO is": true
  }
 }
 {
@@ -25,4 +37,11 @@
   "the server's console: every request went to the server; no page errors": true
  }
 }
-{"checks": 15, "passed": 15, "ok": true}
+{
+ "extensions": {
+  "an extension is served (/console/ext/0.js), and its section, panel tab, view of an answer and menu action show beside the console's own": true,
+  "the console's files carry a tag, and a browser that has them gets 304": true,
+  "with an extension: every request went to the node; no page errors": true
+ }
+}
+{"checks": 30, "passed": 30, "ok": true}

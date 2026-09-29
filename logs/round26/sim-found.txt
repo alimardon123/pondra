@@ -1,6 +1,7 @@
+=== simulated R2 (PUT p50 ~197 ms, GET p50 ~100 ms): harness.py found --s3
 /usr/local/lib/python3.11/dist-packages/adbc_driver_manager/dbapi.py:369: Warning: Cannot disable autocommit; conn will not be DB-API 2.0 compliant
   warnings.warn(
-%6|1790670789.258|FAIL|rdkafka#producer-1| [thrd:127.0.0.1:8110/2111747765]: 127.0.0.1:8110/2111747765: Disconnected: connection closed by peer: receive 0 after POLLIN (after 32317ms in state UP)
+%6|1790707388.156|FAIL|rdkafka#producer-1| [thrd:127.0.0.1:8110/2111747765]: 127.0.0.1:8110/2111747765: Disconnected: connection closed by peer: receive 0 after POLLIN (after 34006ms in state UP)
 {
  "found": {
   "a filtered materialized view follows UPDATE and DELETE of its table": true,
@@ -27,8 +28,10 @@
   "a time without seconds is a timestamp: INSERT, CAST, TIMESTAMP '\u2026', a comparison": true,
   "information_schema: a table is a BASE TABLE, a view a VIEW": true,
   "format=typed: decimals and integers past 2^53 exact (as text), others as numbers": true,
-  "to_timestamp(column) and to_timestamp_millis(column, format): TIMESTAMPTZ, as over a literal": true,
+  "to_timestamp(column) and to_timestamp_millis(column, format): TIMESTAMP (no zone; UTC's time for text with one), as over a literal": true,
+  "to_timestamp answers TIMESTAMP (DataFusion's, Spark's), now() TIMESTAMPTZ in UTC": true,
   "files() after PUT /files lists the new file (never a remembered answer)": true
  },
  "ok": true
 }
+exit 0

@@ -1,4 +1,4 @@
-upsert: 394 live keys after 12,000 random upserts/deletes, 6 compactions (s: 0.0, 0.0, 0.0, 0.0, 0.0, 0.0), 1 restart, 3,400 lookups (0 wrong) -> OK
+upsert: 397 live keys after 12,000 random upserts/deletes, 6 compactions (s: 0.0, 0.0, 0.0, 0.0, 0.0, 0.0), 1 restart, 3,400 lookups (0 wrong) -> OK
 {
  "before tiering, every node": true,
  "after the first round, dealt to three nodes: deleted keys stay deleted, every node": true,
@@ -34,7 +34,7 @@ upsert: 394 live keys after 12,000 random upserts/deletes, 6 compactions (s: 0.0
  "DROP SECRET: refused again": true
 }
 ----------------------------------------
-Exception occurred during processing of request from ('127.0.0.1', 42954)
+Exception occurred during processing of request from ('127.0.0.1', 56052)
 Traceback (most recent call last):
   File "/usr/lib/python3.11/socketserver.py", line 691, in process_request_thread
     self.finish_request(request, client_address)
@@ -60,10 +60,10 @@ ConnectionResetError: [Errno 104] Connection reset by peer
  "gcs: COPY … TO into the lake: refused": true,
  "gcs: COPY … TO the store with a secret, read back by its folders": true
 }
-/home/claude/pondra/tools/harness.py:4141: DeprecationWarning: key_serializer does not implement kafka.serializer.Serializer
-  out = {t.__name__: t() for t in (upsert, deal, outside, clouds, kafkas, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, names, answers, writes, live, temps, across, found, renames, server, scale, flight, reader, crash)}
-/home/claude/pondra/tools/harness.py:4141: DeprecationWarning: value_serializer does not implement kafka.serializer.Serializer
-  out = {t.__name__: t() for t in (upsert, deal, outside, clouds, kafkas, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, names, answers, writes, live, temps, across, found, renames, server, scale, flight, reader, crash)}
+/home/claude/pondra/tools/harness.py:4259: DeprecationWarning: key_serializer does not implement kafka.serializer.Serializer
+  out = {t.__name__: t() for t in (upsert, deal, outside, clouds, kafkas, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, live, temps, across, found, renames, server, scale, flight, reader, crash)}
+/home/claude/pondra/tools/harness.py:4259: DeprecationWarning: value_serializer does not implement kafka.serializer.Serializer
+  out = {t.__name__: t() for t in (upsert, deal, outside, clouds, kafkas, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, live, temps, across, found, renames, server, scale, flight, reader, crash)}
 {
  "a Pondra node's Kafka port, SASL PLAIN from a secret: its table as a topic": true,
  "…a wrong password: refused": true,
@@ -76,9 +76,9 @@ ConnectionResetError: [Errno 104] Connection reset by peer
  "…its feed kept apart from the lake's functions (`/functions` lists them)": true
 }
 tiering: 12 rounds -> files {'events': 5, 'kv': 5, 'totals': 5}, untiered rows 0, rows {'events': 1200, 'kv': {'n': 200, 'v': 2400}, 'totals': 1200} -> OK
-fence: 2nd node joined as follower=True; takeover after 6.0s; stale leader's write rejected; it rejoined as follower; rows=[{'producer': 'a', 'n': 200}, {'producer': 'b', 'n': 200}] -> OK
+fence: 2nd node joined as follower=True; takeover after 6.1s; stale leader's write rejected; it rejoined as follower; rows=[{'producer': 'a', 'n': 200}, {'producer': 'b', 'n': 200}] -> OK
 insert: first={'rows': 5} retry={'duplicate': True} summary={'groups': 5, 'n': 5000} -> OK
-{"serverless": {"alone_s": 0.05, "retry": ["{\"rows\":1000}", "{\"duplicate\":true}"], "four_at_once": ["{\"rows\":1000}", "{\"rows\":1000}", "{\"rows\":1000}", "{\"rows\":1000}"], "node_start_s": 0.02, "node_leads": true, "via_node_s": 0.04, "after_leader_killed_s": 30.15, "rows": {"n": 8000, "ids": 1000}, "ok": true}}
+{"serverless": {"alone_s": 0.04, "retry": ["{\"rows\":1000}", "{\"duplicate\":true}"], "four_at_once": ["{\"rows\":1000}", "{\"rows\":1000}", "{\"rows\":1000}", "{\"rows\":1000}"], "node_start_s": 0.04, "node_leads": true, "via_node_s": 0.06, "after_leader_killed_s": 30.17, "rows": {"n": 8000, "ids": 1000}, "ok": true}}
 {
  "clients": {
   "no token -> 401": true,
@@ -100,15 +100,15 @@ insert: first={'rows': 5} retry={'duplicate': True} summary={'groups': 5, 'n': 5
   "SQL can't touch the node's files": true,
   "MCP": true
  },
- "inbox_s": 0.55,
+ "inbox_s": 0.59,
  "ok": true
 }
-/home/claude/pondra/tools/harness.py:4141: DeprecationWarning: value_serializer does not implement kafka.serializer.Serializer
-  out = {t.__name__: t() for t in (upsert, deal, outside, clouds, kafkas, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, names, answers, writes, live, temps, across, found, renames, server, scale, flight, reader, crash)}
-%3|1790669336.172|FAIL|rdkafka#producer-10| [thrd:sasl_plaintext://127.0.0.1:8110/bootstrap]: sasl_plaintext://127.0.0.1:8110/bootstrap: SASL authentication error: wrong user name or password (after 0ms in state AUTH_REQ)
-%3|1790669336.394|FAIL|rdkafka#producer-10| [thrd:sasl_plaintext://127.0.0.1:8110/bootstrap]: sasl_plaintext://127.0.0.1:8110/bootstrap: SASL authentication error: wrong user name or password (after 0ms in state AUTH_REQ, 1 identical error(s) suppressed)
-%5|1790669339.177|PARTCNT|rdkafka#producer-11| [thrd:sasl_plaintext://127.0.0.1:8110/2111747765]: Topic events (id AAAAAAAAAAAAAAAAAAAAAA) partition count changed from 1 to 0
-%6|1790669339.196|FAIL|rdkafka#producer-11| [thrd:sasl_plaintext://127.0.0.1:8110/2111747765]: sasl_plaintext://127.0.0.1:8110/2111747765: Disconnected: connection closed by peer: receive 0 after POLLIN (after 18ms in state UP)
+/home/claude/pondra/tools/harness.py:4259: DeprecationWarning: value_serializer does not implement kafka.serializer.Serializer
+  out = {t.__name__: t() for t in (upsert, deal, outside, clouds, kafkas, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, live, temps, across, found, renames, server, scale, flight, reader, crash)}
+%3|1790706347.726|FAIL|rdkafka#producer-10| [thrd:sasl_plaintext://127.0.0.1:8110/bootstrap]: sasl_plaintext://127.0.0.1:8110/bootstrap: SASL authentication error: wrong user name or password (after 0ms in state AUTH_REQ)
+%3|1790706347.908|FAIL|rdkafka#producer-10| [thrd:sasl_plaintext://127.0.0.1:8110/bootstrap]: sasl_plaintext://127.0.0.1:8110/bootstrap: SASL authentication error: wrong user name or password (after 0ms in state AUTH_REQ, 1 identical error(s) suppressed)
+%5|1790706351.728|PARTCNT|rdkafka#producer-11| [thrd:sasl_plaintext://127.0.0.1:8110/2111747765]: Topic events (id AAAAAAAAAAAAAAAAAAAAAA) partition count changed from 1 to 0
+%6|1790706351.737|FAIL|rdkafka#producer-11| [thrd:sasl_plaintext://127.0.0.1:8110/2111747765]: sasl_plaintext://127.0.0.1:8110/2111747765: Disconnected: connection closed by peer: receive 0 after POLLIN (after 8ms in state UP)
 {
  "kafka": {
   "librdkafka (5 codecs, idempotent) + kafka-python": true,
@@ -123,7 +123,7 @@ insert: first={'rows': 5} retry={'duplicate': True} summary={'groups': 5, 'n': 5
   "consumer groups (commit, hand-over via a follower, one holder)": true,
   "wrong password / read token refused": true
  },
- "librdkafka_20k_events_s": 2.21,
+ "librdkafka_20k_events_s": 2.6,
  "ok": true
 }
 {
@@ -137,14 +137,14 @@ insert: first={'rows': 5} retry={'duplicate': True} summary={'groups': 5, 'n': 5
   "a clash is refused": true,
   "Delta and Iceberg readers": true
  },
- "rows_written_during": 59300,
+ "rows_written_during": 53900,
  "outside_readers": {
-  "delta-rs": 59303,
-  "polars": 59303,
-  "duckdb": 59303,
-  "iceberg/pyiceberg": 59303,
-  "iceberg/polars": 59303,
-  "iceberg/duckdb": 59303
+  "delta-rs": 53903,
+  "polars": 53903,
+  "duckdb": 53903,
+  "iceberg/pyiceberg": 53903,
+  "iceberg/polars": 53903,
+  "iceberg/duckdb": 53903
  },
  "ok": true
 }
@@ -234,12 +234,11 @@ insert: first={'rows': 5} retry={'duplicate': True} summary={'groups': 5, 'n': 5
  },
  "ok": true,
  "learned": [
-  true,
   true
  ],
  "few_groups_mb": 0.0
 }
-{"files": {"passed": true, "checks": {"all rows": true, "a Parquet file per tiering round (every 10 s), not per INSERT": true, "about one object write per INSERT (\u2264 1.2, and \u2264 2 a second meanwhile)": true, "write-ahead log objects left (\u2264 30)": true, "a pondra sql INSERT's files recorded as written": true}, "secs": 0.7, "parquet_files_made": 0, "writes_per_insert": 1.0, "wal_objects_left": 2, "cli_insert": {"files": 3, "files_seen": 3}}}
+{"files": {"passed": true, "checks": {"all rows": true, "a Parquet file per tiering round (every 10 s), not per INSERT": true, "about one object write per INSERT (\u2264 1.2, and \u2264 2 a second meanwhile)": true, "write-ahead log objects left (\u2264 30)": true, "a pondra sql INSERT's files recorded as written": true}, "secs": 0.8, "parquet_files_made": 0, "writes_per_insert": 1.0, "wal_objects_left": 2, "cli_insert": {"files": 3, "files_seen": 3}}}
 {"layouts": {"passed": true, "checks": {"every round as the model": true, "files: one day each, sorted by user": true, "lookup of a moved row": true, "delta-rs sees what Pondra sees": true}, "rounds": 10, "rows": 309, "delta_rows": 309, "pondra": {"n": 309, "s": 314895}}}
 {"clusters": {"passed": true, "checks": {"all rows": true, "row groups narrow in a and in b (each < 0.75 of the whole)": true}, "row_group_span": {"app": {"a": 0.42, "b": 0.46}, "kv": {"a": 0.42, "b": 0.46}}, "rows": {"app": 2000000, "kv": 2000000}}}
 {"copies": {"passed": true, "checks": {"COPY FROM STDIN, text and CSV": true, "COPY TO STDOUT, text": true, "COPY TO STDOUT, binary": true, "COPY TO STDOUT, csv": true, "ADBC Postgres driver (Arrow)": true, "DECIMAL as NUMERIC, text and binary": true}}}
@@ -259,34 +258,34 @@ insert: first={'rows': 5} retry={'duplicate': True} summary={'groups': 5, 'n': 5
   "refused: a system column": true,
   "Delta and Iceberg readers (by column id / physical name)": true
  },
- "rows": 90520,
+ "rows": 89370,
  "outside_readers": {
   "duckdb/delta": [
-   90520,
-   70004094458690,
-   34050
+   89370,
+   70253991000365,
+   32200
   ],
   "duckdb/iceberg": [
-   90520,
-   70004094458690,
-   34050
+   89370,
+   70253991000365,
+   32200
   ],
   "pyiceberg": [
-   90520,
-   70004094458690,
-   34050
+   89370,
+   70253991000365,
+   32200
   ],
   "delta-rs": [
-   90520,
-   70004094458690,
-   34050
+   89370,
+   70253991000365,
+   32200
   ],
   "delta-rs pyarrow": "refused"
  },
  "expected": [
-  90520,
-  70004094458690,
-  34050
+  89370,
+  70253991000365,
+  32200
  ],
  "ok": true
 }
@@ -309,7 +308,7 @@ insert: first={'rows': 5} retry={'duplicate': True} summary={'groups': 5, 'n': 5
   "per_user2 == its query (:8091)": true,
   "evens2 == its query (:8091)": true
  },
- "rows": 163328,
+ "rows": 157228,
  "ok": true
 }
 {
@@ -360,6 +359,7 @@ insert: first={'rows': 5} retry={'duplicate': True} summary={'groups': 5, 'n': 5
   "DO over Postgres: NOTICE, tag DO (the language after the code, as Postgres allows)": true,
   "DO LANGUAGE sql: its statements, in order": true,
   "DO: only an admin runs one; an error at the line in its code; other languages said so": true,
+  "a session's Python cells share variables, imports and frames; another session's and a block in none don't; ending the session ends them": true,
   "--python without tokens only on 127.0.0.1": true,
   "pondra run: a .sql file with parameters, on a node started for it": true
  },
@@ -399,10 +399,25 @@ Session.login_data is deprecated and will be removed in version 2.0
   "@db.function / @db.procedure: the notebook's imports, helper and constant go along; SQL, frames and here agree": true,
   "\u2026a DataFrame it uses is refused, with the fix": true,
   "PL/Python as Postgres runs it: plpy.execute, plpy.notice": true,
-  "a warm CALL takes under 10 ms (median 2.3 ms); vectorized 14.6M rows/s, per row 6.46M rows/s": true,
+  "a warm CALL takes under 10 ms (median 2.4 ms); vectorized 15.9M rows/s, per row 5.40M rows/s": true,
   "a task through a leader failover: each tick's writes once (11 ticks, 11 runs), and on after it (4 before)": true,
   "idle workers are gone after PONDRA_WORKER_IDLE_SECS": true,
   "the shell: CALL prints what the procedure printed": true
+ },
+ "ok": true
+}
+{
+ "external": {
+  "CSV: declared columns by position, typed as declared, a relative LOCATION where the node runs": true,
+  "Parquet: a folder's files, declared columns by name, one they don't hold NULL (and IS NULL finds it)": true,
+  "JSON: declared columns by name, others left out": true,
+  "a view of a folder: empty before its files; INSERT writes a new file there, from a node and from pondra sql": true,
+  "PARTITIONED BY: its keys' folders, typed as declared, made by INSERT": true,
+  "information_schema lists each as a VIEW, and not the tables of files they read": true,
+  "an existing name: refused, kept with IF NOT EXISTS, replaced with OR REPLACE": true,
+  "DROP TABLE drops it; its file stays": true,
+  "what it can't do, it says: INSERT into one file, UPDATE, Avro, gzip, no files, TEMPORARY, an option it doesn't read, INSERT into a view; others' files need the owner": true,
+  "the lake's own files read as a table by any reader, and nothing else of its folder; /objects says each object's kind": true
  },
  "ok": true
 }
@@ -430,8 +445,8 @@ Session.login_data is deprecated and will be removed in version 2.0
  },
  "ok": true
 }
-Commit failed due to a concurrent update, retrying (1/4) in 105 ms
-Commit failed due to a concurrent update, retrying (1/4) in 108 ms
+Commit failed due to a concurrent update, retrying (1/4) in 109 ms
+Commit failed due to a concurrent update, retrying (1/4) in 103 ms
 {
  "writes": {
   "PyIceberg appends through a follower: the rows are the table's own (row ids), the writer's files gone, its snapshot found by its id": true,
@@ -446,7 +461,7 @@ Commit failed due to a concurrent update, retrying (1/4) in 108 ms
 }
 {
  "live": {
-  "an answer at once, then one after each commit that changes it ([10, 13] ms), none for other tables or the same answer": true,
+  "an answer at once, then one after each commit that changes it ([9, 15] ms), none for other tables or the same answer": true,
   "closed: nothing runs for it on the node (/stats live_queries back to 0)": true,
   "JavaScript: for await (const rows of db.live(sql))": true,
   "refused by name: rows sent with it, and a write": true
@@ -476,8 +491,8 @@ Commit failed due to a concurrent update, retrying (1/4) in 108 ms
 }
 /usr/local/lib/python3.11/dist-packages/adbc_driver_manager/dbapi.py:369: Warning: Cannot disable autocommit; conn will not be DB-API 2.0 compliant
   warnings.warn(
-%6|1790669569.743|FAIL|rdkafka#producer-12| [thrd:127.0.0.1:8110/2111747765]: 127.0.0.1:8110/2111747765: Disconnected: connection closed by peer: receive 0 after POLLIN (after 1093ms in state UP)
-%3|1790669569.743|FAIL|rdkafka#producer-12| [thrd:127.0.0.1:8110/bootstrap]: 127.0.0.1:8110/bootstrap: Connect to ipv4#127.0.0.1:8110 failed: Connection refused (after 0ms in state CONNECT)
+%6|1790706610.350|FAIL|rdkafka#producer-12| [thrd:127.0.0.1:8110/2111747765]: 127.0.0.1:8110/2111747765: Disconnected: connection closed by peer: receive 0 after POLLIN (after 1042ms in state UP)
+%3|1790706610.350|FAIL|rdkafka#producer-12| [thrd:127.0.0.1:8110/bootstrap]: 127.0.0.1:8110/bootstrap: Connect to ipv4#127.0.0.1:8110 failed: Connection refused (after 0ms in state CONNECT)
 {
  "found": {
   "a filtered materialized view follows UPDATE and DELETE of its table": true,
@@ -504,7 +519,8 @@ Commit failed due to a concurrent update, retrying (1/4) in 108 ms
   "a time without seconds is a timestamp: INSERT, CAST, TIMESTAMP '\u2026', a comparison": true,
   "information_schema: a table is a BASE TABLE, a view a VIEW": true,
   "format=typed: decimals and integers past 2^53 exact (as text), others as numbers": true,
-  "to_timestamp(column) and to_timestamp_millis(column, format): TIMESTAMPTZ, as over a literal": true,
+  "to_timestamp(column) and to_timestamp_millis(column, format): TIMESTAMP (no zone; UTC's time for text with one), as over a literal": true,
+  "to_timestamp answers TIMESTAMP (DataFusion's, Spark's), now() TIMESTAMPTZ in UTC": true,
   "files() after PUT /files lists the new file (never a remembered answer)": true
  },
  "ok": true
@@ -524,13 +540,17 @@ Commit failed due to a concurrent update, retrying (1/4) in 108 ms
  "server": {
   "the folder's lakes are its databases, none running until used": true,
   "psql and HTTP reach each database by name; no /db/ means the default (lake)": true,
+  "each database's node gets pondra serve's options (--memory-gb 1.5 here)": true,
   "a query joins across databases (name.schema.table)": true,
   "the console is at /": true,
   "CREATE DATABASE makes one, DROP DATABASE drops it, folder and all; an unknown one is said so": true,
   "idle databases stop, and start again when used": true,
+  "a database with a connection open isn't stopped, however long it is idle; closed, it stops": true,
   "another node joins a database's cluster through the server, and writes through it": true,
   "killed and started again, the server serves the same databases": true,
-  "--flight is refused by name (a Flight port means one lake)": true,
+  "--flight is refused by name (a Flight port is one lake's)": true,
+  "--lake on a folder of lakes, or --lakes on a lake, is refused and says which was meant": true,
+  "a folder holding other things isn't made a lake, and nor is this folder unless named": true,
   "stopped, the server stops its databases' nodes": true
  },
  "ok": true
@@ -585,8 +605,8 @@ Commit failed due to a concurrent update, retrying (1/4) in 108 ms
  "days": 139,
  "files": {
   "inline": 64.0,
-  "sealed": 143.0,
-  "parquet_objects": 539,
+  "sealed": 145.0,
+  "parquet_objects": 542,
   "one_day_scanned": 2.0
  },
  "outside_readers": {
@@ -601,7 +621,6 @@ Commit failed due to a concurrent update, retrying (1/4) in 108 ms
 }
 /usr/local/lib/python3.11/dist-packages/adbc_driver_manager/dbapi.py:369: Warning: Cannot disable autocommit; conn will not be DB-API 2.0 compliant
   warnings.warn(
-{"time":"2026-09-29T13:13:17.077978017+05:00","level":"ERROR","msg":"FlightSQL endpoint DoGet failed","connection_id":"conn-2512049bf2ff","statement_id":"stmt-fb36141a7d01","endpointIndex":0,"numEndpoints":1,"ticketBytes":78,"locations":"<empty: using default client connection>","err":"rpc error: code = Canceled desc = context canceled","elapsed":"no batches received before failure; elapsed=2.51618ms"}
 {
  "flight": {
   "DoPut: 10 batches acked": true,
@@ -618,29 +637,29 @@ Commit failed due to a concurrent update, retrying (1/4) in 108 ms
   "ADBC write as a query, ingest, objects": true,
   "every row once": true
  },
- "follow_ms": 9,
+ "follow_ms": 19,
  "ok": true
 }
-reader: send -> visible on a separate read-only node: p50 8 ms, p99 79 ms; after a failover, 0.0 s after the new leader's ack
-run  1: kill-9=2 injected={'after_seg_put': 0, 'after_commit': 1, 'after_parquet_put': 3} events=9000/9000 unique=9000 task_output=4500/4500 views=exact -> OK
-run  2: kill-9=1 injected={'after_seg_put': 0, 'after_commit': 0, 'after_parquet_put': 2} events=9000/9000 unique=9000 task_output=4500/4500 views=exact -> OK
-run  3: kill-9=1 injected={'after_seg_put': 0, 'after_commit': 0, 'after_parquet_put': 4} events=9000/9000 unique=9000 task_output=4500/4500 views=exact -> OK
-run  4: kill-9=0 injected={'after_seg_put': 0, 'after_commit': 0, 'after_parquet_put': 0} events=9000/9000 unique=9000 task_output=4500/4500 views=exact -> OK
-run  5: kill-9=0 injected={'after_seg_put': 0, 'after_commit': 0, 'after_parquet_put': 1} events=9000/9000 unique=9000 task_output=4500/4500 views=exact -> OK
+reader: send -> visible on a separate read-only node: p50 10 ms, p99 98 ms; after a failover, 0.6 s after the new leader's ack
+run  1: kill-9=2 injected={'after_seg_put': 0, 'after_commit': 0, 'after_parquet_put': 4} events=9000/9000 unique=9000 task_output=4500/4500 views=exact -> OK
+run  2: kill-9=2 injected={'after_seg_put': 0, 'after_commit': 0, 'after_parquet_put': 5} events=9000/9000 unique=9000 task_output=4500/4500 views=exact -> OK
+run  3: kill-9=1 injected={'after_seg_put': 0, 'after_commit': 0, 'after_parquet_put': 5} events=9000/9000 unique=9000 task_output=4500/4500 views=exact -> OK
+run  4: kill-9=2 injected={'after_seg_put': 0, 'after_commit': 0, 'after_parquet_put': 1} events=9000/9000 unique=9000 task_output=4500/4500 views=exact -> OK
+run  5: kill-9=1 injected={'after_seg_put': 0, 'after_commit': 0, 'after_parquet_put': 1} events=9000/9000 unique=9000 task_output=4500/4500 views=exact -> OK
 {
  "events_per_s": 1200,
  "ack_ms_p50": 251,
- "ack_ms_p99": 256,
- "freshness_ms_p50": 166,
- "freshness_ms_p99": 265,
- "freshness_samples": 47,
+ "ack_ms_p99": 255,
+ "freshness_ms_p50": 135,
+ "freshness_ms_p99": 257,
+ "freshness_samples": 49,
  "commits_per_s": 4.0,
  "commit_ms_p50": 2,
  "commit_ms_p95": 3,
- "server_cores_used": 0.08
+ "server_cores_used": 0.09
 }
 {
- "upsert": "12,000 random upserts/deletes with compactions and a restart match the model exactly (394 live keys)",
+ "upsert": "12,000 random upserts/deletes with compactions and a restart match the model exactly (397 live keys)",
  "deal": "a keyed table's and a view's first tiering round, dealt to three nodes: markers and changes kept",
  "outside": "files outside the lake (S3, a web server, this machine), secrets: all 27 checks pass",
  "clouds": "lakes and files on gcs (emulated): all 5 checks pass",
@@ -648,10 +667,10 @@ run  5: kill-9=0 injected={'after_seg_put': 0, 'after_commit': 0, 'after_parquet
  "tiering": "12 rounds of writes and tiering: log drained, files bounded ({'events': 5, 'kv': 5, 'totals': 5}), every row exact",
  "fence": "a frozen leader is replaced; when it wakes, its write is rejected (fenced) and it rejoins as a follower; nothing lost",
  "insert": "bulk INSERT \u2026 SELECT writes Parquet directly; a retried job id is applied once",
- "serverless": "INSERT from a process with no server: 0.05s alone, 4 at once, retries once; a node on the idle lake leads in 0.02s; via a running leader 0.04s; after the leader is killed 30.15s; 8000 rows, no duplicates",
+ "serverless": "INSERT from a process with no server: 0.04s alone, 4 at once, retries once; a node on the idle lake leads in 0.04s; via a running leader 0.06s; after the leader is killed 30.17s; 8000 rows, no duplicates",
  "clients": "SQL writes, Python client, Postgres (4 drivers), tokens, change-feed replay, attached lake, inbox (0.6s), vector search, MCP, no file access from SQL: all 18 checks pass",
  "kafka": "Kafka: librdkafka (5 codecs, idempotent) and kafka-python producers, exactly-once retries, Debezium, tombstones, raw values as JSON, consumers, consumer groups, SASL tokens: all 11 checks pass",
- "alter": "ALTER TABLE ADD COLUMN under load (59,300 rows written meanwhile): old rows null, new ones set, keyed table, view, bulk and Arrow appends, 6 outside readers: all 8 checks pass",
+ "alter": "ALTER TABLE ADD COLUMN under load (53,900 rows written meanwhile): old rows null, new ones set, keyed table, view, bulk and Arrow appends, 6 outside readers: all 8 checks pass",
  "windows": "event-time windows: closed by the data's own time, each emitted once, final; rows out of order within the lateness count; late rows update the view only; a leader restart emits nothing twice",
  "sessions": "session windows: each closed by event time, emitted once, whole; out-of-order rows within the lateness join their session; late rows inside an emitted session are left out; a leader restart emits nothing twice",
  "asof": "point-in-time joins: each streamed trade priced as of its own time, late ones too; ad hoc queries agree; non-as-of conditions refused",
@@ -668,7 +687,7 @@ run  5: kill-9=0 injected={'after_seg_put': 0, 'after_commit': 0, 'after_parquet
    "write-ahead log objects left (\u2264 30)": true,
    "a pondra sql INSERT's files recorded as written": true
   },
-  "secs": 0.7,
+  "secs": 0.8,
   "parquet_files_made": 0,
   "writes_per_insert": 1.0,
   "wal_objects_left": 2,
@@ -734,34 +753,35 @@ run  5: kill-9=0 injected={'after_seg_put': 0, 'after_commit': 0, 'after_parquet
   "pairs": 203,
   "windows": 52
  },
- "columns": "RENAME/DROP/ADD again/widen under streaming (90,520 rows), 3 nodes, bulk INSERT, UPDATE, a keyed table, 5 outside readers: all 12 checks pass",
- "fills": "views filled from existing rows while 163,328 rows streamed in, made again, and through a leader restart: all 12 checks pass",
+ "columns": "RENAME/DROP/ADD again/widen under streaming (89,370 rows), 3 nodes, bulk INSERT, UPDATE, a keyed table, 5 outside readers: all 12 checks pass",
+ "fills": "views filled from existing rows while 157,228 rows streamed in, made again, and through a leader restart: all 12 checks pass",
  "dedup": "deduplication by event time: 2,400 rows out of order over 191 keys, a delete and late rows, compaction, Delta: all 8 checks pass",
- "procedures": "macros, procedures (SQL and Python) and scripts on three nodes: all 33 checks pass",
+ "procedures": "macros, procedures (SQL and Python) and scripts on three nodes: all 34 checks pass",
  "functions": "functions and procedures in SQL and Python on three nodes: all 31 checks pass",
+ "external": true,
  "names": "names: 69 names in the docs' table run, fallbacks equal, Delta and Iceberg folders: all 7 checks pass",
  "answers": "answers: reused within their lifetime, by definition and arguments, only after success: all 7 checks pass",
  "writes": "writes: PyIceberg and Pondra append through the Iceberg REST catalog, once each, views following: all 7 checks pass",
- "live": "live: answers pushed within 13 ms of a commit that changes them, nothing when closed: all 4 checks pass",
+ "live": "live: answers pushed within 15 ms of a commit that changes them, nothing when closed: all 4 checks pass",
  "temps": "temps: a session's own tables and views, every statement, on its node: all 8 checks pass",
  "across": "across: changes to an attached lake from any node: all 3 checks pass",
- "found": "found: what writing the docs found, fixed: all 26 checks pass",
+ "found": "found: what writing the docs found, fixed: all 27 checks pass",
  "renames": "renames: ALTER TABLE | VIEW \u2026 RENAME TO, rows, files and copies kept, a follower, views by name: all 6 checks pass",
- "server": "server: a folder of lakes as databases over Postgres and HTTP, created, dropped, idle-stopped, joined, restarted: all 10 checks pass",
- "scale": "scale: 23,100 rows over 139 daily partitions, 207 files (143 sealed), every file one day, a day's query reads 2 files, 3 nodes, 29 of 29 queries spread, 16 shuffled, 8 by key ranges (all equal to one node), 6 outside readers, a 50 MB memory limit: all 12 checks pass",
- "flight": "Arrow Flight: pyarrow DoPut exactly-once (retried stream applied once, via a follower too), DoGet SQL, FlightInfo, ListFlights, the log as a columnar stream (a subscriber has each new commit in 9 ms), tokens and handshake; ADBC queries, writes, ingest and catalog: all 13 checks pass",
- "reader": "freshness on a separate read-only node: p50 8 ms, p99 79 ms; after a failover 0.0 s",
- "crash": "5/5 runs, 0 lost, 0 duplicated (events, streaming-task output, views); crashes survived: {'after_seg_put': 0, 'after_commit': 1, 'after_parquet_put': 10, 'kill -9': 4}",
+ "server": "server: a folder of lakes as databases over Postgres and HTTP, created, dropped, idle-stopped, joined, restarted: all 14 checks pass",
+ "scale": "scale: 23,100 rows over 139 daily partitions, 209 files (145 sealed), every file one day, a day's query reads 2 files, 3 nodes, 29 of 29 queries spread, 16 shuffled, 8 by key ranges (all equal to one node), 6 outside readers, a 50 MB memory limit: all 12 checks pass",
+ "flight": "Arrow Flight: pyarrow DoPut exactly-once (retried stream applied once, via a follower too), DoGet SQL, FlightInfo, ListFlights, the log as a columnar stream (a subscriber has each new commit in 19 ms), tokens and handshake; ADBC queries, writes, ingest and catalog: all 13 checks pass",
+ "reader": "freshness on a separate read-only node: p50 10 ms, p99 98 ms; after a failover 0.6 s",
+ "crash": "5/5 runs, 0 lost, 0 duplicated (events, streaming-task output, views); crashes survived: {'after_seg_put': 0, 'after_commit': 0, 'after_parquet_put': 16, 'kill -9': 8}",
  "load": {
   "events_per_s": 1200,
   "ack_ms_p50": 251,
-  "ack_ms_p99": 256,
-  "freshness_ms_p50": 166,
-  "freshness_ms_p99": 265,
-  "freshness_samples": 47,
+  "ack_ms_p99": 255,
+  "freshness_ms_p50": 135,
+  "freshness_ms_p99": 257,
+  "freshness_samples": 49,
   "commits_per_s": 4.0,
   "commit_ms_p50": 2,
   "commit_ms_p95": 3,
-  "server_cores_used": 0.08
+  "server_cores_used": 0.09
  }
 }

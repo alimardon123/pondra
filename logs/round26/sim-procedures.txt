@@ -1,3 +1,4 @@
+=== simulated R2 (PUT p50 ~197 ms, GET p50 ~100 ms): harness.py procedures --s3
 {
  "procedures": {
   "a macro made on a follower is used there at once": true,
@@ -31,8 +32,10 @@
   "DO over Postgres: NOTICE, tag DO (the language after the code, as Postgres allows)": true,
   "DO LANGUAGE sql: its statements, in order": true,
   "DO: only an admin runs one; an error at the line in its code; other languages said so": true,
+  "a session's Python cells share variables, imports and frames; another session's and a block in none don't; ending the session ends them": true,
   "--python without tokens only on 127.0.0.1": true,
   "pondra run: a .sql file with parameters, on a node started for it": true
  },
  "ok": true
 }
+exit 0

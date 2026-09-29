@@ -1,0 +1,6 @@
+ok    brand/mark.svg's colours are brand/colors.css's (on light, on dark)
+ok    brand/mark.svg draws in currentColor, its root class pondra-mark
+ok    no copy of the mark, and no other logo or favicon, anywhere else in the repository
+ok    the console's page takes its mark, icon and colours from brand/
+ok    the docs site makes its header's marks and favicon from brand/, and its accent from colors.css
+ok    a node's console shows brand/mark.svg in its header and as its icon, and colors.css's colours
