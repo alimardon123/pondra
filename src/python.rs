@@ -150,21 +150,26 @@ impl Pool {
                 return Ok(lent);
             }
         }
-        let mut cmd = tokio::process::Command::new(exe()?);
-        cmd.args(["-m", "pondra.worker"]).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).kill_on_drop(true);
-        if let Some(p) = &self.path {
-            let old = std::env::var("PYTHONPATH").unwrap_or_default();
-            cmd.env("PYTHONPATH", if old.is_empty() { p.clone() } else { format!("{p}{}{old}", if cfg!(windows) { ";" } else { ":" }) });
-        }
-        let mut child = cmd.spawn().with_context(|| format!("couldn't start {} -m pondra.worker", exe().unwrap_or("python")))?;
-        let (input, output) = (child.stdin.take().expect("piped"), BufReader::new(child.stdout.take().expect("piped")));
-        lent.worker = Some(Worker { child, input, output, idle_since: Instant::now() });
+        lent.worker = Some(spawn(self.path.as_deref())?);
         let _idle = self.idle.lock().unwrap(); // (the reaper decides to stop under this lock)
         if !self.reaping.swap(true, Ordering::SeqCst) {
             tokio::spawn(reap(self.clone()));
         }
         Ok(lent)
     }
+}
+
+/// A new worker, its packages (if any) on its path.
+fn spawn(path: Option<&str>) -> Result<Worker> {
+    let mut cmd = tokio::process::Command::new(exe()?);
+    cmd.args(["-m", "pondra.worker"]).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).kill_on_drop(true);
+    if let Some(p) = path {
+        let old = std::env::var("PYTHONPATH").unwrap_or_default();
+        cmd.env("PYTHONPATH", if old.is_empty() { p.to_string() } else { format!("{p}{}{old}", if cfg!(windows) { ";" } else { ":" }) });
+    }
+    let mut child = cmd.spawn().with_context(|| format!("couldn't start {} -m pondra.worker", exe().unwrap_or("python")))?;
+    let (input, output) = (child.stdin.take().expect("piped"), BufReader::new(child.stdout.take().expect("piped")));
+    Ok(Worker { child, input, output, idle_since: Instant::now() })
 }
 
 impl Lent {
@@ -193,9 +198,10 @@ async fn reap(pool: Arc<Pool>) {
     }
 }
 
-/// The workers running now on this node (idle or busy), for `/stats` and the tests.
+/// The workers running now on this node (idle or busy, sessions' too), for `/stats` and the tests.
 pub fn workers() -> usize {
-    POOLS.lock().unwrap().values().map(|p| p.idle.lock().unwrap().len() + p.busy.load(Ordering::SeqCst)).sum()
+    let pooled: usize = POOLS.lock().unwrap().values().map(|p| p.idle.lock().unwrap().len() + p.busy.load(Ordering::SeqCst)).sum();
+    pooled + KERNELS.lock().unwrap().values().filter(|k| k.0.try_lock().map_or(true, |k| k.is_some())).count()
 }
 
 /// A worker's resident memory in MB (Linux; elsewhere unknown).
@@ -274,6 +280,89 @@ pub async fn ask(packages: &str, kind: Use, head: Value, parts: Vec<Vec<u8>>, li
                 Some(s) => e.context(format!("the Python worker ended ({s})")),
                 None => e,
             })
+        }
+    }
+}
+
+// ---------------------------------------------------------------- a session's own (ADR-032)
+
+/// A session's Python: its cells — the console's, and DO blocks a client sends in a session — run
+/// on one worker kept for it, in one namespace, so each sees what the cells before it made, as a
+/// notebook's kernel does. One cell runs at a time. It ends with its session (`temp::end`), after
+/// `PONDRA_SESSION_IDLE_SECS` idle (3600), or past its memory (`PONDRA_WORKER_MB`); the next cell
+/// then starts a new one, empty, and says so.
+struct Kernel {
+    worker: Worker,
+}
+
+type Slot = Arc<tokio::sync::Mutex<Option<Kernel>>>;
+static KERNELS: LazyLock<Mutex<HashMap<String, (Slot, Instant)>>> = LazyLock::new(Default::default);
+
+/// A cell of `session`'s, on its worker (made now if it has none), and its answer.
+pub async fn ask_session(session: &str, head: Value, parts: Vec<Vec<u8>>, limit: Option<Duration>, notice: &mut (dyn FnMut(String) + Send)) -> Result<(Value, Vec<Vec<u8>>)> {
+    let slot = {
+        let mut all = KERNELS.lock().unwrap();
+        if all.is_empty() {
+            tokio::spawn(reap_kernels()); // (only while there are some)
+        }
+        let e = all.entry(session.to_string()).or_insert_with(|| (Slot::default(), Instant::now()));
+        e.1 = Instant::now();
+        e.0.clone()
+    };
+    let mut kernel = slot.lock().await; // (a session's cells, one after another)
+    let _slot = pool("").await?.procedures.clone().acquire_owned().await?; // (as a procedure: the node's slots for them)
+    if kernel.as_mut().is_some_and(|k| k.worker.child.try_wait().ok().flatten().is_some()) {
+        *kernel = None;
+        notice("Python started again: this session's worker had stopped, and the variables it held are gone".into());
+    }
+    if kernel.is_none() {
+        *kernel = Some(Kernel { worker: spawn(None)? });
+    }
+    let w = &mut kernel.as_mut().expect("a kernel").worker;
+    let exchange = async {
+        send(w, &head, &parts).await?;
+        loop {
+            let (h, parts) = recv(w).await?;
+            match h.get("notice").and_then(Value::as_str) {
+                Some(n) => notice(n.to_string()),
+                None => return anyhow::Ok((h, parts)),
+            }
+        }
+    };
+    let answer = match limit {
+        Some(l) => tokio::time::timeout(l, exchange).await.unwrap_or_else(|_| Err(anyhow::anyhow!("it took longer than {} s, its limit", l.as_secs_f64()))),
+        None => exchange.await,
+    };
+    let answer = match answer {
+        Ok(a) => a,
+        Err(e) => {
+            *kernel = None; // (stopped: its variables with it)
+            return Err(e.context("this session's Python was stopped, and the variables it held are gone"));
+        }
+    };
+    if resident_mb(&kernel.as_ref().expect("a kernel").worker.child).is_some_and(|mb| mb > env_u64("PONDRA_WORKER_MB", 2048)) {
+        *kernel = None;
+        notice(format!("this session's Python grew past {} MB and was stopped: the next cell starts with no variables", env_u64("PONDRA_WORKER_MB", 2048)));
+    }
+    KERNELS.lock().unwrap().entry(session.to_string()).and_modify(|e| e.1 = Instant::now());
+    match answer.0.get("error").and_then(Value::as_str) {
+        Some(e) => bail!("{e}"),
+        None => Ok(answer),
+    }
+}
+
+/// A session ended: its worker stops (once a cell it runs is done).
+pub fn end_session(session: &str) -> bool { KERNELS.lock().unwrap().remove(session).is_some() }
+
+/// Sessions' workers idle for `PONDRA_SESSION_IDLE_SECS` stop; once there are none, this stops.
+async fn reap_kernels() {
+    let idle = Duration::from_secs(env_u64("PONDRA_SESSION_IDLE_SECS", 3600));
+    loop {
+        tokio::time::sleep(idle.min(Duration::from_secs(30))).await;
+        let mut all = KERNELS.lock().unwrap();
+        all.retain(|_, (k, used)| used.elapsed() < idle || k.try_lock().is_err()); // (one running a cell stays)
+        if all.is_empty() {
+            return;
         }
     }
 }

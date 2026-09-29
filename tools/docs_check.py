@@ -12,7 +12,8 @@ Then its blocks run:
   python   in one interpreter per page, so a block sees what the ones before it made;
   js       under Node, as an ES module, with `pondra` resolving to this repo's client;
   bash/sh  in bash, from the page's own folder, with `pondra` on PATH.
-A `python cell` block is a console's Python cell: it runs on the node, as `DO LANGUAGE python`.
+A `python cell` block is a console's Python cell: it runs on the node, as `DO LANGUAGE python`, in
+the page's session (a page's cells share their variables, as a console's do).
 A block whose info string says `norun` is shown but not run: things that can't run here (a real
 cluster, Windows, credentials, a command that serves until stopped). Other languages (text,
 json, toml, yaml, …) are never run.
@@ -82,8 +83,8 @@ def wait_http(url, secs=30):
     return False
 
 
-def sql(q, timeout=120):
-    req = urllib.request.Request(f"http://127.0.0.1:{PORTS['http']}/sql", data=q.encode(), method="POST")
+def sql(q, timeout=120, session=None):
+    req = urllib.request.Request(f"http://127.0.0.1:{PORTS['http']}/sql", data=q.encode(), method="POST", headers={"x-pondra-session": session} if session else {})
     try:
         return urllib.request.urlopen(req, timeout=timeout).read().decode()
     except urllib.error.HTTPError as e:
@@ -135,7 +136,7 @@ def check_page(path, verbose):
                 if lang == "sql":
                     out = sql(code)
                 elif lang in ("python", "py") and "cell" in info.split():
-                    out = sql(f"DO LANGUAGE python $pondra$\n{code}\n$pondra$")  # (a console's Python cell: run on the node, as the console runs it)
+                    out = sql(f"DO LANGUAGE python $pondra$\n{code}\n$pondra$", session=f"docs-page-{os.getpid()}")  # (a console's Python cell: on the node, in the page's session, as the console runs it: a cell sees what the ones before it made)
                 elif lang in ("python", "py"):
                     if py is None:
                         py = subprocess.Popen([sys.executable, "-c", PY_RUNNER], cwd=work, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)

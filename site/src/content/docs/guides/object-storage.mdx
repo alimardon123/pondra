@@ -7,8 +7,8 @@ sidebar:
 
 import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
 
-A lake is a folder, and a folder can be a bucket. `--dir s3://bucket/prefix` is the only change from a
-local lake: the layout is the same, so you can copy a lake between disk and a bucket with any sync
+A lake is a folder, and a folder can be a bucket. `s3://bucket/prefix` in place of a folder is the only
+change from a local lake: the layout is the same, so you can copy a lake between disk and a bucket with any sync
 tool while its nodes are stopped, and it opens as it was. The bucket is the platform and the binary
 is compute anyone brings: nodes, laptops and `pondra sql` all read and write the same lake.
 
@@ -21,33 +21,33 @@ appear on the command line or in SQL.
   <TabItem label="AWS S3">
     ```bash norun
     export AWS_ACCESS_KEY_ID=… AWS_SECRET_ACCESS_KEY=… AWS_REGION=us-east-1
-    pondra serve --dir s3://my-bucket/lake --addr 10.0.0.1:8080
+    pondra serve s3://my-bucket/lake --addr 10.0.0.1:8080
     ```
   </TabItem>
   <TabItem label="Cloudflare R2">
     ```bash norun
     export AWS_ACCESS_KEY_ID=… AWS_SECRET_ACCESS_KEY=… AWS_REGION=auto
     export AWS_ENDPOINT=https://<account-id>.r2.cloudflarestorage.com
-    pondra serve --dir s3://my-bucket/lake --addr 10.0.0.1:8080
+    pondra serve s3://my-bucket/lake --addr 10.0.0.1:8080
     ```
   </TabItem>
   <TabItem label="MinIO">
     ```bash norun
     export AWS_ACCESS_KEY_ID=… AWS_SECRET_ACCESS_KEY=… AWS_REGION=us-east-1
     export AWS_ENDPOINT=http://minio.internal:9000
-    pondra serve --dir s3://my-bucket/lake --addr 10.0.0.1:8080
+    pondra serve s3://my-bucket/lake --addr 10.0.0.1:8080
     ```
   </TabItem>
   <TabItem label="Google Cloud">
     ```bash norun
     export GOOGLE_SERVICE_ACCOUNT=/path/to/service-account.json
-    pondra serve --dir gs://my-bucket/lake --addr 10.0.0.1:8080
+    pondra serve gs://my-bucket/lake --addr 10.0.0.1:8080
     ```
   </TabItem>
   <TabItem label="Azure">
     ```bash norun
     export AZURE_STORAGE_ACCOUNT_NAME=… AZURE_STORAGE_ACCOUNT_KEY=…
-    pondra serve --dir az://my-container/lake --addr 10.0.0.1:8080
+    pondra serve az://my-container/lake --addr 10.0.0.1:8080
     ```
   </TabItem>
 </Tabs>
@@ -95,7 +95,7 @@ Now a node on `s3://my-bucket/lake`, with its SSD cache in a folder here:
 
 ```bash
 . ./s3.env
-nohup pondra serve --dir s3://my-bucket/lake --addr 127.0.0.1:8085 --cache-dir cache --tier-secs 1 > node.log 2>&1 &
+nohup pondra serve s3://my-bucket/lake --addr 127.0.0.1:8085 --cache-dir cache --tier-secs 1 > node.log 2>&1 &
 echo $! > node.pid
 until curl -sf localhost:8085/stats > /dev/null; do sleep 0.3; done
 ```

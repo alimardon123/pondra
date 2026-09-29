@@ -46,7 +46,8 @@ and `db.read_*` return. See the [Python](/pondra/reference/python/) and
 A source is a path, a glob (`sales/*.parquet`), a folder, a list of them, or a URL (`s3://`,
 `gs://`, `az://`, `https://`). A URL needs a [secret](/pondra/reference/sql/#files-and-secrets)
 whose scope covers it, unless the node is yours. A path on the node's machine is read and written
-only by the program that started the node: the shell, `pondra.local()` or `pondra sql`.
+only by the program that started the node: the shell, `pondra.local()` or `pondra sql`. To give a
+source a table's name, see [`CREATE EXTERNAL TABLE`](/pondra/reference/sql/#external-tables).
 
 Options come by name. The same option has each tool's spelling:
 
@@ -58,9 +59,17 @@ Options come by name. The same option has each tool's spelling:
 | Combine files with different columns | `union_by_name => true` | `union_by_name=True` | |
 | Delta version | `version => 3` | `version=3` | |
 | Iceberg snapshot | `snapshot_from_id => 123` | `snapshot_id=123` | |
+| Column names and types | `columns => {'id': 'BIGINT', 'name': 'VARCHAR'}` | | |
+| Types of the `k=v` folders' keys | `hive_types => {'day': 'DATE'}` | | |
+| CSV comment lines | `comment => '#'` | | |
+| CSV line ends | `new_line => '\r'` | | |
+
+`columns` matches a CSV's columns by position, and JSON's and Parquet's by name. `hive_types` implies
+`hive_partitioning`. `new_line` is only needed for `\r` line ends. These four are DuckDB's names, given in SQL.
 
 Writing takes `PARTITION_BY (col, …)`, `APPEND` or `OVERWRITE`, `HEADER`, `DELIMITER`,
-`COMPRESSION` and `ROW_GROUP_SIZE` in SQL. Spark's modes are `df.write.mode("overwrite")` and
+`COMPRESSION` and `ROW_GROUP_SIZE` in SQL, or DataFusion's `STORED AS`, `PARTITIONED BY` and `OPTIONS`
+(see [`COPY`](/pondra/reference/sql/#files-and-secrets)). Spark's modes are `df.write.mode("overwrite")` and
 `"append"`, and `partitionBy(…)` picks the partition columns. A folder that already holds a Delta
 or Iceberg table takes `mode="append"` or `"overwrite"`; the default, `"error"`, refuses.
 

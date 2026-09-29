@@ -18,7 +18,8 @@
   harness.py functions           functions and procedures in SQL and Python: workers, notices, mail, secrets, run log, tasks, speed
   harness.py found               what writing the docs found (round 26), each fixed
   harness.py renames             ALTER TABLE | VIEW … RENAME TO: rows, files, copies, followers, views
-  harness.py server              pondra server: a folder of lakes as databases (Postgres, HTTP, joins, idle, restart)
+  harness.py external            CREATE EXTERNAL TABLE: a named view of files, INSERT into a folder's, what it refuses
+  harness.py server              pondra serve <folder of lakes>: each a database (Postgres, HTTP, joins, idle, restart)
   harness.py load    --secs 30   throughput, ack latency, freshness, catalog commit latency
   harness.py all                 quick run of everything
 """
@@ -78,10 +79,10 @@ def clean_up():
 
 
 class Node:
-    def __init__(self, lake, port, reader=False, env=None, **flags):
+    def __init__(self, lake, port, reader=False, env=None, cwd=None, **flags):
         self.args = [BIN, "serve", "--dir", lake, "--addr", f"127.0.0.1:{port}"] + (["--reader"] if reader else [])
         self.args += [f"--{k.replace('_', '-')}" + ("" if v is True or v == "true" else f"={v}") for k, v in flags.items()]  # (a bare flag for true)
-        self.port, self.env, self.p = port, {**os.environ, **(env or {})}, None
+        self.port, self.env, self.cwd, self.p = port, {**os.environ, **(env or {})}, cwd, None
         self.log = os.path.join(tempfile.gettempdir(), f"pondra-{port}-{uuid.uuid4().hex[:6]}.stderr")
 
     def start(self, tries=20):
@@ -91,7 +92,7 @@ class Node:
         except (ConnectionError, OSError):
             pass  # free, as it should be
         with open(self.log, "a") as err:
-            self.p = subprocess.Popen(self.args, env=self.env, stdout=subprocess.DEVNULL, stderr=err)
+            self.p = subprocess.Popen(self.args, env=self.env, cwd=self.cwd, stdout=subprocess.DEVNULL, stderr=err)
         NODES.append(self)
         deadline = time.time() + 120  # opening a lake on slow object storage can take a while
         while time.time() < deadline:
@@ -200,6 +201,70 @@ def lookup_mismatch(k, model):
     want = [model[k]] if k in model else []
     rows = [call(A.port, "GET", f"/lookup/kv/{k}"), sql(A.port, f"SELECT id, v FROM kv WHERE id = {k}")]
     return sum([r["v"] for r in rs] != want for rs in rows)
+
+
+def external():
+    """CREATE EXTERNAL TABLE (ADR-032): a stored view of files by a name, as DataFusion's statement
+    reads — CSV's declared columns by position, Parquet's and JSON's by name, a folder's keys as
+    declared, a folder with no files yet an empty table; INSERT into a view of a folder a new file
+    in it (from a node and from `pondra sql`); DROP TABLE drops it and keeps the files; the tables
+    of files its views read aren't listed as the lake's; and what it can't do, it says."""
+    lake, here, owner = new_lake(), tempfile.mkdtemp(prefix="pondra-ext-"), uuid.uuid4().hex
+    node = Node(lake, A.port, env={"PONDRA_OWNER_KEY": owner}, cwd=here).start()
+    def q(s):
+        return call(A.port, "POST", "/sql", s.encode(), headers={"x-pondra-owner": owner})
+    def err(s):
+        try:
+            q(s)
+            return ""
+        except Exception as e:
+            return str(e)
+    os.makedirs(os.path.join(here, "dir"))
+    open(os.path.join(here, "a.csv"), "w").write("x,y,z\n1,hello,2024-01-02\n2,world,2024-02-03\n")
+    open(os.path.join(here, "j.json"), "w").write('{"a": 1, "b": "x", "extra": true}\n{"a": 2, "b": "y"}\n')
+    q(f"COPY (SELECT 1 AS id, 'a' AS name, 10 AS n) TO '{here}/dir/one.parquet'")
+    q(f"COPY (SELECT 2 AS id, 'b' AS name, 20 AS n) TO '{here}/dir/two.parquet'")
+    checks = {}
+    q("CREATE EXTERNAL TABLE c1 (a INT, b VARCHAR, c DATE) STORED AS CSV LOCATION 'a.csv' OPTIONS ('format.has_header' 'true')")
+    checks["CSV: declared columns by position, typed as declared, a relative LOCATION where the node runs"] = q("SELECT a, b, CAST(c AS VARCHAR) AS c FROM c1 ORDER BY a") == [{"a": 1, "b": "hello", "c": "2024-01-02"}, {"a": 2, "b": "world", "c": "2024-02-03"}]
+    q("CREATE EXTERNAL TABLE p2 (name VARCHAR, id BIGINT, missing INT, n DOUBLE) STORED AS PARQUET LOCATION 'dir'")
+    checks["Parquet: a folder's files, declared columns by name, one they don't hold NULL (and IS NULL finds it)"] = q("SELECT name, id, n FROM p2 WHERE missing IS NULL AND n > 15") == [{"name": "b", "id": 2, "n": 20.0}]
+    q("CREATE EXTERNAL TABLE j1 (b VARCHAR, a BIGINT) STORED AS JSON LOCATION 'j.json'")
+    checks["JSON: declared columns by name, others left out"] = q("SELECT * FROM j1 ORDER BY a") == [{"b": "x", "a": 1}, {"b": "y", "a": 2}]
+    q("CREATE EXTERNAL TABLE ev (id INT, name VARCHAR) STORED AS CSV LOCATION 'ev/' OPTIONS ('format.has_header' 'false')")
+    empty = q("SELECT count(*) AS n FROM ev")
+    q("INSERT INTO ev VALUES (1, 'one'), (2, 'two')")
+    q("INSERT INTO ev (name) VALUES ('three')")
+    cli = subprocess.run([BIN, "sql", "--dir", lake, "INSERT INTO ev VALUES (4, 'four')"], capture_output=True, text=True, cwd=here, env=node.env)
+    files = sorted(os.listdir(os.path.join(here, "ev")))
+    checks["a view of a folder: empty before its files; INSERT writes a new file there, from a node and from pondra sql"] = empty == [{"n": 0}] and len(files) == 3 \
+        and q("SELECT id, name FROM ev ORDER BY id NULLS LAST") == [{"id": 1, "name": "one"}, {"id": 2, "name": "two"}, {"id": 4, "name": "four"}, {"name": "three"}] \
+        and cli.returncode == 0 and '"rows":1' in cli.stdout.replace(" ", "") and not any(t["table_name"] == "ev" and t["table_type"] == "BASE TABLE" for t in q("SELECT table_name, table_type FROM information_schema.tables"))
+    q("CREATE EXTERNAL TABLE pp (v INT, day INT) STORED AS PARQUET PARTITIONED BY (day) LOCATION 'pp/'")
+    q("INSERT INTO pp VALUES (10, 1), (20, 2), (30, 2)")
+    checks["PARTITIONED BY: its keys' folders, typed as declared, made by INSERT"] = q("SELECT day, sum(v) AS s FROM pp GROUP BY day ORDER BY day") == [{"day": 1, "s": 10}, {"day": 2, "s": 50}] \
+        and sorted(os.listdir(os.path.join(here, "pp"))) == ["day=1", "day=2"]
+    listed = q("SELECT table_name, table_type FROM information_schema.tables WHERE table_schema = 'public' ORDER BY 1")
+    checks["information_schema lists each as a VIEW, and not the tables of files they read"] = all(t["table_type"] == "VIEW" for t in listed) and not any(t["table_name"].startswith("ext:") for t in listed) and len(listed) == 5
+    same = err("CREATE EXTERNAL TABLE c1 STORED AS CSV LOCATION 'a.csv'")
+    kept = q("CREATE EXTERNAL TABLE IF NOT EXISTS c1 STORED AS CSV LOCATION 'a.csv'")
+    q("CREATE OR REPLACE EXTERNAL TABLE c1 (q INT, r VARCHAR, s VARCHAR) STORED AS CSV LOCATION 'a.csv'")
+    checks["an existing name: refused, kept with IF NOT EXISTS, replaced with OR REPLACE"] = "already exists" in same and kept.get("unchanged") is True and q("SELECT q FROM c1 ORDER BY q") == [{"q": 1}, {"q": 2}]
+    q("DROP TABLE c1")
+    checks["DROP TABLE drops it; its file stays"] = "not found" in err("SELECT * FROM c1") and os.path.exists(os.path.join(here, "a.csv"))
+    said = {"one file": err("INSERT INTO j1 VALUES ('z', 3)"), "update": err("UPDATE ev SET name = 'x'"), "avro": err("CREATE EXTERNAL TABLE b1 STORED AS AVRO LOCATION 'x.avro'"),
+            "gzip": err("CREATE EXTERNAL TABLE b2 STORED AS CSV LOCATION 'a.csv' OPTIONS ('format.compression' 'gzip')"), "none": err("CREATE EXTERNAL TABLE b3 STORED AS CSV LOCATION 'nothing.csv'"),
+            "temp": err("CREATE TEMPORARY EXTERNAL TABLE b4 STORED AS CSV LOCATION 'a.csv'"), "option": err("CREATE EXTERNAL TABLE b5 STORED AS CSV LOCATION 'a.csv' OPTIONS ('format.null_regex' 'x')"),
+            "view": (q("CREATE VIEW v AS SELECT 1 AS a"), err("INSERT INTO v VALUES (2)"))[1],
+            "not owner": _raises_text(lambda: call(A.port, "POST", "/sql", b"CREATE EXTERNAL TABLE z STORED AS PARQUET LOCATION 'dir/'"))}
+    checks["what it can't do, it says: INSERT into one file, UPDATE, Avro, gzip, no files, TEMPORARY, an option it doesn't read, INSERT into a view; others' files need the owner"] = \
+        "view of a folder" in said["one file"] and "UPDATE" in said["update"] and "avro" in said["avro"] and "gzip" in said["gzip"] and "no files" in said["none"] \
+        and "TEMP VIEW" in said["temp"] and "null_regex" in said["option"] and "is a view" in said["view"] and "program that started the node" in said["not owner"]
+    node.kill()
+    shutil.rmtree(here, ignore_errors=True)
+    ok = all(checks.values())
+    print(json.dumps({"external": checks, "ok": ok}, indent=1))
+    return ok
 
 
 def outside():
@@ -2914,6 +2979,23 @@ $$""")
     checks["DO: only an admin runs one; an error at the line in its code; other languages said so"] = "admin" in err(block, token="w-tok") \
         and "ZeroDivisionError" in broken and "line 2: 1 / 0" in broken and not broken.split("ZeroDivisionError")[0].strip(" :'\"").endswith("do") \
         and "LANGUAGE python" in err("DO $$ BEGIN END $$")
+    # A session's DO blocks (the console's cells) share one namespace, as a notebook's cells do
+    # (ADR-032); another session's, and a block sent in none, don't; ending the session ends it.
+    def cell(code, session):
+        h = {"authorization": "Bearer a-tok", **({"x-pondra-session": session} if session else {})}
+        try:
+            return json.loads(urllib.request.urlopen(urllib.request.Request(f"http://127.0.0.1:{A.port}/sql", f"DO LANGUAGE python $$\n{code}\n$$".encode(), headers=h), timeout=120).read())
+        except urllib.error.HTTPError as e:
+            return e.read().decode()
+    one, two = "cells-" + uuid.uuid4().hex[:8], "cells-" + uuid.uuid4().hex[:8]
+    cell("x = 20\nimport math\nf = db.table('orders').select('id').sort('id').limit(1)", one)
+    cell("x = x + 1\n1 / 0", one)  # (a cell that fails keeps what it did before the failing line)
+    shared = [cell("x * 2", one), cell("math.floor(math.pi)", one), cell("f", one)]
+    apart = [cell("x", two), cell("x", None)]
+    call(A.port, "DELETE", f"/sessions/{one}", headers={"authorization": "Bearer a-tok"})
+    ended = cell("x", one)
+    checks["a session's Python cells share variables, imports and frames; another session's and a block in none don't; ending the session ends them"] = \
+        shared == [[{"value": 42}], [{"value": 3}], [{"id": first}]] and all("NameError" in a for a in apart) and "NameError" in ended
     for n in nodes:
         n.kill()
     # a node on another address with --python and no tokens refuses to start; `pondra run` runs a file
@@ -4006,7 +4088,9 @@ def found():
         and [c["type"] for c in typed["columns"]] == ["Decimal128(10, 2)", "Int64", "Int64"] and typed["total"] == 1
     # to_timestamp over a column of text answers in its type's zone (UTC), as over a literal.
     zoned = q("SELECT to_timestamp(v) AS a, to_timestamp(d, '%Y-%m-%d') AS b, to_timestamp_millis(d, '%Y-%m-%d') AS c FROM (VALUES ('2020-09-09T00:00:00+02:00', '2020-09-08')) AS x(v, d)")
-    checks["to_timestamp(column) and to_timestamp_millis(column, format): TIMESTAMPTZ, as over a literal"] = zoned == [{"a": "2020-09-08T22:00:00Z", "b": "2020-09-08T00:00:00Z", "c": "2020-09-08T00:00:00Z"}]
+    checks["to_timestamp(column) and to_timestamp_millis(column, format): TIMESTAMP (no zone; UTC's time for text with one), as over a literal"] = zoned == [{"a": "2020-09-08T22:00:00", "b": "2020-09-08T00:00:00", "c": "2020-09-08T00:00:00"}]
+    kinds = q("SELECT arrow_typeof(to_timestamp('2020-09-08 13:42:29')) AS a, arrow_typeof(to_timestamp_millis(d)) AS b, arrow_typeof(now()) AS c FROM (VALUES ('2020-09-08')) AS x(d)")
+    checks["to_timestamp answers TIMESTAMP (DataFusion's, Spark's), now() TIMESTAMPTZ in UTC"] = kinds == [{"a": "Timestamp(ns)", "b": "Timestamp(ms)", "c": 'Timestamp(ns, "+00:00")'}] or kinds == [{"a": "Timestamp(Nanosecond, None)", "b": "Timestamp(Millisecond, None)", "c": 'Timestamp(Nanosecond, Some("+00:00"))'}]
     listing = lambda: [r["path"] for r in q("SELECT path FROM files('listed/')")]
     first = listing()
     call(port, "PUT", "/files/listed/a.txt", b"a")
@@ -4072,11 +4156,13 @@ def renames():
 
 
 def server():
-    """`pondra server` (ADR-030): three lakes in a folder, served as databases. psql and HTTP
-    reach each by name, and queries join across them; the console is at `/`; CREATE DATABASE
-    makes one and DROP DATABASE drops one; a database idle for PONDRA_DATABASE_IDLE_SECS stops,
-    and starts again when next used; another node joins a database's cluster through the server;
-    the server killed and started again serves the same databases; `--flight` is refused."""
+    """`pondra serve <folder>` (ADR-030, ADR-032): three lakes in a folder, served as databases —
+    found as such, or named so (`--databases`). psql and HTTP reach each by name, and queries join
+    across them; the console is at `/`; CREATE DATABASE makes one and DROP DATABASE drops one; a
+    database idle for PONDRA_DATABASE_IDLE_SECS stops, and starts again when next used; each
+    database's node gets `pondra serve`'s options; another node joins a database's cluster through
+    the server; the server killed and started again serves the same databases; `--flight` is
+    refused, and a folder that holds other things than lakes isn't made one."""
     import psycopg
     folder = new_lake()  # (a folder of lakes, here)
     for name, q in [("sales", "CREATE TABLE orders AS SELECT 1 AS id, 10.5 AS amount UNION ALL SELECT 2, 20.0"),
@@ -4084,8 +4170,8 @@ def server():
         subprocess.run([BIN, "sql", "--dir", os.path.join(folder, name), q], check=True, capture_output=True)
     port, pg = A.port, A.port + 10
     env = {**os.environ, "PONDRA_DATABASE_IDLE_SECS": "3"}
-    def start():
-        p = subprocess.Popen([BIN, "server", folder, "--addr", f"127.0.0.1:{port}", "--pg", f"127.0.0.1:{pg}"], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    def start(how=()):
+        p = subprocess.Popen([BIN, "serve", *(how or [folder]), "--addr", f"127.0.0.1:{port}", "--pg", f"127.0.0.1:{pg}", "--memory-gb", "1.5"], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         until(lambda: _try(lambda: call(port, "GET", "/databases") is not None), True, 30)
         return p
     srv = start()
@@ -4099,6 +4185,9 @@ def server():
     checks["the folder's lakes are its databases, none running until used"] = running() == {"crm": False, "lake": False, "sales": False}
     checks["psql and HTTP reach each database by name; no /db/ means the default (lake)"] = pq("sales", "SELECT sum(amount) FROM orders") == [(30.5,)] \
         and call(port, "POST", "/db/crm/sql", b"SELECT name FROM customers ORDER BY id") == [{"name": "ann"}, {"name": "bob"}] and call(port, "POST", "/sql", b"SELECT text FROM notes") == [{"text": "hi"}]
+    nodes_of = lambda: [open(f"/proc/{p}/cmdline").read().split("\0") for p in subprocess.run(["pgrep", "-x", "pondra"], capture_output=True, text=True).stdout.split()
+                        if os.path.exists(f"/proc/{p}/cmdline") and "--attach-found" in open(f"/proc/{p}/cmdline").read() and folder in open(f"/proc/{p}/cmdline").read()]
+    checks["each database's node gets pondra serve's options (--memory-gb 1.5 here)"] = bool(nodes_of()) and all("--memory-gb" in a and a[a.index("--memory-gb") + 1] == "1.5" for a in nodes_of())
     checks["a query joins across databases (name.schema.table)"] = pq("sales", "SELECT c.name, o.amount FROM orders o JOIN crm.customers c ON c.id = o.id ORDER BY o.id") == [("ann", 10.5), ("bob", 20.0)]
     checks["the console is at /"] = b"<html" in call(port, "GET", "/").lower() or b"<!doctype html" in call(port, "GET", "/").lower()
     pq("sales", "CREATE DATABASE hr")
@@ -4119,10 +4208,17 @@ def server():
     srv.send_signal(signal.SIGKILL)
     srv.wait()
     until(lambda: _try(lambda: sql(port, "SELECT 1")) is None, True, 10)
-    srv = start()
+    srv = start(["--databases", folder])  # (named so, nothing guessed: for services)
     checks["killed and started again, the server serves the same databases"] = sorted(running()) == ["hr", "lake", "sales"] and pq("sales", "SELECT count(*) FROM orders") == [(3,)]
-    refused = subprocess.run([BIN, "server", folder, "--addr", f"127.0.0.1:{port + 5}", "--flight", "127.0.0.1:1"], capture_output=True, text=True, timeout=30)
-    checks["--flight is refused by name (a Flight port means one lake)"] = refused.returncode != 0 and "one lake" in refused.stderr
+    refused = subprocess.run([BIN, "serve", folder, "--addr", f"127.0.0.1:{port + 5}", "--flight", "127.0.0.1:1"], capture_output=True, text=True, timeout=30)
+    checks["--flight is refused by name (a Flight port is one lake's)"] = refused.returncode != 0 and "one lake" in refused.stderr
+    other = tempfile.mkdtemp(prefix="pondra-notalake-")
+    open(os.path.join(other, "notes.txt"), "w").write("mine")
+    kept = subprocess.run([BIN, "serve", other, "--addr", f"127.0.0.1:{port + 6}"], capture_output=True, text=True, timeout=30)
+    bare = subprocess.run([BIN, "serve", "--addr", f"127.0.0.1:{port + 7}"], capture_output=True, text=True, timeout=30, cwd=other)
+    checks["a folder holding other things isn't made a lake, and nor is this folder unless named"] = kept.returncode != 0 and "other things" in kept.stderr \
+        and not os.path.exists(os.path.join(other, "catalog")) and bare.returncode != 0 and "no lake in this folder" in bare.stderr
+    shutil.rmtree(other, ignore_errors=True)
     srv.send_signal(signal.SIGTERM)
     srv.wait(timeout=60)
     time.sleep(1)
@@ -4138,7 +4234,7 @@ def server():
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    out = {t.__name__: t() for t in (upsert, deal, outside, clouds, kafkas, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, names, answers, writes, live, temps, across, found, renames, server, scale, flight, reader, crash)}
+    out = {t.__name__: t() for t in (upsert, deal, outside, clouds, kafkas, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, live, temps, across, found, renames, server, scale, flight, reader, crash)}
     A.secs = min(A.secs, 20)
     out["load"] = load()
     print(json.dumps(out, indent=1))
@@ -4146,7 +4242,7 @@ def all_tests():
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "names", "answers", "writes", "live", "temps", "across", "found", "renames", "server", "scale", "flight", "load", "all"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "live", "temps", "across", "found", "renames", "server", "scale", "flight", "load", "all"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -4157,4 +4253,4 @@ if __name__ == "__main__":
     ap.add_argument("--secs", type=int, default=30)
     ap.add_argument("--flush-ms", type=int, default=250)
     A = ap.parse_args()
-    {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "names": names, "answers": answers, "writes": writes, "live": live, "temps": temps, "across": across, "found": found, "renames": renames, "server": server, "scale": scale, "flight": flight, "load": load, "all": all_tests}[A.mode]()
+    {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "live": live, "temps": temps, "across": across, "found": found, "renames": renames, "server": server, "scale": scale, "flight": flight, "load": load, "all": all_tests}[A.mode]()

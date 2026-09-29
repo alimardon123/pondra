@@ -14,9 +14,9 @@ readers, or when the lake shouldn't stop if a machine does.
 
 ```bash norun
 # on each machine: the same lake, and the address the other nodes reach it at
-pondra serve --dir s3://my-bucket/lake --addr 10.0.0.1:8080
-pondra serve --dir s3://my-bucket/lake --addr 10.0.0.2:8080
-pondra serve --dir s3://my-bucket/lake --addr 10.0.0.3:8080 --reader
+pondra serve s3://my-bucket/lake --addr 10.0.0.1:8080
+pondra serve s3://my-bucket/lake --addr 10.0.0.2:8080
+pondra serve s3://my-bucket/lake --addr 10.0.0.3:8080 --reader
 ```
 
 The first node up leads. The others follow. A `--reader` node answers SQL and never leads, so
@@ -36,11 +36,11 @@ This starts three nodes and a reader in the background, with `--ack replicated` 
 ```bash
 mkdir -p cluster
 for i in 1 2 3; do
-  nohup pondra serve --dir cluster/lake --addr 127.0.0.1:808$i --ack replicated > cluster/node$i.log 2>&1 &
+  nohup pondra serve cluster/lake --addr 127.0.0.1:808$i --ack replicated > cluster/node$i.log 2>&1 &
   echo $! > cluster/node$i.pid
   sleep 1
 done
-nohup pondra serve --dir cluster/lake --addr 127.0.0.1:8084 --reader > cluster/reader.log 2>&1 &
+nohup pondra serve cluster/lake --addr 127.0.0.1:8084 --reader > cluster/reader.log 2>&1 &
 echo $! > cluster/reader.pid
 until curl -sf localhost:8084/stats > /dev/null; do sleep 0.2; done
 ```
@@ -217,9 +217,9 @@ kill $(cat cluster/node2.pid cluster/node3.pid cluster/reader.pid)
   (`--attach sales=s3://my-bucket/sales`, or `ATTACH` in SQL), which is how one lake's commit
   rate is split over several. A write to `sales.orders` is recorded by that lake's leader. See
   [tables](/pondra/guides/tables/).
-- **Many lakes on one machine** can share a port with [`pondra server`](/pondra/guides/server/), which
-  serves a folder of lakes as databases. Each database can lead a cluster of its own
-  ([clusters behind the server](/pondra/guides/server/#clusters-behind-the-server)).
+- **Many lakes on one machine** can share a port: `pondra serve` on [a folder of lakes](/pondra/guides/server/)
+  serves each as a database. Each database can lead a cluster of its own
+  ([clusters of one database](/pondra/guides/server/#clusters-of-one-database)).
 - **Laptops** can join with `pondra serve` or `--reader` and leave again. After a full shutdown the
   first node started leads at once.
 - **Streaming tasks** with `shards` are dealt to the live nodes, and move when membership changes

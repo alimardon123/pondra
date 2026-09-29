@@ -7,3 +7,5 @@ __pycache__/
 /site/dist
 /site/.astro
 /singlenode.json
+/site/src/assets/brand
+/site/public/favicon.svg

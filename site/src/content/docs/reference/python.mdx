@@ -322,8 +322,9 @@ Without pyarrow installed, rows come as the node's JSON, dates and times as text
 
 ## Close
 
-`db.close()` ends the connection's session, so its temporary tables and views go, and stops the
-node `pondra.local` started. A connection is a context manager:
+`db.close()` ends the connection's session, so its temporary tables and views go, and so do the
+variables of its `DO LANGUAGE python` blocks. It also stops the node `pondra.local` started. A
+connection is a context manager:
 
 ```python
 with pondra.connect("http://localhost:8080") as session:

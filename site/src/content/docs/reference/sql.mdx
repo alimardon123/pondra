@@ -36,6 +36,8 @@ Columns take these types. A list is written `type[]`, such as `FLOAT[]` for an e
 A `TIMESTAMPTZ` written with an offset (`'2026-09-29 10:00:00+05'`) is stored as the instant it names,
 so it reads back as `2026-09-29T05:00:00Z`. A time may leave out its seconds, as in Postgres and
 DuckDB: `'2024-05-01 10:30'` is a timestamp in `INSERT`, `CAST`, `TIMESTAMP '…'` and comparisons.
+`to_timestamp(…)` answers a `TIMESTAMP`, not a `TIMESTAMPTZ`: see
+[dates and times](/pondra/reference/functions/#dates-and-times).
 
 A value that doesn't cast to its column's type is refused, and the error names the value: `'abc'` into
 a `BIGINT` is an error, never a `NULL`. `substr`, `substring(b FROM 2 FOR 1)` and `byte_length` work
@@ -180,7 +182,7 @@ SELECT * FROM visits ORDER BY id;
 |---|---|
 | Create a schema | `CREATE SCHEMA [IF NOT EXISTS] s` |
 | Drop a schema | `DROP SCHEMA [IF EXISTS] s [CASCADE]` |
-| Make a new lake | `CREATE DATABASE [IF NOT EXISTS] name [LOCATION 'dir']`: a lake beside this one, attached. Under [`pondra server`](/pondra/guides/server/) it makes a new served database, and `DROP DATABASE name` drops one, folder and all |
+| Make a new lake | `CREATE DATABASE [IF NOT EXISTS] name [LOCATION 'dir']`: a lake beside this one, attached. On a [folder of lakes](/pondra/guides/server/) it makes a new served database, and `DROP DATABASE name` drops one, folder and all |
 | Attach a lake | `ATTACH 'dir' AS name`; `ATTACH 'url' AS name (TYPE delta \| iceberg \| kafka, …)` for other engines |
 | Detach | `DETACH [IF EXISTS] name` |
 
@@ -308,11 +310,84 @@ pondra sql --dir scratch "INSERT INTO t_copy SELECT * FROM read_parquet('out.par
 `pondra sql` reads those files in `CREATE TABLE … AS` and `INSERT … SELECT` too. On a folder with no lake
 yet, a query says so and a write makes one.
 
+`COPY … TO` takes DataFusion's words too: `STORED AS`, `PARTITIONED BY` and `OPTIONS`. `'format.has_header'`
+means `HEADER`, `'format.delimiter'` means `DELIMITER` and `'format.max_row_group_size'` means
+`ROW_GROUP_SIZE`. The DuckDB form, `(FORMAT csv, HEADER false)`, is unchanged.
+
+```bash
+pondra sql --dir scratch "COPY t TO 'words/' STORED AS CSV PARTITIONED BY (region) OPTIONS ('format.has_header' 'false')"
+```
+
 ```sql
 CREATE SECRET sales (TYPE s3, KEY_ID 'your-key-id', SECRET 'your-secret', REGION 'eu-west-1', SCOPE 's3://my-bucket');
 SELECT * FROM secrets();
 DROP SECRET sales;
 ```
+
+## External tables
+
+`CREATE EXTERNAL TABLE` is DataFusion's statement for naming files. In Pondra it makes a stored view of them:
+`SELECT * FROM read_csv('…', …)` (or `read_parquet`, `read_json`) under the name you give. Nothing is
+copied, and `information_schema` lists the table as a `VIEW`.
+
+| Statement | Syntax |
+|---|---|
+| Create | `CREATE [OR REPLACE] EXTERNAL TABLE [IF NOT EXISTS] t [(column type, …)] STORED AS PARQUET \| CSV \| JSON LOCATION 'path or URL' [PARTITIONED BY (column, …)] [OPTIONS ('name' 'value', …)]`; `UNBOUNDED` is accepted after `CREATE` |
+| Add a file | `INSERT INTO t [(column, …)] VALUES … \| SELECT …`, when `LOCATION` is a folder |
+| Drop | `DROP TABLE t`, or `DROP VIEW t`: the name goes and the files stay |
+
+- **Columns.** Without a column list, the table has the files' own schema. With one, each column is read as the
+  type you declare: a CSV's by position, Parquet's and JSON's by name. A declared column that Parquet files
+  don't have is `NULL`.
+- **`LOCATION`.** A relative path becomes absolute when the table is made, as `ATTACH` does. A folder (a path
+  ending in `/`, or one that exists) reads its files of that format. With declared columns, a folder with no
+  files yet is an empty table. Without columns, no files is an error: `no files at …`.
+- **`PARTITIONED BY (day)`,** with `day` among the declared columns: the folders `day=…/` give it, typed as
+  declared.
+- **`OPTIONS`.** CSV reads `'format.has_header'`, `'format.delimiter'`, `'format.quote'`, `'format.escape'`,
+  `'format.comment'` and `'format.terminator'`. Options about how files are written, such as Parquet's
+  `'format.compression'` and `'format.max_row_group_size'`, are accepted and ignored. Any other option is
+  refused by name.
+- **Writing.** `INSERT INTO` a table whose `LOCATION` is a folder writes a new file into that folder, in the
+  table's format. A partitioned table writes into `day=…/` folders. `INSERT INTO t (col) VALUES …` fills the
+  other columns with `NULL`.
+- **Who reads the files.** A path on the node's machine is read and written only by the program that started
+  the node: the shell or `pondra.local()`. A URL needs a [secret](#files-and-secrets) that covers it, as for
+  `read_parquet`.
+
+```bash
+printf 'id,name\n1,tea\n2,cake\n' > menu.csv
+pondra scratch <<'SQL'
+CREATE EXTERNAL TABLE menu STORED AS CSV LOCATION 'menu.csv';
+SELECT * FROM menu ORDER BY id;
+CREATE EXTERNAL TABLE events (id INT, name VARCHAR) STORED AS CSV LOCATION 'events/' OPTIONS ('format.has_header' 'false');
+INSERT INTO events VALUES (1, 'one'), (2, 'two');
+SELECT * FROM events ORDER BY id;
+DROP TABLE menu
+SQL
+```
+
+```text
+{"table":"menu","files":true}
++----+------+
+| id | name |
++----+------+
+| 1  | tea  |
+| 2  | cake |
++----+------+
+{"table":"events","files":true}
+{"rows":2}
++----+------+
+| id | name |
++----+------+
+| 1  | one  |
+| 2  | two  |
++----+------+
+{"table":"menu","dropped":true}
+```
+
+`events/` is now a folder with a file in it, and `menu.csv` is still there. A URL or a path in
+a query needs no table: see [names](/pondra/reference/names/).
 
 ## Maintenance
 
@@ -337,7 +412,12 @@ Pondra refuses these by name, so a statement never runs and quietly does somethi
 | a value that doesn't cast to its column's type (`'abc'` into a `BIGINT`) | refused, naming the value; never stored as `NULL` |
 | `INSERT … ON DUPLICATE KEY UPDATE` | refused: it is MySQL's; write `ON CONFLICT (…) DO UPDATE SET …` or `MERGE` |
 | `CREATE TABLE … WITH (…)` with an option name Pondra doesn't know | refused, with the name; see [table options](/pondra/reference/table-options/) |
-| `CREATE EXTERNAL TABLE` | refused; read files in a query (`SELECT * FROM 'file.parquet'`) or make the table with `CREATE TABLE … AS SELECT` |
+| `CREATE TEMPORARY EXTERNAL TABLE` | refused; use `CREATE TEMP VIEW v AS SELECT * FROM read_parquet('…')` |
+| `CREATE EXTERNAL TABLE … STORED AS ARROW` or `AVRO` | refused; Pondra reads Parquet, CSV and JSON (one value a line) |
+| `CREATE EXTERNAL TABLE` over compressed CSV or JSON (`'format.compression' 'gzip'`) | refused; not read yet |
+| `CREATE EXTERNAL TABLE … OPTIONS (…)` with an option Pondra doesn't read | refused, with the name |
+| `INSERT` into an external table whose `LOCATION` is one file | refused: a view of a folder takes `INSERT`s |
+| `UPDATE`, `DELETE` and `ALTER` on an external table | refused |
 | a merge table with a non-key column that has no merge function | refused at `CREATE` (`s needs a merge function`) |
 | `ALTER TABLE t SET (partition_by = …)` | refused; each file holds one partition |
 | `UPDATE` or `DELETE` on a merge table | refused; `INSERT` into it instead, and the key's rows combine |

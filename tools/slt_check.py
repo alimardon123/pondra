@@ -17,14 +17,24 @@ floats rounded to 12 places, decimals without trailing zeros, Arrow's display fo
 sorted where the record says (`rowsort`, `valuesort`). `--nodes 3` runs every query spread over
 three nodes (`?spread=1`), which must give what one node gives.
 
+The nodes run where DataFusion's runner does (the folder above `test_files`), for the program
+that started them (`PONDRA_OWNER_KEY`), so a file's `CREATE EXTERNAL TABLE … LOCATION
+'../../testing/data/…'` reads DataFusion's test data. That data comes with the source's submodules
+and two more folders:
+
+  git -C datafusion sparse-checkout add datafusion/core/tests/data datafusion/core/tests/tpch-csv
+  git -C datafusion submodule update --init --depth 1 testing parquet-testing
+
 A record passes when Pondra answers as the file says. An error the file expects counts as passed
 when Pondra refuses too, whatever its words (`error_text_differs` counts those whose words differ).
 The failures are grouped by their first line, so each can be understood: what Pondra doesn't do
-(`CREATE EXTERNAL TABLE`, session `SET`, a file from DataFusion's test data it doesn't have), what
+(session `SET`, files stored as Arrow or Avro, compressed files), what
 it does differently on purpose, and what is wrong.
 """
-import argparse, collections, decimal, hashlib, io, json, os, re, sys, time
+import argparse, collections, decimal, hashlib, io, json, os, re, shutil, sys, time, uuid
 import numpy
+
+OWNER = {"x-pondra-owner": uuid.uuid4().hex}  # (the nodes' owner: this runner, as DataFusion's reads its files)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -136,7 +146,9 @@ def answer(port, sql, spread):
     """The query's rows as the file writes them, or raises with Pondra's error."""
     import pyarrow as pa
     path = "/sql?format=arrow" + ("&spread=1" if spread else "")
-    data = harness.call(port, "POST", path, sql.encode(), timeout=A.timeout)
+    data = harness.call(port, "POST", path, sql.encode(), timeout=A.timeout, headers=OWNER)
+    if isinstance(data, dict) and len(data) <= 2 and isinstance(data.get("rows", data.get("copied")), int):
+        return [[str(data.get("rows", data.get("copied")))]]  # (rows written: DataFusion answers with their count)
     if isinstance(data, (dict, list)):
         return [[json.dumps(data)]]  # (a statement's answer, not rows)
     rows = []
@@ -181,7 +193,7 @@ def run_file(path, port, spread):
         wants_error = header[:1] == ["error"] or (kind == "query" and header[:1] == ["error"])
         try:
             if kind == "statement":
-                harness.call(port, "POST", "/sql", sql.encode(), timeout=A.timeout)
+                harness.call(port, "POST", "/sql", sql.encode(), timeout=A.timeout, headers=OWNER)
                 ok = not wants_error
                 why = "an error was expected" if wants_error else ""
             else:
@@ -225,7 +237,10 @@ def main():
     t0 = time.time()
     for n, path in enumerate(files, 1):
         lake = harness.new_lake()
-        nodes = [harness.Node(lake, A.port + i).start() for i in range(A.nodes)]
+        scratch = os.path.join(os.path.dirname(A.slt.rstrip("/")), "test_files", "scratch", os.path.splitext(os.path.basename(path))[0])
+        shutil.rmtree(scratch, ignore_errors=True)  # (each file's own, made afresh, as DataFusion's runner does)
+        os.makedirs(scratch, exist_ok=True)
+        nodes = [harness.Node(lake, A.port + i, env={"PONDRA_OWNER_KEY": OWNER["x-pondra-owner"]}, cwd=os.path.dirname(A.slt.rstrip("/"))).start() for i in range(A.nodes)]
         try:
             if A.nodes > 1:
                 while len(harness.call(A.port, "GET", "/stats")["nodes"]) < A.nodes:

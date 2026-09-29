@@ -104,6 +104,7 @@ jobs:
           python3 tools/harness.py all
           python3 tools/frames_check.py
           python3 -m playwright install --with-deps chromium
+          python3 tools/brand_check.py --node   # (the mark and colours from brand/ only: ADR-032)
           python3 tools/console_check.py
           python3 tools/docs_check.py   # (every example on the website runs)
           python3 tools/cluster.py failover --secs 30

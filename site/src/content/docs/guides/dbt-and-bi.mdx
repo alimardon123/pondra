@@ -12,13 +12,13 @@ Pondra's Postgres port answers the catalog queries that dbt and BI tools send: `
 lake as they would to Postgres. Start a node with a Postgres port, and give the tool its address:
 
 ```bash norun
-pondra serve --dir lake --pg 0.0.0.0:5432 --admin-token "$TOKEN"
+pondra serve lake --pg 0.0.0.0:5432 --admin-token "$TOKEN"
 ```
 
 | Setting | Value |
 |---|---|
 | Host, port | the node's `--pg` address, such as `host:5432` |
-| Database | the lake's name (the folder's, such as `lake`), or a database of [`pondra server`](/pondra/guides/server/) |
+| Database | the lake's name (the folder's, such as `lake`), or a database of a [folder of lakes](/pondra/guides/server/) |
 | User | `admin`, `writer` or `reader`: which token the password is |
 | Password | that token (a node with no tokens takes any password) |
 | SSL | off: the port doesn't speak TLS yet |

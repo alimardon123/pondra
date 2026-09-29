@@ -12,14 +12,14 @@ in it and who may read or write it, so you can back it up, copy it, or point ano
 
 ## Disk and bucket are the same
 
-A lake on a local directory (`--dir /data/lake`) and a lake in a bucket (`--dir s3://my-bucket/lake`)
+A lake on a local directory (`/data/lake`) and a lake in a bucket (`s3://my-bucket/lake`)
 have exactly the same layout. The object keys in the bucket are the same relative paths as the files
 on disk, and the catalog stores only relative paths. So you can copy a lake from disk to a bucket, or
 back, with any sync tool while its nodes are stopped, and it opens there as it was.
 
 ```bash norun
 aws s3 sync ./lake s3://my-bucket/lake
-pondra serve --dir s3://my-bucket/lake
+pondra serve s3://my-bucket/lake
 ```
 
 It works wherever the binary runs: Linux, macOS or Windows, on a local or network directory, S3,
@@ -95,7 +95,7 @@ other tools get in by three more.
 
 | Reader | How it reads | Sees | Writes |
 |---|---|---|---|
-| **A node**: `pondra serve --dir …` (`--reader` to only read) | The catalog in memory, kept current by the leader's stream of commits. Hot objects on the local SSD | Every committed write, milliseconds after the acknowledgement | Yes. `--reader`: no |
+| **A node**: `pondra serve LAKE` (`--reader` to only read) | The catalog in memory, kept current by the leader's stream of commits. Hot objects on the local SSD | Every committed write, milliseconds after the acknowledgement | Yes. `--reader`: no |
 | **`pondra sql --dir … "…"`**, no node | Opens the catalog in the bucket, reads the log tail and the Parquet files | Every write already in the bucket (in the default `--ack durable`, every acknowledged write) | `CREATE TABLE`, `INSERT`, `UPDATE`, `DELETE`: this machine does the work, the leader records it |
 | **Another engine**, through Delta or Iceberg | The table's `_delta_log/` or `metadata/`, or a node's Iceberg REST catalog | The table as of the last tiering round | Appends to an append table, through the REST catalog |
 | **Kafka clients**, on a node's `--kafka` port | A topic per table | Every committed write | Yes |

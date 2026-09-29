@@ -1,21 +1,20 @@
 ---
 title: Command line
-description: The pondra command, its SQL shell, and every serve, server, sql, run and catalog option with its default.
+description: The pondra command, its SQL shell, and every serve, sql, run and catalog option with its default.
 sidebar:
   order: 14
 ---
 
 import { Aside } from '@astrojs/starlight/components';
 
-`pondra` is one binary. On its own it opens a SQL shell on a lake. `pondra serve` runs a node,
-`pondra server` serves a folder of lakes as databases, `pondra sql` and `pondra run` run SQL, and
+`pondra` is one binary. On its own it opens a SQL shell on a lake. `pondra serve` runs a node on a
+lake, or serves a folder of lakes as databases, `pondra sql` and `pondra run` run SQL, and
 `pondra catalog` prints what the lake's catalog holds.
 
 | Command | Does |
 |---|---|
 | `pondra [LAKE]` | a SQL shell on a lake (`./lake` if you name none) |
-| `pondra serve --dir LAKE` | run a node |
-| `pondra server [FOLDER]` | serve every lake in a folder as a database |
+| `pondra serve [PATH]` | run a node on a lake, or serve every lake in a folder as a database |
 | `pondra sql --dir LAKE "SQL"` | run one statement against the lake, with no server |
 | `pondra run FILE LAKE` | run a SQL file, its `$name` parameters taking the values you pass |
 | `pondra catalog --dir LAKE PREFIX` | print catalog entries |
@@ -61,25 +60,59 @@ A statement that fails prints `Error: …` on standard error and the shell goes 
 
 ## pondra serve
 
-`pondra serve --dir LAKE` runs a node and stays up until Ctrl-C or SIGTERM. Nodes started on the
-same lake form a cluster: the first leads (ingest, tiering, commits), and the rest follow (SQL,
-task shards, writes forwarded to the leader) and take over if the leader dies. A node that is
-stopped hands over at once, and every write it acknowledged is already durable.
+`pondra serve [PATH]` runs a node and stays up until Ctrl-C or SIGTERM. `PATH` is a lake (a local
+folder, or `s3://bucket/prefix`), or a folder whose subfolders hold lakes. It is the current folder
+if you give none. Nodes started on the same lake form a cluster: the first leads (ingest, tiering,
+commits), and the rest follow (SQL, task shards, writes forwarded to the leader) and take over if
+the leader dies. A node that is stopped hands over at once, and every write it acknowledged is
+already durable.
 
 ```bash norun
-pondra serve --dir lake
-pondra serve --dir lake --addr 127.0.0.1:8081
+pondra serve lake
+pondra serve lake --addr 127.0.0.1:8081
+pondra serve data
 ```
 
-The second line starts a second node on the same lake. It follows the first.
+The second line starts a second node on the same lake. It follows the first. The third serves the
+lakes in `data` as databases: see [A folder of lakes](#a-folder-of-lakes).
+
+### What PATH holds
+
+`pondra serve` looks at `PATH` and does the first of these that fits:
+
+| `PATH` | `pondra serve` |
+|---|---|
+| holds a lake (it has a `catalog/` folder) | serves that lake |
+| has subfolders that hold lakes | serves each as a database named after its folder |
+| is new or empty | makes a new lake there, and serves it |
+
+Two guards keep a mistyped path from making a lake where you did not mean to:
+
+- `pondra serve` with no `PATH` never makes anything. If the current folder is not a lake and holds
+  no lakes, it stops and says so: `pondra serve lake` makes one at `./lake`.
+- A folder that holds other things (files, other folders) but no lakes is refused. Serve a lake in
+  it (`pondra serve folder/lake`), or make one there anyway with `--lake folder`.
+
+For scripts and services (systemd, Docker), name what you mean, and nothing is guessed:
+
+```bash norun
+pondra serve --lake /srv/lake
+pondra serve --databases /srv/data
+```
+
+`--lake` serves exactly this lake, and makes it if it is missing (`--dir` is the same, for older scripts). `--databases` serves exactly this
+folder of lakes. Use these two in anything that starts a node unattended.
 
 ### Where and how
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--dir DIR` | required | the lake: a folder, or `s3://bucket/prefix` (credentials and endpoint from the `AWS_*` variables) |
+| `PATH` | the current folder | the lake (a folder, or `s3://bucket/prefix`, its credentials and endpoint from the `AWS_*` variables), or a folder of lakes |
+| `--lake LAKE` | none | exactly this lake, made if it is missing, and nothing guessed. For scripts and services (`--dir` is the same) |
+| `--databases FOLDER` | none | exactly this folder of lakes, each a database. For scripts and services |
+| `--default NAME` | `lake`, else the only one | serving a folder of lakes: the database a client that names none gets (HTTP without `/db/`, Postgres without a database) |
 | `--addr ADDR` | `127.0.0.1:8080` | the address the HTTP API and [the console](/pondra/start/console/) listen on, and other nodes reach this one at |
-| `--advertise ADDR` | `--addr` | the address other nodes reach this one at, when it isn't `--addr`: behind `pondra server`, `host:port/db/name` |
+| `--advertise ADDR` | `--addr` | the address other nodes reach this one at, when it isn't `--addr`. A database's node, behind the process that serves its folder, is `host:port/db/name` |
 | `--reader` | off | a read-only node: SQL only, never leads. Any number can run beside the writer |
 | `--python PYTHON` | none | run Python functions and procedures (`LANGUAGE python`) with this Python, which has the `pondra` package and pyarrow. `auto` takes the first one found. Routines run on warm workers beside the node, gone after a minute idle |
 | `--stop-with-stdin` | off | stop, as on Ctrl-C, when standard input closes: when the program that started the node ends, however it ends |
@@ -148,34 +181,38 @@ environment: a flag shows in the process list.
 | `--attach-found FOLDER` | for as long as the node runs, attach the lakes in this folder (its subfolders that hold one) under their folder names. Nothing is saved in the catalog. The shell passes its own folder |
 
 ```bash norun
-pondra serve --dir s3://my-bucket/lake --addr 10.0.0.5:8080 \
+pondra serve s3://my-bucket/lake --addr 10.0.0.5:8080 \
   --pg 0.0.0.0:5432 --kafka 0.0.0.0:9092 --kafka-advertise 10.0.0.5:9092 --flight 0.0.0.0:8815 \
   --ack replicated --attach sales=s3://my-bucket/sales
 ```
 
-## pondra server
+### A folder of lakes
 
-`pondra server FOLDER` serves every lake in the folder as a database, behind one HTTP port and one
+`pondra serve data` serves every lake in the folder as a database, behind one HTTP port and one
 Postgres port. Postgres clients pick a database by name, HTTP clients add `/db/{name}` to the URL,
 and the console at `/` lists them all. Each database runs as a node of its own, started when first
-used and stopped when idle. See [A server of databases](/pondra/guides/server/).
+used and stopped when idle (`PONDRA_DATABASE_IDLE_SECS`, 600). See
+[Many databases](/pondra/guides/server/).
 
 ```bash norun
-pondra server data --addr 0.0.0.0:8080 --pg 0.0.0.0:5432
+pondra serve data --addr 0.0.0.0:8080 --pg 0.0.0.0:5432
 ```
 
-| Flag | Default | Meaning |
-|---|---|---|
-| `FOLDER` | `.` | the folder of lakes, on this machine: each subfolder that holds one is a database |
-| `--addr ADDR` | `127.0.0.1:8080` | where HTTP clients, the console and other nodes reach the server |
-| `--pg ADDR` | off | speak the Postgres protocol here, such as `0.0.0.0:5432` |
-| `--default NAME` | `lake`, else the only one | the database for a client that names none (HTTP without `/db/`, Postgres without a database) |
-| `--read-token`, `--write-token`, `--admin-token` | none | tokens, as `pondra serve` takes them (and `PONDRA_*_TOKEN`): every database's node gets them |
-| `--python PYTHON` | none | Python for functions, procedures and the console's Python cells, as `pondra serve --python` |
-| `--tier-secs SECS` | `10` | each database's `--tier-secs` |
+Every other option of `pondra serve` applies to each database's node: `--pg`, the tokens
+(`--read-token`, `--write-token`, `--admin-token`), `--python`, `--reader` (every database
+read-only), `--tier-secs`, `--memory-gb`, `--cache-dir`, `--cache-gb`, `--ack`, `--replicas`,
+`--fsync`, `--publish`, `--flush-ms`, `--task-ms`, `--retain-secs`, `--changelog-secs` and
+`--backlog`. Each database is a process of its own, so a value such as `--memory-gb` is for each
+database's node, not for all of them together.
 
-`PONDRA_DATABASE_IDLE_SECS` (600) is how long a database's node runs with nothing to do. The server
-refuses `--flight` and `--kafka`: those ports mean one lake, so serve such a lake with `pondra serve`.
+`--flight`, `--kafka` (and `--kafka-advertise`), `--attach`, `--advertise` and `--attach-found` are
+refused, and the message names the flag. A Flight or Kafka port speaks for one lake today. Routing
+them to many databases (Kafka by topic, such as `sales.orders`, and Flight by the database the client
+names) is planned for the next round. Serve such a lake on its own:
+
+```bash norun
+pondra serve data/sales --flight 0.0.0.0:8815
+```
 
 ## pondra sql
 
@@ -187,7 +224,7 @@ leads. A write prints its outcome as JSON.
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--dir DIR` | required | the lake |
+| `--dir DIR` (or `--lake`) | required | the lake |
 | `--attach NAME=DIR` | none | another lake to read as `name.table`. Repeat it for more |
 
 ```bash

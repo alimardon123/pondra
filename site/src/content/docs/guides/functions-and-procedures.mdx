@@ -403,6 +403,34 @@ except RuntimeError as e:
   line 2: 1 / 0
 ```
 
+### Cells that share variables
+
+In a session, `DO LANGUAGE python` blocks run on one Python worker kept for that session, in one
+namespace, like a notebook kernel. What one block makes, the next one sees: variables, imports,
+functions, and frames such as `f = db.table('sales')`. A session is a console page, a Postgres
+connection, or an HTTP client that sends the `x-pondra-session: <id>` header. The Python and
+JavaScript clients send one, so their `DO` blocks share variables:
+
+```python
+db.sql("DO LANGUAGE python $$\ntotal = db.sql('SELECT sum(price) FROM sales').item()\n$$")
+print(db.sql("DO LANGUAGE python $$\nround(total * 2, 1)\n$$").rows())
+```
+
+```text
+[{'value': 23.0}]
+```
+
+- A block that fails keeps what it did before the failing line.
+- `_` holds the last answer. A block's single value comes back as a column named `value`.
+- A `DO` block sent without a session runs fresh and shares nothing. `DO` still needs an admin token.
+- One block runs at a time in a session.
+- A session's Python ends when the session ends: the console page closes, the Postgres connection
+  closes, or `DELETE /sessions/{id}`. It also ends after `PONDRA_SESSION_IDLE_SECS` (3600) seconds idle,
+  or if it grows past `PONDRA_WORKER_MB` (2048) MB. The next block then starts empty, and a notice says
+  so.
+- A session id is 8 to 128 letters, digits, `-` or `_`. Any other value is ignored, and the block
+  runs fresh.
+
 Use a procedure when you will run the code again or want it on a schedule. `DO` is for the one-off:
 a fix-up, an experiment, a cell of a notebook.
 

@@ -62,7 +62,8 @@ as text with all their digits (`"1.50"`), and so do integers past 2^53, which Ja
 exactly.
 
 The header `x-pondra-notices` on an answer carries what procedures and `DO` blocks printed, as a
-JSON list of lines. Send `x-pondra-session: <id>` to use temporary tables that only that id sees.
+JSON list of lines. Send `x-pondra-session: <id>` (8 to 128 letters, digits, `-` or `_`) to use temporary tables that only that id sees, and
+`DO LANGUAGE python` blocks that share their variables ([Functions and procedures](/pondra/guides/functions-and-procedures/#cells-that-share-variables)).
 
 ```bash
 curl -s -X POST http://localhost:8080/sql -d "CREATE TABLE events (user VARCHAR, amount BIGINT)"
@@ -249,7 +250,7 @@ token is refused.
 | `GET /stats` | none | health and position, as JSON |
 | `GET /metrics` | read | Prometheus metrics, as text |
 | `POST /tier` | admin | write the log into Parquet now: `{"rows_tiered": N}` |
-| `DELETE /sessions/{id}` | read | end a session's temporary tables and views: `{"ended": true}` |
+| `DELETE /sessions/{id}` | read | end a session: its temporary tables and views go, and so does its Python: `{"ended": true}` |
 | `GET /` | none | [the console](/pondra/start/console/): a web page, with no data in it until you use it |
 
 `GET /stats` needs no token, so a load balancer can poll it. It answers `lake` (its name), `role` (`leader`,
@@ -271,9 +272,9 @@ pondra_role{role="leader"} 1
 {"rows_tiered":0}
 ```
 
-## pondra server
+## A folder of lakes
 
-[`pondra server`](/pondra/guides/server/) answers on one port for every database in its folder:
+[`pondra serve`](/pondra/guides/server/) on a folder of lakes answers on one port for every database in it:
 
 | Method and path | Role | Meaning |
 |---|---|---|

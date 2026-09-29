@@ -28,7 +28,7 @@ An empty value counts as not set. See [HTTP](/pondra/reference/http/#roles) for 
 
 ```bash norun
 PONDRA_ADMIN_TOKEN="$ADMIN" PONDRA_WRITE_TOKEN="$WRITE" PONDRA_READ_TOKEN="$READ" \
-PONDRA_SECRET_KEY="$SECRET" pondra serve --dir lake
+PONDRA_SECRET_KEY="$SECRET" pondra serve lake
 ```
 
 ## Finding things
@@ -50,8 +50,8 @@ PONDRA_SECRET_KEY="$SECRET" pondra serve --dir lake
 | `PONDRA_FILES_CACHE_MB` | `512` | the memory cache for files read from outside the lake, such as attached Delta and Iceberg tables and URLs |
 | `PONDRA_FUNCTION_CACHE_MB` | `256` | the memory for answers a function keeps with `cache = '…'` |
 | `PONDRA_TEMP_MB` | `1024` | the memory all temporary tables on a node may hold together. A change past it is refused |
-| `PONDRA_SESSION_IDLE_SECS` | `3600` | a session idle this long ends, and its temporary tables go |
-| `PONDRA_DATABASE_IDLE_SECS` | `600` | under [`pondra server`](/pondra/guides/server/): a database's node that nothing has used for this long, and that has nothing left to tier, stops. The next query starts it again |
+| `PONDRA_SESSION_IDLE_SECS` | `3600` | a session idle this long ends. Its temporary tables go, and so does its [Python](/pondra/guides/functions-and-procedures/#cells-that-share-variables), with the variables its `DO LANGUAGE python` blocks made |
+| `PONDRA_DATABASE_IDLE_SECS` | `600` | serving a [folder of lakes](/pondra/guides/server/): a database's node that nothing has used for this long, and that has nothing left to tier, stops. The next query starts it again |
 | `PONDRA_CODEC` | `lz4` | how data files are compressed: `lz4` (fastest to read), `zstd` (smaller files), `snappy` or `none` |
 
 ## Queries across nodes
@@ -83,7 +83,7 @@ A query is spread over the nodes of a cluster when that is cheaper than running 
 | Variable | Default | Meaning |
 |---|---|---|
 | `PONDRA_PROCEDURES` | four times the cores | how many Python procedures a node runs at once. Functions run one for each core |
-| `PONDRA_WORKER_MB` | `2048` | a Python worker that has grown past this many MB is stopped after its job |
+| `PONDRA_WORKER_MB` | `2048` | a Python worker that has grown past this many MB is stopped after its job. It also governs a session's Python: past it, the session's next cell starts empty, and a notice says so |
 | `PONDRA_WORKER_IDLE_SECS` | `60` | a Python worker idle this long is stopped |
 
 ## AI functions
@@ -133,7 +133,7 @@ Do not set these. Pondra sets them for its own processes, and some are copies of
 | `PONDRA_OWNER_KEY` | the shell, `pondra.local()` and `local()` in JavaScript | a random key that lets the program that started a node read files on this machine through it. Nobody else may |
 | `PONDRA_PUBLISH`, `PONDRA_CHANGELOG_SECS`, `PONDRA_FSYNC`, `PONDRA_REPLICAS` | `pondra serve`, from `--publish`, `--changelog-secs`, `--fsync`, `--ack` and `--replicas` | the flags' values, for the rest of the node. Setting them in the environment has no effect: `serve` overwrites them. Use the flags |
 | `PONDRA_TRIES` | `pondra sql` | how many times a write has started over after another node took the lake |
-| `PONDRA_SERVER_URL` | `pondra server`, for each database's node | where the server is, for `DROP DATABASE` |
+| `PONDRA_SERVER_URL` | `pondra serve` on a folder of lakes, for each database's node | where the process that serves the folder is, for `DROP DATABASE` |
 
 <Aside type="caution">
 `PONDRA_CRASH`, `PONDRA_DROP_BEATS`, `PONDRA_NO_DIRECT`, `PONDRA_DEBUG_SPREAD` and `PONDRA_DEBUG_PG`

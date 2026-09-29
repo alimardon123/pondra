@@ -192,6 +192,36 @@ TABLE`, but a `CAST` takes only `BYTEA`. Other string functions don't take bytes
 first, then use the string function.
 </Aside>
 
+## Dates and times
+
+DataFusion's `to_timestamp` turns text or a number into a time. It answers a `TIMESTAMP`, a wall-clock time
+with no zone, as DataFusion, Spark and DuckDB's `strptime` do. `to_timestamp_seconds`, `to_timestamp_millis`,
+`to_timestamp_micros` and `to_timestamp_nanos` answer the same. For text that names a zone, the answer is
+UTC's time of day:
+
+```sql
+SELECT to_timestamp('2020-09-08T13:42:29+02:00') AS ts;
+```
+
+```text
+ts
+2020-09-08T11:42:29
+```
+
+A `TIMESTAMPTZ` column, and `now()`, are still `TIMESTAMPTZ`, an instant in UTC. Comparing a `TIMESTAMPTZ`
+column with `to_timestamp(…)` works:
+
+```sql
+CREATE TABLE pings (id BIGINT, at TIMESTAMPTZ);
+INSERT INTO pings VALUES (1, '2020-09-08 09:00:00+00'), (2, '2020-09-08 13:00:00+02');
+SELECT id FROM pings WHERE at < to_timestamp('2020-09-08T12:00:00+02:00') ORDER BY id;
+```
+
+```text
+id
+1
+```
+
 ## Files outside the lake
 
 Table functions read files in place, and give a table. Their names, and the DuckDB names that mean
@@ -210,13 +240,23 @@ A URL is a path, a glob (`sales/*.csv`), a list (`['a.csv', 'b.csv']`) or an `s3
 
 | Function | Options |
 |---|---|
-| `read_parquet`, `read_json` | `hive_partitioning`, `union_by_name` |
-| `read_csv` | `header` (default `true`: the first line names the columns), `delim` (or `sep`, `delimiter`), `quote`, `escape`, `hive_partitioning`, `union_by_name` |
+| `read_parquet`, `read_json` | `hive_partitioning`, `union_by_name`, `columns`, `hive_types` |
+| `read_csv` | `header` (default `true`: the first line names the columns), `delim` (or `sep`, `delimiter`), `quote`, `escape`, `comment`, `new_line`, `hive_partitioning`, `union_by_name`, `columns`, `hive_types` |
 | `read_delta` | `version` |
 | `read_iceberg` | `version`, `snapshot_from_id`, `snapshot_from_timestamp`, `allow_moved_paths` |
 
+- `columns => {'id': 'BIGINT', 'name': 'VARCHAR'}` names the columns and their types. A CSV's are matched by
+  position, JSON's and Parquet's by name.
+- `hive_types => {'day': 'DATE'}` names the keys of the `key=value` folders and their types. It turns on
+  `hive_partitioning`.
+- `comment => '#'` (`read_csv`) skips the lines that start with it.
+- `new_line => '\r'` (`read_csv`) is only needed for files whose lines end in `\r`.
+
 An option Pondra doesn't know is an error that lists the ones it does. A bare quoted name in
 `FROM` (`FROM 'sales.csv'`) picks the reader from the file's extension.
+
+To keep a name for files instead of spelling the reader out each time, see
+[`CREATE EXTERNAL TABLE`](/pondra/reference/sql/#external-tables).
 
 A path on the node's machine is read only by the program that started the node: the shell,
 `pondra.local()` or `pondra sql`. A query over HTTP is refused.
@@ -234,6 +274,22 @@ db.close()
 
 ```text
 [{'id': 1, 'name': 'tea'}, {'id': 2, 'name': 'cake'}]
+```
+
+A file with a comment line and its own delimiter, read with the columns and types you name:
+
+```bash
+printf '# exported by the till\nid;name\n1;tea\n2;cake\n' > till.csv
+pondra sql --dir scratch "SELECT * FROM read_csv('till.csv', delim => ';', comment => '#', columns => {'id': 'BIGINT', 'name': 'VARCHAR'})"
+```
+
+```text
++----+------+
+| id | name |
++----+------+
+| 1  | tea  |
+| 2  | cake |
++----+------+
 ```
 
 ## Secrets

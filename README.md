@@ -69,18 +69,18 @@ and hands the lake on at once, so the next one opens it straight away.
 cargo build --release
 
 # Local directory; the console (SQL, Python and text cells, notebooks) is at http://127.0.0.1:8080/
-./target/release/pondra serve --dir ./lake
+./target/release/pondra serve ./lake
 
 # A folder of lakes as databases: psql -d sales, or http://host:8080/db/sales/…
-./target/release/pondra server ./data --pg 0.0.0.0:5432
+./target/release/pondra serve ./data --pg 0.0.0.0:5432
 
 # A cluster: the same command on each machine, same bucket. Every node takes writes and
 # queries; one of them (elected through the bucket) orders the commits; any can take over.
 export AWS_ACCESS_KEY_ID=… AWS_SECRET_ACCESS_KEY=… AWS_REGION=auto
 export AWS_ENDPOINT=https://<account>.r2.cloudflarestorage.com
-./target/release/pondra serve --dir s3://my-bucket/lake --addr 10.0.0.1:8080
-./target/release/pondra serve --dir s3://my-bucket/lake --addr 10.0.0.2:8080
-./target/release/pondra serve --dir s3://my-bucket/lake --addr 10.0.0.3:8080 --reader   # SQL only
+./target/release/pondra serve s3://my-bucket/lake --addr 10.0.0.1:8080
+./target/release/pondra serve s3://my-bucket/lake --addr 10.0.0.2:8080
+./target/release/pondra serve s3://my-bucket/lake --addr 10.0.0.3:8080 --reader   # SQL only
 
 # Serverless, from any machine with the binary and bucket credentials — no node needed:
 ./target/release/pondra sql --dir s3://my-bucket/lake "SELECT count(*) FROM events"
@@ -88,15 +88,15 @@ export AWS_ENDPOINT=https://<account>.r2.cloudflarestorage.com
 ./target/release/pondra sql --dir s3://my-bucket/lake "UPDATE users SET plan = 'pro' WHERE id = 7"
 
 # SQL from anything that speaks Postgres, and from Python:
-./target/release/pondra serve --dir ./lake --pg 0.0.0.0:5432      # psql, psycopg, SQLAlchemy, dbt, DBeaver, Tableau, Excel
+./target/release/pondra serve ./lake --pg 0.0.0.0:5432      # psql, psycopg, SQLAlchemy, dbt, DBeaver, Tableau, Excel
 pip install ./python && python -c "import pondra; print(pondra.connect('http://127.0.0.1:8080').sql('SELECT 1').to_pandas())"
 
 # Kafka producers and consumers (a topic is a table), and engines attaching the lake by URL:
-./target/release/pondra serve --dir ./lake --kafka 0.0.0.0:9092   # bootstrap.servers=host:9092
+./target/release/pondra serve ./lake --kafka 0.0.0.0:9092   # bootstrap.servers=host:9092
 #   PyIceberg / DuckDB / Spark: an Iceberg REST catalog at http://host:8080 (namespace "default" = schema public; one per schema)
 
 # Arrow Flight and Flight SQL: ADBC / JDBC drivers and pyarrow, Arrow in and out
-./target/release/pondra serve --dir ./lake --flight 0.0.0.0:8815  # adbc_driver_flightsql.dbapi.connect("grpc://host:8815")
+./target/release/pondra serve ./lake --flight 0.0.0.0:8815  # adbc_driver_flightsql.dbapi.connect("grpc://host:8815")
 
 # AI agents over MCP (Claude Code, Claude Desktop, Cursor, …): every node serves POST /mcp
 claude mcp add --transport http pondra http://127.0.0.1:8080/mcp   # add --header "Authorization: Bearer $TOKEN" with tokens on
@@ -150,7 +150,7 @@ Useful `serve` flags (give every node the same ones: any of them may lead):
 - `--read-token`, `--write-token`, `--admin-token`: access control (none set = open). Over
   Postgres the user name picks the role (`reader`, `writer`, `admin`) and the password is its
   token. Whatever the token, SQL sent to a node never touches the node's own disk (no `COPY …
-  TO`, no `CREATE EXTERNAL TABLE`); only `pondra sql` reads local files, on its own machine, and
+  TO`, no `CREATE EXTERNAL TABLE` over local files); only `pondra sql` reads local files, on its own machine, and
   so does the shell's (or `local()`'s) node for the program that started it, by a key only that
   program knows (`FROM 'D:\data\jan.csv'`).
 - `--attach name=dir`: read (and write through its leader) another lake as a database of its
@@ -275,7 +275,7 @@ The Linux binary is portable because it is built with `cargo zigbuild --profile 
 x86_64-unknown-linux-gnu.2.17`: it asks for nothing newer than glibc 2.17, the floor Python's
 own manylinux2014 wheels use.
 
-Paths on Windows work either way, but `--dir s3://bucket/lake` (R2, S3, MinIO) avoids local-path
+Paths on Windows work either way, but a lake at `s3://bucket/lake` (R2, S3, MinIO) avoids local-path
 differences entirely.
 
 ## What it does
@@ -468,8 +468,7 @@ bucket to its newest lakes.
   Delta writers need Delta's catalog-managed commits, which aren't out yet.
 - A materialized view that is a session window or a stream join starts from its creation; others
   are filled from the rows already there, in one go on the leader. Narrowing a type,
-  `search_path` and grants per schema; `CREATE EXTERNAL TABLE` (read files where they are, or
-  `ATTACH` them).
+  `search_path` and grants per schema.
 - The owner has installed the Windows wheel from PyPI on a real machine; the macOS packages, and
   the installers on anything but CI's machines, haven't run elsewhere yet. No winget or Homebrew
   package. The node's JSON leaves out nulls (the Python client puts them back as None; the
@@ -479,8 +478,8 @@ bucket to its newest lakes.
 - Per-table grants, quotas and TLS (tokens are per role; put a TLS proxy in front, and keep a
   cluster's nodes on a private network: they talk plain HTTP to each other). Power BI Desktop
   itself hasn't run against Pondra (its drivers, Npgsql and psqlODBC, are tested).
-- The console: no completion or charts yet, and its Python cells don't share variables (each is
-  a `DO` block). `pondra server` serves a folder on its own disk, not one in a bucket.
+- The console: no completion or charts yet.
+- A folder of lakes (`pondra serve data`) is on the node's own disk, not in a bucket.
 - Kafka: one partition per topic, no transactions; offsets are positions in the log (increasing,
   not dense). Consumer groups live in the leader's memory (members rejoin after a failover).
 - An approximate vector index (see the plan in `docs/comparison-spark-flink-fluss.md`).

@@ -651,6 +651,12 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
     }
     crate::temp::register(&ctx, &text)?; // (the session's temporary tables, over the lake's)
     register_views(&ctx, views, !listing).await?; // (a listing shows what it can)
+    if listing {
+        let direct = crate::ext::names(sql);
+        for n in crate::ext::names(&text).into_iter().filter(|n| !direct.contains(n)) {
+            ctx.deregister_table(datafusion::common::TableReference::bare(n))?; // (files its views read: theirs, not tables to list)
+        }
+    }
     Ok(ctx)
 }
 
@@ -684,7 +690,7 @@ pub async fn register_views(ctx: &SessionContext, mut views: Vec<(String, String
             match ctx.sql(&crate::asof::rewrite(&sql)?).await {
                 Ok(df) => {
                     ctx.deregister_table(table_ref(&name))?;
-                    ctx.register_table(table_ref(&name), Arc::new(datafusion::catalog::view::ViewTable::new(df.into_unoptimized_plan(), Some(sql))))?;
+                    ctx.register_table(table_ref(&name), Arc::new(datafusion::catalog::view::ViewTable::new(df.into_unoptimized_plan(), Some(crate::ext::readable(&sql)))))?; // (its files as SQL named them)
                 }
                 Err(e) => {
                     failed = Some(anyhow::anyhow!("view {name}: {e}"));

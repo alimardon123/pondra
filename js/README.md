@@ -27,4 +27,4 @@ Functions and procedures written in SQL or Python (`CREATE FUNCTION`, `CREATE PR
 python`) run on the node; `local()` gives the node a Python with the `pondra` package if this
 machine has one.
 
-`npx pondra` opens a SQL shell on `./lake`; `npx pondra serve --dir s3://bucket/lake` runs a node.
+`npx pondra` opens a SQL shell on `./lake`; `npx pondra serve s3://bucket/lake` runs a node.

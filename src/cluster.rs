@@ -236,7 +236,7 @@ pub fn mirror(lake: Arc<Lake>, leader: String, me: String, replica: Option<Arc<R
     });
 }
 
-/// An HTTP client that carries no token of its own: `pondra server` passes each client's on.
+/// An HTTP client that carries no token of its own: the process serving a folder of databases (`dbserver.rs`) passes each client's on.
 pub fn http_bare() -> &'static reqwest::Client {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     CLIENT.get_or_init(|| reqwest::Client::builder().build().unwrap_or_default())

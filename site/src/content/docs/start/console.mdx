@@ -22,13 +22,13 @@ to the node that served it.
 Start a node and open its address:
 
 ```bash norun
-pondra serve --dir lake        # then open http://localhost:8080
+pondra serve lake        # then open http://localhost:8080
 ```
 
 - **The shell** starts a node too. Its first line says where: `Pondra 0.26.0 on lake, also at
   http://127.0.0.1:37957`. Open that address while the shell runs.
-- **`pondra server`** serves a folder of lakes, and its console lists every database. See
-  [A server of databases](/pondra/guides/server/).
+- **`pondra serve data`** on a folder of lakes serves each as a database, and its console lists
+  them all. See [Many databases](/pondra/guides/server/).
 - **On another machine**, start the node with tokens (`--admin-token`, see
   [Security](/pondra/guides/security/)). The console asks for a token the first time, and your browser
   keeps it.
@@ -70,6 +70,13 @@ print("regions:", len(by_region.rows()))
 by_region.sort("total", descending=True)
 ```
 
+Cells share variables, as in a notebook: the next cell sees what this one made.
+
+```python cell
+best = by_region.sort("total", descending=True).rows()[0]
+print("best region:", best["region"], best["total"])
+```
+
 The node runs a Python cell as Postgres's anonymous code block, `DO LANGUAGE python`. You can send
 the same block from psql or any client:
 
@@ -83,9 +90,17 @@ $$;
   `--python /path/to/python`. `pondra.local()` does this for you.
 - A Python cell needs an admin token, since it runs code on the node. With no tokens set, the node
   listens only on `127.0.0.1`, and anyone who can reach it is its admin.
-- Each cell runs on its own, so a variable made in one cell isn't there in the next. Keep what later
-  cells need in a table. A [temporary table](/pondra/guides/change-rows/) is the page's own and goes
-  when you close it.
+- A page is a session, and its Python cells run on one Python worker kept for that session, in one
+  namespace, like a notebook kernel. What one cell makes (variables, imports, functions, frames such
+  as `orders = db.table("sales")`), the next cell sees. A cell that fails keeps what it did before the
+  failing line. `_` holds the last answer, and a cell's single value comes back as a column named
+  `value`. One cell runs at a time.
+- The session's Python ends when you close the page (or, in psql, when the connection closes), after
+  `PONDRA_SESSION_IDLE_SECS` (3600) seconds idle, or if it grows past `PONDRA_WORKER_MB` (2048) MB.
+  The next cell then starts empty, and a notice says so.
+- A `DO` block sent without a session runs fresh and shares nothing. In psql, a connection is a
+  session. Over HTTP, send the `x-pondra-session: <id>` header, as the Python and JavaScript clients
+  do: see [Functions and procedures](/pondra/guides/functions-and-procedures/#cells-that-share-variables).
 - A Python error names its line in the cell: `ZeroDivisionError: division by zero, line 2: 1 / 0`.
 
 ## Text cells
@@ -170,5 +185,4 @@ The page follows your system's light or dark setting.
 <Aside type="caution" title="Not in the console yet">
 - Completion of table and column names as you type.
 - Charts. For now, a Python cell can return rows, and the CSV button hands them to a chart tool.
-- Python cells that share variables. Each runs as its own `DO` block on the node.
 </Aside>

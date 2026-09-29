@@ -186,15 +186,15 @@ for await (const rows of db.live("SELECT count(*) AS n FROM orders")) {
 | `db.notices` | what the last statement's procedures printed, as an array of strings |
 | `db.onNotice` | the function each notice goes to |
 | `db.producer`, `db.seq` | the name `append` writes under, and its last sequence number |
-| `db.session` | this connection's session id: its temporary tables and views live under it |
+| `db.session` | this connection's session id: its temporary tables and views, and the variables of its `DO LANGUAGE python` blocks, live under it |
 | `db.position` | the commit the last `live` answer is as of |
 | `await db.request(method, path, body, type)` | one HTTP request to the node, as the methods above make them. Answers the `fetch` response, and throws on an error status with the text `status: message` |
 
 ## Close
 
 `await db.close(timeoutMs = 15000)` ends the connection's session, so its temporary tables and
-views go, and stops the node `local` started. It waits for the node to stop, and kills it after
-`timeoutMs`.
+views go, and so do the variables of its `DO LANGUAGE python` blocks. It also stops the node `local`
+started: it waits for the node to stop, and kills it after `timeoutMs`.
 
 ```js
 import { connect } from "pondra";

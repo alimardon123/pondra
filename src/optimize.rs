@@ -49,16 +49,29 @@ pub fn rules() -> Vec<Arc<dyn OptimizerRule + Send + Sync>> {
     rules
 }
 
-/// `to_timestamp(column)` and its `_seconds`, `_millis`, `_micros` and `_nanos`: over a column of
-/// text, DataFusion 55 returns them without the zone their type says (the session's, UTC, for
-/// `TIMESTAMPTZ`), and the batch is refused. Here their answer is given that zone.
+/// `to_timestamp(…)` and its `_seconds`, `_millis`, `_micros` and `_nanos` answer a `TIMESTAMP`
+/// without a zone (UTC's time of day for text that names a zone), as DataFusion, Spark and
+/// DuckDB's `strptime` do (ADR-032), though the session's zone is UTC so that `TIMESTAMPTZ`
+/// columns are UTC's (`config`). DataFusion reads that zone into these functions when they are
+/// made; here they are made without it, every time the session's settings change. (With it, they
+/// also answered a column of text without the zone their type said, and the batch was refused:
+/// the answer is cast to the type they say.)
 pub fn register_zoned(ctx: &datafusion::prelude::SessionContext) {
     use datafusion::execution::FunctionRegistry;
+    let naive = naive(ctx.copied_config().options());
     for name in ["to_timestamp", "to_timestamp_seconds", "to_timestamp_millis", "to_timestamp_micros", "to_timestamp_nanos"] {
         if let Ok(inner) = ctx.udf(name) {
+            let inner = inner.inner().with_updated_config(&naive).map(Arc::new).unwrap_or(inner);
             ctx.register_udf(datafusion::logical_expr::ScalarUDF::new_from_impl(Zoned(inner)));
         }
     }
+}
+
+/// The session's settings without its zone.
+fn naive(config: &ConfigOptions) -> ConfigOptions {
+    let mut c = config.clone();
+    c.execution.time_zone = None;
+    c
 }
 
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -71,7 +84,7 @@ impl datafusion::logical_expr::ScalarUDFImpl for Zoned {
     fn coerce_types(&self, types: &[DataType]) -> Result<Vec<DataType>> { self.0.coerce_types(types) }
     fn return_type(&self, types: &[DataType]) -> Result<DataType> { self.0.return_type(types) }
     fn with_updated_config(&self, config: &ConfigOptions) -> Option<datafusion::logical_expr::ScalarUDF> {
-        let inner = self.0.inner().with_updated_config(config)?;
+        let inner = self.0.inner().with_updated_config(&naive(config))?;
         Some(datafusion::logical_expr::ScalarUDF::new_from_impl(Zoned(Arc::new(inner))))
     }
     fn invoke_with_args(&self, args: datafusion::logical_expr::ScalarFunctionArgs) -> Result<datafusion::logical_expr::ColumnarValue> {

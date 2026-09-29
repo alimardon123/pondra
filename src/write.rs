@@ -8,7 +8,7 @@ use crate::cluster::{alive, claim, http, latest, mark_alive, release};
 use crate::log::{decode_flush, encode_flush, pack, Append, Outcome, Sequencer, Src};
 use crate::query::{schema, session};
 use crate::store::*;
-use anyhow::{bail, ensure, Result};
+use anyhow::{bail, ensure, Context, Result};
 use bytes::Bytes;
 use datafusion::arrow::compute::concat_batches;
 use datafusion::arrow::datatypes::{DataType, TimeUnit};
@@ -258,6 +258,24 @@ pub fn parse(sql: &str) -> Option<Stmt> {
     static VIEW_RENAME: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(r#"(?is)^\s*ALTER\s+(MATERIALIZED\s+)?VIEW\s+(IF\s+EXISTS\s+)?([\w."-]+)\s+RENAME\s+TO\s+([\w."-]+)\s*;?\s*$"#).expect("a regex")
     });
+    // DataFusion's CREATE EXTERNAL TABLE (a stored view of files: `ext::external`), in its own words.
+    static EXTERNAL: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"(?is)^\s*CREATE\s+(\w+\s+){0,3}EXTERNAL\s+TABLE\b").expect("a regex")
+    });
+    if let Some(m) = EXTERNAL.find(first_word(sql)) {
+        use datafusion::sql::parser::{DFParserBuilder, Statement as DF};
+        if m.as_str().split_whitespace().any(|w| w.eq_ignore_ascii_case("temp") || w.eq_ignore_ascii_case("temporary")) {
+            return Some(Stmt::Invalid("CREATE TEMPORARY EXTERNAL TABLE: make a temporary view of the files instead (CREATE TEMP VIEW t AS SELECT * FROM read_parquet('…'))".into()));
+        }
+        return Some(match DFParserBuilder::new(sql).build().and_then(|mut p| p.parse_statements()) {
+            Ok(mut all) if all.len() == 1 => match all.pop_front() {
+                Some(DF::CreateExternalTable(c)) => crate::ext::external(&c).map(|d| Stmt::Ddl(vec![d])).unwrap_or_else(|e| Stmt::Invalid(format!("{e:#}"))),
+                _ => Stmt::Invalid("CREATE EXTERNAL TABLE t … STORED AS … LOCATION '…'".into()),
+            },
+            Ok(all) => Stmt::Invalid(format!("CREATE EXTERNAL TABLE and {} more: send one statement at a time here (or as a script, over HTTP or in the shell)", all.len().saturating_sub(1))),
+            Err(e) => Stmt::Invalid(format!("{e}")),
+        });
+    }
     if let Some(c) = VIEW_RENAME.captures(first_word(sql)) {
         let name = |s: &str| s.split('.').map(|p| if p.starts_with('"') { p.trim_matches('"').to_string() } else { p.to_lowercase() }).collect::<Vec<_>>().join(".");
         return Some(Stmt::Ddl(vec![Ddl::RenameTable { name: name(&c[3]), to: name(&c[4]) }]));
@@ -273,7 +291,6 @@ pub fn parse(sql: &str) -> Option<Stmt> {
     };
     let text = parsed.to_string();
     Some(match parsed {
-        Statement::CreateTable(c) if c.external => Stmt::Invalid("CREATE EXTERNAL TABLE isn't needed: read files where they are (SELECT … FROM 's3://…/*.parquet', read_csv(…)), or ATTACH '…' AS name (TYPE delta | iceberg)".into()),
         Statement::CreateTable(c) => Stmt::Create(Box::new(c)),
         Statement::Insert(ast::Insert { table: ast::TableObject::TableName(t), source: Some(q), columns, on: Some(on), .. }) => match on {
             ast::OnInsert::OnConflict(oc) => {
@@ -418,13 +435,23 @@ pub fn sql_type(t: &ast::DataType) -> String {
     }
 }
 
+/// A statement's declared columns (`CREATE TABLE t (…)`) as `declared` takes them.
+pub fn columns_sql(columns: &[ast::ColumnDef]) -> String {
+    columns.iter().map(|c| format!("{} {}", c.name, sql_type(&c.data_type))).collect::<Vec<_>>().join(", ")
+}
+
+async fn declared_of(columns: &[ast::ColumnDef]) -> Result<Vec<datafusion::arrow::datatypes::FieldRef>> { declared(&columns_sql(columns)).await }
+
+/// Columns as SQL declares them (`"id" BIGINT, "name" VARCHAR`): their Arrow fields, as
+/// DataFusion types them.
+pub async fn declared(cols: &str) -> Result<Vec<datafusion::arrow::datatypes::FieldRef>> {
+    let ctx = SessionContext::new_with_config(crate::optimize::config(datafusion::prelude::SessionConfig::new())); // (TIMESTAMPTZ in UTC)
+    ctx.sql(&format!("CREATE TABLE t ({cols})")).await.with_context(|| format!("the columns ({cols})"))?;
+    Ok(ctx.table("t").await?.schema().fields().iter().cloned().collect::<Vec<_>>())
+}
+
 pub async fn create_spec(c: &ast::CreateTable, from: &Lake, files: bool) -> Result<String> {
-    let declared = || async {
-        let cols = c.columns.iter().map(|c| format!("{} {}", c.name, sql_type(&c.data_type))).collect::<Vec<_>>().join(", ");
-        let ctx = SessionContext::new_with_config(crate::optimize::config(datafusion::prelude::SessionConfig::new())); // (TIMESTAMPTZ in UTC)
-        ctx.sql(&format!("CREATE TABLE t ({cols})")).await?;
-        anyhow::Ok(ctx.table("t").await?.schema().fields().iter().cloned().collect::<Vec<_>>())
-    };
+    let declared = || declared_of(&c.columns);
     let fields = match &c.query {
         Some(q) => {
             let sql = q.to_string();
@@ -565,7 +592,6 @@ fn rows_sql(meta: &TableMeta, stmt: &Stmt) -> Result<String> {
 /// position, the others NULL (`_deleted` left for `rows` to fill), in the table's order. `VALUES`
 /// stay `VALUES`, so they still go through the log.
 async fn whole_rows(lake: &Lake, table: &str, names: &[String], query: &str) -> Result<String> {
-    use anyhow::Context;
     let (other, name) = crate::ddl::resolve(lake, table).await?;
     let meta: TableMeta = other.as_deref().unwrap_or(lake).cat.get(&table_key(&name)).await?.with_context(|| format!("no table {table}"))?;
     let columns: Vec<String> = meta.logical().columns.into_iter().map(|(c, _)| c).filter(|c| c != "_deleted" || names.contains(c)).collect();
@@ -840,6 +866,10 @@ async fn on_node_listed(app: &crate::server::App, stmt: Stmt, job: Option<String
     if let Stmt::Invalid(why) = stmt {
         bail!(why);
     }
+    if let Some((query, to, options)) = crate::ext::view_write(&app.lake, &stmt).await? {
+        let out = crate::copy::copy_to(&app.lake, &query, &to, &options, &app.cluster.nodes(), &app.cluster.addr).await?; // (a view of a folder: a new file in it)
+        return Ok(j!({"rows": out["copied"]}));
+    }
     let stmt = match stmt {
         Stmt::InsertInto(t, names, query) => Stmt::Insert(t.clone(), whole_rows(&app.lake, &t, &names, &query).await?),
         s => s,
@@ -1045,6 +1075,15 @@ pub async fn made(dir: &str) -> Result<Arc<Lake>> {
 }
 
 pub async fn from_cli(dir: &str, stmt: Stmt) -> Result<Value> {
+    if let Stmt::Invalid(why) = stmt {
+        bail!(why); // (said as a node says it)
+    }
+    if let Ok(lake) = Lake::open(dir, false, false).await {
+        if let Some((query, to, options)) = crate::ext::view_write(&lake, &stmt).await? {
+            let out = crate::copy::copy_to(&lake, &query, &to, &options, &[], "").await?; // (a view of a folder: a new file in it)
+            return Ok(j!({"rows": out["copied"]}));
+        }
+    }
     let stmt = match stmt {
         Stmt::InsertInto(t, names, query) => Stmt::Insert(t.clone(), whole_rows(&*Lake::open(dir, false, false).await?, &t, &names, &query).await?),
         s => s,

@@ -33,6 +33,9 @@ pub struct Schema {
 #[derive(Serialize, Deserialize, Clone)]
 pub struct StoredView {
     pub sql: String,
+    /// Made by CREATE EXTERNAL TABLE (a view of files): DROP TABLE drops it too.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub external: bool,
 }
 
 /// Another lake, attached in SQL (`ATTACH 'dir' AS name`): every node attaches it.
@@ -128,12 +131,13 @@ pub enum Ddl {
     DropSchema { name: String, if_exists: bool, cascade: bool },
     DropTable { name: String, if_exists: bool },
     CreateView { name: String, sql: String, replace: bool },
+    CreateExternal { name: String, sql: String, replace: bool, if_not_exists: bool }, // DataFusion's CREATE EXTERNAL TABLE: a view of files (`ext::external`)
     CreateMaterialized { name: String, sql: String, options: std::collections::BTreeMap<String, String> }, // (`views::options`)
     DropView { name: String, if_exists: bool },
     Attach { name: String, dir: String },
     Detach { name: String, if_exists: bool },
     CreateDatabase { name: String, if_not_exists: bool, dir: Option<String> }, // a new lake (beside this one unless `dir`), attached
-    DropDatabase { name: String, if_exists: bool }, // `pondra server`'s: its node stopped, its folder deleted (ADR-030)
+    DropDatabase { name: String, if_exists: bool }, // a folder of databases' (`dbserver.rs`): its node stopped, its folder deleted (ADR-030)
     AlterColumn { table: String, column: String, change: Change }, // ALTER TABLE … RENAME/DROP/ALTER COLUMN (ADR-022)
     RenameTable { name: String, to: String }, // ALTER TABLE | VIEW … RENAME TO (ADR-030)
     CreateRoutine { name: String, routine: crate::routines::Routine, replace: bool }, // CREATE MACRO, CREATE PROCEDURE (ADR-023)
@@ -165,6 +169,7 @@ pub async fn apply(lake: &Lake, d: Ddl) -> Result<Value> {
     let d = match d {
         Ddl::DropTable { name, if_exists } => Ddl::DropTable { name: here(name), if_exists },
         Ddl::CreateView { name, sql, replace } => Ddl::CreateView { name: here(name), sql, replace },
+        Ddl::CreateExternal { name, sql, replace, if_not_exists } => Ddl::CreateExternal { name: here(name), sql, replace, if_not_exists },
         Ddl::CreateMaterialized { name, sql, options } => Ddl::CreateMaterialized { name: here(name), sql, options },
         Ddl::DropView { name, if_exists } => Ddl::DropView { name: here(name), if_exists },
         Ddl::RenameTable { name, to } => Ddl::RenameTable { name: here(name), to },
@@ -207,16 +212,16 @@ pub async fn apply(lake: &Lake, d: Ddl) -> Result<Value> {
             Ok(j!({"schema": name, "dropped": true}))
         }
         Ddl::DropTable { name, if_exists } => drop_table(lake, &name, if_exists).await,
-        Ddl::CreateView { name, sql, replace } => {
+        Ddl::CreateView { name, sql, replace } => create_view(lake, &name, sql, replace, false).await,
+        Ddl::CreateExternal { name, sql, replace, if_not_exists } => {
             let name = new_name(lake, &name).await?;
-            ensure!(lake.cat.get::<TableMeta>(&table_key(&name)).await?.is_none(), "{name} is a table");
-            ensure!(lake.cat.get::<Value>(&crate::views::view_key(&name)).await?.is_none(), "{name} is a materialized view");
-            ensure!(replace || lake.cat.get::<StoredView>(&query_key(&name)).await?.is_none(), "view {name} already exists (CREATE OR REPLACE VIEW)");
-            let expanded = crate::routines::expand(lake, &sql).await?; // (kept as written: macros are read when it is used)
-            let planned = crate::asof::rewrite(&expanded)?;
-            crate::query::session(lake, &planned, "").await?.sql(&planned).await.context("the view's query")?; // (it plans)
-            lake.cat.commit(vec![(query_key(&name), json(&StoredView { sql }))], &[]).await?;
-            Ok(j!({"view": name}))
+            let taken = lake.cat.get::<TableMeta>(&table_key(&name)).await?.is_some() || lake.cat.get::<StoredView>(&query_key(&name)).await?.is_some()
+                || lake.cat.get::<Value>(&crate::views::view_key(&name)).await?.is_some();
+            if taken && if_not_exists && !replace {
+                return Ok(j!({"table": name, "unchanged": true}));
+            }
+            ensure!(replace || !taken, "{name} already exists (CREATE OR REPLACE EXTERNAL TABLE, or IF NOT EXISTS)");
+            create_view(lake, &name, sql, replace, true).await
         }
         Ddl::CreateMaterialized { name, sql, options } => {
             let name = new_name(lake, &name).await?;
@@ -263,7 +268,7 @@ pub async fn apply(lake: &Lake, d: Ddl) -> Result<Value> {
             Box::pin(apply(lake, Ddl::Attach { name, dir })).await
         }
         Ddl::DropDatabase { name, if_exists } => {
-            let server = std::env::var("PONDRA_SERVER_URL").map_err(|_| anyhow::anyhow!("DROP DATABASE drops a database `pondra server` serves, folder and all; on a node, DETACH {name} (its folder stays)"))?;
+            let server = std::env::var("PONDRA_SERVER_URL").map_err(|_| anyhow::anyhow!("DROP DATABASE drops one of the databases `pondra serve <folder>` serves, folder and all; on a node serving one lake, DETACH {name} (its folder stays)"))?;
             ensure!(name != lake_name(lake), "this is database {name}: drop it from another one");
             let r = crate::cluster::http().delete(format!("{server}/databases/{name}?if_exists={if_exists}")).send().await?;
             let (ok, text) = (r.status().is_success(), r.text().await?);
@@ -496,7 +501,28 @@ pub async fn settle(lake: &Lake, d: &Ddl, me: &str) -> Result<()> {
 
 /// `DROP TABLE`: the table leaves the catalog at once, and its files once they are a day old
 /// (`tier::collect_orphans`). Refused while a view or task reads it or it is a view's own.
+/// `CREATE VIEW` (and CREATE EXTERNAL TABLE's view of files): a query by name, planned once here
+/// to be sure it can be, and kept as written.
+async fn create_view(lake: &Lake, name: &str, sql: String, replace: bool, external: bool) -> Result<Value> {
+    let name = new_name(lake, name).await?;
+    ensure!(lake.cat.get::<TableMeta>(&table_key(&name)).await?.is_none(), "{name} is a table");
+    ensure!(lake.cat.get::<Value>(&crate::views::view_key(&name)).await?.is_none(), "{name} is a materialized view");
+    ensure!(replace || lake.cat.get::<StoredView>(&query_key(&name)).await?.is_none(), "view {name} already exists (CREATE OR REPLACE VIEW)");
+    let expanded = crate::routines::expand(lake, &sql).await?; // (kept as written: macros are read when it is used)
+    let planned = crate::asof::rewrite(&expanded)?;
+    crate::query::session(lake, &planned, "").await?.sql(&planned).await.context(if external { "reading its files" } else { "the view's query" })?; // (it plans)
+    lake.cat.commit(vec![(query_key(&name), json(&StoredView { sql, external }))], &[]).await?;
+    Ok(match external {
+        true => j!({"table": name, "files": true}),
+        false => j!({"view": name}),
+    })
+}
+
 async fn drop_table(lake: &Lake, name: &str, if_exists: bool) -> Result<Value> {
+    if lake.cat.get::<StoredView>(&query_key(name)).await?.is_some_and(|v| v.external) {
+        lake.cat.commit(vec![], &[query_key(name)]).await?; // (CREATE EXTERNAL TABLE's: its files stay)
+        return Ok(j!({"table": name, "dropped": true}));
+    }
     let Some(meta) = lake.cat.get::<TableMeta>(&table_key(name)).await? else {
         ensure!(if_exists, "no table {name}");
         return Ok(j!({"table": name, "dropped": false}));

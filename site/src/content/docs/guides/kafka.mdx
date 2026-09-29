@@ -12,7 +12,7 @@ read the table's log. Use it to point existing Kafka producers, Debezium and con
 without changing them. Pondra can also read and write topics on other Kafka clusters from SQL.
 
 ```bash norun
-pondra serve --dir lake --kafka 0.0.0.0:9092
+pondra serve lake --kafka 0.0.0.0:9092
 ```
 
 Clients use `bootstrap.servers=host:9092`. If clients must reach the node at a different address

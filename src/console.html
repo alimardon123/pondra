@@ -5,22 +5,23 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light dark">
 <title>Pondra</title>
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='14' fill='%232563eb'/%3E%3Cpath d='M7 17c3-3 6-3 9 0s6 3 9 0' stroke='white' stroke-width='2.6' fill='none' stroke-linecap='round'/%3E%3Cpath d='M10 22c2-1.6 4-1.6 6 0s4 1.6 6 0' stroke='white' stroke-width='2' fill='none' stroke-linecap='round' opacity='.7'/%3E%3C/svg%3E">
+<link rel="icon" href="{{favicon}}"><!-- (brand/mark.svg: console.rs) -->
 <!-- The console (ADR-030): this one file, served by the node. No CDN, no fonts, nothing from
      anywhere else: every request it makes goes to the node (or the server) that served it. -->
 <style>
+/*{{colors}}*/
 :root{
   --bg:#fafaf9;--panel:#f4f4f2;--card:#fff;--ink:#1c1c1e;--muted:#6e6e73;--faint:#a1a1a6;--line:#e7e7e3;--line2:#d7d7d2;
-  --accent:#2563eb;--accent-soft:#e9f0ff;--ok:#15803d;--err:#b42318;--err-soft:#fdeeec;--warn:#b45309;
-  --sel:#cfdcff;--kw:#7c3aed;--str:#0f766e;--num:#b45309;--com:#8e8e93;--fn:#2563eb;
+  --accent:var(--pondra-accent);--accent-soft:var(--pondra-accent-soft);--ok:#15803d;--err:#b42318;--err-soft:#fdeeec;--warn:#b45309;
+  --sel:color-mix(in srgb,var(--pondra-accent) 22%,#fff);--kw:#7c3aed;--str:#0f766e;--num:#b45309;--com:#8e8e93;--fn:#2563eb;
   --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;
   --sans:system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
   --on-accent:#fff;--radius:10px;--shadow:0 1px 2px rgba(0,0,0,.04),0 1px 1px rgba(0,0,0,.03)
 }
 @media (prefers-color-scheme:dark){:root{
   --bg:#111113;--panel:#161618;--card:#1b1b1e;--ink:#ececf0;--muted:#9d9da6;--faint:#6b6b74;--line:#28282c;--line2:#36363c;
-  --accent:#7aa2ff;--accent-soft:#1d2842;--ok:#4ade80;--err:#ff8a80;--err-soft:#3a1d1b;--warn:#fbbf24;
-  --sel:#2d3d66;--kw:#c4a5ff;--str:#5eead4;--num:#fdba74;--com:#76767f;--fn:#8fb3ff;--on-accent:#0b1220;--shadow:none
+  --accent:var(--pondra-accent-dark);--accent-soft:var(--pondra-accent-soft-dark);--ok:#4ade80;--err:#ff8a80;--err-soft:#3a1d1b;--warn:#fbbf24;
+  --sel:color-mix(in srgb,var(--pondra-accent-dark) 30%,#111113);--kw:#c4a5ff;--str:#5eead4;--num:#fdba74;--com:#76767f;--fn:#8fb3ff;--on-accent:#06201b;--shadow:none
 }}
 *{box-sizing:border-box}
 [hidden]{display:none!important}
@@ -30,6 +31,8 @@ button,select,input{font:inherit;color:inherit}
 svg{flex:none}
 header{display:flex;align-items:center;gap:8px;padding:8px 14px;border-bottom:1px solid var(--line);background:var(--panel);min-height:50px}
 .brand{display:flex;align-items:center;gap:8px;font-weight:650;letter-spacing:-.01em;margin-right:4px}
+.brand .pondra-mark{height:19px;width:auto;color:var(--pondra-mark)}
+@media (prefers-color-scheme:dark){.brand .pondra-mark{color:var(--pondra-mark-dark)}}
 .pill{font-size:12px;color:var(--muted);border:1px solid var(--line2);border-radius:999px;padding:2px 10px;white-space:nowrap;max-width:40vw;overflow:hidden;text-overflow:ellipsis}
 .pill b{color:var(--ink);font-weight:600}
 .dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--ok);margin-right:6px;vertical-align:1px}
@@ -139,7 +142,7 @@ kbd{font:12px var(--mono);border:1px solid var(--line2);border-bottom-width:2px;
 </head>
 <body>
 <header>
-  <div class="brand"><svg width="22" height="22" viewBox="0 0 32 32" aria-hidden="true"><circle cx="16" cy="16" r="14" fill="#2563eb"/><path d="M7 17c3-3 6-3 9 0s6 3 9 0" stroke="#fff" stroke-width="2.6" fill="none" stroke-linecap="round"/><path d="M10 22c2-1.6 4-1.6 6 0s4 1.6 6 0" stroke="#fff" stroke-width="2" fill="none" stroke-linecap="round" opacity=".7"/></svg>Pondra</div>
+  <div class="brand">{{mark}}Pondra</div>
   <span id="where" class="pill" title="">connecting…</span>
   <input id="nbname" value="untitled" aria-label="Notebook name" spellcheck="false">
   <span id="dirty" aria-live="polite"></span>
@@ -248,7 +251,7 @@ const ICONS = {
 const icon = (name, cls = 'ic') => h('span', { class: cls, 'aria-hidden': 'true', html: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${ICONS[name]}</svg>` });
 
 // ------------------------------------------------------------------ the page's state
-const MODE = document.documentElement.dataset.mode; // node: one lake; server: `pondra server`'s databases
+const MODE = document.documentElement.dataset.mode; // node: one lake; server: a folder's databases (`pondra serve <folder>`)
 const SESSION = [...crypto.getRandomValues(new Uint8Array(12))].map(b => b.toString(16).padStart(2, '0')).join(''); // (this page's temporary tables)
 const S = { db: null, lake: null, cells: [], sel: null, name: 'untitled', version: null, dirty: false, runs: 0, open: new Set(), trash: null, last: null };
 const base = () => MODE === 'server' && S.db ? '/db/' + encodeURIComponent(S.db) : '';

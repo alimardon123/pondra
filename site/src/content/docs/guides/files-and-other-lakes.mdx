@@ -101,14 +101,57 @@ and `scan_ndjson` are the same functions, and DuckDB's `parquet_scan`, `read_csv
 | A list | `read_parquet(['jan.parquet', 'feb.parquet'])` |
 | Hive folders | `read_parquet('export/orders/', hive_partitioning => true)`: `region=eu/` folders become a `region` column |
 
-CSV takes `delim => ';'` and `header => false` (the first line is the header by default). Named
-arguments use `=>`. Files added to a folder, or changed under their name, are read as they are by the
-next statement: nothing is cached from before.
+CSV takes `delim => ';'` and `header => false` (the first line is the header by default), and
+`comment => '#'` to skip lines that start with it. Named arguments use `=>`. Files added to a folder, or
+changed under their name, are read as they are by the next statement: nothing is cached from before.
+
+To choose the columns and their types, say so with `columns`: a CSV's are matched by position, JSON's and
+Parquet's by name. `hive_types` does the same for the `key=value` folders, and turns on
+`hive_partitioning`:
+
+```bash
+pondra files <<'SQL'
+SELECT region, day, sum(amount) AS total
+FROM read_parquet('export/orders/', hive_types => {'region': 'VARCHAR'}, columns => {'amount': 'DOUBLE', 'day': 'DATE'})
+GROUP BY region, day ORDER BY region, day
+SQL
+```
 
 <Aside type="caution">
 A `*` in the middle of a path (`export/orders/*/*.parquet`) matches nothing yet. Use `**`:
 `export/orders/**/*.parquet`.
 </Aside>
+
+## A name for files
+
+`CREATE EXTERNAL TABLE` gives files a table's name, so a query says `FROM orders_files` and not
+`FROM read_parquet(…, …)`. It is DataFusion's statement. In Pondra it makes a stored view: the
+`read_parquet`, `read_csv` or `read_json` call, kept under that name. Nothing is copied, and the files
+stay where they are.
+
+```bash
+pondra files <<'SQL'
+CREATE EXTERNAL TABLE orders_files (id BIGINT, item VARCHAR, amount DOUBLE, region VARCHAR)
+  STORED AS PARQUET PARTITIONED BY (region) LOCATION 'export/orders/';
+SELECT region, sum(amount) AS total FROM orders_files GROUP BY region ORDER BY region;
+CREATE EXTERNAL TABLE drop_box (id INT, item VARCHAR)
+  STORED AS CSV LOCATION 'drop_box/' OPTIONS ('format.has_header' 'false');
+INSERT INTO drop_box VALUES (1, 'tea'), (2, 'cake');
+SELECT * FROM drop_box ORDER BY id;
+DROP TABLE drop_box
+SQL
+```
+
+- **Columns.** Say them in brackets, as here, and each is read as the type you give. Leave them out and the
+  table has the files' own schema.
+- **Folders.** A `LOCATION` that is a folder reads every file of that format in it, each time you query.
+  `PARTITIONED BY (region)` takes `region` from the `region=…/` folders.
+- **`INSERT`.** Into a table whose `LOCATION` is a folder, it writes a new file in that folder, in the
+  table's format (into `region=…/` folders, for a partitioned one). `UPDATE`, `DELETE` and `ALTER` are
+  refused.
+- **`DROP TABLE`** drops the name. The files stay.
+
+[SQL statements](/pondra/reference/sql/#external-tables) has the options and what is refused.
 
 ## Copy files into the lake
 
@@ -281,6 +324,8 @@ SQL
 ```
 
 - `PARTITION_BY` writes Hive-style folders (`day=2026-09-27/`).
+- `COPY` takes DataFusion's words too, `STORED AS CSV PARTITIONED BY (day) OPTIONS ('format.has_header' 'false')`
+  in place of the brackets: see [SQL statements](/pondra/reference/sql/#files-and-secrets).
 - A folder that already holds files is refused unless you say `OVERWRITE` (replace them) or `APPEND`.
   For `delta` and `iceberg`, an empty folder gets a new table, and one that holds a table takes `APPEND`
   or `OVERWRITE`.

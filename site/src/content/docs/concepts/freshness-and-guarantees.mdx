@@ -108,7 +108,7 @@ The same idea covers the rest:
 | It does not survive | | The leader and every holder dying in the same moment, before the bucket has the write (one bucket write: 0.3 to 0.7 s on R2) |
 
 ```bash norun
-pondra serve --dir s3://my-bucket/lake --ack replicated --addr 10.0.0.1:8080
+pondra serve s3://my-bucket/lake --ack replicated --addr 10.0.0.1:8080
 ```
 
 <Aside type="caution">

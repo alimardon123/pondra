@@ -1128,7 +1128,20 @@ async fn python(app: &App, name: &str, r: &Routine, args: RecordBatch, who: Who,
         heard.push(n);
     };
     let whose = if name == "do" { String::new() } else { format!("{name}: ") }; // (a DO block has no name)
-    let (answer, parts) = crate::python::ask(&r.with.packages, kind, head, vec![crate::query::ipc(&[args])?], limit, &mut notice).await.map_err(|e| anyhow::anyhow!("{whose}{}", lease.redact(&format!("{e:#}"))))?;
+    let parts = vec![crate::query::ipc(&[args])?];
+    // A DO block its caller sends in a session (the console's cells): on the session's own worker,
+    // in its namespace (`python::ask_session`). Not one a procedure sends: that would wait for the
+    // cell that is running it.
+    let asked = match (name, crate::temp::current()) {
+        ("do", Some(session)) if who.depth == 1 => {
+            let mut head = head;
+            head["op"] = j!("cell");
+            head["session"] = j!(session);
+            crate::python::ask_session(&session, head, parts, limit, &mut notice).await
+        }
+        _ => crate::python::ask(&r.with.packages, kind, head, parts, limit, &mut notice).await,
+    };
+    let (answer, parts) = asked.map_err(|e| anyhow::anyhow!("{whose}{}", lease.redact(&format!("{e:#}"))))?;
     match answer["kind"].as_str() {
         Some("rows") => Ok(Outcome::Rows(crate::query::read_ipc(parts.first().context("no rows")?)?)),
         Some("sql") => Box::pin(one(app, answer["sql"].as_str().unwrap_or_default(), who, None)).await,

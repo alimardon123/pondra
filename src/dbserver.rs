@@ -1,4 +1,4 @@
-//! `pondra server <folder>` (ADR-030): every lake in a folder served as a database, as a
+//! `pondra serve <folder of lakes>` (ADR-030, ADR-032): every lake in a folder served as a database, as a
 //! database server serves its databases. The server holds no lake itself: each database is a
 //! node of its own (`pondra serve`), started the first time a connection or request names it and
 //! stopped once nothing has used it for `PONDRA_DATABASE_IDLE_SECS` (600) and it has nothing
@@ -31,6 +31,8 @@ use tokio::sync::Mutex;
 pub struct Options {
     pub python: Option<String>,
     pub tier_secs: Option<f64>,
+    pub reader: bool, // (every database's node read-only: `--reader`)
+    pub node: Vec<String>, // the rest of `pondra serve`'s options, for each database's node
 }
 
 /// A database's running node.
@@ -54,6 +56,15 @@ struct Server {
 type Shared = Arc<Server>;
 
 fn idle() -> Duration { Duration::from_secs(std::env::var("PONDRA_DATABASE_IDLE_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(600)) }
+
+/// Does `path` hold lakes rather than be one (`pondra serve data`: each a database)? Not when it
+/// holds one itself, or is new or empty (it becomes a lake).
+pub async fn holds_lakes(path: &str) -> anyhow::Result<bool> {
+    if crate::ext::scheme(path).is_some_and(|s| s != "file") {
+        return Ok(false); // (a bucket's prefix: one lake)
+    }
+    Ok(!std::path::Path::new(path).join("catalog").is_dir() && !databases(path).is_empty())
+}
 
 /// The lakes in the folder: its subfolders that hold one, by name.
 fn databases(folder: &str) -> Vec<String> {
@@ -105,6 +116,10 @@ impl Server {
         if let Some(p) = &self.options.python {
             cmd.args(["--python", p]);
         }
+        if self.options.reader {
+            cmd.arg("--reader");
+        }
+        cmd.args(&self.options.node);
         if let Some(t) = self.options.tier_secs {
             cmd.args(["--tier-secs", &t.to_string()]);
         }
@@ -201,7 +216,7 @@ pub async fn serve(folder: String, addr: String, pg: Option<String>, default: Op
             route(&s, &db, &path, req).await
         })
         .with_state(server.clone());
-    eprintln!("pondra server: the lakes in {folder} as databases, on {addr}");
+    eprintln!("pondra serve: the lakes in {folder} as databases, on {addr}");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     let stop = async {
         crate::stopped(false).await;

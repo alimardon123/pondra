@@ -13,7 +13,7 @@ Arrow, with nothing parsed or converted on the way. Two kinds of client use it:
   read a query's result with `DoGet`, and read a table's log as a stream.
 
 ```bash norun
-pondra serve --dir lake --flight 0.0.0.0:8815
+pondra serve lake --flight 0.0.0.0:8815
 ```
 
 The port has no TLS: connect with `grpc://host:8815`. A request can be as large as 1 GiB.

@@ -267,8 +267,8 @@ SELECT * FROM crm.customers ORDER BY id;
 DETACH crm;
 ```
 
-Under [`pondra server`](/pondra/guides/server/), which serves a folder of lakes, `CREATE DATABASE`
-makes a new served database instead, and `DROP DATABASE` drops one, its folder and all.
+On a node that serves a [folder of lakes](/pondra/guides/server/), `CREATE DATABASE` makes a new
+served database instead, and `DROP DATABASE` drops one, its folder and all.
 
 An attachment is kept in the lake, so every node of a cluster sees it and a restarted node attaches it
 again. Reads join across lakes as one query. `INSERT`, `UPDATE`, `DELETE` and `MERGE` on an attached

@@ -17,7 +17,7 @@ Metabase), psqlODBC (Tableau, Excel) and dbt-postgres. [dbt and BI tools](/pondr
 the settings.
 
 ```bash norun
-pondra serve --dir lake --pg 127.0.0.1:5432
+pondra serve lake --pg 127.0.0.1:5432
 ```
 
 ## Connect
@@ -25,7 +25,7 @@ pondra serve --dir lake --pg 127.0.0.1:5432
 | Setting | Value |
 |---|---|
 | host, port | the address of `--pg` |
-| database | any name on a node that serves one lake. `SELECT current_database()` gives the lake's name. Under [`pondra server`](/pondra/guides/server/), the database in the connection picks the lake |
+| database | any name on a node that serves one lake. `SELECT current_database()` gives the lake's name. On a [folder of lakes](/pondra/guides/server/), the database in the connection picks the lake |
 | user, password | with no tokens set, anything. With tokens, the user picks the role (`reader`, `writer` or `admin`) and the password is that role's token |
 | SSL | not offered yet: use `sslmode=disable`, or `prefer` |
 
@@ -86,7 +86,8 @@ sends them works, but there is no transaction to roll back.
 | `DESCRIBE t` | its columns and types, with Arrow's type names |
 
 A connection is a session: `CREATE TEMP TABLE` and temporary views are the connection's own, and
-end when it closes. A request with several statements, separated by `;`, runs them in order.
+end when it closes. So do its Python variables: `DO LANGUAGE python` blocks on one connection share
+them ([Functions and procedures](/pondra/guides/functions-and-procedures/#cells-that-share-variables)). A request with several statements, separated by `;`, runs them in order.
 
 ```bash
 psql "postgresql://admin@localhost:5432/lake" -c "SHOW TABLES" -c "DESCRIBE orders"

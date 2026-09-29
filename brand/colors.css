@@ -1,0 +1,13 @@
+/* Pondra's colours, in one place (ADR-032): the mark's, on light and on dark (brand/mark.svg holds
+   the same two, for where no stylesheet reaches it: a favicon, a README), and the accent the docs
+   site and the console build theirs from. tools/brand_check.py keeps the mark's in step. */
+:root {
+  --pondra-mark: #0C8A73;
+  --pondra-mark-dark: #2FBF9F;
+  --pondra-accent: #0B7F6A;
+  --pondra-accent-soft: #DDF3EE;
+  --pondra-accent-strong: #075C4D;
+  --pondra-accent-dark: #2FBF9F;
+  --pondra-accent-soft-dark: #0E2E29;
+  --pondra-accent-strong-dark: #B5EDE1;
+}

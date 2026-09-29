@@ -102,17 +102,21 @@ pub fn table(t: &TableFactor) -> Result<Option<String>> {
         match a {
             FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => urls.extend(strings(e).with_context(|| format!("{f}: files are a string or a list of them"))?),
             FunctionArg::Named { name, arg: FunctionArgExpr::Expr(e), .. } | FunctionArg::ExprNamed { name: Expr::Identifier(name), arg: FunctionArgExpr::Expr(e), .. } => {
-                options.insert(name.value.to_lowercase(), literal(e).with_context(|| format!("{f}: {name} is a value"))?);
+                let value = match (name.value.to_lowercase().as_str(), e) {
+                    ("columns" | "hive_types", Expr::Dictionary(d)) => d.iter().map(|c| Ok(format!("{} {}", quoted(&c.key.value), literal(&c.value)?))).collect::<Result<Vec<_>>>().map(|c| c.join(", ")),
+                    _ => literal(e),
+                };
+                options.insert(name.value.to_lowercase(), value.with_context(|| format!("{f}: {name} is a value"))?);
             }
             _ => bail!("{f}: files first, then options by name ({f}('s3://bucket/path/*.{format}', …))"),
         }
     }
     ensure!(!urls.is_empty(), "{f}: which files? {f}('s3://bucket/path/*.{format}')");
     let known: &[&str] = match format {
-        "csv" => &["header", "delim", "sep", "delimiter", "quote", "escape", "hive_partitioning", "union_by_name"],
+        "csv" => &["header", "delim", "sep", "delimiter", "quote", "escape", "comment", "new_line", "hive_partitioning", "hive_types", "union_by_name", "columns"],
         "delta" => &["version"],
         "iceberg" => &["version", "snapshot_from_id", "snapshot_from_timestamp", "allow_moved_paths"],
-        _ => &["hive_partitioning", "union_by_name"],
+        _ => &["hive_partitioning", "hive_types", "union_by_name", "columns"],
     };
     ensure!(!["delta", "iceberg"].contains(&format) || urls.len() == 1, "{f}: one table at a time");
     if let Some(k) = options.keys().find(|k| !known.contains(&k.as_str())) {
@@ -120,6 +124,156 @@ pub fn table(t: &TableFactor) -> Result<Option<String>> {
     }
     Ok(Some(name(&Spec { urls, format: format.into(), options })))
 }
+
+/// DataFusion's (and Hive's) `CREATE EXTERNAL TABLE t [(columns)] STORED AS PARQUET | CSV | JSON
+/// LOCATION '…' [PARTITIONED BY (…)] [OPTIONS (…)]`: a stored view of the files by that name,
+/// `SELECT * FROM read_csv('…', …)` (ADR-032). The columns it declares are the files' — CSV's by
+/// position, Parquet's and JSON's by name — each read as the type declared; without them, as the
+/// files say. A path on this machine is made whole here, as ATTACH makes it, so each node reads
+/// the same files; a folder is its files of that format.
+pub fn external(c: &datafusion::sql::parser::CreateExternalTable) -> Result<crate::ddl::Ddl> {
+    use datafusion::sql::sqlparser::ast::Value as V;
+    let name = crate::write::object(&c.name);
+    ensure!(!c.temporary, "CREATE TEMPORARY EXTERNAL TABLE: make a temporary view of the files (CREATE TEMP VIEW {name} AS SELECT * FROM read_parquet('…'))");
+    let (format, function) = match c.file_type.to_lowercase().as_str() {
+        "parquet" => ("parquet", "read_parquet"),
+        "csv" => ("csv", "read_csv"),
+        "json" | "ndjson" => ("json", "read_json"),
+        f => bail!("files stored as {f}: Pondra reads Parquet, CSV and JSON (a value a line)"),
+    };
+    let text = |s: &str| format!("'{}'", s.replace('\'', "''"));
+    let mut args: Vec<String> = vec![];
+    for (k, v) in &c.options {
+        let v = match v {
+            V::SingleQuotedString(s) | V::DoubleQuotedString(s) => s.clone(),
+            V::Number(n, _) => n.to_string(),
+            V::Boolean(b) => b.to_string(),
+            v => v.to_string(),
+        };
+        let lower = k.to_lowercase();
+        let key = lower.strip_prefix("format.").unwrap_or(&lower);
+        let yes = v.eq_ignore_ascii_case("true");
+        match (format, key.split("::").next().unwrap_or(key)) {
+            ("csv", "has_header") => args.push(format!("header => {yes}")),
+            ("csv", "delimiter") => args.push(format!("delim => {}", text(&v))),
+            ("csv", "quote" | "escape" | "comment") => args.push(format!("{key} => {}", text(&v))),
+            ("csv", "terminator") => args.push(format!("new_line => {}", text(&v))),
+            ("csv", "double_quote") | ("json", "newline_delimited") if yes => {} // (as Pondra reads them)
+            ("csv" | "json", "compression" | "file_compression_type") if !["", "uncompressed"].contains(&v.to_lowercase().as_str()) => {
+                bail!("{v} files aren't read yet: Parquet, CSV and JSON as they are")
+            }
+            (_, k) if WRITING.contains(&k) || (format == "parquet" && (PARQUET_WRITING.contains(&k) || k.starts_with("content_defined_chunking") || PARQUET_TUNING.contains(&k))) => {} // (how files are written, or read faster: not what is read)
+            _ => bail!("CREATE EXTERNAL TABLE … OPTIONS ('{k}' …): Pondra doesn't read files with it{}", if format == "csv" { " (CSV takes format.has_header, format.delimiter, format.quote, format.escape, format.comment and format.terminator)" } else { "" }),
+        }
+    }
+    let urls = c.locations.iter().map(|l| located(l)).collect::<Result<Vec<_>>>()?;
+    ensure!(!urls.is_empty(), "CREATE EXTERNAL TABLE {name}: where are its files? (LOCATION '…')");
+    let parts: Vec<String> = c.table_partition_cols.iter().map(|p| p.trim_matches('"').to_string()).collect();
+    let own = |col: &&datafusion::sql::sqlparser::ast::ColumnDef| !parts.contains(&crate::write::ident(&col.name));
+    let typed = |cols: Vec<&datafusion::sql::sqlparser::ast::ColumnDef>| cols.iter().map(|col| format!("{}: {}", text(&crate::write::ident(&col.name)), text(&crate::write::sql_type(&col.data_type)))).collect::<Vec<_>>().join(", ");
+    let (in_files, keys): (Vec<_>, Vec<_>) = c.columns.iter().partition(own);
+    if !in_files.is_empty() {
+        args.push(format!("columns => {{{}}}", typed(in_files)));
+    }
+    match keys.is_empty() {
+        false => args.push(format!("hive_types => {{{}}}", typed(keys))), // (its folders' keys, `day=…/`, as declared)
+        true if !parts.is_empty() => args.push("hive_partitioning => true".into()),
+        true => {}
+    }
+    let select = match c.columns.is_empty() {
+        true => "*".to_string(),
+        false => c.columns.iter().map(|col| quoted(&crate::write::ident(&col.name))).collect::<Vec<_>>().join(", "),
+    };
+    let files = match &urls[..] {
+        [u] => text(u),
+        us => format!("[{}]", us.iter().map(|u| text(u)).collect::<Vec<_>>().join(", ")),
+    };
+    let args = std::iter::once(files).chain(args).collect::<Vec<_>>().join(", ");
+    Ok(crate::ddl::Ddl::CreateExternal { name, sql: format!("SELECT {select} FROM {function}({args})"), replace: c.or_replace, if_not_exists: c.if_not_exists })
+}
+
+/// A write to a stored view: INSERT into CREATE EXTERNAL TABLE's view of a folder is a new file in
+/// the folder (`COPY … TO '…/' (APPEND)`, in its format, its folders' keys as folders), as
+/// DataFusion's external tables take it: the query, where, and COPY's options. Any other write to
+/// a view is refused (it would make a table by that name). None: not a view.
+pub async fn view_write(lake: &Lake, stmt: &crate::write::Stmt) -> Result<Option<(String, String, BTreeMap<String, String>)>> {
+    use crate::write::Stmt;
+    let (Stmt::Insert(t, _) | Stmt::InsertInto(t, ..) | Stmt::Update(t, ..) | Stmt::Delete(t, _) | Stmt::AddColumn(t, ..)) = stmt else { return Ok(None) };
+    let Ok((None, name)) = crate::ddl::resolve(lake, t).await else { return Ok(None) };
+    let Some(view) = lake.cat.get::<crate::ddl::StoredView>(&crate::ddl::query_key(&name)).await? else { return Ok(None) };
+    ensure!(view.external, "{name} is a view: write to the tables it reads");
+    let (query, names) = match stmt {
+        Stmt::Insert(_, q) => (q, vec![]),
+        Stmt::InsertInto(_, n, q) => (q, n.clone()),
+        _ => bail!("{name} is a view of files (CREATE EXTERNAL TABLE): UPDATE, DELETE and ALTER change a lake's tables; INSERT adds a file to a view of a folder"),
+    };
+    let expanded = crate::routines::expand(lake, &view.sql).await?;
+    let spec = match &self::names(&expanded)[..] {
+        [one] => spec(one).context("its files")?,
+        _ => bail!("{name}: a view of several reads"),
+    };
+    let folder = match &spec.urls[..] {
+        [u] if u.ends_with('/') => u.clone(),
+        _ => bail!("INSERT INTO {name}: it reads {} — a view of a folder takes INSERTs, each a new file in it (LOCATION '…/')", spec.urls.join(", ")),
+    };
+    // Its columns, in order and by type: the rows go as the view reads them (the files' order is
+    // CSV's, their names Parquet's and JSON's).
+    let ctx = crate::query::session(lake, &format!("SELECT * FROM {}", crate::write::sql_name(&name)), "").await?;
+    let fields = ctx.sql(&format!("SELECT * FROM {} LIMIT 0", crate::write::sql_name(&name))).await?.schema().fields().clone();
+    let given: Vec<String> = if names.is_empty() { fields.iter().map(|f| f.name().clone()).collect() } else { names };
+    if let Some(n) = given.iter().find(|n| !fields.iter().any(|f| f.name() == *n)) {
+        bail!("{name} has no column {n}");
+    }
+    let select = fields.iter().map(|f| {
+        let n = quoted(f.name());
+        let t = f.data_type().to_string().replace('\'', "''");
+        match given.contains(f.name()) {
+            true => format!("arrow_cast(s.{n}, '{t}') AS {n}"),
+            false => format!("arrow_cast(NULL, '{t}') AS {n}"),
+        }
+    }).collect::<Vec<_>>().join(", ");
+    let aliases = given.iter().map(|n| quoted(n)).collect::<Vec<_>>().join(", ");
+    let rows = format!("SELECT {select} FROM ({query}) AS s({aliases})");
+    let mut options = BTreeMap::from([("format".to_string(), spec.format.clone()), ("append".to_string(), "true".to_string())]);
+    if spec.format == "csv" {
+        options.insert("header".into(), spec.options.get("header").cloned().unwrap_or_else(|| "true".into()));
+        if let Some(d) = spec.options.get("delim").or(spec.options.get("sep")).or(spec.options.get("delimiter")) {
+            options.insert("delimiter".into(), d.clone());
+        }
+    }
+    match spec.options.get("hive_types") {
+        Some(h) => _ = options.insert("partition_by".into(), crate::write::declared(h).await?.iter().map(|f| f.name().clone()).collect::<Vec<_>>().join(",")), // (its folders' keys: a folder a value)
+        None => ensure!(spec.options.get("hive_partitioning").is_none_or(|v| v == "false"), "INSERT INTO {name}: its folders' keys aren't declared (CREATE EXTERNAL TABLE {name} (…, day DATE) … PARTITIONED BY (day))"),
+    }
+    Ok(Some((rows, folder, options)))
+}
+
+/// How files are written, not read: options CREATE EXTERNAL TABLE takes for DataFusion's INSERT
+/// and COPY, which don't change what a query reads.
+const WRITING: [&str; 12] = ["quote_style", "null_value", "date_format", "datetime_format", "timestamp_format", "timestamp_tz_format", "time_format",
+    "ignore_leading_whitespace", "ignore_trailing_whitespace", "compression", "compression_level", "write_batch_size"];
+const PARQUET_WRITING: [&str; 19] = ["max_row_group_size", "data_page_row_count_limit", "data_pagesize_limit", "dictionary_enabled", "dictionary_page_size_limit",
+    "statistics_enabled", "max_statistics_size", "created_by", "column_index_truncate_length", "statistics_truncate_length", "bloom_filter_on_write",
+    "bloom_filter_fpp", "bloom_filter_ndv", "writer_version", "encoding", "allow_single_file_parallelism", "maximum_parallel_row_group_writers",
+    "maximum_buffered_record_batches_per_stream", "skip_arrow_metadata"];
+/// How DataFusion reads Parquet faster: Pondra decides these itself.
+const PARQUET_TUNING: [&str; 8] = ["pushdown_filters", "reorder_filters", "enable_page_index", "pruning", "skip_metadata", "metadata_size_hint", "bloom_filter_on_read", "schema_force_view_types"];
+
+/// A LOCATION as a read takes it: a URL as written; a path on this machine made whole, and a
+/// folder there ending in `/` (its files).
+fn located(l: &str) -> Result<String> {
+    if scheme(l).is_some() {
+        return Ok(l.to_string());
+    }
+    let whole = crate::ddl::full(l)?;
+    Ok(match l.ends_with('/') || std::path::Path::new(&whole).is_dir() {
+        true => format!("{whole}/"),
+        false => whole,
+    })
+}
+
+/// A name as SQL writes it, in double quotes (`"a"`; a quote inside doubled).
+pub(crate) fn quoted(name: &str) -> String { format!("\"{}\"", name.replace('"', "\"\"")) }
 
 fn strings(e: &Expr) -> Option<Vec<String>> {
     match e {
@@ -324,6 +478,17 @@ async fn resolve(lake: &Lake, spec: &Spec) -> Result<TableMeta> {
     }
     let ctx = lake.session();
     let format = file_format(spec)?;
+    // Columns declared (`columns => {'id': 'BIGINT', …}`, CREATE EXTERNAL TABLE's): the table's.
+    let declared = match spec.options.get("columns") {
+        Some(c) => Some(crate::write::declared(c).await?),
+        None => None,
+    };
+    // The folders' keys' types (`hive_types => {'day': 'DATE'}`, DuckDB's): typed as declared, and
+    // columns even before a folder has files.
+    let hive_types = match spec.options.get("hive_types") {
+        Some(c) => crate::write::declared(c).await?,
+        None => vec![],
+    };
     let (mut objects, mut urls) = (vec![], vec![]);
     let deep = spec.urls.iter().any(|u| u.contains("**") || glob_at(u).is_some_and(|i| u[i..].contains('/')));
     ctx.state_ref().write().config_mut().options_mut().execution.listing_table_ignore_subdirectory = !deep; // (`**`, `*/x.parquet`: into folders)
@@ -334,14 +499,30 @@ async fn resolve(lake: &Lake, spec: &Spec) -> Result<TableMeta> {
         let store = lake.rt.object_store(&url)?;
         let wanted = if u.ends_with('/') { format!(".{}", spec.format) } else { String::new() }; // (a folder: its files of that format)
         let found: Vec<_> = url.list_all_files(&state, store.as_ref(), &wanted).await?.try_collect().await?;
-        ensure!(!found.is_empty(), "no files at {u}");
+        ensure!(!found.is_empty() || declared.is_some(), "no files at {u}"); // (declared: none yet is an empty table)
         objects.extend(found.into_iter().map(|o| (store.clone(), url.clone(), o)));
         urls.push(url);
     }
     objects.sort_by(|a, b| a.2.location.cmp(&b.2.location)); // (every node lists them in one order)
+    let named = |fields: &[datafusion::arrow::datatypes::FieldRef]| -> Vec<(String, String)> { fields.iter().map(|f| (f.name().clone(), crate::query::type_name(f.data_type()))).collect() };
+    if objects.is_empty() {
+        let columns = [named(declared.as_deref().unwrap_or_default()), named(&hive_types)].concat();
+        return Ok(TableMeta { columns, ext: Some(spec.clone()), ..Default::default() });
+    }
     let (store, first) = (objects[0].0.clone(), objects.iter().take(if spec.format == "parquet" { usize::MAX } else { 16 }).map(|o| o.2.clone()).collect::<Vec<_>>());
-    let schema = format.infer_schema(&state, &store, &first).await.with_context(|| format!("reading {}", spec.urls.join(", ")))?;
-    let mut columns: Vec<(String, String)> = schema.fields().iter().map(|f| (f.name().clone(), crate::query::type_name(f.data_type()))).collect();
+    // CSV's declared columns are its columns by position, JSON's by name: the readers take them as
+    // they are. Parquet's files say their own (for their statistics), read by name as declared.
+    let schema = match (&declared, spec.format.as_str()) {
+        (Some(d), "csv" | "json") => Arc::new(datafusion::arrow::datatypes::Schema::new(d.clone())),
+        _ => format.infer_schema(&state, &store, &first).await.with_context(|| format!("reading {}", spec.urls.join(", ")))?,
+    };
+    let mut columns: Vec<(String, String)> = named(declared.as_deref().unwrap_or(&schema.fields()[..]));
+    // (a column read as another type than the file's: its ranges are the file's type's, so none is kept)
+    let as_stored: Vec<String> = match &declared {
+        Some(d) => d.iter().filter(|f| schema.field_with_name(f.name()).is_ok_and(|g| g.data_type() == f.data_type())).map(|f| f.name().clone()).collect(),
+        None => schema.fields().iter().map(|f| f.name().clone()).collect(),
+    };
+    let missing = declared.is_some() && spec.format == "parquet" && columns.iter().any(|(c, _)| schema.field_with_name(c).is_err());
     // Hive-style folders (`day=2026-09-28/`): each a column, the same in every file's path, typed
     // by what all its values are (as Spark, DuckDB and Polars do).
     let hive = |url: &ListingTableUrl, o: &object_store_df::ObjectMeta| -> Vec<(String, String)> {
@@ -349,7 +530,7 @@ async fn resolve(lake: &Lake, spec: &Spec) -> Result<TableMeta> {
         rest.split('/').filter_map(|s| s.split_once('=')).map(|(k, v)| (k.to_string(), v.to_string())).collect()
     };
     // Found unless turned off (DuckDB's and Spark's default); when asked for, every file has them.
-    let asked = spec.options.get("hive_partitioning").map(|v| v != "false" && v != "0");
+    let asked = spec.options.get("hive_partitioning").map(|v| v != "false" && v != "0").or((!hive_types.is_empty()).then_some(true));
     let found: Vec<Vec<String>> = if asked == Some(false) { vec![] } else { objects.iter().map(|(_, u, o)| hive(u, o).into_iter().map(|(k, _)| k).collect()).collect() };
     let same = found.windows(2).all(|w| w[0] == w[1]);
     ensure!(same || asked != Some(true), "{}: files in other folders than {} (hive_partitioning)", spec.urls.join(", "), found[0].join("/"));
@@ -358,17 +539,22 @@ async fn resolve(lake: &Lake, spec: &Spec) -> Result<TableMeta> {
     for (i, k) in keys.iter().enumerate() {
         ensure!(!columns.iter().any(|(c, _)| c == k), "{k} is a folder's key and a column in the files");
         let values: Vec<String> = objects.iter().filter_map(|(_, url, o)| hive_value(hive(url, o).get(i)?.1.as_str())).collect();
-        columns.push((k.clone(), hive_type(&values).into()));
+        let typed = hive_types.iter().find(|f| f.name() == k).map(|f| crate::query::type_name(f.data_type()));
+        columns.push((k.clone(), typed.unwrap_or_else(|| hive_type(&values).into())));
     }
     let parquet = spec.format == "parquet";
     let stats: Vec<_> = objects.into_iter().map(|(store, url, o)| {
-        let (format, schema, state) = (format.clone(), schema.clone(), state.clone());
+        let (format, schema, state, as_stored) = (format.clone(), schema.clone(), state.clone(), as_stored.clone());
         let part = if hived { hive(&url, &o) } else { vec![] };
         async move {
             let root = url.object_store();
             let full = format!("{}{}", root.as_str().strip_suffix('/').unwrap_or(root.as_str()), url_path(&o)); // (`file:///x`, `s3://b/x`)
             let s = if parquet { Some(format.infer_stats(&state, &store, schema.clone(), &o).await?) } else { None };
             let mut f = file(full, o.size, s.as_ref(), &schema);
+            f.stats.retain(|c, _| as_stored.contains(c));
+            if missing {
+                f.nulls = None; // (a column declared that the files don't hold is all NULL)
+            }
             f.part = part.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("/");
             if parquet && hived {
                 let values = part.iter().map(|(k, v)| (k.clone(), hive_value(v))).collect();
@@ -473,6 +659,14 @@ fn file_format(spec: &Spec) -> Result<Arc<dyn FileFormat>> {
             }
             if let Some(e) = o("escape") {
                 f = f.with_escape(Some(byte("escape", e)?));
+            }
+            if let Some(c) = o("comment") {
+                f = f.with_comment(Some(byte("comment", c)?)); // (lines starting with it are skipped)
+            }
+            match o("new_line") {
+                None | Some("\n" | "\r\n" | "\\n" | "\\r\\n") => {} // (either, as read)
+                Some("\r" | "\\r") => f = f.with_terminator(Some(b'\r')),
+                Some(t) => bail!("new_line is \\n, \\r\\n or \\r, not {t:?}"),
             }
             Arc::new(f)
         }
@@ -918,6 +1112,36 @@ fn copy_statement(p: &mut datafusion::sql::sqlparser::parser::Parser) -> Option<
     }
     let Ok(to) = p.parse_literal_string() else { return None }; // (TO STDOUT)
     let mut options = BTreeMap::new();
+    // DataFusion's words for the same: STORED AS csv, PARTITIONED BY (…), OPTIONS ('format.has_header' 'false', …).
+    loop {
+        if p.parse_keywords(&[Keyword::STORED, Keyword::AS]) {
+            let Ok(f) = p.parse_identifier() else { return invalid("STORED AS parquet, csv or json".into()) };
+            options.insert("format".to_string(), f.value.to_lowercase());
+        } else if p.parse_keywords(&[Keyword::PARTITIONED, Keyword::BY]) {
+            match p.expect_token(&Token::LParen).and_then(|_| p.parse_comma_separated(|p| p.parse_identifier())).and_then(|l| p.expect_token(&Token::RParen).map(|_| l)) {
+                Ok(l) => _ = options.insert("partition_by".to_string(), l.iter().map(crate::write::ident).collect::<Vec<_>>().join(",")),
+                Err(e) => return invalid(e.to_string()),
+            }
+        } else if p.parse_keyword(Keyword::OPTIONS) {
+            if p.expect_token(&Token::LParen).is_err() {
+                return invalid("OPTIONS ('format.has_header' 'true', …)".into());
+            }
+            while !p.consume_token(&Token::RParen) {
+                let (Ok(k), Ok(v)) = (p.parse_literal_string(), p.parse_value()) else { return invalid("OPTIONS ('key' 'value', …)".into()) };
+                let v = match v.value { Value::SingleQuotedString(s) | Value::DoubleQuotedString(s) => s, v => v.to_string() };
+                let k = k.to_lowercase();
+                let k = match k.strip_prefix("format.").unwrap_or(&k) {
+                    "has_header" => "header",
+                    "max_row_group_size" => "row_group_size",
+                    k => k,
+                };
+                options.insert(k.to_string(), v);
+                _ = p.consume_token(&Token::Comma);
+            }
+        } else {
+            break;
+        }
+    }
     if p.consume_token(&Token::LParen) && !p.consume_token(&Token::RParen) {
         loop {
             let Ok(k) = p.parse_identifier() else { return invalid("an option's name".into()) };

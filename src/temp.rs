@@ -111,9 +111,10 @@ async fn reap() {
     }
 }
 
-/// End a session: its temporary tables and views are gone.
+/// End a session: its temporary tables and views are gone, and its Python (`python::ask_session`).
 pub fn end(session: &str) -> bool {
-    let gone = SESSIONS.lock().unwrap().remove(session).is_some();
+    let python = crate::python::end_session(session); // (its Python's variables too)
+    let gone = SESSIONS.lock().unwrap().remove(session).is_some() || python;
     if gone {
         CHANGES.send_modify(|v| *v += 1);
     }

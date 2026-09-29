@@ -81,18 +81,35 @@ struct Cli {
 
 #[derive(clap::Subcommand)]
 enum Cmd {
-    /// Run a node. Nodes started on the same lake form a cluster: the first leads (ingest,
-    /// tiering, commits), the rest follow (SQL, task shards, writes forwarded to the leader) and
-    /// take over if the leader dies. `--reader`: SQL only, never leads.
+    /// Serve a lake, or a folder of lakes as databases: `pondra serve lake`, `pondra serve data`.
+    ///
+    /// A lake: nodes started on the same lake form a cluster; the first leads (ingest, tiering,
+    /// commits), the rest follow (SQL, task shards, writes forwarded to the leader) and take over
+    /// if the leader dies. `--reader`: SQL only, never leads.
+    ///
+    /// A folder whose subfolders hold lakes: each is a database by its folder's name. Postgres
+    /// clients pick one by name (`psql -d sales`), HTTP clients by `/db/sales/…`, and the console
+    /// at `/` lists them. Each runs as a node of its own, started when first used and stopped when
+    /// idle (PONDRA_DATABASE_IDLE_SECS, 600); `CREATE DATABASE` makes another.
     Serve {
-        /// Local directory or s3://bucket/prefix (credentials/endpoint from AWS_* env vars).
+        /// The lake (a folder, or s3://bucket/prefix, its credentials from the AWS_* variables), or
+        /// a folder of lakes. Default: this folder. A new or empty one becomes a lake.
+        path: Option<String>,
+        /// For scripts and services, nothing guessed: exactly this lake (made if it isn't there).
+        #[arg(long = "lake", alias = "dir", value_name = "LAKE", conflicts_with_all = ["path", "databases"])]
+        dir: Option<String>,
+        /// For scripts and services, nothing guessed: exactly this folder of lakes, each a database.
+        #[arg(long, value_name = "FOLDER", conflicts_with = "path")]
+        databases: Option<String>,
+        /// Serving a folder of lakes: the database a client that names none gets (default: `lake`,
+        /// else the only one).
         #[arg(long)]
-        dir: String,
+        default: Option<String>,
         /// Address other nodes reach this one at (also the listen address).
         #[arg(long, default_value = "127.0.0.1:8080")]
         addr: String,
-        /// Address other nodes reach this one at, if not `--addr`: behind `pondra server`,
-        /// `host:port/db/name` (the server passes it through).
+        /// Address other nodes reach this one at, if not `--addr`: a database's node, behind the
+        /// process serving its folder, `host:port/db/name` (it passes it through).
         #[arg(long)]
         advertise: Option<String>,
         /// Read-only node: any number can run next to the single writer.
@@ -200,45 +217,9 @@ enum Cmd {
         #[arg(long)]
         python: Option<String>,
     },
-    /// Serve every lake in a folder as a database: Postgres clients pick one by name (`psql -d
-    /// sales`), HTTP clients by `/db/sales/…`, and the console is at `/`. Each database runs as a
-    /// node of its own, started when first used and stopped when idle (PONDRA_DATABASE_IDLE_SECS,
-    /// 600); `CREATE DATABASE` makes another. Flight and Kafka stay with `pondra serve`.
-    Server {
-        /// The folder of lakes (each subfolder holding one is a database).
-        #[arg(default_value = ".")]
-        folder: String,
-        /// Where HTTP clients, the console and other nodes reach the server.
-        #[arg(long, default_value = "127.0.0.1:8080")]
-        addr: String,
-        /// Speak the Postgres wire protocol here (e.g. 0.0.0.0:5432).
-        #[arg(long)]
-        pg: Option<String>,
-        /// The database a client that names none gets (default: `lake`, else the only one).
-        #[arg(long)]
-        default: Option<String>,
-        /// Tokens, as `pondra serve` takes them (and PONDRA_*_TOKEN): every database's node gets them.
-        #[arg(long)]
-        read_token: Option<String>,
-        #[arg(long)]
-        write_token: Option<String>,
-        #[arg(long)]
-        admin_token: Option<String>,
-        /// Python for functions and procedures, as `pondra serve --python`.
-        #[arg(long)]
-        python: Option<String>,
-        /// Each database's `--tier-secs`.
-        #[arg(long)]
-        tier_secs: Option<f64>,
-        /// (Not here: Flight and Kafka ports mean one lake. Use `pondra serve` for them.)
-        #[arg(long, hide = true)]
-        flight: Option<String>,
-        #[arg(long, hide = true)]
-        kafka: Option<String>,
-    },
     /// Print catalog entries whose keys start with `prefix` (t/ tables, s/ segments, p/ producers…).
     Catalog {
-        #[arg(long)]
+        #[arg(long, visible_alias = "lake")]
         dir: String,
         prefix: String,
     },
@@ -247,7 +228,7 @@ enum Cmd {
     /// here too; the leader records them — over HTTP, or through the bucket if this machine can't
     /// reach it — or this process does if nobody leads.
     Sql {
-        #[arg(long)]
+        #[arg(long, visible_alias = "lake")]
         dir: String,
         /// Other lakes to read as `name.table` (`name=dir`, repeatable).
         #[arg(long)]
@@ -302,7 +283,53 @@ async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let Some(cmd) = cli.cmd else { return shell::run(&cli.lake.unwrap_or_else(|| "lake".into())).await };
     match cmd {
-        Cmd::Serve { dir, addr, advertise, reader, flush_ms, tier_secs, task_ms, memory_gb, retain_secs, changelog_secs, backlog, cache_dir, cache_gb, ack, replicas, fsync, publish, pg, kafka, kafka_advertise, flight, read_token, write_token, admin_token, attach: attached, attach_found, stop_with_stdin, python } => {
+        Cmd::Serve { path, dir, databases, default, addr, advertise, reader, flush_ms, tier_secs, task_ms, memory_gb, retain_secs, changelog_secs, backlog, cache_dir, cache_gb, ack, replicas, fsync, publish, pg, kafka, kafka_advertise, flight, read_token, write_token, admin_token, attach: attached, attach_found, stop_with_stdin, python } => {
+            // A lake, or a folder of lakes (each a database: `dbserver.rs`), by what the path holds.
+            let (dir, many) = match (dir, databases) {
+                (Some(d), _) => (d, false),
+                (None, Some(f)) => (f, true),
+                (None, None) => {
+                    let given = path.is_some();
+                    let p = path.unwrap_or_else(|| ".".into());
+                    let many = dbserver::holds_lakes(&p).await?;
+                    // (this folder is made a lake only when named: `pondra serve .`; and a folder with
+                    // other things in it, never: a mistyped path doesn't become a lake)
+                    let lake = std::path::Path::new(&p).join("catalog").is_dir();
+                    anyhow::ensure!(given || many || lake, "no lake in this folder, and no lakes in its folders: `pondra serve lake` makes one at ./lake (or name yours: pondra serve <folder>)");
+                    let empty = std::fs::read_dir(&p).map_or(true, |mut d| d.next().is_none());
+                    anyhow::ensure!(many || lake || empty || ext::scheme(&p).is_some_and(|s| s != "file"), "{p} holds other things than lakes: serve a lake in it (pondra serve {p}/lake), or make one there anyway with --lake {p}");
+                    (p, many)
+                }
+            };
+            if many {
+                let one = [(flight.is_some(), "--flight"), (kafka.is_some(), "--kafka"), (!attached.is_empty(), "--attach"), (advertise.is_some(), "--advertise"), (attach_found.is_some(), "--attach-found")];
+                if let Some((_, flag)) = one.iter().find(|(given, _)| *given) {
+                    anyhow::bail!("{dir} holds several lakes, served as databases; {flag} is one lake's (serve that lake: pondra serve {dir}/<name> {flag} …)");
+                }
+                let env = |flag: Option<String>, var: &str| flag.or_else(|| std::env::var(var).ok()).filter(|t| !t.is_empty());
+                let (r, w, a) = (env(read_token, "PONDRA_READ_TOKEN"), env(write_token, "PONDRA_WRITE_TOKEN"), env(admin_token, "PONDRA_ADMIN_TOKEN"));
+                for (var, v) in [("PONDRA_READ_TOKEN", &r), ("PONDRA_WRITE_TOKEN", &w), ("PONDRA_ADMIN_TOKEN", &a)] {
+                    if let Some(v) = v {
+                        std::env::set_var(var, v); // (each database's node takes them from here)
+                    }
+                }
+                let auth = Arc::new(auth::Auth::new(r, w, a));
+                let local = ["127.0.0.1:", "localhost:", "[::1]:"].iter().any(|x| addr.starts_with(x));
+                anyhow::ensure!(python.is_none() || auth.on() || local, "--python lets whoever makes a procedure run code on this machine: set --admin-token, or listen on 127.0.0.1");
+                // Each database's node gets the rest, as `pondra serve <lake>` would take them.
+                let mut node: Vec<String> = ["--flush-ms", &flush_ms.to_string(), "--task-ms", &task_ms.to_string(), "--retain-secs", &retain_secs.to_string(),
+                    "--changelog-secs", &changelog_secs.to_string(), "--backlog", &backlog.to_string(), "--ack", &ack, "--replicas", &replicas.to_string()].map(String::from).to_vec();
+                for (flag, v) in [("--memory-gb", memory_gb.map(|m| m.to_string())), ("--cache-dir", cache_dir), ("--cache-gb", cache_gb.map(|g| g.to_string())), ("--publish", Some(publish).filter(|p| !p.is_empty()))] {
+                    if let Some(v) = v {
+                        node.extend([flag.to_string(), v]);
+                    }
+                }
+                if fsync {
+                    node.push("--fsync".into());
+                }
+                let options = dbserver::Options { python, tier_secs: Some(tier_secs), reader, node };
+                return dbserver::serve(dir, addr, pg, default, options, auth).await;
+            }
             let env = |flag: Option<String>, var: &str| flag.or_else(|| std::env::var(var).ok()).filter(|t| !t.is_empty());
             let auth = Arc::new(auth::Auth::new(env(read_token, "PONDRA_READ_TOKEN"), env(write_token, "PONDRA_WRITE_TOKEN"), env(admin_token.clone(), "PONDRA_ADMIN_TOKEN")));
             if let Some(t) = env(admin_token, "PONDRA_ADMIN_TOKEN") {
@@ -521,20 +548,6 @@ async fn run() -> anyhow::Result<()> {
             let body = serde_json::json!({"sql": sql, "params": shell::params(&params)?});
             let token = token.or_else(|| std::env::var("PONDRA_TOKEN").ok());
             print!("{}", shell::script(lake.as_deref().unwrap_or("lake"), url.as_deref(), token.as_deref(), body).await?);
-        }
-        Cmd::Server { folder, addr, pg, default, read_token, write_token, admin_token, python, tier_secs, flight, kafka } => {
-            anyhow::ensure!(flight.is_none() && kafka.is_none(), "a Flight or Kafka port means one lake: `pondra serve --dir <lake> --flight …` (or --kafka) serves one");
-            let env = |flag: Option<String>, var: &str| flag.or_else(|| std::env::var(var).ok()).filter(|t| !t.is_empty());
-            let (r, w, a) = (env(read_token, "PONDRA_READ_TOKEN"), env(write_token, "PONDRA_WRITE_TOKEN"), env(admin_token, "PONDRA_ADMIN_TOKEN"));
-            for (var, v) in [("PONDRA_READ_TOKEN", &r), ("PONDRA_WRITE_TOKEN", &w), ("PONDRA_ADMIN_TOKEN", &a)] {
-                if let Some(v) = v {
-                    std::env::set_var(var, v); // (each database's node takes them from here)
-                }
-            }
-            let auth = Arc::new(auth::Auth::new(r, w, a));
-            let local = ["127.0.0.1:", "localhost:", "[::1]:"].iter().any(|x| addr.starts_with(x));
-            anyhow::ensure!(python.is_none() || auth.on() || local, "--python lets whoever makes a procedure run code on this machine: set --admin-token, or listen on 127.0.0.1");
-            dbserver::serve(folder, addr, pg, default, dbserver::Options { python, tier_secs }, auth).await?;
         }
         Cmd::Catalog { dir, prefix } => {
             let lake = store::Lake::open(&dir, false, false).await?;

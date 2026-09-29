@@ -9,6 +9,9 @@ A message is frames, each its length (4 bytes, little-endian) and its bytes: a J
 - `call`: a procedure, its arguments and a token lent its caller's rights → notices (what it
   prints, `plpy.notice`) as they come, then the answer: `{"kind": "rows"}` and the rows,
   `{"kind": "sql", "sql": …}` (a frame: the node runs it) or `{"kind": "none"}`.
+- `cell`: a session's code (a console cell, a DO block sent in a session) on the worker the node
+  keeps for that session, in the session's namespace: what one cell makes, the next one sees.
+  Answered as `call` is.
 
 A failure answers `{"error": "…"}`, and the worker goes on. A body is compiled once per worker, and
 what it imports stays imported: that is why a call takes milliseconds, not a Python start.
@@ -23,6 +26,7 @@ import sys
 import traceback
 
 _compiled = {}  # (name, body, entry, params) -> code
+_sessions = {}  # a session's namespace, kept between its cells (this worker is that session's)
 _functions = {}  # the same key -> a function's callable (its module kept: constants, helpers)
 _out = None  # the answers' channel
 
@@ -42,7 +46,7 @@ def main():
         msg = json.loads(_exact(inp, struct.unpack("<I", n)[0]))
         head, parts = msg["head"], [_exact(inp, struct.unpack("<I", _exact(inp, 4))[0]) for _ in range(msg["parts"])]
         try:
-            answer, parts = {"apply": apply, "call": call, "check": check}[head["op"]](head, parts)
+            answer, parts = {"apply": apply, "call": call, "check": check, "cell": cell}[head["op"]](head, parts)
         except BaseException as e:  # (a routine's `sys.exit()` too: the worker stays)
             answer, parts = {"error": failure(e, head)}, []
         send(answer, parts)
@@ -334,6 +338,47 @@ def call(head, parts):
     return kind, [data] if data else []
 
 
+def cell(head, parts):
+    """A session's cell, in the session's namespace, kept from one cell to the next, as a notebook's
+    kernel keeps it. Its last line, if an expression, is its answer. `db` (and `con`) is one
+    connection back to the node for the whole session, lent each cell's rights as it runs, so a
+    frame made in one cell can be collected in the next."""
+    import ast as _ast
+    import pondra
+    from pondra import client
+    g = _sessions.get(head["session"])
+    if g is None:
+        con = pondra.connect(head["url"], token=head["token"], echo=False)
+        g = _sessions[head["session"]] = scope("cell", con)
+        g["__pondra_con__"] = con
+    con = g["__pondra_con__"]
+    con.token, con._job = head["token"], head.get("job")
+    con._headers["x-pondra-depth"] = str(head["depth"])
+    for k in ("db", "con"):
+        g.setdefault(k, con)
+    filename = f"<{head['name']}>"
+    tree = _ast.parse(_dedent(head["body"]), filename=filename)
+    last = None
+    if tree.body and isinstance(tree.body[-1], _ast.Expr):
+        last = _ast.Expression(tree.body.pop().value)
+    client._current = con
+    sys.stdout.start()
+    try:
+        exec(compile(tree, filename, "exec"), g)
+        value = eval(compile(last, filename, "eval"), g) if last is not None else None
+    except SystemExit as e:
+        if e.code not in (None, 0):
+            raise
+        value = None
+    finally:
+        sys.stdout.stop()
+        client._current = client._last = None
+    if value is not None:
+        g["_"] = value  # (the last answer, as Python's shell keeps it)
+    kind, data = reply(value, "cell")
+    return kind, [data] if data else []
+
+
 def reply(value, name):
     """A procedure's answer: nothing; a frame's SQL (the node runs it: it may spread, and nothing
     crosses twice); or rows — a table, a list of dicts, one dict (a row) or one value."""
@@ -349,7 +394,7 @@ def reply(value, name):
     elif isinstance(value, dict) and not all(isinstance(v, (list, tuple)) for v in value.values()):
         value = [value]  # (one row)
     elif not (isinstance(value, (list, tuple, dict)) or hasattr(value, "to_arrow") or hasattr(value, "schema") or type_of(value) == "pandas"):
-        value = pa.table({name.split(".")[-1]: [value]})  # (one value)
+        value = pa.table({"value" if name in ("do", "cell") else name.split(".")[-1]: [value]})  # (one value: a procedure's by its name, a DO block's or a cell's `value`)
     table = pa.table(value) if isinstance(value, dict) else _arrow(value)
     return {"kind": "rows"}, _ipc(table)
 

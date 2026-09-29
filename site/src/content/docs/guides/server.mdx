@@ -1,23 +1,29 @@
 ---
-title: A server of databases
-description: pondra server serves every lake in a folder as a database. Postgres clients pick one by name, HTTP clients by /db/name, and each starts when first used.
+title: Many databases
+description: pondra serve on a folder of lakes serves each lake as a database. Postgres clients pick one by name, HTTP clients by /db/name, and each starts when first used.
 sidebar:
   order: 17
 ---
 
 import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 
-`pondra server` serves a folder of lakes, one database per lake, behind one HTTP port and one
+`pondra serve` on a folder of lakes serves one database per lake, behind one HTTP port and one
 Postgres port. A Postgres client picks a database by name (`psql -d sales`), as it would on
 Postgres. An HTTP client adds `/db/sales` to its URL. Use it when one machine holds several lakes
 and you don't want a port, a process and a service for each.
 
 ```bash norun
-pondra server data --addr 0.0.0.0:8080 --pg 0.0.0.0:5432 --admin-token "$TOKEN"
+pondra serve data --addr 0.0.0.0:8080 --pg 0.0.0.0:5432 --admin-token "$TOKEN"
 ```
 
-Each lake in `data` (`data/sales`, `data/crm`, …) is a database. The console at
-`http://host:8080/` lists them all.
+Each lake in `data` (`data/sales`, `data/crm`, …) is a database, named after its folder. The
+console at `http://host:8080/` lists them all.
+
+`pondra serve data` looks at the folder to decide what it is. If `data` holds a lake (it has a
+`catalog/` folder), it serves that one lake. If its subfolders hold lakes, it serves each as a
+database, as here. If `data` is new or empty, it makes a lake there. For a service, say which you
+mean: `pondra serve --databases /srv/data` serves exactly this folder of lakes and guesses nothing.
+[The command line](/pondra/reference/cli/#what-path-holds) has the rules.
 
 ## Try it
 
@@ -27,7 +33,7 @@ Make two lakes in a folder, serve the folder, and ask one database about the oth
 pondra sql --dir data/sales "CREATE TABLE orders AS SELECT 1 AS id, 10.5 AS amount UNION ALL SELECT 2, 20.0"
 pondra sql --dir data/crm "CREATE TABLE customers AS SELECT 1 AS id, 'ann' AS name UNION ALL SELECT 2, 'bob'"
 
-pondra server data --addr 127.0.0.1:8088 &
+pondra serve data --addr 127.0.0.1:8088 &
 until curl -s 127.0.0.1:8088/databases > /dev/null; do sleep 0.2; done
 
 curl -s 127.0.0.1:8088/databases
@@ -45,9 +51,9 @@ runs and the console lists both.
 
 ## How it works
 
-The server holds no lake itself. Each database runs as a node of its own, a `pondra serve` that
-the server starts as a child process the first time a connection or a request names it. The server
-passes that database's traffic through to its node:
+The process that serves the folder holds no lake itself. Each database runs as a node of its own, a
+`pondra serve` on that lake, which the process starts as a child process the first time a connection
+or a request names it. The process passes that database's traffic through to its node:
 
 - Postgres connections by the database in their startup message;
 - HTTP requests under `/db/{name}/…`, which is that database's whole API.
@@ -90,9 +96,9 @@ crash.
 </Tabs>
 
 - A request without `/db/` goes to the default database: `--default`, else `lake`, else the only
-  one. So a client written for `pondra serve` works unchanged.
+  one. So a client written for a node of one lake works unchanged.
 - The Postgres user says which token the password is (`admin`, `writer`, or any other name for the
-  read token), as on [`pondra serve`](/pondra/reference/postgres/).
+  read token), as on [a node of one lake](/pondra/reference/postgres/).
 - An unknown database is an error with Postgres's own code (`3D000`, `database "nope" does not
   exist`), so tools report it the usual way.
 
@@ -109,8 +115,8 @@ DROP DATABASE hr;
   `{"name": "hr"}` does the same over HTTP, and the console's **+** does it too.
 - `DROP DATABASE hr` stops its node and deletes its folder, as Postgres drops a database's files. It
   needs an admin token, and you run it from another database, as in Postgres. `DROP DATABASE IF
-  EXISTS` is quiet about one that isn't there. On a node that `pondra serve` started, there is no
-  server to drop it from, so it says to use `DETACH` instead.
+  EXISTS` is quiet about one that isn't there. On a node that serves one lake, there is no folder
+  of lakes to drop it from, so it says to use `DETACH` instead.
 - `GET /databases` lists them, with whether each is running and which is the default:
 
 ```json
@@ -131,37 +137,49 @@ GROUP BY c.name;
 The query runs on the node of the database you are connected to, and reads the other lake's files
 directly. No data moves between nodes first.
 
-## Clusters behind the server
+## Clusters of one database
 
 A database's node can lead a cluster. It advertises itself as `host:8080/db/sales`, so a node on
-another machine joins that database's cluster through the server:
+another machine joins that database's cluster through the process that serves the folder:
 
 ```bash norun
-pondra serve --dir /shared/data/sales --addr 10.0.0.6:8080
+pondra serve /shared/data/sales --addr 10.0.0.6:8080
 ```
 
-For a lake in a bucket, run `pondra serve --dir s3://bucket/sales` on as many machines as you like;
+For a lake in a bucket, run `pondra serve s3://bucket/sales` on as many machines as you like;
 [Clusters](/pondra/guides/clusters/) explains how the nodes share the work.
 
 ## Options
 
+The options of `pondra serve` that matter for a folder of lakes.
+[The command line](/pondra/reference/cli/#a-folder-of-lakes) has the rest.
+
 | Option | What it does |
 |---|---|
-| `FOLDER` | The folder of lakes (default `.`). Each subfolder that holds a lake is a database. |
+| `PATH` | The folder of lakes (default the current folder). Each subfolder that holds a lake is a database. |
+| `--databases FOLDER` | Exactly this folder of lakes, for scripts and services. Nothing is guessed |
 | `--addr` | Where HTTP clients, the console and other nodes reach the server (default `127.0.0.1:8080`) |
 | `--pg` | Speak the Postgres protocol here, such as `0.0.0.0:5432` |
-| `--default` | The database a client that names none gets (default `lake`, else the only one) |
-| `--read-token`, `--write-token`, `--admin-token` | Tokens, as `pondra serve` takes them. Every database's node gets them |
+| `--default NAME` | The database a client that names none gets (default `lake`, else the only one) |
+| `--read-token`, `--write-token`, `--admin-token` | Tokens, as on a node of one lake. Every database's node gets them |
 | `--python` | Python for functions, procedures and the console's Python cells, as `pondra serve --python` |
-| `--tier-secs` | Each database's `--tier-secs` |
+| Every other option | Applies to each database's node: `--reader` (every database read-only), `--tier-secs`, `--memory-gb`, `--cache-dir`, `--cache-gb`, `--ack`, `--replicas`, `--fsync`, `--publish`, `--flush-ms`, `--task-ms`, `--retain-secs`, `--changelog-secs` and `--backlog` |
+
+Each database is a process of its own, so an option such as `--memory-gb` is for each database's
+node, not for all of them together.
 
 `PONDRA_DATABASE_IDLE_SECS` sets how long an unused database runs (600 seconds by default).
 
-<Aside type="caution" title="What stays with pondra serve">
-- **Flight and Kafka ports.** A Flight or Kafka port means one lake, so the server refuses
-  `--flight` and `--kafka`. Serve a lake that needs them with `pondra serve`.
-- **A folder in a bucket.** The server's folder is on this machine's disk. For lakes in a bucket,
+<Aside type="caution" title="What a folder of lakes doesn't do yet">
+- **Flight and Kafka ports.** A Flight or Kafka port speaks for one lake today, so a folder of
+  lakes refuses `--flight`, `--kafka` (and `--kafka-advertise`), and `--attach`, `--advertise` and
+  `--attach-found` too, each with a message that names the flag. Routing them to many databases
+  (Kafka by topic, such as `sales.orders`, and Flight by the database the client names) is planned
+  for the next round. Serve such a lake on its own: `pondra serve data/sales --flight 0.0.0.0:8815`.
+- **A folder in a bucket.** The folder of lakes is on this machine's disk. For lakes in a bucket,
   start a `pondra serve` per lake.
+- **Per-database settings and access.** `ALTER DATABASE sales SET …` and grants per database are
+  planned with the security round. Today the tokens are the same for every database.
 - **TLS.** Neither port speaks TLS yet. Put the server behind a proxy that does, or keep it on a
   private network.
 </Aside>

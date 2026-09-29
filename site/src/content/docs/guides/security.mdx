@@ -37,7 +37,7 @@ export PONDRA_SECRET_KEY=$(python3 -c "import secrets; print(secrets.token_hex(3
 EOF
 
 . ./tokens.env
-nohup pondra serve --dir secure-lake --addr 127.0.0.1:8086 --pg 127.0.0.1:5486 \
+nohup pondra serve secure-lake --addr 127.0.0.1:8086 --pg 127.0.0.1:5486 \
   --kafka 127.0.0.1:9486 --flight 127.0.0.1:8816 --python auto > secure.log 2>&1 &
 echo $! > secure.pid
 until curl -sf localhost:8086/stats > /dev/null; do sleep 0.3; done
@@ -214,7 +214,7 @@ Since a procedure's code is the node's own, `--python` is guarded. A node withou
 refuses it unless it listens on `127.0.0.1` (`pondra.local()` passes its own):
 
 ```bash
-timeout 20 pondra serve --dir open-lake --addr 0.0.0.0:8087 --python auto 2>&1 | head -1
+timeout 20 pondra serve open-lake --addr 0.0.0.0:8087 --python auto 2>&1 | head -1
 ```
 
 ```text

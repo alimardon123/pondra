@@ -1,12 +1,15 @@
-/* Pondra's colours: a pond's teal as the accent, in light and dark. */
+/* Pondra's colours: the accent, from brand/colors.css (ADR-032), in dark (Starlight's first) and light. */
 :root {
-  --sl-color-accent-low: #0b2f2e;
-  --sl-color-accent: #1aa6a0;
-  --sl-color-accent-high: #b8f0ec;
+  --sl-color-accent-low: var(--pondra-accent-soft-dark);
+  --sl-color-accent: var(--pondra-accent-dark);
+  --sl-color-accent-high: var(--pondra-accent-strong-dark);
   --sl-content-width: 50rem;
 }
 :root[data-theme='light'] {
-  --sl-color-accent-low: #cdf3f0;
-  --sl-color-accent: #0f7f7a;
-  --sl-color-accent-high: #0a403d;
+  --sl-color-accent-low: var(--pondra-accent-soft);
+  --sl-color-accent: var(--pondra-accent);
+  --sl-color-accent-high: var(--pondra-accent-strong);
 }
+/* The mark beside the title: a little closer than Starlight's gap. */
+.site-title { gap: 0.55rem; }
+.site-title img { height: 1.75rem; width: auto; }

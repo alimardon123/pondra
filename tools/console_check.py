@@ -12,7 +12,7 @@
   opens, its text rendered and its %%sql cell run.
 - tokens: a node with tokens serves the page, which asks for one; given it, the tables show,
   and after a reload too (the browser keeps it).
-- server: `pondra server`'s console lists its databases, and a cell runs in the one picked.
+- server: `pondra serve <folder of lakes>`'s console lists its databases, and a cell runs in the one picked.
 - every request the page made went to the node (or server) that served it.
 
 --show DIR keeps screenshots, light and dark.
@@ -128,6 +128,9 @@ def node_checks(browser, port, show):
     c = pg.run(1, "SELECT nope FROM people")
     sql_error = c.locator(".err").inner_text()
     checks["errors in plain words: a SQL one, and a Python one at its line in the cell"] = "nope" in sql_error and "ZeroDivisionError" in python_error and "line 2" in python_error
+    c = pg.run(2, "x * 10")  # (the cell before made x, then failed: x stays, as in a notebook)
+    shared = until(lambda: pg.grid(c), (["value"], [["10"]]))
+    checks["Python cells share their variables (one namespace per page, as a notebook's kernel)"] = shared == (["value"], [["10"]])
 
     live = pg.run(1, "SELECT count(*) AS n, sum(amt) AS amt FROM people")
     live.locator("label.live").click()
@@ -239,7 +242,7 @@ def server_checks(browser, port):
     folder = tempfile.mkdtemp(prefix="pondra-")
     for name, q in [("sales", "CREATE TABLE orders AS SELECT 1 AS id, 10.5 AS amount UNION ALL SELECT 2, 20.0"), ("lake", "CREATE TABLE notes AS SELECT 'hi' AS text")]:
         subprocess.run([BIN, "sql", "--dir", os.path.join(folder, name), q], check=True, capture_output=True)
-    srv = subprocess.Popen([BIN, "server", folder, "--addr", f"127.0.0.1:{port}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    srv = subprocess.Popen([BIN, "serve", folder, "--addr", f"127.0.0.1:{port}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
         until(lambda: isinstance(call(port, "GET", "/databases"), list), True, 30)
         pg = Page(browser, f"http://127.0.0.1:{port}/")
