@@ -3070,6 +3070,7 @@ $$""")
     status, heard, out = told("CALL send_report(DATE '2026-09-27', ['ann@example.com', 'bo@example.com'])", port=A.port + 2, token="r-tok")
     top = q("SELECT user, sum(qty) AS sold FROM orders WHERE id <= 1000 GROUP BY user ORDER BY sold DESC, user LIMIT 3")
     sent = box.mail[-1] if box.mail else ("", [], "")
+    mailed = {"status": status, "heard": heard, "out": str(out)[:1500], "sent": [sent[1], sent[2][:600]], "top": top}
     checks["HTTP: a reader's CALL sends the mail (a secret's credentials); what it printed comes back"] = status == 200 and heard == ["sent to 2"] and out == {"called": "send_report"} \
         and sent[1] == ["ann@example.com", "bo@example.com"] and "Top items 2026-09-27" in sent[2] and top[0]["user"] in sent[2]
     said = []
@@ -3220,7 +3221,7 @@ $$""")
     ok = all(checks.values())
     print(json.dumps({"functions": checks, "ok": ok}, indent=1))
     if not ok:
-        print(out, ran.stdout[-2000:], ran.stderr[-3000:], shell.stdout[-1000:], shell.stderr[-2000:])
+        print(out, ran.stdout[-2000:], ran.stderr[-3000:], shell.stdout[-1000:], shell.stderr[-2000:], json.dumps(mailed, default=str))
         sys.exit(1)
     return f"functions and procedures in SQL and Python on three nodes: all {len(checks)} checks pass"
 
@@ -3813,8 +3814,9 @@ def found():
     q("""INSERT INTO blobs VALUES (X'010203', X'04', X'05', '{"a": 1}', '[1, 2]')""")
     seen["bytes"] = q("SELECT byte_length(b) AS n, encode(substr(b, 2), 'hex') AS tail, encode(substr(b, 1, 1), 'hex') AS head, "
                       "encode(substring(b FROM 2 FOR 1), 'hex') AS mid, json_get_int(j, 'a') AS a, substr('hello', 2, 3) AS text FROM blobs")
-    checks["BINARY, VARBINARY, BLOB, VARIANT and JSON columns; substr on bytes and on text"] = \
-        seen["bytes"] == [{"n": 3, "tail": "0203", "head": "01", "mid": "02", "a": 1, "text": "ell"}]
+    seen["named"] = q("SELECT substr(str => 'hello', start_pos => 2, length => 3) AS s")
+    checks["BINARY, VARBINARY, BLOB, VARIANT and JSON columns; substr on bytes and on text (its arguments named too)"] = \
+        seen["bytes"] == [{"n": 3, "tail": "0203", "head": "01", "mid": "02", "a": 1, "text": "ell"}] and seen["named"] == [{"s": "ell"}]
     # FROM first, with clauses after; a comment before CREATE FUNCTION.
     q("-- doubles a number\n/* (for the docs) */ CREATE FUNCTION twice(x BIGINT) RETURNS BIGINT AS 'x * 2'")
     checks["FROM-first with WHERE and ORDER BY; a comment before CREATE FUNCTION"] = \
@@ -4002,6 +4004,9 @@ def found():
     typed = call(port, "POST", "/sql?format=typed", b"SELECT CAST(1.5 AS DECIMAL(10,2)) AS d, 9007199254740993 AS big, 7 AS small")
     checks["format=typed: decimals and integers past 2^53 exact (as text), others as numbers"] = typed["rows"] == [["1.50", "9007199254740993", 7]] \
         and [c["type"] for c in typed["columns"]] == ["Decimal128(10, 2)", "Int64", "Int64"] and typed["total"] == 1
+    # to_timestamp over a column of text answers in its type's zone (UTC), as over a literal.
+    zoned = q("SELECT to_timestamp(v) AS a, to_timestamp(d, '%Y-%m-%d') AS b, to_timestamp_millis(d, '%Y-%m-%d') AS c FROM (VALUES ('2020-09-09T00:00:00+02:00', '2020-09-08')) AS x(v, d)")
+    checks["to_timestamp(column) and to_timestamp_millis(column, format): TIMESTAMPTZ, as over a literal"] = zoned == [{"a": "2020-09-08T22:00:00Z", "b": "2020-09-08T00:00:00Z", "c": "2020-09-08T00:00:00Z"}]
     listing = lambda: [r["path"] for r in q("SELECT path FROM files('listed/')")]
     first = listing()
     call(port, "PUT", "/files/listed/a.txt", b"a")

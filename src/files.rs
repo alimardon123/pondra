@@ -61,7 +61,8 @@ impl ExprPlanner for Substrings {
 
 fn substr() -> Arc<ScalarUDF> {
     static SUBSTR: std::sync::LazyLock<Arc<ScalarUDF>> = std::sync::LazyLock::new(|| {
-        Arc::new(ScalarUDF::new_from_impl(Substr { text: datafusion::functions::unicode::substr(), signature: Signature::user_defined(Volatility::Immutable) }))
+        let signature = Signature::user_defined(Volatility::Immutable).with_parameter_names(vec!["str", "start_pos", "length"]).expect("names"); // (DataFusion's: `substr(str => …, start_pos => …)`)
+        Arc::new(ScalarUDF::new_from_impl(Substr { text: datafusion::functions::unicode::substr(), signature }))
     });
     SUBSTR.clone()
 }

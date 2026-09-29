@@ -49,6 +49,38 @@ pub fn rules() -> Vec<Arc<dyn OptimizerRule + Send + Sync>> {
     rules
 }
 
+/// `to_timestamp(column)` and its `_seconds`, `_millis`, `_micros` and `_nanos`: over a column of
+/// text, DataFusion 55 returns them without the zone their type says (the session's, UTC, for
+/// `TIMESTAMPTZ`), and the batch is refused. Here their answer is given that zone.
+pub fn register_zoned(ctx: &datafusion::prelude::SessionContext) {
+    use datafusion::execution::FunctionRegistry;
+    for name in ["to_timestamp", "to_timestamp_seconds", "to_timestamp_millis", "to_timestamp_micros", "to_timestamp_nanos"] {
+        if let Ok(inner) = ctx.udf(name) {
+            ctx.register_udf(datafusion::logical_expr::ScalarUDF::new_from_impl(Zoned(inner)));
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct Zoned(Arc<datafusion::logical_expr::ScalarUDF>);
+
+impl datafusion::logical_expr::ScalarUDFImpl for Zoned {
+    fn name(&self) -> &str { self.0.name() }
+    fn aliases(&self) -> &[String] { self.0.aliases() }
+    fn signature(&self) -> &datafusion::logical_expr::Signature { self.0.signature() }
+    fn coerce_types(&self, types: &[DataType]) -> Result<Vec<DataType>> { self.0.coerce_types(types) }
+    fn return_type(&self, types: &[DataType]) -> Result<DataType> { self.0.return_type(types) }
+    fn with_updated_config(&self, config: &ConfigOptions) -> Option<datafusion::logical_expr::ScalarUDF> {
+        let inner = self.0.inner().with_updated_config(config)?;
+        Some(datafusion::logical_expr::ScalarUDF::new_from_impl(Zoned(Arc::new(inner))))
+    }
+    fn invoke_with_args(&self, args: datafusion::logical_expr::ScalarFunctionArgs) -> Result<datafusion::logical_expr::ColumnarValue> {
+        let want = args.return_field.data_type().clone();
+        let out = self.0.invoke_with_args(args)?;
+        if out.data_type() == want { Ok(out) } else { out.cast_to(&want, None) }
+    }
+}
+
 /// `CAST('2024-05-01 10:30' AS TIMESTAMP)`, `TIMESTAMP '…'`, `ts > '2024-05-01 10:30'`: text
 /// that DataFusion will parse as a timestamp, given its seconds if it has none (`query::seconds`),
 /// before the literal is folded.

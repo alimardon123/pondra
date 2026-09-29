@@ -357,7 +357,7 @@ async fn run() -> anyhow::Result<()> {
                 // A new lake whose first leader hasn't made the catalog yet (nodes started
                 // together), or never will (it died first): look again, until it has or its
                 // mark goes stale and this node takes over.
-                Err(e) if format!("{e:#}").contains("failed to find latest transactional object") => {
+                Err(e) if ["failed to find latest transactional object", store::Lake::NO_LAKE].iter().any(|m| format!("{e:#}").contains(m)) => {
                     tokio::time::sleep(Duration::from_secs(1)).await;
                     cluster::restart("the lake has no catalog yet: its leader is still making it")
                 }

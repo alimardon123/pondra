@@ -253,8 +253,10 @@ Built as decided, with these differences and details:
   runs it. The README points to the site at its top and keeps its overview: GitHub's front page
   is where most people land first.
 - **Writing the site found 37 bugs**, all fixed with checks (`harness.py found` and others).
-  Finishing it found six more: `pondra sql` didn't check `NOT NULL`, ADBC's Postgres driver
-  couldn't read `pg_type`, Npgsql knew none of the types, a time without seconds wasn't a
+  Finishing it found more: `pondra sql` didn't check `NOT NULL`, ADBC's Postgres driver couldn't
+  read `pg_type`, Npgsql knew none of the types, SQLAlchemy's default schema listed every
+  schema's tables (visibility is now the search path, `public`), a time without seconds wasn't a
   timestamp, tables were views to `information_schema`, and a `files()` listing could be a
-  remembered answer. AGENTS.md
+  remembered answer. The suite found one regression of the round's own: the new "holds no lake
+  yet" message stopped a node that should wait for its leader to make the catalog. AGENTS.md
   invariants 129–138.

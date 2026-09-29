@@ -866,6 +866,9 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    the name), `pg_type`'s functions under Postgres's own names (ADBC picks a type's binary format
    by `typreceive`) and listed in `pg_proc`, a `regproc` column compared with `0` compared with
    `-`, and joined to a function's `oid` joined by name (Npgsql learns the types that way).
+   Visible (`pg_table_is_visible`, `pg_function_is_visible`) means on the search path: `public`,
+   the session's temporary schema and `pg_catalog`, so `\dt` and SQLAlchemy's default schema list
+   only those, as on Postgres.
    Registered only for SQL that names the catalog (`wanted`), so other queries pay nothing.
    `clients_check.py`: dbt's rows equal Postgres 16's; psql, SQLAlchemy, pgjdbc, psqlODBC, ADBC
    and Npgsql 4.0 and 8.
@@ -1038,7 +1041,10 @@ round 18's in `logs/round18/`, round 19's in `logs/round19/`, round 20's in `log
   (`DO LANGUAGE python`) and text cells, live answers, notebooks as `.ipynb` versions in the lake,
   Jupyter's keys, light and dark. `console_check.py` drives it in Chromium.
 - **Found at the end:** `pondra sql` didn't check NOT NULL; ADBC's Postgres driver couldn't read
-  `pg_type`; Npgsql (Power BI's driver) knew none of the types; a time without seconds wasn't a timestamp; tables listed as views in
+  `pg_type`; Npgsql (Power BI's driver) knew none of the types; SQLAlchemy's default schema listed
+  every schema's tables; a node on a lake whose first leader hadn't made its catalog stopped
+  instead of waiting (round 26's "holds no lake yet", caught by `cluster.py race`: the wait now
+  matches it, `Lake::NO_LAKE`); a time without seconds wasn't a timestamp; tables listed as views in
   `information_schema`; a `files()` listing could be a cached answer. All fixed (invariants
   129–138).
 - **Not in this round:** a folder in a bucket for `pondra server` (local folders only), TLS,

@@ -408,6 +408,9 @@ impl ObjectStore for Counted {
 impl Lake {
     /// `writer`: the leader. `streamed`: a follower, which also gets every commit streamed from
     /// the leader, so its own catalog view only needs the leader's checkpoints (no log replay).
+    /// What opening a folder with no catalog says (a follower of a leader still making one waits).
+    pub const NO_LAKE: &'static str = "holds no lake yet";
+
     pub async fn open(url: &str, writer: bool, streamed: bool) -> Result<Arc<Lake>> {
         let (url, store, bucket) = open_store(url)?;
         let pool = Arc::new(datafusion::execution::memory_pool::FairSpillPool::new(memory_limit()));
@@ -433,7 +436,7 @@ impl Lake {
                 Ok(cat) => cat,
                 // (no catalog at all: say so, rather than the database's own words for it)
                 Err(e) => match futures::StreamExt::next(&mut store.list(Some(&object_store::path::Path::from("catalog/manifest")))).await {
-                    None => anyhow::bail!("{url} holds no lake yet: start one there (`pondra {url}`, or `pondra serve --dir {url}`), or make a table in it"),
+                    None => anyhow::bail!("{url} {}: start one there (`pondra {url}`, or `pondra serve --dir {url}`), or make a table in it", Lake::NO_LAKE),
                     Some(_) => return Err(e),
                 },
             },
@@ -633,6 +636,7 @@ impl Lake {
         crate::ai::register(&ctx); // ai_complete, ai_embed, cosine_similarity, …
         crate::asof::register(&ctx); // (ASOF JOIN's marker)
         crate::fsum::register(&ctx); // sum(DOUBLE): the same answer in any order
+        crate::optimize::register_zoned(&ctx); // to_timestamp(column): in the zone its type says
         ctx
     }
 

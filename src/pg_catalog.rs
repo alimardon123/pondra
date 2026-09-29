@@ -557,7 +557,19 @@ fn register_functions(ctx: &SessionContext, l: Arc<Lakes>) {
         Ok(texts_out((0..n).map(|i| format_type(oids[i]? as u32, mods.as_ref().and_then(|m| m[i]).unwrap_or(-1) as i32))))
     }));
     ctx.register_udf(udf("pg_get_expr", to_text, |a, _| Ok(Arc::new(datafusion::arrow::compute::cast(&a[0], &DataType::Utf8)?))));
-    for name in ["pg_table_is_visible", "pg_type_is_visible", "pg_function_is_visible", "has_table_privilege", "has_schema_privilege", "has_database_privilege",
+    // Visible: on the search path, which is `public` (and a session's temporary schema, and the
+    // catalog's own), as in Postgres: `\dt` and SQLAlchemy's default schema list only those.
+    let off_path = |schema: &str| !matches!(schema, "public" | TEMP | "pg_catalog");
+    let hidden: Arc<std::collections::HashSet<u32>> = Arc::new(l.rels.iter().filter(|r| off_path(&r.schema)).flat_map(|r| [r.oid, oid("i", &format!("{}.{}", r.schema, r.name))])
+        .chain(l.routines.iter().filter(|(_, schema, ..)| off_path(schema)).map(|(o, ..)| *o)).collect());
+    for name in ["pg_table_is_visible", "pg_function_is_visible"] {
+        let hidden = hidden.clone();
+        ctx.register_udf(udf(name, to_bool, move |a, n| {
+            let oids = int_arg(&a[0])?;
+            Ok(Arc::new((0..n).map(|i| oids[i].map(|o| !hidden.contains(&(o as u32)))).collect::<datafusion::arrow::array::BooleanArray>()))
+        }));
+    }
+    for name in ["pg_type_is_visible", "has_table_privilege", "has_schema_privilege", "has_database_privilege",
         "has_column_privilege", "has_any_column_privilege", "has_function_privilege"] {
         ctx.register_udf(udf(name, to_bool, move |_, n| Ok(yes(n))));
     }

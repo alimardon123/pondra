@@ -159,9 +159,10 @@ SETUP = ["CREATE TABLE users (id BIGINT PRIMARY KEY, name VARCHAR NOT NULL, scor
 
 
 def psql_check(pg):
-    out = {c: psql(pg, c) for c in ("\\dt", "\\d users", "\\dv", "\\dn", "\\df", "\\l", "\\du", "\\d sales.orders", "\\d+ big")}
+    out = {c: psql(pg, c) for c in ("\\dt", "\\dt sales.*", "\\d users", "\\dv", "\\dn", "\\df", "\\l", "\\du", "\\d sales.orders", "\\d+ big")}
     checks = {
-        "\\dt lists every table, in its schema": all(x in out["\\dt"] for x in ("public|events|table", "public|users|table", "sales|orders|table")),
+        "\\dt lists the tables on the search path (public), \\dt sales.* another schema's": all(x in out["\\dt"] for x in ("public|events|table", "public|users|table"))
+            and "sales|" not in out["\\dt"] and "sales|orders|table" in out["\\dt sales.*"],
         "\\d shows columns, Postgres's types, NOT NULL, defaults and the key": all(x in out["\\d users"] for x in
             ("id|bigint||not null|", "name|character varying||not null|", "score|double precision|||0", "joined|timestamp with time zone|||", '"users_pkey" PRIMARY KEY, btree (id)')),
         "\\dv, \\dn, \\df, \\l, \\du": "public|big|view" in out["\\dv"] and "sales|" in out["\\dn"] and "twice|" in out["\\df"] and "lake|" in out["\\l"] and "u|" in out["\\du"],
@@ -179,8 +180,11 @@ def sqlalchemy_check(pg):
         try:
             insp = sa.inspect(eng)
             cols = {c["name"]: (str(c["type"]), c["nullable"], c["default"]) for c in insp.get_columns("users")}
-            checks[f"{drv}: schemas, tables, views"] = {"public", "sales"} <= set(insp.get_schema_names()) and {"events", "users"} <= set(insp.get_table_names()) \
-                and insp.get_table_names(schema="sales") == ["orders"] and insp.get_view_names() == ["big"]
+            listed = {"schemas": insp.get_schema_names(), "tables": insp.get_table_names(), "sales": insp.get_table_names(schema="sales"), "views": insp.get_view_names()}
+            checks[f"{drv}: schemas, tables, views"] = {"public", "sales"} <= set(listed["schemas"]) and {"events", "users"} <= set(listed["tables"]) \
+                and listed["sales"] == ["orders"] and listed["views"] == ["big"]
+            if not checks[f"{drv}: schemas, tables, views"]:
+                said[f"{drv} listed"] = listed
             checks[f"{drv}: columns (types, nullable, defaults), the primary key, has_table"] = cols == {"id": ("BIGINT", False, None), "name": ("VARCHAR", False, None),
                 "score": ("DOUBLE PRECISION", True, "0"), "joined": ("TIMESTAMP", True, None)} and insp.get_pk_constraint("users")["constrained_columns"] == ["id"] \
                 and insp.has_table("users") and not insp.has_table("nope") and insp.get_view_definition("big").startswith("SELECT")

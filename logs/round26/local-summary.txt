@@ -1,7 +1,1 @@
-11:34:25 start all
-11:38:32 all exit=0
-11:38:32 start frames
-11:38:37 frames exit=0
-11:38:37 start spark
-11:39:52 spark exit=0
-11:39:52 start formats
+13:06:32 start all
