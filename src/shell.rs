@@ -128,8 +128,8 @@ async fn session(dir: &str, base: &str, key: &str, node: &mut Child, log: &Path)
         match (sql.is_empty(), line.trim()) {
             (true, ".quit" | ".exit" | "\\q") => break,
             (true, ".databases") => line = format!("{DATABASES};"),
-            // (an attached lake's tables are also this lake's schema of its name, so `l2.t` works: listed once)
-            (true, ".tables") => line = "SELECT table_catalog AS lake, table_schema AS schema, table_name AS name, table_type AS kind FROM information_schema.tables WHERE table_schema <> 'information_schema' AND table_schema NOT IN (SELECT catalog_name FROM information_schema.schemata) ORDER BY 1, 2, 3;".into(),
+            // (`pondra.tables`: a materialized view says so, which `information_schema.tables` can't)
+            (true, ".tables") => line = "SELECT lake, schema, name, kind FROM pondra.tables ORDER BY 1, 2, 3;".into(),
             _ => {}
         }
         sql.push_str(&line);

@@ -23,6 +23,13 @@ export function answer(r, cell) {
 }
 
 // ------------------------------------------------------------------ cells
+/** A cell's code as another kind's: SQL made Python is `db.sql("""…""")` (its answer the same rows), and back. */
+function convert(src, from, to) {
+  const s = src.trim(), q = s.includes('"""') ? "'''" : '"""';
+  if (from === 'sql' && to === 'python') return `db.sql(${q}\n${s}\n${q})`;
+  const m = from === 'python' && to === 'sql' && s.match(/^db\.sql\(\s*("""|'''|"|')([\s\S]*?)\1\s*\)$/);
+  return m ? m[2].trim() : src;
+}
 let made = 0;
 const newId = () => 'c' + Date.now().toString(36) + (made++).toString(36); // (cell ids as nbformat has them)
 
@@ -46,15 +53,20 @@ export class Cell {
       h('span', { class: 'tools' }, tool('arrowUp', 'Move up', () => nb.move(this, -1)), tool('arrowDown', 'Move down', () => nb.move(this, 1)),
         tool('plus', 'Add a cell below (B)', () => nb.add({ kind: this.kind === 'markdown' ? 'sql' : this.kind }, this, true).edit()),
         tool('dots', 'More', e => menu(e.currentTarget, [{ label: 'Run the cells above', icon: 'arrowUp', run: () => nb.runSome(0, i()) }, { label: 'Run this and the cells below', icon: 'arrowDown', run: () => nb.runSome(i()) }, '-',
+          { label: 'Add a cell above', icon: 'plus', keys: 'A', run: () => nb.add({ kind: this.kind === 'markdown' ? 'sql' : this.kind }, this, false).edit() }, { label: 'Add a cell below', keys: 'B', run: () => nb.add({ kind: this.kind === 'markdown' ? 'sql' : this.kind }, this, true).edit() }, '-',
           { label: this.el.classList.contains('folded') ? 'Show the output' : 'Hide the output', icon: 'eye', keys: 'O', run: () => this.fold() }, { label: 'Clear the output', icon: 'clear', run: () => this.clear() }, '-',
           ...[...R.kinds.values()].map(k => ({ label: `Make it ${k.label}`, checked: k.id === this.kind, run: () => { this.setKind(k.id); this.edit(); } })), '-',
           { label: 'Delete the cell', icon: 'trash', keys: 'D D', run: () => nb.remove(this) }]))));
     this.ed = new Editor({ grow: true, value: o.src || '', label: 'Code', oninput: () => nb.changed(), onkey: e => this.key(e) });
-    this.ed.menu = () => ['-', { label: 'Run cell', icon: 'play', keys: 'Ctrl Enter', run: () => this.run() }, ...this.fmt ? this.ed.formats(this.fmt, 'cell', true) : []];
+    this.ed.menu = () => ['-', { label: 'Run cell', icon: 'play', keys: 'Ctrl Enter', run: () => this.run() }, { label: 'Run the cells above', run: () => nb.runSome(0, i()) }, { label: 'Run this and the cells below', run: () => nb.runSome(i()) },
+      ...this.fmt ? ['-', ...this.ed.formats(this.fmt, 'cell', true)] : [], this.kind === 'sql' ? '-' : null, this.kind === 'sql' ? { label: 'Create as table or view…', icon: 'plus', run: () => R.helpers.createAs(this.src) } : null,
+      ...['sql', 'python'].filter(k => k !== this.kind && this.kind !== 'markdown').map(k => ({ label: k === 'sql' ? 'Make it SQL' : 'Make it Python', run: () => this.setKind(k) }))];
     this.ta = this.ed.ta;
     this.md = h('div', { class: 'md', ondblclick: () => this.edit() });
     this.out = h('div', { class: 'out', onclick: () => { if (this.el.classList.contains('folded')) this.fold(false); } });
-    this.el = h('section', { class: 'cell', tabindex: '-1', 'data-kind': this.kind }, this.bar, h('div', { class: 'ed' }, this.ed.el), this.md, this.out);
+    // (the space above a cell, pointed at: a cell of each kind added there, between it and the one before)
+    const here = h('div', { class: 'here' }, [...R.kinds.values()].map(k => h('button', { tabindex: '-1', title: `Add a ${k.label} cell here (A: above, B: below)`, onclick: () => nb.add({ kind: k.id }, this, false).edit() }, '+ ' + k.label)));
+    this.el = h('section', { class: 'cell', tabindex: '-1', 'data-kind': this.kind }, here, this.bar, h('div', { class: 'ed' }, this.ed.el), this.md, this.out);
     this.el.cell = this;
     this.ta.addEventListener('focus', () => { nb.select(this); this.el.classList.add('editing'); nb.last = this; });
     this.ta.addEventListener('blur', () => { if (this.kind === 'markdown') drawMd(this.md, this.src); this.el.classList.remove('editing'); });
@@ -73,7 +85,9 @@ export class Cell {
   fold(on = !this.el.classList.contains('folded')) { this.el.classList.toggle('folded', on); }
   clear() { this.stopLive(); this.result = null; this.out.replaceChildren(); this.status.textContent = ''; this.nb.changed(); }
   setKind(k, quiet) {
-    this.kind = R.kinds.has(k) ? k : 'sql'; k = this.kind; this.el.dataset.kind = k; this.kindSel.replaceChildren(this.type.label, icon('chevd', 'ic', 12));
+    const was = this.kind;
+    this.kind = R.kinds.has(k) ? k : 'sql'; k = this.kind;
+    if (!quiet && was !== k && this.src.trim()) this.ed.value = convert(this.src, was, k); // (SQL and Python cells: one written as the other) this.el.dataset.kind = k; this.kindSel.replaceChildren(this.type.label, icon('chevd', 'ic', 12));
     this.liveEl.hidden = !this.type.live;
     if (!this.type.live) { this.stopLive(); this.liveBox.checked = false; }
     this.ta.placeholder = this.type.placeholder || '';

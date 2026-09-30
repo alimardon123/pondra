@@ -1,6 +1,6 @@
 # Prototype status: Pondra, a streamhouse in one binary
 
-**Date:** 2026-10-01 (the workspace, rounds 27 and 28, and round 29 part 1 with the owner's second list) · **Plan:** ADR-002 to ADR-034, `roadmap.md` · **Code:** `pondra.zip` / `pondra.bundle` (≈30,700 lines of Rust, plus Python and JavaScript clients, a documentation website, packaging, and test and benchmark tools)
+**Date:** 2026-10-01 (the workspace, rounds 27 and 28, and round 29 part 1 with the owner's second and third lists) · **Plan:** ADR-002 to ADR-034, `roadmap.md` · **Code:** `pondra.zip` / `pondra.bundle` (≈30,700 lines of Rust, plus Python and JavaScript clients, a documentation website, packaging, and test and benchmark tools)
 **Name:** the prototype formerly called `lh` is now **Pondra**. The name is free on crates.io, PyPI and npm. A small personal-finance app uses it (pondra.app), a different category; run a trademark search before a public launch.
 
 ## Where it stands
@@ -62,6 +62,17 @@ Start more copies on the same bucket to scale out. The only state is object stor
    card above the pointer; **Format selection** and **Format file** in every menu; **Settings** as
    sections with a search, Keys one of them, room for users, tokens and audit
    (`register.setting`). The first load stays under 70 KB (69.5).
+10. **The owner's third list** (ADR-034): **rows a page** in Settings and the pager (`/sql?rows=N`);
+   one quiet pager line and a single footer line under a cell's answer; the Run ▾'s items (Create
+   as table or view, Run as a job, Schedule, Save as) in the editor's right-click; **Data profile**
+   (the columns) and **Query profile** (`EXPLAIN ANALYZE`, in Plan) named apart; **right-click on
+   everything in the Data tree**: tables, views, materialized views, columns, schemas, the lake,
+   functions, procedures, schedules and secrets, each action the SQL it runs, **Script as** any
+   statement in SQL or Python (`objects.js`, `register.objectKind`); **Make it Python / SQL** on a
+   cell; and `pondra.tables`, so the shell's `.tables` says *materialized view* (the owner found it
+   said `BASE TABLE`), with `SHOW VIEWS` and `SHOW MATERIALIZED VIEWS`; **+ SQL, + Python, +
+   Markdown between cells**; and `SELECT ts::date, *` (or `SELECT id, *`), which DataFusion refused
+   for two columns of one name, runs and names them as Postgres, Snowflake and DuckDB do.
 10. **Found and fixed:** the Docs workflow failed on a clean checkout since round 26 (`site/public/`
    didn't exist); a `pop` dialog showed "null"; a menu under a button on the left opened off to its
    left; clicking a statement's answer selected it in the editor, so the next Run ran it alone.

@@ -111,6 +111,8 @@ static FILES: LazyLock<HashMap<String, Asset>> = LazyLock::new(|| {
         ("md.js", Asset::new(lean(include_str!("console/md.js")), JS)),
         ("jobs.js", Asset::new(lean(include_str!("console/jobs.js")), JS)),
         ("settings.js", Asset::new(lean(include_str!("console/settings.js")), JS)),
+        ("objects.js", Asset::new(lean(include_str!("console/objects.js")), JS)),
+        ("pyfile.js", Asset::new(lean(include_str!("console/pyfile.js")), JS)),
         ("more.css", Asset::new(lean(include_str!("console/more.css")), "text/css; charset=utf-8")),
         ("console.css", Asset::new(lean(&include_str!("console/console.css").replacen("/*{{colors}}*/", COLORS.trim(), 1)), "text/css; charset=utf-8")),
         ("fonts/Geist.woff2", Asset::new(&include_bytes!("../brand/fonts/Geist.woff2")[..], "font/woff2")),
@@ -222,30 +224,19 @@ pub async fn save_settings(axum::extract::ConnectInfo(from): axum::extract::Conn
 /// own files are, for `read_csv('…/files/x.csv')`. Columns come from `information_schema`, as
 /// every client reads them.
 pub async fn objects(lake: &crate::store::Lake) -> anyhow::Result<serde_json::Value> {
-    use crate::store::TableMeta;
     let mut all = vec![];
-    let attached: Vec<(String, std::sync::Arc<crate::store::Lake>)> = lake.attached.read().unwrap().clone();
-    let lakes = std::iter::once((crate::ddl::lake_name(lake), lake.arc())).chain(attached);
-    for (catalog, l) in lakes {
-        let materialized: std::collections::HashSet<String> = l.cat.scan::<serde_json::Value>("v/", "v0").await?.into_iter().map(|(k, _)| k[2..].to_string()).collect();
-        for (k, m) in l.cat.scan::<TableMeta>("t/", "t0").await? {
-            let name = &k[2..];
-            if crate::sys::hidden(name) {
-                continue;
-            }
-            let (schema, table) = crate::ddl::split(name);
-            let m = m.logical();
-            let sealed = m.sealed.clone().unwrap_or_default();
-            let (rows, bytes) = m.files.iter().fold((sealed.rows, sealed.bytes), |(r, b), f| (r + f.rows, b + f.bytes));
-            let kind = if materialized.contains(name) || materialized.contains(name.trim_end_matches("_final")) { "materialized view" } else { "table" };
-            all.push(serde_json::json!({"catalog": catalog, "schema": schema, "name": table, "kind": kind, "rows": rows, "bytes": bytes,
-                "files": m.files.len() as u64 + sealed.files, "key": m.key, "partition": m.partition, "cluster": m.cluster, "publish": m.publish,
-                "not_null": m.not_null, "defaults": m.defaults, "ttl": m.ttl.map(|(c, s)| format!("{c}: {s} s"))}));
-        }
-        for (k, v) in l.cat.scan::<crate::ddl::StoredView>("q/", "q0").await? {
-            let (schema, view) = crate::ddl::split(&k[2..]);
-            all.push(serde_json::json!({"catalog": catalog, "schema": schema, "name": view, "kind": if v.external { "files" } else { "view" }, "sql": v.sql}));
-        }
+    for o in crate::ddl::listed(lake).await? {
+        let (catalog, schema, name) = (&o.lake, &o.schema, &o.name);
+        let Some(m) = o.meta else {
+            all.push(serde_json::json!({"catalog": catalog, "schema": schema, "name": name, "kind": if o.kind == "external table" { "files" } else { o.kind }, "sql": o.sql}));
+            continue;
+        };
+        let sealed = m.sealed.clone().unwrap_or_default();
+        let (rows, bytes) = m.files.iter().fold((sealed.rows, sealed.bytes), |(r, b), f| (r + f.rows, b + f.bytes));
+        all.push(serde_json::json!({"catalog": catalog, "schema": schema, "name": name, "kind": o.kind, "rows": rows, "bytes": bytes,
+            "files": m.files.len() as u64 + sealed.files, "key": m.key, "partition": m.partition, "cluster": m.cluster, "publish": m.publish,
+            "not_null": m.not_null, "defaults": m.defaults, "ttl": m.ttl.as_ref().map(|(c, s)| format!("{c}: {s} s")), "ttl_secs": m.ttl,
+            "merge": m.merge, "order_by": m.order, "sql": o.sql})); // (a materialized view's SQL: what the console scripts it as)
     }
     Ok(serde_json::json!({"objects": all, "files": format!("{}/files/", lake.url.trim_end_matches('/'))}))
 }

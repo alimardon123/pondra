@@ -48,7 +48,9 @@ pondra> .quit
 - A statement ends at a `;` that is outside a string, a quoted name and a comment. It can run over
   several lines.
 - An error is printed and the session goes on.
-- `.tables` lists the tables and views of every database, `.databases` lists the databases, and
+- `.tables` lists the tables and views of every database with each one's kind (`table`, `view`,
+  `materialized view`, `external table`: [`pondra.tables`](/pondra/reference/system-columns/#tables-and-views)),
+  `.databases` lists the databases, and
   `.quit` leaves (so do `.exit`, `\q` and Ctrl+D).
 
 The shell starts a node on the lake, in the background, and sends each statement to it. So everything

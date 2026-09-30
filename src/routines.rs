@@ -530,7 +530,7 @@ async fn expand_with(lake: &Lake, sql: &str, views: &HashMap<String, String>) ->
     let named = |n: &String| crate::ddl::mentions(sql, n);
     if !all.iter().any(|(n, r)| r.kind != Kind::Procedure && named(n)) && !views.keys().any(named) && !FROM_FIRST.is_match(sql) && !crate::ext::mentions(sql)
         && !outside.iter().any(|(n, _)| named(n)) {
-        return Ok(sql.to_string());
+        return Ok(named_apart(sql).unwrap_or_else(|| sql.to_string()));
     }
     // DuckDB's `FROM t WHERE …` (FROM first, with clauses after it): `SELECT * FROM t WHERE …`.
     static LEADING_FROM: std::sync::LazyLock<regex::Regex> =
@@ -550,17 +550,21 @@ async fn expand_with(lake: &Lake, sql: &str, views: &HashMap<String, String>) ->
     Ok(text(&stmts))
 }
 
-/// `SHOW USER FUNCTIONS`, `SHOW PROCEDURES`, `SHOW TASKS` (`[LIKE 'pattern']`): this lake's own,
-/// from `pondra.routines` and `pondra.tasks`, as Snowflake has them. (`SHOW FUNCTIONS` is every
-/// function a query may call, as DataFusion lists them: its own, and the Python ones.)
+/// `SHOW USER FUNCTIONS`, `SHOW PROCEDURES`, `SHOW TASKS`, `SHOW VIEWS`, `SHOW MATERIALIZED VIEWS`
+/// (`[LIKE 'pattern']`): this lake's own, from `pondra.routines`, `pondra.tasks` and
+/// `pondra.tables`, as Snowflake has them. (`SHOW FUNCTIONS` is every function a query may call,
+/// as DataFusion lists them: its own, and the Python ones; `SHOW TABLES` is DataFusion's.)
 fn show(sql: &str) -> Option<String> {
-    static SHOW: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?is)^\s*show\s+(user\s+functions|procedures|tasks)(?:\s+like\s+('(?:[^']|'')*'))?\s*;?\s*$").expect("a regex"));
+    static SHOW: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?is)^\s*show\s+(user\s+functions|procedures|tasks|materialized\s+views|views)(?:\s+like\s+('(?:[^']|'')*'))?\s*;?\s*$").expect("a regex"));
     let m = SHOW.captures(sql)?;
     let like = m.get(2).map(|l| format!(" AND name LIKE {}", l.as_str())).unwrap_or_default();
-    Some(match m[1].split_whitespace().last().unwrap_or_default().to_lowercase().as_str() {
-        "functions" => format!("SELECT name, kind, language, arguments, returns, volatility FROM pondra.routines WHERE kind <> 'procedure'{like} ORDER BY name"),
+    let what = m[1].split_whitespace().map(str::to_lowercase).collect::<Vec<_>>().join(" ");
+    Some(match what.as_str() {
+        "user functions" => format!("SELECT name, kind, language, arguments, returns, volatility FROM pondra.routines WHERE kind <> 'procedure'{like} ORDER BY name"),
         "procedures" => format!("SELECT name, language, arguments FROM pondra.routines WHERE kind = 'procedure'{like} ORDER BY name"),
-        _ => format!("SELECT * FROM pondra.tasks WHERE true{like} ORDER BY name"),
+        "tasks" => format!("SELECT * FROM pondra.tasks WHERE true{like} ORDER BY name"),
+        "views" => format!("SELECT lake, schema, name, kind, definition FROM pondra.tables WHERE kind <> 'table'{like} ORDER BY 1, 2, 3"),
+        _ => format!("SELECT lake, schema, name, key, definition FROM pondra.tables WHERE kind = 'materialized view'{like} ORDER BY 1, 2, 3"),
     })
 }
 
@@ -583,6 +587,107 @@ fn select_star(body: &mut ast::SetExpr) {
         }
         ast::SetExpr::Query(q) => select_star(&mut q.body),
         _ => {}
+    }
+}
+
+/// `sql` with its answers' columns named apart (`output_names`), if any needed it; else None, and
+/// the text is left as written.
+fn named_apart(sql: &str) -> Option<String> {
+    static MAY: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?is)\bselect\b.*(?:::|\bcast\s*\(|,)").expect("a regex"));
+    if sql.len() > 64 << 10 || !MAY.is_match(sql) {
+        return None; // (a SELECT with more than one column or a cast; not a long INSERT's rows)
+    }
+    struct Names(bool);
+    impl VisitorMut for Names {
+        type Break = ();
+        fn post_visit_query(&mut self, q: &mut ast::Query) -> ControlFlow<()> {
+            self.0 |= output_names(q);
+            ControlFlow::Continue(())
+        }
+    }
+    let mut stmts = Parser::parse_sql(&GenericDialect {}, sql).ok()?;
+    let mut names = Names(false);
+    for s in stmts.iter_mut().filter(|s| !matches!(s, Statement::CreateMacro { .. })) {
+        let _ = s.visit(&mut names);
+    }
+    names.0.then(|| text(&stmts))
+}
+
+/// A SELECT's columns named as other engines name them, where DataFusion would refuse the query or
+/// name one badly; true if any was. DataFusion names an unnamed cast of a column (`ts::date`,
+/// `CAST(ts AS DATE)`) as the column, qualified (`sales.orders.ts`), and refuses two columns of one
+/// name, which Postgres, DuckDB and Snowflake all take (`SELECT ts::date, *`, `SELECT id, *`). So:
+/// - a cast of a column is named as the column (`ts`), as Postgres names it; or, when the SELECT
+///   has another column that may have that name (a `*`, or another of its items), as written
+///   (`ts::DATE`), as Snowflake and DuckDB name every cast;
+/// - a column the SELECT has again (`SELECT id, *`, `SELECT id, id`) is named `id_1`, as DuckDB
+///   names the second in a frame (only the item named can be: a `*`'s columns are the table's).
+///
+/// (A column the ORDER BY names qualified, `ORDER BY o.ts`, is one more of the SELECT's: DataFusion
+/// adds it, so a cast of `ts` is then named as written too.)
+fn output_names(q: &mut ast::Query) -> bool {
+    let sorted: Vec<String> = match q.order_by.as_ref().map(|o| &o.kind) {
+        Some(ast::OrderByKind::Expressions(all)) => all.iter().filter_map(|o| match &o.expr {
+            Expr::CompoundIdentifier(ids) => ids.last().map(|i| if i.quote_style.is_some() { i.value.clone() } else { i.value.to_lowercase() }),
+            _ => None,
+        }).collect(),
+        _ => vec![],
+    };
+    select_names(&mut q.body, &sorted)
+}
+
+fn select_names(body: &mut ast::SetExpr, sorted: &[String]) -> bool {
+    fn plain(i: &ast::Ident) -> String { if i.quote_style.is_some() { i.value.clone() } else { i.value.to_lowercase() } }
+    // (a column's qualifier, if written, and name)
+    fn column(e: &Expr) -> Option<(Option<String>, String)> {
+        match e {
+            Expr::Identifier(i) => Some((None, plain(i))),
+            Expr::CompoundIdentifier(ids) if ids.len() > 1 => Some((Some(plain(&ids[ids.len() - 2])), plain(&ids[ids.len() - 1]))),
+            _ => None,
+        }
+    }
+    fn cast(e: &Expr) -> Option<String> {
+        match e {
+            Expr::Cast { expr, .. } => cast(expr).or_else(|| column(expr).map(|c| c.1)),
+            _ => None,
+        }
+    }
+    match body {
+        ast::SetExpr::Select(s) => {
+            use ast::SelectItem::{ExprWithAlias, QualifiedWildcard, UnnamedExpr, Wildcard};
+            let star = s.projection.iter().any(|i| matches!(i, Wildcard(_)));
+            let stars: Vec<String> = s.projection.iter().filter_map(|i| match i {
+                QualifiedWildcard(ast::SelectItemQualifiedWildcardKind::ObjectName(n), _) => n.0.last().and_then(|p| p.as_ident()).map(plain),
+                _ => None,
+            }).collect();
+            let named = |i: &ast::SelectItem| match i {
+                UnnamedExpr(e) => column(e).map(|c| c.1).or_else(|| cast(e)),
+                ExprWithAlias { alias, .. } => Some(plain(alias)),
+                _ => None,
+            };
+            let mut names: Vec<Option<String>> = s.projection.iter().map(named).collect();
+            let mut changed = false;
+            for k in 0..s.projection.len() {
+                let UnnamedExpr(e) = &s.projection[k] else { continue };
+                let Some(n) = names[k].clone() else { continue };
+                let again = |j: usize| j != k && names[j].as_deref() == Some(n.as_str());
+                let name = match (cast(e).is_some(), column(e)) {
+                    (true, _) if star || !stars.is_empty() || (0..names.len()).any(again) || sorted.contains(&n) => e.to_string(),
+                    (true, _) => n.clone(),
+                    (false, Some((q, _))) if star || q.as_ref().is_some_and(|q| stars.contains(q)) || (0..k).any(again) => {
+                        (1..).map(|i| format!("{n}_{i}")).find(|m| !names.iter().any(|x| x.as_deref() == Some(m.as_str()))).expect("a free name")
+                    }
+                    _ => continue,
+                };
+                names[k] = Some(name.clone());
+                s.projection[k] = ExprWithAlias { expr: e.clone(), alias: ast::Ident::with_quote('"', name) };
+                changed = true;
+            }
+            changed
+        }
+        ast::SetExpr::SetOperation { left, right, .. } => select_names(left, sorted) | select_names(right, sorted),
+        ast::SetExpr::Query(q) => output_names(q),
+        _ => false,
     }
 }
 
@@ -675,6 +780,7 @@ impl VisitorMut for Expander<'_> {
 
     fn post_visit_query(&mut self, q: &mut ast::Query) -> ControlFlow<Self::Break> {
         select_star(&mut q.body);
+        output_names(q);
         ControlFlow::Continue(())
     }
 

@@ -58,11 +58,11 @@ of its object. A statement that isn't a query answers a JSON object, such as `{"
 
 `format=typed` is what [the console](/pondra/start/console/) uses: `{"columns": [{"name", "type"}],
 "rows": [[…], …], "total": N, "pages": "…"}`. Each row is a list in the columns' order, so two
-columns may share a name (a join's). It holds the first 10,000 rows, and `total` says how many there
-were. Decimals come as text with all their digits (`"1.50"`), and so do integers past 2^53, which
+columns may share a name (a join's). It holds the first 10,000 rows (`&rows=N` for another number,
+1 to 100,000: the console's rows a page), and `total` says how many there were. Decimals come as text with all their digits (`"1.50"`), and so do integers past 2^53, which
 JavaScript can't hold exactly.
 
-An answer of more than 10,000 rows is kept on the node a while, and `pages` is its id (else `null`).
+An answer of more rows than that is kept on the node a while, and `pages` is its id (else `null`).
 `GET /sql/pages/{id}?from=10000&rows=10000` answers more of its rows, in the same form: the same rows
 in the same order, without running the query again. The node keeps such answers within
 `PONDRA_PAGES_MB` (256) in all, for 20 minutes after each was last read; one no longer kept answers

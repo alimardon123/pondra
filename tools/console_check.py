@@ -46,7 +46,7 @@
 Needs: playwright (Chromium at PLAYWRIGHT_BROWSERS_PATH), nbformat, pyarrow; axe-core (npm) for the
 layout part's audit: AXE_JS, or node_modules/axe-core beside this file or in the current folder.
 """
-import argparse, gzip, io, json, os, shutil, statistics, subprocess, sys, tempfile, time, urllib.error, urllib.request
+import argparse, gzip, io, json, os, re, shutil, statistics, subprocess, sys, tempfile, time, urllib.error, urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -204,7 +204,7 @@ def node_checks(browser, port, show):
     people.locator(".tw").click()
     names = tree.locator(".row.col:visible .nm").all_inner_texts()
     types = tree.locator(".row.col:visible .ty").all_inner_texts()
-    kinds = {r.locator(".nm").inner_text(): r.get_attribute("data-kind") for r in tree.locator(".row[data-kind]").all() if r.get_attribute("data-kind") not in ("database", "schema")}
+    kinds = {r.locator(".nm").inner_text(): r.get_attribute("data-kind") for r in tree.locator(".row[data-kind]").all() if r.get_attribute("data-kind") not in ("database", "schema", "group")}
     checks["a new notebook, nothing typed, has nothing to save: no dot on its tab or its row in the Workspace's notebooks folder"] = fresh == (("untitled.ipynb", False), 0)
     checks["the Data tree lists schemas, tables and views (each kind its icon), columns with SQL types and coloured type marks, a key marked, no bare numbers"] = \
         kinds == {"people": "table", "grown": "view", "orders": "table"} and names == ["id", "name", "born", "at", "amt"] and types[4] == "DECIMAL(10,2)" and types[3] == "TIMESTAMP" \
@@ -887,7 +887,7 @@ def grid_checks(browser, port, show):
     p.keyboard.press("Escape")
     p.keyboard.press("b")
     big = pg.run(1, "SELECT value AS n FROM range(0, 25000)")
-    rng = lambda: big.locator(".pager .pg-r").inner_text()
+    rng = lambda: big.locator(".pg-r").inner_text()
     first = (rng(), [r[0] for r in pg.grid(big)[1][:1]])
     big.locator(".pager .pg", has_text="3").click()
     third = until(lambda: (rng(), pg.grid(big)[1][0][0]), ("20,001–25,000 of 25,000", "20000"))
@@ -995,8 +995,82 @@ def work_checks(browser, port, show):
     other.ctx.close()
     checks["a SQL cell's answer has Chart and Plan (its graph), as a SQL file's pane; the chart open, and its settings, are kept with the notebook"] = \
         plan is True and chart is True and meta.get("pondra", {}).get("view") == "chart" and meta["pondra"].get("chart", {}).get("x") == "region" and again is True
-    checks["the owner's second list: no page errors"] = pg.errors == []
-    info = {"left": left, "items": items, "formatted": [part, whole], "drawn": drawn, "picture": pic, "opened": opened, "kinds": menu_kinds, "meta": meta, "errors": pg.errors}
+
+    # The owner's third list: a cell's Data profile; SQL <-> Python; the editor's right-click; Create as; the tree's menus; rows a page
+    c.locator(".meta button.view", has_text="Data profile").click()
+    profiled = until(lambda: c.locator(".dprof .dp-row").count(), 2, 10)
+    ta = c.locator("textarea")
+    ta.click(button="right")
+    cell_items = [x.split("\n")[0] for x in p.locator("#menu button").all_inner_texts()]
+    p.locator("#menu button", has_text="Make it Python").click()
+    until(lambda: ta.input_value().startswith('db.sql("""'), True, 5)
+    as_py = ta.input_value()
+    ta.click(button="right")
+    p.locator("#menu button", has_text="Make it SQL").click()
+    as_sql = until(lambda: ta.input_value(), "SELECT region, sum(amount) AS total FROM wk GROUP BY region ORDER BY region", 5)
+    checks["a SQL cell: Data profile (a row a column), its right-click runs, formats, creates as, and makes it Python (db.sql) and back"] = profiled == 2 \
+        and {"Run cell", "Run the cells above", "Run this and the cells below", "Format cell", "Create as table or view…", "Make it Python"} <= set(cell_items) \
+        and bool(as_py) and "GROUP BY region" in as_py and as_sql == "SELECT region, sum(amount) AS total FROM wk GROUP BY region ORDER BY region"
+    before = pg.cells().count()
+    c.hover(position={"x": 200, "y": 2})
+    c.locator(".here button", has_text="Python").click()  # (the space above a cell: a cell added there)
+    between = until(lambda: (pg.cells().count(), pg.cell(1).get_attribute("data-kind"), pg.cell(2).get_attribute("data-kind")), (before + 1, "python", "sql"), 5)
+    checks["between two cells, + SQL, + Python, + Markdown add one there"] = between == (before + 1, "python", "sql")
+    pg.menu("New SQL file")
+    ta = p.locator(".filedoc:visible .editor textarea")
+    ta.fill("SELECT value AS v FROM range(0, 250)")
+    ta.click(button="right")
+    ed_items = [x.split("\n")[0] for x in p.locator("#menu button").all_inner_texts()]
+    p.locator("#menu button", has_text="Create as").click()
+    d = p.locator("dialog.pop[open]")
+    d.locator(".seg", has_text="View").first.click()
+    d.locator("input").fill("wk_values")
+    d.locator(".acts button", has_text="Create").click()
+    made = until(lambda: sql(port, "SELECT kind FROM pondra.tables WHERE name = 'wk_values'"), [{"kind": "view"}])
+    pg.menu("Settings")
+    pg.setting("Editor and results", "Rows a page").locator("select").select_option("100")
+    p.keyboard.press("Escape")
+    ta.press("Control+Enter")
+    bar = lambda: p.locator(".filedoc:visible .pgbar").inner_text().replace("\n", " ") if p.locator(".filedoc:visible .pgbar").count() else ""
+    until(lambda: "of 250" in bar(), True, 15)
+    paged = bar()
+    tabs_now = p.locator(".filedoc:visible .ptab").all_inner_texts()
+    kept_rows = p.evaluate("JSON.parse(localStorage.getItem('pondra.prefs') || '{}').pageRows")
+    p.locator(".filedoc:visible .pgbar .pg-n").click()
+    p.locator("#menu button", has_text="10,000").first.click()  # (back as it was: the parts after this one see 10,000 a page)
+    checks["a SQL file's right-click has Run file, Format, Create as (a view made), Run as a job, Schedule, Save as; 100 rows a page (Settings; the pager's ▾ changes it too); a Data profile tab"] = \
+        {"Run file", "Format file", "Create as table or view…", "Run as a job", "Schedule…", "Save as…"} <= set(ed_items) and made == [{"kind": "view"}] \
+        and "1–100 of 250" in paged and "100 a page" in paged and kept_rows == 100 and any("Data profile" in x for x in tabs_now)
+    tree = p.locator("#data")
+    pub = tree.locator(".row[data-kind=schema]", has_text="public").first
+    if pub.get_attribute("aria-expanded") == "false":
+        pub.click()
+    wk = tree.locator(".row[data-kind]").filter(has=p.locator(".nm", has_text=re.compile("^wk$"))).first
+    def opened(el):
+        """Right-click `el` and read the menu it opens (its items come with objects.js: waited for)."""
+        p.keyboard.press("Escape")
+        until(lambda: p.locator("#menu").is_visible(), False, 5)
+        el.click(button="right")
+        until(lambda: p.locator("#menu").is_visible() and "Copy the name" in p.locator("#menu").inner_text(), True, 10)
+        return [x.split("\n")[0] for x in p.locator("#menu button").all_inner_texts()]
+    t_items = opened(wk)
+    p.locator("#menu button", has_text="Script as").click()
+    d = p.locator("dialog.pop[open]")
+    scripts = d.locator(".sa-i").all_inner_texts()
+    d.locator(".seg", has_text="Python").click()
+    py = d.locator(".sa-c").inner_text()
+    p.keyboard.press("Escape")
+    vw = tree.locator(".row[data-kind]").filter(has=p.locator(".nm", has_text=re.compile("^wk_values$"))).first
+    until(lambda: vw.count(), 1, 10)
+    v_items = opened(vw)
+    p.keyboard.press("Escape")
+    checks["the Data tree's right-click: a table's Preview, Script as (SELECT … DROP, SQL or Python), Insert, Add a column, Rename, Truncate, Drop; a view's has no Insert"] = \
+        {"Preview", "Preview in Python", "Script as…", "Insert rows…", "Add a column…", "Rename…", "Truncate…", "Drop…"} <= set(t_items) \
+        and {"SELECT", "INSERT", "UPDATE", "DELETE", "MERGE", "CREATE", "DROP"} <= set(scripts) and py.startswith("db.") and "Insert rows…" not in v_items and "Drop…" in v_items
+    sql(port, "DROP VIEW wk_values")
+    checks["the owner's second and third lists: no page errors"] = pg.errors == []
+    info = {"left": left, "items": items, "formatted": [part, whole], "drawn": drawn, "picture": pic, "opened": opened, "kinds": menu_kinds, "meta": meta, "cell": cell_items, "editor": ed_items,
+            "paged": paged, "table menu": t_items, "scripts": scripts, "python": py[:80], "view menu": v_items, "errors": pg.errors}
     pg.ctx.close()
     return checks, info
 
@@ -1162,12 +1236,12 @@ def budget_checks(browser, port, show):
             fresh[name] = e.code
     total = sum(sizes.values()) if all(sizes.values()) else None
     later = {}
-    for name in ["chart.js", "plan.js", "more.js", "details.js", "more.css", "data.js", "md.js", "jobs.js", "settings.js"]:  # (loaded when first used)
+    for name in ["chart.js", "plan.js", "more.js", "details.js", "more.css", "data.js", "md.js", "jobs.js", "settings.js", "objects.js", "pyfile.js"]:  # (loaded when first used)
         r = urllib.request.urlopen(urllib.request.Request(f"{base}/console/{name}", headers={"accept-encoding": "gzip"}))
         later[name] = len(r.read()) if r.headers.get("content-encoding") == "gzip" else None
     checks["the scripts and style sheet the page loads, gzipped as the node serves them: <= 70 KB; each answers 304 when the browser has it"] = total is not None and total <= 70 * 1024 \
         and set(fresh.values()) == {304}
-    checks["those loaded when first used (a chart, a plan, History, details, a data file, Markdown, Jobs, Settings): <= 8 KB each, gzipped"] = all(v is not None and v <= 8 * 1024 for v in later.values())
+    checks["those loaded when first used (a chart, a plan, History, details, a data file, Markdown, Jobs, Settings, the tree's menus, a Python file): <= 8 KB each, gzipped"] = all(v is not None and v <= 8 * 1024 for v in later.values())
     paints = []
     for _ in range(3):
         pg = Page(browser, base + "/")

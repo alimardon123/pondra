@@ -18,7 +18,7 @@ use crate::server::App;
 use crate::store::{json, table_key, Lake, TableMeta};
 use anyhow::{bail, ensure, Context, Result};
 use chrono::{Datelike, TimeZone, Timelike};
-use datafusion::arrow::array::{ArrayRef, RecordBatch, StringArray, TimestampMicrosecondArray};
+use datafusion::arrow::array::{ArrayRef, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray};
 use datafusion::sql::sqlparser::{keywords::Keyword, parser::Parser, tokenizer::Token};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -481,10 +481,10 @@ fn latest(e: &Every, after: u64, now: u64) -> Option<u64> {
 /// Does `sql` read one of these tables?
 pub fn mentioned(sql: &str) -> bool {
     let s = sql.to_lowercase();
-    ["pondra.runs", "pondra.routines", "pondra.tasks"].iter().any(|t| s.contains(t))
+    ["pondra.runs", "pondra.routines", "pondra.tasks", "pondra.tables"].iter().any(|t| s.contains(t))
 }
 
-/// `pondra.routines` and `pondra.tasks`, as they are now.
+/// `pondra.routines`, `pondra.tasks` and `pondra.tables`, as they are now.
 pub async fn tables(lake: &Lake) -> Result<Vec<(&'static str, Arc<dyn datafusion::catalog::TableProvider>)>> {
     use datafusion::datasource::MemTable;
     let all = crate::routines::listed(lake).await?;
@@ -524,7 +524,23 @@ pub async fn tables(lake: &Lake) -> Result<Vec<(&'static str, Arc<dyn datafusion
         ("next_tick", at(&|i, x| next(i, x))),
     ])?;
     let mem = |b: RecordBatch| -> Result<Arc<dyn datafusion::catalog::TableProvider>> { Ok(Arc::new(MemTable::try_new(b.schema(), vec![vec![b]])?)) };
-    Ok(vec![("routines", mem(routines)?), ("tasks", mem(tasks)?)])
+    // (every table and view, of what kind: `information_schema.tables` knows only BASE TABLE and VIEW;
+    // rows and bytes in its files, so rows still in the log count once written out)
+    let all = crate::ddl::listed(lake).await?;
+    let l = |f: &dyn Fn(&crate::ddl::Listed) -> Option<String>| Arc::new(all.iter().map(f).collect::<StringArray>()) as ArrayRef;
+    let n = |f: &dyn Fn(&TableMeta) -> u64| Arc::new(all.iter().map(|o| o.meta.as_ref().map(|m| f(m) as i64)).collect::<Int64Array>()) as ArrayRef;
+    let sealed = |m: &TableMeta| m.sealed.clone().unwrap_or_default();
+    let listed = RecordBatch::try_from_iter(vec![
+        ("lake", l(&|o| Some(o.lake.clone()))),
+        ("schema", l(&|o| Some(o.schema.clone()))),
+        ("name", l(&|o| Some(o.name.clone()))),
+        ("kind", l(&|o| Some(o.kind.to_string()))),
+        ("rows_in_files", n(&|m| m.files.iter().map(|f| f.rows).sum::<u64>() + sealed(m).rows)),
+        ("bytes_in_files", n(&|m| m.files.iter().map(|f| f.bytes).sum::<u64>() + sealed(m).bytes)),
+        ("key", l(&|o| o.meta.as_ref().filter(|m| !m.key.is_empty()).map(|m| m.key.join(", ")))),
+        ("definition", l(&|o| o.sql.clone())),
+    ])?;
+    Ok(vec![("routines", mem(routines)?), ("tasks", mem(tasks)?), ("tables", mem(listed)?)])
 }
 
 /// `pondra.runs` before any run: no rows, its columns.

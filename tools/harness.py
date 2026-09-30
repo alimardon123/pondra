@@ -275,8 +275,13 @@ def external():
     mine = anyone(f"SELECT * FROM read_csv('{area}reports/q1.csv')")
     outside = [_raises_text(lambda: anyone(f"SELECT * FROM read_csv('{area}../catalog/x.csv')")), _raises_text(lambda: anyone(f"SELECT * FROM read_csv('{area[:-len('files/')]}other.csv')"))]
     kinds = {o["name"]: o["kind"] for o in call(A.port, "GET", "/objects")["objects"]}
-    checks["the lake's own files read as a table by any reader, and nothing else of its folder; /objects says each object's kind"] = mine == [{"a": 1, "b": "x"}] \
-        and all(("program that started the node" if not A.s3 else "no secret covers") in e for e in outside) and kinds.get("ev") == "files" and kinds.get("v") == "view"
+    q("CREATE TABLE kinds_t (a BIGINT)"); q("CREATE MATERIALIZED VIEW mv_kinds AS SELECT a, count(*) AS n FROM kinds_t GROUP BY a")
+    listed = {r["name"]: r["kind"] for r in call(A.port, "POST", "/sql", b"SELECT name, kind FROM pondra.tables")}
+    shown = [r["name"] for r in call(A.port, "POST", "/sql", b"SHOW MATERIALIZED VIEWS")]
+    q("DROP MATERIALIZED VIEW mv_kinds"); q("DROP TABLE kinds_t")
+    checks["the lake's own files read as a table by any reader, and nothing else of its folder; /objects and pondra.tables say each object's kind (a materialized view's too)"] = mine == [{"a": 1, "b": "x"}] \
+        and all(("program that started the node" if not A.s3 else "no secret covers") in e for e in outside) and kinds.get("ev") == "files" and kinds.get("v") == "view" \
+        and listed.get("ev") == "external table" and listed.get("v") == "view" and listed.get("mv_kinds") == "materialized view" and shown == ["mv_kinds"]
     reader = Node(lake, A.port + 1, reader=True, cwd=here, **({"cache_dir": tier + "2"} if A.s3 else {})).start()
     count = lambda port: call(port, "POST", "/sql", f"SELECT count(*) AS n FROM read_csv('{area}reports/q1.csv')".encode())[0]["n"]
     etag = lambda: urllib.request.urlopen(f"http://127.0.0.1:{A.port}/files/reports/q1.csv").headers["etag"]
@@ -3501,6 +3506,11 @@ def names():
         return len(sql_rows(n, fmt(n))) == 1000  # (a SQL function)
     missing = [n for n in names_ if not _try(lambda n=n: works(n))]
     checks[f"every name in dataframe-api.md's table exists and runs ({len(names_)} names)"] = len(names_) > 40 and not missing
+    # an answer's columns named as other engines name them, where DataFusion would refuse the query
+    cols = lambda q: [c["name"] for c in call(A.port, "POST", "/sql?format=typed&rows=1", q.encode())["columns"]]
+    named = [cols("SELECT x::int FROM t"), cols("SELECT x::int, * FROM t"), cols("SELECT id, * FROM t"), cols("SELECT id, id FROM t"), cols("SELECT CAST(x AS INT), x FROM t")]
+    checks["a cast is named as its column (Postgres), or as written beside a column of that name (Snowflake, DuckDB); a column twice runs, the one named twice as id_1"] = \
+        named == [["x"], ["x::INT", "id", "name", "x"], ["id_1", "id", "name", "x"], ["id", "id_1"], ["CAST(x AS INT)", "x"]]
     # each fallback equals its standard name
     sql_pairs = {"read_parquet": ["parquet_scan"], "read_csv": ["read_csv_auto"], "read_json": ["read_json_auto", "read_ndjson"], "read_delta": ["delta_scan"], "read_iceberg": ["iceberg_scan"]}
     checks["SQL: parquet_scan, read_csv_auto, read_json_auto, read_ndjson, delta_scan, iceberg_scan == Pondra's names"] = \

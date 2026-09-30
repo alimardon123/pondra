@@ -1,6 +1,6 @@
 // A statement's plan as a graph (ADR-034, round 29): EXPLAIN's steps as boxes, each above the
 // steps it reads from, the ones that move rows (between cores, or nodes when a query is spread)
-// marked; its Profile runs the statement with EXPLAIN ANALYZE and puts each step's rows and time
+// marked; its Query profile runs the statement with EXPLAIN ANALYZE and puts each step's rows and time
 // on it, the costliest in the strongest colour. Loaded when first shown.
 import { h, icon, run, secs, count, moreStyle } from './core.js';
 import { doneText } from './notebook.js';
@@ -17,8 +17,8 @@ export function planView(sql, params) {
     const tab = (id, label) => h('button', { class: 'seg' + (st.how === id ? ' on' : ''), 'aria-pressed': String(st.how === id), onclick: () => { st.how = id; draw(); } }, label);
     const shown = st.profile || st.plan;
     box.replaceChildren(h('div', { class: 'cbar' }, h('span', { class: 'segs' }, tab('graph', 'Graph'), tab('text', 'Text')),
-      h('span', { class: 'muted' }, st.profile ? `Profiled: ${secs(st.profile.ms)} in all` : st.plan ? 'The plan, before it runs' : ''), h('span', { class: 'grow' }),
-      read ? h('button', { class: 'btn small', disabled: st.busy, title: 'Run it with EXPLAIN ANALYZE: each step\'s rows and time (it runs the query)', onclick: profile }, icon('play'), st.busy ? 'Profiling…' : st.profile ? 'Profile again' : 'Profile') : null),
+      h('span', { class: 'muted' }, st.profile ? `Query profile: ${secs(st.profile.ms)} in all` : st.plan ? 'The plan, before it runs' : ''), h('span', { class: 'grow' }),
+      read ? h('button', { class: 'btn small', disabled: st.busy, title: 'Run it with EXPLAIN ANALYZE: each step\'s rows and time (it runs the query)', onclick: profile }, icon('play'), st.busy ? 'Profiling…' : st.profile ? 'Query profile again' : 'Query profile') : null),
     !shown ? h('div', { class: 'wait' }, 'Reading the plan…') : shown.error ? h('pre', { class: 'err' }, shown.error)
       : st.how === 'text' ? h('pre', { class: 'said plan' }, shown.text) : graph(shown.tree));
   };

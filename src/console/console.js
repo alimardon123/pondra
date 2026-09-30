@@ -16,7 +16,7 @@ import { h, $, fill, said, esc, store, count, bytes,  ICONS, icon, svg, typeMark
   MODE, SESSION, S, base, call, run, rows, doBlock, ident, qualified, home, toast, menu, prompt, VERSION, ask, interruptPython } from './core.js';
 import { grid } from './grid.js';
 import { Notebook, openNotebook, cleanName, doneText } from './notebook.js';
-import { workspace, drawWorkspace, treeItem, upload, newFolder, registerFiles, SqlDoc, PythonDoc, lastStatement } from './files.js';
+import { workspace, drawWorkspace, treeItem, upload, newFolder, registerFiles, SqlDoc, lastStatement } from './files.js';
 
 R.helpers = {};
 const H = R.helpers;
@@ -338,9 +338,8 @@ H.openNotebook = (nb, name) => newNotebook(nb, cleanName(name || '') || 'untitle
 H.newNotebook = dir => dir === 'notebooks' ? newNotebook() : newNotebook(undefined, undefined, dir + '/');
 /** A new SQL or Python file, to be saved in `at` (asked again when it is saved). */
 function newFile(kind, at = kind === 'python' ? 'scripts/' : 'queries/') {
-  const ext = kind === 'python' ? '.py' : '.sql', d = addDoc(new (kind === 'python' ? PythonDoc : SqlDoc)({ untitled: at + nextName(at, ext) + ext }));
-  d.ed.focus();
-  return d;
+  const ext = kind === 'python' ? '.py' : '.sql', untitled = at + nextName(at, ext) + ext, made = d => { addDoc(d); d.ed.focus(); return d; };
+  return kind === 'python' ? import('./pyfile.js').then(m => made(new m.PythonDoc({ untitled }))) : made(new SqlDoc({ untitled })); // (a Python file: a promise of it, its module loaded when first needed)
 }
 H.newFile = newFile;
 H.close = closeDoc;
@@ -421,23 +420,33 @@ function lakeNode(name, schemas, current, note, depth = 0) {
     const names = [...schemas.keys()].sort((a, b) => (a !== 'public') - (b !== 'public') || a.localeCompare(b));
     kids.append(...names.map(s => schemaNode(name, s, schemas.get(s), names.length === 1)));
     if (!names.length) kids.append(h('div', { class: 'empty' }, 'No tables yet.'));
+    if (current) kids.append(...(R.objectKinds || []).map(g => groupNode(name, g)));
   }
-  return treeItem({ key, kids, depth, icon: 'db', iconCls: 'k-db', name, cls: current ? 'cur' : '', meta: note, dataKind: 'database',
+  return treeItem({ key, kids, depth, icon: 'db', iconCls: 'k-db', name, cls: current ? 'cur' : '', meta: note, dataKind: 'database', menu: e => objects(m => m.lakeMenu(e, name, current)),
     title: MODE === 'lakes' && !current ? `Use database ${name}` : name, onclick: tw => { if (MODE === 'lakes' && name !== S.db) use(name); else tw.click(); } });
+}
+/** The lake's other objects, a group each (functions, procedures, schedules, secrets; users and
+ * roles, pipelines, an extension's: `register.objectKind`), filled when opened (objects.js). */
+const objects = f => import('./objects.js').then(f);
+function groupNode(lake, g) {
+  const key = `g:${lake}.${g.id}`, kids = h('div', { class: 'kids', role: 'group', hidden: !S.open.has(key) }, h('div', { class: 'empty' }, '…'));
+  const fill = () => objects(m => m.fill(g.id, kids));
+  if (!kids.hidden) fill();
+  return treeItem({ key, kids, depth: 1, icon: g.icon, iconCls: 'k-group', name: g.title, dataKind: 'group', onopen: fill, onclick: tw => tw.click(), menu: e => objects(m => m.groupMenu(e, g.id)) });
 }
 function schemaNode(lake, schema, tables, only) {
   const key = `s:${lake}.${schema}`;
   const kids = h('div', { class: 'kids', role: 'group', hidden: !openKey(key, only || schema === 'public') }, tables.map(t => tableNode(t)));
-  return treeItem({ key, kids, depth: 1, icon: 'schema', iconCls: 'k-schema', name: schema, title: `schema ${schema}`, dataKind: 'schema', onclick: tw => tw.click() });
+  return treeItem({ key, kids, depth: 1, icon: 'schema', iconCls: 'k-schema', name: schema, title: `schema ${schema}`, dataKind: 'schema', onclick: tw => tw.click(), menu: e => objects(m => m.schemaMenu(e, lake, schema)) });
 }
 function tableNode(t) {
   // (its columns a level in, under its name, past its guide)
   const [ic, word] = KIND[t.o.kind] || KIND.table, keyed = new Set(t.o.key || []);
   const kids = h('div', { class: 'kids', role: 'group', hidden: !S.open.has(t.key) }, t.columns.map(c =>
-    h('div', { class: 'row col', role: 'treeitem', tabindex: '-1', 'aria-level': '4', style: 'padding-left:69px', title: `${c.n}: ${sqlType(c.d)} (${c.d}). Click: put the name where you are typing`, onclick: () => S.doc?.put?.(ident(c.n)) },
+    h('div', { class: 'row col', role: 'treeitem', tabindex: '-1', 'aria-level': '4', style: 'padding-left:69px', title: `${c.n}: ${sqlType(c.d)} (${c.d}). Click: put the name where you are typing; right-click: more`, onclick: () => S.doc?.put?.(ident(c.n)), oncontextmenu: e => { e.preventDefault(); objects(m => m.columnMenu(e, t, c)); } },
       typeMark(c.d), h('span', { class: 'nm' }, c.n), keyed.has(c.n) ? icon('key', 'kk') : null, h('span', { class: 'ty' }, sqlType(c.d)))));
   const it = treeItem({ key: t.key, kids: t.columns.length ? kids : null, depth: 2, icon: ic, iconCls: 'k-table', name: t.t, dataKey: t.key, dataKind: t.o.kind, on: S.pick?.type === 'object' && S.pick.t.key === t.key,
-    title: `${t.q}: a ${word}. Click: its details; double-click: its first rows`, onclick: () => pick({ type: 'object', t }), ondblclick: () => query(`SELECT * FROM ${t.q} LIMIT 100`) });
+    title: `${t.q}: a ${word}. Click: its details; double-click: its first rows; right-click: more`, onclick: () => pick({ type: 'object', t }), ondblclick: () => query(`SELECT * FROM ${t.q} LIMIT 100`), menu: e => objects(m => m.tableMenu(e, t)) });
   return it;
 }
 async function dataTree(box) {
@@ -465,6 +474,10 @@ async function dataTree(box) {
   if (S.pick?.type === 'object') S.pick.t = S.objects?.find(t => t.key === S.pick.t.key) || S.pick.t; // (as it is now)
   mark(); detail();
 }
+H.newDatabase = () => newDatabase();
+// (the objects' menus, loaded as the pointer first comes over the Data tree: open at once when asked for)
+const warm = e => { if (e.target.closest?.('#data')) { removeEventListener('pointerover', warm); import('./objects.js'); } };
+addEventListener('pointerover', warm, { passive: true });
 async function newDatabase() {
   const name = ((await prompt('New database', 'Its name (letters, digits and _)', '')) || '').trim().toLowerCase();
   if (!name) return;
@@ -529,7 +542,7 @@ const details = () => import('./details.js'); // (a table's, a file's, an answer
 const objectDetail = async t => (await details()).objectDetail(t), fileDetail = async f => (await details()).fileDetail(f), resultDetail = async p => (await details()).resultDetail(p);
 const runs = async () => (await more()).runs(), variables = async () => (await more()).variables(), settings = async at => (await import('./settings.js')).settings(typeof at === 'string' ? at : null);
 const choosePython = async () => (await more()).choosePython();
-Object.assign(H, { KIND, addDoc, closeDoc, act, facts, head, detail, drawLeft, drawViews, look, readVars, themeNow, choosePython, job: async (doc, every) => (await more()).job(doc, every), schedule: async doc => (await more()).job(doc, true) });
+Object.assign(H, { KIND, addDoc, closeDoc, act, facts, head, detail, drawLeft, drawViews, look, readVars, themeNow, choosePython, job: async (doc, every) => (await more()).job(doc, every), schedule: async doc => (await more()).job(doc, true), createAs: async sql => (await more()).createAs(sql) });
 
 // ------------------------------------------------------------------ this page's Python (a session's, on the node)
 function kernel(state) {
@@ -692,8 +705,8 @@ document.addEventListener('focusin', e => { const tree = e.target.closest?.('[ro
 
 // ------------------------------------------------------------------ what the core registers (as an extension would)
 function core() {
-  register.cellKind({ id: 'sql', label: 'SQL', language: 'sql', placeholder: 'SELECT …', live: true, run: (text, signal) => run(text, signal) });
-  register.cellKind({ id: 'python', label: 'Python', language: 'python', placeholder: 'db.sql("SELECT …")      # runs on the node; cells share variables', run: async (text, signal) => { kernel('busy'); try { return await run(doBlock(text), signal); } finally { kernel('idle'); } } });
+  register.cellKind({ id: 'sql', label: 'SQL', language: 'sql', placeholder: 'SELECT …', live: true, run: (text, signal) => run(text, signal, undefined, S.pageRows) });
+  register.cellKind({ id: 'python', label: 'Python', language: 'python', placeholder: 'db.sql("SELECT …")      # runs on the node; cells share variables', run: async (text, signal) => { kernel('busy'); try { return await run(doBlock(text), signal, undefined, S.pageRows); } finally { kernel('idle'); } } });
   register.cellKind({ id: 'markdown', label: 'Markdown', language: 'markdown', placeholder: 'Markdown: # a heading, **bold**, *italic*, [a link](https://…), ![a picture](data/chart.png), - a list, | a | table |' });
   register.renderer({ id: 'error', order: 10, match: r => r.kind === 'error', render: r => h('pre', { class: 'err' }, r.message) });
   register.renderer({ id: 'rows', order: 20, match: r => r.kind === 'rows', render: (r, cell) => grid(r, { footer: !!cell, name: S.doc?.name, explore: i => explore(r, i, cell),
@@ -712,6 +725,7 @@ function core() {
   register.view({ id: 'variables', side: 'right', order: 20, title: 'Variables', tree: false, render: () => variables() });
   register.view({ id: 'runs', side: 'right', order: 30, title: 'History', tree: false, render: () => runs() });
   register.view({ id: 'jobs', side: 'right', order: 40, title: 'Jobs', tree: false, render: async () => (await import('./jobs.js')).jobs() });
+  for (const [id, title, ic, order] of [['functions', 'Functions', 'fn', 10], ['procedures', 'Procedures', 'play', 20], ['schedules', 'Schedules', 'calendar', 30], ['secrets', 'Secrets', 'key', 40]]) register.objectKind({ id, title, icon: ic, order });
   registerFiles(register);
   NEW.forEach(([id, ic, title, run]) => register.command({ id, title, run }));
   for (const [id, title, keys, fn] of [['search', 'Search tables, files and commands', 'Ctrl K', palette], ['left', 'Show or hide the left pane', 'Ctrl B', () => pane('left')], ['bottom', 'Show or hide the bottom panel', 'Ctrl J', () => pane('bottom')],
@@ -723,6 +737,7 @@ function core() {
 // ------------------------------------------------------------------ the page's API, and starting
 /** A tree row for an extension's view (ADR-032's `ui.line`): `line(null, { title, onclick }, ...kids)`. */
 const line = (_tw, attrs, ...kids) => h('div', { class: 'row', role: 'treeitem', tabindex: '-1', ...attrs }, h('span', { class: 'tw none' }), ...kids);
+H.addCell = o => addCell(o);
 function addCell(o) { const nb = S.doc?.kind === 'notebook' ? S.doc : S.nb && S.docs.includes(S.nb) ? (activate(S.nb), S.nb) : newNotebook(); return nb.add(o); }
 const pondra = {
   state: S, session: SESSION, mode: MODE, version: VERSION,
@@ -758,7 +773,7 @@ addEventListener('hashchange', () => { const p = new URLSearchParams(location.ha
 async function start() {
   const hash = new URLSearchParams(location.hash.slice(1));
   if (MODE === 'lakes') S.db = hash.get('db');
-  look(); await machinePrefs(); look(); core();
+  look(); await machinePrefs(); look(); S.pageRows = prefs('pageRows') || null; core();
   $('#search').onclick = palette;
   $('#moreBtn').onclick = e => moreMenu(e.currentTarget);
   $('#settingsBtn').onclick = settings;

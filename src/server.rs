@@ -786,6 +786,7 @@ struct SqlParams {
     spread: Option<String>, // "1": run across the cluster even for small tables; "0": only here
     stale_ms: Option<u64>,  // accept a cached result up to this old (see `Results`)
     job: Option<String>,    // writes: a retry with the same job id is applied once
+    rows: Option<usize>,    // typed: the rows of the first page (the console's rows a page; `SHOWN` if not said)
 }
 
 /// Is this request from whoever started the node here (the shell: `PONDRA_OWNER_KEY`)? Then its
@@ -860,7 +861,7 @@ async fn sql_as(app: App, p: SqlParams, role: axum::Extension<crate::auth::Role>
     }
     let tables = Arc::new(req.tables);
     match crate::query::SENT.scope(tables, crate::routines::script(&app, &req.sql, &req.params, &req.views, who, p.job.clone())).await? {
-        Outcome::Rows(batches) => Ok(([("content-type", content_type(&p))], render(&batches, p.format.as_deref())?).into_response()),
+        Outcome::Rows(batches) => Ok(([("content-type", content_type(&p))], answer(&batches, &p)?).into_response()),
         Outcome::Done(v) => Ok(Json(v).into_response()),
     }
 }
@@ -895,7 +896,7 @@ async fn query(app: &App, p: &SqlParams, query: &str, files: bool) -> anyhow::Re
         || crate::temp::mentioned(query) // (the session's temporary tables change without a commit)
         || crate::routines::volatile(&app.lake, query).await; // (a Python function may answer differently each time)
     let Some(version) = app.lake.version_for(query).await.filter(|_| !volatile) else { return Ok(respond(run_sql(app, p, query, files).await?)) };
-    let key = format!("{format}|{}|{query}", p.spread.as_deref().unwrap_or(""));
+    let key = format!("{format}{}|{}|{query}", p.rows.map(|n| format!(":{n}")).unwrap_or_default(), p.spread.as_deref().unwrap_or(""));
     let stale = p.stale_ms.filter(|_| p.after.is_none()).map(Duration::from_millis); // (read-your-writes wins)
     if let Some(body) = app.results.get(&key, version, stale) {
         return Ok(respond(body));
@@ -926,7 +927,15 @@ async fn run_sql(app: &App, p: &SqlParams, query: &str, files: bool) -> anyhow::
     };
     let explained = crate::write::first_word(query).get(..7).is_some_and(|w| w.eq_ignore_ascii_case("explain"));
     let batches = if explained { crate::ext::readable_rows(batches)? } else { batches }; // (files as SQL named them)
-    render(&batches, p.format.as_deref())
+    answer(&batches, p)
+}
+
+/// Rows as `p` asks: `render`'s, a typed answer's first page as many rows as `?rows=` says.
+fn answer(batches: &[RecordBatch], p: &SqlParams) -> anyhow::Result<bytes::Bytes> {
+    match (p.format.as_deref(), p.rows) {
+        (Some("typed"), Some(n)) => Ok(typed(batches, n.clamp(1, MOST))?.into()),
+        (format, _) => render(batches, format),
+    }
 }
 
 /// Rows as `?format=` asks: JSON, a text table, or Arrow IPC (straight into pandas, Polars and
@@ -934,7 +943,7 @@ async fn run_sql(app: &App, p: &SqlParams, query: &str, files: bool) -> anyhow::
 pub fn render(batches: &[RecordBatch], format: Option<&str>) -> anyhow::Result<bytes::Bytes> {
     Ok(bytes::Bytes::from(match format {
         Some("table") => pretty_format_batches(batches)?.to_string().into_bytes(),
-        Some("typed") => typed(batches)?,
+        Some("typed") => typed(batches, SHOWN)?,
         Some("arrow") => crate::query::ipc(batches)?,
         Some(f @ ("csv" | "tsv")) => {
             let mut w = datafusion::arrow::csv::WriterBuilder::new().with_header(true).with_delimiter(if f == "tsv" { b'\t' } else { b',' }).build(Vec::new());
@@ -967,16 +976,18 @@ pub fn render(batches: &[RecordBatch], format: Option<&str>) -> anyhow::Result<b
     }))
 }
 
-/// The rows of an answer the console is sent at once: a page.
+/// The rows of an answer the console is sent at once, a page, unless it asks for another number
+/// (`?rows=`, its rows a page), at most `MOST`.
 const SHOWN: usize = 10_000;
+const MOST: usize = 100_000;
 
 /// The console's answer (`?format=typed`, `console/console.js`): the columns with their types, the
-/// first `SHOWN` rows as lists in the columns' order (two columns may share a name: a join's), how
+/// first `shown` rows as lists in the columns' order (two columns may share a name: a join's), how
 /// many rows there were, and, when there were more, the id its other pages are read with (`page`).
-fn typed(batches: &[RecordBatch]) -> anyhow::Result<Vec<u8>> {
+fn typed(batches: &[RecordBatch], shown: usize) -> anyhow::Result<Vec<u8>> {
     let columns: Vec<Value> = batches.first().map(|b| b.schema().fields().iter().map(|f| j!({"name": f.name(), "type": crate::query::type_name(f.data_type())})).collect()).unwrap_or_default();
     let mut w = arrow_json::ArrayWriter::new(Vec::new());
-    let mut left = SHOWN;
+    let mut left = shown;
     for b in batches.iter().filter(|b| b.num_rows() > 0) {
         let b = b.slice(0, left.min(b.num_rows()));
         left -= b.num_rows();
@@ -991,15 +1002,15 @@ fn typed(batches: &[RecordBatch]) -> anyhow::Result<Vec<u8>> {
     let objects: Vec<serde_json::Map<String, Value>> = serde_json::from_slice(&w.into_inner()).unwrap_or_default();
     let rows: Vec<Value> = objects.into_iter().map(|mut o| Value::Array((0..columns.len()).map(|i| o.remove(&i.to_string()).unwrap_or(Value::Null)).collect())).collect();
     let total: usize = batches.iter().map(|b| b.num_rows()).sum();
-    let pages = if total > SHOWN { crate::pages::keep(batches) } else { None };
+    let pages = if total > shown { crate::pages::keep(batches) } else { None };
     Ok(serde_json::to_vec(&j!({"columns": columns, "rows": rows, "total": total, "pages": pages}))?)
 }
 
 /// `GET /sql/pages/{id}?from=10000&rows=10000`: more rows of an answer the console was sent the
 /// first page of (`pages.rs`), as `typed` has them; 410 once it is no longer kept (run it again).
 async fn page(Path(id): Path<String>, Query(q): Query<HashMap<String, usize>>) -> Response {
-    let (from, rows) = (q.get("from").copied().unwrap_or(0), q.get("rows").copied().unwrap_or(SHOWN).min(SHOWN));
-    match crate::pages::page(&id, from, rows).map(|b| typed(&b)) {
+    let (from, rows) = (q.get("from").copied().unwrap_or(0), q.get("rows").copied().unwrap_or(SHOWN).clamp(1, MOST));
+    match crate::pages::page(&id, from, rows).map(|b| typed(&b, rows)) {
         Some(Ok(body)) => ([("content-type", "application/json")], body).into_response(),
         Some(Err(e)) => E(e).into_response(),
         None => (StatusCode::GONE, "this answer's rows are no longer kept here: run it again").into_response(),

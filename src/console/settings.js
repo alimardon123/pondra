@@ -2,7 +2,8 @@
 // them. The console's own (Appearance, Editor and results, Layout, Keys: kept on this machine, in
 // console.json) and the node's (Python, About). More come in with `register.setting`, under their
 // own heading: an enterprise build's users and roles, tokens, audit and quotas. Loaded when opened.
-import { h, icon, svg, ICONS, S, R, call, register, moreStyle, toast } from './core.js';
+import { h, icon, svg, count, ICONS, S, R, call, register, moreStyle, toast } from './core.js';
+import { PER_PAGE } from './grid.js';
 
 await moreStyle();
 
@@ -46,7 +47,8 @@ register.setting({ id: 'editor', group: 'Personal', icon: 'code', order: 20, tit
     prefs('results', v);
     for (const d of S.docs) if (d.kind === 'sql' && d.place) { d.layout = v; d.place(); d.draw(); }
   })],
-  ['Pages of rows', 'An answer of more rows than 10,000 comes a page at a time: ‹ 1 2 3 › under it turns them (Alt+Page Down, Alt+Page Up).', h('span', { class: 'muted' }, '10,000 a page')],
+  ['Rows a page', 'An answer of more rows comes a page at a time: ‹ 1 2 3 › under it turns them (Alt+Page Down, Alt+Page Up); the node keeps the rest, so a page is the same rows, not the query run again.',
+    h('select', { 'aria-label': 'Rows a page', onchange: e => { prefs('pageRows', +e.target.value); S.pageRows = +e.target.value; } }, PER_PAGE.map(n => h('option', { value: n, selected: n === (S.pageRows || 10000) }, count(n))))],
   ['Format', 'SQL is formatted here, Python by the node\'s Python (ruff, else black). The selection, or with none the whole file or cell.', kbd('Shift Alt F')],
 ] });
 register.setting({ id: 'layout', group: 'Personal', icon: 'paneL', order: 30, title: 'Layout', about: 'The panes, and the tabs.', rows: () => [

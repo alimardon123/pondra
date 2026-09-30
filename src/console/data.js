@@ -1,8 +1,10 @@
 // A data file (ADR-032, ADR-034): a CSV, TSV, JSON, JSON lines or Parquet file of the lake's, as a
 // table, edited in place. Loaded when a data file first opens, not with the page.
-import { h, icon, bytes, count, S, R, emit, run, fileSql, ident, toast, prompt, readFile, writeFile } from './core.js';
+import { h, icon, bytes, count, S, R, emit, run, fileSql, ident, toast, prompt, readFile, writeFile, moreStyle } from './core.js';
 import { grid, copyText } from './grid.js';
 import { btn, moreBtn, download } from './files.js';
+
+await moreStyle();
 
 const base = p => p.split('/').pop();
 const EDITABLE = 10 << 20; // a CSV or JSON file this big or smaller is edited in the browser; bigger ones open read-only

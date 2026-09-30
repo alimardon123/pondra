@@ -378,8 +378,11 @@ DROP SCHEMA sales CASCADE;
 - A dropped table's files stay in the bucket for a day, and are then deleted. A new table with the
   same name starts empty.
 
-List what you have with the shell's `.tables`, or with SQL:
+List what you have with the shell's `.tables`, or with SQL: `pondra.tables` gives each one's kind
+(`table`, `view`, `materialized view` or `external table`), and `information_schema.tables` is there
+for the tools that read it (to it, a materialized view is a `BASE TABLE`).
 
 ```sql
+SELECT schema, name, kind FROM pondra.tables WHERE lake = 'lake' ORDER BY 1, 2;
 SELECT table_name FROM information_schema.tables WHERE table_catalog = 'lake' AND table_schema = 'public' ORDER BY 1;
 ```

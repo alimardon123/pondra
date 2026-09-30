@@ -492,3 +492,68 @@ From screenshots of the reviewed console. Built in round 29; *decided by Claude 
   and style (`md.js`), Jobs (`jobs.js`), Settings and the key list (`settings.js`), and the files'
   actions (rename, delete, upload, new folder: `more.js`) load when first used: 69.5 KB, and each
   on-demand module under 8 KB.
+
+### The owner's third list (round 29, 2026-10-01)
+
+From screenshots again. The owner's rule for it: fix what was asked, add no more to the page than
+that, and keep it easy to change later. Built in round 29; *decided by Claude where marked*:
+
+- **Rows a page** is a setting (**Editor and results → Rows a page**: 100, 500, 1,000, 5,000,
+  10,000, 50,000), and the pager's **10,000 a page ▾** changes it for the answer shown and those
+  after. The node takes `?rows=N` with `format=typed` (1 to 100,000); a page read from what the node
+  kept is any size.
+- **The pager.** One quiet line at the right of the answer's bar: `1–10,000 of 200,000`, the pages in
+  a pill (‹ 1 2 … 20 ›), then **10,000 a page ▾**. A notebook's answer has a single line under it:
+  the rows, the views (Chart, Data profile, Plan), then Copy, Download and the pages at the right.
+- **The Run ▾'s items in the editor's right-click** (a SQL file's and a cell's): Run selection or
+  file (a cell: the cell, those above, this and those below), Format, **Create as table or view…**,
+  Run as a job, Schedule…, Save as…. **Create as** makes the statement at the caret (or the
+  selection) a table, a view or a materialized view, showing the `CREATE … AS` it runs.
+- **Profile, one meaning each.** The notebook had a **Profile** button (each column summarized) and
+  the Plan a **Profile** (`EXPLAIN ANALYZE`): two things, one word. Now **Data profile** is the
+  columns (a SQL file's pane has it as a tab, a cell's answer as a view, a table's details as a
+  button; *decided by Claude:* from the rows shown, **Profile every row** runs it over the whole
+  answer) and **Query profile** is the plan's timing, inside Plan only.
+- **Right-click in the Data tree**, for every kind of object, each action the SQL it runs, a change
+  that can't be undone asked first: a table's or view's Preview (SQL or Python), Details, Watch it
+  live, **Script as…** (SELECT, INSERT, upsert, UPDATE, DELETE, MERGE, load a file, export, CREATE
+  from the catalog, DROP, each in SQL or Python), Insert rows, Download every row, As a Kafka topic,
+  Add a column, Rename, Truncate, Drop; a column's values, range, rename, type and drop; a schema's
+  and the lake's new objects (templates in a tab), attach, detach, checkpoint, new database; and,
+  under the lake, **Functions**, **Procedures**, **Schedules** and **Secrets** listed with theirs.
+  *(Decided by Claude:)* a kind of object is `register.objectKind({ id, title, icon, list, item,
+  menu })` and an action on one `register.objectAction({ kinds, label, run })`, so round 29's users,
+  roles and grants, round 30's pipelines, and an extension's objects are one more kind, not a new
+  tree; and every menu writes SQL (or its Python), so what the console does, a script, a notebook
+  and a Python program do the same way. The menus are `objects.js`, loaded when first used.
+- **SQL and Python, interchangeable.** A cell's **Make it Python** / **Make it SQL** (and its kind's
+  menu) turns `SELECT …` into `db.sql("""SELECT …""")` and back; every Script as has its Python;
+  Preview in Python opens `db.table("t").limit(100)`.
+- **The shell's `.tables`** (found by the owner after): a materialized view was listed as a `BASE
+  TABLE`, because `information_schema.tables` knows only `BASE TABLE` and `VIEW`. *(Decided by
+  Claude:)* `pondra.tables` lists every table and view of the lake and those attached, with its kind
+  (`table`, `view`, `materialized view`, `external table`), key, definition and size in files, read
+  from the catalog alone; the shell's `.tables`, `SHOW VIEWS` and `SHOW MATERIALIZED VIEWS` read it,
+  and the console's `/objects` is built from the same listing (`ddl::listed`), so the three can't
+  disagree. `information_schema.tables` stays as the standard has it, for the tools that read it.
+- **A cell between two cells** (the owner, after): pointing at the space between two cells, or
+  above the first, shows **+ SQL**, **+ Python**, **+ Markdown** on a line, as Databricks' and
+  Colab's notebooks do; a cell's ⋯ has **Add a cell above** (A) and **below** (B). *(Decided by
+  Claude:)* the buttons are out of the Tab order (A and B are the keys' way), and they list the
+  registered kinds of cell, so an extension's kind is offered there too.
+- **`SELECT ts::date, *` refused** (the owner, after): DataFusion names an unnamed cast as its
+  column and refuses two columns of one name, which Postgres, DuckDB and Snowflake all take; alone,
+  it named the cast `sales.orders.ts`. *(Decided by Claude:)* where the SQL arrives
+  (`routines::output_names`), a cast of a column is named as the column (`ts`, Postgres's name)
+  unless the SELECT may have another column of that name (a `*`, the column again, a column the
+  ORDER BY names qualified), then as written (`ts::DATE`, Snowflake's and DuckDB's name); a column
+  named twice (`SELECT id, *`) is named `id_1` where the SELECT names it (the `*`'s can't be:
+  DataFusion has no `* RENAME`), as DuckDB names the second in a frame. The text is parsed again
+  only for a SELECT with a comma or a cast, and sent as written unless a name was given.
+- **The grid's scrollbars** a size up (the owner, after): 13 px, a thumb a shade darker, where the
+  rest of the page keeps thin ones.
+- **The budget.** *(Decided by Claude:)* a Python file's editor (`pyfile.js`), the column summaries'
+  drawing (moved to `details.js`) and the style of the Python console, data files and profiles
+  (`more.css`) load when first used: the first load is 71,262 bytes gzipped of the budget's 71,680
+  (70 KB), the tree's menus 6.7 KB. The next thing added to the first load has to move something out
+  first: sign-in, round 29's second part, goes in a module of its own.

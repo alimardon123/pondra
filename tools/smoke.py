@@ -62,11 +62,15 @@ def main():
     # The shell attaches the other lakes in its folder, for as long as it runs (ADR-024): here
     # `lake` (the node's, just stopped) and `other` (CREATE DATABASE's) beside `shell`.
     beside = subprocess.run([BIN, "shell"], cwd=work, input=".databases\nFROM lake.sales.orders ORDER BY id;\n", capture_output=True, text=True, timeout=180)
-    elsewhere = subprocess.run([BIN, os.path.join(work, "shell")], cwd=tempfile.mkdtemp(), input=".databases\n", capture_output=True, text=True, timeout=180)
+    elsewhere = subprocess.run([BIN, os.path.join(work, "shell")], cwd=tempfile.mkdtemp(), capture_output=True, text=True, timeout=180,
+                               input=".databases\nCREATE TABLE t (a BIGINT);\nCREATE MATERIALIZED VIEW mv AS SELECT a, count(*) AS n FROM t GROUP BY a;\n.tables\n")
     cells = lambda out: {c.strip() for line in out.splitlines() if line.startswith("|") for c in line.strip("|").split("|")}
     checks["the shell attaches the lakes beside it: .databases lists them"] = {"shell", "other", "lake"} <= cells(beside.stdout)
     checks["FROM t is SELECT * FROM t (DuckDB's), on a lake found beside the shell's"] = {"id", "amount", "1", "2"} <= cells(beside.stdout)
-    checks["…for that session only: nothing saved in the shell's lake"] = "lake" not in cells(elsewhere.stdout) and {"shell", "other"} <= cells(elsewhere.stdout)
+    rows = [[c.strip() for c in line.strip("|").split("|")] for line in elsewhere.stdout.splitlines() if line.startswith("|")]
+    databases = {r[0] for r in rows if len(r) == 1}  # (.databases: one column)
+    checks["…for that session only: nothing saved in the shell's lake"] = "lake" not in databases and {"shell", "other"} <= databases
+    checks[".tables says each one's kind: a materialized view is one, not a BASE TABLE"] = ["shell", "public", "mv", "materialized view"] in rows and ["shell", "public", "t", "table"] in rows
     ok = all(checks.values())
     print(json.dumps({"smoke": checks, "platform": sys.platform, "ok": ok}, indent=1))
     if not ok:

@@ -98,6 +98,8 @@ export const ICONS = {
   sort: '<path d="M8 5v14M4.5 15.5 8 19l3.5-3.5M16 19V5m-3.5 3.5L16 5l3.5 3.5"/>',
   trash: '<path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13"/>',
   clear: '<path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13"/>',
+  fn: '<path d="M15.5 4.5c-2.2-.5-3.4.6-3.8 2.6L9.6 17c-.4 2-1.6 3-3.6 2.6M8.5 10.5h7"/>',
+  columns: '<rect x="4" y="4" width="16" height="16" rx="2.5"/><path d="M4 9h16"/><path d="M7.5 16.5l2.5-3 2.5 2 4-4.5"/>',
   calendar: '<rect x="3.5" y="5" width="17" height="15" rx="2.5"/><path d="M3.5 10h17M8.5 3v4M15.5 3v4M8 14h3"/>',
   pin: '<path d="M9.5 3.5h5l-.8 5.2 3.3 3.3v1.5H7v-1.5l3.3-3.3zM12 13.5v7"/>',
   eye: '<path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>',
@@ -178,6 +180,10 @@ export const register = {
   jobKind(o) { R.jobKinds = put(R.jobKinds || [], o); },
   /** A section of Settings: `{ id, title, group, icon, about, rows() → [[label, about, control]], order }` (an enterprise build's users, tokens, audit). */
   setting(o) { R.settings = put(R.settings || [], o); },
+  /** A kind of object in the Data tree, a group under the lake: `{ id, title, icon, order, list(), item(x) → { name, icon, meta, title }, menu(x) → items, create() → SQL }` (users and roles, pipelines). */
+  objectKind(o) { R.objectKinds = put(R.objectKinds || [], o); shell.redraw(); },
+  /** An item of an object's menu in the Data tree: `{ id, kinds: ['table', 'view', 'materialized_view', 'column', 'schema', 'lake', 'functions', …], label, icon, run(object) }`. */
+  objectAction(o) { R.objectActions = put(R.objectActions || [], o); },
 };
 /** How the page reaches the node: `fetch`, the token, extra headers (an enterprise build's gateway
  * and sign-in replace them). */
@@ -220,10 +226,11 @@ export async function call(path, { method = 'GET', body, headers = {}, signal, r
 }
 
 /** A statement's answer: rows (the columns with their types) or what it did, and what it printed. */
-export async function run(sql, signal, params) {
+export async function run(sql, signal, params, page) {
+  const at = '/sql?format=typed' + (page ? '&rows=' + page : ''); // (a page's rows: what Settings says for what the user runs; 10,000 else)
   const r = params && Object.keys(params).length // (values for its $names: bound on the node, never pasted in)
-    ? await call('/sql?format=typed', { method: 'POST', body: JSON.stringify({ sql, params }), headers: { 'content-type': 'application/json' }, signal })
-    : await call('/sql?format=typed', { method: 'POST', body: sql, headers: { 'content-type': 'text/plain; charset=utf-8' }, signal });
+    ? await call(at, { method: 'POST', body: JSON.stringify({ sql, params }), headers: { 'content-type': 'application/json' }, signal })
+    : await call(at, { method: 'POST', body: sql, headers: { 'content-type': 'text/plain; charset=utf-8' }, signal });
   let notices = [];
   try { notices = JSON.parse(r.headers.get('x-pondra-notices') || '[]'); } catch { /* (none) */ }
   const v = await r.json();

@@ -68,6 +68,42 @@ pub fn lake_name(lake: &Lake) -> String {
     lake.url.trim_end_matches(['/', '\\']).rsplit(['/', '\\']).next().unwrap_or("lake").to_lowercase()
 }
 
+/// A table or view of a lake or one attached to it, as `pondra.tables`, the shell's `.tables` and
+/// the console list it: read from the catalog alone, no query run.
+pub struct Listed {
+    pub lake: String,
+    pub schema: String,
+    pub name: String,
+    /// `table`, `view`, `materialized view` (its `_final` table too) or `external table`.
+    pub kind: &'static str,
+    pub meta: Option<TableMeta>, // (a table's, as its users see it)
+    pub sql: Option<String>,     // (a view's definition; a materialized view's query)
+}
+
+/// Every table and view of this lake and the lakes attached to it, lake by lake.
+pub async fn listed(lake: &Lake) -> Result<Vec<Listed>> {
+    let mut all = vec![];
+    let attached: Vec<(String, Arc<Lake>)> = lake.attached.read().unwrap().clone();
+    for (catalog, l) in std::iter::once((lake_name(lake), lake.arc())).chain(attached) {
+        let materialized: std::collections::HashMap<String, String> = l.cat.scan::<crate::views::View>("v/", "v0").await?.into_iter().map(|(k, v)| (k[2..].to_string(), v.sql)).collect();
+        for (k, m) in l.cat.scan::<TableMeta>("t/", "t0").await? {
+            let name = &k[2..];
+            if crate::sys::hidden(name) {
+                continue;
+            }
+            let (schema, table) = split(name);
+            let sql = materialized.get(name).or_else(|| materialized.get(name.trim_end_matches("_final"))).cloned();
+            let kind = if sql.is_some() { "materialized view" } else { "table" };
+            all.push(Listed { lake: catalog.clone(), schema: schema.into(), name: table.into(), kind, meta: Some(m.logical()), sql });
+        }
+        for (k, v) in l.cat.scan::<StoredView>("q/", "q0").await? {
+            let (schema, view) = split(&k[2..]);
+            all.push(Listed { lake: catalog.clone(), schema: schema.into(), name: view.into(), kind: if v.external { "external table" } else { "view" }, meta: None, sql: Some(v.sql) });
+        }
+    }
+    Ok(all)
+}
+
 pub async fn schemas(lake: &Lake) -> Result<Vec<String>> {
     let mut out = vec![PUBLIC.to_string()];
     out.extend(lake.cat.scan::<Schema>("ns/", "ns0").await?.into_iter().map(|(k, _)| k[3..].to_string()));

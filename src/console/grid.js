@@ -1,7 +1,7 @@
 // The result grid (ADR-034): query answers, notebook outputs and data files. It draws only the
 // rows in sight; a cell, a range, a row or a column can be selected and copied (tab-separated,
 // so a spreadsheet takes it as cells); a data file's cells are edited in place.
-import { h, icon, svg, count, numeric, sqlType, typeKind, typeMark, menu, toast, saveAs, quote, ident, pop, call, run, prompt } from './core.js';
+import { h, icon, svg, count, numeric, sqlType, typeKind, typeMark, menu, toast, saveAs, quote, ident, pop, call, run, prompt, S, R } from './core.js';
 
 const ROW_H = 30; // the height of a row when only the rows in sight are drawn
 let measurer;
@@ -58,20 +58,6 @@ export function summarize(values, type) {
 }
 /** Where a value of this type sits on a line: numbers as they are, dates and times by their instant. */
 export const spread = t => numeric(t) ? v => Number(v) : /^(Date|Timestamp)/.test(t || '') ? v => Date.parse(/[zZ]|[+-]\d\d:?\d\d$/.test(v) ? v : String(v).replace(' ', 'T') + (String(v).length > 10 ? 'Z' : 'T00:00:00Z')) : null;
-export function statView(s) {
-  const pct = n => s.n ? `${(100 * n / s.n).toFixed(n && n < s.n / 100 ? 1 : 0)}%` : '0%';
-  const val = v => { const x = typeof v === 'object' ? JSON.stringify(v) : String(v); return x.length > 28 ? x.slice(0, 27) + '…' : x; };
-  const kids = [h('div', { class: 'nums' }, h('span', {}, `${pct(s.nulls)} null`), h('span', {}, `${s.exact ? '' : '≈ '}${count(s.distinct)} distinct`), s.min != null ? h('span', {}, `${val(s.min)} … ${val(s.max)}`) : null)];
-  if (s.hist) {
-    const top = Math.max(...s.hist, 1), w = 12, g = 2;
-    kids.push(h('div', { html: `<svg width="100%" height="30" preserveAspectRatio="none" viewBox="0 0 ${s.hist.length * (w + g)} 30" role="img" aria-label="histogram">${s.hist.map((c, i) => `<rect x="${i * (w + g)}" y="${30 - Math.max(c ? 2 : 0, 30 * c / top)}" width="${w}" height="${Math.max(c ? 2 : 0, 30 * c / top)}" rx="1.5" fill="var(--accent)" opacity=".75"><title>${count(c)}</title></rect>`).join('')}</svg>` }));
-  } else if (s.top?.length) {
-    const top = s.top[0].n;
-    kids.push(h('div', { class: 'bars' }, s.top.flatMap(t => [h('span', { class: 'v', title: t.v }, t.v), h('span', {}, h('div', { class: 'b', style: `width:${Math.max(4, 100 * t.n / top)}%` })), h('span', { class: 'n' }, count(t.n))])));
-  }
-  return kids;
-}
-
 // ------------------------------------------------------------------ the grid
 /** An answer's rows as a grid. Options:
  * - `explore(i)`: a header clicked (the column's profile in the details);
@@ -91,7 +77,7 @@ export function grid(r, o = {}) {
   const multi = all.slice(0, 200).some(row => row.some(v => typeof v === 'string' && v.includes('\n')));
   const virtual = !multi && (all.length > 60 || !!o.edit);
   let view = all.map((_, i) => i), sort = null, filters = [], sel = null;
-  const size = r.page ||= r.total > all.length && (r.pages || r.sql) ? all.length : 0; // (rows a page: as many as came first)
+  let size = r.page ||= r.total > all.length && (r.pages || r.sql) ? all.length : 0; // (rows a page: as many as came first)
   let from = r.from || 0, turning = false;
 
   // the header: a type mark, the name, a sort arrow; the corner selects everything
@@ -419,20 +405,23 @@ export function grid(r, o = {}) {
     el.style.top = (y - ht - 12 >= 8 ? y - ht - 12 : y + 22) + 'px';
   }
 
-  // its pages: ‹ 1 … 4 5 6 … 20 ›, and the rows of the one shown
-  const pager = size ? h('span', { class: 'pager', role: 'navigation', 'aria-label': 'Pages of rows' }) : null, pages = size ? Math.ceil(r.total / size) : 1;
+  // its pages: which rows show (10,001–20,000 of 200,000), ‹ 1 … 4 5 6 … 20 ›, and how many a page
+  const shows = size ? h('span', { class: 'pg-r' }) : null, nav = size ? h('span', { class: 'pager', role: 'navigation', 'aria-label': 'Pages of rows' }) : null;
+  let pages = size ? Math.ceil(r.total / size) : 1;
   function drawPager() {
-    if (!pager) return;
-    const p = from / size, shown = [...new Set([0, p - 1, p, p + 1, pages - 1])].filter(i => i >= 0 && i < pages).sort((a, b) => a - b);
-    const go = (i, label, aria) => h('button', { class: 'pg' + (i === p && !aria ? ' on' : ''), disabled: i < 0 || i >= pages || turning, 'aria-current': i === p && !aria ? 'page' : null, 'aria-label': aria || `Page ${i + 1}`, title: aria ? `${aria} (Alt ${label === '‹' ? 'Page Up' : 'Page Down'})` : null, onclick: () => turn(i) }, label);
+    if (!nav) return;
+    const p = Math.floor(from / size), shown = [...new Set([0, p - 1, p, p + 1, pages - 1])].filter(i => i >= 0 && i < pages).sort((a, b) => a - b);
+    const go = (i, label, aria) => h('button', { class: 'pg' + (i === p && !aria ? ' on' : '') + (aria ? ' step' : ''), disabled: i < 0 || i >= pages || turning, 'aria-current': i === p && !aria ? 'page' : null, 'aria-label': aria || `Page ${i + 1}`,
+      title: aria ? `${aria} (Alt ${i < p ? 'Page Up' : 'Page Down'})` : null, onclick: () => turn(i), html: aria ? svg('chev', 14, 2) : null }, aria ? null : label);
     const ask = async () => { const v = +(await prompt('Go to a page', `A page from 1 to ${count(pages)}`, String(p + 1))); if (v) turn(Math.min(pages, Math.max(1, Math.round(v))) - 1); };
-    pager.classList.toggle('busy', turning);
-    pager.replaceChildren(h('span', { class: 'pg-r' }, `${count(from + 1)}–${count(from + all.length)} of ${count(r.total)}`), go(p - 1, '‹', 'The page before'),
-      ...shown.flatMap((i, k) => [k && i - shown[k - 1] > 1 ? h('button', { class: 'pg gap', title: 'Go to a page…', 'aria-label': 'Go to a page', onclick: ask }, '…') : null, go(i, count(i + 1))]).filter(Boolean), go(p + 1, '›', 'The next page'));
+    shows.textContent = `${count(from + 1)}–${count(from + all.length)} of ${count(r.total)}`;
+    nav.classList.toggle('busy', turning);
+    nav.replaceChildren(go(p - 1, '', 'The page before'), ...shown.flatMap((i, k) => [k && i - shown[k - 1] > 1 ? h('button', { class: 'pg gap', title: 'Go to a page…', 'aria-label': 'Go to a page', onclick: ask }, '…') : null, go(i, count(i + 1))]).filter(Boolean),
+      go(p + 1, '', 'The next page'));
   }
   /** Show page `p`: its rows in place of these (sorted and filtered as these were). */
-  async function turn(p) {
-    if (!size || turning || p < 0 || p >= pages || p * size === from) return;
+  async function turn(p, again) {
+    if (!size || turning || p < 0 || p >= pages || p * size === from && !again) return;
     turning = true; drawPager();
     try {
       const rows = await pageRows(r, p * size, size);
@@ -443,15 +432,19 @@ export function grid(r, o = {}) {
     } catch (e) { toast(e.message, true); }
     turning = false; drawPager();
   }
+  /** Rows a page: this answer's, from the page that holds the first row shown; and the console's from now on. */
+  const per = () => h('button', { class: 'pg-n', title: 'Rows a page (Settings, Editor and results)', 'aria-haspopup': 'menu', onclick: e => { const b = e.currentTarget; menu(b, [{ head: 'Rows a page' },
+    ...PER_PAGE.map(n => ({ label: count(n), checked: n === size, run: () => { R.helpers.prefs?.('pageRows', n); S.pageRows = n; const first = from; size = r.page = n; pages = Math.ceil(r.total / n); b.firstChild.textContent = `${count(n)} a page`; turn(Math.floor(first / n), true); } }))]); } }, `${count(size)} a page`, icon('chevd', 'ic', 11));
   drawPager();
 
   // the footer: rows, the selection's sum, and the answer's buttons (a notebook's)
   const sumBox = o.onsum ? null : h('span', { class: 'sum' });
-  const n = size ? pager : r.total > all.length ? `${count(all.length)} of ${count(r.total)} rows here` : `${count(r.total ?? all.length)} row${(r.total ?? all.length) === 1 ? '' : 's'}`;
+  const n = size ? shows : r.total > all.length ? `${count(all.length)} of ${count(r.total)} rows here` : `${count(r.total ?? all.length)} row${(r.total ?? all.length) === 1 ? '' : 's'}`;
   const wrap = h('div', { class: 'gridwrap' + (o.fill ? ' fill' : '') }, box);
   if (o.footer) {
-    // (views of it under it, one at a time: Chart, and those given (a notebook's SQL: its Plan))
-    const views = [['chart', 'chart', 'Chart', 'A chart of these rows', () => import('./chart.js').then(m => m.chartView(r, o.name, o.chart))], ...o.views || []];
+    // (views of it under it, one at a time: Chart, Data profile, and those given (a notebook's SQL: its Plan))
+    const views = [['chart', 'chart', 'Chart', 'A chart of these rows', () => import('./chart.js').then(m => m.chartView(r, o.name, o.chart))],
+      ['profile', 'columns', 'Data profile', 'Each column: its NULLs, distinct values, range and spread', () => import('./details.js').then(m => m.dataProfile(r))], ...o.views || []];
     const below = h('div', { class: 'chartbox', hidden: true }), vbtn = {};
     let open = null;
     const openView = (id, quiet) => {
@@ -461,18 +454,16 @@ export function grid(r, o = {}) {
       const v = views.find(x => x[0] === open);
       if (v) Promise.resolve(v[4]()).then(el => { if (open === v[0]) below.replaceChildren(el); });
     };
-    const b = (ic, label, title, fn) => h('button', { class: 'btn small', title, onclick: fn }, ic ? icon(ic) : null, label);
     wrap.append(h('div', { class: 'meta' }, h('span', { class: 'n-rows' }, n), chip, sumBox, more,
+      ...views.map(([id, ic, label, title]) => vbtn[id] = h('button', { class: 'btn small view', title, 'aria-pressed': 'false', onclick: () => openView(id) }, icon(ic), label)), h('span', { class: 'grow' }),
       split('copy', 'Copy the rows (or the selection), tab-separated, with the headers', () => copyText(tsv(true), 'Copied, with the headers'),
         () => [{ head: 'Copy the rows (or the selection)' }, ...COPIES.map(([f, label, headers]) => ({ label, run: () => copyText(as(f, headers), 'Copied') }))]),
       split('down', 'Download the rows here as CSV', () => saveAs(toCsv(r), 'text/csv', `${o.name || 'rows'}.csv`), () => [{ head: 'The rows here' },
         { label: 'CSV', run: () => saveAs(toCsv(r), 'text/csv', `${o.name || 'rows'}.csv`) }, { label: 'TSV (tab-separated)', run: () => saveAs(toCsv(r, '\t'), 'text/tab-separated-values', `${o.name || 'rows'}.tsv`) },
         { label: 'JSON', run: () => saveAs(JSON.stringify(all.map(row => Object.fromEntries(cols.map((c, i) => [c.name, row[i]])))), 'application/json', `${o.name || 'rows'}.json`) },
-        ...r.sql ? [{ head: 'Every row (it runs again)' }, ...DOWNLOADS.map(([f, label]) => ({ label, run: () => fetchRows(r, f, o.name) }))] : []]),
-      ...views.map(([id, ic, label, title]) => vbtn[id] = h('button', { class: 'btn small view', title, 'aria-pressed': 'false', onclick: () => openView(id) }, icon(ic), label)),
-      o.explore ? b(null, 'Profile', 'Each column: its nulls, distinct values, range and spread, in the details', () => o.explore(0)) : null), below);
+        ...r.sql ? [{ head: 'Every row (it runs again)' }, ...DOWNLOADS.map(([f, label]) => ({ label, run: () => fetchRows(r, f, o.name) }))] : []]), nav), below);
     if (o.view && views.some(v => v[0] === o.view)) openView(o.view, true);
-  } else wrap.append(h('div', { class: 'fbar' }, pager, chip, sumBox, more));
+  } else wrap.append(h('div', { class: 'fbar' }, chip, sumBox, more, size ? h('span', { class: 'pgbar' }, shows, nav, per()) : null));
   draw();
   wrap.grid = { refresh, select, sortBy, setFilter, setFilters, copy: tsv, text: as, box, count: () => view.length, selection: () => sel && { ...range(), row: view[sel.fr], col: sel.fc } };
   return wrap;
@@ -480,6 +471,8 @@ export function grid(r, o = {}) {
 let cardBox;
 const cardEl = () => cardBox ||= document.body.appendChild(h('div', { class: 'hcard', role: 'tooltip', hidden: true }));
 const hideCard = () => { if (cardBox) cardBox.hidden = true; };
+/** The rows a page an answer may come in (Settings, and the ▾ under a paged answer). */
+export const PER_PAGE = [100, 500, 1000, 5000, 10000, 50000];
 addEventListener('scroll', hideCard, true);
 
 /** Rows `at…at + n` of an answer: from the node, which keeps a big answer a while (`pages.rs`); once
@@ -489,7 +482,7 @@ async function pageRows(r, at, n) {
     try { return (await (await call(`/sql/pages/${r.pages}?from=${at}&rows=${n}`)).json()).rows; } catch (e) { if (e.status !== 410 || !r.sql) throw e; r.pages = null; }
   }
   if (!r.sql) throw new Error('Its rows are no longer kept on the node: run it again');
-  return (await run(`SELECT * FROM (\n${r.sql.replace(/[\s;]+$/, '')}\n) AS q LIMIT ${n} OFFSET ${at}`, undefined, r.params)).rows;
+  return (await run(`SELECT * FROM (\n${r.sql.replace(/[\s;]+$/, '')}\n) AS q LIMIT ${n} OFFSET ${at}`, undefined, r.params, n)).rows;
 }
 
 /** A SQL `IN` list's values quoted as a name (for the menus of other modules). */

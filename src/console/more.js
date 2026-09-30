@@ -59,7 +59,7 @@ export async function runs() {
   const codeOf = x => { if (x.routine !== 'do') return null; try { const a = JSON.parse(x.args || '{}'); return a.code ? { code: a.code, language: a.language || 'python' } : null; } catch { return null; } };
   const firstLine = code => { const ls = code.split('\n').map(l => l.trim()).filter(l => l && !l.startsWith('#')); return ls.length ? oneLine(ls[0], 90) + (ls.length > 1 ? ' …' : '') : ''; };
   const nameOf = x => { const c = codeOf(x); return fileOf(x) || (c ? firstLine(c.code) || 'DO' : x.routine === 'do' ? 'DO (a Python cell)' : x.routine); };
-  const nodeActs = x => [fileOf(x) ? ['Open the file', () => openFile(fileOf(x)), true] : null, codeOf(x) ? ['Open in a new file', () => { const d = newFile(codeOf(x).language === 'python' ? 'python' : 'sql'); d.ed.value = codeOf(x).code; d.changed(); }, true] : null,
+  const nodeActs = x => [fileOf(x) ? ['Open the file', () => openFile(fileOf(x)), true] : null, codeOf(x) ? ['Open in a new file', async () => { const d = await newFile(codeOf(x).language === 'python' ? 'python' : 'sql'); d.ed.value = codeOf(x).code; d.changed(); }, true] : null,
     codeOf(x) ? ['Copy the code', () => copyText(codeOf(x).code)] : null, ['Copy its id', () => copyText(String(x.id))]].filter(Boolean);
   const nodeLook = x => pop(`Run ${String(x.id).slice(0, 12)}`, h('div', {}, facts([['What', codeOf(x) ? `DO LANGUAGE ${codeOf(x).language}` : x.routine], ['Who', x.caller], ['Status', x.status], ['Started', utc(x.started).toLocaleString()], ['Ended', x.ended ? utc(x.ended).toLocaleString() : null], ['Took', took(x)], ['Id', String(x.id)]]),
     codeOf(x) ? h('pre', { class: 'defn', html: highlighted(codeOf(x).code, codeOf(x).language === 'python' ? 'python' : 'sql') }) : null, x.error ? h('pre', { class: 'err' }, x.error) : null), nodeActs(x));
@@ -81,9 +81,9 @@ export async function runs() {
 /** What to do with something this page ran: open it as a new file, put it in the one in front,
  * copy it, run it again, see its plan. */
 function pageActs(x) {
-  const fresh = () => { const d = newFile(x.kind === 'python' ? 'python' : 'sql'); d.ed.value = x.src; d.changed(); return d; };
+  const fresh = async () => { const d = await newFile(x.kind === 'python' ? 'python' : 'sql'); d.ed.value = x.src; d.changed(); return d; };
   return [['Open in a new file', fresh, true], S.doc?.put ? ['Put it in the tab in front', () => { S.doc.put(x.src); }] : null, ['Copy it', () => copyText(x.src)],
-    ['Run it again', () => { const d = fresh(); d.run(); }], x.kind === 'sql' ? ['See its plan', () => { const d = fresh(); d.tab = 'plan'; d.run(); }] : null].filter(Boolean);
+    ['Run it again', async () => (await fresh()).run()], x.kind === 'sql' ? ['See its plan', async () => { const d = await fresh(); d.tab = 'plan'; d.run(); }] : null].filter(Boolean);
 }
 function pageLook(x) {
   pop(`Run #${x.id}`, h('div', {}, facts([['Where', x.where], ['When', new Date(x.at).toLocaleString()], ['Took', secs(x.ms)], ['Answer', x.ok ? x.rows != null ? `${count(x.rows)} row${x.rows === 1 ? '' : 's'}` : 'done' : 'failed']]),
@@ -207,3 +207,20 @@ export async function remove(f, folder) {
   R.helpers.refreshFiles();
 }
 
+
+/** Create a table, a view or a materialized view from a query (the Run ▾'s, and the editor's, Create as…). */
+export function createAs(sql) {
+  const stmt = sql.trim().replace(/;\s*$/, ''), st = { kind: 'TABLE' }, code = h('pre', { class: 'defn' }), segs = h('span', { class: 'segs' });
+  const input = h('input', { value: 'new_table', spellcheck: 'false', 'aria-label': 'Its name' });
+  const text = () => `CREATE ${st.kind} ${input.value.trim() || '…'} AS\n${stmt};`;
+  const draw = () => {
+    segs.replaceChildren(...[['TABLE', 'Table'], ['VIEW', 'View'], ['MATERIALIZED VIEW', 'Materialized view']].map(([k, label]) => h('button', { type: 'button', class: 'seg' + (st.kind === k ? ' on' : ''), onclick: () => { st.kind = k; draw(); } }, label)));
+    code.innerHTML = highlighted(text(), 'sql');
+  };
+  input.oninput = draw; draw();
+  pop('Create as', h('div', { class: 'form' }, segs, h('label', {}, 'Its name: schema.name, or a name (in public)', input), code,
+    h('small', {}, 'A table keeps the rows as they are now; a view runs its query each time it is read; a materialized view keeps its rows up to date as its tables change.')),
+  [['Create', async () => { try { await run(text()); toast(`Made ${input.value.trim()}`); H.refresh(); } catch (e) { toast(e.message, true); } }, true],
+    ['Open in a new tab', async () => { const d = await newFile('sql'); d.ed.value = text(); d.changed(); }], ['Cancel', () => {}]]);
+  requestAnimationFrame(() => { input.focus(); input.select(); });
+}

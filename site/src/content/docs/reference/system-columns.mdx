@@ -1,6 +1,6 @@
 ---
 title: System columns and tables
-description: The columns every row has, the change feed's change types, and the pondra.runs, pondra.routines and pondra.tasks tables.
+description: The columns every row has, the change feed's change types, and the pondra.runs, pondra.routines, pondra.tasks and pondra.tables tables.
 sidebar:
   order: 16
 ---
@@ -156,7 +156,7 @@ SELECT routine, caller, status, args FROM pondra.runs WHERE routine = 'report' A
 
 ## Routines and tasks
 
-`pondra.routines` and `pondra.tasks` list what is in the catalog as they are now. `SHOW FUNCTIONS`,
+`pondra.routines` and `pondra.tasks` list what is in the catalog as they are now. `SHOW USER FUNCTIONS`,
 `SHOW PROCEDURES` and `SHOW TASKS` read them.
 
 `pondra.routines`:
@@ -197,6 +197,40 @@ SELECT name, kind, language, arguments FROM pondra.routines WHERE name = 'report
 
 ```text
 [{"name":"report","kind":"procedure","language":"sql","arguments":"day VARCHAR"}]
+```
+
+## Tables and views
+
+`pondra.tables` lists every table and view of this lake and the lakes attached to it, each with its
+kind, read from the catalog alone. `information_schema.tables`, which Postgres tools read, knows only
+`BASE TABLE` and `VIEW`, so there a materialized view is a `BASE TABLE` (its rows are kept as one);
+here it says what it is. The shell's `.tables`, `SHOW VIEWS` and `SHOW MATERIALIZED VIEWS` read it,
+and the console's Data tree shows the same kinds.
+
+| Column | Meaning |
+|---|---|
+| `lake` | the lake (database) it is in |
+| `schema` | its schema, `public` unless one is named |
+| `name` | its name |
+| `kind` | `table`, `view`, `materialized view` (and its `_final` table, a windowed one's closed windows) or `external table` |
+| `rows_in_files` | a table's rows in its files, or null for a view; rows still in the log count once they are written out |
+| `bytes_in_files` | the same, in bytes |
+| `key` | a keyed table's key, `id, day`, or null |
+| `definition` | a view's query, or a materialized view's; null for a table |
+
+```sql
+CREATE TABLE sold (item VARCHAR, qty BIGINT);
+CREATE MATERIALIZED VIEW sold_by_item AS SELECT item, sum(qty) AS qty FROM sold GROUP BY item;
+CREATE VIEW big_sales AS SELECT * FROM sold WHERE qty > 10;
+SELECT name, kind, key FROM pondra.tables WHERE name IN ('sold', 'sold_by_item', 'big_sales') ORDER BY name;
+```
+
+```text
+[{"name":"big_sales","kind":"view","key":null},{"name":"sold","kind":"table","key":null},{"name":"sold_by_item","kind":"materialized view","key":"item"}]
+```
+
+```sql
+SHOW MATERIALIZED VIEWS LIKE 'sold%';
 ```
 
 <Aside type="caution">

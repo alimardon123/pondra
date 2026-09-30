@@ -1120,6 +1120,19 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    can't run script or load anything (`br`, `kbd`, `sub`, `sup`, `u`, `mark`, …, no attributes); a
    link is followed only to `http(s):`, `mailto:`, a place in the page or a lake file; a picture is
    `http(s):`, a `data:image/…` or a lake file read with the page's token. `console_check.py` (`work`).
+173. **One listing of what a lake holds** (`ddl::listed`): `pondra.tables` (the shell's `.tables`,
+   `SHOW VIEWS`, `SHOW MATERIALIZED VIEWS`) and the console's `/objects` are built from it, so a
+   table, a view, a materialized view (and its `_final` table) and an external table are called the
+   same everywhere; `information_schema.tables` stays as the standard has it (a materialized view a
+   `BASE TABLE`), for the tools that read it. `harness.py external`.
+174. **The console's actions are SQL (or its Python)** (`objects.js`, ADR-034's third list): every
+   menu on an object runs or opens the statement it stands for, one that can't be undone asked
+   first; a kind of object is `register.objectKind`, an action `register.objectAction`, so new
+   objects (users, grants, pipelines, an extension's) add a kind, not a tree. `console_check.py` (`work`).
+175. **An answer's columns are named apart** (`routines::output_names`): a query DataFusion would
+   refuse for two columns of one name (`SELECT ts::date, *`, `SELECT id, *`) runs, a cast named as
+   its column or, beside another of that name, as written, a column named twice `id_1`; a query
+   that needs no name given is sent as written. `harness.py names`.
 
 ## Tests: run these before and after any change
 
@@ -1261,6 +1274,12 @@ checkout again. **The owner's second list:** Markdown cells drawn as GitHub does
 Chart and Plan kept with its notebook, tabs that scroll and pin, pages of rows kept on the node (171),
 Jobs apart from History (`register.jobKind`), a clearer Data tree, the header's card above the
 pointer, Format selection and Format file, Settings as sections with a search (`register.setting`).
+**The owner's third list:** rows a page as a setting and in the pager (`?rows=`), a quieter pager and
+notebook footer, the Run ▾'s items in the editor's right-click with **Create as table or view**,
+**Data profile** and **Query profile** as two names for two things, a right-click menu for every kind
+of object in the Data tree with **Script as** in SQL or Python (174), a cell made Python or SQL, and
+`pondra.tables` for the shell's `.tables` (173), a cell added between two cells, and `SELECT ts::date, *`
+running as other engines run it (175).
 
 **Round 28 (ADR-029 phase 2): other engines' changes as written.** Spark's `DELETE`, `UPDATE` and
 `MERGE` copy-on-write and merge-on-read, PyIceberg's `delete` and `overwrite`, through the catalog,

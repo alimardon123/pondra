@@ -53,6 +53,7 @@ on bytes as they do on text. A `CAST` to bytes takes `BYTEA` only.
 | `FROM a ASOF JOIN b MATCH_CONDITION (a.ts >= b.ts) ON a.k = b.k` | each row gets the other table's row as it was at that moment (`>=`, `>`, `<=`, `<`) |
 | `EXPLAIN SELECT …` | the plan, and whether it would spread over the nodes |
 | `DESCRIBE t`, `SHOW TABLES`, `SHOW COLUMNS FROM t` | what the lake holds |
+| `SHOW VIEWS`, `SHOW MATERIALIZED VIEWS [LIKE 'p%']`, `SELECT … FROM pondra.tables` | each table and view with its kind (see [system tables](/pondra/reference/system-columns/#tables-and-views)) |
 | `SELECT … FROM 'file.parquet'` | a file or URL as a table (see [names](/pondra/reference/names/)) |
 
 ```sql
@@ -66,6 +67,26 @@ FROM orders SELECT item, sum(amount) AS total GROUP BY item ORDER BY total DESC;
 FROM orders WHERE item = 'tea' ORDER BY id;
 SELECT t.ts, t.px, q.bid FROM trades t ASOF JOIN quotes q MATCH_CONDITION (t.ts >= q.ts) ON t.sym = q.sym;
 SHOW TABLES;
+```
+
+An answer's columns are named as other engines name them, where DataFusion alone would refuse the
+query:
+
+- a column cast without a name (`ts::date`, `CAST(ts AS DATE)`) is named as the column, `ts`, as
+  Postgres names it; when the `SELECT` has another column that may be named so (a `*`, or the
+  column itself), it is named as written, `ts::DATE`, as Snowflake and DuckDB name every cast;
+- a column the `SELECT` has twice (`SELECT id, *`, `SELECT id, id`) is named `id_1` where it is
+  named in the `SELECT`, as DuckDB names the second in a frame. Name it yourself with `AS` for
+  another name.
+
+```sql
+SELECT id::VARCHAR, * FROM orders WHERE id = 1;
+SELECT id, * FROM orders WHERE id = 1;
+```
+
+```text
+[{"id::VARCHAR":"1","id":1,"item":"tea","qty":2,"amount":7.0}]
+[{"id_1":1,"id":1,"item":"tea","qty":2,"amount":7.0}]
 ```
 
 A parameter goes with the request, in JSON. The Python and JavaScript clients do this for you:

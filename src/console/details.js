@@ -1,9 +1,9 @@
-// The details of a table, a view, a file or an answer (ADR-034, round 29), and a table's profile:
-// loaded the first time something is picked, not with the page. What they use of the shell comes
-// through `R.helpers`.
-import { h, count, bytes, utc, ago, icon, typeMark, sqlType, fileSql, S, R, rows, ident, toast, numeric, moreStyle } from './core.js';
+// The details of a table, a view, a file or an answer (ADR-034, round 29), and a data profile (a
+// table's, an answer's): loaded the first time something is picked, not with the page. What they
+// use of the shell comes through `R.helpers`.
+import { h, count, bytes, utc, ago, icon, typeMark, sqlType, fileSql, S, R, run, rows, ident, toast, numeric, moreStyle } from './core.js';
 import { highlighted } from './editor.js';
-import { statView, spread, summarize } from './grid.js';
+import { spread, summarize } from './grid.js';
 import { versions, openNotebook } from './notebook.js';
 import { iconOf, kindOf, download } from './files.js';
 
@@ -11,11 +11,29 @@ await moreStyle();
 
 const H = R.helpers, { KIND, addDoc, closeDoc, query, act, facts, head, openFile } = H;
 
-/** A table's columns profiled where it is: one pass for every column's counts and range, then a
- * histogram or the commonest values of each (at most 24 columns). */
+/** A column's summary as a line of numbers and a histogram (or its most common values). */
+export function statView(s) {
+  const pct = n => s.n ? `${(100 * n / s.n).toFixed(n && n < s.n / 100 ? 1 : 0)}%` : '0%';
+  const val = v => { const x = typeof v === 'object' ? JSON.stringify(v) : String(v); return x.length > 28 ? x.slice(0, 27) + '…' : x; };
+  const kids = [h('div', { class: 'nums' }, h('span', {}, `${pct(s.nulls)} null`), h('span', {}, `${s.exact ? '' : '≈ '}${count(s.distinct)} distinct`), s.min != null ? h('span', {}, `${val(s.min)} … ${val(s.max)}`) : null)];
+  if (s.hist) {
+    const top = Math.max(...s.hist, 1), w = 12, g = 2;
+    kids.push(h('div', { html: `<svg width="100%" height="30" preserveAspectRatio="none" viewBox="0 0 ${s.hist.length * (w + g)} 30" role="img" aria-label="histogram">${s.hist.map((c, i) => `<rect x="${i * (w + g)}" y="${30 - Math.max(c ? 2 : 0, 30 * c / top)}" width="${w}" height="${Math.max(c ? 2 : 0, 30 * c / top)}" rx="1.5" fill="var(--accent)" opacity=".75"><title>${count(c)}</title></rect>`).join('')}</svg>` }));
+  } else if (s.top?.length) {
+    const top = s.top[0].n;
+    kids.push(h('div', { class: 'bars' }, s.top.flatMap(t => [h('span', { class: 'v', title: t.v }, t.v), h('span', {}, h('div', { class: 'b', style: `width:${Math.max(4, 100 * t.n / top)}%` })), h('span', { class: 'n' }, count(t.n))])));
+  }
+  return kids;
+}
+
+/** A data profile where the rows are (`from`: a table, or an answer's statement in brackets), of
+ * `cols` (`[{ n, d }]`): one pass for every column's counts and range, then a histogram or the
+ * commonest values of each (at most 24 columns), each shown in its box's `.ps` as it comes. */
 const iso = v => typeof v === 'string' ? v.replace(/^(\d{4}-\d\d-\d\d)T(\d)/, '$1 $2') : v; // (a time as the grid shows it: a space, not a T)
-export async function profile(t, boxes, btn) {
-  const cols = t.columns.slice(0, 24), q = ident, simple = c => !/^(List|LargeList|FixedSizeList|Struct|Map|Binary|LargeBinary|BinaryView)|\[\]$/.test(c.d);
+export async function profile(from, all, boxes, btn, params) {
+  const cols = all.slice(0, 24), q = ident, simple = c => !/^(List|LargeList|FixedSizeList|Struct|Map|Binary|LargeBinary|BinaryView)|\[\]$/.test(c.d), label = btn.lastChild.textContent;
+  const rows = async sql => { const r = await run(sql, undefined, params); return r.kind === 'rows' ? r.rows.map(a => Object.fromEntries(r.columns.map((c, i) => [c.name, a[i]]))) : []; };
+  const t = { q: from };
   btn.disabled = true; btn.lastChild.textContent = 'Profiling…';
   try {
     const distinct = c => /^Float/.test(c.d) ? `CAST(${q(c.n)} AS VARCHAR)` : q(c.n); // (DataFusion's approx_distinct takes no floats)
@@ -46,7 +64,19 @@ export async function profile(t, boxes, btn) {
     };
     await Promise.all([one(), one(), one()]);
   } catch (e) { toast('Could not profile it: ' + e.message, true); }
-  btn.disabled = false; btn.lastChild.textContent = 'Profile';
+  btn.disabled = false; btn.lastChild.textContent = label;
+}
+/** An answer's data profile (its Data profile view): each column's NULLs, distinct values, range and
+ * spread, of the rows here; **Profile every row** reads them all, the statement run again. */
+export function dataProfile(r) {
+  const times = r.columns.map(c => /^Timestamp/.test(c.type || '')), paged = r.total > r.rows.length;
+  const boxes = r.columns.map((c, k) => {
+    const s = summarize(r.rows.map(row => times[k] && row[k] != null ? String(row[k]).replace(/^(\d{4}-\d\d-\d\d)T/, '$1 ') : row[k]), c.type), [nums, graph] = statView(s);
+    return h('div', { class: 'dp-row', 'data-col': c.name }, h('div', { class: 'dp-c' }, typeMark(c.type), h('span', { class: 'nm', title: c.name }, c.name), h('span', { class: 'ty' }, sqlType(c.type))), h('div', { class: 'ps' }, nums, graph || h('div')));
+  });
+  const all = r.sql ? h('button', { class: 'btn small', title: 'Every row of the answer, counted on the node (its statement runs again)', onclick: () => { note.textContent = `Of all ${count(r.total)} rows`; profile(`(\n${r.sql.replace(/[\s;]+$/, '')}\n) AS q`, r.columns.map(c => ({ n: c.name, d: c.type })), boxes, all, r.params); } }, icon('play'), 'Profile every row') : null;
+  const note = h('span', { class: 'muted' }, `Of the ${count(r.rows.length)} row${r.rows.length === 1 ? '' : 's'} ${paged ? 'on this page' : 'here'}`);
+  return h('div', { class: 'dprof' }, h('div', { class: 'cbar' }, note, h('span', { class: 'grow' }), paged ? all : null), ...boxes);
 }
 
 export function objectDetail(t) {
@@ -59,7 +89,7 @@ export function objectDetail(t) {
     return h('div', { class: 'pc', 'data-col': c.n }, h('div', { class: 'line1' }, typeMark(c.d), h('span', { class: 'nm' }, c.n), keyed.has(c.n) ? icon('key', 'kk') : null, h('span', { class: 'ty' }, sqlType(c.d))),
       flags.length ? h('div', { class: 'sub' }, flags.join(' · ')) : null, h('div', { class: 'ps' }));
   });
-  const profileBtn = act('chart', 'Profile', 'Each column: nulls, distinct values, range and spread (reads the whole table)', () => profile(t, cols, profileBtn));
+  const profileBtn = act('columns', 'Data profile', 'Each column: NULLs, distinct values, range and spread (reads the whole table)', () => profile(t.q, t.columns, cols, profileBtn));
   return [head(ic, t.t, `${word} · ${t.c}.${t.s}`, 'k-table'),
     h('div', { class: 'acts2' }, act('play', 'Preview', 'Its first rows (or double-click it)', () => query(`SELECT * FROM ${t.q} LIMIT 100`)), profileBtn, act('copy', 'Copy name', `Copy ${t.q}`, () => navigator.clipboard?.writeText(t.q).then(() => toast(`Copied ${t.q}`)))),
     facts([['Rows', counted], ['Columns', String(t.columns.length)], ['Key', o.key], ['Partitioned by', o.partition], ['Clustered by', o.cluster],

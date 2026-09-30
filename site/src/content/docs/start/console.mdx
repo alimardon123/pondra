@@ -127,7 +127,11 @@ deletes them all, the marker too.
 ![A SQL file in a tab: the editor with line numbers, and its results below, in the grid.](../../../assets/console-sql-file.png)
 
 **Run** (**Ctrl+Enter**) runs what is selected, or else the whole file. Its **▾** has **Run
-selection**, **Run file**, **Format file**, **Format selection**, **Run as a job** and **Schedule…**.
+selection**, **Run file**, **Format file**, **Format selection**, **Create as table or view…**,
+**Run as a job** and **Schedule…**; a right-click in the editor has them too, and **Save as…**.
+**Create as** makes the statement at the caret (or the selection) a table (its rows as they are now),
+a view (its query, run when read) or a materialized view (kept up to date as its tables change),
+showing the `CREATE … AS` it runs; **Open in a new tab** gives you that SQL to change first.
 
 - **Each statement gets an answer.** They run in order in the page's session, and stop at the first
   that fails. Above the results, a chip per statement (`1 done`, `2 5 rows`, `3 failed`) picks the
@@ -145,9 +149,13 @@ selection**, **Run file**, **Format file**, **Format selection**, **Run as a job
   picture or an SVG drawing.
 - **Plan** draws the statement's plan as a graph: each step (a scan, a filter, a join, an
   aggregate) above the steps it reads from, and a dashed box where rows move between cores, or
-  between nodes when a query is spread. **Text** shows `EXPLAIN` as it is. **Profile** runs the
-  statement with `EXPLAIN ANALYZE` (it does run it) and puts each step's rows and time on it, the
-  costliest marked in red, so you see where the time goes.
+  between nodes when a query is spread. **Text** shows `EXPLAIN` as it is. **Query profile** runs
+  the statement with `EXPLAIN ANALYZE` (it does run it) and puts each step's rows and time on it,
+  the costliest marked in red, so you see where the time goes.
+- **Data profile** summarizes each column of the answer: its share of NULLs, its distinct values, its
+  least and greatest value, and a histogram or its commonest values, from the rows shown; **Profile
+  every row** runs it over the whole answer when there are more pages. (Two words, two things: a
+  *data* profile is about the rows, a *query* profile about the time the query took.)
 - **Copy** (at the right of the results' bar) copies the rows, or the selection, tab-separated with
   the headers; its **▾** has the other forms: without the headers, CSV, JSON, a Markdown table, SQL
   `VALUES` rows, a SQL list for `IN (…)`, or the columns' names. **Download** runs the statement
@@ -155,8 +163,8 @@ selection**, **Run file**, **Format file**, **Format selection**, **Run as a job
   Parquet or Excel (`.xlsx`).
 - The results sit below the editor or at its right (the button at the right of their bar); drag the
   line between them. In a narrow window, the results give way to keep their buttons in reach.
-- **Right-click** in the editor for cut, copy, paste, select all, comment the lines, run, **Format
-  file** and **Format selection**: the SQL words in capitals and each clause on its own line, strings,
+- **Right-click** in the editor for cut, copy, paste, select all, comment the lines, the Run ▾'s
+  items (above), **Format file** and **Format selection**: the SQL words in capitals and each clause on its own line, strings,
   names and comments as you wrote them. **Shift+Alt+F** formats the selection, or with nothing
   selected the whole file. Anything it can't format stays as it was.
 
@@ -234,7 +242,9 @@ Every answer (a cell's, a SQL file's) and every data file is shown in the same g
 - **Sorting:** the small arrow in a header sorts by it (again: the other way).
 - **Pages:** an answer of more than 10,000 rows comes a page at a time. Below it, `10,001–20,000 of
   200,000` says which rows show, and **‹ 1 2 3 … 20 ›** turns the pages (**…** asks for a page;
-  **Alt+Page Down** and **Alt+Page Up** in the grid). The node keeps the answer a while
+  **Alt+Page Down** and **Alt+Page Up** in the grid). **10,000 a page ▾** changes how many (100 to
+  50,000), for this answer and those after it; so does **Settings → Editor and results → Rows a
+  page**. The node keeps the answer a while
   (`PONDRA_PAGES_MB`, 256 MB in all, for 20 minutes after it was last read), so a page is the same
   rows, in the same order, without running the query again; after that, turning a page runs it again
   for that page. Sorting and filtering are of the page shown.
@@ -264,14 +274,14 @@ ORDER BY total DESC;
   file). **Copy ▾** copies the rows shown in any of the forms a SQL file offers, and **Download ▾**
   saves them as CSV, TSV or JSON; a cell that is one query can also download every row (it runs
   again on the node).
-- **Chart** and **Plan** below the answer are a SQL file's: a chart of the rows, and the plan as a
-  graph with its **Profile**. The one open, and the chart's settings, are kept with the notebook, so
-  it opens with its chart. **Profile** summarizes every column in Details.
+- **Chart**, **Data profile** and **Plan** below the answer are a SQL file's: a chart of the rows,
+  each column summarized, and the plan as a graph with its **Query profile**. The one open, and the
+  chart's settings, are kept with the notebook, so it opens with its chart.
 - Decimals keep their digits (`1.50`), and integers too big for JavaScript arrive as text, so what
   you see is exactly what the lake holds.
 
 A long answer scrolls smoothly however many rows it has: the page draws only the rows in sight.
-Click a column's header and the details panel summarizes that column; **Profile** summarizes them all.
+Click a column's header and the details panel summarizes that column; **Data profile** summarizes them all.
 
 ## The lake, on the left
 
@@ -282,6 +292,22 @@ Click a column's header and the details panel summarizes that column; **Profile*
 - **Click** a table or a view to see its details on the right. **Double-click** it for its first
   100 rows: in a new cell when a notebook is in front, else in a new SQL tab. Click a column to put
   its name where you are typing.
+- **Right-click** anything for what can be done with it, each as the SQL it runs (a change that
+  can't be undone asks first):
+  - a table, a view or a materialized view: **Preview** (in SQL or Python), **Details and data
+    profile**, **Watch it live**, **Script as…**, **Insert rows…**, **Download every row…**, **As a
+    Kafka topic…**, **Add a column…**, **Rename…**, **Copy the name** (or as Python), **Truncate…**
+    and **Drop…**. **Script as** shows its `SELECT`, `INSERT`, upsert, `UPDATE`, `DELETE`, `MERGE`,
+    loading a file, exporting, `CREATE` (from the catalog: its columns, key, partitioning, options)
+    and `DROP`, each in SQL or in Python (`db.table("t")`, `db.sql(…)`), to open in a tab or copy;
+  - a column: its values counted, its range and NULLs, **Rename…**, **Change its type…**, **Drop…**;
+  - a schema: a new table, view, materialized view or external table in it (a template in a new
+    tab), **Drop…**;
+  - the lake: a new schema or table, **Attach a lake or catalog…**, a new database (a server's),
+    **Checkpoint**, **Refresh**, and for an attached one **Detach…**;
+  - **Functions**, **Procedures**, **Schedules** and **Secrets**, listed under the lake: each one's
+    definition, use or call, start as a job, schedule, and drop; a secret's values are never shown,
+    only replaced.
 - **Workspace** lists the lake's own files (`PUT /files/…`, `files()`) by folder, and your
   notebooks under `notebooks`, with the headings of the one in front as its outline. A new file not
   saved yet is listed too, with the dot. Whoever may read the lake may read its files, from SQL too.
@@ -294,7 +320,7 @@ The panel on the right (its button is at the top right) shows what you picked:
 |---|---|
 | A table | rows, columns, key, partitioning, clustering, the formats it is published in, and its size in files; each column with its type, `NOT NULL` and default |
 | A view | its definition, and its columns |
-| **Profile** (a table's or a view's) | each column's share of NULLs, its distinct values (approximate), its least and greatest value, and a histogram (numbers, dates, times) or its five commonest values. It reads the whole table: the numbers are the table's, not a sample's |
+| **Data profile** (a table's or a view's) | each column's share of NULLs, its distinct values (approximate), its least and greatest value, and a histogram (numbers, dates, times) or its five commonest values. It reads the whole table: the numbers are the table's, not a sample's |
 | A column of an answer | the same, from the rows the answer holds |
 | A file | its size, when it was written, and how SQL reads it |
 | Nothing | the lake: its tables, views, rows and size, and its cluster |
@@ -404,12 +430,18 @@ one to go to its cell. A `.md` file's **Preview** draws it the same way, its pat
 
 ## A cell's menu
 
+Point at the space between two cells (or above the first) for **+ SQL**, **+ Python** and **+
+Markdown**: each adds a cell there. **A** and **B** add one above or below the cell picked, and so
+do its **⋯**'s **Add a cell above** and **Add a cell below**.
+
 The kind at a cell's top left (**SQL ▾**) makes it SQL, Python or Markdown, and back again. The **⋯** at
 its top right (it shows when you point at the cell) runs the cells above it, or this one and those
 below; hides its output (**O**: its code stays, and a click on the output brings it back); clears
 its output; and deletes it. A right-click in its code has cut, copy, paste, comment, **Run cell**,
-**Format cell** and **Format selection** (**Shift+Alt+F**: SQL here, Python by the node's ruff or
-black, as in files).
+**Run the cells above**, **Run this and the cells below**, **Format cell** and **Format selection**
+(**Shift+Alt+F**: SQL here, Python by the node's ruff or black, as in files), a SQL cell's **Create
+as table or view…**, and **Make it Python** (or **Make it SQL**): the same query either way, `SELECT
+…` becoming `db.sql("""SELECT …""")` and back, so any cell moves between the two.
 The notebook's own **⋯** (in its toolbar) lists its versions, downloads it as `.ipynb` and clears
 every output. **Ctrl+K** finds every command: a new notebook, file or folder, **Upload a file…**,
 restarting or choosing Python, the token, the keys.
