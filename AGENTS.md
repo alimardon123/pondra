@@ -26,6 +26,15 @@ The owner's design principles, which every change must respect:
    Spark and Flink. No feature may slow a cluster down, add a single node everything depends on,
    or cost memory when unused; the cluster bench (3 and 6 nodes) runs every round and must hold or
    improve.
+7. **Within the bucket's limits at any size** (the owner, 2026-09-30: "at PB scale we should not
+   hit rate limits of S3"). Nothing may count on a bucket taking more requests than it allows:
+   - fan-outs are bounded (round 29 puts them all through one request budget per node);
+   - keys that many writers add start with a random part, not a time or a counter;
+   - nothing lists a whole table or the bucket on a schedule;
+   - no key is written more than once a second.
+
+   Round 29 builds the budget and fixes what breaks these today: log segments named by time,
+   the hourly orphan sweep's full listing, and the inbox bell (`docs/roadmap.md`, C5).
 
 ## Layout
 

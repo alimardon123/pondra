@@ -258,6 +258,78 @@ a list of URLs? If it can, that gives a browser read path at no cost.
 | C2 | TPC-H SF100 against Spark on the same VMs | The petabyte road starts at 100 GB | M–L | Pondra vs Spark, like for like |
 | C3 | Nexmark against Flink (the standard streaming benchmark) | Round 16 made streaming Flink-like; this measures it | M | Throughput and latency, query by query, both engines |
 | C4 | A 24-hour soak on R2: steady ingest, views, tiering, failovers | Leaks and slow drifts show only over time | M | Memory flat, log drained, 0 lost, 0 duplicated |
+| C5 | Fast cold starts, within the bucket's limits at any size (the owner, 2026-09-30: "at PB scale we should not hit rate limits of S3"): the start's requests overlapped, one request budget per node, keys that spread, no scheduled whole-bucket listing (below) | A cold node takes 6.5 to 8 s to serve, its requests one after another; and at petabytes every unbounded fan-out, time-ordered key or full listing meets the store's limits | M | Below |
+
+**C5 in detail** (measured 2026-09-30 with `tools/cold_trace.sh`, `logs/round29/cold-before.txt`).
+
+The store's limits:
+
+- **S3:** at least 3,500 writes and 5,500 reads a second per partitioned prefix. It splits a busy
+  prefix by itself, gradually, answering 503 Slow Down meanwhile.
+- **GCS:** about 1,000 writes and 5,000 reads a second per bucket at first. Grow no faster than
+  double every 20 minutes, and avoid names in time order.
+- **Azure:** 20,000 to 40,000 requests a second per account, and 503 Server Busy above that.
+- **R2:** one write a second to the same key; more gets 429.
+
+Where Pondra stands:
+
+- **The cold start is short on requests but slow.** On the simulator at the near R2 bucket's
+  latency, a node serves after 6.5 to 8 s. It sends about 45 requests on a new lake and 80 on an
+  existing one, nearly all one after another:
+  - up to 1.3 s is the lease (three listings, then its writes);
+  - 5 to 7 s is SlateDB opening the catalog. The writer fences, then the compactor starts, and
+    every manifest or compaction write is followed by a read of SlateDB's GC boundary. All of it
+    happens before the node serves.
+
+  So overlapping the start sends no more requests. It only stops them waiting on each other.
+- **Fan-outs pick their own width.** Deletes go 16 at a time and maintenance 4. A few places send
+  one request per file at once:
+  - unpublishing a format's folder;
+  - discarding a refused commit's files;
+  - writing a table's manifests.
+
+  object_store retries 429 and 5xx with jittered backoff (10 tries within 3 minutes), but each
+  request retries on its own, so a storm across nodes keeps its load.
+- **Log segments are named by time** (`log/<ms>-<uuid>.seg`). Every node's flushes land at the
+  same end of the key range, which is the pattern S3 and GCS warn against. Data files are already
+  spread (`data/<table>/<uuid>.parquet`).
+- **The hourly orphan sweep lists all of `log/` and `data/` and reads every manifest.** At 100
+  million files that is 100,000 LIST calls in one stream: hours of work at R2's latency, started
+  every hour.
+- **One key is written by many writers:** `inbox/bell`, touched by every writer that reaches the
+  bucket but not the leader (the bucket inbox). On R2, many at once get 429s.
+- **Queries of the lake's tables never list the bucket;** their files come from the catalog and
+  the manifests. That stays a rule.
+
+The plan (round 29):
+
+1. **Serve as soon as the catalog is open for writing.** The compactor and the other background
+   work start after, and steps that don't depend on each other overlap: the lease's listing
+   with the catalog's check, and a follower's reader with its lease. Check whether a newer SlateDB
+   reads the GC boundary less. The target is under a third of today's time.
+2. **One request budget per node and bucket, in the HTTP layer** (object_store's HTTP connector),
+   so it sees every attempt, retries included. It caps the requests in flight, halves the cap on
+   a 503 or 429, and grows it back by one per round of successes: AIMD, as TCP and the AWS SDK's
+   adaptive retries do. Every fan-out goes through it, so code can fan out freely and the node
+   still backs off within a second of the store asking.
+3. **Keys with a random first part** wherever many writers add keys: log segments become
+   `log/<uuid>.seg`, with their time kept in the catalog, as it already is. Old names still read,
+   since the catalog holds each path.
+4. **No scheduled whole-bucket listing.** The orphan sweep becomes incremental. Either writers
+   record what they are about to write, so orphans are found without listing, or the sweep lists
+   one table's folder at a time, each at most daily. The ADR picks one.
+5. **No key written by many writers faster than once a second.** A 429 on the bell means it just
+   rang, so it counts as rung, with no retry.
+
+Proof:
+
+- `sim_r2.py` answers 503 above a set rate per prefix, and 429 above one write a second per key.
+- With the rate set low (200 writes a second), six nodes start at once, a 50,000-file table is
+  dropped and three nodes scan a big table. Every statement succeeds, and the node backs off
+  within a second.
+- The cold start is timed on the simulator and on the near R2 bucket, against today's 6.5 to 8 s
+  to serve and 14 s to a new database's first write. The requests per statement (`GET /metrics`) do
+  not grow.
 
 ### D. Correctness you can trust
 
@@ -375,7 +447,7 @@ simulated R2 and real R2, an ADR, and a bundle.
 | 26+ ✓ | The workspace (done: ADR-033, moved up by the owner) | J2 | `.sql`, `.py` and notebook files of the lake's run with parameters from every door (`CALL run(…)`), as jobs and on schedules, each run logged by the file's version |
 | 27 ✓ | Anyone's compute, phase 1 (done: ADR-029) | G9: appends as written, the id limit | other engines' appends cost the node only its footers and a commit (a million rows: 0.01 s of CPU against 0.24 s copied); layout published for writers; tables made, renamed and dropped through the catalog; row ids and log places that can't wrap |
 | 28 (begun) | Anyone's compute, phase 2 (ADR-029; copy-on-write changes done) | G9: changes as written, and what phase 1 moved on | Spark's and PyIceberg's `DELETE`, `UPDATE`, `MERGE` and overwrites on Pondra's tables; deletes published as positions; keyed tables published every tier round; followers fed from the files in one commit; `/watch`, the change feed and Kafka topics carrying file commits |
-| 29 | Safe to share | E3, G6 | TLS, mutual TLS between nodes, users and grants down to a table, an audit log, quotas; Postgres and MySQL attached |
+| 29 | Safe to share | E3, G6, C5 | TLS, mutual TLS between nodes, users and grants down to a table, an audit log, quotas; Postgres and MySQL attached; a cold node serving in under a third of today's time, and no burst above what the bucket allows |
 | 30 | Production-ready SQL and frames | D1 to its end, D2, TPC-DS | sqllogictest passing (every exception named), TPC-DS's 99 queries == DuckDB, random queries 1 node == 3 == DuckDB, Polars and PySpark coverage published |
 | 31 | Scale, proven (an ADR of its own: burst) | C1 in one data centre, C2, C4, burst functions | 1 → 3 → 6 machines in one zone; SF100 against Spark; a 24-hour soak; serverless bursts for a big query |
 | 32 | In-process and in the browser | B1, B2, B4 | `pondra.open(…)` without a server; a lake queried in a web page (WebAssembly) |

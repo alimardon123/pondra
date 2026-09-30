@@ -1,0 +1,126 @@
+== new lake: serving after 6.53 s (46 requests); the statement 1.41 s (13 requests)
+  + 0.01 LIST /coldbucket prefix=lake%2Fcatalog%2F
+  + 0.33 LIST /coldbucket prefix=lake%2F
+  + 0.56 LIST /coldbucket prefix=lake%2Fcluster%2Fterm%2F
+  + 0.71 PUT  /coldbucket/lake/cluster/term/<n>
+  + 0.94 PUT  /coldbucket/lake/cluster/alive/<n>
+  + 1.31 PUT  /coldbucket/lake/cluster/alive/<n>
+  + 1.70 LIST /coldbucket prefix=lake%2Fcatalog%2Fmanifest%2F
+  + 1.86 PUT  /coldbucket/lake/catalog/manifest/<n>.manifest
+  + 2.12 GET  /coldbucket/lake/catalog/gc/manifest.boundary
+  + 2.32 GET  /coldbucket/lake/catalog/wal/<n>.sst
+  + 2.32 GET  /coldbucket/lake/catalog/wal/<n>.sst
+  + 2.32 GET  /coldbucket/lake/catalog/wal/<n>.sst
+  + 2.32 GET  /coldbucket/lake/catalog/wal/<n>.sst
+  + 2.32 GET  /coldbucket/lake/catalog/wal/<n>.sst
+  + 2.32 GET  /coldbucket/lake/catalog/wal/<n>.sst
+  + 2.32 GET  /coldbucket/lake/catalog/wal/<n>.sst
+  + 2.32 GET  /coldbucket/lake/catalog/wal/<n>.sst
+  + 2.64 PUT  /coldbucket/lake/catalog/manifest/<n>.manifest
+  + 2.91 GET  /coldbucket/lake/catalog/gc/manifest.boundary
+  + 3.11 PUT  /coldbucket/lake/catalog/wal/<n>.sst
+  + 3.46 GET  /coldbucket/lake/catalog/manifest/<n>.manifest
+  + 3.61 GET  /coldbucket/lake/catalog/gc/manifest.boundary
+  + 3.77 GET  /coldbucket/lake/catalog/manifest/<n>.manifest
+  + 3.86 GET  /coldbucket/lake/catalog/gc/manifest.boundary
+  + 4.06 PUT  /coldbucket/lake/catalog/manifest/<n>.manifest
+  + 4.32 GET  /coldbucket/lake/catalog/gc/manifest.boundary
+  + 4.43 LIST /coldbucket prefix=lake%2Fcatalog%2Fcompactions%2F
+  + 4.59 PUT  /coldbucket/lake/catalog/compactions/<n>.compactions
+  + 4.89 GET  /coldbucket/lake/catalog/gc/compactions.boundary
+  + 5.14 PUT  /coldbucket/lake/catalog/compactions/<n>.compactions
+  + 5.41 GET  /coldbucket/lake/catalog/gc/compactions.boundary
+  + 5.62 PUT  /coldbucket/lake/catalog/compactions/<n>.compactions
+  + 6.01 GET  /coldbucket/lake/catalog/gc/compactions.boundary
+  + 6.13 GET  /coldbucket/lake/catalog/compactions/<n>.compactions
+  + 6.13 GET  /coldbucket/lake/catalog/wal/<n>.sst
+  + 6.13 GET  /coldbucket/lake/catalog/compactions/<n>.compactions
+  + 6.13 GET  /coldbucket/lake/catalog/manifest/<n>.manifest
+  + 6.13 GET  /coldbucket/lake/catalog/manifest/<n>.manifest
+  + 6.21 GET  /coldbucket/lake/catalog/gc/manifest.boundary
+  + 6.25 GET  /coldbucket/lake/catalog/gc/compactions.boundary
+  + 6.28 GET  /coldbucket/lake/catalog/gc/compactions.boundary
+  + 6.38 GET  /coldbucket/lake/catalog/compactions/<n>.compactions
+  + 6.40 GET  /coldbucket/lake/catalog/manifest/<n>.manifest
+  + 6.50 GET  /coldbucket/lake/inbox/bell
+  + 6.51 GET  /coldbucket/lake/catalog/gc/manifest.boundary
+  + 6.52 GET  /coldbucket/lake/catalog/gc/manifest.boundary
+== existing lake: serving after 7.74 s (78 requests); the statement 1.32 s (14 requests)
+  + 0.01 LIST /coldbucket prefix=lake%2Fcatalog%2F
+  + 0.16 LIST /coldbucket prefix=lake%2Fcluster%2Fterm%2F
+  + 0.39 GET  /coldbucket/lake/cluster/term/<n>
+  + 0.64 PUT  /coldbucket/lake/cluster/alive/<n>
+  + 0.84 LIST /coldbucket prefix=lake%2Fcatalog%2Fmanifest%2F
+  + 1.03 GET  /coldbucket/lake/catalog/manifest/<n>.manifest
+  + 1.15 GET  /coldbucket/lake/catalog/gc/manifest.boundary
+  + 1.31 GET  /coldbucket/lake/catalog/wal/<n>.sst
+  + 1.31 GET  /coldbucket/lake/catalog/wal/<n>.sst
+  + 1.31 GET  /coldbucket/lake/catalog/wal/<n>.sst
+  + 1.31 GET  /coldbucket/lake/catalog/wal/<n>.sst
+  + 1.31 GET  /coldbucket/lake/catalog/wal/<n>.sst
+  + 1.31 GET  /coldbucket/lake/catalog/wal/<n>.sst
+  + 1.31 GET  /coldbucket/lake/catalog/wal/<n>.sst
+  + 1.31 GET  /coldbucket/lake/catalog/wal/<n>.sst
+  + 1.58 GET  /coldbucket/lake/catalog/wal/<n>.sst
+  + 1.84 GET  /coldbucket/lake/catalog/wal/<n>.sst
+  + 1.93 PUT  /coldbucket/lake/catalog/manifest/<n>.manifest
+  + 2.14 GET  /coldbucket/lake/catalog/gc/manifest.boundary
+  + 2.29 PUT  /coldbucket/lake/catalog/wal/<n>.sst
+  + 2.62 GET  /coldbucket/lake/catalog/manifest/<n>.manifest
+  + 2.73 GET  /coldbucket/lake/catalog/gc/manifest.boundary
+  + 2.92 GET  /coldbucket/lake/catalog/manifest/<n>.manifest
+  + 3.25 GET  /coldbucket/lake/catalog/gc/manifest.boundary
+  + 3.41 PUT  /coldbucket/lake/catalog/manifest/<n>.manifest
+  + 3.62 GET  /coldbucket/lake/catalog/gc/manifest.boundary
+  + 3.72 LIST /coldbucket prefix=lake%2Fcatalog%2Fcompactions%2F
+  + 3.86 GET  /coldbucket/lake/catalog/compactions/<n>.compactions
+  + 4.03 GET  /coldbucket/lake/catalog/gc/compactions.boundary
+  + 4.14 PUT  /coldbucket/lake/catalog/compactions/<n>.compactions
+  + 4.36 GET  /coldbucket/lake/catalog/gc/compactions.boundary
+  + 4.50 PUT  /coldbucket/lake/catalog/compactions/<n>.compactions
+  + 5.16 GET  /coldbucket/lake/catalog/gc/compactions.boundary
+  + 5.33 GET  /coldbucket/lake/catalog/wal/<n>.sst
+  + 5.33 GET  /coldbucket/lake/catalog/wal/<n>.sst
+  + 5.33 GET  /coldbucket/lake/catalog/wal/<n>.sst
+  + 5.33 GET  /coldbucket/lake/catalog/manifest/<n>.manifest
+  + 5.33 GET  /coldbucket/lake/catalog/wal/<n>.sst
+  + 5.33 GET  /coldbucket/lake/catalog/compactions/<n>.compactions
+  + 5.33 GET  /coldbucket/lake/catalog/compactions/<n>.compactions
+  + 5.33 GET  /coldbucket/lake/catalog/manifest/<n>.manifest
+  + 5.45 GET  /coldbucket/lake/catalog/gc/compactions.boundary
+  + 5.47 GET  /coldbucket/lake/catalog/gc/manifest.boundary
+  + 5.48 GET  /coldbucket/lake/catalog/wal/<n>.sst
+  + 5.50 GET  /coldbucket/lake/catalog/gc/manifest.boundary
+  + 5.53 GET  /coldbucket/lake/catalog/compactions/<n>.compactions
+  + 5.53 GET  /coldbucket/lake/catalog/gc/compactions.boundary
+  + 5.57 GET  /coldbucket/lake/catalog/wal/<n>.sst
+  + 5.60 GET  /coldbucket/lake/catalog/gc/compactions.boundary
+  + 5.63 GET  /coldbucket/lake/catalog/wal/<n>.sst
+  + 5.65 GET  /coldbucket/lake/catalog/wal/<n>.sst
+  + 5.69 GET  /coldbucket/lake/catalog/wal/<n>.sst
+  + 5.73 LIST /coldbucket prefix=lake%2Fcatalog%2Fmanifest%2F
+  + 5.75 GET  /coldbucket/lake/catalog/wal/<n>.sst
+  + 5.77 GET  /coldbucket/lake/catalog/manifest/<n>.manifest
+  + 5.79 GET  /coldbucket/lake/catalog/wal/<n>.sst
+  + 5.89 GET  /coldbucket/lake/catalog/wal/<n>.sst
+  + 5.90 GET  /coldbucket/lake/catalog/gc/manifest.boundary
+  + 5.91 GET  /coldbucket/lake/catalog/wal/<n>.sst
+  + 5.97 GET  /coldbucket/lake/catalog/manifest/<n>.manifest
+  + 6.00 GET  /coldbucket/lake/catalog/wal/<n>.sst
+  + 6.17 GET  /coldbucket/lake/catalog/manifest/<n>.manifest
+  + 6.30 GET  /coldbucket/lake/catalog/wal/<n>.sst
+  + 6.38 GET  /coldbucket/lake/catalog/gc/manifest.boundary
+  + 6.46 GET  /coldbucket/lake/catalog/wal/<n>.sst
+  + 6.60 GET  /coldbucket/lake/catalog/manifest/<n>.manifest
+  + 6.74 GET  /coldbucket/lake/catalog/wal/<n>.sst
+  + 6.78 GET  /coldbucket/lake/catalog/gc/manifest.boundary
+  + 6.86 LIST /coldbucket prefix=lake%2Fcatalog%2Fwal%2F
+  + 6.97 PUT  /coldbucket/lake/catalog/compacted/01M3RJBFV31EN1KN2P0Y5JM8CC.sst
+  + 7.06 GET  /coldbucket/lake/catalog/manifest/<n>.manifest
+  + 7.20 PUT  /coldbucket/lake/catalog/manifest/<n>.manifest
+  + 7.25 GET  /coldbucket/lake/catalog/gc/manifest.boundary
+  + 7.42 GET  /coldbucket/lake/catalog/manifest/<n>.manifest
+  + 7.57 GET  /coldbucket/lake/catalog/gc/manifest.boundary
+  + 7.58 GET  /coldbucket/lake/catalog/gc/manifest.boundary
+  + 7.71 GET  /coldbucket/lake/inbox/bell
+  + 7.71 PUT  /coldbucket/lake/catalog/wal/<n>.sst
