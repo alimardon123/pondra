@@ -1,7 +1,7 @@
 {
  "adopted": {
   "an append is the table's where it was written (no file copied), its rows with system columns from their lineage: ids distinct and in one run, one version, one time": true,
-  "it costs the node footers and a commit: under a quarter of a copy's CPU (0.13 s against 0.22 s for 200,000 rows)": true,
+  "it costs the node footers and a commit: under a quarter of a copy's CPU (0.01 s against 0.23 s for 1,000,000 rows)": true,
   "other engines read the rows as written: PyIceberg and delta-rs; a filter on them skips what it can": true,
   "spread over three nodes, the adopted rows and their ids == one node's": true,
   "UPDATE and DELETE on adopted rows: the row keeps its id": true,
@@ -13,8 +13,8 @@
  },
  "ok": true,
  "cpu_s": {
-  "adopted": 0.13,
-  "copied": 0.21999999999999997,
-  "rows": 200000
+  "adopted": 0.010000000000000009,
+  "copied": 0.23,
+  "rows": 1000000
  }
 }

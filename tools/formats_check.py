@@ -35,8 +35,8 @@ def session(root):
 def spark_commits(url):
     """Spark (Iceberg 1.10) writes to a Pondra table through Pondra's Iceberg REST catalog
     (`--commit`): SQL's INSERT and DataFrame.writeTo().append() (ADR-028), then a DELETE, an UPDATE
-    and a MERGE, copy-on-write (ADR-029 phase 2), and an ALTER TABLE, refused by name. Prints what
-    Spark read back after the appends and after the changes, and what it was told."""
+    and a MERGE, copy-on-write, and an ALTER TABLE … ADD COLUMN (ADR-029 phase 2). Prints what Spark
+    read back after the appends and after the changes, and what it was told."""
     os.environ["TZ"] = "UTC"
     time.tzset()
     from pyspark.sql import SparkSession
@@ -67,7 +67,7 @@ def spark_commits(url):
 def commits(con, spark):
     """Spark writes to Pondra's tables through its Iceberg REST catalog (`spark_commits`): appends,
     the rows the table's, each with its row id; a DELETE, an UPDATE and a MERGE (copy-on-write),
-    after which Pondra reads what Spark does; an ALTER TABLE from Spark refused by name."""
+    after which Pondra reads what Spark does; an ALTER TABLE … ADD COLUMN, Pondra's column too."""
     con.sql("CREATE TABLE spark_in (id BIGINT, name VARCHAR, ts TIMESTAMP) WITH (publish = 'iceberg')")
     run = subprocess.run([spark, os.path.abspath(__file__), "--commit", con.url], capture_output=True, text=True, env={**os.environ, "TZ": "UTC"}, timeout=1200)
     try:
@@ -80,11 +80,11 @@ def commits(con, spark):
     ok = want == theirs["rows"]
     same = [[r["id"], r.get("name"), plain(r.get("ts"))] for r in ours] == changed == theirs["changed"] and all(r.get("_row_id") is not None for r in ours) \
         and not theirs["delete"] and not theirs["update"] and not theirs["merge"]
-    refused = "ALTER TABLE" in theirs["alter"]
+    added = not theirs["alter"] and "x" in [c["column_name"] for c in con.sql("SELECT column_name FROM information_schema.columns WHERE table_name = 'spark_in'").rows()]
     print(json.dumps({"table": "Spark appends through Pondra's Iceberg REST catalog (INSERT, writeTo().append()): the table's rows, with row ids", "equal": ok, **({} if ok else {"ours": ours, "theirs": theirs})}, default=str), flush=True)
     print(json.dumps({"table": "…Spark's DELETE, UPDATE and MERGE (copy-on-write): Pondra reads what Spark does", "equal": same, **({} if same else {"ours": ours, "theirs": {k: v if isinstance(v, list) else v[:500] for k, v in theirs.items()}})}, default=str), flush=True)
-    print(json.dumps({"table": "…an ALTER TABLE from Spark: refused by name", "equal": refused, **({} if refused else {"alter": theirs["alter"][:500]})}), flush=True)
-    return {"commits:spark": ok, "commits:changes": same, "commits:refused": refused}
+    print(json.dumps({"table": "…an ALTER TABLE … ADD COLUMN from Spark: Pondra's table has the column", "equal": added, **({} if added else {"alter": theirs["alter"][:500]})}), flush=True)
+    return {"commits:spark": ok, "commits:changes": same, "commits:altered": added}
 
 
 def read_spark(tables):

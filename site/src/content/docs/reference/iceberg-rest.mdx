@@ -158,10 +158,12 @@ What a commit may contain:
 | `set-snapshot-ref` | only for `main`, and only as a branch that makes the snapshot `main` |
 | requirements | `assert-table-uuid`, `assert-ref-snapshot-id` (on `main`), `assert-current-schema-id`, `assert-default-spec-id`, `assert-default-sort-order-id`, `assert-last-assigned-field-id`, `assert-last-assigned-partition-id` |
 | data files | Parquet, under the table's `data/` folder: the ones the snapshots add, and the table's files they remove (copy-on-write) |
+| a schema change | `add-schema` and `set-current-schema` alone (with the name mapping's `set-properties`): each field added, renamed, widened or dropped is that `ALTER TABLE`, run as the caller |
 
 Everything else is refused with a `400 BadRequestException` that says why: delete files
-(merge-on-read), a snapshot that does `replace` (another engine's compaction), schema and property
-changes (`ALTER TABLE`), other branches and tags, a table that is keyed (`INSERT` into it with
+(merge-on-read), a snapshot that does `replace` (another engine's compaction), property changes
+(`ALTER TABLE … SET`), a schema change Pondra's `ALTER TABLE` can't make (a required column
+added, columns reordered, a narrower type, a changed key), other branches and tags, a table that is keyed (`INSERT` into it with
 Pondra), a change (not an append) to a table that views or tasks follow or that has a renamed
 column, files outside the table's folder, and any other update in a commit (`set-properties`,
 `add-schema` and the like).

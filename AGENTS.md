@@ -1013,6 +1013,12 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    rows in the log or changes not yet purged gets 409 once they are tiered, purged and published
    (`iceberg::up_to_date`). Refused by name: delete files (merge-on-read), `replace`, and changes to
    followed or renamed tables. `harness.py rewrites`, `formats_check.py --spark … --only commits`.
+158. **Another engine's schema change is `ALTER TABLE`** (`iceberg::schema_sql`): a commit of
+   `add-schema` and `set-current-schema` alone (the name mapping's `set-properties` taken and
+   dropped: Pondra publishes its own) is diffed by field id against the published schema into
+   DROP, RENAME, widening ALTER COLUMN TYPE and ADD COLUMN statements, run as the caller; a new
+   required column, a reorder, a changed key or a narrower type is refused before any runs.
+   `harness.py rewrites`, `formats_check.py --spark … --only commits` (Spark's ADD COLUMN).
 
 ## Tests: run these before and after any change
 
@@ -1142,11 +1148,11 @@ R2; round 12's are in `logs/round12/`, round 13's in `logs/round13/`, round 14's
 `logs/round14/`, round 15's in `logs/round15/`, round 16's in `logs/round16/`, round 17's in `logs/round17/`,
 round 18's in `logs/round18/`, round 19's in `logs/round19/`, round 20's in `logs/round20/`, round 21's in `logs/round21/`, round 22's in `logs/round22/`, round 23's in `logs/round23/`, round 24's in `logs/round24/`, round 25's in `logs/round25/` and round 26's in `logs/round26/`.
 
-**Round 28, in part (ADR-029 phase 2): other engines' copy-on-write changes.** Spark's `DELETE`,
-`UPDATE` and `MERGE` and PyIceberg's `delete` and `overwrite` through the catalog: files taken out
-and added in one commit, against the table as Pondra has it (invariant 157). The rest of phase 2
-(merge-on-read, positions published, keyed tables' upserts, schema changes, transactions,
-followers and the feed) is next.
+**Round 28, in part (ADR-029 phase 2): other engines' copy-on-write changes and schema changes.**
+Spark's `DELETE`, `UPDATE` and `MERGE` and PyIceberg's `delete` and `overwrite` through the
+catalog: files taken out and added in one commit, against the table as Pondra has it (invariant
+157); their schema changes as `ALTER TABLE` (invariant 158). The rest of phase 2 (merge-on-read,
+positions published, keyed tables' upserts, transactions, followers and the feed) is next.
 
 **Round 27 (ADR-029 phase 1): other engines' appends as written.** An append through the Iceberg
 catalog costs the node its files' footers and a commit, not a copy (a million rows: 0.01 s of its

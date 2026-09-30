@@ -207,8 +207,8 @@ stale one gets 409 and the writer retries on top. Engines make, rename and drop 
 catalog too, and follow the layout it publishes (partition spec, sort order, key). They change rows
 copy-on-write as well — Spark's `DELETE`, `UPDATE` and `MERGE`, PyIceberg's `delete` and `overwrite`
 — against the table as Pondra has it (a change made before rows still in the log were in its files
-gets 409 once they are). Schema changes, merge-on-read deletes and keyed tables stay with Pondra's
-SQL, and are refused by name.
+gets 409 once they are), and change its schema as `ALTER TABLE` can. Merge-on-read deletes and
+keyed tables stay with Pondra's SQL, and are refused by name.
 
 Pondra's own readers (nodes, `pondra sql`) see every write sooner. The local folder and the bucket
 use the same layout: see `docs/lake-format.md`.
@@ -472,9 +472,9 @@ bucket to its newest lakes.
   Clustering across files.
 - A write to two lakes is two commits, not one transaction.
 - Other engines append to append tables through the Iceberg REST catalog, change their rows
-  copy-on-write, and make, rename and drop tables there; merge-on-read deletes, schema changes,
-  another engine's compaction and writes to keyed tables are refused (next: ADR-029 phase 2's
-  rest). An append to a table that views or tasks follow is still copied (through the log), and
+  copy-on-write and their schemas as `ALTER TABLE` can, and make, rename and drop tables there;
+  merge-on-read deletes, another engine's compaction and writes to keyed tables are refused
+  (next: ADR-029 phase 2's rest). An append to a table that views or tasks follow is still copied (through the log), and
   so is one to a table with a renamed column, whose changes are refused; files recorded as
   written are read from Parquet, not the hot columns, until a merge rewrites them; and `/watch`,
   the change feed and Kafka topics carry the log's rows, not a file commit's (a bulk `INSERT`'s

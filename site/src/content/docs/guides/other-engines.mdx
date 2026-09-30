@@ -186,8 +186,8 @@ streaming tasks follow (they take its rows through the log), or to one with a re
 column (Delta readers match columns by name, and the table's files keep the names they were
 written under).
 
-**Refused:** schema changes (`ALTER TABLE`), writes to keyed tables, and another engine's
-compaction (Pondra merges its tables' files itself).
+**Refused:** writes to keyed tables, and another engine's compaction (Pondra merges its tables'
+files itself).
 
 ## Change rows from another engine
 
@@ -222,6 +222,11 @@ ann   2
 - **Refused by name:** a change to a table that views or tasks follow, or that has a renamed
   column (change those with Pondra's SQL), and delete files: merge-on-read, Spark's
   `write.delete.mode = merge-on-read`, isn't taken yet.
+
+**Schema changes** come through the catalog as `ALTER TABLE` does them (an admin's, when tokens are
+set): Spark's `ALTER TABLE … ADD COLUMN` and PyIceberg's `update_schema` add a column (at the end,
+optional), rename one, widen its type or drop it, and no file is rewritten. A required column added,
+columns reordered, a narrower type or a changed key are refused by name.
 
 ### Make a table through the catalog
 

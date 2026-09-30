@@ -1,5 +1,5 @@
-Commit failed due to a concurrent update, retrying (1/4) in 105 ms
-Commit failed due to a concurrent update, retrying (1/4) in 101 ms
+Commit failed due to a concurrent update, retrying (1/4) in 110 ms
+Commit failed due to a concurrent update, retrying (1/4) in 100 ms
 {
  "writes": {
   "PyIceberg appends through a follower: the rows are the table's own (row ids), its file where it wrote it, its snapshot found by its id": true,
@@ -8,7 +8,7 @@ Commit failed due to a concurrent update, retrying (1/4) in 101 ms
   "a view of the table follows (through the log), and so does its Delta copy": true,
   "an attached lake's table, through this lake's catalog: its leader records it": true,
   "Pondra itself appends to another Pondra's table through its catalog": true,
-  "refused by name: a schema change, a keyed table": true
+  "refused by name: a keyed table": true
  },
  "ok": true
 }

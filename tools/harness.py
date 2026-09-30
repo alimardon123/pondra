@@ -3575,8 +3575,8 @@ def writes():
     file recorded where it wrote it: ADR-029), and its snapshot is found under its id; two writers
     at once, one retrying on 409, each applied once; a commit sent twice applied once; a view and
     the Delta copy follow; an attached lake's table; Pondra itself writing to another Pondra's;
-    refused by name: a schema change, a keyed table, files outside the table's folder. (`adopted`:
-    what round 27 added; `rewrites`: round 28's deletes and overwrites.)"""
+    refused by name: a keyed table, files outside the table's folder. (`adopted`: what round 27
+    added; `rewrites`: round 28's deletes, overwrites and schema changes.)"""
     import deltalake, glob as g, http.server, pyarrow as pa
     from pyiceberg.catalog import load_catalog
     lake, other, third = new_lake(), new_lake(), new_lake()
@@ -3635,7 +3635,6 @@ def writes():
     q("CHECKPOINT")  # (a keyed table is published once compacted)
     ev = cat.load_table("default.events")
     refused = {
-        "a schema change": _raises_text(lambda: ev.update_schema().add_column("extra", __import__("pyiceberg.types").types.IntegerType()).commit()),
         "a keyed table": _raises_text(lambda: cat.load_table("default.kv").append(pa.table({"k": pa.array([1], pa.int64()), "v": ["x"]}, schema=pa.schema([pa.field("k", pa.int64(), nullable=False), ("v", pa.string())])))),
     }
     outside = None if A.s3 else f"{lake}/data/sales/stray.parquet"  # (in the lake, not in the table's data folder)
@@ -3643,7 +3642,7 @@ def writes():
         import pyarrow.parquet as pq
         pq.write_table(pa.table({"region": ["zz"], "amount": [9.0]}), outside)
         refused["files outside the table's folder"] = _raises_text(lambda: cat.load_table("default.sales").add_files([outside]))
-    said = {"a schema change": "ALTER TABLE", "a keyed table": "keyed table", "files outside the table's folder": "data folder"}
+    said = {"a keyed table": "keyed table", "files outside the table's folder": "data folder"}
     checks["refused by name: " + ", ".join(refused)] = all(said[k] in v for k, v in refused.items()) \
         and (outside is None or os.path.exists(outside)) and q("SELECT count(*) AS n FROM events WHERE id < 10") == [{"n": 2}]
     [x.kill() for x in (a, b, o, c)]
@@ -3835,9 +3834,11 @@ def rewrites():
     with a filter (a delete's snapshot and an append's, in one commit); the files taken out gone
     after --retain-secs; the stale rule: a row still in the log when the writer read the table
     gets it 409, and its DELETE, done again, takes that row too; refused by name: a table a view
-    follows, another engine's compaction (replace)."""
+    follows. Schema changes (PyIceberg's update_schema): a column added, renamed, widened and
+    dropped, each an ALTER TABLE; a required column added refused."""
     import deltalake, pyarrow as pa
     from pyiceberg.catalog import load_catalog
+    from pyiceberg.types import LongType, StringType
     lake = new_lake()
     a = Node(lake, A.port, tier_secs=600).start()  # (tiering far off: new rows wait in the log)
     b = Node(lake, A.port + 1, tier_secs=600).start()
@@ -3881,13 +3882,30 @@ def rewrites():
     followed = _raises_text(lambda: cat.load_table("default.s").delete("region = 'eu'"))
     checks["refused by name: a change to a table a view follows (its rows go through the log)"] = "views or tasks follow it" in followed \
         and q("SELECT count(*) AS n FROM s") == [{"n": 2}]
+    q("CREATE TABLE u (id INT, name VARCHAR) WITH (publish = 'iceberg')")
+    q("INSERT INTO u VALUES (1, 'a')")
+    q("CHECKPOINT")
+    until(lambda: _try(lambda: cat.load_table("default.u")) is not None, True, 30)
+    def change(f):
+        with cat.load_table("default.u").update_schema() as s:
+            f(s)
+    change(lambda s: s.add_column("score", LongType()))
+    added = q("SELECT id, name, score FROM u")
+    change(lambda s: s.rename_column("name", "label"))
+    change(lambda s: s.update_column("id", LongType()))
+    change(lambda s: s.delete_column("score"))
+    shape = q("SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 'u' ORDER BY ordinal_position")
+    required = _raises_text(lambda: change(lambda s: s.add_column("must", StringType(), required=True)))
+    checks["schema changes through the catalog: a column added, renamed, widened and dropped, each an ALTER TABLE; a required one refused"] = \
+        added == [{"id": 1, "name": "a"}] and [r["column_name"] for r in shape] == ["id", "label"] and "Int64" in shape[0]["data_type"] + str(q("SELECT arrow_typeof(id) AS t FROM u")) \
+        and bool(required) and [f.name for f in cat.load_table("default.u").schema().fields] == ["id", "label"]
     [x.kill() for x in (a, b)]
     ok = all(checks.values())
     print(json.dumps({"rewrites": checks, "ok": ok}, indent=1))
     if not ok:
-        print(json.dumps({"after": sorted(after)[:5], "theirs": theirs[:5], "delta": str(delta)[:200], "own_file": own_file, "gone": gone, "first": first[:300], "followed": followed[:300]}, default=str))
+        print(json.dumps({"after": sorted(after)[:5], "theirs": theirs[:5], "delta": str(delta)[:200], "own_file": own_file, "gone": gone, "first": first[:300], "followed": followed[:300], "added": added, "shape": shape, "required": required[:200]}, default=str))
         sys.exit(1)
-    return f"rewrites: other engines' copy-on-write DELETE and overwrite, the stale rule: all {len(checks)} checks pass"
+    return f"rewrites: other engines' copy-on-write DELETE and overwrite, the stale rule, schema changes: all {len(checks)} checks pass"
 
 
 def live():

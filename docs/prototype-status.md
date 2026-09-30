@@ -15,13 +15,14 @@ One Rust binary replaces the Kafka + Flink + Spark + metastore + ZooKeeper stack
 
 Start more copies on the same bucket to scale out. The only state is object storage. There's no JVM, no database server and no coordination service.
 
-**Round 28, in part, took other engines' copy-on-write changes** (ADR-029 phase 2's first step):
-Spark's `DELETE`, `UPDATE` and `MERGE` and PyIceberg's `delete` and `overwrite` through the catalog,
-files taken out and added in one commit; rows in untouched files keep their ids; a change made
-while rows waited in the log gets 409 once they are in the files, and its retry sees them. Tested:
-`harness.py rewrites` (6 checks), Spark 4 with Iceberg 1.10 (`formats_check.py --only commits`).
-The rest of phase 2 (merge-on-read, positions published, keyed upserts, schema changes,
-transactions, followers and the feed) is next.
+**Round 28, in part, took other engines' copy-on-write changes and schema changes** (ADR-029
+phase 2's first steps): Spark's `DELETE`, `UPDATE` and `MERGE` and PyIceberg's `delete` and
+`overwrite` through the catalog, files taken out and added in one commit; rows in untouched files
+keep their ids; a change made while rows waited in the log gets 409 once they are in the files,
+and its retry sees them. Schema changes (Spark's `ADD COLUMN`, PyIceberg's `update_schema`) are
+`ALTER TABLE`s. Tested: `harness.py rewrites` (7 checks), Spark 4 with Iceberg 1.10
+(`formats_check.py --only commits`). The rest of phase 2 (merge-on-read, positions published,
+keyed upserts, transactions, followers and the feed) is next.
 
 **Round 27 made other engines' appends cost Pondra a commit, not a copy** (ADR-029 phase 1):
 

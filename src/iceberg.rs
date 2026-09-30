@@ -565,6 +565,32 @@ async fn create(axum::extract::State(app): axum::extract::State<crate::server::A
     Err(refused(500, "ServiceUnavailableException", format!("{name} was made, and isn't published yet: load it again")))
 }
 
+/// An Iceberg field's type as Pondra's SQL says it.
+fn sql_type(t: &Value) -> Result<String> {
+    use anyhow::bail;
+    let prim = |t: &str| -> Result<String> {
+        Ok(match t {
+            "boolean" => "BOOLEAN".into(),
+            "int" => "INT".into(),
+            "long" => "BIGINT".into(),
+            "float" => "REAL".into(),
+            "double" => "DOUBLE".into(),
+            "date" => "DATE".into(),
+            "timestamp" => "TIMESTAMP".into(),
+            "timestamptz" => "TIMESTAMPTZ".into(),
+            "string" => "VARCHAR".into(),
+            "binary" => "BYTEA".into(),
+            t if t.starts_with("decimal(") => t.to_uppercase(),
+            t => bail!("an Iceberg {t} column: not one Pondra has (boolean, int, long, float, double, date, timestamp, timestamptz, string, binary, decimal, and lists of them)"),
+        })
+    };
+    match t {
+        Value::String(t) => prim(t),
+        t if t["type"] == "list" && t["element"].is_string() => Ok(format!("{}[]", prim(t["element"].as_str().unwrap_or_default())?)),
+        t => bail!("an Iceberg {} column: not one Pondra has (lists of plain values are)", t["type"]),
+    }
+}
+
 /// A catalog's table request as `CREATE TABLE` (`create`).
 fn create_sql(name: &str, asked: &Value) -> Result<String> {
     use anyhow::bail;
@@ -572,29 +598,6 @@ fn create_sql(name: &str, asked: &Value) -> Result<String> {
     let fields = asked["schema"]["fields"].as_array().context("a table without its schema's fields")?;
     let q = |n: &str| format!("\"{}\"", n.replace('"', "\"\""));
     let by_id = |id: &Value| fields.iter().find(|f| f["id"] == *id).and_then(|f| f["name"].as_str()).with_context(|| format!("no field {id} in the schema"));
-    let sql_type = |t: &Value| -> Result<String> {
-        let prim = |t: &str| -> Result<String> {
-            Ok(match t {
-                "boolean" => "BOOLEAN".into(),
-                "int" => "INT".into(),
-                "long" => "BIGINT".into(),
-                "float" => "REAL".into(),
-                "double" => "DOUBLE".into(),
-                "date" => "DATE".into(),
-                "timestamp" => "TIMESTAMP".into(),
-                "timestamptz" => "TIMESTAMPTZ".into(),
-                "string" => "VARCHAR".into(),
-                "binary" => "BYTEA".into(),
-                t if t.starts_with("decimal(") => t.to_uppercase(),
-                t => bail!("an Iceberg {t} column: not one Pondra has (boolean, int, long, float, double, date, timestamp, timestamptz, string, binary, decimal, and lists of them)"),
-            })
-        };
-        match t {
-            Value::String(t) => prim(t),
-            t if t["type"] == "list" && t["element"].is_string() => Ok(format!("{}[]", prim(t["element"].as_str().unwrap_or_default())?)),
-            t => bail!("an Iceberg {} column: not one Pondra has (lists of plain values are)", t["type"]),
-        }
-    };
     let mut columns = vec![];
     for f in fields {
         let n = f["name"].as_str().context("a field without its name")?;
@@ -632,6 +635,63 @@ fn create_sql(name: &str, asked: &Value) -> Result<String> {
         options.push(format!("cluster_by = '{}'", cols.join(",")));
     }
     Ok(format!("CREATE TABLE {name} ({}) WITH ({})", columns.join(", "), options.join(", ")))
+}
+
+/// A commit that changes the schema (`add-schema` and `set-current-schema`, no snapshot: PyIceberg's
+/// `update_schema`, Spark's `ALTER TABLE`) as the `ALTER TABLE` statements it comes to (ADR-029
+/// §8), by field id against the current schema: a field gone is dropped, one renamed renamed, one
+/// of a wider type widened, a new one (optional, at the end) added. What Pondra's tables can't
+/// take (a new required column, a key changed, columns reordered, a type narrowed) is refused by
+/// name before anything is changed.
+fn schema_sql(name: &str, meta: &Value, asked: &Value) -> Result<Vec<String>> {
+    use anyhow::ensure;
+    let updates = asked["updates"].as_array().context("a commit without its updates")?;
+    let mut new = None;
+    for u in updates {
+        match u["action"].as_str().unwrap_or_default() {
+            "add-schema" if new.is_none() => new = Some(&u["schema"]),
+            "set-current-schema" => {}
+            // (the name mapping, as the writer made it for the new schema: Pondra publishes its own)
+            "set-properties" if u["updates"].as_object().is_some_and(|p| p.keys().all(|k| k == "schema.name-mapping.default")) => {}
+            a => anyhow::bail!("{a} with a schema change: a commit changes the schema alone (a table's properties are Pondra's: ALTER TABLE … SET)"),
+        }
+    }
+    let new = new.context("a schema change without its schema")?;
+    let id = meta["current-schema-id"].clone();
+    let old = meta["schemas"].as_array().into_iter().flatten().find(|s| s["schema-id"] == id).context("the table's current schema")?;
+    let by_id = |s: &Value| s["fields"].as_array().into_iter().flatten().map(|f| (f["id"].as_i64().unwrap_or(-1), f.clone())).collect::<Vec<_>>();
+    let (was, now) = (by_id(old), by_id(new));
+    let keys = |s: &Value| s["identifier-field-ids"].as_array().cloned().unwrap_or_default();
+    ensure!(keys(old) == keys(new), "a key changed: a Pondra table keeps its key");
+    let kept: Vec<i64> = now.iter().map(|(i, _)| *i).filter(|i| was.iter().any(|(w, _)| w == i)).collect();
+    let before: Vec<i64> = was.iter().map(|(i, _)| *i).filter(|i| kept.contains(i)).collect();
+    let last_old = now.iter().rposition(|(i, _)| kept.contains(i)).map_or(0, |p| p + 1);
+    ensure!(kept == before && now[last_old..].iter().all(|(i, _)| !kept.contains(i)), "columns reordered: a Pondra table's columns keep their order, and a new one goes last");
+    let q = |n: &Value| format!("\"{}\"", n.as_str().unwrap_or_default().replace('"', "\"\""));
+    let mut out = vec![];
+    for (i, f) in &was {
+        if !now.iter().any(|(n, _)| n == i) {
+            out.push(format!("ALTER TABLE {name} DROP COLUMN {}", q(&f["name"])));
+        }
+    }
+    for (i, f) in &now {
+        match was.iter().find(|(w, _)| w == i).map(|(_, w)| w) {
+            Some(w) => {
+                ensure!(w["required"] == f["required"], "{}: required or optional, a column stays as it was", f["name"]);
+                if w["name"] != f["name"] {
+                    out.push(format!("ALTER TABLE {name} RENAME COLUMN {} TO {}", q(&w["name"]), q(&f["name"])));
+                }
+                if w["type"] != f["type"] {
+                    out.push(format!("ALTER TABLE {name} ALTER COLUMN {} TYPE {}", q(&f["name"]), sql_type(&f["type"])?));
+                }
+            }
+            None => {
+                ensure!(!f["required"].as_bool().unwrap_or(false), "{}: a column added can't be required (NOT NULL): the rows already there have no value for it", f["name"]);
+                out.push(format!("ALTER TABLE {name} ADD COLUMN {} {}", q(&f["name"]), sql_type(&f["type"])?));
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// `DELETE /v1/namespaces/{ns}/tables/{table}`: `DROP TABLE`, its files with it (the catalog's
@@ -736,11 +796,27 @@ fn conflict(message: String) -> Refusal { refused(409, "CommitFailedException", 
 /// table as Pondra has it (`adopt::stale`: else 409, once its rows are in its files). The leader
 /// checks what the commit asserts and records it, and the table's next version is published under
 /// the writer's snapshot id. Anything else is refused by name.
-async fn update(axum::extract::State(app): axum::extract::State<crate::server::App>, axum::extract::Path((ns, table)): axum::extract::Path<(String, String)>, body: bytes::Bytes) -> Reply {
-    let (_, lake, schema) = space(&app, &ns).await?;
+async fn update(axum::extract::State(app): axum::extract::State<crate::server::App>, axum::Extension(role): axum::Extension<crate::auth::Role>, axum::extract::Path((ns, table)): axum::extract::Path<(String, String)>, body: bytes::Bytes) -> Reply {
+    let (parts, lake, schema) = space(&app, &ns).await?;
     let name = crate::ddl::join(&schema, &table);
     let current = loaded(&lake, &name).await.map_err(|_| missing(&format!("table {}.{table}", ns.replace('\u{1f}', ".")), "NoSuchTableException"))?;
     let asked: Value = serde_json::from_slice(&body).map_err(|e| bad(format!("the commit: {e}")))?;
+    let updates = asked["updates"].as_array().cloned().unwrap_or_default();
+    if updates.iter().any(|u| u["action"] == "add-schema") && !updates.iter().any(|u| u["action"] == "add-snapshot") {
+        requirements(&current["metadata"], &asked)?;
+        let sql = schema_sql(&sql_name(&app, &parts, &lake, &schema, &table), &current["metadata"], &asked).map_err(|e| bad(format!("{e:#}")))?;
+        for s in &sql {
+            as_caller(&app, role, s).await?;
+        }
+        let version = current["metadata"]["last-sequence-number"].as_u64().unwrap_or(0);
+        for _ in 0..200 {
+            match loaded(&lake, &name).await {
+                Ok(v) if sql.is_empty() || v["metadata"]["last-sequence-number"].as_u64().unwrap_or(0) > version => return Ok(axum::Json(v)),
+                _ => tokio::time::sleep(std::time::Duration::from_millis(50)).await, // (published on the leader: this node sees it a moment later)
+            }
+        }
+        return loaded(&lake, &name).await.map(axum::Json).map_err(|e| bad(format!("{e:#}")));
+    }
     let meta = lake.cat.get::<TableMeta>(&crate::store::table_key(&name)).await.ok().flatten().ok_or_else(|| bad(format!("no table {name}")))?;
     if !meta.key.is_empty() {
         return Err(bad(format!("{name} is a keyed table: other engines append to append tables (keyed ones: not yet; INSERT through Pondra)")));
@@ -896,6 +972,24 @@ fn inside(lake: &Lake, uri: &str) -> Option<String> {
     let plain = |u: &str| u.strip_prefix("file://").or_else(|| u.strip_prefix("file:")).unwrap_or(u).replacen("s3a://", "s3://", 1);
     let rest = plain(uri).strip_prefix(&format!("{}/", plain(&lake.url).trim_end_matches('/')))?.to_string();
     (!rest.split('/').any(|p| p == ".." || p == "." || p.is_empty())).then_some(rest)
+}
+
+/// A schema change's requirements, checked against the table as published: its uuid, its schema
+/// and its main snapshot (409 when it changed since the writer read it).
+fn requirements(meta: &Value, asked: &Value) -> Result<(), Refusal> {
+    for r in asked["requirements"].as_array().into_iter().flatten() {
+        let ok = match r["type"].as_str().unwrap_or_default() {
+            "assert-table-uuid" => r["uuid"] == meta["table-uuid"],
+            "assert-current-schema-id" => r["current-schema-id"] == meta["current-schema-id"],
+            "assert-last-assigned-field-id" => r["last-assigned-field-id"] == meta["last-column-id"],
+            "assert-ref-snapshot-id" => r["snapshot-id"] == meta["current-snapshot-id"],
+            k => return Err(bad(format!("requirement {k}: not one Pondra checks with a schema change"))),
+        };
+        if !ok {
+            return Err(conflict(format!("{}: {CONFLICT}", r["type"])));
+        }
+    }
+    Ok(())
 }
 
 /// Does the table still stand as the writer read it (its uuid, and main's snapshot)?

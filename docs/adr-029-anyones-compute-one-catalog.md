@@ -401,16 +401,24 @@ fully, rather than all of phase 2 at once.
 - **Refused by name:** delete files (merge-on-read), a `replace` snapshot (another engine's
   compaction: Pondra merges its tables itself), and a change to a table that views or tasks follow
   or that has a renamed column (its appends are copied; its changes go through Pondra's SQL).
-- **Tests:** `harness.py rewrites` (6 checks: a whole file dropped and part of another rewritten,
-  ids kept and new, an overwrite of two snapshots, the stale rule, a followed table refused);
-  `formats_check.py --spark … --only commits` (Spark 4 with Iceberg 1.10: INSERT, append, then
-  DELETE, UPDATE and MERGE, Pondra reading what Spark reads).
+- **Schema changes (§8):** a commit of `add-schema` and `set-current-schema` alone (PyIceberg's
+  `update_schema`, Spark's `ALTER TABLE`) is diffed by field id against the published schema into
+  `ALTER TABLE` statements — a field gone dropped, renamed renamed, a wider type widened, a new
+  optional one at the end added — run as the caller (DDL: an admin's), and the new version
+  answered. The name mapping's `set-properties` that PyIceberg sends with it is taken and dropped:
+  Pondra publishes its own. A new required column, a reorder, a changed key or a narrower type is
+  refused by name before any statement runs. *(Decided by Claude: each change is its own
+  statement, as Pondra's ALTER TABLE makes them; a failure part way — which the checks before make
+  unlikely — leaves the ones before it made.)*
+- **Tests:** `harness.py rewrites` (7 checks: a whole file dropped and part of another rewritten,
+  ids kept and new, an overwrite of two snapshots, the stale rule, a followed table refused, schema
+  changes); `formats_check.py --spark … --only commits` (Spark 4 with Iceberg 1.10: INSERT,
+  append, then DELETE, UPDATE and MERGE, Pondra reading what Spark reads, and ADD COLUMN).
 
 **Still to do in phase 2:** merge-on-read (position deletes and deletion vectors, read as row
 selections), Pondra's own changes published as positions and purges as maintenance, keyed tables
-taking upserts and equality deletes, schema changes Pondra can express, multi-table transactions,
-and what round 27 moved here: followers fed from the files in one commit, and the feed carrying
-file commits.
+taking upserts and equality deletes, multi-table transactions, and what round 27 moved here:
+followers fed from the files in one commit, and the feed carrying file commits.
 
 ## Open
 

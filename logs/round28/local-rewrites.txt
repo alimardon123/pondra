@@ -1,4 +1,4 @@
-Commit failed due to a concurrent update, retrying (1/4) in 108 ms
+Commit failed due to a concurrent update, retrying (1/4) in 102 ms
 {
  "rewrites": {
   "a DELETE from PyIceberg: a whole file dropped, part of another rewritten; Pondra, PyIceberg and delta-rs read the same rows": true,
