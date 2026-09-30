@@ -1,0 +1,4 @@
+{"table": "Spark appends through Pondra's Iceberg REST catalog (INSERT, writeTo().append()): the table's rows, with row ids", "equal": true}
+{"table": "\u2026Spark's DELETE, UPDATE and MERGE (copy-on-write): Pondra reads what Spark does", "equal": true}
+{"table": "\u2026an ALTER TABLE from Spark: refused by name", "equal": true}
+{"equal": 3, "tables": 3}

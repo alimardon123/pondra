@@ -1,6 +1,6 @@
 # ADR-029: Anyone's compute, one catalog
 
-**Date:** 2026-09-29 · **Status:** accepted; phase 1 built in round 27 (2026-09-30, below), phase 2 is round 28 (the owner, 2026-09-29) · **Builds on:** ADR-001 (readers who need only the bucket), ADR-002 (the streamhouse), ADR-003 (serverless) · **Follows:** ADR-028 (other engines append, G8), ADR-020 (system columns)
+**Date:** 2026-09-29 · **Status:** accepted; phase 1 built in round 27 (2026-09-30, below); phase 2 begun in round 28 (copy-on-write changes, below), its rest next · **Builds on:** ADR-001 (readers who need only the bucket), ADR-002 (the streamhouse), ADR-003 (serverless) · **Follows:** ADR-028 (other engines append, G8), ADR-020 (system columns)
 
 ## Context
 
@@ -376,6 +376,41 @@ it at once):
   readers read the rows of.
 - **Hot columns:** files recorded as written are read from Parquet, not the hot columns, until a
   merge rewrites them.
+
+## Built in round 28, in part (phase 2's first step, 2026-09-30)
+
+Other engines' **copy-on-write changes** (§2, §3), decided by the owner's plan; how far this round
+went was *decided by Claude, for the owner's review*: the part every engine uses by default, done
+fully, rather than all of phase 2 at once.
+
+- **What a commit may do now:** its snapshots, one after the other with the last made `main`
+  (PyIceberg's `overwrite` sends a delete's and an append's), with operations `append`,
+  `overwrite` and `delete`; files added (recorded as written, as round 27's), and the table's
+  files taken out — Pondra's own or another engine's, sealed ones too (their manifests unsealed).
+  One catalog commit, published under the writer's last snapshot id. Spark's `DELETE`, `UPDATE`
+  and `MERGE` (Iceberg's default, copy-on-write) and PyIceberg's `delete` and `overwrite` work.
+- **Row ids:** rows in a file the change left alone keep theirs; the rows it rewrote get new ones
+  (Iceberg v2's model, a delete and an insert, as §4 says). v3's kept ids are phase 3.
+- **The stale rule (§3):** a commit that takes files out while the table holds rows its last
+  published version doesn't (rows in the log, or `UPDATE`s not yet purged) is answered 409 after
+  the leader tiers, purges and publishes the table; the writer reads it again and runs Iceberg's own
+  conflict checks (PyIceberg's found the new row, in the test). A file taken out that isn't the
+  table's any more (merged since) is a 409 too. *(Found: a change that matches no published file
+  commits nothing, so a row only in the log escapes it; the answer is scan planning, phase 3 —
+  documented.)*
+- **Refused by name:** delete files (merge-on-read), a `replace` snapshot (another engine's
+  compaction: Pondra merges its tables itself), and a change to a table that views or tasks follow
+  or that has a renamed column (its appends are copied; its changes go through Pondra's SQL).
+- **Tests:** `harness.py rewrites` (6 checks: a whole file dropped and part of another rewritten,
+  ids kept and new, an overwrite of two snapshots, the stale rule, a followed table refused);
+  `formats_check.py --spark … --only commits` (Spark 4 with Iceberg 1.10: INSERT, append, then
+  DELETE, UPDATE and MERGE, Pondra reading what Spark reads).
+
+**Still to do in phase 2:** merge-on-read (position deletes and deletion vectors, read as row
+selections), Pondra's own changes published as positions and purges as maintenance, keyed tables
+taking upserts and equality deletes, schema changes Pondra can express, multi-table transactions,
+and what round 27 moved here: followers fed from the files in one commit, and the feed carrying
+file commits.
 
 ## Open
 

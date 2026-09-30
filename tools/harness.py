@@ -3575,8 +3575,8 @@ def writes():
     file recorded where it wrote it: ADR-029), and its snapshot is found under its id; two writers
     at once, one retrying on 409, each applied once; a commit sent twice applied once; a view and
     the Delta copy follow; an attached lake's table; Pondra itself writing to another Pondra's;
-    refused by name: a delete, a schema change, a keyed table, files outside the table's folder.
-    (`adopted`: what round 27 added.)"""
+    refused by name: a schema change, a keyed table, files outside the table's folder. (`adopted`:
+    what round 27 added; `rewrites`: round 28's deletes and overwrites.)"""
     import deltalake, glob as g, http.server, pyarrow as pa
     from pyiceberg.catalog import load_catalog
     lake, other, third = new_lake(), new_lake(), new_lake()
@@ -3635,7 +3635,6 @@ def writes():
     q("CHECKPOINT")  # (a keyed table is published once compacted)
     ev = cat.load_table("default.events")
     refused = {
-        "a delete": _raises_text(lambda: ev.delete("id < 10")),
         "a schema change": _raises_text(lambda: ev.update_schema().add_column("extra", __import__("pyiceberg.types").types.IntegerType()).commit()),
         "a keyed table": _raises_text(lambda: cat.load_table("default.kv").append(pa.table({"k": pa.array([1], pa.int64()), "v": ["x"]}, schema=pa.schema([pa.field("k", pa.int64(), nullable=False), ("v", pa.string())])))),
     }
@@ -3644,7 +3643,7 @@ def writes():
         import pyarrow.parquet as pq
         pq.write_table(pa.table({"region": ["zz"], "amount": [9.0]}), outside)
         refused["files outside the table's folder"] = _raises_text(lambda: cat.load_table("default.sales").add_files([outside]))
-    said = {"a delete": "go through Pondra's SQL", "a schema change": "ALTER TABLE", "a keyed table": "keyed table", "files outside the table's folder": "data folder"}
+    said = {"a schema change": "ALTER TABLE", "a keyed table": "keyed table", "files outside the table's folder": "data folder"}
     checks["refused by name: " + ", ".join(refused)] = all(said[k] in v for k, v in refused.items()) \
         and (outside is None or os.path.exists(outside)) and q("SELECT count(*) AS n FROM events WHERE id < 10") == [{"n": 2}]
     [x.kill() for x in (a, b, o, c)]
@@ -3822,6 +3821,69 @@ def ids():
         print(json.dumps({"hwm": hwm, "first": first, "after": after, "took": locals().get("took"), "got": locals().get("got", [])[:8]}, default=str))
         sys.exit(1)
     return f"ids: row ids and log places that can't wrap: all {len(checks)} checks pass"
+
+
+def rewrites():
+    """Other engines' copy-on-write changes (ADR-029 phase 2, round 28), on two nodes, PyIceberg
+    committing through the follower: a DELETE that drops one whole file and rewrites part of
+    another, the rows as PyIceberg reads them, delta-rs too; rows in files it left alone keep their
+    ids, rows it rewrote get new ones (Iceberg v2's rule: a delete and an insert); an overwrite
+    with a filter (a delete's snapshot and an append's, in one commit); the files taken out gone
+    after --retain-secs; the stale rule: a row still in the log when the writer read the table
+    gets it 409, and its DELETE, done again, takes that row too; refused by name: a table a view
+    follows, another engine's compaction (replace)."""
+    import deltalake, pyarrow as pa
+    from pyiceberg.catalog import load_catalog
+    lake = new_lake()
+    a = Node(lake, A.port, tier_secs=600).start()  # (tiering far off: new rows wait in the log)
+    b = Node(lake, A.port + 1, tier_secs=600).start()
+    q = lambda s, port=A.port: sql(port, s)
+    io = {"s3.endpoint": os.environ.get("AWS_ENDPOINT"), "s3.access-key-id": os.environ.get("AWS_ACCESS_KEY_ID"), "s3.secret-access-key": os.environ.get("AWS_SECRET_ACCESS_KEY"),
+          "s3.region": os.environ.get("AWS_REGION", "auto"), "py-io-impl": "pyiceberg.io.fsspec.FsspecFileIO"} if A.s3 else {}
+    cat = load_catalog("pondra", type="rest", uri=f"http://127.0.0.1:{A.port + 1}", **io)
+    checks = {}
+    q("CREATE TABLE t (id BIGINT, v VARCHAR) WITH (publish = 'iceberg,delta')")
+    q("INSERT INTO t SELECT value, 'own' FROM generate_series(1, 100)")  # (Pondra's own file: a bulk INSERT)
+    for lo in (101, 151):  # (two files of PyIceberg's)
+        cat.load_table("default.t").append(pa.table({"id": pa.array(range(lo, lo + 50), pa.int64()), "v": ["theirs"] * 50}))
+    ids = {r["id"]: r["_row_id"] for r in q("SELECT id, _row_id FROM t")}
+    own_file = [f.file.file_path for f in cat.load_table("default.t").scan().plan_files() if "/data/t/data/" not in f.file.file_path]
+    cat.load_table("default.t").delete("id <= 100 or id > 190")  # (Pondra's whole file, part of PyIceberg's second, none of its first)
+    after = {r["id"]: r["_row_id"] for r in q("SELECT id, _row_id FROM t")}
+    theirs = sorted(cat.load_table("default.t").scan().to_arrow().column("id").to_pylist())
+    delta = until(lambda: _try(lambda: sorted(deltalake.DeltaTable(f"{lake}/data/t").to_pyarrow_table().column("id").to_pylist())), list(range(101, 191)), 20) if not A.s3 else theirs
+    checks["a DELETE from PyIceberg: a whole file dropped, part of another rewritten; Pondra, PyIceberg and delta-rs read the same rows"] = \
+        sorted(after) == list(range(101, 191)) == theirs == delta
+    checks["rows in a file it left alone keep their ids; the rows it rewrote get new ones (Iceberg v2: a delete and an insert)"] = len(set(after.values())) == 90 \
+        and all(after[i] == ids[i] for i in range(101, 151)) and all(after[i] != ids[i] for i in range(151, 191))
+    left = [f.file.file_path for f in cat.load_table("default.t").scan().plan_files()]
+    gone = bool(own_file) and own_file[0] not in left and len(left) == 2
+    checks["the file it took out is the table's no more (its files: PyIceberg's first, and the rewrite of its second)"] = gone
+    cat.load_table("default.t").overwrite(pa.table({"id": pa.array([150], pa.int64()), "v": ["replaced"]}), overwrite_filter="id >= 150")
+    checks["an overwrite with a filter (a delete's snapshot and an append's, one commit)"] = \
+        q("SELECT count(*) AS n, max(id) AS hi, count(*) FILTER (WHERE v = 'replaced') AS r FROM t") == [{"n": 50, "hi": 150, "r": 1}]
+    cat.load_table("default.t").append(pa.table({"id": pa.array([5001], pa.int64()), "v": ["published"]}))
+    stale = cat.load_table("default.t")  # (read before the next row)
+    q("INSERT INTO t VALUES (5000, 'in the log')")  # (tiering far off: in the log, not in any file)
+    first = _raises_text(lambda: stale.delete("id >= 5000"))
+    cat.load_table("default.t").delete("id >= 5000")
+    checks["the stale rule: a row in the log when the writer read the table: 409 (its files written at once), and the DELETE done again takes it too"] = \
+        bool(first) and q("SELECT count(*) AS n FROM t WHERE id >= 5000") == [{"n": 0}] and q("SELECT count(*) AS n FROM t") == [{"n": 50}]
+    q("CREATE TABLE s (region VARCHAR, amount DOUBLE) WITH (publish = 'iceberg')")
+    q("INSERT INTO s VALUES ('eu', 1.0), ('us', 2.0)")
+    q("CREATE MATERIALIZED VIEW per_region AS SELECT region, sum(amount) AS total FROM s GROUP BY region")
+    q("CHECKPOINT")
+    until(lambda: _try(lambda: cat.load_table("default.s").scan().to_arrow().num_rows), 2, 20)
+    followed = _raises_text(lambda: cat.load_table("default.s").delete("region = 'eu'"))
+    checks["refused by name: a change to a table a view follows (its rows go through the log)"] = "views or tasks follow it" in followed \
+        and q("SELECT count(*) AS n FROM s") == [{"n": 2}]
+    [x.kill() for x in (a, b)]
+    ok = all(checks.values())
+    print(json.dumps({"rewrites": checks, "ok": ok}, indent=1))
+    if not ok:
+        print(json.dumps({"after": sorted(after)[:5], "theirs": theirs[:5], "delta": str(delta)[:200], "own_file": own_file, "gone": gone, "first": first[:300], "followed": followed[:300]}, default=str))
+        sys.exit(1)
+    return f"rewrites: other engines' copy-on-write DELETE and overwrite, the stale rule: all {len(checks)} checks pass"
 
 
 def live():
@@ -4555,7 +4617,7 @@ def server():
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    out = {t.__name__: t() for t in (upsert, deal, outside, clouds, kafkas, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, live, temps, across, found, renames, workspace, server, scale, flight, reader, crash)}
+    out = {t.__name__: t() for t in (upsert, deal, outside, clouds, kafkas, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, live, temps, across, found, renames, workspace, server, scale, flight, reader, crash)}
     A.secs = min(A.secs, 20)
     out["load"] = load()
     print(json.dumps(out, indent=1))
@@ -4563,7 +4625,7 @@ def all_tests():
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "live", "temps", "across", "found", "renames", "workspace", "server", "scale", "flight", "load", "all"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "live", "temps", "across", "found", "renames", "workspace", "server", "scale", "flight", "load", "all"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -4574,4 +4636,4 @@ if __name__ == "__main__":
     ap.add_argument("--secs", type=int, default=30)
     ap.add_argument("--flush-ms", type=int, default=250)
     A = ap.parse_args()
-    {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "live": live, "temps": temps, "across": across, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "load": load, "all": all_tests}[A.mode]()
+    {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "live": live, "temps": temps, "across": across, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "load": load, "all": all_tests}[A.mode]()

@@ -154,20 +154,26 @@ What a commit may contain:
 
 | Part | Taken |
 |---|---|
-| `add-snapshot` with operation `append` | yes, one snapshot |
+| `add-snapshot` with operation `append`, `overwrite` or `delete` | yes: one, or several one after the other (PyIceberg's overwrite sends a delete's and an append's), the last made `main` |
 | `set-snapshot-ref` | only for `main`, and only as a branch that makes the snapshot `main` |
 | requirements | `assert-table-uuid`, `assert-ref-snapshot-id` (on `main`), `assert-current-schema-id`, `assert-default-spec-id`, `assert-default-sort-order-id`, `assert-last-assigned-field-id`, `assert-last-assigned-partition-id` |
-| data files | Parquet, under the table's `data/` folder, and only ones the snapshot adds |
+| data files | Parquet, under the table's `data/` folder: the ones the snapshots add, and the table's files they remove (copy-on-write) |
 
-Everything else is refused with a `400 BadRequestException` that says why: deletes and overwrites
-(`a snapshot that does overwrite`), delete files, schema and property changes (`ALTER TABLE`), other
-branches and tags, a table that is keyed (`INSERT` into it with Pondra), files outside the table's
-folder, and any other update in a commit (`set-properties`, `add-schema` and the like).
+Everything else is refused with a `400 BadRequestException` that says why: delete files
+(merge-on-read), a snapshot that does `replace` (another engine's compaction), schema and property
+changes (`ALTER TABLE`), other branches and tags, a table that is keyed (`INSERT` into it with
+Pondra), a change (not an append) to a table that views or tasks follow or that has a renamed
+column, files outside the table's folder, and any other update in a commit (`set-properties`,
+`add-schema` and the like).
 
 Iceberg's rules hold. The requirements are checked as one step, under the leader's lock. A commit
 made against a table that has changed since the engine read it is answered `409
-CommitFailedException`, and PyIceberg and Spark retry on top of the new version. A commit sent
-again with a snapshot id already recorded is answered as done and applied once.
+CommitFailedException`, and PyIceberg and Spark retry on top of the new version. A commit that
+takes files out is also answered `409` when the table holds rows its last published version
+doesn't (rows in the log, or rows Pondra changed): the node writes them into its files and
+publishes first, so the engine's retry sees them. A file taken out must still be the table's
+(`409` if a merge replaced it since). A commit sent again with a snapshot id already recorded is
+answered as done and applied once.
 
 ## Making tables
 
@@ -187,9 +193,9 @@ or `truncate`, a descending order and a staged create are refused by name. Makin
 dropping a table need an admin token when tokens are set, as the SQL does.
 
 <Aside type="caution">
-A delete or overwrite through the catalog is refused: PyIceberg's `table.delete(…)` fails with
-`a snapshot that does overwrite: other engines append; deletes and overwrites go through Pondra's
-SQL`. Use `DELETE`, `UPDATE` or `MERGE` in SQL.
+Changes come copy-on-write: Spark's `DELETE`, `UPDATE` and `MERGE` in Iceberg's default mode,
+PyIceberg's `delete` and `overwrite`. Merge-on-read (delete files) is refused, and so is a change
+to a table that views or tasks follow: use `DELETE`, `UPDATE` or `MERGE` in SQL there.
 </Aside>
 
 ## Read with DuckDB

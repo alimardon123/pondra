@@ -33,9 +33,10 @@ def session(root):
 
 
 def spark_commits(url):
-    """Spark (Iceberg 1.10) appends to a Pondra table through Pondra's Iceberg REST catalog
-    (`--commit`, ADR-028): SQL's INSERT and DataFrame.writeTo().append(); then a DELETE and an ALTER
-    TABLE, each refused by name. Prints what Spark read back and what it was told."""
+    """Spark (Iceberg 1.10) writes to a Pondra table through Pondra's Iceberg REST catalog
+    (`--commit`): SQL's INSERT and DataFrame.writeTo().append() (ADR-028), then a DELETE, an UPDATE
+    and a MERGE, copy-on-write (ADR-029 phase 2), and an ALTER TABLE, refused by name. Prints what
+    Spark read back after the appends and after the changes, and what it was told."""
     os.environ["TZ"] = "UTC"
     time.tzset()
     from pyspark.sql import SparkSession
@@ -47,33 +48,43 @@ def spark_commits(url):
     spark.sparkContext.setLogLevel("ERROR")
     spark.sql("INSERT INTO pondra.default.spark_in VALUES (1, 'a', TIMESTAMP '2026-09-28 10:00:00'), (2, NULL, NULL)")
     spark.createDataFrame([(3, "c", None)], "id BIGINT, name STRING, ts TIMESTAMP").writeTo("pondra.default.spark_in").append()
-    out = {"rows": [[plain(v) for v in r] for r in spark.sql("SELECT id, name, ts FROM pondra.default.spark_in ORDER BY id").collect()]}
-    for name, stmt in (("delete", "DELETE FROM pondra.default.spark_in WHERE id = 1"), ("alter", "ALTER TABLE pondra.default.spark_in ADD COLUMN x INT")):
+    read = lambda: [[plain(v) for v in r] for r in spark.sql("SELECT id, name, ts FROM pondra.default.spark_in ORDER BY id").collect()]
+    out = {"rows": read()}
+    for name, stmt in (("delete", "DELETE FROM pondra.default.spark_in WHERE id = 1"), ("update", "UPDATE pondra.default.spark_in SET name = 'bee' WHERE id = 2"),
+                       ("merge", "MERGE INTO pondra.default.spark_in t USING (SELECT 3L AS id, 'sea' AS name UNION ALL SELECT 4L, 'd') s ON t.id = s.id "
+                                 "WHEN MATCHED THEN UPDATE SET name = s.name WHEN NOT MATCHED THEN INSERT (id, name, ts) VALUES (s.id, s.name, NULL)"),
+                       ("alter", "ALTER TABLE pondra.default.spark_in ADD COLUMN x INT")):
         try:
             spark.sql(stmt)
             out[name] = ""
         except Exception as e:  # noqa: BLE001 (what Spark was told)
             out[name] = str(e)[:2000]
+    out["changed"] = read()
     print(json.dumps(out, default=str))
     spark.stop()
 
 
 def commits(con, spark):
-    """Spark appends to Pondra's tables through its Iceberg REST catalog (`spark_commits`): the rows
-    are the table's, each with its row id; a DELETE and an ALTER TABLE from Spark refused by name."""
+    """Spark writes to Pondra's tables through its Iceberg REST catalog (`spark_commits`): appends,
+    the rows the table's, each with its row id; a DELETE, an UPDATE and a MERGE (copy-on-write),
+    after which Pondra reads what Spark does; an ALTER TABLE from Spark refused by name."""
     con.sql("CREATE TABLE spark_in (id BIGINT, name VARCHAR, ts TIMESTAMP) WITH (publish = 'iceberg')")
     run = subprocess.run([spark, os.path.abspath(__file__), "--commit", con.url], capture_output=True, text=True, env={**os.environ, "TZ": "UTC"}, timeout=1200)
     try:
         theirs = json.loads(run.stdout.strip().splitlines()[-1])
     except (IndexError, json.JSONDecodeError):
-        theirs = {"rows": [], "delete": "", "alter": "", "why": run.stderr[-1500:]}
+        theirs = {"rows": [], "changed": [], "delete": "", "update": "", "merge": "", "alter": "", "why": run.stderr[-1500:]}
     ours = con.sql("SELECT id, name, ts, _row_id FROM spark_in ORDER BY id").rows()
     want = [[1, "a", "2026-09-28 10:00:00"], [2, None, None], [3, "c", None]]
-    ok = [[r["id"], r.get("name"), plain(r.get("ts"))] for r in ours] == want == theirs["rows"] and all(r.get("_row_id") is not None for r in ours)
-    refused = "go through Pondra's SQL" in theirs["delete"] and "ALTER TABLE" in theirs["alter"]
+    changed = [[2, "bee", None], [3, "sea", None], [4, "d", None]]
+    ok = want == theirs["rows"]
+    same = [[r["id"], r.get("name"), plain(r.get("ts"))] for r in ours] == changed == theirs["changed"] and all(r.get("_row_id") is not None for r in ours) \
+        and not theirs["delete"] and not theirs["update"] and not theirs["merge"]
+    refused = "ALTER TABLE" in theirs["alter"]
     print(json.dumps({"table": "Spark appends through Pondra's Iceberg REST catalog (INSERT, writeTo().append()): the table's rows, with row ids", "equal": ok, **({} if ok else {"ours": ours, "theirs": theirs})}, default=str), flush=True)
-    print(json.dumps({"table": "…a DELETE and an ALTER TABLE from Spark: refused by name", "equal": refused, **({} if refused else {"delete": theirs["delete"][:500], "alter": theirs["alter"][:500]})}), flush=True)
-    return {"commits:spark": ok, "commits:refused": refused}
+    print(json.dumps({"table": "…Spark's DELETE, UPDATE and MERGE (copy-on-write): Pondra reads what Spark does", "equal": same, **({} if same else {"ours": ours, "theirs": {k: v if isinstance(v, list) else v[:500] for k, v in theirs.items()}})}, default=str), flush=True)
+    print(json.dumps({"table": "…an ALTER TABLE from Spark: refused by name", "equal": refused, **({} if refused else {"alter": theirs["alter"][:500]})}), flush=True)
+    return {"commits:spark": ok, "commits:changes": same, "commits:refused": refused}
 
 
 def read_spark(tables):

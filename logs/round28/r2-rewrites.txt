@@ -1,0 +1,12 @@
+Commit failed due to a concurrent update, retrying (1/4) in 102 ms
+{
+ "rewrites": {
+  "a DELETE from PyIceberg: a whole file dropped, part of another rewritten; Pondra, PyIceberg and delta-rs read the same rows": true,
+  "rows in a file it left alone keep their ids; the rows it rewrote get new ones (Iceberg v2: a delete and an insert)": true,
+  "the file it took out is the table's no more (its files: PyIceberg's first, and the rewrite of its second)": true,
+  "an overwrite with a filter (a delete's snapshot and an append's, one commit)": true,
+  "the stale rule: a row in the log when the writer read the table: 409 (its files written at once), and the DELETE done again takes it too": true,
+  "refused by name: a change to a table a view follows (its rows go through the log)": true
+ },
+ "ok": true
+}

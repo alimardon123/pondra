@@ -1029,7 +1029,7 @@ pub async fn handle(lake: &Lake, seq: &Sequencer, lock: &Mutex<()>, req: Request
         }
         Request::Iceberg(c) => {
             let _guard = lock.lock().await;
-            crate::iceberg::record(lake, seq, *c, &[String::new()], "").await
+            crate::iceberg::record(lake, seq, *c, &[String::new()], "", 60_000).await // (a leader answering through the bucket: --retain-secs' default)
         }
     }
 }

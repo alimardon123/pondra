@@ -113,18 +113,21 @@ fn same(file: &DataType, table: &DataType) -> bool {
     plain(file) == plain(table)
 }
 
-/// Leader: record the files as the table's, with their lineage: ids from this node's block, the
-/// commit number reserved for them (their rows' `_version`) and its time. False, recording
-/// nothing, when a view of the table was made since the files were checked: their rows go
-/// through the log instead (`iceberg::through_log`).
-pub async fn record(lake: &Lake, seq: &crate::log::Sequencer, table: &str, job: &str, files: &[DataFile]) -> Result<bool> {
-    if crate::views::inline(lake).await?.by_source.contains_key(table) || crate::write::follows(lake, table).await? {
-        return Ok(false);
-    }
+/// Leader: record the files as the table's, with their lineage, and take out the files the
+/// commit removes (another engine's copy-on-write `DELETE`, `UPDATE`, `MERGE` or overwrite: ADR-029
+/// §2), in one commit. False, recording nothing, when a view of the table was made since the files
+/// were checked, or it was altered: an append's rows go through the log instead
+/// (`iceberg::through_log`); a commit that removes files is refused.
+pub async fn record(lake: &Lake, seq: &crate::log::Sequencer, table: &str, job: &str, files: &[DataFile], removed: &[String]) -> Result<bool> {
     let key = table_key(table);
     let mut meta: TableMeta = lake.cat.get(&key).await?.context("no table")?;
-    if !fits_as_written(&meta) {
-        return Ok(false); // (altered since)
+    let followed = crate::views::inline(lake).await?.by_source.contains_key(table) || crate::write::follows(lake, table).await?;
+    if followed || !fits_as_written(&meta) {
+        ensure!(removed.is_empty(), "{table} was altered, or a view or task came to follow it, since the commit was made: {}", crate::iceberg::CONFLICT);
+        return Ok(false);
+    }
+    if !removed.is_empty() {
+        take_out(lake, table, &mut meta, removed).await?;
     }
     let mut recorded = with_lineage(lake, seq, files).await?;
     crate::sketch::add(&mut meta, &mut recorded);
@@ -134,6 +137,36 @@ pub async fn record(lake: &Lake, seq: &crate::log::Sequencer, table: &str, job: 
     }
     lake.cat.commit(vec![(key, json(&meta)), (producer_key(&format!("job:{job}")), json(&1u64))], &[]).await?;
     Ok(true)
+}
+
+/// The table's files `removed` out of it, sealed ones too (their manifests unsealed), to go after
+/// the retention period as merged files do; every one must be the table's now, or the writer read
+/// an older table (409).
+async fn take_out(lake: &Lake, table: &str, meta: &mut TableMeta, removed: &[String]) -> Result<()> {
+    let list = crate::manifest::list(lake, meta).await?;
+    let mut sealed = vec![];
+    for (i, m) in list.iter().enumerate() {
+        if crate::manifest::files(lake, m).await?.iter().any(|f| removed.contains(&f.path)) {
+            sealed.push(i);
+        }
+    }
+    crate::manifest::unseal(lake, table, meta, list, &sealed).await?;
+    let gone: Vec<&String> = removed.iter().filter(|p| !meta.files.iter().any(|f| f.path == **p)).collect();
+    ensure!(gone.is_empty(), "{}: {} is no longer {table}'s (merged or removed since the writer read it)", crate::iceberg::CONFLICT, gone[0]);
+    let now = crate::log::now_ms();
+    meta.files.retain(|f| !removed.contains(&f.path));
+    meta.garbage.extend(removed.iter().map(|p| (p.clone(), now)));
+    Ok(())
+}
+
+/// Does the table hold rows another engine couldn't have read in its last published version:
+/// rows in the log (or changes to its rows) not yet in its files? (A change that removes files is
+/// made against the table as Pondra has it: ADR-029 §3.)
+pub async fn stale(lake: &Lake, table: &str) -> Result<bool> {
+    let meta: TableMeta = lake.cat.get(&table_key(table)).await?.context("no table")?;
+    let waiting = crate::tier::backlog(lake, meta.tiered, None).await?;
+    let deleted = crate::sys::deleted(table);
+    Ok(waiting.get(table).is_some_and(|n| *n > 0) || waiting.get(&deleted).is_some_and(|n| *n > 0) || (meta.changed && meta.purged() < meta.tiered))
 }
 
 /// Files that don't hold their rows' system columns, with the lineage that gives them: ids from

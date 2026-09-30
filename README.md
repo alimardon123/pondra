@@ -204,9 +204,11 @@ An append's files become the table's where the writer put them: the node reads e
 checks it and records it, never copying the rows (a million rows cost it 0.01 s of CPU, against 0.24 s
 to copy them), and the rows take their ids and versions from the commit. Each commit lands once: a
 stale one gets 409 and the writer retries on top. Engines make, rename and drop tables through the
-catalog too, and follow the layout it publishes (partition spec, sort order, key). Deletes, schema
-changes and keyed tables stay with Pondra's SQL, and are refused by name (ADR-029: round 28 takes
-deletes, overwrites and merges).
+catalog too, and follow the layout it publishes (partition spec, sort order, key). They change rows
+copy-on-write as well — Spark's `DELETE`, `UPDATE` and `MERGE`, PyIceberg's `delete` and `overwrite`
+— against the table as Pondra has it (a change made before rows still in the log were in its files
+gets 409 once they are). Schema changes, merge-on-read deletes and keyed tables stay with Pondra's
+SQL, and are refused by name.
 
 Pondra's own readers (nodes, `pondra sql`) see every write sooner. The local folder and the bucket
 use the same layout: see `docs/lake-format.md`.
@@ -469,10 +471,11 @@ bucket to its newest lakes.
   Tables made before 0.19 (without row ids) change after a copy (`CREATE TABLE t2 AS SELECT …`).
   Clustering across files.
 - A write to two lakes is two commits, not one transaction.
-- Other engines append to append tables through the Iceberg REST catalog, and make, rename and
-  drop tables there; their deletes, overwrites, schema changes and writes to keyed tables are
-  refused (round 28: ADR-029 phase 2). An append to a table that views or tasks follow is still
-  copied (through the log), and so is one to a table with a renamed column; files recorded as
+- Other engines append to append tables through the Iceberg REST catalog, change their rows
+  copy-on-write, and make, rename and drop tables there; merge-on-read deletes, schema changes,
+  another engine's compaction and writes to keyed tables are refused (next: ADR-029 phase 2's
+  rest). An append to a table that views or tasks follow is still copied (through the log), and
+  so is one to a table with a renamed column, whose changes are refused; files recorded as
   written are read from Parquet, not the hot columns, until a merge rewrites them; and `/watch`,
   the change feed and Kafka topics carry the log's rows, not a file commit's (a bulk `INSERT`'s
   either). Delta writers need Delta's catalog-managed commits, which aren't out yet.

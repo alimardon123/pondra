@@ -1,0 +1,8 @@
+=== simulated R2, round 28
+09:44:22 start rewrites
+09:45:22 rewrites exit=0
+09:45:22 start writes
+09:46:22 writes exit=0
+09:46:22 start adopted
+09:47:36 adopted exit=0
+09:47:36 SIM_DONE

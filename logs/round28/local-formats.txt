@@ -1,0 +1,54 @@
+{"table": "delta:by_id", "equal": true}
+{"table": "delta:checkpoints", "equal": true}
+{"table": "delta:deltars", "equal": true}
+{"table": "delta:dv", "equal": true}
+{"table": "delta:dv@2", "equal": true}
+{"table": "delta:ins_dv", "equal": true}
+{"table": "delta:ins_mapped", "equal": true}
+{"table": "delta:ins_part", "equal": true}
+{"table": "delta:mapped", "equal": true}
+{"table": "delta:partitioned", "equal": true}
+{"table": "delta:parts", "equal": true}
+{"table": "delta:types", "equal": true}
+{"table": "delta:v2checkpoint", "equal": true}
+{"table": "delta:variant", "equal": true, "why": "500: /tmp/pondra-formats-1bc7xu3c/delta/variant: a Delta table with the reader feature variantType, which Pondra doesn't read yet (it reads columnMapping, deletionVectors, timestampNtz, typeWidening, typeWidening-preview, v2Checkpoint, vacuumProtocolCheck)"}
+{"table": "iceberg:dv", "equal": true}
+{"table": "iceberg:equality", "equal": true}
+{"table": "iceberg:ins", "equal": true}
+{"table": "iceberg:ins_part", "equal": true}
+{"table": "iceberg:mor", "equal": true}
+{"table": "iceberg:mor@2", "equal": true}
+{"table": "iceberg:partitioned", "equal": true}
+{"table": "iceberg:pyiceberg", "equal": true}
+{"table": "iceberg:renamed", "equal": true}
+{"table": "Pondra's own, published, by delta_scan", "equal": true}
+{"table": "Pondra's own, published, by iceberg_scan", "equal": true}
+{"table": "attached: a folder of Delta tables, name.table", "equal": true}
+{"table": "attached: one Delta table, by its name alone", "equal": true}
+{"table": "attached: an Iceberg warehouse's folder, name.namespace.table", "equal": true}
+{"table": "attached: DETACH, then not there", "equal": true}
+{"table": "attached: an Iceberg REST catalog with OAuth, name.namespace.table", "equal": true}
+{"table": "attached: a REST catalog with the wrong secret, refused", "equal": true}
+{"table": "frames: scan_delta", "equal": true}
+{"table": "frames: scan_iceberg", "equal": true}
+{"table": "pondra.spark: format('delta'), versionAsOf", "equal": true}
+{"table": "pondra.spark: format('iceberg'), snapshot-id", "equal": true}
+{"table": "frames: scan_delta of delta-rs's table", "equal": true}
+{"table": "INSERT into dw.ins_dv, read back by Spark == Pondra", "equal": true}
+{"table": "INSERT into dw.ins_mapped, read back by Spark == Pondra", "equal": true}
+{"table": "INSERT into dw.ins_part, read back by Spark == Pondra", "equal": true}
+{"table": "INSERT into iw.db.ins, read back by Spark == Pondra", "equal": true}
+{"table": "INSERT into iw.db.ins_part, read back by Spark == Pondra", "equal": true}
+{"table": "INSERT into an Iceberg table by day, bucket and truncate: PyIceberg prunes by the values Pondra wrote", "equal": true}
+{"table": "INSERT retried with its job: applied once", "equal": true}
+{"table": "INSERT into a REST catalog's table, committed by the catalog, read back by PyIceberg", "equal": true}
+{"table": "Spark appends through Pondra's Iceberg REST catalog (INSERT, writeTo().append()): the table's rows, with row ids", "equal": true}
+{"table": "\u2026Spark's DELETE, UPDATE and MERGE (copy-on-write): Pondra reads what Spark does", "equal": true}
+{"table": "\u2026an ALTER TABLE from Spark: refused by name", "equal": true}
+{"table": "delta:dv on S3, one node and spread over three", "equal": true}
+{"table": "delta:mapped on S3, one node and spread over three", "equal": true}
+{"table": "delta:partitioned on S3, one node and spread over three", "equal": true}
+{"table": "iceberg:mor on S3, one node and spread over three", "equal": true}
+{"table": "iceberg:dv on S3, one node and spread over three", "equal": true}
+{"table": "iceberg:equality on S3, one node and spread over three", "equal": true}
+{"equal": 53, "tables": 53}

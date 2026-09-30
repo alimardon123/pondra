@@ -697,6 +697,9 @@ pub struct Commit {
     /// The files become the table's as written (`adopt.rs`), their footers read and checked.
     #[serde(default)]
     adopt: bool,
+    /// The table's files it takes out (a copy-on-write change: ADR-029 §2), paths in the lake.
+    #[serde(default)]
+    removed: Vec<String>,
     /// Those rows as the table's own files, written by the node that took the commit (None: they
     /// go through the log, for the views and tasks that follow the table).
     written: Option<crate::write::Files>,
@@ -708,6 +711,8 @@ impl Commit {
 
 /// The leader's answer when the table changed since the writer read it: 409, so it retries.
 pub const CONFLICT: &str = "the table changed since the writer read it";
+/// …and when a commit's deletes are files of positions or values (merge-on-read), not yet taken.
+const MERGE_ON_READ: &str = "delete files (merge-on-read): not yet; write the change copy-on-write (Spark: the table's write.delete.mode, write.update.mode and write.merge.mode = copy-on-write, Iceberg's default), or use Pondra's SQL (DELETE, UPDATE, MERGE)";
 /// …and when it refused the commit before recording anything: 400.
 const REFUSED: &str = "Pondra refused the commit";
 
@@ -726,8 +731,11 @@ fn conflict(message: String) -> Refusal { refused(409, "CommitFailedException", 
 /// leader records them with their lineage. A table that views or tasks follow takes the rows
 /// through the log, and one whose files the writer can't lay out as its own (renamed columns, a
 /// partition spec: `adopt::fits_as_written`) has them rewritten here, as a bulk INSERT's (round
-/// 25's copy). The leader checks what the commit asserts and records it, and the table's next
-/// version is published under the writer's snapshot id. Anything else is refused by name.
+/// 25's copy). A copy-on-write change (`DELETE`, `UPDATE`, `MERGE`, an overwrite) takes files out
+/// as it adds others, on a table neither followed nor renamed, and only when the writer read the
+/// table as Pondra has it (`adopt::stale`: else 409, once its rows are in its files). The leader
+/// checks what the commit asserts and records it, and the table's next version is published under
+/// the writer's snapshot id. Anything else is refused by name.
 async fn update(axum::extract::State(app): axum::extract::State<crate::server::App>, axum::extract::Path((ns, table)): axum::extract::Path<(String, String)>, body: bytes::Bytes) -> Reply {
     let (_, lake, schema) = space(&app, &ns).await?;
     let name = crate::ddl::join(&schema, &table);
@@ -744,7 +752,11 @@ async fn update(axum::extract::State(app): axum::extract::State<crate::server::A
     check(&lake, &c).await.map_err(|e| conflict(format!("{e:#}")))?;
     let here = std::sync::Arc::ptr_eq(&lake, &app.lake);
     let followed = crate::write::follows(&lake, &name).await.map_err(|e| bad(format!("{e:#}")))?;
-    if !c.incoming.is_empty() && !followed && crate::adopt::fits_as_written(&meta) {
+    if !c.removed.is_empty() && (followed || !crate::adopt::fits_as_written(&meta)) {
+        return Err(bad(format!("{name}: {}, so other engines append to it; change its rows with Pondra's SQL (DELETE, UPDATE, MERGE)",
+            if followed { "views or tasks follow it" } else { "it has a renamed or dropped column" })));
+    }
+    if (!c.incoming.is_empty() || !c.removed.is_empty()) && !followed && crate::adopt::fits_as_written(&meta) {
         crate::adopt::footers(&lake, &name, &meta, &mut c.incoming).await.map_err(|e| bad(format!("{REFUSED}: {e:#}")))?;
         c.adopt = true;
     } else if !c.incoming.is_empty() && !followed {
@@ -774,10 +786,11 @@ async fn update(axum::extract::State(app): axum::extract::State<crate::server::A
     })
 }
 
-/// What a commit asks, if Pondra takes it: one append snapshot, on main, and the Parquet files it
-/// adds in the table's `data/` folder.
+/// What a commit asks, if Pondra takes it: its snapshots on main (an append, a delete, an overwrite:
+/// one after the other, the last made main), the Parquet files they add in the table's `data/`
+/// folder, and the table's files they take out.
 async fn parse(lake: &Lake, table: &str, meta: &Value, asked: &Value) -> Result<Commit, Refusal> {
-    let (mut uuid, mut parent, mut snapshot, mut main) = (None, None, None, None);
+    let (mut uuid, mut parent, mut main) = (None, None, None);
     for r in asked["requirements"].as_array().into_iter().flatten() {
         let kind = r["type"].as_str().unwrap_or_default();
         let same = |mine: &str| r[kind.trim_start_matches("assert-")] == meta[mine];
@@ -799,62 +812,83 @@ async fn parse(lake: &Lake, table: &str, meta: &Value, asked: &Value) -> Result<
             k => return Err(bad(format!("requirement {k}: not one Pondra checks"))),
         }
     }
+    let mut snapshots = vec![];
     for u in asked["updates"].as_array().into_iter().flatten() {
         match u["action"].as_str().unwrap_or_default() {
-            "add-snapshot" if snapshot.is_none() => snapshot = Some(u["snapshot"].clone()),
+            "add-snapshot" => snapshots.push(u["snapshot"].clone()), // (an overwrite: a delete's and an append's, one after the other)
             "set-snapshot-ref" if u["ref-name"] == "main" && u["type"] == "branch" => main = u["snapshot-id"].as_i64(),
             "set-snapshot-ref" => return Err(bad(format!("branch or tag {}: Pondra's tables have main only", u["ref-name"]))),
-            a => return Err(bad(format!("{a}: a Pondra table changes through its SQL (ALTER TABLE; DELETE, UPDATE, MERGE), and other engines append to it"))),
+            a => return Err(bad(format!("{a}: a Pondra table changes through its SQL (ALTER TABLE), and other engines append to it and change its rows"))),
         }
     }
-    let s = snapshot.ok_or_else(|| bad("a commit with no snapshot: other engines append to Pondra's tables".into()))?;
+    let s = snapshots.last().cloned().ok_or_else(|| bad("a commit with no snapshot: other engines append to Pondra's tables and change their rows".into()))?;
     let id = s["snapshot-id"].as_i64().ok_or_else(|| bad("a snapshot without its snapshot-id".into()))?;
     if main != Some(id) {
         return Err(bad("a snapshot not made main (staged): not taken".into()));
     }
-    let op = s["summary"]["operation"].as_str().unwrap_or("append");
-    if op != "append" {
-        return Err(bad(format!("a snapshot that does {op}: other engines append; deletes and overwrites go through Pondra's SQL (DELETE, UPDATE, MERGE)")));
-    }
-    if !s["schema-id"].is_null() && s["schema-id"] != meta["current-schema-id"] {
-        return Err(conflict(format!("the snapshot's schema: {CONFLICT}")));
-    }
     let home = crate::store::folder_of(lake, table).await.map_err(|e| bad(format!("{e:#}")))?; // (its files' folder: its name, unless it was renamed)
     let under = |uri: &Value, folder: &str| -> Result<String, Refusal> {
         let uri = uri.as_str().unwrap_or_default();
-        inside(lake, uri).filter(|p| p.starts_with(&format!("data/{home}/{folder}/"))).ok_or_else(|| bad(format!("{uri}: not in {table}'s {folder} folder")))
+        let at = format!("data/{home}/{folder}{}", if folder.is_empty() { "" } else { "/" });
+        inside(lake, uri).filter(|p| p.starts_with(&at)).ok_or_else(|| bad(format!("{uri}: not in {table}'s {} folder", if folder.is_empty() { "own" } else { folder })))
     };
     let get = |path: String| async move {
         let bytes = lake.store.get(&Path::from(path.as_str())).await.map_err(|e| bad(format!("{path}: {e}")))?.bytes().await.map_err(|e| bad(format!("{path}: {e}")))?;
         crate::avro::records(&bytes).map_err(|e| bad(format!("{path}: {e:#}")))
     };
-    let list = under(&s["manifest-list"], "metadata")?;
-    let (mut incoming, mut cleanup) = (Vec::<DataFile>::new(), vec![list.clone()]);
-    for m in get(list).await? {
-        if m["added_snapshot_id"].as_i64() != Some(id) {
-            continue; // (the table's manifests, as they were)
+    let (mut incoming, mut cleanup, mut removed) = (Vec::<DataFile>::new(), vec![], vec![]);
+    for (i, s) in snapshots.iter().enumerate() {
+        let id = s["snapshot-id"].as_i64().ok_or_else(|| bad("a snapshot without its snapshot-id".into()))?;
+        if i > 0 && s["parent-snapshot-id"] != snapshots[i - 1]["snapshot-id"] {
+            return Err(bad("snapshots that don't follow one another: not taken".into()));
         }
-        if m["content"].as_i64().unwrap_or(0) != 0 {
-            return Err(bad("delete files: other engines append; deletes go through Pondra's SQL".into()));
+        match s["summary"]["operation"].as_str().unwrap_or("append") {
+            "append" | "overwrite" | "delete" => {}
+            "replace" => return Err(bad("another engine's compaction (a snapshot that does replace): Pondra merges its tables' files itself".into())),
+            op => return Err(bad(format!("a snapshot that does {op}: not one Pondra takes (append, overwrite, delete)"))),
         }
-        let path = under(&m["manifest_path"], "metadata")?;
-        cleanup.push(path.clone());
-        for e in get(path).await? {
-            match e["status"].as_i64() {
-                Some(1) => {}
-                Some(0) => continue, // (a file already in the table, in a manifest the writer merged)
-                _ => return Err(bad("an append that deletes files: not taken".into())),
+        if !s["schema-id"].is_null() && s["schema-id"] != meta["current-schema-id"] {
+            return Err(conflict(format!("the snapshot's schema: {CONFLICT}")));
+        }
+        let list = under(&s["manifest-list"], "metadata")?;
+        cleanup.push(list.clone());
+        for m in get(list).await? {
+            if m["added_snapshot_id"].as_i64() != Some(id) {
+                continue; // (the table's manifests, as they were)
             }
-            let d = &e["data_file"];
-            if d["content"].as_i64().unwrap_or(0) != 0 || !d["file_format"].as_str().unwrap_or_default().eq_ignore_ascii_case("parquet") {
-                return Err(bad(format!("{}: Pondra takes Parquet data files", d["file_path"])));
+            if m["content"].as_i64().unwrap_or(0) != 0 {
+                return Err(bad(MERGE_ON_READ.into()));
             }
-            let (rows, bytes) = (d["record_count"].as_u64().unwrap_or(0), d["file_size_in_bytes"].as_u64().unwrap_or(0));
-            incoming.push(DataFile { path: under(&d["file_path"], "data")?, rows, bytes, ..Default::default() });
+            let path = under(&m["manifest_path"], "metadata")?;
+            cleanup.push(path.clone());
+            for e in get(path).await? {
+                let d = &e["data_file"];
+                if d["content"].as_i64().unwrap_or(0) != 0 {
+                    return Err(bad(MERGE_ON_READ.into()));
+                }
+                match e["status"].as_i64() {
+                    Some(1) => {}
+                    Some(0) => continue, // (a file already in the table, in a manifest the writer merged)
+                    Some(2) => {
+                        let path = under(&d["file_path"], "")?; // (the table's file, Pondra's or another engine's, taken out)
+                        match incoming.iter().position(|f| f.path == path) {
+                            Some(at) => drop(incoming.remove(at)), // (added by an earlier snapshot of this commit)
+                            None => removed.push(path),
+                        }
+                        continue;
+                    }
+                    s => return Err(bad(format!("a manifest entry of status {s:?}"))),
+                }
+                if !d["file_format"].as_str().unwrap_or_default().eq_ignore_ascii_case("parquet") {
+                    return Err(bad(format!("{}: Pondra takes Parquet data files", d["file_path"])));
+                }
+                let (rows, bytes) = (d["record_count"].as_u64().unwrap_or(0), d["file_size_in_bytes"].as_u64().unwrap_or(0));
+                incoming.push(DataFile { path: under(&d["file_path"], "data")?, rows, bytes, ..Default::default() });
+            }
         }
     }
     let summary = s["summary"].as_object().cloned().unwrap_or_default();
-    Ok(Commit { table: table.into(), snapshot: id, summary, uuid, parent, incoming, cleanup, written: None, adopt: false })
+    Ok(Commit { table: table.into(), snapshot: id, summary, uuid, parent, incoming, cleanup, written: None, adopt: false, removed })
 }
 
 /// A writer's URI as a path in the lake, if it is in it (`file:` or none, for a lake on disk).
@@ -893,11 +927,15 @@ async fn incoming(lake: &Lake, meta: &TableMeta, files: &[DataFile]) -> Result<(
 /// Leader, under the lake's lock: record another engine's append, once, if the table still
 /// stands as the writer read it; then publish its next version under the writer's snapshot id,
 /// and delete the writer's own files. Answers the table as the catalog does.
-pub async fn record(lake: &Lake, seq: &crate::log::Sequencer, c: Commit, nodes: &[String], me: &str) -> Result<Value> {
+pub async fn record(lake: &Lake, seq: &crate::log::Sequencer, c: Commit, nodes: &[String], me: &str, retain_ms: u64) -> Result<Value> {
     if !done(lake, &c.job()).await? {
         check(lake, &c).await?;
+        if !c.removed.is_empty() && crate::adopt::stale(lake, &c.table).await? {
+            up_to_date(lake, &c.table, nodes, me, retain_ms).await?;
+            anyhow::bail!("{CONFLICT}: it had rows the writer couldn't read yet (in the log, or changed), now in its files: read it again");
+        }
         let files: Vec<String> = c.written.iter().flat_map(|f| f.paths()).collect();
-        let adopted = c.adopt && crate::adopt::record(lake, seq, &c.table, &c.job(), &c.incoming).await?;
+        let adopted = c.adopt && crate::adopt::record(lake, seq, &c.table, &c.job(), &c.incoming, &c.removed).await?;
         let into_files = adopted || match c.written {
             Some(ref f) => match crate::write::record(lake, f.clone(), Some(seq)).await {
                 Err(e) if format!("{e:#}").contains(crate::write::AGAIN) => {
@@ -925,6 +963,17 @@ pub async fn record(lake: &Lake, seq: &crate::log::Sequencer, c: Commit, nodes: 
         }
     }
     loaded(lake, &c.table).await
+}
+
+/// The table's log rows into its files, its changed rows out of them, and its next version
+/// published: what another engine reads is then the table as Pondra has it (ADR-029 §3).
+async fn up_to_date(lake: &Lake, table: &str, nodes: &[String], me: &str, retain_ms: u64) -> Result<()> {
+    let upto = lake.visible();
+    for t in [table.to_string(), crate::sys::deleted(table)] {
+        while !crate::tier::tier_table(lake, &t, upto, nodes, me).await?.1 {}
+    }
+    crate::tier::purge(lake, table, nodes, me, retain_ms, true).await?;
+    crate::delta::publish_all(lake).await
 }
 
 /// The writer's rows into the log, for the views and tasks that follow the table (one append:

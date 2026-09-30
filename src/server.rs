@@ -470,7 +470,7 @@ impl App {
         let Some(seq) = &self.seq else { return crate::write::post(&self.cluster.leader.addr, &crate::write::Request::Iceberg(Box::new(c))).await };
         let _guard = self.lock.lock().await;
         let nodes = if self.cluster.nodes().is_empty() { vec![self.cluster.addr.clone()] } else { self.cluster.nodes() };
-        crate::iceberg::record(&self.lake, seq, c, &nodes, &self.cluster.addr).await
+        crate::iceberg::record(&self.lake, seq, c, &nodes, &self.cluster.addr, self.retain_ms).await
     }
 
     /// Where this node gets commit numbers (`log::To::reserve`): its own sequencer, or the leader's.

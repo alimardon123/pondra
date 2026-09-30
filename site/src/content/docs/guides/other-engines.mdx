@@ -175,18 +175,7 @@ Spark does the same through the catalog: `INSERT INTO lake.default.events SELECT
 `df.writeTo("lake.default.events").append()`.
 
 Each commit lands once: a writer whose snapshot is stale gets `409` and retries on top of the new
-version, and a commit sent twice is applied once. Anything else is refused by name:
-
-```python
-try:
-    catalog.load_table("default.events").delete("user = 'cy'")
-except Exception as e:
-    print(e)
-```
-
-```text
-BadRequestException: a snapshot that does overwrite: other engines append; deletes and overwrites go through Pondra's SQL (DELETE, UPDATE, MERGE)
-```
+version, and a commit sent twice is applied once.
 
 **Checked, from each file's footer:** its row count is the one its manifest says, its columns have
 the table's types, a `NOT NULL` column holds no NULL, and in a partitioned table the file holds one
@@ -197,8 +186,42 @@ streaming tasks follow (they take its rows through the log), or to one with a re
 column (Delta readers match columns by name, and the table's files keep the names they were
 written under).
 
-**Refused:** deletes and overwrites (use `DELETE`, `UPDATE`, `MERGE` in Pondra), schema changes
-(`ALTER TABLE`), and appends to keyed tables.
+**Refused:** schema changes (`ALTER TABLE`), writes to keyed tables, and another engine's
+compaction (Pondra merges its tables' files itself).
+
+## Change rows from another engine
+
+Other engines change a table's rows through the catalog too, **copy-on-write**: Spark's `DELETE`,
+`UPDATE` and `MERGE` (Iceberg's default mode), PyIceberg's `delete` and `overwrite`. The commit
+takes the files it rewrote out of the table and adds the new ones, which are recorded as written.
+Rows in a file the change left alone keep their row ids; rows it rewrote get new ones, since
+Iceberg v2 sees a change as a delete and an insert.
+
+```python
+catalog.load_table("default.events").delete("user = 'cy'")
+```
+
+```sql
+SELECT user, amount FROM events ORDER BY ts;
+```
+
+```text
+user  amount
+ann   5
+bob   7
+ann   2
+```
+
+- **Against the table as Pondra has it.** A change that takes files out is refused with `409`
+  when the table has rows the writer couldn't read in its last published version (rows still in
+  the log, or changed by Pondra's own `UPDATE`): the node writes them into files and publishes at
+  once, and the writer reads the table again and runs Iceberg's own conflict checks before it
+  retries. So a `DELETE` from Spark never misses a row Pondra took before it. (A change that
+  matches no file at all commits nothing, so rows only in the log escape it: `CHECKPOINT` first,
+  or change them with Pondra's SQL.)
+- **Refused by name:** a change to a table that views or tasks follow, or that has a renamed
+  column (change those with Pondra's SQL), and delete files: merge-on-read, Spark's
+  `write.delete.mode = merge-on-read`, isn't taken yet.
 
 ### Make a table through the catalog
 
