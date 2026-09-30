@@ -206,23 +206,41 @@ curl -s --max-time 2 -G http://localhost:8080/live --data-urlencode 'sql=SELECT 
 
 ## Files
 
+The lake's own files, under `files/`: notebooks, SQL and Python files, data files, images. The
+console's Workspace shows them and edits them in place.
+
 | Method and path | Role | Meaning |
 |---|---|---|
-| `PUT /files/{path}` | write | store the body as an object in the lake, at `files/{path}` |
-| `GET /files/{path}` | read | the object's bytes |
+| `PUT /files/{path}` | write | store the body at `files/{path}`; a new file, or with `If-Match` the file replaced |
+| `GET /files/{path}` | read | the file's bytes, its version as `etag`, and a content type by its name |
+| `DELETE /files/{path}` | write | remove it |
 
-An object is never overwritten: a `PUT` to a path that exists is an error. The answer to `PUT` is
-`{"path": "files/{path}", "bytes": N}`. Read them from SQL with `files()` and `file_read()`, see
-[functions](/pondra/reference/functions/#files).
+- **A new file:** a `PUT` with no `If-Match` to a path that exists is refused with `409`, so a
+  file is never overwritten blind.
+- **Replacing one:** send the `etag` a `GET` gave as `If-Match`. If someone saved the file since,
+  the `PUT` is refused with `412`, and theirs is kept: read it again, or save under another name.
+- **The answer to `PUT`** is `{"path": "files/{path}", "bytes": N, "version": "…"}`, the version
+  the next `If-Match` needs. A `GET` of a path with no file is `404`.
+- **Every node reads a replaced file's new bytes** at its next statement: nothing caches `files/`
+  (not the SSD tier either). The rest of the lake is never overwritten, so it is cached.
+
+Read them from SQL with `files()` and `file_read()`, see [functions](/pondra/reference/functions/#files).
 
 ```bash
 curl -s -X PUT http://localhost:8080/files/notes/a.txt --data-binary 'hello'
-curl -s http://localhost:8080/files/notes/a.txt
+curl -s http://localhost:8080/files/notes/a.txt; echo
+v=$(curl -sI http://localhost:8080/files/notes/a.txt | tr -d '\r' | sed -n 's/^etag: //ip')
+curl -s -X PUT http://localhost:8080/files/notes/a.txt -H "If-Match: $v" --data-binary 'hello again'
+curl -s -X PUT http://localhost:8080/files/notes/a.txt -H "If-Match: $v" --data-binary 'too late'; echo
+curl -s -X DELETE http://localhost:8080/files/notes/a.txt
 ```
 
 ```text
-{"path":"files/notes/a.txt","bytes":5}
+{"path":"files/notes/a.txt","bytes":5,"version":"…"}
 hello
+{"path":"files/notes/a.txt","bytes":11,"version":"…"}
+files/notes/a.txt: the file changed since it was opened: open it again, or save under another name
+{"removed":"files/notes/a.txt"}
 ```
 
 ## Functions, routines and secrets

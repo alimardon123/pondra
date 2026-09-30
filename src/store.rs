@@ -27,6 +27,25 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 pub type Store = Arc<dyn ObjectStore>;
 
+/// A user's file, next to the tables (`PUT /files`): the one kind of lake object that may be
+/// replaced or removed, so no cache keeps it (ADR-034). Everything else is written once.
+pub fn replaceable(path: &str) -> bool { path.starts_with("files/") }
+
+fn version_of(m: &object_store::ObjectMeta) -> String {
+    match &m.e_tag {
+        Some(e) => format!("{}:{}", e.trim_matches('"'), m.size),
+        None => format!("@{}:{}", m.last_modified.timestamp_micros(), m.size),
+    }
+}
+
+/// A file replaced since the version an editor read (`If-Match`): `PUT /files` answers 412.
+#[derive(Debug)]
+pub struct Changed;
+impl std::fmt::Display for Changed {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { write!(f, "the file changed since it was opened: open it again, or save under another name") }
+}
+impl std::error::Error for Changed {}
+
 /// A table: columns, the Parquet files already tiered, and the last log segment they cover.
 #[derive(Serialize, Deserialize, Clone, Default)]
 pub struct TableMeta {
@@ -665,24 +684,73 @@ impl Lake {
         let opts = PutOptions { mode: PutMode::Create, ..Default::default() };
         let bytes = Bytes::from(bytes);
         self.store.put_opts(&Path::from(path), bytes.clone().into(), opts).await?;
-        if let (Some(disk), false) = (&self.disk, crate::delta::open_format(path)) {
+        if let (Some(disk), false) = (&self.disk, crate::delta::open_format(path) || replaceable(path)) {
             disk.put(path, &bytes); // what a node writes, it keeps
         }
         Ok(())
     }
 
-    /// A whole lake object: from the SSD tier if it's there, else from the bucket (and kept).
+    /// A whole lake object: from the SSD tier if it's there, else from the bucket (and kept). A
+    /// user's file (`files/`) may be replaced, so it is always the bucket's (ADR-034).
     pub async fn object(&self, path: &str) -> Result<Bytes> {
-        if let Some((file, _)) = self.disk.as_ref().and_then(|d| d.get(path)) {
+        let disk = self.disk.as_ref().filter(|_| !replaceable(path));
+        if let Some((file, _)) = disk.and_then(|d| d.get(path)) {
             if let Ok(bytes) = tokio::fs::read(file).await {
                 return Ok(bytes.into());
             }
         }
         let bytes = self.store.get(&Path::from(path)).await?.bytes().await?;
-        if let Some(disk) = &self.disk {
+        if let Some(disk) = disk {
             disk.put(path, &bytes);
         }
         Ok(bytes)
+    }
+
+    /// A user's file's version, for `If-Match` (`GET /files` gives it): its e-tag and size, or
+    /// (a store without e-tags) its time and size.
+    pub async fn version(&self, path: &str) -> Result<String> { Ok(version_of(&self.store.head(&Path::from(path)).await?)) }
+
+    /// A user's file and the version of those very bytes (one request: `GET /files`).
+    pub async fn file(&self, path: &str) -> Result<(Bytes, String)> {
+        let r = self.store.get(&Path::from(path)).await?;
+        let v = version_of(&r.meta);
+        Ok((r.bytes().await?, v))
+    }
+
+    /// Replace a user's file (`files/`) that is still the version `expect` (ADR-034): a newer
+    /// one, saved meanwhile, is refused (`Changed`), so two editors never overwrite each other
+    /// blind. Where the store can, the check and the write are one request (a conditional put).
+    pub async fn replace(&self, path: &str, bytes: Vec<u8>, expect: &str) -> Result<String> {
+        anyhow::ensure!(replaceable(path), "only the lake's files (files/…) are replaced");
+        static ONE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(()); // (a store with no conditional put: this node's saves one at a time)
+        let _one = ONE.lock().await;
+        let at = Path::from(path);
+        let m = self.store.head(&at).await?;
+        if version_of(&m) != expect {
+            return Err(Changed.into());
+        }
+        let (len, bytes, opts) = (bytes.len() as u64, Bytes::from(bytes), |mode| PutOptions { mode, ..Default::default() });
+        let update = PutMode::Update(object_store::UpdateVersion { e_tag: m.e_tag.clone(), version: m.version.clone() });
+        let put = match self.store.put_opts(&at, bytes.clone().into(), opts(update)).await {
+            Ok(r) => r,
+            Err(object_store::Error::Precondition { .. }) => return Err(Changed.into()),
+            Err(object_store::Error::NotImplemented { .. } | object_store::Error::NotSupported { .. }) => {
+                self.store.put_opts(&at, bytes.into(), opts(PutMode::Overwrite)).await? // (a local disk: checked just above)
+            }
+            Err(e) => return Err(e.into()),
+        };
+        match put.e_tag {
+            Some(e) => Ok(format!("{}:{len}", e.trim_matches('"'))), // (the version written: not one another save made since)
+            None => self.version(path).await,
+        }
+    }
+
+    /// Remove a user's file (`files/`): the tables' own objects are removed by Pondra alone.
+    pub async fn remove_file(&self, path: &str) -> Result<()> {
+        anyhow::ensure!(replaceable(path), "only the lake's files (files/…) are removed this way");
+        self.store.head(&Path::from(path)).await?; // (not there: an error that says so)
+        self.store.delete(&Path::from(path)).await?;
+        Ok(())
     }
 
     /// The rows of `table` in log segment `n`, decoded once and then served from memory

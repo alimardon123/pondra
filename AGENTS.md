@@ -30,13 +30,16 @@ The owner's design principles, which every change must respect:
 ## Layout
 
 ```
-src/      27,800 lines of Rust, one file per concern (see the table in README.md); round 25 added
+src/      28,600 lines of Rust, one file per concern (see the table in README.md); round 25 added
           live.rs (live queries) and temp.rs (a session's temporary tables and views); round 26
           pg_catalog.rs (Postgres's catalog, for dbt and BI tools), dbserver.rs (`pondra serve
           --lakes`: a folder of lakes as databases), defaults.rs (NOT NULL and DEFAULT), ext.rs
           (files read by name: `read_*`, `CREATE EXTERNAL TABLE`) and console.rs + console/ (the
-          console at /: index.html, console.css, console.js with its extension API, ADR-032)
-brand/    the logo (mark.svg) and colours (colors.css): the only copies; tools/brand_check.py
+          console at /, ADR-032, ADR-034: index.html, console.css, and its modules — core.js the
+          API, state and node; editor.js; grid.js; notebook.js; files.js the Workspace and the
+          file tabs; console.js the shell and `window.pondra`)
+brand/    the logo (mark.svg), colours (colors.css) and fonts (fonts/: Geist and Geist Mono, SIL
+          OFL): the only copies; tools/brand_check.py
 site/     the documentation website (Starlight; ADR-030): site/STYLE.md says how pages are written,
           site/PAGES.md what each covers; every example runs (tools/docs_check.py);
           .github/workflows/pages.yml publishes it to GitHub Pages
@@ -74,7 +77,9 @@ tools/    harness.py, cluster.py (tests), open_check.py (Delta + Iceberg readers
           bench/tpch-queries/ (the 22 TPC-H queries),
           r2_test.sh (run the suite against a real bucket), bench/ (vs Spark and Flink),
           clients_check.py (dbt against Postgres 16, psql, SQLAlchemy, pgjdbc, psqlODBC, ADBC and
-          Npgsql on the Postgres port), console_check.py (the console in headless Chromium), docs_check.py (every
+          Npgsql on the Postgres port), console_check.py (the console in headless Chromium, in parts:
+          node, files, grid, layout, budget, tokens, server, extensions), console_shots.py (the
+          website's pictures of it), docs_check.py (every
           example on the website), package.py (wheels, npm packages and the binary alone from a binary), try_packages.sh
           (them installed and tried as CI does on each OS: pip without and with pyarrow, npm, the
           installer; try_install.ps1 is Windows's), npm_publish.sh (the release's npm publish; CI dry-runs it), anywhere_check.py (the shell, local(),
@@ -894,9 +899,10 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    (`--advertise host:port/db/name`, `--attach-found <folder>`, `--stop-with-stdin`,
    `PONDRA_SERVER_URL`); the server routes Postgres by the startup message and HTTP by
    `/db/{name}`. `harness.py server` (local, `--s3`).
-138. **The console asks only the node that served it** (no CDN, fonts or other hosts; its files are
-   `include_str!`ed; extensions are the node's own files). `console_check.py`: "every request went
-   to the node", with and without an extension.
+138. **The console asks only the node that served it** (no CDN or other hosts; its page, modules
+   and style sheet are `include_str!`ed and its fonts `include_bytes!`ed from `brand/fonts/`;
+   extensions are the node's own files). `console_check.py`: "every request went to the node", in
+   every part, with and without an extension.
 139. **A view of files is a view** (`StoredView.external`, `ext.rs`): `CREATE EXTERNAL TABLE` stores
    `SELECT … FROM read_*(…)`, copies nothing, and `INSERT` into one over a folder is `COPY … TO
    folder/ (APPEND true, …)`, from a node and from `pondra sql` (`write::from_cli` calls
@@ -924,15 +930,36 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
 144. **The brand has one source** (`brand/`): nothing else draws the mark or is a logo or favicon;
    the console and the site take it from there. `tools/brand_check.py` (the repository, `--node`,
    `--site`).
-145. **Everything the console shows is registered** (`console.js`: `register.*`), the core's own
-   parts as an extension's; registrations made while the page starts are drawn with the core's
-   (`started` is set after the first drawing). `console_check.py`: the extension's section, tab,
-   view and action.
-146. **The console's files are tagged by their contents** (`console::file`: a hash, `no-cache`,
-   `304` on a match), so a new binary's console is never a stale one. `console_check.py`.
+145. **Everything the console shows is registered** (`core.js`: `register.*`), the core's own
+   parts as an extension's: its views (Data, Workspace, Details, Variables, Runs: `register.view`,
+   either side), its kinds of file (`register.doc`), cells, answers' views and actions;
+   registrations made while the page starts are drawn with the core's (`started` is set after the
+   first drawing). `console_check.py`: the extension's section, tab, view and action; views moved.
+146. **The console's files are tagged by their contents** (`console::FILES`: a hash, `no-cache`,
+   `304` on a match), so a new binary's console is never a stale one; gzipped when the browser
+   takes it; the console's own scripts and style sheet served without whole-line comments,
+   blank lines and indentation (`console::lean`), so they hold no string or template literal
+   over several lines. `console_check.py` (every part runs the served code; `budget`: the 304s).
 147. **A lake's own files are readable by its readers** (`ext::own_file`), and `GET /objects` reads
    the catalog only (no query). `harness.py external`, `console_check.py` (a file read as a
    table).
+148. **A lake's own files are replaced only by their version** (`store::replace`, ADR-034 §4):
+   `files/` alone may be overwritten, and only by a `PUT` whose `If-Match` is the version a `GET`
+   gave (`412` if it changed: `store::Changed`; `409` with no `If-Match` on a path that exists).
+   Everything else in a lake is still never overwritten, which is what lets it be cached; so
+   `files/` is never cached: `store::replaceable` keeps it out of the SSD tier (`put` and
+   `object`), and DataFusion keeps no list of files (`with_list_files_cache_limit(0)`), so every
+   node reads a replaced file at its next statement. `harness.py external` (both nodes read the
+   new rows; `--s3`: nothing under `files/` in the tier).
+149. **The console keeps its budget** (ADR-034 §7): its scripts and style sheet at most 70 KB
+   gzipped as served, first paint under 400 ms, a key under 8 ms in a 1,000-line file, a 10,000-row
+   scroll's p95 frame under 20 ms; and axe finds nothing (WCAG 2.1 AA, contrast included), light
+   and dark. A change that breaks one makes room first (the ADR's measures: a line highlighted at
+   a time, the width in steps, rows drawn in sight). `console_check.py` (`budget`, `layout`).
+150. **The editor's highlighting is the whole text's** (`editor.js` `LINE`): each line highlighted
+   from the state the one before left (a block comment, a quote, a triple-quoted string), and
+   again only as far as a change moves that state. `console_check.py` (`budget`: the lines drawn
+   equal to the whole text highlighted, after edits that open and close comments and quotes).
 
 ## Tests: run these before and after any change
 
@@ -1061,6 +1088,14 @@ additions (manifests, partitions, shuffles, memory limits, Arrow Flight) also ra
 R2; round 12's are in `logs/round12/`, round 13's in `logs/round13/`, round 14's in
 `logs/round14/`, round 15's in `logs/round15/`, round 16's in `logs/round16/`, round 17's in `logs/round17/`,
 round 18's in `logs/round18/`, round 19's in `logs/round19/`, round 20's in `logs/round20/`, round 21's in `logs/round21/`, round 22's in `logs/round22/`, round 23's in `logs/round23/`, round 24's in `logs/round24/`, round 25's in `logs/round25/` and round 26's in `logs/round26/`.
+
+**Round 26, continued (ADR-034): the console as the canvas drew it.** Tabs of notebooks, SQL,
+Python, data and text files; Data and Workspace on the left (a filter; either view moves to the
+right as a tab), Details, Variables and Runs on the right; a SQL file's statements each with its
+answer (or, by Settings, the last one's); a Python file's console; CSV and JSON edited in a grid and
+saved in place (`If-Match`, invariant 148); one grid everywhere (coloured type marks, a header's
+card, a spreadsheet's selection, copy, filter and sort); Geist fonts, the charcoal dark theme,
+Settings, Sign in, pane edges, narrow windows; the budget and axe checked (invariants 149, 150).
 
 **Round 26, continued (ADR-032), before the tag:** `CREATE EXTERNAL TABLE` as a view of files;
 `to_timestamp` as DataFusion answers it; a page's Python cells sharing a worker (variables,

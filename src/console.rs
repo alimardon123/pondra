@@ -1,17 +1,58 @@
-//! The console (ADR-030, ADR-032): a page at `/`, embedded in the binary, served by every node and by
-//! `pondra serve` over a folder of lakes (its databases). SQL, Python and text cells, a live switch, notebooks kept in the lake as
-//! `.ipynb`. No install, no CDN: it works offline, and no request leaves the node.
-use axum::response::Html;
+//! The console (ADR-030, ADR-032, ADR-034): a page at `/`, embedded in the binary, served by every
+//! node and by `pondra serve` over a folder of lakes (its databases). Tabs of notebooks, SQL,
+//! Python, data and text files; the lake's tables and files; answers in a grid. No install, no CDN:
+//! it works offline, and no request leaves the node.
+use axum::{http::{HeaderMap, StatusCode}, response::{IntoResponse, Response}};
+use std::{collections::HashMap, sync::LazyLock};
 
-/// The console's files: a page that holds the header, and the module and stylesheet it loads, all
-/// built into the binary, their mark and colours from `brand/` (ADR-032). Extensions a node was
-/// given (`PONDRA_CONSOLE_EXTENSIONS`: scripts, separated as PATH is) load after the console, at
-/// `/console/ext/{i}.js`: an enterprise build adds its own sections, panels and actions this way
+/// The console's files (ADR-034): a page, its style sheet, its modules and its fonts, all built into
+/// the binary, their mark and colours from `brand/` (ADR-032). Extensions a node was given
+/// (`PONDRA_CONSOLE_EXTENSIONS`: scripts, separated as PATH is) load after the console, at
+/// `/console/ext/{i}.js`: an enterprise build adds its own views, kinds of file and actions this way
 /// (`window.pondra`).
 const MARK: &str = include_str!("../brand/mark.svg");
 const COLORS: &str = include_str!("../brand/colors.css");
+const JS: &str = "text/javascript; charset=utf-8";
 
-static PAGE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+/// One file the console serves: its bytes, the same gzipped when it is text (worked out once), its
+/// type, and a tag that is its contents' hash, so a browser asks again each time and gets `304`
+/// while it is the same.
+struct Asset { body: bytes::Bytes, gz: Option<bytes::Bytes>, kind: &'static str, tag: String }
+
+impl Asset {
+    fn new(body: impl Into<Vec<u8>>, kind: &'static str) -> Asset {
+        use std::hash::{Hash, Hasher};
+        let body: Vec<u8> = body.into();
+        let gz = (!kind.starts_with("font/")).then(|| {
+            let mut e = flate2::write::GzEncoder::new(vec![], flate2::Compression::best());
+            std::io::Write::write_all(&mut e, &body).and_then(|_| e.finish()).map(bytes::Bytes::from).expect("gzip into memory")
+        });
+        let mut h = std::hash::DefaultHasher::new();
+        body.hash(&mut h);
+        Asset { body: body.into(), gz, kind, tag: format!("{:016x}", h.finish()) }
+    }
+
+    fn serve(&self, headers: &HeaderMap) -> Response {
+        let takes_gzip = headers.get("accept-encoding").and_then(|v| v.to_str().ok()).is_some_and(|v| {
+            v.split(',').map(|e| e.trim()).any(|e| e.split(';').next() == Some("gzip") && !e.replace(' ', "").ends_with("q=0"))
+        });
+        let (body, tag) = match &self.gz {
+            Some(gz) if takes_gzip => (gz.clone(), format!("\"{}.gz\"", self.tag)),
+            _ => (self.body.clone(), format!("\"{}\"", self.tag)),
+        };
+        if headers.get("if-none-match").is_some_and(|t| t.as_bytes() == tag.as_bytes()) {
+            return StatusCode::NOT_MODIFIED.into_response();
+        }
+        let mut r = ([("content-type", self.kind), ("etag", tag.as_str()), ("cache-control", "no-cache"), ("vary", "accept-encoding")], body).into_response();
+        if tag.ends_with(".gz\"") {
+            r.headers_mut().insert("content-encoding", axum::http::HeaderValue::from_static("gzip"));
+        }
+        r
+    }
+}
+
+/// The page: the header's mark, the favicon, the version and the extensions' scripts filled in.
+fn page_text() -> String {
     let icon: String = MARK.bytes().map(|b| match b {
         b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b' ' | b'=' | b'/' | b':' | b'.' | b'-' | b'(' | b')' | b',' | b'"' => (b as char).to_string(),
         b => format!("%{b:02X}"), // (`#`, `<`, `>`, `{`, new lines: as a URL holds them)
@@ -20,14 +61,56 @@ static PAGE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     include_str!("console/index.html")
         .replacen("{{favicon}}", &format!("data:image/svg+xml,{}", icon.replace('"', "'")), 1)
         .replacen("{{mark}}", MARK.trim(), 1)
+        .replacen("{{version}}", env!("CARGO_PKG_VERSION"), 1)
         .replacen("<!--{{extensions}}-->", &extensions, 1)
+}
+
+/// The console's own script or style sheet as served: its whole-line comments, blank lines and
+/// indentation left out (a tenth less to send, gzipped); every other line as written. So its code
+/// holds no string or template literal over several lines (console_check's parts run it as served).
+fn lean(src: &str) -> String {
+    let (mut out, mut comment) = (String::with_capacity(src.len()), false);
+    for line in src.lines() {
+        let mut t = line.trim();
+        if comment {
+            let Some(end) = t.find("*/") else { continue };
+            (comment, t) = (false, t[end + 2..].trim());
+        } else if t.starts_with("/*") && !t.starts_with("/*{{") {
+            match t.find("*/") {
+                Some(end) => t = t[end + 2..].trim(),
+                None => (comment, t) = (true, ""),
+            }
+        }
+        if !t.is_empty() && !t.starts_with("//") {
+            out.push_str(t);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// Everything under `/console/`, by name.
+static FILES: LazyLock<HashMap<String, Asset>> = LazyLock::new(|| {
+    let mut all: HashMap<String, Asset> = [
+        ("console.js", Asset::new(lean(include_str!("console/console.js")), JS)),
+        ("core.js", Asset::new(lean(include_str!("console/core.js")), JS)),
+        ("editor.js", Asset::new(lean(include_str!("console/editor.js")), JS)),
+        ("grid.js", Asset::new(lean(include_str!("console/grid.js")), JS)),
+        ("notebook.js", Asset::new(lean(include_str!("console/notebook.js")), JS)),
+        ("files.js", Asset::new(lean(include_str!("console/files.js")), JS)),
+        ("console.css", Asset::new(lean(&include_str!("console/console.css").replacen("/*{{colors}}*/", COLORS.trim(), 1)), "text/css; charset=utf-8")),
+        ("fonts/Geist.woff2", Asset::new(&include_bytes!("../brand/fonts/Geist.woff2")[..], "font/woff2")),
+        ("fonts/GeistMono.woff2", Asset::new(&include_bytes!("../brand/fonts/GeistMono.woff2")[..], "font/woff2")),
+    ].into_iter().map(|(n, a)| (n.to_string(), a)).collect();
+    for (i, s) in extensions().iter().enumerate() {
+        all.insert(format!("ext/{i}.js"), Asset::new(s.as_str(), JS));
+    }
+    all
 });
-static CSS: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| include_str!("console/console.css").replacen("/*{{colors}}*/", COLORS.trim(), 1));
-const JS: &str = include_str!("console/console.js");
 
 /// The scripts `PONDRA_CONSOLE_EXTENSIONS` names, read once.
 fn extensions() -> &'static [String] {
-    static ALL: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| {
+    static ALL: LazyLock<Vec<String>> = LazyLock::new(|| {
         std::env::var_os("PONDRA_CONSOLE_EXTENSIONS").map(|v| std::env::split_paths(&v).filter_map(|p| match std::fs::read_to_string(&p) {
             Ok(s) => Some(s),
             Err(e) => {
@@ -40,31 +123,23 @@ fn extensions() -> &'static [String] {
 }
 
 /// A node's console: its lake.
-pub fn page() -> Html<&'static str> { Html(PAGE.as_str()) }
-
-/// The server's: its databases, each through `/db/{name}`.
-pub fn server_page() -> Html<&'static str> {
-    static SERVER: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| PAGE.replacen(r#"data-mode="lake""#, r#"data-mode="lakes""#, 1));
-    Html(SERVER.as_str())
+pub async fn page(headers: HeaderMap) -> Response {
+    static PAGE: LazyLock<Asset> = LazyLock::new(|| Asset::new(page_text(), "text/html; charset=utf-8"));
+    PAGE.serve(&headers)
 }
 
-/// `GET /console/{file}`: the module, the stylesheet, an extension. Browsers ask again each time
-/// and get `304` while it is the same (its tag is its contents' hash).
-pub async fn file(axum::extract::Path(name): axum::extract::Path<String>, headers: axum::http::HeaderMap) -> axum::response::Response {
-    use axum::response::IntoResponse;
-    let (body, kind): (&str, &str) = match name.as_str() {
-        "console.js" => (JS, "text/javascript; charset=utf-8"),
-        "console.css" => (CSS.as_str(), "text/css; charset=utf-8"),
-        n => match n.strip_prefix("ext/").and_then(|n| n.strip_suffix(".js")).and_then(|i| i.parse::<usize>().ok()).and_then(|i| extensions().get(i)) {
-            Some(s) => (s.as_str(), "text/javascript; charset=utf-8"),
-            None => return (axum::http::StatusCode::NOT_FOUND, "no such file").into_response(),
-        },
-    };
-    let tag = format!("\"{:x}\"", { use std::hash::{Hash, Hasher}; let mut h = std::hash::DefaultHasher::new(); body.hash(&mut h); h.finish() });
-    if headers.get("if-none-match").is_some_and(|t| t.as_bytes() == tag.as_bytes()) {
-        return axum::http::StatusCode::NOT_MODIFIED.into_response();
+/// The server's: its databases, each through `/db/{name}`.
+pub async fn server_page(headers: HeaderMap) -> Response {
+    static SERVER: LazyLock<Asset> = LazyLock::new(|| Asset::new(page_text().replacen(r#"data-mode="lake""#, r#"data-mode="lakes""#, 1), "text/html; charset=utf-8"));
+    SERVER.serve(&headers)
+}
+
+/// `GET /console/{file}`: a module, the style sheet, a font, an extension.
+pub async fn file(axum::extract::Path(name): axum::extract::Path<String>, headers: HeaderMap) -> Response {
+    match FILES.get(&name) {
+        Some(a) => a.serve(&headers),
+        None => (StatusCode::NOT_FOUND, "no such file").into_response(),
     }
-    ([("content-type", kind), ("etag", tag.as_str()), ("cache-control", "no-cache")], body).into_response()
 }
 
 /// `GET /objects`: what the console's catalog and its details panel show of each table and view

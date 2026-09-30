@@ -263,7 +263,7 @@ pub async fn serve(folder: String, addr: String, pg: Option<String>, default: Op
         });
     }
     let app = Router::new()
-        .route("/", get(|| async { crate::console::server_page() }))
+        .route("/", get(crate::console::server_page))
         .route("/console/{*file}", get(crate::console::file))
         .route("/databases", get(list).post(create))
         .route("/databases/{name}", axum::routing::delete(drop_db))

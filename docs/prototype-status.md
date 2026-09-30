@@ -1,6 +1,6 @@
 # Prototype status: Pondra, a streamhouse in one binary
 
-**Date:** 2026-09-29 (round 26 and its continuation) · **Plan:** ADR-002 to ADR-033, `roadmap.md` · **Code:** `pondra.zip` / `pondra.bundle` (≈27,800 lines of Rust, plus Python and JavaScript clients, a documentation website, packaging, and test and benchmark tools)
+**Date:** 2026-09-29 (round 26 and its continuation) · **Plan:** ADR-002 to ADR-034, `roadmap.md` · **Code:** `pondra.zip` / `pondra.bundle` (≈28,600 lines of Rust, plus Python and JavaScript clients, a documentation website, packaging, and test and benchmark tools)
 **Name:** the prototype formerly called `lh` is now **Pondra**. The name is free on crates.io, PyPI and npm. A small personal-finance app uses it (pondra.app), a different category; run a trademark search before a public launch.
 
 ## Where it stands
@@ -71,6 +71,25 @@ round:
    - `server` and `external` on real R2.
 7. **Proposed, not built:** the server's catalog (ADR-032 §9), a workspace of files, runs and
    parameters (ADR-033). **Decided:** backward compatibility from 1.0 on, not before.
+
+**Round 26, continued again (ADR-034): the console as the owner's canvas drew it.**
+
+1. **Tabs:** notebooks, SQL files (Results, Messages, Chart, Plan; each statement its answer, or
+   by Settings the last one's), Python files (a console on the page's Python, and a `>>>` line),
+   data files (CSV and JSON edited in a grid, Parquet read-only) and text.
+2. **Around them:** Data and Workspace on the left (a filter; the notebook's outline under it), Details,
+   Variables and Runs on the right; any view moves to the other side; pane edges; Settings (theme,
+   order, font, statements); Sign in; narrow windows as drawers.
+3. **Files saved where they are:** `PUT /files` with `If-Match` replaces a lake's file, never over
+   someone else's change (`412`); `DELETE`; `files/` kept out of every cache, so every node reads
+   the new bytes at once.
+4. **One grid:** coloured type marks, a header's card, a spreadsheet's selection (the row lit),
+   Ctrl+C as cells, filter and sort from the menu.
+5. **Measured** (`console_check.py budget`): the code 69 KB gzipped as served (70 KB allowed),
+   first paint about 70 ms, a key 3 ms in a 1,000-line file (33 ms before the line-at-a-time
+   highlighting), a 10,000-row scroll's p95 frame 18 ms; axe finds nothing, light and dark.
+6. **Tests:** `console_check.py` (60 checks in 8 parts), `harness.py external` (locally and on
+   simulated R2: replace, 409, 412, delete, two nodes, the SSD tier), `docs_check.py`.
 
 **Round 26 made Pondra something people can find their way around** (ADR-030): a documentation
 website, a console in the browser, a server of databases, and the Postgres catalog that dbt and BI

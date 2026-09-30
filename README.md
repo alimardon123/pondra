@@ -68,7 +68,7 @@ and hands the lake on at once, so the next one opens it straight away.
 ```bash
 cargo build --release
 
-# Local directory; the console (SQL, Python and text cells, notebooks) is at http://127.0.0.1:8080/
+# Local directory; the console (notebooks, SQL, Python and data files in tabs) is at http://127.0.0.1:8080/
 ./target/release/pondra serve ./lake
 
 # A folder of lakes as databases: psql -d sales, or http://host:8080/db/sales/…
@@ -478,7 +478,8 @@ bucket to its newest lakes.
 - Per-table grants, quotas and TLS (tokens are per role; put a TLS proxy in front, and keep a
   cluster's nodes on a private network: they talk plain HTTP to each other). Power BI Desktop
   itself hasn't run against Pondra (its drivers, Npgsql and psqlODBC, are tested).
-- The console: no completion or charts yet.
+- The console: two people's changes to one file aren't merged (the second save is refused, and
+  says so); a Parquet file, or a data file over 10 MB, opens read-only.
 - A folder of lakes (`pondra serve data`) is on the node's own disk, not in a bucket.
 - Kafka: one partition per topic, no transactions; offsets are positions in the log (increasing,
   not dense). Consumer groups live in the leader's memory (members rejoin after a failover).

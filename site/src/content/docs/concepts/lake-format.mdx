@@ -38,7 +38,7 @@ lake/
 │   └── alive/            "the leader of this term is still here"
 ├── inbox/                writes from machines that can't reach the leader
 ├── log/                  the log tail: bigger flushes, as Arrow IPC + ZSTD
-├── files/                objects put there with PUT /files/<path>: images, PDFs, models
+├── files/                the lake's own files (PUT /files/<path>): notebooks, SQL, data, images
 └── data/<table>/         one folder per table
     ├── <uuid>.parquet    the table's rows
     ├── _manifests/       the file list, once a table has more than 128 files
@@ -83,8 +83,9 @@ lake/data/orders/metadata
 
 A node also keeps two things outside the lake. Delete either whenever you like.
 
-- **The SSD tier**, for lakes on object storage only: copies of immutable objects, in a `pondra-cache`
-  folder in the temp directory (or `--cache-dir`).
+- **The SSD tier**, for lakes on object storage only: copies of the objects that never change (all
+  but `files/`, whose files are replaced in place), in a `pondra-cache` folder in the temp directory
+  (or `--cache-dir`).
 - **Replica files**, with `--ack replicated`: the changes the bucket doesn't have yet. They are
   deleted as soon as it has them.
 

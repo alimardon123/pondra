@@ -66,6 +66,26 @@ def repository(checks):
         and "'../brand/colors.css'" in astro and "public/favicon.svg" in astro and "mark-light.svg" in astro and "mark-dark.svg" in astro
 
 
+def lean(text):
+    """A style sheet as the node serves the console's (`console::lean`): no whole-line comments,
+    blank lines or indentation."""
+    out, comment = [], False
+    for line in text.splitlines():
+        t = line.strip()
+        if comment:
+            if "*/" not in t:
+                continue
+            comment, t = False, t[t.index("*/") + 2:].strip()
+        elif t.startswith("/*") and not t.startswith("/*{{"):
+            if "*/" in t:
+                t = t[t.index("*/") + 2:].strip()
+            else:
+                comment, t = True, ""
+        if t and not t.startswith("//"):
+            out.append(t)
+    return "\n".join(out)
+
+
 def node(checks):
     """The page a node serves: the mark itself in the header, and as the tab's icon."""
     binary = os.environ.get("PONDRA_BIN") or os.path.join(ROOT, "target", "release", "pondra")
@@ -83,7 +103,7 @@ def node(checks):
         shown = urllib.parse.unquote(icon.group(1)) if icon else ""
         css = urllib.request.urlopen(f"http://127.0.0.1:{port}/console/console.css", timeout=5).read().decode() if html else ""
         checks["a node's console shows brand/mark.svg in its header and as its icon, and colors.css's colours"] = bool(html) and MARK.strip() in html \
-            and shown.replace("'", '"') == MARK.replace("'", '"') and COLORS.strip() in css and "{{" not in html + css
+            and shown.replace("'", '"') == MARK.replace("'", '"') and lean(COLORS) in css and "{{" not in html + css
     finally:
         p.terminate()
         p.wait(10)

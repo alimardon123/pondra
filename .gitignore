@@ -4,6 +4,9 @@ __pycache__/
 *.pyc
 *.stderr
 /site/node_modules
+/tools/node_modules
+/tools/package-lock.json
+/tools/package.json
 /site/dist
 /site/.astro
 /singlenode.json

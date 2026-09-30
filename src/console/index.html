@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en" data-mode="lake">
+<html lang="en" data-mode="lake" data-version="{{version}}">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -7,45 +7,69 @@
 <title>Pondra</title>
 <link rel="icon" href="{{favicon}}"><!-- (brand/mark.svg: console.rs) -->
 <link rel="stylesheet" href="/console/console.css">
-<!-- The console (ADR-030, ADR-032): this page, console.css and console.js, all served by the node
-     (or the server). No CDN, no fonts, nothing from anywhere else. console.js is the core and its
-     API, `window.pondra`: what extensions (and an enterprise build) add their sections, panels,
-     cell kinds, answers' views and actions through. -->
+<link rel="preload" href="/console/fonts/Geist.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="modulepreload" href="/console/core.js"><link rel="modulepreload" href="/console/editor.js"><link rel="modulepreload" href="/console/grid.js">
+<link rel="modulepreload" href="/console/notebook.js"><link rel="modulepreload" href="/console/files.js">
+<!-- The console (ADR-030, ADR-032, ADR-034): this page, its style sheet, its modules and its fonts,
+     all served by the node (or the server). No CDN, nothing from anywhere else. console.js is the
+     shell and its API, `window.pondra`: what extensions (and an enterprise build) add their views,
+     kinds of file, answers' views and actions through. -->
 </head>
 <body>
 <header id="top">
+  <h1 class="sr">Pondra console</h1>
   <div class="brand">{{mark}}<span>Pondra</span></div>
   <span id="where" class="pill" title="">connecting…</span>
-  <div class="nb"><input id="nbname" value="untitled" aria-label="Notebook name" spellcheck="false"><span id="dirty" title="Not saved" hidden></span></div>
-  <span class="spacer"></span>
-  <span id="kernel" class="pill kernel" hidden></span>
+  <div class="center"><button id="search" class="search" title="Search tables, files and commands (Ctrl K)"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="6.5"/><path d="m20 20-4.2-4.2"/></svg><span>Search tables, files and commands</span><kbd>Ctrl K</kbd></button></div>
   <div id="actions" class="actions"></div>
+  <div id="panes" class="panes" role="group" aria-label="Panes"></div>
+  <span class="sep"></span>
+  <button id="runsBtn" class="icon" title="Runs: what this page ran" aria-label="Runs"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/></svg></button>
+  <button id="helpBtn" class="icon" title="Keys (?)" aria-label="Keys"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="8.5"/><path d="M9.6 9.3a2.5 2.5 0 1 1 3.6 2.3c-.7.3-1.2.9-1.2 1.6v.6M12 16.8v.2"/></svg></button>
+  <button id="moreBtn" class="icon" title="Settings and more" aria-label="Settings and more"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><path d="M4 7h9M17 7h3M4 12h3M11 12h9M4 17h11M19 17h1"/><circle cx="15" cy="7" r="2"/><circle cx="9" cy="12" r="2"/><circle cx="17" cy="17" r="2"/></svg></button>
+  <button id="signin" class="btn" title="Sign in: the token this node was started with">Sign in</button>
 </header>
 <div id="app">
   <nav id="rail" aria-label="Places" hidden></nav>
-  <aside id="side" aria-label="Catalog"></aside>
+  <aside id="left" aria-label="Data and workspace"><div id="leftEdge" class="edge" role="separator" aria-orientation="vertical" aria-label="The left pane's width (arrows change it)" tabindex="0"></div></aside>
   <main id="main">
-    <div id="cells" aria-label="Cells"></div>
-    <div class="add">
-      <button class="btn ghost" data-add="sql">+ SQL</button>
-      <button class="btn ghost" data-add="python">+ Python</button>
-      <button class="btn ghost" data-add="markdown">+ Text</button>
-    </div>
-    <div class="hint"><kbd>Ctrl</kbd> <kbd>Enter</kbd> runs a cell · <kbd>Tab</kbd> completes a name · <kbd>Esc</kbd> then <kbd>?</kbd> lists every key</div>
+    <div id="tabbar"></div>
+    <div id="docbar" class="docbar" role="toolbar" aria-label="The file in front" hidden></div>
+    <div id="docs"></div>
   </main>
-  <aside id="panel" aria-label="Details" hidden><div id="tabs" role="tablist"></div><div id="detail"></div></aside>
+  <aside id="right" aria-label="Details"><div id="rightEdge" class="edge" role="separator" aria-orientation="vertical" aria-label="The right pane's width (arrows change it)" tabindex="0"></div><div id="rtabs"></div><div id="rbody" role="tabpanel"></div></aside>
 </div>
+<footer id="statusbar"><div id="stl"></div><div id="str"></div></footer>
 <dialog id="tokenDlg"><form method="dialog">
-  <h3>Token</h3>
+  <h3>Sign in</h3>
   <p id="tokenWhy">The token this node was started with. It is kept in this browser only.</p>
-  <input id="tokenIn" type="password" autocomplete="off" spellcheck="false" placeholder="token">
-  <div class="acts"><button class="btn primary" value="ok">Use it</button><button class="btn" value="cancel">Cancel</button><button class="btn" value="clear">Forget it</button></div>
+  <input id="tokenIn" type="password" autocomplete="off" spellcheck="false" placeholder="token" aria-label="Token">
+  <div class="acts"><button class="btn primary" value="ok">Sign in</button><button class="btn" value="cancel">Cancel</button><button class="btn" value="clear">Forget it</button></div>
+</form></dialog>
+<dialog id="askDlg"><form method="dialog">
+  <h3 id="askTitle"></h3>
+  <label><span id="askLabel"></span><input id="askIn" autocomplete="off" spellcheck="false"></label>
+  <p id="askHint"></p>
+  <div class="acts"><button class="btn primary" value="ok">OK</button><button class="btn" value="cancel">Cancel</button></div>
+</form></dialog>
+<dialog id="settingsDlg"><form method="dialog">
+  <h3>Settings</h3>
+  <div class="setting"><label for="setTheme">Theme</label><select id="setTheme"><option value="system">As the system</option><option value="light">Light</option><option value="dark">Dark</option></select></div>
+  <div class="setting"><label for="setGroups">The left pane</label><select id="setGroups"><option value="data">Data first, then Workspace</option><option value="workspace">Workspace first, then Data</option></select></div>
+  <div class="setting"><label for="setStatements">A SQL file's statements</label><select id="setStatements"><option value="each">An answer for each</option><option value="last">The last one's answer</option></select></div>
+  <div class="setting"><label for="setFont">Font</label><select id="setFont"><option value="geist">Geist (built in)</option><option value="system">The system's</option></select></div>
+  <p>Each group's and tab's ⋯ moves it to the other pane. These settings are kept in this browser.</p>
+  <div class="acts"><button class="btn primary" value="ok">Done</button><button class="btn" type="button" id="setReset">Reset the layout</button></div>
 </form></dialog>
 <dialog id="helpDlg"><form method="dialog">
   <h3>Keys</h3>
   <div class="keys" id="keys"></div>
-  <p>A Python cell runs on the node, as <code>DO LANGUAGE python</code>: <code>db</code> is the connection, <code>print</code> shows here, a figure (matplotlib) or an image shows as a picture, and a last expression that is a frame or a table comes back as rows. The page's cells share their variables, as a notebook's do.</p>
+  <p>Python runs on the node, as <code>DO LANGUAGE python</code>: <code>db</code> is the connection, <code>print</code> shows here, a figure (matplotlib) shows as a picture, and a last expression that is a frame or a table comes back as rows. Notebooks' cells and Python files share the page's Python and its variables.</p>
   <div class="acts"><button class="btn primary" value="ok">Close</button></div>
+</form></dialog>
+<dialog id="palette" class="palette"><form method="dialog">
+  <input id="palIn" autocomplete="off" spellcheck="false" placeholder="Search tables, files and commands" aria-label="Search" role="combobox" aria-controls="palList" aria-expanded="true">
+  <div id="palList" role="listbox"></div>
 </form></dialog>
 <div id="menu" class="menu" role="menu" hidden></div>
 <div id="complete" class="complete" role="listbox" hidden></div>

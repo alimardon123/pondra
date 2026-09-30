@@ -1,6 +1,6 @@
 ---
 title: The console
-description: A web page for SQL, Python and notes that every Pondra node serves at /. The lake on the left, cells in the middle, details, profiles and variables on the right, notebooks saved in the lake, and room for extensions.
+description: A web page for SQL, Python, notebooks and data files that every Pondra node serves at /. The lake's tables and files on the left, files in tabs in the middle, details, profiles and variables on the right, answers in a spreadsheet-like grid, and room for extensions.
 sidebar:
   order: 5
 setup: |
@@ -11,12 +11,12 @@ setup: |
 import { Aside } from '@astrojs/starlight/components';
 
 Every Pondra node serves a console at `/`. Open the node's address in a browser and you get the
-lake's tables and files on the left, notebook cells in the middle (SQL, Python and text), and on the
-right the details of whatever you pick and your Python variables. There is nothing to install. The
-page is part of the `pondra` binary (about 115 KB, 35 KB compressed), it works offline, and it sends requests only to
-the node that served it.
+lake's tables and files on the left, your notebooks, SQL, Python and data files in tabs in the
+middle, and on the right the details of whatever you pick and your Python variables. There is nothing
+to install. The page is part of the `pondra` binary (its code about 70 KB compressed, its fonts 53
+KB), it works offline, and it sends requests only to the node that served it.
 
-![The console: the lake's tables and files on the left; a text cell, a SQL cell with its answer, and a Python cell with what it printed and the rows it returned; on the right, a table's details and each column's profile.](../../../assets/console.png)
+![The console: the Data and Workspace trees on the left; a notebook in a tab, with a SQL cell and its answer in the grid; on the right, a table's details.](../../../assets/console.png)
 
 ## Open it
 
@@ -34,6 +34,92 @@ pondra serve lake        # then open http://localhost:8080
   [Security](/pondra/guides/security/)). The console asks for a token the first time, and your browser
   keeps it.
 
+## The page
+
+- **The top bar:** where the page runs (the database, this node), **search** (**Ctrl+K**: tables,
+  files and commands), the three pane switches (left, bottom, right), **Runs**, the keys, **Settings**
+  and **Sign in**.
+- **The left pane:** a **Filter** box, then **Data** (databases, schemas, tables, views, columns) and
+  **Workspace** (the lake's files). The filter narrows both trees to the names that hold what you
+  type; **Esc** clears it.
+- **The middle:** a tab per open file. A dot on a tab (and beside the file in the Workspace) means
+  it has changes not saved; **Ctrl+S** saves the one in front.
+- **The right pane:** **Details**, **Variables** and **Runs**.
+- **Each view's ⋯** moves it to the other pane: Workspace can sit as a tab on the right, for
+  instance. Drag a pane's edge to set its width (a double-click resets it). **Settings** sets the
+  theme (the system's, light or dark), which group comes first on the left, the font, and how a SQL
+  file shows several statements' answers; **Reset the layout** puts the panes back. The browser keeps
+  all of it.
+- **The tabs you had open** open again next time, and the address (`#notebook=…`, `#file=…`) opens
+  one directly.
+- **In a narrow window** the side panes become drawers that close when you use the page.
+
+## Files in tabs
+
+Click a file in the Workspace to open it in a tab (its tab comes forward if it is open):
+
+| File | Opens as | Below it |
+|---|---|---|
+| A notebook (`notebooks/<name>`) | cells: SQL, Python and text | — |
+| `.sql` | an editor with line numbers | Results, Messages, Chart and Plan (or at the right) |
+| `.py` | the same editor | a console: the file's runs, and a `>>>` line |
+| `.csv`, `.tsv`, `.json`, `.jsonl`, `.parquet` | a table: CSV and JSON edited in place, Parquet read-only | — |
+| `.md`, `.txt` | the editor | — |
+
+The Workspace's **+** makes a notebook, a SQL or a Python file, or puts a file from your computer in
+the lake. A new file asks for its path the first time you save it. Right-click a file to rename,
+download or delete it.
+
+A file is saved where it is: **Ctrl+S** replaces it in the lake. If someone else saved it since you
+opened it, your save is refused and theirs kept; open it again, or save under another name. (Over
+HTTP, it's `If-Match`: see [Files](/pondra/reference/http/#files).) Every node reads the new file at
+its next statement.
+
+### SQL files
+
+![A SQL file in a tab: the editor with line numbers, and its results below, in the grid.](../../../assets/console-sql-file.png)
+
+**Run** (**Ctrl+Enter**) runs what is selected, or else the whole file.
+
+- **Each statement gets an answer.** They run in order in the page's session, and stop at the first
+  that fails. Above the results, a chip per statement (`1 done`, `2 5 rows`, `3 failed`) picks the
+  one shown, and **Messages** lists them all with how long each took. A `;` inside a string, a
+  comment or a `$$` body doesn't end a statement.
+- **Settings → A SQL file's statements → The last one's answer** runs the file at once instead and
+  shows only its last statement's answer.
+- **Plan** shows `EXPLAIN` for the statement shown. **Chart** draws the rows. The results sit below
+  the editor or at its right (the button at the right of their bar); drag the line between them.
+
+### Python files
+
+**Run file** runs it in the page's Python, the one the notebooks' Python cells share: what it printed
+and its answer show in the console below. Type a line after `>>>` and press **Enter** to run it there
+too (**↑** **↓** bring back the ones before).
+
+### Data files
+
+A CSV or JSON file opens as a table you can edit: double-click a cell (or select it and type), **Enter**
+keeps the value, **Tab** moves right, **Esc** undoes. **Add row** and **Add column** are below the
+table. A changed cell is tinted, a new row too, until you save. The lines you didn't touch are saved
+exactly as they were. **Query with SQL** reads the file as a table in a SQL tab. A Parquet file, or
+a file over 10 MB, opens read-only (the first 10,000 rows): load it into a table to change it.
+
+## Answers, in a grid
+
+Every answer (a cell's, a SQL file's) and every data file is shown in the same grid:
+
+- **Types:** a coloured mark before each column's name (`T` text, `#` whole numbers, `.01`
+  decimals, a calendar or a clock for dates and times, a switch for true/false, braces for JSON-like
+  values). Hover over a header for its full type, least and greatest value, NULLs and distinct values.
+- **Selecting:** click a cell and its whole row lights up, to follow it across a wide table. Drag or
+  **Shift+click** for a range, a row number for a row, a header for a column (and its profile in
+  Details), the corner for everything. The arrow keys move (**Shift**: extend), **Ctrl+A** takes
+  all. The bar below shows the selection's sum and average.
+- **Copying:** **Ctrl+C** copies tab-separated, so it pastes into a spreadsheet as cells;
+  **Ctrl+Shift+C** adds the headers. Right-click for Copy as CSV, JSON or a SQL list, **Filter to
+  these values** (a chip clears it), Sort and Profile.
+- **Sorting:** the small arrow in a header sorts by it (again: the other way).
+
 ## SQL cells
 
 Type SQL and press **Ctrl+Enter** (**⌘+Enter** on a Mac), or click the cell's **Run**. The answer
@@ -49,7 +135,8 @@ GROUP BY item
 ORDER BY total DESC;
 ```
 
-- A cell may hold several statements. They run in order, and the cell shows the last one's answer.
+- A cell may hold several statements. They run in order, and the cell shows the last one's answer
+  (a SQL file shows each one's).
 - A statement that changes something (`INSERT`, `CREATE TABLE`) shows what it did, such as
   `rows 3`, and the tables on the left update.
 - Errors come back in plain words, such as `No field named nope. Did you mean 'sales.item'?`.
@@ -59,21 +146,20 @@ ORDER BY total DESC;
   you see is exactly what the lake holds.
 
 A long answer scrolls smoothly however many rows it has: the page draws only the rows in sight.
-Click a column's header to sort by it (again: the other way; a third time: as it came), and the
-details panel summarizes that column. **Explore** summarizes them all.
+Click a column's header and the details panel summarizes that column; **Profile** summarizes them all.
 
 ## The lake, on the left
 
-- **Tables and views.** Each kind has its icon: a table a grid, a view the same grid drawn dashed, a
-  materialized view a grid with a solid header, and a view of files (`CREATE EXTERNAL TABLE`) a page
-  with a grid on it. Open one to see its columns: each has a glyph for its type (`#` numbers,
-  `T` text, a calendar for dates, a clock for times, braces for JSON-like values, brackets for
-  lists) and its SQL type on the right; a key column has a key.
+- **Data: tables and views.** Each kind has its icon: a table a grid, a view the same grid drawn
+  dashed, a materialized view a grid with a solid header, and a view of files (`CREATE EXTERNAL
+  TABLE`) a page with a grid on it. Open one to see its columns: each has its type's coloured mark
+  and its SQL type on the right; a key column has a key.
 - **Click** a table or a view to see its details on the right. **Double-click** it for its first
-  100 rows in a new cell. Click a column to put its name where you are typing.
-- **Files** lists the lake's own files (`PUT /files/…`, `files()`) by folder. Click one for its size
-  and when it was written; double-click a CSV, JSON or Parquet file to read it as a table, in a new
-  cell. Whoever may read the lake may read its files this way.
+  100 rows: in a new cell when a notebook is in front, else in a new SQL tab. Click a column to put
+  its name where you are typing.
+- **Workspace** lists the lake's own files (`PUT /files/…`, `files()`) by folder, and your
+  notebooks under `notebooks`, with the headings of the one in front as its outline. Whoever may
+  read the lake may read its files, from SQL too.
 
 ## The details panel
 
@@ -162,16 +248,16 @@ tables stay, since they are SQL's).
 ## Text cells
 
 Text cells hold Markdown: headings, lists, **bold**, *italics*, `code`, links and code blocks. Press
-**Shift+Enter** to show the text, and double-click it to edit. Their headings make the **Outline**
-on the left: click one to go to its cell.
+**Shift+Enter** to show the text, and double-click it to edit. Their headings make the notebook's
+outline, under it in the Workspace: click one to go to its cell.
 
 ## A cell's menu
 
 The **⋯** at a cell's top right (it shows when you point at the cell) runs the cells above it, or
 this one and those below; hides its output (**O**: its code stays, and a click on the output
-brings it back); clears its output; and deletes it. The **⋯** at the top right of the page
-starts a new notebook, downloads or opens an `.ipynb`, clears every output, restarts Python, sets
-the token and lists the keys.
+brings it back); clears its output; and deletes it. The notebook's own **⋯** (in its toolbar) lists
+its versions, downloads it as `.ipynb` and clears every output. The page's menu (top right) holds
+Settings, a new notebook or file, opening an `.ipynb`, restarting Python, the token and the keys.
 
 ## Live answers
 
@@ -189,12 +275,12 @@ program appending over HTTP) shows in the cell within a fraction of a second. Th
 
 ## Notebooks
 
-**Ctrl+S** saves the notebook in the lake, under the name at the top of the page:
+**Ctrl+S** saves the notebook in the lake, under the name in its toolbar:
 
-- Each save is a new version, `files/notebooks/<name>/<time>.ipynb`. A file in the lake is never
-  replaced, so every version stays.
-- The **Notebooks** list on the left opens the latest version, and the arrow beside a notebook lists
-  every version.
+- Each save is a new version, `files/notebooks/<name>/<time>.ipynb`, so every version stays (other
+  files are replaced in place).
+- The Workspace's `notebooks` folder opens the latest version. **Versions…** in the notebook's **⋯**
+  lists every version in Details; click one to open it.
 - Everyone who can read the lake can open them. They are files like any other, so you can list them
   in SQL:
 
@@ -240,7 +326,14 @@ After **Esc**, on the selected cell:
 | **0 0** | Restart Python |
 | **?** | Show these keys |
 
-**Ctrl+S** saves from anywhere on the page.
+Anywhere on the page:
+
+| Keys | What they do |
+|---|---|
+| **Ctrl+S** | Save the file or notebook in front |
+| **Ctrl+K** | Search tables, files and commands |
+| **Ctrl+B**, **Ctrl+J**, **Ctrl+Alt+B** | Show or hide the left pane, the bottom panel, the right pane |
+| **↑** **↓** **←** **→** | Move in a tree (open, close) or along the tabs; **Delete** closes a tab |
 
 ## The cluster at a glance
 
@@ -249,7 +342,7 @@ reader), how many nodes the lake's cluster has, and how many live queries are op
 the nodes' addresses. A query the node spreads over the cluster runs from the console like any
 other: see [Clusters](/pondra/guides/clusters/).
 
-The page follows your system's light or dark setting.
+The page follows your system's light or dark setting, unless Settings says otherwise.
 
 ## Extend it
 
@@ -264,8 +357,10 @@ PONDRA_CONSOLE_EXTENSIONS=./history.js pondra serve lake
 ```js norun
 const { register, on, ui, api } = window.pondra;
 
-// A section on the left.
+// A section on the left (a view: its ⋯ moves it to the right, as the console's own).
 register.section({ id: 'history', title: 'History', render: box => box.append(ui.h('div', {}, '…')) });
+// A kind of file: what opens in a tab for these paths.
+register.doc({ id: 'dash', match: path => path.endsWith('.dash'), open: async path => myDashboard(path) });
 // A tab of the panel on the right: what was picked on the left.
 register.panel({ id: 'sample', title: 'Sample', render: async (box, picked) =>
   picked?.type === 'object' ? (await api.rows(`SELECT * FROM ${picked.t.q} LIMIT 5`)).map(r => ui.h('pre', {}, JSON.stringify(r))) : [] });
@@ -279,8 +374,10 @@ on('ran', (cell, answer) => console.log(cell.src, answer.kind));
 
 | `register.` | Adds |
 |---|---|
-| `section({ id, title, render(box), tools, order })` | a section of the left side |
-| `panel({ id, title, render(box, picked), order })` | a tab of the panel on the right |
+| `view({ id, title, side, render(box, picked), tools, order })` | a view, on the left (`side: 'left'`) or a tab on the right |
+| `section({ id, title, render(box), tools, order })` | a view on the left |
+| `panel({ id, title, render(box, picked), order })` | a view on the right |
+| `doc({ id, match(path), open(path) })` | a kind of file, opened in a tab |
 | `cellKind({ id, label, language, placeholder, run(text, signal) })` | a kind of cell |
 | `renderer({ id, match(answer), render(answer, cell), order })` | a view of an answer |
 | `action({ id, label or icon, title, run(), primary, menu, order })` | a button at the top, or a ⋯ menu item |
@@ -291,7 +388,9 @@ on('ran', (cell, answer) => console.log(cell.src, answer.kind));
 gateway or a sign-in of your own. `pondra.api` runs SQL (`run`, `rows`, `call`), and `pondra.ui`
 holds the page's own pieces (`h`, `icon`, `line`, `button`, `toast`, `menu`, `pick`, `add`), so an
 extension looks like the rest of the page. `pondra.ui.notebook()` gives the notebook as `.ipynb`
-JSON and `pondra.ui.open(nb, name)` opens one, for an extension that keeps notebooks elsewhere. A whole example is in the repository:
+JSON and `pondra.ui.open(nb, name)` opens one, for an extension that keeps notebooks elsewhere;
+`pondra.ui.openFile(path)` opens a lake file in its tab, and `pondra.docs()` lists the open ones. A
+whole example is in the repository:
 [`examples/console-extension.js`](https://github.com/alimardon123/pondra/blob/main/examples/console-extension.js).
-The console's files are at `/console/console.js` and `/console/console.css`, and an extension at
-`/console/ext/0.js`, `1.js`, …; the browser keeps them until they change.
+The console's files are at `/console/` (`console.js` and the modules it loads, `console.css`, the
+fonts), and an extension at `/console/ext/0.js`, `1.js`, …; the browser keeps them until they change.

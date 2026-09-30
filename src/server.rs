@@ -115,10 +115,10 @@ pub fn router(app: App) -> Router {
         .route("/append/{name}", post(append))
         .route("/insert/{name}", post(insert))
         .route("/cluster/files", post(files))
-        .route("/", get(|| async { crate::console::page() }))
+        .route("/", get(crate::console::page))
         .route("/sql", post(sql))
         .route("/mcp", post(crate::mcp::handle))
-        .route("/files/{*path}", put(put_file).get(get_file))
+        .route("/files/{*path}", put(put_file).get(get_file).delete(delete_file))
         .route("/lookup/{name}/{key}", get(lookup))
         .route("/watch/{name}", get(watch))
         .route("/live", get(crate::live::live).post(crate::live::live))
@@ -169,22 +169,61 @@ async fn drop_function(State(app): State<App>, Path(name): Path<String>) -> Resu
     Ok(Json(j!({"dropped": name})))
 }
 
-/// `PUT /files/<path>`: an object in the lake next to the tables — an image, a PDF, a model —
-/// for `files('…')` to list and `file_read(path)` to read (see `files.rs`). Objects are never
-/// overwritten: a path that exists is an error.
-async fn put_file(State(app): State<App>, Path(path): Path<String>, body: Bytes) -> Result<Json<Value>, E> {
+/// `PUT /files/<path>`: an object in the lake next to the tables — an image, a PDF, a model, a SQL
+/// file — for `files('…')` to list and `file_read(path)` to read (see `files.rs`). A path that
+/// exists is refused (409), unless `If-Match` names the version `GET` gave: then it is replaced,
+/// if nobody replaced it meanwhile (412 if so; ADR-034).
+async fn put_file(State(app): State<App>, Path(path): Path<String>, headers: HeaderMap, body: Bytes) -> Result<Response, E> {
     let (path, bytes) = (crate::files::under_files(&path), body.len());
-    if let Err(e) = app.lake.put(&path, body.to_vec()).await {
-        let there = format!("{e:#}").contains("already exists");
-        return Err(E(if there { anyhow::anyhow!("{path} is there already: a file in the lake is never replaced (put it under another name)") } else { e }));
+    let expect = headers.get("if-match").and_then(|v| v.to_str().ok()).map(|v| v.trim_matches('"').to_string());
+    let done = match &expect {
+        Some(v) => app.lake.replace(&path, body.to_vec(), v).await,
+        None => match app.lake.put(&path, body.to_vec()).await {
+            Ok(()) => app.lake.version(&path).await,
+            Err(e) => Err(e),
+        },
+    };
+    match done {
+        Ok(version) => Ok(Json(j!({"path": path, "bytes": bytes, "version": version})).into_response()),
+        Err(e) if e.is::<crate::store::Changed>() => Ok((StatusCode::PRECONDITION_FAILED, format!("{path}: {e}")).into_response()),
+        Err(e) if expect.is_none() && format!("{e:#}").contains("already exists") =>
+            Ok((StatusCode::CONFLICT, format!("{path} is there already: send If-Match with the version you read to replace it, or put it under another name")).into_response()),
+        Err(e) => Err(E(e)),
     }
-    Ok(Json(j!({"path": path, "bytes": bytes})))
 }
 
-/// `GET /files/<path>`: that object's bytes.
+/// `GET /files/<path>`: that object's bytes, its version (`etag`, for `If-Match`) and a content
+/// type by its name.
 async fn get_file(State(app): State<App>, Path(path): Path<String>) -> Result<Response, E> {
-    let bytes = app.lake.object(&crate::files::under_files(&path)).await?;
-    Ok(([("content-type", "application/octet-stream")], bytes).into_response())
+    let path = crate::files::under_files(&path);
+    let (bytes, version) = match app.lake.file(&path).await {
+        Ok(found) => found,
+        Err(e) if e.downcast_ref::<object_store::Error>().is_some_and(|e| matches!(e, object_store::Error::NotFound { .. })) => {
+            return Ok((StatusCode::NOT_FOUND, format!("no such file: {path}")).into_response());
+        }
+        Err(e) => return Err(E(e)),
+    };
+    let ext = path.rsplit('.').next().unwrap_or_default().to_ascii_lowercase();
+    let kind = match ext.as_str() {
+        "csv" => "text/csv; charset=utf-8",
+        "tsv" => "text/tab-separated-values; charset=utf-8",
+        "json" | "ipynb" => "application/json",
+        "jsonl" | "ndjson" => "application/x-ndjson",
+        "sql" | "py" | "md" | "txt" => "text/plain; charset=utf-8",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "svg" => "image/svg+xml",
+        "pdf" => "application/pdf",
+        _ => "application/octet-stream",
+    };
+    Ok(([("content-type", kind), ("etag", &format!("\"{version}\"")), ("cache-control", "no-store")], bytes).into_response())
+}
+
+/// `DELETE /files/<path>`: that object gone (a writer's, as `PUT`).
+async fn delete_file(State(app): State<App>, Path(path): Path<String>) -> Result<Json<Value>, E> {
+    let path = crate::files::under_files(&path);
+    app.lake.remove_file(&path).await?;
+    Ok(Json(j!({"removed": path})))
 }
 
 /// `GET /sessions/{id}/python`: the variables a session's Python holds, as the console's panel

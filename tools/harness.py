@@ -208,9 +208,12 @@ def external():
     reads — CSV's declared columns by position, Parquet's and JSON's by name, a folder's keys as
     declared, a folder with no files yet an empty table; INSERT into a view of a folder a new file
     in it (from a node and from `pondra sql`); DROP TABLE drops it and keeps the files; the tables
-    of files its views read aren't listed as the lake's; and what it can't do, it says."""
+    of files its views read aren't listed as the lake's; and what it can't do, it says. And the
+    lake's own files (ADR-034): replaced in place by their version (If-Match), never over another's
+    change; deleted; read new by every node; never kept in the SSD tier."""
     lake, here, owner = new_lake(), tempfile.mkdtemp(prefix="pondra-ext-"), uuid.uuid4().hex
-    node = Node(lake, A.port, env={"PONDRA_OWNER_KEY": owner}, cwd=here).start()
+    tier = os.path.join(here, "tier")
+    node = Node(lake, A.port, env={"PONDRA_OWNER_KEY": owner}, cwd=here, **({"cache_dir": tier} if A.s3 else {})).start()
     def q(s):
         return call(A.port, "POST", "/sql", s.encode(), headers={"x-pondra-owner": owner})
     def err(s):
@@ -270,6 +273,28 @@ def external():
     kinds = {o["name"]: o["kind"] for o in call(A.port, "GET", "/objects")["objects"]}
     checks["the lake's own files read as a table by any reader, and nothing else of its folder; /objects says each object's kind"] = mine == [{"a": 1, "b": "x"}] \
         and all(("program that started the node" if not A.s3 else "no secret covers") in e for e in outside) and kinds.get("ev") == "files" and kinds.get("v") == "view"
+    reader = Node(lake, A.port + 1, reader=True, cwd=here, **({"cache_dir": tier + "2"} if A.s3 else {})).start()
+    count = lambda port: call(port, "POST", "/sql", f"SELECT count(*) AS n FROM read_csv('{area}reports/q1.csv')".encode())[0]["n"]
+    etag = lambda: urllib.request.urlopen(f"http://127.0.0.1:{A.port}/files/reports/q1.csv").headers["etag"]
+    before, v1 = (count(A.port), count(A.port + 1)), etag()
+    blind = _raises_text(lambda: call(A.port, "PUT", "/files/reports/q1.csv", b"a,b\n9,z\n"))
+    put = call(A.port, "PUT", "/files/reports/q1.csv", b"a,b\n1,x\n2,y\n3,z\n", headers={"if-match": v1})
+    stale = _raises_text(lambda: call(A.port, "PUT", "/files/reports/q1.csv", b"a,b\n7,q\n", headers={"if-match": v1}))
+    after = until(lambda: (count(A.port), count(A.port + 1)), (3, 3))
+    checks["a lake's file is replaced by its version (If-Match); without one, or with an old one, refused (409, 412); both nodes read the new rows"] = \
+        before == (1, 1) and "409" in blind and "412" in stale and put.get("version") == etag().strip('"') and after == (3, 3) \
+        and call(A.port, "GET", "/files/reports/q1.csv") == b"a,b\n1,x\n2,y\n3,z\n"
+    call(A.port, "PUT", "/files/tmp/x.txt", b"bye")
+    gone = call(A.port, "DELETE", "/files/tmp/x.txt")
+    checks["a lake's file is deleted (and is gone from files())"] = gone == {"removed": "files/tmp/x.txt"} and "404" in _raises_text(lambda: call(A.port, "GET", "/files/tmp/x.txt")) \
+        and not call(A.port, "POST", "/sql", b"SELECT path FROM files('tmp/')")
+    if A.s3:  # (the SSD tier: a lake on object storage; a table's files are kept there, as they never change)
+        kept = lambda: [os.path.relpath(os.path.join(d, f), t) for t in (tier, tier + "2") for d, _, fs in os.walk(t) for f in fs]
+        q("CREATE TABLE tiered AS SELECT 1 AS a")
+        until(lambda: q("SELECT count(*) AS n FROM tiered") and any(not k.startswith("files") for k in kept()), True, 20)
+        checks["the lake's files are never kept in the SSD tier (they change in place; a table's files, kept there, never do)"] = any(not k.startswith("files") for k in kept()) \
+            and not any(k.startswith("files" + os.sep) or (os.sep + "files" + os.sep) in k for k in kept())
+    reader.kill()
     node.kill()
     shutil.rmtree(here, ignore_errors=True)
     ok = all(checks.values())

@@ -1,33 +1,45 @@
 #!/usr/bin/env python3
-"""The console (ADR-030), in headless Chromium through Playwright.
+"""The console (ADR-030, ADR-032, ADR-034), in headless Chromium through Playwright.
 
-  console_check.py [--port 8890] [--show DIR]
+  console_check.py [--port 8890] [--show DIR] [--only node,files,grid,layout,budget,tokens,server,extensions]
 
-- node: the tree lists the lake's schemas, tables, views (each kind its icon) and columns (each
-  type its glyph, a key's marked), with no bare numbers; a table picked shows its details (rows,
-  key, columns, a view's definition) and its profile, and Query (or a double-click) its first
-  rows; the lake's files are listed by folder, and one is read as a table; a long answer draws
-  only the rows in sight, sorts by a header's click, and its columns are summarized; a
-  SQL cell and a Python cell run (what the code printed, and its last expression as rows);
-  errors come back in plain words, a Python error at its line in the cell; Python cells share
-  their variables, a figure shows as a picture, the Variables tab lists them, and Restart empties
-  them; a name completes with Tab; a live cell shows a row INSERTed over HTTP, and its query ends
-  when the switch is off; the keys (Esc, B, D D, Z, O, Shift+Enter, ?); text cells' headings make
-  the outline; a notebook saved in the lake (twice: two versions) and opened again is the one
-  saved, and Jupyter's nbformat validates it; so does the one downloaded; an .ipynb uploaded
-  opens, its text rendered and its %%sql cell run.
-- tokens: a node with tokens serves the page, which asks for one; given it, the tables show,
-  and after a reload too (the browser keeps it).
+- node: the Data tree lists the lake's schemas, tables and views (each kind its icon) and columns
+  (each type its coloured mark, a key's marked), with no bare numbers; a table picked shows its
+  details and its profile, a view its definition; double-clicking a table shows its first rows; the
+  Workspace lists the lake's files by folder; a SQL cell's answer (its types as marks, a header's
+  card), a long one drawn in part, sorted and summarized; a Python cell (what it printed, its last
+  expression as rows); errors in plain words; Python cells share their variables, a figure shows,
+  the Variables tab lists them, Restart empties them; Tab completes a name; a live cell; the
+  notebook keys (Esc, B, D D, Z, M, O, Shift+Enter, ?); the outline under the notebook; a notebook
+  saved (twice: two versions, the first opened again), downloaded and uploaded, Jupyter's
+  nbformat validating each.
+- files: a SQL file runs (Results, Messages, Plan) and is saved in place; a new one asks for its
+  path; a Python file runs in its console, and a line typed there too; a CSV file is edited in a
+  grid (a cell, a row) and saved in place, its untouched lines as they were, and the node reads the
+  new rows; saving over someone else's change is refused; a JSONL file is edited; a Parquet file
+  opens read-only; two clicks open one tab.
+- grid: a click lights a cell and its row, Shift+click a range (one outline), the keys move it,
+  Ctrl+C copies it (Shift: with the headers), the menu filters to its values, a header's sort
+  button sorts, a header's card tells its type.
+- layout: a view moves to the other pane and back (kept after a reload); Settings puts Workspace
+  first and the dark theme on; the filter narrows the trees; Ctrl+B and Ctrl+Alt+B; a pane's edge
+  sets its width (kept); the tabs open again after a reload; a narrow window: no sideways scroll,
+  the panes drawers; axe finds nothing (contrast included), light and dark.
+- budget (ADR-034 §7): the scripts and style sheet, gzipped as the node serves them, <= 70 KB; each
+  answers 304 when the browser has it; first paint < 400 ms; typing in a 1,000-line file < 8 ms a
+  key (median); scrolling 10,000 rows: p95 frame < 20 ms.
+- tokens: a node with tokens serves the page, which asks for one; given it, the tables show, and
+  after a reload too (the browser keeps it).
 - server: `pondra serve <folder of lakes>`'s console lists its databases, and a cell runs in the one picked.
 - extensions: a node given PONDRA_CONSOLE_EXTENSIONS (examples/console-extension.js) serves it, and
-  its section, panel tab, view of an answer and menu action show beside the console's own; the
-  console's files answer 304 to a browser that has them.
-- every request the page made went to the node (or server) that served it.
+  its section, panel tab, view of an answer and menu action show beside the console's own.
+- every request the page made went to the node (or server) that served it; no page errors.
 
 --show DIR keeps screenshots, light and dark.
-Needs: playwright (Chromium at PLAYWRIGHT_BROWSERS_PATH) and nbformat.
+Needs: playwright (Chromium at PLAYWRIGHT_BROWSERS_PATH), nbformat, pyarrow; axe-core (npm) for the
+layout part's audit: AXE_JS, or node_modules/axe-core beside this file or in the current folder.
 """
-import argparse, json, os, shutil, subprocess, sys, tempfile, time, urllib.error, urllib.request
+import argparse, gzip, io, json, os, shutil, statistics, subprocess, sys, tempfile, time, urllib.error, urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -52,20 +64,43 @@ def until(f, want=True, secs=20):
     return got
 
 
+def _try(f):
+    try:
+        return f()
+    except Exception as e:  # noqa: BLE001
+        return e
+
+
+def put(port, path, body, version=None):
+    """PUT a file of the lake (with If-Match when `version`); its answer."""
+    return call(port, "PUT", "/files/" + path, body, headers={"if-match": f'"{version}"'} if version else None)
+
+
+def get(port, path):
+    """A file of the lake, as its bytes."""
+    return urllib.request.urlopen(f"http://127.0.0.1:{port}/files/{path}").read()
+
+
+def version(port, path):
+    c = urllib.request.urlopen(f"http://127.0.0.1:{port}/files/{path}")
+    return c.headers["etag"].strip('"')
+
+
 class Page:
     """A browser tab on `url`, with every request it made and every error it hit."""
 
-    def __init__(self, browser, url, scheme="light"):
-        self.ctx = browser.new_context(viewport={"width": 1400, "height": 900}, color_scheme=scheme, accept_downloads=True)
+    def __init__(self, browser, url, scheme="light", size=(1440, 900)):
+        self.ctx = browser.new_context(viewport={"width": size[0], "height": size[1]}, color_scheme=scheme, accept_downloads=True)
+        self.ctx.grant_permissions(["clipboard-read", "clipboard-write"], origin=url.split("/#")[0].rstrip("/"))
         self.p = self.ctx.new_page()
         self.url, self.seen, self.errors = url, [], []
         self.p.on("request", lambda r: self.seen.append(r.url))
         self.p.on("pageerror", lambda e: self.errors.append(str(e)))
-        self.p.on("dialog", lambda d: d.accept())  # (confirm: leave a notebook with changes)
+        self.p.on("dialog", lambda d: d.accept())  # (confirm: close a tab with changes, replace a file)
         self.p.goto(url)
 
     def cells(self):
-        return self.p.locator("section.cell")
+        return self.p.locator("#docs section.cell")
 
     def cell(self, i):
         return self.cells().nth(i)
@@ -76,24 +111,52 @@ class Page:
         c.locator("textarea").fill(code)
         c.locator("textarea").press("Control+Enter")
         c.locator(".out").wait_for(state="visible", timeout=30000)
-        until(lambda: "running" in (c.locator(".st").inner_text() or ""), False, 30)
+        until(lambda: c.locator(".run.stop").count(), 0, 60)
         return c
 
-    def grid(self, c):
-        """A cell's answer: its column names and its rows, as text."""
-        heads = [h.split("\n")[0] for h in c.locator("thead th").all_inner_texts()[1:]]
-        rows = [[t.strip() for t in r.split("\t")[1:]] for r in c.locator("tbody tr:not(.gap)").all_inner_texts()]
-        return heads, rows
+    def grid(self, el):
+        """An answer's column names and its rows, as text."""
+        return el.evaluate("""el => { const g = el.matches('.gt') ? el : el.querySelector('.gt'); if (!g) return [[], []];
+            return [[...g.querySelectorAll('thead th .hn')].map(x => x.textContent),
+                    [...g.querySelectorAll('tbody tr:not(.gap)')].map(tr => [...tr.querySelectorAll('td:not(.i)')].map(td => td.textContent))] }""")
 
     def menu(self, item):
-        """Pick `item` in the top bar's ⋯ menu."""
+        """Pick `item` in the top bar's menu."""
         self.p.click("#moreBtn")
         self.p.locator("#menu button", has_text=item).click()
+
+    def docmenu(self, item):
+        """Pick `item` in the ⋯ menu of the file in front."""
+        self.p.locator("#docbar button[aria-label=More]").click()
+        self.p.locator("#menu button", has_text=item).click()
+
+    def workspace(self, *path):
+        """Click through the Workspace's folders to a file; its row."""
+        ws = self.p.locator("#workspace")
+        for folder in path[:-1]:
+            row = ws.locator(".row", has_text=folder).first
+            row.wait_for(timeout=10000)
+            if row.get_attribute("aria-expanded") == "false":
+                row.click()
+        row = ws.locator(".row", has_text=path[-1]).first
+        row.wait_for(timeout=10000)
+        return row
+
+    def tab(self):
+        """The tab in front: its title, and whether it has changes not saved."""
+        t = self.p.locator("#tabbar .tab.on")
+        return t.locator(".tn").inner_text(), t.locator(".dirty").count() == 1
+
+    def toast(self):
+        return self.p.locator("#toast").inner_text()
+
+    def clipboard(self):
+        return self.p.evaluate("navigator.clipboard.readText()")
 
     def left(self):
         """Requests that went anywhere but the node that served the page."""
         home = self.url.split("/", 3)[:3]
-        return [u for u in self.seen if u.split("/", 3)[:3] != home and not u.startswith(("data:", "blob:"))]
+        return [u for u in self.seen if u.split("/", 3)[:3] != home and not u.startswith(("data:", "blob:", "about:"))]
 
     def shot(self, folder, name):
         if folder:
@@ -110,27 +173,28 @@ def node_checks(browser, port, show):
     sql(port, "CREATE VIEW grown AS SELECT name FROM people WHERE born IS NOT NULL")
     pg = Page(browser, base + "/")
     p = pg.p
-    tree = p.locator("#tree")
+    tree = p.locator("#data")
     tree.locator(".row", has_text="people").wait_for(timeout=20000)
-    people = tree.locator(".line", has_text="people")
-    tree.locator(".line", has_text="sales").locator(".tw").click()
+    tree.locator(".row", has_text="sales").locator(".tw").click()
     tree.locator(".row", has_text="orders").wait_for(timeout=10000)
+    people = tree.locator(".row[data-kind]", has_text="people")
     people.locator(".tw").click()
-    columns = tree.locator(".col:visible").all_inner_texts()
-    kinds = {r.inner_text().strip(): r.get_attribute("data-kind") for r in tree.locator(".row[data-kind]").all()}
-    checks["the tree lists the lake's schemas, tables and views (each kind its icon), columns with SQL types and glyphs, a key marked, no bare numbers"] = \
-        kinds == {"people": "table", "grown": "view", "orders": "table"} and [c.split("\n")[0] for c in columns] == ["id", "name", "born", "at", "amt"] \
-        and "DECIMAL(10,2)" in columns[4] and "TIMESTAMP" in columns[3] and tree.locator(".col:visible .tg").count() == 5 and tree.locator(".col:visible .kk").count() == 1 \
-        and not [t for t in tree.locator(".row:visible").all_inner_texts() if any(w.isdigit() for w in t.split())]
-    people.locator(".row").click()  # (its details, in the panel on the right)
-    detail = p.locator("#detail")
+    names = tree.locator(".row.col:visible .nm").all_inner_texts()
+    types = tree.locator(".row.col:visible .ty").all_inner_texts()
+    kinds = {r.locator(".nm").inner_text(): r.get_attribute("data-kind") for r in tree.locator(".row[data-kind]").all() if r.get_attribute("data-kind") not in ("database", "schema")}
+    checks["the Data tree lists schemas, tables and views (each kind its icon), columns with SQL types and coloured type marks, a key marked, no bare numbers"] = \
+        kinds == {"people": "table", "grown": "view", "orders": "table"} and names == ["id", "name", "born", "at", "amt"] and types[4] == "DECIMAL(10,2)" and types[3] == "TIMESTAMP" \
+        and tree.locator(".row.col:visible .ty-i").count() == 5 and tree.locator(".row.col:visible .kk").count() == 1 \
+        and not [t for t in tree.locator(".row:visible .nm").all_inner_texts() if any(w.isdigit() for w in t.split())]
+    people.click()
+    detail = p.locator("#details")
     rows_shown = until(lambda: detail.locator("dd").first.inner_text(), "3")
     facts = dict(zip(detail.locator("dt").all_inner_texts(), detail.locator("dd").all_inner_texts()))
     checks["a table picked shows its details: rows, key, columns (a key's and NOT NULL marked)"] = rows_shown == "3" and facts.get("Key") == "id" \
         and detail.locator(".pc").count() == 5 and "not null" in detail.locator(".pc", has_text="name").inner_text()
     detail.locator("button", has_text="Profile").click()
     profiled = until(lambda: detail.locator(".pc", has_text="born").locator(".nums").inner_text().startswith("67% null"), True)
-    charts = until(lambda: (detail.locator(".pc", has_text="amt").locator("svg rect").count(), detail.locator(".pc", has_text="name").locator(".bars .v").count()), (20, 3))
+    charts = until(lambda: (detail.locator(".pc", has_text="amt").locator(".ps svg rect").count(), detail.locator(".pc", has_text="name").locator(".bars .v").count()), (20, 3))
     amt = detail.locator(".pc", has_text="amt").inner_text()
     checks["Profile: each column's nulls, distinct values, range, and a histogram or its commonest values"] = profiled is True and "1.50 … 2.25" in amt and charts == (20, 3)
     tree.locator(".row", has_text="grown").click()
@@ -138,57 +202,58 @@ def node_checks(browser, port, show):
 
     c = pg.run(0, "SELECT id, name, born, at, amt FROM people ORDER BY id")
     heads, rows = pg.grid(c)
-    checks["a SQL cell shows the rows with their types; timestamps and decimals as written"] = heads == ["id", "name", "born", "at", "amt"] \
-        and rows[0] == ["1", "Ann", "1990-01-02", "2024-01-01 10:00:00", "1.50"] and rows[1][2] == "NULL" and "3 rows" in c.locator(".meta").inner_text() \
-        and "BIGINT" in c.locator("thead").inner_text()
+    c.locator("thead th", has_text="id").hover()
+    card = until(lambda: p.locator(".hcard").is_visible() and "BIGINT" in p.locator(".hcard").inner_text(), True)
+    p.mouse.move(5, 5)
+    checks["a SQL cell shows the rows, each column's type a mark and its card on hover; timestamps and decimals as written"] = heads == ["id", "name", "born", "at", "amt"] \
+        and rows[0] == ["1", "Ann", "1990-01-02", "2024-01-01 10:00:00", "1.50"] and rows[1][2] == "NULL" and c.locator(".n-rows").inner_text() == "3 rows" \
+        and [m.get_attribute("class") for m in c.locator("thead .ty-i").all()] == ["ty-i k-num", "ty-i k-text", "ty-i k-date", "ty-i k-time", "ty-i k-dec"] and card is True
     tree.locator(".row", has_text="orders").dblclick()  # (a table's first rows, in a new cell)
     peek = until(lambda: pg.grid(pg.cell(1))[1], [["1", "10.5"]])
     checks["double-clicking a table shows its first rows"] = peek == [["1", "10.5"]] and "sales.orders" in pg.cell(1).locator("textarea").input_value()
-    call(port, "PUT", "/files/reports/q1.csv", b"a,b\n1,x\n2,y\n")
+    put(port, "reports/q1.csv", b"a,b\n1,x\n2,y\n")
     p.click("#refresh")
-    files = p.locator("#files")
-    files.locator(".row", has_text="reports").click()
-    files.locator(".row", has_text="q1.csv").wait_for(timeout=10000)
-    files.locator(".row", has_text="q1.csv").dblclick()  # (the lake's own file, read as a table: whoever reads the lake reads it)
-    read = until(lambda: pg.grid(pg.cell(2))[1], [["1", "x"], ["2", "y"]])
-    checks["the lake's files are listed by folder, and a data file is read as a table"] = read == [["1", "x"], ["2", "y"]]
-    long = pg.run(2, "SELECT value AS n, value % 7 AS m FROM range(0, 5000)")
+    row = pg.workspace("reports", "q1.csv")
+    checks["the Workspace lists the lake's files by folder, with their sizes"] = "12 B" in row.inner_text()
+
+    long = pg.run(1, "SELECT value AS n, value % 7 AS m FROM range(0, 5000)")
     drawn = long.locator("tbody tr:not(.gap)").count()
     long.locator(".grid").evaluate("g => g.scrollTop = g.scrollHeight")
-    last = until(lambda: long.locator("tbody tr:not(.gap)").last.inner_text().split("\t")[1].strip(), "4999")
-    long.locator("th", has_text="m").click()
+    last = until(lambda: pg.grid(long)[1][-1][0], "4999")
+    long.locator("thead th", has_text="m").locator(".srt").click()
     long.locator(".grid").evaluate("g => g.scrollTop = 0")
-    top = until(lambda: long.locator("tbody tr:not(.gap)").first.inner_text().split("\t")[2].strip(), "0")
-    m = detail.locator(".pc.on").inner_text()
-    checks["a long answer draws only the rows in sight, sorts by a header, and its column is summarized in the panel"] = drawn < 120 and last == "4999" and top == "0" \
-        and "7 distinct" in m and "0 … 6" in m
+    top = until(lambda: pg.grid(long)[1][0][1], "0")
+    long.locator("thead th", has_text="m").click()  # (a header: its column, summarized in the details)
+    m = until(lambda: "7 distinct" in detail.locator(".pc.on").inner_text() and detail.locator(".pc.on").inner_text(), secs=10) or ""
+    checks["a long answer draws only the rows in sight, sorts by a header's button, and a header clicked is summarized in the details"] = drawn < 120 and last == "4999" and top == "0" \
+        and "7 distinct" in str(m) and "0 … 6" in str(m)
 
     p.click("[data-add=python]")
     p.keyboard.insert_text('for i in range(2):\n    print("hello", i)\ndb.sql("SELECT count(*) AS n FROM people")')
     p.keyboard.press("Control+Enter")
-    py = pg.cell(3)
+    py = pg.cell(2)
     py.locator("table").wait_for(timeout=60000)
-    checks["a Python cell runs on the node: what it printed, then its last expression as rows"] = py.locator(".said").inner_text() == "hello 0\nhello 1" and pg.grid(py) == (["n"], [["3"]])
-    c = pg.run(3, "x = 1\n1 / 0")
+    checks["a Python cell runs on the node: what it printed, then its last expression as rows"] = py.locator(".said").inner_text() == "hello 0\nhello 1" and pg.grid(py) == [["n"], [["3"]]]
+    c = pg.run(2, "x = 1\n1 / 0")
     python_error = c.locator(".err").inner_text()
     c = pg.run(1, "SELECT nope FROM people")
     sql_error = c.locator(".err").inner_text()
     checks["errors in plain words: a SQL one, and a Python one at its line in the cell"] = "nope" in sql_error and "ZeroDivisionError" in python_error and "line 2" in python_error
-    c = pg.run(3, "x * 10")  # (the cell before made x, then failed: x stays, as in a notebook)
-    shared = until(lambda: pg.grid(c), (["value"], [["10"]]))
-    checks["Python cells share their variables (one namespace per page, as a notebook's kernel)"] = shared == (["value"], [["10"]])
-    fig = pg.run(3, "import matplotlib.pyplot as plt\nfig, ax = plt.subplots(figsize=(4, 2))\nax.plot([1, 3, 2])\nfig")
+    c = pg.run(2, "x * 10")  # (the cell before made x, then failed: x stays, as in a notebook)
+    shared = until(lambda: pg.grid(c), [["value"], [["10"]]])
+    checks["Python cells share their variables (one namespace per page, as a notebook's kernel)"] = shared == [["value"], [["10"]]]
+    fig = pg.run(2, "import matplotlib.pyplot as plt\nfig, ax = plt.subplots(figsize=(4, 2))\nax.plot([1, 3, 2])\nfig")
     drawn = until(lambda: fig.locator("img.fig").count() == 1 and fig.locator("img.fig").evaluate("i => i.complete && i.naturalWidth") > 100, True)
     fig_said = fig.locator(".out").inner_text()[:300]  # (why, if it drew nothing: matplotlib missing says so)
     checks["a figure a Python cell returns (matplotlib) shows as a picture"] = drawn is True and fig.locator("img.fig").get_attribute("src").startswith("data:image/png;base64,")
-    p.locator("#tabs button", has_text="Variables").click()
+    p.locator("#rtabs .rtab", has_text="Variables").click()
     want = ["ax", "fig", "i", "x"] if drawn is True else ["i", "x"]  # (the figure's failing is its own check's)
-    names = until(lambda: p.locator("#detail .var .nm").all_inner_texts(), want)
-    x_type = p.locator("#detail .var", has_text="x").last.locator(".ty").inner_text() if names == want else ""
-    p.locator("#detail button", has_text="Restart").click()
-    emptied = until(lambda: p.locator("#detail .var").count(), 0)
-    gone = pg.run(3, "x").locator(".err").inner_text()
-    p.locator("#tabs button", has_text="Details").click()
+    names = until(lambda: p.locator("#variables .var .nm").all_inner_texts(), want)
+    x_type = p.locator("#variables .var", has_text="x").last.locator(".ty").inner_text() if names == want else ""
+    p.locator("#variables button", has_text="Restart").click()
+    emptied = until(lambda: p.locator("#variables .var").count(), 0)
+    gone = pg.run(2, "x").locator(".err").inner_text()
+    p.locator("#rtabs .rtab", has_text="Details").click()
     checks["the Variables tab lists the page's Python names with their types; Restart empties them"] = names == want and x_type.startswith("int") \
         and emptied == 0 and "NameError" in gone
     ta = pg.cell(0).locator("textarea")
@@ -203,7 +268,7 @@ def node_checks(browser, port, show):
     ta.press("Enter")
     checks["Tab completes a table's name, and lists the choices when several fit (a column first)"] = one == "SELECT * FROM people" and listed is True \
         and ta.input_value() == "SELECT name" and p.locator("#complete").is_hidden()
-    c = pg.run(0, "SELECT id, name, born, at, amt FROM people ORDER BY id")
+    pg.run(0, "SELECT id, name, born, at, amt FROM people ORDER BY id")
 
     live = pg.run(1, "SELECT count(*) AS n, sum(amt) AS amt FROM people")
     live.locator("label.live").click()
@@ -235,11 +300,11 @@ def node_checks(browser, port, show):
     typing = p.evaluate("document.activeElement.tagName")
     checks["keys: Esc, B adds a cell, D D deletes it, Z brings it back; M makes it text; Shift+Enter renders it and starts a new cell"] = \
         (added, deleted, back) == (n + 1, n, n + 1) and rendered == "Findings" and typing == "TEXTAREA" and pg.cells().count() == n + 3
-    outline = p.locator("#outline .row")
+    outline = p.locator("#workspace .outline:visible .row")
     headed = until(lambda: outline.all_inner_texts(), ["Findings"])
     pg.cell(0).locator("textarea").click()
     outline.first.click()
-    checks["a text cell's headings make the outline, and one clicked selects its cell"] = headed == ["Findings"] \
+    checks["a text cell's headings make the outline under the notebook in the Workspace, and one clicked selects its cell"] = headed == ["Findings"] \
         and until(lambda: "sel" in pg.cell(pg.cells().count() - 2).get_attribute("class"), True) is True
     pg.cell(0).locator("textarea").click()
     p.keyboard.press("Escape")
@@ -263,21 +328,22 @@ def node_checks(browser, port, show):
     valid = _try(lambda: nbformat.validate(nb) is None)
     page_cells = p.evaluate("pondra.state.cells.map(c => [c.kind, c.src])")
     as_saved = [["markdown" if c.cell_type == "markdown" else "sql" if c.source.startswith("%%sql") else "python", c.source.removeprefix("%%sql\n")] for c in nb.cells] if nb else []
-    checks["a notebook saved in the lake is valid for Jupyter (nbformat), SQL cells as %%sql"] = one == 1 and valid is True and as_saved == page_cells \
-        and any(c.source.startswith("%%sql\n") for c in nb.cells) and p.locator("#dirty").is_hidden()
+    checks["a notebook saved in the lake is valid for Jupyter (nbformat), SQL cells as %%sql; its tab has no changes then"] = one == 1 and valid is True and as_saved == page_cells \
+        and any(c.source.startswith("%%sql\n") for c in nb.cells) and until(lambda: pg.tab(), ("report.ipynb", False)) == ("report.ipynb", False) \
+        and "#notebook=report" in p.url and pg.workspace("notebooks", "report.ipynb").is_visible()
     pg.cell(0).locator("textarea").fill("SELECT 'changed' AS v")
     p.keyboard.press("Control+s")
     two = until(lambda: len(listed()), 2)
     pg.cell(0).locator("textarea").fill("SELECT 'not saved' AS v")
-    nbs = p.locator("#notebooks")
-    until(lambda: nbs.locator(".tw").first.is_visible(), True)
-    nbs.locator(".tw").first.click()  # (its versions)
-    nbs.locator(".kids .row").last.click()  # (the first one saved)
+    pg.docmenu("Versions")
+    versions = detail.locator(".row[role=button]")
+    until(lambda: versions.count(), 2)
+    versions.last.click()  # (the first one saved: newest first)
     reopened = until(lambda: p.evaluate("pondra.state.cells.map(c => [c.kind, c.src])"), page_cells)
-    checks["saved twice: two versions; the first, opened from the sidebar, is what was saved"] = two == 2 and reopened == page_cells
+    checks["saved twice: two versions, listed in its details; the first, opened again, is what was saved"] = two == 2 and reopened == page_cells
 
     with p.expect_download() as d:
-        pg.menu("Download")
+        pg.docmenu("Download as .ipynb")
     downloaded = open(d.value.path()).read()
     checks["a notebook downloaded is valid for Jupyter too"] = _try(lambda: nbformat.validate(nbformat.reads(downloaded, as_version=4)) is None) is True
 
@@ -291,19 +357,405 @@ def node_checks(browser, port, show):
     until(lambda: p.evaluate("pondra.state.cells.map(c => c.kind)"), ["markdown", "sql", "python"])
     kinds = p.evaluate("pondra.state.cells.map(c => c.kind)")
     c = pg.run(1, "SELECT 42 AS answer")
-    checks["an .ipynb uploaded opens: its text rendered (its heading the outline), its %%sql cell a SQL cell that runs"] = kinds == ["markdown", "sql", "python"] \
-        and until(lambda: p.locator("#outline").text_content(), "From Jupyter") == "From Jupyter" \
-        and pg.cell(0).locator(".md h1").inner_text() == "From Jupyter" and pg.grid(c) == (["answer"], [["42"]]) and p.input_value("#nbname") == "from-jupyter"
+    checks["an .ipynb uploaded opens in a tab: its text rendered (its heading in the outline), its %%sql cell a SQL cell that runs"] = kinds == ["markdown", "sql", "python"] \
+        and until(lambda: p.locator("#workspace .outline:visible").text_content(), "From Jupyter") == "From Jupyter" \
+        and pg.cell(0).locator(".md h1").inner_text() == "From Jupyter" and pg.grid(c) == [["answer"], [["42"]]] and p.input_value("#nbname") == "from-jupyter" \
+        and pg.tab()[0] == "from-jupyter.ipynb"
+    shutil.rmtree(os.path.dirname(path), ignore_errors=True)
 
     if show:
+        p.goto("about:blank")
+        p.goto(base + "/#notebook=report")
+        pg.cells().first.wait_for()
+        pg.run(0, "SELECT id, name, born, amt FROM people ORDER BY id")
+        p.locator("#data .row", has_text="people").click()
+        p.wait_for_timeout(800)
         pg.shot(show, "console-light.png")
         dark = Page(browser, base + "/#notebook=report", "dark")
-        dark.p.locator("section.cell").first.wait_for()
-        dark.p.wait_for_timeout(1500)
+        dark.cells().first.wait_for()
+        dark.run(0, "SELECT id, name, born, amt FROM people ORDER BY id")
+        dark.p.wait_for_timeout(800)
         dark.shot(show, "console-dark.png")
         dark.ctx.close()
     checks["every request went to the node; no page errors"] = pg.left() == [] and pg.errors == [] and len(pg.seen) > 10
-    info = {"figure": fig_said, "outline": p.locator("#outline").text_content(), "left": pg.left(), "errors": pg.errors, "sql_error": sql_error, "python_error": python_error, "kinds": kinds, "columns": columns, "facts": facts}
+    info = {"figure": fig_said, "left": pg.left(), "errors": pg.errors, "sql_error": sql_error, "python_error": python_error, "kinds": kinds, "names": names, "types": types, "facts": facts,
+            "heads": heads, "rows": rows[:2], "m": m}
+    pg.ctx.close()
+    return checks, info
+
+
+def files_checks(browser, port, show):
+    """Files in tabs (ADR-034): SQL and Python files run and are saved in place, data files are
+    edited in a grid and saved in place (If-Match: never over someone else's change)."""
+    import pyarrow as pa, pyarrow.parquet as pq
+    checks = {}
+    base = f"http://127.0.0.1:{port}"
+    sql(port, "CREATE TABLE fx AS SELECT value AS id, 'r' || (value % 3) AS region FROM range(0, 30)")
+    top = b"SELECT region, count(*) AS n\nFROM fx\nGROUP BY region\nORDER BY region"
+    put(port, "scripts/top.sql", top)
+    put(port, "scripts/hello.py", b'import math\nprint("pi is", round(math.pi, 4))\ndb.sql("SELECT count(*) AS n FROM fx")')
+    put(port, "data/q.csv", b'id,city,amount\r\n1,Oslo,10\r\n2,"Rome, IT",20\r\n')
+    put(port, "data/e.jsonl", b'{"id":1,"tag":"a"}\n{"id":2,"tag":"b"}\n')
+    out = io.BytesIO()
+    pq.write_table(pa.table({"a": [1, 2], "b": ["x", "y"]}), out)
+    put(port, "data/p.parquet", out.getvalue())
+    lake_files = call(port, "GET", "/objects")["files"]
+    pg = Page(browser, base + "/")
+    p = pg.p
+
+    pg.workspace("scripts", "top.sql").dblclick()  # (two clicks: one tab)
+    until(lambda: pg.tab()[0], "top.sql")
+    one_tab = until(lambda: p.locator("#tabbar .tab", has_text="top.sql").count(), 1, 3)
+    p.click("#runBtn")
+    body = p.locator(".filedoc .pbody")
+    results = until(lambda: pg.grid(body), [["region", "n"], [["r0", "10"], ["r1", "10"], ["r2", "10"]]])
+    p.locator(".ptab", has_text="Messages").click()
+    said = until(lambda: "3 rows" in body.inner_text() and body.inner_text(), secs=5)
+    p.locator(".ptab", has_text="Plan").click()
+    plan = until(lambda: "Exec" in body.inner_text() and body.inner_text(), secs=10)
+    p.locator(".ptab", has_text="Results").click()
+    checks["a SQL file opens in one tab (two clicks), runs, and shows its Results, Messages and Plan"] = one_tab == 1 and results[1] == [["r0", "10"], ["r1", "10"], ["r2", "10"]] \
+        and bool(said) and bool(plan)
+    ed = p.locator(".filedoc .editor textarea")
+    ed.focus()
+    ed.press("Control+End")
+    p.keyboard.insert_text("\nLIMIT 2")
+    dirty = until(lambda: (pg.tab(), pg.workspace("scripts", "top.sql").locator(".dirty").count()), (("top.sql", True), 1), 5)  # (the tree: drawn again a moment after)
+    p.keyboard.press("Control+s")
+    saved = until(lambda: get(port, "scripts/top.sql"), top + b"\nLIMIT 2")
+    clean = until(lambda: pg.tab(), ("top.sql", False))
+    checks["a SQL file changed shows it (its tab, the Workspace) and Ctrl+S saves it in place"] = dirty == (("top.sql", True), 1) and saved == top + b"\nLIMIT 2" and clean == ("top.sql", False)
+    put(port, "scripts/multi.sql", b"CREATE TABLE fm AS SELECT 1 AS a;\n-- its rows; this ; is a comment's\nSELECT a, 'x;y' AS s FROM fm;\nSELECT nope;\nSELECT 5")
+    pg.workspace("scripts", "multi.sql").click()
+    until(lambda: pg.tab()[0], "multi.sql")
+    p.click("#runBtn")
+    strip = p.locator(".filedoc .stmts")
+    listed = lambda: strip.evaluate("s => [...s.querySelectorAll('button.stmt')].map(b => b.querySelector('b').textContent + ' ' + b.lastChild.textContent)")
+    each = until(listed, ["1 done", "2 1 row", "3 failed"])
+    left = strip.locator(".stmts-left").inner_text()
+    strip.locator("button.stmt").nth(1).click()
+    second = until(lambda: pg.grid(body), [["a", "s"], [["1", "x;y"]]])
+    pg.menu("Settings")
+    p.select_option("#setStatements", "last")
+    p.keyboard.press("Escape")
+    p.click("#runBtn")
+    last = until(lambda: body.locator(".err").count() == 1 and strip.count() == 0, True)  # (all at once: it stops at the failure too, one answer)
+    ed.focus()
+    p.keyboard.press("Control+a")
+    p.keyboard.insert_text("SELECT 1 AS a; SELECT 2 AS b")
+    p.click("#runBtn")
+    only = until(lambda: pg.grid(body), [["b"], [["2"]]])
+    pg.menu("Settings")
+    p.select_option("#setStatements", "each")
+    p.keyboard.press("Escape")
+    checks["a SQL file's statements each get an answer (split as the node splits them), up to a failure; Settings can say the last one's only"] = \
+        each == ["1 done", "2 1 row", "3 failed"] and left == "1 after it not run" and second == [["a", "s"], [["1", "x;y"]]] and last is True and only == [["b"], [["2"]]]
+    p.click("#newfile")
+    p.locator("#menu button", has_text="New SQL file").click()
+    p.keyboard.insert_text("SELECT 1 AS one")
+    p.keyboard.press("Control+s")
+    p.locator("#askDlg[open]").wait_for(timeout=5000)
+    p.fill("#askIn", "scripts/one.sql")
+    p.press("#askIn", "Enter")
+    made = until(lambda: get(port, "scripts/one.sql"), b"SELECT 1 AS one")
+    checks["a new SQL file asks for its path when first saved"] = made == b"SELECT 1 AS one" and until(lambda: pg.tab(), ("one.sql", False)) == ("one.sql", False)
+
+    pg.workspace("scripts", "hello.py").click()
+    until(lambda: pg.tab()[0], "hello.py")
+    p.locator("#docbar button", has_text="Run file").click()
+    log = p.locator(".filedoc .log")
+    printed = until(lambda: "pi is 3.1416" in log.inner_text(), True, 60)
+    answered = until(lambda: pg.grid(log.locator(".entry").last), [["n"], [["30"]]])
+    repl = p.locator(".filedoc .prompt input")
+    repl.fill("y = 41")
+    repl.press("Enter")
+    until(lambda: log.locator(".entry").count(), 2)
+    until(lambda: log.locator(".entry .wait").count(), 0)
+    repl.fill("y + 1")
+    repl.press("Enter")
+    typed = until(lambda: pg.grid(log.locator(".entry").last), [["value"], [["42"]]])
+    checks["a Python file runs in its console (what it printed, its answer), and a line typed there runs in the same Python"] = printed is True \
+        and answered == [["n"], [["30"]]] and typed == [["value"], [["42"]]]
+
+    pg.workspace("data", "q.csv").click()
+    doc = p.locator(".datadoc")
+    shown = until(lambda: pg.grid(doc), [["id", "city", "amount"], [["1", "Oslo", "10"], ["2", "Rome, IT", "20"]]])
+    doc.locator("tbody tr:not(.gap)").nth(0).locator("td").nth(3).dblclick()
+    p.keyboard.press("Control+a")
+    p.keyboard.type("15")
+    p.keyboard.press("Enter")
+    doc.locator("button", has_text="Add row").click()
+    p.keyboard.type("3")
+    p.keyboard.press("Tab")
+    p.keyboard.type("Paris")
+    p.keyboard.press("Tab")
+    p.keyboard.type("30")
+    p.keyboard.press("Enter")
+    marked = doc.locator("td.chg").count() >= 1 and doc.locator("tr.new").count() == 1 and pg.tab() == ("q.csv", True)
+    p.keyboard.press("Control+s")
+    want = b'id,city,amount\r\n1,Oslo,15\r\n2,"Rome, IT",20\r\n3,Paris,30\r\n'
+    written = until(lambda: get(port, "data/q.csv"), want)
+    read = until(lambda: sql(port, f"SELECT count(*) AS n, sum(amount) AS s FROM read_csv('{lake_files}data/q.csv')"), [{"n": 3, "s": 65}])
+    checks["a CSV file is edited in a grid (a cell changed, a row added: both marked) and saved in place, its untouched lines as they were; the node reads the new rows"] = \
+        shown[1] == [["1", "Oslo", "10"], ["2", "Rome, IT", "20"]] and marked and written == want and read == [{"n": 3, "s": 65}] and until(lambda: pg.tab(), ("q.csv", False)) == ("q.csv", False)
+    theirs = b"id,city,amount\r\n9,Else,1\r\n"
+    put(port, "data/q.csv", theirs, version(port, "data/q.csv"))
+    doc.locator("tbody tr:not(.gap)").nth(0).locator("td").nth(2).dblclick()
+    p.keyboard.press("Control+a")
+    p.keyboard.type("Bergen")
+    p.keyboard.press("Enter")
+    p.keyboard.press("Control+s")
+    refused = until(lambda: "saved by someone else" in pg.toast(), True)
+    checks["saving over someone else's change is refused (If-Match: 412), and theirs is kept"] = refused is True and get(port, "data/q.csv") == theirs \
+        and pg.tab() == ("q.csv", True)
+    p.locator("#docbar button", has_text="Discard").click()  # (theirs, read again)
+    checks["Discard reads the file again: theirs"] = until(lambda: pg.grid(doc)[1], [["9", "Else", "1"]]) == [["9", "Else", "1"]] and until(lambda: pg.tab(), ("q.csv", False)) == ("q.csv", False)
+
+    pg.workspace("data", "e.jsonl").click()
+    doc = p.locator(".datadoc")
+    until(lambda: pg.grid(doc)[0], ["id", "tag"])
+    doc.locator("tbody tr:not(.gap)").nth(0).locator("td").nth(2).dblclick()
+    p.keyboard.press("Control+a")
+    p.keyboard.type("z")
+    p.keyboard.press("Enter")
+    p.keyboard.press("Control+s")
+    lines = until(lambda: [json.loads(l) for l in get(port, "data/e.jsonl").decode().splitlines()], [{"id": 1, "tag": "z"}, {"id": 2, "tag": "b"}])
+    checks["a JSONL file is edited and saved, a JSON object a line"] = lines == [{"id": 1, "tag": "z"}, {"id": 2, "tag": "b"}]
+
+    pg.workspace("data", "p.parquet").click()
+    doc = p.locator(".datadoc")
+    rows_ro = until(lambda: pg.grid(doc)[1], [["1", "x"], ["2", "y"]])
+    doc.locator("tbody tr:not(.gap)").nth(0).locator("td").nth(1).dblclick()
+    checks["a Parquet file opens read-only (it says so; a cell does not edit)"] = rows_ro == [["1", "x"], ["2", "y"]] and "read-only" in doc.locator(".note").inner_text() \
+        and doc.locator("input.celled").count() == 0
+    if show:
+        pg.workspace("data", "q.csv").click()
+        p.wait_for_timeout(500)
+        pg.shot(show, "console-data-file.png")
+    checks["files: every request went to the node; no page errors"] = pg.left() == [] and pg.errors == []
+    info = {"results": results, "said": said, "each": each, "not run": left, "second": second, "dirty": dirty, "saved": saved, "clean": clean, "shown": shown, "errors": pg.errors, "left": pg.left(), "toast": pg.toast()}
+    pg.ctx.close()
+    return checks, info
+
+
+def grid_checks(browser, port, show):
+    """The grid (ADR-034 §5): a spreadsheet's selection, keys, copy, filter and sort."""
+    checks = {}
+    pg = Page(browser, f"http://127.0.0.1:{port}/")
+    p = pg.p
+    pg.cells().first.wait_for(timeout=20000)
+    c = pg.run(0, "SELECT value AS n, value % 3 AS m, 'r' || value AS s FROM range(0, 10)")
+    cell = lambda r, col: c.locator("tbody tr:not(.gap)").nth(r).locator("td:not(.i)").nth(col)
+    cell(1, 0).click()
+    one = (c.locator("tr.cur").count(), c.locator("tr.cur td.i").inner_text(), c.locator("td.act").inner_text())
+    cell(3, 1).click(modifiers=["Shift"])
+    edges = tuple(c.locator(f"td.{k}").count() for k in ("in", "et", "eb", "el", "er"))
+    total = c.locator(".sum").inner_text()
+    p.keyboard.press("Control+c")
+    copied = until(pg.clipboard, "1\t1\n2\t2\n3\t0", 5)
+    p.keyboard.press("Control+Shift+c")
+    headed = until(pg.clipboard, "n\tm\n1\t1\n2\t2\n3\t0", 5)
+    checks["a click lights a cell and its row; Shift+click a range, one outline round it, summed; Ctrl+C copies it (Shift: with the headers)"] = \
+        one == (1, "2", "1") and edges == (6, 2, 2, 3, 3) and "9" in total and copied == "1\t1\n2\t2\n3\t0" and headed == "n\tm\n1\t1\n2\t2\n3\t0"
+    p.keyboard.press("ArrowDown")
+    moved = (c.locator("td.in").count(), c.locator("tr.cur td.i").inner_text(), c.locator("td.act").inner_text())
+    p.keyboard.press("Shift+ArrowRight")
+    grown = c.locator("td.in").count()
+    p.keyboard.press("Control+a")
+    everything = c.locator("td.in").count()
+    checks["the keys move the cell (Shift: grow the range; Ctrl+A: everything)"] = moved == (1, "5", "1") and grown == 2 and everything == 30
+    cell(0, 1).click()
+    cell(0, 1).click(button="right")  # (in the selection: the menu acts on it)
+    p.locator("#menu button", has_text="Filter to these values").click()
+    kept = until(lambda: [r[0] for r in pg.grid(c)[1]], ["0", "3", "6", "9"])
+    chip = c.locator(".chip-f").is_visible()
+    c.locator(".chip-f .x").click()
+    back = until(lambda: len(pg.grid(c)[1]), 10)
+    checks["the menu filters to a selection's values (a chip says so, and clears it)"] = kept == ["0", "3", "6", "9"] and chip and back == 10
+    srt = c.locator("thead th", has_text="n").first.locator(".srt")
+    srt.click()
+    srt.click()  # (again: the other way)
+    down = until(lambda: pg.grid(c)[1][0][0], "9")
+    c.locator("thead th", has_text="s").hover()
+    card = until(lambda: p.locator(".hcard").is_visible() and "VARCHAR" in p.locator(".hcard").inner_text(), True)
+    checks["a header's button sorts (again: the other way); its card tells its type"] = down == "9" and card is True
+    checks["grid: no page errors"] = pg.errors == []
+    info = {"one": one, "edges": edges, "total": total, "copied": copied, "headed": headed, "moved": moved, "kept": kept, "errors": pg.errors}
+    pg.ctx.close()
+    return checks, info
+
+
+def axe_js():
+    for path in [os.environ.get("AXE_JS", ""), os.path.join(HERE, "node_modules", "axe-core", "axe.min.js"), os.path.join("node_modules", "axe-core", "axe.min.js")]:
+        if path and os.path.exists(path):
+            return open(path).read()
+    return None
+
+
+def audit(page, axe):
+    """What axe finds (WCAG 2.1 A and AA, and its best practice), as [rule, how many]."""
+    page.add_script_tag(content=axe)
+    return page.evaluate("async () => (await axe.run(document, { runOnly: ['wcag2a', 'wcag2aa', 'wcag21aa', 'best-practice'] })).violations.map(v => [v.id, v.nodes.length, v.nodes[0].target.join(' ')])")
+
+
+def layout_checks(browser, port, show):
+    """The shell (ADR-034 §1–2, §6): views on either side, settings, the filter, panes and their
+    edges, tabs kept, a narrow window, and what axe finds."""
+    checks = {}
+    base = f"http://127.0.0.1:{port}"
+    sql(port, "CREATE TABLE lx AS SELECT 1 AS id")
+    sql(port, "CREATE TABLE ly AS SELECT 2 AS id")
+    put(port, "notes/a.sql", b"SELECT id FROM lx")
+    put(port, "notes/b.csv", b"k,v\n1,one\n")
+    pg = Page(browser, base + "/")
+    p = pg.p
+    ready = lambda: p.locator("#data .row", has_text="lx").wait_for(timeout=20000)
+    ready()
+    p.locator('#left button[aria-label="Workspace: more"]').click()
+    p.locator("#menu button", has_text="Move to the right pane").click()
+    moved = (p.locator("#rtabs .rtab").all_inner_texts(), p.locator("#left .group h2").all_inner_texts())
+    p.reload()
+    ready()
+    kept = "Workspace" in p.locator("#rtabs .rtab").all_inner_texts() and p.locator("#left .group h2").all_inner_texts() == ["Data"]
+    p.locator("#rtabs .rtab", has_text="Workspace").click()
+    p.locator('#rtabs button[aria-label="Workspace: more"]').click()
+    p.locator("#menu button", has_text="Move to the left pane").click()
+    back = p.locator("#left .group h2").all_inner_texts()
+    checks["a view moves to the other pane by its ⋯ (kept after a reload), and back"] = "Workspace" in moved[0] and moved[1] == ["Data"] and kept and back == ["Data", "Workspace"]
+    pg.menu("Settings")
+    p.select_option("#setGroups", "workspace")
+    first = p.locator("#left .group h2").all_inner_texts()
+    p.select_option("#setTheme", "dark")
+    dark = p.evaluate("document.documentElement.dataset.theme") == "dark" and p.evaluate("getComputedStyle(document.body).backgroundColor") != "rgb(255, 255, 255)"
+    p.select_option("#setGroups", "data")
+    p.select_option("#setTheme", "system")
+    p.keyboard.press("Escape")
+    checks["Settings: Workspace first (Data first by default), and the dark theme"] = first == ["Workspace", "Data"] and dark \
+        and p.locator("#left .group h2").all_inner_texts() == ["Data", "Workspace"]
+    p.fill("#filter", "lx")
+    seen = lambda: p.locator("#data .row:visible .nm").all_inner_texts()
+    only = until(lambda: "lx" in seen() and "ly" not in seen(), True)
+    p.press("#filter", "Escape")
+    checks["the filter narrows the trees to the names that hold it (and what they are in); Esc clears it"] = only is True and "ly" in seen()
+    p.locator("#docs").click()
+    p.keyboard.press("Control+b")
+    hid = p.locator("#left").is_hidden()
+    p.keyboard.press("Control+b")
+    p.keyboard.press("Control+Alt+b")
+    right = p.locator("#right").is_hidden()
+    p.keyboard.press("Control+Alt+b")
+    checks["Ctrl+B and Ctrl+Alt+B hide and show the side panes"] = hid and p.locator("#left").is_visible() and right and p.locator("#right").is_visible()
+    w0 = p.evaluate("document.querySelector('#left').offsetWidth")
+    b = p.locator("#leftEdge").bounding_box()
+    p.mouse.move(b["x"] + b["width"] / 2, b["y"] + 200)
+    p.mouse.down()
+    p.mouse.move(b["x"] + b["width"] / 2 + 60, b["y"] + 200, steps=5)
+    p.mouse.up()
+    wide = p.evaluate("document.querySelector('#left').offsetWidth")
+    p.reload()
+    ready()
+    again = p.evaluate("document.querySelector('#left').offsetWidth")
+    p.locator("#leftEdge").dblclick()
+    reset = p.evaluate("document.querySelector('#left').offsetWidth")
+    checks["a pane's edge sets its width (kept after a reload); a double-click resets it"] = wide == w0 + 60 and again == wide and reset == w0
+    pg.workspace("notes", "a.sql").click()
+    until(lambda: pg.tab()[0], "a.sql")
+    p.goto("about:blank")
+    p.goto(base + "/")
+    ready()
+    tabs = until(lambda: "a.sql" in p.locator("#tabbar .tab").all_inner_texts(), True)
+    checks["the files open in tabs open again with the page"] = tabs is True
+    p.set_viewport_size({"width": 700, "height": 820})
+    p.wait_for_timeout(300)
+    narrow = p.evaluate("document.documentElement.scrollWidth") == 700 and p.locator("#left").is_hidden() and p.locator("#right").is_hidden()
+    p.locator('#panes button[aria-label="Show or hide the left pane"]').click()
+    drawer = p.locator("#left").is_visible() and p.locator("#left").bounding_box()["x"] == 0
+    p.mouse.click(650, 500)
+    closed = until(lambda: p.locator("#left").is_hidden(), True, 3)
+    p.set_viewport_size({"width": 1440, "height": 900})
+    checks["a narrow window: nothing scrolls sideways, the side panes are drawers, closed by using the page"] = narrow and drawer and closed is True
+    axe, found = axe_js(), {}
+    if axe:
+        for scheme in ("light", "dark"):
+            a = Page(browser, base + "/", scheme)
+            a.p.locator("#data .row", has_text="lx").wait_for(timeout=20000)
+            a.run(0, "SELECT id, 'one' AS s FROM lx")
+            a.p.locator("#data .row", has_text="lx").click()
+            a.p.wait_for_timeout(400)
+            found[scheme + " notebook"] = audit(a.p, axe)
+            a.workspace("notes", "a.sql").click()
+            a.p.click("#runBtn")
+            a.p.locator(".filedoc .gt").wait_for(timeout=15000)
+            found[scheme + " SQL file"] = audit(a.p, axe)
+            a.workspace("notes", "b.csv").click()
+            a.p.locator(".datadoc .gt").wait_for(timeout=15000)
+            found[scheme + " data file"] = audit(a.p, axe)
+            a.ctx.close()
+    checks["axe finds nothing (WCAG 2.1 AA, contrast included, and its best practice), light and dark: a notebook, a SQL file, a data file"] = \
+        bool(axe) and len(found) == 6 and not any(found.values())
+    checks["layout: no page errors"] = pg.errors == []
+    info = {"moved": moved, "back": back, "widths": [w0, wide, again, reset], "axe": found if axe else "axe-core not found: AXE_JS, or npm install --prefix tools axe-core", "errors": pg.errors}
+    pg.ctx.close()
+    return checks, info
+
+
+def budget_checks(browser, port, show):
+    """ADR-034 §7: what the page costs — bytes, first paint, typing, scrolling."""
+    checks = {}
+    base = f"http://127.0.0.1:{port}"
+    sizes, fresh = {}, {}
+    for name in ["core.js", "editor.js", "grid.js", "notebook.js", "files.js", "console.js", "console.css"]:
+        r = urllib.request.urlopen(urllib.request.Request(f"{base}/console/{name}", headers={"accept-encoding": "gzip"}))
+        body, tag = r.read(), r.headers["etag"]
+        sizes[name] = len(body) if r.headers.get("content-encoding") == "gzip" and gzip.decompress(body) else None
+        try:
+            urllib.request.urlopen(urllib.request.Request(f"{base}/console/{name}", headers={"accept-encoding": "gzip", "if-none-match": tag}))
+            fresh[name] = 200
+        except urllib.error.HTTPError as e:
+            fresh[name] = e.code
+    total = sum(sizes.values()) if all(sizes.values()) else None
+    checks["the scripts and style sheet, gzipped as the node serves them: <= 70 KB; each answers 304 when the browser has it"] = total is not None and total <= 70 * 1024 \
+        and set(fresh.values()) == {304}
+    paints = []
+    for _ in range(3):
+        pg = Page(browser, base + "/")
+        pg.p.locator("#tabbar .tab").first.wait_for(timeout=20000)
+        paints.append(pg.p.evaluate("performance.getEntriesByName('first-contentful-paint')[0]?.startTime ?? 1e9"))
+        pg.ctx.close()
+    checks["first paint < 400 ms (the median of three)"] = statistics.median(paints) < 400
+    lines = "\n".join(f"SELECT {i} AS n, 'line {i}' AS s, {i} * 2 AS d FROM range(0, 1) WHERE {i} > 0  -- a comment on line {i}" for i in range(1000))
+    put(port, "perf/big.sql", lines.encode())
+    pg = Page(browser, base + "/#file=perf/big.sql")
+    p = pg.p
+    until(lambda: pg.tab()[0], "big.sql")
+    ta = p.locator(".filedoc .editor textarea")
+    ta.evaluate("""ta => { const at = ta.value.indexOf('\\n', ta.value.length / 2); ta.focus(); ta.setSelectionRange(at, at);
+        const box = ta.closest('.editor'); window.keys = []; let t0 = 0;
+        ta.addEventListener('keydown', () => { t0 = performance.now(); }, true);
+        ta.addEventListener('input', () => { box.getBoundingClientRect(); document.body.offsetHeight; window.keys.push(performance.now() - t0); }); }""")
+    for ch in " AND n < 1000 OR s = 'abc' -- more":
+        p.keyboard.type(ch)
+    keys = p.evaluate("window.keys")
+    for text in ["/* a comment", "\n'a quote", "\nopened */ -- ", "\n'"]:  # (states that go on past a line, opened and closed)
+        p.keyboard.insert_text(text)
+    same = ta.evaluate("""async ta => { const { highlight } = await import('/console/editor.js'), d = document.createElement('div');
+        const want = highlight(ta.value, 'sql').map(x => (d.innerHTML = x || ' ', d.innerHTML)), got = [...ta.closest('.editor').querySelectorAll('pre.hl > div')].map(x => x.innerHTML);
+        return want.length === got.length && want.every((w, i) => w === got[i]); }""")
+    checks["the editor highlights a line at a time (the state a comment or quote leaves carried on), as the whole text highlighted"] = same is True
+    typing = statistics.median(keys) if keys else 1e9
+    checks["typing in a 1,000-line file: < 8 ms a key (the median, the page's work to its layout)"] = len(keys) > 30 and typing < 8
+    ta.evaluate("ta => { ta.value = 'SELECT value AS a, value * 2 AS b, \\'x\\' || value AS c, value % 7 AS d FROM range(0, 10000)'; ta.dispatchEvent(new Event('input')); }")
+    p.click("#runBtn")
+    p.locator(".filedoc .pbody .gt").wait_for(timeout=30000)
+    frames = p.evaluate("""async () => { const g = document.querySelector('.filedoc .pbody .grid'), out = []; let last = performance.now();
+        for (let i = 0; i < 150; i++) { await new Promise(r => requestAnimationFrame(r)); const t = performance.now(); out.push(t - last); last = t; g.scrollTop += 240; }
+        return out.slice(10); }""")
+    frames.sort()
+    p95 = frames[int(len(frames) * 0.95)] if frames else 1e9
+    checks["scrolling 10,000 rows: p95 frame < 20 ms"] = p95 < 20
+    checks["budget: no page errors"] = pg.errors == []
+    info = {"gzipped": sizes, "total": total, "fresh": fresh, "first paint ms": paints, "typing ms": round(typing, 2), "keys": [round(k, 2) for k in keys[:40]], "scroll p95 ms": round(p95, 2),
+            "errors": pg.errors}
     pg.ctx.close()
     return checks, info
 
@@ -316,19 +768,20 @@ def token_checks(browser, port):
         harness.call(port, "POST", "/sql", b"CREATE TABLE secret_things AS SELECT 1 AS id", headers={"authorization": f"Bearer {token}"})
         pg = Page(browser, f"http://127.0.0.1:{port}/")
         asked = until(lambda: pg.p.locator("#tokenDlg").get_attribute("open") is not None, True)
-        hidden = pg.p.locator("#tree .row", has_text="secret_things").count() == 0
+        hidden = pg.p.locator("#data .row", has_text="secret_things").count() == 0
         pg.p.fill("#tokenIn", token)
         pg.p.press("#tokenIn", "Enter")
-        shown = until(lambda: pg.p.locator("#tree .row", has_text="secret_things").count(), 1)
+        shown = until(lambda: pg.p.locator("#data .row", has_text="secret_things").count(), 1)
+        signed = pg.p.locator("#signin").inner_text() == "Signed in"
         pg.p.reload()
-        again = until(lambda: pg.p.locator("#tree .row", has_text="secret_things").count(), 1)
+        again = until(lambda: pg.p.locator("#data .row", has_text="secret_things").count(), 1)
         def python_of(who):
             try:
                 return harness.call(port, "GET", "/sessions/some-page/python", headers={"authorization": f"Bearer {who}"})
             except Exception as e:  # noqa: BLE001 (refused: what it said)
                 return str(e)
-        checks = {"with tokens, the page asks for one, then shows the tables (and after a reload)": asked is True and hidden and shown == 1 and again == 1
-                  and pg.p.locator("#tokenDlg").get_attribute("open") is None,
+        checks = {"with tokens, the page asks for one (Sign in), then shows the tables (and after a reload)": asked is True and hidden and shown == 1 and again == 1
+                  and signed and pg.p.locator("#tokenDlg").get_attribute("open") is None,
                   "a session's Python variables are an admin's to read, as DO is": "admin" in str(python_of("console-check-reader"))
                   and python_of(token) == {"running": False, "variables": []}}
         pg.ctx.close()
@@ -346,14 +799,15 @@ def server_checks(browser, port):
     try:
         until(lambda: isinstance(call(port, "GET", "/databases"), list), True, 30)
         pg = Page(browser, f"http://127.0.0.1:{port}/")
-        tree = pg.p.locator("#tree")
+        tree = pg.p.locator("#data")
         tree.locator(".row", has_text="notes").wait_for(timeout=30000)
-        listed = [t.split("\n")[0] for t in tree.locator(":scope > div > .line .row").all_inner_texts()]
-        tree.locator(".row", has_text="sales").first.click()
+        listed = tree.locator(".row[data-kind=database] .nm").all_inner_texts()
+        title = pg.p.locator("#dataTitle").inner_text()
+        tree.locator(".row[data-kind=database]", has_text="sales").click()
         tree.locator(".row", has_text="orders").wait_for(timeout=30000)
         c = pg.run(0, "SELECT sum(amount) AS total FROM orders")
-        checks = {"the server's console lists its databases; a cell runs in the one picked (/db/sales)": listed == ["lake", "sales"] and pg.grid(c) == (["total"], [["30.5"]])
-                  and any("/db/sales/sql" in u for u in pg.seen) and "#db=sales" in pg.p.url,
+        checks = {"the server's console lists its databases (Databases); a cell runs in the one picked (/db/sales)": listed == ["lake", "sales"] and title == "Databases"
+                  and pg.grid(c) == [["total"], [["30.5"]]] and any("/db/sales/sql" in u for u in pg.seen) and "db=sales" in pg.p.url,
                   "the server's console: every request went to the server; no page errors": pg.left() == [] and pg.errors == []}
         info = {"listed": listed, "left": pg.left(), "errors": pg.errors}
         pg.ctx.close()
@@ -369,34 +823,27 @@ def ext_checks(browser, port):
     registers shows beside the console's own."""
     lake = tempfile.mkdtemp(prefix="pondra-")
     ext = os.path.join(HERE, "..", "examples", "console-extension.js")
-    node = Node(lake, port, env={"PONDRA_CONSOLE_EXTENSIONS": os.path.abspath(ext)}).start()
+    node = Node(lake, port, env={"PONDRA_CONSOLE_EXTENSIONS": ext}).start()
     try:
-        sql(port, "CREATE TABLE things AS SELECT * FROM (VALUES (1, 'a'), (2, 'b'), (3, 'c')) v(id, name)")
-        served = urllib.request.urlopen(f"http://127.0.0.1:{port}/console/ext/0.js").read().decode() == open(ext, encoding="utf-8").read()
-        first = urllib.request.urlopen(f"http://127.0.0.1:{port}/console/console.js")
-        tag = first.headers["etag"]
-        try:
-            again = urllib.request.urlopen(urllib.request.Request(f"http://127.0.0.1:{port}/console/console.js", headers={"if-none-match": tag})).status
-        except urllib.error.HTTPError as e:
-            again = e.code
+        sql(port, "CREATE TABLE things AS SELECT * FROM (VALUES (1), (2), (3)) AS t(id)")
+        served = call(port, "GET", "/console/ext/0.js").decode() == open(ext).read()
         pg = Page(browser, f"http://127.0.0.1:{port}/")
         p = pg.p
-        p.locator("#tree .row", has_text="things").wait_for(timeout=20000)
+        p.locator("#data .row", has_text="things").wait_for(timeout=20000)
         section = p.locator("#historyTitle").text_content() == "History" and p.locator("#history .empty").count() == 1
         c = pg.run(0, "SELECT count(*) AS n FROM things")
         figure = c.locator(".ext-figure").inner_text().split("\n")
         history = until(lambda: p.locator("#history .row").all_inner_texts(), ["SELECT count(*) AS n FROM things"])
-        p.locator("#tree .row", has_text="things").click()
-        p.locator("#tabs button", has_text="Sample").click()
-        sample = until(lambda: p.locator("#detail pre.said").count(), 3)
+        p.locator("#data .row", has_text="things").click()
+        p.locator("#rtabs .rtab", has_text="Sample").click()
+        sample = until(lambda: p.locator("#sample pre.said").count(), 3)
         p.click("#moreBtn")
         action = p.locator("#menu button", has_text="Copy a link to this notebook").count() == 1
         p.keyboard.press("Escape")
         checks = {"an extension is served (/console/ext/0.js), and its section, panel tab, view of an answer and menu action show beside the console's own":
                   served and section and figure == ["3", "n"] and history == ["SELECT count(*) AS n FROM things"] and sample == 3 and action,
-                  "the console's files carry a tag, and a browser that has them gets 304": bool(tag) and again == 304,
                   "with an extension: every request went to the node; no page errors": pg.left() == [] and pg.errors == []}
-        info = {"served": served, "section": section, "action": action, "figure": figure, "history": history, "sample": sample, "etag": tag, "again": again, "errors": pg.errors}
+        info = {"served": served, "section": section, "action": action, "figure": figure, "history": history, "sample": sample, "errors": pg.errors}
         pg.ctx.close()
         return checks, info
     finally:
@@ -404,18 +851,11 @@ def ext_checks(browser, port):
         shutil.rmtree(lake, ignore_errors=True)
 
 
-def _try(f):
-    try:
-        return f()
-    except Exception as e:  # noqa: BLE001
-        return e
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8890)
     ap.add_argument("--show", help="keep screenshots here")
-    ap.add_argument("--only", help="run only these parts (node, tokens, server, extensions), separated by commas")
+    ap.add_argument("--only", help="run only these parts (node, files, grid, layout, budget, tokens, server, extensions), separated by commas")
     A = harness.A = ap.parse_args()
     A.s3, A.keep = False, False
     if A.show:
@@ -426,8 +866,10 @@ def main():
     try:
         with sync_playwright() as pw:
             browser = pw.chromium.launch()
-            for part, f in [("node", lambda: node_checks(browser, A.port, A.show)), ("tokens", lambda: token_checks(browser, A.port + 1)), ("server", lambda: server_checks(browser, A.port + 2)),
-                            ("extensions", lambda: ext_checks(browser, A.port + 3))]:
+            parts = [("node", lambda: node_checks(browser, A.port, A.show)), ("files", lambda: files_checks(browser, A.port, A.show)), ("grid", lambda: grid_checks(browser, A.port, A.show)),
+                     ("layout", lambda: layout_checks(browser, A.port, A.show)), ("budget", lambda: budget_checks(browser, A.port, A.show)),
+                     ("tokens", lambda: token_checks(browser, A.port + 1)), ("server", lambda: server_checks(browser, A.port + 2)), ("extensions", lambda: ext_checks(browser, A.port + 3))]
+            for part, f in parts:
                 if A.only and part not in A.only.split(","):
                     continue
                 try:
@@ -443,8 +885,8 @@ def main():
         node.kill()
         shutil.rmtree(lake, ignore_errors=True)
     ok = all(results.values())
-    if not ok:
-        print(json.dumps(said, indent=1, default=str)[:8000])
+    if not ok or os.environ.get("CONSOLE_CHECK_SAY"):
+        print(json.dumps(said, indent=1, default=str)[:12000])
     print(json.dumps({"checks": len(results), "passed": sum(results.values()), "ok": ok}))
     sys.exit(0 if ok else 1)
 
