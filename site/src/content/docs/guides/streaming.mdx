@@ -72,7 +72,9 @@ because they can't be combined from partial results: keep `sum` and `count` and 
 read. A view that keeps a `min` or `max`, joins another table, or is a window, session or stream
 join can't take a row back, so an `UPDATE` or `DELETE` on its source is refused while it exists.
 `DROP MATERIALIZED VIEW name` first, or change a copy of the table. To change a view's query,
-drop it and make it again: `CREATE OR REPLACE` doesn't replace a materialized view.
+drop it and make it again: `CREATE OR REPLACE` doesn't replace a materialized view. A materialized
+view follows a table, not another materialized view (that is refused for now): make each from the
+tables themselves, or read a view's rows through a stored view (`CREATE VIEW`).
 </Aside>
 
 ### From a frame

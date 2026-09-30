@@ -16,6 +16,10 @@ export function h(tag, attrs = {}, ...kids) {
   for (const k of kids.flat()) if (k != null && k !== false) e.append(k);
   return e;
 }
+/** The rarer parts' style sheet (more.css), once: what more.js, chart.js and plan.js draw with,
+ * loaded with them (their first `await`), so the page's first load doesn't carry it. */
+let moreCss;
+export const moreStyle = () => moreCss ||= new Promise(done => document.head.append(h('link', { rel: 'stylesheet', href: new URL('more.css', import.meta.url).href, onload: done, onerror: done })));
 /** `el`'s children replaced by `kids`, leaving out the null and false ones (as `h` does). */
 export const fill = (el, ...kids) => { el.replaceChildren(...kids.flat().filter(k => k != null && k !== false)); return el; };
 export const esc = s => String(s).replace(/[&<>"']/g, c => `&#${c.charCodeAt(0)};`);
@@ -71,7 +75,8 @@ export const ICONS = {
   refresh: '<path d="M4 12a8 8 0 1 0 2.4-5.7L4 8.5"/><path d="M4 4v4.5h4.5"/>',
   restart: '<path d="M4 12a8 8 0 1 0 2.4-5.7L4 8.5"/><path d="M4 4v4.5h4.5"/>',
   search: '<circle cx="11" cy="11" r="6.5"/><path d="m20 20-4.2-4.2"/>',
-  settings: '<path d="M4 7h9M17 7h3M4 12h3M11 12h9M4 17h11M19 17h1"/><circle cx="15" cy="7" r="2"/><circle cx="9" cy="12" r="2"/><circle cx="17" cy="17" r="2"/>',
+  settings: '<circle cx="12" cy="12" r="3"/><circle cx="12" cy="12" r="6.5"/><path d="M12 2.5v3M12 18.5v3M2.5 12h3M18.5 12h3M5.3 5.3l2.1 2.1M16.6 16.6l2.1 2.1M5.3 18.7l2.1-2.1M16.6 7.4l2.1-2.1"/>',
+  check: '<path d="m5 12.5 4.5 4.5L19 7.5"/>',
   user: '<circle cx="12" cy="8.5" r="3.5"/><path d="M5 19.5c1.2-3.3 3.9-5 7-5s5.8 1.7 7 5"/>',
   save: '<path d="M5.5 4.5h10l3 3v10a2 2 0 0 1-2 2h-11a2 2 0 0 1-2-2v-11a2 2 0 0 1 2-2z"/><path d="M8.5 4.5v4h6v-4M8 19.5v-5h8v5"/>',
   filter: '<path d="M4 5.5h16l-6 7.5v5l-4 1.5v-6.5z"/>',
@@ -283,12 +288,15 @@ export function toast(msg, bad) {
   t.textContent = msg; t.className = 'on' + (bad ? ' bad' : '');
   clearTimeout(toastTimer); toastTimer = setTimeout(() => t.className = '', bad ? 6000 : 2600);
 }
-/** A menu at `at` (an element, an event or a point): items `{ label, icon?, keys?, run, disabled? }`,
- * or '-' for a line. Arrow keys move in it, Enter picks, Esc closes (and focus goes back). */
+/** A menu at `at` (an element, an event or a point): items `{ label, icon?, keys?, run, disabled?,
+ * checked? }`, '-' for a line, or `{ head }` for a heading. Arrow keys move in it, Enter picks, Esc
+ * closes (and focus goes back). */
 export function menu(at, items) {
   const m = $('#menu'), back = document.activeElement;
   const list = items.filter(Boolean).filter((x, i, a) => x !== '-' || (i > 0 && a[i - 1] !== '-' && i < a.length - 1));
-  m.replaceChildren(...list.map(i => i === '-' ? h('div', { class: 'sep', role: 'separator' }) : h('button', { role: 'menuitem', tabindex: '-1', disabled: i.disabled, onclick: () => { close(); i.run(); } }, i.icon ? icon(i.icon) : h('span', { class: 'ic' }), h('span', { class: 'lb' }, i.label), i.keys ? h('kbd', {}, i.keys) : null)));
+  m.replaceChildren(...list.map(i => i === '-' ? h('div', { class: 'sep', role: 'separator' }) : i.head ? h('div', { class: 'mh' }, i.head)
+    : h('button', { role: i.checked != null ? 'menuitemradio' : 'menuitem', 'aria-checked': i.checked != null ? String(!!i.checked) : null, tabindex: '-1', disabled: i.disabled, onclick: () => { close(); i.run(); } },
+      i.checked ? icon('check') : i.icon ? icon(i.icon) : h('span', { class: 'ic' }), h('span', { class: 'lb' }, i.label), i.keys ? h('kbd', {}, i.keys) : null)));
   const close = () => { m.hidden = true; if (document.activeElement?.closest('#menu')) back?.focus?.(); };
   m.onkeydown = e => {
     const all = [...m.querySelectorAll('button:not(:disabled)')], i = all.indexOf(document.activeElement);
@@ -301,7 +309,9 @@ export function menu(at, items) {
   const r = at.getBoundingClientRect ? at.getBoundingClientRect() : { left: at.clientX ?? at.x, right: at.clientX ?? at.x, bottom: at.clientY ?? at.y, top: at.clientY ?? at.y };
   const below = r.bottom + 4 + m.offsetHeight < innerHeight - 8;
   m.style.top = (below ? r.bottom + 4 : Math.max(8, r.top - m.offsetHeight - 4)) + 'px';
-  m.style.left = Math.max(8, Math.min(innerWidth - m.offsetWidth - 8, at.getBoundingClientRect ? r.right - m.offsetWidth : r.left)) + 'px';
+  // (under a button: from its left edge in the page's left half, to its right edge in the right half)
+  const left = at.getBoundingClientRect && r.left + r.right > innerWidth ? r.right - m.offsetWidth : r.left;
+  m.style.left = Math.max(8, Math.min(innerWidth - m.offsetWidth - 8, left)) + 'px';
   m.querySelector('button:not(:disabled)')?.focus();
 }
 addEventListener('mousedown', e => { if (!e.target.closest('#menu')) $('#menu').hidden = true; });
@@ -324,3 +334,28 @@ export function prompt(title, label, value = '', hint = '') {
 }
 /** A yes or no; true for yes. */
 export function confirmed(message) { return confirm(message); }
+/** A small window in the middle of the page: a title, what it shows, and its buttons
+ * (`[label, run, primary?]`); Esc, its ✕ or a press outside it closes it. */
+export function pop(title, body, buttons = []) {
+  const d = h('dialog', { class: 'pop', 'aria-label': title });
+  const close = () => d.close();
+  d.append(h('div', { class: 'pop-h' }, h('h3', {}, title), h('button', { class: 'icon', title: 'Close (Esc)', 'aria-label': 'Close', onclick: close }, icon('close'))),
+    h('div', { class: 'pop-b' }, body), ...buttons.length ? [h('div', { class: 'acts' }, buttons.map(([label, run, primary]) => h('button', { class: 'btn' + (primary ? ' primary' : ''), onclick: () => { close(); run(); } }, label)))] : []);
+  d.addEventListener('close', () => d.remove());
+  document.body.append(d);
+  d.showModal();
+  return d;
+}
+/** Python code formatted by the node's Python, as ruff (or black) formats it (the code isn't run). */
+export async function formatPython(code) {
+  const r = await call('/python/format', { method: 'POST', body: JSON.stringify({ code }), headers: { 'content-type': 'application/json' } });
+  return (await r.json()).code;
+}
+/** Stop the page's Python cell that is running, on the node: it ends with "Interrupted" and the
+ * variables stay (Windows: Python starts again, without them). */
+export async function interruptPython() {
+  try {
+    const r = await (await call(`/sessions/${SESSION}/python`, { method: 'POST' })).json();
+    if (r.done === 'restarted') toast('Python was stopped and starts again: its variables are gone');
+  } catch (e) { toast(e.message, true); }
+}

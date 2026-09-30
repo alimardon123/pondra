@@ -44,6 +44,12 @@ with pondra.local(lake, python=arrow) as db:
             return v.upper() + "!"
 
         assert db.sql("SELECT shout(v) AS s FROM t ORDER BY s LIMIT 1").rows() == [{"s": "A!"}]
+
+        # the page's Python (a console's cells, a Python file): one session's cells share their
+        # variables, and what they print comes back (on every OS: round 29 found Windows' waiting)
+        db.sql("DO LANGUAGE python $$\nx = 41\n$$")
+        db.sql("DO LANGUAGE python $$\nprint(x + 1)\n$$")
+        assert db.notices[-1:] == ["42"], db.notices
     else:  # rows as JSON (a null is None), one value, a text table; tables say what they need
         assert db.sql("SELECT 1 AS a, NULL AS b UNION ALL SELECT 2, 'x' ORDER BY a").rows() == [{"a": 1, "b": None}, {"a": 2, "b": "x"}]
         assert db.table("t").select(pondra.len()).item() == 3
@@ -80,4 +86,26 @@ if os.name != "nt" or os.environ.get("CI"):
         if os.name == "nt":
             with key() as k:
                 winreg.SetValueEx(k, "Path", 0, before[1], before[0])
+# `--python auto` (the shell's): this Python is found — pip put it beside the binary — each Python
+# on the machine tried with a time limit; a DO block runs on it, and /python names it
+if arrow:
+    import json, socket, time, urllib.request
+    with socket.socket() as sk:
+        sk.bind(("127.0.0.1", 0)); port = sk.getsockname()[1]
+    node = subprocess.Popen([pondra.binary(), "serve", "--dir", lake + "-auto", "--addr", f"127.0.0.1:{port}", "--python", "auto", "--stop-with-stdin"], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        url = f"http://127.0.0.1:{port}"
+        for _ in range(300):
+            try:
+                urllib.request.urlopen(url + "/stats", timeout=2); break
+            except OSError:
+                time.sleep(0.1)
+        auto = pondra.connect(url, echo=False)
+        auto.sql("DO LANGUAGE python $$\nprint('found')\n$$")
+        assert auto.notices == ["found"], auto.notices
+        chosen = json.load(urllib.request.urlopen(url + "/python?all=1", timeout=120))
+        assert chosen["python"] and any(p["ok"] for p in chosen["pythons"]), chosen
+        print("--python auto:", chosen["python"], f"({sum(p['ok'] for p in chosen['pythons'])} of {len(chosen['pythons'])} Pythons work)")
+    finally:
+        node.stdin.close(); node.wait(timeout=30)
 print("ok:", rows)

@@ -1,8 +1,8 @@
 // Notebooks (ADR-030, ADR-034): SQL, Python and text cells in a tab, saved in the lake as
 // Jupyter notebooks (`files/notebooks/<name>/<time>.ipynb`, a version per save), or, anywhere
 // else, as one plain `.ipynb` file, saved in place like a SQL file.
-import { h, $, icon, esc, secs, count, S, R, emit, call, rows, fileUrl, toast, menu, saveAs, numeric, ago, Failure, said, failed, readFile, writeFile } from './core.js';
-import { Editor, markdown } from './editor.js';
+import { h, $, icon, esc, secs, count, S, R, emit, call, rows, fileUrl, toast, menu, saveAs, numeric, Failure, said, failed, readFile, writeFile, interruptPython, formatPython } from './core.js';
+import { Editor, markdown, formatSql } from './editor.js';
 
 // ------------------------------------------------------------------ what a cell answered
 export function doneText(v) {
@@ -30,9 +30,9 @@ export class Cell {
     this.id = /^[A-Za-z0-9_-]{1,64}$/.test(o.id || '') ? o.id : newId();
     this.kind = o.kind || 'sql';
     this.result = null; this.count = null; this.ctl = null; this.stream = null;
-    this.kindSel = h('select', { class: 'kind', 'aria-label': 'Kind of cell', title: 'SQL, Python or text (S, P, M)', onchange: e => { this.setKind(e.target.value); this.edit(); } },
-      [...R.kinds.values()].map(k => h('option', { value: k.id }, k.label)));
-    this.runBtn = h('button', { class: 'run', title: 'Run (Ctrl+Enter)', onclick: () => this.ctl ? this.ctl.abort() : this.run() });
+    // (a press on it keeps the text's focus: a text cell being edited stays open while its menu is)
+    this.kindSel = h('button', { class: 'kind', 'aria-haspopup': 'menu', 'aria-label': 'Kind of cell', title: 'SQL, Python or text (S, P, M)', onmousedown: e => e.preventDefault(), onclick: e => this.kindMenu(e.currentTarget) });
+    this.runBtn = h('button', { class: 'run', title: 'Run (Ctrl+Enter)', onclick: () => this.ctl ? this.stop() : this.run() });
     this.idle();
     this.liveBox = h('input', { type: 'checkbox', onchange: () => this.setLive(this.liveBox.checked) });
     this.liveEl = h('label', { class: 'live', title: 'Live: the answer again each time a commit changes what it reads (L)' }, this.liveBox, h('span', { class: 'switch' }), 'Live');
@@ -45,8 +45,11 @@ export class Cell {
         tool('plus', 'Add a cell below (B)', () => nb.add({ kind: this.kind === 'markdown' ? 'sql' : this.kind }, this, true).edit()),
         tool('dots', 'More', e => menu(e.currentTarget, [{ label: 'Run the cells above', icon: 'arrowUp', run: () => nb.runSome(0, i()) }, { label: 'Run this and the cells below', icon: 'arrowDown', run: () => nb.runSome(i()) }, '-',
           { label: this.el.classList.contains('folded') ? 'Show the output' : 'Hide the output', icon: 'eye', keys: 'O', run: () => this.fold() }, { label: 'Clear the output', icon: 'clear', run: () => this.clear() }, '-',
+          ...[...R.kinds.values()].map(k => ({ label: `Make it ${k.label === 'Text' ? 'text' : k.label}`, checked: k.id === this.kind, run: () => { this.setKind(k.id); this.edit(); } })), '-',
           { label: 'Delete the cell', icon: 'trash', keys: 'D D', run: () => nb.remove(this) }]))));
     this.ed = new Editor({ grow: true, value: o.src || '', label: 'Code', oninput: () => nb.changed(), onkey: e => this.key(e) });
+    this.ed.menu = some => ['-', { label: 'Run the cell', icon: 'play', keys: 'Ctrl Enter', run: () => this.run() },
+      this.fmt ? { label: some ? 'Format the selection' : 'Format the cell', icon: 'format', keys: 'Shift Alt F', run: () => this.format() } : null];
     this.ta = this.ed.ta;
     this.md = h('div', { class: 'md', ondblclick: () => this.edit() });
     this.out = h('div', { class: 'out', onclick: () => { if (this.el.classList.contains('folded')) this.fold(false); } });
@@ -60,12 +63,15 @@ export class Cell {
     if (o.out) this.show(o.out, true);
   }
   get src() { return this.ta.value; }
+  kindMenu(at) { menu(at, [...R.kinds.values()].map(k => ({ label: k.label, checked: k.id === this.kind, run: () => { this.setKind(k.id); this.edit(); } }))); }
+  /** Stop it: a Python cell is interrupted on the node (its variables stay); a SQL one is no longer waited for. */
+  stop() { if (this.kind === 'python') interruptPython(); else this.ctl?.abort(); }
   get type() { return R.kinds.get(this.kind) || R.kinds.get('sql'); }
   idle() { this.runBtn.replaceChildren(icon('play'), 'Run'); this.runBtn.classList.remove('stop'); this.runBtn.title = 'Run (Ctrl+Enter)'; }
   fold(on = !this.el.classList.contains('folded')) { this.el.classList.toggle('folded', on); }
   clear() { this.stopLive(); this.result = null; this.out.replaceChildren(); this.status.textContent = ''; this.nb.changed(); }
   setKind(k, quiet) {
-    this.kind = R.kinds.has(k) ? k : 'sql'; k = this.kind; this.el.dataset.kind = k; this.kindSel.value = k;
+    this.kind = R.kinds.has(k) ? k : 'sql'; k = this.kind; this.el.dataset.kind = k; this.kindSel.replaceChildren(this.type.label, icon('chevd', 'ic', 12));
     this.liveEl.hidden = !this.type.live;
     if (!this.type.live) { this.stopLive(); this.liveBox.checked = false; }
     this.ta.placeholder = this.type.placeholder || '';
@@ -91,8 +97,12 @@ export class Cell {
       return true;
     }
     if (e.key === 'Escape') { e.preventDefault(); this.ta.blur(); this.el.focus({ preventScroll: true }); return true; }
+    if (e.shiftKey && e.altKey && e.key.toLowerCase() === 'f' && this.fmt) { e.preventDefault(); this.format(); return true; }
     return false;
   }
+  /** How its kind is formatted: SQL here, Python by the node's Python (ruff or black); text isn't. */
+  get fmt() { return this.kind === 'sql' ? formatSql : this.kind === 'python' ? formatPython : null; }
+  format() { if (this.fmt) this.ed.reformat(this.fmt); }
   async run() {
     if (!this.type.run) { this.md.innerHTML = markdown(this.src); this.ta.blur(); this.el.focus({ preventScroll: true }); return { kind: 'done' }; }
     const text = this.src.trim();
@@ -101,8 +111,8 @@ export class Cell {
     this.ctl?.abort();
     const ctl = this.ctl = new AbortController(), t0 = performance.now();
     this.count = ++S.runs; this.num.textContent = `[${this.count}]`;
-    this.runBtn.replaceChildren(icon('stop'), 'Stop'); this.runBtn.classList.add('stop'); this.runBtn.title = 'Stop waiting for it';
-    emit('run', this);
+    this.runBtn.replaceChildren(icon('stop'), 'Stop'); this.runBtn.classList.add('stop'); this.runBtn.title = this.kind === 'python' ? 'Interrupt it (its variables stay)' : 'Stop waiting for it';
+    emit('run', this); this.nb.running();
     this.status.className = 'st pulse'; this.status.textContent = 'running…';
     const tick = setInterval(() => { this.status.textContent = 'running… ' + secs(performance.now() - t0); }, 250);
     let r;
@@ -113,7 +123,7 @@ export class Cell {
     } finally {
       clearInterval(tick);
       if (this.ctl === ctl) this.ctl = null;
-      this.idle();
+      this.idle(); this.nb.running();
     }
     r.ms = performance.now() - t0;
     this.show(r);
@@ -252,7 +262,7 @@ export class Notebook {
     for (const c of cells.length ? cells : [{}]) this.add(c, null, true, true);
     this.name = name; this.version = version; this.written = version ? Date.now() : null;
     this.select(this.cells[0]);
-    this.dirty = !version; emit('changed', this); // (new: not saved yet)
+    this.dirty = false; emit('changed', this); // (new and untouched: nothing to save yet)
   }
   add(o, near, below = true, quiet) {
     const c = new Cell(this, o), i = near ? this.cells.indexOf(near) + (below ? 1 : 0) : this.cells.length;
@@ -306,7 +316,9 @@ export class Notebook {
       if (r?.kind === 'error') { toast('Stopped at a cell that failed', true); return; }
     }
   }
-  interrupt() { for (const c of this.cells) c.ctl?.abort(); }
+  interrupt() { for (const c of this.cells) if (c.ctl) c.stop(); }
+  /** Cells started or ended: the toolbar's Run all becomes Stop while one runs. */
+  running() { const on = this.cells.some(c => c.ctl); if (on !== this.busy) { this.busy = on; if (S.doc === this) R.helpers.toolbar(); } }
   clearOutputs() { for (const c of this.cells) { c.stopLive(); c.result = null; c.count = null; c.num.textContent = ''; c.out.replaceChildren(); c.status.textContent = ''; } this.changed(); }
   /** A table's first rows, in the empty selected cell or a new one. */
   peek(sql) {
@@ -365,21 +377,19 @@ export class Notebook {
     const name = h('input', { id: 'nbname', value: this.name, 'aria-label': 'Notebook name', spellcheck: 'false', title: 'The notebook\'s name: Ctrl+S saves it under this one' });
     name.addEventListener('change', () => { this.name = cleanName(name.value) || 'untitled'; name.value = this.name; this.version = null; this.changed(); });
     name.addEventListener('keydown', e => { if (e.key === 'Enter') name.blur(); });
-    const b = (ic, label, title, fn, cls = 'btn') => h('button', { class: cls, title, onclick: fn }, ic ? icon(ic) : null, label);
-    const pill = h('button', { class: 'pill kernel', id: 'kernel', title: 'This page\'s Python, on the node: its cells share their variables. Click for Variables and Restart', onclick: e => menu(e.currentTarget, [{ label: 'Variables', icon: 'var', run: () => R.helpers.show('variables') }, { label: 'Restart Python', icon: 'restart', keys: '0 0', run: () => R.helpers.restart() }]) });
-    const drawPill = () => pill.replaceChildren(h('span', { class: 'dot ' + (S.py === 'busy' ? 'busy' : S.py === 'idle' ? '' : 'idle') }), 'Python ', h('b', {}, S.py === 'none' ? 'not started' : S.py));
-    drawPill(); this.drawPill = drawPill;
-    return [h('span', { class: 'crumb' }, this.dir ?? 'notebooks/'), name, h('span', { class: 'said-saved' }, this.dirty ? 'Edited, not saved' : this.written ? `Saved ${ago(new Date(this.written).toISOString())}` : ''),
-      h('span', { class: 'grow' }),
-      b('play', 'Run all', 'Run every cell, in order (Ctrl+Shift+Enter)', () => this.runSome(0), 'btn primary'), b('stop', 'Interrupt', 'Stop waiting for the cells running', () => this.interrupt()),
-      b('restart', 'Restart', 'Restart Python: its variables go', () => R.helpers.restart()), h('span', { class: 'sep' }), pill,
-      b('save', 'Save', 'Save in the lake (Ctrl+S)', () => this.save()),
+    const i = () => Math.max(0, this.cells.indexOf(this.sel));
+    const pill = R.helpers.pythonPill();
+    this.drawPill = pill.draw;
+    return [h('span', { class: 'crumb' }, this.dir ?? 'notebooks/'), name, h('span', { class: 'grow' }),
+      R.helpers.runButton(this.busy, { label: 'Run all', title: 'Run every cell, in order (Ctrl+Shift+Enter)', run: () => this.runSome(0), stop: () => this.interrupt(), stopTitle: 'Stop the cells running (Python\'s are interrupted, their variables kept)' }, [
+        { label: 'Run all', icon: 'play', keys: 'Ctrl Shift Enter', run: () => this.runSome(0) }, { label: 'Run the cells above', icon: 'arrowUp', run: () => this.runSome(0, i()) },
+        { label: 'Run this and the cells below', icon: 'arrowDown', run: () => this.runSome(i()) }, '-', { label: 'Clear every output', icon: 'clear', run: () => this.clearOutputs() },
+        // (a job runs a notebook of notebooks/, with its versions: not a plain file)
+        ...this.plain ? [] : ['-', { label: 'Run as a job', icon: 'play', run: () => R.helpers.job(this) }, { label: 'Schedule…', icon: 'clock', run: () => R.helpers.schedule(this) }]]),
+      pill, R.helpers.saveButton(this),
       h('button', { class: 'icon', title: 'More', 'aria-label': 'More', onclick: e => menu(e.currentTarget, [
         this.plain ? null : { label: 'Versions…', icon: 'clock', run: () => R.helpers.pickFile(`files/${this.path}`) },
-        { label: 'Download as .ipynb', icon: 'down', run: () => saveAs(JSON.stringify(this.notebook(), null, 1) + '\n', 'application/x-ipynb+json', this.name + '.ipynb') },
-        { label: 'Clear every output', icon: 'clear', run: () => this.clearOutputs() }, '-',
-        // (a job runs a notebook of notebooks/, with its versions: not a plain file)
-        this.plain ? null : { label: 'Run as a job', icon: 'play', run: () => R.helpers.job(this) }, this.plain ? null : { label: 'Schedule…', icon: 'clock', run: () => R.helpers.schedule(this) }]) }, icon('dots'))];
+        { label: 'Download as .ipynb', icon: 'down', run: () => saveAs(JSON.stringify(this.notebook(), null, 1) + '\n', 'application/x-ipynb+json', this.name + '.ipynb') }]) }, icon('dots'))];
   }
   status() { return [`${this.cells.length} cell${this.cells.length === 1 ? '' : 's'}`, 'Notebook']; }
   /** Keys on the selected cell, after Esc (Jupyter's). */

@@ -45,7 +45,7 @@ query) and `tables` are for clients that send frames and data along; the clients
 
 | Query parameter | Meaning |
 |---|---|
-| `format` | `json` (the default), `table` (a text table), `arrow` (an Arrow IPC stream, for pandas, Polars and DuckDB) or `typed` (below) |
+| `format` | `json` (the default), `table` (a text table), `arrow` (an Arrow IPC stream, for pandas, Polars and DuckDB) or `typed` (below); or a file of every row to download: `csv`, `tsv`, `ndjson` (JSON lines), `parquet` or `xlsx` (an Excel workbook: one sheet, the names in bold, at most 1,048,575 rows) |
 | `after` | wait until this node has seen this log segment (from an append's `seg`), for reading your own writes |
 | `spread` | `1` runs the query across the cluster even for small tables, `0` only here |
 | `stale_ms` | accept a remembered answer up to this many milliseconds old |
@@ -270,10 +270,16 @@ token is refused.
 | `GET /metrics` | read | Prometheus metrics, as text |
 | `POST /tier` | admin | write the log into Parquet now: `{"rows_tiered": N}` |
 | `DELETE /sessions/{id}` | read | end a session: its temporary tables and views go, and so does its Python: `{"ended": true}` |
-| `GET /sessions/{id}/python` | admin | the session's Python (a console page's cells): `{"running", "busy", "variables": [{"name", "type", "size", "look"}]}` |
+| `GET /sessions/{id}/python` | admin | the session's Python (a console page's cells): `{"running", "busy", "variables": [{"name", "type", "size", "look"}], "python": {"python", "version"}}` |
+| `POST /sessions/{id}/python` | admin | interrupt its running cell: it ends with `KeyboardInterrupt` and the variables stay (`{"done": "interrupted"}`); on Windows Python restarts instead (`"restarted"`) |
 | `DELETE /sessions/{id}/python` | admin | restart it: its variables go, its temporary tables stay |
+| `GET /python` | admin | the Python workers run with: `{"python", "version"}`; with `?all=1`, also `pythons`: each Python this machine has, tried (`path`, `version`, `pondra`, `pyarrow`, `ok`, `error`) |
+| `PUT /python` | admin, from this machine | `{"path": "…"}`: run workers with that Python from now on (it must have `pondra` and `pyarrow`), and next time too. Workers running now finish with the Python they have |
+| `POST /python/format` | admin | `{"code": "…"}`: Python code formatted by the node's Python, as ruff (or black, if it has no ruff) formats it: `{"code": "…"}`. The code is only read, never run |
 | `GET /` | none | [the console](/pondra/start/console/): a web page, with no data in it until you use it |
-| `GET /console/console.js`, `/console/console.css`, `/console/ext/{n}.js` | none | the console's script and style, and the extensions the node was given (`PONDRA_CONSOLE_EXTENSIONS`); each with an `ETag`, `304` when unchanged |
+| `GET /console/console.js`, `/console/console.css`, `/console/ext/{n}.js` | none | the console's scripts and style (the modules it loads, some the first time they are needed), and the extensions the node was given (`PONDRA_CONSOLE_EXTENSIONS`); each with an `ETag`, `304` when unchanged |
+| `GET /console/settings` | none | the console's settings kept on this machine (theme, colours, layout), as JSON: `{}` if none |
+| `PUT /console/settings` | none, from this machine | keep them: a JSON object, at most 64 KB. From a page on another machine it is refused, and that page keeps its own |
 
 `GET /stats` needs no token, so a load balancer can poll it. It answers `lake` (its name), `role` (`leader`,
 `follower` or `reader`), `leader` (its address), `term`, `nodes`, `hwm` (the newest commit),

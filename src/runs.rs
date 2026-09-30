@@ -75,8 +75,13 @@ pub struct Run(Line);
 
 impl Run {
     pub fn start(app: &App, routine: &str, role: Role, job: Option<&str>, args: &RecordBatch, id: Option<String>) -> Run {
+        Run::begin(app, routine, role, job, args_text(args), id)
+    }
+
+    /// A call whose arguments are said as they are: a DO block's `{"language": …, "code": …}`.
+    pub fn begin(app: &App, routine: &str, role: Role, job: Option<&str>, args: String, id: Option<String>) -> Run {
         let caller = CALLER.try_with(|c| c.clone()).unwrap_or_else(|_| format!("{role:?}").to_lowercase());
-        let line = Line { id: id.unwrap_or_else(new_id), routine: routine.into(), caller, node: app.cluster.addr.clone(), job: job.map(String::from), args: args_text(args), started: now_ms(), ended: None, status: "running", notices: None, error: None };
+        let line = Line { id: id.unwrap_or_else(new_id), routine: routine.into(), caller, node: app.cluster.addr.clone(), job: job.map(String::from), args: cut(args), started: now_ms(), ended: None, status: "running", notices: None, error: None };
         log(app, line.clone(), None);
         Run(line)
     }

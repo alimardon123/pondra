@@ -1,6 +1,6 @@
 # Prototype status: Pondra, a streamhouse in one binary
 
-**Date:** 2026-09-30 (the workspace, round 27, and round 28) · **Plan:** ADR-002 to ADR-034, `roadmap.md` · **Code:** `pondra.zip` / `pondra.bundle` (≈30,700 lines of Rust, plus Python and JavaScript clients, a documentation website, packaging, and test and benchmark tools)
+**Date:** 2026-09-30 (the workspace, rounds 27 and 28, and round 29 part 1) · **Plan:** ADR-002 to ADR-034, `roadmap.md` · **Code:** `pondra.zip` / `pondra.bundle` (≈30,700 lines of Rust, plus Python and JavaScript clients, a documentation website, packaging, and test and benchmark tools)
 **Name:** the prototype formerly called `lh` is now **Pondra**. The name is free on crates.io, PyPI and npm. A small personal-finance app uses it (pondra.app), a different category; run a trademark search before a public launch.
 
 ## Where it stands
@@ -14,6 +14,44 @@ One Rust binary replaces the Kafka + Flink + Spark + metastore + ZooKeeper stack
 - upsert and merge tables.
 
 Start more copies on the same bucket to scale out. The only state is object storage. There's no JVM, no database server and no coordination service.
+
+**Round 29, part 1 took the owner's list from 0.26 on Windows** (ADR-034, "Changed after 0.27"):
+
+1. **Python that starts.** `--python auto` tries every Python the machine has at once (the PATH,
+   Windows' `py` launcher, Anaconda and Miniconda and their environments), each for 15 s at most,
+   so a broken install no longer holds a cell forever; a worker must say hello within 60 s, and
+   its error carries what it printed. **Choose the Python…** lists them and keeps the choice. Stop
+   interrupts a running cell (its variables stay; Windows restarts Python), and a cell the page
+   stopped waiting for never answers the next one.
+2. **The grid and its answers:** a whole selection outline, a smaller header card, a header's own
+   menu, typed filters (contains, =, <, is NULL, …) that open again to change, a SQL list of every
+   column selected; Copy and Download as split buttons: tab-separated, CSV, JSON, Markdown, SQL
+   `VALUES` or a list; every row as CSV, TSV, JSON lines, Parquet or Excel (`xlsx.rs`, no crate).
+3. **What ran:** Messages lists each statement; Runs shows each run on a line, a click to see it
+   and open, copy, run again or see its plan; a `DO` block logs its code, so a cell run on the node
+   is named by its first line.
+4. **Plans and charts:** the Plan tab draws the steps as a graph (the ones moving rows between
+   nodes dashed); Profile runs `EXPLAIN ANALYZE` and colours the costliest steps. Charts: bars,
+   lines, areas, points, a pie, saved as PNG or SVG.
+5. **Editing:** a right-click menu in files and cells, **Format** (Shift+Alt+F) for SQL in the page
+   and for Python by the node's ruff or black (`POST /python/format`), leaving what can't be
+   formatted as it was.
+6. **Calmer:** Save shows only when there is something to save; Settings is a gear and a dialog,
+   light first, a background and accent colour per theme, **kept on the machine** for every lake
+   and session (`/console/settings`); the right pane's tabs reorder; a results panel at the right
+   of a narrow file keeps its buttons in reach.
+7. **Lighter:** the page's first load had grown to 76.5 KB gzipped; Runs, Variables, Settings,
+   search, choosing Python, a table's profile and data files now load when first used: 68.5 KB,
+   each later part under 8 KB.
+8. **Found and fixed:** the Docs workflow failed on a clean checkout since round 26 (`site/public/`
+   didn't exist); a `pop` dialog showed "null"; a menu under a button on the left opened off to its
+   left; clicking a statement's answer selected it in the editor, so the next Run ran it alone.
+9. **Tests** (`logs/round29/`): `console_check.py` (80, axe light and dark included), `harness.py
+   procedures` (Stop, a cell abandoned, `/python`, Format, the run log's code) and `clients` (every
+   download read back, Excel by openpyxl), `harness.py all`; the owner's cluster benchmarks on
+   0.27.0 (SF10, 3 and 6 runners): every answer the same, the cluster spreading 4 (3 nodes) and 2 (6 nodes) of 22 queries
+   and faster than one node (23.9 s against 25.1 s; 21.1 against 22.7), spreading all 22 slower
+   (40.0 s, 33.0 s) on a network of 40–85 MB/s.
 
 **Round 28 took other engines' changes as written** (ADR-029 phase 2):
 

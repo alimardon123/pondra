@@ -1,7 +1,7 @@
 // The result grid (ADR-034): query answers, notebook outputs and data files. It draws only the
 // rows in sight; a cell, a range, a row or a column can be selected and copied (tab-separated,
 // so a spreadsheet takes it as cells); a data file's cells are edited in place.
-import { h, icon, svg, count, numeric, sqlType, typeKind, typeMark, menu, toast, saveAs, quote, ident } from './core.js';
+import { h, icon, svg, count, numeric, sqlType, typeKind, typeMark, menu, toast, saveAs, quote, ident, pop } from './core.js';
 
 const ROW_H = 30; // the height of a row when only the rows in sight are drawn
 let measurer;
@@ -17,6 +17,12 @@ export function toCsv(r, sep = ',') {
   const field = v => { const s = v == null ? '' : typeof v === 'object' ? JSON.stringify(v) : String(v); return new RegExp(`["${sep}\\n\\r]`).test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; };
   return [r.columns.map(c => c.name), ...r.rows].map(row => row.map(field).join(sep)).join('\r\n') + '\r\n';
 }
+
+/** A filter's ways to compare: [label, whether it takes a value]. */
+const OPS = { has: ['contains', 1], starts: ['starts with', 1], not: ['does not contain', 1], eq: ['=', 1], ne: ['≠', 1], gt: ['>', 1], ge: ['≥', 1], lt: ['<', 1], le: ['≤', 1], null: ['is NULL', 0], notnull: ['is not NULL', 0] };
+/** The forms a copy takes: [format, label, with the headers]. */
+export const COPIES = [['tsv', 'Tab-separated, with the headers', true], ['tsv', 'Tab-separated, without the headers', false], ['csv', 'CSV', true], ['json', 'JSON', true],
+  ['md', 'A Markdown table', true], ['values', 'SQL: VALUES rows', false], ['list', 'SQL: a list, for IN (…)', false], ['names', 'The columns\' names', true]];
 
 // ------------------------------------------------------------------ copying (works without the clipboard API too)
 let pending = null;
@@ -81,7 +87,7 @@ export function grid(r, o = {}) {
   const text = (row, i) => shown(row[i], times[i], scales[i]);
   const multi = all.slice(0, 200).some(row => row.some(v => typeof v === 'string' && v.includes('\n')));
   const virtual = !multi && (all.length > 60 || !!o.edit);
-  let view = all.map((_, i) => i), sort = null, filter = null, sel = null;
+  let view = all.map((_, i) => i), sort = null, filters = [], sel = null;
 
   // the header: a type mark, the name, a sort arrow; the corner selects everything
   const heads = cols.map((c, i) => h('th', { class: nums[i] ? 'num' : null, 'data-c': i, scope: 'col' },
@@ -232,6 +238,8 @@ export function grid(r, o = {}) {
     else if (e.key.length === 1 && !mod && !e.altKey) { e.preventDefault(); editCell(sel.fr, sel.fc, e.key); }
   });
   box.addEventListener('contextmenu', e => {
+    const th = e.target.closest('th[data-c]');
+    if (th) { e.preventDefault(); headMenu(e, +th.dataset.c); return; }
     const p = at(e);
     if (!p || p.c < 0) return;
     e.preventDefault();
@@ -239,19 +247,43 @@ export function grid(r, o = {}) {
     if (!g || p.k < g.r0 || p.k > g.r1 || p.c < g.c0 || p.c > g.c1) select(p.k, p.c);
     const c = sel.fc, name = cols[c].name;
     menu(e, [{ label: 'Copy', icon: 'copy', keys: 'Ctrl C', run: () => copyText(tsv(false)) }, { label: 'Copy with headers', keys: 'Ctrl Shift C', run: () => copyText(tsv(true), 'Copied, with the headers') },
-      { label: 'Copy as CSV', run: () => copyText(asCsv()) }, { label: 'Copy as JSON', run: () => copyText(asJson()) }, { label: 'Copy as a SQL list', run: () => copyText(asList()) }, '-',
-      { label: 'Filter to these values', icon: 'filter', run: () => filterTo(c) }, filter ? { label: 'Clear the filter', run: () => setFilter(null) } : null,
+      { label: 'Copy as CSV', run: () => copyText(as('csv', true)) }, { label: 'Copy as JSON', run: () => copyText(as('json', true)) }, { label: 'Copy as SQL: VALUES rows', run: () => copyText(as('values')) }, { label: 'Copy as SQL: a list, for IN (…)', run: () => copyText(as('list')) }, '-',
+      { label: 'Filter to these values', icon: 'filter', run: () => filterTo(c) }, { label: `Filter ${name}…`, run: () => askFilter(c) }, filters.length ? { label: 'Clear the filters', run: () => setFilters([]) } : null,
       { label: 'Sort ascending', icon: 'sortUp', run: () => sortBy(c, 1) }, { label: 'Sort descending', icon: 'sortDown', run: () => sortBy(c, -1) }, '-',
       o.explore ? { label: `Profile ${name}`, icon: 'chart', run: () => o.explore(c) } : null,
       o.edit ? '-' : null, o.edit ? { label: 'Delete the row' + (range().r1 > range().r0 ? 's' : ''), icon: 'trash', run: () => { const g2 = range(); o.edit.del(view.slice(g2.r0, g2.r1 + 1)); sel = null; refresh(); } } : null]);
   });
+  /** A column header's menu: its name, the names of the columns selected, sorting, filtering. */
+  function headMenu(e, c) {
+    clearTimeout(hover); hideCard();
+    const g = range(), inSel = g && c >= g.c0 && c <= g.c1 && g.r0 === 0 && g.r1 === view.length - 1, names = inSel ? cols.slice(g.c0, g.c1 + 1).map(x => x.name) : [cols[c].name];
+    if (!inSel) select(0, c, view.length - 1, c);
+    menu(e, [{ label: `Copy the name${names.length > 1 ? 's' : ''}`, icon: 'copy', run: () => copyText(names.join(', ')) }, { label: `Copy as SQL: ${names.map(ident).join(', ').slice(0, 40)}`, run: () => copyText(names.map(ident).join(', ')) },
+      { label: 'Copy the values, with the header', run: () => copyText(tsv(true)) }, '-',
+      { label: 'Sort ascending', icon: 'sortUp', run: () => sortBy(c, 1) }, { label: 'Sort descending', icon: 'sortDown', run: () => sortBy(c, -1) }, sort ? { label: 'Unsorted', run: () => { sort = null; order(); } } : null, '-',
+      { label: `Filter ${cols[c].name}…`, icon: 'filter', run: () => askFilter(c) }, filters.some(f => f.c === c) ? { label: 'Clear its filter', run: () => setFilters(filters.filter(f => f.c !== c)) } : null,
+      filters.length ? { label: 'Clear every filter', run: () => setFilters([]) } : null, '-',
+      o.explore ? { label: `Profile ${cols[c].name}`, icon: 'chart', run: () => o.explore(c) } : null]);
+  }
 
   // what the selection holds, in the copies' forms
   const picked = () => { const g = range(); return { g, rows: view.slice(g.r0, g.r1 + 1).map(i => all[i]), cs: cols.slice(g.c0, g.c1 + 1).map((_, j) => g.c0 + j) }; };
-  const tsv = headers => { const { rows, cs } = picked(), f = v => (v ?? '').replace(/[\t\n\r]+/g, ' '); return [...(headers ? [cs.map(c => cols[c].name)] : []), ...rows.map(row => cs.map(c => f(text(row, c))))].map(l => l.join('\t')).join('\n'); };
-  const asCsv = () => { const { rows, cs } = picked(); return toCsv({ columns: cs.map(c => cols[c]), rows: rows.map(row => cs.map(c => row[c])) }); };
-  const asJson = () => { const { rows, cs } = picked(); return JSON.stringify(rows.map(row => Object.fromEntries(cs.map(c => [cols[c].name, row[c]]))), null, 1); };
-  const asList = () => { const { rows } = picked(), c = sel.fc; return '(' + [...new Set(rows.map(row => row[c]))].map(v => v == null ? 'NULL' : nums[c] ? String(v) : quote(text({ 0: v }, 0) ?? v)).join(', ') + ')'; };
+  const tsv = headers => as('tsv', headers);
+  /** The selection (or, with none, every row here) in one of COPIES' forms. */
+  const as = (f, headers = true) => {
+    const { rows, cs } = sel ? picked() : { rows: view.map(i => all[i]), cs: cols.map((_, i) => i) };
+    const lit = (row, c) => row[c] == null ? 'NULL' : nums[c] ? String(row[c]) : typeof row[c] === 'boolean' ? String(row[c]).toUpperCase() : quote(text(row, c));
+    const cell = (row, c) => (text(row, c) ?? '').replace(/[\t\n\r]+/g, ' ');
+    switch (f) {
+      case 'csv': return toCsv({ columns: cs.map(c => cols[c]), rows: rows.map(row => cs.map(c => row[c])) });
+      case 'json': return JSON.stringify(rows.map(row => Object.fromEntries(cs.map(c => [cols[c].name, row[c]]))), null, 1);
+      case 'md': { const esc = x => x.replace(/\|/g, '\\|'); return [cs.map(c => esc(cols[c].name)), cs.map(c => nums[c] ? '---:' : '---'), ...rows.map(row => cs.map(c => esc(cell(row, c))))].map(l => `| ${l.join(' | ')} |`).join('\n'); }
+      case 'values': return 'VALUES\n  ' + rows.map(row => `(${cs.map(c => lit(row, c)).join(', ')})`).join(',\n  ');
+      case 'list': { const one = cs.length === 1, seen = [...new Set(rows.map(row => cs.map(c => lit(row, c)).join(', ')))]; return '(' + seen.map(v => one ? v : `(${v})`).join(', ') + ')'; }
+      case 'names': return cs.map(c => cols[c].name).join(', ');
+      default: return [...(headers ? [cs.map(c => cols[c].name)] : []), ...rows.map(row => cs.map(c => cell(row, c)))].map(l => l.join('\t')).join('\n');
+    }
+  };
   function said() {
     const g = range();
     let msg = '';
@@ -271,22 +303,47 @@ export function grid(r, o = {}) {
   // sorting and filtering (here, on the rows the answer holds)
   function order() {
     view = all.map((_, i) => i);
-    if (filter) view = view.filter(i => filter.values.has(text(all[i], filter.c)));
+    for (const f of filters) view = view.filter(i => passes(f, all[i]));
     if (sort) {
       const i = sort.i, key = v => v == null ? null : nums[i] ? Number(v) : String(v);
       view.sort((a, b) => { const x = key(all[a][i]), y = key(all[b][i]); return x === y ? a - b : x == null ? 1 : y == null ? -1 : (x < y ? -1 : 1) * sort.dir; });
     }
     heads.forEach((th, k) => { th.classList.toggle('on', sort?.i === k); th.querySelector('.srt').innerHTML = svg(sort?.i === k ? (sort.dir === 1 ? 'sortUp' : 'sortDown') : 'sort', 13); });
-    chip.hidden = !filter;
-    if (filter) chip.firstChild.textContent = `${cols[filter.c].name}: ${[...filter.values].slice(0, 3).map(v => v ?? 'NULL').join(', ')}${filter.values.size > 3 ? ` +${filter.values.size - 3}` : ''}`;
+    chip.hidden = !filters.length;
+    chip.firstChild.textContent = filters.map(f => `${cols[f.c].name} ${f.values ? `in ${[...f.values].slice(0, 3).map(v => v ?? 'NULL').join(', ')}${f.values.size > 3 ? ` +${f.values.size - 3}` : ''}` : OPS[f.op][0] + (OPS[f.op][1] ? ' ' + f.v : '')}`).join(' · ');
+    chip.firstChild.title = 'Click to change the filter';
     sel = null;
     if (virtual) box.scrollTop = 0;
     redrawAll();
   }
   function sortBy(i, dir) { sort = { i, dir: dir ?? (sort?.i === i ? (sort.dir === 1 ? -1 : 0) : 1) }; if (!sort.dir) sort = null; order(); }
-  function filterTo(c) { const { rows } = picked(); setFilter({ c, values: new Set(rows.map(row => text(row, c))) }); }
-  function setFilter(f) { filter = f; order(); }
-  const chip = h('span', { class: 'chip-f', hidden: true }, h('span', {}), h('button', { class: 'x', title: 'Clear the filter', 'aria-label': 'Clear the filter', html: svg('close', 12), onclick: () => setFilter(null) }));
+  function filterTo(c) { const { rows } = picked(); setFilters([...filters.filter(f => f.c !== c), { c, values: new Set(rows.map(row => text(row, c))) }]); }
+  function setFilters(fs) { filters = fs; order(); }
+  const setFilter = f => setFilters(f ? [f] : []); // (the old one-filter API: extensions, tests)
+  /** A test on a row, as a filter says: an operator and a value (or the values picked). */
+  function passes(f, row) {
+    const s = text(row, f.c);
+    if (f.values) return f.values.has(s);
+    if (f.op === 'null') return s == null;
+    if (f.op === 'notnull') return s != null;
+    if (s == null) return false;
+    const a = nums[f.c] ? Number(row[f.c]) : s.toLowerCase(), b = nums[f.c] ? Number(f.v) : String(f.v).toLowerCase();
+    return { eq: a === b, ne: a !== b, has: String(a).includes(b), starts: String(a).startsWith(b), gt: a > b, ge: a >= b, lt: a < b, le: a <= b, not: !String(a).includes(b) }[f.op];
+  }
+  /** A column's filter, asked for in a small window: how to compare, and with what. */
+  function askFilter(c) {
+    const now = filters.find(f => f.c === c && !f.values), sample = all.find(row => row[c] != null);
+    const op = h('select', { 'aria-label': 'How to compare' }, Object.entries(OPS).map(([k, [label]]) => h('option', { value: k, selected: (now?.op || (nums[c] ? 'eq' : 'has')) === k }, label)));
+    const val = h('input', { value: now?.v ?? '', placeholder: sample ? `for example ${text(sample, c).slice(0, 30)}` : 'a value', 'aria-label': 'The value', spellcheck: 'false' });
+    const sync = () => { val.hidden = !OPS[op.value][1]; };
+    op.onchange = sync; sync();
+    const apply = () => setFilters([...filters.filter(f => f.c !== c), { c, op: op.value, v: val.value }]);
+    val.onkeydown = e => { if (e.key === 'Enter') { e.preventDefault(); d.close(); apply(); } };
+    const d = pop(`Filter ${cols[c].name}`, h('div', { class: 'fform' }, op, val, h('p', { class: 'muted' }, 'On the rows here; the other columns\' filters stay.')),
+      [['Filter', apply, true], now ? ['Remove it', () => setFilters(filters.filter(f => f !== now))] : null, ['Cancel', () => {}]].filter(Boolean));
+    requestAnimationFrame(() => (val.hidden ? op : val).focus());
+  }
+  const chip = h('span', { class: 'chip-f', hidden: true }, h('span', { onclick: () => askFilter(filters.at(-1)?.c ?? 0), role: 'button', tabindex: '0' }), h('button', { class: 'x', title: 'Clear the filters', 'aria-label': 'Clear the filters', html: svg('close', 12), onclick: () => setFilters([]) }));
 
   // editing a data file's cell: an input over it; Enter keeps (and goes down), Tab goes right, Esc undoes
   function editCell(k, c, first) {
@@ -334,13 +391,13 @@ export function grid(r, o = {}) {
     hover = setTimeout(() => card(th, +th.dataset.c), 450);
   });
   box.addEventListener('mouseleave', () => { clearTimeout(hover); hideCard(); });
+  box.addEventListener('mousedown', () => { clearTimeout(hover); hideCard(); });
   function card(th, c) {
     const s = summarize(all.map(row => row[c]), cols[c].type), el = cardEl();
     const v = x => { const s2 = typeof x === 'object' ? JSON.stringify(x) : String(x); return s2.length > 24 ? s2.slice(0, 23) + '…' : s2; };
-    const facts = [['Least', s.min != null ? v(s.min) : '—'], ['Greatest', s.max != null ? v(s.max) : '—'], ['Nulls', count(s.nulls)], ['Distinct', count(s.distinct)]];
-    el.replaceChildren(h('div', { class: 'cd-h' }, typeMark(cols[c].type), h('b', {}, cols[c].name), h('span', { class: 'chip' }, sqlType(cols[c].type))),
-      h('div', { class: 'cd-t' }, cols[c].type), h('div', { class: 'cd-f' }, facts.map(([a, b]) => h('div', {}, h('span', {}, a), h('b', {}, b)))),
-      h('div', { class: 'cd-n' }, `Of the ${count(all.length)} row${all.length === 1 ? '' : 's'} here`));
+    const range1 = s.min != null ? `${v(s.min)} … ${v(s.max)}` : null, t = sqlType(cols[c].type), arrow = (cols[c].type || '').toUpperCase() === t ? null : cols[c].type;
+    el.replaceChildren(h('div', { class: 'cd-h' }, typeMark(cols[c].type), h('b', {}, cols[c].name), h('span', { class: 'chip', title: arrow || '' }, t)),
+      h('div', { class: 'cd-f' }, [range1, `${count(s.distinct)} distinct`, s.nulls ? `${count(s.nulls)} null` : 'no nulls'].filter(Boolean).map(x => h('span', {}, x))));
     el.hidden = false;
     const r = th.getBoundingClientRect(), w = el.offsetWidth;
     el.style.left = Math.min(innerWidth - w - 8, Math.max(8, r.left)) + 'px';
@@ -357,53 +414,17 @@ export function grid(r, o = {}) {
     wrap.append(h('div', { class: 'meta' }, h('span', { class: 'n-rows' }, n), chip, sumBox, more,
       b('copy', 'Copy', 'Copy the rows (or the selection), tab-separated, with the headers', () => copyText(sel ? tsv(true) : [cols.map(c => c.name), ...all.map(row => cols.map((_, c) => text(row, c) ?? ''))].map(l => l.join('\t')).join('\n'), 'Copied, with the headers')),
       b(null, 'CSV', 'The rows here, as CSV', () => saveAs(toCsv(r), 'text/csv', `${o.name || 'rows'}.csv`)),
-      b('chart', 'Chart', 'A chart of these rows', () => { chartBox.hidden = !chartBox.hidden; if (!chartBox.hidden) chartBox.replaceChildren(chart(r)); }),
+      b('chart', 'Chart', 'A chart of these rows', () => { chartBox.hidden = !chartBox.hidden; if (!chartBox.hidden) import('./chart.js').then(m => chartBox.replaceChildren(m.chartView(r, o.name))); }),
       o.explore ? b(null, 'Profile', 'Each column: its nulls, distinct values, range and spread, in the details', () => o.explore(0)) : null), chartBox);
   } else wrap.append(h('div', { class: 'fbar' }, chip, sumBox, more));
   draw();
-  wrap.grid = { refresh, select, sortBy, setFilter, copy: tsv, box, count: () => view.length, selection: () => sel && { ...range(), row: view[sel.fr], col: sel.fc } };
+  wrap.grid = { refresh, select, sortBy, setFilter, setFilters, copy: tsv, text: as, box, count: () => view.length, selection: () => sel && { ...range(), row: view[sel.fr], col: sel.fc } };
   return wrap;
 }
 let cardBox;
 const cardEl = () => cardBox ||= document.body.appendChild(h('div', { class: 'hcard', role: 'tooltip', hidden: true }));
 const hideCard = () => { if (cardBox) cardBox.hidden = true; };
 addEventListener('scroll', hideCard, true);
-
-// ------------------------------------------------------------------ charts
-const PALETTE = ['var(--accent)', 'var(--c2)', 'var(--c3)'];
-/** A chart of an answer: by its first date or time column, a line; else, by its first text column,
- * bars; the numbers are its first three numeric columns (at most 50 bars, 2,000 points). */
-export function chart(r) {
-  const cols = r.columns, ys = cols.map((c, i) => numeric(c.type) ? i : -1).filter(i => i >= 0).slice(0, 3);
-  let x = cols.findIndex(c => /^(Date|Timestamp)/.test(c.type || ''));
-  const line = x >= 0;
-  if (!line) x = cols.findIndex((c, i) => !numeric(c.type) && !ys.includes(i));
-  if (!ys.length) return h('div', { class: 'empty' }, 'Nothing to chart: the answer needs a column of numbers.');
-  const W = 720, H = 240, L = 56, B = 34, T = 12, Rt = 14;
-  let data = r.rows.map((row, i) => ({ x: x >= 0 ? row[x] : i + 1, y: ys.map(j => row[j] == null ? null : Number(row[j])) }));
-  if (line) data = data.map(d => ({ ...d, t: Date.parse(String(d.x).replace(' ', 'T') + (String(d.x).length > 10 && !/[zZ+]/.test(String(d.x)) ? 'Z' : '')) })).filter(d => Number.isFinite(d.t)).sort((a, b) => a.t - b.t).slice(0, 2000);
-  else data = data.slice(0, 50);
-  if (!data.length) return h('div', { class: 'empty' }, 'Nothing to chart.');
-  const vals = data.flatMap(d => d.y).filter(v => v != null && Number.isFinite(v)), lo = Math.min(0, ...vals), hi = Math.max(0, ...vals) || 1;
-  const sy = v => T + (H - T - B) * (1 - (v - lo) / (hi - lo || 1));
-  const ticks = [lo, lo + (hi - lo) / 2, hi].map(v => `<line x1="${L}" x2="${W - Rt}" y1="${sy(v)}" y2="${sy(v)}" stroke="var(--line2)"/><text x="${L - 8}" y="${sy(v) + 4}" text-anchor="end">${esc2(short(v))}</text>`).join('');
-  let marks = '', labels = '';
-  if (line) {
-    const t0 = data[0].t, t1 = data.at(-1).t || t0 + 1, sx = t => L + (W - L - Rt) * ((t - t0) / (t1 - t0 || 1));
-    marks = ys.map((_, j) => `<polyline fill="none" stroke="${PALETTE[j]}" stroke-width="2" points="${data.filter(d => d.y[j] != null).map(d => `${sx(d.t).toFixed(1)},${sy(d.y[j]).toFixed(1)}`).join(' ')}"/>`).join('');
-    labels = [data[0], data[Math.floor(data.length / 2)], data.at(-1)].map((d, i) => `<text x="${sx(d.t)}" y="${H - 10}" text-anchor="${['start', 'middle', 'end'][i]}">${esc2(String(d.x).slice(0, 16))}</text>`).join('');
-  } else {
-    const band = (W - L - Rt) / data.length, bw = Math.max(2, band * 0.72 / ys.length);
-    marks = data.map((d, i) => d.y.map((v, j) => v == null ? '' : `<rect x="${(L + i * band + band * 0.14 + j * bw).toFixed(1)}" y="${Math.min(sy(v), sy(0)).toFixed(1)}" width="${bw.toFixed(1)}" height="${Math.abs(sy(0) - sy(v)).toFixed(1)}" rx="2" fill="${PALETTE[j]}"><title>${esc2(String(d.x))}: ${esc2(String(v))}</title></rect>`).join('')).join('');
-    const every = Math.ceil(data.length / 12);
-    labels = data.map((d, i) => i % every ? '' : `<text x="${L + i * band + band / 2}" y="${H - 10}" text-anchor="middle">${esc2(String(d.x ?? '').slice(0, 12))}</text>`).join('');
-  }
-  const legend = ys.map((j, k) => `<span><i style="background:${PALETTE[k]}"></i>${esc2(cols[j].name)}</span>`).join('');
-  return h('div', { class: 'chart' }, h('div', { class: 'legend', html: legend }),
-    h('div', { html: `<svg viewBox="0 0 ${W} ${H}" width="100%" role="img" aria-label="A ${line ? 'line' : 'bar'} chart of ${ys.map(j => cols[j].name).join(', ')} by ${x >= 0 ? cols[x].name : 'row'}">${ticks}${marks}${labels}</svg>` }));
-}
-const esc2 = s => s.replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[c]);
-const short = n => Math.abs(n) >= 1e9 ? (n / 1e9).toFixed(1) + 'B' : Math.abs(n) >= 1e6 ? (n / 1e6).toFixed(1) + 'M' : Math.abs(n) >= 1e4 ? (n / 1e3).toFixed(1) + 'K' : (+n.toFixed(2)).toLocaleString('en-US');
 
 /** A SQL `IN` list's values quoted as a name (for the menus of other modules). */
 export const names = cs => cs.map(c => ident(c.name)).join(', ');

@@ -1,9 +1,9 @@
 // The Workspace and its files (ADR-034): the lake's own files, as a tree; SQL, Python, data and
 // text files open in tabs, are edited there and saved back in place (`PUT /files` with
 // `If-Match`: replaced only if nobody saved it meanwhile).
-import { h, fill, icon, svg, secs, count, bytes, utc, S, R, emit, call, run, rows, doBlock, fileUrl, fileSql, quote, ident, toast, menu, prompt, confirmed, saveAs, MODE, DATA, store, failed, readFile, writeFile } from './core.js';
+import { h, fill, icon, svg, secs, count, bytes, utc, S, R, emit, call, run, rows, doBlock, fileUrl, fileSql, quote, toast, menu, prompt, confirmed, saveAs, MODE, DATA, store, failed, readFile, writeFile, interruptPython, formatPython } from './core.js';
 import { Editor, formatSql } from './editor.js';
-import { grid, chart, toCsv, copyText } from './grid.js';
+import { grid, copyText, COPIES } from './grid.js';
 import { answer, doneText, cleanName, openPlain } from './notebook.js';
 
 const base = p => p.split('/').pop();
@@ -170,7 +170,7 @@ async function remove(f, folder) {
 // ------------------------------------------------------------------ text files: SQL, Python, Markdown and text
 class TextDoc {
   constructor({ path = null, text = '', version = null, kind = 'text', language = 'text', untitled = 'untitled.txt' }) {
-    Object.assign(this, { path, version, kind, dirty: !path, untitled, pos: { line: 1, col: 1 } }); // (new: not saved yet)
+    Object.assign(this, { path, version, kind, dirty: false, untitled, pos: { line: 1, col: 1 } }); // (new and untouched: nothing to save yet)
     this.icon = iconOf(path || untitled);
     this.ed = new Editor({ gutter: true, language, value: text, label: this.title, oninput: () => this.changed(), onkey: e => this.key(e), oncursor: (line, col) => { this.pos = { line, col }; R.helpers.status(); } });
     this.main = h('div', { class: 'pane-ed' }, this.ed.el);
@@ -206,23 +206,21 @@ class TextDoc {
   }
   crumbs() {
     const parts = (this.path || this.untitled).split('/');
-    return [...parts.slice(0, -1).flatMap(p => [h('span', { class: 'crumb' }, p), h('span', { class: 'slash' }, '/')]), h('b', { class: 'crumb cur' }, parts.at(-1)),
-      h('span', { class: 'said-saved' }, this.dirty ? (this.path ? 'Edited, not saved' : 'Not saved yet') : this.path ? 'Saved' : '')];
+    return [...parts.slice(0, -1).flatMap(p => [h('span', { class: 'crumb' }, p), h('span', { class: 'slash' }, '/')]), h('b', { class: 'crumb cur' }, parts.at(-1))];
   }
   more() {
-    return [{ label: 'Save as…', icon: 'save', run: () => this.save(true) }, this.path ? { label: 'Download', icon: 'down', run: () => saveAs(this.ed.value, 'text/plain', this.title) } : null,
-      ...this.kind === 'sql' || this.kind === 'python' ? ['-', { label: 'Run as a job', icon: 'play', run: () => R.helpers.job(this) }, { label: 'Schedule…', icon: 'clock', run: () => R.helpers.schedule(this) }] : []];
+    return [{ label: 'Save as…', icon: 'save', run: () => this.save(true) }, this.path ? { label: 'Download', icon: 'down', run: () => saveAs(this.ed.value, 'text/plain', this.title) } : null];
   }
-  toolbar() { return [...this.crumbs(), h('span', { class: 'grow' }), btn('save', 'Save', 'Save it (Ctrl+S)', () => this.save()), moreBtn(() => this.more())]; }
+  toolbar() { return [...this.crumbs(), h('span', { class: 'grow' }), R.helpers.saveButton(this), moreBtn(() => this.more())]; }
   status() { return [`Ln ${this.pos.line}, Col ${this.pos.col}`, { sql: 'SQL', python: 'Python', text: /\.md$/i.test(this.title) ? 'Markdown' : 'Text' }[this.kind] || '', 'Spaces: 4']; }
 }
-const btn = (ic, label, title, fn, cls = 'btn', id) => h('button', { class: cls, title, onclick: fn, id }, ic ? icon(ic) : null, label);
-const moreBtn = items => h('button', { class: 'icon', title: 'More', 'aria-label': 'More', onclick: e => menu(e.currentTarget, items()) }, icon('dots'));
+export const btn = (ic, label, title, fn, cls = 'btn', id) => h('button', { class: cls, title, onclick: fn, id }, ic ? icon(ic) : null, label);
+export const moreBtn = items => h('button', { class: 'icon', title: 'More', 'aria-label': 'More', onclick: e => menu(e.currentTarget, items()) }, icon('dots'));
 
 /** A panel under a file (SQL's results, Python's console), its height dragged; or at the right. */
 function splitPanel(doc, panel) {
   const grip = h('div', { class: 'grip', role: 'separator', 'aria-label': 'The panel\'s size (arrows change it)', tabindex: '0', 'aria-valuemin': '120' });
-  const size = store.json('pondra.split', { below: 320, right: 520 });
+  const size = { below: 320, right: 520, ...R.helpers.prefs('split') }; // (kept with the settings: on this machine)
   const place = () => {
     const right = doc.layout === 'right';
     doc.el.classList.toggle('side', right);
@@ -234,9 +232,9 @@ function splitPanel(doc, panel) {
     const right = doc.layout === 'right', start = right ? e.clientX : e.clientY, was = right ? size.right : size.below;
     const move = ev => { const d = (right ? ev.clientX : ev.clientY) - start, v = Math.max(120, Math.min((right ? innerWidth : innerHeight) - 220, was - d)); panel.style.flexBasis = v + 'px'; size[right ? 'right' : 'below'] = v; };
     grip.addEventListener('pointermove', move);
-    grip.addEventListener('pointerup', () => { grip.removeEventListener('pointermove', move); store.set('pondra.split', JSON.stringify(size)); }, { once: true });
+    grip.addEventListener('pointerup', () => { grip.removeEventListener('pointermove', move); R.helpers.prefs('split', { ...size }); }, { once: true });
   });
-  grip.addEventListener('keydown', e => { const d = { ArrowUp: 24, ArrowDown: -24, ArrowLeft: 24, ArrowRight: -24 }[e.key]; if (d) { e.preventDefault(); const k = doc.layout === 'right' ? 'right' : 'below'; size[k] = Math.max(120, size[k] + d); place(); store.set('pondra.split', JSON.stringify(size)); } });
+  grip.addEventListener('keydown', e => { const d = { ArrowUp: 24, ArrowDown: -24, ArrowLeft: 24, ArrowRight: -24 }[e.key]; if (d) { e.preventDefault(); const k = doc.layout === 'right' ? 'right' : 'below'; size[k] = Math.max(120, size[k] + d); place(); R.helpers.prefs('split', { ...size }); } });
   doc.el.append(grip, panel);
   doc.place = place;
   place();
@@ -246,7 +244,7 @@ function splitPanel(doc, panel) {
 export class SqlDoc extends TextDoc {
   constructor(o = {}) {
     super({ ...o, kind: 'sql', language: 'sql', untitled: o.untitled || 'queries/untitled.sql' });
-    this.layout = store.get('pondra.results') || 'below';
+    this.layout = R.helpers.prefs('results') || 'below';
     this.tab = 'results'; this.result = null;
     this.body = h('div', { class: 'pbody' });
     this.tabs = h('div', { class: 'ptabs', role: 'tablist' });
@@ -255,7 +253,15 @@ export class SqlDoc extends TextDoc {
     this.pbar = h('div', { class: 'params', role: 'group', 'aria-label': 'Parameters', hidden: true });
     this.main.prepend(this.pbar);
     splitPanel(this, this.panel);
+    this.ed.menu = some => ['-', { label: some ? 'Run the selection' : 'Run the file', icon: 'play', keys: 'Ctrl Enter', run: () => this.run() },
+      { label: some ? 'Format the selection' : 'Format the file', icon: 'format', keys: 'Shift Alt F', run: () => this.format() }];
     this.draw(); this.paramsBar();
+  }
+  /** Format the SQL selected (or all of it): its words in capitals, a clause a line. */
+  format() { this.ed.reformat(formatSql); }
+  key(e) {
+    if (e.shiftKey && e.altKey && e.key.toLowerCase() === 'f') { e.preventDefault(); this.format(); return true; }
+    return super.key(e);
   }
   get hasPanel() { return true; }
   changed() { super.changed(); clearTimeout(this.pt); this.pt = setTimeout(() => this.paramsBar(), 250); }
@@ -281,11 +287,14 @@ export class SqlDoc extends TextDoc {
   /** Run the file, or what is selected: each statement its own answer (in order, stopping at a
    * failure), or — as Settings may say — all of it at once, the last one's answer. */
   async run() {
-    const text = (this.ed.selected() || this.ed.value).trim();
+    const sel = this.ed.selected(), from = sel ? this.ed.ta.selectionStart : 0, text = (sel || this.ed.value).trim();
     if (!text) return;
     this.ctl?.abort();
-    const ctl = this.ctl = new AbortController(), each = (store.json('pondra.prefs', {}).statements || 'each') === 'each';
+    const ctl = this.ctl = new AbortController(), each = (R.helpers.prefs('statements') || 'each') === 'each';
     const list = each ? statements(text) : [text];
+    const whole = sel || this.ed.value;
+    let seek = 0;
+    const places = list.map(q => { const at = whole.indexOf(q, seek); seek = at < 0 ? seek : at + q.length; return at < 0 ? null : [from + at, from + at + q.length]; }); // (where each is, to point at it)
     this.running = true; this.plan = null; this.results = []; this.result = null; this.todo = list.length; R.helpers.toolbar();
     this.body.replaceChildren(h('div', { class: 'wait pulse' }, 'Running…'));
     emit('run', { kind: 'sql', src: text, doc: this });
@@ -295,7 +304,7 @@ export class SqlDoc extends TextDoc {
       const t0 = performance.now();
       try { r = await run(sql, ctl.signal, values); } catch (e) { r = failed(e); }
       if (this.ctl !== ctl) return;
-      r.ms = performance.now() - t0; r.sql = sql;
+      r.ms = performance.now() - t0; r.sql = sql; r.at = places[this.results.length]; r.params = values;
       this.results.push(r); this.result = r;
       if (list.length > 1 && this.tab === 'messages' && r.kind === 'rows') this.tab = 'results';
       this.draw();
@@ -309,49 +318,81 @@ export class SqlDoc extends TextDoc {
     emit('ran', { kind: 'sql', src: text, doc: this }, r, { kind: 'sql', src: text });
     return r;
   }
-  stop() { this.ctl?.abort(); this.ctl = null; this.running = false; this.body.replaceChildren(h('div', { class: 'wait' }, 'Stopped waiting.')); R.helpers.toolbar(); }
-  /** The panel: Results (the grid), Messages (what it printed and did), Chart, Plan (EXPLAIN). */
+  stop() { this.ctl?.abort(); this.ctl = null; this.running = false; this.body.replaceChildren(h('div', { class: 'wait' }, 'Stopped waiting. (A statement already on its way may still finish on the node.)')); R.helpers.toolbar(); }
+  /** Point at a statement that ran: the caret at its start, in sight, if the text there is still
+   * it (not selected: Run would then run it alone). */
+  point(x) { const [a, b] = x.at || []; if (a != null && this.ed.value.slice(a, b) === x.sql) { this.ed.focus(); this.ed.ta.setSelectionRange(a, a); this.ed.reveal(); } }
+  /** The panel: Results (the grid), Messages (each statement: what it printed and did), Chart and
+   * Plan (a graph of EXPLAIN, and a profile of the time each step took). */
   draw() {
-    const r = this.result, tab = (id, label, ic) => h('button', { class: 'ptab' + (this.tab === id ? ' on' : ''), role: 'tab', 'aria-selected': String(this.tab === id), onclick: () => { this.tab = id; this.draw(); } }, ic ? icon(ic) : null, label);
+    const r = this.result, tab = (id, label, ic) => h('button', { class: 'ptab' + (this.tab === id ? ' on' : ''), role: 'tab', 'aria-label': label, 'aria-selected': String(this.tab === id), onclick: () => { this.tab = id; this.draw(); } }, ic ? icon(ic) : null, h('span', { class: 'tl' }, label));
     this.tabs.replaceChildren(tab('results', 'Results'), tab('messages', 'Messages'), tab('chart', 'Chart', 'chart'), tab('plan', 'Plan', 'plan'));
-    const sum = h('span', { class: 'sum' });
-    fill(this.info, sum, r?.kind === 'rows' ? h('span', { class: 'n' }, r.total > r.rows.length ? `${count(r.rows.length)} of ${count(r.total)} rows` : `${count(r.total)} row${r.total === 1 ? '' : 's'}`) : null,
-      r ? h('span', { class: 'bar-sep' }, '|') : null, r ? h('span', { class: 'n' }, secs(r.ms)) : null, h('span', { class: 'sep' }),
-      h('button', { class: 'icon', title: 'Copy the rows (or the selection), tab-separated, with the headers', 'aria-label': 'Copy', onclick: () => this.gridEl?.grid ? copyText(this.gridEl.grid.selection() ? this.gridEl.grid.copy(true) : toCsv(r, '\t'), 'Copied, with the headers') : null }, icon('copy')),
-      h('button', { class: 'icon', title: 'Download the rows as CSV', 'aria-label': 'Download CSV', onclick: () => r?.kind === 'rows' && saveAs(toCsv(r), 'text/csv', this.title.replace(/\.sql$/i, '') + '.csv') }, icon('down')),
-      h('button', { class: 'icon', title: this.layout === 'right' ? 'Move the results below' : 'Move the results to the right', 'aria-label': 'Move the results', onclick: () => { this.layout = this.layout === 'right' ? 'below' : 'right'; store.set('pondra.results', this.layout); this.place(); this.draw(); } }, icon(this.layout === 'right' ? 'panelBelow' : 'panelRight')));
+    const sum = h('span', { class: 'sum' }), name = this.title.replace(/\.sql$/i, ''), rowsOk = r?.kind === 'rows';
+    const text = (f, headers) => this.gridEl?.grid ? this.gridEl.grid.text(f, headers) : '';
+    fill(this.info, sum, rowsOk ? h('span', { class: 'n' }, r.total > r.rows.length ? `${count(r.rows.length)} of ${count(r.total)} rows` : `${count(r.total)} row${r.total === 1 ? '' : 's'}`) : null,
+      r ? h('span', { class: 'bar-sep' }, '|') : null, r ? h('span', { class: 'n t' }, secs(r.ms)) : null, h('span', { class: 'sep' }),
+      split('copy', 'Copy the rows (or the selection), tab-separated, with the headers', () => rowsOk && copyText(text('tsv', true), 'Copied, with the headers'),
+        () => [{ head: 'Copy the rows (or the selection)' }, ...COPIES.map(([f, label, headers]) => ({ label, run: () => rowsOk && copyText(text(f, headers), 'Copied') }))], !rowsOk),
+      split('down', 'Download the rows as CSV (all of them: the statement runs again on the node)', () => rowsOk && fetchRows(r, 'csv', name),
+        () => [{ head: 'Download every row (it runs again)' }, ...DOWNLOADS.map(([f, label]) => ({ label, run: () => fetchRows(r, f, name) }))], !rowsOk),
+      h('button', { class: 'icon', title: this.layout === 'right' ? 'Move the results below' : 'Move the results to the right', 'aria-label': 'Move the results', onclick: () => { this.layout = this.layout === 'right' ? 'below' : 'right'; R.helpers.prefs('results', this.layout); this.place(); this.draw(); } }, icon(this.layout === 'right' ? 'panelBelow' : 'panelRight')));
     if (!r) { this.body.replaceChildren(h('div', { class: 'wait' }, this.running ? 'Running…' : h('span', {}, 'Run the file, or what is selected: ', h('kbd', {}, 'Ctrl'), ' ', h('kbd', {}, 'Enter')))); return; }
-    const said = x => [...x.notices || [], x.kind === 'done' ? doneText(x.value) : x.kind === 'error' ? x.message : `${count(x.total)} row${x.total === 1 ? '' : 's'}`, `(${secs(x.ms)})`].filter(Boolean).join('\n');
     const many = this.results?.length > 1 || this.running && this.todo > 1;
     if (this.tab === 'results') {
       const strip = many ? h('div', { class: 'stmts', role: 'group', 'aria-label': 'The statements\' answers' }, this.results.map((x, k) =>
-        h('button', { class: 'stmt' + (x === r ? ' on' : '') + (x.kind === 'error' ? ' bad' : ''), 'aria-pressed': String(x === r), title: x.sql.split('\n').find(l => l.trim() && !l.trim().startsWith('--')) || x.sql,
-          onclick: () => { this.result = x; this.draw(); } }, h('b', {}, String(k + 1)), x.kind === 'rows' ? `${count(x.total)} row${x.total === 1 ? '' : 's'}` : x.kind === 'error' ? 'failed' : 'done')),
+        h('button', { class: 'stmt' + (x === r ? ' on' : '') + (x.kind === 'error' ? ' bad' : ''), 'aria-pressed': String(x === r), title: x.sql,
+          onclick: () => { this.result = x; this.draw(); this.point(x); } }, h('b', {}, String(k + 1)), h('span', { class: 'q' }, oneLine(x.sql, 40)), h('span', { class: 'm' }, x.kind === 'rows' ? `${count(x.total)} row${x.total === 1 ? '' : 's'}` : x.kind === 'error' ? 'failed' : 'done'))),
         this.running ? h('span', { class: 'stmt wait pulse' }, h('b', {}, String(this.results.length + 1)), `of ${this.todo}…`)
           : this.results.length < this.todo ? h('span', { class: 'stmts-left' }, `${this.todo - this.results.length} after it not run`) : null) : null;
-      if (r.kind === 'rows') { this.gridEl = grid(r, { fill: true, name: this.title.replace(/\.sql$/i, ''), onsum: t => { sum.textContent = t; }, explore: i => R.helpers.explore(r, i) }); fill(this.body, strip, this.gridEl); }
+      if (r.kind === 'rows') { this.gridEl = grid(r, { fill: true, name, onsum: t => { sum.textContent = t; }, explore: i => R.helpers.explore(r, i) }); fill(this.body, strip, this.gridEl); }
       else fill(this.body, strip, ...answer(r));
     } else if (this.tab === 'messages') {
-      const all = many ? this.results.map((x, k) => `${k + 1}. ${x.sql.split('\n').find(l => l.trim() && !l.trim().startsWith('--')) || x.sql}\n${said(x)}`).join('\n\n') : said(r);
-      this.body.replaceChildren(h('pre', { class: this.results?.some(x => x.kind === 'error') ? 'err' : 'said msgs' }, all));
+      const all = this.results?.length ? this.results : [r];
+      this.body.replaceChildren(h('div', { class: 'msgs' }, all.map((x, k) => h('div', { class: 'msg' + (x.kind === 'error' ? ' bad' : '') + (x === r ? ' on' : '') },
+        h('button', { class: 'msg-h', title: x.sql + '\n\n(click: its answer, and the statement selected in the file)', onclick: () => { this.result = x; this.tab = x.kind === 'rows' ? 'results' : 'messages'; this.draw(); this.point(x); } },
+          h('b', {}, String(k + 1)), h('span', { class: 'ic', html: svg(x.kind === 'error' ? 'close' : 'check', 13) }), h('code', {}, oneLine(x.sql, 160)),
+          h('span', { class: 'm' }, x.kind === 'rows' ? `${count(x.total)} row${x.total === 1 ? '' : 's'}` : x.kind === 'error' ? 'failed' : 'done', ' · ', secs(x.ms))),
+        [...x.notices || [], x.kind === 'done' ? doneText(x.value) : x.kind === 'error' ? x.message : null].filter(Boolean).length
+          ? h('pre', { class: x.kind === 'error' ? 'err' : 'said' }, [...x.notices || [], x.kind === 'done' ? doneText(x.value) : x.kind === 'error' ? x.message : null].filter(Boolean).join('\n')) : null)),
+        this.results.length < this.todo && !this.running ? h('div', { class: 'stmts-left' }, `${this.todo - this.results.length} after it not run`) : null));
     } else if (this.tab === 'chart') {
-      this.body.replaceChildren(r.kind === 'rows' ? chart(r) : h('div', { class: 'wait' }, 'A chart needs rows.'));
+      if (r.kind !== 'rows') { this.body.replaceChildren(h('div', { class: 'wait' }, 'A chart needs rows.')); return; }
+      this.body.replaceChildren(h('div', { class: 'wait' }, 'Drawing…'));
+      import('./chart.js').then(m => { if (this.tab === 'chart' && this.result === r) this.body.replaceChildren(m.chartView(r, name)); });
     } else {
       const stmt = lastStatement(r.sql);
-      if (this.plan?.sql !== stmt) { this.plan = { sql: stmt, text: null }; run('EXPLAIN ' + stmt).then(p => { this.plan.text = p.kind === 'rows' ? p.rows.map(x => x.join('\n')).join('\n\n') : doneText(p.value); if (this.tab === 'plan') this.draw(); }, e => { this.plan.text = e.message; if (this.tab === 'plan') this.draw(); }); }
-      this.body.replaceChildren(h('pre', { class: 'said plan' }, this.plan.text ?? 'Reading the plan…'));
+      this.body.replaceChildren(h('div', { class: 'wait' }, 'Reading the plan…'));
+      import('./plan.js').then(m => { if (this.tab === 'plan' && this.result === r) this.body.replaceChildren(m.planView(stmt, r.params)); });
     }
   }
   toolbar() {
     const db = MODE === 'lakes' ? h('button', { class: 'btn', title: 'The database the file runs in', onclick: e => R.helpers.pickDb(e.currentTarget) }, icon('db'), S.db || '…', icon('chevd'))
       : h('span', { class: 'pill', title: 'The lake the file runs in' }, icon('db'), S.lake || '');
+    const some = () => !!this.ed.selected();
     return [...this.crumbs(), h('span', { class: 'grow' }),
-      btn('play', 'Run', 'Run the file, or what is selected (Ctrl+Enter)', () => this.run(), 'btn primary', 'runBtn'),
-      btn(null, 'Run selection', 'Run only what is selected', () => { if (!this.ed.selected()) toast('Select some SQL first'); else this.run(); }),
-      h('button', { class: 'btn', title: 'Stop waiting for it', disabled: !this.running, onclick: () => this.stop() }, icon('stop'), 'Stop'), h('span', { class: 'sep' }), db,
-      h('button', { class: 'icon', title: 'Format the SQL: its words in capitals, a clause a line', 'aria-label': 'Format', onclick: () => { const t = formatSql(this.ed.value); if (t !== this.ed.value) { this.ed.ta.select(); this.ed.insert(t); } } }, icon('format')),
-      btn('save', 'Save', 'Save it (Ctrl+S)', () => this.save()), moreBtn(() => this.more())];
+      R.helpers.runButton(this.running, { label: 'Run', title: 'Run the file, or what is selected (Ctrl+Enter)', run: () => this.run(), stop: () => this.stop(), stopTitle: 'Stop waiting for it' }, [
+        { label: 'Run the file, or what is selected', icon: 'play', keys: 'Ctrl Enter', run: () => this.run() },
+        { label: 'Run the selection', run: () => { if (!some()) toast('Select some SQL first'); else this.run(); } },
+        { label: 'Run the whole file', run: () => { this.ed.ta.setSelectionRange(0, 0); this.run(); } }, '-',
+        { label: 'Format the file (or the selection)', icon: 'format', keys: 'Shift Alt F', run: () => this.format() }, '-',
+        { label: 'Run as a job', icon: 'play', run: () => R.helpers.job(this) }, { label: 'Schedule…', icon: 'clock', run: () => R.helpers.schedule(this) }]),
+      h('span', { class: 'sep' }), db, R.helpers.saveButton(this), moreBtn(() => this.more())];
   }
+}
+/** A statement on one line: its comments out, its spaces one, at most `n` characters. */
+export const oneLine = (sql, n) => { const t = sql.replace(/--[^\n]*|\/\*[\s\S]*?\*\//g, ' ').replace(/\s+/g, ' ').trim(); return t.length > n ? t.slice(0, n - 1) + '…' : t; };
+/** A copy's or a download's button, with a ▾ for its other forms. */
+const split = (ic, title, run, items, disabled) => h('span', { class: 'split' }, h('button', { class: 'icon', title, 'aria-label': title, disabled, onclick: run }, icon(ic)),
+  h('button', { class: 'icon caret', title: 'Other forms', 'aria-label': 'Other forms', 'aria-haspopup': 'menu', disabled, onclick: e => menu(e.currentTarget, items()) }, icon('chevd', 'ic', 12)));
+const DOWNLOADS = [['csv', 'CSV'], ['tsv', 'TSV (tab-separated)'], ['json', 'JSON'], ['ndjson', 'JSON lines'], ['parquet', 'Parquet'], ['xlsx', 'Excel (.xlsx)']];
+/** Every row of an answer, in a file to download: its statement again on the node, in that format. */
+async function fetchRows(r, f, name) {
+  toast('Preparing the download…');
+  try {
+    const body = r.params && Object.keys(r.params).length ? JSON.stringify({ sql: r.sql, params: r.params }) : r.sql;
+    const res = await call('/sql?format=' + f, { method: 'POST', body, headers: { 'content-type': r.params && Object.keys(r.params).length ? 'application/json' : 'text/plain; charset=utf-8' } });
+    saveAs(await res.blob(), res.headers.get('content-type') || 'application/octet-stream', `${name || 'rows'}.${f === 'ndjson' ? 'jsonl' : f}`);
+  } catch (e) { toast('Not downloaded: ' + e.message, true); }
 }
 /** A script's statements, split as the node splits them (routines.rs `statements`): each ends at
  * a `;` outside strings ('…', $$…$$, $tag$…$tag$), quoted names and comments; the last `;` optional. */
@@ -399,9 +440,17 @@ export class PythonDoc extends TextDoc {
       h('button', { class: 'icon', title: 'Clear the console', 'aria-label': 'Clear the console', onclick: () => this.log.replaceChildren() }, icon('clear'))),
       h('div', { class: 'pbody term' }, this.log, h('div', { class: 'prompt' }, h('span', { class: 'ps1' }, '>>>'), this.input)));
     splitPanel(this, this.panel);
+    this.ed.menu = some => ['-', { label: some ? 'Run the selection' : 'Run the file', icon: 'play', keys: 'Ctrl Enter', run: () => this.run() },
+      { label: some ? 'Format the selection' : 'Format the file', icon: 'format', keys: 'Shift Alt F', run: () => this.format() }];
   }
   get hasPanel() { return true; }
   run() { const sel = this.ed.selected(); return this.exec(sel || this.ed.value, sel ? `» the selection of ${this.title}` : `» ${this.title}`); }
+  /** Format the Python selected (or all of it): the node's Python formats it, as ruff (or black) does. */
+  format() { this.ed.reformat(formatPython); }
+  key(e) {
+    if (e.shiftKey && e.altKey && e.key.toLowerCase() === 'f') { e.preventDefault(); this.format(); return true; }
+    return super.key(e);
+  }
   /** Run code in the page's Python (the notebooks' too): what it printed, then its answer. */
   async exec(code, head) {
     if (!code.trim()) return;
@@ -421,160 +470,17 @@ export class PythonDoc extends TextDoc {
     return r;
   }
   toolbar() {
+    const pill = R.helpers.pythonPill();
+    this.drawPill = pill.draw;
     return [...this.crumbs(), h('span', { class: 'grow' }),
-      btn('play', 'Run file', 'Run the file, or what is selected, in the page\'s Python (Ctrl+Enter)', () => this.run(), 'btn primary', 'runBtn'),
-      btn(null, 'Run selection', 'Run only what is selected', () => { if (!this.ed.selected()) toast('Select some Python first'); else this.run(); }),
-      h('button', { class: 'btn', title: 'Stop waiting for it', disabled: !this.running, onclick: () => this.ctl?.abort() }, icon('stop'), 'Stop'), h('span', { class: 'sep' }),
-      btn('restart', 'Restart', 'Restart the page\'s Python: its variables go', () => R.helpers.restart()),
-      btn('save', 'Save', 'Save it (Ctrl+S)', () => this.save()), moreBtn(() => this.more())];
+      R.helpers.runButton(this.running, { label: 'Run file', title: 'Run the file, or what is selected, in the page\'s Python (Ctrl+Enter)', run: () => this.run(), stop: () => interruptPython(), stopTitle: 'Interrupt it (its variables stay)' }, [
+        { label: 'Run the file, or what is selected', icon: 'play', keys: 'Ctrl Enter', run: () => this.run() },
+        { label: 'Run the selection', run: () => { if (!this.ed.selected()) toast('Select some Python first'); else this.run(); } }, '-',
+        { label: 'Run as a job', icon: 'play', run: () => R.helpers.job(this) }, { label: 'Schedule…', icon: 'clock', run: () => R.helpers.schedule(this) }]),
+      h('span', { class: 'sep' }), pill, R.helpers.saveButton(this), moreBtn(() => this.more())];
   }
   status() { return [`Ln ${this.pos.line}, Col ${this.pos.col}`, `Python · ${S.py === 'none' ? 'not started' : S.py}`, 'Spaces: 4']; }
 }
-
-// ------------------------------------------------------------------ a data file: a table, edited in place
-const EDITABLE = 10 << 20; // a CSV or JSON file this big or smaller is edited in the browser; bigger ones open read-only
-/** CSV's fields (RFC 4180): quotes, doubled quotes, separators and new lines inside quotes; each
- * record keeps its text, so rows not changed are written back exactly as they were. */
-export function parseCsv(text, sep = ',') {
-  const recs = [];
-  let i = 0, row = [], field = '', quoted = false, start = 0;
-  const end = at => { row.push(field); recs.push({ cells: row, raw: text.slice(start, at) }); row = []; field = ''; };
-  while (i < text.length) {
-    const ch = text[i];
-    if (quoted) {
-      if (ch === '"') { if (text[i + 1] === '"') { field += '"'; i += 2; continue; } quoted = false; i++; continue; }
-      field += ch; i++; continue;
-    }
-    if (ch === '"' && field === '') { quoted = true; i++; }
-    else if (ch === sep) { row.push(field); field = ''; i++; }
-    else if (ch === '\r' || ch === '\n') { end(i); i += ch === '\r' && text[i + 1] === '\n' ? 2 : 1; start = i; }
-    else { field += ch; i++; }
-  }
-  if (field !== '' || row.length) end(i);
-  return { recs, crlf: /\r\n/.test(text.slice(0, 10000)), last: /\r?\n$/.test(text) };
-}
-const csvField = (v, sep) => { const s = v == null ? '' : String(v); return s.includes(sep) || /["\r\n]/.test(s) || /^\s|\s$/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; };
-
-export class DataDoc {
-  constructor({ path }) {
-    Object.assign(this, { path, kind: 'data', icon: 'filedata', dirty: false, version: null, marks: new WeakMap(), added: new WeakSet(), cols: [], data: [] });
-    this.sep = /\.tsv$/i.test(path) ? '\t' : ',';
-    this.format = /\.(csv|tsv)$/i.test(path) ? 'csv' : /\.(jsonl|ndjson)$/i.test(path) ? 'jsonl' : /\.json$/i.test(path) ? 'json' : 'parquet';
-    this.box = h('div', { class: 'databox' }, h('div', { class: 'wait pulse' }, 'Reading…'));
-    this.foot = h('div', { class: 'datafoot' });
-    this.el = h('div', { class: 'doc datadoc' }, this.box, this.foot);
-  }
-  get title() { return base(this.path); }
-  async load() {
-    const size = S.files?.find(f => f.path === 'files/' + this.path)?.size;
-    let types = [];
-    try { types = (await run(`SELECT * FROM ${fileSql(this.path)} LIMIT 0`)).columns || []; } catch { /* (not readable as a table: every column text) */ }
-    this.readonly = this.format === 'parquet' || (size != null && size > EDITABLE);
-    if (this.readonly) {
-      const r = await run(`SELECT * FROM ${fileSql(this.path)} LIMIT 10000`);
-      this.cols = r.columns; this.data = r.rows; this.total = r.total;
-      this.why = this.format === 'parquet' ? 'Parquet files open read-only: load it into a table to change it with SQL.' : `This file is ${bytes(size)}: it opens read-only (the first 10,000 rows). Load it into a table to change it with SQL.`;
-    } else {
-      const f = await readFile(this.path);
-      this.version = f.version;
-      if (this.format === 'csv') {
-        const p = parseCsv(f.text, this.sep), [head, ...recs] = p.recs;
-        this.crlf = p.crlf; this.last = p.last;
-        const names = head?.cells || [];
-        this.cols = names.map(n => ({ name: n, type: types.find(t => t.name === n)?.type || 'Utf8' }));
-        this.data = recs.filter(r => !(r.cells.length === 1 && r.cells[0] === '')).map(r => { const cells = names.map((_, i) => r.cells[i] ?? ''); cells.raw = r.raw; return cells; });
-      } else {
-        const objs = this.format === 'jsonl' ? f.text.split('\n').filter(l => l.trim()).map(l => JSON.parse(l)) : JSON.parse(f.text);
-        if (!Array.isArray(objs) || objs.some(o => !o || typeof o !== 'object' || Array.isArray(o))) {
-          this.readonly = true; this.why = 'This JSON is not a list of objects: it opens read-only.';
-          const r = await run(`SELECT * FROM ${fileSql(this.path)} LIMIT 10000`); this.cols = r.columns; this.data = r.rows;
-        } else {
-          const names = [...new Set(objs.flatMap(o => Object.keys(o)))];
-          this.cols = names.map(n => ({ name: n, type: types.find(t => t.name === n)?.type || 'Utf8' }));
-          this.data = objs.map(o => names.map(n => o[n] ?? null));
-        }
-      }
-    }
-    this.draw();
-    return this;
-  }
-  async reload() { this.marks = new WeakMap(); this.added = new WeakSet(); this.dirty = false; await this.load(); emit('changed', this); }
-  mark(row, c) { (this.marks.get(row) || this.marks.set(row, new Set()).get(row)).add(c); if (!this.dirty) { this.dirty = true; emit('changed', this); } }
-  /** The grid, and what it may change: cells, rows, columns. */
-  draw() {
-    const d = this, r = { columns: this.cols, rows: this.data, total: this.total ?? this.data.length };
-    const edit = this.readonly ? null : {
-      set(i, c, text) { const row = d.data[i]; row[c] = d.format === 'csv' ? text : parseValue(text); d.mark(row, c); },
-      changed: (i, c) => !!d.marks.get(d.data[i])?.has(c), added: i => d.added.has(d.data[i]),
-      del(is) { const gone = new Set(is.map(i => d.data[i])); d.data = d.data.filter(row => !gone.has(row)); d.gridEl.remove(); d.draw(); d.dirty = true; d.removed = (d.removed || 0) + gone.size; emit('changed', d); },
-    };
-    this.gridEl = grid(r, { fill: true, edit, name: this.title, onsum: t => { this.sumText = t; this.footer(); }, explore: i => R.helpers.explore(r, i) });
-    this.box.replaceChildren(...this.readonly ? [h('div', { class: 'note' }, icon('eye'), this.why)] : [], this.gridEl);
-    this.footer();
-  }
-  addRow() { const row = this.cols.map(() => this.format === 'csv' ? '' : null); this.data.push(row); this.added.add(row); this.dirty = true; emit('changed', this); this.gridEl.remove(); this.draw(); this.gridEl.grid.refresh(this.data.length - 1); }
-  async addColumn() {
-    const name = await prompt('Add a column', 'Its name', 'column_' + (this.cols.length + 1));
-    if (!name) return;
-    this.cols.push({ name, type: 'Utf8' });
-    for (const row of this.data) { row.push(this.format === 'csv' ? '' : null); this.mark(row, this.cols.length - 1); }
-    this.dirty = true; emit('changed', this); this.draw();
-  }
-  footer() {
-    const b = (ic, label, title, fn) => h('button', { class: 'btn ghost small', title, onclick: fn }, icon(ic), label);
-    this.foot.replaceChildren(...this.readonly ? [] : [b('plus', 'Add row', 'A row at the end', () => this.addRow()), b('plus', 'Add column', 'A column at the right', () => this.addColumn())],
-      h('span', { class: 'sum' }, this.sumText || ''), h('span', { class: 'grow' }),
-      h('span', { class: 'hint' }, this.readonly ? 'Read-only' : 'Double-click or type to edit · Enter to keep · Esc to undo · Ctrl S to save to the file'));
-  }
-  /** The file's text as it will be saved: untouched CSV rows exactly as they were. */
-  serialize() {
-    if (this.format === 'csv') {
-      const nl = this.crlf ? '\r\n' : '\n', line = row => row.raw != null && !this.marks.get(row) && !this.added.has(row) ? row.raw : row.map(v => csvField(v, this.sep)).join(this.sep);
-      return [this.cols.map(c => csvField(c.name, this.sep)).join(this.sep), ...this.data.map(line)].join(nl) + (this.last === false ? '' : nl);
-    }
-    const objs = this.data.map(row => Object.fromEntries(this.cols.map((c, i) => [c.name, row[i]])));
-    return this.format === 'jsonl' ? objs.map(o => JSON.stringify(o)).join('\n') + '\n' : JSON.stringify(objs, null, 2) + '\n';
-  }
-  /** What changed since it was opened (for the details). */
-  changes() {
-    let cells = 0, rowsAdded = 0;
-    for (const row of this.data) { if (this.added.has(row)) rowsAdded++; else cells += this.marks.get(row)?.size || 0; }
-    return [cells ? `${count(cells)} cell${cells === 1 ? '' : 's'} changed` : null, rowsAdded ? `${count(rowsAdded)} row${rowsAdded === 1 ? '' : 's'} added` : null, this.removed ? `${count(this.removed)} row${this.removed === 1 ? '' : 's'} deleted` : null].filter(Boolean);
-  }
-  async save() {
-    if (this.readonly) { toast('This file is read-only here: load it into a table to change it', true); return false; }
-    const v = await writeFile(this.path, this.serialize(), this.version, this.format === 'csv' ? 'text/csv; charset=utf-8' : 'application/json');
-    if (!v) return false;
-    this.version = v;
-    for (const row of this.data) { if (this.marks.get(row) || this.added.has(row)) row.raw = null; }
-    this.marks = new WeakMap(); this.added = new WeakSet(); this.removed = 0; this.dirty = false;
-    this.draw();
-    toast(`Saved: files/${this.path}`);
-    emit('changed', this); emit('saved', this, 'files/' + this.path);
-    return true;
-  }
-  async discard() { if (!this.dirty || confirm('Throw away the changes to ' + this.title + '?')) { this.gridEl?.remove(); await this.reload(); } }
-  close() { return !this.dirty || confirm(`Close ${this.title}? It has changes that are not saved.`); }
-  activate() { requestAnimationFrame(() => this.gridEl?.grid?.box.focus({ preventScroll: true })); }
-  async loadIntoTable() {
-    const name = await prompt('Load into a table', 'The new table\'s name', this.title.replace(/\.[^.]+$/, '').replace(/[^\w]+/g, '_').toLowerCase());
-    if (!name) return;
-    try { await run(`CREATE TABLE ${ident(name)} AS SELECT * FROM ${fileSql(this.path)}`); toast(`Loaded into the table ${name}`); R.helpers.refresh(); } catch (e) { toast(e.message, true); }
-  }
-  toolbar() {
-    const parts = this.path.split('/');
-    return [...parts.slice(0, -1).flatMap(p => [h('span', { class: 'crumb' }, p), h('span', { class: 'slash' }, '/')]), h('b', { class: 'crumb cur' }, parts.at(-1)),
-      h('span', { class: 'said-saved' }, this.readonly ? 'Read-only' : this.dirty ? `${this.changes().length ? this.changes().join(', ') : 'Edited'}, not saved` : 'Saved'),
-      h('span', { class: 'grow' }),
-      this.readonly ? null : btn('save', 'Save', 'Save it to the file (Ctrl+S)', () => this.save(), this.dirty ? 'btn primary' : 'btn'),
-      this.readonly ? null : h('button', { class: 'btn', disabled: !this.dirty, title: 'Throw away the changes', onclick: () => this.discard() }, 'Discard'), h('span', { class: 'sep' }),
-      btn('play', 'Query with SQL', 'Query it, in a new SQL tab', () => R.helpers.query(`SELECT * FROM ${fileSql(this.path)} LIMIT 1000`)),
-      moreBtn(() => [{ label: 'Load into a table…', icon: 'up', run: () => this.loadIntoTable() }, { label: 'Download', icon: 'down', run: () => download(this.path) }, { label: 'Copy the path', icon: 'copy', run: () => copyText('files/' + this.path, 'Path copied') }])];
-  }
-  status() { return [`${count(this.data.length)} rows · ${this.cols.length} columns`, this.format === 'csv' ? `CSV · UTF-8 · ${this.sep === '\t' ? 'tab' : 'comma'}` : this.format.toUpperCase()]; }
-}
-/** A JSON file's cell, as typed: a number, true, false, null, an object or a list stay what they are. */
-const parseValue = t => { if (t === '') return null; if (/^(-?\d+(\.\d+)?([eE][+-]?\d+)?|true|false|null|[[{].*)$/s.test(t.trim())) { try { return JSON.parse(t); } catch { /* (text) */ } } return t; };
 
 // ------------------------------------------------------------------ the core's kinds of file, as an extension would register them
 export function registerFiles(register) {
@@ -582,6 +488,6 @@ export function registerFiles(register) {
   register.doc({ id: 'notebook', label: 'Notebook', icon: 'notebook', match: p => /\.ipynb$/i.test(p) && !p.startsWith('notebooks/'), open: openPlain }); // (a plain file, saved in place; notebooks keeps versions)
   register.doc({ id: 'sql', label: 'SQL file', icon: 'filesql', order: 20, match: p => /\.sql$/i.test(p), open: text(SqlDoc) });
   register.doc({ id: 'python', label: 'Python file', icon: 'filepy', order: 30, match: p => /\.py$/i.test(p), open: text(PythonDoc) });
-  register.doc({ id: 'data', label: 'Data file', icon: 'filedata', order: 40, match: p => DATA.test(p), open: path => new DataDoc({ path }).load() });
+  register.doc({ id: 'data', label: 'Data file', icon: 'filedata', order: 40, match: p => DATA.test(p), open: async path => { const { DataDoc } = await import('./data.js'); return new DataDoc({ path }).load(); } }); // (data.js: loaded when a data file first opens)
   register.doc({ id: 'text', label: 'Text file', icon: 'file', order: 50, match: p => /\.(md|txt)$/i.test(p), open: async path => { const f = await readFile(path); return new TextDoc({ path, text: f.text, version: f.version, language: /\.md$/i.test(path) ? 'markdown' : 'text' }); } });
 }

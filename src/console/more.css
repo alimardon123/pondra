@@ -1,0 +1,40 @@
+/* The console's rarer parts' style (ADR-034, round 29): charts, the plan's graph, Runs, Settings,
+   search (Ctrl K) and choosing the Python. Loaded with the modules that draw them (more.js,
+   chart.js, plan.js), so the page's first load doesn't carry it. */
+.chart{padding:6px 2px 2px}
+.chart svg text{font:10.5px var(--mono);fill:var(--faint)}
+.legend{display:flex;gap:14px;font-size:12px;color:var(--muted);margin-bottom:4px}.legend span{display:inline-flex;align-items:center;gap:6px}.legend i{width:10px;height:10px;border-radius:2px;display:inline-block}
+.run-item{padding:6px;border-radius:8px;cursor:pointer}.run-item:hover{background:var(--hover)}
+.run-item .line1{display:flex;gap:8px;align-items:center}.run-item .nm{font:12px var(--mono)}.run-item .sub{color:var(--faint);font-size:11.5px;margin-left:22px}
+.setting{display:grid;grid-template-columns:130px 1fr;gap:12px;align-items:center;margin:10px 0}
+.setting label{color:var(--ink)}
+.setting>.btn{justify-self:start}
+.palette{padding:8px;max-width:620px;top:12vh;margin-top:0}
+#palIn{height:40px;font-size:14px;border:0;background:transparent;outline:none!important}
+#palList{max-height:50vh;overflow:auto;margin-top:6px;border-top:1px solid var(--line2);padding-top:6px}
+.pi{display:flex;align-items:center;gap:9px;height:32px;padding:0 10px;border-radius:7px;cursor:pointer}
+.pi.on{background:var(--sel)}.pi .meta{margin-left:auto}
+dialog.settings form{padding:0 20px 16px}dialog.settings .pop-h{margin:0 -20px 4px}
+dialog.settings h4{margin:16px 0 2px;font-size:11.5px;letter-spacing:.04em;text-transform:uppercase;color:var(--faint)}
+.setting label small{color:var(--faint);font-size:11px;display:block}
+.colors{display:flex;gap:8px;align-items:center}.colors input[type=color]{width:52px!important;height:30px!important;padding:2px!important;cursor:pointer}
+/* the chart's and the plan's bars */
+.cbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:0 0 10px;font-size:12px;color:var(--muted)}.cbar .grow{flex:1}
+.csel{display:inline-flex;align-items:center;gap:6px}.csel select{height:26px;border:1px solid var(--line);border-radius:6px;background:var(--surface);color:var(--ink);font-size:12px;padding:0 6px}
+.segs{display:inline-flex;border:1px solid var(--line);border-radius:7px;overflow:hidden}.seg{height:26px;padding:0 10px;border:0;background:var(--surface);color:var(--muted);font-size:12px;cursor:pointer}.seg.on{background:var(--accent-soft);color:var(--accent);font-weight:600}
+.art svg text{fill:var(--muted);font-size:11px}
+/* the plan as a graph: each step above those it reads */
+.pgraph{overflow:auto;padding:4px 0 16px}
+.pt,.pt ul{display:flex;justify-content:center;margin:0;padding:18px 0 0;list-style:none;position:relative}.pt{padding-top:0}
+.pt li{display:flex;flex-direction:column;align-items:center;position:relative;padding:18px 6px 0}.pt>li{padding-top:0}
+.pt li::before,.pt li::after{content:"";position:absolute;top:0;width:50%;height:18px;border-top:1px solid var(--line)}.pt li::before{right:50%}.pt li::after{left:50%;border-left:1px solid var(--line)}
+.pt li:only-child::before,.pt li:only-child::after{border-top:0}.pt li:first-child::before,.pt li:last-child::after{border-top:0}.pt>li::before,.pt>li::after{display:none}
+.pt ul::before{content:"";position:absolute;top:0;left:50%;height:18px;border-left:1px solid var(--line)}
+.pn{display:flex;flex-direction:column;gap:2px;min-width:120px;max-width:260px;padding:6px 10px;border:1px solid var(--line);border-left:3px solid color-mix(in srgb,var(--err) min(100%,var(--heat,0%) * 2.5),var(--line));border-radius:8px;font-size:12px;text-align:center;background:color-mix(in srgb,var(--err) calc(var(--heat,0%) * .3),var(--surface))}
+.pn b{font-weight:600}.pn .pd{font:11px var(--mono);color:var(--muted);overflow-wrap:anywhere}.pn .pm{font-size:10.5px;color:var(--c2)}.pn .pmx{font-size:11px;color:var(--ink);font-variant-numeric:tabular-nums}
+.pn.moves{border-style:dashed;border-color:color-mix(in srgb,var(--c2) 60%,var(--line))}
+/* choosing the Python */
+.pylist{display:flex;flex-direction:column;gap:8px;margin:10px 0}.py{border:1px solid var(--line2);border-radius:8px;padding:8px 10px}.py.on{border-color:var(--accent)}
+.py .line1{display:flex;align-items:center;gap:8px}.py .ic{color:var(--ok)}.py.bad .ic{color:var(--err)}.py .grow{flex:1}.py .sub{font:11.5px var(--mono);color:var(--muted);overflow-wrap:anywhere;margin-top:2px}.py .sub.bad{color:var(--err);font-family:var(--sans)}
+.py .fix{display:flex;align-items:center;gap:6px;margin-top:6px}.py .fix code{flex:1;font-size:11.5px;overflow-wrap:anywhere}
+.pypath{display:flex;gap:8px;margin-top:8px}.pypath input{flex:1}

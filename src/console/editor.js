@@ -1,6 +1,6 @@
 // The code editor (ADR-034): a textarea over its highlighted copy, for notebook cells and files.
 // It re-renders only the lines a key changed, so typing stays fast in long files; no library.
-import { h, esc, S, ident, sqlType, SQL_KW } from './core.js';
+import { h, esc, S, ident, sqlType, SQL_KW, menu, toast } from './core.js';
 
 // ------------------------------------------------------------------ highlighting
 const PY_KW = new Set('False None True and as assert async await break class continue def del elif else except finally for from global if import in is lambda nonlocal not or pass raise return try while with yield match case'.split(' '));
@@ -134,7 +134,7 @@ const measure = () => { if (!charW) { const c = document.createElement('canvas')
 export class Editor {
   constructor(o = {}) {
     const { value = '', label = 'Code', ...rest } = o;
-    Object.assign(this, { language: 'sql', gutter: false, grow: false, placeholder: '', oninput: null, onkey: null, oncursor: null }, rest);
+    Object.assign(this, { language: 'sql', gutter: false, grow: false, placeholder: '', oninput: null, onkey: null, oncursor: null, menu: null }, rest);
     this.src = []; this.html = []; this.states = ['']; this.width = 0; // (each line: its text, its HTML, the state it starts in; and the state the last leaves)
     this.pre = h('pre', { class: 'hl', 'aria-hidden': 'true' });
     this.ta = h('textarea', { spellcheck: 'false', autocapitalize: 'off', autocomplete: 'off', 'aria-label': label, wrap: 'off', placeholder: this.placeholder });
@@ -148,7 +148,37 @@ export class Editor {
     for (const ev of ['keyup', 'mouseup', 'focus']) this.ta.addEventListener(ev, () => this.cursor());
     this.ta.addEventListener('blur', () => { if (cm?.ed === this) closeComplete(); });
     this.ta.addEventListener('scroll', () => { this.ta.scrollTop = 0; this.ta.scrollLeft = 0; }); // (the box scrolls, never the textarea: it is as big as its text)
+    this.ta.addEventListener('contextmenu', e => { e.preventDefault(); this.contextMenu(e); });
     this.paint();
+  }
+  /** Its right-click menu, as an application's: cut, copy, paste, select all, comment, and what its
+   * document adds (`menu`: running, formatting). */
+  contextMenu(at) {
+    const ta = this.ta, some = ta.selectionStart !== ta.selectionEnd, mod = navigator.platform?.startsWith('Mac') ? 'Cmd' : 'Ctrl';
+    const exec = cmd => { ta.focus(); document.execCommand(cmd); };
+    menu(at, [{ label: 'Cut', keys: `${mod} X`, disabled: !some, run: () => exec('cut') }, { label: 'Copy', icon: 'copy', keys: `${mod} C`, disabled: !some, run: () => exec('copy') },
+      { label: 'Paste', keys: `${mod} V`, run: () => navigator.clipboard?.readText ? navigator.clipboard.readText().then(t => { ta.focus(); insert(ta, t); }, () => toast(`${mod}+V pastes here`)) : toast(`${mod}+V pastes here`) },
+      { label: 'Select all', keys: `${mod} A`, run: () => { ta.focus(); ta.select(); } }, '-',
+      this.language !== 'markdown' ? { label: 'Comment the lines, or uncomment them', keys: `${mod} /`, run: () => { ta.focus(); comment(this); } } : null,
+      ...this.menu?.(some) || []]);
+  }
+  /** Replace what is selected (or, with nothing selected, all of it) by `f` of it (`f` may answer
+   * later: the node's Python formats Python); if `f` fails, changes nothing, or the text changed
+   * meanwhile, it stays as it was. Indented lines are formatted as if they weren't, then indented
+   * back; a last new line stays as it was. */
+  async reformat(f) {
+    const ta = this.ta, some = ta.selectionStart !== ta.selectionEnd, [a0, b0] = some ? [ta.selectionStart, ta.selectionEnd] : [0, ta.value.length];
+    const before = ta.value, text = before.slice(a0, b0), pad = text.match(/^[ \t]*(?=\S)/gm)?.reduce((a, b) => b.length < a.length ? b : a) || '';
+    let out;
+    try { out = await f(pad ? text.replace(new RegExp('^' + pad, 'gm'), '') : text); }
+    catch (e) { toast(`It can't be formatted as it is: left as it was${e?.message ? ` (${e.message.split('\n')[0].slice(0, 200)})` : ''}`, true); return; }
+    if (out == null) return;
+    if (pad) out = out.replace(/^(?=.)/gm, pad);
+    out = /\n$/.test(text) ? out.replace(/\n*$/, '\n') : out.replace(/\n+$/, '');
+    if (out === text) return;
+    if (ta.value !== before) return toast('It changed while it was being formatted: left as it was', true);
+    ta.focus(); ta.setSelectionRange(a0, b0);
+    insert(ta, out); ta.setSelectionRange(a0, a0 + out.length);
   }
   get value() { return this.ta.value; }
   set value(v) { this.ta.value = v; this.paint(); }

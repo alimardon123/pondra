@@ -3,7 +3,7 @@
 
   console_check.py [--port 8890] [--show DIR] [--only node,files,grid,layout,budget,tokens,server,extensions]
 
-- node: a new notebook shows it is not saved (its tab, the Workspace); the Data tree lists the lake's schemas, tables and views (each kind its icon) and columns
+- node: a new notebook has no dot until something is typed (its tab, the Workspace); the Data tree lists the lake's schemas, tables and views (each kind its icon) and columns
   (each type its coloured mark, a key's marked), with no bare numbers; a table picked shows its
   details and its profile, a view its definition; double-clicking a table shows its first rows; the
   Workspace lists the lake's files by folder; a SQL cell's answer (its types as marks, a header's
@@ -22,8 +22,8 @@
   tab bar's + and a folder's menu (a name that exists or is not one is refused), deleted with
   their files; a ⋯ on every row of the Workspace (on hover, on focus, on the one picked) opens its
   menu; a notebook made in a folder is one plain file saved in place (refused over someone else's
-  change), opens again after a reload, offers no jobs; a file renamed moves its tab; the +, the
-  ⋯ and the welcome page say "Upload a file…".
+  change), opens again after a reload, offers no jobs; a file renamed moves its tab; the +, Ctrl+K
+  and the welcome page say "Upload a file…"; the top bar has a gear for Settings, no ⋯ of its own.
 - grid: a click lights a cell and its row, Shift+click a range (one outline), the keys move it,
   Ctrl+C copies it (Shift: with the headers), the menu filters to its values, a header's sort
   button sorts, a header's card tells its type.
@@ -31,8 +31,9 @@
   first and the dark theme on; the filter narrows the trees; Ctrl+B and Ctrl+Alt+B; a pane's edge
   sets its width (kept); the tabs open again after a reload; a narrow window: no sideways scroll,
   the panes drawers; axe finds nothing (contrast included), light and dark.
-- budget (ADR-034 §7): the scripts and style sheet, gzipped as the node serves them, <= 70 KB; each
-  answers 304 when the browser has it; first paint < 400 ms; typing in a 1,000-line file < 8 ms a
+- budget (ADR-034 §7): the scripts and style sheet the page loads, gzipped as the node serves them,
+  <= 70 KB, and those loaded when first used (chart, plan, more, data) <= 8 KB each; each answers
+  304 when the browser has it; first paint < 400 ms; typing in a 1,000-line file < 8 ms a
   key (median); scrolling 10,000 rows: p95 frame < 20 ms.
 - tokens: a node with tokens serves the page, which asks for one; given it, the tables show, and
   after a reload too (the browser keeps it).
@@ -127,8 +128,17 @@ class Page:
                     [...g.querySelectorAll('tbody tr:not(.gap)')].map(tr => [...tr.querySelectorAll('td:not(.i)')].map(td => td.textContent))] }""")
 
     def menu(self, item):
-        """Pick `item` in the top bar's menu."""
-        self.p.click("#moreBtn")
+        """Settings (the top bar's gear: a dialog, loaded when first opened), or `item` in the Workspace's + menu."""
+        if item == "Settings":
+            self.p.click("#settingsBtn")
+            self.p.locator("#settingsDlg[open]").wait_for(timeout=10000)
+            return
+        self.p.click("#newfile")
+        self.p.locator("#menu button", has_text=item).click()
+
+    def runmenu(self, item):
+        """Pick `item` in the ▾ beside the Run of the file in front (its other ways to run: a job, a schedule)."""
+        self.p.locator("#docbar .split .caret").first.click()
         self.p.locator("#menu button", has_text=item).click()
 
     def docmenu(self, item):
@@ -181,7 +191,7 @@ def node_checks(browser, port, show):
     p = pg.p
     tree = p.locator("#data")
     tree.locator(".row", has_text="people").wait_for(timeout=20000)
-    fresh = until(lambda: (pg.tab(), pg.workspace("notebooks", "untitled.ipynb").locator(".dirty").count()), (("untitled.ipynb", True), 1))
+    fresh = until(lambda: (pg.tab(), pg.workspace("notebooks", "untitled.ipynb").locator(".dirty").count()), (("untitled.ipynb", False), 0))
     tree.locator(".row", has_text="sales").locator(".tw").click()
     tree.locator(".row", has_text="orders").wait_for(timeout=10000)
     people = tree.locator(".row[data-kind]", has_text="people")
@@ -189,7 +199,7 @@ def node_checks(browser, port, show):
     names = tree.locator(".row.col:visible .nm").all_inner_texts()
     types = tree.locator(".row.col:visible .ty").all_inner_texts()
     kinds = {r.locator(".nm").inner_text(): r.get_attribute("data-kind") for r in tree.locator(".row[data-kind]").all() if r.get_attribute("data-kind") not in ("database", "schema")}
-    checks["a new notebook shows it is not saved: its tab and its row in the Workspace's notebooks folder have the dot"] = fresh == (("untitled.ipynb", True), 1)
+    checks["a new notebook, nothing typed, has nothing to save: no dot on its tab or its row in the Workspace's notebooks folder"] = fresh == (("untitled.ipynb", False), 0)
     checks["the Data tree lists schemas, tables and views (each kind its icon), columns with SQL types and coloured type marks, a key marked, no bare numbers"] = \
         kinds == {"people": "table", "grown": "view", "orders": "table"} and names == ["id", "name", "born", "at", "amt"] and types[4] == "DECIMAL(10,2)" and types[3] == "TIMESTAMP" \
         and tree.locator(".row.col:visible .ty-i").count() == 5 and tree.locator(".row.col:visible .kk").count() == 1 \
@@ -421,9 +431,11 @@ def files_checks(browser, port, show):
     p.locator(".ptab", has_text="Messages").click()
     said = until(lambda: "3 rows" in body.inner_text() and body.inner_text(), secs=5)
     p.locator(".ptab", has_text="Plan").click()
-    plan = until(lambda: "Exec" in body.inner_text() and body.inner_text(), secs=10)
+    drawn = until(lambda: body.locator(".pgraph .pn").count() > 1, True, 10)  # (a graph of its steps)
+    body.locator(".seg", has_text="Text").click()
+    plan = until(lambda: "Exec" in body.inner_text() and body.inner_text(), secs=10) if drawn is True else None
     p.locator(".ptab", has_text="Results").click()
-    checks["a SQL file opens in one tab (two clicks), runs, and shows its Results, Messages and Plan"] = one_tab == 1 and results[1] == [["r0", "10"], ["r1", "10"], ["r2", "10"]] \
+    checks["a SQL file opens in one tab (two clicks), runs, and shows its Results, Messages and Plan (a graph of its steps, and as text)"] = one_tab == 1 and results[1] == [["r0", "10"], ["r1", "10"], ["r2", "10"]] \
         and bool(said) and bool(plan)
     ed = p.locator(".filedoc .editor textarea")
     ed.focus()
@@ -481,10 +493,10 @@ def files_checks(browser, port, show):
     bar.locator("input").fill("r1")
     bar.locator("input").press("Enter")
     bound = until(lambda: pg.grid(body), [["n", "region"], [["10", "r1"]]])
-    pg.docmenu("Run as a job")
+    pg.runmenu("Run as a job")
     jobs = p.locator("#runs .run-item", has_text="by_region.sql")
     ran = until(lambda: jobs.count() > 0 and "failed" not in jobs.first.inner_text() and "running" not in jobs.first.inner_text(), True, 30)
-    pg.docmenu("Schedule")
+    pg.runmenu("Schedule")
     p.locator("#askDlg[open]").wait_for(timeout=5000)
     p.fill("#askIn", "1 hour")
     p.press("#askIn", "Enter")
@@ -570,7 +582,7 @@ def files_checks(browser, port, show):
     checks["files: every request went to the node; no page errors"] = pg.left() == [] and pg.errors == []
     more, folders = folders_checks(browser, port, show)
     checks.update(more)
-    info = {"task": task, "bound": bound, "results": results, "said": said, "each": each, "not run": left, "second": second, "dirty": dirty, "saved": saved, "clean": clean, "shown": shown, "errors": pg.errors, "left": pg.left(), "toast": pg.toast(), "folders": folders}
+    info = {"task": task, "bound": bound, "results": results, "said": said, "each": each, "not run": left, "second": second, "last": last, "only": only, "plan": plan, "dirty": dirty, "saved": saved, "clean": clean, "shown": shown, "errors": pg.errors, "left": pg.left(), "toast": pg.toast(), "folders": folders}
     pg.ctx.close()
     return checks, info
 
@@ -667,8 +679,9 @@ def folders_checks(browser, port, show):
     folder("projects").click(button="right")
     p.locator("#menu button", has_text="New notebook here").click()
     mine = lambda name: kids("projects").locator(".row", has_text=name)
-    fresh = until(lambda: (pg.tab(), mine("untitled.ipynb").locator(".dirty").count()), (("untitled.ipynb", True), 1))
+    fresh = until(lambda: (pg.tab(), mine("untitled.ipynb").locator(".dirty").count()), (("untitled.ipynb", False), 0))
     pg.cell(0).locator("textarea").fill("SELECT 7 AS seven")
+    typed = until(lambda: (pg.tab(), mine("untitled.ipynb").locator(".dirty").count(), p.locator("#saveBtn").count()), (("untitled.ipynb", True), 1, 1))
     p.fill("#nbname", "analysis")
     p.press("#nbname", "Enter")
     p.keyboard.press("Control+s")
@@ -677,13 +690,17 @@ def folders_checks(browser, port, show):
     text = until(lambda: "seven" in get(port, "projects/analysis.ipynb").decode(), True) and get(port, "projects/analysis.ipynb").decode()
     valid = _try(lambda: nbformat.validate(nbformat.reads(text, as_version=4)) is None)
     clean = until(lambda: (pg.tab(), mine("analysis.ipynb").locator(".dirty").count()), (("analysis.ipynb", False), 0))
-    checks["a new notebook in a folder shows it is not saved (tab, row in that folder), then Ctrl+S saves it in place, as projects/analysis.ipynb, valid for Jupyter: no versions"] = \
-        fresh == (("untitled.ipynb", True), 1) and in_place == want_files and valid is True and clean == (("analysis.ipynb", False), 0) and in_lake("notebooks/analysis") == [] \
+    checks["a new notebook in a folder: no dot until something is typed, then its tab and row have the dot and Save shows; Ctrl+S saves it in place, as projects/analysis.ipynb, valid for Jupyter: no versions"] = \
+        fresh == (("untitled.ipynb", False), 0) and typed == (("untitled.ipynb", True), 1, 1) and in_place == want_files and valid is True and clean == (("analysis.ipynb", False), 0) and in_lake("notebooks/analysis") == [] \
         and "file=projects%2Fanalysis.ipynb" in p.url and p.locator("#docbar .crumb").first.inner_text() == "projects/"
     p.locator("#docbar button[aria-label=More]").click()
     nb_menu = items()
     p.keyboard.press("Escape")
-    checks["a notebook saved in place offers no versions, jobs or schedule"] = "Download as .ipynb" in nb_menu and not {"Versions…", "Run as a job", "Schedule…"} & set(nb_menu)
+    p.locator("#docbar .split .caret").first.click()
+    nb_run = items()
+    p.keyboard.press("Escape")
+    checks["a notebook saved in place offers no versions, jobs or schedule (its ⋯ and its Run's ▾)"] = "Download as .ipynb" in nb_menu and "Run all" in nb_run \
+        and not {"Versions…", "Run as a job", "Schedule…"} & set(nb_menu + nb_run)
 
     both = palette("projects/")
     every = palette("")
@@ -771,18 +788,16 @@ def folders_checks(browser, port, show):
     p.click("#newfile")
     plus = items()
     p.keyboard.press("Escape")
-    p.click("#moreBtn")
-    top = items()
-    p.keyboard.press("Escape")
+    top = p.locator("#moreBtn").is_hidden()  # (the top bar's ⋯: only an extension's actions)
     cmds = palette("upload")
     w = Page(browser, base + "/")
     w.p.locator("#tabbar .tab").first.click(button="middle")
     welcome = until(lambda: w.p.locator(".welcome .btn").all_inner_texts(), ["New notebook", "New SQL file", "New Python file", "New folder", "Upload a file…"])
     w.ctx.close()
-    checks["the Workspace's ⋯ lists no New item (Data's keeps Refresh); the +, the top ⋯, Ctrl+K and the welcome page say Upload a file…"] = \
+    checks["the Workspace's ⋯ lists no New item (Data's keeps Refresh); the +, Ctrl+K and the welcome page say Upload a file…; the top bar has no ⋯ of its own"] = \
         not [x for x in group if x.startswith("New")] and "Move to the right pane" in group and "Refresh" in data \
-        and plus == ["New notebook", "New SQL file", "New Python file", "New folder", "Upload a file…"] and "Upload a file…" in top and "New folder" in top \
-        and cmds.count("Upload a file…") == 1 and not [x for x in top + cmds + welcome if "Open an" in x] and welcome == ["New notebook", "New SQL file", "New Python file", "New folder", "Upload a file…"]
+        and plus == ["New notebook", "New SQL file", "New Python file", "New folder", "Upload a file…"] and top is True \
+        and cmds.count("Upload a file…") == 1 and not [x for x in cmds + welcome if "Open an" in x] and welcome == ["New notebook", "New SQL file", "New Python file", "New folder", "Upload a file…"]
     if show:
         pg.menu("Settings")
         p.select_option("#setGroups", "workspace")
@@ -795,7 +810,7 @@ def folders_checks(browser, port, show):
         p.wait_for_timeout(300)
         pg.shot(show, "console-workspace.png")
     checks["folders: every request went to the node; no page errors"] = pg.left() == [] and pg.errors == []
-    info = {"shown": shown, "made": [viaTab, inside, twice, dots], "menus": {"folder": by_button, "file": file_menu, "notebook": nb_menu, "group": group, "data": data, "plus": plus, "top": top, "palette": cmds}, "asked": asked, "deleted": [said, emptied, gone],
+    info = {"shown": shown, "made": [viaTab, inside, twice, dots], "menus": {"folder": by_button, "file": file_menu, "notebook": nb_menu, "notebook run": nb_run, "group": group, "data": data, "plus": plus, "top": top, "palette": cmds}, "asked": asked, "deleted": [said, emptied, gone],
             "toast": pg.toast(), "errors": pg.errors, "left": pg.left(), "welcome": welcome}
     pg.ctx.close()
     return checks, info
@@ -895,6 +910,23 @@ def layout_checks(browser, port, show):
     p.keyboard.press("Escape")
     checks["Settings: Workspace first (Data first by default), and the dark theme"] = first == ["Workspace", "Data"] and dark \
         and p.locator("#left .group h2").all_inner_texts() == ["Data", "Workspace"]
+    # Kept on the machine (round 29): another browser (no storage of its own) opens with them.
+    pg.menu("Settings")
+    p.select_option("#setTheme", "dark")
+    p.locator("#setBg").evaluate("(el) => { el.value = '#203040'; el.dispatchEvent(new Event('input', { bubbles: true })); }")
+    p.keyboard.press("Escape")
+    kept_json = until(lambda: json.loads(urllib.request.urlopen(f"http://127.0.0.1:{port}/console/settings").read()).get("theme"), "dark")
+    other = Page(browser, f"http://127.0.0.1:{port}/")
+    other.p.locator("#tabbar .tab").first.wait_for(timeout=20000)
+    there = until(lambda: (other.p.evaluate("document.documentElement.dataset.theme"), other.p.evaluate("getComputedStyle(document.documentElement).getPropertyValue('--surface').trim()")), ("dark", "#203040"))
+    other.ctx.close()
+    pg.menu("Settings")
+    p.select_option("#setTheme", "light")
+    p.locator("#setBgReset").click()
+    p.keyboard.press("Escape")
+    light = until(lambda: json.loads(urllib.request.urlopen(f"http://127.0.0.1:{port}/console/settings").read()).get("theme"), "light")
+    checks["Settings are kept on the machine: another browser opens with the dark theme and the background picked; light is the first theme"] = \
+        kept_json == "dark" and there == ("dark", "#203040") and light == "light"
     p.fill("#filter", "lx")
     seen = lambda: p.locator("#data .row:visible .nm").all_inner_texts()
     only = until(lambda: "lx" in seen() and "ly" not in seen(), True)
@@ -980,8 +1012,13 @@ def budget_checks(browser, port, show):
         except urllib.error.HTTPError as e:
             fresh[name] = e.code
     total = sum(sizes.values()) if all(sizes.values()) else None
-    checks["the scripts and style sheet, gzipped as the node serves them: <= 70 KB; each answers 304 when the browser has it"] = total is not None and total <= 70 * 1024 \
+    later = {}
+    for name in ["chart.js", "plan.js", "more.js", "more.css", "data.js"]:  # (loaded when first used)
+        r = urllib.request.urlopen(urllib.request.Request(f"{base}/console/{name}", headers={"accept-encoding": "gzip"}))
+        later[name] = len(r.read()) if r.headers.get("content-encoding") == "gzip" else None
+    checks["the scripts and style sheet the page loads, gzipped as the node serves them: <= 70 KB; each answers 304 when the browser has it"] = total is not None and total <= 70 * 1024 \
         and set(fresh.values()) == {304}
+    checks["those loaded when first used (a chart, a plan, Runs and Settings, a data file): <= 8 KB each, gzipped"] = all(v is not None and v <= 8 * 1024 for v in later.values())
     paints = []
     for _ in range(3):
         pg = Page(browser, base + "/")
@@ -1020,7 +1057,7 @@ def budget_checks(browser, port, show):
     p95 = frames[int(len(frames) * 0.95)] if frames else 1e9
     checks["scrolling 10,000 rows: p95 frame < 20 ms"] = p95 < 20
     checks["budget: no page errors"] = pg.errors == []
-    info = {"gzipped": sizes, "total": total, "fresh": fresh, "first paint ms": paints, "typing ms": round(typing, 2), "keys": [round(k, 2) for k in keys[:40]], "scroll p95 ms": round(p95, 2),
+    info = {"gzipped": sizes, "total": total, "later": later, "fresh": fresh, "first paint ms": paints, "typing ms": round(typing, 2), "keys": [round(k, 2) for k in keys[:40]], "scroll p95 ms": round(p95, 2),
             "errors": pg.errors}
     pg.ctx.close()
     return checks, info
@@ -1127,6 +1164,8 @@ def main():
     if A.show:
         os.makedirs(A.show, exist_ok=True)
     lake = tempfile.mkdtemp(prefix="pondra-")
+    # (the console's settings, kept by the node for its machine: this run's own, never the machine's)
+    os.environ["PONDRA_CONFIG_DIR"] = tempfile.mkdtemp(prefix="pondra-config-")
     node = Node(lake, A.port, env={"PYTHONPATH": os.path.join(HERE, "..", "python")}, python=sys.executable).start()
     results, said = {}, {}
     try:

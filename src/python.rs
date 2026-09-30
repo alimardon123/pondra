@@ -8,11 +8,11 @@
 //! take it down, and the binary stays one file for glibc 2.17.
 use anyhow::{bail, ensure, Context, Result};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
@@ -22,27 +22,131 @@ static EXE: OnceLock<Option<String>> = OnceLock::new();
 pub fn init(exe: Option<String>) { let _ = EXE.set(exe); }
 
 /// Does this node run Python (`--python`)?
-pub fn runs() -> bool { exe().is_ok() }
+pub fn runs() -> bool { EXE.get().is_some_and(|e| e.is_some()) }
 
-/// Ready to run `what` (a routine's name and kind), or why not: no `--python`, or none found
-/// with the pondra package (`--python auto`).
-pub fn ready(what: &str) -> Result<()> { exe().map(|_| ()).with_context(|| format!("{what}, so this node needs Python")) }
+/// Started with Python, and (with `--python auto`) one was found: a routine made on a node with
+/// none is checked when it is first used instead, where the error says why.
+pub async fn found() -> bool { runs() && exe().await.is_ok() }
 
-/// The Python: `--python`'s, or with `--python auto` (the shell's) the first found with the
-/// `pondra` package and pyarrow — `$PONDRA_PYTHON`, the one beside this binary (pip put it
-/// there), `python3`, `python` — looked for once, when first needed.
-fn exe() -> Result<&'static str> {
-    static FOUND: OnceLock<Option<String>> = OnceLock::new();
+/// Ready to run `what` (a routine's name and kind), or why not: no `--python`.
+pub fn ready(what: &str) -> Result<()> {
+    ensure!(runs(), "{what}, so this node needs Python: it was started without --python (start it with --python <python>, or --python auto)");
+    Ok(())
+}
+
+/// The Python chosen now: `--python`'s, one chosen in the console since (`choose`), or, with
+/// `--python auto` (the shell's), the first that works of those this machine has (`pythons`).
+static CHOSEN: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
+
+/// The Python to run workers with, looked for the first time it is needed.
+async fn exe() -> Result<String> {
     let given = EXE.get().and_then(|e| e.as_deref()).context("it was started without --python (start it with --python <python>, or --python auto)")?;
-    if given != "auto" {
-        return Ok(given);
+    if let Some(p) = CHOSEN.read().unwrap().clone() {
+        return Ok(p);
     }
-    FOUND.get_or_init(|| {
-        let beside = std::env::current_exe().ok().and_then(|e| Some(e.parent()?.to_path_buf()));
-        let near = ["python3", "python", "python.exe"].iter().filter_map(|p| Some(beside.as_ref()?.join(p).to_string_lossy().to_string()));
-        let all: Vec<String> = std::env::var("PONDRA_PYTHON").ok().into_iter().chain(near).chain(["python3".to_string(), "python".to_string()]).collect();
-        all.into_iter().find(|p| std::process::Command::new(p).args(["-c", "import pondra.worker, pyarrow"]).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().is_ok_and(|s| s.success()))
-    }).as_deref().context("no Python with the pondra package and pyarrow was found (pip install pondra pyarrow; or --python <python>)")
+    if given != "auto" {
+        return Ok(given.to_string());
+    }
+    static LOOKING: LazyLock<tokio::sync::Mutex<()>> = LazyLock::new(Default::default);
+    let _one = LOOKING.lock().await;
+    if let Some(p) = CHOSEN.read().unwrap().clone() {
+        return Ok(p);
+    }
+    let found = pythons().await;
+    let good = found.iter().find(|p| p["ok"] == true).and_then(|p| p["path"].as_str()).map(str::to_string);
+    let Some(good) = good else {
+        let tried: Vec<String> = found.iter().map(|p| format!("{} ({})", p["path"].as_str().unwrap_or("?"), p["error"].as_str().unwrap_or("no pondra or pyarrow"))).collect();
+        bail!("no Python with the pondra package and pyarrow was found (tried: {}). Install them into one: <python> -m pip install pondra pyarrow; or start with --python <python>, or choose one in the console", if tried.is_empty() { "none found".into() } else { tried.join("; ") });
+    };
+    *CHOSEN.write().unwrap() = Some(good.clone());
+    Ok(good)
+}
+
+/// Where the console's choice of Python is kept on this machine (beside its settings).
+fn kept_choice() -> Option<std::path::PathBuf> { crate::console::settings_dir().map(|d| d.join("python.txt")) }
+
+/// The Pythons this machine has, the likeliest first: `$PONDRA_PYTHON`, the one chosen before, the
+/// one beside this binary (pip put it there, a virtualenv's), those on the PATH, Windows' `py`
+/// launcher's, and Anaconda's and Miniconda's (their environments too).
+async fn candidates() -> Vec<String> {
+    let mut out: Vec<std::path::PathBuf> = vec![];
+    let var = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty()).map(std::path::PathBuf::from);
+    out.extend(var("PONDRA_PYTHON"));
+    out.extend(kept_choice().and_then(|f| std::fs::read_to_string(f).ok()).map(|p| p.trim().into()));
+    let names: &[&str] = if cfg!(windows) { &["python.exe", "python3.exe"] } else { &["python3", "python"] };
+    let bin = if cfg!(windows) { "" } else { "bin" };
+    if let Some(dir) = std::env::current_exe().ok().and_then(|e| Some(e.parent()?.to_path_buf())) {
+        out.extend(names.iter().map(|n| dir.join(n)));
+        out.extend(names.iter().filter_map(|n| Some(dir.parent()?.join(n)))); // (a Windows install's Scripts\ is beside its python.exe)
+    }
+    for dir in var("PATH").map(|p| std::env::split_paths(&p).collect::<Vec<_>>()).unwrap_or_default() {
+        out.extend(names.iter().map(|n| dir.join(n)));
+    }
+    if cfg!(windows) { // (the py launcher knows every python.org install)
+        let listed = tokio::time::timeout(Duration::from_secs(5), tokio::process::Command::new("py").arg("-0p").stdin(std::process::Stdio::null()).kill_on_drop(true).output()).await;
+        if let Ok(Ok(o)) = listed {
+            out.extend(String::from_utf8_lossy(&o.stdout).lines().filter_map(|l| l.split_whitespace().last()).filter(|p| p.to_lowercase().ends_with(".exe")).map(std::path::PathBuf::from));
+        }
+    }
+    let home = var("USERPROFILE").or_else(|| var("HOME"));
+    let conda: Vec<std::path::PathBuf> = var("CONDA_PREFIX").into_iter()
+        .chain(["anaconda3", "miniconda3", "Anaconda3", "Miniconda3"].iter().filter_map(|d| Some(home.as_ref()?.join(d))))
+        .chain(var("ProgramData").map(|p| p.join("Anaconda3"))).collect();
+    for base in conda {
+        out.push(base.join(bin).join(names[0]));
+        if let Ok(envs) = std::fs::read_dir(base.join("envs")) {
+            out.extend(envs.flatten().map(|e| e.path().join(bin).join(names[0])));
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    out.into_iter().filter(|p| p.is_file()).filter(|p| seen.insert(std::fs::canonicalize(p).unwrap_or_else(|_| p.clone()))).map(|p| p.to_string_lossy().to_string()).take(24).collect()
+}
+
+/// Each Python this machine has, tried at once, each for at most `PONDRA_PYTHON_PROBE_SECS` (15):
+/// its version, whether it has the pondra package and pyarrow, and whether they import — one that
+/// hangs (a broken install) is one that doesn't work, never a wait for everyone.
+pub async fn pythons() -> Vec<Value> { probe(candidates().await).await }
+
+async fn probe(paths: Vec<String>) -> Vec<Value> {
+    const TRY: &str = "import sys, json, importlib.util as u\nr = {'version': sys.version.split()[0], 'pondra': bool(u.find_spec('pondra')), 'pyarrow': bool(u.find_spec('pyarrow'))}\ntry:\n    import pyarrow, pondra, pondra.worker\n    r['ok'] = True; r['pondra_version'] = getattr(pondra, '__version__', '')\nexcept BaseException as e:\n    r['ok'] = False; r['error'] = (type(e).__name__ + ': ' + str(e))[:300]\nprint(json.dumps(r))";
+    let limit = Duration::from_secs(env_u64("PONDRA_PYTHON_PROBE_SECS", 15));
+    let probes = paths.into_iter().map(|path| async move {
+        let run = tokio::process::Command::new(&path).args(["-c", TRY]).stdin(std::process::Stdio::null()).stderr(std::process::Stdio::null()).kill_on_drop(true).output();
+        let mut v = match tokio::time::timeout(limit, run).await {
+            Ok(Ok(o)) => String::from_utf8_lossy(&o.stdout).lines().last().and_then(|l| serde_json::from_str::<Value>(l).ok()).unwrap_or_else(|| json!({"ok": false, "error": format!("it didn't start (exit {})", o.status)})),
+            Ok(Err(e)) => json!({"ok": false, "error": format!("it didn't start: {e}")}),
+            Err(_) => json!({"ok": false, "error": format!("it didn't answer within {} s: a broken install?", limit.as_secs())}),
+        };
+        v["path"] = json!(path);
+        v
+    });
+    futures::future::join_all(probes).await
+}
+
+/// The Python in use, and how it came to be: for the console's Python menu.
+pub fn current() -> Value {
+    let given = EXE.get().and_then(|e| e.clone());
+    json!({"python": CHOSEN.read().unwrap().clone().or_else(|| given.clone().filter(|g| g != "auto")), "given": given, "worker": PYTHON.get()})
+}
+
+/// Use `path` from now on (the console's Choose Python): it must work (pondra and pyarrow import);
+/// kept on this machine for the next start; workers and sessions start again on it.
+pub async fn choose(path: &str) -> Result<Value> {
+    ensure!(runs(), "this node was started without --python");
+    let path = path.trim().trim_matches('"');
+    ensure!(std::path::Path::new(path).is_file(), "{path}: no such Python");
+    let probe = probe(vec![path.to_string()]).await.pop().context("no answer")?;
+    ensure!(probe["ok"] == true, "{path} can't run Pondra's Python: {}", probe["error"].as_str().unwrap_or("it lacks the pondra package or pyarrow (<python> -m pip install pondra pyarrow)"));
+    *CHOSEN.write().unwrap() = Some(path.to_string());
+    if let Some(f) = kept_choice() {
+        let _ = f.parent().map(std::fs::create_dir_all);
+        let _ = std::fs::write(f, path);
+    }
+    POOLS.lock().unwrap().clear(); // (idle workers stop; busy ones finish first)
+    for s in KERNELS.lock().unwrap().drain().map(|(s, _)| s).collect::<Vec<_>>() {
+        PIDS.lock().unwrap().remove(&s);
+    }
+    Ok(probe)
 }
 
 fn env_u64(var: &str, default: u64) -> u64 { std::env::var(var).ok().and_then(|v| v.parse().ok()).unwrap_or(default) }
@@ -52,7 +156,23 @@ struct Worker {
     input: ChildStdin,
     output: BufReader<ChildStdout>,
     idle_since: Instant,
+    said: Arc<Mutex<VecDeque<String>>>, // its standard error's last lines: why, if it stops
 }
+
+impl Worker {
+    /// What its standard error said last (a traceback, a missing package), for an error.
+    async fn tail(&self) -> String {
+        tokio::time::sleep(Duration::from_millis(100)).await; // (its last lines, read by now)
+        let said = self.said.lock().unwrap();
+        match said.is_empty() {
+            true => String::new(),
+            false => format!("; it said: {}", said.iter().cloned().collect::<Vec<_>>().join(" / ")),
+        }
+    }
+}
+
+/// The Python the workers run, as the first one said it (`/sessions/{id}/python` shows it).
+static PYTHON: OnceLock<Value> = OnceLock::new();
 
 /// What a request is for, which decides the slot it waits for. Functions' batches share one per
 /// core (a query may run one over millions of rows on every node); procedures have their own
@@ -105,8 +225,8 @@ async fn install(packages: &str) -> Result<String> {
         let list: Vec<&str> = packages.split(',').collect();
         let target = dir.to_string_lossy().to_string();
         let out = match which("uv") {
-            Some(uv) => tokio::process::Command::new(uv).args(["pip", "install", "--quiet", "--python", exe()?, "--target", &target]).args(&list).output().await?,
-            None => tokio::process::Command::new(exe()?).args(["-m", "pip", "install", "--quiet", "--disable-pip-version-check", "--target", &target]).args(&list).output().await?,
+            Some(uv) => tokio::process::Command::new(uv).args(["pip", "install", "--quiet", "--python", &exe().await?, "--target", &target]).args(&list).output().await?,
+            None => tokio::process::Command::new(exe().await?).args(["-m", "pip", "install", "--quiet", "--disable-pip-version-check", "--target", &target]).args(&list).output().await?,
         };
         ensure!(out.status.success(), "installing {packages}: {}", String::from_utf8_lossy(&out.stderr).trim());
         std::fs::write(&done, packages)?;
@@ -150,7 +270,7 @@ impl Pool {
                 return Ok(lent);
             }
         }
-        lent.worker = Some(spawn(self.path.as_deref())?);
+        lent.worker = Some(spawn(self.path.as_deref()).await?);
         let _idle = self.idle.lock().unwrap(); // (the reaper decides to stop under this lock)
         if !self.reaping.swap(true, Ordering::SeqCst) {
             tokio::spawn(reap(self.clone()));
@@ -159,17 +279,51 @@ impl Pool {
     }
 }
 
-/// A new worker, its packages (if any) on its path.
-fn spawn(path: Option<&str>) -> Result<Worker> {
-    let mut cmd = tokio::process::Command::new(exe()?);
-    cmd.args(["-m", "pondra.worker"]).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).kill_on_drop(true);
+/// A new worker, its packages (if any) on its path, once it has answered: a Python that doesn't
+/// start (a missing package, one that hangs importing) is an error that says so, within
+/// `PONDRA_WORKER_START_SECS` (60), not a cell that waits forever. What it writes to its standard
+/// error goes to the node's, its last lines kept for that error.
+async fn spawn(path: Option<&str>) -> Result<Worker> {
+    let exe = &exe().await?;
+    let mut cmd = tokio::process::Command::new(exe);
+    cmd.args(["-m", "pondra.worker"]).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).kill_on_drop(true);
     if let Some(p) = path {
         let old = std::env::var("PYTHONPATH").unwrap_or_default();
         cmd.env("PYTHONPATH", if old.is_empty() { p.to_string() } else { format!("{p}{}{old}", if cfg!(windows) { ";" } else { ":" }) });
     }
-    let mut child = cmd.spawn().with_context(|| format!("couldn't start {} -m pondra.worker", exe().unwrap_or("python")))?;
+    let mut child = cmd.spawn().with_context(|| format!("couldn't start {exe} -m pondra.worker"))?;
+    let said = Arc::new(Mutex::new(VecDeque::new()));
+    if let Some(err) = child.stderr.take() {
+        let said = said.clone();
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(err).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                eprintln!("{line}");
+                let mut s = said.lock().unwrap();
+                if s.len() == 20 {
+                    s.pop_front();
+                }
+                s.push_back(line);
+            }
+        });
+    }
     let (input, output) = (child.stdin.take().expect("piped"), BufReader::new(child.stdout.take().expect("piped")));
-    Ok(Worker { child, input, output, idle_since: Instant::now() })
+    let mut w = Worker { child, input, output, idle_since: Instant::now(), said };
+    let limit = Duration::from_secs(env_u64("PONDRA_WORKER_START_SECS", 60));
+    let hello = async {
+        send(&mut w, &json!({"op": "hello"}), &[]).await?;
+        recv(&mut w).await // (an older worker answers an error: it is alive all the same)
+    };
+    match tokio::time::timeout(limit, hello).await {
+        Ok(Ok((head, _))) => {
+            if head.get("python").is_some() {
+                let _ = PYTHON.set(head);
+            }
+            Ok(w)
+        }
+        Ok(Err(e)) => bail!("{exe} -m pondra.worker stopped as it started ({e:#}){}", w.tail().await),
+        Err(_) => bail!("{exe} -m pondra.worker didn't answer within {} s of starting{}", limit.as_secs(), w.tail().await),
+    }
 }
 
 impl Lent {
@@ -293,6 +447,28 @@ pub async fn ask(packages: &str, kind: Use, head: Value, parts: Vec<Vec<u8>>, li
 /// then starts a new one, empty, and says so.
 struct Kernel {
     worker: Worker,
+    busy: bool, // a cell sent, its answer not read: its request went away (the page's Stop) before it came
+}
+
+/// Each session's worker's process id: an interrupt reaches it while a cell holds its slot.
+static PIDS: LazyLock<Mutex<HashMap<String, u32>>> = LazyLock::new(Default::default);
+
+/// Interrupt `session`'s running cell: its worker gets SIGINT, and the cell ends with
+/// `KeyboardInterrupt`, its variables kept, as a notebook's kernel does. Windows has no such
+/// signal for another process: the worker is stopped instead, its variables with it. What was done.
+pub fn interrupt(session: &str) -> &'static str {
+    let Some(pid) = PIDS.lock().unwrap().get(session).copied() else { return "none" };
+    #[cfg(unix)]
+    {
+        unsafe { libc::kill(pid as i32, libc::SIGINT) };
+        "interrupted"
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = std::process::Command::new("taskkill").args(["/F", "/T", "/PID", &pid.to_string()]).output();
+        end_session(session);
+        "restarted"
+    }
 }
 
 type Slot = Arc<tokio::sync::Mutex<Option<Kernel>>>;
@@ -315,9 +491,29 @@ pub async fn ask_session(session: &str, head: Value, parts: Vec<Vec<u8>>, limit:
         *kernel = None;
         notice("Python started again: this session's worker had stopped, and the variables it held are gone".into());
     }
-    if kernel.is_none() {
-        *kernel = Some(Kernel { worker: spawn(None)? });
+    if let Some(k) = kernel.as_mut().filter(|k| k.busy) {
+        // A cell whose request went away: its answer (an interrupted one's comes at once) is read
+        // and left, so this cell's is this cell's; one still running after a few seconds is stopped.
+        let drained = tokio::time::timeout(Duration::from_secs(3), async {
+            while recv(&mut k.worker).await?.0.get("notice").is_some() {}
+            anyhow::Ok(())
+        });
+        match drained.await {
+            Ok(Ok(())) => k.busy = false,
+            _ => {
+                *kernel = None;
+                notice("Python started again: the cell before was stopped while it ran, and the variables it held are gone".into());
+            }
+        }
     }
+    if kernel.is_none() {
+        let worker = spawn(None).await?;
+        if let Some(pid) = worker.child.id() {
+            PIDS.lock().unwrap().insert(session.to_string(), pid);
+        }
+        *kernel = Some(Kernel { worker, busy: false });
+    }
+    kernel.as_mut().expect("a kernel").busy = true;
     let w = &mut kernel.as_mut().expect("a kernel").worker;
     let exchange = async {
         send(w, &head, &parts).await?;
@@ -336,10 +532,12 @@ pub async fn ask_session(session: &str, head: Value, parts: Vec<Vec<u8>>, limit:
     let answer = match answer {
         Ok(a) => a,
         Err(e) => {
+            let said = kernel.as_ref().expect("a kernel").worker.tail().await;
             *kernel = None; // (stopped: its variables with it)
-            return Err(e.context("this session's Python was stopped, and the variables it held are gone"));
+            return Err(e.context(format!("this session's Python was stopped, and the variables it held are gone{said}")));
         }
     };
+    kernel.as_mut().expect("a kernel").busy = false;
     if resident_mb(&kernel.as_ref().expect("a kernel").worker.child).is_some_and(|mb| mb > env_u64("PONDRA_WORKER_MB", 2048)) {
         *kernel = None;
         notice(format!("this session's Python grew past {} MB and was stopped: the next cell starts with no variables", env_u64("PONDRA_WORKER_MB", 2048)));
@@ -357,13 +555,19 @@ pub async fn variables(session: &str) -> Result<Value> {
     let Some(slot) = KERNELS.lock().unwrap().get(session).map(|k| k.0.clone()) else { return Ok(json!({"running": false, "variables": []})) };
     let Ok(mut kernel) = slot.try_lock() else { return Ok(json!({"running": true, "busy": true, "variables": []})) };
     let Some(k) = kernel.as_mut() else { return Ok(json!({"running": false, "variables": []})) };
+    if k.busy {
+        return Ok(json!({"running": true, "busy": true, "variables": [], "python": PYTHON.get()})); // (a cell left running: the next cell sees to it)
+    }
     send(&mut k.worker, &json!({"op": "vars", "session": session}), &[]).await?;
     let (head, _) = recv(&mut k.worker).await?;
-    Ok(json!({"running": true, "busy": false, "variables": head["variables"]}))
+    Ok(json!({"running": true, "busy": false, "variables": head["variables"], "python": PYTHON.get()}))
 }
 
 /// A session ended: its worker stops (once a cell it runs is done).
-pub fn end_session(session: &str) -> bool { KERNELS.lock().unwrap().remove(session).is_some() }
+pub fn end_session(session: &str) -> bool {
+    PIDS.lock().unwrap().remove(session);
+    KERNELS.lock().unwrap().remove(session).is_some()
+}
 
 /// Sessions' workers idle for `PONDRA_SESSION_IDLE_SECS` stop; once there are none, this stops.
 async fn reap_kernels() {

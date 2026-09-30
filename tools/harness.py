@@ -1050,12 +1050,32 @@ def clients():
         and tool("r-tok", "query", sql="SELECT count(*) AS n FROM docs")["rows"] == [{"n": 3}] and tool("r-tok", "write", sql="DELETE FROM docs") is None \
         and wrote == {"rows": 1} and tool("w-tok", "write", sql="INSERT INTO docs VALUES (4, 'trucks', [0.0, 0.1, 0.9])", job="mcp-1") == {"duplicate": True} \
         and len(feed["rows"]) == 5 and any(r.get("_deleted") for r in feed["rows"]) and feed["position"] > 0
+    # Downloads (the console's, round 29): every row, not the 10,000 the console shows, in each form.
+    import io, openpyxl, pyarrow.parquet as pq
+    many = "SELECT value AS n, 'r' || value AS s, value % 2 = 0 AS even, value * 0.5 AS half FROM generate_series(1, 12345) ORDER BY n"
+    def fetch(f):
+        c = http.client.HTTPConnection("127.0.0.1", A.port, timeout=120)
+        c.request("POST", f"/sql?format={f}", many.encode(), {"authorization": "Bearer r-tok"})
+        r = c.getresponse()
+        return r.read() if r.status == 200 else b""
+    got = {f: fetch(f) for f in ("csv", "tsv", "ndjson", "parquet", "xlsx")}
+    csv_lines, tsv_lines = got["csv"].decode().splitlines(), got["tsv"].decode().splitlines()
+    nd = [json.loads(x) for x in got["ndjson"].decode().splitlines()]
+    pt = pq.read_table(io.BytesIO(got["parquet"]))
+    ws = openpyxl.load_workbook(io.BytesIO(got["xlsx"]), read_only=True).active
+    rows_x = list(ws.iter_rows(values_only=True))
+    checks["downloads: CSV, TSV, JSON lines, Parquet and Excel, every row (12,345, past the console's 10,000), read back"] = \
+        csv_lines[0] == "n,s,even,half" and len(csv_lines) == 12346 and csv_lines[1] == "1,r1,false,0.5" and tsv_lines[1] == "1\tr1\tfalse\t0.5" and len(tsv_lines) == 12346 \
+        and len(nd) == 12345 and nd[-1] == {"n": 12345, "s": "r12345", "even": False, "half": 6172.5} and pt.num_rows == 12345 and pt.column_names == ["n", "s", "even", "half"] \
+        and rows_x[0] == ("n", "s", "even", "half") and len(rows_x) == 12346 and rows_x[1] == (1, "r1", False, 0.5) and rows_x[-1] == (12345, "r12345", False, 6172.5)
+    if not checks["downloads: CSV, TSV, JSON lines, Parquet and Excel, every row (12,345, past the console's 10,000), read back"]:
+        print("downloads:", csv_lines[:2], len(csv_lines), tsv_lines[:2], len(nd), nd[-1:], pt.num_rows, rows_x[:2], len(rows_x), rows_x[-1:])
     a.kill(); b.kill()
     ok = all(checks.values())
     print(json.dumps({"clients": checks, "inbox_s": round(inbox_s, 2), "ok": ok}, indent=1))
     if not ok:
         sys.exit(1)
-    return f"SQL writes, Python client, Postgres (4 drivers), tokens, change-feed replay, attached lake, inbox ({inbox_s:.1f}s), vector search, MCP, no file access from SQL: all {len(checks)} checks pass"
+    return f"SQL writes, Python client, Postgres (4 drivers), tokens, change-feed replay, attached lake, inbox ({inbox_s:.1f}s), vector search, MCP, no file access from SQL, downloads: all {len(checks)} checks pass"
 
 
 def kafka():
@@ -1591,6 +1611,9 @@ def schemas():
     got = until(lambda: q("SELECT k, n, s FROM dbo.per_k ORDER BY k"), want, 30)
     checks["CREATE MATERIALIZED VIEW: the rows already there and those written after; WITH (window …) emits to _final; bad options refused"] = got == want and len(want) == 3 \
         and n("per_min_final") == 0 and err("CREATE MATERIALIZED VIEW m2 WITH (windw = 'w') AS SELECT k FROM t") is not None
+    # a view of a view's rows would stay empty (a view's rows aren't taken in as a table's): refused, never left empty
+    over = [err("CREATE MATERIALIZED VIEW m3 AS SELECT k FROM dbo.per_k"), err("CREATE MATERIALIZED VIEW m4 AS SELECT w FROM per_min_final")]
+    checks["a materialized view of a materialized view (or its _final) is refused, saying what to do"] = all(e and "isn't followed yet" in str(e) for e in over)
     # clients see the schemas
     with psycopg.connect(f"host=127.0.0.1 port={A.port + 10} dbname={me} user=x", autocommit=True) as c:
         spaces = {r[0] for r in c.execute("SELECT nspname FROM pg_catalog.pg_namespace").fetchall()}
@@ -3035,6 +3058,41 @@ $$""")
     ended = cell("x", one)
     checks["a session's Python cells share variables, imports and frames; another session's and a block in none don't; ending the session ends them"] = \
         shared == [[{"value": 42}], [{"value": 3}], [{"id": first}]] and all("NameError" in a for a in apart) and "NameError" in ended
+    # Stop (round 29): an interrupt ends the running cell, its variables kept; a cell whose caller
+    # stopped waiting never answers the next one.
+    three = "cells-" + uuid.uuid4().hex[:8]
+    admin = {"authorization": "Bearer a-tok"}
+    cell("y = 5", three)
+    slow = {}
+    t = threading.Thread(target=lambda: slow.setdefault("a", cell("import time\ny = 6\ntime.sleep(60)", three)))
+    t0 = time.time(); t.start(); time.sleep(1.5)
+    said = call(A.port, "POST", f"/sessions/{three}/python", b"", headers=admin)
+    t.join(30); took = time.time() - t0
+    kept = cell("y", three)
+    checks["Stop: an interrupt ends a session's running cell at once (KeyboardInterrupt), and its variables stay"] = \
+        said == {"done": "interrupted"} and "Interrupt" in str(slow.get("a")) and took < 10 and kept == [{"value": 6}]
+    h = {**admin, "x-pondra-session": three}
+    try:
+        urllib.request.urlopen(urllib.request.Request(f"http://127.0.0.1:{A.port}/sql", b"DO LANGUAGE python $$\nimport time\ntime.sleep(2)\n'late'\n$$", headers=h), timeout=0.5)
+    except Exception:
+        pass  # (the caller went away: the cell goes on)
+    after = cell("'next'", three)
+    checks["a cell its caller stopped waiting for is finished first: the next cell gets its own answer"] = after == [{"value": "next"}]
+    info = call(A.port, "GET", "/python?all=1", headers=admin)
+    checks["GET /python: the Python in use, and (?all=1) each this machine has, tried; PUT /python an admin's"] = \
+        bool(info.get("python")) and info.get("worker", {}).get("version") is not None and any(p.get("ok") for p in info.get("pythons", [])) and "401" in _raises_text(lambda: call(A.port, "PUT", "/python", b'{"path": "x"}', headers={"authorization": "Bearer w-tok", "content-type": "application/json"}))
+    try:
+        fmt = call(A.port, "POST", "/python/format", json.dumps({"code": "x=[1,2]\nif x :  print( x )\n"}).encode(), headers={**admin, "content-type": "application/json"})
+    except Exception as e:
+        fmt = str(e)
+    has = any(subprocess.run([sys.executable, "-c", f"import {m}"], capture_output=True, env={**os.environ, **env}).returncode == 0 for m in ("ruff", "black"))  # (as the node's workers see it)
+    broken_fmt = _raises_text(lambda: call(A.port, "POST", "/python/format", b'{"code": "x = (1,"}', headers={**admin, "content-type": "application/json"}))
+    checks["POST /python/format: ruff's (or black's) formatting, or how to get one; code that doesn't parse is refused, never run"] = \
+        (fmt == {"code": "x = [1, 2]\nif x:\n    print(x)\n"} if has else "pip install ruff" in str(fmt)) and broken_fmt != ""
+    if not checks["POST /python/format: ruff's (or black's) formatting, or how to get one; code that doesn't parse is refused, never run"]:
+        print("format:", fmt, "| broken:", broken_fmt, "| has:", has)
+    logged = q("SELECT args FROM pondra.runs WHERE routine = 'do' AND args LIKE '%time.sleep(60)%'")
+    checks["the run log names a DO block by its code (pondra.runs.args: language and code)"] = bool(logged) and json.loads(logged[0]["args"]).get("language") == "python"
     for n in nodes:
         n.kill()
     # a node on another address with --python and no tokens refuses to start; `pondra run` runs a file

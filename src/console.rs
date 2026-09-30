@@ -58,7 +58,8 @@ fn page_text() -> String {
         b => format!("%{b:02X}"), // (`#`, `<`, `>`, `{`, new lines: as a URL holds them)
     }).collect();
     let extensions: String = (0..extensions().len()).map(|i| format!("<script type=\"module\" src=\"/console/ext/{i}.js\"></script>\n")).collect();
-    include_str!("console/index.html")
+    let html = from_dir("index.html").map(|a| String::from_utf8_lossy(&a.body).to_string());
+    html.as_deref().unwrap_or(include_str!("console/index.html"))
         .replacen("{{favicon}}", &format!("data:image/svg+xml,{}", icon.replace('"', "'")), 1)
         .replacen("{{mark}}", MARK.trim(), 1)
         .replacen("{{version}}", env!("CARGO_PKG_VERSION"), 1)
@@ -101,6 +102,12 @@ static FILES: LazyLock<HashMap<String, Asset>> = LazyLock::new(|| {
         ("grid.js", Asset::new(lean(include_str!("console/grid.js")), JS)),
         ("notebook.js", Asset::new(lean(include_str!("console/notebook.js")), JS)),
         ("files.js", Asset::new(lean(include_str!("console/files.js")), JS)),
+        // (loaded when first shown, not with the page: its first load stays within ADR-034's budget)
+        ("chart.js", Asset::new(lean(include_str!("console/chart.js")), JS)),
+        ("plan.js", Asset::new(lean(include_str!("console/plan.js")), JS)),
+        ("more.js", Asset::new(lean(include_str!("console/more.js")), JS)),
+        ("data.js", Asset::new(lean(include_str!("console/data.js")), JS)),
+        ("more.css", Asset::new(lean(include_str!("console/more.css")), "text/css; charset=utf-8")),
         ("console.css", Asset::new(lean(&include_str!("console/console.css").replacen("/*{{colors}}*/", COLORS.trim(), 1)), "text/css; charset=utf-8")),
         ("fonts/Geist.woff2", Asset::new(&include_bytes!("../brand/fonts/Geist.woff2")[..], "font/woff2")),
         ("fonts/GeistMono.woff2", Asset::new(&include_bytes!("../brand/fonts/GeistMono.woff2")[..], "font/woff2")),
@@ -125,9 +132,24 @@ fn extensions() -> &'static [String] {
     &ALL
 }
 
+/// `PONDRA_CONSOLE_DIR`, for working on the console: its files read from there on every request
+/// (as served: lean), so a change shows on a reload, without building the binary again.
+fn from_dir(name: &str) -> Option<Asset> {
+    let dir = std::env::var_os("PONDRA_CONSOLE_DIR")?;
+    let text = std::fs::read_to_string(std::path::Path::new(&dir).join(name)).ok()?;
+    Some(match name.rsplit('.').next() {
+        Some("js") => Asset::new(lean(&text), JS),
+        Some("css") => Asset::new(lean(&text.replacen("/*{{colors}}*/", COLORS.trim(), 1)), "text/css; charset=utf-8"),
+        _ => Asset::new(text, "text/html; charset=utf-8"),
+    })
+}
+
 /// A node's console: its lake.
 pub async fn page(headers: HeaderMap) -> Response {
     static PAGE: LazyLock<Asset> = LazyLock::new(|| Asset::new(page_text(), "text/html; charset=utf-8"));
+    if std::env::var_os("PONDRA_CONSOLE_DIR").is_some() {
+        return Asset::new(page_text(), "text/html; charset=utf-8").serve(&headers);
+    }
     PAGE.serve(&headers)
 }
 
@@ -139,9 +161,54 @@ pub async fn server_page(headers: HeaderMap) -> Response {
 
 /// `GET /console/{file}`: a module, the style sheet, a font, an extension.
 pub async fn file(axum::extract::Path(name): axum::extract::Path<String>, headers: HeaderMap) -> Response {
+    if let Some(a) = (!name.contains("..") && !name.starts_with("fonts/")).then(|| from_dir(&name)).flatten() {
+        return a.serve(&headers);
+    }
     match FILES.get(&name) {
         Some(a) => a.serve(&headers),
         None => (StatusCode::NOT_FOUND, "no such file").into_response(),
+    }
+}
+
+/// Where the console's settings are kept on this machine, for every lake and every session:
+/// `PONDRA_CONFIG_DIR`, else the system's place for a program's settings (Windows `%APPDATA%`,
+/// macOS `~/Library/Application Support`, else `$XDG_CONFIG_HOME` or `~/.config`), in `pondra/`.
+fn settings_file() -> Option<std::path::PathBuf> { settings_dir().map(|d| d.join("console.json")) }
+
+/// This machine's folder for Pondra's settings (the console's, the Python chosen).
+pub fn settings_dir() -> Option<std::path::PathBuf> {
+    let var = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty()).map(std::path::PathBuf::from);
+    var("PONDRA_CONFIG_DIR").or_else(|| match () {
+        _ if cfg!(windows) => var("APPDATA").map(|d| d.join("pondra")),
+        _ if cfg!(target_os = "macos") => var("HOME").map(|d| d.join("Library/Application Support/pondra")),
+        _ => var("XDG_CONFIG_HOME").or_else(|| var("HOME").map(|d| d.join(".config"))).map(|d| d.join("pondra")),
+    })
+}
+
+/// `GET /console/settings`: the console's settings kept on this machine (`{}` if none yet): its
+/// theme, colours, fonts and layout, the same for every lake and session opened here.
+pub async fn settings() -> Response {
+    let body = settings_file().and_then(|f| std::fs::read_to_string(f).ok()).filter(|s| serde_json::from_str::<serde_json::Value>(s).is_ok()).unwrap_or_else(|| "{}".into());
+    ([("content-type", "application/json"), ("cache-control", "no-store")], body).into_response()
+}
+
+/// `PUT /console/settings`: keep them, for the page of someone on this machine (a request from
+/// another one is refused: the file is this machine's user's). At most 64 KB of JSON.
+pub async fn save_settings(axum::extract::ConnectInfo(from): axum::extract::ConnectInfo<std::net::SocketAddr>, body: bytes::Bytes) -> Response {
+    if !from.ip().is_loopback() {
+        return (StatusCode::FORBIDDEN, "the console's settings are kept by a page on this machine only").into_response();
+    }
+    if body.len() > 64 << 10 || serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(&body).is_err() {
+        return (StatusCode::BAD_REQUEST, "settings are one JSON object, at most 64 KB").into_response();
+    }
+    let Some(file) = settings_file() else { return (StatusCode::NOT_FOUND, "no place for settings on this machine (set PONDRA_CONFIG_DIR)").into_response() };
+    let wrote = file.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|_| {
+        let tmp = file.with_extension("json.tmp"); // (whole or not at all: two pages saving at once)
+        std::fs::write(&tmp, &body).and_then(|_| std::fs::rename(&tmp, &file))
+    });
+    match wrote {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{}: {e}", file.display())).into_response(),
     }
 }
 

@@ -316,3 +316,66 @@ the same day; *decided by Claude where marked*:
   the program that started the node may read: that view is left out, instead of the whole tree
   failing.
 - **Tests:** `console_check.py`, 16 new checks (78 in all).
+
+## Changed after 0.27 (round 29, 2026-09-30)
+
+The owner went through 0.26 on Windows, part by part. Built in round 29; *decided by Claude where
+marked*:
+
+- **The grid.** A selection's outline is whole (its bottom edge was missing). A header's card is
+  smaller, and hides as soon as the header is pressed. "Copy as a SQL list" takes every column
+  selected, not just the first. A header has its own right-click menu: its name (or the selected
+  columns' names), as SQL too, its values with the header, sort, filter, profile. A filter is typed:
+  how to compare (contains, starts with, =, ≠, <, ≤, >, ≥, is NULL, …) and the value; its chip opens
+  it again to change it.
+- **Copy and Download are split buttons**: a click does the usual thing (tab-separated with the
+  headers; CSV), the ▾ lists the other forms. A download is every row, not the 10,000 shown: the
+  statement runs again on the node with `?format=csv|tsv|ndjson|parquet|xlsx`. *(Decided by Claude:
+  the workbook is written by `xlsx.rs`, a zip of five XML parts, rather than a crate: a few KB of
+  code, no dependency; Excel's own limit, 1,048,575 rows, is said in the error.)*
+- **Messages** shows each statement: its SQL, its time, what it did or printed, its error.
+- **The Plan tab draws the plan**: a graph of the steps, each above what it reads, the steps that
+  move rows dashed. **Profile** runs `EXPLAIN ANALYZE` and puts each step's rows, time and share on
+  it, the costliest in red. *(Decided by Claude: DataFusion's metrics as they are, no cost model of
+  our own: they are measured, not estimated. The owner asked whether Runs should keep profiles, as
+  Snowflake's and Databricks' query histories do: they will, from the query history table of round
+  32, where every node's statements, plans and times are kept.)*
+- **Charts:** bars, lines, areas, points, a pie; by any column, of any number columns; saved as PNG
+  or SVG.
+- **Runs:** each run a line (a statement shortened, a run's number, its file), a click shows it with
+  what to do (open in a new file, put in the tab in front, copy, run again, see its plan), and a
+  right-click the same. A node's `DO` block logs its code (`pondra.runs.args`: `{"language", "code"}`),
+  so Runs names it by its first line, not "do". The clock in the top bar opens Runs, and closes it.
+- **The right pane's tabs** reorder by dragging, and Details follows the file in front.
+- **Editors** have a right-click menu: cut, copy, paste, select all, comment, run, and **Format**
+  (Shift+Alt+F) of the selection or the whole file, in SQL and Python files and in notebook cells.
+  SQL is formatted in the page; Python by the node's Python (`POST /python/format`: ruff, else
+  black). Whatever can't be formatted, or changed while it was, stays as it was. *(Decided by
+  Claude: no Python formatter in JavaScript is small enough for the budget, and ruff and black are
+  the formatters Python's users already run.)*
+- **Notebook cells:** the kind is a button with a menu (a text cell switches back); Python cells
+  that never ended on Windows: see below.
+- **Save** shows only when there is something to save, highlighted; no "not saved" text; a new file
+  gets its dot when something is typed in it.
+- **Settings** is a gear and a dialog (✕, Esc, a click outside). Light is the first theme; each
+  theme takes a background and an accent colour of the user's (the panes' shades are mixed from
+  them). **The node keeps the settings on its machine** (`GET/PUT /console/settings`,
+  `PONDRA_CONFIG_DIR` or the system's place), so every lake and session opened there has them.
+  *(Decided by Claude: a `PUT` from loopback only, so a page on another machine keeps its own in its
+  browser rather than changing the machine's; an enterprise build replaces the store, not the page.)*
+- **Python on Windows.** The likeliest cause of cells that never ended: `--python auto` waiting on
+  a Python that never answered. Now each Python found (the PATH, the `py` launcher's, Anaconda's and
+  Miniconda's and their environments) is tried at once, for `PONDRA_PYTHON_PROBE_SECS` (15) at most;
+  a new worker must say hello within `PONDRA_WORKER_START_SECS` (60), and an error carries what it
+  printed. **Choose the Python…** lists them (version, pondra, pyarrow, the pip command for one that
+  lacks them) and keeps the choice beside the settings. Stop interrupts a running cell (SIGINT: its
+  variables stay; Windows restarts Python); a cell the page stopped waiting for never holds up the
+  next one.
+- **Narrow windows:** a results panel at the right gives way (it may not take more than all but
+  160 px of its file), and below 560 and 440 px it drops the time, then the row count and the tabs'
+  words, so its buttons stay in reach.
+- **The budget.** The page's first load had grown to 76.5 KB gzipped. *(Decided by Claude:)* Runs,
+  Variables, Settings, search, choosing the Python and a table's profile moved to `more.js`, a data
+  file's editor to `data.js`, and their style to `more.css`, all loaded when first used, as
+  `chart.js` and `plan.js` are: 68.5 KB now, and each on-demand module under 8 KB, which
+  `console_check.py` measures too.

@@ -145,6 +145,10 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, mut emit: Option<Emit>, 
     let (other, source) = crate::ddl::resolve(lake, &first_table(sql)?).await?;
     ensure!(other.is_none(), "a view follows a table of this lake");
     let src: TableMeta = lake.cat.get::<TableMeta>(&table_key(&source)).await?.with_context(|| format!("no table {source}"))?.logical(); // (SQL's names: ADR-022)
+    // A view's own rows are written in the commit that derives them, not taken in as a table's
+    // are, so a view of them would stay empty: refused until chains are followed (the roadmap).
+    let upstream = source.strip_suffix("_final").unwrap_or(&source);
+    ensure!(lake.cat.get::<View>(&view_key(upstream)).await?.is_none(), "{source} is a materialized view's table, and a materialized view of one isn't followed yet: make {name} from {}'s own tables, or make it a stored view (CREATE VIEW {name} AS …), which reads {source} as it is", upstream);
     if let Some(s) = sessions {
         ensure!(emit.is_none() && join.is_none(), "a view emits windows or sessions, or joins streams: one of them");
         return create_sessions(lake, name, sql, source, &src, s).await;

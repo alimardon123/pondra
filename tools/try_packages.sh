@@ -15,6 +15,13 @@ py=$try/venv/bin/python && [ -x "$py" ] || py=$try/venv/Scripts/python.exe
 "$py" "$root/tools/package_check.py"  # (no pyarrow: rows as JSON)
 "$py" -m pip install -q pyarrow
 "$py" "$root/tools/package_check.py"
+# uv installs the same wheel, and uvx runs its `pondra` without installing it
+python -m pip install -q uv
+python -m uv venv -q "$try/uvenv"
+uvpy=$try/uvenv/bin/python && [ -x "$uvpy" ] || uvpy=$try/uvenv/Scripts/python.exe
+python -m uv pip install -q --python "$uvpy" "$root"/dist/*.whl
+"$uvpy" -c "import pondra, subprocess; print('uv:', subprocess.run([pondra.binary(), '--version'], capture_output=True, text=True, check=True).stdout.strip())"
+python -m uv tool run --from "$(ls "$root"/dist/*.whl)" pondra --version
 
 (cd "$try" && npm init -y > /dev/null &&
   npm install "$root"/dist/pondra-"$platform"-*.tgz "$root"/dist/pondra-[0-9]*.tgz &&

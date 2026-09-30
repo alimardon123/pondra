@@ -35,6 +35,10 @@ The owner's design principles, which every change must respect:
 
    Round 29 builds the budget and fixes what breaks these today: log segments named by time,
    the hourly orphan sweep's full listing, and the inbox bell (`docs/roadmap.md`, C5).
+8. **Every round leaves it better on every angle** (the owner, 2026-09-30): faster, more
+   performant, simpler, easier to use, more functional, versatile, scalable and powerful — while
+   staying lightweight and efficient. The gates hold each round to it (`logs/gates/`: speed and
+   SQL never drop), and the console's budget keeps the page light.
 
 ## Layout
 
@@ -46,7 +50,9 @@ src/      28,600 lines of Rust, one file per concern (see the table in README.md
           (files read by name: `read_*`, `CREATE EXTERNAL TABLE`) and console.rs + console/ (the
           console at /, ADR-032, ADR-034: index.html, console.css, and its modules — core.js the
           API, state and node; editor.js; grid.js; notebook.js; files.js the Workspace and the
-          file tabs; console.js the shell and `window.pondra`)
+          file tabs; console.js the shell and `window.pondra`; loaded when first used: more.js
+          (Runs, Variables, Settings, search, choosing Python), data.js (data files), chart.js,
+          plan.js and more.css), xlsx.rs (a download as an Excel workbook)
 brand/    the logo (mark.svg), colours (colors.css) and fonts (fonts/: Geist and Geist Mono, SIL
           OFL): the only copies; tools/brand_check.py
 site/     the documentation website (Starlight; ADR-030): site/STYLE.md says how pages are written,
@@ -1078,6 +1084,29 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
 165. **Data files carry no Arrow schema in their footers** (`tier::plain`): Parquet's own types only,
    so other engines' Arrow reads strings as strings, not views (PyArrow can't yet take rows of a
    `string_view`, which PyIceberg does to apply a position delete). `harness.py upserts`.
+166. **Finding Python never waits on one Python** (`python::candidates`, `probe`): every Python the
+   machine has is tried at once, each for `PONDRA_PYTHON_PROBE_SECS` at most; a worker must say
+   hello (`worker.py` `hello`) within `PONDRA_WORKER_START_SECS`, and a worker's error carries the
+   last lines it wrote. The Python chosen in the console (`PUT /python`, loopback and admin only) is
+   kept in `python.txt` beside the console's settings and tried first next time. `tools/package_check.py`
+   (`--python auto` with a Python that hangs on the PATH).
+167. **A session's worker is never out of step with its cells** (`python::ask_session`): a cell the
+   caller stopped waiting for is drained before the next one is sent (or the worker restarted, with
+   a notice, if it doesn't end); an interrupt (`POST /sessions/{id}/python`) is SIGINT, raised only
+   while a request runs (`worker.py` `_running`), so the variables stay; Windows stops the worker.
+   `harness.py procedures`.
+168. **The console's settings are the machine's** (`console::settings`, `save_settings`): read by
+   anyone, written only from loopback, one JSON object of at most 64 KB, written whole (a temporary
+   file renamed); a page on another machine keeps its own in its browser. `console_check.py` (`layout`).
+169. **A download is every row, as the file says** (`server::render`, `xlsx.rs`): `?format=csv|tsv|ndjson|
+   parquet|xlsx` runs the statement again and writes all its rows, not the 10,000 the console
+   shows; a workbook over Excel's 1,048,575 rows is refused with the way out (CSV, Parquet), never
+   cut. `harness.py clients` (each format read back: pandas, pyarrow, openpyxl).
+170. **What the page needs later loads later** (ADR-034 §7, round 29): Runs, Variables, Settings,
+   search, choosing the Python and a table's profile (`more.js`), a data file (`data.js`), charts
+   (`chart.js`), plans (`plan.js`) and their style (`more.css`) load the first time they are used,
+   through `R.helpers` (no import of `console.js`); each at most 8 KB gzipped. The first load stays
+   within 149's 70 KB. `console_check.py` (`budget`).
 
 ## Tests: run these before and after any change
 
@@ -1199,13 +1228,23 @@ Practical notes for an agent working here:
 - Node stderr goes to `/tmp/pondra-<port>-<id>.stderr`; that's where "restarting to rejoin",
   "slow tiering" and panics show up.
 
-## State of the work (2026-09-30, round 28)
+## State of the work (2026-09-30, round 29 part 1)
 
 Everything in `docs/prototype-status.md` passes on local disk and on simulated R2. The round-11
 additions (manifests, partitions, shuffles, memory limits, Arrow Flight) also ran against real
 R2; round 12's are in `logs/round12/`, round 13's in `logs/round13/`, round 14's in
 `logs/round14/`, round 15's in `logs/round15/`, round 16's in `logs/round16/`, round 17's in `logs/round17/`,
-round 18's in `logs/round18/`, round 19's in `logs/round19/`, round 20's in `logs/round20/`, round 21's in `logs/round21/`, round 22's in `logs/round22/`, round 23's in `logs/round23/`, round 24's in `logs/round24/`, round 25's in `logs/round25/`, round 26's in `logs/round26/`, round 27's in `logs/round27/` and round 28's in `logs/round28/`.
+round 18's in `logs/round18/`, round 19's in `logs/round19/`, round 20's in `logs/round20/`, round 21's in `logs/round21/`, round 22's in `logs/round22/`, round 23's in `logs/round23/`, round 24's in `logs/round24/`, round 25's in `logs/round25/`, round 26's in `logs/round26/`, round 27's in `logs/round27/`, round 28's in `logs/round28/` and round 29's in `logs/round29/`.
+
+**Round 29, part 1 (ADR-034, after 0.27): the owner's console list.** The grid's outline, header
+card and menus, typed filters, Copy and Download in every form (a download is every row:
+`?format=csv|tsv|ndjson|parquet|xlsx`, 169); Messages and Runs that say what ran (a `DO` block logs
+its code); the plan as a graph with a profile; charts to choose and save; Format for SQL and Python
+(`POST /python/format`); calmer toolbars (Save only when there is something to save); Settings as a
+dialog, light first, colours per theme, kept on the machine (168); Python found without waiting on
+a broken one, chosen in the console, interrupted by Stop, never out of step (166, 167); the first
+load back under 70 KB, the rest loaded when first used (170). The Docs workflow builds from a clean
+checkout again.
 
 **Round 28 (ADR-029 phase 2): other engines' changes as written.** Spark's `DELETE`, `UPDATE` and
 `MERGE` copy-on-write and merge-on-read, PyIceberg's `delete` and `overwrite`, through the catalog,

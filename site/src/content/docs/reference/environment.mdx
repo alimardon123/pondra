@@ -36,7 +36,9 @@ PONDRA_SECRET_KEY="$SECRET" pondra serve lake
 | Variable | Default | Meaning |
 |---|---|---|
 | `PONDRA_BIN` | the binary the package installed, or the one on `PATH` | the `pondra` executable that the Python and JavaScript clients start with `local()` |
-| `PONDRA_PYTHON` | none | the first Python that `--python auto` tries. It needs the `pondra` package and pyarrow. `auto` then tries the Pythons beside the `pondra` binary, then `python3` and `python` |
+| `PONDRA_PYTHON` | none | the first Python that `--python auto` tries. It needs the `pondra` package and pyarrow. `auto` then tries the one chosen in the [console](/pondra/start/console/#which-python), those beside the `pondra` binary, those on the `PATH`, Windows' `py` launcher's, and Anaconda's and Miniconda's (their environments too), all at once, and takes the first that works |
+| `PONDRA_PYTHON_PROBE_SECS` | `15` | how long `--python auto` (and the console's **Choose the Python…**) waits for each Python it tries. One that doesn't answer in time, such as a broken install, is passed over |
+| `PONDRA_WORKER_START_SECS` | `60` | how long a new Python worker has to start and answer. Past it, the error says so, with what the worker printed |
 
 ## Memory and disk
 
@@ -50,6 +52,7 @@ PONDRA_SECRET_KEY="$SECRET" pondra serve lake
 | `PONDRA_FILES_CACHE_MB` | `512` | the memory cache for files read from outside the lake, such as attached Delta and Iceberg tables and URLs |
 | `PONDRA_FUNCTION_CACHE_MB` | `256` | the memory for answers a function keeps with `cache = '…'` |
 | `PONDRA_TEMP_MB` | `1024` | the memory all temporary tables on a node may hold together. A change past it is refused |
+| `PONDRA_CONFIG_DIR` | `%APPDATA%\pondra` on Windows, `~/Library/Application Support/pondra` on a Mac, `~/.config/pondra` elsewhere | where a node keeps what it keeps for its machine: the console's [settings](/pondra/start/console/#settings) (`console.json`) and the Python chosen in it (`python.txt`) |
 | `PONDRA_CONSOLE_EXTENSIONS` | none | scripts the console loads after its own, separated as `PATH` is: an [extension](/pondra/start/console/#extend-it) adds sections, tabs, views of answers and actions. Served at `/console/ext/{n}.js` |
 | `PONDRA_SESSION_IDLE_SECS` | `3600` | a session idle this long ends. Its temporary tables go, and so does its [Python](/pondra/guides/functions-and-procedures/#cells-that-share-variables), with the variables its `DO LANGUAGE python` blocks made |
 | `PONDRA_DATABASE_IDLE_SECS` | `600` | serving a [folder of lakes](/pondra/guides/server/): a database's node with no connection open and no request on its way, that nothing has used for this long, and that has nothing left to tier, stops. The next query starts it again |

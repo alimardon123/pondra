@@ -1,0 +1,91 @@
+# cluster-bench.yml on 0.27.0 (e58f27a, the build workflow's binary), TPC-H SF10, 3nodes, GitHub ubuntu-24.04 runners (4 cores) over Tailscale, lake on R2; the owner's run, 2026-09-30
+# the driver's output (tools/cloud/actions/driver.py)
+50Z ##[group]Run prefix="s3://$BUCKET/bench-results/36755589989"
+ [36;1mprefix="s3://$BUCKET/bench-results/36755589989"[0m
+ [36;1muntil [ "$(aws s3 ls "$prefix/nodes/" | wc -l)" -ge "3" ]; do sleep 10; done[0m
+ [36;1mnodes=$(for i in $(seq 0 $(( 3 - 1 ))); do aws s3 cp "$prefix/nodes/$i" -; done | paste -sd, -)[0m
+ [36;1mpython3 tools/cloud/actions/driver.py --nodes "$nodes" --lake "s3://$BUCKET/bench-36755589989" \[0m
+ [36;1m  --data tpch --queries tools/bench/tpch-queries --bin ./pondra --out results.json[0m
+ [36;1maws s3 cp results.json "$prefix/results.json"[0m
+ env:
+   RESOLVED_VERSION: 1.82.0
+   TS_ARCH: amd64
+   SHA256SUM: c4ad89554f2289c6aefedc261148c5c08c6db78354ae7b3726608b8c8910cc2b
+ ##[endgroup]
+ {
+  "network": {
+   "100.74.31.94:8080": {
+    "path": "pong from pondra-36755589989-0 (100.74.31.94) via 20.169.93.22:58400 in 46ms",
+    "mb_s": 62.5
+   },
+   "100.64.174.46:8080": {
+    "path": "pong from pondra-36755589989-1 (100.64.174.46) via 20.169.68.240:56320 in 49ms",
+    "mb_s": 56.1
+   },
+   "100.77.140.42:8080": {
+    "path": "pong from pondra-36755589989-2 (100.77.140.42) via 130.131.237.136:52288 in 31ms",
+    "mb_s": 84.9
+   }
+  }
+ }
+ {"rows":5}
+ {"rows":25}
+ {"rows":100000}
+ {"rows":1500000}
+ {"rows":2000000}
+ {"rows":8000000}
+ {"rows":15000000}
+ {"rows":59986052}
+ q1   one node    2.46s  3 nodes    2.14s shuffled  (spread anyway    1.98s shuffled )  same=True  sent 0.0 MB (0.2 MB), waited 0.07 s (0.268 s)
+ q2   one node    0.34s  3 nodes    0.37s gathered  (spread anyway    0.33s gathered )  same=True  sent 0.0 MB (0.0 MB), waited 0.0 s (0.0 s)
+ q3   one node    0.94s  3 nodes    0.93s one node  (spread anyway    0.73s shuffled )  same=True  sent 0.0 MB (0.7 MB), waited 0.0 s (0.477 s)
+ q4   one node    0.63s  3 nodes    0.64s one node  (spread anyway    0.72s shuffled )  same=True  sent 0.0 MB (0.0 MB), waited 0.0 s (0.125 s)
+ q5   one node    1.36s  3 nodes    1.38s one node  (spread anyway    8.10s shuffled )  same=True  sent 0.0 MB (354.7 MB), waited 0.0 s (6.947 s)
+ q6   one node    0.59s  3 nodes    0.49s gathered  (spread anyway    0.49s gathered )  same=True  sent 0.0 MB (0.0 MB), waited 0.0 s (0.0 s)
+ q7   one node    1.20s  3 nodes    1.23s one node  (spread anyway    1.26s shuffled )  same=True  sent 0.0 MB (27.2 MB), waited 0.0 s (1.316 s)
+ q8   one node    1.33s  3 nodes    1.36s one node  (spread anyway    1.49s shuffled )  same=True  sent 0.0 MB (0.7 MB), waited 0.0 s (0.807 s)
+ q9   one node    2.07s  3 nodes    2.15s one node  (spread anyway    4.54s shuffled )  same=True  sent 0.0 MB (143.8 MB), waited 0.0 s (6.059 s)
+ q10  one node    1.46s  3 nodes    1.22s one node  (spread anyway    2.14s shuffled )  same=True  sent 0.0 MB (103.8 MB), waited 0.0 s (3.134 s)
+ q11  one node    0.26s  3 nodes    0.28s one node  (spread anyway    0.35s shuffled )  same=True  sent 0.0 MB (0.0 MB), waited 0.0 s (0.125 s)
+ q12  one node    0.88s  3 nodes    0.90s one node  (spread anyway    0.57s shuffled )  same=True  sent 0.0 MB (0.0 MB), waited 0.0 s (0.125 s)
+ q13  one node    1.16s  3 nodes    1.17s one node  (spread anyway    1.97s shuffled )  same=True  sent 0.0 MB (53.6 MB), waited 0.0 s (2.412 s)
+ q14  one node    0.61s  3 nodes    0.62s one node  (spread anyway    0.95s shuffled )  same=True  sent 0.0 MB (11.0 MB), waited 0.0 s (0.932 s)
+ q15  one node    1.14s  3 nodes    1.12s one node  (spread anyway    1.59s shuffled )  same=True  sent 0.0 MB (10.3 MB), waited 0.0 s (1.33 s)
+ q16  one node    0.94s  3 nodes    0.94s one node  (spread anyway    1.28s shuffled )  same=True  sent 0.0 MB (12.8 MB), waited 0.0 s (1.154 s)
+ q17  one node    0.77s  3 nodes    0.77s one node  (spread anyway    1.08s shuffled )  same=True  sent 0.0 MB (0.6 MB), waited 0.0 s (0.886 s)
+ q18  one node    2.01s  3 nodes    2.04s one node  (spread anyway    4.21s shuffled )  same=True  sent 0.0 MB (161.4 MB), waited 0.0 s (5.585 s)
+ q19  one node    1.07s  3 nodes    1.07s one node  (spread anyway    1.10s shuffled )  same=True  sent 0.0 MB (0.1 MB), waited 0.0 s (0.168 s)
+ q20  one node    1.11s  3 nodes    1.12s one node  (spread anyway    2.47s shuffled )  same=True  sent 0.0 MB (51.0 MB), waited 0.0 s (2.545 s)
+ q21  one node    2.52s  3 nodes    1.66s shuffled  (spread anyway    1.58s shuffled )  same=True  sent 0.1 MB (0.1 MB), waited 0.128 s (0.128 s)
+ q22  one node    0.28s  3 nodes    0.29s one node  (spread anyway    1.06s shuffled )  same=True  sent 0.0 MB (38.8 MB), waited 0.0 s (1.786 s)
+ {
+  "nodes": 3,
+  "lake": "s3://***/bench-36755589989",
+  "data": "tpch",
+  "network": {
+   "100.74.31.94:8080": {
+    "path": "pong from pondra-36755589989-0 (100.74.31.94) via 20.169.93.22:58400 in 46ms",
+    "mb_s": 62.5
+   },
+   "100.64.174.46:8080": {
+    "path": "pong from pondra-36755589989-1 (100.64.174.46) via 20.169.68.240:56320 in 49ms",
+    "mb_s": 56.1
+   },
+   "100.77.140.42:8080": {
+    "path": "pong from pondra-36755589989-2 (100.77.140.42) via 130.131.237.136:52288 in 31ms",
+    "mb_s": 84.9
+   }
+  },
+  "load_s": 172.0,
+  "settle_s": 33.6,
+  "one_node_s": 25.13,
+  "cluster_s": 23.89,
+  "forced_s": 40.0,
+  "spread": 4,
+  "forced_spread": 22,
+  "all_same": true,
+  "cpus": 4,
+  "wire_mb": 0.1,
+  "wait_s": 0.2
+ }
+ upload: ./results.json to s3://***/bench-results/36755589989/results.json

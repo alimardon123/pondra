@@ -13,6 +13,8 @@ A message is frames, each its length (4 bytes, little-endian) and its bytes: a J
   keeps for that session, in the session's namespace: what one cell makes, the next one sees.
   Answered as `call` is, or with the figures it drew (`{"kind": "images"}`: PNG, as Jupyter shows
   them). `vars`: what that namespace holds, for the console's panel.
+- `format`: Python code formatted, as ruff (or black) formats it, for the console's Format; the code
+  is only read.
 
 A failure answers `{"error": "…"}`, and the worker goes on. A body is compiled once per worker, and
 what it imports stays imported: that is why a call takes milliseconds, not a Python start.
@@ -22,6 +24,7 @@ import inspect
 import io
 import json
 import os
+import signal
 import struct
 import sys
 import traceback
@@ -30,6 +33,7 @@ _compiled = {}  # (name, body, entry, params) -> code
 _sessions = {}  # a session's namespace, kept between its cells (this worker is that session's)
 _functions = {}  # the same key -> a function's callable (its module kept: constants, helpers)
 _out = None  # the answers' channel
+_running = False  # a request is being served (an interrupt stops it; between requests it is ignored)
 
 
 def main():
@@ -39,8 +43,10 @@ def main():
     os.dup2(2, 1)  # (anything else written to standard output goes to the node's log)
     sys.stdout = Notices()
     inp = sys.stdin.buffer
+    signal.signal(signal.SIGINT, _interrupted)  # (the node's interrupt of a session's cell)
     import pyarrow  # noqa: F401 (once, now: every request needs it)
     import pondra  # noqa: F401
+    global _running
     while True:
         n = inp.read(4)
         if len(n) < 4:
@@ -48,10 +54,57 @@ def main():
         msg = json.loads(_exact(inp, struct.unpack("<I", n)[0]))
         head, parts = msg["head"], [_exact(inp, struct.unpack("<I", _exact(inp, 4))[0]) for _ in range(msg["parts"])]
         try:
-            answer, parts = {"apply": apply, "call": call, "check": check, "cell": cell, "vars": variables}[head["op"]](head, parts)
+            _running = True
+            answer, parts = {"apply": apply, "call": call, "check": check, "cell": cell, "vars": variables, "hello": hello, "format": format_code}[head["op"]](head, parts)
         except BaseException as e:  # (a routine's `sys.exit()` too: the worker stays)
             answer, parts = {"error": failure(e, head)}, []
+        finally:
+            _running = False
         send(answer, parts)
+
+
+def _interrupted(signum, frame):
+    if _running:
+        raise KeyboardInterrupt
+
+
+def hello(head, parts):
+    """The node's first word to a new worker: which Python this is (it shows in the console)."""
+    import pondra
+    return {"python": sys.executable, "version": sys.version.split()[0], "pondra": getattr(pondra, "__version__", "")}, []
+
+
+def format_code(head, parts):
+    """Python code formatted (the console's Format): as ruff formats it, else black, whichever this
+    Python has. The code is only read, never run. Why it can't be is said as it is (no type name)."""
+    import subprocess
+    code = head["code"]
+    try:
+        r = subprocess.run([sys.executable, "-m", "ruff", "format", "--stdin-filename", "code.py", "-"], input=code, capture_output=True, text=True, timeout=20)
+        if r.returncode == 0:
+            return {"code": r.stdout}, []
+        if "No module named ruff" not in r.stderr:
+            return {"error": _first_error(r.stderr) or "ruff couldn't format it"}, []
+    except FileNotFoundError:
+        pass
+    try:
+        import black
+    except ImportError:
+        return {"error": f"No formatter in this Python ({sys.executable}): pip install ruff (or black) in it"}, []
+    try:
+        return {"code": black.format_str(code, mode=black.Mode())}, []
+    except Exception as e:
+        return {"error": f"black couldn't format it: {str(e).splitlines()[0][:300]}"}, []
+
+
+def _first_error(said):
+    """ruff's reason, in one line: `error: Failed to parse code.py:2:5: Expected an expression` is
+    `it doesn't parse at line 2, column 5: Expected an expression`."""
+    import re
+    lines = [x.strip() for x in said.splitlines() if x.strip()]
+    line = next((x for x in lines if x.startswith("error")), lines[0] if lines else "")
+    m = re.search(r"code\.py:(\d+):(\d+): (.*)", line)
+    return (f"it doesn't parse at line {m[1]}, column {m[2]}: {m[3]}" if m else line.removeprefix("error: "))[:300]
 
 
 def _exact(inp, n):
@@ -169,7 +222,8 @@ def failure(e, head):
     here = f"<{head.get('name')}>"
     where = [f"  line {f.lineno}: {lines[f.lineno - 1].strip()}" for f in traceback.extract_tb(e.__traceback__) if f.filename == here and 0 < f.lineno <= len(lines)]
     traceback.print_exception(type(e), e, e.__traceback__, file=sys.stderr)  # (the whole of it: the node's log)
-    return f"{type(e).__name__}: {e}" + "".join("\n" + w for w in where[-3:])
+    said = "Interrupted" if isinstance(e, KeyboardInterrupt) else f"{type(e).__name__}: {e}"
+    return said + "".join("\n" + w for w in where[-3:])
 
 
 def check(head, _):

@@ -1,0 +1,880 @@
+upsert: 399 live keys after 12,000 random upserts/deletes, 6 compactions (s: 0.0, 0.0, 0.0, 0.0, 0.0, 0.0), 1 restart, 3,400 lookups (0 wrong) -> OK
+{
+ "before tiering, every node": true,
+ "after the first round, dealt to three nodes: deleted keys stay deleted, every node": true,
+ "…and the view keeps the UPDATE that changed a total, not a count": true
+}
+{
+ "without a secret, a URL is refused": true,
+ "…but the program that started the node reads it, with its own credentials": true,
+ "…and a path on the node's machine only for that program": true,
+ "CREATE SECRET: listed by secrets() without its values, sealed in the catalog": true,
+ "one secret a bucket: another scope in it, or the same one, refused": true,
+ "a Parquet glob, a folder, a list of files == pyarrow": true,
+ "CSV with options, TSV by extension, JSON lines": true,
+ "Hive-style folders are columns, and filter (NULL's folder too)": true,
+ "a filter skips files by their footers' ranges": true,
+ "spread over three nodes == one node, and joined with a lake table": true,
+ "CREATE TABLE … AS and INSERT … SELECT from files": true,
+ "a web server's file, with its secret": true,
+ "a file changed under its name, or one more in a folder: the next query, at once, reads them as they are now": true,
+ "refused by name: an unknown option, a compressed file, an unknown format": true,
+ "COPY … TO a Parquet file: pyarrow reads what the query gave": true,
+ "…a folder of files by PARTITION_BY, read back as one table": true,
+ "…written by every node at once, each its own share's files": true,
+ "…a lake table's files and its log tail, every node its share": true,
+ "…but an aggregate or a LIMIT, whose rows no node has alone, from one node": true,
+ "…CSV with a header and a delimiter, JSON lines": true,
+ "…a file there already is replaced": true,
+ "…from the Postgres port too": true,
+ "…to a bucket no secret covers: refused, but the node's owner may": true,
+ "…and never into a lake, not even by the node's owner": true,
+ "…needs the admin role (it writes outside the lake)": true,
+ "a node with another key can't open the secret, and says why": true,
+ "DROP SECRET: refused again": true
+}
+(Azurite not found: npm install -g azurite, or AZURITE=…/azurite-blob; the Azure half is skipped)
+{
+ "gcs: two nodes on a lake there, rows from both, tiered to Parquet, read on both": true,
+ "gcs: the leader killed, the other leads (a put-if-absent term there) with every row": true,
+ "gcs: a file beside the lake, changed under its name: read as it is now": true,
+ "gcs: COPY … TO into the lake: refused": true,
+ "gcs: COPY … TO the store with a secret, read back by its folders": true
+}
+/home/claude/pondra/tools/harness.py:4988: DeprecationWarning: key_serializer does not implement kafka.serializer.Serializer
+  out = {t.__name__: t() for t in (upsert, deal, outside, clouds, kafkas, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, found, renames, workspace, server, scale, flight, reader, crash)}
+/home/claude/pondra/tools/harness.py:4988: DeprecationWarning: value_serializer does not implement kafka.serializer.Serializer
+  out = {t.__name__: t() for t in (upsert, deal, outside, clouds, kafkas, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, found, renames, workspace, server, scale, flight, reader, crash)}
+{
+ "a Pondra node's Kafka port, SASL PLAIN from a secret: its table as a topic": true,
+ "…a wrong password: refused": true,
+ "Apache Kafka: a topic as a table == what was produced": true,
+ "…spread over three nodes (its partitions dealt) == one node": true,
+ "COPY … TO a topic: every row once, each key in Kafka's partition for it": true,
+ "SASL SCRAM-SHA-256 from a secret": true,
+ "…a wrong SCRAM password: refused": true,
+ "a view fed by a topic on three nodes, one killed, then the leader: every record once": true,
+ "…its feed kept apart from the lake's functions (`/functions` lists them)": true
+}
+tiering: 12 rounds -> files {'events': 5, 'kv': 5, 'totals': 5}, untiered rows 0, rows {'events': 1200, 'kv': {'n': 200, 'v': 2400}, 'totals': 1200} -> OK
+fence: 2nd node joined as follower=True; takeover after 6.0s; stale leader's write rejected; it rejoined as follower; rows=[{'producer': 'a', 'n': 200}, {'producer': 'b', 'n': 200}] -> OK
+insert: first={'rows': 5} retry={'duplicate': True} summary={'groups': 5, 'n': 5000} -> OK
+{"serverless": {"alone_s": 0.05, "retry": ["{\"rows\":1000}", "{\"duplicate\":true}"], "four_at_once": ["{\"rows\":1000}", "{\"rows\":1000}", "{\"rows\":1000}", "{\"rows\":1000}"], "node_start_s": 0.02, "node_leads": true, "via_node_s": 0.04, "after_leader_killed_s": 30.14, "rows": {"n": 8000, "ids": 1000}, "ok": true}}
+{
+ "clients": {
+  "no token -> 401": true,
+  "read token can't write": true,
+  "write token can't create": true,
+  "users via SQL": true,
+  "pandas / polars / list appends": true,
+  "lookup": true,
+  "change feed replay (upserts + delete)": true,
+  "psycopg 3": true,
+  "psycopg 3 binary": true,
+  "psycopg2": true,
+  "SQLAlchemy + pandas": true,
+  "asyncpg": true,
+  "wrong password refused": true,
+  "cross-lake join": true,
+  "inbox write": true,
+  "vector search (SQL + Postgres)": true,
+  "SQL can't touch the node's files": true,
+  "MCP": true,
+  "downloads: CSV, TSV, JSON lines, Parquet and Excel, every row (12,345, past the console's 10,000), read back": true
+ },
+ "inbox_s": 1.04,
+ "ok": true
+}
+/home/claude/pondra/tools/harness.py:4988: DeprecationWarning: value_serializer does not implement kafka.serializer.Serializer
+  out = {t.__name__: t() for t in (upsert, deal, outside, clouds, kafkas, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, found, renames, workspace, server, scale, flight, reader, crash)}
+%3|1790795105.653|FAIL|rdkafka#producer-10| [thrd:sasl_plaintext://127.0.0.1:9620/bootstrap]: sasl_plaintext://127.0.0.1:9620/bootstrap: SASL authentication error: wrong user name or password (after 0ms in state AUTH_REQ)
+%3|1790795105.869|FAIL|rdkafka#producer-10| [thrd:sasl_plaintext://127.0.0.1:9620/bootstrap]: sasl_plaintext://127.0.0.1:9620/bootstrap: SASL authentication error: wrong user name or password (after 0ms in state AUTH_REQ, 1 identical error(s) suppressed)
+%5|1790795108.706|PARTCNT|rdkafka#producer-11| [thrd:sasl_plaintext://127.0.0.1:9620/2111782392]: Topic events (id AAAAAAAAAAAAAAAAAAAAAA) partition count changed from 1 to 0
+%6|1790795108.715|FAIL|rdkafka#producer-11| [thrd:sasl_plaintext://127.0.0.1:9620/2111782392]: sasl_plaintext://127.0.0.1:9620/2111782392: Disconnected: connection closed by peer: receive 0 after POLLIN (after 9ms in state UP)
+{
+ "kafka": {
+  "librdkafka (5 codecs, idempotent) + kafka-python": true,
+  "a view fed by Kafka": true,
+  "exactly-once retries (idempotent producer)": true,
+  "Debezium events and tombstones": true,
+  "a payload without its schema; a delete for a table without a key refused by name": true,
+  "raw values (_value), queried as JSON": true,
+  "kafka-python consumer (upserts, deletes as tombstones)": true,
+  "an offset before the oldest segment reads from there": true,
+  "librdkafka consumer": true,
+  "consumer groups (commit, hand-over via a follower, one holder)": true,
+  "wrong password / read token refused": true
+ },
+ "librdkafka_20k_events_s": 2.23,
+ "ok": true
+}
+{
+ "alter": {
+  "old and new rows": true,
+  "the new column": true,
+  "a view over the table": true,
+  "a keyed table": true,
+  "lookup": true,
+  "IF NOT EXISTS": true,
+  "a clash is refused": true,
+  "Delta and Iceberg readers": true
+ },
+ "rows_written_during": 53700,
+ "outside_readers": {
+  "delta-rs": 53703,
+  "polars": 53703,
+  "duckdb": 53703,
+  "iceberg/pyiceberg": 53703,
+  "iceberg/polars": 53703,
+  "iceberg/duckdb": 53703
+ },
+ "ok": true
+}
+{
+ "windows": {
+  "a window closes when event time passes its end, not when the next one starts": true,
+  "each window once, final, with rows up to the lateness out of order": true,
+  "late row: in the view, not re-emitted": true,
+  "the same view asked for again changes nothing; with other options, it is refused": true
+ },
+ "ok": true
+}
+{
+ "sessions": {
+  "a session closes when the watermark passes its last row plus the gap": true,
+  "each session once, whole, with rows out of order within the lateness": true
+ },
+ "ok": true
+}
+{
+ "asof": {
+  "each trade priced as of its own time, in the stream": true,
+  "the same query ad hoc agrees, over HTTP and Postgres (described, then run)": true,
+  "what isn't an as-of join is refused": true
+ },
+ "ok": true
+}
+{
+ "sums": {
+  "sum(DOUBLE) == math.fsum, whole and per group, on every node, every time": true,
+  "and in a window over each group": true,
+  "[1e16, 1, -1e16] adds up to 1; all NULLs to NULL; overflow to infinity, not NaN": true,
+  "a sliding window takes values back out": true,
+  "integers, decimals and DISTINCT keep DataFusion's sum; FILTER works": true
+ },
+ "ok": true
+}
+/usr/local/lib/python3.11/dist-packages/adbc_driver_manager/dbapi.py:369: Warning: Cannot disable autocommit; conn will not be DB-API 2.0 compliant
+  warnings.warn(
+{
+ "schemas": {
+  "a schema must exist before its tables; CREATE SCHEMA on a follower": true,
+  "t, public.t and lake.public.t are one table; dbo.t another": true,
+  "a join across schemas": true,
+  "attached lakes: other.t, other.public.t, other.eu.t, joined with this lake's": true,
+  "names: unquoted ones are lower case; odd characters and four parts refused": true,
+  "CREATE TABLE \u2026 AS: the query's rows and columns, or the ones it names": true,
+  "INSERT INTO t (columns): the ones named, by position, the rest NULL": true,
+  "a view: the query, run over the tables as they are now; a view of a view": true,
+  "CREATE VIEW over a name in use refused; OR REPLACE replaces": true,
+  "queries over views spread, with the same answers": true,
+  "CREATE MATERIALIZED VIEW: the rows already there and those written after; WITH (window \u2026) emits to _final; bad options refused": true,
+  "a materialized view of a materialized view (or its _final) is refused, saying what to do": true,
+  "Postgres, Flight SQL (ADBC ingest into a schema) and Iceberg REST see the schemas": true,
+  "DROP refused while a view reads it; after the drop, a new table of its name is empty": true,
+  "DROP SCHEMA refused while it holds tables; CASCADE drops them all": true,
+  "FROM t is SELECT * FROM t (alone, a subquery, a view's); UPDATE on an attached lake, from any node, is its leader's": true,
+  "ATTACH 'dir' AS name on one node: every node, after a restart, pondra sql; joins and writes across; DETACH everywhere; bad ones refused": true,
+  "ATTACH of a place with no lake makes one; CREATE DATABASE makes one beside this lake, attached; twice is refused": true
+ },
+ "ok": true
+}
+{
+ "changes": {
+  "60 random INSERT/UPDATE/DELETE/MERGE on 3 nodes == the model, every node, while tiering and purging": true,
+  "an UPDATE or MERGE keeps a row's _row_id; ids are unique": true,
+  "a retried job changes rows once; `pondra sql` changes them through the leader": true,
+  "three nodes changing the same rows at once: every change counts": true,
+  "the change feed replays to the table's rows; each old version as it was": true,
+  "/watch?changes=true: an UPDATE as its old and new versions": true,
+  "Delta readers see the changes once they are tiered and purged": true,
+  "spread over three nodes == one node, over the changed tables": true,
+  "refused: a change under a view keeping a max; a view's table; a system column; a MERGE matching a row twice": true,
+  "keyed tables: UPDATE and MERGE keep a row's _row_id; MERGE inserts and deletes": true,
+  "after a restart, the same rows": true
+ },
+ "ok": true
+}
+{
+ "guard": {
+  "the same answers every way": true,
+  "a query nothing is known about stays on one node": true,
+  "over a slow network, queries that would shuffle stay on one node": true,
+  "over a fast one, they spread": true,
+  "?spread=1 spreads anyway": true,
+  "a query that ran both ways goes the faster way": true,
+  "an aggregate of a few groups is known to move little (under 1 MB)": true
+ },
+ "ok": true,
+ "learned": [
+  true
+ ],
+ "few_groups_mb": 0.0
+}
+{"files": {"passed": true, "checks": {"all rows": true, "a Parquet file per tiering round (every 10 s), not per INSERT": true, "about one object write per INSERT (\u2264 1.2, and \u2264 2 a second meanwhile)": true, "write-ahead log objects left (\u2264 30)": true, "a pondra sql INSERT's files recorded as written": true}, "secs": 0.6, "parquet_files_made": 0, "writes_per_insert": 1.0, "wal_objects_left": 2, "cli_insert": {"files": 3, "files_seen": 3}}}
+{"layouts": {"passed": true, "checks": {"every round as the model": true, "files: one day each, sorted by user": true, "lookup of a moved row": true, "delta-rs sees what Pondra sees": true}, "rounds": 10, "rows": 309, "delta_rows": 309, "pondra": {"n": 309, "s": 314895}}}
+{"clusters": {"passed": true, "checks": {"all rows": true, "row groups narrow in a and in b (each < 0.75 of the whole)": true}, "row_group_span": {"app": {"a": 0.42, "b": 0.46}, "kv": {"a": 0.42, "b": 0.46}}, "rows": {"app": 2000000, "kv": 2000000}}}
+{"copies": {"passed": true, "checks": {"COPY FROM STDIN, text and CSV": true, "COPY TO STDOUT, text": true, "COPY TO STDOUT, binary": true, "COPY TO STDOUT, csv": true, "ADBC Postgres driver (Arrow)": true, "DECIMAL as NUMERIC, text and binary": true}}}
+{"streams": {"passed": true, "checks": {"stream join: each pair once, whichever side came first": true, "sliding windows: every window, every click it covers": true}, "pairs": 203, "windows": 52}}
+{
+ "columns": {
+  "every node == the model": true,
+  "SELECT * has SQL's columns": true,
+  "spread over three nodes == one node": true,
+  "a keyed table: renamed, updated, looked up": true,
+  "the table renamed and back, its columns as they were": true,
+  "refused: a key column": true,
+  "refused: narrowing": true,
+  "refused: a column a view reads": true,
+  "refused: a partition column": true,
+  "refused: a clash": true,
+  "refused: a system column": true,
+  "Delta and Iceberg readers (by column id / physical name)": true
+ },
+ "rows": 92170,
+ "outside_readers": {
+  "duckdb/delta": [
+   92170,
+   72754245065265,
+   32250
+  ],
+  "duckdb/iceberg": [
+   92170,
+   72754245065265,
+   32250
+  ],
+  "pyiceberg": [
+   92170,
+   72754245065265,
+   32250
+  ],
+  "delta-rs": [
+   92170,
+   72754245065265,
+   32250
+  ],
+  "delta-rs pyarrow": [
+   92170,
+   72754245065265,
+   32250
+  ]
+ },
+ "expected": [
+  92170,
+  72754245065265,
+  32250
+ ],
+ "ok": true
+}
+(making views 0 on :9600)
+(making views 1 on :9601)
+(making views 0 on :9601)
+(making views 2 on :9601)
+{
+ "fills": {
+  "per_user0 == its query (:9600)": true,
+  "evens0 == its query (:9600)": true,
+  "per_user0 == its query (:9601)": true,
+  "evens0 == its query (:9601)": true,
+  "per_user1 == its query (:9600)": true,
+  "evens1 == its query (:9600)": true,
+  "per_user1 == its query (:9601)": true,
+  "evens1 == its query (:9601)": true,
+  "per_user2 == its query (:9600)": true,
+  "evens2 == its query (:9600)": true,
+  "per_user2 == its query (:9601)": true,
+  "evens2 == its query (:9601)": true
+ },
+ "rows": 161400,
+ "ok": true
+}
+{
+ "dedup": {
+  "reads == the model, both nodes": true,
+  "after compaction": true,
+  "/lookup": true,
+  "a point query": true,
+  "a late row doesn't bring a deleted key back; a newer one does": true,
+  "SELECT * leaves _deleted out": true,
+  "\u2026unless named": true,
+  "DuckDB reads the Delta copy == the model": true
+ },
+ "keys": 191,
+ "rows": 2400,
+ "ok": true
+}
+{
+ "procedures": {
+  "a macro made on a follower is used there at once": true,
+  "a macro in a query spread over three nodes == one node == the SQL written out": true,
+  "macros calling each other stop 16 deep": true,
+  "a macro can't hide SQL's own function": true,
+  "a stored view reads macros as they are now": true,
+  "a materialized view keeps them as they were made": true,
+  "a procedure's answer is its last statement's": true,
+  "its arguments are worked out once (random() is one value)": true,
+  "a reader may not CALL a procedure that writes": true,
+  "a writer may not make one": true,
+  "a CALL retried with its job writes once": true,
+  "procedures calling procedures stop 16 deep": true,
+  "a script: statements split around strings and $$ bodies": true,
+  "$name parameters (JSON values, SQL expressions)": true,
+  "a parameter with no value is an error": true,
+  "a Python procedure's frame runs here, called by a reader on a follower": true,
+  "\u2026and with its rights: it may not write for a reader": true,
+  "it writes for a writer; its lent token dies with it": true,
+  "a Python error comes back as the error": true,
+  "Python procedures calling themselves stop 16 deep": true,
+  "rows sent with a request, joined with the lake's (asked to spread: here only)": true,
+  "Postgres: a macro, a CALL": true,
+  "MCP: CALL through the write tool": true,
+  "MCP: each procedure is a tool, its parameters the tool's": true,
+  "a schema's macros": true,
+  "\u2026go with it (DROP SCHEMA \u2026 CASCADE)": true,
+  "DROP MACRO, DROP PROCEDURE": true,
+  "DO LANGUAGE python over HTTP: what it printed as notices, its last expression (a frame) as rows": true,
+  "DO over Postgres: NOTICE, tag DO (the language after the code, as Postgres allows)": true,
+  "DO LANGUAGE sql: its statements, in order": true,
+  "DO: only an admin runs one; an error at the line in its code; other languages said so": true,
+  "a session's Python cells share variables, imports and frames; another session's and a block in none don't; ending the session ends them": true,
+  "Stop: an interrupt ends a session's running cell at once (KeyboardInterrupt), and its variables stay": true,
+  "a cell its caller stopped waiting for is finished first: the next cell gets its own answer": true,
+  "GET /python: the Python in use, and (?all=1) each this machine has, tried; PUT /python an admin's": true,
+  "POST /python/format: ruff's (or black's) formatting, or how to get one; code that doesn't parse is refused, never run": true,
+  "the run log names a DO block by its code (pondra.runs.args: language and code)": true,
+  "--python without tokens only on 127.0.0.1": true,
+  "pondra run: a .sql file with parameters, on a node started for it": true
+ },
+ "ok": true
+}
+Session.login_data is deprecated and will be removed in version 2.0
+Session.login_data is deprecated and will be removed in version 2.0
+Session.login_data is deprecated and will be removed in version 2.0
+Session.login_data is deprecated and will be removed in version 2.0
+Session.login_data is deprecated and will be removed in version 2.0
+{
+ "functions": {
+  "SQL functions: $1, STRICT, typed, defaults and named arguments, a query's value": true,
+  "RETURNS TABLE and SETOF: rows as declared, on three nodes == one == written out": true,
+  "CREATE FUNCTION errors say what is wrong": true,
+  "Python functions: per row, NULLs, STRICT, vectorized, a table": true,
+  "SHOW USER FUNCTIONS: the lake's own, SQL and Python": true,
+  "a Python function anywhere a SQL one goes: GROUP BY, ORDER BY, COUNT(DISTINCT), a window": true,
+  "an IMMUTABLE function gets each distinct argument once a batch (0.6 s for 50,000 rows at 20 ms a call); a volatile one every row": true,
+  "a spread query: three nodes == one node": true,
+  "\u2026each node runs its rows through its own workers": true,
+  "a query reading a Python table function runs on one node": true,
+  "a volatile Python function isn't answered from the result cache (an IMMUTABLE one is)": true,
+  "a function has no connection to the lake": true,
+  "a batch past its time limit stops its worker, and fails with why": true,
+  "a worker killed mid-query: that query fails with why, the node and the next query go on": true,
+  "HTTP: a reader's CALL sends the mail (a secret's credentials); what it printed comes back": true,
+  "Postgres: the same CALL, its print a NOTICE": true,
+  "MCP: the procedure is a tool; its notices come with the answer": true,
+  "JavaScript: db.call, and db.notices": true,
+  "a procedure answers nothing, rows, or a frame (run on the node)": true,
+  "a CALL retried with its job: each of its writes once": true,
+  "a secret read by a procedure never shows: not in its notices, its error or the run log": true,
+  "pondra.runs: every call, its caller, arguments and outcome": true,
+  "pondra.start: a run id at once, its outcome in pondra.runs": true,
+  "procedures calling procedures take no slot of their own (two here): 16 deep, not stuck": true,
+  "@db.function / @db.procedure: the notebook's imports, helper and constant go along; SQL, frames and here agree": true,
+  "\u2026a DataFrame it uses is refused, with the fix": true,
+  "PL/Python as Postgres runs it: plpy.execute, plpy.notice": true,
+  "a warm CALL takes under 10 ms (median 2.6 ms); vectorized 17.6M rows/s, per row 5.22M rows/s": true,
+  "a task through a leader failover: each tick's writes once (11 ticks, 11 runs), and on after it (4 before)": true,
+  "idle workers are gone after PONDRA_WORKER_IDLE_SECS": true,
+  "the shell: CALL prints what the procedure printed": true
+ },
+ "ok": true
+}
+{
+ "external": {
+  "CSV: declared columns by position, typed as declared, a relative LOCATION where the node runs": true,
+  "Parquet: a folder's files, declared columns by name, one they don't hold NULL (and IS NULL finds it)": true,
+  "JSON: declared columns by name, others left out": true,
+  "a view of a folder: empty before its files; INSERT writes a new file there, from a node and from pondra sql": true,
+  "PARTITIONED BY: its keys' folders, typed as declared, made by INSERT": true,
+  "information_schema lists each as a VIEW, and not the tables of files they read": true,
+  "an existing name: refused, kept with IF NOT EXISTS, replaced with OR REPLACE": true,
+  "DROP TABLE drops it; its file stays": true,
+  "what it can't do, it says: INSERT into one file, UPDATE, Avro, gzip, no files, TEMPORARY, an option it doesn't read, INSERT into a view; others' files need the owner": true,
+  "the lake's own files read as a table by any reader, and nothing else of its folder; /objects says each object's kind": true,
+  "a lake's file is replaced by its version (If-Match); without one, or with an old one, refused (409, 412); both nodes read the new rows": true,
+  "a lake's file is deleted (and is gone from files())": true
+ },
+ "ok": true
+}
+{
+ "names": {
+  "every name in dataframe-api.md's table exists and runs (69 names)": true,
+  "SQL: parquet_scan, read_csv_auto, read_json_auto, read_ndjson, delta_scan, iceberg_scan == Pondra's names": true,
+  "Python: scan_* and read_ndjson == read_*, on the connection and the module": true,
+  "frames: sink_parquet, sink_csv, sink_ndjson, write_ndjson == write_parquet, write_csv, write_json": true,
+  "PySpark: spark.read.format('delta' | 'iceberg').load == read_delta, read_iceberg": true,
+  "Delta and Iceberg folders: made, APPEND, OVERWRITE; again without a mode refused, 'ignore' leaves it; delta-rs and PyIceberg agree": true,
+  "a folder named relatively: written and read back (read_delta, read_iceberg, delta_scan); Iceberg's location absolute, as PyIceberg reads it": true
+ },
+ "ok": true
+}
+{
+ "answers": {
+  "a second query within the lifetime calls nothing (100 calls, then 0)": true,
+  "a replaced function never reuses an old answer": true,
+  "past its lifetime, it calls again": true,
+  "a table function's rows too (by its arguments)": true,
+  "a failed call isn't kept": true,
+  "refused by name: on a SQL function, a procedure, a schedule": true,
+  "@db.function(cache=\u2026), in SQL and frames": true
+ },
+ "ok": true
+}
+Commit failed due to a concurrent update, retrying (1/4) in 108 ms
+{
+ "writes": {
+  "PyIceberg appends through a follower: the rows are the table's own (row ids), its file where it wrote it, its snapshot found by its id": true,
+  "two writers at once: the second gets 409, retries, and each append is in once": true,
+  "a commit sent twice (a retry after a lost answer) is applied once": true,
+  "a view of the table follows (in the same commit), and so does its Delta copy": true,
+  "an attached lake's table, through this lake's catalog: its leader records it": true,
+  "Pondra itself appends to another Pondra's table through its catalog": true,
+  "a keyed table takes an append as upserts": true,
+  "refused by name: files outside the table's folder": true
+ },
+ "ok": true
+}
+{
+ "adopted": {
+  "an append is the table's where it was written (no file copied), its rows with system columns from their lineage: ids distinct and in one run, one version, one time": true,
+  "it costs the node footers and a commit: under a quarter of a copy's CPU (0.01 s against 0.15 s for 1,000,000 rows)": true,
+  "other engines read the rows as written: PyIceberg and delta-rs; a filter on them skips what it can": true,
+  "spread over three nodes, the adopted rows and their ids == one node's": true,
+  "UPDATE and DELETE on adopted rows: the row keeps its id": true,
+  "a merge writes their system columns out: 8 appends' files in one, every row keeping its id and version": true,
+  "a partitioned table: its spec published (day), the writer's files one day each, and a file of two days refused by name": true,
+  "the layout published: a write order as cluster_by and back, a key as identifier fields": true,
+  "a NULL in a NOT NULL column refused by name, from the file's footer": true,
+  "renamed and dropped through the catalog": true
+ },
+ "ok": true,
+ "cpu_s": {
+  "adopted": 0.010000000000000009,
+  "copied": 0.15,
+  "rows": 1000000
+ }
+}
+{
+ "ids": {
+  "row ids from blocks of their own: 300 commits took one block, a restart the next, a bulk INSERT the one after": true,
+  "a segment of 2^24 + 10 rows of a table takes two numbers; a consumer seeking into the second reads on from there, then the next segment": true
+ },
+ "ok": true
+}
+Commit failed due to a concurrent update, retrying (1/4) in 103 ms
+{
+ "rewrites": {
+  "a DELETE from PyIceberg: a whole file dropped, part of another rewritten; Pondra, PyIceberg and delta-rs read the same rows": true,
+  "rows in a file it left alone keep their ids; the rows it rewrote get new ones (Iceberg v2: a delete and an insert)": true,
+  "the file it took out is the table's no more (its files: PyIceberg's first, and the rewrite of its second)": true,
+  "an overwrite with a filter (a delete's snapshot and an append's, one commit)": true,
+  "the stale rule: a row in the log when the writer read the table: 409 (its files written at once), and the DELETE done again takes it too": true,
+  "refused by name: a change to a table a view follows that can't take it back (no count to drop the groups it empties)": true,
+  "schema changes through the catalog: a column added, renamed, widened and dropped, each an ALTER TABLE; a required one refused": true
+ },
+ "ok": true
+}
+Commit failed due to a concurrent update, retrying (1/4) in 104 ms
+{
+ "followers": {
+  "two views follow a bulk INSERT and a PyIceberg append, its file where PyIceberg wrote it, each commit's rows its _version": true,
+  "and a PyIceberg DELETE: the adding-up view takes the rows back, the row-by-row one drops them": true,
+  "the change feed replays to the table: the bulk INSERT's and PyIceberg's rows as inserts, its DELETE's as deletes (and the rows it rewrote)": true,
+  "a Kafka consumer reads every row appended, in order, a big commit a piece at a time (and the rows a DELETE rewrote)": true,
+  "a streaming task takes a bulk INSERT's rows and PyIceberg's; a change it can't follow is refused by name": true,
+  "a stream join pairs the rows bulk INSERTs wrote on either side, each pair once": true
+ },
+ "ok": true
+}
+{
+ "transactions": {
+  "a transaction over two tables is one commit: both tables' rows, one _version, each table's view following": true,
+  "one whose second table changed since is refused (409), and changes neither table": true,
+  "a DELETE planned before Pondra merged its file, sent after: carried over to the merged file by row id; the rows as they should be, none twice, their ids kept": true,
+  "a change naming rows deleted since (and its file merged) is refused (409), the table as it was": true
+ },
+ "ok": true
+}
+{
+ "upserts": {
+  "a keyed table read by PyIceberg, DuckDB (Delta) and Polars as Pondra reads it after every tier round, before any compaction": true,
+  "another engine's append is upserts: a key there is replaced, a new one added": true,
+  "its DELETE (copy-on-write): the key gone, the file's other rows as they were": true,
+  "an equality delete on the key (Flink's kind): a delete marker, the key gone": true,
+  "the change feed replays to the table: Pondra's writes and the other engine's, as upserts and deletes": true,
+  "a table that combines each key's rows (order_by) refuses another engine's change by name": true
+ },
+ "ok": true
+}
+{
+ "live": {
+  "an answer at once, then one after each commit that changes it ([8, 11] ms), none for other tables or the same answer": true,
+  "closed: nothing runs for it on the node (/stats live_queries back to 0)": true,
+  "JavaScript: for await (const rows of db.live(sql))": true,
+  "refused by name: rows sent with it, and a write": true
+ },
+ "ok": true
+}
+{
+ "temps": {
+  "CREATE TEMP TABLE, INSERT (all columns or some), UPDATE (a row keeps its _row_id), DELETE, MERGE": true,
+  "TEMP VIEW, CTAS; a query spread over three nodes reading one runs on its node, with the same answer": true,
+  "not answered from the result cache (the same query after a change to it)": true,
+  "a temporary table shadows the lake's of its name, for its session only; DROP takes it away": true,
+  "another session doesn't see them; without a session, CREATE TEMP TABLE is refused by name": true,
+  "a lake's view over one refused; a procedure sees its caller's": true,
+  "Postgres: a connection's own, gone when it ends": true,
+  "close() ends a session; so does idleness (PONDRA_SESSION_IDLE_SECS)": true
+ },
+ "ok": true
+}
+{
+ "across": {
+  "from a follower of another lake: UPDATE, DELETE with a temporary table, MERGE from this lake's table and from a file here == the same on that lake's node": true,
+  "a retried job applies once": true,
+  "with nobody leading that lake: this node leads it for the moment it takes": true
+ },
+ "ok": true
+}
+/usr/local/lib/python3.11/dist-packages/adbc_driver_manager/dbapi.py:369: Warning: Cannot disable autocommit; conn will not be DB-API 2.0 compliant
+  warnings.warn(
+%6|1790795372.063|FAIL|rdkafka#producer-12| [thrd:127.0.0.1:9620/2111782392]: 127.0.0.1:9620/2111782392: Disconnected: connection closed by peer: receive 0 after POLLIN (after 1134ms in state UP)
+{
+ "found": {
+  "a filtered materialized view follows UPDATE and DELETE of its table": true,
+  "seq 0 refused, by HTTP and by Flight, and nothing written": true,
+  "refused at CREATE: a merge table leaving a column unmerged, an unknown WITH option, CREATE EXTERNAL TABLE": true,
+  "a value that doesn't cast is refused (INSERT \u2026 VALUES, DoPut), not stored as NULL": true,
+  "a task into a keyed table made in SQL": true,
+  "INSERT \u2026 ON CONFLICT DO NOTHING / DO UPDATE, UPDATE \u2026 FROM, DELETE \u2026 USING, TRUNCATE": true,
+  "BINARY, VARBINARY, BLOB, VARIANT and JSON columns; substr on bytes and on text (its arguments named too)": true,
+  "FROM-first with WHERE and ORDER BY; a comment before CREATE FUNCTION": true,
+  "COPY \u2026 TO STDOUT with HEADER: the header, then the rows, counted": true,
+  "TIMESTAMPTZ is an instant, shown in UTC with its zone (JSON, Postgres text and binary); TIMESTAMP has none": true,
+  "a write token's DROP TABLE is refused as a change to the lake's tables": true,
+  "PUT /files twice: refused by name, no server path; files() and file_read() with or without files/": true,
+  "async calls inside async calls (Python functions, file_read) in SELECT, WHERE, GROUP BY, INSERT \u2026 VALUES; no Python found, said so": true,
+  "a Flight function is callable as soon as it is made, and gone once dropped": true,
+  "ADBC: username/password (unpadded base64), ingest create/append/create_append/replace, table types": true,
+  "DEFAULT for a column a write leaves out (INSERT, DEFAULT, append, COPY, Flight, Kafka, bulk INSERT), each row its own": true,
+  "NOT NULL refused by name on every door (a key's columns too); a bad DEFAULT refused at CREATE; ADD COLUMN \u2026 DEFAULT refused": true,
+  "read your writes on a follower: an INSERT then a SELECT, one request or two, and an UPDATE (40 times)": true,
+  "pondra run: --url and parameters in any order; a lake and --url together refused": true,
+  "pondra sql: no lake there said so; a write makes one; files in CTAS and INSERT; errors without backtraces": true,
+  "pondra sql: NOT NULL refused, DEFAULT filled (its own writes to the log)": true,
+  "a time without seconds is a timestamp: INSERT, CAST, TIMESTAMP '\u2026', a comparison": true,
+  "information_schema: a table is a BASE TABLE, a view a VIEW": true,
+  "format=typed: decimals and integers past 2^53 exact (as text), others as numbers": true,
+  "to_timestamp(column) and to_timestamp_millis(column, format): TIMESTAMP (no zone; UTC's time for text with one), as over a literal": true,
+  "to_timestamp answers TIMESTAMP (DataFusion's, Spark's), now() TIMESTAMPTZ in UTC": true,
+  "files() after PUT /files lists the new file (never a remembered answer)": true
+ },
+ "ok": true
+}
+{
+ "renames": {
+  "rows in the log before the rename are the renamed table's": true,
+  "the follower reads it by its new name, and the old one is gone": true,
+  "a view reads by name: the new table under the old name (dbt's rename-and-replace)": true,
+  "its files, Delta and Iceberg copies stay in its folder; a new table under the old name has a folder of its own": true,
+  "ALTER VIEW \u2026 RENAME TO": true,
+  "refused by name: a taken name, a table a materialized view follows, a materialized view": true
+ },
+ "ok": true
+}
+{
+ "workspace": {
+  "a SQL file runs, its $names bound; its answer is its last statement's": true,
+  "a Python file runs with its parameters as variables, its print a notice, its last expression the answer": true,
+  "a notebook runs: the given values replace its parameters cell's, then %%sql and Python cells in turn": true,
+  "a saved notebook by name runs its newest version": true,
+  "files run files: SQL runs Python, Python runs SQL (pondra.run)": true,
+  "files running themselves stop 16 deep": true,
+  "a run retried with its job writes once": true,
+  "every door runs a file: Postgres, MCP, Python's db.run, JavaScript's db.run": true,
+  "pondra.start('run', \u2026): started, not waited for; its row says how it went": true,
+  "a task runs a file on its schedule, the run log naming the task": true,
+  "each run is a row of pondra.runs: files/<path>@<version>, its arguments, how it went": true,
+  "a writer runs SQL files, not Python ones (they need an admin, as DO does)": true,
+  "mistakes said by name: no such file, not a file that runs, a value not named, a name twice, no saved notebook, run is Pondra's": true
+ },
+ "ok": true
+}
+{
+ "server": {
+  "the folder's lakes are its databases, none running until used": true,
+  "psql and HTTP reach each database by name; no /db/ means the default (lake)": true,
+  "each database's node gets pondra serve's options (--memory-gb 1.5 here)": true,
+  "a query joins across databases (name.schema.table)": true,
+  "the console is at /": true,
+  "CREATE DATABASE makes one, DROP DATABASE drops it, folder and all; an unknown one is said so": true,
+  "idle databases stop, and start again when used": true,
+  "a database with a connection open isn't stopped, however long it is idle; closed, it stops": true,
+  "another node joins a database's cluster through the server, and writes through it": true,
+  "killed and started again, the server serves the same databases": true,
+  "--flight is refused by name (a Flight port is one lake's)": true,
+  "--lake on a folder of lakes, or --lakes on a lake, is refused and says which was meant": true,
+  "a folder holding other things isn't made a lake, and nor is this folder unless named": true,
+  "stopped, the server stops its databases' nodes": true
+ },
+ "ok": true,
+ "first_write_s": 0.1
+}
+{
+ "scale": {
+  "bad partition specs refused": true,
+  "files sealed into manifests": true,
+  "every row, every day": true,
+  "one day reads only its files": true,
+  "every file holds one day": true,
+  "three nodes: same answer": true,
+  "three nodes: a self-join on sealed files by their time ranges": true,
+  "shuffles (GROUP BY, joins, windows) = one node": true,
+  "outer, semi and anti joins, subqueries, CTEs and unions run across the nodes": true,
+  "tables that share a key meet where they are, by its ranges": true,
+  "Delta and Iceberg readers see sealed files": true,
+  "over the memory limit: aggregation, sort, join": true
+ },
+ "shuffles": {
+  "many groups": "same, shuffled",
+  "groups, no order": "same, shuffled",
+  "HAVING": "same, shuffled",
+  "string keys": "same, by ranges, gathered",
+  "DISTINCT": "same, shuffled",
+  "join, then many groups": "same, shuffled",
+  "join, filters, count": "same, gathered",
+  "join, then another key": "same, shuffled",
+  "self-join": "same, shuffled",
+  "count(DISTINCT) per group": "same, shuffled",
+  "window, PARTITION BY": "same, shuffled",
+  "window over all": "same, gathered",
+  "global aggregate": "same, gathered",
+  "a keyed table": "same, by ranges, shuffled",
+  "LEFT JOIN, unmatched rows kept": "same, gathered",
+  "small table LEFT JOIN big one": "same, shuffled",
+  "FULL JOIN": "same, shuffled",
+  "IN (a semi join)": "same, gathered",
+  "NOT EXISTS (an anti join)": "same, shuffled",
+  "NOT IN (NULLs matter)": "same, gathered",
+  "a scalar subquery": "same, shuffled",
+  "a CTE and UNION ALL": "same, gathered",
+  "a keyed table, LEFT JOIN": "same, by ranges, gathered",
+  "by key ranges: join, then groups": "same, by ranges, shuffled",
+  "by key ranges: EXISTS": "same, by ranges, gathered",
+  "by key ranges: groups of the key": "same, by ranges, gathered",
+  "by key ranges: LEFT JOIN": "same, by ranges, gathered",
+  "by key ranges: NULL keys": "same, gathered",
+  "by key ranges: grouped by a padded key": "same, by ranges, shuffled"
+ },
+ "rows": 23100,
+ "days": 139,
+ "files": {
+  "inline": 122.0,
+  "sealed": 85.0,
+  "parquet_objects": 538,
+  "one_day_scanned": 2.0
+ },
+ "outside_readers": {
+  "delta-rs": 23100,
+  "polars": 23100,
+  "duckdb": 23100,
+  "iceberg/pyiceberg": 23100,
+  "iceberg/polars": 23100,
+  "iceberg/duckdb": 23100
+ },
+ "ok": true
+}
+/usr/local/lib/python3.11/dist-packages/adbc_driver_manager/dbapi.py:369: Warning: Cannot disable autocommit; conn will not be DB-API 2.0 compliant
+  warnings.warn(
+{"time":"2026-10-01T00:10:33.485657613+05:00","level":"ERROR","msg":"FlightSQL endpoint DoGet failed","connection_id":"conn-427cc0848d4a","statement_id":"stmt-41e001b9d870","endpointIndex":0,"numEndpoints":1,"ticketBytes":78,"locations":"<empty: using default client connection>","err":"rpc error: code = Canceled desc = context canceled","elapsed":"no batches received before failure; elapsed=2.464568ms"}
+{
+ "flight": {
+  "DoPut: 10 batches acked": true,
+  "a retried stream is applied once": true,
+  "DoPut to a follower": true,
+  "a read token can't write": true,
+  "DoGet SQL": true,
+  "GetFlightInfo + DoGet": true,
+  "ListFlights": true,
+  "the log, two columns": true,
+  "the log, following": true,
+  "basic-auth handshake": true,
+  "ADBC query": true,
+  "ADBC write as a query, ingest, objects": true,
+  "every row once": true
+ },
+ "follow_ms": 5,
+ "ok": true
+}
+reader: send -> visible on a separate read-only node: p50 8 ms, p99 98 ms; after a failover, 0.6 s after the new leader's ack
+run  1: kill-9=0 injected={'after_seg_put': 0, 'after_commit': 1, 'after_parquet_put': 5} events=9000/9000 unique=9000 task_output=4500/4500 views=exact -> OK
+run  2: kill-9=2 injected={'after_seg_put': 0, 'after_commit': 0, 'after_parquet_put': 1} events=9000/9000 unique=9000 task_output=4500/4500 views=exact -> OK
+run  3: kill-9=2 injected={'after_seg_put': 0, 'after_commit': 0, 'after_parquet_put': 6} events=9000/9000 unique=9000 task_output=4500/4500 views=exact -> OK
+run  4: kill-9=1 injected={'after_seg_put': 0, 'after_commit': 0, 'after_parquet_put': 4} events=9000/9000 unique=9000 task_output=4500/4500 views=exact -> OK
+run  5: kill-9=2 injected={'after_seg_put': 0, 'after_commit': 0, 'after_parquet_put': 2} events=9000/9000 unique=9000 task_output=4500/4500 views=exact -> OK
+{
+ "events_per_s": 1200,
+ "ack_ms_p50": 251,
+ "ack_ms_p99": 256,
+ "freshness_ms_p50": 131,
+ "freshness_ms_p99": 265,
+ "freshness_samples": 47,
+ "commits_per_s": 4.0,
+ "commit_ms_p50": 2,
+ "commit_ms_p95": 3,
+ "server_cores_used": 0.07
+}
+{
+ "upsert": "12,000 random upserts/deletes with compactions and a restart match the model exactly (399 live keys)",
+ "deal": "a keyed table's and a view's first tiering round, dealt to three nodes: markers and changes kept",
+ "outside": "files outside the lake (S3, a web server, this machine), secrets: all 27 checks pass",
+ "clouds": "lakes and files on gcs (emulated): all 5 checks pass",
+ "kafkas": "other Kafka clusters in and out: all 9 checks pass",
+ "tiering": "12 rounds of writes and tiering: log drained, files bounded ({'events': 5, 'kv': 5, 'totals': 5}), every row exact",
+ "fence": "a frozen leader is replaced; when it wakes, its write is rejected (fenced) and it rejoins as a follower; nothing lost",
+ "insert": "bulk INSERT \u2026 SELECT writes Parquet directly; a retried job id is applied once",
+ "serverless": "INSERT from a process with no server: 0.05s alone, 4 at once, retries once; a node on the idle lake leads in 0.02s; via a running leader 0.04s; after the leader is killed 30.14s; 8000 rows, no duplicates",
+ "clients": "SQL writes, Python client, Postgres (4 drivers), tokens, change-feed replay, attached lake, inbox (1.0s), vector search, MCP, no file access from SQL, downloads: all 19 checks pass",
+ "kafka": "Kafka: librdkafka (5 codecs, idempotent) and kafka-python producers, exactly-once retries, Debezium, tombstones, raw values as JSON, consumers, consumer groups, SASL tokens: all 11 checks pass",
+ "alter": "ALTER TABLE ADD COLUMN under load (53,700 rows written meanwhile): old rows null, new ones set, keyed table, view, bulk and Arrow appends, 6 outside readers: all 8 checks pass",
+ "windows": "event-time windows: closed by the data's own time, each emitted once, final; rows out of order within the lateness count; late rows update the view only; a leader restart emits nothing twice",
+ "sessions": "session windows: each closed by event time, emitted once, whole; out-of-order rows within the lateness join their session; late rows inside an emitted session are left out; a leader restart emits nothing twice",
+ "asof": "point-in-time joins: each streamed trade priced as of its own time, late ones too; ad hoc queries agree; non-as-of conditions refused",
+ "sums": "sum(DOUBLE): the true sum rounded once in any order (== math.fsum), grouped, windowed, on every node; NULLs, overflow, sliding windows and other types as before",
+ "schemas": "schemas: lake.schema.table, attached lakes as catalogs, CREATE/DROP SCHEMA, DROP TABLE, CTAS, stored and materialized views in SQL from any node, spread over views, clients list schemas: all 18 checks pass",
+ "changes": "changes: 60 random changes on 3 nodes == the model, rows keep their ids, views and the change feed follow, Delta sees them purged, spread == one node: all 11 checks pass",
+ "guard": "guard: 3 queries stay on one node over a slow network and spread over a fast one, forced ones spread, the same answers: all 7 checks pass",
+ "files": {
+  "passed": true,
+  "checks": {
+   "all rows": true,
+   "a Parquet file per tiering round (every 10 s), not per INSERT": true,
+   "about one object write per INSERT (\u2264 1.2, and \u2264 2 a second meanwhile)": true,
+   "write-ahead log objects left (\u2264 30)": true,
+   "a pondra sql INSERT's files recorded as written": true
+  },
+  "secs": 0.6,
+  "parquet_files_made": 0,
+  "writes_per_insert": 1.0,
+  "wal_objects_left": 2,
+  "cli_insert": {
+   "files": 3,
+   "files_seen": 3
+  }
+ },
+ "layouts": {
+  "passed": true,
+  "checks": {
+   "every round as the model": true,
+   "files: one day each, sorted by user": true,
+   "lookup of a moved row": true,
+   "delta-rs sees what Pondra sees": true
+  },
+  "rounds": 10,
+  "rows": 309,
+  "delta_rows": 309,
+  "pondra": {
+   "n": 309,
+   "s": 314895
+  }
+ },
+ "clusters": {
+  "passed": true,
+  "checks": {
+   "all rows": true,
+   "row groups narrow in a and in b (each < 0.75 of the whole)": true
+  },
+  "row_group_span": {
+   "app": {
+    "a": 0.42,
+    "b": 0.46
+   },
+   "kv": {
+    "a": 0.42,
+    "b": 0.46
+   }
+  },
+  "rows": {
+   "app": 2000000,
+   "kv": 2000000
+  }
+ },
+ "copies": {
+  "passed": true,
+  "checks": {
+   "COPY FROM STDIN, text and CSV": true,
+   "COPY TO STDOUT, text": true,
+   "COPY TO STDOUT, binary": true,
+   "COPY TO STDOUT, csv": true,
+   "ADBC Postgres driver (Arrow)": true,
+   "DECIMAL as NUMERIC, text and binary": true
+  }
+ },
+ "streams": {
+  "passed": true,
+  "checks": {
+   "stream join: each pair once, whichever side came first": true,
+   "sliding windows: every window, every click it covers": true
+  },
+  "pairs": 203,
+  "windows": 52
+ },
+ "columns": "RENAME/DROP/ADD again/widen under streaming (92,170 rows), 3 nodes, bulk INSERT, UPDATE, a keyed table, 5 outside readers: all 12 checks pass",
+ "fills": "views filled from existing rows while 161,400 rows streamed in, made again, and through a leader restart: all 12 checks pass",
+ "dedup": "deduplication by event time: 2,400 rows out of order over 191 keys, a delete and late rows, compaction, Delta: all 8 checks pass",
+ "procedures": "macros, procedures (SQL and Python) and scripts on three nodes: all 39 checks pass",
+ "functions": "functions and procedures in SQL and Python on three nodes: all 31 checks pass",
+ "external": true,
+ "names": "names: 69 names in the docs' table run, fallbacks equal, Delta and Iceberg folders: all 7 checks pass",
+ "answers": "answers: reused within their lifetime, by definition and arguments, only after success: all 7 checks pass",
+ "writes": "writes: PyIceberg and Pondra append through the Iceberg REST catalog, once each, views following: all 8 checks pass",
+ "adopted": "adopted: other engines' appends recorded as written (0.01 s of the node's CPU against a copy's 0.15 s for 1,000,000 rows), layout published, tables made through the catalog: all 10 checks pass",
+ "ids": "ids: row ids and log places that can't wrap: all 2 checks pass",
+ "rewrites": "rewrites: other engines' copy-on-write DELETE and overwrite, the stale rule, schema changes: all 7 checks pass",
+ "followers": "followers: file commits followed as the log's rows are (views, the change feed, Kafka, tasks, a stream join): all 6 checks pass",
+ "transactions": "transactions: several tables' changes as one commit, other engines' changes carried over Pondra's merges: all 4 checks pass",
+ "upserts": "upserts: keyed tables published every round, other engines' upserts and deletes: all 6 checks pass",
+ "live": "live: answers pushed within 11 ms of a commit that changes them, nothing when closed: all 4 checks pass",
+ "temps": "temps: a session's own tables and views, every statement, on its node: all 8 checks pass",
+ "across": "across: changes to an attached lake from any node: all 3 checks pass",
+ "found": "found: what writing the docs found, fixed: all 27 checks pass",
+ "renames": "renames: ALTER TABLE | VIEW \u2026 RENAME TO, rows, files and copies kept, a follower, views by name: all 6 checks pass",
+ "workspace": "workspace: files run from every door, with parameters, logged, scheduled: all 13 checks pass",
+ "server": "server: a folder of lakes as databases over Postgres and HTTP, created, dropped, idle-stopped, joined, restarted: all 14 checks pass",
+ "scale": "scale: 23,100 rows over 139 daily partitions, 207 files (85 sealed), every file one day, a day's query reads 2 files, 3 nodes, 29 of 29 queries spread, 16 shuffled, 8 by key ranges (all equal to one node), 6 outside readers, a 50 MB memory limit: all 12 checks pass",
+ "flight": "Arrow Flight: pyarrow DoPut exactly-once (retried stream applied once, via a follower too), DoGet SQL, FlightInfo, ListFlights, the log as a columnar stream (a subscriber has each new commit in 5 ms), tokens and handshake; ADBC queries, writes, ingest and catalog: all 13 checks pass",
+ "reader": "freshness on a separate read-only node: p50 8 ms, p99 98 ms; after a failover 0.6 s",
+ "crash": "5/5 runs, 0 lost, 0 duplicated (events, streaming-task output, views); crashes survived: {'after_seg_put': 0, 'after_commit': 1, 'after_parquet_put': 18, 'kill -9': 7}",
+ "load": {
+  "events_per_s": 1200,
+  "ack_ms_p50": 251,
+  "ack_ms_p99": 256,
+  "freshness_ms_p50": 131,
+  "freshness_ms_p99": 265,
+  "freshness_samples": 47,
+  "commits_per_s": 4.0,
+  "commit_ms_p50": 2,
+  "commit_ms_p95": 3,
+  "server_cores_used": 0.07
+ }
+}
+exit 0

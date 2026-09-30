@@ -195,8 +195,8 @@ header{height:48px;display:flex;align-items:center;gap:10px;padding:0 10px 0 16p
 .cell.editing{box-shadow:0 0 0 3px color-mix(in srgb,var(--accent) 13%,transparent)}
 .bar{display:flex;align-items:center;gap:8px;min-height:36px;padding:4px 8px 0 12px;font-size:12px;color:var(--muted)}
 .bar .n{font:12px var(--mono);color:var(--faint);min-width:28px}
-.kind{border:1px solid transparent;background:transparent;border-radius:6px;font:600 12px var(--sans);padding:2px;field-sizing:content;color:var(--muted);cursor:pointer}
-.kind:hover{border-color:var(--line)}
+.kind{display:inline-flex;align-items:center;gap:3px;height:24px;border:1px solid transparent;background:transparent;border-radius:6px;font:600 12px var(--sans);padding:0 5px 0 7px;color:var(--muted);cursor:pointer}
+.kind:hover,.kind[aria-expanded=true]{border-color:var(--line);background:var(--surface);color:var(--ink)}.kind .ic{opacity:.7}
 .st{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:inline-flex;align-items:center;gap:6px}.st.bad{color:var(--err)}
 .tools{margin-left:auto;display:flex;gap:1px;opacity:0;transition:opacity .12s}
 .cell:hover .tools,.cell.sel .tools,.tools:focus-within{opacity:1}
@@ -270,13 +270,20 @@ header{height:48px;display:flex;align-items:center;gap:10px;padding:0 10px 0 16p
 .filedoc.side .grip{height:auto;width:7px;cursor:col-resize;border-top:0;border-left:1px solid var(--line)}
 .filedoc.side .grip::after{left:2px;top:50%;width:3px;height:36px;transform:translateY(-50%)}
 .filedoc.nopanel .grip,.filedoc.nopanel .panel{display:none}
+/* (at the right of a narrow file: the panel gives way, the editor keeps a little, the buttons stay in reach) */
+.filedoc.side .panel{flex-shrink:1;max-width:calc(100% - 160px);container-type:inline-size}
+.filedoc.side .pane-ed{min-width:150px}
+@container (max-width:560px){.pinfo .t,.pinfo .sum,.bar-sep{display:none}}
+@container (max-width:440px){.pinfo .n,.ptab .ic+.tl{display:none}.ptab{padding:0 8px}}
 .panel{flex:0 0 320px;min-height:0;min-width:0;display:flex;flex-direction:column;background:var(--surface)}
-.phead{display:flex;align-items:center;gap:6px;padding:0 10px 0 12px;border-bottom:1px solid var(--line);flex:none;height:36px}
-.ptabs{display:flex;gap:2px;height:100%}
+.phead{display:flex;align-items:center;gap:6px;padding:0 10px 0 12px;border-bottom:1px solid var(--line);flex:none;height:36px;min-width:0}
+/* (narrow: the tabs scroll, the buttons on the right stay in reach) */
+.ptabs{display:flex;gap:2px;height:100%;min-width:0;flex:0 1 auto;overflow-x:auto;scrollbar-width:none}.ptabs::-webkit-scrollbar{display:none}
+.phead>.grow{flex:1 1 0;min-width:4px}
 .ptab{display:flex;align-items:center;gap:6px;height:100%;padding:0 10px;border:0;background:transparent;color:var(--muted);font-size:12.5px;border-bottom:2px solid transparent;cursor:pointer;white-space:nowrap}
 .ptab:hover{color:var(--ink)}.ptab.on{color:var(--ink);font-weight:600;border-bottom-color:var(--accent)}
 .ptab .ic{color:inherit}
-.pinfo{display:flex;align-items:center;gap:8px;color:var(--muted);font-size:12px;font-variant-numeric:tabular-nums;white-space:nowrap}
+.pinfo{display:flex;align-items:center;gap:8px;color:var(--muted);font-size:12px;font-variant-numeric:tabular-nums;white-space:nowrap;flex:none}
 .pinfo .sum:not(:empty){margin-right:4px;padding-right:10px;border-right:1px solid var(--line)}
 .bar-sep{color:var(--line)}
 .pbody{flex:1;min-height:0;overflow:auto;padding:10px 12px;display:flex;flex-direction:column}
@@ -325,7 +332,7 @@ span.stmt{cursor:default}
 .gt th:hover .srt,.gt th.on .srt{opacity:1}.gt th.on .srt{color:var(--accent)}.srt:hover{background:var(--hover)}
 .gt th.hs,.gt th.hs .hn{color:var(--accent)}.gt th:hover{background:color-mix(in srgb,var(--ink) 4%,var(--head))}
 .gt td{box-shadow:var(--el,0 0 transparent),var(--er,0 0 transparent),var(--et,0 0 transparent),inset 0 var(--ebw,-1px) 0 var(--ebc,var(--line2))}
-.gt tbody tr:last-child td{--ebw:0px}
+.gt tbody tr:last-child td:not(.eb){--ebw:0px}
 .gt .i{position:sticky;left:0;z-index:0;background:var(--head);color:var(--faint);font:11px var(--mono);text-align:right;padding:0 10px;cursor:default;box-shadow:inset -1px 0 0 var(--line),inset 0 -1px 0 var(--line2)}
 .gt th.i{z-index:2;box-shadow:inset -1px 0 0 var(--line),inset 0 -1px 0 var(--line)}
 .gt td.num{text-align:right}
@@ -348,16 +355,13 @@ tr.gap td{padding:0;border:0;box-shadow:none;height:0}
 .sum{font-variant-numeric:tabular-nums}
 .chip-f{display:inline-flex;align-items:center;gap:4px;height:22px;padding:0 4px 0 8px;border-radius:999px;background:var(--accent-soft);color:var(--accent);font-size:12px}
 .chip-f .x{display:inline-flex;border:0;background:transparent;color:inherit;cursor:pointer;border-radius:50%;padding:2px}
-.hcard{position:fixed;z-index:25;width:280px;padding:11px 13px 12px;background:var(--pop);border:1px solid var(--line);border-radius:10px;box-shadow:var(--float);font-size:12.5px;pointer-events:none}
+.hcard{position:fixed;z-index:25;max-width:260px;padding:7px 10px 8px;background:var(--pop);border:1px solid var(--line);border-radius:8px;box-shadow:var(--float);font-size:12px;pointer-events:none}
 .cd-h{display:flex;align-items:center;gap:6px}.cd-h b{font-weight:600;flex:1;overflow:hidden;text-overflow:ellipsis}
 .cd-t{font:11.5px var(--mono);color:var(--muted);margin:6px 0 8px;overflow-wrap:anywhere}
-.cd-f{display:grid;grid-template-columns:1fr 1fr;gap:6px 14px;padding-top:8px;border-top:1px solid var(--line2);font-variant-numeric:tabular-nums}
-.cd-f div{display:flex;flex-direction:column}.cd-f span{color:var(--muted);font-size:11.5px}.cd-f b{font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.cd-f{display:flex;flex-wrap:wrap;gap:2px 10px;margin-top:4px;color:var(--muted);font-size:11.5px;font-variant-numeric:tabular-nums}
+.cd-f span{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%}
 .cd-n{color:var(--faint);font-size:11px;margin-top:8px}
 .chartbox{margin-top:8px}
-.chart{padding:6px 2px 2px}
-.chart svg text{font:10.5px var(--mono);fill:var(--faint)}
-.legend{display:flex;gap:14px;font-size:12px;color:var(--muted);margin-bottom:4px}.legend span{display:inline-flex;align-items:center;gap:6px}.legend i{width:10px;height:10px;border-radius:2px;display:inline-block}
 
 /* the details (and the right pane's other views) */
 .dh{display:flex;gap:10px;align-items:center;margin-bottom:12px}
@@ -385,8 +389,6 @@ tr.gap td{padding:0;border:0;box-shadow:none;height:0}
 .var .line1{display:flex;gap:8px;align-items:baseline}.var .nm{font:600 12.5px var(--mono)}.var .ty{max-width:55%}
 .var .look{font:11.5px/1.45 var(--mono);color:var(--muted);margin-top:2px;overflow-wrap:anywhere}
 .change{padding:3px 0 3px 12px;border-left:2px solid var(--warn);margin:3px 0}
-.run-item{padding:6px;border-radius:8px;cursor:pointer}.run-item:hover{background:var(--hover)}
-.run-item .line1{display:flex;gap:8px;align-items:center}.run-item .nm{font:12px var(--mono)}.run-item .sub{color:var(--faint);font-size:11.5px;margin-left:22px}
 
 /* menus, completion, dialogs, search, toasts */
 .menu,.complete{position:fixed;z-index:30;background:var(--pop);border:1px solid var(--line);border-radius:10px;box-shadow:var(--float);padding:4px;min-width:200px;font-size:13px}
@@ -407,15 +409,8 @@ dialog input:focus,dialog select:focus{outline:2px solid var(--accent);outline-o
 #tokenIn{font-family:var(--mono)}
 /* (the first button is Enter's) */
 .acts{display:flex;flex-direction:row-reverse;gap:8px;margin-top:16px}
-.setting{display:grid;grid-template-columns:130px 1fr;gap:12px;align-items:center;margin:10px 0}
-.setting label{color:var(--ink)}
 .keys{display:grid;grid-template-columns:auto 1fr;gap:6px 16px;font-size:13px;align-items:baseline;max-height:60vh;overflow:auto}
 .keys h4{grid-column:1/-1;margin:12px 0 0;font-size:12px;color:var(--muted)}
-.palette{padding:8px;max-width:620px;top:12vh;margin-top:0}
-#palIn{height:40px;font-size:14px;border:0;background:transparent;outline:none!important}
-#palList{max-height:50vh;overflow:auto;margin-top:6px;border-top:1px solid var(--line2);padding-top:6px}
-.pi{display:flex;align-items:center;gap:9px;height:32px;padding:0 10px;border-radius:7px;cursor:pointer}
-.pi.on{background:var(--sel)}.pi .meta{margin-left:auto}
 #toast{position:fixed;bottom:40px;left:50%;transform:translateX(-50%);background:var(--ink);color:var(--surface);padding:8px 14px;border-radius:9px;font-size:13px;opacity:0;transition:opacity .2s;pointer-events:none;max-width:80vw;z-index:40}
 #toast.on{opacity:.96}#toast.bad{background:var(--err);color:#fff}
 
@@ -432,3 +427,28 @@ dialog input:focus,dialog select:focus{outline:2px solid var(--accent);outline-o
   #signin{padding:0 8px}
   .docbar{padding:0 8px}
 }
+/* round 29: split buttons, the Python chip, Save when there is something to save */
+.split{display:inline-flex;align-items:center}.split>.btn:first-child{border-top-right-radius:0;border-bottom-right-radius:0}
+.split>.caret{padding:0 6px;border-top-left-radius:0;border-bottom-left-radius:0;border-left:1px solid color-mix(in srgb,var(--on-accent) 30%,transparent)}
+.split>.icon.caret{min-width:18px;padding:0 1px;margin-left:-3px}
+.btn.stopb{background:var(--err-soft);border-color:color-mix(in srgb,var(--err) 40%,var(--line));color:var(--err);font-weight:600}
+.btn.savep{border-color:var(--accent);color:var(--accent);font-weight:600}.btn.savep:hover{background:var(--accent-soft)}
+.pill.kernel{cursor:pointer}.pill.kernel .ic{opacity:.6}
+.menu .mh{padding:6px 9px 4px;font-size:11.5px;color:var(--faint);max-width:420px;overflow-wrap:anywhere}
+/* a small window (pop): runs, filters, choosing the Python; Settings */
+dialog.pop,dialog.settings{padding:0;max-width:620px}
+.pop-h{display:flex;align-items:center;gap:8px;padding:12px 12px 8px 20px;border-bottom:1px solid var(--line2)}.pop-h h3{margin:0;flex:1}
+.pop-b{padding:14px 20px 4px;max-height:65vh;overflow:auto}.pop .acts{padding:0 20px 16px}
+.pop-b .defn{max-height:40vh}
+.fform{display:grid;grid-template-columns:150px 1fr;gap:8px;align-items:center}.fform p{grid-column:1/-1}
+/* the Messages tab: each statement */
+.msgs{display:flex;flex-direction:column;gap:8px}
+.msg{border:1px solid var(--line2);border-radius:8px;background:var(--surface)}.msg.on{border-color:color-mix(in srgb,var(--accent) 50%,var(--line))}.msg.bad{border-color:color-mix(in srgb,var(--err) 40%,var(--line))}
+.msg-h{display:flex;align-items:center;gap:8px;width:100%;min-height:32px;padding:4px 10px 4px 6px;border:0;background:transparent;color:var(--ink);cursor:pointer;text-align:left;font-size:12.5px}
+.msg-h:hover{background:var(--hover)}.msg-h b{display:inline-grid;place-items:center;min-width:18px;height:18px;border-radius:5px;background:var(--hover);font-size:11px}
+.msg-h code{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font:12px var(--mono)}.msg-h .m{color:var(--muted);white-space:nowrap;font-variant-numeric:tabular-nums}
+.msg-h .ic{color:var(--ok)}.msg.bad .msg-h .ic{color:var(--err)}
+.msg>pre{margin:0;padding:6px 12px 8px 36px;max-height:220px;border-top:1px solid var(--line2)}
+.stmt .q{max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font:11.5px var(--mono)}.stmt .m{color:var(--faint)}
+/* the right pane's tabs move by dragging; the top bar's Runs shows when on */
+.rtab.drop{box-shadow:inset 2px 0 0 var(--accent)}#runsBtn.on{color:var(--accent);background:var(--accent-soft)}

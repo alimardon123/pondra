@@ -264,6 +264,7 @@ pub async fn serve(folder: String, addr: String, pg: Option<String>, default: Op
     }
     let app = Router::new()
         .route("/", get(crate::console::server_page))
+        .route("/console/settings", get(crate::console::settings).put(crate::console::save_settings))
         .route("/console/{*file}", get(crate::console::file))
         .route("/databases", get(list).post(create))
         .route("/databases/{name}", axum::routing::delete(drop_db))
@@ -280,7 +281,7 @@ pub async fn serve(folder: String, addr: String, pg: Option<String>, default: Op
     let stop = async {
         crate::stopped(false).await;
     };
-    axum::serve(listener, app).with_graceful_shutdown(stop).await?;
+    axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).with_graceful_shutdown(stop).await?;
     let nodes: Vec<Node> = server.nodes.lock().await.drain().map(|(_, n)| n).collect();
     for mut n in nodes {
         drop(n.child.stdin.take());

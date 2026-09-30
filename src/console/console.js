@@ -12,26 +12,48 @@
 //   pondra.on('pick', picked => …)                 // (and 'run', 'ran', 'refresh', 'start', 'open', 'active')
 //
 // No framework and nothing from anywhere else: the page, its modules and its fonts come from the node.
-import { h, $, fill, said, esc, store, secs, count, bytes, ago, utc, ICONS, icon, svg, typeMark, sqlType, numeric, on, emit, R, byOrder, shell, register, T, configure,
-  MODE, SESSION, S, base, call, run, rows, doBlock, ident, quote, qualified, home, fileSql, toast, menu, prompt, confirmed, VERSION, ask } from './core.js';
+import { h, $, fill, said, esc, store, count, bytes, ago, utc, ICONS, icon, svg, typeMark, sqlType, on, emit, R, byOrder, shell, register, T, configure,
+  MODE, SESSION, S, base, call, run, rows, doBlock, ident, qualified, home, fileSql, toast, menu, prompt, VERSION, ask, interruptPython } from './core.js';
 import { highlighted } from './editor.js';
-import { grid, summarize, statView, spread } from './grid.js';
+import { grid, summarize, statView } from './grid.js';
 import { Notebook, openNotebook, versions, cleanName, doneText } from './notebook.js';
-import { workspace, drawWorkspace, treeItem, upload, newFolder, FOLDER, registerFiles, SqlDoc, PythonDoc, kindOf, iconOf, download } from './files.js';
+import { workspace, drawWorkspace, treeItem, upload, newFolder, registerFiles, SqlDoc, PythonDoc, kindOf, iconOf, download } from './files.js';
 
 R.helpers = {};
 const H = R.helpers;
+// The settings (theme, colours, fonts, layout): kept on this machine by the node (`/console/settings`),
+// the same for every lake and session opened here; this browser's copy where the node can't keep them.
 const PREFS = store.json('pondra.prefs', {});
-const prefs = (k, v) => { if (v === undefined) return PREFS[k]; PREFS[k] = v; store.set('pondra.prefs', JSON.stringify(PREFS)); };
+let keeping = 0;
+const keepPrefs = () => call('/console/settings', { method: 'PUT', body: JSON.stringify(PREFS), headers: { 'content-type': 'application/json' }, root: true }).then(() => { S.prefsHere = true; }, () => { S.prefsHere = false; });
+const prefs = (k, v) => { if (v === undefined) return PREFS[k]; PREFS[k] = v; store.set('pondra.prefs', JSON.stringify(PREFS)); clearTimeout(keeping); keeping = setTimeout(() => { keeping = 0; keepPrefs(); }, 300); };
+H.prefs = prefs;
+async function machinePrefs() {
+  try {
+    const kept = await (await call('/console/settings', { root: true })).json();
+    if (Object.keys(kept).length) { Object.assign(PREFS, kept); store.set('pondra.prefs', JSON.stringify(PREFS)); S.prefsHere = true; } else if (Object.keys(PREFS).length) keepPrefs(); // (this browser's, kept for the machine from now on)
+  } catch { /* (an older node: this browser's) */ }
+}
 const narrow = () => innerWidth < 760;
 
-// ------------------------------------------------------------------ the look: theme and fonts (Settings)
+// ------------------------------------------------------------------ the look: theme, colours and fonts (Settings)
+const DARK = matchMedia('(prefers-color-scheme: dark)');
+const themeNow = () => { const t = prefs('theme') || 'light'; return t === 'system' ? (DARK.matches ? 'dark' : 'light') : t; };
+/** The surfaces from one background colour (a shade darker for the chrome, lighter for pop-ups on
+ * dark), and the accent's tints from one accent: what Settings' two colours set, per theme. */
+const TONES = ['--surface', '--chrome', '--side', '--sunk', '--head', '--line', '--line2', '--pop', '--accent', '--accent-soft', '--cellsel', '--rowsel'];
 function look() {
-  const d = document.documentElement;
-  const theme = prefs('theme') || 'system';
+  const d = document.documentElement, theme = prefs('theme') || 'light', now = themeNow(), c = prefs('colors')?.[now] || {};
   if (theme === 'system') delete d.dataset.theme; else d.dataset.theme = theme;
   d.classList.toggle('sysfont', prefs('font') === 'system');
+  for (const k of TONES) d.style.removeProperty(k);
+  const mix = (p, to) => `color-mix(in srgb, ${c.bg} ${100 - p}%, ${to})`, dk = p => mix(p, '#000'), lt = p => mix(p, '#fff');
+  const set = o => Object.entries(o).forEach(([k, v]) => d.style.setProperty(k, v));
+  if (c.bg) set(now === 'dark' ? { '--surface': c.bg, '--chrome': dk(22), '--side': dk(12), '--sunk': dk(12), '--head': lt(5), '--line': lt(12), '--line2': lt(7), '--pop': lt(6) }
+    : { '--surface': c.bg, '--chrome': dk(4), '--side': dk(2.5), '--sunk': dk(3), '--head': dk(5.5), '--line': dk(11), '--line2': dk(7.5), '--pop': c.bg });
+  if (c.accent) set({ '--accent': c.accent, '--accent-soft': `color-mix(in srgb, ${c.accent} 14%, var(--surface))`, '--cellsel': `color-mix(in srgb, ${c.accent} 12%, var(--surface))`, '--rowsel': `color-mix(in srgb, ${c.accent} 8%, var(--surface))` });
 }
+DARK.addEventListener('change', look);
 
 // ------------------------------------------------------------------ panes: left, bottom, right
 const PANE = { left: '#left', right: '#right' };
@@ -40,7 +62,7 @@ function pane(which, open) {
   if (open === undefined) open = !was;
   if (which === 'bottom') { prefs('bottom', open); S.doc?.el.classList.toggle('nopanel', !open); }
   else { $(PANE[which]).hidden = !open; if (!narrow()) prefs(which, open); if (which === 'right' && open) drawRight(); }
-  drawPanes();
+  drawPanes(); drawTop();
 }
 H.pane = pane;
 const paneOpen = which => which === 'bottom' ? prefs('bottom') !== false : !$(PANE[which]).hidden;
@@ -51,6 +73,9 @@ function drawPanes() {
   };
   $('#panes').replaceChildren(one('left', 'paneL', 'Show or hide the left pane', 'Ctrl B'), one('bottom', 'paneB', 'Show or hide the bottom panel', 'Ctrl J'), one('right', 'paneR', 'Show or hide the right pane', 'Ctrl Alt B'));
 }
+
+/** The top bar's Runs button: pressed while Runs shows; pressed again, the pane closes. */
+function drawTop() { const on = !$('#right').hidden && S.tab === 'runs'; $('#runsBtn').classList.toggle('on', on); $('#runsBtn').setAttribute('aria-pressed', String(on)); }
 
 // ------------------------------------------------------------------ views: groups on the left, tabs on the right; either moves to the other side
 const sideOf = v => prefs('sides')?.[v.id] || v.side;
@@ -66,6 +91,7 @@ const viewTitle = v => typeof v.title === 'function' ? v.title() : v.title;
 function viewMenu(e, v) {
   const tools = (v.tools || []).filter(t => !t.hidden?.() && t.menu !== false); // (a tool that opens a menu at its button is only a button)
   menu(e.currentTarget || e, [...tools.map(t => ({ label: t.title, icon: t.icon, run: t.run })), tools.length ? '-' : null,
+    sideOf(v) === 'right' ? { label: 'Move its tab left', run: () => moveTab(v.id, null, -1) } : null, sideOf(v) === 'right' ? { label: 'Move its tab right', run: () => moveTab(v.id, null, 1) } : null,
     { label: sideOf(v) === 'left' ? 'Move to the right pane' : 'Move to the left pane', icon: 'moveSide', run: () => moveView(v) },
     sideOf(v) === 'left' ? { label: folded(v) ? 'Unfold' : 'Fold', run: () => fold(v) } : null]);
 }
@@ -154,10 +180,22 @@ function divider(a, b) {
   return d;
 }
 const renderOnce = v => { if (!v.drawn) { v.drawn = true; renderView(v); } else v.box ||= h('div', { id: v.id, class: 'vbox' }); };
+/** The right pane's views, in the order their tabs were dragged into (else their own). */
+const rightViews = () => { const o = prefs('rorder') || [], at = v => { const i = o.indexOf(v.id); return i < 0 ? 99 : i; }; return R.views.filter(v => sideOf(v) === 'right').sort((a, b) => at(a) - at(b) || byOrder(a, b)); };
+/** A right-pane tab moved: before `to` (dragged onto it), or `by` one place (its menu). */
+function moveTab(id, to, by) {
+  const ids = rightViews().map(v => v.id), i = ids.indexOf(id);
+  ids.splice(i, 1);
+  ids.splice(to ? Math.max(0, ids.indexOf(to) + (by || 0)) : Math.max(0, Math.min(ids.length, i + by)), 0, id);
+  prefs('rorder', ids); drawRight();
+}
 function drawRight() {
-  const views = R.views.filter(v => sideOf(v) === 'right').sort(byOrder);
+  const views = rightViews();
   if (!views.some(v => v.id === S.tab)) S.tab = views[0]?.id;
-  const tab = v => h('button', { class: 'rtab', role: 'tab', id: 'rtab-' + v.id, tabindex: v.id === S.tab ? '0' : '-1', 'aria-selected': String(v.id === S.tab), 'aria-controls': 'rbody', onclick: () => { S.tab = v.id; drawRight(); } }, viewTitle(v));
+  const tab = v => h('button', { class: 'rtab', role: 'tab', id: 'rtab-' + v.id, tabindex: v.id === S.tab ? '0' : '-1', 'aria-selected': String(v.id === S.tab), 'aria-controls': 'rbody', draggable: 'true', title: 'Drag it to move it',
+    onclick: () => { S.tab = v.id; drawRight(); drawTop(); }, ondragstart: e => { e.dataTransfer.setData('text/x-pondra-tab', v.id); e.dataTransfer.effectAllowed = 'move'; },
+    ondragover: e => { if (e.dataTransfer.types.includes('text/x-pondra-tab')) { e.preventDefault(); e.currentTarget.classList.add('drop'); } }, ondragleave: e => e.currentTarget.classList.remove('drop'),
+    ondrop: e => { e.preventDefault(); const id = e.dataTransfer.getData('text/x-pondra-tab'); if (id && id !== v.id) moveTab(id, v.id, e.offsetX > e.currentTarget.offsetWidth / 2 ? 1 : 0); } }, viewTitle(v));
   const cur = views.find(v => v.id === S.tab);
   fill($('#rtabs'), h('div', { class: 'tlist', role: 'tablist', 'aria-label': 'The right pane' }, views.map(tab)), h('span', { class: 'grow' }), cur ? h('button', { class: 'icon sm', title: `${viewTitle(cur)}: more`, 'aria-label': `${viewTitle(cur)}: more`, onclick: e => viewMenu(e, cur) }, icon('dots')) : null);
   if (!cur || $('#right').hidden) return;
@@ -189,6 +227,7 @@ function activate(doc) {
   doc.activate?.();
   drawTabs(); toolbar(); status(); drawPanes();
   if (doc.kind === 'notebook') S.nb = doc;
+  follow(doc);
   document.title = `${doc.dirty ? '• ' : ''}${doc.title} · Pondra`;
   laterWorkspace();
   if (narrow()) pane('left', false);
@@ -458,41 +497,19 @@ async function fileDetail(f) {
   }
   return out;
 }
-H.pickFile = path => { const rel = path.replace(/^files\//, ''), nb = rel.match(/^notebooks\/([^/]+)$/); pick({ type: 'file', f: nb ? { rel, name: nb[1] + '.ipynb', notebook: true } : S.files?.find(f => f.path === 'files/' + rel) || { rel, path: 'files/' + rel } }); };
-/** A table's columns profiled where it is: one pass for every column's counts and range, then a
- * histogram or the commonest values of each (at most 24 columns). */
-async function profile(t, boxes, btn) {
-  const cols = t.columns.slice(0, 24), q = ident, simple = c => !/^(List|LargeList|FixedSizeList|Struct|Map|Binary|LargeBinary|BinaryView)|\[\]$/.test(c.d);
-  btn.disabled = true; btn.lastChild.textContent = 'Profiling…';
-  try {
-    const parts = cols.flatMap((c, i) => [`count(${q(c.n)}) AS "v${i}"`, simple(c) ? `approx_distinct(${q(c.n)}) AS "d${i}"` : `NULL AS "d${i}"`,
-      simple(c) ? `CAST(min(${q(c.n)}) AS VARCHAR) AS "lo${i}"` : `NULL AS "lo${i}"`, simple(c) ? `CAST(max(${q(c.n)}) AS VARCHAR) AS "hi${i}"` : `NULL AS "hi${i}"`]);
-    const [a] = await rows(`SELECT count(*) AS n, ${parts.join(', ')} FROM ${t.q}`);
-    const stats = cols.map((c, i) => ({ n: Number(a.n), nulls: Number(a.n) - Number(a['v' + i]), distinct: Number(a['d' + i] ?? 0), exact: false, min: a['lo' + i], max: a['hi' + i] }));
-    const showOne = i => { const box = boxes[i]?.querySelector('.ps'); if (box) box.replaceChildren(...statView(stats[i])); };
-    cols.forEach((_, i) => showOne(i));
-    let next = 0;
-    const one = async () => {
-      for (let i; (i = next++) < cols.length;) {
-        const c = cols[i], at = spread(c.d), s = stats[i];
-        if (!simple(c) || s.n === s.nulls) continue;
-        if (at && s.min != null) {
-          const lo = at(s.min), hi = at(s.max);
-          if (!Number.isFinite(lo) || !Number.isFinite(hi)) continue;
-          const x = numeric(c.d) ? `CAST(${q(c.n)} AS DOUBLE)` : `CAST(date_part('epoch', CAST(${q(c.n)} AS TIMESTAMP)) AS DOUBLE) * 1000`;
-          const b = hi === lo ? '0' : `least(19, CAST(floor((${x} - ${lo}) / ${(hi - lo) / 20}) AS BIGINT))`;
-          const hist = Array(20).fill(0);
-          for (const r of await rows(`SELECT ${b} AS b, count(*) AS n FROM ${t.q} WHERE ${q(c.n)} IS NOT NULL GROUP BY 1`)) hist[Math.max(0, Math.min(19, Number(r.b)))] += Number(r.n);
-          s.hist = hist;
-        } else if (!at) {
-          s.top = (await rows(`SELECT CAST(${q(c.n)} AS VARCHAR) AS v, count(*) AS n FROM ${t.q} WHERE ${q(c.n)} IS NOT NULL GROUP BY 1 ORDER BY 2 DESC, 1 LIMIT 5`)).map(r => ({ v: r.v, n: Number(r.n) }));
-        }
-        showOne(i);
-      }
-    };
-    await Promise.all([one(), one(), one()]);
-  } catch (e) { toast('Could not profile it: ' + e.message, true); }
-  btn.disabled = false; btn.lastChild.textContent = 'Profile';
+const filePick = path => { const rel = path.replace(/^files\//, ''), nb = rel.match(/^notebooks\/([^/]+)$/); return { type: 'file', f: nb ? { rel, name: nb[1] + '.ipynb', notebook: true } : S.files?.find(f => f.path === 'files/' + rel) || { rel, path: 'files/' + rel } }; };
+H.pickFile = path => pick(filePick(path));
+/** The details follow the tab in front (its file, or what it is while it has none), as long as
+ * they showed a file or nothing: a table picked stays until another pick. */
+function follow(doc) {
+  if (S.pick && S.pick.type !== 'file' && S.pick.type !== 'doc') return;
+  const saved = doc.kind === 'notebook' ? doc.version && (doc.plain ? doc.path : `notebooks/${doc.name}`) : doc.path;
+  S.pick = saved ? filePick(saved) : doc.kind ? { type: 'doc', doc } : null;
+  mark(); detail();
+}
+function docDetail(doc) {
+  return [head(doc.icon, doc.title, `a new ${doc.kind === 'notebook' ? 'notebook' : doc.kind === 'sql' ? 'SQL file' : doc.kind === 'python' ? 'Python file' : 'file'}, not saved yet`, 'k-' + doc.kind),
+    h('div', { class: 'acts2' }, act('save', 'Save', 'Save it in the lake (Ctrl+S)', () => doc.save())), h('p', { class: 'muted' }, 'Saved, it is kept in the lake\'s files: the Workspace lists it, and here its size and versions show.')];
 }
 /** An answer's columns, summarized from the rows it holds (a header clicked). */
 function explore(r, i, cell) { pick({ type: 'result', r, i, cell }); }
@@ -509,6 +526,13 @@ function resultDetail(p) {
   return out;
 }
 
+// The rarer parts, loaded when first used (more.js): Runs, Variables, Settings, choosing the
+// Python, a table's profile, a file run as a job.
+const more = () => import('./more.js');
+const runs = async () => (await more()).runs(), variables = async () => (await more()).variables(), settings = async () => (await more()).settings();
+const profile = async (...a) => (await more()).profile(...a), choosePython = async () => (await more()).choosePython();
+Object.assign(H, { KIND, act, facts, head, detail, drawLeft, drawViews, look, readVars, themeNow, choosePython, job: async (doc, every) => (await more()).job(doc, every), schedule: async doc => (await more()).job(doc, true) });
+
 // ------------------------------------------------------------------ this page's Python (a session's, on the node)
 function kernel(state) {
   if (state) S.py = state;
@@ -521,58 +545,29 @@ async function restart() {
   kernel('none'); S.vars = []; toast('Python restarted: its variables are gone'); if (S.tab === 'variables') detail();
 }
 H.restart = restart;
-async function readVars() { const v = await (await call(`/sessions/${SESSION}/python`)).json(); S.vars = v.variables || []; return v; }
-async function variables() {
-  let v;
-  try { v = await readVars(); } catch (e) { return [h('pre', { class: 'err' }, e.message)]; }
-  return [head('var', 'Variables', v.busy ? 'a cell is running: they show when it is done' : v.running ? `${S.vars.length} in this page's Python` : 'no Python yet: a Python cell or file starts it'),
-    h('div', { class: 'acts2' }, act('restart', 'Restart', 'Stop this page\'s Python: its variables go (its temporary tables stay)', restart), act('refresh', 'Refresh', 'Read them again', () => detail())),
-    ...S.vars.map(x => h('div', { class: 'var' }, h('div', { class: 'line1' }, h('span', { class: 'nm' }, x.name), h('span', { class: 'ty' }, x.type + (x.size ? ` · ${x.size}` : ''))), h('div', { class: 'look' }, x.look)))];
-}
-/** Runs: the node's (jobs, files run, procedures and tasks: `pondra.runs`), the schedules
- * (`pondra.tasks`), and what this page ran, newest first. */
-async function runs() {
-  let node = [], tasks = [];
-  try { node = await rows('SELECT id, routine, caller, status, started, ended, error FROM pondra.runs ORDER BY started DESC LIMIT 30'); } catch { /* (no run yet, or no rights) */ }
-  try { tasks = await rows('SELECT name, schedule, statement, next_tick FROM pondra.tasks ORDER BY name'); } catch { /* (none) */ }
-  clearTimeout(runs.again);
-  if (node.some(x => x.status === 'running')) runs.again = setTimeout(() => { if (S.tab === 'runs') detail(); }, 2000); // (until it ends)
-  const took = x => x.ended ? secs(utc(x.ended) - utc(x.started)) : 'running';
-  const fileOf = x => /^files\/.+@/.test(x.routine) ? x.routine.replace(/^files\//, '').replace(/@[^@]*$/, '') : null;
-  const nodeRun = x => h('div', { class: 'run-item', role: fileOf(x) ? 'button' : null, tabindex: fileOf(x) ? '0' : null, title: x.error || x.routine, onclick: () => fileOf(x) && openFile(fileOf(x)) },
-    h('div', { class: 'line1' }, h('span', { class: 'ic', html: svg(fileOf(x) ? iconOf(fileOf(x)) : 'play', 14) }), h('span', { class: 'nm' }, fileOf(x) || x.routine),
-      h('span', { class: 'meta ' + (x.status === 'failed' ? 'bad' : '') }, x.status === 'failed' ? 'failed' : took(x))),
-    h('div', { class: 'sub' }, `${x.caller} · ${utc(x.started).toLocaleString()}`), x.error ? h('div', { class: 'sub bad' }, x.error.split('\n')[0].slice(0, 200)) : null);
-  const task = t => h('div', { class: 'run-item', title: t.statement },
-    h('div', { class: 'line1' }, h('span', { class: 'ic', html: svg('clock', 14) }), h('span', { class: 'nm' }, t.name), h('span', { class: 'meta' }, t.schedule),
-      h('button', { class: 'icon sm', title: `Stop ${t.name}: DROP TASK`, 'aria-label': `Drop the task ${t.name}`, onclick: async () => { if (!confirmed(`Drop the task ${t.name}? It stops running.`)) return; try { await run(`DROP TASK ${ident(t.name)}`); detail(); } catch (e) { toast(e.message, true); } } }, icon('trash'))),
-    h('div', { class: 'sub' }, `${t.statement.slice(0, 120)} · next ${utc(t.next_tick).toLocaleString()}`));
-  const page = x => h('div', { class: 'run-item', role: 'button', tabindex: '0', title: x.src, onclick: () => { const d = newFile(x.kind === 'python' ? 'python' : 'sql'); d.ed.value = x.src; } },
-    h('div', { class: 'line1' }, h('span', { class: 'ic k-' + x.kind, html: svg(x.kind === 'python' ? 'filepy' : 'filesql', 14) }), h('span', { class: 'nm' }, x.src.split('\n').find(l => l.trim()) || ''), h('span', { class: 'meta ' + (x.ok ? '' : 'bad') }, x.ok ? secs(x.ms) : 'failed')),
-    h('div', { class: 'sub' }, `${x.where} · ${new Date(x.at).toLocaleTimeString()}`));
-  return [head('clock', 'Runs', 'jobs and schedules on the node, and what this page ran'),
-    h('div', { class: 'dsect' }, 'On the node'), ...node.length ? node.map(nodeRun) : [h('div', { class: 'empty' }, 'No job yet: a file\'s ⋯ runs it as one.')],
-    tasks.length ? h('div', { class: 'dsect' }, 'Schedules') : null, ...tasks.map(task),
-    h('div', { class: 'dsect' }, 'This page'), ...S.ran.length ? S.ran.map(page) : [h('div', { class: 'empty' }, 'Nothing run yet.')]];
-}
-/** A file (or a saved notebook) run on the node, not waited for (ADR-033): now, as a job
- * (`pondra.start('run', …)`), or on a schedule, as a task. What is saved runs, with the SQL file's
- * parameters as they are now; Runs shows it. */
-async function job(doc, every) {
-  if (doc.dirty && !(await doc.save())) return;
-  if (every && !(every = await prompt('Schedule', 'How often', '1 hour', 'For example 15 minutes, 1 day, or cron 0 2 * * * UTC. It runs on the node as CALL run(…), and Runs lists it.'))) return;
-  const path = doc.kind === 'notebook' ? `notebooks/${doc.name}` : doc.path, name = path.replace(/\.[^./]+$/, '').replace(/\W+/g, '_').replace(/^_+|_+$/g, '').toLowerCase() || 'job';
-  const args = quote(path) + Object.entries(doc.params?.() || {}).map(([n, v]) => `, ${ident(n)} => ${typeof v === 'string' ? quote(v) : String(v).toUpperCase()}`).join('');
-  try {
-    await run(every ? `CREATE OR REPLACE TASK ${ident(name)} SCHEDULE ${quote(every)} AS CALL run(${args})` : `SELECT pondra.start('run', ${args})`);
-    toast(every ? `Scheduled: ${name}, every ${every}` : `Started on the node: ${path}`); show('runs');
-  } catch (e) { toast(e.message, true); }
-}
-Object.assign(H, { job, schedule: doc => job(doc, true) });
+async function readVars() { const v = await (await call(`/sessions/${SESSION}/python`)).json(); S.vars = v.variables || []; if (v.python) S.pyInfo = v.python; return v; }
+/** The Python chip of a notebook's or a Python file's toolbar: whether it runs, and its menu. */
+H.pythonPill = () => {
+  const pill = h('button', { class: 'pill kernel', id: 'kernel', 'aria-haspopup': 'menu', title: 'This page\'s Python, on the node: notebooks\' cells and Python files share its variables',
+    onclick: e => menu(e.currentTarget, [S.pyInfo ? { head: `Python ${S.pyInfo.version} · ${S.pyInfo.python}` } : null,
+      S.py === 'busy' ? { label: 'Interrupt the cell running', icon: 'stop', run: interruptPython } : null,
+      { label: 'Restart Python', icon: 'restart', keys: '0 0', run: restart }, { label: 'Variables', icon: 'var', run: () => show('variables') }, '-',
+      { label: 'Choose the Python…', icon: 'settings', run: choosePython }]) });
+  const draw = () => pill.replaceChildren(h('span', { class: 'dot ' + (S.py === 'busy' ? 'busy' : S.py === 'idle' ? '' : 'idle') }), 'Python ', h('b', {}, S.py === 'none' || !S.py ? 'not started' : S.py), icon('chevd', 'ic', 12));
+  draw(); pill.draw = draw;
+  return pill;
+};
+/** A document's Run: a button, a ▾ with its other ways to run; while it runs, Stop in its place. */
+H.runButton = (busy, o, items) => busy ? h('button', { class: 'btn stopb', id: 'runBtn', title: o.stopTitle, onclick: o.stop }, icon('stop'), 'Stop')
+  : h('span', { class: 'split' }, h('button', { class: 'btn primary', id: 'runBtn', title: o.title, onclick: o.run }, icon('play'), o.label),
+    h('button', { class: 'btn primary caret', title: 'Other ways to run it', 'aria-label': 'Other ways to run it', 'aria-haspopup': 'menu', onclick: e => menu(e.currentTarget, items) }, icon('chevd', 'ic', 12)));
+/** Save, shown only when there is something to save. */
+H.saveButton = doc => doc.dirty ? h('button', { class: 'btn savep', id: 'saveBtn', title: 'Save it (Ctrl+S)', onclick: () => doc.save() }, icon('save'), 'Save') : null;
 on('ran', (who, r, what) => {
   const src = what?.src ?? who?.src ?? '';
   if (!src.trim()) return;
-  S.ran.unshift({ kind: what?.kind || who?.kind || 'sql', src, ms: r?.ms || 0, ok: r?.kind !== 'error', at: Date.now(), where: S.doc?.title || '' });
+  S.ranN = (S.ranN || 0) + 1;
+  S.ran.unshift({ id: S.ranN, kind: what?.kind || who?.kind || 'sql', src, ms: r?.ms || 0, ok: r?.kind !== 'error', at: Date.now(), where: S.doc?.title || '', rows: r?.kind === 'rows' ? r.total : null, error: r?.kind === 'error' ? r.message : null });
   S.ran.length = Math.min(S.ran.length, 100);
   if (S.tab === 'runs') detail();
   if (r?.kind === 'done' || what?.kind === 'python' || who?.kind === 'python') later(refresh);
@@ -623,44 +618,10 @@ on('saved', (doc, path) => {
   toolbar(); remember(); hashNow(); later(() => refreshViews(['workspace']));
 });
 
-// ------------------------------------------------------------------ search (Ctrl K): tables, files, commands
-function palette() {
-  const d = $('#palette'), input = $('#palIn'), list = $('#palList');
-  let items = [], on = 0;
-  const all = () => [
-    ...R.commands.size ? [...R.commands.values()].map(c => ({ kind: 'command', icon: c.icon || 'keyboard', label: c.title, note: c.keys || 'command', run: c.run })) : [],
-    ...(S.objects || []).map(t => ({ kind: 'table', icon: (KIND[t.o.kind] || KIND.table)[0], label: t.q, note: (KIND[t.o.kind] || KIND.table)[1], run: () => { pick({ type: 'object', t }); } })),
-    ...(S.files || []).filter(f => !/^files\/notebooks\/[^/]+\/[^/]+\.ipynb$/.test(f.path) && !f.path.endsWith('/' + FOLDER)).map(f => ({ kind: 'file', icon: iconOf(f.path), label: f.path.replace(/^files\//, ''), note: bytes(f.size), run: () => openFile(f.path) })),
-    ...[...new Set((S.files || []).map(f => f.path.match(/^files\/notebooks\/([^/]+)\//)?.[1]).filter(Boolean))].map(n => ({ kind: 'notebook', icon: 'notebook', label: `notebooks/${n}.ipynb`, note: 'notebook', run: () => openFile('notebooks/' + n) })),
-  ];
-  const score = (text, q) => { if (!q) return 1; let i = 0; const t = text.toLowerCase(); for (const ch of q) { i = t.indexOf(ch, i); if (i < 0) return 0; i++; } return t.includes(q) ? 2 + (t.startsWith(q) ? 1 : 0) : 1; };
-  const draw = () => {
-    const q = input.value.trim().toLowerCase();
-    items = all().map(x => ({ ...x, s: score(x.label, q) })).filter(x => x.s).sort((a, b) => b.s - a.s || a.label.length - b.label.length).slice(0, 60);
-    on = Math.min(on, Math.max(0, items.length - 1));
-    list.replaceChildren(...items.length ? items.map((x, i) => h('div', { class: 'pi' + (i === on ? ' on' : ''), role: 'option', 'aria-selected': String(i === on), onmousedown: e => { e.preventDefault(); on = i; go(); } },
-      h('span', { class: 'ic k-' + x.kind, html: svg(x.icon, 15) }), h('span', { class: 'nm' }, x.label), h('span', { class: 'meta' }, x.note))) : [h('div', { class: 'empty' }, 'Nothing matches.')]);
-    list.children[on]?.scrollIntoView({ block: 'nearest' });
-  };
-  const go = () => { const x = items[on]; d.close(); x?.run(); };
-  input.value = ''; on = 0; draw();
-  input.oninput = () => { on = 0; draw(); };
-  input.onkeydown = e => {
-    const mv = { ArrowDown: 1, ArrowUp: -1 }[e.key];
-    if (mv) { e.preventDefault(); on = (on + mv + items.length) % Math.max(1, items.length); draw(); }
-    else if (e.key === 'Enter') { e.preventDefault(); go(); }
-  };
-  d.showModal();
-}
+// ------------------------------------------------------------------ search (Ctrl K): in more.js
+const palette = async () => (await more()).palette();
 
 // ------------------------------------------------------------------ settings, sign-in, keys
-function settings() {
-  const d = $('#settingsDlg'), set = (id, v) => { $(id).value = v; };
-  set('#setTheme', prefs('theme') || 'system'); set('#setGroups', prefs('workspaceFirst') ? 'workspace' : 'data'); set('#setFont', prefs('font') || 'geist'); set('#setStatements', prefs('statements') || 'each');
-  d.onchange = () => { prefs('theme', $('#setTheme').value); prefs('workspaceFirst', $('#setGroups').value === 'workspace'); prefs('font', $('#setFont').value); prefs('statements', $('#setStatements').value); look(); drawLeft(); };
-  $('#setReset').onclick = () => { for (const k of ['sides', 'folded', 'weights', 'widths', 'left', 'right', 'bottom']) prefs(k, null); store.set('pondra.split', null); $('#left').style.width = $('#right').style.width = ''; drawViews(); pane('left', true); toast('The layout is back as it was'); };
-  d.showModal();
-}
 function signin() {
   const token = T.token();
   if (!token) return askToken('The token this node was started with (--admin-token, --write-token or --read-token)');
@@ -688,12 +649,11 @@ function drawKeys() {
   $('#keys').replaceChildren(...groups.flatMap(g => [h('h4', {}, g), ...R.keys.filter(k => k.group === g).flatMap(k => [h('span', {}, ...k.keys.split(' ').map(x => h('kbd', {}, x))), h('span', {}, k.title)])]));
 }
 function drawActions() {
+  $('#moreBtn').hidden = !R.actions.some(a => a.menu && !a.hidden?.());
   $('#actions').replaceChildren(...R.actions.filter(a => !a.menu && !a.hidden?.()).map(a => h('button', { class: a.label ? 'btn' + (a.primary ? ' primary' : '') : 'icon', id: a.id + 'Btn', title: a.title, 'aria-label': a.title, onclick: e => a.run(e) }, a.icon ? icon(a.icon) : null, a.label || null)));
 }
-function moreMenu(at) {
-  menu(at, [{ label: 'Settings…', icon: 'settings', run: settings }, '-',
-    ...R.actions.filter(a => a.menu && !a.hidden?.()).flatMap(a => [a.sep ? '-' : null, { label: a.title, icon: a.icon, keys: a.keys, run: a.run }])]);
-}
+/** The top bar's ⋯: extensions' menu actions (there only when some are). */
+function moreMenu(at) { menu(at, R.actions.filter(a => a.menu && !a.hidden?.()).flatMap(a => [a.sep ? '-' : null, { label: a.title, icon: a.icon, keys: a.keys, run: a.run }])); }
 function drawRail() {
   $('#rail').hidden = !R.nav.length;
   $('#rail').replaceChildren(...R.nav.map(n => h('button', { class: 'rb' + (S.place === n.id ? ' on' : ''), title: n.label, 'aria-label': n.label, onclick: () => { S.place = n.id; drawRail(); n.run(); }, html: `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${n.icon || ICONS.dots}</svg><span>${esc(n.label)}</span>` })));
@@ -751,17 +711,15 @@ function core() {
     { icon: 'refresh', title: 'Refresh', domId: 'refresh', run: () => refresh() }] });
   register.view({ id: 'workspace', side: 'left', order: 20, title: 'Workspace', render: box => workspace(box), tools: [
     { icon: 'plus', title: 'New: a notebook, a file or a folder', domId: 'newfile', menu: false, run: e => newMenu(e.currentTarget) }] });
-  register.view({ id: 'details', side: 'right', order: 10, title: 'Details', tree: false, render: (box, p) => p?.type === 'object' ? objectDetail(p.t) : p?.type === 'file' ? fileDetail(p.f) : p?.type === 'result' ? resultDetail(p) : summary() });
+  register.view({ id: 'details', side: 'right', order: 10, title: 'Details', tree: false, render: (box, p) => p?.type === 'object' ? objectDetail(p.t) : p?.type === 'file' ? fileDetail(p.f) : p?.type === 'result' ? resultDetail(p) : p?.type === 'doc' && S.docs.includes(p.doc) ? docDetail(p.doc) : summary() });
   register.view({ id: 'variables', side: 'right', order: 20, title: 'Variables', tree: false, render: () => variables() });
   register.view({ id: 'runs', side: 'right', order: 30, title: 'Runs', tree: false, render: () => runs() });
   registerFiles(register);
-  NEW.forEach(([id, ic, title, run], i) => { register.action({ id, order: 100 + i, menu: true, icon: ic, title, run }); register.command({ id, title, run }); });
-  register.action({ id: 'restart', order: 140, menu: true, sep: true, icon: 'restart', title: 'Restart Python', keys: '0 0', run: restart });
-  register.action({ id: 'token', order: 150, menu: true, icon: 'key', title: 'Token…', run: () => askToken('The token this node was started with') });
-  register.action({ id: 'keys', order: 160, menu: true, icon: 'keyboard', title: 'Keys', keys: '?', run: () => $('#helpDlg').showModal() });
+  NEW.forEach(([id, ic, title, run]) => register.command({ id, title, run }));
   for (const [id, title, keys, fn] of [['search', 'Search tables, files and commands', 'Ctrl K', palette], ['left', 'Show or hide the left pane', 'Ctrl B', () => pane('left')], ['bottom', 'Show or hide the bottom panel', 'Ctrl J', () => pane('bottom')],
     ['right', 'Show or hide the right pane', 'Ctrl Alt B', () => pane('right')], ['settings', 'Settings', '', settings],
-    ['restart', 'Restart Python', '', restart], ['refresh', 'Refresh the catalog', '', refresh], ['keys', 'Keys', '?', () => $('#helpDlg').showModal()]]) register.command({ id, title, keys, run: fn });
+    ['restart', 'Restart Python', '', restart], ['python', 'Choose the Python…', '', choosePython], ['token', 'Sign in with a token…', '', () => askToken('The token this node was started with')],
+    ['refresh', 'Refresh the catalog', '', refresh], ['keys', 'Keys', '?', () => $('#helpDlg').showModal()]]) register.command({ id, title, keys, run: fn });
   const cellKey = (keys, title, fn) => register.key({ keys, title, run: fn, group: 'On a cell (after Esc)' });
   for (const [keys, title] of [['Ctrl K', 'Search tables, files and commands'], ['Ctrl S', 'Save the file or notebook in front'], ['Ctrl B', 'The left pane'], ['Ctrl J', 'The bottom panel'], ['Ctrl Alt B', 'The right pane'], ['?', 'These keys']]) register.key({ keys, title, group: 'Anywhere' });
   for (const [keys, title] of [['Ctrl Enter', 'Run it (a file: what is selected, or all of it)'], ['Shift Enter', 'Run it and go to the next cell'], ['Alt Enter', 'Run it and add a cell below'], ['Ctrl Shift Enter', 'Run every cell'], ['Tab', 'Complete a name (or indent)'], ['Ctrl Space', 'Complete a name'], ['Ctrl /', 'Comment the lines out, or in'], ['Esc', 'Leave the cell: the keys below then work']]) register.key({ keys, title, group: 'In a cell or a file' });
@@ -793,6 +751,7 @@ export { pondra };
 addEventListener('beforeunload', e => { if (S.docs.some(d => d.dirty && !d.blank)) { e.preventDefault(); e.returnValue = ''; } });
 addEventListener('pagehide', () => {
   const token = T.token();
+  if (keeping) { clearTimeout(keeping); keeping = 0; T.fetch('/console/settings', { method: 'PUT', keepalive: true, body: JSON.stringify(PREFS), headers: { 'content-type': 'application/json' } }).catch(() => {}); } // (a setting changed just before the page went)
   T.fetch(base() + '/sessions/' + SESSION, { method: 'DELETE', keepalive: true, headers: { ...T.headers(), ...(token ? { authorization: 'Bearer ' + token } : {}) } }).catch(() => {}); // (the temporary tables of this page, and its Python)
 });
 let wasNarrow = narrow();
@@ -810,11 +769,12 @@ $('#main').addEventListener('pointerdown', () => { if (narrow()) { for (const w 
 async function start() {
   const hash = new URLSearchParams(location.hash.slice(1));
   if (MODE === 'lakes') S.db = hash.get('db');
-  look(); core();
+  look(); await machinePrefs(); look(); core();
   $('#search').onclick = palette;
   $('#moreBtn').onclick = e => moreMenu(e.currentTarget);
+  $('#settingsBtn').onclick = settings;
   $('#helpBtn').onclick = () => $('#helpDlg').showModal();
-  $('#runsBtn').onclick = () => show('runs');
+  $('#runsBtn').onclick = () => { if (!$('#right').hidden && S.tab === 'runs') pane('right', false); else show('runs'); };
   $('#signin').onclick = signin;
   edges();
   sides();

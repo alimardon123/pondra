@@ -402,7 +402,7 @@ async fn check(lake: &Lake, name: &str, r: &Routine) -> Result<()> {
         }
         Kind::Procedure => {}
     }
-    if r.python() && r.with.packages.is_empty() && crate::python::runs() {
+    if r.python() && r.with.packages.is_empty() && crate::python::found().await {
         // (compiled by a worker now, so a mistake is found when it's made, with its line; one
         // with packages when it is first used: they are installed then, not under the DDL lock)
         crate::python::ask(&r.with.packages, crate::python::Use::Procedure { nested: true }, j!({"op": "check", "name": name, "body": r.body, "entry": r.with.entry, "params": names(r)}), vec![], Some(std::time::Duration::from_secs(600)), &mut |_| {}).await.with_context(|| name.to_string())?;
@@ -1049,7 +1049,11 @@ async fn prepared(app: &App, name: &str, args: &[FunctionArg], who: Who) -> Resu
 
 /// Run a procedure, logged (`pondra.runs`): its statements, or its Python on a worker.
 async fn run(app: &App, name: String, r: Routine, row: RecordBatch, who: Who, job: Option<String>, id: Option<String>) -> Result<Outcome> {
-    let log = crate::runs::Run::start(app, &name, who.role, job.as_deref(), &row, id);
+    let log = match name.as_str() {
+        // (a DO block's code is what says what it was: Runs shows its first line)
+        "do" => crate::runs::Run::begin(app, &name, who.role, job.as_deref(), serde_json::json!({"language": r.language, "code": r.body}).to_string(), id),
+        _ => crate::runs::Run::start(app, &name, who.role, job.as_deref(), &row, id),
+    };
     let inner = Who { depth: who.depth + 1, ..who };
     let mut heard = vec![];
     let out = match r.python() {

@@ -140,8 +140,9 @@ back to the lake** (pass rows in as arguments, or use a procedure), a **time lim
 a worker over its memory limit (`PONDRA_WORKER_MB`, 2048) is replaced. A table function takes
 values, not another table's rows: there is no `LATERAL`. The node needs Python:
 `pondra serve --python auto` (a node from `local()` has it). `auto` looks for a Python with the `pondra`
-package and `pyarrow`. If the machine has none, a call says so: `no Python with the pondra package and
-pyarrow was found (pip install pondra pyarrow; or --python <python>)`.
+package and `pyarrow`, trying every Python the machine has at once. If none has them, a call says so,
+with each Python it tried and why it didn't work: `no Python with the pondra package and pyarrow was
+found (tried: …)`. The console's **Choose the Python…** picks one.
 </Aside>
 
 ## Functions from a notebook or a file

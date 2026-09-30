@@ -30,3 +30,4 @@ playwright==1.56.0  # (tools/console_check.py: headless Chromium; `python3 -m pl
 nbformat==5.11.1  # (the console's notebooks, read as Jupyter reads them)
 matplotlib==3.10.9  # (tools/console_check.py: a Python cell's figure, drawn as a picture)
 PyYAML==6.0.3  # (tools/docs_check.py reads the pages' frontmatter)
+openpyxl==3.1.5  # (harness.py clients: the Excel download read back as Excel's readers read it)

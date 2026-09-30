@@ -123,7 +123,10 @@ pub fn router(app: App) -> Router {
         .route("/watch/{name}", get(watch))
         .route("/live", get(crate::live::live).post(crate::live::live))
         .route("/sessions/{id}", axum::routing::delete(|Path(id): Path<String>| async move { Json(j!({"ended": crate::temp::end(&id)})) }))
-        .route("/sessions/{id}/python", get(session_python).delete(session_python))
+        .route("/sessions/{id}/python", get(session_python).delete(session_python).post(session_python))
+        .route("/python", get(list_pythons).put(choose_python))
+        .route("/python/format", post(format_python))
+        .route("/console/settings", get(crate::console::settings).put(crate::console::save_settings))
         .route("/console/{*file}", get(crate::console::file))
         .route("/functions", get(list_functions))
         .route("/routines", get(|State(app): State<App>| async move { Ok::<_, E>(Json(j!(*crate::routines::listed(&app.lake).await?))) }))
@@ -235,8 +238,40 @@ async fn session_python(method: axum::http::Method, Path(id): Path<String>, role
     }
     Ok(Json(match method {
         axum::http::Method::DELETE => j!({"restarted": crate::python::end_session(&id)}),
+        axum::http::Method::POST => j!({"done": crate::python::interrupt(&id)}), // (interrupt its running cell)
         _ => crate::python::variables(&id).await?,
     }))
+}
+
+/// `GET /python`: the Python in use, and (`?all=1`) each Python this machine has, tried: the
+/// console's Choose Python. An admin's, as Python is.
+async fn list_pythons(Query(q): Query<HashMap<String, String>>, role: axum::Extension<crate::auth::Role>) -> Result<Json<Value>, E> {
+    if *role < crate::auth::Role::Admin {
+        return Err(E(anyhow::anyhow!("which Python runs is an admin's, as DO is")));
+    }
+    let mut v = crate::python::current();
+    if q.contains_key("all") {
+        v["pythons"] = j!(crate::python::pythons().await);
+    }
+    Ok(Json(v))
+}
+
+/// `PUT /python` `{"path": …}`: run workers with that Python from now on (and next time: kept on
+/// this machine). From a page on this machine only, an admin's.
+async fn choose_python(axum::extract::ConnectInfo(from): axum::extract::ConnectInfo<std::net::SocketAddr>, role: axum::Extension<crate::auth::Role>, Json(b): Json<Value>) -> Result<Json<Value>, E> {
+    if *role < crate::auth::Role::Admin || !from.ip().is_loopback() {
+        return Err(E(anyhow::anyhow!("which Python runs is chosen by an admin, on this machine")));
+    }
+    Ok(Json(crate::python::choose(b["path"].as_str().unwrap_or_default()).await?))
+}
+
+/// `POST /python/format` `{"code": …}`: the code formatted by the node's Python, as ruff (or black)
+/// formats it: the console's Format for Python files and cells. The code is only read, never run.
+async fn format_python(Json(b): Json<Value>) -> Result<Json<Value>, E> {
+    crate::python::ready("Formatting Python uses the node's Python (its ruff or black)")?;
+    let head = j!({"op": "format", "code": b["code"].as_str().unwrap_or_default()});
+    let (said, _) = crate::python::ask("", crate::python::Use::Function, head, vec![], Some(std::time::Duration::from_secs(30)), &mut |_| {}).await?;
+    Ok(Json(j!({"code": said["code"]})))
 }
 
 /// `GET /functions`: the lake's own functions, by name.
@@ -833,6 +868,11 @@ fn content_type(p: &SqlParams) -> &'static str {
     match p.format.as_deref() {
         Some("table") => "text/plain",
         Some("arrow") => "application/vnd.apache.arrow.stream",
+        Some("csv") => "text/csv; charset=utf-8",
+        Some("tsv") => "text/tab-separated-values; charset=utf-8",
+        Some("ndjson") => "application/x-ndjson",
+        Some("parquet") => "application/vnd.apache.parquet",
+        Some("xlsx") => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         _ => "application/json",
     }
 }
@@ -889,12 +929,34 @@ async fn run_sql(app: &App, p: &SqlParams, query: &str, files: bool) -> anyhow::
 }
 
 /// Rows as `?format=` asks: JSON, a text table, or Arrow IPC (straight into pandas, Polars and
-/// DuckDB, no JSON parsing).
+/// DuckDB, no JSON parsing); or a file of them to download: CSV, TSV, NDJSON, Parquet, Excel.
 pub fn render(batches: &[RecordBatch], format: Option<&str>) -> anyhow::Result<bytes::Bytes> {
     Ok(bytes::Bytes::from(match format {
         Some("table") => pretty_format_batches(batches)?.to_string().into_bytes(),
         Some("typed") => typed(batches)?,
         Some("arrow") => crate::query::ipc(batches)?,
+        Some(f @ ("csv" | "tsv")) => {
+            let mut w = datafusion::arrow::csv::WriterBuilder::new().with_header(true).with_delimiter(if f == "tsv" { b'\t' } else { b',' }).build(Vec::new());
+            for b in batches {
+                w.write(b)?;
+            }
+            w.into_inner()
+        }
+        Some("ndjson") => {
+            let mut w = arrow_json::LineDelimitedWriter::new(Vec::new());
+            w.write_batches(&batches.iter().collect::<Vec<_>>())?;
+            w.finish()?;
+            w.into_inner()
+        }
+        Some("parquet") => {
+            let schema = batches.first().map(|b| b.schema()).unwrap_or_else(|| Arc::new(datafusion::arrow::datatypes::Schema::empty()));
+            let mut w = datafusion::parquet::arrow::ArrowWriter::try_new(Vec::new(), schema, None)?;
+            for b in batches {
+                w.write(b)?;
+            }
+            w.into_inner()?
+        }
+        Some("xlsx") => crate::xlsx::workbook(batches)?,
         _ => {
             let mut w = arrow_json::ArrayWriter::new(Vec::new());
             w.write_batches(&batches.iter().collect::<Vec<_>>())?;

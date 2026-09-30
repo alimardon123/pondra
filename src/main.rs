@@ -30,6 +30,7 @@ mod serve;
 mod shell;
 mod cluster;
 mod console;
+mod xlsx;
 mod dbserver;
 mod log;
 mod manifest;
@@ -539,7 +540,7 @@ async fn run() -> anyhow::Result<()> {
             // No Nagle: a small answer goes out at once, not after the client's delayed ACK (the
             // Postgres, Kafka and Flight ports do the same).
             let listener = axum::serve::ListenerExt::tap_io(tokio::net::TcpListener::bind(&listen).await?, |tcp| drop(tcp.set_nodelay(true)));
-            axum::serve(listener, server::router(app)).await?;
+            axum::serve(listener, server::router(app).into_make_service_with_connect_info::<std::net::SocketAddr>()).await?; // (who asks: `console::save_settings`)
         }
         Cmd::Run { file, url, token, rest } => {
             // (the lake first if it is there; `--url` and `--token` wherever they are; the rest parameters)
