@@ -47,7 +47,7 @@ transactions, followers and the feed) is next.
 7. **Moved to round 28:** followers fed from the files in one commit, and `/watch`, the change
    feed and Kafka topics carrying file commits (bulk `INSERT`s' too); adopted files are read from
    Parquet, not the hot columns, until merged.
-8. **Tests** (`logs/round27/`): `harness.py adopted` (9 checks) and `ids` (2), `writes` updated,
+8. **Tests** (`logs/round27/`): `harness.py adopted` (10 checks: spread over three nodes too) and `ids` (2), `writes` updated,
    `harness.py all`, locally, on simulated R2 and on real R2.
 
 **The workspace (ADR-033), after round 26:** the lake's `.sql`, `.py` and notebook files run as

@@ -359,7 +359,7 @@ where marked.
   after it too (`log::span`), and a Kafka fetch looks back over them. *(Decided by Claude: offsets
   a consumer saved before this upgrade point elsewhere now; there is no promise of that before
   1.0, ADR-032 §8.)*
-- **Tests:** `harness.py adopted` (9 checks), `ids` (a 2^24 + 10-row segment, a consumer seeking
+- **Tests:** `harness.py adopted` (10 checks: spread over three nodes too), `ids` (a 2^24 + 10-row segment, a consumer seeking
   into its second number), `writes` updated; everything else in `harness.py all` as before; Spark
   4 with Iceberg 1.10 appending through the catalog (`formats_check.py --only commits`), its rows
   and their ids as it wrote them.

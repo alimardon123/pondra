@@ -3660,7 +3660,7 @@ def adopted():
     follower taking PyIceberg's commits: tables made through the catalog (a partition spec, a
     write order, properties); an append's files are the table's where the writer put them, its
     rows with system columns from their lineage (ids distinct and in one run, one version, one
-    time), read the same by Pondra, PyIceberg and delta-rs; it costs the node its footers and a
+    time), read the same by Pondra (spread over three nodes too), PyIceberg and delta-rs; it costs the node its footers and a
     commit (a quarter of a copy's CPU at most); UPDATE and DELETE keep an adopted row's id; a
     merge writes the columns out, every row keeping its id and version; a partitioned table's
     files one day each, as its published spec says, and a file of two days refused by name; the
@@ -3679,6 +3679,7 @@ def adopted():
     lake = new_lake()
     a = Node(lake, A.port, tier_secs=0.5).start()
     b = Node(lake, A.port + 1, tier_secs=0.5).start()
+    c = Node(lake, A.port + 2, tier_secs=0.5).start()  # (three: a query spreads)
     q = lambda s, port=A.port: sql(port, s)
     io = {"s3.endpoint": os.environ.get("AWS_ENDPOINT"), "s3.access-key-id": os.environ.get("AWS_ACCESS_KEY_ID"), "s3.secret-access-key": os.environ.get("AWS_SECRET_ACCESS_KEY"),
           "s3.region": os.environ.get("AWS_REGION", "auto"), "py-io-impl": "pyiceberg.io.fsspec.FsspecFileIO"} if A.s3 else {}
@@ -3710,6 +3711,9 @@ def adopted():
     checks["other engines read the rows as written: PyIceberg and delta-rs; a filter on them skips what it can"] = cat.load_table("default.events").scan(row_filter="id >= 1000 and id < 1010").to_arrow().num_rows == 10 \
         and delta == n and q("SELECT count(*) AS n, sum(id) AS s FROM events WHERE id BETWEEN 5000 AND 5009") == [{"n": 10, "s": sum(range(5000, 5010))}] \
         and q("SELECT count(*) AS n FROM copied") == [{"n": n}]
+    grouped = "SELECT name, count(*) AS n, sum(amount) AS s, count(DISTINCT _row_id) AS ids FROM events WHERE id % 97 = 0 GROUP BY name ORDER BY name"
+    spread = call(A.port + 2, "POST", "/sql?spread=1", grouped.encode(), timeout=120)
+    checks["spread over three nodes, the adopted rows and their ids == one node's"] = spread == q(grouped) and len(spread) > 0
     kept = q("SELECT _row_id FROM events WHERE id = 150")
     q("UPDATE events SET name = 'changed' WHERE id = 150")
     q("DELETE FROM events WHERE id = 151")
@@ -3756,7 +3760,7 @@ def adopted():
     cat.drop_table("default.smaller")
     checks["renamed and dropped through the catalog"] = renamed == [{"n": 80}] and bool(_raises_text(lambda: q("SELECT * FROM smaller"))) \
         and "default.smaller" not in [".".join(t) for t in cat.list_tables("default")]
-    [x.kill() for x in (a, b)]
+    [x.kill() for x in (a, b, c)]
     ok = all(checks.values())
     print(json.dumps({"adopted": checks, "ok": ok, "cpu_s": {"adopted": adopt_cpu, "copied": copy_cpu, "rows": n}}, indent=1))
     if not ok:
