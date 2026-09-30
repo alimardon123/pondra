@@ -201,7 +201,7 @@ pub async fn resolve_metadata(lake: &Lake, url: &str, at: &str, meta: &Value, op
             let at_file = place(p["file_path"].as_str().context("a delete file without its path")?);
             deletes.push(match p["file_format"].as_str().unwrap_or("PARQUET").to_uppercase().as_str() {
                 "PUFFIN" => Delete::Blob { path: at_file, offset: p["content_offset"].as_u64().context("a deletion vector without its offset")?, size: p["content_size_in_bytes"].as_u64().context("a deletion vector without its size")? },
-                "PARQUET" => Delete::Positions { path: at_file, file: written.to_string() },
+                "PARQUET" => Delete::Positions { path: at_file, file: written.to_string(), rows: 0, bytes: 0 },
                 other => bail!("{at}: position deletes in {other}, which aren't read"),
             });
         }

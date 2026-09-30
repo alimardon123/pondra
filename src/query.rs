@@ -113,11 +113,12 @@ fn with_seconds(c: &ArrayRef) -> Result<ArrayRef> {
     Ok(Arc::new(text.iter().map(|s| s.map(|s| seconds(s).unwrap_or_else(|| s.to_string()))).collect::<StringArray>()) as ArrayRef)
 }
 
-/// Rows of `table` from committed segments in (after, upto]; `None` = up to the latest; under
-/// the names SQL knows their columns by (ADR-022: `tail_of` gives them as stored).
+/// Rows of `table` from committed segments in (after, upto], file commits' too (what the log's
+/// readers see: tasks, `/watch`, watermarks); `None` = up to the latest; under the names SQL
+/// knows their columns by (ADR-022: `tail_of` gives them as stored).
 /// With `ord`, each row gets `_ord` (`log::ord`: its segment, then its position), so later versions sort last.
 pub async fn tail(lake: &Lake, table: &str, after: u64, upto: Option<u64>, ord: bool) -> Result<Vec<RecordBatch>> {
-    let rows = tail_of(lake, table, after, upto, ord, false).await?;
+    let rows = tail_of(lake, table, after, upto, ord, false, true).await?;
     match lake.cat.get::<TableMeta>(&table_key(table)).await? {
         Some(m) if m.mapped() => rows.iter().map(|b| m.to_logical(b)).collect(),
         _ => Ok(rows),
@@ -125,17 +126,26 @@ pub async fn tail(lake: &Lake, table: &str, after: u64, upto: Option<u64>, ord: 
 }
 
 /// `tail`, with the system columns (`sys.rs`) when `sys`: each row's commit, and its `_row_id`.
-pub async fn tail_of(lake: &Lake, table: &str, after: u64, upto: Option<u64>, ord: bool, sys: bool) -> Result<Vec<RecordBatch>> {
+/// `filed`: file commits' rows too (`Segment::files`), as the log's readers take them; queries
+/// and tiering don't (those files are the table's already).
+pub async fn tail_of(lake: &Lake, table: &str, after: u64, upto: Option<u64>, ord: bool, sys: bool, filed: bool) -> Result<Vec<RecordBatch>> {
     let end = upto.map_or("s0".to_string(), |u| seg_key(u + 1)); // "s0" sorts right after every "s/…"
     let mut segs = vec![];
     for (key, seg) in lake.cat.scan::<Segment>(&seg_key(after + 1), &end).await? {
-        if seg.parts.contains_key(table) {
+        if seg.parts.contains_key(table) || (filed && seg.files.contains_key(table)) {
             segs.push((key[2..].parse::<u64>()?, seg));
         }
     }
-    // Fetch many segments at once: on object storage each one may be a round trip.
-    let fetches: Vec<_> = segs.iter().map(|(n, seg)| lake.segment_rows(*n, seg, table)).collect();
-    let fetched: Vec<Rows> = futures::stream::iter(fetches).buffered(32).try_collect().await?;
+    // Fetch many segments at once: on object storage each one may be a round trip. (A file
+    // commit's rows come with their system columns: the log's rows get theirs from their segment.)
+    let fetches: Vec<_> = segs.iter().map(|(n, seg)| async move {
+        let mut rows: Vec<(RecordBatch, bool)> = lake.segment_rows(*n, seg, table).await?.iter().map(|b| (b.clone(), true)).collect();
+        if filed {
+            rows.extend(lake.filed_rows(seg, table, false, 0, u64::MAX).await?.into_iter().map(|b| (b, false)));
+        }
+        anyhow::Ok(rows)
+    }).collect();
+    let fetched: Vec<Vec<(RecordBatch, bool)>> = futures::stream::iter(fetches).buffered(32).try_collect().await?;
     let target = match lake.cat.get::<TableMeta>(&table_key(table)).await? {
         Some(m) if sys => Some(schema(&crate::sys::with_sys(&m).columns)?),
         Some(m) => Some(schema(&m.columns)?),
@@ -144,9 +154,9 @@ pub async fn tail_of(lake: &Lake, table: &str, after: u64, upto: Option<u64>, or
     let mut out = vec![];
     for ((n, seg), rows) in segs.iter().zip(fetched) {
         let (n, mut pos) = (*n, 0u64);
-        for b in rows.iter() {
+        for (b, logged) in rows.iter() {
             let b = &match &target {
-                Some(s) if sys => conform(&crate::sys::derive(b, n, pos, seg.ts_ms)?, s)?,
+                Some(s) if sys && *logged => conform(&crate::sys::derive(b, n, pos, seg.ts_ms)?, s)?,
                 Some(s) => conform(b, s)?,
                 None => b.clone(),
             };
@@ -245,7 +255,7 @@ pub async fn sources(lake: &Lake, ctx: &SessionContext, name: &str, meta: &Table
         files.push(if keyed { df.with_column("_ord", lit(0u64))? } else { df });
     }
     let sys = meta.columns.iter().any(|(c, _)| c == crate::sys::ROW_ID); // (`sys::with_sys`)
-    let hot = tail_of(lake, name, meta.tiered, upto, keyed, sys).await?;
+    let hot = tail_of(lake, name, meta.tiered, upto, keyed, sys, false).await?;
     if hot.is_empty() {
         return Ok((None, files));
     }
@@ -263,24 +273,30 @@ async fn read_files(lake: &Lake, ctx: &SessionContext, files: Vec<&DataFile>, me
     if !lake.hot.on() {
         return files_once(lake, ctx, &files, meta, schema).await;
     }
-    let (adopted, own): (Vec<&DataFile>, Vec<&DataFile>) = files.into_iter().partition(|f| f.lineage.is_some());
+    let (plain, rest): (Vec<&DataFile>, Vec<&DataFile>) = files.into_iter().partition(|f| f.lineage.is_none() && (f.deletes.is_empty() || !meta.key.is_empty()));
     let mut parts = vec![];
-    if !own.is_empty() {
-        parts.push(ctx.read_table(Arc::new(crate::hot::HotFiles { lake: lake.arc(), files: own.into_iter().cloned().collect(), schema: schema.clone() }))?);
+    if !plain.is_empty() {
+        parts.push(ctx.read_table(Arc::new(crate::hot::HotFiles { lake: lake.arc(), files: plain.into_iter().cloned().collect(), schema: schema.clone() }))?);
     }
-    if !adopted.is_empty() {
-        parts.push(crate::scan::adopted(lake, ctx, &adopted, meta, schema).await?);
+    if !rest.is_empty() {
+        parts.push(files_once(lake, ctx, &rest, meta, schema).await?);
     }
     union_all(parts)
 }
 
 /// Files of a table as one read, as `read_files` reads them but not through the hot columns (and
-/// so not loading them there: maintenance reads a file once).
+/// so not loading them there: maintenance reads a file once). A file with deleted rows is read
+/// without them, one with a lineage with its rows' system columns from it (`scan.rs`).
 pub async fn files_once(lake: &Lake, ctx: &SessionContext, files: &[&DataFile], meta: &TableMeta, schema: &SchemaRef) -> Result<DataFrame> {
     let (adopted, own): (Vec<&DataFile>, Vec<&DataFile>) = files.iter().copied().partition(|f| f.lineage.is_some());
+    // (a keyed table's positions are the older versions its newer files hold: what others read; its own reads take the newest anyway)
+    let (deleted, own): (Vec<&DataFile>, Vec<&DataFile>) = own.into_iter().partition(|f| !f.deletes.is_empty() && meta.key.is_empty());
     let mut parts = vec![];
     if !own.is_empty() {
         parts.push(ctx.read_parquet(own.iter().map(|f| lake.full(&f.path)).collect::<Vec<_>>(), ParquetReadOptions::default().schema(schema)).await?);
+    }
+    if !deleted.is_empty() {
+        parts.push(crate::scan::with_deletes(lake, ctx, &deleted, schema).await?);
     }
     if !adopted.is_empty() {
         parts.push(crate::scan::adopted(lake, ctx, &adopted, meta, schema).await?);
@@ -622,10 +638,14 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
             ctx.register_table(table_ref(name), named(&ctx, view, &meta, names_deleted(&text))?)?;
         }
     }
-    let names = crate::ext::names(&text);
-    let metas = futures::future::try_join_all(names.iter().map(|n| crate::ext::meta(lake, n))).await?; // (listed at once)
+    let (names, direct) = (crate::ext::names(&text), crate::ext::names(sql));
+    let metas = futures::future::join_all(names.iter().map(|n| crate::ext::meta(lake, n))).await; // (listed at once)
     for (name, meta) in names.into_iter().zip(metas) {
-        let meta = meta.expect("files"); // (files anywhere: `ext.rs`)
+        let meta = match meta {
+            Ok(m) => m.expect("files"), // (files anywhere: `ext.rs`)
+            Err(_) if listing && !direct.contains(&name) => continue, // (a view's files this caller can't read, or that are gone: a listing shows the rest)
+            Err(e) => return Err(e),
+        };
         let view = table_view(lake, &ctx, &name, &meta, upto).await?;
         ctx.register_table(datafusion::common::TableReference::bare(name.clone()), named(&ctx, view, &meta, false)?)?; // (another engine's names for its columns)
     }

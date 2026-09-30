@@ -37,16 +37,27 @@ struct Published {
     manifests: BTreeMap<String, u64>,
     #[serde(default, alias = "files")]
     inline: BTreeMap<String, (u64, u64)>,
+    /// The files published with a deletion vector (path in the table folder -> its descriptor):
+    /// rows deleted by position (ADR-029 §4). Once there is one, the log's protocol says so.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    dvs: BTreeMap<String, Value>,
+    #[serde(default)]
+    vectors: bool,
+    /// The table's rows as of the last commit (`TableMeta::rows_at`, its last purge): a commit whose
+    /// files changed but not these only rewrote them (`dataChange: false`, which a stream reading
+    /// the table's changes passes over).
+    #[serde(default)]
+    rows: (u64, u64),
 }
 
 /// Every table in every format it's published in at once (each is an object-store write or
 /// two), then one catalog write that records what was published. One round at a time, each
 /// starting from the last one's recorded state: a tiering round and a `CHECKPOINT` publishing at
 /// once both wrote an Iceberg table's next version, and the second failed (real R2, round 21).
-pub async fn publish_all(lake: &Lake) -> Result<()> { publish_named(lake, None).await }
+pub async fn publish_all(lake: &Lake) -> Result<()> { publish_named(lake, &[]).await }
 
 /// `publish_all`, and the version of `named`'s table carries that engine's snapshot id (ADR-028).
-pub async fn publish_named(lake: &Lake, named: Option<&crate::iceberg::Named<'_>>) -> Result<()> {
+pub async fn publish_named(lake: &Lake, named: &[crate::iceberg::Named<'_>]) -> Result<()> {
     static ONE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     let _one = ONE.lock().await;
     lake.cat.wait_durable(lake.cat.committed()).await; // (replicated acks: publish only what's in the bucket)
@@ -54,12 +65,12 @@ pub async fn publish_named(lake: &Lake, named: Option<&crate::iceberg::Named<'_>
     static SEEN: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, u64>>> = std::sync::LazyLock::new(Default::default);
     let print = |meta: &TableMeta| std::hash::BuildHasher::hash_one(&std::hash::BuildHasherDefault::<std::collections::hash_map::DefaultHasher>::default(), json(meta));
     let tables = lake.cat.scan::<TableMeta>("t/", "t0").await?;
-    let changed: Vec<_> = tables.iter().filter(|(key, meta)| named.is_some_and(|n| key[2..] == *n.table) || SEEN.lock().unwrap().get(key) != Some(&print(meta))).collect();
+    let changed: Vec<_> = tables.iter().filter(|(key, meta)| named.iter().any(|n| key[2..] == *n.table) || SEEN.lock().unwrap().get(key) != Some(&print(meta))).collect();
     let jobs = changed.iter().flat_map(|(key, meta)| meta.publish.iter().map(move |f| (&key[2..], meta, f.as_str())));
     let states = futures::future::try_join_all(jobs.map(|(table, meta, format)| async move {
         match format {
             "delta" => publish(lake, table, meta).await,
-            _ => crate::iceberg::publish(lake, table, meta, named.filter(|n| n.table == table)).await,
+            _ => crate::iceberg::publish(lake, table, meta, named.iter().find(|n| n.table == table)).await,
         }
     }))
     .await?;
@@ -88,6 +99,8 @@ pub async fn publishable(lake: &Lake, meta: &TableMeta) -> Result<Option<Parts>>
     let deletes = meta.columns.iter().any(|(c, _)| c == "_deleted");
     Ok(match meta.key.is_empty() {
         true => Some(Parts { manifests: crate::manifest::list(lake, meta).await?, inline: meta.files.clone() }),
+        // (every generation, its older versions and markers positions: `tier::shadow`)
+        false if (meta.shadows || meta.files.is_empty()) && meta.merge.is_empty() && meta.order.is_none() => Some(Parts { manifests: vec![], inline: meta.files.clone() }),
         // (one generation: a compaction's files, one per partition)
         false if meta.files.windows(2).all(|w| w[0].ord == w[1].ord) && !meta.files.is_empty() && meta.files.iter().all(|f| f.whole || !deletes) => Some(Parts { manifests: vec![], inline: meta.files.clone() }),
         false => None,
@@ -130,12 +143,25 @@ async fn publish(lake: &Lake, table: &str, meta: &TableMeta) -> Result<Option<(S
     let went: Vec<crate::manifest::Manifest> = state.manifests.keys().filter(|p| !now.contains_key(*p)).map(|p| crate::manifest::Manifest { path: p.clone(), ..Default::default() }).collect();
     let gained = load(lake, came.into_iter().cloned().collect()).await?;
     let lost = load(lake, went).await?;
-    let mut want: BTreeMap<String, u64> = gained.iter().map(|f| (name(&dir, f), f.bytes)).collect();
-    want.extend(parts.inline.iter().map(|f| (name(&dir, f), f.bytes)));
-    let mut gone: BTreeMap<String, u64> = lost.iter().map(|f| (name(&dir, f), f.bytes)).collect();
+    let mut want: BTreeMap<String, &DataFile> = gained.iter().map(|f| (name(&dir, f), f)).collect();
+    want.extend(parts.inline.iter().map(|f| (name(&dir, f), f)));
+    let lost: BTreeMap<String, u64> = lost.iter().map(|f| (name(&dir, f), f.bytes)).collect();
+    let mut gone: BTreeMap<String, u64> = lost.iter().map(|(p, b)| (p.clone(), *b)).collect();
     gone.extend(state.inline.iter().filter(|(p, _)| !want.contains_key(*p)).map(|(p, (b, _))| (p.clone(), *b)));
-    let adds: Vec<(String, u64)> = want.iter().filter(|(p, _)| !state.inline.contains_key(*p)).map(|(p, b)| (p.clone(), *b)).collect();
-    let removes: Vec<String> = gone.keys().filter(|p| !want.contains_key(*p)).cloned().collect();
+    // A file with rows deleted by position goes in with its deletion vector (the same one again,
+    // unless more of its rows were deleted since); one whose vector changed goes out and back in.
+    let mut dvs = BTreeMap::new();
+    for (p, f) in want.iter().filter(|(_, f)| f.deleted > 0) {
+        let same = state.dvs.get(p).filter(|d| d["cardinality"].as_u64() == Some(f.deleted));
+        dvs.insert(p.clone(), match same {
+            Some(d) => d.clone(),
+            None => vector(&crate::scan::deleted_rows(lake, f).await?),
+        });
+    }
+    let was = |p: &String| state.inline.contains_key(p) || lost.contains_key(p);
+    let changed = |p: &String| was(p) && state.dvs.get(p) != dvs.get(p);
+    let adds: Vec<(String, u64, u64)> = want.iter().filter(|(p, _)| !was(p) || changed(p)).map(|(p, f)| (p.clone(), f.bytes, f.rows)).collect();
+    let removes: Vec<String> = gone.keys().filter(|p| !want.contains_key(*p)).chain(want.keys().filter(|p| changed(p))).cloned().collect();
     if state.version.is_some() && adds.is_empty() && removes.is_empty() && state.schema == schema {
         return Ok(None);
     }
@@ -143,17 +169,20 @@ async fn publish(lake: &Lake, table: &str, meta: &TableMeta) -> Result<Option<(S
     if state.id.is_empty() {
         state.id = uuid::Uuid::new_v4().to_string();
     }
+    let vectors = state.vectors || !dvs.is_empty();
+    let rows_now = (meta.rows_at, meta.purged());
+    let change = state.version.is_none() || state.rows != rows_now;
     let (mut adds, mut removes) = (adds, removes);
     loop {
         let mut actions = vec![];
-        if version == 0 || protocol(&state.schema) != protocol(&schema) {
-            actions.push(protocol(&schema));
+        if version == 0 || protocol(&state.schema, state.vectors) != protocol(&schema, vectors) {
+            actions.push(protocol(&schema, vectors));
         }
-        if state.schema != schema {
-            actions.push(metadata(&state.id, table, &schema, ms));
+        if state.schema != schema || state.vectors != vectors {
+            actions.push(metadata(&state.id, table, &schema, ms, vectors));
         }
-        actions.extend(removes.iter().map(|p| json!({"remove": {"path": p, "deletionTimestamp": ms, "dataChange": true}})));
-        actions.extend(adds.iter().map(|(p, b)| add(p, *b, ms)));
+        actions.extend(removes.iter().map(|p| remove(p, ms, state.dvs.get(p), change)));
+        actions.extend(adds.iter().map(|(p, b, n)| add(p, *b, *n, ms, dvs.get(p), change)));
         let body = actions.iter().map(Value::to_string).collect::<Vec<_>>().join("\n");
         // Written once, never overwritten. If it's already there, an earlier attempt wrote it and
         // crashed before recording it: it was derived from committed state too, so whatever it
@@ -163,7 +192,7 @@ async fn publish(lake: &Lake, table: &str, meta: &TableMeta) -> Result<Option<(S
         }
         let earlier = lake.store.get(&Path::from(format!("{dir}_delta_log/{version:020}.json"))).await?.bytes().await?;
         let (added, removed) = applied(&earlier)?;
-        adds.retain(|(p, _)| !added.contains(p));
+        adds.retain(|(p, _, _)| !added.contains(p));
         removes.retain(|p| !removed.contains(p));
         state.schema = schema.clone();
         version += 1;
@@ -172,6 +201,11 @@ async fn publish(lake: &Lake, table: &str, meta: &TableMeta) -> Result<Option<(S
             break;
         }
     }
+    // (the vectors of the files in the manifests kept stay as they were)
+    state.dvs.retain(|p, _| !gone.contains_key(p) && !want.contains_key(p));
+    state.dvs.extend(dvs);
+    state.vectors = vectors;
+    state.rows = rows_now;
     state.version = Some(version);
     state.schema = schema;
     state.manifests = now;
@@ -231,12 +265,14 @@ async fn checkpoint(lake: &Lake, dir: &str, version: u64, state: &Published, tab
         }
         Ok((buf, rows))
     });
-    tx.send(vec![protocol(&state.schema), metadata(&state.id, table, &state.schema, 0)]).await?;
+    tx.send(vec![protocol(&state.schema, state.vectors), metadata(&state.id, table, &state.schema, 0, state.vectors)]).await?;
     for m in crate::manifest::list(lake, meta).await? {
         let files = crate::manifest::files(lake, &m).await?;
-        tx.send(files.iter().map(|f| add(f.path.strip_prefix(dir).unwrap_or(&f.path), f.bytes, 0)).collect()).await?;
+        let listed = files.iter().map(|f| (f.path.strip_prefix(dir).unwrap_or(&f.path), f));
+        tx.send(listed.map(|(p, f)| add(p, f.bytes, f.rows, 0, state.dvs.get(p), false)).collect()).await?;
     }
-    tx.send(state.inline.iter().map(|(p, (b, t))| add(p, *b, *t)).collect()).await?;
+    let inline = meta.files.iter().map(|f| (f.path.strip_prefix(dir).unwrap_or(&f.path), f)); // (as just published: `state.inline`)
+    tx.send(inline.map(|(p, f)| add(p, f.bytes, f.rows, state.inline.get(p).map_or(0, |x| x.1), state.dvs.get(p), false)).collect()).await?;
     drop(tx);
     let (buf, rows) = writing.await??;
     lake.put(&format!("{dir}_delta_log/{version:020}.checkpoint.parquet"), buf).await.ok(); // (a retry may find it written)
@@ -257,22 +293,25 @@ async fn checkpoint(lake: &Lake, dir: &str, version: u64, state: &Published, tab
 /// The protocol a schema needs: `timestamp_ntz` columns take the `timestampNtz` table feature;
 /// renamed or dropped columns, `columnMapping` — as a named feature, not reader version 2: a
 /// reader that can't map columns then says so (delta-rs's pyarrow reader, Polars) instead of
-/// reading them by the wrong names.
-pub fn protocol(schema: &str) -> Value {
-    let features: Vec<&str> = [("timestampNtz", schema.contains("\"timestamp_ntz\"")), ("columnMapping", schema.contains(MAPPING_ID))].iter().filter(|f| f.1).map(|f| f.0).collect();
+/// reading them by the wrong names; rows deleted by position (`vectors`), `deletionVectors`.
+pub fn protocol(schema: &str, vectors: bool) -> Value {
+    let features: Vec<&str> = [("timestampNtz", schema.contains("\"timestamp_ntz\"")), ("columnMapping", schema.contains(MAPPING_ID)), ("deletionVectors", vectors)].iter().filter(|f| f.1).map(|f| f.0).collect();
     match features.is_empty() {
         false => json!({"protocol": {"minReaderVersion": 3, "minWriterVersion": 7, "readerFeatures": features, "writerFeatures": features}}),
         true => json!({"protocol": {"minReaderVersion": 1, "minWriterVersion": 2}}),
     }
 }
 
-pub fn metadata(id: &str, table: &str, schema: &str, now: u64) -> Value {
+pub fn metadata(id: &str, table: &str, schema: &str, now: u64, vectors: bool) -> Value {
     // (column mapping by name: the files' columns are the fields' physical names)
     let ids = serde_json::from_str::<Value>(schema).ok().and_then(|s| s["fields"].as_array().map(|f| f.iter().filter_map(|f| f["metadata"][MAPPING_ID].as_u64()).max()));
-    let configuration = match ids.flatten() {
+    let mut configuration = match ids.flatten() {
         Some(max) => json!({"delta.columnMapping.mode": "name", "delta.columnMapping.maxColumnId": max.to_string()}),
         None => json!({}),
     };
+    if vectors {
+        configuration["delta.enableDeletionVectors"] = json!("true");
+    }
     json!({"metaData": {"id": id, "name": table, "format": {"provider": "parquet", "options": {}}, "schemaString": schema,
         "partitionColumns": [], "configuration": configuration, "createdTime": now}})
 }
@@ -284,19 +323,41 @@ const MAPPING_ID: &str = "delta.columnMapping.id";
 /// the files hold it under — Delta's column mapping, by name.
 fn table_schema(meta: &TableMeta, mapped: bool) -> Option<String> {
     if !mapped {
-        return schema_string(&meta.columns);
+        return schema_string(&meta.columns.iter().filter(|(c, _)| !meta.marker(c)).cloned().collect::<Vec<_>>());
     }
-    let live: Vec<(String, String)> = meta.live().map(|(_, n, t)| (n.to_string(), t.to_string())).collect();
+    let live: Vec<(String, String)> = meta.live().filter(|(s, _, _)| !meta.marker(s)).map(|(_, n, t)| (n.to_string(), t.to_string())).collect();
     let mut schema: Value = serde_json::from_str(&schema_string(&live)?).ok()?;
-    let ids = meta.columns.iter().enumerate().filter(|(_, (c, _))| !meta.dropped.contains(c)).map(|(i, (c, _))| (i + 1, c));
+    let ids = meta.columns.iter().enumerate().filter(|(_, (c, _))| !meta.dropped.contains(c) && !meta.marker(c)).map(|(i, (c, _))| (i + 1, c));
     for (f, (id, stored)) in schema["fields"].as_array_mut()?.iter_mut().zip(ids) {
         f["metadata"] = json!({(MAPPING_ID): id, "delta.columnMapping.physicalName": stored});
     }
     Some(schema.to_string())
 }
 
-fn add(path: &str, bytes: u64, at: u64) -> Value {
-    json!({"add": {"path": path, "partitionValues": {}, "size": bytes, "modificationTime": at, "dataChange": true}})
+/// A file into the log, with its rows (`numRecords`, which a reader needs for a file with a
+/// deletion vector) and its deletion vector, if rows of it were deleted by position; `change`:
+/// false when the commit only rewrote files.
+fn add(path: &str, bytes: u64, rows: u64, at: u64, dv: Option<&Value>, change: bool) -> Value {
+    let stats = json!({"numRecords": rows}).to_string();
+    let mut a = json!({"add": {"path": path, "partitionValues": {}, "size": bytes, "modificationTime": at, "dataChange": change, "stats": stats}});
+    if let Some(dv) = dv {
+        a["add"]["deletionVector"] = dv.clone();
+    }
+    a
+}
+
+fn remove(path: &str, at: u64, dv: Option<&Value>, change: bool) -> Value {
+    let mut r = json!({"remove": {"path": path, "deletionTimestamp": at, "dataChange": change}});
+    if let Some(dv) = dv {
+        r["remove"]["deletionVector"] = dv.clone();
+    }
+    r
+}
+
+/// A deletion vector for these rows (positions, sorted), inline in the log: the bitmap in Z85.
+fn vector(rows: &[u64]) -> Value {
+    let bitmap = crate::scan::roaring_bytes(rows);
+    json!({"storageType": "i", "pathOrInlineDv": crate::scan::z85_of(&bitmap), "sizeInBytes": bitmap.len(), "cardinality": rows.len()})
 }
 
 /// One Delta type name, for a list's elements.
@@ -347,7 +408,8 @@ fn checkpoint_schema() -> Arc<Schema> {
         st("protocol", vec![i("minReaderVersion", DataType::Int32), i("minWriterVersion", DataType::Int32), list("readerFeatures"), list("writerFeatures")]),
         st("metaData", vec![s("id"), s("name"), s("description"), st("format", vec![s("provider"), map("options")]), s("schemaString"),
             list("partitionColumns"), map("configuration"), i("createdTime", DataType::Int64)]),
-        st("add", vec![s("path"), map("partitionValues"), i("size", DataType::Int64), i("modificationTime", DataType::Int64), i("dataChange", DataType::Boolean), s("stats")]),
+        st("add", vec![s("path"), map("partitionValues"), i("size", DataType::Int64), i("modificationTime", DataType::Int64), i("dataChange", DataType::Boolean), s("stats"),
+            st("deletionVector", vec![s("storageType"), s("pathOrInlineDv"), i("offset", DataType::Int32), i("sizeInBytes", DataType::Int32), i("cardinality", DataType::Int64)])]),
         st("remove", vec![s("path"), i("deletionTimestamp", DataType::Int64), i("dataChange", DataType::Boolean)]),
     ]))
 }

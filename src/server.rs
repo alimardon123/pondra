@@ -108,7 +108,7 @@ pub fn router(app: App) -> Router {
         .route("/tier", post(tier_now))
         .route("/cluster/ddl", post(ddl))
         .route("/cluster/change", post(change))
-        .route("/cluster/iceberg", post(|State(app): State<App>, Json(c): Json<crate::iceberg::Commit>| async move { Ok::<_, E>(Json(app.record_iceberg(c).await?)) }))
+        .route("/cluster/iceberg", post(|State(app): State<App>, Json(c): Json<Vec<crate::iceberg::Commit>>| async move { Ok::<_, E>(Json(app.record_iceberg(c).await?)) }))
         .route_layer(middleware::from_fn_with_state(app.clone(), to_leader));
     Router::new()
         .merge(leader_only)
@@ -456,18 +456,18 @@ impl App {
 
     /// Record an INSERT's files: here on the leader, or forwarded to it.
     pub async fn record_files(&self, f: crate::write::Files) -> anyhow::Result<Value> {
-        if self.seq.is_none() {
+        let Some(seq) = &self.seq else {
             let r = crate::cluster::http().post(format!("http://{}/cluster/files", self.cluster.leader.addr)).json(&f).send().await?;
             anyhow::ensure!(r.status().is_success(), "leader: {}", r.text().await?);
             return Ok(r.json().await?);
-        }
+        };
         let _guard = self.lock.lock().await;
-        crate::write::record(&self.lake, f, self.seq.as_deref()).await
+        crate::write::record(&self.lake, f, seq).await
     }
 
     /// Another engine's append (`iceberg::update`), recorded by the leader under the lake's lock.
-    pub async fn record_iceberg(&self, c: crate::iceberg::Commit) -> anyhow::Result<Value> {
-        let Some(seq) = &self.seq else { return crate::write::post(&self.cluster.leader.addr, &crate::write::Request::Iceberg(Box::new(c))).await };
+    pub async fn record_iceberg(&self, c: Vec<crate::iceberg::Commit>) -> anyhow::Result<Value> {
+        let Some(seq) = &self.seq else { return crate::write::post(&self.cluster.leader.addr, &crate::write::Request::Iceberg(c)).await };
         let _guard = self.lock.lock().await;
         let nodes = if self.cluster.nodes().is_empty() { vec![self.cluster.addr.clone()] } else { self.cluster.nodes() };
         crate::iceberg::record(&self.lake, seq, c, &nodes, &self.cluster.addr, self.retain_ms).await
@@ -494,7 +494,8 @@ impl App {
         // tables side by side finish in the time of one (memory stays bounded: ≤4M rows a job).
         let busy: Vec<String> = tables.iter().map(|(k, _)| k[2..].to_string()).filter(|t| backlog.get(t).copied().unwrap_or(0) >= min_rows).collect();
         // Tables with files to merge or seal, busy or not (bulk INSERTs don't go through the log).
-        let untidy = tables.iter().filter(|(k, m)| m.files.len() >= 8 && !busy.contains(&k[2..].to_string())).map(|(k, _)| k[2..].to_string());
+        let heavy = |m: &TableMeta| m.files.iter().any(|f| f.deleted > 0 && f.deleted * 10 >= f.rows); // (`tier::maintain` rewrites them)
+        let untidy = tables.iter().filter(|(k, m)| (m.files.len() >= 8 || heavy(m)) && !busy.contains(&k[2..].to_string())).map(|(k, _)| k[2..].to_string());
         let untidy: Vec<String> = busy.iter().cloned().chain(untidy).collect();
         // (tables whose changed rows may wait in files: `tier::purge` says whether it's time)
         let changed: Vec<String> = tables.iter().filter(|(_, m)| m.changed && m.purged() < m.tiered).map(|(k, _)| k[2..].to_string()).collect();
@@ -646,7 +647,7 @@ async fn insert(State(app): State<App>, Path(name): Path<String>, Query(p): Quer
     ensure!(!app.cluster.reader, "read-only node");
     let query = crate::routines::expand(&app.lake, &query).await?;
     let ctx = session(&app.lake, &query, "").await?;
-    match crate::write::write_files(&app.lake, &ctx, &name, &query, &p.job, Some(app.to().reserve().await?)).await? {
+    match crate::write::write_files(&app.lake, &ctx, &name, &query, &p.job, crate::write::stamp(&app.lake, &name, Some(&app.to())).await?).await? {
         Some(f) => Ok(Json(app.record_files(f).await?)),
         None => Ok(Json(j!({"duplicate": true}))),
     }

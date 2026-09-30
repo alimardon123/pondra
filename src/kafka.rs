@@ -634,17 +634,21 @@ async fn list_offsets(app: &App, ver: i16, r: &mut Rd) -> Result<Vec<u8>> {
     Ok(w)
 }
 
-/// The oldest segment still in the log (segments expire oldest first).
+/// The oldest segment still in the log (segments expire oldest first). Some numbers never hold
+/// one (a commit number reserved, a big segment's rows running on: `log::span`), so the search
+/// looks at a window of them at a time: the first window holding a segment is where it starts.
 async fn first_segment(app: &App) -> Result<u64> {
+    const WINDOW: u64 = 4096;
+    let first = |from: u64| async move { anyhow::Ok(app.lake.cat.scan::<Segment>(&seg_key(from), &seg_key(from + WINDOW)).await?.first().map(|(k, _)| k[2..].parse::<u64>()).transpose()?) };
     let (mut lo, mut hi) = (0, app.lake.visible() + 1); // the answer is in [lo, hi]
     while lo < hi {
         let mid = (lo + hi) / 2;
-        match app.lake.cat.get_raw(&seg_key(mid)).await?.is_some() {
+        match first(mid).await?.is_some() {
             true => hi = mid,
             false => lo = mid + 1,
         }
     }
-    Ok(lo)
+    Ok(first(lo).await?.unwrap_or(lo))
 }
 
 /// The first segment committed at or after `t_ms`.
@@ -775,24 +779,35 @@ fn fetch_error(ver: i16, e: &anyhow::Error) -> Vec<u8> {
 async fn read(app: &App, table: &str, meta: &TableMeta, offset: u64, visible: u64, limit: usize) -> Result<Vec<u8>> {
     // (from a few segments back: a big one's rows run on past its number, `log::span`)
     let (mut out, mut at) = (vec![], (offset >> crate::log::ORD_BITS).saturating_sub(64));
-    while out.is_empty() && at <= visible {
+    let s = schema(&meta.columns)?;
+    'fetch: while out.is_empty() && at <= visible {
         let upto = visible.min(at + 4095); // (segments without this table are skipped, 4,096 at a time)
         for (key, seg) in app.lake.cat.scan::<Segment>(&seg_key(at), &seg_key(upto + 1)).await? {
             let n: u64 = key[2..].parse()?;
-            let held = seg.parts.get(table).map_or(0, |p| p.iter().map(|x| x.2).sum::<u64>());
+            let held = seg.rows_of(table);
             if crate::log::ord(n, held) <= offset || out.len() >= limit {
                 continue; // (none of its rows at the offset or after)
             }
-            let rows = app.lake.segment_rows(n, &seg, table).await?;
-            let s = schema(&meta.columns)?;
-            let all = concat_batches(&s, &rows.iter().map(|b| crate::query::conform(b, &s)).collect::<Result<Vec<_>>>()?)?;
-            if all.num_rows() == 0 {
-                continue;
+            let start = offset.saturating_sub(crate::log::ord(n, 0)).min(held);
+            let logged: u64 = seg.parts.get(table).map_or(0, |p| p.iter().map(|x| x.2).sum());
+            let mut rows = vec![];
+            if start < logged {
+                let all = app.lake.segment_rows(n, &seg, table).await?;
+                let all = concat_batches(&s, &all.iter().map(|b| crate::query::conform(b, &s)).collect::<Result<Vec<_>>>()?)?;
+                rows.push(all.slice(start as usize, all.num_rows() - start as usize));
             }
-            let start = offset.saturating_sub(crate::log::ord(n, 0)).min(all.num_rows() as u64) as usize;
-            let rows = all.slice(start, all.num_rows() - start);
+            // A file commit's rows, a piece at a time: the next fetch reads on from where this stops.
+            let (from, piece) = (start.saturating_sub(logged), (limit as u64 / 64).clamp(1_000, 1_000_000));
+            let partial = held - logged > from + piece;
+            if held > logged {
+                rows.extend(app.lake.filed_rows(&seg, table, false, from, piece).await?.iter().map(|b| crate::query::conform(b, &s)).collect::<Result<Vec<_>>>()?);
+            }
+            let rows = concat_batches(&s, &rows)?;
             if rows.num_rows() > 0 {
-                out.extend(encode_batch(crate::log::ord(n, start as u64) as i64, seg.ts_ms as i64, &records(&meta.logical(), &meta.to_logical(&rows)?)?)); // (SQL's names: ADR-022)
+                out.extend(encode_batch(crate::log::ord(n, start) as i64, seg.ts_ms as i64, &records(&meta.logical(), &meta.to_logical(&rows)?)?)); // (SQL's names: ADR-022)
+            }
+            if partial {
+                break 'fetch; // (never past rows not sent: a consumer goes on from the last it got)
             }
         }
         at = upto + 1;

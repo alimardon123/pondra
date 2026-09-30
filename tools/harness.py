@@ -19,6 +19,9 @@
   harness.py found               what writing the docs found (round 26), each fixed
   harness.py renames             ALTER TABLE | VIEW … RENAME TO: rows, files, copies, followers, views
   harness.py workspace           the lake's files run (CALL run): parameters, every door, files running files, the run log, a task
+  harness.py followers           file commits followed as the log's rows are: views, the change feed, Kafka, tasks, a stream join
+  harness.py transactions        other engines' commits over two tables at once, and carried over Pondra's merges by row id
+  harness.py upserts             keyed tables published every round; other engines' upserts, deletes, equality deletes
   harness.py external            CREATE EXTERNAL TABLE: a named view of files, INSERT into a folder's, what it refuses
   harness.py server              pondra serve <folder of lakes>: each a database (Postgres, HTTP, joins, idle, restart)
   harness.py load    --secs 30   throughput, ack latency, freshness, catalog commit latency
@@ -3833,8 +3836,8 @@ def rewrites():
     ids, rows it rewrote get new ones (Iceberg v2's rule: a delete and an insert); an overwrite
     with a filter (a delete's snapshot and an append's, in one commit); the files taken out gone
     after --retain-secs; the stale rule: a row still in the log when the writer read the table
-    gets it 409, and its DELETE, done again, takes that row too; refused by name: a table a view
-    follows. Schema changes (PyIceberg's update_schema): a column added, renamed, widened and
+    gets it 409, and its DELETE, done again, takes that row too; refused by name: a change a view
+    of the table can't take back (`followers`: those it can). Schema changes (PyIceberg's update_schema): a column added, renamed, widened and
     dropped, each an ALTER TABLE; a required column added refused."""
     import deltalake, pyarrow as pa
     from pyiceberg.catalog import load_catalog
@@ -3880,7 +3883,7 @@ def rewrites():
     q("CHECKPOINT")
     until(lambda: _try(lambda: cat.load_table("default.s").scan().to_arrow().num_rows), 2, 20)
     followed = _raises_text(lambda: cat.load_table("default.s").delete("region = 'eu'"))
-    checks["refused by name: a change to a table a view follows (its rows go through the log)"] = "views or tasks follow it" in followed \
+    checks["refused by name: a change to a table a view follows that can't take it back (no count to drop the groups it empties)"] = "count(*)" in followed \
         and q("SELECT count(*) AS n FROM s") == [{"n": 2}]
     q("CREATE TABLE u (id INT, name VARCHAR) WITH (publish = 'iceberg')")
     q("INSERT INTO u VALUES (1, 'a')")
@@ -3906,6 +3909,283 @@ def rewrites():
         print(json.dumps({"after": sorted(after)[:5], "theirs": theirs[:5], "delta": str(delta)[:200], "own_file": own_file, "gone": gone, "first": first[:300], "followed": followed[:300], "added": added, "shape": shape, "required": required[:200]}, default=str))
         sys.exit(1)
     return f"rewrites: other engines' copy-on-write DELETE and overwrite, the stale rule, schema changes: all {len(checks)} checks pass"
+
+
+def transactions():
+    """Other engines' commits that span tables or cross Pondra's upkeep (ADR-029 §7, round 28), on
+    two nodes, PyIceberg's commits sent as Iceberg's REST catalog takes them: a transaction over two
+    tables (`/v1/transactions/commit`) is one commit — both tables' rows, one `_version`, a view of
+    each following; one whose second table changed since is refused (409) and changes neither; a
+    copy-on-write DELETE planned before Pondra merged the files it takes out, sent after (as a
+    writer that retries does, its check passed), is carried over to the merged file by its rows'
+    ids: the rows as they should be, none twice; and a change naming rows gone since is refused."""
+    import pyarrow as pa
+    from pyiceberg.catalog import load_catalog
+    from pyiceberg.table import CommitTableRequest, TableIdentifier
+    lake = new_lake()
+    a = Node(lake, A.port, tier_secs=3600).start()
+    b = Node(lake, A.port + 1, tier_secs=3600).start()
+    q = lambda s: sql(A.port, s)
+    io = {"s3.endpoint": os.environ.get("AWS_ENDPOINT"), "s3.access-key-id": os.environ.get("AWS_ACCESS_KEY_ID"), "s3.secret-access-key": os.environ.get("AWS_SECRET_ACCESS_KEY"),
+          "s3.region": os.environ.get("AWS_REGION", "auto"), "py-io-impl": "pyiceberg.io.fsspec.FsspecFileIO"} if A.s3 else {}
+    cat = load_catalog("pondra", type="rest", uri=f"http://127.0.0.1:{A.port + 1}", **io)  # (the follower)
+    checks = {}
+    for t in ("orders", "lines"):
+        q(f"CREATE TABLE {t} (id BIGINT, v VARCHAR) WITH (publish = 'iceberg')")
+        q(f"CREATE MATERIALIZED VIEW {t}_n AS SELECT id, v FROM {t} WHERE id >= 0")
+        q(f"INSERT INTO {t} VALUES (0, 'first')")
+    q("CHECKPOINT")
+    until(lambda: all(_try(lambda: cat.load_table(f"default.{t}")) is not None for t in ("orders", "lines")), True, 30)
+    def staged(t, f):  # (a commit PyIceberg made ready: its files written, not sent)
+        tx = cat.load_table(f"default.{t}").transaction()
+        f(tx)
+        return tx
+    def change(t, tx, main=None):
+        body = json.loads(CommitTableRequest(identifier=TableIdentifier(namespace=["default"], name=t), requirements=tx._requirements, updates=tx._updates).model_dump_json())
+        for r in body["requirements"]:
+            if r["type"] == "assert-ref-snapshot-id" and main is not None:
+                r["snapshot-id"] = main  # (as a writer that retried sends it, having checked what came since)
+        return body
+    def send(path, body):
+        c = http.client.HTTPConnection("127.0.0.1", A.port + 1, timeout=60)
+        c.request("POST", path, json.dumps(body).encode(), {"content-type": "application/json"})
+        r = c.getresponse()
+        return r.status, r.read().decode()[:500]
+    rows = lambda lo, hi: pa.table({"id": pa.array(range(lo, hi), pa.int64()), "v": [f"r{i}" for i in range(lo, hi)]})
+    both = [change("orders", staged("orders", lambda tx: tx.append(rows(1, 4)))), change("lines", staged("lines", lambda tx: tx.append(rows(10, 16))))]
+    status, said = send("/v1/transactions/commit", {"table-changes": both})
+    versions = q("SELECT DISTINCT _version FROM orders WHERE id > 0 UNION ALL SELECT DISTINCT _version FROM lines WHERE id > 0")
+    views = until(lambda: (q("SELECT count(*) AS n, sum(id) AS s FROM orders_n"), q("SELECT count(*) AS n, sum(id) AS s FROM lines_n")), ([{"n": 4, "s": 6}], [{"n": 7, "s": 75}]), 20)
+    checks["a transaction over two tables is one commit: both tables' rows, one _version, each table's view following"] = status == 204 \
+        and len({r["_version"] for r in versions}) == 1 and len(versions) == 2 and views == ([{"n": 4, "s": 6}], [{"n": 7, "s": 75}]) or said
+    first, second = staged("orders", lambda tx: tx.append(rows(100, 101))), staged("lines", lambda tx: tx.append(rows(200, 201)))
+    q("INSERT INTO lines VALUES (300, 'meanwhile')")
+    q("CHECKPOINT")
+    status, said = send("/v1/transactions/commit", {"table-changes": [change("orders", first), change("lines", second)]})
+    checks["one whose second table changed since is refused (409), and changes neither table"] = status == 409 \
+        and q("SELECT count(*) AS n FROM orders WHERE id = 100") == [{"n": 0}] and q("SELECT count(*) AS n FROM lines WHERE id = 200") == [{"n": 0}]
+    q("CREATE TABLE ev (id BIGINT, v VARCHAR) WITH (publish = 'iceberg')")
+    for i in range(7):
+        q(f"INSERT INTO ev VALUES ({2 * i}, 'a'), ({2 * i + 1}, 'b')")
+        q("CHECKPOINT")  # (a small file each: seven)
+    until(lambda: _try(lambda: len(cat.load_table("default.ev").scan().plan_files())), 7, 30)
+    ids = {r["id"]: r["_row_id"] for r in q("SELECT id, _row_id FROM ev")}
+    planned = staged("ev", lambda tx: tx.delete("id = 5"))  # (a copy-on-write DELETE: one file out, one in)
+    gone = staged("ev", lambda tx: tx.delete("id = 6"))
+    q("INSERT INTO ev VALUES (14, 'a'), (15, 'b')")
+    q("CHECKPOINT")  # (the eighth small file: Pondra merges the eight)
+    merged = until(lambda: _try(lambda: len(cat.load_table("default.ev").scan().plan_files())), 1, 30)
+    main = cat.load_table("default.ev").metadata.current_snapshot_id
+    status, said = send("/v1/namespaces/default/tables/ev", change("ev", planned, main))
+    after = q("SELECT id, _row_id FROM ev ORDER BY id")
+    checks["a DELETE planned before Pondra merged its file, sent after: carried over to the merged file by row id; the rows as they should be, none twice, their ids kept"] = \
+        status == 200 and merged == 1 and [r["id"] for r in after] == [i for i in range(16) if i != 5] and all(r["_row_id"] == ids[r["id"]] for r in after if r["id"] // 2 not in (2, 7)) or {"status": status, "merged": merged, "after": after, "ids": ids}
+    q("DELETE FROM ev WHERE id = 7")
+    q("CHECKPOINT")
+    main = cat.load_table("default.ev").metadata.current_snapshot_id
+    status, said = send("/v1/namespaces/default/tables/ev", change("ev", gone, main))
+    checks["a change naming rows deleted since (and its file merged) is refused (409), the table as it was"] = status == 409 and "changed since" in said \
+        and [r["id"] for r in q("SELECT id FROM ev ORDER BY id")] == [i for i in range(16) if i not in (5, 7)]
+    [x.kill() for x in (a, b)]
+    ok = all(v is True for v in checks.values())
+    print(json.dumps({"transactions": checks, "ok": ok}, indent=1))
+    if not ok:
+        raise SystemExit("transactions: FAILED")
+    return f"transactions: several tables' changes as one commit, other engines' changes carried over Pondra's merges: all {len(checks)} checks pass"
+
+
+def upserts():
+    """Keyed tables and other engines (ADR-029 §4, §5, round 28), on two nodes: a keyed table that
+    publishes is read by PyIceberg, DuckDB (Delta) and Polars as Pondra reads it after every tier
+    round, its older versions and delete markers positions (not only after a compaction); another
+    engine's append to it is upserts, its delete (copy-on-write) delete markers, an equality delete
+    on the key a marker too; each arrives in the change feed; a table that combines its rows
+    (`order_by`) refuses them by name."""
+    import duckdb, glob, site, pyarrow as pa, pyarrow.parquet as pq, polars as pl
+    from pyiceberg.catalog import load_catalog
+    from pyiceberg.manifest import ManifestWriterV2, ManifestContent, DataFile, DataFileContent, FileFormat, ManifestEntry, ManifestEntryStatus, write_manifest_list
+    from pyiceberg.typedef import Record
+    lake = new_lake()
+    a = Node(lake, A.port, tier_secs=1, changelog_secs=600).start()
+    b = Node(lake, A.port + 1, tier_secs=1).start()
+    q = lambda s: sql(A.port, s)
+    io = {"s3.endpoint": os.environ.get("AWS_ENDPOINT"), "s3.access-key-id": os.environ.get("AWS_ACCESS_KEY_ID"), "s3.secret-access-key": os.environ.get("AWS_SECRET_ACCESS_KEY"),
+          "s3.region": os.environ.get("AWS_REGION", "auto"), "py-io-impl": "pyiceberg.io.fsspec.FsspecFileIO"} if A.s3 else {}
+    cat = load_catalog("pondra", type="rest", uri=f"http://127.0.0.1:{A.port + 1}", **io)  # (the follower)
+    con = duckdb.connect()
+    for ext in ("delta",):
+        found = [f for d in site.getsitepackages() for f in glob.glob(f"{d}/duckdb_extension_{ext}/**/{ext}.duckdb_extension", recursive=True)]
+        con.execute(f"LOAD '{found[0]}'" if found else f"INSTALL {ext}; LOAD {ext}")
+    if A.s3:
+        con.execute(f"CREATE SECRET (TYPE s3, KEY_ID '{os.environ['AWS_ACCESS_KEY_ID']}', SECRET '{os.environ['AWS_SECRET_ACCESS_KEY']}', ENDPOINT '{os.environ['AWS_ENDPOINT'].split('://')[-1]}', URL_STYLE 'path', REGION 'auto', USE_SSL {str(os.environ['AWS_ENDPOINT'].startswith('https')).lower()})")
+    checks = {}
+    q("CREATE TABLE kv (k BIGINT PRIMARY KEY, v VARCHAR) WITH (publish = 'iceberg,delta')")
+    ours = lambda: sorted((r["k"], r["v"]) for r in q("SELECT k, v FROM kv"))
+    def theirs():
+        t = cat.load_table("default.kv").scan().to_arrow()
+        where = f"{lake}/data/kv"
+        opts = {"storage_options": {"aws_endpoint_url": os.environ["AWS_ENDPOINT"], "aws_access_key_id": os.environ["AWS_ACCESS_KEY_ID"], "aws_secret_access_key": os.environ["AWS_SECRET_ACCESS_KEY"], "aws_region": "auto", "aws_allow_http": "true"}} if A.s3 else {}
+        return (sorted(zip(t["k"].to_pylist(), t["v"].to_pylist())), sorted(con.execute(f"SELECT k, v FROM delta_scan('{where}')").fetchall()),
+                sorted(pl.read_delta(where, **opts).select(["k", "v"]).rows()))
+    same = lambda want: until(lambda: _try(lambda: (ours(), *theirs())), (want,) * 4, 30)
+    rounds = []
+    for stmt, want in (("INSERT INTO kv VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e')", [(1, "a"), (2, "b"), (3, "c"), (4, "d"), (5, "e")]),
+                       ("INSERT INTO kv VALUES (2, 'B'), (6, 'f')", [(1, "a"), (2, "B"), (3, "c"), (4, "d"), (5, "e"), (6, "f")]),
+                       ("DELETE FROM kv WHERE k = 4", [(1, "a"), (2, "B"), (3, "c"), (5, "e"), (6, "f")])):
+        q(stmt)
+        rounds.append(same(want) == (want,) * 4)
+    files = len(cat.load_table("default.kv").scan().plan_files())
+    checks["a keyed table read by PyIceberg, DuckDB (Delta) and Polars as Pondra reads it after every tier round, before any compaction"] = all(rounds) and files >= 2 or (rounds, files)
+    now = [(1, "a"), (2, "B"), (3, "c"), (5, "e"), (6, "f")]
+    key = pa.schema([pa.field("k", pa.int64(), nullable=False), pa.field("v", pa.string())])  # (the key is required)
+    cat.load_table("default.kv").append(pa.table({"k": [3, 7], "v": ["three", "seven"]}, schema=key))
+    now = sorted(dict(now + [(3, "three"), (7, "seven")]).items())
+    checks["another engine's append is upserts: a key there is replaced, a new one added"] = same(now) == (now,) * 4
+    cat.load_table("default.kv").delete("k = 1")
+    now = [r for r in now if r[0] != 1]
+    checks["its DELETE (copy-on-write): the key gone, the file's other rows as they were"] = same(now) == (now,) * 4
+    # An equality delete on the key (Flink's upserts write them), as Iceberg's Java writers commit one.
+    t = cat.load_table("default.kv")
+    sid, parent, seq, loc = uuid.uuid4().int >> 65, t.metadata.current_snapshot_id, t.metadata.next_sequence_number(), t.metadata.location
+    field = pa.field("k", pa.int64(), nullable=False, metadata={"PARQUET:field_id": "1"})
+    path = f"{loc}/data/eq-{uuid.uuid4().hex}.parquet"
+    with t.io.new_output(path).create() as f:
+        pq.write_table(pa.table({"k": pa.array([2], pa.int64())}, schema=pa.schema([field])), f)
+    eq = DataFile.from_args(content=DataFileContent.EQUALITY_DELETES, file_path=path, file_format=FileFormat.PARQUET, partition=Record(), record_count=1,
+                            file_size_in_bytes=len(t.io.new_input(path)), equality_ids=[1])
+    class Deletes(ManifestWriterV2):
+        def content(self):
+            return ManifestContent.DELETES
+    with Deletes(t.spec(), t.schema(), t.io.new_output(f"{loc}/metadata/{uuid.uuid4()}-m0.avro"), sid, "deflate") as w:
+        w.add_entry(ManifestEntry.from_args(status=ManifestEntryStatus.ADDED, snapshot_id=sid, data_file=eq))
+    listed = f"{loc}/metadata/snap-{sid}-{uuid.uuid4()}.avro"
+    with write_manifest_list(2, t.io.new_output(listed), sid, parent, seq, "deflate") as lw:
+        lw.add_manifests([w.to_manifest_file()])
+    snapshot = {"snapshot-id": sid, "parent-snapshot-id": parent, "sequence-number": seq, "timestamp-ms": int(time.time() * 1000), "manifest-list": listed, "summary": {"operation": "delete"}, "schema-id": t.schema().schema_id}
+    body = {"requirements": [{"type": "assert-ref-snapshot-id", "ref": "main", "snapshot-id": parent}],
+            "updates": [{"action": "add-snapshot", "snapshot": snapshot}, {"action": "set-snapshot-ref", "ref-name": "main", "type": "branch", "snapshot-id": sid}]}
+    c = http.client.HTTPConnection("127.0.0.1", A.port + 1, timeout=60)
+    c.request("POST", "/v1/namespaces/default/tables/kv", json.dumps(body).encode(), {"content-type": "application/json"})
+    r = c.getresponse()
+    status, said = r.status, r.read().decode()[:400]
+    now = [r for r in now if r[0] != 2]
+    checks["an equality delete on the key (Flink's kind): a delete marker, the key gone"] = status == 200 and same(now) == (now,) * 4 or (status, said)
+    def changes(after):
+        body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "changes", "arguments": {"table": "kv", "after": after}}}).encode()
+        return json.loads(call(A.port, "POST", "/mcp", body, headers={"content-type": "application/json"}, timeout=120)["result"]["content"][0]["text"])
+    state, pos = {}, 0
+    for _ in range(100):
+        got = changes(pos)
+        for r in got["rows"]:
+            if r["_change_type"] == "delete":
+                state.pop(r["k"], None)
+            else:
+                state[r["k"]] = r["v"]
+        if got["position"] == pos and not got["rows"]:
+            break
+        pos = got["position"]
+    checks["the change feed replays to the table: Pondra's writes and the other engine's, as upserts and deletes"] = sorted(state.items()) == now or sorted(state.items())
+    q("CREATE TABLE latest (k BIGINT PRIMARY KEY, ts BIGINT, v VARCHAR) WITH (order_by = 'ts', publish = 'iceberg')")
+    q("INSERT INTO latest VALUES (1, 10, 'a')")
+    until(lambda: _try(lambda: cat.load_table("default.latest")) is not None, True, 30)
+    refused = _raises_text(lambda: cat.load_table("default.latest").append(pa.table({"k": [1], "ts": [5], "v": ["old"]}, schema=pa.schema([pa.field("k", pa.int64(), nullable=False), pa.field("ts", pa.int64()), pa.field("v", pa.string())]))))
+    checks["a table that combines each key's rows (order_by) refuses another engine's change by name"] = "combines each key's rows" in refused or refused
+    [x.kill() for x in (a, b)]
+    ok = all(v is True for v in checks.values())
+    print(json.dumps({"upserts": checks, "ok": ok}, indent=1, default=str))
+    if not ok:
+        raise SystemExit("upserts: FAILED")
+    return f"upserts: keyed tables published every round, other engines' upserts and deletes: all {len(checks)} checks pass"
+
+
+def followers():
+    """File commits through the log (ADR-029 §7, round 28): a bulk INSERT's files and other engines'
+    commits are the table's where they were written, and whatever follows the table follows them
+    as it follows the log's rows, in the same commit. On two nodes, PyIceberg committing through the
+    follower: two views (one adding up with a count, one row by row) follow a bulk INSERT, a
+    PyIceberg append (no copy: its file where PyIceberg wrote it) and a PyIceberg DELETE (the views
+    take back its rows); every row of a commit has that commit as its `_version`; the change feed
+    replays to the table (inserts, deletes); a Kafka consumer reads every appended row in order, a
+    big commit a piece at a time; a streaming task takes a bulk INSERT's and PyIceberg's rows, and a
+    change it can't follow is refused by name; a stream join pairs rows bulk INSERTs wrote."""
+    import kafka as kp, pyarrow as pa
+    from pyiceberg.catalog import load_catalog
+    lake = new_lake()
+    kport = A.port + 30
+    a = Node(lake, A.port, tier_secs=1, kafka=f"127.0.0.1:{kport}", changelog_secs=600).start()
+    b = Node(lake, A.port + 1, tier_secs=1).start()
+    q = lambda s, port=A.port: sql(port, s)
+    io = {"s3.endpoint": os.environ.get("AWS_ENDPOINT"), "s3.access-key-id": os.environ.get("AWS_ACCESS_KEY_ID"), "s3.secret-access-key": os.environ.get("AWS_SECRET_ACCESS_KEY"),
+          "s3.region": os.environ.get("AWS_REGION", "auto"), "py-io-impl": "pyiceberg.io.fsspec.FsspecFileIO"} if A.s3 else {}
+    cat = load_catalog("pondra", type="rest", uri=f"http://127.0.0.1:{A.port + 1}", **io)  # (the follower)
+    checks = {}
+    q("CREATE TABLE ev (id BIGINT, g VARCHAR, amount DOUBLE) WITH (publish = 'iceberg')")
+    q("CREATE MATERIALIZED VIEW per_g AS SELECT g, count(*) AS n, sum(amount) AS total FROM ev GROUP BY g")
+    q("CREATE MATERIALIZED VIEW big AS SELECT id, g, amount FROM ev WHERE amount >= 500")
+    q("INSERT INTO ev SELECT value, 'g' || (value % 3), value * 1.0 FROM generate_series(0, 99)")  # (a bulk INSERT: files)
+    n = 20_000 if A.s3 else 100_000
+    rows = lambda lo, hi: pa.table({"id": pa.array(range(lo, hi), pa.int64()), "g": [f"g{i % 3}" for i in range(lo, hi)], "amount": pa.array([float(i) for i in range(lo, hi)])})
+    until(lambda: _try(lambda: cat.load_table("default.ev")) is not None, True, 30)
+    cat.load_table("default.ev").append(rows(100, 100 + n))
+    files = [f.file.file_path for f in cat.load_table("default.ev").scan().plan_files()]
+    versions = q("SELECT count(DISTINCT _version) AS v, count(*) AS n FROM ev WHERE id >= 100")
+    views = lambda: (q("SELECT g, n, total FROM per_g ORDER BY g"), q("SELECT count(*) AS n, sum(id) AS s FROM big"))
+    want = lambda: (q("SELECT g, count(*) AS n, sum(amount) AS total FROM ev GROUP BY g ORDER BY g"), q("SELECT count(*) AS n, sum(id) AS s FROM ev WHERE amount >= 500"))
+    appended = until(views, want(), 20)
+    checks["two views follow a bulk INSERT and a PyIceberg append, its file where PyIceberg wrote it, each commit's rows its _version"] = appended == want() \
+        and appended[0][0]["n"] == (n + 100 + 2) // 3 and versions == [{"v": 1, "n": n}] and any("/data/ev/data/" in f for f in files)
+    cat.load_table("default.ev").delete("id < 50 or id >= 1000")
+    deleted = until(views, want(), 20)
+    checks["and a PyIceberg DELETE: the adding-up view takes the rows back, the row-by-row one drops them"] = deleted == want() \
+        and q("SELECT count(*) AS n FROM ev") == [{"n": 950}] and deleted[1] == [{"n": 500, "s": sum(range(500, 1000))}]
+    state, pos = {}, 0
+    def changes(after):
+        body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "changes", "arguments": {"table": "ev", "after": after}}}).encode()
+        return json.loads(call(A.port, "POST", "/mcp", body, headers={"content-type": "application/json"}, timeout=120)["result"]["content"][0]["text"])
+    kinds = set()
+    for _ in range(1000):
+        got = changes(pos)
+        for r in got["rows"]:
+            kinds.add(r["_change_type"])
+            if r["_change_type"] == "insert":
+                state[r["_row_id"]] = r["id"]
+            else:
+                state.pop(r["_row_id"], None)
+        if got["position"] == pos and not got["rows"]:
+            break
+        pos = got["position"]
+    checks["the change feed replays to the table: the bulk INSERT's and PyIceberg's rows as inserts, its DELETE's as deletes (and the rows it rewrote)"] = \
+        sorted(state.values()) == [r["id"] for r in q("SELECT id FROM ev ORDER BY id")] and kinds == {"insert", "delete"}
+    c = kp.KafkaConsumer("ev", bootstrap_servers=f"127.0.0.1:{kport}", auto_offset_reset="earliest", consumer_timeout_ms=5000, max_partition_fetch_bytes=64 << 10, fetch_max_bytes=64 << 10)
+    got = [json.loads(r.value)["id"] for r in c]
+    c.close()
+    checks["a Kafka consumer reads every row appended, in order, a big commit a piece at a time (and the rows a DELETE rewrote)"] = got[:100 + n] == list(range(100 + n))
+    q("CREATE TABLE src (id BIGINT, v VARCHAR) WITH (publish = 'iceberg')")
+    q("CREATE TABLE dst (id BIGINT, v VARCHAR)")
+    call(A.port, "POST", "/tasks/copy_src", json.dumps({"source": "src", "target": "dst", "sql": "SELECT id, v FROM src"}).encode())
+    q("INSERT INTO src SELECT value, 'bulk' FROM generate_series(1, 10)")
+    until(lambda: _try(lambda: cat.load_table("default.src")) is not None, True, 30)
+    cat.load_table("default.src").append(pa.table({"id": pa.array([11, 12], pa.int64()), "v": ["iceberg", "iceberg"]}))
+    task = until(lambda: q("SELECT count(*) AS n, sum(id) AS s FROM dst"), [{"n": 12, "s": 78}], 20)
+    refused = _raises_text(lambda: cat.load_table("default.src").delete("id = 1"))
+    checks["a streaming task takes a bulk INSERT's rows and PyIceberg's; a change it can't follow is refused by name"] = task == [{"n": 12, "s": 78}] \
+        and "task copy_src" in refused and q("SELECT count(*) AS n FROM src") == [{"n": 12}]
+    q("CREATE TABLE orders (id BIGINT, amount DOUBLE)")
+    q("CREATE TABLE payments (order_id BIGINT, paid DOUBLE)")
+    q("CREATE MATERIALIZED VIEW paid WITH (join = 'streams') AS SELECT o.id, o.amount, p.paid FROM orders o JOIN payments p ON o.id = p.order_id")
+    q("INSERT INTO orders SELECT value, value * 1.0 FROM generate_series(1, 50)")
+    q("INSERT INTO payments SELECT value, value + 0.5 FROM generate_series(26, 75)")
+    q("INSERT INTO orders SELECT value, value * 1.0 FROM generate_series(51, 60)")
+    pairs = until(lambda: q("SELECT count(*) AS n, min(id) AS lo, max(id) AS hi FROM paid"), [{"n": 35, "lo": 26, "hi": 60}], 20)
+    checks["a stream join pairs the rows bulk INSERTs wrote on either side, each pair once"] = pairs == [{"n": 35, "lo": 26, "hi": 60}]
+    [x.kill() for x in (a, b)]
+    ok = all(checks.values())
+    print(json.dumps({"followers": checks, "ok": ok}, indent=1))
+    if not ok:
+        print(json.dumps({"appended": appended, "versions": versions, "files": files[:3], "deleted": deleted, "want": want(), "kinds": sorted(kinds), "state": len(state), "kafka": [len(got), got[:3], got[-3:]],
+                          "task": task, "refused": refused[:300], "pairs": pairs}, default=str))
+        sys.exit(1)
+    return f"followers: file commits followed as the log's rows are (views, the change feed, Kafka, tasks, a stream join): all {len(checks)} checks pass"
 
 
 def live():
@@ -4470,7 +4750,7 @@ console.log(JSON.stringify(await db.run("etl/orders.sql", {{ day: "2026-09-29", 
     q("CREATE TASK nightly SCHEDULE '2 seconds' AS CALL run('etl/orders.sql', day => DATE '2026-09-29', region => 'task', amount => 1.0)")
     ticked = until(lambda: q("SELECT count(*) > 0 AS ran FROM orders WHERE region = 'task'"), [{"ran": True}], 30)
     q("DROP TASK nightly")
-    by_task = q("SELECT caller FROM pondra.runs WHERE routine LIKE 'files/etl/orders.sql@%' AND caller LIKE 'task:%' LIMIT 1")
+    by_task = until(lambda: q("SELECT caller FROM pondra.runs WHERE routine LIKE 'files/etl/orders.sql@%' AND caller LIKE 'task:%' LIMIT 1"), [{"caller": "task:nightly"}], 15)
     checks["a task runs a file on its schedule, the run log naming the task"] = ticked == [{"ran": True}] and by_task == [{"caller": "task:nightly"}]
     version = urllib.request.urlopen(urllib.request.Request(f"http://127.0.0.1:{A.port}/files/etl/orders.sql", headers={"authorization": "Bearer a-tok"})).headers["etag"].strip('"')
     logged = until(lambda: q(f"SELECT routine, args, status FROM pondra.runs WHERE routine = 'files/etl/orders.sql@{version}' AND args LIKE '%\"region\":\"west\"%'"), None, 5)
@@ -4639,7 +4919,7 @@ def server():
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    out = {t.__name__: t() for t in (upsert, deal, outside, clouds, kafkas, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, live, temps, across, found, renames, workspace, server, scale, flight, reader, crash)}
+    out = {t.__name__: t() for t in (upsert, deal, outside, clouds, kafkas, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, found, renames, workspace, server, scale, flight, reader, crash)}
     A.secs = min(A.secs, 20)
     out["load"] = load()
     print(json.dumps(out, indent=1))
@@ -4647,7 +4927,7 @@ def all_tests():
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "live", "temps", "across", "found", "renames", "workspace", "server", "scale", "flight", "load", "all"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "found", "renames", "workspace", "server", "scale", "flight", "load", "all"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -4658,4 +4938,4 @@ if __name__ == "__main__":
     ap.add_argument("--secs", type=int, default=30)
     ap.add_argument("--flush-ms", type=int, default=250)
     A = ap.parse_args()
-    {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "live": live, "temps": temps, "across": across, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "load": load, "all": all_tests}[A.mode]()
+    {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "load": load, "all": all_tests}[A.mode]()

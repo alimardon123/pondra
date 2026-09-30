@@ -1,0 +1,100 @@
+{
+ "network": {
+  "100.87.98.41:8080": {
+   "path": "pong from pondra-36696766035-0 (100.87.98.41) via 4.154.117.243:51200 in 64ms",
+   "mb_s": 44.7
+  },
+  "100.111.238.48:8080": {
+   "path": "pong from pondra-36696766035-1 (100.111.238.48) via 20.168.127.84:17536 in 49ms",
+   "mb_s": 56.2
+  },
+  "100.99.113.69:8080": {
+   "path": "pong from pondra-36696766035-2 (100.99.113.69) via 64.236.161.18:33792 in 20ms",
+   "mb_s": 123.2
+  },
+  "100.94.229.61:8080": {
+   "path": "pong from pondra-36696766035-3 (100.94.229.61) via 57.152.36.195:18304 in 1ms",
+   "mb_s": 276.4
+  },
+  "100.86.129.65:8080": {
+   "path": "pong from pondra-36696766035-4 (100.86.129.65) via 172.184.209.162:9232 in 67ms",
+   "mb_s": 42.3
+  },
+  "100.82.202.4:8080": {
+   "path": "pong from pondra-36696766035-5 (100.82.202.4) via 20.83.158.129:24512 in 1ms",
+   "mb_s": 404.0
+  }
+ }
+}
+{"rows":5}
+{"rows":25}
+{"rows":100000}
+{"rows":1500000}
+{"rows":2000000}
+{"rows":8000000}
+{"rows":15000000}
+{"rows":59986052}
+q1   one node    2.46s  6 nodes    2.01s shuffled  (spread anyway    1.07s shuffled )  same=True  sent 0.1 MB (0.2 MB), waited 21.441 s (0.382 s)
+q2   one node    0.37s  6 nodes    0.36s one node  (spread anyway    0.40s gathered )  same=True  sent 0.0 MB (0.1 MB), waited 0.0 s (0.0 s)
+q3   one node    0.77s  6 nodes    0.80s one node  (spread anyway    0.65s shuffled )  same=True  sent 0.0 MB (1.7 MB), waited 0.0 s (1.183 s)
+q4   one node    0.64s  6 nodes    0.65s one node  (spread anyway    0.54s shuffled )  same=True  sent 0.0 MB (0.0 MB), waited 0.0 s (0.378 s)
+q5   one node    1.40s  6 nodes    1.43s one node  (spread anyway    4.54s shuffled )  same=True  sent 0.0 MB (518.7 MB), waited 0.0 s (14.937 s)
+q6   one node    0.68s  6 nodes    0.46s gathered  (spread anyway    0.46s gathered )  same=True  sent 0.0 MB (0.0 MB), waited 0.0 s (0.0 s)
+q7   one node    1.09s  6 nodes    1.11s one node  (spread anyway    1.32s shuffled )  same=True  sent 0.0 MB (68.0 MB), waited 0.0 s (3.168 s)
+q8   one node    1.20s  6 nodes    1.07s one node  (spread anyway    1.26s shuffled )  same=True  sent 0.0 MB (1.9 MB), waited 0.0 s (1.983 s)
+q9   one node    2.14s  6 nodes    2.15s one node  (spread anyway    4.07s shuffled )  same=True  sent 0.0 MB (216.0 MB), waited 0.0 s (11.771 s)
+q10  one node    1.14s  6 nodes    1.15s one node  (spread anyway    2.73s shuffled )  same=True  sent 0.0 MB (227.6 MB), waited 0.0 s (8.796 s)
+q11  one node    0.27s  6 nodes    0.28s one node  (spread anyway    0.42s shuffled )  same=True  sent 0.0 MB (0.1 MB), waited 0.0 s (0.376 s)
+q12  one node    0.90s  6 nodes    0.90s one node  (spread anyway    0.53s shuffled )  same=True  sent 0.0 MB (0.0 MB), waited 0.0 s (0.376 s)
+q13  one node    1.32s  6 nodes    1.32s one node  (spread anyway    1.73s shuffled )  same=True  sent 0.0 MB (83.0 MB), waited 0.0 s (4.114 s)
+q14  one node    0.60s  6 nodes    0.60s one node  (spread anyway    0.82s shuffled )  same=True  sent 0.0 MB (27.4 MB), waited 0.0 s (2.026 s)
+q15  one node    1.13s  6 nodes    1.14s one node  (spread anyway    1.12s shuffled )  same=True  sent 0.0 MB (22.7 MB), waited 0.0 s (2.753 s)
+q16  one node    1.09s  6 nodes    1.08s one node  (spread anyway    1.89s shuffled )  same=True  sent 0.0 MB (21.2 MB), waited 0.0 s (3.003 s)
+q17  one node    0.88s  6 nodes    0.84s one node  (spread anyway    0.92s shuffled )  same=True  sent 0.0 MB (1.6 MB), waited 0.0 s (1.981 s)
+q18  one node    2.31s  6 nodes    2.33s one node  (spread anyway    3.50s shuffled )  same=True  sent 0.0 MB (266.4 MB), waited 0.0 s (9.566 s)
+q19  one node    1.03s  6 nodes    1.04s one node  (spread anyway    0.59s shuffled )  same=True  sent 0.0 MB (0.2 MB), waited 0.0 s (0.493 s)
+q20  one node    1.19s  6 nodes    1.21s one node  (spread anyway    2.10s shuffled )  same=True  sent 0.0 MB (74.9 MB), waited 0.0 s (4.503 s)
+q21  one node    2.64s  6 nodes    1.19s shuffled  (spread anyway    1.18s shuffled )  same=True  sent 0.2 MB (0.2 MB), waited 0.379 s (0.378 s)
+q22  one node    0.29s  6 nodes    0.28s one node  (spread anyway    1.34s shuffled )  same=True  sent 0.0 MB (56.0 MB), waited 0.0 s (4.487 s)
+{
+ "nodes": 6,
+ "lake": "s3://<bucket>/bench-36696766035",
+ "data": "tpch",
+ "network": {
+  "100.87.98.41:8080": {
+   "path": "pong from pondra-36696766035-0 (100.87.98.41) via 4.154.117.243:51200 in 64ms",
+   "mb_s": 44.7
+  },
+  "100.111.238.48:8080": {
+   "path": "pong from pondra-36696766035-1 (100.111.238.48) via 20.168.127.84:17536 in 49ms",
+   "mb_s": 56.2
+  },
+  "100.99.113.69:8080": {
+   "path": "pong from pondra-36696766035-2 (100.99.113.69) via 64.236.161.18:33792 in 20ms",
+   "mb_s": 123.2
+  },
+  "100.94.229.61:8080": {
+   "path": "pong from pondra-36696766035-3 (100.94.229.61) via 57.152.36.195:18304 in 1ms",
+   "mb_s": 276.4
+  },
+  "100.86.129.65:8080": {
+   "path": "pong from pondra-36696766035-4 (100.86.129.65) via 172.184.209.162:9232 in 67ms",
+   "mb_s": 42.3
+  },
+  "100.82.202.4:8080": {
+   "path": "pong from pondra-36696766035-5 (100.82.202.4) via 20.83.158.129:24512 in 1ms",
+   "mb_s": 404.0
+  }
+ },
+ "load_s": 141.6,
+ "settle_s": 246.4,
+ "one_node_s": 25.53,
+ "cluster_s": 23.41,
+ "forced_s": 33.18,
+ "spread": 3,
+ "forced_spread": 22,
+ "all_same": true,
+ "cpus": 4,
+ "wire_mb": 0.3,
+ "wait_s": 21.82
+}

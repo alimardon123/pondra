@@ -63,7 +63,7 @@ pub async fn copy_table(lake: &Lake, df: datafusion::prelude::DataFrame, to: &st
             let (file, body) = match format {
                 "delta" => {
                     let schema = crate::delta::schema_string(&columns).with_context(|| format!("COPY … TO {to}: a column's type has no Delta equivalent"))?;
-                    let actions = [crate::delta::protocol(&schema), crate::delta::metadata(&uuid::Uuid::new_v4().to_string(), name, &schema, now)];
+                    let actions = [crate::delta::protocol(&schema, false), crate::delta::metadata(&uuid::Uuid::new_v4().to_string(), name, &schema, now, false)];
                     ("_delta_log/00000000000000000000.json", actions.iter().map(|a| a.to_string() + "\n").collect::<String>())
                 }
                 _ => ("metadata/v1.metadata.json", crate::iceberg::empty(root, &columns, now).with_context(|| format!("COPY … TO {to}: a column's type has no Iceberg equivalent"))?.to_string()),
@@ -289,7 +289,7 @@ pub async fn write_files(lake: &Lake, root: &str, dir: &str, df: datafusion::pre
             let piece = RecordBatch::try_new(schema.clone(), cols)?;
             let w = match open.entry(p.folder.clone()) {
                 std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-                std::collections::hash_map::Entry::Vacant(e) => e.insert((ArrowWriter::try_new(vec![], schema.clone(), Some(props()))?, 0, p.values)),
+                std::collections::hash_map::Entry::Vacant(e) => e.insert((ArrowWriter::try_new_with_options(vec![], schema.clone(), crate::tier::plain(props()))?, 0, p.values)),
             };
             w.0.write(&piece)?;
             w.1 += piece.num_rows() as u64;

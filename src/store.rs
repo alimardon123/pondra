@@ -60,6 +60,23 @@ pub struct TableMeta {
     pub tiered: u64, // every segment <= `tiered` is already inside `files` (or sealed)
     #[serde(default)]
     pub garbage: Vec<(String, u64)>, // replaced files + when; deleted after the retention period
+    /// The commit that last put rows into its files (tiered from the log, or a file commit): with
+    /// its purges, what tells a version that changed its rows from one that only rewrote its files
+    /// (`iceberg::publish`: a `replace`, which writers' conflict checks pass over).
+    #[serde(default)]
+    pub rows_at: u64,
+    /// An upsert table whose older versions are positions (`tier::shadow`): each round since it
+    /// held one generation of files (made, or compacted), so every generation it has is published.
+    #[serde(default)]
+    pub shadows: bool,
+    /// The position-delete files of replaced files, and when: deleted after the retention period
+    /// too, unless another of the table's files still names one (a delete file may name several).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub garbage_deletes: Vec<(String, u64)>,
+    /// Those files' records, while they are kept: a writer that read the table before they were
+    /// replaced names them, and its change is carried over by their rows' ids (`adopt::carry`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub replaced: Vec<DataFile>,
     #[serde(default)]
     pub publish: Vec<String>, // open formats other engines also read it in: "delta", "iceberg"
     #[serde(default)]
@@ -106,11 +123,19 @@ pub struct TableMeta {
     /// Another engine's table (`scan.rs`): what matches its files' columns to its own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outside: Option<crate::scan::Table>,
+    /// Other engines' properties of the table (Iceberg's: `write.delete.mode`, say), kept and
+    /// published for them; Pondra's own options are fields above.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub properties: BTreeMap<String, String>,
 }
 
 impl TableMeta {
     /// The changes whose old rows are out of the table's files: reads skip their `{t}$deleted` rows.
     pub fn purged(&self) -> u64 { self.purges.last().map_or(0, |p| p.0) }
+
+    /// Is this column an upsert table's delete markers (`_deleted`)? Others never see it: published,
+    /// its rows are positions (`tier::shadow`), and Iceberg keeps the name for its own.
+    pub fn marker(&self, column: &str) -> bool { column == "_deleted" && !self.key.is_empty() }
 
     /// Has any column been renamed or dropped (ADR-022)? If not, SQL sees `columns` as stored.
     pub fn mapped(&self) -> bool { !self.names.is_empty() || !self.dropped.is_empty() }
@@ -233,6 +258,37 @@ pub struct DataFile {
     /// doesn't hold, from here (`scan::adopted`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lineage: Option<Lineage>,
+    /// Rows deleted from it by position (ADR-029 §4), in Iceberg's position-delete files (paths in
+    /// the lake) that name it: another engine's merge-on-read change, or Pondra's own changes
+    /// (`tier::positions`). Reads skip them without decoding them (`scan::lake_files`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deletes: Vec<crate::scan::Delete>,
+    /// How many of its rows those delete (a file mostly deleted is rewritten: `tier::maintain`).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub deleted: u64,
+}
+
+fn is_zero(n: &u64) -> bool { *n == 0 }
+
+impl TableMeta {
+    /// Files replaced or taken out: they go after the retention period, and their position-delete
+    /// files with them (`tier::expire`).
+    pub fn discard(&mut self, files: &[DataFile]) {
+        let now = crate::log::now_ms();
+        self.garbage.extend(files.iter().map(|f| (f.path.clone(), now)));
+        self.garbage_deletes.extend(files.iter().flat_map(|f| f.delete_files()).map(|p| (p.clone(), now)));
+        self.replaced.extend(files.iter().map(|f| DataFile { stats: Default::default(), sketch: Default::default(), nulls: None, ..f.clone() }));
+    }
+}
+
+impl DataFile {
+    /// The position-delete files that name it (paths in the lake).
+    pub fn delete_files(&self) -> impl Iterator<Item = &String> {
+        self.deletes.iter().filter_map(|d| match d {
+            crate::scan::Delete::Positions { path, .. } => Some(path),
+            _ => None,
+        })
+    }
 }
 
 /// Where a file's rows' system columns come from when it doesn't hold them: its first row's id
@@ -249,11 +305,36 @@ pub struct Lineage {
 /// One log segment = one node's flush, holding rows for many tables. Small segments are stored
 /// inside the catalog write itself (one round trip to object storage per flush); big ones as an
 /// object written by the node that received the rows.
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Default)]
 pub struct Segment {
     pub path: String,                                // empty = inline, under data_key(seg)
     pub parts: BTreeMap<String, Vec<(u64, u64, u64)>>, // table -> (offset, length, rows) of Arrow IPC streams
     pub ts_ms: u64,
+    /// A file commit (ADR-029 §7): the files it put into tables and took out of them, whose rows
+    /// the log's readers read from the files — the change feed, Kafka topics, `/watch`, tasks.
+    /// Queries and tiering don't: the files are the tables' own already.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub files: BTreeMap<String, Filed>,
+}
+
+/// One table's files in a file commit, as they were then.
+#[derive(Serialize, Deserialize, Clone, Default)]
+pub struct Filed {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub added: Vec<DataFile>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub removed: Vec<DataFile>,
+    /// Files it deleted rows of by position: each as it was, with the deletes it took.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deleted: Vec<(DataFile, Vec<crate::scan::Delete>)>,
+}
+
+impl Segment {
+    /// Rows of `table` this segment gives the log's readers: its parts', then its files'.
+    pub fn rows_of(&self, table: &str) -> u64 {
+        let parts = self.parts.get(table).map_or(0, |p| p.iter().map(|x| x.2).sum::<u64>());
+        parts + self.files.get(table).map_or(0, |f| f.added.iter().map(|d| d.rows).sum::<u64>())
+    }
 }
 
 pub fn table_key(t: &str) -> String { format!("t/{t}") }
@@ -796,6 +877,40 @@ impl Lake {
             c.1 -= old.iter().map(|b| b.get_array_memory_size()).sum::<usize>();
         }
         Ok(rows)
+    }
+
+    /// Rows of `table` a file commit gives the log's readers (`Segment::files`): its files' rows as
+    /// they were then, with their system columns (stored names), from the `from`-th on and `rows`
+    /// of them at most; `removed`: the rows of the files it took out.
+    pub async fn filed_rows(&self, seg: &Segment, table: &str, removed: bool, from: u64, rows: u64) -> Result<Vec<RecordBatch>> {
+        let (Some(filed), Some(meta)) = (seg.files.get(table), self.cat.get::<TableMeta>(&table_key(table)).await?) else { return Ok(vec![]) };
+        let meta = crate::sys::with_sys(&meta);
+        let schema = crate::query::schema(&meta.columns)?;
+        let (ctx, end, mut at, mut out) = (self.session(), from.saturating_add(rows), 0u64, vec![]);
+        for f in if removed { &filed.removed } else { &filed.added } {
+            let (lo, hi) = (at.max(from), (at + f.rows).min(end));
+            if lo < hi {
+                out.extend(crate::scan::file_rows(self, &ctx, f, &meta, &schema, crate::scan::Pick::Range(lo - at, hi - at)).await?.collect().await?);
+            }
+            at += f.rows;
+            if at >= end {
+                break;
+            }
+        }
+        out.iter().map(|b| crate::query::conform(b, &schema)).collect()
+    }
+
+    /// Rows of `table` a file commit deleted by position (`Filed::deleted`), with their system
+    /// columns (stored names): each file's rows at the places its new deletes name.
+    pub async fn deleted_rows(&self, seg: &Segment, table: &str) -> Result<Vec<RecordBatch>> {
+        let (Some(filed), Some(meta)) = (seg.files.get(table), self.cat.get::<TableMeta>(&table_key(table)).await?) else { return Ok(vec![]) };
+        let meta = crate::sys::with_sys(&meta);
+        let schema = crate::query::schema(&meta.columns)?;
+        let mut out = vec![];
+        for (f, deletes) in &filed.deleted {
+            out.extend(crate::adopt::rows_deleted(self, &meta, f, deletes, &schema).await?);
+        }
+        out.iter().map(|b| crate::query::conform(b, &schema)).collect()
     }
 
     pub async fn delete(&self, path: &str) {

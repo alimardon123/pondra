@@ -4,7 +4,7 @@
 //! catalog write, so a crash never loses or doubles rows (an uncommitted Parquet file is just an
 //! unreferenced object). Then, separately, `maintain` keeps the file count down: small append
 //! files are merged 8 at a time, and keyed tables are compacted into one file once 8 pile up.
-use crate::query::{latest_sql, raw, schema, tail};
+use crate::query::{latest_sql, raw, schema};
 use datafusion::prelude::ParquetReadOptions;
 use crate::store::*;
 use anyhow::{Context, Result};
@@ -66,8 +66,12 @@ pub async fn tier_table(lake: &Lake, table: &str, hwm: u64, nodes: &[String], me
     let mut files = deal(lake, jobs, nodes, me).await?;
     let rows = files.iter().map(|f| f.rows).sum();
     crate::sketch::add(&mut meta, &mut files);
+    let one = meta.files.windows(2).all(|w| w[0].ord == w[1].ord); // (one generation, or none: nothing shadowed yet)
+    meta.shadows = shadowing(&meta) && (meta.shadows || one);
+    let new: Vec<String> = files.iter().map(|f| f.path.clone()).collect();
     meta.files.extend(files);
-    meta.tiered = upto;
+    (meta.tiered, meta.rows_at) = (upto, upto);
+    shadow(lake, table, &mut meta, &new, true).await?;
     lake.cat.commit(vec![(table_key(table), json(&meta))], &[]).await?;
     lake.backlog.fetch_sub(n.min(lake.backlog.load(std::sync::atomic::Ordering::Relaxed)), std::sync::atomic::Ordering::Relaxed);
     Ok((rows, n < MAX_ROWS))
@@ -97,15 +101,17 @@ pub async fn maintain(lake: &Lake, table: &str, nodes: &[String], me: &str, now_
             false => Kind::Squash { files: run.clone() },
         };
         let merged = deal(lake, vec![Job::new(table, &meta, job)], nodes, me).await?;
+        let new: Vec<String> = merged.iter().map(|f| f.path.clone()).collect();
         replace(&mut meta, &run, merged);
+        shadow(lake, table, &mut meta, &new, false).await?; // (its delete markers, kept to shadow what's older)
         true
-    } else if meta.key.is_empty() && small.len() >= 2 {
+    } else if meta.key.is_empty() && (small.len() >= 2 || meta.files.iter().any(mostly_deleted)) {
         // Small files of one partition merge together (so each file keeps one): 8 at a time, and
         // all of them before they're sealed (manifests never change, so they'd stay small).
         let sealing: std::collections::HashSet<&str> = crate::manifest::to_seal(&meta).iter().map(|f| f.path.as_str()).collect();
         let mut by_part: BTreeMap<(&str, bool), Vec<DataFile>> = BTreeMap::new();
         small.iter().for_each(|f| by_part.entry((f.part.as_str(), sealing.contains(f.path.as_str()))).or_default().push(f.clone()));
-        let groups: Vec<Vec<DataFile>> = by_part.into_iter().flat_map(|((_, sealing), g)| {
+        let mut groups: Vec<Vec<DataFile>> = by_part.into_iter().flat_map(|((_, sealing), g)| {
             let (least, most) = if sealing { (2, 32) } else { (8, 8) };
             if g.len() < least {
                 return vec![];
@@ -122,6 +128,11 @@ pub async fn maintain(lake: &Lake, table: &str, nodes: &[String], me: &str, now_
             groups.retain(|g| g.len() > 1);
             groups
         }).collect();
+        // A file a tenth or more of whose rows were deleted by position is rewritten without
+        // them (a merge reads it so), alone if no merge took it: the purge that used to rewrite
+        // every changed file every round, now for the files it pays for (ADR-029 §4).
+        let merged: std::collections::HashSet<String> = groups.iter().flatten().map(|f| f.path.clone()).collect();
+        groups.extend(meta.files.iter().filter(|f| mostly_deleted(f) && !merged.contains(&f.path)).map(|f| vec![f.clone()]));
         if !groups.is_empty() {
             let jobs = groups.iter().map(|g| Job::new(table, &meta, Kind::Merge { files: g.clone() })).collect();
             let merged = deal(lake, jobs, nodes, me).await?;
@@ -139,13 +150,63 @@ pub async fn maintain(lake: &Lake, table: &str, nodes: &[String], me: &str, now_
     Ok(true)
 }
 
+/// A file a tenth or more of whose rows were deleted by position: `maintain` rewrites it.
+/// An upsert table that others read, each round (ADR-029 §4): the rows its new files shadow in
+/// older ones — older versions of their keys — and the new files' delete markers become positions,
+/// so other engines read one row per key between compactions (`delta::publishable`). Pondra's own
+/// reads pass over them: the newest row per key is theirs anyway (`query::files_once`). `older`:
+/// look for the new keys in the older files (a squash's output shadows nothing new).
+async fn shadow(lake: &Lake, table: &str, meta: &mut TableMeta, new: &[String], older: bool) -> Result<()> {
+    use datafusion::arrow::{array::AsArray, datatypes::Int64Type};
+    use datafusion::prelude::{col, ident};
+    meta.shadows &= shadowing(meta); // (published no longer, say: positions stop, and start again after a compaction)
+    if !meta.shadows || new.is_empty() {
+        return Ok(());
+    }
+    let (ctx, marked) = (lake.session(), meta.columns.iter().any(|(c, _)| c == "_deleted"));
+    let cols: Vec<(String, String)> = meta.columns.iter().filter(|(c, _)| meta.key.contains(c) || c == "_deleted").cloned().collect();
+    let schema = schema(&cols)?;
+    let places = |b: Vec<RecordBatch>| b.iter().flat_map(|b| b.column(0).as_primitive::<Int64Type>().values().iter().map(|p| *p as u64).collect::<Vec<_>>()).collect::<Vec<u64>>();
+    let mut hit: Vec<(String, Vec<u64>)> = vec![];
+    let mut fresh: Vec<(u64, datafusion::prelude::DataFrame)> = vec![]; // (each new file's keys, by its generation)
+    for f in meta.files.iter().filter(|f| new.contains(&f.path)) {
+        let df = crate::scan::placed(lake, &ctx, f, &schema).await?;
+        fresh.push((f.ord, df.clone().select(meta.key.iter().map(|k| ident(k).alias(format!("__k_{k}"))).collect::<Vec<_>>())?));
+        if marked {
+            hit.push((f.path.clone(), places(df.filter(col("_deleted").is_true())?.select_columns(&["__row"])?.collect().await?)));
+        }
+    }
+    for f in meta.files.iter().filter(|_| older) {
+        let Some(newer) = fresh.iter().filter(|(ord, _)| *ord > f.ord).map(|(_, k)| k.clone()).reduce(|a, b| a.union(b).expect("the same columns")) else { continue };
+        let (left, right): (Vec<String>, Vec<String>) = meta.key.iter().map(|k| (k.clone(), format!("__k_{k}"))).unzip();
+        let (left, right) = (left.iter().map(String::as_str).collect::<Vec<_>>(), right.iter().map(String::as_str).collect::<Vec<_>>());
+        let df = crate::scan::placed(lake, &ctx, f, &schema).await?.join(newer, datafusion::common::JoinType::LeftSemi, &left, &right, None)?;
+        hit.push((f.path.clone(), places(df.select_columns(&["__row"])?.collect().await?)));
+    }
+    let folder = meta.folder(table).to_string();
+    for (path, at) in hit.into_iter().filter(|(_, at)| !at.is_empty()) {
+        let (p, rows, bytes) = write_positions(lake, &folder, at.iter().map(|i| (lake.full(&path), *i)).collect()).await?;
+        let f = meta.files.iter_mut().find(|f| f.path == path).expect("the table's");
+        f.deletes.push(crate::scan::Delete::Positions { path: p, file: lake.full(&path), rows, bytes });
+        f.deleted += at.len() as u64;
+    }
+    Ok(())
+}
+
+/// An upsert table (newest wins: no merge functions, no `order_by`) that others read.
+fn shadowing(meta: &TableMeta) -> bool { !meta.key.is_empty() && meta.merge.is_empty() && meta.order.is_none() && !meta.publish.is_empty() }
+
+fn mostly_deleted(f: &DataFile) -> bool { f.deleted > 0 && f.deleted * 10 >= f.rows }
+
 /// UPDATE, DELETE and MERGE leave an append table's old rows in its files, and reads leave them
-/// out (`query::current`, against `{t}$deleted`). A purge rewrites the files holding them without
-/// them — so other engines (Delta, Iceberg) see the change, and reads stop paying for it: every
-/// round for a table that is published, else once `PONDRA_PURGE_ROWS` (100,000) old rows or a
-/// tenth of the table wait. It covers the changes whose old rows are all in files and whose
-/// tombstones are too (commits up to both tables' `tiered`), and says so (`TableMeta::purges`).
-/// `now_anyway`: whatever waits (`CHECKPOINT`).
+/// out (`query::current`, against `{t}$deleted`). A purge turns them into positions (ADR-029 §4):
+/// each file holding one gets an Iceberg position-delete file naming its rows' places
+/// (`DataFile::deletes`), which reads skip unread and other engines see (Iceberg as delete files,
+/// Delta as deletion vectors) — no file rewritten; a file mostly deleted is rewritten later
+/// (`maintain`). Every round for a table that is published, else once `PONDRA_PURGE_ROWS`
+/// (100,000) old rows or a tenth of the table wait. It covers the changes whose old rows are all
+/// in files and whose tombstones are too (commits up to both tables' `tiered`), and says so
+/// (`TableMeta::purges`). `now_anyway`: whatever waits (`CHECKPOINT`).
 /// A `{t}$deleted` file whose changes were all purged goes once every reader has passed that
 /// purge (`retain_ms` later: a reader with an older entry for the table still needs it).
 pub async fn purge(lake: &Lake, table: &str, nodes: &[String], me: &str, retain_ms: u64, now_anyway: bool) -> Result<bool> {
@@ -179,18 +240,23 @@ pub async fn purge(lake: &Lake, table: &str, nodes: &[String], me: &str, retain_
     }
     hit.extend(meta.files.iter().filter(|f| holds(&f.stats)).cloned());
     if !hit.is_empty() {
-        crate::manifest::unseal(lake, table, &mut meta, list, &sealed).await?;
+        crate::manifest::unseal(lake, table, &mut meta, list, &sealed).await?; // (a sealed file's record changes: it comes back inline)
+        // A job per partition (a delete file holds one, as Iceberg asks), of bounded size.
         let mut groups: Vec<Vec<DataFile>> = vec![];
+        hit.sort_by(|a, b| a.part.cmp(&b.part));
         for f in hit.iter().cloned() {
             match groups.last_mut() {
-                Some(g) if g.iter().map(|f| f.bytes).sum::<u64>() + f.bytes <= MERGE_BYTES => g.push(f),
+                Some(g) if g[0].part == f.part && g.iter().map(|f| f.bytes).sum::<u64>() + f.bytes <= MERGE_BYTES => g.push(f),
                 _ => groups.push(vec![f]),
             }
         }
-        let jobs = groups.into_iter().map(|files| Job::new(table, &meta, Kind::Purge { files, gone: gone.clone(), after, upto })).collect();
-        let kept = deal(lake, jobs, nodes, me).await?;
-        replace(&mut meta, &hit, kept);
-        crate::manifest::seal(lake, table, &mut meta).await?;
+        let jobs = groups.into_iter().map(|files| Job::new(table, &meta, Kind::Positions { files, gone: gone.clone(), after, upto })).collect();
+        for f in deal(lake, jobs, nodes, me).await? {
+            if let Some(mine) = meta.files.iter_mut().find(|m| m.path == f.path) {
+                *mine = f; // (the same file, with the positions deleted from it)
+            }
+        }
+        // (sealed again by `maintain`, once it has rewritten the files mostly deleted)
     }
     // (the newest purge every reader has passed, and those after it, are kept)
     meta.purges.push((upto, now));
@@ -203,6 +269,66 @@ pub async fn purge(lake: &Lake, table: &str, nodes: &[String], me: &str, retain_
     }
     lake.cat.commit(vec![(table_key(table), json(&meta)), (table_key(&deleted(table)), json(&dmeta))], &[]).await?;
     Ok(true)
+}
+
+/// The places in file `f` of the rows `dead` names (sorted (`_row_id`, `_version`) pairs): from its
+/// lineage (a row's id is its first plus its place), else from its rows' own system columns, read
+/// in order, every row (the ones deleted before too, whose places count).
+async fn positions_of(lake: &Lake, meta: &TableMeta, f: &DataFile, dead: &[(i64, i64)]) -> Result<Vec<u64>> {
+    use datafusion::arrow::{array::AsArray, datatypes::Int64Type};
+    if let Some(l) = f.lineage {
+        let ids = l.first..l.first + f.rows as i64;
+        return Ok(dead.iter().filter(|(id, v)| *v == l.version as i64 && ids.contains(id)).map(|(id, _)| (id - l.first) as u64).collect());
+    }
+    let s = schema(&[(crate::sys::ROW_ID.into(), "Int64".into()), (crate::sys::VERSION.into(), "Int64".into())])?;
+    let every = DataFile { deletes: vec![], ..f.clone() };
+    let (mut out, mut at) = (vec![], 0u64);
+    for b in crate::query::files_once(lake, &lake.session_with(1), &[&every], meta, &s).await?.collect().await? {
+        let (ids, versions) = (b.column(0).as_primitive::<Int64Type>(), b.column(1).as_primitive::<Int64Type>());
+        for i in 0..b.num_rows() {
+            if dead.binary_search(&(ids.value(i), versions.value(i))).is_ok() {
+                out.push(at + i as u64);
+            }
+        }
+        at += b.num_rows() as u64;
+    }
+    Ok(out)
+}
+
+/// Every row id of a file, by place (its deletes aside): from its lineage, or its `_row_id` column.
+pub async fn ids_of(lake: &Lake, meta: &TableMeta, f: &DataFile) -> Result<Vec<i64>> {
+    use datafusion::arrow::{array::AsArray, datatypes::Int64Type};
+    if let Some(l) = f.lineage {
+        return Ok((l.first..l.first + f.rows as i64).collect());
+    }
+    anyhow::ensure!(f.sys, "{}: its rows have no ids (written before Pondra 0.19)", f.path);
+    let (s, every) = (schema(&[(crate::sys::ROW_ID.into(), "Int64".into())])?, DataFile { deletes: vec![], ..f.clone() });
+    let mut out = vec![];
+    for b in crate::query::files_once(lake, &lake.session_with(1), &[&every], meta, &s).await?.collect().await? {
+        out.extend(b.column(0).as_primitive::<Int64Type>().values());
+    }
+    Ok(out)
+}
+
+/// Iceberg's position deletes (format v2): each row a data file's name, as the table's Iceberg
+/// metadata gives it, and a row's place in that file, sorted, in one Parquet file in the table's
+/// folder (`_deletes/`). Pondra's own deletes are kept so (`purge`); its reads skip them, and other
+/// engines read them as they read their own. The file's path in the lake, rows and bytes.
+pub async fn write_positions(lake: &Lake, folder: &str, mut rows: Vec<(String, u64)>) -> Result<(String, u64, u64)> {
+    use datafusion::arrow::array::{Int64Array, StringArray};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    rows.sort();
+    let field = |n: &str, t: DataType, id: i64| Field::new(n, t, false).with_metadata([("PARQUET:field_id".to_string(), id.to_string())].into());
+    let schema = std::sync::Arc::new(Schema::new(vec![field("file_path", DataType::Utf8, 2147483546), field("pos", DataType::Int64, 2147483545)]));
+    let columns: Vec<datafusion::arrow::array::ArrayRef> = vec![std::sync::Arc::new(StringArray::from_iter_values(rows.iter().map(|r| r.0.as_str()))), std::sync::Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.1 as i64)))];
+    let mut buf = vec![];
+    let props = WriterProperties::builder().set_compression(Compression::ZSTD(ZstdLevel::default())).build();
+    let mut w = ArrowWriter::try_new(&mut buf, schema.clone(), Some(props))?;
+    w.write(&RecordBatch::try_new(schema, columns)?)?;
+    w.close()?;
+    let (path, bytes) = (format!("data/{folder}/_deletes/{}.parquet", uuid::Uuid::new_v4()), buf.len() as u64);
+    lake.put(&path, buf).await?;
+    Ok((path, rows.len() as u64, bytes))
 }
 
 /// The old rows of the changes in (after, upto]: (`_row_id`, `_version`) pairs, from `{t}$deleted` files.
@@ -255,9 +381,8 @@ fn run(files: &[DataFile]) -> Vec<DataFile> {
 
 /// Swap `old` files for `new` ones; the old ones are deleted after the retention period.
 fn replace(meta: &mut TableMeta, old: &[DataFile], new: Vec<DataFile>) {
-    let now = crate::log::now_ms();
     meta.files.retain(|f| !old.iter().any(|o| o.path == f.path));
-    meta.garbage.extend(old.iter().map(|f| (f.path.clone(), now)));
+    meta.discard(old);
     meta.files.extend(new.into_iter().map(|f| DataFile { sketch: Default::default(), ..f })); // (rows the table's sketches already saw)
 }
 
@@ -281,7 +406,7 @@ enum Kind {
     Merge { files: Vec<DataFile> },            // small files -> one
     Compact { upto: u64, rows: u64 },          // files + log up to `upto` -> one row per key
     Squash { files: Vec<DataFile> },           // keyed: a run of newer files -> one (delete markers kept)
-    Purge { files: Vec<DataFile>, gone: Vec<DataFile>, after: u64, upto: u64 }, // each file, without the old rows `gone` (`{t}$deleted`'s) holds for changes in (after, upto]
+    Positions { files: Vec<DataFile>, gone: Vec<DataFile>, after: u64, upto: u64 }, // the places in these files (one partition's) of the old rows `gone` (`{t}$deleted`'s) holds for changes in (after, upto], as a delete file: the files' records with it
 }
 
 /// Run jobs round-robin on the live nodes (each round starts where the last one stopped, so
@@ -313,7 +438,7 @@ pub async fn run_job(lake: &Lake, Job { table, meta, kind }: Job) -> Result<Vec<
     let slots = SLOTS.get_or_init(|| tokio::sync::Semaphore::new(budget));
     let mb = |files: &[DataFile]| (files.iter().map(|f| f.bytes).sum::<u64>() >> 20) as usize;
     let takes = match &kind {
-        Kind::Merge { files } | Kind::Squash { files } | Kind::Purge { files, .. } => mb(files),
+        Kind::Merge { files } | Kind::Squash { files } | Kind::Positions { files, .. } => mb(files),
         Kind::Compact { .. } => mb(&meta.files),
         Kind::Fold { .. } => 32,
     };
@@ -327,7 +452,7 @@ pub async fn run_job(lake: &Lake, Job { table, meta, kind }: Job) -> Result<Vec<
     let (batches, ord) = match kind {
         Kind::Fold { after, upto, rows } if meta.key.is_empty() => {
             caught_up(lake, &table, after, upto, rows).await?;
-            let rows = crate::query::tail_of(lake, &table, after, Some(upto), false, true).await?;
+            let rows = crate::query::tail_of(lake, &table, after, Some(upto), false, true, false).await?;
             let rows = match (rows.is_empty(), meta.cluster.len()) {
                 (true, _) | (_, 0) => rows,
                 (_, 1) => clustered(&meta, lake.session().read_batches(rows)?)?.collect().await?,
@@ -354,19 +479,25 @@ pub async fn run_job(lake: &Lake, Job { table, meta, kind }: Job) -> Result<Vec<
             let part = TableMeta { files, ..meta.clone() };
             (latest(lake, &table, &part, meta.tiered, true).await?, ord)
         }
-        // Each file on its own (its partition, its order), its rows but the old versions.
-        Kind::Purge { files, gone, after, upto } => {
-            let (mut out, s) = (vec![], schema(&meta.columns)?);
+        // The places of the old versions these files hold, in one delete file.
+        Kind::Positions { files, gone, after, upto } => {
+            let mut dead = dead(lake, &gone, after, upto).await?;
+            dead.sort_unstable();
+            let (mut rows, mut found) = (vec![], vec![]);
             for f in files {
-                let ctx = lake.session_with(1);
-                let rows = crate::query::files_once(lake, &ctx, &[&f], &meta, &s).await?;
-                let dead = ctx.read_batches(dead_rows(lake, &gone, after, upto).await?.collect().await?)?;
-                let kept = dead.join(rows, datafusion::common::JoinType::RightAnti, &["__id", "__v"], &[crate::sys::ROW_ID, crate::sys::VERSION], None)?.collect().await?;
-                if let Some(new) = write_file(lake, &table, &kept, &keys, true).await? {
-                    out.push(DataFile { ord: f.ord, part: f.part.clone(), ..new });
-                }
+                let at = positions_of(lake, &meta, &f, &dead).await?;
+                rows.extend(at.iter().map(|p| (lake.full(&f.path), *p)));
+                found.push((f, at.len() as u64));
             }
-            return Ok(out);
+            if rows.is_empty() {
+                return Ok(vec![]);
+            }
+            let (path, n, bytes) = write_positions(lake, meta.folder(&table), rows).await?;
+            return Ok(found.into_iter().filter(|(_, k)| *k > 0).map(|(mut f, k)| {
+                f.deletes.push(crate::scan::Delete::Positions { path: path.clone(), file: lake.full(&f.path), rows: n, bytes });
+                f.deleted += k;
+                f
+            }).collect());
         }
         Kind::Merge { files } => {
             let schema = schema(&meta.columns)?;
@@ -503,7 +634,8 @@ pub async fn expire(lake: &Lake, grace_ms: u64) -> Result<()> {
     for (key, task) in lake.cat.scan::<crate::tasks::Task>("k/", "k0").await? {
         for producer in crate::tasks::producers(&key[2..], &task) {
             let done = lake.cat.get(&producer_key(&producer)).await?.unwrap_or(0);
-            if done < floor && !tail(lake, &task.source, done, Some(floor), false).await?.is_empty() {
+            let unread = lake.cat.scan::<Segment>(&seg_key(done + 1), &seg_key(floor + 1)).await?.iter().any(|(_, s)| s.rows_of(&task.source) > 0);
+            if done < floor && unread {
                 floor = done; // the task still has to read these (tasks skip runs with nothing new)
             }
         }
@@ -522,17 +654,28 @@ pub async fn expire(lake: &Lake, grace_ms: u64) -> Result<()> {
     // (`--changelog-secs`: the log is also a change feed, kept that long for `/watch?after=` replays.)
     let changelog = std::env::var("PONDRA_CHANGELOG_SECS").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0) * 1000;
     let log_cutoff = cutoff.min(crate::log::now_ms().saturating_sub(changelog));
-    let segs: Vec<(String, Segment)> = lake.cat.scan::<Segment>(&seg_key(1), &seg_key(floor + 1)).await?
-        .into_iter().filter(|(_, s)| s.ts_ms < log_cutoff).collect();
+    let (segs, kept): (Vec<(String, Segment)>, Vec<(String, Segment)>) = lake.cat.scan::<Segment>(&seg_key(1), &seg_key(floor + 1)).await?
+        .into_iter().partition(|(_, s)| s.ts_ms < log_cutoff);
+    // A replaced file stays while a segment kept from before its replacement may name it: a file
+    // commit's files are read from them by the log's readers (a task behind, `/watch?after=`).
+    let next = match kept.first() {
+        Some((_, s)) => Some(s.ts_ms),
+        None => lake.cat.scan::<Segment>(&seg_key(floor + 1), &seg_key(floor + 1001)).await?.first().map(|(_, s)| s.ts_ms),
+    };
+    let files_cutoff = next.map_or(cutoff, |ts| cutoff.min(ts));
     let mut dead: Vec<String> = segs.iter().filter(|(_, s)| !s.path.is_empty()).map(|(_, s)| s.path.clone()).collect();
     let mut deletes: Vec<String> = segs.iter().map(|(k, _)| k.clone()).collect();
     deletes.extend(segs.iter().filter(|(_, s)| s.path.is_empty()).map(|(k, _)| data_key(k[2..].parse().unwrap_or(0))));
     let mut puts = vec![];
     for ((key, mut meta), idle) in tables.into_iter().zip(idle) {
-        let (old, keep): (Vec<_>, Vec<_>) = meta.garbage.drain(..).partition(|(_, ts)| *ts < cutoff);
-        if !old.is_empty() || idle {
-            dead.extend(old.into_iter().map(|(p, _)| p));
-            meta.garbage = keep;
+        let (old, keep): (Vec<_>, Vec<_>) = meta.garbage.drain(..).partition(|(_, ts)| *ts < files_cutoff);
+        let (deletes, kept): (Vec<_>, Vec<_>) = meta.garbage_deletes.drain(..).partition(|(_, ts)| *ts < files_cutoff);
+        if !old.is_empty() || !deletes.is_empty() || idle {
+            let named = if deletes.is_empty() { Default::default() } else { named_deletes(lake, &meta).await? };
+            dead.extend(old.into_iter().chain(deletes).map(|(p, _)| p).filter(|p| !named.contains(p)));
+            (meta.garbage, meta.garbage_deletes) = (keep, kept);
+            let garbage: std::collections::HashSet<&String> = meta.garbage.iter().map(|(p, _)| p).collect();
+            meta.replaced.retain(|f| garbage.contains(&f.path));
             puts.push((key, json(&meta)));
         }
     }
@@ -542,6 +685,16 @@ pub async fn expire(lake: &Lake, grace_ms: u64) -> Result<()> {
     lake.cat.wait_durable(lake.cat.committed()).await; // (replicated acks: forget objects only once the bucket has)
     futures::stream::iter(dead).for_each_concurrent(16, |path| async move { lake.delete(&path).await }).await; // (one round trip each)
     collect_orphans(lake).await
+}
+
+/// The position-delete files the table's files name: a replaced file's stay while another names
+/// them, and go with the last (the orphan sweep's).
+async fn named_deletes(lake: &Lake, meta: &TableMeta) -> Result<std::collections::HashSet<String>> {
+    let mut named: std::collections::HashSet<String> = meta.files.iter().flat_map(|f| f.delete_files().cloned()).collect();
+    for m in crate::manifest::list(lake, meta).await? {
+        named.extend(crate::manifest::files(lake, &m).await?.iter().flat_map(|f| f.delete_files().cloned()));
+    }
+    Ok(named)
 }
 
 /// Hourly: delete objects that no catalog entry points to and that are a day old: segments a
@@ -559,17 +712,19 @@ async fn collect_orphans(lake: &Lake) -> Result<()> {
     let segments = lake.cat.scan::<Segment>("s/", "s0").await?;
     // A Bloom filter of the paths in use, sized for them, so this costs a few megabytes on a
     // table of a million files instead of holding every path (ADR-013).
-    let n = segments.len() + tables.iter().map(|(_, m)| m.files.len() + m.garbage.len() + m.sealed.as_ref().map_or(0, |s| s.files as usize) + 64).sum::<usize>();
+    let n = segments.len() + tables.iter().map(|(_, m)| m.files.len() + m.garbage.len() + m.garbage_deletes.len() + m.sealed.as_ref().map_or(0, |s| s.files as usize) + 64).sum::<usize>();
     let mut used = Seen::of(n);
     segments.iter().for_each(|(_, s)| used.add(&s.path));
+    // (a file and the position-delete files naming it)
+    let named = |f: &DataFile| std::iter::once(&f.path).chain(f.delete_files()).cloned().collect::<Vec<_>>();
     for (_, m) in &tables {
         for manifest in crate::manifest::list(lake, m).await? {
-            crate::manifest::files(lake, &manifest).await?.iter().for_each(|f| used.add(&f.path));
+            crate::manifest::files(lake, &manifest).await?.iter().flat_map(named).for_each(|p| used.add(&p));
             used.add(&manifest.path);
         }
         m.sealed.iter().for_each(|s| used.add(&s.list));
-        m.files.iter().for_each(|f| used.add(&f.path));
-        m.garbage.iter().for_each(|(p, _)| used.add(p));
+        m.files.iter().flat_map(named).for_each(|p| used.add(&p));
+        m.garbage.iter().chain(&m.garbage_deletes).for_each(|(p, _)| used.add(p));
     }
     for prefix in ["log", "data"] {
         let mut objects = lake.store.list(Some(&object_store::path::Path::from(prefix)));
@@ -626,7 +781,14 @@ fn writer<'a>(buf: &'a mut Vec<u8>, batch: &RecordBatch, keys: &[String]) -> Res
         let encoding = if *c == crate::sys::ROW_ID { datafusion::parquet::basic::Encoding::DELTA_BINARY_PACKED } else { datafusion::parquet::basic::Encoding::PLAIN };
         props = props.set_column_dictionary_enabled(path.clone(), false).set_column_encoding(path, encoding);
     }
-    Ok(ArrowWriter::try_new(buf, batch.schema(), Some(props.build()))?)
+    Ok(ArrowWriter::try_new_with_options(buf, batch.schema(), plain(props.build()))?)
+}
+
+/// Writer options with the Parquet file's own types only: no Arrow schema in its footer, which would
+/// have other engines' Arrow read strings as views (`string_view`), which PyArrow can't yet take
+/// rows of — PyIceberg applying a position delete, say.
+pub fn plain(props: WriterProperties) -> datafusion::parquet::arrow::arrow_writer::ArrowWriterOptions {
+    datafusion::parquet::arrow::arrow_writer::ArrowWriterOptions::new().with_properties(props).with_skip_arrow_metadata(true)
 }
 
 /// The codec data files are written with (`PONDRA_CODEC`). LZ4 by default: it decodes fastest,
@@ -665,7 +827,7 @@ pub async fn write_file(lake: &Lake, table: &str, batches: &[RecordBatch], keys:
         false => Default::default(),
     };
     let sys = batches[0].schema().index_of(crate::sys::ROW_ID).is_ok();
-    Ok(Some(DataFile { path, rows: rows as u64, bytes, ord: 0, whole: false, stats, part: String::new(), nulls, sketch, sys, outside: None, lineage: None }))
+    Ok(Some(DataFile { path, rows: rows as u64, bytes, ord: 0, whole: false, stats, part: String::new(), nulls, sketch, sys, ..Default::default() }))
 }
 
 /// The columns as Iceberg knows them (`iceberg.rs`), each with its field id: a column's place

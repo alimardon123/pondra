@@ -35,8 +35,10 @@ def session(root):
 def spark_commits(url):
     """Spark (Iceberg 1.10) writes to a Pondra table through Pondra's Iceberg REST catalog
     (`--commit`): SQL's INSERT and DataFrame.writeTo().append() (ADR-028), then a DELETE, an UPDATE
-    and a MERGE, copy-on-write, and an ALTER TABLE … ADD COLUMN (ADR-029 phase 2). Prints what Spark
-    read back after the appends and after the changes, and what it was told."""
+    and a MERGE, copy-on-write, an ALTER TABLE … ADD COLUMN, and, once the table's properties say
+    merge-on-read, a DELETE, an UPDATE and a MERGE again: position deletes (ADR-029 phase 2). Prints
+    what Spark read back after the appends, after the changes and after the merge-on-read ones, and
+    what it was told."""
     os.environ["TZ"] = "UTC"
     time.tzset()
     from pyspark.sql import SparkSession
@@ -53,13 +55,44 @@ def spark_commits(url):
     for name, stmt in (("delete", "DELETE FROM pondra.default.spark_in WHERE id = 1"), ("update", "UPDATE pondra.default.spark_in SET name = 'bee' WHERE id = 2"),
                        ("merge", "MERGE INTO pondra.default.spark_in t USING (SELECT 3L AS id, 'sea' AS name UNION ALL SELECT 4L, 'd') s ON t.id = s.id "
                                  "WHEN MATCHED THEN UPDATE SET name = s.name WHEN NOT MATCHED THEN INSERT (id, name, ts) VALUES (s.id, s.name, NULL)"),
-                       ("alter", "ALTER TABLE pondra.default.spark_in ADD COLUMN x INT")):
+                       ("alter", "ALTER TABLE pondra.default.spark_in ADD COLUMN x INT"), ("changed", None),
+                       ("mor", "ALTER TABLE pondra.default.spark_in SET TBLPROPERTIES ('write.delete.mode' = 'merge-on-read', 'write.update.mode' = 'merge-on-read', 'write.merge.mode' = 'merge-on-read')"),
+                       ("mor_delete", "DELETE FROM pondra.default.spark_in WHERE id = 4"), ("mor_update", "UPDATE pondra.default.spark_in SET name = 'bea' WHERE id = 2"),
+                       ("mor_merge", "MERGE INTO pondra.default.spark_in t USING (SELECT 3L AS id, 'see' AS name UNION ALL SELECT 5L, 'e') s ON t.id = s.id "
+                                     "WHEN MATCHED THEN UPDATE SET name = s.name WHEN NOT MATCHED THEN INSERT (id, name, ts, x) VALUES (s.id, s.name, NULL, NULL)")):
+        if stmt is None:
+            out[name] = read()
+            import urllib.request  # (and what Pondra reads then)
+            ask = urllib.request.Request(url + "/sql?format=json", data=b"SELECT id, name, ts, _row_id FROM spark_in ORDER BY id", method="POST")
+            out["pondra_changed"] = json.loads(urllib.request.build_opener(urllib.request.ProxyHandler({})).open(ask, timeout=120).read())
+            continue
         try:
             spark.sql(stmt)
             out[name] = ""
         except Exception as e:  # noqa: BLE001 (what Spark was told)
             out[name] = str(e)[:2000]
-    out["changed"] = read()
+    # A keyed table (Pondra's `PRIMARY KEY`): Spark's INSERT as upserts, its UPDATE copy-on-write, its
+    # DELETE and MERGE merge-on-read — each a change of the table's keys (ADR-029 §5).
+    kv = lambda: [[plain(v) for v in r] for r in spark.sql("SELECT k, v FROM pondra.default.spark_kv ORDER BY k").collect()]
+    for name, stmt in (("kv_insert", "INSERT INTO pondra.default.spark_kv (k, v) VALUES (1, 'a'), (2, 'b'), (3, 'c')"), ("kv_upsert", "INSERT INTO pondra.default.spark_kv (k, v) VALUES (2, 'B')"),
+                       ("kv_update", "UPDATE pondra.default.spark_kv SET v = 'C' WHERE k = 3"),
+                       ("kv_mor", "ALTER TABLE pondra.default.spark_kv SET TBLPROPERTIES ('write.delete.mode' = 'merge-on-read', 'write.update.mode' = 'merge-on-read', 'write.merge.mode' = 'merge-on-read')"),
+                       ("kv_delete", "DELETE FROM pondra.default.spark_kv WHERE k = 1"),
+                       ("kv_merge", "MERGE INTO pondra.default.spark_kv t USING (SELECT 3L AS k, 'see' AS v UNION ALL SELECT 4L, 'd') s ON t.k = s.k WHEN MATCHED THEN UPDATE SET v = s.v WHEN NOT MATCHED THEN INSERT (k, v) VALUES (s.k, s.v)")):
+        try:
+            spark.sql(stmt)
+            out[name] = ""
+        except Exception as e:  # noqa: BLE001
+            out[name] = str(e)[:2000]
+    try:
+        out["kv_rows"] = kv()
+    except Exception as e:  # noqa: BLE001
+        out["kv_rows"] = str(e)[:2000]
+    out["mor_rows"] = read()
+    try:
+        out["mor_files"] = [r[0] for r in spark.sql("SELECT content FROM pondra.default.spark_in.files").collect()]
+    except Exception as e:  # noqa: BLE001
+        out["mor_files"] = str(e)[:2000]
     print(json.dumps(out, default=str))
     spark.stop()
 
@@ -67,24 +100,53 @@ def spark_commits(url):
 def commits(con, spark):
     """Spark writes to Pondra's tables through its Iceberg REST catalog (`spark_commits`): appends,
     the rows the table's, each with its row id; a DELETE, an UPDATE and a MERGE (copy-on-write),
-    after which Pondra reads what Spark does; an ALTER TABLE … ADD COLUMN, Pondra's column too."""
+    after which Pondra reads what Spark does; an ALTER TABLE … ADD COLUMN, Pondra's column too; and
+    merge-on-read ones (position deletes), which Pondra reads as Spark does, a view that adds up
+    the table and the change feed following them."""
     con.sql("CREATE TABLE spark_in (id BIGINT, name VARCHAR, ts TIMESTAMP) WITH (publish = 'iceberg')")
+    con.sql("CREATE MATERIALIZED VIEW spark_named AS SELECT name, count(*) AS n, sum(id) AS s FROM spark_in GROUP BY name")
+    con.sql("CREATE TABLE spark_kv (k BIGINT PRIMARY KEY, v VARCHAR) WITH (publish = 'iceberg')")
     run = subprocess.run([spark, os.path.abspath(__file__), "--commit", con.url], capture_output=True, text=True, env={**os.environ, "TZ": "UTC"}, timeout=1200)
     try:
         theirs = json.loads(run.stdout.strip().splitlines()[-1])
     except (IndexError, json.JSONDecodeError):
         theirs = {"rows": [], "changed": [], "delete": "", "update": "", "merge": "", "alter": "", "why": run.stderr[-1500:]}
-    ours = con.sql("SELECT id, name, ts, _row_id FROM spark_in ORDER BY id").rows()
+    ours = theirs.get("pondra_changed") or []
+    ours = ours.get("rows", []) if isinstance(ours, dict) else ours
     want = [[1, "a", "2026-09-28 10:00:00"], [2, None, None], [3, "c", None]]
     changed = [[2, "bee", None], [3, "sea", None], [4, "d", None]]
     ok = want == theirs["rows"]
     same = [[r["id"], r.get("name"), plain(r.get("ts"))] for r in ours] == changed == theirs["changed"] and all(r.get("_row_id") is not None for r in ours) \
         and not theirs["delete"] and not theirs["update"] and not theirs["merge"]
     added = not theirs["alter"] and "x" in [c["column_name"] for c in con.sql("SELECT column_name FROM information_schema.columns WHERE table_name = 'spark_in'").rows()]
+    # Merge-on-read: Spark's position deletes, read by Pondra, followed by its view and its change feed.
+    now = con.sql("SELECT id, name, ts FROM spark_in ORDER BY id").rows()
+    mor = [[2, "bea", None], [3, "see", None], [5, "e", None]]
+    view = con.sql("SELECT name, n, s FROM spark_named ORDER BY name").rows() == con.sql("SELECT name, count(*) AS n, sum(id) AS s FROM spark_in GROUP BY name ORDER BY name").rows()
+    state, pos = {}, 0
+    for _ in range(100):
+        ask = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "changes", "arguments": {"table": "spark_in", "after": pos}}}).encode()
+        got = json.loads(json.loads(con._call("POST", "/mcp", ask, {"content-type": "application/json"}))["result"]["content"][0]["text"])
+        for r in got["rows"]:
+            if r["_change_type"] in ("insert", "update_postimage"):
+                state[r["_row_id"]] = r["id"]
+            else:
+                state.pop(r["_row_id"], None)
+        if got["position"] == pos and not got["rows"]:
+            break
+        pos = got["position"]
+    merged = [[r["id"], r.get("name"), plain(r.get("ts"))] for r in now] == mor == theirs.get("mor_rows") and 1 in theirs.get("mor_files", []) \
+        and not any(theirs.get(k) for k in ("mor", "mor_delete", "mor_update", "mor_merge")) and view and sorted(state.values()) == [2, 3, 5]
     print(json.dumps({"table": "Spark appends through Pondra's Iceberg REST catalog (INSERT, writeTo().append()): the table's rows, with row ids", "equal": ok, **({} if ok else {"ours": ours, "theirs": theirs})}, default=str), flush=True)
     print(json.dumps({"table": "…Spark's DELETE, UPDATE and MERGE (copy-on-write): Pondra reads what Spark does", "equal": same, **({} if same else {"ours": ours, "theirs": {k: v if isinstance(v, list) else v[:500] for k, v in theirs.items()}})}, default=str), flush=True)
     print(json.dumps({"table": "…an ALTER TABLE … ADD COLUMN from Spark: Pondra's table has the column", "equal": added, **({} if added else {"alter": theirs["alter"][:500]})}), flush=True)
-    return {"commits:spark": ok, "commits:changes": same, "commits:altered": added}
+    print(json.dumps({"table": "…and merge-on-read (the table's properties set from Spark): its DELETE, UPDATE and MERGE as position deletes; Pondra reads what Spark does, a view and the change feed follow",
+                      "equal": merged, **({} if merged else {"ours": now, "view": view, "feed": sorted(state.values()), "theirs": {k: v if isinstance(v, list) else v[:500] for k, v in theirs.items() if k.startswith("mor")}})}, default=str), flush=True)
+    keyed = [[r["k"], r["v"]] for r in con.sql("SELECT k, v FROM spark_kv ORDER BY k").rows()] == [[2, "B"], [3, "see"], [4, "d"]] == theirs.get("kv_rows") \
+        and not any(theirs.get(k) for k in theirs if k.startswith("kv_") and k != "kv_rows")
+    print(json.dumps({"table": "…and a keyed table: Spark's INSERT as upserts, UPDATE (copy-on-write), DELETE and MERGE (merge-on-read) as its keys' changes; Pondra reads what Spark does",
+                      "equal": keyed, **({} if keyed else {"theirs": {k: v if isinstance(v, list) else v[:500] for k, v in theirs.items() if k.startswith("kv_")}})}, default=str), flush=True)
+    return {"commits:spark": ok, "commits:changes": same, "commits:altered": added, "commits:merge-on-read": merged, "commits:keyed": keyed}
 
 
 def read_spark(tables):

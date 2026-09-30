@@ -244,6 +244,14 @@ pub fn derive(b: &RecordBatch, seg: u64, pos: u64, ms: u64) -> Result<RecordBatc
     set(&b, UPDATED, now)
 }
 
+/// Rows as of the commit `seg` (at `ms`) that changed them: its `_version` and `_updated_at`
+/// (the change feed's old versions of another engine's change: `change::feed`).
+pub fn at_commit(b: &RecordBatch, seg: u64, ms: u64) -> Result<RecordBatch> {
+    let n = b.num_rows();
+    let b = set(b, VERSION, Arc::new(Int64Array::from(vec![seg as i64; n])))?;
+    set(&b, UPDATED, Arc::new(TimestampMicrosecondArray::from(vec![(ms * 1000) as i64; n]).with_timezone("UTC")))
+}
+
 /// `b` with column `name` set to `values` (replaced if it has one, else added at the end).
 fn set(b: &RecordBatch, name: &str, values: ArrayRef) -> Result<RecordBatch> {
     let (mut fields, mut cols): (Vec<_>, Vec<_>) = (b.schema().fields().to_vec(), b.columns().to_vec());

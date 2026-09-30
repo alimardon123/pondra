@@ -1,0 +1,76 @@
+{
+ "network": {
+  "100.119.87.113:8080": {
+   "path": "pong from pondra-36695489509-0 (100.119.87.113) via 20.29.52.245:24896 in 1ms",
+   "mb_s": 316.5
+  },
+  "100.125.23.20:8080": {
+   "path": "pong from pondra-36695489509-1 (100.125.23.20) via 20.172.111.86:50240 in 41ms",
+   "mb_s": 69.0
+  },
+  "100.89.80.22:8080": {
+   "path": "pong from pondra-36695489509-2 (100.89.80.22) via 172.183.133.247:53304 in 11ms",
+   "mb_s": 216.5
+  }
+ }
+}
+{"rows":5}
+{"rows":25}
+{"rows":100000}
+{"rows":1500000}
+{"rows":2000000}
+{"rows":8000000}
+{"rows":15000000}
+{"rows":59986052}
+q1   one node    3.03s  3 nodes    2.37s shuffled  (spread anyway    1.72s shuffled )  same=True  sent 0.0 MB (0.2 MB), waited 0.093 s (0.307 s)
+q2   one node    0.22s  3 nodes    0.23s gathered  (spread anyway    0.12s gathered )  same=True  sent 0.0 MB (0.0 MB), waited 0.0 s (0.0 s)
+q3   one node    0.90s  3 nodes    0.92s one node  (spread anyway    0.64s shuffled )  same=True  sent 0.0 MB (0.7 MB), waited 0.0 s (0.454 s)
+q4   one node    0.58s  3 nodes    0.58s one node  (spread anyway    0.60s shuffled )  same=True  sent 0.0 MB (0.0 MB), waited 0.0 s (0.146 s)
+q5   one node    1.44s  3 nodes    1.48s one node  (spread anyway    7.76s shuffled )  same=True  sent 0.0 MB (354.7 MB), waited 0.0 s (6.549 s)
+q6   one node    0.68s  3 nodes    0.46s gathered  (spread anyway    0.46s gathered )  same=True  sent 0.0 MB (0.0 MB), waited 0.0 s (0.0 s)
+q7   one node    1.21s  3 nodes    1.21s one node  (spread anyway    1.11s shuffled )  same=True  sent 0.0 MB (27.2 MB), waited 0.0 s (1.483 s)
+q8   one node    1.32s  3 nodes    1.37s one node  (spread anyway    1.43s shuffled )  same=True  sent 0.0 MB (0.7 MB), waited 0.0 s (0.9 s)
+q9   one node    2.24s  3 nodes    2.25s one node  (spread anyway    4.38s shuffled )  same=True  sent 0.0 MB (143.8 MB), waited 0.0 s (6.686 s)
+q10  one node    1.20s  3 nodes    1.18s one node  (spread anyway    2.88s shuffled )  same=True  sent 0.0 MB (103.8 MB), waited 0.0 s (6.127 s)
+q11  one node    0.19s  3 nodes    0.21s one node  (spread anyway    0.23s shuffled )  same=True  sent 0.0 MB (0.0 MB), waited 0.0 s (0.141 s)
+q12  one node    0.84s  3 nodes    0.86s one node  (spread anyway    0.47s shuffled )  same=True  sent 0.0 MB (0.0 MB), waited 0.0 s (0.14 s)
+q13  one node    1.25s  3 nodes    1.26s one node  (spread anyway    2.30s shuffled )  same=True  sent 0.0 MB (53.6 MB), waited 0.0 s (3.984 s)
+q14  one node    0.59s  3 nodes    0.60s one node  (spread anyway    1.16s shuffled )  same=True  sent 0.0 MB (11.0 MB), waited 0.0 s (1.356 s)
+q15  one node    1.23s  3 nodes    1.26s one node  (spread anyway    1.90s shuffled )  same=True  sent 0.0 MB (10.4 MB), waited 0.0 s (1.761 s)
+q16  one node    0.38s  3 nodes    0.37s one node  (spread anyway    0.51s shuffled )  same=True  sent 0.0 MB (12.8 MB), waited 0.0 s (1.129 s)
+q17  one node    0.88s  3 nodes    0.78s one node  (spread anyway    1.01s shuffled )  same=True  sent 0.0 MB (0.6 MB), waited 0.0 s (0.905 s)
+q18  one node    2.00s  3 nodes    2.05s one node  (spread anyway    4.78s shuffled )  same=True  sent 0.0 MB (161.5 MB), waited 0.0 s (10.994 s)
+q19  one node    1.09s  3 nodes    1.12s one node  (spread anyway    1.03s shuffled )  same=True  sent 0.0 MB (0.1 MB), waited 0.0 s (0.266 s)
+q20  one node    1.01s  3 nodes    1.00s one node  (spread anyway    3.35s shuffled )  same=True  sent 0.0 MB (51.2 MB), waited 0.0 s (3.705 s)
+q21  one node    2.85s  3 nodes    1.58s shuffled  (spread anyway    1.55s shuffled )  same=True  sent 0.1 MB (0.1 MB), waited 0.142 s (0.144 s)
+q22  one node    0.18s  3 nodes    0.19s one node  (spread anyway    1.10s shuffled )  same=True  sent 0.0 MB (38.8 MB), waited 0.0 s (2.422 s)
+{
+ "nodes": 3,
+ "lake": "s3://<bucket>/bench-36695489509",
+ "data": "tpch",
+ "network": {
+  "100.119.87.113:8080": {
+   "path": "pong from pondra-36695489509-0 (100.119.87.113) via 20.29.52.245:24896 in 1ms",
+   "mb_s": 316.5
+  },
+  "100.125.23.20:8080": {
+   "path": "pong from pondra-36695489509-1 (100.125.23.20) via 20.172.111.86:50240 in 41ms",
+   "mb_s": 69.0
+  },
+  "100.89.80.22:8080": {
+   "path": "pong from pondra-36695489509-2 (100.89.80.22) via 172.183.133.247:53304 in 11ms",
+   "mb_s": 216.5
+  }
+ },
+ "load_s": 137.0,
+ "settle_s": 30.7,
+ "one_node_s": 25.3,
+ "cluster_s": 23.33,
+ "forced_s": 40.48,
+ "spread": 4,
+ "forced_spread": 22,
+ "all_same": true,
+ "cpus": 4,
+ "wire_mb": 0.1,
+ "wait_s": 0.23
+}

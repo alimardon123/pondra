@@ -81,12 +81,11 @@ async fn has_schema(lake: &Lake, s: &str) -> Result<bool> {
 /// Where a name points: this lake (None) or an attached one, and the name inside it. Names are as
 /// SQL resolves them (`write::object`): unquoted parts already lower-case.
 pub async fn resolve(lake: &Lake, name: &str) -> Result<(Option<Arc<Lake>>, String)> {
-    let attached = |l: &str| lake.attached.read().unwrap().iter().find(|(n, _)| n == l).map(|(_, o)| o.clone());
     let parts: Vec<&str> = name.split('.').collect();
     Ok(match parts[..] {
         [t] => (None, t.to_string()),
         [s, t] if has_schema(lake, s).await? => (None, join(s, t)),
-        [l, t] => match attached(l) {
+        [l, t] => match attached(lake, l).await? {
             Some(other) => (Some(other), t.to_string()),
             None => bail!("no schema {l} (CREATE SCHEMA {l})"),
         },
@@ -94,9 +93,25 @@ pub async fn resolve(lake: &Lake, name: &str) -> Result<(Option<Arc<Lake>>, Stri
             ensure!(has_schema(lake, s).await?, "no schema {s} (CREATE SCHEMA {s})");
             (None, join(s, t))
         }
-        [l, s, t] => (Some(attached(l).with_context(|| format!("no lake {l}: this one is {}, and none is attached as {l}", lake_name(lake)))?), join(s, t)),
+        [l, s, t] => (Some(attached(lake, l).await?.with_context(|| format!("no lake {l}: this one is {}, and none is attached as {l}", lake_name(lake)))?), join(s, t)),
         _ => bail!("{name}: a name is table, schema.table or lake.schema.table"),
     })
+}
+
+/// The lake attached as `l`. One the catalog lists that this node hasn't attached yet (made a
+/// moment ago on another node: `CREATE DATABASE`, `ATTACH`) is waited for, as the node attaches it
+/// within a second (`sync`).
+async fn attached(lake: &Lake, l: &str) -> Result<Option<Arc<Lake>>> {
+    let here = || lake.attached.read().unwrap().iter().find(|(n, _)| n == l).map(|(_, o)| o.clone());
+    if here().is_none() && lake.cat.get_raw(&attachment_key(l)).await?.is_some() {
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if here().is_some() {
+                break;
+            }
+        }
+    }
+    Ok(here())
 }
 
 /// A table of this lake by its name inside it, from a name as SQL wrote it (`write::object`):

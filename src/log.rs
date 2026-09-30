@@ -63,6 +63,21 @@ pub struct Flush {
     pub reserve: u64,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub block: bool,
+    /// A file commit (the leader's own, under the lake's lock: `adopt::file`): files into tables
+    /// and out of them, in this commit, as its segment names them (`Segment::files`).
+    #[serde(skip)]
+    pub filed: Vec<Filing>,
+}
+
+/// One table's part of a file commit: the table as it is to be, the files it takes out already
+/// taken, and the files it takes in (whose lineage, if they need one, the sequencer completes:
+/// their rows' `_version` and times are this commit's).
+pub struct Filing {
+    pub table: String,
+    pub meta: TableMeta,
+    pub added: Vec<DataFile>,
+    pub removed: Vec<DataFile>,
+    pub deleted: Vec<(DataFile, Vec<crate::scan::Delete>)>,
 }
 
 fn is_zero(n: &u64) -> bool { *n == 0 }
@@ -264,7 +279,11 @@ async fn send(lake: &Lake, to: &To, mut pending: Vec<Append>, mut turn: Option<o
 }
 
 /// Encode the producers' batches and their views' output into one flush.
-pub async fn pack(lake: &Lake, pending: &[Append]) -> Result<Flush> {
+pub async fn pack(lake: &Lake, pending: &[Append]) -> Result<Flush> { pack_with(lake, pending, BTreeMap::new()).await }
+
+/// `pack`, the views deriving from `followed` too: rows a file commit puts into tables (and a
+/// change's old ones, under `{t}$deleted`), which the flush doesn't carry itself.
+pub async fn pack_with(lake: &Lake, pending: &[Append], followed: BTreeMap<String, Vec<RecordBatch>>) -> Result<Flush> {
     let (mut data, mut parts) = (vec![], vec![]);
     let mut add = |table: &str, batch: &RecordBatch, src: Option<Src>| -> Result<()> {
         let off = data.len() as u64;
@@ -274,7 +293,7 @@ pub async fn pack(lake: &Lake, pending: &[Append]) -> Result<Flush> {
         parts.push(Part { table: table.into(), off, len: data.len() as u64 - off, rows: batch.num_rows() as u64, src });
         Ok(())
     };
-    let mut by_table: BTreeMap<String, Vec<RecordBatch>> = BTreeMap::new();
+    let mut by_table = followed;
     let mut metas: BTreeMap<String, Option<TableMeta>> = BTreeMap::new(); // (the log keeps columns under their stored names: ADR-022)
     for a in pending {
         if !metas.contains_key(&a.table) {
@@ -393,7 +412,7 @@ async fn commit(lake: &Arc<Lake>, next: &mut u64, block: &mut u64, last_seq: &mu
     }
     let (views, blocks) = (crate::views::inline(lake).await?, *block);
     puts.extend(crate::views::bound(lake, &views, *next)); // (views made since: their filling ends before this commit)
-    for (f, reply) in batch {
+    for (mut f, reply) in batch {
         if f.reserve > 0 || f.block {
             // (numbers no segment will take: gaps in the log's sequence, which nothing minds)
             let ack = Ack { seg: *next, ms: now_ms(), block: *block, ..Default::default() };
@@ -405,7 +424,8 @@ async fn commit(lake: &Arc<Lake>, next: &mut u64, block: &mut u64, last_seq: &mu
         // 0. A flush packed with other views than the ones its tables have now goes back to be
         // packed again (`views::Inline`).
         let derived: std::collections::HashSet<&str> = f.parts.iter().filter(|p| p.src.is_none()).map(|p| p.table.as_str()).collect();
-        let mut owed = f.parts.iter().filter(|p| p.src.is_some() && p.rows > 0).flat_map(|p| views.by_source.get(&p.table).into_iter().flatten());
+        let filed = f.filed.iter().filter(|x| !x.added.is_empty() || !x.removed.is_empty() || !x.deleted.is_empty()).map(|x| x.table.as_str()); // (a file commit's rows: its views derived theirs too)
+        let mut owed = f.parts.iter().filter(|p| p.src.is_some() && p.rows > 0).map(|p| p.table.as_str()).chain(filed).flat_map(|t| views.by_source.get(t).into_iter().flatten());
         if owed.any(|v| !derived.contains(v.as_str())) || derived.iter().any(|t| !views.tables.contains(*t)) {
             replies.push((reply, Outcome::Retry(vec![])));
             continue;
@@ -428,23 +448,30 @@ async fn commit(lake: &Arc<Lake>, next: &mut u64, block: &mut u64, last_seq: &mu
             }
             bad.push(i);
         }
+        if !bad.is_empty() && !f.filed.is_empty() {
+            replies.push((reply, Outcome::Acks(acks))); // (a file commit already in: its job's seq)
+            continue;
+        }
         if !bad.is_empty() && f.parts.iter().any(|p| p.src.is_none()) {
             // Views derived rows from the skipped batches too: the node must redo the flush.
             replies.push((reply, Outcome::Retry(bad.iter().map(|&i| (i, acks[i])).collect())));
             continue;
         }
         seqs.extend(mine);
-        // 2. An object flush becomes the next segment; inline flushes all go into one (below).
-        let base = if f.path.is_empty() { inline.len() as u64 } else { 0 };
+        // 2. An object flush becomes the next segment, and so does a file commit; inline flushes
+        // all go into one (below).
+        let filings = std::mem::take(&mut f.filed);
+        let inlined = f.path.is_empty() && filings.is_empty();
+        let base = if inlined { inline.len() as u64 } else { 0 };
         let mut parts: BTreeMap<String, Vec<(u64, u64, u64)>> = BTreeMap::new();
-        let before = |t: &str| if f.path.is_empty() { inline_parts.get(t).map_or(0, |v| v.iter().map(|p| p.2).sum()) } else { 0 };
+        let before = |t: &str| if inlined { inline_parts.get(t).map_or(0, |v| v.iter().map(|p| p.2).sum()) } else { 0 };
         for (i, p) in f.parts.iter().enumerate().filter(|(i, p)| p.rows > 0 && !bad.contains(i)) {
             let rows = parts.entry(p.table.clone()).or_default();
             acks[i].row = before(&p.table) + rows.iter().map(|p| p.2).sum::<u64>();
             rows.push((base + p.off, p.len, p.rows));
             lake.backlog.fetch_add(p.rows, Ordering::Relaxed);
         }
-        let seg = match (parts.is_empty(), f.path.is_empty()) {
+        let seg = match (parts.is_empty() && filings.is_empty(), inlined) {
             (true, _) => 0,
             (false, true) => {
                 inline.extend_from_slice(&f.data);
@@ -452,9 +479,20 @@ async fn commit(lake: &Arc<Lake>, next: &mut u64, block: &mut u64, last_seq: &mu
                 u64::MAX // the inline segment's number, set below
             }
             (false, false) => {
-                let seg = *next;
-                *next += span(&parts);
-                puts.push((seg_key(seg), json(&Segment { path: f.path, parts, ts_ms: now_ms() })));
+                let (seg, ts) = (*next, now_ms());
+                let mut files = BTreeMap::new();
+                for Filing { table, mut meta, mut added, removed, deleted } in filings {
+                    added.iter_mut().for_each(|d| stamp_file(d, seg, ts));
+                    meta.files.extend(added.iter().cloned());
+                    meta.rows_at = seg;
+                    puts.push((table_key(&table), json(&meta))); // (the leader's, under the lake's lock)
+                    files.insert(table, Filed { added, removed, deleted });
+                }
+                *next += span(&parts, &files);
+                if f.path.is_empty() && !f.data.is_empty() {
+                    puts.push((data_key(seg), f.data.to_vec()));
+                }
+                puts.push((seg_key(seg), json(&Segment { path: f.path, parts, ts_ms: ts, files })));
                 seg
             }
         };
@@ -463,9 +501,9 @@ async fn commit(lake: &Arc<Lake>, next: &mut u64, block: &mut u64, last_seq: &mu
     }
     if !inline_parts.is_empty() {
         let seg = *next;
-        *next += span(&inline_parts);
+        *next += span(&inline_parts, &BTreeMap::new());
         puts.push((data_key(seg), inline));
-        puts.push((seg_key(seg), json(&Segment { path: String::new(), parts: inline_parts, ts_ms: now_ms() })));
+        puts.push((seg_key(seg), json(&Segment { path: String::new(), parts: inline_parts, ts_ms: now_ms(), files: BTreeMap::new() })));
         for (_, o) in replies.iter_mut() {
             if let Outcome::Acks(acks) = o {
                 acks.iter_mut().filter(|a| a.seg == u64::MAX).for_each(|a| a.seg = seg);
@@ -500,9 +538,22 @@ async fn commit(lake: &Arc<Lake>, next: &mut u64, block: &mut u64, last_seq: &mu
     Ok(())
 }
 
-/// The numbers a segment takes: one, and one more for each `1 << ORD_BITS` rows of a table in it
-/// (its rows' places, `ord`, run on into them).
-fn span(parts: &BTreeMap<String, Vec<(u64, u64, u64)>>) -> u64 { 1 + parts.values().map(|p| p.iter().map(|x| x.2).sum::<u64>().saturating_sub(1) >> ORD_BITS).max().unwrap_or(0) }
+/// The numbers a segment takes: one, and one more for each `1 << ORD_BITS` rows of a table in it,
+/// its files' rows after its parts' (its rows' places, `ord`, run on into them).
+fn span(parts: &BTreeMap<String, Vec<(u64, u64, u64)>>, files: &BTreeMap<String, Filed>) -> u64 {
+    let rows = |t: &String| parts.get(t).map_or(0, |p| p.iter().map(|x| x.2).sum::<u64>()) + files.get(t).map_or(0, |f| f.added.iter().map(|d| d.rows).sum());
+    1 + parts.keys().chain(files.keys()).map(|t| rows(t).saturating_sub(1) >> ORD_BITS).max().unwrap_or(0)
+}
+
+/// A file a commit takes in, as of that commit (`seg`, at `ms`): its place in the table's files,
+/// and the lineage it was given without them completed (its rows' `_version` and times).
+fn stamp_file(d: &mut DataFile, seg: u64, ms: u64) {
+    d.ord = seg;
+    if let Some(l) = d.lineage.as_mut().filter(|l| l.version == 0) {
+        (l.version, l.ms) = (seg, ms);
+        d.stats.extend(crate::adopt::system_stats(l, d.rows));
+    }
+}
 
 // ---------------------------------------------------------------- encoding
 

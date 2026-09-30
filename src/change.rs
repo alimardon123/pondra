@@ -395,7 +395,7 @@ fn without(b: &RecordBatch, name: &str) -> Result<RecordBatch> {
 
 /// An append table's `{t}$deleted`, made the first time its rows change: its columns, and the
 /// version each old row had (`_version`, which it keeps as `_old_version`: its own is the change's).
-async fn companion(lake: &Lake, table: &str, meta: &TableMeta) -> Result<()> {
+pub async fn companion(lake: &Lake, table: &str, meta: &TableMeta) -> Result<()> {
     if meta.changed {
         return Ok(());
     }
@@ -407,7 +407,7 @@ async fn companion(lake: &Lake, table: &str, meta: &TableMeta) -> Result<()> {
 }
 
 /// The old rows as `{t}$deleted` holds them: `_version` renamed `_old_version`.
-fn as_deleted(b: &RecordBatch) -> Result<RecordBatch> {
+pub fn as_deleted(b: &RecordBatch) -> Result<RecordBatch> {
     let fields = b.schema().fields().iter().map(|f| match f.name() == sys::VERSION {
         true => Arc::new(Field::new("_old_version", f.data_type().clone(), true)),
         false => f.clone(),
@@ -424,11 +424,12 @@ pub async fn feed(lake: &Lake, table: &str, after: u64, upto: Option<u64>) -> Re
     use datafusion::arrow::datatypes::Int64Type;
     use std::collections::HashSet;
     let meta: TableMeta = lake.cat.get(&table_key(table)).await?.with_context(|| format!("no table {table}"))?;
-    let rows = crate::query::tail_of(lake, table, after, upto, false, true).await?;
-    let gone = match meta.changed {
-        true => crate::query::tail_of(lake, &sys::deleted(table), after, upto, false, true).await?,
+    let rows = crate::query::tail_of(lake, table, after, upto, false, true, true).await?;
+    let mut gone = match meta.changed {
+        true => crate::query::tail_of(lake, &sys::deleted(table), after, upto, false, true, false).await?,
         false => vec![],
     };
+    gone.extend(taken_out(lake, table, after, upto).await?);
     let key = |b: &RecordBatch, i: usize| {
         let col = |c: &str| b.column_by_name(c).expect("a system column").as_primitive::<Int64Type>().value(i);
         (col(ROW_ID), col(sys::VERSION))
@@ -460,6 +461,26 @@ pub async fn feed(lake: &Lake, table: &str, after: u64, upto: Option<u64>) -> Re
     }
     all.sort_by_key(|((version, _), side)| (*version, *side)); // (stable: each side's own order kept)
     all.into_iter().map(|((_, b), _)| meta.to_logical(&b)).collect() // (under the names SQL knows)
+}
+
+/// The rows file commits took out of `table` in (after, upto] — the rows of the files they took
+/// out (another engine's copy-on-write `DELETE`, `UPDATE`, `MERGE`, overwrite: ADR-029 §7) and the
+/// rows they deleted by position (its merge-on-read ones: §4) — as those commits' old versions:
+/// `_version` and `_updated_at` the commit's.
+async fn taken_out(lake: &Lake, table: &str, after: u64, upto: Option<u64>) -> Result<Vec<RecordBatch>> {
+    let end = upto.map_or("s0".to_string(), |u| seg_key(u + 1));
+    let mut out = vec![];
+    for (key, seg) in lake.cat.scan::<Segment>(&seg_key(after + 1), &end).await? {
+        if seg.files.get(table).is_some_and(|f| !f.removed.is_empty() || !f.deleted.is_empty()) {
+            let n: u64 = key[2..].parse()?;
+            let mut rows = lake.filed_rows(&seg, table, true, 0, u64::MAX).await?;
+            rows.extend(lake.deleted_rows(&seg, table).await?);
+            for b in rows {
+                out.push(sys::at_commit(&b, n, seg.ts_ms)?);
+            }
+        }
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------- a change for another leader (ADR-028)

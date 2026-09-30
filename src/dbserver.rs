@@ -237,7 +237,7 @@ pub async fn serve(folder: String, addr: String, pg: Option<String>, default: Op
         true => folder.trim_end_matches('/').to_string(), // (a bucket's prefix)
         false => {
             std::fs::create_dir_all(&folder)?;
-            std::fs::canonicalize(&folder)?.to_string_lossy().to_string()
+            std::fs::canonicalize(&folder)?.to_string_lossy().trim_start_matches(r"\\?\").to_string() // (Windows verbatim prefix)
         }
     };
     let server: Shared = Arc::new(Server { folder: folder.clone(), addr: addr.clone(), default, options, auth, nodes: Default::default(), starting: Default::default() });
