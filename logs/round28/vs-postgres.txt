@@ -1,0 +1,18 @@
+tools/bench/vs_postgres.py (2026-09-30, after round 28): Pondra 0.27.0 against PostgreSQL 16.13,
+this 2-vCPU sandbox, local disk, one client. Postgres near its defaults (shared_buffers 512MB,
+max_wal_size 4GB, fsync and synchronous_commit on, 2 parallel workers per query); Pondra's lake on
+local disk. Lookups: 3,000 random keys of a 1M-row table with a primary key; inserts: 1,000 rows,
+each its own commit; queries: best of 3.
+{
+ "lookup: Postgres (psycopg)": {"p50_ms": 0.126, "p99_ms": 0.376},
+ "lookup: Pondra, its Postgres port (psycopg)": {"p50_ms": 6.45, "p99_ms": 12.139},
+ "lookup: Pondra, GET /lookup (HTTP keep-alive)": {"p50_ms": 0.168, "p99_ms": 0.36},
+ "insert one row: Postgres (fsync on)": {"p50_ms": 0.306, "p99_ms": 0.891},
+ "insert one row: Pondra keyed table (Postgres port)": {"p50_ms": 2.315, "p99_ms": 4.503},
+ "insert one row: Pondra append table (Postgres port)": {"p50_ms": 2.331, "p99_ms": 5.093},
+ "load lineitem (6M rows)": {"Postgres (CSV COPY, then VACUUM ANALYZE), s": 24.4, "Pondra (CREATE TABLE AS from the Parquet file), s": 5.9},
+ "TPC-H Q1 on SF1 lineitem, best of 3 (s)": {"Postgres": 3.273, "Pondra": 0.311},
+ "TPC-H Q6 on SF1 lineitem, best of 3 (s)": {"Postgres": 0.571, "Pondra": 0.053}
+}
+Found: a point query through the Postgres port is planned as any query (6.5 ms); GET /lookup
+takes the fast path (0.17 ms). Routing `SELECT … WHERE key = $1` on a keyed table to it is open.
