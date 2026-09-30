@@ -476,8 +476,7 @@ bucket to its newest lakes.
 - Other engines' writes through the Iceberg REST catalog: another engine's compaction is refused
   (Pondra merges its tables itself); an append to a table with a renamed column is copied, and
   changes to it refused; a keyed table's changes are copied through the log (as upserts), not
-  recorded as written; files recorded as written are read from Parquet, not the hot columns, until a
-  merge rewrites them. Iceberg v3 (row ids kept through other engines' updates), vended credentials
+  recorded as written. Iceberg v3 (row ids kept through other engines' updates), vended credentials
   and scan planning are ADR-029's phase 3. Delta writers need Delta's catalog-managed commits,
   which aren't out yet. delta-rs's `to_pyarrow_table` refuses a table with deletion vectors (its
   `QueryBuilder` reads it).

@@ -8,9 +8,13 @@
 //! costing the CPU that decoding it would. When full, the cache makes room only by dropping
 //! columns nobody read for a minute: a working set bigger than memory is read from Parquet as
 //! before, instead of being churned through the cache.
-use crate::store::{DataFile, Lake};
+//!
+//! A file with a lineage (another engine's, or written without a leader) gets its rows' system
+//! columns from it here, and an append table's file with rows deleted is held without them: both
+//! read as `query::files_once` reads them, cold or hot.
+use crate::store::{DataFile, Lake, Lineage, TableMeta};
 use anyhow::Result;
-use datafusion::arrow::array::{new_null_array, ArrayData, ArrayRef, RecordBatch, RecordBatchOptions};
+use datafusion::arrow::array::{new_null_array, Array, ArrayData, ArrayRef, BooleanArray, Int64Array, RecordBatch, RecordBatchOptions, TimestampMicrosecondArray};
 use datafusion::arrow::datatypes::{DataType, FieldRef, Schema, SchemaRef};
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::datasource::file_format::options::ReadOptions;
@@ -117,40 +121,41 @@ impl Hot {
     }
 
     /// Decode `file`'s columns among `fields` that aren't here yet, in the background, if they
-    /// can fit.
-    fn load(self: &Arc<Self>, lake: Arc<Lake>, file: DataFile, fields: Vec<FieldRef>) {
+    /// can fit (`deletes`: without its deleted rows).
+    fn load(self: &Arc<Self>, lake: Arc<Lake>, file: DataFile, fields: Vec<FieldRef>, deletes: bool) {
         let guess = (file.bytes as usize).max(1 << 20) * 3; // decoded LZ4 Parquet: roughly 3x (checked after)
         // Queries come first: what they hold now is off the cache's budget, so a node under load
         // keeps its memory for them (both are bounded by `--memory-gb`).
         let (reserved, limit) = lake.memory();
         let room = self.max.min(limit.saturating_sub(reserved));
+        let key = key(&file, deletes);
         let fields: Vec<FieldRef> = {
             let mut s = self.state.lock().unwrap();
-            let missing: Vec<FieldRef> = fields.into_iter().filter(|f| !s.cols.contains_key(&(file.path.clone(), f.name().clone()))).collect();
-            if missing.is_empty() || s.busy.contains(&file.path) || !s.twice(&file.path) || !s.room(guess, room) {
+            let missing: Vec<FieldRef> = fields.into_iter().filter(|f| !s.cols.contains_key(&(key.clone(), f.name().clone()))).collect();
+            if missing.is_empty() || s.busy.contains(&key) || !s.twice(&key) || !s.room(guess, room) {
                 return;
             }
-            s.busy.insert(file.path.clone());
+            s.busy.insert(key.clone());
             missing
         };
         let hot = self.clone();
         tokio::spawn(async move {
             let _slot = hot.slot.acquire().await;
-            let decoded = decode(&lake, &file.path, &fields).await;
+            let decoded = decode(&lake, &file, &fields, deletes).await;
             let mut s = hot.state.lock().unwrap();
-            s.busy.remove(&file.path);
+            s.busy.remove(&key);
             let Ok((rows, arrays)) = decoded else { return };
-            if s.rows.get(&file.path).is_some_and(|r| *r != rows) {
+            if s.rows.get(&key).is_some_and(|r| *r != rows) {
                 return; // (batches cut differently: can't be combined)
             }
             let sizes: Vec<usize> = arrays.iter().map(|a| size(a)).collect();
             if !s.room(sizes.iter().sum(), room) {
                 return;
             }
-            s.rows.insert(file.path.clone(), rows);
+            s.rows.insert(key.clone(), rows);
             for ((f, arrays), bytes) in fields.iter().zip(arrays).zip(sizes) {
                 s.used += bytes;
-                s.cols.insert((file.path.clone(), f.name().clone()), Col { arrays: Arc::new(arrays), bytes, read: Instant::now() });
+                s.cols.insert((key.clone(), f.name().clone()), Col { arrays: Arc::new(arrays), bytes, read: Instant::now() });
             }
         });
     }
@@ -201,11 +206,25 @@ fn size(arrays: &[ArrayRef]) -> usize {
     arrays.iter().map(|a| add(&a.to_data(), &mut seen)).sum()
 }
 
-/// `fields` of the Parquet file at `path`, cast to their types (a column the file lacks, added
-/// to the table after it was written, is null): rows per batch, and each field's arrays.
-async fn decode(lake: &Lake, path: &str, fields: &[FieldRef]) -> Result<(Vec<usize>, Vec<Vec<ArrayRef>>)> {
-    let bytes = lake.object(path).await?;
-    let fields = fields.to_vec();
+/// A file's name here: its path, and for a file read without its deleted rows, which deletes it
+/// has (more rows deleted since: another entry, decoded again).
+fn key(f: &DataFile, deletes: bool) -> String {
+    if !deletes || f.deletes.is_empty() {
+        return f.path.clone();
+    }
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    format!("{:?}", f.deletes).hash(&mut h);
+    format!("{}#{:x}", f.path, h.finish())
+}
+
+/// `fields` of `file`, cast to their types (a column the file lacks, added to the table after it
+/// was written, is null): rows per batch, and each field's arrays. Its system columns come from
+/// its lineage if it has one; with `deletes`, its deleted rows are left out.
+async fn decode(lake: &Lake, file: &DataFile, fields: &[FieldRef], deletes: bool) -> Result<(Vec<usize>, Vec<Vec<ArrayRef>>)> {
+    let bytes = lake.object(&file.path).await?;
+    let gone = if deletes && !file.deletes.is_empty() { crate::scan::deleted_rows(lake, file).await? } else { vec![] };
+    let (fields, lineage) = (fields.to_vec(), file.lineage);
     tokio::task::spawn_blocking(move || {
         // Strings straight to views (no copy of their bytes), as the table is read (see `read_schema`).
         let file = ParquetRecordBatchReaderBuilder::try_new(bytes.clone())?.schema().clone();
@@ -217,29 +236,54 @@ async fn decode(lake: &Lake, path: &str, fields: &[FieldRef]) -> Result<(Vec<usi
         let b = ParquetRecordBatchReaderBuilder::try_new_with_options(bytes, ArrowReaderOptions::new().with_schema(hint))?;
         let present: Vec<usize> = fields.iter().filter_map(|f| b.schema().index_of(f.name()).ok()).collect();
         let mask = ProjectionMask::roots(b.parquet_schema(), present);
-        let (mut rows, mut out) = (vec![], vec![vec![]; fields.len()]);
+        let (mut rows, mut out, mut at, mut next) = (vec![], vec![vec![]; fields.len()], 0, 0); // (at: the batch's first row's place in the file)
         for batch in b.with_projection(mask).with_batch_size(BATCH).build()? {
             let batch = batch?;
-            rows.push(batch.num_rows());
+            let n = batch.num_rows();
+            let keep = (!gone.is_empty()).then(|| {
+                BooleanArray::from_iter((at..at + n as u64).map(|i| {
+                    while next < gone.len() && gone[next] < i {
+                        next += 1;
+                    }
+                    Some(gone.get(next) != Some(&i))
+                }))
+            });
             for (f, arrays) in fields.iter().zip(&mut out) {
-                arrays.push(match batch.column_by_name(f.name()) {
-                    Some(c) => datafusion::arrow::compute::cast(c, f.data_type())?,
-                    None => new_null_array(f.data_type(), batch.num_rows()),
+                let c = datafusion::arrow::compute::cast(&column(&batch, f, lineage, at), f.data_type())?;
+                arrays.push(match &keep {
+                    Some(k) => datafusion::arrow::compute::filter(&c, k)?,
+                    None => c,
                 });
             }
+            rows.push(keep.as_ref().map_or(n, |k| k.true_count()));
+            at += n as u64;
         }
         Ok((rows, out))
     })
     .await?
 }
 
+/// A field of `batch`, whose first row is the file's `at`-th: a system column from the file's
+/// lineage when it has one (as `scan::adopted` gives it), else the file's column, or nulls.
+fn column(batch: &RecordBatch, f: &FieldRef, lineage: Option<Lineage>, at: u64) -> ArrayRef {
+    let n = batch.num_rows();
+    match (lineage, f.name().as_str()) {
+        (Some(l), crate::sys::ROW_ID) => Arc::new(Int64Array::from_iter_values((0..n as i64).map(|i| l.first + at as i64 + i))),
+        (Some(l), crate::sys::VERSION) => Arc::new(Int64Array::from_value(l.version as i64, n)),
+        (Some(l), crate::sys::CREATED | crate::sys::UPDATED) => Arc::new(TimestampMicrosecondArray::from_value(l.ms as i64 * 1000, n).with_timezone("UTC")),
+        _ => batch.column_by_name(f.name()).cloned().unwrap_or_else(|| new_null_array(f.data_type(), n)),
+    }
+}
+
 /// A table's Parquet files, read through the hot columns: files whose columns a scan needs are
 /// all in memory come from there, the others from Parquet (with the scan's filters, to skip row
-/// groups), and are loaded for next time.
+/// groups; a file with a lineage or deleted rows as `query::files_once` reads it), and are loaded
+/// for next time.
 pub struct HotFiles {
     pub lake: Arc<Lake>,
     pub files: Vec<DataFile>,
     pub schema: SchemaRef,
+    pub meta: TableMeta, // (what reading a file takes of its table: its columns, their names, the key)
 }
 
 impl std::fmt::Debug for HotFiles {
@@ -260,23 +304,32 @@ impl TableProvider for HotFiles {
             Some(p) => self.schema.project(p)?,
             None => self.schema.as_ref().clone(),
         });
+        let deletes = self.meta.key.is_empty(); // (a keyed table's positions are older versions its own reads pass over)
         let (mut cached, mut cold) = (vec![], vec![]);
         for f in &self.files {
-            match self.lake.hot.get(&f.path, &schema) {
+            match self.lake.hot.get(&key(f, deletes), &schema) {
                 Some(batches) => cached.extend(batches),
                 None => cold.push(f),
             }
         }
         let mut plans: Vec<Arc<dyn ExecutionPlan>> = vec![];
-        if !cold.is_empty() {
-            let urls = cold.iter().map(|f| ListingTableUrl::parse(self.lake.full(&f.path))).collect::<Result<Vec<_>, _>>()?;
+        let (plain, special): (Vec<&DataFile>, Vec<&DataFile>) = cold.iter().copied().partition(|f| f.lineage.is_none() && (f.deletes.is_empty() || !deletes));
+        if !plain.is_empty() {
+            let urls = plain.iter().map(|f| ListingTableUrl::parse(self.lake.full(&f.path))).collect::<Result<Vec<_>, _>>()?;
             let options = ParquetReadOptions::default().to_listing_options(state.config(), state.table_options().clone());
             let config = ListingTableConfig::new_with_multi_paths(urls).with_listing_options(options).with_schema(self.schema.clone());
             let table = ListingTable::try_new(config)?.with_cache(state.runtime_env().cache_manager.get_file_statistic_cache());
             plans.push(table.scan(state, projection, filters, limit).await?);
-            for f in cold {
-                self.lake.hot.load(self.lake.clone(), f.clone(), schema.fields().to_vec());
-            }
+        }
+        if !special.is_empty() {
+            let state = state.as_any().downcast_ref::<datafusion::execution::SessionState>().ok_or_else(|| datafusion::error::DataFusionError::Internal("a session without its state".into()))?;
+            let ctx = datafusion::prelude::SessionContext::new_with_state(state.clone());
+            let df = crate::query::files_once(&self.lake, &ctx, &special, &self.meta, &self.schema).await.map_err(|e| datafusion::error::DataFusionError::External(e.into()))?;
+            let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+            plans.push(df.select_columns(&names)?.create_physical_plan().await?);
+        }
+        for f in cold {
+            self.lake.hot.load(self.lake.clone(), f.clone(), schema.fields().to_vec(), deletes);
         }
         if !cached.is_empty() {
             let n = state.config().target_partitions().max(1);

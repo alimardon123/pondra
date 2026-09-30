@@ -1042,9 +1042,12 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    a big one a piece at a time. A bulk INSERT stamps its files' system columns only when nothing
    follows the table (`write::stamp`); files stamped under a reserved commit meeting a table
    followed since go again without them (`write::AGAIN`). `harness.py followers`.
-160. **Deleted rows are positions** (ADR-029 §4, `DataFile::deletes`, `deleted`): reads skip them
-   by Parquet row selections (`scan::with_deletes`, `placed`, `adopted_in`), never through the hot
-   columns; Pondra's purge writes one position-delete file per partition (`tier::purge`,
+160. **Deleted rows are positions** (ADR-029 §4, `DataFile::deletes`, `deleted`): cold reads skip
+   them by Parquet row selections (`scan::with_deletes`, `placed`, `adopted_in`); the hot columns
+   hold an append table's file without them, under a key naming its deletes (`hot::key`), and a
+   file with a lineage with its system columns from it (`hot::column`): every file of a table is
+   read through `hot::HotFiles` (round 28's fix: they had been left out, TPC-H SF1 from memory
+   3.48 s instead of 2.03 s); Pondra's purge writes one position-delete file per partition (`tier::purge`,
    `write_positions`) instead of rewriting files; maintenance rewrites a file a tenth deleted
    (`tier::mostly_deleted`). A replaced file's delete files go with it after the retention period,
    unless another file still names them (`TableMeta::garbage_deletes`, `tier::named_deletes`).

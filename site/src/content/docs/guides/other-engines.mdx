@@ -267,7 +267,9 @@ columns reordered, a narrower type or a changed key are refused by name.
 An engine can make, rename and drop tables there too, as `CREATE TABLE`, `ALTER TABLE … RENAME TO`
 and `DROP TABLE` do (with an admin token, when tokens are set). The schema's types become Pondra's, a
 required field is `NOT NULL`, identifier fields are the key, a partition spec is `partition_by`
-(one field: the column, or its year, month, day or hour) and a write order is `cluster_by`:
+(one field: the column, or its year, month, day or hour) and a write order is `cluster_by`. (To
+write a partitioned table, PyIceberg needs its `pyiceberg-core` extra: `pip install
+"pyiceberg[pyiceberg-core]"`.)
 
 ```python
 from pyiceberg.schema import Schema

@@ -66,13 +66,22 @@ pub enum Delete {
     Equality { path: String, columns: Vec<String>, seq: i64 },
 }
 
+/// A file's place as a URL: a path on this machine first, as `ListingTableUrl::parse` does
+/// (`Url::parse` would take Windows' `C:\…` for a URL of scheme `c`), then `s3://…` and the like.
+fn url_of(path: &str) -> Result<url::Url> {
+    if std::path::Path::new(path).is_absolute() {
+        return url::Url::from_file_path(path).map_err(|_| anyhow::anyhow!("{path}: not a path"));
+    }
+    Ok(url::Url::parse(path)?)
+}
+
 /// Another engine's files (`files`, of one table) read as `schema` says: its columns in its
 /// order, matched by field id where `table` gives them, partition values from each file's place,
 /// deleted rows left out.
 pub async fn read(ctx: &datafusion::prelude::SessionContext, files: &[&crate::store::DataFile], schema: &SchemaRef, table: Option<&Table>) -> Result<datafusion::prelude::DataFrame> {
     use datafusion::prelude::{cast, ident};
     let first = files.first().context("no files")?;
-    let url = url::Url::parse(&first.path).or_else(|_| url::Url::from_file_path(&first.path).map_err(|_| anyhow::anyhow!("{}: not a path", first.path)))?;
+    let url = url_of(&first.path)?;
     let store = ObjectStoreUrl::parse(&url[..url::Position::BeforePath])?;
     let partition: Vec<String> = first.outside.as_ref().map(|o| o.values.iter().map(|(k, _)| k.clone()).collect()).unwrap_or_default();
     let field = |n: &str| schema.field_with_name(n).cloned().map(Arc::new).with_context(|| format!("no column {n} ({})", names(schema)));
@@ -136,7 +145,7 @@ async fn adopted_in(lake: &crate::store::Lake, ctx: &datafusion::prelude::Sessio
     use datafusion::arrow::datatypes::{DataType, TimeUnit};
     use datafusion::prelude::{cast, col, ident};
     let first = files.first().context("no files")?;
-    let url = url::Url::parse(&lake.full(&first.path)).or_else(|_| url::Url::from_file_path(lake.full(&first.path)).map_err(|_| anyhow::anyhow!("{}: not a path", first.path)))?;
+    let url = url_of(&lake.full(&first.path))?;
     let store = ObjectStoreUrl::parse(&url[..url::Position::BeforePath])?;
     let (mut ids, mut mapping) = (std::collections::BTreeMap::new(), std::collections::HashMap::new());
     let own = meta.columns.iter().enumerate().filter(|(_, (c, _))| !crate::sys::NAMES.contains(&c.as_str()));
@@ -173,7 +182,7 @@ async fn adopted_in(lake: &crate::store::Lake, ctx: &datafusion::prelude::Sessio
 /// (`__row`), the rows deleted by position skipped unread.
 pub async fn placed(lake: &crate::store::Lake, ctx: &datafusion::prelude::SessionContext, f: &crate::store::DataFile, schema: &SchemaRef) -> Result<datafusion::prelude::DataFrame> {
     use datafusion::arrow::datatypes::DataType;
-    let url = url::Url::parse(&lake.full(&f.path)).or_else(|_| url::Url::from_file_path(lake.full(&f.path)).map_err(|_| anyhow::anyhow!("{}: not a path", f.path)))?;
+    let url = url_of(&lake.full(&f.path))?;
     let store = ObjectStoreUrl::parse(&url[..url::Position::BeforePath])?;
     let deleted = lake_gone(lake, ctx, &[f]).await?.pop().flatten();
     let stats = Arc::new(statistics(f, f.rows, deleted.as_ref().map_or(0, |d| d.len()), true, schema));
@@ -186,7 +195,7 @@ pub async fn placed(lake: &crate::store::Lake, ctx: &datafusion::prelude::Sessio
 /// position (`DataFile::deletes`), read as `schema` (stored names): those rows skipped unread.
 pub async fn with_deletes(lake: &crate::store::Lake, ctx: &datafusion::prelude::SessionContext, files: &[&crate::store::DataFile], schema: &SchemaRef) -> Result<datafusion::prelude::DataFrame> {
     let first = files.first().context("no files")?;
-    let url = url::Url::parse(&lake.full(&first.path)).or_else(|_| url::Url::from_file_path(lake.full(&first.path)).map_err(|_| anyhow::anyhow!("{}: not a path", first.path)))?;
+    let url = url_of(&lake.full(&first.path))?;
     let store = ObjectStoreUrl::parse(&url[..url::Position::BeforePath])?;
     let mut out = vec![];
     for (f, deleted) in files.iter().zip(lake_gone(lake, ctx, files).await?) {
@@ -215,7 +224,7 @@ pub async fn file_rows(lake: &crate::store::Lake, ctx: &datafusion::prelude::Ses
     if f.lineage.is_some() {
         return adopted_in(lake, ctx, &[f], meta, schema, pick).await;
     }
-    let url = url::Url::parse(&lake.full(&f.path)).or_else(|_| url::Url::from_file_path(lake.full(&f.path)).map_err(|_| anyhow::anyhow!("{}: not a path", f.path)))?;
+    let url = url_of(&lake.full(&f.path))?;
     let store = ObjectStoreUrl::parse(&url[..url::Position::BeforePath])?;
     let stats = Arc::new(datafusion::common::Statistics::new_unknown(schema));
     let (range, only) = pick.of();
@@ -342,7 +351,7 @@ fn name_mapping(json: &str) -> std::collections::HashMap<String, i64> {
 fn key_of(path: &str, root: &url::Url) -> Result<String> {
     match path.contains("://") {
         true => Ok(path[root[..url::Position::BeforePath].len()..].trim_start_matches('/').to_string()),
-        false => Ok(path.trim_start_matches('/').to_string()), // (this machine's: the whole path)
+        false => Ok(url::Url::from_file_path(path).ok().and_then(|u| object_store_df::path::Path::from_url_path(u.path()).ok()).map_or_else(|| path.trim_start_matches('/').to_string(), |p| p.to_string())), // (this machine's: the whole path, `C:/…` on Windows)
     }
 }
 

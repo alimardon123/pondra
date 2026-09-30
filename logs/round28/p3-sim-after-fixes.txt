@@ -1,0 +1,65 @@
+sim changes exit=0
+sim adopted exit=0
+sim rewrites exit=0
+sim upserts exit=0
+DONE
+=== changes
+{
+ "changes": {
+  "60 random INSERT/UPDATE/DELETE/MERGE on 3 nodes == the model, every node, while tiering and purging": true,
+  "an UPDATE or MERGE keeps a row's _row_id; ids are unique": true,
+  "a retried job changes rows once; `pondra sql` changes them through the leader": true,
+  "three nodes changing the same rows at once: every change counts": true,
+  "the change feed replays to the table's rows; each old version as it was": true,
+  "/watch?changes=true: an UPDATE as its old and new versions": true,
+  "Delta readers see the changes once they are tiered and purged": true,
+  "spread over three nodes == one node, over the changed tables": true,
+  "refused: a change under a view keeping a max; a view's table; a system column; a MERGE matching a row twice": true,
+  "keyed tables: UPDATE and MERGE keep a row's _row_id; MERGE inserts and deletes": true,
+  "after a restart, the same rows": true
+ },
+ "ok": true
+}
+=== adopted
+  "other engines read the rows as written: PyIceberg and delta-rs; a filter on them skips what it can": true,
+  "spread over three nodes, the adopted rows and their ids == one node's": true,
+  "UPDATE and DELETE on adopted rows: the row keeps its id": true,
+  "a merge writes their system columns out: 8 appends' files in one, every row keeping its id and version": true,
+  "a partitioned table: its spec published (day), the writer's files one day each, and a file of two days refused by name": true,
+  "the layout published: a write order as cluster_by and back, a key as identifier fields": true,
+  "a NULL in a NOT NULL column refused by name, from the file's footer": true,
+  "renamed and dropped through the catalog": true
+ },
+ "ok": true,
+ "cpu_s": {
+  "adopted": 0.16999999999999998,
+  "copied": 0.24,
+  "rows": 200000
+ }
+}
+=== rewrites
+Commit failed due to a concurrent update, retrying (1/4) in 110 ms
+{
+ "rewrites": {
+  "a DELETE from PyIceberg: a whole file dropped, part of another rewritten; Pondra, PyIceberg and delta-rs read the same rows": true,
+  "rows in a file it left alone keep their ids; the rows it rewrote get new ones (Iceberg v2: a delete and an insert)": true,
+  "the file it took out is the table's no more (its files: PyIceberg's first, and the rewrite of its second)": true,
+  "an overwrite with a filter (a delete's snapshot and an append's, one commit)": true,
+  "the stale rule: a row in the log when the writer read the table: 409 (its files written at once), and the DELETE done again takes it too": true,
+  "refused by name: a change to a table a view follows that can't take it back (no count to drop the groups it empties)": true,
+  "schema changes through the catalog: a column added, renamed, widened and dropped, each an ALTER TABLE; a required one refused": true
+ },
+ "ok": true
+}
+=== upserts
+{
+ "upserts": {
+  "a keyed table read by PyIceberg, DuckDB (Delta) and Polars as Pondra reads it after every tier round, before any compaction": true,
+  "another engine's append is upserts: a key there is replaced, a new one added": true,
+  "its DELETE (copy-on-write): the key gone, the file's other rows as they were": true,
+  "an equality delete on the key (Flink's kind): a delete marker, the key gone": true,
+  "the change feed replays to the table: Pondra's writes and the other engine's, as upserts and deletes": true,
+  "a table that combines each key's rows (order_by) refuses another engine's change by name": true
+ },
+ "ok": true
+}

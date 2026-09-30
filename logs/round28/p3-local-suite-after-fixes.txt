@@ -1,0 +1,158 @@
+upsert exit=0
+deal exit=0
+outside exit=0
+clouds exit=0
+kafkas exit=0
+tiering exit=0
+fence exit=0
+insert exit=0
+serverless exit=0
+clients exit=0
+kafka exit=0
+alter exit=0
+windows exit=0
+sessions exit=0
+asof exit=0
+sums exit=0
+schemas exit=0
+changes exit=0
+guard exit=0
+files exit=0
+layouts exit=0
+clusters exit=0
+copies exit=0
+streams exit=0
+columns exit=0
+fills exit=0
+dedup exit=0
+procedures exit=0
+functions exit=0
+external exit=0
+names exit=0
+answers exit=0
+writes exit=0
+adopted exit=0
+ids exit=0
+rewrites exit=0
+followers exit=0
+transactions exit=0
+upserts exit=0
+live exit=0
+temps exit=0
+across exit=0
+found exit=0
+renames exit=0
+workspace exit=0
+server exit=0
+scale exit=0
+flight exit=0
+reader exit=0
+crash exit=0
+formats exit=0
+smoke exit=0
+DONE
+
+=== changes
+{
+ "changes": {
+  "60 random INSERT/UPDATE/DELETE/MERGE on 3 nodes == the model, every node, while tiering and purging": true,
+  "an UPDATE or MERGE keeps a row's _row_id; ids are unique": true,
+  "a retried job changes rows once; `pondra sql` changes them through the leader": true,
+  "three nodes changing the same rows at once: every change counts": true,
+  "the change feed replays to the table's rows; each old version as it was": true,
+  "/watch?changes=true: an UPDATE as its old and new versions": true,
+  "Delta readers see the changes once they are tiered and purged": true,
+  "spread over three nodes == one node, over the changed tables": true,
+  "refused: a change under a view keeping a max; a view's table; a system column; a MERGE matching a row twice": true,
+  "keyed tables: UPDATE and MERGE keep a row's _row_id; MERGE inserts and deletes": true,
+  "after a restart, the same rows": true
+ },
+ "ok": true
+}
+=== adopted
+{
+ "adopted": {
+  "an append is the table's where it was written (no file copied), its rows with system columns from their lineage: ids distinct and in one run, one version, one time": true,
+  "it costs the node footers and a commit: under a quarter of a copy's CPU (0.02 s against 0.19 s for 1,000,000 rows)": true,
+  "other engines read the rows as written: PyIceberg and delta-rs; a filter on them skips what it can": true,
+  "spread over three nodes, the adopted rows and their ids == one node's": true,
+  "UPDATE and DELETE on adopted rows: the row keeps its id": true,
+  "a merge writes their system columns out: 8 appends' files in one, every row keeping its id and version": true,
+  "a partitioned table: its spec published (day), the writer's files one day each, and a file of two days refused by name": true,
+  "the layout published: a write order as cluster_by and back, a key as identifier fields": true,
+  "a NULL in a NOT NULL column refused by name, from the file's footer": true,
+  "renamed and dropped through the catalog": true
+ },
+ "ok": true,
+ "cpu_s": {
+  "adopted": 0.020000000000000004,
+  "copied": 0.18999999999999997,
+  "rows": 1000000
+ }
+}
+=== rewrites
+Commit failed due to a concurrent update, retrying (1/4) in 105 ms
+{
+ "rewrites": {
+  "a DELETE from PyIceberg: a whole file dropped, part of another rewritten; Pondra, PyIceberg and delta-rs read the same rows": true,
+  "rows in a file it left alone keep their ids; the rows it rewrote get new ones (Iceberg v2: a delete and an insert)": true,
+  "the file it took out is the table's no more (its files: PyIceberg's first, and the rewrite of its second)": true,
+  "an overwrite with a filter (a delete's snapshot and an append's, one commit)": true,
+  "the stale rule: a row in the log when the writer read the table: 409 (its files written at once), and the DELETE done again takes it too": true,
+  "refused by name: a change to a table a view follows that can't take it back (no count to drop the groups it empties)": true,
+  "schema changes through the catalog: a column added, renamed, widened and dropped, each an ALTER TABLE; a required one refused": true
+ },
+ "ok": true
+}
+=== followers
+Commit failed due to a concurrent update, retrying (1/4) in 101 ms
+{
+ "followers": {
+  "two views follow a bulk INSERT and a PyIceberg append, its file where PyIceberg wrote it, each commit's rows its _version": true,
+  "and a PyIceberg DELETE: the adding-up view takes the rows back, the row-by-row one drops them": true,
+  "the change feed replays to the table: the bulk INSERT's and PyIceberg's rows as inserts, its DELETE's as deletes (and the rows it rewrote)": true,
+  "a Kafka consumer reads every row appended, in order, a big commit a piece at a time (and the rows a DELETE rewrote)": true,
+  "a streaming task takes a bulk INSERT's rows and PyIceberg's; a change it can't follow is refused by name": true,
+  "a stream join pairs the rows bulk INSERTs wrote on either side, each pair once": true
+ },
+ "ok": true
+}
+=== transactions
+{
+ "transactions": {
+  "a transaction over two tables is one commit: both tables' rows, one _version, each table's view following": true,
+  "one whose second table changed since is refused (409), and changes neither table": true,
+  "a DELETE planned before Pondra merged its file, sent after: carried over to the merged file by row id; the rows as they should be, none twice, their ids kept": true,
+  "a change naming rows deleted since (and its file merged) is refused (409), the table as it was": true
+ },
+ "ok": true
+}
+=== upserts
+{
+ "upserts": {
+  "a keyed table read by PyIceberg, DuckDB (Delta) and Polars as Pondra reads it after every tier round, before any compaction": true,
+  "another engine's append is upserts: a key there is replaced, a new one added": true,
+  "its DELETE (copy-on-write): the key gone, the file's other rows as they were": true,
+  "an equality delete on the key (Flink's kind): a delete marker, the key gone": true,
+  "the change feed replays to the table: Pondra's writes and the other engine's, as upserts and deletes": true,
+  "a table that combines each key's rows (order_by) refuses another engine's change by name": true
+ },
+ "ok": true
+}
+=== files
+{"files": {"passed": true, "checks": {"all rows": true, "a Parquet file per tiering round (every 10 s), not per INSERT": true, "about one object write per INSERT (\u2264 1.2, and \u2264 2 a second meanwhile)": true, "write-ahead log objects left (\u2264 30)": true, "a pondra sql INSERT's files recorded as written": true}, "secs": 0.7, "parquet_files_made": 0, "writes_per_insert": 1.0, "wal_objects_left": 2, "cli_insert": {"files": 3, "files_seen": 3}}}
+=== writes
+Commit failed due to a concurrent update, retrying (1/4) in 106 ms
+{
+ "writes": {
+  "PyIceberg appends through a follower: the rows are the table's own (row ids), its file where it wrote it, its snapshot found by its id": true,
+  "two writers at once: the second gets 409, retries, and each append is in once": true,
+  "a commit sent twice (a retry after a lost answer) is applied once": true,
+  "a view of the table follows (in the same commit), and so does its Delta copy": true,
+  "an attached lake's table, through this lake's catalog: its leader records it": true,
+  "Pondra itself appends to another Pondra's table through its catalog": true,
+  "a keyed table takes an append as upserts": true,
+  "refused by name: files outside the table's folder": true
+ },
+ "ok": true
+}

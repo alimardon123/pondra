@@ -47,7 +47,16 @@ Start more copies on the same bucket to scale out. The only state is object stor
    commits part 5 of 5: copy-on-write, merge-on-read, a keyed table); `harness.py all`,
    `console_check.py` (78), locally; the new tests on simulated and real R2. Tests read Delta
    through delta-rs's `QueryBuilder`: its `to_pyarrow_table` refuses deletion vectors.
-8. **The console's Workspace** (after the owner tried 0.26 on Windows): folders, a ⋯ on every row,
+8. **Found after the round, fixed the same day** (`logs/gates/`, CI on 443e607):
+   - TPC-H SF1 from memory had gone from 2.34 s (round 26) to 3.48 s: files with a lineage
+     (rounds 27–28) and an append table's files with deleted rows (round 28) never reached the hot
+     columns. The hot columns now hold them (system columns from the lineage, deleted rows left
+     out): 2.03 s. The rounds' gates hadn't been run; `roadmap.md`'s road to 1.0 makes them one
+     command;
+   - on Windows, a file of an attached lake, read by its path (`C:\…`), was taken for a URL of scheme
+     `c` (`smoke.py` on CI's Windows runner);
+   - CI lacked `pyiceberg-core`, which PyIceberg needs to write a partitioned table.
+9. **The console's Workspace** (after the owner tried 0.26 on Windows): folders, a ⋯ on every row,
    new files in the tree with the unsaved dot, notebooks in any folder, dialogs that close on a
    click outside, and a Data tree that lists what it can when a view reads a local file.
 

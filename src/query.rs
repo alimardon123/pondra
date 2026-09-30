@@ -267,21 +267,14 @@ pub async fn sources(lake: &Lake, ctx: &SessionContext, name: &str, meta: &Table
     Ok((Some(ctx.read_batches(hot.iter().map(|b| conform(b, &s)).collect::<Result<Vec<_>>>()?)?), files))
 }
 
-/// Parquet files as one read: through the hot columns (`hot.rs`) when they're on; files recorded
-/// as another engine wrote them with their lineage (`scan::adopted`).
+/// Parquet files as one read: through the hot columns (`hot.rs`) when they're on, which read a
+/// file with a lineage or deleted rows as `files_once` does.
 async fn read_files(lake: &Lake, ctx: &SessionContext, files: Vec<&DataFile>, meta: &TableMeta, schema: &SchemaRef) -> Result<DataFrame> {
     if !lake.hot.on() {
         return files_once(lake, ctx, &files, meta, schema).await;
     }
-    let (plain, rest): (Vec<&DataFile>, Vec<&DataFile>) = files.into_iter().partition(|f| f.lineage.is_none() && (f.deletes.is_empty() || !meta.key.is_empty()));
-    let mut parts = vec![];
-    if !plain.is_empty() {
-        parts.push(ctx.read_table(Arc::new(crate::hot::HotFiles { lake: lake.arc(), files: plain.into_iter().cloned().collect(), schema: schema.clone() }))?);
-    }
-    if !rest.is_empty() {
-        parts.push(files_once(lake, ctx, &rest, meta, schema).await?);
-    }
-    union_all(parts)
+    let meta = TableMeta { columns: meta.columns.clone(), names: meta.names.clone(), key: meta.key.clone(), ..Default::default() }; // (what reading a file takes of its table)
+    Ok(ctx.read_table(Arc::new(crate::hot::HotFiles { lake: lake.arc(), files: files.into_iter().cloned().collect(), schema: schema.clone(), meta }))?)
 }
 
 /// Files of a table as one read, as `read_files` reads them but not through the hot columns (and

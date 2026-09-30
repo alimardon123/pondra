@@ -485,6 +485,10 @@ the owner's review*:
   - A delete file's `file_path` read as `VARCHAR` is a string view in this DataFusion: the node
     panicked (and a panic stops the node, by design).
   - Kafka's first fetch could skip a table's first row when segment numbers had gaps (reservations).
+  - *(After the round.)* Files with a lineage and an append table's files with deleted rows never
+    reached the hot columns (TPC-H SF1 from memory 3.48 s against round 26's 2.34 s): the hot
+    columns now hold them, system columns from the lineage and deleted rows left out (2.03 s).
+    And on Windows, such a file's path (`C:\…`) was parsed as a URL of scheme `c`.
 - **Tests:** `harness.py followers` (6 checks), `transactions` (4), `upserts` (6), `rewrites`
   updated; `formats_check.py --spark … --only commits` (5: Spark 4 with Iceberg 1.10, copy-on-write,
   merge-on-read with a view and the change feed following, and a keyed table), and `harness.py all`
