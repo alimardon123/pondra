@@ -43,7 +43,7 @@ pondra serve lake        # then open http://localhost:8080
   **Workspace** (the lake's files). The filter narrows both trees to the names that hold what you
   type; **Esc** clears it.
 - **The middle:** a tab per open file. A dot on a tab (and beside the file in the Workspace) means
-  it has changes not saved; **Ctrl+S** saves the one in front.
+  it has changes not saved, and a new file has it from the start; **Ctrl+S** saves the one in front.
 - **The right pane:** **Details**, **Variables** and **Runs** (the node's jobs and schedules, and
   what this page ran).
 - **Each view's ⋯** moves it to the other pane: Workspace can sit as a tab on the right, for
@@ -61,20 +61,34 @@ Click a file in the Workspace to open it in a tab (its tab comes forward if it i
 
 | File | Opens as | Below it |
 |---|---|---|
-| A notebook (`notebooks/<name>`) | cells: SQL, Python and text | — |
+| A notebook (`notebooks/<name>`, or an `.ipynb` in any other folder) | cells: SQL, Python and text | — |
 | `.sql` | an editor with line numbers | Results, Messages, Chart and Plan (or at the right) |
 | `.py` | the same editor | a console: the file's runs, and a `>>>` line |
 | `.csv`, `.tsv`, `.json`, `.jsonl`, `.parquet` | a table: CSV and JSON edited in place, Parquet read-only | — |
 | `.md`, `.txt` | the editor | — |
 
-The Workspace's **+** makes a notebook, a SQL or a Python file, or puts a file from your computer in
-the lake. A new file asks for its path the first time you save it. Right-click a file to rename,
-download or delete it.
+The Workspace's **+** (the tab bar's too) makes a notebook, a SQL or a Python file, or a folder, or
+puts a file from your computer in the lake (**Upload a file…**). A new file is in the Workspace at
+once, in the folder it will be saved to, with the dot: it is not in the lake yet. It asks for its path
+the first time you save it.
 
 A file is saved where it is: **Ctrl+S** replaces it in the lake. If someone else saved it since you
 opened it, your save is refused and theirs kept; open it again, or save under another name. (Over
 HTTP, it's `If-Match`: see [Files](/pondra/reference/http/#files).) Every node reads the new file at
 its next statement.
+
+### Folders
+
+**New folder** (in a **+** menu, or **New folder here** in a folder's menu) asks for a name (`a/b`
+makes both) and makes the folder. A lake holds files, not folders, so an empty folder is a zero-byte
+file, `<folder>/.folder`, put as any file is. The console never lists it, in the Workspace or in
+search. A folder shows while it holds a file or a marker.
+
+Each row of the Workspace has a **⋯**. It shows when you point at the row, focus it, or have it
+picked, and opens what a right-click opens. A file's menu opens, renames, downloads and deletes it.
+A folder's menu has **New notebook here**, **New SQL file here**, **New Python file here**, **New
+folder here**, **Upload a file here…** and **Delete folder…**, which says how many files go, then
+deletes them all, the marker too.
 
 ### SQL files
 
@@ -102,7 +116,7 @@ too (**↑** **↓** bring back the ones before).
 
 ### Jobs and schedules
 
-A file's **⋯** (and a notebook's) runs it on the node, where it goes on without the page:
+A file's **⋯** (and a notebook's, in `notebooks`) runs it on the node, where it goes on without the page:
 
 - **Run as a job** saves the file and starts it, with the parameters' values as they are now.
 - **Schedule…** makes a task that runs it every so often (`15 minutes`, `1 day`, or a cron line such
@@ -174,8 +188,8 @@ Click a column's header and the details panel summarizes that column; **Profile*
   100 rows: in a new cell when a notebook is in front, else in a new SQL tab. Click a column to put
   its name where you are typing.
 - **Workspace** lists the lake's own files (`PUT /files/…`, `files()`) by folder, and your
-  notebooks under `notebooks`, with the headings of the one in front as its outline. Whoever may
-  read the lake may read its files, from SQL too.
+  notebooks under `notebooks`, with the headings of the one in front as its outline. A new file not
+  saved yet is listed too, with the dot. Whoever may read the lake may read its files, from SQL too.
 
 ## The details panel
 
@@ -273,7 +287,7 @@ The **⋯** at a cell's top right (it shows when you point at the cell) runs the
 this one and those below; hides its output (**O**: its code stays, and a click on the output
 brings it back); clears its output; and deletes it. The notebook's own **⋯** (in its toolbar) lists
 its versions, downloads it as `.ipynb` and clears every output. The page's menu (top right) holds
-Settings, a new notebook or file, opening an `.ipynb`, restarting Python, the token and the keys.
+Settings, a new notebook, file or folder, **Upload a file…**, restarting Python, the token and the keys.
 
 ## Live answers
 
@@ -293,10 +307,14 @@ program appending over HTTP) shows in the cell within a fraction of a second. Th
 
 **Ctrl+S** saves the notebook in the lake, under the name in its toolbar:
 
-- Each save is a new version, `files/notebooks/<name>/<time>.ipynb`, so every version stays (other
-  files are replaced in place).
+- In the `notebooks` folder each save is a new version, `files/notebooks/<name>/<time>.ipynb`, so
+  every version stays (other files are replaced in place).
 - The Workspace's `notebooks` folder opens the latest version. **Versions…** in the notebook's **⋯**
   lists every version in Details; click one to open it.
+- A notebook can live in any other folder: **New notebook here** in its menu, or an `.ipynb`
+  uploaded there. It is one plain file, `<folder>/<name>.ipynb`, and **Ctrl+S** replaces it in place
+  (refused if someone saved it since you opened it, as any file is). It has no versions, and no jobs
+  or schedules.
 - Everyone who can read the lake can open them. They are files like any other, so you can list them
   in SQL:
 
@@ -310,8 +328,9 @@ rows) and shown, marked **saved**, until you run the cell again.
 
 - **Download** saves the notebook to your computer. Jupyter, VS Code and GitHub open it as it is. In
   Jupyter, `%load_ext pondra` makes the `%%sql` cells run (see [Notebooks](/pondra/guides/notebooks/)).
-- **Upload** opens an `.ipynb` from your computer, from Jupyter or anywhere else. **Ctrl+S** then
-  keeps it in the lake.
+- **Upload a file…** puts any file from your computer in the lake. An `.ipynb` (from Jupyter or
+  anywhere else) opens as a notebook instead, and **Ctrl+S** then keeps it in the lake. **Upload a
+  file here…** in a folder's menu puts it in that folder, an `.ipynb` too.
 
 ## Keys
 

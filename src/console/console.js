@@ -13,11 +13,11 @@
 //
 // No framework and nothing from anywhere else: the page, its modules and its fonts come from the node.
 import { h, $, fill, said, esc, store, secs, count, bytes, ago, utc, ICONS, icon, svg, typeMark, sqlType, numeric, on, emit, R, byOrder, shell, register, T, configure,
-  MODE, SESSION, S, base, call, run, rows, doBlock, ident, quote, qualified, home, fileSql, toast, menu, prompt, confirmed, VERSION, DATA, fileUrl, Failure, ask } from './core.js';
-import { highlighted, closeComplete } from './editor.js';
+  MODE, SESSION, S, base, call, run, rows, doBlock, ident, quote, qualified, home, fileSql, toast, menu, prompt, confirmed, VERSION, ask } from './core.js';
+import { highlighted } from './editor.js';
 import { grid, summarize, statView, spread } from './grid.js';
 import { Notebook, openNotebook, versions, cleanName, doneText } from './notebook.js';
-import { workspace, drawWorkspace, treeItem, upload, registerFiles, SqlDoc, PythonDoc, kindOf, iconOf, download } from './files.js';
+import { workspace, drawWorkspace, treeItem, upload, newFolder, FOLDER, registerFiles, SqlDoc, PythonDoc, kindOf, iconOf, download } from './files.js';
 
 R.helpers = {};
 const H = R.helpers;
@@ -64,7 +64,8 @@ function moveView(v) {
 }
 const viewTitle = v => typeof v.title === 'function' ? v.title() : v.title;
 function viewMenu(e, v) {
-  menu(e.currentTarget || e, [...(v.tools || []).filter(t => !t.hidden?.()).map(t => ({ label: t.title, icon: t.icon, run: t.run })), (v.tools || []).length ? '-' : null,
+  const tools = (v.tools || []).filter(t => !t.hidden?.() && t.menu !== false); // (a tool that opens a menu at its button is only a button)
+  menu(e.currentTarget || e, [...tools.map(t => ({ label: t.title, icon: t.icon, run: t.run })), tools.length ? '-' : null,
     { label: sideOf(v) === 'left' ? 'Move to the right pane' : 'Move to the left pane', icon: 'moveSide', run: () => moveView(v) },
     sideOf(v) === 'left' ? { label: folded(v) ? 'Unfold' : 'Fold', run: () => fold(v) } : null]);
 }
@@ -74,7 +75,7 @@ function fold(v, on = !folded(v)) { prefs('folded', [...new Set((prefs('folded')
 const leftViews = () => R.views.filter(v => sideOf(v) === 'left').map(v => ({ v, o: v.id === 'workspace' && prefs('workspaceFirst') ? 5 : v.order ?? 50 })).sort((a, b) => a.o - b.o).map(x => x.v);
 async function renderView(v) {
   v.box ||= h('div', { id: v.id, role: v.tree !== false ? 'tree' : null, class: 'vbox', 'aria-label': viewTitle(v) });
-  const n = v.n = (v.n || 0) + 1; // (a slow answer for an earlier pick never covers a later one's)
+  const n = v.n = (v.n || 0) + 1; // (a slow answer for an earlier pick never covers a later pick)
   try {
     const out = await v.render(v.box, S.pick);
     if (n === v.n && Array.isArray(out)) v.box.replaceChildren(...out.filter(Boolean));
@@ -97,13 +98,13 @@ function drawLeft() {
   $('#left').replaceChildren(FILTER, ...parts.length ? parts : [h('div', { class: 'empty pad' }, 'Nothing here: views moved to the right pane come back with their ⋯.')], EDGE);
   filterLeft();
 }
-const EDGE = $('#leftEdge'); // (the left pane's edge: kept as its groups are drawn again)
+const EDGE = $('#leftEdge'); // (the edge of the left pane: kept as its groups are drawn again)
 /** The left pane's filter: the trees show the names that hold what is typed (and what they are in). */
 const FILTER = h('label', { class: 'lfilter' }, icon('filter'), h('input', { id: 'filter', type: 'search', placeholder: 'Filter', autocomplete: 'off', spellcheck: 'false', 'aria-label': 'Filter the tables and files',
   oninput: e => { S.filter = e.target.value.trim().toLowerCase(); filterLeft(); }, onkeydown: e => { if (e.key === 'Escape' && e.target.value) { e.stopPropagation(); e.target.value = ''; S.filter = ''; filterLeft(); } } }));
 function filterLeft() {
   const q = S.filter || '', name = row => (row.querySelector(':scope > .nm')?.textContent || '').toLowerCase();
-  const walk = (el, keep) => { // → whether `el`, or something in it, holds q
+  const walk = (el, keep) => { // → whether el, or something in it, holds q
     const item = el.classList.contains('item'), row = item ? el.firstElementChild : el;
     if (!row?.classList.contains('row')) return false;
     const self = !!q && name(row).includes(q);
@@ -218,7 +219,7 @@ function drawTabs() {
     t.dataset.i = i;
     return t;
   });
-  $('#tabbar').replaceChildren(h('div', { class: 'tlist', role: 'tablist', 'aria-label': 'Open files' }, tabs), h('button', { class: 'icon newtab', title: 'New: a notebook, a SQL or a Python file', 'aria-label': 'New', html: svg('plus', 16), onclick: e => newMenu(e.currentTarget) }));
+  $('#tabbar').replaceChildren(h('div', { class: 'tlist', role: 'tablist', 'aria-label': 'Open files' }, tabs), h('button', { class: 'icon newtab', title: 'New: a notebook, a file or a folder', 'aria-label': 'New', html: svg('plus', 16), onclick: e => newMenu(e.currentTarget) }));
   if (S.doc) document.title = `${S.doc.dirty ? '• ' : ''}${S.doc.title} · Pondra`;
 }
 H.drawTabs = drawTabs;
@@ -236,26 +237,34 @@ function status() {
 }
 H.status = status;
 function welcome() {
-  const b = (ic, label, fn) => h('button', { class: 'btn', onclick: fn }, icon(ic), label);
-  return h('div', { class: 'doc welcome' }, h('div', {}, h('h1', {}, 'Pondra'), h('p', {}, 'Open a file from the Workspace, a table from Data, or start something new.'),
-    h('div', { class: 'acts2' }, b('notebook', 'New notebook', () => newNotebook()), b('filesql', 'New SQL file', () => newFile('sql')), b('filepy', 'New Python file', () => newFile('python')), b('up', 'Upload a file', () => upload()))));
+  const b = ([, ic, label, fn]) => h('button', { class: 'btn', onclick: fn }, icon(ic), label);
+  return h('div', { class: 'doc welcome' }, h('div', {}, h('h1', {}, 'Pondra'), h('p', {}, 'Open a file from the Workspace, a table from Data, or start something new.'), h('div', { class: 'acts2' }, NEW.map(b))));
 }
-function newMenu(at) {
-  menu(at, [{ label: 'New notebook', icon: 'notebook', run: () => newNotebook() }, { label: 'New SQL file', icon: 'filesql', run: () => newFile('sql') }, { label: 'New Python file', icon: 'filepy', run: () => newFile('python') }, '-',
-    { label: 'Open an .ipynb or put a file in the lake…', icon: 'up', run: () => upload() }]);
-}
+/** What the page makes new, for its welcome page, + menus, ⋯ menu and search: [id, icon, label, run]. */
+const NEW = [['newnb', 'notebook', 'New notebook', () => newNotebook()], ['newsql', 'filesql', 'New SQL file', () => newFile('sql')], ['newpy', 'filepy', 'New Python file', () => newFile('python')],
+  ['newdir', 'folder', 'New folder', () => newFolder()], ['upload', 'up', 'Upload a file…', () => upload()]];
+const newMenu = at => menu(at, [...NEW.slice(0, -1), '-', NEW.at(-1)].map(x => x === '-' ? x : { icon: x[1], label: x[2], run: x[3] }));
 let untitled = 0;
-function newNotebook(nb = { cells: [] }, name) { const d = addDoc(new Notebook({ name: name || nextName('untitled', n => S.docs.some(x => x.kind === 'notebook' && x.name === n)), nb })); if (!nb.cells.length) d.cells[0].edit(); return d; }
-H.openNotebook = (nb, name) => { const d = newNotebook(nb, cleanName(name || '') || 'untitled'); d.changed(); return d; };
-const nextName = (stem, taken) => { let n = stem; while (taken(n)) n = `${stem}-${++untitled + 1}`; return n; };
-function newFile(kind, at = '') {
-  const Cls = kind === 'python' ? PythonDoc : SqlDoc, ext = kind === 'python' ? 'py' : 'sql';
-  const name = nextName('untitled', n => S.docs.some(d => d.title === `${n}.${ext}`)) + '.' + ext;
-  const d = addDoc(new Cls({ untitled: at + name }));
+/** A name for a new file in `dir`: `untitled`, or `untitled-2`… (one no tab has). */
+const taken = p => S.docs.some(d => (d.path || d.untitled) === p);
+const nextName = (dir, ext) => { let n = 'untitled'; while (taken(dir + n + ext)) n = `untitled-${++untitled + 1}`; return n; };
+/** A new notebook (with a `dir`: one plain file, saved in place there). */
+function newNotebook(nb = { cells: [] }, name, dir = null) {
+  const d = addDoc(new Notebook({ name: name || nextName(dir ?? 'notebooks/', dir == null ? '' : '.ipynb'), nb, dir }));
+  if (!nb.cells.length) d.cells[0].edit();
+  return d;
+}
+H.openNotebook = (nb, name) => newNotebook(nb, cleanName(name || '') || 'untitled');
+// (notebooks/ keeps versions: any other folder, a plain file)
+H.newNotebook = dir => dir === 'notebooks' ? newNotebook() : newNotebook(undefined, undefined, dir + '/');
+/** A new SQL or Python file, to be saved in `at` (asked again when it is saved). */
+function newFile(kind, at = kind === 'python' ? 'scripts/' : 'queries/') {
+  const ext = kind === 'python' ? '.py' : '.sql', d = addDoc(new (kind === 'python' ? PythonDoc : SqlDoc)({ untitled: at + nextName(at, ext) + ext }));
   d.ed.focus();
   return d;
 }
 H.newFile = newFile;
+H.close = closeDoc;
 /** Open a lake file (a path under `files/`, or `notebooks/<name>`) in its tab: the open one comes forward. */
 const opening = new Map(); // (a path being opened: a second click waits for the same tab)
 function openFile(path, opts = {}) {
@@ -295,7 +304,7 @@ async function restoreTabs() {
 function hashNow() {
   const p = new URLSearchParams();
   if (S.db && MODE === 'lakes') p.set('db', S.db);
-  if (S.doc?.kind === 'notebook' && S.doc.version) p.set('notebook', S.doc.name);
+  if (S.doc?.kind === 'notebook' && S.doc.version && !S.doc.plain) p.set('notebook', S.doc.name);
   else if (kept(S.doc)) p.set('file', S.doc.path);
   history.replaceState(null, '', p.size ? '#' + p : location.pathname);
 }
@@ -538,7 +547,7 @@ async function runs() {
     h('div', { class: 'line1' }, h('span', { class: 'ic', html: svg('clock', 14) }), h('span', { class: 'nm' }, t.name), h('span', { class: 'meta' }, t.schedule),
       h('button', { class: 'icon sm', title: `Stop ${t.name}: DROP TASK`, 'aria-label': `Drop the task ${t.name}`, onclick: async () => { if (!confirmed(`Drop the task ${t.name}? It stops running.`)) return; try { await run(`DROP TASK ${ident(t.name)}`); detail(); } catch (e) { toast(e.message, true); } } }, icon('trash'))),
     h('div', { class: 'sub' }, `${t.statement.slice(0, 120)} · next ${utc(t.next_tick).toLocaleString()}`));
-  const page = x => h('div', { class: 'run-item', role: 'button', tabindex: '0', title: x.src, onclick: () => { const d = newFile(x.kind === 'python' ? 'python' : 'sql'); d.ed.value = x.src; d.changed(); } },
+  const page = x => h('div', { class: 'run-item', role: 'button', tabindex: '0', title: x.src, onclick: () => { const d = newFile(x.kind === 'python' ? 'python' : 'sql'); d.ed.value = x.src; } },
     h('div', { class: 'line1' }, h('span', { class: 'ic k-' + x.kind, html: svg(x.kind === 'python' ? 'filepy' : 'filesql', 14) }), h('span', { class: 'nm' }, x.src.split('\n').find(l => l.trim()) || ''), h('span', { class: 'meta ' + (x.ok ? '' : 'bad') }, x.ok ? secs(x.ms) : 'failed')),
     h('div', { class: 'sub' }, `${x.where} · ${new Date(x.at).toLocaleTimeString()}`));
   return [head('clock', 'Runs', 'jobs and schedules on the node, and what this page ran'),
@@ -621,7 +630,7 @@ function palette() {
   const all = () => [
     ...R.commands.size ? [...R.commands.values()].map(c => ({ kind: 'command', icon: c.icon || 'keyboard', label: c.title, note: c.keys || 'command', run: c.run })) : [],
     ...(S.objects || []).map(t => ({ kind: 'table', icon: (KIND[t.o.kind] || KIND.table)[0], label: t.q, note: (KIND[t.o.kind] || KIND.table)[1], run: () => { pick({ type: 'object', t }); } })),
-    ...(S.files || []).filter(f => !/^files\/notebooks\/[^/]+\/[^/]+\.ipynb$/.test(f.path)).map(f => ({ kind: 'file', icon: iconOf(f.path), label: f.path.replace(/^files\//, ''), note: bytes(f.size), run: () => openFile(f.path) })),
+    ...(S.files || []).filter(f => !/^files\/notebooks\/[^/]+\/[^/]+\.ipynb$/.test(f.path) && !f.path.endsWith('/' + FOLDER)).map(f => ({ kind: 'file', icon: iconOf(f.path), label: f.path.replace(/^files\//, ''), note: bytes(f.size), run: () => openFile(f.path) })),
     ...[...new Set((S.files || []).map(f => f.path.match(/^files\/notebooks\/([^/]+)\//)?.[1]).filter(Boolean))].map(n => ({ kind: 'notebook', icon: 'notebook', label: `notebooks/${n}.ipynb`, note: 'notebook', run: () => openFile('notebooks/' + n) })),
   ];
   const score = (text, q) => { if (!q) return 1; let i = 0; const t = text.toLowerCase(); for (const ch of q) { i = t.indexOf(ch, i); if (i < 0) return 0; i++; } return t.includes(q) ? 2 + (t.startsWith(q) ? 1 : 0) : 1; };
@@ -703,11 +712,12 @@ document.addEventListener('keydown', e => {
   if (t.closest?.('textarea,input,select,dialog,[contenteditable]')) return; // (typing)
   if (t.closest?.('[role=tree]')) { treeKeys(e); return; }
   if (t.closest?.('[role=tablist]')) { tabKeys(e); return; }
-  if (t.closest?.('button,a,summary,.grid')) return; // (a control's own keys)
+  if (t.closest?.('button,a,summary,.grid')) return; // (the keys of a control)
   if (e.key === '?') { e.preventDefault(); $('#helpDlg').showModal(); return; }
   if (S.doc?.onkey && (t === document.body || t.closest?.('#docs'))) S.doc.onkey(e);
 });
 function treeKeys(e) {
+  if (e.target.closest('button')) return; // (the ⋯ of a row has its own keys)
   const tree = e.target.closest('[role=tree]'), rows = [...tree.querySelectorAll('[role=treeitem]')].filter(r => r.offsetParent), i = rows.indexOf(e.target.closest('[role=treeitem]'));
   const go = j => { const r = rows[Math.max(0, Math.min(rows.length - 1, j))]; if (!r) return; rows.forEach(x => x.tabIndex = -1); r.tabIndex = 0; r.focus(); };
   const row = rows[i], open = row?.getAttribute('aria-expanded');
@@ -740,21 +750,18 @@ function core() {
     { icon: 'plus', title: 'New database', domId: 'newdb', hidden: () => MODE !== 'lakes', run: newDatabase },
     { icon: 'refresh', title: 'Refresh', domId: 'refresh', run: () => refresh() }] });
   register.view({ id: 'workspace', side: 'left', order: 20, title: 'Workspace', render: box => workspace(box), tools: [
-    { icon: 'plus', title: 'New: a notebook, a SQL or a Python file', domId: 'newfile', run: e => newMenu(e.currentTarget) }] });
+    { icon: 'plus', title: 'New: a notebook, a file or a folder', domId: 'newfile', menu: false, run: e => newMenu(e.currentTarget) }] });
   register.view({ id: 'details', side: 'right', order: 10, title: 'Details', tree: false, render: (box, p) => p?.type === 'object' ? objectDetail(p.t) : p?.type === 'file' ? fileDetail(p.f) : p?.type === 'result' ? resultDetail(p) : summary() });
   register.view({ id: 'variables', side: 'right', order: 20, title: 'Variables', tree: false, render: () => variables() });
   register.view({ id: 'runs', side: 'right', order: 30, title: 'Runs', tree: false, render: () => runs() });
   registerFiles(register);
-  register.action({ id: 'newnb', order: 100, menu: true, icon: 'notebook', title: 'New notebook', run: () => newNotebook() });
-  register.action({ id: 'newsql', order: 101, menu: true, icon: 'filesql', title: 'New SQL file', run: () => newFile('sql') });
-  register.action({ id: 'newpy', order: 102, menu: true, icon: 'filepy', title: 'New Python file', run: () => newFile('python') });
-  register.action({ id: 'upload', order: 120, menu: true, icon: 'up', title: 'Open an .ipynb or put a file in the lake…', run: () => upload() });
+  NEW.forEach(([id, ic, title, run], i) => { register.action({ id, order: 100 + i, menu: true, icon: ic, title, run }); register.command({ id, title, run }); });
   register.action({ id: 'restart', order: 140, menu: true, sep: true, icon: 'restart', title: 'Restart Python', keys: '0 0', run: restart });
   register.action({ id: 'token', order: 150, menu: true, icon: 'key', title: 'Token…', run: () => askToken('The token this node was started with') });
   register.action({ id: 'keys', order: 160, menu: true, icon: 'keyboard', title: 'Keys', keys: '?', run: () => $('#helpDlg').showModal() });
   for (const [id, title, keys, fn] of [['search', 'Search tables, files and commands', 'Ctrl K', palette], ['left', 'Show or hide the left pane', 'Ctrl B', () => pane('left')], ['bottom', 'Show or hide the bottom panel', 'Ctrl J', () => pane('bottom')],
-    ['right', 'Show or hide the right pane', 'Ctrl Alt B', () => pane('right')], ['settings', 'Settings', '', settings], ['newnb', 'New notebook', '', () => newNotebook()], ['newsql', 'New SQL file', '', () => newFile('sql')],
-    ['newpy', 'New Python file', '', () => newFile('python')], ['restart', 'Restart Python', '', restart], ['refresh', 'Refresh the catalog', '', refresh], ['keys', 'Keys', '?', () => $('#helpDlg').showModal()]]) register.command({ id, title, keys, run: fn });
+    ['right', 'Show or hide the right pane', 'Ctrl Alt B', () => pane('right')], ['settings', 'Settings', '', settings],
+    ['restart', 'Restart Python', '', restart], ['refresh', 'Refresh the catalog', '', refresh], ['keys', 'Keys', '?', () => $('#helpDlg').showModal()]]) register.command({ id, title, keys, run: fn });
   const cellKey = (keys, title, fn) => register.key({ keys, title, run: fn, group: 'On a cell (after Esc)' });
   for (const [keys, title] of [['Ctrl K', 'Search tables, files and commands'], ['Ctrl S', 'Save the file or notebook in front'], ['Ctrl B', 'The left pane'], ['Ctrl J', 'The bottom panel'], ['Ctrl Alt B', 'The right pane'], ['?', 'These keys']]) register.key({ keys, title, group: 'Anywhere' });
   for (const [keys, title] of [['Ctrl Enter', 'Run it (a file: what is selected, or all of it)'], ['Shift Enter', 'Run it and go to the next cell'], ['Alt Enter', 'Run it and add a cell below'], ['Ctrl Shift Enter', 'Run every cell'], ['Tab', 'Complete a name (or indent)'], ['Ctrl Space', 'Complete a name'], ['Ctrl /', 'Comment the lines out, or in'], ['Esc', 'Leave the cell: the keys below then work']]) register.key({ keys, title, group: 'In a cell or a file' });
@@ -783,10 +790,10 @@ const pondra = {
 window.pondra = pondra;
 export { pondra };
 
-addEventListener('beforeunload', e => { if (S.docs.some(d => d.dirty && (d.kind !== 'notebook' || d.cells.some(c => c.src.trim())))) { e.preventDefault(); e.returnValue = ''; } });
+addEventListener('beforeunload', e => { if (S.docs.some(d => d.dirty && !d.blank)) { e.preventDefault(); e.returnValue = ''; } });
 addEventListener('pagehide', () => {
   const token = T.token();
-  T.fetch(base() + '/sessions/' + SESSION, { method: 'DELETE', keepalive: true, headers: { ...T.headers(), ...(token ? { authorization: 'Bearer ' + token } : {}) } }).catch(() => {}); // (this page's temporary tables, and its Python)
+  T.fetch(base() + '/sessions/' + SESSION, { method: 'DELETE', keepalive: true, headers: { ...T.headers(), ...(token ? { authorization: 'Bearer ' + token } : {}) } }).catch(() => {}); // (the temporary tables of this page, and its Python)
 });
 let wasNarrow = narrow();
 addEventListener('resize', () => { // (into a narrow window the side panes become drawers, closed; back out, they are as they were)
@@ -814,7 +821,7 @@ async function start() {
   drawSignin(); drawActions(); drawRail(); drawKeys(); drawPanes(); status();
   // (extensions, loaded after these modules, register meanwhile: drawn with the core's from here on)
   const data = R.views.find(v => v.id === 'data');
-  if (MODE === 'lakes') { data.drawn = true; await renderView(data); await stats(); drawLeft(); } // (the tree picks the database /stats is asked of)
+  if (MODE === 'lakes') { data.drawn = true; await renderView(data); await stats(); drawLeft(); } // (the tree picks the database that stats asks of)
   else { await stats(); drawLeft(); }
   drawRight();
   started = true;

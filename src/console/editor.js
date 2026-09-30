@@ -1,9 +1,8 @@
 // The code editor (ADR-034): a textarea over its highlighted copy, for notebook cells and files.
 // It re-renders only the lines a key changed, so typing stays fast in long files; no library.
-import { h, esc, S, ident, sqlType } from './core.js';
+import { h, esc, S, ident, sqlType, SQL_KW } from './core.js';
 
 // ------------------------------------------------------------------ highlighting
-export const SQL_KW = new Set(('SELECT FROM WHERE GROUP BY ORDER HAVING LIMIT OFFSET JOIN LEFT RIGHT FULL INNER OUTER CROSS NATURAL ON USING AS AND OR NOT NULL IS IN EXISTS BETWEEN LIKE ILIKE SIMILAR CASE WHEN THEN ELSE END DISTINCT ALL UNION INTERSECT EXCEPT WITH RECURSIVE INSERT INTO VALUES UPDATE SET DELETE CREATE TABLE VIEW MATERIALIZED REPLACE DROP ALTER ADD COLUMN RENAME TO IF PRIMARY KEY DEFAULT TRUE FALSE ASC DESC NULLS FIRST LAST OVER PARTITION ROWS RANGE UNBOUNDED PRECEDING FOLLOWING CURRENT ROW FILTER WITHIN CAST TRY_CAST INTERVAL DATE TIMESTAMP TIMESTAMPTZ TIME BIGINT INT INTEGER SMALLINT TINYINT DOUBLE PRECISION FLOAT REAL DECIMAL NUMERIC VARCHAR TEXT CHAR BOOLEAN BYTEA BINARY JSON EXPLAIN ANALYZE SHOW DESCRIBE CALL DO LANGUAGE FUNCTION PROCEDURE RETURNS RETURN BEGIN COMMIT ROLLBACK MERGE MATCHED SCHEMA DATABASE ATTACH DETACH COPY TEMP TEMPORARY SECRET TASK QUALIFY LATERAL UNNEST ANY SOME ARRAY STRUCT MAP AT OF FOR TRUNCATE GRANT REVOKE WINDOW FETCH NEXT ONLY UNIQUE REFERENCES CHECK CONSTRAINT INDEX OPTIMIZE VACUUM INSTALL LOAD EXTERNAL STORED LOCATION').split(' '));
 const PY_KW = new Set('False None True and as assert async await break class continue def del elif else except finally for from global if import in is lambda nonlocal not or pass raise return try while with yield match case'.split(' '));
 const SQL_TOKEN = /--.*|\/\*|'|"|\b\d+(?:\.\d+)?(?:[eE][+-]?\d+)?\b|[A-Za-z_][\w$]*/g;
 const PY_TOKEN = /#.*|[rRbBfFuU]{0,2}(?:"""|'''|"|')|\b\d[\d_]*(?:\.\d+)?(?:[eE][+-]?\d+)?\b|[A-Za-z_]\w*/g;
@@ -136,7 +135,7 @@ export class Editor {
   constructor(o = {}) {
     const { value = '', label = 'Code', ...rest } = o;
     Object.assign(this, { language: 'sql', gutter: false, grow: false, placeholder: '', oninput: null, onkey: null, oncursor: null }, rest);
-    this.src = []; this.html = []; this.states = ['']; this.width = 0; // (each line's text and HTML, the state each starts in and the last leaves)
+    this.src = []; this.html = []; this.states = ['']; this.width = 0; // (each line: its text, its HTML, the state it starts in; and the state the last leaves)
     this.pre = h('pre', { class: 'hl', 'aria-hidden': 'true' });
     this.ta = h('textarea', { spellcheck: 'false', autocapitalize: 'off', autocomplete: 'off', 'aria-label': label, wrap: 'off', placeholder: this.placeholder });
     this.cur = h('div', { class: 'curline', 'aria-hidden': 'true' });
@@ -165,7 +164,7 @@ export class Editor {
     const shift = n - on, html = [], states = [];
     let i = a, st = this.states[a] ?? '';
     for (; i < n; i++) {
-      if (i >= n - b && st === this.states[i - shift]) break; // (the rest is as it was, `shift` lines on)
+      if (i >= n - b && st === this.states[i - shift]) break; // (the rest is as it was, shift lines on)
       const [line, next] = f(lines[i], st);
       html.push(line); states.push(st); st = next;
     }

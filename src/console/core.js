@@ -18,7 +18,7 @@ export function h(tag, attrs = {}, ...kids) {
 }
 /** `el`'s children replaced by `kids`, leaving out the null and false ones (as `h` does). */
 export const fill = (el, ...kids) => { el.replaceChildren(...kids.flat().filter(k => k != null && k !== false)); return el; };
-export const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+export const esc = s => String(s).replace(/[&<>"']/g, c => `&#${c.charCodeAt(0)};`);
 export const store = {
   get(k) { try { return localStorage.getItem(k); } catch { return null; } },
   set(k, v) { try { v == null ? localStorage.removeItem(k) : localStorage.setItem(k, v); } catch { /* (private windows) */ } },
@@ -72,7 +72,6 @@ export const ICONS = {
   restart: '<path d="M4 12a8 8 0 1 0 2.4-5.7L4 8.5"/><path d="M4 4v4.5h4.5"/>',
   search: '<circle cx="11" cy="11" r="6.5"/><path d="m20 20-4.2-4.2"/>',
   settings: '<path d="M4 7h9M17 7h3M4 12h3M11 12h9M4 17h11M19 17h1"/><circle cx="15" cy="7" r="2"/><circle cx="9" cy="12" r="2"/><circle cx="17" cy="17" r="2"/>',
-  help: '<circle cx="12" cy="12" r="8.5"/><path d="M9.6 9.3a2.5 2.5 0 1 1 3.6 2.3c-.7.3-1.2.9-1.2 1.6v.6M12 16.8v.2"/>',
   user: '<circle cx="12" cy="8.5" r="3.5"/><path d="M5 19.5c1.2-3.3 3.9-5 7-5s5.8 1.7 7 5"/>',
   save: '<path d="M5.5 4.5h10l3 3v10a2 2 0 0 1-2 2h-11a2 2 0 0 1-2-2v-11a2 2 0 0 1 2-2z"/><path d="M8.5 4.5v4h6v-4M8 19.5v-5h8v5"/>',
   filter: '<path d="M4 5.5h16l-6 7.5v5l-4 1.5v-6.5z"/>',
@@ -140,14 +139,15 @@ const hooks = new Map();
  * and 'close' (a document's tab), 'active' (the document in front). */
 export function on(event, fn) { (hooks.get(event) || hooks.set(event, []).get(event)).push(fn); }
 export function emit(event, ...args) { for (const fn of hooks.get(event) || []) { try { fn(...args); } catch (e) { console.error(`pondra: ${event}:`, e); } } }
-export const R = { views: [], docs: [], kinds: new Map(), renderers: [], actions: [], nav: [], commands: new Map(), keys: [], helpers: {} }; // (helpers: the shell's, for the other modules)
+export const R = { views: [], docs: [], kinds: new Map(), renderers: [], actions: [], nav: [], commands: new Map(), keys: [], helpers: {} }; // (helpers: what the shell offers the other modules)
 export const byOrder = (a, b) => (a.order ?? 50) - (b.order ?? 50);
 const put = (list, o) => list.filter(x => x.id !== o.id).concat(o).sort(byOrder);
 /** Draw the regions again once (the shell sets how: registrations may come after it starts). */
 export const shell = { redraw() {} };
 export const register = {
   /** A view: `{ id, title, side: 'left' | 'right', render(box, picked) → elements?, tools?: [{ icon, title, run }], order }`.
-   * On the left it is a group that folds; on the right a tab. Either can be moved to the other side. */
+   * On the left it is a group that folds; on the right a tab. Either can be moved to the other side.
+   * A tool is a button and an item of the view's ⋯, unless it is `menu: false` (one that opens a menu at its button). */
   view(o) { R.views = put(R.views, { side: 'left', ...o }); shell.redraw(); },
   /** A group of the left side (a view on the left): `{ id, title, render(box), tools, order }`. */
   section(o) { register.view({ ...o, side: 'left' }); },
@@ -174,8 +174,8 @@ export const T = { fetch: (url, init) => fetch(url, init), token: () => store.ge
 export function configure(o) { Object.assign(T, o); }
 
 // ------------------------------------------------------------------ the page's state
-export const MODE = document.documentElement.dataset.mode; // lake: one lake (`serve --lake`); lakes: a folder of lakes, its databases
-export const SESSION = [...crypto.getRandomValues(new Uint8Array(12))].map(b => b.toString(16).padStart(2, '0')).join(''); // (this page's temporary tables and Python)
+export const MODE = document.documentElement.dataset.mode; // lake: one lake (serve --lake); lakes: a folder of lakes, its databases
+export const SESSION = [...crypto.getRandomValues(new Uint8Array(12))].map(b => b.toString(16).padStart(2, '0')).join(''); // (the temporary tables and the Python of this page)
 /** What the page holds: the database, the documents open (`doc` the one in front), the pick the
  * details show, the catalog, this page's Python and runs. */
 export const S = { db: null, lake: null, docs: [], doc: null, sel: null, runs: 0, open: new Set(), pick: null, objects: null, info: null, filesAt: '', tab: 'details', py: 'none', vars: [], place: null, files: null, ran: [],
@@ -187,7 +187,9 @@ export const base = () => MODE === 'lakes' && S.db ? '/db/' + encodeURIComponent
 
 // ------------------------------------------------------------------ talking to the node
 export class Failure extends Error { constructor(message, status) { super(message); this.status = status; } }
-export const ask = { token() {} }; // (the shell's sign-in dialog)
+/** What a run that failed answers (a wait the page stopped says so). */
+export const failed = (e, stopped = 'Stopped waiting. (A statement already on its way may still finish on the node.)') => ({ kind: 'error', message: e.name === 'AbortError' ? stopped : e.message, notices: [] });
+export const ask = { token() {} }; // (the sign-in dialog of the shell)
 
 export async function call(path, { method = 'GET', body, headers = {}, signal, root = false } = {}) {
   const hd = { 'x-pondra-session': SESSION, ...T.headers(), ...headers };
@@ -208,7 +210,7 @@ export async function call(path, { method = 'GET', body, headers = {}, signal, r
 
 /** A statement's answer: rows (the columns with their types) or what it did, and what it printed. */
 export async function run(sql, signal, params) {
-  const r = params && Object.keys(params).length // (values for its `$name`s: bound on the node, never pasted in)
+  const r = params && Object.keys(params).length // (values for its $names: bound on the node, never pasted in)
     ? await call('/sql?format=typed', { method: 'POST', body: JSON.stringify({ sql, params }), headers: { 'content-type': 'application/json' }, signal })
     : await call('/sql?format=typed', { method: 'POST', body: sql, headers: { 'content-type': 'text/plain; charset=utf-8' }, signal });
   let notices = [];
@@ -230,8 +232,27 @@ export function doBlock(code) {
 }
 /** A path under the lake's files, for `/files/…`. */
 export const fileUrl = path => '/files/' + path.replace(/^files\//, '').split('/').map(encodeURIComponent).join('/');
+/** A file in the lake as text, with the version to replace it by (`If-Match`). */
+export async function readFile(rel) {
+  const r = await call(fileUrl(rel));
+  return { text: await r.text(), version: (r.headers.get('etag') || '').replace(/"/g, '') || null };
+}
+/** Write a file back: in place if `version` is the one read (else 412: someone saved it
+ * meanwhile), or a new file if it has none. The new version, or null if not saved. */
+export async function writeFile(rel, body, version, type = 'text/plain; charset=utf-8') {
+  try {
+    const r = await call(fileUrl(rel), { method: 'PUT', body, headers: { 'content-type': type, ...(version ? { 'if-match': `"${version}"` } : {}) } });
+    return (await r.json()).version || 'saved';
+  } catch (e) {
+    if (e.status === 412) toast(`Not saved: ${rel.split('/').pop()} was saved by someone else since you opened it. Save it under another name (⋯), or open it again.`, true);
+    else if (e.status === 409) toast(`Not saved: files/${rel} is there already. Open it, or pick another name.`, true);
+    else toast('Not saved: ' + e.message, true);
+    return null;
+  }
+}
 
 const RESERVED = new Set('ALL AND ANY ARRAY AS ASC BETWEEN BY CASE CAST CHECK COLUMN CREATE CROSS DEFAULT DELETE DESC DISTINCT DO ELSE END EXCEPT FALSE FETCH FOR FROM FULL GRANT GROUP HAVING IN INNER INSERT INTERSECT INTO IS JOIN LEFT LIKE LIMIT NATURAL NOT NULL OFFSET ON OR ORDER OUTER RIGHT SELECT SET TABLE THEN TO TRUE UNION UNIQUE UPDATE USER USING VALUES VIEW WHEN WHERE WINDOW WITH'.split(' '));
+export const SQL_KW = new Set([...RESERVED, ...'EXISTS ILIKE SIMILAR RECURSIVE MATERIALIZED REPLACE DROP ALTER ADD RENAME IF PRIMARY KEY NULLS FIRST LAST OVER PARTITION ROWS RANGE UNBOUNDED PRECEDING FOLLOWING CURRENT ROW FILTER WITHIN TRY_CAST INTERVAL DATE TIMESTAMP TIMESTAMPTZ TIME BIGINT INT INTEGER SMALLINT TINYINT DOUBLE PRECISION FLOAT REAL DECIMAL NUMERIC VARCHAR TEXT CHAR BOOLEAN BYTEA BINARY JSON EXPLAIN ANALYZE SHOW DESCRIBE CALL LANGUAGE FUNCTION PROCEDURE RETURNS RETURN BEGIN COMMIT ROLLBACK MERGE MATCHED SCHEMA DATABASE ATTACH DETACH COPY TEMP TEMPORARY SECRET TASK QUALIFY LATERAL UNNEST SOME STRUCT MAP AT OF TRUNCATE REVOKE NEXT ONLY REFERENCES CONSTRAINT INDEX OPTIMIZE VACUUM INSTALL LOAD EXTERNAL STORED LOCATION'.split(' ')]);
 export const ident = s => /^[a-z_][a-z0-9_]*$/.test(s) && !RESERVED.has(s.toUpperCase()) ? s : '"' + s.replace(/"/g, '""') + '"';
 export const quote = s => "'" + String(s).replace(/'/g, "''") + "'";
 /** The database the page's statements run in (a server's database is the lake of that name). */
@@ -284,6 +305,11 @@ export function menu(at, items) {
   m.querySelector('button:not(:disabled)')?.focus();
 }
 addEventListener('mousedown', e => { if (!e.target.closest('#menu')) $('#menu').hidden = true; });
+// A dialog closes when you press outside it, as Esc closes it (a press on the backdrop is the dialog's).
+addEventListener('mousedown', e => {
+  const d = e.target, r = d instanceof HTMLDialogElement && d.open && d.getBoundingClientRect();
+  if (r && (e.clientX < r.left || e.clientX >= r.right || e.clientY < r.top || e.clientY >= r.bottom)) d.close();
+});
 /** A small dialog asking for one line of text; `null` if cancelled. */
 export function prompt(title, label, value = '', hint = '') {
   const d = $('#askDlg');

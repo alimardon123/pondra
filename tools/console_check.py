@@ -3,7 +3,7 @@
 
   console_check.py [--port 8890] [--show DIR] [--only node,files,grid,layout,budget,tokens,server,extensions]
 
-- node: the Data tree lists the lake's schemas, tables and views (each kind its icon) and columns
+- node: a new notebook shows it is not saved (its tab, the Workspace); the Data tree lists the lake's schemas, tables and views (each kind its icon) and columns
   (each type its coloured mark, a key's marked), with no bare numbers; a table picked shows its
   details and its profile, a view its definition; double-clicking a table shows its first rows; the
   Workspace lists the lake's files by folder; a SQL cell's answer (its types as marks, a header's
@@ -14,10 +14,16 @@
   saved (twice: two versions, the first opened again), downloaded and uploaded, Jupyter's
   nbformat validating each.
 - files: a SQL file runs (Results, Messages, Plan) and is saved in place; a new one asks for its
-  path; a Python file runs in its console, and a line typed there too; a CSV file is edited in a
-  grid (a cell, a row) and saved in place, its untouched lines as they were, and the node reads the
-  new rows; saving over someone else's change is refused; a JSONL file is edited; a Parquet file
-  opens read-only; two clicks open one tab.
+  path, and shows it is not saved (its tab, the Workspace) until it is; a Python file runs in its
+  console, and a line typed there too; a CSV file is edited in a grid (a cell, a row) and saved in
+  place, its untouched lines as they were, and the node reads the new rows; saving over someone
+  else's change is refused; a JSONL file is edited; a Parquet file opens read-only; two clicks open
+  one tab. Folders (a zero-byte `.folder` marker nobody sees): made from the Workspace's +, the
+  tab bar's + and a folder's menu (a name that exists or is not one is refused), deleted with
+  their files; a ⋯ on every row of the Workspace (on hover, on focus, on the one picked) opens its
+  menu; a notebook made in a folder is one plain file saved in place (refused over someone else's
+  change), opens again after a reload, offers no jobs; a file renamed moves its tab; the +, the
+  ⋯ and the welcome page say "Upload a file…".
 - grid: a click lights a cell and its row, Shift+click a range (one outline), the keys move it,
   Ctrl+C copies it (Shift: with the headers), the menu filters to its values, a header's sort
   button sorts, a header's card tells its type.
@@ -175,6 +181,7 @@ def node_checks(browser, port, show):
     p = pg.p
     tree = p.locator("#data")
     tree.locator(".row", has_text="people").wait_for(timeout=20000)
+    fresh = until(lambda: (pg.tab(), pg.workspace("notebooks", "untitled.ipynb").locator(".dirty").count()), (("untitled.ipynb", True), 1))
     tree.locator(".row", has_text="sales").locator(".tw").click()
     tree.locator(".row", has_text="orders").wait_for(timeout=10000)
     people = tree.locator(".row[data-kind]", has_text="people")
@@ -182,6 +189,7 @@ def node_checks(browser, port, show):
     names = tree.locator(".row.col:visible .nm").all_inner_texts()
     types = tree.locator(".row.col:visible .ty").all_inner_texts()
     kinds = {r.locator(".nm").inner_text(): r.get_attribute("data-kind") for r in tree.locator(".row[data-kind]").all() if r.get_attribute("data-kind") not in ("database", "schema")}
+    checks["a new notebook shows it is not saved: its tab and its row in the Workspace's notebooks folder have the dot"] = fresh == (("untitled.ipynb", True), 1)
     checks["the Data tree lists schemas, tables and views (each kind its icon), columns with SQL types and coloured type marks, a key marked, no bare numbers"] = \
         kinds == {"people": "table", "grown": "view", "orders": "table"} and names == ["id", "name", "born", "at", "amt"] and types[4] == "DECIMAL(10,2)" and types[3] == "TIMESTAMP" \
         and tree.locator(".row.col:visible .ty-i").count() == 5 and tree.locator(".row.col:visible .kk").count() == 1 \
@@ -323,13 +331,14 @@ def node_checks(browser, port, show):
     p.keyboard.press("Control+s")
     listed = lambda: [r["path"] for r in sql(port, "SELECT path FROM files('notebooks/report/') ORDER BY path")]
     one = until(lambda: len(listed()), 1)
+    row_clean = until(lambda: pg.workspace("notebooks", "report.ipynb").locator(".dirty").count(), 0)
     saved = call(port, "GET", "/" + listed()[0]) if one == 1 else None  # (JSON: read as such)
     nb = nbformat.reads(json.dumps(saved), as_version=4) if saved else None
     valid = _try(lambda: nbformat.validate(nb) is None)
     page_cells = p.evaluate("pondra.state.cells.map(c => [c.kind, c.src])")
     as_saved = [["markdown" if c.cell_type == "markdown" else "sql" if c.source.startswith("%%sql") else "python", c.source.removeprefix("%%sql\n")] for c in nb.cells] if nb else []
     checks["a notebook saved in the lake is valid for Jupyter (nbformat), SQL cells as %%sql; its tab has no changes then"] = one == 1 and valid is True and as_saved == page_cells \
-        and any(c.source.startswith("%%sql\n") for c in nb.cells) and until(lambda: pg.tab(), ("report.ipynb", False)) == ("report.ipynb", False) \
+        and any(c.source.startswith("%%sql\n") for c in nb.cells) and until(lambda: pg.tab(), ("report.ipynb", False)) == ("report.ipynb", False) and row_clean == 0 \
         and "#notebook=report" in p.url and pg.workspace("notebooks", "report.ipynb").is_visible()
     pg.cell(0).locator("textarea").fill("SELECT 'changed' AS v")
     p.keyboard.press("Control+s")
@@ -352,7 +361,7 @@ def node_checks(browser, port, show):
     path = os.path.join(tempfile.mkdtemp(prefix="pondra-console-"), "from-jupyter.ipynb")
     nbformat.write(up, path)
     with p.expect_file_chooser() as chooser:
-        pg.menu("Open an .ipynb")
+        pg.menu("Upload a file")
     chooser.value.set_files(path)
     until(lambda: p.evaluate("pondra.state.cells.map(c => c.kind)"), ["markdown", "sql", "python"])
     kinds = p.evaluate("pondra.state.cells.map(c => c.kind)")
@@ -453,12 +462,15 @@ def files_checks(browser, port, show):
     p.click("#newfile")
     p.locator("#menu button", has_text="New SQL file").click()
     p.keyboard.insert_text("SELECT 1 AS one")
+    unsaved = until(lambda: (pg.tab(), pg.workspace("queries", "untitled.sql").locator(".dirty").count()), (("untitled.sql", True), 1))  # (in the folder it will be saved to)
     p.keyboard.press("Control+s")
     p.locator("#askDlg[open]").wait_for(timeout=5000)
     p.fill("#askIn", "scripts/one.sql")
     p.press("#askIn", "Enter")
     made = until(lambda: get(port, "scripts/one.sql"), b"SELECT 1 AS one")
     checks["a new SQL file asks for its path when first saved"] = made == b"SELECT 1 AS one" and until(lambda: pg.tab(), ("one.sql", False)) == ("one.sql", False)
+    checks["a new SQL file shows it is not saved (its tab, its row in the folder it will be saved to) until Ctrl+S saves it"] = unsaved == (("untitled.sql", True), 1) \
+        and until(lambda: (pg.workspace("scripts", "one.sql").locator(".dirty").count(), p.locator("#workspace .row", has_text="untitled.sql").count()), (0, 0)) == (0, 0)
 
     put(port, "scripts/by_region.sql", b"SELECT count(*) AS n, $region AS region FROM fx WHERE region = $region")
     pg.workspace("scripts", "by_region.sql").click()
@@ -556,7 +568,235 @@ def files_checks(browser, port, show):
         p.wait_for_timeout(500)
         pg.shot(show, "console-data-file.png")
     checks["files: every request went to the node; no page errors"] = pg.left() == [] and pg.errors == []
-    info = {"task": task, "bound": bound, "results": results, "said": said, "each": each, "not run": left, "second": second, "dirty": dirty, "saved": saved, "clean": clean, "shown": shown, "errors": pg.errors, "left": pg.left(), "toast": pg.toast()}
+    more, folders = folders_checks(browser, port, show)
+    checks.update(more)
+    info = {"task": task, "bound": bound, "results": results, "said": said, "each": each, "not run": left, "second": second, "dirty": dirty, "saved": saved, "clean": clean, "shown": shown, "errors": pg.errors, "left": pg.left(), "toast": pg.toast(), "folders": folders}
+    pg.ctx.close()
+    return checks, info
+
+
+def folders_checks(browser, port, show):
+    """The Workspace's folders (a zero-byte `.folder` marker nobody sees), the ⋯ on each of its rows,
+    notebooks in any folder (one plain file saved in place), Delete folder, Upload a file."""
+    checks = {}
+    base = f"http://127.0.0.1:{port}"
+    put(port, "notebooks/seed/20240101T000000Z.ipynb", nbformat.writes(nbformat.v4.new_notebook()).encode())  # (so there is a notebooks folder)
+    pg = Page(browser, base + "/")
+    p = pg.p
+    ws = p.locator("#workspace")
+    asked = []  # (what the page asked to confirm)
+    p.on("dialog", lambda d: asked.append(d.message))
+    in_lake = lambda folder: [(r["path"], r["size"]) for r in sql(port, f"SELECT path, size FROM files('{folder}/') ORDER BY path")]
+    folder = lambda name: ws.locator(".row[aria-expanded]", has_text=name).first
+    kids = lambda name: folder(name).locator("xpath=../div[contains(@class,'kids')]")
+    items = lambda: p.locator("#menu:not([hidden]) button .lb").all_inner_texts()
+    palette = lambda q: (p.keyboard.press("Control+k"), p.fill("#palIn", q), p.locator("#palList .pi .nm").all_inner_texts(), p.keyboard.press("Escape"))[2]
+    ws.locator(".row").first.wait_for(timeout=20000)
+
+    def make(name, via):
+        """Make a folder called `name`: `via` opens a menu that has New folder."""
+        via()
+        p.locator("#menu button", has_text="New folder").click()
+        p.locator("#askDlg[open]").wait_for(timeout=5000)
+        p.fill("#askIn", name)
+        p.press("#askIn", "Enter")
+
+    def more_of(row):
+        """Open a row's ⋯ menu (on hover), and what it lists."""
+        row.hover()
+        row.locator("button.more").click()
+        return items()
+
+    make("projects", lambda: p.click("#newfile"))
+    marker = until(lambda: in_lake("projects"), [("files/projects/.folder", 0)])
+    shown = until(lambda: folder("projects").count(), 1)
+    p.reload()
+    again = until(lambda: folder("projects").count(), 1)
+    folder("projects").click()
+    empty = kids("projects").locator(".row").count() == 0 and ".folder" not in ws.text_content()
+    checks["New folder in the Workspace's + makes a folder (a zero-byte .folder marker in the lake) that shows, empty and without the marker, and is there after a reload"] = \
+        marker == [("files/projects/.folder", 0)] and shown == 1 and again == 1 and empty
+    make("archive", lambda: p.click("#tabbar .newtab"))
+    viaTab = until(lambda: in_lake("archive"), [("files/archive/.folder", 0)])
+    make("2024", lambda: folder("projects").click(button="right"))
+    inside = until(lambda: in_lake("projects"), [("files/projects/.folder", 0), ("files/projects/2024/.folder", 0)])
+    make("projects", lambda: p.click("#newfile"))
+    twice = until(lambda: "there already" in pg.toast(), True)
+    make("a/../b", lambda: p.click("#newfile"))
+    dots = until(lambda: "Not a folder name" in pg.toast(), True)
+    checks["New folder from the tab bar's + and from a folder's menu (New folder here, inside it) makes one; a name that exists, or has a .. in it, is refused"] = \
+        viaTab == [("files/archive/.folder", 0)] and inside == [("files/projects/.folder", 0), ("files/projects/2024/.folder", 0)] and twice is True and dots is True \
+        and in_lake("a") == [] and in_lake("b") == [] and folder("2024").count() == 1
+
+    p.mouse.move(700, 600)
+    p.evaluate("document.activeElement?.blur()")
+    row, bar = folder("archive"), folder("archive").locator("button.more")
+    away = bar.is_visible()
+    row.hover()
+    hover = bar.is_visible()
+    named = bar.get_attribute("aria-label")
+    by_button = more_of(row)
+    p.keyboard.press("Escape")
+    row.click(button="right")
+    by_click = items()
+    p.keyboard.press("Escape")
+    want = ["New notebook here", "New SQL file here", "New Python file here", "New folder here", "Upload a file here…", "Delete folder…"]
+    checks["a folder's ⋯ (a button with a label) shows on hover, and its menu, the same as a right-click's, has New notebook, SQL file, Python file and folder here, Upload a file here, Delete folder"] = \
+        away is False and hover is True and named == "archive: more" and by_button == want and by_click == want
+    put(port, "misc/blob.bin", b"\x00\x01\x02")
+    put(port, "misc/old.txt", b"old")
+    p.click("#refresh")
+    file_row = pg.workspace("misc", "blob.bin")
+    file_row.click()  # (picked: its details show, its row stays marked)
+    until(lambda: "on" in (file_row.get_attribute("class") or "").split(), True)
+    p.evaluate("document.activeElement?.blur()")
+    p.mouse.move(700, 600)
+    picked = file_row.locator("button.more").is_visible()
+    other = pg.workspace("misc", "old.txt")
+    p.mouse.move(700, 600)
+    hidden = other.locator("button.more").is_visible()
+    other.focus()
+    focused = other.locator("button.more").is_visible()
+    file_menu = more_of(other)
+    p.keyboard.press("Escape")
+    other.click(button="right")
+    checks["a file's ⋯ shows on hover, on focus and on the row picked, and opens the menu a right-click does"] = picked is True and hidden is False and focused is True \
+        and file_menu == items() and "Rename…" in file_menu and "Delete…" in file_menu
+    p.keyboard.press("Escape")
+
+    folder("projects").click(button="right")
+    p.locator("#menu button", has_text="New notebook here").click()
+    mine = lambda name: kids("projects").locator(".row", has_text=name)
+    fresh = until(lambda: (pg.tab(), mine("untitled.ipynb").locator(".dirty").count()), (("untitled.ipynb", True), 1))
+    pg.cell(0).locator("textarea").fill("SELECT 7 AS seven")
+    p.fill("#nbname", "analysis")
+    p.press("#nbname", "Enter")
+    p.keyboard.press("Control+s")
+    want_files = sorted(["files/projects/.folder", "files/projects/2024/.folder", "files/projects/analysis.ipynb"])
+    in_place = until(lambda: sorted(x[0] for x in in_lake("projects")), want_files)
+    text = until(lambda: "seven" in get(port, "projects/analysis.ipynb").decode(), True) and get(port, "projects/analysis.ipynb").decode()
+    valid = _try(lambda: nbformat.validate(nbformat.reads(text, as_version=4)) is None)
+    clean = until(lambda: (pg.tab(), mine("analysis.ipynb").locator(".dirty").count()), (("analysis.ipynb", False), 0))
+    checks["a new notebook in a folder shows it is not saved (tab, row in that folder), then Ctrl+S saves it in place, as projects/analysis.ipynb, valid for Jupyter: no versions"] = \
+        fresh == (("untitled.ipynb", True), 1) and in_place == want_files and valid is True and clean == (("analysis.ipynb", False), 0) and in_lake("notebooks/analysis") == [] \
+        and "file=projects%2Fanalysis.ipynb" in p.url and p.locator("#docbar .crumb").first.inner_text() == "projects/"
+    p.locator("#docbar button[aria-label=More]").click()
+    nb_menu = items()
+    p.keyboard.press("Escape")
+    checks["a notebook saved in place offers no versions, jobs or schedule"] = "Download as .ipynb" in nb_menu and not {"Versions…", "Run as a job", "Schedule…"} & set(nb_menu)
+
+    both = palette("projects/")
+    every = palette("")
+    only = palette(".folder")
+    checks["the .folder marker is in no list: not the tree, not Ctrl+K (empty, or the folder's name, or .folder searched)"] = "projects/analysis.ipynb" in both \
+        and not [x for x in both + every + only if x.endswith(".folder")] and ".folder" not in ws.text_content()
+    p.reload()
+    tab = until(lambda: p.locator("#tabbar .tab", has_text="analysis.ipynb").count(), 1)
+    p.locator("#tabbar .tab", has_text="analysis.ipynb").click()
+    back = until(lambda: pg.cell(0).locator("textarea").input_value(), "SELECT 7 AS seven")
+    pg.cell(0).locator("textarea").fill("SELECT 8 AS eight")
+    until(lambda: pg.tab(), ("analysis.ipynb", True))
+    p.keyboard.press("Control+s")
+    eight = until(lambda: "eight" in get(port, "projects/analysis.ipynb").decode(), True)
+    checks["a notebook saved in a folder opens again after a reload, and Ctrl+S saves it over itself (still the one file)"] = tab == 1 and back == "SELECT 7 AS seven" and eight is True \
+        and until(lambda: pg.tab(), ("analysis.ipynb", False)) == ("analysis.ipynb", False) and sorted(x[0] for x in in_lake("projects")) == want_files
+    theirs = nbformat.writes(nbformat.v4.new_notebook(cells=[nbformat.v4.new_code_cell("%%sql\nSELECT 'theirs'")]))
+    put(port, "projects/analysis.ipynb", theirs.encode(), version(port, "projects/analysis.ipynb"))
+    pg.cell(0).locator("textarea").fill("SELECT 9 AS nine")
+    p.keyboard.press("Control+s")
+    refused = until(lambda: "saved by someone else" in pg.toast(), True)
+    checks["a notebook saved in place is refused over someone else's change (If-Match: 412), and theirs is kept"] = refused is True and "theirs" in get(port, "projects/analysis.ipynb").decode() \
+        and pg.tab() == ("analysis.ipynb", True)
+
+    folder("notebooks").click(button="right")
+    p.locator("#menu button", has_text="New notebook here").click()
+    pg.cell(0).locator("textarea").fill("SELECT 1 AS one")
+    p.fill("#nbname", "versioned")
+    p.press("#nbname", "Enter")
+    p.keyboard.press("Control+s")
+    mine_v = until(lambda: len(in_lake("notebooks/versioned")), 1)
+    checks["New notebook here in notebooks keeps its versions: notebooks/<name>/<time>.ipynb"] = mine_v == 1 and in_lake("notebooks/versioned")[0][0].startswith("files/notebooks/versioned/") \
+        and not [x for x in in_lake("projects") if "versioned" in x[0]]
+
+    tmp = tempfile.mkdtemp(prefix="pondra-console-")
+    csv, nb = os.path.join(tmp, "up.csv"), os.path.join(tmp, "up.ipynb")
+    open(csv, "w").write("a,b\n1,2\n")
+    nbformat.write(nbformat.v4.new_notebook(cells=[nbformat.v4.new_code_cell("%%sql\nSELECT 1 AS one")]), nb)
+    row = folder("projects")
+    row.hover()
+    row.locator("button.more").click()
+    with p.expect_file_chooser() as chooser:
+        p.locator("#menu button", has_text="Upload a file here").click()
+    chooser.value.set_files([csv, nb])
+    put_in = until(lambda: sorted(x[0] for x in in_lake("projects") if "/up." in x[0]), ["files/projects/up.csv", "files/projects/up.ipynb"])
+    pg.workspace("projects", "up.ipynb").click()
+    opened = until(lambda: pg.tab(), ("up.ipynb", False))
+    plain = p.locator("#docbar .crumb").first.inner_text() == "projects/" and p.input_value("#nbname") == "up"
+    shutil.rmtree(tmp, ignore_errors=True)
+    checks["Upload a file here puts a CSV and an .ipynb in that folder; the .ipynb, clicked, opens as a notebook saved in place"] = put_in == ["files/projects/up.csv", "files/projects/up.ipynb"] \
+        and opened == ("up.ipynb", False) and plain
+
+    put(port, "trash/a.txt", b"a")
+    put(port, "trash/sub/b.csv", b"x\n1\n")
+    put(port, "trash/.folder", b"")
+    p.click("#refresh")
+    folder("trash").wait_for(timeout=10000)
+    asked.clear()
+    more_of(folder("trash"))
+    p.locator("#menu button", has_text="Delete folder").click()
+    said = until(lambda: "Deleted trash" in pg.toast(), True)  # (the page asks first: its dialog is answered while this waits on the page)
+    emptied = until(lambda: in_lake("trash"), [])
+    gone = until(lambda: folder("trash").count(), 0)
+    checks["Delete folder asks (with how many files), then deletes every file under it, the marker too, and the folder goes from the tree"] = said is True and emptied == [] and gone == 0 \
+        and any("2 files" in m and "trash" in m for m in asked)
+
+    rename = pg.workspace("misc", "old.txt")
+    rename.click()
+    until(lambda: pg.tab()[0], "old.txt")
+    more_of(rename)
+    p.locator("#menu button", has_text="Rename").click()
+    p.locator("#askDlg[open]").wait_for(timeout=5000)
+    p.fill("#askIn", "misc/new.txt")
+    p.press("#askIn", "Enter")
+    moved = until(lambda: sorted(x[0] for x in in_lake("misc")), ["files/misc/blob.bin", "files/misc/new.txt"])
+    titles = until(lambda: "new.txt" in p.locator("#tabbar .tab .tn").all_inner_texts() and "old.txt" not in p.locator("#tabbar .tab .tn").all_inner_texts(), True)
+    checks["a file renamed from its ⋯ moves its open tab to the new name"] = moved == ["files/misc/blob.bin", "files/misc/new.txt"] and titles is True and pg.tab()[0] == "new.txt"
+
+    p.locator('#left button[aria-label="Workspace: more"]').click()
+    group = items()
+    p.keyboard.press("Escape")
+    p.locator('#left button[aria-label="Data: more"]').click()
+    data = items()
+    p.keyboard.press("Escape")
+    p.click("#newfile")
+    plus = items()
+    p.keyboard.press("Escape")
+    p.click("#moreBtn")
+    top = items()
+    p.keyboard.press("Escape")
+    cmds = palette("upload")
+    w = Page(browser, base + "/")
+    w.p.locator("#tabbar .tab").first.click(button="middle")
+    welcome = until(lambda: w.p.locator(".welcome .btn").all_inner_texts(), ["New notebook", "New SQL file", "New Python file", "New folder", "Upload a file…"])
+    w.ctx.close()
+    checks["the Workspace's ⋯ lists no New item (Data's keeps Refresh); the +, the top ⋯, Ctrl+K and the welcome page say Upload a file…"] = \
+        not [x for x in group if x.startswith("New")] and "Move to the right pane" in group and "Refresh" in data \
+        and plus == ["New notebook", "New SQL file", "New Python file", "New folder", "Upload a file…"] and "Upload a file…" in top and "New folder" in top \
+        and cmds.count("Upload a file…") == 1 and not [x for x in top + cmds + welcome if "Open an" in x] and welcome == ["New notebook", "New SQL file", "New Python file", "New folder", "Upload a file…"]
+    if show:
+        pg.menu("Settings")
+        p.select_option("#setGroups", "workspace")
+        p.keyboard.press("Escape")
+        folder("projects").click(button="right")
+        p.locator("#menu button", has_text="New SQL file here").click()
+        p.keyboard.insert_text("SELECT 1")
+        p.wait_for_function("!document.querySelector('#toast.on')", timeout=15000)  # (the last toast gone)
+        folder("projects").hover()
+        p.wait_for_timeout(300)
+        pg.shot(show, "console-workspace.png")
+    checks["folders: every request went to the node; no page errors"] = pg.left() == [] and pg.errors == []
+    info = {"shown": shown, "made": [viaTab, inside, twice, dots], "menus": {"folder": by_button, "file": file_menu, "notebook": nb_menu, "group": group, "data": data, "plus": plus, "top": top, "palette": cmds}, "asked": asked, "deleted": [said, emptied, gone],
+            "toast": pg.toast(), "errors": pg.errors, "left": pg.left(), "welcome": welcome}
     pg.ctx.close()
     return checks, info
 

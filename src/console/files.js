@@ -1,20 +1,25 @@
 // The Workspace and its files (ADR-034): the lake's own files, as a tree; SQL, Python, data and
 // text files open in tabs, are edited there and saved back in place (`PUT /files` with
 // `If-Match`: replaced only if nobody saved it meanwhile).
-import { h, fill, icon, svg, esc, secs, count, bytes, ago, utc, S, R, emit, call, run, rows, doBlock, fileUrl, fileSql, quote, ident, toast, menu, prompt, confirmed, saveAs, MODE, DATA, Failure, store } from './core.js';
+import { h, fill, icon, svg, secs, count, bytes, utc, S, R, emit, call, run, rows, doBlock, fileUrl, fileSql, quote, ident, toast, menu, prompt, confirmed, saveAs, MODE, DATA, store, failed, readFile, writeFile } from './core.js';
 import { Editor, formatSql } from './editor.js';
 import { grid, chart, toCsv, copyText } from './grid.js';
-import { answer, doneText, cleanName } from './notebook.js';
+import { answer, doneText, cleanName, openPlain } from './notebook.js';
 
 const base = p => p.split('/').pop();
-const dir = p => p.includes('/') ? p.slice(0, p.lastIndexOf('/')) : '';
+/** An empty folder is a zero-byte object, `<folder>/.folder` (object storage has no folders): the tree and the search leave it out. */
+export const FOLDER = '.folder';
+/** Where a tab's file is, or will be saved. */
+const target = d => d?.path || d?.untitled;
 /** A file's kind, by its name: what opens it and which icon it has. */
 export const kindOf = p => /\.sql$/i.test(p) ? 'sql' : /\.py$/i.test(p) ? 'python' : DATA.test(p) ? 'data' : /\.(md|txt)$/i.test(p) ? 'text' : /\.ipynb$/i.test(p) ? 'notebook' : 'file';
 export const iconOf = p => ({ sql: 'filesql', python: 'filepy', data: 'filedata', notebook: 'notebook', text: 'file', file: 'file' })[kindOf(p)];
 
 // ------------------------------------------------------------------ the Workspace view: the lake's files, as a tree
 /** The lake's files by folder. A notebook's versions (`notebooks/<name>/<time>.ipynb`) are one
- * entry, `<name>.ipynb`; the open one shows its outline under it. */
+ * entry, `<name>.ipynb`; the open one shows its outline under it. A folder is there if it holds
+ * a file or a `.folder` marker; a file that is only in its tab (new, or its file deleted) is there
+ * too, marked not saved. */
 export async function workspace(box) {
   try { S.files = await rows(`SELECT path, size, written FROM files() ORDER BY path`); } catch (e) {
     box.replaceChildren(h('div', { class: 'empty' }, e.status === 401 ? 'A token is needed to list the files.' : e.message));
@@ -27,44 +32,48 @@ export function drawWorkspace(box) {
   const list = S.files || [];
   const root = { dirs: new Map(), files: [] };
   const into = parts => { let d = root; for (const p of parts) d = d.dirs.get(p) || d.dirs.set(p, { dirs: new Map(), files: [] }).get(p); return d; };
-  const notebooks = new Map();
+  const notebooks = new Map(), here = new Set();
   for (const f of list) {
-    const rel = f.path.replace(/^files\//, ''), nb = rel.match(/^notebooks\/([^/]+)\/([^/]+)\.ipynb$/);
+    const rel = f.path.replace(/^files\//, ''), nb = rel.match(/^notebooks\/([^/]+)\/([^/]+)\.ipynb$/), parts = rel.split('/');
+    here.add(nb ? 'notebooks/' + nb[1] : rel);
     if (nb) { const n = notebooks.get(nb[1]) || notebooks.set(nb[1], { name: nb[1], written: f.written, n: 0 }).get(nb[1]); n.n++; if (f.written > n.written) n.written = f.written; continue; }
-    const parts = rel.split('/');
-    into(parts.slice(0, -1)).files.push({ ...f, rel, name: parts.at(-1) });
+    const d = into(parts.slice(0, -1));
+    if (parts.at(-1) !== FOLDER) d.files.push({ ...f, rel, name: parts.at(-1) });
   }
   if (notebooks.size) into(['notebooks']).files.push(...[...notebooks.values()].map(n => ({ rel: `notebooks/${n.name}`, name: n.name + '.ipynb', written: n.written, versions: n.n, notebook: true })));
-  const openNb = S.docs.filter(d => d.kind === 'notebook' && !d.version).map(d => ({ rel: d.path, name: d.title, notebook: true, unsaved: true }));
-  if (openNb.length) into(['notebooks']).files.unshift(...openNb.filter(o => !notebooks.has(o.rel.slice(10))));
+  for (const d of S.docs) {
+    const rel = target(d);
+    if (rel && !here.has(rel)) into(rel.split('/').slice(0, -1)).files.push({ rel, name: d.title, notebook: d.kind === 'notebook', doc: d });
+  }
   const render = (d, at, depth) => [
     ...[...d.dirs.keys()].sort().map(n => {
-      const key = 'dir:' + at + n, front = !!S.doc?.path?.startsWith(at + n + '/') && !S.open.has('closed:' + key); // (the folders of the file in front are open)
+      const key = 'dir:' + at + n, front = !!target(S.doc)?.startsWith(at + n + '/') && !S.open.has('closed:' + key); // (the folders of the file in front are open)
       const kids = h('div', { class: 'kids', role: 'group', hidden: !S.open.has(key) && !front }, render(d.dirs.get(n), at + n + '/', depth + 1));
       return treeItem({ key, kids, depth, icon: 'folder', name: n, title: at + n, onclick: tw => tw.click(), menu: e => folderMenu(e, at + n) });
     }),
     ...d.files.sort((a, b) => a.name.localeCompare(b.name)).map(f => {
-      const doc = S.docs.find(x => x.path === f.rel), kind = f.notebook ? 'notebook' : kindOf(f.rel), heads = doc?.kind === 'notebook' ? doc.outline() : [];
+      const doc = f.doc || S.docs.find(x => x.path === f.rel), kind = f.notebook ? 'notebook' : kindOf(f.rel), heads = doc?.kind === 'notebook' ? doc.outline() : [];
       const kids = heads.length ? h('div', { class: 'kids outline', role: 'group', hidden: S.doc !== doc && !S.open.has('nb:' + f.rel) }, heads.map(x =>
         treeItem({ depth: depth + 1, icon: 'hash', name: x.text, cls: 'h' + x.level, title: x.text, onclick: () => { R.helpers.activate(doc); doc.goto(x.c); } }))) : null;
       return treeItem({ key: 'nb:' + f.rel, kids, depth, icon: iconOf(f.notebook ? 'x.ipynb' : f.rel), iconCls: 'k-' + kind, name: f.name, dataKey: 'file:' + f.rel, cls: doc && S.doc === doc ? 'front' : '',
         meta: kind === 'data' || kind === 'file' ? bytes(f.size) : f.versions > 1 ? `${f.versions} versions` : '', dirty: doc?.dirty,
-        title: f.notebook ? `${f.name}: ${f.versions || 0} version${f.versions === 1 ? '' : 's'}` : `files/${f.rel} · ${bytes(f.size)} · written ${f.written ? utc(f.written).toLocaleString() : ''}`,
-        onclick: () => kind === 'file' ? R.helpers.pick({ type: 'file', f }) : R.helpers.openFile(f.rel),
+        title: f.doc ? `${f.name}: not saved yet` : f.notebook ? `${f.name}: ${f.versions || 0} version${f.versions === 1 ? '' : 's'}` : `files/${f.rel} · ${bytes(f.size)} · written ${f.written ? utc(f.written).toLocaleString() : ''}`,
+        onclick: () => f.doc ? R.helpers.activate(f.doc) : kind === 'file' ? R.helpers.pick({ type: 'file', f }) : R.helpers.openFile(f.rel),
         menu: e => fileMenu(e, f, kind) });
     }),
   ];
   const tree = render(root, '', 0);
-  box.replaceChildren(...tree.length ? tree : [h('div', { class: 'empty' }, 'No files yet. + makes a notebook, a SQL or a Python file, or uploads one.')]);
+  box.replaceChildren(...tree.length ? tree : [h('div', { class: 'empty' }, 'No files yet. + makes a file or a folder, or uploads one.')]);
 }
-/** A row of a tree: its twisty (it folds, when it has kids), icon, name, a note, and the unsaved dot. */
+/** A row of a tree: its twisty (it folds, when it has kids), icon, name, a note, the unsaved dot, and (if it has a menu) a ⋯ that opens it. */
 export function treeItem({ key, kids, depth = 0, icon: ic, iconCls = '', name, meta, dirty, on, title, onclick, ondblclick, menu: onmenu, cls = '', dataKey, dataKind }) {
   const open = kids && !kids.hidden;
   const tw = h('span', { class: 'tw' + (kids ? '' : ' none'), 'aria-hidden': 'true', html: kids ? svg('chev', 14, 2) : '' });
   const row = h('div', { class: `row ${cls}${on ? ' on' : ''}`, role: 'treeitem', tabindex: '-1', 'aria-level': String(depth + 1), 'aria-expanded': kids ? String(!!open) : null, title,
     'data-key': dataKey, 'data-kind': dataKind, style: `padding-left:${6 + depth * 14}px` },
     tw, h('span', { class: 'ic ' + iconCls, html: svg(ic, 16) }), h('span', { class: 'nm' }, name), meta ? h('span', { class: 'meta' }, meta) : null,
-    dirty ? h('span', { class: 'dirty', title: 'Not saved', 'aria-label': 'not saved' }) : null);
+    dirty ? h('span', { class: 'dirty', title: 'Not saved', 'aria-label': 'not saved' }) : null,
+    onmenu ? h('button', { class: 'icon sm more', title: 'More', 'aria-label': `${name}: more`, onclick: e => { e.stopPropagation(); onmenu(e.currentTarget); } }, icon('dots')) : null);
   const toggle = () => {
     if (!kids) return;
     kids.hidden = !kids.hidden;
@@ -79,6 +88,8 @@ export function treeItem({ key, kids, depth = 0, icon: ic, iconCls = '', name, m
   return kids ? h('div', { class: 'item' }, row, kids) : row;
 }
 function fileMenu(e, f, kind) {
+  // (a file only in its tab: not in the lake yet)
+  if (f.doc) return menu(e, [{ label: 'Save…', icon: 'save', run: () => { R.helpers.activate(f.doc); f.doc.save(); } }, { label: 'Close', icon: 'close', run: () => R.helpers.close(f.doc) }]);
   menu(e, [kind !== 'file' ? { label: 'Open', icon: iconOf(f.notebook ? 'x.ipynb' : f.rel), run: () => R.helpers.openFile(f.rel) } : null,
     { label: 'Details', icon: 'eye', run: () => R.helpers.pick({ type: 'file', f }) },
     kind === 'data' ? { label: 'Query with SQL', icon: 'play', run: () => R.helpers.query(`SELECT * FROM ${fileSql(f.rel)} LIMIT 1000`) } : null, '-',
@@ -88,20 +99,36 @@ function fileMenu(e, f, kind) {
     { label: f.notebook ? 'Delete every version…' : 'Delete…', icon: 'trash', run: () => remove(f) }]);
 }
 function folderMenu(e, at) {
-  menu(e, [{ label: 'New SQL file here', icon: 'filesql', run: () => R.helpers.newFile('sql', at + '/') }, { label: 'New Python file here', icon: 'filepy', run: () => R.helpers.newFile('python', at + '/') },
-    { label: 'Upload a file here…', icon: 'up', run: () => upload(at + '/') }]);
+  const make = R.helpers;
+  menu(e, [{ label: 'New notebook here', icon: 'notebook', run: () => make.newNotebook(at) }, { label: 'New SQL file here', icon: 'filesql', run: () => make.newFile('sql', at + '/') },
+    { label: 'New Python file here', icon: 'filepy', run: () => make.newFile('python', at + '/') }, { label: 'New folder here', icon: 'folder', run: () => newFolder(at + '/') }, '-',
+    { label: 'Upload a file here…', icon: 'up', run: () => upload(at + '/') }, { label: 'Delete folder…', icon: 'trash', run: () => remove({ rel: at, name: at }, true) }]);
+}
+/** A folder in `at`, by name (`a/b` makes both): its marker is put as any file is. */
+export async function newFolder(at = '') {
+  const name = ((await prompt('New folder', 'Its name', '')) || '').replace(/^\/+|\/+$/g, ''), rel = at + name;
+  if (!name) return;
+  const bad = /(^|\/)(\.{0,2}|\s+)(\/|$)|^notebooks(\/|$)/.test(rel) ? 'Not a folder name: no empty part, . or .., nor in notebooks/'
+    : S.files?.some(f => f.path === 'files/' + rel || f.path.startsWith(`files/${rel}/`)) ? `${rel} is there already` : '';
+  if (bad) return toast(bad, true);
+  try {
+    await call(fileUrl(`${rel}/${FOLDER}`), { method: 'PUT', body: '' });
+    S.open.add('dir:' + at.slice(0, -1)); // (so it shows)
+    toast(`Made the folder ${rel}`);
+  } catch (err) { toast('No folder made: ' + err.message, true); }
+  R.helpers.refreshFiles();
 }
 export async function download(rel) {
   try { const r = await call(fileUrl(rel)); saveAs(await r.blob(), 'application/octet-stream', base(rel)); } catch (e) { toast(e.message, true); }
 }
-/** A file from this computer into the lake's files (a notebook opens; the rest are put). */
+/** A file from this computer into the lake's files (a notebook opens, unless it is for a folder: then it is put there; the rest are put). */
 export function upload(at = '') {
   const input = h('input', { type: 'file', hidden: true, multiple: true });
   input.onchange = async () => {
     const fs = [...input.files];
     input.remove();
     for (const f of fs) {
-      if (/\.ipynb$/i.test(f.name)) { try { R.helpers.openNotebook(JSON.parse(await f.text()), cleanName(f.name) || 'uploaded'); toast(`Opened ${f.name}: Ctrl+S keeps it in the lake`); } catch (err) { toast(`Could not open ${f.name}: ${err.message}`, true); } continue; }
+      if (/\.ipynb$/i.test(f.name) && (!at || at === 'notebooks/')) { try { R.helpers.openNotebook(JSON.parse(await f.text()), cleanName(f.name) || 'uploaded'); toast(`Opened ${f.name}: Ctrl+S keeps it in the lake`); } catch (err) { toast(`Could not open ${f.name}: ${err.message}`, true); } continue; }
       const rel = at + f.name;
       try { await call(fileUrl(rel), { method: 'PUT', body: f }); toast(`Put in the lake: files/${rel}`); } catch (err) {
         if (err.status !== 409) { toast(`${f.name}: ${err.message}`, true); continue; }
@@ -122,46 +149,28 @@ async function rename(rel) {
     await call(fileUrl(to), { method: 'PUT', body: await r.blob() });
     await call(fileUrl(rel), { method: 'DELETE' });
     const doc = S.docs.find(d => d.path === rel);
-    if (doc) { doc.path = to; doc.version = null; await doc.reload?.(); R.helpers.drawTabs(); }
+    if (doc) { await R.helpers.close(doc); R.helpers.openFile(to); } // (its tab again, at the new path)
     toast(`Renamed to ${to}`);
   } catch (e) { toast('Not renamed: ' + e.message, true); }
   R.helpers.refreshFiles();
 }
-async function remove(f) {
-  if (!confirm(f.notebook ? `Delete the notebook ${f.name}, every version of it?` : `Delete files/${f.rel}? This can't be undone.`)) return;
+/** Delete a file, a notebook (every version) or a folder (every file in it, its marker too), once asked. */
+async function remove(f, folder) {
   try {
-    const paths = f.notebook ? (await rows(`SELECT path FROM files('${f.rel.replace(/'/g, "''")}/')`)).map(x => x.path) : ['files/' + f.rel];
-    for (const p of paths) await call(fileUrl(p), { method: 'DELETE' });
-    const doc = S.docs.find(d => d.path === f.rel);
-    if (doc) { doc.dirty = true; doc.version = null; doc.written = null; R.helpers.drawTabs(); }
+    const paths = f.notebook || folder ? (await rows(`SELECT path FROM files(${quote(f.rel + '/')})`)).map(x => x.path) : ['files/' + f.rel], n = paths.filter(p => !p.endsWith('/' + FOLDER)).length;
+    if (!confirmed(f.notebook ? `Delete the notebook ${f.name}, every version of it?` : folder ? `Delete the folder ${f.rel} and its ${n} file${n === 1 ? '' : 's'}? This can't be undone.` : `Delete files/${f.rel}? This can't be undone.`)) return;
+    await Promise.all(paths.map(p => call(fileUrl(p), { method: 'DELETE' })));
+    for (const d of S.docs) if (d.path === f.rel || folder && d.path?.startsWith(f.rel + '/')) Object.assign(d, { dirty: true, version: null, written: null }); // (a tab keeps what it holds, unsaved)
+    R.helpers.drawTabs();
     toast(`Deleted ${f.name}`);
   } catch (e) { toast('Not deleted: ' + e.message, true); }
   R.helpers.refreshFiles();
 }
 
 // ------------------------------------------------------------------ text files: SQL, Python, Markdown and text
-/** A file in the lake as text, with the version to replace it by (`If-Match`). */
-export async function readFile(rel) {
-  const r = await call(fileUrl(rel));
-  return { text: await r.text(), version: (r.headers.get('etag') || '').replace(/"/g, '') || null };
-}
-/** Write a file back: in place if `version` is the one read (else 412: someone saved it
- * meanwhile), or a new file if it has none. The new version, or null if not saved. */
-export async function writeFile(rel, body, version, type = 'text/plain; charset=utf-8') {
-  try {
-    const r = await call(fileUrl(rel), { method: 'PUT', body, headers: { 'content-type': type, ...(version ? { 'if-match': `"${version}"` } : {}) } });
-    return (await r.json()).version || 'saved';
-  } catch (e) {
-    if (e.status === 412) toast(`Not saved: ${base(rel)} was saved by someone else since you opened it. Save it under another name (⋯), or open it again.`, true);
-    else if (e.status === 409) toast(`Not saved: files/${rel} is there already. Open it, or pick another name.`, true);
-    else toast('Not saved: ' + e.message, true);
-    return null;
-  }
-}
-
 class TextDoc {
   constructor({ path = null, text = '', version = null, kind = 'text', language = 'text', untitled = 'untitled.txt' }) {
-    Object.assign(this, { path, version, kind, dirty: false, untitled, pos: { line: 1, col: 1 } });
+    Object.assign(this, { path, version, kind, dirty: !path, untitled, pos: { line: 1, col: 1 } }); // (new: not saved yet)
     this.icon = iconOf(path || untitled);
     this.ed = new Editor({ gutter: true, language, value: text, label: this.title, oninput: () => this.changed(), onkey: e => this.key(e), oncursor: (line, col) => { this.pos = { line, col }; R.helpers.status(); } });
     this.main = h('div', { class: 'pane-ed' }, this.ed.el);
@@ -176,13 +185,14 @@ class TextDoc {
   }
   put(text) { this.ed.insert(text); }
   activate() { requestAnimationFrame(() => this.ed.focus()); }
-  close() { return !this.dirty || confirm(`Close ${this.title}? It has changes that are not saved.`); }
+  get blank() { return !this.path && !this.ed.value.trim(); } // (new and empty: nothing to lose)
+  close() { return !this.dirty || this.blank || confirm(`Close ${this.title}? It has changes that are not saved.`); }
   async reload() { if (!this.path) return; const f = await readFile(this.path); this.ed.value = f.text; this.version = f.version; this.dirty = false; this.paramsBar?.(); emit('changed', this); }
   /** Save it where it is (a new file asks where first). */
   async save(as) {
     let path = this.path;
     if (!path || as) {
-      path = await prompt(as ? 'Save as' : 'Save', 'Where, under the lake\'s files', path || (this.kind === 'sql' ? 'queries/' : this.kind === 'python' ? 'scripts/' : '') + this.untitled);
+      path = await prompt(as ? 'Save as' : 'Save', 'Where, under the lake\'s files', path || this.untitled);
       if (!path) return false;
       path = path.replace(/^\/?(files\/)?/, '');
       if (as || !this.path) this.version = null;
@@ -235,7 +245,7 @@ function splitPanel(doc, panel) {
 // ------------------------------------------------------------------ a SQL file: its results below
 export class SqlDoc extends TextDoc {
   constructor(o = {}) {
-    super({ ...o, kind: 'sql', language: 'sql', untitled: o.untitled || 'untitled.sql' });
+    super({ ...o, kind: 'sql', language: 'sql', untitled: o.untitled || 'queries/untitled.sql' });
     this.layout = store.get('pondra.results') || 'below';
     this.tab = 'results'; this.result = null;
     this.body = h('div', { class: 'pbody' });
@@ -283,7 +293,7 @@ export class SqlDoc extends TextDoc {
     const values = this.params();
     for (const sql of list.length ? list : [text]) {
       const t0 = performance.now();
-      try { r = await run(sql, ctl.signal, values); } catch (e) { r = { kind: 'error', message: e.name === 'AbortError' ? 'Stopped waiting. (A statement already on its way may still finish on the node.)' : e.message, notices: [] }; }
+      try { r = await run(sql, ctl.signal, values); } catch (e) { r = failed(e); }
       if (this.ctl !== ctl) return;
       r.ms = performance.now() - t0; r.sql = sql;
       this.results.push(r); this.result = r;
@@ -374,7 +384,7 @@ export const lastStatement = sql => statements(sql).at(-1) || sql;
 // ------------------------------------------------------------------ a Python file: a console below
 export class PythonDoc extends TextDoc {
   constructor(o = {}) {
-    super({ ...o, kind: 'python', language: 'python', untitled: o.untitled || 'untitled.py' });
+    super({ ...o, kind: 'python', language: 'python', untitled: o.untitled || 'scripts/untitled.py' });
     this.layout = 'below';
     this.log = h('div', { class: 'log', 'aria-live': 'polite' });
     this.hist = []; this.at = 0;
@@ -402,7 +412,7 @@ export class PythonDoc extends TextDoc {
     this.running = true; R.helpers.toolbar(); R.helpers.pane('bottom', true); R.helpers.kernel('busy');
     emit('run', { kind: 'python', src: code, doc: this });
     let r;
-    try { r = await run(doBlock(code), ctl.signal); } catch (e) { r = { kind: 'error', message: e.name === 'AbortError' ? 'Stopped waiting.' : e.message, notices: [] }; }
+    try { r = await run(doBlock(code), ctl.signal); } catch (e) { r = failed(e, 'Stopped waiting.'); }
     this.running = false; this.ctl = null; r.ms = performance.now() - t0;
     R.helpers.kernel('idle'); R.helpers.toolbar();
     entry.lastChild.replaceWith(h('div', { class: 'res' }, ...answer(r), h('div', { class: 'took' }, `${r.kind === 'error' ? 'failed' : 'done'} in ${secs(r.ms)}`)));
@@ -569,9 +579,9 @@ const parseValue = t => { if (t === '') return null; if (/^(-?\d+(\.\d+)?([eE][+
 // ------------------------------------------------------------------ the core's kinds of file, as an extension would register them
 export function registerFiles(register) {
   const text = (Cls, kind) => async path => { if (!path) return new Cls({}); const f = await readFile(path); return new Cls({ path, text: f.text, version: f.version, kind }); };
+  register.doc({ id: 'notebook', label: 'Notebook', icon: 'notebook', match: p => /\.ipynb$/i.test(p) && !p.startsWith('notebooks/'), open: openPlain }); // (a plain file, saved in place; notebooks keeps versions)
   register.doc({ id: 'sql', label: 'SQL file', icon: 'filesql', order: 20, match: p => /\.sql$/i.test(p), open: text(SqlDoc) });
   register.doc({ id: 'python', label: 'Python file', icon: 'filepy', order: 30, match: p => /\.py$/i.test(p), open: text(PythonDoc) });
   register.doc({ id: 'data', label: 'Data file', icon: 'filedata', order: 40, match: p => DATA.test(p), open: path => new DataDoc({ path }).load() });
   register.doc({ id: 'text', label: 'Text file', icon: 'file', order: 50, match: p => /\.(md|txt)$/i.test(p), open: async path => { const f = await readFile(path); return new TextDoc({ path, text: f.text, version: f.version, language: /\.md$/i.test(path) ? 'markdown' : 'text' }); } });
 }
-export { TextDoc, esc, ago, Failure, dir };

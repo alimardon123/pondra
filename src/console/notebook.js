@@ -1,6 +1,7 @@
 // Notebooks (ADR-030, ADR-034): SQL, Python and text cells in a tab, saved in the lake as
-// Jupyter notebooks (`files/notebooks/<name>/<time>.ipynb`, a version per save).
-import { h, $, icon, esc, secs, count, S, R, emit, call, rows, fileUrl, toast, menu, saveAs, numeric, ago, Failure, said } from './core.js';
+// Jupyter notebooks (`files/notebooks/<name>/<time>.ipynb`, a version per save), or, anywhere
+// else, as one plain `.ipynb` file, saved in place like a SQL file.
+import { h, $, icon, esc, secs, count, S, R, emit, call, rows, fileUrl, toast, menu, saveAs, numeric, ago, Failure, said, failed, readFile, writeFile } from './core.js';
 import { Editor, markdown } from './editor.js';
 
 // ------------------------------------------------------------------ what a cell answered
@@ -21,7 +22,7 @@ export function answer(r, cell) {
 
 // ------------------------------------------------------------------ cells
 let made = 0;
-const newId = () => 'c' + Date.now().toString(36) + (made++).toString(36); // (nbformat's cell ids)
+const newId = () => 'c' + Date.now().toString(36) + (made++).toString(36); // (cell ids as nbformat has them)
 
 export class Cell {
   constructor(nb, o = {}) {
@@ -108,7 +109,7 @@ export class Cell {
     try {
       r = await this.type.run(text, ctl.signal);
     } catch (e) {
-      r = { kind: 'error', message: e.name === 'AbortError' ? 'Stopped waiting. (A statement already on its way may still finish on the node.)' : e.message, notices: [] };
+      r = failed(e);
     } finally {
       clearInterval(tick);
       if (this.ctl === ctl) this.ctl = null;
@@ -227,10 +228,11 @@ export async function versions(name) {
 }
 
 // ------------------------------------------------------------------ the notebook, a document
-/** A notebook in a tab: its cells, its toolbar (Run all, Interrupt, Restart, Python, Save), its keys. */
+/** A notebook in a tab: its cells, its toolbar (Run all, Interrupt, Restart, Python, Save), its keys.
+ * With a `dir` (`''` or `reports/`) it is a plain file, `<dir><name>.ipynb`, saved in place. */
 export class Notebook {
-  constructor({ name = 'untitled', version = null, nb = { cells: [] } } = {}) {
-    this.kind = 'notebook'; this.icon = 'notebook';
+  constructor({ name = 'untitled', version = null, nb = { cells: [] }, dir = null } = {}) {
+    this.kind = 'notebook'; this.icon = 'notebook'; this.dir = dir;
     this.cells = []; this.sel = null; this.last = null; this.trash = null; this.dirty = false;
     this.box = h('div', { class: 'cells', 'aria-label': 'Cells' });
     const add = kind => h('button', { class: 'btn ghost', 'data-add': kind, onclick: () => this.add({ kind }).edit() }, '+ ' + { sql: 'SQL', python: 'Python', markdown: 'Text' }[kind]);
@@ -238,8 +240,10 @@ export class Notebook {
       h('div', { class: 'hint' }, h('kbd', {}, 'Ctrl'), ' ', h('kbd', {}, 'Enter'), ' runs a cell · ', h('kbd', {}, 'Tab'), ' completes a name · ', h('kbd', {}, 'Esc'), ' then ', h('kbd', {}, '?'), ' lists every key')));
     this.load(nb, name, version);
   }
-  get path() { return `notebooks/${this.name}`; }
+  get plain() { return this.dir != null; }
+  get path() { return this.plain ? `${this.dir}${this.name}.ipynb` : `notebooks/${this.name}`; }
   get title() { return this.name + '.ipynb'; }
+  get blank() { return !this.cells.some(c => c.src.trim()); } // (nothing typed: nothing to lose)
   /** The cells from a notebook's JSON (a saved version, an upload, an extension's). */
   load(nb, name, version) {
     const cells = cellsOf(nb);
@@ -248,7 +252,7 @@ export class Notebook {
     for (const c of cells.length ? cells : [{}]) this.add(c, null, true, true);
     this.name = name; this.version = version; this.written = version ? Date.now() : null;
     this.select(this.cells[0]);
-    this.saved();
+    this.dirty = !version; emit('changed', this); // (new: not saved yet)
   }
   add(o, near, below = true, quiet) {
     const c = new Cell(this, o), i = near ? this.cells.indexOf(near) + (below ? 1 : 0) : this.cells.length;
@@ -330,17 +334,18 @@ export class Notebook {
       nbformat: 4, nbformat_minor: 5,
     };
   }
-  /** Save in the lake as a new version (a file in the lake is never replaced, so every version stays). */
+  /** Save in the lake as a new version (a file in the lake is never replaced, so every version stays), or a plain file in place. */
   async save() {
     const input = $('#nbname');
-    const name = cleanName(input ? input.value : this.name);
+    const name = input && input.value !== this.name ? cleanName(input.value) : this.name;
     if (!name) { toast('Give the notebook a name first', true); input?.focus(); return false; }
     this.name = name; if (input) input.value = name;
-    const version = stampOf(), path = `notebooks/${name}/${version}.ipynb`;
+    const version = stampOf(), path = this.plain ? this.path : `notebooks/${name}/${version}.ipynb`, body = JSON.stringify(this.notebook(), null, 1) + '\n';
     try {
-      await call(fileUrl(path), { method: 'PUT', body: JSON.stringify(this.notebook(), null, 1) + '\n', headers: { 'content-type': 'application/x-ipynb+json' } });
-      this.version = version; this.written = Date.now(); this.saved();
-      toast(`Saved: ${name} (a new version)`);
+      if (this.plain) { const v = await writeFile(path, body, this.version, 'application/x-ipynb+json'); if (!v) return false; this.version = v; } // (refused, with a word, if someone saved it since)
+      else { await call(fileUrl(path), { method: 'PUT', body, headers: { 'content-type': 'application/x-ipynb+json' } }); this.version = version; }
+      this.written = Date.now(); this.saved();
+      toast(this.plain ? `Saved: files/${path}` : `Saved: ${name} (a new version)`);
       emit('saved', this, `files/${path}`);
       return true;
     } catch (e) {
@@ -350,7 +355,7 @@ export class Notebook {
   }
   /** Close it: its live answers stop, and it asks first if it has changes. */
   close() {
-    if (this.dirty && this.cells.some(c => c.src.trim()) && !confirm(`Close ${this.title}? It has changes that are not saved.`)) return false;
+    if (this.dirty && !this.blank && !confirm(`Close ${this.title}? It has changes that are not saved.`)) return false;
     for (const c of this.cells) { c.stopLive(); c.ctl?.abort(); }
     return true;
   }
@@ -364,16 +369,17 @@ export class Notebook {
     const pill = h('button', { class: 'pill kernel', id: 'kernel', title: 'This page\'s Python, on the node: its cells share their variables. Click for Variables and Restart', onclick: e => menu(e.currentTarget, [{ label: 'Variables', icon: 'var', run: () => R.helpers.show('variables') }, { label: 'Restart Python', icon: 'restart', keys: '0 0', run: () => R.helpers.restart() }]) });
     const drawPill = () => pill.replaceChildren(h('span', { class: 'dot ' + (S.py === 'busy' ? 'busy' : S.py === 'idle' ? '' : 'idle') }), 'Python ', h('b', {}, S.py === 'none' ? 'not started' : S.py));
     drawPill(); this.drawPill = drawPill;
-    return [h('span', { class: 'crumb' }, 'notebooks'), h('span', { class: 'slash' }, '/'), name, h('span', { class: 'said-saved' }, this.dirty ? 'Edited, not saved' : this.written ? `Saved ${ago(new Date(this.written).toISOString())}` : ''),
+    return [h('span', { class: 'crumb' }, this.dir ?? 'notebooks/'), name, h('span', { class: 'said-saved' }, this.dirty ? 'Edited, not saved' : this.written ? `Saved ${ago(new Date(this.written).toISOString())}` : ''),
       h('span', { class: 'grow' }),
       b('play', 'Run all', 'Run every cell, in order (Ctrl+Shift+Enter)', () => this.runSome(0), 'btn primary'), b('stop', 'Interrupt', 'Stop waiting for the cells running', () => this.interrupt()),
       b('restart', 'Restart', 'Restart Python: its variables go', () => R.helpers.restart()), h('span', { class: 'sep' }), pill,
-      b('save', 'Save', 'Save in the lake, as a new version (Ctrl+S)', () => this.save()),
+      b('save', 'Save', 'Save in the lake (Ctrl+S)', () => this.save()),
       h('button', { class: 'icon', title: 'More', 'aria-label': 'More', onclick: e => menu(e.currentTarget, [
-        { label: 'Versions…', icon: 'clock', run: () => R.helpers.pickFile(`files/${this.path}`) },
+        this.plain ? null : { label: 'Versions…', icon: 'clock', run: () => R.helpers.pickFile(`files/${this.path}`) },
         { label: 'Download as .ipynb', icon: 'down', run: () => saveAs(JSON.stringify(this.notebook(), null, 1) + '\n', 'application/x-ipynb+json', this.name + '.ipynb') },
         { label: 'Clear every output', icon: 'clear', run: () => this.clearOutputs() }, '-',
-        { label: 'Run as a job', icon: 'play', run: () => R.helpers.job(this) }, { label: 'Schedule…', icon: 'clock', run: () => R.helpers.schedule(this) }]) }, icon('dots'))];
+        // (a job runs a notebook of notebooks/, with its versions: not a plain file)
+        this.plain ? null : { label: 'Run as a job', icon: 'play', run: () => R.helpers.job(this) }, this.plain ? null : { label: 'Schedule…', icon: 'clock', run: () => R.helpers.schedule(this) }]) }, icon('dots'))];
   }
   status() { return [`${this.cells.length} cell${this.cells.length === 1 ? '' : 's'}`, 'Notebook']; }
   /** Keys on the selected cell, after Esc (Jupyter's). */
@@ -400,6 +406,11 @@ export class Notebook {
     if (mine) { e.preventDefault(); mine.run(c); return true; }
     return false;
   }
+}
+/** A notebook that is one plain file (`<folder>/<name>.ipynb`), to be saved in place. */
+export async function openPlain(path) {
+  const f = await readFile(path), dir = path.slice(0, path.lastIndexOf('/') + 1);
+  return new Notebook({ name: path.slice(dir.length).replace(/\.ipynb$/i, ''), dir, version: f.version, nb: JSON.parse(f.text) });
 }
 /** Open a saved notebook's version (the latest if none is named). */
 export async function openNotebook(name, version) {

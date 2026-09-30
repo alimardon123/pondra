@@ -3,14 +3,14 @@
 // so a spreadsheet takes it as cells); a data file's cells are edited in place.
 import { h, icon, svg, count, numeric, sqlType, typeKind, typeMark, menu, toast, saveAs, quote, ident } from './core.js';
 
-const ROW_H = 30; // a row's height when only the rows in sight are drawn
+const ROW_H = 30; // the height of a row when only the rows in sight are drawn
 let measurer;
 const textWidth = s => { measurer ||= document.createElement('canvas').getContext('2d'); measurer.font = '13px ' + getComputedStyle(document.body).fontFamily; return measurer.measureText(s).width; };
 
 /** A value as the grid, its copies and the column profile write it. */
 export function shown(v, time, scale) {
   if (v == null) return null;
-  let s = typeof v === 'object' ? JSON.stringify(v) : typeof v === 'number' && scale != null ? v.toFixed(scale) : String(v); // (a live answer's decimals: numbers)
+  let s = typeof v === 'object' ? JSON.stringify(v) : typeof v === 'number' && scale != null ? v.toFixed(scale) : String(v); // (the decimals of a live answer: numbers)
   return time ? s.replace(/^(\d{4}-\d\d-\d\d)T/, '$1 ') : s;
 }
 export function toCsv(r, sep = ',') {
