@@ -4720,6 +4720,17 @@ def found():
     typed = call(port, "POST", "/sql?format=typed", b"SELECT CAST(1.5 AS DECIMAL(10,2)) AS d, 9007199254740993 AS big, 7 AS small")
     checks["format=typed: decimals and integers past 2^53 exact (as text), others as numbers"] = typed["rows"] == [["1.50", "9007199254740993", 7]] \
         and [c["type"] for c in typed["columns"]] == ["Decimal128(10, 2)", "Int64", "Int64"] and typed["total"] == 1
+    # An answer of more rows than the console is sent at once: its other pages, kept on the node (pages.rs).
+    big = call(port, "POST", "/sql?format=typed", b"SELECT value AS n FROM range(0, 25000)")
+    page3 = call(port, "GET", f"/sql/pages/{big.get('pages')}?from=20000&rows=10000") if big.get("pages") else {}
+    try:
+        call(port, "GET", "/sql/pages/0123456789abcdef0123456789abcdef?from=0")
+        gone = None
+    except RuntimeError as e:
+        gone = str(e)[:3]
+    checks["format=typed: 10,000 rows of a bigger answer, and an id its other pages are read with (the same rows, not run again); 410 once not kept"] = \
+        (len(big["rows"]), big["total"], big["rows"][-1]) == (10000, 25000, [9999]) and len(page3.get("rows", [])) == 5000 and page3["rows"][0] == [20000] \
+        and gone == "410" and typed.get("pages") is None
     # to_timestamp over a column of text answers in its type's zone (UTC), as over a literal.
     zoned = q("SELECT to_timestamp(v) AS a, to_timestamp(d, '%Y-%m-%d') AS b, to_timestamp_millis(d, '%Y-%m-%d') AS c FROM (VALUES ('2020-09-09T00:00:00+02:00', '2020-09-08')) AS x(v, d)")
     checks["to_timestamp(column) and to_timestamp_millis(column, format): TIMESTAMP (no zone; UTC's time for text with one), as over a literal"] = zoned == [{"a": "2020-09-08T22:00:00", "b": "2020-09-08T00:00:00", "c": "2020-09-08T00:00:00"}]

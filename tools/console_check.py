@@ -131,10 +131,16 @@ class Page:
         """Settings (the top bar's gear: a dialog, loaded when first opened), or `item` in the Workspace's + menu."""
         if item == "Settings":
             self.p.click("#settingsBtn")
-            self.p.locator("#settingsDlg[open]").wait_for(timeout=10000)
+            self.p.locator("dialog.settings2[open] .s-row").first.wait_for(timeout=10000)
             return
         self.p.click("#newfile")
         self.p.locator("#menu button", has_text=item).click()
+
+    def setting(self, section, row=None):
+        """Settings' `section` (its row named `row`, when given): open it where it is."""
+        self.p.locator("dialog.settings2 .s-i", has_text=section).click()
+        self.p.locator("dialog.settings2 .s-body h4", has_text=section).wait_for(timeout=5000)
+        return self.p.locator("dialog.settings2 .s-row", has=self.p.locator(".s-n", has_text=row)).first if row else None
 
     def runmenu(self, item):
         """Pick `item` in the ▾ beside the Run of the file in front (its other ways to run: a job, a schedule)."""
@@ -332,9 +338,9 @@ def node_checks(browser, port, show):
     shown = "folded" not in pg.cell(0).get_attribute("class") and pg.cell(0).locator("table").is_visible()
     p.keyboard.press("Escape")
     p.keyboard.press("?")
-    keys = until(lambda: p.locator("#helpDlg").get_attribute("open") is not None and p.locator("#keys kbd").count() > 20, True)
+    keys = until(lambda: p.locator("dialog.settings2[open] .s-body h4").inner_text() == "Keys" and p.locator("dialog.settings2 .keys-k kbd").count() > 20, True)
     p.keyboard.press("Escape")
-    checks["O hides a cell's output (its code stays) and a click shows it; ? lists every key"] = folded and shown and keys is True
+    checks["O hides a cell's output (its code stays) and a click shows it; ? lists every key (Settings, Keys)"] = folded and shown and keys is True
 
     p.fill("#nbname", "report")
     p.press("#nbname", "Enter")
@@ -457,7 +463,7 @@ def files_checks(browser, port, show):
     strip.locator("button.stmt").nth(1).click()
     second = until(lambda: pg.grid(body), [["a", "s"], [["1", "x;y"]]])
     pg.menu("Settings")
-    p.select_option("#setStatements", "last")
+    pg.setting("Editor and results", "A SQL file's statements").locator(".seg", has_text="The last one's").click()
     p.keyboard.press("Escape")
     p.click("#runBtn")
     last = until(lambda: body.locator(".err").count() == 1 and strip.count() == 0, True)  # (all at once: it stops at the failure too, one answer)
@@ -467,7 +473,7 @@ def files_checks(browser, port, show):
     p.click("#runBtn")
     only = until(lambda: pg.grid(body), [["b"], [["2"]]])
     pg.menu("Settings")
-    p.select_option("#setStatements", "each")
+    pg.setting("Editor and results", "A SQL file's statements").locator(".seg", has_text="An answer each").click()
     p.keyboard.press("Escape")
     checks["a SQL file's statements each get an answer (split as the node splits them), up to a failure; Settings can say the last one's only"] = \
         each == ["1 done", "2 1 row", "3 failed"] and left == "1 after it not run" and second == [["a", "s"], [["1", "x;y"]]] and last is True and only == [["b"], [["2"]]]
@@ -501,12 +507,16 @@ def files_checks(browser, port, show):
     p.fill("#askIn", "1 hour")
     p.press("#askIn", "Enter")
     task = until(lambda: sql(port, "SELECT name, schedule, statement FROM pondra.tasks"), [{"name": "scripts_by_region", "schedule": "1 hour", "statement": "CALL run('scripts/by_region.sql', region => 'r1')"}], 10)
-    listed = until(lambda: p.locator("#runs .run-item", has_text="scripts_by_region").count(), 1, 10)
-    p.locator("#runs .run-item", has_text="scripts_by_region").locator("button[aria-label^='Drop']").click()
+    job = p.locator("#jobs .job", has_text="scripts_by_region")
+    listed = until(lambda: job.count(), 1, 10)
+    cadence = job.locator(".cad").inner_text() if listed == 1 else None
+    job.locator("button[aria-label$='more']").click()
+    p.locator("#menu button", has_text="Drop it").click()
     dropped = until(lambda: sql(port, "SELECT count(*) AS n FROM pondra.tasks"), [{"n": 0}], 10)
+    gone = until(lambda: p.locator("#jobs .job").count(), 0, 10)
     p.locator("#rtabs .rtab", has_text="Details").click()
-    checks["a SQL file's $names each get an input, bound on the node; its ⋯ runs it as a job (History shows it) and schedules it (a task, dropped from History)"] = \
-        shown == ["$region"] and bound == [["n", "region"], [["10", "r1"]]] and ran is True and isinstance(task, list) and len(task) == 1 and listed == 1 and dropped == [{"n": 0}]
+    checks["a SQL file's $names each get an input, bound on the node; its Run ▾ runs it as a job (History shows it) and schedules it (Jobs shows it, apart from History, and drops it)"] = \
+        shown == ["$region"] and bound == [["n", "region"], [["10", "r1"]]] and ran is True and isinstance(task, list) and len(task) == 1 and listed == 1 and cadence == "every 1 hour" and dropped == [{"n": 0}] and gone == 0
     pg.workspace("scripts", "hello.py").click()
     until(lambda: pg.tab()[0], "hello.py")
     p.locator("#docbar button", has_text="Run file").click()
@@ -813,7 +823,7 @@ def folders_checks(browser, port, show):
         and cmds.count("Upload a file…") == 1 and not [x for x in cmds + welcome if "Open an" in x] and welcome == ["New notebook", "New SQL file", "New Python file", "New folder", "Upload a file…"]
     if show:
         pg.menu("Settings")
-        p.select_option("#setGroups", "workspace")
+        pg.setting("Layout", "The left pane").locator(".seg", has_text="Workspace first").click()
         p.keyboard.press("Escape")
         folder("projects").click(button="right")
         p.locator("#menu button", has_text="New SQL file here").click()
@@ -867,11 +877,126 @@ def grid_checks(browser, port, show):
     srt.click()
     srt.click()  # (again: the other way)
     down = until(lambda: pg.grid(c)[1][0][0], "9")
-    c.locator("thead th", has_text="s").hover()
+    th = c.locator("thead th", has_text="s")
+    th.hover()
     card = until(lambda: p.locator(".hcard").is_visible() and "VARCHAR" in p.locator(".hcard").inner_text(), True)
-    checks["a header's button sorts (again: the other way); its card tells its type"] = down == "9" and card is True
+    hb, cb = th.bounding_box(), p.locator(".hcard").bounding_box()
+    above = cb is not None and cb["y"] + cb["height"] <= hb["y"] + hb["height"] / 2  # (the pointer is at the header's middle)
+    checks["a header's button sorts (again: the other way); its card tells its type, above the pointer (it hides no rows)"] = down == "9" and card is True and above
+    # Pages (round 29): an answer of more rows than come at once turns its pages, kept on the node.
+    p.keyboard.press("Escape")
+    p.keyboard.press("b")
+    big = pg.run(1, "SELECT value AS n FROM range(0, 25000)")
+    rng = lambda: big.locator(".pager .pg-r").inner_text()
+    first = (rng(), [r[0] for r in pg.grid(big)[1][:1]])
+    big.locator(".pager .pg", has_text="3").click()
+    third = until(lambda: (rng(), pg.grid(big)[1][0][0]), ("20,001–25,000 of 25,000", "20000"))
+    big.locator(".gt tbody td[data-c]").first.click()
+    p.keyboard.press("Alt+PageUp")
+    second = until(lambda: (rng(), pg.grid(big)[1][0][0]), ("10,001–20,000 of 25,000", "10000"))
+    checks["an answer of more than 10,000 rows turns its pages (‹ 1 2 3 ›, Alt+Page Up): the node's rows, numbered on"] = \
+        first == ("1–10,000 of 25,000", ["0"]) and third == ("20,001–25,000 of 25,000", "20000") and second == ("10,001–20,000 of 25,000", "10000")
     checks["grid: no page errors"] = pg.errors == []
-    info = {"one": one, "edges": edges, "total": total, "copied": copied, "headed": headed, "moved": moved, "kept": kept, "errors": pg.errors}
+    info = {"one": one, "edges": edges, "total": total, "copied": copied, "headed": headed, "moved": moved, "kept": kept, "pages": [first, third, second], "errors": pg.errors}
+    pg.ctx.close()
+    return checks, info
+
+
+def work_checks(browser, port, show):
+    """Round 29's second list (the owner's): tabs pinned and scrolled, Format of the selection or
+    the file, Markdown drawn (cells and .md files), a SQL cell's Chart and Plan kept with its notebook."""
+    checks = {}
+    base = f"http://127.0.0.1:{port}"
+    sql(port, "CREATE TABLE IF NOT EXISTS wk AS SELECT value AS id, 'r' || (value % 3) AS region, value * 1.5 AS amount FROM range(0, 30)")
+    put(port, "wk/a.sql", b"select region,count(*) as n from wk group by region")
+    md = b"# Title\n\nSome **bold**, *italic*, ~~gone~~ and `code`; [a query](a.sql), [the web](https://example.org).\n\n- [x] done\n- [ ] to do\n  1. nested\n\n| a | b |\n|---|--:|\n| 1 | 2 |\n\n![a picture](p.png)\n\n```sql\nSELECT 1\n```\n"
+    put(port, "wk/notes.md", md)  # (its links and pictures read from its own folder, wk/)
+    import struct, zlib
+    chunk = lambda k, d: struct.pack(">I", len(d)) + k + d + struct.pack(">I", zlib.crc32(k + d))
+    png = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 2, 2, 8, 2, 0, 0, 0)) + chunk(b"IDAT", zlib.compress(b"\x00" + b"\x0b\x7f\x6a" * 2 + b"\x00" + b"\x0b\x7f\x6a" * 2)) + chunk(b"IEND", b"")
+    put(port, "wk/p.png", png)
+    pg = Page(browser, base + "/")
+    p = pg.p
+    pg.cells().first.wait_for(timeout=20000)
+
+    # Tabs: pinned at the left (kept after a reload), not closed with the others; many scroll, ⌄ lists them all
+    for i in range(10):
+        pg.menu("New SQL file")
+    tabs = p.locator("#tabbar .tab")
+    tabs.nth(3).click(button="right")
+    p.locator("#menu button", has_text="Pin").click()
+    pinned = until(lambda: p.locator("#tabbar .pins .tab").count(), 1)
+    over = p.locator("#tabbar .tlist").evaluate("l => l.scrollWidth > l.clientWidth") and p.locator("#tabbar .tmore").is_visible()
+    p.locator("#tabbar .tmore").click()
+    listed = len([x for x in p.locator("#menu button").all_inner_texts() if x.strip()])
+    p.keyboard.press("Escape")
+    n = tabs.count()
+    tabs.nth(n - 1).click(button="right")
+    p.locator("#menu button", has_text="Close others").click()
+    left = until(lambda: (p.locator("#tabbar .tab").count(), p.locator("#tabbar .tab.pinned").count()), (2, 1))
+    checks["tabs: one pinned stays at the left and isn't closed with the others; many scroll, and ⌄ lists them all"] = pinned == 1 and over and listed == n and left == (2, 1)
+
+    # Format: the file, or only what is selected
+    pg.workspace("wk", "a.sql").click()
+    until(lambda: pg.tab()[0], "a.sql")
+    pg.p.locator("#docbar .split .caret").first.click()
+    items = p.locator("#menu button").all_inner_texts()
+    sel_off = p.locator("#menu button", has_text="Format selection").is_disabled()
+    p.keyboard.press("Escape")
+    ta = p.locator(".filedoc:visible .editor textarea")
+    ta.evaluate("t => { t.value = 'select 1;\\nselect a from wk'; t.dispatchEvent(new Event('input')); t.focus(); t.setSelectionRange(0, 9); }")
+    pg.runmenu("Format selection")
+    part = until(lambda: ta.input_value(), "SELECT 1;\nselect a from wk")
+    pg.runmenu("Format file")
+    whole = until(lambda: "SELECT a\nFROM wk" in ta.input_value() and ta.input_value(), secs=5)
+    checks["Format: the Run ▾ has Format file and Format selection (off with nothing selected); each formats what it says"] = \
+        any(x.startswith("Format file") for x in items) and sel_off and part == "SELECT 1;\nselect a from wk" and bool(whole) and whole.startswith("SELECT 1;")
+
+    # Markdown: a .md file's preview, and a notebook's Markdown cell
+    pg.workspace("wk", "notes.md").click()
+    until(lambda: pg.tab()[0], "notes.md")
+    p.locator("#docbar button", has_text="Preview").click()
+    view = p.locator(".mdfile")
+    view.locator("h1").wait_for(timeout=10000)
+    drawn = view.evaluate("""v => [v.querySelector('h1')?.textContent, v.querySelectorAll('p strong,p em,p del,p code').length, v.querySelectorAll('li.task input').length, v.querySelector('li.task input')?.checked,
+        !!v.querySelector('ol li'), v.querySelectorAll('table td').length, v.querySelector('td[style]')?.style.textAlign, v.querySelector('a[target=_blank]')?.getAttribute('href'), v.querySelector('pre .k')?.textContent]""")
+    pic = until(lambda: view.locator("img").evaluate("i => i.complete && i.naturalWidth"), 2)  # (the 2×2 picture, read from the lake)
+    view.locator("a", has_text="a query").click()
+    opened = until(lambda: pg.tab()[0], "a.sql")
+    checks["Markdown drawn: headings, bold, italic, strikethrough, code, tasks, nested lists, tables (aligned), links (a lake file opens in a tab), pictures (read from the lake), SQL highlighted"] = \
+        drawn == ["Title", 4, 2, True, True, 2, "right", "https://example.org", "SELECT"] and pic == 2 and opened == "a.sql"
+    pg.menu("New notebook")
+    kinds = pg.cell(0).locator(".kind")
+    kinds.click()
+    menu_kinds = p.locator("#menu button").all_inner_texts()
+    p.locator("#menu button", has_text="Markdown").click()
+    pg.cell(0).locator("textarea").fill("## Sales\n\n| a |\n|---|\n| 1 |")
+    pg.cell(0).locator("textarea").press("Shift+Enter")
+    cell_md = until(lambda: (pg.cell(0).locator(".md h2").inner_text(), pg.cell(0).locator(".md td").count()), ("Sales", 1))
+    checks["a notebook's cell kinds are SQL, Python and Markdown; a Markdown cell draws its table"] = [x.strip() for x in menu_kinds] == ["SQL", "Python", "Markdown"] and cell_md == ("Sales", 1)
+
+    # A SQL cell's Chart and Plan, as a SQL file's pane has them; the chart open is kept with the notebook
+    c = pg.run(1, "SELECT region, sum(amount) AS total FROM wk GROUP BY region ORDER BY region")
+    c.locator(".meta button.view", has_text="Plan").click()
+    plan = until(lambda: c.locator(".pgraph .pn").count() > 1, True, 10)
+    c.locator(".meta button.view", has_text="Chart").click()
+    chart = until(lambda: c.locator(".chart svg").count() > 0 and c.locator(".meta button.view.on").all_inner_texts() == ["Chart"], True, 10)
+    p.fill("#nbname", "wkbook")
+    p.press("#nbname", "Enter")
+    p.keyboard.press("Control+s")
+    saved = until(lambda: sql(port, "SELECT count(*) AS n FROM files('notebooks/wkbook/')"), [{"n": 1}])
+    path = sql(port, "SELECT path FROM files('notebooks/wkbook/')")[0]["path"] if saved == [{"n": 1}] else ""
+    got = call(port, "GET", "/" + path) if path else {}
+    got = json.loads(got) if isinstance(got, (bytes, str)) else got
+    meta = (got.get("cells") or [{}, {}])[1].get("metadata", {})
+    other = Page(browser, base + "/#notebook=wkbook")
+    oc = other.cell(1)
+    again = until(lambda: oc.locator(".chart svg").count() > 0 and oc.locator(".meta button.view.on").all_inner_texts() == ["Chart"], True, 15)
+    other.ctx.close()
+    checks["a SQL cell's answer has Chart and Plan (its graph), as a SQL file's pane; the chart open, and its settings, are kept with the notebook"] = \
+        plan is True and chart is True and meta.get("pondra", {}).get("view") == "chart" and meta["pondra"].get("chart", {}).get("x") == "region" and again is True
+    checks["the owner's second list: no page errors"] = pg.errors == []
+    info = {"left": left, "items": items, "formatted": [part, whole], "drawn": drawn, "picture": pic, "opened": opened, "kinds": menu_kinds, "meta": meta, "errors": pg.errors}
     pg.ctx.close()
     return checks, info
 
@@ -914,19 +1039,27 @@ def layout_checks(browser, port, show):
     back = p.locator("#left .group h2").all_inner_texts()
     checks["a view moves to the other pane by its ⋯ (kept after a reload), and back"] = "Workspace" in moved[0] and moved[1] == ["Data"] and kept and back == ["Data", "Workspace"]
     pg.menu("Settings")
-    p.select_option("#setGroups", "workspace")
+    sections = p.locator("dialog.settings2 .s-i").all_inner_texts()
+    pg.setting("Layout", "The left pane").locator(".seg", has_text="Workspace first").click()
     first = p.locator("#left .group h2").all_inner_texts()
-    p.select_option("#setTheme", "dark")
+    pg.setting("Appearance")
+    p.locator("dialog.settings2 .theme", has_text="Dark").click()
     dark = p.evaluate("document.documentElement.dataset.theme") == "dark" and p.evaluate("getComputedStyle(document.body).backgroundColor") != "rgb(255, 255, 255)"
-    p.select_option("#setGroups", "data")
-    p.select_option("#setTheme", "system")
+    pg.setting("Layout", "The left pane").locator(".seg", has_text="Data first").click()
+    pg.setting("Appearance")
+    p.locator("dialog.settings2 .theme", has_text="As the system").click()
+    p.locator("dialog.settings2 .s-find").fill("statements")
+    found = until(lambda: p.locator("dialog.settings2 .s-body .s-n").all_inner_texts(), ["A SQL file's statements"])
+    p.locator("dialog.settings2 .s-find").fill("")
     p.keyboard.press("Escape")
-    checks["Settings: Workspace first (Data first by default), and the dark theme"] = first == ["Workspace", "Data"] and dark \
+    checks["Settings: sections (Appearance, Editor and results, Layout, Keys, Python, About) and a search across them; Workspace first (Data first by default), and the dark theme"] = \
+        sections == ["Appearance", "Editor and results", "Layout", "Keys", "Python", "About"] and found == ["A SQL file's statements"] and first == ["Workspace", "Data"] and dark \
         and p.locator("#left .group h2").all_inner_texts() == ["Data", "Workspace"]
     # Kept on the machine (round 29): another browser (no storage of its own) opens with them.
     pg.menu("Settings")
-    p.select_option("#setTheme", "dark")
-    p.locator("#setBg").evaluate("(el) => { el.value = '#203040'; el.dispatchEvent(new Event('input', { bubbles: true })); }")
+    pg.setting("Appearance")
+    p.locator("dialog.settings2 .theme", has_text="Dark").click()
+    pg.setting("Appearance", "Background").locator("input[type=color]").evaluate("(el) => { el.value = '#203040'; el.dispatchEvent(new Event('input', { bubbles: true })); }")
     p.keyboard.press("Escape")
     kept_json = until(lambda: json.loads(urllib.request.urlopen(f"http://127.0.0.1:{port}/console/settings").read()).get("theme"), "dark")
     other = Page(browser, f"http://127.0.0.1:{port}/")
@@ -934,8 +1067,11 @@ def layout_checks(browser, port, show):
     there = until(lambda: (other.p.evaluate("document.documentElement.dataset.theme"), other.p.evaluate("getComputedStyle(document.documentElement).getPropertyValue('--surface').trim()")), ("dark", "#203040"))
     other.ctx.close()
     pg.menu("Settings")
-    p.select_option("#setTheme", "light")
-    p.locator("#setBgReset").click()
+    pg.setting("Appearance")
+    p.locator("dialog.settings2 .theme", has_text="Light").click()
+    p.locator("dialog.settings2 .theme", has_text="Dark").click()  # (the dark theme's background, set above: back to its default)
+    pg.setting("Appearance", "Background").locator("button", has_text="Default").click()
+    p.locator("dialog.settings2 .theme", has_text="Light").click()
     p.keyboard.press("Escape")
     light = until(lambda: json.loads(urllib.request.urlopen(f"http://127.0.0.1:{port}/console/settings").read()).get("theme"), "light")
     checks["Settings are kept on the machine: another browser opens with the dark theme and the background picked; light is the first theme"] = \
@@ -1026,12 +1162,12 @@ def budget_checks(browser, port, show):
             fresh[name] = e.code
     total = sum(sizes.values()) if all(sizes.values()) else None
     later = {}
-    for name in ["chart.js", "plan.js", "more.js", "details.js", "more.css", "data.js"]:  # (loaded when first used)
+    for name in ["chart.js", "plan.js", "more.js", "details.js", "more.css", "data.js", "md.js", "jobs.js", "settings.js"]:  # (loaded when first used)
         r = urllib.request.urlopen(urllib.request.Request(f"{base}/console/{name}", headers={"accept-encoding": "gzip"}))
         later[name] = len(r.read()) if r.headers.get("content-encoding") == "gzip" else None
     checks["the scripts and style sheet the page loads, gzipped as the node serves them: <= 70 KB; each answers 304 when the browser has it"] = total is not None and total <= 70 * 1024 \
         and set(fresh.values()) == {304}
-    checks["those loaded when first used (a chart, a plan, History and Settings, details, a data file): <= 8 KB each, gzipped"] = all(v is not None and v <= 8 * 1024 for v in later.values())
+    checks["those loaded when first used (a chart, a plan, History, details, a data file, Markdown, Jobs, Settings): <= 8 KB each, gzipped"] = all(v is not None and v <= 8 * 1024 for v in later.values())
     paints = []
     for _ in range(3):
         pg = Page(browser, base + "/")
@@ -1171,7 +1307,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8890)
     ap.add_argument("--show", help="keep screenshots here")
-    ap.add_argument("--only", help="run only these parts (node, files, grid, layout, budget, tokens, server, extensions), separated by commas")
+    ap.add_argument("--only", help="run only these parts (node, files, grid, work, layout, budget, tokens, server, extensions), separated by commas")
     A = harness.A = ap.parse_args()
     A.s3, A.keep = False, False
     if A.show:
@@ -1184,7 +1320,7 @@ def main():
     try:
         with sync_playwright() as pw:
             browser = pw.chromium.launch()
-            parts = [("node", lambda: node_checks(browser, A.port, A.show)), ("files", lambda: files_checks(browser, A.port, A.show)), ("grid", lambda: grid_checks(browser, A.port, A.show)),
+            parts = [("node", lambda: node_checks(browser, A.port, A.show)), ("files", lambda: files_checks(browser, A.port, A.show)), ("grid", lambda: grid_checks(browser, A.port, A.show)), ("work", lambda: work_checks(browser, A.port, A.show)),
                      ("layout", lambda: layout_checks(browser, A.port, A.show)), ("budget", lambda: budget_checks(browser, A.port, A.show)),
                      ("tokens", lambda: token_checks(browser, A.port + 1)), ("server", lambda: server_checks(browser, A.port + 2)), ("extensions", lambda: ext_checks(browser, A.port + 3))]
             for part, f in parts:

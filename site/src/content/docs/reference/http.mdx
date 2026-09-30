@@ -37,6 +37,7 @@ curl -s -H "Authorization: Bearer $PONDRA_TOKEN" -X POST http://localhost:8080/s
 | Method and path | Role | Meaning |
 |---|---|---|
 | `POST /sql` | read (write and admin for statements that change things) | run one or more statements; answer with the last one's rows or outcome |
+| `GET /sql/pages/{id}?from=&rows=` | read | more rows of an answer of more than 10,000 (`format=typed`'s `pages`), kept on the node a while: `410` once it isn't |
 
 The body is SQL text. To send parameters, send JSON with `Content-Type: application/json`:
 `{"sql": "…", "params": {"min": 5}}`. Parameters are `$name` in the SQL; a value is JSON, or
@@ -56,10 +57,32 @@ of its object. A statement that isn't a query answers a JSON object, such as `{"
 `{"table": "t", "publish": []}`. Several statements in one request run in order.
 
 `format=typed` is what [the console](/pondra/start/console/) uses: `{"columns": [{"name", "type"}],
-"rows": [[…], …], "total": N}`. Each row is a list in the columns' order, so two columns may share a
-name (a join's). It holds the first 10,000 rows, and `total` says how many there were. Decimals come
-as text with all their digits (`"1.50"`), and so do integers past 2^53, which JavaScript can't hold
-exactly.
+"rows": [[…], …], "total": N, "pages": "…"}`. Each row is a list in the columns' order, so two
+columns may share a name (a join's). It holds the first 10,000 rows, and `total` says how many there
+were. Decimals come as text with all their digits (`"1.50"`), and so do integers past 2^53, which
+JavaScript can't hold exactly.
+
+An answer of more than 10,000 rows is kept on the node a while, and `pages` is its id (else `null`).
+`GET /sql/pages/{id}?from=10000&rows=10000` answers more of its rows, in the same form: the same rows
+in the same order, without running the query again. The node keeps such answers within
+`PONDRA_PAGES_MB` (256) in all, for 20 minutes after each was last read; one no longer kept answers
+`410`, and the query can be run again (`LIMIT … OFFSET …`). The id is random: only whoever was sent
+the answer knows it, and reading a page needs the read token, as `/sql` does.
+
+```python
+import json, urllib.request
+
+def post(sql):
+    return json.load(urllib.request.urlopen(urllib.request.Request("http://localhost:8080/sql?format=typed", sql.encode(), method="POST")))
+
+first = post("SELECT value AS n FROM range(0, 25000)")
+more = json.load(urllib.request.urlopen(f"http://localhost:8080/sql/pages/{first['pages']}?from=20000&rows=10000"))
+print(first["total"], len(first["rows"]), len(more["rows"]), more["rows"][0])
+```
+
+```text
+25000 10000 5000 [20000]
+```
 
 The header `x-pondra-notices` on an answer carries what procedures and `DO` blocks printed, as a
 JSON list of lines. Send `x-pondra-session: <id>` (8 to 128 letters, digits, `-` or `_`) to use temporary tables that only that id sees, and

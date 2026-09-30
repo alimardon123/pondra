@@ -117,6 +117,7 @@ pub fn router(app: App) -> Router {
         .route("/cluster/files", post(files))
         .route("/", get(crate::console::page))
         .route("/sql", post(sql))
+        .route("/sql/pages/{id}", get(page))
         .route("/mcp", post(crate::mcp::handle))
         .route("/files/{*path}", put(put_file).get(get_file).delete(delete_file))
         .route("/lookup/{name}/{key}", get(lookup))
@@ -966,11 +967,13 @@ pub fn render(batches: &[RecordBatch], format: Option<&str>) -> anyhow::Result<b
     }))
 }
 
+/// The rows of an answer the console is sent at once: a page.
+const SHOWN: usize = 10_000;
+
 /// The console's answer (`?format=typed`, `console/console.js`): the columns with their types, the
-/// first `SHOWN` rows as lists in the columns' order (two columns may share a name: a join's), and
-/// how many rows there were.
+/// first `SHOWN` rows as lists in the columns' order (two columns may share a name: a join's), how
+/// many rows there were, and, when there were more, the id its other pages are read with (`page`).
 fn typed(batches: &[RecordBatch]) -> anyhow::Result<Vec<u8>> {
-    const SHOWN: usize = 10_000;
     let columns: Vec<Value> = batches.first().map(|b| b.schema().fields().iter().map(|f| j!({"name": f.name(), "type": crate::query::type_name(f.data_type())})).collect()).unwrap_or_default();
     let mut w = arrow_json::ArrayWriter::new(Vec::new());
     let mut left = SHOWN;
@@ -988,7 +991,19 @@ fn typed(batches: &[RecordBatch]) -> anyhow::Result<Vec<u8>> {
     let objects: Vec<serde_json::Map<String, Value>> = serde_json::from_slice(&w.into_inner()).unwrap_or_default();
     let rows: Vec<Value> = objects.into_iter().map(|mut o| Value::Array((0..columns.len()).map(|i| o.remove(&i.to_string()).unwrap_or(Value::Null)).collect())).collect();
     let total: usize = batches.iter().map(|b| b.num_rows()).sum();
-    Ok(serde_json::to_vec(&j!({"columns": columns, "rows": rows, "total": total}))?)
+    let pages = if total > SHOWN { crate::pages::keep(batches) } else { None };
+    Ok(serde_json::to_vec(&j!({"columns": columns, "rows": rows, "total": total, "pages": pages}))?)
+}
+
+/// `GET /sql/pages/{id}?from=10000&rows=10000`: more rows of an answer the console was sent the
+/// first page of (`pages.rs`), as `typed` has them; 410 once it is no longer kept (run it again).
+async fn page(Path(id): Path<String>, Query(q): Query<HashMap<String, usize>>) -> Response {
+    let (from, rows) = (q.get("from").copied().unwrap_or(0), q.get("rows").copied().unwrap_or(SHOWN).min(SHOWN));
+    match crate::pages::page(&id, from, rows).map(|b| typed(&b)) {
+        Some(Ok(body)) => ([("content-type", "application/json")], body).into_response(),
+        Some(Err(e)) => E(e).into_response(),
+        None => (StatusCode::GONE, "this answer's rows are no longer kept here: run it again").into_response(),
+    }
 }
 
 /// A column as JavaScript can hold it exactly: decimals as their digits (`1.50`), and 64-bit

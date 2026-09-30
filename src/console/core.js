@@ -98,6 +98,8 @@ export const ICONS = {
   sort: '<path d="M8 5v14M4.5 15.5 8 19l3.5-3.5M16 19V5m-3.5 3.5L16 5l3.5 3.5"/>',
   trash: '<path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13"/>',
   clear: '<path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13"/>',
+  calendar: '<rect x="3.5" y="5" width="17" height="15" rx="2.5"/><path d="M3.5 10h17M8.5 3v4M15.5 3v4M8 14h3"/>',
+  pin: '<path d="M9.5 3.5h5l-.8 5.2 3.3 3.3v1.5H7v-1.5l3.3-3.3zM12 13.5v7"/>',
   eye: '<path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>',
   keyboard: '<rect x="2" y="6" width="20" height="13" rx="2"/><path d="M6 10h.01M10 10h.01M14 10h.01M18 10h.01M7 15h10"/>',
   pencil: '<path d="M4 20h4L19 9l-4-4L4 16z"/><path d="m13.5 6.5 4 4"/>',
@@ -172,6 +174,10 @@ export const register = {
   command(o) { R.commands.set(o.id, o); },
   /** A key, listed under ?: `{ keys: 'd d', title, run(cell), group }` (on a notebook cell after Esc, if it runs). */
   key(o) { R.keys = R.keys.filter(x => x.keys !== o.keys || x.group !== o.group).concat(o); shell.redraw(); },
+  /** A kind of job, a section of Jobs: `{ id, title, load() → items, item(x) → element, empty, order }` (schedules; round 30's pipelines). */
+  jobKind(o) { R.jobKinds = put(R.jobKinds || [], o); },
+  /** A section of Settings: `{ id, title, group, icon, about, rows() → [[label, about, control]], order }` (an enterprise build's users, tokens, audit). */
+  setting(o) { R.settings = put(R.settings || [], o); },
 };
 /** How the page reaches the node: `fetch`, the token, extra headers (an enterprise build's gateway
  * and sign-in replace them). */
@@ -221,7 +227,7 @@ export async function run(sql, signal, params) {
   let notices = [];
   try { notices = JSON.parse(r.headers.get('x-pondra-notices') || '[]'); } catch { /* (none) */ }
   const v = await r.json();
-  if (v && Array.isArray(v.columns) && Array.isArray(v.rows)) return { kind: 'rows', columns: v.columns, rows: v.rows, total: v.total ?? v.rows.length, notices };
+  if (v && Array.isArray(v.columns) && Array.isArray(v.rows)) return { kind: 'rows', columns: v.columns, rows: v.rows, total: v.total ?? v.rows.length, pages: v.pages, notices }; // (pages: its other rows' id on the node)
   return { kind: 'done', value: v, notices };
 }
 /** A query's rows as objects (the console's own queries). */

@@ -422,3 +422,73 @@ notebook) at 1440, 1024 and 760 px, light and dark, measured it, and fixed what 
   key (the textarea lays out its whole text on every change): a line-virtualized editor is the fix,
   planned rather than patched.
 
+
+### The owner's second list (round 29, 2026-10-01)
+
+From screenshots of the reviewed console. Built in round 29; *decided by Claude where marked*:
+
+- **Markdown cells.** The notebook's "Text" cell is a **Markdown** cell (the kind's name, its menu,
+  its `+`, its key M). It is drawn as GitHub draws Markdown: headings (ATX and underlined), bold,
+  italic, strikethrough, code spans, links (inline, `<url>`, bare `https://`, by reference), pictures,
+  lists nested and numbered and of tasks, quotes (with blocks inside), tables with aligned columns,
+  rules, code blocks with SQL and Python highlighted, hard breaks. *(Decided by Claude:)* the text's
+  own HTML shows as text, but for a few tags that can't run anything (`<br>`, `<kbd>`, `<sub>`,
+  `<sup>`, `<u>`, `<mark>`, `<b>`, `<i>`…): a notebook is shared, so its Markdown is never a way to
+  run script in someone else's page. A link or picture without a scheme is a file of the lake's: a
+  link opens it in a tab, a picture is read with the page's token (so a node with tokens shows it).
+  `javascript:` and other schemes are not followed. The renderer is `md.js` (loaded with the first
+  Markdown drawn, 3.9 KB), not a library; a `.md` file's **Preview** uses it too. No math:
+  KaTeX alone is larger than the page's whole budget.
+- **A SQL cell's answer has what a SQL file's pane has.** Chart was there; **Plan** (the graph and
+  its Profile) is added beside it, one open at a time under the answer. The one open, and the
+  chart's settings (by the columns' names), are kept in the cell's metadata (`pondra.view`,
+  `pondra.chart`), so a notebook opens with its charts, as Databricks' do; a chart kept its settings
+  across runs in a SQL file too.
+- **Tabs.** *(Decided by Claude:)* tabs keep their names' width and scroll, rather than shrinking to
+  unreadable stubs: the wheel scrolls them, a thin bar above them shows where the view is (dragged,
+  it scrolls; the native bar would have pushed the tabs off their line), and **⌄** lists them all.
+  **Pin** (a tab's right-click) keeps a tab at the left, sticky while the others scroll under it,
+  with a pin for its ✕; **Close others, to the right, saved, all** leave pinned tabs alone, as VS
+  Code does. Pinned tabs are pinned again next time.
+- **Pages of rows.** An answer of more than 10,000 rows turns its pages: `‹ 1 … 4 5 6 … 20 ›` below
+  the grid (… asks for a page; Alt+Page Down and Up), and `10,001–20,000 of 200,000`. *(Decided by
+  Claude:)* the node keeps the answer it already computed, rather than the page running the query
+  again with `LIMIT … OFFSET …`: a page is then the same rows in the same order (a query without
+  `ORDER BY` needn't give the same order twice), and turning one costs slicing batches in memory, not
+  a query. `pages.rs` keeps them within `PONDRA_PAGES_MB` (256), 20 minutes after each was last read,
+  the least lately read going first; an id is random, and reading a page needs the read token.
+  When a page is gone (410) the query runs again for it. The grid is the same grid: its rows are the
+  page's, numbered on (10,001…), its sort and filter of the page. DataGrip pages by 500 and DBeaver
+  by 200 because each page is a fetch over JDBC; here a page is 10,000 rows because the grid draws
+  only what is in sight. Measured on 200,000 orders: a page turned in 22 ms on the node (10,000 rows,
+  600 KB of JSON), against 47 ms for the same page by `LIMIT … OFFSET …`, a gap that grows with
+  what the query costs.
+- **Jobs, apart from History.** History is what ran; **Jobs** is what runs on its own: a right-pane
+  view (and the calendar in the top bar) with a section a kind of job. Schedules are the first: a
+  card each with its last run's state, how often and when next, a bar for each of its last 16 runs
+  (height its time, red if it failed), its statement, and **Run now**, **Edit**, its ⋯ (open the
+  file, copy, drop), and **New schedule**. History tags a schedule's runs with its name.
+  *(Decided by Claude:)* a kind of job is `register.jobKind({ id, title, load, item })`, so round
+  30's pipelines are one more section, not a new view, and an extension or an enterprise build adds
+  its own the same way. **Run now** starts a `CALL` as a job (`pondra.start`), so it runs as a
+  scheduled tick does, without the page waiting.
+- **The Data tree.** A column sat left of its table's icon, so columns read as siblings of the
+  table. Columns are a level in, under the table's name; every group has a faint guide line down
+  from its arrow; columns are a size smaller and muted, their types smaller still.
+- **A header's card** shows above the pointer (below it only with no room above), so it hides no
+  rows.
+- **Format selection and Format file** are both in every menu that formats (the Run ▾, the editor's
+  right-click, a cell's), shortly named, the one Shift+Alt+F does marked. A whole file formatted
+  keeps the caret where it was, rather than selecting everything. The Run ▾ reads **Run
+  selection**, **Run file**.
+- **Settings** is a window of sections: at the left, grouped (*Personal*: Appearance, Editor and
+  results, Layout, Keys; *This node*: Python, About), each a list of settings with what each does,
+  and **Search settings** across them. The theme is three pictures; the accent a row of colours and
+  one of your own. **Keys** is a section (**?** opens it), so the old Keys dialog is gone.
+  *(Decided by Claude:)* sections are `register.setting({ id, title, group, rows })`, so what round
+  29's second part brings (users and roles, tokens, audit, quotas) and an enterprise build's
+  settings are sections under their own heading, not another dialog.
+- **The budget.** These put the first load at 71.7 KB. *(Decided by Claude:)* Markdown's renderer
+  and style (`md.js`), Jobs (`jobs.js`), Settings and the key list (`settings.js`), and the files'
+  actions (rename, delete, upload, new folder: `more.js`) load when first used: 69.5 KB, and each
+  on-demand module under 8 KB.

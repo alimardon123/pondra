@@ -52,6 +52,7 @@ PONDRA_SECRET_KEY="$SECRET" pondra serve lake
 | `PONDRA_FILES_CACHE_MB` | `512` | the memory cache for files read from outside the lake, such as attached Delta and Iceberg tables and URLs |
 | `PONDRA_FUNCTION_CACHE_MB` | `256` | the memory for answers a function keeps with `cache = '…'` |
 | `PONDRA_TEMP_MB` | `1024` | the memory all temporary tables on a node may hold together. A change past it is refused |
+| `PONDRA_PAGES_MB` | `256` | the memory for answers of more than 10,000 rows that a node keeps, so the console turns their pages (`GET /sql/pages/{id}`) without running them again. Each is kept 20 minutes after it was last read; past this size, the least lately read go first |
 | `PONDRA_CONFIG_DIR` | `%APPDATA%\pondra` on Windows, `~/Library/Application Support/pondra` on a Mac, `~/.config/pondra` elsewhere | where a node keeps what it keeps for its machine: the console's [settings](/pondra/start/console/#settings) (`console.json`) and the Python chosen in it (`python.txt`) |
 | `PONDRA_CONSOLE_EXTENSIONS` | none | scripts the console loads after its own, separated as `PATH` is: an [extension](/pondra/start/console/#extend-it) adds sections, tabs, views of answers and actions. Served at `/console/ext/{n}.js` |
 | `PONDRA_SESSION_IDLE_SECS` | `3600` | a session idle this long ends. Its temporary tables go, and so does its [Python](/pondra/guides/functions-and-procedures/#cells-that-share-variables), with the variables its `DO LANGUAGE python` blocks made |

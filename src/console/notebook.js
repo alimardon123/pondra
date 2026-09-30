@@ -1,8 +1,10 @@
-// Notebooks (ADR-030, ADR-034): SQL, Python and text cells in a tab, saved in the lake as
+// Notebooks (ADR-030, ADR-034): SQL, Python and Markdown cells in a tab, saved in the lake as
 // Jupyter notebooks (`files/notebooks/<name>/<time>.ipynb`, a version per save), or, anywhere
 // else, as one plain `.ipynb` file, saved in place like a SQL file.
 import { h, $, icon, esc, secs, count, S, R, emit, call, rows, fileUrl, toast, menu, saveAs, numeric, Failure, said, failed, readFile, writeFile, interruptPython, formatPython } from './core.js';
-import { Editor, markdown, formatSql } from './editor.js';
+import { Editor, formatSql } from './editor.js';
+/** A Markdown cell's text drawn (md.js: loaded when a notebook first has one). */
+const drawMd = async (el, src) => { const m = await import('./md.js'); m.render(el, src); };
 
 // ------------------------------------------------------------------ what a cell answered
 export function doneText(v) {
@@ -30,8 +32,8 @@ export class Cell {
     this.id = /^[A-Za-z0-9_-]{1,64}$/.test(o.id || '') ? o.id : newId();
     this.kind = o.kind || 'sql';
     this.result = null; this.count = null; this.ctl = null; this.stream = null;
-    // (a press on it keeps the text's focus: a text cell being edited stays open while its menu is)
-    this.kindSel = h('button', { class: 'kind', 'aria-haspopup': 'menu', 'aria-label': 'Kind of cell', title: 'SQL, Python or text (S, P, M)', onmousedown: e => e.preventDefault(), onclick: e => this.kindMenu(e.currentTarget) });
+    // (a press on it keeps the text's focus: a Markdown cell being edited stays open while its menu is)
+    this.kindSel = h('button', { class: 'kind', 'aria-haspopup': 'menu', 'aria-label': 'Kind of cell', title: 'SQL, Python or Markdown (S, P, M)', onmousedown: e => e.preventDefault(), onclick: e => this.kindMenu(e.currentTarget) });
     this.runBtn = h('button', { class: 'run', title: 'Run (Ctrl+Enter)', onclick: () => this.ctl ? this.stop() : this.run() });
     this.idle();
     this.liveBox = h('input', { type: 'checkbox', onchange: () => this.setLive(this.liveBox.checked) });
@@ -45,19 +47,19 @@ export class Cell {
         tool('plus', 'Add a cell below (B)', () => nb.add({ kind: this.kind === 'markdown' ? 'sql' : this.kind }, this, true).edit()),
         tool('dots', 'More', e => menu(e.currentTarget, [{ label: 'Run the cells above', icon: 'arrowUp', run: () => nb.runSome(0, i()) }, { label: 'Run this and the cells below', icon: 'arrowDown', run: () => nb.runSome(i()) }, '-',
           { label: this.el.classList.contains('folded') ? 'Show the output' : 'Hide the output', icon: 'eye', keys: 'O', run: () => this.fold() }, { label: 'Clear the output', icon: 'clear', run: () => this.clear() }, '-',
-          ...[...R.kinds.values()].map(k => ({ label: `Make it ${k.label === 'Text' ? 'text' : k.label}`, checked: k.id === this.kind, run: () => { this.setKind(k.id); this.edit(); } })), '-',
+          ...[...R.kinds.values()].map(k => ({ label: `Make it ${k.label}`, checked: k.id === this.kind, run: () => { this.setKind(k.id); this.edit(); } })), '-',
           { label: 'Delete the cell', icon: 'trash', keys: 'D D', run: () => nb.remove(this) }]))));
     this.ed = new Editor({ grow: true, value: o.src || '', label: 'Code', oninput: () => nb.changed(), onkey: e => this.key(e) });
-    this.ed.menu = some => ['-', { label: 'Run the cell', icon: 'play', keys: 'Ctrl Enter', run: () => this.run() },
-      this.fmt ? { label: some ? 'Format the selection' : 'Format the cell', icon: 'format', keys: 'Shift Alt F', run: () => this.format() } : null];
+    this.ed.menu = () => ['-', { label: 'Run cell', icon: 'play', keys: 'Ctrl Enter', run: () => this.run() }, ...this.fmt ? this.ed.formats(this.fmt, 'cell', true) : []];
     this.ta = this.ed.ta;
     this.md = h('div', { class: 'md', ondblclick: () => this.edit() });
     this.out = h('div', { class: 'out', onclick: () => { if (this.el.classList.contains('folded')) this.fold(false); } });
     this.el = h('section', { class: 'cell', tabindex: '-1', 'data-kind': this.kind }, this.bar, h('div', { class: 'ed' }, this.ed.el), this.md, this.out);
     this.el.cell = this;
     this.ta.addEventListener('focus', () => { nb.select(this); this.el.classList.add('editing'); nb.last = this; });
-    this.ta.addEventListener('blur', () => { if (this.kind === 'markdown') this.md.innerHTML = markdown(this.src); this.el.classList.remove('editing'); });
+    this.ta.addEventListener('blur', () => { if (this.kind === 'markdown') drawMd(this.md, this.src); this.el.classList.remove('editing'); });
     this.el.addEventListener('mousedown', e => { if (!e.target.closest('textarea,button,select,input,a,label,.grid')) nb.select(this); });
+    this.chartKeep = { st: o.chart }; this.view = o.view || null; // (its answer's chart, and the view of it open: kept with the notebook)
     this.setKind(this.kind, true);
     if (o.live) { this.liveBox.checked = true; this.status.textContent = 'live once run'; }
     if (o.out) this.show(o.out, true);
@@ -75,7 +77,7 @@ export class Cell {
     this.liveEl.hidden = !this.type.live;
     if (!this.type.live) { this.stopLive(); this.liveBox.checked = false; }
     this.ta.placeholder = this.type.placeholder || '';
-    if (k === 'markdown') this.md.innerHTML = markdown(this.src);
+    if (k === 'markdown') drawMd(this.md, this.src);
     this.ed.setLanguage(this.type.language || k);
     if (!quiet) this.nb.changed();
   }
@@ -100,11 +102,11 @@ export class Cell {
     if (e.shiftKey && e.altKey && e.key.toLowerCase() === 'f' && this.fmt) { e.preventDefault(); this.format(); return true; }
     return false;
   }
-  /** How its kind is formatted: SQL here, Python by the node's Python (ruff or black); text isn't. */
+  /** How its kind is formatted: SQL here, Python by the node's Python (ruff or black); Markdown isn't. */
   get fmt() { return this.kind === 'sql' ? formatSql : this.kind === 'python' ? formatPython : null; }
   format() { if (this.fmt) this.ed.reformat(this.fmt); }
   async run() {
-    if (!this.type.run) { this.md.innerHTML = markdown(this.src); this.ta.blur(); this.el.focus({ preventScroll: true }); return { kind: 'done' }; }
+    if (!this.type.run) { drawMd(this.md, this.src); this.ta.blur(); this.el.focus({ preventScroll: true }); return { kind: 'done' }; }
     const text = this.src.trim();
     if (!text) return { kind: 'done' };
     this.stopLive();
@@ -126,6 +128,7 @@ export class Cell {
       this.idle(); this.nb.running();
     }
     r.ms = performance.now() - t0;
+    if (this.kind === 'sql') r.src = text; // (its plan: of what ran)
     // (one query: Download can fetch every row of it again, not only those shown)
     if (this.kind === 'sql' && r.kind === 'rows' && !text.replace(/;\s*$/, '').includes(';') && /^\s*(select|with|from|values|table)\b/i.test(text.replace(/--[^\n]*|\/\*[\s\S]*?\*\//g, ' '))) r.sql = text;
     this.show(r);
@@ -195,6 +198,8 @@ function textTable(columns, rs, total) {
   return [fmt(cells[0]), w.map(n => '-'.repeat(n)).join('-+-'), ...cells.slice(1).map(fmt), `(${count(total)} row${total === 1 ? '' : 's'})`].join('\n');
 }
 const KEPT = 100; // rows a saved notebook keeps of each answer
+/** A code cell's own metadata: live, and its answer's view (a chart, with its settings; a plan). */
+const pondraOf = c => { const p = { live: c.kind === 'sql' && c.liveBox.checked || null, view: c.view, chart: c.view === 'chart' ? c.chartKeep.st : null }; for (const k in p) if (p[k] == null) delete p[k]; return Object.keys(p).length ? { pondra: p } : {}; };
 function outputs(c) {
   const r = c.result, out = [];
   if (!r || c.kind === 'markdown') return out;
@@ -228,7 +233,8 @@ export function cellsOf(nb) {
     const src = Array.isArray(c.source) ? c.source.join('') : String(c.source ?? '');
     if (c.cell_type !== 'code') return { kind: 'markdown', src, id: c.id };
     const magic = src.match(/^%%sql[^\n]*(\n|$)/);
-    return { kind: magic ? 'sql' : 'python', src: magic ? src.slice(magic[0].length) : src, id: c.id, live: !!c.metadata?.pondra?.live, out: savedAnswer(c.outputs) };
+    const p = c.metadata?.pondra || {};
+    return { kind: magic ? 'sql' : 'python', src: magic ? src.slice(magic[0].length) : src, id: c.id, live: !!p.live, view: p.view, chart: p.chart, out: savedAnswer(c.outputs) };
   });
 }
 export const cleanName = s => s.trim().replace(/\.ipynb$/i, '').replace(/^notebooks\//, '').replace(/[^\w.-]+/g, '-').replace(/^[.-]+|-+$/g, '').slice(0, 80);
@@ -247,7 +253,7 @@ export class Notebook {
     this.kind = 'notebook'; this.icon = 'notebook'; this.dir = dir;
     this.cells = []; this.sel = null; this.last = null; this.trash = null; this.dirty = false;
     this.box = h('div', { class: 'cells', 'aria-label': 'Cells' });
-    const add = kind => h('button', { class: 'btn ghost', 'data-add': kind, onclick: () => this.add({ kind }).edit() }, '+ ' + { sql: 'SQL', python: 'Python', markdown: 'Text' }[kind]);
+    const add = kind => h('button', { class: 'btn ghost', 'data-add': kind, onclick: () => this.add({ kind }).edit() }, '+ ' + { sql: 'SQL', python: 'Python', markdown: 'Markdown' }[kind]);
     this.el = h('div', { class: 'doc nbdoc' }, h('div', { class: 'nbcol' }, this.box, h('div', { class: 'add' }, add('sql'), add('python'), add('markdown')),
       h('div', { class: 'hint' }, h('kbd', {}, 'Ctrl'), ' ', h('kbd', {}, 'Enter'), ' runs a cell · ', h('kbd', {}, 'Tab'), ' completes a name · ', h('kbd', {}, 'Esc'), ' then ', h('kbd', {}, '?'), ' lists every key')));
     this.load(nb, name, version);
@@ -336,14 +342,14 @@ export class Notebook {
     else emit('changed', this, ran);
   }
   saved() { this.dirty = false; emit('changed', this); }
-  /** The headings of its text cells, for the outline under its row in the Workspace. */
+  /** The headings of its Markdown cells, for the outline under its row in the Workspace. */
   outline() { return this.cells.flatMap(c => c.kind !== 'markdown' ? [] : [...c.src.matchAll(/^(#{1,3})\s+(.+)$/gm)].map(m => ({ c, level: m[1].length, text: m[2].replace(/[*_`]/g, '') }))); }
   goto(c) { this.select(c, true); c.el.scrollIntoView({ block: 'start', behavior: 'smooth' }); }
   notebook() {
     return {
       cells: this.cells.map(c => c.kind === 'markdown'
         ? { cell_type: 'markdown', id: c.id, metadata: {}, source: lines(c.src) }
-        : { cell_type: 'code', id: c.id, metadata: c.kind === 'sql' && c.liveBox.checked ? { pondra: { live: true } } : {}, execution_count: c.result ? c.count ?? null : null, source: lines(c.kind === 'sql' ? '%%sql\n' + c.src : c.src), outputs: outputs(c) }),
+        : { cell_type: 'code', id: c.id, metadata: pondraOf(c), execution_count: c.result ? c.count ?? null : null, source: lines(c.kind === 'sql' ? '%%sql\n' + c.src : c.src), outputs: outputs(c) }),
       metadata: { kernelspec: { name: 'python3', display_name: 'Python 3', language: 'python' }, language_info: { name: 'python' }, pondra: { database: S.db || S.lake } },
       nbformat: 4, nbformat_minor: 5,
     };

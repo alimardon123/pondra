@@ -14,7 +14,7 @@ Every Pondra node serves a console at `/`. Open the node's address in a browser 
 lake's tables and files on the left, your notebooks, SQL, Python and data files in tabs in the
 middle, and on the right the details of whatever you pick and your Python variables. There is nothing
 to install. The page is part of the `pondra` binary: the code it loads first is under 70 KB
-compressed, the rest (charts, plans, History, Settings, data files) loads the first time you use it,
+compressed, the rest (charts, plans, History, Jobs, Settings, Markdown, data files) loads the first time you use it,
 and its fonts are 53 KB. It works offline, and it sends requests only to the node that served it.
 
 ![The console: the Data and Workspace trees on the left; a notebook in a tab, with a SQL cell and its answer in the grid; on the right, a table's details.](../../../assets/console.png)
@@ -39,15 +39,21 @@ pondra serve lake        # then open http://localhost:8080
 
 - **The top bar:** where the page runs (the database, this node), **search** (**Ctrl+K**: tables,
   files and commands), the three pane switches (left, bottom, right), **History** (the clock: it opens
-  the right pane at History, and a second click closes it), the keys, **Settings** (the gear) and **Sign in**.
+  the right pane at History, and a second click closes it), **Jobs** (the calendar, the same way), the
+  keys (**?**), **Settings** (the gear) and **Sign in**.
 - **The left pane:** a **Filter** box, then **Data** (databases, schemas, tables, views, columns) and
   **Workspace** (the lake's files). The filter narrows both trees to the names that hold what you
   type; **Esc** clears it.
 - **The middle:** a tab per open file. A dot on a tab (and beside the file in the Workspace) means
   it has changes not saved; a new file gets it once you type in it. The file's toolbar shows **Save**
   only when there is something to save, and **Ctrl+S** saves the one in front.
-- **The right pane:** **Details**, **Variables** and **History** (the node's jobs and schedules, and
-  what this page ran). Drag a tab to put it in another place. Details follows the tab in front; a
+- **Many tabs** keep their names and scroll: the wheel over them scrolls them, a thin bar above them
+  shows where you are (drag it), and **⌄** at their right lists them all. **Right-click** a tab to
+  **Pin** it: a pinned tab stays at the left, always in sight, shows a pin instead of its **✕**, and
+  isn't closed by **Close others**, **Close to the right**, **Close saved** or **Close all**, which the
+  same menu has. Pinned tabs are pinned again next time.
+- **The right pane:** **Details**, **Variables**, **History** (what ran: the node's runs, and what
+  this page ran) and **Jobs** (what runs on its own: the schedules). Drag a tab to put it in another place. Details follows the tab in front; a
   table you pick stays there until you switch tabs. In a window up to 1180 px wide the pane opens
   over the page when you pick a table or a column, and closes as soon as you go back to your work.
 - **Each view's ⋯** moves it to the other pane: Workspace can sit as a tab on the right, for
@@ -55,15 +61,23 @@ pondra serve lake        # then open http://localhost:8080
 
 ### Settings
 
-The gear at the top opens Settings (**Esc**, its **✕** or a click outside it closes it):
+The gear at the top opens Settings (**Esc**, its **✕** or a click outside it closes it). Its sections
+are at the left, grouped, and **Search settings** at the top finds a setting in any of them:
 
-- **Theme:** light (the first time), dark, or as the system is.
-- **Background** and **Accent:** a colour of your own for each theme (**Default** puts the theme's
-  back). The panes, lines and pop-ups take their shades from the background you pick.
-- **Font:** the console's own (Geist) or the system's.
-- **The left pane:** Data first, or Workspace first.
-- **Panes and tabs:** **Reset the layout** puts the panes, their widths and their tabs back.
-- **SQL files:** an answer for each statement, or only the last one's.
+- **Appearance:** the theme (light the first time, dark, or as the system is); the accent, one of a
+  few or a colour of your own, and the background, for each theme (**Default** puts the theme's
+  back: the panes, lines and pop-ups take their shades from it); the font, the console's own (Geist)
+  or the system's.
+- **Editor and results:** a SQL file's statements (an answer for each, or only the last one's), where
+  its results show (below or at the right), and how pages of rows and Format work.
+- **Layout:** Data first or Workspace first on the left, and **Reset the layout** (the panes, their
+  widths and their tabs, as they were at first).
+- **Keys:** every key, where it works (**?** opens Settings here).
+- **This node:** **Python** (the one in use, and **Choose…**) and **About** (the version, the lake,
+  the cluster, and where the settings are kept).
+
+Sections an extension (or an enterprise build: users, tokens, audit) adds show here too, under their
+own heading: `register.setting` below.
 
 The node keeps them on its machine, so every lake and every session you open on that machine has
 them: in `PONDRA_CONFIG_DIR` if it is set, else `%APPDATA%\pondra` on Windows,
@@ -79,11 +93,11 @@ Click a file in the Workspace to open it in a tab (its tab comes forward if it i
 
 | File | Opens as | Below it |
 |---|---|---|
-| A notebook (`notebooks/<name>`, or an `.ipynb` in any other folder) | cells: SQL, Python and text | — |
+| A notebook (`notebooks/<name>`, or an `.ipynb` in any other folder) | cells: SQL, Python and Markdown | — |
 | `.sql` | an editor with line numbers | Results, Messages, Chart and Plan (or at the right) |
 | `.py` | the same editor | a console: the file's runs, and a `>>>` line |
 | `.csv`, `.tsv`, `.json`, `.jsonl`, `.parquet` | a table: CSV and JSON edited in place, Parquet read-only | — |
-| `.md`, `.txt` | the editor | — |
+| `.md`, `.txt` | the editor (**Preview** draws a `.md` file's Markdown) | — |
 
 The Workspace's **+** (the tab bar's too) makes a notebook, a SQL or a Python file, or a folder, or
 puts a file from your computer in the lake (**Upload a file…**). A new file is in the Workspace at
@@ -112,7 +126,8 @@ deletes them all, the marker too.
 
 ![A SQL file in a tab: the editor with line numbers, and its results below, in the grid.](../../../assets/console-sql-file.png)
 
-**Run** (**Ctrl+Enter**) runs what is selected, or else the whole file.
+**Run** (**Ctrl+Enter**) runs what is selected, or else the whole file. Its **▾** has **Run
+selection**, **Run file**, **Format file**, **Format selection**, **Run as a job** and **Schedule…**.
 
 - **Each statement gets an answer.** They run in order in the page's session, and stop at the first
   that fails. Above the results, a chip per statement (`1 done`, `2 5 rows`, `3 failed`) picks the
@@ -140,10 +155,10 @@ deletes them all, the marker too.
   Parquet or Excel (`.xlsx`).
 - The results sit below the editor or at its right (the button at the right of their bar); drag the
   line between them. In a narrow window, the results give way to keep their buttons in reach.
-- **Right-click** in the editor for cut, copy, paste, select all, comment the lines, run, and
-  **Format** (**Shift+Alt+F**): the SQL words in capitals and each clause on its own line, strings,
-  names and comments as you wrote them. With something selected, only that is formatted. Anything it
-  can't format stays as it was.
+- **Right-click** in the editor for cut, copy, paste, select all, comment the lines, run, **Format
+  file** and **Format selection**: the SQL words in capitals and each clause on its own line, strings,
+  names and comments as you wrote them. **Shift+Alt+F** formats the selection, or with nothing
+  selected the whole file. Anything it can't format stays as it was.
 
 ### Python files
 
@@ -151,26 +166,33 @@ deletes them all, the marker too.
 and its answer show in the console below. Type a line after `>>>` and press **Enter** to run it there
 too (**↑** **↓** bring back the ones before).
 
-**Format** (**Shift+Alt+F**, or a right-click) formats the file, or what is selected, as
+**Format file** and **Format selection** (**Shift+Alt+F**, a right-click, or **Run ▾**) format it as
 [ruff](https://docs.astral.sh/ruff/formatter/) does, by the node's Python: it needs `ruff` (or
 `black`) installed there (`pip install ruff`). Code that doesn't parse stays as it was, and the
 message says where it went wrong.
 
 ### Jobs and schedules
 
-A file's **⋯** (and a notebook's, in `notebooks`) runs it on the node, where it goes on without the page:
+A file's **Run ▾** (and a notebook's, in `notebooks`) runs it on the node, where it goes on without the page:
 
 - **Run as a job** saves the file and starts it, with the parameters' values as they are now.
 - **Schedule…** makes a task that runs it every so often (`15 minutes`, `1 day`, or a cron line such
   as `cron 0 2 * * * UTC`).
 
-**History**, in the right pane (or the clock at the top), lists:
+**Jobs**, in the right pane (or the calendar at the top), is what runs on its own. Each schedule is a
+card: its name and whether its last run worked, how often it runs and when next, a bar for each of its
+last runs (its height the time it took, red if it failed), and the statement it runs. Click the card
+for its last runs; **Run now** starts it at once (a `CALL` as a job), **Edit** changes how often,
+and its **⋯** opens its file, copies the statement, or drops it. **New schedule** makes one from any
+statement. Pipelines (round 30) will be a section here too.
+
+**History**, in the right pane (or the clock at the top), is what ran:
 
 - **On the node:** its runs, newest first: what ran (a file, a procedure, or a Python cell's first
-  line of code), its id, who ran it and when, how long it took or its error. A running one's row
-  updates until it ends. Click one for all of it (a cell's whole code) and to open its file, or open
-  the code in a new file; right-click to copy its id.
-- **Schedules:** each task, when it runs next, and a button to drop it.
+  line of code), its id, who ran it and when, how long it took or its error; a schedule's runs are
+  tagged with its name (click the tag for Jobs). A running one's row updates until it ends. Click one
+  for all of it (a cell's whole code) and to open its file, or open the code in a new file;
+  right-click to copy its id.
 - **This page:** each statement and Python run from this page, its SQL shortened to a line, with its
   number (`#3`), its file, the time and its rows. Click one to see it whole, and to **Open in a new
   file**, **Put it in the tab in front**, **Copy it**, **Run it again** or **See its plan**; a
@@ -194,7 +216,8 @@ Every answer (a cell's, a SQL file's) and every data file is shown in the same g
 
 - **Types:** a coloured mark before each column's name (`T` text, `#` whole numbers, `.01`
   decimals, a calendar or a clock for dates and times, a switch for true/false, braces for JSON-like
-  values). Hover over a header for its full type, least and greatest value, NULLs and distinct values.
+  values). Hover over a header for its full type, least and greatest value, NULLs and distinct values
+  (the card shows above the pointer, so it hides no rows).
 - **Selecting:** click a cell and its whole row lights up, to follow it across a wide table. Drag or
   **Shift+click** for a range, a row number for a row, a header for a column (and its profile in
   Details), the corner for everything. The arrow keys move (**Shift**: extend), **Ctrl+A** takes
@@ -209,6 +232,12 @@ Every answer (a cell's, a SQL file's) and every data file is shown in the same g
   click it to change the last one, its **✕** clears them all. Each column has one filter, and they
   all apply.
 - **Sorting:** the small arrow in a header sorts by it (again: the other way).
+- **Pages:** an answer of more than 10,000 rows comes a page at a time. Below it, `10,001–20,000 of
+  200,000` says which rows show, and **‹ 1 2 3 … 20 ›** turns the pages (**…** asks for a page;
+  **Alt+Page Down** and **Alt+Page Up** in the grid). The node keeps the answer a while
+  (`PONDRA_PAGES_MB`, 256 MB in all, for 20 minutes after it was last read), so a page is the same
+  rows, in the same order, without running the query again; after that, turning a page runs it again
+  for that page. Sorting and filtering are of the page shown.
 
 ## SQL cells
 
@@ -231,9 +260,13 @@ ORDER BY total DESC;
 - A statement that changes something (`INSERT`, `CREATE TABLE`) shows what it did, such as
   `rows 3`, and the tables on the left update.
 - Errors come back in plain words, such as `No field named nope. Did you mean 'sales.item'?`.
-- The console shows the first 10,000 rows of an answer. Below it, **Copy ▾** copies them in any of
-  the forms a SQL file offers, and **Download ▾** saves them as CSV, TSV or JSON; a cell that is one
-  query can also download every row, not only those shown (it runs again on the node).
+- An answer of more than 10,000 rows comes a page at a time (**‹ 1 2 3 ›** below it, as in a SQL
+  file). **Copy ▾** copies the rows shown in any of the forms a SQL file offers, and **Download ▾**
+  saves them as CSV, TSV or JSON; a cell that is one query can also download every row (it runs
+  again on the node).
+- **Chart** and **Plan** below the answer are a SQL file's: a chart of the rows, and the plan as a
+  graph with its **Profile**. The one open, and the chart's settings, are kept with the notebook, so
+  it opens with its chart. **Profile** summarizes every column in Details.
 - Decimals keep their digits (`1.50`), and integers too big for JavaScript arrive as text, so what
   you see is exactly what the lake holds.
 
@@ -355,19 +388,28 @@ The **Python** chip says whether a cell is running. **Restart Python** in its me
 cell after **Esc**) ends it: its variables go, and the next cell starts afresh (temporary tables stay,
 since they are SQL's).
 
-## Text cells
+## Markdown cells
 
-Text cells hold Markdown: headings, lists, **bold**, *italics*, `code`, links and code blocks. Press
-**Shift+Enter** to show the text, and double-click it to edit. Their headings make the notebook's
-outline, under it in the Workspace: click one to go to its cell.
+Markdown cells hold text, drawn as GitHub draws Markdown: headings (`#` to `######`, or underlined),
+**bold**, *italics*, ~~strikethrough~~, `code`, links (`[text](url)`, `<url>`, a bare `https://…`, or
+`[text][name]` with `[name]: url` below), pictures (`![what it shows](path)`), lists (nested,
+numbered, and of tasks: `- [ ]`, `- [x]`), quotes, tables (with `:--:` to align their columns), rules
+(`---`) and code blocks (SQL and Python ones highlighted). A few HTML tags work as they are
+(`<br>`, `<kbd>`, `<sub>`, `<sup>`, `<u>`, `<mark>`); any other HTML shows as text.
+
+A link or a picture without a scheme is a file of the lake's (`data/chart.png`, `queries/daily.sql`):
+a link opens it in a tab, a picture is read from the lake. Press **Shift+Enter** to draw the cell, and
+double-click it to edit. Its headings make the notebook's outline, under it in the Workspace: click
+one to go to its cell. A `.md` file's **Preview** draws it the same way, its paths read from its folder.
 
 ## A cell's menu
 
-The kind at a cell's top left (**SQL ▾**) makes it SQL, Python or text, and back again. The **⋯** at
+The kind at a cell's top left (**SQL ▾**) makes it SQL, Python or Markdown, and back again. The **⋯** at
 its top right (it shows when you point at the cell) runs the cells above it, or this one and those
 below; hides its output (**O**: its code stays, and a click on the output brings it back); clears
-its output; and deletes it. A right-click in its code has cut, copy, paste, comment, **Run the
-cell** and **Format** (**Shift+Alt+F**: SQL here, Python by the node's ruff or black, as in files).
+its output; and deletes it. A right-click in its code has cut, copy, paste, comment, **Run cell**,
+**Format cell** and **Format selection** (**Shift+Alt+F**: SQL here, Python by the node's ruff or
+black, as in files).
 The notebook's own **⋯** (in its toolbar) lists its versions, downloads it as `.ipynb` and clears
 every output. **Ctrl+K** finds every command: a new notebook, file or folder, **Upload a file…**,
 restarting or choosing Python, the token, the keys.
@@ -406,8 +448,9 @@ SELECT path, size, written FROM files('notebooks/') ORDER BY written DESC;
 ```
 
 A notebook is a Jupyter notebook (`.ipynb`, format 4.5). SQL cells are saved as `%%sql` cells,
-Python cells as code cells, and text as Markdown. Each answer is kept with its cell (the first 100
-rows) and shown, marked **saved**, until you run the cell again.
+Python cells as code cells, and Markdown as Markdown. Each answer is kept with its cell (the first
+100 rows) and shown, marked **saved**, until you run the cell again; a cell's chart (or plan) open
+is kept in its metadata (`pondra.view`, `pondra.chart`).
 
 - **Download** saves the notebook to your computer. Jupyter, VS Code and GitHub open it as it is. In
   Jupyter, `%load_ext pondra` makes the `%%sql` cells run (see [Notebooks](/pondra/guides/notebooks/)).
@@ -439,11 +482,11 @@ After **Esc**, on the selected cell:
 | **↑** **↓** (or **K** **J**) | Go to the cell above or below |
 | **A**, **B** | Add a cell above, below |
 | **D D** | Delete it. **Z** brings it back |
-| **S**, **P**, **M** | Make it SQL, Python or text |
+| **S**, **P**, **M** | Make it SQL, Python or Markdown |
 | **L** | Turn Live on or off |
 | **O** | Hide its output, or show it again |
 | **0 0** | Restart Python |
-| **?** | Show these keys |
+| **?** | Show these keys (Settings, Keys) |
 
 Anywhere on the page:
 
@@ -454,6 +497,7 @@ Anywhere on the page:
 | **Ctrl+K** | Search tables, files and commands |
 | **Ctrl+B**, **Ctrl+J**, **Ctrl+Alt+B** | Show or hide the left pane, the bottom panel, the right pane |
 | **↑** **↓** **←** **→** | Move in a tree (open, close) or along the tabs; **Delete** closes a tab |
+| **Alt+Page Down**, **Alt+Page Up** | The next page of an answer's rows, the one before (in its grid) |
 
 ## The cluster at a glance
 
@@ -503,6 +547,8 @@ on('ran', (cell, answer) => console.log(cell.src, answer.kind));
 | `action({ id, label or icon, title, run(), primary, menu, order })` | a button at the top, or an item of the top bar's ⋯ (shown once an extension adds one) |
 | `nav({ id, label, icon, run() })` | a place in a rail at the far left (it shows once one is added) |
 | `key({ keys, title, run(cell), group })` | a key on a cell, listed under **?** |
+| `setting({ id, title, group, icon, about, rows(), order })` | a section of Settings: `rows()` gives `[name, what it does, its control]`, under the heading `group` |
+| `jobKind({ id, title, load(), item(x), empty, order })` | a section of Jobs: what `load()` gives, each drawn by `item` |
 
 `pondra.configure({ fetch, token, headers })` changes how the page reaches the node, for a
 gateway or a sign-in of your own. `pondra.api` runs SQL (`run`, `rows`, `call`), and `pondra.ui`

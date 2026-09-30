@@ -1,14 +1,15 @@
 // The console's rarer parts (ADR-034, round 29), loaded when first used, so the page's first load
-// doesn't carry them: the History view (the node's runs, the schedules, what this page ran), the
-// Variables view, Settings, search (Ctrl K), choosing the Python, a file run as a job. What they use of the shell comes through `R.helpers`.
-import { h, $, secs, count, bytes, utc, icon, svg, S, R, call, run, rows, ident, quote, toast, menu, prompt, confirmed, pop, moreStyle } from './core.js';
+// doesn't carry them: the History view (the node's runs, what this page ran), the Variables view,
+// search (Ctrl K), choosing the Python, a file run as a job or on a schedule. What they use of the shell comes through `R.helpers`.
+import { h, $, secs, count, bytes, utc, icon, svg, S, R, call, run, rows, ident, quote, toast, menu, prompt, confirmed, pop, fileUrl, fileSql, writeFile, moreStyle } from './core.js';
 import { highlighted } from './editor.js';
 import { copyText } from './grid.js';
-import { iconOf, oneLine, FOLDER } from './files.js';
+import { iconOf, oneLine, FOLDER, download } from './files.js';
+import { cleanName } from './notebook.js';
 
 await moreStyle();
 
-const H = R.helpers, { KIND, pick, act, facts, head, detail, drawLeft, drawViews, look, readVars, themeNow, prefs, pane, show, openFile, newFile, restart, kernel } = H;
+const H = R.helpers, { KIND, pick, act, facts, head, detail, readVars, show, openFile, newFile, restart, kernel } = H;
 let again = 0;
 
 
@@ -43,15 +44,15 @@ export async function variables() {
     ...S.vars.map(x => h('div', { class: 'var' }, h('div', { class: 'line1' }, h('span', { class: 'nm' }, x.name), h('span', { class: 'ty' }, x.type + (x.size ? ` · ${x.size}` : ''))), h('div', { class: 'look' }, x.look)))];
 }
 
-/** History: the node's runs (jobs, files run, procedures and tasks: `pondra.runs`), the schedules
- * (`pondra.tasks`), and what this page ran, newest first. */
+/** History: what ran, newest first: the node's runs (jobs, files run, procedures, schedules' runs:
+ * `pondra.runs`), and what this page ran. What runs on a schedule is in Jobs (jobs.js). */
 export async function runs() {
-  let node = [], tasks = [];
+  let node = [];
   try { node = await rows('SELECT id, routine, caller, status, started, ended, args, error FROM pondra.runs ORDER BY started DESC LIMIT 30'); } catch { /* (no run yet, or no rights) */ }
-  try { tasks = await rows('SELECT name, schedule, statement, next_tick FROM pondra.tasks ORDER BY name'); } catch { /* (none) */ }
   clearTimeout(again);
   // (until it ends; a run whose node stopped under it says running for good: not looked at again after a day)
   if (node.some(x => x.status === 'running' && Date.now() - utc(x.started) < 864e5)) again = setTimeout(() => { if (S.tab === 'runs') detail(); }, 2000);
+  const sched = x => x.caller === 'schedule' ? x.routine : x.caller?.startsWith('task:') ? x.caller.slice(5) : null;
   const took = x => x.ended ? secs(utc(x.ended) - utc(x.started)) : 'running';
   const fileOf = x => /^files\/.+@/.test(x.routine) ? x.routine.replace(/^files\//, '').replace(/@[^@]*$/, '') : null;
   // (a DO block: its code, a console's Python cell or file run on the node)
@@ -66,18 +67,15 @@ export async function runs() {
     oncontextmenu: e => { e.preventDefault(); menu(e, [{ label: 'Show it', run: () => nodeLook(x) }, ...nodeActs(x).map(([label, run]) => ({ label, run }))]); } },
     h('div', { class: 'line1' }, h('span', { class: 'ic', html: svg(fileOf(x) ? iconOf(fileOf(x)) : codeOf(x)?.language === 'python' || x.routine === 'do' ? 'filepy' : 'play', 14) }), h('span', { class: 'nm' }, nameOf(x)),
       h('span', { class: 'meta ' + (x.status === 'failed' ? 'bad' : '') }, x.status === 'failed' ? 'failed' : took(x))),
-    h('div', { class: 'sub' }, `${String(x.id).slice(0, 8)} · ${x.caller} · ${utc(x.started).toLocaleString()}`), x.error ? h('div', { class: 'sub bad' }, x.error.split('\n')[0].slice(0, 200)) : null);
-  const task = t => h('div', { class: 'run-item', title: t.statement },
-    h('div', { class: 'line1' }, h('span', { class: 'ic', html: svg('clock', 14) }), h('span', { class: 'nm' }, t.name), h('span', { class: 'meta' }, t.schedule),
-      h('button', { class: 'icon sm', title: `Stop ${t.name}: DROP TASK`, 'aria-label': `Drop the task ${t.name}`, onclick: async () => { if (!confirmed(`Drop the task ${t.name}? It stops running.`)) return; try { await run(`DROP TASK ${ident(t.name)}`); detail(); } catch (e) { toast(e.message, true); } } }, icon('trash'))),
-    h('div', { class: 'sub' }, `${t.statement.slice(0, 120)} · next ${utc(t.next_tick).toLocaleString()}`));
+    // (a schedule's run, and what it called: tagged with the schedule, which Jobs shows)
+    h('div', { class: 'sub' }, sched(x) ? h('button', { class: 'tag', title: 'It ran on a schedule: Jobs has the schedules', onclick: e => { e.stopPropagation(); show('jobs'); } }, icon('calendar', 'ic', 11), sched(x)) : null,
+      `${sched(x) ? '' : `${String(x.id).slice(0, 8)} · ${x.caller} · `}${utc(x.started).toLocaleString()}`), x.error ? h('div', { class: 'sub bad' }, x.error.split('\n')[0].slice(0, 200)) : null);
   const page = x => h('div', { class: 'run-item', role: 'button', tabindex: '0', title: 'Click: what it ran, and what to do with it. Right-click: the same', onclick: () => pageLook(x), onkeydown: e => e.key === 'Enter' && pageLook(x),
     oncontextmenu: e => { e.preventDefault(); menu(e, pageActs(x).map(([label, run]) => ({ label, run }))); } },
     h('div', { class: 'line1' }, h('span', { class: 'ic k-' + x.kind, html: svg(x.kind === 'python' ? 'filepy' : 'filesql', 14) }), h('span', { class: 'nm' }, x.kind === 'python' ? firstLine(x.src) : oneLine(x.src, 90)), h('span', { class: 'meta ' + (x.ok ? '' : 'bad') }, x.ok ? secs(x.ms) : 'failed')),
     h('div', { class: 'sub' }, `#${x.id} · ${x.where} · ${new Date(x.at).toLocaleTimeString()}${x.rows != null ? ` · ${count(x.rows)} row${x.rows === 1 ? '' : 's'}` : ''}`));
-  return [head('clock', 'History', 'what ran on the node, its schedules, and what this page ran'),
-    h('div', { class: 'dsect' }, 'On the node'), ...node.length ? node.map(nodeRun) : [h('div', { class: 'empty' }, 'No job yet: a file\'s ⋯ runs it as one.')],
-    tasks.length ? h('div', { class: 'dsect' }, 'Schedules') : null, ...tasks.map(task),
+  return [head('clock', 'History', 'what ran, on the node and on this page'),
+    h('div', { class: 'dsect' }, 'On the node'), ...node.length ? node.map(nodeRun) : [h('div', { class: 'empty' }, 'No job yet: a file\'s Run ▾ runs it as one.')],
     h('div', { class: 'dsect' }, 'This page'), ...S.ran.length ? S.ran.map(page) : [h('div', { class: 'empty' }, 'Nothing run yet.')]];
 }
 /** What to do with something this page ran: open it as a new file, put it in the one in front,
@@ -96,35 +94,13 @@ function pageLook(x) {
  * parameters as they are now; History shows it. */
 export async function job(doc, every) {
   if (doc.dirty && !(await doc.save())) return;
-  if (every && !(every = await prompt('Schedule', 'How often', '1 hour', 'For example 15 minutes, 1 day, or cron 0 2 * * * UTC. It runs on the node as CALL run(…), and History lists it.'))) return;
+  if (every && !(every = await prompt('Schedule', 'How often', '1 hour', 'For example 15 minutes, 1 day, or cron 0 2 * * * UTC. It runs on the node as CALL run(…): Jobs lists it, History its runs.'))) return;
   const path = doc.kind === 'notebook' ? `notebooks/${doc.name}` : doc.path, name = path.replace(/\.[^./]+$/, '').replace(/\W+/g, '_').replace(/^_+|_+$/g, '').toLowerCase() || 'job';
   const args = quote(path) + Object.entries(doc.params?.() || {}).map(([n, v]) => `, ${ident(n)} => ${typeof v === 'string' ? quote(v) : String(v).toUpperCase()}`).join('');
   try {
     await run(every ? `CREATE OR REPLACE TASK ${ident(name)} SCHEDULE ${quote(every)} AS CALL run(${args})` : `SELECT pondra.start('run', ${args})`);
-    toast(every ? `Scheduled: ${name}, every ${every}` : `Started on the node: ${path}`); show('runs');
+    toast(every ? `Scheduled: ${name}, every ${every}` : `Started on the node: ${path}`); show(every ? 'jobs' : 'runs');
   } catch (e) { toast(e.message, true); }
-}
-
-export function settings() {
-  const d = $('#settingsDlg'), set = (id, v) => { $(id).value = v; };
-  const colors = () => ({ ...prefs('colors') || {} }), mine = () => colors()[themeNow()] || {};
-  const css = getComputedStyle(document.documentElement), hex = v => { const c = document.createElement('canvas').getContext('2d'); c.fillStyle = v; return c.fillStyle.startsWith('#') ? c.fillStyle : '#888888'; };
-  const show = () => {
-    set('#setTheme', prefs('theme') || 'light'); set('#setGroups', prefs('workspaceFirst') ? 'workspace' : 'data'); set('#setFont', prefs('font') || 'geist'); set('#setStatements', prefs('statements') || 'each');
-    set('#setBg', mine().bg || hex(css.getPropertyValue('--surface').trim())); set('#setAccent', mine().accent || hex(css.getPropertyValue('--accent').trim()));
-    $('#setColorsFor').textContent = `for the ${themeNow()} theme`;
-    $('#setWhere').textContent = S.prefsHere ? 'Kept on this machine: every lake and session opened here has them.' : 'Kept in this browser (the node can\'t keep them on its machine for a page on another).';
-  };
-  const color = (k, v) => { const all = colors(); all[themeNow()] = { ...mine(), [k]: v }; if (!v) delete all[themeNow()][k]; prefs('colors', all); look(); show(); };
-  d.onchange = e => {
-    if (e.target.id === 'setBg' || e.target.id === 'setAccent') return;
-    prefs('theme', $('#setTheme').value); prefs('workspaceFirst', $('#setGroups').value === 'workspace'); prefs('font', $('#setFont').value); prefs('statements', $('#setStatements').value); look(); drawLeft(); show();
-  };
-  $('#setBg').oninput = e => color('bg', e.target.value); $('#setAccent').oninput = e => color('accent', e.target.value);
-  $('#setBgReset').onclick = () => color('bg', null); $('#setAccentReset').onclick = () => color('accent', null);
-  $('#setReset').onclick = () => { for (const k of ['sides', 'folded', 'weights', 'widths', 'left', 'right', 'bottom', 'rorder', 'split', 'results']) prefs(k, null); $('#left').style.width = $('#right').style.width = ''; drawViews(); pane('left', true); toast('The layout is back as it was'); };
-  show();
-  d.showModal();
 }
 
 /** Search (Ctrl K): tables, files, notebooks and commands, as you type. */
@@ -156,3 +132,78 @@ export function palette() {
   };
   d.showModal();
 }
+
+/** A tab's right-click menu: pin it, close it or some of the others (the pinned stay), copy its path. */
+export function tabMenu(e, d) {
+  const { closeDoc: close, pin } = H, i = S.docs.indexOf(d), some = f => S.docs.filter((x, j) => x !== d && !x.pinned && f(x, j));
+  const closeAll = async list => { for (const x of list) await close(x); };
+  const others = some(() => true), right = some((_, j) => j > i), saved = some(x => !x.dirty);
+  menu(e, [{ label: d.pinned ? 'Unpin' : 'Pin', icon: 'pin', run: () => pin(d, !d.pinned) }, '-',
+    { label: 'Close', icon: 'close', keys: 'Delete', run: () => close(d) },
+    { label: 'Close others', disabled: !others.length, run: () => closeAll(others) }, { label: 'Close to the right', disabled: !right.length, run: () => closeAll(right) },
+    { label: 'Close saved', disabled: !saved.length && (d.dirty || d.pinned), run: () => closeAll(saved.concat(d.dirty || d.pinned ? [] : [d])) },
+    { label: S.docs.some(x => x.pinned) ? 'Close all but the pinned' : 'Close all', run: () => closeAll(S.docs.filter(x => !x.pinned)) },
+    d.path ? '-' : null, d.path ? { label: 'Copy the path', icon: 'copy', run: () => copyText('files/' + d.path, 'Path copied') } : null]);
+}
+
+// ------------------------------------------------------------------ the Workspace's files: their menus, a folder, uploads, renaming, deleting
+/** A folder in `at`, by name (`a/b` makes both): its marker is put as any file is. */
+export async function newFolder(at = '') {
+  const name = ((await prompt('New folder', 'Its name', '')) || '').replace(/^\/+|\/+$/g, ''), rel = at + name;
+  if (!name) return;
+  const bad = /(^|\/)(\.{0,2}|\s+)(\/|$)|^notebooks(\/|$)/.test(rel) ? 'Not a folder name: no empty part, . or .., nor in notebooks/'
+    : S.files?.some(f => f.path === 'files/' + rel || f.path.startsWith(`files/${rel}/`)) ? `${rel} is there already` : '';
+  if (bad) return toast(bad, true);
+  try {
+    await call(fileUrl(`${rel}/${FOLDER}`), { method: 'PUT', body: '' });
+    S.open.add('dir:' + at.slice(0, -1)); // (so it shows)
+    toast(`Made the folder ${rel}`);
+  } catch (err) { toast('No folder made: ' + err.message, true); }
+  R.helpers.refreshFiles();
+}
+/** A file from this computer into the lake's files (a notebook opens, unless it is for a folder: then it is put there; the rest are put). */
+export function upload(at = '') {
+  const input = h('input', { type: 'file', hidden: true, multiple: true });
+  input.onchange = async () => {
+    const fs = [...input.files];
+    input.remove();
+    for (const f of fs) {
+      if (/\.ipynb$/i.test(f.name) && (!at || at === 'notebooks/')) { try { R.helpers.openNotebook(JSON.parse(await f.text()), cleanName(f.name) || 'uploaded'); toast(`Opened ${f.name}: Ctrl+S keeps it in the lake`); } catch (err) { toast(`Could not open ${f.name}: ${err.message}`, true); } continue; }
+      const rel = at + f.name;
+      try { await call(fileUrl(rel), { method: 'PUT', body: f }); toast(`Put in the lake: files/${rel}`); } catch (err) {
+        if (err.status !== 409) { toast(`${f.name}: ${err.message}`, true); continue; }
+        if (!confirmed(`files/${rel} is there already. Replace it with the one picked?`)) continue; // (a file is replaced only as it is: its version asked for)
+        const version = ((await call(fileUrl(rel), { method: 'HEAD' })).headers.get('etag') || '').replace(/"/g, '');
+        if (await writeFile(rel, f, version, f.type || 'application/octet-stream')) toast(`Replaced files/${rel}`);
+      }
+    }
+    R.helpers.refreshFiles();
+  };
+  document.body.append(input); input.click();
+}
+export async function rename(rel) {
+  const to = await prompt('Rename', 'The new path, under the lake\'s files', rel);
+  if (!to || to === rel) return;
+  try {
+    const r = await call(fileUrl(rel));
+    await call(fileUrl(to), { method: 'PUT', body: await r.blob() });
+    await call(fileUrl(rel), { method: 'DELETE' });
+    const doc = S.docs.find(d => d.path === rel);
+    if (doc) { await R.helpers.close(doc); R.helpers.openFile(to); } // (its tab again, at the new path)
+    toast(`Renamed to ${to}`);
+  } catch (e) { toast('Not renamed: ' + e.message, true); }
+  R.helpers.refreshFiles();
+}
+/** Delete a file, a notebook (every version) or a folder (every file in it, its marker too), once asked. */
+export async function remove(f, folder) {
+  try {
+    const paths = f.notebook || folder ? (await rows(`SELECT path FROM files(${quote(f.rel + '/')})`)).map(x => x.path) : ['files/' + f.rel], n = paths.filter(p => !p.endsWith('/' + FOLDER)).length;
+    if (!confirmed(f.notebook ? `Delete the notebook ${f.name}, every version of it?` : folder ? `Delete the folder ${f.rel} and its ${n} file${n === 1 ? '' : 's'}? This can't be undone.` : `Delete files/${f.rel}? This can't be undone.`)) return;
+    await Promise.all(paths.map(p => call(fileUrl(p), { method: 'DELETE' })));
+    for (const d of S.docs) if (d.path === f.rel || folder && d.path?.startsWith(f.rel + '/')) Object.assign(d, { dirty: true, version: null, written: null }); // (a tab keeps what it holds, unsaved)
+    R.helpers.drawTabs();
+    toast(`Deleted ${f.name}`);
+  } catch (e) { toast('Not deleted: ' + e.message, true); }
+  R.helpers.refreshFiles();
+}
+

@@ -1,7 +1,7 @@
 // The result grid (ADR-034): query answers, notebook outputs and data files. It draws only the
 // rows in sight; a cell, a range, a row or a column can be selected and copied (tab-separated,
 // so a spreadsheet takes it as cells); a data file's cells are edited in place.
-import { h, icon, svg, count, numeric, sqlType, typeKind, typeMark, menu, toast, saveAs, quote, ident, pop, call } from './core.js';
+import { h, icon, svg, count, numeric, sqlType, typeKind, typeMark, menu, toast, saveAs, quote, ident, pop, call, run, prompt } from './core.js';
 
 const ROW_H = 30; // the height of a row when only the rows in sight are drawn
 let measurer;
@@ -79,7 +79,10 @@ export function statView(s) {
  * - `footer`: the footer with the row count and buttons (a notebook's answer);
  * - `fill`: as tall as its box (a results panel), else at most 520 px;
  * - `name`: for its CSV;
- * - `edit`: a data file's `{ set(i, c, text), changed(i, c), added(i), add(), del(is), addColumn(name) }`. */
+ * - `views`: more views of it under a notebook's answer, beside Chart: `[id, icon, label, title, make() → element]`;
+ *   `view`, the one open to start with, and `onview(id)`, told when another opens; `chart`, where its chart's settings are kept;
+ * - `edit`: a data file's `{ set(i, c, text), changed(i, c), added(i), add(), del(is), addColumn(name) }`.
+ * An answer of more rows than came (`r.total`) turns its pages (`pageRows`): its rows are then those of a page. */
 export function grid(r, o = {}) {
   const cols = r.columns, all = r.rows;
   if (!cols.length) return h('div', { class: 'done' }, 'No columns.');
@@ -88,6 +91,8 @@ export function grid(r, o = {}) {
   const multi = all.slice(0, 200).some(row => row.some(v => typeof v === 'string' && v.includes('\n')));
   const virtual = !multi && (all.length > 60 || !!o.edit);
   let view = all.map((_, i) => i), sort = null, filters = [], sel = null;
+  const size = r.page ||= r.total > all.length && (r.pages || r.sql) ? all.length : 0; // (rows a page: as many as came first)
+  let from = r.from || 0, turning = false;
 
   // the header: a type mark, the name, a sort arrow; the corner selects everything
   const heads = cols.map((c, i) => h('th', { class: nums[i] ? 'num' : null, 'data-c': i, scope: 'col' },
@@ -95,11 +100,11 @@ export function grid(r, o = {}) {
     h('small', {}, sqlType(c.type))));
   const corner = h('th', { class: 'i', title: 'Select everything (Ctrl A)' }, h('span', { class: 'sr' }, 'Row'));
   const body = h('tbody'), colgroup = h('colgroup');
-  const table = h('table', { class: 'gt' + (o.edit ? ' editable' : ''), role: 'grid', 'aria-rowcount': String(all.length + 1) }, colgroup, h('thead', {}, h('tr', {}, corner, heads)), body);
+  const table = h('table', { class: 'gt' + (o.edit ? ' editable' : ''), role: 'grid', 'aria-rowcount': String((r.total ?? all.length) + 1) }, colgroup, h('thead', {}, h('tr', {}, corner, heads)), body);
   const box = h('div', { class: 'grid' + (virtual ? ' v' : '') + (o.fill ? ' fill' : ''), tabindex: '0', 'aria-label': 'Rows' }, table);
   const widths = () => {
     const sample = all.slice(0, 300), ws = cols.map((c, i) => Math.min(440, Math.max(72, textWidth(c.name) * 1.06 + 76, ...sample.map(row => textWidth(text(row, i) ?? 'NULL') + 30))));
-    const iw = Math.max(40, textWidth(count(all.length + 5)) + 22);
+    const iw = Math.max(40, textWidth(count(Math.max(all.length, r.total || 0) + 5)) + 22);
     colgroup.replaceChildren(h('col', { style: `width:${iw}px` }), ...ws.map(w => h('col', { style: `width:${Math.ceil(w)}px` })));
     table.style.width = Math.ceil(iw + ws.reduce((a, b) => a + b, 0)) + 'px';
   };
@@ -118,7 +123,7 @@ export function grid(r, o = {}) {
     return td;
   };
   const rowOf = k => {
-    const row = all[view[k]], tr = h('tr', { 'data-k': k, class: o.edit?.added(view[k]) ? 'new' : null }, h('td', { class: 'i' }, String(view[k] + 1)), row.map((_, i) => cellOf(row, k, i)));
+    const row = all[view[k]], tr = h('tr', { 'data-k': k, class: o.edit?.added(view[k]) ? 'new' : null }, h('td', { class: 'i' }, String(from + view[k] + 1)), row.map((_, i) => cellOf(row, k, i)));
     drawnRows.set(k, tr);
     return tr;
   };
@@ -230,6 +235,7 @@ export function grid(r, o = {}) {
     const mod = e.ctrlKey || e.metaKey;
     if (mod && e.key.toLowerCase() === 'a') { e.preventDefault(); select(0, 0, view.length - 1, cols.length - 1); return; }
     if (mod && e.key.toLowerCase() === 'c') { if (sel) { e.preventDefault(); copyText(tsv(e.shiftKey), e.shiftKey ? 'Copied, with the headers' : 'Copied'); } return; }
+    if (e.altKey && size && (e.key === 'PageDown' || e.key === 'PageUp')) { e.preventDefault(); turn(from / size + (e.key === 'PageDown' ? 1 : -1)); return; }
     const move = { ArrowUp: [-1, 0], ArrowDown: [1, 0], ArrowLeft: [0, -1], ArrowRight: [0, 1], PageUp: [-20, 0], PageDown: [20, 0], Home: [0, -1e9], End: [0, 1e9] }[e.key];
     if (move) {
       e.preventDefault();
@@ -390,13 +396,14 @@ export function grid(r, o = {}) {
   }
 
   // the header's card: the full type and what the rows hold
-  let hover = 0;
+  let hover = 0, px = 0, py = 0;
   box.addEventListener('mouseover', e => {
     const th = e.target.closest('th[data-c]');
     clearTimeout(hover);
     if (!th) return;
     hover = setTimeout(() => card(th, +th.dataset.c), 450);
   });
+  box.addEventListener('mousemove', e => { px = e.clientX; py = e.clientY; }, { passive: true });
   box.addEventListener('mouseleave', () => { clearTimeout(hover); hideCard(); });
   box.addEventListener('mousedown', () => { clearTimeout(hover); hideCard(); });
   function card(th, c) {
@@ -406,18 +413,55 @@ export function grid(r, o = {}) {
     el.replaceChildren(h('div', { class: 'cd-h' }, typeMark(cols[c].type), h('b', {}, cols[c].name), h('span', { class: 'chip', title: arrow || '' }, t)),
       h('div', { class: 'cd-f' }, [range1, `${count(s.distinct)} distinct`, s.nulls ? `${count(s.nulls)} null` : 'no nulls'].filter(Boolean).map(x => h('span', {}, x))));
     el.hidden = false;
-    const r = th.getBoundingClientRect(), w = el.offsetWidth;
-    el.style.left = Math.min(innerWidth - w - 8, Math.max(8, r.left)) + 'px';
-    el.style.top = (r.bottom + 6 + el.offsetHeight < innerHeight ? r.bottom + 6 : r.top - el.offsetHeight - 6) + 'px';
+    // (above the pointer, where it hides no rows; below it only when there is no room above)
+    const b = th.getBoundingClientRect(), x = px || b.left + 12, y = py || b.top, w = el.offsetWidth, ht = el.offsetHeight;
+    el.style.left = Math.min(innerWidth - w - 8, Math.max(8, x - 14)) + 'px';
+    el.style.top = (y - ht - 12 >= 8 ? y - ht - 12 : y + 22) + 'px';
   }
+
+  // its pages: ‹ 1 … 4 5 6 … 20 ›, and the rows of the one shown
+  const pager = size ? h('span', { class: 'pager', role: 'navigation', 'aria-label': 'Pages of rows' }) : null, pages = size ? Math.ceil(r.total / size) : 1;
+  function drawPager() {
+    if (!pager) return;
+    const p = from / size, shown = [...new Set([0, p - 1, p, p + 1, pages - 1])].filter(i => i >= 0 && i < pages).sort((a, b) => a - b);
+    const go = (i, label, aria) => h('button', { class: 'pg' + (i === p && !aria ? ' on' : ''), disabled: i < 0 || i >= pages || turning, 'aria-current': i === p && !aria ? 'page' : null, 'aria-label': aria || `Page ${i + 1}`, title: aria ? `${aria} (Alt ${label === '‹' ? 'Page Up' : 'Page Down'})` : null, onclick: () => turn(i) }, label);
+    const ask = async () => { const v = +(await prompt('Go to a page', `A page from 1 to ${count(pages)}`, String(p + 1))); if (v) turn(Math.min(pages, Math.max(1, Math.round(v))) - 1); };
+    pager.classList.toggle('busy', turning);
+    pager.replaceChildren(h('span', { class: 'pg-r' }, `${count(from + 1)}–${count(from + all.length)} of ${count(r.total)}`), go(p - 1, '‹', 'The page before'),
+      ...shown.flatMap((i, k) => [k && i - shown[k - 1] > 1 ? h('button', { class: 'pg gap', title: 'Go to a page…', 'aria-label': 'Go to a page', onclick: ask }, '…') : null, go(i, count(i + 1))]).filter(Boolean), go(p + 1, '›', 'The next page'));
+  }
+  /** Show page `p`: its rows in place of these (sorted and filtered as these were). */
+  async function turn(p) {
+    if (!size || turning || p < 0 || p >= pages || p * size === from) return;
+    turning = true; drawPager();
+    try {
+      const rows = await pageRows(r, p * size, size);
+      all.length = 0; for (const x of rows) all.push(x);
+      from = r.from = p * size;
+      if (virtual) { box.scrollTop = 0; widths(); }
+      order(); o.onpage?.();
+    } catch (e) { toast(e.message, true); }
+    turning = false; drawPager();
+  }
+  drawPager();
 
   // the footer: rows, the selection's sum, and the answer's buttons (a notebook's)
   const sumBox = o.onsum ? null : h('span', { class: 'sum' });
-  const n = r.total > all.length ? `${count(all.length)} of ${count(r.total)} rows here` : `${count(r.total ?? all.length)} row${(r.total ?? all.length) === 1 ? '' : 's'}`;
+  const n = size ? pager : r.total > all.length ? `${count(all.length)} of ${count(r.total)} rows here` : `${count(r.total ?? all.length)} row${(r.total ?? all.length) === 1 ? '' : 's'}`;
   const wrap = h('div', { class: 'gridwrap' + (o.fill ? ' fill' : '') }, box);
   if (o.footer) {
+    // (views of it under it, one at a time: Chart, and those given (a notebook's SQL: its Plan))
+    const views = [['chart', 'chart', 'Chart', 'A chart of these rows', () => import('./chart.js').then(m => m.chartView(r, o.name, o.chart))], ...o.views || []];
+    const below = h('div', { class: 'chartbox', hidden: true }), vbtn = {};
+    let open = null;
+    const openView = (id, quiet) => {
+      open = open === id ? null : id; below.hidden = !open; below.replaceChildren();
+      for (const [k, el] of Object.entries(vbtn)) { el.classList.toggle('on', k === open); el.setAttribute('aria-pressed', String(k === open)); }
+      if (!quiet) o.onview?.(open);
+      const v = views.find(x => x[0] === open);
+      if (v) Promise.resolve(v[4]()).then(el => { if (open === v[0]) below.replaceChildren(el); });
+    };
     const b = (ic, label, title, fn) => h('button', { class: 'btn small', title, onclick: fn }, ic ? icon(ic) : null, label);
-    const chartBox = h('div', { class: 'chartbox', hidden: true });
     wrap.append(h('div', { class: 'meta' }, h('span', { class: 'n-rows' }, n), chip, sumBox, more,
       split('copy', 'Copy the rows (or the selection), tab-separated, with the headers', () => copyText(tsv(true), 'Copied, with the headers'),
         () => [{ head: 'Copy the rows (or the selection)' }, ...COPIES.map(([f, label, headers]) => ({ label, run: () => copyText(as(f, headers), 'Copied') }))]),
@@ -425,9 +469,10 @@ export function grid(r, o = {}) {
         { label: 'CSV', run: () => saveAs(toCsv(r), 'text/csv', `${o.name || 'rows'}.csv`) }, { label: 'TSV (tab-separated)', run: () => saveAs(toCsv(r, '\t'), 'text/tab-separated-values', `${o.name || 'rows'}.tsv`) },
         { label: 'JSON', run: () => saveAs(JSON.stringify(all.map(row => Object.fromEntries(cols.map((c, i) => [c.name, row[i]])))), 'application/json', `${o.name || 'rows'}.json`) },
         ...r.sql ? [{ head: 'Every row (it runs again)' }, ...DOWNLOADS.map(([f, label]) => ({ label, run: () => fetchRows(r, f, o.name) }))] : []]),
-      b('chart', 'Chart', 'A chart of these rows', () => { chartBox.hidden = !chartBox.hidden; if (!chartBox.hidden) import('./chart.js').then(m => chartBox.replaceChildren(m.chartView(r, o.name))); }),
-      o.explore ? b(null, 'Profile', 'Each column: its nulls, distinct values, range and spread, in the details', () => o.explore(0)) : null), chartBox);
-  } else wrap.append(h('div', { class: 'fbar' }, chip, sumBox, more));
+      ...views.map(([id, ic, label, title]) => vbtn[id] = h('button', { class: 'btn small view', title, 'aria-pressed': 'false', onclick: () => openView(id) }, icon(ic), label)),
+      o.explore ? b(null, 'Profile', 'Each column: its nulls, distinct values, range and spread, in the details', () => o.explore(0)) : null), below);
+    if (o.view && views.some(v => v[0] === o.view)) openView(o.view, true);
+  } else wrap.append(h('div', { class: 'fbar' }, pager, chip, sumBox, more));
   draw();
   wrap.grid = { refresh, select, sortBy, setFilter, setFilters, copy: tsv, text: as, box, count: () => view.length, selection: () => sel && { ...range(), row: view[sel.fr], col: sel.fc } };
   return wrap;
@@ -436,6 +481,16 @@ let cardBox;
 const cardEl = () => cardBox ||= document.body.appendChild(h('div', { class: 'hcard', role: 'tooltip', hidden: true }));
 const hideCard = () => { if (cardBox) cardBox.hidden = true; };
 addEventListener('scroll', hideCard, true);
+
+/** Rows `at…at + n` of an answer: from the node, which keeps a big answer a while (`pages.rs`); once
+ * it doesn't, its statement run again for them (without an ORDER BY, rows may then come in another order). */
+async function pageRows(r, at, n) {
+  if (r.pages) {
+    try { return (await (await call(`/sql/pages/${r.pages}?from=${at}&rows=${n}`)).json()).rows; } catch (e) { if (e.status !== 410 || !r.sql) throw e; r.pages = null; }
+  }
+  if (!r.sql) throw new Error('Its rows are no longer kept on the node: run it again');
+  return (await run(`SELECT * FROM (\n${r.sql.replace(/[\s;]+$/, '')}\n) AS q LIMIT ${n} OFFSET ${at}`, undefined, r.params)).rows;
+}
 
 /** A SQL `IN` list's values quoted as a name (for the menus of other modules). */
 export const names = cs => cs.map(c => ident(c.name)).join(', ');

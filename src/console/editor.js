@@ -6,7 +6,9 @@ import { h, esc, S, ident, sqlType, SQL_KW, menu, toast } from './core.js';
 const PY_KW = new Set('False None True and as assert async await break class continue def del elif else except finally for from global if import in is lambda nonlocal not or pass raise return try while with yield match case'.split(' '));
 const SQL_TOKEN = /--.*|\/\*|'|"|\b\d+(?:\.\d+)?(?:[eE][+-]?\d+)?\b|[A-Za-z_][\w$]*/g;
 const PY_TOKEN = /#.*|[rRbBfFuU]{0,2}(?:"""|'''|"|')|\b\d[\d_]*(?:\.\d+)?(?:[eE][+-]?\d+)?\b|[A-Za-z_]\w*/g;
-const MD_TOKEN = /^#{1,6}\s.*$|`[^`]*`|\*\*[^*]+\*\*|\b\d+\b/g;
+// (Markdown: headings, list marks and quotes, code, emphasis, links and pictures; `md.js` draws it)
+const MD_TOKEN = /^#{1,6}\s.*$|^\s*(?:[-*+]|\d+[.)])(?=\s)|^\s*>|^\s*(?:```|~~~).*$|`[^`]*`|\*\*[^*]+\*\*|(?<![\w*])[*_][^*_\s][^*_]*[*_](?![\w*])|~~[^~]+~~|!?\[[^\]]*\]\([^)]*\)/g;
+const MD_CLS = { '#': 'k', '`': 's', '~': 'f', '*': 'f', _: 'f', '[': 'nu', '!': 'nu' };
 const span = (cls, t) => !t ? '' : cls ? `<span class="${cls}">${esc(t)}</span>` : esc(t);
 /** Where a quoted run ends, looking from `from`: after its closing `q` (a doubled quote, or with
  * `bs` one after a backslash, stays inside), or -1 when the line ends first. */
@@ -65,7 +67,7 @@ const LINE = {
   markdown(s) {
     let out = '', i = 0;
     MD_TOKEN.lastIndex = 0;
-    for (let m; (m = MD_TOKEN.exec(s));) { out += esc(s.slice(i, m.index)) + span({ '#': 'k', '`': 's', '*': 'f' }[m[0][0]] || 'nu', m[0]); i = MD_TOKEN.lastIndex; }
+    for (let m; (m = MD_TOKEN.exec(s));) { const t = m[0].trimStart(); out += esc(s.slice(i, m.index)) + span(/^([-*+>]|\d+[.)])$/.test(t) ? 'c' : /^(```|~~~)/.test(t) ? 's' : MD_CLS[t[0]] || 'c', m[0]); i = MD_TOKEN.lastIndex; }
     return [out + esc(s.slice(i)), ''];
   },
   text: s => [esc(s), ''],
@@ -80,49 +82,6 @@ export function highlight(text, lang) {
 }
 /** Whole highlighted HTML (a view's definition, read-only). */
 export const highlighted = (text, lang) => highlight(text, lang).join('\n');
-
-// ------------------------------------------------------------------ Markdown (text cells)
-export function markdown(src) {
-  const inline = s => {
-    const codes = [];
-    s = esc(s).replace(/`([^`]+)`/g, (_, c) => (codes.push(c), `\u0000${codes.length - 1}\u0000`));
-    s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>').replace(/(^|[^*\w])\*([^*\s][^*]*?)\*(?!\w)/g, '$1<em>$2</em>')
-      .replace(/(^|[^\w])_([^_\s][^_]*?)_(?!\w)/g, '$1<em>$2</em>')
-      .replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (_, text, url) => /^(https?:|mailto:|#|\/|\.)/i.test(url.replace(/&amp;/g, '&')) ? `<a href="${url}" target="_blank" rel="noopener noreferrer">${text}</a>` : text);
-    return s.replace(/\u0000(\d+)\u0000/g, (_, i) => `<code>${codes[i]}</code>`);
-  };
-  const lines = src.replace(/\r/g, '').split('\n'), item = /^\s*([-*+]|\d+[.)])\s+/, block = /^(```|#{1,6}\s|>|\s*([-*+]|\d+[.)])\s+|\s*(---|\*\*\*|___)\s*$)/;
-  let html = '', i = 0;
-  while (i < lines.length) {
-    const l = lines[i];
-    let m;
-    if (/^```/.test(l)) {
-      const code = [];
-      for (i++; i < lines.length && !/^```/.test(lines[i]); i++) code.push(lines[i]);
-      i++;
-      html += `<pre><code>${esc(code.join('\n'))}</code></pre>`;
-    } else if ((m = l.match(/^(#{1,6})\s+(.*)$/))) {
-      html += `<h${m[1].length}>${inline(m[2])}</h${m[1].length}>`; i++;
-    } else if (item.test(l)) {
-      const tag = /^\s*\d/.test(l) ? 'ol' : 'ul', items = [];
-      while (i < lines.length && item.test(lines[i])) items.push(lines[i++].replace(item, ''));
-      html += `<${tag}>${items.map(x => `<li>${inline(x)}</li>`).join('')}</${tag}>`;
-    } else if (/^>/.test(l)) {
-      const quote = [];
-      while (i < lines.length && /^>/.test(lines[i])) quote.push(lines[i++].replace(/^>\s?/, ''));
-      html += `<blockquote>${inline(quote.join(' '))}</blockquote>`;
-    } else if (/^\s*(---|\*\*\*|___)\s*$/.test(l)) {
-      html += '<hr>'; i++;
-    } else if (!l.trim()) {
-      i++;
-    } else {
-      const para = [];
-      do para.push(lines[i++]); while (i < lines.length && lines[i].trim() && !block.test(lines[i]));
-      html += `<p>${inline(para.join('\n')).replace(/\n/g, ' ')}</p>`;
-    }
-  }
-  return html || '<p class="hint">Empty text. Double-click to write (Markdown).</p>';
-}
 
 // ------------------------------------------------------------------ the editor
 const LINE_H = 21; // (px: --code-lh in console.css)
@@ -163,12 +122,12 @@ export class Editor {
       this.language !== 'markdown' ? { label: 'Comment the lines, or uncomment them', keys: `${mod} /`, run: () => { ta.focus(); comment(this); } } : null,
       ...this.menu?.(some) || []]);
   }
-  /** Replace what is selected (or, with nothing selected, all of it) by `f` of it (`f` may answer
-   * later: the node's Python formats Python); if `f` fails, changes nothing, or the text changed
-   * meanwhile, it stays as it was. Indented lines are formatted as if they weren't, then indented
-   * back; a last new line stays as it was. */
-  async reformat(f) {
-    const ta = this.ta, some = ta.selectionStart !== ta.selectionEnd, [a0, b0] = some ? [ta.selectionStart, ta.selectionEnd] : [0, ta.value.length];
+  /** Replace what is selected (or, with nothing selected or `whole`, all of it) by `f` of it (`f`
+   * may answer later: the node's Python formats Python); if `f` fails, changes nothing, or the text
+   * changed meanwhile, it stays as it was. Indented lines are formatted as if they weren't, then
+   * indented back; a last new line stays as it was. */
+  async reformat(f, whole) {
+    const ta = this.ta, some = !whole && ta.selectionStart !== ta.selectionEnd, [a0, b0] = some ? [ta.selectionStart, ta.selectionEnd] : [0, ta.value.length], caret = ta.selectionStart;
     const before = ta.value, text = before.slice(a0, b0), pad = text.match(/^[ \t]*(?=\S)/gm)?.reduce((a, b) => b.length < a.length ? b : a) || '';
     let out;
     try { out = await f(pad ? text.replace(new RegExp('^' + pad, 'gm'), '') : text); }
@@ -179,7 +138,13 @@ export class Editor {
     if (out === text) return;
     if (ta.value !== before) return toast('It changed while it was being formatted: left as it was', true);
     ta.focus(); ta.setSelectionRange(a0, b0);
-    insert(ta, out); ta.setSelectionRange(a0, a0 + out.length);
+    insert(ta, out);
+    if (some) ta.setSelectionRange(a0, a0 + out.length); else { ta.setSelectionRange(Math.min(caret, out.length), Math.min(caret, out.length)); this.reveal(); } // (the whole: the caret about where it was)
+  }
+  /** A menu's Format items: the whole `what`'s, and the selection's (Shift+Alt+F formats the selection when there is one, else the whole). */
+  formats(f, what = 'file', always) {
+    const some = !!this.selected();
+    return [{ label: `Format ${what}`, icon: 'format', keys: some ? null : 'Shift Alt F', run: () => this.reformat(f, true) }, some || always ? { label: 'Format selection', keys: some ? 'Shift Alt F' : null, disabled: !some, run: () => this.reformat(f) } : null];
   }
   get value() { return this.ta.value; }
   set value(v) { this.ta.value = v; this.paint(); }

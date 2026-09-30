@@ -1109,7 +1109,17 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    table's profile (`details.js`), a data file (`data.js`), charts
    (`chart.js`), plans (`plan.js`) and their style (`more.css`) load the first time they are used,
    through `R.helpers` (no import of `console.js`); each at most 8 KB gzipped. The first load stays
-   within 149's 70 KB. `console_check.py` (`budget`).
+   within 149's 70 KB. Markdown (`md.js`), Jobs (`jobs.js`), Settings and the key list
+   (`settings.js`), and the files' menus and what they do (`more.js`) too. `console_check.py` (`budget`).
+171. **A page of an answer is that answer's rows** (`pages.rs`, `server::page`): an answer of more
+   rows than `typed` sends at once is kept whole, under a random id, and a page is a slice of it: the
+   same rows in the same order, never the query run again while it is kept. Kept within
+   `PONDRA_PAGES_MB`, 20 minutes after it was last read; a page of one gone is `410`, never another
+   answer's rows. `harness.py found`, `console_check.py` (`grid`).
+172. **A notebook's Markdown runs nothing** (`md.js`): the text's HTML is escaped but for tags that
+   can't run script or load anything (`br`, `kbd`, `sub`, `sup`, `u`, `mark`, …, no attributes); a
+   link is followed only to `http(s):`, `mailto:`, a place in the page or a lake file; a picture is
+   `http(s):`, a `data:image/…` or a lake file read with the page's token. `console_check.py` (`work`).
 
 ## Tests: run these before and after any change
 
@@ -1247,7 +1257,10 @@ its code); the plan as a graph with a profile; charts to choose and save; Format
 dialog, light first, colours per theme, kept on the machine (168); Python found without waiting on
 a broken one, chosen in the console, interrupted by Stop, never out of step (166, 167); the first
 load back under 70 KB, the rest loaded when first used (170). The Docs workflow builds from a clean
-checkout again.
+checkout again. **The owner's second list:** Markdown cells drawn as GitHub does (172), a SQL cell's
+Chart and Plan kept with its notebook, tabs that scroll and pin, pages of rows kept on the node (171),
+Jobs apart from History (`register.jobKind`), a clearer Data tree, the header's card above the
+pointer, Format selection and Format file, Settings as sections with a search (`register.setting`).
 
 **Round 28 (ADR-029 phase 2): other engines' changes as written.** Spark's `DELETE`, `UPDATE` and
 `MERGE` copy-on-write and merge-on-read, PyIceberg's `delete` and `overwrite`, through the catalog,

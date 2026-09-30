@@ -1,6 +1,6 @@
 # Prototype status: Pondra, a streamhouse in one binary
 
-**Date:** 2026-09-30 (the workspace, rounds 27 and 28, and round 29 part 1) · **Plan:** ADR-002 to ADR-034, `roadmap.md` · **Code:** `pondra.zip` / `pondra.bundle` (≈30,700 lines of Rust, plus Python and JavaScript clients, a documentation website, packaging, and test and benchmark tools)
+**Date:** 2026-10-01 (the workspace, rounds 27 and 28, and round 29 part 1 with the owner's second list) · **Plan:** ADR-002 to ADR-034, `roadmap.md` · **Code:** `pondra.zip` / `pondra.bundle` (≈30,700 lines of Rust, plus Python and JavaScript clients, a documentation website, packaging, and test and benchmark tools)
 **Name:** the prototype formerly called `lh` is now **Pondra**. The name is free on crates.io, PyPI and npm. A small personal-finance app uses it (pondra.app), a different category; run a trademark search before a public launch.
 
 ## Where it stands
@@ -51,7 +51,18 @@ Start more copies on the same bucket to scale out. The only state is object stor
    the Copy and Download menus; scrolling 10,000 rows (p95 27.7 → 17–20 ms). Measured: page ready
    in 0.2 s, 10,000 rows drawn in 0.11 s, a 40-cell notebook run in 1.05 s; typing in a
    1,000-line file 28 ms a key (a new editor: round 34).
-9. **Found and fixed:** the Docs workflow failed on a clean checkout since round 26 (`site/public/`
+9. **The owner's second list** (from screenshots of the reviewed console; ADR-034): **Markdown**
+   cells drawn as GitHub does (tables, pictures from the lake, task lists, links that open lake
+   files, SQL highlighted; no HTML that can run), and a `.md` file's Preview; a SQL cell's **Chart**
+   and **Plan** under its answer, kept with the notebook; **tabs** that scroll (a thin bar, the
+   wheel, ⌄ for all) and **pin**; **pages of rows** for answers over 10,000 (`‹ 1 2 3 ›`), the
+   node keeping the answer (`pages.rs`, `GET /sql/pages/{id}`) so a page is the same rows without
+   running the query again; **Jobs** apart from History, a card a schedule with its last runs, room
+   for pipelines (`register.jobKind`); the Data tree's columns a level in, with guides; the header
+   card above the pointer; **Format selection** and **Format file** in every menu; **Settings** as
+   sections with a search, Keys one of them, room for users, tokens and audit
+   (`register.setting`). The first load stays under 70 KB (69.5).
+10. **Found and fixed:** the Docs workflow failed on a clean checkout since round 26 (`site/public/`
    didn't exist); a `pop` dialog showed "null"; a menu under a button on the left opened off to its
    left; clicking a statement's answer selected it in the editor, so the next Run ran it alone.
 10. **Tests** (`logs/round29/`): `console_check.py` (81, axe light and dark included), `harness.py

@@ -9,15 +9,19 @@ const PALETTE = ['var(--accent)', 'var(--c2)', 'var(--c3)', 'var(--t-time)', 'va
 const TYPES = [['auto', 'Automatic'], ['bar', 'Bars'], ['line', 'Lines'], ['area', 'Areas'], ['point', 'Points'], ['pie', 'Pie']];
 const isTime = c => /^(Date|Timestamp)/.test(c?.type || '');
 
-/** An answer's chart and its settings: how (the type), by what (x), of what (the numbers). */
-export function chartView(r, name = 'chart') {
-  const cols = r.columns, nums = cols.map((c, i) => numeric(c.type) ? i : -1).filter(i => i >= 0);
+/** An answer's chart and its settings: how (the type), by what (x), of what (the numbers). `keep.st`
+ * keeps them by the columns' names: the answer again (run again, a page turned) is charted as it was. */
+export function chartView(r, name = 'chart', keep = {}) {
+  const cols = r.columns, nums = cols.map((c, i) => numeric(c.type) ? i : -1).filter(i => i >= 0), at = n => cols.findIndex(c => c.name === n);
   let x = cols.findIndex(isTime);
   if (x < 0) x = cols.findIndex((c, i) => !numeric(c.type));
-  const st = { type: 'auto', x, ys: nums.filter(i => i !== x).slice(0, 1) }; // (one number to start: others on its scale may not show; Of… adds them)
+  let st = { type: 'auto', x, ys: nums.filter(i => i !== x).slice(0, 1) }; // (one number to start: others on its scale may not show; Of… adds them)
+  const was = keep.st, ys = was?.ys.map(at).filter(i => nums.includes(i));
+  if (ys?.length && (was.x == null || at(was.x) >= 0)) st = { type: was.type, x: was.x == null ? -1 : at(was.x), ys };
   const box = h('div', { class: 'chart' });
   const pick = (label, value, options, on) => h('label', { class: 'csel' }, label, h('select', { onchange: e => { on(e.target.value); draw(); } }, options.map(([v, t]) => h('option', { value: v, selected: String(v) === String(value) }, t))));
   const draw = () => {
+    keep.st = { type: st.type, x: st.x >= 0 ? cols[st.x].name : null, ys: st.ys.map(i => cols[i].name) };
     const art = nums.length ? render(r, st) : h('div', { class: 'empty' }, 'Nothing to chart: the answer needs a column of numbers.');
     const ofWhat = h('button', { class: 'btn small', title: 'The numbers it shows', onclick: e => menu(e.currentTarget, nums.map(i => ({ label: cols[i].name, checked: st.ys.includes(i), run: () => { st.ys = st.ys.includes(i) ? st.ys.filter(j => j !== i) : [...st.ys, i].sort((a, b) => a - b); draw(); } }))) },
       `Of ${st.ys.map(i => cols[i].name).join(', ') || '…'}`, icon('chevd', 'ic', 12));

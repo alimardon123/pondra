@@ -36,6 +36,7 @@ mod log;
 mod manifest;
 mod metrics;
 mod optimize;
+mod pages;
 mod mcp;
 mod pg;
 mod pg_catalog;

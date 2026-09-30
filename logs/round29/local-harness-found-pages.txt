@@ -1,0 +1,37 @@
+/usr/local/lib/python3.11/dist-packages/adbc_driver_manager/dbapi.py:369: Warning: Cannot disable autocommit; conn will not be DB-API 2.0 compliant
+  warnings.warn(
+{"time":"2026-10-01T02:55:33.027687372+05:00","level":"ERROR","msg":"FlightSQL endpoint stream ended with error","connection_id":"conn-8e9743ba764e","statement_id":"stmt-01e413e8fb2d","endpointIndex":0,"numEndpoints":1,"ticketBytes":102,"locations":"<empty: using default client connection>","err":"rpc error: code = Canceled desc = context canceled","batchesRead":1,"recordsRead":1,"approxBytesRead":8,"elapsed":295114,"timeToFirstBatch":39746,"timeSinceLastBatch":256234}
+%6|1790805334.263|FAIL|rdkafka#producer-1| [thrd:127.0.0.1:8110/2111747765]: 127.0.0.1:8110/2111747765: Disconnected: connection closed by peer: receive 0 after POLLIN (after 1094ms in state UP)
+{
+ "found": {
+  "a filtered materialized view follows UPDATE and DELETE of its table": true,
+  "seq 0 refused, by HTTP and by Flight, and nothing written": true,
+  "refused at CREATE: a merge table leaving a column unmerged, an unknown WITH option, CREATE EXTERNAL TABLE": true,
+  "a value that doesn't cast is refused (INSERT \u2026 VALUES, DoPut), not stored as NULL": true,
+  "a task into a keyed table made in SQL": true,
+  "INSERT \u2026 ON CONFLICT DO NOTHING / DO UPDATE, UPDATE \u2026 FROM, DELETE \u2026 USING, TRUNCATE": true,
+  "BINARY, VARBINARY, BLOB, VARIANT and JSON columns; substr on bytes and on text (its arguments named too)": true,
+  "FROM-first with WHERE and ORDER BY; a comment before CREATE FUNCTION": true,
+  "COPY \u2026 TO STDOUT with HEADER: the header, then the rows, counted": true,
+  "TIMESTAMPTZ is an instant, shown in UTC with its zone (JSON, Postgres text and binary); TIMESTAMP has none": true,
+  "a write token's DROP TABLE is refused as a change to the lake's tables": true,
+  "PUT /files twice: refused by name, no server path; files() and file_read() with or without files/": true,
+  "async calls inside async calls (Python functions, file_read) in SELECT, WHERE, GROUP BY, INSERT \u2026 VALUES; no Python found, said so": true,
+  "a Flight function is callable as soon as it is made, and gone once dropped": true,
+  "ADBC: username/password (unpadded base64), ingest create/append/create_append/replace, table types": true,
+  "DEFAULT for a column a write leaves out (INSERT, DEFAULT, append, COPY, Flight, Kafka, bulk INSERT), each row its own": true,
+  "NOT NULL refused by name on every door (a key's columns too); a bad DEFAULT refused at CREATE; ADD COLUMN \u2026 DEFAULT refused": true,
+  "read your writes on a follower: an INSERT then a SELECT, one request or two, and an UPDATE (40 times)": true,
+  "pondra run: --url and parameters in any order; a lake and --url together refused": true,
+  "pondra sql: no lake there said so; a write makes one; files in CTAS and INSERT; errors without backtraces": true,
+  "pondra sql: NOT NULL refused, DEFAULT filled (its own writes to the log)": true,
+  "a time without seconds is a timestamp: INSERT, CAST, TIMESTAMP '\u2026', a comparison": true,
+  "information_schema: a table is a BASE TABLE, a view a VIEW": true,
+  "format=typed: decimals and integers past 2^53 exact (as text), others as numbers": true,
+  "format=typed: 10,000 rows of a bigger answer, and an id its other pages are read with (the same rows, not run again); 410 once not kept": true,
+  "to_timestamp(column) and to_timestamp_millis(column, format): TIMESTAMP (no zone; UTC's time for text with one), as over a literal": true,
+  "to_timestamp answers TIMESTAMP (DataFusion's, Spark's), now() TIMESTAMPTZ in UTC": true,
+  "files() after PUT /files lists the new file (never a remembered answer)": true
+ },
+ "ok": true
+}
