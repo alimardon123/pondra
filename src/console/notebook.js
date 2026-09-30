@@ -7,9 +7,9 @@ import { Editor, markdown, formatSql } from './editor.js';
 // ------------------------------------------------------------------ what a cell answered
 export function doneText(v) {
   if (v == null || typeof v !== 'object') return v == null ? 'Done.' : String(v);
-  const entries = Object.entries(v).filter(([k]) => k !== 'called' || v.called !== 'do');
+  const entries = Object.entries(v).filter(([k, x]) => (k !== 'called' || v.called !== 'do') && x != null && !(Array.isArray(x) && !x.length)); // (nothing said for what is empty)
   if (!entries.length) return v.called === 'do' ? '' : 'Done.';
-  return entries.map(([k, x]) => `${k.replace(/_/g, ' ')} ${typeof x === 'string' ? x : JSON.stringify(x)}`).join(' · ');
+  return entries.map(([k, x]) => k === 'rows' && typeof x === 'number' ? `${count(x)} row${x === 1 ? '' : 's'}` : `${k.replace(/_/g, ' ')} ${typeof x === 'string' ? x : JSON.stringify(x)}`).join(' · ');
 }
 /** An answer drawn by the first view that takes it (errors, rows, figures, text, what it did). */
 export function answer(r, cell) {
@@ -126,6 +126,8 @@ export class Cell {
       this.idle(); this.nb.running();
     }
     r.ms = performance.now() - t0;
+    // (one query: Download can fetch every row of it again, not only those shown)
+    if (this.kind === 'sql' && r.kind === 'rows' && !text.replace(/;\s*$/, '').includes(';') && /^\s*(select|with|from|values|table)\b/i.test(text.replace(/--[^\n]*|\/\*[\s\S]*?\*\//g, ' '))) r.sql = text;
     this.show(r);
     if (r.kind === 'rows' && this.type.live && this.liveBox.checked) this.startLive();
     this.nb.changed(true);

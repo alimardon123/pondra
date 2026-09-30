@@ -133,8 +133,11 @@ header{height:48px;display:flex;align-items:center;gap:10px;padding:0 10px 0 16p
 #rbody>.vbox{padding:0;overflow:visible}
 
 /* tabs, and the toolbar of the document in front */
-#tabbar{display:flex;align-items:flex-end;gap:2px;height:36px;padding:0 8px 0 0;background:var(--chrome);border-bottom:1px solid var(--line);flex:none;overflow-x:auto;overflow-y:hidden}
+#tabbar{display:flex;align-items:flex-end;gap:2px;height:36px;padding:0 8px 0 0;background:var(--chrome);border-bottom:1px solid var(--line);flex:none;overflow:hidden}
 .tlist{display:flex;align-items:flex-end;gap:2px;min-width:0;align-self:stretch}#rtabs .tlist{align-items:center}
+/* (many tabs: each gives way to 96px, then the list scrolls, its + in reach) */
+#tabbar .tlist{overflow-x:auto;overflow-y:hidden;scrollbar-width:none}#tabbar .tlist::-webkit-scrollbar{display:none}
+#tabbar .tab{flex:0 1 auto;min-width:96px}#tabbar .tab .tn{min-width:0}
 .tab{display:flex;align-items:center;gap:8px;height:31px;margin-bottom:-1px;padding:0 6px 0 12px;border:1px solid transparent;border-bottom:0;border-radius:8px 8px 0 0;color:var(--muted);font-size:13px;white-space:nowrap;background:transparent;position:relative;cursor:pointer;flex:none}
 .tab:first-child{margin-left:-1px}
 .tab:not(.on):hover{background:var(--hover)}
@@ -287,7 +290,7 @@ header{height:48px;display:flex;align-items:center;gap:10px;padding:0 10px 0 16p
 .pinfo .sum:not(:empty){margin-right:4px;padding-right:10px;border-right:1px solid var(--line)}
 .bar-sep{color:var(--line)}
 .pbody{flex:1;min-height:0;overflow:auto;padding:10px 12px;display:flex;flex-direction:column}
-.pbody>.said,.pbody>.err{max-height:none;flex:1}
+.pbody>.said{max-height:none;flex:1}.pbody>.err{max-height:none;flex:none}
 .stmts{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 10px;flex:none}
 .stmt{display:inline-flex;align-items:center;gap:7px;height:26px;padding:0 10px 0 4px;border:1px solid var(--line);border-radius:7px;background:var(--surface);color:var(--muted);font-size:12px;cursor:pointer}
 .stmt b{display:inline-grid;place-items:center;min-width:18px;height:18px;padding:0 4px;border-radius:5px;background:var(--hover);color:var(--ink);font-size:11px;font-weight:600}
@@ -409,7 +412,7 @@ dialog input:focus,dialog select:focus{outline:2px solid var(--accent);outline-o
 #tokenIn{font-family:var(--mono)}
 /* (the first button is Enter's) */
 .acts{display:flex;flex-direction:row-reverse;gap:8px;margin-top:16px}
-.keys{display:grid;grid-template-columns:auto 1fr;gap:6px 16px;font-size:13px;align-items:baseline;max-height:60vh;overflow:auto}
+.keys:focus{outline:none}.keys{display:grid;grid-template-columns:auto 1fr;gap:6px 16px;font-size:13px;align-items:baseline;max-height:60vh;overflow:auto}
 .keys h4{grid-column:1/-1;margin:12px 0 0;font-size:12px;color:var(--muted)}
 #toast{position:fixed;bottom:40px;left:50%;transform:translateX(-50%);background:var(--ink);color:var(--surface);padding:8px 14px;border-radius:9px;font-size:13px;opacity:0;transition:opacity .2s;pointer-events:none;max-width:80vw;z-index:40}
 #toast.on{opacity:.96}#toast.bad{background:var(--err);color:#fff}

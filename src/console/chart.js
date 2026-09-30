@@ -14,7 +14,7 @@ export function chartView(r, name = 'chart') {
   const cols = r.columns, nums = cols.map((c, i) => numeric(c.type) ? i : -1).filter(i => i >= 0);
   let x = cols.findIndex(isTime);
   if (x < 0) x = cols.findIndex((c, i) => !numeric(c.type));
-  const st = { type: 'auto', x, ys: nums.filter(i => i !== x).slice(0, 3) };
+  const st = { type: 'auto', x, ys: nums.filter(i => i !== x).slice(0, 1) }; // (one number to start: others on its scale may not show; Of… adds them)
   const box = h('div', { class: 'chart' });
   const pick = (label, value, options, on) => h('label', { class: 'csel' }, label, h('select', { onchange: e => { on(e.target.value); draw(); } }, options.map(([v, t]) => h('option', { value: v, selected: String(v) === String(value) }, t))));
   const draw = () => {

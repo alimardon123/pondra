@@ -1,7 +1,7 @@
 // The result grid (ADR-034): query answers, notebook outputs and data files. It draws only the
 // rows in sight; a cell, a range, a row or a column can be selected and copied (tab-separated,
 // so a spreadsheet takes it as cells); a data file's cells are edited in place.
-import { h, icon, svg, count, numeric, sqlType, typeKind, typeMark, menu, toast, saveAs, quote, ident, pop } from './core.js';
+import { h, icon, svg, count, numeric, sqlType, typeKind, typeMark, menu, toast, saveAs, quote, ident, pop, call } from './core.js';
 
 const ROW_H = 30; // the height of a row when only the rows in sight are drawn
 let measurer;
@@ -126,16 +126,23 @@ export function grid(r, o = {}) {
   let drawn = 0, frame = 0;
   const more = h('button', { class: 'btn small', onclick: () => draw() });
   let editing = null; // (a cell being edited: its rows stay while it is in sight; scrolled away, it is kept)
+  let topGap = null, endGap = null, dFrom = 0, dTo = 0; // (the rows drawn: from dFrom to dTo, between two spacers)
+  const rowsOf = (a, b) => { const f = document.createDocumentFragment(); for (let k = a; k < b; k++) f.append(rowOf(k)); return f; };
   function draw() {
     if (virtual) {
       const top = box.scrollTop, seen = box.clientHeight || 520, from = Math.max(0, Math.floor(top / ROW_H) - 12), to = Math.min(view.length, Math.ceil((top + seen) / ROW_H) + 12);
       if (editing) return editing.k >= from && editing.k < to ? undefined : editing(true);
-      const frag = document.createDocumentFragment();
-      drawnRows.clear();
-      frag.append(gap(from * ROW_H));
-      for (let k = from; k < to; k++) frag.append(rowOf(k));
-      frag.append(gap((view.length - to) * ROW_H));
-      body.replaceChildren(frag);
+      if (!drawnRows.size || to <= dFrom || from >= dTo || !topGap?.isConnected) { // (all of it again)
+        drawnRows.clear();
+        topGap = gap(from * ROW_H); endGap = gap((view.length - to) * ROW_H);
+        body.replaceChildren(topGap, rowsOf(from, to), endGap);
+      } else { // (scrolled: the rows that left go, those that came are added; the rest stay as they are)
+        for (const [k, tr] of drawnRows) if (k < from || k >= to) { tr.remove(); drawnRows.delete(k); }
+        if (from < dFrom) topGap.after(rowsOf(from, dFrom));
+        if (to > dTo) endGap.before(rowsOf(dTo, to));
+        topGap.firstChild.style.height = from * ROW_H + 'px'; endGap.firstChild.style.height = (view.length - to) * ROW_H + 'px';
+      }
+      dFrom = from; dTo = to;
       more.hidden = true;
     } else {
       const end = Math.min(view.length, drawn + (drawn ? 1000 : 200)), frag = document.createDocumentFragment();
@@ -412,8 +419,12 @@ export function grid(r, o = {}) {
     const b = (ic, label, title, fn) => h('button', { class: 'btn small', title, onclick: fn }, ic ? icon(ic) : null, label);
     const chartBox = h('div', { class: 'chartbox', hidden: true });
     wrap.append(h('div', { class: 'meta' }, h('span', { class: 'n-rows' }, n), chip, sumBox, more,
-      b('copy', 'Copy', 'Copy the rows (or the selection), tab-separated, with the headers', () => copyText(sel ? tsv(true) : [cols.map(c => c.name), ...all.map(row => cols.map((_, c) => text(row, c) ?? ''))].map(l => l.join('\t')).join('\n'), 'Copied, with the headers')),
-      b(null, 'CSV', 'The rows here, as CSV', () => saveAs(toCsv(r), 'text/csv', `${o.name || 'rows'}.csv`)),
+      split('copy', 'Copy the rows (or the selection), tab-separated, with the headers', () => copyText(tsv(true), 'Copied, with the headers'),
+        () => [{ head: 'Copy the rows (or the selection)' }, ...COPIES.map(([f, label, headers]) => ({ label, run: () => copyText(as(f, headers), 'Copied') }))]),
+      split('down', 'Download the rows here as CSV', () => saveAs(toCsv(r), 'text/csv', `${o.name || 'rows'}.csv`), () => [{ head: 'The rows here' },
+        { label: 'CSV', run: () => saveAs(toCsv(r), 'text/csv', `${o.name || 'rows'}.csv`) }, { label: 'TSV (tab-separated)', run: () => saveAs(toCsv(r, '\t'), 'text/tab-separated-values', `${o.name || 'rows'}.tsv`) },
+        { label: 'JSON', run: () => saveAs(JSON.stringify(all.map(row => Object.fromEntries(cols.map((c, i) => [c.name, row[i]])))), 'application/json', `${o.name || 'rows'}.json`) },
+        ...r.sql ? [{ head: 'Every row (it runs again)' }, ...DOWNLOADS.map(([f, label]) => ({ label, run: () => fetchRows(r, f, o.name) }))] : []]),
       b('chart', 'Chart', 'A chart of these rows', () => { chartBox.hidden = !chartBox.hidden; if (!chartBox.hidden) import('./chart.js').then(m => chartBox.replaceChildren(m.chartView(r, o.name))); }),
       o.explore ? b(null, 'Profile', 'Each column: its nulls, distinct values, range and spread, in the details', () => o.explore(0)) : null), chartBox);
   } else wrap.append(h('div', { class: 'fbar' }, chip, sumBox, more));
@@ -428,3 +439,18 @@ addEventListener('scroll', hideCard, true);
 
 /** A SQL `IN` list's values quoted as a name (for the menus of other modules). */
 export const names = cs => cs.map(c => ident(c.name)).join(', ');
+
+// ------------------------------------------------------------------ copies and downloads: a button and its forms
+/** A button and its ▾: the usual way on a click, the others in its menu (Copy, Download). */
+export const split = (ic, title, run, items, disabled) => h('span', { class: 'split' }, h('button', { class: 'icon', title, 'aria-label': title, disabled, onclick: run }, icon(ic)),
+  h('button', { class: 'icon caret', title: 'Other forms', 'aria-label': 'Other forms', 'aria-haspopup': 'menu', disabled, onclick: e => menu(e.currentTarget, items()) }, icon('chevd', 'ic', 12)));
+export const DOWNLOADS = [['csv', 'CSV'], ['tsv', 'TSV (tab-separated)'], ['json', 'JSON'], ['ndjson', 'JSON lines'], ['parquet', 'Parquet'], ['xlsx', 'Excel (.xlsx)']];
+/** Every row of an answer, in a file to download: its statement again on the node, in that format. */
+export async function fetchRows(r, f, name) {
+  toast('Preparing the download…');
+  try {
+    const body = r.params && Object.keys(r.params).length ? JSON.stringify({ sql: r.sql, params: r.params }) : r.sql;
+    const res = await call('/sql?format=' + f, { method: 'POST', body, headers: { 'content-type': r.params && Object.keys(r.params).length ? 'application/json' : 'text/plain; charset=utf-8' } });
+    saveAs(await res.blob(), res.headers.get('content-type') || 'application/octet-stream', `${name || 'rows'}.${f === 'ndjson' ? 'jsonl' : f}`);
+  } catch (e) { toast('Not downloaded: ' + e.message, true); }
+}

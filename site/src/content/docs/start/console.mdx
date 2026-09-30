@@ -47,7 +47,9 @@ pondra serve lake        # then open http://localhost:8080
   it has changes not saved; a new file gets it once you type in it. The file's toolbar shows **Save**
   only when there is something to save, and **Ctrl+S** saves the one in front.
 - **The right pane:** **Details**, **Variables** and **History** (the node's jobs and schedules, and
-  what this page ran). Drag a tab to put it in another place.
+  what this page ran). Drag a tab to put it in another place. Details follows the tab in front; a
+  table you pick stays there until you switch tabs. In a window up to 1180 px wide the pane opens
+  over the page when you pick a table or a column, and closes as soon as you go back to your work.
 - **Each view's ⋯** moves it to the other pane: Workspace can sit as a tab on the right, for
   instance. Drag a pane's edge to set its width (a double-click resets it).
 
@@ -183,7 +185,8 @@ keeps the value, **Tab** moves right, **Esc** undoes. **Add row** and **Add colu
 table. A changed cell is tinted, a new row too, until you save; the toolbar says what changed, with
 **Discard** and **Save**. The lines you didn't touch are saved
 exactly as they were. **Query with SQL** reads the file as a table in a SQL tab. A Parquet file, or
-a file over 10 MB, opens read-only (the first 10,000 rows): load it into a table to change it.
+a file over 10 MB, opens read-only (the first 10,000 rows): load it into a table to change it. A
+JSON file that isn't a list of rows (a settings file, say) opens as text.
 
 ## Answers, in a grid
 
@@ -212,8 +215,9 @@ Every answer (a cell's, a SQL file's) and every data file is shown in the same g
 Type SQL and press **Ctrl+Enter** (**⌘+Enter** on a Mac), or click the cell's **Run**. The answer
 shows below the cell: the rows, each column's type, how many rows there are, and how long it took.
 **Tab** completes a name: a table's, a column's (the columns of the tables the cell names come
-first), a function's or a SQL word. When several fit, it lists them; **↑** **↓** and **Enter**
-pick one.
+first), a function's or a SQL word. After a table's name or its alias and a dot (`o.`), it lists
+that table's columns; after a schema's (`sales.`), its tables. When several fit, it lists them;
+**↑** **↓** and **Enter** pick one.
 
 ```sql
 SELECT item, count(*) AS sales, sum(amount) AS total
@@ -227,8 +231,9 @@ ORDER BY total DESC;
 - A statement that changes something (`INSERT`, `CREATE TABLE`) shows what it did, such as
   `rows 3`, and the tables on the left update.
 - Errors come back in plain words, such as `No field named nope. Did you mean 'sales.item'?`.
-- The console shows the first 10,000 rows of an answer, and the **CSV** button saves them. To export
-  more, use [`COPY … TO`](/pondra/guides/files-and-other-lakes/).
+- The console shows the first 10,000 rows of an answer. Below it, **Copy ▾** copies them in any of
+  the forms a SQL file offers, and **Download ▾** saves them as CSV, TSV or JSON; a cell that is one
+  query can also download every row, not only those shown (it runs again on the node).
 - Decimals keep their digits (`1.50`), and integers too big for JavaScript arrive as text, so what
   you see is exactly what the lake holds.
 

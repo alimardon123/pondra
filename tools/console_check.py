@@ -32,7 +32,7 @@
   sets its width (kept); the tabs open again after a reload; a narrow window: no sideways scroll,
   the panes drawers; axe finds nothing (contrast included), light and dark.
 - budget (ADR-034 §7): the scripts and style sheet the page loads, gzipped as the node serves them,
-  <= 70 KB, and those loaded when first used (chart, plan, more, data) <= 8 KB each; each answers
+  <= 70 KB, and those loaded when first used (chart, plan, more, details, data) <= 8 KB each; each answers
   304 when the browser has it; first paint < 400 ms; typing in a 1,000-line file < 8 ms a
   key (median); scrolling 10,000 rows: p95 frame < 20 ms.
 - tokens: a node with tokens serves the page, which asks for one; given it, the tables show, and
@@ -582,7 +582,20 @@ def files_checks(browser, port, show):
     checks["files: every request went to the node; no page errors"] = pg.left() == [] and pg.errors == []
     more, folders = folders_checks(browser, port, show)
     checks.update(more)
-    info = {"task": task, "bound": bound, "results": results, "said": said, "each": each, "not run": left, "second": second, "last": last, "only": only, "plan": plan, "dirty": dirty, "saved": saved, "clean": clean, "shown": shown, "errors": pg.errors, "left": pg.left(), "toast": pg.toast(), "folders": folders}
+    # The editor (round 29's review): an alias `c` is a name, not a comment; `alias.` + Tab lists that table's columns.
+    lit = p.evaluate("""() => import('/console/editor.js').then(m => m.highlighted("SELECT c.x FROM fx c WHERE c.id = 1 /* c */", 'sql'))""")
+    p.click("#tabbar .newtab")
+    p.locator("#menu button", has_text="New SQL file").click()
+    p.keyboard.insert_text("SELECT o. FROM fx o")
+    for _ in range(len(" FROM fx o")):
+        p.keyboard.press("ArrowLeft")
+    p.keyboard.press("Tab")
+    offered = until(lambda: p.locator("#complete").is_visible() and p.locator("#complete div span:first-child").all_inner_texts(), ["id", "region"], 5)
+    p.keyboard.press("Escape")
+    checks["the editor: an alias called c is a name, not a comment's start; after o. Tab lists the columns of the table o names"] = \
+        '<span class="k">FROM</span>' in lit and '<span class="k">WHERE</span>' in lit and '<span class="c">/* c */</span>' in lit and offered == ["id", "region"]
+    info_editor = {"highlighted": lit, "offered": offered}
+    info = {"editor": info_editor, "task": task, "bound": bound, "results": results, "said": said, "each": each, "not run": left, "second": second, "last": last, "only": only, "plan": plan, "dirty": dirty, "saved": saved, "clean": clean, "shown": shown, "errors": pg.errors, "left": pg.left(), "toast": pg.toast(), "folders": folders}
     pg.ctx.close()
     return checks, info
 
@@ -1013,12 +1026,12 @@ def budget_checks(browser, port, show):
             fresh[name] = e.code
     total = sum(sizes.values()) if all(sizes.values()) else None
     later = {}
-    for name in ["chart.js", "plan.js", "more.js", "more.css", "data.js"]:  # (loaded when first used)
+    for name in ["chart.js", "plan.js", "more.js", "details.js", "more.css", "data.js"]:  # (loaded when first used)
         r = urllib.request.urlopen(urllib.request.Request(f"{base}/console/{name}", headers={"accept-encoding": "gzip"}))
         later[name] = len(r.read()) if r.headers.get("content-encoding") == "gzip" else None
     checks["the scripts and style sheet the page loads, gzipped as the node serves them: <= 70 KB; each answers 304 when the browser has it"] = total is not None and total <= 70 * 1024 \
         and set(fresh.values()) == {304}
-    checks["those loaded when first used (a chart, a plan, History and Settings, a data file): <= 8 KB each, gzipped"] = all(v is not None and v <= 8 * 1024 for v in later.values())
+    checks["those loaded when first used (a chart, a plan, History and Settings, details, a data file): <= 8 KB each, gzipped"] = all(v is not None and v <= 8 * 1024 for v in later.values())
     paints = []
     for _ in range(3):
         pg = Page(browser, base + "/")

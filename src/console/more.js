@@ -1,10 +1,9 @@
 // The console's rarer parts (ADR-034, round 29), loaded when first used, so the page's first load
 // doesn't carry them: the History view (the node's runs, the schedules, what this page ran), the
-// Variables view, Settings, search (Ctrl K), choosing the Python, a table's profile, a file run as
-// a job. What they use of the shell comes through `R.helpers`.
-import { h, $, secs, count, bytes, utc, icon, svg, S, R, call, run, rows, ident, quote, toast, menu, prompt, confirmed, pop, numeric, moreStyle } from './core.js';
+// Variables view, Settings, search (Ctrl K), choosing the Python, a file run as a job. What they use of the shell comes through `R.helpers`.
+import { h, $, secs, count, bytes, utc, icon, svg, S, R, call, run, rows, ident, quote, toast, menu, prompt, confirmed, pop, moreStyle } from './core.js';
 import { highlighted } from './editor.js';
-import { copyText, statView, spread } from './grid.js';
+import { copyText } from './grid.js';
 import { iconOf, oneLine, FOLDER } from './files.js';
 
 await moreStyle();
@@ -12,41 +11,6 @@ await moreStyle();
 const H = R.helpers, { KIND, pick, act, facts, head, detail, drawLeft, drawViews, look, readVars, themeNow, prefs, pane, show, openFile, newFile, restart, kernel } = H;
 let again = 0;
 
-/** A table's columns profiled where it is: one pass for every column's counts and range, then a
- * histogram or the commonest values of each (at most 24 columns). */
-export async function profile(t, boxes, btn) {
-  const cols = t.columns.slice(0, 24), q = ident, simple = c => !/^(List|LargeList|FixedSizeList|Struct|Map|Binary|LargeBinary|BinaryView)|\[\]$/.test(c.d);
-  btn.disabled = true; btn.lastChild.textContent = 'Profiling…';
-  try {
-    const parts = cols.flatMap((c, i) => [`count(${q(c.n)}) AS "v${i}"`, simple(c) ? `approx_distinct(${q(c.n)}) AS "d${i}"` : `NULL AS "d${i}"`,
-      simple(c) ? `CAST(min(${q(c.n)}) AS VARCHAR) AS "lo${i}"` : `NULL AS "lo${i}"`, simple(c) ? `CAST(max(${q(c.n)}) AS VARCHAR) AS "hi${i}"` : `NULL AS "hi${i}"`]);
-    const [a] = await rows(`SELECT count(*) AS n, ${parts.join(', ')} FROM ${t.q}`);
-    const stats = cols.map((c, i) => ({ n: Number(a.n), nulls: Number(a.n) - Number(a['v' + i]), distinct: Number(a['d' + i] ?? 0), exact: false, min: a['lo' + i], max: a['hi' + i] }));
-    const showOne = i => { const box = boxes[i]?.querySelector('.ps'); if (box) box.replaceChildren(...statView(stats[i])); };
-    cols.forEach((_, i) => showOne(i));
-    let next = 0;
-    const one = async () => {
-      for (let i; (i = next++) < cols.length;) {
-        const c = cols[i], at = spread(c.d), s = stats[i];
-        if (!simple(c) || s.n === s.nulls) continue;
-        if (at && s.min != null) {
-          const lo = at(s.min), hi = at(s.max);
-          if (!Number.isFinite(lo) || !Number.isFinite(hi)) continue;
-          const x = numeric(c.d) ? `CAST(${q(c.n)} AS DOUBLE)` : `CAST(date_part('epoch', CAST(${q(c.n)} AS TIMESTAMP)) AS DOUBLE) * 1000`;
-          const b = hi === lo ? '0' : `least(19, CAST(floor((${x} - ${lo}) / ${(hi - lo) / 20}) AS BIGINT))`;
-          const hist = Array(20).fill(0);
-          for (const r of await rows(`SELECT ${b} AS b, count(*) AS n FROM ${t.q} WHERE ${q(c.n)} IS NOT NULL GROUP BY 1`)) hist[Math.max(0, Math.min(19, Number(r.b)))] += Number(r.n);
-          s.hist = hist;
-        } else if (!at) {
-          s.top = (await rows(`SELECT CAST(${q(c.n)} AS VARCHAR) AS v, count(*) AS n FROM ${t.q} WHERE ${q(c.n)} IS NOT NULL GROUP BY 1 ORDER BY 2 DESC, 1 LIMIT 5`)).map(r => ({ v: r.v, n: Number(r.n) }));
-        }
-        showOne(i);
-      }
-    };
-    await Promise.all([one(), one(), one()]);
-  } catch (e) { toast('Could not profile it: ' + e.message, true); }
-  btn.disabled = false; btn.lastChild.textContent = 'Profile';
-}
 
 /** Choose the Python the node runs: each this machine has, tried (its version, whether pondra and
  * pyarrow import), the one in use marked; one that lacks them says how to install them. */
@@ -109,7 +73,7 @@ export async function runs() {
     h('div', { class: 'sub' }, `${t.statement.slice(0, 120)} · next ${utc(t.next_tick).toLocaleString()}`));
   const page = x => h('div', { class: 'run-item', role: 'button', tabindex: '0', title: 'Click: what it ran, and what to do with it. Right-click: the same', onclick: () => pageLook(x), onkeydown: e => e.key === 'Enter' && pageLook(x),
     oncontextmenu: e => { e.preventDefault(); menu(e, pageActs(x).map(([label, run]) => ({ label, run }))); } },
-    h('div', { class: 'line1' }, h('span', { class: 'ic k-' + x.kind, html: svg(x.kind === 'python' ? 'filepy' : 'filesql', 14) }), h('span', { class: 'nm' }, oneLine(x.src, 90)), h('span', { class: 'meta ' + (x.ok ? '' : 'bad') }, x.ok ? secs(x.ms) : 'failed')),
+    h('div', { class: 'line1' }, h('span', { class: 'ic k-' + x.kind, html: svg(x.kind === 'python' ? 'filepy' : 'filesql', 14) }), h('span', { class: 'nm' }, x.kind === 'python' ? firstLine(x.src) : oneLine(x.src, 90)), h('span', { class: 'meta ' + (x.ok ? '' : 'bad') }, x.ok ? secs(x.ms) : 'failed')),
     h('div', { class: 'sub' }, `#${x.id} · ${x.where} · ${new Date(x.at).toLocaleTimeString()}${x.rows != null ? ` · ${count(x.rows)} row${x.rows === 1 ? '' : 's'}` : ''}`));
   return [head('clock', 'History', 'what ran on the node, its schedules, and what this page ran'),
     h('div', { class: 'dsect' }, 'On the node'), ...node.length ? node.map(nodeRun) : [h('div', { class: 'empty' }, 'No job yet: a file\'s ⋯ runs it as one.')],

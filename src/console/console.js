@@ -12,12 +12,11 @@
 //   pondra.on('pick', picked => …)                 // (and 'run', 'ran', 'refresh', 'start', 'open', 'active')
 //
 // No framework and nothing from anywhere else: the page, its modules and its fonts come from the node.
-import { h, $, fill, said, esc, store, count, bytes, ago, utc, ICONS, icon, svg, typeMark, sqlType, on, emit, R, byOrder, shell, register, T, configure,
-  MODE, SESSION, S, base, call, run, rows, doBlock, ident, qualified, home, fileSql, toast, menu, prompt, VERSION, ask, interruptPython } from './core.js';
-import { highlighted } from './editor.js';
-import { grid, summarize, statView } from './grid.js';
-import { Notebook, openNotebook, versions, cleanName, doneText } from './notebook.js';
-import { workspace, drawWorkspace, treeItem, upload, newFolder, registerFiles, SqlDoc, PythonDoc, kindOf, iconOf, download } from './files.js';
+import { h, $, fill, said, esc, store, count, bytes,  ICONS, icon, svg, typeMark, sqlType, on, emit, R, byOrder, shell, register, T, configure,
+  MODE, SESSION, S, base, call, run, rows, doBlock, ident, qualified, home, toast, menu, prompt, VERSION, ask, interruptPython } from './core.js';
+import { grid } from './grid.js';
+import { Notebook, openNotebook, cleanName, doneText } from './notebook.js';
+import { workspace, drawWorkspace, treeItem, upload, newFolder, registerFiles, SqlDoc, PythonDoc } from './files.js';
 
 R.helpers = {};
 const H = R.helpers;
@@ -34,7 +33,9 @@ async function machinePrefs() {
     if (Object.keys(kept).length) { Object.assign(PREFS, kept); store.set('pondra.prefs', JSON.stringify(PREFS)); S.prefsHere = true; } else if (Object.keys(PREFS).length) keepPrefs(); // (this browser's, kept for the machine from now on)
   } catch { /* (an older node: this browser's) */ }
 }
-const narrow = () => innerWidth < 760;
+const narrow = () => innerWidth <= 760; // (as console.css's max-width:760px)
+/** A side pane over the page, not beside it: the left one in a narrow window, the right one up to 1180px (console.css). */
+const drawer = which => which === 'right' ? innerWidth <= 1180 : narrow();
 
 // ------------------------------------------------------------------ the look: theme, colours and fonts (Settings)
 const DARK = matchMedia('(prefers-color-scheme: dark)');
@@ -61,7 +62,7 @@ function pane(which, open) {
   const was = paneOpen(which);
   if (open === undefined) open = !was;
   if (which === 'bottom') { prefs('bottom', open); S.doc?.el.classList.toggle('nopanel', !open); }
-  else { $(PANE[which]).hidden = !open; if (!narrow()) prefs(which, open); if (which === 'right' && open) drawRight(); }
+  else { $(PANE[which]).hidden = !open; if (!drawer(which)) prefs(which, open); if (which === 'right' && open) drawRight(); }
   drawPanes(); drawTop();
 }
 H.pane = pane;
@@ -260,6 +261,7 @@ function drawTabs() {
   });
   $('#tabbar').replaceChildren(h('div', { class: 'tlist', role: 'tablist', 'aria-label': 'Open files' }, tabs), h('button', { class: 'icon newtab', title: 'New: a notebook, a file or a folder', 'aria-label': 'New', html: svg('plus', 16), onclick: e => newMenu(e.currentTarget) }));
   if (S.doc) document.title = `${S.doc.dirty ? '• ' : ''}${S.doc.title} · Pondra`;
+  $('#tabbar .tab.on')?.scrollIntoView({ block: 'nearest', inline: 'nearest' }); // (the tab in front always in sight)
 }
 H.drawTabs = drawTabs;
 function toolbar() {
@@ -328,7 +330,8 @@ H.openFile = openFile;
 /** SQL in a tab and run: into the notebook in front (a cell), else a new SQL tab. */
 function query(sql) {
   if (S.doc?.kind === 'notebook') return S.doc.peek(sql);
-  const d = newFile('sql');
+  const p = S.pick, d = newFile('sql');
+  if (p && p.type !== 'file' && p.type !== 'doc') { S.pick = p; S.pickedOn = d; mark(); detail(); } // (a table's first rows, in a tab of their own: its details stay)
   d.ed.value = sql;
   d.run();
 }
@@ -433,10 +436,11 @@ H.pickDb = at => menu(at, (S.dbs || []).map(d => ({ label: d.name, icon: 'db', r
 
 // ------------------------------------------------------------------ what was picked, and the details view
 function pick(p, tab) {
-  S.pick = p; mark();
+  S.pick = p; S.pickedOn = S.doc; mark(); // (a table, a column: shown while this tab is in front)
   const details = R.views.find(v => v.id === (tab || 'details'));
   if (details && sideOf(details) === 'right') { S.tab = details.id; drawRight(); }
-  if ($('#right').hidden) pane('right', true); else detail();
+  if (!$('#right').hidden) detail();
+  else if (!(drawer('right') && p.type === 'file')) pane('right', true); // (a file opened from the tree doesn't cover itself with its details)
   emit('pick', p);
 }
 H.pick = pick;
@@ -458,80 +462,33 @@ function summary() {
       ['Nodes', s.nodes ? String(s.nodes.length) : null], ['This node', s.role], ['Leader', s.leader], ['Commits', s.hwm != null ? count(s.hwm) : null]]),
     h('p', { class: 'muted' }, 'Pick a table, a view or a file, or a column of an answer, to see it here.')];
 }
-function objectDetail(t) {
-  const o = t.o, [ic, word] = KIND[o.kind] || KIND.table, stored = o.kind === 'table' || o.kind === 'materialized view';
-  const counted = h('span', { class: 'muted' }, '…');
-  rows(`SELECT count(*) AS n FROM ${t.q}`).then(r => counted.textContent = count(r[0].n), e => counted.textContent = e.message.split('\n')[0].slice(0, 120));
-  const keyed = new Set(o.key || []), nn = new Set(o.not_null || []);
-  const cols = t.columns.map(c => {
-    const flags = [keyed.has(c.n) ? 'key' : null, nn.has(c.n) && !keyed.has(c.n) ? 'not null' : null, o.defaults?.[c.n] ? `default ${o.defaults[c.n]}` : null].filter(Boolean);
-    return h('div', { class: 'pc', 'data-col': c.n }, h('div', { class: 'line1' }, typeMark(c.d), h('span', { class: 'nm' }, c.n), keyed.has(c.n) ? icon('key', 'kk') : null, h('span', { class: 'ty' }, sqlType(c.d))),
-      flags.length ? h('div', { class: 'sub' }, flags.join(' · ')) : null, h('div', { class: 'ps' }));
-  });
-  const profileBtn = act('chart', 'Profile', 'Each column: nulls, distinct values, range and spread (reads the whole table)', () => profile(t, cols, profileBtn));
-  return [head(ic, t.t, `${word} · ${t.c}.${t.s}`, 'k-table'),
-    h('div', { class: 'acts2' }, act('play', 'Preview', 'Its first rows (or double-click it)', () => query(`SELECT * FROM ${t.q} LIMIT 100`)), profileBtn, act('copy', 'Copy name', `Copy ${t.q}`, () => navigator.clipboard?.writeText(t.q).then(() => toast(`Copied ${t.q}`)))),
-    facts([['Rows', counted], ['Columns', String(t.columns.length)], ['Key', o.key], ['Partitioned by', o.partition], ['Clustered by', o.cluster],
-      ['Published as', o.publish], ['Rows kept', o.ttl], ['In files', stored ? `${bytes(o.bytes)} · ${count(o.files || 0)} file${o.files === 1 ? '' : 's'}` : null]]),
-    o.sql ? h('div', { class: 'dsect' }, o.kind === 'files' ? 'Reads' : 'Definition') : null, o.sql ? h('pre', { class: 'defn', html: highlighted(o.sql, 'sql') }) : null,
-    h('div', { class: 'dsect' }, 'Columns'), ...cols];
-}
-async function fileDetail(f) {
-  const rel = f.rel || f.path.replace(/^files\//, ''), kind = f.notebook ? 'notebook' : kindOf(rel), doc = S.docs.find(d => d.path === rel);
-  const out = [head(iconOf(f.notebook ? 'x.ipynb' : rel), f.name || rel.split('/').pop(), f.notebook ? `a notebook in notebooks/` : `a ${kind === 'data' ? 'data ' : kind === 'sql' ? 'SQL ' : kind === 'python' ? 'Python ' : ''}file in ${rel.includes('/') ? rel.slice(0, rel.lastIndexOf('/') + 1) : 'files/'}`, 'k-' + kind),
-    h('div', { class: 'acts2' }, kind !== 'file' ? act('eye', 'Open', 'Open it in a tab', () => openFile(rel)) : null,
-      kind === 'data' ? act('play', 'Query with SQL', 'Read it as a table, in a SQL tab', () => query(`SELECT * FROM ${fileSql(rel)} LIMIT 1000`)) : null,
-      !f.notebook ? act('down', 'Download', 'Download it', () => download(rel)) : null)];
-  if (f.notebook) {
-    const vs = await versions(rel.slice(10)).catch(() => []);
-    out.push(h('div', { class: 'dsect' }, `Versions (${vs.length})`), ...vs.map(v => h('div', { class: 'row', role: 'button', tabindex: '0', title: 'Open this version', onclick: async () => { const open = S.docs.find(d => d.path === rel); if (open && !open.close()) return; if (open) closeDoc(open); addDoc(await openNotebook(rel.slice(10), v.version)); } },
-      icon('clock'), h('span', { class: 'nm' }, utc(v.written).toLocaleString()), h('span', { class: 'meta' }, ago(v.written)))));
-    return out;
-  }
-  out.push(facts([['Size', bytes(f.size)], ['Written', f.written ? utc(f.written).toLocaleString() : null], ['In SQL', kind === 'data' ? fileSql(rel) : `file_read('files/${rel}')`]]));
-  if (doc?.kind === 'data') {
-    out.push(facts([['Rows', count(doc.data.length)], ['Columns', String(doc.cols.length)], ['Format', doc.status()[1]]]));
-    const ch = doc.changes();
-    if (ch.length) out.push(h('div', { class: 'dsect' }, 'Not saved'), ...ch.map(c => h('div', { class: 'change' }, c)));
-    out.push(h('p', { class: 'note' }, 'CSV and JSON files are edited in place. Parquet files, and files too big to hold, open read-only: load one into a table to change it with SQL.'));
-  }
-  return out;
-}
 const filePick = path => { const rel = path.replace(/^files\//, ''), nb = rel.match(/^notebooks\/([^/]+)$/); return { type: 'file', f: nb ? { rel, name: nb[1] + '.ipynb', notebook: true } : S.files?.find(f => f.path === 'files/' + rel) || { rel, path: 'files/' + rel } }; };
 H.pickFile = path => pick(filePick(path));
-/** The details follow the tab in front (its file, or what it is while it has none), as long as
- * they showed a file or nothing: a table picked stays until another pick. */
+/** The details follow the tab in front (its file, or what it is while it has none): a table or a
+ * column picked stays while the tab it was picked with is in front, and gives way when another is. */
 function follow(doc) {
-  if (S.pick && S.pick.type !== 'file' && S.pick.type !== 'doc') return;
+  if (S.pick && S.pick.type !== 'file' && S.pick.type !== 'doc' && S.pickedOn === doc) return;
   const saved = doc.kind === 'notebook' ? doc.version && (doc.plain ? doc.path : `notebooks/${doc.name}`) : doc.path;
   S.pick = saved ? filePick(saved) : doc.kind ? { type: 'doc', doc } : null;
   mark(); detail();
 }
 function docDetail(doc) {
   return [head(doc.icon, doc.title, `a new ${doc.kind === 'notebook' ? 'notebook' : doc.kind === 'sql' ? 'SQL file' : doc.kind === 'python' ? 'Python file' : 'file'}, not saved yet`, 'k-' + doc.kind),
-    h('div', { class: 'acts2' }, act('save', 'Save', 'Save it in the lake (Ctrl+S)', () => doc.save())), h('p', { class: 'muted' }, 'Saved, it is kept in the lake\'s files: the Workspace lists it, and here its size and versions show.')];
+    doc.dirty ? h('div', { class: 'acts2' }, act('save', 'Save', 'Save it in the lake (Ctrl+S)', () => doc.save())) : null, h('p', { class: 'muted' }, 'Once saved, it is kept in the lake\'s files: the Workspace lists it, and its size and versions show here.')];
 }
+
 /** An answer's columns, summarized from the rows it holds (a header clicked). */
 function explore(r, i, cell) { pick({ type: 'result', r, i, cell }); }
 H.explore = explore;
-function resultDetail(p) {
-  const { r, i, cell } = p, times = r.columns.map(c => /^Timestamp/.test(c.type || ''));
-  const out = [head('chart', cell?.count ? `Answer [${cell.count}]` : 'Answer', `${count(r.rows.length)} row${r.rows.length === 1 ? '' : 's'}${r.total > r.rows.length ? ` of ${count(r.total)} (the ones here)` : ''} · ${r.columns.length} column${r.columns.length === 1 ? '' : 's'}`), h('div', { class: 'dsect' }, 'Columns')];
-  r.columns.forEach((c, k) => {
-    const s = summarize(r.rows.map(row => times[k] && row[k] != null ? String(row[k]).replace(/^(\d{4}-\d\d-\d\d)T/, '$1 ') : row[k]), c.type);
-    const box = h('div', { class: 'pc' + (k === i ? ' on' : ''), 'data-col': c.name }, h('div', { class: 'line1' }, typeMark(c.type), h('span', { class: 'nm' }, c.name), h('span', { class: 'ty' }, sqlType(c.type))), h('div', { class: 'ps' }, ...statView(s)));
-    out.push(box);
-    if (k === i) requestAnimationFrame(() => box.scrollIntoView({ block: 'nearest' }));
-  });
-  return out;
-}
 
 // The rarer parts, loaded when first used (more.js): History, Variables, Settings, choosing the
 // Python, a table's profile, a file run as a job.
 const more = () => import('./more.js');
+const details = () => import('./details.js'); // (a table's, a file's, an answer's: loaded with the first pick)
+const objectDetail = async t => (await details()).objectDetail(t), fileDetail = async f => (await details()).fileDetail(f), resultDetail = async p => (await details()).resultDetail(p);
 const runs = async () => (await more()).runs(), variables = async () => (await more()).variables(), settings = async () => (await more()).settings();
-const profile = async (...a) => (await more()).profile(...a), choosePython = async () => (await more()).choosePython();
-Object.assign(H, { KIND, act, facts, head, detail, drawLeft, drawViews, look, readVars, themeNow, choosePython, job: async (doc, every) => (await more()).job(doc, every), schedule: async doc => (await more()).job(doc, true) });
+const choosePython = async () => (await more()).choosePython();
+Object.assign(H, { KIND, addDoc, closeDoc, act, facts, head, detail, drawLeft, drawViews, look, readVars, themeNow, choosePython, job: async (doc, every) => (await more()).job(doc, every), schedule: async doc => (await more()).job(doc, true) });
 
 // ------------------------------------------------------------------ this page's Python (a session's, on the node)
 function kernel(state) {
@@ -609,7 +566,7 @@ let wsTimer;
 const laterWorkspace = () => { clearTimeout(wsTimer); wsTimer = setTimeout(() => { const v = R.views.find(x => x.id === 'workspace'); if (v?.box && S.files) drawWorkspace(v.box); mark(); }, 120); };
 on('changed', doc => {
   if (!doc) return;
-  if (doc.dirty !== doc.shown) { doc.shown = doc.dirty; drawTabs(); if (doc === S.doc) toolbar(); }
+  if (doc.dirty !== doc.shown) { doc.shown = doc.dirty; drawTabs(); if (doc === S.doc) toolbar(); if (S.pick?.doc === doc) detail(); }
   if (doc === S.doc) status();
   laterWorkspace();
 });
@@ -754,18 +711,21 @@ addEventListener('pagehide', () => {
   if (keeping) { clearTimeout(keeping); keeping = 0; T.fetch('/console/settings', { method: 'PUT', keepalive: true, body: JSON.stringify(PREFS), headers: { 'content-type': 'application/json' } }).catch(() => {}); } // (a setting changed just before the page went)
   T.fetch(base() + '/sessions/' + SESSION, { method: 'DELETE', keepalive: true, headers: { ...T.headers(), ...(token ? { authorization: 'Bearer ' + token } : {}) } }).catch(() => {}); // (the temporary tables of this page, and its Python)
 });
-let wasNarrow = narrow();
+const layout = () => `${narrow()} ${drawer('right')}`;
+let wasLayout = layout();
 addEventListener('resize', () => { // (into a narrow window the side panes become drawers, closed; back out, they are as they were)
-  if (narrow() !== wasNarrow) { wasNarrow = narrow(); sides(true); }
+  if (layout() !== wasLayout) { wasLayout = layout(); sides(true); }
   drawPanes();
 });
 const sides = draw => {
   $('#left').hidden = narrow() || prefs('left') === false;
-  $('#right').hidden = narrow() || (prefs('right') == null ? innerWidth < 1180 : !prefs('right'));
+  $('#right').hidden = drawer('right') || prefs('right') === false;
   if (draw && !$('#right').hidden) drawRight();
 };
-$('#main').addEventListener('pointerdown', () => { if (narrow()) { for (const w of ['left', 'right']) if (paneOpen(w)) pane(w, false); } }); // (a drawer closes when the page behind it is used)
+$('#main').addEventListener('pointerdown', () => { for (const w of ['left', 'right']) if (drawer(w) && paneOpen(w)) pane(w, false); }); // (a drawer closes when the page behind it is used)
 
+// (a link to a file or notebook followed in the open page opens it, as the address does at the start)
+addEventListener('hashchange', () => { const p = new URLSearchParams(location.hash.slice(1)), nb = p.get('notebook'), file = p.get('file'); if (nb) openFile('notebooks/' + nb); else if (file) openFile(file); });
 async function start() {
   const hash = new URLSearchParams(location.hash.slice(1));
   if (MODE === 'lakes') S.db = hash.get('db');

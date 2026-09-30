@@ -43,10 +43,18 @@ Start more copies on the same bucket to scale out. The only state is object stor
 7. **Lighter:** the page's first load had grown to 76.5 KB gzipped; Runs, Variables, Settings,
    search, choosing Python, a table's profile and data files now load when first used: 68.5 KB,
    each later part under 8 KB.
-8. **Found and fixed:** the Docs workflow failed on a clean checkout since round 26 (`site/public/`
+8. **Reviewed before shipping** (the owner asked if it is production-ready; ADR-034): every
+   workflow on a realistic lake at 1440, 1024 and 760 px, light and dark. Fixed: the SQL
+   highlighter taking an alias `c` for a comment; Profile failing on `DOUBLE` columns; the details
+   pane covering Run between 760 and 1180 px; the tab in front pushed out of sight; Details stuck
+   on a table; completion after `o.`; a JSON document failing to open; notebook answers without
+   the Copy and Download menus; scrolling 10,000 rows (p95 27.7 → 17–20 ms). Measured: page ready
+   in 0.2 s, 10,000 rows drawn in 0.11 s, a 40-cell notebook run in 1.05 s; typing in a
+   1,000-line file 28 ms a key (a new editor: round 34).
+9. **Found and fixed:** the Docs workflow failed on a clean checkout since round 26 (`site/public/`
    didn't exist); a `pop` dialog showed "null"; a menu under a button on the left opened off to its
    left; clicking a statement's answer selected it in the editor, so the next Run ran it alone.
-9. **Tests** (`logs/round29/`): `console_check.py` (80, axe light and dark included), `harness.py
+10. **Tests** (`logs/round29/`): `console_check.py` (81, axe light and dark included), `harness.py
    procedures` (Stop, a cell abandoned, `/python`, Format, the run log's code) and `clients` (every
    download read back, Excel by openpyxl), `harness.py all`; the owner's cluster benchmarks on
    0.27.0 (SF10, 3 and 6 runners): every answer the same, the cluster spreading 4 (3 nodes) and 2 (6 nodes) of 22 queries

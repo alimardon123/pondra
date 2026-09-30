@@ -1,0 +1,18 @@
+# The console reviewed before shipping (round 29, 2026-10-01): a node on a lake of 200,000 orders,
+# 5,000 customers, 50,000 events, a 61-column table, views, a materialized view, CSV/Parquet/JSON
+# files, SQL and Python files, a notebook; Playwright walking every workflow at 1440x900, 1024x700
+# and 760x900, light and dark; then measured (headless Chromium, this machine).
+
+Measured after the fixes
+  page ready                        0.21 s   (first contentful paint 96 ms; 135.8 KB transferred, fonts included)
+  10,000-row answer, run to grid    0.11 s   (no long task)
+  61 columns x 2,000 rows           0.38 s
+  scrolling 10,000 rows             p50 16.7 ms, p95 19.7 ms (was 18.4 / 27.7 before rows were kept)
+  40-cell notebook: open            0.26 s
+  40-cell notebook: run all         1.05 s   (no long task)
+  script memory                     10.0 MB, 6,326 elements
+  typing, 10-line file              1.7 ms in the handler, 16.4 ms to the next frame
+  typing, 1,000-line file           17.2 ms in the handler, 28.4 ms to the next frame (the textarea's layout; not fixed: round 34)
+
+Found and fixed: see docs/adr-034-a-console-of-tabs.md, "The review before it shipped".
+Also found, for later: DataFusion refuses `n * INTERVAL '37 seconds'` (Postgres takes it): round 31.

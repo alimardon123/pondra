@@ -12,7 +12,7 @@ const MOVES = /^(RepartitionExec|CoalescePartitionsExec|SortPreservingMergeExec|
 /** The Plan tab's view of `sql` (its `$name`s bound to `params`). */
 export function planView(sql, params) {
   const box = h('div', { class: 'planv' }), st = { how: 'graph', plan: null, profile: null, busy: false };
-  const read = /^\s*(\(|select\b|with\b|values\b|from\b|table\b)/i.test(sql);
+  const read = /^\s*(\(|select\b|with\b|values\b|from\b|table\b)/i.test(sql.replace(/--[^\n]*|\/\*[\s\S]*?\*\//g, ' ')); // (a comment before it too)
   const draw = () => {
     const tab = (id, label) => h('button', { class: 'seg' + (st.how === id ? ' on' : ''), 'aria-pressed': String(st.how === id), onclick: () => { st.how = id; draw(); } }, label);
     const shown = st.profile || st.plan;

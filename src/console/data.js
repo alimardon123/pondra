@@ -59,8 +59,7 @@ export class DataDoc {
       } else {
         const objs = this.format === 'jsonl' ? f.text.split('\n').filter(l => l.trim()).map(l => JSON.parse(l)) : JSON.parse(f.text);
         if (!Array.isArray(objs) || objs.some(o => !o || typeof o !== 'object' || Array.isArray(o))) {
-          this.readonly = true; this.why = 'This JSON is not a list of objects: it opens read-only.';
-          const r = await run(`SELECT * FROM ${fileSql(this.path)} LIMIT 10000`); this.cols = r.columns; this.data = r.rows;
+          throw Object.assign(new Error('not rows'), { asText: true }); // (a JSON document, not a table: it opens as text)
         } else {
           const names = [...new Set(objs.flatMap(o => Object.keys(o)))];
           this.cols = names.map(n => ({ name: n, type: types.find(t => t.name === n)?.type || 'Utf8' }));

@@ -381,3 +381,44 @@ marked*:
   file's editor to `data.js`, and their style to `more.css`, all loaded when first used, as
   `chart.js` and `plan.js` are: 68.5 KB now, and each on-demand module under 8 KB, which
   `console_check.py` measures too.
+
+### The review before it shipped (2026-10-01)
+
+The owner asked whether the console was production-ready. Claude went through every workflow on a
+lake of realistic size (200,000 orders, 5,000 customers, a 60-column table, views, files, a
+notebook) at 1440, 1024 and 760 px, light and dark, measured it, and fixed what it found:
+
+- **The SQL highlighter took an alias `c` for a block comment** (its state for `/*` was the letter
+  `c`): after `FROM customers c`, the rest of the file was grey. Its state is now `/*`.
+- **A table's Profile failed on any `DOUBLE` column** (DataFusion's `approx_distinct` takes no
+  floats): floats are counted as text.
+- **Between 760 and 1180 px, the details pane covered the file's Run button** and stayed. It is a
+  drawer there now: a pick opens it, working in the page closes it, a file opened from the tree
+  doesn't open it, and it isn't kept open for next time. The page and its style sheet disagreed
+  about exactly 760 and 1180 px; they agree now.
+- **Many tabs pushed the one in front out of sight.** Tabs give way to 96 px, the list scrolls, the
+  tab in front is always in sight, and + stays in reach.
+- **Details stayed on a table after switching tabs** (the owner's "stuck"): it follows the tab in
+  front; a table picked stays while the tab it was picked with is in front.
+- **Completion after `o.` indented instead:** an alias or table and a dot lists its columns, a
+  schema and a dot its tables.
+- **A JSON document that isn't rows failed to open**, with the server's path in the error: it opens
+  as text.
+- **Plan's Profile was missing for a query that began with a comment.**
+- **Notebook answers had plain Copy and CSV buttons** while files had the menus: both have Copy ▾
+  and Download ▾ now (a one-query cell can download every row).
+- **Scrolling a 10,000-row answer** redrew every visible row each frame (p95 27.7 ms): rows that
+  stay are kept, only those scrolled in are made (p95 17–20 ms).
+- **Smaller:** the results panel starts at half the file (it was 320 px); an error is as tall as
+  what it says; Messages says `2 rows`, not `rows 2 · publish []`; a chart starts with one series
+  and fills the panel; History names Python by its first line; the Keys dialog lost a black focus
+  ring; Details offers Save only when there is something to save; `#file=…` links open in a page
+  already open; the profile shows times as the grid does.
+- **The budget:** with these, the first load was 71.8 KB of 70. A table's, file's and answer's
+  details and a table's profile moved to `details.js`, loaded with the first pick: 68.3 KB.
+- **Measured:** the page ready in 0.2 s (136 KB with its fonts); a 10,000-row answer drawn in
+  0.11 s; a 61-column answer in 0.38 s; a 40-cell notebook opened in 0.26 s and run in 1.05 s, no
+  long task; 10 MB of script memory. **Not fixed:** typing in a 1,000-line file takes about 28 ms a
+  key (the textarea lays out its whole text on every change): a line-virtualized editor is the fix,
+  planned rather than patched.
+

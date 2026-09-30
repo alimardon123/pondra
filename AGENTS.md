@@ -52,7 +52,7 @@ src/      28,600 lines of Rust, one file per concern (see the table in README.md
           API, state and node; editor.js; grid.js; notebook.js; files.js the Workspace and the
           file tabs; console.js the shell and `window.pondra`; loaded when first used: more.js
           (Runs, Variables, Settings, search, choosing Python), data.js (data files), chart.js,
-          plan.js and more.css), xlsx.rs (a download as an Excel workbook)
+          plan.js, details.js and more.css), xlsx.rs (a download as an Excel workbook)
 brand/    the logo (mark.svg), colours (colors.css) and fonts (fonts/: Geist and Geist Mono, SIL
           OFL): the only copies; tools/brand_check.py
 site/     the documentation website (Starlight; ADR-030): site/STYLE.md says how pages are written,
@@ -984,8 +984,10 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    a time, the width in steps, rows drawn in sight). `console_check.py` (`budget`, `layout`).
 150. **The editor's highlighting is the whole text's** (`editor.js` `LINE`): each line highlighted
    from the state the one before left (a block comment, a quote, a triple-quoted string), and
-   again only as far as a change moves that state. `console_check.py` (`budget`: the lines drawn
-   equal to the whole text highlighted, after edits that open and close comments and quotes).
+   again only as far as a change moves that state, which is what opened a run (`/*`, a quote),
+   never a word (an alias `c` once opened a comment). `console_check.py` (`budget`: the lines drawn
+   equal to the whole text highlighted, after edits that open and close comments and quotes;
+   `files`: an alias `c`).
 151. **`run` is Pondra's own procedure** (`workspace.rs`, ADR-033): `CALL run('path', name =>
    value…)` runs a file of the lake's (`.sql`, `.py`, `.ipynb`, or `notebooks/<name>`: its newest
    version), never a procedure of that name (`CREATE PROCEDURE run` is refused). Its values are
@@ -1103,7 +1105,8 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    shows; a workbook over Excel's 1,048,575 rows is refused with the way out (CSV, Parquet), never
    cut. `harness.py clients` (each format read back: pandas, pyarrow, openpyxl).
 170. **What the page needs later loads later** (ADR-034 §7, round 29): Runs, Variables, Settings,
-   search, choosing the Python and a table's profile (`more.js`), a data file (`data.js`), charts
+   search and choosing the Python (`more.js`), a table's, a file's or an answer's details and a
+   table's profile (`details.js`), a data file (`data.js`), charts
    (`chart.js`), plans (`plan.js`) and their style (`more.css`) load the first time they are used,
    through `R.helpers` (no import of `console.js`); each at most 8 KB gzipped. The first load stays
    within 149's 70 KB. `console_check.py` (`budget`).

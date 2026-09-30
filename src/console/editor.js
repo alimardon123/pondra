@@ -28,14 +28,15 @@ const word = (s, m, kw, up) => /\d/.test(m[0][0]) ? span('nu', m[0]) : kw.has(up
 const LINE = {
   sql(s, st) {
     let out = '', i = 0;
-    const end = (q, from) => { if (q !== 'c') return closing(s, from, q, false); const e = s.indexOf('*/', from); return e < 0 ? -1 : e + 2; };
-    const cls = q => q === 'c' ? 'c' : q === "'" ? 's' : '';
+    // (the state is what opened the run: '/*', a quote; never a word, which could be `c`)
+    const end = (q, from) => { if (q !== '/*') return closing(s, from, q, false); const e = s.indexOf('*/', from); return e < 0 ? -1 : e + 2; };
+    const cls = q => q === '/*' ? 'c' : q === "'" ? 's' : '';
     if (st) { const e = end(st, 0); if (e < 0) return [span(cls(st), s), st]; out = span(cls(st), s.slice(0, e)); i = e; }
     SQL_TOKEN.lastIndex = i;
     for (let m; (m = SQL_TOKEN.exec(s));) {
       out += esc(s.slice(i, m.index));
-      const t = m[0], q = t === '/*' ? 'c' : t;
-      if (q === 'c' || q === "'" || q === '"') {
+      const t = m[0], q = t;
+      if (q === '/*' || q === "'" || q === '"') {
         const e = end(q, m.index + t.length);
         if (e < 0) return [out + span(cls(q), s.slice(m.index)), q];
         out += span(cls(q), s.slice(m.index, e)); SQL_TOKEN.lastIndex = e;
@@ -298,6 +299,16 @@ let cm = null; // (the completion open now: its editor, where the word starts, t
 export function complete(ed, force) {
   const ta = ed.ta, at = ta.selectionStart, before = ta.value.slice(0, at), m = before.match(/[\w.$"]*$/), word = m[0].replace(/"/g, '');
   if (!word && !force) return false;
+  if (ed.language === 'sql' && word.includes('.')) { // (after `o.`, `sales.orders.`, `sales.`: that table's columns, or that schema's tables)
+    const dot = word.lastIndexOf('.'), q = word.slice(0, dot).toLowerCase(), rest = word.slice(dot + 1), objs = S.objects || [];
+    const named = n => objs.filter(t => [t.t, `${t.s}.${t.t}`, t.q].some(x => x.toLowerCase() === n.toLowerCase()));
+    let tables = named(q);
+    if (!tables.length && /^\w+$/.test(q)) for (const a of ta.value.matchAll(new RegExp(`([\\w.]+)\\s+(?:as\\s+)?${q}\\b`, 'gi'))) tables.push(...named(a[1]));
+    const list = tables.length ? [...new Set(tables.flatMap(t => t.columns.map(c => ident(c.n) + '\t' + sqlType(c.d))))].map(x => x.split('\t'))
+      : objs.filter(t => t.s.toLowerCase() === q || t.c?.toLowerCase() === q).map(t => [ident(t.t), t.o.kind]);
+    const fit = list.filter(([n]) => n.toLowerCase().startsWith(rest.toLowerCase()) && n.toLowerCase() !== rest.toLowerCase()).map(([text, ty]) => ({ text, ty }));
+    if (fit.length) { cm = { ed, from: at - rest.length, list: fit.slice(0, 50), on: 0 }; drawComplete(); return true; }
+  }
   const low = word.toLowerCase(), seen = new Set(), all = [];
   const push = (text, ty, rank) => { if (!seen.has(text) && text.toLowerCase().startsWith(low) && text.toLowerCase() !== low) { seen.add(text); all.push({ text, ty, rank }); } };
   if (ed.language === 'sql') {

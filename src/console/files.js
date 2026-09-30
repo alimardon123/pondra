@@ -3,7 +3,7 @@
 // `If-Match`: replaced only if nobody saved it meanwhile).
 import { h, fill, icon, svg, secs, count, bytes, utc, S, R, emit, call, run, rows, doBlock, fileUrl, fileSql, quote, toast, menu, prompt, confirmed, saveAs, MODE, DATA, store, failed, readFile, writeFile, interruptPython, formatPython } from './core.js';
 import { Editor, formatSql } from './editor.js';
-import { grid, copyText, COPIES } from './grid.js';
+import { grid, copyText, COPIES, split, DOWNLOADS, fetchRows } from './grid.js';
 import { answer, doneText, cleanName, openPlain } from './notebook.js';
 
 const base = p => p.split('/').pop();
@@ -220,21 +220,22 @@ export const moreBtn = items => h('button', { class: 'icon', title: 'More', 'ari
 /** A panel under a file (SQL's results, Python's console), its height dragged; or at the right. */
 function splitPanel(doc, panel) {
   const grip = h('div', { class: 'grip', role: 'separator', 'aria-label': 'The panel\'s size (arrows change it)', tabindex: '0', 'aria-valuemin': '120' });
-  const size = { below: 320, right: 520, ...R.helpers.prefs('split') }; // (kept with the settings: on this machine)
+  // (a size set by dragging is kept with the settings, on this machine; until then, a share of the file's height or width)
+  const size = { ...R.helpers.prefs('split') }, now = right => Math.round(panel.getBoundingClientRect()[right ? 'width' : 'height']) || (right ? 520 : 320);
   const place = () => {
-    const right = doc.layout === 'right';
+    const right = doc.layout === 'right', k = right ? 'right' : 'below';
     doc.el.classList.toggle('side', right);
-    panel.style.flexBasis = (right ? size.right : size.below) + 'px';
-    grip.setAttribute('aria-orientation', right ? 'vertical' : 'horizontal'); grip.setAttribute('aria-valuenow', String(Math.round(right ? size.right : size.below)));
+    panel.style.flexBasis = size[k] ? size[k] + 'px' : right ? '45%' : '48%';
+    grip.setAttribute('aria-orientation', right ? 'vertical' : 'horizontal'); grip.setAttribute('aria-valuenow', String(size[k] || now(right)));
   };
   grip.addEventListener('pointerdown', e => {
     e.preventDefault(); grip.setPointerCapture(e.pointerId);
-    const right = doc.layout === 'right', start = right ? e.clientX : e.clientY, was = right ? size.right : size.below;
+    const right = doc.layout === 'right', start = right ? e.clientX : e.clientY, was = now(right);
     const move = ev => { const d = (right ? ev.clientX : ev.clientY) - start, v = Math.max(120, Math.min((right ? innerWidth : innerHeight) - 220, was - d)); panel.style.flexBasis = v + 'px'; size[right ? 'right' : 'below'] = v; };
     grip.addEventListener('pointermove', move);
     grip.addEventListener('pointerup', () => { grip.removeEventListener('pointermove', move); R.helpers.prefs('split', { ...size }); }, { once: true });
   });
-  grip.addEventListener('keydown', e => { const d = { ArrowUp: 24, ArrowDown: -24, ArrowLeft: 24, ArrowRight: -24 }[e.key]; if (d) { e.preventDefault(); const k = doc.layout === 'right' ? 'right' : 'below'; size[k] = Math.max(120, size[k] + d); place(); R.helpers.prefs('split', { ...size }); } });
+  grip.addEventListener('keydown', e => { const d = { ArrowUp: 24, ArrowDown: -24, ArrowLeft: 24, ArrowRight: -24 }[e.key]; if (d) { e.preventDefault(); const right = doc.layout === 'right', k = right ? 'right' : 'below'; size[k] = Math.max(120, (size[k] || now(right)) + d); place(); R.helpers.prefs('split', { ...size }); } });
   doc.el.append(grip, panel);
   doc.place = place;
   place();
@@ -382,18 +383,6 @@ export class SqlDoc extends TextDoc {
 /** A statement on one line: its comments out, its spaces one, at most `n` characters. */
 export const oneLine = (sql, n) => { const t = sql.replace(/--[^\n]*|\/\*[\s\S]*?\*\//g, ' ').replace(/\s+/g, ' ').trim(); return t.length > n ? t.slice(0, n - 1) + '…' : t; };
 /** A copy's or a download's button, with a ▾ for its other forms. */
-const split = (ic, title, run, items, disabled) => h('span', { class: 'split' }, h('button', { class: 'icon', title, 'aria-label': title, disabled, onclick: run }, icon(ic)),
-  h('button', { class: 'icon caret', title: 'Other forms', 'aria-label': 'Other forms', 'aria-haspopup': 'menu', disabled, onclick: e => menu(e.currentTarget, items()) }, icon('chevd', 'ic', 12)));
-const DOWNLOADS = [['csv', 'CSV'], ['tsv', 'TSV (tab-separated)'], ['json', 'JSON'], ['ndjson', 'JSON lines'], ['parquet', 'Parquet'], ['xlsx', 'Excel (.xlsx)']];
-/** Every row of an answer, in a file to download: its statement again on the node, in that format. */
-async function fetchRows(r, f, name) {
-  toast('Preparing the download…');
-  try {
-    const body = r.params && Object.keys(r.params).length ? JSON.stringify({ sql: r.sql, params: r.params }) : r.sql;
-    const res = await call('/sql?format=' + f, { method: 'POST', body, headers: { 'content-type': r.params && Object.keys(r.params).length ? 'application/json' : 'text/plain; charset=utf-8' } });
-    saveAs(await res.blob(), res.headers.get('content-type') || 'application/octet-stream', `${name || 'rows'}.${f === 'ndjson' ? 'jsonl' : f}`);
-  } catch (e) { toast('Not downloaded: ' + e.message, true); }
-}
 /** A script's statements, split as the node splits them (routines.rs `statements`): each ends at
  * a `;` outside strings ('…', $$…$$, $tag$…$tag$), quoted names and comments; the last `;` optional. */
 export function statements(text) {
@@ -488,6 +477,9 @@ export function registerFiles(register) {
   register.doc({ id: 'notebook', label: 'Notebook', icon: 'notebook', match: p => /\.ipynb$/i.test(p) && !p.startsWith('notebooks/'), open: openPlain }); // (a plain file, saved in place; notebooks keeps versions)
   register.doc({ id: 'sql', label: 'SQL file', icon: 'filesql', order: 20, match: p => /\.sql$/i.test(p), open: text(SqlDoc) });
   register.doc({ id: 'python', label: 'Python file', icon: 'filepy', order: 30, match: p => /\.py$/i.test(p), open: text(PythonDoc) });
-  register.doc({ id: 'data', label: 'Data file', icon: 'filedata', order: 40, match: p => DATA.test(p), open: async path => { const { DataDoc } = await import('./data.js'); return new DataDoc({ path }).load(); } }); // (data.js: loaded when a data file first opens)
+  register.doc({ id: 'data', label: 'Data file', icon: 'filedata', order: 40, match: p => DATA.test(p), open: async path => {
+    const { DataDoc } = await import('./data.js'); // (loaded when a data file first opens)
+    try { return await new DataDoc({ path }).load(); } catch (e) { if (!e.asText) throw e; const f = await readFile(path); return new TextDoc({ path, text: f.text, version: f.version, language: 'text' }); } // (a JSON document, not rows: its text)
+  } });
   register.doc({ id: 'text', label: 'Text file', icon: 'file', order: 50, match: p => /\.(md|txt)$/i.test(p), open: async path => { const f = await readFile(path); return new TextDoc({ path, text: f.text, version: f.version, language: /\.md$/i.test(path) ? 'markdown' : 'text' }); } });
 }
