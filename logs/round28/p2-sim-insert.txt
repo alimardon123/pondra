@@ -1,0 +1,1 @@
+insert: first={'rows': 5} retry={'duplicate': True} summary={'groups': 5, 'n': 5000} -> OK

@@ -181,21 +181,32 @@ version, and a commit sent twice is applied once.
 the table's types, a `NOT NULL` column holds no NULL, and in a partitioned table the file holds one
 partition value. A file that fails is refused by name, and nothing of the commit is recorded.
 
-**Copied instead, as a bulk `INSERT` would:** an append to a table that materialized views or
-streaming tasks follow (they take its rows through the log), or to one with a renamed or dropped
+**Followed as written.** Materialized views, streaming tasks, the change feed, `/watch` and Kafka
+topics take an append's rows from its files, in the same commit that records them.
+
+**Copied instead, as a bulk `INSERT` would:** an append to a table with a renamed or dropped
 column (Delta readers match columns by name, and the table's files keep the names they were
 written under).
 
-**Refused:** writes to keyed tables, and another engine's compaction (Pondra merges its tables'
-files itself).
+**Refused:** another engine's compaction (Pondra merges its tables' files itself).
 
 ## Change rows from another engine
 
-Other engines change a table's rows through the catalog too, **copy-on-write**: Spark's `DELETE`,
-`UPDATE` and `MERGE` (Iceberg's default mode), PyIceberg's `delete` and `overwrite`. The commit
-takes the files it rewrote out of the table and adds the new ones, which are recorded as written.
+Other engines change a table's rows through the catalog too, both ways Iceberg has:
+
+- **Copy-on-write**, Iceberg's default: Spark's `DELETE`, `UPDATE` and `MERGE`, PyIceberg's `delete`
+  and `overwrite`. The commit takes the files it rewrote out of the table and adds the new ones,
+  which are recorded as written.
+- **Merge-on-read**: Spark with the table's `write.delete.mode`, `write.update.mode` and
+  `write.merge.mode` set to `merge-on-read` (`ALTER TABLE … SET TBLPROPERTIES` from Spark, or in
+  Pondra's SQL). The commit adds position-delete files, which are taken as written: reads skip the
+  rows they name without decoding them. Nothing is rewritten until a file is a tenth deleted; then
+  Pondra's maintenance rewrites it without them.
+
 Rows in a file the change left alone keep their row ids; rows it rewrote get new ones, since
-Iceberg v2 sees a change as a delete and an insert.
+Iceberg v2 sees a change as a delete and an insert. Pondra's own `UPDATE`, `DELETE` and `MERGE` are
+published the same way: as Iceberg position-delete files and Delta deletion vectors, not rewritten
+files.
 
 ```python
 catalog.load_table("default.events").delete("user = 'cy'")
@@ -219,9 +230,32 @@ ann   2
   retries. So a `DELETE` from Spark never misses a row Pondra took before it. (A change that
   matches no file at all commits nothing, so rows only in the log escape it: `CHECKPOINT` first,
   or change them with Pondra's SQL.)
-- **Refused by name:** a change to a table that views or tasks follow, or that has a renamed
-  column (change those with Pondra's SQL), and delete files: merge-on-read, Spark's
-  `write.delete.mode = merge-on-read`, isn't taken yet.
+- **Pondra's upkeep never fails a writer.** A change planned before Pondra merged or rewrote the
+  files it names (writers retry with the new version, having checked it only rewrote files) is
+  carried over to the files that hold those rows now, by their row ids. A row changed since fails
+  it with `409`, as it should.
+- **Followed as written:** views take the rows a change deletes back, and the change feed shows
+  them as `delete` rows.
+- **Refused by name:** a change to a table followed by a view that can't take rows back (one that
+  keeps a `min` or `max`, or has no `count(*)`) or by a streaming task; one to a table with a
+  renamed column (change those with Pondra's SQL); and equality-delete files on an append table
+  (Spark writes position deletes).
+
+### Several tables at once
+
+Iceberg's multi-table transactions (`POST /v1/transactions/commit`) are one Pondra commit: every
+table's change, or none. If one table changed since the writer read it, the whole transaction is
+refused with `409` and no table changes. A keyed table's changes go a table at a time.
+
+### Keyed tables
+
+An engine writing to a keyed table (a `PRIMARY KEY`) writes **upserts**: each row it appends is its
+key's newest version. Its deletes delete keys: a copy-on-write `DELETE`, a merge-on-read position
+delete of a key's current version, and an equality delete on the key columns (what Flink's upsert
+mode writes) all become delete markers. These go through the log, like Pondra's own writes, so views
+and the change feed see them as upserts and deletes; the node tiers and publishes the table before it
+answers. A keyed table that combines each key's rows (`order_by`, or a view's `GROUP BY`) refuses
+other engines' changes by name.
 
 **Schema changes** come through the catalog as `ALTER TABLE` does them (an admin's, when tokens are
 set): Spark's `ALTER TABLE … ADD COLUMN` and PyIceberg's `update_schema` add a column (at the end,
@@ -282,9 +316,13 @@ Iceberg to Pondra, not Delta.
 - **Column types:** integers, floats, strings, booleans, dates, timestamps, binary, decimals and
   float arrays (vector columns) publish. A table with a column of another type isn't published in
   that format.
-- **Keyed tables** publish when a file holds one row per key, which is after each compaction (every
-  8 files, or `CHECKPOINT`). Other engines see a keyed table as of its last compaction; run
-  `CHECKPOINT` to bring them up to date.
+- **Keyed tables** publish every tier round, like append tables: the older versions a round replaces
+  and its delete markers become position deletes (Delta deletion vectors), so readers see one row per
+  key. A keyed table with `order_by` or merge functions still publishes after each full compaction
+  (`CHECKPOINT` brings it up to date).
+- **Deleted rows** are Iceberg position-delete files and Delta deletion vectors. PyIceberg, DuckDB,
+  Polars, Spark and Trino read them, and so does delta-rs's `QueryBuilder`; its `to_pyarrow_table`
+  doesn't read deletion vectors yet, and refuses the table.
 - **Schema changes follow.** `ADD COLUMN`, renames and drops reach Delta (column mapping) and
   Iceberg (field ids) without rewriting files.
 - **A table rename** (`ALTER TABLE … RENAME TO`) keeps the Delta and Iceberg copies readable: the

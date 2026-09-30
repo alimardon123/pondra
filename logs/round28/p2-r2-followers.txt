@@ -1,0 +1,13 @@
+Commit failed due to a concurrent update, retrying (1/4) in 103 ms
+Commit failed due to a concurrent update, retrying (1/4) in 108 ms
+{
+ "followers": {
+  "two views follow a bulk INSERT and a PyIceberg append, its file where PyIceberg wrote it, each commit's rows its _version": true,
+  "and a PyIceberg DELETE: the adding-up view takes the rows back, the row-by-row one drops them": true,
+  "the change feed replays to the table: the bulk INSERT's and PyIceberg's rows as inserts, its DELETE's as deletes (and the rows it rewrote)": true,
+  "a Kafka consumer reads every row appended, in order, a big commit a piece at a time (and the rows a DELETE rewrote)": true,
+  "a streaming task takes a bulk INSERT's rows and PyIceberg's; a change it can't follow is refused by name": true,
+  "a stream join pairs the rows bulk INSERTs wrote on either side, each pair once": true
+ },
+ "ok": true
+}

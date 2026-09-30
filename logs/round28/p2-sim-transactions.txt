@@ -1,0 +1,9 @@
+{
+ "transactions": {
+  "a transaction over two tables is one commit: both tables' rows, one _version, each table's view following": true,
+  "one whose second table changed since is refused (409), and changes neither table": true,
+  "a DELETE planned before Pondra merged its file, sent after: carried over to the merged file by row id; the rows as they should be, none twice, their ids kept": true,
+  "a change naming rows deleted since (and its file merged) is refused (409), the table as it was": true
+ },
+ "ok": true
+}

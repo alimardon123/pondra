@@ -57,7 +57,8 @@ version for up to `--tier-secs`. `POST /tier` (with the admin token) writes the 
 | `GET`, `HEAD /v1/namespaces/{ns}` | one namespace. `404 NoSuchNamespaceException` if there is none |
 | `GET /v1/namespaces/{ns}/tables` | the tables of a namespace that publish Iceberg |
 | `GET`, `HEAD /v1/namespaces/{ns}/tables/{table}` | load a table: `metadata-location`, the current metadata, and `config`. `404 NoSuchTableException` if there is none |
-| `POST /v1/namespaces/{ns}/tables/{table}` | commit an append. See [appending](#appending) |
+| `POST /v1/namespaces/{ns}/tables/{table}` | commit an append or a change of rows. See [appending](#appending) |
+| `POST /v1/transactions/commit` | commit changes to several tables of a database at once: all or none. `204` |
 | `POST /v1/namespaces/{ns}/tables` | make a table, as `CREATE TABLE … WITH (publish = 'iceberg')` does. See [making tables](#making-tables) |
 | `DELETE /v1/namespaces/{ns}/tables/{table}` | `DROP TABLE`, its files with it. `204` |
 | `POST /v1/tables/rename` | `ALTER TABLE … RENAME TO`, within the table's namespace. `204` |
@@ -69,7 +70,6 @@ message names the SQL that does it:
 |---|---|
 | `POST /v1/namespaces` | `CREATE SCHEMA` |
 | `DELETE /v1/namespaces/{ns}` | `DROP SCHEMA` |
-| `POST /v1/transactions/commit` | a change to several tables at once |
 
 Errors come in the REST API's shape, `{"error": {"message": …, "type": …, "code": …}}`. A client
 that reads `/v1/config` knows which of these the catalog serves, and does not send the others.
@@ -129,10 +129,11 @@ files, not the rows.
   (matched by field id, or by name), a `NOT NULL` column holds no NULL, and a partitioned table's
   file holds one partition value. A file that fails is refused by name with a `400`, and nothing of
   the commit is recorded.
-- **Copied, not recorded as written:** when views or streaming tasks follow the table (its rows go
-  through the log, for them), and when the table has a renamed or dropped column (Delta readers
+- **Followed in the same commit:** views and streaming tasks that follow the table take the new rows
+  from the files, and the change feed, `/watch` and Kafka topics read them there.
+- **Copied, not recorded as written:** when the table has a renamed or dropped column (Delta readers
   match columns by name). Then the node writes the rows as the table's own, as a bulk `INSERT` does,
-  and deletes the engine's files.
+  and deletes the engine's files. A keyed table's rows go through the log as upserts (below).
 - **The layout the metadata publishes is the one to follow:** the table's `partition_by` as its
   partition spec, a `cluster_by` on one column as its sort order, a key as its identifier fields.
 
@@ -158,24 +159,35 @@ What a commit may contain:
 | `set-snapshot-ref` | only for `main`, and only as a branch that makes the snapshot `main` |
 | requirements | `assert-table-uuid`, `assert-ref-snapshot-id` (on `main`), `assert-current-schema-id`, `assert-default-spec-id`, `assert-default-sort-order-id`, `assert-last-assigned-field-id`, `assert-last-assigned-partition-id` |
 | data files | Parquet, under the table's `data/` folder: the ones the snapshots add, and the table's files they remove (copy-on-write) |
+| position-delete files | Parquet, under the table's `data/` folder (merge-on-read): each file they name must be the table's; reads skip those rows |
+| equality-delete files | on a keyed table, by its key's fields: delete markers for those keys |
+| properties | `set-properties` and `remove-properties` alone: `ALTER TABLE … SET TBLPROPERTIES`, run as the caller (`write.delete.mode` and the like) |
 | a schema change | `add-schema` and `set-current-schema` alone (with the name mapping's `set-properties`): each field added, renamed, widened or dropped is that `ALTER TABLE`, run as the caller |
 
-Everything else is refused with a `400 BadRequestException` that says why: delete files
-(merge-on-read), a snapshot that does `replace` (another engine's compaction), property changes
-(`ALTER TABLE … SET`), a schema change Pondra's `ALTER TABLE` can't make (a required column
-added, columns reordered, a narrower type, a changed key), other branches and tags, a table that is keyed (`INSERT` into it with
-Pondra), a change (not an append) to a table that views or tasks follow or that has a renamed
-column, files outside the table's folder, and any other update in a commit (`set-properties`,
-`add-schema` and the like).
+Everything else is refused with a `400 BadRequestException` that says why: a snapshot that does
+`replace` (another engine's compaction), a schema change Pondra's `ALTER TABLE` can't make (a
+required column added, columns reordered, a narrower type, a changed key), other branches and tags,
+equality deletes on an append table (or on a keyed table's other columns), a change to a table
+followed by a view that can't take rows back (a `min` or `max`, no `count(*)`) or by a streaming
+task, a change to a table with a renamed column, a change to a keyed table that combines its rows
+(`order_by`, merge functions), files outside the table's folder, and any other update in a commit.
+
+**A keyed table** (identifier fields) takes an append as upserts, each row its key's newest version,
+and its deletes as delete markers: a copy-on-write commit's files taken out, a position delete of
+a key's current version, an equality delete by the key. They go through the log as Pondra's own
+writes do, and the node tiers and publishes the table before it answers.
 
 Iceberg's rules hold. The requirements are checked as one step, under the leader's lock. A commit
 made against a table that has changed since the engine read it is answered `409
 CommitFailedException`, and PyIceberg and Spark retry on top of the new version. A commit that
-takes files out is also answered `409` when the table holds rows its last published version
-doesn't (rows in the log, or rows Pondra changed): the node writes them into its files and
-publishes first, so the engine's retry sees them. A file taken out must still be the table's
-(`409` if a merge replaced it since). A commit sent again with a snapshot id already recorded is
-answered as done and applied once.
+takes files out or deletes rows is also answered `409` when the table holds rows its last published
+version doesn't (rows in the log, or rows Pondra changed): the node writes them into its files and
+publishes first, so the engine's retry sees them. A file the commit takes out, or deletes rows of,
+that Pondra merged or rewrote since has the change carried over to the files holding those rows
+now, by their row ids (a version that only rewrote files is published as a `replace`, which the
+engine's own conflict checks pass over); a row changed since is a `409`. A commit sent again with a
+snapshot id already recorded is answered as done and applied once. A transaction is one commit: a
+`409` for any of its tables refuses all of them.
 
 ## Making tables
 
@@ -194,10 +206,11 @@ Other types (`struct`, `map`, `uuid`, `time`, `fixed`), a spec of more than one 
 or `truncate`, a descending order and a staged create are refused by name. Making, renaming and
 dropping a table need an admin token when tokens are set, as the SQL does.
 
-<Aside type="caution">
-Changes come copy-on-write: Spark's `DELETE`, `UPDATE` and `MERGE` in Iceberg's default mode,
-PyIceberg's `delete` and `overwrite`. Merge-on-read (delete files) is refused, and so is a change
-to a table that views or tasks follow: use `DELETE`, `UPDATE` or `MERGE` in SQL there.
+<Aside type="note">
+Changes come copy-on-write (Spark's `DELETE`, `UPDATE` and `MERGE` in Iceberg's default mode,
+PyIceberg's `delete` and `overwrite`) or merge-on-read (Spark with the table's `write.delete.mode`
+and the like set to `merge-on-read`). Pondra publishes deleted rows the same way: Iceberg
+position-delete files, Delta deletion vectors.
 </Aside>
 
 ## Read with DuckDB

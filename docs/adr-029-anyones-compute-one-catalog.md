@@ -1,6 +1,6 @@
 # ADR-029: Anyone's compute, one catalog
 
-**Date:** 2026-09-29 · **Status:** accepted; phase 1 built in round 27 (2026-09-30, below); phase 2 begun in round 28 (copy-on-write changes, below), its rest next · **Builds on:** ADR-001 (readers who need only the bucket), ADR-002 (the streamhouse), ADR-003 (serverless) · **Follows:** ADR-028 (other engines append, G8), ADR-020 (system columns)
+**Date:** 2026-09-29 · **Status:** accepted; phase 1 built in round 27 (2026-09-30, below); phase 2 built in round 28 (2026-09-30, below); phase 3 when each part can be tested · **Builds on:** ADR-001 (readers who need only the bucket), ADR-002 (the streamhouse), ADR-003 (serverless) · **Follows:** ADR-028 (other engines append, G8), ADR-020 (system columns)
 
 ## Context
 
@@ -415,10 +415,80 @@ fully, rather than all of phase 2 at once.
   changes); `formats_check.py --spark … --only commits` (Spark 4 with Iceberg 1.10: INSERT,
   append, then DELETE, UPDATE and MERGE, Pondra reading what Spark reads, and ADD COLUMN).
 
-**Still to do in phase 2:** merge-on-read (position deletes and deletion vectors, read as row
-selections), Pondra's own changes published as positions and purges as maintenance, keyed tables
-taking upserts and equality deletes, multi-table transactions, and what round 27 moved here:
-followers fed from the files in one commit, and the feed carrying file commits.
+## Built in round 28, the rest (phase 2 complete, 2026-09-30)
+
+The owner: "finish round 28 first". What each part became, and what was *decided by Claude, for
+the owner's review*:
+
+- **Followers fed from the files (§7).** A file commit — another engine's, or a bulk `INSERT`'s —
+  is a commit through the log now: the leader hands the sequencer the files with the table's new
+  record (`log::Filing`), and one catalog write records the files, the views' derived rows and the
+  job's mark. The commit's segment names the files (`Segment::files`: added, taken out, rows
+  deleted), so the change feed, `/watch`, Kafka topics and streaming tasks read a file commit's rows
+  from its files, a big one a piece at a time (a Kafka fetch of 64 KB reads that much). A view
+  derives from the new files' rows, and takes back the rows a commit takes out or deletes. A task
+  that can't take a change (tasks see new rows only) is named in the refusal. The round-25 copy for
+  followed tables is gone. *(Decided by Claude: a bulk `INSERT` stamps its files' system columns
+  only when nothing follows the table; one that meets a table followed since goes again without
+  them, so every row's `_version` is the commit that recorded it, which views go by.)*
+- **Positions (§4).** A file's deleted rows are Iceberg position-delete files it keeps
+  (`DataFile::deletes`); reads skip them by Parquet row selections, without decoding them.
+  - **Pondra's own changes** are purged into one position-delete file per partition each round (a
+    published table's every round), instead of every changed file rewritten; a file a tenth deleted
+    is rewritten by maintenance.
+  - **Published** as Iceberg delete manifests beside the data manifests, and as Delta deletion
+    vectors inline in the log (Delta's `deletionVectors` feature: reader 3, writer 7).
+    *(Found: delta-rs's `to_pyarrow_table` refuses that feature; its `QueryBuilder`, Polars, DuckDB
+    and Spark read it. Documented, and the tests read Delta through the `QueryBuilder`.)*
+  - **Another engine's merge-on-read** is taken as written: its position-delete files are read once
+    (which of the table's files each names, how many rows) and kept on those files; a delete file
+    taken out must name only files taken out too. Equality deletes on an append table are refused
+    by name (Spark writes position deletes).
+- **What a published version says (found in the Spark tests).** Spark's own conflict checks failed
+  every other statement while Pondra merged files between them, for two reasons, both fixed:
+  every version listed its inline files again as added (now they are existing entries, with the
+  sequence number and snapshot that first added them), and a merge's version was an `overwrite`
+  (now a version whose rows didn't change is a `replace`, which Iceberg's checks pass over, and
+  Delta's `dataChange: false`).
+- **Carried over Pondra's merges** *(decided by Claude)*. A writer that planned its change before
+  Pondra merged or rewrote the files it names retries with the new version, and Spark's checks pass
+  it (the version was a `replace`). Its change is then carried over: the rows of the files it takes
+  out, or at the places it deletes, are found where they are now by their row ids (a merge keeps
+  them), and deleted there by position. A row changed since fails it (409). So Pondra's upkeep never
+  fails another engine's commit — Delta's row-level concurrency, from ids Pondra already has.
+- **Multi-table transactions (§8):** `POST /v1/transactions/commit` is one commit, every table's
+  change or none.
+- **Keyed tables every tier round (§4).** The older versions a round's new files replace, and its
+  delete markers, become positions: each new file's keys (a semi-join on the key columns, file by
+  file), found in the files older than it. A table does this once it held one generation (made, or
+  compacted), and from then publishes every generation. The `_deleted` column is never published
+  (Iceberg reserves the name, and Spark refused `UPDATE` on a table that has it). Pondra's own reads
+  pass over these positions: the newest row per key is theirs anyway. **Measured**
+  (`tools/bench/keyed_publish.py`, a 2M-row keyed table on local disk): a round of 100 upserts takes
+  52 ms published (positions found, Iceberg and Delta written) against 6 ms unpublished; of 10,000,
+  104 ms against 48 ms.
+- **Keyed tables take upserts (§5).** Another engine's change to a keyed table becomes rows for the
+  log: its rows are upserts, and the keys it deletes — the rows of files it takes out, a position
+  delete of a key's current version, an equality delete by the key's fields — are delete markers
+  before them. The node tiers and publishes the table before it answers, so the writer reads its
+  change. Tables that combine a key's rows (`order_by`, merge functions) refuse. *(Decided by Claude:
+  copied through the log, not recorded as written. Files as written need `_ord` per row across
+  files, which is phase 3's with v3's row lineage.)*
+- **Found and fixed on the way:**
+  - Data files carried an Arrow schema in their footers, so PyArrow read their strings as
+    `string_view`, which it can't yet take rows of: PyIceberg failed to apply any position delete.
+    Data files are written with Parquet's own types only.
+  - An `ALTER` through the catalog (schema or properties) answered 400 after ten seconds: it waited
+    for the table's next version under its SQL name.
+  - Spark's metadata tables (`t.files`) failed: loading a table in a namespace that isn't one
+    answered "no such namespace", where Spark falls back only on "no such table".
+  - A delete file's `file_path` read as `VARCHAR` is a string view in this DataFusion: the node
+    panicked (and a panic stops the node, by design).
+  - Kafka's first fetch could skip a table's first row when segment numbers had gaps (reservations).
+- **Tests:** `harness.py followers` (6 checks), `transactions` (4), `upserts` (6), `rewrites`
+  updated; `formats_check.py --spark … --only commits` (5: Spark 4 with Iceberg 1.10, copy-on-write,
+  merge-on-read with a view and the change feed following, and a keyed table), and `harness.py all`
+  on local disk, simulated R2 and real R2 (`logs/round28/`).
 
 ## Open
 

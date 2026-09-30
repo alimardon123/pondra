@@ -1,0 +1,17 @@
+tools/bench/keyed_publish.py (round 28, 2026-09-30), one node, local disk, this 2-vCPU sandbox.
+A 2M-row keyed table, compacted; five rounds of upserts to random keys at each size; the median
+tier round (fold, positions found by key, Iceberg and Delta published) against the same table
+unpublished (fold only).
+{
+ "rows": 2000000,
+ "median tier round (s) by keys upserted per round": {
+  "iceberg,delta": {
+   "100": 0.052,
+   "10000": 0.104
+  },
+  "unpublished": {
+   "100": 0.006,
+   "10000": 0.048
+  }
+ }
+}

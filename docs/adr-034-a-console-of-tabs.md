@@ -291,3 +291,28 @@ New are `register.view`, `register.doc`, `pondra.ui.openFile(path)` and `pondra.
 - `DELETE` removes it;
 - a replaced CSV reads its new rows through SQL, on the node and on a second node of the lake;
 - `files/` never lands in the SSD tier.
+
+## Changed after 0.26 (round 28, 2026-09-30)
+
+The owner tried 0.26 on Windows and asked for the Workspace to work like VS Code's explorer. Built
+the same day; *decided by Claude where marked*:
+
+- **New files are in the tree before they are saved**, in the folder they will be saved to (SQL in
+  `queries/`, Python in `scripts/`), with the unsaved dot, which their tabs show too.
+- **Folders.** New folder is in the + menus and each folder's menu. An empty folder is kept as a
+  zero-byte `.folder` object, which nothing lists. *(Decided by Claude: object storage has no
+  folders, and a marker is what keeps an empty one across reloads.)*
+- **A ⋯ on every row** of the tree (on hover, on focus, and on the row that is picked) opens the menu
+  a right-click does. A folder's menu: New notebook, SQL file, Python file and folder here, Upload a
+  file here, Delete folder (it says how many files it deletes).
+- **Notebooks in any folder.** In `notebooks/` they keep their versions, as before; anywhere else a
+  notebook is one `.ipynb` file saved in place, as SQL and Python files are (`If-Match`). *(Decided by
+  Claude: those can't run as jobs or on a schedule yet, which go by a notebook's name; the menu
+  leaves them out.)*
+- **One way to make things:** the Workspace's ⋯ no longer repeats the + (its item failed from
+  there), and "Upload a file…" replaces "Open an .ipynb or put a file in the lake…".
+- **Dialogs close on a click outside them** (search, Settings, Keys), as Esc closes them.
+- **The Data tree lists what it can** when a view reads a file on the node's machine, which only
+  the program that started the node may read: that view is left out, instead of the whole tree
+  failing.
+- **Tests:** `console_check.py`, 16 new checks (78 in all).

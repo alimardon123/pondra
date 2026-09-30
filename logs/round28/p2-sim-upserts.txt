@@ -1,0 +1,11 @@
+{
+ "upserts": {
+  "a keyed table read by PyIceberg, DuckDB (Delta) and Polars as Pondra reads it after every tier round, before any compaction": true,
+  "another engine's append is upserts: a key there is replaced, a new one added": true,
+  "its DELETE (copy-on-write): the key gone, the file's other rows as they were": true,
+  "an equality delete on the key (Flink's kind): a delete marker, the key gone": true,
+  "the change feed replays to the table: Pondra's writes and the other engine's, as upserts and deletes": true,
+  "a table that combines each key's rows (order_by) refuses another engine's change by name": true
+ },
+ "ok": true
+}

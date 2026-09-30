@@ -196,8 +196,17 @@ The same on local disk and on object storage:
   small manifests are merged 16 at a time. A table of a million files commits a ~19 KB entry, as
   fast as a table of ten (`tools/metadata_bench.py`).
 
-Not there yet: clustering across files (Z-order / Hilbert), deletion vectors, copy-on-write
-DELETE for append tables, merging files once they're sealed.
+**Deleted rows are positions** (round 28, ADR-029 §4). A file's record lists the Iceberg
+position-delete files that name it (`deletes`: Parquet files of `file_path` and `pos`, Pondra's own
+under `data/{t}/_deletes/`, other engines' where they wrote them) and how many of its rows they
+delete (`deleted`). Reads skip those rows by Parquet row selections; a file a tenth deleted is
+rewritten without them. A replaced file's delete files go with it after the retention period,
+unless another file still names them (`garbage_deletes`); its record stays while it does
+(`replaced`), so a writer's change planned before the rewrite can be carried over by row id. An
+upsert table that publishes keeps its older versions and delete markers as positions too
+(`shadows`). They are published as Iceberg delete manifests and Delta deletion vectors.
+
+Not there yet: clustering across files (Z-order / Hilbert), merging files once they're sealed.
 
 ## Reading it with other engines
 

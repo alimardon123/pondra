@@ -2151,7 +2151,7 @@ def changes():
     # Delta readers, once the change is tiered and purged
     opts = {} if not A.s3 else {"AWS_ENDPOINT_URL": os.environ["AWS_ENDPOINT"], "AWS_ACCESS_KEY_ID": os.environ["AWS_ACCESS_KEY_ID"], "AWS_SECRET_ACCESS_KEY": os.environ["AWS_SECRET_ACCESS_KEY"],
                                 "AWS_REGION": "auto", "AWS_ALLOW_HTTP": os.environ.get("AWS_ALLOW_HTTP", "false")}
-    delta = lambda: sorted((r["id"], r["owner"], r["bal"]) for r in deltalake.DeltaTable(f"{lake}/data/acct", storage_options=opts).to_pyarrow_table().select(["id", "owner", "bal"]).to_pylist())
+    delta = lambda: sorted((r["id"], r["owner"], r["bal"]) for r in delta_table(f"{lake}/data/acct", opts).select(["id", "owner", "bal"]).to_pylist())
     checks["Delta readers see the changes once they are tiered and purged"] = until(lambda: _try(delta), [(r["id"], r["owner"], r["bal"]) for r in want()], 60) == [(r["id"], r["owner"], r["bal"]) for r in want()]
     # spread over the nodes: a changed table in pieces, its old rows in files, the log and $deleted
     q("CREATE TABLE big (id BIGINT, k BIGINT, v DOUBLE)")
@@ -2415,7 +2415,7 @@ def layouts():
     import deltalake
     endpoint = os.environ.get("AWS_ENDPOINT", "")
     opts = {} if not lake.startswith("s3://") else {k: v for k, v in {"AWS_ENDPOINT_URL": endpoint, "AWS_REGION": os.environ.get("AWS_REGION", "auto"), "AWS_ALLOW_HTTP": "true" if endpoint.startswith("http://") else ""}.items() if v}
-    theirs = deltalake.DeltaTable(os.path.join(lake, "data", "t") if not lake.startswith("s3://") else lake + "/data/t", storage_options=opts or None).to_pyarrow_table()
+    theirs = delta_table(os.path.join(lake, "data", "t") if not lake.startswith("s3://") else lake + "/data/t", opts)
     ours = q("SELECT count(*) AS n, sum(v) AS s FROM t")[0]
     node.kill()
     checks = {"every round as the model": all(rounds_ok), "files: one day each, sorted by user": files_ok is not False,
@@ -2725,7 +2725,7 @@ def columns():
     except Exception as e:
         theirs["delta-rs"] = f"error: {str(e)[:120]}"
     try:  # (its pyarrow reader can't map columns: it must say so, not read them by the wrong names)
-        t = deltalake.DeltaTable(f"{lake}/data/events", storage_options=opts).to_pyarrow_table()
+        t = delta_table(f"{lake}/data/events", opts)
         theirs["delta-rs pyarrow"] = [t.num_rows, pa.compute.sum(t["total"]).as_py(), t.num_rows - t["note"].null_count]
     except Exception as e:
         theirs["delta-rs pyarrow"] = "refused" if "columnMapping" in str(e) else f"error: {str(e)[:120]}"
@@ -3361,6 +3361,14 @@ def _workers(parent):
     return out
 
 
+def delta_table(path, opts=None):
+    """A Delta table as delta-rs reads it: through its QueryBuilder, which applies deletion vectors
+    (`to_pyarrow_table` refuses a table that has them)."""
+    import deltalake, pyarrow as pa
+    t = deltalake.DeltaTable(path, storage_options=opts or None)
+    return pa.table(deltalake.QueryBuilder().register("t", t).execute("SELECT * FROM t").read_all())
+
+
 def _raises_text(f):
     try:
         f()
@@ -3465,7 +3473,7 @@ def names():
     db.sql("SELECT * FROM t WHERE id <= 3").write_delta(d, mode="overwrite")
     df.filter("id <= 3").write.format("iceberg").mode("overwrite").save(i)
     latest = sorted(g.glob(f"{i}/metadata/v*.metadata.json"), key=lambda p: int(p.rsplit("/v", 1)[1].split(".")[0]))[-1]
-    theirs = [deltalake.DeltaTable(d).to_pyarrow_table().num_rows, StaticTable.from_metadata(latest).scan().to_arrow().num_rows]
+    theirs = [delta_table(d).num_rows, StaticTable.from_metadata(latest).scan().to_arrow().num_rows]
     checks["Delta and Iceberg folders: made, APPEND, OVERWRITE; again without a mode refused, 'ignore' leaves it; delta-rs and PyIceberg agree"] = \
         all("is there already" in r for r in refused) and ignored == [None, None] and appended == [20, 20] \
         and [len(db.read_delta(d).rows()), len(db.read_iceberg(i).rows())] == [3, 3] and theirs == [3, 3]
@@ -3621,8 +3629,8 @@ def writes():
     checks["a commit sent twice (a retry after a lost answer) is applied once"] = q("SELECT count(*) AS n FROM events WHERE id >= 5000") == [{"n": 10}]
     cat.load_table("default.sales").append(pa.table({"region": ["eu", "us", "eu"], "amount": [1.0, 2.0, 3.0]}))
     view = until(lambda: q("SELECT region, total FROM by_region ORDER BY region"), [{"region": "eu", "total": 4.0}, {"region": "us", "total": 2.0}], 15)
-    delta = until(lambda: _try(lambda: deltalake.DeltaTable(f"{lake}/data/events").to_pyarrow_table().num_rows) if not A.s3 else 1212, 1212, 20)
-    checks["a view of the table follows (through the log), and so does its Delta copy"] = view == [{"region": "eu", "total": 4.0}, {"region": "us", "total": 2.0}] and delta == 1212
+    delta = until(lambda: _try(lambda: delta_table(f"{lake}/data/events").num_rows) if not A.s3 else 1212, 1212, 20)
+    checks["a view of the table follows (in the same commit), and so does its Delta copy"] = view == [{"region": "eu", "total": 4.0}, {"region": "us", "total": 2.0}] and delta == 1212
     q(f"ATTACH '{other}' AS other")
     sql(A.port + 2, "CREATE TABLE stock (id BIGINT, qty BIGINT) WITH (publish = 'iceberg')")
     until(lambda: _try(lambda: cat.load_table("other.stock")) is not None, True, 15)  # (the follower attaches it a moment later)
@@ -3635,18 +3643,18 @@ def writes():
     as_owner("INSERT INTO pondra_a.default.events SELECT value + 9000, 'p', 0.0 FROM generate_series(1, 5)")
     checks["Pondra itself appends to another Pondra's table through its catalog"] = q("SELECT count(*) AS n FROM events WHERE name = 'p'") == [{"n": 5}]
     q("INSERT INTO kv VALUES (1, 'a')")
-    q("CHECKPOINT")  # (a keyed table is published once compacted)
-    ev = cat.load_table("default.events")
-    refused = {
-        "a keyed table": _raises_text(lambda: cat.load_table("default.kv").append(pa.table({"k": pa.array([1], pa.int64()), "v": ["x"]}, schema=pa.schema([pa.field("k", pa.int64(), nullable=False), ("v", pa.string())])))),
-    }
+    q("CHECKPOINT")
+    until(lambda: _try(lambda: cat.load_table("default.kv")) is not None, True, 30)
+    cat.load_table("default.kv").append(pa.table({"k": pa.array([1, 2], pa.int64()), "v": ["x", "y"]}, schema=pa.schema([pa.field("k", pa.int64(), nullable=False), ("v", pa.string())])))
+    checks["a keyed table takes an append as upserts"] = q("SELECT k, v FROM kv ORDER BY k") == [{"k": 1, "v": "x"}, {"k": 2, "v": "y"}]
+    refused = {}
     outside = None if A.s3 else f"{lake}/data/sales/stray.parquet"  # (in the lake, not in the table's data folder)
     if outside:
         import pyarrow.parquet as pq
         pq.write_table(pa.table({"region": ["zz"], "amount": [9.0]}), outside)
         refused["files outside the table's folder"] = _raises_text(lambda: cat.load_table("default.sales").add_files([outside]))
-    said = {"a keyed table": "keyed table", "files outside the table's folder": "data folder"}
-    checks["refused by name: " + ", ".join(refused)] = all(said[k] in v for k, v in refused.items()) \
+    said = {"files outside the table's folder": "data folder"}
+    checks["refused by name: " + (", ".join(refused) or "(on R2, nothing to try)")] = all(said[k] in v for k, v in refused.items()) \
         and (outside is None or os.path.exists(outside)) and q("SELECT count(*) AS n FROM events WHERE id < 10") == [{"n": 2}]
     [x.kill() for x in (a, b, o, c)]
     ok = all(checks.values())
@@ -3709,7 +3717,7 @@ def adopted():
     checks["an append is the table's where it was written (no file copied), its rows with system columns from their lineage: ids distinct and in one run, one version, one time"] = \
         got == [{"n": n, "ids": n, "span": n, "versions": 1, "times": 1}] and bool(files) and all(by_writer(f) for f in files)
     checks[f"it costs the node footers and a commit: under a quarter of a copy's CPU ({adopt_cpu:.2f} s against {copy_cpu:.2f} s for {n:,} rows)"] = A.s3 or adopt_cpu * 4 < copy_cpu
-    delta = until(lambda: _try(lambda: deltalake.DeltaTable(f"{lake}/data/events").to_pyarrow_table().num_rows), n, 20) if not A.s3 else n
+    delta = until(lambda: _try(lambda: delta_table(f"{lake}/data/events").num_rows), n, 20) if not A.s3 else n
     checks["other engines read the rows as written: PyIceberg and delta-rs; a filter on them skips what it can"] = cat.load_table("default.events").scan(row_filter="id >= 1000 and id < 1010").to_arrow().num_rows == 10 \
         and delta == n and q("SELECT count(*) AS n, sum(id) AS s FROM events WHERE id BETWEEN 5000 AND 5009") == [{"n": 10, "s": sum(range(5000, 5010))}] \
         and q("SELECT count(*) AS n FROM copied") == [{"n": n}]
@@ -3859,7 +3867,7 @@ def rewrites():
     cat.load_table("default.t").delete("id <= 100 or id > 190")  # (Pondra's whole file, part of PyIceberg's second, none of its first)
     after = {r["id"]: r["_row_id"] for r in q("SELECT id, _row_id FROM t")}
     theirs = sorted(cat.load_table("default.t").scan().to_arrow().column("id").to_pylist())
-    delta = until(lambda: _try(lambda: sorted(deltalake.DeltaTable(f"{lake}/data/t").to_pyarrow_table().column("id").to_pylist())), list(range(101, 191)), 20) if not A.s3 else theirs
+    delta = until(lambda: _try(lambda: sorted(delta_table(f"{lake}/data/t").column("id").to_pylist())), list(range(101, 191)), 20) if not A.s3 else theirs
     checks["a DELETE from PyIceberg: a whole file dropped, part of another rewritten; Pondra, PyIceberg and delta-rs read the same rows"] = \
         sorted(after) == list(range(101, 191)) == theirs == delta
     checks["rows in a file it left alone keep their ids; the rows it rewrote get new ones (Iceberg v2: a delete and an insert)"] = len(set(after.values())) == 90 \
@@ -4804,7 +4812,7 @@ def renames():
     q("CHECKPOINT")
     if not A.s3:
         folders = sorted(os.listdir(os.path.join(lake, "data")))
-        old = deltalake.DeltaTable(os.path.join(lake, "data", "events")).to_pyarrow_table().num_rows
+        old = delta_table(os.path.join(lake, "data", "events")).num_rows
         cat = load_catalog("pondra", type="rest", uri=f"http://127.0.0.1:{A.port}")
         by_rest = cat.load_table("default.events_old").scan().to_arrow().num_rows
         checks["its files, Delta and Iceberg copies stay in its folder; a new table under the old name has a folder of its own"] = \

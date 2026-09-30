@@ -1,6 +1,6 @@
 # Prototype status: Pondra, a streamhouse in one binary
 
-**Date:** 2026-09-30 (the workspace, round 27, and round 28 in part) · **Plan:** ADR-002 to ADR-034, `roadmap.md` · **Code:** `pondra.zip` / `pondra.bundle` (≈29,400 lines of Rust, plus Python and JavaScript clients, a documentation website, packaging, and test and benchmark tools)
+**Date:** 2026-09-30 (the workspace, round 27, and round 28) · **Plan:** ADR-002 to ADR-034, `roadmap.md` · **Code:** `pondra.zip` / `pondra.bundle` (≈30,700 lines of Rust, plus Python and JavaScript clients, a documentation website, packaging, and test and benchmark tools)
 **Name:** the prototype formerly called `lh` is now **Pondra**. The name is free on crates.io, PyPI and npm. A small personal-finance app uses it (pondra.app), a different category; run a trademark search before a public launch.
 
 ## Where it stands
@@ -15,14 +15,41 @@ One Rust binary replaces the Kafka + Flink + Spark + metastore + ZooKeeper stack
 
 Start more copies on the same bucket to scale out. The only state is object storage. There's no JVM, no database server and no coordination service.
 
-**Round 28, in part, took other engines' copy-on-write changes and schema changes** (ADR-029
-phase 2's first steps): Spark's `DELETE`, `UPDATE` and `MERGE` and PyIceberg's `delete` and
-`overwrite` through the catalog, files taken out and added in one commit; rows in untouched files
-keep their ids; a change made while rows waited in the log gets 409 once they are in the files,
-and its retry sees them. Schema changes (Spark's `ADD COLUMN`, PyIceberg's `update_schema`) are
-`ALTER TABLE`s. Tested: `harness.py rewrites` (7 checks), Spark 4 with Iceberg 1.10
-(`formats_check.py --only commits`). The rest of phase 2 (merge-on-read, positions published,
-keyed upserts, transactions, followers and the feed) is next.
+**Round 28 took other engines' changes as written** (ADR-029 phase 2):
+
+1. **Changes through the catalog, both ways.** Spark's `DELETE`, `UPDATE` and `MERGE`
+   copy-on-write (files taken out and added) and merge-on-read (position-delete files, taken as
+   written), PyIceberg's `delete` and `overwrite`, against the table as Pondra has it (a change
+   made while rows waited in the log gets 409 once they are in the files). Schema and property
+   changes (`ADD COLUMN`, `SET TBLPROPERTIES`) are `ALTER TABLE`s. Several tables in one
+   transaction (`/v1/transactions/commit`): all or none.
+2. **Followed in the same commit.** Every file commit — another engine's, a bulk `INSERT`'s — goes
+   through the log: views derive from the files' rows (and take back the rows deleted), and the
+   change feed, `/watch`, Kafka topics and tasks read the rows from the files.
+3. **Deleted rows are positions.** Pondra's own `UPDATE`, `DELETE` and `MERGE` are purged into
+   position-delete files, not rewritten files; a file a tenth deleted is rewritten by maintenance.
+   Published as Iceberg delete files and Delta deletion vectors.
+4. **Pondra's upkeep never fails a writer.** A version that only merged files is published as a
+   `replace` (Delta: `dataChange: false`), with the files it lists again as existing, so Spark's
+   conflict checks pass it; the writer's change is then carried over to the merged files by row id.
+   Before this, Spark's second statement failed whenever Pondra merged between two.
+5. **Keyed tables every tier round.** Their older versions and delete markers are positions, so
+   PyIceberg, DuckDB, Polars and Spark read one row per key after every round, not only after a
+   compaction. **Measured:** on a 2M-row keyed table, a round of 100 upserts takes 52 ms published
+   (6 ms unpublished), of 10,000 upserts 104 ms (48 ms). Other engines' appends to them are upserts, their deletes (copy-on-write,
+   merge-on-read, equality deletes on the key) deletes of keys.
+6. **Found and fixed:** PyArrow read Pondra's strings as `string_view` (from the Arrow schema in the
+   files' footers) and couldn't apply a position delete to them, so PyIceberg failed on any
+   deleted row; an `ALTER` through the catalog answered 400 after ten seconds; Spark's metadata
+   tables (`t.files`) failed; a delete file's names read as string views panicked the node.
+7. **Tests** (`logs/round28/`): `harness.py followers` (6), `transactions` (4), `upserts` (6),
+   `rewrites`, `writes` and `changes` updated; `formats_check.py` with Spark 4 (55 of 55, the
+   commits part 5 of 5: copy-on-write, merge-on-read, a keyed table); `harness.py all`,
+   `console_check.py` (78), locally; the new tests on simulated and real R2. Tests read Delta
+   through delta-rs's `QueryBuilder`: its `to_pyarrow_table` refuses deletion vectors.
+8. **The console's Workspace** (after the owner tried 0.26 on Windows): folders, a ⋯ on every row,
+   new files in the tree with the unsaved dot, notebooks in any folder, dialogs that close on a
+   click outside, and a Data tree that lists what it can when a view reads a local file.
 
 **Round 27 made other engines' appends cost Pondra a commit, not a copy** (ADR-029 phase 1):
 
@@ -1636,9 +1663,12 @@ peak at 279–586 MB.
   short timeout will see it as a slow ack.
 - Tokens per role only (round 9): no TLS, per-table grants, quotas or multi-tenancy. Nodes call
   each other over plain HTTP: keep a cluster on a private network (a VPC, Tailscale).
-- Other engines read Delta and Iceberg (opt-in per table), published unpartitioned, and keyed tables only
-  as of their last compaction (at most 8 tiering rounds behind). Time travel reaches back only as
-  far as `--retain-secs` keeps replaced files.
+- Other engines read Delta and Iceberg (opt-in per table); keyed tables with `order_by` or merge
+  functions only as of their last compaction (at most 8 tiering rounds behind; plain upsert tables
+  every round since round 28). Time travel reaches back only as far as `--retain-secs` keeps
+  replaced files. A keyed table's changes from other engines are copied through the log, not
+  recorded as written; Iceberg v3 (row ids through other engines' updates), vended credentials and
+  scan planning are ADR-029's phase 3.
 - Bucket credentials still decide who can use `pondra sql` and the inbox directly.
 
 ## Next

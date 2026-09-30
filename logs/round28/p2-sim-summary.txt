@@ -1,0 +1,22 @@
+=== simulated R2, round 28
+19:07:29 start followers
+19:08:15 followers exit=0
+19:08:15 start transactions
+19:09:25 transactions exit=0
+19:09:25 start upserts
+19:10:34 upserts exit=0
+19:10:34 start rewrites
+19:11:41 rewrites exit=0
+19:11:41 start writes
+19:12:42 writes exit=0
+19:12:42 start changes
+19:17:10 changes exit=0
+19:17:10 start adopted
+19:18:22 adopted exit=0
+19:18:22 start insert
+19:18:31 insert exit=0
+19:18:31 start serverless
+19:20:14 serverless exit=0
+19:20:14 start crash
+19:35:20 crash exit=0
+19:35:20 SIM_DONE

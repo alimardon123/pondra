@@ -1,0 +1,14 @@
+=== real R2 (ponderabucket-us), round 28
+19:07:34 start followers
+19:08:36 followers exit=0
+19:08:36 start transactions
+19:10:18 transactions exit=0
+19:10:18 start upserts
+19:11:52 upserts exit=0
+19:11:52 start rewrites
+19:13:15 rewrites exit=0
+19:13:15 start changes
+19:19:06 changes exit=0
+19:19:06 start writes
+19:20:31 writes exit=0
+19:20:31 R2_DONE

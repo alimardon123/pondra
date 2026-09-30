@@ -1,0 +1,276 @@
+upsert: 401 live keys after 12,000 random upserts/deletes, 6 compactions (s: 0.0, 0.0, 0.0, 0.0, 0.0, 0.0), 1 restart, 3,400 lookups (0 wrong) -> OK
+{
+ "before tiering, every node": true,
+ "after the first round, dealt to three nodes: deleted keys stay deleted, every node": true,
+ "…and the view keeps the UPDATE that changed a total, not a count": true
+}
+{
+ "without a secret, a URL is refused": true,
+ "…but the program that started the node reads it, with its own credentials": true,
+ "…and a path on the node's machine only for that program": true,
+ "CREATE SECRET: listed by secrets() without its values, sealed in the catalog": true,
+ "one secret a bucket: another scope in it, or the same one, refused": true,
+ "a Parquet glob, a folder, a list of files == pyarrow": true,
+ "CSV with options, TSV by extension, JSON lines": true,
+ "Hive-style folders are columns, and filter (NULL's folder too)": true,
+ "a filter skips files by their footers' ranges": true,
+ "spread over three nodes == one node, and joined with a lake table": true,
+ "CREATE TABLE … AS and INSERT … SELECT from files": true,
+ "a web server's file, with its secret": true,
+ "a file changed under its name, or one more in a folder: the next query, at once, reads them as they are now": true,
+ "refused by name: an unknown option, a compressed file, an unknown format": true,
+ "COPY … TO a Parquet file: pyarrow reads what the query gave": true,
+ "…a folder of files by PARTITION_BY, read back as one table": true,
+ "…written by every node at once, each its own share's files": true,
+ "…a lake table's files and its log tail, every node its share": true,
+ "…but an aggregate or a LIMIT, whose rows no node has alone, from one node": true,
+ "…CSV with a header and a delimiter, JSON lines": true,
+ "…a file there already is replaced": true,
+ "…from the Postgres port too": true,
+ "…to a bucket no secret covers: refused, but the node's owner may": true,
+ "…and never into a lake, not even by the node's owner": true,
+ "…needs the admin role (it writes outside the lake)": true,
+ "a node with another key can't open the secret, and says why": true,
+ "DROP SECRET: refused again": true
+}
+(Azurite not found: npm install -g azurite, or AZURITE=…/azurite-blob; the Azure half is skipped)
+{
+ "gcs: two nodes on a lake there, rows from both, tiered to Parquet, read on both": true,
+ "gcs: the leader killed, the other leads (a put-if-absent term there) with every row": true,
+ "gcs: a file beside the lake, changed under its name: read as it is now": true,
+ "gcs: COPY … TO into the lake: refused": true,
+ "gcs: COPY … TO the store with a secret, read back by its folders": true
+}
+/home/claude/pondra/tools/harness.py:4922: DeprecationWarning: key_serializer does not implement kafka.serializer.Serializer
+  out = {t.__name__: t() for t in (upsert, deal, outside, clouds, kafkas, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, found, renames, workspace, server, scale, flight, reader, crash)}
+/home/claude/pondra/tools/harness.py:4922: DeprecationWarning: value_serializer does not implement kafka.serializer.Serializer
+  out = {t.__name__: t() for t in (upsert, deal, outside, clouds, kafkas, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, found, renames, workspace, server, scale, flight, reader, crash)}
+{
+ "a Pondra node's Kafka port, SASL PLAIN from a secret: its table as a topic": true,
+ "…a wrong password: refused": true,
+ "Apache Kafka: a topic as a table == what was produced": true,
+ "…spread over three nodes (its partitions dealt) == one node": true,
+ "COPY … TO a topic: every row once, each key in Kafka's partition for it": true,
+ "SASL SCRAM-SHA-256 from a secret": true,
+ "…a wrong SCRAM password: refused": true,
+ "a view fed by a topic on three nodes, one killed, then the leader: every record once": true,
+ "…its feed kept apart from the lake's functions (`/functions` lists them)": true
+}
+tiering: 12 rounds -> files {'events': 5, 'kv': 5, 'totals': 5}, untiered rows 0, rows {'events': 1200, 'kv': {'n': 200, 'v': 2400}, 'totals': 1200} -> OK
+fence: 2nd node joined as follower=True; takeover after 6.0s; stale leader's write rejected; it rejoined as follower; rows=[{'producer': 'a', 'n': 200}, {'producer': 'b', 'n': 200}] -> OK
+insert: first={'rows': 5} retry={'duplicate': True} summary={'groups': 5, 'n': 5000} -> OK
+{"serverless": {"alone_s": 0.05, "retry": ["{\"rows\":1000}", "{\"duplicate\":true}"], "four_at_once": ["{\"rows\":1000}", "{\"rows\":1000}", "{\"rows\":1000}", "{\"rows\":1000}"], "node_start_s": 0.04, "node_leads": true, "via_node_s": 0.05, "after_leader_killed_s": 30.15, "rows": {"n": 8000, "ids": 1000}, "ok": true}}
+{
+ "clients": {
+  "no token -> 401": true,
+  "read token can't write": true,
+  "write token can't create": true,
+  "users via SQL": true,
+  "pandas / polars / list appends": true,
+  "lookup": true,
+  "change feed replay (upserts + delete)": true,
+  "psycopg 3": true,
+  "psycopg 3 binary": true,
+  "psycopg2": true,
+  "SQLAlchemy + pandas": true,
+  "asyncpg": true,
+  "wrong password refused": true,
+  "cross-lake join": true,
+  "inbox write": true,
+  "vector search (SQL + Postgres)": true,
+  "SQL can't touch the node's files": true,
+  "MCP": true
+ },
+ "inbox_s": 1.05,
+ "ok": true
+}
+/home/claude/pondra/tools/harness.py:4922: DeprecationWarning: value_serializer does not implement kafka.serializer.Serializer
+  out = {t.__name__: t() for t in (upsert, deal, outside, clouds, kafkas, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, found, renames, workspace, server, scale, flight, reader, crash)}
+%3|1790775614.488|FAIL|rdkafka#producer-10| [thrd:sasl_plaintext://127.0.0.1:8620/bootstrap]: sasl_plaintext://127.0.0.1:8620/bootstrap: SASL authentication error: wrong user name or password (after 0ms in state AUTH_REQ)
+%3|1790775614.662|FAIL|rdkafka#producer-10| [thrd:sasl_plaintext://127.0.0.1:8620/bootstrap]: sasl_plaintext://127.0.0.1:8620/bootstrap: SASL authentication error: wrong user name or password (after 0ms in state AUTH_REQ, 1 identical error(s) suppressed)
+%5|1790775617.491|PARTCNT|rdkafka#producer-11| [thrd:sasl_plaintext://127.0.0.1:8620/2111752601]: Topic events (id AAAAAAAAAAAAAAAAAAAAAA) partition count changed from 1 to 0
+%6|1790775617.499|FAIL|rdkafka#producer-11| [thrd:sasl_plaintext://127.0.0.1:8620/2111752601]: sasl_plaintext://127.0.0.1:8620/2111752601: Disconnected: connection closed by peer: receive 0 after POLLIN (after 8ms in state UP)
+{
+ "kafka": {
+  "librdkafka (5 codecs, idempotent) + kafka-python": true,
+  "a view fed by Kafka": true,
+  "exactly-once retries (idempotent producer)": true,
+  "Debezium events and tombstones": true,
+  "a payload without its schema; a delete for a table without a key refused by name": true,
+  "raw values (_value), queried as JSON": true,
+  "kafka-python consumer (upserts, deletes as tombstones)": true,
+  "an offset before the oldest segment reads from there": true,
+  "librdkafka consumer": true,
+  "consumer groups (commit, hand-over via a follower, one holder)": true,
+  "wrong password / read token refused": true
+ },
+ "librdkafka_20k_events_s": 2.2,
+ "ok": true
+}
+{
+ "alter": {
+  "old and new rows": true,
+  "the new column": true,
+  "a view over the table": true,
+  "a keyed table": true,
+  "lookup": true,
+  "IF NOT EXISTS": true,
+  "a clash is refused": true,
+  "Delta and Iceberg readers": true
+ },
+ "rows_written_during": 44100,
+ "outside_readers": {
+  "delta-rs": 44103,
+  "polars": 44103,
+  "duckdb": 44103,
+  "iceberg/pyiceberg": 44103,
+  "iceberg/polars": 44103,
+  "iceberg/duckdb": 44103
+ },
+ "ok": true
+}
+{
+ "windows": {
+  "a window closes when event time passes its end, not when the next one starts": true,
+  "each window once, final, with rows up to the lateness out of order": true,
+  "late row: in the view, not re-emitted": true,
+  "the same view asked for again changes nothing; with other options, it is refused": true
+ },
+ "ok": true
+}
+{
+ "sessions": {
+  "a session closes when the watermark passes its last row plus the gap": true,
+  "each session once, whole, with rows out of order within the lateness": true
+ },
+ "ok": true
+}
+{
+ "asof": {
+  "each trade priced as of its own time, in the stream": true,
+  "the same query ad hoc agrees, over HTTP and Postgres (described, then run)": true,
+  "what isn't an as-of join is refused": true
+ },
+ "ok": true
+}
+{
+ "sums": {
+  "sum(DOUBLE) == math.fsum, whole and per group, on every node, every time": true,
+  "and in a window over each group": true,
+  "[1e16, 1, -1e16] adds up to 1; all NULLs to NULL; overflow to infinity, not NaN": true,
+  "a sliding window takes values back out": true,
+  "integers, decimals and DISTINCT keep DataFusion's sum; FILTER works": true
+ },
+ "ok": true
+}
+/usr/local/lib/python3.11/dist-packages/adbc_driver_manager/dbapi.py:369: Warning: Cannot disable autocommit; conn will not be DB-API 2.0 compliant
+  warnings.warn(
+{
+ "schemas": {
+  "a schema must exist before its tables; CREATE SCHEMA on a follower": true,
+  "t, public.t and lake.public.t are one table; dbo.t another": true,
+  "a join across schemas": true,
+  "attached lakes: other.t, other.public.t, other.eu.t, joined with this lake's": true,
+  "names: unquoted ones are lower case; odd characters and four parts refused": true,
+  "CREATE TABLE \u2026 AS: the query's rows and columns, or the ones it names": true,
+  "INSERT INTO t (columns): the ones named, by position, the rest NULL": true,
+  "a view: the query, run over the tables as they are now; a view of a view": true,
+  "CREATE VIEW over a name in use refused; OR REPLACE replaces": true,
+  "queries over views spread, with the same answers": true,
+  "CREATE MATERIALIZED VIEW: the rows already there and those written after; WITH (window \u2026) emits to _final; bad options refused": true,
+  "Postgres, Flight SQL (ADBC ingest into a schema) and Iceberg REST see the schemas": true,
+  "DROP refused while a view reads it; after the drop, a new table of its name is empty": true,
+  "DROP SCHEMA refused while it holds tables; CASCADE drops them all": true,
+  "FROM t is SELECT * FROM t (alone, a subquery, a view's); UPDATE on an attached lake, from any node, is its leader's": true,
+  "ATTACH 'dir' AS name on one node: every node, after a restart, pondra sql; joins and writes across; DETACH everywhere; bad ones refused": true,
+  "ATTACH of a place with no lake makes one; CREATE DATABASE makes one beside this lake, attached; twice is refused": true
+ },
+ "ok": true
+}
+{
+ "changes": {
+  "60 random INSERT/UPDATE/DELETE/MERGE on 3 nodes == the model, every node, while tiering and purging": true,
+  "an UPDATE or MERGE keeps a row's _row_id; ids are unique": true,
+  "a retried job changes rows once; `pondra sql` changes them through the leader": true,
+  "three nodes changing the same rows at once: every change counts": true,
+  "the change feed replays to the table's rows; each old version as it was": true,
+  "/watch?changes=true: an UPDATE as its old and new versions": true,
+  "Delta readers see the changes once they are tiered and purged": false,
+  "spread over three nodes == one node, over the changed tables": true,
+  "refused: a change under a view keeping a max; a view's table; a system column; a MERGE matching a row twice": true,
+  "keyed tables: UPDATE and MERGE keep a row's _row_id; MERGE inserts and deletes": true,
+  "after a restart, the same rows": true
+ },
+ "ok": false
+}
+[True, True, True, True, True, True, True, True, True, True, True, True, True, True, True, True, True, True, True, True, True, True, True, True, True, True, True, True, True, True] [True, True, True, True, True, True, True, True, True, True] {'rows': 35, 'updated': 35, 'deleted': 0, 'inserted': 0} {'duplicate': True}  [(1, 'a', 101.0), (3, 'b', 39.0), (4, 'c', 81.0), (7, 'd', 16.0), (11, 'b', 44.0)] [{'id': 1, 'owner': 'w', 'bal': 101.0}, {'id': 3, 'owner': 'b', 'bal': 39.0}, {'id': 4, 'owner': 'c', 'bal': 81.0}, {'id': 7, 'owner': 'd', 'bal': 16.0}, {'id': 11, 'owner': 'b', 'bal': 44.0}] [{'id': 1, 'owner': 'a', 'bal': 101.0, '_row_id': 4294967296, '_version': 77, '_created_at': '2026-09-30T13:41:01.152Z', '_updated_at': '2026-09-30T13:41:03.824Z', '_change_type': 'update_preimage'}, {'id': 1, 'owner': 'w', 'bal': 101.0, '_row_id': 4294967296, '_version': 77, '_created_at': '2026-09-30T13:41:01.152Z', '_updated_at': '2026-09-30T13:41:03.824Z', '_change_type': 'update_postimage'}] [([{'n': 105600, 's': 647718000.0}], [{'n': 105600, 's': 647718000.0}], True), ([{'k': 0, 'n': 2400, 's': 24060000.0}, {'k': 1, 'n': 2400, 's': 23942400.0}, {'k': 2, 'n': 2400, 's': 23944800.0}, {'k': 3, 'n': 2400, 's': 23947200.0}, {'k': 4, 'n': 2400, 's': 23949600.0}, {'k': 5, 'n': 2400, 's': 23952000.0}, {'k': 6, 'n': 2400, 's': 23954400.0}, {'k': 7, 'n': 2400, 's': 23956800.0}, {'k': 8, 'n': 2400, 's': 23959200.0}, {'k': 9, 'n': 2400, 's': 23961600.0}, {'k': 10, 'n': 2400, 's': 11982000.0}, {'k': 11, 'n': 2400, 's': 11983200.0}, {'k': 12, 'n': 2400, 's': 11984400.0}, {'k': 13, 'n': 2400, 's': 11985600.0}, {'k': 14, 'n': 2400, 's': 11986800.0}, {'k': 15, 'n': 2400, 's': 11988000.0}, {'k': 16, 'n': 2400, 's': 11989200.0}, {'k': 17, 'n': 2400, 's': 11990400.0}, {'k': 18, 'n': 2400, 's': 11991600.0}, {'k': 19, 'n': 2400, 's': 11992800.0}, {'k': 21, 'n': 2400, 's': 11995200.0}, {'k': 22, 'n': 2400, 's': 11996400.0}, {'k': 23, 'n': 2400, 's': 11997600.0}, {'k': 24, 'n': 2400, 's': 11998800.0}, {'k': 25, 'n': 2400, 's': 12000000.0}, {'k': 26, 'n': 2400, 's': 12001200.0}, {'k': 27, 'n': 2400, 's': 12002400.0}, {'k': 28, 'n': 2400, 's': 12003600.0}, {'k': 29, 'n': 2400, 's': 12004800.0}, {'k': 30, 'n': 2400, 's': 12006000.0}, {'k': 31, 'n': 2400, 's': 12007200.0}, {'k': 32, 'n': 2400, 's': 12008400.0}, {'k': 33, 'n': 2400, 's': 12009600.0}, {'k': 34, 'n': 2400, 's': 12010800.0}, {'k': 35, 'n': 2400, 's': 12012000.0}, {'k': 36, 'n': 2400, 's': 12013200.0}, {'k': 37, 'n': 2400, 's': 12014400.0}, {'k': 38, 'n': 2400, 's': 12015600.0}, {'k': 39, 'n': 2400, 's': 12016800.0}, {'k': 40, 'n': 2400, 's': 12018000.0}, {'k': 41, 'n': 2400, 's': 12019200.0}, {'k': 42, 'n': 2400, 's': 12020400.0}, {'k': 43, 'n': 2400, 's': 12021600.0}, {'k': 44, 'n': 2400, 's': 12022800.0}], [{'k': 0, 'n': 2400, 's': 24060000.0}, {'k': 1, 'n': 2400, 's': 23942400.0}, {'k': 2, 'n': 2400, 's': 23944800.0}, {'k': 3, 'n': 2400, 's': 23947200.0}, {'k': 4, 'n': 2400, 's': 23949600.0}, {'k': 5, 'n': 2400, 's': 23952000.0}, {'k': 6, 'n': 2400, 's': 23954400.0}, {'k': 7, 'n': 2400, 's': 23956800.0}, {'k': 8, 'n': 2400, 's': 23959200.0}, {'k': 9, 'n': 2400, 's': 23961600.0}, {'k': 10, 'n': 2400, 's': 11982000.0}, {'k': 11, 'n': 2400, 's': 11983200.0}, {'k': 12, 'n': 2400, 's': 11984400.0}, {'k': 13, 'n': 2400, 's': 11985600.0}, {'k': 14, 'n': 2400, 's': 11986800.0}, {'k': 15, 'n': 2400, 's': 11988000.0}, {'k': 16, 'n': 2400, 's': 11989200.0}, {'k': 17, 'n': 2400, 's': 11990400.0}, {'k': 18, 'n': 2400, 's': 11991600.0}, {'k': 19, 'n': 2400, 's': 11992800.0}, {'k': 21, 'n': 2400, 's': 11995200.0}, {'k': 22, 'n': 2400, 's': 11996400.0}, {'k': 23, 'n': 2400, 's': 11997600.0}, {'k': 24, 'n': 2400, 's': 11998800.0}, {'k': 25, 'n': 2400, 's': 12000000.0}, {'k': 26, 'n': 2400, 's': 12001200.0}, {'k': 27, 'n': 2400, 's': 12002400.0}, {'k': 28, 'n': 2400, 's': 12003600.0}, {'k': 29, 'n': 2400, 's': 12004800.0}, {'k': 30, 'n': 2400, 's': 12006000.0}, {'k': 31, 'n': 2400, 's': 12007200.0}, {'k': 32, 'n': 2400, 's': 12008400.0}, {'k': 33, 'n': 2400, 's': 12009600.0}, {'k': 34, 'n': 2400, 's': 12010800.0}, {'k': 35, 'n': 2400, 's': 12012000.0}, {'k': 36, 'n': 2400, 's': 12013200.0}, {'k': 37, 'n': 2400, 's': 12014400.0}, {'k': 38, 'n': 2400, 's': 12015600.0}, {'k': 39, 'n': 2400, 's': 12016800.0}, {'k': 40, 'n': 2400, 's': 12018000.0}, {'k': 41, 'n': 2400, 's': 12019200.0}, {'k': 42, 'n': 2400, 's': 12020400.0}, {'k': 43, 'n': 2400, 's': 12021600.0}, {'k': 44, 'n': 2400, 's': 12022800.0}], True), ([{'n': 40800, 's': 253057200.0}], [{'n': 40800, 's': 253057200.0}], True)] {'n': 105600, 's': 647718000.0} 105600 ['500: b"acct\'s rows can\'t change while these follow it: view top (keeps a min or max). Drop them first, or change a copy of the table"', '500: b"rich is a view\'s: change the table it follows"', '500: b"acct\'s rows can\'t change while these follow it: view top (keeps a min or max). Drop them first, or change a copy of the table"', '500: b"acct\'s rows can\'t change while these follow it: view top (keeps a min or max). Drop them first, or change a copy of the table"'] [{'k': 1, 'v': 100, '_row_id': 4295031753}, {'k': 3, 'v': 300, '_row_id': 4295031756}] {2: 4295031754, 1: 4295031753}
+
+=== harness.py all stops at its first failure: changes' Delta check (delta-rs's to_pyarrow_table refuses deletion vectors); the tests now read Delta through delta-rs's QueryBuilder. changes again:
+{
+ "changes": {
+  "60 random INSERT/UPDATE/DELETE/MERGE on 3 nodes == the model, every node, while tiering and purging": true,
+  "an UPDATE or MERGE keeps a row's _row_id; ids are unique": true,
+  "a retried job changes rows once; `pondra sql` changes them through the leader": true,
+  "three nodes changing the same rows at once: every change counts": true,
+  "the change feed replays to the table's rows; each old version as it was": true,
+  "/watch?changes=true: an UPDATE as its old and new versions": true,
+  "Delta readers see the changes once they are tiered and purged": true,
+  "spread over three nodes == one node, over the changed tables": true,
+  "refused: a change under a view keeping a max; a view's table; a system column; a MERGE matching a row twice": true,
+  "keyed tables: UPDATE and MERGE keep a row's _row_id; MERGE inserts and deletes": true,
+  "after a restart, the same rows": true
+ },
+ "ok": true
+}
+
+=== the rest of harness.py all, test by test:
+guard exit=0   "a query that ran both ways goes the faster way": true,   "an aggregate of a few groups is known to move little (under 1 MB)": true  },  "ok": true,  "learned": [   true  ],  "few_groups_mb": 0.0 } 
+files exit=0 ": true, "a pondra sql INSERT's files recorded as written": true}, "secs": 0.6, "parquet_files_made": 0, "writes_per_insert": 1.0, "wal_objects_left": 2, "cli_insert": {"files": 3, "files_seen": 3}}} 
+layouts exit=0  "files: one day each, sorted by user": true, "lookup of a moved row": true, "delta-rs sees what Pondra sees": true}, "rounds": 10, "rows": 309, "delta_rows": 309, "pondra": {"n": 309, "s": 314895}}} 
+clusters exit=0 : true, "row groups narrow in a and in b (each < 0.75 of the whole)": true}, "row_group_span": {"app": {"a": 0.42, "b": 0.46}, "kv": {"a": 0.42, "b": 0.46}}, "rows": {"app": 2000000, "kv": 2000000}}} 
+copies exit=0 N, text and CSV": true, "COPY TO STDOUT, text": true, "COPY TO STDOUT, binary": true, "COPY TO STDOUT, csv": true, "ADBC Postgres driver (Arrow)": true, "DECIMAL as NUMERIC, text and binary": true}}} 
+streams exit=0 {"streams": {"passed": true, "checks": {"stream join: each pair once, whichever side came first": true, "sliding windows: every window, every click it covers": true}, "pairs": 203, "windows": 52}} 
+columns exit=0 ],   "delta-rs": [    85920,    64753688706390,    30400   ],   "delta-rs pyarrow": [    85920,    64753688706390,    30400   ]  },  "expected": [   85920,   64753688706390,   30400  ],  "ok": true } 
+fills exit=0 ue,   "per_user2 == its query (:8600)": true,   "evens2 == its query (:8600)": true,   "per_user2 == its query (:8601)": true,   "evens2 == its query (:8601)": true  },  "rows": 138542,  "ok": true } 
+dedup exit=0  back; a newer one does": true,   "SELECT * leaves _deleted out": true,   "\u2026unless named": true,   "DuckDB reads the Delta copy == the model": true  },  "keys": 191,  "rows": 2400,  "ok": true } 
+procedures exit=0  in none don't; ending the session ends them": true,   "--python without tokens only on 127.0.0.1": true,   "pondra run: a .sql file with parameters, on a node started for it": true  },  "ok": true } 
+functions exit=0 ce (10 ticks, 10 runs), and on after it (3 before)": true,   "idle workers are gone after PONDRA_WORKER_IDLE_SECS": true,   "the shell: CALL prints what the procedure printed": true  },  "ok": true } 
+external exit=0 ed by its version (If-Match); without one, or with an old one, refused (409, 412); both nodes read the new rows": true,   "a lake's file is deleted (and is gone from files())": true  },  "ok": true } 
+names exit=0 -rs and PyIceberg agree": true,   "a folder named relatively: written and read back (read_delta, read_iceberg, delta_scan); Iceberg's location absolute, as PyIceberg reads it": true  },  "ok": true } 
+answers exit=0 arguments)": true,   "a failed call isn't kept": true,   "refused by name: on a SQL function, a procedure, a schedule": true,   "@db.function(cache=\u2026), in SQL and frames": true  },  "ok": true } 
+writes exit=1  4.0}, {'region': 'us', 'total': 2.0}] 1212 {'a keyed table': '', "files outside the table's folder": "BadRequestException: /tmp/pondra-gjcyhn65/data/sales/stray.parquet: not in sales's data folder"} 
+adopted exit=0 used by name, from the file's footer": true,   "renamed and dropped through the catalog": true  },  "ok": true,  "cpu_s": {   "adopted": 0.009999999999999995,   "copied": 0.18,   "rows": 1000000  } } 
+ids exit=0 a bulk INSERT the one after": true,   "a segment of 2^24 + 10 rows of a table takes two numbers; a consumer seeking into the second reads on from there, then the next segment": true  },  "ok": true } 
+rewrites exit=0  count to drop the groups it empties)": true,   "schema changes through the catalog: a column added, renamed, widened and dropped, each an ALTER TABLE; a required one refused": true  },  "ok": true } 
+followers exit=0 es a bulk INSERT's rows and PyIceberg's; a change it can't follow is refused by name": true,   "a stream join pairs the rows bulk INSERTs wrote on either side, each pair once": true  },  "ok": true } 
+transactions exit=0 le by row id; the rows as they should be, none twice, their ids kept": true,   "a change naming rows deleted since (and its file merged) is refused (409), the table as it was": true  },  "ok": true } 
+upserts exit=0  the table: Pondra's writes and the other engine's, as upserts and deletes": true,   "a table that combines each key's rows (order_by) refuses another engine's change by name": true  },  "ok": true } 
+live exit=0 ns for it on the node (/stats live_queries back to 0)": true,   "JavaScript: for await (const rows of db.live(sql))": true,   "refused by name: rows sent with it, and a write": true  },  "ok": true } 
+temps exit=0 fused; a procedure sees its caller's": true,   "Postgres: a connection's own, gone when it ends": true,   "close() ends a session; so does idleness (PONDRA_SESSION_IDLE_SECS)": true  },  "ok": true } 
+across exit=0 nd from a file here == the same on that lake's node": true,   "a retried job applies once": true,   "with nobody leading that lake: this node leads it for the moment it takes": true  },  "ok": true } 
+found exit=0 : true,   "to_timestamp answers TIMESTAMP (DataFusion's, Spark's), now() TIMESTAMPTZ in UTC": true,   "files() after PUT /files lists the new file (never a remembered answer)": true  },  "ok": true } 
+renames exit=0 the old name has a folder of its own": true,   "ALTER VIEW \u2026 RENAME TO": true,   "refused by name: a taken name, a table a materialized view follows, a materialized view": true  },  "ok": true } 
+workspace exit=0 nes (they need an admin, as DO does)": true,   "mistakes said by name: no such file, not a file that runs, a value not named, a name twice, no saved notebook, run is Pondra's": true  },  "ok": true } 
+server exit=0 true,   "a folder holding other things isn't made a lake, and nor is this folder unless named": true,   "stopped, the server stops its databases' nodes": true  },  "ok": true,  "first_write_s": 0.1 } 
+scale exit=0 scanned": 2.0  },  "outside_readers": {   "delta-rs": 23100,   "polars": 23100,   "duckdb": 23100,   "iceberg/pyiceberg": 23100,   "iceberg/polars": 23100,   "iceberg/duckdb": 23100  },  "ok": true } 
+flight exit=0 true,   "the log, following": true,   "basic-auth handshake": true,   "ADBC query": true,   "ADBC write as a query, ingest, objects": true,   "every row once": true  },  "follow_ms": 6,  "ok": true } 
+reader exit=0 reader: send -> visible on a separate read-only node: p50 9 ms, p99 100 ms; after a failover, 0.3 s after the new leader's ack 
+crash exit=0 sk_output=6000/6000 views=exact -> OK run 20: kill-9=2 injected={'after_seg_put': 0, 'after_commit': 0, 'after_parquet_put': 1} events=12000/12000 unique=12000 task_output=6000/6000 views=exact -> OK 
+DONE
+
+=== writes again (a keyed table now takes appends as upserts):
+Commit failed due to a concurrent update, retrying (1/4) in 103 ms
+Commit failed due to a concurrent update, retrying (1/4) in 102 ms
+{
+ "writes": {
+  "PyIceberg appends through a follower: the rows are the table's own (row ids), its file where it wrote it, its snapshot found by its id": true,
+  "two writers at once: the second gets 409, retries, and each append is in once": true,
+  "a commit sent twice (a retry after a lost answer) is applied once": true,
+  "a view of the table follows (through the log), and so does its Delta copy": true,
+  "an attached lake's table, through this lake's catalog: its leader records it": true,
+  "Pondra itself appends to another Pondra's table through its catalog": true,
+  "a keyed table takes an append as upserts": true,
+  "refused by name: files outside the table's folder": true
+ },
+ "ok": true
+}

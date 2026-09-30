@@ -99,8 +99,8 @@ def readers(lake, table):
                 "AWS_SECRET_ACCESS_KEY": os.environ["AWS_SECRET_ACCESS_KEY"], "AWS_REGION": "auto", "AWS_S3_ALLOW_UNSAFE_RENAME": "true"}
     out = {}
     try:
-        import deltalake
-        out["delta-rs"] = deltalake.DeltaTable(uri, storage_options=opts).to_pyarrow_table().num_rows
+        import deltalake, pyarrow as pa
+        out["delta-rs"] = pa.table(deltalake.QueryBuilder().register("t", deltalake.DeltaTable(uri, storage_options=opts)).execute("SELECT * FROM t").read_all()).num_rows  # (deletion vectors applied)
     except Exception as e:
         out["delta-rs"] = f"error: {str(e)[:120]}"
     try:

@@ -2,7 +2,7 @@
 
 Read this first, then `README.md` (what it does), `docs/adr-005-every-node-writes.md` (why it
 works this way) and `docs/adr-028-one-vocabulary-and-open-writes.md` (the latest round;
-`docs/adr-029-anyones-compute-one-catalog.md`, phase 1 built in round 27, phase 2 next).
+`docs/adr-029-anyones-compute-one-catalog.md`, phase 1 built in round 27, phase 2 in round 28).
 `docs/prototype-status.md` has the measured numbers and what's left.
 
 ## What this is
@@ -19,7 +19,7 @@ The owner's design principles, which every change must respect:
 2. **As serverless as possible**: no always-on services besides the nodes themselves.
 3. **SPMD, not driver/executor** (Bodo-style): every node runs the same code on its slice.
 4. **No JVM, no Spark, no Flink, no Fluss needed.**
-5. **Short, simple, readable code** — without losing functionality. ~25,100 lines of Rust total (the Kafka protocol is 1,300 of them; other engines' formats, Kafka's client side and files anywhere, round 23, 4,650; Python functions, procedures on workers, the run log and tasks, round 24, 1,400; outside appends, live queries, temporary tables, answers kept and changes across lakes, round 25, 1,200).
+5. **Short, simple, readable code** — without losing functionality. ~30,700 lines of Rust total (the Kafka protocol is 1,300 of them; other engines' formats, Kafka's client side and files anywhere, round 23, 4,650; Python functions, procedures on workers, the run log and tasks, round 24, 1,400; outside appends, live queries, temporary tables, answers kept and changes across lakes, round 25, 1,200; other engines' changes as written, round 28, 1,300).
    If a change makes a file much longer, look for the simpler shape first.
 6. **Scale-out is the point** (the owner, 2026-09-27): running across machines is what sets
    Pondra apart from single-node engines (DuckDB, Polars, Daft, Bodo) and makes it leaner than
@@ -291,9 +291,11 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
   - **`POST /sql`** takes several statements (`routines::statements`) and `$name` parameters
     (`routines::bind`); MCP lists every procedure as a tool.
   - **Other engines' writes** (ADR-029, `adopt.rs`, `iceberg.rs`): an append through the REST
-    catalog is recorded as written (footers checked, lineage given), or copied when the table is
-    followed or has renamed columns; the catalog makes, renames and drops tables, and publishes
-    each table's layout for writers.
+    catalog is recorded as written (footers checked, lineage given), or copied when the table has
+    renamed columns; their changes too — files taken out (copy-on-write), position deletes
+    (merge-on-read), several tables at once — as one commit through the log that what follows the
+    table follows; a keyed table's as upserts and delete markers through the log. The catalog makes,
+    renames and drops tables, and publishes each table's layout for writers.
   - **The workspace** (ADR-033, `workspace.rs`): `CALL run('etl/orders.sql', day =>
     …)` runs a file of the lake's as its caller: a `.sql` file through `routines::script`, a `.py`
     file and a notebook's Python cells in a worker of the run's own (`python::ask_session`, the
@@ -994,8 +996,8 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    one partition value; its `lineage` (a first row id, the commit that recorded it, its time)
    gives its rows' system columns, `_row_id` by the row's place in the file (Parquet's row number:
    `scan::adopted`), in every read (`query::read_files`, `files_once`: merges, purges); a merge
-   writes them out. Copied instead (round 25's path) when views or tasks follow the table or it
-   has a renamed or dropped column (Delta readers go by name: `adopt::fits_as_written`). Pondra's
+   writes them out. Copied instead (round 25's path) when the table has a renamed or dropped column
+   (Delta readers go by name: `adopt::fits_as_written`). Pondra's
    own files written without a leader take lineage too, never a rewrite. `harness.py adopted`,
    `writes`.
 154. **A table's layout is published for writers** (`iceberg::Layout`): `partition_by` as partition
@@ -1020,14 +1022,59 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    `MERGE`, overwrite), in one catalog commit, sealed files too (their manifests unsealed); a file
    taken out must still be the table's (409); a commit that takes files out while the table has
    rows in the log or changes not yet purged gets 409 once they are tiered, purged and published
-   (`iceberg::up_to_date`). Refused by name: delete files (merge-on-read), `replace`, and changes to
-   followed or renamed tables. `harness.py rewrites`, `formats_check.py --spark … --only commits`.
+   (`iceberg::up_to_date`). Position-delete files (merge-on-read) are taken as written, each data
+   file they name the table's (`iceberg::deleted`, `adopt::mark`); a delete file taken out must name
+   only files taken out too (`iceberg::still_deleting`). Refused by name: equality deletes on an
+   append table, `replace`, changes to renamed tables and to tables followed by what can't take
+   rows back (`views::can_follow`). `harness.py rewrites`, `formats_check.py --spark … --only commits`.
 158. **Another engine's schema change is `ALTER TABLE`** (`iceberg::schema_sql`): a commit of
    `add-schema` and `set-current-schema` alone (the name mapping's `set-properties` taken and
    dropped: Pondra publishes its own) is diffed by field id against the published schema into
    DROP, RENAME, widening ALTER COLUMN TYPE and ADD COLUMN statements, run as the caller; a new
    required column, a reorder, a changed key or a narrower type is refused before any runs.
    `harness.py rewrites`, `formats_check.py --spark … --only commits` (Spark's ADD COLUMN).
+159. **A file commit is a commit through the log** (ADR-029 §7, `adopt::file`, `log::Filing`,
+   `Segment::files`): a bulk INSERT's files and other engines' commits go through the sequencer
+   with the views' derived rows and the jobs' marks, in one catalog write (`t/` under the lake's
+   lock); the views derive from the files' rows (and take back the rows taken out or deleted:
+   `{t}$deleted` rows passed to `derive` only). The change feed, `/watch`, Kafka topics and tasks
+   read a file commit's rows from its files (`Lake::filed_rows`, `deleted_rows`, `query::tail_of`),
+   a big one a piece at a time. A bulk INSERT stamps its files' system columns only when nothing
+   follows the table (`write::stamp`); files stamped under a reserved commit meeting a table
+   followed since go again without them (`write::AGAIN`). `harness.py followers`.
+160. **Deleted rows are positions** (ADR-029 §4, `DataFile::deletes`, `deleted`): reads skip them
+   by Parquet row selections (`scan::with_deletes`, `placed`, `adopted_in`), never through the hot
+   columns; Pondra's purge writes one position-delete file per partition (`tier::purge`,
+   `write_positions`) instead of rewriting files; maintenance rewrites a file a tenth deleted
+   (`tier::mostly_deleted`). A replaced file's delete files go with it after the retention period,
+   unless another file still names them (`TableMeta::garbage_deletes`, `tier::named_deletes`).
+   Published as Iceberg delete manifests and Delta deletion vectors (inline, reader 3 and writer 7).
+   `harness.py changes`, `rewrites`.
+161. **A published version never looks like a change it isn't** (`iceberg::publish`,
+   `delta::publish`): a file listed again is an existing entry with the sequence number and snapshot
+   that first added it (`Published::since`, and the manifests a version drops, read); a version whose
+   rows didn't change (`TableMeta::rows_at`, the last purge) only rewrote files: Iceberg's `replace`,
+   Delta's `dataChange: false`. Writers' own conflict checks pass over Pondra's merges.
+   `formats_check.py --spark … --only commits`.
+162. **A writer's change to files Pondra rewrote since is carried over** (`adopt::carry`): a file it
+   takes out or deletes rows of that a merge replaced (`TableMeta::replaced`, kept while the file
+   is) has its rows found where they are now by row id, and deleted there by position; a row changed
+   since is a 409. `harness.py transactions`.
+163. **A transaction is one commit** (`iceberg::transaction`, `record` over several commits): every
+   table's change is checked, then all go in one `adopt::file`, or none; a keyed table's changes go
+   a table at a time. `harness.py transactions`.
+164. **An upsert table that others read publishes every round** (`tier::shadow`, `TableMeta::shadows`):
+   the older versions a round's files replace and its delete markers become positions, found by
+   key; once a table held one generation (made, or compacted) every generation is published
+   (`delta::publishable`). Its `_deleted` is never published (`TableMeta::marker`: Iceberg reserves
+   the name). Pondra's own reads of keyed files pass over those positions (`query::files_once`).
+   Another engine's change to a keyed table is rows for the log (`iceberg::keyed`, `adopt::upserts`):
+   its rows upserts, the keys it deletes (files taken out, positions, equality deletes by the key)
+   markers before them; tiered and published before the answer. `order_by` and merge tables refuse
+   it. `harness.py upserts`, `formats_check.py --spark … --only commits`.
+165. **Data files carry no Arrow schema in their footers** (`tier::plain`): Parquet's own types only,
+   so other engines' Arrow reads strings as strings, not views (PyArrow can't yet take rows of a
+   `string_view`, which PyIceberg does to apply a position delete). `harness.py upserts`.
 
 ## Tests: run these before and after any change
 
@@ -1149,19 +1196,23 @@ Practical notes for an agent working here:
 - Node stderr goes to `/tmp/pondra-<port>-<id>.stderr`; that's where "restarting to rejoin",
   "slow tiering" and panics show up.
 
-## State of the work (2026-09-30, round 27)
+## State of the work (2026-09-30, round 28)
 
 Everything in `docs/prototype-status.md` passes on local disk and on simulated R2. The round-11
 additions (manifests, partitions, shuffles, memory limits, Arrow Flight) also ran against real
 R2; round 12's are in `logs/round12/`, round 13's in `logs/round13/`, round 14's in
 `logs/round14/`, round 15's in `logs/round15/`, round 16's in `logs/round16/`, round 17's in `logs/round17/`,
-round 18's in `logs/round18/`, round 19's in `logs/round19/`, round 20's in `logs/round20/`, round 21's in `logs/round21/`, round 22's in `logs/round22/`, round 23's in `logs/round23/`, round 24's in `logs/round24/`, round 25's in `logs/round25/` and round 26's in `logs/round26/`.
+round 18's in `logs/round18/`, round 19's in `logs/round19/`, round 20's in `logs/round20/`, round 21's in `logs/round21/`, round 22's in `logs/round22/`, round 23's in `logs/round23/`, round 24's in `logs/round24/`, round 25's in `logs/round25/`, round 26's in `logs/round26/`, round 27's in `logs/round27/` and round 28's in `logs/round28/`.
 
-**Round 28, in part (ADR-029 phase 2): other engines' copy-on-write changes and schema changes.**
-Spark's `DELETE`, `UPDATE` and `MERGE` and PyIceberg's `delete` and `overwrite` through the
-catalog: files taken out and added in one commit, against the table as Pondra has it (invariant
-157); their schema changes as `ALTER TABLE` (invariant 158). The rest of phase 2 (merge-on-read,
-positions published, keyed tables' upserts, transactions, followers and the feed) is next.
+**Round 28 (ADR-029 phase 2): other engines' changes as written.** Spark's `DELETE`, `UPDATE` and
+`MERGE` copy-on-write and merge-on-read, PyIceberg's `delete` and `overwrite`, through the catalog,
+against the table as Pondra has it (invariant 157); schema and property changes as `ALTER TABLE`
+(158); every file commit through the log, followed by views, tasks, the feed and Kafka in the same
+commit (159); deleted rows as positions, Pondra's own too, published as delete files and deletion
+vectors (160); versions that don't look like changes they aren't, and changes carried over Pondra's
+merges (161, 162); multi-table transactions (163); keyed tables published every round, and other
+engines' upserts and deletes into them (164). The console's Workspace got folders and the unsaved
+dot, after the owner tried 0.26 on Windows.
 
 **Round 27 (ADR-029 phase 1): other engines' appends as written.** An append through the Iceberg
 catalog costs the node its files' footers and a commit, not a copy (a million rows: 0.01 s of its

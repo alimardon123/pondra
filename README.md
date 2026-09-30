@@ -205,10 +205,12 @@ checks it and records it, never copying the rows (a million rows cost it 0.01 s 
 to copy them), and the rows take their ids and versions from the commit. Each commit lands once: a
 stale one gets 409 and the writer retries on top. Engines make, rename and drop tables through the
 catalog too, and follow the layout it publishes (partition spec, sort order, key). They change rows
-copy-on-write as well — Spark's `DELETE`, `UPDATE` and `MERGE`, PyIceberg's `delete` and `overwrite`
-— against the table as Pondra has it (a change made before rows still in the log were in its files
-gets 409 once they are), and change its schema as `ALTER TABLE` can. Merge-on-read deletes and
-keyed tables stay with Pondra's SQL, and are refused by name.
+as well — Spark's `DELETE`, `UPDATE` and `MERGE`, copy-on-write or merge-on-read, PyIceberg's
+`delete` and `overwrite` — against the table as Pondra has it (a change made before rows still in
+the log were in its files gets 409 once they are), several tables in one transaction, and change
+its schema as `ALTER TABLE` can. Views, tasks, the change feed and Kafka topics follow their commits
+as they follow the log's. A keyed table takes their appends as upserts and their deletes as deletes
+of keys, and publishes every round, like the rest.
 
 Pondra's own readers (nodes, `pondra sql`) see every write sooner. The local folder and the bucket
 use the same layout: see `docs/lake-format.md`.
@@ -471,14 +473,14 @@ bucket to its newest lakes.
   Tables made before 0.19 (without row ids) change after a copy (`CREATE TABLE t2 AS SELECT …`).
   Clustering across files.
 - A write to two lakes is two commits, not one transaction.
-- Other engines append to append tables through the Iceberg REST catalog, change their rows
-  copy-on-write and their schemas as `ALTER TABLE` can, and make, rename and drop tables there;
-  merge-on-read deletes, another engine's compaction and writes to keyed tables are refused
-  (next: ADR-029 phase 2's rest). An append to a table that views or tasks follow is still copied (through the log), and
-  so is one to a table with a renamed column, whose changes are refused; files recorded as
-  written are read from Parquet, not the hot columns, until a merge rewrites them; and `/watch`,
-  the change feed and Kafka topics carry the log's rows, not a file commit's (a bulk `INSERT`'s
-  either). Delta writers need Delta's catalog-managed commits, which aren't out yet.
+- Other engines' writes through the Iceberg REST catalog: another engine's compaction is refused
+  (Pondra merges its tables itself); an append to a table with a renamed column is copied, and
+  changes to it refused; a keyed table's changes are copied through the log (as upserts), not
+  recorded as written; files recorded as written are read from Parquet, not the hot columns, until a
+  merge rewrites them. Iceberg v3 (row ids kept through other engines' updates), vended credentials
+  and scan planning are ADR-029's phase 3. Delta writers need Delta's catalog-managed commits,
+  which aren't out yet. delta-rs's `to_pyarrow_table` refuses a table with deletion vectors (its
+  `QueryBuilder` reads it).
 - A materialized view that is a session window or a stream join starts from its creation; others
   are filled from the rows already there, in one go on the leader. Narrowing a type,
   `search_path` and grants per schema.
