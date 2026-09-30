@@ -15,6 +15,7 @@ fs.mkdirSync(made(''), { recursive: true });
 for (const [f, c] of [['mark-light.svg', colour('pondra-mark')], ['mark-dark.svg', colour('pondra-mark-dark')]]) {
   fs.writeFileSync(made(f), mark.replace(/<style>[\s\S]*?<\/style>\n?/, '').replace(/ color="#[0-9a-fA-F]{6}"/, ` color="${c}"`));
 }
+fs.mkdirSync(new URL('./public/', import.meta.url), { recursive: true }); // (a clean checkout has no public/: the favicon is all it holds)
 fs.writeFileSync(new URL('./public/favicon.svg', import.meta.url), mark);
 
 export default defineConfig({
