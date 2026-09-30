@@ -256,6 +256,11 @@ header{height:48px;display:flex;align-items:center;gap:10px;padding:0 10px 0 16p
 .filedoc{flex-direction:column}
 .filedoc.side{flex-direction:row}
 .pane-ed{flex:1;min-height:0;min-width:0;display:flex;flex-direction:column}
+.params{display:flex;flex-wrap:wrap;align-items:center;gap:6px 14px;padding:7px 14px;border-bottom:1px solid var(--line2);background:var(--chrome);font-size:12.5px;flex:none}
+.params .plabel{color:var(--muted);font-weight:500}.param{display:inline-flex;align-items:center;gap:6px;font:500 12.5px var(--mono);color:var(--ink)}
+.param input{width:13ch;height:26px;padding:0 8px;border:1px solid var(--line);border-radius:6px;background:var(--surface);color:var(--ink);font:12.5px var(--mono)}
+.param input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
+.sub.bad{color:var(--err)}
 .grip{flex:none;height:7px;cursor:row-resize;position:relative;background:var(--surface);border-top:1px solid var(--line)}
 .grip::after{content:"";position:absolute;left:50%;top:2px;width:36px;height:3px;border-radius:2px;background:var(--line);transform:translateX(-50%)}
 .grip:hover::after,.grip:focus-visible::after{background:var(--accent)}

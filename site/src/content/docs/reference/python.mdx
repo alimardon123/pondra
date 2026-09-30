@@ -60,7 +60,7 @@ local.close()
 |---|---|
 | `db.sql(query, job=None, **names)` | a query as a frame, run when you ask for its rows. Other statements (writes, DDL, `CALL`, several at once) run now and give a `Result` or the outcome |
 | `db.table(name)` | a table or view as a frame |
-| `db.run(file, job=None, **params)` | a `.sql` file's statements, or the SQL text itself, in order; the last one's rows or outcome |
+| `db.run(file, job=None, wait=True, **params)` | a `.sql` file on this machine, or else a `.sql`, `.py` or notebook file of the lake's, run on the node (`CALL run`, [Run files as jobs](/pondra/guides/workspace/)); or SQL text itself. The last statement's rows or outcome. `wait=False` starts a lake file's run and gives its `Run` |
 | `db.from_arrow(data, name=None)` | rows of this machine as a frame: a pyarrow, pandas or Polars table, or a list of dicts. Also `from_pandas`, `from_polars`, `from_rows` |
 
 In `sql` and `run`, a keyword argument is a `$name` parameter in the query. A keyword whose value
@@ -337,7 +337,7 @@ with pondra.connect("http://localhost:8080") as session:
 ## Module functions
 
 `pondra.sql`, `pondra.table`, `pondra.read_parquet`, `pondra.read_csv`, `pondra.read_json`,
-`pondra.read_delta`, `pondra.read_iceberg`, `pondra.call` and `pondra.secret` do what the
+`pondra.read_delta`, `pondra.read_iceberg`, `pondra.call`, `pondra.run` and `pondra.secret` do what the
 connection's methods do, on the current connection: the newest one made, or inside a procedure the
 one its caller lent. Code moves between a notebook and a procedure as it is, as `duckdb.sql` runs
 on DuckDB's default connection.

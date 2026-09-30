@@ -100,12 +100,50 @@ pub async fn read(ctx: &datafusion::prelude::SessionContext, files: &[&crate::st
         out.push(File { key, size: f.bytes, rows, partition, deleted: gone, stats });
     }
     let adapter = (!ids.is_empty()).then(|| Arc::new(ById { ids: ids.clone(), mapping: table.and_then(|t| t.name_mapping.as_deref()).map(name_mapping).unwrap_or_default() }) as _);
-    let df = ctx.read_table(Arc::new(Files { store, file_schema, partition: partition_fields, files: out, adapter }))?;
+    let df = ctx.read_table(Arc::new(Files { store, file_schema, partition: partition_fields, files: out, adapter, row: None }))?;
     let df = if equality { without_equal(ctx, df, files).await? } else { df };
     Ok(df.select(schema.fields().iter().map(|f| cast(ident(f.name()), f.data_type().clone()).alias(f.name())).collect::<Vec<_>>())?)
 }
 
 const SEQ: &str = "__pondra_seq";
+
+/// A lake's files as another engine wrote them, recorded where they are (ADR-029 §1), read as
+/// `schema` (stored names; the system columns too, if it has them): the table's columns matched by
+/// field id (a stored column's place, as the table's Iceberg schema numbers them) or else by name;
+/// the system columns from each file's lineage: `_row_id` its first id plus the row's place in the
+/// file (Parquet's row number, right under skipped row groups and pages), `_version` and the times
+/// its commit's.
+pub async fn adopted(lake: &crate::store::Lake, ctx: &datafusion::prelude::SessionContext, files: &[&crate::store::DataFile], meta: &crate::store::TableMeta, schema: &SchemaRef) -> Result<datafusion::prelude::DataFrame> {
+    use datafusion::arrow::datatypes::{DataType, TimeUnit};
+    use datafusion::prelude::{cast, col, ident};
+    let first = files.first().context("no files")?;
+    let url = url::Url::parse(&lake.full(&first.path)).or_else(|_| url::Url::from_file_path(lake.full(&first.path)).map_err(|_| anyhow::anyhow!("{}: not a path", first.path)))?;
+    let store = ObjectStoreUrl::parse(&url[..url::Position::BeforePath])?;
+    let (mut ids, mut mapping) = (std::collections::BTreeMap::new(), std::collections::HashMap::new());
+    for (i, (c, _)) in meta.columns.iter().enumerate().filter(|(_, (c, _))| !crate::sys::NAMES.contains(&c.as_str())) {
+        ids.insert(c.clone(), i as i64 + 1); // (`iceberg::fields`)
+        mapping.insert(meta.name_of(c).to_string(), i as i64 + 1);
+    }
+    let file_schema = Arc::new(Schema::new(schema.fields().iter().filter(|f| ids.contains_key(f.name())).cloned().collect::<Vec<_>>())); // (the ids go to `ById`)
+    let time = DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
+    let partition = vec![field("__first", DataType::Int64), field("__version", DataType::Int64), field("__at", time.clone())];
+    let mut out = vec![];
+    for f in files {
+        let l = f.lineage.context("a file without lineage")?;
+        let values = vec![ScalarValue::Int64(Some(l.first)), ScalarValue::Int64(Some(l.version as i64)), ScalarValue::TimestampMicrosecond(Some(l.ms as i64 * 1000), Some("UTC".into()))];
+        let stats = Arc::new(statistics(f, f.rows, 0, true, &file_schema));
+        out.push(File { key: key_of(&lake.full(&f.path), &url)?, size: f.bytes, rows: f.rows, partition: values, deleted: None, stats });
+    }
+    let adapter = Some(Arc::new(ById { ids, mapping }) as _);
+    let row = Arc::new(Field::new("__row", DataType::Int64, false).with_extension_type(datafusion::parquet::arrow::RowNumber));
+    let df = ctx.read_table(Arc::new(Files { store, file_schema, partition, files: out, adapter, row: Some(row) }))?;
+    Ok(df.select(schema.fields().iter().map(|f| match f.name().as_str() {
+        crate::sys::ROW_ID => (col("__first") + col("__row")).alias(f.name()),
+        crate::sys::VERSION => col("__version").alias(f.name()),
+        crate::sys::CREATED | crate::sys::UPDATED => col("__at").alias(f.name()),
+        n => cast(ident(n), f.data_type().clone()).alias(n),
+    }).collect::<Vec<_>>())?)
+}
 
 /// What the planner knows of a file before reading it (the join order rests on it): its rows
 /// and bytes and, for plain Parquet files, its columns' ranges from their footers, as the
@@ -177,10 +215,10 @@ impl datafusion::physical_expr_adapter::PhysicalExprAdapterFactory for ById {
         // name the file can't have (read as NULL).
         let mut renames = std::collections::HashMap::new();
         let fields: Vec<Field> = logical.fields().iter().map(|f| {
-            let name = match self.ids.get(f.name()).and_then(|id| in_file.get(id)) {
-                Some(n) => n.to_string(),
-                None if physical.field_with_name(f.name()).is_ok() => format!("\u{1}missing:{}", f.name()),
-                None => f.name().clone(),
+            let name = match self.ids.get(f.name()).map(|id| in_file.get(id)) {
+                Some(Some(n)) => n.to_string(),
+                Some(None) if physical.field_with_name(f.name()).is_ok() => format!("\u{1}missing:{}", f.name()),
+                _ => f.name().clone(), // (or not a column of the table's: a partition value, the row number)
             };
             if &name != f.name() {
                 renames.insert(f.name().clone(), name.clone());
@@ -307,6 +345,7 @@ pub struct Files {
     pub partition: Vec<FieldRef>, // columns a file's place gives (Delta's partition values), after them
     pub files: Vec<File>,
     pub adapter: Option<Arc<dyn datafusion::physical_expr_adapter::PhysicalExprAdapterFactory>>, // (columns matched by field id)
+    pub row: Option<FieldRef>, // Parquet's row number, last, under this name (`adopted`)
 }
 
 #[derive(Debug, Clone)]
@@ -322,7 +361,7 @@ pub struct File {
 #[async_trait::async_trait]
 impl TableProvider for Files {
     fn schema(&self) -> SchemaRef {
-        Arc::new(Schema::new(self.file_schema.fields().iter().cloned().chain(self.partition.iter().cloned()).collect::<Vec<_>>()))
+        Arc::new(Schema::new(self.file_schema.fields().iter().cloned().chain(self.partition.iter().cloned()).chain(self.row.clone()).collect::<Vec<_>>()))
     }
 
     fn table_type(&self) -> TableType { TableType::Base }
@@ -333,7 +372,7 @@ impl TableProvider for Files {
 
     async fn scan(&self, state: &dyn Session, projection: Option<&Vec<usize>>, _: &[Expr], limit: Option<usize>) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         let format = ParquetFormat::default().with_options(state.table_options().parquet.clone());
-        let table = datafusion::datasource::table_schema::TableSchema::builder(self.file_schema.clone()).with_table_partition_cols(self.partition.clone()).build();
+        let table = datafusion::datasource::table_schema::TableSchema::builder(self.file_schema.clone()).with_table_partition_cols(self.partition.clone()).with_virtual_columns(self.row.clone().into_iter().collect::<Vec<_>>()).build();
         let source = format.file_source(table);
         // Files dealt to the partitions by size, each partition a run of them.
         let parts = state.config().target_partitions().max(1);

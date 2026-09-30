@@ -1,0 +1,13 @@
+=== real R2, round 27
+08:55:07 start adopted
+08:58:59 adopted exit=0
+08:58:59 start writes
+09:02:03 writes exit=0
+09:02:03 start ids
+09:06:49 ids exit=0
+09:06:49 start fence
+09:07:38 fence exit=0
+09:07:38 start serverless
+09:11:32 serverless exit=1
+09:11:32 R2_DONE
+09:13:36 serverless: its one failed check is a time (a node on the idle lake leads in 11.8 s; < 10 s asked) with R2 3-4x slower than in earlier rounds (r2-latency.txt); its rows are exact

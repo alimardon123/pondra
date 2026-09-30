@@ -181,9 +181,10 @@ at the oldest one.
 
 ### Offsets
 
-A record's offset is its position in the log: `(segment << 32) + row`, the segment the commit made
-and the row within it. Offsets rise, but they are not one apart, so the gap between two offsets is
-not a count of records. The offset a producer gets back is the offset a consumer reads.
+A record's offset is its position in the log: `(segment << 24) + row`, the segment the commit made
+and the row within it (a segment holding more of a topic's rows than 24 bits count takes the
+numbers after it too). Offsets rise, but they are not one apart, so the gap between two offsets is
+not a count of records. They last: at a thousand commits a second, 34 years. The offset a producer gets back is the offset a consumer reads.
 
 ```python
 producer = KafkaProducer(bootstrap_servers="localhost:9092")

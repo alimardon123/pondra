@@ -207,8 +207,10 @@ export async function call(path, { method = 'GET', body, headers = {}, signal, r
 }
 
 /** A statement's answer: rows (the columns with their types) or what it did, and what it printed. */
-export async function run(sql, signal) {
-  const r = await call('/sql?format=typed', { method: 'POST', body: sql, headers: { 'content-type': 'text/plain; charset=utf-8' }, signal });
+export async function run(sql, signal, params) {
+  const r = params && Object.keys(params).length // (values for its `$name`s: bound on the node, never pasted in)
+    ? await call('/sql?format=typed', { method: 'POST', body: JSON.stringify({ sql, params }), headers: { 'content-type': 'application/json' }, signal })
+    : await call('/sql?format=typed', { method: 'POST', body: sql, headers: { 'content-type': 'text/plain; charset=utf-8' }, signal });
   let notices = [];
   try { notices = JSON.parse(r.headers.get('x-pondra-notices') || '[]'); } catch { /* (none) */ }
   const v = await r.json();

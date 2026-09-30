@@ -358,6 +358,10 @@ def cell(head, parts):
     con._headers["x-pondra-depth"] = str(head["depth"])
     for k in ("db", "con"):
         g.setdefault(k, con)
+    if head.get("vars") and parts:  # (a file run's parameters, as variables: ADR-033)
+        import pyarrow as pa
+        rows = pa.ipc.open_stream(parts[0]).read_all().to_pylist()
+        g.update(rows[0] if rows else {})
     filename = f"<{head['name']}>"
     tree = _ast.parse(_dedent(head["body"]), filename=filename)
     last = None

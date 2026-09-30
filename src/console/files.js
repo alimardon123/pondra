@@ -177,7 +177,7 @@ class TextDoc {
   put(text) { this.ed.insert(text); }
   activate() { requestAnimationFrame(() => this.ed.focus()); }
   close() { return !this.dirty || confirm(`Close ${this.title}? It has changes that are not saved.`); }
-  async reload() { if (!this.path) return; const f = await readFile(this.path); this.ed.value = f.text; this.version = f.version; this.dirty = false; emit('changed', this); }
+  async reload() { if (!this.path) return; const f = await readFile(this.path); this.ed.value = f.text; this.version = f.version; this.dirty = false; this.paramsBar?.(); emit('changed', this); }
   /** Save it where it is (a new file asks where first). */
   async save(as) {
     let path = this.path;
@@ -199,7 +199,10 @@ class TextDoc {
     return [...parts.slice(0, -1).flatMap(p => [h('span', { class: 'crumb' }, p), h('span', { class: 'slash' }, '/')]), h('b', { class: 'crumb cur' }, parts.at(-1)),
       h('span', { class: 'said-saved' }, this.dirty ? (this.path ? 'Edited, not saved' : 'Not saved yet') : this.path ? 'Saved' : '')];
   }
-  more() { return [{ label: 'Save as…', icon: 'save', run: () => this.save(true) }, this.path ? { label: 'Download', icon: 'down', run: () => saveAs(this.ed.value, 'text/plain', this.title) } : null]; }
+  more() {
+    return [{ label: 'Save as…', icon: 'save', run: () => this.save(true) }, this.path ? { label: 'Download', icon: 'down', run: () => saveAs(this.ed.value, 'text/plain', this.title) } : null,
+      ...this.kind === 'sql' || this.kind === 'python' ? ['-', { label: 'Run as a job', icon: 'play', run: () => R.helpers.job(this) }, { label: 'Schedule…', icon: 'clock', run: () => R.helpers.schedule(this) }] : []];
+  }
   toolbar() { return [...this.crumbs(), h('span', { class: 'grow' }), btn('save', 'Save', 'Save it (Ctrl+S)', () => this.save()), moreBtn(() => this.more())]; }
   status() { return [`Ln ${this.pos.line}, Col ${this.pos.col}`, { sql: 'SQL', python: 'Python', text: /\.md$/i.test(this.title) ? 'Markdown' : 'Text' }[this.kind] || '', 'Spaces: 4']; }
 }
@@ -239,10 +242,32 @@ export class SqlDoc extends TextDoc {
     this.tabs = h('div', { class: 'ptabs', role: 'tablist' });
     this.info = h('div', { class: 'pinfo' });
     this.panel = h('section', { class: 'panel results', 'aria-label': 'Results' }, h('div', { class: 'phead' }, this.tabs, h('span', { class: 'grow' }), this.info), this.body);
+    this.pbar = h('div', { class: 'params', role: 'group', 'aria-label': 'Parameters', hidden: true });
+    this.main.prepend(this.pbar);
     splitPanel(this, this.panel);
-    this.draw();
+    this.draw(); this.paramsBar();
   }
   get hasPanel() { return true; }
+  changed() { super.changed(); clearTimeout(this.pt); this.pt = setTimeout(() => this.paramsBar(), 250); }
+  /** The file's `$name`s, an input each above the editor: their values go with every run, bound
+   * on the node (ADR-033), and are kept in this browser for the file. */
+  paramsBar() {
+    const names = parameters(this.ed.value), key = 'pondra.params:' + (this.path || this.untitled);
+    this.kept ??= store.json(key, {});
+    this.pbar.hidden = !names.length;
+    if (names.join() === this.shownParams) return;
+    this.shownParams = names.join();
+    fill(this.pbar, h('span', { class: 'plabel' }, 'Parameters'), names.map(n => h('label', { class: 'param' }, h('span', {}, '$' + n),
+      h('input', { value: this.kept[n] ?? '', spellcheck: 'false', placeholder: 'a value', 'aria-label': `The value of $${n}`,
+        oninput: e => { this.kept[n] = e.target.value; store.set(key, JSON.stringify(this.kept)); }, onkeydown: e => { if (e.key === 'Enter') this.run(); } }))));
+  }
+  /** The parameters' values as the node takes them: numbers and true/false as such, the rest as text. */
+  params() {
+    return Object.fromEntries(parameters(this.ed.value).filter(n => (this.kept?.[n] ?? '') !== '').map(n => {
+      const v = this.kept[n].trim();
+      return [n, /^-?\d+(\.\d+)?$/.test(v) && Math.abs(+v) < 2 ** 53 ? +v : v === 'true' || v === 'false' ? v === 'true' : v];
+    }));
+  }
   /** Run the file, or what is selected: each statement its own answer (in order, stopping at a
    * failure), or — as Settings may say — all of it at once, the last one's answer. */
   async run() {
@@ -255,9 +280,10 @@ export class SqlDoc extends TextDoc {
     this.body.replaceChildren(h('div', { class: 'wait pulse' }, 'Running…'));
     emit('run', { kind: 'sql', src: text, doc: this });
     let r;
+    const values = this.params();
     for (const sql of list.length ? list : [text]) {
       const t0 = performance.now();
-      try { r = await run(sql, ctl.signal); } catch (e) { r = { kind: 'error', message: e.name === 'AbortError' ? 'Stopped waiting. (A statement already on its way may still finish on the node.)' : e.message, notices: [] }; }
+      try { r = await run(sql, ctl.signal, values); } catch (e) { r = { kind: 'error', message: e.name === 'AbortError' ? 'Stopped waiting. (A statement already on its way may still finish on the node.)' : e.message, notices: [] }; }
       if (this.ctl !== ctl) return;
       r.ms = performance.now() - t0; r.sql = sql;
       this.results.push(r); this.result = r;
@@ -338,6 +364,10 @@ export function statements(text) {
   if (code) out.push(text.slice(start));
   return out.map(x => x.trim());
 }
+/** A script's `$name` parameters, in order, once each (not `$1`, nor what strings, comments and
+ * `$$` bodies hold). */
+export const parameters = sql => [...new Set([...sql.replace(/--[^\n]*|\/\*[\s\S]*?\*\/|'(?:[^']|'')*'|"(?:[^"]|"")*"|\$(\w*)\$[\s\S]*?\$\1\$/g, ' ')
+  .matchAll(/\$([A-Za-z_]\w*)/g)].map(m => m[1]))];
 /** The last statement of a script (for its plan). */
 export const lastStatement = sql => statements(sql).at(-1) || sql;
 

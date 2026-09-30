@@ -1,0 +1,6 @@
+{
+ "ids": {
+  "row ids from blocks of their own: 300 commits took one block, a restart the next, a bulk INSERT the one after": true
+ },
+ "ok": true
+}

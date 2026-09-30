@@ -720,7 +720,7 @@ impl Files {
 /// already recorded).
 /// `stamp`: the commit number and time the rows' system columns get (`sys.rs`); None: the leader
 /// stamps them when it records the files (`record`).
-pub async fn write_files(lake: &Lake, ctx: &SessionContext, table: &str, query: &str, job: &str, stamp: Option<(u64, u64)>) -> Result<Option<Files>> {
+pub async fn write_files(lake: &Lake, ctx: &SessionContext, table: &str, query: &str, job: &str, stamp: Option<crate::log::Reserved>) -> Result<Option<Files>> {
     use datafusion::arrow::datatypes::DataType;
     use datafusion::prelude::{cast as cast_to, Expr};
     if lake.cat.get::<u64>(&producer_key(&format!("job:{job}"))).await?.is_some() {
@@ -768,7 +768,7 @@ pub async fn write_files(lake: &Lake, ctx: &SessionContext, table: &str, query: 
 
 /// Leader: record an INSERT's files in one commit, creating the table if it's new. Files written
 /// without their rows' system columns (their writer couldn't reserve a commit number: `pondra
-/// sql`, the inbox) get them here first: rewritten, stamped (`seq`).
+/// sql`, the inbox) are recorded with the lineage that gives them (`adopt::with_lineage`).
 pub async fn record(lake: &Lake, mut f: Files, seq: Option<&Sequencer>) -> Result<Value> {
     let producer = producer_key(&format!("job:{}", f.job));
     if lake.cat.get::<u64>(&producer).await?.is_some() {
@@ -784,7 +784,7 @@ pub async fn record(lake: &Lake, mut f: Files, seq: Option<&Sequencer>) -> Resul
     let live: Vec<(String, String)> = meta.live().map(|(s, _, t)| (s.to_string(), t.to_string())).collect(); // (dropped columns aren't written)
     ensure!(types(&live) == types(&f.columns), "query columns {:?} don't match table {}", f.columns, f.table);
     if let (Some(seq), true) = (seq, f.files.iter().any(|d| !d.sys)) {
-        f.files = stamp_files(lake, &f.table, f.files, seq.reserve().await?).await?;
+        f.files = crate::adopt::with_lineage(lake, seq, &f.files).await?; // (their system columns from their lineage: ADR-029 §1)
     }
     let rows: u64 = f.files.iter().map(|f| f.rows).sum();
     let ord = lake.visible(); // (append tables: files in the order they arrived)
@@ -801,29 +801,6 @@ pub async fn record(lake: &Lake, mut f: Files, seq: Option<&Sequencer>) -> Resul
 /// What `record` says of files written before a view of their table was made: the INSERT goes
 /// again, through the log (`on_node_as` does it at once).
 pub const AGAIN: &str = "INSERT again, through the log";
-
-/// Files rewritten with their rows' system columns (`record`); the old ones are deleted.
-async fn stamp_files(lake: &Lake, table: &str, files: Vec<DataFile>, reserved: (u64, u64)) -> Result<Vec<DataFile>> {
-    let mut out = vec![];
-    let mut first = (reserved.0 << 32) as i64;
-    for d in files {
-        if d.sys {
-            out.push(d);
-            continue;
-        }
-        let batches = lake.session().read_parquet(lake.full(&d.path), Default::default()).await?.collect().await?;
-        let stamped = batches.iter().map(|b| {
-            let s = crate::sys::stamp_new(b, first, reserved);
-            first += b.num_rows() as i64;
-            s
-        }).collect::<Result<Vec<_>>>()?;
-        if let Some(new) = crate::tier::write_file(lake, table, &stamped, &[], true).await? {
-            out.push(DataFile { part: d.part.clone(), ..new });
-        }
-        lake.delete(&d.path).await;
-    }
-    Ok(out)
-}
 
 // ---------------------------------------------------------------- on a node
 
@@ -1221,13 +1198,13 @@ async fn prepare(query: &Lake, target: &Arc<Lake>, table: &str, stmt: &Stmt, job
 
 /// Row ids for a bulk INSERT from any machine: a block from the lake's leader, if it can be
 /// reached, so the files are written with their system columns (`sys.rs`); None: the leader
-/// stamps them as it records them, which rewrites them (the inbox, or no leader yet).
-pub async fn reserve(lake: &Lake) -> Option<(u64, u64)> {
+/// records them with their lineage instead (the inbox, or no leader yet).
+pub async fn reserve(lake: &Lake) -> Option<crate::log::Reserved> {
     let t = latest(&lake.store).await.ok()??;
     if t.addr.is_empty() || !alive(&lake.store, &t).await || std::env::var_os("PONDRA_NO_DIRECT").is_some() {
         return None;
     }
-    crate::log::reserve_at(&t.addr).await.ok()
+    crate::log::To::Leader(t.addr).reserve().await.ok()
 }
 
 /// Send a request to the leader over HTTP.

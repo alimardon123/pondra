@@ -115,7 +115,7 @@ fn with_seconds(c: &ArrayRef) -> Result<ArrayRef> {
 
 /// Rows of `table` from committed segments in (after, upto]; `None` = up to the latest; under
 /// the names SQL knows their columns by (ADR-022: `tail_of` gives them as stored).
-/// With `ord`, each row gets `_ord` = (segment << 32) + position, so later versions sort last.
+/// With `ord`, each row gets `_ord` (`log::ord`: its segment, then its position), so later versions sort last.
 pub async fn tail(lake: &Lake, table: &str, after: u64, upto: Option<u64>, ord: bool) -> Result<Vec<RecordBatch>> {
     let rows = tail_of(lake, table, after, upto, ord, false).await?;
     match lake.cat.get::<TableMeta>(&table_key(table)).await? {
@@ -155,7 +155,7 @@ pub async fn tail_of(lake: &Lake, table: &str, after: u64, upto: Option<u64>, or
                 out.push(b.clone());
                 continue;
             }
-            let ords: ArrayRef = Arc::new(UInt64Array::from_iter_values((pos..pos + b.num_rows() as u64).map(|p| (n << 32) + p)));
+            let ords: ArrayRef = Arc::new(UInt64Array::from_iter_values((pos..pos + b.num_rows() as u64).map(|p| crate::log::ord(n, p))));
             pos += b.num_rows() as u64;
             let mut fields = b.schema().fields().to_vec();
             fields.push(Arc::new(Field::new("_ord", DataType::UInt64, false)));
@@ -223,7 +223,7 @@ async fn dead(lake: &Lake, ctx: &SessionContext, name: &str, meta: &TableMeta, a
 
 /// A table's rows as separate reads: the log tail up to `upto` (if any rows), and the files.
 /// Upsert tables get one read per generation of files, newest first, and `_ord` on every row: a
-/// newer file's rows above an older one's, and log rows ((segment << 32) + position) above both.
+/// newer file's rows above an older one's, and log rows (`log::ord`) above both.
 /// Other tables read all their files as one (merge tables combine rows in any order).
 pub async fn sources(lake: &Lake, ctx: &SessionContext, name: &str, meta: &TableMeta, upto: Option<u64>) -> Result<(Option<DataFrame>, Vec<DataFrame>)> {
     if let Some(spec) = &meta.ext {
@@ -238,10 +238,10 @@ pub async fn sources(lake: &Lake, ctx: &SessionContext, name: &str, meta: &Table
             by_ord.entry(f.ord).or_default().push(f);
         }
         for (ord, group) in by_ord.into_iter().rev() {
-            files.push(read_files(lake, ctx, group, &schema).await?.with_column("_ord", lit(ord << 32))?);
+            files.push(read_files(lake, ctx, group, meta, &schema).await?.with_column("_ord", lit(crate::log::ord(ord, 0)))?);
         }
     } else if !meta.files.is_empty() {
-        let df = read_files(lake, ctx, meta.files.iter().collect(), &schema).await?;
+        let df = read_files(lake, ctx, meta.files.iter().collect(), meta, &schema).await?;
         files.push(if keyed { df.with_column("_ord", lit(0u64))? } else { df });
     }
     let sys = meta.columns.iter().any(|(c, _)| c == crate::sys::ROW_ID); // (`sys::with_sys`)
@@ -257,13 +257,41 @@ pub async fn sources(lake: &Lake, ctx: &SessionContext, name: &str, meta: &Table
     Ok((Some(ctx.read_batches(hot.iter().map(|b| conform(b, &s)).collect::<Result<Vec<_>>>()?)?), files))
 }
 
-/// Parquet files as one read: through the hot columns (`hot.rs`) when they're on.
-async fn read_files(lake: &Lake, ctx: &SessionContext, files: Vec<&DataFile>, schema: &SchemaRef) -> Result<DataFrame> {
-    if lake.hot.on() {
-        let files = files.into_iter().cloned().collect();
-        return Ok(ctx.read_table(Arc::new(crate::hot::HotFiles { lake: lake.arc(), files, schema: schema.clone() }))?);
+/// Parquet files as one read: through the hot columns (`hot.rs`) when they're on; files recorded
+/// as another engine wrote them with their lineage (`scan::adopted`).
+async fn read_files(lake: &Lake, ctx: &SessionContext, files: Vec<&DataFile>, meta: &TableMeta, schema: &SchemaRef) -> Result<DataFrame> {
+    if !lake.hot.on() {
+        return files_once(lake, ctx, &files, meta, schema).await;
     }
-    Ok(ctx.read_parquet(files.iter().map(|f| lake.full(&f.path)).collect::<Vec<_>>(), ParquetReadOptions::default().schema(schema)).await?)
+    let (adopted, own): (Vec<&DataFile>, Vec<&DataFile>) = files.into_iter().partition(|f| f.lineage.is_some());
+    let mut parts = vec![];
+    if !own.is_empty() {
+        parts.push(ctx.read_table(Arc::new(crate::hot::HotFiles { lake: lake.arc(), files: own.into_iter().cloned().collect(), schema: schema.clone() }))?);
+    }
+    if !adopted.is_empty() {
+        parts.push(crate::scan::adopted(lake, ctx, &adopted, meta, schema).await?);
+    }
+    union_all(parts)
+}
+
+/// Files of a table as one read, as `read_files` reads them but not through the hot columns (and
+/// so not loading them there: maintenance reads a file once).
+pub async fn files_once(lake: &Lake, ctx: &SessionContext, files: &[&DataFile], meta: &TableMeta, schema: &SchemaRef) -> Result<DataFrame> {
+    let (adopted, own): (Vec<&DataFile>, Vec<&DataFile>) = files.iter().copied().partition(|f| f.lineage.is_some());
+    let mut parts = vec![];
+    if !own.is_empty() {
+        parts.push(ctx.read_parquet(own.iter().map(|f| lake.full(&f.path)).collect::<Vec<_>>(), ParquetReadOptions::default().schema(schema)).await?);
+    }
+    if !adopted.is_empty() {
+        parts.push(crate::scan::adopted(lake, ctx, &adopted, meta, schema).await?);
+    }
+    union_all(parts)
+}
+
+fn union_all(parts: Vec<DataFrame>) -> Result<DataFrame> {
+    let mut all = parts.into_iter();
+    let first = all.next().ok_or_else(|| anyhow::anyhow!("no files"))?;
+    all.try_fold(first, |a, b| Ok(a.union(b)?))
 }
 
 fn empty(ctx: &SessionContext, meta: &TableMeta) -> Result<DataFrame> {

@@ -46,9 +46,15 @@ export class Pondra {
     return (await this.request("POST", "/sql", JSON.stringify({ sql: query, params }), "application/json")).json();
   }
 
-  /** A `.sql` file (or SQL), its statements in order, `$name` taking `params.name`. */
+  /** A file's statements in order, `$name` taking `params.name`: a `.sql` file here (or SQL itself)
+   * runs from here; otherwise a file of the lake's (`etl/orders.sql`, `.py`, `.ipynb`: ADR-033) runs
+   * on the node, as `CALL run(…)`, logged in `pondra.runs`. */
   async run(file, params = {}) {
-    return this.sql(file.endsWith(".sql") && existsSync(file) ? readFileSync(file, "utf8") : file, params);
+    if (file.endsWith(".sql") && existsSync(file)) return this.sql(readFileSync(file, "utf8"), params);
+    if (!/\.(sql|py|ipynb)$|^(files\/)?notebooks\/[\w.-]+$/.test(file)) return this.sql(file, params); // (else a file of the lake's, or a saved notebook by name)
+    const names = Object.keys(params);
+    const given = names.map((n, i) => `, "${n.replace(/"/g, '""')}" => $p${i}`).join("");
+    return this.sql(`CALL run($file${given})`, { file, ...Object.fromEntries(names.map((n, i) => [`p${i}`, params[n]])) });
   }
 
   /** A stored procedure (`CREATE PROCEDURE`), called, as Python's `con.call`: `await db.call("load_day", "2026-09-27")`. */

@@ -372,7 +372,8 @@ export class Notebook {
       h('button', { class: 'icon', title: 'More', 'aria-label': 'More', onclick: e => menu(e.currentTarget, [
         { label: 'Versions…', icon: 'clock', run: () => R.helpers.pickFile(`files/${this.path}`) },
         { label: 'Download as .ipynb', icon: 'down', run: () => saveAs(JSON.stringify(this.notebook(), null, 1) + '\n', 'application/x-ipynb+json', this.name + '.ipynb') },
-        { label: 'Clear every output', icon: 'clear', run: () => this.clearOutputs() }]) }, icon('dots'))];
+        { label: 'Clear every output', icon: 'clear', run: () => this.clearOutputs() }, '-',
+        { label: 'Run as a job', icon: 'play', run: () => R.helpers.job(this) }, { label: 'Schedule…', icon: 'clock', run: () => R.helpers.schedule(this) }]) }, icon('dots'))];
   }
   status() { return [`${this.cells.length} cell${this.cells.length === 1 ? '' : 's'}`, 'Notebook']; }
   /** Keys on the selected cell, after Esc (Jupyter's). */

@@ -1,6 +1,6 @@
 ---
 title: Other engines
-description: Publish tables as Delta Lake and Iceberg so DuckDB, Polars, Spark and others read them, and let engines append through the Iceberg REST catalog.
+description: Publish tables as Delta Lake and Iceberg so DuckDB, Polars, Spark and others read them, and let engines make tables and append to them through the Iceberg REST catalog.
 sidebar:
   order: 10
 ---
@@ -9,8 +9,9 @@ import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
 
 A Pondra table can also be a **Delta Lake** table and an **Iceberg** table, in the same folder as
 its Parquet files. Spark, Databricks, DuckDB, Polars, delta-rs, PyIceberg, Trino and Athena read
-them without knowing Pondra. Engines can also attach the node's **Iceberg REST catalog** by URL
-and append to a table. Use this page to hand a table to a team that uses other tools.
+them without knowing Pondra. Engines can also attach the node's **Iceberg REST catalog** by URL,
+make tables there and append to them with their own compute. Use this page to hand a table to a
+team that uses other tools.
 
 ## Publish a table
 
@@ -137,9 +138,12 @@ Parquet files carry them.
 
 ## Append from another engine
 
-Through the REST catalog, other engines **append** to a table. The node takes the files the commit
-adds and makes their rows the table's own, as a bulk `INSERT` would: with row ids, the table's
-layout, views and the Delta copy following. So this is Pondra's catalog, not a second one.
+Through the REST catalog, other engines **append** to a table with their own compute. The files a
+commit adds become the table's where the writer put them: the node reads each file's Parquet footer
+once, checks it against the table, and records it. It never copies the rows, so an append of any
+size costs the node about what a 10-row one does (a million rows: 0.01 s of its CPU, against 0.24 s
+to copy them). The rows get their row ids and versions from the commit, and the Delta copy and
+every reader see them. So this is Pondra's catalog, not a second one.
 
 ```python
 import datetime as dt
@@ -184,9 +188,56 @@ except Exception as e:
 BadRequestException: a snapshot that does overwrite: other engines append; deletes and overwrites go through Pondra's SQL (DELETE, UPDATE, MERGE)
 ```
 
+**Checked, from each file's footer:** its row count is the one its manifest says, its columns have
+the table's types, a `NOT NULL` column holds no NULL, and in a partitioned table the file holds one
+partition value. A file that fails is refused by name, and nothing of the commit is recorded.
+
+**Copied instead, as a bulk `INSERT` would:** an append to a table that materialized views or
+streaming tasks follow (they take its rows through the log), or to one with a renamed or dropped
+column (Delta readers match columns by name, and the table's files keep the names they were
+written under).
+
 **Refused:** deletes and overwrites (use `DELETE`, `UPDATE`, `MERGE` in Pondra), schema changes
-(`ALTER TABLE`), appends to keyed tables, and creating a table through the catalog (make it with
-`CREATE TABLE … WITH (publish = 'iceberg')`).
+(`ALTER TABLE`), and appends to keyed tables.
+
+### Make a table through the catalog
+
+An engine can make, rename and drop tables there too, as `CREATE TABLE`, `ALTER TABLE … RENAME TO`
+and `DROP TABLE` do (with an admin token, when tokens are set). The schema's types become Pondra's, a
+required field is `NOT NULL`, identifier fields are the key, a partition spec is `partition_by`
+(one field: the column, or its year, month, day or hour) and a write order is `cluster_by`:
+
+```python
+from pyiceberg.schema import Schema
+from pyiceberg.types import NestedField, LongType, StringType, TimestampType
+from pyiceberg.partitioning import PartitionSpec, PartitionField
+from pyiceberg.transforms import DayTransform
+
+clicks = catalog.create_table(
+    "default.clicks",
+    schema=Schema(NestedField(1, "ts", TimestampType()), NestedField(2, "page", StringType()), NestedField(3, "ms", LongType())),
+    partition_spec=PartitionSpec(PartitionField(source_id=1, field_id=1000, transform=DayTransform(), name="ts_day")),
+)
+clicks.append(pa.table({
+    "ts": pa.array([dt.datetime(2026, 9, 28, 9), dt.datetime(2026, 9, 29, 9)], pa.timestamp("us")),
+    "page": ["/", "/docs"],
+    "ms": pa.array([120, 80], pa.int64()),
+}))
+```
+
+```sql
+SELECT page, ms FROM clicks ORDER BY ts;
+```
+
+```text
+page   ms
+/      120
+/docs  80
+```
+
+**A table's layout is published for writers to follow:** its `partition_by` as the Iceberg partition
+spec (so PyIceberg and Spark write a file per day, here), a `cluster_by` on one column as its sort
+order, and a keyed table's key as its identifier fields.
 
 <Aside type="caution">
 Write through Pondra or through the REST catalog, never into the `_delta_log` or `metadata` folders

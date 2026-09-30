@@ -246,6 +246,7 @@ DROP MATERIALIZED VIEW spend_by_item;
 | Macro | `CREATE [OR REPLACE] MACRO m(x) AS expression` (DuckDB's) |
 | Procedure | `CREATE [OR REPLACE] PROCEDURE p(x type [DEFAULT v], …) LANGUAGE sql \| python AS $$ … $$` |
 | Call | `CALL p(args)` or `CALL p(name => value)` |
+| Run a file | `CALL run('etl/orders.sql', day => DATE '2026-09-29')`: a `.sql`, `.py` or notebook file of the lake's, its parameters by name ([Run files as jobs](/pondra/guides/workspace/)) |
 | Run code once | `DO LANGUAGE python \| sql $$ … $$` (the language may come after the code, as in Postgres) |
 | Start | `SELECT pondra.start('p', args)`: runs it without waiting, and answers with the run's id |
 | Task | `CREATE [OR REPLACE] TASK t SCHEDULE '5 minutes' \| 'cron 0 2 * * * UTC' AS CALL p(…)` |
@@ -257,7 +258,7 @@ rights: it needs an admin token, and Python needs a node started with `--python`
 comes back as notices, and its last expression, if it is a frame, table, list of dicts or value, comes
 back as rows (see [Functions and procedures](/pondra/guides/functions-and-procedures/#run-code-once-do)).
 Python functions and procedures need a node started with `--python`. Functions, procedures and tasks are kept in the lake, so every node and client has
-them. Every call of a procedure is a row of `pondra.runs`
+them. Every call of a procedure, and every file run, is a row of `pondra.runs`
 (see [system columns](/pondra/reference/system-columns/)).
 
 ```sql

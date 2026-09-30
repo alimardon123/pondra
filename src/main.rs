@@ -1,6 +1,7 @@
 //! Pondra: a streamhouse in one binary (see ADR-002 to ADR-005).
 //! Object storage — a local dir or s3://bucket/prefix (S3, R2, MinIO) — is the only state.
 #![recursion_limit = "256"] // (the Send check of a query's future, many awaits deep)
+mod adopt;
 mod ai;
 mod avro;
 mod bridge;
@@ -61,6 +62,7 @@ mod udf;
 mod views;
 mod write;
 mod write_outside;
+mod workspace;
 
 use clap::Parser;
 

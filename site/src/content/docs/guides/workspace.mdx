@@ -1,0 +1,161 @@
+---
+title: Run files as jobs
+description: Run the lake's SQL, Python and notebook files with parameters, from every client, on a schedule, each run logged.
+sidebar:
+  order: 9.5
+setup: |
+  CREATE TABLE orders (day DATE, region VARCHAR, amount DOUBLE);
+---
+
+import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+
+The lake's own files are a workspace. A `.sql` file, a `.py` file or a notebook kept there (the
+console's Workspace, or `PUT /files/…`) runs as a job: with parameters, from any client, on a
+schedule, and each run is logged. That is an ETL pipeline with nothing else to install.
+
+## A file with parameters
+
+Save a SQL file in the lake. `$day` and `$region` are its parameters:
+
+```bash
+curl -s -X PUT http://localhost:8080/files/etl/orders.sql --data-binary @- <<'EOF'
+INSERT INTO orders VALUES ($day, $region, $amount);
+SELECT region, count(*) AS n, sum(amount) AS total FROM orders WHERE day = $day GROUP BY region;
+EOF
+```
+
+Run it with `CALL run`, naming each value:
+
+```sql
+CALL run('etl/orders.sql', day => DATE '2026-09-29', region => 'west', amount => 10.5);
+```
+
+```text
+ region | n | total
+--------+---+-------
+ west   | 1 |  10.5
+```
+
+- **The values are bound, never pasted into the text:** `$day` is a `DATE` here, and a string with a
+  quote in it stays one string.
+- **The answer** is the last statement's.
+- **The statements run in order**, and a failure stops the file: its error names the statement.
+- **The path** is under the lake's files, with or without `files/`.
+
+## Python files and notebooks
+
+A `.py` file gets its parameters as variables. What it prints comes back as notices (psql shows
+them as `NOTICE`), and its last expression is the answer, as in a notebook cell:
+
+```bash
+curl -s -X PUT http://localhost:8080/files/etl/score.py --data-binary @- <<'EOF'
+print("scoring", region)
+n = db.sql(f"SELECT count(*) AS n FROM orders WHERE region = '{region}'").item()
+{"region": region, "orders": n}
+EOF
+```
+
+```sql
+CALL run('etl/score.py', region => 'west');
+```
+
+A notebook (`.ipynb`) runs its cells in order: `%%sql` cells as SQL, the others as Python, in one
+namespace for the run. Its cell tagged `parameters` (as papermill's) holds the defaults, and the
+values given replace them. SQL cells take the values as `$name`.
+
+```sql norun
+CALL run('reports/weekly.ipynb', region => 'west');
+CALL run('notebooks/weekly');           -- a notebook the console saved: its newest version
+```
+
+<Aside>
+Python files and notebooks with Python cells run code on the node, so they need an admin token,
+as `DO` does. A writer runs SQL files, with its own rights for each statement. The node needs
+Python for them: see [Functions and procedures](/pondra/guides/functions-and-procedures/).
+</Aside>
+
+## From every client
+
+<Tabs>
+<TabItem label="Python">
+```python
+import pondra, datetime
+db = pondra.connect("http://localhost:8080")
+db.run("etl/orders.sql", day=datetime.date(2026, 9, 29), region="south", amount=2.0)
+```
+`db.run` runs a `.sql` file on your machine if there is one at that path, and otherwise the lake's
+file, on the node. `wait=False` starts it there and gives back its run.
+</TabItem>
+<TabItem label="JavaScript">
+```js
+import { connect } from "pondra";
+const db = connect("http://localhost:8080");
+await db.run("etl/orders.sql", { day: "2026-09-29", region: "south", amount: 2 });
+```
+</TabItem>
+<TabItem label="Postgres">
+```sql
+CALL run('etl/orders.sql', day => DATE '2026-09-29', region => 'south', amount => 2.0);
+```
+</TabItem>
+</Tabs>
+
+MCP clients run a file through the `write` tool, with the same `CALL`.
+
+## Files that run files
+
+A file may run another with the same `CALL`, and a Python file with `pondra.run`, so SQL and Python
+chain freely:
+
+```bash
+curl -s -X PUT http://localhost:8080/files/etl/daily.sql --data-binary @- <<'EOF'
+CALL run('etl/orders.sql', day => $day, region => 'east', amount => 1.0);
+CALL run('etl/orders.sql', day => $day, region => 'north', amount => 2.0);
+EOF
+```
+
+```sql
+CALL run('etl/daily.sql', day => DATE '2026-09-30');
+```
+
+```python norun
+pondra.run("etl/orders.sql", day=datetime.date(2026, 9, 29), region="chain", amount=3.0)  # in a .py file
+```
+
+Runs inside runs stop 16 deep, so a file that runs itself ends with an error, not a loop.
+
+## Jobs, schedules and the run log
+
+`pondra.start('run', …)` starts a file on the node and answers at once with its run's id. A task
+runs it on a schedule:
+
+```sql
+SELECT pondra.start('run', 'etl/orders.sql', day => DATE '2026-09-28', region => 'later', amount => 8.0) AS run;
+CREATE TASK nightly SCHEDULE 'cron 0 2 * * * UTC' AS CALL run('etl/daily.sql', day => current_date - 1);
+```
+
+Every run is a row of `pondra.runs`, named `files/<path>@<version>`: the file, and the version of it
+that ran. Its arguments, who ran it (a task's runs say `task:nightly`), when, and how it went are
+there too:
+
+```sql
+SELECT routine, args, caller, status, error FROM pondra.runs WHERE routine LIKE 'files/%' ORDER BY started DESC LIMIT 5;
+```
+
+- **Retried with a job, a run writes once.** Over HTTP, `POST /sql?job=…`; a task's tick has its
+  own. Each statement of the file (and of the files it runs) gets its part of the job.
+- **The version is the file's `etag`.** A file is replaced in place when saved, so the log names
+  which version ran; keep the files in git (the console downloads them) for their history.
+
+```sql
+DROP TASK nightly;
+```
+
+## In the console
+
+- **A SQL file's `$name`s** each get an input above the editor. **Run** sends their values with
+  the statements, bound on the node.
+- **The file's ⋯** (and a notebook's) has **Run as a job**, which saves the file and starts it on the
+  node, and **Schedule…**, which makes a task that runs it (`15 minutes`, `1 day`, or a cron line).
+- **Runs** (the right pane) lists the node's runs, newest first, and the schedules, each with a
+  button to drop it. A running job's row updates until it ends. Click a file's run to open the file.

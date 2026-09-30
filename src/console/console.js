@@ -13,7 +13,7 @@
 //
 // No framework and nothing from anywhere else: the page, its modules and its fonts come from the node.
 import { h, $, fill, said, esc, store, secs, count, bytes, ago, utc, ICONS, icon, svg, typeMark, sqlType, numeric, on, emit, R, byOrder, shell, register, T, configure,
-  MODE, SESSION, S, base, call, run, rows, doBlock, ident, qualified, home, fileSql, toast, menu, prompt, VERSION, DATA, fileUrl, Failure, ask } from './core.js';
+  MODE, SESSION, S, base, call, run, rows, doBlock, ident, quote, qualified, home, fileSql, toast, menu, prompt, confirmed, VERSION, DATA, fileUrl, Failure, ask } from './core.js';
 import { highlighted, closeComplete } from './editor.js';
 import { grid, summarize, statView, spread } from './grid.js';
 import { Notebook, openNotebook, versions, cleanName, doneText } from './notebook.js';
@@ -520,13 +520,46 @@ async function variables() {
     h('div', { class: 'acts2' }, act('restart', 'Restart', 'Stop this page\'s Python: its variables go (its temporary tables stay)', restart), act('refresh', 'Refresh', 'Read them again', () => detail())),
     ...S.vars.map(x => h('div', { class: 'var' }, h('div', { class: 'line1' }, h('span', { class: 'nm' }, x.name), h('span', { class: 'ty' }, x.type + (x.size ? ` · ${x.size}` : ''))), h('div', { class: 'look' }, x.look)))];
 }
-/** What this page ran, newest first: click one to run it again in a tab. */
-function runs() {
-  if (!S.ran.length) return [head('clock', 'Runs', 'what this page ran'), h('div', { class: 'empty' }, 'Nothing run yet.')];
-  return [head('clock', 'Runs', `${S.ran.length} in this page`), ...S.ran.map(x => h('div', { class: 'run-item', role: 'button', tabindex: '0', title: x.src, onclick: () => { const d = newFile(x.kind === 'python' ? 'python' : 'sql'); d.ed.value = x.src; d.changed(); } },
+/** Runs: the node's (jobs, files run, procedures and tasks: `pondra.runs`), the schedules
+ * (`pondra.tasks`), and what this page ran, newest first. */
+async function runs() {
+  let node = [], tasks = [];
+  try { node = await rows('SELECT id, routine, caller, status, started, ended, error FROM pondra.runs ORDER BY started DESC LIMIT 30'); } catch { /* (no run yet, or no rights) */ }
+  try { tasks = await rows('SELECT name, schedule, statement, next_tick FROM pondra.tasks ORDER BY name'); } catch { /* (none) */ }
+  clearTimeout(runs.again);
+  if (node.some(x => x.status === 'running')) runs.again = setTimeout(() => { if (S.tab === 'runs') detail(); }, 2000); // (until it ends)
+  const took = x => x.ended ? secs(utc(x.ended) - utc(x.started)) : 'running';
+  const fileOf = x => /^files\/.+@/.test(x.routine) ? x.routine.replace(/^files\//, '').replace(/@[^@]*$/, '') : null;
+  const nodeRun = x => h('div', { class: 'run-item', role: fileOf(x) ? 'button' : null, tabindex: fileOf(x) ? '0' : null, title: x.error || x.routine, onclick: () => fileOf(x) && openFile(fileOf(x)) },
+    h('div', { class: 'line1' }, h('span', { class: 'ic', html: svg(fileOf(x) ? iconOf(fileOf(x)) : 'play', 14) }), h('span', { class: 'nm' }, fileOf(x) || x.routine),
+      h('span', { class: 'meta ' + (x.status === 'failed' ? 'bad' : '') }, x.status === 'failed' ? 'failed' : took(x))),
+    h('div', { class: 'sub' }, `${x.caller} · ${utc(x.started).toLocaleString()}`), x.error ? h('div', { class: 'sub bad' }, x.error.split('\n')[0].slice(0, 200)) : null);
+  const task = t => h('div', { class: 'run-item', title: t.statement },
+    h('div', { class: 'line1' }, h('span', { class: 'ic', html: svg('clock', 14) }), h('span', { class: 'nm' }, t.name), h('span', { class: 'meta' }, t.schedule),
+      h('button', { class: 'icon sm', title: `Stop ${t.name}: DROP TASK`, 'aria-label': `Drop the task ${t.name}`, onclick: async () => { if (!confirmed(`Drop the task ${t.name}? It stops running.`)) return; try { await run(`DROP TASK ${ident(t.name)}`); detail(); } catch (e) { toast(e.message, true); } } }, icon('trash'))),
+    h('div', { class: 'sub' }, `${t.statement.slice(0, 120)} · next ${utc(t.next_tick).toLocaleString()}`));
+  const page = x => h('div', { class: 'run-item', role: 'button', tabindex: '0', title: x.src, onclick: () => { const d = newFile(x.kind === 'python' ? 'python' : 'sql'); d.ed.value = x.src; d.changed(); } },
     h('div', { class: 'line1' }, h('span', { class: 'ic k-' + x.kind, html: svg(x.kind === 'python' ? 'filepy' : 'filesql', 14) }), h('span', { class: 'nm' }, x.src.split('\n').find(l => l.trim()) || ''), h('span', { class: 'meta ' + (x.ok ? '' : 'bad') }, x.ok ? secs(x.ms) : 'failed')),
-    h('div', { class: 'sub' }, `${x.where} · ${new Date(x.at).toLocaleTimeString()}`)))];
+    h('div', { class: 'sub' }, `${x.where} · ${new Date(x.at).toLocaleTimeString()}`));
+  return [head('clock', 'Runs', 'jobs and schedules on the node, and what this page ran'),
+    h('div', { class: 'dsect' }, 'On the node'), ...node.length ? node.map(nodeRun) : [h('div', { class: 'empty' }, 'No job yet: a file\'s ⋯ runs it as one.')],
+    tasks.length ? h('div', { class: 'dsect' }, 'Schedules') : null, ...tasks.map(task),
+    h('div', { class: 'dsect' }, 'This page'), ...S.ran.length ? S.ran.map(page) : [h('div', { class: 'empty' }, 'Nothing run yet.')]];
 }
+/** A file (or a saved notebook) run on the node, not waited for (ADR-033): now, as a job
+ * (`pondra.start('run', …)`), or on a schedule, as a task. What is saved runs, with the SQL file's
+ * parameters as they are now; Runs shows it. */
+async function job(doc, every) {
+  if (doc.dirty && !(await doc.save())) return;
+  if (every && !(every = await prompt('Schedule', 'How often', '1 hour', 'For example 15 minutes, 1 day, or cron 0 2 * * * UTC. It runs on the node as CALL run(…), and Runs lists it.'))) return;
+  const path = doc.kind === 'notebook' ? `notebooks/${doc.name}` : doc.path, name = path.replace(/\.[^./]+$/, '').replace(/\W+/g, '_').replace(/^_+|_+$/g, '').toLowerCase() || 'job';
+  const args = quote(path) + Object.entries(doc.params?.() || {}).map(([n, v]) => `, ${ident(n)} => ${typeof v === 'string' ? quote(v) : String(v).toUpperCase()}`).join('');
+  try {
+    await run(every ? `CREATE OR REPLACE TASK ${ident(name)} SCHEDULE ${quote(every)} AS CALL run(${args})` : `SELECT pondra.start('run', ${args})`);
+    toast(every ? `Scheduled: ${name}, every ${every}` : `Started on the node: ${path}`); show('runs');
+  } catch (e) { toast(e.message, true); }
+}
+Object.assign(H, { job, schedule: doc => job(doc, true) });
 on('ran', (who, r, what) => {
   const src = what?.src ?? who?.src ?? '';
   if (!src.trim()) return;

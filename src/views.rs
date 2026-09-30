@@ -569,7 +569,7 @@ pub async fn fill_all(lake: &Lake, seq: &crate::log::Sequencer, log: &crate::log
         let (Some(v), None) = (lake.cat.get::<View>(&view_key(name)).await?, lake.cat.get::<u64>(&producer_key(&producer)).await?) else { continue }; // (dropped, or filled, meanwhile)
         let Some(fill) = &v.fill else { continue };
         let Some(upto) = fill.upto else {
-            seq.reserve().await?; // (a commit: the sequencer sets `upto` in it)
+            seq.number().await?; // (a commit: the sequencer sets `upto` in it)
             continue;
         };
         // The source as it was at `upto`: its rows (and changes) from then, none from after.

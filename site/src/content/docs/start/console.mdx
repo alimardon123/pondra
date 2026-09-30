@@ -44,7 +44,8 @@ pondra serve lake        # then open http://localhost:8080
   type; **Esc** clears it.
 - **The middle:** a tab per open file. A dot on a tab (and beside the file in the Workspace) means
   it has changes not saved; **Ctrl+S** saves the one in front.
-- **The right pane:** **Details**, **Variables** and **Runs**.
+- **The right pane:** **Details**, **Variables** and **Runs** (the node's jobs and schedules, and
+  what this page ran).
 - **Each view's ⋯** moves it to the other pane: Workspace can sit as a tab on the right, for
   instance. Drag a pane's edge to set its width (a double-click resets it). **Settings** sets the
   theme (the system's, light or dark), which group comes first on the left, the font, and how a SQL
@@ -87,6 +88,9 @@ its next statement.
   comment or a `$$` body doesn't end a statement.
 - **Settings → A SQL file's statements → The last one's answer** runs the file at once instead and
   shows only its last statement's answer.
+- **A `$name` in the file** gets an input above the editor. **Run** sends the values with the
+  statements, and the node binds them (numbers and `true`/`false` as such, the rest as text); the
+  browser keeps them for the file.
 - **Plan** shows `EXPLAIN` for the statement shown. **Chart** draws the rows. The results sit below
   the editor or at its right (the button at the right of their bar); drag the line between them.
 
@@ -95,6 +99,18 @@ its next statement.
 **Run file** runs it in the page's Python, the one the notebooks' Python cells share: what it printed
 and its answer show in the console below. Type a line after `>>>` and press **Enter** to run it there
 too (**↑** **↓** bring back the ones before).
+
+### Jobs and schedules
+
+A file's **⋯** (and a notebook's) runs it on the node, where it goes on without the page:
+
+- **Run as a job** saves the file and starts it, with the parameters' values as they are now.
+- **Schedule…** makes a task that runs it every so often (`15 minutes`, `1 day`, or a cron line such
+  as `cron 0 2 * * * UTC`).
+
+**Runs**, in the right pane, lists the node's runs, newest first (a running one's row updates until it
+ends; click a file's run to open the file), the schedules, each with a button to drop it, and what
+this page ran. It's the workspace of [Run files as jobs](/pondra/guides/workspace/).
 
 ### Data files
 

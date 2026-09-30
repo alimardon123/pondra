@@ -65,8 +65,8 @@ fn page_text() -> String {
         .replacen("<!--{{extensions}}-->", &extensions, 1)
 }
 
-/// The console's own script or style sheet as served: its whole-line comments, blank lines and
-/// indentation left out (a tenth less to send, gzipped); every other line as written. So its code
+/// The console's own script or style sheet as served: its comments, blank lines and indentation
+/// left out (a tenth less to send, gzipped); the code of every other line as written. So its code
 /// holds no string or template literal over several lines (console_check's parts run it as served).
 fn lean(src: &str) -> String {
     let (mut out, mut comment) = (String::with_capacity(src.len()), false);
@@ -80,6 +80,9 @@ fn lean(src: &str) -> String {
                 Some(end) => t = t[end + 2..].trim(),
                 None => (comment, t) = (true, ""),
             }
+        }
+        if let Some(at) = t.rfind(" // ").filter(|&at| !t[at..].contains(['\'', '"', '`']) && !t[at + 3..].contains('/')) {
+            t = t[..at].trim_end(); // (a comment after the code: no string or regex can go on past it, as none spans lines)
         }
         if !t.is_empty() && !t.starts_with("//") {
             out.push_str(t);

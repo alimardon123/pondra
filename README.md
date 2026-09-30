@@ -200,9 +200,13 @@ load_catalog("lake", type="rest", uri="http://node:8080").load_table("default.ev
 #        spark.sql("INSERT INTO lake.default.events SELECT …"); df.writeTo("lake.default.events").append()
 ```
 
-An append becomes the table's own rows, as a bulk `INSERT`'s would (row ids, the table's layout,
-views following), each commit once: a stale one gets 409 and the writer retries on top. Deletes,
-schema changes and keyed tables stay with Pondra's SQL, and are refused by name.
+An append's files become the table's where the writer put them: the node reads each footer once,
+checks it and records it, never copying the rows (a million rows cost it 0.01 s of CPU, against 0.24 s
+to copy them), and the rows take their ids and versions from the commit. Each commit lands once: a
+stale one gets 409 and the writer retries on top. Engines make, rename and drop tables through the
+catalog too, and follow the layout it publishes (partition spec, sort order, key). Deletes, schema
+changes and keyed tables stay with Pondra's SQL, and are refused by name (ADR-029: round 28 takes
+deletes, overwrites and merges).
 
 Pondra's own readers (nodes, `pondra sql`) see every write sooner. The local folder and the bucket
 use the same layout: see `docs/lake-format.md`.
@@ -297,6 +301,7 @@ differences entirely.
 | Python functions | `CREATE FUNCTION slug(t VARCHAR) RETURNS VARCHAR LANGUAGE python AS $$ … $$`: per row, a batch at once (`WITH (vectorized = true)`: pyarrow in and out) or a table (`RETURNS TABLE`); `WITH (packages = 'requests')`; `WITH (cache = '10 minutes')`: an answer reused for the same arguments (an API or model called once, not once a query); PL/Python's `plpy`. Run on warm workers beside every node (each node its own rows), anywhere SQL's own functions go; no connection back, a time limit per batch; `@db.function` on a notebook's function (its imports, helpers and constants go along), PySpark's `udf` / `pandas_udf` | Snowflake / Databricks Python UDFs and UDTFs, PySpark UDFs |
 | Procedures | `CREATE PROCEDURE p(day DATE, n BIGINT DEFAULT 10) LANGUAGE sql AS $$ …; …; $$` or `LANGUAGE python` (anything Python can do — mail, HTTP, files; `pondra.sql(…)` is the caller's connection, `pondra.secret(…)` a `CREATE SECRET`'s values, never shown; `return` optional); `CALL p(DATE '2026-09-27')` from SQL, Postgres, Python (`db.call`; `@db.procedure`, or `db.create_procedure(name, file="job.py")`), JavaScript, the shell, and as MCP tools. What it prints comes back as notices (psql's NOTICE). Arguments worked out once; the caller's rights; exactly-once with a job; `SELECT pondra.start('p', …)` / `db.call(…, wait=False)` without waiting; every call in `pondra.runs`; a warm call in about 2 ms | Snowflake / Postgres stored procedures, Databricks jobs |
 | Tasks | `CREATE TASK nightly SCHEDULE 'cron 0 2 * * * UTC' AS CALL report(current_date - 1)` (or `'5 minutes'`): the leader runs each tick once, through a failover; `SHOW TASKS`, `DROP TASK` (and `SHOW USER FUNCTIONS`, `SHOW PROCEDURES`) | Snowflake tasks, Databricks jobs, cron |
+| Files as jobs | `CALL run('etl/orders.sql', day => DATE '2026-09-29')` runs a `.sql`, `.py` or notebook file kept in the lake (`$day` bound; a `.py` file's `day` a variable; a notebook's `parameters` cell replaced, as papermill does), from every door (`db.run`, JavaScript, Postgres, MCP, `pondra.start('run', …)`, a task); files run files; each run in `pondra.runs` as `files/<path>@<version>`. The console's ⋯ runs a file as a job or on a schedule | Databricks jobs and notebooks, Snowflake notebooks and tasks, Airflow's simple DAGs |
 | Scripts and parameters | `POST /sql` takes several statements and `{"sql": …, "params": {"day": "2026-09-27"}}` for `$day` (bound by the node, never pasted in); `pondra run load.sql lake --day 2026-09-27` runs a file | psql scripts, dbt's `var()` |
 | A shell | `pondra` or `pondra <lake>`: SQL typed or piped in, answers as tables, `.tables`, `.databases`, DuckDB-style | the DuckDB / psql prompt |
 | Kafka | `--kafka`: producers write to tables (a topic is a table; JSON values; `_key`/`_timestamp`/`_value` columns; idempotent producers exactly-once; gzip/snappy/lz4/zstd), Debezium change events and tombstones become upserts and deletes; consumers and consumer groups read the log (offsets = `_ord`); SASL/PLAIN with the tokens. Tested: librdkafka (confluent-kafka), kafka-python | Kafka / Fluss ingest, Debezium sinks |
@@ -351,6 +356,8 @@ differences entirely.
 | `files.rs`, `ai.rs`, `udf.rs` | Files in the lake (`files('…')`, `file_read`), models in SQL (`ai_complete`, `ai_embed`) and vector maths, and functions of your own on an Arrow Flight server |
 | `routines.rs` | Functions (SQL, Python), procedures and scripts: `CREATE FUNCTION` / `PROCEDURE` in Postgres's forms, SQL functions expanded where SQL comes in, `CALL`, `pondra.start`, notices |
 | `python.rs`, `pyfn.rs` | Python beside each node: a pool of warm workers (`python -m pondra.worker`) over Arrow IPC, and Python functions as DataFusion functions and table functions |
+| `adopt.rs` | Other engines' files recorded as written (ADR-029): their footers read and checked, their lineage (a first row id, the commit, its time) giving their rows' system columns |
+| `workspace.rs` | Files of the lake's run as jobs (ADR-033): `CALL run('etl/orders.sql', day => …)` for `.sql`, `.py` and notebooks, logged by path and version |
 | `runs.rs` | The run log (`pondra.runs`), tasks on a schedule (each tick once), `pondra.routines` and `pondra.tasks` |
 | `cache.rs` | For lakes on object storage: an in-memory read cache and a local SSD tier (write-through, read-through, prefetched from the commit stream, warmed at start) |
 | `serve.rs` | Serving reads: key lookups without SQL (tail, then files newest-first, cached key-sorted row groups, binary search), and SQL point queries routed to them |
@@ -462,10 +469,13 @@ bucket to its newest lakes.
   Tables made before 0.19 (without row ids) change after a copy (`CREATE TABLE t2 AS SELECT …`).
   Clustering across files.
 - A write to two lakes is two commits, not one transaction.
-- Other engines append to append tables through the Iceberg REST catalog; their deletes, schema
-  changes and writes to keyed tables are refused (next: equality deletes as upserts), and so is
-  a table made through the catalog (make it with `CREATE TABLE … WITH (publish = 'iceberg')`).
-  Delta writers need Delta's catalog-managed commits, which aren't out yet.
+- Other engines append to append tables through the Iceberg REST catalog, and make, rename and
+  drop tables there; their deletes, overwrites, schema changes and writes to keyed tables are
+  refused (round 28: ADR-029 phase 2). An append to a table that views or tasks follow is still
+  copied (through the log), and so is one to a table with a renamed column; files recorded as
+  written are read from Parquet, not the hot columns, until a merge rewrites them; and `/watch`,
+  the change feed and Kafka topics carry the log's rows, not a file commit's (a bulk `INSERT`'s
+  either). Delta writers need Delta's catalog-managed commits, which aren't out yet.
 - A materialized view that is a session window or a stream join starts from its creation; others
   are filled from the rows already there, in one go on the leader. Narrowing a type,
   `search_path` and grants per schema.
@@ -480,14 +490,17 @@ bucket to its newest lakes.
   itself hasn't run against Pondra (its drivers, Npgsql and psqlODBC, are tested).
 - The console: two people's changes to one file aren't merged (the second save is refused, and
   says so); a Parquet file, or a data file over 10 MB, opens read-only.
+- Files run as jobs: a file's old versions aren't kept (the run log names the version that ran;
+  keep the files in git), and a notebook's run doesn't write its outputs into a copy of it, as
+  papermill does.
 - A folder of lakes (`pondra serve data`) is on the node's own disk, not in a bucket.
 - Kafka: one partition per topic, no transactions; offsets are positions in the log (increasing,
   not dense). Consumer groups live in the leader's memory (members rejoin after a failover).
 - An approximate vector index (see the plan in `docs/comparison-spark-flink-fluss.md`).
 - Frames: the JavaScript client has parameters, `run` and `call`, not the frame builder;
   a sort inside `db.sql(…)`'s own SQL by an expression (not a column) ends at the next frame step.
-  A folder of `.sql` and `.py` models run in order of what reads what (`pondra run models/`), and
-  notebooks run as procedures or on a schedule, are next (the console keeps notebooks in the lake).
+  A folder of `.sql` and `.py` models run in order of what reads what (`pondra run models/`) is
+  next; files run one by one (`CALL run`), or one file runs the others in its order.
 - Functions and procedures: a Python table function takes values, not another table's rows (no
   LATERAL); `plpy.subtransaction` is refused (each statement commits on its own); a cast to an
   integer truncates where Postgres rounds; a task's ticks missed while no node led run once.

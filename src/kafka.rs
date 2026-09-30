@@ -8,7 +8,8 @@
 //!   a null value (a tombstone) deletes its key from a keyed table. Idempotent producers are
 //!   exactly-once: their producer id and sequence become a Pondra producer and seq.
 //! - **Consuming:** a topic reads the table's log, as far back as it is kept (`--changelog-secs`).
-//!   A record's offset is its `_ord` — (segment << 32) + row: increasing, but not dense. Keyed
+//!   A record's offset is its `_ord` (`log::ord`: its segment, then its row): increasing, not
+//!   dense, and it can't wrap in a table's lifetime (ADR-029 §11). Keyed
 //!   tables' deletes arrive as tombstones.
 //! - **Tokens:** with tokens set, clients log in with SASL/PLAIN: the user name picks the role
 //!   (`reader`, `writer`, `admin`), the password is its token.
@@ -407,7 +408,7 @@ async fn queue(app: &App, table: &str, meta: &TableMeta, records: &[u8]) -> BoxF
             match ack.await {
                 Ok(Ack { conflict: true, .. }) => return (OUT_OF_ORDER_SEQUENCE, -1, None),
                 Ok(Ack { duplicate: true, .. }) => {} // a retry of a committed batch: success
-                Ok(a) => first = first.or(Some(((a.seg << 32) + a.row) as i64)),
+                Ok(a) => first = first.or(Some(crate::log::ord(a.seg, a.row) as i64)),
                 Err(e) => return (POLICY_VIOLATION, -1, Some(format!("{e:#}"))),
             }
         }
@@ -617,9 +618,9 @@ async fn list_offsets(app: &App, ver: i16, r: &mut Rd) -> Result<Vec<u8>> {
             }
             let at = r.i64()?;
             let offset = match at {
-                -1 => (app.lake.visible() + 1) << 32,
-                -2 => first_segment(app).await? << 32,
-                t => after_time(app, t).await? << 32,
+                -1 => crate::log::ord(app.lake.visible() + 1, 0),
+                -2 => crate::log::ord(first_segment(app).await?, 0),
+                t => crate::log::ord(after_time(app, t).await?, 0),
             };
             w.put_i32(index);
             w.put_i16(if exists && index == 0 { 0 } else { UNKNOWN_TOPIC });
@@ -713,7 +714,7 @@ async fn fetch(app: &App, ver: i16, req: FetchReq) -> Result<Vec<u8>> {
                 // An offset before the oldest segment still kept reads from that one: its rows went
                 // with retention, as Kafka's would. ("Out of range" made librdkafka retry an
                 // earliest offset it had cached from before those segments expired, in a loop.)
-                let (offset, end) = (offset.max(first << 32), (visible + 1) << 32);
+                let (offset, end) = (offset.max(crate::log::ord(first, 0)), crate::log::ord(visible + 1, 0));
                 let (error, records) = match &meta {
                     Some(meta) if index == 0 && offset <= end => (0, read(app, name, meta, offset, visible, limit.min(budget)).await?),
                     Some(_) if index == 0 => (OFFSET_OUT_OF_RANGE, vec![]),
@@ -772,25 +773,26 @@ fn fetch_error(ver: i16, e: &anyhow::Error) -> Vec<u8> {
 
 /// Record batches of `table` from `offset` on, up to about `limit` bytes (at least one batch).
 async fn read(app: &App, table: &str, meta: &TableMeta, offset: u64, visible: u64, limit: usize) -> Result<Vec<u8>> {
-    let (from, skip) = (offset >> 32, offset & 0xffff_ffff);
-    let (mut out, mut at) = (vec![], from);
+    // (from a few segments back: a big one's rows run on past its number, `log::span`)
+    let (mut out, mut at) = (vec![], (offset >> crate::log::ORD_BITS).saturating_sub(64));
     while out.is_empty() && at <= visible {
         let upto = visible.min(at + 4095); // (segments without this table are skipped, 4,096 at a time)
         for (key, seg) in app.lake.cat.scan::<Segment>(&seg_key(at), &seg_key(upto + 1)).await? {
-            if !seg.parts.contains_key(table) || out.len() >= limit {
-                continue;
-            }
             let n: u64 = key[2..].parse()?;
+            let held = seg.parts.get(table).map_or(0, |p| p.iter().map(|x| x.2).sum::<u64>());
+            if crate::log::ord(n, held) <= offset || out.len() >= limit {
+                continue; // (none of its rows at the offset or after)
+            }
             let rows = app.lake.segment_rows(n, &seg, table).await?;
             let s = schema(&meta.columns)?;
             let all = concat_batches(&s, &rows.iter().map(|b| crate::query::conform(b, &s)).collect::<Result<Vec<_>>>()?)?;
             if all.num_rows() == 0 {
                 continue;
             }
-            let start = if n == from { skip.min(all.num_rows() as u64) as usize } else { 0 };
+            let start = offset.saturating_sub(crate::log::ord(n, 0)).min(all.num_rows() as u64) as usize;
             let rows = all.slice(start, all.num_rows() - start);
             if rows.num_rows() > 0 {
-                out.extend(encode_batch(((n << 32) + start as u64) as i64, seg.ts_ms as i64, &records(&meta.logical(), &meta.to_logical(&rows)?)?)); // (SQL's names: ADR-022)
+                out.extend(encode_batch(crate::log::ord(n, start as u64) as i64, seg.ts_ms as i64, &records(&meta.logical(), &meta.to_logical(&rows)?)?)); // (SQL's names: ADR-022)
             }
         }
         at = upto + 1;

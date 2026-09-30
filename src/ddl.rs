@@ -732,6 +732,9 @@ async fn alter_column(lake: &Lake, table: &str, column: &str, change: Change) ->
         puts.push((table_key(&del), json(&d)));
     }
     lake.cat.commit(puts, &[]).await?;
+    if !m.publish.is_empty() {
+        crate::delta::publish_all(lake).await?; // (other engines see the new names at once: they write by them)
+    }
     Ok(j!({"table": name, "altered": what}))
 }
 

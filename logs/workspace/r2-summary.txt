@@ -1,0 +1,11 @@
+=== real R2, the workspace (ADR-033), with its binary
+07:59:08 start workspace
+08:00:15 workspace exit=0
+08:00:15 start fence
+08:01:05 fence exit=0
+08:01:05 start server
+08:06:53 server exit=1
+08:06:53 R2_DONE
+08:10:16 start server (again: a new database's first write given 180 s, the binary named pondra)
+08:18:43 server exit=0
+08:18:43 R2_DONE

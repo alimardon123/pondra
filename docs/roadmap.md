@@ -323,7 +323,7 @@ table's slices.
 | G6 | Databases: `ATTACH 'postgres://…'` / MySQL as a database to read (filters pushed down) and write; their changes streamed in natively (logical replication, binlog) | CDC without Debezium | L | Tables equal the source's under changes; a restart |
 | G7 | Sinks: a materialized view or task kept in step in an outside target (Kafka, Postgres upsert, files) | The other half of ETL | M | Exactly-once through failovers |
 | G8 ✓ (appends) | Outside engines write Pondra's tables through its Iceberg REST catalog (the owner, 2026-09-28: others should write too; Polaris and Unity Catalog are JVM services and would have to be the source of truth, so Pondra plays their part itself): appends to append tables first, committed by the leader as its own (schema checked, exactly-once, views and the change feed following); keyed tables later (equality deletes as upserts); Delta through catalog-managed commits when Delta has them. Never by writing the published files behind Pondra's back: its catalog is the truth, and a commit it didn't see would break views, row ids and the next publish | Spark, Trino, Flink, PyIceberg, Snowflake and DuckDB write through a REST catalog, as with Polaris and Unity | M | Spark and PyIceberg append; Pondra's views, change feed and Delta copy follow; a retried commit applied once |
-| G9 | Other engines' compute for their writes (ADR-029, proposed). Files are taken as written: the leader records them and reads only their footers. Each file's rows get ids from its first id plus position (Iceberg v3's row lineage, Delta's row tracking). Deletes are kept as positions, and Pondra publishes its own deletes the same way (purges become maintenance). Keyed tables take upserts. Partition spec, sort order and key are published for writers. Views are fed from the files. The Iceberg REST catalog becomes complete (create, alter, transactions, vended credentials, scan planning). Also fixes the row-id and Kafka-offset limits (ADR-029 decision 11) | Batch writes cost Pondra nothing but the commit, which makes compute and storage separate | L (3 phases) | An outside 1 GB append costs the node its footers and one commit; Spark's `DELETE`/`MERGE` equal Pondra's; views and the change feed follow |
+| G9 | Other engines' compute for their writes (ADR-029; phase 1 built in round 27). Files are taken as written: the leader records them and reads only their footers. Each file's rows get ids from its first id plus position (Iceberg v3's row lineage, Delta's row tracking). Deletes are kept as positions, and Pondra publishes its own deletes the same way (purges become maintenance). Keyed tables take upserts. Partition spec, sort order and key are published for writers. Views are fed from the files. The Iceberg REST catalog becomes complete (create, alter, transactions, vended credentials, scan planning). Also fixes the row-id and Kafka-offset limits (ADR-029 decision 11) | Batch writes cost Pondra nothing but the commit, which makes compute and storage separate | L (3 phases) | An outside 1 GB append costs the node its footers and one commit; Spark's `DELETE`/`MERGE` equal Pondra's; views and the change feed follow |
 
 ### H. SQL and Python as one (the owner, 2026-09-28; ADR-027)
 
@@ -352,7 +352,7 @@ the platform after.
 | # | Item | Why | Size | Proof |
 |---|---|---|---|---|
 | J1 | The server's catalog (ADR-032 §9): databases anywhere by name, attachments, secrets, users and extensions for every database of a server | Users live above the databases (round 29 needs it); no listing per connection | M | Databases in two buckets served as one server; listing costs no request; a user made once reaches every database |
-| J2 | A workspace (ADR-033): `.sql`, `.py` and notebooks as versioned files, edited in the console, run with parameters from every door (`CALL run(…)`), recorded in the run log, scheduled | ETL without another tool; SQL and Python calling each other | M–L | A SQL file and a Python file chained with parameters, from SQL, Python, JavaScript and the console; a schedule runs a notebook; the run log names each version |
+| J2 ✓ | A workspace (ADR-033, built 2026-09-30): `.sql`, `.py` and notebooks as versioned files, edited in the console, run with parameters from every door (`CALL run(…)`), recorded in the run log, scheduled | ETL without another tool; SQL and Python calling each other | M–L | A SQL file and a Python file chained with parameters, from SQL, Python, JavaScript and the console; a schedule runs a notebook; the run log names each version |
 | J3 | Dashboards and reports: a notebook with parameters shown read-only | What a team shares | M | A report with inputs, refreshed by a schedule |
 
 ## The rounds
@@ -372,13 +372,14 @@ simulated R2 and real R2, an ADR, and a bundle.
 | 24 ✓ | SQL and Python as one (done: ADR-027) | H1–H6 | `CREATE FUNCTION` in SQL and Python; procedures that send mail from a SQL cell; decorators that take a notebook's function; schedules and a run log |
 | 25 ✓ | One vocabulary, open writes, live answers (done: ADR-028) | E9, E10, G8, B3, temporary tables, changes to attached lakes | `read_*`/`write_*` everywhere (the tools' names as fallbacks); Spark and PyIceberg append to Pondra's tables through its Iceberg catalog; live queries; function results reused; `CREATE TEMP TABLE`; `UPDATE`/`MERGE` on attached lakes from any node |
 | 26 ✓ | The console, the server and the docs (done: ADR-030, ADR-032, ADR-034) | A4, E1, E2, the server, E11 | a console at `/` with SQL, Python and text cells, then tabs of notebooks, SQL, Python and data files edited in place (ADR-034), built to be extended; a folder of lakes (local or in a bucket) served as databases (`pondra serve --lakes`); dbt and BI tools through Postgres's catalog; a documentation website on GitHub Pages covering everything, each example tested |
-| 27 | Anyone's compute, phase 1 (ADR-029) | G9: appends as written, the id limit | other engines' appends cost the node only a commit; layout published for writers; tables made through the catalog |
-| 28 | Anyone's compute, phase 2 (ADR-029) | G9: changes as written | Spark's and PyIceberg's `DELETE`, `UPDATE`, `MERGE` and overwrites on Pondra's tables; deletes published as positions; keyed tables published every tier round |
+| 26+ ✓ | The workspace (done: ADR-033, moved up by the owner) | J2 | `.sql`, `.py` and notebook files of the lake's run with parameters from every door (`CALL run(…)`), as jobs and on schedules, each run logged by the file's version |
+| 27 ✓ | Anyone's compute, phase 1 (done: ADR-029) | G9: appends as written, the id limit | other engines' appends cost the node only its footers and a commit (a million rows: 0.01 s of CPU against 0.24 s copied); layout published for writers; tables made, renamed and dropped through the catalog; row ids and log places that can't wrap |
+| 28 | Anyone's compute, phase 2 (ADR-029) | G9: changes as written, and what phase 1 moved on | Spark's and PyIceberg's `DELETE`, `UPDATE`, `MERGE` and overwrites on Pondra's tables; deletes published as positions; keyed tables published every tier round; followers fed from the files in one commit; `/watch`, the change feed and Kafka topics carrying file commits |
 | 29 | Safe to share | E3, G6 | TLS, mutual TLS between nodes, users and grants down to a table, an audit log, quotas; Postgres and MySQL attached |
 | 30 | Production-ready SQL and frames | D1 to its end, D2, TPC-DS | sqllogictest passing (every exception named), TPC-DS's 99 queries == DuckDB, random queries 1 node == 3 == DuckDB, Polars and PySpark coverage published |
 | 31 | Scale, proven (an ADR of its own: burst) | C1 in one data centre, C2, C4, burst functions | 1 → 3 → 6 machines in one zone; SF100 against Spark; a 24-hour soak; serverless bursts for a big query |
 | 32 | In-process and in the browser | B1, B2, B4 | `pondra.open(…)` without a server; a lake queried in a web page (WebAssembly) |
-| 33+ | Depth, then the platform | G7, H7, E4, I1 (extensions, when the owner places it), F by evidence; J1 (before round 29 if users need it), J2, J3 | sinks, `INSTALL`/`LOAD` extensions, streaming depth, what users show matters; the server's catalog, a workspace of files and runs, reports |
+| 33+ | Depth, then the platform | G7, H7, E4, I1 (extensions, when the owner places it), F by evidence; J1 (before round 29 if users need it), J3 | sinks, `INSTALL`/`LOAD` extensions, streaming depth, what users show matters; the server's catalog, reports |
 
 **Every round, whatever its theme** (the owner's rules: nothing half-done, performance only goes
 up, scale-out is the point):
@@ -447,9 +448,9 @@ Why this order:
    compute (round 29, pushing security to 30), or with depth (33+).
 6. **The plural's name.** `pondra serve --lakes` is built. "Lake hub" (or another word) could name
    the mode in the docs and the console; the flag can stay.
-7. **The server's catalog (J1) and the workspace (J2).** Proposed in ADR-032 §9 and ADR-033. The
-   owner put the base binary first; J1 may need to come before round 29, since users live above
-   the databases.
+7. **The server's catalog (J1).** Proposed in ADR-032 §9. The owner put the base binary first; J1
+   may need to come before round 29, since users live above the databases. (The workspace, J2, is
+   built: ADR-033.)
 
 ## What not to do yet
 

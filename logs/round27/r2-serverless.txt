@@ -1,0 +1,1 @@
+{"serverless": {"alone_s": 35.22, "retry": ["{\"rows\":1000}", "{\"duplicate\":true}"], "four_at_once": ["{\"rows\":1000}", "{\"rows\":1000}", "{\"rows\":1000}", "{\"rows\":1000}"], "node_start_s": 11.82, "node_leads": true, "via_node_s": 14.16, "after_leader_killed_s": 51.98, "rows": {"n": 8000, "ids": 1000}, "ok": false}}

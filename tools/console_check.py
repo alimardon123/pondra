@@ -460,6 +460,29 @@ def files_checks(browser, port, show):
     made = until(lambda: get(port, "scripts/one.sql"), b"SELECT 1 AS one")
     checks["a new SQL file asks for its path when first saved"] = made == b"SELECT 1 AS one" and until(lambda: pg.tab(), ("one.sql", False)) == ("one.sql", False)
 
+    put(port, "scripts/by_region.sql", b"SELECT count(*) AS n, $region AS region FROM fx WHERE region = $region")
+    pg.workspace("scripts", "by_region.sql").click()
+    until(lambda: pg.tab()[0], "by_region.sql")
+    bar = p.locator(".filedoc .params")
+    shown = until(lambda: bar.is_visible() and bar.locator(".param span").all_inner_texts(), ["$region"], 5)
+    p.wait_for_function("document.activeElement?.tagName === 'TEXTAREA'")  # (the file open: its editor has the keys, so a value typed sooner could go there)
+    bar.locator("input").fill("r1")
+    bar.locator("input").press("Enter")
+    bound = until(lambda: pg.grid(body), [["n", "region"], [["10", "r1"]]])
+    pg.docmenu("Run as a job")
+    jobs = p.locator("#runs .run-item", has_text="by_region.sql")
+    ran = until(lambda: jobs.count() > 0 and "failed" not in jobs.first.inner_text() and "running" not in jobs.first.inner_text(), True, 30)
+    pg.docmenu("Schedule")
+    p.locator("#askDlg[open]").wait_for(timeout=5000)
+    p.fill("#askIn", "1 hour")
+    p.press("#askIn", "Enter")
+    task = until(lambda: sql(port, "SELECT name, schedule, statement FROM pondra.tasks"), [{"name": "scripts_by_region", "schedule": "1 hour", "statement": "CALL run('scripts/by_region.sql', region => 'r1')"}], 10)
+    listed = until(lambda: p.locator("#runs .run-item", has_text="scripts_by_region").count(), 1, 10)
+    p.locator("#runs .run-item", has_text="scripts_by_region").locator("button[aria-label^='Drop']").click()
+    dropped = until(lambda: sql(port, "SELECT count(*) AS n FROM pondra.tasks"), [{"n": 0}], 10)
+    p.locator("#rtabs .rtab", has_text="Details").click()
+    checks["a SQL file's $names each get an input, bound on the node; its ⋯ runs it as a job (Runs shows it) and schedules it (a task, dropped from Runs)"] = \
+        shown == ["$region"] and bound == [["n", "region"], [["10", "r1"]]] and ran is True and isinstance(task, list) and len(task) == 1 and listed == 1 and dropped == [{"n": 0}]
     pg.workspace("scripts", "hello.py").click()
     until(lambda: pg.tab()[0], "hello.py")
     p.locator("#docbar button", has_text="Run file").click()
@@ -533,7 +556,7 @@ def files_checks(browser, port, show):
         p.wait_for_timeout(500)
         pg.shot(show, "console-data-file.png")
     checks["files: every request went to the node; no page errors"] = pg.left() == [] and pg.errors == []
-    info = {"results": results, "said": said, "each": each, "not run": left, "second": second, "dirty": dirty, "saved": saved, "clean": clean, "shown": shown, "errors": pg.errors, "left": pg.left(), "toast": pg.toast()}
+    info = {"task": task, "bound": bound, "results": results, "said": said, "each": each, "not run": left, "second": second, "dirty": dirty, "saved": saved, "clean": clean, "shown": shown, "errors": pg.errors, "left": pg.left(), "toast": pg.toast()}
     pg.ctx.close()
     return checks, info
 
@@ -605,7 +628,7 @@ def layout_checks(browser, port, show):
     base = f"http://127.0.0.1:{port}"
     sql(port, "CREATE TABLE lx AS SELECT 1 AS id")
     sql(port, "CREATE TABLE ly AS SELECT 2 AS id")
-    put(port, "notes/a.sql", b"SELECT id FROM lx")
+    put(port, "notes/a.sql", b"SELECT count(*) AS n FROM lx;\nSELECT id FROM lx WHERE id >= $low")  # (for the audit: a parameter's input, a statement's answers)
     put(port, "notes/b.csv", b"k,v\n1,one\n")
     pg = Page(browser, base + "/")
     p = pg.p
@@ -684,7 +707,10 @@ def layout_checks(browser, port, show):
             a.p.wait_for_timeout(400)
             found[scheme + " notebook"] = audit(a.p, axe)
             a.workspace("notes", "a.sql").click()
+            a.p.wait_for_function("document.activeElement?.tagName === 'TEXTAREA'")
+            a.p.fill(".param input", "0")
             a.p.click("#runBtn")
+            a.p.locator(".stmts .stmt").nth(1).wait_for(timeout=15000)
             a.p.locator(".filedoc .gt").wait_for(timeout=15000)
             found[scheme + " SQL file"] = audit(a.p, axe)
             a.workspace("notes", "b.csv").click()

@@ -81,6 +81,8 @@ One vocabulary, and reading and writing everything else.
 | [ADR-026](https://github.com/alimardon123/pondra/blob/main/docs/adr-026-read-and-write-anything.md) | Read and write anything: files, Delta and Iceberg tables and Kafka clusters anywhere, and `CREATE SECRET` | Accepted, built (round 23) |
 | [ADR-027](https://github.com/alimardon123/pondra/blob/main/docs/adr-027-sql-and-python-as-one.md) | `CREATE FUNCTION` in Postgres's forms, procedures that do anything Python can, warm workers, schedules and a run log | Accepted, built (round 24) |
 | [ADR-028](https://github.com/alimardon123/pondra/blob/main/docs/adr-028-one-vocabulary-and-open-writes.md) | `read_*` and `write_*` everywhere, other engines appending through the Iceberg REST catalog, live queries, temporary tables | Accepted, built (round 25) |
+| [ADR-033](https://github.com/alimardon123/pondra/blob/main/docs/adr-033-a-workspace-files-runs-and-parameters.md) | A workspace: SQL, Python and notebook files in the lake, run with parameters from every client, recorded and scheduled | Accepted, built (after round 26) |
+| [ADR-034](https://github.com/alimardon123/pondra/blob/main/docs/adr-034-a-console-of-tabs.md) | A console of tabs: notebooks, SQL, Python and data files edited in place, one grid, a performance budget | Accepted, built (round 26) |
 
 ## Next
 
@@ -88,11 +90,10 @@ Decisions made and not yet built.
 
 | Note | What it decides | Status |
 |---|---|---|
-| [ADR-029](https://github.com/alimardon123/pondra/blob/main/docs/adr-029-anyones-compute-one-catalog.md) | Anyone's compute, one catalog: other engines write with their own compute and Pondra only commits their files | Proposed |
+| [ADR-029](https://github.com/alimardon123/pondra/blob/main/docs/adr-029-anyones-compute-one-catalog.md) | Anyone's compute, one catalog: other engines write with their own compute and Pondra only commits their files | Accepted; phase 1 built (round 27), phase 2 next |
 | [ADR-030](https://github.com/alimardon123/pondra/blob/main/docs/adr-030-the-console-the-server-and-the-docs.md) | The web console, serving a folder of lakes as databases, Postgres as dbt and BI tools use it, and this documentation site | Accepted (round 26) |
 | [ADR-031](https://github.com/alimardon123/pondra/blob/main/docs/adr-031-extensions.md) | Extensions: DuckDB-style `INSTALL` and `LOAD`, as WebAssembly components | Proposed |
 | [ADR-032](https://github.com/alimardon123/pondra/blob/main/docs/adr-032-files-by-name-one-serve-a-console-to-build-on.md) | Files by name (`CREATE EXTERNAL TABLE`), one serve command (`--lake`, `--lakes`, local or in a bucket), a page's Python cells sharing variables, the brand in one place, and the console as a core to build on; backward compatibility from 1.0; a server's catalog (proposed) | Accepted (round 26), §9 proposed |
-| [ADR-033](https://github.com/alimardon123/pondra/blob/main/docs/adr-033-a-workspace-files-runs-and-parameters.md) | A workspace: SQL, Python and notebook files in the lake, run with parameters from every client, recorded and scheduled | Proposed |
 
 ## Other documents
 

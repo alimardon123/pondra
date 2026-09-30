@@ -30,7 +30,7 @@ from .frame import Expr, Frame, GroupBy, coalesce, col, concat, concat_str, fn, 
 from .frame import all, count, first, last, len, max, mean, median, min, n_unique, sum  # noqa: A004 (Polars' names)
 
 __version__ = "0.26.0"
-__all__ = ["connect", "local", "current", "sql", "table", "read_parquet", "read_csv", "read_json", "read_delta", "read_iceberg", "call", "secret", "fn", "Pondra", "Result", "Run", "Frame", "Expr", "GroupBy", "col", "lit", "when",
+__all__ = ["connect", "local", "current", "sql", "table", "read_parquet", "read_csv", "read_json", "read_delta", "read_iceberg", "call", "run", "secret", "fn", "Pondra", "Result", "Run", "Frame", "Expr", "GroupBy", "col", "lit", "when",
            "sql_expr", "coalesce", "concat", "concat_str",
            "all", "count", "first", "last", "len", "max", "mean", "median", "min", "n_unique", "sum"]
 
@@ -79,6 +79,12 @@ scan_ndjson = read_ndjson = read_json
 def call(name, *args, **kwargs):
     """A procedure, called on the current connection (`Pondra.call`)."""
     return current().call(name, *args, **kwargs)
+
+
+def run(file, **params):
+    """A file run on the current connection (`Pondra.run`): in a file the lake runs, another of
+    its files, with these parameters."""
+    return current().run(file, **params)
 
 
 def secret(name):

@@ -1,0 +1,3 @@
+=== real R2, round 26 (ADR-034)
+=== harness.py upsert --s3
+exit=124

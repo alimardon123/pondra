@@ -1,0 +1,16 @@
+=== simulated R2, round 27
+08:55:07 start adopted
+08:56:21 adopted exit=0
+08:56:21 start writes
+08:57:25 writes exit=0
+08:57:25 start ids
+08:58:46 ids exit=0
+08:58:46 start changes
+09:02:13 changes exit=0
+09:02:13 start insert
+09:02:20 insert exit=0
+09:02:20 start serverless
+09:04:04 serverless exit=0
+09:04:04 start crash
+09:20:46 crash exit=0
+09:20:46 SIM_DONE

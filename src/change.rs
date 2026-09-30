@@ -351,7 +351,7 @@ async fn commit(lake: &Lake, seq: &Sequencer, table: &str, meta: &TableMeta, old
             if let Some(f) = lake.ids.take(a.batch.num_rows() as u64) {
                 break f;
             }
-            lake.ids.refill(seq.reserve().await?.0);
+            lake.ids.refill(seq.block().await?);
         };
         a.batch = sys::stamp(&a.batch, first)?;
     }

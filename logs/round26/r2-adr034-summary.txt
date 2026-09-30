@@ -1,0 +1,10 @@
+=== real R2, round 26 (ADR-034: files replaced in place, the console)
+06:15:55 start external
+06:16:55 external exit=0
+06:16:55 start server
+06:22:43 server exit=1
+06:22:43 start fence
+06:23:18 fence exit=1
+06:23:18 start upsert
+06:48:18 upsert exit=124
+DONE

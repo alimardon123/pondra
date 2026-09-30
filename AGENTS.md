@@ -2,7 +2,7 @@
 
 Read this first, then `README.md` (what it does), `docs/adr-005-every-node-writes.md` (why it
 works this way) and `docs/adr-028-one-vocabulary-and-open-writes.md` (the latest round;
-`docs/adr-029-anyones-compute-one-catalog.md` is the next design, proposed).
+`docs/adr-029-anyones-compute-one-catalog.md`, phase 1 built in round 27, phase 2 next).
 `docs/prototype-status.md` has the measured numbers and what's left.
 
 ## What this is
@@ -281,6 +281,15 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
     `j/`, ticks `jt/`) run on the leader, each tick once.
   - **`POST /sql`** takes several statements (`routines::statements`) and `$name` parameters
     (`routines::bind`); MCP lists every procedure as a tool.
+  - **Other engines' writes** (ADR-029, `adopt.rs`, `iceberg.rs`): an append through the REST
+    catalog is recorded as written (footers checked, lineage given), or copied when the table is
+    followed or has renamed columns; the catalog makes, renames and drops tables, and publishes
+    each table's layout for writers.
+  - **The workspace** (ADR-033, `workspace.rs`): `CALL run('etl/orders.sql', day =>
+    …)` runs a file of the lake's as its caller: a `.sql` file through `routines::script`, a `.py`
+    file and a notebook's Python cells in a worker of the run's own (`python::ask_session`, the
+    values as variables), `%%sql` cells as scripts. `routines::one` and `start` hand `run` here;
+    the run is logged as `files/<path>@<version>`.
 - **Files and other engines' tables, anywhere** (round 23, ADR-026). A file, folder or glob
   (`'s3://b/*.parquet'`, `read_csv(…)`), another engine's table (`delta_scan`, `iceberg_scan`), a
   topic (`'kafka://brokers/topic'`) or a name under a catalog attached with `ATTACH … (TYPE delta
@@ -938,8 +947,8 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
 146. **The console's files are tagged by their contents** (`console::FILES`: a hash, `no-cache`,
    `304` on a match), so a new binary's console is never a stale one; gzipped when the browser
    takes it; the console's own scripts and style sheet served without whole-line comments,
-   blank lines and indentation (`console::lean`), so they hold no string or template literal
-   over several lines. `console_check.py` (every part runs the served code; `budget`: the 304s).
+   blank lines and indentation (`console::lean`: a comment after code too, when no quote or `/`
+   follows its `//`), so they hold no string or template literal over several lines. `console_check.py` (every part runs the served code; `budget`: the 304s).
 147. **A lake's own files are readable by its readers** (`ext::own_file`), and `GET /objects` reads
    the catalog only (no query). `harness.py external`, `console_check.py` (a file read as a
    table).
@@ -960,6 +969,42 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    from the state the one before left (a block comment, a quote, a triple-quoted string), and
    again only as far as a change moves that state. `console_check.py` (`budget`: the lines drawn
    equal to the whole text highlighted, after edits that open and close comments and quotes).
+151. **`run` is Pondra's own procedure** (`workspace.rs`, ADR-033): `CALL run('path', name =>
+   value…)` runs a file of the lake's (`.sql`, `.py`, `.ipynb`, or `notebooks/<name>`: its newest
+   version), never a procedure of that name (`CREATE PROCEDURE run` is refused). Its values are
+   worked out once, as the caller, and bound, never pasted in (`routines::bind`: every `$name`
+   missing is named). A file's run is a row of `pondra.runs` named `files/<path>@<version>`, the
+   version that ran; its statements get the job's parts, so a retried run writes once. `harness.py
+   workspace`.
+152. **A file that runs Python needs an admin** (`workspace::run`): a `.py` file, or a notebook with
+   a Python cell, runs code on the node, as `DO` does; a writer runs `.sql` files with its own
+   rights for each statement, a reader none. Runs inside runs stop 16 deep. `harness.py workspace`.
+153. **A file is a file, whoever wrote it** (ADR-029 §1, `adopt.rs`): another engine's appended
+   file is recorded where it was written, never copied, once its footer shows it holds the
+   manifest's rows, the table's types (by field id, else name), no NULL in a NOT NULL column and
+   one partition value; its `lineage` (a first row id, the commit that recorded it, its time)
+   gives its rows' system columns, `_row_id` by the row's place in the file (Parquet's row number:
+   `scan::adopted`), in every read (`query::read_files`, `files_once`: merges, purges); a merge
+   writes them out. Copied instead (round 25's path) when views or tasks follow the table or it
+   has a renamed or dropped column (Delta readers go by name: `adopt::fits_as_written`). Pondra's
+   own files written without a leader take lineage too, never a rewrite. `harness.py adopted`,
+   `writes`.
+154. **A table's layout is published for writers** (`iceberg::Layout`): `partition_by` as partition
+   spec 1 (spec 0, none, stays for manifests written before), every file's partition record in its
+   manifest entry; a `cluster_by` on one column as the sort order; a key as identifier fields
+   (required). A new version is published when the schema or layout changes, not only the files
+   (`Published::shape`), and at once after `ALTER TABLE … COLUMN`; a renamed column is in the name
+   mapping by both names. `harness.py adopted`.
+155. **Row ids and log places can't wrap** (ADR-029 §11): row-id blocks come from their own counter
+   (catalog `b`, moving only when a node or a bulk write takes a block: `log::To::block`,
+   `reserve`), never from commit numbers; a log row's place is `log::ord` (segment << 24, then its
+   row), and a segment with more of a table's rows than that takes the numbers after it
+   (`log::span`), which a Kafka fetch looks back over. `harness.py ids`.
+156. **The REST catalog makes, renames and drops tables as the SQL does** (`iceberg::create`,
+   `drop_table`, `rename`): each is the statement, run as the caller (DDL: an admin's); what
+   Pondra's tables can't be (a type, a spec of two fields or by bucket, a descending order, a
+   staged create) is refused by name, and a table made answers its first published version.
+   `harness.py adopted`.
 
 ## Tests: run these before and after any change
 
@@ -1081,13 +1126,29 @@ Practical notes for an agent working here:
 - Node stderr goes to `/tmp/pondra-<port>-<id>.stderr`; that's where "restarting to rejoin",
   "slow tiering" and panics show up.
 
-## State of the work (2026-09-29, round 26)
+## State of the work (2026-09-30, round 27)
 
 Everything in `docs/prototype-status.md` passes on local disk and on simulated R2. The round-11
 additions (manifests, partitions, shuffles, memory limits, Arrow Flight) also ran against real
 R2; round 12's are in `logs/round12/`, round 13's in `logs/round13/`, round 14's in
 `logs/round14/`, round 15's in `logs/round15/`, round 16's in `logs/round16/`, round 17's in `logs/round17/`,
 round 18's in `logs/round18/`, round 19's in `logs/round19/`, round 20's in `logs/round20/`, round 21's in `logs/round21/`, round 22's in `logs/round22/`, round 23's in `logs/round23/`, round 24's in `logs/round24/`, round 25's in `logs/round25/` and round 26's in `logs/round26/`.
+
+**Round 27 (ADR-029 phase 1): other engines' appends as written.** An append through the Iceberg
+catalog costs the node its files' footers and a commit, not a copy (a million rows: 0.01 s of its
+CPU against 0.24 s); the files keep their lineage for their rows' system columns until a merge
+writes them out; tables made, renamed and dropped through the catalog; the layout published
+(partition spec, sort order, identifier fields); row ids from blocks of their own and log places
+that can't wrap (invariants 153–156). Followers fed from the files and the feed seeing file
+commits moved to round 28.
+
+**The workspace (ADR-033), after round 26:** the lake's files run as jobs, `CALL run('etl/orders.sql',
+day => …)` from every door (HTTP, Postgres, MCP, Python's and JavaScript's `db.run`,
+`pondra.run` in a file, `pondra.start('run', …)`, tasks); `.sql` files with `$name`s bound, `.py`
+files with their values as variables, notebooks with a `parameters` cell (papermill's) and a saved
+one by name; files running files, 16 deep at most; each run a row of `pondra.runs` named
+`files/<path>@<version>`. In the console: a SQL file's parameters bar, a file's Run as a job and
+Schedule…, and Runs listing the node's runs and schedules (invariants 151, 152).
 
 **Round 26, continued (ADR-034): the console as the canvas drew it.** Tabs of notebooks, SQL,
 Python, data and text files; Data and Workspace on the left (a filter; either view moves to the

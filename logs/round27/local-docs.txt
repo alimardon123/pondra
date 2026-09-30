@@ -1,0 +1,388 @@
+=== docs_check.py --offset 2000 (every page): 37 pages ok; 12 failed only because the offset put HTTP on port 10080, which Node's fetch refuses ('bad port')
+ok   site/src/content/docs/concepts/compared.mdx (0 examples)
+ok   site/src/content/docs/concepts/design-notes.mdx (0 examples)
+ok   site/src/content/docs/concepts/freshness-and-guarantees.mdx (5 examples)
+ok   site/src/content/docs/concepts/how-it-works.mdx (4 examples)
+FAIL site/src/content/docs/concepts/keyed-tables.mdx (3 examples)
+     at site/src/content/docs/concepts/keyed-tables.mdx:37 (js):
+node:internal/deps/undici/undici:14976
+      Error.captureStackTrace(err);
+            ^
+
+TypeError: fetch failed
+    at node:internal/deps/undici/undici:14976:13
+    at async Pondra.request (file:///home/claude/pondra/js/index.js:34:15)
+    at async Pondra.append (file:///home/claude/pondra/js/index.js:85:23)
+    at async file:///tmp/pondra-docs-kfgp74ts/[eval1]:3:1 {
+  [cause]: Error: bad port
+      at makeNetworkError (node:internal/deps/undici/undici:9495:35)
+      at mainFetch (node:internal/deps/undici/undici:10721:20)
+      at fetching (node:internal/deps/undici/undici:10707:7)
+      at fetch (node:internal/deps/undici/undici:10576:20)
+      at fetch (node:internal/deps/undici/undici:14974:10)
+      at fetch (node:internal/bootstrap/web/exposed-window-or-worker:75:12)
+      at Pondra.request (file:///home/claude/pondra/js/index.js:34:21)
+      at Pondra.append (file:///home/claude/pondra/js/index.js:85:34)
+      at async file:///tmp/pondra-docs-kfgp74ts/[eval1]:3:1
+}
+
+Node.js v22.22.2
+
+
+ok   site/src/content/docs/concepts/lake-format.mdx (3 examples)
+ok   site/src/content/docs/concepts/performance.mdx (5 examples)
+ok   site/src/content/docs/guides/ai-and-files.mdx (12 examples)
+FAIL site/src/content/docs/guides/change-rows.mdx (15 examples)
+     at site/src/content/docs/guides/change-rows.mdx:308 (js):
+node:internal/deps/undici/undici:14976
+      Error.captureStackTrace(err);
+            ^
+
+TypeError: fetch failed
+    at node:internal/deps/undici/undici:14976:13
+    at process.processTicksAndRejections (node:internal/process/task_queues:103:5)
+    at async Pondra.request (file:///home/claude/pondra/js/index.js:34:15)
+    at async Pondra.sql (file:///home/claude/pondra/js/index.js:45:26)
+    at async file:///tmp/pondra-docs-1s0a_cl6/[eval1]:4:1 {
+  [cause]: Error: bad port
+      at makeNetworkError (node:internal/deps/undici/undici:9495:35)
+      at mainFetch (node:internal/deps/undici/undici:10721:20)
+      at fetching (node:internal/deps/undici/undici:10707:7)
+      at fetch (node:internal/deps/undici/undici:10576:20)
+      at fetch (node:internal/deps/undici/undici:14974:10)
+      at fetch (node:internal/bootstrap/web/exposed-window-or-worker:75:12)
+      at Pondra.request (file:///home/claude/pondra/js/index.js:34:21)
+      at Pondra.sql (file:///home/claude/pondra/js/index.js:45:37)
+      at file:///tmp/pondra-docs-1s0a_cl6/[eval1]:4:10
+      at ModuleJob.run (node:internal/modules/esm/module_job:343:25)
+}
+
+Node.js v22.22.2
+
+
+ok   site/src/content/docs/guides/clusters.mdx (10 examples)
+ok   site/src/content/docs/guides/dataframes.mdx (15 examples)
+ok   site/src/content/docs/guides/dbt-and-bi.mdx (0 examples)
+ok   site/src/content/docs/guides/files-and-other-lakes.mdx (15 examples)
+FAIL site/src/content/docs/guides/functions-and-procedures.mdx (14 examples)
+     at site/src/content/docs/guides/functions-and-procedures.mdx:235 (js):
+node:internal/deps/undici/undici:14976
+      Error.captureStackTrace(err);
+            ^
+
+TypeError: fetch failed
+    at node:internal/deps/undici/undici:14976:13
+    at process.processTicksAndRejections (node:internal/process/task_queues:103:5)
+    at async Pondra.request (file:///home/claude/pondra/js/index.js:34:15)
+    at async Pondra.sql (file:///home/claude/pondra/js/index.js:46:13)
+    at async file:///tmp/pondra-docs-aiol34te/[eval1]:3:1 {
+  [cause]: Error: bad port
+      at makeNetworkError (node:internal/deps/undici/undici:9495:35)
+      at mainFetch (node:internal/deps/undici/undici:10721:20)
+      at fetching (node:internal/deps/undici/undici:10707:7)
+      at fetch (node:internal/deps/undici/undici:10576:20)
+      at fetch (node:internal/deps/undici/undici:14974:10)
+      at fetch (node:internal/bootstrap/web/exposed-window-or-worker:75:12)
+      at Pondra.request (file:///home/claude/pondra/js/index.js:34:21)
+      at Pondra.sql (file:///home/claude/pondra/js/index.js:46:24)
+      at Pondra.call (file:///home/claude/pondra/js/index.js:62:17)
+      at file:///tmp/pondra-docs-aiol34te/[eval1]:3:10
+}
+
+Node.js v22.22.2
+
+
+ok   site/src/content/docs/guides/index.md (0 examples)
+ok   site/src/content/docs/guides/kafka.mdx (16 examples)
+FAIL site/src/content/docs/guides/load-data.mdx (2 examples)
+     at site/src/content/docs/guides/load-data.mdx:51 (js):
+node:internal/deps/undici/undici:14976
+      Error.captureStackTrace(err);
+            ^
+
+TypeError: fetch failed
+    at node:internal/deps/undici/undici:14976:13
+    at async Pondra.request (file:///home/claude/pondra/js/index.js:34:15)
+    at async Pondra.append (file:///home/claude/pondra/js/index.js:85:23)
+    at async file:///tmp/pondra-docs-t6i9_3k5/[eval1]:3:1 {
+  [cause]: Error: bad port
+      at makeNetworkError (node:internal/deps/undici/undici:9495:35)
+      at mainFetch (node:internal/deps/undici/undici:10721:20)
+      at fetching (node:internal/deps/undici/undici:10707:7)
+      at fetch (node:internal/deps/undici/undici:10576:20)
+      at fetch (node:internal/deps/undici/undici:14974:10)
+      at fetch (node:internal/bootstrap/web/exposed-window-or-worker:75:12)
+      at Pondra.request (file:///home/claude/pondra/js/index.js:34:21)
+      at Pondra.append (file:///home/claude/pondra/js/index.js:85:34)
+      at async file:///tmp/pondra-docs-t6i9_3k5/[eval1]:3:1
+}
+
+Node.js v22.22.2
+
+
+ok   site/src/content/docs/guides/notebooks.mdx (6 examples)
+ok   site/src/content/docs/guides/object-storage.mdx (8 examples)
+ok   site/src/content/docs/guides/other-engines.mdx (14 examples)
+ok   site/src/content/docs/guides/pyspark.mdx (8 examples)
+FAIL site/src/content/docs/guides/query.mdx (3 examples)
+     at site/src/content/docs/guides/query.mdx:44 (js):
+node:internal/deps/undici/undici:14976
+      Error.captureStackTrace(err);
+            ^
+
+TypeError: fetch failed
+    at node:internal/deps/undici/undici:14976:13
+    at process.processTicksAndRejections (node:internal/process/task_queues:103:5)
+    at async Pondra.request (file:///home/claude/pondra/js/index.js:34:15)
+    at async Pondra.sql (file:///home/claude/pondra/js/index.js:45:26)
+    at async file:///tmp/pondra-docs-lfan_949/[eval1]:3:13 {
+  [cause]: Error: bad port
+      at makeNetworkError (node:internal/deps/undici/undici:9495:35)
+      at mainFetch (node:internal/deps/undici/undici:10721:20)
+      at fetching (node:internal/deps/undici/undici:10707:7)
+      at fetch (node:internal/deps/undici/undici:10576:20)
+      at fetch (node:internal/deps/undici/undici:14974:10)
+      at fetch (node:internal/bootstrap/web/exposed-window-or-worker:75:12)
+      at Pondra.request (file:///home/claude/pondra/js/index.js:34:21)
+      at Pondra.sql (file:///home/claude/pondra/js/index.js:45:37)
+      at file:///tmp/pondra-docs-lfan_949/[eval1]:3:22
+      at ModuleJob.run (node:internal/modules/esm/module_job:343:25)
+}
+
+Node.js v22.22.2
+
+
+%5|1790740641.188|PARTCNT|rdkafka#producer-2| [thrd:sasl_plaintext://127.0.0.1:9486/2111780662]: Topic notes (id AAAAAAAAAAAAAAAAAAAAAA) partition count changed from 1 to 0
+ok   site/src/content/docs/guides/security.mdx (13 examples)
+ok   site/src/content/docs/guides/server.mdx (1 examples)
+FAIL site/src/content/docs/guides/streaming.mdx (3 examples)
+     at site/src/content/docs/guides/streaming.mdx:42 (js):
+node:internal/deps/undici/undici:14976
+      Error.captureStackTrace(err);
+            ^
+
+TypeError: fetch failed
+    at node:internal/deps/undici/undici:14976:13
+    at process.processTicksAndRejections (node:internal/process/task_queues:103:5)
+    at async Pondra.request (file:///home/claude/pondra/js/index.js:34:15)
+    at async Pondra.sql (file:///home/claude/pondra/js/index.js:45:26)
+    at async file:///tmp/pondra-docs-df5tdjo7/[eval1]:3:1 {
+  [cause]: Error: bad port
+      at makeNetworkError (node:internal/deps/undici/undici:9495:35)
+      at mainFetch (node:internal/deps/undici/undici:10721:20)
+      at fetching (node:internal/deps/undici/undici:10707:7)
+      at fetch (node:internal/deps/undici/undici:10576:20)
+      at fetch (node:internal/deps/undici/undici:14974:10)
+      at fetch (node:internal/bootstrap/web/exposed-window-or-worker:75:12)
+      at Pondra.request (file:///home/claude/pondra/js/index.js:34:21)
+      at Pondra.sql (file:///home/claude/pondra/js/index.js:45:37)
+      at Pondra.view (file:///home/claude/pondra/js/index.js:108:17)
+      at file:///tmp/pondra-docs-df5tdjo7/[eval1]:3:10
+}
+
+Node.js v22.22.2
+
+
+FAIL site/src/content/docs/guides/tables.mdx (2 examples)
+     at site/src/content/docs/guides/tables.mdx:30 (js):
+node:internal/deps/undici/undici:14976
+      Error.captureStackTrace(err);
+            ^
+
+TypeError: fetch failed
+    at node:internal/deps/undici/undici:14976:13
+    at process.processTicksAndRejections (node:internal/process/task_queues:103:5)
+    at async Pondra.request (file:///home/claude/pondra/js/index.js:34:15)
+    at async Pondra.sql (file:///home/claude/pondra/js/index.js:45:26)
+    at async file:///tmp/pondra-docs-cb93op2p/[eval1]:3:1 {
+  [cause]: Error: bad port
+      at makeNetworkError (node:internal/deps/undici/undici:9495:35)
+      at mainFetch (node:internal/deps/undici/undici:10721:20)
+      at fetching (node:internal/deps/undici/undici:10707:7)
+      at fetch (node:internal/deps/undici/undici:10576:20)
+      at fetch (node:internal/deps/undici/undici:14974:10)
+      at fetch (node:internal/bootstrap/web/exposed-window-or-worker:75:12)
+      at Pondra.request (file:///home/claude/pondra/js/index.js:34:21)
+      at Pondra.sql (file:///home/claude/pondra/js/index.js:45:37)
+      at file:///tmp/pondra-docs-cb93op2p/[eval1]:3:10
+      at ModuleJob.run (node:internal/modules/esm/module_job:343:25)
+}
+
+Node.js v22.22.2
+
+
+FAIL site/src/content/docs/guides/workspace.mdx (5 examples)
+     at site/src/content/docs/guides/workspace.mdx:90 (js):
+node:internal/deps/undici/undici:14976
+      Error.captureStackTrace(err);
+            ^
+
+TypeError: fetch failed
+    at node:internal/deps/undici/undici:14976:13
+    at process.processTicksAndRejections (node:internal/process/task_queues:103:5)
+    at async Pondra.request (file:///home/claude/pondra/js/index.js:34:15)
+    at async Pondra.sql (file:///home/claude/pondra/js/index.js:46:13)
+    at async file:///tmp/pondra-docs-4arebwgw/[eval1]:3:1 {
+  [cause]: Error: bad port
+      at makeNetworkError (node:internal/deps/undici/undici:9495:35)
+      at mainFetch (node:internal/deps/undici/undici:10721:20)
+      at fetching (node:internal/deps/undici/undici:10707:7)
+      at fetch (node:internal/deps/undici/undici:10576:20)
+      at fetch (node:internal/deps/undici/undici:14974:10)
+      at fetch (node:internal/bootstrap/web/exposed-window-or-worker:75:12)
+      at Pondra.request (file:///home/claude/pondra/js/index.js:34:21)
+      at Pondra.sql (file:///home/claude/pondra/js/index.js:46:24)
+      at Pondra.run (file:///home/claude/pondra/js/index.js:57:17)
+      at file:///tmp/pondra-docs-4arebwgw/[eval1]:3:10
+}
+
+Node.js v22.22.2
+
+
+ok   site/src/content/docs/index.mdx (2 examples)
+ok   site/src/content/docs/reference/cli.mdx (4 examples)
+ok   site/src/content/docs/reference/environment.mdx (1 examples)
+{"time":"2026-09-30T08:57:28.529300107+05:00","level":"ERROR","msg":"FlightSQL endpoint DoGet failed","connection_id":"conn-3985ed376ba2","statement_id":"stmt-be8631c1f79c","endpointIndex":0,"numEndpoints":1,"ticketBytes":78,"locations":"<empty: using default client connection>","err":"rpc error: code = Canceled desc = context canceled","elapsed":"no batches received before failure; elapsed=174.379µs"}
+ok   site/src/content/docs/reference/flight.mdx (9 examples)
+ok   site/src/content/docs/reference/frames.mdx (12 examples)
+ok   site/src/content/docs/reference/functions.mdx (15 examples)
+ok   site/src/content/docs/reference/http.mdx (6 examples)
+ok   site/src/content/docs/reference/iceberg-rest.mdx (6 examples)
+FAIL site/src/content/docs/reference/javascript.mdx (0 examples)
+     at site/src/content/docs/reference/javascript.mdx:16 (js):
+node:internal/deps/undici/undici:14976
+      Error.captureStackTrace(err);
+            ^
+
+TypeError: fetch failed
+    at node:internal/deps/undici/undici:14976:13
+    at process.processTicksAndRejections (node:internal/process/task_queues:103:5)
+    at async Pondra.request (file:///home/claude/pondra/js/index.js:34:15)
+    at async Pondra.sql (file:///home/claude/pondra/js/index.js:45:26)
+    at async file:///tmp/pondra-docs-ivzfnsum/[eval1]:4:13 {
+  [cause]: Error: bad port
+      at makeNetworkError (node:internal/deps/undici/undici:9495:35)
+      at mainFetch (node:internal/deps/undici/undici:10721:20)
+      at fetching (node:internal/deps/undici/undici:10707:7)
+      at fetch (node:internal/deps/undici/undici:10576:20)
+      at fetch (node:internal/deps/undici/undici:14974:10)
+      at fetch (node:internal/bootstrap/web/exposed-window-or-worker:75:12)
+      at Pondra.request (file:///home/claude/pondra/js/index.js:34:21)
+      at Pondra.sql (file:///home/claude/pondra/js/index.js:45:37)
+      at file:///tmp/pondra-docs-ivzfnsum/[eval1]:4:22
+      at ModuleJob.run (node:internal/modules/esm/module_job:343:25)
+}
+
+Node.js v22.22.2
+
+
+ok   site/src/content/docs/reference/kafka-protocol.mdx (13 examples)
+ok   site/src/content/docs/reference/mcp.mdx (3 examples)
+ok   site/src/content/docs/reference/names.mdx (10 examples)
+ok   site/src/content/docs/reference/postgres.mdx (10 examples)
+ok   site/src/content/docs/reference/python.mdx (13 examples)
+FAIL site/src/content/docs/reference/sql.mdx (2 examples)
+     at site/src/content/docs/reference/sql.mdx:82 (js):
+node:internal/deps/undici/undici:14976
+      Error.captureStackTrace(err);
+            ^
+
+TypeError: fetch failed
+    at node:internal/deps/undici/undici:14976:13
+    at process.processTicksAndRejections (node:internal/process/task_queues:103:5)
+    at async Pondra.request (file:///home/claude/pondra/js/index.js:34:15)
+    at async Pondra.sql (file:///home/claude/pondra/js/index.js:46:13)
+    at async file:///tmp/pondra-docs-efmbawhr/[eval1]:3:13 {
+  [cause]: Error: bad port
+      at makeNetworkError (node:internal/deps/undici/undici:9495:35)
+      at mainFetch (node:internal/deps/undici/undici:10721:20)
+      at fetching (node:internal/deps/undici/undici:10707:7)
+      at fetch (node:internal/deps/undici/undici:10576:20)
+      at fetch (node:internal/deps/undici/undici:14974:10)
+      at fetch (node:internal/bootstrap/web/exposed-window-or-worker:75:12)
+      at Pondra.request (file:///home/claude/pondra/js/index.js:34:21)
+      at Pondra.sql (file:///home/claude/pondra/js/index.js:46:24)
+      at file:///tmp/pondra-docs-efmbawhr/[eval1]:3:22
+      at ModuleJob.run (node:internal/modules/esm/module_job:343:25)
+}
+
+Node.js v22.22.2
+
+
+ok   site/src/content/docs/reference/system-columns.mdx (9 examples)
+ok   site/src/content/docs/reference/table-options.mdx (18 examples)
+ok   site/src/content/docs/start/console.mdx (6 examples)
+FAIL site/src/content/docs/start/first-lake.mdx (2 examples)
+     at site/src/content/docs/start/first-lake.mdx:58 (js):
+node:internal/deps/undici/undici:14976
+      Error.captureStackTrace(err);
+            ^
+
+TypeError: fetch failed
+    at node:internal/deps/undici/undici:14976:13
+    at process.processTicksAndRejections (node:internal/process/task_queues:103:5)
+    at async Pondra.request (file:///home/claude/pondra/js/index.js:34:15)
+    at async Pondra.sql (file:///home/claude/pondra/js/index.js:45:26)
+    at async file:///tmp/pondra-docs-dmkup1u3/[eval1]:3:1 {
+  [cause]: Error: bad port
+      at makeNetworkError (node:internal/deps/undici/undici:9495:35)
+      at mainFetch (node:internal/deps/undici/undici:10721:20)
+      at fetching (node:internal/deps/undici/undici:10707:7)
+      at fetch (node:internal/deps/undici/undici:10576:20)
+      at fetch (node:internal/deps/undici/undici:14974:10)
+      at fetch (node:internal/bootstrap/web/exposed-window-or-worker:75:12)
+      at Pondra.request (file:///home/claude/pondra/js/index.js:34:21)
+      at Pondra.sql (file:///home/claude/pondra/js/index.js:45:37)
+      at file:///tmp/pondra-docs-dmkup1u3/[eval1]:3:10
+      at ModuleJob.run (node:internal/modules/esm/module_job:343:25)
+}
+
+Node.js v22.22.2
+
+
+ok   site/src/content/docs/start/install.mdx (2 examples)
+ok   site/src/content/docs/start/shell.mdx (6 examples)
+FAIL site/src/content/docs/start/tour.mdx (10 examples)
+     at site/src/content/docs/start/tour.mdx:159 (js):
+node:internal/deps/undici/undici:14976
+      Error.captureStackTrace(err);
+            ^
+
+TypeError: fetch failed
+    at node:internal/deps/undici/undici:14976:13
+    at process.processTicksAndRejections (node:internal/process/task_queues:103:5)
+    at async Pondra.request (file:///home/claude/pondra/js/index.js:34:15)
+    at async Pondra.live (file:///home/claude/pondra/js/index.js:136:15)
+    at async file:///tmp/pondra-docs-lbcw8ef2/[eval1]:8:18 {
+  [cause]: Error: bad port
+      at makeNetworkError (node:internal/deps/undici/undici:9495:35)
+      at mainFetch (node:internal/deps/undici/undici:10721:20)
+      at fetching (node:internal/deps/undici/undici:10707:7)
+      at fetch (node:internal/deps/undici/undici:10576:20)
+      at fetch (node:internal/deps/undici/undici:14974:10)
+      at fetch (node:internal/bootstrap/web/exposed-window-or-worker:75:12)
+      at Pondra.request (file:///home/claude/pondra/js/index.js:34:21)
+      at Pondra.live (file:///home/claude/pondra/js/index.js:136:26)
+      at live.next (<anonymous>)
+      at file:///tmp/pondra-docs-lbcw8ef2/[eval1]:8:18
+}
+
+Node.js v22.22.2
+
+
+{"pages": 49, "examples": 341, "failed": ["site/src/content/docs/concepts/keyed-tables.mdx", "site/src/content/docs/guides/change-rows.mdx", "site/src/content/docs/guides/functions-and-procedures.mdx", "site/src/content/docs/guides/load-data.mdx", "site/src/content/docs/guides/query.mdx", "site/src/content/docs/guides/streaming.mdx", "site/src/content/docs/guides/tables.mdx", "site/src/content/docs/guides/workspace.mdx", "site/src/content/docs/reference/javascript.mdx", "site/src/content/docs/reference/sql.mdx", "site/src/content/docs/start/first-lake.mdx", "site/src/content/docs/start/tour.mdx"], "ok": false}
+
+=== docs_check.py --offset 1000, those 12 pages again
+ok   site/src/content/docs/concepts/keyed-tables.mdx
+ok   site/src/content/docs/guides/change-rows.mdx
+ok   site/src/content/docs/guides/functions-and-procedures.mdx
+ok   site/src/content/docs/guides/load-data.mdx
+ok   site/src/content/docs/guides/query.mdx
+ok   site/src/content/docs/guides/streaming.mdx
+ok   site/src/content/docs/guides/tables.mdx
+ok   site/src/content/docs/guides/workspace.mdx
+ok   site/src/content/docs/reference/javascript.mdx
+ok   site/src/content/docs/reference/sql.mdx
+ok   site/src/content/docs/start/first-lake.mdx
+ok   site/src/content/docs/start/tour.mdx
+{"pages": 12, "examples": 199, "failed": [], "ok": true}

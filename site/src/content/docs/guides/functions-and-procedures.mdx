@@ -432,7 +432,8 @@ print(db.sql("DO LANGUAGE python $$\nround(total * 2, 1)\n$$").rows())
   runs fresh.
 
 Use a procedure when you will run the code again or want it on a schedule. `DO` is for the one-off:
-a fix-up, an experiment, a cell of a notebook.
+a fix-up, an experiment, a cell of a notebook. A file of the lake's (`.sql`, `.py` or a notebook) runs
+as it is with `CALL run('etl/orders.sql', day => …)`: see [Run files as jobs](/pondra/guides/workspace/).
 
 ## Start a call without waiting
 
@@ -468,7 +469,7 @@ DROP TASK nightly;
 ## See what ran
 
 Every procedure call is a row of `pondra.runs`: routine, caller, node, arguments, start, end, status
-(`running`, `ok`, `failed`), notices and error. Rows go after 30 days (`PONDRA_RUNS_DAYS`).
+(`running`, `ok`, `failed`), notices and error. A file's run is named `files/<path>@<version>`. Rows go after 30 days (`PONDRA_RUNS_DAYS`).
 
 ```sql
 SELECT routine, caller, status, notices FROM pondra.runs ORDER BY started DESC LIMIT 3;

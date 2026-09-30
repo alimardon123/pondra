@@ -359,7 +359,7 @@ pub async fn run_job(lake: &Lake, Job { table, meta, kind }: Job) -> Result<Vec<
             let (mut out, s) = (vec![], schema(&meta.columns)?);
             for f in files {
                 let ctx = lake.session_with(1);
-                let rows = ctx.read_parquet(lake.full(&f.path), ParquetReadOptions::default().schema(&s)).await?;
+                let rows = crate::query::files_once(lake, &ctx, &[&f], &meta, &s).await?;
                 let dead = ctx.read_batches(dead_rows(lake, &gone, after, upto).await?.collect().await?)?;
                 let kept = dead.join(rows, datafusion::common::JoinType::RightAnti, &["__id", "__v"], &[crate::sys::ROW_ID, crate::sys::VERSION], None)?.collect().await?;
                 if let Some(new) = write_file(lake, &table, &kept, &keys, true).await? {
@@ -369,10 +369,9 @@ pub async fn run_job(lake: &Lake, Job { table, meta, kind }: Job) -> Result<Vec<
             return Ok(out);
         }
         Kind::Merge { files } => {
-            let paths: Vec<String> = files.iter().map(|f| lake.full(&f.path)).collect();
             let schema = schema(&meta.columns)?;
             let session = lake.session();
-            let read = || session.read_parquet(paths.clone(), ParquetReadOptions::default().schema(&schema));
+            let read = || async { crate::query::files_once(lake, &session, &files.iter().collect::<Vec<_>>(), &meta, &schema).await };
             let rows = match meta.cluster.is_empty() {
                 false if meta.cluster.len() > 1 => {
                     let rows = crate::hilbert::sort(&read().await?.collect().await?, &meta.cluster)?; // (what a merge takes fits: MERGE_BYTES)
@@ -384,10 +383,13 @@ pub async fn run_job(lake: &Lake, Job { table, meta, kind }: Job) -> Result<Vec<
                 // range of a key (data that arrived in order) merge into one that still does.
                 // (Several files in one read come in whatever order they're listed.)
                 true => {
-                    let (ctx, s) = (lake.session_with(1), schema.clone());
-                    let each = futures::stream::iter(paths).then(move |p| {
-                        let (ctx, s) = (ctx.clone(), s.clone());
-                        async move { ctx.read_parquet(p, ParquetReadOptions::default().schema(&s)).await?.execute_stream().await }
+                    let (ctx, s, lake, m) = (lake.session_with(1), schema.clone(), lake.arc(), std::sync::Arc::new(meta.clone()));
+                    let each = futures::stream::iter(files.clone()).then(move |f| {
+                        let (ctx, s, lake, m) = (ctx.clone(), s.clone(), lake.clone(), m.clone());
+                        async move {
+                            let rows = crate::query::files_once(&lake, &ctx, &[&f], &m, &s).await.map_err(|e| datafusion::error::DataFusionError::External(e.into()))?;
+                            rows.execute_stream().await
+                        }
                     });
                     Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(schema.clone(), futures::TryStreamExt::try_flatten(each)))
                 }
@@ -412,7 +414,7 @@ pub async fn run_job(lake: &Lake, Job { table, meta, kind }: Job) -> Result<Vec<
 }
 
 /// A partitioned table's rows, one group per partition value (`day(ts)`: the day, `col`: the value).
-async fn split(spec: &str, batches: Vec<RecordBatch>) -> Result<Vec<(String, Vec<RecordBatch>)>> {
+pub async fn split(spec: &str, batches: Vec<RecordBatch>) -> Result<Vec<(String, Vec<RecordBatch>)>> {
     use datafusion::arrow::{array::{AsArray, UInt32Array}, compute::{concat_batches, take_record_batch}};
     let Some(first) = batches.first() else { return Ok(vec![]) };
     let all = concat_batches(&first.schema(), &batches)?;
@@ -663,7 +665,7 @@ pub async fn write_file(lake: &Lake, table: &str, batches: &[RecordBatch], keys:
         false => Default::default(),
     };
     let sys = batches[0].schema().index_of(crate::sys::ROW_ID).is_ok();
-    Ok(Some(DataFile { path, rows: rows as u64, bytes, ord: 0, whole: false, stats, part: String::new(), nulls, sketch, sys, outside: None }))
+    Ok(Some(DataFile { path, rows: rows as u64, bytes, ord: 0, whole: false, stats, part: String::new(), nulls, sketch, sys, outside: None, lineage: None }))
 }
 
 /// The columns as Iceberg knows them (`iceberg.rs`), each with its field id: a column's place

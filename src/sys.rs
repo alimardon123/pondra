@@ -9,10 +9,11 @@
 //! `SELECT *` leaves them out; a query that names one gets them (`SELECT _row_id, * FROM t`).
 //!
 //! Where they come from: the node that packs a row into the log stamps its `_row_id` from a block
-//! it reserved from the leader (`(commit number << 32) + n`: `Ids`), and so does a bulk INSERT as
-//! it writes its files. `_version` and the times are the commit's: a log row's are its segment's,
-//! read off the catalog (`derive`); tiering writes all four into the Parquet files, and a bulk
-//! INSERT writes the commit number and time it reserved.
+//! it reserved from the leader (`(block << 32) + n`: `Ids`; blocks count on their own, not with
+//! the commits: ADR-029 §11), and so does a bulk INSERT as it writes its files. `_version` and
+//! the times are the commit's: a log row's are its segment's, read off the catalog (`derive`);
+//! tiering writes all four into the Parquet files, and a bulk INSERT writes the commit number and
+//! time it reserved. Another engine's file has none: its lineage gives them (`store::Lineage`).
 use crate::store::TableMeta;
 use anyhow::Result;
 use datafusion::arrow::array::{Array, ArrayRef, AsArray, Int64Array, TimestampMicrosecondArray};
@@ -120,8 +121,8 @@ pub fn holds(dead: &[(i64, i64)], stats: &crate::manifest::Stats) -> bool {
     }
 }
 
-/// A block of row ids reserved from the leader: `(commit number << 32) + n`, n counting up. A
-/// node takes a new block when one runs out (or after a restart: ids are never reused).
+/// A block of row ids reserved from the leader: `(block << 32) + n`, n counting up. A node takes a
+/// new block when one runs out (or after a restart: ids are never reused).
 #[derive(Default)]
 pub struct Ids(std::sync::Mutex<Option<(u64, u64)>>); // (block, next n)
 
@@ -143,7 +144,7 @@ impl Ids {
 
 /// A bulk INSERT's rows with their system columns: ids from `first` on, the commit number and
 /// time the writer reserved (`log::To::reserve`).
-pub fn stamp_new(b: &RecordBatch, first: i64, (n, ms): (u64, u64)) -> Result<RecordBatch> {
+pub fn stamp_new(b: &RecordBatch, first: i64, crate::log::Reserved { version: n, ms, .. }: crate::log::Reserved) -> Result<RecordBatch> {
     let rows = b.num_rows();
     let at = || -> ArrayRef { Arc::new(TimestampMicrosecondArray::from(vec![(ms * 1000) as i64; rows]).with_timezone("UTC")) };
     let b = set(b, ROW_ID, Arc::new(Int64Array::from_iter_values(first..first + rows as i64)))?;
@@ -154,15 +155,18 @@ pub fn stamp_new(b: &RecordBatch, first: i64, (n, ms): (u64, u64)) -> Result<Rec
 
 /// A stream of a bulk INSERT's rows, stamped (`stamp_new`); `next` counts the rows its streams
 /// have taken so far (they share the reservation).
-pub fn stamp_stream(rows: datafusion::execution::SendableRecordBatchStream, next: Arc<std::sync::atomic::AtomicU64>, reserved: (u64, u64)) -> Result<datafusion::execution::SendableRecordBatchStream> {
+pub fn stamp_stream(rows: datafusion::execution::SendableRecordBatchStream, next: Arc<std::sync::atomic::AtomicU64>, reserved: crate::log::Reserved) -> Result<datafusion::execution::SendableRecordBatchStream> {
     use futures::StreamExt;
     let mut fields = rows.schema().fields().to_vec();
     fields.extend(columns().iter().map(|(n, t)| Arc::new(Field::new(n, crate::query::dtype(t).expect("a type"), true))));
     let schema = Arc::new(Schema::new(fields));
     let stamped = rows.map(move |b| {
         let b = b?;
-        let first = (reserved.0 << 32) as i64 + next.fetch_add(b.num_rows() as u64, std::sync::atomic::Ordering::Relaxed) as i64;
-        stamp_new(&b, first, reserved).map_err(|e| datafusion::error::DataFusionError::External(e.into()))
+        let at = next.fetch_add(b.num_rows() as u64, std::sync::atomic::Ordering::Relaxed);
+        if at + b.num_rows() as u64 > 1 << 32 {
+            return Err(datafusion::error::DataFusionError::Execution("an INSERT of more than 4,294,967,296 rows: split it in two".into()));
+        }
+        stamp_new(&b, ((reserved.block << 32) + at) as i64, reserved).map_err(|e| datafusion::error::DataFusionError::External(e.into()))
     });
     Ok(Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(schema, stamped)))
 }

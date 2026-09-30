@@ -33,6 +33,8 @@ struct Published {
     inlined: BTreeMap<String, u64>,    // those files (path -> rows), to see when they change
     snapshots: Vec<(Value, String)>,   // kept, oldest first: (snapshot entry, its manifest list)
     dropped: Vec<(u64, String)>,       // manifests no longer named, deleted once no kept snapshot names them
+    #[serde(default)]
+    shape: u64, // its schema's and layout's (a hash): a version is published when they change too
 }
 
 /// An Iceberg manifest this lake wrote.
@@ -43,6 +45,107 @@ struct Avro {
     files: u64,
     rows: u64,
     seq: u64, // the snapshot that added it; its entries carry this sequence number
+    #[serde(default)]
+    spec: i32, // its partition spec: 0 (none), or 1 (`Layout`)
+}
+
+/// A table's layout as Iceberg says it, for writers to follow (ADR-029 §6): its partition spec
+/// (`partition_by`: identity, or year, month, day or hour of a time; spec 1, since spec 0, no
+/// partitions, is what manifests written before said), its sort order (`cluster_by` on one
+/// column; two or more follow a Hilbert curve, which Iceberg can't say), and its key as the
+/// schema's identifier fields (required, as Iceberg asks; a key is NOT NULL).
+pub struct Layout {
+    partition: Option<(usize, String, DataType)>, // the stored column's place, the transform, its type
+    name: String,                                 // the partition field's name
+    sort: Option<usize>,
+    keys: Vec<usize>,
+}
+
+impl Layout {
+    pub fn of(meta: &TableMeta) -> Layout {
+        let at = |c: &str| meta.columns.iter().position(|(n, _)| n == c);
+        let partition = meta.partition.as_deref().and_then(|p| {
+            let (transform, col) = match p.split_once('(') {
+                Some((f, c)) => (f.trim().to_string(), c.trim_end_matches(')').trim()),
+                None => ("identity".to_string(), p.trim()),
+            };
+            let i = at(col)?;
+            let t = crate::query::dtype(&meta.columns[i].1).ok()?;
+            let time = matches!(t, DataType::Date32 | DataType::Timestamp(TimeUnit::Microsecond, _));
+            let fits = match transform.as_str() {
+                "identity" => time || matches!(t, DataType::Int32 | DataType::Int64 | DataType::Utf8 | DataType::Boolean),
+                _ => time,
+            };
+            fits.then_some((i, transform, t))
+        });
+        let name = partition.as_ref().map_or(String::new(), |(i, t, _)| match t.as_str() {
+            "identity" => meta.name_of(&meta.columns[*i].0).to_string(),
+            t => format!("{}_{t}", meta.name_of(&meta.columns[*i].0)),
+        });
+        let sort = (meta.cluster.len() == 1 && meta.key.is_empty()).then(|| at(&meta.cluster[0])).flatten();
+        Layout { partition, name, sort, keys: meta.key.iter().filter_map(|k| at(k)).collect() }
+    }
+
+    /// Does the table publish its partitions (or have none)? A writer lays out its files so only then.
+    pub fn followable(meta: &TableMeta) -> bool { meta.partition.is_none() || Layout::of(meta).partition.is_some() }
+
+    fn spec(&self) -> Value {
+        match &self.partition {
+            Some((i, t, _)) => json!([{"source-id": i + 1, "field-id": 1000, "name": self.name, "transform": t}]),
+            None => json!([]),
+        }
+    }
+
+    /// The partition record's Avro fields, as manifests carry them.
+    fn avro(&self) -> Vec<Value> {
+        let Some((_, t, dt)) = &self.partition else { return vec![] };
+        let kind = match (t.as_str(), dt) {
+            ("identity", DataType::Int32) => json!("int"),
+            ("identity", DataType::Int64) => json!("long"),
+            ("identity", DataType::Utf8) => json!("string"),
+            ("identity", DataType::Boolean) => json!("boolean"),
+            ("identity", DataType::Date32) => json!({"type": "int", "logicalType": "date"}),
+            ("identity", _) => json!({"type": "long", "logicalType": "timestamp-micros", "adjust-to-utc": matches!(dt, DataType::Timestamp(_, Some(_)))}),
+            _ => json!("int"),
+        };
+        vec![opt(&self.name, 1000, kind)]
+    }
+
+    /// A file's partition record, Avro-encoded, from its partition value (`DataFile::part`: the
+    /// text `tier::split` gives it).
+    fn record(&self, part: &str) -> Result<Vec<u8>> {
+        use datafusion::arrow::array::{AsArray, StringArray};
+        use datafusion::arrow::datatypes::{Date32Type, Int32Type, Int64Type, TimestampMicrosecondType};
+        let Some((_, t, dt)) = &self.partition else { return Ok(vec![]) };
+        if part == "null" {
+            return Ok(vec![0]); // (the union's null)
+        }
+        let mut b = vec![];
+        long(&mut b, 1);
+        let text: datafusion::arrow::array::ArrayRef = std::sync::Arc::new(StringArray::from(vec![part]));
+        let micros = |a: datafusion::arrow::array::ArrayRef| a.as_primitive::<TimestampMicrosecondType>().value(0);
+        let as_time = || -> Result<i64> { Ok(micros(datafusion::arrow::compute::cast(&text, &DataType::Timestamp(TimeUnit::Microsecond, None))?)) };
+        match (t.as_str(), dt) {
+            ("identity", DataType::Utf8) => bytes(&mut b, part.as_bytes()),
+            ("identity", DataType::Boolean) => b.push((part == "true") as u8),
+            ("identity", DataType::Int32) => long(&mut b, datafusion::arrow::compute::cast(&text, dt)?.as_primitive::<Int32Type>().value(0) as i64),
+            ("identity", DataType::Int64) => long(&mut b, datafusion::arrow::compute::cast(&text, dt)?.as_primitive::<Int64Type>().value(0)),
+            ("identity", DataType::Date32) => long(&mut b, datafusion::arrow::compute::cast(&text, dt)?.as_primitive::<Date32Type>().value(0) as i64),
+            ("identity", _) => long(&mut b, micros(datafusion::arrow::compute::cast(&text, dt)?)),
+            (unit, _) => {
+                use chrono::Datelike;
+                let us = as_time()?;
+                let d = chrono::DateTime::from_timestamp_micros(us).context("a time out of range")?.naive_utc();
+                long(&mut b, match unit {
+                    "year" => d.year() as i64 - 1970,
+                    "month" => (d.year() as i64 - 1970) * 12 + d.month0() as i64,
+                    "day" => us.div_euclid(86_400_000_000),
+                    _ => us.div_euclid(3_600_000_000),
+                });
+            }
+        }
+        Ok(b)
+    }
 }
 
 /// The table's next Iceberg version, if its files changed (or `named`: another engine's commit
@@ -56,7 +159,10 @@ pub async fn publish(lake: &Lake, table: &str, meta: &TableMeta, named: Option<&
     let fresh: Vec<&crate::manifest::Manifest> = parts.manifests.iter().filter(|m| !st.manifests.contains_key(&m.path)).collect();
     let went: Vec<String> = st.manifests.keys().filter(|p| !parts.manifests.iter().any(|m| m.path == **p)).cloned().collect();
     let inline_changed = st.inline.is_none() != parts.inline.is_empty() || st.inlined != inlined;
-    if st.version > 0 && fresh.is_empty() && went.is_empty() && !inline_changed && named.is_none() {
+    let layout = Layout::of(meta);
+    let shape = std::hash::BuildHasher::hash_one(&std::hash::BuildHasherDefault::<std::collections::hash_map::DefaultHasher>::default(),
+        json!([fields, layout.spec(), layout.sort, layout.keys, meta.columns.iter().map(|(c, _)| meta.name_of(c)).collect::<Vec<_>>()]).to_string()); // (a rename, say)
+    if st.version > 0 && fresh.is_empty() && went.is_empty() && !inline_changed && named.is_none() && st.shape == shape {
         return Ok(None);
     }
     if st.uuid.is_empty() {
@@ -71,15 +177,15 @@ pub async fn publish(lake: &Lake, table: &str, meta: &TableMeta, named: Option<&
     // Version N is sequence number N; its snapshot id is N too, unless another engine's commit
     // named it (`record`), so the engine finds its snapshot.
     let id = named.map_or(v as i64, |n| n.id);
-    let schema = json!({"type": "struct", "schema-id": 0, "fields": fields});
+    let schema = json!({"type": "struct", "schema-id": 0, "fields": fields, "identifier-field-ids": layout.keys.iter().map(|i| i + 1).collect::<Vec<_>>()});
     // The manifests this snapshot adds: one per new manifest of ours, and one for the inline files.
     let mut written = vec![];
     for m in &fresh {
         let files = crate::manifest::files(lake, m).await?;
-        written.push((Some(m.path.clone()), write_manifest(lake, &dir, &schema, v, id, &files).await?));
+        written.push((Some(m.path.clone()), write_manifest(lake, &dir, &schema, &layout, v, id, &files).await?));
     }
     if inline_changed && !parts.inline.is_empty() {
-        written.push((None, write_manifest(lake, &dir, &schema, v, id, &parts.inline).await?));
+        written.push((None, write_manifest(lake, &dir, &schema, &layout, v, id, &parts.inline).await?));
     }
     // The snapshot's manifest list: the ones written now, plus the ones it keeps from before.
     let kept: Vec<Avro> = parts.manifests.iter().filter_map(|m| st.manifests.get(&m.path).cloned()).collect();
@@ -90,7 +196,7 @@ pub async fn publish(lake: &Lake, table: &str, meta: &TableMeta, named: Option<&
     let all: Vec<Avro> = written.iter().map(|(_, a)| a.clone()).chain(kept).chain(inline.clone().filter(|_| !inline_changed)).collect();
     let entries: Vec<Vec<u8>> = all.iter().map(|a| {
         let new = a.seq == v;
-        manifest_file(&lake.full(&a.path), a.bytes as usize, v, a.seq, id, [if new { a.files as usize } else { 0 }, if new { 0 } else { a.files as usize }],
+        manifest_file(&lake.full(&a.path), a.bytes as usize, a.spec, v, a.seq, id, [if new { a.files as usize } else { 0 }, if new { 0 } else { a.files as usize }],
                       [if new { a.rows as i64 } else { 0 }, if new { 0 } else { a.rows as i64 }])
     }).collect();
     let list = format!("{dir}/snap-{v}-{}.avro", uuid::Uuid::new_v4());
@@ -110,7 +216,7 @@ pub async fn publish(lake: &Lake, table: &str, meta: &TableMeta, named: Option<&
     }
     st.snapshots.push((snapshot, list));
     let gone: Vec<(Value, String)> = st.snapshots.drain(..st.snapshots.len().saturating_sub(HISTORY)).collect();
-    let body = metadata(lake, meta.folder(table), &st.uuid, v, now, &schema, &meta.columns, &st.snapshots);
+    let body = metadata(lake, meta.folder(table), &st.uuid, v, now, &schema, &layout, meta, &st.snapshots);
     // Written once, never overwritten; if it's there, an attempt that crashed wrote it, and this
     // one's objects are garbage the next round's version replaces.
     lake.put(&format!("{dir}/v{v}.metadata.json"), body.to_string().into_bytes()).await?;
@@ -145,28 +251,34 @@ pub async fn publish(lake: &Lake, table: &str, meta: &TableMeta, named: Option<&
     if parts.inline.is_empty() {
         st.inline = None;
     }
-    (st.version, st.inlined) = (v, inlined);
+    (st.version, st.inlined, st.shape) = (v, inlined, shape);
     Ok(Some((key, json(&st))))
 }
 
-/// One Iceberg manifest holding `files`, added by version `v` (snapshot `id`).
-async fn write_manifest(lake: &Lake, dir: &str, schema: &Value, v: u64, id: i64, files: &[DataFile]) -> Result<Avro> {
-    let entries: Vec<Vec<u8>> = files.iter().map(|f| entry(true, v, id, &lake.full(&f.path), f.rows, f.bytes)).collect();
-    let spec = [("schema", schema.to_string()), ("schema-id", "0".into()), ("partition-spec", "[]".into()), ("partition-spec-id", "0".into()), ("format-version", "2".into()), ("content", "data".into())];
-    let body = ocf(&entry_schema(), &spec, &entries);
+/// One Iceberg manifest holding `files`, added by version `v` (snapshot `id`), each file with its
+/// partition (under the layout's spec).
+#[allow(clippy::too_many_arguments)]
+async fn write_manifest(lake: &Lake, dir: &str, schema: &Value, layout: &Layout, v: u64, id: i64, files: &[DataFile]) -> Result<Avro> {
+    let entries: Vec<Vec<u8>> = files.iter().map(|f| Ok(entry(true, v, id, &lake.full(&f.path), &layout.record(&f.part)?, f.rows, f.bytes))).collect::<Result<_>>()?;
+    let spec_id = if layout.partition.is_some() { 1 } else { 0 };
+    let spec = [("schema", schema.to_string()), ("schema-id", "0".into()), ("partition-spec", layout.spec().to_string()), ("partition-spec-id", spec_id.to_string()), ("format-version", "2".into()), ("content", "data".into())];
+    let body = ocf(&entry_schema_with(layout.avro()).to_string(), &spec, &entries);
     let path = format!("{dir}/{}-m0.avro", uuid::Uuid::new_v4());
-    let a = Avro { bytes: body.len() as u64, files: files.len() as u64, rows: files.iter().map(|f| f.rows).sum(), seq: v, path: path.clone() };
+    let a = Avro { bytes: body.len() as u64, files: files.len() as u64, rows: files.iter().map(|f| f.rows).sum(), seq: v, path: path.clone(), spec: spec_id };
     lake.put(&path, body).await?;
     Ok(a)
 }
 
-/// The table metadata file (format v2): one unpartitioned spec, no sort order, the snapshots kept.
+/// The table metadata file (format v2): its layout (`Layout`), the snapshots kept.
 #[allow(clippy::too_many_arguments)]
-fn metadata(lake: &Lake, folder: &str, uuid: &str, v: u64, now: u64, schema: &Value, columns: &[(String, String)], snapshots: &[(Value, String)]) -> Value {
+fn metadata(lake: &Lake, folder: &str, uuid: &str, v: u64, now: u64, schema: &Value, layout: &Layout, meta: &TableMeta, snapshots: &[(Value, String)]) -> Value {
+    let columns = &meta.columns;
     // A list's elements need a mapping of their own: arrow-rs writes them as `item` (parquet-mr as `element`).
+    // (a renamed column by both names: Pondra's files keep the stored one, other writers write SQL's)
+    let known = |c: &String| if meta.name_of(c) == c { json!([c]) } else { json!([meta.name_of(c), c]) };
     let mut names: Vec<Value> = columns.iter().enumerate().map(|(i, (c, t))| match t.ends_with("[]") {
-        true => json!({"field-id": i + 1, "names": [c], "fields": [{"field-id": columns.len() + i + 1, "names": ["item", "element"]}]}),
-        false => json!({"field-id": i + 1, "names": [c]}),
+        true => json!({"field-id": i + 1, "names": known(c), "fields": [{"field-id": columns.len() + i + 1, "names": ["item", "element"]}]}),
+        false => json!({"field-id": i + 1, "names": known(c)}),
     }).collect();
     // The files also hold the rows' system columns (`sys.rs`), which the schema leaves out: named
     // too (ids of their own, never the schema's), so a reader that maps a file's every column by
@@ -178,8 +290,10 @@ fn metadata(lake: &Lake, folder: &str, uuid: &str, v: u64, now: u64, schema: &Va
         "format-version": 2, "table-uuid": uuid, "location": lake.full(&format!("data/{folder}")),
         "last-sequence-number": v, "last-updated-ms": now, "last-column-id": 2 * columns.len(), // (list elements take ids after the columns')
         "current-schema-id": 0, "schemas": [schema],
-        "default-spec-id": 0, "partition-specs": [{"spec-id": 0, "fields": []}], "last-partition-id": 999,
-        "default-sort-order-id": 0, "sort-orders": [{"order-id": 0, "fields": []}],
+        "default-spec-id": layout.partition.is_some() as i32, "last-partition-id": if layout.partition.is_some() { 1000 } else { 999 },
+        "partition-specs": std::iter::once(json!({"spec-id": 0, "fields": []})).chain(layout.partition.as_ref().map(|_| json!({"spec-id": 1, "fields": layout.spec()}))).collect::<Vec<_>>(),
+        "default-sort-order-id": layout.sort.is_some() as i32,
+        "sort-orders": std::iter::once(json!({"order-id": 0, "fields": []})).chain(layout.sort.map(|i| json!({"order-id": 1, "fields": [{"transform": "identity", "source-id": i + 1, "direction": "asc", "null-order": "nulls-last"}]}))).collect::<Vec<_>>(),
         "properties": {"schema.name-mapping.default": Value::Array(names).to_string(), "written-by": "pondra"},
         "current-snapshot-id": current, "refs": {"main": {"snapshot-id": current, "type": "branch"}},
         "snapshots": snapshots.iter().map(|(s, _)| s).collect::<Vec<_>>(),
@@ -201,7 +315,7 @@ pub fn empty(location: &str, columns: &[(String, String)], now: u64) -> Option<V
     }))
 }
 
-/// The table's columns as Iceberg fields, if every type has an equivalent: all optional, each
+/// The table's columns as Iceberg fields, if every type has an equivalent: optional but a key's, each
 /// with its place among the stored columns as its id and the name SQL knows it by (a renamed
 /// column keeps its id; a dropped one leaves the schema, its id unused again: ADR-022).
 fn fields(meta: &TableMeta) -> Option<Vec<Value>> {
@@ -229,7 +343,7 @@ fn fields(meta: &TableMeta) -> Option<Vec<Value>> {
         None => Some(Value::String(iceberg(t)?)),
     };
     let live = columns.iter().enumerate().filter(|(_, (c, _))| !meta.dropped.contains(c));
-    live.map(|(i, (c, t))| Some(json!({"id": i + 1, "name": meta.name_of(c), "required": false, "type": kind(i, t)?}))).collect()
+    live.map(|(i, (c, t))| Some(json!({"id": i + 1, "name": meta.name_of(c), "required": meta.key.contains(c), "type": kind(i, t)?}))).collect() // (a key: identifier fields are required)
 }
 
 // ---------------------------------------------------------------- Avro, just what manifests need
@@ -269,8 +383,9 @@ fn ocf(schema: &str, meta: &[(&str, String)], records: &[Vec<u8>]) -> Vec<u8> {
     b
 }
 
-/// A manifest entry for a data file (status 1 = added by this snapshot, 0 = existing).
-fn entry(added: bool, seq: u64, id: i64, path: &str, rows: u64, size: u64) -> Vec<u8> {
+/// A manifest entry for a data file (status 1 = added by this snapshot, 0 = existing), its
+/// partition record as encoded (`Layout::record`).
+fn entry(added: bool, seq: u64, id: i64, path: &str, partition: &[u8], rows: u64, size: u64) -> Vec<u8> {
     let mut b = vec![];
     long(&mut b, added as i64);
     for v in [id, seq as i64, seq as i64] {
@@ -280,17 +395,19 @@ fn entry(added: bool, seq: u64, id: i64, path: &str, rows: u64, size: u64) -> Ve
     long(&mut b, 0); // content: data
     bytes(&mut b, path.as_bytes());
     bytes(&mut b, b"PARQUET");
-    long(&mut b, rows as i64); // (the partition is an empty record: no bytes)
+    b.extend(partition);
+    long(&mut b, rows as i64);
     long(&mut b, size as i64);
     b.extend([0; 10]); // the ten optional fields (column stats, split offsets…): null
     b
 }
 
-/// A manifest list entry for the snapshot's one manifest.
-fn manifest_file(path: &str, len: usize, seq: u64, min_seq: u64, id: i64, files: [usize; 2], rows: [i64; 2]) -> Vec<u8> {
+/// A manifest list entry for one of the snapshot's manifests.
+#[allow(clippy::too_many_arguments)]
+fn manifest_file(path: &str, len: usize, spec: i32, seq: u64, min_seq: u64, id: i64, files: [usize; 2], rows: [i64; 2]) -> Vec<u8> {
     let mut b = vec![];
     bytes(&mut b, path.as_bytes());
-    for v in [len as i64, 0, 0, seq as i64, min_seq as i64, id, files[0] as i64, files[1] as i64, 0, rows[0], rows[1], 0] {
+    for v in [len as i64, spec as i64, 0, seq as i64, min_seq as i64, id, files[0] as i64, files[1] as i64, 0, rows[0], rows[1], 0] {
         long(&mut b, v); // length, spec id, content (data), sequence numbers, snapshot, file and row counts
     }
     b.extend([0, 0]); // partitions, key metadata: null
@@ -299,9 +416,6 @@ fn manifest_file(path: &str, len: usize, seq: u64, min_seq: u64, id: i64, files:
 
 pub fn req(name: &str, id: u32, t: Value) -> Value { json!({"name": name, "field-id": id, "type": t}) }
 pub fn opt(name: &str, id: u32, t: Value) -> Value { json!({"name": name, "field-id": id, "type": ["null", t], "default": null}) }
-
-/// The Avro schema of a manifest entry (Iceberg v2).
-fn entry_schema() -> String { entry_schema_with(vec![]).to_string() }
 
 /// The Avro schema of a manifest entry (Iceberg v2), its partition's fields as given.
 pub fn entry_schema_with(partition: Vec<Value>) -> Value {
@@ -346,16 +460,17 @@ pub fn list_schema() -> String {
 pub fn rest() -> axum::Router<crate::server::App> {
     use axum::routing::{get, post};
     let endpoints = ["GET /v1/{prefix}/namespaces", "GET /v1/{prefix}/namespaces/{namespace}", "HEAD /v1/{prefix}/namespaces/{namespace}",
-        "GET /v1/{prefix}/namespaces/{namespace}/tables", "GET /v1/{prefix}/namespaces/{namespace}/tables/{table}",
-        "HEAD /v1/{prefix}/namespaces/{namespace}/tables/{table}", "POST /v1/{prefix}/namespaces/{namespace}/tables/{table}"];
+        "GET /v1/{prefix}/namespaces/{namespace}/tables", "POST /v1/{prefix}/namespaces/{namespace}/tables", "GET /v1/{prefix}/namespaces/{namespace}/tables/{table}",
+        "HEAD /v1/{prefix}/namespaces/{namespace}/tables/{table}", "POST /v1/{prefix}/namespaces/{namespace}/tables/{table}",
+        "DELETE /v1/{prefix}/namespaces/{namespace}/tables/{table}", "POST /v1/{prefix}/tables/rename"];
     let refuse = |what: &'static str| move || async move { Err::<axum::Json<Value>, _>(bad(format!("{what} in Pondra's SQL; other engines read its tables and append to them"))) };
     axum::Router::new()
         .route("/v1/config", get(move || async move { axum::Json(json!({"defaults": {}, "overrides": {}, "endpoints": endpoints})) }))
         .route("/v1/namespaces", get(namespaces).post(refuse("CREATE SCHEMA")))
         .route("/v1/namespaces/{ns}", get(namespace).head(namespace).delete(refuse("DROP SCHEMA")))
-        .route("/v1/namespaces/{ns}/tables", get(tables).post(refuse("CREATE TABLE … WITH (publish = 'iceberg')")))
-        .route("/v1/namespaces/{ns}/tables/{table}", get(load).head(load).post(update).delete(refuse("DROP TABLE")))
-        .route("/v1/tables/rename", post(refuse("ALTER TABLE … RENAME")))
+        .route("/v1/namespaces/{ns}/tables", get(tables).post(create))
+        .route("/v1/namespaces/{ns}/tables/{table}", get(load).head(load).post(update).delete(drop_table))
+        .route("/v1/tables/rename", post(rename))
         .route("/v1/transactions/commit", post(refuse("A change to several tables at once goes")))
 }
 
@@ -408,6 +523,142 @@ async fn tables(axum::extract::State(app): axum::extract::State<crate::server::A
     Ok(axum::Json(json!({"identifiers": ids})))
 }
 
+/// A table's name as SQL says it, from its namespace (`spaces`).
+fn sql_name(app: &crate::server::App, parts: &[String], lake: &std::sync::Arc<Lake>, schema: &str, table: &str) -> String {
+    let q = |n: &str| format!("\"{}\"", n.replace('"', "\"\""));
+    match (std::sync::Arc::ptr_eq(lake, &app.lake), schema == crate::ddl::PUBLIC) {
+        (true, true) => q(table),
+        (true, false) => format!("{}.{}", q(schema), q(table)),
+        (false, _) => format!("{}.{}.{}", q(&parts[0]), q(schema), q(table)),
+    }
+}
+
+/// A statement for the catalog's table changes, run as the caller (DDL: an admin's).
+async fn as_caller(app: &crate::server::App, role: crate::auth::Role, sql: &str) -> Result<(), Refusal> {
+    let who = crate::routines::Who { role, files: false, depth: 0 };
+    Box::pin(crate::routines::one(app, sql, who, None)).await.map(|_| ()).map_err(|e| match format!("{e:#}") {
+        e if e.contains("may not") => refused(403, "ForbiddenException", e),
+        e if e.contains("already exists") => refused(409, "AlreadyExistsException", e),
+        e => bad(e),
+    })
+}
+
+/// `POST /v1/namespaces/{ns}/tables`: a table made through the catalog (ADR-029 §8), as `CREATE
+/// TABLE` makes it: its schema's types as Pondra's (a required field NOT NULL, the identifier
+/// fields its key), its partition spec as `partition_by` (one field: identity, or year, month,
+/// day or hour), its write order as `cluster_by` (columns sorted ascending), published as Iceberg
+/// (and anything else its `publish` property names). The metadata answered is its first
+/// version's. What Pondra's tables can't be is refused by name.
+async fn create(axum::extract::State(app): axum::extract::State<crate::server::App>, axum::Extension(role): axum::Extension<crate::auth::Role>, axum::extract::Path(ns): axum::extract::Path<String>, body: bytes::Bytes) -> Reply {
+    let (parts, lake, schema) = space(&app, &ns).await?;
+    let asked: Value = serde_json::from_slice(&body).map_err(|e| bad(format!("the table: {e}")))?;
+    let table = asked["name"].as_str().filter(|n| !n.is_empty()).ok_or_else(|| bad("a table without its name".into()))?;
+    let sql = create_sql(&sql_name(&app, &parts, &lake, &schema, table), &asked).map_err(|e| bad(format!("{e:#}")))?;
+    as_caller(&app, role, &sql).await?;
+    let name = crate::ddl::join(&schema, table);
+    for _ in 0..600 {
+        if let Ok(v) = loaded(&lake, &name).await {
+            return Ok(axum::Json(v)); // (its first version: published by the leader's next round)
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    Err(refused(500, "ServiceUnavailableException", format!("{name} was made, and isn't published yet: load it again")))
+}
+
+/// A catalog's table request as `CREATE TABLE` (`create`).
+fn create_sql(name: &str, asked: &Value) -> Result<String> {
+    use anyhow::bail;
+    anyhow::ensure!(!asked["stage-create"].as_bool().unwrap_or(false), "a staged create (a table made with its first commit): not yet; make it, then append");
+    let fields = asked["schema"]["fields"].as_array().context("a table without its schema's fields")?;
+    let q = |n: &str| format!("\"{}\"", n.replace('"', "\"\""));
+    let by_id = |id: &Value| fields.iter().find(|f| f["id"] == *id).and_then(|f| f["name"].as_str()).with_context(|| format!("no field {id} in the schema"));
+    let sql_type = |t: &Value| -> Result<String> {
+        let prim = |t: &str| -> Result<String> {
+            Ok(match t {
+                "boolean" => "BOOLEAN".into(),
+                "int" => "INT".into(),
+                "long" => "BIGINT".into(),
+                "float" => "REAL".into(),
+                "double" => "DOUBLE".into(),
+                "date" => "DATE".into(),
+                "timestamp" => "TIMESTAMP".into(),
+                "timestamptz" => "TIMESTAMPTZ".into(),
+                "string" => "VARCHAR".into(),
+                "binary" => "BYTEA".into(),
+                t if t.starts_with("decimal(") => t.to_uppercase(),
+                t => bail!("an Iceberg {t} column: not one Pondra has (boolean, int, long, float, double, date, timestamp, timestamptz, string, binary, decimal, and lists of them)"),
+            })
+        };
+        match t {
+            Value::String(t) => prim(t),
+            t if t["type"] == "list" && t["element"].is_string() => Ok(format!("{}[]", prim(t["element"].as_str().unwrap_or_default())?)),
+            t => bail!("an Iceberg {} column: not one Pondra has (lists of plain values are)", t["type"]),
+        }
+    };
+    let mut columns = vec![];
+    for f in fields {
+        let n = f["name"].as_str().context("a field without its name")?;
+        columns.push(format!("{} {}{}", q(n), sql_type(&f["type"])?, if f["required"].as_bool().unwrap_or(false) { " NOT NULL" } else { "" }));
+    }
+    let keys: Vec<String> = asked["schema"]["identifier-field-ids"].as_array().into_iter().flatten().map(|id| by_id(id).map(q)).collect::<Result<_>>()?;
+    if !keys.is_empty() {
+        columns.push(format!("PRIMARY KEY ({})", keys.join(", ")));
+    }
+    let mut options = vec![];
+    let publish = asked["properties"]["publish"].as_str().unwrap_or("iceberg");
+    anyhow::ensure!(publish.split(',').any(|f| f.trim() == "iceberg"), "publish = '{publish}': a table made through the Iceberg catalog publishes Iceberg");
+    options.push(format!("publish = '{}'", publish.replace('\'', "")));
+    let spec = asked["partition-spec"]["fields"].as_array().cloned().unwrap_or_default();
+    match spec.as_slice() {
+        [] => {}
+        [f] => {
+            let col = by_id(&f["source-id"])?;
+            let by = match f["transform"].as_str().unwrap_or("identity") {
+                "identity" => col.to_string(),
+                t @ ("year" | "month" | "day" | "hour") => format!("{t}({col})"),
+                t => bail!("a partition by {t}: Pondra's tables partition by a column, or the year, month, day or hour of one"),
+            };
+            options.push(format!("partition_by = '{}'", by.replace('\'', "")));
+        }
+        _ => bail!("a partition spec of {} fields: Pondra's tables partition by one", spec.len()),
+    }
+    let order = asked["write-order"]["fields"].as_array().cloned().unwrap_or_default();
+    if !order.is_empty() {
+        let mut cols = vec![];
+        for f in &order {
+            anyhow::ensure!(f["transform"].as_str().unwrap_or("identity") == "identity" && f["direction"].as_str().unwrap_or("asc") == "asc", "a write order by {} {}: Pondra's tables sort by columns, ascending (cluster_by)", f["transform"], f["direction"]);
+            cols.push(by_id(&f["source-id"])?.replace('\'', ""));
+        }
+        options.push(format!("cluster_by = '{}'", cols.join(",")));
+    }
+    Ok(format!("CREATE TABLE {name} ({}) WITH ({})", columns.join(", "), options.join(", ")))
+}
+
+/// `DELETE /v1/namespaces/{ns}/tables/{table}`: `DROP TABLE`, its files with it (the catalog's
+/// `purgeRequested` or not: a Pondra table's files are its own).
+async fn drop_table(axum::extract::State(app): axum::extract::State<crate::server::App>, axum::Extension(role): axum::Extension<crate::auth::Role>, axum::extract::Path((ns, table)): axum::extract::Path<(String, String)>) -> Result<axum::http::StatusCode, Refusal> {
+    let (parts, lake, schema) = space(&app, &ns).await?;
+    loaded(&lake, &crate::ddl::join(&schema, &table)).await.map_err(|_| missing(&format!("table {}.{table}", parts.join(".")), "NoSuchTableException"))?;
+    as_caller(&app, role, &format!("DROP TABLE {}", sql_name(&app, &parts, &lake, &schema, &table))).await?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+/// `POST /v1/tables/rename`: `ALTER TABLE … RENAME TO`, within its lake and schema.
+async fn rename(axum::extract::State(app): axum::extract::State<crate::server::App>, axum::Extension(role): axum::Extension<crate::auth::Role>, body: bytes::Bytes) -> Result<axum::http::StatusCode, Refusal> {
+    let asked: Value = serde_json::from_slice(&body).map_err(|e| bad(format!("the rename: {e}")))?;
+    let ns = |v: &Value| v["namespace"].as_array().into_iter().flatten().filter_map(Value::as_str).collect::<Vec<_>>().join("\u{1f}");
+    let (from, to) = (&asked["source"], &asked["destination"]);
+    let (parts, lake, schema) = space(&app, &ns(from)).await?;
+    let (name, new) = (from["name"].as_str().unwrap_or_default(), to["name"].as_str().unwrap_or_default());
+    if ns(from) != ns(to) {
+        return Err(bad(format!("{name} to another namespace: a Pondra table is renamed within its schema")));
+    }
+    loaded(&lake, &crate::ddl::join(&schema, name)).await.map_err(|_| missing(&format!("table {}.{name}", parts.join(".")), "NoSuchTableException"))?;
+    let sql = format!("ALTER TABLE {} RENAME TO \"{}\"", sql_name(&app, &parts, &lake, &schema, name), new.replace('"', "\"\""));
+    as_caller(&app, role, &sql).await?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
 /// A table: its current metadata file, and what it says.
 async fn load(axum::extract::State(app): axum::extract::State<crate::server::App>, axum::extract::Path((ns, table)): axum::extract::Path<(String, String)>) -> Reply {
     let (_, lake, schema) = space(&app, &ns).await?;
@@ -441,8 +692,11 @@ pub struct Commit {
     summary: serde_json::Map<String, Value>,
     uuid: Option<String>,        // assert-table-uuid
     parent: Option<Option<i64>>, // assert-ref-snapshot-id on main (Some(None): no snapshot yet)
-    incoming: Vec<String>,       // the writer's data files (paths in the lake)
+    incoming: Vec<DataFile>,     // the writer's data files (paths in the lake, rows, bytes)
     cleanup: Vec<String>,        // its manifest list and the manifests it added
+    /// The files become the table's as written (`adopt.rs`), their footers read and checked.
+    #[serde(default)]
+    adopt: bool,
     /// Those rows as the table's own files, written by the node that took the commit (None: they
     /// go through the log, for the views and tasks that follow the table).
     written: Option<crate::write::Files>,
@@ -468,10 +722,12 @@ fn bad(message: String) -> Refusal { refused(400, "BadRequestException", message
 fn conflict(message: String) -> Refusal { refused(409, "CommitFailedException", message) }
 
 /// `POST /v1/namespaces/{ns}/tables/{table}`: another engine's commit. An append's files become
-/// the table's rows as a bulk INSERT's would: rewritten here with their row ids, sized and
-/// partitioned as the table says (or through the log, when views or tasks follow the table). The
-/// leader checks what the commit asserts and records it, and the table's next version is
-/// published under the writer's snapshot id. Anything else is refused by name.
+/// the table's where the writer put them (ADR-029), their footers read here and checked; the
+/// leader records them with their lineage. A table that views or tasks follow takes the rows
+/// through the log, and one whose files the writer can't lay out as its own (renamed columns, a
+/// partition spec: `adopt::fits_as_written`) has them rewritten here, as a bulk INSERT's (round
+/// 25's copy). The leader checks what the commit asserts and records it, and the table's next
+/// version is published under the writer's snapshot id. Anything else is refused by name.
 async fn update(axum::extract::State(app): axum::extract::State<crate::server::App>, axum::extract::Path((ns, table)): axum::extract::Path<(String, String)>, body: bytes::Bytes) -> Reply {
     let (_, lake, schema) = space(&app, &ns).await?;
     let name = crate::ddl::join(&schema, &table);
@@ -487,7 +743,11 @@ async fn update(axum::extract::State(app): axum::extract::State<crate::server::A
     }
     check(&lake, &c).await.map_err(|e| conflict(format!("{e:#}")))?;
     let here = std::sync::Arc::ptr_eq(&lake, &app.lake);
-    if !c.incoming.is_empty() && !crate::write::follows(&lake, &name).await.map_err(|e| bad(format!("{e:#}")))? {
+    let followed = crate::write::follows(&lake, &name).await.map_err(|e| bad(format!("{e:#}")))?;
+    if !c.incoming.is_empty() && !followed && crate::adopt::fits_as_written(&meta) {
+        crate::adopt::footers(&lake, &name, &meta, &mut c.incoming).await.map_err(|e| bad(format!("{REFUSED}: {e:#}")))?;
+        c.adopt = true;
+    } else if !c.incoming.is_empty() && !followed {
         let written = async {
             let stamp = match here { true => Some(app.to().reserve().await?), false => crate::write::reserve(&lake).await };
             let (ctx, query) = incoming(&lake, &meta, &c.incoming).await?;
@@ -569,7 +829,7 @@ async fn parse(lake: &Lake, table: &str, meta: &Value, asked: &Value) -> Result<
         crate::avro::records(&bytes).map_err(|e| bad(format!("{path}: {e:#}")))
     };
     let list = under(&s["manifest-list"], "metadata")?;
-    let (mut incoming, mut cleanup) = (vec![], vec![list.clone()]);
+    let (mut incoming, mut cleanup) = (Vec::<DataFile>::new(), vec![list.clone()]);
     for m in get(list).await? {
         if m["added_snapshot_id"].as_i64() != Some(id) {
             continue; // (the table's manifests, as they were)
@@ -589,11 +849,12 @@ async fn parse(lake: &Lake, table: &str, meta: &Value, asked: &Value) -> Result<
             if d["content"].as_i64().unwrap_or(0) != 0 || !d["file_format"].as_str().unwrap_or_default().eq_ignore_ascii_case("parquet") {
                 return Err(bad(format!("{}: Pondra takes Parquet data files", d["file_path"])));
             }
-            incoming.push(under(&d["file_path"], "data")?);
+            let (rows, bytes) = (d["record_count"].as_u64().unwrap_or(0), d["file_size_in_bytes"].as_u64().unwrap_or(0));
+            incoming.push(DataFile { path: under(&d["file_path"], "data")?, rows, bytes, ..Default::default() });
         }
     }
     let summary = s["summary"].as_object().cloned().unwrap_or_default();
-    Ok(Commit { table: table.into(), snapshot: id, summary, uuid, parent, incoming, cleanup, written: None })
+    Ok(Commit { table: table.into(), snapshot: id, summary, uuid, parent, incoming, cleanup, written: None, adopt: false })
 }
 
 /// A writer's URI as a path in the lake, if it is in it (`file:` or none, for a lake on disk).
@@ -618,11 +879,11 @@ async fn done(lake: &Lake, job: &str) -> Result<bool> { Ok(lake.cat.get::<u64>(&
 
 /// The writer's files as a table `__incoming` of the table's columns (by name), and the query
 /// that reads them in the table's order.
-async fn incoming(lake: &Lake, meta: &TableMeta, files: &[String]) -> Result<(datafusion::prelude::SessionContext, String)> {
+async fn incoming(lake: &Lake, meta: &TableMeta, files: &[DataFile]) -> Result<(datafusion::prelude::SessionContext, String)> {
     let meta = meta.logical();
     let schema = crate::query::schema(&meta.columns)?;
     let ctx = lake.session();
-    let urls: Vec<String> = files.iter().map(|f| lake.full(f)).collect();
+    let urls: Vec<String> = files.iter().map(|f| lake.full(&f.path)).collect();
     let df = ctx.read_parquet(urls, datafusion::prelude::ParquetReadOptions::default().schema(&schema)).await?;
     ctx.register_table("__incoming", df.into_view())?;
     let columns: Vec<String> = meta.columns.iter().map(|(c, _)| format!("\"{}\"", c.replace('"', "\"\""))).collect();
@@ -636,7 +897,8 @@ pub async fn record(lake: &Lake, seq: &crate::log::Sequencer, c: Commit, nodes: 
     if !done(lake, &c.job()).await? {
         check(lake, &c).await?;
         let files: Vec<String> = c.written.iter().flat_map(|f| f.paths()).collect();
-        let into_files = match c.written {
+        let adopted = c.adopt && crate::adopt::record(lake, seq, &c.table, &c.job(), &c.incoming).await?;
+        let into_files = adopted || match c.written {
             Some(ref f) => match crate::write::record(lake, f.clone(), Some(seq)).await {
                 Err(e) if format!("{e:#}").contains(crate::write::AGAIN) => {
                     futures::future::join_all(files.iter().map(|f| lake.delete(f))).await; // (a view came: through the log)
@@ -650,7 +912,9 @@ pub async fn record(lake: &Lake, seq: &crate::log::Sequencer, c: Commit, nodes: 
             through_log(lake, seq, &c, nodes, me).await?;
         }
         crate::delta::publish_named(lake, Some(&Named { table: &c.table, id: c.snapshot, summary: &c.summary })).await?;
-        futures::future::join_all(c.incoming.iter().map(|f| lake.delete(f))).await; // (its rows are the table's now)
+        if !adopted {
+            futures::future::join_all(c.incoming.iter().map(|f| lake.delete(&f.path))).await; // (its rows are the table's own files, or the log's, now)
+        }
         // Its manifests go with the table's replaced files, after the retention period: the writer
         // may read them once more as it cleans up after its commit (Iceberg 1.10 does).
         let key = crate::store::table_key(&c.table);
@@ -678,7 +942,7 @@ async fn through_log(lake: &Lake, seq: &crate::log::Sequencer, c: &Commit, nodes
             if let Some(f) = lake.ids.take(batch.num_rows() as u64) {
                 break f;
             }
-            lake.ids.refill(seq.reserve().await?.0);
+            lake.ids.refill(seq.block().await?);
         };
         let batch = crate::sys::stamp(&batch, first)?;
         let append = [Append { table: c.table.clone(), src: Src { producer: c.job(), seq: 1, prev: None }, batch, ack: tokio::sync::oneshot::channel().0 }];

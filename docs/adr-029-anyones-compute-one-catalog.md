@@ -1,6 +1,6 @@
 # ADR-029: Anyone's compute, one catalog
 
-**Date:** 2026-09-29 · **Status:** proposed; phases 1 and 2 in rounds 27 and 28 (the owner, 2026-09-29) · **Builds on:** ADR-001 (readers who need only the bucket), ADR-002 (the streamhouse), ADR-003 (serverless) · **Follows:** ADR-028 (other engines append, G8), ADR-020 (system columns)
+**Date:** 2026-09-29 · **Status:** accepted; phase 1 built in round 27 (2026-09-30, below), phase 2 is round 28 (the owner, 2026-09-29) · **Builds on:** ADR-001 (readers who need only the bucket), ADR-002 (the streamhouse), ADR-003 (serverless) · **Follows:** ADR-028 (other engines append, G8), ADR-020 (system columns)
 
 ## Context
 
@@ -301,11 +301,89 @@ freshness between nodes are all unchanged. Outside commits join the same order:
   node started cold takes a commit.
 - **Every new invariant** gets a test in `tools/` that fails without it.
 
+## Built in round 27 (phase 1, 2026-09-30)
+
+What was built, what was measured, and what moved. **Decided by Claude, for the owner's review**,
+where marked.
+
+- **Appends as written** (`adopt.rs`). The node taking the commit reads each added file's footer
+  once (sixteen at a time) and checks it: the manifest's row count, each column's type as the
+  table's (strings, binaries and lists however they are laid out; matched by field id, else by
+  name), no NULL in a NOT NULL column (a footer that doesn't say is refused too), and one partition
+  value in a partitioned table (by the footer's range of the partition column, put through the
+  table's own `partition_by` expression). A file that fails refuses the whole commit by name,
+  before anything is recorded. The leader records the files with their lineage and the columns'
+  ranges and NULLs the footers gave, and publishes. The writer's files stay where they are.
+- **Lineage per file** (`store::Lineage`: first row id, commit, time). Reads give the system
+  columns from it (`scan::adopted`): `_row_id` is the first id plus Parquet's row number, a
+  virtual column of DataFusion 55's Parquet reader, which stays right under skipped row groups;
+  `_version` and the times are the commit's. Every read goes through it — queries, spread queries'
+  slices, `UPDATE`/`DELETE`/`MERGE`, purges and merges (`query::files_once`) — and a merge writes
+  the columns into its file. The ranges of the system columns are recorded too, so a purge skips
+  the files that hold no changed row.
+- **Measured:** a million rows appended by PyIceberg (one file): the two nodes' CPU for the commit
+  0.01 s recorded as written, against 0.24 s copied (round 25's path, still taken below). The
+  commit's work grows with the files, not the rows (`harness.py adopted`).
+- **Still copied** (round 25's path, *decided by Claude*): a table that views or tasks follow (its
+  rows go through the log for them, as a bulk `INSERT`'s do), and a table with a renamed or dropped
+  column. **The Delta question is settled that way:** Pondra publishes Delta with column mapping, so
+  a Delta reader looks a column up by its physical (stored) name, which another engine's file
+  written after a rename doesn't have. Copying those appends keeps every Delta reader right; a
+  table altered this way is the exception, and nothing is lost but the copy's cost.
+- **Pondra's own files written without a leader** (`pondra sql`, the inbox) now take lineage when
+  they are recorded instead of being rewritten with their system columns. *(Decided by Claude: one
+  rule for every file that doesn't hold them.)*
+- **Layout published** (`iceberg::Layout`): `partition_by` as partition spec 1 — identity (of an
+  integer, string, boolean, date or timestamp), or year, month, day or hour — each manifest entry
+  with its file's partition record; spec 0, no partitions, stays in the metadata for manifests
+  written before. *(Decided by Claude: a new spec id rather than changing spec 0, so no manifest
+  already written is misread.)* A `cluster_by` on one column is the sort order; a key is the
+  schema's identifier fields, which Iceberg asks to be required, so a key's columns are published
+  as required (they are NOT NULL). PyIceberg now writes a partitioned table a file per partition
+  value, and Pondra takes them as written.
+- **Found on the way:** a column rename reached the Iceberg metadata only with the next files, and
+  PyIceberg (which matches an Arrow table's columns by the name mapping) refused appends to a
+  renamed table. Now a version is published when the schema or layout changes (`Published::shape`),
+  at once after `ALTER TABLE … COLUMN`, and the name mapping holds a renamed column's both names.
+- **Tables through the catalog:** create (the types, required fields as NOT NULL, identifier fields
+  as the key, one partition field, a write order of ascending columns as `cluster_by`, `publish`
+  from the properties), drop and rename (within a namespace), each as the SQL statement run as the
+  caller, so DDL needs an admin token as in SQL. A create answers the table's first published
+  version. Struct, map, uuid, time and fixed columns, specs by bucket or truncate or of two
+  fields, descending orders and staged creates are refused by name.
+- **The id fix (§11):** row-id blocks come from their own counter (catalog key `b`, starting at the
+  commit number the first time, so no block before it is reused); a node's block lasts it 2^32
+  rows, and a bulk `INSERT` takes one. A log row's place (`_ord`, a Kafka offset) is now its
+  segment's number shifted by 24 bits, not 32, then its row: 40 bits of segment numbers, 34 years at
+  a thousand commits a second. A segment with more of one table's rows than 2^24 takes the numbers
+  after it too (`log::span`), and a Kafka fetch looks back over them. *(Decided by Claude: offsets
+  a consumer saved before this upgrade point elsewhere now; there is no promise of that before
+  1.0, ADR-032 §8.)*
+- **Tests:** `harness.py adopted` (9 checks), `ids` (a 2^24 + 10-row segment, a consumer seeking
+  into its second number), `writes` updated; everything else in `harness.py all` as before; Spark
+  4 with Iceberg 1.10 appending through the catalog (`formats_check.py --only commits`), its rows
+  and their ids as it wrote them.
+
+**Moved to round 28, with phase 2** (*decided by Claude*, to finish phase 1 well rather than all of
+it at once):
+
+- **Followers fed from the files (§7):** a followed table still takes an append through the log.
+  Deriving each follower's change from the files, in the same commit, needs the file records to
+  travel with the sequencer's commit; phase 2's changes need the same.
+- **The feed seeing file commits:** `/watch`, the change feed and Kafka topics read the log, so
+  they carry neither an outside append recorded as written nor a bulk `INSERT` (which never did).
+  The plan: a file commit leaves a marker segment in the log naming its files, which the feed's
+  readers read the rows of.
+- **Hot columns:** files recorded as written are read from Parquet, not the hot columns, until a
+  merge rewrites them.
+
 ## Open
 
 - **Delta readers and renamed columns.** Say another engine writes a file after a column was
   renamed. Delta readers match columns by physical name, and the file uses the new name. Either
   maintenance rewrites those files before they are published to Delta, or Delta is published
-  with column mapping by id. Decided in phase 1.
+  with column mapping by id. *(Settled in round 27, for now: such a table's appends are copied, as
+  above. Rewriting them in maintenance, or Delta's mapping by id, stay the ways to record them as
+  written if renamed tables turn out to take many.)*
 - **Which round: decided.** Phase 1 is round 27 and phase 2 is round 28, after round 26's console,
   server and docs (the owner, 2026-09-29).

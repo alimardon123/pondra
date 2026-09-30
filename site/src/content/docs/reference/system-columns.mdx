@@ -21,6 +21,11 @@ what procedures did and what is on a schedule. You read both with ordinary SQL.
 | `_deleted` | `BOOLEAN` | on keyed tables only: the delete marker. See [keyed tables](#keyed-tables) |
 | `_change_type` | `VARCHAR` | in the change feed only. See [the change feed](#the-change-feed) |
 
+Rows another engine appended through the [Iceberg catalog](/pondra/reference/iceberg-rest/#appending)
+have them too, though its files don't hold them: the commit that recorded a file gives its rows'
+`_version` and times, and a block of ids its `_row_id`s, one per row in the file's order (as Iceberg
+v3's row lineage and Delta's row tracking number rows). A merge writes them into its file.
+
 `SELECT *` leaves the system columns out, and so does `DESCRIBE`. A query that names one gets it:
 `SELECT _row_id, * FROM t`. `SELECT *, _row_id FROM t` shows the table's columns and `_row_id`
 once. Over a join, `*` shows each table's system columns as well.

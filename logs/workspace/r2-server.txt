@@ -1,0 +1,20 @@
+{
+ "server": {
+  "the folder's lakes are its databases, none running until used": true,
+  "psql and HTTP reach each database by name; no /db/ means the default (lake)": true,
+  "each database's node gets pondra serve's options (--memory-gb 1.5 here)": true,
+  "a query joins across databases (name.schema.table)": true,
+  "the console is at /": true,
+  "CREATE DATABASE makes one, DROP DATABASE drops it, folder and all; an unknown one is said so": true,
+  "idle databases stop, and start again when used": true,
+  "a database with a connection open isn't stopped, however long it is idle; closed, it stops": true,
+  "another node joins a database's cluster through the server, and writes through it": true,
+  "killed and started again, the server serves the same databases": true,
+  "--flight is refused by name (a Flight port is one lake's)": true,
+  "--lake on a folder of lakes, or --lakes on a lake, is refused and says which was meant": true,
+  "a folder holding other things isn't made a lake, and nor is this folder unless named": true,
+  "stopped, the server stops its databases' nodes": true
+ },
+ "ok": true,
+ "first_write_s": 31.2
+}

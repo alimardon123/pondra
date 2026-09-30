@@ -229,6 +229,21 @@ pub struct DataFile {
     /// Another engine's table's file (`scan.rs`): its partition values and deletes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outside: Option<Box<crate::scan::Outside>>,
+    /// A file recorded as another engine wrote it (ADR-029 §1): its rows' system columns, which it
+    /// doesn't hold, from here (`scan::adopted`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lineage: Option<Lineage>,
+}
+
+/// Where a file's rows' system columns come from when it doesn't hold them: its first row's id
+/// (the next rows' follow, by their place in the file), and the commit that recorded it (their
+/// `_version`) and its time (`_created_at`, `_updated_at`). Iceberg v3's row lineage and Delta's
+/// row tracking give a row its id the same way.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+pub struct Lineage {
+    pub first: i64,
+    pub version: u64,
+    pub ms: u64,
 }
 
 /// One log segment = one node's flush, holding rows for many tables. Small segments are stored

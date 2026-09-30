@@ -51,8 +51,8 @@ pub struct Part {
 }
 
 /// One node's flush: its parts, whose bytes are at `path` (written by the node) or in `data`. Or,
-/// with `reserve`, no rows: a request for that many commit numbers, whose rows a writer stamps
-/// itself (`sys.rs`: a block of row ids each, and the number as the rows' `_version`).
+/// with `reserve` or `block`, no rows: a request for that many commit numbers, whose rows a writer
+/// stamps itself (the number as their `_version`), and for a block of row ids (`sys.rs`).
 #[derive(Serialize, Deserialize, Default)]
 pub struct Flush {
     pub path: String,
@@ -61,9 +61,19 @@ pub struct Flush {
     pub data: Bytes,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub reserve: u64,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub block: bool,
 }
 
 fn is_zero(n: &u64) -> bool { *n == 0 }
+
+/// A log row's place (`_ord`, a Kafka offset): its segment's number, then its position among the
+/// table's rows there. A segment holding more of one table's rows than the low bits count takes
+/// the numbers after it too (`commit`), so the places never meet, and 40 bits of segment numbers
+/// last 34 years at 1,000 commits a second (ADR-029 §11).
+pub const ORD_BITS: u32 = 24;
+
+pub fn ord(seg: u64, row: u64) -> u64 { (seg << ORD_BITS) + row }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Default)]
 pub struct Ack {
@@ -71,9 +81,20 @@ pub struct Ack {
     pub duplicate: bool, // this seq was already committed: nothing to do
     pub conflict: bool,  // `prev` didn't match: someone else committed first; re-read and retry
     #[serde(default)]
-    pub row: u64, // where the rows start among the table's rows in `seg` (their `_ord` is (seg << 32) + row)
+    pub row: u64, // where the rows start among the table's rows in `seg` (their `_ord`: `ord(seg, row)`)
     #[serde(default)]
     pub ms: u64, // a reservation's commit time
+    #[serde(default)]
+    pub block: u64, // a reservation's block of row ids
+}
+
+/// A reservation: a commit number of its own and its time (the `_version` and times of rows a
+/// writer stamps itself), and a block of row ids for them (`sys.rs`).
+#[derive(Clone, Copy, Debug)]
+pub struct Reserved {
+    pub version: u64,
+    pub ms: u64,
+    pub block: u64,
 }
 
 /// The sequencer's answer: an ack per part, or (rarely) "these parts are retries of committed
@@ -102,26 +123,31 @@ pub struct Log {
 pub const SEQ_FROM_1: &str = "a producer's batches count from seq=1 (seq 0 would be taken for a batch already written)";
 
 /// Where flushes go: the sequencer in this process (the leader), or the leader over HTTP.
+#[derive(Clone)]
 pub enum To {
     Local(Arc<Sequencer>),
     Leader(String),
 }
 
 impl To {
-    /// A commit number of its own, and its time (`Sequencer::reserve`).
-    pub async fn reserve(&self) -> Result<(u64, u64)> {
-        match self {
-            To::Local(seq) => seq.reserve().await,
-            To::Leader(addr) => reserve_at(addr).await,
-        }
+    /// A commit number of its own, its time, and a block of row ids (`Sequencer::reserve`).
+    pub async fn reserve(&self) -> Result<Reserved> { self.ask(Flush { reserve: 1, block: true, ..Default::default() }).await }
+
+    /// A block of row ids only.
+    pub async fn block(&self) -> Result<u64> { Ok(self.ask(Flush { block: true, ..Default::default() }).await?.block) }
+
+    async fn ask(&self, f: Flush) -> Result<Reserved> {
+        reserved(match self {
+            To::Local(seq) => seq.submit(f).await?,
+            To::Leader(addr) => http().post(format!("http://{addr}/cluster/commit")).body(encode_flush(&f)?).send().await?.error_for_status()?.json().await?,
+        })
     }
 }
 
-/// `Sequencer::reserve` at the leader, over HTTP.
-pub async fn reserve_at(addr: &str) -> Result<(u64, u64)> {
-    let body = encode_flush(&Flush { reserve: 1, ..Default::default() })?;
-    match http().post(format!("http://{addr}/cluster/commit")).body(body).send().await?.error_for_status()?.json().await? {
-        Outcome::Acks(a) if !a.is_empty() => Ok((a[0].seg, a[0].ms)),
+/// A reservation's answer.
+fn reserved(o: Outcome) -> Result<Reserved> {
+    match o {
+        Outcome::Acks(a) if !a.is_empty() => Ok(Reserved { version: a[0].seg, ms: a[0].ms, block: a[0].block }),
         _ => Err(anyhow!("no reservation")),
     }
 }
@@ -132,7 +158,7 @@ pub async fn ids(lake: &Lake, to: &To, rows: u64) -> Result<i64> {
         if let Some(first) = lake.ids.take(rows) {
             return Ok(first);
         }
-        lake.ids.refill(to.reserve().await?.0);
+        lake.ids.refill(to.block().await?);
     }
 }
 
@@ -300,6 +326,9 @@ impl Sequencer {
     /// (so producers slow down to what the cluster sustains, instead of memory growing).
     pub async fn start(lake: Arc<Lake>, max_backlog: Option<u64>) -> Result<Arc<Sequencer>> {
         let mut next: u64 = lake.cat.get("n").await?.unwrap_or(1);
+        // Row ids' blocks (ADR-029 §11): a counter of their own, which starts above every commit
+        // number (the blocks before it had), and moves only as blocks are taken.
+        let mut block: u64 = lake.cat.get("b").await?.unwrap_or(next);
         crate::views::forget(&lake); // (the views as this leader finds them)
         for (key, meta) in lake.cat.scan::<TableMeta>("t/", "t0").await? {
             let rows = crate::tier::backlog(&lake, meta.tiered, None).await?.get(&key[2..]).copied().unwrap_or(0);
@@ -321,7 +350,7 @@ impl Sequencer {
                 while let Ok(f) = rx.try_recv() {
                     batch.push(f);
                 }
-                if let Err(e) = commit(&lake, &mut next, &mut last_seq, batch, &ms, slot).await {
+                if let Err(e) = commit(&lake, &mut next, &mut block, &mut last_seq, batch, &ms, slot).await {
                     // Committed or not, we can't tell: restart and reload the state from the catalog.
                     eprintln!("sequencer failed: {e:#}");
                     crate::cluster::restart("the sequencer failed");
@@ -333,13 +362,11 @@ impl Sequencer {
 
     pub async fn submit(&self, f: Flush) -> Result<Outcome> { Ok(self.enqueue(f).await?.await?) }
 
-    /// A commit number of its own, and the time: for rows a writer stamps itself (`sys.rs`).
-    pub async fn reserve(&self) -> Result<(u64, u64)> {
-        match self.submit(Flush { reserve: 1, ..Default::default() }).await? {
-            Outcome::Acks(a) if !a.is_empty() => Ok((a[0].seg, a[0].ms)),
-            _ => Err(anyhow!("no reservation")),
-        }
-    }
+    /// A commit number of its own and its time, here (no block of ids: `block`).
+    pub async fn number(&self) -> Result<Reserved> { reserved(self.submit(Flush { reserve: 1, ..Default::default() }).await?) }
+
+    /// `To::block`, here.
+    pub async fn block(&self) -> Result<u64> { Ok(reserved(self.submit(Flush { block: true, ..Default::default() }).await?)?.block) }
 
     /// Queue a flush; its outcome comes once it's committed.
     pub async fn enqueue(&self, f: Flush) -> Result<oneshot::Receiver<Outcome>> {
@@ -357,19 +384,21 @@ pub fn forget_producers(names: impl IntoIterator<Item = String>) { FORGOTTEN.loc
 
 /// Sequence a batch of flushes and write them as one catalog commit. Without waiting for it to
 /// be committed, the next batch can follow; acks go out once this one is.
-async fn commit(lake: &Arc<Lake>, next: &mut u64, last_seq: &mut HashMap<String, u64>, batch: Vec<(Flush, oneshot::Sender<Outcome>)>, ms: &Arc<Mutex<Vec<f64>>>, slot: tokio::sync::OwnedSemaphorePermit) -> Result<()> {
+#[allow(clippy::too_many_arguments)]
+async fn commit(lake: &Arc<Lake>, next: &mut u64, block: &mut u64, last_seq: &mut HashMap<String, u64>, batch: Vec<(Flush, oneshot::Sender<Outcome>)>, ms: &Arc<Mutex<Vec<f64>>>, slot: tokio::sync::OwnedSemaphorePermit) -> Result<()> {
     let (mut puts, mut seqs, mut replies) = (vec![], HashMap::<String, u64>::new(), vec![]);
     let (mut inline, mut inline_parts) = (vec![], BTreeMap::<String, Vec<(u64, u64, u64)>>::new()); // all inline flushes: one segment
     for p in std::mem::take(&mut *FORGOTTEN.lock().unwrap()) {
         last_seq.remove(&p);
     }
-    let views = crate::views::inline(lake).await?;
+    let (views, blocks) = (crate::views::inline(lake).await?, *block);
     puts.extend(crate::views::bound(lake, &views, *next)); // (views made since: their filling ends before this commit)
     for (f, reply) in batch {
-        if f.reserve > 0 {
+        if f.reserve > 0 || f.block {
             // (numbers no segment will take: gaps in the log's sequence, which nothing minds)
-            let ack = Ack { seg: *next, ms: now_ms(), ..Default::default() };
+            let ack = Ack { seg: *next, ms: now_ms(), block: *block, ..Default::default() };
             *next += f.reserve;
+            *block += f.block as u64;
             replies.push((reply, Outcome::Acks(vec![ack])));
             continue;
         }
@@ -423,9 +452,10 @@ async fn commit(lake: &Arc<Lake>, next: &mut u64, last_seq: &mut HashMap<String,
                 u64::MAX // the inline segment's number, set below
             }
             (false, false) => {
-                *next += 1;
-                puts.push((seg_key(*next - 1), json(&Segment { path: f.path, parts, ts_ms: now_ms() })));
-                *next - 1
+                let seg = *next;
+                *next += span(&parts);
+                puts.push((seg_key(seg), json(&Segment { path: f.path, parts, ts_ms: now_ms() })));
+                seg
             }
         };
         acks.iter_mut().enumerate().filter(|(i, _)| !bad.contains(i)).for_each(|(_, a)| a.seg = seg);
@@ -433,7 +463,7 @@ async fn commit(lake: &Arc<Lake>, next: &mut u64, last_seq: &mut HashMap<String,
     }
     if !inline_parts.is_empty() {
         let seg = *next;
-        *next += 1;
+        *next += span(&inline_parts);
         puts.push((data_key(seg), inline));
         puts.push((seg_key(seg), json(&Segment { path: String::new(), parts: inline_parts, ts_ms: now_ms() })));
         for (_, o) in replies.iter_mut() {
@@ -445,6 +475,9 @@ async fn commit(lake: &Arc<Lake>, next: &mut u64, last_seq: &mut HashMap<String,
     // 3. One catalog write for everything; acks once it's committed (see `Lake::commits`).
     puts.extend(seqs.iter().map(|(p, s)| (producer_key(p), json(s))));
     puts.push(("n".into(), json(next)));
+    if *block != blocks {
+        puts.push(("b".into(), json(block)));
+    }
     let (t0, durable) = (Instant::now(), lake.cat.write(puts, &[]).await?);
     last_seq.extend(seqs);
     let (lake, ms, hwm) = (lake.clone(), ms.clone(), *next - 1);
@@ -466,6 +499,10 @@ async fn commit(lake: &Arc<Lake>, next: &mut u64, last_seq: &mut HashMap<String,
     });
     Ok(())
 }
+
+/// The numbers a segment takes: one, and one more for each `1 << ORD_BITS` rows of a table in it
+/// (its rows' places, `ord`, run on into them).
+fn span(parts: &BTreeMap<String, Vec<(u64, u64, u64)>>) -> u64 { 1 + parts.values().map(|p| p.iter().map(|x| x.2).sum::<u64>().saturating_sub(1) >> ORD_BITS).max().unwrap_or(0) }
 
 // ---------------------------------------------------------------- encoding
 

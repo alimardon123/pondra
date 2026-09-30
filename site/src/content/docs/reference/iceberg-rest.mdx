@@ -58,6 +58,9 @@ version for up to `--tier-secs`. `POST /tier` (with the admin token) writes the 
 | `GET /v1/namespaces/{ns}/tables` | the tables of a namespace that publish Iceberg |
 | `GET`, `HEAD /v1/namespaces/{ns}/tables/{table}` | load a table: `metadata-location`, the current metadata, and `config`. `404 NoSuchTableException` if there is none |
 | `POST /v1/namespaces/{ns}/tables/{table}` | commit an append. See [appending](#appending) |
+| `POST /v1/namespaces/{ns}/tables` | make a table, as `CREATE TABLE … WITH (publish = 'iceberg')` does. See [making tables](#making-tables) |
+| `DELETE /v1/namespaces/{ns}/tables/{table}` | `DROP TABLE`, its files with it. `204` |
+| `POST /v1/tables/rename` | `ALTER TABLE … RENAME TO`, within the table's namespace. `204` |
 
 There is no `{prefix}` in the path. These are refused, each with a `400 BadRequestException` whose
 message names the SQL that does it:
@@ -66,14 +69,10 @@ message names the SQL that does it:
 |---|---|
 | `POST /v1/namespaces` | `CREATE SCHEMA` |
 | `DELETE /v1/namespaces/{ns}` | `DROP SCHEMA` |
-| `POST /v1/namespaces/{ns}/tables` | `CREATE TABLE … WITH (publish = 'iceberg')` |
-| `DELETE /v1/namespaces/{ns}/tables/{table}` | `DROP TABLE` |
-| `POST /v1/tables/rename` | `ALTER TABLE … RENAME TO` |
 | `POST /v1/transactions/commit` | a change to several tables at once |
 
 Errors come in the REST API's shape, `{"error": {"message": …, "type": …, "code": …}}`. A client
-that reads `/v1/config` knows which of these the catalog serves, and does not send the others:
-PyIceberg's `create_table` stops with `Server does not support endpoint`.
+that reads `/v1/config` knows which of these the catalog serves, and does not send the others.
 
 ```bash
 # write the new rows to files now, so other engines see them
@@ -120,10 +119,22 @@ table under its new name.
 
 A commit is `POST /v1/namespaces/{ns}/tables/{table}`, as PyIceberg's `append` and Spark's
 `INSERT INTO` and `writeTo(…).append()` send it. The engine writes Parquet files in the table's
-`data/{table}/data/` folder and commits a snapshot. The node reads the files that snapshot adds,
-writes their rows as the table's own (as a bulk `INSERT` does, with row ids and the table's layout,
-sending them through the log when views or tasks follow the table), publishes the table's next
-version under the engine's snapshot id, and deletes the engine's own files.
+`data/{table}/data/` folder and commits a snapshot. The node reads each added file's Parquet footer
+(one ranged read), checks it, and the leader records the files as the table's, where they are, with
+their rows' ids, version and time; then it publishes the table's next version under the engine's
+snapshot id. The rows are never read or written again, so the commit's cost grows with the number of
+files, not the rows.
+
+- **Checked from each footer:** the row count is the manifest's, each column has the table's type
+  (matched by field id, or by name), a `NOT NULL` column holds no NULL, and a partitioned table's
+  file holds one partition value. A file that fails is refused by name with a `400`, and nothing of
+  the commit is recorded.
+- **Copied, not recorded as written:** when views or streaming tasks follow the table (its rows go
+  through the log, for them), and when the table has a renamed or dropped column (Delta readers
+  match columns by name). Then the node writes the rows as the table's own, as a bulk `INSERT` does,
+  and deletes the engine's files.
+- **The layout the metadata publishes is the one to follow:** the table's `partition_by` as its
+  partition spec, a `cluster_by` on one column as its sort order, a key as its identifier fields.
 
 ```python
 import pyarrow as pa
@@ -157,6 +168,23 @@ Iceberg's rules hold. The requirements are checked as one step, under the leader
 made against a table that has changed since the engine read it is answered `409
 CommitFailedException`, and PyIceberg and Spark retry on top of the new version. A commit sent
 again with a snapshot id already recorded is answered as done and applied once.
+
+## Making tables
+
+`POST /v1/namespaces/{ns}/tables` makes the table as `CREATE TABLE` would, published as Iceberg (and
+in whatever else its `publish` property names), and answers its first version:
+
+| Iceberg | Pondra |
+|---|---|
+| `boolean`, `int`, `long`, `float`, `double`, `date`, `timestamp`, `timestamptz`, `string`, `binary`, `decimal(p, s)`, a `list` of one of them | `BOOLEAN`, `INT`, `BIGINT`, `REAL`, `DOUBLE`, `DATE`, `TIMESTAMP`, `TIMESTAMPTZ`, `VARCHAR`, `BYTEA`, `DECIMAL(p, s)`, `type[]` |
+| a required field | `NOT NULL` |
+| `identifier-field-ids` | `PRIMARY KEY` |
+| a partition spec of one field: `identity`, `year`, `month`, `day`, `hour` | `partition_by = 'col'`, `'day(col)'`… |
+| a write order of columns, ascending | `cluster_by` |
+
+Other types (`struct`, `map`, `uuid`, `time`, `fixed`), a spec of more than one field or by `bucket`
+or `truncate`, a descending order and a staged create are refused by name. Making, renaming and
+dropping a table need an admin token when tokens are set, as the SQL does.
 
 <Aside type="caution">
 A delete or overwrite through the catalog is refused: PyIceberg's `table.delete(…)` fails with

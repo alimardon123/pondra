@@ -353,6 +353,7 @@ pub fn columns_of(returns: &str) -> Result<Vec<(String, String)>> {
 /// Leader: keep a function or procedure (`ddl::apply`).
 pub async fn create(lake: &Lake, name: &str, r: Routine, replace: bool) -> Result<Value> {
     let name = crate::ddl::new_name(lake, name).await?;
+    ensure!(r.kind != Kind::Procedure || !crate::workspace::is_run(crate::ddl::split(&name).1), "{name}: run is Pondra's own procedure (CALL run('etl/orders.sql') runs a file of the lake's)");
     if let Some(old) = lake.cat.get::<Routine>(&key(&name)).await? {
         ensure!(replace, "{} {name} already exists (CREATE OR REPLACE {})", old.what(), r.what().to_uppercase());
         ensure!((old.kind == Kind::Procedure) == (r.kind == Kind::Procedure), "{name} is a {}", old.what());
@@ -474,21 +475,20 @@ pub fn bind(sql: &str, params: &HashMap<String, Value>) -> Result<String> {
     }
     let mut stmts = Parser::parse_sql(&GenericDialect {}, sql)?;
     let values = params.iter().map(|(k, v)| Ok((k.clone(), literal(v)?))).collect::<Result<HashMap<_, _>>>()?;
-    let mut missing = None;
+    let mut missing: Vec<String> = vec![];
     let _ = visit_expressions_mut(&mut stmts, |e| {
         if let Expr::Value(v) = e {
             if let ast::Value::Placeholder(p) = &v.value {
                 match values.get(p.trim_start_matches('$')) {
                     Some(to) => *e = Expr::Nested(Box::new(to.clone())),
-                    None => missing = Some(p.clone()),
+                    None if !missing.contains(p) => missing.push(p.clone()),
+                    None => {}
                 }
             }
         }
         ControlFlow::<()>::Continue(())
     });
-    if let Some(p) = missing {
-        bail!("no value for {p}");
-    }
+    ensure!(missing.is_empty(), "no value for {}", missing.join(", "));
     Ok(text(&stmts))
 }
 
@@ -920,6 +920,9 @@ pub async fn one(app: &App, sql: &str, who: Who, job: Option<String>) -> Result<
         return Ok(Outcome::Done(app.checkpoint().await?));
     }
     if let Some((name, args)) = call_of(sql) {
+        if crate::workspace::is_run(&name) {
+            return Box::pin(crate::workspace::run(app, &args, who, job, None)).await; // (a file of the lake's: ADR-033)
+        }
         let (local, r, row) = Box::pin(prepared(app, &name, &args, who)).await?;
         return Box::pin(run(app, local, r, row, who, job, None)).await;
     }
@@ -1067,12 +1070,20 @@ async fn run(app: &App, name: String, r: Routine, row: RecordBatch, who: Who, jo
 /// for in `pondra.runs`.
 fn start<'a>(app: &'a App, name: &'a str, args: &'a [FunctionArg], column: &'a str, who: Who, job: Option<String>) -> futures::future::BoxFuture<'a, Result<Outcome>> {
     Box::pin(async move {
-        let (local, r, row) = Box::pin(prepared(app, name, args, who)).await?;
         let id = crate::runs::new_id();
         let (app2, id2) = (app.clone(), id.clone());
-        tokio::spawn(async move {
-            let _ = Box::pin(run(&app2, local, r, row, who, job, Some(id2))).await; // (its outcome: the run log's)
-        });
+        if crate::workspace::is_run(name) {
+            let args = args.to_vec();
+            crate::workspace::arguments(app, &args).await?; // (its mistakes: said now, not only in the log)
+            tokio::spawn(async move {
+                let _ = Box::pin(crate::workspace::run(&app2, &args, who, job, Some(id2))).await;
+            });
+        } else {
+            let (local, r, row) = Box::pin(prepared(app, name, args, who)).await?;
+            tokio::spawn(async move {
+                let _ = Box::pin(run(&app2, local, r, row, who, job, Some(id2))).await; // (its outcome: the run log's)
+            });
+        }
         let ids = datafusion::arrow::array::StringArray::from(vec![id]);
         let schema = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![datafusion::arrow::datatypes::Field::new(column, datafusion::arrow::datatypes::DataType::Utf8, false)]));
         Ok(Outcome::Rows(vec![RecordBatch::try_new(schema, vec![Arc::new(ids)])?]))
@@ -1080,7 +1091,7 @@ fn start<'a>(app: &'a App, name: &'a str, args: &'a [FunctionArg], column: &'a s
 }
 
 /// The arguments as parameters for SQL: each value exactly, at its own type.
-fn values_of(row: &RecordBatch) -> Result<HashMap<String, Value>> {
+pub fn values_of(row: &RecordBatch) -> Result<HashMap<String, Value>> {
     use datafusion::arrow::util::display::{ArrayFormatter, FormatOptions};
     let mut out = HashMap::new();
     for (f, col) in row.schema().fields().iter().zip(row.columns()) {
@@ -1097,6 +1108,9 @@ tokio::task_local! {
     /// What the procedures a request calls print, for its caller (`with_notices`).
     static NOTICES: Arc<Mutex<Vec<String>>>;
 }
+
+/// A notice for the request being answered (what a procedure or a file run printed).
+pub fn heard(n: &str) { let _ = NOTICES.try_with(|all| all.lock().unwrap().push(n.to_string())); }
 
 /// Run `f`, and collect the notices its procedures send (what they print): the Postgres port sends
 /// them as NOTICE, HTTP as the `x-pondra-notices` header, MCP with the tool's answer.

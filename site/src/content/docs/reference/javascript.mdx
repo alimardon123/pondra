@@ -58,7 +58,7 @@ await db.close();
 | Method | Returns |
 |---|---|
 | `await db.sql(query, params)` | a query's rows, as an array of objects. For other statements (`CREATE`, `INSERT`, `UPDATE`, `DELETE`, `CALL`, several at once), the last one's outcome. `params` gives values for `$name` in the query |
-| `await db.run(file, params = {})` | a `.sql` file's statements in order, or SQL text, with `$name` taking `params.name` |
+| `await db.run(file, params = {})` | a `.sql` file on this machine, or else a `.sql`, `.py` or notebook file of the lake's, run on the node ([Run files as jobs](/pondra/guides/workspace/)); or SQL text. `$name` takes `params.name` |
 
 A parameter is a JSON value: a number, string, boolean, `null` or an array.
 

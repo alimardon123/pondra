@@ -1,6 +1,6 @@
 # Prototype status: Pondra, a streamhouse in one binary
 
-**Date:** 2026-09-29 (round 26 and its continuation) · **Plan:** ADR-002 to ADR-034, `roadmap.md` · **Code:** `pondra.zip` / `pondra.bundle` (≈28,600 lines of Rust, plus Python and JavaScript clients, a documentation website, packaging, and test and benchmark tools)
+**Date:** 2026-09-30 (round 27, and the workspace) · **Plan:** ADR-002 to ADR-034, `roadmap.md` · **Code:** `pondra.zip` / `pondra.bundle` (≈29,400 lines of Rust, plus Python and JavaScript clients, a documentation website, packaging, and test and benchmark tools)
 **Name:** the prototype formerly called `lh` is now **Pondra**. The name is free on crates.io, PyPI and npm. A small personal-finance app uses it (pondra.app), a different category; run a trademark search before a public launch.
 
 ## Where it stands
@@ -14,6 +14,43 @@ One Rust binary replaces the Kafka + Flink + Spark + metastore + ZooKeeper stack
 - upsert and merge tables.
 
 Start more copies on the same bucket to scale out. The only state is object storage. There's no JVM, no database server and no coordination service.
+
+**Round 27 made other engines' appends cost Pondra a commit, not a copy** (ADR-029 phase 1):
+
+1. **Appends as written.** An append through the Iceberg REST catalog is recorded where the writer
+   put its files: the node reads each file's footer once and checks it (the manifest's rows, the
+   table's types, no NULL in a NOT NULL column, one partition value), and never reads or writes the
+   rows. **Measured:** a million rows from PyIceberg cost the two nodes 0.01 s of CPU, against 0.24 s
+   to copy them as round 25 did. Tables that views or tasks follow, or that have a renamed column,
+   still copy (decided by Claude, in the ADR).
+2. **Lineage per file:** a first row id, the commit and its time give the rows' system columns
+   (`_row_id` by Parquet's row number), in every read; `UPDATE` keeps an adopted row's id, and a
+   merge writes the columns out, every row keeping its id and version.
+3. **The layout published for writers:** `partition_by` as the partition spec (PyIceberg then
+   writes a file per day, and Pondra takes them as written; a file of two days is refused), a
+   `cluster_by` column as the sort order, a key as identifier fields.
+4. **Tables made, renamed and dropped through the catalog**, as the SQL does.
+5. **Row ids and log places that can't wrap:** blocks of ids from a counter of their own, and
+   `_ord`/Kafka offsets as the segment shifted by 24 bits (34 years at 1,000 commits a second),
+   a big segment taking the numbers after it.
+6. **Found and fixed:** a column rename reached the published Iceberg schema only with the next
+   files, and PyIceberg refused appends to a renamed table (the name mapping had only the stored
+   name).
+7. **Moved to round 28:** followers fed from the files in one commit, and `/watch`, the change
+   feed and Kafka topics carrying file commits (bulk `INSERT`s' too); adopted files are read from
+   Parquet, not the hot columns, until merged.
+8. **Tests** (`logs/round27/`): `harness.py adopted` (9 checks) and `ids` (2), `writes` updated,
+   `harness.py all`, locally, on simulated R2 and on real R2.
+
+**The workspace (ADR-033), after round 26:** the lake's `.sql`, `.py` and notebook files run as
+jobs, `CALL run('etl/orders.sql', day => DATE '2026-09-29')`, from every door (HTTP, Postgres, MCP,
+Python's and JavaScript's `db.run`, `pondra.run` inside a file, `pondra.start('run', …)`, tasks),
+each run a row of `pondra.runs` named `files/<path>@<version>`. The console gives a SQL file's
+`$name`s inputs, runs a file as a job or on a schedule, and lists the node's runs and schedules.
+Tested (`logs/workspace/`): `harness.py workspace` (13 checks) locally, on simulated R2 and on real
+R2; `harness.py all` locally; `console_check.py` (61 checks; the budget 71.6 of 71.7 KB), and the
+workspace guide's examples. Real R2 also passed `fence` again, and `server` once a new database's
+first write was given longer than 30 s: it took 31 s there, a cold node's many round trips.
 
 **Round 26's continuation** (ADR-032), before the tag, took the owner's asks after seeing the
 round:
@@ -69,8 +106,8 @@ round:
      failover, race, `brand_check.py`, and sqllogictest, locally;
    - `server`, `external`, `procedures` and `found` on simulated R2;
    - `server` and `external` on real R2.
-7. **Proposed, not built:** the server's catalog (ADR-032 §9), a workspace of files, runs and
-   parameters (ADR-033). **Decided:** backward compatibility from 1.0 on, not before.
+7. **Proposed, not built:** the server's catalog (ADR-032 §9). **Decided:** backward
+   compatibility from 1.0 on, not before. (The workspace, ADR-033, is built: below.)
 
 **Round 26, continued again (ADR-034): the console as the owner's canvas drew it.**
 

@@ -1,0 +1,18 @@
+{
+ "workspace": {
+  "a SQL file runs, its $names bound; its answer is its last statement's": true,
+  "a Python file runs with its parameters as variables, its print a notice, its last expression the answer": true,
+  "a notebook runs: the given values replace its parameters cell's, then %%sql and Python cells in turn": true,
+  "a saved notebook by name runs its newest version": true,
+  "files run files: SQL runs Python, Python runs SQL (pondra.run)": true,
+  "files running themselves stop 16 deep": true,
+  "a run retried with its job writes once": true,
+  "every door runs a file: Postgres, MCP, Python's db.run, JavaScript's db.run": true,
+  "pondra.start('run', \u2026): started, not waited for; its row says how it went": true,
+  "a task runs a file on its schedule, the run log naming the task": true,
+  "each run is a row of pondra.runs: files/<path>@<version>, its arguments, how it went": true,
+  "a writer runs SQL files, not Python ones (they need an admin, as DO does)": true,
+  "mistakes said by name: no such file, not a file that runs, a value not named, a name twice, no saved notebook, run is Pondra's": true
+ },
+ "ok": true
+}

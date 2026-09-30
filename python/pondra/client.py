@@ -246,11 +246,20 @@ class Pondra:
         args = "".join(f", {k} => {_literal(v)}" for k, v in options.items() if v is not None)
         return Frame(self, f"SELECT * FROM {fn}({where}{args})")
 
-    def run(self, file, job=None, **params):
-        """A `.sql` file's statements (or the SQL itself), in order, `$name` taking `name`'s value:
-        the last one's rows or outcome."""
-        text = open(file, encoding="utf-8").read() if str(file).endswith(".sql") and os.path.exists(file) else str(file)
-        return self._run(text, params, None, job)
+    def run(self, file, job=None, wait=True, **params):
+        """A file's statements, in order, `$name` taking `name`'s value: the last one's rows or
+        outcome. A `.sql` file here (or SQL itself) runs from here; otherwise a file of the lake's
+        (`etl/orders.sql`, `.py`, `.ipynb`, or `notebooks/<name>`: ADR-033) runs on the node, as `CALL run(…)`, logged in
+        `pondra.runs`; `wait=False` starts it there (a `Run`, as `call`'s)."""
+        where = str(file)
+        if where.endswith(".sql") and os.path.exists(file):
+            return self._run(open(file, encoding="utf-8").read(), params, None, job)
+        if not where.endswith((".sql", ".py", ".ipynb")) and not re.fullmatch(r"(files/)?notebooks/[\w.-]+", where):  # (a saved notebook, by name)
+            return self._run(where, params, None, job)
+        given = "".join(f", {_quote(k)} => {_literal(v)}" for k, v in params.items())  # (quoted: `$myDay` is `myDay`)
+        if wait:
+            return self._run(f"CALL run({_literal(where)}{given})", job=job)
+        return Run(self, self._run(f"SELECT pondra.start('run', {_literal(where)}{given})", job=job).rows()[0]["run"])
 
     def _frame_rows(self, frame, format=None):
         """A frame's rows: a pyarrow Table, or (no pyarrow here) a list of dicts, or the text table

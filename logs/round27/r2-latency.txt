@@ -1,0 +1,1 @@
+09:13:23 R2 from this sandbox now: PUT p50 713 ms (max 1373), GET p50 449 ms (max 481) (the simulator models PUT p50 197 ms, GET p50 100 ms, as R2 measured in earlier rounds)

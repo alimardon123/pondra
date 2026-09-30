@@ -1,6 +1,6 @@
 # ADR-033: A workspace: files, runs and parameters
 
-**Date:** 2026-09-29 · **Status:** proposed (the owner's idea; to be built after the base-binary rounds the owner put first) · **Builds on:** ADR-027 (procedures, schedules and the run log), ADR-030 and ADR-032 (the console, notebooks in the lake)
+**Date:** 2026-09-29 · **Status:** accepted and built, 2026-09-30 (the owner moved it before round 27; the open questions were decided by Claude, marked below, for the owner's review) · **Builds on:** ADR-027 (procedures, schedules and the run log), ADR-030 and ADR-032 (the console, notebooks in the lake), ADR-034 (files edited in place)
 
 ## Context
 
@@ -27,7 +27,7 @@ How the others do it:
 Duckle (an ETL studio on DuckDB) keeps its workspaces as plain files in a folder, which makes
 them git-friendly, and advances a watermark only when a run fully succeeds.
 
-## Decision (proposed)
+## Decision (as proposed; Built, below, says what changed)
 
 ### 1. Files in the lake, edited in the console
 
@@ -90,3 +90,48 @@ The console grows by an editor view for files, reusing the cell's editor.
 - Versions per save (like notebooks), or git as the history.
 - Whether `run` spreads a SQL file's statements over the cluster as any query spreads (yes by
   default), and where a Python file runs (the session's worker, or a fresh one).
+
+## Built (2026-09-30)
+
+What was built, and how the open questions were settled. **Decided by Claude, for the owner's
+review**, where marked.
+
+- **Where the files live:** under the lake's `files/`, as the console's Workspace shows them
+  (ADR-034). No prefix of their own: a file anywhere there runs. *(Decided by Claude.)*
+- **Versions:** a file is replaced in place when saved (ADR-034's `If-Match`), not kept per save;
+  a run records the version that ran (`files/<path>@<etag>` in `pondra.runs`), and git is the
+  history (the console downloads files; a `pondra` command that syncs a folder is left for later).
+  Notebooks keep their versions as before, and `run('notebooks/<name>')` runs the newest.
+  *(Decided by Claude: two kinds of history for text files would be one too many.)*
+- **`CALL run(path, name => value, …)`** (`workspace.rs`): `run` is Pondra's own procedure
+  (`CREATE PROCEDURE run` is refused). Its values are worked out once, as the caller, like a
+  procedure's arguments.
+  - `.sql`: `routines::script`, `$name` bound (never pasted in); the last statement's answer.
+  - `.py`: a namespace of the run's own (a session kernel, ended with the run), the values as
+    variables, prints as notices, the last expression as the answer. *(Decided by Claude: a fresh
+    namespace per run, not the caller's session, so a job never depends on what a page ran.)*
+  - `.ipynb`: code cells in order, `%%sql` ones as SQL (`$name`) and the rest as Python in one
+    namespace; the values given are set after the cell tagged `parameters` (papermill's rule);
+    Jupyter's `%` and `!` lines are skipped.
+- **Every door:** SQL over HTTP and Postgres, MCP's `write` tool, a task, `pondra.start('run', …)`,
+  and the clients: Python's `db.run(path, **values)` (a `.sql` file on the machine if there is one,
+  else the lake's) and `pondra.run` inside a run, JavaScript's `db.run(path, values)`.
+- **Rights:** each statement of a SQL file has the caller's rights; a file that runs Python needs
+  an admin token, as `DO` does. Runs inside runs stop 16 deep.
+- **The job:** a run retried with its job writes once; each statement (and each file it runs) gets
+  its part of the job.
+- **The console:** a SQL file's `$name`s get inputs above the editor, bound on the node; a file's
+  and a notebook's ⋯ has **Run as a job** (`pondra.start('run', …)`) and **Schedule…** (a task);
+  **Runs** lists the node's runs and the schedules (dropped from there).
+- **Mistakes by name:** no such file, a file that doesn't run (`.csv`), a value not named, a name
+  given twice, no saved notebook; a file missing values names all of them (`no value for $region,
+  $amount`).
+- **The console's budget** (ADR-034 §7): the parameters bar, the jobs and Runs took it to 72.4 KB;
+  the served code now leaves out a comment after code too (`console::lean`, when no quote or `/`
+  follows its `//`), which brings it to 71,632 bytes of the 71,680. The next change to the console
+  makes room first.
+- **Tests:** `harness.py workspace` (every door, parameters, notebooks, files running files, the
+  run log, a task, the job, rights, mistakes by name) and `console_check.py files`.
+
+Left for later: a command that syncs files with a git folder, dependencies between runs (a DAG),
+watermarks that advance on success, and dashboards (§4).
