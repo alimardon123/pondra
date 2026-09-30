@@ -1,0 +1,1 @@
+     8  Error during planning: DML not supported: COPY'

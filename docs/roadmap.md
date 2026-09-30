@@ -1,7 +1,7 @@
-# Pondra: what's left, and in what order (after round 26)
+# Pondra: what's left, and in what order (after round 28)
 
-**Date:** 2026-09-28 · **Status:** proposed; the order in "The rounds" is what I recommend, the
-decisions in "What only you can decide" are yours · **Builds on:** ADR-002 to ADR-017,
+**Date:** 2026-09-28, the road to 1.0 added 2026-09-30 · **Status:** proposed; the order in "The
+rounds" is what I recommend, the decisions in "What only you can decide" are yours · **Builds on:** ADR-002 to ADR-017,
 `prototype-status.md`, `comparison-spark-flink-fluss.md`
 
 **Progress (2026-09-29):** rounds 17 to 26 are done (ADR-018 to ADR-030, and ADR-032 for round
@@ -427,6 +427,63 @@ the platform after.
 | J2 ✓ | A workspace (ADR-033, built 2026-09-30): `.sql`, `.py` and notebooks as versioned files, edited in the console, run with parameters from every door (`CALL run(…)`), recorded in the run log, scheduled | ETL without another tool; SQL and Python calling each other | M–L | A SQL file and a Python file chained with parameters, from SQL, Python, JavaScript and the console; a schedule runs a notebook; the run log names each version |
 | J3 | Dashboards and reports: a notebook with parameters shown read-only | What a team shares | M | A report with inputs, refreshed by a schedule |
 
+## The road to 1.0 (proposed 2026-09-30, after round 28)
+
+Twenty-eight rounds made Pondra broad: a streaming store, a lakehouse and a SQL engine in one
+binary, eight doors (HTTP, Postgres, Flight SQL, Kafka, MCP, an Iceberg catalog, the Python and
+JavaScript clients), other engines reading and writing its tables, a console, a docs site. What
+stands between it and *mature* is depth, not more breadth. This one session found:
+
+- **doors that differ:** the console can't read files on the node's machine and the shell can;
+  one key lookup takes 0.17 ms through `/lookup` and 6.5 ms through the Postgres port; `BEGIN`
+  and `COMMIT` are accepted on the Postgres port and do nothing;
+- **a node stopped by its input:** a delete file whose column came back as a string view panicked
+  the node, and every panic stops a node (`panic = "abort"`);
+- **the gates not run, and a regression missed:** rounds 27 and 28 didn't re-measure
+  sqllogictest or TPC-H. Measured on 2026-09-30: sqllogictest held (two records fewer: three
+  answers in an order SQL leaves open, one record newly passing), but TPC-H SF1 from memory went
+  from 2.34 s (round 26) to 3.48 s. Files that carry a lineage (written without a leader, as
+  `pondra sql` does, or while something follows the table: round 27) and an append table's files
+  with deleted rows (round 28's positions) were read from Parquet every time, never through the
+  hot columns. Fixed the same day: 2.03 s, faster than round 26;
+- **the main claim unproven:** on GitHub's runners, over the internet, three nodes ran TPC-H SF10
+  in 23.3 s and six in 23.4 s, against one node's 25.3–25.5 s (v0.26.0). Shuffles over links of up
+  to 67 ms and as slow as 69 MB/s lose, so the guard keeps most queries on one node. Nothing has
+  run in one data centre.
+
+**The proposal: from round 29 to 1.0, no new surface unless a bar below needs it.** Each round
+takes one angle to its bar; every round re-measures all of them.
+
+### The scorecard
+
+| Angle | Today (measured) | The bar for 1.0 | Round |
+|---|---|---|---|
+| **Right answers** | sqllogictest 74.5% (18,460 of 24,783) on one node; TPC-H 22 of 22 on 1, 3 and 6 nodes; no TPC-DS; no random-query test | sqllogictest ≥ 95%, every exception named; TPC-DS's 99 equal to DuckDB's; 100,000 random queries: one node == three == DuckDB | 31 |
+| **Never loses data** | kill -9 and injected crashes, leader kills: every event once, views exact | also a 24-hour soak (0 lost, memory flat); every release's lake opens in the next; a rolling upgrade; time travel and `UNDROP` within a retention you set (today 60 s) | 32 |
+| **Safe** | read, write and admin tokens; plain HTTP between nodes; any panic stops the node | TLS on every door and between nodes; users and grants down to a column; an audit log; quotas; every wire parser fuzzed; no request can stop a node | 29 |
+| **The same from every door** | local files for the shell only; the fast lookup on `/lookup` only; no transactions on the Postgres port | every feature × every door in one test; `BEGIN`…`COMMIT` everywhere; Postgres's error codes; the console signed in as the shell is | 29, 30 |
+| **Fast: analytics** | TPC-H SF1 from files 3.60 s, DuckDB 3.70 s (Polars 3.79 s, the same day); from memory 2.03 s against DuckDB's own tables 1.74 s; Q1 10x Postgres | from memory ≤ DuckDB's own tables at SF1 and SF10; ClickBench published | every round, 33 |
+| **Fast: points and writes** | lookup 0.17 ms (`/lookup`), 6.5 ms (Postgres port; Postgres 0.13 ms); one-row insert 2.3 ms (Postgres 0.3 ms) | ≤ 0.5 ms from every door; `pgbench` runs, balances right | 30 |
+| **Fast from cold** | 6.5–8 s before a node serves, on R2-like storage | a third of that; no burst above the bucket's limits (C5) | 29 |
+| **Scales out** | never run in one data centre; GitHub's runners (above): 3 nodes 8% faster than one | TPC-H SF100: time falls 1 → 3 → 6 machines; faster than Spark on the same VMs | 33 |
+| **Streaming** | Nexmark's q1, q2, q5, q7, q11: 2.2–2.9x Flink on 2 vCPUs (round 21); Fluss compared from its docs | all of Nexmark against Flink; Fluss run head to head | 33 |
+| **Easy to run** | `/metrics`, `/stats`, node logs | a query history table, a query's plan and time across the nodes, a slow-query log; a container image, a compose cluster, a Helm chart; drain before stop; an upgrade guide | 32 |
+| **Fits in** | psql, dbt, SQLAlchemy, JDBC, ODBC, ADBC, Npgsql (Power BI's drivers; Power BI itself not yet run); Spark and PyIceberg write | also Metabase, Superset, Grafana, Tableau, DBeaver; Postgres and MySQL attached; sinks; Kafka partitions | 35 |
+| **Runs anywhere** | Linux, macOS, Windows binaries; pip; npm | also in-process, in the browser; Homebrew, winget, a container; signed binaries | 34, 36 |
+
+### How the work changes
+
+- **Gates as one command** (round 29's first step): `tools/gates.py` runs sqllogictest, TPC-H
+  SF1 against DuckDB, `vs_postgres.py` and a Nexmark subset, and appends a line to
+  `logs/gates/README.md` (its first lines are 2026-09-30's, by hand). A release is tagged only
+  when no gate dropped (a drop explained, as an order SQL leaves open, is recorded as such).
+- **The doors matrix** (round 30): one list of features, run from SQL over HTTP, Postgres, Flight,
+  Python (connection and frames), JavaScript and MCP. A door that can't do one refuses it by name.
+- **A real workload:** one real dataset and job of the owner's, run on Pondra every round. The
+  owner's Windows sessions found more than any test this month.
+- **Scale runs start as soon as there are machines:** round 33 is where their fixes are gathered,
+  not when they start.
+
 ## The rounds
 
 Each round is about one session like the last sixteen, ending with tests on local disk,
@@ -447,11 +504,15 @@ simulated R2 and real R2, an ADR, and a bundle.
 | 26+ ✓ | The workspace (done: ADR-033, moved up by the owner) | J2 | `.sql`, `.py` and notebook files of the lake's run with parameters from every door (`CALL run(…)`), as jobs and on schedules, each run logged by the file's version |
 | 27 ✓ | Anyone's compute, phase 1 (done: ADR-029) | G9: appends as written, the id limit | other engines' appends cost the node only its footers and a commit (a million rows: 0.01 s of CPU against 0.24 s copied); layout published for writers; tables made, renamed and dropped through the catalog; row ids and log places that can't wrap |
 | 28 ✓ | Anyone's compute, phase 2 (done: ADR-029) | G9: changes as written, and what phase 1 moved on | Spark's and PyIceberg's `DELETE`, `UPDATE`, `MERGE` and overwrites on Pondra's tables, copy-on-write and merge-on-read; deletes published as positions (Iceberg delete files, Delta deletion vectors), purges as maintenance; changes carried over Pondra's merges by row id; multi-table transactions; keyed tables published every tier round and taking other engines' upserts and deletes; followers fed from the files in one commit; `/watch`, the change feed and Kafka topics carrying file commits |
-| 29 | Safe to share | E3, G6, C5 | TLS, mutual TLS between nodes, users and grants down to a table, an audit log, quotas; Postgres and MySQL attached; a cold node serving in under a third of today's time, and no burst above what the bucket allows |
-| 30 | Production-ready SQL and frames | D1 to its end, D2, TPC-DS | sqllogictest passing (every exception named), TPC-DS's 99 queries == DuckDB, random queries 1 node == 3 == DuckDB, Polars and PySpark coverage published |
-| 31 | Scale, proven (an ADR of its own: burst) | C1 in one data centre, C2, C4, burst functions | 1 → 3 → 6 machines in one zone; SF100 against Spark; a 24-hour soak; serverless bursts for a big query |
-| 32 | In-process and in the browser | B1, B2, B4 | `pondra.open(…)` without a server; a lake queried in a web page (WebAssembly) |
-| 33+ | Depth, then the platform | G7, H7, E4, I1 (extensions, when the owner places it), F by evidence; J1 (before round 29 if users need it), J3 | sinks, `INSTALL`/`LOAD` extensions, streaming depth, what users show matters; the server's catalog, reports |
+| 29 | Safe to share (as approved, and robust) | E3, C5; no request can stop a node | TLS on every door, mutual TLS between nodes; users and roles with grants down to a column (`CREATE USER`, `GRANT`), one check every door calls; an audit log as a system table; quotas; the console signed in as the shell is (a link with a key, as Jupyter's), so it reads the node's own files; every wire parser fuzzed, a panic in a request answered as an error with the node kept up (the commit path still stops on a broken invariant); a cold node serving in a third of today's time, no burst above the bucket's limits; `tools/gates.py` |
+| 30 | Behaves like a database, from every door | transactions, errors, the point path, constraints | `BEGIN`…`COMMIT`/`ROLLBACK` on every door as one commit (reads from one snapshot, a conflict as Postgres's serialization error); Postgres's error codes everywhere; the key lookup's fast path from every door and prepared statements' plans kept; one-row inserts faster; `UNIQUE`, `CHECK` and identity columns; the doors matrix. Gates: `pgbench`'s own script runs with the balances right; a lookup through the Postgres port ≤ 0.5 ms |
+| 31 | Correct SQL, proven | D1 to its end, D2, TPC-DS | sqllogictest ≥ 95%, every exception named; TPC-DS's 99 queries == DuckDB, one node and three; 100,000 random queries (SQLancer's oracles) one node == three == DuckDB; Polars and PySpark coverage published |
+| 32 | Run it for years | upgrades, recovery, observability, deployment; C4 | a lake format version, and a lake of every release since 0.22 opening in the new one (in CI); a rolling upgrade of a mixed-version cluster; time travel in SQL (`AT`), retention per table, `UNDROP`, zero-copy `CLONE`, `RESTORE`; a query history table, plans and times across the nodes, a slow-query log, traces; a container image, a compose cluster, a Helm chart; drain before stop; a 24-hour soak on R2 |
+| 33 | Scale, proven (machines: the owner's decision 9) | C1, C2, C3, ClickBench, burst | 1 → 3 → 6 machines in one data centre, TPC-H SF100 time falling, against Spark on the same VMs; all of Nexmark against Flink; Fluss head to head; ClickBench submitted; what they find fixed (six nodes' 246 s settle first); serverless bursts for a big query (an ADR of its own) |
+| 34 | In-process and in the browser | B1, B2, B4 | `pondra.open(…)` in Python without a server, Arrow straight into pandas and Polars; a lake queried in a web page (WebAssembly), against DuckDB-WASM |
+| 35 | Fits in | G6, G7, E2, Kafka's partitions | Postgres and MySQL attached and their changes streamed in; sinks; Kafka partitions and transactions; Metabase, Superset, Grafana, Tableau and DBeaver checked; a SQLAlchemy dialect and a dbt adapter packaged |
+| 36 | 1.0 | the promises | what stays stable (the lake format, SQL, the APIs) and how things are deprecated; a security review; signed binaries for Windows and macOS; Homebrew, winget and a container image; the docs complete (every feature from every door, limits, troubleshooting, upgrading); a benchmarks page one command re-runs |
+| after 1.0 | Depth, then the platform | F by evidence, I1, J1, J3 | streaming depth (timers, CEP, Top-N, a watermark per partition), keyed compaction by key range, a vector index, `INSTALL`/`LOAD` extensions, the server's catalog, reports, a managed service |
 
 **Every round, whatever its theme** (the owner's rules: nothing half-done, performance only goes
 up, scale-out is the point):
@@ -487,11 +548,18 @@ Why this order:
 - **Anyone's compute next** (rounds 27 and 28, the owner's choice): ADR-029's two phases, after
   the docs and the console.
 - **Security after that** (round 29): a server others connect to needs users, grants and TLS
-  before anyone else's data goes in. Outside writers (ADR-029) make grants matter more.
-- **Conformance runs every round and finishes in round 30**, before the scale runs, so what is
-  proven at scale is the finished SQL.
-- **The in-process library and the browser come last** of these: the library split is the
-  biggest change, and everything above makes what it exposes settle first.
+  before anyone else's data goes in. Outside writers (ADR-029) make grants matter more. A request
+  that can stop a node is a security hole too, so fuzzing and panics answered as errors go with it.
+- **A database's behaviour before conformance** (round 30): the doors must agree, and
+  transactions exist, before the tests that measure them are finished.
+- **Correct SQL before scale and before promises** (round 31): what is proven at scale and
+  promised stable should be the finished SQL.
+- **Upgrades, recovery and operations before the scale runs** (round 32): a soak and a rolling
+  upgrade are what a data-centre run should exercise.
+- **Scale as soon as there are machines** (round 33 gathers its fixes): it is the main claim, and
+  the one only machines can settle.
+- **The in-process library and the browser after the promises** (round 34): the library exposes
+  the lake format and the APIs, which should settle first.
 
 ## What only you can decide
 
@@ -523,6 +591,17 @@ Why this order:
 7. **The server's catalog (J1).** Proposed in ADR-032 §9. The owner put the base binary first; J1
    may need to come before round 29, since users live above the databases. (The workspace, J2, is
    built: ADR-033.)
+
+8. **A freeze on new surface until 1.0** (proposed 2026-09-30): new features only where a bar of
+   the scorecard needs them; new ideas go to "after 1.0".
+9. **Machines for round 33.** Three to six VMs in one region for a few hours at a time
+   (`tools/cloud/` sets them up; a cloud trial's credit covers it). The sooner the better: the
+   scale runs can begin during any round.
+10. **An `INSERT` of a key that exists.** Today it replaces the row (an upsert), as Fluss's and
+    Paimon's key tables do; Postgres raises an error instead, and Snowflake's and Databricks'
+    ordinary tables don't enforce keys at all. My recommendation: keep the upsert, and add `WITH (on_duplicate =
+    'error')` for tables that want Postgres's behaviour, `ON CONFLICT` working in both.
+11. **Postgres and MySQL attached (G6) move from round 29 to 35**, so round 29 is security alone.
 
 ## What not to do yet
 
