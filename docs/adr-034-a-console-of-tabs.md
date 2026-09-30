@@ -346,6 +346,8 @@ marked*:
   what to do (open in a new file, put in the tab in front, copy, run again, see its plan), and a
   right-click the same. A node's `DO` block logs its code (`pondra.runs.args`: `{"language", "code"}`),
   so Runs names it by its first line, not "do". The clock in the top bar opens Runs, and closes it.
+  **Runs is called History** since (the owner, 2026-10-01): what ran, on the node and on the page;
+  its view keeps the id `runs`, so a layout kept and an extension's `show('runs')` still find it.
 - **The right pane's tabs** reorder by dragging, and Details follows the file in front.
 - **Editors** have a right-click menu: cut, copy, paste, select all, comment, run, and **Format**
   (Shift+Alt+F) of the selection or the whole file, in SQL and Python files and in notebook cells.

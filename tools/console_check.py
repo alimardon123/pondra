@@ -505,7 +505,7 @@ def files_checks(browser, port, show):
     p.locator("#runs .run-item", has_text="scripts_by_region").locator("button[aria-label^='Drop']").click()
     dropped = until(lambda: sql(port, "SELECT count(*) AS n FROM pondra.tasks"), [{"n": 0}], 10)
     p.locator("#rtabs .rtab", has_text="Details").click()
-    checks["a SQL file's $names each get an input, bound on the node; its ⋯ runs it as a job (Runs shows it) and schedules it (a task, dropped from Runs)"] = \
+    checks["a SQL file's $names each get an input, bound on the node; its ⋯ runs it as a job (History shows it) and schedules it (a task, dropped from History)"] = \
         shown == ["$region"] and bound == [["n", "region"], [["10", "r1"]]] and ran is True and isinstance(task, list) and len(task) == 1 and listed == 1 and dropped == [{"n": 0}]
     pg.workspace("scripts", "hello.py").click()
     until(lambda: pg.tab()[0], "hello.py")
@@ -1018,7 +1018,7 @@ def budget_checks(browser, port, show):
         later[name] = len(r.read()) if r.headers.get("content-encoding") == "gzip" else None
     checks["the scripts and style sheet the page loads, gzipped as the node serves them: <= 70 KB; each answers 304 when the browser has it"] = total is not None and total <= 70 * 1024 \
         and set(fresh.values()) == {304}
-    checks["those loaded when first used (a chart, a plan, Runs and Settings, a data file): <= 8 KB each, gzipped"] = all(v is not None and v <= 8 * 1024 for v in later.values())
+    checks["those loaded when first used (a chart, a plan, History and Settings, a data file): <= 8 KB each, gzipped"] = all(v is not None and v <= 8 * 1024 for v in later.values())
     paints = []
     for _ in range(3):
         pg = Page(browser, base + "/")

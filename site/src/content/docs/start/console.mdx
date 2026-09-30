@@ -14,7 +14,7 @@ Every Pondra node serves a console at `/`. Open the node's address in a browser 
 lake's tables and files on the left, your notebooks, SQL, Python and data files in tabs in the
 middle, and on the right the details of whatever you pick and your Python variables. There is nothing
 to install. The page is part of the `pondra` binary: the code it loads first is under 70 KB
-compressed, the rest (charts, plans, Runs, Settings, data files) loads the first time you use it,
+compressed, the rest (charts, plans, History, Settings, data files) loads the first time you use it,
 and its fonts are 53 KB. It works offline, and it sends requests only to the node that served it.
 
 ![The console: the Data and Workspace trees on the left; a notebook in a tab, with a SQL cell and its answer in the grid; on the right, a table's details.](../../../assets/console.png)
@@ -38,15 +38,15 @@ pondra serve lake        # then open http://localhost:8080
 ## The page
 
 - **The top bar:** where the page runs (the database, this node), **search** (**Ctrl+K**: tables,
-  files and commands), the three pane switches (left, bottom, right), **Runs** (it opens the right
-  pane at Runs, and a second click closes it), the keys, **Settings** (the gear) and **Sign in**.
+  files and commands), the three pane switches (left, bottom, right), **History** (the clock: it opens
+  the right pane at History, and a second click closes it), the keys, **Settings** (the gear) and **Sign in**.
 - **The left pane:** a **Filter** box, then **Data** (databases, schemas, tables, views, columns) and
   **Workspace** (the lake's files). The filter narrows both trees to the names that hold what you
   type; **Esc** clears it.
 - **The middle:** a tab per open file. A dot on a tab (and beside the file in the Workspace) means
   it has changes not saved; a new file gets it once you type in it. The file's toolbar shows **Save**
   only when there is something to save, and **Ctrl+S** saves the one in front.
-- **The right pane:** **Details**, **Variables** and **Runs** (the node's jobs and schedules, and
+- **The right pane:** **Details**, **Variables** and **History** (the node's jobs and schedules, and
   what this page ran). Drag a tab to put it in another place.
 - **Each view's ⋯** moves it to the other pane: Workspace can sit as a tab on the right, for
   instance. Drag a pane's edge to set its width (a double-click resets it).
@@ -162,7 +162,7 @@ A file's **⋯** (and a notebook's, in `notebooks`) runs it on the node, where i
 - **Schedule…** makes a task that runs it every so often (`15 minutes`, `1 day`, or a cron line such
   as `cron 0 2 * * * UTC`).
 
-**Runs**, in the right pane (or the clock at the top), lists:
+**History**, in the right pane (or the clock at the top), lists:
 
 - **On the node:** its runs, newest first: what ran (a file, a procedure, or a Python cell's first
   line of code), its id, who ran it and when, how long it took or its error. A running one's row

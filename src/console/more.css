@@ -1,4 +1,4 @@
-/* The console's rarer parts' style (ADR-034, round 29): charts, the plan's graph, Runs, Settings,
+/* The console's rarer parts' style (ADR-034, round 29): charts, the plan's graph, History, Settings,
    search (Ctrl K) and choosing the Python. Loaded with the modules that draw them (more.js,
    chart.js, plan.js), so the page's first load doesn't carry it. */
 .chart{padding:6px 2px 2px}

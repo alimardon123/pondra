@@ -450,5 +450,5 @@ dialog.pop,dialog.settings{padding:0;max-width:620px}
 .msg-h .ic{color:var(--ok)}.msg.bad .msg-h .ic{color:var(--err)}
 .msg>pre{margin:0;padding:6px 12px 8px 36px;max-height:220px;border-top:1px solid var(--line2)}
 .stmt .q{max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font:11.5px var(--mono)}.stmt .m{color:var(--faint)}
-/* the right pane's tabs move by dragging; the top bar's Runs shows when on */
+/* the right pane's tabs move by dragging; the top bar's History shows when on */
 .rtab.drop{box-shadow:inset 2px 0 0 var(--accent)}#runsBtn.on{color:var(--accent);background:var(--accent-soft)}

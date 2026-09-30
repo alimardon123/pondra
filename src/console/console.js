@@ -74,7 +74,7 @@ function drawPanes() {
   $('#panes').replaceChildren(one('left', 'paneL', 'Show or hide the left pane', 'Ctrl B'), one('bottom', 'paneB', 'Show or hide the bottom panel', 'Ctrl J'), one('right', 'paneR', 'Show or hide the right pane', 'Ctrl Alt B'));
 }
 
-/** The top bar's Runs button: pressed while Runs shows; pressed again, the pane closes. */
+/** The top bar's History button: pressed while History shows; pressed again, the pane closes. */
 function drawTop() { const on = !$('#right').hidden && S.tab === 'runs'; $('#runsBtn').classList.toggle('on', on); $('#runsBtn').setAttribute('aria-pressed', String(on)); }
 
 // ------------------------------------------------------------------ views: groups on the left, tabs on the right; either moves to the other side
@@ -526,7 +526,7 @@ function resultDetail(p) {
   return out;
 }
 
-// The rarer parts, loaded when first used (more.js): Runs, Variables, Settings, choosing the
+// The rarer parts, loaded when first used (more.js): History, Variables, Settings, choosing the
 // Python, a table's profile, a file run as a job.
 const more = () => import('./more.js');
 const runs = async () => (await more()).runs(), variables = async () => (await more()).variables(), settings = async () => (await more()).settings();
@@ -713,7 +713,7 @@ function core() {
     { icon: 'plus', title: 'New: a notebook, a file or a folder', domId: 'newfile', menu: false, run: e => newMenu(e.currentTarget) }] });
   register.view({ id: 'details', side: 'right', order: 10, title: 'Details', tree: false, render: (box, p) => p?.type === 'object' ? objectDetail(p.t) : p?.type === 'file' ? fileDetail(p.f) : p?.type === 'result' ? resultDetail(p) : p?.type === 'doc' && S.docs.includes(p.doc) ? docDetail(p.doc) : summary() });
   register.view({ id: 'variables', side: 'right', order: 20, title: 'Variables', tree: false, render: () => variables() });
-  register.view({ id: 'runs', side: 'right', order: 30, title: 'Runs', tree: false, render: () => runs() });
+  register.view({ id: 'runs', side: 'right', order: 30, title: 'History', tree: false, render: () => runs() });
   registerFiles(register);
   NEW.forEach(([id, ic, title, run]) => register.command({ id, title, run }));
   for (const [id, title, keys, fn] of [['search', 'Search tables, files and commands', 'Ctrl K', palette], ['left', 'Show or hide the left pane', 'Ctrl B', () => pane('left')], ['bottom', 'Show or hide the bottom panel', 'Ctrl J', () => pane('bottom')],

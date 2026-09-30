@@ -1,5 +1,5 @@
 // The console's rarer parts (ADR-034, round 29), loaded when first used, so the page's first load
-// doesn't carry them: the Runs view (the node's runs, the schedules, what this page ran), the
+// doesn't carry them: the History view (the node's runs, the schedules, what this page ran), the
 // Variables view, Settings, search (Ctrl K), choosing the Python, a table's profile, a file run as
 // a job. What they use of the shell comes through `R.helpers`.
 import { h, $, secs, count, bytes, utc, icon, svg, S, R, call, run, rows, ident, quote, toast, menu, prompt, confirmed, pop, numeric, moreStyle } from './core.js';
@@ -79,7 +79,7 @@ export async function variables() {
     ...S.vars.map(x => h('div', { class: 'var' }, h('div', { class: 'line1' }, h('span', { class: 'nm' }, x.name), h('span', { class: 'ty' }, x.type + (x.size ? ` · ${x.size}` : ''))), h('div', { class: 'look' }, x.look)))];
 }
 
-/** Runs: the node's (jobs, files run, procedures and tasks: `pondra.runs`), the schedules
+/** History: the node's runs (jobs, files run, procedures and tasks: `pondra.runs`), the schedules
  * (`pondra.tasks`), and what this page ran, newest first. */
 export async function runs() {
   let node = [], tasks = [];
@@ -111,7 +111,7 @@ export async function runs() {
     oncontextmenu: e => { e.preventDefault(); menu(e, pageActs(x).map(([label, run]) => ({ label, run }))); } },
     h('div', { class: 'line1' }, h('span', { class: 'ic k-' + x.kind, html: svg(x.kind === 'python' ? 'filepy' : 'filesql', 14) }), h('span', { class: 'nm' }, oneLine(x.src, 90)), h('span', { class: 'meta ' + (x.ok ? '' : 'bad') }, x.ok ? secs(x.ms) : 'failed')),
     h('div', { class: 'sub' }, `#${x.id} · ${x.where} · ${new Date(x.at).toLocaleTimeString()}${x.rows != null ? ` · ${count(x.rows)} row${x.rows === 1 ? '' : 's'}` : ''}`));
-  return [head('clock', 'Runs', 'jobs and schedules on the node, and what this page ran'),
+  return [head('clock', 'History', 'what ran on the node, its schedules, and what this page ran'),
     h('div', { class: 'dsect' }, 'On the node'), ...node.length ? node.map(nodeRun) : [h('div', { class: 'empty' }, 'No job yet: a file\'s ⋯ runs it as one.')],
     tasks.length ? h('div', { class: 'dsect' }, 'Schedules') : null, ...tasks.map(task),
     h('div', { class: 'dsect' }, 'This page'), ...S.ran.length ? S.ran.map(page) : [h('div', { class: 'empty' }, 'Nothing run yet.')]];
@@ -129,10 +129,10 @@ function pageLook(x) {
 }
 /** A file (or a saved notebook) run on the node, not waited for (ADR-033): now, as a job
  * (`pondra.start('run', …)`), or on a schedule, as a task. What is saved runs, with the SQL file's
- * parameters as they are now; Runs shows it. */
+ * parameters as they are now; History shows it. */
 export async function job(doc, every) {
   if (doc.dirty && !(await doc.save())) return;
-  if (every && !(every = await prompt('Schedule', 'How often', '1 hour', 'For example 15 minutes, 1 day, or cron 0 2 * * * UTC. It runs on the node as CALL run(…), and Runs lists it.'))) return;
+  if (every && !(every = await prompt('Schedule', 'How often', '1 hour', 'For example 15 minutes, 1 day, or cron 0 2 * * * UTC. It runs on the node as CALL run(…), and History lists it.'))) return;
   const path = doc.kind === 'notebook' ? `notebooks/${doc.name}` : doc.path, name = path.replace(/\.[^./]+$/, '').replace(/\W+/g, '_').replace(/^_+|_+$/g, '').toLowerCase() || 'job';
   const args = quote(path) + Object.entries(doc.params?.() || {}).map(([n, v]) => `, ${ident(n)} => ${typeof v === 'string' ? quote(v) : String(v).toUpperCase()}`).join('');
   try {
