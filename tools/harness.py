@@ -4585,7 +4585,7 @@ def server():
     checks["the console is at /"] = b"<html" in call(port, "GET", "/").lower() or b"<!doctype html" in call(port, "GET", "/").lower()
     pq("sales", "CREATE DATABASE hr")
     t0 = time.time()
-    call(port, "POST", "/db/hr/sql", b"CREATE TABLE people AS SELECT 1 AS id", timeout=180 if A.s3 else 30)  # (a new database's first write: its node starts, takes the lease, writes; on R2, seconds each)
+    call(port, "POST", "/db/hr/sql", b"CREATE TABLE people AS SELECT 1 AS id")  # (a new database's first write: its node starts, takes the lease, writes)
     first_write = round(time.time() - t0, 1)
     missing = _raises_text(lambda: pq("nope", "SELECT 1"))
     pq("sales", "DROP DATABASE crm")

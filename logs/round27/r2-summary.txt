@@ -10,4 +10,4 @@
 09:07:38 start serverless
 09:11:32 serverless exit=1
 09:11:32 R2_DONE
-09:13:36 serverless: its one failed check is a time (a node on the idle lake leads in 11.8 s; < 10 s asked) with R2 3-4x slower than in earlier rounds (r2-latency.txt); its rows are exact
+09:13:36 serverless: its one failed check is a time (a node on the idle lake leads in 11.8 s; < 10 s asked) on the far bucket, pondbucket (r2-latency.txt); on the near one it passed (logs/round28/r2-near-serverless.txt); its rows are exact

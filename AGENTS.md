@@ -1320,6 +1320,10 @@ round: the engine first (this), then the console and `--server` (round 26).
 - `ponderabucket-us` (Eastern North America, ~290 ms per PUT from the sandbox; the default);
 - `pondbucket` (~670 ms per PUT).
 
+Set `PONDRA_BUCKET=ponderabucket-us` for test runs: `LH_BUCKET` in `~/.r2env` names `pondbucket`,
+and runs there take two to three times as long (round 27's `server` and `serverless` missed their
+time limits on it, and passed on the near one).
+
 **The owner's R2 free tier is 10 GB.** Test runs delete their lakes; keep at most three lakes in
 all. After R2 runs: `tools/clean_bucket.py --bucket ponderabucket-us --bucket pondbucket --newest
 3 --dry-run`, then without `--dry-run`.

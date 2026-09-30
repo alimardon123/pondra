@@ -58,8 +58,11 @@ each run a row of `pondra.runs` named `files/<path>@<version>`. The console give
 `$name`s inputs, runs a file as a job or on a schedule, and lists the node's runs and schedules.
 Tested (`logs/workspace/`): `harness.py workspace` (13 checks) locally, on simulated R2 and on real
 R2; `harness.py all` locally; `console_check.py` (61 checks; the budget 71.6 of 71.7 KB), and the
-workspace guide's examples. Real R2 also passed `fence` again, and `server` once a new database's
-first write was given longer than 30 s: it took 31 s there, a cold node's many round trips.
+workspace guide's examples. Real R2 also passed `fence` again; `server` and `serverless` missed
+their time limits there only because the runs used the far test bucket (`pondbucket`: PUT p50
+≈660 ms, GET ≈440 ms), and passed with the original limits on the near one (`ponderabucket-us`:
+PUT ≈250–300 ms, GET ≈115–165 ms; a new database's first write 14 s, a node leading an idle lake
+in 5 s: `logs/round28/r2-near-*.txt`).
 
 **Round 26's continuation** (ADR-032), before the tag, took the owner's asks after seeing the
 round:

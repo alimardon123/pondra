@@ -1,0 +1,8 @@
+=== real R2, the near bucket (ponderabucket-us)
+ponderabucket-us: PUT p50 302 ms, GET p50 165 ms
+pondbucket: PUT p50 678 ms, GET p50 457 ms
+11:34:33 start server
+11:38:44 server exit=0
+11:38:44 start serverless
+11:40:47 serverless exit=0
+11:40:47 R2_DONE

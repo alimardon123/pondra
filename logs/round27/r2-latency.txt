@@ -1,1 +1,4 @@
-09:13:23 R2 from this sandbox now: PUT p50 713 ms (max 1373), GET p50 449 ms (max 481) (the simulator models PUT p50 197 ms, GET p50 100 ms, as R2 measured in earlier rounds)
+09:13 R2 from this sandbox: PUT p50 713 ms, GET p50 449 ms — measured on pondbucket, the far test
+bucket, which these runs used (LH_BUCKET in ~/.r2env). Not R2 slowing down: at 11:34 the near
+bucket answered PUT p50 302 ms, GET p50 165 ms, and pondbucket 678 / 457 ms, as in earlier rounds.
+`server` and `serverless` passed with their original limits there (logs/round28/r2-near-*.txt).
