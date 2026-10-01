@@ -109,16 +109,16 @@ Python in one notebook** (the owner's list after the first part):
    DataFrame 45%, Column 64%, reader 64%, writer 61%, its functions 12% defined and 39% by name in
    Pondra's SQL.
 8. **Tests**: every harness suite passes (`versions` once its tie in a millisecond was ordered);
-   `pipelines`, `begin`, `doors`; the changed docs pages' 59 examples.
+   `flows`, `begin`, `doors`; the changed docs pages' 59 examples.
 
-**Then (2026-10-01, round 30): pipelines, and a database's behaviour from every door** (ADR-036):
+**Then (2026-10-01, round 30): flows (ADR-036 calls them pipelines), and a database's behaviour from every door** (ADR-036):
 
-1. **Pipelines** (the owner's ask, as Databricks' DLT has them): a materialized view may follow
+1. **Flows** (the owner's ask, as Databricks' DLT has them): a materialized view may follow
    another, and every stage moves in the commit that wrote the rows that started it (bronze →
    silver → gold, no lag between stages). A view of a GROUP BY view must be a rollup (its keys,
    `sum` of sums and counts, `min` of mins, `max` of maxes), else it is refused saying why; changes
-   (`UPDATE`, `DELETE`) flow down the chain in one commit; a pipeline is dropped from its end.
-   `pondra.pipelines`, and the console's details panel draws each table's pipeline. **History per
+   (`UPDATE`, `DELETE`) flow down the chain in one commit; a flow is dropped from its end.
+   `pondra.flows`, and the console's details panel draws each table's flow. **History per
    key** (SCD type 2): `WITH (history = 'id', sequence_by = 'at', delete_when = '…')` keeps every
    version, each with its `__start_at` and `__end_at` worked out when read, late versions in their
    place, a delete ending its key.
@@ -147,7 +147,7 @@ Python in one notebook** (the owner's list after the first part):
    100,000-row INSERT). In a transaction a lookup reads its own version or its snapshot's
    (6.2 → 0.4 ms); a one-key `UPDATE` of a keyed table is worked out without planning, in a
    transaction (6.5 → 0.7 ms) or not (10.8 → 2.5 ms).
-7. **What a pipeline costs** (`tools/bench/pipeline.py`, 4 producers of 1,000-row batches over
+7. **What a flow costs** (`tools/bench/flow.py`, 4 producers of 1,000-row batches over
    HTTP on this 2-vCPU machine): no view 183,000 rows/s; with silver (two expectations) 156,000;
    with gold 135,000; with platinum 131,000 (−29% for three stages), the append p50 16 → 24 ms;
    at the moment the producers stop, every stage equals its query over the source.
@@ -163,8 +163,8 @@ Python in one notebook** (the owner's list after the first part):
    Flink 7.4 s), 42 MB of memory of its own idle (Spark and Flink over 550 MB).
 10. **Found and fixed:** the new key-lookup work, inline in the statement loop procedures recurse
    through, overflowed a worker's stack 16 procedures deep: put on the heap, as the rest is.
-11. **Tests**: `harness.py pipelines`, `begin`, `doors`, and every other suite; `tools/bench/pgbench.py`,
-    `tools/bench/pipeline.py`, `tools/bench/footprint.py`.
+11. **Tests**: `harness.py flows`, `begin`, `doors`, and every other suite; `tools/bench/pgbench.py`,
+    `tools/bench/flow.py`, `tools/bench/footprint.py`.
 
 **Then (2026-10-01): every file keeps its versions, a stopped run says so, a faster cold start**
 (ADR-035 §8, round 29 part 3):

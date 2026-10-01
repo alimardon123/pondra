@@ -594,6 +594,7 @@ async fn run() -> anyhow::Result<()> {
                     replica::members(lake.clone(), cluster.clone());
                 }
             } else {
+                cluster::catch_up(lake.clone(), cluster.leader.addr.clone()); // (answers wait until this node holds what the leader had)
                 match reader {
                     false => cluster.clone().follow(store),
                     true => cluster.clone().watch_leader(store, streamed), // a reader never votes or leads

@@ -413,6 +413,7 @@ pub struct Lake {
     pub attached: std::sync::RwLock<Vec<(String, Arc<Lake>)>>, // other lakes, read as `name.table` (`--attach`)
     cached: Option<Arc<crate::cache::CachedStore>>, // what DataFusion reads the bucket through
     pub ids: crate::sys::Ids, // the row ids this process stamps rows with (a block reserved from the leader)
+    pub caught: watch::Sender<bool>, // false while a node that just started catches up with its leader (`caught_up`)
     me: std::sync::Weak<Lake>,
 }
 
@@ -567,7 +568,7 @@ impl Lake {
             },
         };
         let hwm = watch::Sender::new(cat.get::<u64>("n").await?.unwrap_or(1) - 1);
-        let lake = Arc::new_cyclic(|me| Lake { url, store, cat, hwm, backlog: Default::default(), rt, tail: Mutex::new((lru::LruCache::unbounded(), 0)), disk, groups: crate::serve::Groups::new(cache_mb() << 19), hot: Arc::new(crate::hot::Hot::new()), attached: Default::default(), ids: Default::default(), cached: cached_store, me: me.clone() });
+        let lake = Arc::new_cyclic(|me| Lake { url, store, cat, hwm, backlog: Default::default(), rt, tail: Mutex::new((lru::LruCache::unbounded(), 0)), disk, groups: crate::serve::Groups::new(cache_mb() << 19), hot: Arc::new(crate::hot::Hot::new()), attached: Default::default(), ids: Default::default(), cached: cached_store, caught: watch::channel(true).0, me: me.clone() });
         lake.hot.watch(); // the decoded columns give memory back when the node needs it
         if let Some(writes) = lake.cat.unstarted.lock().unwrap().take() {
             crate::panics::spawn(lake.clone().commits(writes));
@@ -682,6 +683,16 @@ impl Lake {
             }
         }
         Ok(())
+    }
+
+    /// Wait, 10 s at most, until this node holds what its leader had committed when it started
+    /// (`cluster::catch_up`). A node restarted after a failover would otherwise answer from an older
+    /// catalog than it did before: its view reads no WAL, and the new leader flushes what it took
+    /// over a moment after it leads (a table just made was "not found").
+    pub async fn caught_up(&self) {
+        if !*self.caught.borrow() {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(10), self.caught.subscribe().wait_for(|c| *c)).await;
+        }
     }
 
     /// Non-leaders: catch up with our own catalog view (and prune what it now holds).

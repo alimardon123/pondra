@@ -1251,6 +1251,13 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    drops a subquery's, and Spark sorts by columns it leaves out); a frame's later steps sort again
    only by columns it kept. PySpark's `spark.sql` sends its queries this way, its writes as
    Pondra's SQL. `harness.py sparksql` (its "by a column it leaves out" fails without the first).
+197. **A node that just started answers only once it holds what its leader had** (`cluster::catch_up`,
+   `Lake::caught_up`, in `query::session_at` and `write::on_node_as`; 10 s at most): restarted after
+   a failover, its catalog view reads no WAL, and what the new leader took over from the old one's
+   is flushed a moment after it leads, so a table made just before the kill was "not found" there.
+   A Flight log stream that follows a table skips the commits to other tables instead of sending
+   them as empty chunks. The website's `guides/clusters.mdx` (a node killed and restarted, then
+   asked for that table) failed one run in three under load without it; `cluster.py failover`.
 
 ## Tests: run these before and after any change
 
