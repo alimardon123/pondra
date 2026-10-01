@@ -697,44 +697,67 @@ async fn named_deletes(lake: &Lake, meta: &TableMeta) -> Result<std::collections
     Ok(named)
 }
 
-/// Hourly: delete objects that no catalog entry points to and that are a day old: segments a
-/// node wrote whose commit never happened, Parquet files from crashed tiering or insert jobs.
-/// (A day, because a huge bulk insert writes its files long before it commits them.)
+/// Delete objects that no catalog entry points to and that are a day old: segments a node wrote
+/// whose commit never happened, Parquet files from crashed tiering or insert jobs. (A day, because
+/// a huge bulk insert writes its files long before it commits them.) One part of the lake at a
+/// time, never the whole bucket at once (C5): `log/`, each table's folder, and the folders of
+/// tables gone, each looked at once a day at most, and in each hourly round only as many as a day
+/// of rounds needs to cover them all.
 async fn collect_orphans(lake: &Lake) -> Result<()> {
-    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    use futures::TryStreamExt;
     const HOUR: u64 = 3_600_000;
+    const DAY: u64 = 24 * HOUR;
+    static SWEPT: std::sync::LazyLock<std::sync::Mutex<(u64, std::collections::HashMap<String, u64>)>> = std::sync::LazyLock::new(Default::default);
     let now = crate::log::now_ms();
-    if now - LAST.load(std::sync::atomic::Ordering::Relaxed) < HOUR {
+    if now - SWEPT.lock().unwrap().0 < HOUR {
         return Ok(());
     }
-    LAST.store(now, std::sync::atomic::Ordering::Relaxed);
+    SWEPT.lock().unwrap().0 = now;
+    use object_store::path::Path;
+    let key = |raw: &str| Path::from(raw).to_string(); // (a path as the store lists it: a few characters escaped)
     let tables = lake.cat.scan::<TableMeta>("t/", "t0").await?;
-    let segments = lake.cat.scan::<Segment>("s/", "s0").await?;
-    // A Bloom filter of the paths in use, sized for them, so this costs a few megabytes on a
-    // table of a million files instead of holding every path (ADR-013).
-    let n = segments.len() + tables.iter().map(|(_, m)| m.files.len() + m.garbage.len() + m.garbage_deletes.len() + m.sealed.as_ref().map_or(0, |s| s.files as usize) + 64).sum::<usize>();
-    let mut used = Seen::of(n);
-    segments.iter().for_each(|(_, s)| used.add(&s.path));
-    // (a file and the position-delete files naming it)
-    let named = |f: &DataFile| std::iter::once(&f.path).chain(f.delete_files()).cloned().collect::<Vec<_>>();
-    for (_, m) in &tables {
-        for manifest in crate::manifest::list(lake, m).await? {
-            crate::manifest::files(lake, &manifest).await?.iter().flat_map(named).for_each(|p| used.add(&p));
-            used.add(&manifest.path);
-        }
-        m.sealed.iter().for_each(|s| used.add(&s.list));
-        m.files.iter().flat_map(named).for_each(|p| used.add(&p));
-        m.garbage.iter().chain(&m.garbage_deletes).for_each(|(p, _)| used.add(p));
-    }
-    for prefix in ["log", "data"] {
-        let mut objects = lake.store.list(Some(&object_store::path::Path::from(prefix)));
-        while let Some(o) = objects.next().await {
-            let o = o?;
-            let old = now as i64 - o.last_modified.timestamp_millis() > 24 * HOUR as i64;
+    let folders: std::collections::HashMap<String, &TableMeta> = tables.iter().map(|(k, m)| (key(&format!("data/{}", m.folder(&k[2..]))), m)).collect();
+    let listed = lake.store.list_with_delimiter(Some(&Path::from("data"))).await?; // (one request a thousand folders)
+    let gone = listed.common_prefixes.iter().map(|p| p.to_string()).filter(|p| !folders.contains_key(p));
+    let parts: Vec<String> = std::iter::once("log".to_string()).chain(folders.keys().cloned()).chain(gone).collect();
+    let due: Vec<String> = {
+        let swept = &SWEPT.lock().unwrap().1;
+        let mut due: Vec<(u64, String)> = parts.iter().map(|p| (swept.get(p).copied().unwrap_or(0), p.clone())).filter(|(at, _)| now - at >= DAY).collect();
+        due.sort();
+        due.into_iter().take(parts.len().div_ceil(24).max(1)).map(|(_, p)| p).collect()
+    };
+    for part in due {
+        // A Bloom filter of the paths in use there, sized for them (a few megabytes for a million files: ADR-013).
+        let named = |f: &DataFile| std::iter::once(f.path.clone()).chain(f.delete_files().cloned()).collect::<Vec<_>>();
+        let used = match (part.as_str(), folders.get(&part)) {
+            ("log", _) => {
+                let segments = lake.cat.scan::<Segment>("s/", "s0").await?;
+                let mut used = Seen::of(segments.len());
+                segments.iter().for_each(|(_, s)| used.add(&key(&s.path)));
+                used
+            }
+            (_, Some(m)) => {
+                let mut used = Seen::of(m.files.len() + m.garbage.len() + m.garbage_deletes.len() + m.sealed.as_ref().map_or(0, |s| s.files as usize) + 64);
+                for manifest in crate::manifest::list(lake, m).await? {
+                    crate::manifest::files(lake, &manifest).await?.iter().flat_map(named).for_each(|p| used.add(&key(&p)));
+                    used.add(&key(&manifest.path));
+                }
+                m.sealed.iter().for_each(|s| used.add(&key(&s.list)));
+                m.files.iter().flat_map(named).for_each(|p| used.add(&key(&p)));
+                m.garbage.iter().chain(&m.garbage_deletes).for_each(|(p, _)| used.add(&key(p)));
+                used
+            }
+            _ => Seen::of(0), // (a table gone: nothing there is in use)
+        };
+        let at = Path::parse(&part)?; // (as listed: already escaped)
+        let objects: Vec<object_store::ObjectMeta> = lake.store.list(Some(&at)).try_collect().await?;
+        for o in objects {
+            let old = now as i64 - o.last_modified.timestamp_millis() > DAY as i64;
             if old && !used.has(o.location.as_ref()) && !crate::delta::open_format(o.location.as_ref()) {
-                lake.delete(o.location.as_ref()).await;
+                let _ = object_store::ObjectStoreExt::delete(&lake.store, &o.location).await; // (by the listed path itself)
             }
         }
+        SWEPT.lock().unwrap().1.insert(part, now);
     }
     Ok(())
 }

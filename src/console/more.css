@@ -135,3 +135,9 @@ dialog.pop:has(.sa){max-width:860px;width:calc(100% - 40px)}.sa{display:flex;fle
 .bars .b{height:6px;border-radius:3px;background:var(--accent);opacity:.75}
 .bars .n{font-variant-numeric:tabular-nums;text-align:right}
 .defn{margin:0;padding:10px 12px;background:var(--surface);border:1px solid var(--line);border-radius:8px;font:12px/1.55 var(--mono);white-space:pre-wrap;overflow-wrap:anywhere}
+/* a file's versions (versions.js) */
+dialog.pop.wide{max-width:980px;width:calc(100% - 40px)}.vers{display:grid;grid-template-columns:minmax(200px,280px) 1fr;gap:14px;min-height:46vh}
+.vlist{overflow:auto;max-height:62vh;padding-right:8px;border-right:1px solid var(--line2)}.vlist .meta{margin-left:auto}.vdiff{overflow:auto;max-height:62vh;min-width:0}
+.dpre{margin:0;font:12px/1.55 var(--mono);color:var(--ink)}.dl{white-space:pre-wrap;word-break:break-all;padding:0 8px 0 4px;border-radius:3px}.dl .mk{display:inline-block;width:16px;color:var(--faint);user-select:none}
+.dl.plus{background:color-mix(in srgb,var(--ok) 15%,transparent)}.dl.minus{background:color-mix(in srgb,var(--err) 13%,transparent)}.dl.fold{color:var(--faint);font-style:italic;padding:2px 20px}
+@media (max-width:720px){.vers{grid-template-columns:1fr}.vlist{border-right:0;max-height:24vh}}

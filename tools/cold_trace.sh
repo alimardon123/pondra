@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # A cold node's bucket requests, one by one: the simulator (near R2's latency) traces each request,
 # a node starts on a new lake and runs a first write, then starts again on the same lake (C5).
+# Then what each node said of its own steps (PONDRA_TRACE_START): which step the time went to.
 # usage: tools/cold_trace.sh [put_p50_ms get_p50_ms]   (the simulator only: its credentials are fake)
 set -u; P=$(cd "$(dirname "$0")/.." && pwd); W=$(mktemp -d); SP=9571; NP=8571
 python3 "$P/tools/sim_r2.py" --port $SP --put-p50 "${1:-300}" --get-p50 "${2:-165}" --trace > "$W/trace" 2>/dev/null & SIM=$!
@@ -9,7 +10,7 @@ for i in $(seq 100); do curl -s -o /dev/null "$AWS_ENDPOINT/__sim/stats" && brea
 python3 -c "import boto3; boto3.client('s3', endpoint_url='$AWS_ENDPOINT', region_name='us-east-1', aws_access_key_id='k', aws_secret_access_key='s').create_bucket(Bucket='coldbucket')"
 mark() { echo "$(date +%s.%N | cut -c1-14) $1" >> "$W/marks"; }
 run() { # label, statement
-  mark "$1 start"; "$P/target/release/pondra" serve --lake s3://coldbucket/lake --addr 127.0.0.1:$NP > "$W/$1.log" 2>&1 & N=$!
+  mark "$1 start"; PONDRA_TRACE_START=1 "$P/target/release/pondra" serve --lake s3://coldbucket/lake --addr 127.0.0.1:$NP > "$W/$1.log" 2>&1 & N=$!
   for i in $(seq 3000); do curl -s -o /dev/null localhost:$NP/stats && break; sleep 0.02; done; mark "$1 serving"
   curl -s -X POST localhost:$NP/sql -d "$2" > /dev/null; mark "$1 answered"; kill $N; wait $N 2>/dev/null
 }
@@ -33,4 +34,5 @@ for run in ["new", "existing"]:
     for t, k, p in start:
         print(f"  +{t - s:5.2f} {k:4} {p}")
 PY
+for r in new existing; do echo "== $r: the node said"; grep "^start:" "$W/$r.log"; done
 rm -rf "$W"

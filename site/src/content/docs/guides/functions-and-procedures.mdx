@@ -470,7 +470,7 @@ DROP TASK nightly;
 ## See what ran
 
 Every procedure call is a row of `pondra.runs`: routine, caller, node, arguments, start, end, status
-(`running`, `ok`, `failed`), notices and error. A file's run is named `files/<path>@<version>`. Rows go after 30 days (`PONDRA_RUNS_DAYS`).
+(`running`, `ok`, `failed`, or `stopped` when its node stopped while it ran), notices and error. A file's run is named `files/<path>@<version>`. Rows go after 30 days (`PONDRA_RUNS_DAYS`).
 
 ```sql
 SELECT routine, caller, status, notices FROM pondra.runs ORDER BY started DESC LIMIT 3;

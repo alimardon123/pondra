@@ -446,8 +446,8 @@ its output; and deletes it. A right-click in its code has cut, copy, paste, comm
 (**Shift+Alt+F**: SQL here, Python by the node's ruff or black, as in files), a SQL cell's **Create
 as table or view…**, and **Make it Python** (or **Make it SQL**): the same query either way, `SELECT
 …` becoming `db.sql("""SELECT …""")` and back, so any cell moves between the two.
-The notebook's own **⋯** (in its toolbar) lists its versions, downloads it as `.ipynb` and clears
-every output. **Ctrl+K** finds every command: a new notebook, file or folder, **Upload a file…**,
+The notebook's own **⋯** (in its toolbar) shows its **Versions…**, downloads it as `.ipynb` and
+clears every output. **Ctrl+K** finds every command: a new notebook, file or folder, **Upload a file…**,
 restarting or choosing Python, the token, the keys.
 
 ## Live answers
@@ -468,14 +468,16 @@ program appending over HTTP) shows in the cell within a fraction of a second. Th
 
 **Ctrl+S** saves the notebook in the lake, under the name in its toolbar:
 
-- In the `notebooks` folder each save is a new version, `files/notebooks/<name>/<time>.ipynb`, so
-  every version stays (other files are replaced in place).
-- The Workspace's `notebooks` folder opens the latest version. **Versions…** in the notebook's **⋯**
-  lists every version in Details; click one to open it.
-- A notebook can live in any other folder: **New notebook here** in its menu, or an `.ipynb`
-  uploaded there. It is one plain file, `<folder>/<name>.ipynb`, and **Ctrl+S** replaces it in place
-  (refused if someone saved it since you opened it, as any file is). It has no versions, and no jobs
-  or schedules.
+- It is one file, `files/notebooks/<name>.ipynb`, or `<folder>/<name>.ipynb` in any other folder
+  (**New notebook here** in a folder's menu, or an `.ipynb` uploaded there). **Ctrl+S** replaces it
+  in place, refused if someone saved it since you opened it, as any file is.
+- **Every file keeps its versions**, notebooks or not: each save, with who made it and when.
+  **Versions…** in a file's **⋯** (or in the Workspace's menu, or in Details) lists them; pick one to
+  see what changed since, line by line, and **Restore this version** to make it the file again. A
+  deleted file keeps its versions too.
+- A notebook saved before versions, as `notebooks/<name>/<time>.ipynb`, still opens; its next save
+  makes it `notebooks/<name>.ipynb`, and its earlier saves are among its versions.
+- Any notebook can be a job or a schedule (**Run all ▾**), and a run records the version it ran.
 - Everyone who can read the lake can open them. They are files like any other, so you can list them
   in SQL:
 

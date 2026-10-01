@@ -25,6 +25,8 @@
   harness.py external            CREATE EXTERNAL TABLE: a named view of files, INSERT into a folder's, what it refuses
   harness.py server              pondra serve <folder of lakes>: each a database (Postgres, HTTP, joins, idle, restart)
   harness.py safety              panics answered as errors, TLS at every door, mutual TLS, the audit log, quotas
+  harness.py versions            every file keeps its versions: listed, read, restored, kept after a delete, retention, old notebooks
+  harness.py stopped             a run whose node was killed under it: stopped, not running for good
   harness.py load    --secs 30   throughput, ack latency, freshness, catalog commit latency
   harness.py all                 quick run of everything
 """
@@ -5400,9 +5402,108 @@ def safety():
     return ok
 
 
+def versions():
+    """Every file keeps its versions (ADR-035 §8): each save through PUT /files kept with who made
+    it and when, listed newest first, read back, restored (itself kept as the newest); a deleted
+    file keeps them; files() doesn't list them; the newest PONDRA_FILE_VERSIONS stay; a notebook
+    saved before versions (notebooks/<name>/<time>.ipynb) has those saves as versions of
+    notebooks/<name>.ipynb, and CALL run('notebooks/<name>') runs the one file once it is saved
+    again; nothing outside a file's own versions is read through ?version=."""
+    import base64, urllib.parse
+    lake = new_lake()
+    node = Node(lake, A.port, admin_token="a-tok", python=sys.executable, env={"PONDRA_FILE_VERSIONS": "3", "PYTHONPATH": os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "python")}).start()
+    admin = {"authorization": "Bearer a-tok"}
+    def go(method, path, body=b"", headers=None):
+        c = http.client.HTTPConnection("127.0.0.1", A.port, timeout=60)
+        c.request(method, path, body.encode() if isinstance(body, str) else body, {**admin, **(headers or {})})
+        r = c.getresponse()
+        return r.status, r.read().decode(errors="replace"), r.getheader("etag")
+    def put(path, text, headers=None):
+        status, body, _ = go("PUT", f"/files/{path}", text, headers)
+        return status, json.loads(body) if status == 200 else body
+    def save(path, text, **h):
+        etag = go("GET", f"/files/{path}")[2]
+        return put(path, text, {"if-match": etag, **h} if etag else h)
+    listed = lambda path: json.loads(go("GET", f"/files/{path}?versions")[1])
+    read = lambda path, v=None: go("GET", f"/files/{path}" + (f"?version={urllib.parse.quote(v)}" if v else ""))[:2]
+    checks, info = {}, {}
+    call(A.port, "POST", "/sql", b"CREATE USER ann PASSWORD 'ann-password-1'", headers=admin)
+    call(A.port, "POST", "/sql", b"GRANT INSERT ON ALL TABLES TO ann", headers=admin)
+    for i, text in enumerate(["SELECT 1 AS v", "SELECT 2 AS v"]):
+        save("etl/a.sql", text)
+    ann = {"authorization": "Basic " + base64.b64encode(b"ann:ann-password-1").decode()}
+    etag = go("GET", "/files/etl/a.sql")[2]
+    c = http.client.HTTPConnection("127.0.0.1", A.port, timeout=60)
+    c.request("PUT", "/files/etl/a.sql", b"SELECT 3 AS v", {**ann, "if-match": etag})
+    ann_put = c.getresponse().status
+    vs = listed("etl/a.sql")
+    info["listed"] = vs
+    oldest = vs[-1]["id"] if vs else ""
+    checks["each save kept: newest first, by whom (a user, the admin token), its bytes read back"] = ann_put == 200 and [v["who"] for v in vs] == ["ann", "admin", "admin"] \
+        and read("etl/a.sql", oldest) == (200, "SELECT 1 AS v") and read("etl/a.sql", vs[0]["id"]) == (200, "SELECT 3 AS v") and vs[0]["at"] >= vs[-1]["at"]
+    gone = go("DELETE", "/files/etl/a.sql")[0]
+    after_delete = listed("etl/a.sql")
+    restored = go("POST", f"/files/etl/a.sql?restore={urllib.parse.quote(oldest)}")
+    now = read("etl/a.sql")
+    files_listed = call(A.port, "POST", "/sql", b"SELECT path FROM files() ORDER BY path", headers=admin)
+    checks["a deleted file keeps its versions; one restored is the file again, kept as the newest; files() doesn't list them"] = gone == 200 and len(after_delete) == 3 \
+        and restored[0] == 200 and now == (200, "SELECT 1 AS v") and files_listed == [{"path": "files/etl/a.sql"}]
+    for i in range(4):
+        save("etl/b.sql", f"SELECT {i}")
+    kept = until(lambda: len(listed("etl/b.sql")), 3, 10)
+    checks["the newest PONDRA_FILE_VERSIONS (3) stay"] = kept == 3 and read("etl/b.sql", listed("etl/b.sql")[0]["id"]) == (200, "SELECT 3")
+    nb = lambda n: json.dumps({"cells": [{"cell_type": "code", "metadata": {}, "source": [f"%%sql\nSELECT {n} AS n"], "outputs": [], "execution_count": None}], "metadata": {}, "nbformat": 4, "nbformat_minor": 5})
+    put("notebooks/old/2026-01-01T00-00-00-000Z.ipynb", nb(1))
+    put("notebooks/old/2026-02-01T00-00-00-000Z.ipynb", nb(2))
+    before = listed("notebooks/old.ipynb")
+    ran_before = call(A.port, "POST", "/sql", b"CALL run('notebooks/old')", headers=admin)
+    put("notebooks/old.ipynb", nb(3))
+    ran_after = call(A.port, "POST", "/sql", b"CALL run('notebooks/old')", headers=admin)
+    both = listed("notebooks/old.ipynb")
+    info["notebook"] = {"before": before, "ran": [ran_before, ran_after], "both": both}
+    checks["a notebook saved before versions: its saves are versions of notebooks/<name>.ipynb; run('notebooks/<name>') runs the one file once there"] = \
+        [v["id"] for v in before] == ["notebooks/old/2026-02-01T00-00-00-000Z.ipynb", "notebooks/old/2026-01-01T00-00-00-000Z.ipynb"] \
+        and read("notebooks/old.ipynb", before[-1]["id"])[0] == 200 and ran_before == [{"n": 2}] and ran_after == [{"n": 3}] and len(both) == 3
+    refused = [read("notebooks/old.ipynb", "../../t/x")[0], read("notebooks/old.ipynb", "notebooks/other/x.ipynb")[0], read("etl/a.sql", "notebooks/old/2026-01-01T00-00-00-000Z.ipynb")[0]]
+    checks["nothing but a file's own versions is read through ?version="] = all(r >= 400 for r in refused)
+    info["refused"] = refused
+    node.kill()
+    ok = all(checks.values())
+    print(json.dumps({"versions": checks, "ok": ok, "info": info}, indent=1, default=str))
+    return ok
+
+
+def stopped():
+    """A run whose node stopped under it (round 29 part 3): a procedure started without waiting
+    (pondra.start) is `running` in pondra.runs; the node is killed (-9) and started again at the
+    same address; the run is then `stopped`, saying whose node, not `running` for good. A run on
+    a node still up is left alone."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    env = {"PYTHONPATH": os.path.join(here, "..", "python")}
+    lake = new_lake()
+    node = Node(lake, A.port, env=env, python=sys.executable).start()
+    sql(A.port, "CREATE PROCEDURE slow(secs DOUBLE) LANGUAGE python AS $$\nimport time\ntime.sleep(secs)\nreturn 'slept'\n$$")
+    long_run = sql(A.port, "SELECT pondra.start('slow', 600.0) AS run")[0]["run"]
+    status = lambda run: (sql(A.port, f"SELECT status, error FROM pondra.runs WHERE id = '{run}'") or [{}])[0]
+    running = until(lambda: status(long_run).get("status"), "running", 30)
+    node.kill()
+    node = Node(lake, A.port, env=env, python=sys.executable).start()
+    after = until(lambda: status(long_run).get("status"), "stopped", 30)
+    said = status(long_run).get("error") or ""
+    short_run = sql(A.port, "SELECT pondra.start('slow', 3.0) AS run")[0]["run"]
+    mid = until(lambda: status(short_run).get("status"), "running", 30)
+    done = until(lambda: status(short_run).get("status"), "ok", 60)
+    checks = {"a run whose node was killed and started again: stopped, saying whose node, not running for good": running == "running" and after == "stopped" and f"127.0.0.1:{A.port}" in said and "stopped while it ran" in said,
+              "a run on the node that is up: running, then ok": mid == "running" and done == "ok"}
+    node.kill()
+    ok = all(checks.values())
+    print(json.dumps({"stopped": checks, "ok": ok, "info": {"said": said, "statuses": [running, after, mid, done]}}, indent=1, default=str))
+    return ok
+
+
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    out = {t.__name__: t() for t in (upsert, deal, outside, clouds, kafkas, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, found, renames, workspace, server, scale, flight, users, secrets, safety, reader, crash)}
+    out = {t.__name__: t() for t in (upsert, deal, outside, clouds, kafkas, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, found, renames, workspace, server, scale, flight, users, secrets, safety, versions, stopped, reader, crash)}
     A.secs = min(A.secs, 20)
     out["load"] = load()
     print(json.dumps(out, indent=1))
@@ -5410,7 +5511,7 @@ def all_tests():
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "found", "renames", "workspace", "server", "scale", "flight", "users", "secrets", "safety", "load", "all"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "found", "renames", "workspace", "server", "scale", "flight", "users", "secrets", "safety", "versions", "stopped", "load", "all"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -5421,4 +5522,4 @@ if __name__ == "__main__":
     ap.add_argument("--secs", type=int, default=30)
     ap.add_argument("--flush-ms", type=int, default=250)
     A = ap.parse_args()
-    {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "safety": safety, "load": load, "all": all_tests}[A.mode]()
+    {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "safety": safety, "versions": versions, "stopped": stopped, "load": load, "all": all_tests}[A.mode]()

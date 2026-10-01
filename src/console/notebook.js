@@ -253,7 +253,6 @@ export function cellsOf(nb) {
   });
 }
 export const cleanName = s => s.trim().replace(/\.ipynb$/i, '').replace(/^notebooks\//, '').replace(/[^\w.-]+/g, '-').replace(/^[.-]+|-+$/g, '').slice(0, 80);
-const stampOf = () => new Date().toISOString().replace(/[:.]/g, '-');
 /** A notebook's versions in the lake, newest first: `[{ version, written }]`. */
 export async function versions(name) {
   const fs = await rows(`SELECT path, written FROM files('notebooks/${name.replace(/'/g, "''")}/') ORDER BY path DESC`);
@@ -369,18 +368,19 @@ export class Notebook {
       nbformat: 4, nbformat_minor: 5,
     };
   }
-  /** Save in the lake as a new version (a file in the lake is never replaced, so every version stays), or a plain file in place. */
+  /** Save it in place, `<dir><name>.ipynb` (the node keeps each save as a version: ADR-035 §8). A
+   * notebook saved before that, as `notebooks/<name>/<time>.ipynb`, becomes `notebooks/<name>.ipynb`. */
   async save() {
     const input = $('#nbname');
     const name = input && input.value !== this.name ? cleanName(input.value) : this.name;
     if (!name) { toast('Give the notebook a name first', true); input?.focus(); return false; }
     this.name = name; if (input) input.value = name;
-    const version = stampOf(), path = this.plain ? this.path : `notebooks/${name}/${version}.ipynb`, body = JSON.stringify(this.notebook(), null, 1) + '\n';
+    if (!this.plain) { this.dir = 'notebooks/'; this.version = null; }
+    const path = this.path, body = JSON.stringify(this.notebook(), null, 1) + '\n';
     try {
-      if (this.plain) { const v = await writeFile(path, body, this.version, 'application/x-ipynb+json'); if (!v) return false; this.version = v; } // (refused, with a word, if someone saved it since)
-      else { await call(fileUrl(path), { method: 'PUT', body, headers: { 'content-type': 'application/x-ipynb+json' } }); this.version = version; }
+      const v = await writeFile(path, body, this.version, 'application/x-ipynb+json'); if (!v) return false; this.version = v; // (refused, with a word, if someone saved it since)
       this.written = Date.now(); this.saved();
-      toast(this.plain ? `Saved: files/${path}` : `Saved: ${name} (a new version)`);
+      toast(`Saved: files/${path}`);
       emit('saved', this, `files/${path}`);
       return true;
     } catch (e) {
@@ -407,11 +407,10 @@ export class Notebook {
       R.helpers.runButton(this.busy, { label: 'Run all', title: 'Run every cell, in order (Ctrl+Shift+Enter)', run: () => this.runSome(0), stop: () => this.interrupt(), stopTitle: 'Stop the cells running (Python\'s are interrupted, their variables kept)' }, [
         { label: 'Run all', icon: 'play', keys: 'Ctrl Shift Enter', run: () => this.runSome(0) }, { label: 'Run the cells above', icon: 'arrowUp', run: () => this.runSome(0, i()) },
         { label: 'Run this and the cells below', icon: 'arrowDown', run: () => this.runSome(i()) }, '-', { label: 'Clear every output', icon: 'clear', run: () => this.clearOutputs() },
-        // (a job runs a notebook of notebooks/, with its versions: not a plain file)
-        ...this.plain ? [] : ['-', { label: 'Run as a job', icon: 'play', run: () => R.helpers.job(this) }, { label: 'Schedule…', icon: 'clock', run: () => R.helpers.schedule(this) }]]),
+        '-', { label: 'Run as a job', icon: 'play', run: () => R.helpers.job(this) }, { label: 'Schedule…', icon: 'clock', run: () => R.helpers.schedule(this) }]),
       pill, R.helpers.saveButton(this),
       h('button', { class: 'icon', title: 'More', 'aria-label': 'More', onclick: e => menu(e.currentTarget, [
-        this.plain ? null : { label: 'Versions…', icon: 'clock', run: () => R.helpers.pickFile(`files/${this.path}`) },
+        { label: 'Versions…', icon: 'clock', run: () => R.helpers.versions(this) },
         { label: 'Download as .ipynb', icon: 'down', run: () => saveAs(JSON.stringify(this.notebook(), null, 1) + '\n', 'application/x-ipynb+json', this.name + '.ipynb') }]) }, icon('dots'))];
   }
   status() { return [`${this.cells.length} cell${this.cells.length === 1 ? '' : 's'}`, 'Notebook']; }

@@ -680,6 +680,11 @@ async fn keys(lake: &Lake) -> Result<Keys> {
     if let Some(k) = KEYS_HERE.lock().unwrap().get(&lake.url) {
         return Ok(k.clone());
     }
+    static MAKING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(()); // (made once: a request may ask while the leader makes them)
+    let _one = MAKING.lock().await;
+    if let Some(k) = KEYS_HERE.lock().unwrap().get(&lake.url) {
+        return Ok(k.clone());
+    }
     let k = match lake.cat.get::<Keys>(KEYS).await? {
         Some(k) => k,
         None => {

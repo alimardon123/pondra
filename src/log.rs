@@ -311,7 +311,7 @@ pub async fn pack_with(lake: &Lake, pending: &[Append], followed: BTreeMap<Strin
     }
     let mut f = Flush { parts, ..Default::default() };
     if data.len() > inline_bytes() {
-        f.path = format!("log/{:015}-{}.seg", now_ms(), uuid::Uuid::new_v4());
+        f.path = format!("log/{}-{:015}.seg", uuid::Uuid::new_v4().simple(), now_ms()); // (a random first part: every node's flushes spread over the key range, C5; the catalog holds each path)
         lake.put(&f.path, data).await?;
         maybe_crash("after_seg_put");
     } else {

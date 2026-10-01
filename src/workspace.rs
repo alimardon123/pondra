@@ -72,9 +72,13 @@ pub async fn run(app: &App, args: &[FunctionArg], who: Who, job: Option<String>,
     out.map_err(|e| e.context(format!("run {path}")))
 }
 
-/// A notebook's newest version (`files/notebooks/<name>/<time>.ipynb`: the times sort).
+/// A notebook by name: `notebooks/<name>.ipynb` (its versions kept with it, ADR-035 §8), or, saved
+/// before that, its newest `notebooks/<name>/<time>.ipynb` (the times sort).
 async fn latest(app: &App, notebook: &str) -> Result<String> {
     use futures::TryStreamExt;
+    if app.lake.version(&format!("{notebook}.ipynb")).await.is_ok() {
+        return Ok(format!("{notebook}.ipynb"));
+    }
     let found: Vec<object_store::ObjectMeta> = app.lake.store.list(Some(&object_store::path::Path::from(format!("{notebook}/")))).try_collect().await?;
     found.into_iter().map(|m| m.location.to_string()).filter(|p| p.ends_with(".ipynb")).max().with_context(|| format!("run: no notebook {notebook} (none saved)"))
 }

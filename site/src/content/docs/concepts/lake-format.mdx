@@ -77,7 +77,7 @@ lake/data/orders/metadata
 | `log/` | Rows not yet in Parquet: Arrow IPC with ZSTD | Pondra | Never edited. Deleted once tiered, and older than `--retain-secs` (or `--changelog-secs`, if longer) |
 | `data/<table>/*.parquet` | The table's rows. LZ4-compressed by default (`PONDRA_CODEC=zstd` for smaller files) | Anyone | Never edited. Replaced files are deleted after `--retain-secs` |
 | `data/<table>/data/` | The table's rows as another engine wrote them through the Iceberg catalog: its files are the table's where they are, their rows' ids and versions from the commit that recorded them | Anyone | As the table's own files |
-| `files/` | Whatever was put there | Anyone | Replaced only by a `PUT` that names the version it replaces (`If-Match`); nothing else is |
+| `files/` | Whatever was put there | Anyone | Replaced only by a `PUT` that names the version it replaces (`If-Match`); nothing else is. Each save is also kept under `files/.versions/<path>/<ms>.<who>` |
 | `data/<table>/_manifests/` | The older files' list, with each file's column ranges | Pondra | Never edited |
 | `data/<table>/_delta_log/` | Delta Lake commits and checkpoints | Delta readers | Appended to |
 | `data/<table>/metadata/` | Iceberg metadata, manifest lists and manifests | Iceberg readers | Appended to. `version-hint.text` is rewritten |

@@ -21,7 +21,7 @@ use slatedb::config::{CompactorOptions, DbReaderOptions, GarbageCollectorDirecto
 use slatedb::{Db, DbReader, DbReaderMode, ErrorKind, WriteBatch, WriteHandle};
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
@@ -464,10 +464,12 @@ pub fn open_store(url: &str) -> Result<(String, Store, Option<(String, Store)>)>
     // Idle connections are dropped after 15 s rather than reused: through proxies and NATs that
     // silently forget idle connections, a reused one hung a PUT for the full 30 s timeout on R2.
     let (idle, after) = (ClientConfigKey::PoolIdleTimeout, "15s");
+    // Every request to the bucket takes a turn of its budget, retries too (`budget.rs`, C5).
+    let turns = || crate::budget::Budget::of(&root);
     let whole: Store = match scheme {
-        "s3" => Arc::new(AmazonS3Builder::from_env().with_bucket_name(bucket).with_allow_http(true).with_config(AmazonS3ConfigKey::Client(idle), after).build()?),
-        "gs" => Arc::new(GoogleCloudStorageBuilder::from_env().with_bucket_name(bucket).with_config(GoogleConfigKey::Client(idle), after).build()?),
-        _ => Arc::new(MicrosoftAzureBuilder::from_env().with_url(&root).with_config(AzureConfigKey::Client(idle), after).build()?),
+        "s3" => Arc::new(AmazonS3Builder::from_env().with_bucket_name(bucket).with_allow_http(true).with_config(AmazonS3ConfigKey::Client(idle), after).with_http_connector(turns()).build()?),
+        "gs" => Arc::new(GoogleCloudStorageBuilder::from_env().with_bucket_name(bucket).with_config(GoogleConfigKey::Client(idle), after).with_http_connector(turns()).build()?),
+        _ => Arc::new(MicrosoftAzureBuilder::from_env().with_url(&root).with_config(AzureConfigKey::Client(idle), after).with_http_connector(turns()).build()?),
     };
     let store: Store = if prefix.is_empty() { whole.clone() } else { Arc::new(PrefixStore::new(whole.clone(), prefix)) };
     Ok((url.trim_end_matches('/').to_string(), Arc::new(Counted(store)), Some((root, whole))))
@@ -1076,6 +1078,35 @@ fn field(f: &mut Bytes) -> Result<Bytes> {
     next(f, n)
 }
 
+/// A cold start's steps and their times, with `PONDRA_TRACE_START` (`tools/cold_trace.sh`, C5).
+pub fn trace(what: &str, since: std::time::Instant) {
+    if std::env::var_os("PONDRA_TRACE_START").is_some() {
+        eprintln!("start: {what} {:.2} s", since.elapsed().as_secs_f64());
+    }
+}
+
+/// Has the node begun to serve? (Then the catalog's upkeep starts: `upkeep`.)
+static SERVING: LazyLock<watch::Sender<bool>> = LazyLock::new(|| watch::Sender::new(false));
+
+/// The node serves now (`main.rs`).
+pub fn serving() { SERVING.send_replace(true); }
+
+/// The catalog's compactor and garbage collector, as SlateDB runs them beside a writer, started
+/// once the node serves (or after 10 s: a `pondra sql` writer never does), so a cold start waits
+/// for neither (C5). A failure in either stops the node, as one in the writer would.
+fn upkeep(store: Store, compactor: CompactorOptions, gc: GarbageCollectorOptions) {
+    crate::panics::spawn(async move {
+        let _ = tokio::time::timeout(Duration::from_secs(10), SERVING.subscribe().wait_for(|s| *s)).await;
+        let compactor = slatedb::CompactorBuilder::new("catalog", store.clone()).with_options(compactor).build();
+        let gc = slatedb::GarbageCollectorBuilder::new("catalog", store).with_options(gc).build();
+        let (a, b) = tokio::join!(compactor.run(), gc.run());
+        if let Err(e) = a.and(b) {
+            eprintln!("stopping: the catalog's compactor or garbage collector failed: {e}");
+            std::process::abort();
+        }
+    });
+}
+
 impl Catalog {
     async fn writer(store: Store, object_store_cache_options: ObjectStoreCacheOptions) -> Result<Self> {
         // Poll object storage rarely when idle (that's an idle writer's request bill), but often
@@ -1087,8 +1118,13 @@ impl Catalog {
         let every = |secs: u64| Some(GarbageCollectorDirectoryOptions { interval: Some(Duration::from_secs(secs)), min_age: Duration::from_secs(secs), dry_run: false });
         let secs = std::env::var("PONDRA_GC_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(60);
         let garbage_collector_options = Some(GarbageCollectorOptions { wal_options: every(secs), manifest_options: every(secs), ..Default::default() });
-        let settings = Settings { garbage_collector_options, flush_interval: Some(Duration::from_millis(1)), manifest_poll_interval: Duration::from_secs(10), l0_sst_size_bytes: 16 << 20, l0_max_ssts: 64, l0_max_ssts_per_key: 32, max_unflushed_bytes: 64 << 20, compactor_options, object_store_cache_options, ..Default::default() };
-        let mut cat = Self::new(Db_::Writer(Db::builder("catalog", store).with_settings(settings).build().await?));
+        // (the compactor and the garbage collector start once the node serves: their first reads
+        // were most of a cold start's, C5; `upkeep`)
+        let settings = Settings { garbage_collector_options: None, flush_interval: Some(Duration::from_millis(1)), manifest_poll_interval: Duration::from_secs(10), l0_sst_size_bytes: 16 << 20, l0_max_ssts: 64, l0_max_ssts_per_key: 32, max_unflushed_bytes: 64 << 20, compactor_options: None, object_store_cache_options, ..Default::default() };
+        let t0 = std::time::Instant::now();
+        let mut cat = Self::new(Db_::Writer(Db::builder("catalog", store.clone()).with_settings(settings).build().await?));
+        trace("the catalog's writer open", t0);
+        upkeep(store, compactor_options.unwrap_or_default(), garbage_collector_options.unwrap_or_default());
         cat.replicas = std::env::var("PONDRA_REPLICAS").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
         cat.last_n.store(cat.get::<u64>("n").await?.unwrap_or(1), Relaxed);
         let c = cat.get::<u64>("c").await?.unwrap_or(0);
@@ -1097,11 +1133,13 @@ impl Catalog {
         (cat.writes, *cat.unstarted.get_mut().unwrap()) = (Some(tx), Some(rx));
         cat.committed.store(c, Relaxed);
         cat.durable.send_replace(c);
-        cat.checkpoint().await?; // what we inherited (replayed from the WAL) into every node's view
+        // (what we inherited, replayed from the WAL, reaches every node's view at the first
+        // checkpoint: right after the node serves, `main.rs`)
         // The leader too reads the catalog from memory: everything committed, nothing in flight.
         let Db_::Writer(db) = &cat.db else { unreachable!() };
         let mut all = collect(db.scan(b"".to_vec()..b"d/".to_vec()).await.map_err(fatal)?).await?;
         all.extend(collect(db.scan(b"d0".to_vec()..vec![0xff]).await.map_err(fatal)?).await?);
+        trace("the catalog in memory", t0);
         cat.overlay.get_mut().unwrap().extend(all.into_iter().map(|(k, v)| (k, (c, Some(v)))));
         cat.streamed.store(c, Relaxed);
         cat.mirror.store(true, Relaxed);

@@ -13,9 +13,10 @@ same way every round, so a drop is seen before a release rather than after.
   (`bench/nexmark.py`).
 
 Each run appends a row to `logs/gates/README.md` and its numbers to `logs/gates/history.jsonl`,
-with the details beside them, and compares itself with the run before: fewer sqllogictest records
-passed, an answer that stopped matching, or a total more than 15% slower is a **drop**, and the
-command exits 1 (a drop explained, as an order SQL leaves open, is written in `--note`).
+with the details beside them, and compares itself with the latest measurement of each gate: fewer
+sqllogictest records passed, an answer that stopped matching, or a total more than 15% slower is a
+**drop**, and the command exits 1, unless `--explained` says why it is expected (an order SQL
+leaves open, a difference on purpose): then it is recorded with its reason.
 
 `--prepare` fetches what's missing: DataFusion's test files at the version Pondra builds on
 (`~/datafusion`, git, sparse) and TPC-H SF1 (`~/tpch/sf1`, tpchgen-cli). A gate whose inputs
@@ -136,7 +137,7 @@ def drops(now, before):
 
 def row(day, binary, r, note):
     s, t, n = r.get("slt", {}), r.get("tpch", {}), r.get("nexmark", {})
-    cell = lambda g, text: g.get("skipped") and f"skipped: {g['skipped']}" or (text if g else "not run")
+    cell = lambda g, text: g.get("skipped") and f"skipped: {g['skipped']}" or g.get("failed") and "failed (see the log)" or (text if g else "not run")
     slt_cell = cell(s, f"{s.get('passed', 0):,} of {s.get('records', 0):,} ({100 * s.get('rate', 0):.1f}%)")
     mem = cell(t, f"{t.get('memory_s')} s")
     files = cell(t, f"{t.get('files_s')} s")
@@ -152,6 +153,7 @@ def main():
     ap.add_argument("--only", default="slt,tpch,postgres,nexmark")
     ap.add_argument("--prepare", action="store_true")
     ap.add_argument("--note", default="")
+    ap.add_argument("--explained", default="", help="why the drops this run finds are expected: written beside them, and the run passes")
     ap.add_argument("--bin", default=os.path.join(ROOT, "target", "release", "pondra"))
     a = ap.parse_args()
     a.bin = os.path.abspath(a.bin)
@@ -176,13 +178,15 @@ def main():
     for b in before:  # (each gate's latest measurement, whichever run made it)
         last.update({k: v for k, v in b.items() if isinstance(v, dict) and not v.get("skipped") and not v.get("failed")})
     dropped = drops(results, last)
-    results["drops"], results["note"], results["secs"] = dropped, a.note, round(time.time() - t0)
+    results["drops"], results["note"], results["secs"], results["explained"] = dropped, a.note, round(time.time() - t0), a.explained
+    note = a.note + ("; **dropped:** " + "; ".join(dropped) + (f" (explained: {a.explained})" if a.explained else "") if dropped else "")
     with open(history, "a") as f:
         f.write(json.dumps(results) + "\n")
     with open(os.path.join(LOGS, "README.md"), "a") as f:
-        f.write(row(day, binary, results, a.note + ("; **dropped:** " + "; ".join(dropped) if dropped else "")) + "\n")
-    print(json.dumps({"gates": results, "ok": not dropped}, indent=1))
-    sys.exit(1 if dropped else 0)
+        f.write(row(day, binary, results, note) + "\n")
+    ok = not dropped or bool(a.explained)
+    print(json.dumps({"gates": results, "ok": ok}, indent=1))
+    sys.exit(0 if ok else 1)
 
 
 if __name__ == "__main__":

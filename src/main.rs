@@ -8,6 +8,7 @@ mod avro;
 mod bridge;
 mod asof;
 mod auth;
+mod budget;
 mod cache;
 mod change;
 mod copy;
@@ -289,6 +290,9 @@ pub(crate) async fn stopped(stdin: bool) {
     tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = closed => {} }
 }
 
+/// The lake this node serves (its catalog checkpointed when it stops).
+static MAIN: std::sync::OnceLock<Arc<store::Lake>> = std::sync::OnceLock::new();
+
 #[tokio::main]
 async fn main() {
     // An error is said in words, its causes after it: a backtrace (RUST_BACKTRACE) is for panics.
@@ -383,14 +387,18 @@ async fn run() -> anyhow::Result<()> {
                 std::env::set_var("PONDRA_CACHE_DIR", d);
             }
             let (_, store, _) = store::open_store(&dir)?;
+            let t_start = std::time::Instant::now();
+            let tr = |w: &str| store::trace(w, t_start);
             let listen = addr.clone();
             let addr = advertise.unwrap_or(addr); // (how others reach it: its cluster name)
             let cluster = cluster::Cluster::join(&store, &addr, reader).await?;
+            tr("the lease");
             let leader = cluster.is_leader();
             if leader {
                 // "Still here", in the bucket, from the start: for machines outside the cluster.
                 let (s, n) = (store.clone(), cluster.leader.n);
-                cluster::mark_alive(&s, n).await?;
+                let first = s.clone(); // (beside the catalog's opening, not before it: C5)
+                tokio::spawn(async move { cluster::mark_alive(&first, n).await.map_err(|e| eprintln!("the leader's mark: {e:#}")) });
                 every(Duration::from_secs(10), move || { let s = s.clone(); async move { cluster::mark_alive(&s, n).await } });
             }
             // Stopped (Ctrl-C, SIGTERM from a scheduler scaling down, or the program that started
@@ -400,6 +408,10 @@ async fn run() -> anyhow::Result<()> {
             panics::spawn(async move {
                 stopped(stop_with_stdin).await;
                 if let Some(n) = n {
+                    if let Some(l) = MAIN.get() {
+                        // (the catalog's memtable written out: the next leader replays no WAL, C5)
+                        let _ = tokio::time::timeout(Duration::from_secs(5), l.cat.checkpoint()).await;
+                    }
                     cluster::release(&s, n).await;
                 }
                 std::process::exit(0);
@@ -422,6 +434,8 @@ async fn run() -> anyhow::Result<()> {
                 }
                 lake => lake?,
             };
+            let _ = MAIN.set(lake.clone());
+            tr("the lake open");
             for spec in &attached {
                 attach(&lake, spec, &addr, true).await?;
             }
@@ -432,17 +446,21 @@ async fn run() -> anyhow::Result<()> {
                 }
             }
             // The lakes attached in SQL (`ATTACH … AS …`), and later ATTACHes and DETACHes.
+            tr("lakes attached");
             let (l, me) = (lake.clone(), addr.clone());
             ddl::sync(&l, &me, true).await?;
+            tr("attachments synced");
             every(Duration::from_secs(1), move || { let (l, me) = (l.clone(), me.clone()); async move { ddl::sync(&l, &me, true).await } });
             let l = lake.clone();
             tokio::spawn(async move { l.warm().await.map_err(|e| eprintln!("warming the SSD tier: {e:#}")) });
             // Followers keep the leader's changes that aren't in the bucket yet (replicated acks);
             // a new leader first commits what they hold from the previous one.
+            tr("warming");
             let replica = if reader { None } else { Some(replica::ReplicaLog::open(replica::dir(&dir, &addr))?) };
             if let (true, Some(own)) = (leader, &replica) {
                 replica::recover(&lake, &addr, cluster.leader.n, Some(own)).await?;
             }
+            tr("followers' changes recovered");
             let max_backlog = (tier_secs > 0.0).then_some(backlog); // rows waiting to be tiered
             let seq = if leader { Some(log::Sequencer::start(lake.clone(), max_backlog).await?) } else { None };
             let log = (!reader).then(|| {
@@ -452,16 +470,23 @@ async fn run() -> anyhow::Result<()> {
                 };
                 Arc::new(log::Log::start(lake.clone(), Duration::from_millis(flush_ms), to))
             });
+            tr("the sequencer");
             python::init(python);
             let app = server::App { lake: lake.clone(), cluster: cluster.clone(), log, seq, lock: Default::default(), retain_ms: retain_secs * 1000, results: Default::default(), replica: replica.clone(), auth };
             if leader {
-                users::make_keys(&app.lake).await?; // (sessions' signing key, and the nodes' own: `users.rs`)
-                match ext::rewrap(&app.lake).await {
-                    Ok(0) => {}
-                    Ok(n) => eprintln!("rewrapped {n} secret{} with the master key in use now", if n == 1 { "" } else { "s" }),
-                    Err(e) => eprintln!("secrets not rewrapped: {e:#}"),
-                }
+                let l = app.lake.clone(); // (beside serving, not before it: C5)
+                tokio::spawn(async move {
+                    if let Err(e) = users::make_keys(&l).await {
+                        eprintln!("the lake's keys (sessions', the nodes'): {e:#}"); // (sessions' signing key, and the nodes' own: `users.rs`)
+                    }
+                    match ext::rewrap(&l).await {
+                        Ok(0) => {}
+                        Ok(n) => eprintln!("rewrapped {n} secret{} with the master key in use now", if n == 1 { "" } else { "s" }),
+                        Err(e) => eprintln!("secrets not rewrapped: {e:#}"),
+                    }
+                });
             }
+            tr("the app");
             let l = app.lake.clone();
             panics::spawn(async move {
                 // (a follower's catalog shows the leader's keys once the leader has flushed them)
@@ -581,7 +606,14 @@ async fn run() -> anyhow::Result<()> {
             eprintln!("pondra {role} (term {}) serving {dir} on {addr}", cluster.leader.n);
             // No Nagle: a small answer goes out at once, not after the client's delayed ACK (the
             // Postgres, Kafka and Flight ports do the same).
+            tr("listening");
             let listener = tls::Doors::bind(&listen, tls::Door::Http).await?; // (TLS too: `tls.rs`)
+            store::serving(); // (the catalog's compactor and garbage collector start now: C5)
+            runs::mark_stopped(app.clone()); // (runs whose node stopped under them: `stopped`)
+            if leader {
+                let l = app.lake.clone(); // (what it inherited, replayed from the WAL, into every node's view)
+                tokio::spawn(async move { l.cat.checkpoint().await.map_err(|e| eprintln!("checkpoint: {e:#}")) });
+            }
             axum::serve(listener, server::router(app).into_make_service_with_connect_info::<tls::Peer>()).await?; // (who asks: `console::save_settings`)
         }
         Cmd::Run { file, url, token, rest } => {

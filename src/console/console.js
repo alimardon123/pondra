@@ -15,7 +15,7 @@
 import { h, $, fill, said, esc, store, count, bytes,  ICONS, icon, svg, typeMark, sqlType, on, emit, R, byOrder, shell, register, T, configure,
   MODE, SESSION, S, base, call, run, rows, doBlock, ident, qualified, home, toast, menu, prompt, VERSION, ask, interruptPython } from './core.js';
 import { grid } from './grid.js';
-import { Notebook, openNotebook, cleanName, doneText } from './notebook.js';
+import { Notebook, openNotebook, openPlain, cleanName, doneText } from './notebook.js';
 import { workspace, drawWorkspace, treeItem, upload, newFolder, registerFiles, SqlDoc, lastStatement } from './files.js';
 
 R.helpers = {};
@@ -327,15 +327,15 @@ let untitled = 0;
 /** A name for a new file in `dir`: `untitled`, or `untitled-2`… (one no tab has). */
 const taken = p => S.docs.some(d => (d.path || d.untitled) === p);
 const nextName = (dir, ext) => { let n = 'untitled'; while (taken(dir + n + ext)) n = `untitled-${++untitled + 1}`; return n; };
-/** A new notebook (with a `dir`: one plain file, saved in place there). */
-function newNotebook(nb = { cells: [] }, name, dir = null) {
-  const d = addDoc(new Notebook({ name: name || nextName(dir ?? 'notebooks/', dir == null ? '' : '.ipynb'), nb, dir }));
+/** A new notebook: one file, `<dir><name>.ipynb`, saved in place (the node keeps its versions). */
+function newNotebook(nb = { cells: [] }, name, dir = 'notebooks/') {
+  const d = addDoc(new Notebook({ name: name || nextName(dir, '.ipynb'), nb, dir }));
   if (!nb.cells.length) d.cells[0].edit();
   return d;
 }
 H.openNotebook = (nb, name) => newNotebook(nb, cleanName(name || '') || 'untitled');
-// (notebooks/ keeps versions: any other folder, a plain file)
-H.newNotebook = dir => dir === 'notebooks' ? newNotebook() : newNotebook(undefined, undefined, dir + '/');
+H.newNotebook = dir => newNotebook(undefined, undefined, dir + '/');
+H.versions = doc => import('./versions.js').then(m => m.open(doc));
 /** A new SQL or Python file, to be saved in `at` (asked again when it is saved). */
 function newFile(kind, at = kind === 'python' ? 'scripts/' : 'queries/') {
   const ext = kind === 'python' ? '.py' : '.sql', untitled = at + nextName(at, ext) + ext, made = d => { addDoc(d); d.ed.focus(); return d; };
@@ -355,7 +355,10 @@ function openFile(path, opts = {}) {
 async function opened(path, opts) {
   try {
     const nb = path.match(/^notebooks\/([^/]+?)(?:\/([^/]+)\.ipynb)?$/);
-    if (nb) return addDoc(await openNotebook(nb[1], nb[2] || opts.version));
+    if (nb && !/\.ipynb$/i.test(nb[1])) {
+      if (!nb[2] && !opts.version) try { return addDoc(await openPlain(path + '.ipynb')); } catch { /* (saved before versions: its newest save) */ }
+      return addDoc(await openNotebook(nb[1], nb[2] || opts.version));
+    }
     const kind = R.docs.find(d => d.match(path));
     if (!kind) { pick({ type: 'file', f: S.files?.find(f => f.path === 'files/' + path) || { path: 'files/' + path, rel: path, name: path.split('/').pop() } }); return null; }
     const doc = await kind.open(path, opts);

@@ -1,6 +1,6 @@
 # Prototype status: Pondra, a streamhouse in one binary
 
-**Date:** 2026-10-01 (the workspace, rounds 27 and 28, and round 29 part 1 with the owner's second and third lists, and part 2: users, grants, secrets, TLS, audit, quotas) · **Plan:** ADR-002 to ADR-035, `roadmap.md` · **Code:** `pondra.zip` / `pondra.bundle` (≈30,700 lines of Rust, plus Python and JavaScript clients, a documentation website, packaging, and test and benchmark tools)
+**Date:** 2026-10-01 (the workspace, rounds 27 and 28, and round 29 part 1 with the owner's second and third lists, and part 2: users, grants, secrets, TLS, audit, quotas; files with versions) · **Plan:** ADR-002 to ADR-035, `roadmap.md` · **Code:** `pondra.zip` / `pondra.bundle` (≈30,700 lines of Rust, plus Python and JavaScript clients, a documentation website, packaging, and test and benchmark tools)
 **Name:** the prototype formerly called `lh` is now **Pondra**. The name is free on crates.io, PyPI and npm. A small personal-finance app uses it (pondra.app), a different category; run a trademark search before a public launch.
 
 ## Where it stands
@@ -14,6 +14,31 @@ One Rust binary replaces the Kafka + Flink + Spark + metastore + ZooKeeper stack
 - upsert and merge tables.
 
 Start more copies on the same bucket to scale out. The only state is object storage. There's no JVM, no database server and no coordination service.
+
+**Then (2026-10-01): every file keeps its versions, a stopped run says so, a faster cold start**
+(ADR-035 §8, round 29 part 3):
+
+1. **Versions**: each save of a lake file kept with who made it and when (`files/.versions/`, the
+   newest 50 for 90 days); **Versions…** in every file's ⋯ shows what changed since, line by line,
+   and restores one; a deleted file keeps them. Notebooks are one file each (`notebooks/<name>.ipynb`;
+   saved before as `notebooks/<name>/<time>.ipynb`, they still open, and those saves are among their
+   versions), and any notebook can be a job or a schedule.
+2. **`stopped`**: a run whose node was killed, restarted or left the cluster is marked so in
+   `pondra.runs`, saying whose node, instead of `running` for good.
+3. **Within the bucket's limits, and a faster cold start** (C5): the catalog's compactor and
+   garbage collector start once the node serves, and the first checkpoint, the leader's mark and
+   the lake's keys go beside serving: on the simulator at R2's latency a node serves after 3.1–4.4 s
+   (was 6.5–7.7 s). One request budget per bucket and node, in the HTTP layer so retries count
+   too, halves on a 503 or 429 and grows back (`budget.rs`); log segments are named with a random
+   first part; the orphan sweep takes one part of the lake at a time, not the whole bucket each
+   hour; a ring of the inbox's bell refused (R2's one write a second to a key) counts as rung.
+   `tools/c5_check.py`: 240 INSERTs into a bucket that takes 10 writes a second all succeed as the
+   node slows down; four writers through the inbox at once all answered.
+4. **Found and fixed:** with the lake's keys made beside serving, a request could make them at the
+   same moment as the leader, two keys, and a follower's calls refused: they are made once now.
+5. **Tests**: `harness.py versions` and `stopped`, `tools/c5_check.py`, `tools/cold_trace.sh`,
+   `console_check.py` (94: Versions… shows the change and restores), the docs' examples,
+   `harness.py all` again.
 
 **Round 29, part 2 made a lake safe to share: users, grants, sealed secrets, TLS, an audit log, quotas, and no request that stops a node** (ADR-035 §2, §3, §5):
 

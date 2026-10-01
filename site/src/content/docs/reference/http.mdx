@@ -236,7 +236,10 @@ console's Workspace shows them and edits them in place.
 |---|---|---|
 | `PUT /files/{path}` | write | store the body at `files/{path}`; a new file, or with `If-Match` the file replaced |
 | `GET /files/{path}` | read | the file's bytes, its version as `etag`, and a content type by its name |
-| `DELETE /files/{path}` | write | remove it |
+| `DELETE /files/{path}` | write | remove it (its versions stay) |
+| `GET /files/{path}?versions` | read | its versions, newest first: `[{"id", "at", "who", "bytes"}]` |
+| `GET /files/{path}?version={id}` | read | one version's bytes |
+| `POST /files/{path}?restore={id}` | write | that version made the file again (and kept as the newest) |
 
 - **A new file:** a `PUT` with no `If-Match` to a path that exists is refused with `409`, so a
   file is never overwritten blind.
@@ -246,6 +249,10 @@ console's Workspace shows them and edits them in place.
   the next `If-Match` needs. A `GET` of a path with no file is `404`.
 - **Every node reads a replaced file's new bytes** at its next statement: nothing caches `files/`
   (not the SSD tier either). The rest of the lake is never overwritten, so it is cached.
+- **Every save is kept as a version**, with who made it and when, in `files/.versions/` (which
+  `files()` doesn't list): the newest 50 for 90 days (`PONDRA_FILE_VERSIONS`,
+  `PONDRA_FILE_VERSIONS_DAYS`), files up to 64 MB. A deleted file keeps its versions, so it can be
+  restored. The console's **Versions…** shows what changed and restores one.
 
 Read them from SQL with `files()` and `file_read()`, see [functions](/pondra/reference/functions/#files).
 
@@ -256,6 +263,9 @@ v=$(curl -sI http://localhost:8080/files/notes/a.txt | tr -d '\r' | sed -n 's/^e
 curl -s -X PUT http://localhost:8080/files/notes/a.txt -H "If-Match: $v" --data-binary 'hello again'
 curl -s -X PUT http://localhost:8080/files/notes/a.txt -H "If-Match: $v" --data-binary 'too late'; echo
 curl -s -X DELETE http://localhost:8080/files/notes/a.txt
+first=$(curl -s "http://localhost:8080/files/notes/a.txt?versions" | python3 -c "import json, sys; print(json.load(sys.stdin)[-1]['id'])")
+curl -s -X POST "http://localhost:8080/files/notes/a.txt?restore=$first" > /dev/null
+curl -s http://localhost:8080/files/notes/a.txt; echo
 ```
 
 ```text
@@ -264,6 +274,7 @@ hello
 {"path":"files/notes/a.txt","bytes":11,"version":"…"}
 files/notes/a.txt: the file changed since it was opened: open it again, or save under another name
 {"removed":"files/notes/a.txt"}
+hello
 ```
 
 ## Functions, routines and secrets

@@ -345,27 +345,36 @@ def node_checks(browser, port, show):
     p.fill("#nbname", "report")
     p.press("#nbname", "Enter")
     p.keyboard.press("Control+s")
-    listed = lambda: [r["path"] for r in sql(port, "SELECT path FROM files('notebooks/report/') ORDER BY path")]
-    one = until(lambda: len(listed()), 1)
+    saved_now = lambda: _try(lambda: json.loads(get(port, "notebooks/report.ipynb")))
+    one = until(lambda: isinstance(saved_now(), dict), True)
     row_clean = until(lambda: pg.workspace("notebooks", "report.ipynb").locator(".dirty").count(), 0)
-    saved = call(port, "GET", "/" + listed()[0]) if one == 1 else None  # (JSON: read as such)
+    saved = saved_now() if one is True else None
     nb = nbformat.reads(json.dumps(saved), as_version=4) if saved else None
     valid = _try(lambda: nbformat.validate(nb) is None)
     page_cells = p.evaluate("pondra.state.cells.map(c => [c.kind, c.src])")
     as_saved = [["markdown" if c.cell_type == "markdown" else "sql" if c.source.startswith("%%sql") else "python", c.source.removeprefix("%%sql\n")] for c in nb.cells] if nb else []
-    checks["a notebook saved in the lake is valid for Jupyter (nbformat), SQL cells as %%sql; its tab has no changes then"] = one == 1 and valid is True and as_saved == page_cells \
+    checks["a notebook saved in the lake (one file, notebooks/report.ipynb) is valid for Jupyter (nbformat), SQL cells as %%sql; its tab has no changes then"] = one is True and valid is True and as_saved == page_cells \
         and any(c.source.startswith("%%sql\n") for c in nb.cells) and until(lambda: pg.tab(), ("report.ipynb", False)) == ("report.ipynb", False) and row_clean == 0 \
-        and "#notebook=report" in p.url and pg.workspace("notebooks", "report.ipynb").is_visible()
+        and "notebooks%2Freport.ipynb" in p.url.replace("/", "%2F") and pg.workspace("notebooks", "report.ipynb").is_visible()
+    kept = lambda: json.loads(get(port, "notebooks/report.ipynb?versions"))
     pg.cell(0).locator("textarea").fill("SELECT 'changed' AS v")
     p.keyboard.press("Control+s")
-    two = until(lambda: len(listed()), 2)
+    two = until(lambda: len(kept()), 2)
     pg.cell(0).locator("textarea").fill("SELECT 'not saved' AS v")
     pg.docmenu("Versions")
-    versions = detail.locator(".row[role=button]")
-    until(lambda: versions.count(), 2)
-    versions.last.click()  # (the first one saved: newest first)
+    dlg = p.locator("dialog.pop.wide")
+    until(lambda: dlg.locator(".vlist .row").count(), 2)
+    diffed = until(lambda: dlg.locator(".dl.minus").count() > 0 and dlg.locator(".dl.plus").count() > 0, True)  # (the save before now, against now)
+    if show:
+        pg.shot(show, "console-versions.png")
+    # (its changes not saved: the page's confirm is accepted, as every one here is)
+    dlg.locator("button", has_text="Restore this version").click()
     reopened = until(lambda: p.evaluate("pondra.state.cells.map(c => [c.kind, c.src])"), page_cells)
-    checks["saved twice: two versions, listed in its details; the first, opened again, is what was saved"] = two == 2 and reopened == page_cells
+    three = until(lambda: len(kept()), 3)
+    if show:
+        pg.shot(show, "console-restored.png")
+    checks["saved twice: two versions; Versions… shows what changed since (− and +) and restores the first: its tab has it again, kept as the newest"] = \
+        two == 2 and diffed is True and reopened == page_cells and three == 3
 
     with p.expect_download() as d:
         pg.docmenu("Download as .ipynb")
@@ -390,7 +399,7 @@ def node_checks(browser, port, show):
 
     if show:
         p.goto("about:blank")
-        p.goto(base + "/#notebook=report")
+        p.goto(base + "/#notebook=report")  # (a link of before: the one file now)
         pg.cells().first.wait_for()
         pg.run(0, "SELECT id, name, born, amt FROM people ORDER BY id")
         p.locator("#data .row", has_text="people").click()
@@ -713,7 +722,7 @@ def folders_checks(browser, port, show):
     text = until(lambda: "seven" in get(port, "projects/analysis.ipynb").decode(), True) and get(port, "projects/analysis.ipynb").decode()
     valid = _try(lambda: nbformat.validate(nbformat.reads(text, as_version=4)) is None)
     clean = until(lambda: (pg.tab(), mine("analysis.ipynb").locator(".dirty").count()), (("analysis.ipynb", False), 0))
-    checks["a new notebook in a folder: no dot until something is typed, then its tab and row have the dot and Save shows; Ctrl+S saves it in place, as projects/analysis.ipynb, valid for Jupyter: no versions"] = \
+    checks["a new notebook in a folder: no dot until something is typed, then its tab and row have the dot and Save shows; Ctrl+S saves it in place, as projects/analysis.ipynb, valid for Jupyter"] = \
         fresh == (("untitled.ipynb", False), 0) and typed == (("untitled.ipynb", True), 1, 1) and in_place == want_files and valid is True and clean == (("analysis.ipynb", False), 0) and in_lake("notebooks/analysis") == [] \
         and "file=projects%2Fanalysis.ipynb" in p.url and p.locator("#docbar .crumb").first.inner_text() == "projects/"
     p.locator("#docbar button[aria-label=More]").click()
@@ -722,8 +731,8 @@ def folders_checks(browser, port, show):
     p.locator("#docbar .split .caret").first.click()
     nb_run = items()
     p.keyboard.press("Escape")
-    checks["a notebook saved in place offers no versions, jobs or schedule (its ⋯ and its Run's ▾)"] = "Download as .ipynb" in nb_menu and "Run all" in nb_run \
-        and not {"Versions…", "Run as a job", "Schedule…"} & set(nb_menu + nb_run)
+    checks["a notebook anywhere offers its versions, a job and a schedule (its ⋯ and its Run's ▾)"] = "Download as .ipynb" in nb_menu and "Run all" in nb_run \
+        and {"Versions…", "Run as a job", "Schedule…"} <= set(nb_menu + nb_run)
 
     both = palette("projects/")
     every = palette("")
@@ -754,9 +763,9 @@ def folders_checks(browser, port, show):
     p.fill("#nbname", "versioned")
     p.press("#nbname", "Enter")
     p.keyboard.press("Control+s")
-    mine_v = until(lambda: len(in_lake("notebooks/versioned")), 1)
-    checks["New notebook here in notebooks keeps its versions: notebooks/<name>/<time>.ipynb"] = mine_v == 1 and in_lake("notebooks/versioned")[0][0].startswith("files/notebooks/versioned/") \
-        and not [x for x in in_lake("projects") if "versioned" in x[0]]
+    mine_v = until(lambda: _try(lambda: len(json.loads(get(port, "notebooks/versioned.ipynb?versions")))), 1)
+    checks["New notebook here in notebooks: one file, notebooks/versioned.ipynb, its save kept as a version"] = mine_v == 1 and "SELECT 1 AS one" in get(port, "notebooks/versioned.ipynb").decode() \
+        and in_lake("notebooks/versioned/") == [] and not [x for x in in_lake("projects") if "versioned" in x[0]]
 
     tmp = tempfile.mkdtemp(prefix="pondra-console-")
     csv, nb = os.path.join(tmp, "up.csv"), os.path.join(tmp, "up.ipynb")
@@ -987,12 +996,10 @@ def work_checks(browser, port, show):
     p.fill("#nbname", "wkbook")
     p.press("#nbname", "Enter")
     p.keyboard.press("Control+s")
-    saved = until(lambda: sql(port, "SELECT count(*) AS n FROM files('notebooks/wkbook/')"), [{"n": 1}])
-    path = sql(port, "SELECT path FROM files('notebooks/wkbook/')")[0]["path"] if saved == [{"n": 1}] else ""
-    got = call(port, "GET", "/" + path) if path else {}
-    got = json.loads(got) if isinstance(got, (bytes, str)) else got
+    saved = until(lambda: isinstance(_try(lambda: json.loads(get(port, "notebooks/wkbook.ipynb"))), dict), True)
+    got = json.loads(get(port, "notebooks/wkbook.ipynb")) if saved is True else {}
     meta = (got.get("cells") or [{}, {}])[1].get("metadata", {})
-    other = Page(browser, base + "/#notebook=wkbook")
+    other = Page(browser, base + "/#file=notebooks%2Fwkbook.ipynb")
     oc = other.cell(1)
     again = until(lambda: oc.locator(".chart svg").count() > 0 and oc.locator(".abar .ptab.on").all_inner_texts() == ["Chart"], True, 15)
     other.ctx.close()
@@ -1247,7 +1254,7 @@ def budget_checks(browser, port, show):
             fresh[name] = e.code
     total = sum(sizes.values()) if all(sizes.values()) else None
     later = {}
-    for name in ["chart.js", "plan.js", "more.js", "details.js", "more.css", "data.js", "md.js", "jobs.js", "settings.js", "objects.js", "pyfile.js"]:  # (loaded when first used)
+    for name in ["chart.js", "plan.js", "more.js", "details.js", "more.css", "data.js", "md.js", "jobs.js", "settings.js", "objects.js", "pyfile.js", "versions.js"]:  # (loaded when first used)
         r = urllib.request.urlopen(urllib.request.Request(f"{base}/console/{name}", headers={"accept-encoding": "gzip"}))
         later[name] = len(r.read()) if r.headers.get("content-encoding") == "gzip" else None
     checks["the scripts and style sheet the page loads, gzipped as the node serves them: <= 70 KB; each answers 304 when the browser has it"] = total is not None and total <= 70 * 1024 \

@@ -130,7 +130,7 @@ does not exist is refused before it starts, and has no row.
 | `args` | `VARCHAR` | the arguments as JSON, `{"day": "2026-09-27"}` |
 | `started` | `TIMESTAMP` (UTC) | when it started |
 | `ended` | `TIMESTAMP` (UTC) | when it ended. Null while it runs |
-| `status` | `VARCHAR` | `running`, `ok` or `failed` |
+| `status` | `VARCHAR` | `running`, `ok`, `failed`, or `stopped`: its node stopped while it ran (killed, restarted, or gone from the cluster a minute), and `error` says which |
 | `notices` | `VARCHAR` | what it printed, up to 64 KB |
 | `error` | `VARCHAR` | why it failed, up to 64 KB |
 

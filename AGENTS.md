@@ -1157,6 +1157,16 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    statement path calls it, once (a nested call is its caller's). A statement that makes a user, a
    token or a secret is kept with its values as `'***'`; `pondra.audit` is a superuser's and is
    never answered from the result cache.
+181. **Every save of a lake file is kept** (`files::keep`, ADR-035 §8): a new way to write
+   `files/` from a door calls it after the write succeeds; `files/.versions/` is never listed by
+   `files()`, and `?version=` reads only that file's own versions. Notebooks are one file each.
+182. **A cold start waits only for what serving needs, and the bucket is never stormed** (C5): the
+   catalog's compactor and garbage collector start at `store::serving()`; work that can go beside
+   serving (a checkpoint, the lake's keys, the leader's mark) does. Every request to a bucket goes
+   through its `budget.rs` turns (a new store builder gets `.with_http_connector(Budget::of(…))`);
+   keys many writers add have a random first part; nothing lists the whole bucket on a schedule;
+   no key is written by many writers faster than once a second. `tools/cold_trace.sh`,
+   `tools/c5_check.py`.
 
 ## Tests: run these before and after any change
 
@@ -1166,6 +1176,10 @@ python3 tools/harness.py all            # upsert, fence/split-brain, bulk insert
 python3 tools/gates.py [--prepare]      # the gates (sqllogictest, TPC-H SF1 vs DuckDB, vs Postgres, Nexmark): a row in logs/gates/README.md; exit 1 on a drop
 python3 tools/harness.py safety         # panics answered as errors, TLS at every door, mutual TLS, the audit log, quotas
 python3 tools/fuzz_doors.py --secs 60   # malformed input at HTTP, SQL, Postgres, Kafka and Flight: the node stays up
+python3 tools/harness.py versions       # every file keeps its versions: listed, read, restored, after a delete, retention, old notebooks
+python3 tools/harness.py stopped        # a run whose node was killed under it: stopped, not running for good
+bash tools/cold_trace.sh                # a cold start's requests on the simulator at R2's latency, and the node's own steps
+python3 tools/c5_check.py               # the bucket's limits: a 10 writes/s bucket, 240 INSERTs at once, the inbox's bell
 python3 tools/harness.py crash --runs 3 --batches 60 --size 50000   # kill -9 + injected crashes, 9M events
 python3 tools/cluster.py users --secs 30      # 64 writers + 16 readers: 0 torn reads, 0 lost
 python3 tools/cluster.py failover --secs 45   # 2 leader kills; task state == inline view == model

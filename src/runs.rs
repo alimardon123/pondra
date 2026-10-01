@@ -195,6 +195,53 @@ async fn append(app: &App, producer: &str, seq: u64, lines: &[Line], made: &mut 
     Ok(())
 }
 
+/// Runs whose node stopped under them (killed, restarted, gone from the cluster) are marked
+/// `stopped`, so none says `running` for good: each node marks its own address's from before it
+/// started, once it serves; the leader, every 30 s, those of nodes that left the cluster a minute
+/// ago or more. (A run that ends after all writes its row again: the newest row is its row.)
+pub fn mark_stopped(app: App) {
+    crate::panics::spawn(async move {
+        let since = now_ms();
+        for round in 0.. {
+            if round == 0 || app.cluster.is_leader() {
+                if let Err(e) = stopped(&app, since, round == 0).await {
+                    eprintln!("runs whose node stopped: {e:#}");
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        }
+    });
+}
+
+async fn stopped(app: &App, since: u64, own_only: bool) -> Result<()> {
+    use datafusion::arrow::array::{Array, AsArray};
+    use datafusion::arrow::datatypes::TimestampMicrosecondType;
+    if app.log.is_none() {
+        return Ok(()); // (a read-only node writes nothing)
+    }
+    let live = app.cluster.nodes();
+    let batches = app.query("SELECT id, routine, caller, node, job, args, started FROM pondra.runs WHERE status = 'running'", None).await?;
+    for b in &batches {
+        let text = |i: usize| datafusion::arrow::compute::cast(b.column(i), &datafusion::arrow::datatypes::DataType::Utf8);
+        let (id, routine, caller, node, job, args) = (text(0)?, text(1)?, text(2)?, text(3)?, text(4)?, text(5)?);
+        let (id, routine, caller, node, job, args) = (id.as_string::<i32>(), routine.as_string::<i32>(), caller.as_string::<i32>(), node.as_string::<i32>(), job.as_string::<i32>(), args.as_string::<i32>());
+        let started = b.column(6).as_primitive::<TimestampMicrosecondType>();
+        for r in 0..b.num_rows() {
+            let (at, by) = ((started.value(r) / 1000) as u64, node.value(r));
+            let gone = match by == app.cluster.addr {
+                true => at < since, // (this address's, from before this node started)
+                false => !own_only && !live.iter().any(|n| n == by) && now_ms().saturating_sub(at) > 60_000,
+            };
+            if gone {
+                let why = format!("its node, {by}, stopped while it ran");
+                log(app, Line { id: id.value(r).into(), routine: routine.value(r).into(), caller: caller.value(r).into(), node: by.into(), job: job.is_valid(r).then(|| job.value(r).into()),
+                    args: args.value(r).into(), started: at, ended: Some(now_ms()), status: "stopped", notices: None, error: Some(why) }, None);
+            }
+        }
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------- tasks
 
 /// A statement run on a schedule, as the catalog keeps it (`j/`).

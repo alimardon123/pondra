@@ -142,7 +142,7 @@ export class DataDoc {
       h('span', { class: 'grow' }),
       this.readonly || !this.dirty ? null : h('button', { class: 'btn', title: 'Throw away the changes', onclick: () => this.discard() }, 'Discard'), this.readonly ? null : R.helpers.saveButton(this), h('span', { class: 'sep' }),
       btn('play', 'Query with SQL', 'Query it, in a new SQL tab', () => R.helpers.query(`SELECT * FROM ${fileSql(this.path)} LIMIT 1000`)),
-      moreBtn(() => [{ label: 'Load into a table…', icon: 'up', run: () => this.loadIntoTable() }, { label: 'Download', icon: 'down', run: () => download(this.path) }, { label: 'Copy the path', icon: 'copy', run: () => copyText('files/' + this.path, 'Path copied') }])];
+      moreBtn(() => [{ label: 'Load into a table…', icon: 'up', run: () => this.loadIntoTable() }, { label: 'Versions…', icon: 'clock', run: () => R.helpers.versions(this) }, { label: 'Download', icon: 'down', run: () => download(this.path) }, { label: 'Copy the path', icon: 'copy', run: () => copyText('files/' + this.path, 'Path copied') }])];
   }
   status() { return [`${count(this.data.length)} rows · ${this.cols.length} columns`, this.format === 'csv' ? `CSV · UTF-8 · ${this.sep === '\t' ? 'tab' : 'comma'}` : this.format.toUpperCase()]; }
 }

@@ -95,7 +95,7 @@ function pageLook(x) {
 export async function job(doc, every) {
   if (doc.dirty && !(await doc.save())) return;
   if (every && !(every = await prompt('Schedule', 'How often', '1 hour', 'For example 15 minutes, 1 day, or cron 0 2 * * * UTC. It runs on the node as CALL run(…): Jobs lists it, History its runs.'))) return;
-  const path = doc.kind === 'notebook' ? `notebooks/${doc.name}` : doc.path, name = path.replace(/\.[^./]+$/, '').replace(/\W+/g, '_').replace(/^_+|_+$/g, '').toLowerCase() || 'job';
+  const path = doc.kind === 'notebook' && !doc.plain ? `notebooks/${doc.name}` : doc.path, name = path.replace(/\.[^./]+$/, '').replace(/\W+/g, '_').replace(/^_+|_+$/g, '').toLowerCase() || 'job';
   const args = quote(path) + Object.entries(doc.params?.() || {}).map(([n, v]) => `, ${ident(n)} => ${typeof v === 'string' ? quote(v) : String(v).toUpperCase()}`).join('');
   try {
     await run(every ? `CREATE OR REPLACE TASK ${ident(name)} SCHEDULE ${quote(every)} AS CALL run(${args})` : `SELECT pondra.start('run', ${args})`);

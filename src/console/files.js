@@ -40,6 +40,7 @@ export function drawWorkspace(box) {
     const d = into(parts.slice(0, -1));
     if (parts.at(-1) !== FOLDER) d.files.push({ ...f, rel, name: parts.at(-1) });
   }
+  for (const n of notebooks.keys()) if (here.has(`notebooks/${n}.ipynb`)) notebooks.delete(n); // (saved again since: one file, these its versions)
   if (notebooks.size) into(['notebooks']).files.push(...[...notebooks.values()].map(n => ({ rel: `notebooks/${n.name}`, name: n.name + '.ipynb', written: n.written, versions: n.n, notebook: true })));
   for (const d of S.docs) {
     const rel = target(d);
@@ -98,7 +99,7 @@ function fileMenu(e, f, kind) {
     { label: 'Details', icon: 'eye', run: () => R.helpers.pick({ type: 'file', f }) },
     kind === 'data' ? { label: 'Query with SQL', icon: 'play', run: () => R.helpers.query(`SELECT * FROM ${fileSql(f.rel)} LIMIT 1000`) } : null, '-',
     !f.notebook ? { label: 'Rename…', icon: 'pencil', run: () => later(m => m.rename(f.rel)) } : null,
-    !f.notebook ? { label: 'Download', icon: 'down', run: () => download(f.rel) } : null,
+    !f.notebook ? { label: 'Download', icon: 'down', run: () => download(f.rel) } : null, { label: 'Versions…', icon: 'clock', run: () => R.helpers.versions({ path: f.notebook ? f.rel + '.ipynb' : f.rel }) },
     { label: 'Copy the path', icon: 'copy', run: () => copyText('files/' + f.rel, 'Path copied') }, '-',
     { label: f.notebook ? 'Delete every version…' : 'Delete…', icon: 'trash', run: () => later(m => m.remove(f)) }]);
 }
@@ -160,7 +161,7 @@ export class TextDoc {
       { label: 'Schedule…', icon: 'clock', run: () => R.helpers.schedule(this) }, saveAs ? '-' : null, saveAs ? { label: 'Save as…', icon: 'save', run: () => this.save(true) } : null];
   }
   more() {
-    return [{ label: 'Save as…', icon: 'save', run: () => this.save(true) }, this.path ? { label: 'Download', icon: 'down', run: () => saveAs(this.ed.value, 'text/plain', this.title) } : null];
+    return [{ label: 'Save as…', icon: 'save', run: () => this.save(true) }, this.path ? { label: 'Versions…', icon: 'clock', run: () => R.helpers.versions(this) } : null, this.path ? { label: 'Download', icon: 'down', run: () => saveAs(this.ed.value, 'text/plain', this.title) } : null];
   }
   /** A Markdown file drawn (md.js), or its text again. */
   preview(on) {
@@ -384,7 +385,7 @@ export const lastStatement = sql => statements(sql).at(-1) || sql;
 // ------------------------------------------------------------------ the core's kinds of file, as an extension would register them
 export function registerFiles(register) {
   const text = (Cls, kind) => async path => { if (!path) return new Cls({}); const f = await readFile(path); return new Cls({ path, text: f.text, version: f.version, kind }); };
-  register.doc({ id: 'notebook', label: 'Notebook', icon: 'notebook', match: p => /\.ipynb$/i.test(p) && !p.startsWith('notebooks/'), open: openPlain }); // (a plain file, saved in place; notebooks keeps versions)
+  register.doc({ id: 'notebook', label: 'Notebook', icon: 'notebook', match: p => /\.ipynb$/i.test(p) && !/^notebooks\/[^/]+\//.test(p), open: openPlain }); // (one file, saved in place, its versions kept by the node; notebooks/<name>/<time>.ipynb: saved before that)
   register.doc({ id: 'sql', label: 'SQL file', icon: 'filesql', order: 20, match: p => /\.sql$/i.test(p), open: text(SqlDoc) });
   register.doc({ id: 'python', label: 'Python file', icon: 'filepy', order: 30, match: p => /\.py$/i.test(p), open: async path => { const { PythonDoc } = await import('./pyfile.js'); return text(PythonDoc)(path); } }); // (loaded when a Python file first opens)
   register.doc({ id: 'data', label: 'Data file', icon: 'filedata', order: 40, match: p => DATA.test(p), open: async path => {

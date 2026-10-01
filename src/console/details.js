@@ -1,10 +1,9 @@
 // The details of a table, a view, a file or an answer (ADR-034, round 29), and a data profile (a
 // table's, an answer's): loaded the first time something is picked, not with the page. What they
 // use of the shell comes through `R.helpers`.
-import { h, count, bytes, utc, ago, icon, typeMark, sqlType, fileSql, S, R, run, rows, ident, toast, numeric, moreStyle } from './core.js';
+import { h, count, bytes, utc, icon, typeMark, sqlType, fileSql, S, R, run, rows, ident, toast, numeric, moreStyle } from './core.js';
 import { highlighted } from './editor.js';
 import { spread, summarize } from './grid.js';
-import { versions, openNotebook } from './notebook.js';
 import { iconOf, kindOf, download } from './files.js';
 
 await moreStyle();
@@ -103,12 +102,8 @@ export async function fileDetail(f) {
     h('div', { class: 'acts2' }, kind !== 'file' ? act('eye', 'Open', 'Open it in a tab', () => openFile(rel)) : null,
       kind === 'data' ? act('play', 'Query with SQL', 'Read it as a table, in a SQL tab', () => query(`SELECT * FROM ${fileSql(rel)} LIMIT 1000`)) : null,
       !f.notebook ? act('down', 'Download', 'Download it', () => download(rel)) : null)];
-  if (f.notebook) {
-    const vs = await versions(rel.slice(10)).catch(() => []);
-    out.push(h('div', { class: 'dsect' }, `Versions (${vs.length})`), ...vs.map(v => h('div', { class: 'row', role: 'button', tabindex: '0', title: 'Open this version', onclick: async () => { const open = S.docs.find(d => d.path === rel); if (open && !open.close()) return; if (open) closeDoc(open); addDoc(await openNotebook(rel.slice(10), v.version)); } },
-      icon('clock'), h('span', { class: 'nm' }, utc(v.written).toLocaleString()), h('span', { class: 'meta' }, ago(v.written)))));
-    return out;
-  }
+  out[1].append(act('clock', 'Versions…', 'Its saves, each kept: what changed, and a version back', () => R.helpers.versions({ path: f.notebook ? rel + '.ipynb' : rel })));
+  if (f.notebook) return out;
   out.push(facts([['Size', bytes(f.size)], ['Written', f.written ? utc(f.written).toLocaleString() : null], ['In SQL', kind === 'data' ? fileSql(rel) : `file_read('files/${rel}')`]]));
   if (doc?.kind === 'data') {
     out.push(facts([['Rows', count(doc.data.length)], ['Columns', String(doc.cols.length)], ['Format', doc.status()[1]]]));

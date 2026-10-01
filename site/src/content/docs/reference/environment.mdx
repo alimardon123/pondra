@@ -90,6 +90,9 @@ A query is spread over the nodes of a cluster when that is cheaper than running 
 |---|---|---|
 | `PONDRA_GC_SECS` | `60` | how often the catalog's write-ahead-log objects and old manifests are cleared, and how old they must be |
 | `PONDRA_RUNS_DAYS` | `30` | how many days the run log, `pondra.runs`, keeps. Read when the log is first made |
+| `PONDRA_BUCKET_REQUESTS` | `256` | how many requests a node sends a bucket at once to start with. It halves when the bucket answers 503 or 429, and grows back, up to four times this |
+| `PONDRA_FILE_VERSIONS` | `50` | how many versions of each of the lake's files are kept ([versions](/pondra/reference/http/#files)) |
+| `PONDRA_FILE_VERSIONS_DAYS` | `90` | how many days a file's versions are kept (its newest always is) |
 | `PONDRA_PURGE_ROWS` | `100000` | after `UPDATE`, `DELETE` and `MERGE` on an append table, its files are rewritten without the old rows once this many, or a tenth of the table, are waiting. A table that publishes a format is rewritten every round |
 | `PONDRA_INLINE_KB` | `64`, or `1024` with `--ack replicated` and `--replicas` above 1 | a write smaller than this is carried inside the commit. A bigger one is written as its own object first |
 

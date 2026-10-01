@@ -26,7 +26,9 @@ pub async fn send(store: &Store, r: &Request, wake: Option<&str>) -> Result<Opti
     let id = uuid::Uuid::new_v4();
     let (req, out) = (Path::from(format!("inbox/{id}.{kind}")), Path::from(format!("inbox/{id}.out")));
     store.put(&req, body.into()).await?;
-    store.put(&Path::from(BELL), id.to_string().into_bytes().into()).await?;
+    // (R2 takes one write a second to a key: a ring refused (429) means it just rang, so it counts
+    // as rung; and the leader looks every 30 s anyway: C5)
+    let _ = store.put(&Path::from(BELL), id.to_string().into_bytes().into()).await;
     if let Some(dir) = wake {
         let dir = dir.to_string();
         crate::panics::spawn(async move { lead_once(&dir).await });
@@ -68,10 +70,11 @@ pub async fn lead_once(dir: &str) -> Result<()> {
 /// for a leader).
 pub fn serve(lake: Arc<Lake>, seq: Arc<Sequencer>, lock: Arc<Mutex<()>>) {
     crate::panics::spawn(async move {
-        let mut heard = None;
+        let (mut heard, mut looked) = (None, std::time::Instant::now());
         loop {
             let bell = lake.store.head(&Path::from(BELL)).await.ok().map(|m| (m.last_modified, m.e_tag));
-            if heard.is_none() || bell != heard.clone().flatten() {
+            if heard.is_none() || bell != heard.clone().flatten() || looked.elapsed() > Duration::from_secs(30) {
+                looked = std::time::Instant::now();
                 if let Err(e) = drain(&lake, &seq, &lock).await {
                     eprintln!("inbox: {e:#}");
                 }

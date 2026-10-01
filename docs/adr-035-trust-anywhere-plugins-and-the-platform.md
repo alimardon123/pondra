@@ -266,3 +266,25 @@ a run records what it ran. To add:
   header's length past its body: fixed) and through pgwire's decoding of `Bind`, `Parse` and
   `CopyData` messages cut short (pgwire's, 0.41: now that connection's alone); Kafka's and Flight's
   parsers held.
+
+### §8: every file keeps its versions (2026-10-01)
+
+- **Each save through `PUT /files` is kept twice**: the file, replaced in place as before
+  (`If-Match`), and a copy at `files/.versions/<path>/<ms>.<who>` (`files.rs`). *By Claude:* the
+  copy is written at save time rather than the old bytes moved aside at the next save, so a
+  version's author is known (an object store keeps no writer), the newest version is the file as
+  it is, and a deleted file keeps every version. The catalog records nothing: listing a file's
+  folder of versions is one request, and the catalog stays the tables'. Files over 64 MB aren't
+  copied.
+- **Kept**: the newest `PONDRA_FILE_VERSIONS` (50) for `PONDRA_FILE_VERSIONS_DAYS` (90), let go at
+  each save of that file (the newest always stays). `files()` doesn't list `.versions`.
+- **`GET /files/<p>?versions`**, **`?version=<id>`**, **`POST /files/<p>?restore=<id>`** (the
+  restored bytes kept as the newest version, by whoever restored them). Nothing outside a file's own
+  versions is read through `?version=`.
+- **Notebooks are one file** (`notebooks/<name>.ipynb`), as any other; a notebook saved before as
+  `notebooks/<name>/<time>.ipynb` still opens, its next save makes it one file, and those saves are
+  listed among its versions (`run('notebooks/<name>')` runs the one file once it is there). Any
+  notebook can be a job or a schedule; a run records the version it ran, as before.
+- **The console**: **Versions…** in every file's ⋯, the Workspace's menu and Details: the versions
+  newest first, by whom; one picked shows what changed since, line by line (− what went, + what
+  came, the rest folded), and **Restore this version** (`versions.js`, loaded when first used).

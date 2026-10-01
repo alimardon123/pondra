@@ -119,7 +119,7 @@ pub fn router(app: App) -> Router {
         .route("/sql", post(sql))
         .route("/sql/pages/{id}", get(page))
         .route("/mcp", post(crate::mcp::handle))
-        .route("/files/{*path}", put(put_file).get(get_file).delete(delete_file))
+        .route("/files/{*path}", put(put_file).get(get_file).delete(delete_file).post(restore_file))
         .route("/lookup/{name}/{key}", get(lookup))
         .route("/watch/{name}", get(watch))
         .route("/live", get(crate::live::live).post(crate::live::live))
@@ -178,7 +178,8 @@ async fn drop_function(State(app): State<App>, Path(name): Path<String>) -> Resu
 /// `PUT /files/<path>`: an object in the lake next to the tables — an image, a PDF, a model, a SQL
 /// file — for `files('…')` to list and `file_read(path)` to read (see `files.rs`). A path that
 /// exists is refused (409), unless `If-Match` names the version `GET` gave: then it is replaced,
-/// if nobody replaced it meanwhile (412 if so; ADR-034).
+/// if nobody replaced it meanwhile (412 if so; ADR-034). Each save is kept as a version too
+/// (`files::keep`, ADR-035 §8).
 async fn put_file(State(app): State<App>, Path(path): Path<String>, headers: HeaderMap, body: Bytes) -> Result<Response, E> {
     let (path, bytes) = (crate::files::under_files(&path), body.len());
     let expect = headers.get("if-match").and_then(|v| v.to_str().ok()).map(|v| v.trim_matches('"').to_string());
@@ -190,7 +191,12 @@ async fn put_file(State(app): State<App>, Path(path): Path<String>, headers: Hea
         },
     };
     match done {
-        Ok(version) => Ok(Json(j!({"path": path, "bytes": bytes, "version": version})).into_response()),
+        Ok(version) => {
+            if let Err(e) = crate::files::keep(&app.lake, &path, &body).await {
+                eprintln!("{path}: saved, but not kept as a version: {e:#}");
+            }
+            Ok(Json(j!({"path": path, "bytes": bytes, "version": version})).into_response())
+        }
         Err(e) if e.is::<crate::store::Changed>() => Ok((StatusCode::PRECONDITION_FAILED, format!("{path}: {e}")).into_response()),
         Err(e) if expect.is_none() && format!("{e:#}").contains("already exists") =>
             Ok((StatusCode::CONFLICT, format!("{path} is there already: send If-Match with the version you read to replace it, or put it under another name")).into_response()),
@@ -199,10 +205,21 @@ async fn put_file(State(app): State<App>, Path(path): Path<String>, headers: Hea
 }
 
 /// `GET /files/<path>`: that object's bytes, its version (`etag`, for `If-Match`) and a content
-/// type by its name.
-async fn get_file(State(app): State<App>, Path(path): Path<String>) -> Result<Response, E> {
+/// type by its name. `?versions`: the versions it keeps, newest first; `?version=<id>`: one's bytes.
+async fn get_file(State(app): State<App>, Path(path): Path<String>, Query(q): Query<HashMap<String, String>>) -> Result<Response, E> {
     let path = crate::files::under_files(&path);
-    let (bytes, version) = match app.lake.file(&path).await {
+    if q.contains_key("versions") {
+        let all = crate::files::versions(&app.lake, &path).await?;
+        return Ok(Json(all.iter().map(|v| j!({"id": v.id, "at": v.ms, "who": v.who, "bytes": v.bytes})).collect::<Vec<_>>()).into_response());
+    }
+    let found = match q.get("version") {
+        Some(id) => match crate::files::version(&app.lake, &path, id).await {
+            Ok(b) => Ok((b, id.clone())),
+            Err(e) => return Ok((StatusCode::NOT_FOUND, format!("{e:#}")).into_response()), // (not one of its versions, or gone)
+        },
+        None => app.lake.file(&path).await,
+    };
+    let (bytes, version) = match found {
         Ok(found) => found,
         Err(e) if e.downcast_ref::<object_store::Error>().is_some_and(|e| matches!(e, object_store::Error::NotFound { .. })) => {
             return Ok((StatusCode::NOT_FOUND, format!("no such file: {path}")).into_response());
@@ -225,7 +242,23 @@ async fn get_file(State(app): State<App>, Path(path): Path<String>) -> Result<Re
     Ok(([("content-type", kind), ("etag", &format!("\"{version}\"")), ("cache-control", "no-store")], bytes).into_response())
 }
 
-/// `DELETE /files/<path>`: that object gone (a writer's, as `PUT`).
+/// `POST /files/<path>?restore=<id>`: that version made the file again (itself kept as the newest).
+async fn restore_file(State(app): State<App>, Path(path): Path<String>, Query(q): Query<HashMap<String, String>>) -> Result<Json<Value>, E> {
+    let path = crate::files::under_files(&path);
+    let id = q.get("restore").ok_or_else(|| E(anyhow::anyhow!("POST /files/<path>?restore=<a version's id> (GET ?versions lists them)")))?;
+    let bytes = crate::files::version(&app.lake, &path, id).await?;
+    let version = match app.lake.version(&path).await {
+        Ok(now) => app.lake.replace(&path, bytes.to_vec(), &now).await?,
+        Err(_) => {
+            app.lake.put(&path, bytes.to_vec()).await?; // (deleted since: back again)
+            app.lake.version(&path).await?
+        }
+    };
+    crate::files::keep(&app.lake, &path, &bytes).await?;
+    Ok(Json(j!({"path": path, "version": version, "restored": id})))
+}
+
+/// `DELETE /files/<path>`: that object gone (a writer's, as `PUT`); its versions stay.
 async fn delete_file(State(app): State<App>, Path(path): Path<String>) -> Result<Json<Value>, E> {
     let path = crate::files::under_files(&path);
     app.lake.remove_file(&path).await?;
