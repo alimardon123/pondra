@@ -44,6 +44,9 @@ pub fn id(id: &str) -> String { format!("{}~{id}", crate::auth::current().map(|p
 
 pub fn current() -> Option<String> { SESSION.try_with(|s| s.clone()).ok().flatten() }
 
+/// A session for one script sent without one (`#`: no client names it so).
+pub fn of_script() -> String { format!("{}#script-{}", crate::auth::current().map(|p| p.name).unwrap_or_default(), uuid::Uuid::new_v4()) }
+
 /// The current session's temporary tables (name, columns) and views (name, SQL), as Postgres's
 /// catalog lists them (`pg_catalog.rs`).
 pub fn listed() -> (Vec<(String, Vec<(String, String)>)>, Vec<(String, String)>) {
@@ -68,10 +71,12 @@ impl Table {
 }
 
 #[derive(Default)]
-struct Session {
+pub struct Session {
     tables: HashMap<String, Table>,
     views: HashMap<String, String>,
     secrets: std::collections::BTreeMap<String, crate::ext::Secret>, // (CREATE TEMPORARY SECRET: in memory only)
+    pub settings: std::collections::BTreeMap<String, String>,       // SET name = value (`settings.rs`)
+    pub prepared: HashMap<String, String>,                          // PREPARE name AS …: its text
     used: Option<Instant>,
     version: u64, // changes so far (`live.rs` watches them)
 }
@@ -85,8 +90,8 @@ pub fn changes() -> tokio::sync::watch::Receiver<u64> { CHANGES.subscribe() }
 /// How many changes a session's temporary tables and views have had.
 pub fn version(session: Option<&str>) -> u64 { session.and_then(|s| SESSIONS.lock().unwrap().get(s).map(|x| x.version)).unwrap_or(0) }
 
-/// A session's tables and views, made on first use; its changes counted.
-fn with<T>(session: &str, change: bool, f: impl FnOnce(&mut Session) -> Result<T>) -> Result<T> {
+/// A session's tables, views and settings, made on first use; its changes counted.
+pub fn with<T>(session: &str, change: bool, f: impl FnOnce(&mut Session) -> Result<T>) -> Result<T> {
     let mut all = SESSIONS.lock().unwrap();
     let first = all.is_empty();
     let x = all.entry(session.to_string()).or_default();

@@ -1671,6 +1671,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "datafusion-spark"
+version = "55.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f7809ecefb16fcb950c6b22ee3df99cb412dca6fae72c329d64c938ae53254f9"
+dependencies = [
+ "arrow",
+ "bigdecimal",
+ "chrono",
+ "crc32fast",
+ "datafusion-catalog",
+ "datafusion-common",
+ "datafusion-execution",
+ "datafusion-expr",
+ "datafusion-functions",
+ "datafusion-functions-aggregate",
+ "datafusion-functions-aggregate-common",
+ "datafusion-functions-nested",
+ "log",
+ "num-traits",
+ "percent-encoding",
+ "rand 0.9.5",
+ "serde_json",
+ "sha1",
+ "sha2",
+ "twox-hash",
+ "url",
+]
+
+[[package]]
 name = "datafusion-sql"
 version = "55.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3224,6 +3253,7 @@ dependencies = [
  "crc-fast",
  "datafusion",
  "datafusion-functions-json",
+ "datafusion-spark",
  "flate2",
  "futures",
  "glob",
@@ -3968,6 +3998,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sha1"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aacc4cc499359472b4abe1bf11d0b12e688af9a805fa5e3016f9a386dc2d0214"
+dependencies = [
+ "cfg-if",
+ "cpufeatures",
+ "digest 0.11.3",
+]
+
+[[package]]
 name = "sha2"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4631,6 +4672,9 @@ name = "twox-hash"
 version = "2.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5283634e518fe9e82c7b20520bb4bc209009fd16c82077c802f8111ecbb0117a"
+dependencies = [
+ "rand 0.10.2",
+]
 
 [[package]]
 name = "typenum"

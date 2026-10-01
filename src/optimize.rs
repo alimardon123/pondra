@@ -45,6 +45,7 @@ pub fn rules() -> Vec<Arc<dyn OptimizerRule + Send + Sync>> {
     }
     rules.insert(0, Arc::new(Seconds)); // (before a literal is folded into a timestamp)
     rules.push(Arc::new(CheapFirst));
+    rules.push(Arc::new(InListOfRows));
     rules.push(Arc::new(AsyncBelow)); // (last: after COUNT(DISTINCT) became a GROUP BY)
     rules
 }
@@ -377,6 +378,39 @@ fn cheap_first(e: &Expr, schema: &DFSchema) -> Expr {
         }
         Expr::BinaryExpr(b) if b.op == Operator::Or => disjunction(split_binary(e, Operator::Or).into_iter().map(|p| cheap_first(p, schema))).expect("at least two"),
         _ => e.clone(),
+    }
+}
+
+/// `x IN (a, b)` whose list reads the row (`c1`, `CASE WHEN c1 < 0 THEN … END`) as `x = a OR x = b`
+/// (`NOT IN`: `x <> a AND x <> b`), the same answer to NULLs too. DataFusion 55.1 tries such a list
+/// on an empty batch to see if it is constant; a `CASE` passes, and every row is then compared
+/// with what it gave there (found by `tools/random_sql.py`).
+#[derive(Debug)]
+struct InListOfRows;
+
+impl OptimizerRule for InListOfRows {
+    fn name(&self) -> &str {
+        "in_list_of_rows"
+    }
+
+    fn apply_order(&self) -> Option<ApplyOrder> {
+        Some(ApplyOrder::BottomUp)
+    }
+
+    fn rewrite(&self, plan: LogicalPlan, _: &dyn OptimizerConfig) -> Result<Transformed<LogicalPlan>> {
+        let names = datafusion::logical_expr::expr_rewriter::NamePreserver::new(&plan); // (a column keeps the name its expression gave it)
+        plan.map_expressions(|e| {
+            let name = names.save(&e);
+            e.transform_up(|e| match e {
+                Expr::InList(i) if !i.list.is_empty() && i.list.iter().any(|x| !x.column_refs().is_empty()) => {
+                    let (op, join) = if i.negated { (Operator::NotEq, Operator::And) } else { (Operator::Eq, Operator::Or) };
+                    let each = i.list.into_iter().map(|x| datafusion::logical_expr::binary_expr((*i.expr).clone(), op, x));
+                    Ok(Transformed::yes(each.reduce(|a, b| datafusion::logical_expr::binary_expr(a, join, b)).expect("a list")))
+                }
+                e => Ok(Transformed::no(e)),
+            })
+            .map(|t| t.update_data(|e| name.restore(e)))
+        })
     }
 }
 

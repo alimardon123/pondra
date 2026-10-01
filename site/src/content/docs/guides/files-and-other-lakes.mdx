@@ -35,8 +35,8 @@ SQL
 
 ## Read files
 
-Name a file, a folder, a glob or a list where SQL takes a table. Reading is `read_parquet`, `read_csv`
-and `read_json`, in SQL and in every client.
+Name a file, a folder, a glob or a list where SQL takes a table. Reading is `read_parquet`, `read_csv`,
+`read_json` and `read_arrow` (Arrow's IPC files, `.arrow`, `.feather`), in SQL and in every client.
 
 <Tabs syncKey="lang">
   <TabItem label="Shell">
@@ -305,7 +305,7 @@ built yet.
 ## Write files
 
 `COPY (query) TO 'path' (FORMAT …)` writes a query's rows outside the lake: `parquet`, `csv`, `json`
-(lines), `delta` or `iceberg`. A path that ends in `/` is a folder. Anything else is one file.
+(lines), `arrow`, `delta` or `iceberg`. A path that ends in `/` is a folder. Anything else is one file.
 
 ```bash
 pondra files <<'SQL'
@@ -325,7 +325,10 @@ SQL
 
 - `PARTITION_BY` writes Hive-style folders (`day=2026-09-27/`).
 - `COPY` takes DataFusion's words too, `STORED AS CSV PARTITIONED BY (day) OPTIONS ('format.has_header' 'false')`
-  in place of the brackets: see [SQL statements](/pondra/reference/sql/#files-and-secrets).
+  in place of the brackets: see [SQL statements](/pondra/reference/sql/#files-and-secrets). Its
+  writers' own options pass through as DataFusion names them (`'format.compression' 'zstd(10)'`,
+  `'format.data_page_row_count_limit' '1000'`, `'format.quote_style' 'Always'`, …); one that isn't
+  the format's is refused.
 - A folder that already holds files is refused unless you say `OVERWRITE` (replace them) or `APPEND`.
   For `delta` and `iceberg`, an empty folder gets a new table, and one that holds a table takes `APPEND`
   or `OVERWRITE`.

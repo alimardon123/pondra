@@ -82,6 +82,57 @@ impl Merge {
 }
 
 /// A MERGE statement's pieces (None: not one Pondra takes).
+/// What a MERGE can't mean, said before it runs: no WHEN clause, a column set or inserted twice,
+/// a SET of the source's column, a source named as the target, Oracle's `… WHERE` after an action.
+pub fn merge_refused(m: &ast::Merge) -> Option<String> {
+    let ast::TableFactor::Table { name, alias, .. } = &m.table else { return None };
+    let target = alias.as_ref().map(|a| a.name.value.to_lowercase()).unwrap_or_else(|| name.0.last().map(|p| p.to_string().to_lowercase()).unwrap_or_default());
+    let source = match &m.source {
+        ast::TableFactor::Table { name, alias, .. } => Some(alias.as_ref().map(|a| a.name.value.to_lowercase()).unwrap_or_else(|| name.0.last().map(|p| p.to_string().to_lowercase()).unwrap_or_default())),
+        ast::TableFactor::Derived { alias: Some(a), .. } => Some(a.name.value.to_lowercase()),
+        _ => None,
+    };
+    if m.clauses.is_empty() {
+        return Some("MERGE … ON …: and then? WHEN MATCHED THEN UPDATE SET … | DELETE, WHEN NOT MATCHED THEN INSERT …".into());
+    }
+    if source.as_deref() == Some(target.as_str()) {
+        return Some(format!("MERGE: the source is named {target}, as the target is: name one of them otherwise (USING s AS src)"));
+    }
+    let twice = |names: Vec<String>| names.iter().enumerate().find(|(i, n)| names[..*i].contains(n)).map(|(_, n)| n.clone());
+    for c in &m.clauses {
+        match &c.action {
+            ast::MergeAction::Update(u) => {
+                if u.update_predicate.is_some() || u.delete_predicate.is_some() {
+                    return Some("MERGE … UPDATE SET … WHERE: put the condition in the clause, WHEN MATCHED AND … THEN UPDATE SET …".into());
+                }
+                let set: Vec<(Option<String>, String)> = u.assignments.iter().filter_map(|a| match &a.target {
+                    ast::AssignmentTarget::ColumnName(n) => {
+                        let parts: Vec<String> = n.0.iter().map(|p| p.to_string().trim_matches('"').to_lowercase()).collect();
+                        Some((parts.len().checked_sub(2).map(|i| parts[i].clone()), parts.last()?.clone()))
+                    }
+                    _ => None,
+                }).collect();
+                if let Some((Some(q), c)) = set.iter().find(|(q, _)| q.as_ref().is_some_and(|q| *q != target)) {
+                    return Some(format!("MERGE … UPDATE SET {q}.{c}: only the target's columns are set ({target}.{c}, or {c})"));
+                }
+                if let Some(c) = twice(set.into_iter().map(|(_, c)| c).collect()) {
+                    return Some(format!("MERGE … UPDATE SET {c} = …, {c} = …: one value a column"));
+                }
+            }
+            ast::MergeAction::Insert(i) => {
+                if i.insert_predicate.is_some() {
+                    return Some("MERGE … INSERT … WHERE: put the condition in the clause, WHEN NOT MATCHED AND … THEN INSERT …".into());
+                }
+                if let Some(c) = twice(i.columns.iter().map(|n| n.to_string().trim_matches('"').to_lowercase()).collect()) {
+                    return Some(format!("MERGE … INSERT ({c}, …, {c}): each column once"));
+                }
+            }
+            ast::MergeAction::Delete { .. } => {}
+        }
+    }
+    None
+}
+
 pub fn merge_of(m: &ast::Merge) -> Option<Merge> {
     let ast::TableFactor::Table { name, alias, .. } = &m.table else { return None };
     let target = crate::write::object(name);

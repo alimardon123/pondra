@@ -753,8 +753,10 @@ impl Lake {
             .with_default_catalog_and_schema(crate::ddl::lake_name(self), crate::ddl::PUBLIC));
         let state = SessionStateBuilder::new().with_config(config).with_runtime_env(self.rt.clone()).with_default_features();
         let mut state = state.with_optimizer_rules(crate::optimize::rules()).with_physical_optimizer_rules(crate::optimize::physical_rules());
-        state.expr_planners().get_or_insert_with(Vec::new).insert(0, crate::files::planner()); // (SUBSTRING of bytes too)
+        state.expr_planners().get_or_insert_with(Vec::new).insert(0, crate::files::planner());
+        state.expr_planners().get_or_insert_with(Vec::new).insert(0, crate::intervals::planner()); // (n * INTERVAL '37 seconds') // (SUBSTRING of bytes too)
         let mut ctx = SessionContext::new_with_state(state.build());
+        spark(&ctx); // format_string, pmod, parse_url, …
         datafusion_functions_json::register_all(&mut ctx).expect("JSON functions register"); // json_get(…), ->, ->>
         crate::files::register(&ctx, self.arc()); // files('…'), file_read(path)
         crate::ext::register_secrets(&ctx, self.arc()); // secrets()
@@ -1563,4 +1565,21 @@ pub fn maybe_crash(point: &str) {
 pub fn partitions() -> usize {
     let cores = std::env::var("PONDRA_CORES").ok().and_then(|p| p.parse().ok()).unwrap_or_else(|| std::thread::available_parallelism().map_or(2, |n| n.get()));
     cores.min(memory_limit() / (24 << 20)).max(2)
+}
+
+/// Spark's functions whose names DataFusion doesn't have (`format_string`, `pmod`, `parse_url`,
+/// `sha2`, `collect_list`, …: PySpark's vocabulary in SQL). Where both have a name, DataFusion's
+/// stays, so no answer changes.
+fn spark(ctx: &SessionContext) {
+    use datafusion::logical_expr::{AggregateUDF, ScalarUDF};
+    static MORE: LazyLock<(Vec<ScalarUDF>, Vec<AggregateUDF>)> = LazyLock::new(|| {
+        let s = SessionStateBuilder::new().with_default_features().build();
+        let new = |name: &str, aliases: &[String]| std::iter::once(name).chain(aliases.iter().map(String::as_str))
+            .all(|n| !s.scalar_functions().contains_key(n) && !s.aggregate_functions().contains_key(n) && !s.window_functions().contains_key(n));
+        let scalar = datafusion_spark::all_default_scalar_functions().into_iter().filter(|f| new(f.name(), f.aliases()));
+        let aggregate = datafusion_spark::all_default_aggregate_functions().into_iter().filter(|f| new(f.name(), f.aliases()));
+        (scalar.map(|f| f.as_ref().clone()).collect(), aggregate.map(|f| f.as_ref().clone()).collect())
+    });
+    MORE.0.iter().for_each(|f| { ctx.register_udf(f.clone()); });
+    MORE.1.iter().for_each(|f| { ctx.register_udaf(f.clone()); });
 }

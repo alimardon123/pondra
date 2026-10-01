@@ -304,3 +304,12 @@ def lead(c, offset=1, default=None):
 
 def broadcast(df):
     return df  # (the planner decides)
+
+
+def __getattr__(name):
+    """Any other of PySpark's functions: the SQL function of that name (`F.sha2("s", F.lit(256))`
+    is `sha2(s, 256)`). Pondra's SQL has DataFusion's functions and Spark's own where DataFusion
+    has none (`format_string`, `pmod`, `parse_url`, …); a name both have is DataFusion's meaning."""
+    if name.startswith("_"):
+        raise AttributeError(name)
+    return lambda *cols: _f(name, *cols)

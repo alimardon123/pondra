@@ -319,7 +319,8 @@ pub fn parse(sql: &str) -> Option<Stmt> {
         let name = |s: &str| s.split('.').map(|p| if p.starts_with('"') { p.trim_matches('"').to_string() } else { p.to_lowercase() }).collect::<Vec<_>>().join(".");
         return Some(Stmt::Ddl(vec![Ddl::RenameTable { name: name(&c[3]), to: name(&c[4]) }]));
     }
-    let parsed = match Parser::parse_sql(&GenericDialect {}, sql) {
+    let parsed = Parser::parse_sql(&GenericDialect {}, sql).or_else(|e| crate::settings::dialect().map_or(Err(e), |d| Parser::parse_sql(d.as_ref(), sql))); // (DuckDB's STRUCT(a INT), …: the session's dialect)
+    let parsed = match parsed {
         Ok(mut s) => s.pop()?,
         Err(_) => return None,
     };
@@ -433,7 +434,14 @@ pub fn parse(sql: &str) -> Option<Stmt> {
         },
         Statement::CreateDatabase { db_name, if_not_exists, location, .. } => Stmt::Ddl(vec![Ddl::CreateDatabase { name: object(&db_name).to_lowercase(), if_not_exists, dir: location }]),
         Statement::DetachDuckDBDatabase { if_exists, database_alias, .. } => Stmt::Ddl(vec![Ddl::Detach { name: ident(&database_alias), if_exists }]),
+        Statement::Merge(m) if crate::change::merge_refused(&m).is_some() => Stmt::Invalid(crate::change::merge_refused(&m).unwrap_or_default()),
         Statement::Merge(m) => Stmt::Merge(Box::new(crate::change::merge_of(&m)?)),
+        Statement::Query(mut q) => {
+            // `SELECT … INTO t FROM …`: CREATE TABLE t AS SELECT … FROM …
+            let ast::SetExpr::Select(s) = q.body.as_mut() else { return None };
+            let into = s.into.take()?;
+            return parse(&format!("CREATE {}TABLE {} AS {q}", if into.temporary { "TEMP " } else { "" }, into.name));
+        }
         Statement::CreateMacro { or_replace, name, args, definition, .. } => Stmt::Ddl(vec![Ddl::CreateRoutine { name: object(&name), routine: crate::routines::of_macro(&args, &definition), replace: or_replace }]),
         Statement::DropFunction(ast::DropFunction { if_exists, func_desc: names, .. }) | Statement::DropProcedure { if_exists, proc_desc: names, .. } => {
             Stmt::Ddl(names.iter().map(|f| Ddl::DropRoutine { name: object(&f.name), if_exists }).collect())
@@ -485,6 +493,7 @@ async fn declared_of(columns: &[ast::ColumnDef]) -> Result<Vec<datafusion::arrow
 /// DataFusion types them.
 pub async fn declared(cols: &str) -> Result<Vec<datafusion::arrow::datatypes::FieldRef>> {
     let ctx = SessionContext::new_with_config(crate::optimize::config(datafusion::prelude::SessionConfig::new())); // (TIMESTAMPTZ in UTC)
+    let ctx = crate::settings::apply(ctx).await?; // (the session's dialect: DuckDB's STRUCT(a INT), …)
     ctx.sql(&format!("CREATE TABLE t ({cols})")).await.with_context(|| format!("the columns ({cols})"))?;
     Ok(ctx.table("t").await?.schema().fields().iter().cloned().collect::<Vec<_>>())
 }
@@ -885,6 +894,34 @@ pub fn on_node_as(app: &crate::server::App, stmt: Stmt, job: Option<String>, fil
     })
 }
 
+/// SQL's CREATE TABLE of a table that's there, as Postgres has it: refused (42P07), left as it is
+/// with IF NOT EXISTS, dropped first with OR REPLACE. (`POST /tables/{name}`, which may only add
+/// columns, is the call that may be sent again.)
+async fn existing(app: &crate::server::App, c: &ast::CreateTable, job: &str, files: bool) -> Result<Option<Value>> {
+    match there(&app.lake, c).await? {
+        Some(true) => Ok(Some(j!({"table": object(&c.name), "exists": true}))),
+        Some(false) => {
+            let drop = Stmt::Ddl(vec![crate::ddl::Ddl::DropTable { name: object(&c.name), if_exists: true }]);
+            Box::pin(on_node_as(app, drop, Some(format!("{job}:replaced")), files)).await.map(|_| None)
+        }
+        None => Ok(None),
+    }
+}
+
+/// Is the table a CREATE TABLE names there? None: no; Some(true): leave it (IF NOT EXISTS);
+/// Some(false): drop it first (OR REPLACE); otherwise refused.
+async fn there(lake: &Lake, c: &ast::CreateTable) -> Result<Option<bool>> {
+    let name = object(&c.name);
+    ensure!(!(c.or_replace && c.if_not_exists), "CREATE OR REPLACE TABLE … IF NOT EXISTS: one or the other");
+    let (other, table) = crate::ddl::resolve(lake, &name).await?;
+    let lake = other.unwrap_or_else(|| lake.arc());
+    if lake.cat.get::<TableMeta>(&table_key(&table)).await?.is_none() {
+        return Ok(None);
+    }
+    ensure!(c.if_not_exists || c.or_replace, "table {name} already exists (CREATE TABLE IF NOT EXISTS leaves it as it is; CREATE OR REPLACE TABLE makes it anew)");
+    Ok(Some(c.if_not_exists))
+}
+
 /// A write done through a follower is in its reads before it answers: the next statement on this
 /// node sees it (a script's INSERT, then its SELECT), as on the leader. The follower waits until
 /// its view holds everything the leader had committed once the write was done (5 s at most: a
@@ -941,6 +978,9 @@ async fn on_node_listed(app: &crate::server::App, stmt: Stmt, job: Option<String
     }
     // CREATE TABLE … AS SELECT: the table, with the query's columns, then its rows.
     if let Stmt::Create(c) = &stmt {
+        if let Some(out) = Box::pin(existing(app, c, &job, files)).await? {
+            return Ok(out);
+        }
         if let Some(q) = &c.query {
             let (name, query) = (object(&c.name), q.to_string());
             Box::pin(on_node_as(app, Stmt::Define(name.clone(), create_spec(c, lake, files).await?), Some(job.clone()), files)).await?;
@@ -1151,6 +1191,11 @@ pub async fn from_cli(dir: &str, stmt: Stmt) -> Result<Value> {
         Stmt::InsertInto(t, names, query) => Stmt::Insert(t.clone(), whole_rows(&*Lake::open(dir, false, false).await?, &t, &names, &query).await?),
         s => s,
     };
+    if let Stmt::Create(c) = &stmt {
+        if Lake::open(dir, false, false).await.is_ok() && Box::pin(created(dir, c)).await?.is_some() {
+            return Ok(j!({"table": object(&c.name), "exists": true})); // (CREATE TABLE IF NOT EXISTS of one that's there)
+        }
+    }
     match stmt {
         Stmt::CopyTo(query, to, options) => {
             let lake = Lake::open(dir, false, false).await?;
@@ -1171,6 +1216,17 @@ pub async fn from_cli(dir: &str, stmt: Stmt) -> Result<Value> {
             Ok(out)
         }
         stmt => one_from_cli(dir, stmt).await,
+    }
+}
+
+/// The shell's CREATE TABLE of a table that's there: Some (left, IF NOT EXISTS), None (made
+/// next: OR REPLACE dropped it), or refused.
+async fn created(dir: &str, c: &ast::CreateTable) -> Result<Option<()>> {
+    let lake = Lake::open(dir, false, false).await?;
+    match there(&lake, c).await? {
+        Some(true) => Ok(Some(())),
+        Some(false) => Box::pin(one_from_cli(dir, Stmt::Ddl(vec![crate::ddl::Ddl::DropTable { name: object(&c.name), if_exists: true }]))).await.map(|_| None),
+        None => Ok(None),
     }
 }
 

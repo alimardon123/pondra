@@ -1061,6 +1061,13 @@ async fn one_of(app: &App, sql: &str, who: Who, job: Option<String>) -> Result<O
         let none = RecordBatch::try_new_with_options(Arc::new(datafusion::arrow::datatypes::Schema::empty()), vec![], &datafusion::arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(1)))?;
         return Box::pin(run(app, "do".into(), r, none, who, job, None)).await;
     }
+    if crate::settings::is(sql) {
+        // SET, RESET, PREPARE, EXECUTE, DEALLOCATE: the session's (round 31)
+        return match Box::pin(crate::settings::statement(&app.lake, sql)).await? {
+            crate::settings::Done::Said(tag) => Ok(Outcome::Done(j!({"command": tag}))),
+            crate::settings::Done::Run(sql) => Box::pin(one_of(app, &sql, who, job)).await,
+        };
+    }
     if let Some(stmt) = crate::write::parse(sql) {
         app.auth.allows(who.role, &stmt)?;
         return Ok(Outcome::Done(crate::write::on_node_as(app, stmt, job, who.files).await?));
@@ -1275,7 +1282,7 @@ async fn python(app: &App, name: &str, r: &Routine, args: RecordBatch, who: Who,
     // in its namespace (`python::ask_session`). Not one a procedure sends: that would wait for the
     // cell that is running it.
     let asked = match (name, crate::temp::current()) {
-        ("do", Some(session)) if who.depth == 1 => {
+        ("do", Some(session)) if who.depth == 1 && !session.contains("#script-") => { // (not a script's own: a session of the moment)
             let mut head = head;
             head["op"] = j!("cell");
             head["session"] = j!(session);

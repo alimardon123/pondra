@@ -44,7 +44,7 @@ def sh(*args, **kw):
 def prepare():
     if not os.path.isdir(os.path.join(DF, "datafusion", "sqllogictest", "test_files")):
         sh("git", "clone", "--depth", "1", "--filter=blob:none", "--sparse", "--branch", DF_VERSION, "https://github.com/apache/datafusion", DF)
-        sh("git", "-C", DF, "sparse-checkout", "set", "datafusion/sqllogictest/test_files", "datafusion/core/tests/data", "datafusion/core/tests/tpch-csv")
+        sh("git", "-C", DF, "sparse-checkout", "set", "datafusion/sqllogictest/test_files", "datafusion/core/tests/data", "datafusion/core/tests/tpch-csv", "datafusion/datasource-arrow/tests/data")
         sh("git", "-C", DF, "submodule", "update", "--init", "--depth", "1", "testing", "parquet-testing")
     if not os.path.exists(os.path.join(TPCH, "lineitem.parquet")):
         os.makedirs(TPCH, exist_ok=True)

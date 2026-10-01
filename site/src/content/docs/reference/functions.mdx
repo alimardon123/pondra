@@ -1,6 +1,6 @@
 ---
 title: SQL functions
-description: The functions Pondra adds to DataFusion's standard ones, for JSON, vectors, files, binary data, models and routines.
+description: The functions Pondra adds to DataFusion's standard ones, for Spark's vocabulary, JSON, vectors, files, binary data, models and routines.
 sidebar:
   order: 2
 ---
@@ -11,6 +11,30 @@ Pondra's SQL is [Apache DataFusion's](https://datafusion.apache.org/user-guide/s
 so every function in DataFusion's lists works here: strings, math, dates, arrays, `regexp_*`,
 `window` functions and aggregates. This page lists what Pondra adds. For the functions you make
 yourself, see [`CREATE FUNCTION`](/pondra/reference/sql/#functions-procedures-and-tasks).
+
+## Spark's functions
+
+Spark SQL's functions whose names DataFusion doesn't have work as Spark computes them (from Apache
+DataFusion's [`datafusion-spark`](https://crates.io/crates/datafusion-spark)), so a PySpark job's
+SQL keeps its words: `format_string`, `pmod`, `parse_url`, `try_parse_url`, `sha1`, `sha2`, `crc32`,
+`xxhash64`, `bin`, `bit_count`, `bit_get`, `shiftleft`, `shiftright`, `luhn_check`, `soundex`,
+`elt`, `str_to_map`, `json_tuple`, `make_dt_interval`, `date_add`, `date_sub`, `last_day`,
+`next_day`, `from_utc_timestamp`, `to_utc_timestamp`, `collect_list`, `collect_set`, `try_sum` and
+more (`SHOW FUNCTIONS` lists them all).
+
+```sql
+SELECT format_string('%s x %d', 'tea', 3) AS said, pmod(-7, 3) AS m, parse_url('https://example.com/a?q=1', 'HOST') AS host;
+```
+
+```text
+said     m  host
+tea x 3  2  example.com
+```
+
+Where both have a name and differ (Spark's `floor` of a `DOUBLE` is a `BIGINT`; its `substring`
+from a negative start counts from the end), DataFusion's is the one you get, unless the session
+speaks Spark: after `SET datafusion.sql_parser.dialect = 'spark'` (or `'databricks'`), Spark's are,
+and so are its `EXTRACT` and `SUBSTRING`.
 
 ## JSON
 

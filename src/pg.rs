@@ -221,6 +221,15 @@ impl Backend {
             });
         }
         crate::txn::refuse().map_err(user_error)?; // (a failed transaction takes nothing but its end)
+        if crate::settings::is(&sql) {
+            // SET, RESET, PREPARE, EXECUTE, DEALLOCATE: this connection's (round 31)
+            return match crate::settings::statement(&self.app.lake, &sql).await {
+                Ok(crate::settings::Done::Said(tag)) => Ok(Response::Execution(Tag::new(tag))),
+                Ok(crate::settings::Done::Run(sql)) => Box::pin(self.run(user, &sql, format)).await,
+                Err(_) if crate::write::first_word(&sql).to_uppercase().starts_with("DEALLOCATE") => Ok(Response::Execution(Tag::new("DEALLOCATE"))), // (a statement the protocol prepared: pgwire's)
+                Err(e) => Err(user_error(e)),
+            };
+        }
         if let Some(r) = session_command(&sql) {
             return Ok(r);
         }
@@ -460,7 +469,8 @@ fn command_tag(sql: &str, stmt: &crate::write::Stmt) -> String {
     }
 }
 
-/// Session settings and transactions: accepted (every statement commits on its own).
+/// Postgres's session commands: `SHOW` of a Postgres setting (what the session set, or what
+/// clients expect), and `DISCARD` and `CLOSE` accepted. (`SET` and the rest: `settings.rs`.)
 fn session_command(sql: &str) -> Option<Response> {
     let first = sql.split_whitespace().next()?.to_uppercase();
     let setting = |v: &str| {
@@ -471,13 +481,17 @@ fn session_command(sql: &str) -> Option<Response> {
     };
     match first.as_str() {
         "SET" | "RESET" | "BEGIN" | "START" | "COMMIT" | "END" | "ROLLBACK" | "DISCARD" | "DEALLOCATE" | "CLOSE" => Some(Response::Execution(Tag::new(&first))),
-        "SHOW" if !sql.to_lowercase().contains("tables") => setting(match sql.to_lowercase() {
-            s if s.contains("standard_conforming_strings") => "on",
-            s if s.contains("transaction") => "read committed",
-            s if s.contains("server_version") => "16.0",
-            s if s.contains("encoding") => "UTF8",
-            _ => "",
-        }),
+        "SHOW" if !sql.to_lowercase().contains("tables") && !sql.to_lowercase().contains("datafusion.") && !sql.to_lowercase().trim_end_matches(';').trim().ends_with(" all") => {
+            let name = sql.split_whitespace().skip(1).collect::<Vec<_>>().join(" ").trim_end_matches(';').to_lowercase();
+            setting(&crate::settings::shown(&name).unwrap_or_else(|| match name.as_str() {
+                s if s.contains("standard_conforming_strings") => "on".into(),
+                s if s.contains("transaction") => "read committed".into(),
+                s if s.contains("server_version") => "16.0".into(),
+                s if s.contains("encoding") => "UTF8".into(),
+                s if s.contains("zone") => "UTC".into(),
+                _ => String::new(),
+            }))
+        }
         _ => None,
     }
 }
@@ -834,7 +848,7 @@ impl Backend {
         }
         let n = (1..).take_while(|i| sql.contains(&format!("${i}"))).count();
         let mut types = vec![Type::VARCHAR; n];
-        if n > 0 && session_command(sql).is_none() && crate::write::parse(sql).is_none() && Copy::of(sql).is_none() {
+        if n > 0 && session_command(sql).is_none() && !crate::settings::is(sql) && crate::write::parse(sql).is_none() && Copy::of(sql).is_none() {
             let plan = async { self.session(sql, "").await.ok()?.sql_with_options(&crate::asof::rewrite(sql).ok()?, read_only()).await.ok() }.await;
             for (name, t) in plan.and_then(|df| df.logical_plan().get_parameter_types().ok()).unwrap_or_default() {
                 if let (Some(i @ 1..), Some(t)) = (name.trim_start_matches('$').parse::<usize>().ok(), t) {
@@ -853,7 +867,7 @@ impl Backend {
             None => crate::serve::point(&self.app.lake, sql).await.ok().flatten().and_then(|p| p.schema().ok()), // (a key lookup's columns, unplanned, first)
             Some(_) => None,
         };
-        if point.is_none() && (session_command(sql).is_some() || crate::write::parse(sql).is_some() || Copy::of(sql).is_some()) {
+        if point.is_none() && (session_command(sql).is_some() || crate::settings::is(sql) || crate::write::parse(sql).is_some() || Copy::of(sql).is_some()) {
             return Ok(vec![]); // (a COPY's columns come with its data)
         }
         let schema = match point {

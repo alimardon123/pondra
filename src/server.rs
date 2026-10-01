@@ -555,7 +555,7 @@ impl App {
         use crate::metrics::{add, QUERIES, QUERY_ERRORS, QUERY_US, SPREAD};
         let start = std::time::Instant::now();
         let run = async {
-            let here_only = spread == Some("0") || crate::query::sent() || crate::temp::mentioned(query) || crate::txn::open() || crate::routines::pinned(&self.lake, query).await // (rows sent with a request are here only; so are the session's temporary tables and its transaction, and a Python table function's call)
+            let here_only = spread == Some("0") || crate::query::sent() || crate::temp::mentioned(query) || crate::txn::open() || crate::settings::any() || crate::routines::pinned(&self.lake, query).await // (rows sent with a request are here only; so are the session's temporary tables, its transaction and settings, and a Python table function's call)
                 || crate::auth::limited().is_some(); // (and a user's granted some tables: its grants are checked where it is planned, here)
             let nodes = if here_only { vec![] } else { self.cluster.nodes() };
             match crate::spmd::query(&self.lake, &nodes, &self.cluster.addr, query, spread == Some("1")).await {
@@ -972,12 +972,21 @@ async fn sql_as(app: App, p: SqlParams, role: axum::Extension<crate::auth::Role>
     }
     if let ([one], true, true, true) = (&crate::routines::split(&req.sql)[..], req.params.is_empty(), req.tables.is_empty(), req.views.is_empty()) {
         let one = crate::routines::expand(&app.lake, one).await?;
-        if !crate::write::checkpoint(&one) && !crate::routines::runs_procedure(&one) && crate::write::parse(&one).is_none() && crate::txn::control(&one).is_none() && !crate::txn::open() {
+        if !crate::write::checkpoint(&one) && !crate::routines::runs_procedure(&one) && crate::write::parse(&one).is_none() && crate::txn::control(&one).is_none() && !crate::txn::open() && !crate::settings::is(&one) {
             return Ok(crate::audit::statement(&app, &one, query(&app, &p, &one, who.files)).await?);
         }
     }
     let tables = Arc::new(req.tables);
-    match crate::query::SENT.scope(tables, crate::routines::script(&app, &req.sql, &req.params, &req.views, who, p.job.clone())).await? {
+    // A script sent without a session is one of its own while it runs: its SET, PREPARE, BEGIN
+    // and temporary tables last to its end.
+    let own = (crate::temp::current().is_none() && crate::routines::split(&req.sql).len() > 1).then(crate::temp::of_script);
+    let run = crate::query::SENT.scope(tables, crate::routines::script(&app, &req.sql, &req.params, &req.views, who, p.job.clone()));
+    let out = match &own {
+        Some(s) => crate::temp::SESSION.scope(Some(s.clone()), run).await,
+        None => run.await,
+    };
+    own.inspect(|s| _ = crate::temp::end(s));
+    match out? {
         Outcome::Rows(batches) => Ok(([("content-type", content_type(&p))], answer(&batches, &p)?).into_response()),
         Outcome::Done(v) => Ok(Json(v).into_response()),
     }
@@ -1012,6 +1021,7 @@ async fn query(app: &App, p: &SqlParams, query: &str, files: bool) -> anyhow::Re
     let q = query.to_lowercase();
     let volatile = files || limited || !crate::ext::names(query).is_empty() || ["now()", "random(", "current_", "uuid(", "explain", "pondra.runs", "pondra.tasks", "pondra.audit", "files("].iter().any(|f| q.contains(f)) // (files outside the lake change on their own; `files()` lists objects put since)
         || crate::temp::mentioned(query) // (the session's temporary tables change without a commit)
+        || crate::settings::any() // (and its settings may change the answer)
         || crate::routines::volatile(&app.lake, query).await; // (a Python function may answer differently each time)
     let Some(version) = app.lake.version_for(query).await.filter(|_| !volatile) else { return Ok(respond(run_sql(app, p, query, files).await?)) };
     let key = format!("{format}{}|{}|{query}", p.rows.map(|n| format!(":{n}")).unwrap_or_default(), p.spread.as_deref().unwrap_or(""));

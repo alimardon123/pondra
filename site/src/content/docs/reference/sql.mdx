@@ -112,8 +112,8 @@ A parameter goes with the request, in JSON. The Python and JavaScript clients do
 
 | Statement | Syntax |
 |---|---|
-| Create | `CREATE TABLE [IF NOT EXISTS] t (column type [NOT NULL] [DEFAULT expression] [CHECK (condition)] [PRIMARY KEY], … [, PRIMARY KEY (column, …)] [, CONSTRAINT name CHECK (condition)]) [WITH (option = 'value', …)]` |
-| Create from a query | `CREATE TABLE t AS SELECT …`, or `CREATE TABLE t (a INT, b VARCHAR) AS VALUES …` |
+| Create | `CREATE [OR REPLACE] TABLE [IF NOT EXISTS] t (column type [NOT NULL] [DEFAULT expression] [CHECK (condition)] [PRIMARY KEY], … [, PRIMARY KEY (column, …)] [, CONSTRAINT name CHECK (condition)]) [WITH (option = 'value', …)]` |
+| Create from a query | `CREATE TABLE t AS SELECT …`, `CREATE TABLE t (a INT, b VARCHAR) AS VALUES …`, or `SELECT … INTO t FROM …` |
 | Add a column | `ALTER TABLE t ADD COLUMN [IF NOT EXISTS] c type` |
 | Rename a column | `ALTER TABLE t RENAME COLUMN a TO b` |
 | Rename a table | `ALTER TABLE t RENAME TO u` |
@@ -122,6 +122,10 @@ A parameter goes with the request, in JSON. The Python and JavaScript clients do
 | Change options | `ALTER TABLE t SET (publish = 'delta', cluster_by = 'user', ttl = 'ts:3600', order_by = 'ts')` |
 | Empty | `TRUNCATE [TABLE] t` |
 | Drop | `DROP TABLE [IF EXISTS] t [, t2 …]` |
+
+A table of that name already there refuses `CREATE TABLE` (`42P07`, as in Postgres), whether it
+has the same columns or not; `IF NOT EXISTS` leaves it as it is, and `OR REPLACE` drops it and
+makes it anew.
 
 A table without a primary key is an append table. With a key, a new row replaces the old one with the
 same key. The options are on [table options](/pondra/reference/table-options/). An `ALTER TABLE`
@@ -213,6 +217,56 @@ SELECT * FROM visits ORDER BY id;
 The statements between `BEGIN` and `COMMIT` are one commit, read their own writes, and see the lake
 as it was at `BEGIN` (snapshot isolation). A row another commit changed since then refuses `COMMIT`
 with `40001`: run it again. See [Transactions](/pondra/guides/change-rows/#transactions).
+
+## Settings and prepared statements
+
+A session's own, as in Postgres: a Postgres connection's, the Python or JavaScript client's, or
+one script's (statements sent together, over HTTP or in the shell).
+
+| Statement | Syntax |
+|---|---|
+| Set | `SET name = value`, `SET name TO value`, `SET TIME ZONE '+08:00'` |
+| Show | `SHOW name`, `SHOW TIME ZONE`, `SHOW ALL` |
+| Set back | `RESET name`, `RESET ALL` |
+| Prepare | `PREPARE p [(type, …)] AS statement`, with `$1`, `$2`, … where the values go |
+| Run | `EXECUTE p [(value, …)]` |
+| Forget | `DEALLOCATE [PREPARE] p`, `DEALLOCATE ALL` |
+
+- A `datafusion.*` name is one of [DataFusion's options](https://datafusion.apache.org/user-guide/configs.html)
+  (`datafusion.execution.time_zone`, `datafusion.execution.batch_size`,
+  `datafusion.sql_parser.dialect`, …), checked as it is set. The session's queries are planned with
+  it; they run on its node, and aren't answered from the results other queries left.
+- Any other name without a dot is Postgres's (`search_path`, `extra_float_digits`,
+  `application_name`, …): kept, and shown by `SHOW`, since clients set many as they connect.
+- `datafusion.runtime.*` (memory, spill folder, caches) is the node's, set as it starts
+  ([`PONDRA_MEMORY_MB`](/pondra/reference/environment/)), and refused here.
+- `SET datafusion.sql_parser.dialect = 'spark'` (or `'databricks'`) gives the session Spark's
+  functions where Spark and DataFusion share a name ([Spark's functions](/pondra/reference/functions/#sparks-functions)),
+  and `'duckdb'` takes DuckDB's `STRUCT(a INT)` in `CREATE TABLE`.
+- A prepared statement can be a query or a write. `EXECUTE` puts its values where `$1`, `$2`, …
+  were, each cast to the type `PREPARE` gave, and runs it as if it were sent.
+
+```sql
+SET TIME ZONE '+08:00';
+SELECT TIMESTAMPTZ '2026-10-01T00:00:00Z' AS t;
+```
+
+```text
+t
+2026-10-01T08:00:00+08:00
+```
+
+```sql
+CREATE TABLE people (id INT, name VARCHAR, age INT);
+INSERT INTO people VALUES (1, 'ann', 31), (2, 'bob', 25);
+PREPARE older (INT) AS SELECT name FROM people WHERE age > $1 ORDER BY name;
+EXECUTE older (30);
+```
+
+```text
+name
+ann
+```
 
 ## Schemas and other lakes
 
@@ -476,7 +530,10 @@ Pondra refuses these by name, so a statement never runs and quietly does somethi
 | `INSERT … ON DUPLICATE KEY UPDATE` | refused: it is MySQL's; write `ON CONFLICT (…) DO UPDATE SET …` or `MERGE` |
 | `CREATE TABLE … WITH (…)` with an option name Pondra doesn't know | refused, with the name; see [table options](/pondra/reference/table-options/) |
 | `CREATE TEMPORARY EXTERNAL TABLE` | refused; use `CREATE TEMP VIEW v AS SELECT * FROM read_parquet('…')` |
-| `CREATE EXTERNAL TABLE … STORED AS ARROW` or `AVRO` | refused; Pondra reads Parquet, CSV and JSON (one value a line) |
+| `CREATE EXTERNAL TABLE … STORED AS AVRO` | refused; Pondra reads Parquet, CSV, JSON (one value a line) and Arrow |
+| `CREATE TABLE t` when `t` is there | refused (`42P07`); say `IF NOT EXISTS` or `OR REPLACE` |
+| `SET datafusion.runtime.…` | refused: the node's memory and caches are set as it starts |
+| `MERGE` with no `WHEN` clause, a column set or inserted twice, a `SET` of the source's column, or a source named as the target | refused, saying which |
 | `CREATE EXTERNAL TABLE` over compressed CSV or JSON (`'format.compression' 'gzip'`) | refused; not read yet |
 | `CREATE EXTERNAL TABLE … OPTIONS (…)` with an option Pondra doesn't read | refused, with the name |
 | `INSERT` into an external table whose `LOCATION` is one file | refused: a view of a folder takes `INSERT`s |

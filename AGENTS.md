@@ -1193,6 +1193,22 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    literal or a parameter); Postgres answers it before anything else in `pg::run`, its `Describe`
    and parameter types from it too; in a transaction `txn::point_read`; a one-key UPDATE of a keyed
    table is `txn::point_change`, in a transaction or not.
+188. **A session's settings are checked as they are set, and travel with its queries only**
+   (`settings.rs`, round 31): `SET datafusion.*` is validated against DataFusion's options and
+   applied in `query::session_at` (and `write::declared`); a session that has any runs its queries
+   on its own node and never from `Results`. Postgres's undotted names are kept for `SHOW`;
+   `datafusion.runtime.*` is refused. A script sent without a session gets one of its own
+   (`temp::of_script`, `#` in its id: no client can name it), ended with the script.
+189. **SQL's CREATE TABLE refuses a table that is there** (`write::there`, 42P07), unless `IF NOT
+   EXISTS` (left as it is: no rows added) or `OR REPLACE` (dropped first). Only `POST
+   /tables/{name}` may be sent again (it may add columns at the end).
+190. **Spark's functions never change DataFusion's answers by default** (`store::spark`): only
+   names DataFusion doesn't have are registered. Spark's versions of shared names come only with
+   `datafusion.sql_parser.dialect = 'spark' | 'databricks'` (`settings::apply`).
+191. **sqllogictest exceptions are named, never a bucket** (`tools/slt_check.py` `EXCEPTIONS`): a
+   failure left out of the pass rate matches a rule with its reason (plan text, a write explained,
+   what the runner makes in Rust, the node's memory, microseconds, an order no query asked for).
+   A new kind gets a name and a reason, or it is a failure.
 
 ## Tests: run these before and after any change
 

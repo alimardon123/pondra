@@ -34,8 +34,8 @@ impl Target {
 /// (DuckDB's). With the secret covering it (an admin's statement anyway: `auth::allows`), or, on
 /// the node's machine, from its owner. `nodes`: the cluster's live members, `me` among them.
 pub async fn copy_to(lake: &Lake, query: &str, to: &str, options: &BTreeMap<String, String>, nodes: &[String], me: &str) -> Result<serde_json::Value> {
-    if let Some(k) = options.keys().find(|k| !KNOWN.contains(&k.as_str())) {
-        bail!("COPY … TO has no option {k}: {}", KNOWN.join(", "));
+    if let Some(k) = options.iter().find(|(k, v)| !KNOWN.contains(&k.as_str()) && writer(k, v).is_none()) {
+        bail!("COPY … TO has no option {}: {} (or DataFusion's writers' own: 'format.data_page_row_count_limit', …)", k.0, KNOWN.join(", "));
     }
     let on = |k: &str| options.get(k).is_some_and(|v| !v.eq_ignore_ascii_case("false"));
     let lakes: Vec<String> = std::iter::once(lake.url.clone()).chain(lake.attached.read().unwrap().iter().map(|(_, o)| o.url.clone())).collect();
@@ -66,8 +66,11 @@ pub async fn copy_to(lake: &Lake, query: &str, to: &str, options: &BTreeMap<Stri
         let df = crate::query::session(lake, &query, "").await?.sql_with_options(&query, crate::query::read_only()).await?;
         return crate::write_outside::copy_table(lake, df, to, &format, on("append"), on("overwrite")).await; // (a table, not files: ADR-028)
     }
-    ensure!(["parquet", "csv", "json"].contains(&format.as_str()), "COPY … TO as {format}: parquet, csv, json, delta or iceberg");
+    ensure!(["parquet", "csv", "json", "arrow"].contains(&format.as_str()), "COPY … TO as {format}: parquet, csv, json, arrow, delta or iceberg");
     ensure!(format == "parquet" || !options.contains_key("compression") && !options.contains_key("row_group_size"), "COPY … TO as {format}: COMPRESSION and ROW_GROUP_SIZE are Parquet's (files are read as they are: not compressed)");
+    if let Some((k, _)) = options.iter().find(|(k, v)| !KNOWN.contains(&k.as_str()) && writer(k, v) != Some(format.as_str())) {
+        bail!("COPY … TO as {format}: {k} isn't {format}'s option");
+    }
     let partition: Vec<String> = options.get("partition_by").map(|p| p.split(',').map(|c| c.trim().to_string()).collect()).unwrap_or_default();
     let target = Target { to: to.into(), format, partition, options: options.clone() };
     let mut kept = HashSet::new(); // (what the folder held before, and holds on)
@@ -115,6 +118,23 @@ async fn delete(lake: &Lake, to: &str, files: Vec<object_store_df::path::Path>) 
     Ok(())
 }
 
+/// Which of DataFusion's writers takes this option (`data_page_row_count_limit`, `quote_style`,
+/// `content_defined_chunking.enabled`, …): "parquet", "csv" or "json".
+fn writer(k: &str, v: &str) -> Option<&'static str> {
+    use datafusion::config::{ConfigField, CsvOptions, JsonOptions, TableParquetOptions};
+    fn takes<T: ConfigField + Default>(k: &str, v: &str) -> bool { T::default().set(k, v).is_ok() }
+    [("parquet", takes::<TableParquetOptions>(k, v)), ("csv", takes::<CsvOptions>(k, v)), ("json", takes::<JsonOptions>(k, v))].into_iter().find(|w| w.1).map(|w| w.0)
+}
+
+/// DataFusion's own options for the format's writer, as given.
+fn own<T: datafusion::config::ConfigField>(mut o: T, format: &str, options: &BTreeMap<String, String>) -> Result<T> {
+    for (k, v) in options.iter().filter(|(k, _)| !KNOWN.contains(&k.as_str())) {
+        ensure!(writer(k, v) == Some(format), "COPY … TO as {format}: {k} isn't {format}'s option");
+        o.set(k, v)?;
+    }
+    Ok(o)
+}
+
 /// A query's rows written to the target, from this node: how many.
 pub async fn write(mut df: DataFrame, t: &Target) -> Result<u64> {
     let options = &t.options;
@@ -131,14 +151,16 @@ pub async fn write(mut df: DataFrame, t: &Target) -> Result<u64> {
     let write = DataFrameWriteOptions::new().with_single_file_output(!t.folder()).with_partition_by(t.partition.clone());
     let out = match t.format.as_str() {
         "parquet" => {
-            let mut parquet = datafusion::common::config::TableParquetOptions::default();
+            let mut parquet = own(datafusion::common::config::TableParquetOptions::default(), "parquet", options)?;
             if let Some(c) = options.get("compression") {
+                let level = regex::Regex::new(r"^(zstd|gzip|brotli)\(\d+\)$").expect("a regex");
                 parquet.global.compression = Some(match c.to_lowercase().as_str() {
                     "zstd" => "zstd(3)".into(),
                     "gzip" => "gzip(6)".into(),
                     "brotli" => "brotli(4)".into(),
                     c @ ("snappy" | "lz4" | "lz4_raw" | "uncompressed") => c.into(),
-                    c => bail!("COMPRESSION {c}: snappy, zstd, gzip, brotli, lz4 or uncompressed"),
+                    c if level.is_match(c) => c.into(), // (DataFusion's: a level)
+                    c => bail!("COMPRESSION {c}: snappy, zstd, gzip, brotli, lz4 or uncompressed (zstd(1…22), gzip(0…9), brotli(0…11) at a level)"),
                 });
             }
             if let Some(n) = options.get("row_group_size") {
@@ -146,15 +168,26 @@ pub async fn write(mut df: DataFrame, t: &Target) -> Result<u64> {
             }
             df.write_parquet(&t.to, write, Some(parquet)).await?
         }
-        "json" => df.write_json(&t.to, write, None).await?,
+        "json" => {
+            let json = own(datafusion::common::config::JsonOptions::default(), "json", options)?;
+            df.write_json(&t.to, write, Some(json)).await?
+        }
         "csv" => {
-            let mut csv = datafusion::common::config::CsvOptions::default().with_has_header(options.get("header").is_none_or(|h| !h.eq_ignore_ascii_case("false")));
+            let mut csv = own(datafusion::common::config::CsvOptions::default(), "csv", options)?.with_has_header(options.get("header").is_none_or(|h| !h.eq_ignore_ascii_case("false")));
             if let Some(d) = options.get("delimiter").or(options.get("delim")).or(options.get("sep")) {
                 csv = csv.with_delimiter(d.bytes().next().filter(|_| d.len() == 1).context("DELIMITER is one character")?);
             }
             df.write_csv(&t.to, write, Some(csv)).await?
         }
-        f => bail!("COPY … TO as {f}: parquet, csv or json"),
+        "arrow" => {
+            // (Arrow's file format, as DataFrame's write_json writes JSON)
+            use datafusion::datasource::file_format::{arrow::ArrowFormatFactory, format_as_file_type};
+            let single = std::collections::HashMap::from([("single_file_output".to_string(), (!t.folder()).to_string())]);
+            let (state, plan) = df.into_parts();
+            let plan = datafusion::logical_expr::LogicalPlanBuilder::copy_to(plan, t.to.clone(), format_as_file_type(std::sync::Arc::new(ArrowFormatFactory::new())), single, t.partition.clone())?.build()?;
+            DataFrame::new(state, plan).collect().await?
+        }
+        f => bail!("COPY … TO as {f}: parquet, csv, json or arrow"),
     };
     use datafusion::arrow::array::AsArray;
     Ok(out.iter().map(|b| b.column(0).as_primitive::<datafusion::arrow::datatypes::UInt64Type>().iter().flatten().sum::<u64>()).sum())

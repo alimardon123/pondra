@@ -664,7 +664,7 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
     use crate::ddl::{mentions, split, PUBLIC};
     let upto = upto.or_else(crate::txn::snapshot); // (in a transaction: as of its snapshot, its writes over it)
     use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider, MemorySchemaProvider};
-    let ctx = lake.session();
+    let ctx = crate::settings::apply(lake.session()).await?; // (the session's `SET datafusion.…`)
     crate::udf::register(lake, &ctx).await?; // the lake's own functions (`POST /functions/…`)
     crate::pyfn::register(lake, &ctx).await?; // …and its Python functions (`CREATE FUNCTION … LANGUAGE python`)
     let listing = ["information_schema", "show tables", "show columns"].iter().any(|w| sql.to_lowercase().contains(w)); // (every table)

@@ -83,13 +83,15 @@ its own commit.
 | `DO LANGUAGE python \| sql $$ … $$` | the block's rows, or the tag `DO`. What Python prints comes as `NOTICE` messages. It needs an admin, and Python needs a node started with `--python` |
 | `BEGIN`, `START TRANSACTION`, `COMMIT`, `END`, `ROLLBACK`, `ABORT` | a transaction: its statements one commit |
 | `SAVEPOINT`, `RELEASE`, `ROLLBACK TO` | refused (`0A000`): a transaction commits or rolls back whole |
-| `SET`, `RESET`, `DISCARD`, `DEALLOCATE`, `CLOSE` | accepted, and ignored |
-| `SHOW server_version`, `standard_conforming_strings`, `transaction_isolation`, `client_encoding` | a fixed answer |
+| `SET`, `RESET`, `SHOW` | the connection's [settings](/pondra/reference/sql/#settings-and-prepared-statements): DataFusion's `datafusion.*` options checked and used by its queries, Postgres's names kept and shown |
+| `PREPARE`, `EXECUTE`, `DEALLOCATE` | the connection's prepared statements (a `DEALLOCATE` of a name the protocol prepared: accepted) |
+| `DISCARD`, `CLOSE` | accepted, and ignored |
+| `SHOW server_version`, `standard_conforming_strings`, `transaction_isolation`, `client_encoding` | a fixed answer, unless the connection set it |
 | `SHOW TABLES` | the lake's tables and views, and the `information_schema` views |
 | `DESCRIBE t` | its columns and types, with Arrow's type names |
 
-A connection is a session: `CREATE TEMP TABLE` and temporary views are the connection's own, and
-end when it closes. So do its Python variables: `DO LANGUAGE python` blocks on one connection share
+A connection is a session: `CREATE TEMP TABLE`, temporary views, settings and prepared statements
+are the connection's own, and end when it closes. So do its Python variables: `DO LANGUAGE python` blocks on one connection share
 them ([Functions and procedures](/pondra/guides/functions-and-procedures/#cells-that-share-variables)). A request with several statements, separated by `;`, runs them in order.
 
 ```bash

@@ -70,7 +70,7 @@ pub fn spec(name: &str) -> Option<Spec> { serde_json::from_slice(&B64.decode(nam
 /// Might `sql` name files? (A cheap test, before anything is parsed.)
 pub fn mentions(sql: &str) -> bool {
     static FILES: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r"(?i)'(s3|r2|gs|gcs|az|azure|abfss?|https?)://|\b(from|join|using)\s+'|\b(read_parquet|parquet_scan|read_csv|read_csv_auto|read_json|read_json_auto|read_ndjson|read_delta|read_iceberg|delta_scan|iceberg_scan)\s*\(").expect("a regex")
+        regex::Regex::new(r"(?i)'(s3|r2|gs|gcs|az|azure|abfss?|https?)://|\b(from|join|using)\s+'|\b(read_parquet|parquet_scan|read_csv|read_csv_auto|read_json|read_json_auto|read_ndjson|read_arrow|read_delta|read_iceberg|delta_scan|iceberg_scan)\s*\(").expect("a regex")
     });
     FILES.is_match(sql)
 }
@@ -93,6 +93,7 @@ pub fn table(t: &TableFactor) -> Result<Option<String>> {
         "read_parquet" | "parquet_scan" => "parquet",
         "read_csv" | "read_csv_auto" => "csv",
         "read_json" | "read_json_auto" | "read_ndjson" => "json",
+        "read_arrow" => "arrow",
         "read_delta" | "delta_scan" => "delta",
         "read_iceberg" | "iceberg_scan" => "iceberg",
         _ => return Ok(None),
@@ -139,7 +140,8 @@ pub fn external(c: &datafusion::sql::parser::CreateExternalTable) -> Result<crat
         "parquet" => ("parquet", "read_parquet"),
         "csv" => ("csv", "read_csv"),
         "json" | "ndjson" => ("json", "read_json"),
-        f => bail!("files stored as {f}: Pondra reads Parquet, CSV and JSON (a value a line)"),
+        "arrow" => ("arrow", "read_arrow"),
+        f => bail!("files stored as {f}: Pondra reads Parquet, CSV, JSON (a value a line) and Arrow"),
     };
     let text = |s: &str| format!("'{}'", s.replace('\'', "''"));
     let mut args: Vec<String> = vec![];
@@ -158,9 +160,10 @@ pub fn external(c: &datafusion::sql::parser::CreateExternalTable) -> Result<crat
             ("csv", "delimiter") => args.push(format!("delim => {}", text(&v))),
             ("csv", "quote" | "escape" | "comment") => args.push(format!("{key} => {}", text(&v))),
             ("csv", "terminator") => args.push(format!("new_line => {}", text(&v))),
-            ("csv", "double_quote") | ("json", "newline_delimited") if yes => {} // (as Pondra reads them)
+            ("csv", "double_quote") => {} // (how quotes inside quotes are written: read either way)
+            ("json", "newline_delimited") if yes => {} // (as Pondra reads them)
             ("csv" | "json", "compression" | "file_compression_type") if !["", "uncompressed"].contains(&v.to_lowercase().as_str()) => {
-                bail!("{v} files aren't read yet: Parquet, CSV and JSON as they are")
+                bail!("{v} files aren't read yet: Parquet, CSV, JSON and Arrow as they are")
             }
             (_, k) if WRITING.contains(&k) || (format == "parquet" && (PARQUET_WRITING.contains(&k) || k.starts_with("content_defined_chunking") || PARQUET_TUNING.contains(&k))) => {} // (how files are written, or read faster: not what is read)
             _ => bail!("CREATE EXTERNAL TABLE … OPTIONS ('{k}' …): Pondra doesn't read files with it{}", if format == "csv" { " (CSV takes format.has_header, format.delimiter, format.quote, format.escape, format.comment and format.terminator)" } else { "" }),
@@ -307,8 +310,9 @@ pub(crate) fn format_of(url: &str) -> Result<(String, BTreeMap<String, String>)>
         "csv" => ("csv".into(), BTreeMap::new()),
         "tsv" => ("csv".into(), tsv),
         "json" | "ndjson" | "jsonl" => ("json".into(), BTreeMap::new()),
-        "gz" | "zst" | "bz2" | "xz" => bail!("{url}: compressed files aren't read yet: Parquet, CSV and JSON as they are"),
-        _ => bail!("{url}: which format? name files by their extension (.parquet, .csv, .json), or read them with read_parquet(…), read_csv(…) or read_json(…)"),
+        "arrow" | "feather" | "ipc" => ("arrow".into(), BTreeMap::new()), // (Arrow's file format: IPC with a footer)
+        "gz" | "zst" | "bz2" | "xz" => bail!("{url}: compressed files aren't read yet: Parquet, CSV, JSON and Arrow as they are"),
+        _ => bail!("{url}: which format? name files by their extension (.parquet, .csv, .json, .arrow), or read them with read_parquet(…), read_csv(…), read_json(…) or read_arrow(…)"),
     })
 }
 
@@ -520,7 +524,7 @@ async fn resolve(lake: &Lake, spec: &Spec) -> Result<TableMeta> {
     // they are. Parquet's files say their own (for their statistics), read by name as declared.
     let schema = match (&declared, spec.format.as_str()) {
         (Some(d), "csv" | "json") => Arc::new(datafusion::arrow::datatypes::Schema::new(d.clone())),
-        _ => format.infer_schema(&state, &store, &first).await.with_context(|| format!("reading {}", spec.urls.join(", ")))?,
+        _ => inferred(format.as_ref(), &state, &store, &first).await.with_context(|| format!("reading {}", spec.urls.join(", ")))?,
     };
     let mut columns: Vec<(String, String)> = named(declared.as_deref().unwrap_or(&schema.fields()[..]));
     // (a column read as another type than the file's: its ranges are the file's type's, so none is kept)
@@ -649,12 +653,27 @@ fn file(path: String, bytes: u64, s: Option<&datafusion::common::Statistics>, sc
     DataFile { path, bytes, rows, stats, nulls, ..Default::default() }
 }
 
+/// The files' columns; files whose notes differ (pandas' metadata, each file's own) merged without them.
+async fn inferred(format: &dyn FileFormat, state: &dyn datafusion::catalog::Session, store: &Arc<dyn object_store_df::ObjectStore>, files: &[object_store_df::ObjectMeta]) -> Result<datafusion::arrow::datatypes::SchemaRef> {
+    match format.infer_schema(state, store, files).await {
+        Err(e) if e.to_string().contains("conflicting metadata") => {
+            let mut each = vec![];
+            for f in files {
+                each.push(format.infer_schema(state, store, std::slice::from_ref(f)).await?.as_ref().clone().with_metadata(Default::default()));
+            }
+            Ok(Arc::new(datafusion::arrow::datatypes::Schema::try_merge(each)?))
+        }
+        r => Ok(r?),
+    }
+}
+
 fn file_format(spec: &Spec) -> Result<Arc<dyn FileFormat>> {
     let o = |k: &str| spec.options.get(k).map(String::as_str);
     let byte = |k: &str, v: &str| -> Result<u8> { v.bytes().next().filter(|_| v.len() == 1).with_context(|| format!("{k} is one character, not {v:?}")) };
     Ok(match spec.format.as_str() {
         "parquet" => Arc::new(ParquetFormat::default()),
         "json" => Arc::new(JsonFormat::default()),
+        "arrow" => Arc::new(datafusion::datasource::file_format::arrow::ArrowFormat),
         "csv" => {
             let mut f = CsvFormat::default().with_has_header(o("header").is_none_or(|h| h != "false"));
             if let Some(d) = o("delim").or(o("sep")).or(o("delimiter")) {
@@ -676,7 +695,7 @@ fn file_format(spec: &Spec) -> Result<Arc<dyn FileFormat>> {
             }
             Arc::new(f)
         }
-        f => bail!("files as {f}: parquet, csv or json"),
+        f => bail!("files as {f}: parquet, csv, json or arrow"),
     })
 }
 
@@ -705,7 +724,18 @@ pub async fn read(lake: &Lake, ctx: &datafusion::prelude::SessionContext, files:
     for group in by_folder.into_values() {
         let urls = group.iter().map(|f| ListingTableUrl::parse(&f.path)).collect::<datafusion::error::Result<Vec<_>>>()?;
         let options = ListingOptions::new(file_format(spec)?).with_file_extension("");
-        let table = ListingTable::try_new(ListingTableConfig::new_with_multi_paths(urls).with_listing_options(options).with_schema(in_files.clone()))?;
+        let config = ListingTableConfig::new_with_multi_paths(urls).with_listing_options(options);
+        let config = match spec.format.as_str() {
+            "arrow" => {
+                // (as each file holds its columns: Arrow's reader doesn't cast them, the select below
+                // does; the files' notes left out, as the table's columns have none)
+                let mut c = config.infer_schema(&ctx.state()).await?;
+                c.file_schema = c.file_schema.map(|s| Arc::new(s.as_ref().clone().with_metadata(Default::default())));
+                c
+            }
+            _ => config.with_schema(in_files.clone()),
+        };
+        let table = ListingTable::try_new(config)?;
         let mut df = ctx.read_table(Arc::new(table))?;
         for (k, v) in folders(group[0]) {
             df = df.with_column(&k, lit(datafusion::common::ScalarValue::Utf8(hive_value(&v))))?; // (a folder's value, for each of its rows)
@@ -1129,7 +1159,7 @@ fn copy_statement(p: &mut datafusion::sql::sqlparser::parser::Parser) -> Option<
     // DataFusion's words for the same: STORED AS csv, PARTITIONED BY (…), OPTIONS ('format.has_header' 'false', …).
     loop {
         if p.parse_keywords(&[Keyword::STORED, Keyword::AS]) {
-            let Ok(f) = p.parse_identifier() else { return invalid("STORED AS parquet, csv or json".into()) };
+            let Ok(f) = p.parse_identifier() else { return invalid("STORED AS parquet, csv, json or arrow".into()) };
             options.insert("format".to_string(), f.value.to_lowercase());
         } else if p.parse_keywords(&[Keyword::PARTITIONED, Keyword::BY]) {
             match p.expect_token(&Token::LParen).and_then(|_| p.parse_comma_separated(|p| p.parse_identifier())).and_then(|l| p.expect_token(&Token::RParen).map(|_| l)) {
