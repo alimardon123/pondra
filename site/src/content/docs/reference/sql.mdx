@@ -253,6 +253,8 @@ DROP SCHEMA sales CASCADE;
 
 A materialized view is filled from the rows already in its table, then follows every new row. Its
 options make windows, sessions and stream joins: see [table options](/pondra/reference/table-options/).
+`WITH (history = 'id', sequence_by = 'at' [, delete_when = '…'])` keeps every version of each key
+with its `__start_at` and `__end_at` ([history per key](/pondra/guides/pipelines/#history-per-key-scd-type-2)).
 A temporary table lives in the memory of the node a session talks to, and ends with the session (a
 Postgres connection, or a Python or JavaScript client until `close()`).
 

@@ -22,7 +22,10 @@ Start more copies on the same bucket to scale out. The only state is object stor
    silver → gold, no lag between stages). A view of a GROUP BY view must be a rollup (its keys,
    `sum` of sums and counts, `min` of mins, `max` of maxes), else it is refused saying why; changes
    (`UPDATE`, `DELETE`) flow down the chain in one commit; a pipeline is dropped from its end.
-   `pondra.pipelines`, and the console's details panel draws each table's pipeline.
+   `pondra.pipelines`, and the console's details panel draws each table's pipeline. **History per
+   key** (SCD type 2): `WITH (history = 'id', sequence_by = 'at', delete_when = '…')` keeps every
+   version, each with its `__start_at` and `__end_at` worked out when read, late versions in their
+   place, a delete ending its key.
 2. **Expectations**: `CONSTRAINT c CHECK (…) [ON VIOLATION DROP ROW | FAIL]` and `EXPECT (…)` on a
    materialized view, counted exactly in `pondra$expectations` with the rows (`pondra.expectations`).
    A row a `FAIL` one refuses fails its own INSERT only: the flush it was packed in is checked

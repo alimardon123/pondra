@@ -30,18 +30,20 @@
   "big == its query over orders (:8091), after UPDATE and DELETE": true,
   "strict == its query over orders (:8090), after UPDATE and DELETE": true,
   "strict == its query over orders (:8091), after UPDATE and DELETE": true,
-  "a view of a view made again after its pipeline is dropped from the end": true
+  "a view of a view made again after its pipeline is dropped from the end": true,
+  "a history view (SCD type 2): every version with __start_at and __end_at, a late one in its place, a delete ending its key, on every node": true,
+  "refused: a materialized view of a history view (its ends are worked out as it is read)": true
  },
  "ok": true,
  "info": {
-  "sent": 16050,
+  "sent": 15950,
   "refused": "500: b'new row for relation \"strict\" violates check constraint \"small\": CHECK (amount < 100000)'",
   "said": {
    "a view of a GROUP BY view's partial rows, without GROUP BY": "500: b'gold is a GROUP BY view: its table keeps partial rows, a few per key, combined as they are read. A view of it must combine them the same way: GROUP BY so",
    "count(*) of a GROUP BY view's rows": "500: b'gold is a GROUP BY view: its table keeps partial rows, a few per key, combined as they are read. A view of it must combine them the same way: GROUP BY so",
    "a WHERE on a GROUP BY view's totals": "500: b'gold is a GROUP BY view: its table keeps partial rows, a few per key, combined as they are read. A view of it must combine them the same way: GROUP BY so",
    "expectations on a GROUP BY view": "500: b\"bad4 is a GROUP BY view: its table keeps partial rows, so expectations can't check its totals. Put them on the rows before it (a view of orders without G",
-   "a FAIL expectation rows already break": "500: b'695 of the rows orders has now would break expectation c of bad5, CHECK (amount > 0): fix them first, or make it ON VIOLATION DROP ROW'",
+   "a FAIL expectation rows already break": "500: b'684 of the rows orders has now would break expectation c of bad5, CHECK (amount > 0): fix them first, or make it ON VIOLATION DROP ROW'",
    "dropping a view others follow": "500: b'silver is followed by materialized view big, materialized view gold: drop them first'"
   },
   "expectations": {
@@ -50,14 +52,14 @@
     "expectation": "has_buyer",
     "condition": "buyer IS NOT NULL",
     "on_violation": "keep",
-    "failed_rows": 724
+    "failed_rows": 717
    },
    "positive": {
     "view": "silver",
     "expectation": "positive",
     "condition": "amount > 0",
     "on_violation": "drop",
-    "failed_rows": 761
+    "failed_rows": 755
    },
    "small": {
     "view": "strict",

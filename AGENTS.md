@@ -1171,7 +1171,9 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    taking what the views before it derived in the same flush; the sequencer owes a view's rows to
    the views that follow it (any part with rows, not only a producer's). A view of a GROUP BY view
    is a rollup (`views::merges` with `up`) or refused; a pipeline is dropped from its end.
-   `can_follow` and `row_views` follow the chain. `tools/harness.py pipelines`.
+   `can_follow` and `row_views` follow the chain. A history view (SCD type 2) is an append view
+   whose table has `TableMeta::history`: every read of it goes through `views::history_view`
+   (`__start_at`, `__end_at`), so nothing may follow it inline. `tools/harness.py pipelines`.
 184. **Expectations count with the rows, and a refusal is the writer's alone** (ADR-036 §2): a
    view's new rows go through `views::expected` (taken-back rows through `let_in`); counts are a
    part of `pondra$expectations` in the same flush; a `Violation` from packing a group sends

@@ -5601,6 +5601,20 @@ def pipelines():
     q("DELETE FROM orders WHERE id % 13 = 0")
     checks.update({k + ", after UPDATE and DELETE": v for k, v in same().items()})
     checks["a view of a view made again after its pipeline is dropped from the end"] = all(err(f"DROP MATERIALIZED VIEW {v}") is None for v in ("platinum", "big", "gold", "silver"))
+    # History per key (SCD type 2, ADR-036 §8): versions in any order, a delete ending a key.
+    q("CREATE TABLE customer_changes (id BIGINT, name VARCHAR, city VARCHAR, op VARCHAR, at BIGINT)")
+    q("INSERT INTO customer_changes VALUES (1, 'ann', 'paris', 'U', 1), (1, 'ann', 'rome', 'U', 3), (2, 'bob', 'nyc', 'U', 1)")
+    q("CREATE MATERIALIZED VIEW customers_history WITH (history = 'id', sequence_by = 'at', delete_when = 'op = ''D''') "
+      "AS SELECT id, name, city, op, at FROM customer_changes", ports[1])
+    q("INSERT INTO customer_changes VALUES (3, 'cy', 'lima', 'U', 2)")
+    q("INSERT INTO customer_changes VALUES (1, 'ann', 'oslo', 'U', 2)", ports[1])  # (late: between paris and rome)
+    q("INSERT INTO customer_changes VALUES (2, 'bob', NULL, 'D', 5)")
+    want_h = [{"id": 1, "city": "paris", "__start_at": 1, "__end_at": 2}, {"id": 1, "city": "oslo", "__start_at": 2, "__end_at": 3}, {"id": 1, "city": "rome", "__start_at": 3, "__end_at": None},
+              {"id": 2, "city": "nyc", "__start_at": 1, "__end_at": 5}, {"id": 3, "city": "lima", "__start_at": 2, "__end_at": None}]
+    hist = lambda port: [{k: r.get(k) for k in ("id", "city", "__start_at", "__end_at")} for r in q("SELECT id, city, __start_at, __end_at FROM customers_history ORDER BY id, __start_at", port)]  # (JSON leaves out NULLs)
+    checks["a history view (SCD type 2): every version with __start_at and __end_at, a late one in its place, a delete ending its key, on every node"] = \
+        all(until(lambda: hist(p), want_h, secs=20) == want_h for p in ports) and q("SELECT id, city FROM customers_history WHERE __end_at IS NULL ORDER BY id") == [{"id": 1, "city": "rome"}, {"id": 3, "city": "lima"}]
+    checks["refused: a materialized view of a history view (its ends are worked out as it is read)"] = "history view" in (err("CREATE MATERIALIZED VIEW h2 AS SELECT id FROM customers_history") or "")
     info = {"sent": sent_all, "refused": (refused or "")[:200], "said": {k: (v or "")[:160] for k, v in say.items()}, "expectations": ex}
     a.kill(); b.kill()
     ok = all(checks.values())

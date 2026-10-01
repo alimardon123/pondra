@@ -131,6 +131,10 @@ pub struct TableMeta {
     /// published for them; Pondra's own options are fields above.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub properties: BTreeMap<String, String>,
+    /// A history view's table (SCD type 2, ADR-036 §8): every version of each key as it came;
+    /// reads give each its `__start_at` and `__end_at` (`views::history_view`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history: Option<crate::views::History>,
 }
 
 impl TableMeta {

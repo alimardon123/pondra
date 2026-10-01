@@ -1,6 +1,6 @@
 # ADR-036: Pipelines, and a database's behaviour from every door
 
-**Date:** 2026-10-01 · **Status:** built (round 30), but identity columns (§3), UNIQUE (decision 10) and SCD type 2 (§8) · **Builds on:** ADR-017 (streams on their own time), ADR-020 (change any row), ADR-022 (views filled from existing rows), ADR-035 (trust anywhere)
+**Date:** 2026-10-01 · **Status:** built (round 30), but identity columns (§3) and UNIQUE (decision 10) · **Builds on:** ADR-017 (streams on their own time), ADR-020 (change any row), ADR-022 (views filled from existing rows), ADR-035 (trust anywhere)
 
 ## Context
 
@@ -153,13 +153,17 @@ in one test (`harness.py doors`). Every cell is right, or refused by name: a tra
 SQL and MCP. Its first run found three gaps, fixed: Flight SQL ran no `CALL` and its planning
 errors lost their codes; MCP's errors had no code.
 
-### 8. History per key, SCD type 2 (proposed)
+### 8. History per key, SCD type 2 (built)
 
-`CREATE MATERIALIZED VIEW dim WITH (history = 'id', sequence_by = 'updated_at') AS SELECT … FROM
-changes`: every version of each key kept as it arrives (an append view: concurrent writers need no
-coordination), its `__start_at` the row's `sequence_by`, and `__end_at` the next version's, worked
-out when read (a window over the key), so rows that arrive out of order still make the right
-history. Databricks' `APPLY CHANGES … STORED AS SCD TYPE 2`, without its ordering constraints.
+`CREATE MATERIALIZED VIEW dim WITH (history = 'id', sequence_by = 'updated_at' [, delete_when =
+'op = ''D''']) AS SELECT … FROM changes`: every version of each key kept as it arrives (an append
+view: writers on any node need no coordination), its `__start_at` the row's `sequence_by`, and
+`__end_at` the next version's, worked out when read (a window over the key: `views::history_view`,
+wrapped around the table in `query::session_at` from `TableMeta::history`), so rows that arrive out
+of order still make the right history. A version `delete_when` holds for (`__delete`) ends its
+key's history and isn't shown. Databricks' `APPLY CHANGES … STORED AS SCD TYPE 2`, without its
+ordering constraints. A materialized view can't follow one (its ends exist only as it is read); a
+stored view can.
 
 ## Open: decision 10
 

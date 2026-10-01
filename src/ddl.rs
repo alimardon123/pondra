@@ -290,8 +290,7 @@ pub async fn apply(lake: &Lake, d: Ddl) -> Result<Value> {
                 }
             }
             ensure!(outside.is_empty(), "a materialized view follows the rows its tables take in, and files outside the lake take none: read them into a table (CREATE TABLE … AS, INSERT … SELECT) and follow that, or make a stored view (CREATE VIEW)");
-            let (emit, sessions, join, expect) = crate::views::options(&options)?;
-            crate::views::create(lake, &name, &sql, emit, sessions, join, expect).await?;
+            crate::views::create(lake, &name, &sql, crate::views::options(&options)?).await?;
             crate::views::forget(lake); // (the sequencer holds flushes to it from its next commit)
             Ok(j!({"view": name, "materialized": true}))
         }

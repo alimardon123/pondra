@@ -7,8 +7,8 @@ rounds" is what I recommend, the decisions in "What only you can decide" are you
 **Progress (2026-10-01):** rounds 17 to 29 are done (ADR-018 to ADR-035; round 29, the owner's
 console lists, then users, grants, secrets, TLS, an audit log, quotas, files with versions and C5,
 is 0.28.0). Round 30 is under way (ADR-036): pipelines with expectations, transactions, error
-codes, CHECK constraints, the point path from every door and the doors matrix are built; identity
-columns, UNIQUE (decision 10) and SCD type 2 are left.
+codes, CHECK constraints, the point path from every door, the doors matrix and history per key
+(SCD type 2) are built; identity columns and UNIQUE (decision 10) are left.
 
 - **Round 17** made Pondra install anywhere: a glibc 2.17 Linux binary, pip and npm packages
   (built, not published), a SQL shell, and both flaky tests fixed.

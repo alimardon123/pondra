@@ -79,6 +79,32 @@ impl OnViolation {
     }
 }
 
+/// History kept per key (SCD type 2, ADR-036 §8): `WITH (history = 'id', sequence_by = 'ts'
+/// [, delete_when = 'op = ''D'''])`. The view keeps every version of each key as it arrives (an
+/// append view: writers on any node need no coordination); a read gives each version its
+/// `__start_at` (its `sequence_by`) and `__end_at` (the next version's, NULL for the current one),
+/// worked out then, so versions that arrive out of order still make the right history. A version
+/// `delete_when` holds for ends its key's history and isn't shown (`__delete`).
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct History {
+    pub key: Vec<String>,
+    pub sequence_by: String,
+    #[serde(default)]
+    pub deletes: bool,
+}
+
+/// A history view's table as it is read: its versions, each with `__start_at` and `__end_at`.
+pub async fn history_view(ctx: &datafusion::prelude::SessionContext, base: std::sync::Arc<dyn datafusion::catalog::TableProvider>, h: &History, sys: bool) -> Result<std::sync::Arc<dyn datafusion::catalog::TableProvider>> {
+    let aux = datafusion::prelude::SessionContext::new_with_state(ctx.state());
+    aux.register_table("__versions", base.clone())?;
+    let keep: Vec<String> = base.schema().fields().iter().map(|f| f.name().clone()).filter(|n| n != "__delete" && (sys || !crate::sys::NAMES.contains(&n.as_str()))).map(|n| quoted(&n)).collect();
+    let key = h.key.iter().map(|k| quoted(k)).collect::<Vec<_>>().join(", ");
+    let seq = quoted(&h.sequence_by);
+    let shown = if h.deletes { "WHERE NOT coalesce(\"__delete\", false)" } else { "" };
+    let sql = format!("SELECT {}, \"__start_at\", \"__end_at\" FROM (SELECT *, {seq} AS \"__start_at\", lead({seq}) OVER (PARTITION BY {key} ORDER BY {seq}) AS \"__end_at\" FROM \"__versions\") AS __h {shown}", keep.join(", "));
+    Ok(aux.sql(&sql).await?.into_view())
+}
+
 /// Where expectations' failed rows are counted: a merge table, a row per view, expectation and
 /// flush that had any (its key), combined as it is read.
 pub const EXPECTED: &str = "pondra$expectations";
@@ -142,8 +168,19 @@ impl View {
 /// `CREATE MATERIALIZED VIEW … WITH (window = 'w', size_secs = 60, lateness_secs = 10)` (and
 /// `slide_secs = 10`: sliding), `WITH (session = 'ts', gap_secs = 1800, lateness_secs = 5)`, or
 /// `WITH (join = 'streams', time = 'ts', within_secs = 600)`: what `POST /views/{v}?…` takes.
-pub fn options(kv: &std::collections::BTreeMap<String, String>) -> Result<(Option<Emit>, Option<Sessions>, Option<Join>, Vec<Expect>)> {
-    const KNOWN: [&str; 10] = ["window", "size_secs", "slide_secs", "lateness_secs", "session", "gap_secs", "join", "time", "within_secs", "expect"];
+/// A materialized view's options (`options`).
+#[derive(Default)]
+pub struct Options {
+    pub emit: Option<Emit>,
+    pub sessions: Option<Sessions>,
+    pub join: Option<Join>,
+    pub expect: Vec<Expect>,
+    pub history: Option<History>,
+    pub delete_when: Option<String>,
+}
+
+pub fn options(kv: &std::collections::BTreeMap<String, String>) -> Result<Options> {
+    const KNOWN: [&str; 13] = ["window", "size_secs", "slide_secs", "lateness_secs", "session", "gap_secs", "join", "time", "within_secs", "expect", "history", "sequence_by", "delete_when"];
     if let Some(k) = kv.keys().find(|k| !KNOWN.contains(&k.as_str())) {
         bail!("{k}: a materialized view's options are {}", KNOWN.join(", "));
     }
@@ -166,7 +203,14 @@ pub fn options(kv: &std::collections::BTreeMap<String, String>) -> Result<(Optio
         Some(e) => serde_json::from_str(e).context("expect: a JSON list of {\"name\", \"check\", \"on\": \"keep\" | \"drop\" | \"fail\"}")?,
         None => vec![],
     };
-    Ok((emit, sessions, join, expect))
+    let list = |v: &str| v.split(',').map(|c| c.trim().to_string()).filter(|c| !c.is_empty()).collect::<Vec<_>>();
+    let history = kv.get("history").map(|k| Ok::<_, anyhow::Error>(History {
+        key: list(k),
+        sequence_by: kv.get("sequence_by").cloned().context("history = '…' keeps versions in an order: sequence_by = 'a column' (a time, or a number that grows)")?,
+        deletes: kv.contains_key("delete_when"),
+    })).transpose()?;
+    ensure!(history.is_some() || (!kv.contains_key("sequence_by") && !kv.contains_key("delete_when")), "sequence_by and delete_when go with history = 'key columns'");
+    Ok(Options { emit, sessions, join, expect, history, delete_when: kv.get("delete_when").cloned() })
 }
 /// `CREATE MATERIALIZED VIEW v (CONSTRAINT c CHECK (…) [ON VIOLATION DROP ROW | FAIL], …) AS …`:
 /// the statement without its expectations, and them (`EXPECT (…)` too, Databricks' word; a column
@@ -272,8 +316,17 @@ fn open_key(name: &str) -> String { format!("w/{name}") }
 
 /// Register view `name` (leader only): its table gets the query's output columns; a GROUP BY
 /// query makes it a merge table keyed by the group columns.
-#[allow(clippy::too_many_arguments)]
-pub async fn create(lake: &Lake, name: &str, sql: &str, mut emit: Option<Emit>, sessions: Option<Sessions>, join: Option<Join>, expect: Vec<Expect>) -> Result<()> {
+pub async fn create(lake: &Lake, name: &str, sql: &str, o: Options) -> Result<()> {
+    let Options { mut emit, sessions, join, expect, history, delete_when } = o;
+    // (a history view's deletes: a column of its rows saying which versions end their key)
+    let wrapped;
+    let sql = match &delete_when {
+        Some(w) => {
+            wrapped = format!("SELECT *, coalesce(({w}), false) AS \"__delete\" FROM ({sql}) AS __history");
+            wrapped.as_str()
+        }
+        None => sql,
+    };
     if let Some(v) = lake.cat.get::<View>(&view_key(name)).await? {
         let windows = |e: &Option<Emit>| e.as_ref().map(|e| (e.window.clone(), e.size_secs, e.lateness_secs, e.slide_secs));
         let gaps = |s: &Option<Sessions>| s.as_ref().map(|s| (s.time.clone(), s.gap_secs, s.lateness_secs));
@@ -291,6 +344,8 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, mut emit: Option<Emit>, 
     // combined as they are read: what follows it must combine them too (`merges`: a rollup).
     let upstream = lake.cat.get::<View>(&view_key(&source)).await?;
     let partial = upstream.is_some() && !src.merge.is_empty();
+    ensure!(src.history.is_none(), "{source} is a history view, whose __start_at and __end_at are worked out as it is read: make {name} a stored view of it (CREATE VIEW {name} AS SELECT … FROM {source})");
+    ensure!(history.is_none() || (sessions.is_none() && join.is_none() && emit.is_none()), "a history view keeps each version as it comes: not with windows, sessions or a stream join");
     ensure!(expect.is_empty() || (sessions.is_none() && join.is_none() && emit.is_none()), "expectations check a view's rows as it writes them: a view that emits windows or sessions, or joins streams, writes them later. Put them on a view before it");
     if let Some(s) = sessions {
         ensure!(emit.is_none() && join.is_none(), "a view emits windows or sessions, or joins streams: one of them");
@@ -312,7 +367,15 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, mut emit: Option<Emit>, 
     // (row by row over a table, or over a view that is: then a row keeps its first source row's id)
     let ids = merge.is_empty() && alone(&plan, false) && upstream.as_ref().is_none_or(|u| u.ids);
     ensure!(expect.is_empty() || merge.is_empty(), "{name} is a GROUP BY view: its table keeps partial rows, so expectations can't check its totals. Put them on the rows before it (a view of {source} without GROUP BY, which {name} then follows)");
-    let meta = TableMeta { columns, key, merge, publish: default_publish(), ids: true, tiered: lake.visible(), ..Default::default() };
+    if let Some(h) = &history {
+        ensure!(merge.is_empty(), "a history view keeps every version of each key as it comes: no GROUP BY");
+        let has = |c: &str| columns.iter().any(|(n, _)| n == c);
+        if let Some(c) = h.key.iter().chain([&h.sequence_by]).find(|c| !has(c)) {
+            bail!("{c}: history = '{}' and sequence_by = '{}' name columns the view's query gives", h.key.join(", "), h.sequence_by);
+        }
+        ensure!(!has("__start_at") && !has("__end_at"), "__start_at and __end_at are a history view's own columns: name yours something else");
+    }
+    let meta = TableMeta { columns, key, merge, publish: default_publish(), ids: true, tiered: lake.visible(), history, ..Default::default() };
     if !expect.is_empty() {
         expectations(lake, name, &source, &planned, &meta, &expect).await?;
     }
@@ -1160,14 +1223,19 @@ pub async fn system(lake: &Lake, counts: Vec<RecordBatch>) -> Result<Vec<(&'stat
     if let Some(a) = crate::auth::limited() {
         views.retain(|(name, _)| a.may("select", name));
     }
-    let mut kinds = vec![];
+    let (mut kinds, mut histories) = (vec![], std::collections::HashSet::new());
     for (name, v) in &views {
-        let merged = lake.cat.get::<TableMeta>(&table_key(name)).await?.is_some_and(|m| !m.merge.is_empty());
+        let meta = lake.cat.get::<TableMeta>(&table_key(name)).await?;
+        let merged = meta.as_ref().is_some_and(|m| !m.merge.is_empty());
+        if meta.as_ref().is_some_and(|m| m.history.is_some()) {
+            histories.insert(name.clone());
+        }
         kinds.push(match () {
             _ if v.emit.is_some() => "window",
             _ if v.sessions.is_some() => "sessions",
             _ if v.join.is_some() => "stream join",
             _ if merged => "aggregate",
+            _ if histories.contains(name) => "history",
             _ => "rows",
         });
     }

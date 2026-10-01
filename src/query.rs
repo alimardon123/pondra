@@ -688,6 +688,9 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
             if touched {
                 t = crate::txn::overlaid(&ctx, name, &meta.logical().key, t, crate::sys::mentioned(&text))?;
             }
+            if let Some(h) = &meta.history {
+                t = crate::views::history_view(&ctx, t, h, crate::sys::mentioned(&text)).await?; // (each version's __start_at and __end_at, as it is read)
+            }
             if let Some(t) = guarded(name, t, listing) {
                 ctx.register_table(table_ref(name), t)?;
             }

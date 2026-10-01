@@ -1,6 +1,6 @@
 ---
 title: Pipelines
-description: Materialized views that follow each other in one commit (bronze, silver, gold), expectations that keep, drop or refuse rows, and the pipeline's graph.
+description: Materialized views that follow each other in one commit (bronze, silver, gold), expectations that keep, drop or refuse rows, history per key (SCD type 2), and the pipeline's graph.
 sidebar:
   order: 6.5
 ---
@@ -122,6 +122,35 @@ eu      2       60
 us      1       12
 ```
 
+## History per key (SCD type 2)
+
+A history view keeps every version of each key as it arrives, and gives each its `__start_at` and
+`__end_at` when you read it: Databricks' `APPLY CHANGES … STORED AS SCD TYPE 2`, or a slowly
+changing dimension of type 2. Versions are put in order by `sequence_by` as they are read, so one
+that arrives late still lands in its place, and a version `delete_when` holds for ends its key's
+history without being shown.
+
+```sql
+CREATE TABLE customer_changes (id BIGINT, name VARCHAR, city VARCHAR, op VARCHAR, at BIGINT);
+INSERT INTO customer_changes VALUES (1, 'ann', 'paris', 'U', 1), (1, 'ann', 'rome', 'U', 3), (2, 'bob', 'nyc', 'U', 1);
+CREATE MATERIALIZED VIEW customers WITH (history = 'id', sequence_by = 'at', delete_when = 'op = ''D''')
+  AS SELECT id, name, city, op, at FROM customer_changes;
+INSERT INTO customer_changes VALUES (1, 'ann', 'oslo', 'U', 2), (2, 'bob', NULL, 'D', 5);
+SELECT id, city, __start_at, __end_at FROM customers ORDER BY id, __start_at;
+```
+
+```text
+id  city   __start_at  __end_at
+1   paris  1           2
+1   oslo   2           3
+1   rome   3
+2   nyc    1           5
+```
+
+The current version of each key is the one whose `__end_at` is NULL
+(`WHERE __end_at IS NULL`). The view's rows are worked out as it is read, so a materialized view
+can't follow it; a stored view can.
+
 ## The pipeline
 
 `pondra.pipelines` lists every materialized view: what it follows, its kind, what else it reads
@@ -133,11 +162,12 @@ SELECT name, follows, kind, expectations FROM pondra.pipelines ORDER BY name;
 ```
 
 ```text
-name       follows  kind       expectations
-by_region  gold     aggregate  0
-gold       silver   aggregate  0
-silver     orders   rows       2
-strict     orders   rows       1
+name       follows           kind       expectations
+by_region  gold              aggregate  0
+customers  customer_changes  history    0
+gold       silver            aggregate  0
+silver     orders            rows       2
+strict     orders            rows       1
 ```
 
 <Aside>

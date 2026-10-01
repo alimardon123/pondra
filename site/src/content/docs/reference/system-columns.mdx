@@ -241,7 +241,7 @@ SHOW MATERIALIZED VIEWS LIKE 'sold%';
 |---|---|
 | `name` | the view |
 | `follows` | the table or view whose rows it follows (a stream join's two tables) |
-| `kind` | `rows` (no `GROUP BY`), `aggregate`, `window`, `sessions` or `stream join` |
+| `kind` | `rows` (no `GROUP BY`), `aggregate`, `window`, `sessions`, `stream join` or `history` |
 | `reads` | other tables its query reads, or null |
 | `expectations` | how many it has |
 | `definition` | its query |

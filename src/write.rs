@@ -234,6 +234,15 @@ impl Stmt {
     }
 }
 
+/// An option's value as text: a quoted string as it says (`'op = ''D'''` is `op = 'D'`), anything
+/// else as written.
+fn option_text(v: &ast::Expr) -> String {
+    match v {
+        ast::Expr::Value(ast::ValueWithSpan { value: ast::Value::SingleQuotedString(s) | ast::Value::DoubleQuotedString(s), .. }) => s.clone(),
+        other => other.to_string().trim_matches('\'').to_string(),
+    }
+}
+
 /// A name as SQL resolves it: its parts, unquoted ones in lower case, joined by dots.
 pub fn object(n: &ast::ObjectName) -> String {
     let part = |p: &ast::ObjectNamePart| p.as_ident().map(ident).unwrap_or_else(|| p.to_string());
@@ -377,7 +386,7 @@ pub fn parse(sql: &str) -> Option<Stmt> {
                 Stmt::Ddl(vec![Ddl::RenameTable { name: object(&a.name), to }])
             }
             [ast::AlterTableOperation::SetOptionsParens { options } | ast::AlterTableOperation::SetTblProperties { table_properties: options }] => Stmt::SetOptions(object(&a.name), options.iter().map(|o| match o {
-                ast::SqlOption::KeyValue { key, value } => Some((key.value.to_lowercase(), value.to_string().trim_matches('\'').to_string())),
+                ast::SqlOption::KeyValue { key, value } => Some((key.value.to_lowercase(), option_text(value))),
                 _ => None,
             }).collect::<Option<_>>()?),
             _ => return None,
@@ -409,7 +418,7 @@ pub fn parse(sql: &str) -> Option<Stmt> {
         Statement::CreateView(v) if v.materialized => {
             let options = match &v.options {
                 ast::CreateTableOptions::With(o) | ast::CreateTableOptions::Options(o) => o.iter().filter_map(|o| match o {
-                    ast::SqlOption::KeyValue { key, value } => Some((key.value.to_lowercase(), value.to_string().trim_matches('\'').to_string())),
+                    ast::SqlOption::KeyValue { key, value } => Some((key.value.to_lowercase(), option_text(value))),
                     _ => None,
                 }).collect(),
                 _ => Default::default(),
@@ -533,7 +542,7 @@ pub async fn create_spec(c: &ast::CreateTable, from: &Lake, files: bool) -> Resu
     if let ast::CreateTableOptions::With(o) | ast::CreateTableOptions::Options(o) = &c.table_options {
         for o in o {
             if let ast::SqlOption::KeyValue { key, value } = o {
-                opts.insert(key.value.to_lowercase(), value.to_string().trim_matches('\'').to_string());
+                opts.insert(key.value.to_lowercase(), option_text(value));
             }
         }
     }
