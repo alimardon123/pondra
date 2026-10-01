@@ -7,7 +7,7 @@ name: build
 # the suite on its binary, while the others finish (the slowest, macOS Intel, doesn't hold it up).
 # A tag's release (release.yml) publishes this run's packages: nothing is built twice, and what
 # the suite tested is what ships. A pull request to main gets the same run, so a branch is tried
-# on every platform before it is merged.
+# on every platform before it is merged, and its merge isn't built again (`reuse`).
 on:
   push:
     branches: [main]
@@ -16,7 +16,30 @@ on:
   workflow_dispatch:
 
 jobs:
+  # A push to main whose code a pull request's run already built and tested (the merge changed
+  # nothing in it: the branch was up to date with main) builds nothing: release.yml and
+  # cluster-bench.yml take that run's packages (tools/ci_build.sh finds them by the commit's tree).
+  reuse:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      run: ${{ steps.find.outputs.run }}
+    steps:
+      - uses: actions/checkout@v5
+      - id: find
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          run=$(bash tools/ci_build.sh "$GITHUB_SHA")
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+          if [ -n "$run" ]; then echo "Built and tested already: https://github.com/$GITHUB_REPOSITORY/actions/runs/$run" >> "$GITHUB_STEP_SUMMARY"; fi
+
   build:
+    needs: reuse
+    if: ${{ !cancelled() && needs.reuse.outputs.run == '' }}
     name: ${{ matrix.platform == 'linux-x64' && 'linux-x64 (build and suite)' || matrix.platform }}
     strategy:
       fail-fast: false

@@ -4,7 +4,8 @@ name: release
 # that very commit (build.yml: the five platforms' wheels, npm packages and installer archives,
 # each tried on its platform, and the suite run on the Linux binary) to a GitHub release with
 # install.sh and install.ps1, to PyPI and to npm. Nothing is built here, so a release takes a
-# minute or two: tag a commit once its build is green. A build still running is waited for; one
+# minute or two: tag a commit once its build is green. A merge to main that changed nothing in a
+# pull request's code isn't built again: its packages are the pull request's (tools/ci_build.sh). A build still running is waited for; one
 # that failed stops the release (re-run its failed jobs, then this).
 #
 # Publishing needs no token: PyPI and npm both trust this workflow ("trusted publishing", with
@@ -39,7 +40,9 @@ jobs:
           run=$(gh run list --workflow build.yml --commit "$GITHUB_SHA" --limit 1 --json databaseId --jq '.[0].databaseId')
           [ -n "$run" ] || { echo "::error::no build run for $GITHUB_SHA: push it to main first (or start the build workflow on this tag)"; exit 1; }
           gh run watch "$run" --exit-status --interval 30 > /dev/null || { echo "::error::build run $run didn't pass: re-run its failed jobs, then this"; exit 1; }
-          echo "run=$run" >> "$GITHUB_OUTPUT"
+          built=$(bash tools/ci_build.sh "$GITHUB_SHA") # (its own packages, or the pull request's it reused: build.yml's `reuse`)
+          [ -n "$built" ] || { echo "::error::build run $run passed, but no run has this commit's packages"; exit 1; }
+          echo "run=$built" >> "$GITHUB_OUTPUT"
       - uses: actions/download-artifact@v7
         with:
           run-id: ${{ steps.build.outputs.run }}
