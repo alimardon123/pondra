@@ -115,6 +115,7 @@ static FILES: LazyLock<HashMap<String, Asset>> = LazyLock::new(|| {
         ("pyfile.js", Asset::new(lean(include_str!("console/pyfile.js")), JS)),
         ("versions.js", Asset::new(lean(include_str!("console/versions.js")), JS)),
         ("stmts.js", Asset::new(lean(include_str!("console/stmts.js")), JS)),
+        ("params.js", Asset::new(lean(include_str!("console/params.js")), JS)),
         ("more.css", Asset::new(lean(include_str!("console/more.css")), "text/css; charset=utf-8")),
         ("console.css", Asset::new(lean(&include_str!("console/console.css").replacen("/*{{colors}}*/", COLORS.trim(), 1)), "text/css; charset=utf-8")),
         ("fonts/Geist.woff2", Asset::new(&include_bytes!("../brand/fonts/Geist.woff2")[..], "font/woff2")),

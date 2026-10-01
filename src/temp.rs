@@ -77,6 +77,7 @@ pub struct Session {
     secrets: std::collections::BTreeMap<String, crate::ext::Secret>, // (CREATE TEMPORARY SECRET: in memory only)
     pub settings: std::collections::BTreeMap<String, String>,       // SET name = value (`settings.rs`)
     pub prepared: HashMap<String, String>,                          // PREPARE name AS …: its text
+    pub variables: std::collections::BTreeMap<String, crate::vars::Var>, // DECLARE $name …, $name = … (`vars.rs`)
     used: Option<Instant>,
     version: u64, // changes so far (`live.rs` watches them)
 }

@@ -71,6 +71,7 @@ mod temp;
 mod tier;
 mod udf;
 mod users;
+mod vars;
 mod views;
 mod write;
 mod write_outside;
@@ -262,9 +263,13 @@ enum Cmd {
     },
     /// Run a SQL file — its statements in order, `$name` taking the value of `--name` — on a node
     /// of the lake started for it (`pondra run load.sql lake --day 2026-09-27`), or on a node
-    /// already running (`--url http://host:8080`).
+    /// already running (`--url http://host:8080`). `pondra run load.sql --help` lists its parameters.
+    #[command(disable_help_flag = true)]
     Run {
-        file: String,
+        file: Option<String>,
+        /// This help, and the file's parameters (its DECLAREs: type, default, what each means).
+        #[arg(short, long)]
+        help: bool,
         #[arg(long)]
         url: Option<String>,
         /// A token for that node (also PONDRA_TOKEN).
@@ -275,6 +280,26 @@ enum Cmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, value_name = "LAKE] [--NAME VALUE")]
         rest: Vec<String>,
     },
+}
+
+/// `pondra run --help`, and with a file its parameters, as `--name` options (ADR-037).
+fn run_help(file: Option<&str>) -> anyhow::Result<()> {
+    use clap::CommandFactory;
+    let mut cmd = Cli::command();
+    let run = cmd.find_subcommand_mut("run").expect("the run command");
+    let Some(file) = file else { return Ok(run.print_help()?) };
+    let text = std::fs::read_to_string(file).map_err(|e| anyhow::anyhow!("{file}: {e}"))?;
+    let params = vars::parameters(&text);
+    let arg = |p: &vars::Param| format!("--{} {}", p.name, p.ty.as_deref().unwrap_or("VALUE").to_uppercase());
+    println!("Usage: pondra run {file} [LAKE] {}", params.iter().map(|p| match p.required { true => arg(p), false => format!("[{}]", arg(p)) }).collect::<Vec<_>>().join(" "));
+    println!("\n{}", match params.is_empty() { true => format!("{file} takes no parameters."), false => format!("Parameters of {file}:") });
+    let width = params.iter().map(|p| arg(p).len()).max().unwrap_or(0);
+    for p in &params {
+        let said = [p.description.clone(), Some(p.default.as_ref().map_or("required".into(), |d| format!("default: {d}")))];
+        println!("  {:width$}  {}", arg(p), said.into_iter().flatten().collect::<Vec<_>>().join(" · "));
+    }
+    println!("\nOptions: --url URL (a node already running), --token TOKEN (also PONDRA_TOKEN)");
+    Ok(())
 }
 
 /// Ctrl-C, SIGTERM (how schedulers and `kill` stop a process), or with `stdin`, standard input
@@ -632,7 +657,11 @@ async fn run() -> anyhow::Result<()> {
             }
             axum::serve(listener, server::router(app).into_make_service_with_connect_info::<tls::Peer>()).await?; // (who asks: `console::save_settings`)
         }
-        Cmd::Run { file, url, token, rest } => {
+        Cmd::Run { file, url, token, help, rest } => {
+            if help || file.is_none() || rest.iter().any(|a| a == "--help" || a == "-h") {
+                return run_help(file.as_deref());
+            }
+            let file = file.unwrap_or_default();
             // (the lake first if it is there; `--url` and `--token` wherever they are; the rest parameters)
             let (mut lake, mut url, mut token, mut params, mut it) = (None, url, token, vec![], rest.into_iter());
             while let Some(a) = it.next() {

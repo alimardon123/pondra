@@ -62,11 +62,15 @@ pub async fn run(app: &App, args: &[FunctionArg], who: Who, job: Option<String>,
     let mut heard = vec![];
     let values = crate::routines::values_of(&row)?;
     let session = format!("run-{}", crate::runs::new_id());
-    let out = match kind.as_str() {
-        "sql" => Box::pin(crate::routines::script(app, &text, &values, &HashMap::new(), inner, job)).await,
-        "py" => python(app, &path, &text, Some(&row), &session, inner, job, &mut heard).await,
-        _ => Box::pin(cells(app, &path, &text, &row, &values, &session, inner, job, &mut heard)).await,
-    };
+    let (none, no_views) = (HashMap::new(), HashMap::new());
+    let out = crate::vars::own(values, async { // (the run's variables, from the values given: every cell's, and its Python's `db.vars`)
+        match kind.as_str() {
+            "sql" => Box::pin(crate::routines::script(app, &text, &none, &no_views, inner, job)).await,
+            "py" => python(app, &path, &text, Some(&row), &session, inner, job, &mut heard).await,
+            _ => Box::pin(cells(app, &path, &text, &row, &session, inner, job, &mut heard)).await,
+        }
+    })
+    .await;
     crate::python::end_session(&session);
     let _ = log.end(app, &out, heard);
     out.map_err(|e| e.context(format!("run {path}")))
@@ -128,7 +132,7 @@ fn notebook(text: &str) -> Result<Vec<Cell>> {
 /// namespace of the run's own. The given parameters are set as variables after the cell tagged
 /// `parameters` (its values are the defaults), or before the first cell if none is.
 #[allow(clippy::too_many_arguments)]
-async fn cells(app: &App, path: &str, text: &str, row: &RecordBatch, values: &HashMap<String, Value>, session: &str, who: Who, job: Option<String>, heard: &mut Vec<String>) -> Result<Outcome> {
+async fn cells(app: &App, path: &str, text: &str, row: &RecordBatch, session: &str, who: Who, job: Option<String>, heard: &mut Vec<String>) -> Result<Outcome> {
     let all = notebook(text)?;
     let at = all.iter().position(|c| c.parameters);
     let (mut last, mut pending) = (Outcome::Done(j!({"ran": path})), row.num_columns() > 0);
@@ -148,7 +152,7 @@ async fn cells(app: &App, path: &str, text: &str, row: &RecordBatch, values: &Ha
                 python(app, &name, &format!("{v} = db.sql({})\n{v}", j!(c.code.trim())), None, session, who, job, heard).await
             }
             false => {
-                let out = Box::pin(crate::routines::script(app, &c.code, values, &HashMap::new(), who, job)).await;
+                let out = Box::pin(crate::routines::script(app, &c.code, &HashMap::new(), &HashMap::new(), who, job)).await; // (`$name`: the run's variables and values)
                 if let (Ok(_), Some(v), true) = (&out, &c.name, query && all[i + 1..].iter().any(|c| c.python)) {
                     python(app, &name, &format!("{v} = db.sql({})", j!(c.code.trim())), None, session, who, None, heard).await?; // (its answer, a frame, for the Python cells after it)
                 }

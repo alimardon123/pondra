@@ -27,6 +27,7 @@
   harness.py safety              panics answered as errors, TLS at every door, mutual TLS, the audit log, quotas
   harness.py versions            every file keeps its versions: listed, read, restored, kept after a delete, retention, old notebooks
   harness.py stopped             a run whose node was killed under it: stopped, not running for good
+  harness.py variables           DECLARE $day / $day = … from every door, a file's parameters, runs and procedures of their own
   harness.py load    --secs 30   throughput, ack latency, freshness, catalog commit latency
   harness.py all                 quick run of everything
 """
@@ -6002,6 +6003,120 @@ def sparksql():
         sys.exit(1)
 
 
+
+def variables():
+    """SQL variables (round 31): `DECLARE $day DATE = …` declares one (type and default optional),
+    `$day = …` changes it, and every `$day` after is its value, bound, from every door (HTTP with a
+    session, Postgres, Python's `db.vars`); DuckDB's `SET VARIABLE`, `getvariable` and `RESET
+    VARIABLE` are the same. A file's `DECLARE`s are its parameters (`pondra.parameters(…)`): a run's
+    given values replace their defaults, cast to their types. Procedures and file runs have
+    variables of their own; `SET` stays the settings'."""
+    import datetime
+    import psycopg
+    lake = new_lake()
+    here = os.path.dirname(os.path.abspath(__file__))
+    pg = A.port + 10
+    node = Node(lake, A.port, pg=f"127.0.0.1:{pg}", python="auto", env={"PYTHONPATH": os.path.join(here, "..", "python")}).start()
+    s1, s2 = {"x-pondra-session": "harness-vars-one"}, {"x-pondra-session": "harness-vars-two"}
+    q = lambda s, h=s1: call(A.port, "POST", "/sql", s.encode(), headers=h)
+    checks, info = {}, {}
+    q("CREATE TABLE orders (id BIGINT, day DATE, amount DOUBLE)")
+    q("INSERT INTO orders VALUES (1, DATE '2026-09-29', 10), (2, DATE '2026-09-30', 20), (3, DATE '2026-09-30', 5)")
+    got = {"declared": q("DECLARE $day DATE = DATE '2026-10-01' - INTERVAL '1 day'"), "used": q("SELECT sum(amount) AS total FROM orders WHERE day = $day"),
+           "named": q("SELECT $day, $day + 1")}
+    got["changed"] = q("$day = $day - 1")
+    got["after"] = q("SELECT sum(amount) AS total FROM orders WHERE day = $day")
+    got["typed"] = _raises_text(lambda: q("$day = 'not a day'"))
+    got["other session"] = _raises_text(lambda: q("SELECT $day", s2))
+    got["no session"] = _raises_text(lambda: q("DECLARE $x = 1", {}))
+    got["one script"] = q("DECLARE $n BIGINT = 2; $n = $n * 21; SELECT $n AS n", {})
+    got["duckdb"] = q("SET VARIABLE region = 'eu'; SELECT getvariable('region') AS r, $region AS s, getvariable('nope') AS none")
+    q("RESET VARIABLE region")
+    got["reset"] = _raises_text(lambda: q("SELECT $region"))
+    q("SET datafusion.execution.batch_size = 4096")  # (a setting, not a variable)
+    got["listed"] = q("SELECT name, value, type, declared FROM pondra.variables ORDER BY name")
+    q("$day = DATE '2026-09-30'")
+    got["listed again"] = q("SELECT name, value, type, declared FROM pondra.variables ORDER BY name")
+    checks["DECLARE $day DATE = …: its value, worked out once, in WHERE and SELECT; $day = … changes it"] = \
+        got["declared"] == {"variable": "day", "value": "2026-09-30", "type": "Date32"} and got["used"] == [{"total": 25.0}] \
+        and got["changed"]["value"] == "2026-09-29" and got["after"] == [{"total": 10.0}]
+    checks["a column of a variable is named as written ($day, $day + 1)"] = got["named"] == [{"$day": "2026-09-30", "$day + 1": "2026-10-01"}]
+    checks["a declared type holds: a value that isn't one refused by name"] = "$day is DATE" in got["typed"]
+    checks["a variable is its session's: another session doesn't have it; with none, a DECLARE says so; a script sent at once has its own"] = \
+        "no value for $day" in got["other session"] and "session" in got["no session"] and got["one script"] == [{"n": 42}]
+    checks["DuckDB's SET VARIABLE, getvariable (NULL if none) and RESET VARIABLE"] = got["duckdb"] == [{"r": "eu", "s": "eu"}] and "no value for $region" in got["reset"]
+    checks["pondra.variables lists them (name, value, type, declared), never a remembered answer; SET is still a setting"] = \
+        got["listed"] == [{"name": "day", "value": "2026-09-29", "type": "Date32", "declared": "DATE"}] \
+        and got["listed again"] == [{"name": "day", "value": "2026-09-30", "type": "Date32", "declared": "DATE"}]
+    # A file's parameters, and runs.
+    daily = ("-- The day to load\nDECLARE $day DATE = DATE '2026-09-29';\n-- $region: where the orders come from\nDECLARE $min DOUBLE DEFAULT 0;\n"
+             "SELECT count(*) AS n, sum(amount) AS total, $region AS region FROM orders WHERE day = $day AND amount >= $min;\n")
+    call(A.port, "PUT", "/files/etl/daily.sql", daily.encode())
+    got["parameters"] = q("SELECT * FROM pondra.parameters('etl/daily.sql')")
+    got["run given"] = q("CALL run('etl/daily.sql', region => 'eu', day => '2026-09-30', min => 6)")
+    got["run defaults"] = q("CALL run('etl/daily.sql', region => 'us')")
+    got["run missing"] = _raises_text(lambda: q("CALL run('etl/daily.sql')"))
+    got["session after runs"] = q("SELECT name, value FROM pondra.variables ORDER BY name")
+    checks["a file's parameters: its DECLAREs (type, default) and the $names it uses unset (required), the comment above each its description, in order"] = got["parameters"] == [
+        {"name": "day", "type": "DATE", "default": "DATE '2026-09-29'", "required": False, "description": "The day to load"},
+        {"name": "min", "type": "DOUBLE", "default": "0", "required": False},
+        {"name": "region", "required": True, "description": "where the orders come from"}]
+    checks["a run's values replace the defaults, cast to their types; a required one missing is named; the run's variables stay its own"] = \
+        got["run given"] == [{"n": 1, "total": 20.0, "region": "eu"}] and got["run defaults"] == [{"n": 1, "total": 10.0, "region": "us"}] \
+        and "no value for $region" in got["run missing"] and got["session after runs"] == [{"name": "day", "value": "2026-09-30"}]
+    # Procedures.
+    q("CREATE PROCEDURE twice(n BIGINT) LANGUAGE sql AS $$ DECLARE $m = $n * 2; $m = $m + 1; SELECT $m AS m, $1 AS first $$")
+    got["procedure"] = q("CALL twice(21)")
+    got["procedure refused"] = _raises_text(lambda: q("CREATE PROCEDURE broken() LANGUAGE sql AS $$ SELECT $nowhere $$"))
+    checks["a procedure declares variables of its own; one using a $name nothing gives it is refused when made"] = \
+        got["procedure"] == [{"m": 43, "first": 21}] and "no value for $nowhere" in got["procedure refused"] and "m" not in [r["name"] for r in q("SELECT name FROM pondra.variables")]
+    # Postgres: each connection its own.
+    with psycopg.connect(f"host=127.0.0.1 port={pg} user=pondra dbname=pondra", autocommit=True) as c:
+        cur = c.execute("DECLARE $day DATE = DATE '2026-09-29'")
+        tag = cur.statusmessage
+        simple = c.execute("SELECT count(*) FROM orders WHERE day = $day").fetchall()
+        c.execute("$day = $day + 1")
+        extended = c.execute("SELECT count(*) FROM orders WHERE day = $day AND amount > %s", (6,)).fetchall()
+    checks["over Postgres: DECLARE (its tag), $day = …, and $day beside the protocol's own parameters"] = tag == "DECLARE" and simple == [(1,)] and extended == [(1,)]
+    # Python: db.vars, and a file run's Python and a session's DO block.
+    db = _client(A.port)
+    db.sql("DECLARE $day DATE = DATE '2026-09-30'")
+    first = db.vars.day
+    db.vars.day = datetime.date(2026, 9, 29)
+    db.vars.limit = 3
+    listed = dict(db.vars)
+    del db.vars.limit
+    total = db.sql("SELECT sum(amount) AS t FROM orders WHERE day = $day").rows()
+    call(A.port, "PUT", "/files/etl/load.py", b"import pondra\nprint('given', pondra.vars.day)\npondra.vars.seen = 41\nprint(pondra.sql('SELECT $seen + 1 AS x').rows())\n")
+    db.run("etl/load.py", day="2026-10-01")
+    ran = list(db.notices)
+    db.sql("DO LANGUAGE python $$\nimport pondra\nprint('do', pondra.vars.day)\n$$")
+    did = list(db.notices)
+    info["python"] = {"first": str(first), "listed": {k: str(v) for k, v in listed.items()}, "total": total, "ran": ran, "did": did, "after": sorted(db.vars)}
+    checks["Python's db.vars reads, sets and forgets $day; a file run's Python sees its given values as pondra.vars; a session's DO block sees the session's"] = \
+        first == datetime.date(2026, 9, 30) and listed == {"day": datetime.date(2026, 9, 29), "limit": 3} and total == [{"t": 10.0}] \
+        and ran == ["given 2026-10-01", "[{'x': 42}]"] and did == ["do 2026-09-29"] and sorted(db.vars) == ["day"]
+    js = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "js", "index.js")
+    script = f"""import {{ connect }} from {json.dumps(js)};
+const db = connect("http://127.0.0.1:{A.port}");
+await db.sql("DECLARE $day DATE = DATE '2026-09-29'"); await db.setVariable("top", 2);
+const all = await db.vars(), top = await db.getVariable("top"), rows = await db.sql("SELECT count(*) AS n, $top * 10 AS t FROM orders WHERE day = $day");
+await db.resetVariable("top");
+console.log(JSON.stringify([all, top, rows, await db.vars(), (await db.parameters("etl/daily.sql")).map(p => p.name)])); await db.close();"""
+    path = os.path.join(tempfile.mkdtemp(prefix="pondra-vars-"), "vars.mjs")
+    open(path, "w").write(script)
+    js_out = subprocess.run(["node", path], capture_output=True, text=True, timeout=60)
+    got["javascript"] = js_out.stdout.strip() or js_out.stderr[-1500:]
+    checks["JavaScript: db.vars(), getVariable, setVariable, resetVariable, parameters"] = \
+        got["javascript"] == json.dumps([{"day": "2026-09-29", "top": 2}, 2, [{"n": 1, "t": 20}], {"day": "2026-09-29"}, ["day", "min", "region"]], separators=(",", ":"))
+    info["got"] = got
+    node.kill()
+    ok = all(checks.values())
+    print(json.dumps({"variables": checks, "ok": ok, "info": info}, indent=1, default=str))
+    if not ok:
+        sys.exit(1)
+    return f"variables: DECLARE $day, $day = …, from HTTP, Postgres and Python; a file's parameters; runs and procedures of their own: all {len(checks)} checks pass"
+
 def doors():
     """The doors matrix (ADR-036 §7): one list of features, each through every door — SQL over HTTP
     (a session), the Python client, the Postgres port (psycopg), Flight SQL (ADBC), the JavaScript
@@ -6137,7 +6252,7 @@ finally {{ await db.close?.(); }}"""
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    out = {t.__name__: t() for t in (upsert, deal, outside, clouds, kafkas, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, found, renames, workspace, server, scale, flight, users, secrets, safety, versions, stopped, flows, begin, doors, objects, sparksql, reader, crash)}
+    out = {t.__name__: t() for t in (upsert, deal, outside, clouds, kafkas, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, found, renames, workspace, server, scale, flight, users, secrets, safety, versions, stopped, flows, begin, doors, objects, sparksql, variables, reader, crash)}
     A.secs = min(A.secs, 20)
     out["load"] = load()
     print(json.dumps(out, indent=1))
@@ -6145,7 +6260,7 @@ def all_tests():
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "found", "renames", "workspace", "server", "scale", "flight", "users", "secrets", "safety", "versions", "stopped", "flows", "begin", "doors", "objects", "sparksql", "load", "all"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "found", "renames", "workspace", "server", "scale", "flight", "users", "secrets", "safety", "versions", "stopped", "flows", "begin", "doors", "objects", "sparksql", "variables", "load", "all"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -6156,4 +6271,4 @@ if __name__ == "__main__":
     ap.add_argument("--secs", type=int, default=30)
     ap.add_argument("--flush-ms", type=int, default=250)
     A = ap.parse_args()
-    {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "safety": safety, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "objects": objects, "sparksql": sparksql, "load": load, "all": all_tests}[A.mode]()
+    {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "safety": safety, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "objects": objects, "sparksql": sparksql, "variables": variables, "load": load, "all": all_tests}[A.mode]()

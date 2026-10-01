@@ -457,6 +457,7 @@ def files_checks(browser, port, show):
     sql(port, "CREATE TABLE fx AS SELECT value AS id, 'r' || (value % 3) AS region FROM range(0, 30)")
     top = b"SELECT region, count(*) AS n\nFROM fx\nGROUP BY region\nORDER BY region"
     put(port, "scripts/top.sql", top)
+    put(port, "scripts/since.sql", b"-- The first day counted\nDECLARE $since DATE = DATE '2026-01-01';\nDECLARE $top BIGINT DEFAULT 3;\nSELECT $since AS since, $top + 1 AS more;\nSELECT 7 AS seven")
     put(port, "scripts/hello.py", b'import math\nprint("pi is", round(math.pi, 4))\ndb.sql("SELECT count(*) AS n FROM fx")')
     put(port, "data/q.csv", b'id,city,amount\r\n1,Oslo,10\r\n2,"Rome, IT",20\r\n')
     put(port, "data/e.jsonl", b'{"id":1,"tag":"a"}\n{"id":2,"tag":"b"}\n')
@@ -556,6 +557,47 @@ def files_checks(browser, port, show):
     p.locator("#rtabs .rtab", has_text="Details").click()
     checks["a SQL file's $names each get an input, bound on the node; its Run ▾ runs it as a job (History shows it) and schedules it (Jobs shows it, apart from History, and drops it)"] = \
         shown == ["$region"] and bound == [["n", "region"], [["10", "r1"]]] and ran is True and isinstance(task, list) and len(task) == 1 and listed == 1 and cadence == "every 1 hour" and dropped == [{"n": 0}] and gone == 0
+    pg.workspace("scripts", "since.sql").click()
+    until(lambda: pg.tab()[0], "since.sql")
+    params = lambda: bar.evaluate("b => [...b.querySelectorAll('.param')].map(l => [l.querySelector('span').textContent, l.querySelector('i')?.textContent, l.querySelector('input').type, l.querySelector('input').placeholder, l.title])")
+    typed = until(params, [["$since", "date", "date", "DATE '2026-01-01'", "The first day counted\nDefault: DATE '2026-01-01'"], ["$top", "bigint", "text", "3", "Default: 3"]], 5)
+    lit = p.locator(".filedoc pre.hl span.nu", has_text="$since").count() > 0
+    p.wait_for_function("document.activeElement?.tagName === 'TEXTAREA'")
+    ed.focus()
+    p.keyboard.press("Control+Home")
+    p.keyboard.press("Control+Enter")
+    answers = lambda: strip.evaluate("s => [...s.querySelectorAll('button.stmt')].map(b => b.querySelector('b').textContent + ' ' + b.lastChild.textContent)")
+    whole = until(lambda: strip.count() and answers(), ["1 done", "2 done", "3 1 row", "4 1 row"])
+    strip.locator("button.stmt").nth(2).click()
+    defaults = until(lambda: pg.grid(body), [["since", "more"], [["2026-01-01", "4"]]])
+    bar.locator("input").nth(1).fill("10")
+    bar.locator("input").nth(1).press("Enter")
+    strip.locator("button.stmt").nth(2).click()
+    given = until(lambda: pg.grid(body), [["since", "more"], [["2026-01-01", "11"]]])
+    ed.focus()
+    p.keyboard.press("Control+End")
+    p.keyboard.press("Control+Shift+Enter")  # (the caret in the last statement: that one alone)
+    alone = until(lambda: strip.count() == 0 and pg.grid(body), [["seven"], [["7"]]])
+    ed.evaluate("t => t.setSelectionRange(t.value.indexOf('AS more;') + 8, t.value.indexOf('AS more;') + 8)")  # (just after its ;: the statement before)
+    p.keyboard.press("Control+Shift+Enter")
+    after = until(lambda: pg.grid(body), [["since", "more"], [["2026-01-01", "11"]]])
+    box, cw = ed.bounding_box(), p.evaluate("(() => { const c = document.createElement('canvas').getContext('2d'); c.font = '13px ' + getComputedStyle(document.body).getPropertyValue('--mono'); return c.measureText('0').width; })()")
+    p.mouse.move(box["x"] + 14 + cw * 9.5, box["y"] + 9 + 21 * 1.5)  # (over `$since`, line 2)
+    hovered = until(lambda: ed.get_attribute("title") or "", "$since DATE = DATE '2026-01-01'\nThe first day counted\nNow: 2026-01-01 (date)", 5)
+    p.locator("#rtabs .rtab", has_text="Variables").click()
+    shown_vars = until(lambda: p.locator("#variables .vhead").count() == 1 and p.locator("#variables .var .nm").all_inner_texts()[-2:], ["$since", "$top"], 10)
+    p.locator("#rtabs .rtab", has_text="Details").click()
+    ed.focus()
+    p.keyboard.press("Control+End")
+    p.keyboard.insert_text(" + $t")
+    p.keyboard.press("Control+Space")
+    completes = until(lambda: p.locator("#complete:not([hidden]) div").all_inner_texts()[:1], ["$top\nvariable"], 5)
+    p.keyboard.press("Escape")
+    checks["a SQL file's DECLAREs are its parameters (type, default, what the comment above says; a date picks a date), $names highlighted; a value given replaces the default; Ctrl+Shift+Enter runs the statement at the caret (just after its ; too); hovering a $name says it; Variables lists SQL's; $ completes"] = \
+        typed == [["$since", "date", "date", "DATE '2026-01-01'", "The first day counted\nDefault: DATE '2026-01-01'"], ["$top", "bigint", "text", "3", "Default: 3"]] and lit \
+        and whole == ["1 done", "2 done", "3 1 row", "4 1 row"] and defaults == [["since", "more"], [["2026-01-01", "4"]]] and given == [["since", "more"], [["2026-01-01", "11"]]] \
+        and alone == [["seven"], [["7"]]] and after == [["since", "more"], [["2026-01-01", "11"]]] and hovered.startswith("$since DATE") and shown_vars == ["$since", "$top"] and completes == ["$top\nvariable"]
+    var_info = {"typed": typed, "whole": whole, "defaults": defaults, "given": given, "alone": alone, "after": after, "hovered": hovered, "vars": shown_vars, "completes": completes}
     pg.workspace("scripts", "hello.py").click()
     until(lambda: pg.tab()[0], "hello.py")
     p.locator("#docbar button", has_text="Run file").click()
@@ -644,7 +686,7 @@ def files_checks(browser, port, show):
     checks["the editor: an alias called c is a name, not a comment's start; after o. Tab lists the columns of the table o names"] = \
         '<span class="k">FROM</span>' in lit and '<span class="k">WHERE</span>' in lit and '<span class="c">/* c */</span>' in lit and offered == ["id", "region"]
     info_editor = {"highlighted": lit, "offered": offered}
-    info = {"editor": info_editor, "task": task, "bound": bound, "results": results, "said": said, "each": each, "not run": left, "second": second, "last": last, "only": only, "plan": plan, "dirty": dirty, "saved": saved, "clean": clean, "shown": shown, "errors": pg.errors, "left": pg.left(), "toast": pg.toast(), "folders": folders}
+    info = {"editor": info_editor, "variables": var_info, "task": task, "bound": bound, "results": results, "said": said, "each": each, "not run": left, "second": second, "last": last, "only": only, "plan": plan, "dirty": dirty, "saved": saved, "clean": clean, "shown": shown, "errors": pg.errors, "left": pg.left(), "toast": pg.toast(), "folders": folders}
     pg.ctx.close()
     return checks, info
 
@@ -1284,7 +1326,7 @@ def budget_checks(browser, port, show):
             fresh[name] = e.code
     total = sum(sizes.values()) if all(sizes.values()) else None
     later = {}
-    for name in ["chart.js", "plan.js", "more.js", "details.js", "more.css", "data.js", "md.js", "jobs.js", "settings.js", "objects.js", "pyfile.js", "versions.js", "stmts.js"]:  # (loaded when first used)
+    for name in ["chart.js", "plan.js", "more.js", "details.js", "more.css", "data.js", "md.js", "jobs.js", "settings.js", "objects.js", "pyfile.js", "versions.js", "stmts.js", "params.js"]:  # (loaded when first used)
         r = urllib.request.urlopen(urllib.request.Request(f"{base}/console/{name}", headers={"accept-encoding": "gzip"}))
         later[name] = len(r.read()) if r.headers.get("content-encoding") == "gzip" else None
     checks["the scripts and style sheet the page loads, gzipped as the node serves them: <= 70 KB; each answers 304 when the browser has it"] = total is not None and total <= 70 * 1024 \

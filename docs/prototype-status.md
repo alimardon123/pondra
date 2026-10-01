@@ -68,7 +68,26 @@ Python in one notebook** (the owner's list after the first part):
      change, replace and extend.
    - **The first load** stays within its budget (71,335 bytes of 71,680): the sign-in dialog, a SQL
      file's Messages and gutter numbers (`stmts.js`, new) and a cell's ⋯ load when first used.
-9. **Tests:** `harness.py objects` (new, 13 checks, a Pondra node's Kafka port as the topic);
+9. **SQL variables and a file's parameters declared** (ADR-037, invariant 198, the owner's choice
+   of 2026-10-01): `DECLARE $day DATE = current_date - 1;` (type and value optional) and `$day =
+   $day + 1;`, with DuckDB's `SET VARIABLE`, `RESET VARIABLE` and `getvariable` as other names. A
+   value is worked out once and bound as a typed literal wherever `$day` is used; a session holds
+   its variables (Postgres, `x-pondra-session`, a console tab, a script), a procedure and a file
+   run their own, shared with their Python (`db.vars.day` is `$day`). In a file a `DECLARE` is a
+   parameter with its default, its description the comment above:
+   `pondra.parameters('etl/orders.sql')`, `db.parameters(…)`; `pondra.variables` lists what is set.
+   A column using a variable is named as written (`$day + 1`). In the console a SQL file's bar shows
+   each parameter's type, default (a date picker for a `DATE`) and comment; `$name`s are highlighted,
+   completed after `$` and say their value on hover; the Variables view lists SQL's too; Ctrl+Shift+
+   Enter runs the statement at the caret (just after its `;` too), and Settings says what Ctrl+Enter
+   runs. JavaScript's `db.vars()`, `getVariable`, `setVariable`, `resetVariable`, `parameters`;
+   `pondra run daily.sql --help` lists a file's parameters. `harness.py variables` (12 checks),
+   `console_check.py` (`files`). Found on the way: PL/Python's `plpy.execute(plan, [v])` lost its
+   `$1` once a run's values became its run's (`harness.py functions`).
+10. **CI builds a commit once:** a push to main whose code a pull request's run built and tested
+   (the branch was up to date) builds nothing; the release and the cluster bench take that run's
+   packages (`tools/ci_build.sh`, by the commit's tree).
+11. **Tests:** `harness.py objects` (new, 13 checks, a Pondra node's Kafka port as the topic);
    `harness.py sparksql` (new); `harness.py flows` (renamed);
    `console_check.py` in every part (axe clean, light and dark); the changed docs pages' 142
    examples; `harness.py` workspace, procedures, temps, external, schemas, secrets,

@@ -555,7 +555,7 @@ impl App {
         use crate::metrics::{add, QUERIES, QUERY_ERRORS, QUERY_US, SPREAD};
         let start = std::time::Instant::now();
         let run = async {
-            let here_only = spread == Some("0") || crate::query::sent() || crate::temp::mentioned(query) || crate::txn::open() || crate::settings::any() || crate::routines::pinned(&self.lake, query).await // (rows sent with a request are here only; so are the session's temporary tables, its transaction and settings, and a Python table function's call)
+            let here_only = spread == Some("0") || crate::query::sent() || crate::temp::mentioned(query) || crate::txn::open() || crate::settings::any() || crate::vars::mentioned(query) || crate::routines::pinned(&self.lake, query).await // (rows sent with a request are here only; so are the session's temporary tables, its transaction and settings, and a Python table function's call)
                 || crate::auth::limited().is_some(); // (and a user's granted some tables: its grants are checked where it is planned, here)
             let nodes = if here_only { vec![] } else { self.cluster.nodes() };
             match crate::spmd::query(&self.lake, &nodes, &self.cluster.addr, query, spread == Some("1")).await {
@@ -921,7 +921,9 @@ fn owner(headers: &axum::http::HeaderMap) -> bool {
 async fn sql(State(app): State<App>, Query(p): Query<SqlParams>, role: axum::Extension<crate::auth::Role>, headers: axum::http::HeaderMap, body: Bytes) -> Response {
     let files = owner(&headers); // (the program that started this node: its files, and URLs no secret covers)
     let session = crate::temp::of(&headers); // (its temporary tables: `temp.rs`)
-    let (out, heard) = crate::routines::with_notices(crate::temp::SESSION.scope(session, crate::ext::scope(files, sql_as(app, p, role, headers, body)))).await;
+    let token = headers.get("authorization").and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer "));
+    let vars = crate::auth::lent_vars(token); // (Python code a run lent a connection to: the run's variables)
+    let (out, heard) = crate::routines::with_notices(crate::vars::within(vars, crate::temp::SESSION.scope(session, crate::ext::scope(files, sql_as(app, p, role, headers, body))))).await;
     let mut r = out.unwrap_or_else(IntoResponse::into_response);
     if let Some(h) = notices(&heard) {
         r.headers_mut().insert("x-pondra-notices", h);
@@ -970,8 +972,8 @@ async fn sql_as(app: App, p: SqlParams, role: axum::Extension<crate::auth::Role>
         let mut hwm = app.lake.hwm.subscribe();
         let _ = tokio::time::timeout(Duration::from_secs(30), async { while app.lake.visible() < seg { hwm.changed().await.ok()?; } Some(()) }).await;
     }
-    if let ([one], true, true, true) = (&crate::routines::split(&req.sql)[..], req.params.is_empty(), req.tables.is_empty(), req.views.is_empty()) {
-        let one = crate::routines::expand(&app.lake, one).await?;
+    if let ([one], true, true, true, None) = (&crate::routines::split(&req.sql)[..], req.params.is_empty(), req.tables.is_empty(), req.views.is_empty(), crate::vars::change(&req.sql)) {
+        let one = crate::routines::expand(&app.lake, &crate::vars::bound(one)?).await?; // (`$name`: the session's variables)
         if !crate::write::checkpoint(&one) && !crate::routines::runs_procedure(&one) && crate::write::parse(&one).is_none() && crate::txn::control(&one).is_none() && !crate::txn::open() && !crate::settings::is(&one) {
             return Ok(crate::audit::statement(&app, &one, query(&app, &p, &one, who.files)).await?);
         }
@@ -1019,7 +1021,7 @@ async fn query(app: &App, p: &SqlParams, query: &str, files: bool) -> anyhow::Re
     // Same query, same catalog version: same answer (unless it asks for the time or randomness,
     // or may read a file on this machine).
     let q = query.to_lowercase();
-    let volatile = files || limited || !crate::ext::names(query).is_empty() || ["now()", "random(", "current_", "uuid(", "explain", "pondra.runs", "pondra.tasks", "pondra.audit", "files("].iter().any(|f| q.contains(f)) // (files outside the lake change on their own; `files()` lists objects put since)
+    let volatile = files || limited || !crate::ext::names(query).is_empty() || ["now()", "random(", "current_", "uuid(", "explain", "pondra.runs", "pondra.tasks", "pondra.audit", "pondra.variables", "files("].iter().any(|f| q.contains(f)) // (files outside the lake change on their own; `files()` lists objects put since)
         || crate::temp::mentioned(query) // (the session's temporary tables change without a commit)
         || crate::settings::any() // (and its settings may change the answer)
         || crate::routines::volatile(&app.lake, query).await; // (a Python function may answer differently each time)

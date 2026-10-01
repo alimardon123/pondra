@@ -42,6 +42,43 @@ CALL run('etl/orders.sql', day => DATE '2026-09-29', region => 'west', amount =>
 - **The statements run in order**, and a failure stops the file: its error names the statement.
 - **The path** is under the lake's files, with or without `files/`.
 
+## Parameters declared
+
+A `DECLARE` says what a parameter is: its type, its default, and, in the comment above it, what it
+means. A run's value takes the default's place, cast to the type; a parameter with no default must
+be given. Tools and people read them with `pondra.parameters`:
+
+```bash
+curl -s -X PUT http://localhost:8080/files/etl/by_region.sql --data-binary @- <<'EOF'
+-- The day to load
+DECLARE $day DATE = current_date - 1;
+-- Where the orders come from
+DECLARE $region VARCHAR;
+SELECT count(*) AS n FROM orders WHERE day = $day AND region = $region;
+EOF
+```
+
+```sql
+SELECT name, type, "default", required, description FROM pondra.parameters('etl/by_region.sql');
+```
+
+```text
+ name   | type    | default          | required | description
+--------+---------+------------------+----------+---------------------------
+ day    | DATE    | current_date - 1 | false    | The day to load
+ region | VARCHAR |                  | true     | Where the orders come from
+```
+
+```sql
+CALL run('etl/by_region.sql', region => 'west');
+CALL run('etl/by_region.sql', region => 'west', day => '2026-09-29');
+```
+
+- **A `$name` used and never set** is a parameter too, required, with no type.
+- **The run's variables are its own:** a `DECLARE` in a file doesn't change the caller's `$day`,
+  and `$day = $day + 1` in it changes only the run's ([variables](/pondra/reference/sql/#variables)).
+- **In Python** (a `.py` file, a notebook's cells), `pondra.vars.day` is the same value.
+
 ## Python files and notebooks
 
 A `.py` file gets its parameters as variables. What it prints comes back as notices (psql shows

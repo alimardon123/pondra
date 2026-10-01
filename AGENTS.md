@@ -50,7 +50,8 @@ The owner's design principles, which every change must respect:
 
 ```
 src/      28,600 lines of Rust, one file per concern (see the table in README.md); round 25 added
-          live.rs (live queries) and temp.rs (a session's temporary tables and views); round 26
+          live.rs (live queries) and temp.rs (a session's temporary tables and views); round 31 vars.rs
+          (SQL variables and a file's declared parameters, ADR-037); round 26
           pg_catalog.rs (Postgres's catalog, for dbt and BI tools), dbserver.rs (`pondra serve
           --lakes`: a folder of lakes as databases), defaults.rs (NOT NULL and DEFAULT), ext.rs
           (files read by name: `read_*`, `CREATE EXTERNAL TABLE`) and console.rs + console/ (the
@@ -1259,6 +1260,16 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    them as empty chunks. The website's `guides/clusters.mdx` (a node killed and restarted, then
    asked for that table) failed one run in three under load without it; `cluster.py failover`.
 
+198. **A variable's value is bound, never pasted, and lives where its statements do** (`vars.rs`,
+   ADR-037): `DECLARE $day DATE = …` and `$day = …` (DuckDB's `SET VARIABLE`, `RESET VARIABLE`,
+   `getvariable` the same) work their value out once, as the caller, cast to the declared type,
+   and every `$day` after is a literal in the syntax tree (`routines::bind`). A session holds its
+   variables (`temp::Session.variables`); a procedure and a file run hold their own (`vars::own`),
+   lent to their Python's connection (`auth::lend`); with no session a `DECLARE` is refused, never
+   kept where nothing reads it. A run's given values replace its `DECLARE`s' defaults, cast to
+   their types. `pondra.variables` and `pondra.parameters('file')` are never remembered answers
+   and run on their node. `harness.py variables`.
+
 ## Tests: run these before and after any change
 
 ```bash
@@ -1269,6 +1280,7 @@ python3 tools/harness.py safety         # panics answered as errors, TLS at ever
 python3 tools/fuzz_doors.py --secs 60   # malformed input at HTTP, SQL, Postgres, Kafka and Flight: the node stays up
 python3 tools/harness.py versions       # every file keeps its versions: listed, read, restored, after a delete, retention, old notebooks
 python3 tools/harness.py stopped        # a run whose node was killed under it: stopped, not running for good
+python3 tools/harness.py variables      # DECLARE $x, $x = …, SET VARIABLE, getvariable: sessions, Postgres, procedures, file runs, db.vars, pondra.parameters
 python3 tools/harness.py sparksql       # spark.sql / spark_sql('…') in Spark's grammar: literals, LATERAL VIEW, Spark's floor and substring, frames on top, refusals
 python3 tools/harness.py flows          # views of views in one commit, rollups, expectations (keep, drop, fail), changes down the flow
 python3 tools/harness.py begin          # BEGIN … COMMIT from every door, read-your-writes, 40001 and retries, 25P02, SQLSTATEs
