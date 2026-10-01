@@ -712,7 +712,7 @@ function core() {
   register.renderer({ id: 'rows', order: 20, match: r => r.kind === 'rows', render: (r, cell) => grid(r, { footer: !!cell, name: S.doc?.name, explore: i => explore(r, i, cell),
     // (a cell's: Chart, and a SQL cell's Plan, as a SQL file's pane has them; the one open, and the chart's settings, kept with the notebook)
     chart: cell?.chartKeep, view: cell?.view, onview: v => { cell.view = v; cell.nb.changed(); },
-    views: cell?.kind === 'sql' ? [['plan', 'plan', 'Plan', 'Its plan: its steps as a graph, and a profile of the time each took', () => import('./plan.js').then(m => m.planView(lastStatement(r.src || cell.src)))]] : [] }) });
+    views: cell?.kind === 'sql' ? [['plan', 'Plan', 'plan', () => import('./plan.js').then(m => m.planView(lastStatement(r.src || cell.src)))]] : [] }) });
   register.renderer({ id: 'figures', order: 30, match: r => r.kind === 'done' && Array.isArray(r.value?.images), render: r => h('div', { class: 'figs' }, r.value.images.map(b => h('img', { class: 'fig', alt: 'a figure the code drew', src: 'data:image/png;base64,' + b }))) });
   register.renderer({ id: 'text', order: 40, match: r => r.kind === 'text', render: r => said(r.text) });
   register.renderer({ id: 'done', order: 90, match: r => r.kind === 'done', render: r => { const d = doneText(r.value) || (r.notices?.length ? '' : 'Done.'); return d && !(d === 'Done.' && r.notices?.length) ? h('div', { class: 'done' }, d) : null; } });

@@ -156,7 +156,7 @@ showing the `CREATE … AS` it runs; **Open in a new tab** gives you that SQL to
   least and greatest value, and a histogram or its commonest values, from the rows shown; **Profile
   every row** runs it over the whole answer when there are more pages. (Two words, two things: a
   *data* profile is about the rows, a *query* profile about the time the query took.)
-- **Copy** (at the right of the results' bar) copies the rows, or the selection, tab-separated with
+- **Copy** (at the right of the tabs) copies the rows, or the selection, tab-separated with
   the headers; its **▾** has the other forms: without the headers, CSV, JSON, a Markdown table, SQL
   `VALUES` rows, a SQL list for `IN (…)`, or the columns' names. **Download** runs the statement
   again on the node and saves every row, not only the ones shown: CSV, TSV, JSON, JSON lines,
@@ -240,11 +240,13 @@ Every answer (a cell's, a SQL file's) and every data file is shown in the same g
   click it to change the last one, its **✕** clears them all. Each column has one filter, and they
   all apply.
 - **Sorting:** the small arrow in a header sorts by it (again: the other way).
-- **Pages:** an answer of more than 10,000 rows comes a page at a time. Below it, `10,001–20,000 of
-  200,000` says which rows show, and **‹ 1 2 3 … 20 ›** turns the pages (**…** asks for a page;
-  **Alt+Page Down** and **Alt+Page Up** in the grid). **10,000 a page ▾** changes how many (100 to
-  50,000), for this answer and those after it; so does **Settings → Editor and results → Rows a
-  page**. The node keeps the answer a while
+- **The line under it** (a SQL file's answer and a cell's alike) says how many rows there are and
+  how long they took (`200,000 rows · 28 ms`), the filters, and the selection's sum and average.
+- **Pages:** an answer of more than 10,000 rows comes a page at a time. At the right of the line
+  under it, `10,001–20,000 ▾` says which rows show, and **‹ ›** turn the pages (**Alt+Page Down**
+  and **Alt+Page Up** in the grid). Its **▾** goes to a page, the first or the last, and sets the
+  rows a page (100 to 50,000), for this answer and those after it; so does **Settings → Editor and
+  results → Rows a page**. The node keeps the answer a while
   (`PONDRA_PAGES_MB`, 256 MB in all, for 20 minutes after it was last read), so a page is the same
   rows, in the same order, without running the query again; after that, turning a page runs it again
   for that page. Sorting and filtering are of the page shown.
@@ -270,13 +272,13 @@ ORDER BY total DESC;
 - A statement that changes something (`INSERT`, `CREATE TABLE`) shows what it did, such as
   `rows 3`, and the tables on the left update.
 - Errors come back in plain words, such as `No field named nope. Did you mean 'sales.item'?`.
-- An answer of more than 10,000 rows comes a page at a time (**‹ 1 2 3 ›** below it, as in a SQL
-  file). **Copy ▾** copies the rows shown in any of the forms a SQL file offers, and **Download ▾**
-  saves them as CSV, TSV or JSON; a cell that is one query can also download every row (it runs
-  again on the node).
-- **Chart**, **Data profile** and **Plan** below the answer are a SQL file's: a chart of the rows,
-  each column summarized, and the plan as a graph with its **Query profile**. The one open, and the
-  chart's settings, are kept with the notebook, so it opens with its chart.
+- An answer looks as a SQL file's does: **Results**, **Chart**, **Data profile** and **Plan** as
+  tabs above it (a chart of the rows, each column summarized, and the plan as a graph with its
+  **Query profile**), **Copy ▾** and **Download ▾** at their right, and the line under it with the
+  rows, the time and the pages. The tab open, and the chart's settings, are kept with the notebook,
+  so it opens with its chart. **Copy ▾** copies the rows shown in any of the forms a SQL file
+  offers, and **Download ▾** saves them as CSV, TSV or JSON; a cell that is one query can also
+  download every row (it runs again on the node).
 - Decimals keep their digits (`1.50`), and integers too big for JavaScript arrive as text, so what
   you see is exactly what the lake holds.
 

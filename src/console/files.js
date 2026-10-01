@@ -297,10 +297,10 @@ export class SqlDoc extends TextDoc {
   draw() {
     const r = this.result, tab = (id, label, ic) => h('button', { class: 'ptab' + (this.tab === id ? ' on' : ''), role: 'tab', 'aria-label': label, 'aria-selected': String(this.tab === id), onclick: () => { this.tab = id; this.draw(); } }, ic ? icon(ic) : null, h('span', { class: 'tl' }, label));
     this.tabs.replaceChildren(tab('results', 'Results'), tab('messages', 'Messages'), tab('chart', 'Chart', 'chart'), tab('profile', 'Data profile', 'columns'), tab('plan', 'Plan', 'plan'));
-    const sum = h('span', { class: 'sum' }), name = this.title.replace(/\.sql$/i, ''), rowsOk = r?.kind === 'rows';
+    const name = this.title.replace(/\.sql$/i, ''), rowsOk = r?.kind === 'rows';
     const text = (f, headers) => this.gridEl?.grid ? this.gridEl.grid.text(f, headers) : '';
-    fill(this.info, sum, rowsOk ? h('span', { class: 'n' }, r.total > r.rows.length && !r.pages && !r.sql ? `${count(r.rows.length)} of ${count(r.total)} rows` : `${count(r.total)} row${r.total === 1 ? '' : 's'}`) : null,
-      r ? h('span', { class: 'bar-sep' }, '|') : null, r ? h('span', { class: 'n t' }, secs(r.ms)) : null, h('span', { class: 'sep' }),
+    // (how many rows and how long: on the line under the rows, as a cell's answer has it)
+    fill(this.info, r && !rowsOk ? h('span', { class: 'n t' }, secs(r.ms)) : null,
       split('copy', 'Copy the rows (or the selection), tab-separated, with the headers', () => rowsOk && copyText(text('tsv', true), 'Copied, with the headers'),
         () => [{ head: 'Copy the rows (or the selection)' }, ...COPIES.map(([f, label, headers]) => ({ label, run: () => rowsOk && copyText(text(f, headers), 'Copied') }))], !rowsOk),
       split('down', 'Download the rows as CSV (all of them: the statement runs again on the node)', () => rowsOk && fetchRows(r, 'csv', name),
@@ -314,7 +314,7 @@ export class SqlDoc extends TextDoc {
           onclick: () => { this.result = x; this.draw(); this.point(x); } }, h('b', {}, String(k + 1)), h('span', { class: 'q' }, oneLine(x.sql, 40)), h('span', { class: 'm' }, x.kind === 'rows' ? `${count(x.total)} row${x.total === 1 ? '' : 's'}` : x.kind === 'error' ? 'failed' : 'done'))),
         this.running ? h('span', { class: 'stmt wait pulse' }, h('b', {}, String(this.results.length + 1)), `of ${this.todo}…`)
           : this.results.length < this.todo ? h('span', { class: 'stmts-left' }, `${this.todo - this.results.length} after it not run`) : null) : null;
-      if (r.kind === 'rows') { this.gridEl = grid(r, { fill: true, name, onsum: t => { sum.textContent = t; }, explore: i => R.helpers.explore(r, i) }); fill(this.body, strip, this.gridEl); }
+      if (r.kind === 'rows') { this.gridEl = grid(r, { fill: true, name, explore: i => R.helpers.explore(r, i) }); fill(this.body, strip, this.gridEl); }
       else fill(this.body, strip, ...answer(r));
     } else if (this.tab === 'messages') {
       const all = this.results?.length ? this.results : [r];

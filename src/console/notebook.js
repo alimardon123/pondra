@@ -87,7 +87,8 @@ export class Cell {
   setKind(k, quiet) {
     const was = this.kind;
     this.kind = R.kinds.has(k) ? k : 'sql'; k = this.kind;
-    if (!quiet && was !== k && this.src.trim()) this.ed.value = convert(this.src, was, k); // (SQL and Python cells: one written as the other) this.el.dataset.kind = k; this.kindSel.replaceChildren(this.type.label, icon('chevd', 'ic', 12));
+    if (!quiet && was !== k && this.src.trim()) this.ed.value = convert(this.src, was, k); // (SQL and Python cells: one written as the other)
+    this.el.dataset.kind = k; this.kindSel.replaceChildren(this.type.label, icon('chevd', 'ic', 12));
     this.liveEl.hidden = !this.type.live;
     if (!this.type.live) { this.stopLive(); this.liveBox.checked = false; }
     this.ta.placeholder = this.type.placeholder || '';
@@ -156,7 +157,7 @@ export class Cell {
     this.out.replaceChildren(...answer(r, this));
     if (saved) this.out.append(h('div', { class: 'meta' }, h('span', { class: 'badge', title: 'As it was when the notebook was saved: run the cell for the answer now' }, 'saved')));
     this.status.className = 'st' + (r.kind === 'error' ? ' bad' : '');
-    this.status.textContent = saved ? '' : r.kind === 'error' ? `failed · ${secs(r.ms)}` : secs(r.ms);
+    this.status.textContent = saved || r.kind === 'rows' ? '' : r.kind === 'error' ? `failed · ${secs(r.ms)}` : secs(r.ms); // (rows: their count and time under them)
   }
   setLive(on) {
     this.liveBox.checked = on;

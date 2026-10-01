@@ -557,3 +557,25 @@ that, and keep it easy to change later. Built in round 29; *decided by Claude wh
   (`more.css`) load when first used: the first load is 71,262 bytes gzipped of the budget's 71,680
   (70 KB), the tree's menus 6.7 KB. The next thing added to the first load has to move something out
   first: sign-in, round 29's second part, goes in a module of its own.
+
+### One layout for an answer (round 29, 2026-10-02)
+
+The owner, on the third list's pager and a cell's answer: the numbered pages still looked busy, a
+cell's footer crowded, and a SQL file's answer and a cell's laid out differently. Now one answer
+looks the same in both:
+
+- **above** it, its views as tabs (Results, Chart, Data profile, Plan; a SQL file's pane adds
+  Messages), and Copy ▾ and Download ▾ at their right (a file's pane also its layout button);
+- **under** it, one quiet line: `200,000 rows · 28 ms`, the filters, the selection's sum, and at the
+  right `1–500 ▾ ‹ ›`. The numbered pages are gone: **‹ ›** turn them (Alt+Page Up and Down), and the
+  ▾ goes to a page, the first or the last, and sets the rows a page, as Gmail's and DataGrip's do.
+- A cell's views are tabs as a file's are, one at a time in the cell, rather than opening under the
+  rows; the one open is kept with the notebook as before. A cell's own bar keeps its time for what
+  isn't rows (rows: the line under them).
+
+*(Decided by Claude:)* the grid draws the line under it for every answer (`gfoot`), so the two can't
+drift apart again; a data file keeps its own footer (Add row, Add column). Found while doing it: a
+comment put in the middle of a line in round 29's third list had hidden the code after it (a cell's
+kind changed, its label and colour didn't); `console_check.py` now looks for code after a `//`
+comment in the middle of a line. The first load is 70,924 bytes gzipped (of 71,680): one footer is
+less code than two.

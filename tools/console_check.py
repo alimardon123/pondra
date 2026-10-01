@@ -230,7 +230,7 @@ def node_checks(browser, port, show):
     card = until(lambda: p.locator(".hcard").is_visible() and "BIGINT" in p.locator(".hcard").inner_text(), True)
     p.mouse.move(5, 5)
     checks["a SQL cell shows the rows, each column's type a mark and its card on hover; timestamps and decimals as written"] = heads == ["id", "name", "born", "at", "amt"] \
-        and rows[0] == ["1", "Ann", "1990-01-02", "2024-01-01 10:00:00", "1.50"] and rows[1][2] == "NULL" and c.locator(".n-rows").inner_text() == "3 rows" \
+        and rows[0] == ["1", "Ann", "1990-01-02", "2024-01-01 10:00:00", "1.50"] and rows[1][2] == "NULL" and c.locator(".n-rows").inner_text().startswith("3 rows · ") \
         and [m.get_attribute("class") for m in c.locator("thead .ty-i").all()] == ["ty-i k-num", "ty-i k-text", "ty-i k-date", "ty-i k-time", "ty-i k-dec"] and card is True
     tree.locator(".row", has_text="orders").dblclick()  # (a table's first rows, in a new cell)
     peek = until(lambda: pg.grid(pg.cell(1))[1], [["1", "10.5"]])
@@ -888,14 +888,17 @@ def grid_checks(browser, port, show):
     p.keyboard.press("b")
     big = pg.run(1, "SELECT value AS n FROM range(0, 25000)")
     rng = lambda: big.locator(".pg-r").inner_text()
-    first = (rng(), [r[0] for r in pg.grid(big)[1][:1]])
-    big.locator(".pager .pg", has_text="3").click()
-    third = until(lambda: (rng(), pg.grid(big)[1][0][0]), ("20,001–25,000 of 25,000", "20000"))
+    first = (rng(), [r[0] for r in pg.grid(big)[1][:1]], big.locator(".n-rows").inner_text().split(" · ")[0])
+    big.locator(".pg-r").click()
+    p.locator("#menu button", has_text="The last page").click()
+    third = until(lambda: (rng(), pg.grid(big)[1][0][0]), ("20,001–25,000", "20000"))
     big.locator(".gt tbody td[data-c]").first.click()
     p.keyboard.press("Alt+PageUp")
-    second = until(lambda: (rng(), pg.grid(big)[1][0][0]), ("10,001–20,000 of 25,000", "10000"))
-    checks["an answer of more than 10,000 rows turns its pages (‹ 1 2 3 ›, Alt+Page Up): the node's rows, numbered on"] = \
-        first == ("1–10,000 of 25,000", ["0"]) and third == ("20,001–25,000 of 25,000", "20000") and second == ("10,001–20,000 of 25,000", "10000")
+    second = until(lambda: (rng(), pg.grid(big)[1][0][0]), ("10,001–20,000", "10000"))
+    big.locator(".pages .pg.back").click()
+    back = until(lambda: (rng(), big.locator(".pages .pg.back").is_disabled()), ("1–10,000", True))
+    checks["an answer of more than 10,000 rows turns its pages (1–10,000 ▾ ‹ ›, the last page, Alt+Page Up): the node's rows, numbered on"] = \
+        first == ("1–10,000", ["0"], "25,000 rows") and third == ("20,001–25,000", "20000") and second == ("10,001–20,000", "10000") and back == ("1–10,000", True)
     checks["grid: no page errors"] = pg.errors == []
     info = {"one": one, "edges": edges, "total": total, "copied": copied, "headed": headed, "moved": moved, "kept": kept, "pages": [first, third, second], "errors": pg.errors}
     pg.ctx.close()
@@ -977,10 +980,10 @@ def work_checks(browser, port, show):
 
     # A SQL cell's Chart and Plan, as a SQL file's pane has them; the chart open is kept with the notebook
     c = pg.run(1, "SELECT region, sum(amount) AS total FROM wk GROUP BY region ORDER BY region")
-    c.locator(".meta button.view", has_text="Plan").click()
+    c.locator(".abar .ptab", has_text="Plan").click()
     plan = until(lambda: c.locator(".pgraph .pn").count() > 1, True, 10)
-    c.locator(".meta button.view", has_text="Chart").click()
-    chart = until(lambda: c.locator(".chart svg").count() > 0 and c.locator(".meta button.view.on").all_inner_texts() == ["Chart"], True, 10)
+    c.locator(".abar .ptab", has_text="Chart").click()
+    chart = until(lambda: c.locator(".chart svg").count() > 0 and c.locator(".abar .ptab.on").all_inner_texts() == ["Chart"], True, 10)
     p.fill("#nbname", "wkbook")
     p.press("#nbname", "Enter")
     p.keyboard.press("Control+s")
@@ -991,13 +994,13 @@ def work_checks(browser, port, show):
     meta = (got.get("cells") or [{}, {}])[1].get("metadata", {})
     other = Page(browser, base + "/#notebook=wkbook")
     oc = other.cell(1)
-    again = until(lambda: oc.locator(".chart svg").count() > 0 and oc.locator(".meta button.view.on").all_inner_texts() == ["Chart"], True, 15)
+    again = until(lambda: oc.locator(".chart svg").count() > 0 and oc.locator(".abar .ptab.on").all_inner_texts() == ["Chart"], True, 15)
     other.ctx.close()
     checks["a SQL cell's answer has Chart and Plan (its graph), as a SQL file's pane; the chart open, and its settings, are kept with the notebook"] = \
         plan is True and chart is True and meta.get("pondra", {}).get("view") == "chart" and meta["pondra"].get("chart", {}).get("x") == "region" and again is True
 
     # The owner's third list: a cell's Data profile; SQL <-> Python; the editor's right-click; Create as; the tree's menus; rows a page
-    c.locator(".meta button.view", has_text="Data profile").click()
+    c.locator(".abar .ptab", has_text="Data profile").click()
     profiled = until(lambda: c.locator(".dprof .dp-row").count(), 2, 10)
     ta = c.locator("textarea")
     ta.click(button="right")
@@ -1031,16 +1034,16 @@ def work_checks(browser, port, show):
     pg.setting("Editor and results", "Rows a page").locator("select").select_option("100")
     p.keyboard.press("Escape")
     ta.press("Control+Enter")
-    bar = lambda: p.locator(".filedoc:visible .pgbar").inner_text().replace("\n", " ") if p.locator(".filedoc:visible .pgbar").count() else ""
-    until(lambda: "of 250" in bar(), True, 15)
+    bar = lambda: p.locator(".filedoc:visible .gfoot").inner_text().replace("\n", " ") if p.locator(".filedoc:visible .gfoot").count() else ""
+    until(lambda: "250 rows" in bar() and "1–100" in bar(), True, 15)
     paged = bar()
     tabs_now = p.locator(".filedoc:visible .ptab").all_inner_texts()
     kept_rows = p.evaluate("JSON.parse(localStorage.getItem('pondra.prefs') || '{}').pageRows")
-    p.locator(".filedoc:visible .pgbar .pg-n").click()
+    p.locator(".filedoc:visible .pg-r").click()
     p.locator("#menu button", has_text="10,000").first.click()  # (back as it was: the parts after this one see 10,000 a page)
-    checks["a SQL file's right-click has Run file, Format, Create as (a view made), Run as a job, Schedule, Save as; 100 rows a page (Settings; the pager's ▾ changes it too); a Data profile tab"] = \
+    checks["a SQL file's right-click has Run file, Format, Create as (a view made), Run as a job, Schedule, Save as; 100 rows a page (Settings; the pager's 1–100 ▾ changes it too); a Data profile tab"] = \
         {"Run file", "Format file", "Create as table or view…", "Run as a job", "Schedule…", "Save as…"} <= set(ed_items) and made == [{"kind": "view"}] \
-        and "1–100 of 250" in paged and "100 a page" in paged and kept_rows == 100 and any("Data profile" in x for x in tabs_now)
+        and "250 rows" in paged and "1–100" in paged and kept_rows == 100 and any("Data profile" in x for x in tabs_now)
     tree = p.locator("#data")
     pub = tree.locator(".row[data-kind=schema]", has_text="public").first
     if pub.get_attribute("aria-expanded") == "false":
@@ -1220,6 +1223,14 @@ def layout_checks(browser, port, show):
     return checks, info
 
 
+def swallowed():
+    """Lines whose code a `//` comment put in the middle of them hides (the node strips such comments):
+    `x(); // (why) this.y = 1;` — what follows the comment never runs."""
+    here = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src", "console")
+    pat = re.compile(r" // [^\n]*\)[ ;]+(this\.|const |let |if \(|return |[a-zA-Z_.]+\()")
+    return [f"{f}:{i + 1}" for f in sorted(os.listdir(here)) if f.endswith(".js") for i, line in enumerate(open(os.path.join(here, f), encoding="utf-8")) if pat.search(line)]
+
+
 def budget_checks(browser, port, show):
     """ADR-034 §7: what the page costs — bytes, first paint, typing, scrolling."""
     checks = {}
@@ -1279,6 +1290,8 @@ def budget_checks(browser, port, show):
     frames.sort()
     p95 = frames[int(len(frames) * 0.95)] if frames else 1e9
     checks["scrolling 10,000 rows: p95 frame < 20 ms"] = p95 < 20
+    hidden = swallowed()
+    checks["no code hidden after a // comment in the middle of a line (the node strips them)"] = hidden == []
     checks["budget: no page errors"] = pg.errors == []
     info = {"gzipped": sizes, "total": total, "later": later, "fresh": fresh, "first paint ms": paints, "typing ms": round(typing, 2), "keys": [round(k, 2) for k in keys[:40]], "scroll p95 ms": round(p95, 2),
             "errors": pg.errors}

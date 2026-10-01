@@ -1,7 +1,7 @@
 // The result grid (ADR-034): query answers, notebook outputs and data files. It draws only the
 // rows in sight; a cell, a range, a row or a column can be selected and copied (tab-separated,
 // so a spreadsheet takes it as cells); a data file's cells are edited in place.
-import { h, icon, svg, count, numeric, sqlType, typeKind, typeMark, menu, toast, saveAs, quote, ident, pop, call, run, prompt, S, R } from './core.js';
+import { h, icon, svg, count, secs, fill, numeric, sqlType, typeKind, typeMark, menu, toast, saveAs, quote, ident, pop, call, run, prompt, S, R } from './core.js';
 
 const ROW_H = 30; // the height of a row when only the rows in sight are drawn
 let measurer;
@@ -405,19 +405,26 @@ export function grid(r, o = {}) {
     el.style.top = (y - ht - 12 >= 8 ? y - ht - 12 : y + 22) + 'px';
   }
 
-  // its pages: which rows show (10,001–20,000 of 200,000), ‹ 1 … 4 5 6 … 20 ›, and how many a page
-  const shows = size ? h('span', { class: 'pg-r' }) : null, nav = size ? h('span', { class: 'pager', role: 'navigation', 'aria-label': 'Pages of rows' }) : null;
+  // its pages, at the right of the line under it: `1–500 ▾ ‹ ›` (▾: rows a page, go to a page, the first, the last)
   let pages = size ? Math.ceil(r.total / size) : 1;
+  const rows1 = size ? h('button', { class: 'pg-r', 'aria-haspopup': 'menu', title: 'Rows a page, and other pages', onclick: e => pageMenu(e.currentTarget) }) : null;
+  const step = (d, label, key) => h('button', { class: 'icon pg' + (d < 0 ? ' back' : ''), title: `${label} (Alt ${key})`, 'aria-label': label, onclick: () => turn(Math.floor(from / size) + d), html: svg('chev', 14, 2) });
+  const prev = size && step(-1, 'The page before', 'Page Up'), next = size && step(1, 'The next page', 'Page Down');
+  const pager = size ? h('span', { class: 'pages', role: 'navigation', 'aria-label': 'Pages of rows' }, rows1, prev, next) : null;
   function drawPager() {
-    if (!nav) return;
-    const p = Math.floor(from / size), shown = [...new Set([0, p - 1, p, p + 1, pages - 1])].filter(i => i >= 0 && i < pages).sort((a, b) => a - b);
-    const go = (i, label, aria) => h('button', { class: 'pg' + (i === p && !aria ? ' on' : '') + (aria ? ' step' : ''), disabled: i < 0 || i >= pages || turning, 'aria-current': i === p && !aria ? 'page' : null, 'aria-label': aria || `Page ${i + 1}`,
-      title: aria ? `${aria} (Alt ${i < p ? 'Page Up' : 'Page Down'})` : null, onclick: () => turn(i), html: aria ? svg('chev', 14, 2) : null }, aria ? null : label);
+    if (!pager) return;
+    const p = Math.floor(from / size);
+    fill(rows1, `${count(from + 1)}–${count(from + all.length)}`, icon('chevd', 'ic', 11));
+    rows1.title = `Page ${count(p + 1)} of ${count(pages)}: rows a page, other pages`;
+    prev.disabled = p <= 0 || turning; next.disabled = p >= pages - 1 || turning;
+    pager.classList.toggle('busy', turning);
+  }
+  function pageMenu(at) {
+    const p = Math.floor(from / size);
     const ask = async () => { const v = +(await prompt('Go to a page', `A page from 1 to ${count(pages)}`, String(p + 1))); if (v) turn(Math.min(pages, Math.max(1, Math.round(v))) - 1); };
-    shows.textContent = `${count(from + 1)}–${count(from + all.length)} of ${count(r.total)}`;
-    nav.classList.toggle('busy', turning);
-    nav.replaceChildren(go(p - 1, '', 'The page before'), ...shown.flatMap((i, k) => [k && i - shown[k - 1] > 1 ? h('button', { class: 'pg gap', title: 'Go to a page…', 'aria-label': 'Go to a page', onclick: ask }, '…') : null, go(i, count(i + 1))]).filter(Boolean),
-      go(p + 1, '', 'The next page'));
+    const per = n => { R.helpers.prefs?.('pageRows', n); S.pageRows = n; const first = from; size = r.page = n; pages = Math.ceil(r.total / n); turn(Math.floor(first / n), true); };
+    menu(at, [{ head: `Page ${count(p + 1)} of ${count(pages)}` }, { label: 'Go to a page…', run: ask }, { label: 'The first page', disabled: p === 0, run: () => turn(0) },
+      { label: 'The last page', disabled: p === pages - 1, run: () => turn(pages - 1) }, { head: 'Rows a page' }, ...PER_PAGE.map(n => ({ label: count(n), checked: n === size, run: () => per(n) }))]);
   }
   /** Show page `p`: its rows in place of these (sorted and filtered as these were). */
   async function turn(p, again) {
@@ -432,38 +439,40 @@ export function grid(r, o = {}) {
     } catch (e) { toast(e.message, true); }
     turning = false; drawPager();
   }
-  /** Rows a page: this answer's, from the page that holds the first row shown; and the console's from now on. */
-  const per = () => h('button', { class: 'pg-n', title: 'Rows a page (Settings, Editor and results)', 'aria-haspopup': 'menu', onclick: e => { const b = e.currentTarget; menu(b, [{ head: 'Rows a page' },
-    ...PER_PAGE.map(n => ({ label: count(n), checked: n === size, run: () => { R.helpers.prefs?.('pageRows', n); S.pageRows = n; const first = from; size = r.page = n; pages = Math.ceil(r.total / n); b.firstChild.textContent = `${count(n)} a page`; turn(Math.floor(first / n), true); } }))]); } }, `${count(size)} a page`, icon('chevd', 'ic', 11));
   drawPager();
 
-  // the footer: rows, the selection's sum, and the answer's buttons (a notebook's)
-  const sumBox = o.onsum ? null : h('span', { class: 'sum' });
-  const n = size ? shows : r.total > all.length ? `${count(all.length)} of ${count(r.total)} rows here` : `${count(r.total ?? all.length)} row${(r.total ?? all.length) === 1 ? '' : 's'}`;
-  const wrap = h('div', { class: 'gridwrap' + (o.fill ? ' fill' : '') }, box);
+  // the line under it, the same for a SQL file's answer and a cell's: how many rows and how long, the
+  // filters, the selection's sum; the pages at the right
+  const sumBox = o.onsum ? null : h('span', { class: 'sum' }), total = r.total ?? all.length;
+  const what = `${count(total)} row${total === 1 ? '' : 's'}${!size && r.total > all.length ? ` (${count(all.length)} here)` : ''}${r.ms != null ? ' · ' + secs(r.ms) : ''}`;
+  const foot = h('div', { class: 'gfoot' + (o.onsum ? ' own' : '') }, o.onsum ? null : h('span', { class: 'n-rows' }, what), chip, sumBox, more, h('span', { class: 'grow' }), pager); // (own: a data file's, its count and sum in its own footer)
+  const wrap = h('div', { class: 'gridwrap' + (o.fill ? ' fill' : '') });
   if (o.footer) {
-    // (views of it under it, one at a time: Chart, Data profile, and those given (a notebook's SQL: its Plan))
-    const views = [['chart', 'chart', 'Chart', 'A chart of these rows', () => import('./chart.js').then(m => m.chartView(r, o.name, o.chart))],
-      ['profile', 'columns', 'Data profile', 'Each column: its NULLs, distinct values, range and spread', () => import('./details.js').then(m => m.dataProfile(r))], ...o.views || []];
-    const below = h('div', { class: 'chartbox', hidden: true }), vbtn = {};
-    let open = null;
-    const openView = (id, quiet) => {
-      open = open === id ? null : id; below.hidden = !open; below.replaceChildren();
-      for (const [k, el] of Object.entries(vbtn)) { el.classList.toggle('on', k === open); el.setAttribute('aria-pressed', String(k === open)); }
-      if (!quiet) o.onview?.(open);
+    // (a cell's answer: its views as a SQL file's pane has them, tabs above it, one at a time: the rows,
+    // Chart, Data profile, and those given (a SQL cell's Plan); Copy and Download at the right)
+    const views = [['results', 'Results'], ['chart', 'Chart', 'chart', () => import('./chart.js').then(m => m.chartView(r, o.name, o.chart))],
+      ['profile', 'Data profile', 'columns', () => import('./details.js').then(m => m.dataProfile(r))], ...o.views || []];
+    const tabs = h('div', { class: 'ptabs', role: 'tablist' }), body = h('div', { class: 'aview' });
+    let open = 'results';
+    const show = (id, quiet) => {
+      open = views.some(v => v[0] === id) ? id : 'results';
+      tabs.replaceChildren(...views.map(([k, label, ic]) => h('button', { class: 'ptab' + (k === open ? ' on' : ''), role: 'tab', 'aria-selected': String(k === open), onclick: () => show(k) }, ic ? icon(ic) : null, label)));
+      if (pager) pager.hidden = open !== 'results';
+      if (!quiet) o.onview?.(open === 'results' ? null : open);
       const v = views.find(x => x[0] === open);
-      if (v) Promise.resolve(v[4]()).then(el => { if (open === v[0]) below.replaceChildren(el); });
+      if (!v[3]) return body.replaceChildren(box);
+      body.replaceChildren(h('div', { class: 'wait' }, 'Drawing…'));
+      Promise.resolve(v[3]()).then(el => { if (open === v[0]) body.replaceChildren(el); });
     };
-    wrap.append(h('div', { class: 'meta' }, h('span', { class: 'n-rows' }, n), chip, sumBox, more,
-      ...views.map(([id, ic, label, title]) => vbtn[id] = h('button', { class: 'btn small view', title, 'aria-pressed': 'false', onclick: () => openView(id) }, icon(ic), label)), h('span', { class: 'grow' }),
+    wrap.append(h('div', { class: 'abar' }, tabs, h('span', { class: 'grow' }),
       split('copy', 'Copy the rows (or the selection), tab-separated, with the headers', () => copyText(tsv(true), 'Copied, with the headers'),
         () => [{ head: 'Copy the rows (or the selection)' }, ...COPIES.map(([f, label, headers]) => ({ label, run: () => copyText(as(f, headers), 'Copied') }))]),
       split('down', 'Download the rows here as CSV', () => saveAs(toCsv(r), 'text/csv', `${o.name || 'rows'}.csv`), () => [{ head: 'The rows here' },
         { label: 'CSV', run: () => saveAs(toCsv(r), 'text/csv', `${o.name || 'rows'}.csv`) }, { label: 'TSV (tab-separated)', run: () => saveAs(toCsv(r, '\t'), 'text/tab-separated-values', `${o.name || 'rows'}.tsv`) },
         { label: 'JSON', run: () => saveAs(JSON.stringify(all.map(row => Object.fromEntries(cols.map((c, i) => [c.name, row[i]])))), 'application/json', `${o.name || 'rows'}.json`) },
-        ...r.sql ? [{ head: 'Every row (it runs again)' }, ...DOWNLOADS.map(([f, label]) => ({ label, run: () => fetchRows(r, f, o.name) }))] : []]), nav), below);
-    if (o.view && views.some(v => v[0] === o.view)) openView(o.view, true);
-  } else wrap.append(h('div', { class: 'fbar' }, chip, sumBox, more, size ? h('span', { class: 'pgbar' }, shows, nav, per()) : null));
+        ...r.sql ? [{ head: 'Every row (it runs again)' }, ...DOWNLOADS.map(([f, label]) => ({ label, run: () => fetchRows(r, f, o.name) }))] : []])), body, foot);
+    show(o.view, true);
+  } else wrap.append(box, foot);
   draw();
   wrap.grid = { refresh, select, sortBy, setFilter, setFilters, copy: tsv, text: as, box, count: () => view.length, selection: () => sel && { ...range(), row: view[sel.fr], col: sel.fc } };
   return wrap;
