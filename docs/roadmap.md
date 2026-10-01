@@ -460,6 +460,26 @@ the platform after.
 | J1 | The server's catalog (ADR-032 §9): databases anywhere by name, attachments, secrets, users and extensions for every database of a server | Users live above the databases (round 29 needs it); no listing per connection | M | Databases in two buckets served as one server; listing costs no request; a user made once reaches every database |
 | J2 ✓ | A workspace (ADR-033, built 2026-09-30): `.sql`, `.py` and notebooks as versioned files, edited in the console, run with parameters from every door (`CALL run(…)`), recorded in the run log, scheduled | ETL without another tool; SQL and Python calling each other | M–L | A SQL file and a Python file chained with parameters, from SQL, Python, JavaScript and the console; a schedule runs a notebook; the run log names each version |
 | J3 | Dashboards and reports: a notebook with parameters shown read-only | What a team shares | M | A report with inputs, refreshed by a schedule |
+| J4 | Connections, for ETL in code and on a canvas (the owner, 2026-10-01; proposed, an ADR first): a named, typed connection to a source or target system that holds its details and points to a secret for its credentials | A graphical or code ETL tool has to keep many systems' logins safely, and a pipeline should never hold a password | M | A pipeline in SQL, Python and the console reads and writes through one connection; nobody sees the password, not even an admin; one `ALTER SECRET` rotates it for every pipeline; every use is in `pondra.audit` |
+
+**J4 in brief (as proposed to the owner on 2026-10-01).** Secrets stay the one place for
+credentials. They already are sealed by the master key or a KMS command, never shown back, granted
+with `GRANT USAGE ON SECRET`, audited, and have a per-session temporary form (ADR-035). A
+connection adds the wiring, in the catalog, in plain sight:
+
+- `CREATE CONNECTION crm (TYPE postgres, HOST 'db.local', PORT 5432, DATABASE 'sales', SECRET crm_login)`:
+  the type, host, port, database and options are visible and editable (the console's form for a
+  connection shows them); the credentials are only named, by the secret.
+- A pipeline names the connection, never the secret or the password: `ATTACH CONNECTION crm`,
+  `read_table(crm, 'public.orders')`, `COPY … TO CONNECTION warehouse`, a canvas step's
+  "source: crm". The same object serves graphical and code ETL.
+- `GRANT USAGE ON CONNECTION crm TO etl` checks the secret's grant as well; `TEST CONNECTION crm`
+  reaches the system and says what failed; each use is a row in `pondra.audit`.
+- Rotation is one `ALTER SECRET crm_login …`; every connection and pipeline using it follows.
+- Later, a secret can be a pointer to an outside vault (AWS Secrets Manager, Azure Key Vault,
+  HashiCorp Vault, GCP Secret Manager), fetched when used and kept in memory a short while;
+  OAuth sources (Salesforce, Google) as a secret type whose refresh token the node renews.
+- It builds on G6 (databases attached), G7 (sinks) and the workspace (J2).
 
 ## The road to 1.0 (proposed 2026-09-30, after round 28)
 
