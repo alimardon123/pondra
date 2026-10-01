@@ -125,7 +125,11 @@ A parameter goes with the request, in JSON. The Python and JavaScript clients do
 
 A table of that name already there refuses `CREATE TABLE` (`42P07`, as in Postgres), whether it
 has the same columns or not; `IF NOT EXISTS` leaves it as it is, and `OR REPLACE` drops it and
-makes it anew.
+makes it anew. So does every kind of object: tables, views, materialized views, functions,
+procedures, macros, tasks, secrets, external tables and a session's temporary tables, views and
+secrets take both words (`OR REPLACE` and `IF NOT EXISTS` together are refused, as one contradicts
+the other). Schemas, databases, users and roles take `IF NOT EXISTS` only: replacing one would drop
+what it holds or the rights given to it.
 
 A table without a primary key is an append table. With a key, a new row replaces the old one with the
 same key. The options are on [table options](/pondra/reference/table-options/). An `ALTER TABLE`
@@ -299,10 +303,11 @@ DROP SCHEMA sales CASCADE;
 
 | Statement | Syntax |
 |---|---|
-| Stored view | `CREATE [OR REPLACE] VIEW v AS SELECT …`: a query run over the tables as they are when read |
-| Materialized view | `CREATE MATERIALIZED VIEW v [(CONSTRAINT c CHECK \| EXPECT (condition) [ON VIOLATION DROP ROW \| FAIL], …)] [WITH (option = value, …)] AS SELECT … FROM t …`: kept up to date as rows arrive; it may follow another materialized view ([Pipelines](/pondra/guides/pipelines/)) |
-| Temporary | `CREATE TEMP TABLE t AS SELECT …`, `CREATE TEMP VIEW v AS SELECT …`: a session's own |
+| Stored view | `CREATE [OR REPLACE] VIEW [IF NOT EXISTS] v AS SELECT …`: a query run over the tables as they are when read |
+| Materialized view | `CREATE [OR REPLACE] MATERIALIZED VIEW [IF NOT EXISTS] v [(CONSTRAINT c CHECK \| EXPECT (condition) [ON VIOLATION DROP ROW \| FAIL], …)] [WITH (option = value, …)] AS SELECT … FROM t …`: kept up to date as rows arrive; it may follow another materialized view ([Pipelines](/pondra/guides/pipelines/)) |
+| Temporary | `CREATE [OR REPLACE] TEMP TABLE [IF NOT EXISTS] t AS SELECT …`, `CREATE [OR REPLACE] TEMP VIEW [IF NOT EXISTS] v AS SELECT …`: a session's own |
 | Rename | `ALTER VIEW v RENAME TO w`: a stored view, not a materialized one |
+| Detach | `ALTER MATERIALIZED VIEW v DETACH`: its rows stop following and stay, as a table of that name (a `GROUP BY` view's a merge table, its rows combining as they are read). What follows it keeps following its table. A view that keeps windows is refused |
 | Drop | `DROP VIEW [IF EXISTS] v`, `DROP MATERIALIZED VIEW [IF EXISTS] v` |
 
 A materialized view is filled from the rows already in its table, then follows every new row. Its
@@ -334,16 +339,16 @@ DROP MATERIALIZED VIEW spend_by_item;
 
 | Statement | Syntax |
 |---|---|
-| SQL function | `CREATE [OR REPLACE] FUNCTION f(x type [DEFAULT v], …) RETURNS type RETURN expression` |
+| SQL function | `CREATE [OR REPLACE] FUNCTION [IF NOT EXISTS] f(x type [DEFAULT v], …) RETURNS type RETURN expression` |
 | Table function | `CREATE FUNCTION f(…) RETURNS TABLE (c type, …) LANGUAGE sql AS $$ SELECT … $$` |
 | Python function | `CREATE FUNCTION f(x type) RETURNS type LANGUAGE python [WITH (…)] AS $$ … $$` |
-| Macro | `CREATE [OR REPLACE] MACRO m(x) AS expression` (DuckDB's) |
-| Procedure | `CREATE [OR REPLACE] PROCEDURE p(x type [DEFAULT v], …) LANGUAGE sql \| python AS $$ … $$` |
+| Macro | `CREATE [OR REPLACE] MACRO [IF NOT EXISTS] m(x) AS expression` (DuckDB's) |
+| Procedure | `CREATE [OR REPLACE] PROCEDURE [IF NOT EXISTS] p(x type [DEFAULT v], …) LANGUAGE sql \| python AS $$ … $$` |
 | Call | `CALL p(args)` or `CALL p(name => value)` |
 | Run a file | `CALL run('etl/orders.sql', day => DATE '2026-09-29')`: a `.sql`, `.py` or notebook file of the lake's, its parameters by name ([Run files as jobs](/pondra/guides/workspace/)) |
 | Run code once | `DO LANGUAGE python \| sql $$ … $$` (the language may come after the code, as in Postgres) |
 | Start | `SELECT pondra.start('p', args)`: runs it without waiting, and answers with the run's id |
-| Task | `CREATE [OR REPLACE] TASK t SCHEDULE '5 minutes' \| 'cron 0 2 * * * UTC' AS CALL p(…)` |
+| Task | `CREATE [OR REPLACE] TASK [IF NOT EXISTS] t SCHEDULE '5 minutes' \| 'cron 0 2 * * * UTC' AS CALL p(…)` |
 | Drop | `DROP FUNCTION [IF EXISTS] f`, `DROP PROCEDURE …`, `DROP MACRO …`, `DROP TASK [IF EXISTS] t` |
 | List | `SHOW USER FUNCTIONS`, `SHOW PROCEDURES`, `SHOW TASKS` (each takes `LIKE 'pattern'`) |
 
@@ -385,7 +390,7 @@ DROP MACRO double_it;
 | Write files | `COPY (SELECT …) TO 'url' (FORMAT parquet \| csv \| json \| delta \| iceberg, PARTITION_BY (col, …), APPEND \| OVERWRITE, HEADER true, DELIMITER ';', COMPRESSION zstd, ROW_GROUP_SIZE n)` |
 | Write a topic | `COPY (SELECT …) TO 'kafka://brokers/topic' (FORMAT json, KEY col)` |
 | Make a secret | `CREATE [OR REPLACE] SECRET [IF NOT EXISTS] name (TYPE s3 \| r2 \| gcs \| azure \| http \| iceberg \| kafka \| generic, KEY value, …, SCOPE 'url')` |
-| A session's own | `CREATE [OR REPLACE] TEMPORARY SECRET name (…)`: in the node's memory for this session only, used before the lake's |
+| A session's own | `CREATE [OR REPLACE] TEMPORARY SECRET [IF NOT EXISTS] name (…)`: in the node's memory for this session only, used before the lake's |
 | Drop a secret | `DROP [TEMPORARY] SECRET [IF EXISTS] name` |
 
 `COPY table TO …` is short for `COPY (SELECT * FROM table) TO …`. A URL needs a secret whose `SCOPE`

@@ -153,15 +153,19 @@ pub fn statement(sql: &str) -> Option<Stmt> {
     let create = p.parse_keyword(Keyword::CREATE);
     let replace = p.parse_keywords(&[Keyword::OR, Keyword::REPLACE]);
     let what = p.parse_one_of_keywords(&[Keyword::FUNCTION, Keyword::PROCEDURE, Keyword::TASK]).filter(|_| create)?;
+    let quiet = p.parse_keywords(&[Keyword::IF, Keyword::NOT, Keyword::EXISTS]); // (nothing if one of the name is there)
+    if quiet && replace {
+        return Some(Stmt::Invalid("CREATE OR REPLACE … IF NOT EXISTS: one or the other".into()));
+    }
     Some(match what {
-        Keyword::TASK => crate::runs::task(&mut p).map_or_else(|e| Stmt::Invalid(format!("CREATE TASK: {e:#} ({})", crate::runs::USAGE)), |(name, task)| Stmt::Ddl(vec![Ddl::CreateTask { name, task, replace }])),
+        Keyword::TASK => crate::runs::task(&mut p).map_or_else(|e| Stmt::Invalid(format!("CREATE TASK: {e:#} ({})", crate::runs::USAGE)), |(name, task)| Stmt::Ddl(vec![crate::write::unless(quiet, &name, "task", Ddl::CreateTask { name: name.clone(), task, replace })])),
         k => {
             let procedure = k == Keyword::PROCEDURE;
             let usage = match procedure {
                 true => "CREATE PROCEDURE name(p TYPE [DEFAULT …], …) LANGUAGE sql|python AS $$ … $$",
                 false => "CREATE FUNCTION name(p TYPE, …) RETURNS TYPE RETURN expression, or … RETURNS TYPE|TABLE (c TYPE, …) LANGUAGE sql|python AS $$ … $$",
             };
-            routine(&mut p, procedure).map_or_else(|e| Stmt::Invalid(format!("CREATE {}: {e:#} ({usage})", if procedure { "PROCEDURE" } else { "FUNCTION" })), |(name, routine)| Stmt::Ddl(vec![Ddl::CreateRoutine { name, routine, replace }]))
+            routine(&mut p, procedure).map_or_else(|e| Stmt::Invalid(format!("CREATE {}: {e:#} ({usage})", if procedure { "PROCEDURE" } else { "FUNCTION" })), |(name, routine)| Stmt::Ddl(vec![crate::write::unless(quiet, &name, "routine", Ddl::CreateRoutine { name: name.clone(), routine, replace })]))
         }
     })
 }

@@ -893,6 +893,9 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    and its Delta and Iceberg copies, stay where they are, so other engines keep reading them. A new
    table under a used name gets a folder of its own, `name__N` (not `~`: object_store
    percent-encodes it, and the files would be written where no reader looks). `harness.py renames`.
+   The log's rows are kept under a table's name, so a rename sends the table's and its
+   `{t}$deleted`'s to files first (`ddl::rename`): left in the log, an `UPDATE`'s old versions came
+   back (`harness.py columns`, now and then).
 130. **NOT NULL and DEFAULT hold on every door** (`defaults.rs`): `check` in the log's `queue`, in
    `change.rs`, `kafka.rs` and Flight; `checked` for a bulk INSERT's stream; and in
    `write::prepare` for `pondra sql`, which writes its rows to the log itself. `harness.py found`:
@@ -1209,6 +1212,25 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    failure left out of the pass rate matches a rule with its reason (plan text, a write explained,
    what the runner makes in Rust, the node's memory, microseconds, an order no query asked for).
    A new kind gets a name and a reason, or it is a failure.
+192. **`IF NOT EXISTS` and `OR REPLACE` mean one thing for every kind of object** (round 31): a
+   kind without its own handling is wrapped (`Ddl::Unless`: nothing if a relation, routine or task
+   of the name is there; `Ddl::Replacing`: a materialized view, or one fed by a topic, dropped
+   first, refused while another follows it). Both together are refused. Schemas, databases, users
+   and roles take only `IF NOT EXISTS`: replacing one would drop what it holds. `harness.py objects`.
+193. **`ALTER MATERIALIZED VIEW v DETACH` keeps the table and nothing of the view** (`ddl::detach_view`):
+   the view's entry, watermark and producers go, the table stays as it is (a merge table stays
+   one); what follows it keeps following the table. A view with a `_final` table is refused. A view
+   fed by a topic stops reading it: its feed and offsets go, from the sequencer's memory too
+   (invariant 78), as when one is dropped, and a shard running it looks at its feed after every
+   fetch, ending when it changed or went (`feeds::shard`), so one made again under its name fills
+   again with its own query. `harness.py objects` (a Pondra node's Kafka port as the topic).
+194. **A notebook's SQL and Python see each other the same way in the console and in a run**
+   (`console.js` `sqlCell`, `workspace::cells`): a SQL query naming a table the session's Python
+   holds runs through Python (`db.sql`, which sends it along); a SQL cell named (`%%sql df <<`, the
+   console's **→ name**) leaves `df = db.sql(…)` in Python, a frame, not a copy. Only a single query
+   is named: a write never runs twice.
+195. **The work runs on an 8 MB stack on every OS** (`main.rs`): Windows gives its main thread 1 MB;
+   a session's making and DataFusion's planning need more there than Linux's main thread lets on.
 
 ## Tests: run these before and after any change
 

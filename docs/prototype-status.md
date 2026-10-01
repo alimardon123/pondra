@@ -1,6 +1,6 @@
 # Prototype status: Pondra, a streamhouse in one binary
 
-**Date:** 2026-10-01 (the workspace, rounds 27 and 28, round 29 (the owner's lists, users, grants, secrets, TLS, audit, quotas, files with versions, C5), and round 30: pipelines, transactions, error codes, the point path) · **Plan:** ADR-002 to ADR-035, `roadmap.md` · **Code:** `pondra.zip` / `pondra.bundle` (≈30,700 lines of Rust, plus Python and JavaScript clients, a documentation website, packaging, and test and benchmark tools)
+**Date:** 2026-10-01 (the workspace, rounds 27 and 28, round 29 (the owner's lists, users, grants, secrets, TLS, audit, quotas, files with versions, C5), round 30: pipelines, transactions, error codes, the point path; round 31: correct SQL, every kind of object alike, SQL and Python in one notebook) · **Plan:** ADR-002 to ADR-035, `roadmap.md` · **Code:** `pondra.zip` / `pondra.bundle` (≈30,700 lines of Rust, plus Python and JavaScript clients, a documentation website, packaging, and test and benchmark tools)
 **Name:** the prototype formerly called `lh` is now **Pondra**. The name is free on crates.io, PyPI and npm. A small personal-finance app uses it (pondra.app), a different category; run a trademark search before a public launch.
 
 ## Where it stands
@@ -14,6 +14,76 @@ One Rust binary replaces the Kafka + Flink + Spark + metastore + ZooKeeper stack
 - upsert and merge tables.
 
 Start more copies on the same bucket to scale out. The only state is object storage. There's no JVM, no database server and no coordination service.
+
+**Then (2026-10-01, round 31, second part so far; 0.29.0): every kind of object alike, SQL and
+Python in one notebook** (the owner's list after the first part):
+
+1. **`CREATE OR REPLACE` and `IF NOT EXISTS` mean one thing everywhere** (invariant 192): tables,
+   views, materialized views (one fed by a topic too), functions, procedures, macros, tasks,
+   secrets, external tables and a session's temporary tables, views and secrets take both; both
+   together are refused; schemas, databases, users and roles take only `IF NOT EXISTS`, and `OR
+   REPLACE` there is refused with what it would drop.
+2. **`ALTER MATERIALIZED VIEW v DETACH`** (invariant 193): the flow stops and the rows stay, a table
+   that takes `INSERT`s; what follows it keeps following that table (a `GROUP BY` view's stays a
+   merge table); a view keeping windows is refused; one fed by a topic stops reading it.
+3. **A notebook's SQL and Python see each other** (invariant 194), in the console and in a run
+   (`CALL run('nb.ipynb')`): a SQL cell's **→ name** (saved as `%%sql df <<`) is a frame in the
+   page's Python; a SQL cell naming a pandas, Polars or Arrow table, or a frame, of the page's
+   Python reads it (through `db.sql`, which sends it along).
+4. **Versions…** shows a notebook's changes cell by cell (a cell the same folded, one added or gone
+   whole), each cell's lines highlighted as its language; SQL and Python files highlighted too.
+5. **The build of `0253f18`**: Windows' node never started (its main thread has 1 MB of stack, and
+   round 31 made a whole session state there): the work runs on an 8 MB thread on every OS
+   (invariant 195), and Spark's functions are found against the first session; the columns suite
+   waits for a renamed table's streamed rows.
+6. **Found on the way:** a view fed by a topic made again under its name kept running its old query
+   from where it was, and never filled: a shard now ends when its feed changes or goes, and a feed
+   dropped leaves the sequencer's memory (invariant 78's rule for views). And a table renamed soon
+   after an `UPDATE` could show the changed rows' old versions again, for good: the rename sent the
+   table's log rows to files first, but not its `{t}$deleted`'s, which were left under the old name
+   (`harness.py columns` failed on it now and then; the rename now does both, invariant 129).
+7. **Tests:** `harness.py objects` (new, 13 checks, a Pondra node's Kafka port as the topic);
+   `console_check.py` in every part (two new checks; axe clean; the first load 71,563 bytes of
+   71,680, the cell's Python side moved to `more.js` to make room); the changed docs pages' 43
+   examples; `harness.py` workspace, procedures, temps, pipelines, external, schemas, secrets,
+   versions, columns (4 runs of 4 with the rename's fix), renames, changes, found, functions,
+   kafkas, outside, doors, begin and users; `smoke.py`.
+
+**Then (2026-10-01, round 31, first part; 0.29.0): correct SQL, proven**:
+
+1. **sqllogictest 74.5% → 98.0%** of DataFusion 55.1's records that aren't named exceptions
+   (23,032 of 23,493; 92.9% of all 24,783). `slt_check.py` runs each file in a session of its own,
+   with DataFusion's runner's two choices (4 partitions, `1.5` a DOUBLE), shows times, durations
+   and intervals as Arrow does, and leaves out only failures that match a named rule, each with
+   its reason: EXPLAIN's text (987), a write explained (37), what the runner makes in Rust (196),
+   the node's memory settings (41), microseconds (23), an order no query asked for (6).
+2. **Session settings and prepared statements** (`settings.rs`): `SET`, `RESET`, `SHOW`, `SET TIME
+   ZONE`, `PREPARE`, `EXECUTE`, `DEALLOCATE`, a Postgres connection's, a client's session's, or a
+   script's own. DataFusion's options are checked as they are set and used by the session's
+   queries (on its node, never from the result cache); Postgres's names are kept for `SHOW`.
+3. **Spark's functions**: `format_string`, `pmod`, `parse_url`, `sha2` and the rest of
+   `datafusion-spark`'s names DataFusion lacks, everywhere; in the `spark` or `databricks` dialect,
+   Spark's versions of shared names too. `pondra.spark.functions` reaches any of them by name.
+4. **Files and DDL**: Arrow IPC files read (`read_arrow`, `STORED AS ARROW`) and written (`COPY …
+   TO` as arrow); DataFusion's writer options through `COPY` (`'format.compression' 'zstd(10)'`);
+   `CREATE TABLE` of a table that is there refused (42P07) unless `IF NOT EXISTS` (left alone, no
+   rows added) or `OR REPLACE` (it used to append); `SELECT … INTO`; DuckDB's `STRUCT(a INT)` in
+   the `duckdb` dialect; a MERGE with no WHEN, a column set twice, a SET of the source's column or a
+   source named as the target refused; `n * INTERVAL '37 seconds'` and `INTERVAL … / n` as Postgres
+   computes them (`intervals.rs`).
+5. **TPC-DS** (`tools/tpcds_check.py`, DuckDB's data and queries at SF1): all 99 queries answer
+   as DuckDB does on one node. Pondra 123.5 s in all against DuckDB's 22.2 s, 81 s of it q72 (a join
+   order to fix); on three nodes 98, q72 running out of this 8 GB box's memory beside a build.
+6. **Random queries** (`tools/random_sql.py`): each query on one node against DuckDB, every tenth
+   spread over three, and split three ways by a random condition (ternary logic partitioning). It
+   found DataFusion 55.1 answering `x IN (CASE WHEN … END, 1)` wrong (the list taken for a
+   constant after a try on an empty batch); `optimize::InListOfRows` writes such lists as ORs.
+7. **Coverage published** (`tools/api_coverage.py`, `logs/round31/api-coverage.json`): Polars
+   1.44's DataFrame and LazyFrame 23%, Expr 17%, `str` 29%, `dt` 28% by name; PySpark 4.2's
+   DataFrame 45%, Column 64%, reader 64%, writer 61%, its functions 12% defined and 39% by name in
+   Pondra's SQL.
+8. **Tests**: every harness suite passes (`versions` once its tie in a millisecond was ordered);
+   `pipelines`, `begin`, `doors`; the changed docs pages' 59 examples.
 
 **Then (2026-10-01, round 30): pipelines, and a database's behaviour from every door** (ADR-036):
 
@@ -172,7 +242,7 @@ Start more copies on the same bucket to scale out. The only state is object stor
    on a table; completion after `o.`; a JSON document failing to open; notebook answers without
    the Copy and Download menus; scrolling 10,000 rows (p95 27.7 → 17–20 ms). Measured: page ready
    in 0.2 s, 10,000 rows drawn in 0.11 s, a 40-cell notebook run in 1.05 s; typing in a
-   1,000-line file 28 ms a key (a new editor: round 34).
+   1,000-line file 28 ms a key (a new editor: round 35).
 9. **The owner's second list** (from screenshots of the reviewed console; ADR-034): **Markdown**
    cells drawn as GitHub does (tables, pictures from the lake, task lists, links that open lake
    files, SQL highlighted; no HTML that can run), and a `.md` file's Preview; a SQL cell's **Chart**

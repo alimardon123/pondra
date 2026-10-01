@@ -1,7 +1,7 @@
 // The console's rarer parts (ADR-034, round 29), loaded when first used, so the page's first load
 // doesn't carry them: the History view (the node's runs, what this page ran), the Variables view,
 // search (Ctrl K), choosing the Python, a file run as a job or on a schedule. What they use of the shell comes through `R.helpers`.
-import { h, $, secs, count, bytes, utc, icon, svg, S, R, call, run, rows, ident, quote, toast, menu, prompt, confirmed, pop, fileUrl, fileSql, writeFile, moreStyle } from './core.js';
+import { h, $, secs, count, bytes, utc, icon, svg, S, R, call, run, doBlock, rows, ident, quote, toast, menu, prompt, confirmed, pop, fileUrl, fileSql, writeFile, moreStyle } from './core.js';
 import { highlighted } from './editor.js';
 import { copyText } from './grid.js';
 import { iconOf, oneLine, FOLDER, download } from './files.js';
@@ -11,6 +11,22 @@ await moreStyle();
 
 const H = R.helpers, { KIND, pick, act, facts, head, detail, readVars, show, openFile, newFile, restart, kernel } = H;
 let again = 0;
+
+/** A SQL cell with the page's Python in it: through Python when it names a table Python holds
+ * (pandas, Polars, Arrow, a frame: sent along, as `db.sql` sends them); its answer kept in Python
+ * as a frame under the cell's name (`→ df`), as a notebook's run on the node does it too. */
+export async function sqlCell(text, signal, cell) {
+  const tables = (S.vars || []).filter(v => /^(pandas|polars|pyarrow|pondra\.frame)\./.test(v.type) && new RegExp(`\\b${v.name}\\b`, 'i').test(text));
+  const query = /^\s*(select|with|from|values|table|show|describe)\b/i.test(text.replace(/--[^\n]*|\/\*[\s\S]*?\*\//g, ' ')) && !text.replace(/;\s*$/, '').includes(';');
+  const name = query && /^\w+$/.test(cell?.as || '') ? cell.as : '';
+  if (query && tables.length) {
+    kernel('busy');
+    try { return await run(doBlock(`${name || '_sql'} = db.sql(${JSON.stringify(text)})\n${name || '_sql'}`), signal, undefined, S.pageRows); } finally { kernel('idle'); if (name) readVars().catch(() => {}); }
+  }
+  const r = await run(text, signal, undefined, S.pageRows);
+  if (name && r.kind === 'rows') { await run(doBlock(`${name} = db.sql(${JSON.stringify(text)})`)); readVars().catch(() => {}); }
+  return r;
+}
 
 
 /** Choose the Python the node runs: each this machine has, tried (its version, whether pondra and

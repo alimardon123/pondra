@@ -152,10 +152,19 @@ pub async fn apply(ctx: SessionContext) -> Result<SessionContext> {
     if !matches!(ctx.state().config().options().sql_parser.dialect, Dialect::Spark | Dialect::Databricks) {
         return Ok(ctx);
     }
+    // DataFusion's of a name Spark has go, aliases and all: a session rebuilt later (files read by
+    // URL) registers what is left in no set order, and must find Spark's alone.
+    let (scalar, aggregate) = (datafusion_spark::all_default_scalar_functions(), datafusion_spark::all_default_aggregate_functions());
+    let names: std::collections::HashSet<String> = scalar.iter().map(|f| (f.name(), f.aliases())).chain(aggregate.iter().map(|f| (f.name(), f.aliases())))
+        .flat_map(|(n, a)| std::iter::once(n.to_string()).chain(a.iter().cloned())).collect();
     let mut spark = datafusion::execution::SessionStateBuilder::new_from_existing(ctx.state());
     spark.expr_planners().get_or_insert_with(Vec::new).insert(0, std::sync::Arc::new(datafusion_spark::planner::SparkFunctionPlanner));
-    spark.scalar_functions().get_or_insert_with(Vec::new).extend(datafusion_spark::all_default_scalar_functions());
-    spark.aggregate_functions().get_or_insert_with(Vec::new).extend(datafusion_spark::all_default_aggregate_functions());
+    let fns = spark.scalar_functions().get_or_insert_with(Vec::new);
+    fns.retain(|f| !names.contains(f.name()));
+    fns.extend(scalar);
+    let fns = spark.aggregate_functions().get_or_insert_with(Vec::new);
+    fns.retain(|f| !names.contains(f.name()));
+    fns.extend(aggregate);
     Ok(SessionContext::new_with_state(spark.build()))
 }
 

@@ -297,12 +297,20 @@ pub(crate) async fn stopped(stdin: bool) {
 /// The lake this node serves (its catalog checkpointed when it stops).
 static MAIN: std::sync::OnceLock<Arc<store::Lake>> = std::sync::OnceLock::new();
 
-#[tokio::main]
-async fn main() {
-    // An error is said in words, its causes after it: a backtrace (RUST_BACKTRACE) is for panics.
-    if let Err(e) = run().await {
-        eprintln!("Error: {}", ext::said(&e));
-        std::process::exit(1);
+fn main() {
+    // The work runs on a thread with Linux's main stack, 8 MB: Windows gives its main thread 1 MB,
+    // and planning (DataFusion's, recursive) and a session's making can need more.
+    let work = std::thread::Builder::new().name("pondra".into()).stack_size(8 << 20).spawn(|| {
+        tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("a runtime").block_on(async {
+            // An error is said in words, its causes after it: a backtrace (RUST_BACKTRACE) is for panics.
+            if let Err(e) = run().await {
+                eprintln!("Error: {}", ext::said(&e));
+                std::process::exit(1);
+            }
+        })
+    });
+    if work.expect("a thread to work on").join().is_err() {
+        std::process::exit(101); // (a panic, said already: as Rust's main says one)
     }
 }
 

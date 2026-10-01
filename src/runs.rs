@@ -260,7 +260,7 @@ struct Tick {
     done: bool,
 }
 
-fn task_key(name: &str) -> String { format!("j/{name}") }
+pub fn task_key(name: &str) -> String { format!("j/{name}") }
 fn tick_key(name: &str) -> String { format!("jt/{name}") }
 
 pub const USAGE: &str = "CREATE TASK name SCHEDULE 'cron 0 2 * * * UTC' | '5 minutes' AS CALL procedure(…)";

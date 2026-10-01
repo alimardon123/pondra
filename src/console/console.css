@@ -215,6 +215,8 @@ header{height:48px;display:flex;align-items:center;gap:10px;padding:0 10px 0 16p
 .live input:checked+.switch{background:var(--ok)}.live input:checked+.switch::after{left:14px}
 .live input:focus-visible+.switch{outline:2px solid var(--accent);outline-offset:1px}
 .cell:not(.sel):not(:hover) .live:not(:has(input:checked)){opacity:0}
+.as{width:9ch;font-size:12px;padding:1px 6px;border:1px solid transparent;border-radius:6px;background:none;color:var(--ink)}
+.as:hover,.as:focus{border-color:var(--line)}.as:not(:placeholder-shown){color:var(--accent);font-weight:600}.cell:not(.sel):not(:hover) .as:placeholder-shown{opacity:0}
 .run{display:inline-flex;gap:5px;align-items:center;height:26px;border:0;border-radius:6px;padding:0 10px 0 8px;font-size:12px;font-weight:600;cursor:pointer;background:transparent;color:var(--accent);box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--accent) 40%,transparent)}
 .cell.sel .run{background:var(--accent);color:var(--on-accent);box-shadow:none}
 .run.stop,.cell.sel .run.stop{background:var(--err);color:#fff;box-shadow:none}

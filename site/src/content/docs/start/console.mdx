@@ -287,6 +287,38 @@ ORDER BY total DESC;
 A long answer scrolls smoothly however many rows it has: the page draws only the rows in sight.
 Click a column's header and the details panel summarizes that column; **Data profile** summarizes them all.
 
+### SQL and Python cells, one page
+
+A SQL cell and a Python cell see each other's work, in both directions:
+
+- **A SQL cell's answer in Python.** Type a name in the cell's **→ name** field, beside Live. Once
+  the cell runs, that name is a [frame](/pondra/guides/dataframes/) of its query in the page's
+  Python: `df.to_pandas()`, `df.to_polars()`, `df.filter(…)`. A frame is the query, not a copy, so
+  it reads the lake as it is when used. In the `.ipynb` file the cell begins `%%sql df <<`, as
+  Pondra's Jupyter magic writes it, and a notebook run as a job does the same.
+- **Python's tables in a SQL cell.** A SQL cell that names a pandas, Polars or Arrow table, or a
+  frame, that a Python cell made reads it by that name. The table is sent along with the query, as
+  `db.sql` sends it, and a table in the lake wins over a variable of the same name.
+- Temporary tables and views (`CREATE TEMP VIEW`) are the page's too, seen from both kinds.
+
+```python cell
+import pandas as pd
+targets = pd.DataFrame({"item": ["tea", "cake"], "target": [3, 1]})
+```
+
+```sql norun
+-- a SQL cell on the same page: `targets` is the Python cell's
+SELECT s.item, count(*) AS sold, t.target
+FROM sales s JOIN targets t USING (item)
+GROUP BY s.item, t.target ORDER BY s.item;
+```
+
+```text
+item  sold  target
+cake  1     1
+tea   2     3
+```
+
 ## The lake, on the left
 
 - **Data: tables and views.** Each kind has its icon: a table a grid, a view the same grid drawn

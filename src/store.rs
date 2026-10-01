@@ -1571,15 +1571,16 @@ pub fn partitions() -> usize {
 /// `sha2`, `collect_list`, …: PySpark's vocabulary in SQL). Where both have a name, DataFusion's
 /// stays, so no answer changes.
 fn spark(ctx: &SessionContext) {
+    use datafusion::execution::FunctionRegistry;
     use datafusion::logical_expr::{AggregateUDF, ScalarUDF};
-    static MORE: LazyLock<(Vec<ScalarUDF>, Vec<AggregateUDF>)> = LazyLock::new(|| {
-        let s = SessionStateBuilder::new().with_default_features().build();
-        let new = |name: &str, aliases: &[String]| std::iter::once(name).chain(aliases.iter().map(String::as_str))
-            .all(|n| !s.scalar_functions().contains_key(n) && !s.aggregate_functions().contains_key(n) && !s.window_functions().contains_key(n));
+    static MORE: std::sync::OnceLock<(Vec<ScalarUDF>, Vec<AggregateUDF>)> = std::sync::OnceLock::new();
+    let more = MORE.get_or_init(|| {
+        // (worked out once, against the first session's names: DataFusion's own, nothing else yet)
+        let new = |name: &str, aliases: &[String]| std::iter::once(name).chain(aliases.iter().map(String::as_str)).all(|n| ctx.udf(n).is_err() && ctx.udaf(n).is_err() && ctx.udwf(n).is_err());
         let scalar = datafusion_spark::all_default_scalar_functions().into_iter().filter(|f| new(f.name(), f.aliases()));
         let aggregate = datafusion_spark::all_default_aggregate_functions().into_iter().filter(|f| new(f.name(), f.aliases()));
         (scalar.map(|f| f.as_ref().clone()).collect(), aggregate.map(|f| f.as_ref().clone()).collect())
     });
-    MORE.0.iter().for_each(|f| { ctx.register_udf(f.clone()); });
-    MORE.1.iter().for_each(|f| { ctx.register_udaf(f.clone()); });
+    more.0.iter().for_each(|f| { ctx.register_udf(f.clone()); });
+    more.1.iter().for_each(|f| { ctx.register_udaf(f.clone()); });
 }

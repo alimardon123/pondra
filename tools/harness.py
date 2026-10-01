@@ -2713,7 +2713,8 @@ def columns():
     }
     # (Round 26 renames tables: this one, with its renamed, dropped and widened columns, and back.)
     q("ALTER TABLE events RENAME TO events_renamed")
-    renamed = q("SELECT count(*) AS n, sum(total) AS s FROM events_renamed")
+    want_renamed = [{"n": len(model), "s": sum(r["total"] or 0 for r in model.values())}]
+    renamed = until(lambda: q("SELECT count(*) AS n, sum(total) AS s FROM events_renamed"), want_renamed, 20)  # (the last rows sent through the other nodes: in this node's view within moments)
     q("ALTER TABLE events_renamed RENAME TO events")
     q("CHECKPOINT")
     want = sorted((i, r["total"], r["note"]) for i, r in model.items())
@@ -5768,6 +5769,170 @@ def begin():
         sys.exit(1)
 
 
+def objects():
+    """Round 31's SQL: `CREATE` of what is there (42P07, `IF NOT EXISTS`, `OR REPLACE`) for every
+    kind of object; `ALTER MATERIALIZED VIEW … DETACH`; a session's `SET`, `SHOW`, `RESET`,
+    `PREPARE`, `EXECUTE` (and a script's own session); Spark's functions, and Spark's for shared
+    names in its dialect; MERGE's mistakes refused; `n * INTERVAL`; a notebook's `%%sql df <<` cell
+    a frame in its Python, and a SQL cell reading a Python table by name."""
+    lake = new_lake()
+    here = os.path.dirname(os.path.abspath(__file__))
+    nb_dir = os.path.join(lake, "files", "nb")
+    node = Node(lake, A.port, env={"PYTHONPATH": os.path.join(here, "..", "python"), "PONDRA_SECRET_KEY": "objects-key"}, python=sys.executable).start()
+    q = lambda s, port=A.port: sql(port, s)
+    def http(body, session=None):
+        c = http_client.HTTPConnection("127.0.0.1", A.port, timeout=60)
+        c.request("POST", "/sql", body.encode(), {"x-pondra-session": session} if session else {})
+        r = c.getresponse()
+        data = r.read()
+        return r.status, r.getheader("x-pondra-sqlstate"), (json.loads(data) if data[:1] in (b"{", b"[") else data.decode())
+    checks, info = {}, {}
+    q("CREATE TABLE t (a BIGINT)")
+    q("INSERT INTO t VALUES (1), (2)")
+    again = http("CREATE TABLE t (a BIGINT)")
+    as_again = http("CREATE TABLE t AS SELECT 9 AS a")
+    quiet = q("CREATE TABLE IF NOT EXISTS t AS SELECT 9 AS a")
+    checks["CREATE TABLE of one there: refused (42P07), AS SELECT adds nothing, IF NOT EXISTS leaves it"] = again[:2] == (500, "42P07") and as_again[1] == "42P07" \
+        and quiet.get("exists") is True and q("SELECT count(*) AS n FROM t") == [{"n": 2}]
+    q("CREATE OR REPLACE TABLE t AS SELECT 7 AS a")
+    checks["CREATE OR REPLACE TABLE makes it anew"] = q("SELECT a FROM t") == [{"a": 7}]
+    q("CREATE VIEW v AS SELECT a FROM t")
+    q("CREATE VIEW IF NOT EXISTS v AS SELECT a + 1 AS a FROM t")
+    kept = q("SELECT a FROM v")
+    q("CREATE OR REPLACE VIEW v AS SELECT a + 1 AS a FROM t")
+    both = http("CREATE OR REPLACE VIEW IF NOT EXISTS v AS SELECT 1")
+    checks["views: IF NOT EXISTS leaves it, OR REPLACE replaces it, both at once refused"] = kept == [{"a": 7}] and q("SELECT a FROM v") == [{"a": 8}] and both[0] == 500
+    q("CREATE TABLE orders (id BIGINT, region VARCHAR, amount BIGINT)")
+    q("INSERT INTO orders VALUES (1, 'eu', 10), (2, 'us', 20), (3, 'eu', 30)")
+    q("CREATE MATERIALIZED VIEW eu AS SELECT id, amount FROM orders WHERE region = 'eu'")
+    q("CREATE MATERIALIZED VIEW IF NOT EXISTS eu AS SELECT id FROM orders")
+    same = q("SELECT count(*) AS n, sum(amount) AS s FROM eu")
+    q("CREATE OR REPLACE MATERIALIZED VIEW eu AS SELECT id, amount * 2 AS amount FROM orders WHERE region = 'eu'")
+    q("CREATE MATERIALIZED VIEW eu_big AS SELECT id FROM eu WHERE amount > 30")
+    followed = http("CREATE OR REPLACE MATERIALIZED VIEW eu AS SELECT id, amount FROM orders")
+    checks["materialized views: IF NOT EXISTS, OR REPLACE, refused while another follows"] = same == [{"n": 2, "s": 40}] \
+        and q("SELECT sum(amount) AS s FROM eu") == [{"s": 80}] and followed[0] == 500 and "follow" in str(followed[2])
+    q("CREATE FUNCTION twice(x BIGINT) RETURNS BIGINT RETURN x * 2")
+    q("CREATE FUNCTION IF NOT EXISTS twice(x BIGINT) RETURNS BIGINT RETURN x * 3")
+    q("CREATE TASK tick SCHEDULE '1 hour' AS SELECT 1")
+    q("CREATE TASK IF NOT EXISTS tick SCHEDULE '1 hour' AS SELECT 2")
+    checks["functions and tasks: IF NOT EXISTS leaves them"] = q("SELECT twice(5) AS x") == [{"x": 10}] and http("CREATE TASK tick SCHEDULE '1 hour' AS SELECT 3")[0] == 500
+    # Every other kind alike (IF NOT EXISTS leaves one, OR REPLACE replaces it, both at once
+    # refused), and OR REPLACE refused where it would drop what's inside
+    q("CREATE MACRO plus1(x) AS x + 1")
+    q("CREATE MACRO IF NOT EXISTS plus1(x) AS x + 2")
+    macros = [q("SELECT plus1(1) AS x")]
+    q("CREATE OR REPLACE MACRO plus1(x) AS x + 3")
+    macros += [q("SELECT plus1(1) AS x"), http("CREATE OR REPLACE MACRO IF NOT EXISTS plus1(x) AS x")[0]]
+    secret = "CREATE {}SECRET {}sec (TYPE http, BEARER_TOKEN 'b', SCOPE 'http://127.0.0.1:9/{}/')"
+    q(secret.format("", "", "a"))
+    secrets = [q(secret.format("", "IF NOT EXISTS ", "b")).get("unchanged"), http(secret.format("", "", "b"))[0]]
+    q(secret.format("OR REPLACE ", "", "c"))
+    secrets += [q("SELECT scope FROM secrets() WHERE name = 'sec'"), http(secret.format("OR REPLACE ", "IF NOT EXISTS ", "d"))[0]]
+    call(A.port, "PUT", "/files/k/a.csv", b"a,b\n1,x\n")
+    external = "CREATE {}EXTERNAL TABLE {}x1 {}STORED AS CSV LOCATION '" + call(A.port, "GET", "/objects")["files"] + "k/a.csv' OPTIONS ('format.has_header' 'true')"
+    q(external.format("", "", "(a BIGINT, b VARCHAR) "))
+    externals = [q(external.format("", "IF NOT EXISTS ", "(a VARCHAR, b VARCHAR) ")).get("unchanged"), http(external.format("", "", "(a VARCHAR, b VARCHAR) "))[0], q("SELECT a FROM x1")]
+    q(external.format("OR REPLACE ", "", "(a VARCHAR, b VARCHAR) "))
+    externals += [q("SELECT a FROM x1"), http(external.format("OR REPLACE ", "IF NOT EXISTS ", ""))[0]]
+    t = f"objects-temp-{uuid.uuid4().hex[:8]}"
+    http("CREATE TEMP TABLE tt (a BIGINT)", t)
+    http("CREATE TEMP VIEW tv AS SELECT 1 AS a", t)
+    http("CREATE TEMP SECRET ts (TYPE http, BEARER_TOKEN 'x', SCOPE 'http://127.0.0.1:9/t/')", t)
+    temps = [http("CREATE TEMP TABLE IF NOT EXISTS tt (a BIGINT, b BIGINT)", t)[0], http("CREATE TEMP VIEW IF NOT EXISTS tv AS SELECT 2 AS a", t)[0],
+             http("CREATE TEMP SECRET IF NOT EXISTS ts (TYPE http, SCOPE 'http://127.0.0.1:9/t/')", t)[2], http("SELECT a FROM tv", t)[2]]
+    http("CREATE OR REPLACE TEMP VIEW tv AS SELECT 3 AS a", t)
+    temps += [http("SELECT a FROM tv", t)[2]] + [http(s, t)[0] for s in ("CREATE OR REPLACE TEMP TABLE IF NOT EXISTS tt (a BIGINT)", "CREATE OR REPLACE TEMP VIEW IF NOT EXISTS tv AS SELECT 4 AS a",
+                                                                    "CREATE OR REPLACE TEMP SECRET IF NOT EXISTS ts (TYPE http, SCOPE 'http://127.0.0.1:9/t/')", "CREATE TEMP SECRET ts (TYPE http, SCOPE 'http://127.0.0.1:9/t/')")]
+    kept = [http(f"CREATE OR REPLACE {k}") for k in ("SCHEMA s1", "DATABASE d1", "USER u1 PASSWORD 'pw-0123456789'", "ROLE r1")]
+    info.update({"macros": macros, "secrets": secrets, "externals": externals, "temps": temps, "kept": [str(k[2])[:160] for k in kept]})
+    checks["macros, secrets, external tables, a session's temporary tables, views and secrets: IF NOT EXISTS, OR REPLACE, both refused"] = \
+        macros == [[{"x": 2}], [{"x": 4}], 500] and secrets == [True, 500, [{"scope": "http://127.0.0.1:9/c/"}], 500] \
+        and externals == [True, 500, [{"a": 1}], [{"a": "1"}], 500] and temps == [200, 200, {"secret": "ts", "temporary": True, "exists": True}, [{"a": 1}], [{"a": 3}], 500, 500, 500, 500]
+    checks["OR REPLACE of a schema, a database, a user or a role: refused, saying what it would drop"] = all(k[0] == 500 for k in kept) \
+        and all("everything in it" in str(k[2]) for k in kept[:2]) and all("rights given to it" in str(k[2]) for k in kept[2:])
+    # DETACH: rows stay, the flow stops, what follows keeps following the table
+    q("ALTER MATERIALIZED VIEW eu DETACH")
+    q("INSERT INTO orders VALUES (4, 'eu', 50)")
+    q("INSERT INTO eu VALUES (9, 100)")
+    q("CREATE MATERIALIZED VIEW sums AS SELECT region, sum(amount) AS s FROM orders GROUP BY region")
+    q("CREATE MATERIALIZED VIEW w AS SELECT region, count(*) AS n FROM orders GROUP BY region")
+    q("ALTER MATERIALIZED VIEW sums DETACH")
+    q("INSERT INTO orders VALUES (5, 'us', 1)")
+    info["detached"] = [q("SELECT id FROM eu ORDER BY id"), q("SELECT id FROM eu_big ORDER BY id"), q("SELECT region, s FROM sums ORDER BY region"), q("SELECT region, n FROM w ORDER BY region"), str(http("ALTER MATERIALIZED VIEW t DETACH")[2])[:200]]
+    checks["DETACH: its rows stay a table, the flow stops, it takes INSERTs, what follows it keeps following"] = \
+        sorted(r["id"] for r in q("SELECT id FROM eu")) == [1, 3, 9] and sorted(r["id"] for r in q("SELECT id FROM eu_big")) == [3, 9] \
+        and q("SELECT s FROM sums WHERE region = 'us'") == [{"s": 20}] and q("SELECT n FROM w WHERE region = 'us'") == [{"n": 2}] \
+        and http("ALTER MATERIALIZED VIEW t DETACH")[0] == 500
+    # A view fed by a topic (a Pondra node's Kafka port): made again by OR REPLACE it fills again
+    # (its old offsets forgotten); DETACH stops its reading and keeps its rows as a table
+    other, pk = new_lake(), A.port + 70
+    them = Node(other, A.port + 5, kafka=f"127.0.0.1:{pk}").start()
+    try:
+        call(A.port + 5, "POST", "/sql", b"CREATE TABLE ticks (id BIGINT, v BIGINT)")
+        call(A.port + 5, "POST", "/sql", ("INSERT INTO ticks VALUES " + ", ".join(f"({i}, {i * 2})" for i in range(10))).encode())
+        topic = f"'kafka://127.0.0.1:{pk}/ticks'"
+        q(f"CREATE SECRET ticks_k (TYPE kafka, SECURITY_PROTOCOL 'PLAINTEXT', SCOPE 'kafka://127.0.0.1:{pk}')")
+        q(f"CREATE MATERIALIZED VIEW fed AS SELECT CAST(value->>'id' AS BIGINT) AS id FROM {topic}")
+        first = until(lambda: q("SELECT count(*) AS n FROM fed"), [{"n": 10}], 30)
+        q(f"CREATE OR REPLACE MATERIALIZED VIEW fed AS SELECT CAST(value->>'v' AS BIGINT) AS v FROM {topic}")
+        again = until(lambda: _try(lambda: q("SELECT count(*) AS n, sum(v) AS s FROM fed")), [{"n": 10, "s": 90}], 30)
+        q("ALTER MATERIALIZED VIEW fed DETACH")
+        call(A.port + 5, "POST", "/sql", b"INSERT INTO ticks VALUES (10, 20), (11, 22)")
+        time.sleep(8)  # (a feed takes new records within its loop's 5 s)
+        q("INSERT INTO fed VALUES (1000)")
+        detached = q("SELECT count(*) AS n, sum(v) AS s FROM fed")
+    finally:
+        them.kill()
+    info["fed"] = [first, again, detached]
+    checks["a view fed by a topic: OR REPLACE fills it again; DETACH stops its reading, its rows a table that takes INSERTs"] = \
+        first == [{"n": 10}] and again == [{"n": 10, "s": 90}] and detached == [{"n": 11, "s": 1090}]
+    # A session's settings and prepared statements; a script's own session
+    s = f"objects-{uuid.uuid4().hex[:8]}"
+    http("SET TIME ZONE '+08:00'", s)
+    zoned = http("SELECT TIMESTAMPTZ '2026-10-01T00:00:00Z' AS t", s)[2]
+    other = q("SELECT TIMESTAMPTZ '2026-10-01T00:00:00Z' AS t")
+    shown = http("SHOW datafusion.execution.time_zone", s)[2]
+    http("RESET ALL", s)
+    http("PREPARE big (BIGINT) AS SELECT id FROM orders WHERE amount > $1 ORDER BY id", s)
+    executed = http("EXECUTE big (25)", s)[2]
+    script = q("SET TIME ZONE '+02:00'; SELECT TIMESTAMPTZ '2026-10-01T00:00:00Z' AS t")
+    checks["SET, SHOW, RESET, PREPARE, EXECUTE: the session's; a script is a session of its own"] = zoned == [{"t": "2026-10-01T08:00:00+08:00"}] \
+        and other == [{"t": "2026-10-01T00:00:00Z"}] and shown == [{"name": "datafusion.execution.time_zone", "value": "+08:00"}] \
+        and executed == [{"id": 3}, {"id": 4}] and script == [{"t": "2026-10-01T02:00:00+02:00"}] and http("SET aa.bb = 1", s)[0] == 500
+    spark = q("SELECT format_string('%s x %d', 'tea', 3) AS f, pmod(-7, 3) AS m, arrow_typeof(floor(CAST(1.5 AS DOUBLE))) AS fl")
+    http("SET datafusion.sql_parser.dialect = 'spark'", s)
+    floor_spark = http("SELECT arrow_typeof(floor(CAST(1.5 AS DOUBLE))) AS t, arrow_typeof(floor(1.5)) AS d", s)[2]  # (Spark's: a DOUBLE's floor a BIGINT, a DECIMAL's a DECIMAL of scale 0)
+    info["spark"] = [spark, floor_spark]
+    checks["Spark's functions; Spark's floor in its dialect (DataFusion's otherwise)"] = spark == [{"f": "tea x 3", "m": 2, "fl": "Float64"}] and floor_spark == [{"t": "Int64", "d": "Decimal128(2, 0)"}]
+    refused = [http(m)[0] for m in ("MERGE INTO orders USING t ON orders.id = t.a",
+                                     "MERGE INTO orders USING t ON orders.id = t.a WHEN MATCHED THEN UPDATE SET amount = 1, amount = 2",
+                                     "MERGE INTO orders o USING t AS o ON o.id = o.a WHEN MATCHED THEN DELETE")]
+    interval = q("SELECT 3 * INTERVAL '37 seconds' AS a, INTERVAL '1 month' * 2.5 AS b")
+    checks["MERGE's mistakes refused; n * INTERVAL as Postgres"] = refused == [500, 500, 500] and interval == [{"a": "1 mins 51.000000000 secs", "b": "2 mons 15 days"}]
+    # A notebook run: `%%sql df <<` is a frame in its Python; a SQL cell reads a Python table
+    cell = lambda src, kind="code": {"cell_type": kind, "metadata": {}, "source": src, "outputs": [], "execution_count": None}
+    nb = {"cells": [cell("%%sql eu_rows <<\nSELECT id, amount FROM orders WHERE region = 'eu'"), cell("import pandas as pd\ntargets = pd.DataFrame({'region': ['eu', 'us'], 'target': [3, 1]})\nn = len(eu_rows.to_pandas())"),
+                    cell("%%sql\nSELECT o.region, count(*) AS n, t.target FROM orders o JOIN targets t USING (region) GROUP BY o.region, t.target ORDER BY o.region"),
+                    cell("[{'eu': n}]")], "metadata": {}, "nbformat": 4, "nbformat_minor": 5}
+    call(A.port, "PUT", "/files/nb/check.ipynb", json.dumps(nb).encode())
+    ran = q("CALL run('nb/check.ipynb')")
+    joined = None
+    try:
+        nb["cells"] = nb["cells"][:3]
+        call(A.port, "PUT", "/files/nb/joined.ipynb", json.dumps(nb).encode())
+        joined = q("CALL run('nb/joined.ipynb')")
+    except Exception as e:
+        info["joined"] = str(e)[:300]
+    checks["a notebook's %%sql df << cell is a frame in its Python; a SQL cell reads a Python table by name"] = ran == [{"eu": 3}] \
+        and joined == [{"region": "eu", "n": 3, "target": 3}, {"region": "us", "n": 2, "target": 1}]
+    info.update({"ran": ran, "joined": joined})
+    node.kill()
+    ok = all(checks.values())
+    print(json.dumps({"objects": checks, "ok": ok, "info": info}, indent=1, default=str))
+    return ok
+
+
 def doors():
     """The doors matrix (ADR-036 §7): one list of features, each through every door — SQL over HTTP
     (a session), the Python client, the Postgres port (psycopg), Flight SQL (ADBC), the JavaScript
@@ -5903,7 +6068,7 @@ finally {{ await db.close?.(); }}"""
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    out = {t.__name__: t() for t in (upsert, deal, outside, clouds, kafkas, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, found, renames, workspace, server, scale, flight, users, secrets, safety, versions, stopped, pipelines, begin, doors, reader, crash)}
+    out = {t.__name__: t() for t in (upsert, deal, outside, clouds, kafkas, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, found, renames, workspace, server, scale, flight, users, secrets, safety, versions, stopped, pipelines, begin, doors, objects, reader, crash)}
     A.secs = min(A.secs, 20)
     out["load"] = load()
     print(json.dumps(out, indent=1))
@@ -5911,7 +6076,7 @@ def all_tests():
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "found", "renames", "workspace", "server", "scale", "flight", "users", "secrets", "safety", "versions", "stopped", "pipelines", "begin", "doors", "load", "all"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "found", "renames", "workspace", "server", "scale", "flight", "users", "secrets", "safety", "versions", "stopped", "pipelines", "begin", "doors", "objects", "load", "all"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -5922,4 +6087,4 @@ if __name__ == "__main__":
     ap.add_argument("--secs", type=int, default=30)
     ap.add_argument("--flush-ms", type=int, default=250)
     A = ap.parse_args()
-    {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "safety": safety, "versions": versions, "stopped": stopped, "pipelines": pipelines, "begin": begin, "doors": doors, "load": load, "all": all_tests}[A.mode]()
+    {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "safety": safety, "versions": versions, "stopped": stopped, "pipelines": pipelines, "begin": begin, "doors": doors, "objects": objects, "load": load, "all": all_tests}[A.mode]()

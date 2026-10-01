@@ -203,6 +203,9 @@ pub enum Ddl {
     RunLog, // the run log's table (`pondra.runs`), made when a node first has a line for it
     AuditLog, // the audit log's (`pondra.audit`), the same way (`audit.rs`)
     Users(crate::users::Change), // CREATE USER and ROLE, GRANT, REVOKE, CREATE TOKEN (ADR-035: `users.rs`)
+    Unless { name: String, kind: String, then: Box<Ddl> }, // CREATE … IF NOT EXISTS: nothing if a `kind` ("relation", "routine", "task") of that name is there
+    Replacing { name: String, then: Box<Ddl> },              // CREATE OR REPLACE MATERIALIZED VIEW: the old one dropped first (refused while another follows it)
+    DetachView { name: String },                             // ALTER MATERIALIZED VIEW v DETACH: its rows stop following, and stay a table
 }
 
 /// What `ALTER TABLE` does to a column: rename it, drop it, or widen its type (a SQL type).
@@ -230,9 +233,32 @@ pub async fn apply(lake: &Lake, d: Ddl) -> Result<Value> {
         Ddl::RenameTable { name, to } => Ddl::RenameTable { name: here(name), to },
         Ddl::CreateRoutine { name, routine, replace } => Ddl::CreateRoutine { name: here(name), routine, replace },
         Ddl::DropRoutine { name, if_exists } => Ddl::DropRoutine { name: here(name), if_exists },
+        Ddl::Unless { name, kind, then } => Ddl::Unless { name: here(name), kind, then },
+        Ddl::Replacing { name, then } => Ddl::Replacing { name: here(name), then },
+        Ddl::DetachView { name } => Ddl::DetachView { name: here(name) },
         d => d,
     };
     match d {
+        Ddl::Unless { name, kind, then } => {
+            let name = new_name(lake, &name).await?;
+            let there = match kind.as_str() {
+                "routine" => lake.cat.get::<Value>(&crate::routines::key(&name)).await?.is_some(),
+                "task" => lake.cat.get::<Value>(&crate::runs::task_key(&name)).await?.is_some(),
+                _ => lake.cat.get::<StoredView>(&query_key(&name)).await?.is_some() || lake.cat.get::<TableMeta>(&table_key(&name)).await?.is_some(), // (a view, a materialized view or a table)
+            };
+            if there {
+                return Ok(j!({"name": name, "exists": true}));
+            }
+            Box::pin(apply(lake, *then)).await
+        }
+        Ddl::Replacing { name, then } => {
+            let here = new_name(lake, &name).await?;
+            if lake.cat.get::<Value>(&crate::views::view_key(&here)).await?.is_some() || lake.cat.get::<Value>(&crate::feeds::feed_key(&here)).await?.is_some() {
+                drop_view(lake, &name, true).await?; // (refused, saying so, while another view follows it)
+            }
+            Box::pin(apply(lake, *then)).await
+        }
+        Ddl::DetachView { name } => detach_view(lake, &new_name(lake, &name).await?).await,
         Ddl::CreateSchema { name, if_not_exists } => {
             check(&name)?;
             if has_schema(lake, &name).await? {
@@ -272,7 +298,7 @@ pub async fn apply(lake: &Lake, d: Ddl) -> Result<Value> {
             let name = new_name(lake, &name).await?;
             let taken = lake.cat.get::<TableMeta>(&table_key(&name)).await?.is_some() || lake.cat.get::<StoredView>(&query_key(&name)).await?.is_some()
                 || lake.cat.get::<Value>(&crate::views::view_key(&name)).await?.is_some();
-            if taken && if_not_exists && !replace {
+            if taken && if_not_exists {
                 return Ok(j!({"table": name, "unchanged": true}));
             }
             ensure!(replace || !taken, "{name} already exists (CREATE OR REPLACE EXTERNAL TABLE, or IF NOT EXISTS)");
@@ -648,20 +674,26 @@ async fn rename(lake: &Lake, name: &str, to: &str) -> Result<Value> {
     let followers: Vec<String> = readers(lake, &name).await?.into_iter().filter(|r| !r.starts_with("view ")).collect();
     ensure!(followers.is_empty(), "{name} is followed by {}: they follow it by name, so drop them first", followers.join(", "));
     // Its rows in the log go to files, so none is left under the old name (new ones may come:
-    // then again).
+    // then again); its changed rows' old versions (`{name}$deleted`) too, or they would show again.
+    let (old_deleted, new_deleted) = (crate::sys::deleted(&name), crate::sys::deleted(&to));
+    let tables = [name.clone(), old_deleted.clone()];
     for _ in 0..10 {
-        loop {
-            let (_, done) = crate::tier::tier_table(lake, &name, lake.visible(), &["here".to_string()], "here").await?;
-            if done {
-                break;
+        let mut late = false;
+        for t in &tables {
+            loop {
+                let (_, done) = crate::tier::tier_table(lake, t, lake.visible(), &["here".to_string()], "here").await?;
+                if done {
+                    break;
+                }
             }
+            let Some(meta) = lake.cat.get::<TableMeta>(&table_key(t)).await? else { continue }; // (no rows ever changed: no `$deleted`)
+            let upto = lake.visible();
+            late |= lake.cat.scan::<crate::store::Segment>(&crate::store::seg_key(meta.tiered + 1), &crate::store::seg_key(upto + 1)).await?.iter().any(|(_, s)| s.parts.contains_key(t));
         }
-        let meta: TableMeta = lake.cat.get(&table_key(&name)).await?.ok_or_else(|| anyhow::anyhow!("no table {name}"))?;
-        let upto = lake.visible();
-        let late = lake.cat.scan::<crate::store::Segment>(&crate::store::seg_key(meta.tiered + 1), &crate::store::seg_key(upto + 1)).await?.iter().any(|(_, s)| s.parts.contains_key(&name));
         if late {
             continue;
         }
+        let meta: TableMeta = lake.cat.get(&table_key(&name)).await?.ok_or_else(|| anyhow::anyhow!("no table {name}"))?;
         let mut puts = vec![];
         let mut gone = vec![table_key(&name)];
         let moved = |mut m: TableMeta, n: &str| {
@@ -669,7 +701,6 @@ async fn rename(lake: &Lake, name: &str, to: &str) -> Result<Value> {
             m
         };
         puts.push((table_key(&to), json(&moved(meta, &name))));
-        let (old_deleted, new_deleted) = (crate::sys::deleted(&name), crate::sys::deleted(&to));
         if let Some(d) = lake.cat.get::<TableMeta>(&table_key(&old_deleted)).await? {
             puts.push((table_key(&new_deleted), json(&moved(d, &old_deleted))));
             gone.push(table_key(&old_deleted));
@@ -814,9 +845,10 @@ fn widens(old: &datafusion::arrow::datatypes::DataType, new: &datafusion::arrow:
 /// `DROP VIEW` or `DROP MATERIALIZED VIEW`: a stored view, or a live one with its tables and state.
 async fn drop_view(lake: &Lake, name: &str, if_exists: bool) -> Result<Value> {
     if lake.cat.get::<crate::feeds::Feed>(&crate::feeds::feed_key(name)).await?.is_some() {
-        let mut gone = vec![crate::feeds::feed_key(name), table_key(name)];
-        gone.extend(lake.cat.scan::<u64>(&crate::store::producer_key(&format!("feed:{name}:")), &crate::store::producer_key(&format!("feed:{name};"))).await?.into_iter().map(|(k, _)| k)); // (its offsets: made again, it starts over)
+        let offsets: Vec<String> = lake.cat.scan::<u64>(&crate::store::producer_key(&format!("feed:{name}:")), &crate::store::producer_key(&format!("feed:{name};"))).await?.into_iter().map(|(k, _)| k).collect();
+        let gone: Vec<String> = [crate::feeds::feed_key(name), table_key(name)].into_iter().chain(offsets.iter().cloned()).collect();
         lake.cat.commit(vec![], &gone).await?;
+        crate::log::forget_producers(offsets.into_iter().map(|k| k[2..].to_string())); // (its offsets: made again, it starts over)
         return Ok(j!({"view": name, "dropped": true}));
     }
     if lake.cat.get::<StoredView>(&query_key(name)).await?.is_some() {
@@ -846,6 +878,30 @@ async fn drop_view(lake: &Lake, name: &str, if_exists: bool) -> Result<Value> {
     crate::log::forget_producers(producers); // (a view made again under this name starts over)
     crate::views::forget(lake);
     Ok(j!({"view": name, "dropped": true}))
+}
+
+/// `ALTER MATERIALIZED VIEW v DETACH`: the view is gone and its table stays, a table like any
+/// other from now on (a GROUP BY view's: a merge table, its rows combining as they are read). What
+/// follows it keeps following its table. A view that keeps windows (its `_final` table) is refused:
+/// the windows still open would be left half counted. A view fed by a topic stops reading it.
+async fn detach_view(lake: &Lake, name: &str) -> Result<Value> {
+    if lake.cat.get::<crate::feeds::Feed>(&crate::feeds::feed_key(name)).await?.is_some() {
+        // (its offsets go with the feed: a shard's append in flight, made against them, is refused)
+        let offsets = lake.cat.scan::<u64>(&crate::store::producer_key(&format!("feed:{name}:")), &crate::store::producer_key(&format!("feed:{name};"))).await?;
+        let gone: Vec<String> = std::iter::once(crate::feeds::feed_key(name)).chain(offsets.iter().map(|(k, _)| k.clone())).collect();
+        lake.cat.commit(vec![], &gone).await?;
+        crate::log::forget_producers(offsets.into_iter().map(|(k, _)| k[2..].to_string())); // (`p/…`: a feed made again starts over)
+        return Ok(j!({"view": name, "detached": true, "table": name}));
+    }
+    ensure!(lake.cat.get::<crate::views::View>(&crate::views::view_key(name)).await?.is_some(), "{name} is not a materialized view");
+    ensure!(lake.cat.get::<TableMeta>(&table_key(&format!("{name}_final"))).await?.is_none(),
+        "{name} keeps windows, and those still open would be left half counted: make a table of what it has (CREATE TABLE t AS SELECT * FROM {name}_final), then drop it");
+    let producers = ["emit", "join", "fill"].map(|p| format!("{p}:{name}"));
+    let gone: Vec<String> = [crate::views::view_key(name), format!("w/{name}")].into_iter().chain(producers.iter().map(|p| crate::store::producer_key(p))).collect();
+    lake.cat.commit(vec![], &gone).await?;
+    crate::log::forget_producers(producers);
+    crate::views::forget(lake);
+    Ok(j!({"view": name, "detached": true, "table": name}))
 }
 
 /// Does query `sql` read this lake's table `t`? (If it can't be parsed, a word match: cautious, so

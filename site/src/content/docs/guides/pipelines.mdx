@@ -122,6 +122,28 @@ eu      2       60
 us      1       12
 ```
 
+## Stop a stage, keep its rows
+
+`ALTER MATERIALIZED VIEW v DETACH` stops `v` following its tables and keeps what it holds, as a
+table of the same name. From then on it is a table like any other: it takes `INSERT`s, and what
+follows it keeps following it. A `GROUP BY` view's table stays a merge table, its rows combining
+as they are read. A view that keeps windows is refused, since the windows still open would be
+left half counted.
+
+```sql
+CREATE MATERIALIZED VIEW eu_orders AS SELECT id, buyer, amount FROM orders WHERE region = 'eu';
+ALTER MATERIALIZED VIEW eu_orders DETACH;
+INSERT INTO orders VALUES (7, 'eu', 'dee', 40, 'paid');
+SELECT count(*) AS n FROM eu_orders;
+```
+
+```text
+n
+3
+```
+
+The order sent after `DETACH` (id 7) isn't in `eu_orders`: only the three eu orders it held.
+
 ## History per key (SCD type 2)
 
 A history view keeps every version of each key as it arrives, and gives each its `__start_at` and

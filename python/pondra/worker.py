@@ -492,6 +492,16 @@ def variables(head, _):
     return {"variables": sorted(out, key=lambda v: v["name"])}, []
 
 
+def _names_python(frame):
+    """Whether a frame's SQL names data or a frame of the Python it was written in: found only when
+    it runs (`db.sql` looks a name up there when the lake hasn't it), so such a frame runs here."""
+    import re
+    from pondra.client import _code, _data
+    from pondra.frame import Frame
+    words = set(re.findall(r"\w+", _code(frame.sql).lower()))
+    return any(k.lower() in words and (isinstance(v, Frame) or _data(v)) for where in frame._scopes for d in where for k, v in list(d.items()))
+
+
 def reply(value, name):
     """A procedure's answer: nothing; a frame's SQL (the node runs it: it may spread, and nothing
     crosses twice); or rows — a table, a list of dicts, one dict (a row) or one value."""
@@ -500,7 +510,7 @@ def reply(value, name):
     from pondra.frame import Frame
     if value is None or isinstance(value, dict) and not value:
         return {"kind": "none"}, b""
-    if isinstance(value, Frame) and not value._sent and not value._params:
+    if isinstance(value, Frame) and not value._sent and not value._params and not _names_python(value):
         return {"kind": "sql", "sql": value.sql}, b""
     if isinstance(value, (Frame, Result)):
         value = value.collect()

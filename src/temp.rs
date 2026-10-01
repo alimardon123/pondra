@@ -203,22 +203,29 @@ pub async fn statement(app: &App, stmt: &Stmt, files: bool) -> Result<Option<Val
     let session = current();
     match stmt {
         Stmt::Create(c) if c.temporary => return create(app, &session.context(NO_SESSION)?, c, files).await.map(Some),
-        Stmt::TempView(name, sql, replace) => {
+        Stmt::TempView(name, sql, replace, quiet) => {
             let s = session.context(NO_SESSION)?;
             ensure!(!name.contains('.'), "{name}: a temporary view's name has no schema (it is the session's)");
+            if *quiet && has(&s, name, false) {
+                return Ok(Some(j!({"view": name, "temporary": true, "exists": true}))); // (IF NOT EXISTS)
+            }
             ensure!(*replace || !has(&s, name, false), "temporary view {name} exists (CREATE OR REPLACE TEMP VIEW replaces it)");
             crate::query::session(&app.lake, sql, "").await?.sql(&crate::asof::rewrite(sql)?).await.with_context(|| format!("temporary view {name}"))?; // (it plans)
             with(&s, true, |x| Ok(x.views.insert(name.clone(), sql.clone())))?;
             return Ok(Some(j!({"view": name, "temporary": true})));
         }
-        Stmt::TempSecret(name, params, replace) => {
+        Stmt::TempSecret(name, params, replace, quiet) => {
             let s = session.context("a temporary secret is a session's: a Postgres connection's, or the Python or JavaScript client's (over HTTP, send x-pondra-session: <id>)")?;
             let secret = crate::ext::temporary(name, params.clone())?;
-            with(&s, true, |x| {
+            let kept = with(&s, true, |x| {
+                if *quiet && x.secrets.contains_key(name) {
+                    return Ok(false); // (IF NOT EXISTS)
+                }
                 ensure!(*replace || !x.secrets.contains_key(name), "temporary secret {name} exists (CREATE OR REPLACE TEMPORARY SECRET replaces it)");
-                Ok(x.secrets.insert(name.clone(), secret))
+                x.secrets.insert(name.clone(), secret);
+                Ok(true)
             })?;
-            return Ok(Some(j!({"secret": name, "temporary": true})));
+            return Ok(Some(if kept { j!({"secret": name, "temporary": true}) } else { j!({"secret": name, "temporary": true, "exists": true}) }));
         }
         Stmt::Ddl(d) => {
             for d in d {
@@ -255,6 +262,7 @@ pub async fn statement(app: &App, stmt: &Stmt, files: bool) -> Result<Option<Val
 async fn create(app: &App, s: &str, c: &ast::CreateTable, files: bool) -> Result<Value> {
     let name = crate::write::object(&c.name);
     ensure!(!name.contains('.'), "{name}: a temporary table's name has no schema (it is the session's)");
+    ensure!(!(c.or_replace && c.if_not_exists), "CREATE OR REPLACE TEMP TABLE … IF NOT EXISTS: one or the other");
     if has(s, &name, true) && !c.or_replace {
         ensure!(c.if_not_exists, "temporary table {name} exists");
         return Ok(j!({"table": name, "temporary": true, "unchanged": true}));

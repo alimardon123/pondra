@@ -47,9 +47,13 @@ export class Cell {
     this.liveEl = h('label', { class: 'live', title: 'Live: the answer again each time a commit changes what it reads (L)' }, this.liveBox, h('span', { class: 'switch' }), 'Live');
     this.num = h('span', { class: 'n' });
     this.status = h('span', { class: 'st', 'aria-live': 'polite' });
+    // (a SQL cell's answer, a frame, in the page's Python under this name: `%%sql df <<` in the file)
+    this.as = /^\w+$/.test(o.as || '') ? o.as : '';
+    this.asEl = h('input', { class: 'as', value: this.as, placeholder: '→ name', spellcheck: 'false', 'aria-label': 'Name its answer in Python', title: 'Its answer, a frame in the page\'s Python of this name',
+      onchange: e => { this.as = e.target.value.trim().replace(/\W/g, ''); e.target.value = this.as; this.nb.changed(); } });
     const tool = (ic, title, fn) => h('button', { class: 'icon', title, 'aria-label': title, onclick: fn }, icon(ic));
     const i = () => nb.cells.indexOf(this);
-    this.bar = h('div', { class: 'bar' }, this.num, this.kindSel, this.runBtn, this.liveEl, this.status,
+    this.bar = h('div', { class: 'bar' }, this.num, this.kindSel, this.runBtn, this.liveEl, this.asEl, this.status,
       h('span', { class: 'tools' }, tool('arrowUp', 'Move up', () => nb.move(this, -1)), tool('arrowDown', 'Move down', () => nb.move(this, 1)),
         tool('plus', 'Add a cell below (B)', () => nb.add({ kind: this.kind === 'markdown' ? 'sql' : this.kind }, this, true).edit()),
         tool('dots', 'More', e => menu(e.currentTarget, [{ label: 'Run the cells above', icon: 'arrowUp', run: () => nb.runSome(0, i()) }, { label: 'Run this and the cells below', icon: 'arrowDown', run: () => nb.runSome(i()) }, '-',
@@ -90,6 +94,7 @@ export class Cell {
     if (!quiet && was !== k && this.src.trim()) this.ed.value = convert(this.src, was, k); // (SQL and Python cells: one written as the other)
     this.el.dataset.kind = k; this.kindSel.replaceChildren(this.type.label, icon('chevd', 'ic', 12));
     this.liveEl.hidden = !this.type.live;
+    this.asEl.hidden = k !== 'sql';
     if (!this.type.live) { this.stopLive(); this.liveBox.checked = false; }
     this.ta.placeholder = this.type.placeholder || '';
     if (k === 'markdown') drawMd(this.md, this.src);
@@ -134,7 +139,7 @@ export class Cell {
     const tick = setInterval(() => { this.status.textContent = 'running… ' + secs(performance.now() - t0); }, 250);
     let r;
     try {
-      r = await this.type.run(text, ctl.signal);
+      r = await this.type.run(text, ctl.signal, this);
     } catch (e) {
       r = failed(e);
     } finally {
@@ -249,7 +254,7 @@ export function cellsOf(nb) {
     if (c.cell_type !== 'code') return { kind: 'markdown', src, id: c.id };
     const magic = src.match(/^%%sql[^\n]*(\n|$)/);
     const p = c.metadata?.pondra || {};
-    return { kind: magic ? 'sql' : 'python', src: magic ? src.slice(magic[0].length) : src, id: c.id, live: !!p.live, view: p.view, chart: p.chart, out: savedAnswer(c.outputs) };
+    return { kind: magic ? 'sql' : 'python', src: magic ? src.slice(magic[0].length) : src, as: magic?.[0].match(/^%%sql\s+(\w+)\s*<</)?.[1], id: c.id, live: !!p.live, view: p.view, chart: p.chart, out: savedAnswer(c.outputs) };
   });
 }
 export const cleanName = s => s.trim().replace(/\.ipynb$/i, '').replace(/^notebooks\//, '').replace(/[^\w.-]+/g, '-').replace(/^[.-]+|-+$/g, '').slice(0, 80);
@@ -363,7 +368,7 @@ export class Notebook {
     return {
       cells: this.cells.map(c => c.kind === 'markdown'
         ? { cell_type: 'markdown', id: c.id, metadata: {}, source: lines(c.src) }
-        : { cell_type: 'code', id: c.id, metadata: pondraOf(c), execution_count: c.result ? c.count ?? null : null, source: lines(c.kind === 'sql' ? '%%sql\n' + c.src : c.src), outputs: outputs(c) }),
+        : { cell_type: 'code', id: c.id, metadata: pondraOf(c), execution_count: c.result ? c.count ?? null : null, source: lines(c.kind === 'sql' ? `%%sql${c.as ? ` ${c.as} <<` : ''}\n` + c.src : c.src), outputs: outputs(c) }),
       metadata: { kernelspec: { name: 'python3', display_name: 'Python 3', language: 'python' }, language_info: { name: 'python' }, pondra: { database: S.db || S.lake } },
       nbformat: 4, nbformat_minor: 5,
     };

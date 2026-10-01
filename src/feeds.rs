@@ -138,6 +138,11 @@ async fn shard(app: App, view: String, p: i32) -> Result<()> {
                 return Err(e);
             }
         };
+        // (made again, detached or dropped meanwhile: this run ends, and the loop starts the feed as
+        // it is now; an append already made against the old offsets is refused by its `prev`)
+        if lake.cat.get::<Feed>(&feed_key(&view)).await?.as_ref() != Some(&feed) {
+            return Ok(());
+        }
         at = Some(next.max(from));
         if recs.is_empty() {
             continue;

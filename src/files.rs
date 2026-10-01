@@ -311,7 +311,7 @@ pub async fn versions(lake: &Lake, path: &str) -> anyhow::Result<Vec<Version>> {
             }
         }
     }
-    out.sort_by(|a, b| b.ms.cmp(&a.ms));
+    out.sort_by(|a, b| (b.ms, &b.id).cmp(&(a.ms, &a.id))); // (saves in the same millisecond: by id, which is dated)
     Ok(out)
 }
 

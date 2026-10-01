@@ -559,6 +559,9 @@ async function restart() {
   kernel('none'); S.vars = []; toast('Python restarted: its variables are gone'); if (S.tab === 'variables') detail();
 }
 H.restart = restart;
+/** A SQL cell: on the node, unless the page's Python is in it (`more.js`: a table of its named, or
+ * its answer named `→ df`). */
+const sqlCell = async (text, signal, cell) => cell?.as || S.vars?.length ? (await more()).sqlCell(text, signal, cell) : run(text, signal, undefined, S.pageRows);
 async function readVars() { const v = await (await call(`/sessions/${SESSION}/python`)).json(); S.vars = v.variables || []; if (v.python) S.pyInfo = v.python; return v; }
 /** The Python chip of a notebook's or a Python file's toolbar: whether it runs, and its menu. */
 H.pythonPill = () => {
@@ -715,7 +718,7 @@ document.addEventListener('focusin', e => { const tree = e.target.closest?.('[ro
 
 // ------------------------------------------------------------------ what the core registers (as an extension would)
 function core() {
-  register.cellKind({ id: 'sql', label: 'SQL', language: 'sql', placeholder: 'SELECT …', live: true, run: (text, signal) => run(text, signal, undefined, S.pageRows) });
+  register.cellKind({ id: 'sql', label: 'SQL', language: 'sql', placeholder: 'SELECT …', live: true, run: sqlCell });
   register.cellKind({ id: 'python', label: 'Python', language: 'python', placeholder: 'db.sql("SELECT …")      # runs on the node; cells share variables', run: async (text, signal) => { kernel('busy'); try { return await run(doBlock(text), signal, undefined, S.pageRows); } finally { kernel('idle'); } } });
   register.cellKind({ id: 'markdown', label: 'Markdown', language: 'markdown', placeholder: 'Markdown: # a heading, **bold**, *italic*, [a link](https://…), ![a picture](data/chart.png), - a list, | a | table |' });
   register.renderer({ id: 'error', order: 10, match: r => r.kind === 'error', render: r => h('pre', { class: 'err' }, r.message) });
