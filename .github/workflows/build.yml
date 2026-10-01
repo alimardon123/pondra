@@ -53,7 +53,8 @@ jobs:
         run: |
           if [ -n "${{ matrix.zig }}" ]; then
             pip install ziglang cargo-zigbuild
-            cargo zigbuild --profile dist --target ${{ matrix.zig }}
+            # (zig's linker says, on every build, that it ignores the -Wl,-O1 rustc passes it: not a warning of ours)
+            RUSTFLAGS="-A linker_messages" cargo zigbuild --profile dist --target ${{ matrix.zig }}
           else
             cargo build --profile dist --target ${{ matrix.target }}
           fi
