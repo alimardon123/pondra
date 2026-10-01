@@ -6,9 +6,12 @@ name: build
 # packages installed and tried as users get them (tools/try_packages.sh). The Linux job then runs
 # the suite on its binary, while the others finish (the slowest, macOS Intel, doesn't hold it up).
 # A tag's release (release.yml) publishes this run's packages: nothing is built twice, and what
-# the suite tested is what ships.
+# the suite tested is what ships. A pull request to main gets the same run, so a branch is tried
+# on every platform before it is merged.
 on:
   push:
+    branches: [main]
+  pull_request:
     branches: [main]
   workflow_dispatch:
 
