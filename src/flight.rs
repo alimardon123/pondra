@@ -232,7 +232,7 @@ async fn log_stream(app: App, table: String, after: Option<u64>, columns: Option
     let after = after.unwrap_or_else(|| app.lake.visible());
     let hwm = app.lake.hwm.subscribe();
     let first = FlightDataEncoderBuilder::new().with_schema(schema.clone()).build(futures::stream::empty()).map_err(Status::from);
-    let chunks = futures::stream::unfold((app, hwm, after, false), move |(app, mut hwm, after, done)| {
+    let chunks = futures::stream::unfold((app, hwm, after, false), move |(app, mut hwm, mut after, done)| {
         let (table, schema, pick) = (table.clone(), schema.clone(), pick.clone());
         async move {
             loop {
@@ -243,6 +243,10 @@ async fn log_stream(app: App, table: String, after: Option<u64>, columns: Option
                 let now = app.lake.visible();
                 if now > after || !follow {
                     let rows = crate::query::tail(&app.lake, &table, after, Some(now), false).await.map_err(status);
+                    if follow && rows.as_ref().is_ok_and(|r| r.iter().all(|b| b.num_rows() == 0)) {
+                        after = now; // (commits to other tables: nothing to send while following)
+                        continue;
+                    }
                     let chunk = rows.and_then(|rows| {
                         let rows = rows.iter().map(|b| b.project(&pick)).collect::<Result<Vec<_>, _>>().map_err(status)?;
                         let mut data: Vec<Result<FlightData, Status>> = arrow_flight::utils::batches_to_flight_data(&schema, rows).map_err(status)?.into_iter().skip(1).map(Ok).collect(); // (the schema went first)

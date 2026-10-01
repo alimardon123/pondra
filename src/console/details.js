@@ -89,7 +89,7 @@ export function objectDetail(t) {
       flags.length ? h('div', { class: 'sub' }, flags.join(' · ')) : null, h('div', { class: 'ps' }));
   });
   const flow = h('div');
-  if (o.kind === 'table' || o.kind === 'materialized view') pipeline(t, flow);
+  if (o.kind === 'table' || o.kind === 'materialized view') flowOf(t, flow);
   const profileBtn = act('columns', 'Data profile', 'Each column: NULLs, distinct values, range and spread (reads the whole table)', () => profile(t.q, t.columns, cols, profileBtn));
   return [head(ic, t.t, `${word} · ${t.c}.${t.s}`, 'k-table'),
     h('div', { class: 'acts2' }, act('play', 'Preview', 'Its first rows (or double-click it)', () => query(`SELECT * FROM ${t.q} LIMIT 100`)), profileBtn, act('copy', 'Copy name', `Copy ${t.q}`, () => navigator.clipboard?.writeText(t.q).then(() => toast(`Copied ${t.q}`)))),
@@ -98,17 +98,17 @@ export function objectDetail(t) {
     flow, o.sql ? h('div', { class: 'dsect' }, o.kind === 'files' ? 'Reads' : 'Definition') : null, o.sql ? h('pre', { class: 'defn', html: highlighted(o.sql, 'sql') }) : null,
     h('div', { class: 'dsect' }, 'Columns'), ...cols];
 }
-// A materialized view's pipeline: what it follows, back to its tables, and what follows it; its
-// expectations with the rows that broke each (pondra.pipelines, pondra.expectations: ADR-036).
-function pipeline(t, box) {
+// A materialized view's flow: what it follows, back to its tables, and what follows it; its
+// expectations with the rows that broke each (pondra.flows, pondra.expectations: ADR-036).
+function flowOf(t, box) {
   const me = t.s === 'public' ? t.t : `${t.s}.${t.t}`;
-  rows('SELECT name, follows FROM pondra.pipelines').then(async r => {
+  rows('SELECT name, follows FROM pondra.flows').then(async r => {
     const by = new Map(r.map(x => [x.name, x.follows])), up = [];
     for (let n = me; by.has(n) && up.length < 20;) up.unshift(n = by.get(n));
     const down = r.filter(x => x.follows === me).map(x => x.name);
     if (!up.length && !down.length) return;
     const nm = n => h('span', { class: n === me ? 'fl cur' : 'fl' }, n), arr = () => h('span', { class: 'arr' }, '→');
-    box.append(h('div', { class: 'dsect' }, 'Pipeline'), h('div', { class: 'flow' }, ...[...up, me].flatMap((n, i) => [i ? arr() : null, nm(n)]),
+    box.append(h('div', { class: 'dsect' }, 'Flow'), h('div', { class: 'flow' }, ...[...up, me].flatMap((n, i) => [i ? arr() : null, nm(n)]),
       ...(down.length ? [arr(), ...down.map(nm)] : [])));
     if (!by.has(me)) return;
     const e = await rows(`SELECT expectation, condition, on_violation, failed_rows FROM pondra.expectations WHERE view = '${me.replace(/'/g, "''")}'`);

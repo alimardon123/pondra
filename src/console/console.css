@@ -215,6 +215,9 @@ header{height:48px;display:flex;align-items:center;gap:10px;padding:0 10px 0 16p
 .live input:checked+.switch{background:var(--ok)}.live input:checked+.switch::after{left:14px}
 .live input:focus-visible+.switch{outline:2px solid var(--accent);outline-offset:1px}
 .cell:not(.sel):not(:hover) .live:not(:has(input:checked)){opacity:0}
+.as{display:inline-flex;align-items:center;gap:5px;font-size:12px;color:var(--muted);white-space:nowrap}.as svg{width:14px;height:14px}
+.as input{field-sizing:content;min-width:7ch;max-width:20ch;font:12px var(--mono);padding:1px 6px;border:1px solid var(--line);border-radius:6px;background:var(--surface);color:var(--ink)}
+.as input:not(:placeholder-shown){color:var(--accent);font-weight:600}.cell:not(.sel):not(:hover) .as:has(input:placeholder-shown){opacity:0}
 .run{display:inline-flex;gap:5px;align-items:center;height:26px;border:0;border-radius:6px;padding:0 10px 0 8px;font-size:12px;font-weight:600;cursor:pointer;background:transparent;color:var(--accent);box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--accent) 40%,transparent)}
 .cell.sel .run{background:var(--accent);color:var(--on-accent);box-shadow:none}
 .run.stop,.cell.sel .run.stop{background:var(--err);color:#fff;box-shadow:none}
@@ -292,8 +295,8 @@ header{height:48px;display:flex;align-items:center;gap:10px;padding:0 10px 0 16p
 .pinfo{display:flex;align-items:center;gap:8px;color:var(--muted);font-size:12px;font-variant-numeric:tabular-nums;white-space:nowrap;flex:none}
 .pbody{flex:1;min-height:0;overflow:auto;padding:10px 12px;display:flex;flex-direction:column}
 .pbody>.said{max-height:none;flex:1}.pbody>.err{max-height:none;flex:none}
-.stmts{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 10px;flex:none}
-.stmt{display:inline-flex;align-items:center;gap:7px;height:26px;padding:0 10px 0 4px;border:1px solid var(--line);border-radius:7px;background:var(--surface);color:var(--muted);font-size:12px;cursor:pointer}
+.stmts{display:flex;gap:6px;margin:0 0 10px;flex:none;overflow-x:auto;scrollbar-width:thin}
+.stmt{flex:none;display:inline-flex;align-items:center;gap:7px;height:26px;padding:0 10px 0 4px;border:1px solid var(--line);border-radius:7px;background:var(--surface);color:var(--muted);font-size:12px;cursor:pointer}
 .stmt b{display:inline-grid;place-items:center;min-width:18px;height:18px;padding:0 4px;border-radius:5px;background:var(--hover);color:var(--ink);font-size:11px;font-weight:600}
 .stmt:hover{color:var(--ink)}.stmt.on{border-color:var(--accent);color:var(--ink);background:var(--accent-soft)}.stmt.on b{background:var(--accent);color:var(--on-accent)}
 .stmt.bad{color:var(--err)}.stmt.bad b{background:var(--err-soft);color:var(--err)}.stmt.on.bad{border-color:var(--err);background:var(--err-soft)}.stmts-left{align-self:center;font-size:12px;color:var(--faint)}
@@ -429,13 +432,6 @@ dialog.pop,dialog.settings{padding:0;max-width:620px}
 .pop-b .defn{max-height:40vh}
 .fform{display:grid;grid-template-columns:150px 1fr;gap:8px;align-items:center}.fform p{grid-column:1/-1}
 /* the Messages tab: each statement */
-.msgs{display:flex;flex-direction:column;gap:8px}
-.msg{border:1px solid var(--line2);border-radius:8px;background:var(--surface)}.msg.on{border-color:color-mix(in srgb,var(--accent) 50%,var(--line))}.msg.bad{border-color:color-mix(in srgb,var(--err) 40%,var(--line))}
-.msg-h{display:flex;align-items:center;gap:8px;width:100%;min-height:32px;padding:4px 10px 4px 6px;border:0;background:transparent;color:var(--ink);cursor:pointer;text-align:left;font-size:12.5px}
-.msg-h:hover{background:var(--hover)}.msg-h b{display:inline-grid;place-items:center;min-width:18px;height:18px;border-radius:5px;background:var(--hover);font-size:11px}
-.msg-h code{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font:12px var(--mono)}.msg-h .m{color:var(--muted);white-space:nowrap;font-variant-numeric:tabular-nums}
-.msg-h .ic{color:var(--ok)}.msg.bad .msg-h .ic{color:var(--err)}
-.msg>pre{margin:0;padding:6px 12px 8px 36px;max-height:220px;border-top:1px solid var(--line2)}
-.stmt .q{max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font:11.5px var(--mono)}.stmt .m{color:var(--faint)}
+.stmt .m{color:var(--faint)}
 /* the right pane's tabs move by dragging; the top bar's History shows when on */
 .rtab.drop{box-shadow:inset 2px 0 0 var(--accent)}#runsBtn.on{color:var(--accent);background:var(--accent-soft)}

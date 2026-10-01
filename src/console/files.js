@@ -204,6 +204,7 @@ export function splitPanel(doc, panel) {
 }
 
 // ------------------------------------------------------------------ a SQL file: its results below
+export const said = x => x.kind === 'rows' ? `${count(x.total)} row${x.total === 1 ? '' : 's'}` : x.kind === 'error' ? 'failed' : 'done';
 export class SqlDoc extends TextDoc {
   constructor(o = {}) {
     super({ ...o, kind: 'sql', language: 'sql', untitled: o.untitled || 'queries/untitled.sql' });
@@ -216,7 +217,7 @@ export class SqlDoc extends TextDoc {
     this.pbar = h('div', { class: 'params', role: 'group', 'aria-label': 'Parameters', hidden: true });
     this.main.prepend(this.pbar);
     splitPanel(this, this.panel);
-    this.ed.menu = some => ['-', { label: some ? 'Run selection' : 'Run file', icon: 'play', keys: 'Ctrl Enter', run: () => this.run() }, ...this.ed.formats(formatSql, 'file', true), '-', ...this.jobs(true)];
+    this.ed.menu = some => ['-', { label: some ? 'Run selection' : 'Run file', icon: 'play', keys: 'Ctrl Enter', run: () => this.run() }, this.explainItem(), ...this.ed.formats(formatSql, 'file', true), '-', ...this.jobs(true)];
     this.draw(); this.paramsBar();
   }
   /** The statement the caret is in, or what is selected: what Create as… makes a table or a view of. */
@@ -227,14 +228,18 @@ export class SqlDoc extends TextDoc {
     for (const q of list) { const i = v.indexOf(q, seek); seek = i < 0 ? seek : i + q.length; if (i >= 0 && at <= seek + 1) return q; }
     return list.at(-1) || '';
   }
+  /** Explain: the plan of the statement selected, or the one the caret is in, without running it. */
+  explain() { const x = R.helpers.explain(this.current(), this.params()); this.results = [x]; this.result = x; this.todo = 1; this.tab = 'results'; this.draw(); R.helpers.pane('bottom', true); }
+  explainItem() { return { label: 'Explain: its plan, not run', icon: 'plan', keys: 'Ctrl Shift E', run: () => this.explain() }; }
   /** Format the SQL selected (or all of it): its words in capitals, a clause a line. */
   format() { this.ed.reformat(formatSql); }
   key(e) {
     if (e.shiftKey && e.altKey && e.key.toLowerCase() === 'f') { e.preventDefault(); this.format(); return true; }
+    if (e.shiftKey && (e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'e') { e.preventDefault(); this.explain(); return true; }
     return super.key(e);
   }
   get hasPanel() { return true; }
-  changed() { super.changed(); clearTimeout(this.pt); this.pt = setTimeout(() => this.paramsBar(), 250); }
+  changed() { super.changed(); clearTimeout(this.pt); this.pt = setTimeout(() => { this.paramsBar(); this.marks(); }, 250); }
   /** The file's `$name`s, an input each above the editor: their values go with every run, bound
    * on the node (ADR-033), and are kept in this browser for the file. */
   paramsBar() {
@@ -292,16 +297,20 @@ export class SqlDoc extends TextDoc {
   /** Point at a statement that ran: the caret at its start, in sight, if the text there is still
    * it (not selected: Run would then run it alone). */
   point(x) { const [a, b] = x.at || []; if (a != null && this.ed.value.slice(a, b) === x.sql) { this.ed.focus(); this.ed.ta.setSelectionRange(a, a); this.ed.reveal(); } }
+  /** Each answer's number beside its statement in the file (while the text there is still it), the
+   * one shown (or `hover`ed) with its lines tinted. */
+  marks(hover) { if (this.results?.length > 1 || this.ed.marks) import('./stmts.js').then(m => m.marks(this, hover)); }
   /** The panel: Results (the grid), Messages (each statement: what it printed and did), Chart, Data
    * profile (each column's NULLs, distinct values, range and spread) and Plan (a graph of EXPLAIN,
    * and its query profile: the time each step took). */
   draw() {
     const r = this.result, tab = (id, label, ic) => h('button', { class: 'ptab' + (this.tab === id ? ' on' : ''), role: 'tab', 'aria-label': label, 'aria-selected': String(this.tab === id), onclick: () => { this.tab = id; this.draw(); } }, ic ? icon(ic) : null, h('span', { class: 'tl' }, label));
+    this.marks();
     this.tabs.replaceChildren(tab('results', 'Results'), tab('messages', 'Messages'), tab('chart', 'Chart', 'chart'), tab('profile', 'Data profile', 'columns'), tab('plan', 'Plan', 'plan'));
     const name = this.title.replace(/\.sql$/i, ''), rowsOk = r?.kind === 'rows';
     const text = (f, headers) => this.gridEl?.grid ? this.gridEl.grid.text(f, headers) : '';
     // (how many rows and how long: on the line under the rows, as a cell's answer has it)
-    fill(this.info, r && !rowsOk ? h('span', { class: 'n t' }, secs(r.ms)) : null,
+    fill(this.info, r && !rowsOk && r.ms != null ? h('span', { class: 'n t' }, secs(r.ms)) : null,
       split('copy', 'Copy the rows (or the selection), tab-separated, with the headers', () => rowsOk && copyText(text('tsv', true), 'Copied, with the headers'),
         () => [{ head: 'Copy the rows (or the selection)' }, ...COPIES.map(([f, label, headers]) => ({ label, run: () => rowsOk && copyText(text(f, headers), 'Copied') }))], !rowsOk),
       split('down', 'Download the rows as CSV (all of them: the statement runs again on the node)', () => rowsOk && fetchRows(r, 'csv', name),
@@ -310,22 +319,15 @@ export class SqlDoc extends TextDoc {
     if (!r) { this.body.replaceChildren(h('div', { class: 'wait' }, this.running ? 'Running…' : h('span', {}, 'Run the file, or what is selected: ', h('kbd', {}, 'Ctrl'), ' ', h('kbd', {}, 'Enter')))); return; }
     const many = this.results?.length > 1 || this.running && this.todo > 1;
     if (this.tab === 'results') {
-      const strip = many ? h('div', { class: 'stmts', role: 'group', 'aria-label': 'The statements\' answers' }, this.results.map((x, k) =>
-        h('button', { class: 'stmt' + (x === r ? ' on' : '') + (x.kind === 'error' ? ' bad' : ''), 'aria-pressed': String(x === r), title: x.sql,
-          onclick: () => { this.result = x; this.draw(); this.point(x); } }, h('b', {}, String(k + 1)), h('span', { class: 'q' }, oneLine(x.sql, 40)), h('span', { class: 'm' }, x.kind === 'rows' ? `${count(x.total)} row${x.total === 1 ? '' : 's'}` : x.kind === 'error' ? 'failed' : 'done'))),
+      const strip = many ? h('div', { class: 'stmts', role: 'group', 'aria-label': 'The statements\' answers, numbered as in the file' }, this.results.map((x, k) =>
+        h('button', { class: 'stmt' + (x === r ? ' on' : '') + (x.kind === 'error' ? ' bad' : ''), 'aria-pressed': String(x === r), title: `${x.sql}\n\n(its lines are marked ${k + 1} in the file)`,
+          onclick: () => { this.result = x; this.draw(); this.point(x); }, onmouseenter: () => this.marks(k + 1), onmouseleave: () => this.marks() }, h('b', {}, String(k + 1)), h('span', { class: 'm' }, said(x)))),
         this.running ? h('span', { class: 'stmt wait pulse' }, h('b', {}, String(this.results.length + 1)), `of ${this.todo}…`)
           : this.results.length < this.todo ? h('span', { class: 'stmts-left' }, `${this.todo - this.results.length} after it not run`) : null) : null;
       if (r.kind === 'rows') { this.gridEl = grid(r, { fill: true, name, explore: i => R.helpers.explore(r, i) }); fill(this.body, strip, this.gridEl); }
       else fill(this.body, strip, ...answer(r));
     } else if (this.tab === 'messages') {
-      const all = this.results?.length ? this.results : [r];
-      this.body.replaceChildren(h('div', { class: 'msgs' }, all.map((x, k) => h('div', { class: 'msg' + (x.kind === 'error' ? ' bad' : '') + (x === r ? ' on' : '') },
-        h('button', { class: 'msg-h', title: x.sql + '\n\n(click: its answer, and the statement selected in the file)', onclick: () => { this.result = x; this.tab = x.kind === 'rows' ? 'results' : 'messages'; this.draw(); this.point(x); } },
-          h('b', {}, String(k + 1)), h('span', { class: 'ic', html: svg(x.kind === 'error' ? 'close' : 'check', 13) }), h('code', {}, oneLine(x.sql, 160)),
-          h('span', { class: 'm' }, x.kind === 'rows' ? `${count(x.total)} row${x.total === 1 ? '' : 's'}` : x.kind === 'error' ? 'failed' : 'done', ' · ', secs(x.ms))),
-        [...x.notices || [], x.kind === 'done' ? doneText(x.value) : x.kind === 'error' ? x.message : null].filter(Boolean).length
-          ? h('pre', { class: x.kind === 'error' ? 'err' : 'said' }, [...x.notices || [], x.kind === 'done' ? doneText(x.value) : x.kind === 'error' ? x.message : null].filter(Boolean).join('\n')) : null)),
-        this.results.length < this.todo && !this.running ? h('div', { class: 'stmts-left' }, `${this.todo - this.results.length} after it not run`) : null));
+      import('./stmts.js').then(m => { if (this.tab === 'messages' && this.result === r) this.body.replaceChildren(m.messages(this, r)); }); // (each statement: what it printed and did)
     } else if (this.tab === 'profile') {
       if (r.kind !== 'rows') { this.body.replaceChildren(h('div', { class: 'wait' }, 'A data profile needs rows.')); return; }
       import('./details.js').then(m => { if (this.tab === 'profile' && this.result === r) this.body.replaceChildren(m.dataProfile(r)); });
@@ -346,7 +348,7 @@ export class SqlDoc extends TextDoc {
     return [...this.crumbs(), h('span', { class: 'grow' }),
       R.helpers.runButton(this.running, { label: 'Run', title: 'Run the file, or what is selected (Ctrl+Enter)', run: () => this.run(), stop: () => this.stop(), stopTitle: 'Stop waiting for it' }, () => [
         { label: 'Run selection', icon: 'play', keys: some() ? 'Ctrl Enter' : null, disabled: !some(), run: () => this.run() },
-        { label: 'Run file', keys: some() ? null : 'Ctrl Enter', run: () => { this.ed.ta.setSelectionRange(0, 0); this.run(); } }, '-',
+        { label: 'Run file', keys: some() ? null : 'Ctrl Enter', run: () => { this.ed.ta.setSelectionRange(0, 0); this.run(); } }, this.explainItem(), '-',
         ...this.ed.formats(formatSql, 'file', true), '-', ...this.jobs(true, false)]),
       h('span', { class: 'sep' }), db, R.helpers.saveButton(this), moreBtn(() => this.more())];
   }

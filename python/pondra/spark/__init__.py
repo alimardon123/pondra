@@ -16,7 +16,7 @@ import re
 import sys
 
 from .. import client as _client
-from ..frame import Frame, _literal, _quote, sql_expr
+from ..frame import Frame, _literal, _quote, sql_expr, trailing_order
 
 _ids = itertools.count(1)
 _SIMPLE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*$")
@@ -314,13 +314,23 @@ class SparkSession:
         return cls._active
 
     def sql(self, query, args=None, **kwargs):
-        """A DataFrame for a query (DataFrames by keyword as `{name}`, `args` as `:name` or
-        `$name` parameters); other statements run now, as PySpark's do."""
+        """A DataFrame for a query, read as Spark SQL: `"text"` a string, `LATERAL VIEW explode`,
+        `DIV`, `<=>`, and Spark's answers where Spark and Pondra share a function's name (`floor`,
+        `substring`…), through the node's `spark_sql('…')`; DataFrames by keyword as `{name}`,
+        `args` as `:name` or `$name` parameters. Other statements run now, as PySpark's do, in
+        Pondra's SQL."""
         names = {k: (v._f if isinstance(v, DataFrame) else v) for k, v in kwargs.items()}
         params = dict(args or {})
         query = re.sub(r":(\w+)\b", lambda m: f"${m.group(1)}" if m.group(1) in params else m.group(0), query)
+        order = None
+        if _client._is_query(query):
+            order = trailing_order(re.sub(r"`([^`]*)`", r'"\1"', query))
+            query = f"SELECT * FROM spark_sql({_literal(query)})"  # (the node runs it as the query itself, its sort included)
         caller = sys._getframe(1)
         out = _sql_from(self.con, query, caller, names, params)
+        if isinstance(out, Frame) and order:  # (the steps after it sort again, as SQL drops a CTE's sort: by columns it keeps)
+            columns = out.columns
+            out._order = order if all(n in columns for _, n in order) else None
         return DataFrame(self, out if isinstance(out, Frame) else self.con.sql("SELECT 1 AS done WHERE FALSE"))  # (DDL and writes: done, as PySpark's)
 
     def table(self, name):

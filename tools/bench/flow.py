@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""What a pipeline costs (ADR-036 §1): ingest with no view, then with a pipeline one stage longer
+"""What a flow costs (ADR-036 §1): ingest with no view, then with a flow one stage longer
 each run — silver (row by row, two expectations), gold (a GROUP BY of silver), platinum (a rollup of
 gold) — each run on a fresh lake, the same producers for the same time. Reports rows a second, the
 append latency (an acknowledged append has every stage committed with it), and whether every stage
 equals its query over the source at the moment the producers stop: no waiting, no lag.
 
-  pipeline.py [--bin target/release/pondra] [--secs 15] [--producers 4] [--batch 1000]
+  flow.py [--bin target/release/pondra] [--secs 15] [--producers 4] [--batch 1000]
 """
 import argparse, json, os, random, shutil, statistics, subprocess, sys, tempfile, threading, time, urllib.request
 

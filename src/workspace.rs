@@ -83,12 +83,14 @@ async fn latest(app: &App, notebook: &str) -> Result<String> {
     found.into_iter().map(|m| m.location.to_string()).filter(|p| p.ends_with(".ipynb")).max().with_context(|| format!("run: no notebook {notebook} (none saved)"))
 }
 
-/// A notebook's code cells, in order: each SQL (`%%sql`) or Python, and which one takes the
-/// parameters (tagged `parameters`, as papermill's).
+/// A notebook's code cells, in order: each SQL (`%%sql`) or Python, which one takes the
+/// parameters (tagged `parameters`, as papermill's), and the name a SQL cell's answer has in
+/// Python (`%%sql df <<`, as Pondra's Jupyter magic writes it).
 struct Cell {
     python: bool,
     code: String,
     parameters: bool,
+    name: Option<String>,
 }
 
 fn notebook(text: &str) -> Result<Vec<Cell>> {
@@ -104,15 +106,19 @@ fn notebook(text: &str) -> Result<Vec<Cell>> {
         }
         let src = source(c);
         let tags = c["metadata"]["tags"].as_array().map_or(false, |t| t.iter().any(|t| t == "parameters"));
-        let (python, code) = match src.trim_start().strip_prefix("%%sql") {
-            Some(rest) => (false, rest.split_once('\n').map_or("", |(_, body)| body).to_string()),
+        let (python, code, name) = match src.trim_start().strip_prefix("%%sql") {
+            Some(rest) => {
+                let (head, body) = rest.split_once('\n').unwrap_or((rest, ""));
+                let name = head.trim().strip_suffix("<<").map(str::trim).filter(|n| !n.is_empty() && n.chars().all(|c| c.is_alphanumeric() || c == '_')).map(String::from);
+                (false, body.to_string(), name)
+            }
             None => (true, src.lines().map(|l| match l.trim_start().starts_with(['%', '!']) {
                 true => format!("{}pass", &l[..l.len() - l.trim_start().len()]), // (a magic or a shell line: Jupyter's, not Python)
                 false => l.to_string(),
-            }).collect::<Vec<_>>().join("\n")),
+            }).collect::<Vec<_>>().join("\n"), None),
         };
         if !code.trim().is_empty() {
-            out.push(Cell { python, code, parameters: tags });
+            out.push(Cell { python, code, parameters: tags, name });
         }
     }
     Ok(out)
@@ -132,13 +138,35 @@ async fn cells(app: &App, path: &str, text: &str, row: &RecordBatch, values: &Ha
             pending = false;
         }
         let (name, job) = (format!("{path}, cell {}", i + 1), job.as_ref().map(|j| format!("{j}:c{i}")));
+        let ran_python = all[..i].iter().any(|c| c.python);
+        let query = crate::write::parse(&c.code).is_none() && crate::routines::split(&c.code).len() == 1;
         last = match c.python {
             true => python(app, &name, &c.code, None, session, who, job, heard).await,
-            false => Box::pin(crate::routines::script(app, &c.code, values, &HashMap::new(), who, job)).await,
+            // (a query naming a table of the run's Python: through Python, which sends it along)
+            false if query && ran_python && python_tables(session, &c.code).await => {
+                let v = c.name.as_deref().unwrap_or("_sql");
+                python(app, &name, &format!("{v} = db.sql({})\n{v}", j!(c.code.trim())), None, session, who, job, heard).await
+            }
+            false => {
+                let out = Box::pin(crate::routines::script(app, &c.code, values, &HashMap::new(), who, job)).await;
+                if let (Ok(_), Some(v), true) = (&out, &c.name, query && all[i + 1..].iter().any(|c| c.python)) {
+                    python(app, &name, &format!("{v} = db.sql({})", j!(c.code.trim())), None, session, who, None, heard).await?; // (its answer, a frame, for the Python cells after it)
+                }
+                out
+            }
         }
         .map_err(|e| e.context(format!("cell {}", i + 1)))?;
     }
     Ok(last)
+}
+
+/// Does `sql` name a table the session's Python holds (pandas, Polars, Arrow, a frame)?
+async fn python_tables(session: &str, sql: &str) -> bool {
+    let Ok(v) = crate::python::variables(session).await else { return false };
+    v["variables"].as_array().into_iter().flatten().any(|v| {
+        let (name, kind) = (v["name"].as_str().unwrap_or_default(), v["type"].as_str().unwrap_or_default());
+        ["pandas.", "polars.", "pyarrow.", "pondra.frame."].iter().any(|p| kind.starts_with(p)) && crate::ddl::mentions(sql, name)
+    })
 }
 
 /// Python code in the run's own namespace (a worker for the run, as a notebook's kernel): `vars`

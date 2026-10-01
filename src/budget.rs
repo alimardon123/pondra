@@ -51,14 +51,14 @@ impl Gate {
             self.cap.fetch_add(1, Relaxed);
             match self.owed.load(Relaxed) {
                 0 => self.turns.add_permits(1),
-                _ => drop(self.owed.fetch_update(Relaxed, Relaxed, |o| o.checked_sub(1))), // (one owed less instead)
+                _ => drop(self.owed.try_update(Relaxed, Relaxed, |o| o.checked_sub(1))), // (one owed less instead)
             }
         }
     }
 
     /// A turn handed back: kept, or taken back if owed.
     fn hand_back(&self, turn: tokio::sync::SemaphorePermit<'_>) {
-        if self.owed.fetch_update(Relaxed, Relaxed, |o| o.checked_sub(1)).is_ok() {
+        if self.owed.try_update(Relaxed, Relaxed, |o| o.checked_sub(1)).is_ok() {
             turn.forget();
         }
     }

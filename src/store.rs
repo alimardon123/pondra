@@ -413,6 +413,7 @@ pub struct Lake {
     pub attached: std::sync::RwLock<Vec<(String, Arc<Lake>)>>, // other lakes, read as `name.table` (`--attach`)
     cached: Option<Arc<crate::cache::CachedStore>>, // what DataFusion reads the bucket through
     pub ids: crate::sys::Ids, // the row ids this process stamps rows with (a block reserved from the leader)
+    pub caught: watch::Sender<bool>, // false while a node that just started catches up with its leader (`caught_up`)
     me: std::sync::Weak<Lake>,
 }
 
@@ -567,7 +568,7 @@ impl Lake {
             },
         };
         let hwm = watch::Sender::new(cat.get::<u64>("n").await?.unwrap_or(1) - 1);
-        let lake = Arc::new_cyclic(|me| Lake { url, store, cat, hwm, backlog: Default::default(), rt, tail: Mutex::new((lru::LruCache::unbounded(), 0)), disk, groups: crate::serve::Groups::new(cache_mb() << 19), hot: Arc::new(crate::hot::Hot::new()), attached: Default::default(), ids: Default::default(), cached: cached_store, me: me.clone() });
+        let lake = Arc::new_cyclic(|me| Lake { url, store, cat, hwm, backlog: Default::default(), rt, tail: Mutex::new((lru::LruCache::unbounded(), 0)), disk, groups: crate::serve::Groups::new(cache_mb() << 19), hot: Arc::new(crate::hot::Hot::new()), attached: Default::default(), ids: Default::default(), cached: cached_store, caught: watch::channel(true).0, me: me.clone() });
         lake.hot.watch(); // the decoded columns give memory back when the node needs it
         if let Some(writes) = lake.cat.unstarted.lock().unwrap().take() {
             crate::panics::spawn(lake.clone().commits(writes));
@@ -682,6 +683,16 @@ impl Lake {
             }
         }
         Ok(())
+    }
+
+    /// Wait, 10 s at most, until this node holds what its leader had committed when it started
+    /// (`cluster::catch_up`). A node restarted after a failover would otherwise answer from an older
+    /// catalog than it did before: its view reads no WAL, and the new leader flushes what it took
+    /// over a moment after it leads (a table just made was "not found").
+    pub async fn caught_up(&self) {
+        if !*self.caught.borrow() {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(10), self.caught.subscribe().wait_for(|c| *c)).await;
+        }
     }
 
     /// Non-leaders: catch up with our own catalog view (and prune what it now holds).
@@ -1569,17 +1580,39 @@ pub fn partitions() -> usize {
 
 /// Spark's functions whose names DataFusion doesn't have (`format_string`, `pmod`, `parse_url`,
 /// `sha2`, `collect_list`, …: PySpark's vocabulary in SQL). Where both have a name, DataFusion's
-/// stays, so no answer changes.
+/// stays, so no answer changes, and Spark's is there under a name of its own (`spark_floor`):
+/// `spark_sql('…')` calls it where Spark SQL names `floor` (`sparksql.rs`).
 fn spark(ctx: &SessionContext) {
-    use datafusion::logical_expr::{AggregateUDF, ScalarUDF};
-    static MORE: LazyLock<(Vec<ScalarUDF>, Vec<AggregateUDF>)> = LazyLock::new(|| {
-        let s = SessionStateBuilder::new().with_default_features().build();
-        let new = |name: &str, aliases: &[String]| std::iter::once(name).chain(aliases.iter().map(String::as_str))
-            .all(|n| !s.scalar_functions().contains_key(n) && !s.aggregate_functions().contains_key(n) && !s.window_functions().contains_key(n));
-        let scalar = datafusion_spark::all_default_scalar_functions().into_iter().filter(|f| new(f.name(), f.aliases()));
-        let aggregate = datafusion_spark::all_default_aggregate_functions().into_iter().filter(|f| new(f.name(), f.aliases()));
-        (scalar.map(|f| f.as_ref().clone()).collect(), aggregate.map(|f| f.as_ref().clone()).collect())
-    });
-    MORE.0.iter().for_each(|f| { ctx.register_udf(f.clone()); });
-    MORE.1.iter().for_each(|f| { ctx.register_udaf(f.clone()); });
+    let more = SPARK.get_or_init(|| spark_of(ctx));
+    more.scalar.iter().chain(&more.shared).for_each(|f| { ctx.register_udf(f.clone()); });
+    more.aggregate.iter().for_each(|f| { ctx.register_udaf(f.clone()); });
+}
+
+pub struct Spark {
+    scalar: Vec<datafusion::logical_expr::ScalarUDF>,
+    aggregate: Vec<datafusion::logical_expr::AggregateUDF>,
+    shared: Vec<datafusion::logical_expr::ScalarUDF>, // (Spark's of the names both have, renamed)
+    pub names: std::collections::HashMap<String, String>, // a name both have (or its alias) → Spark's here
+}
+
+static SPARK: std::sync::OnceLock<Spark> = std::sync::OnceLock::new();
+
+/// Spark's functions as every session has them (worked out once, against the first session's
+/// names: DataFusion's own, nothing else yet).
+pub fn spark_functions() -> &'static Spark {
+    SPARK.get_or_init(|| spark_of(&SessionContext::new()))
+}
+
+fn spark_of(ctx: &SessionContext) -> Spark {
+    use datafusion::execution::FunctionRegistry;
+    let new = |name: &str, aliases: &[String]| std::iter::once(name).chain(aliases.iter().map(String::as_str)).all(|n| ctx.udf(n).is_err() && ctx.udaf(n).is_err() && ctx.udwf(n).is_err());
+    let (scalar, shared): (Vec<_>, Vec<_>) = datafusion_spark::all_default_scalar_functions().into_iter().partition(|f| new(f.name(), f.aliases()));
+    let aggregate = datafusion_spark::all_default_aggregate_functions().into_iter().filter(|f| new(f.name(), f.aliases()));
+    let names = shared.iter().flat_map(|f| std::iter::once(f.name().to_string()).chain(f.aliases().iter().cloned()).map(|n| (n, format!("spark_{}", f.name())))).collect();
+    Spark {
+        scalar: scalar.iter().map(|f| f.as_ref().clone()).collect(),
+        aggregate: aggregate.map(|f| f.as_ref().clone()).collect(),
+        shared: shared.iter().map(crate::sparksql::renamed).collect(),
+        names,
+    }
 }

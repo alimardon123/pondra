@@ -280,6 +280,18 @@ def node_checks(browser, port, show):
     p.locator("#rtabs .rtab", has_text="Details").click()
     checks["the Variables tab lists the page's Python names with their types; Restart empties them"] = names == want and x_type.startswith("int") \
         and emptied == 0 and "NameError" in gone
+    named = pg.cell(1).locator(".bar .as input")  # (a SQL cell's → name: its answer a frame in the page's Python)
+    named.fill("ppl")
+    named.press("Tab")
+    pg.run(1, "SELECT id FROM people")
+    in_python = until(lambda: pg.grid(pg.run(2, "len(ppl.to_pandas())")), [["value"], [["3"]]], 10)
+    pg.run(2, "import pandas as pd\ngoals = pd.DataFrame({'who': ['Ann'], 'goal': [5]})\nlen(goals)")
+    until(lambda: "goals" in p.evaluate("(pondra.state.vars || []).map(v => v.name)"), True)
+    named.fill("")
+    named.press("Tab")
+    from_python = until(lambda: pg.grid(pg.run(1, "SELECT goal FROM goals")), [["goal"], [["5"]]], 10)
+    checks["a SQL cell's answer named (→ name) is a frame in the page's Python; a SQL cell reads the page's pandas table by its name"] = \
+        in_python == [["value"], [["3"]]] and from_python == [["goal"], [["5"]]]
     ta = pg.cell(0).locator("textarea")
     ta.fill("SELECT * FROM peo")
     ta.press("End")
@@ -365,6 +377,9 @@ def node_checks(browser, port, show):
     dlg = p.locator("dialog.pop.wide")
     until(lambda: dlg.locator(".vlist .row").count(), 2)
     diffed = until(lambda: dlg.locator(".dl.minus").count() > 0 and dlg.locator(".dl.plus").count() > 0, True)  # (the save before now, against now)
+    as_cells = _try(lambda: dlg.locator(".vcell .vhead").first.inner_text())  # (a notebook's: by cell, as its kind shows it, not its JSON)
+    lit = _try(lambda: dlg.locator(".vcell .dl .k").count())
+    raw = _try(lambda: dlg.locator(".vdiff").inner_text().count('"cell_type"'))
     if show:
         pg.shot(show, "console-versions.png")
     # (its changes not saved: the page's confirm is accepted, as every one here is)
@@ -373,8 +388,9 @@ def node_checks(browser, port, show):
     three = until(lambda: len(kept()), 3)
     if show:
         pg.shot(show, "console-restored.png")
-    checks["saved twice: two versions; Versions… shows what changed since (− and +) and restores the first: its tab has it again, kept as the newest"] = \
-        two == 2 and diffed is True and reopened == page_cells and three == 3
+    checks["saved twice: two versions; Versions… shows what changed since (− and +), cell by cell, highlighted, and restores the first: its tab has it again, kept as the newest"] = \
+        two == 2 and diffed is True and isinstance(as_cells, str) and "Cell 1 · SQL" in as_cells and "changed" in as_cells and (lit or 0) > 0 \
+        and raw == 0 and reopened == page_cells and three == 3
 
     with p.expect_download() as d:
         pg.docmenu("Download as .ipynb")
@@ -411,7 +427,7 @@ def node_checks(browser, port, show):
         dark.p.wait_for_timeout(800)
         dark.shot(show, "console-dark.png")
         dark.ctx.close()
-    # A pipeline (ADR-036): a view's details draw what it follows and what follows it, and its expectations.
+    # A flow (ADR-036): a view's details draw what it follows and what follows it, and its expectations.
     sql(port, "CREATE TABLE pay (id BIGINT, amount BIGINT)")
     sql(port, "INSERT INTO pay VALUES (1, 5), (2, -1), (3, 7)")
     sql(port, "CREATE MATERIALIZED VIEW pay_ok (CONSTRAINT positive CHECK (amount > 0) ON VIOLATION DROP ROW) AS SELECT id, amount FROM pay")
@@ -422,11 +438,11 @@ def node_checks(browser, port, show):
     p.locator("#data .row", has_text="pay_ok").first.click()
     flow = until(lambda: p.locator("#details .flow").inner_text().split() if p.locator("#details .flow").count() else [], ["pay", "→", "pay_ok", "→", "pay_sum"])
     broke = until(lambda: "1 row broke it" in (p.locator("#details .pc", has_text="positive").inner_text() if p.locator("#details .pc", has_text="positive").count() else ""), True)
-    checks["a materialized view's details draw its pipeline (pay → pay_ok → pay_sum) and its expectations, with the rows that broke each"] = \
+    checks["a materialized view's details draw its flow (pay → pay_ok → pay_sum) and its expectations, with the rows that broke each"] = \
         flow == ["pay", "→", "pay_ok", "→", "pay_sum"] and broke is True
-    pg.shot(show, "console-pipeline.png")
+    pg.shot(show, "console-flow.png")
     checks["every request went to the node; no page errors"] = pg.left() == [] and pg.errors == [] and len(pg.seen) > 10
-    info = {"figure": fig_said, "left": pg.left(), "errors": pg.errors, "sql_error": sql_error, "python_error": python_error, "kinds": kinds, "names": names, "types": types, "facts": facts,
+    info = {"named": [in_python, from_python], "figure": fig_said, "left": pg.left(), "errors": pg.errors, "sql_error": sql_error, "python_error": python_error, "kinds": kinds, "names": names, "types": types, "facts": facts,
             "heads": heads, "rows": rows[:2], "m": m}
     pg.ctx.close()
     return checks, info
@@ -1268,7 +1284,7 @@ def budget_checks(browser, port, show):
             fresh[name] = e.code
     total = sum(sizes.values()) if all(sizes.values()) else None
     later = {}
-    for name in ["chart.js", "plan.js", "more.js", "details.js", "more.css", "data.js", "md.js", "jobs.js", "settings.js", "objects.js", "pyfile.js", "versions.js"]:  # (loaded when first used)
+    for name in ["chart.js", "plan.js", "more.js", "details.js", "more.css", "data.js", "md.js", "jobs.js", "settings.js", "objects.js", "pyfile.js", "versions.js", "stmts.js"]:  # (loaded when first used)
         r = urllib.request.urlopen(urllib.request.Request(f"{base}/console/{name}", headers={"accept-encoding": "gzip"}))
         later[name] = len(r.read()) if r.headers.get("content-encoding") == "gzip" else None
     checks["the scripts and style sheet the page loads, gzipped as the node serves them: <= 70 KB; each answers 304 when the browser has it"] = total is not None and total <= 70 * 1024 \

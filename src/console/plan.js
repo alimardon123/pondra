@@ -2,7 +2,8 @@
 // steps it reads from, the ones that move rows (between cores, or nodes when a query is spread)
 // marked; its Query profile runs the statement with EXPLAIN ANALYZE and puts each step's rows and time
 // on it, the costliest in the strongest colour. Loaded when first shown.
-import { h, icon, run, secs, count, moreStyle } from './core.js';
+import { h, icon, run, secs, count, moreStyle, menu, saveAs } from './core.js';
+import { copyText } from './grid.js';
 import { doneText } from './notebook.js';
 
 await moreStyle();
@@ -18,7 +19,12 @@ export function planView(sql, params) {
     const shown = st.profile || st.plan;
     box.replaceChildren(h('div', { class: 'cbar' }, h('span', { class: 'segs' }, tab('graph', 'Graph'), tab('text', 'Text')),
       h('span', { class: 'muted' }, st.profile ? `Query profile: ${secs(st.profile.ms)} in all` : st.plan ? 'The plan, before it runs' : ''), h('span', { class: 'grow' }),
-      read ? h('button', { class: 'btn small', disabled: st.busy, title: 'Run it with EXPLAIN ANALYZE: each step\'s rows and time (it runs the query)', onclick: profile }, icon('play'), st.busy ? 'Profiling…' : st.profile ? 'Query profile again' : 'Query profile') : null),
+      read ? h('button', { class: 'btn small', disabled: st.busy, title: 'Run it with EXPLAIN ANALYZE: each step\'s rows and time (it runs the query)', onclick: profile }, icon('play'), st.busy ? 'Profiling…' : st.profile ? 'Query profile again' : 'Query profile') : null,
+      shown?.tree ? h('button', { class: 'icon', title: 'Copy or download the plan', 'aria-label': 'Copy or download the plan', onclick: e => menu(e.currentTarget, [
+        { label: 'Copy as text', icon: 'copy', run: () => copyText(shown.text, 'Copied the plan') },
+        { label: 'Download as text', icon: 'down', run: () => saveAs(shown.text, 'text/plain', 'plan.txt') },
+        { label: 'Download as a picture (SVG)', run: () => saveAs(picture(shown.tree), 'image/svg+xml', 'plan.svg') },
+        { label: 'Download as a picture (PNG)', run: () => png(picture(shown.tree)) }]) }, icon('down')) : null),
     !shown ? h('div', { class: 'wait' }, 'Reading the plan…') : shown.error ? h('pre', { class: 'err' }, shown.error)
       : st.how === 'text' ? h('pre', { class: 'said plan' }, shown.text) : graph(shown.tree));
   };
@@ -71,4 +77,36 @@ function graph(steps) {
     n.kids.length ? h('ul', {}, n.kids.map(box)) : null);
   };
   return steps.length ? h('div', { class: 'pgraph' }, h('ul', { class: 'pt' }, steps.map(box))) : h('div', { class: 'empty' }, 'No plan to draw.');
+}
+
+/** The plan as a picture (SVG): each step a box above the steps it reads from, with its rows and
+ * time when profiled, on a light ground, for a document or a ticket. */
+function picture(steps) {
+  const esc = t => t.replace(/[&<>"]/g, c => `&#${c.charCodeAt(0)};`), GX = 16, GY = 30, BH = 50;
+  const lines = n => [n.op.replace(/Exec$/, ''), n.detail.length > 56 ? n.detail.slice(0, 55) + '…' : n.detail,
+    n.metrics.output_rows != null ? `${n.metrics.output_rows} rows · ${n.metrics.elapsed_compute || ''}` : ''].filter(Boolean);
+  const span = n => { n.w = Math.max(...lines(n).map(l => l.length)) * 6.7 + 20; n.kw = n.kids.reduce((a, k) => a + span(k), 0) + GX * (n.kids.length - 1); return n.span = Math.max(n.w, n.kw); };
+  let out = '', height = 0;
+  const place = (n, x, y) => {
+    const cx = x + n.span / 2;
+    height = Math.max(height, y + BH);
+    out += `<rect x="${cx - n.w / 2}" y="${y}" width="${n.w}" height="${BH}" rx="6"/>` + lines(n).map((l, i) => `<text x="${cx}" y="${y + 17 + i * 14}"${i ? '' : ' font-weight="600"'}>${esc(l)}</text>`).join('');
+    let kx = x + (n.span - n.kw) / 2;
+    for (const k of n.kids) { out += `<path d="M${cx} ${y + BH}V${y + BH + GY / 2}H${kx + k.span / 2}V${y + BH + GY}"/>`; place(k, kx, y + BH + GY); kx += k.span + GX; }
+  };
+  let x = 10;
+  for (const n of steps) { span(n); place(n, x, 10); x += n.span + GX; }
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${x}" height="${height + 10}" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="11" text-anchor="middle">`
+    + `<style>rect{fill:#fff;stroke:#9aa1ab}path{fill:none;stroke:#9aa1ab}text{fill:#1f2328}</style><rect x="0" y="0" width="${x}" height="${height + 10}" rx="0" style="stroke:none;fill:#f6f7f9"/>${out}</svg>`;
+}
+
+/** The picture as a PNG, twice its size (a canvas draws the SVG). */
+function png(svgText) {
+  const img = new Image(), url = URL.createObjectURL(new Blob([svgText], { type: 'image/svg+xml' }));
+  img.onload = () => {
+    const c = h('canvas', { width: img.width * 2, height: img.height * 2 }), g = c.getContext('2d');
+    g.scale(2, 2); g.drawImage(img, 0, 0); URL.revokeObjectURL(url);
+    c.toBlob(b => saveAs(b, 'image/png', 'plan.png'));
+  };
+  img.src = url;
 }

@@ -62,6 +62,7 @@ mod routines;
 mod scan;
 mod server;
 mod spill;
+mod sparksql;
 mod spmd;
 mod store;
 mod sys;
@@ -297,12 +298,22 @@ pub(crate) async fn stopped(stdin: bool) {
 /// The lake this node serves (its catalog checkpointed when it stops).
 static MAIN: std::sync::OnceLock<Arc<store::Lake>> = std::sync::OnceLock::new();
 
-#[tokio::main]
-async fn main() {
-    // An error is said in words, its causes after it: a backtrace (RUST_BACKTRACE) is for panics.
-    if let Err(e) = run().await {
-        eprintln!("Error: {}", ext::said(&e));
-        std::process::exit(1);
+fn main() {
+    // The work runs on threads with Linux's main stack, 8 MB: Windows gives its main thread 1 MB,
+    // and planning (DataFusion's, recursive) and a session's making can need more; tokio's workers
+    // get 2 MB, which procedures calling procedures 16 deep overflowed in the release build (only
+    // the pages a thread touches are memory).
+    let work = std::thread::Builder::new().name("pondra".into()).stack_size(8 << 20).spawn(|| {
+        tokio::runtime::Builder::new_multi_thread().enable_all().thread_stack_size(8 << 20).build().expect("a runtime").block_on(async {
+            // An error is said in words, its causes after it: a backtrace (RUST_BACKTRACE) is for panics.
+            if let Err(e) = run().await {
+                eprintln!("Error: {}", ext::said(&e));
+                std::process::exit(1);
+            }
+        })
+    });
+    if work.expect("a thread to work on").join().is_err() {
+        std::process::exit(101); // (a panic, said already: as Rust's main says one)
     }
 }
 
@@ -583,6 +594,7 @@ async fn run() -> anyhow::Result<()> {
                     replica::members(lake.clone(), cluster.clone());
                 }
             } else {
+                cluster::catch_up(lake.clone(), cluster.leader.addr.clone()); // (answers wait until this node holds what the leader had)
                 match reader {
                     false => cluster.clone().follow(store),
                     true => cluster.clone().watch_leader(store, streamed), // a reader never votes or leads

@@ -51,7 +51,7 @@ Pondra has changed since, and the comparison has not been run again.
 | One machine, transactions (pgbench's TPC-B script) | Postgres 16 | balances right on both; **Postgres 997 tps** on 1 client, 1,793 on 4; Pondra 133 and 91 (snapshot isolation, first committer wins: at scale 1 four clients retry on the one branch row) | 2026-10-01 | current (`tools/bench/pgbench.py --postgres`) |
 | Pipelines (views following views) | Databricks pipelines, Snowflake dynamic tables, chained Flink jobs (their docs) | Pondra: every stage in the commit that wrote its rows, exactly once, no lag between stages; three stages (a filter with expectations, an aggregate, a rollup) take 29% off ingest (183,000 → 131,000 rows/s on 2 vCPUs). Databricks: continuous mode updates every 10 s to a few minutes, triggered every 10 minutes to daily ([its docs](https://docs.databricks.com/aws/en/ldp/concepts/pipeline-mode)); Snowflake: each dynamic table its target lag, 60 s at least ([its docs](https://docs.snowflake.com/en/user-guide/dynamic-tables/target-lag)); Flink: each stage's exactly-once output visible at a checkpoint | 2026-10-01 | Pondra measured (`tools/bench/pipeline.py`); the others from their docs, **not run here** |
 | Several machines, TPC-H SF10 | one Pondra node | GitHub's runners over the internet (4 vCPUs each, 1–67 ms apart): 3 nodes 23.3 s, 6 nodes 23.4 s, one node 25.3–25.5 s; every query forced across: 40.5 s and 33.2 s. Every answer equal | v0.26.0, 2026-09-30 | not yet run on 0.27.0; **one data centre never run** |
-| Several machines | Spark, Flink | not run | — | round 33, needs machines |
+| Several machines | Spark, Flink | not run | — | round 34, needs machines |
 | Streaming, Nexmark q1, q2, q5, q7, q11 | Flink 2.3 (MiniCluster) | 10 M bids (2.1x): **Pondra 14.3 s** (ingest over HTTP 9.2 s of it, views written to the lake, answers == DuckDB's), Flink 30.4 s for all five over one source (bids generated in process, blackhole sinks; 8.1 s to start not counted). Round 21: 8.7–10.9 s against 24.3–25.0 s | 2026-10-01 | current (`logs/round30/nexmark-10m.json`); the other queries not run |
 | Streaming, keyed running aggregate | Flink, Spark Structured Streaming | **Pondra 2.4 M events/s** durable; Flink 0.75 M/s; Spark 3.9 s from memory into a `noop` sink | round 3 | stale |
 | Ingest, three nodes | Kafka's protocol | ~0.8 M events/s exactly-once over librdkafka, ack 1 ms; 4.3–4.6 M/s over HTTP | rounds 3–10 | stale |
@@ -59,8 +59,8 @@ Pondra has changed since, and the comparison has not been run again.
 | Serving | Databricks Lakehouse//RT (its published numbers) | **20,000–36,000 lookups/s on two cores**; they publish 12,000 QPS on a cluster | round 7 | stale |
 | Lakehouse, other engines | DuckDB, Polars, delta-rs, PyIceberg, Spark 4 | Pondra reads other engines' Delta and Iceberg tables: 55 of 55 equal (`formats_check.py`); Spark and PyIceberg write through its catalog, copy-on-write and merge-on-read; DuckDB, Polars, delta-rs and PyIceberg read its tables (`open_check.py`) | round 28 | current |
 | Form factor | DuckDB, Polars (in Python), Spark 4.2, Flink 2.3 (`tools/bench/footprint.py`) | to first answer: **Pondra 0.07 s** (a server), DuckDB 0.07 s, Polars 0.12 s, Spark 9.7 s, Flink 7.4 s; idle memory: DuckDB 51 MB and Polars 48 MB (with Python), **Pondra 42 MB of its own** (+73 MB of its binary's code mapped from disk), Spark 563 MB, Flink 559 MB; install: DuckDB 59 MB, Polars 181 MB, Pondra 175–211 MB, Flink 351 MB + a JVM, Spark 481 MB + a JVM | 2026-10-01 | current (`logs/round30/footprint.json`) |
-| In-process (DuckDB's form) | DuckDB, Polars | not built: `pondra.local()` starts a node | — | round 34 |
-| In the browser (WebAssembly) | DuckDB-WASM | not built | — | round 34 |
+| In-process (DuckDB's form) | DuckDB, Polars | not built: `pondra.local()` starts a node | — | round 35 |
+| In the browser (WebAssembly) | DuckDB-WASM | not built | — | round 35 |
 
 ## The short answer
 

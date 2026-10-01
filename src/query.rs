@@ -662,6 +662,7 @@ pub async fn session(lake: &Lake, sql: &str, except: &str) -> Result<SessionCont
 /// `session`, this lake's tables as of log segment `upto` (every query in it reads the same rows).
 pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>) -> Result<SessionContext> {
     use crate::ddl::{mentions, split, PUBLIC};
+    lake.caught_up().await; // (a node that just started: not from an older catalog than its leader's)
     let upto = upto.or_else(crate::txn::snapshot); // (in a transaction: as of its snapshot, its writes over it)
     use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider, MemorySchemaProvider};
     let ctx = crate::settings::apply(lake.session()).await?; // (the session's `SET datafusion.…`)
@@ -755,8 +756,8 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
             };
             system.register_table("audit".into(), audit)?;
         }
-        if text.to_lowercase().contains("pondra.pipelines") || text.to_lowercase().contains("pondra.expectations") {
-            // (a materialized view's pipeline and its expectations: `views::system`)
+        if text.to_lowercase().contains("pondra.flows") || text.to_lowercase().contains("pondra.expectations") {
+            // (a materialized view's flow and its expectations: `views::system`)
             let counts = match lake.cat.get::<TableMeta>(&crate::store::table_key(crate::views::EXPECTED)).await? {
                 Some(meta) => ctx.read_table(table_view(lake, &ctx, crate::views::EXPECTED, &meta, upto).await?)?.collect().await?,
                 None => vec![],

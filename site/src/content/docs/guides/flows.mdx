@@ -1,13 +1,13 @@
 ---
-title: Pipelines
-description: Materialized views that follow each other in one commit (bronze, silver, gold), expectations that keep, drop or refuse rows, history per key (SCD type 2), and the pipeline's graph.
+title: Flows
+description: Materialized views that follow each other in one commit (bronze, silver, gold), expectations that keep, drop or refuse rows, history per key (SCD type 2), and the flow's graph.
 sidebar:
   order: 6.5
 ---
 
 import { Aside } from '@astrojs/starlight/components';
 
-A pipeline is materialized views following each other: raw rows land in a table (bronze), a view
+A flow is materialized views following each other: raw rows land in a table (bronze), a view
 cleans them (silver), another adds them up (gold). It is what Databricks calls a pipeline (Delta
 Live Tables, now Lakeflow) and what you would otherwise run as a chain of jobs. In Pondra every
 stage moves **in the same commit** as the rows that started it: when an `INSERT` is acknowledged,
@@ -108,7 +108,7 @@ its totals aren't there to check. Put them on the view before it.
   mins, `max()` of its maxes. Anything else is refused, saying why. To filter or reshape the
   totals, make a stored view (`CREATE VIEW … AS SELECT … FROM gold WHERE total > 100`), which reads
   them as they are when asked.
-- A pipeline is dropped from its end: `DROP MATERIALIZED VIEW silver` is refused while gold
+- A flow is dropped from its end: `DROP MATERIALIZED VIEW silver` is refused while gold
   follows it.
 
 ```sql
@@ -121,6 +121,28 @@ region  orders  total
 eu      2       60
 us      1       12
 ```
+
+## Stop a stage, keep its rows
+
+`ALTER MATERIALIZED VIEW v DETACH` stops `v` following its tables and keeps what it holds, as a
+table of the same name. From then on it is a table like any other: it takes `INSERT`s, and what
+follows it keeps following it. A `GROUP BY` view's table stays a merge table, its rows combining
+as they are read. A view that keeps windows is refused, since the windows still open would be
+left half counted.
+
+```sql
+CREATE MATERIALIZED VIEW eu_orders AS SELECT id, buyer, amount FROM orders WHERE region = 'eu';
+ALTER MATERIALIZED VIEW eu_orders DETACH;
+INSERT INTO orders VALUES (7, 'eu', 'dee', 40, 'paid');
+SELECT count(*) AS n FROM eu_orders;
+```
+
+```text
+n
+3
+```
+
+The order sent after `DETACH` (id 7) isn't in `eu_orders`: only the three eu orders it held.
 
 ## History per key (SCD type 2)
 
@@ -151,14 +173,14 @@ The current version of each key is the one whose `__end_at` is NULL
 (`WHERE __end_at IS NULL`). The view's rows are worked out as it is read, so a materialized view
 can't follow it; a stored view can.
 
-## The pipeline
+## The flow
 
-`pondra.pipelines` lists every materialized view: what it follows, its kind, what else it reads
-and its expectations. The console's details panel draws each table's and view's pipeline, from
+`pondra.flows` lists every materialized view: what it follows, its kind, what else it reads
+and its expectations. The console's details panel draws each table's and view's flow, from
 its tables to what follows it.
 
 ```sql
-SELECT name, follows, kind, expectations FROM pondra.pipelines ORDER BY name;
+SELECT name, follows, kind, expectations FROM pondra.flows ORDER BY name;
 ```
 
 ```text
@@ -174,7 +196,7 @@ strict     orders            rows       1
 **Compared with Databricks and Snowflake.** A Databricks pipeline updates its tables on compute of
 its own, every 10 seconds to a few minutes in continuous mode; a Snowflake dynamic table refreshes
 within its target lag, 60 seconds at least. Here every stage is computed by the node that took the
-rows in, as part of packing them, so the whole pipeline commits at once: no lag between stages and
+rows in, as part of packing them, so the whole flow commits at once: no lag between stages and
 no checkpoints to keep. The cost is that each stage's SQL runs as rows arrive (three stages took
 29% off ingest on two vCPUs); a stage that must see everything at once (a top-N over all time, a
 totals filter) is a stored view, read when asked.

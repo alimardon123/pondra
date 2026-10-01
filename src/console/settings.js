@@ -1,8 +1,8 @@
 // Settings (ADR-034, round 29): a window of sections, a list of settings each, and a search across
 // them. The console's own (Appearance, Editor and results, Layout, Keys: kept on this machine, in
-// console.json) and the node's (Python, About). More come in with `register.setting`, under their
+// console.json) and the node's (Python, About); and signing in. More come in with `register.setting`, under their
 // own heading: an enterprise build's users and roles, tokens, audit and quotas. Loaded when opened.
-import { h, icon, svg, count, ICONS, S, R, call, register, moreStyle, toast } from './core.js';
+import { h, $, icon, svg, count, ICONS, S, R, call, register, moreStyle, toast, store } from './core.js';
 import { PER_PAGE } from './grid.js';
 
 await moreStyle();
@@ -15,7 +15,7 @@ Object.assign(ICONS, {
 });
 // (the core's keys, for Keys: the page's own handle them; an extension's keys come with `register.key`)
 const KEYS = { Anywhere: [['Ctrl K', 'Search tables, files and commands'], ['Ctrl S', 'Save the file or notebook in front'], ['Ctrl B', 'The left pane'], ['Ctrl J', 'The bottom panel'], ['Ctrl Alt B', 'The right pane'], ['?', 'These keys']],
-  'In a cell or a file': [['Ctrl Enter', 'Run it (a file: what is selected, or all of it)'], ['Shift Enter', 'Run it and go to the next cell'], ['Alt Enter', 'Run it and add a cell below'], ['Ctrl Shift Enter', 'Run every cell'], ['Shift Alt F', 'Format the selection, or all of it'], ['Tab', 'Complete a name (or indent)'], ['Ctrl Space', 'Complete a name'], ['Ctrl /', 'Comment the lines out, or in'], ['Esc', 'Leave the cell: the keys below then work']],
+  'In a cell or a file': [['Ctrl Enter', 'Run it (a file: what is selected, or all of it)'], ['Shift Enter', 'Run it and go to the next cell'], ['Alt Enter', 'Run it and add a cell below'], ['Ctrl Shift Enter', 'Run every cell'], ['Shift Alt F', 'Format the selection, or all of it'], ['Ctrl Shift E', 'Explain: the plan of the selection or the statement, not run'], ['Tab', 'Complete a name (or indent)'], ['Ctrl Space', 'Complete a name'], ['Ctrl /', 'Comment the lines out, or in'], ['Esc', 'Leave the cell: the keys below then work']],
   'On a cell (after Esc)': [['Enter', 'Edit it'], ['↑ ↓', 'The cell above, below (or K J)'], ['A B', 'Add a cell above, below'], ['D D', 'Delete it (Z brings it back)'], ['S P M', 'Make it SQL, Python, Markdown'], ['L', 'Live on or off: its answer again after each commit that changes it'], ['O', 'Hide or show its output'], ['0 0', 'Restart Python: its variables go']],
   'In a grid': [['Click', 'A cell: its row lights up'], ['Shift Click', 'A range'], ['Ctrl C', 'Copy, tab-separated (Shift: with the headers)'], ['Ctrl A', 'Select every cell'], ['Alt PgDn', 'The next page of rows (Alt PgUp: the one before)'], ['Enter', 'Edit a data file\'s cell']],
   'In a tab': [['← →', 'The tab before, after'], ['Delete', 'Close it'], ['Right-click', 'Pin it, close others']] };
@@ -112,4 +112,31 @@ export function settings(section) {
   dlg.querySelector('.s-find').value = '';
   draw();
   dlg.showModal();
+}
+
+// ------------------------------------------------------------------ signing in: a token, or a user's name and password
+let asking = false;
+/** The sign-in dialog, saying why it is asked for. */
+export function askToken(why) {
+  const d = $('#tokenDlg');
+  if (d.open) return;
+  if (!asking) { asking = true; d.addEventListener('close', signedIn); }
+  $('#tokenWhy').textContent = `${why}; or a user's name and password. It is kept in this browser only.`;
+  $('#tokenIn').value = store.get('pondra.user') ? '' : store.get('pondra.token') || '';
+  $('#userIn').value = store.get('pondra.user') || '';
+  d.returnValue = '';
+  d.showModal();
+}
+async function signedIn() {
+  const v = $('#tokenDlg').returnValue, user = $('#userIn').value.trim(), secret = $('#tokenIn').value.trim();
+  if (v === 'clear') { store.set('pondra.token', null); store.set('pondra.user', null); }
+  else if (v !== 'ok' || !secret) return;
+  else if (!user) { store.set('pondra.token', secret); store.set('pondra.user', null); }
+  else {
+    // (a user: a session for it, which the node signs: `POST /login`)
+    const r = await fetch(new URL('login', location.href), { method: 'POST', body: JSON.stringify({ user, password: secret }) });
+    if (!r.ok) { toast(await r.text(), true); return askToken('Sign in again'); }
+    store.set('pondra.token', (await r.json()).token); store.set('pondra.user', user);
+  }
+  H.drawSignin(); H.refresh();
 }

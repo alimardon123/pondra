@@ -188,8 +188,8 @@ pub enum Stmt {
     Merge(Box<crate::change::Merge>),                     // MERGE INTO … (`change.rs`)
     Invalid(String),                                      // CREATE PROCEDURE or DROP MACRO, written wrong: why
     CopyTo(String, String, std::collections::BTreeMap<String, String>), // COPY (query) TO 'url' (options): files outside the lake (`ext.rs`)
-    TempView(String, String, bool),                        // CREATE [OR REPLACE] TEMP VIEW name AS query: the session's (`temp.rs`)
-    TempSecret(String, std::collections::BTreeMap<String, String>, bool), // CREATE [OR REPLACE] TEMPORARY SECRET name (…): the session's, in memory (`temp.rs`)
+    TempView(String, String, bool, bool),                  // CREATE [OR REPLACE] TEMP VIEW [IF NOT EXISTS] name AS query: the session's (`temp.rs`)
+    TempSecret(String, std::collections::BTreeMap<String, String>, bool, bool), // CREATE [OR REPLACE] TEMPORARY SECRET [IF NOT EXISTS] name (…): the session's, in memory (`temp.rs`)
 }
 
 impl Stmt {
@@ -257,6 +257,14 @@ pub fn sql_name(name: &str) -> String {
     name.split('.').map(|p| format!("\"{p}\"")).collect::<Vec<_>>().join(".")
 }
 
+/// `d`, or with IF NOT EXISTS nothing when a `kind` of that name is there (`Ddl::Unless`).
+pub fn unless(if_not_exists: bool, name: &str, kind: &str, d: crate::ddl::Ddl) -> crate::ddl::Ddl {
+    match if_not_exists {
+        true => crate::ddl::Ddl::Unless { name: name.to_string(), kind: kind.to_string(), then: Box::new(d) },
+        false => d,
+    }
+}
+
 /// A write statement, or None for a query.
 pub fn parse(sql: &str) -> Option<Stmt> {
     use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
@@ -267,6 +275,13 @@ pub fn parse(sql: &str) -> Option<Stmt> {
         ast::TableFactor::Table { name, .. } => Some(object(name)),
         _ => None,
     };
+    // OR REPLACE where replacing one would lose what it holds: refused, saying why.
+    static NO_REPLACE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?is)^\s*CREATE\s+OR\s+REPLACE\s+(SCHEMA|DATABASE|USER|ROLE)\b").expect("a regex"));
+    if let Some(c) = NO_REPLACE.captures(first_word(sql)) {
+        let kind = c[1].to_uppercase();
+        let lost = if matches!(kind.as_str(), "USER" | "ROLE") { "the rights given to it" } else { "everything in it" };
+        return Some(Stmt::Invalid(format!("CREATE OR REPLACE {kind}: replacing one would drop {lost}; CREATE {kind} IF NOT EXISTS leaves one that is there as it is")));
+    }
     if let Some(s) = crate::users::statement(sql) {
         return Some(s); // (CREATE USER and ROLE, GRANT, REVOKE, CREATE TOKEN: `users.rs`)
     }
@@ -315,9 +330,31 @@ pub fn parse(sql: &str) -> Option<Stmt> {
         Ok(None) => {}
         Err(e) => return Some(Stmt::Invalid(format!("{e:#}"))),
     }
+    let name = |s: &str| s.split('.').map(|p| if p.starts_with('"') { p.trim_matches('"').to_string() } else { p.to_lowercase() }).collect::<Vec<_>>().join(".");
     if let Some(c) = VIEW_RENAME.captures(first_word(sql)) {
-        let name = |s: &str| s.split('.').map(|p| if p.starts_with('"') { p.trim_matches('"').to_string() } else { p.to_lowercase() }).collect::<Vec<_>>().join(".");
         return Some(Stmt::Ddl(vec![Ddl::RenameTable { name: name(&c[3]), to: name(&c[4]) }]));
+    }
+    // `ALTER MATERIALIZED VIEW v DETACH`: its rows stop following, and stay as a table of that name.
+    static DETACH: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r#"(?is)^\s*ALTER\s+MATERIALIZED\s+VIEW\s+([\w."-]+)\s+DETACH\s*;?\s*$"#).expect("a regex"));
+    if let Some(c) = DETACH.captures(first_word(sql)) {
+        return Some(Stmt::Ddl(vec![Ddl::DetachView { name: name(&c[1]) }]));
+    }
+    // DuckDB's CREATE MACRO … IF NOT EXISTS (the parser takes only OR REPLACE): read without it, kept unless one is there.
+    static MACRO_QUIET: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?is)^(\s*CREATE\s+(OR\s+REPLACE\s+)?(TEMP\s+|TEMPORARY\s+)?MACRO\s+)IF\s+NOT\s+EXISTS\s+").expect("a regex"));
+    if let Some(c) = MACRO_QUIET.captures(first_word(sql)) {
+        if c.get(2).is_some() {
+            return Some(Stmt::Invalid("CREATE OR REPLACE MACRO … IF NOT EXISTS: one or the other".into()));
+        }
+        return Some(match parse(&MACRO_QUIET.replace(first_word(sql), "$1")) {
+            Some(Stmt::Ddl(d)) => Stmt::Ddl(d.into_iter().map(|d| match &d {
+                Ddl::CreateRoutine { name, .. } => {
+                    let name = name.clone();
+                    unless(true, &name, "routine", d)
+                }
+                _ => d,
+            }).collect()),
+            other => other?,
+        });
     }
     let parsed = Parser::parse_sql(&GenericDialect {}, sql).or_else(|e| crate::settings::dialect().map_or(Err(e), |d| Parser::parse_sql(d.as_ref(), sql))); // (DuckDB's STRUCT(a INT), …: the session's dialect)
     let parsed = match parsed {
@@ -424,10 +461,17 @@ pub fn parse(sql: &str) -> Option<Stmt> {
                 }).collect(),
                 _ => Default::default(),
             };
-            Stmt::Ddl(vec![Ddl::CreateMaterialized { name: object(&v.name), sql: v.query.to_string(), options }])
+            let made = Ddl::CreateMaterialized { name: object(&v.name), sql: v.query.to_string(), options };
+            Stmt::Ddl(vec![match (v.or_replace, v.if_not_exists) {
+                (true, true) => return Some(Stmt::Invalid("CREATE OR REPLACE … IF NOT EXISTS: one or the other".into())),
+                (true, false) => Ddl::Replacing { name: object(&v.name), then: Box::new(made) },
+                (false, true) => Ddl::Unless { name: object(&v.name), kind: "relation".into(), then: Box::new(made) },
+                (false, false) => made,
+            }])
         }
-        Statement::CreateView(v) if v.temporary => Stmt::TempView(object(&v.name), v.query.to_string(), v.or_replace), // (the session's: `temp.rs`)
-        Statement::CreateView(v) => Stmt::Ddl(vec![Ddl::CreateView { name: object(&v.name), sql: v.query.to_string(), replace: v.or_replace }]),
+        Statement::CreateView(v) if v.or_replace && v.if_not_exists => Stmt::Invalid("CREATE OR REPLACE VIEW … IF NOT EXISTS: one or the other".into()),
+        Statement::CreateView(v) if v.temporary => Stmt::TempView(object(&v.name), v.query.to_string(), v.or_replace, v.if_not_exists), // (the session's: `temp.rs`)
+        Statement::CreateView(v) => Stmt::Ddl(vec![unless(v.if_not_exists, &object(&v.name), "relation", Ddl::CreateView { name: object(&v.name), sql: v.query.to_string(), replace: v.or_replace })]),
         Statement::AttachDatabase { schema_name, database_file_name: ast::Expr::Value(v), .. } => match &v.value {
             ast::Value::SingleQuotedString(dir) | ast::Value::DoubleQuotedString(dir) => Stmt::Ddl(vec![Ddl::Attach { name: ident(&schema_name), dir: dir.clone() }]),
             _ => return None,
@@ -888,6 +932,7 @@ pub async fn on_node(app: &crate::server::App, stmt: Stmt, job: Option<String>) 
 #[inline(never)] // (its work on the heap, made here: `App::query_as`)
 pub fn on_node_as(app: &crate::server::App, stmt: Stmt, job: Option<String>, files: bool) -> futures::future::BoxFuture<'_, Result<Value>> {
     Box::pin(async move {
+        app.lake.caught_up().await; // (a node that just started: not against an older catalog than its leader's)
         let out = crate::ext::listing(on_node_listed(app, stmt, job, files)).await?; // (files outside the lake: listed once a statement)
         seen_here(app).await;
         Ok(out)

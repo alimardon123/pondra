@@ -150,7 +150,7 @@ a run records what it ran. To add:
   Terraform and dbt do; secrets by name only, their values per environment;
 - notebooks exported without their outputs;
 - **environments** as lakes (or a server's databases), a staging copy of production by zero-copy
-  `CLONE` (round 32); CI applies a branch to a clone, runs its tests (round 30's expectations), then
+  `CLONE` (round 33); CI applies a branch to a clone, runs its tests (round 30's expectations), then
   promotes;
 - later, a Git panel in the console (branch, commit, pull, push).
 

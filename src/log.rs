@@ -443,7 +443,7 @@ async fn commit(lake: &Arc<Lake>, next: &mut u64, block: &mut u64, last_seq: &mu
         // packed again (`views::Inline`).
         let derived: std::collections::HashSet<&str> = f.parts.iter().filter(|p| p.src.is_none()).map(|p| p.table.as_str()).collect();
         let filed = f.filed.iter().filter(|x| !x.added.is_empty() || !x.removed.is_empty() || !x.deleted.is_empty()).map(|x| x.table.as_str()); // (a file commit's rows: its views derived theirs too)
-        // (a view's own rows are owed to the views that follow it: a pipeline, ADR-036 §1)
+        // (a view's own rows are owed to the views that follow it: a flow, ADR-036 §1)
         let mut owed = f.parts.iter().filter(|p| p.rows > 0).map(|p| p.table.as_str()).chain(filed).flat_map(|t| views.by_source.get(t).into_iter().flatten());
         if owed.any(|v| !derived.contains(v.as_str())) || derived.iter().any(|t| !views.tables.contains(*t)) {
             replies.push((reply, Outcome::Retry(vec![])));

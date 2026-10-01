@@ -169,7 +169,7 @@ def check_page(path, verbose):
                     if (out or "").strip():
                         print("       " + str(out).strip()[:1500].replace("\n", "\n       "), flush=True)  # (what it said: to write under it)
             except Exception as e:
-                report.update(ok=False, failed=where, lang=lang, error=str(e)[-2500:], code=code[:600])
+                report.update(ok=False, failed=where, lang=lang, error=str(e)[-2500:] + logs(work), code=code[:600])
                 break
     except Exception as e:
         report.update(ok=False, error=str(e)[-2000:])
@@ -184,6 +184,12 @@ def check_page(path, verbose):
             node.kill()
         shutil.rmtree(work, ignore_errors=True)
     return report
+
+
+def logs(work):
+    """The ends of the logs a page's examples wrote (its own nodes'), to see why one failed."""
+    found = sorted(os.path.join(d, f) for d, _, fs in os.walk(work) for f in fs if f.endswith(".log") and f != "node.log")
+    return "".join(f"\n--- {os.path.relpath(p, work)}:\n" + open(p, errors="replace").read()[-1200:] for p in found)[-6000:]
 
 
 def main():

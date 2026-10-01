@@ -180,6 +180,30 @@ impl Cluster {
     }
 }
 
+/// A node that just started under a leader: what the leader has committed, then until this node
+/// holds it too (`Lake::caught_up` waits on it; 10 s at most each way). Restarted after a
+/// failover, its catalog view lacks what the new leader took over from the old one's WAL until the
+/// new leader flushes it, a moment after it leads.
+pub fn catch_up(lake: Arc<Lake>, leader: String) {
+    lake.caught.send_replace(false);
+    crate::panics::spawn(async move {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let url = crate::tls::url(&format!("{leader}/cluster/visible"));
+        let mut upto = None;
+        while upto.is_none() && tokio::time::Instant::now() < deadline {
+            upto = async { http().get(&url).timeout(Duration::from_secs(2)).send().await?.error_for_status()?.json::<u64>().await }.await.ok();
+            if upto.is_none() {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        }
+        if let Some(upto) = upto {
+            let mut hwm = lake.hwm.subscribe();
+            let _ = tokio::time::timeout(Duration::from_secs(10), async { while lake.visible() < upto { let _ = tokio::time::timeout(Duration::from_millis(50), hwm.changed()).await; } }).await;
+        }
+        lake.caught.send_replace(true);
+    });
+}
+
 /// Follower or read-only node: follow the leader's commit stream (see `store.rs`). If it breaks,
 /// reconnect; meanwhile our own catalog view keeps us correct, just a little behind. A follower
 /// (`replica`) of a leader that replicates commits also keeps every change on local disk and

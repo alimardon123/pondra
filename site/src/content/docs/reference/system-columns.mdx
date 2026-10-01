@@ -1,6 +1,6 @@
 ---
 title: System columns and tables
-description: The columns every row has, the change feed's change types, and the pondra.runs, pondra.routines, pondra.tasks, pondra.tables, pondra.pipelines and pondra.expectations tables.
+description: The columns every row has, the change feed's change types, and the pondra.runs, pondra.routines, pondra.tasks, pondra.tables, pondra.flows and pondra.expectations tables.
 sidebar:
   order: 16
 ---
@@ -233,9 +233,9 @@ SELECT name, kind, key FROM pondra.tables WHERE name IN ('sold', 'sold_by_item',
 SHOW MATERIALIZED VIEWS LIKE 'sold%';
 ```
 
-## Pipelines and expectations
+## Flows and expectations
 
-`pondra.pipelines` lists each materialized view ([Pipelines](/pondra/guides/pipelines/)):
+`pondra.flows` lists each materialized view ([Flows](/pondra/guides/flows/)):
 
 | Column | Meaning |
 |---|---|
@@ -251,7 +251,7 @@ SHOW MATERIALIZED VIEWS LIKE 'sold%';
 commits that wrote the view's rows.
 
 ```sql
-SELECT name, follows, kind FROM pondra.pipelines WHERE name = 'sold_by_item';
+SELECT name, follows, kind FROM pondra.flows WHERE name = 'sold_by_item';
 ```
 
 ```text

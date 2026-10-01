@@ -115,7 +115,7 @@ the ones it does.
 | `time` | `'col'` or `'col1, col2'` | | the event-time column both tables have, or one for each table |
 | `within_secs` | seconds | none | pair a row only with rows this close to it in time; needs `time` |
 | `start` | `'earliest'` or `'latest'` | `'earliest'` | for a view over a Kafka topic: where to start reading |
-| `history` | `'col'` or `'col1, col2'` | | keep every version of each key, with `__start_at` and `__end_at` when read ([history per key](/pondra/guides/pipelines/#history-per-key-scd-type-2)) |
+| `history` | `'col'` or `'col1, col2'` | | keep every version of each key, with `__start_at` and `__end_at` when read ([history per key](/pondra/guides/flows/#history-per-key-scd-type-2)) |
 | `sequence_by` | column name | | a history view's order of versions: a time, or a number that grows |
 | `delete_when` | a condition | none | a history view's version that ends its key, not shown |
 

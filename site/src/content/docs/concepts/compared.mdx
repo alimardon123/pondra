@@ -27,10 +27,10 @@ Per machine, in the main areas, Pondra measured ahead of Spark and Flink:
   Spark and Flink take 7 to 10 s and over 550 MB.
 - **Latency:** a change shows up on another node in about 5 ms. Writes are acknowledged in 2 to 4 ms on
   R2 with `--ack replicated`.
-- **Pipelines:** materialized views that follow each other (bronze, silver, gold) move in the commit
+- **Flows:** materialized views that follow each other (bronze, silver, gold) move in the commit
   that wrote the rows, with expectations that keep, drop or refuse rows: no stage lags another, where
   Databricks' pipelines, Snowflake's dynamic tables and chained Flink jobs each lag the stage before
-  ([Pipelines](/pondra/guides/pipelines/)).
+  ([Flows](/pondra/guides/flows/)).
 - **A database's behaviour:** `BEGIN` … `COMMIT` as one commit with snapshot isolation, Postgres's
   error codes on every door, and key lookups through the Postgres port in about 0.4 ms. pgbench's own
   TPC-B script runs with its balances right.
@@ -113,7 +113,7 @@ Flink is a stateful stream processor.
   and Pondra took its over HTTP.
 - A change is visible on another node in 5 ms. Flink's exactly-once results become visible at a
   checkpoint.
-- A pipeline of views (a filter, then an aggregate of it, then a rollup) is one commit: each stage's
+- A flow of views (a filter, then an aggregate of it, then a rollup) is one commit: each stage's
   rows are written with the rows that caused them, exactly once, with no state to checkpoint between
   stages. In Flink each stage is an operator or a job whose output a sink commits at a checkpoint.
 - No JVM, checkpoints, or Kafka or Fluss underneath.
@@ -196,7 +196,7 @@ AI tools.
 - It runs anywhere you can run a binary, with no cloud account: on your disk or in any bucket.
 - Spark 4 reads the Delta and Iceberg tables Pondra publishes, and gets Pondra's answers. Databricks'
   own runtime hasn't been tried.
-- Its pipelines are Databricks' declarative pipelines in SQL — views following views, expectations
+- Its flows are Databricks' declarative pipelines in SQL — views following views, expectations
   (`CONSTRAINT … EXPECT (…) ON VIOLATION DROP ROW | FAIL`), counted in `pondra.expectations` — but
   every stage commits with its source's rows, where a Databricks pipeline updates its tables on
   compute of its own, every 10 seconds to a few minutes in continuous mode. History per key (SCD
@@ -219,7 +219,7 @@ Snowflake is a managed cloud data warehouse.
 - Tasks with `CREATE TASK … SCHEDULE`, stored procedures in SQL and Python, and Python functions follow
   Snowflake's ideas. The table below sets them side by side.
 - The tables are open files in your own bucket, and Iceberg and Delta readers can use them.
-- A dynamic table refreshes within its target lag, 60 seconds at least; a Pondra pipeline's views
+- A dynamic table refreshes within its target lag, 60 seconds at least; a Pondra flow's views
   move in the commit that wrote the rows.
 
 Pondra hasn't been measured against Snowflake.

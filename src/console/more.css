@@ -139,9 +139,22 @@ dialog.pop:has(.sa){max-width:860px;width:calc(100% - 40px)}.sa{display:flex;fle
 dialog.pop.wide{max-width:980px;width:calc(100% - 40px)}.vers{display:grid;grid-template-columns:minmax(200px,280px) 1fr;gap:14px;min-height:46vh}
 .vlist{overflow:auto;max-height:62vh;padding-right:8px;border-right:1px solid var(--line2)}.vlist .meta{margin-left:auto}.vdiff{overflow:auto;max-height:62vh;min-width:0}
 .dpre{margin:0;font:12px/1.55 var(--mono);color:var(--ink)}.dl{white-space:pre-wrap;word-break:break-all;padding:0 8px 0 4px;border-radius:3px}.dl .mk{display:inline-block;width:16px;color:var(--faint);user-select:none}
+.vcell{margin:0 0 10px;border:1px solid var(--line2);border-radius:8px;overflow:hidden}.vcell .vhead{font:600 12px var(--sans,inherit);padding:5px 10px;background:var(--head);color:var(--muted)}
+.vcell.added .vhead{color:var(--ok)}.vcell.gone .vhead{color:var(--err)}.vcell .dpre{padding:4px 0}
 .dl.plus{background:color-mix(in srgb,var(--ok) 15%,transparent)}.dl.minus{background:color-mix(in srgb,var(--err) 13%,transparent)}.dl.fold{color:var(--faint);font-style:italic;padding:2px 20px}
 @media (max-width:720px){.vers{grid-template-columns:1fr}.vlist{border-right:0;max-height:24vh}}
 .flow{display:flex;flex-wrap:wrap;align-items:center;gap:4px 6px;font:12px var(--mono)}
 .flow .fl{padding:2px 7px;border-radius:5px;background:var(--sunk);border:1px solid var(--line2);color:var(--muted)}
 .flow .fl.cur{background:var(--accent-soft);border-color:transparent;color:var(--ink);font-weight:600}
 .flow .arr{color:var(--faint)}
+/* a SQL file's Messages: each statement, what it printed and did */
+.msgs{display:flex;flex-direction:column;gap:8px}
+.msg{border:1px solid var(--line2);border-radius:8px;background:var(--surface)}.msg.on{border-color:color-mix(in srgb,var(--accent) 50%,var(--line))}.msg.bad{border-color:color-mix(in srgb,var(--err) 40%,var(--line))}
+.msg-h{display:flex;align-items:center;gap:8px;width:100%;min-height:32px;padding:4px 10px 4px 6px;border:0;background:transparent;color:var(--ink);cursor:pointer;text-align:left;font-size:12.5px}
+.msg-h:hover{background:var(--hover)}.msg-h b{display:inline-grid;place-items:center;min-width:18px;height:18px;border-radius:5px;background:var(--hover);font-size:11px}
+.msg-h code{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font:12px var(--mono)}.msg-h .m{color:var(--muted);white-space:nowrap;font-variant-numeric:tabular-nums}
+.msg-h .ic{color:var(--ok)}.msg.bad .msg-h .ic{color:var(--err)}
+.msg>pre{margin:0;padding:6px 12px 8px 36px;max-height:220px;border-top:1px solid var(--line2)}
+/* a SQL file's answers numbered beside their statements */
+.smarks{position:absolute;left:0;top:0}.smark{position:absolute;left:5px;margin-top:2px;min-width:17px;height:17px;padding:0 4px;border:0;border-radius:5px;background:var(--hover);color:var(--ink);font:600 10.5px/17px var(--sans);cursor:pointer}
+.smark.on{background:var(--accent);color:var(--on-accent)}.smark.bad{background:var(--err-soft);color:var(--err)}.sband{position:absolute;left:0;right:0;background:var(--accent-soft);box-shadow:inset 2px 0 var(--accent);pointer-events:none}

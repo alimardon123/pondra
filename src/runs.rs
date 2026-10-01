@@ -260,7 +260,7 @@ struct Tick {
     done: bool,
 }
 
-fn task_key(name: &str) -> String { format!("j/{name}") }
+pub fn task_key(name: &str) -> String { format!("j/{name}") }
 fn tick_key(name: &str) -> String { format!("jt/{name}") }
 
 pub const USAGE: &str = "CREATE TASK name SCHEDULE 'cron 0 2 * * * UTC' | '5 minutes' AS CALL procedure(…)";
@@ -528,7 +528,7 @@ fn latest(e: &Every, after: u64, now: u64) -> Option<u64> {
 /// Does `sql` read one of these tables?
 pub fn mentioned(sql: &str) -> bool {
     let s = sql.to_lowercase();
-    ["pondra.runs", "pondra.routines", "pondra.tasks", "pondra.tables", "pondra.users", "pondra.grants", "pondra.audit", "pondra.pipelines", "pondra.expectations"].iter().any(|t| s.contains(t))
+    ["pondra.runs", "pondra.routines", "pondra.tasks", "pondra.tables", "pondra.users", "pondra.grants", "pondra.audit", "pondra.flows", "pondra.expectations"].iter().any(|t| s.contains(t))
 }
 
 /// `pondra.routines`, `pondra.tasks` and `pondra.tables`, as they are now.

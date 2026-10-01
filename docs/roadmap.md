@@ -4,11 +4,15 @@
 rounds" is what I recommend, the decisions in "What only you can decide" are yours · **Builds on:** ADR-002 to ADR-017,
 `prototype-status.md`, `comparison-spark-flink-fluss.md`
 
-**Progress (2026-10-01):** rounds 17 to 29 are done (ADR-018 to ADR-035; round 29, the owner's
+**Progress (2026-10-01):** rounds 17 to 30 are done (ADR-018 to ADR-036; round 29, the owner's
 console lists, then users, grants, secrets, TLS, an audit log, quotas, files with versions and C5,
-is 0.28.0). Round 30 is under way (ADR-036): pipelines with expectations, transactions, error
-codes, CHECK constraints, the point path from every door, the doors matrix and history per key
-(SCD type 2) are built; identity columns and UNIQUE (decision 10) are left.
+is 0.28.0; round 30: pipelines with expectations, transactions, error codes, CHECK constraints,
+the point path from every door, the doors matrix and history per key; identity columns and UNIQUE
+(decision 10) are left). Round 31's first part is 0.29.0: session settings and prepared
+statements, Spark's functions, Arrow files, `CREATE TABLE` as Postgres has it, interval
+arithmetic; sqllogictest 98.0% with every exception named (92.9% of every record); TPC-DS's 99
+queries equal to DuckDB's; a random-query tester (which found a wrong answer in DataFusion's `IN`
+lists, worked around); Polars' and PySpark's coverage published.
 
 - **Round 17** made Pondra install anywhere: a glibc 2.17 Linux binary, pip and npm packages
   (built, not published), a SQL shell, and both flaky tests fixed.
@@ -393,6 +397,19 @@ Proof:
   - stream joins sharded across the nodes;
   - a view's state split by key ranges over the nodes, each keeping its own keys' (Flink's keyed
     state, without a JobManager: every node knows its ranges, as queries' shuffles do).
+- **Flows** (the owner, 2026-10-01: "can we fix and improve these parts?"; a later round):
+  - **cheaper stages:** today three stages cost 29% of ingest (`tools/bench/flow.py`: 183k → 131k
+    rows/s, the append p50 16 → 24 ms), mostly each view planned again for every flush. Plan each
+    view once and run its physical plan over each new batch, and derive a node's queued flushes in
+    one pass; the target is three stages within 10% of no view, on the same bench;
+  - **more SQL kept up:** `avg` (a hidden sum and count, divided as read), `count(DISTINCT)` (a
+    hidden table of a group's values, counted as read), `DISTINCT`, `HAVING` (over the kept totals),
+    `UNION ALL` (a view of two tables), outer joins (the padded row taken back when its match
+    arrives), and Top-N per key;
+  - **every query, one way or another:** a materialized view whose query can't be kept up is
+    refreshed whole, on a schedule or when its tables change (`WITH (refresh = '10 minutes')`, as
+    Snowflake's dynamic tables and Databricks' materialized views do), instead of being refused;
+    `pondra.flows` says which way each view is kept.
 - **Distributed:**
   - the stages after a shuffle planned again from what the ones before found (Spark's adaptive
     execution: sizes, skew, a join switched to a broadcast), SPMD's way: every node gets the same
@@ -442,6 +459,7 @@ table's slices.
 | H5 ✓ | Decorators that take a notebook's function as it is (imports, helpers, constants) | Python users write Python, not wrappers | S–M | The same function runs in the notebook and on the node (done); PySpark's `udf` too |
 | H6 ✓ | Schedules (`CREATE TASK … SCHEDULE`) and the run log (`pondra.runs`) | Jobs that run by themselves, and what they did | M | Every tick's writes once through a failover (done) |
 | H7 | Notebooks in the catalog: `.ipynb` in the lake, run as a procedure, on a schedule | The platform on top | M–L | Later: after the console (round 26) |
+| H8 ✓ | Spark SQL where PySpark code sends it (the owner, 2026-10-01; built in round 31, part 2: `spark_sql('…')`, `sparksql.rs`, `harness.py sparksql`): `spark.sql(…)` read with Spark's grammar and functions, one statement at a time, and turned into Pondra's own SQL before frames build on it; Pondra's SQL everywhere else; a session's `SET datafusion.sql_parser.dialect = 'spark'` for whole sessions | A PySpark job keeps its SQL as written, with one engine and one SQL underneath | M | Spark's `"text"` literals, backticks, `LATERAL VIEW explode`, and shared names (`floor`, `substring`) answer as Spark does inside `spark.sql`, and frames built on them still compose |
 
 ### I. Extensions (the owner, 2026-09-29; ADR-031, proposed)
 
@@ -460,6 +478,27 @@ the platform after.
 | J1 | The server's catalog (ADR-032 §9): databases anywhere by name, attachments, secrets, users and extensions for every database of a server | Users live above the databases (round 29 needs it); no listing per connection | M | Databases in two buckets served as one server; listing costs no request; a user made once reaches every database |
 | J2 ✓ | A workspace (ADR-033, built 2026-09-30): `.sql`, `.py` and notebooks as versioned files, edited in the console, run with parameters from every door (`CALL run(…)`), recorded in the run log, scheduled | ETL without another tool; SQL and Python calling each other | M–L | A SQL file and a Python file chained with parameters, from SQL, Python, JavaScript and the console; a schedule runs a notebook; the run log names each version |
 | J3 | Dashboards and reports: a notebook with parameters shown read-only | What a team shares | M | A report with inputs, refreshed by a schedule |
+| J4 | Connections, for ETL in code and on a canvas (the owner, 2026-10-01; proposed, an ADR first): a named, typed connection to a source or target system that holds its details and points to a secret for its credentials | A graphical or code ETL tool has to keep many systems' logins safely, and a pipeline should never hold a password | M | A pipeline in SQL, Python and the console reads and writes through one connection; nobody sees the password, not even an admin; one `ALTER SECRET` rotates it for every pipeline; every use is in `pondra.audit` |
+| J5 | A workspace exported and imported whole, for CI/CD (the owner, 2026-10-01; proposed): one file (a zip) of a lake's definitions — schemas, tables' layouts, views and flows, functions, procedures, tasks, grants, the workspace's files with their versions — with its data or without, made from the console (a database's menu), SQL (`EXPORT DATABASE … TO 'x.zip' [WITH DATA]`), the clients and the command line, and imported into an empty lake or another database the same ways | Moving a lake from a laptop to staging to production, or keeping a copy, without `pg_dump`'s scripts: the lake is already files, so this is a copy plus its definitions in an order that applies (secrets named, never their values) | M | A lake exported with and without its data and imported elsewhere answers every query alike; a flow and a task keep running there; a second import of the same file changes nothing |
+
+**J4 in brief (as proposed to the owner on 2026-10-01).** Secrets stay the one place for
+credentials. They already are sealed by the master key or a KMS command, never shown back, granted
+with `GRANT USAGE ON SECRET`, audited, and have a per-session temporary form (ADR-035). A
+connection adds the wiring, in the catalog, in plain sight:
+
+- `CREATE CONNECTION crm (TYPE postgres, HOST 'db.local', PORT 5432, DATABASE 'sales', SECRET crm_login)`:
+  the type, host, port, database and options are visible and editable (the console's form for a
+  connection shows them); the credentials are only named, by the secret.
+- A pipeline names the connection, never the secret or the password: `ATTACH CONNECTION crm`,
+  `read_table(crm, 'public.orders')`, `COPY … TO CONNECTION warehouse`, a canvas step's
+  "source: crm". The same object serves graphical and code ETL.
+- `GRANT USAGE ON CONNECTION crm TO etl` checks the secret's grant as well; `TEST CONNECTION crm`
+  reaches the system and says what failed; each use is a row in `pondra.audit`.
+- Rotation is one `ALTER SECRET crm_login …`; every connection and pipeline using it follows.
+- Later, a secret can be a pointer to an outside vault (AWS Secrets Manager, Azure Key Vault,
+  HashiCorp Vault, GCP Secret Manager), fetched when used and kept in memory a short while;
+  OAuth sources (Salesforce, Google) as a secret type whose refresh token the node renews.
+- It builds on G6 (databases attached), G7 (sinks) and the workspace (J2).
 
 ## The road to 1.0 (proposed 2026-09-30, after round 28)
 
@@ -492,18 +531,18 @@ takes one angle to its bar; every round re-measures all of them.
 
 | Angle | Today (measured) | The bar for 1.0 | Round |
 |---|---|---|---|
-| **Right answers** | sqllogictest 74.5% (18,460 of 24,783) on one node; TPC-H 22 of 22 on 1, 3 and 6 nodes; no TPC-DS; no random-query test | sqllogictest ≥ 95%, every exception named; TPC-DS's 99 equal to DuckDB's; 100,000 random queries: one node == three == DuckDB | 31 |
-| **Never loses data** | kill -9 and injected crashes, leader kills: every event once, views exact | also a 24-hour soak (0 lost, memory flat); every release's lake opens in the next; a rolling upgrade; time travel and `UNDROP` within a retention you set (today 60 s) | 32 |
+| **Right answers** | ~~sqllogictest 74.5%~~ round 31: sqllogictest 98.0% of the records not named an exception (23,032 of 23,493; 92.9% of all 24,783), each exception named with its reason; TPC-H 22 of 22 on 1, 3 and 6 nodes; TPC-DS SF1 99 of 99 equal to DuckDB on one node (98 on three: q72 ran out of this box's memory); random queries against DuckDB and three nodes (`tools/random_sql.py`) | sqllogictest ≥ 95%, every exception named; TPC-DS's 99 equal to DuckDB's; 100,000 random queries: one node == three == DuckDB | 31 |
+| **Never loses data** | kill -9 and injected crashes, leader kills: every event once, views exact | also a 24-hour soak (0 lost, memory flat); every release's lake opens in the next; a rolling upgrade; time travel and `UNDROP` within a retention you set (today 60 s) | 33 |
 | **Safe** | ~~read, write and admin tokens; plain HTTP between nodes; any panic stops the node~~ round 29: users and grants to a column, TLS everywhere, mutual TLS, an audit log, quotas, doors fuzzed, a request's panic an error | TLS on every door and between nodes; users and grants down to a column; an audit log; quotas; every wire parser fuzzed; no request can stop a node | 29 |
 | **The same from every door** | ~~local files for the shell only; the fast lookup on `/lookup` only; no transactions on the Postgres port~~ round 30: the doors matrix (9 features × 6 doors, each right or refused by name); `BEGIN`…`COMMIT` on Postgres, HTTP and the clients; Postgres's error codes on every door | every feature × every door in one test; `BEGIN`…`COMMIT` everywhere; Postgres's error codes; the console signed in as the shell is | 29, 30 |
-| **Fast: analytics** | TPC-H SF1 from files 3.60 s, DuckDB 3.70 s (Polars 3.79 s, the same day); from memory 2.03 s against DuckDB's own tables 1.74 s; Q1 10x Postgres | from memory ≤ DuckDB's own tables at SF1 and SF10; ClickBench published | every round, 33 |
+| **Fast: analytics** | TPC-H SF1 from files 3.60 s, DuckDB 3.70 s (Polars 3.79 s, the same day); from memory 2.03 s against DuckDB's own tables 1.74 s; Q1 10x Postgres | from memory ≤ DuckDB's own tables at SF1 and SF10; ClickBench published | every round, 32, 34 |
 | **Fast: points and writes** | lookup p50 0.19 ms (`/lookup`), ~~6.5~~ **0.29 ms** (Postgres port, psycopg, round 30; Postgres 0.09 ms); one-row insert 2.0 ms (Postgres 0.33 ms); one-key UPDATE 2.5 ms; pgbench runs, balances right: 134 tps on 1 client (Postgres 997), 95 on 4 (Postgres 1,793) | ≤ 0.5 ms from every door; `pgbench` runs, balances right | 30 |
 | **Fast from cold** | 6.5–8 s before a node serves, on R2-like storage | a third of that; no burst above the bucket's limits (C5) | 29 |
-| **Scales out** | never run in one data centre; GitHub's runners (above): 3 nodes 8% faster than one | TPC-H SF100: time falls 1 → 3 → 6 machines; faster than Spark on the same VMs | 33 |
-| **Streaming** | Nexmark's q1, q2, q5, q7, q11: 2.1x Flink 2.3 on 2 vCPUs (10 M bids 14.3 s against 30.4 s, 2026-10-01; 2.2–2.9x in round 21); pipelines of views in one commit (round 30); Fluss compared from its docs | all of Nexmark against Flink; Fluss run head to head | 33 |
-| **Easy to run** | `/metrics`, `/stats`, node logs | a query history table, a query's plan and time across the nodes, a slow-query log; a container image, a compose cluster, a Helm chart; drain before stop; an upgrade guide | 32 |
-| **Fits in** | psql, dbt, SQLAlchemy, JDBC, ODBC, ADBC, Npgsql (Power BI's drivers; Power BI itself not yet run); Spark and PyIceberg write | also Metabase, Superset, Grafana, Tableau, DBeaver; Postgres and MySQL attached; sinks; Kafka partitions | 35 |
-| **Runs anywhere** | Linux, macOS, Windows binaries; pip; npm | also in-process, in the browser; Homebrew, winget, a container; signed binaries | 34, 36 |
+| **Scales out** | never run in one data centre; GitHub's runners (above): 3 nodes 8% faster than one | TPC-H SF100: time falls 1 → 3 → 6 machines; faster than Spark on the same VMs | 34 |
+| **Streaming** | Nexmark's q1, q2, q5, q7, q11: 2.1x Flink 2.3 on 2 vCPUs (10 M bids 14.3 s against 30.4 s, 2026-10-01; 2.2–2.9x in round 21); pipelines of views in one commit (round 30); Fluss compared from its docs | all of Nexmark against Flink; Fluss run head to head | 34 |
+| **Easy to run** | `/metrics`, `/stats`, node logs | a query history table, a query's plan and time across the nodes, a slow-query log; a container image, a compose cluster, a Helm chart; drain before stop; an upgrade guide | 33 |
+| **Fits in** | psql, dbt, SQLAlchemy, JDBC, ODBC, ADBC, Npgsql (Power BI's drivers; Power BI itself not yet run); Spark and PyIceberg write | also Metabase, Superset, Grafana, Tableau, DBeaver; Postgres and MySQL attached; sinks; Kafka partitions | 36 |
+| **Runs anywhere** | Linux, macOS, Windows binaries; pip; npm | also in-process, in the browser; Homebrew, winget, a container; signed binaries | 35, 37 |
 
 ### How the work changes
 
@@ -515,7 +554,7 @@ takes one angle to its bar; every round re-measures all of them.
   Python (connection and frames), JavaScript and MCP. A door that can't do one refuses it by name.
 - **A real workload:** one real dataset and job of the owner's, run on Pondra every round. The
   owner's Windows sessions found more than any test this month.
-- **Scale runs start as soon as there are machines:** round 33 is where their fixes are gathered,
+- **Scale runs start as soon as there are machines:** round 34 is where their fixes are gathered,
   not when they start.
 
 ## The rounds
@@ -540,12 +579,13 @@ simulated R2 and real R2, an ADR, and a bundle.
 | 28 ✓ | Anyone's compute, phase 2 (done: ADR-029) | G9: changes as written, and what phase 1 moved on | Spark's and PyIceberg's `DELETE`, `UPDATE`, `MERGE` and overwrites on Pondra's tables, copy-on-write and merge-on-read; deletes published as positions (Iceberg delete files, Delta deletion vectors), purges as maintenance; changes carried over Pondra's merges by row id; multi-table transactions; keyed tables published every tier round and taking other engines' upserts and deletes; followers fed from the files in one commit; `/watch`, the change feed and Kafka topics carrying file commits |
 | 29 ✓ | The owner's console list, then safe to share (as approved, and robust) (done: ADR-034, ADR-035; 0.28.0) | the console (part 1), E3 (part 2), C5 (part 3); no request can stop a node | **part 1**, the owner's list from 0.26 on Windows: Python found with a time limit and chosen in the console, Stop interrupting a Python cell, the grid's menus and filters, copies and downloads in every form, Messages and Runs worth reading, the plan as a graph with a profile, charts to choose and save, Format for SQL and Python (right-click, Shift+Alt+F), calmer toolbars, the right pane and Settings reworked, colours, settings kept on the machine, light by default, the page's first load back under its 70 KB budget, uv checked in CI, the docs site building from a clean checkout; the owner's second list (2026-10-01): Markdown cells drawn as GitHub does, a SQL cell's Chart and Plan kept with its notebook, tabs that scroll and pin, pages of rows kept on the node (`pages.rs`), Jobs apart from History (schedules now, pipelines as a section), a clearer Data tree, Format selection and file, Settings as sections (`register.setting`); the owner's third list (2026-10-01): rows a page, a quieter pager, the Run ▾ in the editor's right-click with Create as, Data profile and Query profile named apart, a right-click menu for every kind of object with Script as in SQL or Python (`register.objectKind`), a cell made Python or SQL, `pondra.tables` so the shell's `.tables` says what a materialized view is, cells added between cells, `SELECT ts::date, *` named as other engines name it; **part 2 built (2026-10-01):** users and roles with grants down to a column, one check at every door, passwords and tokens kept as hashes, secrets sealed by a master key or a KMS command with `GRANT USAGE ON SECRET` and `CREATE TEMPORARY SECRET`, the console signed in as the shell is, TLS on every door (plain only from the node's machine), mutual TLS between nodes, `pondra.audit`, quotas (`MAX_QUERIES`, `STATEMENT_TIMEOUT`), every door fuzzed, a panic in a request answered as an error (ADR-035 "Built"), `tools/gates.py`; **then, after security** (the owner, 2026-10-01): **built:** every file keeps its versions (ADR-035 §8: each save kept with who and when, **Versions…** shows what changed and restores one, notebooks one file each, any notebook a job); a run whose node stopped under it marked `stopped` in `pondra.runs`; the cold start about 40% shorter (C5: 3.1–4.4 s against 6.5–7.7 s), a request budget per bucket and node that backs off on 503 and 429, log keys with a random first part, the orphan sweep one part at a time, the bell's 429 counted as rung; **left:** the last of C5's step 1 (SlateDB reading the WAL once) and its bigger proof (six nodes at once, a 50,000-file drop) |
 | 30 | Behaves like a database, from every door | transactions, errors, the point path, constraints | `BEGIN`…`COMMIT`/`ROLLBACK` on every door as one commit (reads from one snapshot, a conflict as Postgres's serialization error); Postgres's error codes everywhere; the key lookup's fast path from every door and prepared statements' plans kept; one-row inserts faster; `UNIQUE`, `CHECK` and identity columns; the doors matrix; pipelines as Databricks' DLT (now Lakeflow pipelines) has them (the owner, 2026-10-01: round 30): pipelines of materialized views, each following the one before in the same commit (bronze → silver → gold; until then a view of a view is refused, never left empty), expectations (`CHECK … ON VIOLATION DROP ROW | FAIL`, the rows dropped counted), history kept per key (SCD type 2) from a change feed, and the pipeline's graph in the console. Gates: `pgbench`'s own script runs with the balances right; a lookup through the Postgres port ≤ 0.5 ms |
-| 31 | Correct SQL, proven | D1 to its end, D2, TPC-DS | sqllogictest ≥ 95%, every exception named; Postgres's interval arithmetic (`n * INTERVAL '37 seconds'`, refused today: found by the console review); TPC-DS's 99 queries == DuckDB, one node and three; 100,000 random queries (SQLancer's oracles) one node == three == DuckDB; Polars and PySpark coverage published |
-| 32 | Run it for years | upgrades, recovery, observability, deployment; C4 | a lake format version, and a lake of every release since 0.22 opening in the new one (in CI); a rolling upgrade of a mixed-version cluster; time travel in SQL (`AT`), retention per table, `UNDROP`, zero-copy `CLONE`, `RESTORE`; a query history table, plans and times across the nodes (the console's History showing each statement's plan and profile from it), a slow-query log, traces; a container image, a compose cluster, a Helm chart; `pondra service install` (a node that starts with the machine and restarts if it stops, on the same lake and port: a systemd unit, a launchd agent, a Windows service; the owner, 2026-10-01, optional); drain before stop; a 24-hour soak on R2 |
-| 33 | Scale, proven (machines: the owner's decision 9) | C1, C2, C3, ClickBench, burst | 1 → 3 → 6 machines in one data centre, TPC-H SF100 time falling, against Spark on the same VMs; all of Nexmark against Flink; Fluss head to head; ClickBench submitted; what they find fixed (six nodes' 246 s settle first; the guard spreading a query that reads much and sends little: on 0.27.0's SF10 runs it kept q1, q3, q12 and q19 on one node, 21.1 s where 19.4 s was there on 6 runners); the cluster benchmark's data made in parts on every runner, so SF100 fits on runners of 14 GB; `INSERT … SELECT` and `CREATE TABLE AS` computed and written by every node at once, each its share's files, recorded in one commit (as `COPY … TO` already is); serverless bursts for a big query (an ADR of its own) |
-| 34 | In-process and in the browser | B1, B2, B4 | `pondra.open(…)` in Python without a server, Arrow straight into pandas and Polars; a lake queried in a web page (WebAssembly), against DuckDB; the console's editor drawing only the lines in sight (typing in a 1,000-line file: 28 ms a key today, under 8 the aim)-WASM |
-| 35 | Fits in | G6, G7, E2, Kafka's partitions | Postgres and MySQL attached and their changes streamed in; sinks; Kafka partitions and transactions; Metabase, Superset, Grafana, Tableau and DBeaver checked; a SQLAlchemy dialect and a dbt adapter packaged |
-| 36 | 1.0 | the promises | what stays stable (the lake format, SQL, the APIs) and how things are deprecated; a security review; signed binaries for Windows and macOS; Homebrew, winget and a container image; the docs complete (every feature from every door, limits, troubleshooting, upgrading); a benchmarks page one command re-runs; **a review of every document, the site and the code** against what was decided (the owner, 2026-09-30): Pondra's own names first, Polars', PySpark's and DuckDB's shown as optional; what was superseded marked or gone |
+| 31 (part 1 ✓, 0.29.0; part 2 under way) | Correct SQL, proven | D1 to its end, D2, TPC-DS | **built (2026-10-01):** sqllogictest 98.0%, every exception named (`slt_check.py`: plan text, a write explained, what the runner makes in Rust, the node's memory, microseconds, an order no query asked for, interval arithmetic); `SET`/`RESET`/`SHOW`, `PREPARE`/`EXECUTE`/`DEALLOCATE` per session (a script its own), Spark's functions (DataFusion's names untouched; Spark's for all in the `spark` dialect), Arrow files, DataFusion's writer options through `COPY`, `CREATE TABLE` refusing a table that is there (42P07), `SELECT … INTO`, MERGE's mistakes refused, `n * INTERVAL` as Postgres; TPC-DS's 99 equal to DuckDB (`tools/tpcds_check.py`); `tools/random_sql.py`; `tools/api_coverage.py` (Polars 17–29% of each part by name, PySpark's DataFrame 45%, functions 39% by name in SQL); **part 2 (the owner, 2026-10-01), built:** `CREATE OR REPLACE` and `IF NOT EXISTS` for every kind of object (both together refused; `IF NOT EXISTS` only where replacing would drop data or permissions: schemas, databases, users, roles); a notebook's SQL cell named (`→ df`, saved as `%%sql df <<`) is a frame in the page's Python, and a SQL cell reads the page's Python tables by name, in the console and in a notebook's run; `ALTER MATERIALIZED VIEW v DETACH` (the flow stops, the rows stay a table, what follows it keeps following that table; a GROUP BY view's stays a merge table; a view keeping windows refused; one fed by a topic stops reading it); **Versions…** showing a notebook's changes cell by cell, each cell's lines highlighted as its language, and SQL and Python files highlighted; the Windows build starting again (an 8 MB stack for the work). **Still to build:** `spark.sql(…)` in Spark's grammar and functions, a statement at a time, turned into Pondra's SQL before frames build on it; chained materialized views renamed from "pipelines" to a name of Pondra's own (the owner's choice), so a future ETL tool's pipelines aren't confused with them; TPC-DS on three nodes in full, 100,000 random queries, Avro files, identity and UNIQUE. (q72's join order: round 32.) **The bar:** sqllogictest ≥ 95%, every exception named; Postgres's interval arithmetic (`n * INTERVAL '37 seconds'`, refused today: found by the console review); TPC-DS's 99 queries == DuckDB, one node and three; 100,000 random queries (SQLancer's oracles) one node == three == DuckDB; Polars and PySpark coverage published |
+| 32 | Lean and fast (the owner, 2026-10-01: a round only for optimizing) | sizes, speed, the tests' time, stale docs | the binary's size back down (what each crate adds, measured; features off by default that most don't use), start-up and idle memory, a session's making cheaper; one node: TPC-DS's slow ones (q72's join order: 81 s against DuckDB's 1 s), TPC-H and ClickBench from memory against DuckDB's own tables; flows' stages within 10% of ingest with no view (F, the owner 2026-10-01; 29% for three today); several nodes: what the cluster bench shows (shuffles, the guard's choices); the suite, the gates and the benchmarks fast enough to run whole every round (they have grown slow: parallel suites, smaller data where it proves the same); every stale doc brought up to date (the site, ADRs marked superseded where they are). The gate: every number holds or improves, and the binary and the suite's time fall |
+| 33 | Run it for years | upgrades, recovery, observability, deployment; C4 | a lake format version, and a lake of every release since 0.22 opening in the new one (in CI); a rolling upgrade of a mixed-version cluster; time travel in SQL (`AT`), retention per table, `UNDROP`, zero-copy `CLONE`, `RESTORE`; a query history table, plans and times across the nodes (the console's History showing each statement's plan and profile from it), a slow-query log, traces; a container image, a compose cluster, a Helm chart; **environments** (the owner, 2026-10-01, a note to weigh in this round): dev, staging and prod for the workspace's files, jobs, tasks and materialized views, each with its own settings, secrets and connections, and promotion from one to the next in CI (as Databricks' asset bundles do), so a change is tried before it reaches production; `pondra service install` (a node that starts with the machine and restarts if it stops, on the same lake and port: a systemd unit, a launchd agent, a Windows service; the owner, 2026-10-01, optional); drain before stop; a 24-hour soak on R2 |
+| 34 | Scale, proven (machines: the owner's decision 9) | C1, C2, C3, ClickBench, burst | 1 → 3 → 6 machines in one data centre, TPC-H SF100 time falling, against Spark on the same VMs; all of Nexmark against Flink; Fluss head to head; ClickBench submitted; what they find fixed (six nodes' 246 s settle first; the guard spreading a query that reads much and sends little: on 0.27.0's SF10 runs it kept q1, q3, q12 and q19 on one node, 21.1 s where 19.4 s was there on 6 runners); the cluster benchmark's data made in parts on every runner, so SF100 fits on runners of 14 GB; `INSERT … SELECT` and `CREATE TABLE AS` computed and written by every node at once, each its share's files, recorded in one commit (as `COPY … TO` already is); serverless bursts for a big query (an ADR of its own) |
+| 35 | In-process and in the browser | B1, B2, B4 | `pondra.open(…)` in Python without a server, Arrow straight into pandas and Polars; a lake queried in a web page (WebAssembly), against DuckDB; the console's editor drawing only the lines in sight (typing in a 1,000-line file: 28 ms a key today, under 8 the aim)-WASM |
+| 36 | Fits in | G6, G7, E2, Kafka's partitions | Postgres and MySQL attached and their changes streamed in; sinks; Kafka partitions and transactions; Metabase, Superset, Grafana, Tableau and DBeaver checked; a SQLAlchemy dialect and a dbt adapter packaged |
+| 37 | 1.0 | the promises | what stays stable (the lake format, SQL, the APIs) and how things are deprecated; a security review; signed binaries for Windows and macOS; Homebrew, winget and a container image; the docs complete (every feature from every door, limits, troubleshooting, upgrading); a benchmarks page one command re-runs; **a review of every document, the site and the code** against what was decided (the owner, 2026-09-30): Pondra's own names first, Polars', PySpark's and DuckDB's shown as optional; what was superseded marked or gone |
 | after 1.0 | Depth, then the platform | F by evidence, I1, J1, J3 | streaming depth (timers, CEP, Top-N, a watermark per partition), keyed compaction by key range, adaptive stages and raced stragglers (the owner, 2026-09-30, on Spark's DAGs), tasks that run after others (`CREATE TASK b AFTER a`: a DAG of jobs, as Airflow's, in the catalog; the same from Python (`@pondra.task(after=…)`) as from SQL; drawn and edited as a graph in the console: the owner's idea, 2026-09-30), a vector index, `INSTALL`/`LOAD` extensions, the server's catalog, reports, lineage and entity-relationship diagrams (the owner, 2026-09-30), a managed service |
 
 **Every round, whatever its theme** (the owner's rules: nothing half-done, performance only goes
@@ -588,11 +628,14 @@ Why this order:
   transactions exist, before the tests that measure them are finished.
 - **Correct SQL before scale and before promises** (round 31): what is proven at scale and
   promised stable should be the finished SQL.
-- **Upgrades, recovery and operations before the scale runs** (round 32): a soak and a rolling
+- **Lean and fast before running it for years** (round 32, the owner, 2026-10-01): the binary,
+  the tests and the benchmarks had grown; one round optimizes and nothing else, so what is proven
+  at scale and promised is also small and quick.
+- **Upgrades, recovery and operations before the scale runs** (round 33): a soak and a rolling
   upgrade are what a data-centre run should exercise.
-- **Scale as soon as there are machines** (round 33 gathers its fixes): it is the main claim, and
+- **Scale as soon as there are machines** (round 34 gathers its fixes): it is the main claim, and
   the one only machines can settle.
-- **The in-process library and the browser after the promises** (round 34): the library exposes
+- **The in-process library and the browser after the promises** (round 35): the library exposes
   the lake format and the APIs, which should settle first.
 
 ## What only you can decide
@@ -628,7 +671,7 @@ Why this order:
 
 8. **A freeze on new surface until 1.0** (proposed 2026-09-30): new features only where a bar of
    the scorecard needs them; new ideas go to "after 1.0".
-9. **Machines for round 33.** Three to six VMs in one region for a few hours at a time
+9. **Machines for round 34.** Three to six VMs in one region for a few hours at a time
    (`tools/cloud/` sets them up; a cloud trial's credit covers it). The sooner the better: the
    scale runs can begin during any round.
 10. **An `INSERT` of a key that exists.** Today it replaces the row (an upsert), as Fluss's and

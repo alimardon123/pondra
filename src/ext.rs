@@ -169,6 +169,7 @@ pub fn external(c: &datafusion::sql::parser::CreateExternalTable) -> Result<crat
             _ => bail!("CREATE EXTERNAL TABLE … OPTIONS ('{k}' …): Pondra doesn't read files with it{}", if format == "csv" { " (CSV takes format.has_header, format.delimiter, format.quote, format.escape, format.comment and format.terminator)" } else { "" }),
         }
     }
+    ensure!(!(c.or_replace && c.if_not_exists), "CREATE OR REPLACE EXTERNAL TABLE … IF NOT EXISTS: one or the other");
     let urls = c.locations.iter().map(|l| located(l)).collect::<Result<Vec<_>>>()?;
     ensure!(!urls.is_empty(), "CREATE EXTERNAL TABLE {name}: where are its files? (LOCATION '…')");
     let parts: Vec<String> = c.table_partition_cols.iter().map(|p| p.trim_matches('"').to_string()).collect();
@@ -1067,6 +1068,9 @@ pub fn statement(sql: &str) -> Option<crate::write::Stmt> {
     }
     let usage = "CREATE SECRET name (TYPE s3, KEY_ID '…', SECRET '…', SCOPE 's3://bucket')";
     let if_not_exists = p.parse_keywords(&[Keyword::IF, Keyword::NOT, Keyword::EXISTS]);
+    if replace && if_not_exists {
+        return invalid("CREATE OR REPLACE SECRET … IF NOT EXISTS: one or the other".into());
+    }
     let Ok(name) = p.parse_identifier() else { return invalid(format!("which name? {usage}")) };
     if !p.consume_token(&Token::LParen) {
         return invalid(usage.into());
@@ -1088,7 +1092,7 @@ pub fn statement(sql: &str) -> Option<crate::write::Stmt> {
         }
     }
     if temporary {
-        return Some(crate::write::Stmt::TempSecret(name.value.to_lowercase(), params, replace));
+        return Some(crate::write::Stmt::TempSecret(name.value.to_lowercase(), params, replace, if_not_exists));
     }
     Some(crate::write::Stmt::Ddl(vec![Ddl::CreateSecret { name: name.value.to_lowercase(), params, replace, if_not_exists }]))
 }

@@ -1,6 +1,6 @@
 // Jobs (ADR-034, round 29): what runs on its own, apart from History (what ran). A section a kind:
 // the schedules (`pondra.tasks`, each with its last runs from `pondra.runs`) now; round 30's
-// pipelines are another (`register.jobKind`, as an extension adds its own). Loaded when first shown.
+// flows are another (`register.jobKind`, as an extension adds its own). Loaded when first shown.
 import { h, secs, utc, icon, svg, R, S, run, rows, ident, quote, toast, menu, pop, prompt, confirmed, moreStyle, register } from './core.js';
 import { highlighted } from './editor.js';
 import { copyText } from './grid.js';

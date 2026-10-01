@@ -39,6 +39,12 @@ The owner's design principles, which every change must respect:
    performant, simpler, easier to use, more functional, versatile, scalable and powerful — while
    staying lightweight and efficient. The gates hold each round to it (`logs/gates/`: speed and
    SQL never drop), and the console's budget keeps the page light.
+9. **Easy to change, replace and extend** (the owner, 2026-10-01): the platform will grow tools of
+   its own (ETL on a canvas, AI agents, reports, GPUs) and parts will be swapped. Every feature is
+   a part with one job behind a small surface — a registry entry (`register.*` in the console, a
+   kind of object, a door, a format), not a branch threaded through other code — and works the
+   same from the UI, SQL, the clients and the HTTP API. Prefer a shape a new tool can plug into
+   over one that has to be edited to admit it.
 
 ## Layout
 
@@ -893,6 +899,9 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    and its Delta and Iceberg copies, stay where they are, so other engines keep reading them. A new
    table under a used name gets a folder of its own, `name__N` (not `~`: object_store
    percent-encodes it, and the files would be written where no reader looks). `harness.py renames`.
+   The log's rows are kept under a table's name, so a rename sends the table's and its
+   `{t}$deleted`'s to files first (`ddl::rename`): left in the log, an `UPDATE`'s old versions came
+   back (`harness.py columns`, now and then).
 130. **NOT NULL and DEFAULT hold on every door** (`defaults.rs`): `check` in the log's `queue`, in
    `change.rs`, `kafka.rs` and Flight; `checked` for a bulk INSERT's stream; and in
    `write::prepare` for `pondra sql`, which writes its rows to the log itself. `harness.py found`:
@@ -1109,8 +1118,9 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    table's profile (`details.js`), a data file (`data.js`), charts
    (`chart.js`), plans (`plan.js`) and their style (`more.css`) load the first time they are used,
    through `R.helpers` (no import of `console.js`); each at most 8 KB gzipped. The first load stays
-   within 149's 70 KB. Markdown (`md.js`), Jobs (`jobs.js`), Settings and the key list
-   (`settings.js`), and the files' menus and what they do (`more.js`) too. `console_check.py` (`budget`).
+   within 149's 70 KB. Markdown (`md.js`), Jobs (`jobs.js`), Settings, the key list and the
+   sign-in dialog (`settings.js`), a SQL file's Messages and its answers' numbers in the gutter
+   (`stmts.js`), and the files' menus and a cell's ⋯ (`more.js`) too. `console_check.py` (`budget`).
 171. **A page of an answer is that answer's rows** (`pages.rs`, `server::page`): an answer of more
    rows than `typed` sends at once is kept whole, under a random id, and a page is a slice of it: the
    same rows in the same order, never the query run again while it is kept. Kept within
@@ -1128,7 +1138,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
 174. **The console's actions are SQL (or its Python)** (`objects.js`, ADR-034's third list): every
    menu on an object runs or opens the statement it stands for, one that can't be undone asked
    first; a kind of object is `register.objectKind`, an action `register.objectAction`, so new
-   objects (users, grants, pipelines, an extension's) add a kind, not a tree. `console_check.py` (`work`).
+   objects (users, grants, flows, an extension's) add a kind, not a tree. `console_check.py` (`work`).
 175. **An answer's columns are named apart** (`routines::output_names`): a query DataFusion would
    refuse for two columns of one name (`SELECT ts::date, *`, `SELECT id, *`) runs, a cast named as
    its column or, beside another of that name, as written, a column named twice `id_1`; a query
@@ -1167,13 +1177,13 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    keys many writers add have a random first part; nothing lists the whole bucket on a schedule;
    no key is written by many writers faster than once a second. `tools/cold_trace.sh`,
    `tools/c5_check.py`.
-183. **A pipeline moves in one commit** (ADR-036 §1): `views::derive` runs views in `in_order`, each
+183. **A flow moves in one commit** (ADR-036 §1, which calls it a pipeline; renamed by the owner, 2026-10-01): `views::derive` runs views in `in_order`, each
    taking what the views before it derived in the same flush; the sequencer owes a view's rows to
    the views that follow it (any part with rows, not only a producer's). A view of a GROUP BY view
-   is a rollup (`views::merges` with `up`) or refused; a pipeline is dropped from its end.
+   is a rollup (`views::merges` with `up`) or refused; a flow is dropped from its end.
    `can_follow` and `row_views` follow the chain. A history view (SCD type 2) is an append view
    whose table has `TableMeta::history`: every read of it goes through `views::history_view`
-   (`__start_at`, `__end_at`), so nothing may follow it inline. `tools/harness.py pipelines`.
+   (`__start_at`, `__end_at`), so nothing may follow it inline. `tools/harness.py flows`.
 184. **Expectations count with the rows, and a refusal is the writer's alone** (ADR-036 §2): a
    view's new rows go through `views::expected` (taken-back rows through `let_in`); counts are a
    part of `pondra$expectations` in the same flush; a `Violation` from packing a group sends
@@ -1204,11 +1214,50 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    /tables/{name}` may be sent again (it may add columns at the end).
 190. **Spark's functions never change DataFusion's answers by default** (`store::spark`): only
    names DataFusion doesn't have are registered. Spark's versions of shared names come only with
-   `datafusion.sql_parser.dialect = 'spark' | 'databricks'` (`settings::apply`).
+   `datafusion.sql_parser.dialect = 'spark' | 'databricks'` (`settings::apply`), or under names of
+   their own (`spark_floor`, `sparksql::renamed`), which only `spark_sql('…')` writes for them.
 191. **sqllogictest exceptions are named, never a bucket** (`tools/slt_check.py` `EXCEPTIONS`): a
    failure left out of the pass rate matches a rule with its reason (plan text, a write explained,
    what the runner makes in Rust, the node's memory, microseconds, an order no query asked for).
    A new kind gets a name and a reason, or it is a failure.
+192. **`IF NOT EXISTS` and `OR REPLACE` mean one thing for every kind of object** (round 31): a
+   kind without its own handling is wrapped (`Ddl::Unless`: nothing if a relation, routine or task
+   of the name is there; `Ddl::Replacing`: a materialized view, or one fed by a topic, dropped
+   first, refused while another follows it). Both together are refused. Schemas, databases, users
+   and roles take only `IF NOT EXISTS`: replacing one would drop what it holds. `harness.py objects`.
+193. **`ALTER MATERIALIZED VIEW v DETACH` keeps the table and nothing of the view** (`ddl::detach_view`):
+   the view's entry, watermark and producers go, the table stays as it is (a merge table stays
+   one); what follows it keeps following the table. A view with a `_final` table is refused. A view
+   fed by a topic stops reading it: its feed and offsets go, from the sequencer's memory too
+   (invariant 78), as when one is dropped, and a shard running it looks at its feed after every
+   fetch, ending when it changed or went (`feeds::shard`), so one made again under its name fills
+   again with its own query. `harness.py objects` (a Pondra node's Kafka port as the topic).
+194. **A notebook's SQL and Python see each other the same way in the console and in a run**
+   (`console.js` `sqlCell`, `workspace::cells`): a SQL query naming a table the session's Python
+   holds runs through Python (`db.sql`, which sends it along); a SQL cell named (`%%sql df <<`, the
+   console's **→ name**) leaves `df = db.sql(…)` in Python, a frame, not a copy. Only a single query
+   is named: a write never runs twice.
+195. **The work runs on an 8 MB stack on every OS** (`main.rs`): Windows gives its main thread 1 MB;
+   a session's making and DataFusion's planning need more there than Linux's main thread lets on.
+   Tokio's workers get 8 MB too (`thread_stack_size`): at its 2 MB, the dist build's
+   "procedures calling procedures stop 16 deep" (`harness.py procedures`) overflowed one and
+   killed the node (CI, PR #2); 4 MB passed.
+196. **Spark SQL is turned into Pondra's where SQL comes in, and nowhere else** (`sparksql::inline`,
+   from `routines::expand` and `routines::bind`): `spark_sql('…')` in a FROM becomes a subquery in
+   Pondra's SQL (Spark's grammar read by `SparkSqlDialect`; `"text"`, `DIV`, `<=>`, `!`, `RLIKE`,
+   `LATERAL VIEW`, `explode`, and the names both have as `spark_<name>`), so a frame built on it,
+   a view of it, a spread query or a macro sees plain SQL; it takes a query only. A query that is
+   `SELECT * FROM spark_sql('…')` alone becomes that query itself, so its sort holds (DataFusion
+   drops a subquery's, and Spark sorts by columns it leaves out); a frame's later steps sort again
+   only by columns it kept. PySpark's `spark.sql` sends its queries this way, its writes as
+   Pondra's SQL. `harness.py sparksql` (its "by a column it leaves out" fails without the first).
+197. **A node that just started answers only once it holds what its leader had** (`cluster::catch_up`,
+   `Lake::caught_up`, in `query::session_at` and `write::on_node_as`; 10 s at most): restarted after
+   a failover, its catalog view reads no WAL, and what the new leader took over from the old one's
+   is flushed a moment after it leads, so a table made just before the kill was "not found" there.
+   A Flight log stream that follows a table skips the commits to other tables instead of sending
+   them as empty chunks. The website's `guides/clusters.mdx` (a node killed and restarted, then
+   asked for that table) failed one run in three under load without it; `cluster.py failover`.
 
 ## Tests: run these before and after any change
 
@@ -1220,10 +1269,11 @@ python3 tools/harness.py safety         # panics answered as errors, TLS at ever
 python3 tools/fuzz_doors.py --secs 60   # malformed input at HTTP, SQL, Postgres, Kafka and Flight: the node stays up
 python3 tools/harness.py versions       # every file keeps its versions: listed, read, restored, after a delete, retention, old notebooks
 python3 tools/harness.py stopped        # a run whose node was killed under it: stopped, not running for good
-python3 tools/harness.py pipelines      # views of views in one commit, rollups, expectations (keep, drop, fail), changes down the pipeline
+python3 tools/harness.py sparksql       # spark.sql / spark_sql('…') in Spark's grammar: literals, LATERAL VIEW, Spark's floor and substring, frames on top, refusals
+python3 tools/harness.py flows          # views of views in one commit, rollups, expectations (keep, drop, fail), changes down the flow
 python3 tools/harness.py begin          # BEGIN … COMMIT from every door, read-your-writes, 40001 and retries, 25P02, SQLSTATEs
 python3 tools/bench/pgbench.py          # pgbench's own TPC-B script, 1 and 4 clients: the balances agree (--postgres: Postgres too)
-python3 tools/bench/pipeline.py         # what a pipeline of 0 to 3 views costs ingest; every stage right when acknowledged
+python3 tools/bench/flow.py             # what a flow of 0 to 3 views costs ingest; every stage right when acknowledged
 python3 tools/bench/footprint.py        # install size, start to first answer, idle memory: Pondra, DuckDB, Polars, Spark, Flink (a venv with pyspark, apache-flink)
 FLINK_PYTHON=/tmp/engines/bin/python python3 tools/bench/nexmark.py --bids 10000000   # Nexmark q1 q2 q5 q7 q11 against Flink 2.3
 python3 tools/bench/tpch.py --data ~/tpch/sf1 --queries tools/bench/tpch-queries --engines pondra,duckdb,spark --spark-python /tmp/engines/bin/python   # Spark alone if memory is short
