@@ -262,7 +262,7 @@ async fn list_pythons(Query(q): Query<HashMap<String, String>>, role: axum::Exte
 
 /// `PUT /python` `{"path": …}`: run workers with that Python from now on (and next time: kept on
 /// this machine). From a page on this machine only, an admin's.
-async fn choose_python(axum::extract::ConnectInfo(from): axum::extract::ConnectInfo<std::net::SocketAddr>, role: axum::Extension<crate::auth::Role>, Json(b): Json<Value>) -> Result<Json<Value>, E> {
+async fn choose_python(axum::extract::ConnectInfo(crate::tls::Peer { addr: from, .. }): axum::extract::ConnectInfo<crate::tls::Peer>, role: axum::Extension<crate::auth::Role>, Json(b): Json<Value>) -> Result<Json<Value>, E> {
     if *role < crate::auth::Role::Admin || !from.ip().is_loopback() {
         return Err(E(anyhow::anyhow!("which Python runs is chosen by an admin, on this machine")));
     }
@@ -290,6 +290,15 @@ async fn list_functions(State(app): State<App>) -> Result<Json<Value>, E> {
 /// role too.
 async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response {
     let header = req.headers().get("authorization").and_then(|v| v.to_str().ok()).map(String::from);
+    let from = req.extensions().get::<axum::extract::ConnectInfo<crate::tls::Peer>>().map(|c| c.0.addr);
+    if let Some(axum::extract::ConnectInfo(peer)) = req.extensions().get::<axum::extract::ConnectInfo<crate::tls::Peer>>() {
+        if !peer.allowed() {
+            return (StatusCode::FORBIDDEN, crate::tls::PLAIN).into_response(); // (`tls.rs`)
+        }
+        if header.as_deref().is_some_and(|h| h.starts_with("Bearer pn_")) && !peer.may_be_node() {
+            return (StatusCode::UNAUTHORIZED, "the nodes' key is taken only with a certificate the nodes' authority signed (PONDRA_TLS_CA)").into_response();
+        }
+    }
     let signed = match &header {
         Some(h) => crate::users::who(&app.lake, &app.auth, Some(h)).await,
         None => None,
@@ -298,19 +307,34 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
         Some(p) => p,
         None if owner(req.headers()) || app.open().await => crate::auth::Principal::of(crate::auth::Role::Admin),
         None if header.is_some() => {
+            crate::audit::refused(&app, &basic_user(header.as_deref()), "http", from, &format!("{} {}", req.method(), req.uri().path()), "wrong token, or user name and password");
             tokio::time::sleep(Duration::from_millis(400)).await; // (a guess costs time)
             return (StatusCode::UNAUTHORIZED, "wrong token, or user name and password").into_response();
         }
         None => crate::auth::Principal::of(crate::auth::Role::None),
     };
+    let who = who.at("http", from);
     if who.role < crate::auth::Auth::needed(req.uri().path(), req.method().as_str()) {
         return match who.role {
             crate::auth::Role::None => (StatusCode::UNAUTHORIZED, "sign in: a token, or a user's name and password").into_response(),
-            _ => (StatusCode::FORBIDDEN, "this needs more rights than this token's or user's").into_response(),
+            _ => {
+                crate::audit::refused(&app, &who.name, "http", from, &format!("{} {}", req.method(), req.uri().path()), "this needs more rights than this token's or user's");
+                (StatusCode::FORBIDDEN, "this needs more rights than this token's or user's").into_response()
+            }
         };
     }
     req.extensions_mut().insert(who.role);
-    crate::auth::WHO.scope(who, next.run(req)).await
+    match crate::panics::door(crate::auth::WHO.scope(who, next.run(req))).await {
+        Ok(r) => r,
+        Err(m) => (StatusCode::INTERNAL_SERVER_ERROR, m).into_response(), // (and the node stays up)
+    }
+}
+
+/// The user name in a Basic header (for the audit log: who tried).
+fn basic_user(header: Option<&str>) -> String {
+    use base64::Engine;
+    let b = header.and_then(|h| h.strip_prefix("Basic ")).and_then(|b| base64::engine::general_purpose::STANDARD.decode(b.trim()).ok());
+    b.and_then(|b| String::from_utf8(b).ok()).and_then(|up| up.split_once(':').map(|(u, _)| u.to_string())).unwrap_or_default()
 }
 
 /// `POST /login` `{"user", "password"}`: a session (`{"token": "ps_…", "until": ms}`) to send as
@@ -319,6 +343,7 @@ async fn login(State(app): State<App>, body: Bytes) -> Response {
     let b: Value = serde_json::from_slice(&body).unwrap_or_default(); // (JSON, whatever its content type says)
     let (user, password) = (b["user"].as_str().unwrap_or_default(), b["password"].as_str().unwrap_or_default());
     if !crate::users::password_ok(&app.lake, user, password).await {
+        crate::audit::refused(&app, user, "http", crate::auth::current().and_then(|p| p.from), "sign in", "wrong user name or password");
         tokio::time::sleep(Duration::from_millis(400)).await; // (a guess costs time)
         return (StatusCode::UNAUTHORIZED, "wrong user name or password").into_response();
     }
@@ -358,7 +383,7 @@ async fn to_leader(State(app): State<App>, req: Request, next: Next) -> Response
 
 async fn proxy(addr: &str, req: Request) -> anyhow::Result<Response> {
     let (parts, body) = req.into_parts();
-    let url = format!("http://{addr}{}", parts.uri.path_and_query().map_or("", |p| p.as_str()));
+    let url = crate::tls::url(&format!("{addr}{}", parts.uri.path_and_query().map_or("", |p| p.as_str())));
     let mut out = crate::cluster::http().request(parts.method, url).body(axum::body::to_bytes(body, usize::MAX).await?);
     if let Some(ct) = parts.headers.get("content-type") {
         out = out.header("content-type", ct);
@@ -547,7 +572,7 @@ impl App {
     /// Record an INSERT's files: here on the leader, or forwarded to it.
     pub async fn record_files(&self, f: crate::write::Files) -> anyhow::Result<Value> {
         let Some(seq) = &self.seq else {
-            let r = crate::cluster::http().post(format!("http://{}/cluster/files", self.cluster.leader.addr)).json(&f).send().await?;
+            let r = crate::cluster::http().post(crate::tls::url(&format!("{}/cluster/files", self.cluster.leader.addr))).json(&f).send().await?;
             anyhow::ensure!(r.status().is_success(), "leader: {}", r.text().await?);
             return Ok(r.json().await?);
         };
@@ -625,7 +650,7 @@ impl App {
     /// work: a follower asks it).
     pub async fn checkpoint(&self) -> anyhow::Result<Value> {
         if self.seq.is_none() {
-            let r = crate::cluster::http().post(format!("http://{}/sql", self.cluster.leader.addr)).body("CHECKPOINT").send().await?;
+            let r = crate::cluster::http().post(crate::tls::url(&format!("{}/sql", self.cluster.leader.addr))).body("CHECKPOINT").send().await?;
             anyhow::ensure!(r.status().is_success(), "the leader: {}", r.text().await?);
             return Ok(r.json().await?);
         }
@@ -911,7 +936,7 @@ async fn sql_as(app: App, p: SqlParams, role: axum::Extension<crate::auth::Role>
     if let ([one], true, true, true) = (&crate::routines::split(&req.sql)[..], req.params.is_empty(), req.tables.is_empty(), req.views.is_empty()) {
         let one = crate::routines::expand(&app.lake, one).await?;
         if !crate::write::checkpoint(&one) && !crate::routines::runs_procedure(&one) && crate::write::parse(&one).is_none() {
-            return Ok(query(&app, &p, &one, who.files).await?);
+            return Ok(crate::audit::statement(&app, &one, query(&app, &p, &one, who.files)).await?);
         }
     }
     let tables = Arc::new(req.tables);
@@ -948,7 +973,7 @@ async fn query(app: &App, p: &SqlParams, query: &str, files: bool) -> anyhow::Re
     // Same query, same catalog version: same answer (unless it asks for the time or randomness,
     // or may read a file on this machine).
     let q = query.to_lowercase();
-    let volatile = files || limited || !crate::ext::names(query).is_empty() || ["now()", "random(", "current_", "uuid(", "explain", "pondra.runs", "pondra.tasks", "files("].iter().any(|f| q.contains(f)) // (files outside the lake change on their own; `files()` lists objects put since)
+    let volatile = files || limited || !crate::ext::names(query).is_empty() || ["now()", "random(", "current_", "uuid(", "explain", "pondra.runs", "pondra.tasks", "pondra.audit", "files("].iter().any(|f| q.contains(f)) // (files outside the lake change on their own; `files()` lists objects put since)
         || crate::temp::mentioned(query) // (the session's temporary tables change without a commit)
         || crate::routines::volatile(&app.lake, query).await; // (a Python function may answer differently each time)
     let Some(version) = app.lake.version_for(query).await.filter(|_| !volatile) else { return Ok(respond(run_sql(app, p, query, files).await?)) };

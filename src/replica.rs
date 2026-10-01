@@ -146,7 +146,7 @@ pub async fn recover(lake: &Lake, me: &str, term: u64, own: Option<&ReplicaLog>)
     merge(&own.map(|o| o.serve(term, in_bucket)).unwrap_or_default())?;
     let deadline = Instant::now() + Duration::from_secs(20);
     for peer in members.iter().filter(|p| *p != me) {
-        let url = format!("http://{peer}/cluster/replica?after={in_bucket}&term={term}");
+        let url = crate::tls::url(&format!("{peer}/cluster/replica?after={in_bucket}&term={term}"));
         loop {
             match crate::cluster::http().get(&url).timeout(Duration::from_secs(5)).send().await.and_then(|r| r.error_for_status()) {
                 Ok(r) => break merge(&r.bytes().await?).context("replica from a peer")?,
@@ -180,7 +180,7 @@ pub async fn recover(lake: &Lake, me: &str, term: u64, own: Option<&ReplicaLog>)
 /// (with everything it helped commit in the bucket) before it leaves the list, so a new leader
 /// always knows everyone it has to ask.
 pub fn members(lake: Arc<Lake>, cluster: Arc<crate::cluster::Cluster>) {
-    tokio::spawn(async move {
+    crate::panics::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(1)).await;
             let live: Vec<String> = cluster.nodes().into_iter().filter(|n| *n != cluster.addr).collect();

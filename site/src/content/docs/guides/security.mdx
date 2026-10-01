@@ -1,6 +1,6 @@
 ---
 title: Security
-description: Turn on read, write and admin tokens for every door, make users and roles with grants down to columns, and keep secrets, code and the network in their place.
+description: Turn on read, write and admin tokens for every door, make users and roles with grants down to columns, hold them to quotas, keep an audit log, take TLS at every door, and keep secrets, code and the network in their place.
 sidebar:
   order: 16
 ---
@@ -250,10 +250,10 @@ on a column she may not read is refused too, since its answer would tell:
 ```python
 def attempt_as(db, sql):
     try:
-        db.sql(sql)
+        getattr(db.sql(sql), "rows", list)()  # (a query runs when its rows are asked for)
         return "ran"
     except Exception as e:
-        return str(e).split(" (GRANT")[0]
+        return str(e).split(" (GRANT")[0].split(": ", 1)[1]  # (after the HTTP status)
 
 print(attempt_as(ann, "SELECT * FROM salaries"))
 print(attempt_as(ann, "SELECT name FROM salaries WHERE pay > 110"))
@@ -336,6 +336,105 @@ key on its input (a short script over `aws kms`, `gcloud kms`, `az keyvault key`
 start the nodes with the new one and the old as `PONDRA_SECRET_KEY_PREVIOUS`: the leader rewraps every
 secret's key when it starts (the values aren't touched), and the old key can then go.
 
+## Quotas
+
+A user may be held to a **quota** on each node: `MAX_QUERIES n`, how many of its statements run at
+once (the rest wait their turn, 30 seconds at most), and `STATEMENT_TIMEOUT`, how long one may run
+before it is stopped. `PONDRA_USER_QUERIES` and `PONDRA_USER_TIMEOUT` (seconds) set them for every
+user without its own; `0` lifts one. Tokens and superusers have none.
+
+```python
+admin.sql("ALTER USER ann MAX_QUERIES 2 STATEMENT_TIMEOUT '1 second'")
+print(attempt_as(ann, "SELECT sum(v) AS s FROM generate_series(1, 4000000000) AS g(v)"))
+print(admin.sql("SELECT name, max_queries, statement_timeout FROM pondra.users WHERE name = 'ann'").rows())
+```
+
+```text
+quota: ann's statements run at most 1 s (STATEMENT_TIMEOUT); this one was stopped
+[{'name': 'ann', 'max_queries': 2, 'statement_timeout': '1 second'}]
+```
+
+A write stopped this way may still land if it was already committing, as with Postgres's
+`statement_timeout` on a remote commit.
+
+## The audit log
+
+**`pondra.audit`** says who did what, through which door and from where, and what came of it.
+Only a superuser reads it. By default it keeps every change to users, roles, grants, tokens and
+secrets (`role`), every other change to what exists (`ddl`), every procedure call and `DO` block
+(`function`), and every refusal: a sign-in that failed, a statement its rights or its quota didn't
+cover. `PONDRA_AUDIT` chooses the classes, as pgaudit does: `role`, `ddl`, `function`, `write` (rows
+written), `read` (queries), `misc` (`SET`, `BEGIN`), `all` or `off`. Rows are kept 90 days
+(`PONDRA_AUDIT_DAYS`). A statement that makes a user, a token or a secret is kept with its quoted
+values as `'***'`:
+
+```python
+for row in admin.sql("""SELECT "user", door, class, statement, outcome FROM pondra.audit
+                        WHERE "user" = 'ann' OR statement LIKE '%USER ann%' ORDER BY at""").rows():
+    print(row)
+```
+
+```text
+{'user': 'admin', 'door': 'http', 'class': 'role', 'statement': "CREATE USER ann PASSWORD '***'", 'outcome': 'ok'}
+{'user': 'ann', 'door': 'http', 'class': 'read', 'statement': 'SELECT * FROM salaries', 'outcome': 'refused'}
+{'user': 'ann', 'door': 'http', 'class': 'read', 'statement': 'SELECT name FROM salaries WHERE pay > 110', 'outcome': 'refused'}
+{'user': 'ann', 'door': 'http', 'class': 'write', 'statement': "INSERT INTO notes VALUES (2, 'second')", 'outcome': 'refused'}
+{'user': 'admin', 'door': 'http', 'class': 'role', 'statement': "CREATE TOKEN nightly FOR USER ann EXPIRES IN '***'", 'outcome': 'ok'}
+{'user': 'admin', 'door': 'http', 'class': 'role', 'statement': "ALTER USER ann MAX_QUERIES 2 STATEMENT_TIMEOUT '***'", 'outcome': 'ok'}
+```
+
+Each row also has the time (`at`), the address it came from (`from`), the error (`message`), how
+long it took (`ms`) and the node that wrote it.
+
+## TLS
+
+With a certificate and its key, every door takes TLS on its own port: HTTPS, Postgres's
+`sslmode=require`, Kafka's `security.protocol=SSL` and Flight's `grpc+tls`. A plain connection is
+then taken only from the node's own machine (`PONDRA_TLS=optional` takes it from anywhere), so a
+password or a token never crosses a network in the clear. A certificate for one node:
+
+```bash
+openssl req -x509 -newkey rsa:2048 -nodes -days 365 -keyout node.key -out node.pem -subj "/CN=pondra" \
+  -addext "subjectAltName=IP:127.0.0.1,DNS:localhost" -addext "basicConstraints=critical,CA:FALSE" 2> /dev/null
+nohup pondra serve tls-lake --addr 127.0.0.1:8096 --tls-cert node.pem --tls-key node.key > tls.log 2>&1 &
+echo $! > tls.pid
+until curl -sf --cacert node.pem https://127.0.0.1:8096/stats > /dev/null; do sleep 0.3; done
+curl -s --cacert node.pem https://127.0.0.1:8096/sql -d "SELECT 'over TLS' AS hello"
+```
+
+```text
+[{"hello":"over TLS"}]
+```
+
+Clients trust it as they trust any server's: the system's authorities, or the file itself
+(`pondra.connect(url, ca="node.pem")`, `sslrootcert=node.pem`, `NODE_EXTRA_CA_CERTS` for
+JavaScript, `tls_root_certs` for pyarrow's Flight).
+
+```python
+print(pondra.connect("https://127.0.0.1:8096", ca="node.pem").sql("SELECT 'from Python' AS hello").rows())
+```
+
+```text
+[{'hello': 'from Python'}]
+```
+
+The nodes of a cluster share the certificate, and call each other over HTTPS. Give them an
+authority too (`--tls-ca` or `PONDRA_TLS_CA`, a PEM file) and they show their certificates to each
+other: **mutual TLS**. A request made with the nodes' own key is then taken only over a connection
+whose certificate that authority signed, so the key alone, taken from a node, opens nothing.
+
+```bash
+kill $(cat tls.pid)
+```
+
+## A request can't stop a node
+
+A request that hits a bug in the node, at any door, is answered as an error (`internal error: …`,
+HTTP 500, SQLSTATE `XX000`) and the node goes on serving. Only the work the node can't do without
+(committing, tiering, following the leader) still stops it on a broken invariant, as before: a
+crashed writer restarts and reloads its state from the catalog. Every door's parser is fuzzed with
+malformed input (`tools/fuzz_doors.py`).
+
 ## What a node's SQL can't touch
 
 Whatever the token, SQL sent to a node never reads or writes the node's own disk: no `COPY … TO` to a
@@ -360,14 +459,11 @@ people's data: see [files and other lakes](/pondra/guides/files-and-other-lakes/
 - **Tokens guard nodes, not the bucket.** With the bucket's own credentials anyone runs `pondra sql
   --dir s3://…` and reads the lake with no node at all, so give people read-only bucket keys, and
   keep the keys as secret as the data.
-- **There is no TLS yet.** Tokens, and the data with them, cross the wire as plain text on HTTP,
-  Postgres, Kafka and Flight, so put a TLS proxy in front of the ports clients use, or keep them on a
-  private network. A cluster's nodes talk plain HTTP to each other with the admin token, so keep
-  them on a private network.
 - **A token is the whole login, for everything.** A read token reads every table: give people users
   instead, with grants. Rotate a token by restarting every node with the new values.
-- **Row filters and masks, a mutual-TLS cluster, an audit log and quotas** come next (round 29 on the
-  roadmap). A view doesn't yet lend its owner's rights: a user reading one needs SELECT on what it reads.
+- **Row filters and masks** come later. A view doesn't yet lend its owner's rights: a user reading
+  one needs SELECT on what it reads.
+- **Quotas are each node's.** A user held to 4 statements at once may run 4 on each node.
 
 </Aside>
 

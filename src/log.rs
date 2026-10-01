@@ -154,7 +154,7 @@ impl To {
     async fn ask(&self, f: Flush) -> Result<Reserved> {
         reserved(match self {
             To::Local(seq) => seq.submit(f).await?,
-            To::Leader(addr) => http().post(format!("http://{addr}/cluster/commit")).body(encode_flush(&f)?).send().await?.error_for_status()?.json().await?,
+            To::Leader(addr) => http().post(crate::tls::url(&format!("{addr}/cluster/commit"))).body(encode_flush(&f)?).send().await?.error_for_status()?.json().await?,
         })
     }
 }
@@ -190,7 +190,7 @@ impl Log {
         let (tx, mut rx) = mpsc::channel::<Append>(100_000);
         let me = lake.clone();
         let (to, slots) = (Arc::new(to), Arc::new(tokio::sync::Semaphore::new(FLUSHES_IN_FLIGHT)));
-        tokio::spawn(async move {
+        crate::panics::spawn(async move {
             let (mut last, mut turn) = (tokio::time::Instant::now(), None);
             while let Some(first) = rx.recv().await {
                 // While all flush slots are busy, appends queue up; then they all go in one flush.
@@ -203,7 +203,7 @@ impl Log {
                 let (lake, to) = (lake.clone(), to.clone());
                 let (done, next) = oneshot::channel();
                 let turn = std::mem::replace(&mut turn, Some(next));
-                tokio::spawn(async move {
+                crate::panics::spawn(async move {
                     send(&lake, &to, pending, turn, done).await;
                     drop(slot);
                 });
@@ -249,7 +249,7 @@ async fn send(lake: &Lake, to: &To, mut pending: Vec<Append>, mut turn: Option<o
                     anyhow::Ok(outcome.await?)
                 }
                 To::Leader(addr) => {
-                    let request = http().post(format!("http://{addr}/cluster/commit")).body(encode_flush(&f)?).send();
+                    let request = http().post(crate::tls::url(&format!("{addr}/cluster/commit"))).body(encode_flush(&f)?).send();
                     drop(done.take()); // (sent in order; over HTTP they may still arrive out of order, rarely)
                     Ok(request.await?.error_for_status()?.json().await?)
                 }
@@ -328,7 +328,8 @@ pub fn encode_flush(f: &Flush) -> Result<Vec<u8>> {
 
 pub fn decode_flush(body: Bytes) -> Result<Flush> {
     let n = u32::from_le_bytes(body.get(..4).ok_or_else(|| anyhow!("empty flush"))?.try_into()?) as usize;
-    let mut f: Flush = serde_json::from_slice(&body[4..4 + n])?;
+    let head = body.get(4..4usize.saturating_add(n)).ok_or_else(|| anyhow!("a flush cut short"))?; // (fuzzed: `tools/fuzz_doors.py`)
+    let mut f: Flush = serde_json::from_slice(head)?;
     f.data = body.slice(4 + n..);
     Ok(f)
 }
@@ -356,7 +357,7 @@ impl Sequencer {
         let (tx, mut rx) = mpsc::channel::<(Flush, oneshot::Sender<Outcome>)>(10_000);
         let commit_ms = Arc::new(Mutex::new(vec![]));
         let ms = commit_ms.clone();
-        tokio::spawn(async move {
+        crate::panics::spawn(async move {
             let mut last_seq = HashMap::new(); // producer -> last committed seq (cache of p/ keys)
             let in_flight = Arc::new(tokio::sync::Semaphore::new(COMMITS_IN_FLIGHT));
             while let Some(first) = rx.recv().await {
@@ -519,7 +520,7 @@ async fn commit(lake: &Arc<Lake>, next: &mut u64, block: &mut u64, last_seq: &mu
     let (t0, durable) = (Instant::now(), lake.cat.write(puts, &[]).await?);
     last_seq.extend(seqs);
     let (lake, ms, hwm) = (lake.clone(), ms.clone(), *next - 1);
-    tokio::spawn(async move {
+    crate::panics::spawn(async move {
         if durable.await.is_ok() {
             let mut ms = ms.lock().unwrap();
             if ms.len() >= 10_000 {

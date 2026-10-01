@@ -73,7 +73,7 @@ impl Hot {
         if !self.on() {
             return;
         }
-        tokio::spawn(async move {
+        crate::panics::spawn(async move {
             let line = ram / 5 * 3; // three fifths of the machine
             loop {
                 tokio::time::sleep(Duration::from_secs(2)).await;
@@ -139,7 +139,7 @@ impl Hot {
             missing
         };
         let hot = self.clone();
-        tokio::spawn(async move {
+        crate::panics::spawn(async move {
             let _slot = hot.slot.acquire().await;
             let decoded = decode(&lake, &file, &fields, deletes).await;
             let mut s = hot.state.lock().unwrap();

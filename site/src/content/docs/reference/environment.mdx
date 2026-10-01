@@ -26,6 +26,13 @@ A number that is left unset, or set to something that is not a number, takes its
 | `PONDRA_SECRET_KEY_PREVIOUS` | none | the master key before it changed: secrets' keys it wrapped still open, and the leader rewraps them with the new one when it starts |
 | `PONDRA_KMS_COMMAND` | none | a key service in place of the master key: a command run with `wrap` or `unwrap` and a data key on its input, answering on its output (a script over `aws kms`, `gcloud kms`, `az keyvault key` or Vault's transit) |
 | `PONDRA_SESSION_HOURS` | 12 | how long a user's session lasts (`POST /login`, a Flight handshake) |
+| `PONDRA_TLS_CERT`, `PONDRA_TLS_KEY` | none | a PEM certificate and its key, when `--tls-cert` and `--tls-key` are not given: every door takes [TLS](/pondra/guides/security/#tls), and nodes call each other over HTTPS |
+| `PONDRA_TLS_CA` | none | the authority that signed the nodes' certificates, when `--tls-ca` is not given: nodes show theirs to each other (mutual TLS), and the nodes' own key is taken only with one it signed |
+| `PONDRA_TLS` | plain from this machine only | `optional`: a node with a certificate takes plain connections from anywhere too |
+| `PONDRA_AUDIT` | `role,ddl,function` | what the [audit log](/pondra/guides/security/#the-audit-log) keeps, by class: `role`, `ddl`, `function`, `write`, `read`, `misc`, `all`, or `off`. Refusals are always kept |
+| `PONDRA_AUDIT_DAYS` | `90` | how many days `pondra.audit` keeps. Read when the log is first made |
+| `PONDRA_USER_QUERIES` | none | how many statements a user without its own `MAX_QUERIES` runs at once on a node ([quotas](/pondra/guides/security/#quotas)) |
+| `PONDRA_USER_TIMEOUT` | none | how many seconds a statement of a user without its own `STATEMENT_TIMEOUT` may run |
 
 An empty value counts as not set. See [HTTP](/pondra/reference/http/#roles) for what each token may do.
 

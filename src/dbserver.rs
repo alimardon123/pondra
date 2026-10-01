@@ -161,6 +161,9 @@ impl Server {
         if let Some(t) = self.options.tier_secs {
             cmd.args(["--tier-secs", &t.to_string()]);
         }
+        for v in ["PONDRA_TLS_CERT", "PONDRA_TLS_KEY", "PONDRA_TLS_CA"] {
+            cmd.env_remove(v); // (a database's node listens on this machine only: TLS is the server's)
+        }
         cmd.env("PONDRA_SERVER_URL", format!("http://{}", self.addr)).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::null()).kill_on_drop(true);
         let mut child = cmd.spawn().context("starting a database's node")?;
         let started = Instant::now();
@@ -242,7 +245,7 @@ pub async fn serve(folder: String, addr: String, pg: Option<String>, default: Op
     };
     let server: Shared = Arc::new(Server { folder: folder.clone(), addr: addr.clone(), default, options, auth, nodes: Default::default(), starting: Default::default() });
     let s = server.clone();
-    tokio::spawn(async move {
+    crate::panics::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(10)).await;
             s.reap().await;
@@ -250,9 +253,10 @@ pub async fn serve(folder: String, addr: String, pg: Option<String>, default: Op
     });
     if let Some(pg) = pg {
         let (s, listener) = (server.clone(), tokio::net::TcpListener::bind(&pg).await.with_context(|| format!("the Postgres port {pg}"))?);
-        tokio::spawn(async move {
+        crate::panics::spawn(async move {
             loop {
                 let Ok((socket, _)) = listener.accept().await else { continue };
+                let _ = socket.set_nodelay(true);
                 let s = s.clone();
                 tokio::spawn(async move {
                     if let Err(e) = postgres(&s, socket).await {
@@ -275,13 +279,14 @@ pub async fn serve(folder: String, addr: String, pg: Option<String>, default: Op
             let db = s.default_db().await;
             route(&s, &db, &path, req).await
         })
+        .layer(axum::middleware::from_fn(plain))
         .with_state(server.clone());
     eprintln!("pondra serve: the lakes in {folder} as databases, on {addr}");
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    let listener = crate::tls::Doors::bind(&addr, crate::tls::Door::Http).await?; // (TLS too: `tls.rs`)
     let stop = async {
         crate::stopped(false).await;
     };
-    axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).with_graceful_shutdown(stop).await?;
+    axum::serve(listener, app.into_make_service_with_connect_info::<crate::tls::Peer>()).with_graceful_shutdown(stop).await?;
     let nodes: Vec<Node> = server.nodes.lock().await.drain().map(|(_, n)| n).collect();
     for mut n in nodes {
         drop(n.child.stdin.take());
@@ -366,19 +371,40 @@ async fn route(s: &Server, name: &str, path: &str, req: Request) -> Response {
 
 /// A Postgres connection: its startup message says the database; from then on, the bytes go to
 /// and from that database's node as they are.
-async fn postgres(s: &Server, mut client: tokio::net::TcpStream) -> Result<()> {
-    client.set_nodelay(true)?;
+/// A plain connection from another machine, when this server takes TLS: refused, saying why.
+async fn plain(axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<crate::tls::Peer>, req: Request, next: axum::middleware::Next) -> Response {
+    match peer.allowed() {
+        true => next.run(req).await,
+        false => (StatusCode::FORBIDDEN, crate::tls::PLAIN).into_response(),
+    }
+}
+
+async fn postgres(s: &Server, tcp: tokio::net::TcpStream) -> Result<()> {
+    let addr = tcp.peer_addr()?;
+    let mut client = crate::tls::Conn::Plain(tcp);
     let startup = loop {
         let len = client.read_i32().await? as usize;
         anyhow::ensure!((8..=10_000).contains(&len), "not a Postgres client");
         let mut body = vec![0; len - 4];
         client.read_exact(&mut body).await?;
-        match i32::from_be_bytes(body[..4].try_into()?) {
-            80_877_103 | 80_877_104 => client.write_all(b"N").await?, // (SSL, GSS: not here)
-            80_877_102 => return Ok(()),                              // (a cancel: its node is unknown here)
+        match (i32::from_be_bytes(body[..4].try_into()?), client.is_tls(), crate::tls::pg()) {
+            (80_877_103, false, Some(tls)) => {
+                // (SSL: the client's TLS ends here; its database's node is on this machine)
+                client.write_all(b"S").await?;
+                let crate::tls::Conn::Plain(tcp) = client else { unreachable!() };
+                client = crate::tls::Conn::Tls(Box::new(tls.accept(tcp).await?));
+            }
+            (80_877_103 | 80_877_104, _, _) => client.write_all(b"N").await?, // (GSS: not here)
+            (80_877_102, _, _) => return Ok(()),                              // (a cancel: its node is unknown here)
             _ => break [(len as i32).to_be_bytes().to_vec(), body].concat(),
         }
     };
+    if !crate::tls::pg_allowed(client.is_tls(), addr) {
+        let fields = [("S", "FATAL"), ("V", "FATAL"), ("C", "28000"), ("M", crate::tls::PLAIN)];
+        let body: Vec<u8> = fields.iter().flat_map(|(k, v)| [k.as_bytes(), v.as_bytes(), b"\0"].concat()).chain([0u8]).collect();
+        client.write_all(&[b"E".to_vec(), ((body.len() + 4) as i32).to_be_bytes().to_vec(), body].concat()).await?;
+        return Ok(());
+    }
     let params: Vec<String> = startup[8..].split(|b| *b == 0).map(|p| String::from_utf8_lossy(p).to_string()).collect();
     let param = |k: &str| params.chunks(2).find(|p| p.len() == 2 && p[0] == k).map(|p| p[1].clone());
     let fallback = s.default_db().await;

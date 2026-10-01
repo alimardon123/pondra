@@ -20,6 +20,8 @@ pub struct Principal {
     pub name: String,
     pub role: Role,
     pub access: Option<Arc<crate::users::Access>>,
+    pub door: &'static str,                  // (which door it came in by, and from where: the audit log's)
+    pub from: Option<std::net::SocketAddr>,
 }
 
 impl Principal {
@@ -31,7 +33,13 @@ impl Principal {
             Role::Read => "reader",
             Role::None => "",
         };
-        Principal { name: name.into(), role, access: None }
+        Principal { name: name.into(), role, access: None, door: "node", from: None }
+    }
+
+    /// The same, as come in by `door` from `from`.
+    pub fn at(mut self, door: &'static str, from: Option<std::net::SocketAddr>) -> Principal {
+        (self.door, self.from) = (door, from);
+        self
     }
 
     /// May it use `privilege` on `table` (as SQL names it)? (Its role decides what kind of thing.)

@@ -326,8 +326,8 @@ their values.
 
 | Statement | Syntax |
 |---|---|
-| Make a user or a role | `CREATE USER [IF NOT EXISTS] name [WITH] [PASSWORD 'at least 8'] [SUPERUSER]`, `CREATE ROLE name` |
-| Change one | `ALTER USER name [WITH] PASSWORD '…' \| SUPERUSER \| NOSUPERUSER` |
+| Make a user or a role | `CREATE USER [IF NOT EXISTS] name [WITH] [PASSWORD 'at least 8'] [SUPERUSER] [MAX_QUERIES n] [STATEMENT_TIMEOUT '5 minutes']`, `CREATE ROLE name` |
+| Change one | `ALTER USER name [WITH] PASSWORD '…' \| SUPERUSER \| NOSUPERUSER \| MAX_QUERIES n \| STATEMENT_TIMEOUT '…'` (`0`: no limit) |
 | Drop one | `DROP USER [IF EXISTS] name`, `DROP ROLE [IF EXISTS] name` |
 | Grant | `GRANT SELECT [(col, …)] \| INSERT \| UPDATE \| DELETE \| ALL [PRIVILEGES] ON [TABLE] t \| SCHEMA s \| ALL TABLES [IN SCHEMA s] TO name, …` |
 | Grant a secret | `GRANT USAGE ON SECRET s TO name, …` |
@@ -335,9 +335,11 @@ their values.
 | Take back | `REVOKE … FROM …`, as GRANT names them (`REVOKE SELECT (col) ON t FROM r`: that column only) |
 | A token | `CREATE TOKEN name FOR [USER] u [EXPIRES IN '90 days']` (answers it, once), `DROP TOKEN name FOR [USER] u` |
 | List | `SELECT * FROM pondra.users`, `SELECT * FROM pondra.grants` |
+| What was done, and refused | `SELECT * FROM pondra.audit` (a superuser's): `at`, `user`, `door`, `from`, `class`, `statement`, `outcome`, `message`, `ms`, `node` |
 
 `public` is every user: `GRANT SELECT ON t TO public`. A grant on a schema covers its tables made later
-too. Only a superuser (or the admin token) runs these. See [security](/pondra/guides/security/#users-roles-and-grants).
+too. Only a superuser (or the admin token) runs these. `MAX_QUERIES` and `STATEMENT_TIMEOUT` are a user's
+[quota](/pondra/guides/security/#quotas) on each node. See [security](/pondra/guides/security/#users-roles-and-grants).
 
 ```bash
 pondra sql --dir scratch "CREATE TABLE t (a BIGINT, region VARCHAR)"

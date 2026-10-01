@@ -166,6 +166,8 @@ def check_page(path, verbose):
                 report["ran"] += 1
                 if verbose:
                     print(f"  ok   {where} ({lang})", flush=True)
+                    if (out or "").strip():
+                        print("       " + str(out).strip()[:1500].replace("\n", "\n       "), flush=True)  # (what it said: to write under it)
             except Exception as e:
                 report.update(ok=False, failed=where, lang=lang, error=str(e)[-2500:], code=code[:600])
                 break

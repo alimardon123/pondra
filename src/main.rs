@@ -2,6 +2,7 @@
 //! Object storage — a local dir or s3://bucket/prefix (S3, R2, MinIO) — is the only state.
 #![recursion_limit = "256"] // (the Send check of a query's future, many awaits deep)
 mod adopt;
+mod audit;
 mod ai;
 mod avro;
 mod bridge;
@@ -37,6 +38,8 @@ mod manifest;
 mod metrics;
 mod optimize;
 mod pages;
+mod panics;
+mod tls;
 mod mcp;
 mod pg;
 mod pg_catalog;
@@ -201,6 +204,17 @@ enum Cmd {
         write_token: Option<String>,
         #[arg(long)]
         admin_token: Option<String>,
+        /// TLS on every door (also PONDRA_TLS_CERT, PONDRA_TLS_KEY): a PEM certificate and its key.
+        /// Plain connections are then taken only from this machine (PONDRA_TLS=optional: from
+        /// anywhere), and nodes call each other over HTTPS.
+        #[arg(long)]
+        tls_cert: Option<String>,
+        #[arg(long)]
+        tls_key: Option<String>,
+        /// The authority that signs the nodes' certificates (also PONDRA_TLS_CA): nodes show theirs
+        /// to each other (mutual TLS), and the nodes' key is taken only with one.
+        #[arg(long)]
+        tls_ca: Option<String>,
         /// Another lake to read as `name.table`, and write to through its own leader (repeatable):
         /// `--attach sales=s3://bucket/sales`. Several clusters, each leading its own lake, share
         /// one bucket this way.
@@ -288,7 +302,13 @@ async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let Some(cmd) = cli.cmd else { return shell::run(&cli.lake.unwrap_or_else(|| "lake".into())).await };
     match cmd {
-        Cmd::Serve { path, dir, databases, default, addr, advertise, reader, flush_ms, tier_secs, task_ms, memory_gb, retain_secs, changelog_secs, backlog, cache_dir, cache_gb, ack, replicas, fsync, publish, pg, kafka, kafka_advertise, flight, read_token, write_token, admin_token, attach: attached, attach_found, stop_with_stdin, python } => {
+        Cmd::Serve { path, dir, databases, default, addr, advertise, reader, flush_ms, tier_secs, task_ms, memory_gb, retain_secs, changelog_secs, backlog, cache_dir, cache_gb, ack, replicas, fsync, publish, pg, kafka, kafka_advertise, flight, read_token, write_token, admin_token, tls_cert, tls_key, tls_ca, attach: attached, attach_found, stop_with_stdin, python } => {
+            for (flag, var) in [(tls_cert, "PONDRA_TLS_CERT"), (tls_key, "PONDRA_TLS_KEY"), (tls_ca, "PONDRA_TLS_CA")] {
+                if let Some(v) = flag {
+                    std::env::set_var(var, v); // (read by `tls.rs`)
+                }
+            }
+            tls::init()?; // (a certificate that can't be read: said now)
             // A lake, or a folder of lakes (each a database: `dbserver.rs`), by what the path holds.
             let (dir, many) = match (dir, databases) {
                 (Some(d), _) => {
@@ -377,7 +397,7 @@ async fn run() -> anyhow::Result<()> {
             // this node ending): the next node leads at once instead of waiting out the lease.
             // Acknowledged writes are already durable.
             let (s, n) = (store.clone(), leader.then_some(cluster.leader.n));
-            tokio::spawn(async move {
+            panics::spawn(async move {
                 stopped(stop_with_stdin).await;
                 if let Some(n) = n {
                     cluster::release(&s, n).await;
@@ -443,7 +463,7 @@ async fn run() -> anyhow::Result<()> {
                 }
             }
             let l = app.lake.clone();
-            tokio::spawn(async move {
+            panics::spawn(async move {
                 // (a follower's catalog shows the leader's keys once the leader has flushed them)
                 for _ in 0..600 {
                     if let Ok(k) = users::node_key(&l).await {
@@ -459,24 +479,24 @@ async fn run() -> anyhow::Result<()> {
             }
             if let Some(pg_addr) = pg {
                 let a = app.clone();
-                tokio::spawn(async move { pg::serve(a, pg_addr).await.map_err(|e| eprintln!("postgres protocol: {e:#}")) });
+                panics::spawn(async move { pg::serve(a, pg_addr).await.map_err(|e| eprintln!("postgres protocol: {e:#}")) });
             }
             if let Some(kafka_addr) = kafka {
                 let port = kafka_addr.rsplit_once(':').map_or("9092", |(_, p)| p).to_string();
                 let advertise = kafka_advertise.unwrap_or_else(|| format!("{}:{port}", addr.rsplit_once(':').map_or("127.0.0.1", |(h, _)| h)));
                 let a = app.clone();
-                tokio::spawn(async move { kafka::serve(a, kafka_addr, advertise).await.map_err(|e| eprintln!("kafka protocol: {e:#}")) });
+                panics::spawn(async move { kafka::serve(a, kafka_addr, advertise).await.map_err(|e| eprintln!("kafka protocol: {e:#}")) });
             }
             if let Some(flight_addr) = flight {
                 let a = app.clone();
-                tokio::spawn(async move { flight::serve(a, flight_addr).await.map_err(|e| eprintln!("flight: {e:#}")) });
+                panics::spawn(async move { flight::serve(a, flight_addr).await.map_err(|e| eprintln!("flight: {e:#}")) });
             }
             if app.log.is_some() {
                 feeds::start(app.clone()); // (other clusters' topics feeding views: none, no work)
             }
             if let (Some(_), Some(log)) = (&app.seq, &app.log) {
                 let (lake, log) = (lake.clone(), log.clone()); // windows and sessions past the watermark, emitted once
-                tokio::spawn(async move {
+                panics::spawn(async move {
                     loop {
                         tokio::time::sleep(Duration::from_millis(500)).await;
                         if let Err(e) = views::emit_all(&lake, &log).await {
@@ -493,7 +513,7 @@ async fn run() -> anyhow::Result<()> {
             if leader {
                 // The leader's SSD tier learns of objects other nodes wrote from its own commits.
                 let l = lake.clone();
-                tokio::spawn(async move {
+                panics::spawn(async move {
                     let (_, mut commits) = l.cat.subscribe();
                     loop {
                         match commits.recv().await {
@@ -509,7 +529,7 @@ async fn run() -> anyhow::Result<()> {
                 // inserts, compaction, retention).
                 if tier_secs > 0.0 {
                     let (a, mut hwm, period) = (app.clone(), lake.hwm.subscribe(), Duration::from_secs_f64(tier_secs));
-                    tokio::spawn(async move {
+                    panics::spawn(async move {
                         loop {
                             let start = tokio::time::Instant::now();
                             hwm.borrow_and_update();
@@ -546,7 +566,7 @@ async fn run() -> anyhow::Result<()> {
             }
             if !reader {
                 let (a, max_wait) = (app.clone(), Duration::from_millis(task_ms));
-                tokio::spawn(async move {
+                panics::spawn(async move {
                     let mut commits = a.lake.hwm.subscribe();
                     loop {
                         let _ = tokio::time::timeout(max_wait, commits.changed()).await; // new rows, or time's up
@@ -561,8 +581,8 @@ async fn run() -> anyhow::Result<()> {
             eprintln!("pondra {role} (term {}) serving {dir} on {addr}", cluster.leader.n);
             // No Nagle: a small answer goes out at once, not after the client's delayed ACK (the
             // Postgres, Kafka and Flight ports do the same).
-            let listener = axum::serve::ListenerExt::tap_io(tokio::net::TcpListener::bind(&listen).await?, |tcp| drop(tcp.set_nodelay(true)));
-            axum::serve(listener, server::router(app).into_make_service_with_connect_info::<std::net::SocketAddr>()).await?; // (who asks: `console::save_settings`)
+            let listener = tls::Doors::bind(&listen, tls::Door::Http).await?; // (TLS too: `tls.rs`)
+            axum::serve(listener, server::router(app).into_make_service_with_connect_info::<tls::Peer>()).await?; // (who asks: `console::save_settings`)
         }
         Cmd::Run { file, url, token, rest } => {
             // (the lake first if it is there; `--url` and `--token` wherever they are; the rest parameters)
@@ -597,7 +617,7 @@ async fn run() -> anyhow::Result<()> {
             let store = store::open_store(&dir)?.1;
             match cluster::latest(&store).await? {
                 Some(t) if !t.addr.is_empty() && cluster::alive(&store, &t).await => {
-                    println!("{}", cluster::http().post(format!("http://{}/sql", t.addr)).body("CHECKPOINT").send().await?.error_for_status()?.text().await?)
+                    println!("{}", cluster::http().post(crate::tls::url(&format!("{}/sql", t.addr))).body("CHECKPOINT").send().await?.error_for_status()?.text().await?)
                 }
                 _ => println!("{}", serde_json::json!({"checkpoint": false, "why": "no node runs this lake: the next one to start tiers its log"})),
             }
@@ -645,7 +665,7 @@ where
     if period.is_zero() {
         return;
     }
-    tokio::spawn(async move {
+    panics::spawn(async move {
         let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
         ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {

@@ -1019,8 +1019,10 @@ fn dollar_tag(s: &str) -> Option<&str> {
     (inner.chars().all(|c| c.is_alphanumeric() || c == '_') && !inner.starts_with(|c: char| c.is_ascii_digit())).then(|| &s[..end])
 }
 
-/// Run one statement here as the caller could have sent it.
-pub async fn one(app: &App, sql: &str, who: Who, job: Option<String>) -> Result<Outcome> {
+/// Run one statement here as the caller could have sent it (the audit log told: `audit.rs`).
+pub async fn one(app: &App, sql: &str, who: Who, job: Option<String>) -> Result<Outcome> { crate::audit::statement(app, sql, one_of(app, sql, who, job)).await }
+
+async fn one_of(app: &App, sql: &str, who: Who, job: Option<String>) -> Result<Outcome> {
     if crate::write::checkpoint(sql) {
         ensure!(who.role >= Role::Write, "CHECKPOINT needs a write token");
         return Ok(Outcome::Done(app.checkpoint().await?));

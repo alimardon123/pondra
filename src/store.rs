@@ -560,7 +560,7 @@ impl Lake {
         let lake = Arc::new_cyclic(|me| Lake { url, store, cat, hwm, backlog: Default::default(), rt, tail: Mutex::new((lru::LruCache::unbounded(), 0)), disk, groups: crate::serve::Groups::new(cache_mb() << 19), hot: Arc::new(crate::hot::Hot::new()), attached: Default::default(), ids: Default::default(), cached: cached_store, me: me.clone() });
         lake.hot.watch(); // the decoded columns give memory back when the node needs it
         if let Some(writes) = lake.cat.unstarted.lock().unwrap().take() {
-            tokio::spawn(lake.clone().commits(writes));
+            crate::panics::spawn(lake.clone().commits(writes));
         }
         Ok(lake)
     }
@@ -573,7 +573,7 @@ impl Lake {
     async fn commits(self: Arc<Self>, mut writes: mpsc::UnboundedReceiver<Write>) {
         let (to_bucket, mut in_bucket) = mpsc::unbounded_channel::<(Arc<WriteHandle>, u64)>();
         let lake = self.clone();
-        tokio::spawn(async move {
+        crate::panics::spawn(async move {
             while let Some((handle, id)) = in_bucket.recv().await {
                 if let Err(e) = handle.await_durable().await {
                     eprintln!("catalog commit failed: {e}");
@@ -752,6 +752,7 @@ impl Lake {
         crate::asof::register(&ctx); // (ASOF JOIN's marker)
         crate::fsum::register(&ctx); // sum(DOUBLE): the same answer in any order
         crate::optimize::register_zoned(&ctx); // to_timestamp(column): in the zone its type says
+        crate::panics::test_function(&ctx); // pondra_panic(), for the tests only
         ctx
     }
 

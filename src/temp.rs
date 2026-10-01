@@ -97,7 +97,7 @@ fn with<T>(session: &str, change: bool, f: impl FnOnce(&mut Session) -> Result<T
         CHANGES.send_modify(|v| *v += 1);
     }
     if first {
-        tokio::spawn(reap()); // (only while there are sessions)
+        crate::panics::spawn(reap()); // (only while there are sessions)
     }
     Ok(out)
 }

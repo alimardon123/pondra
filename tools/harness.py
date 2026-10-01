@@ -24,6 +24,7 @@
   harness.py upserts             keyed tables published every round; other engines' upserts, deletes, equality deletes
   harness.py external            CREATE EXTERNAL TABLE: a named view of files, INSERT into a folder's, what it refuses
   harness.py server              pondra serve <folder of lakes>: each a database (Postgres, HTTP, joins, idle, restart)
+  harness.py safety              panics answered as errors, TLS at every door, mutual TLS, the audit log, quotas
   harness.py load    --secs 30   throughput, ack latency, freshness, catalog commit latency
   harness.py all                 quick run of everything
 """
@@ -5140,6 +5141,7 @@ def users():
         and no_role is True and gone == [True, True] and {"grantee": "analyst", "privilege": "SELECT", "on_name": "sales.orders", "columns": "id, amount"} in grants
     info = {"said": said, "wrote": wrote, "pg": pg_said, "kafka": kafka_said, "flight": flight_said[1:], "grants": grants, "revoked": [revoked, still, no_role, gone],
             "tokens": [by_token, expired, by_session, tampered, ended, dropped_token]}
+    a.kill(), b.kill()  # (the ports free for the next test of `all`)
     ok = all(checks.values())
     print(json.dumps({"users": checks, "ok": ok, "info": info}, indent=1, default=str))
     return ok
@@ -5217,14 +5219,190 @@ def secrets():
     without = _raises_text(lambda: adm(read))
     checks["PONDRA_KMS_COMMAND wraps a data key (kms:…); without it, it doesn't open"] = by_kms == [[{"cur": "EUR"}, {"cur": "GBP"}], True] and "PONDRA_KMS_COMMAND" in without
     web.shutdown()
+    node.kill()
     ok = all(checks.values())
     print(json.dumps({"secrets": checks, "ok": ok, "info": {"used": used, "temp": temp, "refused": refused, "without": without}}, indent=1, default=str))
     return ok
 
 
+def safety():
+    """Safe to share, the rest of it (round 29, ADR-035 §5): a panic in a request is answered as an
+    error, the node kept up (HTTP, Postgres, a query's own tasks); TLS on every door (HTTPS,
+    Postgres's sslmode, Kafka's SSL, Flight's grpc+tls), plain connections only from this machine,
+    nodes calling each other over HTTPS, the nodes' key only with the authority's certificate
+    (mutual TLS); the audit log (what's written by default, values hidden, refusals at every door,
+    a superuser's only); a user's quota (statements at once, and how long each may run)."""
+    import base64, re, socket, ssl, struct, psycopg, pyarrow.flight as fl
+    here = tempfile.mkdtemp(prefix="pondra-tls-")
+    ca_key, ca, key, csr, crt, ext = [os.path.join(here, n) for n in ("ca.key", "ca.pem", "node.key", "node.csr", "node.pem", "ext.cnf")]
+    sh = lambda *a: subprocess.run(a, check=True, capture_output=True)
+    sh("openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", ca_key, "-out", ca, "-days", "2", "-subj", "/CN=pondra test authority")
+    sh("openssl", "req", "-newkey", "rsa:2048", "-nodes", "-keyout", key, "-out", csr, "-subj", "/CN=pondra node")
+    open(ext, "w").write("subjectAltName=IP:127.0.0.1,DNS:localhost\nextendedKeyUsage=serverAuth,clientAuth\n")
+    sh("openssl", "x509", "-req", "-in", csr, "-CA", ca, "-CAkey", ca_key, "-CAcreateserial", "-out", crt, "-days", "2", "-extfile", ext)
+    # Another machine, as far as the node can tell: this one's own non-loopback address, to 127.0.0.1
+    away = next((ip for ip in subprocess.run(["hostname", "-I"], capture_output=True, text=True).stdout.split() if not ip.startswith("127.") and ":" not in ip), None)
+    P = A.port
+    lake = new_lake()
+    tls = dict(tls_cert=crt, tls_key=key, tls_ca=ca)
+    a = Node(lake, P, pg=f"127.0.0.1:{P + 10}", kafka=f"127.0.0.1:{P + 20}", flight=f"127.0.0.1:{P + 30}", env={"PONDRA_TEST_PANICS": "1"}, **tls).start()
+    checks, info = {}, {"away": away}
+
+    def http_(port, path, body=b"", source=None, auth=None, secure=False, cert=False, method="POST"):
+        if secure:
+            ctx = ssl.create_default_context(cafile=ca)
+            if cert:
+                ctx.load_cert_chain(crt, key)
+            c = http.client.HTTPSConnection("127.0.0.1", port, context=ctx, timeout=60, source_address=(source, 0) if source else None)
+        else:
+            c = http.client.HTTPConnection("127.0.0.1", port, timeout=60, source_address=(source, 0) if source else None)
+        try:
+            c.request(method, path, body, {"Authorization": auth} if auth else {})
+            r = c.getresponse()
+            return r.status, r.read().decode(errors="replace")
+        except Exception as e:
+            return 0, f"{type(e).__name__}: {e}"
+
+    # Panics: answered as errors; the node stays up
+    panic = http_(P, "/sql", b"SELECT pondra_panic() AS x")
+    spread = http_(P, "/sql", b"SELECT v % 5 AS k, sum(pondra_panic()) AS s FROM generate_series(1, 200000) g(v) GROUP BY 1")
+    with psycopg.connect(f"host=127.0.0.1 port={P + 10} user=admin dbname=lake sslmode=verify-full sslrootcert={ca}", autocommit=True) as c:
+        pg_panic = _raises_text(lambda: c.execute("SELECT pondra_panic()").fetchall())
+        pg_after = c.execute("SELECT 1 AS x").fetchall()
+        pg_ssl = c.pgconn.ssl_in_use
+    info["panics"] = [panic, spread[1][:200], pg_panic]
+    checks["a panic in a request is an error (HTTP 500, a query's own tasks', Postgres's), the node and the connection kept"] = \
+        panic[0] == 500 and "pondra_panic() was called" in panic[1] and spread[0] == 500 and "pondra_panic() was called" in spread[1] \
+        and "pondra_panic() was called" in pg_panic and pg_after == [(1,)] and a.alive() and sql(P, "SELECT 1 AS x") == [{"x": 1}]
+
+    # TLS at every door; plain from this machine only
+    said = {
+        "https": http_(P, "/sql", b"SELECT 1 AS x", secure=True),
+        "https away": http_(P, "/sql", b"SELECT 1 AS x", source=away, secure=True) if away else None,
+        "plain here": http_(P, "/sql", b"SELECT 1 AS x"),
+        "plain away": http_(P, "/sql", b"SELECT 1 AS x", source=away) if away else None,
+    }
+    checks["HTTPS answers; plain HTTP only from this machine, refused from another saying why"] = said["https"] == (200, '[{"x":1}]') and said["plain here"] == (200, '[{"x":1}]') \
+        and (not away or (said["https away"] == (200, '[{"x":1}]') and said["plain away"][0] == 403 and "takes TLS" in said["plain away"][1]))
+
+    def raw(port, chunks, source=None, wrap=False, first=None):
+        s = socket.create_connection(("127.0.0.1", port), timeout=10, source_address=(source, 0) if source else None)
+        try:
+            if first:
+                s.sendall(first)
+                if s.recv(1) != b"S":
+                    return b"no TLS"
+            if wrap:
+                s = ssl.create_default_context(cafile=ca).wrap_socket(s, server_hostname="127.0.0.1")
+            for c in chunks:
+                s.sendall(c)
+            got = b""
+            while True:
+                d = s.recv(65536)
+                if not d:
+                    break
+                got += d
+                if len(got) > 4 and (got.endswith(b"Z\x00\x00\x00\x05I") or got[:4] == struct.pack(">i", len(got) - 4)):
+                    break  # (Postgres ready, or one whole Kafka response)
+            return got
+        except OSError as e:
+            return f"{type(e).__name__}".encode()
+        finally:
+            s.close()
+    start = lambda: (lambda b: struct.pack(">i", len(b) + 4) + b)(struct.pack(">i", 196608) + b"user\0admin\0database\0lake\0\0")
+    pg_tls = raw(P + 10, [start()], wrap=True, first=struct.pack(">ii", 8, 80877103))
+    pg_away = raw(P + 10, [start()], source=away) if away else b""
+    versions = struct.pack(">hhi", 18, 0, 7) + struct.pack(">h", 1) + b"t"
+    kafka_tls = raw(P + 20, [struct.pack(">i", len(versions)) + versions], wrap=True)
+    kafka_away = raw(P + 20, [struct.pack(">i", len(versions)) + versions], source=away) if away else b""
+    client = fl.connect(f"grpc+tls://127.0.0.1:{P + 30}", tls_root_certs=open(ca, "rb").read())
+    flight_tls = client.do_get(fl.Ticket(json.dumps({"sql": "SELECT 1 AS x"}).encode())).read_all().to_pylist()
+    flight_away = raw(P + 30, [b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" + bytes(9)], source=away) if away else b""
+    info["doors"] = {"pg away": pg_away[:120], "kafka away": kafka_away[:40], "flight away": flight_away[:40]}
+    checks["Postgres (sslmode=verify-full), Kafka (SSL) and Flight (grpc+tls) take TLS; plain from another machine refused"] = pg_ssl and b"Z\x00\x00\x00\x05I" in pg_tls \
+        and kafka_tls[4:8] == struct.pack(">i", 7) and flight_tls == [{"x": 1}] \
+        and (not away or (b"28000" in pg_away and b"takes TLS" in pg_away and kafka_away[:4] != struct.pack(">i", len(kafka_away) - 4) and not flight_away.startswith(b"\x00\x00")))
+
+    # Nodes over HTTPS: a follower with the same certificate joins, and its writes reach the leader
+    b = Node(lake, P + 1, **tls).start()
+    sql(P, "CREATE TABLE notes (id BIGINT, text VARCHAR)")
+    wrote = _raises_text(lambda: sql(P + 1, "INSERT INTO notes VALUES (1, 'over https')")) or "ok"
+    seen = until(lambda: sql(P, "SELECT text FROM notes"), [{"text": "over https"}], 20)
+    node_key = next(iter(re.findall(r"pn_[A-Za-z0-9_-]+", subprocess.run([BIN, "catalog", "--dir", lake, "z/"], capture_output=True, text=True).stdout)), "")
+    bearer = f"Bearer {node_key}"
+    keyed = {"here": http_(P, "/stats", auth=bearer, method="GET")[0],
+             "away, no certificate": http_(P, "/stats", auth=bearer, source=away, secure=True, method="GET")[0] if away else None,
+             "away, the nodes' certificate": http_(P, "/stats", auth=bearer, source=away, secure=True, cert=True, method="GET")[0] if away else None}
+    info["nodes"] = {"wrote": wrote, "key": bool(node_key), "keyed": keyed}
+    checks["nodes call each other over HTTPS (a follower's write committed by the leader); the nodes' key only with the authority's certificate"] = \
+        seen == [{"text": "over https"}] and bool(node_key) and keyed["here"] == 200 and (not away or (keyed["away, no certificate"] == 401 and keyed["away, the nodes' certificate"] == 200))
+    b.kill()
+    a.kill()
+
+    # The audit log, and quotas
+    lake2 = new_lake()
+    n = Node(lake2, P + 5, pg=f"127.0.0.1:{P + 15}").start()
+    basic = lambda u, p: "Basic " + base64.b64encode(f"{u}:{p}".encode()).decode()
+    def q(auth, s):
+        try:
+            return call(P + 5, "POST", "/sql", s.encode(), headers={"Authorization": auth} if auth else {})
+        except Exception as e:
+            return f"ERROR {e}"
+    for s in ["CREATE TABLE t (id BIGINT, card VARCHAR)", "INSERT INTO t VALUES (1, '4111')", "CREATE USER boss PASSWORD 'boss-password-1' SUPERUSER"]:
+        q(None, s)
+    boss, ana = basic("boss", "boss-password-1"), basic("ana", "ana-password-1")
+    for s in ["CREATE USER ana PASSWORD 'ana-password-1'", "GRANT SELECT (id) ON t TO ana", "CREATE SECRET s (TYPE s3, KEY_ID 'kid', SECRET 'very-secret-value')"]:
+        q(boss, s)
+    q(basic("ana", "not-her-password"), "SELECT 1")
+    denied = q(ana, "SELECT card FROM t")
+    q(ana, "SELECT id FROM t")
+    _raises(lambda: psycopg.connect(f"host=127.0.0.1 port={P + 15} user=ana password=not-hers dbname=lake"))
+    log = lambda: q(boss, "SELECT \"user\", door, \"from\", class, statement, outcome, message FROM pondra.audit ORDER BY at")
+    rows = log()
+    for _ in range(40):  # (written a moment later, in batches)
+        if isinstance(rows, list) and sum(x["outcome"] == "refused" for x in rows) >= 3:
+            break
+        time.sleep(0.25)
+        rows = log()
+    info["audit"] = rows
+    text = json.dumps(rows)
+    has = lambda **want: any(all(str(r.get(k)) == v or (isinstance(v, str) and v.endswith("…") and str(r.get(k)).startswith(v[:-1])) for k, v in want.items()) for r in rows) if isinstance(rows, list) else False
+    checks["the audit log: users, grants and secrets made (values '***', nowhere in the clear); refused sign-ins over HTTP and Postgres; a column refused; reads not written by default"] = \
+        has(user="boss", door="http", **{"class": "role"}, statement="CREATE USER ana PASSWORD '***'", outcome="ok") and has(user="boss", statement="GRANT SELECT (id) ON t TO ana") \
+        and has(statement="CREATE SECRET s (TYPE s3, KEY_ID '***', SECRET '***')") and has(user="ana", door="http", **{"class": "access"}, outcome="refused") \
+        and has(user="ana", door="postgres", outcome="refused") and has(user="ana", statement="SELECT card FROM t", outcome="refused") and "permission denied" in denied \
+        and not has(statement="SELECT id FROM t") and "ana-password-1" not in text and "very-secret-value" not in text and "boss-password-1" not in text \
+        and all(r["from"] and r["from"].startswith("127.0.0.1:") for r in rows if r["door"] == "http")
+    checks["...a superuser's only"] = "permission denied: pondra.audit" in q(ana, "SELECT * FROM pondra.audit")
+    q(boss, "ALTER USER ana MAX_QUERIES 1 STATEMENT_TIMEOUT '2 seconds'")
+    listed = q(boss, "SELECT max_queries, statement_timeout FROM pondra.users WHERE name = 'ana'")
+    slow = "SELECT sum(v) AS s FROM generate_series(1, 4000000000) g(v)"
+    took = {}
+    def timed(name):
+        t0 = time.time()
+        took[name] = (q(ana, slow), round(time.time() - t0, 2))
+    ts = [threading.Thread(target=timed, args=(i,)) for i in range(2)]
+    for t in ts:
+        t.start()
+        time.sleep(0.2)
+    for t in ts:
+        t.join()
+    ends = sorted(s for _, s in took.values())
+    q(boss, "ALTER USER ana MAX_QUERIES 0 STATEMENT_TIMEOUT 0")
+    after = q(boss, "SELECT max_queries, statement_timeout FROM pondra.users WHERE name = 'ana'")
+    info["quota"] = {"listed": listed, "took": took, "after": after}
+    checks["a user's quota: one statement at a time (the next waits its turn), each stopped after its STATEMENT_TIMEOUT; pondra.users says so; 0 lifts it"] = \
+        listed == [{"max_queries": 1, "statement_timeout": "2 seconds"}] and all("STATEMENT_TIMEOUT" in r for r, _ in took.values()) \
+        and 1.5 <= ends[0] <= 3.5 and ends[1] >= ends[0] + 1.5 and after == [{}]  # (nulls: no keys)
+    n.kill()
+    ok = all(checks.values())
+    print(json.dumps({"safety": checks, "ok": ok, "info": info}, indent=1, default=str))
+    return ok
+
+
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    out = {t.__name__: t() for t in (upsert, deal, outside, clouds, kafkas, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, found, renames, workspace, server, scale, flight, users, secrets, reader, crash)}
+    out = {t.__name__: t() for t in (upsert, deal, outside, clouds, kafkas, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, found, renames, workspace, server, scale, flight, users, secrets, safety, reader, crash)}
     A.secs = min(A.secs, 20)
     out["load"] = load()
     print(json.dumps(out, indent=1))
@@ -5232,7 +5410,7 @@ def all_tests():
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "found", "renames", "workspace", "server", "scale", "flight", "users", "secrets", "load", "all"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "found", "renames", "workspace", "server", "scale", "flight", "users", "secrets", "safety", "load", "all"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -5243,4 +5421,4 @@ if __name__ == "__main__":
     ap.add_argument("--secs", type=int, default=30)
     ap.add_argument("--flush-ms", type=int, default=250)
     A = ap.parse_args()
-    {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "load": load, "all": all_tests}[A.mode]()
+    {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "safety": safety, "load": load, "all": all_tests}[A.mode]()

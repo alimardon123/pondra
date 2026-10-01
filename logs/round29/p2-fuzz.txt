@@ -1,0 +1,130 @@
+http: {'sent': 13516, 'answered': 6628, 'dropped': 6884, 'timeouts': 4} up: True
+sql: {'sent': 136224, 'answered': 4960, 'dropped': 131264, 'timeouts': 0} up: True
+pg: {'sent': 226808, 'answered': 91927, 'dropped': 134881, 'timeouts': 0} up: True
+kafka: {'sent': 21781, 'answered': 1362, 'dropped': 20417, 'timeouts': 2} up: True
+flight: {'sent': 278580, 'answered': 268759, 'dropped': 9821, 'timeouts': 0} up: True
+{
+ "seed": 3,
+ "doors": {
+  "http": {
+   "sent": 13516,
+   "answered": 6628,
+   "dropped": 6884,
+   "timeouts": 4,
+   "node up after": true
+  },
+  "sql": {
+   "sent": 136224,
+   "answered": 4960,
+   "dropped": 131264,
+   "timeouts": 0,
+   "node up after": true
+  },
+  "pg": {
+   "sent": 226808,
+   "answered": 91927,
+   "dropped": 134881,
+   "timeouts": 0,
+   "node up after": true
+  },
+  "kafka": {
+   "sent": 21781,
+   "answered": 1362,
+   "dropped": 20417,
+   "timeouts": 2,
+   "node up after": true
+  },
+  "flight": {
+   "sent": 278580,
+   "answered": 268759,
+   "dropped": 9821,
+   "timeouts": 0,
+   "node up after": true
+  }
+ },
+ "stops": [],
+ "ok": true
+}
+http: {'sent': 490, 'answered': 472, 'dropped': 18, 'timeouts': 0} up: True
+sql: {'sent': 27438, 'answered': 27438, 'dropped': 0, 'timeouts': 0} up: True
+{
+ "seed": 4,
+ "doors": {
+  "http": {
+   "sent": 490,
+   "answered": 472,
+   "dropped": 18,
+   "timeouts": 0,
+   "node up after": true
+  },
+  "sql": {
+   "sent": 27438,
+   "answered": 27438,
+   "dropped": 0,
+   "timeouts": 0,
+   "node up after": true
+  }
+ },
+ "stops": [],
+ "ok": true
+}
+http: {'sent': 2613, 'answered': 2543, 'dropped': 70, 'timeouts': 0} up: True
+pg: {'sent': 3572, 'answered': 2004, 'dropped': 1568, 'timeouts': 0} up: True
+kafka: {'sent': 2084, 'answered': 244, 'dropped': 1840, 'timeouts': 0} up: True
+flight: {'sent': 288, 'answered': 288, 'dropped': 0, 'timeouts': 0} up: True
+{
+ "seed": 5,
+ "doors": {
+  "http": {
+   "sent": 2613,
+   "answered": 2543,
+   "dropped": 70,
+   "timeouts": 0,
+   "node up after": true
+  },
+  "pg": {
+   "sent": 3572,
+   "answered": 2004,
+   "dropped": 1568,
+   "timeouts": 0,
+   "node up after": true
+  },
+  "kafka": {
+   "sent": 2084,
+   "answered": 244,
+   "dropped": 1840,
+   "timeouts": 0,
+   "node up after": true
+  },
+  "flight": {
+   "sent": 288,
+   "answered": 288,
+   "dropped": 0,
+   "timeouts": 0,
+   "node up after": true
+  }
+ },
+ "stops": [],
+ "ok": true
+}
+== before (the panic=abort build): node stops found
+      1 /tmp/claude-0/sec/fuzz2.log:sql: the node stopped answering; the last inputs are in /tmp/pondra-fuzz-cx030wiy/stopped-sql-131.json
+      1 /tmp/claude-0/sec/fuzz2.log:pg: {'sent': 25000, 'answered': 8641, 'dropped': 16359, 'timeouts': 0} up: True
+      1 /tmp/claude-0/sec/fuzz2.log:pg: the node stopped; the last inputs are in /tmp/pondra-fuzz-cx030wiy/stopped-pg-99.json
+      1 /tmp/claude-0/sec/fuzz2.log:pg: the node stopped; the last inputs are in /tmp/pondra-fuzz-cx030wiy/stopped-pg-98.json
+      1 /tmp/claude-0/sec/fuzz2.log:pg: the node stopped; the last inputs are in /tmp/pondra-fuzz-cx030wiy/stopped-pg-97.json
+      1 /tmp/claude-0/sec/fuzz2.log:pg: the node stopped; the last inputs are in /tmp/pondra-fuzz-cx030wiy/stopped-pg-96.json
+      1 /tmp/claude-0/sec/fuzz2.log:pg: the node stopped; the last inputs are in /tmp/pondra-fuzz-cx030wiy/stopped-pg-95.json
+      1 /tmp/claude-0/sec/fuzz2.log:pg: the node stopped; the last inputs are in /tmp/pondra-fuzz-cx030wiy/stopped-pg-94.json
+      1 /tmp/claude-0/sec/fuzz2.log:pg: the node stopped; the last inputs are in /tmp/pondra-fuzz-cx030wiy/stopped-pg-93.json
+      1 /tmp/claude-0/sec/fuzz2.log:pg: the node stopped; the last inputs are in /tmp/pondra-fuzz-cx030wiy/stopped-pg-92.json
+      1 /tmp/claude-0/sec/fuzz2.log:pg: the node stopped; the last inputs are in /tmp/pondra-fuzz-cx030wiy/stopped-pg-91.json
+      1 /tmp/claude-0/sec/fuzz2.log:pg: the node stopped; the last inputs are in /tmp/pondra-fuzz-cx030wiy/stopped-pg-90.json
+      1 /tmp/claude-0/sec/fuzz2.log:pg: the node stopped; the last inputs are in /tmp/pondra-fuzz-cx030wiy/stopped-pg-9.json
+      1 /tmp/claude-0/sec/fuzz2.log:pg: the node stopped; the last inputs are in /tmp/pondra-fuzz-cx030wiy/stopped-pg-89.json
+      1 /tmp/claude-0/sec/fuzz2.log:pg: the node stopped; the last inputs are in /tmp/pondra-fuzz-cx030wiy/stopped-pg-88.json
+      1 /tmp/claude-0/sec/fuzz2.log:pg: the node stopped; the last inputs are in /tmp/pondra-fuzz-cx030wiy/stopped-pg-87.json
+      1 /tmp/claude-0/sec/fuzz2.log:pg: the node stopped; the last inputs are in /tmp/pondra-fuzz-cx030wiy/stopped-pg-86.json
+      1 /tmp/claude-0/sec/fuzz2.log:pg: the node stopped; the last inputs are in /tmp/pondra-fuzz-cx030wiy/stopped-pg-85.json
+      1 /tmp/claude-0/sec/fuzz2.log:pg: the node stopped; the last inputs are in /tmp/pondra-fuzz-cx030wiy/stopped-pg-84.json
+      1 /tmp/claude-0/sec/fuzz2.log:pg: the node stopped; the last inputs are in /tmp/pondra-fuzz-cx030wiy/stopped-pg-83.json

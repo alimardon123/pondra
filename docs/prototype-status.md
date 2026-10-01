@@ -1,6 +1,6 @@
 # Prototype status: Pondra, a streamhouse in one binary
 
-**Date:** 2026-10-01 (the workspace, rounds 27 and 28, and round 29 part 1 with the owner's second and third lists, and part 2: users, grants and secrets) · **Plan:** ADR-002 to ADR-035, `roadmap.md` · **Code:** `pondra.zip` / `pondra.bundle` (≈30,700 lines of Rust, plus Python and JavaScript clients, a documentation website, packaging, and test and benchmark tools)
+**Date:** 2026-10-01 (the workspace, rounds 27 and 28, and round 29 part 1 with the owner's second and third lists, and part 2: users, grants, secrets, TLS, audit, quotas) · **Plan:** ADR-002 to ADR-035, `roadmap.md` · **Code:** `pondra.zip` / `pondra.bundle` (≈30,700 lines of Rust, plus Python and JavaScript clients, a documentation website, packaging, and test and benchmark tools)
 **Name:** the prototype formerly called `lh` is now **Pondra**. The name is free on crates.io, PyPI and npm. A small personal-finance app uses it (pondra.app), a different category; run a trademark search before a public launch.
 
 ## Where it stands
@@ -15,7 +15,7 @@ One Rust binary replaces the Kafka + Flink + Spark + metastore + ZooKeeper stack
 
 Start more copies on the same bucket to scale out. The only state is object storage. There's no JVM, no database server and no coordination service.
 
-**Round 29, part 2 made a lake safe to share: users, grants and sealed secrets** (ADR-035 §2–3):
+**Round 29, part 2 made a lake safe to share: users, grants, sealed secrets, TLS, an audit log, quotas, and no request that stops a node** (ADR-035 §2, §3, §5):
 
 1. **Users and roles** in SQL: `CREATE USER ana PASSWORD '…'`, `CREATE ROLE`, `GRANT SELECT (id,
    amount) ON orders TO ana`, `GRANT INSERT ON SCHEMA sales` (its later tables too), `GRANT USAGE ON
@@ -32,10 +32,30 @@ Start more copies on the same bucket to scale out. The only state is object stor
    `CREATE TEMPORARY SECRET` lives in the session's memory.
 5. **The console signs in as the shell is** (the shell prints a link with a key, as Jupyter does)
    or as a user (Sign in as someone else…).
-6. **Found and fixed:** a Postgres client could sign in as `reader` with an empty password when no
-   read token was set; the AI functions sent the nodes' admin token to the AI endpoint.
-7. **Tests:** `harness.py users` and `secrets` (every door, a column refused, a revoke seen
-   at once on a follower, a rotated master key, a KMS command), and the whole suite again.
+6. **TLS on every door, on its own port** (`--tls-cert`, `--tls-key`): HTTPS, Postgres's
+   `sslmode=require`, Kafka's SSL, Flight's `grpc+tls`; a plain connection only from the node's
+   own machine; nodes call each other over HTTPS, and with an authority (`--tls-ca`) show their
+   certificates to each other (mutual TLS): the nodes' key alone opens nothing.
+7. **`pondra.audit`**: refused sign-ins and requests at every door, and every change to users,
+   grants, secrets and what exists (pgaudit's classes, `PONDRA_AUDIT`), values as `'***'`; a
+   superuser's only.
+8. **Quotas**: `MAX_QUERIES` (the rest wait their turn) and `STATEMENT_TIMEOUT` per user, on each
+   node.
+9. **No request stops a node** (`panics.rs`): a panic in a request is answered as an error (HTTP
+   500, `XX000`) or ends that connection; the node's own loops still stop it. `tools/fuzz_doors.py`
+   threw malformed input at all four doors and generated SQL: against the build before, it stopped
+   the node through `/cluster/commit` (fixed) and through pgwire's decoding of `Bind`, `Parse` and
+   `CopyData` cut short (now that connection's alone); the new build stayed up through every door.
+   The cost: the binary is about a fifth bigger (unwinding tables).
+10. **Found and fixed:** a Postgres client could sign in as `reader` with an empty password when no
+   read token was set; the AI functions sent the nodes' admin token to the AI endpoint; a docs
+   example claimed a refusal for a query it never ran (the client runs a query when its rows are
+   asked for).
+11. **Tests** (`logs/round29/p2-*`): `harness.py users`, `secrets` and `safety` (every door, a column
+   refused, a revoke seen at once on a follower, a rotated master key, a KMS command, panics, TLS
+   from another address, mutual TLS, the audit log, quotas), `tools/fuzz_doors.py`, the whole
+   suite again, `console_check.py` (94), the docs' examples. `tools/gates.py` runs the gates as one
+   command and appends a row to `logs/gates/README.md`.
 
 **Round 29, part 1 took the owner's list from 0.26 on Windows** (ADR-034, "Changed after 0.27"):
 

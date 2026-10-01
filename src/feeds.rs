@@ -47,7 +47,7 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, topic: &str, options: &s
 /// Every node: run this node's shards of every feed, starting and stopping them as feeds come
 /// and go and as nodes join and leave.
 pub fn start(app: App) {
-    tokio::spawn(async move {
+    crate::panics::spawn(async move {
         let mut running: HashMap<(String, i32), tokio::task::JoinHandle<()>> = HashMap::new();
         let mut hwm = app.lake.hwm.subscribe();
         loop {
@@ -94,7 +94,7 @@ pub fn start(app: App) {
                     continue;
                 }
                 let (a, v) = (app.clone(), view.clone());
-                running.insert((view, p), tokio::spawn(async move {
+                running.insert((view, p), crate::panics::spawn(async move {
                     if let Err(e) = shard(a, v.clone(), p).await {
                         eprintln!("feed {v}[{p}]: {e:#}");
                         tokio::time::sleep(Duration::from_secs(2)).await; // (then the loop starts it again)

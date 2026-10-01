@@ -1,0 +1,128 @@
+{
+ "safety": {
+  "a panic in a request is an error (HTTP 500, a query's own tasks', Postgres's), the node and the connection kept": true,
+  "HTTPS answers; plain HTTP only from this machine, refused from another saying why": true,
+  "Postgres (sslmode=verify-full), Kafka (SSL) and Flight (grpc+tls) take TLS; plain from another machine refused": true,
+  "nodes call each other over HTTPS (a follower's write committed by the leader); the nodes' key only with the authority's certificate": true,
+  "the audit log: users, grants and secrets made (values '***', nowhere in the clear); refused sign-ins over HTTP and Postgres; a column refused; reads not written by default": true,
+  "...a superuser's only": true,
+  "a user's quota: one statement at a time (the next waits its turn), each stopped after its STATEMENT_TIMEOUT; pondra.users says so; 0 lifts it": true
+ },
+ "ok": true,
+ "info": {
+  "away": "192.0.2.2",
+  "panics": [
+   [
+    500,
+    "internal error: pondra_panic() was called"
+   ],
+   "Join Error\ncaused by\nExternal error: task 130 panicked with message \"pondra_panic() was called\"",
+   "internal error: pondra_panic() was called"
+  ],
+  "doors": {
+   "pg away": "b'E\\x00\\x00\\x00oSFATAL\\x00C28000\\x00Mthis node takes TLS from other machines (https://, sslmode=require, security.protocol=SSL)\\x00\\x00Z\\x00\\x00\\x00\\x05I'",
+   "kafka away": "b'ConnectionResetError'",
+   "flight away": "b'ConnectionResetError'"
+  },
+  "nodes": {
+   "wrote": "ok",
+   "key": true,
+   "keyed": {
+    "here": 200,
+    "away, no certificate": 401,
+    "away, the nodes' certificate": 200
+   }
+  },
+  "audit": [
+   {
+    "user": "admin",
+    "door": "http",
+    "from": "127.0.0.1:35502",
+    "class": "ddl",
+    "statement": "CREATE TABLE t (id BIGINT, card VARCHAR)",
+    "outcome": "ok"
+   },
+   {
+    "user": "admin",
+    "door": "http",
+    "from": "127.0.0.1:35528",
+    "class": "role",
+    "statement": "CREATE USER boss PASSWORD '***' SUPERUSER",
+    "outcome": "ok"
+   },
+   {
+    "user": "boss",
+    "door": "http",
+    "from": "127.0.0.1:35534",
+    "class": "role",
+    "statement": "CREATE USER ana PASSWORD '***'",
+    "outcome": "ok"
+   },
+   {
+    "user": "boss",
+    "door": "http",
+    "from": "127.0.0.1:35542",
+    "class": "role",
+    "statement": "GRANT SELECT (id) ON t TO ana",
+    "outcome": "ok"
+   },
+   {
+    "user": "boss",
+    "door": "http",
+    "from": "127.0.0.1:35558",
+    "class": "role",
+    "statement": "CREATE SECRET s (TYPE s3, KEY_ID '***', SECRET '***')",
+    "outcome": "ok"
+   },
+   {
+    "user": "ana",
+    "door": "http",
+    "from": "127.0.0.1:35572",
+    "class": "access",
+    "statement": "POST /sql",
+    "outcome": "refused",
+    "message": "wrong token, or user name and password"
+   },
+   {
+    "user": "ana",
+    "door": "http",
+    "from": "127.0.0.1:35584",
+    "class": "read",
+    "statement": "SELECT card FROM t",
+    "outcome": "refused",
+    "message": "Error during planning: permission denied: SELECT (card) on t (GRANT SELECT ON t TO \u2026)"
+   },
+   {
+    "user": "ana",
+    "door": "postgres",
+    "from": "127.0.0.1:44152",
+    "class": "access",
+    "statement": "sign in",
+    "outcome": "refused",
+    "message": "wrong user name or password"
+   }
+  ],
+  "quota": {
+   "listed": [
+    {
+     "max_queries": 1,
+     "statement_timeout": "2 seconds"
+    }
+   ],
+   "took": {
+    "0": [
+     "ERROR 500: b\"quota: ana's statements run at most 2 s (STATEMENT_TIMEOUT); this one was stopped\"",
+     2.01
+    ],
+    "1": [
+     "ERROR 500: b\"quota: ana's statements run at most 2 s (STATEMENT_TIMEOUT); this one was stopped\"",
+     3.8
+    ]
+   },
+   "after": [
+    {}
+   ]
+  }
+ }
+}
+exit 0

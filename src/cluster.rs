@@ -98,10 +98,10 @@ impl Cluster {
 
     /// Follower loop: heartbeat the leader; if it's gone for `LEASE`, claim the next term.
     pub fn follow(self: Arc<Self>, store: Store) {
-        tokio::spawn(async move {
+        crate::panics::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(1)).await;
-                let url = format!("http://{}/cluster/beat?from={}", self.leader.addr, self.addr);
+                let url = crate::tls::url(&format!("{}/cluster/beat?from={}", self.leader.addr, self.addr));
                 match http().post(url).timeout(Duration::from_secs(2)).send().await.and_then(|r| r.error_for_status()) {
                     Ok(r) => {
                         let (term, nodes): (u64, Vec<String>) = r.json().await.unwrap_or_default();
@@ -133,7 +133,7 @@ impl Cluster {
     /// Read-only nodes: no heartbeat, no vote, no takeover. They only notice when leadership
     /// moves, and restart to follow the new leader's commit stream (see `mirror`).
     pub fn watch_leader(self: Arc<Self>, store: Store, streamed: bool) {
-        tokio::spawn(async move {
+        crate::panics::spawn(async move {
             let mut gone = 0;
             loop {
                 // While the leader's commit stream is down, look for a new leader every second
@@ -158,7 +158,7 @@ impl Cluster {
 
     /// Does the leader of our term answer? (A read-only node follows its commit stream only then.)
     pub async fn leader_alive(&self) -> bool {
-        let r = http().get(format!("http://{}/cluster/leader", self.leader.addr)).timeout(Duration::from_secs(2)).send().await;
+        let r = http().get(crate::tls::url(&format!("{}/cluster/leader", self.leader.addr))).timeout(Duration::from_secs(2)).send().await;
         match r {
             Ok(r) => r.json::<(u64, bool)>().await.is_ok_and(|(term, _)| term == self.leader.n),
             Err(_) => false,
@@ -169,7 +169,7 @@ impl Cluster {
     async fn peer_sees_leader(&self) -> bool {
         let peers = self.view.lock().unwrap().clone(); // the last member list we were given
         for peer in peers.iter().filter(|p| **p != self.addr && **p != self.leader.addr) {
-            let ok = http().get(format!("http://{peer}/cluster/leader")).timeout(Duration::from_secs(1)).send().await;
+            let ok = http().get(crate::tls::url(&format!("{peer}/cluster/leader"))).timeout(Duration::from_secs(1)).send().await;
             if let Ok(r) = ok {
                 if r.json::<(u64, bool)>().await.is_ok_and(|(term, ok)| ok && term == self.leader.n) {
                     return true;
@@ -191,17 +191,17 @@ pub fn mirror(lake: Arc<Lake>, leader: String, me: String, replica: Option<Arc<R
     // Acks, coalesced: however many changes arrive meanwhile, one request says "up to here".
     let (held, mut to_ack) = tokio::sync::watch::channel((0u64, 0u64, 0u64)); // term, first, last
     let l = leader.clone();
-    tokio::spawn(async move {
+    crate::panics::spawn(async move {
         while to_ack.changed().await.is_ok() {
             let (term, first, upto) = *to_ack.borrow_and_update();
-            let url = format!("http://{l}/cluster/ack?from={me}&term={term}&first={first}&upto={upto}");
+            let url = crate::tls::url(&format!("{l}/cluster/ack?from={me}&term={term}&first={first}&upto={upto}"));
             let _ = http().post(url).timeout(Duration::from_secs(2)).send().await;
         }
     });
-    tokio::spawn(async move {
+    crate::panics::spawn(async move {
         let mut last = 0; // the last change we got (a reconnect replays some we have)
         loop {
-            if let Ok(r) = http().get(format!("http://{leader}/cluster/log")).send().await.and_then(|r| r.error_for_status()) {
+            if let Ok(r) = http().get(crate::tls::url(&format!("{leader}/cluster/log"))).send().await.and_then(|r| r.error_for_status()) {
                 STREAM_DOWN.store(false, std::sync::atomic::Ordering::Relaxed);
                 let (mut body, mut buf, mut term) = (r.bytes_stream(), bytes::BytesMut::new(), None);
                 while let Some(Ok(chunk)) = body.next().await {
@@ -256,7 +256,7 @@ pub fn http() -> reqwest::Client {
     }
     let made = {
         let headers: reqwest::header::HeaderMap = token.iter().filter_map(|t| format!("Bearer {t}").parse().ok()).map(|v| (reqwest::header::AUTHORIZATION, v)).collect();
-        let client = |b: reqwest::ClientBuilder| b.default_headers(headers.clone()).build();
+        let client = |b: reqwest::ClientBuilder| crate::tls::client(b).default_headers(headers.clone()).build(); // (HTTPS between nodes: `tls.rs`)
         client(reqwest::Client::builder()).unwrap_or_else(|e| {
             // (a minimal container image with no CA certificates: nodes talk plain HTTP anyway)
             eprintln!("HTTPS calls out will fail: {e} (install the ca-certificates package)");

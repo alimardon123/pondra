@@ -32,15 +32,18 @@ use std::sync::Arc;
 /// Accept Postgres clients on `addr`.
 pub async fn serve(app: App, addr: String) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&addr).await?;
+    let tls = crate::tls::pg(); // (sslmode=require: `tls.rs`)
     let parser = Arc::new(NoopQueryParser::new());
     loop {
         let (socket, _) = listener.accept().await?;
+        let tls = tls.clone();
         // A connection is a session: its temporary tables end with it (`temp.rs`).
         let session = format!("pg-{}", uuid::Uuid::new_v4().simple());
         let backend = Arc::new(Backend { app: app.clone(), parser: parser.clone(), session: session.clone(), who: Default::default() });
         let pg = Arc::new(Pg(backend.clone(), Arc::new(Startup { backend, scram: Default::default(), plain: Default::default() })));
         tokio::spawn(async move {
-            let _ = pgwire::tokio::process_socket(socket, None, pg).await;
+            let _ = socket.set_nodelay(true);
+            let _ = pgwire::tokio::process_socket(socket, tls, pg).await;
             crate::temp::end(&session);
         });
     }
@@ -86,13 +89,20 @@ impl StartupHandler for Startup {
     {
         use pgwire::messages::startup::Authentication;
         let app = &self.backend.app;
-        let wrong = |user: &str| PgWireError::InvalidPassword(user.to_string());
+        let from = Some(client.socket_addr());
+        let wrong = |user: &str| {
+            crate::audit::refused(app, user, "postgres", from, "sign in", "wrong user name or password");
+            PgWireError::InvalidPassword(user.to_string())
+        };
         match message {
             PgWireFrontendMessage::Startup(ref startup) => {
+                if !crate::tls::pg_allowed(client.is_secure(), client.socket_addr()) {
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new("FATAL".into(), "28000".into(), crate::tls::PLAIN.into()))));
+                }
                 pgwire::api::auth::protocol_negotiation(client, startup).await?;
                 pgwire::api::auth::save_startup_parameters_to_metadata(client, startup);
                 if app.open().await {
-                    *self.backend.who.lock().unwrap() = Some(crate::auth::Principal::of(crate::auth::Role::Admin));
+                    *self.backend.who.lock().unwrap() = Some(crate::auth::Principal::of(crate::auth::Role::Admin).at("postgres", Some(client.socket_addr())));
                     return finish(client).await;
                 }
                 client.set_state(pgwire::api::PgWireConnectionState::AuthenticationInProgress);
@@ -109,7 +119,7 @@ impl StartupHandler for Startup {
                     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
                     return Err(wrong(&user));
                 };
-                *self.backend.who.lock().unwrap() = Some(who);
+                *self.backend.who.lock().unwrap() = Some(who.at("postgres", Some(client.socket_addr())));
                 return finish(client).await;
             }
             PgWireFrontendMessage::PasswordMessageFamily(m) => {
@@ -140,7 +150,7 @@ impl StartupHandler for Startup {
                             false => crate::users::principal(&app.lake, &user).await.ok(),
                         };
                         let Some(who) = who else { return Err(wrong(&user)) };
-                        *self.backend.who.lock().unwrap() = Some(who);
+                        *self.backend.who.lock().unwrap() = Some(who.at("postgres", Some(client.socket_addr())));
                         client.send(PgWireBackendMessage::Authentication(Authentication::SASLFinal(reply.into_bytes().into()))).await?;
                         return finish(client).await;
                     }
@@ -236,11 +246,17 @@ impl Backend {
 
     /// `run`, the notices its procedures send (what they print) sent first: psql shows NOTICE.
     async fn told<C: Sink<PgWireBackendMessage> + Unpin + Send>(&self, client: &mut C, user: &str, sql: &str, format: &Format) -> PgWireResult<Response> {
-        let (out, heard) = crate::routines::with_notices(crate::temp::SESSION.scope(Some(self.session.clone()), crate::auth::WHO.scope(self.who(), self.run(user, sql, format)))).await;
+        let (out, heard) = crate::routines::with_notices(crate::temp::SESSION.scope(Some(self.session.clone()), crate::auth::WHO.scope(self.who(), self.caught(user, sql, format)))).await;
         for n in heard {
             let _ = client.send(PgWireBackendMessage::NoticeResponse(ErrorInfo::new("NOTICE".into(), "00000".into(), n).into())).await; // (a client gone: the answer fails too)
         }
         out
+    }
+
+    /// `run`, a panic in it answered as an error (`panics.rs`).
+    async fn caught(&self, user: &str, sql: &str, format: &Format) -> PgWireResult<Response> {
+        let run = async { crate::panics::door(self.run(user, sql, format)).await.unwrap_or_else(|m| Err(user_error(anyhow::anyhow!(m)))) };
+        crate::audit::statement(&self.app, sql, run).await
     }
 
     /// Whoever signed in on this connection (nobody, before).

@@ -512,7 +512,7 @@ pub async fn create_spec(c: &ast::CreateTable, from: &Lake, files: bool) -> Resu
 /// Create a table (or change it: a spec sent again) from any node: the leader does it.
 pub async fn define(app: &crate::server::App, name: &str, spec: &str) -> Result<Value> {
     if app.seq.is_none() {
-        return Ok(http().post(format!("http://{}/tables/{name}", app.cluster.leader.addr)).body(spec.to_string()).send().await?.error_for_status()?.json().await?);
+        return Ok(http().post(crate::tls::url(&format!("{}/tables/{name}", app.cluster.leader.addr))).body(spec.to_string()).send().await?.error_for_status()?.json().await?);
     }
     let _guard = app.lock.lock().await;
     create_table(&app.lake, name, spec).await
@@ -842,7 +842,7 @@ pub async fn seen_here(app: &crate::server::App) {
     if app.seq.is_some() || app.cluster.reader {
         return;
     }
-    let url = format!("http://{}/cluster/visible", app.cluster.leader.addr);
+    let url = crate::tls::url(&format!("{}/cluster/visible", app.cluster.leader.addr));
     let asked = async { http().get(url).timeout(std::time::Duration::from_secs(2)).send().await?.json::<u64>().await };
     let Ok(upto) = asked.await else { return };
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -1223,7 +1223,7 @@ pub async fn reserve(lake: &Lake) -> Option<crate::log::Reserved> {
 /// Send a request to the leader over HTTP.
 pub async fn post(addr: &str, r: &Request) -> Result<Value> {
     let (path, body) = r.http()?;
-    let res = http().post(format!("http://{addr}{path}")).header("content-type", "application/json").body(body).send().await?;
+    let res = http().post(crate::tls::url(&format!("{addr}{path}"))).header("content-type", "application/json").body(body).send().await?;
     ensure!(res.status().is_success(), "the leader at {addr}: {}", res.text().await?);
     Ok(res.json().await?)
 }

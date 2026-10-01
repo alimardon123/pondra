@@ -62,7 +62,7 @@ async fn link(node: &str) -> Option<Link> {
     }
     let get = |bytes: usize| async move {
         let t = Instant::now();
-        let r = crate::cluster::http().get(format!("http://{node}/cluster/probe?bytes={bytes}")).timeout(Duration::from_secs(20)).send().await.ok()?;
+        let r = crate::cluster::http().get(crate::tls::url(&format!("{node}/cluster/probe?bytes={bytes}"))).timeout(Duration::from_secs(20)).send().await.ok()?;
         let got = r.bytes().await.ok()?.len();
         (got == bytes).then(|| t.elapsed().as_secs_f64())
     };

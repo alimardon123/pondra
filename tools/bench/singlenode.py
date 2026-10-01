@@ -51,11 +51,12 @@ def prepare(data):
     return out
 
 
-def ensure_repos(repos):
+def ensure_repos(repos, engines=("polars", "daft", "bodo")):
+    os.makedirs(repos, exist_ok=True)
     for name, url in [("pola-tpch", "https://github.com/pola-rs/tpch.git"), ("daft-repo", "https://github.com/Eventual-Inc/Daft.git"), ("bodo-repo", "https://github.com/bodo-ai/Bodo.git")]:
         path = os.path.join(repos, name)
-        if os.path.exists(path):
-            continue
+        if os.path.exists(path) or not any(e.startswith(name.split("-")[0]) for e in engines):
+            continue  # (there, or no engine here needs it)
         sub = {"daft-repo": "benchmarking/tpch", "bodo-repo": "benchmarks/tpch"}.get(name)
         subprocess.run(["git", "clone", "--depth", "1", *(["--filter=blob:none", "--sparse"] if sub else []), url, path], check=True)
         if sub:
@@ -252,7 +253,7 @@ def run():
     import re
     sys.path.insert(0, HERE)
     from tpch import queries as sql_queries
-    ensure_repos(A.repos)
+    ensure_repos(A.repos, A.engines.split(","))
     json.dump({str(k): v for k, v in sql_queries(A.queries).items()}, open(os.path.join(A.repos, "sql.json"), "w"))
     qs = list(range(1, 23))
     results, info = {}, {}

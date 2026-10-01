@@ -92,7 +92,7 @@ pub async fn live(State(app): State<App>, Query(p): Query<Params>, headers: axum
             }
             (w.print, w.next) = (Some(print), Instant::now() + w.every);
             let who = match w.who.access.is_some() { // (a user's grants as they are now: revoked, the answers end)
-                true => crate::users::principal(&w.app.lake, &w.who.name).await.unwrap_or_else(|_| crate::auth::Principal { name: w.who.name.clone(), role: crate::auth::Role::None, access: Some(Default::default()) }), // (gone: nothing)
+                true => crate::users::principal(&w.app.lake, &w.who.name).await.unwrap_or_else(|_| crate::auth::Principal { name: w.who.name.clone(), role: crate::auth::Role::None, access: Some(Default::default()), door: "http", from: None }), // (gone: nothing)
                 false => w.who.clone(),
             };
             let rows = crate::temp::SESSION.scope(w.session.clone(), crate::auth::WHO.scope(who, w.app.query(&w.sql, None))).await.and_then(|b| crate::server::render(&b, None));

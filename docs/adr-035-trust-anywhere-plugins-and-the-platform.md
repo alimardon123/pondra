@@ -222,3 +222,47 @@ a run records what it ran. To add:
 - Found and fixed on the way: a Postgres client could sign in as `reader` with an empty password
   when no read token was set, and Postgres reads weren't held to a role; the AI functions' calls
   carried the nodes' admin token to the AI endpoint.
+
+### The rest of §5 (round 29, part 2, 2026-10-01)
+
+- **TLS on every door, on the door's own port** (`tls.rs`): HTTP, Kafka and Flight tell a TLS
+  client from a plain one by its first byte (a handshake starts with 22), so no second port and no
+  proxy; Postgres takes it as Postgres does (`SSLRequest`, through pgwire's own TLS). rustls on
+  aws-lc-rs, already in the binary for the bucket's HTTPS. *By Claude:* with a certificate, a plain
+  connection is taken only from the node's own machine (loopback, or its own address), so the
+  shell, `pondra.local()` and Python workers calling back need nothing, and a password or a token
+  never crosses a network in the clear; `PONDRA_TLS=optional` takes plain from anywhere.
+- **Nodes over HTTPS, mutual TLS with an authority** (`--tls-ca`): nodes trust the authority (or,
+  without one, the shared certificate) and show their certificate when they call; a request with the
+  nodes' own key (`pn_…`) is taken only over a connection whose certificate the authority signed.
+  Rejected for now: certificates the leader issues (a join token, §5's laptop peer): an outside
+  authority first, the leader's own with the laptop peer. A served folder of lakes (`dbserver.rs`)
+  takes TLS at the server; each database's node listens on this machine only, plain.
+- **The audit log** (`audit.rs`, `pondra.audit`): a hidden append table with a TTL, written by a
+  writer on each node in batches (as the run log), exactly once. Classes as pgaudit names them
+  (`role`, `ddl`, `function`, `write`, `read`, `misc`); the default is `role,ddl,function`, cheap
+  enough to leave on; refusals always (a sign-in failed at any door, a request its rights or its
+  quota didn't cover). A statement that makes a user, a token or a secret is kept with its quoted
+  values as `'***'`. One wrapper (`audit::statement`) every door's statement goes through: the
+  HTTP door's scripts and its single-query path, Postgres, Flight SQL, MCP; a procedure's own
+  statements are its call's. Only a superuser reads it, and it is never answered from the result
+  cache.
+- **Quotas** (`users::Quota`): per user, on each node, `MAX_QUERIES` (a semaphore: the rest wait
+  their turn, 30 s at most) and `STATEMENT_TIMEOUT` (the statement's future dropped, as
+  `statement_timeout`), defaults for every user from `PONDRA_USER_QUERIES` and
+  `PONDRA_USER_TIMEOUT`; tokens and superusers have none. Rejected for now: memory per user
+  (DataFusion's pool is the node's; a pool per user means a runtime per query) and a cluster-wide
+  count (a round trip per statement).
+- **A panic in a request is an error** (`panics.rs`): panics unwind now (`panic = "abort"` gone);
+  each HTTP request, each Postgres statement and each Kafka and Flight connection is a door whose
+  panic is answered (HTTP 500, `XX000`) or ends that connection; DataFusion hands a panic in a
+  query's own tasks back to the request. The node's own loops (committing, tiering, following,
+  the run and audit logs, the doors' accept loops) are started with `panics::spawn`, which still
+  stops the node on a panic: a broken invariant there is not survivable. The cost: unwinding tables
+  make the binary about a fifth bigger (the release build here, stripped: 143 → 177 MB, pgwire's
+  TLS included); no request stopping a node is worth it, and the dist build's LTO keeps it smaller.
+- **Fuzzed** (`tools/fuzz_doors.py`): malformed and random input at all four doors, and generated
+  SQL. Against the build before this one it stopped the node through `/cluster/commit` (a flush
+  header's length past its body: fixed) and through pgwire's decoding of `Bind`, `Parse` and
+  `CopyData` messages cut short (pgwire's, 0.41: now that connection's alone); Kafka's and Flight's
+  parsers held.

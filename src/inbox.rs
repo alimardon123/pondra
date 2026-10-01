@@ -29,7 +29,7 @@ pub async fn send(store: &Store, r: &Request, wake: Option<&str>) -> Result<Opti
     store.put(&Path::from(BELL), id.to_string().into_bytes().into()).await?;
     if let Some(dir) = wake {
         let dir = dir.to_string();
-        tokio::spawn(async move { lead_once(&dir).await });
+        crate::panics::spawn(async move { lead_once(&dir).await });
     }
     for tick in 1.. {
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -67,7 +67,7 @@ pub async fn lead_once(dir: &str) -> Result<()> {
 /// Leader: answer the inbox whenever the bell rings (and once at start: requests may have waited
 /// for a leader).
 pub fn serve(lake: Arc<Lake>, seq: Arc<Sequencer>, lock: Arc<Mutex<()>>) {
-    tokio::spawn(async move {
+    crate::panics::spawn(async move {
         let mut heard = None;
         loop {
             let bell = lake.store.head(&Path::from(BELL)).await.ok().map(|m| (m.last_modified, m.e_tag));

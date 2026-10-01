@@ -132,7 +132,7 @@ fn log(app: &App, line: Line, done: Option<tokio::sync::oneshot::Sender<()>>) {
     }
     let tx = WRITER.get_or_init(|| {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        tokio::spawn(write(app.clone(), rx));
+        crate::panics::spawn(write(app.clone(), rx));
         tx
     });
     let _ = tx.send((line, done));
@@ -273,7 +273,7 @@ async fn tasks(lake: &Lake) -> Result<Arc<Vec<(String, Task)>>> {
 /// Leader: run the tasks as their ticks come, for as long as this node leads (a new leader is a
 /// new process). Nothing to do costs a look at the catalog's version twice a second.
 pub fn schedule(app: App) {
-    tokio::spawn(async move {
+    crate::panics::spawn(async move {
         let running: Arc<Mutex<HashSet<String>>> = Default::default();
         loop {
             tokio::time::sleep(Duration::from_millis(500)).await;
@@ -481,7 +481,7 @@ fn latest(e: &Every, after: u64, now: u64) -> Option<u64> {
 /// Does `sql` read one of these tables?
 pub fn mentioned(sql: &str) -> bool {
     let s = sql.to_lowercase();
-    ["pondra.runs", "pondra.routines", "pondra.tasks", "pondra.tables", "pondra.users", "pondra.grants"].iter().any(|t| s.contains(t))
+    ["pondra.runs", "pondra.routines", "pondra.tasks", "pondra.tables", "pondra.users", "pondra.grants", "pondra.audit"].iter().any(|t| s.contains(t))
 }
 
 /// `pondra.routines`, `pondra.tasks` and `pondra.tables`, as they are now.

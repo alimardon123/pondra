@@ -200,7 +200,7 @@ pub async fn settings() -> Response {
 
 /// `PUT /console/settings`: keep them, for the page of someone on this machine (a request from
 /// another one is refused: the file is this machine's user's). At most 64 KB of JSON.
-pub async fn save_settings(axum::extract::ConnectInfo(from): axum::extract::ConnectInfo<std::net::SocketAddr>, body: bytes::Bytes) -> Response {
+pub async fn save_settings(axum::extract::ConnectInfo(crate::tls::Peer { addr: from, .. }): axum::extract::ConnectInfo<crate::tls::Peer>, body: bytes::Bytes) -> Response {
     if !from.ip().is_loopback() {
         return (StatusCode::FORBIDDEN, "the console's settings are kept by a page on this machine only").into_response();
     }

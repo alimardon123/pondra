@@ -93,7 +93,7 @@ impl Disk {
             return;
         }
         let disk = self.clone();
-        tokio::spawn(async move {
+        crate::panics::spawn(async move {
             let _slot = disk.slots.clone().acquire_owned().await;
             let path = object_store::path::Path::from(key.as_str());
             if let Ok(r) = disk.store.get_opts(&path, Default::default()).await {

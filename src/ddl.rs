@@ -201,6 +201,7 @@ pub enum Ddl {
     CreateTask { name: String, task: crate::runs::Task, replace: bool }, // CREATE TASK … SCHEDULE … AS … (ADR-027: `runs.rs`)
     DropTask { name: String, if_exists: bool },
     RunLog, // the run log's table (`pondra.runs`), made when a node first has a line for it
+    AuditLog, // the audit log's (`pondra.audit`), the same way (`audit.rs`)
     Users(crate::users::Change), // CREATE USER and ROLE, GRANT, REVOKE, CREATE TOKEN (ADR-035: `users.rs`)
 }
 
@@ -339,6 +340,7 @@ pub async fn apply(lake: &Lake, d: Ddl) -> Result<Value> {
         Ddl::CreateTask { name, task, replace } => crate::runs::create_task(lake, &name, task, replace).await,
         Ddl::DropTask { name, if_exists } => crate::runs::drop_task(lake, &name, if_exists).await,
         Ddl::RunLog => crate::runs::create_log(lake).await,
+        Ddl::AuditLog => crate::audit::create_log(lake).await,
         Ddl::Users(c) => crate::users::apply(lake, c).await,
         Ddl::AttachOutside { name, url, kind, options } => {
             ensure!(!has_schema(lake, &name).await?, "a schema here is called {name}: attach under another name");
@@ -445,7 +447,7 @@ fn beside(url: &str, name: &str) -> String {
 pub async fn attach(home: &Lake, name: &str, dir: &str, me: &str, follow: bool, stream: bool) -> Result<()> {
     let leader = crate::cluster::latest(&crate::store::open_store(dir)?.1).await?.map(|t| t.addr).filter(|a| !a.is_empty());
     let live = match (&leader, stream) {
-        (Some(a), true) => crate::cluster::http().get(format!("http://{a}/cluster/leader")).timeout(std::time::Duration::from_secs(2)).send().await.is_ok(),
+        (Some(a), true) => crate::cluster::http().get(crate::tls::url(&format!("{a}/cluster/leader"))).timeout(std::time::Duration::from_secs(2)).send().await.is_ok(),
         _ => false,
     };
     let other = Lake::open(dir, false, live).await?;
@@ -454,7 +456,7 @@ pub async fn attach(home: &Lake, name: &str, dir: &str, me: &str, follow: bool, 
     }
     if follow {
         let (home, weak) = (Arc::downgrade(&home.arc()), Arc::downgrade(&other));
-        tokio::spawn(async move {
+        crate::panics::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                 let (Some(home), Some(other)) = (home.upgrade(), weak.upgrade()) else { return }; // (detached)

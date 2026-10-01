@@ -152,7 +152,7 @@ async fn list(app: &App) -> Result<Value> {
 async fn query(app: &App, sql: &str) -> Result<Value> {
     let sql = &crate::routines::expand(&app.lake, sql).await?; // (macros: ADR-023)
     ensure!(crate::write::parse(sql).is_none() && !crate::routines::runs_procedure(sql), "this is a write: use the write tool");
-    let batches = app.query(sql, None).await?;
+    let batches = crate::audit::statement(app, sql, app.query(sql, None)).await?;
     let total: usize = batches.iter().map(RecordBatch::num_rows).sum();
     Ok(json!({"rows": rows(&batches)?, "total_rows": total}))
 }
@@ -163,8 +163,11 @@ async fn write(app: &App, role: Role, sql: &str, job: Option<&str>) -> Result<Va
         return called(app, role, sql, job).await; // (CALL: a procedure may write)
     }
     let stmt = crate::write::parse(sql).ok_or_else(|| anyhow!("not a write (INSERT, UPDATE, DELETE, CREATE, DROP or CALL): use the query tool"))?;
-    app.auth.allows(role, &stmt)?;
-    crate::write::on_node(app, stmt, job.map(String::from)).await
+    crate::audit::statement(app, sql, async {
+        app.auth.allows(role, &stmt)?;
+        crate::write::on_node(app, stmt, job.map(String::from)).await
+    })
+    .await
 }
 
 /// A procedure's answer, as a tool's: its rows or outcome, and what it printed (`notices`).

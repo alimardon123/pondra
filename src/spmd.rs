@@ -237,7 +237,7 @@ pub async fn copy(lake: &Lake, nodes: &[String], me: &str, sql: &str, target: &c
         match *node == me {
             true => copy_share(lake, s, target).await,
             false => {
-                let res = crate::cluster::http().post(format!("http://{node}/cluster/copy")).json(&(s, target)).send().await?;
+                let res = crate::cluster::http().post(crate::tls::url(&format!("{node}/cluster/copy"))).json(&(s, target)).send().await?;
                 ensure!(res.status().is_success(), "{node}: {}", res.text().await?);
                 Ok(res.json::<u64>().await?)
             }
@@ -374,7 +374,7 @@ async fn drain(plan: &Arc<dyn ExecutionPlan>, ctx: Arc<datafusion::execution::Ta
 /// Another node's share, streamed onto this node's disk piece by piece: the plan's shape first,
 /// then how many buckets follow, then each bucket's piece count and its pieces.
 async fn remote(node: &str, s: &Slice) -> Result<(String, Vec<Spill>)> {
-    let res = crate::cluster::http().post(format!("http://{node}/cluster/stage")).json(s).send().await?;
+    let res = crate::cluster::http().post(crate::tls::url(&format!("{node}/cluster/stage"))).json(s).send().await?;
     ensure!(res.status().is_success(), "{node}: {}", res.text().await?);
     read_reply(res, &s.job(), &format!("from-{}", node.replace(':', "_"))).await
 }
@@ -516,7 +516,7 @@ async fn shuffle(lake: &Lake, nodes: &[String], me: &str, sql: &str, tables: &[S
 async fn abandon(nodes: &[String], me: &str) {
     let Some(id) = LAST.lock().unwrap().clone() else { return };
     forget(&id);
-    let asks = nodes.iter().filter(|n| *n != me).map(|n| crate::cluster::http().get(format!("http://{n}/cluster/shuffle?id={id}&exchange=0&to=0&drop=true")).send());
+    let asks = nodes.iter().filter(|n| *n != me).map(|n| crate::cluster::http().get(crate::tls::url(&format!("{n}/cluster/shuffle?id={id}&exchange=0&to=0&drop=true"))).send());
     futures::future::join_all(asks).await;
 }
 
@@ -1263,7 +1263,7 @@ async fn fetch(job: &Job, id: &str, from: &str, local: bool, k: usize, to: usize
         return Ok(one(job.buckets.lock().unwrap().get(&(k, to)).cloned().unwrap_or_default(), part));
     }
     let only = part.map(|q| format!("&part={q}")).unwrap_or_default();
-    let res = crate::cluster::http().get(format!("http://{from}/cluster/shuffle?id={id}&exchange={k}&to={to}{only}")).send().await?;
+    let res = crate::cluster::http().get(crate::tls::url(&format!("{from}/cluster/shuffle?id={id}&exchange={k}&to={to}{only}"))).send().await?;
     ensure!(res.status().is_success(), "{from}: {}", res.text().await?);
     let name = format!("in-{k}-{to}-{}{}", from.replace(':', "_"), part.map(|q| format!("-p{q}")).unwrap_or_default());
     Ok(read_reply(res, id, &name).await?.1)

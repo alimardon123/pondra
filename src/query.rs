@@ -738,6 +738,14 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
             None => crate::runs::no_runs()?,
         };
         system.register_table("runs".into(), runs)?;
+        if crate::audit::check(&text)? {
+            // (a superuser's only: `audit.rs`)
+            let audit = match lake.cat.get::<TableMeta>(&crate::store::table_key(crate::audit::TABLE)).await? {
+                Some(meta) => named(&ctx, table_view(lake, &ctx, crate::audit::TABLE, &sys(meta.clone()), upto).await?, &meta, false)?,
+                None => crate::audit::empty()?,
+            };
+            system.register_table("audit".into(), audit)?;
+        }
         default.register_schema("pondra", system)?;
     }
     if let Ok(sent) = SENT.try_with(|t| t.clone()) {

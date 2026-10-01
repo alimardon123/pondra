@@ -1142,12 +1142,30 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
 177. **A password is kept as SCRAM's verifier, a token as its hash, a secret sealed by a key the master
    key wraps** (`users.rs`, `ext.rs`): the catalog gives none of them away, and nothing is written in
    the clear. `harness.py users`, `harness.py secrets`.
+178. **A request can't stop a node; the node's own work still can** (`panics.rs`): panics unwind.
+   Start every loop the node can't do without with `panics::spawn` (a panic in it aborts the
+   process, as before); a request's work runs in `panics::door` (HTTP's guard, each Postgres
+   statement) or in its connection's own task (Kafka, Flight). Never `panic = "abort"` again; never
+   a plain `tokio::spawn` for a loop that commits, tiers or follows. `harness.py safety`,
+   `tools/fuzz_doors.py`.
+179. **With a certificate, nothing crosses a network in the clear** (`tls.rs`): every door takes TLS
+   on its own port; a plain connection only from the node's own machine (unless
+   `PONDRA_TLS=optional`); a call to another node is `tls::url(…)`, never `format!("http://…")`;
+   with `PONDRA_TLS_CA`, the nodes' key only over a connection with the authority's certificate.
+180. **Every statement a door is sent goes through `audit::statement`** (`audit.rs`): it is where a
+   user's quota (`users::Quota`) is taken and where the audit log is written; a new door or a new
+   statement path calls it, once (a nested call is its caller's). A statement that makes a user, a
+   token or a secret is kept with its values as `'***'`; `pondra.audit` is a superuser's and is
+   never answered from the result cache.
 
 ## Tests: run these before and after any change
 
 ```bash
 cargo build --release
 python3 tools/harness.py all            # upsert, fence/split-brain, bulk insert, reader, crash, load
+python3 tools/gates.py [--prepare]      # the gates (sqllogictest, TPC-H SF1 vs DuckDB, vs Postgres, Nexmark): a row in logs/gates/README.md; exit 1 on a drop
+python3 tools/harness.py safety         # panics answered as errors, TLS at every door, mutual TLS, the audit log, quotas
+python3 tools/fuzz_doors.py --secs 60   # malformed input at HTTP, SQL, Postgres, Kafka and Flight: the node stays up
 python3 tools/harness.py crash --runs 3 --batches 60 --size 50000   # kill -9 + injected crashes, 9M events
 python3 tools/cluster.py users --secs 30      # 64 writers + 16 readers: 0 torn reads, 0 lost
 python3 tools/cluster.py failover --secs 45   # 2 leader kills; task state == inline view == model

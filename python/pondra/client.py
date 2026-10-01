@@ -96,7 +96,7 @@ class Result:
 
 
 class Pondra:
-    def __init__(self, url="http://127.0.0.1:8080", token=None, producer=None, timeout=300, headers=None, job=None, echo=True, user=None, password=None):
+    def __init__(self, url="http://127.0.0.1:8080", token=None, producer=None, timeout=300, headers=None, job=None, echo=True, user=None, password=None, ca=None):
         global _last
         self.url, self.token, self.timeout = url.rstrip("/"), token, timeout
         # (a user signs in with its name and password, or its token as the password: HTTP Basic)
@@ -108,7 +108,11 @@ class Pondra:
         self._headers, self._job, self._jobs, self._temp = dict(headers or {}), job, itertools.count(1), {}
         # a node on this machine is reached directly, whatever proxy the environment names
         local = urllib.parse.urlsplit(self.url).hostname in ("127.0.0.1", "localhost", "::1")
-        self._open = urllib.request.build_opener(urllib.request.ProxyHandler({})).open if local else urllib.request.urlopen
+        handlers = [urllib.request.ProxyHandler({})] if local else []
+        if ca:  # (a node's own certificate, or its authority's: a PEM file to trust besides the system's)
+            import ssl
+            handlers.append(urllib.request.HTTPSHandler(context=ssl.create_default_context(cafile=ca)))
+        self._open = urllib.request.build_opener(*handlers).open if handlers else urllib.request.urlopen
         _last = self
 
     def _call(self, method, path, body=b"", headers=None, stream=False):

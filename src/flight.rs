@@ -39,7 +39,8 @@ type Out<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
 pub async fn serve(app: App, addr: String) -> anyhow::Result<()> {
     let door = Door(Sql(app));
     let service = FlightServiceServer::new(door).max_decoding_message_size(1 << 30).max_encoding_message_size(1 << 30);
-    tonic::transport::Server::builder().add_service(service).serve(addr.parse()?).await?;
+    let doors = crate::tls::Doors::bind(&addr, crate::tls::Door::Flight).await?; // (TLS too: `tls.rs`)
+    tonic::transport::Server::builder().add_service(service).serve_with_incoming(doors.stream()).await?;
     Ok(())
 }
 
@@ -59,11 +60,18 @@ fn allowed<T>(_: &App, _: &Request<T>, need: Role) -> Result<Role, Status> {
 /// nothing that needs a sign-in, an admin.
 async fn caller<T>(app: &App, req: &Request<T>) -> crate::auth::Principal {
     let header = req.metadata().get("authorization").and_then(|v| v.to_str().ok());
-    match crate::users::who(&app.lake, &app.auth, header).await {
+    let from = req.extensions().get::<crate::tls::Peer>().map(|p| p.addr);
+    let who = match crate::users::who(&app.lake, &app.auth, header).await {
         Some(p) => p,
         None if app.open().await => crate::auth::Principal::of(Role::Admin),
-        None => crate::auth::Principal::of(Role::None),
-    }
+        None => {
+            if header.is_some() {
+                crate::audit::refused(app, "", "flight", from, "sign in", "wrong token, or user name and password");
+            }
+            crate::auth::Principal::of(Role::None)
+        }
+    };
+    who.at("flight", from)
 }
 
 /// Batches as a Flight stream (the schema first, so an empty result still has columns).
@@ -75,7 +83,7 @@ fn send(schema: SchemaRef, batches: Vec<RecordBatch>) -> Out<FlightData> {
 /// Run a query (spread over the cluster when it pays), with its schema.
 async fn query(app: &App, sql: &str) -> anyhow::Result<(SchemaRef, Vec<RecordBatch>)> {
     let sql = &crate::routines::expand(&app.lake, sql).await?; // (macros: ADR-023)
-    let batches = app.query(sql, None).await?;
+    let batches = crate::audit::statement(app, sql, app.query(sql, None)).await?;
     let schema = match batches.first() {
         Some(b) => b.schema(),
         None => Arc::new(plan_schema(app, sql).await?),
@@ -92,9 +100,11 @@ async fn plan_schema(app: &App, sql: &str) -> anyhow::Result<Schema> {
 async fn write(app: &App, role: Role, sql: &str) -> Result<i64, Status> {
     let sql = crate::routines::expand(&app.lake, sql).await.map_err(status)?;
     let stmt = crate::write::parse(&sql).ok_or_else(|| Status::invalid_argument("not a write statement"))?;
-    app.auth.allows(role, &stmt).map_err(|e| Status::permission_denied(e.to_string()))?;
-    let done = crate::write::on_node(app, stmt, None).await.map_err(status)?;
-    Ok(done["rows"].as_i64().unwrap_or(0))
+    let done = crate::audit::statement(app, &sql, async {
+        app.auth.allows(role, &stmt).map_err(|e| Status::permission_denied(e.to_string()))?;
+        crate::write::on_node(app, stmt, None).await.map_err(status)
+    });
+    Ok(done.await?["rows"].as_i64().unwrap_or(0))
 }
 
 /// Appends batches to `table` through the log, pipelined: each is queued as it arrives and
@@ -275,7 +285,10 @@ impl FlightSqlService for Sql {
             _ if open => password,
             Role::None => match crate::users::sign_in(&self.0.lake, &self.0.auth, &user, &password).await {
                 Some(p) if p.role > Role::None => crate::users::session(&self.0.lake, &p.name).await.map_err(status)?.0,
-                _ => return Err(Status::unauthenticated("wrong user name or password")),
+                _ => {
+                    crate::audit::refused(&self.0, &user, "flight", req.extensions().get::<crate::tls::Peer>().map(|p| p.addr), "sign in", "wrong user name or password");
+                    return Err(Status::unauthenticated("wrong user name or password"));
+                }
             },
             _ => password,
         };

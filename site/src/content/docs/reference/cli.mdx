@@ -145,6 +145,17 @@ Give every node the same tokens. With none set there are no checks. A flag beats
 variable. See [HTTP](/pondra/reference/http/#roles) for what each role may do. Prefer the
 environment: a flag shows in the process list.
 
+### TLS
+
+| Flag | Environment | Meaning |
+|---|---|---|
+| `--tls-cert FILE` | `PONDRA_TLS_CERT` | a PEM certificate: HTTP, Postgres, Kafka and Flight take TLS on their own ports, and plain connections only from this machine |
+| `--tls-key FILE` | `PONDRA_TLS_KEY` | its key |
+| `--tls-ca FILE` | `PONDRA_TLS_CA` | the authority that signs the nodes' certificates: mutual TLS between nodes |
+
+See [security](/pondra/guides/security/#tls). Serving a folder of lakes, the server takes TLS, and
+each database's node, on this machine only, doesn't.
+
 ### Writes and the log
 
 | Flag | Default | Meaning |
@@ -199,7 +210,8 @@ pondra serve data --addr 0.0.0.0:8080 --pg 0.0.0.0:5432
 ```
 
 Every other option of `pondra serve` applies to each database's node: `--pg`, the tokens
-(`--read-token`, `--write-token`, `--admin-token`), `--python`, `--reader` (every database
+(`--read-token`, `--write-token`, `--admin-token`), the TLS files (to the server's own doors),
+`--python`, `--reader` (every database
 read-only), `--tier-secs`, `--memory-gb`, `--cache-dir`, `--cache-gb`, `--ack`, `--replicas`,
 `--fsync`, `--publish`, `--flush-ms`, `--task-ms`, `--retain-secs`, `--changelog-secs` and
 `--backlog`. Each database is a process of its own, so a value such as `--memory-gb` is for each

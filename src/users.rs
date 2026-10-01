@@ -40,6 +40,20 @@ pub struct User {
     pub grants: Vec<Grant>,
     #[serde(default)]
     pub created_ms: u64,
+    #[serde(default, flatten)]
+    pub limits: Limits,
+}
+
+/// A user's quota, on each node: at most `max_queries` of its statements at once (the rest wait
+/// their turn, 30 s at most), each at most `timeout_secs` (`MAX_QUERIES 4`,
+/// `STATEMENT_TIMEOUT '5 minutes'`; 0 is none). Without its own: `PONDRA_USER_QUERIES`,
+/// `PONDRA_USER_TIMEOUT` (seconds). A superuser has none.
+#[derive(Serialize, Deserialize, Clone, Copy, Default, PartialEq, Debug)]
+pub struct Limits {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_queries: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
 }
 
 /// A password as SCRAM-SHA-256 keeps it (RFC 5802, 7677): what checks it, never what makes it.
@@ -82,8 +96,8 @@ pub enum On {
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(tag = "do", rename_all = "snake_case")]
 pub enum Change {
-    Create { name: String, login: bool, if_not_exists: bool, verifier: Option<Verifier>, superuser: bool },
-    Alter { name: String, verifier: Option<Verifier>, superuser: Option<bool> },
+    Create { name: String, login: bool, if_not_exists: bool, verifier: Option<Verifier>, superuser: bool, #[serde(default)] limits: Limits },
+    Alter { name: String, verifier: Option<Verifier>, superuser: Option<bool>, #[serde(default)] limits: Limits },
     Drop { name: String, if_exists: bool },
     Grant { privileges: Vec<String>, on: On, columns: Vec<String>, to: Vec<String> },
     Revoke { privileges: Vec<String>, on: On, columns: Vec<String>, from: Vec<String> },
@@ -232,7 +246,7 @@ fn parse(mut w: Words) -> Result<Change> {
             let if_not_exists = verb == "create" && w.is("if") && { w.expect("not")?; w.expect("exists")?; true };
             let name = plain(&w.name()?)?;
             w.is("with");
-            let (mut verifier, mut superuser, mut login2) = (None, None, None);
+            let (mut verifier, mut superuser, mut login2, mut limits) = (None, None, None, Limits::default());
             while !w.0.is_empty() {
                 if w.is("password") {
                     let p = w.string()?;
@@ -246,15 +260,31 @@ fn parse(mut w: Words) -> Result<Change> {
                     login2 = Some(true);
                 } else if w.is("nologin") {
                     login2 = Some(false);
+                } else if w.is("max_queries") {
+                    w.sym('=');
+                    limits.max_queries = Some(match w.next() {
+                        Some(W::Num(n)) => n.parse().map_err(|_| anyhow!("MAX_QUERIES is a whole number: 4 (0: no limit)"))?,
+                        _ => bail!("MAX_QUERIES is a whole number: 4 (0: no limit)"),
+                    });
+                } else if w.is("statement_timeout") {
+                    w.sym('=');
+                    limits.timeout_secs = Some(match w.next() {
+                        Some(W::Num(n)) if n == "0" => 0,
+                        Some(W::Str(s)) => match crate::runs::every(&s) {
+                            Ok(crate::runs::Every::Seconds(s)) => s,
+                            _ => bail!("STATEMENT_TIMEOUT '5 minutes' (or seconds, hours; 0: none)"),
+                        },
+                        _ => bail!("STATEMENT_TIMEOUT '5 minutes' (or seconds, hours; 0: none)"),
+                    });
                 } else {
-                    bail!("expected PASSWORD '…', SUPERUSER, NOSUPERUSER, LOGIN or NOLOGIN {}", w.near());
+                    bail!("expected PASSWORD '…', SUPERUSER, NOSUPERUSER, LOGIN, NOLOGIN, MAX_QUERIES n or STATEMENT_TIMEOUT '…' {}", w.near());
                 }
             }
             Ok(match verb.as_str() {
-                "create" => Change::Create { name, login: login2.unwrap_or(login), if_not_exists, verifier, superuser: superuser.unwrap_or(false) },
+                "create" => Change::Create { name, login: login2.unwrap_or(login), if_not_exists, verifier, superuser: superuser.unwrap_or(false), limits },
                 _ => {
-                    ensure!(verifier.is_some() || superuser.is_some(), "ALTER USER {name} PASSWORD '…' | SUPERUSER | NOSUPERUSER");
-                    Change::Alter { name, verifier, superuser }
+                    ensure!(verifier.is_some() || superuser.is_some() || limits != Limits::default(), "ALTER USER {name} PASSWORD '…' | SUPERUSER | NOSUPERUSER | MAX_QUERIES n | STATEMENT_TIMEOUT '…'");
+                    Change::Alter { name, verifier, superuser, limits }
                 }
             })
         }
@@ -370,20 +400,26 @@ pub async fn apply(lake: &Lake, c: Change) -> Result<Value> {
     let put = |n: &str, u: &User| (user_key(n), json(u));
     let must = |n: &str, u: Option<User>| u.ok_or_else(|| anyhow!("no user or role {n} (CREATE USER {n}, CREATE ROLE {n})"));
     let out = match c {
-        Change::Create { name, login, if_not_exists, verifier, superuser } => {
+        Change::Create { name, login, if_not_exists, verifier, superuser, limits } => {
             if get(&name).await?.is_some() {
                 ensure!(if_not_exists, "{} {name} already exists", if login { "user" } else { "role" });
                 return Ok(j!({"user": name, "unchanged": true}));
             }
             ensure!(name != "public", "public is every user: GRANT … TO public");
-            let u = User { login, verifier, superuser, created_ms: crate::log::now_ms(), ..Default::default() };
+            let u = User { login, verifier, superuser, created_ms: crate::log::now_ms(), limits, ..Default::default() };
             lake.cat.commit(vec![put(&name, &u)], &[]).await?;
             j!({ if login { "user" } else { "role" }: name })
         }
-        Change::Alter { name, verifier, superuser } => {
+        Change::Alter { name, verifier, superuser, limits } => {
             let mut u = must(&name, get(&name).await?)?;
             if verifier.is_some() {
                 u.verifier = verifier;
+            }
+            if let Some(n) = limits.max_queries {
+                u.limits.max_queries = Some(n).filter(|n| *n > 0);
+            }
+            if let Some(s) = limits.timeout_secs {
+                u.limits.timeout_secs = Some(s).filter(|s| *s > 0);
             }
             if let Some(s) = superuser {
                 u.superuser = s;
@@ -727,6 +763,7 @@ async fn token_user(lake: &Lake, token: &str) -> Option<String> {
 pub struct Access {
     grants: Vec<Grant>,
     names: HashSet<String>, // (itself, its roles, public: whose grants they are)
+    pub limits: Limits,     // (its own)
 }
 
 impl Access {
@@ -784,13 +821,60 @@ pub async fn principal(lake: &Lake, user: &str) -> Result<Principal> {
                 grants.extend(u.grants.iter().cloned());
                 todo.extend(u.roles.iter().map(|r| (r.clone(), None)));
             }
-            let access = Arc::new(Access { grants, names: seen });
+            let access = Arc::new(Access { grants, names: seen, limits: me.limits });
             ACCESS.lock().unwrap().insert(user.to_string(), (version, std::time::Instant::now(), access.clone(), superuser));
             (access, superuser)
         }
     };
     let role = if superuser { Role::Admin } else if access.writes() { Role::Write } else { Role::Read };
-    Ok(Principal { name: user.to_string(), role, access: (!superuser).then_some(access) })
+    Ok(Principal { name: user.to_string(), role, access: (!superuser).then_some(access), door: "node", from: None })
+}
+
+/// Seconds as said: `90 seconds`, `5 minutes`, `1 hour`.
+fn span(s: u64) -> String {
+    let (n, unit) = match s {
+        _ if s >= 3600 && s % 3600 == 0 => (s / 3600, "hour"),
+        _ if s >= 60 && s % 60 == 0 => (s / 60, "minute"),
+        _ => (s, "second"),
+    };
+    format!("{n} {unit}{}", if n == 1 { "" } else { "s" })
+}
+
+/// The quota of the statement being run (its user's `Limits`): a turn among its statements on this
+/// node, and how long it may take. Tokens and superusers have none.
+pub struct Quota {
+    turns: Option<(Arc<tokio::sync::Semaphore>, u32)>,
+    pub timeout: Option<std::time::Duration>,
+    pub user: String,
+}
+
+pub fn quota() -> Quota {
+    let p = crate::auth::current();
+    let Some((user, a)) = p.and_then(|p| Some((p.name, p.access?))) else { return Quota { turns: None, timeout: None, user: String::new() } };
+    let env = |v: &str| std::env::var(v).ok().and_then(|n| n.parse::<u64>().ok());
+    let most = a.limits.max_queries.map(u64::from).or_else(|| env("PONDRA_USER_QUERIES")).filter(|n| *n > 0).map(|n| n.min(10_000) as u32);
+    let timeout = a.limits.timeout_secs.or_else(|| env("PONDRA_USER_TIMEOUT")).filter(|s| *s > 0).map(std::time::Duration::from_secs);
+    static TURNS: LazyLock<Mutex<HashMap<String, (u32, Arc<tokio::sync::Semaphore>)>>> = LazyLock::new(Default::default);
+    let turns = most.map(|n| {
+        let mut all = TURNS.lock().unwrap();
+        let e = all.entry(user.clone()).or_insert_with(|| (n, Arc::new(tokio::sync::Semaphore::new(n as usize))));
+        if e.0 != n {
+            *e = (n, Arc::new(tokio::sync::Semaphore::new(n as usize))); // (changed: the new number from now on)
+        }
+        (e.1.clone(), n)
+    });
+    Quota { turns, timeout, user }
+}
+
+impl Quota {
+    /// Its turn: at once if fewer than its number run, else when one ends (30 s at most).
+    pub async fn turn(&self) -> std::result::Result<Option<tokio::sync::OwnedSemaphorePermit>, String> {
+        let Some((s, n)) = &self.turns else { return Ok(None) };
+        match tokio::time::timeout(std::time::Duration::from_secs(30), s.clone().acquire_owned()).await {
+            Ok(Ok(p)) => Ok(Some(p)),
+            _ => Err(format!("quota: {} runs at most {n} statements at once (MAX_QUERIES); this one waited 30 s for its turn", self.user)),
+        }
+    }
 }
 
 /// Is what was worked out at catalog version `then` (at `at`) still so? On the leader, until the
@@ -870,6 +954,8 @@ pub async fn tables(lake: &Lake) -> Result<Vec<(&'static str, Arc<dyn datafusion
         ("password", Arc::new(all.iter().map(|(_, u)| Some(u.verifier.is_some())).collect::<BooleanArray>()) as ArrayRef),
         ("tokens", s(&|_, u| Some(u.tokens.iter().map(|t| t.name.clone()).collect::<Vec<_>>().join(", ")).filter(|t| !t.is_empty()))),
         ("member_of", s(&|_, u| Some(u.roles.join(", ")).filter(|r| !r.is_empty()))),
+        ("max_queries", Arc::new(all.iter().map(|(_, u)| u.limits.max_queries.map(|n| n as i64)).collect::<datafusion::arrow::array::Int64Array>()) as ArrayRef),
+        ("statement_timeout", s(&|_, u| u.limits.timeout_secs.map(span))),
         ("created", Arc::new(all.iter().map(|(_, u)| (u.created_ms > 0).then_some(u.created_ms as i64 * 1000)).collect::<TimestampMicrosecondArray>().with_timezone("UTC")) as ArrayRef),
     ])?;
     let rows: Vec<(String, &Grant)> = all.iter().flat_map(|(k, u)| u.grants.iter().map(move |g| (k[2..].to_string(), g))).collect();

@@ -1,0 +1,131 @@
+{
+ "node": {
+  "a new notebook, nothing typed, has nothing to save: no dot on its tab or its row in the Workspace's notebooks folder": true,
+  "the Data tree lists schemas, tables and views (each kind its icon), columns with SQL types and coloured type marks, a key marked, no bare numbers": true,
+  "a table picked shows its details: rows, key, columns (a key's and NOT NULL marked)": true,
+  "Profile: each column's nulls, distinct values, range, and a histogram or its commonest values": true,
+  "a view picked shows its definition": true,
+  "a SQL cell shows the rows, each column's type a mark and its card on hover; timestamps and decimals as written": true,
+  "double-clicking a table shows its first rows": true,
+  "the Workspace lists the lake's files by folder, with their sizes": true,
+  "a long answer draws only the rows in sight, sorts by a header's button, and a header clicked is summarized in the details": true,
+  "a Python cell runs on the node: what it printed, then its last expression as rows": true,
+  "errors in plain words: a SQL one, and a Python one at its line in the cell": true,
+  "Python cells share their variables (one namespace per page, as a notebook's kernel)": true,
+  "a figure a Python cell returns (matplotlib) shows as a picture": true,
+  "the Variables tab lists the page's Python names with their types; Restart empties them": true,
+  "Tab completes a table's name, and lists the choices when several fit (a column first)": true,
+  "a live cell shows a row INSERTed over HTTP (a decimal to its scale); off, its query ends": true,
+  "keys: Esc, B adds a cell, D D deletes it, Z brings it back; M makes it text; Shift+Enter renders it and starts a new cell": true,
+  "a text cell's headings make the outline under the notebook in the Workspace, and one clicked selects its cell": true,
+  "O hides a cell's output (its code stays) and a click shows it; ? lists every key (Settings, Keys)": true,
+  "a notebook saved in the lake is valid for Jupyter (nbformat), SQL cells as %%sql; its tab has no changes then": true,
+  "saved twice: two versions, listed in its details; the first, opened again, is what was saved": true,
+  "a notebook downloaded is valid for Jupyter too": true,
+  "an .ipynb uploaded opens in a tab: its text rendered (its heading in the outline), its %%sql cell a SQL cell that runs": true,
+  "every request went to the node; no page errors": true
+ }
+}
+{
+ "files": {
+  "a SQL file opens in one tab (two clicks), runs, and shows its Results, Messages and Plan (a graph of its steps, and as text)": true,
+  "a SQL file changed shows it (its tab, the Workspace) and Ctrl+S saves it in place": true,
+  "a SQL file's statements each get an answer (split as the node splits them), up to a failure; Settings can say the last one's only": true,
+  "a new SQL file asks for its path when first saved": true,
+  "a new SQL file shows it is not saved (its tab, its row in the folder it will be saved to) until Ctrl+S saves it": true,
+  "a SQL file's $names each get an input, bound on the node; its Run \u25be runs it as a job (History shows it) and schedules it (Jobs shows it, apart from History, and drops it)": true,
+  "a Python file runs in its console (what it printed, its answer), and a line typed there runs in the same Python": true,
+  "a CSV file is edited in a grid (a cell changed, a row added: both marked) and saved in place, its untouched lines as they were; the node reads the new rows": true,
+  "saving over someone else's change is refused (If-Match: 412), and theirs is kept": true,
+  "Discard reads the file again: theirs": true,
+  "a JSONL file is edited and saved, a JSON object a line": true,
+  "a Parquet file opens read-only (it says so; a cell does not edit)": true,
+  "files: every request went to the node; no page errors": true,
+  "New folder in the Workspace's + makes a folder (a zero-byte .folder marker in the lake) that shows, empty and without the marker, and is there after a reload": true,
+  "New folder from the tab bar's + and from a folder's menu (New folder here, inside it) makes one; a name that exists, or has a .. in it, is refused": true,
+  "a folder's \u22ef (a button with a label) shows on hover, and its menu, the same as a right-click's, has New notebook, SQL file, Python file and folder here, Upload a file here, Delete folder": true,
+  "a file's \u22ef shows on hover, on focus and on the row picked, and opens the menu a right-click does": true,
+  "a new notebook in a folder: no dot until something is typed, then its tab and row have the dot and Save shows; Ctrl+S saves it in place, as projects/analysis.ipynb, valid for Jupyter: no versions": true,
+  "a notebook saved in place offers no versions, jobs or schedule (its \u22ef and its Run's \u25be)": true,
+  "the .folder marker is in no list: not the tree, not Ctrl+K (empty, or the folder's name, or .folder searched)": true,
+  "a notebook saved in a folder opens again after a reload, and Ctrl+S saves it over itself (still the one file)": true,
+  "a notebook saved in place is refused over someone else's change (If-Match: 412), and theirs is kept": true,
+  "New notebook here in notebooks keeps its versions: notebooks/<name>/<time>.ipynb": true,
+  "Upload a file here puts a CSV and an .ipynb in that folder; the .ipynb, clicked, opens as a notebook saved in place": true,
+  "Delete folder asks (with how many files), then deletes every file under it, the marker too, and the folder goes from the tree": true,
+  "a file renamed from its \u22ef moves its open tab to the new name": true,
+  "the Workspace's \u22ef lists no New item (Data's keeps Refresh); the +, Ctrl+K and the welcome page say Upload a file\u2026; the top bar has no \u22ef of its own": true,
+  "folders: every request went to the node; no page errors": true,
+  "the editor: an alias called c is a name, not a comment's start; after o. Tab lists the columns of the table o names": true
+ }
+}
+{
+ "grid": {
+  "a click lights a cell and its row; Shift+click a range, one outline round it, summed; Ctrl+C copies it (Shift: with the headers)": true,
+  "the keys move the cell (Shift: grow the range; Ctrl+A: everything)": true,
+  "the menu filters to a selection's values (a chip says so, and clears it)": true,
+  "a header's button sorts (again: the other way); its card tells its type, above the pointer (it hides no rows)": true,
+  "an answer of more than 10,000 rows turns its pages (1\u201310,000 \u25be \u2039 \u203a, the last page, Alt+Page Up): the node's rows, numbered on": true,
+  "grid: no page errors": true
+ }
+}
+{
+ "work": {
+  "tabs: one pinned stays at the left and isn't closed with the others; many scroll, and \u2304 lists them all": true,
+  "Format: the Run \u25be has Format file and Format selection (off with nothing selected); each formats what it says": true,
+  "Markdown drawn: headings, bold, italic, strikethrough, code, tasks, nested lists, tables (aligned), links (a lake file opens in a tab), pictures (read from the lake), SQL highlighted": true,
+  "a notebook's cell kinds are SQL, Python and Markdown; a Markdown cell draws its table": true,
+  "a SQL cell's answer has Chart and Plan (its graph), as a SQL file's pane; the chart open, and its settings, are kept with the notebook": true,
+  "a SQL cell: Data profile (a row a column), its right-click runs, formats, creates as, and makes it Python (db.sql) and back": true,
+  "between two cells, + SQL, + Python, + Markdown add one there": true,
+  "a SQL file's right-click has Run file, Format, Create as (a view made), Run as a job, Schedule, Save as; 100 rows a page (Settings; the pager's 1\u2013100 \u25be changes it too); a Data profile tab": true,
+  "the Data tree's right-click: a table's Preview, Script as (SELECT \u2026 DROP, SQL or Python), Insert, Add a column, Rename, Truncate, Drop; a view's has no Insert": true,
+  "the owner's second and third lists: no page errors": true
+ }
+}
+{
+ "layout": {
+  "a view moves to the other pane by its \u22ef (kept after a reload), and back": true,
+  "Settings: sections (Appearance, Editor and results, Layout, Keys, Python, About) and a search across them; Workspace first (Data first by default), and the dark theme": true,
+  "Settings are kept on the machine: another browser opens with the dark theme and the background picked; light is the first theme": true,
+  "the filter narrows the trees to the names that hold it (and what they are in); Esc clears it": true,
+  "Ctrl+B and Ctrl+Alt+B hide and show the side panes": true,
+  "a pane's edge sets its width (kept after a reload); a double-click resets it": true,
+  "the files open in tabs open again with the page": true,
+  "a narrow window: nothing scrolls sideways, the side panes are drawers, closed by using the page": true,
+  "axe finds nothing (WCAG 2.1 AA, contrast included, and its best practice), light and dark: a notebook, a SQL file, a data file": true,
+  "layout: no page errors": true
+ }
+}
+{
+ "budget": {
+  "the scripts and style sheet the page loads, gzipped as the node serves them: <= 70 KB; each answers 304 when the browser has it": true,
+  "those loaded when first used (a chart, a plan, History, details, a data file, Markdown, Jobs, Settings, the tree's menus, a Python file): <= 8 KB each, gzipped": true,
+  "first paint < 400 ms (the median of three)": true,
+  "the editor highlights a line at a time (the state a comment or quote leaves carried on), as the whole text highlighted": true,
+  "typing in a 1,000-line file: < 8 ms a key (the median, the page's work to its layout)": true,
+  "scrolling 10,000 rows: p95 frame < 20 ms": true,
+  "no code hidden after a // comment in the middle of a line (the node strips them)": true,
+  "budget: no page errors": true
+ }
+}
+{
+ "tokens": {
+  "a user signs in with its name and password (a session) and sees only what it may read; the shell's link (#key=\u2026) signs the page in as the shell, its key out of the address": true,
+  "with tokens, the page asks for one (Sign in), then shows the tables (and after a reload)": true,
+  "a session's Python variables are an admin's to read, as DO is": true
+ }
+}
+{
+ "server": {
+  "the server's console lists its databases (Databases); a cell runs in the one picked (/db/sales)": true,
+  "the server's console: every request went to the server; no page errors": true
+ }
+}
+{
+ "extensions": {
+  "an extension is served (/console/ext/0.js), and its section, panel tab, view of an answer and menu action show beside the console's own": true,
+  "with an extension: every request went to the node; no page errors": true
+ }
+}
+{"checks": 94, "passed": 94, "ok": true}

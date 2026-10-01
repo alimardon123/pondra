@@ -273,7 +273,7 @@ impl Pool {
         lent.worker = Some(spawn(self.path.as_deref()).await?);
         let _idle = self.idle.lock().unwrap(); // (the reaper decides to stop under this lock)
         if !self.reaping.swap(true, Ordering::SeqCst) {
-            tokio::spawn(reap(self.clone()));
+            crate::panics::spawn(reap(self.clone()));
         }
         Ok(lent)
     }
@@ -479,7 +479,7 @@ pub async fn ask_session(session: &str, head: Value, parts: Vec<Vec<u8>>, limit:
     let slot = {
         let mut all = KERNELS.lock().unwrap();
         if all.is_empty() {
-            tokio::spawn(reap_kernels()); // (only while there are some)
+            crate::panics::spawn(reap_kernels()); // (only while there are some)
         }
         let e = all.entry(session.to_string()).or_insert_with(|| (Slot::default(), Instant::now()));
         e.1 = Instant::now();

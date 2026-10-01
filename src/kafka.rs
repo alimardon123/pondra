@@ -37,7 +37,6 @@ use std::io::Read;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 
 /// The requests we answer and their version ranges (none needs the "flexible" encoding, except
@@ -95,25 +94,25 @@ struct Broker {
 
 /// Answer Kafka clients on `addr`; tell them to come back to `advertise` (host:port).
 pub async fn serve(app: App, addr: String, advertise: String) -> Result<()> {
-    let listener = TcpListener::bind(&addr).await?;
+    let mut doors = crate::tls::Doors::bind(&addr, crate::tls::Door::Kafka).await?; // (TLS too: `tls.rs`)
     let (host, port) = advertise.rsplit_once(':').ok_or_else(|| anyhow!("--kafka-advertise is host:port"))?;
     let id = (advertise.bytes().fold(0u32, |h, b| h.wrapping_mul(31).wrapping_add(b as u32)) & 0x7fff_ffff) as i32; // stable per address
     let me = Arc::new(Broker { id, host: host.into(), port: port.parse()? });
     let _ = ME.set(serde_json::json!({"id": me.id, "host": me.host, "port": me.port}));
-    loop {
-        let (socket, _) = listener.accept().await?;
-        socket.set_nodelay(true)?;
+    while let Some((socket, _)) = doors.next().await {
         let (app, me) = (app.clone(), me.clone());
         tokio::spawn(async move { conn(app, me, socket).await.map_err(|e| eprintln!("kafka client: {e:#}")) });
     }
+    Ok(())
 }
 
 type Reply = BoxFuture<'static, Option<Vec<u8>>>; // a response frame, or None (acks=0 produce)
 
 /// One client connection. Requests are read and started in order (produced rows are queued at
 /// once), and their responses are written in that order as each completes: many in flight.
-async fn conn(app: App, me: Arc<Broker>, socket: TcpStream) -> Result<()> {
-    let (mut rd, mut wr) = socket.into_split();
+async fn conn(app: App, me: Arc<Broker>, socket: crate::tls::Conn) -> Result<()> {
+    let from = Some(socket.peer().addr);
+    let (mut rd, mut wr) = tokio::io::split(socket);
     let (tx, mut rx) = mpsc::channel::<Reply>(64);
     let writer = tokio::spawn(async move {
         while let Some(reply) = rx.recv().await {
@@ -123,7 +122,7 @@ async fn conn(app: App, me: Arc<Broker>, socket: TcpStream) -> Result<()> {
         }
         anyhow::Ok(())
     });
-    let mut who = crate::auth::Principal::of(if app.open().await { Role::Admin } else { Role::None });
+    let mut who = crate::auth::Principal::of(if app.open().await { Role::Admin } else { Role::None }).at("kafka", from);
     while let Ok(size) = rd.read_i32().await {
         ensure!((0..=128 << 20).contains(&size), "request of {size} bytes");
         let mut buf = vec![0; size as usize];
@@ -283,8 +282,9 @@ async fn sasl_authenticate(app: &App, who: &mut crate::auth::Principal, ver: i16
         false => crate::users::sign_in(&app.lake, &app.auth, &user, &String::from_utf8_lossy(password)).await,
     };
     let ok = signed.is_some();
-    if let Some(p) = signed {
-        *who = p;
+    match signed {
+        Some(p) => *who = p.at("kafka", who.from),
+        None => crate::audit::refused(app, &user, "kafka", who.from, "sign in", "wrong user name or password"),
     }
     let mut w = vec![];
     w.put_i16(if ok { 0 } else { SASL_FAILED });
@@ -1111,7 +1111,7 @@ async fn find_coordinator(app: &App, me: &Broker, ver: i16, r: &mut Rd) -> Resul
 }
 
 async fn leader_broker(app: &App) -> Result<(i32, String, i32)> {
-    let b: Value = crate::cluster::http().get(format!("http://{}/cluster/kafka", app.cluster.leader.addr)).send().await?.error_for_status()?.json().await?;
+    let b: Value = crate::cluster::http().get(crate::tls::url(&format!("{}/cluster/kafka", app.cluster.leader.addr))).send().await?.error_for_status()?.json().await?;
     Ok((b["id"].as_i64().ok_or_else(|| anyhow!("the leader doesn't speak Kafka"))? as i32, b["host"].as_str().unwrap_or_default().into(), b["port"].as_i64().unwrap_or(-1) as i32))
 }
 

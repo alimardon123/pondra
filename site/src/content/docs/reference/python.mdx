@@ -19,7 +19,7 @@ db = pondra.connect("http://localhost:8080")
 
 | Call | Meaning |
 |---|---|
-| `pondra.connect(url="http://127.0.0.1:8080", token=None, **options)` | a connection to a node: with a token, or as a user (`user=`, `password=`: its password, or one of its tokens) |
+| `pondra.connect(url="http://127.0.0.1:8080", token=None, **options)` | a connection to a node: with a token, or as a user (`user=`, `password=`: its password, or one of its tokens); over HTTPS, `ca=` names a PEM file to trust besides the system's (a node's own certificate) |
 | `pondra.local(dir="lake", port=None, token=None, flags=(), timeout=120, python=True)` | start a node on a lake here (a folder or `s3://bucket/prefix`) and connect to it |
 | `pondra.current()` | the connection `pondra.sql` and its kin use |
 | `pondra.binary()` | the path of the `pondra` executable: `$PONDRA_BIN`, the one pip installed, or the one on `PATH` |
