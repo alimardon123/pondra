@@ -34,7 +34,18 @@ tea x 3  2  example.com
 Where both have a name and differ (Spark's `floor` of a `DOUBLE` is a `BIGINT`; its `substring`
 from a negative start counts from the end), DataFusion's is the one you get, unless the session
 speaks Spark: after `SET datafusion.sql_parser.dialect = 'spark'` (or `'databricks'`), Spark's are,
-and so are its `EXTRACT` and `SUBSTRING`.
+and so are its `EXTRACT` and `SUBSTRING`. Spark's are also there under names of their own
+(`spark_floor`, `spark_substring`, …), which a query in Spark's grammar, `spark_sql('…')`, calls
+where it says `floor`:
+
+```sql
+SELECT floor(2.5) AS pondra, spark_floor(2.5) AS spark, s.* FROM spark_sql('SELECT floor(-2.5) AS f, substring("Spark SQL", -3) AS s') s;
+```
+
+```text
+pondra  spark  f   s
+2.0     2      -3  SQL
+```
 
 ## JSON
 

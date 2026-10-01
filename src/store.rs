@@ -1569,18 +1569,39 @@ pub fn partitions() -> usize {
 
 /// Spark's functions whose names DataFusion doesn't have (`format_string`, `pmod`, `parse_url`,
 /// `sha2`, `collect_list`, …: PySpark's vocabulary in SQL). Where both have a name, DataFusion's
-/// stays, so no answer changes.
+/// stays, so no answer changes, and Spark's is there under a name of its own (`spark_floor`):
+/// `spark_sql('…')` calls it where Spark SQL names `floor` (`sparksql.rs`).
 fn spark(ctx: &SessionContext) {
+    let more = SPARK.get_or_init(|| spark_of(ctx));
+    more.scalar.iter().chain(&more.shared).for_each(|f| { ctx.register_udf(f.clone()); });
+    more.aggregate.iter().for_each(|f| { ctx.register_udaf(f.clone()); });
+}
+
+pub struct Spark {
+    scalar: Vec<datafusion::logical_expr::ScalarUDF>,
+    aggregate: Vec<datafusion::logical_expr::AggregateUDF>,
+    shared: Vec<datafusion::logical_expr::ScalarUDF>, // (Spark's of the names both have, renamed)
+    pub names: std::collections::HashMap<String, String>, // a name both have (or its alias) → Spark's here
+}
+
+static SPARK: std::sync::OnceLock<Spark> = std::sync::OnceLock::new();
+
+/// Spark's functions as every session has them (worked out once, against the first session's
+/// names: DataFusion's own, nothing else yet).
+pub fn spark_functions() -> &'static Spark {
+    SPARK.get_or_init(|| spark_of(&SessionContext::new()))
+}
+
+fn spark_of(ctx: &SessionContext) -> Spark {
     use datafusion::execution::FunctionRegistry;
-    use datafusion::logical_expr::{AggregateUDF, ScalarUDF};
-    static MORE: std::sync::OnceLock<(Vec<ScalarUDF>, Vec<AggregateUDF>)> = std::sync::OnceLock::new();
-    let more = MORE.get_or_init(|| {
-        // (worked out once, against the first session's names: DataFusion's own, nothing else yet)
-        let new = |name: &str, aliases: &[String]| std::iter::once(name).chain(aliases.iter().map(String::as_str)).all(|n| ctx.udf(n).is_err() && ctx.udaf(n).is_err() && ctx.udwf(n).is_err());
-        let scalar = datafusion_spark::all_default_scalar_functions().into_iter().filter(|f| new(f.name(), f.aliases()));
-        let aggregate = datafusion_spark::all_default_aggregate_functions().into_iter().filter(|f| new(f.name(), f.aliases()));
-        (scalar.map(|f| f.as_ref().clone()).collect(), aggregate.map(|f| f.as_ref().clone()).collect())
-    });
-    more.0.iter().for_each(|f| { ctx.register_udf(f.clone()); });
-    more.1.iter().for_each(|f| { ctx.register_udaf(f.clone()); });
+    let new = |name: &str, aliases: &[String]| std::iter::once(name).chain(aliases.iter().map(String::as_str)).all(|n| ctx.udf(n).is_err() && ctx.udaf(n).is_err() && ctx.udwf(n).is_err());
+    let (scalar, shared): (Vec<_>, Vec<_>) = datafusion_spark::all_default_scalar_functions().into_iter().partition(|f| new(f.name(), f.aliases()));
+    let aggregate = datafusion_spark::all_default_aggregate_functions().into_iter().filter(|f| new(f.name(), f.aliases()));
+    let names = shared.iter().flat_map(|f| std::iter::once(f.name().to_string()).chain(f.aliases().iter().cloned()).map(|n| (n, format!("spark_{}", f.name())))).collect();
+    Spark {
+        scalar: scalar.iter().map(|f| f.as_ref().clone()).collect(),
+        aggregate: aggregate.map(|f| f.as_ref().clone()).collect(),
+        shared: shared.iter().map(crate::sparksql::renamed).collect(),
+        names,
+    }
 }

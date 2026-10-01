@@ -477,6 +477,7 @@ pub fn bind(sql: &str, params: &HashMap<String, Value>) -> Result<String> {
     if !sql.contains('$') {
         return Ok(sql.to_string());
     }
+    let sql = &crate::sparksql::inline(sql)?; // (a parameter of Spark SQL's is in its text: bound once it is Pondra's)
     let mut stmts = Parser::parse_sql(&GenericDialect {}, sql)?;
     let values = params.iter().map(|(k, v)| Ok((k.clone(), literal(v)?))).collect::<Result<HashMap<_, _>>>()?;
     let mut missing: Vec<String> = vec![];
@@ -529,6 +530,7 @@ async fn expand_with(lake: &Lake, sql: &str, views: &HashMap<String, String>) ->
     if let Some(q) = show(sql) {
         return Ok(q);
     }
+    let sql = &crate::sparksql::inline(sql)?; // (`spark_sql('…')`: Spark SQL as Pondra's, then expanded as any)
     let all = listed(lake).await?;
     let outside = crate::ext::attached(lake).await?;
     let named = |n: &String| crate::ddl::mentions(sql, n);

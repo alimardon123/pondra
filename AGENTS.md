@@ -1207,7 +1207,8 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    /tables/{name}` may be sent again (it may add columns at the end).
 190. **Spark's functions never change DataFusion's answers by default** (`store::spark`): only
    names DataFusion doesn't have are registered. Spark's versions of shared names come only with
-   `datafusion.sql_parser.dialect = 'spark' | 'databricks'` (`settings::apply`).
+   `datafusion.sql_parser.dialect = 'spark' | 'databricks'` (`settings::apply`), or under names of
+   their own (`spark_floor`, `sparksql::renamed`), which only `spark_sql('…')` writes for them.
 191. **sqllogictest exceptions are named, never a bucket** (`tools/slt_check.py` `EXCEPTIONS`): a
    failure left out of the pass rate matches a rule with its reason (plan text, a write explained,
    what the runner makes in Rust, the node's memory, microseconds, an order no query asked for).
@@ -1231,6 +1232,18 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    is named: a write never runs twice.
 195. **The work runs on an 8 MB stack on every OS** (`main.rs`): Windows gives its main thread 1 MB;
    a session's making and DataFusion's planning need more there than Linux's main thread lets on.
+   Tokio's workers get 8 MB too (`thread_stack_size`): at its 2 MB, the dist build's
+   "procedures calling procedures stop 16 deep" (`harness.py procedures`) overflowed one and
+   killed the node (CI, PR #2); 4 MB passed.
+196. **Spark SQL is turned into Pondra's where SQL comes in, and nowhere else** (`sparksql::inline`,
+   from `routines::expand` and `routines::bind`): `spark_sql('…')` in a FROM becomes a subquery in
+   Pondra's SQL (Spark's grammar read by `SparkSqlDialect`; `"text"`, `DIV`, `<=>`, `!`, `RLIKE`,
+   `LATERAL VIEW`, `explode`, and the names both have as `spark_<name>`), so a frame built on it,
+   a view of it, a spread query or a macro sees plain SQL; it takes a query only. A query that is
+   `SELECT * FROM spark_sql('…')` alone becomes that query itself, so its sort holds (DataFusion
+   drops a subquery's, and Spark sorts by columns it leaves out); a frame's later steps sort again
+   only by columns it kept. PySpark's `spark.sql` sends its queries this way, its writes as
+   Pondra's SQL. `harness.py sparksql` (its "by a column it leaves out" fails without the first).
 
 ## Tests: run these before and after any change
 
@@ -1242,6 +1255,7 @@ python3 tools/harness.py safety         # panics answered as errors, TLS at ever
 python3 tools/fuzz_doors.py --secs 60   # malformed input at HTTP, SQL, Postgres, Kafka and Flight: the node stays up
 python3 tools/harness.py versions       # every file keeps its versions: listed, read, restored, after a delete, retention, old notebooks
 python3 tools/harness.py stopped        # a run whose node was killed under it: stopped, not running for good
+python3 tools/harness.py sparksql       # spark.sql / spark_sql('…') in Spark's grammar: literals, LATERAL VIEW, Spark's floor and substring, frames on top, refusals
 python3 tools/harness.py pipelines      # views of views in one commit, rollups, expectations (keep, drop, fail), changes down the pipeline
 python3 tools/harness.py begin          # BEGIN … COMMIT from every door, read-your-writes, 40001 and retries, 25P02, SQLSTATEs
 python3 tools/bench/pgbench.py          # pgbench's own TPC-B script, 1 and 4 clients: the balances agree (--postgres: Postgres too)

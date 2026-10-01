@@ -62,6 +62,7 @@ mod routines;
 mod scan;
 mod server;
 mod spill;
+mod sparksql;
 mod spmd;
 mod store;
 mod sys;

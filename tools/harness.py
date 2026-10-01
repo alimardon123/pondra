@@ -5930,7 +5930,75 @@ def objects():
     node.kill()
     ok = all(checks.values())
     print(json.dumps({"objects": checks, "ok": ok, "info": info}, indent=1, default=str))
-    return ok
+    if not ok:
+        sys.exit(1)
+
+
+def sparksql():
+    """Spark SQL where PySpark code sends it (H8): `spark.sql(…)` read with Spark's grammar and
+    turned into Pondra's SQL (`spark_sql('…')`): `"text"`, backticks, `LATERAL VIEW [OUTER]
+    explode`, `explode`, `DIV`, `<=>`, `RLIKE`, Spark's answers for names both have; frames built on
+    it, its sort, `args` and `{df}`; the SQL door's `spark_sql`, a view over it, and what it refuses.
+    Pondra's own SQL answers as before."""
+    lake = new_lake()
+    node = Node(lake, A.port).start()
+    db = _client(A.port)
+    from pondra.spark import SparkSession, functions as F
+    spark = SparkSession(db)
+    q = lambda s: sql(A.port, s)
+    checks, info = {}, {}
+    q("CREATE TABLE people AS SELECT id, name, xs, CAST(d AS DOUBLE) AS d FROM (VALUES (1, 'ann', make_array(1, 2, 3), 2.5), (2, 'bob', make_array(4), -2.5), "
+      "(3, 'cy', CAST(make_array() AS BIGINT[]), 0.5), (4, 'dee', CAST(NULL AS BIGINT[]), 7.5)) AS v(id, name, xs, d)")  # (Spark's floor of a DOUBLE is a BIGINT; 2.5 is a DECIMAL, whose floor has scale 0)
+    rows = lambda df: [r.asDict() for r in df.collect()]
+    got = {
+        "text": rows(spark.sql('SELECT "hi" AS s, `name` FROM people WHERE name = "ann"')),
+        "floor": rows(spark.sql("SELECT id, floor(d) AS f, ceil(d) AS c FROM people ORDER BY id")),
+        "substring": rows(spark.sql("SELECT substring('Spark SQL', 5, 1) AS a, substring('Spark SQL', -3, 2) AS b, substr('Spark SQL', -3) AS c")),
+        "ours": q("SELECT floor(CAST(2.5 AS DOUBLE)) AS f, substring('Spark SQL', -3, 2) AS b"),
+        "lateral": rows(spark.sql("SELECT id, x FROM people LATERAL VIEW explode(xs) v AS x ORDER BY id, x")),
+        "outer": rows(spark.sql("SELECT p.name, v.e FROM people p LATERAL VIEW OUTER explode(p.xs) v AS e WHERE p.id >= 2 ORDER BY p.name, v.e")),
+        "two": rows(spark.sql("SELECT id, a, b FROM people LATERAL VIEW explode(xs) v AS a LATERAL VIEW explode(xs) w AS b WHERE id = 1 ORDER BY a, b"))[:4],
+        "explode": rows(spark.sql("SELECT explode(xs) FROM people WHERE id = 1")),
+        "operators": rows(spark.sql("SELECT 7 DIV 2 AS d, -7 DIV 2 AS e, NULL <=> NULL AS n, 'abc' RLIKE 'b' AS r, !(1 = 2) AS t")),
+        "composed": rows(spark.sql("SELECT id, floor(d) AS f FROM people").where(F.col("f") > 0).orderBy("id")),
+        "sorted": [r["id"] for r in rows(spark.sql("SELECT id FROM people ORDER BY id DESC"))],
+        "sorted out": [r["name"] for r in rows(spark.sql("SELECT name FROM people ORDER BY d DESC"))] + [r["name"] for r in sql(A.port, "SELECT * FROM spark_sql('SELECT name FROM people ORDER BY d')")],
+        "args": [r["id"] for r in rows(spark.sql("SELECT id FROM people WHERE id > :m ORDER BY id", args={"m": 2}))],
+        "frame": rows(spark.sql("SELECT count(*) AS n FROM {d} WHERE `name` <> \"bob\"", d=spark.table("people"))),
+        "door": q("SELECT f, arrow_typeof(f) AS t FROM spark_sql('SELECT floor(CAST(2.5 AS DOUBLE)) AS f')"),
+    }
+    q("CREATE VIEW floors AS SELECT * FROM spark_sql('SELECT id, floor(d) AS f FROM people')")
+    got["view"] = q("SELECT sum(f) AS s FROM floors")
+    refused = {
+        "a statement that isn't a query": _raises_text(lambda: q("SELECT * FROM spark_sql('INSERT INTO people SELECT * FROM people')")),
+        "posexplode": _raises_text(lambda: q("SELECT * FROM spark_sql('SELECT id, p, x FROM people LATERAL VIEW posexplode(xs) v AS p, x')")),
+        "a lateral view over a join": _raises_text(lambda: q("SELECT * FROM spark_sql('SELECT * FROM people a JOIN people b ON a.id = b.id LATERAL VIEW explode(a.xs) v AS x')")),
+    }
+    info.update(got=got, refused=refused)
+    checks['"text" is a string, `name` a name'] = got["text"] == [{"s": "hi", "name": "ann"}]
+    checks["floor and ceil answer as Spark's (whole numbers, BIGINT), and Pondra's own SQL as before (a DOUBLE)"] = \
+        got["floor"] == [{"id": 1, "f": 2, "c": 3}, {"id": 2, "f": -3, "c": -2}, {"id": 3, "f": 0, "c": 1}, {"id": 4, "f": 7, "c": 8}] \
+        and all(type(r["f"]) is int for r in got["floor"]) and got["ours"][0]["f"] == 2.0 and isinstance(got["ours"][0]["f"], float)
+    checks["substring and substr as Spark's (a negative start counts from the end), Pondra's as before"] = \
+        got["substring"] == [{"a": "k", "b": "SQ", "c": "SQL"}] and got["ours"][0]["b"] != "SQ"
+    checks["LATERAL VIEW explode: a row a value, none for an empty or NULL array"] = \
+        got["lateral"] == [{"id": 1, "x": 1}, {"id": 1, "x": 2}, {"id": 1, "x": 3}, {"id": 2, "x": 4}]
+    checks["LATERAL VIEW OUTER: a NULL for an empty or NULL array; the view's columns by its name, the table's by its alias"] = \
+        got["outer"] == [{"name": "bob", "e": 4}, {"name": "cy", "e": None}, {"name": "dee", "e": None}]
+    checks["two lateral views cross, not pair"] = got["two"] == [{"id": 1, "a": 1, "b": 1}, {"id": 1, "a": 1, "b": 2}, {"id": 1, "a": 1, "b": 3}, {"id": 1, "a": 2, "b": 1}]
+    checks["explode in the select list: named col, as Spark names it"] = got["explode"] == [{"col": 1}, {"col": 2}, {"col": 3}]
+    checks["DIV, <=>, RLIKE, !"] = got["operators"] == [{"d": 3, "e": -3, "n": True, "r": True, "t": True}]
+    checks["a frame built on spark.sql composes; its ORDER BY is kept, by a column it leaves out too; args; {df}"] = \
+        got["composed"] == [{"id": 1, "f": 2}, {"id": 4, "f": 7}] and got["sorted"] == [4, 3, 2, 1] \
+        and got["sorted out"] == ["dee", "ann", "cy", "bob", "bob", "cy", "ann", "dee"] and got["args"] == [3, 4] and got["frame"] == [{"n": 3}]
+    checks["spark_sql('…') from any door, and a view over it"] = got["door"] == [{"f": 2, "t": "Int64"}] and got["view"] == [{"s": 6}]
+    checks["refused by name: " + ", ".join(refused)] = "takes a query" in refused["a statement that isn't a query"] and "posexplode" in refused["posexplode"] \
+        and "over a join" in refused["a lateral view over a join"]
+    node.kill()
+    ok = all(checks.values())
+    print(json.dumps({"sparksql": checks, "ok": ok, "info": info}, indent=1, default=str))
+    if not ok:
+        sys.exit(1)
 
 
 def doors():
@@ -6068,7 +6136,7 @@ finally {{ await db.close?.(); }}"""
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    out = {t.__name__: t() for t in (upsert, deal, outside, clouds, kafkas, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, found, renames, workspace, server, scale, flight, users, secrets, safety, versions, stopped, pipelines, begin, doors, objects, reader, crash)}
+    out = {t.__name__: t() for t in (upsert, deal, outside, clouds, kafkas, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, found, renames, workspace, server, scale, flight, users, secrets, safety, versions, stopped, pipelines, begin, doors, objects, sparksql, reader, crash)}
     A.secs = min(A.secs, 20)
     out["load"] = load()
     print(json.dumps(out, indent=1))
@@ -6076,7 +6144,7 @@ def all_tests():
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "found", "renames", "workspace", "server", "scale", "flight", "users", "secrets", "safety", "versions", "stopped", "pipelines", "begin", "doors", "objects", "load", "all"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "found", "renames", "workspace", "server", "scale", "flight", "users", "secrets", "safety", "versions", "stopped", "pipelines", "begin", "doors", "objects", "sparksql", "load", "all"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -6087,4 +6155,4 @@ if __name__ == "__main__":
     ap.add_argument("--secs", type=int, default=30)
     ap.add_argument("--flush-ms", type=int, default=250)
     A = ap.parse_args()
-    {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "safety": safety, "versions": versions, "stopped": stopped, "pipelines": pipelines, "begin": begin, "doors": doors, "objects": objects, "load": load, "all": all_tests}[A.mode]()
+    {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "safety": safety, "versions": versions, "stopped": stopped, "pipelines": pipelines, "begin": begin, "doors": doors, "objects": objects, "sparksql": sparksql, "load": load, "all": all_tests}[A.mode]()

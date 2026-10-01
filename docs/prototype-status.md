@@ -32,17 +32,25 @@ Python in one notebook** (the owner's list after the first part):
    Python reads it (through `db.sql`, which sends it along).
 4. **Versions…** shows a notebook's changes cell by cell (a cell the same folded, one added or gone
    whole), each cell's lines highlighted as its language; SQL and Python files highlighted too.
-5. **The build of `0253f18`**: Windows' node never started (its main thread has 1 MB of stack, and
+5. **Spark SQL in `spark.sql`** (H8, invariant 196): PySpark's `spark.sql` reads its query with
+   Spark's grammar (backticks, `"text"`, `!`, `DIV`, `<=>`, `RLIKE`, `LATERAL VIEW [OUTER]
+   explode`, `explode` named `col`) and Spark's functions where both have a name and differ
+   (`floor` a `BIGINT`, `substring` from a negative start), turned into Pondra's SQL where SQL
+   comes in: `spark_sql('…')` in any FROM, from any door; Spark's versions of shared names are
+   `spark_floor`, `spark_substring`, … in every session, DataFusion's answers unchanged.
+6. **The build of `0253f18`**: Windows' node never started (its main thread has 1 MB of stack, and
    round 31 made a whole session state there): the work runs on an 8 MB thread on every OS
    (invariant 195), and Spark's functions are found against the first session; the columns suite
-   waits for a renamed table's streamed rows.
-6. **Found on the way:** a view fed by a topic made again under its name kept running its old query
+   waits for a renamed table's streamed rows. The pull request's own build then found tokio's 2 MB
+   workers too small for 16 procedures calling each other in the release build: they get 8 MB.
+7. **Found on the way:** a view fed by a topic made again under its name kept running its old query
    from where it was, and never filled: a shard now ends when its feed changes or goes, and a feed
    dropped leaves the sequencer's memory (invariant 78's rule for views). And a table renamed soon
    after an `UPDATE` could show the changed rows' old versions again, for good: the rename sent the
    table's log rows to files first, but not its `{t}$deleted`'s, which were left under the old name
    (`harness.py columns` failed on it now and then; the rename now does both, invariant 129).
-7. **Tests:** `harness.py objects` (new, 13 checks, a Pondra node's Kafka port as the topic);
+8. **Tests:** `harness.py objects` (new, 13 checks, a Pondra node's Kafka port as the topic);
+   `harness.py sparksql` (new);
    `console_check.py` in every part (two new checks; axe clean; the first load 71,563 bytes of
    71,680, the cell's Python side moved to `more.js` to make room); the changed docs pages' 43
    examples; `harness.py` workspace, procedures, temps, pipelines, external, schemas, secrets,

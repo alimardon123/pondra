@@ -55,6 +55,7 @@ on bytes as they do on text. A `CAST` to bytes takes `BYTEA` only.
 | `DESCRIBE t`, `SHOW TABLES`, `SHOW COLUMNS FROM t` | what the lake holds |
 | `SHOW VIEWS`, `SHOW MATERIALIZED VIEWS [LIKE 'p%']`, `SELECT … FROM pondra.tables` | each table and view with its kind (see [system tables](/pondra/reference/system-columns/#tables-and-views)) |
 | `SELECT … FROM 'file.parquet'` | a file or URL as a table (see [names](/pondra/reference/names/)) |
+| `SELECT … FROM spark_sql('SELECT …')` | a query in Spark SQL's grammar, with Spark's functions (PySpark's `spark.sql` sends this) |
 
 ```sql
 CREATE TABLE orders (id BIGINT, item VARCHAR, qty INT, amount DOUBLE);
