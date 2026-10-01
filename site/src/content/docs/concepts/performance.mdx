@@ -137,10 +137,10 @@ More streaming numbers:
   sinks. Round 21 had measured 8.7 to 10.9 s against Flink's 24.3 to 25.0 s: Pondra is slower over
   10 million bids than it was then, while the gates' 2-million-bid run has held at 2.75 to 2.98 s
   since round 29.
-- **A pipeline** (views following views, [Pipelines](/pondra/guides/pipelines/)): 4 producers, 1,000-row
+- **A flow** (views following views, [Flows](/pondra/guides/flows/)): 4 producers, 1,000-row
   batches over HTTP: no view 183,000 rows a second; a filter with two expectations 156,000; then an
   aggregate of it 135,000; then a rollup of that 131,000. At every acknowledgement each stage already
-  has the rows: a pipeline is one commit.
+  has the rows: a flow is one commit.
 
 Flink has timers, CEP, Top-N and very large keyed state that Pondra doesn't. See
 [Pondra compared](/pondra/concepts/compared/).

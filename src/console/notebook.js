@@ -49,20 +49,16 @@ export class Cell {
     this.status = h('span', { class: 'st', 'aria-live': 'polite' });
     // (a SQL cell's answer, a frame, in the page's Python under this name: `%%sql df <<` in the file)
     this.as = /^\w+$/.test(o.as || '') ? o.as : '';
-    this.asEl = h('input', { class: 'as', value: this.as, placeholder: '→ name', spellcheck: 'false', 'aria-label': 'Name its answer in Python', title: 'Its answer, a frame in the page\'s Python of this name',
-      onchange: e => { this.as = e.target.value.trim().replace(/\W/g, ''); e.target.value = this.as; this.nb.changed(); } });
+    this.asEl = h('label', { class: 'as', title: 'Its answer as a frame of this name in the notebook\'s Python, for a Python cell to use (empty: not named)' }, icon('filepy'), 'Result in Python:',
+      h('input', { value: this.as, placeholder: 'name it', spellcheck: 'false', 'aria-label': 'Its answer\'s name in Python', onchange: e => { this.as = e.target.value.trim().replace(/\W/g, ''); e.target.value = this.as; this.nb.changed(); } }));
     const tool = (ic, title, fn) => h('button', { class: 'icon', title, 'aria-label': title, onclick: fn }, icon(ic));
     const i = () => nb.cells.indexOf(this);
     this.bar = h('div', { class: 'bar' }, this.num, this.kindSel, this.runBtn, this.liveEl, this.asEl, this.status,
       h('span', { class: 'tools' }, tool('arrowUp', 'Move up', () => nb.move(this, -1)), tool('arrowDown', 'Move down', () => nb.move(this, 1)),
         tool('plus', 'Add a cell below (B)', () => nb.add({ kind: this.kind === 'markdown' ? 'sql' : this.kind }, this, true).edit()),
-        tool('dots', 'More', e => menu(e.currentTarget, [{ label: 'Run the cells above', icon: 'arrowUp', run: () => nb.runSome(0, i()) }, { label: 'Run this and the cells below', icon: 'arrowDown', run: () => nb.runSome(i()) }, '-',
-          { label: 'Add a cell above', icon: 'plus', keys: 'A', run: () => nb.add({ kind: this.kind === 'markdown' ? 'sql' : this.kind }, this, false).edit() }, { label: 'Add a cell below', keys: 'B', run: () => nb.add({ kind: this.kind === 'markdown' ? 'sql' : this.kind }, this, true).edit() }, '-',
-          { label: this.el.classList.contains('folded') ? 'Show the output' : 'Hide the output', icon: 'eye', keys: 'O', run: () => this.fold() }, { label: 'Clear the output', icon: 'clear', run: () => this.clear() }, '-',
-          ...[...R.kinds.values()].map(k => ({ label: `Make it ${k.label}`, checked: k.id === this.kind, run: () => { this.setKind(k.id); this.edit(); } })), '-',
-          { label: 'Delete the cell', icon: 'trash', keys: 'D D', run: () => nb.remove(this) }]))));
+        tool('dots', 'More', e => { const at = e.currentTarget; import('./more.js').then(m => m.cellMenu(this, at)); })));
     this.ed = new Editor({ grow: true, value: o.src || '', label: 'Code', oninput: () => nb.changed(), onkey: e => this.key(e) });
-    this.ed.menu = () => ['-', { label: 'Run cell', icon: 'play', keys: 'Ctrl Enter', run: () => this.run() }, { label: 'Run the cells above', run: () => nb.runSome(0, i()) }, { label: 'Run this and the cells below', run: () => nb.runSome(i()) },
+    this.ed.menu = () => ['-', { label: 'Run cell', icon: 'play', keys: 'Ctrl Enter', run: () => this.run() }, this.kind === 'sql' ? { label: 'Explain: its plan, not run', icon: 'plan', keys: 'Ctrl Shift E', run: () => this.explain() } : null, { label: 'Run the cells above', run: () => nb.runSome(0, i()) }, { label: 'Run this and the cells below', run: () => nb.runSome(i()) },
       ...this.fmt ? ['-', ...this.ed.formats(this.fmt, 'cell', true)] : [], this.kind === 'sql' ? '-' : null, this.kind === 'sql' ? { label: 'Create as table or view…', icon: 'plus', run: () => R.helpers.createAs(this.src) } : null,
       ...['sql', 'python'].filter(k => k !== this.kind && this.kind !== 'markdown').map(k => ({ label: k === 'sql' ? 'Make it SQL' : 'Make it Python', run: () => this.setKind(k) }))];
     this.ta = this.ed.ta;
@@ -120,11 +116,14 @@ export class Cell {
     }
     if (e.key === 'Escape') { e.preventDefault(); this.ta.blur(); this.el.focus({ preventScroll: true }); return true; }
     if (e.shiftKey && e.altKey && e.key.toLowerCase() === 'f' && this.fmt) { e.preventDefault(); this.format(); return true; }
+    if (e.shiftKey && (e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'e' && this.kind === 'sql') { e.preventDefault(); this.explain(); return true; }
     return false;
   }
   /** How its kind is formatted: SQL here, Python by the node's Python (ruff or black); Markdown isn't. */
   get fmt() { return this.kind === 'sql' ? formatSql : this.kind === 'python' ? formatPython : null; }
   format() { if (this.fmt) this.ed.reformat(this.fmt); }
+  /** Explain: the plan of what is selected, or of its last statement, without running it. */
+  explain() { this.show(R.helpers.explain(this.ed.selected() || this.src)); }
   async run() {
     if (!this.type.run) { drawMd(this.md, this.src); this.ta.blur(); this.el.focus({ preventScroll: true }); return { kind: 'done' }; }
     const text = this.src.trim();
@@ -162,7 +161,7 @@ export class Cell {
     this.out.replaceChildren(...answer(r, this));
     if (saved) this.out.append(h('div', { class: 'meta' }, h('span', { class: 'badge', title: 'As it was when the notebook was saved: run the cell for the answer now' }, 'saved')));
     this.status.className = 'st' + (r.kind === 'error' ? ' bad' : '');
-    this.status.textContent = saved || r.kind === 'rows' ? '' : r.kind === 'error' ? `failed · ${secs(r.ms)}` : secs(r.ms); // (rows: their count and time under them)
+    this.status.textContent = saved || r.kind === 'rows' || r.kind === 'plan' ? '' : r.kind === 'error' ? `failed · ${secs(r.ms)}` : secs(r.ms); // (rows: their count and time under them)
   }
   setLive(on) {
     this.liveBox.checked = on;

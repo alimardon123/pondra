@@ -396,14 +396,16 @@ function hashNow() {
 // ------------------------------------------------------------------ the Data view: databases, schemas, tables, views, columns
 const KIND = { table: ['table', 'table'], view: ['view', 'view'], 'materialized view': ['matview', 'materialized view'], files: ['files', 'view of files'] };
 async function catalog() {
-  const [tables, columns, objects] = await Promise.all([
+  const [tables, columns, objects, schemata] = await Promise.all([
     rows(`SELECT table_catalog AS c, table_schema AS s, table_name AS t, table_type AS k FROM information_schema.tables WHERE table_schema <> 'information_schema' AND table_schema NOT IN (SELECT catalog_name FROM information_schema.schemata) ORDER BY 1, 2, 3`),
     rows(`SELECT table_catalog AS c, table_schema AS s, table_name AS t, column_name AS n, data_type AS d FROM information_schema.columns WHERE table_schema <> 'information_schema' ORDER BY 1, 2, 3, ordinal_position`),
     call('/objects').then(r => r.json(), () => ({ objects: [] })),
+    rows(`SELECT catalog_name AS c, schema_name AS s FROM information_schema.schemata WHERE schema_name <> 'information_schema' AND schema_name NOT IN (SELECT catalog_name FROM information_schema.schemata)`),
   ]);
   S.filesAt = objects.files;
   const about = new Map(objects.objects.map(o => [`${o.catalog}\u0000${o.schema}\u0000${o.name}`, o]));
   const lakes = new Map(), find = new Map();
+  for (const x of schemata) (lakes.get(x.c) || lakes.set(x.c, new Map()).get(x.c)).set(x.s, []); // (a schema with no tables yet too)
   for (const t of tables) {
     const schemas = lakes.get(t.c) || lakes.set(t.c, new Map()).get(t.c);
     const list = schemas.get(t.s) || schemas.set(t.s, []).get(t.s);
@@ -421,25 +423,26 @@ function lakeNode(name, schemas, current, note, depth = 0) {
   const kids = schemas ? h('div', { class: 'kids', role: 'group', hidden: !openKey(key, current) }) : null;
   if (schemas) {
     const names = [...schemas.keys()].sort((a, b) => (a !== 'public') - (b !== 'public') || a.localeCompare(b));
-    kids.append(...names.map(s => schemaNode(name, s, schemas.get(s), names.length === 1)));
+    kids.append(...names.map(s => schemaNode(name, s, schemas.get(s), names.length === 1, current)));
     if (!names.length) kids.append(h('div', { class: 'empty' }, 'No tables yet.'));
-    if (current) kids.append(...(R.objectKinds || []).map(g => groupNode(name, g)));
+    if (current) kids.append(...(R.objectKinds || []).filter(g => !g.schema).map(g => groupNode(name, g)));
   }
   return treeItem({ key, kids, depth, icon: 'db', iconCls: 'k-db', name, cls: current ? 'cur' : '', meta: note, dataKind: 'database', menu: e => objects(m => m.lakeMenu(e, name, current)),
     title: MODE === 'lakes' && !current ? `Use database ${name}` : name, onclick: tw => { if (MODE === 'lakes' && name !== S.db) use(name); else tw.click(); } });
 }
-/** The lake's other objects, a group each (functions, procedures, schedules, secrets; users and
- * roles, pipelines, an extension's: `register.objectKind`), filled when opened (objects.js). */
+/** The lake's other objects, a group each (secrets; users and roles, flows, an extension's:
+ * `register.objectKind`), and a schema's (`schema: true`: functions, procedures, schedules, as
+ * Postgres keeps them), filled when opened (objects.js). */
 const objects = f => import('./objects.js').then(f);
-function groupNode(lake, g) {
-  const key = `g:${lake}.${g.id}`, kids = h('div', { class: 'kids', role: 'group', hidden: !S.open.has(key) }, h('div', { class: 'empty' }, '…'));
-  const fill = () => objects(m => m.fill(g.id, kids));
+function groupNode(lake, g, schema) {
+  const key = `g:${lake}.${schema ? schema + '.' : ''}${g.id}`, kids = h('div', { class: 'kids', role: 'group', hidden: !S.open.has(key) }, h('div', { class: 'empty' }, '…'));
+  const fill = () => objects(m => m.fill(g.id, kids, schema));
   if (!kids.hidden) fill();
-  return treeItem({ key, kids, depth: 1, icon: g.icon, iconCls: 'k-group', name: g.title, dataKind: 'group', onopen: fill, onclick: tw => tw.click(), menu: e => objects(m => m.groupMenu(e, g.id)) });
+  return treeItem({ key, kids, depth: schema ? 2 : 1, icon: g.icon, iconCls: 'k-group', name: g.title, dataKind: 'group', onopen: fill, onclick: tw => tw.click(), menu: e => objects(m => m.groupMenu(e, g.id, schema)) });
 }
-function schemaNode(lake, schema, tables, only) {
+function schemaNode(lake, schema, tables, only, current) {
   const key = `s:${lake}.${schema}`;
-  const kids = h('div', { class: 'kids', role: 'group', hidden: !openKey(key, only || schema === 'public') }, tables.map(t => tableNode(t)));
+  const kids = h('div', { class: 'kids', role: 'group', hidden: !openKey(key, only || schema === 'public') }, tables.map(t => tableNode(t)), current ? (R.objectKinds || []).filter(g => g.schema).map(g => groupNode(lake, g, schema)) : null);
   return treeItem({ key, kids, depth: 1, icon: 'schema', iconCls: 'k-schema', name: schema, title: `schema ${schema}`, dataKind: 'schema', onclick: tw => tw.click(), menu: e => objects(m => m.schemaMenu(e, lake, schema)) });
 }
 function tableNode(t) {
@@ -478,6 +481,7 @@ async function dataTree(box) {
   mark(); detail();
 }
 H.newDatabase = () => newDatabase();
+H.explain = (sql, params) => ({ kind: 'plan', sql: lastStatement(sql), params });
 // (the objects' menus, loaded as the pointer first comes over the Data tree: open at once when asked for)
 const warm = e => { if (e.target.closest?.('#data')) { removeEventListener('pointerover', warm); import('./objects.js'); } };
 addEventListener('pointerover', warm, { passive: true });
@@ -645,29 +649,10 @@ function signin() {
   menu($('#signin'), [{ label: 'Sign in as someone else…', icon: 'key', run: () => askToken('A token this node takes') }, { label: 'Sign out', icon: 'close', run: () => { store.set('pondra.token', null); store.set('pondra.user', null); drawSignin(); refresh(); } }]);
 }
 function drawSignin() { const b = $('#signin'), on = !!T.token(), who = store.get('pondra.user'); b.replaceChildren(icon(on ? 'key' : 'user'), on ? who || 'Signed in' : 'Sign in'); b.classList.toggle('on', on); }
-function askToken(why) {
-  const d = $('#tokenDlg');
-  if (d.open) return;
-  $('#tokenWhy').textContent = `${why}; or a user's name and password. It is kept in this browser only.`;
-  $('#tokenIn').value = store.get('pondra.user') ? '' : store.get('pondra.token') || '';
-  $('#userIn').value = store.get('pondra.user') || '';
-  d.returnValue = '';
-  d.showModal();
-}
+// (the sign-in dialog: settings.js)
+const askToken = async why => (await import('./settings.js')).askToken(why);
 ask.token = askToken;
-$('#tokenDlg').addEventListener('close', async () => {
-  const v = $('#tokenDlg').returnValue, user = $('#userIn').value.trim(), secret = $('#tokenIn').value.trim();
-  if (v === 'clear') { store.set('pondra.token', null); store.set('pondra.user', null); }
-  else if (v !== 'ok' || !secret) return;
-  else if (!user) { store.set('pondra.token', secret); store.set('pondra.user', null); }
-  else {
-    // (a user: a session for it, which the node signs: `POST /login`)
-    const r = await fetch(new URL('login', location.href), { method: 'POST', body: JSON.stringify({ user, password: secret }) });
-    if (!r.ok) { toast(await r.text(), true); return askToken('Sign in again'); }
-    store.set('pondra.token', (await r.json()).token); store.set('pondra.user', user);
-  }
-  drawSignin(); refresh();
-});
+H.drawSignin = drawSignin;
 function drawActions() {
   $('#moreBtn').hidden = !R.actions.some(a => a.menu && !a.hidden?.());
   $('#actions').replaceChildren(...R.actions.filter(a => !a.menu && !a.hidden?.()).map(a => h('button', { class: a.label ? 'btn' + (a.primary ? ' primary' : '') : 'icon', id: a.id + 'Btn', title: a.title, 'aria-label': a.title, onclick: e => a.run(e) }, a.icon ? icon(a.icon) : null, a.label || null)));
@@ -728,6 +713,8 @@ function core() {
     views: cell?.kind === 'sql' ? [['plan', 'Plan', 'plan', () => import('./plan.js').then(m => m.planView(lastStatement(r.src || cell.src)))]] : [] }) });
   register.renderer({ id: 'figures', order: 30, match: r => r.kind === 'done' && Array.isArray(r.value?.images), render: r => h('div', { class: 'figs' }, r.value.images.map(b => h('img', { class: 'fig', alt: 'a figure the code drew', src: 'data:image/png;base64,' + b }))) });
   register.renderer({ id: 'text', order: 40, match: r => r.kind === 'text', render: r => said(r.text) });
+  // (Explain: a statement's plan, not run: H.explain)
+  register.renderer({ id: 'plan', order: 50, match: r => r.kind === 'plan', render: r => { const box = h('div', { class: 'wait' }, 'Reading the plan…'); import('./plan.js').then(m => box.replaceWith(m.planView(r.sql, r.params))); return box; } });
   register.renderer({ id: 'done', order: 90, match: r => r.kind === 'done', render: r => { const d = doneText(r.value) || (r.notices?.length ? '' : 'Done.'); return d && !(d === 'Done.' && r.notices?.length) ? h('div', { class: 'done' }, d) : null; } });
   register.view({ id: 'data', side: 'left', order: 10, title: () => MODE === 'lakes' ? 'Databases' : 'Data', render: box => dataTree(box), tools: [
     { icon: 'plus', title: 'New database', domId: 'newdb', hidden: () => MODE !== 'lakes', run: newDatabase },
@@ -738,7 +725,7 @@ function core() {
   register.view({ id: 'variables', side: 'right', order: 20, title: 'Variables', tree: false, render: () => variables() });
   register.view({ id: 'runs', side: 'right', order: 30, title: 'History', tree: false, render: () => runs() });
   register.view({ id: 'jobs', side: 'right', order: 40, title: 'Jobs', tree: false, render: async () => (await import('./jobs.js')).jobs() });
-  for (const [id, title, ic, order] of [['functions', 'Functions', 'fn', 10], ['procedures', 'Procedures', 'play', 20], ['schedules', 'Schedules', 'calendar', 30], ['secrets', 'Secrets', 'key', 40]]) register.objectKind({ id, title, icon: ic, order });
+  for (const [id, title, ic, order, schema] of [['functions', 'Functions', 'fn', 10, 1], ['procedures', 'Procedures', 'play', 20, 1], ['schedules', 'Schedules', 'calendar', 30, 1], ['secrets', 'Secrets', 'key', 40]]) register.objectKind({ id, title, icon: ic, order, schema: !!schema });
   registerFiles(register);
   NEW.forEach(([id, ic, title, run]) => register.command({ id, title, run }));
   for (const [id, title, keys, fn] of [['search', 'Search tables, files and commands', 'Ctrl K', palette], ['left', 'Show or hide the left pane', 'Ctrl B', () => pane('left')], ['bottom', 'Show or hide the bottom panel', 'Ctrl J', () => pane('bottom')],

@@ -859,7 +859,7 @@ async fn drop_view(lake: &Lake, name: &str, if_exists: bool) -> Result<Value> {
         ensure!(if_exists, "no view {name}");
         return Ok(j!({"view": name, "dropped": false}));
     };
-    // (what follows it by name would be left without rows: a pipeline is dropped from its end)
+    // (what follows it by name would be left without rows: a flow is dropped from its end)
     let mut followers = readers(lake, name).await?;
     followers.extend(readers(lake, &format!("{name}_final")).await?);
     followers.retain(|r| !r.starts_with("view ") && r != &format!("materialized view {name}"));

@@ -1620,7 +1620,7 @@ def schemas():
     got = until(lambda: q("SELECT k, n, s FROM dbo.per_k ORDER BY k"), want, 30)
     checks["CREATE MATERIALIZED VIEW: the rows already there and those written after; WITH (window …) emits to _final; bad options refused"] = got == want and len(want) == 3 \
         and n("per_min_final") == 0 and err("CREATE MATERIALIZED VIEW m2 WITH (windw = 'w') AS SELECT k FROM t") is not None
-    # a view of a view (a pipeline, ADR-036): of a GROUP BY view's partial rows only a rollup; of a _final, as of a table
+    # a view of a view (a flow, ADR-036): of a GROUP BY view's partial rows only a rollup; of a _final, as of a table
     over = [err("CREATE MATERIALIZED VIEW m3 AS SELECT k FROM dbo.per_k"), err("CREATE MATERIALIZED VIEW m4 AS SELECT w FROM per_min_final")]
     checks["a materialized view of a GROUP BY view that isn't a rollup is refused, saying what to do; of a _final, made"] = "GROUP BY view" in str(over[0]) and over[1] is None
     # clients see the schemas
@@ -5504,13 +5504,13 @@ def stopped():
 
 
 
-def pipelines():
-    """Pipelines of materialized views (ADR-036 §1–2), as Databricks' DLT has them: silver follows
+def flows():
+    """Flows of materialized views (ADR-036 §1–2), as Databricks' DLT has them: silver follows
     orders with expectations (one drops rows, one counts them), gold adds silver up, platinum rolls
     gold up, big follows silver row by row; all made while two producers stream into two nodes,
     each filled from the rows already there. Each view == its query over orders, every row once,
     also after an UPDATE and a DELETE of orders; a row a FAIL expectation refuses fails its own
-    INSERT only; what can't follow is refused by name; pondra.pipelines and pondra.expectations."""
+    INSERT only; what can't follow is refused by name; pondra.flows and pondra.expectations."""
     lake = new_lake()
     a = Node(lake, A.port, tier_secs=0.5).start()
     b = Node(lake, A.port + 1, tier_secs=0.5).start()
@@ -5594,14 +5594,14 @@ def pipelines():
     ex = {r["expectation"]: r for r in q("SELECT * FROM pondra.expectations ORDER BY view, expectation")}
     bad = q("SELECT count(*) FILTER (WHERE amount <= 0) AS neg, count(*) FILTER (WHERE buyer IS NULL) AS nobuyer FROM orders WHERE status <> 'test'")[0]
     checks["pondra.expectations counts each expectation's failed rows, filled and streamed"] = ex.get("positive", {}).get("failed_rows") == bad["neg"] and ex.get("has_buyer", {}).get("failed_rows") == bad["nobuyer"] and ex.get("small", {}).get("on_violation") == "fail"
-    pipe = {r["name"]: r for r in q("SELECT name, follows, kind FROM pondra.pipelines")}
-    checks["pondra.pipelines: orders → silver → gold → platinum, silver → big"] = [pipe.get(n, {}).get("follows") for n in ("silver", "gold", "platinum", "big")] == ["orders", "silver", "gold", "silver"] and pipe["gold"]["kind"] == "aggregate"
-    # Changes of orders flow down the pipeline, in the same commit.
+    pipe = {r["name"]: r for r in q("SELECT name, follows, kind FROM pondra.flows")}
+    checks["pondra.flows: orders → silver → gold → platinum, silver → big"] = [pipe.get(n, {}).get("follows") for n in ("silver", "gold", "platinum", "big")] == ["orders", "silver", "gold", "silver"] and pipe["gold"]["kind"] == "aggregate"
+    # Changes of orders flow down the flow, in the same commit.
     q("UPDATE orders SET amount = amount + 7 WHERE id % 10 = 0")
     q("UPDATE orders SET amount = -amount WHERE id % 17 = 0")  # (in and out of silver's expectation)
     q("DELETE FROM orders WHERE id % 13 = 0")
     checks.update({k + ", after UPDATE and DELETE": v for k, v in same().items()})
-    checks["a view of a view made again after its pipeline is dropped from the end"] = all(err(f"DROP MATERIALIZED VIEW {v}") is None for v in ("platinum", "big", "gold", "silver"))
+    checks["a view of a view made again after its flow is dropped from the end"] = all(err(f"DROP MATERIALIZED VIEW {v}") is None for v in ("platinum", "big", "gold", "silver"))
     # History per key (SCD type 2, ADR-036 §8): versions in any order, a delete ending a key.
     q("CREATE TABLE customer_changes (id BIGINT, name VARCHAR, city VARCHAR, op VARCHAR, at BIGINT)")
     q("INSERT INTO customer_changes VALUES (1, 'ann', 'paris', 'U', 1), (1, 'ann', 'rome', 'U', 3), (2, 'bob', 'nyc', 'U', 1)")
@@ -5619,7 +5619,7 @@ def pipelines():
     info = {"sent": sent_all, "refused": (refused or "")[:200], "said": {k: (v or "")[:160] for k, v in say.items()}, "expectations": ex}
     a.kill(); b.kill()
     ok = all(checks.values())
-    print(json.dumps({"pipelines": checks, "ok": ok, "info": info}, indent=1, default=str))
+    print(json.dumps({"flows": checks, "ok": ok, "info": info}, indent=1, default=str))
     if not ok:
         sys.exit(1)
 
@@ -6136,7 +6136,7 @@ finally {{ await db.close?.(); }}"""
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    out = {t.__name__: t() for t in (upsert, deal, outside, clouds, kafkas, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, found, renames, workspace, server, scale, flight, users, secrets, safety, versions, stopped, pipelines, begin, doors, objects, sparksql, reader, crash)}
+    out = {t.__name__: t() for t in (upsert, deal, outside, clouds, kafkas, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, found, renames, workspace, server, scale, flight, users, secrets, safety, versions, stopped, flows, begin, doors, objects, sparksql, reader, crash)}
     A.secs = min(A.secs, 20)
     out["load"] = load()
     print(json.dumps(out, indent=1))
@@ -6144,7 +6144,7 @@ def all_tests():
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "found", "renames", "workspace", "server", "scale", "flight", "users", "secrets", "safety", "versions", "stopped", "pipelines", "begin", "doors", "objects", "sparksql", "load", "all"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "found", "renames", "workspace", "server", "scale", "flight", "users", "secrets", "safety", "versions", "stopped", "flows", "begin", "doors", "objects", "sparksql", "load", "all"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -6155,4 +6155,4 @@ if __name__ == "__main__":
     ap.add_argument("--secs", type=int, default=30)
     ap.add_argument("--flush-ms", type=int, default=250)
     A = ap.parse_args()
-    {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "safety": safety, "versions": versions, "stopped": stopped, "pipelines": pipelines, "begin": begin, "doors": doors, "objects": objects, "sparksql": sparksql, "load": load, "all": all_tests}[A.mode]()
+    {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "safety": safety, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "objects": objects, "sparksql": sparksql, "load": load, "all": all_tests}[A.mode]()

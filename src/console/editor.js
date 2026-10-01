@@ -84,7 +84,7 @@ export function highlight(text, lang) {
 export const highlighted = (text, lang) => highlight(text, lang).join('\n');
 
 // ------------------------------------------------------------------ the editor
-const LINE_H = 21; // (px: --code-lh in console.css)
+export const LINE_H = 21; // (px: --code-lh in console.css)
 let charW = 0;
 const measure = () => { if (!charW) { const c = document.createElement('canvas').getContext('2d'); c.font = `13px ${getComputedStyle(document.body).getPropertyValue('--mono')}`; charW = c.measureText('0').width || 7.8; } return charW; };
 
@@ -99,7 +99,7 @@ export class Editor {
     this.pre = h('pre', { class: 'hl', 'aria-hidden': 'true' });
     this.ta = h('textarea', { spellcheck: 'false', autocapitalize: 'off', autocomplete: 'off', 'aria-label': label, wrap: 'off', placeholder: this.placeholder });
     this.cur = h('div', { class: 'curline', 'aria-hidden': 'true' });
-    this.nums = this.gutter ? h('pre', { class: 'nums', 'aria-hidden': 'true' }) : null;
+    this.nums = this.gutter ? h('pre', { class: 'nums', 'aria-hidden': 'true' }, this.numText = document.createTextNode('')) : null;
     this.body = h('div', { class: 'code' }, this.cur, this.pre, this.ta);
     this.el = h('div', { class: 'editor' + (this.grow ? ' fit' : ' fill') }, this.nums, this.body);
     this.ta.value = value;
@@ -176,7 +176,7 @@ export class Editor {
     if (i === n) this.states[n] = st;
     this.src = lines;
     if (n !== on) {
-      if (this.nums) this.nums.textContent = Array.from({ length: n }, (_, k) => k + 1).join('\n');
+      if (this.nums) this.numText.data = Array.from({ length: n }, (_, k) => k + 1).join('\n');
       if (this.grow) this.body.style.height = (n * LINE_H + 18) + 'px';
     }
     let longest = 0;

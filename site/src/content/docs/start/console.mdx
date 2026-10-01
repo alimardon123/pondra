@@ -136,9 +136,13 @@ a view (its query, run when read) or a materialized view (kept up to date as its
 showing the `CREATE … AS` it runs; **Open in a new tab** gives you that SQL to change first.
 
 - **Each statement gets an answer.** They run in order in the page's session, and stop at the first
-  that fails. Above the results, a chip per statement (`1 done`, `2 5 rows`, `3 failed`) picks the
-  one shown, and **Messages** lists them all with how long each took. A `;` inside a string, a
-  comment or a `$$` body doesn't end a statement.
+  that fails. Above the results, a numbered tab per answer (`1 done`, `2 5 rows`, `3 failed`, in one
+  row that scrolls) picks the one shown, and the same numbers stand beside the statements in the
+  editor: the one shown has its lines tinted, pointing at a tab tints its statement, and a click on
+  a number shows its answer. **Messages** lists them all with how long each took. A `;` inside a
+  string, a comment or a `$$` body doesn't end a statement.
+- **Explain** (in **Run ▾**, a right-click, or **Ctrl+Shift+E**) shows the plan of the statement the
+  caret is in, or of what is selected, without running it: the same graph as **Plan**.
 - **Settings → A SQL file's statements → The last one's answer** runs the file at once instead and
   shows only its last statement's answer.
 - **A `$name` in the file** gets an input above the editor. **Run** sends the values with the
@@ -153,7 +157,8 @@ showing the `CREATE … AS` it runs; **Open in a new tab** gives you that SQL to
   aggregate) above the steps it reads from, and a dashed box where rows move between cores, or
   between nodes when a query is spread. **Text** shows `EXPLAIN` as it is. **Query profile** runs
   the statement with `EXPLAIN ANALYZE` (it does run it) and puts each step's rows and time on it,
-  the costliest marked in red, so you see where the time goes.
+  the costliest marked in red, so you see where the time goes. Its download button copies the plan
+  as text, or saves it as text or as a picture (SVG or PNG).
 - **Data profile** summarizes each column of the answer: its share of NULLs, its distinct values, its
   least and greatest value, and a histogram or its commonest values, from the rows shown; **Profile
   every row** runs it over the whole answer when there are more pages. (Two words, two things: a
@@ -194,7 +199,7 @@ card: its name and whether its last run worked, how often it runs and when next,
 last runs (its height the time it took, red if it failed), and the statement it runs. Click the card
 for its last runs; **Run now** starts it at once (a `CALL` as a job), **Edit** changes how often,
 and its **⋯** opens its file, copies the statement, or drops it. **New schedule** makes one from any
-statement. Pipelines (round 30) will be a section here too.
+statement. Flows will be a section here too.
 
 **History**, in the right pane (or the clock at the top), is what ran:
 
@@ -274,6 +279,8 @@ ORDER BY total DESC;
 - A statement that changes something (`INSERT`, `CREATE TABLE`) shows what it did, such as
   `rows 3`, and the tables on the left update.
 - Errors come back in plain words, such as `No field named nope. Did you mean 'sales.item'?`.
+- **Explain** (the cell's ⋯, a right-click, or **Ctrl+Shift+E**) shows the plan of what is
+  selected, or of the cell's last statement, without running it.
 - An answer looks as a SQL file's does: **Results**, **Chart**, **Data profile** and **Plan** as
   tabs above it (a chart of the rows, each column summarized, and the plan as a graph with its
   **Query profile**), **Copy ▾** and **Download ▾** at their right, and the line under it with the
@@ -291,7 +298,7 @@ Click a column's header and the details panel summarizes that column; **Data pro
 
 A SQL cell and a Python cell see each other's work, in both directions:
 
-- **A SQL cell's answer in Python.** Type a name in the cell's **→ name** field, beside Live. Once
+- **A SQL cell's answer in Python.** Type a name in the cell's **Result in Python** field, beside Live. Once
   the cell runs, that name is a [frame](/pondra/guides/dataframes/) of its query in the page's
   Python: `df.to_pandas()`, `df.to_polars()`, `df.filter(…)`. A frame is the query, not a copy, so
   it reads the lake as it is when used. In the `.ipynb` file the cell begins `%%sql df <<`, as
@@ -331,19 +338,22 @@ tea   2     3
 - **Right-click** anything for what can be done with it, each as the SQL it runs (a change that
   can't be undone asks first):
   - a table, a view or a materialized view: **Preview** (in SQL or Python), **Details and data
-    profile**, **Watch it live**, **Script as…**, **Insert rows…**, **Download every row…**, **As a
-    Kafka topic…**, **Add a column…**, **Rename…**, **Copy the name** (or as Python), **Truncate…**
-    and **Drop…**. **Script as** shows its `SELECT`, `INSERT`, upsert, `UPDATE`, `DELETE`, `MERGE`,
+    profile**, **Watch it live**, **Script as…**, **Insert rows…**, **Import rows from a file…** (a CSV,
+    JSON or Parquet file from your computer, put in the lake's `imports/` folder and read in by
+    column name), **Download every row…**, **As a Kafka topic…**, **Add a column…**, **Rename…**,
+    **Copy the name** (or its column names, or as Python), **Truncate…** and **Drop…**. **Script as** shows its `SELECT`, `INSERT`, upsert, `UPDATE`, `DELETE`, `MERGE`,
     loading a file, exporting, `CREATE` (from the catalog: its columns, key, partitioning, options)
     and `DROP`, each in SQL or in Python (`db.table("t")`, `db.sql(…)`), to open in a tab or copy;
   - a column: its values counted, its range and NULLs, **Rename…**, **Change its type…**, **Drop…**;
-  - a schema: a new table, view, materialized view or external table in it (a template in a new
-    tab), **Drop…**;
+  - a schema: a new table, view, materialized view, external table, function, procedure or
+    schedule in it (a template in a new tab), **New table from a file…**, **Copy the table names**,
+    **Drop…**;
   - the lake: a new schema or table, **Attach a lake or catalog…**, a new database (a server's),
     **Checkpoint**, **Refresh**, and for an attached one **Detach…**;
-  - **Functions**, **Procedures**, **Schedules** and **Secrets**, listed under the lake: each one's
-    definition, use or call, start as a job, schedule, and drop; a secret's values are never shown,
-    only replaced.
+  - **Functions**, **Procedures** and **Schedules**, listed under each schema, as Postgres keeps
+    them (`CREATE FUNCTION sales.f …` is in `sales`; a name without a schema is in `public`), and
+    **Secrets** under the lake (a secret covers a bucket, not a schema): each one's definition, use
+    or call, start as a job, schedule, and drop; a secret's values are never shown, only replaced.
 - **Workspace** lists the lake's own files (`PUT /files/…`, `files()`) by folder, and your
   notebooks under `notebooks`, with the headings of the one in front as its outline. A new file not
   saved yet is listed too, with the dot. Whoever may read the lake may read its files, from SQL too.

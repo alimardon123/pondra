@@ -339,7 +339,7 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, o: Options) -> Result<()
     let (other, source) = crate::ddl::resolve(lake, &first_table(sql)?).await?;
     ensure!(other.is_none(), "a view follows a table of this lake");
     let src: TableMeta = lake.cat.get::<TableMeta>(&table_key(&source)).await?.with_context(|| format!("no table {source}"))?.logical(); // (SQL's names: ADR-022)
-    // A view of a view: a pipeline (ADR-036 §1). Its rows are derived from the other's in the
+    // A view of a view: a flow (ADR-036 §1's pipeline). Its rows are derived from the other's in the
     // same flush, so in the same commit (`derive`). A GROUP BY view's table keeps partial rows,
     // combined as they are read: what follows it must combine them too (`merges`: a rollup).
     let upstream = lake.cat.get::<View>(&view_key(&source)).await?;
@@ -715,7 +715,7 @@ pub async fn can_follow(lake: &Lake, table: &str, append: bool) -> Result<()> {
 }
 
 /// What follows `table` and can't take its rows' changes, and why: its views, what follows them
-/// (a pipeline: a row-by-row view's rows change as its source's do; a GROUP BY view's partial rows
+/// (a flow: a row-by-row view's rows change as its source's do; a GROUP BY view's partial rows
 /// taken back arrive as new ones), and its tasks.
 async fn cannot_follow(lake: &Lake, table: &str, append: bool) -> Result<Vec<String>> {
     let mut not = vec![];
@@ -780,7 +780,7 @@ fn alone(p: &LogicalPlan, grouped: bool) -> bool {
 /// The rows every view derives from a flush's new rows, per view table. A change's old rows
 /// (`{source}$deleted`, `change.rs`) are taken back: subtracted from a view that adds up, and, for
 /// a row-by-row view, its rows of them go to `{view}$deleted` (whose rows reads leave out).
-/// A view of a view takes the rows that view derives here (ADR-036 §1: a pipeline, bronze → silver
+/// A view of a view takes the rows that view derives here (ADR-036 §1: a flow, bronze → silver
 /// → gold, in one flush, so in one commit): views go after the views they follow (`in_order`).
 /// Expectations keep, drop or refuse each view's new rows (`expected`), counted in
 /// `pondra$expectations`.
@@ -1213,7 +1213,7 @@ fn span(rows: &[RecordBatch], c: &str, within_secs: u64) -> Option<(i64, i64)> {
     Some((lo? - w, hi? + w))
 }
 
-/// `pondra.pipelines` (a row per materialized view: what it follows, its kind, what else it reads,
+/// `pondra.flows` (a row per materialized view: what it follows, its kind, what else it reads,
 /// its expectations) and `pondra.expectations` (a row per expectation, with the rows that broke it:
 /// `counts`, the rows of `pondra$expectations`). What a user may read only.
 pub async fn system(lake: &Lake, counts: Vec<RecordBatch>) -> Result<Vec<(&'static str, std::sync::Arc<dyn datafusion::catalog::TableProvider>)>> {
@@ -1252,7 +1252,7 @@ pub async fn system(lake: &Lake, counts: Vec<RecordBatch>) -> Result<Vec<(&'stat
     }
     let s = |f: &dyn Fn(usize, &(String, View)) -> Option<String>| std::sync::Arc::new(views.iter().enumerate().map(|(i, x)| f(i, x)).collect::<StringArray>()) as datafusion::arrow::array::ArrayRef;
     let reads = |v: &View| crate::spmd::tables(&v.sql).map(|t| t.into_iter().filter(|t| *t != v.source).collect::<Vec<_>>().join(", ")).filter(|r| !r.is_empty());
-    let pipelines = RecordBatch::try_from_iter(vec![
+    let flows = RecordBatch::try_from_iter(vec![
         ("name", s(&|_, (n, _)| Some(n.clone()))),
         ("follows", s(&|_, (_, v)| Some(v.join.as_ref().map_or(v.source.clone(), |j| j.tables.join(", "))))),
         ("kind", s(&|i, _| Some(kinds[i].to_string()))),
@@ -1270,5 +1270,5 @@ pub async fn system(lake: &Lake, counts: Vec<RecordBatch>) -> Result<Vec<(&'stat
         ("failed_rows", std::sync::Arc::new(all.iter().map(|(_, v, x)| failed.get(&(v.fill.as_ref().map_or(String::new(), |f| f.id.clone()), x.name.clone())).copied().unwrap_or(0)).collect::<Int64Array>())),
     ])?;
     let mem = |b: RecordBatch| -> Result<std::sync::Arc<dyn datafusion::catalog::TableProvider>> { Ok(std::sync::Arc::new(MemTable::try_new(b.schema(), vec![vec![b]])?)) };
-    Ok(vec![("pipelines", mem(pipelines)?), ("expectations", mem(expectations)?)])
+    Ok(vec![("flows", mem(flows)?), ("expectations", mem(expectations)?)])
 }

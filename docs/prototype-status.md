@@ -49,11 +49,29 @@ Python in one notebook** (the owner's list after the first part):
    after an `UPDATE` could show the changed rows' old versions again, for good: the rename sent the
    table's log rows to files first, but not its `{t}$deleted`'s, which were left under the old name
    (`harness.py columns` failed on it now and then; the rename now does both, invariant 129).
-8. **Tests:** `harness.py objects` (new, 13 checks, a Pondra node's Kafka port as the topic);
-   `harness.py sparksql` (new);
-   `console_check.py` in every part (two new checks; axe clean; the first load 71,563 bytes of
-   71,680, the cell's Python side moved to `more.js` to make room); the changed docs pages' 43
-   examples; `harness.py` workspace, procedures, temps, pipelines, external, schemas, secrets,
+8. **The owner's list of 19:50** (the console, after trying the second part):
+   - **Flows:** chains of materialized views are *flows* now (`pondra.flows`, `guides/flows`,
+     `harness.py flows`, `tools/bench/flow.py`); "pipeline" stays free for the ETL tools to come (J4).
+   - **A SQL file's answers numbered:** a strip of numbers with what each did (`2 · 3 rows`), scrolled
+     when there are many; each number is also in the file's gutter beside its statement, and the
+     one shown (or pointed at) has its lines tinted. Messages lists every statement in full.
+   - **Explain** (Ctrl+Shift+E, in the Run ▾ and the editor's right-click, a SQL cell's ⋯ too): the
+     plan of the selection or the statement the caret is in, not run. A plan copies or downloads as
+     text, SVG or PNG.
+   - **A SQL cell's frame name** reads *Result in Python: [name it]*, shown on hover until named.
+   - **The Data tree by schema:** functions, procedures and schedules under the schema that holds
+     them (secrets stay the lake's), empty schemas listed; a schema's ⋯ makes any of them there,
+     makes a table from a file and copies its tables' names; a table's ⋯ imports rows from a file
+     and copies its columns' names.
+   - **Planned:** a workspace exported and imported whole, with or without data, for CI/CD (J5);
+     flows' cost and more SQL kept up incrementally (F, round 32). AGENTS.md principle 9: easy to
+     change, replace and extend.
+   - **The first load** stays within its budget (71,335 bytes of 71,680): the sign-in dialog, a SQL
+     file's Messages and gutter numbers (`stmts.js`, new) and a cell's ⋯ load when first used.
+9. **Tests:** `harness.py objects` (new, 13 checks, a Pondra node's Kafka port as the topic);
+   `harness.py sparksql` (new); `harness.py flows` (renamed);
+   `console_check.py` in every part (axe clean, light and dark); the changed docs pages' 142
+   examples; `harness.py` workspace, procedures, temps, external, schemas, secrets,
    versions, columns (4 runs of 4 with the rename's fix), renames, changes, found, functions,
    kafkas, outside, doors, begin and users; `smoke.py`.
 

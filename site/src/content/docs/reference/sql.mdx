@@ -305,7 +305,7 @@ DROP SCHEMA sales CASCADE;
 | Statement | Syntax |
 |---|---|
 | Stored view | `CREATE [OR REPLACE] VIEW [IF NOT EXISTS] v AS SELECT …`: a query run over the tables as they are when read |
-| Materialized view | `CREATE [OR REPLACE] MATERIALIZED VIEW [IF NOT EXISTS] v [(CONSTRAINT c CHECK \| EXPECT (condition) [ON VIOLATION DROP ROW \| FAIL], …)] [WITH (option = value, …)] AS SELECT … FROM t …`: kept up to date as rows arrive; it may follow another materialized view ([Pipelines](/pondra/guides/pipelines/)) |
+| Materialized view | `CREATE [OR REPLACE] MATERIALIZED VIEW [IF NOT EXISTS] v [(CONSTRAINT c CHECK \| EXPECT (condition) [ON VIOLATION DROP ROW \| FAIL], …)] [WITH (option = value, …)] AS SELECT … FROM t …`: kept up to date as rows arrive; it may follow another materialized view ([Flows](/pondra/guides/flows/)) |
 | Temporary | `CREATE [OR REPLACE] TEMP TABLE [IF NOT EXISTS] t AS SELECT …`, `CREATE [OR REPLACE] TEMP VIEW [IF NOT EXISTS] v AS SELECT …`: a session's own |
 | Rename | `ALTER VIEW v RENAME TO w`: a stored view, not a materialized one |
 | Detach | `ALTER MATERIALIZED VIEW v DETACH`: its rows stop following and stay, as a table of that name (a `GROUP BY` view's a merge table, its rows combining as they are read). What follows it keeps following its table. A view that keeps windows is refused |
@@ -314,7 +314,7 @@ DROP SCHEMA sales CASCADE;
 A materialized view is filled from the rows already in its table, then follows every new row. Its
 options make windows, sessions and stream joins: see [table options](/pondra/reference/table-options/).
 `WITH (history = 'id', sequence_by = 'at' [, delete_when = '…'])` keeps every version of each key
-with its `__start_at` and `__end_at` ([history per key](/pondra/guides/pipelines/#history-per-key-scd-type-2)).
+with its `__start_at` and `__end_at` ([history per key](/pondra/guides/flows/#history-per-key-scd-type-2)).
 A temporary table lives in the memory of the node a session talks to, and ends with the session (a
 Postgres connection, or a Python or JavaScript client until `close()`).
 
@@ -554,7 +554,7 @@ Pondra refuses these by name, so a statement never runs and quietly does somethi
 | `CREATE INDEX`, `GRANT` | not supported |
 | `SAVEPOINT`, `ROLLBACK TO` | refused: a transaction commits or rolls back whole |
 | `CREATE`, `ALTER`, `DROP` inside `BEGIN` … `COMMIT` | refused (`0A000`): run them outside the transaction |
-| a materialized view of a `GROUP BY` view that isn't a rollup | refused, saying why ([Pipelines](/pondra/guides/pipelines/)) |
+| a materialized view of a `GROUP BY` view that isn't a rollup | refused, saying why ([Flows](/pondra/guides/flows/)) |
 | `COPY … TO` a path on the node's machine | refused unless the program that started the node sends it |
 | `COPY … TO` a folder inside a lake | refused; a lake's files are its own |
 | Python functions and procedures on a node started without `--python` | refused, with the flag to use |

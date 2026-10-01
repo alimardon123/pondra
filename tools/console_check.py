@@ -280,7 +280,7 @@ def node_checks(browser, port, show):
     p.locator("#rtabs .rtab", has_text="Details").click()
     checks["the Variables tab lists the page's Python names with their types; Restart empties them"] = names == want and x_type.startswith("int") \
         and emptied == 0 and "NameError" in gone
-    named = pg.cell(1).locator(".bar input.as")  # (a SQL cell's → name: its answer a frame in the page's Python)
+    named = pg.cell(1).locator(".bar .as input")  # (a SQL cell's → name: its answer a frame in the page's Python)
     named.fill("ppl")
     named.press("Tab")
     pg.run(1, "SELECT id FROM people")
@@ -427,7 +427,7 @@ def node_checks(browser, port, show):
         dark.p.wait_for_timeout(800)
         dark.shot(show, "console-dark.png")
         dark.ctx.close()
-    # A pipeline (ADR-036): a view's details draw what it follows and what follows it, and its expectations.
+    # A flow (ADR-036): a view's details draw what it follows and what follows it, and its expectations.
     sql(port, "CREATE TABLE pay (id BIGINT, amount BIGINT)")
     sql(port, "INSERT INTO pay VALUES (1, 5), (2, -1), (3, 7)")
     sql(port, "CREATE MATERIALIZED VIEW pay_ok (CONSTRAINT positive CHECK (amount > 0) ON VIOLATION DROP ROW) AS SELECT id, amount FROM pay")
@@ -438,9 +438,9 @@ def node_checks(browser, port, show):
     p.locator("#data .row", has_text="pay_ok").first.click()
     flow = until(lambda: p.locator("#details .flow").inner_text().split() if p.locator("#details .flow").count() else [], ["pay", "→", "pay_ok", "→", "pay_sum"])
     broke = until(lambda: "1 row broke it" in (p.locator("#details .pc", has_text="positive").inner_text() if p.locator("#details .pc", has_text="positive").count() else ""), True)
-    checks["a materialized view's details draw its pipeline (pay → pay_ok → pay_sum) and its expectations, with the rows that broke each"] = \
+    checks["a materialized view's details draw its flow (pay → pay_ok → pay_sum) and its expectations, with the rows that broke each"] = \
         flow == ["pay", "→", "pay_ok", "→", "pay_sum"] and broke is True
-    pg.shot(show, "console-pipeline.png")
+    pg.shot(show, "console-flow.png")
     checks["every request went to the node; no page errors"] = pg.left() == [] and pg.errors == [] and len(pg.seen) > 10
     info = {"named": [in_python, from_python], "figure": fig_said, "left": pg.left(), "errors": pg.errors, "sql_error": sql_error, "python_error": python_error, "kinds": kinds, "names": names, "types": types, "facts": facts,
             "heads": heads, "rows": rows[:2], "m": m}
@@ -1284,7 +1284,7 @@ def budget_checks(browser, port, show):
             fresh[name] = e.code
     total = sum(sizes.values()) if all(sizes.values()) else None
     later = {}
-    for name in ["chart.js", "plan.js", "more.js", "details.js", "more.css", "data.js", "md.js", "jobs.js", "settings.js", "objects.js", "pyfile.js", "versions.js"]:  # (loaded when first used)
+    for name in ["chart.js", "plan.js", "more.js", "details.js", "more.css", "data.js", "md.js", "jobs.js", "settings.js", "objects.js", "pyfile.js", "versions.js", "stmts.js"]:  # (loaded when first used)
         r = urllib.request.urlopen(urllib.request.Request(f"{base}/console/{name}", headers={"accept-encoding": "gzip"}))
         later[name] = len(r.read()) if r.headers.get("content-encoding") == "gzip" else None
     checks["the scripts and style sheet the page loads, gzipped as the node serves them: <= 70 KB; each answers 304 when the browser has it"] = total is not None and total <= 70 * 1024 \

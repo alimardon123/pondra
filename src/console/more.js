@@ -240,3 +240,14 @@ export function createAs(sql) {
     ['Open in a new tab', async () => { const d = await newFile('sql'); d.ed.value = text(); d.changed(); }], ['Cancel', () => {}]]);
   requestAnimationFrame(() => { input.focus(); input.select(); });
 }
+
+/** A notebook cell's ⋯: run around it, add beside it, its output, its kind, delete it. */
+export function cellMenu(c, at) {
+  const nb = c.nb, i = nb.cells.indexOf(c), kind = c.kind === 'markdown' ? 'sql' : c.kind;
+  menu(at, [{ label: 'Run the cells above', icon: 'arrowUp', run: () => nb.runSome(0, i) }, { label: 'Run this and the cells below', icon: 'arrowDown', run: () => nb.runSome(i) }, '-',
+    { label: 'Add a cell above', icon: 'plus', keys: 'A', run: () => nb.add({ kind }, c, false).edit() }, { label: 'Add a cell below', keys: 'B', run: () => nb.add({ kind }, c, true).edit() }, '-',
+    c.kind === 'sql' ? { label: 'Explain: its plan, not run', icon: 'plan', run: () => c.explain() } : null,
+    { label: c.el.classList.contains('folded') ? 'Show the output' : 'Hide the output', icon: 'eye', keys: 'O', run: () => c.fold() }, { label: 'Clear the output', icon: 'clear', run: () => c.clear() }, '-',
+    ...[...R.kinds.values()].map(k => ({ label: `Make it ${k.label}`, checked: k.id === c.kind, run: () => { c.setKind(k.id); c.edit(); } })), '-',
+    { label: 'Delete the cell', icon: 'trash', keys: 'D D', run: () => nb.remove(c) }]);
+}

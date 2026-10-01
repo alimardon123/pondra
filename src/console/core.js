@@ -176,11 +176,11 @@ export const register = {
   command(o) { R.commands.set(o.id, o); },
   /** A key, listed under ?: `{ keys: 'd d', title, run(cell), group }` (on a notebook cell after Esc, if it runs). */
   key(o) { R.keys = R.keys.filter(x => x.keys !== o.keys || x.group !== o.group).concat(o); shell.redraw(); },
-  /** A kind of job, a section of Jobs: `{ id, title, load() → items, item(x) → element, empty, order }` (schedules; round 30's pipelines). */
+  /** A kind of job, a section of Jobs: `{ id, title, load() → items, item(x) → element, empty, order }` (schedules; flows). */
   jobKind(o) { R.jobKinds = put(R.jobKinds || [], o); },
   /** A section of Settings: `{ id, title, group, icon, about, rows() → [[label, about, control]], order }` (an enterprise build's users, tokens, audit). */
   setting(o) { R.settings = put(R.settings || [], o); },
-  /** A kind of object in the Data tree, a group under the lake: `{ id, title, icon, order, list(), item(x) → { name, icon, meta, title }, menu(x) → items, create() → SQL }` (users and roles, pipelines). */
+  /** A kind of object in the Data tree, a group under the lake: `{ id, title, icon, order, list(), item(x) → { name, icon, meta, title }, menu(x) → items, create() → SQL }` (users and roles, flows). */
   objectKind(o) { R.objectKinds = put(R.objectKinds || [], o); shell.redraw(); },
   /** An item of an object's menu in the Data tree: `{ id, kinds: ['table', 'view', 'materialized_view', 'column', 'schema', 'lake', 'functions', …], label, icon, run(object) }`. */
   objectAction(o) { R.objectActions = put(R.objectActions || [], o); },
