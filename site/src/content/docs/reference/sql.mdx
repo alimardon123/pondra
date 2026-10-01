@@ -112,7 +112,7 @@ A parameter goes with the request, in JSON. The Python and JavaScript clients do
 
 | Statement | Syntax |
 |---|---|
-| Create | `CREATE TABLE [IF NOT EXISTS] t (column type [NOT NULL] [DEFAULT expression] [PRIMARY KEY], … [, PRIMARY KEY (column, …)]) [WITH (option = 'value', …)]` |
+| Create | `CREATE TABLE [IF NOT EXISTS] t (column type [NOT NULL] [DEFAULT expression] [CHECK (condition)] [PRIMARY KEY], … [, PRIMARY KEY (column, …)] [, CONSTRAINT name CHECK (condition)]) [WITH (option = 'value', …)]` |
 | Create from a query | `CREATE TABLE t AS SELECT …`, or `CREATE TABLE t (a INT, b VARCHAR) AS VALUES …` |
 | Add a column | `ALTER TABLE t ADD COLUMN [IF NOT EXISTS] c type` |
 | Rename a column | `ALTER TABLE t RENAME COLUMN a TO b` |
@@ -133,6 +133,11 @@ release keeps its old rules. A row that leaves a column out gets its default, ea
 (`DEFAULT now()` is the time of each row). A JSON row sent to `/append` or Kafka without the column
 takes the default; an explicit `null` stays null, and is refused if the column is `NOT NULL`. A
 `DEFAULT` that doesn't cast to the column's type is refused at `CREATE`.
+
+A `CHECK` is enforced on the same doors, and on `UPDATE` and `MERGE`: a row for which its condition
+is false is refused with `23514` (`new row for relation "t" violates check constraint "t_balance_check"`);
+`NULL` passes, as in Postgres. One without a name is named as Postgres names it: `{table}_{column}_check`
+on a column, `{table}_check` on the table.
 
 `ALTER TABLE … ADD COLUMN … NOT NULL` and `… DEFAULT` are refused, because the rows already there
 would need a value and no file is rewritten. Add the column, then `UPDATE` it.
@@ -197,6 +202,18 @@ SELECT * FROM users ORDER BY id;
 SELECT * FROM visits ORDER BY id;
 ```
 
+### Transactions
+
+| Statement | Syntax |
+|---|---|
+| Begin | `BEGIN [TRANSACTION \| WORK]`, `START TRANSACTION` |
+| Commit | `COMMIT`, `END` |
+| Roll back | `ROLLBACK`, `ABORT` |
+
+The statements between `BEGIN` and `COMMIT` are one commit, read their own writes, and see the lake
+as it was at `BEGIN` (snapshot isolation). A row another commit changed since then refuses `COMMIT`
+with `40001`: run it again. See [Transactions](/pondra/guides/change-rows/#transactions).
+
 ## Schemas and other lakes
 
 | Statement | Syntax |
@@ -229,7 +246,7 @@ DROP SCHEMA sales CASCADE;
 | Statement | Syntax |
 |---|---|
 | Stored view | `CREATE [OR REPLACE] VIEW v AS SELECT …`: a query run over the tables as they are when read |
-| Materialized view | `CREATE MATERIALIZED VIEW v [WITH (option = value, …)] AS SELECT … FROM t …`: kept up to date as rows arrive |
+| Materialized view | `CREATE MATERIALIZED VIEW v [(CONSTRAINT c CHECK \| EXPECT (condition) [ON VIOLATION DROP ROW \| FAIL], …)] [WITH (option = value, …)] AS SELECT … FROM t …`: kept up to date as rows arrive; it may follow another materialized view ([Pipelines](/pondra/guides/pipelines/)) |
 | Temporary | `CREATE TEMP TABLE t AS SELECT …`, `CREATE TEMP VIEW v AS SELECT …`: a session's own |
 | Rename | `ALTER VIEW v RENAME TO w`: a stored view, not a materialized one |
 | Drop | `DROP VIEW [IF EXISTS] v`, `DROP MATERIALIZED VIEW [IF EXISTS] v` |
@@ -470,7 +487,9 @@ Pondra refuses these by name, so a statement never runs and quietly does somethi
 | `DROP TABLE` while a view or task reads the table | refused; drop the view or task first |
 | a change to a table a window, session, join or min/max view follows | refused, with the view's name, because such a view cannot take a row back |
 | `CREATE INDEX`, `GRANT` | not supported |
-| `BEGIN`, `COMMIT`, `SET` over HTTP | not supported: every statement commits on its own (the Postgres door accepts and ignores them) |
+| `SAVEPOINT`, `ROLLBACK TO` | refused: a transaction commits or rolls back whole |
+| `CREATE`, `ALTER`, `DROP` inside `BEGIN` … `COMMIT` | refused (`0A000`): run them outside the transaction |
+| a materialized view of a `GROUP BY` view that isn't a rollup | refused, saying why ([Pipelines](/pondra/guides/pipelines/)) |
 | `COPY … TO` a path on the node's machine | refused unless the program that started the node sends it |
 | `COPY … TO` a folder inside a lake | refused; a lake's files are its own |
 | Python functions and procedures on a node started without `--python` | refused, with the flag to use |

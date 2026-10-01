@@ -1,7 +1,7 @@
 """The client: a node over HTTP (`connect`), or one started here (`local`). Queries become frames
 (`frame.py`); writes, scripts and procedures run at once."""
 import atexit
-import base64
+import base64, contextlib
 import importlib.util
 import inspect
 import io
@@ -66,6 +66,15 @@ def _json_rows(out):
     return [{k: r.get(k) for k in keys} for r in rows]
 
 
+
+class PondraError(RuntimeError):
+    """An error from a node: its words, and `sqlstate`, Postgres's code for it (`23514` a CHECK,
+    `42P01` no such table, `40001` a conflict worth trying again…; `XX000` anything else)."""
+
+    def __init__(self, message, sqlstate=None, status=None):
+        super().__init__(message)
+        self.sqlstate, self.status = sqlstate or "XX000", status
+
 class Result:
     """Rows a statement returned at once (a script's last query, a procedure's answer): Arrow IPC,
     or JSON rows where pyarrow isn't installed."""
@@ -128,7 +137,7 @@ class Pondra:
             r = self._open(req, timeout=None if stream else self.timeout)
         except urllib.error.HTTPError as e:
             self._heard(e.headers)
-            raise RuntimeError(f"{e.code}: {e.read().decode(errors='replace')}") from None
+            raise PondraError(f"{e.code}: {e.read().decode(errors='replace')}", e.headers.get("x-pondra-sqlstate") if e.headers else None, e.code) from None
         if stream:
             return r
         self._heard(r.headers)
@@ -462,6 +471,19 @@ class Pondra:
                 yield _json_rows(json.dumps(answer["rows"]))
         finally:
             r.close()
+
+    @contextlib.contextmanager
+    def transaction(self):
+        """`with con.transaction():` the block's statements as one commit (`BEGIN` … `COMMIT`),
+        reading its own writes, rolled back if the block raises. Another commit that changed one of
+        its rows first refuses it: `PondraError` with `sqlstate == "40001"`; run the block again."""
+        self._run("BEGIN")
+        try:
+            yield self
+        except BaseException:
+            self._run("ROLLBACK")
+            raise
+        self._run("COMMIT")
 
     def close(self):
         """End this connection's session (its temporary tables and views), and stop the node

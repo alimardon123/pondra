@@ -123,6 +123,7 @@ pub fn secrets() -> Vec<(String, crate::ext::Secret)> {
 
 /// End a session: its temporary tables and views are gone, and its Python (`python::ask_session`).
 pub fn end(session: &str) -> bool {
+    crate::txn::end(session); // (its transaction, if open: rolled back)
     let python = crate::python::end_session(session); // (its Python's variables too)
     let gone = SESSIONS.lock().unwrap().remove(session).is_some() || python;
     if gone {

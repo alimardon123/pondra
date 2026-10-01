@@ -189,7 +189,7 @@ for await (const rows of db.live("SELECT count(*) AS n FROM orders")) {
 | `db.producer`, `db.seq` | the name `append` writes under, and its last sequence number |
 | `db.session` | this connection's session id: its temporary tables and views, and the variables of its `DO LANGUAGE python` blocks, live under it |
 | `db.position` | the commit the last `live` answer is as of |
-| `await db.request(method, path, body, type)` | one HTTP request to the node, as the methods above make them. Answers the `fetch` response, and throws on an error status with the text `status: message` |
+| `await db.request(method, path, body, type)` | one HTTP request to the node, as the methods above make them. Answers the `fetch` response, and throws on an error status with the text `status: message`; the error's `sqlstate` is Postgres's code for it (`23514`, `40001`…) |
 
 ## Close
 

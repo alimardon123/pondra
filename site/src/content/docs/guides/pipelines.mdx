@@ -1,0 +1,151 @@
+---
+title: Pipelines
+description: Materialized views that follow each other in one commit (bronze, silver, gold), expectations that keep, drop or refuse rows, and the pipeline's graph.
+sidebar:
+  order: 6.5
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+A pipeline is materialized views following each other: raw rows land in a table (bronze), a view
+cleans them (silver), another adds them up (gold). It is what Databricks calls a pipeline (Delta
+Live Tables, now Lakeflow) and what you would otherwise run as a chain of jobs. In Pondra every
+stage moves **in the same commit** as the rows that started it: when an `INSERT` is acknowledged,
+silver and gold already have its rows, and a query never sees one stage ahead of another.
+
+## Bronze, silver, gold
+
+```sql
+CREATE TABLE orders (id BIGINT, region VARCHAR, buyer VARCHAR, amount BIGINT, status VARCHAR);
+INSERT INTO orders VALUES
+  (1, 'eu', 'ann', 30, 'paid'),
+  (2, 'eu', 'bob', -5, 'paid'),
+  (3, 'us', NULL, 12, 'paid'),
+  (4, 'us', 'cat', 50, 'test');
+```
+
+Silver keeps the real, paid orders, with two **expectations**: one drops a row that breaks it,
+the other keeps the row and counts it.
+
+```sql
+CREATE MATERIALIZED VIEW silver (
+  CONSTRAINT positive CHECK (amount > 0) ON VIOLATION DROP ROW,
+  CONSTRAINT has_buyer EXPECT (buyer IS NOT NULL)
+) AS SELECT id, region, buyer, amount FROM orders WHERE status <> 'test';
+```
+
+Gold adds silver up, and a third view rolls gold up by region:
+
+```sql
+CREATE MATERIALIZED VIEW gold AS
+  SELECT region, buyer, count(*) AS orders, sum(amount) AS total FROM silver GROUP BY region, buyer;
+CREATE MATERIALIZED VIEW by_region AS
+  SELECT region, sum(orders) AS orders, sum(total) AS total FROM gold GROUP BY region;
+```
+
+Each view was filled from the rows already there. Now a new order moves through all three in
+the commit that writes it:
+
+```sql
+INSERT INTO orders VALUES (5, 'eu', 'ann', 20, 'paid');
+SELECT * FROM by_region ORDER BY region;
+```
+
+```text
+region  orders  total
+eu      2       50
+us      1       12
+```
+
+Order 2 (a negative amount) was dropped by silver's expectation; order 3 (no buyer) was kept and
+counted; order 4 is a test and never entered silver.
+
+## Expectations
+
+An expectation is a condition each of a view's rows should meet, checked as the rows are written.
+A row breaks it when the condition is false (`NULL` passes, as with a `CHECK` in Postgres).
+
+| You write | A row that breaks it |
+|---|---|
+| `CONSTRAINT c EXPECT (…)` | is kept, and counted |
+| `CONSTRAINT c CHECK (…) ON VIOLATION DROP ROW` (or `EXPECT … ON VIOLATION DROP ROW`) | is left out, and counted |
+| `CONSTRAINT c CHECK (…)` (or `… ON VIOLATION FAIL`) | refuses the write that brought it, with Postgres's `check_violation` (23514) |
+
+A refused write is only the writer's: many clients' rows are committed together, and only the
+`INSERT` that brought the bad row fails. `pondra.expectations` shows each expectation and how many
+rows broke it, counted in the same commits as the rows, so the numbers are exact:
+
+```sql
+SELECT view, expectation, on_violation, failed_rows FROM pondra.expectations ORDER BY expectation;
+```
+
+```text
+view    expectation  on_violation  failed_rows
+silver  has_buyer    keep          1
+silver  positive     drop          1
+```
+
+```sql
+CREATE MATERIALIZED VIEW strict (CONSTRAINT small CHECK (amount < 1000)) AS SELECT id, amount FROM orders;
+```
+
+```sql norun
+INSERT INTO orders VALUES (6, 'eu', 'ann', 5000, 'paid');
+-- ERROR 23514: new row for relation "strict" violates check constraint "small": CHECK (amount < 1000)
+```
+
+Expectations go on row-by-row views (no `GROUP BY`): a grouped view's table keeps partial sums, so
+its totals aren't there to check. Put them on the view before it.
+
+## What a view of a view may be
+
+- **A view of a row-by-row view** (a filter, a projection, a join with another table) takes its
+  rows as a view of a table does, and follows their changes: an `UPDATE` or `DELETE` of `orders`
+  changes silver's row and then gold's, in one commit.
+- **A view of a `GROUP BY` view** sees that view's partial rows (a few per key, combined as you
+  read them), not its totals. So it must combine them the same way, a **rollup**: `GROUP BY` some of
+  the view's keys, a `WHERE` on those keys only, `sum()` of its sums and counts, `min()` of its
+  mins, `max()` of its maxes. Anything else is refused, saying why. To filter or reshape the
+  totals, make a stored view (`CREATE VIEW … AS SELECT … FROM gold WHERE total > 100`), which reads
+  them as they are when asked.
+- A pipeline is dropped from its end: `DROP MATERIALIZED VIEW silver` is refused while gold
+  follows it.
+
+```sql
+UPDATE orders SET amount = amount + 10 WHERE id = 1;
+SELECT region, orders, total FROM by_region ORDER BY region;
+```
+
+```text
+region  orders  total
+eu      2       60
+us      1       12
+```
+
+## The pipeline
+
+`pondra.pipelines` lists every materialized view: what it follows, its kind, what else it reads
+and its expectations. The console's details panel draws each table's and view's pipeline, from
+its tables to what follows it.
+
+```sql
+SELECT name, follows, kind, expectations FROM pondra.pipelines ORDER BY name;
+```
+
+```text
+name       follows  kind       expectations
+by_region  gold     aggregate  0
+gold       silver   aggregate  0
+silver     orders   rows       2
+strict     orders   rows       1
+```
+
+<Aside>
+**Compared with Databricks and Snowflake.** A Databricks pipeline updates its tables on compute of
+its own, every 10 seconds to a few minutes in continuous mode; a Snowflake dynamic table refreshes
+within its target lag, 60 seconds at least. Here every stage is computed by the node that took the
+rows in, as part of packing them, so the whole pipeline commits at once: no lag between stages and
+no checkpoints to keep. The cost is that each stage's SQL runs as rows arrive (three stages took
+29% off ingest on two vCPUs); a stage that must see everything at once (a top-N over all time, a
+totals filter) is a stored view, read when asked.
+</Aside>

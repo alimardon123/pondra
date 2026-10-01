@@ -1167,6 +1167,30 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    keys many writers add have a random first part; nothing lists the whole bucket on a schedule;
    no key is written by many writers faster than once a second. `tools/cold_trace.sh`,
    `tools/c5_check.py`.
+183. **A pipeline moves in one commit** (ADR-036 §1): `views::derive` runs views in `in_order`, each
+   taking what the views before it derived in the same flush; the sequencer owes a view's rows to
+   the views that follow it (any part with rows, not only a producer's). A view of a GROUP BY view
+   is a rollup (`views::merges` with `up`) or refused; a pipeline is dropped from its end.
+   `can_follow` and `row_views` follow the chain. `tools/harness.py pipelines`.
+184. **Expectations count with the rows, and a refusal is the writer's alone** (ADR-036 §2): a
+   view's new rows go through `views::expected` (taken-back rows through `let_in`); counts are a
+   part of `pondra$expectations` in the same flush; a `Violation` from packing a group sends
+   `log::send` back to check each append alone. Errors that are a row refused are `Violation`
+   (23514), tables' CHECKs included (`defaults::check`).
+185. **Every error has Postgres's code** (`codes.rs`, ADR-036 §4): a new kind of error a client
+   should tell apart gets a typed `Coded` or words `codes::by_words` knows, and a test in
+   `codes::tests`. Postgres sends it, HTTP's `x-pondra-sqlstate`, Flight's metadata, the clients'
+   `sqlstate`.
+186. **A transaction is a session's, kept where the session is, and one commit** (`txn.rs`, ADR-036
+   §5): every read in it goes through `query::session_at`, which takes its snapshot and its overlay
+   (`txn::overlaid`); a new path that reads tables for a session must too, or refuse inside a
+   transaction. Writes are kept by `txn::keep`, and `COMMIT` is `Request::Txn` → `commit_here`
+   under the lake's lock: the conflict check (40001), then `change::appends` for every table, one
+   `change::submit`. `tools/harness.py begin`; `tools/bench/pgbench.py`.
+187. **A key lookup isn't planned, on any door** (ADR-036 §6): `serve::point` recognises one (a
+   literal or a parameter); Postgres answers it before anything else in `pg::run`, its `Describe`
+   and parameter types from it too; in a transaction `txn::point_read`; a one-key UPDATE of a keyed
+   table is `txn::point_change`, in a transaction or not.
 
 ## Tests: run these before and after any change
 
@@ -1178,6 +1202,9 @@ python3 tools/harness.py safety         # panics answered as errors, TLS at ever
 python3 tools/fuzz_doors.py --secs 60   # malformed input at HTTP, SQL, Postgres, Kafka and Flight: the node stays up
 python3 tools/harness.py versions       # every file keeps its versions: listed, read, restored, after a delete, retention, old notebooks
 python3 tools/harness.py stopped        # a run whose node was killed under it: stopped, not running for good
+python3 tools/harness.py pipelines      # views of views in one commit, rollups, expectations (keep, drop, fail), changes down the pipeline
+python3 tools/harness.py begin          # BEGIN … COMMIT from every door, read-your-writes, 40001 and retries, 25P02, SQLSTATEs
+python3 tools/bench/pgbench.py          # pgbench's own TPC-B script, 1 and 4 clients: the balances agree
 bash tools/cold_trace.sh                # a cold start's requests on the simulator at R2's latency, and the node's own steps
 python3 tools/c5_check.py               # the bucket's limits: a 10 writes/s bucket, 240 INSERTs at once, the inbox's bell
 python3 tools/harness.py crash --runs 3 --batches 60 --size 50000   # kill -9 + injected crashes, 9M events

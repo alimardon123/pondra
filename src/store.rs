@@ -117,6 +117,10 @@ pub struct TableMeta {
     /// expression, worked out for each row as it is written (`defaults.rs`).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub defaults: BTreeMap<String, String>,
+    /// `CHECK` constraints (ADR-036 §3): (name, condition over the columns by their SQL names),
+    /// which every row written must not make false (`defaults.rs`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checks: Vec<(String, String)>,
     /// Not the lake's: files outside it a query reads as a table (`ext.rs`), never in the catalog.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ext: Option<crate::ext::Spec>,
@@ -854,6 +858,44 @@ impl Lake {
 
     /// The rows of `table` in log segment `n`, decoded once and then served from memory
     /// (segments never change, so the cache never goes stale).
+    /// The log's segments after `after`, to the newest, each decoded once per node (a segment
+    /// never changes once committed), the list kept whole from where it was first asked for: a
+    /// key lookup reads only what was committed since the last one, however long the log tail.
+    pub async fn segments_after(&self, after: u64) -> Result<Vec<(u64, Arc<Segment>)>> {
+        struct Known {
+            start: u64, // every segment from here…
+            whole: u64, // …to here is in `segs`
+            segs: BTreeMap<u64, Arc<Segment>>,
+        }
+        static KNOWN: LazyLock<Mutex<std::collections::HashMap<String, Known>>> = LazyLock::new(Default::default);
+        let now = self.visible();
+        let from = match KNOWN.lock().unwrap().get(&self.url) {
+            Some(k) if k.start <= after + 1 && k.whole >= after => k.whole + 1, // (only what is new)
+            _ => after + 1,
+        };
+        let raw = if from <= now { self.cat.scan_raw(&seg_key(from), "s0").await? } else { BTreeMap::new() };
+        let mut all = KNOWN.lock().unwrap();
+        let k = all.entry(self.url.clone()).or_insert(Known { start: from, whole: from - 1, segs: BTreeMap::new() });
+        if from < k.start || from > k.whole + 1 {
+            *k = Known { start: from, whole: from - 1, segs: BTreeMap::new() }; // (asked from further back: begun again there)
+        }
+        for (key, v) in raw {
+            let n = key[2..].parse::<u64>()?;
+            if n <= now && !k.segs.contains_key(&n) {
+                k.segs.insert(n, Arc::new(serde_json::from_slice::<Segment>(&v)?));
+            }
+        }
+        k.whole = k.whole.max(now);
+        while k.segs.len() > 200_000 {
+            let Some((first, _)) = k.segs.pop_first() else { break };
+            k.start = first + 1; // (the oldest go: asked for again, they are read again)
+        }
+        let mut out: Vec<(u64, Arc<Segment>)> = k.segs.range(after + 1..).map(|(n, s)| (*n, s.clone())).collect();
+        drop(all);
+        out.retain(|(n, _)| *n <= now);
+        Ok(out)
+    }
+
     pub async fn segment_rows(&self, n: u64, seg: &Segment, table: &str) -> Result<Rows> {
         let key = (n, table.to_string());
         if let Some(rows) = self.tail.lock().unwrap().0.get(&key) {
@@ -1388,11 +1430,16 @@ impl Catalog {
 
     /// All entries with keys in [from, to).
     pub async fn scan<T: DeserializeOwned>(&self, from: &str, to: &str) -> Result<Vec<(String, T)>> {
+        self.scan_raw(from, to).await?.into_iter().map(|(k, v)| Ok((k, serde_json::from_slice(&v)?))).collect()
+    }
+
+    /// `scan`, the values as they are kept (JSON), for a caller that decodes only what it hasn't.
+    pub async fn scan_raw(&self, from: &str, to: &str) -> Result<BTreeMap<String, Bytes>> {
         if from >= to {
-            return Ok(vec![]);
+            return Ok(BTreeMap::new());
         }
         let range = from.as_bytes().to_vec()..to.as_bytes().to_vec();
-        let decode = |all: BTreeMap<String, Bytes>| all.into_iter().map(|(k, v)| Ok((k, serde_json::from_slice(&v)?))).collect();
+        let decode = |all: BTreeMap<String, Bytes>| -> Result<BTreeMap<String, Bytes>> { Ok(all) };
         let r = match &self.db {
             Db_::Writer(db) if !self.mirror.load(Relaxed) => return decode(collect(db.scan_with_options(range, &ScanOptions::new().with_durability_filter(DurabilityLevel::Remote)).await.map_err(fatal)?).await?),
             Db_::Writer(_) => None,

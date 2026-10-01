@@ -1,0 +1,71 @@
+{
+ "pipelines": {
+  "a row a FAIL expectation refuses fails its INSERT, naming it": true,
+  "refused: a view of a GROUP BY view's partial rows, without GROUP BY": true,
+  "refused: count(*) of a GROUP BY view's rows": true,
+  "refused: a WHERE on a GROUP BY view's totals": true,
+  "refused: expectations on a GROUP BY view": true,
+  "refused: a FAIL expectation rows already break": true,
+  "refused: dropping a view others follow": true,
+  "silver == its query over orders (:8090)": true,
+  "silver == its query over orders (:8091)": true,
+  "gold == its query over orders (:8090)": true,
+  "gold == its query over orders (:8091)": true,
+  "platinum == its query over orders (:8090)": true,
+  "platinum == its query over orders (:8091)": true,
+  "big == its query over orders (:8090)": true,
+  "big == its query over orders (:8091)": true,
+  "strict == its query over orders (:8090)": true,
+  "strict == its query over orders (:8091)": true,
+  "every row sent is there once, beside the refused INSERT": true,
+  "pondra.expectations counts each expectation's failed rows, filled and streamed": true,
+  "pondra.pipelines: orders \u2192 silver \u2192 gold \u2192 platinum, silver \u2192 big": true,
+  "silver == its query over orders (:8090), after UPDATE and DELETE": true,
+  "silver == its query over orders (:8091), after UPDATE and DELETE": true,
+  "gold == its query over orders (:8090), after UPDATE and DELETE": true,
+  "gold == its query over orders (:8091), after UPDATE and DELETE": true,
+  "platinum == its query over orders (:8090), after UPDATE and DELETE": true,
+  "platinum == its query over orders (:8091), after UPDATE and DELETE": true,
+  "big == its query over orders (:8090), after UPDATE and DELETE": true,
+  "big == its query over orders (:8091), after UPDATE and DELETE": true,
+  "strict == its query over orders (:8090), after UPDATE and DELETE": true,
+  "strict == its query over orders (:8091), after UPDATE and DELETE": true,
+  "a view of a view made again after its pipeline is dropped from the end": true
+ },
+ "ok": true,
+ "info": {
+  "sent": 16050,
+  "refused": "500: b'new row for relation \"strict\" violates check constraint \"small\": CHECK (amount < 100000)'",
+  "said": {
+   "a view of a GROUP BY view's partial rows, without GROUP BY": "500: b'gold is a GROUP BY view: its table keeps partial rows, a few per key, combined as they are read. A view of it must combine them the same way: GROUP BY so",
+   "count(*) of a GROUP BY view's rows": "500: b'gold is a GROUP BY view: its table keeps partial rows, a few per key, combined as they are read. A view of it must combine them the same way: GROUP BY so",
+   "a WHERE on a GROUP BY view's totals": "500: b'gold is a GROUP BY view: its table keeps partial rows, a few per key, combined as they are read. A view of it must combine them the same way: GROUP BY so",
+   "expectations on a GROUP BY view": "500: b\"bad4 is a GROUP BY view: its table keeps partial rows, so expectations can't check its totals. Put them on the rows before it (a view of orders without G",
+   "a FAIL expectation rows already break": "500: b'695 of the rows orders has now would break expectation c of bad5, CHECK (amount > 0): fix them first, or make it ON VIOLATION DROP ROW'",
+   "dropping a view others follow": "500: b'silver is followed by materialized view big, materialized view gold: drop them first'"
+  },
+  "expectations": {
+   "has_buyer": {
+    "view": "silver",
+    "expectation": "has_buyer",
+    "condition": "buyer IS NOT NULL",
+    "on_violation": "keep",
+    "failed_rows": 724
+   },
+   "positive": {
+    "view": "silver",
+    "expectation": "positive",
+    "condition": "amount > 0",
+    "on_violation": "drop",
+    "failed_rows": 761
+   },
+   "small": {
+    "view": "strict",
+    "expectation": "small",
+    "condition": "amount < 100000",
+    "on_violation": "fail",
+    "failed_rows": 0
+   }
+  }
+ }
+}

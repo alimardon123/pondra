@@ -141,3 +141,7 @@ dialog.pop.wide{max-width:980px;width:calc(100% - 40px)}.vers{display:grid;grid-
 .dpre{margin:0;font:12px/1.55 var(--mono);color:var(--ink)}.dl{white-space:pre-wrap;word-break:break-all;padding:0 8px 0 4px;border-radius:3px}.dl .mk{display:inline-block;width:16px;color:var(--faint);user-select:none}
 .dl.plus{background:color-mix(in srgb,var(--ok) 15%,transparent)}.dl.minus{background:color-mix(in srgb,var(--err) 13%,transparent)}.dl.fold{color:var(--faint);font-style:italic;padding:2px 20px}
 @media (max-width:720px){.vers{grid-template-columns:1fr}.vlist{border-right:0;max-height:24vh}}
+.flow{display:flex;flex-wrap:wrap;align-items:center;gap:4px 6px;font:12px var(--mono)}
+.flow .fl{padding:2px 7px;border-radius:5px;background:var(--sunk);border:1px solid var(--line2);color:var(--muted)}
+.flow .fl.cur{background:var(--accent-soft);border-color:transparent;color:var(--ink);font-weight:600}
+.flow .arr{color:var(--faint)}

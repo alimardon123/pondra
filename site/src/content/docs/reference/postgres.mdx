@@ -68,9 +68,10 @@ INSERT 0 2
 (2 rows)
 ```
 
-Use `autocommit=True` in a driver that starts transactions (psycopg does): every statement commits
-on its own. `BEGIN`, `COMMIT`, `ROLLBACK` and `SET` are accepted and do nothing, so a driver that
-sends them works, but there is no transaction to roll back.
+A driver's transactions are Pondra's: `BEGIN` … `COMMIT` is one commit, with snapshot isolation
+(Postgres's `REPEATABLE READ`), and the connection's status says when one is open, as drivers expect
+([Transactions](/pondra/guides/change-rows/#transactions)). `autocommit=True` makes every statement
+its own commit.
 
 ## What runs
 
@@ -80,7 +81,9 @@ sends them works, but there is no transaction to roll back.
 | `CREATE`, `ALTER`, `DROP`, `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `COPY … TO 'url'` | the same as over HTTP, answered with a command tag such as `INSERT 0 2` |
 | `CALL p(…)` | the procedure's rows, or `CALL`. What it prints comes as `NOTICE` messages, which psql shows |
 | `DO LANGUAGE python \| sql $$ … $$` | the block's rows, or the tag `DO`. What Python prints comes as `NOTICE` messages. It needs an admin, and Python needs a node started with `--python` |
-| `SET`, `RESET`, `BEGIN`, `START`, `COMMIT`, `END`, `ROLLBACK`, `DISCARD`, `DEALLOCATE`, `CLOSE` | accepted, and ignored |
+| `BEGIN`, `START TRANSACTION`, `COMMIT`, `END`, `ROLLBACK`, `ABORT` | a transaction: its statements one commit |
+| `SAVEPOINT`, `RELEASE`, `ROLLBACK TO` | refused (`0A000`): a transaction commits or rolls back whole |
+| `SET`, `RESET`, `DISCARD`, `DEALLOCATE`, `CLOSE` | accepted, and ignored |
 | `SHOW server_version`, `standard_conforming_strings`, `transaction_isolation`, `client_encoding` | a fixed answer |
 | `SHOW TABLES` | the lake's tables and views, and the `information_schema` views |
 | `DESCRIBE t` | its columns and types, with Arrow's type names |
@@ -291,3 +294,25 @@ with adbc.connect("postgresql://admin@localhost:5432/lake") as conn:
 ```text
 {'id': [1, 2], 'item': ['tea', 'cake']}
 ```
+
+## Error codes
+
+Errors carry Postgres's codes (SQLSTATE), so a driver can tell them apart. The same code is on
+every door: HTTP's `x-pondra-sqlstate` header, Flight SQL's metadata, `PondraError.sqlstate` in
+Python and `err.sqlstate` in JavaScript.
+
+| Code | When |
+|---|---|
+| `23514` | a row breaks a `CHECK`, or a view's expectation that fails writes |
+| `23502` | a `NOT NULL` column left empty |
+| `40001` | a transaction's row changed by another commit since it began: run it again |
+| `25P02` | a statement in a transaction that already failed |
+| `42P01`, `42703`, `42883` | no such table, column, function |
+| `42601` | a syntax error |
+| `42501` | a user's grants don't allow it |
+| `42P07` | a table or view of that name exists |
+| `22012`, `22003`, `22P02` | division by zero, a number out of range, a value that doesn't cast |
+| `57014`, `53200` | a statement timeout; out of memory |
+| `0A000` | not supported |
+| `XX000` | anything else |
+

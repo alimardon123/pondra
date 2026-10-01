@@ -1,0 +1,45 @@
+schemas 0
+changes 0
+guard 0
+files 0
+layouts 0
+clusters 0
+copies 0
+streams 0
+columns 1
+fills 0
+dedup 0
+procedures 1
+functions 0
+external 0
+names 0
+answers 0
+writes 0
+adopted 0
+ids 0
+rewrites 0
+followers 0
+transactions 0
+upserts 0
+live 0
+temps 0
+across 0
+found 0
+renames 0
+workspace 0
+server 1
+scale 0
+flight 0
+users 0
+secrets 0
+safety 0
+versions 0
+stopped 0
+pipelines 0
+begin 0
+doors 0
+reader 0
+done
+procedures 0 (again, after the stack fix)
+server 0 (again, under its own name: the suite finds its nodes by name)
+columns 0 (again: a flake in the first run)

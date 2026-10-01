@@ -186,7 +186,14 @@ pub async fn run(lake: &Lake, seq: &Sequencer, sql: &str, job: &str) -> Result<V
         bail!("materialized view {v} is still being filled from {table}'s rows: change them once it is (in a moment)"); // (it reads them as they were)
     }
     let upto = lake.visible(); // (one snapshot for every query below: the lock keeps its files)
-    let (old, new) = rows_of(lake, &table, &meta, &stmt, upto).await?;
+    let point = match &stmt {
+        crate::write::Stmt::Update(_, set, Some(cond)) if !append => crate::txn::point_change(lake, &table, &stored, None, set, cond).await?, // (one key: no planning, ADR-036 §6)
+        _ => None,
+    };
+    let (old, new) = match point {
+        Some(p) => p,
+        None => rows_of(lake, &table, &meta, &stmt, upto).await?,
+    };
     commit(lake, seq, &table, &stored, old, new, job).await
 }
 
@@ -320,10 +327,34 @@ async fn merge(lake: &Lake, table: &str, meta: &TableMeta, m: &Merge, upto: u64)
 /// `{t}$deleted` (an append table) or as delete markers (a keyed one). `meta` as stored; the rows
 /// are under their SQL names (the log takes them so: `log::pack`).
 async fn commit(lake: &Lake, seq: &Sequencer, table: &str, meta: &TableMeta, old: Vec<RecordBatch>, new: Vec<RecordBatch>, job: &str) -> Result<Value> {
+    let (pending, (replaced, added, inserted)) = appends(lake, seq, table, meta, old, new, &format!("sql:{job}")).await?;
+    if pending.is_empty() {
+        return Ok(j!({"rows": 0}));
+    }
+    Ok(match submit(lake, seq, &pending).await? {
+        Outcome::Acks(acks) if acks.iter().all(|a| !a.duplicate) => j!({"rows": replaced + inserted, "updated": added - inserted, "deleted": replaced + inserted - added, "inserted": inserted}),
+        _ => j!({"duplicate": true}), // (this job's change is already in)
+    })
+}
+
+/// Appends as one flush, packed again while the views change under it.
+pub async fn submit(lake: &Lake, seq: &Sequencer, pending: &[Append]) -> Result<Outcome> {
+    loop {
+        match seq.submit(pack(lake, pending).await?).await? {
+            Outcome::Retry(r) if r.is_empty() => tokio::time::sleep(std::time::Duration::from_millis(10)).await, // (views changed: pack again)
+            o => return Ok(o),
+        }
+    }
+}
+
+/// A change of `table` as appends, stamped (producer `{producer}` and `{producer}:deleted`, seq 1):
+/// and its counts, (rows replaced, rows added, of them new). None to append: nothing changes.
+#[allow(clippy::type_complexity)]
+pub async fn appends(lake: &Lake, seq: &Sequencer, table: &str, meta: &TableMeta, old: Vec<RecordBatch>, new: Vec<RecordBatch>, producer: &str) -> Result<(Vec<Append>, (usize, usize, usize))> {
     let rows = |b: &[RecordBatch]| b.iter().map(|b| b.num_rows()).sum::<usize>();
     let (replaced, added) = (rows(&old), rows(&new));
     if replaced + added == 0 {
-        return Ok(j!({"rows": 0}));
+        return Ok((vec![], (0, 0, 0)));
     }
     // (new versions carry their ids, new rows don't yet: one schema for both)
     let one = |b: Vec<RecordBatch>, s: SchemaRef| -> Result<Option<RecordBatch>> {
@@ -342,13 +373,15 @@ async fn commit(lake: &Lake, seq: &Sequencer, table: &str, meta: &TableMeta, old
         crate::defaults::check(meta, table, n)?; // (an UPDATE may not empty a NOT NULL column)
     }
     let inserted = new.as_ref().and_then(|n| Some(n.column_by_name(ROW_ID)?.null_count())).unwrap_or(0); // (new rows: no id yet)
-    let src = |p: &str| Src { producer: format!("sql:{job}{p}"), seq: 1, prev: None };
+    let src = |p: &str| Src { producer: format!("{producer}{p}"), seq: 1, prev: None };
     let append = |table: &str, batch: RecordBatch, src: Src| Append { table: table.into(), src, batch, ack: tokio::sync::oneshot::channel().0 };
     let mut pending = vec![];
     if meta.key.is_empty() {
-        companion(lake, table, meta).await?;
-        for (view, vmeta) in crate::views::row_views(lake, table).await? {
-            companion(lake, &view, &vmeta).await?; // (its rows of the old ones go there: `views::derive`)
+        if old.is_some() {
+            companion(lake, table, meta).await?;
+            for (view, vmeta) in crate::views::row_views(lake, table).await? {
+                companion(lake, &view, &vmeta).await?; // (its rows of the old ones go there: `views::derive`)
+            }
         }
         pending.push(append(table, new.unwrap_or_else(|| RecordBatch::new_empty(ids)), src(""))); // (empty: its producer's seq still advances)
         if let Some(old) = old {
@@ -375,16 +408,7 @@ async fn commit(lake: &Lake, seq: &Sequencer, table: &str, meta: &TableMeta, old
         };
         a.batch = sys::stamp(&a.batch, first)?;
     }
-    let outcome = loop {
-        match seq.submit(pack(lake, &pending).await?).await? {
-            Outcome::Retry(r) if r.is_empty() => tokio::time::sleep(std::time::Duration::from_millis(10)).await, // (views changed: pack again)
-            o => break o,
-        }
-    };
-    Ok(match outcome {
-        Outcome::Acks(acks) if acks.iter().all(|a| !a.duplicate) => j!({"rows": replaced + inserted, "updated": added - inserted, "deleted": replaced + inserted - added, "inserted": inserted}),
-        _ => j!({"duplicate": true}), // (this job's change is already in)
-    })
+    Ok((pending, (replaced, added, inserted)))
 }
 
 /// A batch's `_row_id`s.
@@ -487,7 +511,7 @@ pub async fn feed(lake: &Lake, table: &str, after: u64, upto: Option<u64>) -> Re
 /// out (another engine's copy-on-write `DELETE`, `UPDATE`, `MERGE`, overwrite: ADR-029 §7) and the
 /// rows they deleted by position (its merge-on-read ones: §4) — as those commits' old versions:
 /// `_version` and `_updated_at` the commit's.
-async fn taken_out(lake: &Lake, table: &str, after: u64, upto: Option<u64>) -> Result<Vec<RecordBatch>> {
+pub async fn taken_out(lake: &Lake, table: &str, after: u64, upto: Option<u64>) -> Result<Vec<RecordBatch>> {
     let end = upto.map_or("s0".to_string(), |u| seg_key(u + 1));
     let mut out = vec![];
     for (key, seg) in lake.cat.scan::<Segment>(&seg_key(after + 1), &end).await? {

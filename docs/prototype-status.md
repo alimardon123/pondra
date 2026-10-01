@@ -1,6 +1,6 @@
 # Prototype status: Pondra, a streamhouse in one binary
 
-**Date:** 2026-10-01 (the workspace, rounds 27 and 28, and round 29 part 1 with the owner's second and third lists, and part 2: users, grants, secrets, TLS, audit, quotas; files with versions) · **Plan:** ADR-002 to ADR-035, `roadmap.md` · **Code:** `pondra.zip` / `pondra.bundle` (≈30,700 lines of Rust, plus Python and JavaScript clients, a documentation website, packaging, and test and benchmark tools)
+**Date:** 2026-10-01 (the workspace, rounds 27 and 28, round 29 (the owner's lists, users, grants, secrets, TLS, audit, quotas, files with versions, C5), and round 30: pipelines, transactions, error codes, the point path) · **Plan:** ADR-002 to ADR-035, `roadmap.md` · **Code:** `pondra.zip` / `pondra.bundle` (≈30,700 lines of Rust, plus Python and JavaScript clients, a documentation website, packaging, and test and benchmark tools)
 **Name:** the prototype formerly called `lh` is now **Pondra**. The name is free on crates.io, PyPI and npm. A small personal-finance app uses it (pondra.app), a different category; run a trademark search before a public launch.
 
 ## Where it stands
@@ -14,6 +14,52 @@ One Rust binary replaces the Kafka + Flink + Spark + metastore + ZooKeeper stack
 - upsert and merge tables.
 
 Start more copies on the same bucket to scale out. The only state is object storage. There's no JVM, no database server and no coordination service.
+
+**Then (2026-10-01, round 30): pipelines, and a database's behaviour from every door** (ADR-036):
+
+1. **Pipelines** (the owner's ask, as Databricks' DLT has them): a materialized view may follow
+   another, and every stage moves in the commit that wrote the rows that started it (bronze →
+   silver → gold, no lag between stages). A view of a GROUP BY view must be a rollup (its keys,
+   `sum` of sums and counts, `min` of mins, `max` of maxes), else it is refused saying why; changes
+   (`UPDATE`, `DELETE`) flow down the chain in one commit; a pipeline is dropped from its end.
+   `pondra.pipelines`, and the console's details panel draws each table's pipeline.
+2. **Expectations**: `CONSTRAINT c CHECK (…) [ON VIOLATION DROP ROW | FAIL]` and `EXPECT (…)` on a
+   materialized view, counted exactly in `pondra$expectations` with the rows (`pondra.expectations`).
+   A row a `FAIL` one refuses fails its own INSERT only: the flush it was packed in is checked
+   producer by producer and the others go on.
+3. **CHECK constraints on tables**, every door, `23514` as Postgres sends it.
+4. **Postgres's error codes everywhere** (`codes.rs`): the Postgres port, HTTP's
+   `x-pondra-sqlstate`, Flight SQL's metadata, MCP's text, `PondraError.sqlstate` in Python and
+   `err.sqlstate` in JavaScript.
+5. **Transactions**: `BEGIN` … `COMMIT` is one commit with snapshot isolation (Postgres's REPEATABLE
+   READ): reads see the transaction's own writes over its snapshot; a row another commit changed
+   first refuses it with 40001; a failed statement fails it (25P02). The Postgres port (drivers'
+   transactions, psycopg's status), HTTP and the clients (a session; `with con.transaction():`).
+   **pgbench's own TPC-B script runs, its balances right** (the roadmap's gate): 1 client 133 tps
+   (7.5 ms a transaction; 28 tps when it first ran this round), 4 clients 91 tps with most
+   retrying on the one branch row; Postgres on the same machine 997 and 1,793 tps
+   (`tools/bench/pgbench.py --postgres`, a gate in `gates.py`).
+6. **The point path from every door**: a key lookup through the Postgres port is answered from the
+   serving path before anything is planned, its `Describe` and parameter types too, each worked out
+   once per catalog version: with psycopg (`vs_postgres.py`), p50 6.5 ms → **0.29 ms** (Postgres
+   0.09 ms), the roadmap's ≤ 0.5 ms. The log's segments are decoded once per node, a lookup reads
+   only those committed since the last (`Lake::segments_after`), and a big log batch not yet
+   tiered is looked up through an index of its keys made once (0.93 → 0.53 ms for a row in a
+   100,000-row INSERT). In a transaction a lookup reads its own version or its snapshot's
+   (6.2 → 0.4 ms); a one-key `UPDATE` of a keyed table is worked out without planning, in a
+   transaction (6.5 → 0.7 ms) or not (10.8 → 2.5 ms).
+7. **What a pipeline costs** (`tools/bench/pipeline.py`, 4 producers of 1,000-row batches over
+   HTTP on this 2-vCPU machine): no view 183,000 rows/s; with silver (two expectations) 156,000;
+   with gold 135,000; with platinum 131,000 (−29% for three stages), the append p50 16 → 24 ms;
+   at the moment the producers stop, every stage equals its query over the source.
+8. **The doors matrix** (`harness.py doors`): nine features through HTTP, Python, Postgres, Flight
+   SQL, JavaScript and MCP; every cell right, or refused by name (a transaction on Flight SQL and
+   MCP, which have no session). It found three gaps, fixed: Flight SQL ran no `CALL` and lost its
+   errors' codes, MCP's errors had none.
+9. **Found and fixed:** the new key-lookup work, inline in the statement loop procedures recurse
+   through, overflowed a worker's stack 16 procedures deep: put on the heap, as the rest is.
+10. **Tests**: `harness.py pipelines`, `begin`, `doors`, and every other suite; `tools/bench/pgbench.py`,
+    `tools/bench/pipeline.py`.
 
 **Then (2026-10-01): every file keeps its versions, a stopped run says so, a faster cold start**
 (ADR-035 §8, round 29 part 3):

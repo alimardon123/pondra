@@ -44,7 +44,44 @@ pub struct View {
     /// Filled from the rows its source had when it was made (views made from Pondra 0.21 on).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fill: Option<Fill>,
+    /// What each of its rows should meet (ADR-036 §2).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub expect: Vec<Expect>,
 }
+
+/// An expectation, as Databricks' pipelines have them: a condition each of a view's rows should
+/// meet, checked as they are written. A row breaks it when the condition is false (NULL passes, as
+/// with Postgres's CHECK). `CONSTRAINT c CHECK (…)` fails the write that brings such a row;
+/// `EXPECT (…)` keeps it and counts it; `ON VIOLATION DROP ROW | FAIL` says which, for either.
+/// Counted in `pondra$expectations`, committed with the rows (`pondra.expectations`).
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct Expect {
+    pub name: String,
+    pub check: String,
+    pub on: OnViolation,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug)]
+#[serde(rename_all = "lowercase")]
+pub enum OnViolation {
+    Keep,
+    Drop,
+    Fail,
+}
+
+impl OnViolation {
+    fn word(self) -> &'static str {
+        match self {
+            OnViolation::Keep => "keep",
+            OnViolation::Drop => "drop",
+            OnViolation::Fail => "fail",
+        }
+    }
+}
+
+/// Where expectations' failed rows are counted: a merge table, a row per view, expectation and
+/// flush that had any (its key), combined as it is read.
+pub const EXPECTED: &str = "pondra$expectations";
 
 /// A view's filling (ADR-022). Its rows are its source's rows up to commit `upto`, run through
 /// its SQL once (by the leader: `fill_all`, producer `fill:{view}`), and the rows every flush
@@ -105,8 +142,8 @@ impl View {
 /// `CREATE MATERIALIZED VIEW … WITH (window = 'w', size_secs = 60, lateness_secs = 10)` (and
 /// `slide_secs = 10`: sliding), `WITH (session = 'ts', gap_secs = 1800, lateness_secs = 5)`, or
 /// `WITH (join = 'streams', time = 'ts', within_secs = 600)`: what `POST /views/{v}?…` takes.
-pub fn options(kv: &std::collections::BTreeMap<String, String>) -> Result<(Option<Emit>, Option<Sessions>, Option<Join>)> {
-    const KNOWN: [&str; 9] = ["window", "size_secs", "slide_secs", "lateness_secs", "session", "gap_secs", "join", "time", "within_secs"];
+pub fn options(kv: &std::collections::BTreeMap<String, String>) -> Result<(Option<Emit>, Option<Sessions>, Option<Join>, Vec<Expect>)> {
+    const KNOWN: [&str; 10] = ["window", "size_secs", "slide_secs", "lateness_secs", "session", "gap_secs", "join", "time", "within_secs", "expect"];
     if let Some(k) = kv.keys().find(|k| !KNOWN.contains(&k.as_str())) {
         bail!("{k}: a materialized view's options are {}", KNOWN.join(", "));
     }
@@ -125,19 +162,123 @@ pub fn options(kv: &std::collections::BTreeMap<String, String>) -> Result<(Optio
     };
     ensure!(join.as_ref().is_none_or(|j| j.within_secs.is_none() || !j.time.is_empty()), "within_secs needs time = '…': the column (or one per table) it bounds");
     let sessions = kv.get("session").map(|t| Ok::<_, anyhow::Error>(Sessions { time: t.clone(), gap_secs: num("gap_secs", 1800)?, lateness_secs, keys: vec![] })).transpose()?;
-    Ok((emit, sessions, join))
+    let expect: Vec<Expect> = match kv.get("expect") {
+        Some(e) => serde_json::from_str(e).context("expect: a JSON list of {\"name\", \"check\", \"on\": \"keep\" | \"drop\" | \"fail\"}")?,
+        None => vec![],
+    };
+    Ok((emit, sessions, join, expect))
 }
+/// `CREATE MATERIALIZED VIEW v (CONSTRAINT c CHECK (…) [ON VIOLATION DROP ROW | FAIL], …) AS …`:
+/// the statement without its expectations, and them (`EXPECT (…)` too, Databricks' word; a column
+/// named in the list stays). None: no such list.
+pub fn constraints(sql: &str) -> Result<Option<(String, Vec<Expect>)>> {
+    use datafusion::sql::sqlparser::{dialect::GenericDialect, tokenizer::{Token, Tokenizer}};
+    let head = sql.trim_start().chars().take(64).collect::<String>().to_uppercase();
+    if !head.starts_with("CREATE") || !head.contains("MATERIALIZED") {
+        return Ok(None); // (every other statement, as fast as before)
+    }
+    let Ok(tokens) = Tokenizer::new(&GenericDialect {}, sql).tokenize() else { return Ok(None) };
+    let solid: Vec<usize> = (0..tokens.len()).filter(|&i| !matches!(tokens[i], Token::Whitespace(_))).collect();
+    let word = |i: usize| match solid.get(i).map(|&j| &tokens[j]) {
+        Some(Token::Word(w)) if w.quote_style.is_none() => w.value.to_uppercase(),
+        _ => String::new(),
+    };
+    let is = |i: usize, t: Token| solid.get(i).is_some_and(|&j| tokens[j] == t);
+    let mut i = 0;
+    for w in ["CREATE", "OR", "REPLACE", "MATERIALIZED", "VIEW", "IF", "NOT", "EXISTS"] {
+        match (w, word(i) == w) {
+            (_, true) => i += 1,
+            ("OR" | "REPLACE" | "IF" | "NOT" | "EXISTS", false) => {}
+            _ => return Ok(None),
+        }
+    }
+    i += 1; // (the name, in parts)
+    while is(i, Token::Period) {
+        i += 2;
+    }
+    if !is(i, Token::LParen) {
+        return Ok(None);
+    }
+    let (open, mut items, mut item, mut depth) = (i, vec![], vec![], 0);
+    let close = loop {
+        i += 1;
+        let Some(&j) = solid.get(i) else { return Ok(None) };
+        match &tokens[j] {
+            Token::LParen => depth += 1,
+            Token::RParen if depth == 0 => break i,
+            Token::RParen => depth -= 1,
+            Token::Comma if depth == 0 => {
+                items.push(std::mem::take(&mut item));
+                continue;
+            }
+            _ => {}
+        }
+        item.push(i);
+    };
+    items.push(item);
+    let text = |a: usize, b: usize| tokens[solid[a]..=solid[b]].iter().map(|t| t.to_string()).collect::<String>();
+    let (mut columns, mut expect) = (vec![], vec![]);
+    for it in items.into_iter().filter(|it| !it.is_empty()) {
+        let (mut k, mut name) = (it[0], None);
+        if word(k) == "CONSTRAINT" {
+            name = Some(match solid.get(k + 1).map(|&j| &tokens[j]) {
+                Some(Token::Word(w)) if w.quote_style.is_none() => w.value.to_lowercase(),
+                Some(Token::Word(w)) => w.value.clone(),
+                _ => bail!("CONSTRAINT <name> CHECK (…)"),
+            });
+            k += 2;
+        }
+        let on = match word(k).as_str() {
+            "CHECK" => OnViolation::Fail,
+            "EXPECT" => OnViolation::Keep,
+            _ if name.is_none() => {
+                columns.push(text(it[0], *it.last().unwrap_or(&it[0])));
+                continue;
+            }
+            _ => bail!("CONSTRAINT {}: CHECK (…) or EXPECT (…), then ON VIOLATION DROP ROW or FAIL if you like", name.unwrap_or_default()),
+        };
+        ensure!(is(k + 1, Token::LParen), "{} (…): the condition in parentheses", word(k));
+        let (start, mut end, mut d) = (k + 1, k + 1, 0);
+        while end <= *it.last().unwrap_or(&end) {
+            match &tokens[solid[end]] {
+                Token::LParen => d += 1,
+                Token::RParen if d == 1 => break,
+                Token::RParen => d -= 1,
+                _ => {}
+            }
+            end += 1;
+        }
+        ensure!(end > start + 1 && is(end, Token::RParen), "{} (…): a condition", word(k));
+        let rest: Vec<String> = (end + 1..=*it.last().unwrap_or(&end)).map(word).collect();
+        let on = match rest.iter().map(String::as_str).collect::<Vec<_>>()[..] {
+            [] => on,
+            ["ON", "VIOLATION", "DROP", "ROW"] => OnViolation::Drop,
+            ["ON", "VIOLATION", "FAIL"] | ["ON", "VIOLATION", "FAIL", "UPDATE"] => OnViolation::Fail,
+            _ => bail!("after {} (…): ON VIOLATION DROP ROW, or ON VIOLATION FAIL", word(k)),
+        };
+        let check = text(start + 1, end - 1).trim().to_string();
+        expect.push(Expect { name: name.unwrap_or_else(|| format!("expectation_{}", expect.len() + 1)), check, on });
+    }
+    if expect.is_empty() {
+        return Ok(None);
+    }
+    let list = if columns.is_empty() { String::new() } else { format!(" ({})", columns.join(", ")) };
+    let rest = tokens[solid[close] + 1..].iter().map(|t| t.to_string()).collect::<String>();
+    Ok(Some((format!("{}{list}{rest}", text(0, open - 1)), expect)))
+}
+
 /// A session view's bound: no session still open starts before this (µs).
 fn open_key(name: &str) -> String { format!("w/{name}") }
 
 /// Register view `name` (leader only): its table gets the query's output columns; a GROUP BY
 /// query makes it a merge table keyed by the group columns.
-pub async fn create(lake: &Lake, name: &str, sql: &str, mut emit: Option<Emit>, sessions: Option<Sessions>, join: Option<Join>) -> Result<()> {
+#[allow(clippy::too_many_arguments)]
+pub async fn create(lake: &Lake, name: &str, sql: &str, mut emit: Option<Emit>, sessions: Option<Sessions>, join: Option<Join>, expect: Vec<Expect>) -> Result<()> {
     if let Some(v) = lake.cat.get::<View>(&view_key(name)).await? {
         let windows = |e: &Option<Emit>| e.as_ref().map(|e| (e.window.clone(), e.size_secs, e.lateness_secs, e.slide_secs));
         let gaps = |s: &Option<Sessions>| s.as_ref().map(|s| (s.time.clone(), s.gap_secs, s.lateness_secs));
         let joins = |j: &Option<Join>| j.as_ref().map(|j| (j.time.clone(), j.within_secs));
-        let same = v.sql == sql && windows(&v.emit) == windows(&emit) && gaps(&v.sessions) == gaps(&sessions) && joins(&v.join) == joins(&join);
+        let same = v.sql == sql && windows(&v.emit) == windows(&emit) && gaps(&v.sessions) == gaps(&sessions) && joins(&v.join) == joins(&join) && v.expect == expect;
         ensure!(same, "view {name} already exists, with other SQL or options");
         return Ok(()); // (asked again, the same: a notebook cell run twice)
     }
@@ -145,28 +286,43 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, mut emit: Option<Emit>, 
     let (other, source) = crate::ddl::resolve(lake, &first_table(sql)?).await?;
     ensure!(other.is_none(), "a view follows a table of this lake");
     let src: TableMeta = lake.cat.get::<TableMeta>(&table_key(&source)).await?.with_context(|| format!("no table {source}"))?.logical(); // (SQL's names: ADR-022)
-    // A view's own rows are written in the commit that derives them, not taken in as a table's
-    // are, so a view of them would stay empty: refused until chains are followed (the roadmap).
-    let upstream = source.strip_suffix("_final").unwrap_or(&source);
-    ensure!(lake.cat.get::<View>(&view_key(upstream)).await?.is_none(), "{source} is a materialized view's table, and a materialized view of one isn't followed yet: make {name} from {}'s own tables, or make it a stored view (CREATE VIEW {name} AS …), which reads {source} as it is", upstream);
+    // A view of a view: a pipeline (ADR-036 §1). Its rows are derived from the other's in the
+    // same flush, so in the same commit (`derive`). A GROUP BY view's table keeps partial rows,
+    // combined as they are read: what follows it must combine them too (`merges`: a rollup).
+    let upstream = lake.cat.get::<View>(&view_key(&source)).await?;
+    let partial = upstream.is_some() && !src.merge.is_empty();
+    ensure!(expect.is_empty() || (sessions.is_none() && join.is_none() && emit.is_none()), "expectations check a view's rows as it writes them: a view that emits windows or sessions, or joins streams, writes them later. Put them on a view before it");
     if let Some(s) = sessions {
         ensure!(emit.is_none() && join.is_none(), "a view emits windows or sessions, or joins streams: one of them");
+        ensure!(!partial, "{source} is a GROUP BY view, whose table keeps partial rows: sessions are cut from rows, so make {name} from {source}'s own source");
         return create_sessions(lake, name, sql, source, &src, s).await;
     }
     if let Some(j) = join {
         ensure!(emit.is_none(), "a view emits windows or joins streams, not both");
+        ensure!(!partial, "{source} is a GROUP BY view, whose table keeps partial rows: streams are joined row by row, so make {name} from {source}'s own source");
         return create_join(lake, name, sql, source, j).await;
     }
     let planned = crate::asof::rewrite(sql)?;
     let plan = session(lake, &planned, "").await?.sql(&planned).await?.logical_plan().clone();
-    let (key, merge) = merges(&plan)?;
+    let (key, merge) = merges(&plan, partial.then_some((source.as_str(), &src)))?;
     let columns: Vec<(String, String)> = plan.schema().fields().iter().map(|f| (f.name().clone(), crate::query::type_name(f.data_type()))).collect();
     if let Some((c, _)) = columns.iter().find(|(c, _)| crate::sys::NAMES.contains(&c.as_str())) {
         bail!("{c} is a system column of the view's own table: name it something else ({c} AS source{c})");
     }
-    let ids = merge.is_empty() && alone(&plan, false);
+    // (row by row over a table, or over a view that is: then a row keeps its first source row's id)
+    let ids = merge.is_empty() && alone(&plan, false) && upstream.as_ref().is_none_or(|u| u.ids);
+    ensure!(expect.is_empty() || merge.is_empty(), "{name} is a GROUP BY view: its table keeps partial rows, so expectations can't check its totals. Put them on the rows before it (a view of {source} without GROUP BY, which {name} then follows)");
     let meta = TableMeta { columns, key, merge, publish: default_publish(), ids: true, tiered: lake.visible(), ..Default::default() };
+    if !expect.is_empty() {
+        expectations(lake, name, &source, &planned, &meta, &expect).await?;
+    }
     let mut puts = vec![(table_key(name), json(&meta))];
+    if !expect.is_empty() && lake.cat.get::<TableMeta>(&table_key(EXPECTED)).await?.is_none() {
+        let s = |c: &str| (c.to_string(), "Utf8".to_string());
+        let columns = vec![s("view"), s("id"), s("expectation"), s("action"), ("failed".into(), "Int64".into())];
+        let key = ["view", "id", "expectation", "action"].map(String::from).to_vec();
+        puts.push((table_key(EXPECTED), json(&TableMeta { columns, key, merge: [("failed".to_string(), "sum".to_string())].into(), tiered: lake.visible(), ..Default::default() })));
+    }
     if let Some(e) = &mut emit {
         let is_time = meta.columns.iter().any(|(c, t)| *c == e.window && t.starts_with("Timestamp"));
         ensure!(meta.key.contains(&e.window) && is_time, "emit: the window column must be a GROUP BY timestamp (date_bin(…) AS {})", e.window);
@@ -176,8 +332,92 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, mut emit: Option<Emit>, 
         puts.push((table_key(&format!("{name}_final")), json(&TableMeta { columns, publish: default_publish(), ids: true, tiered: lake.visible(), ..Default::default() })));
     }
     let fill = Some(Fill { id: uuid::Uuid::new_v4().to_string(), upto: None }); // (from the rows already there)
-    puts.push((view_key(name), json(&View { source, sql: sql.into(), emit, sessions: None, ids, join: None, fill })));
+    puts.push((view_key(name), json(&View { source, sql: sql.into(), emit, sessions: None, ids, join: None, fill, expect })));
     lake.cat.commit(puts, &[]).await
+}
+
+/// A new view's expectations: each a condition over its columns; and one that fails a write
+/// (`FAIL`) refuses the view if rows already there break it (they would fill it).
+async fn expectations(lake: &Lake, name: &str, source: &str, planned: &str, meta: &TableMeta, expect: &[Expect]) -> Result<()> {
+    let empty = RecordBatch::new_empty(crate::query::schema(&meta.columns)?);
+    let mut names = std::collections::HashSet::new();
+    for e in expect {
+        ensure!(names.insert(e.name.to_lowercase()), "{name} has two expectations named {}", e.name);
+        crate::defaults::breaking(&empty, &e.check).with_context(|| format!("expectation {} of {name}: CHECK ({})", e.name, e.check))?;
+        if e.on == OnViolation::Fail {
+            let sql = format!("SELECT count(*) AS n FROM ({planned}) AS _v WHERE NOT ({})", e.check);
+            let rows = session(lake, &sql, "").await?.sql(&sql).await?.collect().await?;
+            let n = rows.first().and_then(|b| b.column(0).as_any().downcast_ref::<datafusion::arrow::array::Int64Array>()).map_or(0, |c| c.value(0));
+            ensure!(n == 0, "{n} of the rows {source} has now would break expectation {} of {name}, CHECK ({}): fix them first, or make it ON VIOLATION DROP ROW", e.name, e.check);
+        }
+    }
+    Ok(())
+}
+
+/// A row an expectation or a table's CHECK refuses (Postgres's `check_violation`, 23514).
+#[derive(Debug)]
+pub struct Violation(pub String);
+
+impl std::fmt::Display for Violation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(&self.0) }
+}
+
+impl std::error::Error for Violation {}
+
+/// Was this error a row refused by a CHECK or an expectation?
+pub fn refused(e: &anyhow::Error) -> bool { e.chain().any(|c| c.is::<Violation>()) }
+
+/// A row-by-row view's rows taken back (`{view}$deleted`), less those its expectations never let
+/// in: a view that adds them up must not take back what it never had.
+fn let_in(v: &View, rows: RecordBatch) -> Result<RecordBatch> {
+    let mut keep = vec![true; rows.num_rows()];
+    for e in v.expect.iter().filter(|e| e.on != OnViolation::Keep) {
+        let bad = crate::defaults::breaking(&rows, &e.check)?;
+        keep.iter_mut().zip(bad.values().iter()).for_each(|(k, b)| *k &= !b);
+    }
+    Ok(match keep.iter().all(|k| *k) {
+        true => rows,
+        false => datafusion::arrow::compute::filter_record_batch(&rows, &keep.into())?,
+    })
+}
+
+/// A view's new rows through its expectations: the rows it keeps, and a row of
+/// `pondra$expectations` per expectation some broke. A `FAIL` one refuses the write (`filling`:
+/// rows that were there when the view was made can't be refused any more: they are dropped).
+fn expected(view: &str, v: &View, rows: RecordBatch, filling: bool) -> Result<(RecordBatch, Option<RecordBatch>)> {
+    use datafusion::arrow::array::{Int64Array, StringArray};
+    if v.expect.is_empty() || rows.num_rows() == 0 {
+        return Ok((rows, None));
+    }
+    let (mut keep, mut failed) = (vec![true; rows.num_rows()], vec![]);
+    for e in &v.expect {
+        let bad = crate::defaults::breaking(&rows, &e.check)?;
+        let n = bad.true_count();
+        if n == 0 {
+            continue;
+        }
+        if e.on == OnViolation::Fail && !filling {
+            return Err(anyhow::Error::new(Violation(format!("new row for relation \"{view}\" violates check constraint \"{}\": CHECK ({})", e.name, e.check))));
+        }
+        if e.on != OnViolation::Keep {
+            keep.iter_mut().zip(bad.values().iter()).for_each(|(k, b)| *k &= !b);
+        }
+        failed.push((e, n as i64));
+    }
+    if failed.is_empty() {
+        return Ok((rows, None));
+    }
+    let text = |f: &dyn Fn(&(&Expect, i64)) -> String| std::sync::Arc::new(failed.iter().map(f).map(Some).collect::<StringArray>()) as datafusion::arrow::array::ArrayRef;
+    let id = v.fill.as_ref().map_or("", |f| f.id.as_str());
+    let counts = RecordBatch::try_from_iter(vec![
+        ("view", text(&|_| view.to_string())),
+        ("id", text(&|_| id.to_string())),
+        ("expectation", text(&|(e, _)| e.name.clone())),
+        ("action", text(&|(e, _)| e.on.word().to_string())),
+        ("failed", std::sync::Arc::new(failed.iter().map(|(_, n)| *n).collect::<Int64Array>())),
+    ])?;
+    let kept = datafusion::arrow::compute::filter_record_batch(&rows, &keep.into())?;
+    Ok((kept, Some(counts)))
 }
 
 /// A session view: the SQL runs over each closed session's rows, grouped by session too, so its
@@ -201,7 +441,7 @@ async fn create_sessions(lake: &Lake, name: &str, sql: &str, source: String, src
     ensure!(s.keys.iter().all(|k| out.field_with_unqualified_name(k).is_ok()), "a session view SELECTs its GROUP BY columns, as they are named");
     let columns = out.fields().iter().map(|f| (f.name().clone(), crate::query::type_name(f.data_type()))).collect();
     let meta = TableMeta { columns, publish: default_publish(), ids: true, tiered: lake.visible(), ..Default::default() };
-    let view = View { source, sql: sql.into(), emit: None, sessions: Some(s), ids: false, join: None, fill: None };
+    let view = View { source, sql: sql.into(), emit: None, sessions: Some(s), ids: false, join: None, fill: None, expect: vec![] };
     lake.cat.commit(vec![(view_key(name), json(&view)), (table_key(name), json(&meta))], &[]).await
 }
 
@@ -406,6 +646,15 @@ async fn sessions(lake: &Lake, log: &crate::log::Log, view: &str, v: &View, s: &
 /// refused while they follow the table. (`append`: an append table's; a keyed table's changes are
 /// upserts, which its followers already see as new rows.)
 pub async fn can_follow(lake: &Lake, table: &str, append: bool) -> Result<()> {
+    let not = cannot_follow(lake, table, append).await?;
+    ensure!(not.is_empty(), "{table}'s rows can't change while these follow it: {}. Drop them first, or change a copy of the table", not.join("; "));
+    Ok(())
+}
+
+/// What follows `table` and can't take its rows' changes, and why: its views, what follows them
+/// (a pipeline: a row-by-row view's rows change as its source's do; a GROUP BY view's partial rows
+/// taken back arrive as new ones), and its tasks.
+async fn cannot_follow(lake: &Lake, table: &str, append: bool) -> Result<Vec<String>> {
     let mut not = vec![];
     for (k, v) in lake.cat.scan::<View>("v/", "v0").await?.into_iter().filter(|(_, v)| v.follows(table)) {
         let name = &k[2..];
@@ -422,23 +671,29 @@ pub async fn can_follow(lake: &Lake, table: &str, append: bool) -> Result<()> {
             _ if meta.columns.iter().any(|(c, t)| meta.merge.contains_key(c) && t.starts_with("UInt")) => Some("adds up an unsigned column (it can't subtract)"),
             _ => None,
         };
-        not.extend(why.map(|w| format!("view {name} ({w})")));
+        match why {
+            Some(w) => not.push(format!("view {name} ({w})")),
+            None => not.extend(Box::pin(cannot_follow(lake, name, meta.merge.is_empty())).await?),
+        }
     }
     for (k, t) in lake.cat.scan::<crate::tasks::Task>("k/", "k0").await? {
         if t.source == table {
             not.push(format!("task {} (streaming tasks see new rows only)", &k[2..]));
         }
     }
-    ensure!(not.is_empty(), "{table}'s rows can't change while these follow it: {}. Drop them first, or change a copy of the table", not.join("; "));
-    Ok(())
+    Ok(not)
 }
 
-/// The row-by-row views of `table` (`View::ids`), with their tables: a change of its rows
-/// changes theirs.
+/// The row-by-row views of `table` (`View::ids`), and theirs, with their tables: a change of its
+/// rows changes theirs.
 pub async fn row_views(lake: &Lake, table: &str) -> Result<Vec<(String, TableMeta)>> {
-    let mut out = vec![];
-    for (k, _) in lake.cat.scan::<View>("v/", "v0").await?.into_iter().filter(|(_, v)| v.source == table && v.ids) {
-        out.push((k[2..].to_string(), lake.cat.get(&table_key(&k[2..])).await?.context("view without table")?));
+    let all = lake.cat.scan::<View>("v/", "v0").await?;
+    let (mut out, mut next) = (vec![], vec![table.to_string()]);
+    while let Some(t) = next.pop() {
+        for (k, _) in all.iter().filter(|(_, v)| v.source == t && v.ids) {
+            out.push((k[2..].to_string(), lake.cat.get(&table_key(&k[2..])).await?.context("view without table")?));
+            next.push(k[2..].to_string());
+        }
     }
     Ok(out)
 }
@@ -462,28 +717,61 @@ fn alone(p: &LogicalPlan, grouped: bool) -> bool {
 /// The rows every view derives from a flush's new rows, per view table. A change's old rows
 /// (`{source}$deleted`, `change.rs`) are taken back: subtracted from a view that adds up, and, for
 /// a row-by-row view, its rows of them go to `{view}$deleted` (whose rows reads leave out).
+/// A view of a view takes the rows that view derives here (ADR-036 §1: a pipeline, bronze → silver
+/// → gold, in one flush, so in one commit): views go after the views they follow (`in_order`).
+/// Expectations keep, drop or refuse each view's new rows (`expected`), counted in
+/// `pondra$expectations`.
 pub async fn derive(lake: &Lake, new: &BTreeMap<String, Vec<RecordBatch>>) -> Result<Vec<(String, RecordBatch)>> {
-    let mut out = vec![];
-    for (key, v) in lake.cat.scan::<View>("v/", "v0").await? {
+    let (mut out, mut made) = (vec![], BTreeMap::<String, Vec<RecordBatch>>::new());
+    for (target, v) in in_order(lake.cat.scan::<View>("v/", "v0").await?) {
         if v.sessions.is_some() || v.join.is_some() {
             continue; // (sessions are cut as they close; stream joins run once rows commit)
         }
-        let (rows, gone) = (new.get(&v.source), new.get(&crate::sys::deleted(&v.source)));
-        if rows.is_none() && gone.is_none() {
+        let gone_from = crate::sys::deleted(&v.source);
+        let rows: Vec<&Vec<RecordBatch>> = [new.get(&v.source), made.get(&v.source)].into_iter().flatten().collect();
+        let gone: Vec<&Vec<RecordBatch>> = [new.get(&gone_from), made.get(&gone_from)].into_iter().flatten().collect();
+        if rows.is_empty() && gone.is_empty() {
             continue;
         }
-        let target = key[2..].to_string();
         let meta: TableMeta = lake.cat.get(&table_key(&target)).await?.context("view without table")?;
-        if let Some(rows) = rows {
-            out.push((target.clone(), view_rows(lake, &v, &meta, rows, false).await?));
+        let mut parts = vec![];
+        for rows in rows {
+            let (kept, failed) = expected(&target, &v, view_rows(lake, &v, &meta, rows, false).await?, false)?;
+            parts.push((target.clone(), kept));
+            parts.extend(failed.map(|f| (EXPECTED.to_string(), f)));
         }
-        match gone {
-            Some(gone) if !meta.merge.is_empty() => out.push((target, negated(&view_rows(lake, &v, &meta, gone, false).await?, &meta)?)),
-            Some(gone) if v.ids => out.push((crate::sys::deleted(&target), view_rows(lake, &v, &meta, gone, true).await?)),
-            _ => {}
+        for gone in gone {
+            match () {
+                _ if !meta.merge.is_empty() => parts.push((target.clone(), negated(&view_rows(lake, &v, &meta, gone, false).await?, &meta)?)),
+                _ if v.ids => parts.push((crate::sys::deleted(&target), let_in(&v, view_rows(lake, &v, &meta, gone, true).await?)?)),
+                _ => {}
+            }
+        }
+        for (t, b) in parts {
+            if b.num_rows() > 0 && t != EXPECTED {
+                made.entry(t.clone()).or_default().push(b.clone()); // (for the views that follow this one)
+            }
+            out.push((t, b));
         }
     }
     Ok(out)
+}
+
+/// Views, each after the view it follows (by table name, without the `v/`).
+fn in_order(views: Vec<(String, View)>) -> Vec<(String, View)> {
+    let names: std::collections::HashSet<String> = views.iter().map(|(k, _)| k[2..].to_string()).collect();
+    let (mut done, mut out, mut left) = (std::collections::HashSet::new(), vec![], views);
+    while !left.is_empty() {
+        let (ready, rest): (Vec<_>, Vec<_>) = left.into_iter().partition(|(_, v)| !names.contains(&v.source) || done.contains(&v.source));
+        if ready.is_empty() {
+            out.extend(rest); // (a loop: none can be made, as a view follows a table that exists)
+            break;
+        }
+        done.extend(ready.iter().map(|(k, _)| k[2..].to_string()));
+        out.extend(ready);
+        left = rest;
+    }
+    out.into_iter().map(|(k, v)| (k[2..].to_string(), v)).collect()
 }
 
 /// The views whose rows are derived as flushes are packed (`derive`): the sequencer holds every
@@ -517,6 +805,9 @@ pub async fn inline(lake: &Lake) -> Result<std::sync::Arc<Inline>> {
         let t = key[2..].to_string();
         i.by_source.entry(v.source.clone()).or_default().push(t.clone());
         i.tables.extend([crate::sys::deleted(&t), t.clone()]);
+        if !v.expect.is_empty() {
+            i.tables.insert(EXPECTED.into()); // (their counts)
+        }
         if v.fill.as_ref().is_some_and(|f| f.upto.is_none() && !BOUNDED.lock().unwrap().contains(&f.id)) {
             i.unbounded.push((t, v));
         }
@@ -586,6 +877,10 @@ pub async fn fill_all(lake: &Lake, seq: &crate::log::Sequencer, log: &crate::log
             true => view_rows(lake, &v, &meta, &rows, false).await?,
             false => RecordBatch::new_empty(crate::query::schema(&meta.columns)?),
         };
+        let (out, failed) = expected(name, &v, out, true)?;
+        if let Some(failed) = failed {
+            log.append(EXPECTED.into(), crate::log::Src { producer: format!("{producer}:expect"), seq: 1, prev: None }, failed).await?; // (once, as the filling is)
+        }
         log.append(name.to_string(), crate::log::Src { producer, seq: 1, prev: None }, out).await?;
     }
     Ok(())
@@ -646,9 +941,34 @@ fn negated(b: &RecordBatch, meta: &TableMeta) -> Result<RecordBatch> {
 
 /// For a GROUP BY query: its key columns and how each aggregate column merges. Only aggregates
 /// that combine from partial results qualify.
-fn merges(plan: &LogicalPlan) -> Result<(Vec<String>, BTreeMap<String, String>)> {
+fn merges(plan: &LogicalPlan, up: Option<(&str, &TableMeta)>) -> Result<(Vec<String>, BTreeMap<String, String>)> {
     let (mut key, mut merge) = (vec![], BTreeMap::new());
-    let Some(LogicalPlan::Aggregate(agg)) = top_aggregate(plan) else { return Ok((key, merge)) }; // no GROUP BY: rows are appended
+    // (`up`: a GROUP BY view this one follows, whose partial rows only a rollup combines right)
+    let rollup = |source: &str, m: &TableMeta| {
+        format!("{source} is a GROUP BY view: its table keeps partial rows, a few per key, combined as they are read. A view of it must combine them the same way: GROUP BY some of its keys ({}), a WHERE on those only, and sum() of its sums and counts, min() of its mins, max() of its maxes. Or read it as it is: CREATE VIEW … AS SELECT … FROM {source}", m.key.join(", "))
+    };
+    let Some(LogicalPlan::Aggregate(agg)) = top_aggregate(plan) else {
+        if let Some((source, m)) = up {
+            bail!(rollup(source, m));
+        }
+        return Ok((key, merge)); // no GROUP BY: rows are appended
+    };
+    if let Some((source, m)) = up {
+        // (its keys only, no subquery; below its GROUP BY, filters, then the view's table — whose
+        // reading, which combines its rows, the plan shows inlined under its name)
+        use datafusion::common::tree_node::TreeNode;
+        let keys = |e: &Expr| e.column_refs().iter().all(|c| m.key.contains(&c.name)) && !e.exists(|e| Ok(matches!(e, Expr::ScalarSubquery(_) | Expr::Exists(_) | Expr::InSubquery(_)))).unwrap_or(true);
+        let mut ok = agg.group_expr.iter().all(keys);
+        let mut below = agg.input.as_ref();
+        loop {
+            match below {
+                LogicalPlan::Filter(f) => (ok, below) = (ok && keys(&f.predicate), f.input.as_ref()),
+                LogicalPlan::SubqueryAlias(_) | LogicalPlan::TableScan(_) => break,
+                _ => break ok = false,
+            }
+        }
+        ensure!(ok, rollup(source, m));
+    }
     let plain = "an aggregating view must be a plain SELECT … GROUP BY (no HAVING, ORDER BY or LIMIT)";
     let LogicalPlan::Projection(p) = plan else { bail!(plain) };
     ensure!(matches!(p.input.as_ref(), LogicalPlan::Aggregate(_)), plain);
@@ -661,13 +981,26 @@ fn merges(plan: &LogicalPlan) -> Result<(Vec<String>, BTreeMap<String, String>)>
         }
         let Expr::AggregateFunction(a) = agg.aggr_expr[i - agg.group_expr.len()].clone().unalias() else { bail!("unexpected aggregate") };
         ensure!(!a.params.distinct, "DISTINCT aggregates can't be combined from partial results");
-        let m = match a.func.name() {
+        let mut m = match a.func.name() {
             "count" => "count", // (added up like a sum; a group whose count is 0 is gone: a change emptied it)
             "sum" => "sum",
             "min" => "min",
             "max" => "max",
             other => bail!("{other}() can't be combined from partial results: use sum, count, min or max (e.g. avg = sum / count at query time)"),
         };
+        if let Some((source, up)) = up {
+            let of = match &a.params.args[..] {
+                [Expr::Column(c)] if a.params.filter.is_none() => up.merge.get(&c.name).map(String::as_str),
+                _ => None,
+            };
+            m = match (m, of) {
+                ("sum", Some("sum")) => "sum",
+                ("sum", Some("count")) => "count", // (counts added up are a count: a group they empty is gone)
+                ("min", Some("min")) => "min",
+                ("max", Some("max")) => "max",
+                _ => bail!(rollup(source, up)),
+            };
+        }
         merge.insert(f.name().clone(), m.to_string());
     }
     ensure!(!key.is_empty(), "an aggregating view needs GROUP BY columns in its SELECT");
@@ -716,7 +1049,7 @@ async fn create_join(lake: &Lake, name: &str, sql: &str, source: String, mut j: 
     j.tables = tables;
     let now = lake.visible();
     let meta = TableMeta { columns, publish: default_publish(), ids: true, tiered: now, ..Default::default() };
-    let view = View { source, sql: sql.into(), emit: None, sessions: None, ids: false, join: Some(j), fill: None };
+    let view = View { source, sql: sql.into(), emit: None, sessions: None, ids: false, join: Some(j), fill: None, expect: vec![] };
     lake.cat.commit(vec![(table_key(name), json(&meta)), (view_key(name), json(&view)), (producer_key(&format!("join:{name}")), json(&now))], &[]).await
 }
 
@@ -815,4 +1148,59 @@ fn span(rows: &[RecordBatch], c: &str, within_secs: u64) -> Option<(i64, i64)> {
     }
     let w = (within_secs * 1_000_000) as i64;
     Some((lo? - w, hi? + w))
+}
+
+/// `pondra.pipelines` (a row per materialized view: what it follows, its kind, what else it reads,
+/// its expectations) and `pondra.expectations` (a row per expectation, with the rows that broke it:
+/// `counts`, the rows of `pondra$expectations`). What a user may read only.
+pub async fn system(lake: &Lake, counts: Vec<RecordBatch>) -> Result<Vec<(&'static str, std::sync::Arc<dyn datafusion::catalog::TableProvider>)>> {
+    use datafusion::arrow::array::{Array, AsArray, Int64Array, StringArray};
+    use datafusion::datasource::MemTable;
+    let mut views = in_order(lake.cat.scan::<View>("v/", "v0").await?);
+    if let Some(a) = crate::auth::limited() {
+        views.retain(|(name, _)| a.may("select", name));
+    }
+    let mut kinds = vec![];
+    for (name, v) in &views {
+        let merged = lake.cat.get::<TableMeta>(&table_key(name)).await?.is_some_and(|m| !m.merge.is_empty());
+        kinds.push(match () {
+            _ if v.emit.is_some() => "window",
+            _ if v.sessions.is_some() => "sessions",
+            _ if v.join.is_some() => "stream join",
+            _ if merged => "aggregate",
+            _ => "rows",
+        });
+    }
+    let mut failed: std::collections::HashMap<(String, String), i64> = Default::default();
+    for b in &counts {
+        let col = |n: &str| b.column_by_name(n).map(|c| datafusion::arrow::compute::cast(c, &datafusion::arrow::datatypes::DataType::Utf8)).transpose();
+        let (Some(id), Some(e), Some(n)) = (col("id")?, col("expectation")?, b.column_by_name("failed")) else { continue };
+        let n = datafusion::arrow::compute::cast(n, &datafusion::arrow::datatypes::DataType::Int64)?;
+        let n = n.as_primitive::<datafusion::arrow::datatypes::Int64Type>();
+        for i in (0..b.num_rows()).filter(|&i| n.is_valid(i)) {
+            let k = (id.as_string::<i32>().value(i).to_string(), e.as_string::<i32>().value(i).to_string());
+            *failed.entry(k).or_default() += n.value(i);
+        }
+    }
+    let s = |f: &dyn Fn(usize, &(String, View)) -> Option<String>| std::sync::Arc::new(views.iter().enumerate().map(|(i, x)| f(i, x)).collect::<StringArray>()) as datafusion::arrow::array::ArrayRef;
+    let reads = |v: &View| crate::spmd::tables(&v.sql).map(|t| t.into_iter().filter(|t| *t != v.source).collect::<Vec<_>>().join(", ")).filter(|r| !r.is_empty());
+    let pipelines = RecordBatch::try_from_iter(vec![
+        ("name", s(&|_, (n, _)| Some(n.clone()))),
+        ("follows", s(&|_, (_, v)| Some(v.join.as_ref().map_or(v.source.clone(), |j| j.tables.join(", "))))),
+        ("kind", s(&|i, _| Some(kinds[i].to_string()))),
+        ("reads", s(&|_, (_, v)| reads(v))),
+        ("expectations", std::sync::Arc::new(views.iter().map(|(_, v)| v.expect.len() as i64).collect::<Int64Array>())),
+        ("definition", s(&|_, (_, v)| Some(v.sql.clone()))),
+    ])?;
+    let all: Vec<(&String, &View, &Expect)> = views.iter().flat_map(|(n, v)| v.expect.iter().map(move |e| (n, v, e))).collect();
+    let e = |f: &dyn Fn(&(&String, &View, &Expect)) -> String| std::sync::Arc::new(all.iter().map(|x| Some(f(x))).collect::<StringArray>()) as datafusion::arrow::array::ArrayRef;
+    let expectations = RecordBatch::try_from_iter(vec![
+        ("view", e(&|(n, _, _)| n.to_string())),
+        ("expectation", e(&|(_, _, x)| x.name.clone())),
+        ("condition", e(&|(_, _, x)| x.check.clone())),
+        ("on_violation", e(&|(_, _, x)| x.on.word().to_string())),
+        ("failed_rows", std::sync::Arc::new(all.iter().map(|(_, v, x)| failed.get(&(v.fill.as_ref().map_or(String::new(), |f| f.id.clone()), x.name.clone())).copied().unwrap_or(0)).collect::<Int64Array>())),
+    ])?;
+    let mem = |b: RecordBatch| -> Result<std::sync::Arc<dyn datafusion::catalog::TableProvider>> { Ok(std::sync::Arc::new(MemTable::try_new(b.schema(), vec![vec![b]])?)) };
+    Ok(vec![("pipelines", mem(pipelines)?), ("expectations", mem(expectations)?)])
 }

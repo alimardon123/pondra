@@ -25,14 +25,18 @@ checked here.
 
 | Command | What it does |
 |---|---|
-| `CommandStatementQuery` | runs a query. A write statement sent this way (as a DB-API `execute` does) runs at once and answers one row: `rows`, the number of rows it wrote |
+| `CommandStatementQuery` | runs a query. A write statement sent this way (as a DB-API `execute` does) runs at once and answers one row: `rows`, the number of rows it wrote. A `CALL` runs at once too, and its ticket answers what the procedure returned |
 | `CommandStatementUpdate` | runs a write statement (`CREATE`, `ALTER`, `DROP`, `INSERT`, `UPDATE`, `DELETE`) and answers with the row count. Needs the `write` role |
 | `CommandStatementIngest` | bulk load: Arrow batches into a table, in one of four [modes](#bulk-ingest). A table that does not exist is created from the batches' schema, which needs the `admin` role. `db_schema_name` picks the schema |
 | `CommandGetCatalogs` | one catalog: the lake's name |
 | `CommandGetDbSchemas` | the lake's schemas |
 | `CommandGetTables` | tables (type `TABLE`) and views (type `VIEW`), with their columns if the client asks |
 | `CommandGetTableTypes` | the two types: `TABLE` and `VIEW` |
-| `CommandGetSqlInfo` | the server's name (`Pondra`), version, Arrow version (1.3), that it is not read-only, and that it has no transactions |
+| `CommandGetSqlInfo` | the server's name (`Pondra`), version, Arrow version (1.3), that it is not read-only, and that it has no transactions (Flight SQL's are not taken yet: use the Postgres port or HTTP for `BEGIN` … `COMMIT`) |
+
+An error is a gRPC status near its meaning (`NOT_FOUND` for no such table, `FAILED_PRECONDITION`
+for a `CHECK`, `ABORTED` for a conflict…), with Postgres's code in its metadata as
+`x-pondra-sqlstate`. ADBC shows it in the error's `details`.
 
 Anything else answers `Unimplemented`: prepared statements (so bound parameters too), keys and
 transactions. Put values in the SQL text instead. A statement's writes

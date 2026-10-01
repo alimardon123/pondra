@@ -1,4 +1,4 @@
-# Pondra vs Spark, Flink, Fluss, Databricks Lakehouse//RT — and the single-node engines (round 12; the table of where each stands: 2026-09-30)
+# Pondra vs Spark, Flink, Fluss, Databricks Lakehouse//RT — and the single-node engines (round 12; the table of where each stands: 2026-10-01, after round 30)
 
 **Date:** 2026-09-28 (Nexmark and schema rows: round 21; DataFrames and procedures: round 22; functions, procedures and tasks: round 24) · **Machine:** one 2-vCPU, 7 GB sandbox VM, local disk (plus a real Cloudflare R2 bucket where marked); every engine ran alone
 **Versions:**
@@ -35,7 +35,7 @@
 - Spark's TPC-H and the serving numbers: round 7.
 - Spark's and Flink's batch and streaming numbers: round 3, same machine and scripts.
 
-## Where each comparison stands (2026-09-30, after round 28)
+## Where each comparison stands (2026-10-01, after round 30)
 
 Measured on this 2-vCPU sandbox unless marked. "Stale" means the number is older than the code:
 Pondra has changed since, and the comparison has not been run again.
@@ -47,7 +47,9 @@ Pondra has changed since, and the comparison has not been run again.
 | One node, TPC-H SF10 | DuckDB, Polars, Daft | **Pondra 38.0 s**, DuckDB 39.8 s, Polars 42.8 s, Daft 89.0 s | round 12 | stale |
 | One machine, TPC-H SF1 | Spark 4.2 (`local[*]`) | **Pondra 5.9 s** against 58.5–65.2 s (Pondra takes 3.5 s on the single-node bench's data now) | round 7 | stale |
 | One machine, batch and ETL on 20 M rows | Spark, Flink | 2–14x Spark per query, a fifth of its memory | round 3 | stale |
-| One machine, key lookups and small writes | Postgres 16 | lookup: **Postgres 0.13 ms**, Pondra 0.17 ms (`/lookup`), 6.5 ms (Postgres port); one-row insert: **Postgres 0.31 ms**, Pondra 2.3 ms; TPC-H Q1: **Pondra 0.31 s**, Postgres 3.27 s; loading 6 M rows: **Pondra 5.9 s**, Postgres 24.4 s | 2026-09-30 | current (`logs/round28/vs-postgres.txt`) |
+| One machine, key lookups and small writes | Postgres 16 | lookup p50: **Postgres 0.09 ms**, Pondra 0.19 ms (`/lookup`), 0.29 ms (Postgres port; 6.5 ms before round 30); one-row insert: **Postgres 0.33 ms**, Pondra 2.0 ms; TPC-H Q1: **Pondra 0.37 s**, Postgres 2.78 s; Q6: **Pondra 0.06 s**, Postgres 0.40 s; loading 6 M rows: **Pondra 8.0 s**, Postgres 29.1 s | 2026-10-01 | current (`logs/gates/2026-10-01-postgres.txt`) |
+| One machine, transactions (pgbench's TPC-B script) | Postgres 16 | balances right on both; **Postgres 997 tps** on 1 client, 1,793 on 4; Pondra 133 and 91 (snapshot isolation, first committer wins: at scale 1 four clients retry on the one branch row) | 2026-10-01 | current (`tools/bench/pgbench.py --postgres`) |
+| Pipelines (views following views) | Databricks pipelines, Snowflake dynamic tables, chained Flink jobs (their docs) | Pondra: every stage in the commit that wrote its rows, exactly once, no lag between stages; three stages (a filter with expectations, an aggregate, a rollup) take 29% off ingest (183,000 → 131,000 rows/s on 2 vCPUs). Databricks: continuous mode updates every 10 s to a few minutes, triggered every 10 minutes to daily ([its docs](https://docs.databricks.com/aws/en/ldp/concepts/pipeline-mode)); Snowflake: each dynamic table its target lag, 60 s at least ([its docs](https://docs.snowflake.com/en/user-guide/dynamic-tables/target-lag)); Flink: each stage's exactly-once output visible at a checkpoint | 2026-10-01 | Pondra measured (`tools/bench/pipeline.py`); the others from their docs, **not run here** |
 | Several machines, TPC-H SF10 | one Pondra node | GitHub's runners over the internet (4 vCPUs each, 1–67 ms apart): 3 nodes 23.3 s, 6 nodes 23.4 s, one node 25.3–25.5 s; every query forced across: 40.5 s and 33.2 s. Every answer equal | v0.26.0, 2026-09-30 | not yet run on 0.27.0; **one data centre never run** |
 | Several machines | Spark, Flink | not run | — | round 33, needs machines |
 | Streaming, Nexmark q1, q2, q5, q7, q11 | Flink 2.3 (MiniCluster) | 10 M bids (2.2–2.9x): **Pondra 8.7–10.9 s** (ingest over HTTP, views written to the lake), Flink 24.3–25.0 s (bids generated in process, blackhole sinks) | round 21 | stale; the other queries not run |
@@ -75,7 +77,15 @@ Pondra has changed since, and the comparison has not been run again.
 - **Serving:** **20,000–36,000 lookups/s on two cores**, where Lakehouse//RT publishes 12,000
   QPS.
 
-All of that comes from one 95 MB binary, with no JVM, ZooKeeper, Kafka or separate tiering job.
+- **Pipelines:** bronze → silver → gold in **one commit** (round 30): no stage lags another, where
+  Databricks' pipelines, Snowflake's dynamic tables and chained Flink jobs each lag the stage
+  before. Three stages cost 29% of ingest.
+- **A database from every door** (round 30): `BEGIN` … `COMMIT` with snapshot isolation; pgbench's
+  TPC-B script runs with its balances right (at 133 tps on one client, Postgres's 997); key lookups
+  through the Postgres port in 0.29 ms (Postgres 0.09).
+
+All of that comes from one binary (about 175 MB, every door and TLS in it), with no JVM, ZooKeeper,
+Kafka or separate tiering job.
 
 **At cluster scale and in breadth: not yet.**
 

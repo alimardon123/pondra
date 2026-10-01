@@ -21,6 +21,13 @@ Per machine, in the main areas, Pondra measured ahead of Spark and Flink:
 - **Stateful streaming:** about 3 times Flink's throughput on a keyed aggregation.
 - **Latency:** a change shows up on another node in about 5 ms. Writes are acknowledged in 2 to 4 ms on
   R2 with `--ack replicated`.
+- **Pipelines:** materialized views that follow each other (bronze, silver, gold) move in the commit
+  that wrote the rows, with expectations that keep, drop or refuse rows: no stage lags another, where
+  Databricks' pipelines, Snowflake's dynamic tables and chained Flink jobs each lag the stage before
+  ([Pipelines](/pondra/guides/pipelines/)).
+- **A database's behaviour:** `BEGIN` … `COMMIT` as one commit with snapshot isolation, Postgres's
+  error codes on every door, and key lookups through the Postgres port in about 0.4 ms. pgbench's own
+  TPC-B script runs with its balances right.
 
 At cluster scale, and in breadth, it is not there yet:
 
@@ -100,6 +107,9 @@ Flink is a stateful stream processor.
   and Pondra took its over HTTP.
 - A change is visible on another node in 5 ms. Flink's exactly-once results become visible at a
   checkpoint.
+- A pipeline of views (a filter, then an aggregate of it, then a rollup) is one commit: each stage's
+  rows are written with the rows that caused them, exactly once, with no state to checkpoint between
+  stages. In Flink each stage is an operator or a job whose output a sink commits at a checkpoint.
 - No JVM, checkpoints, or Kafka or Fluss underneath.
 
 Pondra's stream joins run on the leader alone.
@@ -142,7 +152,8 @@ as a service.
 - It is the reference for single-machine SQL, with a mature ecosystem and extensions.
 - On data in memory, DuckDB was about 9% ahead at SF1: 1.80 s against Pondra's 1.96 s. In its own
   format it took 1.65 s against Pondra's 2.11 s in the newest recheck.
-- It is small, about 20 MB for its command line, against about 100 MB for Pondra.
+- It is small, about 20 MB for its command line, against about 175 MB for Pondra's one binary (its
+  server, every door, TLS and Python's bridge included).
 
 **Where Pondra fits:**
 
@@ -179,6 +190,11 @@ AI tools.
 - It runs anywhere you can run a binary, with no cloud account: on your disk or in any bucket.
 - Spark 4 reads the Delta and Iceberg tables Pondra publishes, and gets Pondra's answers. Databricks'
   own runtime hasn't been tried.
+- Its pipelines are Databricks' declarative pipelines in SQL — views following views, expectations
+  (`CONSTRAINT … EXPECT (…) ON VIOLATION DROP ROW | FAIL`), counted in `pondra.expectations` — but
+  every stage commits with its source's rows, where a Databricks pipeline updates its tables on
+  compute of its own, every 10 seconds to a few minutes in continuous mode. History per key (SCD
+  type 2) isn't built yet.
 
 ## Snowflake
 
@@ -197,6 +213,8 @@ Snowflake is a managed cloud data warehouse.
 - Tasks with `CREATE TASK … SCHEDULE`, stored procedures in SQL and Python, and Python functions follow
   Snowflake's ideas. The table below sets them side by side.
 - The tables are open files in your own bucket, and Iceberg and Delta readers can use them.
+- A dynamic table refreshes within its target lag, 60 seconds at least; a Pondra pipeline's views
+  move in the commit that wrote the rows.
 
 Pondra hasn't been measured against Snowflake.
 
@@ -215,8 +233,12 @@ Pondra hasn't been measured against Snowflake.
 <Aside type="caution">
 - **Evidence at scale.** The multi-machine runs so far were on one machine and on three machines over
   the internet, where a cluster was no faster than one node.
-- **Governance.** Read, write and admin tokens on every door. No TLS and no per-table grants yet: put a
-  TLS proxy in front, and keep a cluster's nodes on a private network.
+- **Governance.** Users, roles and grants down to a column, TLS on every door and between nodes, an
+  audit log and quotas are built ([Security](/pondra/guides/security/)). Single sign-on, row filters
+  and masking policies aren't, and Unity Catalog's and Snowflake's governance go further.
+- **Transactions.** Snapshot isolation, first committer wins (40001 to the other, to try again) where
+  Postgres would wait on a row's lock: under heavy contention on one row, most transactions retry.
+  Flight SQL's own transactions and savepoints aren't taken.
 - **Kafka.** One partition per topic and no transactions, so Kafka Streams and Flink's exactly-once
   Kafka sinks are not covered.
 - **Other databases.** Reading and writing Postgres or MySQL as attached databases, and streaming their

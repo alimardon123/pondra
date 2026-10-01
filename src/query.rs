@@ -662,6 +662,7 @@ pub async fn session(lake: &Lake, sql: &str, except: &str) -> Result<SessionCont
 /// `session`, this lake's tables as of log segment `upto` (every query in it reads the same rows).
 pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>) -> Result<SessionContext> {
     use crate::ddl::{mentions, split, PUBLIC};
+    let upto = upto.or_else(crate::txn::snapshot); // (in a transaction: as of its snapshot, its writes over it)
     use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider, MemorySchemaProvider};
     let ctx = lake.session();
     crate::udf::register(lake, &ctx).await?; // the lake's own functions (`POST /functions/…`)
@@ -681,8 +682,13 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
     for (key, meta) in lake.cat.scan::<TableMeta>("t/", "t0").await? {
         let name = &key[2..];
         if name != except && !crate::sys::hidden(name) && (listing || mentions(&text, name)) {
-            let view = table_view(lake, &ctx, name, &sys(meta.clone()), upto).await?;
-            if let Some(t) = guarded(name, named(&ctx, view, &meta, names_deleted(&text))?, listing) {
+            let touched = crate::txn::touched(name);
+            let view = table_view(lake, &ctx, name, &if touched { crate::sys::with_sys(&meta) } else { sys(meta.clone()) }, upto).await?;
+            let mut t = named(&ctx, view, &meta, names_deleted(&text))?;
+            if touched {
+                t = crate::txn::overlaid(&ctx, name, &meta.logical().key, t, crate::sys::mentioned(&text))?;
+            }
+            if let Some(t) = guarded(name, t, listing) {
                 ctx.register_table(table_ref(name), t)?;
             }
         }
@@ -745,6 +751,16 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
                 None => crate::audit::empty()?,
             };
             system.register_table("audit".into(), audit)?;
+        }
+        if text.to_lowercase().contains("pondra.pipelines") || text.to_lowercase().contains("pondra.expectations") {
+            // (a materialized view's pipeline and its expectations: `views::system`)
+            let counts = match lake.cat.get::<TableMeta>(&crate::store::table_key(crate::views::EXPECTED)).await? {
+                Some(meta) => ctx.read_table(table_view(lake, &ctx, crate::views::EXPECTED, &meta, upto).await?)?.collect().await?,
+                None => vec![],
+            };
+            for (name, table) in crate::views::system(lake, counts).await? {
+                system.register_table(name.into(), table)?;
+            }
         }
         default.register_schema("pondra", system)?;
     }

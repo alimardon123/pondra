@@ -30,6 +30,7 @@
   harness.py load    --secs 30   throughput, ack latency, freshness, catalog commit latency
   harness.py all                 quick run of everything
 """
+import http.client as http_client
 import argparse, atexit, glob as glob_, http.client, itertools, json, os, random, shutil, signal, subprocess, sys, tempfile, threading, time, urllib.request, uuid
 
 BIN = os.environ.get("PONDRA_BIN", os.path.join(os.path.dirname(os.path.abspath(__file__)), "../target/release/pondra"))
@@ -1619,9 +1620,9 @@ def schemas():
     got = until(lambda: q("SELECT k, n, s FROM dbo.per_k ORDER BY k"), want, 30)
     checks["CREATE MATERIALIZED VIEW: the rows already there and those written after; WITH (window …) emits to _final; bad options refused"] = got == want and len(want) == 3 \
         and n("per_min_final") == 0 and err("CREATE MATERIALIZED VIEW m2 WITH (windw = 'w') AS SELECT k FROM t") is not None
-    # a view of a view's rows would stay empty (a view's rows aren't taken in as a table's): refused, never left empty
+    # a view of a view (a pipeline, ADR-036): of a GROUP BY view's partial rows only a rollup; of a _final, as of a table
     over = [err("CREATE MATERIALIZED VIEW m3 AS SELECT k FROM dbo.per_k"), err("CREATE MATERIALIZED VIEW m4 AS SELECT w FROM per_min_final")]
-    checks["a materialized view of a materialized view (or its _final) is refused, saying what to do"] = all(e and "isn't followed yet" in str(e) for e in over)
+    checks["a materialized view of a GROUP BY view that isn't a rollup is refused, saying what to do; of a _final, made"] = "GROUP BY view" in str(over[0]) and over[1] is None
     # clients see the schemas
     with psycopg.connect(f"host=127.0.0.1 port={A.port + 10} dbname={me} user=x", autocommit=True) as c:
         spaces = {r[0] for r in c.execute("SELECT nspname FROM pg_catalog.pg_namespace").fetchall()}
@@ -5501,9 +5502,394 @@ def stopped():
     return ok
 
 
+
+def pipelines():
+    """Pipelines of materialized views (ADR-036 §1–2), as Databricks' DLT has them: silver follows
+    orders with expectations (one drops rows, one counts them), gold adds silver up, platinum rolls
+    gold up, big follows silver row by row; all made while two producers stream into two nodes,
+    each filled from the rows already there. Each view == its query over orders, every row once,
+    also after an UPDATE and a DELETE of orders; a row a FAIL expectation refuses fails its own
+    INSERT only; what can't follow is refused by name; pondra.pipelines and pondra.expectations."""
+    lake = new_lake()
+    a = Node(lake, A.port, tier_secs=0.5).start()
+    b = Node(lake, A.port + 1, tier_secs=0.5).start()
+    ports = [A.port, A.port + 1]
+    q = lambda s, port=A.port: sql(port, s)
+    def err(s, port=A.port):
+        try:
+            q(s, port)
+            return None
+        except Exception as e:
+            return str(e)
+    q("CREATE TABLE orders (id BIGINT, region VARCHAR, buyer VARCHAR, amount BIGINT, status VARCHAR)")
+    stop, sent = threading.Event(), [0, 0]
+    def produce(k):
+        seq, rng = 0, random.Random(k)
+        while not stop.is_set():
+            seq += 1
+            row = lambda i: {"id": k * 10**9 + seq * 100 + i, "region": f"r{rng.randrange(4)}", "buyer": None if rng.random() < 0.05 else f"u{rng.randrange(20)}",
+                             "amount": rng.randrange(-50, 1000), "status": "test" if rng.random() < 0.1 else "paid"}
+            body = "".join(json.dumps(row(i)) + "\n" for i in range(50)).encode()
+            while True:
+                try:
+                    call(ports[k], "POST", f"/append/orders?producer=p{k}&seq={seq}", body, timeout=15)
+                    break
+                except Exception:
+                    if stop.is_set():
+                        return
+                    time.sleep(0.1)
+            sent[k] += 50
+            time.sleep(0.02)
+    threads = [threading.Thread(target=produce, args=(k,), daemon=True) for k in (0, 1)]
+    for t in threads:
+        t.start()
+    time.sleep(1.5)
+    q("""CREATE MATERIALIZED VIEW silver (
+           CONSTRAINT positive CHECK (amount > 0) ON VIOLATION DROP ROW,
+           CONSTRAINT has_buyer EXPECT (buyer IS NOT NULL)
+         ) AS SELECT id, region, buyer, amount, amount * 2 AS doubled FROM orders WHERE status <> 'test'""")
+    time.sleep(0.7)
+    q("CREATE MATERIALIZED VIEW gold AS SELECT region, buyer, count(*) AS n, sum(amount) AS total FROM silver GROUP BY region, buyer", ports[1])
+    q("CREATE MATERIALIZED VIEW big AS SELECT id, buyer, doubled FROM silver WHERE doubled > 1000", ports[1])
+    time.sleep(0.5)
+    q("CREATE MATERIALIZED VIEW platinum AS SELECT region, sum(n) AS n, sum(total) AS total FROM gold GROUP BY region")
+    q("CREATE MATERIALIZED VIEW strict (CONSTRAINT small CHECK (amount < 100000)) AS SELECT id, amount FROM orders")
+    time.sleep(0.5)
+    checks = {}
+    refused = err("INSERT INTO orders VALUES (1, 'r0', 'u1', 500000, 'paid'), (2, 'r0', 'u1', 5, 'paid')", ports[1])
+    checks["a row a FAIL expectation refuses fails its INSERT, naming it"] = bool(refused) and 'violates check constraint "small"' in refused
+    say = {
+        "a view of a GROUP BY view's partial rows, without GROUP BY": err("CREATE MATERIALIZED VIEW bad1 AS SELECT * FROM gold WHERE total > 100"),
+        "count(*) of a GROUP BY view's rows": err("CREATE MATERIALIZED VIEW bad2 AS SELECT region, count(*) AS n FROM gold GROUP BY region"),
+        "a WHERE on a GROUP BY view's totals": err("CREATE MATERIALIZED VIEW bad3 AS SELECT region, sum(total) AS t FROM gold WHERE total > 5 GROUP BY region"),
+        "expectations on a GROUP BY view": err("CREATE MATERIALIZED VIEW bad4 (CONSTRAINT c CHECK (n > 0)) AS SELECT region, count(*) AS n FROM orders GROUP BY region"),
+        "a FAIL expectation rows already break": err("CREATE MATERIALIZED VIEW bad5 (CONSTRAINT c CHECK (amount > 0)) AS SELECT id, amount FROM orders"),
+        "dropping a view others follow": err("DROP MATERIALIZED VIEW silver"),
+    }
+    for what, e in say.items():
+        checks[f"refused: {what}"] = bool(e) and ("GROUP BY view" in e or "expectation" in e or "followed by" in e)
+    time.sleep(1)
+    stop.set()
+    for t in threads:
+        t.join()
+    def same():
+        out = {}
+        base = "FROM orders WHERE status <> 'test' AND amount > 0"
+        want = {
+            "silver": (f"SELECT count(*) AS n, sum(doubled) AS d FROM silver", f"SELECT count(*) AS n, sum(amount * 2) AS d {base}"),
+            "gold": ("SELECT region, buyer, n, total FROM gold ORDER BY region, buyer NULLS FIRST", f"SELECT region, buyer, count(*) AS n, sum(amount) AS total {base} GROUP BY region, buyer ORDER BY region, buyer NULLS FIRST"),
+            "platinum": ("SELECT region, n, total FROM platinum ORDER BY region", f"SELECT region, count(*) AS n, sum(amount) AS total {base} GROUP BY region ORDER BY region"),
+            "big": ("SELECT count(*) AS n, sum(doubled) AS d FROM big", f"SELECT count(*) AS n, sum(amount * 2) AS d {base} AND amount * 2 > 1000"),
+            "strict": ("SELECT count(*) AS n, sum(amount) AS s FROM strict", "SELECT count(*) AS n, sum(amount) AS s FROM orders"),
+        }
+        for view, (got, expected) in want.items():
+            for port in ports:
+                e = q(expected, port)
+                out[f"{view} == its query over orders (:{port})"] = until(lambda: q(got, port), e, secs=30) == e
+        return out
+    checks.update(same())
+    sent_all = sum(sent)
+    checks["every row sent is there once, beside the refused INSERT"] = q("SELECT count(*) AS n FROM orders")[0]["n"] == sent_all
+    ex = {r["expectation"]: r for r in q("SELECT * FROM pondra.expectations ORDER BY view, expectation")}
+    bad = q("SELECT count(*) FILTER (WHERE amount <= 0) AS neg, count(*) FILTER (WHERE buyer IS NULL) AS nobuyer FROM orders WHERE status <> 'test'")[0]
+    checks["pondra.expectations counts each expectation's failed rows, filled and streamed"] = ex.get("positive", {}).get("failed_rows") == bad["neg"] and ex.get("has_buyer", {}).get("failed_rows") == bad["nobuyer"] and ex.get("small", {}).get("on_violation") == "fail"
+    pipe = {r["name"]: r for r in q("SELECT name, follows, kind FROM pondra.pipelines")}
+    checks["pondra.pipelines: orders → silver → gold → platinum, silver → big"] = [pipe.get(n, {}).get("follows") for n in ("silver", "gold", "platinum", "big")] == ["orders", "silver", "gold", "silver"] and pipe["gold"]["kind"] == "aggregate"
+    # Changes of orders flow down the pipeline, in the same commit.
+    q("UPDATE orders SET amount = amount + 7 WHERE id % 10 = 0")
+    q("UPDATE orders SET amount = -amount WHERE id % 17 = 0")  # (in and out of silver's expectation)
+    q("DELETE FROM orders WHERE id % 13 = 0")
+    checks.update({k + ", after UPDATE and DELETE": v for k, v in same().items()})
+    checks["a view of a view made again after its pipeline is dropped from the end"] = all(err(f"DROP MATERIALIZED VIEW {v}") is None for v in ("platinum", "big", "gold", "silver"))
+    info = {"sent": sent_all, "refused": (refused or "")[:200], "said": {k: (v or "")[:160] for k, v in say.items()}, "expectations": ex}
+    a.kill(); b.kill()
+    ok = all(checks.values())
+    print(json.dumps({"pipelines": checks, "ok": ok, "info": info}, indent=1, default=str))
+    if not ok:
+        sys.exit(1)
+
+
+def begin():
+    """Transactions (ADR-036 §5) and Postgres's error codes (§4): BEGIN … COMMIT as one commit
+    from HTTP (a session), Python (`with con.transaction()`) and the Postgres port, on the leader
+    and on a follower; reads see their own writes, others don't until COMMIT; ROLLBACK; a failed
+    statement fails the transaction (25P02); two transactions changing one row: the second is
+    refused with 40001; transfers between accounts from 8 clients at once, retried on 40001, keep the
+    total; a view follows every commit; constraints and errors with their SQLSTATE on every door."""
+    import psycopg
+    lake = new_lake()
+    pga, pgb = A.port + 2000, A.port + 2001
+    a = Node(lake, A.port, tier_secs=0.5, pg=f"127.0.0.1:{pga}").start()
+    b = Node(lake, A.port + 1, tier_secs=0.5, pg=f"127.0.0.1:{pgb}").start()
+    q = lambda s, port=A.port: sql(port, s)
+    def http(port, body, session=None):
+        c = http_client.HTTPConnection("127.0.0.1", port, timeout=60)
+        c.request("POST", "/sql", body.encode(), {"x-pondra-session": session} if session else {})
+        r = c.getresponse()
+        data = r.read()
+        return r.status, r.getheader("x-pondra-sqlstate"), (json.loads(data) if data[:1] in (b"{", b"[") else data.decode())
+    q("CREATE TABLE accounts (id BIGINT, balance BIGINT CHECK (balance >= -1000))")
+    q("CREATE TABLE history (account BIGINT, delta BIGINT)")
+    q("CREATE TABLE prices (item VARCHAR PRIMARY KEY, price BIGINT)")
+    q("INSERT INTO accounts SELECT value AS id, 1000 AS balance FROM range(1, 21)")
+    q("INSERT INTO prices VALUES ('tea', 3), ('cake', 5)")
+    q("CREATE MATERIALIZED VIEW total AS SELECT 1 AS k, sum(balance) AS s, count(*) AS n FROM accounts GROUP BY 1")
+    checks = {}
+    total = lambda port=A.port: q("SELECT sum(balance) AS s, count(*) AS n FROM accounts", port)[0]
+    # Read your own writes; nobody else's until COMMIT; one commit.
+    for port, where in ((A.port, "leader"), (A.port + 1, "follower")):
+        s = f"s-{where}-{uuid.uuid4().hex[:8]}"
+        http(port, "BEGIN", s)
+        http(port, "UPDATE accounts SET balance = balance - 10 WHERE id = 1", s)
+        http(port, "UPDATE accounts SET balance = balance + 10 WHERE id = 2", s)
+        http(port, "INSERT INTO history VALUES (1, -10), (2, 10)", s)
+        http(port, "INSERT INTO prices VALUES ('tea', 4)", s)
+        mine = http(port, "SELECT id, balance FROM accounts WHERE id IN (1, 2) ORDER BY id", s)[2]
+        theirs = q("SELECT id, balance FROM accounts WHERE id IN (1, 2) ORDER BY id", port)
+        tea = http(port, "SELECT price FROM prices WHERE item = 'tea'", s)[2]
+        before = q("SELECT count(*) AS n FROM history", port)[0]["n"]
+        done = http(port, "COMMIT", s)
+        after = q("SELECT id, balance, _version FROM accounts WHERE id IN (1, 2) ORDER BY id", port)
+        hist = q("SELECT count(*) AS n, count(DISTINCT _version) AS v FROM history", port)[0]
+        checks[f"on the {where}: a transaction reads its own writes, others don't see them until COMMIT"] = mine[0]["balance"] == theirs[0]["balance"] - 10 and tea == [{"price": 4}] and before == hist["n"] - 2 and done[0] == 200
+        checks[f"on the {where}: COMMIT is one commit (every row it wrote, one _version)"] = len({r["_version"] for r in after}) == 1 and after[0]["balance"] + after[1]["balance"] == 2000 and q("SELECT price FROM prices WHERE item = 'tea'", port) == [{"price": 4}]
+    # ROLLBACK, and a failed statement.
+    s = "s-rollback-" + uuid.uuid4().hex[:8]
+    http(A.port, "BEGIN", s); http(A.port, "DELETE FROM accounts", s); http(A.port, "ROLLBACK", s)
+    checks["ROLLBACK leaves nothing"] = total()["n"] == 20
+    s = "s-failed-" + uuid.uuid4().hex[:8]
+    http(A.port, "BEGIN", s)
+    http(A.port, "UPDATE accounts SET balance = balance + 1 WHERE id = 3", s)
+    bad = http(A.port, "SELECT * FROM nope", s)
+    then = http(A.port, "SELECT 1", s)
+    end = http(A.port, "COMMIT", s)
+    checks["a failed statement fails the transaction: 42P01, then 25P02 until it ends; COMMIT rolls it back"] = bad[1] == "42P01" and then[1] == "25P02" and end[2].get("transaction") == "rollback" and q("SELECT balance FROM accounts WHERE id = 3") == [{"balance": 1000}]
+    # Two transactions change one row: the second to commit is refused, 40001.
+    s1, s2 = "s-one-" + uuid.uuid4().hex[:8], "s-two-" + uuid.uuid4().hex[:8]
+    http(A.port, "BEGIN", s1); http(A.port + 1, "BEGIN", s2)
+    http(A.port, "UPDATE accounts SET balance = balance + 5 WHERE id = 4", s1)
+    http(A.port + 1, "UPDATE accounts SET balance = balance + 7 WHERE id = 4", s2)
+    first, second = http(A.port, "COMMIT", s1), http(A.port + 1, "COMMIT", s2)
+    checks["two transactions change one row: the first commits, the second gets 40001"] = first[0] == 200 and second[1] == "40001" and q("SELECT balance FROM accounts WHERE id = 4") == [{"balance": 1005}]
+    # A keyed row: a one-key UPDATE in a transaction (no planning), and one changed since the snapshot.
+    s1, s2 = "s-k1-" + uuid.uuid4().hex[:8], "s-k2-" + uuid.uuid4().hex[:8]
+    http(A.port, "BEGIN", s1); http(A.port + 1, "BEGIN", s2)
+    http(A.port, "UPDATE prices SET price = price + 1 WHERE item = 'cake'", s1)
+    mine = http(A.port, "SELECT price FROM prices WHERE item = 'cake'", s1)[2]
+    http(A.port, "COMMIT", s1)
+    early = http(A.port + 1, "UPDATE prices SET price = price + 10 WHERE item = 'cake'", s2)
+    late = http(A.port + 1, "COMMIT", s2)
+    checks["a keyed row: its one-key UPDATE read back in the transaction; changed since the snapshot, 40001 (at the UPDATE or the COMMIT)"] = \
+        mine == [{"price": 6}] and (early[1] == "40001" or late[1] == "40001") and q("SELECT price FROM prices WHERE item = 'cake'") == [{"price": 6}]
+    with psycopg.connect(f"host=127.0.0.1 port={pgb} user=u dbname=lake", autocommit=True) as c:
+        got = [c.execute("SELECT price FROM prices WHERE item = %s", ("cake",)).fetchall(), c.execute("SELECT * FROM prices WHERE item = 'none'").fetchall(),
+               [d.name for d in c.execute("SELECT * FROM prices WHERE item = 'tea'").description]]
+        c.execute("UPDATE prices SET price = price * 2 WHERE item = 'tea'")
+        got.append(c.execute("SELECT price FROM prices WHERE item = 'tea'").fetchall())
+    checks["key lookups and one-key UPDATEs through the Postgres port, without planning: right answers"] = got == [[(6,)], [], ["item", "price"], [(8,)]]
+    # Transfers from 8 clients at once through both Postgres ports, retried on 40001.
+    stop, done, retried, errors = time.time() + 8, [0], [0], []
+    def client(k):
+        rng = random.Random(k)
+        with psycopg.connect(f"host=127.0.0.1 port={(pga, pgb)[k % 2]} user=u dbname=lake") as c:
+            while time.time() < stop:
+                x, y, d = rng.randrange(1, 21), rng.randrange(1, 21), rng.randrange(1, 50)
+                for _ in range(20):
+                    try:
+                        with c.cursor() as cur:
+                            cur.execute(f"UPDATE accounts SET balance = balance - {d} WHERE id = {x}")
+                            cur.execute(f"UPDATE accounts SET balance = balance + {d} WHERE id = {y}")
+                            cur.execute(f"INSERT INTO history VALUES ({x}, {-d}), ({y}, {d})")
+                        c.commit()
+                        done[0] += 1
+                        break
+                    except psycopg.errors.SerializationFailure:
+                        c.rollback(); retried[0] += 1
+                    except Exception as e:
+                        c.rollback(); errors.append(str(e)[:200]); break
+    ts = [threading.Thread(target=client, args=(k,)) for k in range(8)]
+    [t.start() for t in ts]; [t.join() for t in ts]
+    h = q("SELECT count(*) AS n, sum(delta) AS s FROM history")[0]
+    view = until(lambda: q("SELECT s, n FROM total"), [{"s": 20005, "n": 20}], secs=20)
+    checks["8 clients' transfers, retried on 40001: the total kept, every transfer's history there"] = total() == {"s": 20005, "n": 20} and h["s"] == 0 and h["n"] == 4 + 2 * done[0] and not errors
+    checks["…and the view following accounts == its query, after every commit"] = view == [{"s": 20005, "n": 20}]
+    # Python: with con.transaction().
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "python"))
+    import pondra
+    con = pondra.connect(f"http://127.0.0.1:{A.port + 1}")
+    with con.transaction():
+        con.sql("UPDATE accounts SET balance = balance - 1 WHERE id = 5")
+        con.sql("UPDATE accounts SET balance = balance + 1 WHERE id = 6")
+    try:
+        with con.transaction():
+            con.sql("UPDATE accounts SET balance = balance - 5000 WHERE id = 7")
+        caught = None
+    except pondra.PondraError as e:
+        caught = e.sqlstate
+    checks["Python: with con.transaction(); a CHECK refused with 23514 rolls it back"] = caught == "23514" and total()["s"] == 20005 and q("SELECT balance FROM accounts WHERE id = 7") == q("SELECT balance FROM accounts WHERE id = 7", A.port + 1)
+    # Error codes on every door.
+    codes = {}
+    for what, stmt in {"no table": "SELECT * FROM nope", "no column": "SELECT nope FROM accounts", "syntax": "SELEC 1", "check": "INSERT INTO accounts VALUES (99, -5000)", "divide": "SELECT 1 / 0"}.items():
+        st = http(A.port, stmt)[1]
+        try:
+            with psycopg.connect(f"host=127.0.0.1 port={pga} user=u dbname=lake", autocommit=True) as c:
+                c.execute(stmt)
+            pg = None
+        except Exception as e:
+            pg = getattr(e, "sqlstate", None)
+        codes[what] = (st, pg)
+    want = {"no table": "42P01", "no column": "42703", "syntax": "42601", "check": "23514", "divide": "22012"}
+    checks["SQLSTATE over HTTP (x-pondra-sqlstate) and the Postgres port, as Postgres's"] = all(codes[k] == (v, v) for k, v in want.items())
+    with psycopg.connect(f"host=127.0.0.1 port={pga} user=u dbname=lake") as c:
+        status = [c.info.transaction_status.name]
+        c.execute("SELECT 1")
+        status.append(c.info.transaction_status.name)
+        c.rollback()
+        status.append(c.info.transaction_status.name)
+    checks["the Postgres port reports the transaction's status (psycopg's IDLE, INTRANS, IDLE)"] = status == ["IDLE", "INTRANS", "IDLE"]
+    a.kill(); b.kill()
+    ok = all(checks.values())
+    print(json.dumps({"begin": checks, "ok": ok, "info": {"transfers": done[0], "retried": retried[0], "errors": errors[:3], "codes": codes, "status": status}}, indent=1, default=str))
+    if not ok:
+        sys.exit(1)
+
+
+def doors():
+    """The doors matrix (ADR-036 §7): one list of features, each through every door — SQL over HTTP
+    (a session), the Python client, the Postgres port (psycopg), Flight SQL (ADBC), the JavaScript
+    client and MCP. Each cell is right, or refused by name where the door can't (a transaction needs
+    a session: Flight SQL and MCP have none). The table is printed; every cell must be one of the two."""
+    import re, psycopg, adbc_driver_flightsql.dbapi as adbc
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "python"))
+    import pondra
+    lake = new_lake()
+    pgp, fp = A.port + 2000, A.port + 30
+    node = Node(lake, A.port, pg=f"127.0.0.1:{pgp}", flight=f"127.0.0.1:{fp}", tier_secs=0.5).start()
+    q = lambda s: sql(A.port, s)
+    q("CREATE TABLE d_items (id BIGINT PRIMARY KEY, qty BIGINT CHECK (qty >= 0))")
+    q("CREATE TABLE d_log (door VARCHAR, n BIGINT)")
+    q("INSERT INTO d_items SELECT value AS id, 100 AS qty FROM range(1, 101)")
+    q("CREATE PROCEDURE d_bump(k BIGINT) LANGUAGE sql AS $$ UPDATE d_items SET qty = qty + 1000 WHERE id = $k $$")
+    DOORS = ["http", "python", "postgres", "flight", "javascript", "mcp"]
+    def features(i):
+        k = 10 * i + 1  # (each door its own keys)
+        return {
+            "query": ([f"SELECT count(*) AS n FROM d_items WHERE id <= 100"], lambda r: r[-1] == [[100]]),
+            "insert": ([f"INSERT INTO d_log VALUES ('door{i}', {i})"], lambda r: q(f"SELECT n FROM d_log WHERE door = 'door{i}'") == [{"n": i}]),
+            "key lookup": ([f"SELECT qty FROM d_items WHERE id = {k}"], lambda r: r[-1] == [[100]]),
+            "one-key update": ([f"UPDATE d_items SET qty = qty + 5 WHERE id = {k + 1}"], lambda r: q(f"SELECT qty FROM d_items WHERE id = {k + 1}") == [{"qty": 105}]),
+            "update by a filter": ([f"UPDATE d_items SET qty = qty + 1 WHERE id BETWEEN {k + 2} AND {k + 3}"], lambda r: q(f"SELECT sum(qty) AS s FROM d_items WHERE id BETWEEN {k + 2} AND {k + 3}") == [{"s": 202}]),
+            "a CHECK refused, 23514": (["INSERT INTO d_items VALUES (999, -1)"], lambda r: r == "23514"),
+            "no table, 42P01": (["SELECT * FROM d_nope"], lambda r: r == "42P01"),
+            "procedure": ([f"CALL d_bump({k + 4})"], lambda r: q(f"SELECT qty FROM d_items WHERE id = {k + 4}") == [{"qty": 1100}]),
+            "transaction": (["BEGIN", f"UPDATE d_items SET qty = qty - 7 WHERE id = {k + 5}", f"UPDATE d_items SET qty = qty + 7 WHERE id = {k + 6}", f"SELECT qty FROM d_items WHERE id = {k + 5}", "COMMIT"],
+                            lambda r: r[3] == [[93]] and q(f"SELECT count(DISTINCT _version) AS v, sum(qty) AS s FROM d_items WHERE id IN ({k + 5}, {k + 6})") == [{"v": 1, "s": 200}]),
+        }
+    def rows_of(x):
+        return [list(r.values()) if isinstance(r, dict) else list(r) for r in x] if isinstance(x, list) else x
+    # Each door runs a feature's statements in one session: their answers, or the error's SQLSTATE.
+    def via_http(stmts):
+        sid, out = "d-" + uuid.uuid4().hex[:10], []
+        for st in stmts:
+            c = http.client.HTTPConnection("127.0.0.1", A.port, timeout=60)
+            c.request("POST", "/sql", st.encode(), {"x-pondra-session": sid})
+            r = c.getresponse(); body = r.read()
+            if r.status != 200:
+                return r.getheader("x-pondra-sqlstate")
+            out.append(rows_of(json.loads(body)) if body[:1] == b"[" else None)
+        return out
+    def via_python(stmts):
+        con, out = pondra.connect(f"http://127.0.0.1:{A.port}"), []
+        try:
+            for st in stmts:
+                r = con.sql(st)
+                out.append(rows_of(r.rows()) if hasattr(r, "rows") else None)
+        except pondra.PondraError as e:
+            return e.sqlstate
+        finally:
+            con.close()
+        return out
+    def via_postgres(stmts):
+        out = []
+        try:
+            with psycopg.connect(f"host=127.0.0.1 port={pgp} user=u dbname=lake", autocommit=True) as c:
+                for st in stmts:
+                    cur = c.execute(st)
+                    out.append([list(r) for r in cur.fetchall()] if cur.description else None)
+        except psycopg.Error as e:
+            return e.sqlstate
+        return out
+    def via_flight(stmts):
+        out = []
+        try:
+            with adbc.connect(f"grpc://127.0.0.1:{fp}", autocommit=True) as c:
+                cur = c.cursor()
+                for st in stmts:
+                    cur.execute(st)
+                    try:
+                        out.append([list(r) for r in cur.fetchall()])
+                    except Exception:
+                        out.append(None)
+        except Exception as e:
+            meta = {(k.decode() if isinstance(k, bytes) else k): (v.decode() if isinstance(v, bytes) else v) for k, v in (getattr(e, "details", None) or [])}  # (ADBC: the status's metadata)
+            return meta.get("x-pondra-sqlstate") or "refused: " + str(e).splitlines()[0][:160]
+        return out
+    def via_mcp(stmts):
+        out = []
+        for st in stmts:
+            tool = "query" if st.split()[0].upper() in ("SELECT",) else "write"
+            body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": tool, "arguments": {"sql": st}}}).encode()
+            r = json.loads(urllib.request.urlopen(urllib.request.Request(f"http://127.0.0.1:{A.port}/mcp", data=body, headers={"content-type": "application/json"}), timeout=60).read())["result"]
+            text = r["content"][0]["text"]
+            if r["isError"]:
+                m = re.search(r"\b(\d{2}[0-9A-Z]\d{2})\b", text)
+                return m.group(1) if m and m.group(1) in ("23514", "42P01", "40001", "25P02") else "refused: " + text[:160]
+            got = json.loads(text)
+            out.append(rows_of(got["rows"]) if isinstance(got, dict) and "rows" in got else None)
+        return out
+    js_lib = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "js", "index.js")
+    def via_javascript(stmts):
+        script = f"""import {{ connect }} from {json.dumps(js_lib)};
+const db = connect("http://127.0.0.1:{A.port}"); const out = [];
+try {{ for (const s of {json.dumps(stmts)}) {{ const r = await db.sql(s); out.push(Array.isArray(r) ? r.map(x => Object.values(x)) : null); }} console.log(JSON.stringify(out)); }}
+catch (e) {{ console.log(JSON.stringify(e.sqlstate || ("refused: " + e.message.slice(0, 160)))); }}
+finally {{ await db.close?.(); }}"""
+        path = os.path.join(tempfile.mkdtemp(prefix="pondra-doors-"), "d.mjs")
+        open(path, "w").write(script)
+        r = subprocess.run(["node", path], capture_output=True, text=True, timeout=60)
+        return json.loads(r.stdout.strip().splitlines()[-1]) if r.stdout.strip() else "refused: " + r.stderr[-160:]
+    via = {"http": via_http, "python": via_python, "postgres": via_postgres, "flight": via_flight, "javascript": via_javascript, "mcp": via_mcp}
+    matrix, checks = {}, {}
+    no_session = {"flight", "mcp"}  # (no session to hold a transaction: refused by name)
+    for i, door in enumerate(DOORS):
+        for name, (stmts, right) in features(i + 1).items():
+            try:
+                got = via[door](stmts)
+            except Exception as e:
+                got = "error: " + str(e)[:160]
+            ok = False
+            try:
+                ok = bool(right(got))
+            except Exception:
+                pass
+            refused = isinstance(got, str) and ("session" in got or got.startswith("refused") or got == "0A000")
+            cell = "ok" if ok else ("refused" if refused and name == "transaction" and door in no_session else "WRONG")
+            matrix.setdefault(name, {})[door] = cell if cell != "WRONG" else f"WRONG: {str(got)[:120]}"
+    for name, row in matrix.items():
+        checks[f"{name}: " + ", ".join(f"{d} {'ok' if v == 'ok' else v}" for d, v in row.items())] = all(v in ("ok", "refused") for v in row.values())
+    node.kill()
+    ok = all(checks.values())
+    width = max(len(n) for n in matrix)
+    print(f"{'':{width}}  " + "  ".join(f"{d:10}" for d in DOORS), file=sys.stderr)
+    for n, row in matrix.items():
+        print(f"{n:{width}}  " + "  ".join(f"{(row[d] if len(row[d]) < 10 else 'WRONG'):10}" for d in DOORS), file=sys.stderr)
+    print(json.dumps({"doors": checks, "ok": ok, "matrix": matrix}, indent=1))
+    if not ok:
+        sys.exit(1)
+
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    out = {t.__name__: t() for t in (upsert, deal, outside, clouds, kafkas, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, found, renames, workspace, server, scale, flight, users, secrets, safety, versions, stopped, reader, crash)}
+    out = {t.__name__: t() for t in (upsert, deal, outside, clouds, kafkas, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, found, renames, workspace, server, scale, flight, users, secrets, safety, versions, stopped, pipelines, begin, doors, reader, crash)}
     A.secs = min(A.secs, 20)
     out["load"] = load()
     print(json.dumps(out, indent=1))
@@ -5511,7 +5897,7 @@ def all_tests():
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "found", "renames", "workspace", "server", "scale", "flight", "users", "secrets", "safety", "versions", "stopped", "load", "all"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "found", "renames", "workspace", "server", "scale", "flight", "users", "secrets", "safety", "versions", "stopped", "pipelines", "begin", "doors", "load", "all"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -5522,4 +5908,4 @@ if __name__ == "__main__":
     ap.add_argument("--secs", type=int, default=30)
     ap.add_argument("--flush-ms", type=int, default=250)
     A = ap.parse_args()
-    {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "safety": safety, "versions": versions, "stopped": stopped, "load": load, "all": all_tests}[A.mode]()
+    {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "safety": safety, "versions": versions, "stopped": stopped, "pipelines": pipelines, "begin": begin, "doors": doors, "load": load, "all": all_tests}[A.mode]()

@@ -88,13 +88,34 @@ export function objectDetail(t) {
     return h('div', { class: 'pc', 'data-col': c.n }, h('div', { class: 'line1' }, typeMark(c.d), h('span', { class: 'nm' }, c.n), keyed.has(c.n) ? icon('key', 'kk') : null, h('span', { class: 'ty' }, sqlType(c.d))),
       flags.length ? h('div', { class: 'sub' }, flags.join(' · ')) : null, h('div', { class: 'ps' }));
   });
+  const flow = h('div');
+  if (o.kind === 'table' || o.kind === 'materialized view') pipeline(t, flow);
   const profileBtn = act('columns', 'Data profile', 'Each column: NULLs, distinct values, range and spread (reads the whole table)', () => profile(t.q, t.columns, cols, profileBtn));
   return [head(ic, t.t, `${word} · ${t.c}.${t.s}`, 'k-table'),
     h('div', { class: 'acts2' }, act('play', 'Preview', 'Its first rows (or double-click it)', () => query(`SELECT * FROM ${t.q} LIMIT 100`)), profileBtn, act('copy', 'Copy name', `Copy ${t.q}`, () => navigator.clipboard?.writeText(t.q).then(() => toast(`Copied ${t.q}`)))),
     facts([['Rows', counted], ['Columns', String(t.columns.length)], ['Key', o.key], ['Partitioned by', o.partition], ['Clustered by', o.cluster],
       ['Published as', o.publish], ['Rows kept', o.ttl], ['In files', stored ? `${bytes(o.bytes)} · ${count(o.files || 0)} file${o.files === 1 ? '' : 's'}` : null]]),
-    o.sql ? h('div', { class: 'dsect' }, o.kind === 'files' ? 'Reads' : 'Definition') : null, o.sql ? h('pre', { class: 'defn', html: highlighted(o.sql, 'sql') }) : null,
+    flow, o.sql ? h('div', { class: 'dsect' }, o.kind === 'files' ? 'Reads' : 'Definition') : null, o.sql ? h('pre', { class: 'defn', html: highlighted(o.sql, 'sql') }) : null,
     h('div', { class: 'dsect' }, 'Columns'), ...cols];
+}
+// A materialized view's pipeline: what it follows, back to its tables, and what follows it; its
+// expectations with the rows that broke each (pondra.pipelines, pondra.expectations: ADR-036).
+function pipeline(t, box) {
+  const me = t.s === 'public' ? t.t : `${t.s}.${t.t}`;
+  rows('SELECT name, follows FROM pondra.pipelines').then(async r => {
+    const by = new Map(r.map(x => [x.name, x.follows])), up = [];
+    for (let n = me; by.has(n) && up.length < 20;) up.unshift(n = by.get(n));
+    const down = r.filter(x => x.follows === me).map(x => x.name);
+    if (!up.length && !down.length) return;
+    const nm = n => h('span', { class: n === me ? 'fl cur' : 'fl' }, n), arr = () => h('span', { class: 'arr' }, '→');
+    box.append(h('div', { class: 'dsect' }, 'Pipeline'), h('div', { class: 'flow' }, ...[...up, me].flatMap((n, i) => [i ? arr() : null, nm(n)]),
+      ...(down.length ? [arr(), ...down.map(nm)] : [])));
+    if (!by.has(me)) return;
+    const e = await rows(`SELECT expectation, condition, on_violation, failed_rows FROM pondra.expectations WHERE view = '${me.replace(/'/g, "''")}'`);
+    if (e.length) box.append(h('div', { class: 'dsect' }, 'Expectations'), ...e.map(x => h('div', { class: 'pc' },
+      h('div', { class: 'line1' }, h('span', { class: 'nm' }, x.expectation), h('span', { class: 'ty' }, { keep: 'kept, counted', drop: 'dropped', fail: 'refused' }[x.on_violation])),
+      h('div', { class: 'sub' }, h('code', {}, x.condition), x.failed_rows > 0 ? ` · ${count(x.failed_rows)} row${x.failed_rows === 1 ? '' : 's'} broke it` : ''))));
+  }, () => {});
 }
 export async function fileDetail(f) {
   const rel = f.rel || f.path.replace(/^files\//, ''), kind = f.notebook ? 'notebook' : kindOf(rel), doc = S.docs.find(d => d.path === rel);

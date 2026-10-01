@@ -44,7 +44,14 @@ pub async fn serve(app: App, addr: String) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn status(e: impl Into<anyhow::Error>) -> Status { Status::internal(crate::ext::said(&e.into())) }
+/// An error as a gRPC status: the nearest code to its SQLSTATE, which rides along in `x-pondra-sqlstate`.
+fn status(e: impl Into<anyhow::Error>) -> Status {
+    let e = e.into();
+    let code = crate::codes::of(&e);
+    let mut s = Status::new(crate::codes::grpc(code), crate::ext::said(&e));
+    s.metadata_mut().insert("x-pondra-sqlstate", tonic::metadata::MetadataValue::from_static(code));
+    s
+}
 
 /// The caller's role (who it is: `Door` works it out); refused below `need`.
 fn allowed<T>(_: &App, _: &Request<T>, need: Role) -> Result<Role, Status> {
@@ -96,8 +103,19 @@ async fn plan_schema(app: &App, sql: &str) -> anyhow::Result<Schema> {
     Ok(ctx.sql_with_options(&crate::asof::rewrite(sql)?, crate::query::read_only()).await?.schema().as_arrow().clone())
 }
 
-/// A write sent as SQL: a CREATE, INSERT, UPDATE, DELETE or ALTER. Returns the rows written.
+/// A CALL's answer, run when its flight was asked for, until its ticket reads it (10 minutes).
+static KEPT: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, (Vec<RecordBatch>, std::time::Instant)>>> = std::sync::LazyLock::new(Default::default);
+
+/// A write sent as SQL: a CREATE, INSERT, UPDATE, DELETE or ALTER (or a CALL). Returns the rows written.
 async fn write(app: &App, role: Role, sql: &str) -> Result<i64, Status> {
+    if crate::txn::control(sql).is_some() {
+        return Err(status(crate::codes::coded("0A000", "Flight SQL's transactions aren't taken yet: BEGIN … COMMIT through the Postgres port or HTTP (a session)")));
+    }
+    if crate::routines::runs_procedure(sql) {
+        let who = crate::routines::Who { role, files: false, depth: 0 };
+        crate::routines::one(app, sql, who, None).await.map_err(status)?;
+        return Ok(0);
+    }
     let sql = crate::routines::expand(&app.lake, sql).await.map_err(status)?;
     let stmt = crate::write::parse(&sql).ok_or_else(|| Status::invalid_argument("not a write statement"))?;
     let done = crate::audit::statement(app, &sql, async {
@@ -301,6 +319,24 @@ impl FlightSqlService for Sql {
 
     async fn get_flight_info_statement(&self, q: CommandStatementQuery, req: Request<FlightDescriptor>) -> Result<Response<FlightInfo>, Status> {
         let role = allowed(&self.0, &req, Role::Read)?;
+        if crate::txn::control(&q.query).is_some() {
+            return Err(status(crate::codes::coded("0A000", "Flight SQL's transactions aren't taken yet: BEGIN … COMMIT through the Postgres port or HTTP (a session)")));
+        }
+        if crate::routines::runs_procedure(&q.query) {
+            // A CALL (or DO): run now, as every door runs one; the ticket reads back what it answered.
+            let who = crate::routines::Who { role, files: false, depth: 0 };
+            let batches = match crate::routines::one(&self.0, &q.query, who, None).await.map_err(status)? {
+                crate::routines::Outcome::Rows(b) => b,
+                crate::routines::Outcome::Done(_) => vec![RecordBatch::try_from_iter([("rows", Arc::new(datafusion::arrow::array::Int64Array::from(vec![0])) as _)]).map_err(status)?],
+            };
+            let schema = batches.first().map(|b| b.schema()).unwrap_or_else(|| Arc::new(Schema::empty()));
+            let id = uuid::Uuid::new_v4().simple().to_string();
+            let mut kept = KEPT.lock().unwrap();
+            kept.retain(|_, (_, at)| at.elapsed() < std::time::Duration::from_secs(600));
+            kept.insert(id.clone(), (batches, std::time::Instant::now()));
+            let ticket = TicketStatementQuery { statement_handle: format!("kept:{id}").into_bytes().into() };
+            return info(&schema, ticket.as_any().encode_to_vec(), req.into_inner());
+        }
         if crate::write::parse(&q.query).is_some() {
             // A write sent as a query (DB-API's `execute`): done now; the ticket reads back the count.
             let rows = write(&self.0, role, &q.query).await?;
@@ -308,7 +344,7 @@ impl FlightSqlService for Sql {
             let ticket = TicketStatementQuery { statement_handle: format!("rows:{rows}").into_bytes().into() };
             return info(&schema, ticket.as_any().encode_to_vec(), req.into_inner());
         }
-        let schema = plan_schema(&self.0, &q.query).await.map_err(|e| Status::invalid_argument(format!("{e:#}")))?;
+        let schema = plan_schema(&self.0, &q.query).await.map_err(status)?;
         let ticket = TicketStatementQuery { statement_handle: q.query.into_bytes().into() };
         info(&schema, ticket.as_any().encode_to_vec(), req.into_inner())
     }
@@ -316,6 +352,11 @@ impl FlightSqlService for Sql {
     async fn do_get_statement(&self, t: TicketStatementQuery, req: Request<Ticket>) -> Result<Response<Out<FlightData>>, Status> {
         allowed(&self.0, &req, Role::Read)?;
         let sql = String::from_utf8(t.statement_handle.to_vec()).map_err(status)?;
+        if let Some(id) = sql.strip_prefix("kept:") {
+            let Some((batches, _)) = KEPT.lock().unwrap().remove(id) else { return Err(Status::not_found("that answer was read already, or is gone")) };
+            let schema = batches.first().map(|b| b.schema()).unwrap_or_else(|| Arc::new(Schema::empty()));
+            return Ok(Response::new(send(schema, batches)));
+        }
         if let Some(n) = sql.strip_prefix("rows:").and_then(|n| n.parse::<i64>().ok()) {
             let batch = RecordBatch::try_from_iter([("rows", Arc::new(datafusion::arrow::array::Int64Array::from(vec![n])) as _)]).map_err(status)?;
             return Ok(Response::new(send(batch.schema(), vec![batch])));
@@ -497,7 +538,7 @@ impl FlightService for Door {
             let app = &self.0 .0;
             allowed(app, &req, Role::Read)?;
             let schema = match (&json.sql, &json.table) {
-                (Some(sql), _) => plan_schema(app, sql).await.map_err(|e| Status::invalid_argument(format!("{e:#}")))?,
+                (Some(sql), _) => plan_schema(app, sql).await.map_err(status)?,
                 (None, Some(table)) => {
                     let meta: TableMeta = app.lake.cat.get(&table_key(table)).await.map_err(status)?.ok_or_else(|| Status::not_found(format!("no table {table}")))?;
                     let full = crate::query::schema(&meta.logical().columns).map_err(status)?;

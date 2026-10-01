@@ -36,7 +36,7 @@ export class Pondra {
     const said = r.headers.get("x-pondra-notices");
     this.notices = said ? JSON.parse(said) : [];
     if (this.onNotice) this.notices.forEach((n) => this.onNotice(n));
-    if (!r.ok) throw new Error(`${r.status}: ${(await r.text()).slice(0, 500)}`);
+    if (!r.ok) throw Object.assign(new Error(`${r.status}: ${(await r.text()).slice(0, 500)}`), { sqlstate: r.headers.get("x-pondra-sqlstate") || "XX000", status: r.status }); // (Postgres's code: 23514 a CHECK, 40001 try again…)
     return r;
   }
 

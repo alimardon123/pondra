@@ -269,6 +269,23 @@ async fn send(lake: &Lake, to: &To, mut pending: Vec<Append>, mut turn: Option<o
                     let _ = pending.remove(i).ack.send(Ok(ack)); // and go again with the rest
                 }
             }
+            Err(e) if crate::views::refused(&e) && pending.len() > 1 => {
+                // A row a view's expectation refuses fails its own write, not the others it was
+                // packed with: they go again without it.
+                let n = pending.len();
+                let mut kept = vec![];
+                for a in pending.drain(..) {
+                    let rows = BTreeMap::from([(a.table.clone(), vec![a.batch.clone()])]);
+                    match crate::views::derive(lake, &rows).await {
+                        Err(e) if crate::views::refused(&e) => drop(a.ack.send(Err(format!("{e:#}")))),
+                        _ => kept.push(a),
+                    }
+                }
+                if kept.len() == n {
+                    kept.drain(..).for_each(|a| drop(a.ack.send(Err(format!("{e:#}"))))); // (refused together only: all of them)
+                }
+                pending = kept;
+            }
             Err(e) => {
                 for a in pending.drain(..) {
                     let _ = a.ack.send(Err(format!("{e:#}"))); // the producer retries, maybe elsewhere
@@ -426,7 +443,8 @@ async fn commit(lake: &Arc<Lake>, next: &mut u64, block: &mut u64, last_seq: &mu
         // packed again (`views::Inline`).
         let derived: std::collections::HashSet<&str> = f.parts.iter().filter(|p| p.src.is_none()).map(|p| p.table.as_str()).collect();
         let filed = f.filed.iter().filter(|x| !x.added.is_empty() || !x.removed.is_empty() || !x.deleted.is_empty()).map(|x| x.table.as_str()); // (a file commit's rows: its views derived theirs too)
-        let mut owed = f.parts.iter().filter(|p| p.src.is_some() && p.rows > 0).map(|p| p.table.as_str()).chain(filed).flat_map(|t| views.by_source.get(t).into_iter().flatten());
+        // (a view's own rows are owed to the views that follow it: a pipeline, ADR-036 §1)
+        let mut owed = f.parts.iter().filter(|p| p.rows > 0).map(|p| p.table.as_str()).chain(filed).flat_map(|t| views.by_source.get(t).into_iter().flatten());
         if owed.any(|v| !derived.contains(v.as_str())) || derived.iter().any(|t| !views.tables.contains(*t)) {
             replies.push((reply, Outcome::Retry(vec![])));
             continue;

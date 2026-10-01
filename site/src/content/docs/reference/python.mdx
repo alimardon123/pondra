@@ -320,6 +320,27 @@ for rows in db.live("SELECT count(*) AS n FROM orders"):
 Without pyarrow installed, rows come as the node's JSON, dates and times as text, and `rows()`,
 `item()` and `show()` still work. Tables (`collect()`, `to_pandas()`) need `pip install pyarrow`.
 
+## Transactions and errors
+
+`with db.transaction():` makes the block's statements one commit (`BEGIN` … `COMMIT`), reading its
+own writes, rolled back if the block raises ([Transactions](/pondra/guides/change-rows/#transactions)).
+
+An error from the node raises `pondra.PondraError` (a `RuntimeError`), whose `sqlstate` is
+Postgres's code for it: `"23514"` a `CHECK`, `"42P01"` no such table, `"40001"` a transaction
+another commit got to first (run it again). `status` is the HTTP status.
+
+```python
+db.sql("CREATE TABLE stock (sku VARCHAR, qty BIGINT CHECK (qty >= 0))")
+try:
+    db.sql("INSERT INTO stock VALUES ('tea', -1)")
+except pondra.PondraError as e:
+    print(e.sqlstate)
+```
+
+```text
+23514
+```
+
 ## Close
 
 `db.close()` ends the connection's session, so its temporary tables and views go, and so do the

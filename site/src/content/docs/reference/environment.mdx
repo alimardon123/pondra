@@ -66,6 +66,8 @@ PONDRA_SECRET_KEY="$SECRET" pondra serve lake
 | `PONDRA_CONFIG_DIR` | `%APPDATA%\pondra` on Windows, `~/Library/Application Support/pondra` on a Mac, `~/.config/pondra` elsewhere | where a node keeps what it keeps for its machine: the console's [settings](/pondra/start/console/#settings) (`console.json`) and the Python chosen in it (`python.txt`) |
 | `PONDRA_CONSOLE_EXTENSIONS` | none | scripts the console loads after its own, separated as `PATH` is: an [extension](/pondra/start/console/#extend-it) adds sections, tabs, views of answers and actions. Served at `/console/ext/{n}.js` |
 | `PONDRA_SESSION_IDLE_SECS` | `3600` | a session idle this long ends. Its temporary tables go, and so does its [Python](/pondra/guides/functions-and-procedures/#cells-that-share-variables), with the variables its `DO LANGUAGE python` blocks made |
+| `PONDRA_TXN_IDLE_SECS` | `600` | a transaction idle this long ends, rolled back ([Transactions](/pondra/guides/change-rows/#transactions)) |
+| `PONDRA_TRACE_PG` | unset | `1`: where each Postgres statement's time goes, on the node's stderr |
 | `PONDRA_DATABASE_IDLE_SECS` | `600` | serving a [folder of lakes](/pondra/guides/server/): a database's node with no connection open and no request on its way, that nothing has used for this long, and that has nothing left to tier, stops. The next query starts it again |
 | `PONDRA_CODEC` | `lz4` | how data files are compressed: `lz4` (fastest to read), `zstd` (smaller files), `snappy` or `none` |
 

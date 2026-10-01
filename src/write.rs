@@ -51,6 +51,8 @@ enum TableSpec {
         #[serde(default)]
         defaults: BTreeMap<String, String>, // column -> SQL expression for rows that leave it out
         properties: Option<BTreeMap<String, String>>, // other engines' (`write.delete.mode`, say): published for them
+        #[serde(default)]
+        checks: Vec<(String, String)>, // CHECK constraints: (name, condition), made with the table
     },
 }
 
@@ -59,9 +61,9 @@ enum TableSpec {
 pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> {
     let name = &crate::ddl::new_name(lake, name).await?; // (its schema exists; `public.t` is `t`)
     ensure!(lake.cat.get::<crate::ddl::StoredView>(&crate::ddl::query_key(name)).await?.is_none(), "{name} is a view");
-    let (columns, key, merge, publish, cluster, ttl, partition, order, not_null, defaults, properties) = match serde_json::from_str(spec)? {
-        TableSpec::Columns(c) => (c, vec![], BTreeMap::new(), None, None, None, None, None, vec![], BTreeMap::new(), None),
-        TableSpec::Full { columns, key, merge, publish, cluster_by, ttl, partition_by, order_by, not_null, defaults, properties } => (columns, key, merge, publish, cluster_by, ttl, partition_by, order_by, not_null, defaults, properties),
+    let (columns, key, merge, publish, cluster, ttl, partition, order, not_null, defaults, properties, checks) = match serde_json::from_str(spec)? {
+        TableSpec::Columns(c) => (c, vec![], BTreeMap::new(), None, None, None, None, None, vec![], BTreeMap::new(), None, vec![]),
+        TableSpec::Full { columns, key, merge, publish, cluster_by, ttl, partition_by, order_by, not_null, defaults, properties, checks } => (columns, key, merge, publish, cluster_by, ttl, partition_by, order_by, not_null, defaults, properties, checks),
     };
     // Types as the lake records them: `VARIANT` is JSON text, `Float32[]` a list (see `query::dtype`).
     let columns = columns.iter().map(|(n, t)| Ok((n.clone(), crate::query::type_name(&crate::query::dtype(t)?)))).collect::<Result<Vec<_>>>()?;
@@ -93,6 +95,10 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
         let t = &columns.iter().find(|(n, _)| n == c).expect("a column").1;
         crate::defaults::validate(c, t, expr).await?;
     }
+    let empty = RecordBatch::new_empty(schema(&columns)?);
+    for (n, c) in &checks {
+        crate::defaults::breaking(&empty, c).with_context(|| format!("CONSTRAINT {n} CHECK ({c})"))?; // (a condition over its columns)
+    }
     // (a key's columns are NOT NULL too: a row with no key has nothing to be found by)
     let not_null: Vec<String> = columns.iter().map(|(c, _)| c).filter(|c| not_null.contains(c) || key.contains(c)).cloned().collect();
     let meta = match lake.cat.get::<TableMeta>(&table_key(name)).await? {
@@ -100,7 +106,7 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
         // in segments that aren't expired yet.)
         None => {
             let folder = crate::ddl::free_folder(lake, name).await?; // (a renamed table may still have this name's folder)
-            TableMeta { columns, key, merge, publish: publish.unwrap_or_else(default_publish), cluster: cluster.unwrap_or_default(), ttl, partition, order, not_null, defaults, folder, tiered: lake.visible(), ids: true, properties: properties.unwrap_or_default(), ..Default::default() }
+            TableMeta { columns, key, merge, publish: publish.unwrap_or_else(default_publish), cluster: cluster.unwrap_or_default(), ttl, partition, order, not_null, defaults, checks, folder, tiered: lake.visible(), ids: true, properties: properties.unwrap_or_default(), ..Default::default() }
         }
         Some(mut m) => {
             // (the spec names columns as SQL does; the table keeps its stored names: ADR-022)
@@ -282,6 +288,23 @@ pub fn parse(sql: &str) -> Option<Stmt> {
             Ok(all) => Stmt::Invalid(format!("CREATE EXTERNAL TABLE and {} more: send one statement at a time here (or as a script, over HTTP or in the shell)", all.len().saturating_sub(1))),
             Err(e) => Stmt::Invalid(format!("{e}")),
         });
+    }
+    // CREATE MATERIALIZED VIEW v (CONSTRAINT c CHECK (…) ON VIOLATION DROP ROW, …): its
+    // expectations (ADR-036 §2), which the parser doesn't take.
+    match crate::views::constraints(sql) {
+        Ok(Some((rest, expect))) => {
+            return Some(match parse(&rest) {
+                Some(Stmt::Ddl(mut d)) if matches!(d[..], [Ddl::CreateMaterialized { .. }]) => {
+                    if let Some(Ddl::CreateMaterialized { options, .. }) = d.first_mut() {
+                        options.insert("expect".into(), serde_json::to_string(&expect).unwrap_or_default());
+                    }
+                    Stmt::Ddl(d)
+                }
+                other => other.unwrap_or_else(|| Stmt::Invalid("CREATE MATERIALIZED VIEW v (CONSTRAINT c CHECK (…)) AS SELECT …".into())),
+            });
+        }
+        Ok(None) => {}
+        Err(e) => return Some(Stmt::Invalid(format!("{e:#}"))),
     }
     if let Some(c) = VIEW_RENAME.captures(first_word(sql)) {
         let name = |s: &str| s.split('.').map(|p| if p.starts_with('"') { p.trim_matches('"').to_string() } else { p.to_lowercase() }).collect::<Vec<_>>().join(".");
@@ -487,6 +510,25 @@ pub async fn create_spec(c: &ast::CreateTable, from: &Lake, files: bool) -> Resu
         ast::ColumnOption::Default(e) => Some((c.name.value.clone(), e.to_string())),
         _ => None,
     })).collect();
+    // CHECKs, named as Postgres names them when they aren't: `{table}_{column}_check`, `{table}_check`.
+    let table = object(&c.name).rsplit('.').next().unwrap_or_default().to_string();
+    let mut checks: Vec<(String, String)> = vec![];
+    let mut check = |name: Option<&ast::Ident>, base: String, expr: &ast::Expr| {
+        let name = name.map(ident).unwrap_or_else(|| (1..).map(|i| if i == 1 { base.clone() } else { format!("{base}{}", i - 1) }).find(|n| !checks.iter().any(|(c, _)| c == n)).unwrap_or(base));
+        checks.push((name, expr.to_string()));
+    };
+    for col in &c.columns {
+        for o in &col.options {
+            if let ast::ColumnOption::Check(k) = &o.option {
+                check(k.name.as_ref().or(o.name.as_ref()), format!("{table}_{}_check", col.name.value), &k.expr);
+            }
+        }
+    }
+    for k in &c.constraints {
+        if let ast::TableConstraint::Check(k) = k {
+            check(k.name.as_ref(), format!("{table}_check"), &k.expr);
+        }
+    }
     let mut opts: BTreeMap<String, String> = BTreeMap::new();
     if let ast::CreateTableOptions::With(o) | ast::CreateTableOptions::Options(o) = &c.table_options {
         for o in o {
@@ -505,7 +547,7 @@ pub async fn create_spec(c: &ast::CreateTable, from: &Lake, files: bool) -> Resu
     if !key.is_empty() && merge.is_empty() && !columns.iter().any(|(c, _)| c == "_deleted") {
         columns.push(("_deleted".into(), "Boolean".into())); // (so DELETE works; writes leave it out)
     }
-    let spec = j!({"columns": columns, "key": key, "merge": merge, "publish": list("publish"), "cluster_by": list("cluster_by"), "ttl": opts.get("ttl"), "partition_by": opts.get("partition_by"), "order_by": opts.get("order_by"), "not_null": not_null, "defaults": defaults});
+    let spec = j!({"columns": columns, "key": key, "merge": merge, "publish": list("publish"), "cluster_by": list("cluster_by"), "ttl": opts.get("ttl"), "partition_by": opts.get("partition_by"), "order_by": opts.get("order_by"), "not_null": not_null, "defaults": defaults, "checks": checks});
     Ok(spec.to_string())
 }
 
@@ -534,7 +576,7 @@ async fn alter_spec(lake: &Lake, stmt: &Stmt) -> Result<Option<String>> {
     let table = stmt.table();
     let m: TableMeta = lake.cat.get::<TableMeta>(&table_key(&table)).await?.ok_or_else(|| anyhow::anyhow!("no table {table}"))?.logical(); // (as SQL names it)
     let ttl = m.ttl.as_ref().map(|(c, s)| format!("{c}:{s}"));
-    let mut spec = j!({"columns": m.columns, "key": m.key, "merge": m.merge, "publish": m.publish, "cluster_by": m.cluster, "ttl": ttl, "partition_by": m.partition, "order_by": m.order, "not_null": m.not_null, "defaults": m.defaults, "properties": m.properties});
+    let mut spec = j!({"columns": m.columns, "key": m.key, "merge": m.merge, "publish": m.publish, "cluster_by": m.cluster, "ttl": ttl, "partition_by": m.partition, "order_by": m.order, "not_null": m.not_null, "defaults": m.defaults, "properties": m.properties, "checks": m.checks});
     match stmt {
         Stmt::AddColumn(_, column, sql_type, if_not_exists) => {
             if m.columns.iter().any(|(c, _)| c == column) {
@@ -602,7 +644,7 @@ fn rows_sql(meta: &TableMeta, stmt: &Stmt) -> Result<String> {
 /// `INSERT INTO t (b, a) …` as an INSERT of whole rows: the columns it names from its query, by
 /// position, the others NULL (`_deleted` left for `rows` to fill), in the table's order. `VALUES`
 /// stay `VALUES`, so they still go through the log.
-async fn whole_rows(lake: &Lake, table: &str, names: &[String], query: &str) -> Result<String> {
+pub async fn whole_rows(lake: &Lake, table: &str, names: &[String], query: &str) -> Result<String> {
     let (other, name) = crate::ddl::resolve(lake, table).await?;
     let meta: TableMeta = other.as_deref().unwrap_or(lake).cat.get(&table_key(&name)).await?.with_context(|| format!("no table {table}"))?;
     let columns: Vec<String> = meta.logical().columns.into_iter().map(|(c, _)| c).filter(|c| c != "_deleted" || names.contains(c)).collect();
@@ -855,6 +897,9 @@ async fn on_node_listed(app: &crate::server::App, stmt: Stmt, job: Option<String
     if let Some(out) = crate::temp::statement(app, &stmt, files).await? {
         return Ok(out); // (the session's own tables and views: on this node, in memory)
     }
+    if let Some(out) = Box::pin(crate::txn::statement(app, &stmt, files)).await? {
+        return Ok(out); // (in a transaction: kept until COMMIT, ADR-036 §5)
+    }
     ensure!(!app.cluster.reader, "read-only node");
     if let Stmt::Invalid(why) = stmt {
         bail!(why);
@@ -952,7 +997,18 @@ async fn on_node_listed(app: &crate::server::App, stmt: Stmt, job: Option<String
         _ => bail!("UPDATE and DELETE need a keyed table (append tables only take INSERTs)"),
     };
     let meta = meta.expect("a table");
-    let batch = rows(&open(session(lake, &sql, "").await?), &meta, &sql).await?;
+    let point = match &stmt {
+        // (one key's UPDATE: its row from the serving path, no planning, ADR-036 §6)
+        Stmt::Update(_, set, Some(cond)) => match lake.cat.get::<TableMeta>(&table_key(&table)).await? {
+            Some(stored) => Box::pin(crate::txn::point_change(lake, &table, &stored, None, set, cond)).await?.map(|(_, new)| new),
+            None => None,
+        },
+        _ => None,
+    };
+    let batch = match point {
+        Some(new) if !new.is_empty() => new.into_iter().next().expect("a row"),
+        _ => rows(&open(session(lake, &sql, "").await?), &meta, &sql).await?,
+    };
     let n = batch.num_rows();
     let ack = app.log()?.append(table, Src { producer: format!("sql:{job}"), seq: 1, prev: None }, batch).await?;
     Ok(if ack.duplicate { j!({"duplicate": true}) } else { j!({"rows": n}) })
@@ -978,6 +1034,7 @@ pub enum Request {
     Ddl(crate::ddl::Ddl),
     Change(String, String, crate::change::Sent), // an UPDATE, DELETE or MERGE the leader carries out (`change.rs`): SQL, job, the rows it reads that the leader can't
     Iceberg(Vec<crate::iceberg::Commit>), // another engine's commit (ADR-028), or its transaction over several tables
+    Txn(crate::txn::Commit),              // a transaction's writes, one commit (ADR-036 §5)
 }
 
 impl Request {
@@ -990,6 +1047,7 @@ impl Request {
             Request::Ddl(d) => ("/cluster/ddl".into(), serde_json::to_vec(d)?),
             Request::Change(sql, job, sent) => ("/cluster/change".into(), serde_json::to_vec(&(sql, job, sent))?),
             Request::Iceberg(c) => ("/cluster/iceberg".into(), serde_json::to_vec(c)?),
+            Request::Txn(c) => ("/cluster/txn".into(), serde_json::to_vec(c)?),
         })
     }
 
@@ -1001,6 +1059,7 @@ impl Request {
             Request::Ddl(_) => ("ddl".into(), self.http()?.1),
             Request::Change(..) => ("change".into(), self.http()?.1),
             Request::Iceberg(_) => ("iceberg".into(), self.http()?.1),
+            Request::Txn(_) => ("txn".into(), self.http()?.1),
         })
     }
 
@@ -1010,6 +1069,7 @@ impl Request {
             "flush" => Request::Flush(body),
             "iceberg" => Request::Iceberg(serde_json::from_slice(&body)?),
             "ddl" => Request::Ddl(serde_json::from_slice(&body)?),
+            "txn" => Request::Txn(serde_json::from_slice(&body)?),
             "change" => {
                 let (sql, job, sent): (String, String, crate::change::Sent) = serde_json::from_slice(&body)?;
                 Request::Change(sql, job, sent)
@@ -1043,6 +1103,7 @@ pub async fn handle(lake: &Lake, seq: &Sequencer, lock: &Mutex<()>, req: Request
             let _guard = lock.lock().await;
             crate::query::SENT.scope(Arc::new(crate::change::unpack(&sent)?), crate::change::run(lake, seq, &sql, &job)).await
         }
+        Request::Txn(c) => crate::txn::commit_here(lake, seq, lock, c).await, // (it takes the lock)
         Request::Iceberg(c) => {
             let _guard = lock.lock().await;
             crate::iceberg::record(lake, seq, c, &[String::new()], "", 60_000).await // (a leader answering through the bucket: --retain-secs' default)

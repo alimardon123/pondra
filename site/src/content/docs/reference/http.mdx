@@ -85,8 +85,11 @@ print(first["total"], len(first["rows"]), len(more["rows"]), more["rows"][0])
 ```
 
 The header `x-pondra-notices` on an answer carries what procedures and `DO` blocks printed, as a
-JSON list of lines. Send `x-pondra-session: <id>` (8 to 128 letters, digits, `-` or `_`) to use temporary tables that only that id sees, and
-`DO LANGUAGE python` blocks that share their variables ([Functions and procedures](/pondra/guides/functions-and-procedures/#cells-that-share-variables)).
+JSON list of lines. Send `x-pondra-session: <id>` (8 to 128 letters, digits, `-` or `_`) to use temporary tables that only that id sees,
+`DO LANGUAGE python` blocks that share their variables ([Functions and procedures](/pondra/guides/functions-and-procedures/#cells-that-share-variables)),
+and a transaction: `BEGIN`, then statements, then `COMMIT`, each request with the same id
+([Transactions](/pondra/guides/change-rows/#transactions)). An error is status 500 with its message
+as the body, and `x-pondra-sqlstate`, Postgres's code for it ([error codes](/pondra/reference/postgres/#error-codes)).
 
 ```bash
 curl -s -X POST http://localhost:8080/sql -d "CREATE TABLE events (user VARCHAR, amount BIGINT)"

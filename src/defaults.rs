@@ -13,24 +13,65 @@ use datafusion::prelude::SessionContext;
 pub fn check(meta: &TableMeta, table: &str, rows: &RecordBatch) -> Result<()> { check_named(meta, table, rows, true) }
 
 fn check_named(meta: &TableMeta, table: &str, rows: &RecordBatch, sql_names: bool) -> Result<()> {
-    if meta.not_null.is_empty() || rows.num_rows() == 0 {
+    if (meta.not_null.is_empty() && meta.checks.is_empty()) || rows.num_rows() == 0 {
         return Ok(());
     }
     let deleted = rows.column_by_name("_deleted").and_then(|d| d.as_boolean_opt().cloned());
+    let marker = |i: usize| deleted.as_ref().is_some_and(|d| d.is_valid(i) && d.value(i));
+    if !meta.checks.is_empty() {
+        // (under SQL's names, every column there: one a write leaves out is NULL, which passes)
+        let named = match sql_names || !meta.mapped() {
+            true => rows.clone(),
+            false => {
+                let fields: Vec<_> = rows.schema().fields().iter().map(|f| std::sync::Arc::new(f.as_ref().clone().with_name(meta.name_of(f.name())))).collect();
+                RecordBatch::try_new(std::sync::Arc::new(datafusion::arrow::datatypes::Schema::new(fields)), rows.columns().to_vec())?
+            }
+        };
+        let all = crate::query::conform(&named, &crate::query::schema(&meta.logical().columns)?)?;
+        for (name, c) in &meta.checks {
+            let bad = breaking(&all, c)?;
+            if (0..bad.len()).any(|i| bad.value(i) && !marker(i)) {
+                return Err(anyhow::Error::new(crate::views::Violation(format!("new row for relation \"{table}\" violates check constraint \"{name}\": CHECK ({c})"))));
+            }
+        }
+    }
     for stored in &meta.not_null {
         let name = meta.name_of(stored);
         let Some(c) = rows.column_by_name(if sql_names { name } else { stored }).filter(|c| c.null_count() > 0) else { continue };
-        if (0..c.len()).any(|i| c.is_null(i) && !deleted.as_ref().is_some_and(|d| d.is_valid(i) && d.value(i))) {
+        if (0..c.len()).any(|i| c.is_null(i) && !marker(i)) {
             bail!("{table}.{name} is NOT NULL, and a row gives it no value");
         }
     }
     Ok(())
 }
 
+/// `expr` over `rows` (their columns by name), a value for each row; None if it doesn't plan
+/// over them alone (a qualified name, a subquery: SQL works it out instead).
+pub fn evaluate(rows: &RecordBatch, expr: &str) -> Result<Option<ArrayRef>> {
+    use datafusion::common::DFSchema;
+    static CTX: std::sync::LazyLock<SessionContext> = std::sync::LazyLock::new(SessionContext::new);
+    let schema = DFSchema::try_from(rows.schema().as_ref().clone())?;
+    let Ok(e) = CTX.parse_sql_expr(expr, &schema) else { return Ok(None) };
+    let Ok(phys) = CTX.create_physical_expr(e, &schema) else { return Ok(None) };
+    Ok(Some(phys.evaluate(rows)?.into_array(rows.num_rows())?))
+}
+
+/// Which of `rows` break `check`, a condition over their columns by name: those it is false for
+/// (NULL passes, as with Postgres's CHECK). Expectations (`views::Expect`) and tables' CHECKs.
+pub fn breaking(rows: &RecordBatch, check: &str) -> Result<BooleanArray> {
+    use datafusion::common::DFSchema;
+    static CTX: std::sync::LazyLock<SessionContext> = std::sync::LazyLock::new(SessionContext::new);
+    let schema = DFSchema::try_from(rows.schema().as_ref().clone())?;
+    let expr = CTX.parse_sql_expr(check, &schema)?;
+    let value = CTX.create_physical_expr(expr, &schema)?.evaluate(rows)?.into_array(rows.num_rows())?;
+    let Some(b) = value.as_boolean_opt() else { bail!("CHECK ({check}) is not a condition: it gives {}, not true or false", value.data_type()) };
+    Ok(b.iter().map(|v| Some(v == Some(false))).collect())
+}
+
 /// A bulk INSERT's rows (under their stored names), checked as they stream into files.
 pub fn checked(rows: datafusion::execution::SendableRecordBatchStream, meta: &Option<TableMeta>, table: &str) -> datafusion::execution::SendableRecordBatchStream {
     use futures::StreamExt;
-    let Some(meta) = meta.clone().filter(|m| !m.not_null.is_empty()) else { return rows };
+    let Some(meta) = meta.clone().filter(|m| !m.not_null.is_empty() || !m.checks.is_empty()) else { return rows };
     let (schema, table) = (rows.schema(), table.to_string());
     let checked = rows.map(move |b| {
         let b = b?;

@@ -403,6 +403,74 @@ db.close()
 The change to `picks` left `stock` alone: `tea` is 0 in the copy and 17 in the table. JavaScript's
 `await db.sql(…)` and `await db.close()` do the same, and so does a `psql` session until it ends.
 
+## Transactions
+
+`BEGIN` … `COMMIT` makes several statements one commit: all of them or none, the views that
+follow the tables moving with it. Inside, every statement reads the lake as it was at `BEGIN`, with
+the transaction's own writes over it, and nobody else sees those writes until `COMMIT`.
+
+```python
+import pondra
+db = pondra.connect("http://localhost:8080")
+db.sql("CREATE TABLE accounts (id BIGINT, balance BIGINT CHECK (balance >= 0))")
+db.sql("INSERT INTO accounts VALUES (1, 100), (2, 50)")
+with db.transaction():
+    db.sql("UPDATE accounts SET balance = balance - 30 WHERE id = 1")
+    db.sql("UPDATE accounts SET balance = balance + 30 WHERE id = 2")
+    print(db.sql("SELECT id, balance FROM accounts ORDER BY id").rows())
+print(db.sql("SELECT count(DISTINCT _version) AS commits FROM accounts WHERE id IN (1, 2)").rows())
+```
+
+```text
+[{'id': 1, 'balance': 70}, {'id': 2, 'balance': 80}]
+[{'commits': 1}]
+```
+
+A statement that fails fails its transaction: until it ends, every statement is refused
+(`25P02`, as in Postgres), and `COMMIT` rolls it back. `with db.transaction():` rolls back when its
+block raises:
+
+```python
+try:
+    with db.transaction():
+        db.sql("UPDATE accounts SET balance = balance + 500 WHERE id = 2")
+        db.sql("UPDATE accounts SET balance = balance - 500 WHERE id = 1")
+except pondra.PondraError as e:
+    print(e.sqlstate)
+print(db.sql("SELECT id, balance FROM accounts ORDER BY id").rows())
+```
+
+```text
+23514
+[{'id': 1, 'balance': 70}, {'id': 2, 'balance': 80}]
+```
+
+Over the Postgres port a connection is the session, so drivers' transactions work as they do with
+Postgres (psycopg's `with conn.transaction()`, JDBC's `setAutoCommit(false)`):
+
+```sql norun
+BEGIN;
+UPDATE accounts SET balance = balance - 10 WHERE id = 1;
+INSERT INTO history VALUES (1, -10);
+COMMIT;
+```
+
+Over HTTP, send the statements of one transaction with the same `x-pondra-session` header (the
+Python and JavaScript clients do), or all of them in one request: `BEGIN; …; COMMIT`.
+
+**Isolation.** A transaction is snapshot isolation, Postgres's `REPEATABLE READ`: it reads one
+snapshot, and if another commit changed a row it changes (by row; a keyed table's, by key) after
+that snapshot, its `COMMIT` is refused with `40001` (`could not serialize access due to concurrent
+update`), the first to commit winning. Run it again: `PondraError.sqlstate == "40001"` in Python,
+psycopg's `SerializationFailure`, pgbench's `--max-tries`.
+
+<Aside type="note">
+A transaction is kept in the memory of the node its session talks to, and sent to the leader as
+one request at `COMMIT`. `CREATE`, `ALTER` and `DROP` aren't part of one (refused inside, `0A000`),
+nor are savepoints. One idle for `PONDRA_TXN_IDLE_SECS` (600) ends, rolled back, as does one whose
+connection closes.
+</Aside>
+
 ## What to know
 
 <Aside type="caution">

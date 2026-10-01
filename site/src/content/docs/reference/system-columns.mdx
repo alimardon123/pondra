@@ -1,6 +1,6 @@
 ---
 title: System columns and tables
-description: The columns every row has, the change feed's change types, and the pondra.runs, pondra.routines, pondra.tasks and pondra.tables tables.
+description: The columns every row has, the change feed's change types, and the pondra.runs, pondra.routines, pondra.tasks, pondra.tables, pondra.pipelines and pondra.expectations tables.
 sidebar:
   order: 16
 ---
@@ -231,6 +231,31 @@ SELECT name, kind, key FROM pondra.tables WHERE name IN ('sold', 'sold_by_item',
 
 ```sql
 SHOW MATERIALIZED VIEWS LIKE 'sold%';
+```
+
+## Pipelines and expectations
+
+`pondra.pipelines` lists each materialized view ([Pipelines](/pondra/guides/pipelines/)):
+
+| Column | Meaning |
+|---|---|
+| `name` | the view |
+| `follows` | the table or view whose rows it follows (a stream join's two tables) |
+| `kind` | `rows` (no `GROUP BY`), `aggregate`, `window`, `sessions` or `stream join` |
+| `reads` | other tables its query reads, or null |
+| `expectations` | how many it has |
+| `definition` | its query |
+
+`pondra.expectations` has a row per expectation: `view`, `expectation`, `condition`,
+`on_violation` (`keep`, `drop` or `fail`) and `failed_rows`, the rows that broke it, counted in the
+commits that wrote the view's rows.
+
+```sql
+SELECT name, follows, kind FROM pondra.pipelines WHERE name = 'sold_by_item';
+```
+
+```text
+[{"name":"sold_by_item","follows":"sold","kind":"aggregate"}]
 ```
 
 <Aside type="caution">

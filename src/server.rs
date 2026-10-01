@@ -108,6 +108,10 @@ pub fn router(app: App) -> Router {
         .route("/tier", post(tier_now))
         .route("/cluster/ddl", post(ddl))
         .route("/cluster/change", post(change))
+        .route("/cluster/txn", post(|State(app): State<App>, Json(c): Json<crate::txn::Commit>| async move {
+            let seq = app.seq.as_ref().ok_or_else(|| anyhow::anyhow!("not the leader"))?;
+            Ok::<_, E>(Json(crate::txn::commit_here(&app.lake, seq, &app.lock, c).await?))
+        }))
         .route("/cluster/iceberg", post(|State(app): State<App>, Json(c): Json<Vec<crate::iceberg::Commit>>| async move { Ok::<_, E>(Json(app.record_iceberg(c).await?)) }))
         .route_layer(middleware::from_fn_with_state(app.clone(), to_leader));
     Router::new()
@@ -551,7 +555,7 @@ impl App {
         use crate::metrics::{add, QUERIES, QUERY_ERRORS, QUERY_US, SPREAD};
         let start = std::time::Instant::now();
         let run = async {
-            let here_only = spread == Some("0") || crate::query::sent() || crate::temp::mentioned(query) || crate::routines::pinned(&self.lake, query).await // (rows sent with a request are here only; so are the session's temporary tables, and a Python table function's call)
+            let here_only = spread == Some("0") || crate::query::sent() || crate::temp::mentioned(query) || crate::txn::open() || crate::routines::pinned(&self.lake, query).await // (rows sent with a request are here only; so are the session's temporary tables and its transaction, and a Python table function's call)
                 || crate::auth::limited().is_some(); // (and a user's granted some tables: its grants are checked where it is planned, here)
             let nodes = if here_only { vec![] } else { self.cluster.nodes() };
             match crate::spmd::query(&self.lake, &nodes, &self.cluster.addr, query, spread == Some("1")).await {
@@ -968,7 +972,7 @@ async fn sql_as(app: App, p: SqlParams, role: axum::Extension<crate::auth::Role>
     }
     if let ([one], true, true, true) = (&crate::routines::split(&req.sql)[..], req.params.is_empty(), req.tables.is_empty(), req.views.is_empty()) {
         let one = crate::routines::expand(&app.lake, one).await?;
-        if !crate::write::checkpoint(&one) && !crate::routines::runs_procedure(&one) && crate::write::parse(&one).is_none() {
+        if !crate::write::checkpoint(&one) && !crate::routines::runs_procedure(&one) && crate::write::parse(&one).is_none() && crate::txn::control(&one).is_none() && !crate::txn::open() {
             return Ok(crate::audit::statement(&app, &one, query(&app, &p, &one, who.files)).await?);
         }
     }
@@ -1232,5 +1236,8 @@ impl<T: Into<anyhow::Error>> From<T> for E {
     fn from(e: T) -> Self { E(e.into()) }
 }
 impl IntoResponse for E {
-    fn into_response(self) -> Response { (StatusCode::INTERNAL_SERVER_ERROR, crate::ext::said(&self.0)).into_response() }
+    fn into_response(self) -> Response {
+        let code = crate::codes::of(&self.0); // (Postgres's SQLSTATE, for any client: ADR-036 §4)
+        (StatusCode::INTERNAL_SERVER_ERROR, [("x-pondra-sqlstate", code)], crate::ext::said(&self.0)).into_response()
+    }
 }

@@ -6,7 +6,9 @@ rounds" is what I recommend, the decisions in "What only you can decide" are you
 
 **Progress (2026-10-01):** rounds 17 to 29 are done (ADR-018 to ADR-035; round 29, the owner's
 console lists, then users, grants, secrets, TLS, an audit log, quotas, files with versions and C5,
-is 0.28.0). Round 30 is next.
+is 0.28.0). Round 30 is under way (ADR-036): pipelines with expectations, transactions, error
+codes, CHECK constraints, the point path from every door and the doors matrix are built; identity
+columns, UNIQUE (decision 10) and SCD type 2 are left.
 
 - **Round 17** made Pondra install anywhere: a glibc 2.17 Linux binary, pip and npm packages
   (built, not published), a SQL shell, and both flaky tests fixed.
@@ -493,9 +495,9 @@ takes one angle to its bar; every round re-measures all of them.
 | **Right answers** | sqllogictest 74.5% (18,460 of 24,783) on one node; TPC-H 22 of 22 on 1, 3 and 6 nodes; no TPC-DS; no random-query test | sqllogictest ≥ 95%, every exception named; TPC-DS's 99 equal to DuckDB's; 100,000 random queries: one node == three == DuckDB | 31 |
 | **Never loses data** | kill -9 and injected crashes, leader kills: every event once, views exact | also a 24-hour soak (0 lost, memory flat); every release's lake opens in the next; a rolling upgrade; time travel and `UNDROP` within a retention you set (today 60 s) | 32 |
 | **Safe** | ~~read, write and admin tokens; plain HTTP between nodes; any panic stops the node~~ round 29: users and grants to a column, TLS everywhere, mutual TLS, an audit log, quotas, doors fuzzed, a request's panic an error | TLS on every door and between nodes; users and grants down to a column; an audit log; quotas; every wire parser fuzzed; no request can stop a node | 29 |
-| **The same from every door** | local files for the shell only; the fast lookup on `/lookup` only; no transactions on the Postgres port | every feature × every door in one test; `BEGIN`…`COMMIT` everywhere; Postgres's error codes; the console signed in as the shell is | 29, 30 |
+| **The same from every door** | ~~local files for the shell only; the fast lookup on `/lookup` only; no transactions on the Postgres port~~ round 30: the doors matrix (9 features × 6 doors, each right or refused by name); `BEGIN`…`COMMIT` on Postgres, HTTP and the clients; Postgres's error codes on every door | every feature × every door in one test; `BEGIN`…`COMMIT` everywhere; Postgres's error codes; the console signed in as the shell is | 29, 30 |
 | **Fast: analytics** | TPC-H SF1 from files 3.60 s, DuckDB 3.70 s (Polars 3.79 s, the same day); from memory 2.03 s against DuckDB's own tables 1.74 s; Q1 10x Postgres | from memory ≤ DuckDB's own tables at SF1 and SF10; ClickBench published | every round, 33 |
-| **Fast: points and writes** | lookup 0.17 ms (`/lookup`), 6.5 ms (Postgres port; Postgres 0.13 ms); one-row insert 2.3 ms (Postgres 0.3 ms) | ≤ 0.5 ms from every door; `pgbench` runs, balances right | 30 |
+| **Fast: points and writes** | lookup p50 0.19 ms (`/lookup`), ~~6.5~~ **0.29 ms** (Postgres port, psycopg, round 30; Postgres 0.09 ms); one-row insert 2.0 ms (Postgres 0.33 ms); one-key UPDATE 2.5 ms; pgbench runs, balances right: 134 tps on 1 client (Postgres 997), 95 on 4 (Postgres 1,793) | ≤ 0.5 ms from every door; `pgbench` runs, balances right | 30 |
 | **Fast from cold** | 6.5–8 s before a node serves, on R2-like storage | a third of that; no burst above the bucket's limits (C5) | 29 |
 | **Scales out** | never run in one data centre; GitHub's runners (above): 3 nodes 8% faster than one | TPC-H SF100: time falls 1 → 3 → 6 machines; faster than Spark on the same VMs | 33 |
 | **Streaming** | Nexmark's q1, q2, q5, q7, q11: 2.2–2.9x Flink on 2 vCPUs (round 21); Fluss compared from its docs | all of Nexmark against Flink; Fluss run head to head | 33 |

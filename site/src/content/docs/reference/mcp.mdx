@@ -119,7 +119,9 @@ Every request is a JSON-RPC message in a `POST`. A `GET` answers `405`.
 
 A tool that fails is not a protocol error: it answers with `"isError": true` and the reason as the
 text, which the agent can read and act on (`no tool nosuch`, `this token may not write`, or the
-SQL error).
+SQL error), after Postgres's code for it: `SQLSTATE 23514: new row for relation "t" violates check
+constraint …` ([error codes](/pondra/reference/postgres/#error-codes)). MCP has no session, so a
+transaction is refused by name: send a procedure that does the work as one statement instead.
 
 ```bash
 mcp() {

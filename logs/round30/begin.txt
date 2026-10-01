@@ -1,0 +1,51 @@
+{
+ "begin": {
+  "on the leader: a transaction reads its own writes, others don't see them until COMMIT": true,
+  "on the leader: COMMIT is one commit (every row it wrote, one _version)": true,
+  "on the follower: a transaction reads its own writes, others don't see them until COMMIT": true,
+  "on the follower: COMMIT is one commit (every row it wrote, one _version)": true,
+  "ROLLBACK leaves nothing": true,
+  "a failed statement fails the transaction: 42P01, then 25P02 until it ends; COMMIT rolls it back": true,
+  "two transactions change one row: the first commits, the second gets 40001": true,
+  "a keyed row: its one-key UPDATE read back in the transaction; changed since the snapshot, 40001 (at the UPDATE or the COMMIT)": true,
+  "key lookups and one-key UPDATEs through the Postgres port, without planning: right answers": true,
+  "8 clients' transfers, retried on 40001: the total kept, every transfer's history there": true,
+  "\u2026and the view following accounts == its query, after every commit": true,
+  "Python: with con.transaction(); a CHECK refused with 23514 rolls it back": true,
+  "SQLSTATE over HTTP (x-pondra-sqlstate) and the Postgres port, as Postgres's": true,
+  "the Postgres port reports the transaction's status (psycopg's IDLE, INTRANS, IDLE)": true
+ },
+ "ok": true,
+ "info": {
+  "transfers": 423,
+  "retried": 436,
+  "errors": [],
+  "codes": {
+   "no table": [
+    "42P01",
+    "42P01"
+   ],
+   "no column": [
+    "42703",
+    "42703"
+   ],
+   "syntax": [
+    "42601",
+    "42601"
+   ],
+   "check": [
+    "23514",
+    "23514"
+   ],
+   "divide": [
+    "22012",
+    "22012"
+   ]
+  },
+  "status": [
+   "IDLE",
+   "INTRANS",
+   "IDLE"
+  ]
+ }
+}

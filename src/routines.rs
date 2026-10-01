@@ -1020,7 +1020,20 @@ fn dollar_tag(s: &str) -> Option<&str> {
 }
 
 /// Run one statement here as the caller could have sent it (the audit log told: `audit.rs`).
-pub async fn one(app: &App, sql: &str, who: Who, job: Option<String>) -> Result<Outcome> { crate::audit::statement(app, sql, one_of(app, sql, who, job)).await }
+pub async fn one(app: &App, sql: &str, who: Who, job: Option<String>) -> Result<Outcome> {
+    if let Some(word) = crate::txn::control(sql) {
+        // BEGIN, COMMIT, ROLLBACK: the session's transaction (ADR-036 §5)
+        let (tag, warning) = crate::audit::statement(app, sql, Box::pin(crate::txn::command(app, word))).await?; // (on the heap: procedures call procedures deep)
+        warning.iter().for_each(|w| heard(&format!("WARNING: {w}")));
+        return Ok(Outcome::Done(j!({"transaction": tag.to_lowercase()})));
+    }
+    crate::txn::refuse()?; // (a failed transaction takes nothing but its end)
+    let out = crate::audit::statement(app, sql, one_of(app, sql, who, job)).await;
+    if let Err(e) = &out {
+        crate::txn::failed(&crate::ext::said(e)); // (in a transaction: it fails with the statement)
+    }
+    out
+}
 
 async fn one_of(app: &App, sql: &str, who: Who, job: Option<String>) -> Result<Outcome> {
     if crate::write::checkpoint(sql) {
@@ -1051,6 +1064,9 @@ async fn one_of(app: &App, sql: &str, who: Who, job: Option<String>) -> Result<O
     if let Some(stmt) = crate::write::parse(sql) {
         app.auth.allows(who.role, &stmt)?;
         return Ok(Outcome::Done(crate::write::on_node_as(app, stmt, job, who.files).await?));
+    }
+    if let Some(rows) = Box::pin(crate::txn::point_read(&app.lake, sql)).await? {
+        return Ok(Outcome::Rows(rows)); // (a key lookup in a transaction: no planning)
     }
     Ok(Outcome::Rows(match who.files {
         true => app.query_as(&crate::asof::rewrite(sql)?, Some("0"), true).await?, // (a file here: this node only)

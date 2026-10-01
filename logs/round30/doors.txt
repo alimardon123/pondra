@@ -1,0 +1,98 @@
+                        http        python      postgres    flight      javascript  mcp       
+query                   ok          ok          ok          ok          ok          ok        
+insert                  ok          ok          ok          ok          ok          ok        
+key lookup              ok          ok          ok          ok          ok          ok        
+one-key update          ok          ok          ok          ok          ok          ok        
+update by a filter      ok          ok          ok          ok          ok          ok        
+a CHECK refused, 23514  ok          ok          ok          ok          ok          ok        
+no table, 42P01         ok          ok          ok          ok          ok          ok        
+procedure               ok          ok          ok          ok          ok          ok        
+transaction             ok          ok          ok          refused     ok          refused   
+{
+ "doors": {
+  "query: http ok, python ok, postgres ok, flight ok, javascript ok, mcp ok": true,
+  "insert: http ok, python ok, postgres ok, flight ok, javascript ok, mcp ok": true,
+  "key lookup: http ok, python ok, postgres ok, flight ok, javascript ok, mcp ok": true,
+  "one-key update: http ok, python ok, postgres ok, flight ok, javascript ok, mcp ok": true,
+  "update by a filter: http ok, python ok, postgres ok, flight ok, javascript ok, mcp ok": true,
+  "a CHECK refused, 23514: http ok, python ok, postgres ok, flight ok, javascript ok, mcp ok": true,
+  "no table, 42P01: http ok, python ok, postgres ok, flight ok, javascript ok, mcp ok": true,
+  "procedure: http ok, python ok, postgres ok, flight ok, javascript ok, mcp ok": true,
+  "transaction: http ok, python ok, postgres ok, flight refused, javascript ok, mcp refused": true
+ },
+ "ok": true,
+ "matrix": {
+  "query": {
+   "http": "ok",
+   "python": "ok",
+   "postgres": "ok",
+   "flight": "ok",
+   "javascript": "ok",
+   "mcp": "ok"
+  },
+  "insert": {
+   "http": "ok",
+   "python": "ok",
+   "postgres": "ok",
+   "flight": "ok",
+   "javascript": "ok",
+   "mcp": "ok"
+  },
+  "key lookup": {
+   "http": "ok",
+   "python": "ok",
+   "postgres": "ok",
+   "flight": "ok",
+   "javascript": "ok",
+   "mcp": "ok"
+  },
+  "one-key update": {
+   "http": "ok",
+   "python": "ok",
+   "postgres": "ok",
+   "flight": "ok",
+   "javascript": "ok",
+   "mcp": "ok"
+  },
+  "update by a filter": {
+   "http": "ok",
+   "python": "ok",
+   "postgres": "ok",
+   "flight": "ok",
+   "javascript": "ok",
+   "mcp": "ok"
+  },
+  "a CHECK refused, 23514": {
+   "http": "ok",
+   "python": "ok",
+   "postgres": "ok",
+   "flight": "ok",
+   "javascript": "ok",
+   "mcp": "ok"
+  },
+  "no table, 42P01": {
+   "http": "ok",
+   "python": "ok",
+   "postgres": "ok",
+   "flight": "ok",
+   "javascript": "ok",
+   "mcp": "ok"
+  },
+  "procedure": {
+   "http": "ok",
+   "python": "ok",
+   "postgres": "ok",
+   "flight": "ok",
+   "javascript": "ok",
+   "mcp": "ok"
+  },
+  "transaction": {
+   "http": "ok",
+   "python": "ok",
+   "postgres": "ok",
+   "flight": "refused",
+   "javascript": "ok",
+   "mcp": "refused"
+  }
+ }
+}

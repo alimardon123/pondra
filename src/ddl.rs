@@ -290,8 +290,8 @@ pub async fn apply(lake: &Lake, d: Ddl) -> Result<Value> {
                 }
             }
             ensure!(outside.is_empty(), "a materialized view follows the rows its tables take in, and files outside the lake take none: read them into a table (CREATE TABLE … AS, INSERT … SELECT) and follow that, or make a stored view (CREATE VIEW)");
-            let (emit, sessions, join) = crate::views::options(&options)?;
-            crate::views::create(lake, &name, &sql, emit, sessions, join).await?;
+            let (emit, sessions, join, expect) = crate::views::options(&options)?;
+            crate::views::create(lake, &name, &sql, emit, sessions, join, expect).await?;
             crate::views::forget(lake); // (the sequencer holds flushes to it from its next commit)
             Ok(j!({"view": name, "materialized": true}))
         }
@@ -828,6 +828,11 @@ async fn drop_view(lake: &Lake, name: &str, if_exists: bool) -> Result<Value> {
         ensure!(if_exists, "no view {name}");
         return Ok(j!({"view": name, "dropped": false}));
     };
+    // (what follows it by name would be left without rows: a pipeline is dropped from its end)
+    let mut followers = readers(lake, name).await?;
+    followers.extend(readers(lake, &format!("{name}_final")).await?);
+    followers.retain(|r| !r.starts_with("view ") && r != &format!("materialized view {name}"));
+    ensure!(followers.is_empty(), "{name} is followed by {}: drop them first", followers.join(", "));
     let producers = ["emit", "join", "fill"].map(|p| format!("{p}:{name}"));
     let mut gone: Vec<String> = [crate::views::view_key(name), format!("w/{name}")].into_iter().chain(producers.iter().map(|p| crate::store::producer_key(p))).collect();
     for table in [name.to_string(), format!("{name}_final")] {

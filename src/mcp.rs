@@ -86,7 +86,7 @@ async fn call(app: &App, role: Role, params: &Value) -> Value {
     };
     let (text, error) = match out {
         Ok(v) => (v.to_string(), false),
-        Err(e) => (format!("{e:#}"), true), // (a tool error, which the agent sees and can act on)
+        Err(e) => (format!("SQLSTATE {}: {e:#}", crate::codes::of(&e)), true), // (a tool error, which the agent sees and can act on: with Postgres's code)
     };
     json!({"content": [{"type": "text", "text": text}], "isError": error})
 }

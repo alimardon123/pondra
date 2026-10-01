@@ -2,7 +2,7 @@
 """The gates, as one command (roadmap, "The road to 1.0"): right answers and speed, measured the
 same way every round, so a drop is seen before a release rather than after.
 
-  gates.py [--only slt,tpch,postgres,nexmark] [--prepare] [--note "…"] [--bin target/release/pondra]
+  gates.py [--only slt,tpch,postgres,nexmark,pgbench] [--prepare] [--note "…"] [--bin target/release/pondra]
 
 - **slt**: DataFusion's own SQL tests (sqllogictest) through Pondra on one node (`slt_check.py`).
 - **tpch**: TPC-H SF1, Pondra from memory and from its lake's files, against DuckDB's own tables
@@ -11,6 +11,8 @@ same way every round, so a drop is seen before a release rather than after.
   (`bench/vs_postgres.py`), on a Postgres this starts for the run.
 - **nexmark**: five Nexmark queries over 2M bids, answers checked against DuckDB's
   (`bench/nexmark.py`).
+- **pgbench**: pgbench's own TPC-B script through the Postgres port, 1 and 4 clients, retried on
+  40001; the balances must agree (`bench/pgbench.py`).
 
 Each run appends a row to `logs/gates/README.md` and its numbers to `logs/gates/history.jsonl`,
 with the details beside them, and compares itself with the latest measurement of each gate: fewer
@@ -110,7 +112,16 @@ def nexmark(a, day):
     return {"secs": got["secs"], "bids_per_s": got["bids_per_s"], "answers": got["same_as_duckdb"]}
 
 
-GATES = {"slt": slt, "tpch": tpch, "postgres": postgres, "nexmark": nexmark}
+def pgbench(a, day):
+    if not shutil.which("pgbench"):
+        return {"skipped": "no pgbench here"}
+    r = subprocess.run([sys.executable, os.path.join(HERE, "bench", "pgbench.py"), "--bin", a.bin], capture_output=True, text=True, timeout=3600)
+    open(os.path.join(LOGS, f"{day}-pgbench.txt"), "w").write(r.stdout + r.stderr)
+    got = json.loads(r.stdout.strip().splitlines()[-1])
+    return {"runs": got["runs"], "balances_right": got["balances_right"]}
+
+
+GATES = {"slt": slt, "tpch": tpch, "postgres": postgres, "nexmark": nexmark, "pgbench": pgbench}
 
 
 # ---------------------------------------------------------------- the record
@@ -127,6 +138,8 @@ def drops(now, before):
             out.append(f"TPC-H {f}: {n} s, {b} s before")
     if g(now, "tpch", "answers") is not None and g(now, "tpch", "answers") < 22:
         out.append(f"TPC-H: {g(now, 'tpch', 'answers')} of 22 answers as DuckDB's")
+    if g(now, "pgbench", "balances_right") is False:
+        out.append("pgbench: balances wrong")
     if g(now, "nexmark", "answers") is False:
         out.append("Nexmark: answers differ from DuckDB's")
     n, b = g(now, "nexmark", "secs"), g(before, "nexmark", "secs")
@@ -143,6 +156,9 @@ def row(day, binary, r, note):
     files = cell(t, f"{t.get('files_s')} s")
     duck = cell(t, f"{t.get('duckdb_own_s')} s / {t.get('duckdb_files_s')} s")
     extra = [f"Nexmark 2M bids {n['secs']} s, answers {'right' if n['answers'] else 'WRONG'}"] if n.get("secs") else []
+    pb = r.get("pgbench", {})
+    if pb.get("runs"):
+        extra.append("pgbench " + ", ".join(f"{x['clients']}c {x['tps']} tps" for x in pb["runs"]) + f", balances {'right' if pb['balances_right'] else 'WRONG'}")
     if r.get("postgres", {}).get("details"):
         extra.append(f"vs Postgres: `{day}-postgres.txt`")
     return f"| {day} | {binary} | {slt_cell} | {mem} | {files} | {duck} | {'; '.join(extra + ([note] if note else [])) or '`tools/gates.py`'} |"
@@ -150,7 +166,7 @@ def row(day, binary, r, note):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--only", default="slt,tpch,postgres,nexmark")
+    ap.add_argument("--only", default="slt,tpch,postgres,nexmark,pgbench")
     ap.add_argument("--prepare", action="store_true")
     ap.add_argument("--note", default="")
     ap.add_argument("--explained", default="", help="why the drops this run finds are expected: written beside them, and the run passes")

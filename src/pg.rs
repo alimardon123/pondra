@@ -180,17 +180,47 @@ impl Debug for App {
 }
 
 fn user_error(e: anyhow::Error) -> PgWireError {
-    PgWireError::UserError(Box::new(ErrorInfo::new("ERROR".into(), "XX000".into(), crate::ext::said(&e))))
+    PgWireError::UserError(Box::new(ErrorInfo::new("ERROR".into(), crate::codes::of(&e).into(), crate::ext::said(&e))))
 }
 
 impl Backend {
     /// Run one statement the way `POST /sql` does, for a client whose role comes from its user name.
     async fn run(&self, user: &str, sql: &str, format: &Format) -> PgWireResult<Response> {
+        let reader = crate::auth::current().is_some_and(|p| p.role >= crate::auth::Role::Read);
+        if reader && crate::txn::open() && crate::txn::refuse().is_ok() {
+            if let Some(b) = crate::txn::point_read(&self.app.lake, sql).await.map_err(user_error)? {
+                let schema = b.first().map(|b| b.schema()).unwrap_or_else(|| Arc::new(Schema::empty()));
+                return Ok(Response::Query(rows(&schema, b, format)?)); // (in a transaction: its own version, or its snapshot's)
+            }
+        }
+        if reader && crate::auth::limited().is_none() && !crate::txn::open() && !crate::temp::mentioned(sql) {
+            // A key lookup: the serving path, before anything else (ADR-036 §6), as `/lookup` answers it.
+            let t0 = std::time::Instant::now();
+            if let Some(p) = crate::serve::point(&self.app.lake, sql.trim().trim_end_matches(';')).await.map_err(user_error)? {
+                let t1 = t0.elapsed();
+                if let Some(b) = p.rows(&self.app.lake).await.map_err(user_error)? {
+                    if trace() {
+                        eprintln!("pg point: parse {} µs, row {} µs", t1.as_micros(), (t0.elapsed() - t1).as_micros());
+                    }
+                    return Ok(Response::Query(rows(&b.schema(), vec![b], format)?));
+                }
+            }
+        }
         let sql = crate::routines::expand(&self.app.lake, sql).await.map_err(user_error)?; // (macros: ADR-023)
         let sql = crate::asof::rewrite(&pg_dialect(&self.app.lake, &sql, user)).map_err(user_error)?.into_owned();
         if std::env::var_os("PONDRA_DEBUG_PG").is_some() {
             eprintln!("pg {user}: {sql}");
         }
+        if let Some(word) = crate::txn::control(&sql) {
+            // BEGIN, COMMIT, ROLLBACK: this connection's transaction (ADR-036 §5)
+            let (tag, warning) = crate::txn::command(&self.app, word).await.map_err(user_error)?;
+            warning.iter().for_each(|w| crate::routines::heard(&format!("WARNING: {w}")));
+            return Ok(match tag {
+                "BEGIN" => Response::TransactionStart(Tag::new(tag)), // (the client sees it: ReadyForQuery's status)
+                _ => Response::TransactionEnd(Tag::new(tag)),
+            });
+        }
+        crate::txn::refuse().map_err(user_error)?; // (a failed transaction takes nothing but its end)
         if let Some(r) = session_command(&sql) {
             return Ok(r);
         }
@@ -246,17 +276,27 @@ impl Backend {
 
     /// `run`, the notices its procedures send (what they print) sent first: psql shows NOTICE.
     async fn told<C: Sink<PgWireBackendMessage> + Unpin + Send>(&self, client: &mut C, user: &str, sql: &str, format: &Format) -> PgWireResult<Response> {
+        let t0 = std::time::Instant::now();
         let (out, heard) = crate::routines::with_notices(crate::temp::SESSION.scope(Some(self.session.clone()), crate::auth::WHO.scope(self.who(), self.caught(user, sql, format)))).await;
         for n in heard {
             let _ = client.send(PgWireBackendMessage::NoticeResponse(ErrorInfo::new("NOTICE".into(), "00000".into(), n).into())).await; // (a client gone: the answer fails too)
         }
+        if trace() {
+            eprintln!("pg told: {} µs: {}", t0.elapsed().as_micros(), sql.chars().take(60).collect::<String>());
+        }
         out
     }
 
-    /// `run`, a panic in it answered as an error (`panics.rs`).
+    /// `run`, a panic in it answered as an error (`panics.rs`); in a transaction, an error fails it.
     async fn caught(&self, user: &str, sql: &str, format: &Format) -> PgWireResult<Response> {
         let run = async { crate::panics::door(self.run(user, sql, format)).await.unwrap_or_else(|m| Err(user_error(anyhow::anyhow!(m)))) };
-        crate::audit::statement(&self.app, sql, run).await
+        let out = crate::audit::statement(&self.app, sql, run).await;
+        if let Err(e) = &out {
+            if crate::txn::control(sql).is_none() {
+                crate::txn::failed(&e.to_string());
+            }
+        }
+        out
     }
 
     /// Whoever signed in on this connection (nobody, before).
@@ -789,6 +829,9 @@ impl Backend {
     /// The types of `$1`, `$2`… as the query implies them (`WHERE id = $1`: id's type); text when
     /// it doesn't say.
     async fn param_types(&self, sql: &str) -> Vec<Type> {
+        if let (None, Ok(Some(p))) = (crate::auth::limited(), crate::serve::point(&self.app.lake, sql).await) {
+            return p.parameters(sql).iter().map(|t| pg_type(t, FieldFormat::Text).0).collect(); // (a key lookup's: its key's types, unplanned)
+        }
         let n = (1..).take_while(|i| sql.contains(&format!("${i}"))).count();
         let mut types = vec![Type::VARCHAR; n];
         if n > 0 && session_command(sql).is_none() && crate::write::parse(sql).is_none() && Copy::of(sql).is_none() {
@@ -806,11 +849,27 @@ impl Backend {
 
     /// The columns a statement returns (none for writes and session commands).
     async fn describe(&self, sql: &str, format: &Format) -> PgWireResult<Vec<FieldInfo>> {
-        if session_command(sql).is_some() || crate::write::parse(sql).is_some() || Copy::of(sql).is_some() {
+        let point = match crate::auth::limited() {
+            None => crate::serve::point(&self.app.lake, sql).await.ok().flatten().and_then(|p| p.schema().ok()), // (a key lookup's columns, unplanned, first)
+            Some(_) => None,
+        };
+        if point.is_none() && (session_command(sql).is_some() || crate::write::parse(sql).is_some() || Copy::of(sql).is_some()) {
             return Ok(vec![]); // (a COPY's columns come with its data)
         }
-        let probe = (1..).take_while(|i| sql.contains(&format!("${i}"))).fold(sql.to_string(), |q, i| q.replace(&format!("${i}"), "NULL"));
-        let schema = self.schema(&probe, "").await?;
+        let schema = match point {
+            Some(s) => s,
+            None => {
+                let probe = (1..).take_while(|i| sql.contains(&format!("${i}"))).fold(sql.to_string(), |q, i| q.replace(&format!("${i}"), "NULL"));
+                self.schema(&probe, "").await?
+            }
+        };
         Ok(schema.fields().iter().enumerate().map(|(i, f)| FieldInfo::new(f.name().clone(), None, None, pg_type(f.data_type(), format.format_for(i)).0, format.format_for(i))).collect())
     }
 }
+
+/// `PONDRA_TRACE_PG=1`: where a Postgres statement's time goes, on stderr.
+fn trace() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var_os("PONDRA_TRACE_PG").is_some());
+    *ON
+}
+
