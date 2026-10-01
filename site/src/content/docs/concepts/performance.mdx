@@ -72,18 +72,22 @@ DuckDB in its own format is still ahead of Pondra. Pondra's ratio to DuckDB over
 
 ### TPC-H against Spark
 
-The 22 queries at SF1 on the same Parquet files, best of two runs (round 7). Pondra's runs went over
-HTTP and returned JSON, and each run was a new query, so the result cache never answered. All three
-engines returned the same row counts for every query.
+The 22 queries at SF1 on the same Parquet files, best of two runs (run again on 2026-10-01, round 30,
+with `tools/bench/tpch.py`). Pondra's runs went over HTTP and returned JSON, and each run was a new
+query, so the result cache never answered. All three engines returned the same row counts for every
+query.
 
-| | Pondra | Spark 4.2 | DuckDB 1.5.5 |
+| | Pondra | Spark 4.2 (`local[*]`) | DuckDB 1.5.5 |
 |---|---|---|---|
-| All 22 queries | **5.9 s** | 58.5 to 65.2 s | **3.8 s** |
-| Fastest and slowest query | 0.06 and 0.60 s | 0.6 and 6.8 s | 0.04 and 0.47 s |
-| Per query against Spark | 3 to 23 times faster (median about 11) | 1 | |
+| All 22 queries | **4.5 s** | 56.1 s | **3.5 s** |
+| Fastest and slowest query | 0.06 and 0.42 s | 0.69 and 5.6 s | 0.03 and 0.40 s |
+| Per query against Spark | 5 to 19 times faster (median 13.6) | 1 | |
 
-That is about 10 times faster than Spark on this machine. DuckDB is 1.5 times faster than Pondra
-here. Flink couldn't take part: PyFlink has no Parquet reader in this setup.
+That is about 12 times faster than Spark on this machine (round 7 measured 5.9 s against 58.5 to
+65.2 s). Pondra loaded the files into its lake first (16 s); DuckDB read the Parquet files as they
+are. The gates' own TPC-H run puts Pondra level with DuckDB on files (3.31 s against 3.42 s) and
+behind DuckDB's own tables from memory (2.11 s against 1.68 s). Flink couldn't take part: PyFlink
+has no Parquet reader in this setup.
 
 ### Batch: 20 million rows, write then six queries
 
@@ -126,10 +130,17 @@ More streaming numbers:
   Fluss and checkpoints to do this, so they weren't run on it.
 - **A 3-node cluster,** producers writing to the followers: 4.3 to 4.6 million events a second, durable
   and exactly-once. The leader used 26 to 28% of the CPU.
-- **Nexmark** (queries q1, q2, q5, q7, q11, over 10 million bids): Pondra took 8.7 to 10.9 s and Flink
-  2.3 took 24.3 to 25.0 s, on the same 2 vCPUs. Over 4 million bids it was 3.8 to 5.1 s against 11.0 to
-  11.2 s. Pondra took the bids over HTTP and wrote every view to the lake, and its answers equal
-  DuckDB's. Flink generated the bids in its own process, into blackhole sinks.
+- **Nexmark** (queries q1, q2, q5, q7, q11, over 10 million bids, run again on 2026-10-01): Pondra took
+  14.3 s and Flink 2.3 30.4 s for all five over one stream, on the same 2 vCPUs (Flink's 8.1 s to
+  start not counted). Pondra took the bids over HTTP (9.2 s of the 14.3) and wrote every view to the
+  lake, and its answers equal DuckDB's; Flink generated the bids in its own process, into blackhole
+  sinks. Round 21 had measured 8.7 to 10.9 s against Flink's 24.3 to 25.0 s: Pondra is slower over
+  10 million bids than it was then, while the gates' 2-million-bid run has held at 2.75 to 2.98 s
+  since round 29.
+- **A pipeline** (views following views, [Pipelines](/pondra/guides/pipelines/)): 4 producers, 1,000-row
+  batches over HTTP: no view 183,000 rows a second; a filter with two expectations 156,000; then an
+  aggregate of it 135,000; then a rollup of that 131,000. At every acknowledgement each stage already
+  has the rows: a pipeline is one commit.
 
 Flink has timers, CEP, Top-N and very large keyed state that Pondra doesn't. See
 [Pondra compared](/pondra/concepts/compared/).
@@ -164,12 +175,20 @@ claims to do on a cluster in under 100 ms. Pondra runs a new TPC-H query in 60 t
 
 ## Small on disk and in memory
 
-| | Pondra | Spark 4.2 | Flink 2.3 |
-|---|---|---|---|
-| What you install | One binary of about 100 MB (96.7 MB in round 17, 101.2 MB in round 23, 34 MB compressed) | 485 MB of PySpark and a JVM | 353 MB of PyFlink and a JVM |
-| Start to first query | 0.02 to 0.07 s | 4.1 s | 5.2 to 5.4 s |
-| Idle memory | 44 to 49 MB | | |
-| Peak memory in the batch and streaming runs | 293 to 609 MB (1.3 GB at 2.7 M events a second sustained) | 0.7 to 1.5 GB | 1.2 to 3.1 GB |
+Measured on 2026-10-01 (`tools/bench/footprint.py`): each engine started, its first answer, its
+resident memory two seconds later, and after one query over a million generated rows.
+
+| | Pondra (a server) | DuckDB (in Python) | Polars (in Python) | Spark 4.2 (`local[2]`) | Flink 2.3 (MiniCluster) |
+|---|---|---|---|---|---|
+| What you install | one binary, 175 to 211 MB (every door, TLS, the console) | 59 MB | 181 MB | 481 MB, and a JVM | 351 MB, and a JVM |
+| Start to first answer | **0.07 s** | **0.07 s** | 0.12 s | 9.7 s | 7.4 s |
+| Idle memory | 127 MB: 42 MB its own, 73 MB its binary's code mapped from disk | 51 MB, Python's included | 48 MB | 563 MB | 559 MB |
+| After the query | 127 MB | 52 MB | 69 MB | 593 MB | 694 MB |
+
+DuckDB and Polars run inside your process and are the smaller ones; Pondra is a server (with a log,
+a catalog, a lake and eight doors), and starts as fast as they do. The JVM engines take seconds to
+start and half a gigabyte to idle. In the batch and streaming runs above Pondra peaked at 293 to
+609 MB (1.3 GB at 2.7 M events a second sustained), Spark at 0.7 to 1.5 GB, Flink at 1.2 to 3.1 GB.
 
 Memory under saturation is bounded by how many rows may wait in the log for tiering (`--backlog`,
 10 million rows by default). One node, 8 producers, 60 seconds, a 100,000-key aggregating view:

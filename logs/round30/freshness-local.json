@@ -1,0 +1,32 @@
+{
+ "lake": "local disk",
+ "flags": {
+  "tier_secs": 2.0,
+  "publish": "delta,iceberg"
+ },
+ "probes": 5,
+ "write ack": {
+  "p50": 4,
+  "max": 13
+ },
+ "visible to another node after the ack": {
+  "p50": 16,
+  "max": 111
+ },
+ "visible to read-only node after the ack": {
+  "p50": 18,
+  "max": 111
+ },
+ "visible to pondra sql (new process) after the ack": {
+  "p50": 67,
+  "max": 118
+ },
+ "visible to Delta (delta-rs) after the ack": {
+  "p50": 458,
+  "max": 1978
+ },
+ "visible to Iceberg (PyIceberg) after the ack": {
+  "p50": 422,
+  "max": 2014
+ }
+}

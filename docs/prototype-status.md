@@ -56,10 +56,16 @@ Start more copies on the same bucket to scale out. The only state is object stor
    SQL, JavaScript and MCP; every cell right, or refused by name (a transaction on Flight SQL and
    MCP, which have no session). It found three gaps, fixed: Flight SQL ran no `CALL` and lost its
    errors' codes, MCP's errors had none.
-9. **Found and fixed:** the new key-lookup work, inline in the statement loop procedures recurse
+9. **The comparisons, run again** (2026-10-01; `docs/comparison-spark-flink-fluss.md`): TPC-H SF1
+   4.5 s against Spark 4.2's 56.1 s (DuckDB 3.5 s); Nexmark's five queries over 10 M bids 14.3 s
+   against Flink 2.3's 30.4 s (slower than round 21's 8.7–10.9 s; the gates' 2 M-bid run has held
+   at 2.75–2.98 s); a row in the Delta and Iceberg tables 0.42–0.46 s after its ack on local disk;
+   and the form factor (`tools/bench/footprint.py`): first answer 0.07 s after start (Spark 9.7 s,
+   Flink 7.4 s), 42 MB of memory of its own idle (Spark and Flink over 550 MB).
+10. **Found and fixed:** the new key-lookup work, inline in the statement loop procedures recurse
    through, overflowed a worker's stack 16 procedures deep: put on the heap, as the rest is.
-10. **Tests**: `harness.py pipelines`, `begin`, `doors`, and every other suite; `tools/bench/pgbench.py`,
-    `tools/bench/pipeline.py`.
+11. **Tests**: `harness.py pipelines`, `begin`, `doors`, and every other suite; `tools/bench/pgbench.py`,
+    `tools/bench/pipeline.py`, `tools/bench/footprint.py`.
 
 **Then (2026-10-01): every file keeps its versions, a stopped run says so, a faster cold start**
 (ADR-035 §8, round 29 part 3):

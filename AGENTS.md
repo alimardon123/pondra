@@ -1204,7 +1204,11 @@ python3 tools/harness.py versions       # every file keeps its versions: listed,
 python3 tools/harness.py stopped        # a run whose node was killed under it: stopped, not running for good
 python3 tools/harness.py pipelines      # views of views in one commit, rollups, expectations (keep, drop, fail), changes down the pipeline
 python3 tools/harness.py begin          # BEGIN … COMMIT from every door, read-your-writes, 40001 and retries, 25P02, SQLSTATEs
-python3 tools/bench/pgbench.py          # pgbench's own TPC-B script, 1 and 4 clients: the balances agree
+python3 tools/bench/pgbench.py          # pgbench's own TPC-B script, 1 and 4 clients: the balances agree (--postgres: Postgres too)
+python3 tools/bench/pipeline.py         # what a pipeline of 0 to 3 views costs ingest; every stage right when acknowledged
+python3 tools/bench/footprint.py        # install size, start to first answer, idle memory: Pondra, DuckDB, Polars, Spark, Flink (a venv with pyspark, apache-flink)
+FLINK_PYTHON=/tmp/engines/bin/python python3 tools/bench/nexmark.py --bids 10000000   # Nexmark q1 q2 q5 q7 q11 against Flink 2.3
+python3 tools/bench/tpch.py --data ~/tpch/sf1 --queries tools/bench/tpch-queries --engines pondra,duckdb,spark --spark-python /tmp/engines/bin/python   # Spark alone if memory is short
 bash tools/cold_trace.sh                # a cold start's requests on the simulator at R2's latency, and the node's own steps
 python3 tools/c5_check.py               # the bucket's limits: a 10 writes/s bucket, 240 INSERTs at once, the inbox's bell
 python3 tools/harness.py crash --runs 3 --batches 60 --size 50000   # kill -9 + injected crashes, 9M events

@@ -16,9 +16,15 @@ to the tools you may be choosing between, says what each one is, and says where 
 
 Per machine, in the main areas, Pondra measured ahead of Spark and Flink:
 
-- **Batch SQL:** TPC-H SF1 ran about 10 times faster than Spark (5.9 s against 58 to 65 s for all 22
-  queries, same answers).
-- **Stateful streaming:** about 3 times Flink's throughput on a keyed aggregation.
+- **Batch SQL:** TPC-H SF1 ran about 12 times faster than Spark 4.2 (4.5 s against 56.1 s for all 22
+  queries, same answers; 2026-10-01).
+- **Streaming:** Nexmark's q1, q2, q5, q7 and q11 over 10 million bids in 14.3 s against Flink 2.3's
+  30.4 s, ingest over HTTP included; about 3 times Flink's throughput on a keyed aggregation.
+- **Into the lake:** a row is in the Delta and Iceberg tables other engines read about 0.4 s after its
+  acknowledgement on local disk (3 to 10 s on R2), where Fluss's lake tables trail by 3 minutes by
+  default.
+- **Light:** one binary that answers 0.07 s after it starts and idles at 42 MB of its own memory;
+  Spark and Flink take 7 to 10 s and over 550 MB.
 - **Latency:** a change shows up on another node in about 5 ms. Writes are acknowledged in 2 to 4 ms on
   R2 with `--ack replicated`.
 - **Pipelines:** materialized views that follow each other (bronze, silver, gold) move in the commit
@@ -71,7 +77,7 @@ and R.
 
 **Where Pondra fits:**
 
-- On the same machine, TPC-H SF1 took 5.9 s against Spark's 58.5 to 65.2 s, and a 20-million-row batch
+- On the same machine, TPC-H SF1 took 4.5 s against Spark 4.2's 56.1 s (2026-10-01), and a 20-million-row batch
   ran 2 to 14 times faster, with 293 MB of peak memory against 1.5 GB.
 - One binary of about 100 MB, against 485 MB of PySpark and a JVM. It starts a first query in 0.02 to
   0.07 s, where Spark takes 4.1 s.
@@ -103,7 +109,7 @@ Flink is a stateful stream processor.
   deduplicates by event time.
 - About 3 times Flink's throughput on a keyed aggregation of 10 million events (4.2 s end to end,
   durable, over HTTP, against 13.3 s), and on the Nexmark queries q1, q2, q5, q7 and q11, 10 million
-  bids in 8.7 to 10.9 s against Flink 2.3's 24.3 to 25.0 s. Flink generated its input in process,
+  bids in 14.3 s against Flink 2.3's 30.4 s (2026-10-01). Flink generated its input in process,
   and Pondra took its over HTTP.
 - A change is visible on another node in 5 ms. Flink's exactly-once results become visible at a
   checkpoint.
@@ -134,9 +140,9 @@ top-level project in August 2026 and released 1.0 on 2026-09-21. You pair it wit
   job, all on the JVM. Pondra is one binary, and object storage is its only state.
 - **Like for like, the fast paths match.** Pondra's nodes see a write 10 to 15 ms after the
   acknowledgement, as Fluss's TabletServers serve theirs in milliseconds.
-- **The lake tables don't.** Pondra's Delta and Iceberg versions trail the acknowledgement by 3 to 10
-  seconds on R2. Fluss's lake tables trail by 3 minutes by default. Fluss can be set lower, and so can
-  Pondra.
+- **The lake tables don't.** Pondra's Delta and Iceberg versions trail the acknowledgement by about
+  0.4 seconds on local disk and 3 to 10 seconds on R2. Fluss's lake tables trail by 3 minutes by
+  default. Fluss can be set lower, and so can Pondra.
 - Pondra already has the Postgres protocol and MCP, which are on Fluss's roadmap.
 
 Fluss's roadmap moves toward Pondra's design: writes straight to S3 with diskless servers, and no

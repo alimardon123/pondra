@@ -16,7 +16,7 @@ Arrow batches from a client, as a real stream arrives. Time: from the first bid 
 query's last row is out (windows and sessions closed by the stream's own end). Pondra's answers
 are checked against DuckDB's over the same bids.
 
-  nexmark.py [--bids 2000000] [--engines pondra,flink]   (Flink: /home/claude/venv-flink, PyFlink 2.3)
+  nexmark.py [--bids 2000000] [--engines pondra,flink]   (Flink: PyFlink 2.3 in $FLINK_PYTHON, or /home/claude/venv-flink)
 """
 import argparse, json, os, shutil, subprocess, sys, tempfile, time
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
@@ -107,7 +107,7 @@ def model(n):
     return {"q1": {"n": n1, "s": s1}, "q2": n2, "q5": {"n": w5[0], "s": int(w5[1])}, "q7": {"n": w7[0], "s": w7[1]}, "q11": {"n": sessions[0] - 1, "s": int(sessions[1]) - 1}}
 
 
-def flink(n, venv="/home/claude/venv-flink/bin/python"):
+def flink(n, venv=os.environ.get("FLINK_PYTHON", "/home/claude/venv-flink/bin/python")):
     """Each query alone, then all five over one source (`flink_nexmark.py`)."""
     here = os.path.join(os.path.dirname(os.path.abspath(__file__)), "flink_nexmark.py")
     r = subprocess.run([venv, here, str(n), json.dumps(BID), str(BASE), str(PER_MS)], capture_output=True, text=True, timeout=1800)
