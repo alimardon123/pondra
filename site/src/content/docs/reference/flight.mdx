@@ -293,18 +293,21 @@ print(info.schema.names, info.endpoints[0].ticket.ticket)
 
 ## Tokens
 
-With no tokens set, anyone may do anything. With tokens, the role comes from a token, as it does
-for [HTTP](/pondra/reference/http/#roles). Send it in one of two ways:
+With no tokens set and no user who signs in, anyone may do anything. Otherwise the role comes from
+a token, as it does for [HTTP](/pondra/reference/http/#roles), or a
+[user's](/pondra/guides/security/#users-roles-and-grants) grants. Send it in one of two ways:
 
-- a header `authorization: Bearer <token>` on every call, or
-- a handshake with basic authentication whose password is the token. The user name is ignored. The
-  server answers with the header to send on the calls that follow.
+- a header `authorization: Bearer <token>` on every call (a token, a user's token or session), or
+- a handshake with basic authentication: a user's name and password (the answer is a session for
+  it), or any name and a token as the password. The server answers with the header to send on the
+  calls that follow.
 
-A call with no token, or a token with too few rights, fails with `this needs a token with more
-rights`. A handshake with a token the server does not know fails with `wrong token`. A write
+A call with no token fails as unauthenticated (`sign in: …`), and one with too few rights as
+unauthorized (`this needs more rights than this token's or user's`). A handshake with a name and
+password or token the server does not know fails with `wrong user name or password`. A write
 statement over Flight SQL from a token that may not write fails with `this token may not write`, and
 `DROP TABLE` or other DDL from a `write` token fails with `this token may not change the lake's
-tables, views, schemas or routines (an admin token does)`.
+tables, views, schemas, routines or users (an admin token, or a superuser, does)`.
 
 ```python norun
 import os

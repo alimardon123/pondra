@@ -243,11 +243,18 @@ pub fn http_bare() -> &'static reqwest::Client {
 }
 
 /// One HTTP client (connection pool) for all node-to-node traffic. It carries this process's
-/// token: a node's is the admin token, a `pondra sql` writer's is `PONDRA_TOKEN`.
-pub fn http() -> &'static reqwest::Client {
-    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-    CLIENT.get_or_init(|| {
-        let token = std::env::var("PONDRA_TOKEN").or_else(|_| std::env::var("PONDRA_ADMIN_TOKEN")).ok();
+/// token: a node's is the admin token, else the lake's own key for its nodes (`users::node_key`,
+/// known once the lake is open: the client is made again then); a `pondra sql` writer's is
+/// `PONDRA_TOKEN`.
+pub fn http() -> reqwest::Client {
+    static CLIENT: std::sync::Mutex<Option<(Option<String>, reqwest::Client)>> = std::sync::Mutex::new(None);
+    let token = std::env::var("PONDRA_TOKEN").or_else(|_| std::env::var("PONDRA_ADMIN_TOKEN")).or_else(|_| std::env::var("PONDRA_NODE_KEY")).ok();
+    let mut client = CLIENT.lock().unwrap();
+    if let Some((t, c)) = client.as_ref().filter(|(t, _)| *t == token) {
+        let _ = t;
+        return c.clone();
+    }
+    let made = {
         let headers: reqwest::header::HeaderMap = token.iter().filter_map(|t| format!("Bearer {t}").parse().ok()).map(|v| (reqwest::header::AUTHORIZATION, v)).collect();
         let client = |b: reqwest::ClientBuilder| b.default_headers(headers.clone()).build();
         client(reqwest::Client::builder()).unwrap_or_else(|e| {
@@ -255,7 +262,9 @@ pub fn http() -> &'static reqwest::Client {
             eprintln!("HTTPS calls out will fail: {e} (install the ca-certificates package)");
             client(reqwest::Client::builder().tls_certs_only([])).expect("an HTTP client")
         })
-    })
+    };
+    *client = Some((token, made.clone()));
+    made
 }
 
 /// The newest term, if any.

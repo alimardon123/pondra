@@ -1,6 +1,6 @@
 ---
 title: Security
-description: Turn on read, write and admin tokens for every door, see what each one may do, and keep secrets, code and the network in their place.
+description: Turn on read, write and admin tokens for every door, make users and roles with grants down to columns, and keep secrets, code and the network in their place.
 sidebar:
   order: 16
 ---
@@ -175,7 +175,7 @@ for label, headers in [("no token", {}), ("wrong token", {"Authorization": "Bear
 read  SELECT count(*) AS n FROM notes               [{'n': 2}]
 read  INSERT INTO notes VALUES (3, 'from a reader') this token may not write
 write INSERT INTO notes VALUES (3, 'from a writer') ok
-write CREATE TABLE more (id BIGINT)                 this token may not change the lake's tables, views, schemas or routines (an admin token does)
+write CREATE TABLE more (id BIGINT)                 this token may not change the lake's tables, views, schemas, routines or users (an admin token, or a superuser, does)
 admin CREATE TABLE more (id BIGINT)                 ok
 no token    401
 wrong token 401
@@ -200,7 +200,7 @@ print(attempt("write", "CALL add_note('by a writer')"))
 ```
 
 ```text
-this token may not change the lake's tables, views, schemas or routines (an admin token does)
+this token may not change the lake's tables, views, schemas, routines or users (an admin token, or a superuser, does)
 add_note: RuntimeError: 500: this token may not write
   line 2: pondra.sql("INSERT INTO notes VALUES (100, $text)", text=text)
 [{'add_note': 'added'}]
@@ -221,11 +221,92 @@ timeout 20 pondra serve open-lake --addr 0.0.0.0:8087 --python auto 2>&1 | head 
 Error: --python lets whoever makes a procedure run code on this machine: set --admin-token, or listen on 127.0.0.1
 ```
 
+## Users, roles and grants
+
+Tokens are three keys shared by everyone with the same role. **Users** sign in as themselves and may
+do what they are granted, down to a table's columns. A superuser makes them in SQL; the admin token is
+one:
+
+```python
+admin = connect("admin")
+admin.sql("CREATE TABLE salaries (id BIGINT, name VARCHAR, pay DOUBLE)")
+admin.sql("INSERT INTO salaries VALUES (1, 'ann', 100.0), (2, 'bob', 120.0)")
+admin.sql("CREATE USER ann PASSWORD 'correct-horse-battery'")
+admin.sql("CREATE ROLE staff")
+admin.sql("GRANT SELECT (id, name) ON salaries TO staff")
+admin.sql("GRANT SELECT ON notes TO staff")
+admin.sql("GRANT staff TO ann")
+ann = pondra.connect("http://localhost:8086", user="ann", password="correct-horse-battery")
+ann.sql("SELECT id, name FROM salaries ORDER BY id").rows()
+```
+
+```text
+[{'id': 1, 'name': 'ann'}, {'id': 2, 'name': 'bob'}]
+```
+
+A column, a table or a write she isn't granted is refused, saying which, as Postgres says it; a filter
+on a column she may not read is refused too, since its answer would tell:
+
+```python
+def attempt_as(db, sql):
+    try:
+        db.sql(sql)
+        return "ran"
+    except Exception as e:
+        return str(e).split(" (GRANT")[0]
+
+print(attempt_as(ann, "SELECT * FROM salaries"))
+print(attempt_as(ann, "SELECT name FROM salaries WHERE pay > 110"))
+print(attempt_as(ann, "INSERT INTO notes VALUES (2, 'second')"))
+```
+
+```text
+Error during planning: permission denied: SELECT (pay) on salaries
+Error during planning: permission denied: SELECT (pay) on salaries
+permission denied: INSERT on notes
+```
+
+| Statement | Does |
+|---|---|
+| `CREATE USER u PASSWORD '…' [SUPERUSER]` | a user who signs in (a superuser may do everything, as the admin token) |
+| `CREATE ROLE r` | grants to give users together |
+| `ALTER USER u PASSWORD '…'`, `ALTER USER u SUPERUSER \| NOSUPERUSER` | a new password; superuser or not |
+| `DROP USER u`, `DROP ROLE r` | gone, at once on every node |
+| `GRANT SELECT [(a, b)] \| INSERT \| UPDATE \| DELETE \| ALL ON t TO r` | a table or view, or some of its columns |
+| `GRANT … ON SCHEMA s` or `ON ALL TABLES IN SCHEMA s` | every table of a schema, now and later |
+| `GRANT … ON ALL TABLES` | every table of the lake (and of the lakes attached to it) |
+| `GRANT USAGE ON SECRET s TO r` | queries may read the URLs its scope covers (below) |
+| `GRANT r TO u`, `REVOKE r FROM u`, `REVOKE … FROM r` | roles held, and grants taken back |
+| `GRANT … TO public` | every user |
+| `CREATE TOKEN t FOR USER u [EXPIRES IN '90 days']`, `DROP TOKEN t FOR u` | a token for a script or a service, shown once |
+| `SELECT * FROM pondra.users`, `pondra.grants` | who there is, and what each holds (a user sees its own) |
+
+A user signs in at every door: over HTTP with its name and password (Basic) or a token (`Bearer`);
+`POST /login` gives a **session**, a token the lake signs and any node checks, for 12 hours
+(`PONDRA_SESSION_HOURS`), which the console uses; Postgres clients sign in with SCRAM-SHA-256, as
+they do with Postgres (a user with only tokens gives one as its password); Kafka's SASL/PLAIN takes
+the name and password; Flight's handshake turns them into a session. A password is kept only as
+SCRAM's verifier and a token as its hash, so the catalog gives neither away.
+
+```python
+token = admin.sql("CREATE TOKEN nightly FOR USER ann EXPIRES IN '30 days'")["token"]
+pondra.connect("http://localhost:8086", token=token).sql("SELECT name FROM salaries ORDER BY id").rows()
+```
+
+```text
+[{'name': 'ann'}, {'name': 'bob'}]
+```
+
+Once a user who signs in exists, a node with no tokens set refuses whoever doesn't sign in, too.
+Listings show a user what it may read: `information_schema.tables`, `pondra.tables`, the console's
+Data tree. A stream of a table's rows (Kafka, Flight's log, `/watch`, a key lookup, another engine
+through the Iceberg catalog) needs every column of it.
+
 ## Secrets
 
 A password or key for something else, such as a bucket, a Kafka cluster or an SMTP server, goes in a
-**secret**. Only an admin makes one. It is kept in the lake encrypted with AES-256-GCM, and SQL can list
-its name, type and scope, never its values:
+**secret**. Only an admin makes one. It is kept in the lake encrypted with AES-256-GCM, with a key of
+its own, which the lake's master key wraps; SQL can list its name, type and scope, never its values:
 
 ```python
 connect("admin").sql("CREATE SECRET mail (TYPE generic, HOST 'smtp.example.com', PASSWORD 'not-a-real-password')")
@@ -241,9 +322,19 @@ procedure prints or fails with is blanked out (`***`) in its notices, errors and
 reads (`s3://…`, `https://…`) uses the secret whose scope covers it, and a URL no secret covers is
 refused.
 
-The encryption key is `PONDRA_SECRET_KEY`, and **every node of a cluster needs the same one**: a node
-with another key stops with `was sealed with another key`. Without it a node makes a key for its
-machine at `~/.pondra/secret.key`, which is enough for nodes that share that file.
+A user's queries use a secret only with `GRANT USAGE ON SECRET s TO …`. And anyone signed in may
+bring their own for a session: `CREATE TEMPORARY SECRET s (TYPE s3, …)` lives in the node's memory for
+that session (a Postgres connection, a client's connection), is used before the lake's, and is written
+nowhere.
+
+The master key is `PONDRA_SECRET_KEY`, and **every node of a cluster needs the same one**: a node
+with another key stops with `was sealed with another master key`. Without it a node makes a key for its
+machine at `~/.pondra/secret.key`, which is enough for nodes that share that file. Better, a key
+service keeps it: `PONDRA_KMS_COMMAND` names a command the node runs with `wrap` or `unwrap` and a data
+key on its input (a short script over `aws kms`, `gcloud kms`, `az keyvault key` or Vault's
+`transit`), so the master key is never in a file, a variable or the lake. To change the master key,
+start the nodes with the new one and the old as `PONDRA_SECRET_KEY_PREVIOUS`: the leader rewraps every
+secret's key when it starts (the values aren't touched), and the old key can then go.
 
 ## What a node's SQL can't touch
 
@@ -273,10 +364,10 @@ people's data: see [files and other lakes](/pondra/guides/files-and-other-lakes/
   Postgres, Kafka and Flight, so put a TLS proxy in front of the ports clients use, or keep them on a
   private network. A cluster's nodes talk plain HTTP to each other with the admin token, so keep
   them on a private network.
-- **Roles are per node, not per table.** A read token reads everything. Per-table grants, users, a
-  mutual-TLS cluster, an audit log and quotas are planned together (round 29 on the roadmap), before
-  other people's data goes in.
-- **The token is the whole login.** Rotate one by restarting every node with the new values.
+- **A token is the whole login, for everything.** A read token reads every table: give people users
+  instead, with grants. Rotate a token by restarting every node with the new values.
+- **Row filters and masks, a mutual-TLS cluster, an audit log and quotas** come next (round 29 on the
+  roadmap). A view doesn't yet lend its owner's rights: a user reading one needs SELECT on what it reads.
 
 </Aside>
 

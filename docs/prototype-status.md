@@ -1,6 +1,6 @@
 # Prototype status: Pondra, a streamhouse in one binary
 
-**Date:** 2026-10-01 (the workspace, rounds 27 and 28, and round 29 part 1 with the owner's second and third lists) · **Plan:** ADR-002 to ADR-034, `roadmap.md` · **Code:** `pondra.zip` / `pondra.bundle` (≈30,700 lines of Rust, plus Python and JavaScript clients, a documentation website, packaging, and test and benchmark tools)
+**Date:** 2026-10-01 (the workspace, rounds 27 and 28, and round 29 part 1 with the owner's second and third lists, and part 2: users, grants and secrets) · **Plan:** ADR-002 to ADR-035, `roadmap.md` · **Code:** `pondra.zip` / `pondra.bundle` (≈30,700 lines of Rust, plus Python and JavaScript clients, a documentation website, packaging, and test and benchmark tools)
 **Name:** the prototype formerly called `lh` is now **Pondra**. The name is free on crates.io, PyPI and npm. A small personal-finance app uses it (pondra.app), a different category; run a trademark search before a public launch.
 
 ## Where it stands
@@ -14,6 +14,28 @@ One Rust binary replaces the Kafka + Flink + Spark + metastore + ZooKeeper stack
 - upsert and merge tables.
 
 Start more copies on the same bucket to scale out. The only state is object storage. There's no JVM, no database server and no coordination service.
+
+**Round 29, part 2 made a lake safe to share: users, grants and sealed secrets** (ADR-035 §2–3):
+
+1. **Users and roles** in SQL: `CREATE USER ana PASSWORD '…'`, `CREATE ROLE`, `GRANT SELECT (id,
+   amount) ON orders TO ana`, `GRANT INSERT ON SCHEMA sales` (its later tables too), `GRANT USAGE ON
+   SECRET`, `CREATE TOKEN … FOR USER … EXPIRES IN '30 days'`; `pondra.users` and `pondra.grants`.
+   The tokens of before stay, as the built-in roles `admin`, `writer` and `reader`.
+2. **One check at every door**: HTTP (Basic, a token or a session), Postgres (SCRAM-SHA-256 or a
+   password), Kafka (SASL PLAIN), Flight (its handshake gives a session), the Iceberg catalog and
+   MCP all sign in the same users. A column a user may not read is refused in its query, its
+   filters included; a stream of rows needs every column.
+3. **Nothing readable kept**: a password as SCRAM's verifier, a token as its SHA-256, sessions
+   signed with a key the lake keeps.
+4. **Secrets sealed twice**: each with a data key of its own, wrapped by the master key or by a key
+   service (`PONDRA_KMS_COMMAND`, any KMS by a short script); a new master key rewraps them all;
+   `CREATE TEMPORARY SECRET` lives in the session's memory.
+5. **The console signs in as the shell is** (the shell prints a link with a key, as Jupyter does)
+   or as a user (Sign in as someone else…).
+6. **Found and fixed:** a Postgres client could sign in as `reader` with an empty password when no
+   read token was set; the AI functions sent the nodes' admin token to the AI endpoint.
+7. **Tests:** `harness.py users` and `secrets` (every door, a column refused, a revoke seen
+   at once on a follower, a rotated master key, a KMS command), and the whole suite again.
 
 **Round 29, part 1 took the owner's list from 0.26 on Windows** (ADR-034, "Changed after 0.27"):
 

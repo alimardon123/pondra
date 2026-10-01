@@ -36,8 +36,11 @@ pub fn of(headers: &axum::http::HeaderMap) -> Option<String> {
     let named = headers.get("x-pondra-session").and_then(|v| v.to_str().ok());
     let named = named.filter(|s| (8..=128).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'));
     let token = headers.get("authorization").and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer "));
-    crate::auth::lent_session(token).or(named.map(String::from)) // (a procedure's own client names one: its caller's wins)
+    crate::auth::lent_session(token).or(named.map(id)) // (a procedure's own client names one: its caller's wins)
 }
+
+/// The session a client's id names: its user's (another who names the same id has a session of its own).
+pub fn id(id: &str) -> String { format!("{}~{id}", crate::auth::current().map(|p| p.name).unwrap_or_default()) }
 
 pub fn current() -> Option<String> { SESSION.try_with(|s| s.clone()).ok().flatten() }
 
@@ -68,6 +71,7 @@ impl Table {
 struct Session {
     tables: HashMap<String, Table>,
     views: HashMap<String, String>,
+    secrets: std::collections::BTreeMap<String, crate::ext::Secret>, // (CREATE TEMPORARY SECRET: in memory only)
     used: Option<Instant>,
     version: u64, // changes so far (`live.rs` watches them)
 }
@@ -111,6 +115,12 @@ async fn reap() {
     }
 }
 
+/// The current session's temporary secrets (`CREATE TEMPORARY SECRET`), by name.
+pub fn secrets() -> Vec<(String, crate::ext::Secret)> {
+    let Some(s) = current() else { return vec![] };
+    SESSIONS.lock().unwrap().get(&s).map(|x| x.secrets.iter().map(|(n, v)| (n.clone(), v.clone())).collect()).unwrap_or_default()
+}
+
 /// End a session: its temporary tables and views are gone, and its Python (`python::ask_session`).
 pub fn end(session: &str) -> bool {
     let python = crate::python::end_session(session); // (its Python's variables too)
@@ -136,10 +146,11 @@ pub fn own(stmt: &Stmt) -> bool {
     let Some(s) = current() else { return false };
     match stmt {
         Stmt::Create(c) => c.temporary,
-        Stmt::TempView(..) => true,
+        Stmt::TempView(..) | Stmt::TempSecret(..) => true,
         Stmt::Ddl(d) => !d.is_empty() && d.iter().all(|d| match d {
             Ddl::DropTable { name, .. } => has(&s, name, true),
             Ddl::DropView { name, .. } => has(&s, name, false),
+            Ddl::DropSecret { name, .. } => SESSIONS.lock().unwrap().get(&s).is_some_and(|x| x.secrets.contains_key(name)),
             _ => false,
         }),
         Stmt::Insert(t, _) | Stmt::InsertInto(t, ..) | Stmt::Update(t, ..) | Stmt::Delete(t, _) => has(&s, t, true),
@@ -194,6 +205,15 @@ pub async fn statement(app: &App, stmt: &Stmt, files: bool) -> Result<Option<Val
             with(&s, true, |x| Ok(x.views.insert(name.clone(), sql.clone())))?;
             return Ok(Some(j!({"view": name, "temporary": true})));
         }
+        Stmt::TempSecret(name, params, replace) => {
+            let s = session.context("a temporary secret is a session's: a Postgres connection's, or the Python or JavaScript client's (over HTTP, send x-pondra-session: <id>)")?;
+            let secret = crate::ext::temporary(name, params.clone())?;
+            with(&s, true, |x| {
+                ensure!(*replace || !x.secrets.contains_key(name), "temporary secret {name} exists (CREATE OR REPLACE TEMPORARY SECRET replaces it)");
+                Ok(x.secrets.insert(name.clone(), secret))
+            })?;
+            return Ok(Some(j!({"secret": name, "temporary": true})));
+        }
         Stmt::Ddl(d) => {
             for d in d {
                 if let Ddl::CreateView { name, sql, .. } | Ddl::CreateMaterialized { name, sql, .. } = d {
@@ -207,6 +227,7 @@ pub async fn statement(app: &App, stmt: &Stmt, files: bool) -> Result<Option<Val
             let dropped = with(&s, true, |x| Ok(d.iter().map(|d| match d {
                 Ddl::DropTable { name, .. } => x.tables.remove(name).map(|_| name.clone()),
                 Ddl::DropView { name, .. } => x.views.remove(name).map(|_| name.clone()),
+                Ddl::DropSecret { name, .. } => x.secrets.remove(name).map(|_| name.clone()),
                 _ => None,
             }).collect::<Vec<_>>()))?;
             return Ok(Some(j!({"dropped": dropped, "temporary": true})));

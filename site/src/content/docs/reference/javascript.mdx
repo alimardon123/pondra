@@ -35,6 +35,7 @@ console.log(await db.sql("SELECT 1 AS one"));
 | Option | Default | Meaning |
 |---|---|---|
 | `token` | none | sent as `Authorization: Bearer …`; the token's role decides what the connection may do |
+| `user`, `password` | none | sign in as a [user](/pondra/guides/security/#users-roles-and-grants) instead: its name and password (or one of its tokens) |
 | `onNotice` | `console.log` | called with each line a procedure printed. `null` keeps them quiet |
 | `port` | a free port | the port `local`'s node listens on (`127.0.0.1`) |
 | `flags` | `[]` | more `pondra serve` options, such as `["--memory-gb", "2"]` |

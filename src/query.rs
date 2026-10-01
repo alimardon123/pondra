@@ -360,6 +360,60 @@ pub fn named(ctx: &SessionContext, provider: Arc<dyn TableProvider>, meta: &Tabl
     Ok(Arc::new(Table(df.select(keep)?.into_view())))
 }
 
+/// `name` as the request being served may read it: as it is for a token or a superuser; for a user
+/// granted some tables, `Guarded` (and left out of a listing if it may read none of it).
+fn guarded(name: &str, t: Arc<dyn TableProvider>, listing: bool) -> Option<Arc<dyn TableProvider>> {
+    let Some(access) = crate::auth::limited() else { return Some(t) };
+    let columns = access.columns("select", name);
+    if listing && columns.is_none() {
+        return None;
+    }
+    Some(Arc::new(Guarded { inner: t, name: name.to_string(), columns }))
+}
+
+/// A table as a user granted some of it reads it (`users.rs`): planned as the table is (its
+/// columns are no secret, as in Postgres), but a scan of a column it may not read is refused, the
+/// columns its filters use included; and every scan, if it may read none.
+#[derive(Debug)]
+struct Guarded {
+    inner: Arc<dyn TableProvider>,
+    name: String,
+    columns: Option<Option<std::collections::HashSet<String>>>,
+}
+
+#[async_trait::async_trait]
+impl TableProvider for Guarded {
+    fn schema(&self) -> SchemaRef { self.inner.schema() }
+    fn table_type(&self) -> datafusion::datasource::TableType { self.inner.table_type() }
+    fn get_logical_plan(&self) -> Option<std::borrow::Cow<'_, datafusion::logical_expr::LogicalPlan>> { None } // (a view's plan would read around the check)
+    fn supports_filters_pushdown(&self, filters: &[&Expr]) -> datafusion::error::Result<Vec<datafusion::logical_expr::TableProviderFilterPushDown>> {
+        // (inexact: each filter stays above the scan too, so its columns are in what is scanned)
+        Ok(self.inner.supports_filters_pushdown(filters)?.into_iter().map(|p| match p {
+            datafusion::logical_expr::TableProviderFilterPushDown::Exact => datafusion::logical_expr::TableProviderFilterPushDown::Inexact,
+            p => p,
+        }).collect())
+    }
+    async fn scan(&self, state: &dyn datafusion::catalog::Session, projection: Option<&Vec<usize>>, filters: &[Expr], limit: Option<usize>) -> datafusion::error::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+        let denied = |what: String| datafusion::error::DataFusionError::Plan(format!("permission denied: SELECT{what} on {} (GRANT SELECT ON {} TO …)", self.name, self.name));
+        let Some(columns) = &self.columns else { return Err(denied(String::new())) };
+        if let Some(allowed) = columns {
+            let schema = self.inner.schema();
+            let mut used: Vec<String> = match projection {
+                Some(p) => p.iter().map(|&i| schema.field(i).name().clone()).collect(),
+                None => schema.fields().iter().map(|f| f.name().clone()).collect(),
+            };
+            used.extend(filters.iter().flat_map(|f| f.column_refs()).map(|c| c.name.clone()));
+            let mut not: Vec<String> = used.into_iter().filter(|c| !allowed.contains(c)).collect();
+            not.sort();
+            not.dedup();
+            if !not.is_empty() {
+                return Err(denied(format!(" ({})", not.join(", "))));
+            }
+        }
+        self.inner.scan(state, projection, filters, limit).await
+    }
+}
+
 /// A lake's table as clients list it (`information_schema.tables`, the shell's `.tables`, the
 /// console): a `BASE TABLE`, though it is planned as the query over its files and log it is (every
 /// call is `inner`'s, its plan included).
@@ -628,7 +682,9 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
         let name = &key[2..];
         if name != except && !crate::sys::hidden(name) && (listing || mentions(&text, name)) {
             let view = table_view(lake, &ctx, name, &sys(meta.clone()), upto).await?;
-            ctx.register_table(table_ref(name), named(&ctx, view, &meta, names_deleted(&text))?)?;
+            if let Some(t) = guarded(name, named(&ctx, view, &meta, names_deleted(&text))?, listing) {
+                ctx.register_table(table_ref(name), t)?;
+            }
         }
     }
     let (names, direct) = (crate::ext::names(&text), crate::ext::names(sql));
@@ -661,6 +717,7 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
                 continue;
             }
             let view = named(&ctx, table_view(&other, &ctx, name, &sys(meta.clone()), None).await?, &meta, names_deleted(&text))?;
+            let Some(view) = guarded(&format!("{ns}.{name}"), view, listing) else { continue }; // (a user's: granted ON ALL TABLES)
             let (s, t) = split(name);
             if old && s == PUBLIC {
                 default.schema(&ns).expect("registered").register_table(t.to_string(), view.clone())?;
@@ -673,7 +730,7 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
         // (`pondra.runs`, `pondra.routines`, `pondra.tasks`; a schema of the lake's own called pondra wins)
         use datafusion::catalog::SchemaProvider;
         let system = Arc::new(MemorySchemaProvider::new());
-        for (name, table) in crate::runs::tables(lake).await? {
+        for (name, table) in crate::runs::tables(lake).await?.into_iter().chain(crate::users::tables(lake).await?) {
             system.register_table(name.into(), table)?;
         }
         let runs = match lake.cat.get::<TableMeta>(&crate::store::table_key(crate::runs::TABLE)).await? {
@@ -691,7 +748,7 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
         }
     }
     crate::temp::register(&ctx, &text)?; // (the session's temporary tables, over the lake's)
-    register_views(&ctx, views, !listing).await?; // (a listing shows what it can)
+    register_views(&ctx, views, !listing, listing).await?; // (a listing shows what it can)
     if listing {
         let direct = crate::ext::names(sql);
         for n in crate::ext::names(&text).into_iter().filter(|n| !direct.contains(n)) {
@@ -722,7 +779,7 @@ pub async fn stored_views(lake: &Lake, sql: &str, listing: bool) -> Result<Vec<(
 /// Stored views over the tables `ctx` has now — again, if they are there already: a node's shares
 /// of its tables replace them (`spmd.rs`), and the views must read those. One view may use
 /// another: until none is left.
-pub async fn register_views(ctx: &SessionContext, mut views: Vec<(String, String)>, strict: bool) -> Result<()> {
+pub async fn register_views(ctx: &SessionContext, mut views: Vec<(String, String)>, strict: bool, listing: bool) -> Result<()> {
     let mut failed = None;
     while !views.is_empty() {
         let before = views.len();
@@ -731,7 +788,10 @@ pub async fn register_views(ctx: &SessionContext, mut views: Vec<(String, String
             match ctx.sql(&crate::asof::rewrite(&sql)?).await {
                 Ok(df) => {
                     ctx.deregister_table(table_ref(&name))?;
-                    ctx.register_table(table_ref(&name), Arc::new(datafusion::catalog::view::ViewTable::new(df.into_unoptimized_plan(), Some(crate::ext::readable(&sql)))))?; // (its files as SQL named them)
+                    let view = Arc::new(datafusion::catalog::view::ViewTable::new(df.into_unoptimized_plan(), Some(crate::ext::readable(&sql)))); // (its files as SQL named them)
+                    if let Some(v) = guarded(&name, view, listing) {
+                        ctx.register_table(table_ref(&name), v)?;
+                    }
                 }
                 Err(e) => {
                     failed = Some(anyhow::anyhow!("view {name}: {e}"));

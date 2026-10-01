@@ -45,7 +45,8 @@
 <dialog id="tokenDlg"><form method="dialog">
   <h3>Sign in</h3>
   <p id="tokenWhy">The token this node was started with. It is kept in this browser only.</p>
-  <input id="tokenIn" type="password" autocomplete="off" spellcheck="false" placeholder="token" aria-label="Token">
+  <input id="userIn" autocomplete="username" spellcheck="false" placeholder="user name (none: a token)" aria-label="User name">
+  <input id="tokenIn" type="password" autocomplete="current-password" spellcheck="false" placeholder="password, or a token" aria-label="Password or token">
   <div class="acts"><button class="btn primary" value="ok">Sign in</button><button class="btn" value="cancel">Cancel</button><button class="btn" value="clear">Forget it</button></div>
 </form></dialog>
 <dialog id="askDlg"><form method="dialog">

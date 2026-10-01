@@ -1,6 +1,6 @@
 # ADR-035: Trust anywhere: users, keys and secrets for every form; plugins; files with versions; the platform around the lake
 
-**Date:** 2026-10-01 · **Status:** proposed (the owner's questions; parts are round 29 part 2, the rest later rounds) · **Builds on:** ADR-011 (open doors), ADR-027 (secrets, procedures), ADR-029 (anyone's compute, one catalog), ADR-031 (extensions), ADR-033 (the workspace), ADR-034 (the console)
+**Date:** 2026-10-01 · **Status:** §2 and §3 built (round 29 part 2, 2026-10-01); the rest proposed, for later rounds · **Builds on:** ADR-011 (open doors), ADR-027 (secrets, procedures), ADR-029 (anyone's compute, one catalog), ADR-031 (extensions), ADR-033 (the workspace), ADR-034 (the console)
 
 ## Context
 
@@ -185,3 +185,40 @@ a run records what it ran. To add:
   KMS keeps it out of every file, process list and backup.
 - **A plugin format per layer** (functions one way, UI another, Python a third): one package, one
   version, one rollback.
+
+## Built (round 29, part 2, 2026-10-01)
+
+§2 and §3, with these decisions taken while building them (*by Claude*):
+
+- **Users and roles** are one record each under `u/<name>` (a role can't sign in); `public` is every
+  user. `CREATE USER … PASSWORD … [SUPERUSER]`, `CREATE ROLE`, `ALTER USER`, `DROP USER|ROLE`,
+  `GRANT`/`REVOKE` (SELECT on some columns, INSERT, UPDATE, DELETE, ALL; on a table, a schema — its
+  later tables too, as Snowflake's FUTURE grants — or the lake; USAGE on a secret; a role to a user),
+  `CREATE TOKEN … FOR USER … [EXPIRES IN …]`, `pondra.users`, `pondra.grants` (`users.rs`).
+- **A password is kept as SCRAM-SHA-256's verifier**, not Argon2id: one hash then serves every door,
+  Postgres's SCRAM included (as Postgres keeps it), and a cleartext password (HTTP Basic, Kafka's
+  PLAIN, Flight's handshake) is checked by hashing it as a client would, 10,000 iterations, a checked
+  one remembered a minute. A token is kept as its SHA-256.
+- **Sessions are signed with an HMAC key the lake keeps** (`z/auth`), not Ed25519: only nodes check
+  them today, and every node holds the catalog (§1). Ed25519 comes when a browser or a peer must
+  check one. The same record holds the key nodes call each other with when no admin token is set.
+- **One check**: every door works out a `Principal` and runs the request inside `auth::WHO`; a
+  query's tables are registered as the user may read them (`query::Guarded`: a scan of a column it
+  may not read is refused, the columns its filters use included, as Postgres refuses `SELECT *` on a
+  table granted in part); writes are checked by privilege (`auth::allows`); a stream of a table's
+  rows (Kafka, Flight's log, `/watch`, lookups, the Iceberg catalog's loads) needs every column; a
+  user's queries run on the node that planned them (its grants checked there), and its answers are
+  cached as its own; a live query re-reads its user's grants each time.
+- **Not yet:** a view lending its owner's rights (a user reading a view needs SELECT on what it
+  reads), row filters and masks, CREATE privileges on a schema (DDL is a superuser's).
+- **Secrets**: each sealed with a data key of its own, wrapped by the master key. The master key is
+  `PONDRA_SECRET_KEY` (or this machine's), or **a key service through a command**
+  (`PONDRA_KMS_COMMAND wrap|unwrap`), rather than an SDK per cloud: one seam, any KMS (a short
+  script over `aws kms`, `gcloud kms`, `az keyvault key`, Vault's transit), and no SDK in the binary.
+  A new master key, with the old one as `PONDRA_SECRET_KEY_PREVIOUS`, has the leader rewrap every
+  data key when it starts. `GRANT USAGE ON SECRET`; `CREATE TEMPORARY SECRET` in the session's
+  memory, used before the lake's; sessions are their user's (another user naming the same session id
+  has its own).
+- Found and fixed on the way: a Postgres client could sign in as `reader` with an empty password
+  when no read token was set, and Postgres reads weren't held to a role; the AI functions' calls
+  carried the nodes' admin token to the AI endpoint.

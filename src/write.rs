@@ -183,6 +183,7 @@ pub enum Stmt {
     Invalid(String),                                      // CREATE PROCEDURE or DROP MACRO, written wrong: why
     CopyTo(String, String, std::collections::BTreeMap<String, String>), // COPY (query) TO 'url' (options): files outside the lake (`ext.rs`)
     TempView(String, String, bool),                        // CREATE [OR REPLACE] TEMP VIEW name AS query: the session's (`temp.rs`)
+    TempSecret(String, std::collections::BTreeMap<String, String>, bool), // CREATE [OR REPLACE] TEMPORARY SECRET name (…): the session's, in memory (`temp.rs`)
 }
 
 impl Stmt {
@@ -192,7 +193,7 @@ impl Stmt {
             Stmt::Create(c) => object(&c.name),
             Stmt::Define(t, _) | Stmt::Insert(t, _) | Stmt::InsertInto(t, ..) | Stmt::Update(t, ..) | Stmt::Delete(t, _) | Stmt::AddColumn(t, ..) | Stmt::SetOptions(t, _) => t.clone(),
             Stmt::Ddl(_) | Stmt::Invalid(_) | Stmt::CopyTo(..) => String::new(),
-            Stmt::TempView(v, ..) => v.clone(),
+            Stmt::TempView(v, ..) | Stmt::TempSecret(v, ..) => v.clone(),
             Stmt::Merge(m) => m.target.clone(),
         }
     }
@@ -251,6 +252,9 @@ pub fn parse(sql: &str) -> Option<Stmt> {
         ast::TableFactor::Table { name, .. } => Some(object(name)),
         _ => None,
     };
+    if let Some(s) = crate::users::statement(sql) {
+        return Some(s); // (CREATE USER and ROLE, GRANT, REVOKE, CREATE TOKEN: `users.rs`)
+    }
     if let Some(s) = crate::ext::statement(sql) {
         return Some(s); // (CREATE SECRET: values of any kind; DROP SECRET)
     }
@@ -591,7 +595,7 @@ fn rows_sql(meta: &TableMeta, stmt: &Stmt) -> Result<String> {
             ensure!(meta.merge.is_empty() && deletes, "DELETE needs an upsert table with a Boolean _deleted column");
             Ok(select(&|c: &str| if c == "_deleted" { "true".into() } else { q(c) }, t, cond))
         }
-        Stmt::Create(_) | Stmt::Define(..) | Stmt::AddColumn(..) | Stmt::SetOptions(..) | Stmt::Ddl(_) | Stmt::Merge(_) | Stmt::Invalid(_) | Stmt::CopyTo(..) | Stmt::InsertInto(..) | Stmt::TempView(..) => unreachable!("not a row write here"),
+        Stmt::Create(_) | Stmt::Define(..) | Stmt::AddColumn(..) | Stmt::SetOptions(..) | Stmt::Ddl(_) | Stmt::Merge(_) | Stmt::Invalid(_) | Stmt::CopyTo(..) | Stmt::InsertInto(..) | Stmt::TempView(..) | Stmt::TempSecret(..) => unreachable!("not a row write here"),
     }
 }
 

@@ -61,6 +61,7 @@ mod tasks;
 mod temp;
 mod tier;
 mod udf;
+mod users;
 mod views;
 mod write;
 mod write_outside;
@@ -433,6 +434,26 @@ async fn run() -> anyhow::Result<()> {
             });
             python::init(python);
             let app = server::App { lake: lake.clone(), cluster: cluster.clone(), log, seq, lock: Default::default(), retain_ms: retain_secs * 1000, results: Default::default(), replica: replica.clone(), auth };
+            if leader {
+                users::make_keys(&app.lake).await?; // (sessions' signing key, and the nodes' own: `users.rs`)
+                match ext::rewrap(&app.lake).await {
+                    Ok(0) => {}
+                    Ok(n) => eprintln!("rewrapped {n} secret{} with the master key in use now", if n == 1 { "" } else { "s" }),
+                    Err(e) => eprintln!("secrets not rewrapped: {e:#}"),
+                }
+            }
+            let l = app.lake.clone();
+            tokio::spawn(async move {
+                // (a follower's catalog shows the leader's keys once the leader has flushed them)
+                for _ in 0..600 {
+                    if let Ok(k) = users::node_key(&l).await {
+                        std::env::set_var("PONDRA_NODE_KEY", k); // (nodes call each other with it when no admin token is set: cluster::http)
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+                eprintln!("the lake's key for its nodes isn't readable here: with users and no --admin-token, this node can't call the others");
+            });
             if cluster.is_leader() && !cluster.reader {
                 runs::schedule(app.clone()); // (tasks: the leader runs their ticks)
             }

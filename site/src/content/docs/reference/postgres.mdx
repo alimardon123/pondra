@@ -26,7 +26,7 @@ pondra serve lake --pg 127.0.0.1:5432
 |---|---|
 | host, port | the address of `--pg` |
 | database | any name on a node that serves one lake. `SELECT current_database()` gives the lake's name. On a [folder of lakes](/pondra/guides/server/), the database in the connection picks the lake |
-| user, password | with no tokens set, anything. With tokens, the user picks the role (`reader`, `writer` or `admin`) and the password is that role's token |
+| user, password | with no tokens set and no user who signs in, anything. Otherwise a [user](/pondra/guides/security/#users-roles-and-grants) and its password, signed in with SCRAM-SHA-256 as Postgres does it (a user with only tokens gives one as its password); or `reader`, `writer` or `admin` and that role's token |
 | SSL | not offered yet: use `sslmode=disable`, or `prefer` |
 
 `SELECT version()` answers `PostgreSQL 16.0 (Pondra on Apache DataFusion)`, and `SHOW server_version` answers `16.0`.

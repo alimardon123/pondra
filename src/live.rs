@@ -30,6 +30,7 @@ struct Watch {
     next: Instant,         // not queried again before this
     every: Duration,
     session: Option<String>, // its temporary tables' session (`temp.rs`)
+    who: crate::auth::Principal, // whose it is: each answer as its grants are then
     temps: u64,              // their changes when it last looked
     _open: Open,             // (counted in /stats while its client listens)
 }
@@ -62,7 +63,7 @@ pub async fn live(State(app): State<App>, Query(p): Query<Params>, headers: axum
         let sql = crate::routines::prepare(&app.lake, &req.sql, &req.params, &req.views).await?;
         anyhow::ensure!(crate::routines::split(&sql).len() == 1 && crate::write::parse(&sql).is_none(), "a live query is one query");
         let (tables, others) = reads(&app, &sql).await?;
-        anyhow::Ok(Watch { seen: app.lake.visible(), app, sql, tables, others, print: None, answer: None, next: Instant::now(), every: Duration::from_millis(p.every_ms.unwrap_or(100).max(10)), session, temps: 0, _open: Open::new() })
+        anyhow::Ok(Watch { seen: app.lake.visible(), app, sql, tables, others, print: None, answer: None, next: Instant::now(), every: Duration::from_millis(p.every_ms.unwrap_or(100).max(10)), session, who: crate::auth::current().unwrap_or_else(|| crate::auth::Principal::of(crate::auth::Role::Admin)), temps: 0, _open: Open::new() })
     });
     let w = match start.await {
         Ok(w) => w,
@@ -90,7 +91,11 @@ pub async fn live(State(app): State<App>, Query(p): Query<Params>, headers: axum
                 continue; // (commits to other tables)
             }
             (w.print, w.next) = (Some(print), Instant::now() + w.every);
-            let rows = crate::temp::SESSION.scope(w.session.clone(), w.app.query(&w.sql, None)).await.and_then(|b| crate::server::render(&b, None));
+            let who = match w.who.access.is_some() { // (a user's grants as they are now: revoked, the answers end)
+                true => crate::users::principal(&w.app.lake, &w.who.name).await.unwrap_or_else(|_| crate::auth::Principal { name: w.who.name.clone(), role: crate::auth::Role::None, access: Some(Default::default()) }), // (gone: nothing)
+                false => w.who.clone(),
+            };
+            let rows = crate::temp::SESSION.scope(w.session.clone(), crate::auth::WHO.scope(who, w.app.query(&w.sql, None))).await.and_then(|b| crate::server::render(&b, None));
             let rows = match rows {
                 Ok(r) => r,
                 Err(e) => return Some((Ok(error(e)), None)),

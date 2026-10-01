@@ -27,13 +27,15 @@ Start a node and open its address:
 pondra serve lake        # then open http://localhost:8080
 ```
 
-- **The shell** starts a node too. Its first line says where: `Pondra 0.27.0 on lake, also at
-  http://127.0.0.1:37957`. Open that address while the shell runs.
+- **The shell** starts a node too. Its second line is the console's link, with the shell's key:
+  `The console, as this shell: http://127.0.0.1:37957/#key=…`. Open it while the shell runs, and the
+  page works as the shell does (it reads this machine's files too).
 - **`pondra serve --lakes data`** serves each lake in a folder as a database, and its console
   lists them all. See [Many databases](/pondra/guides/server/).
-- **On another machine**, start the node with tokens (`--admin-token`, see
-  [Security](/pondra/guides/security/)). The console asks for a token the first time, and your browser
-  keeps it.
+- **On another machine**, start the node with tokens (`--admin-token`) or make users (see
+  [Security](/pondra/guides/security/)). The console asks the first time: a user's name and password
+  (it then holds a session the node signs, 12 hours by default), or a token; your browser keeps it.
+  **Sign in ▾** in the top bar signs in as someone else, or out.
 
 ## The page
 

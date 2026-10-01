@@ -1133,6 +1133,15 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    refuse for two columns of one name (`SELECT ts::date, *`, `SELECT id, *`) runs, a cast named as
    its column or, beside another of that name, as written, a column named twice `id_1`; a query
    that needs no name given is sent as written. `harness.py names`.
+176. **One check at every door** (`auth::WHO`, ADR-035): HTTP, Postgres, Kafka and Flight each work
+   out a `Principal` (a token's role, or a user's grants) and run the request inside `WHO.scope`;
+   anything that reads tables for it (`query::guarded`), writes (`auth::allows`), streams rows
+   (`auth::check_all`) or uses a secret (`ext::usable`) asks it. Work no door started (tasks, the
+   leader's own) runs as the node. A door that can't tell who it is refuses (no principal is never
+   "everything"). `harness.py users`.
+177. **A password is kept as SCRAM's verifier, a token as its hash, a secret sealed by a key the master
+   key wraps** (`users.rs`, `ext.rs`): the catalog gives none of them away, and nothing is written in
+   the clear. `harness.py users`, `harness.py secrets`.
 
 ## Tests: run these before and after any change
 

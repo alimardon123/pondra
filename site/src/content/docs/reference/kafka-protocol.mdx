@@ -296,10 +296,11 @@ keeps asking for the topic's metadata until its timeout.
 
 ## Tokens
 
-With no tokens set, anyone may connect and do anything. With tokens, a client logs in with
-SASL/PLAIN. The user name picks the role, `reader`, `writer` or `admin`, and the password is that
-role's token, as for [Postgres](/pondra/reference/postgres/#connect). A `reader` may consume and
-not produce. A client that does not log in, or logs in with a wrong password, cannot connect: its
+With no tokens set and no user who signs in, anyone may connect and do anything. Otherwise a client
+logs in with SASL/PLAIN: a [user](/pondra/guides/security/#users-roles-and-grants) with its password
+(or one of its tokens), or `reader`, `writer` or `admin` with that role's token, as for
+[Postgres](/pondra/reference/postgres/#connect). A `reader` may consume and not produce; a user
+produces to a table it has INSERT on, and consumes one it may read every column of. A client that does not log in, or logs in with a wrong password, cannot connect: its
 first request is refused and the connection closes. There is no TLS, so use `SASL_PLAINTEXT`.
 
 ```python norun

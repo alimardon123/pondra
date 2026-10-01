@@ -1862,7 +1862,7 @@ def flight():
     try:
         put(["ev"], [batch(0)], token="r")
         read_token_refused = False
-    except fl.FlightUnauthenticatedError:
+    except (fl.FlightUnauthenticatedError, fl.FlightUnauthorizedError):  # (signed in, not allowed: unauthorized)
         read_token_refused = True
     sql_ticket = fl.Ticket(json.dumps({"sql": "SELECT user, sum(amount) AS s FROM ev GROUP BY user ORDER BY user"}))
     by_user = client.do_get(sql_ticket, options=opts("r")).read_all()
@@ -3085,7 +3085,7 @@ $$""")
     checks["a cell its caller stopped waiting for is finished first: the next cell gets its own answer"] = after == [{"value": "next"}]
     info = call(A.port, "GET", "/python?all=1", headers=admin)
     checks["GET /python: the Python in use, and (?all=1) each this machine has, tried; PUT /python an admin's"] = \
-        bool(info.get("python")) and info.get("worker", {}).get("version") is not None and any(p.get("ok") for p in info.get("pythons", [])) and "401" in _raises_text(lambda: call(A.port, "PUT", "/python", b'{"path": "x"}', headers={"authorization": "Bearer w-tok", "content-type": "application/json"}))
+        bool(info.get("python")) and info.get("worker", {}).get("version") is not None and any(p.get("ok") for p in info.get("pythons", [])) and "403" in _raises_text(lambda: call(A.port, "PUT", "/python", b'{"path": "x"}', headers={"authorization": "Bearer w-tok", "content-type": "application/json"}))  # (signed in, not allowed)
     try:
         fmt = call(A.port, "POST", "/python/format", json.dumps({"code": "x=[1,2]\nif x :  print( x )\n"}).encode(), headers={**admin, "content-type": "application/json"})
     except Exception as e:
@@ -5004,9 +5004,227 @@ def server():
     return f"server: a folder of lakes as databases over Postgres and HTTP, created, dropped, idle-stopped, joined, restarted: all {len(checks)} checks pass"
 
 
+# ---------------------------------------------------------------- round 29, part 2 (ADR-035)
+
+def users():
+    """Users, roles and grants (ADR-035 §2): made in SQL; signed in at every door — HTTP (a password,
+    a token, a session), Postgres (SCRAM; a token-only user's token), Kafka (SASL/PLAIN), Flight (a
+    handshake gives a session) — and held to their grants: a table, some of its columns (a scan of
+    another refused, its filters' too), a schema's tables (later ones too), public's; writes by
+    privilege; a listing shows what they may read; a stream of rows needs every column. Revoked and
+    dropped at once, on the leader and a follower; tokens and sessions end; once a user signs in,
+    nothing without a sign-in, though no token is set; the nodes call each other with the lake's
+    own key."""
+    import base64, psycopg
+    lake = new_lake()
+    a = Node(lake, A.port, pg=f"127.0.0.1:{A.port + 10}", kafka=f"127.0.0.1:{A.port + 20}", flight=f"127.0.0.1:{A.port + 30}").start()
+    b = Node(lake, A.port + 1, env={"PONDRA_SESSION_HOURS": "0.0005"}).start()  # (a follower; its sessions last 1.8 s)
+    checks = {}
+
+    def as_(port, auth, q, method="POST", path="/sql"):
+        try:
+            return call(port, method, path, q.encode() if isinstance(q, str) else q, headers={"Authorization": auth} if auth else {})
+        except Exception as e:
+            return f"ERROR {e}"
+    basic = lambda u, p: "Basic " + base64.b64encode(f"{u}:{p}".encode()).decode()
+    boss = basic("boss", "boss-password-1")
+    # Open, until a user who signs in exists; then nothing without a sign-in (no token is set)
+    opened = as_(A.port, None, "SELECT 1 AS x")
+    for q in ["CREATE SCHEMA sales", "CREATE TABLE sales.orders (id BIGINT, item VARCHAR, amount DOUBLE, card VARCHAR)", "INSERT INTO sales.orders VALUES (1, 'tea', 2.5, '4111'), (2, 'cake', 4.0, '5500')",
+              "CREATE TABLE hr (id BIGINT, salary DOUBLE)", "INSERT INTO hr VALUES (1, 100.0)", "CREATE TABLE notes (id BIGINT, text VARCHAR)", "INSERT INTO notes VALUES (1, 'hello')",
+              "CREATE USER boss PASSWORD 'boss-password-1' SUPERUSER"]:
+        as_(A.port, None, q)
+    closed = until(lambda: as_(A.port, None, "SELECT 1 AS x"), "ERROR 401: b\"sign in: a token, or a user's name and password\"", 10)
+    checks["open until a user who signs in exists; then nothing without a sign-in (no token set)"] = opened == [{"x": 1}] and closed.startswith("ERROR 401")
+    for q in ["CREATE USER ann PASSWORD 'ann-password-1'", "CREATE ROLE analyst", "GRANT SELECT (id, item, amount) ON sales.orders TO analyst", "GRANT analyst TO ann",
+              "CREATE USER bob PASSWORD 'bob-password-1'", "GRANT SELECT, INSERT ON ALL TABLES IN SCHEMA sales TO bob", "GRANT SELECT ON notes TO public", "CREATE USER svc"]:
+        as_(A.port, boss, q)
+    ann, bob = basic("ann", "ann-password-1"), basic("bob", "bob-password-1")
+    said = {
+        "cols": as_(A.port, ann, "SELECT id, item FROM sales.orders ORDER BY id"),
+        "star": as_(A.port, ann, "SELECT * FROM sales.orders"),
+        "filter": as_(A.port, ann, "SELECT id FROM sales.orders WHERE card = '4111'"),
+        "other": as_(A.port, ann, "SELECT * FROM hr"),
+        "count": as_(A.port, ann, "SELECT count(*) AS n FROM sales.orders"),
+        "public": as_(A.port, ann, "SELECT text FROM notes"),
+        "write": as_(A.port, ann, "INSERT INTO sales.orders VALUES (3, 'pie', 1.0, '1')"),
+        "listed": as_(A.port, ann, "SELECT name FROM pondra.tables ORDER BY name"),
+        "info": as_(A.port, ann, "SELECT table_name FROM information_schema.tables WHERE table_schema IN ('public', 'sales') ORDER BY 1"),
+        "users": as_(A.port, ann, "CREATE USER eve PASSWORD 'eve-password-1'"),
+        "wrong": as_(A.port, basic("ann", "not-her-password"), "SELECT 1 AS x"),
+    }
+    checks["a user reads the columns granted (its roles' and public's); *, a filter on another column, another table: refused, saying why"] = \
+        said["cols"] == [{"id": 1, "item": "tea"}, {"id": 2, "item": "cake"}] and "permission denied: SELECT (card) on sales.orders" in said["star"] \
+        and "permission denied: SELECT (card)" in said["filter"] and "permission denied: SELECT on hr" in said["other"] and said["count"] == [{"n": 2}] and said["public"] == [{"text": "hello"}]
+    checks["...writes only as granted; lists only what it may read; makes no users; a wrong password refused"] = "permission denied: INSERT on sales.orders" in said["write"] \
+        and said["listed"] == [{"name": "notes"}, {"name": "orders"}] and said["info"] == [{"table_name": "notes"}, {"table_name": "orders"}] and "superuser" in said["users"] and said["wrong"].startswith("ERROR 401")
+    # A schema's tables, later ones too; writes through a follower (the nodes' own key between them)
+    as_(A.port, boss, "CREATE TABLE sales.refunds (id BIGINT, amount DOUBLE)")
+    wrote = [as_(A.port + 1, bob, "INSERT INTO sales.refunds VALUES (1, 2.5)"), as_(A.port + 1, bob, "INSERT INTO hr VALUES (2, 1.0)"), as_(A.port, bob, "UPDATE sales.orders SET amount = 0")]
+    later = until(lambda: as_(A.port + 1, bob, "SELECT id FROM sales.refunds"), [{"id": 1}], 10)
+    checks["a schema's grant covers its later tables; a follower forwards a user's writes (the nodes' own key), refusing the rest"] = \
+        wrote[0] == {"rows": 1} and "permission denied: INSERT on hr" in wrote[1] and "permission denied: UPDATE on sales.orders" in wrote[2] and later == [{"id": 1}]
+    # Tokens and sessions
+    tok = as_(A.port, boss, "CREATE TOKEN ci FOR USER svc")
+    short = as_(A.port, boss, "CREATE TOKEN brief FOR USER svc EXPIRES IN '1 second'")
+    as_(A.port, boss, "GRANT SELECT ON hr TO svc")
+    by_token = until(lambda: as_(A.port + 1, "Bearer " + tok["token"], "SELECT salary FROM hr"), [{"salary": 100.0}], 10)  # (a follower: its grants as of a second ago)
+    time.sleep(1.5)
+    expired = as_(A.port, "Bearer " + short["token"], "SELECT 1 AS x")
+    session = as_(A.port, None, json.dumps({"user": "ann", "password": "ann-password-1"}), path="/login")
+    by_session = as_(A.port + 1, "Bearer " + session["token"], "SELECT item FROM sales.orders WHERE id = 1")
+    tampered = as_(A.port, "Bearer " + session["token"][:-4] + "AAAA", "SELECT 1 AS x")
+    short_session = as_(A.port + 1, None, json.dumps({"user": "ann", "password": "ann-password-1"}), path="/login")
+    time.sleep(2.2)
+    ended = as_(A.port, "Bearer " + short_session["token"], "SELECT 1 AS x")
+    as_(A.port, boss, "DROP TOKEN ci FOR svc")
+    dropped_token = as_(A.port, "Bearer " + tok["token"], "SELECT 1 AS x")
+    checks["a user's token (shown once, kept as its hash) and session (signed, any node checks it) sign in; expired, tampered, dropped: refused"] = \
+        tok["token"].startswith("pt_") and by_token == [{"salary": 100.0}] and expired.startswith("ERROR 401") and by_session == [{"item": "tea"}] \
+        and tampered.startswith("ERROR 401") and ended.startswith("ERROR 401") and dropped_token.startswith("ERROR 401") \
+        and "pt_" not in json.dumps(as_(A.port, boss, "SELECT * FROM pondra.users"))
+    # Postgres: SCRAM-SHA-256 (the verifier only), a token-only user's token as its password
+    pg = lambda u, p, q: psycopg.connect(f"host=127.0.0.1 port={A.port + 10} user={u} password={p} dbname=lake", connect_timeout=10).execute(q).fetchall()
+    tok2 = as_(A.port, boss, "CREATE TOKEN pg FOR USER svc")["token"]
+    pg_said = [_raises_text(lambda: pg("ann", "ann-password-1", "SELECT id, item FROM sales.orders ORDER BY id")), _raises_text(lambda: pg("ann", "ann-password-1", "SELECT * FROM sales.orders")),
+               _raises_text(lambda: pg("ann", "wrong-password", "SELECT 1")), _raises_text(lambda: pg("svc", tok2, "SELECT salary FROM hr")), _raises_text(lambda: pg("boss", "boss-password-1", "SELECT card FROM sales.orders ORDER BY id"))]
+    rows = [pg("ann", "ann-password-1", "SELECT id, item FROM sales.orders ORDER BY id"), pg("svc", tok2, "SELECT salary FROM hr"), pg("boss", "boss-password-1", "SELECT card FROM sales.orders ORDER BY id")]
+    checks["Postgres: SCRAM-SHA-256 with the user's password, a token-only user's token; held to the grants; a wrong password refused"] = \
+        pg_said[0] == "" and "permission denied" in pg_said[1] and "authentication failed" in pg_said[2].lower() and pg_said[3] == "" and pg_said[4] == "" \
+        and rows == [[(1, "tea"), (2, "cake")], [(100.0,)], [("4111",), ("5500",)]]
+    # Kafka: SASL/PLAIN; producing needs INSERT, consuming every column
+    from kafka import KafkaConsumer, KafkaProducer
+    from kafka.errors import TopicAuthorizationFailedError
+    sasl = lambda u, p: dict(bootstrap_servers=f"127.0.0.1:{A.port + 20}", security_protocol="SASL_PLAINTEXT", sasl_mechanism="PLAIN", sasl_plain_username=u, sasl_plain_password=p)
+    def produce(u, p, topic):
+        pr = KafkaProducer(value_serializer=lambda v: json.dumps(v).encode(), **sasl(u, p))
+        try:
+            return pr.send(topic, {"id": 7, "amount": 1.0}).get(timeout=15) and "ok"
+        except TopicAuthorizationFailedError:
+            return "refused"
+        finally:
+            pr.close()
+    def consume(u, p, topic):
+        c = KafkaConsumer(topic, auto_offset_reset="earliest", consumer_timeout_ms=4000, **sasl(u, p))
+        try:
+            return len(list(c))
+        except TopicAuthorizationFailedError:
+            return "refused"
+        finally:
+            c.close()
+    kafka_said = [produce("bob", "bob-password-1", "sales.refunds"), produce("ann", "ann-password-1", "sales.refunds"), consume("bob", "bob-password-1", "sales.refunds"), consume("ann", "ann-password-1", "sales.orders")]
+    checks["Kafka: SASL/PLAIN as a user; producing needs INSERT; consuming a table needs SELECT on every column"] = kafka_said == ["ok", "refused", 2, "refused"]
+    # Flight: the handshake turns a user's name and password into a session
+    import pyarrow.flight as fl
+    client = fl.FlightClient(f"grpc://127.0.0.1:{A.port + 30}")
+    bearer = client.authenticate_basic_token("ann", "ann-password-1")
+    opts = fl.FlightCallOptions(headers=[bearer])
+    def fsql(q):
+        try:
+            info = client.get_flight_info(fl.FlightDescriptor.for_command(json.dumps({"sql": q})), opts)
+            return client.do_get(info.endpoints[0].ticket, opts).read_all().to_pylist()
+        except Exception as e:
+            return f"ERROR {e}"
+    flight_said = [bearer[1].decode().startswith("Bearer ps_"), fsql("SELECT item FROM sales.orders ORDER BY id"), fsql("SELECT card FROM sales.orders")]
+    checks["Flight: a handshake with a user's name and password gives a session; held to the grants"] = flight_said[0] and flight_said[1] == [{"item": "tea"}, {"item": "cake"}] and "permission denied" in flight_said[2]
+    # Revoked and dropped: at once, on the leader and a follower
+    as_(A.port, boss, "REVOKE SELECT (item) ON sales.orders FROM analyst")
+    revoked = [until(lambda: "permission denied" in str(as_(port, ann, "SELECT item FROM sales.orders")), True, 10) for port in (A.port, A.port + 1)]
+    still = as_(A.port, ann, "SELECT id FROM sales.orders ORDER BY id")
+    as_(A.port, boss, "REVOKE analyst FROM ann")
+    no_role = until(lambda: "permission denied" in str(as_(A.port + 1, ann, "SELECT id FROM sales.orders")), True, 10)
+    grants = as_(A.port, boss, "SELECT grantee, privilege, on_name, columns FROM pondra.grants ORDER BY grantee, privilege, on_name")
+    as_(A.port, boss, "DROP USER ann")
+    gone = [until(lambda: str(as_(port, ann, "SELECT 1 AS x")).startswith("ERROR 401"), True, 10) for port in (A.port, A.port + 1)]
+    checks["revoked (a column, a role) and dropped: at once on the leader and a follower; pondra.grants says what stands"] = revoked == [True, True] and still == [{"id": 1}, {"id": 2}] \
+        and no_role is True and gone == [True, True] and {"grantee": "analyst", "privilege": "SELECT", "on_name": "sales.orders", "columns": "id, amount"} in grants
+    info = {"said": said, "wrote": wrote, "pg": pg_said, "kafka": kafka_said, "flight": flight_said[1:], "grants": grants, "revoked": [revoked, still, no_role, gone],
+            "tokens": [by_token, expired, by_session, tampered, ended, dropped_token]}
+    ok = all(checks.values())
+    print(json.dumps({"users": checks, "ok": ok, "info": info}, indent=1, default=str))
+    return ok
+
+
+def secrets():
+    """Secrets (ADR-035 §3): each sealed with a data key of its own, which the master key wraps
+    (the values never in the clear in the catalog); a user uses one only with USAGE on it; a
+    session's CREATE TEMPORARY SECRET is its own, in memory, nowhere in the lake; a new master key
+    (the previous one still set) rewraps every data key when the leader starts; a key service
+    (PONDRA_KMS_COMMAND) wraps them instead, and without it they don't open."""
+    import base64, http.server, socketserver
+    here = tempfile.mkdtemp(prefix="pondra-secrets-")
+    open(os.path.join(here, "rates.csv"), "w").write("cur,rate\nEUR,1.1\nGBP,1.3\n")
+    class Quiet(http.server.SimpleHTTPRequestHandler):
+        def __init__(self, *a, **k):
+            super().__init__(*a, directory=here, **k)
+        def log_message(self, *a):
+            pass
+    web = socketserver.TCPServer(("127.0.0.1", 0), Quiet)
+    threading.Thread(target=web.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{web.server_address[1]}/"
+    kms = os.path.join(here, "kms.sh")  # (a stand-in key service: it "wraps" by reversing, as a test can see)
+    open(kms, "w").write("#!/bin/sh\nread x\nif [ \"$1\" = wrap ]; then echo \"$x\" | rev; else echo \"$x\" | rev; fi\n")
+    os.chmod(kms, 0o755)
+    lake = new_lake()
+    keys = {"PONDRA_SECRET_KEY": "first-master-key"}
+    node = Node(lake, A.port, admin_token="adm", env=keys).start()
+    adm = lambda q, h=None: call(A.port, "POST", "/sql", q.encode(), headers={"Authorization": "Bearer adm", **(h or {})})
+    def as_(auth, q, session=None):
+        try:
+            return call(A.port, "POST", "/sql", q.encode(), headers={"Authorization": auth, **({"x-pondra-session": session} if session else {})})
+        except Exception as e:
+            return f"ERROR {e}"
+    basic = lambda u, p: "Basic " + base64.b64encode(f"{u}:{p}".encode()).decode()
+    adm(f"CREATE SECRET rates (TYPE http, BEARER_TOKEN 'tok-123456', SCOPE '{url}')")
+    adm("CREATE USER ann PASSWORD 'ann-password-1'")
+    adm("CREATE USER bob PASSWORD 'bob-password-1'")
+    adm("GRANT USAGE ON SECRET rates TO ann")
+    ann, bob = basic("ann", "ann-password-1"), basic("bob", "bob-password-1")
+    read = f"SELECT cur FROM read_csv('{url}rates.csv') ORDER BY cur"
+    catalog = lambda: subprocess.run([BIN, "catalog", "--dir", lake, "e/"], capture_output=True, text=True, env={**os.environ, **keys}).stdout
+    used = [as_(ann, read), as_(bob, read)]
+    sealed = catalog()
+    checks = {}
+    checks["a secret is used only by who has USAGE on it (a token's or superuser's: any); its values never in the clear in the catalog, a data key of its own wrapped"] = \
+        used[0] == [{"cur": "EUR"}, {"cur": "GBP"}] and "no secret" in used[1].lower() and "tok-123456" not in sealed and '"key"' in sealed and adm(read) == [{"cur": "EUR"}, {"cur": "GBP"}]
+    # A session's own temporary secret: its queries only; not in the lake
+    mine = as_(bob, f"CREATE TEMPORARY SECRET bobs (TYPE http, BEARER_TOKEN 'bob-own-9999', SCOPE '{url}')", session="bob-session-1")
+    temp = [as_(bob, read, session="bob-session-1"), as_(bob, read, session="bob-session-2"), as_(bob, "SELECT name FROM secrets() ORDER BY name", session="bob-session-1"), as_(ann, read, session="bob-session-1")]
+    checks["CREATE TEMPORARY SECRET: the session's own (another session, another user naming it: not), in memory, nowhere in the lake"] = mine == {"secret": "bobs", "temporary": True} \
+        and temp[0] == [{"cur": "EUR"}, {"cur": "GBP"}] and "no secret" in temp[1].lower() and {"name": "bobs"} in temp[2] and "bob-own-9999" not in catalog() and "bobs" not in catalog() \
+        and temp[3] == [{"cur": "EUR"}, {"cur": "GBP"}]  # (ann's own grant, not bob's secret: her session is her own)
+    # A new master key: the previous one set, the leader rewraps every data key when it starts
+    node.kill()
+    keys = {"PONDRA_SECRET_KEY": "second-master-key", "PONDRA_SECRET_KEY_PREVIOUS": "first-master-key"}
+    node = Node(lake, A.port, admin_token="adm", env=keys).start()
+    rewrapped = until(lambda: "rewrapped 1 secret" in open(node.log).read(), True, 20)
+    node.kill()
+    keys = {"PONDRA_SECRET_KEY": "second-master-key"}
+    node = Node(lake, A.port, admin_token="adm", env=keys).start()
+    after = adm(read)
+    node.kill()
+    wrong = Node(lake, A.port, admin_token="adm", env={"PONDRA_SECRET_KEY": "first-master-key"}).start()
+    refused = _raises_text(lambda: adm(read))
+    wrong.kill()
+    checks["a new master key: the leader rewraps the data keys (the previous key set), then the secret opens with the new key alone, not the old"] = rewrapped is True and after == [{"cur": "EUR"}, {"cur": "GBP"}] and "master key" in refused
+    # A key service wraps them (PONDRA_KMS_COMMAND), the master key never in a file or a variable
+    keys = {"PONDRA_KMS_COMMAND": kms}
+    node = Node(lake, A.port, admin_token="adm", env=keys).start()
+    adm(f"CREATE OR REPLACE SECRET rates (TYPE http, BEARER_TOKEN 'tok-654321', SCOPE '{url}')")
+    by_kms = [adm(read), '"key":"kms:' in catalog().replace(" ", "")]
+    node.kill()
+    node = Node(lake, A.port, admin_token="adm", env={"PONDRA_SECRET_KEY": "second-master-key"}).start()
+    without = _raises_text(lambda: adm(read))
+    checks["PONDRA_KMS_COMMAND wraps a data key (kms:…); without it, it doesn't open"] = by_kms == [[{"cur": "EUR"}, {"cur": "GBP"}], True] and "PONDRA_KMS_COMMAND" in without
+    web.shutdown()
+    ok = all(checks.values())
+    print(json.dumps({"secrets": checks, "ok": ok, "info": {"used": used, "temp": temp, "refused": refused, "without": without}}, indent=1, default=str))
+    return ok
+
+
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    out = {t.__name__: t() for t in (upsert, deal, outside, clouds, kafkas, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, found, renames, workspace, server, scale, flight, reader, crash)}
+    out = {t.__name__: t() for t in (upsert, deal, outside, clouds, kafkas, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, found, renames, workspace, server, scale, flight, users, secrets, reader, crash)}
     A.secs = min(A.secs, 20)
     out["load"] = load()
     print(json.dumps(out, indent=1))
@@ -5014,7 +5232,7 @@ def all_tests():
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "found", "renames", "workspace", "server", "scale", "flight", "load", "all"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "found", "renames", "workspace", "server", "scale", "flight", "users", "secrets", "load", "all"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -5025,4 +5243,4 @@ if __name__ == "__main__":
     ap.add_argument("--secs", type=int, default=30)
     ap.add_argument("--flush-ms", type=int, default=250)
     A = ap.parse_args()
-    {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "load": load, "all": all_tests}[A.mode]()
+    {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "load": load, "all": all_tests}[A.mode]()

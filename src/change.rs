@@ -61,6 +61,26 @@ enum Action {
     Insert(Vec<String>, Vec<String>), // columns (none: all, in order), values
 }
 
+impl Merge {
+    /// The privileges on its table it needs: what its clauses do (`auth::allows`).
+    pub fn privileges(&self) -> Vec<&'static str> {
+        let mut all: Vec<&'static str> = self.clauses.iter().map(|c| match c.action {
+            Action::Update(_) => "update",
+            Action::Delete => "delete",
+            Action::Insert(..) => "insert",
+        }).collect();
+        if let Some(u) = &self.upsert {
+            all.push("insert");
+            if u.update.is_some() {
+                all.push("update");
+            }
+        }
+        all.sort();
+        all.dedup();
+        all
+    }
+}
+
 /// A MERGE statement's pieces (None: not one Pondra takes).
 pub fn merge_of(m: &ast::Merge) -> Option<Merge> {
     let ast::TableFactor::Table { name, alias, .. } = &m.table else { return None };

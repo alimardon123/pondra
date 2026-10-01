@@ -18,9 +18,10 @@ import { createServer } from "node:net";
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 export class Pondra {
-  constructor(url = "http://127.0.0.1:8080", { token, onNotice = (n) => console.log(n) } = {}) {
+  constructor(url = "http://127.0.0.1:8080", { token, user, password, onNotice = (n) => console.log(n) } = {}) {
     this.url = url.replace(/\/$/, "");
     this.token = token;
+    this.basic = user ? `Basic ${Buffer.from(`${user}:${password}`).toString("base64")}` : null; // (a user: its name and password, or its token as the password)
     this.notices = []; // what the last statement's procedures printed
     this.onNotice = onNotice; // (each one, as it comes back; null: keep them quiet)
     this.producer = `js-${randomUUID().slice(0, 12)}`; // exactly-once: one name, increasing seq
@@ -30,7 +31,7 @@ export class Pondra {
 
   /** One HTTP request to the node (what the methods below are made of). */
   async request(method, path, body, type) {
-    const headers = { "x-pondra-session": this.session, ...(this.token && { authorization: `Bearer ${this.token}` }), ...(type && { "content-type": type }), ...(this.owner && { "x-pondra-owner": this.owner }) };
+    const headers = { "x-pondra-session": this.session, ...(this.token ? { authorization: `Bearer ${this.token}` } : this.basic && { authorization: this.basic }), ...(type && { "content-type": type }), ...(this.owner && { "x-pondra-owner": this.owner }) };
     const r = await fetch(this.url + path, { method, body, headers });
     const said = r.headers.get("x-pondra-notices");
     this.notices = said ? JSON.parse(said) : [];

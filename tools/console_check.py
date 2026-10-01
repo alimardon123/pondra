@@ -1302,7 +1302,8 @@ def budget_checks(browser, port, show):
 def token_checks(browser, port):
     token = "console-check-admin-token"
     lake = tempfile.mkdtemp(prefix="pondra-")
-    node = Node(lake, port, admin_token=token, read_token="console-check-reader").start()
+    owner = "console-check-owner-key-1234"
+    node = Node(lake, port, admin_token=token, read_token="console-check-reader", env={"PONDRA_OWNER_KEY": owner}).start()
     try:
         harness.call(port, "POST", "/sql", b"CREATE TABLE secret_things AS SELECT 1 AS id", headers={"authorization": f"Bearer {token}"})
         pg = Page(browser, f"http://127.0.0.1:{port}/")
@@ -1319,7 +1320,23 @@ def token_checks(browser, port):
                 return harness.call(port, "GET", "/sessions/some-page/python", headers={"authorization": f"Bearer {who}"})
             except Exception as e:  # noqa: BLE001 (refused: what it said)
                 return str(e)
-        checks = {"with tokens, the page asks for one (Sign in), then shows the tables (and after a reload)": asked is True and hidden and shown == 1 and again == 1
+        # A user: its name and password (a session), and only what it may read
+        adm = lambda q: harness.call(port, "POST", "/sql", q.encode(), headers={"authorization": f"Bearer {token}"})
+        for q in ["CREATE TABLE other_things AS SELECT 2 AS id", "CREATE USER cc_user PASSWORD 'cc-password-1'", "GRANT SELECT ON secret_things TO cc_user"]:
+            adm(q)
+        user = Page(browser, f"http://127.0.0.1:{port}/")
+        until(lambda: user.p.locator("#tokenDlg").get_attribute("open") is not None, True)
+        user.p.fill("#userIn", "cc_user")
+        user.p.fill("#tokenIn", "cc-password-1")
+        user.p.press("#tokenIn", "Enter")
+        as_user = until(lambda: (user.p.locator("#data .row", has_text="secret_things").count(), user.p.locator("#data .row", has_text="other_things").count(), user.p.locator("#signin").inner_text()), (1, 0, "cc_user"))
+        user.ctx.close()
+        # The shell's link (#key=…): the page works as the shell does, asking nothing
+        shell = Page(browser, f"http://127.0.0.1:{port}/#key={owner}")
+        as_shell = until(lambda: (shell.p.locator("#data .row", has_text="other_things").count(), shell.p.locator("#tokenDlg").get_attribute("open"), shell.p.evaluate("location.hash")), (1, None, ""))
+        shell.ctx.close()
+        checks = {"a user signs in with its name and password (a session) and sees only what it may read; the shell's link (#key=…) signs the page in as the shell, its key out of the address": as_user == (1, 0, "cc_user") and as_shell == (1, None, ""),
+                  "with tokens, the page asks for one (Sign in), then shows the tables (and after a reload)": asked is True and hidden and shown == 1 and again == 1
                   and signed and pg.p.locator("#tokenDlg").get_attribute("open") is None,
                   "a session's Python variables are an admin's to read, as DO is": "admin" in str(python_of("console-check-reader"))
                   and python_of(token) == {"running": False, "variables": []}}

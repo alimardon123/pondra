@@ -85,15 +85,17 @@ pub async fn listed(lake: &Lake) -> Result<Vec<Listed>> {
     let mut all = vec![];
     let attached: Vec<(String, Arc<Lake>)> = lake.attached.read().unwrap().clone();
     for (catalog, l) in std::iter::once((lake_name(lake), lake.arc())).chain(attached) {
-        let materialized: std::collections::HashMap<String, String> = l.cat.scan::<crate::views::View>("v/", "v0").await?.into_iter().map(|(k, v)| (k[2..].to_string(), v.sql)).collect();
+        // (a materialized view of any kind: windows, sessions and joins keep more than its SQL)
+        let materialized: std::collections::HashMap<String, String> = l.cat.scan::<Value>("v/", "v0").await?.into_iter().map(|(k, v)| (k[2..].to_string(), v["sql"].as_str().unwrap_or_default().to_string())).collect();
         for (k, m) in l.cat.scan::<TableMeta>("t/", "t0").await? {
             let name = &k[2..];
             if crate::sys::hidden(name) {
                 continue;
             }
             let (schema, table) = split(name);
-            let sql = materialized.get(name).or_else(|| materialized.get(name.trim_end_matches("_final"))).cloned();
-            let kind = if sql.is_some() { "materialized view" } else { "table" };
+            let found = materialized.get(name).or_else(|| materialized.get(name.trim_end_matches("_final")));
+            let kind = if found.is_some() { "materialized view" } else { "table" };
+            let sql = found.filter(|s| !s.is_empty()).cloned();
             all.push(Listed { lake: catalog.clone(), schema: schema.into(), name: table.into(), kind, meta: Some(m.logical()), sql });
         }
         for (k, v) in l.cat.scan::<StoredView>("q/", "q0").await? {
@@ -199,6 +201,7 @@ pub enum Ddl {
     CreateTask { name: String, task: crate::runs::Task, replace: bool }, // CREATE TASK … SCHEDULE … AS … (ADR-027: `runs.rs`)
     DropTask { name: String, if_exists: bool },
     RunLog, // the run log's table (`pondra.runs`), made when a node first has a line for it
+    Users(crate::users::Change), // CREATE USER and ROLE, GRANT, REVOKE, CREATE TOKEN (ADR-035: `users.rs`)
 }
 
 /// What `ALTER TABLE` does to a column: rename it, drop it, or widen its type (a SQL type).
@@ -336,6 +339,7 @@ pub async fn apply(lake: &Lake, d: Ddl) -> Result<Value> {
         Ddl::CreateTask { name, task, replace } => crate::runs::create_task(lake, &name, task, replace).await,
         Ddl::DropTask { name, if_exists } => crate::runs::drop_task(lake, &name, if_exists).await,
         Ddl::RunLog => crate::runs::create_log(lake).await,
+        Ddl::Users(c) => crate::users::apply(lake, c).await,
         Ddl::AttachOutside { name, url, kind, options } => {
             ensure!(!has_schema(lake, &name).await?, "a schema here is called {name}: attach under another name");
             ensure!(lake.cat.get::<Attachment>(&attachment_key(&name)).await?.is_none(), "{name} is an attached lake: attach under another name");

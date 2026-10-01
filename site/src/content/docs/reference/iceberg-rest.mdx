@@ -252,7 +252,7 @@ A lake on object storage needs the engine to reach the bucket too: for PyIceberg
 
 With tokens set, the catalog uses the same ones as [HTTP](/pondra/reference/http/#roles), sent as
 `Authorization: Bearer`. Reading needs the `read` token, and a commit needs the `write` token. A
-token with too few rights gets `401` with the text `this needs a token with more rights`.
+token with too few rights gets `403` with the text `this needs more rights than this token's or user's`; no token, or a wrong one, `401`.
 
 ```python norun
 import os

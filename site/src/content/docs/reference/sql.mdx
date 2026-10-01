@@ -312,12 +312,32 @@ DROP MACRO double_it;
 | Write files | `COPY (SELECT …) TO 'url' (FORMAT parquet \| csv \| json \| delta \| iceberg, PARTITION_BY (col, …), APPEND \| OVERWRITE, HEADER true, DELIMITER ';', COMPRESSION zstd, ROW_GROUP_SIZE n)` |
 | Write a topic | `COPY (SELECT …) TO 'kafka://brokers/topic' (FORMAT json, KEY col)` |
 | Make a secret | `CREATE [OR REPLACE] SECRET [IF NOT EXISTS] name (TYPE s3 \| r2 \| gcs \| azure \| http \| iceberg \| kafka \| generic, KEY value, …, SCOPE 'url')` |
-| Drop a secret | `DROP SECRET [IF EXISTS] name` |
+| A session's own | `CREATE [OR REPLACE] TEMPORARY SECRET name (…)`: in the node's memory for this session only, used before the lake's |
+| Drop a secret | `DROP [TEMPORARY] SECRET [IF EXISTS] name` |
 
 `COPY table TO …` is short for `COPY (SELECT * FROM table) TO …`. A URL needs a secret whose `SCOPE`
-covers it, and only an admin may write files. A path on a machine is written only by the program that
-started the node: the shell, `local()`, or `pondra sql`. Secrets are sealed with `PONDRA_SECRET_KEY`;
-`SELECT * FROM secrets()` lists their names and scopes, never their values.
+covers it (a user's query, one it has `USAGE` on), and only an admin may write files. A path on a
+machine is written only by the program that started the node: the shell, `local()`, or `pondra sql`.
+Each secret is sealed with a key of its own, which the master key (`PONDRA_SECRET_KEY`, or a key
+service: `PONDRA_KMS_COMMAND`) wraps; `SELECT * FROM secrets()` lists their names and scopes, never
+their values.
+
+## Users and grants
+
+| Statement | Syntax |
+|---|---|
+| Make a user or a role | `CREATE USER [IF NOT EXISTS] name [WITH] [PASSWORD 'at least 8'] [SUPERUSER]`, `CREATE ROLE name` |
+| Change one | `ALTER USER name [WITH] PASSWORD '…' \| SUPERUSER \| NOSUPERUSER` |
+| Drop one | `DROP USER [IF EXISTS] name`, `DROP ROLE [IF EXISTS] name` |
+| Grant | `GRANT SELECT [(col, …)] \| INSERT \| UPDATE \| DELETE \| ALL [PRIVILEGES] ON [TABLE] t \| SCHEMA s \| ALL TABLES [IN SCHEMA s] TO name, …` |
+| Grant a secret | `GRANT USAGE ON SECRET s TO name, …` |
+| Grant a role | `GRANT role, … TO user, …` |
+| Take back | `REVOKE … FROM …`, as GRANT names them (`REVOKE SELECT (col) ON t FROM r`: that column only) |
+| A token | `CREATE TOKEN name FOR [USER] u [EXPIRES IN '90 days']` (answers it, once), `DROP TOKEN name FOR [USER] u` |
+| List | `SELECT * FROM pondra.users`, `SELECT * FROM pondra.grants` |
+
+`public` is every user: `GRANT SELECT ON t TO public`. A grant on a schema covers its tables made later
+too. Only a superuser (or the admin token) runs these. See [security](/pondra/guides/security/#users-roles-and-grants).
 
 ```bash
 pondra sql --dir scratch "CREATE TABLE t (a BIGINT, region VARCHAR)"

@@ -481,7 +481,7 @@ fn latest(e: &Every, after: u64, now: u64) -> Option<u64> {
 /// Does `sql` read one of these tables?
 pub fn mentioned(sql: &str) -> bool {
     let s = sql.to_lowercase();
-    ["pondra.runs", "pondra.routines", "pondra.tasks", "pondra.tables"].iter().any(|t| s.contains(t))
+    ["pondra.runs", "pondra.routines", "pondra.tasks", "pondra.tables", "pondra.users", "pondra.grants"].iter().any(|t| s.contains(t))
 }
 
 /// `pondra.routines`, `pondra.tasks` and `pondra.tables`, as they are now.
@@ -526,7 +526,10 @@ pub async fn tables(lake: &Lake) -> Result<Vec<(&'static str, Arc<dyn datafusion
     let mem = |b: RecordBatch| -> Result<Arc<dyn datafusion::catalog::TableProvider>> { Ok(Arc::new(MemTable::try_new(b.schema(), vec![vec![b]])?)) };
     // (every table and view, of what kind: `information_schema.tables` knows only BASE TABLE and VIEW;
     // rows and bytes in its files, so rows still in the log count once written out)
-    let all = crate::ddl::listed(lake).await?;
+    let mut all = crate::ddl::listed(lake).await?;
+    if let Some(a) = crate::auth::limited() {
+        all.retain(|o| a.may("select", &if o.lake == crate::ddl::lake_name(lake) { crate::ddl::join(&o.schema, &o.name) } else { format!("{}.{}", o.lake, crate::ddl::join(&o.schema, &o.name)) })); // (a user's: what it may read)
+    }
     let l = |f: &dyn Fn(&crate::ddl::Listed) -> Option<String>| Arc::new(all.iter().map(f).collect::<StringArray>()) as ArrayRef;
     let n = |f: &dyn Fn(&TableMeta) -> u64| Arc::new(all.iter().map(|o| o.meta.as_ref().map(|m| f(m) as i64)).collect::<Int64Array>()) as ArrayRef;
     let sealed = |m: &TableMeta| m.sealed.clone().unwrap_or_default();

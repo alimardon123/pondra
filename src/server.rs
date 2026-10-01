@@ -123,7 +123,7 @@ pub fn router(app: App) -> Router {
         .route("/lookup/{name}/{key}", get(lookup))
         .route("/watch/{name}", get(watch))
         .route("/live", get(crate::live::live).post(crate::live::live))
-        .route("/sessions/{id}", axum::routing::delete(|Path(id): Path<String>| async move { Json(j!({"ended": crate::temp::end(&id)})) }))
+        .route("/sessions/{id}", axum::routing::delete(|Path(id): Path<String>| async move { Json(j!({"ended": crate::temp::end(&crate::temp::id(&id))})) }))
         .route("/sessions/{id}/python", get(session_python).delete(session_python).post(session_python))
         .route("/python", get(list_pythons).put(choose_python))
         .route("/python/format", post(format_python))
@@ -133,6 +133,8 @@ pub fn router(app: App) -> Router {
         .route("/routines", get(|State(app): State<App>| async move { Ok::<_, E>(Json(j!(*crate::routines::listed(&app.lake).await?))) }))
         .route("/secrets/{name}", get(secret))
         .route("/stats", get(stats))
+        .route("/login", post(login))
+        .route("/whoami", get(whoami))
         .route("/objects", get(|State(app): State<App>| async move { Ok::<_, E>(Json(crate::console::objects(&app.lake).await?)) }))
         .route("/metrics", get(|State(app): State<App>| async move { crate::metrics::render(&app).await.map_err(E) }))
         .route("/cluster/commit", post(commit))
@@ -234,6 +236,7 @@ async fn delete_file(State(app): State<App>, Path(path): Path<String>) -> Result
 /// lists them (none, if it has none yet); `DELETE`: stop it (its variables go; the session's
 /// temporary tables stay), as a notebook's kernel is restarted. An admin's, as Python is.
 async fn session_python(method: axum::http::Method, Path(id): Path<String>, role: axum::Extension<crate::auth::Role>) -> Result<Json<Value>, E> {
+    let id = crate::temp::id(&id); // (as the client's requests name it: its user's)
     if *role < crate::auth::Role::Admin {
         return Err(E(anyhow::anyhow!("a session's Python is an admin's, as DO is")));
     }
@@ -281,15 +284,65 @@ async fn list_functions(State(app): State<App>) -> Result<Json<Value>, E> {
     Ok(Json(j!(fns.into_iter().map(|(k, u)| (k[2..].to_string(), serde_json::to_value(u).unwrap_or_default())).collect::<serde_json::Map<_, _>>())))
 }
 
-/// Tokens (see `auth.rs`): the caller's role must cover the route; handlers see it too.
+/// Who asks (see `auth.rs`, `users.rs`): a token, a user's token, session or password; the
+/// program that started the node (`owner`); or, when nothing needs a sign-in, anyone, as an admin.
+/// Its role must cover the route; the request then runs as it (`auth::WHO`), and handlers see its
+/// role too.
 async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response {
-    let token = req.headers().get("authorization").and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer "));
-    let role = app.auth.role(token);
-    if role < crate::auth::Auth::needed(req.uri().path(), req.method().as_str()) {
-        return (StatusCode::UNAUTHORIZED, "this needs a token with more rights").into_response();
+    let header = req.headers().get("authorization").and_then(|v| v.to_str().ok()).map(String::from);
+    let signed = match &header {
+        Some(h) => crate::users::who(&app.lake, &app.auth, Some(h)).await,
+        None => None,
+    };
+    let who = match signed {
+        Some(p) => p,
+        None if owner(req.headers()) || app.open().await => crate::auth::Principal::of(crate::auth::Role::Admin),
+        None if header.is_some() => {
+            tokio::time::sleep(Duration::from_millis(400)).await; // (a guess costs time)
+            return (StatusCode::UNAUTHORIZED, "wrong token, or user name and password").into_response();
+        }
+        None => crate::auth::Principal::of(crate::auth::Role::None),
+    };
+    if who.role < crate::auth::Auth::needed(req.uri().path(), req.method().as_str()) {
+        return match who.role {
+            crate::auth::Role::None => (StatusCode::UNAUTHORIZED, "sign in: a token, or a user's name and password").into_response(),
+            _ => (StatusCode::FORBIDDEN, "this needs more rights than this token's or user's").into_response(),
+        };
     }
-    req.extensions_mut().insert(role);
-    next.run(req).await
+    req.extensions_mut().insert(who.role);
+    crate::auth::WHO.scope(who, next.run(req)).await
+}
+
+/// `POST /login` `{"user", "password"}`: a session (`{"token": "ps_…", "until": ms}`) to send as
+/// `Authorization: Bearer …` until it ends (`PONDRA_SESSION_HOURS`); the console's sign-in.
+async fn login(State(app): State<App>, body: Bytes) -> Response {
+    let b: Value = serde_json::from_slice(&body).unwrap_or_default(); // (JSON, whatever its content type says)
+    let (user, password) = (b["user"].as_str().unwrap_or_default(), b["password"].as_str().unwrap_or_default());
+    if !crate::users::password_ok(&app.lake, user, password).await {
+        tokio::time::sleep(Duration::from_millis(400)).await; // (a guess costs time)
+        return (StatusCode::UNAUTHORIZED, "wrong user name or password").into_response();
+    }
+    match crate::users::session(&app.lake, user).await {
+        Ok((token, until)) => Json(j!({"token": token, "until": until, "user": user})).into_response(),
+        Err(e) => E(e).into_response(),
+    }
+}
+
+/// `GET /whoami`: who this request signs in as, and what it may do.
+async fn whoami(State(app): State<App>) -> Json<Value> {
+    let p = crate::auth::current().unwrap_or_else(|| crate::auth::Principal::of(crate::auth::Role::None));
+    let role = match p.role {
+        crate::auth::Role::Admin => "admin",
+        crate::auth::Role::Write => "write",
+        crate::auth::Role::Read => "read",
+        crate::auth::Role::None => "none",
+    };
+    Json(j!({"user": p.name, "role": role, "superuser": p.role == crate::auth::Role::Admin && p.access.is_none(), "open": app.open().await}))
+}
+
+impl App {
+    /// Does nothing need a sign-in here? (No token set, and no user who signs in.)
+    pub async fn open(&self) -> bool { !self.auth.on() && !crate::users::any(&self.lake).await }
 }
 
 /// Followers forward metadata writes to the leader, unchanged.
@@ -440,7 +493,8 @@ impl App {
         use crate::metrics::{add, QUERIES, QUERY_ERRORS, QUERY_US, SPREAD};
         let start = std::time::Instant::now();
         let run = async {
-            let here_only = spread == Some("0") || crate::query::sent() || crate::temp::mentioned(query) || crate::routines::pinned(&self.lake, query).await; // (rows sent with a request are here only; so are the session's temporary tables, and a Python table function's call)
+            let here_only = spread == Some("0") || crate::query::sent() || crate::temp::mentioned(query) || crate::routines::pinned(&self.lake, query).await // (rows sent with a request are here only; so are the session's temporary tables, and a Python table function's call)
+                || crate::auth::limited().is_some(); // (and a user's granted some tables: its grants are checked where it is planned, here)
             let nodes = if here_only { vec![] } else { self.cluster.nodes() };
             match crate::spmd::query(&self.lake, &nodes, &self.cluster.addr, query, spread == Some("1")).await {
                 Ok(Some(batches)) => {
@@ -740,6 +794,7 @@ async fn ddl(State(app): State<App>, Json(d): Json<crate::ddl::Ddl>) -> Result<J
 /// the key's partial rows with a filter + GROUP BY on one thread. Composite keys are
 /// comma-separated, in the key's column order.
 async fn lookup(State(app): State<App>, Path((name, key)): Path<(String, String)>) -> Result<Response, E> {
+    crate::auth::check_all(&name)?; // (a user's: the whole row)
     let lake = &app.lake;
     let meta: TableMeta = lake.cat.get(&table_key(&name)).await?.ok_or_else(|| anyhow::anyhow!("no table {name}"))?;
     ensure!(!meta.key.is_empty(), "{name} has no key: use /sql");
@@ -884,7 +939,8 @@ fn content_type(p: &SqlParams) -> &'static str {
 async fn query(app: &App, p: &SqlParams, query: &str, files: bool) -> anyhow::Result<Response> {
     let format = p.format.as_deref().unwrap_or("json");
     let respond = |body: bytes::Bytes| ([("content-type", content_type(p))], body).into_response();
-    if format == "json" && !crate::temp::mentioned(query) {
+    let limited = crate::auth::limited().is_some(); // (a user granted some tables: planned as it may read them, never answered from what another read, nor kept: its grants may change)
+    if format == "json" && !crate::temp::mentioned(query) && !limited {
         if let Some(body) = crate::serve::point_sql(&app.lake, query).await? {
             return Ok(respond(body.into())); // a key lookup: no planning
         }
@@ -892,7 +948,7 @@ async fn query(app: &App, p: &SqlParams, query: &str, files: bool) -> anyhow::Re
     // Same query, same catalog version: same answer (unless it asks for the time or randomness,
     // or may read a file on this machine).
     let q = query.to_lowercase();
-    let volatile = files || !crate::ext::names(query).is_empty() || ["now()", "random(", "current_", "uuid(", "explain", "pondra.runs", "pondra.tasks", "files("].iter().any(|f| q.contains(f)) // (files outside the lake change on their own; `files()` lists objects put since)
+    let volatile = files || limited || !crate::ext::names(query).is_empty() || ["now()", "random(", "current_", "uuid(", "explain", "pondra.runs", "pondra.tasks", "files("].iter().any(|f| q.contains(f)) // (files outside the lake change on their own; `files()` lists objects put since)
         || crate::temp::mentioned(query) // (the session's temporary tables change without a commit)
         || crate::routines::volatile(&app.lake, query).await; // (a Python function may answer differently each time)
     let Some(version) = app.lake.version_for(query).await.filter(|_| !volatile) else { return Ok(respond(run_sql(app, p, query, files).await?)) };
@@ -1043,6 +1099,9 @@ struct WatchParams {
 /// New rows of a table as NDJSON, pushed the moment they commit (a view's rows included); with
 /// `?changes=true`, its changes: UPDATE's and DELETE's too, with the rows' system columns.
 async fn watch(State(app): State<App>, Path(name): Path<String>, Query(p): Query<WatchParams>) -> Response {
+    if let Err(e) = crate::auth::check_all(&name) {
+        return (StatusCode::FORBIDDEN, e.to_string()).into_response(); // (a user's: the whole rows)
+    }
     let hwm = app.lake.hwm.subscribe();
     let after = p.after.unwrap_or_else(|| app.lake.visible());
     let (marks, changes) = (p.marks, p.changes);

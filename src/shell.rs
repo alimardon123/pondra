@@ -116,6 +116,7 @@ async fn session(dir: &str, base: &str, key: &str, node: &mut Child, log: &Path)
         let others = databases(&http, base).await.unwrap_or_default();
         let others = if others.len() > 1 { format!(" Databases: {}.", others.join(", ")) } else { String::new() };
         eprintln!("Pondra {} on {dir}, also at {base}.{others} End each statement with ;  .tables and .databases list them, .quit leaves.", env!("CARGO_PKG_VERSION"));
+        eprintln!("The console, as this shell: {base}/#key={key}"); // (its key: the page then reads this machine's files as the shell does, and only while the shell runs)
     }
     let (mut sql, mut failed) = (String::new(), false);
     loop {

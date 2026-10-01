@@ -123,12 +123,12 @@ async fn conn(app: App, me: Arc<Broker>, socket: TcpStream) -> Result<()> {
         }
         anyhow::Ok(())
     });
-    let mut role = if app.auth.on() { Role::None } else { Role::Admin };
+    let mut who = crate::auth::Principal::of(if app.open().await { Role::Admin } else { Role::None });
     while let Ok(size) = rd.read_i32().await {
         ensure!((0..=128 << 20).contains(&size), "request of {size} bytes");
         let mut buf = vec![0; size as usize];
         rd.read_exact(&mut buf).await?;
-        let reply = request(&app, &me, &mut role, Bytes::from(buf)).await?;
+        let reply = request(&app, &me, &mut who, Bytes::from(buf)).await?;
         if tx.send(reply).await.is_err() {
             break;
         }
@@ -137,7 +137,7 @@ async fn conn(app: App, me: Arc<Broker>, socket: TcpStream) -> Result<()> {
     writer.await?
 }
 
-async fn request(app: &App, me: &Broker, role: &mut Role, buf: Bytes) -> Result<Reply> {
+async fn request(app: &App, me: &Broker, who: &mut crate::auth::Principal, buf: Bytes) -> Result<Reply> {
     let mut r = Rd { b: buf, at: 0 };
     let (key, ver, corr) = (r.i16()?, r.i16()?, r.i32()?);
     r.nstr()?; // client id
@@ -145,7 +145,7 @@ async fn request(app: &App, me: &Broker, role: &mut Role, buf: Bytes) -> Result<
         r.tags()?; // (request header v2)
     }
     let login = matches!(key, API_VERSIONS | SASL_HANDSHAKE | SASL_AUTHENTICATE);
-    ensure!(login || *role >= Role::Read, "not logged in (api {key})"); // (a read token can't produce: see `produce`)
+    ensure!(login || who.role >= Role::Read, "not logged in (api {key})"); // (a read token can't produce: see `produce`)
     let supported = APIS.iter().any(|&(k, lo, hi)| k == key && (lo..=hi).contains(&ver));
     ensure!(supported || key == API_VERSIONS, "unsupported request: api {key} v{ver}");
     let done = |body: Vec<u8>| -> Reply { async move { Some(frame(corr, body)) }.boxed() };
@@ -153,9 +153,9 @@ async fn request(app: &App, me: &Broker, role: &mut Role, buf: Bytes) -> Result<
         API_VERSIONS => done(api_versions(if supported { ver } else { 0 }, supported)),
         METADATA => done(metadata(app, me, ver, &mut r).await?),
         SASL_HANDSHAKE => done(sasl_handshake(&mut r)?),
-        SASL_AUTHENTICATE => done(sasl_authenticate(app, role, ver, &mut r)?),
+        SASL_AUTHENTICATE => done(sasl_authenticate(app, who, ver, &mut r).await?),
         INIT_PRODUCER_ID => done(init_producer_id(&mut r)?),
-        PRODUCE => produce(app, *role >= Role::Write, ver, &mut r).await?.map(move |body| body.map(|b| frame(corr, b))).boxed(),
+        PRODUCE => produce(app, who, ver, &mut r).await?.map(move |body| body.map(|b| frame(corr, b))).boxed(),
         LIST_OFFSETS => done(list_offsets(app, ver, &mut r).await?),
         FIND_COORDINATOR => done(find_coordinator(app, me, ver, &mut r).await?),
         JOIN_GROUP => join_group(app, ver, &mut r).await?.map(move |b| Some(frame(corr, b))).boxed(),
@@ -166,8 +166,8 @@ async fn request(app: &App, me: &Broker, role: &mut Role, buf: Bytes) -> Result<
         OFFSET_FETCH => done(offset_fetch(app, ver, &mut r).await?),
         FETCH => {
             let app = app.clone();
-            let req = FetchReq::read(ver, &mut r)?;
-            async move { Some(frame(corr, fetch(&app, ver, req).await.unwrap_or_else(|e| fetch_error(ver, &e)))) }.boxed()
+            let (req, who) = (FetchReq::read(ver, &mut r)?, who.clone());
+            async move { Some(frame(corr, fetch(&app, ver, req, &who).await.unwrap_or_else(|e| fetch_error(ver, &e)))) }.boxed()
         }
         _ => bail!("api {key}"),
     })
@@ -269,17 +269,22 @@ fn sasl_handshake(r: &mut Rd) -> Result<Vec<u8>> {
     Ok(w)
 }
 
-/// SASL/PLAIN: "\0user\0password". The user name picks the role; the password is its token.
-fn sasl_authenticate(app: &App, role: &mut Role, ver: i16, r: &mut Rd) -> Result<Vec<u8>> {
+/// SASL/PLAIN: "\0user\0password": a user and its password (or one of its tokens), or a role's
+/// name (`reader`, `writer`, `admin`) and its token (`users::sign_in`).
+async fn sasl_authenticate(app: &App, who: &mut crate::auth::Principal, ver: i16, r: &mut Rd) -> Result<Vec<u8>> {
     let auth = r.nbytes()?.unwrap_or_default();
     let parts: Vec<&[u8]> = auth.split(|&b| b == 0).collect();
     let (user, password) = match parts[..] {
         [_, user, password] => (String::from_utf8_lossy(user).to_string(), password),
         _ => (String::new(), &b""[..]),
     };
-    let ok = !app.auth.on() || app.auth.token_for(&user).is_some_and(|t| t.as_bytes() == password);
-    if ok {
-        *role = app.auth.role_of_user(&user);
+    let signed = match app.open().await {
+        true => Some(crate::auth::Principal::of(Role::Admin)),
+        false => crate::users::sign_in(&app.lake, &app.auth, &user, &String::from_utf8_lossy(password)).await,
+    };
+    let ok = signed.is_some();
+    if let Some(p) = signed {
+        *who = p;
     }
     let mut w = vec![];
     w.put_i16(if ok { 0 } else { SASL_FAILED });
@@ -308,7 +313,7 @@ fn init_producer_id(r: &mut Rd) -> Result<Vec<u8>> {
 type Outcome = (i16, i64, Option<String>);
 
 /// Decode every batch now and queue its rows in the log; the response waits for their acks.
-async fn produce(app: &App, allowed: bool, ver: i16, r: &mut Rd) -> Result<BoxFuture<'static, Option<Vec<u8>>>> {
+async fn produce(app: &App, who: &crate::auth::Principal, ver: i16, r: &mut Rd) -> Result<BoxFuture<'static, Option<Vec<u8>>>> {
     r.nstr()?; // transactional id
     let acks = r.i16()?;
     r.i32()?; // timeout
@@ -316,11 +321,12 @@ async fn produce(app: &App, allowed: bool, ver: i16, r: &mut Rd) -> Result<BoxFu
     for _ in 0..r.len()? {
         let name = r.str()?;
         let meta: Option<TableMeta> = app.lake.cat.get::<TableMeta>(&table_key(&name)).await?.map(|m| m.logical()); // (JSON fields by SQL's names: ADR-022)
+        let allowed = who.role >= Role::Write && who.may("insert", &name);
         let mut parts = vec![];
         for _ in 0..r.len()? {
             let (index, records) = (r.i32()?, r.nbytes()?.unwrap_or_default());
             let outcome = match (&meta, index) {
-                _ if !allowed => ready((TOPIC_AUTHORIZATION_FAILED, -1, Some("this token may not write".into()))),
+                _ if !allowed => ready((TOPIC_AUTHORIZATION_FAILED, -1, Some(format!("this {} may not write {name}", if who.access.is_some() { "user" } else { "token" })))),
                 (Some(meta), 0) => queue(app, &name, meta, &records).await,
                 _ => ready((UNKNOWN_TOPIC, -1, None)),
             };
@@ -704,7 +710,7 @@ impl FetchReq {
 
 /// Records from each asked offset on, one batch per log segment. With nothing new yet, it waits
 /// up to the client's max wait for the next commit.
-async fn fetch(app: &App, ver: i16, req: FetchReq) -> Result<Vec<u8>> {
+async fn fetch(app: &App, ver: i16, req: FetchReq, who: &crate::auth::Principal) -> Result<Vec<u8>> {
     let mut hwm = app.lake.hwm.subscribe();
     let deadline = tokio::time::Instant::now() + req.max_wait;
     let answers = loop {
@@ -720,6 +726,7 @@ async fn fetch(app: &App, ver: i16, req: FetchReq) -> Result<Vec<u8>> {
                 // earliest offset it had cached from before those segments expired, in a loop.)
                 let (offset, end) = (offset.max(crate::log::ord(first, 0)), crate::log::ord(visible + 1, 0));
                 let (error, records) = match &meta {
+                    Some(_) if !who.may_read_all(name) => (TOPIC_AUTHORIZATION_FAILED, vec![]),
                     Some(meta) if index == 0 && offset <= end => (0, read(app, name, meta, offset, visible, limit.min(budget)).await?),
                     Some(_) if index == 0 => (OFFSET_OUT_OF_RANGE, vec![]),
                     _ => (UNKNOWN_TOPIC, vec![]),

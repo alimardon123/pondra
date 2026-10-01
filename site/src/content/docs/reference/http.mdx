@@ -25,7 +25,7 @@ read.
 | write | also append rows, insert, put files, and write with `POST /sql` |
 | admin | also create tables, views, tasks and functions, run DDL (`CREATE`, `ALTER`, `DROP`, `COPY … TO`) and `DO` blocks in `POST /sql`, and tier |
 
-A request without enough rights is answered `401` with `this needs a token with more rights`. Any
+A request with no token is answered `401` (`sign in: a token, or a user's name and password`), with a wrong one `401` too, and with a token or user without enough rights `403` (`this needs more rights than this token's or user's`). Any
 other error is `500` with its message as plain text.
 
 ```bash norun
@@ -289,6 +289,8 @@ token is refused.
 | Method and path | Role | Meaning |
 |---|---|---|
 | `GET /stats` | none | health and position, as JSON |
+| `POST /login` | none | `{"user", "password"}`: a session for the user, `{"token": "ps_…", "until": ms}`, to send as `Authorization: Bearer …` until it ends (`PONDRA_SESSION_HOURS`) |
+| `GET /whoami` | none | who the request signs in as: `{"user", "role", "superuser", "open"}` |
 | `GET /objects` | read | each table and view of this lake and the lakes attached to it: `catalog`, `schema`, `name`, `kind` (`table`, `view`, `materialized view`, or `files` for [a view of files](/pondra/reference/sql/)), and for a table its `rows` and `bytes` in files, `files`, `key`, `partition`, `cluster`, `publish`, `not_null`, `defaults`; for a view its `sql`. Also `files`: where the lake's own files are, for `read_csv('…')`. What the console's catalog shows |
 | `GET /metrics` | read | Prometheus metrics, as text |
 | `POST /tier` | admin | write the log into Parquet now: `{"rows_tiered": N}` |

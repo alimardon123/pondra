@@ -1,6 +1,7 @@
 """The client: a node over HTTP (`connect`), or one started here (`local`). Queries become frames
 (`frame.py`); writes, scripts and procedures run at once."""
 import atexit
+import base64
 import importlib.util
 import inspect
 import io
@@ -95,9 +96,11 @@ class Result:
 
 
 class Pondra:
-    def __init__(self, url="http://127.0.0.1:8080", token=None, producer=None, timeout=300, headers=None, job=None, echo=True):
+    def __init__(self, url="http://127.0.0.1:8080", token=None, producer=None, timeout=300, headers=None, job=None, echo=True, user=None, password=None):
         global _last
         self.url, self.token, self.timeout = url.rstrip("/"), token, timeout
+        # (a user signs in with its name and password, or its token as the password: HTTP Basic)
+        self._basic = "Basic " + base64.b64encode(f"{user}:{password}".encode()).decode() if user else None
         self.notices, self.echo = [], echo  # what the last statement's procedures printed; printed here too, unless echo=False
         self.producer = producer or f"py-{uuid.uuid4().hex[:12]}"  # exactly-once: one name, increasing seq
         self.seq = 0
@@ -112,6 +115,8 @@ class Pondra:
         h = {"x-pondra-session": self.session, **self._headers, **(headers or {})}
         if self.token:
             h["Authorization"] = f"Bearer {self.token}"
+        elif self._basic:
+            h["Authorization"] = self._basic
         if getattr(self, "owner", None):
             h["x-pondra-owner"] = self.owner  # (the node `local()` started: its SQL may read files here)
         req = urllib.request.Request(self.url + path, data=body if method == "POST" else None, headers=h, method=method)
@@ -627,6 +632,8 @@ def _module_of(f, lambda_name="udf"):
 
 
 def connect(url="http://127.0.0.1:8080", token=None, **kw):
+    """A connection to a node: with a token (`token=`), or as a user (`user=`, `password=`: its
+    password, or one of its tokens)."""
     return Pondra(url, token, **kw)
 
 

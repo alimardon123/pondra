@@ -187,7 +187,9 @@ export const register = {
 };
 /** How the page reaches the node: `fetch`, the token, extra headers (an enterprise build's gateway
  * and sign-in replace them). */
-export const T = { fetch: (url, init) => fetch(url, init), token: () => store.get('pondra.token'), headers: () => ({}) };
+// (the shell's console link carries its key (#key=…): this page then works as the shell does)
+export const T = { fetch: (url, init) => fetch(url, init), token: () => store.get('pondra.token'), headers: () => (OWNER ? { 'x-pondra-owner': OWNER } : {}) };
+const OWNER = (() => { try { const k = new URLSearchParams(location.hash.slice(1)).get('key'); if (k) { sessionStorage.setItem('pondra.owner', k); history.replaceState(null, '', location.pathname + location.search); } return sessionStorage.getItem('pondra.owner'); } catch { return null; } })();
 export function configure(o) { Object.assign(T, o); }
 
 // ------------------------------------------------------------------ the page's state

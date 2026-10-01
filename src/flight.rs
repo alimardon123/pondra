@@ -45,14 +45,25 @@ pub async fn serve(app: App, addr: String) -> anyhow::Result<()> {
 
 fn status(e: impl Into<anyhow::Error>) -> Status { Status::internal(crate::ext::said(&e.into())) }
 
-/// The caller's role, from its bearer token; refused below `need`.
-fn allowed<T>(app: &App, req: &Request<T>, need: Role) -> Result<Role, Status> {
-    let token = req.metadata().get("authorization").and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer "));
-    let role = app.auth.role(token);
-    if role < need {
-        return Err(Status::unauthenticated("this needs a token with more rights"));
+/// The caller's role (who it is: `Door` works it out); refused below `need`.
+fn allowed<T>(_: &App, _: &Request<T>, need: Role) -> Result<Role, Status> {
+    let role = crate::auth::current().map_or(Role::None, |p| p.role);
+    match role {
+        _ if role >= need => Ok(role),
+        Role::None => Err(Status::unauthenticated("sign in: a token, or a user's name and password (handshake)")),
+        _ => Err(Status::permission_denied("this needs more rights than this token's or user's")),
     }
-    Ok(role)
+}
+
+/// Who a call is: its `authorization` (a token, a user's token or session: `users::who`); or, with
+/// nothing that needs a sign-in, an admin.
+async fn caller<T>(app: &App, req: &Request<T>) -> crate::auth::Principal {
+    let header = req.metadata().get("authorization").and_then(|v| v.to_str().ok());
+    match crate::users::who(&app.lake, &app.auth, header).await {
+        Some(p) => p,
+        None if app.open().await => crate::auth::Principal::of(Role::Admin),
+        None => crate::auth::Principal::of(Role::None),
+    }
 }
 
 /// Batches as a Flight stream (the schema first, so an empty result still has columns).
@@ -256,11 +267,18 @@ impl FlightSqlService for Sql {
         let basic = req.metadata().get("authorization").and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Basic "));
         // (padding optional: ADBC's driver sends none)
         let lenient = base64::engine::GeneralPurpose::new(&base64::alphabet::STANDARD, base64::engine::GeneralPurposeConfig::new().with_decode_padding_mode(base64::engine::DecodePaddingMode::Indifferent));
-        let token = basic.and_then(|b| lenient.decode(b).ok()).and_then(|b| String::from_utf8(b).ok()).and_then(|up| up.split_once(':').map(|(_, p)| p.to_string()));
-        if self.0.auth.role(token.as_deref()) == Role::None {
-            return Err(Status::unauthenticated("wrong token"));
-        }
-        let token = token.unwrap_or_default();
+        let (user, password) = basic.and_then(|b| lenient.decode(b).ok()).and_then(|b| String::from_utf8(b).ok()).and_then(|up| up.split_once(':').map(|(u, p)| (u.to_string(), p.to_string()))).unwrap_or_default();
+        // (a token as the password, whatever the name, as before; or a user's name and password, or
+        // token: a session for it)
+        let open = self.0.open().await;
+        let token = match self.0.auth.token_role(&password) {
+            _ if open => password,
+            Role::None => match crate::users::sign_in(&self.0.lake, &self.0.auth, &user, &password).await {
+                Some(p) if p.role > Role::None => crate::users::session(&self.0.lake, &p.name).await.map_err(status)?.0,
+                _ => return Err(Status::unauthenticated("wrong user name or password")),
+            },
+            _ => password,
+        };
         let mut res: Response<Out<HandshakeResponse>> = Response::new(Box::pin(futures::stream::iter([Ok(HandshakeResponse { protocol_version: 0, payload: token.clone().into_bytes().into() })])));
         if let Ok(v) = format!("Bearer {token}").parse() {
             res.metadata_mut().insert("authorization", v);
@@ -306,6 +324,7 @@ impl FlightSqlService for Sql {
         };
         let mut batches = arrow_flight::decode::FlightRecordBatchStream::new_from_flight_data(req.into_inner().map_err(Into::into)).map_err(Status::from).peekable();
         let mut exists = self.0.lake.cat.get::<TableMeta>(&table_key(&table)).await.map_err(status)?.is_some();
+        crate::auth::check("insert", &crate::auth::catalog_name(&table)).map_err(|e| Status::permission_denied(e.to_string()))?;
         // ADBC's modes: create (fail if there), append (fail if not), replace, create_append.
         use arrow_flight::sql::{TableExistsOption as IfThere, TableNotExistOption as IfNot};
         let options = cmd.table_definition_options.unwrap_or_default();
@@ -443,59 +462,89 @@ impl FlightService for Door {
     async fn handshake(&self, req: Request<Streaming<HandshakeRequest>>) -> Result<Response<Self::HandshakeStream>, Status> { self.0.handshake(req).await }
 
     async fn list_flights(&self, req: Request<Criteria>) -> Result<Response<Self::ListFlightsStream>, Status> {
-        let app = &self.0 .0;
-        allowed(app, &req, Role::Read)?;
-        let mut infos = vec![];
-        for (key, meta) in app.lake.cat.scan::<TableMeta>("t/", "t0").await.map_err(status)?.into_iter().filter(|(k, _)| !crate::sys::hidden(k)) {
-            let table = &key[2..];
-            let ticket = serde_json::json!({"sql": format!("SELECT * FROM {}", crate::write::sql_name(table))}).to_string();
-            let schema = crate::query::schema(&meta.logical().columns).map_err(status)?;
-            infos.push(Ok(FlightInfo::new().try_with_schema(&schema).map_err(status)?.with_endpoint(FlightEndpoint::new().with_ticket(Ticket::new(ticket))).with_descriptor(FlightDescriptor::new_path(vec![table.to_string()]))));
-        }
-        Ok(Response::new(Box::pin(futures::stream::iter(infos))))
+        let who = caller(&self.0 .0, &req).await;
+        crate::auth::WHO.scope(who, async move {
+            let app = &self.0 .0;
+            allowed(app, &req, Role::Read)?;
+            let mut infos = vec![];
+            for (key, meta) in app.lake.cat.scan::<TableMeta>("t/", "t0").await.map_err(status)?.into_iter().filter(|(k, _)| !crate::sys::hidden(k) && crate::auth::check("select", &k[2..]).is_ok()) {
+                let table = &key[2..];
+                let ticket = serde_json::json!({"sql": format!("SELECT * FROM {}", crate::write::sql_name(table))}).to_string();
+                let schema = crate::query::schema(&meta.logical().columns).map_err(status)?;
+                infos.push(Ok(FlightInfo::new().try_with_schema(&schema).map_err(status)?.with_endpoint(FlightEndpoint::new().with_ticket(Ticket::new(ticket))).with_descriptor(FlightDescriptor::new_path(vec![table.to_string()]))));
+            }
+            Ok(Response::new(Box::pin(futures::stream::iter(infos)) as Self::ListFlightsStream))
+        }).await
     }
 
     async fn get_flight_info(&self, req: Request<FlightDescriptor>) -> Result<Response<FlightInfo>, Status> {
-        let Some(json) = Json::parse(&req.get_ref().cmd) else { return self.0.get_flight_info(req).await };
-        let app = &self.0 .0;
-        allowed(app, &req, Role::Read)?;
-        let schema = match (&json.sql, &json.table) {
-            (Some(sql), _) => plan_schema(app, sql).await.map_err(|e| Status::invalid_argument(format!("{e:#}")))?,
-            (None, Some(table)) => {
-                let meta: TableMeta = app.lake.cat.get(&table_key(table)).await.map_err(status)?.ok_or_else(|| Status::not_found(format!("no table {table}")))?;
-                let full = crate::query::schema(&meta.logical().columns).map_err(status)?;
-                let pick = json.columns.iter().flatten().filter_map(|c| full.index_of(c).ok()).collect::<Vec<_>>();
-                if json.columns.is_some() { full.project(&pick).map_err(status)? } else { full.as_ref().clone() }
-            }
-            _ => return Err(Status::invalid_argument("{\"sql\": …} or {\"table\": …}")),
-        };
-        let cmd = req.get_ref().cmd.to_vec();
-        info(&schema, cmd, req.into_inner())
+        let who = caller(&self.0 .0, &req).await;
+        crate::auth::WHO.scope(who, async move {
+            let Some(json) = Json::parse(&req.get_ref().cmd) else { return self.0.get_flight_info(req).await };
+            let app = &self.0 .0;
+            allowed(app, &req, Role::Read)?;
+            let schema = match (&json.sql, &json.table) {
+                (Some(sql), _) => plan_schema(app, sql).await.map_err(|e| Status::invalid_argument(format!("{e:#}")))?,
+                (None, Some(table)) => {
+                    let meta: TableMeta = app.lake.cat.get(&table_key(table)).await.map_err(status)?.ok_or_else(|| Status::not_found(format!("no table {table}")))?;
+                    let full = crate::query::schema(&meta.logical().columns).map_err(status)?;
+                    let pick = json.columns.iter().flatten().filter_map(|c| full.index_of(c).ok()).collect::<Vec<_>>();
+                    if json.columns.is_some() { full.project(&pick).map_err(status)? } else { full.as_ref().clone() }
+                }
+                _ => return Err(Status::invalid_argument("{\"sql\": …} or {\"table\": …}")),
+            };
+            let cmd = req.get_ref().cmd.to_vec();
+            info(&schema, cmd, req.into_inner())
+        }).await
     }
 
-    async fn poll_flight_info(&self, req: Request<FlightDescriptor>) -> Result<Response<PollInfo>, Status> { self.0.poll_flight_info(req).await }
+    async fn poll_flight_info(&self, req: Request<FlightDescriptor>) -> Result<Response<PollInfo>, Status> {
+        let who = caller(&self.0 .0, &req).await;
+        crate::auth::WHO.scope(who, async move { self.0.poll_flight_info(req).await }).await
+    }
 
-    async fn get_schema(&self, req: Request<FlightDescriptor>) -> Result<Response<SchemaResult>, Status> { self.0.get_schema(req).await }
+    async fn get_schema(&self, req: Request<FlightDescriptor>) -> Result<Response<SchemaResult>, Status> {
+        let who = caller(&self.0 .0, &req).await;
+        crate::auth::WHO.scope(who, async move { self.0.get_schema(req).await }).await
+    }
 
     async fn do_get(&self, req: Request<Ticket>) -> Result<Response<Self::DoGetStream>, Status> {
-        let Some(json) = Json::parse(&req.get_ref().ticket) else { return self.0.do_get(req).await };
-        let app = &self.0 .0;
-        allowed(app, &req, Role::Read)?;
-        match (json.sql, json.table) {
-            (Some(sql), _) => {
-                let (schema, batches) = query(app, &sql).await.map_err(status)?;
-                Ok(Response::new(send(schema, batches)))
+        let who = caller(&self.0 .0, &req).await;
+        crate::auth::WHO.scope(who, async move {
+            let Some(json) = Json::parse(&req.get_ref().ticket) else { return self.0.do_get(req).await };
+            let app = &self.0 .0;
+            allowed(app, &req, Role::Read)?;
+            match (json.sql, json.table) {
+                (Some(sql), _) => {
+                    let (schema, batches) = query(app, &sql).await.map_err(status)?;
+                    Ok(Response::new(send(schema, batches)))
+                }
+                (None, Some(table)) => {
+                    crate::auth::check("select", &crate::auth::catalog_name(&table)).map_err(|e| Status::permission_denied(e.to_string()))?;
+                    Ok(Response::new(log_stream(app.clone(), table, json.after, json.columns, json.follow).await?))
+                }
+                _ => Err(Status::invalid_argument("{\"sql\": …} or {\"table\": …}")),
             }
-            (None, Some(table)) => Ok(Response::new(log_stream(app.clone(), table, json.after, json.columns, json.follow).await?)),
-            _ => Err(Status::invalid_argument("{\"sql\": …} or {\"table\": …}")),
-        }
+        }).await
     }
 
-    async fn do_put(&self, req: Request<Streaming<FlightData>>) -> Result<Response<Self::DoPutStream>, Status> { self.0.do_put(req).await }
+    async fn do_put(&self, req: Request<Streaming<FlightData>>) -> Result<Response<Self::DoPutStream>, Status> {
+        let who = caller(&self.0 .0, &req).await;
+        crate::auth::WHO.scope(who, async move { self.0.do_put(req).await }).await
+    }
 
-    async fn do_action(&self, req: Request<Action>) -> Result<Response<Self::DoActionStream>, Status> { self.0.do_action(req).await }
+    async fn do_action(&self, req: Request<Action>) -> Result<Response<Self::DoActionStream>, Status> {
+        let who = caller(&self.0 .0, &req).await;
+        crate::auth::WHO.scope(who, async move { self.0.do_action(req).await }).await
+    }
 
-    async fn list_actions(&self, req: Request<Empty>) -> Result<Response<Self::ListActionsStream>, Status> { self.0.list_actions(req).await }
+    async fn list_actions(&self, req: Request<Empty>) -> Result<Response<Self::ListActionsStream>, Status> {
+        let who = caller(&self.0 .0, &req).await;
+        crate::auth::WHO.scope(who, async move { self.0.list_actions(req).await }).await
+    }
 
-    async fn do_exchange(&self, req: Request<Streaming<FlightData>>) -> Result<Response<Self::DoExchangeStream>, Status> { self.0.do_exchange(req).await }
+    async fn do_exchange(&self, req: Request<Streaming<FlightData>>) -> Result<Response<Self::DoExchangeStream>, Status> {
+        let who = caller(&self.0 .0, &req).await;
+        crate::auth::WHO.scope(who, async move { self.0.do_exchange(req).await }).await
+    }
 }

@@ -970,12 +970,19 @@ pub async fn rest_token(lake: &Lake, url: &str) -> Result<Option<String>> {
 
 // ---------------------------------------------------------------- secrets
 
-/// A secret as the catalog keeps it: its type and scope in the clear, its values sealed.
+/// A secret as the catalog keeps it: its type and scope in the clear, its values sealed with a key
+/// of its own (`key`), which the lake's master key wraps (envelope encryption, ADR-035 §3): the
+/// master key is never in the lake, and changing it rewraps the keys, never the values. (A secret
+/// sealed before round 29 has no key of its own: the master key sealed it.)
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Secret {
     pub kind: String,
     pub scope: Option<String>,
     pub sealed: String, // base64 (nonce, AES-256-GCM ciphertext) of its values, as JSON
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>, // its data key, wrapped by the master key (`wrap`)
+    #[serde(skip)]
+    pub temporary: bool, // (CREATE TEMPORARY SECRET: the session's, in memory: `temp.rs`)
 }
 
 fn secret_key(name: &str) -> String { format!("e/{name}") }
@@ -1023,9 +1030,7 @@ pub fn statement(sql: &str) -> Option<crate::write::Stmt> {
         return None;
     }
     let replace = p.parse_keywords(&[Keyword::OR, Keyword::REPLACE]);
-    if p.parse_keyword(Keyword::TEMPORARY) {
-        return p.parse_keyword(Keyword::SECRET).then(|| crate::write::Stmt::Invalid("CREATE TEMPORARY SECRET: secrets are kept in the lake (CREATE SECRET)".into()));
-    }
+    let temporary = p.parse_one_of_keywords(&[Keyword::TEMPORARY, Keyword::TEMP]).is_some(); // (the session's, in memory: `temp.rs`)
     let _ = p.parse_keyword(Keyword::PERSISTENT);
     if !p.parse_keyword(Keyword::SECRET) {
         return None;
@@ -1051,6 +1056,9 @@ pub fn statement(sql: &str) -> Option<crate::write::Stmt> {
         if !p.consume_token(&Token::Comma) {
             return invalid(usage.into());
         }
+    }
+    if temporary {
+        return Some(crate::write::Stmt::TempSecret(name.value.to_lowercase(), params, replace));
     }
     Some(crate::write::Stmt::Ddl(vec![Ddl::CreateSecret { name: name.value.to_lowercase(), params, replace, if_not_exists }]))
 }
@@ -1177,7 +1185,8 @@ fn copy_statement(p: &mut datafusion::sql::sqlparser::parser::Parser) -> Option<
 
 /// Leader: keep a secret, sealed. Its scope's bucket may have no other secret's scope in it:
 /// a bucket is read with one secret.
-pub async fn create(lake: &Lake, name: &str, mut params: BTreeMap<String, String>, replace: bool, if_not_exists: bool) -> Result<serde_json::Value> {
+/// A secret's type, scope and values, checked, and sealed (`made`).
+fn made(name: &str, mut params: BTreeMap<String, String>) -> Result<Secret> {
     crate::ddl::check(name)?;
     let t = params.remove("type").context("which TYPE? (s3, r2, gcs, azure, http or generic)")?.to_lowercase();
     let (known, schemes) = kind(&t)?;
@@ -1188,6 +1197,17 @@ pub async fn create(lake: &Lake, name: &str, mut params: BTreeMap<String, String
     if let Some(s) = &scope {
         ensure!(scheme(s).is_some_and(|x| schemes.contains(&x)), "a {t} secret's SCOPE is a URL of {}", schemes.iter().map(|s| format!("{s}://")).collect::<Vec<_>>().join(" or "));
     }
+    let (sealed, key) = seal_new(&serde_json::to_vec(&params)?)?;
+    Ok(Secret { kind: t, scope, sealed, key: Some(key), temporary: false })
+}
+
+/// `CREATE TEMPORARY SECRET`: a session's own, in this node's memory only (`temp.rs`), used by its
+/// queries before the lake's of the same scope, never written anywhere.
+pub fn temporary(name: &str, params: BTreeMap<String, String>) -> Result<Secret> { Ok(Secret { temporary: true, ..made(name, params)? }) }
+
+pub async fn create(lake: &Lake, name: &str, params: BTreeMap<String, String>, replace: bool, if_not_exists: bool) -> Result<serde_json::Value> {
+    let secret = made(name, params)?;
+    let scope = secret.scope.clone();
     if lake.cat.get::<Secret>(&secret_key(name)).await?.is_some() {
         ensure!(replace || if_not_exists, "secret {name} already exists (CREATE OR REPLACE SECRET)");
         if !replace {
@@ -1201,7 +1221,6 @@ pub async fn create(lake: &Lake, name: &str, mut params: BTreeMap<String, String
             ensure!(other == name || !same, "{b} already has secret {other} for {}: a bucket is read with one secret (one SCOPE in it)", s.scope.unwrap_or_default());
         }
     }
-    let secret = Secret { kind: t, scope, sealed: seal(&serde_json::to_vec(&params)?)? };
     lake.cat.commit(vec![(secret_key(name), json(&secret))], &[]).await?;
     Ok(serde_json::json!({"secret": name}))
 }
@@ -1215,15 +1234,26 @@ pub async fn drop(lake: &Lake, name: &str, if_exists: bool) -> Result<serde_json
     Ok(serde_json::json!({"secret": name, "dropped": true}))
 }
 
+/// The lake's secrets, and the session's temporary ones (which win, by name).
 pub async fn list(lake: &Lake) -> Result<Vec<(String, Secret)>> {
-    Ok(lake.cat.scan::<Secret>("e/", "e0").await?.into_iter().map(|(k, s)| (k[2..].to_string(), s)).collect())
+    let mut all: Vec<(String, Secret)> = crate::temp::secrets();
+    for (k, s) in lake.cat.scan::<Secret>("e/", "e0").await? {
+        if !all.iter().any(|(n, _)| *n == k[2..]) {
+            all.push((k[2..].to_string(), s));
+        }
+    }
+    Ok(all)
 }
+
+/// May the request being served use this secret? Its own temporary one, or one a user is granted
+/// USAGE on (`GRANT USAGE ON SECRET`); a token's or a superuser's, any.
+fn usable(name: &str, s: &Secret) -> bool { s.temporary || crate::auth::limited().is_none_or(|a| a.secret(name)) }
 
 /// The secret for a URL: the longest scope that is a prefix of it (no scope: every URL of its
 /// type's schemes).
 pub(crate) fn covering(secrets: &[(String, Secret)], url: &str) -> Option<(String, Secret)> {
     let s = scheme(url)?;
-    secrets.iter().filter(|(_, x)| kind(&x.kind).is_ok_and(|(_, schemes)| schemes.contains(&s)))
+    secrets.iter().filter(|(n, x)| usable(n, x) && kind(&x.kind).is_ok_and(|(_, schemes)| schemes.contains(&s)))
         .filter(|(_, x)| x.scope.as_deref().is_none_or(|p| url.starts_with(p)))
         .max_by_key(|(_, x)| x.scope.as_ref().map_or(0, |p| p.len() + 1)).cloned()
 }
@@ -1232,39 +1262,132 @@ pub(crate) fn covering(secrets: &[(String, Secret)], url: &str) -> Option<(Strin
 /// `type` and `scope`.
 pub async fn reveal(lake: &Lake, name: &str) -> Result<BTreeMap<String, String>> {
     let (name, s) = list(lake).await?.into_iter().find(|(n, _)| n == name).with_context(|| format!("no secret {name} (CREATE SECRET {name} (TYPE generic, …))"))?;
+    ensure!(usable(&name, &s), "permission denied: USAGE on secret {name} (GRANT USAGE ON SECRET {name} TO …)");
     let mut values = open(&name, &s)?;
     values.entry("type".into()).or_insert(s.kind.clone());
     Ok(values)
 }
 
-/// A secret's values, opened with the nodes' key.
+/// A secret's values: its data key unwrapped by the master key, then its values opened with it.
 fn open(name: &str, s: &Secret) -> Result<BTreeMap<String, String>> {
-    let sealed = B64.decode(&s.sealed)?;
-    ensure!(sealed.len() > 12, "secret {name} is damaged");
-    let (nonce, data) = sealed.split_at(12);
-    let mut data = data.to_vec();
-    let plain = cipher()?.open_in_place(Nonce::try_assume_unique_for_key(nonce).map_err(|_| anyhow!("nonce"))?, Aad::empty(), &mut data)
-        .map_err(|_| anyhow!("secret {name} was sealed with another key: every node needs the same PONDRA_SECRET_KEY"))?;
-    Ok(serde_json::from_slice(plain)?)
+    let damaged = || anyhow!("secret {name} was sealed with another master key: every node needs the same PONDRA_SECRET_KEY (or PONDRA_KMS_COMMAND)");
+    let key = match &s.key {
+        Some(wrapped) => unwrap_key(wrapped).map_err(|e| anyhow!("{}: {e:#}", damaged()))?,
+        None => master()?.to_vec(), // (sealed before round 29: by the master key itself)
+    };
+    let plain = open_with(&key, &s.sealed).ok_or_else(damaged)?;
+    Ok(serde_json::from_slice(&plain)?)
 }
 
-fn seal(plain: &[u8]) -> Result<String> {
+/// `plain` sealed with a new data key: (the sealed values, the data key wrapped by the master key).
+fn seal_new(plain: &[u8]) -> Result<(String, String)> {
+    let mut key = [0u8; 32];
+    aws_lc_rs::rand::fill(&mut key).map_err(|_| anyhow!("no randomness"))?;
+    Ok((seal_with(&key, plain)?, wrap_key(&key)?))
+}
+
+fn seal_with(key: &[u8], plain: &[u8]) -> Result<String> {
     let mut nonce = [0u8; 12];
     aws_lc_rs::rand::fill(&mut nonce).map_err(|_| anyhow!("no randomness"))?;
     let mut data = plain.to_vec();
-    cipher()?.seal_in_place_append_tag(Nonce::assume_unique_for_key(nonce), Aad::empty(), &mut data).map_err(|_| anyhow!("sealing failed"))?;
+    LessSafeKey::new(UnboundKey::new(&AES_256_GCM, key).map_err(|_| anyhow!("key"))?).seal_in_place_append_tag(Nonce::assume_unique_for_key(nonce), Aad::empty(), &mut data).map_err(|_| anyhow!("sealing failed"))?;
     Ok(B64.encode([nonce.as_slice(), &data].concat()))
 }
 
-/// The key secrets are sealed with: `PONDRA_SECRET_KEY` (the same on every node of a cluster), or
-/// one made for this machine (`~/.pondra/secret.key`), enough for nodes that share it.
-fn cipher() -> Result<LessSafeKey> {
+fn open_with(key: &[u8], sealed: &str) -> Option<Vec<u8>> {
+    let sealed = B64.decode(sealed).ok()?;
+    (sealed.len() > 12).then_some(())?;
+    let (nonce, data) = sealed.split_at(12);
+    let mut data = data.to_vec();
+    let key = LessSafeKey::new(UnboundKey::new(&AES_256_GCM, key).ok()?);
+    key.open_in_place(Nonce::try_assume_unique_for_key(nonce).ok()?, Aad::empty(), &mut data).ok().map(|p| p.to_vec())
+}
+
+/// Data keys unwrapped so far (by their wrapped form): a query using a secret again doesn't ask the
+/// key service again.
+static UNWRAPPED: std::sync::LazyLock<std::sync::Mutex<HashMap<String, Vec<u8>>>> = std::sync::LazyLock::new(Default::default);
+
+/// A data key wrapped by the master key: by `PONDRA_KMS_COMMAND wrap` (a key service: its key never
+/// leaves it), or sealed with the local master key (`PONDRA_SECRET_KEY`, else this machine's).
+fn wrap_key(key: &[u8]) -> Result<String> {
+    match kms() {
+        Some(cmd) => Ok(format!("kms:{}", kms_run(&cmd, "wrap", &B64.encode(key))?)),
+        None => seal_with(&master()?, key),
+    }
+}
+
+/// A data key, unwrapped: by the key service for `kms:…`; else by the master key, or the previous
+/// one (`PONDRA_SECRET_KEY_PREVIOUS`) while keys move to a new one (`rewrap`).
+fn unwrap_key(wrapped: &str) -> Result<Vec<u8>> {
+    if let Some(k) = UNWRAPPED.lock().unwrap().get(wrapped) {
+        return Ok(k.clone());
+    }
+    let key = match wrapped.strip_prefix("kms:") {
+        Some(w) => B64.decode(kms_run(&kms().context("this secret's key was wrapped by a key service: set PONDRA_KMS_COMMAND")?, "unwrap", w)?)?,
+        None => match open_with(&master()?, wrapped) {
+            Some(k) => k,
+            None => previous().and_then(|p| open_with(&p, wrapped)).context("its key was wrapped by another master key")?,
+        },
+    };
+    UNWRAPPED.lock().unwrap().insert(wrapped.to_string(), key.clone());
+    Ok(key)
+}
+
+fn kms() -> Option<String> { std::env::var("PONDRA_KMS_COMMAND").ok().filter(|c| !c.trim().is_empty()) }
+
+/// Run the key service's command (`<command> wrap|unwrap`, the input on stdin, the answer on stdout):
+/// `aws kms`, `gcloud kms`, `az keyvault key`, `vault write transit/…`, through a short script.
+fn kms_run(cmd: &str, what: &str, input: &str) -> Result<String> {
+    use std::io::Write;
+    let shell = if cfg!(windows) { ("cmd", "/C") } else { ("sh", "-c") };
+    let mut child = std::process::Command::new(shell.0).args([shell.1, &format!("{cmd} {what}")]).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().context("PONDRA_KMS_COMMAND")?;
+    child.stdin.take().context("stdin")?.write_all(input.as_bytes())?;
+    let out = child.wait_with_output()?;
+    ensure!(out.status.success(), "PONDRA_KMS_COMMAND {what}: {}", String::from_utf8_lossy(&out.stderr).trim());
+    Ok(String::from_utf8(out.stdout)?.trim().to_string())
+}
+
+/// Leader: every secret's data key wrapped by the master key in use now (after it changed: the
+/// previous one still set), its values untouched. How many were.
+pub async fn rewrap(lake: &Lake) -> Result<usize> {
+    let mut puts = vec![];
+    for (k, mut s) in lake.cat.scan::<Secret>("e/", "e0").await? {
+        let current = match &s.key {
+            Some(w) if w.starts_with("kms:") == kms().is_some() && (w.starts_with("kms:") || open_with(&master()?, w).is_some()) => continue,
+            Some(w) => unwrap_key(w)?,
+            None => master()?.to_vec(),
+        };
+        if s.key.is_none() {
+            // (sealed by the master key itself, before round 29: sealed again, with a key of its own)
+            let plain = open_with(&current, &s.sealed).with_context(|| format!("secret {}", &k[2..]))?;
+            (s.sealed, s.key) = { let (a, b) = seal_new(&plain)?; (a, Some(b)) };
+        } else {
+            s.key = Some(wrap_key(&current)?);
+        }
+        puts.push((k, json(&s)));
+    }
+    let n = puts.len();
+    if n > 0 {
+        lake.cat.commit(puts, &[]).await?;
+    }
+    Ok(n)
+}
+
+/// The master key, when no key service is set: `PONDRA_SECRET_KEY` (the same on every node of a
+/// cluster), or one made for this machine (`~/.pondra/secret.key`), enough for nodes that share it.
+fn master() -> Result<[u8; 32]> {
     let key = match std::env::var("PONDRA_SECRET_KEY") {
         Ok(k) if !k.is_empty() => k,
         _ => machine_key()?,
     };
-    let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, key.as_bytes());
-    Ok(LessSafeKey::new(UnboundKey::new(&AES_256_GCM, digest.as_ref()).map_err(|_| anyhow!("key"))?))
+    Ok(aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, key.as_bytes()).as_ref().try_into().expect("32 bytes"))
+}
+
+/// The master key before it changed (`PONDRA_SECRET_KEY_PREVIOUS`): keys it wrapped still open, and
+/// the leader rewraps them with the new one when it starts (`rewrap`).
+fn previous() -> Option<[u8; 32]> {
+    let k = std::env::var("PONDRA_SECRET_KEY_PREVIOUS").ok().filter(|k| !k.is_empty())?;
+    aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, k.as_bytes()).as_ref().try_into().ok()
 }
 
 fn machine_key() -> Result<String> {

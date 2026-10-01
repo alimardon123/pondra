@@ -636,23 +636,30 @@ const palette = async () => (await more()).palette();
 function signin() {
   const token = T.token();
   if (!token) return askToken('The token this node was started with (--admin-token, --write-token or --read-token)');
-  menu($('#signin'), [{ label: 'Change the token…', icon: 'key', run: () => askToken('The token this node was started with') }, { label: 'Sign out (forget the token)', icon: 'close', run: () => { store.set('pondra.token', null); drawSignin(); refresh(); } }]);
+  menu($('#signin'), [{ label: 'Sign in as someone else…', icon: 'key', run: () => askToken('A token this node takes') }, { label: 'Sign out', icon: 'close', run: () => { store.set('pondra.token', null); store.set('pondra.user', null); drawSignin(); refresh(); } }]);
 }
-function drawSignin() { const b = $('#signin'), on = !!T.token(); b.replaceChildren(icon(on ? 'key' : 'user'), on ? 'Signed in' : 'Sign in'); b.classList.toggle('on', on); }
+function drawSignin() { const b = $('#signin'), on = !!T.token(), who = store.get('pondra.user'); b.replaceChildren(icon(on ? 'key' : 'user'), on ? who || 'Signed in' : 'Sign in'); b.classList.toggle('on', on); }
 function askToken(why) {
   const d = $('#tokenDlg');
   if (d.open) return;
-  $('#tokenWhy').textContent = `${why}. The token is kept in this browser only.`;
-  $('#tokenIn').value = store.get('pondra.token') || '';
+  $('#tokenWhy').textContent = `${why}; or a user's name and password. It is kept in this browser only.`;
+  $('#tokenIn').value = store.get('pondra.user') ? '' : store.get('pondra.token') || '';
+  $('#userIn').value = store.get('pondra.user') || '';
   d.returnValue = '';
   d.showModal();
 }
 ask.token = askToken;
-$('#tokenDlg').addEventListener('close', () => {
-  const v = $('#tokenDlg').returnValue;
-  if (v === 'ok' && $('#tokenIn').value.trim()) store.set('pondra.token', $('#tokenIn').value.trim());
-  else if (v === 'clear') store.set('pondra.token', null);
-  else return;
+$('#tokenDlg').addEventListener('close', async () => {
+  const v = $('#tokenDlg').returnValue, user = $('#userIn').value.trim(), secret = $('#tokenIn').value.trim();
+  if (v === 'clear') { store.set('pondra.token', null); store.set('pondra.user', null); }
+  else if (v !== 'ok' || !secret) return;
+  else if (!user) { store.set('pondra.token', secret); store.set('pondra.user', null); }
+  else {
+    // (a user: a session for it, which the node signs: `POST /login`)
+    const r = await fetch(new URL('login', location.href), { method: 'POST', body: JSON.stringify({ user, password: secret }) });
+    if (!r.ok) { toast(await r.text(), true); return askToken('Sign in again'); }
+    store.set('pondra.token', (await r.json()).token); store.set('pondra.user', user);
+  }
   drawSignin(); refresh();
 });
 function drawActions() {

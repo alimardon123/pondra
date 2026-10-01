@@ -5,8 +5,9 @@
 //! bound as literals. `COPY … TO STDOUT` sends a table or a query in text, CSV or binary (what the
 //! ADBC Postgres driver reads results with), `COPY … FROM STDIN` loads text or CSV (psql's
 //! `\copy`, psycopg's `cursor.copy`).
-//! With tokens set, the user name picks the role (`reader`, `writer`, `admin`) and the password
-//! is that role's token.
+//! With tokens set or users made (`users.rs`), a client signs in with SCRAM-SHA-256, as Postgres's
+//! own: a user with its password (or one of its tokens), or `reader`, `writer`, `admin` with that
+//! role's token. Each statement runs as whoever signed in (`auth::WHO`).
 use crate::query::read_only;
 use crate::server::App;
 use async_trait::async_trait;
@@ -15,9 +16,7 @@ use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::{DataType, Date32Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Schema, TimeUnit, TimestampMicrosecondType};
 use datafusion::arrow::record_batch::RecordBatch;
 use futures::{stream, Sink, SinkExt};
-use pgwire::api::auth::cleartext::CleartextPasswordAuthStartupHandler;
-use pgwire::api::auth::noop::NoopStartupHandler;
-use pgwire::api::auth::{AuthSource, DefaultServerParameterProvider, LoginInfo, Password, StartupHandler};
+use pgwire::api::auth::{DefaultServerParameterProvider, StartupHandler};
 use pgwire::api::portal::{Format, Portal};
 use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
 use pgwire::api::copy::CopyHandler;
@@ -38,7 +37,8 @@ pub async fn serve(app: App, addr: String) -> anyhow::Result<()> {
         let (socket, _) = listener.accept().await?;
         // A connection is a session: its temporary tables end with it (`temp.rs`).
         let session = format!("pg-{}", uuid::Uuid::new_v4().simple());
-        let pg = Arc::new(Pg(Arc::new(Backend { app: app.clone(), parser: parser.clone(), session: session.clone() })));
+        let backend = Arc::new(Backend { app: app.clone(), parser: parser.clone(), session: session.clone(), who: Default::default() });
+        let pg = Arc::new(Pg(backend.clone(), Arc::new(Startup { backend, scram: Default::default(), plain: Default::default() })));
         tokio::spawn(async move {
             let _ = pgwire::tokio::process_socket(socket, None, pg).await;
             crate::temp::end(&session);
@@ -46,36 +46,35 @@ pub async fn serve(app: App, addr: String) -> anyhow::Result<()> {
     }
 }
 
-struct Pg(Arc<Backend>);
+struct Pg(Arc<Backend>, Arc<Startup>);
 
 struct Backend {
     app: App,
     parser: Arc<NoopQueryParser>,
     session: String,
+    who: std::sync::Mutex<Option<crate::auth::Principal>>, // (whoever signed in)
 }
 
 impl PgWireServerHandlers for Pg {
     fn simple_query_handler(&self) -> Arc<impl SimpleQueryHandler> { self.0.clone() }
     fn extended_query_handler(&self) -> Arc<impl ExtendedQueryHandler> { self.0.clone() }
     fn copy_handler(&self) -> Arc<impl CopyHandler> { self.0.clone() }
-    fn startup_handler(&self) -> Arc<impl StartupHandler> {
-        let mut params = DefaultServerParameterProvider::default();
-        params.server_version = "16.0 (Pondra)".into();
-        let password = CleartextPasswordAuthStartupHandler::new(Tokens(self.0.app.clone()), params);
-        Arc::new(Startup { password, open: Arc::new(Open), on: self.0.app.auth.on() })
-    }
+    fn startup_handler(&self) -> Arc<impl StartupHandler> { self.1.clone() }
 }
 
-/// With tokens: a password check; without: straight in.
+/// Signing in: SCRAM-SHA-256 against the user's verifier (`users::Scram`), or a role's token; with
+/// nothing that needs a sign-in, straight in as an admin.
 struct Startup {
-    password: CleartextPasswordAuthStartupHandler<Tokens, DefaultServerParameterProvider>,
-    open: Arc<Open>,
-    on: bool,
+    backend: Arc<Backend>,
+    scram: tokio::sync::Mutex<Option<(crate::users::Scram, String)>>, // (the exchange so far, and whose)
+    plain: tokio::sync::Mutex<bool>, // (a token asked for as a plain password)
 }
 
-struct Open;
-
-impl NoopStartupHandler for Open {}
+fn params() -> DefaultServerParameterProvider {
+    let mut params = DefaultServerParameterProvider::default();
+    params.server_version = "16.0 (Pondra)".into();
+    params
+}
 
 #[async_trait]
 impl StartupHandler for Startup {
@@ -85,28 +84,89 @@ impl StartupHandler for Startup {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        match self.on {
-            true => self.password.on_startup(client, message).await,
-            false => self.open.on_startup(client, message).await,
+        use pgwire::messages::startup::Authentication;
+        let app = &self.backend.app;
+        let wrong = |user: &str| PgWireError::InvalidPassword(user.to_string());
+        match message {
+            PgWireFrontendMessage::Startup(ref startup) => {
+                pgwire::api::auth::protocol_negotiation(client, startup).await?;
+                pgwire::api::auth::save_startup_parameters_to_metadata(client, startup);
+                if app.open().await {
+                    *self.backend.who.lock().unwrap() = Some(crate::auth::Principal::of(crate::auth::Role::Admin));
+                    return finish(client).await;
+                }
+                client.set_state(pgwire::api::PgWireConnectionState::AuthenticationInProgress);
+                // (a user with only tokens, a service's: its token as a password, asked for plainly)
+                let user = client.metadata().get("user").cloned().unwrap_or_default();
+                let tokens_only = !crate::users::BUILT_IN.contains(&user.as_str()) && crate::users::verifier(&app.lake, &user).await.is_none() && crate::users::principal(&app.lake, &user).await.is_ok();
+                *self.plain.lock().await = tokens_only;
+                client.send(PgWireBackendMessage::Authentication(if tokens_only { Authentication::CleartextPassword } else { Authentication::SASL(vec!["SCRAM-SHA-256".into()]) })).await?;
+            }
+            PgWireFrontendMessage::PasswordMessageFamily(m) if *self.plain.lock().await => {
+                let user = client.metadata().get("user").cloned().unwrap_or_default();
+                let password = m.into_password()?.password;
+                let Some(who) = crate::users::sign_in(&app.lake, &app.auth, &user, &password).await else {
+                    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                    return Err(wrong(&user));
+                };
+                *self.backend.who.lock().unwrap() = Some(who);
+                return finish(client).await;
+            }
+            PgWireFrontendMessage::PasswordMessageFamily(m) => {
+                let user = client.metadata().get("user").cloned().unwrap_or_default();
+                let mut scram = self.scram.lock().await;
+                match scram.take() {
+                    None => {
+                        let first = m.into_sasl_initial_response()?;
+                        let text = String::from_utf8_lossy(first.data.as_deref().unwrap_or_default()).to_string();
+                        // (a token's role: its token as the password; a user: its verifier; nobody: one no password fits)
+                        let verifier = match crate::users::BUILT_IN.contains(&user.as_str()) {
+                            true => app.auth.token_for(&user).filter(|t| !t.is_empty()).map(|t| crate::users::Verifier::of(&t)),
+                            false => crate::users::verifier(&app.lake, &user).await,
+                        };
+                        let (exchange, reply) = crate::users::Scram::first(verifier.unwrap_or_else(|| crate::users::Verifier::of(&uuid::Uuid::new_v4().to_string())), &text).map_err(|_| wrong(&user))?;
+                        *scram = Some((exchange, user));
+                        client.send(PgWireBackendMessage::Authentication(Authentication::SASLContinue(reply.into_bytes().into()))).await?;
+                    }
+                    Some((exchange, user)) => {
+                        let last = m.into_sasl_response()?;
+                        let text = String::from_utf8_lossy(&last.data).to_string();
+                        let Ok(reply) = exchange.last(&text) else {
+                            tokio::time::sleep(std::time::Duration::from_millis(400)).await; // (a guess costs time)
+                            return Err(wrong(&user));
+                        };
+                        let who = match crate::users::BUILT_IN.contains(&user.as_str()) {
+                            true => Some(crate::auth::Principal::of(app.auth.role_of_user(&user))),
+                            false => crate::users::principal(&app.lake, &user).await.ok(),
+                        };
+                        let Some(who) = who else { return Err(wrong(&user)) };
+                        *self.backend.who.lock().unwrap() = Some(who);
+                        client.send(PgWireBackendMessage::Authentication(Authentication::SASLFinal(reply.into_bytes().into()))).await?;
+                        return finish(client).await;
+                    }
+                }
+            }
+            _ => {}
         }
+        Ok(())
     }
 }
 
-/// Passwords: the user name picks the role, whose token is the password (anything goes when no
-/// tokens are set).
-#[derive(Debug)]
-struct Tokens(App);
+/// Signed in: Postgres's parameters, a key to cancel with, ready for queries.
+async fn finish<C>(client: &mut C) -> PgWireResult<()>
+where
+    C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+    C::Error: Debug,
+    PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+{
+    use pgwire::api::PidSecretKeyGenerator;
+    let (pid, key) = pgwire::api::RandomPidSecretKeyGenerator::default().generate(client);
+    client.set_pid_and_secret_key(pid, key);
+    pgwire::api::auth::finish_authentication(client, &params()).await
+}
 
 impl Debug for App {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { f.write_str("App") }
-}
-
-#[async_trait]
-impl AuthSource for Tokens {
-    async fn get_password(&self, login: &LoginInfo) -> PgWireResult<Password> {
-        let token = self.0.auth.token_for(login.user().unwrap_or_default()).unwrap_or_default();
-        Ok(Password::new(None, token.into_bytes()))
-    }
 }
 
 fn user_error(e: anyhow::Error) -> PgWireError {
@@ -127,7 +187,10 @@ impl Backend {
         if let Some(copy) = Copy::of(&sql) {
             return self.copy_out(copy?).await;
         }
-        let role = self.app.auth.role_of_user(user);
+        let role = crate::auth::current().map_or(crate::auth::Role::None, |p| p.role);
+        if role < crate::auth::Role::Read {
+            return Err(user_error(anyhow::anyhow!("sign in first")));
+        }
         if crate::routines::runs_procedure(&sql) {
             let who = crate::routines::Who { role, files: false, depth: 0 };
             return match crate::routines::one(&self.app, &sql, who, None).await.map_err(user_error)? {
@@ -173,12 +236,15 @@ impl Backend {
 
     /// `run`, the notices its procedures send (what they print) sent first: psql shows NOTICE.
     async fn told<C: Sink<PgWireBackendMessage> + Unpin + Send>(&self, client: &mut C, user: &str, sql: &str, format: &Format) -> PgWireResult<Response> {
-        let (out, heard) = crate::routines::with_notices(crate::temp::SESSION.scope(Some(self.session.clone()), self.run(user, sql, format))).await;
+        let (out, heard) = crate::routines::with_notices(crate::temp::SESSION.scope(Some(self.session.clone()), crate::auth::WHO.scope(self.who(), self.run(user, sql, format)))).await;
         for n in heard {
             let _ = client.send(PgWireBackendMessage::NoticeResponse(ErrorInfo::new("NOTICE".into(), "00000".into(), n).into())).await; // (a client gone: the answer fails too)
         }
         out
     }
+
+    /// Whoever signed in on this connection (nobody, before).
+    fn who(&self) -> crate::auth::Principal { self.who.lock().unwrap().clone().unwrap_or_else(|| crate::auth::Principal::of(crate::auth::Role::None)) }
 
     /// `COPY … TO STDOUT`: the rows, one COPY message each.
     async fn copy_out(&self, c: Copy) -> PgWireResult<Response> {
@@ -220,13 +286,13 @@ impl Backend {
     }
 
     /// `COPY t FROM STDIN`: what is to come, noted on the connection (`on_copy_data` gathers it).
-    async fn copy_in<C: ClientInfo>(&self, client: &mut C, user: &str, c: Copy) -> PgWireResult<Response> {
+    async fn copy_in<C: ClientInfo>(&self, client: &mut C, _user: &str, c: Copy) -> PgWireResult<Response> {
         let refuse = |why: &str| Err(user_error(anyhow::anyhow!("{why}")));
         if c.query.is_some() || c.format == "binary" {
             return refuse("COPY FROM STDIN takes a table, in text or CSV");
         }
         let stmt = crate::write::parse(&format!("INSERT INTO {} SELECT 1", c.table)).ok_or_else(|| user_error(anyhow::anyhow!("COPY: no table {}", c.table)))?;
-        self.app.auth.allows(self.app.auth.role_of_user(user), &stmt).map_err(user_error)?;
+        self.app.auth.allows(crate::auth::current().map_or(crate::auth::Role::None, |p| p.role), &stmt).map_err(user_error)?;
         let (other, table) = crate::ddl::resolve(&self.app.lake, &c.table).await.map_err(user_error)?;
         if other.is_some() {
             return refuse("COPY into an attached lake: INSERT INTO it instead");
@@ -656,7 +722,7 @@ impl SimpleQueryHandler for Backend {
         let mut out = vec![];
         for q in crate::routines::split(query).iter().map(|q| q.trim()) {
             out.push(match Copy::of(q) {
-                Some(Ok(c)) if !c.to => self.copy_in(client, &user, c).await?,
+                Some(Ok(c)) if !c.to => crate::auth::WHO.scope(self.who(), self.copy_in(client, &user, c)).await?,
                 _ => self.told(client, &user, q, &Format::UnifiedText).await?,
             });
         }
@@ -677,7 +743,7 @@ impl ExtendedQueryHandler for Backend {
     {
         let user = client.metadata().get("user").cloned().unwrap_or_default();
         if let Some(Ok(c)) = Copy::of(&portal.statement.statement).filter(|c| c.as_ref().is_ok_and(|c| !c.to)) {
-            return self.copy_in(client, &user, c).await;
+            return crate::auth::WHO.scope(self.who(), self.copy_in(client, &user, c)).await;
         }
         let inferred = crate::temp::SESSION.scope(Some(self.session.clone()), self.param_types(&pg_dialect(&self.app.lake, &portal.statement.statement, ""))).await;
         self.told(client, &user, &bind(portal, &inferred)?, &portal.result_column_format).await

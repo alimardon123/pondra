@@ -22,7 +22,10 @@ A number that is left unset, or set to something that is not a number, takes its
 | `PONDRA_WRITE_TOKEN` | none | the write token, when `--write-token` is not given |
 | `PONDRA_ADMIN_TOKEN` | none | the admin token, when `--admin-token` is not given. A node also sends it when it calls other nodes |
 | `PONDRA_TOKEN` | none | the token a program presents: `pondra run` (`--token`), a write made with `pondra sql`, and a node's calls to other nodes, which use it before the admin token |
-| `PONDRA_SECRET_KEY` | one made for the machine | the key [secrets](/pondra/reference/sql/#files-and-secrets) are sealed with. Every node of a cluster needs the same one. Without it, a key is made in `~/.pondra/secret.key` (from `HOME` or `USERPROFILE`), which is enough for nodes that share that machine's home |
+| `PONDRA_SECRET_KEY` | one made for the machine | the master key that wraps each [secret's](/pondra/reference/sql/#files-and-secrets) own key. Every node of a cluster needs the same one. Without it, a key is made in `~/.pondra/secret.key` (from `HOME` or `USERPROFILE`), which is enough for nodes that share that machine's home |
+| `PONDRA_SECRET_KEY_PREVIOUS` | none | the master key before it changed: secrets' keys it wrapped still open, and the leader rewraps them with the new one when it starts |
+| `PONDRA_KMS_COMMAND` | none | a key service in place of the master key: a command run with `wrap` or `unwrap` and a data key on its input, answering on its output (a script over `aws kms`, `gcloud kms`, `az keyvault key` or Vault's transit) |
+| `PONDRA_SESSION_HOURS` | 12 | how long a user's session lasts (`POST /login`, a Flight handshake) |
 
 An empty value counts as not set. See [HTTP](/pondra/reference/http/#roles) for what each token may do.
 

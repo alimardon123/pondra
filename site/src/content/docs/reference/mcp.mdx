@@ -176,14 +176,14 @@ asyncio.run(main())
 
 ## Tokens
 
-The endpoint needs at least the `read` token. A request without one, or with a wrong one, gets `401`
-and the text `this needs a token with more rights`. What a tool may do depends on the role:
+The endpoint needs at least the `read` token (or a user). A request without one gets `401` (`sign in:
+…`), with a wrong one `401` too, and with too few rights `403`. What a tool may do depends on the role:
 
 | Role | May |
 |---|---|
 | `read` | `list_tables`, `query`, `changes` |
 | `write` | also `write` with `INSERT`, `UPDATE`, `DELETE` and `CALL`. A `read` token is refused with `this token may not write` |
-| `admin` | also `write` with `CREATE`, `ALTER` and `DROP`, and the other statements that change the lake's tables, views, schemas or routines. A `write` token is refused with `this token may not change the lake's tables, views, schemas or routines (an admin token does)` |
+| `admin` | also `write` with `CREATE`, `ALTER` and `DROP`, and the other statements that change the lake's tables, views, schemas or routines. A `write` token is refused with `this token may not change the lake's tables, views, schemas, routines or users (an admin token, or a superuser, does)` |
 
 A procedure runs with the rights of the agent's token: a `read` token that calls one which writes
 is refused by the procedure's own statements.

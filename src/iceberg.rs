@@ -828,6 +828,7 @@ async fn load(axum::extract::State(app): axum::extract::State<crate::server::App
     // metadata table `files` of `t`, as Spark does)
     let no_table = || missing(&format!("table {}.{table}", ns.replace('\u{1f}', ".")), "NoSuchTableException");
     let (_, lake, schema) = space(&app, &ns).await.map_err(|_| no_table())?;
+    crate::auth::check_all(&crate::ddl::join(&schema, &table)).map_err(|e| refused(403, "ForbiddenException", e.to_string()))?; // (a user's: an engine reads the whole files)
     Ok(axum::Json(loaded(&lake, &crate::ddl::join(&schema, &table)).await.map_err(|_| no_table())?))
 }
 
@@ -924,6 +925,7 @@ fn conflict(message: String) -> Refusal { refused(409, "CommitFailedException", 
 async fn update(axum::extract::State(app): axum::extract::State<crate::server::App>, axum::Extension(role): axum::Extension<crate::auth::Role>, axum::extract::Path((ns, table)): axum::extract::Path<(String, String)>, body: bytes::Bytes) -> Reply {
     let (parts, lake, schema) = space(&app, &ns).await?;
     let name = crate::ddl::join(&schema, &table);
+    crate::auth::check("insert", &name).map_err(|e| refused(403, "ForbiddenException", e.to_string()))?;
     let current = loaded(&lake, &name).await.map_err(|_| missing(&format!("table {}.{table}", ns.replace('\u{1f}', ".")), "NoSuchTableException"))?;
     let asked: Value = serde_json::from_slice(&body).map_err(|e| bad(format!("the commit: {e}")))?;
     let updates = asked["updates"].as_array().cloned().unwrap_or_default();
@@ -969,6 +971,7 @@ async fn transaction(axum::extract::State(app): axum::extract::State<crate::serv
         }
         let table = id["name"].as_str().unwrap_or_default();
         let name = crate::ddl::join(&schema, table);
+        crate::auth::check("insert", &name).map_err(|e| refused(403, "ForbiddenException", e.to_string()))?;
         let current = loaded(&lake, &name).await.map_err(|_| missing(&format!("table {}.{table}", ns.join(".")), "NoSuchTableException"))?;
         if let Some(c) = prepare(&lake, &name, &current, change).await? {
             commits.push(c);

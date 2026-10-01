@@ -93,7 +93,7 @@ async fn call(embed: bool, input: &str, model: &str) -> anyhow::Result<Value> {
         true => ("embeddings", json!({"model": model, "input": input})),
         false => ("chat/completions", json!({"model": model, "messages": [{"role": "user", "content": input}]})),
     };
-    let mut req = crate::cluster::http().post(format!("{}/{path}", url.trim_end_matches('/'))).json(&body);
+    let mut req = crate::cluster::http_bare().post(format!("{}/{path}", url.trim_end_matches('/'))).json(&body); // (not the nodes' client: its token is theirs alone)
     if let Ok(key) = std::env::var("PONDRA_AI_KEY") {
         req = req.bearer_auth(key);
     }
