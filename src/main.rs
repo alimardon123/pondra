@@ -298,10 +298,12 @@ pub(crate) async fn stopped(stdin: bool) {
 static MAIN: std::sync::OnceLock<Arc<store::Lake>> = std::sync::OnceLock::new();
 
 fn main() {
-    // The work runs on a thread with Linux's main stack, 8 MB: Windows gives its main thread 1 MB,
-    // and planning (DataFusion's, recursive) and a session's making can need more.
+    // The work runs on threads with Linux's main stack, 8 MB: Windows gives its main thread 1 MB,
+    // and planning (DataFusion's, recursive) and a session's making can need more; tokio's workers
+    // get 2 MB, which procedures calling procedures 16 deep overflowed in the release build (only
+    // the pages a thread touches are memory).
     let work = std::thread::Builder::new().name("pondra".into()).stack_size(8 << 20).spawn(|| {
-        tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("a runtime").block_on(async {
+        tokio::runtime::Builder::new_multi_thread().enable_all().thread_stack_size(8 << 20).build().expect("a runtime").block_on(async {
             // An error is said in words, its causes after it: a backtrace (RUST_BACKTRACE) is for panics.
             if let Err(e) = run().await {
                 eprintln!("Error: {}", ext::said(&e));

@@ -587,7 +587,7 @@ on('ran', (who, r, what) => {
   S.ran.unshift({ id: S.ranN, kind: what?.kind || who?.kind || 'sql', src, ms: r?.ms || 0, ok: r?.kind !== 'error', at: Date.now(), where: S.doc?.title || '', rows: r?.kind === 'rows' ? r.total : null, error: r?.kind === 'error' ? r.message : null });
   S.ran.length = Math.min(S.ran.length, 100);
   if (S.tab === 'runs') detail();
-  if (r?.kind === 'done' || what?.kind === 'python' || who?.kind === 'python') later(refresh);
+  if (r?.kind === 'done' || what?.kind === 'python' || who?.kind === 'python' || /\b(create|drop|alter|attach|detach)\b/i.test(src)) later(refresh); // (the last answer of a script may be rows after its DDL)
   if (what?.kind === 'python' || who?.kind === 'python') readVars().then(() => S.tab === 'variables' && detail(), () => {});
 });
 
