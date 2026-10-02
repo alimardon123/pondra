@@ -7,7 +7,8 @@ use datafusion::logical_expr::{build_join_schema, Aggregate, Expr, Filter, Join,
 use datafusion::optimizer::{optimizer::ApplyOrder, Optimizer, OptimizerConfig, OptimizerRule};
 use datafusion::common::config::ConfigOptions;
 use datafusion::physical_optimizer::{optimizer::PhysicalOptimizer, PhysicalOptimizerRule};
-use datafusion::physical_plan::{aggregates::AggregateExec, filter::FilterExec, joins::HashJoinExec, ExecutionPlan};
+use datafusion::physical_expr::expressions::{lit, Column as PhysicalColumn, DynamicFilterPhysicalExpr};
+use datafusion::physical_plan::{aggregates::AggregateExec, filter::FilterExec, joins::HashJoinExec, ExecutionPlan, PhysicalExpr};
 use datafusion::prelude::SessionConfig;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -447,7 +448,65 @@ pub fn physical_rules() -> Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> {
     rules.insert(at + 1, Arc::new(crate::asof::Rule)); // (before the rules that add exchanges: it asks for its own)
     let end = rules.iter().position(|r| r.name() == "SanityCheckPlan").unwrap_or(rules.len());
     rules.insert(end, Arc::new(crate::hot::TopFirst)); // (after DataFusion's own sort pushdown)
+    rules.insert(end, Arc::new(MinMaxBounds)); // (after the filters are pushed down)
     rules
+}
+
+/// A global `min` / `max` hands the scans a filter of the rows that could still change its answer
+/// (DataFusion's `a < least so far OR b > greatest so far`), and the scans skip row groups and hot
+/// batches by it. DataFusion leaves two things out of it: a min or max of anything but a column,
+/// and one with no value yet (every row so far NULL in its column). The filter then skips rows
+/// those still need: `min(a), max(b + 1)` came back too low, and `min(a), max(b)` NULL when the
+/// first files' `b` were. Where that can happen the aggregate keeps a filter of its own and the
+/// scans keep theirs, which never moves from `true`. It can't happen with one aggregate, or with
+/// several of one column, or of columns that are never NULL, and none with a FILTER.
+#[derive(Debug)]
+struct MinMaxBounds;
+
+impl PhysicalOptimizerRule for MinMaxBounds {
+    fn optimize(&self, plan: Arc<dyn ExecutionPlan>, _: &ConfigOptions) -> Result<Arc<dyn ExecutionPlan>> {
+        plan.transform_up(|p| {
+            let Some(a) = p.downcast_ref::<AggregateExec>() else { return Ok(Transformed::no(p)) };
+            let produced = a.dynamic_expressions_produced();
+            let Some(filter) = produced.first().and_then(|f| f.downcast_ref::<DynamicFilterPhysicalExpr>()) else { return Ok(Transformed::no(p)) };
+            if bounds_whole(a) {
+                return Ok(Transformed::no(p));
+            }
+            let own = DynamicFilterPhysicalExpr::new(filter.children().into_iter().cloned().collect(), lit(true));
+            Ok(Transformed::yes(Arc::new(a.clone().with_dynamic_filter_expr(Arc::new(own))?) as Arc<dyn ExecutionPlan>))
+        })
+        .data()
+    }
+
+    fn name(&self) -> &str {
+        "min_max_bounds"
+    }
+
+    fn schema_check(&self) -> bool {
+        true
+    }
+}
+
+/// Does every bound of `a`'s filter have a value as soon as any has (so none is left out while
+/// NULL), with each aggregate's argument a column (so none is left out at all)?
+fn bounds_whole(a: &AggregateExec) -> bool {
+    let schema = a.input().schema();
+    let columns: Option<Vec<usize>> = a
+        .aggr_expr()
+        .iter()
+        .map(|e| match &e.expressions()[..] {
+            [c] => c.downcast_ref::<PhysicalColumn>().map(|c| c.index()),
+            _ => None,
+        })
+        .collect();
+    match columns.as_deref() {
+        None => false,
+        Some([_]) => true,
+        Some(columns) => {
+            a.filter_expr().iter().all(Option::is_none)
+                && (columns.iter().all(|c| *c == columns[0]) || columns.iter().all(|c| !schema.field(*c).is_nullable()))
+        }
+    }
 }
 
 /// `x IN (SELECT k … GROUP BY k HAVING …)`: the few groups a HAVING keeps are the hash table, the

@@ -140,7 +140,7 @@ impl Auth {
             "files" if method == "GET" => Role::Read, // (objects next to the tables: files.rs)
             "files" => Role::Write,
             "" | "console" => Role::None, // (the console's page and files: they hold no data, and ask for a token)
-            "stats" => Role::None, // (a health check: load balancers and the tests poll it)
+            "stats" | "healthz" | "ready" => Role::None, // (health checks: load balancers and the tests poll them)
             "login" | "whoami" => Role::None, // (signing in; and who one is)
             "secrets" => Role::None, // (a procedure's lent token only: `server::secret`)
             "v1" if method == "POST" || method == "DELETE" => Role::Write, // (another engine's append: ADR-028; its tables made, dropped and renamed: ADR-029, as the SQL's rights say)

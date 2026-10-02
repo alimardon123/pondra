@@ -12,6 +12,7 @@ use std::panic::AssertUnwindSafe;
 
 /// Run a request: `Err` (the panic's message) if it panicked.
 pub async fn door<T>(f: impl Future<Output = T>) -> Result<T, String> {
+    let _busy = crate::drain::Busy::new(); // (a node stopping waits for it: `drain.rs`)
     AssertUnwindSafe(f).catch_unwind().await.map_err(|p| said(&*p))
 }
 

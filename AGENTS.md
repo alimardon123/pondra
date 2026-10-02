@@ -1326,6 +1326,14 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    top-N either way (through a filter too) and a key skip batches, and NULL-sensitive filters over
    a batch of NULLs answer as the model does (fails on a build without it; the newest rows skip
    nothing without `TopFirst`).
+204. **A global min/max skips only rows that can't change any of its answers**
+   (`optimize::MinMaxBounds`): DataFusion's filter for one (`a < least so far OR b > greatest so
+   far`), which the scans skip row groups and hot batches by, leaves out a min or max of anything
+   but a column, and one whose column has been NULL so far; nothing above the scan checks those
+   rows again, so `min(a), max(b + 1)` came back too low and `min(a), max(c)` NULL (0.30 and 0.31.0
+   too). Unless every bound fills at once (one aggregate; several of one column, or of columns never
+   NULL, and none with a FILTER), the aggregate keeps a filter of its own and the scans keep theirs,
+   which never moves from `true`. `harness.py minmax`: three of its seven checks fail without it.
 
 ## Tests: run these before and after any change
 
@@ -1339,6 +1347,7 @@ python3 tools/harness.py versions       # every file keeps its versions: listed,
 python3 tools/harness.py stopped        # a run whose node was killed under it: stopped, not running for good
 python3 tools/harness.py variables      # DECLARE $x, $x = …, SET VARIABLE, getvariable: sessions, Postgres, procedures, file runs, db.vars, pondra.parameters
 python3 tools/harness.py hot            # hot columns skip batches by their ranges (a time range, a top-N either way, a key); NULL filters == the model
+python3 tools/harness.py minmax         # a global min/max over 24 files skips no row its other answers need (an expression, NULLs so far, FILTER)
 python3 tools/harness.py sparksql       # spark.sql / spark_sql('…') in Spark's grammar: literals, LATERAL VIEW, Spark's floor and substring, frames on top, refusals
 python3 tools/harness.py flows          # views of views in one commit, rollups, expectations (keep, drop, fail), changes down the flow
 python3 tools/harness.py begin          # BEGIN … COMMIT from every door, read-your-writes, 40001 and retries, 25P02, SQLSTATEs
