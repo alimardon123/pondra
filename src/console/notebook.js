@@ -3,8 +3,10 @@
 // else, as one plain `.ipynb` file, saved in place like a SQL file.
 import { h, $, icon, esc, secs, count, S, R, emit, call, rows, fileUrl, toast, menu, saveAs, numeric, Failure, said, failed, readFile, writeFile, interruptPython, formatPython } from './core.js';
 import { Editor, formatSql } from './editor.js';
-/** A Markdown cell's text drawn (md.js: loaded when a notebook first has one). */
-const drawMd = async (el, src) => { const m = await import('./md.js'); m.render(el, src); };
+/** A Markdown cell's text drawn (md.js: loaded when a notebook first has one). Only the latest
+ * call draws: calls made while md.js loads resume in any order, and an older text drawn last
+ * left a cell written in at once (M, Enter, typing) showing it empty. */
+const drawMd = async (el, src) => { const n = el.drawing = (el.drawing || 0) + 1; const m = await import('./md.js'); if (el.drawing === n) m.render(el, src); };
 
 // ------------------------------------------------------------------ what a cell answered
 export function doneText(v) {
