@@ -488,7 +488,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
 35. **A scalar subquery is answered before anything that uses it runs** (`spmd::hoist`): a shuffle
    takes the `ScalarSubqueryExec`s out of the plan, and `step()` fills their shared answer slots
    as soon as the exchanges they read are done — on every node, from the same all-gathered rows.
-   A shuffle's pieces are compacted (`spill::compact`) before they are counted or written: a
+   A shuffle's pieces are compacted (`query::compact`, invariant 202) before they are counted or written: a
    `Utf8View` slice otherwise carries every string of the batch it was cut from.
 36. **A key range holds its NULLs once.** The first range holds every NULL of the key: a piece
    that may hold one (`DataFile::nulls` lists the column, or doesn't say) is read by the first
@@ -1303,6 +1303,14 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    projections already sit between them. `join_order.py`: "past an outer join, written badly, joins
    the returns last" and "under an exists, written badly, starts from the nation" fail without
    them; `tpcds_check.py`: 99 of 99 the same as DuckDB.
+202. **An answer carries only its own rows' strings** (`query::compact`): a string or binary view
+   points into a buffer it may share with every other row of the page or batch it came from, and
+   Arrow IPC sends every buffer a view points into. So an answer (`App::query_as`), every IPC stream
+   (`query::ipc`, `log::encode_ipc`), Flight's streams and a shuffle's pieces copy out views whose
+   buffers are mostly other rows'. Without it a `LIMIT 5` of a 50,000-row table was 3.2 MB as
+   Arrow, a 10-row ClickBench answer 220 MB (and too big for the result cache).
+   `harness.py found`: "a few rows of a table's, sent as Arrow (HTTP, Flight), carry only their own
+   strings".
 
 ## Tests: run these before and after any change
 

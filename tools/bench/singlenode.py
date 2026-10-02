@@ -1,10 +1,19 @@
 #!/usr/bin/env python3
-"""Single-node TPC-H: Pondra against DuckDB, Polars, Daft and Bodo, on one machine and one copy
-of the data.
+"""Single-node TPC-H (and ClickBench): Pondra against DuckDB, Polars, Daft and Bodo, on one machine
+and one copy of the data.
 
   singlenode.py prepare --data ~/tpch/sf1                  # tpchgen output -> <data>-bench/ (below)
   singlenode.py run --data ~/tpch/sf1-bench --sf 1 [--engines pondra,duckdb,polars,daft,bodo]
                 [--runs 3] [--out results.json] [--daft-python …] [--bodo-python …] [--repos DIR]
+  singlenode.py prepare --suite clickbench --data ~/clickbench   # hits_*.parquet -> <data>-bench/hits.parquet
+  singlenode.py run --suite clickbench --data ~/clickbench-bench --engines pondra,pondra-cold,duckdb,duckdb-native
+
+ClickBench (`--suite clickbench`): ClickHouse's 43 queries over its `hits` table, as DuckDB's own
+entry writes them (`clickbench-queries.sql`, `strlen` as `length`), over the partitioned files'
+first N (`hits_0.parquet` … from datasets.clickhouse.com/hits_compatible/athena_partitioned):
+`prepare` gives them SQL's types (strings, `EventTime` a TIMESTAMP, `EventDate` a DATE) and
+lower-case names, as DuckDB's `create.sql` declares them. DuckDB's version is in the output: run
+the script with another Python for another DuckDB (`pip install --pre duckdb` for its 2.0).
 
 The data: tpchgen-cli's Parquet with money columns as DOUBLE (not every engine computes on
 DECIMAL alike) and 122,880-row row groups. Two ways to run, compared like with like:
@@ -14,7 +23,8 @@ DECIMAL alike) and 122,880-row row groups. Two ways to run, compared like with l
   in-memory columns off (PONDRA_HOT_GB=0);
 - from memory: `duckdb-native` loads the tables into DuckDB first; `pondra` runs every query twice
   first, so the columns they read are in memory (hot.rs takes a file on its second read; they get
-  `--hot-gb` GB, 3 by default). Neither load is in the times.
+  `--hot-gb` GB: 3 by default, room for TPC-H SF1's; 6 for ClickBench, whose 10 million rows'
+  columns take 5.4 GB decoded). Neither load is in the times.
 
 Each query runs `--runs` times: the best time is "hot", the first "first". Answers are checked
 against DuckDB's (row count, and every value; numbers to a relative 1e-6).
@@ -29,9 +39,35 @@ import argparse, json, os, subprocess, sys, tempfile, threading, time
 HERE = os.path.dirname(os.path.abspath(__file__))
 TABLES = ["region", "nation", "supplier", "customer", "part", "partsupp", "orders", "lineitem"]
 A = None
+tables = lambda: ["hits"] if A.suite == "clickbench" else TABLES
 
 
 # ---------------------------------------------------------------- data
+
+def prepare_hits(data):
+    """ClickBench's partitioned files -> one `hits.parquet`, with SQL's types and lower-case names."""
+    import glob, pyarrow as pa, pyarrow.compute as pc, pyarrow.parquet as pq
+    out = data.rstrip("/") + "-bench"
+    os.makedirs(out, exist_ok=True)
+    def typed(t):
+        cols = {}
+        for f, c in zip(t.schema, t.columns):
+            if f.name == "EventTime":
+                c = c.cast(pa.int64()).cast(pa.timestamp("s"))
+            elif f.name == "EventDate":
+                c = c.cast(pa.int32()).cast(pa.date32())
+            elif pa.types.is_binary(f.type):
+                c = c.cast(pa.string())
+            cols[f.name.lower()] = c
+        return pa.table(cols)
+    files = sorted(glob.glob(os.path.join(data, "hits_*.parquet")), key=lambda f: int(f.rsplit("_", 1)[1].split(".")[0]))
+    with pq.ParquetWriter(os.path.join(out, "hits.parquet"), typed(pq.ParquetFile(files[0]).schema_arrow.empty_table()).schema, compression="snappy") as w:
+        for f in files:
+            for b in pq.ParquetFile(f).iter_batches(batch_size=122_880):
+                w.write_table(typed(pa.Table.from_batches([b])), row_group_size=122_880)
+            print("prepared", f, flush=True)
+    return out
+
 
 def prepare(data):
     """tpchgen Parquet -> money as DOUBLE, 122,880-row row groups, Snappy (as tpchgen writes).
@@ -67,8 +103,7 @@ def ensure_repos(repos, engines=("polars", "daft", "bodo")):
 
 RUNNER = r'''
 import json, os, sys, time, datetime, decimal
-engine, data, sf, runs, repos, queries = sys.argv[1], sys.argv[2], float(sys.argv[3]), int(sys.argv[4]), sys.argv[5], json.loads(sys.argv[6])
-T = ["region", "nation", "supplier", "customer", "part", "partsupp", "orders", "lineitem"]
+engine, data, sf, runs, repos, queries, T = sys.argv[1], sys.argv[2], float(sys.argv[3]), int(sys.argv[4]), sys.argv[5], json.loads(sys.argv[6]), json.loads(sys.argv[7])
 path = lambda t: os.path.join(data, t + ".parquet")
 
 def cell(v):
@@ -93,7 +128,7 @@ if engine.startswith("duckdb"):
     for t in T:
         kind = "TABLE" if engine == "duckdb-native" else "VIEW"
         con.execute(f"CREATE {kind} {t} AS SELECT * FROM read_parquet('{path(t)}')")
-    print(json.dumps({"load": time.time() - t0}), flush=True)
+    print(json.dumps({"load": time.time() - t0, "version": duckdb.__version__}), flush=True)
     qs = json.load(open(os.path.join(repos, "sql.json")))
     for q in queries:
         report(q, lambda: con.execute(qs[str(q)]).fetch_arrow_table())
@@ -186,7 +221,7 @@ def run_engine(engine, python, qs_left, env):
     and the rest go on in a new process."""
     out, left = {}, list(qs_left)
     while left:
-        cmd = [python, "-c", RUNNER, engine, A.data, str(A.sf), str(A.runs), A.repos, json.dumps(left)]
+        cmd = [python, "-c", RUNNER, engine, A.data, str(A.sf), str(A.runs), A.repos, json.dumps(left), json.dumps(tables())]
         if engine == "bodo":  # (Bodo spawns its MPI workers; here that needs a process manager to start from)
             cmd = [os.path.join(os.path.dirname(python), "mpiexec"), "-n", "1"] + cmd
         p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
@@ -202,6 +237,7 @@ def run_engine(engine, python, qs_left, env):
             last[0] = time.time()
             if line.startswith('{"load"'):
                 out["load_s"] = round(json.loads(line)["load"], 1)
+                out["version"] = json.loads(line).get("version")
             elif line.startswith("{"):
                 r = json.loads(line)
                 out[r["q"]] = r
@@ -223,7 +259,7 @@ def pondra_lake():
     import harness
     lake = tempfile.mkdtemp(prefix="pondra-tpch-")
     t0 = time.time()
-    for t in TABLES:
+    for t in tables():
         subprocess.run([harness.BIN, "sql", "--dir", lake, f"INSERT INTO {t} SELECT * FROM '{os.path.join(A.data, t)}.parquet'"], check=True, capture_output=True)
     return lake, time.time() - t0
 
@@ -233,7 +269,8 @@ def pondra_up(lake, hot, qs):
     read to be in memory; returns how long that took."""
     import harness, re
     harness.A = argparse.Namespace(s3=False, keep=False)
-    env = {"PONDRA_HOT_GB": str(A.hot_gb) if hot else "0"}
+    gb = A.hot_gb if A.hot_gb is not None else 6 if A.suite == "clickbench" else 3
+    env = {"PONDRA_HOT_GB": str(gb) if hot else "0"}
     node = harness.Node(lake, A.port, env=env, **dict(f.split("=", 1) for f in A.flag)).start()
     harness.call(A.port, "POST", "/tier", timeout=3600)  # (merges and sealing done before timing)
     t0 = time.time()
@@ -252,10 +289,11 @@ def pondra_up(lake, hot, qs):
 def run():
     import re
     sys.path.insert(0, HERE)
-    from tpch import queries as sql_queries
+    from tpch import queries
+    sql_queries = lambda _: {i + 1: q.strip().rstrip(";") for i, q in enumerate(open(os.path.join(HERE, "clickbench-queries.sql")).read().strip().splitlines())} if A.suite == "clickbench" else queries(A.queries)
     ensure_repos(A.repos, A.engines.split(","))
     json.dump({str(k): v for k, v in sql_queries(A.queries).items()}, open(os.path.join(A.repos, "sql.json"), "w"))
-    qs = list(range(1, 23))
+    qs = list(sql_queries(A.queries))
     results, info = {}, {}
     engines = A.engines.split(",")
     lake = None
@@ -275,6 +313,8 @@ def run():
         results[engine] = run_engine(engine, python, qs, env)
         if "load_s" in results[engine]:
             info[f"{engine}_load_s"] = results[engine].pop("load_s")
+        if results[engine].get("version"):
+            info[f"{engine}_version"] = results[engine].pop("version")
         info[f"{engine}_wall_s"] = round(time.time() - t, 1)
         if engine.startswith("pondra"):
             node.kill()
@@ -292,10 +332,10 @@ def run():
             ok = q not in ref or "rows" not in ref[q] or same(r["rows"], ref[q]["rows"])
             row[q] = {"hot": round(min(r["times"]), 3), "first": round(r["times"][0], 3), "same_as_duckdb": ok}
         good = [v for v in row.values() if "hot" in v]
-        row["total_hot"] = round(sum(v["hot"] for v in good), 2) if len(good) == 22 else None
+        row["total_hot"] = round(sum(v["hot"] for v in good), 2) if len(good) == len(qs) else None
         row["answers_match"] = sum(1 for v in good if v["same_as_duckdb"])
         table[engine] = row
-    out = {"data": A.data, "sf": A.sf, "cores": os.cpu_count(), "runs": A.runs, "info": info, "results": table}
+    out = {"suite": A.suite, "data": A.data, "sf": A.sf, "cores": os.cpu_count(), "runs": A.runs, "info": info, "results": table}
     json.dump(out, open(A.out, "w"), indent=1)
     print(f"\n{'':6}" + "".join(f"{e:>12}" for e in table))
     for q in qs:
@@ -311,6 +351,7 @@ def run():
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("what", choices=["prepare", "run"])
+    ap.add_argument("--suite", choices=["tpch", "clickbench"], default="tpch")
     ap.add_argument("--data", required=True)
     ap.add_argument("--sf", type=float, default=1)
     ap.add_argument("--engines", default="duckdb,duckdb-native,pondra,pondra-cold,polars,polars-streaming,daft,bodo")
@@ -322,7 +363,7 @@ if __name__ == "__main__":
     ap.add_argument("--bodo-python", default=os.path.expanduser("~/venv-bodo/bin/python"))
     ap.add_argument("--port", type=int, default=8150)
     ap.add_argument("--flag", action="append", default=[], help="a pondra serve flag for the node, e.g. memory-gb=4")
-    ap.add_argument("--hot-gb", type=float, default=3, help="memory for Pondra's hot columns (PONDRA_HOT_GB)")
+    ap.add_argument("--hot-gb", type=float, help="memory for Pondra's hot columns (PONDRA_HOT_GB; 3, 6 for ClickBench)")
     ap.add_argument("--out", default="singlenode.json")
     A = ap.parse_args()
-    prepare(A.data) if A.what == "prepare" else run()
+    (prepare_hits if A.suite == "clickbench" else prepare)(A.data) if A.what == "prepare" else run()

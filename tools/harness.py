@@ -4778,6 +4778,14 @@ def found():
     first = listing()
     call(port, "PUT", "/files/listed/a.txt", b"a")
     checks["files() after PUT /files lists the new file (never a remembered answer)"] = first == [] and listing() == ["files/listed/a.txt"]
+    # A few rows of a table's go with their own strings only, not the buffers of the batch they were
+    # cut from (round 32: a 10-row Arrow answer of ClickBench's was 220 MB), over HTTP and Flight.
+    q("CREATE TABLE wide AS SELECT value AS i, repeat('x', 200) || value AS s FROM range(0, 50000)")
+    few = "SELECT i, s FROM wide LIMIT 5"  # (a slice of a batch: 3.2 MB as Arrow before)
+    sent = call(port, "POST", "/sql?format=arrow", few.encode())
+    flown = client.do_get(fl.Ticket(json.dumps({"sql": few}))).read_all()
+    seen["few"] = (len(sent), flown.nbytes, flown.num_rows)
+    checks["a few rows of a table's, sent as Arrow (HTTP, Flight), carry only their own strings"] = len(sent) < 16 << 10 and flown.nbytes < 16 << 10 and flown.num_rows == 5
     node.kill(); locked.kill()
     ok = all(checks.values())
     print(json.dumps({"found": checks, "ok": ok}, indent=1))

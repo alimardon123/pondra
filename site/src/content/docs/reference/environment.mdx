@@ -156,8 +156,10 @@ Do not set these. Pondra sets them for its own processes, and some are copies of
 | `PONDRA_SERVER_URL` | `pondra serve` on a folder of lakes, for each database's node | where the process that serves the folder is, for `DROP DATABASE` |
 
 <Aside type="caution">
-`PONDRA_CRASH`, `PONDRA_DROP_BEATS`, `PONDRA_NO_DIRECT`, `PONDRA_DEBUG_SPREAD` and `PONDRA_DEBUG_PG`
-(which prints each statement the Postgres port gets, as it arrives and as it runs) are for tests and
-debugging. `PONDRA_CRASH` aborts the process at chosen points, at random, to test recovery. Never
+`PONDRA_CRASH`, `PONDRA_DROP_BEATS`, `PONDRA_NO_DIRECT`, `PONDRA_DEBUG_SPREAD` (why each query ran on
+one node or across them, with the estimate that decided), `PONDRA_DEBUG_JOIN_ORDER` (each join order
+considered: the rows the order written moves, the rows the order chosen moves, and each input's size)
+and `PONDRA_DEBUG_PG` (which prints each statement the Postgres port gets, as it arrives and as it
+runs) are for tests and debugging. `PONDRA_CRASH` aborts the process at chosen points, at random, to test recovery. Never
 set it on a node that matters.
 </Aside>
