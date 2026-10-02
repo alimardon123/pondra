@@ -2,7 +2,9 @@
 # at https://alimardon123.github.io/pondra/. Its examples run in build.yml (tools/docs_check.py),
 # against the binary of the same commit.
 #
-# Once, in the repository's settings: Pages → Build and deployment → Source: "GitHub Actions".
+# Once, in the repository's settings: Pages → Build and deployment → Source: "GitHub Actions"; and
+# Environments → github-pages → Deployment branches and tags → a tag rule `v*` (Pages takes deploys
+# from main alone otherwise: v0.30.0's was refused "due to environment protection rules").
 name: Docs
 
 on:
