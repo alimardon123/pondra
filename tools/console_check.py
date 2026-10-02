@@ -237,7 +237,7 @@ def node_checks(browser, port, show):
     card = until(lambda: p.locator(".hcard").is_visible() and "BIGINT" in p.locator(".hcard").inner_text(), True)
     p.mouse.move(5, 5)
     checks["a SQL cell shows the rows, each column's type a mark and its card on hover; timestamps and decimals as written"] = heads == ["id", "name", "born", "at", "amt"] \
-        and rows[0] == ["1", "Ann", "1990-01-02", "2024-01-01 10:00:00", "1.50"] and rows[1][2] == "NULL" and c.locator(".n-rows").inner_text().startswith("3 rows · ") \
+        and rows[0] == ["1", "Ann", "1990-01-02", "2024-01-01 10:00:00", "1.50"] and rows[1][2] == "NULL" and c.locator(".n-rows").inner_text() == "3 rows" and re.fullmatch(r"[\d.]+ m?s", c.locator(".bar .st").inner_text()) \
         and [m.get_attribute("class") for m in c.locator("thead .ty-i").all()] == ["ty-i k-num", "ty-i k-text", "ty-i k-date", "ty-i k-time", "ty-i k-dec"] and card is True
     tree.locator(".row", has_text="orders").dblclick()  # (a table's first rows, in a new cell)
     peek = until(lambda: pg.grid(pg.cell(1))[1], [["1", "10.5"]])
@@ -941,9 +941,11 @@ def folders_checks(browser, port, show):
     checks["a file renamed from its ⋯ moves its open tab to the new name"] = moved == ["files/misc/blob.bin", "files/misc/new.txt"] and titles is True and pg.tab()[0] == "new.txt"
 
     p.locator('#left button[aria-label="Workspace: more"]').click()
+    p.locator("#menu:not([hidden])").wait_for(timeout=5000)  # (a view's menu: loaded the first time)
     group = items()
     p.keyboard.press("Escape")
     p.locator('#left button[aria-label="Data: more"]').click()
+    p.locator("#menu:not([hidden])").wait_for(timeout=5000)
     data = items()
     p.keyboard.press("Escape")
     p.click("#newfile")
