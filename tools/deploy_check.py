@@ -274,11 +274,16 @@ def helm(a):
         with Forward(ns, "svc/p-pondra-read", 8080) as port:
             check("…and through the readers' service", until(lambda: all(count(port, token=token) == 20000 for _ in range(4)), 30), count(port, token=token))
         before = kept()
+        uid = k("get", "pod", first, "-o", "jsonpath={.metadata.uid}")
         k("delete", "pod", first, "--grace-period=0", "--force", "--wait=false")
         t0 = time.time()
-        second = until(lambda: (l := leader()) and l != first and l, 120)
-        info["leader's pod deleted -> a new leader (s)"] = round(time.time() - t0, 1)
-        check("the leader's pod deleted: another leads, the pod back as a follower", second, {p: stats(p) for p in ("p-pondra-0", "p-pondra-1", "p-pondra-2")})
+        # Its pod comes back under its name, which is its address (ADR-005): it leads its term again
+        # when nobody claimed the next one meanwhile (a node finding the latest term its own resumes
+        # it), or follows whoever did.
+        second = until(lambda: k("get", "pod", first, "-o", "jsonpath={.metadata.uid}") != uid and leader(), 120)
+        info["leader's pod deleted -> one leader again (s)"] = round(time.time() - t0, 1)
+        info["…the leader then"] = "the same pod, its term resumed" if second == first else second
+        check("the leader's pod deleted: back under its name, one leader, the others following it", second, {p: stats(p) for p in ("p-pondra-0", "p-pondra-1", "p-pondra-2")})
         with Forward(ns, "svc/p-pondra", 8080) as port:
             wrote = until(lambda: sql(port, "INSERT INTO t VALUES (20001, now())", token=token), 60, every=1)
             check("…and the cluster takes writes", wrote and count(port, token=token) == 20001, count(port, token=token))
@@ -313,8 +318,10 @@ def chart(a):
     made = {v: render(*v.split(" ")) for v in ["replicas=1", "lake=s3://b/l", "lake=gs://b/l,readers.replicas=2,readers.autoscaling.enabled=true",
                                                  "sharedStorage.existingClaim=nfs,kafka.enabled=true,flight.enabled=true,ack=replicated",
                                                  "lake=az://c/l,tls.existingSecret=t,tls.mutual=true,python.enabled=true,ingress.enabled=true,ingress.hosts[0]=x.example.com,podMonitor.enabled=true",
-                                                 "lake=s3://b/l,auth.existingSecret=a,secretKey.existingSecret=k,persistence.enabled=false"]}
+                                                 "lake=s3://b/l,auth.existingSecret=a,secretKey.existingSecret=k,persistence.enabled=false,podAnnotations.round=2,podLabels.tier=1"]}
     check("the chart renders for every way it's meant to run", all(r.returncode == 0 for r in made.values()), {v: r.stderr[-300:] for v, r in made.items() if r.returncode})
+    given = made["lake=s3://b/l,auth.existingSecret=a,secretKey.existingSecret=k,persistence.enabled=false,podAnnotations.round=2,podLabels.tier=1"].stdout
+    check("pods' labels and annotations given as numbers are strings, as Kubernetes needs", given.count('round: "2"') == 1 and given.count('tier: "1"') == 1, given[:400])
     nodes = lambda r: r.stdout.count("kind: StatefulSet") == 1 and re.search(r"replicas: (\d+)", r.stdout.split("kind: StatefulSet")[1]).group(1)
     check("with nothing set, one node; on a bucket, three", nodes(render()) == "1" and nodes(made["lake=s3://b/l"]) == "3", (nodes(render()), nodes(made["lake=s3://b/l"])))
     refused = {"several nodes on a lake they can't share": ("replicas=3",), "readers without a shared lake": ("replicas=1", "readers.replicas=1"),

@@ -21,11 +21,11 @@ spec:
     metadata:
       labels: {{- include "pondra.selector" . | nindent 8 }}
         app.kubernetes.io/component: node
-        {{- with .Values.podLabels }}{{ toYaml . | nindent 8 }}{{- end }}
+        {{- with .Values.podLabels }}{{ include "pondra.strings" . | trim | nindent 8 }}{{- end }}
       annotations:
         # (new keys or tokens restart the nodes)
         checksum/secrets: {{ include (print $.Template.BasePath "/secrets.yaml") . | sha256sum | trunc 16 }}
-        {{- with .Values.podAnnotations }}{{ toYaml . | nindent 8 }}{{- end }}
+        {{- with .Values.podAnnotations }}{{ include "pondra.strings" . | trim | nindent 8 }}{{- end }}
     spec:
       {{- include "pondra.podSpec" . | nindent 6 }}
       terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}

@@ -192,3 +192,10 @@ tolerations: {{- toYaml . | nindent 2 }}
 topologySpreadConstraints: {{- toYaml . | nindent 2 }}
 {{- end }}
 {{- end -}}
+
+{{/* Labels or annotations given in values, every value a string (`--set podAnnotations.round=2` is a number, which Kubernetes refuses). */}}
+{{- define "pondra.strings" -}}
+{{- range $k, $v := . }}
+{{ $k }}: {{ $v | toString | quote }}
+{{- end }}
+{{- end -}}

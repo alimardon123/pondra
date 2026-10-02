@@ -197,7 +197,8 @@ deploy/compose/compose.yaml down`; add `-v` to delete the lake and the volumes t
 ## Kubernetes with Helm
 
 The chart runs the nodes as a StatefulSet. Each keeps its name, so a restarted node is the same member
-of the cluster, and any of them takes over as leader within seconds. It needs Kubernetes 1.25 or newer.
+of the cluster: a leader whose pod comes back quickly leads again, and if it stays down another node
+takes over within seconds. It needs Kubernetes 1.25 or newer.
 
 ```bash norun
 helm install pondra oci://ghcr.io/alimardon123/charts/pondra \
