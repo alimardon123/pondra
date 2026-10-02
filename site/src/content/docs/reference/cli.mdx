@@ -275,6 +275,7 @@ rows print as a table.
 | `--url URL` | none | run on the node at this URL |
 | `--token TOKEN` | `PONDRA_TOKEN` | a token for that node |
 | `--NAME VALUE` | none | the file's parameters, after `LAKE` |
+| `--help` | | this, and with `FILE` the file's parameters: each `DECLARE`'s type, default and comment |
 
 ```bash
 printf 'SELECT count(*) AS orders, $day AS day FROM orders;\n' > report.sql
@@ -282,6 +283,30 @@ pondra run report.sql shell-lake --day 2026-09-27
 ```
 
 ```text
++--------+------------+
+| orders | day        |
++--------+------------+
+| 3      | 2026-09-27 |
++--------+------------+
+```
+
+A file that declares its parameters (`DECLARE $day DATE = current_date - 1;`, with what each
+means in the comment above it: see [Variables](/pondra/reference/sql/#variables)) says so with
+`--help`, and a value given replaces the default, cast to its type:
+
+```bash
+printf -- '-- The day to count\nDECLARE $day DATE = current_date - 1;\nSELECT count(*) AS orders, $day AS day FROM orders;\n' > daily.sql
+pondra run daily.sql --help
+pondra run daily.sql shell-lake --day 2026-09-27
+```
+
+```text
+Usage: pondra run daily.sql [LAKE] [--day DATE]
+
+Parameters of daily.sql:
+  --day DATE  The day to count · default: current_date - 1
+
+Options: --url URL (a node already running), --token TOKEN (also PONDRA_TOKEN)
 +--------+------------+
 | orders | day        |
 +--------+------------+

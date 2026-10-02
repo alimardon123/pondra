@@ -279,6 +279,19 @@ class Pondra:
             return self._run(f"CALL run({_literal(where)}{given})", job=job)
         return Run(self, self._run(f"SELECT pondra.start('run', {_literal(where)}{given})", job=job).rows()[0]["run"])
 
+    @property
+    def vars(self):
+        """SQL's variables (`DECLARE $day …`, `$day = …`): this connection's, or, in a procedure or a
+        file run, the run's. `db.vars.day` (or `db.vars["day"]`) is `$day`; `db.vars.day = date(2026,
+        9, 30)` sets it, as `$day = DATE '2026-09-30'` does; `del db.vars.day` forgets it;
+        `dict(db.vars)` has them all."""
+        return Vars(self)
+
+    def parameters(self, file):
+        """A SQL file's parameters (`etl/orders.sql`): each `DECLARE $name [type] [= default]`, and each
+        `$name` it uses without setting (required), with the comment above it as its description."""
+        return self._run(f"SELECT * FROM pondra.parameters({_literal(str(file))})").rows()
+
     def _frame_rows(self, frame, format=None):
         """A frame's rows: a pyarrow Table, or (no pyarrow here) a list of dicts, or the text table
         `format="table"` asks for. A name the lake doesn't have is looked for among this
@@ -507,6 +520,69 @@ class Pondra:
 
     def __exit__(self, *_):
         self.close()
+
+
+class Vars:
+    """A connection's SQL variables (`db.vars`): `$day` is `db.vars.day` and `db.vars["day"]`."""
+
+    def __init__(self, db):
+        object.__setattr__(self, "_db", db)
+
+    def keys(self):
+        return [r["name"] for r in self._db._run("SELECT name FROM pondra.variables ORDER BY name").rows()]
+
+    def __iter__(self):
+        return iter(self.keys())
+
+    def __len__(self):
+        return len(self.keys())
+
+    def __contains__(self, name):
+        return name in self.keys()
+
+    def __getitem__(self, name):
+        _name(name)
+        rows = self._db._run(f"SELECT getvariable({_literal(name)}) AS value, (SELECT count(*) FROM pondra.variables WHERE name = {_literal(name)}) AS n").rows()
+        if not rows or not rows[0]["n"]:
+            raise KeyError(f"no variable ${name} (DECLARE ${name} … = …, or db.vars.{name} = …)")
+        return rows[0].get("value")
+
+    def __setitem__(self, name, value):
+        self._db._run(f"${_name(name)} = {_literal(value)}")
+
+    def __delitem__(self, name):
+        self._db._run(f"RESET VARIABLE {_name(name)}")
+
+    def __getattr__(self, name):
+        if name.startswith("__"):
+            raise AttributeError(name)
+        try:
+            return self[name]
+        except KeyError as e:
+            raise AttributeError(e.args[0]) from None
+
+    def __setattr__(self, name, value):
+        self[name] = value
+
+    def __delattr__(self, name):
+        del self[name]
+
+    def items(self):
+        names = self.keys()
+        if not names:
+            return []
+        row = self._db._run("SELECT " + ", ".join(f"getvariable({_literal(n)}) AS {_quote(n)}" for n in names)).rows()[0]
+        return [(n, row.get(n)) for n in names]
+
+    def __repr__(self):
+        return repr(dict(self.items()))
+
+
+def _name(name):
+    """A variable's name, as `$name` writes it."""
+    if not re.fullmatch(r"[A-Za-z_]\w*", str(name)):
+        raise ValueError(f"a variable's name is a letter or _ then letters, digits or _: not {name!r}")
+    return name
 
 
 class Run:

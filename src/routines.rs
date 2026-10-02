@@ -397,11 +397,19 @@ async fn check(lake: &Lake, name: &str, r: &Routine) -> Result<()> {
             }
         }
         Kind::Procedure if r.language == "sql" => {
-            let nulls = r.params.iter().map(|p| (p.name.clone(), Value::Null)).chain((1..=r.params.len()).map(|i| (i.to_string(), Value::Null))).collect();
+            let mut known: HashMap<String, Value> = r.params.iter().map(|p| (p.name.clone(), Value::Null)).chain((1..=r.params.len()).map(|i| (i.to_string(), Value::Null))).collect();
             for s in split(&r.body) {
-                if statement(&s).is_none() {
-                    bind(&s, &nulls).with_context(|| format!("{name}: {}", s.trim()))?;
+                use crate::vars::Change;
+                let (check, sets) = match crate::vars::change(&s) {
+                    Some(Change::Declare { name, default, .. }) => (default.map(|d| format!("SELECT {d}")), Some(name)), // (its variables: known after their DECLARE)
+                    Some(Change::Set { name, value }) => (Some(format!("SELECT {value}")), Some(name)),
+                    Some(Change::Reset(_)) => (None, None),
+                    None => (statement(&s).is_none().then(|| s.clone()), None),
+                };
+                if let Some(check) = check {
+                    bind(&check, &known).with_context(|| format!("{name}: {}", s.trim()))?;
                 }
+                known.extend(sets.map(|n| (n, Value::Null)));
             }
         }
         Kind::Procedure => {}
@@ -468,33 +476,113 @@ pub async fn listed(lake: &Lake) -> Result<Arc<HashMap<String, Routine>>> {
 /// request's own `views` (a client's frames, by name) by theirs. Text that needs none of it is
 /// left as it is (and so is text sqlparser can't read).
 pub async fn prepare(lake: &Lake, sql: &str, params: &HashMap<String, Value>, views: &HashMap<String, String>) -> Result<String> {
-    let sql = if params.is_empty() { sql.to_string() } else { bind(sql, params)? };
+    let values = crate::vars::values(params); // (the variables there are, the values given over them: `vars.rs`)
+    let numbered = values.keys().any(|k| k.starts_with(|c: char| c.is_ascii_digit())); // ($1 only when given: else a PREPARE's own)
+    let sql = match crate::vars::uses(sql) || !values.is_empty() && sql.contains('$') { // (a value given may be for spark_sql('…')'s text)
+        false => sql.to_string(),
+        true => match bind_as(sql, &values, numbered) {
+            Err(_) if !crate::vars::uses(sql) => sql.to_string(), // (text sqlparser can't read, using no variable: as it is)
+            out => out?,
+        },
+    };
     expand_with(lake, &sql, views).await
 }
 
-/// `$name` → the value given for it; every `$name` needs one.
-pub fn bind(sql: &str, params: &HashMap<String, Value>) -> Result<String> {
-    if !sql.contains('$') {
+/// `$name` → the value given for it; every `$name` needs one. `getvariable('name')` (DuckDB's) is
+/// its value too, NULL if there is none.
+pub fn bind(sql: &str, params: &HashMap<String, Value>) -> Result<String> { bind_as(sql, params, true) }
+
+/// `bind`, but Postgres's `$1`, `$2` left for whoever binds them (the Postgres port's protocol).
+pub fn bind_named(sql: &str, params: &HashMap<String, Value>) -> Result<String> { bind_as(sql, params, false) }
+
+fn bind_as(sql: &str, params: &HashMap<String, Value>, numbered: bool) -> Result<String> {
+    let getvariable = crate::vars::calls_getvariable(sql);
+    if !sql.contains('$') && !getvariable {
         return Ok(sql.to_string());
     }
     let sql = &crate::sparksql::inline(sql)?; // (a parameter of Spark SQL's is in its text: bound once it is Pondra's)
     let mut stmts = Parser::parse_sql(&GenericDialect {}, sql)?;
     let values = params.iter().map(|(k, v)| Ok((k.clone(), literal(v)?))).collect::<Result<HashMap<_, _>>>()?;
+    let bound = |p: &str| numbered || p.trim_start_matches('$').starts_with(|c: char| c.is_alphabetic() || c == '_');
+    named_as_written(&mut stmts, |e| {
+        let mut uses = false;
+        let _ = ast::visit_expressions(e, |x| {
+            uses |= match x {
+                Expr::Value(v) => matches!(&v.value, ast::Value::Placeholder(p) if bound(p)),
+                Expr::Function(f) => getvariable && object(&f.name) == "getvariable",
+                _ => false,
+            };
+            ControlFlow::<()>::Continue(())
+        });
+        uses
+    });
     let mut missing: Vec<String> = vec![];
     let _ = visit_expressions_mut(&mut stmts, |e| {
-        if let Expr::Value(v) = e {
-            if let ast::Value::Placeholder(p) = &v.value {
-                match values.get(p.trim_start_matches('$')) {
-                    Some(to) => *e = Expr::Nested(Box::new(to.clone())),
-                    None if !missing.contains(p) => missing.push(p.clone()),
-                    None => {}
+        match e {
+            Expr::Value(v) => {
+                if let ast::Value::Placeholder(p) = &v.value {
+                    let name = p.trim_start_matches('$');
+                    match values.get(name) {
+                        _ if !bound(p) => {}
+                        Some(to) => *e = Expr::Nested(Box::new(to.clone())),
+                        None if !missing.contains(p) => missing.push(p.clone()),
+                        None => {}
+                    }
                 }
             }
+            Expr::Function(f) if getvariable && object(&f.name) == "getvariable" => {
+                if let FunctionArguments::List(l) = &f.args {
+                    if let [FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(v)))] = &l.args[..] {
+                        if let ast::Value::SingleQuotedString(name) = &v.value {
+                            let null = || Expr::Value(ast::Value::Null.into());
+                            *e = Expr::Nested(Box::new(values.get(name.as_str()).cloned().unwrap_or_else(null)));
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
         ControlFlow::<()>::Continue(())
     });
-    ensure!(missing.is_empty(), "no value for {}", missing.join(", "));
+    ensure!(missing.is_empty(), "no value for {} (give it one, or declare it: DECLARE {} = …)", missing.join(", "), missing[0]);
     Ok(text(&stmts))
+}
+
+/// A select's columns that use a parameter or a variable, and have no name, named as written
+/// (`$day + 1`), not after the value put in their place (`arrow_cast('2026-09-29', 'Date32') + 1`).
+fn named_as_written(stmts: &mut [Statement], uses: impl Fn(&Expr) -> bool) {
+    struct Namer<F>(F);
+    impl<F: Fn(&Expr) -> bool> VisitorMut for Namer<F> {
+        type Break = ();
+        fn pre_visit_query(&mut self, q: &mut ast::Query) -> ControlFlow<()> {
+            let mut body = &mut *q.body;
+            while let ast::SetExpr::SetOperation { left, .. } = body {
+                body = left; // (a union's names are its first part's)
+            }
+            if let ast::SetExpr::Select(s) = body {
+                for item in s.projection.iter_mut() {
+                    if let ast::SelectItem::UnnamedExpr(e) = item {
+                        if (self.0)(e) {
+                            *item = ast::SelectItem::ExprWithAlias { alias: ast::Ident::with_quote('"', e.to_string()), expr: e.clone() };
+                        }
+                    }
+                }
+            }
+            ControlFlow::Continue(())
+        }
+    }
+    let mut namer = Namer(uses);
+    for s in stmts {
+        let _ = s.visit(&mut namer);
+    }
+}
+
+/// A SQL type as written (`DATE`, `DECIMAL(10, 2)`), read.
+pub fn data_type(t: &str) -> Result<ast::DataType> {
+    let mut p = Parser::new(&GenericDialect {}).try_with_sql(t)?;
+    let ty = p.parse_data_type()?;
+    ensure!(p.peek_token().token == Token::EOF, "{t}: not a type");
+    Ok(ty)
 }
 
 /// A parameter's value as SQL: JSON's strings, numbers, booleans, null and lists as literals;
@@ -527,6 +615,7 @@ fn text(stmts: &[Statement]) -> String { stmts.iter().map(|s| s.to_string()).col
 pub async fn expand(lake: &Lake, sql: &str) -> Result<String> { expand_with(lake, sql, &HashMap::new()).await }
 
 async fn expand_with(lake: &Lake, sql: &str, views: &HashMap<String, String>) -> Result<String> {
+    let sql = &crate::vars::parameters_in(lake, sql).await?; // (`pondra.parameters('etl/orders.sql')`: a file's parameters, as rows)
     if let Some(q) = show(sql) {
         return Ok(q);
     }
@@ -1019,7 +1108,7 @@ pub fn split(text: &str) -> Vec<String> {
 }
 
 /// `$$` or `$tag$` where a dollar-quoted string starts (not `$1` or `$name`: parameters).
-fn dollar_tag(s: &str) -> Option<&str> {
+pub(crate) fn dollar_tag(s: &str) -> Option<&str> {
     let end = s[1..].find('$')? + 2;
     let inner = &s[1..end - 1];
     (inner.chars().all(|c| c.is_alphanumeric() || c == '_') && !inner.starts_with(|c: char| c.is_ascii_digit())).then(|| &s[..end])
@@ -1042,6 +1131,9 @@ pub async fn one(app: &App, sql: &str, who: Who, job: Option<String>) -> Result<
 }
 
 async fn one_of(app: &App, sql: &str, who: Who, job: Option<String>) -> Result<Outcome> {
+    if let Some(c) = crate::vars::change(sql) {
+        return Box::pin(crate::vars::apply(app, c)).await; // (DECLARE $day …, $day = …: the scope's variable)
+    }
     if crate::write::checkpoint(sql) {
         ensure!(who.role >= Role::Write, "CHECKPOINT needs a write token");
         return Ok(Outcome::Done(app.checkpoint().await?));
@@ -1089,13 +1181,29 @@ async fn one_of(app: &App, sql: &str, who: Who, job: Option<String>) -> Result<O
 
 /// A script's statements, each in turn; the last one's outcome. With a `job`, each gets its own
 /// (`{job}:{i}`): the script run again with the same job applies each write once.
+/// `params` are the values it was given (`vars.rs`): `$name` is one until something sets it, and a
+/// `DECLARE` takes one in place of its default.
 pub async fn script(app: &App, sql: &str, params: &HashMap<String, Value>, views: &HashMap<String, String>, who: Who, job: Option<String>) -> Result<Outcome> {
+    let go = script_of(app, sql, views, who, job);
+    match crate::vars::in_run() && params.is_empty() {
+        true => go.await, // (a file run's cell, a lent connection's request: the run's values)
+        false => crate::vars::run(params.clone(), go).await, // (with no session, a DECLARE says it needs one)
+    }
+}
+
+async fn script_of(app: &App, sql: &str, views: &HashMap<String, String>, who: Who, job: Option<String>) -> Result<Outcome> {
     let (all, mut last) = (split(sql), Outcome::Done(j!({})));
     for (i, s) in all.iter().enumerate() {
-        let s = prepare(&app.lake, s, params, views).await?;
         let job = job.as_ref().map(|j| if all.len() == 1 { j.clone() } else { format!("{j}:{i}") });
-        last = match Box::pin(one(app, &s, who, job)).await {
-            Err(e) if all.len() > 1 => return Err(e.context(format!("statement {}: {}", i + 1, short(&s)))),
+        let out = async {
+            let s = match crate::vars::change(s) {
+                Some(_) => s.clone(), // (`DECLARE $day …`, `$day = …`: worked out by `one`)
+                None => prepare(&app.lake, s, &HashMap::new(), views).await?,
+            };
+            Box::pin(one(app, &s, who, job)).await
+        };
+        last = match out.await {
+            Err(e) if all.len() > 1 => return Err(e.context(format!("statement {}: {}", i + 1, short(s)))),
             r => r?,
         };
     }
@@ -1193,14 +1301,15 @@ async fn run(app: &App, name: String, r: Routine, row: RecordBatch, who: Who, jo
     };
     let inner = Who { depth: who.depth + 1, ..who };
     let mut heard = vec![];
-    let out = match r.python() {
-        true => Box::pin(python(app, &name, &r, row, inner, job, &mut heard)).await,
-        false => {
+    let out = match (r.python(), name == "do") {
+        (true, true) => Box::pin(python(app, &name, &r, row, inner, job, &mut heard)).await, // (a session's DO: the session's variables)
+        (true, false) => Box::pin(crate::vars::own(HashMap::new(), python(app, &name, &r, row, inner, job, &mut heard))).await,
+        (false, _) => {
             let mut values = values_of(&row)?;
             for (i, p) in r.params.iter().enumerate() {
                 values.insert((i + 1).to_string(), values[&p.name].clone()); // ($1: the first)
             }
-            Box::pin(script(app, &r.body, &values, &HashMap::new(), inner, job)).await
+            Box::pin(crate::vars::own(values, script(app, &r.body, &HashMap::new(), &HashMap::new(), inner, job))).await // (a procedure's variables are its own)
         }
     };
     let _ = log.end(app, &out, heard); // (written a moment later: a call doesn't wait for its log)

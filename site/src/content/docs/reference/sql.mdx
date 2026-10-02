@@ -49,7 +49,7 @@ on bytes as they do on text. A `CAST` to bytes takes `BYTEA` only.
 |---|---|
 | `SELECT … FROM t` | any DataFusion query: joins, `WITH`, windows, `VALUES`, sub-queries |
 | `FROM t [SELECT …] [WHERE …] [GROUP BY …] [ORDER BY …] [LIMIT n]` | DuckDB's form: the `FROM` first, then any clauses |
-| `$name` | a parameter, bound by the node and never pasted into the text |
+| `$name` | a [variable](#variables) or a parameter, bound by the node and never pasted into the text |
 | `FROM a ASOF JOIN b MATCH_CONDITION (a.ts >= b.ts) ON a.k = b.k` | each row gets the other table's row as it was at that moment (`>=`, `>`, `<=`, `<`) |
 | `EXPLAIN SELECT …` | the plan, and whether it would spread over the nodes |
 | `DESCRIBE t`, `SHOW TABLES`, `SHOW COLUMNS FROM t` | what the lake holds |
@@ -271,6 +271,42 @@ EXECUTE older (30);
 ```text
 name
 ann
+```
+
+## Variables
+
+A variable holds one value for the statements after it. It is a session's, as settings are (a
+Postgres connection's, a client's, or one script's); a procedure and a file run have their own.
+
+| Statement | Syntax |
+|---|---|
+| Declare | `DECLARE $name [type] [= value]` (or `DEFAULT value`): type and value both optional |
+| Change | `$name = value` |
+| Use | `$name` wherever a value goes, or `getvariable('name')` (DuckDB's; NULL when there is none) |
+| Forget | `RESET VARIABLE name` |
+| List | `SELECT * FROM pondra.variables` (name, value, type, declared) |
+
+- The value is worked out once, when it is set, and bound wherever `$name` is used, never pasted
+  into the text: `$day = current_date - 1` is one day for every statement after it.
+- A declared type holds: each value the variable takes is cast to it, and one that can't be is
+  refused. `$name = …` needs no `SET`; DuckDB's `SET VARIABLE name = value` is the same.
+  `SET` alone is a setting's ([above](#settings-and-prepared-statements)).
+- A column that uses a variable and has no name is named as written: `$day`, `$day + 1`.
+- In a file, a `DECLARE` is a parameter with a default: a run's value for it takes the default's
+  place, cast to its type ([Run files as jobs](/pondra/guides/workspace/#parameters-declared)).
+  Python's `db.vars.day` is `$day` ([Python client](/pondra/reference/python/)).
+
+```sql
+CREATE TABLE daily (day DATE, amount DOUBLE);
+INSERT INTO daily VALUES (DATE '2026-09-29', 10), (DATE '2026-09-30', 20);
+DECLARE $day DATE = DATE '2026-09-30';
+$day = $day - 1;
+SELECT $day, sum(amount) AS total FROM daily WHERE day = $day;
+```
+
+```text
+$day       | total
+2026-09-29 | 10.0
 ```
 
 ## Schemas and other lakes

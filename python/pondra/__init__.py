@@ -29,8 +29,8 @@ from .client import Pondra, PondraError, Result, Run, binary, connect, current, 
 from .frame import Expr, Frame, GroupBy, coalesce, col, concat, concat_str, fn, lit, sql_expr, when
 from .frame import all, count, first, last, len, max, mean, median, min, n_unique, sum  # noqa: A004 (Polars' names)
 
-__version__ = "0.29.0"
-__all__ = ["connect", "local", "current", "sql", "table", "read_parquet", "read_csv", "read_json", "read_delta", "read_iceberg", "call", "run", "secret", "fn", "Pondra", "PondraError", "Result", "Run", "Frame", "Expr", "GroupBy", "col", "lit", "when",
+__version__ = "0.30.0"
+__all__ = ["connect", "local", "current", "sql", "table", "read_parquet", "read_csv", "read_json", "read_delta", "read_iceberg", "call", "run", "secret", "parameters", "fn", "Pondra", "PondraError", "Result", "Run", "Frame", "Expr", "GroupBy", "col", "lit", "when",
            "sql_expr", "coalesce", "concat", "concat_str",
            "all", "count", "first", "last", "len", "max", "mean", "median", "min", "n_unique", "sum"]
 
@@ -90,6 +90,17 @@ def run(file, **params):
 def secret(name):
     """A secret's values, in a procedure (`Pondra.secret`)."""
     return current().secret(name)
+
+
+def parameters(file):
+    """A SQL file's parameters, on the current connection (`Pondra.parameters`)."""
+    return current().parameters(file)
+
+
+def __getattr__(name):
+    if name == "vars":  # (`pondra.vars.day`: the current connection's SQL variables, `$day`; in a file run, the run's)
+        return current().vars
+    raise AttributeError(f"module 'pondra' has no attribute {name!r}")
 
 
 def load_ipython_extension(ipython):

@@ -186,6 +186,14 @@ fn user_error(e: anyhow::Error) -> PgWireError {
 impl Backend {
     /// Run one statement the way `POST /sql` does, for a client whose role comes from its user name.
     async fn run(&self, user: &str, sql: &str, format: &Format) -> PgWireResult<Response> {
+        if let Some(c) = crate::vars::change(sql) {
+            // DECLARE $day …, $day = …: this connection's variable (`vars.rs`)
+            let tag = c.tag();
+            Box::pin(crate::vars::apply(&self.app, c)).await.map_err(user_error)?;
+            return Ok(Response::Execution(Tag::new(tag)));
+        }
+        let bound = crate::vars::bound(sql).map_err(user_error)?; // (`$day`: its value; `$1` is the protocol's)
+        let sql: &str = &bound;
         let reader = crate::auth::current().is_some_and(|p| p.role >= crate::auth::Role::Read);
         if reader && crate::txn::open() && crate::txn::refuse().is_ok() {
             if let Some(b) = crate::txn::point_read(&self.app.lake, sql).await.map_err(user_error)? {
@@ -867,9 +875,11 @@ impl Backend {
             None => crate::serve::point(&self.app.lake, sql).await.ok().flatten().and_then(|p| p.schema().ok()), // (a key lookup's columns, unplanned, first)
             Some(_) => None,
         };
-        if point.is_none() && (session_command(sql).is_some() || crate::settings::is(sql) || crate::write::parse(sql).is_some() || Copy::of(sql).is_some()) {
+        if point.is_none() && (session_command(sql).is_some() || crate::settings::is(sql) || crate::vars::change(sql).is_some() || crate::write::parse(sql).is_some() || Copy::of(sql).is_some()) {
             return Ok(vec![]); // (a COPY's columns come with its data)
         }
+        let bound = crate::vars::bound(sql).map_err(user_error)?; // (`$day`: the connection's variable)
+        let sql: &str = &bound;
         let schema = match point {
             Some(s) => s,
             None => {

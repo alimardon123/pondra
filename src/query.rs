@@ -766,6 +766,9 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
                 system.register_table(name.into(), table)?;
             }
         }
+        if crate::vars::mentioned(&text) {
+            system.register_table("variables".into(), crate::vars::table()?)?; // (the session's or the run's: `vars.rs`)
+        }
         default.register_schema("pondra", system)?;
     }
     if let Ok(sent) = SENT.try_with(|t| t.clone()) {

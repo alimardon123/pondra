@@ -38,12 +38,12 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v5
-      - name: The build workflow's, for this commit (what a release publishes)
+      - name: The build workflow's, for this commit (what a release publishes; a pull request's, if main reused it)
         if: inputs.binary == 'ci'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          run=$(gh run list --workflow build.yml --commit "$GITHUB_SHA" --status success --limit 1 --json databaseId --jq '.[0].databaseId')
+          run=$(bash tools/ci_build.sh "$GITHUB_SHA")
           [ -n "$run" ] || { echo "::error::no passing build run for $GITHUB_SHA: wait for it, or use binary: build"; exit 1; }
           gh run download "$run" --name pondra-linux-x64 --dir dl && tar -xzf dl/pondra-linux-x64.tar.gz pondra
       - name: Or build from source

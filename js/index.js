@@ -15,6 +15,7 @@ import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { createServer } from "node:net";
 
+const varName = (n) => { if (!/^[A-Za-z_]\w*$/.test(n)) throw new Error(`${n}: not a variable's name (letters, digits and _, not first a digit)`); return n; };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 export class Pondra {
@@ -57,6 +58,28 @@ export class Pondra {
     const given = names.map((n, i) => `, "${n.replace(/"/g, '""')}" => $p${i}`).join("");
     return this.sql(`CALL run($file${given})`, { file, ...Object.fromEntries(names.map((n, i) => [`p${i}`, params[n]])) });
   }
+
+  /** This connection's SQL variables (`DECLARE $day DATE = …`, `$day = …`: ADR-037), as an object
+   * of their values. */
+  async vars() {
+    const names = (await this.sql("SELECT name FROM pondra.variables ORDER BY name")).map(r => r.name);
+    if (!names.length) return {};
+    const [row] = await this.sql(`SELECT ${names.map(n => `getvariable('${n}') AS "${n}"`).join(", ")}`);
+    return Object.fromEntries(names.map(n => [n, row[n] ?? null]));
+  }
+
+  /** A variable's value (DuckDB's `getvariable`), null if none. */
+  async getVariable(name) { return (await this.sql(`SELECT getvariable('${varName(name)}') AS value`))[0]?.value ?? null; }
+
+  /** Set a variable (SQL's `$name = …`): `value` bound, never pasted in. */
+  async setVariable(name, value) { await this.sql(`$${varName(name)} = $value`, { value }); }
+
+  /** Forget a variable (`RESET VARIABLE`). */
+  async resetVariable(name) { await this.sql(`RESET VARIABLE ${varName(name)}`); }
+
+  /** A SQL file's parameters (its DECLAREs: name, type, default, required, description), a file of
+   * the lake's: `await db.parameters("etl/orders.sql")`. */
+  async parameters(file) { return this.sql(`SELECT * FROM pondra.parameters('${String(file).replace(/'/g, "''")}')`); }
 
   /** A stored procedure (`CREATE PROCEDURE`), called, as Python's `con.call`: `await db.call("load_day", "2026-09-27")`. */
   async call(name, ...args) {

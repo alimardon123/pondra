@@ -192,6 +192,7 @@ struct Lent {
     files: bool,
     secrets: Vec<String>,
     session: Option<String>, // (its caller's temporary tables are its own too: `temp.rs`)
+    vars: crate::vars::Lent, // (its run's variables and given values: `db.vars` is `$name`)
 }
 
 /// A table as the catalog names it (`t` for `public.t`, `s.t`; another lake's `l.s.t` stays).
@@ -207,7 +208,7 @@ static LENT: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<Stri
 pub fn lend(role: Role, files: bool) -> Lease {
     let token = format!("lease-{}", uuid::Uuid::new_v4().simple());
     let who = current().filter(|p| p.role >= role).unwrap_or_else(|| Principal::of(role));
-    LENT.lock().unwrap().insert(token.clone(), Lent { role, who, files, secrets: vec![], session: crate::temp::current() });
+    LENT.lock().unwrap().insert(token.clone(), Lent { role, who, files, secrets: vec![], session: crate::temp::current(), vars: crate::vars::lend() });
     Lease(token)
 }
 
@@ -216,6 +217,9 @@ pub fn lent(token: Option<&str>) -> Option<(Role, bool)> { LENT.lock().unwrap().
 
 /// The session of the caller a lent token's procedure runs for.
 pub fn lent_session(token: Option<&str>) -> Option<String> { LENT.lock().unwrap().get(token?).and_then(|l| l.session.clone()) }
+
+/// The variables of the run a lent token's code runs in (`vars::within`).
+pub fn lent_vars(token: Option<&str>) -> Option<crate::vars::Lent> { LENT.lock().unwrap().get(token?).map(|l| l.vars.clone()) }
 
 /// A secret's values, read by a lent token's procedure: kept, to be blanked out of its notices,
 /// its error and the run log. False: not a lent token (only a procedure's code reads a secret).

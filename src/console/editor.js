@@ -4,7 +4,7 @@ import { h, esc, S, ident, sqlType, SQL_KW, menu, toast } from './core.js';
 
 // ------------------------------------------------------------------ highlighting
 const PY_KW = new Set('False None True and as assert async await break class continue def del elif else except finally for from global if import in is lambda nonlocal not or pass raise return try while with yield match case'.split(' '));
-const SQL_TOKEN = /--.*|\/\*|'|"|\b\d+(?:\.\d+)?(?:[eE][+-]?\d+)?\b|[A-Za-z_][\w$]*/g;
+const SQL_TOKEN = /--.*|\/\*|'|"|\$\w+|\b\d+(?:\.\d+)?(?:[eE][+-]?\d+)?\b|[A-Za-z_][\w$]*/g;
 const PY_TOKEN = /#.*|[rRbBfFuU]{0,2}(?:"""|'''|"|')|\b\d[\d_]*(?:\.\d+)?(?:[eE][+-]?\d+)?\b|[A-Za-z_]\w*/g;
 // (Markdown: headings, list marks and quotes, code, emphasis, links and pictures; `md.js` draws it)
 const MD_TOKEN = /^#{1,6}\s.*$|^\s*(?:[-*+]|\d+[.)])(?=\s)|^\s*>|^\s*(?:```|~~~).*$|`[^`]*`|\*\*[^*]+\*\*|(?<![\w*])[*_][^*_\s][^*_]*[*_](?![\w*])|~~[^~]+~~|!?\[[^\]]*\]\([^)]*\)/g;
@@ -42,7 +42,7 @@ const LINE = {
         const e = end(q, m.index + t.length);
         if (e < 0) return [out + span(cls(q), s.slice(m.index)), q];
         out += span(cls(q), s.slice(m.index, e)); SQL_TOKEN.lastIndex = e;
-      } else out += t[0] === '-' ? span('c', t) : word(s, m, SQL_KW, true);
+      } else out += t[0] === '-' ? span('c', t) : t[0] === '$' ? span('nu', t) : word(s, m, SQL_KW, true);
       i = SQL_TOKEN.lastIndex;
     }
     return [out + esc(s.slice(i)), ''];
@@ -86,7 +86,7 @@ export const highlighted = (text, lang) => highlight(text, lang).join('\n');
 // ------------------------------------------------------------------ the editor
 export const LINE_H = 21; // (px: --code-lh in console.css)
 let charW = 0;
-const measure = () => { if (!charW) { const c = document.createElement('canvas').getContext('2d'); c.font = `13px ${getComputedStyle(document.body).getPropertyValue('--mono')}`; charW = c.measureText('0').width || 7.8; } return charW; };
+export const measure = () => { if (!charW) { const c = document.createElement('canvas').getContext('2d'); c.font = `13px ${getComputedStyle(document.body).getPropertyValue('--mono')}`; charW = c.measureText('0').width || 7.8; } return charW; };
 
 /** Code with its highlighting: `new Editor({ language, value, gutter, grow, placeholder })`.
  * `grow`: as tall as its lines (a notebook cell); else it fills its box and scrolls (a file).
@@ -109,6 +109,7 @@ export class Editor {
     this.ta.addEventListener('blur', () => { if (cm?.ed === this) closeComplete(); });
     this.ta.addEventListener('scroll', () => { this.ta.scrollTop = 0; this.ta.scrollLeft = 0; }); // (the box scrolls, never the textarea: it is as big as its text)
     this.ta.addEventListener('contextmenu', e => { e.preventDefault(); this.contextMenu(e); });
+    this.ta.addEventListener('mousemove', e => this.onhover?.(e));
     this.paint();
   }
   /** Its right-click menu, as an application's: cut, copy, paste, select all, comment, and what its
@@ -277,6 +278,7 @@ export function complete(ed, force) {
   const low = word.toLowerCase(), seen = new Set(), all = [];
   const push = (text, ty, rank) => { if (!seen.has(text) && text.toLowerCase().startsWith(low) && text.toLowerCase() !== low) { seen.add(text); all.push({ text, ty, rank }); } };
   if (ed.language === 'sql') {
+    if (word[0] === '$') for (const n of [...ta.value.matchAll(/\$([A-Za-z_]\w*)/g)].map(m => m[1]).concat(S.sqlVars || [])) push('$' + n, 'variable', 0);
     const named = (S.objects || []).filter(t => new RegExp(`\\b${t.t.replace(/[^\w]/g, '')}\\b`, 'i').test(ta.value));
     for (const t of named) for (const col of t.columns) push(ident(col.n), sqlType(col.d), 0);
     for (const t of S.objects || []) push(t.q, t.o.kind, 1);

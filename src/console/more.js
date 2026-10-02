@@ -1,7 +1,7 @@
 // The console's rarer parts (ADR-034, round 29), loaded when first used, so the page's first load
 // doesn't carry them: the History view (the node's runs, what this page ran), the Variables view,
 // search (Ctrl K), choosing the Python, a file run as a job or on a schedule. What they use of the shell comes through `R.helpers`.
-import { h, $, secs, count, bytes, utc, icon, svg, S, R, call, run, doBlock, rows, ident, quote, toast, menu, prompt, confirmed, pop, fileUrl, fileSql, writeFile, moreStyle } from './core.js';
+import { on, h, $, secs, count, bytes, utc, icon, svg, S, R, call, run, doBlock, rows, ident, quote, toast, menu, prompt, confirmed, pop, fileUrl, fileSql, writeFile, moreStyle } from './core.js';
 import { highlighted } from './editor.js';
 import { copyText } from './grid.js';
 import { iconOf, oneLine, FOLDER, download } from './files.js';
@@ -52,12 +52,19 @@ export async function choosePython() {
   } catch (e) { list.replaceChildren(h('pre', { class: 'err' }, e.message)); }
 }
 
+on('ran', (what, r, who) => { if (S.tab === 'variables' && /\$\w+\s*=|\b(declare|variable)\b/i.test(what?.src || who?.src || '')) detail(); }); // (a SQL variable set: shown at once)
 export async function variables() {
   let v;
+  const sql = (await import('./params.js')).sqlVars();
   try { v = await readVars(); } catch (e) { return [h('pre', { class: 'err' }, e.message)]; }
-  return [head('var', 'Variables', v.busy ? 'a cell is running: they show when it is done' : v.running ? `${S.vars.length} in this page's Python` : 'no Python yet: a Python cell or file starts it'),
+  const one = (name, ty, look) => h('div', { class: 'var' }, h('div', { class: 'line1' }, h('span', { class: 'nm' }, name), h('span', { class: 'ty' }, ty)), h('div', { class: 'look' }, look));
+  const vars = await sql;
+  const py = v.busy ? 'a cell is running: they show when it is done' : v.running ? `${S.vars.length} in this page's Python` : vars.length ? '' : 'no Python yet: a Python cell or file starts it';
+  return [head('var', 'Variables', [py, vars.length && `${vars.length} in SQL`].filter(Boolean).join(' · ')),
     h('div', { class: 'acts2' }, act('restart', 'Restart', 'Stop this page\'s Python: its variables go (its temporary tables stay)', restart), act('refresh', 'Refresh', 'Read them again', () => detail())),
-    ...S.vars.map(x => h('div', { class: 'var' }, h('div', { class: 'line1' }, h('span', { class: 'nm' }, x.name), h('span', { class: 'ty' }, x.type + (x.size ? ` · ${x.size}` : ''))), h('div', { class: 'look' }, x.look)))];
+    ...S.vars.map(x => one(x.name, x.type + (x.size ? ` · ${x.size}` : ''), x.look)),
+    // (SQL's: DECLARE $day DATE = …, $day = …; this page's session holds them)
+    vars.length ? h('h4', { class: 'vhead' }, 'SQL') : null, ...vars.map(x => one('$' + x.name, (x.type || '').toLowerCase(), x.value ?? 'NULL'))];
 }
 
 /** History: what ran, newest first: the node's runs (jobs, files run, procedures, schedules' runs:

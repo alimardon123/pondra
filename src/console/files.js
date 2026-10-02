@@ -217,57 +217,51 @@ export class SqlDoc extends TextDoc {
     this.pbar = h('div', { class: 'params', role: 'group', 'aria-label': 'Parameters', hidden: true });
     this.main.prepend(this.pbar);
     splitPanel(this, this.panel);
-    this.ed.menu = some => ['-', { label: some ? 'Run selection' : 'Run file', icon: 'play', keys: 'Ctrl Enter', run: () => this.run() }, this.explainItem(), ...this.ed.formats(formatSql, 'file', true), '-', ...this.jobs(true)];
+    this.ed.menu = some => ['-', ...this.runItems(some), this.explainItem(), ...this.ed.formats(formatSql, 'file', true), '-', ...this.jobs(true)];
+    this.ed.onhover = e => /\$[A-Za-z_]/.test(this.ed.value) && import('./params.js').then(m => m.hover(this, e));
     this.draw(); this.paramsBar();
   }
-  /** The statement the caret is in, or what is selected: what Create as… makes a table or a view of. */
-  current() {
-    const sel = this.ed.selected(), v = this.ed.value, at = this.ed.ta.selectionStart, list = statements(v);
-    if (sel) return sel;
-    let seek = 0;
-    for (const q of list) { const i = v.indexOf(q, seek); seek = i < 0 ? seek : i + q.length; if (i >= 0 && at <= seek + 1) return q; }
-    return list.at(-1) || '';
+  /** The statement the caret is in (just after its `;` too), and where it starts. */
+  statementAt() {
+    const v = this.ed.value, at = this.ed.ta.selectionStart;
+    let seek = 0, last = ['', 0];
+    for (const q of statements(v)) { const i = v.indexOf(q, seek); if (i < 0) continue; seek = i + q.length; last = [q, i]; if (at <= seek + 1) break; }
+    return last;
   }
+  /** What is selected, or the statement the caret is in: what Explain and Create as… take. */
+  current() { return this.ed.selected() || this.statementAt()[0]; }
   /** Explain: the plan of the statement selected, or the one the caret is in, without running it. */
   explain() { const x = R.helpers.explain(this.current(), this.params()); this.results = [x]; this.result = x; this.todo = 1; this.tab = 'results'; this.draw(); R.helpers.pane('bottom', true); }
+  /** Run the file, Run statement: the keys each takes as Settings say (a selection: Ctrl+Enter). */
+  runItems(some, both) {
+    const st = R.helpers.prefs('enter') === 'statement', go = what => () => { const ta = this.ed.ta; ta.setSelectionRange(ta.selectionStart, ta.selectionStart); this.run(what); };
+    return [some && !both ? { label: 'Run selection', icon: 'play', keys: 'Ctrl Enter', run: () => this.run() } : null, { label: 'Run file', icon: both ? null : 'play', keys: some ? null : st ? null : 'Ctrl Enter', run: go('file') },
+      { label: 'Run statement', keys: some ? 'Ctrl Shift Enter' : st ? 'Ctrl Enter' : 'Ctrl Shift Enter', run: go('statement') }];
+  }
   explainItem() { return { label: 'Explain: its plan, not run', icon: 'plan', keys: 'Ctrl Shift E', run: () => this.explain() }; }
   /** Format the SQL selected (or all of it): its words in capitals, a clause a line. */
   format() { this.ed.reformat(formatSql); }
   key(e) {
     if (e.shiftKey && e.altKey && e.key.toLowerCase() === 'f') { e.preventDefault(); this.format(); return true; }
     if (e.shiftKey && (e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'e') { e.preventDefault(); this.explain(); return true; }
+    if (e.shiftKey && (e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); this.run('statement'); return true; }
     return super.key(e);
   }
   get hasPanel() { return true; }
   changed() { super.changed(); clearTimeout(this.pt); this.pt = setTimeout(() => { this.paramsBar(); this.marks(); }, 250); }
-  /** The file's `$name`s, an input each above the editor: their values go with every run, bound
-   * on the node (ADR-033), and are kept in this browser for the file. */
-  paramsBar() {
-    const names = parameters(this.ed.value), key = 'pondra.params:' + (this.path || this.untitled);
-    this.kept ??= store.json(key, {});
-    this.pbar.hidden = !names.length;
-    if (names.join() === this.shownParams) return;
-    this.shownParams = names.join();
-    fill(this.pbar, h('span', { class: 'plabel' }, 'Parameters'), names.map(n => h('label', { class: 'param' }, h('span', {}, '$' + n),
-      h('input', { value: this.kept[n] ?? '', spellcheck: 'false', placeholder: 'a value', 'aria-label': `The value of $${n}`,
-        oninput: e => { this.kept[n] = e.target.value; store.set(key, JSON.stringify(this.kept)); }, onkeydown: e => { if (e.key === 'Enter') this.run(); } }))));
-  }
-  /** The parameters' values as the node takes them: numbers and true/false as such, the rest as text. */
-  params() {
-    return Object.fromEntries(parameters(this.ed.value).filter(n => (this.kept?.[n] ?? '') !== '').map(n => {
-      const v = this.kept[n].trim();
-      return [n, /^-?\d+(\.\d+)?$/.test(v) && Math.abs(+v) < 2 ** 53 ? +v : v === 'true' || v === 'false' ? v === 'true' : v];
-    }));
-  }
-  /** Run the file, or what is selected: each statement its own answer (in order, stopping at a
-   * failure), or — as Settings may say — all of it at once, the last one's answer. */
-  async run() {
-    const sel = this.ed.selected(), from = sel ? this.ed.ta.selectionStart : 0, text = (sel || this.ed.value).trim();
+  /** The file's parameters, an input each above the editor (params.js, loaded once it says `$name`). */
+  paramsBar() { if (/\$[A-Za-z_]/.test(this.ed.value) || !this.pbar.hidden) import('./params.js').then(m => m.bar(this)); }
+  /** The values its runs send for its parameters (as the bar has them). */
+  params() { return this.given || {}; }
+  /** Run what is selected, else the file or the statement the caret is in (`what`, else as Settings
+   * say Ctrl+Enter does): each statement its own answer (in order, stopping at a failure), or, as
+   * Settings may say, all of it at once, the last one's answer. */
+  async run(what) {
+    const sel = this.ed.selected(), [whole, from] = sel ? [sel, this.ed.ta.selectionStart] : (what || R.helpers.prefs('enter')) === 'statement' ? this.statementAt() : [this.ed.value, 0], text = whole.trim();
     if (!text) return;
     this.ctl?.abort();
     const ctl = this.ctl = new AbortController(), each = (R.helpers.prefs('statements') || 'each') === 'each';
     const list = each ? statements(text) : [text];
-    const whole = sel || this.ed.value;
     let seek = 0;
     const places = list.map(q => { const at = whole.indexOf(q, seek); seek = at < 0 ? seek : at + q.length; return at < 0 ? null : [from + at, from + at + q.length]; }); // (where each is, to point at it)
     this.running = true; this.plan = null; this.results = []; this.result = null; this.todo = list.length; R.helpers.toolbar();
@@ -316,7 +310,7 @@ export class SqlDoc extends TextDoc {
       split('down', 'Download the rows as CSV (all of them: the statement runs again on the node)', () => rowsOk && fetchRows(r, 'csv', name),
         () => [{ head: 'Download every row (it runs again)' }, ...DOWNLOADS.map(([f, label]) => ({ label, run: () => fetchRows(r, f, name) }))], !rowsOk),
       h('button', { class: 'icon', title: this.layout === 'right' ? 'Move the results below' : 'Move the results to the right', 'aria-label': 'Move the results', onclick: () => { this.layout = this.layout === 'right' ? 'below' : 'right'; R.helpers.prefs('results', this.layout); this.place(); this.draw(); } }, icon(this.layout === 'right' ? 'panelBelow' : 'panelRight')));
-    if (!r) { this.body.replaceChildren(h('div', { class: 'wait' }, this.running ? 'Running…' : h('span', {}, 'Run the file, or what is selected: ', h('kbd', {}, 'Ctrl'), ' ', h('kbd', {}, 'Enter')))); return; }
+    if (!r) { this.body.replaceChildren(h('div', { class: 'wait' }, this.running ? 'Running…' : h('span', {}, `Run the ${R.helpers.prefs('enter') || 'file'}, or what is selected: `, h('kbd', {}, 'Ctrl'), ' ', h('kbd', {}, 'Enter')))); return; }
     const many = this.results?.length > 1 || this.running && this.todo > 1;
     if (this.tab === 'results') {
       const strip = many ? h('div', { class: 'stmts', role: 'group', 'aria-label': 'The statements\' answers, numbered as in the file' }, this.results.map((x, k) =>
@@ -346,9 +340,8 @@ export class SqlDoc extends TextDoc {
       : h('span', { class: 'pill', title: 'The lake the file runs in' }, icon('db'), S.lake || '');
     const some = () => !!this.ed.selected();
     return [...this.crumbs(), h('span', { class: 'grow' }),
-      R.helpers.runButton(this.running, { label: 'Run', title: 'Run the file, or what is selected (Ctrl+Enter)', run: () => this.run(), stop: () => this.stop(), stopTitle: 'Stop waiting for it' }, () => [
-        { label: 'Run selection', icon: 'play', keys: some() ? 'Ctrl Enter' : null, disabled: !some(), run: () => this.run() },
-        { label: 'Run file', keys: some() ? null : 'Ctrl Enter', run: () => { this.ed.ta.setSelectionRange(0, 0); this.run(); } }, this.explainItem(), '-',
+      R.helpers.runButton(this.running, { label: 'Run', title: 'Run what is selected, else the ' + (R.helpers.prefs('enter') || 'file') + ' (Ctrl+Enter)', run: () => this.run(), stop: () => this.stop(), stopTitle: 'Stop waiting for it' }, () => [
+        { label: 'Run selection', icon: 'play', keys: some() ? 'Ctrl Enter' : null, disabled: !some(), run: () => this.run() }, ...this.runItems(some(), true), this.explainItem(), '-',
         ...this.ed.formats(formatSql, 'file', true), '-', ...this.jobs(true, false)]),
       h('span', { class: 'sep' }), db, R.helpers.saveButton(this), moreBtn(() => this.more())];
   }
@@ -377,10 +370,6 @@ export function statements(text) {
   if (code) out.push(text.slice(start));
   return out.map(x => x.trim());
 }
-/** A script's `$name` parameters, in order, once each (not `$1`, nor what strings, comments and
- * `$$` bodies hold). */
-export const parameters = sql => [...new Set([...sql.replace(/--[^\n]*|\/\*[\s\S]*?\*\/|'(?:[^']|'')*'|"(?:[^"]|"")*"|\$(\w*)\$[\s\S]*?\$\1\$/g, ' ')
-  .matchAll(/\$([A-Za-z_]\w*)/g)].map(m => m[1]))];
 /** The last statement of a script (for its plan). */
 export const lastStatement = sql => statements(sql).at(-1) || sql;
 

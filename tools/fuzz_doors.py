@@ -42,7 +42,7 @@ class Node:
     def start(self):
         args = [self.binary, "serve", "--lake", os.path.join(self.folder, "lake"), "--addr", f"127.0.0.1:{self.port}",
                 "--pg", f"127.0.0.1:{self.port + 1}", "--kafka", f"127.0.0.1:{self.port + 2}", "--flight", f"127.0.0.1:{self.port + 3}"]
-        self.p = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=open(self.log, "a"), env={**os.environ, **self.env})
+        self.p = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=open(self.log, "a"), env={**os.environ, **self.env}, cwd=self.folder)  # (`ATTACH 'nope'` makes a lake where the node runs)
         NODES.append(self)
         deadline = time.time() + 120  # (a lake whose leader was killed: its lease runs out first)
         while time.time() < deadline:
