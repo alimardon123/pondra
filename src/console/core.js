@@ -62,7 +62,7 @@ export const ICONS = {
   hash: '<path d="M5 9h14M5 15h14M10.5 4 8.5 20M15.5 4l-2 16"/>',
   clock: '<circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/>',
   key: '<circle cx="8" cy="15" r="3.5"/><path d="m10.5 12.5 8-8M16 7l2.5 2.5"/>',
-  play: '<path d="M8 5.5v13l10.5-6.5z" fill="currentColor" stroke="none"/>',
+  play: '<path d="M8 5.5v13l10.5-6.5z" fill="currentColor" stroke="none"/>', playall: '<path d="M4.5 6v12l7-6zM12.5 6v12l7-6z" fill="currentColor" stroke="none"/>',
   stop: '<rect x="6.5" y="6.5" width="11" height="11" rx="2"/>',
   down: '<path d="M12 4.5v10M7.5 10.5 12 15l4.5-4.5M5 19.5h14"/>',
   up: '<path d="M12 15.5v-11M7.5 9 12 4.5 16.5 9M5 19.5h14"/>',
@@ -194,10 +194,14 @@ export function configure(o) { Object.assign(T, o); }
 
 // ------------------------------------------------------------------ the page's state
 export const MODE = document.documentElement.dataset.mode; // lake: one lake (serve --lake); lakes: a folder of lakes, its databases
-export const SESSION = [...crypto.getRandomValues(new Uint8Array(12))].map(b => b.toString(16).padStart(2, '0')).join(''); // (the temporary tables and the Python of this page)
+export const SESSION = [...crypto.getRandomValues(new Uint8Array(12))].map(b => b.toString(16).padStart(2, '0')).join(''); // (the page's own queries)
+let tabs = 0;
+/** A tab's session on the node, made when first used: its temporary tables, SQL variables and
+ * Python, apart from every other tab's (as an editor's connection is), ended when it closes. */
+export const sessionOf = d => d ? d.session ||= SESSION + '-' + (++tabs).toString(36) : SESSION;
 /** What the page holds: the database, the documents open (`doc` the one in front), the pick the
- * details show, the catalog, this page's Python and runs. */
-export const S = { db: null, lake: null, docs: [], doc: null, sel: null, runs: 0, open: new Set(), pick: null, objects: null, info: null, filesAt: '', tab: 'details', py: 'none', vars: [], place: null, files: null, ran: [],
+ * details show, the catalog, the runs. (A tab's Python and variables are its own: `py`, `vars`.) */
+export const S = { db: null, lake: null, docs: [], doc: null, sel: null, runs: 0, open: new Set(), pick: null, objects: null, info: null, filesAt: '', tab: 'details', place: null, files: null, ran: [],
   /** The cells of the notebook in front (or of the last one in front). */
   get cells() { return (S.doc?.kind === 'notebook' ? S.doc : S.nb)?.cells || []; },
   /** Its name (ADR-032's `state.name`). */
@@ -210,8 +214,8 @@ export class Failure extends Error { constructor(message, status) { super(messag
 export const failed = (e, stopped = 'Stopped waiting. (A statement already on its way may still finish on the node.)') => ({ kind: 'error', message: e.name === 'AbortError' ? stopped : e.message, notices: [] });
 export const ask = { token() {} }; // (the sign-in dialog of the shell)
 
-export async function call(path, { method = 'GET', body, headers = {}, signal, root = false } = {}) {
-  const hd = { 'x-pondra-session': SESSION, ...T.headers(), ...headers };
+export async function call(path, { method = 'GET', body, headers = {}, signal, root = false, session = SESSION } = {}) {
+  const hd = { 'x-pondra-session': session, ...T.headers(), ...headers };
   const token = T.token();
   if (token) hd.authorization = 'Bearer ' + token;
   let r;
@@ -228,11 +232,11 @@ export async function call(path, { method = 'GET', body, headers = {}, signal, r
 }
 
 /** A statement's answer: rows (the columns with their types) or what it did, and what it printed. */
-export async function run(sql, signal, params, page) {
+export async function run(sql, signal, params, page, session) {
   const at = '/sql?format=typed' + (page ? '&rows=' + page : ''); // (a page's rows: what Settings says for what the user runs; 10,000 else)
   const r = params && Object.keys(params).length // (values for its $names: bound on the node, never pasted in)
-    ? await call(at, { method: 'POST', body: JSON.stringify({ sql, params }), headers: { 'content-type': 'application/json' }, signal })
-    : await call(at, { method: 'POST', body: sql, headers: { 'content-type': 'text/plain; charset=utf-8' }, signal });
+    ? await call(at, { method: 'POST', body: JSON.stringify({ sql, params }), headers: { 'content-type': 'application/json' }, signal, session })
+    : await call(at, { method: 'POST', body: sql, headers: { 'content-type': 'text/plain; charset=utf-8' }, signal, session });
   let notices = [];
   try { notices = JSON.parse(r.headers.get('x-pondra-notices') || '[]'); } catch { /* (none) */ }
   const v = await r.json();
@@ -240,11 +244,11 @@ export async function run(sql, signal, params, page) {
   return { kind: 'done', value: v, notices };
 }
 /** A query's rows as objects (the console's own queries). */
-export async function rows(sql) {
-  const r = await run(sql);
+export async function rows(sql, session) {
+  const r = await run(sql, undefined, undefined, undefined, session);
   return r.kind === 'rows' ? r.rows.map(a => Object.fromEntries(r.columns.map((c, i) => [c.name, a[i]]))) : [];
 }
-/** Python as the node runs it: Postgres's anonymous code block, in this page's session. */
+/** Python as the node runs it: Postgres's anonymous code block, in its tab's session. */
 export function doBlock(code) {
   let tag = 'pondra';
   while (code.includes('$' + tag + '$')) tag += '_';
@@ -297,7 +301,7 @@ export function crumbs(d) {
 }
 
 const RESERVED = new Set('ALL AND ANY ARRAY AS ASC BETWEEN BY CASE CAST CHECK COLUMN CREATE CROSS DEFAULT DELETE DESC DISTINCT DO ELSE END EXCEPT FALSE FETCH FOR FROM FULL GRANT GROUP HAVING IN INNER INSERT INTERSECT INTO IS JOIN LEFT LIKE LIMIT NATURAL NOT NULL OFFSET ON OR ORDER OUTER RIGHT SELECT SET TABLE THEN TO TRUE UNION UNIQUE UPDATE USER USING VALUES VIEW WHEN WHERE WINDOW WITH'.split(' '));
-export const SQL_KW = new Set([...RESERVED, ...'EXISTS ILIKE SIMILAR RECURSIVE MATERIALIZED REPLACE DROP ALTER ADD RENAME IF PRIMARY KEY NULLS FIRST LAST OVER PARTITION ROWS RANGE UNBOUNDED PRECEDING FOLLOWING CURRENT ROW FILTER WITHIN TRY_CAST INTERVAL DATE TIMESTAMP TIMESTAMPTZ TIME BIGINT INT INTEGER SMALLINT TINYINT DOUBLE PRECISION FLOAT REAL DECIMAL NUMERIC VARCHAR TEXT CHAR BOOLEAN BYTEA BINARY JSON EXPLAIN ANALYZE SHOW DESCRIBE CALL LANGUAGE FUNCTION PROCEDURE RETURNS RETURN BEGIN COMMIT ROLLBACK MERGE MATCHED SCHEMA DATABASE ATTACH DETACH COPY TEMP TEMPORARY SECRET TASK QUALIFY LATERAL UNNEST SOME STRUCT MAP AT OF TRUNCATE REVOKE NEXT ONLY REFERENCES CONSTRAINT INDEX OPTIMIZE VACUUM INSTALL LOAD EXTERNAL STORED LOCATION'.split(' ')]);
+export const SQL_KW = new Set([...RESERVED, ...'EXISTS ILIKE SIMILAR RECURSIVE MATERIALIZED REPLACE DROP ALTER ADD RENAME IF PRIMARY KEY NULLS FIRST LAST OVER PARTITION ROWS RANGE UNBOUNDED PRECEDING FOLLOWING CURRENT ROW FILTER WITHIN TRY_CAST INTERVAL DATE TIMESTAMP TIMESTAMPTZ TIME BIGINT INT INTEGER SMALLINT TINYINT DOUBLE PRECISION FLOAT REAL DECIMAL NUMERIC VARCHAR TEXT CHAR BOOLEAN BYTEA BINARY JSON EXPLAIN ANALYZE SHOW DESCRIBE CALL LANGUAGE FUNCTION PROCEDURE RETURNS RETURN BEGIN COMMIT ROLLBACK MERGE MATCHED SCHEMA DATABASE ATTACH DETACH COPY TEMP TEMPORARY SECRET TASK QUALIFY LATERAL UNNEST SOME STRUCT MAP AT OF TRUNCATE REVOKE NEXT ONLY REFERENCES CONSTRAINT INDEX OPTIMIZE VACUUM INSTALL LOAD EXTERNAL STORED LOCATION DECLARE VARIABLE RESET'.split(' ')]);
 export const ident = s => /^[a-z_][a-z0-9_]*$/.test(s) && !RESERVED.has(s.toUpperCase()) ? s : '"' + s.replace(/"/g, '""') + '"';
 export const quote = s => "'" + String(s).replace(/'/g, "''") + "'";
 /** The database the page's statements run in (a server's database is the lake of that name). */
@@ -415,11 +419,11 @@ export async function formatPython(code) {
   const r = await call('/python/format', { method: 'POST', body: JSON.stringify({ code }), headers: { 'content-type': 'application/json' } });
   return (await r.json()).code;
 }
-/** Stop the page's Python cell that is running, on the node: it ends with "Interrupted" and the
- * variables stay (Windows: Python starts again, without them). */
-export async function interruptPython() {
+/** Stop what a tab's Python is running, on the node: it ends with "Interrupted" and the variables
+ * stay (Windows: Python starts again, without them). */
+export async function interruptPython(d = S.doc) {
   try {
-    const r = await (await call(`/sessions/${SESSION}/python`, { method: 'POST' })).json();
+    const r = await (await call(`/sessions/${sessionOf(d)}/python`, { method: 'POST' })).json();
     if (r.done === 'restarted') toast('Python was stopped and starts again: its variables are gone');
   } catch (e) { toast(e.message, true); }
 }

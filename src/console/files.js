@@ -204,13 +204,13 @@ export function splitPanel(doc, panel) {
 }
 
 // ------------------------------------------------------------------ a SQL file (sqlfile.js): what its answers are called
-export const said = x => x.kind === 'rows' ? `${count(x.total)} row${x.total === 1 ? '' : 's'}` : x.kind === 'error' ? 'failed' : x.kind === 'plan' ? (x.profile ? 'profiled' : 'not run') : 'done';
+export const said = x => x.kind === 'rows' ? `${count(x.total)} row${x.total === 1 ? '' : 's'}` : x.kind === 'error' ? 'failed' : x.kind === 'plan' ? (x.profile ? 'profiled' : 'plan') : 'done';
 /** A statement on one line: its comments out, its spaces one, at most `n` characters. */
 export const oneLine = (sql, n) => { const t = sql.replace(/--[^\n]*|\/\*[\s\S]*?\*\//g, ' ').replace(/\s+/g, ' ').trim(); return t.length > n ? t.slice(0, n - 1) + '…' : t; };
 /** A copy's or a download's button, with a ▾ for its other forms. */
 /** A script's statements, split as the node splits them (routines.rs `statements`): each ends at
  * a `;` outside strings ('…', $$…$$, $tag$…$tag$), quoted names and comments; the last `;` optional. */
-export function statements(text) {
+export function statements(text, raw) {
   const out = [];
   let start = 0, i = 0, code = false;
   const upto = (end, from) => { const e = text.indexOf(end, i + from); return e < 0 ? text.length - i : e - i + end.length; };
@@ -227,7 +227,7 @@ export function statements(text) {
     i += skip;
   }
   if (code) out.push(text.slice(start));
-  return out.map(x => x.trim());
+  return raw ? out : out.map(x => x.trim()); // (raw: as written, what follows a `;` on its line too)
 }
 /** The last statement of a script (for its plan). */
 export const lastStatement = sql => statements(sql).at(-1) || sql;

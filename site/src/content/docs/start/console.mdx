@@ -50,7 +50,10 @@ pondra serve lake        # then open http://localhost:8080
   it has changes not saved; a new file gets it once you type in it. The file's toolbar shows **Save**
   only when there is something to save, and **Ctrl+S** saves the one in front.
 - **Many tabs** keep their names and scroll: the wheel over them scrolls them, a thin bar above them
-  shows where you are (drag it), and **⌄** at their right lists them all. **Right-click** a tab to
+  shows where you are (drag it), and **⌄** at their right lists them all: a click brings one forward,
+  its **✕** closes it, a right-click gives its tab's menu, and **Ctrl** or **Shift** picks several to
+  close at once. A tab comes back where you left it: scrolled to the same place, in the same cell.
+  **Right-click** a tab to
   **Pin** it: a pinned tab stays at the left, always in sight, shows a pin instead of its **✕**, and
   isn't closed by **Close others**, **Close to the right**, **Close saved** or **Close all**, which the
   same menu has. Pinned tabs are pinned again next time.
@@ -130,9 +133,12 @@ deletes them all, the marker too.
 
 ![A SQL file in a tab: the editor with line numbers, and its results below, in the grid.](../../../assets/console-sql-file.png)
 
-**Run** (**Ctrl+Enter**) runs what is selected, or else the whole file. Its **▾** has **Run
-selection**, **Run file**, **Format file**, **Format selection**, **Create as table or view…**,
-**Run as a job** and **Schedule…**; a right-click in the editor has them too, and **Save as…**.
+**Run** (**Ctrl+Enter**) runs what is selected, or else the statement the caret is in. **Run file**
+beside it (**Ctrl+Shift+Enter**) runs every statement of the file, in order. (**Settings → Ctrl+Enter
+in a SQL file** swaps the two keys.) **Run ▾** has them both, **Show execution plan**, **Format
+file**, **Format selection**, **Create as table or view…**, **Run as a job** and **Schedule…**. A
+right-click in the editor starts with **Run** and **Run file**, then cut, copy and paste, **Comment /
+Uncomment**, and the rest, **Save as…** too.
 **Create as** makes the statement at the caret (or the selection) a table (its rows as they are now),
 a view (its query, run when read) or a materialized view (kept up to date as its tables change),
 showing the `CREATE … AS` it runs; **Open in a new tab** gives you that SQL to change first.
@@ -140,22 +146,32 @@ The database's name in the toolbar says where the file runs. Its **▾**, on a s
 --lakes`), picks another database or takes one by name; on a lake, it lists the lakes attached (a
 click puts the name in the file, for `name.table`); both copy the name.
 
-- **Each statement gets an answer.** They run in order in the page's session, and stop at the first
-  that fails. Above the results, a numbered tab per answer (`1 done`, `2 5 rows`, `3 failed`, in one
-  row that scrolls, above **Chart**, **Data profile** and **Plan** too) picks the one shown, and the
-  same numbers stand beside the statements in the editor, tinted once they ran: the one shown has
-  its lines tinted and its number filled. Pointing at a number shows its statement; a click shows
-  its answer and leaves the caret where it is, and a double-click goes to its lines in the file.
-  **Messages** lists them all with how long each took. A `;` inside a string, a comment or a `$$`
-  body doesn't end a statement.
+- **Each statement gets an answer.** They run in order in the tab's own session, and stop at the
+  first that fails. **Results** shows the answers with rows (and a failure); what the others did (a
+  `DECLARE`, a `CREATE`, an `INSERT`) is in **Messages**, which opens by itself when nothing gave
+  rows. Above the results, a number per answer (`2 5 rows`, `3 failed`, numbered as in the file, in
+  one row that scrolls, above **Chart**, **Data profile** and **Plan** too) picks the one shown, and
+  **2 more in Messages** says how many did something else. The same numbers stand beside the
+  statements in the editor, tinted once they ran: the one shown has its lines tinted and its number
+  filled. Pointing at a number shows its statement; a click shows its answer and leaves the caret
+  where it is, and a double-click goes to its lines in the file. A `;` inside a string, a comment or
+  a `$$` body doesn't end a statement.
+- **Each tab is its own session**, as each editor tab of a database tool is its own connection: its
+  SQL variables, temporary tables and Python are its own, and another file's don't leak into it. A
+  tab's session ends when you close it. A job's files, run one after another, share one.
 - **Show execution plan** (in **Run ▾**, a right-click, or **Ctrl+Shift+E**) shows the plan of the
   statement the caret is in, or of what is selected, without running it, in the **Plan** tab.
-  **Run query profile** runs it with `EXPLAIN ANALYZE` and shows each step's rows and time.
+  **Run query profile** runs it with `EXPLAIN ANALYZE` and shows each step's rows and time. In a file
+  of several statements, **Show every statement's plan** gives each its plan, picked by its number
+  (a `DECLARE` or a `SET` has none, and says so). The next **Run** shows rows again.
 - **Settings → A SQL file's statements → The last one's answer** runs the file at once instead and
   shows only its last statement's answer.
-- **A `$name` in the file** gets an input above the editor. **Run** sends the values with the
-  statements, and the node binds them (numbers and `true`/`false` as such, the rest as text); the
-  browser keeps them for the file.
+- **A `DECLARE $name` in the file** is a parameter, with an input above the editor: its type, its
+  default as the value, and what the comment above it (or after it, on its line) says. A value you
+  change is marked, and **↺** puts the default back; **Enter** in one runs the file. **Run** sends the
+  values with the statements, and the node binds them (numbers and `true`/`false` as such, the rest
+  as text); the browser keeps them for the file. `$name = …` later in the file is a working variable,
+  not a parameter. (A `$name` used without a `DECLARE` gets an input too, with no default.)
 - **Messages** lists every statement that ran: its number, its SQL, how long it took, what it did
   (`rows 3`), and what it printed, set apart under **Printed**. A click picks one (its text stays
   selectable, to copy); a double-click or **Enter** shows its answer and its lines.
@@ -181,15 +197,16 @@ click puts the name in the file, for `name.table`); both copy the name.
   (`.xlsx`).
 - The results sit below the editor or at its right (the button at the right of their bar); drag the
   line between them. In a narrow window, the results give way to keep their buttons in reach.
-- **Right-click** in the editor for cut, copy, paste, select all, comment the lines, the Run ▾'s
-  items (above), **Format file** and **Format selection**: the SQL words in capitals and each clause on its own line, strings,
+- **Right-click** in the editor for **Run** and **Run file**, cut, copy, paste, select all, **Comment /
+  Uncomment**, the Run ▾'s other items (above), **Format file** and **Format selection**: the SQL words in capitals and each clause on its own line, strings,
   names and comments as you wrote them. **Shift+Alt+F** formats the selection, or with nothing
   selected the whole file. Anything it can't format stays as it was.
 
 ### Python files
 
-**Run file** runs it in the page's Python, the one the notebooks' Python cells share: what it printed
-and its answer show in the console below. Type a line after `>>>` and press **Enter** to run it there
+**Run file** runs it in the tab's own Python: what it printed and its answer show in the console
+below. With something selected, **Run** (**Ctrl+Enter**) runs only that, and the right-click has
+both. **Stop** interrupts it (its variables stay), as **Interrupt** in the Python chip's menu does. Type a line after `>>>` and press **Enter** to run it there
 too (**↑** **↓** bring back the ones before).
 
 **Format file** and **Format selection** (**Shift+Alt+F**, a right-click, or **Run ▾**) format it as
@@ -202,6 +219,7 @@ message says where it went wrong.
 A file's **Run ▾** (and a notebook's, in `notebooks`) runs it on the node, where it goes on without the page:
 
 - **Run as a job** saves the file and starts it, with the parameters' values as they are now.
+  **History** opens with the job at its top, and a note says when it is done or why it failed.
 - **Schedule…** makes a task that runs it every so often (`15 minutes`, `1 day`, or a cron line such
   as `cron 0 2 * * * UTC`).
 
@@ -314,7 +332,8 @@ Click a column's header and the details panel summarizes that column; **Data pro
 
 A SQL cell and a Python cell see each other's work, in both directions:
 
-- **A SQL cell's answer in Python.** Type a name in the cell's **Result in Python** field, beside Live. Once
+- **A SQL cell's answer in Python.** Type a name in the cell's **Result in Python** field, beside Live (a
+  Python name: a keyword such as `as` is refused). Once
   the cell runs, that name is a [frame](/pondra/guides/dataframes/) of its query in the page's
   Python: `df.to_pandas()`, `df.to_polars()`, `df.filter(…)`. A frame is the query, not a copy, so
   it reads the lake as it is when used. In the `.ipynb` file the cell begins `%%sql df <<`, as
@@ -420,19 +439,19 @@ $$;
   `--python /path/to/python`. `pondra.local()` does this for you.
 - A Python cell needs an admin token, since it runs code on the node. With no tokens set, the node
   listens only on `127.0.0.1`, and anyone who can reach it is its admin.
-- A page is a session, and its Python cells run on one Python worker kept for that session, in one
-  namespace, like a notebook kernel. What one cell makes (variables, imports, functions, frames such
+- A notebook is a session, and its Python cells run on one Python worker kept for that session, in one
+  namespace, like a notebook kernel; another notebook (or Python file) has a worker of its own. What one cell makes (variables, imports, functions, frames such
   as `orders = db.table("sales")`), the next cell sees. A cell that fails keeps what it did before the
   failing line. `_` holds the last answer, and a cell's single value comes back as a column named
   `value`. One cell runs at a time.
-- The session's Python ends when you close the page (or, in psql, when the connection closes), after
+- The session's Python ends when you close its tab or the page (or, in psql, when the connection closes), after
   `PONDRA_SESSION_IDLE_SECS` (3600) seconds idle, or if it grows past `PONDRA_WORKER_MB` (2048) MB.
   The next cell then starts empty, and a notice says so.
 - A `DO` block sent without a session runs fresh and shares nothing. In psql, a connection is a
   session. Over HTTP, send the `x-pondra-session: <id>` header, as the Python and JavaScript clients
   do: see [Functions and procedures](/pondra/guides/functions-and-procedures/#cells-that-share-variables).
 - A Python error names its line in the cell: `ZeroDivisionError: division by zero, line 2: 1 / 0`.
-- **Stop** (the cell's Run button while it runs, or **Interrupt** in the Python menu) interrupts the
+- **Stop** (the cell's Run button while it runs, **I I** on a cell after **Esc**, or **Interrupt** in the Python menu) interrupts the
   cell on the node: it ends with `KeyboardInterrupt`, and its variables stay. On Windows, where one
   process can't interrupt another, Python restarts instead and the variables go. A cell whose page
   stopped waiting for it never holds up the next one.
@@ -520,7 +539,9 @@ SELECT region, sum(amount) AS total FROM sales GROUP BY region ORDER BY region;
 
 With **Live** on, an `INSERT` into `sales` from anywhere (another cell, psql, a Kafka producer, a
 program appending over HTTP) shows in the cell within a fraction of a second. The console uses
-[`/live`](/pondra/guides/query/), which any HTTP client can use too.
+[`/live`](/pondra/guides/query/), which any HTTP client can use too: every live cell of the page
+shares one connection to the node, so however many are on, the page's other requests (a Python cell,
+a query) never wait for them.
 
 ## Notebooks
 
@@ -560,7 +581,7 @@ The console follows Jupyter's keys. In a cell:
 
 | Keys | What they do |
 |---|---|
-| **Ctrl+Enter** | Run the cell |
+| **Ctrl+Enter** | Run the cell (a right-click has **Run selection** for a part of it) |
 | **Shift+Enter** | Run it, then go to the next cell (a new one at the end) |
 | **Alt+Enter** | Run it, then add a cell below |
 | **Ctrl+Shift+Enter** | Run every cell, in order (it stops at one that fails) |
@@ -581,6 +602,7 @@ After **Esc**, on the selected cell:
 | **S**, **P**, **M** | Make it SQL, Python or Markdown |
 | **L** | Turn Live on or off |
 | **O** | Hide its output, or show it again |
+| **I I** | Interrupt its Python (the variables stay) |
 | **0 0** | Restart Python |
 | **?** | Show these keys (Settings, Keys) |
 

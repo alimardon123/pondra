@@ -13,6 +13,16 @@ await moreStyle();
 
 const H = R.helpers;
 
+/** A new database, in a folder of lakes (`pondra serve --lakes`): made by the server, then used. */
+export async function newDatabase() {
+  const name = ((await prompt('New database', 'Its name (letters, digits and _)', '')) || '').trim().toLowerCase();
+  if (!name) return;
+  try {
+    await call('/databases', { method: 'POST', body: JSON.stringify({ name }), headers: { 'content-type': 'application/json' }, root: true });
+    await H.use(name);
+  } catch (e) { toast(e.message, true); }
+}
+
 // ------------------------------------------------------------------ what an action does: a script in a tab, or SQL run
 /** SQL (or Python) in a new tab, to read, change and run. */
 async function tab(text, kind = 'sql') { const d = await H.newFile(kind); d.ed.value = text; d.changed(); d.ed.focus(); return d; }

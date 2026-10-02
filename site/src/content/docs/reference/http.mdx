@@ -214,10 +214,18 @@ queries on a busy table (default 100). An answer that comes out the same isn't s
 `{"error": …}` ends the stream. The query runs while the connection is open, and stops when it
 closes.
 
+Several live queries share one connection with `POST /live` and a JSON body `{"queries": [{"id":
+"a", "sql": "…", "params": {…}, "session": "…"}, …]}`: each line names its query's `id`, a query
+that can't be watched sends its own `{"id": …, "error": …}` line while the others go on, and
+`session` is the `x-pondra-session` that query runs in. A browser opens six connections to a host at
+most, so a page that shows several live answers (the console's) needs this.
+
 ```bash
 curl -s http://localhost:8080/lookup/points/1
 curl -s --max-time 2 'http://localhost:8080/watch/events?after=0&marks=true' || true
 curl -s --max-time 2 -G http://localhost:8080/live --data-urlencode 'sql=SELECT count(*) AS n FROM events' || true
+curl -s --max-time 2 http://localhost:8080/live -H 'content-type: application/json' \
+  -d '{"queries": [{"id": "n", "sql": "SELECT count(*) AS n FROM events"}, {"id": "one", "sql": "SELECT 1 AS one"}]}' || true
 ```
 
 ```text

@@ -23,7 +23,7 @@ export function marks(doc, hover) {
     const n = all.indexOf(x) + 1, a = line(x.at[0]) + v.slice(x.at[0]).match(/^(?:\s|--[^\n]*)*/)[0].split('\n').length - 1;
     if (n === on) { ed.band.hidden = false; ed.band.style.cssText = `${top(a)};height:${(line(x.at[1]) - a + 1) * LINE_H}px`; }
     return tip(h('button', { class: 'smark' + (n === on ? ' on' : '') + (x.kind === 'error' ? ' bad' : ''), style: top(a), 'aria-label': `Answer ${n}: ${said(x)}`, tabindex: -1,
-      onclick: () => { if (doc.result !== x) { doc.result = x; doc.draw(); } } }, String(n)), () => doc.card(x, 'Click: show its answer'));
+      onclick: () => { doc.result = x; if (x.kind === 'done') doc.tab = 'messages'; doc.draw(); } }, String(n)), () => doc.card(x, x.kind === 'done' ? 'Click: what it did, in Messages' : 'Click: show its answer'));
   }));
 }
 

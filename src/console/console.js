@@ -13,7 +13,7 @@
 //
 // No framework and nothing from anywhere else: the page, its modules and its fonts come from the node.
 import { h, $, fill, said, esc, store, count, bytes,  ICONS, icon, svg, typeMark, sqlType, on, emit, R, byOrder, shell, register, T, configure,
-  MODE, SESSION, S, base, call, run, rows, doBlock, ident, qualified, home, toast, menu, prompt, VERSION, ask, interruptPython } from './core.js';
+  MODE, SESSION, sessionOf, S, base, call, run, rows, doBlock, ident, qualified, home, toast, menu, VERSION, ask } from './core.js';
 import { grid, copyText } from './grid.js';
 import { Notebook, openNotebook, openPlain, cleanName, doneText } from './notebook.js';
 import { workspace, drawWorkspace, treeItem, upload, newFolder, registerFiles, lastStatement } from './files.js';
@@ -80,22 +80,7 @@ function drawTop() { for (const [id, b] of [['runs', '#runsBtn'], ['jobs', '#job
 
 // ------------------------------------------------------------------ views: groups on the left, tabs on the right; either moves to the other side
 const sideOf = v => prefs('sides')?.[v.id] || v.side;
-function moveView(v) {
-  const sides = { ...prefs('sides') || {} }, to = sideOf(v) === 'left' ? 'right' : 'left';
-  sides[v.id] = to;
-  prefs('sides', sides);
-  if (to === 'right') { S.tab = v.id; pane('right', true); } else pane('left', true);
-  drawViews();
-  toast(`${v.title} is now in the ${to} pane`);
-}
 const viewTitle = v => typeof v.title === 'function' ? v.title() : v.title;
-function viewMenu(e, v) {
-  const tools = (v.tools || []).filter(t => !t.hidden?.() && t.menu !== false); // (a tool that opens a menu at its button is only a button)
-  menu(e.currentTarget || e, [...tools.map(t => ({ label: t.title, icon: t.icon, run: t.run })), tools.length ? '-' : null,
-    sideOf(v) === 'right' ? { label: 'Move its tab left', run: () => moveTab(v.id, null, -1) } : null, sideOf(v) === 'right' ? { label: 'Move its tab right', run: () => moveTab(v.id, null, 1) } : null,
-    { label: sideOf(v) === 'left' ? 'Move to the right pane' : 'Move to the left pane', icon: 'moveSide', run: () => moveView(v) },
-    sideOf(v) === 'left' ? { label: folded(v) ? 'Unfold' : 'Fold', run: () => fold(v) } : null]);
-}
 const folded = v => (prefs('folded') || []).includes(v.id);
 function fold(v, on = !folded(v)) { prefs('folded', [...new Set((prefs('folded') || []).filter(x => x !== v.id).concat(on ? [v.id] : []))]); drawLeft(); }
 /** The order of the left groups: Data first, unless Settings says Workspace first. */
@@ -117,7 +102,7 @@ function drawLeft() {
     renderOnce(v);
     const f = folded(v), tools = (v.tools || []).filter(t => !t.hidden?.()).map(t => h('button', { class: 'icon sm', title: t.title, 'aria-label': t.title, id: t.domId || null, onclick: e => { e.stopPropagation(); t.run(e); } }, icon(t.icon)));
     const head = h('div', { class: 'ghead' }, h('button', { class: 'gtitle', 'aria-expanded': String(!f), onclick: () => fold(v) }, h('span', { class: 'tw', html: svg(f ? 'chev' : 'chevd', 14, 2) }), h('h2', { id: v.id + 'Title' }, viewTitle(v))),
-      h('span', { class: 'gtools' }, tools, h('button', { class: 'icon sm', title: `${viewTitle(v)}: more`, 'aria-label': `${viewTitle(v)}: more`, onclick: e => viewMenu(e, v) }, icon('dots'))));
+      h('span', { class: 'gtools' }, tools, h('button', { class: 'icon sm', title: `${viewTitle(v)}: more`, 'aria-label': `${viewTitle(v)}: more`, onclick: e => viewMenu(e.currentTarget, v) }, icon('dots'))));
     const g = h('section', { class: 'group' + (f ? ' folded' : ''), 'data-view': v.id, style: !f && weights[v.id] ? `flex:${weights[v.id]} 1 0` : null }, head, f ? null : v.box);
     if (i && !f && parts.length && !parts.at(-1).classList.contains('folded')) parts.push(divider(parts.at(-1), g));
     parts.push(g);
@@ -198,7 +183,7 @@ function drawRight() {
     ondragover: e => { if (e.dataTransfer.types.includes('text/x-pondra-tab')) { e.preventDefault(); e.currentTarget.classList.add('drop'); } }, ondragleave: e => e.currentTarget.classList.remove('drop'),
     ondrop: e => { e.preventDefault(); const id = e.dataTransfer.getData('text/x-pondra-tab'); if (id && id !== v.id) moveTab(id, v.id, e.offsetX > e.currentTarget.offsetWidth / 2 ? 1 : 0); } }, viewTitle(v));
   const cur = views.find(v => v.id === S.tab);
-  fill($('#rtabs'), h('div', { class: 'tlist', role: 'tablist', 'aria-label': 'The right pane' }, views.map(tab)), h('span', { class: 'grow' }), cur ? h('button', { class: 'icon sm', title: `${viewTitle(cur)}: more`, 'aria-label': `${viewTitle(cur)}: more`, onclick: e => viewMenu(e, cur) }, icon('dots')) : null);
+  fill($('#rtabs'), h('div', { class: 'tlist', role: 'tablist', 'aria-label': 'The right pane' }, views.map(tab)), h('span', { class: 'grow' }), cur ? h('button', { class: 'icon sm', title: `${viewTitle(cur)}: more`, 'aria-label': `${viewTitle(cur)}: more`, onclick: e => viewMenu(e.currentTarget, cur) }, icon('dots')) : null);
   if (!cur || $('#right').hidden) return;
   cur.box ||= h('div', { id: cur.id, class: 'vbox' });
   $('#rbody').replaceChildren(cur.box);
@@ -220,13 +205,19 @@ function addDoc(doc) {
   remember();
   return doc;
 }
+/** Where a tab was scrolled to, and what in it had the focus: kept while another is in front (out of
+ * the page, its elements forget), given back when it comes forward again. */
+const keep = d => { if (d?.el.isConnected) d.was = [[d.el, ...d.el.querySelectorAll('*')].filter(e => e.scrollTop || e.scrollLeft).map(e => [e, e.scrollTop, e.scrollLeft]), d.el.contains(document.activeElement) ? document.activeElement : null]; };
+const back = was => { if (!was) return; for (const [e, t, l] of was[0]) { e.scrollTop = t; e.scrollLeft = l; } was[1]?.focus({ preventScroll: true }); };
 function activate(doc) {
   if (!doc) return;
+  if (doc !== S.doc) keep(S.doc);
   S.doc = doc;
   $('#docs').replaceChildren(doc.el);
   doc.el.classList.toggle('nopanel', prefs('bottom') === false);
   doc.activate?.();
   drawTabs(); toolbar(); status(); drawPanes();
+  back(doc.was); doc.was = null;
   if (doc.kind === 'notebook') S.nb = doc;
   follow(doc);
   document.title = `${doc.dirty ? '• ' : ''}${doc.title} · Pondra`;
@@ -241,6 +232,7 @@ async function closeDoc(doc) {
   const i = S.docs.indexOf(doc);
   S.docs.splice(i, 1);
   emit('close', doc);
+  if (doc.session) call('/sessions/' + doc.session, { method: 'DELETE' }).catch(() => {}); // (its temporary tables, variables and Python go with it)
   if (S.doc === doc) {
     S.doc = null;
     if (S.docs.length) activate(S.docs[Math.min(i, S.docs.length - 1)]);
@@ -254,7 +246,7 @@ async function closeDoc(doc) {
 function drawTabs() {
   const tab = (d, i) => {
     const t = h('div', { class: 'tab' + (d === S.doc ? ' on' : '') + (d.pinned ? ' pinned' : ''), role: 'tab', tabindex: d === S.doc ? '0' : '-1', 'aria-selected': String(d === S.doc), title: (d.path ? `files/${d.path}` : d.title) + (d.pinned ? ' (pinned)' : ''), 'aria-keyshortcuts': 'Delete',
-      onclick: e => { if (!e.target.closest('.x')) activate(d); }, onauxclick: e => { if (e.button === 1) closeDoc(d); }, oncontextmenu: e => { e.preventDefault(); more().then(m => m.tabMenu(e, d)); } },
+      onclick: e => { if (!e.target.closest('.x')) activate(d); }, onauxclick: e => { if (e.button === 1) closeDoc(d); }, oncontextmenu: e => { e.preventDefault(); menus().then(m => m.tabMenu(e, d)); } },
       h('span', { class: 'ic k-' + d.kind, html: svg(d.icon, 15) }), h('span', { class: 'tn' }, d.title),
       d.dirty ? h('span', { class: 'dirty', title: 'Not saved', 'aria-label': 'not saved' }) : null,
       d.pinned ? h('span', { class: 'x pin', title: `Unpin ${d.title}`, 'aria-hidden': 'true', html: svg('pin', 14), onclick: () => pin(d, false) })
@@ -264,12 +256,12 @@ function drawTabs() {
   };
   const tabs = S.docs.map(tab), pins = h('span', { class: 'pins' }, tabs.filter((_, i) => S.docs[i].pinned));
   const list = h('div', { class: 'tlist', role: 'tablist', 'aria-label': 'Open files' }, pins, tabs.filter((_, i) => !S.docs[i].pinned));
-  const all = h('button', { class: 'icon tmore', title: 'Every open tab', 'aria-label': 'Every open tab', 'aria-haspopup': 'menu', hidden: true, html: svg('chevd', 15), onclick: e => { const item = d => ({ label: d.title + (d.dirty ? ' •' : ''), icon: d.pinned ? 'pin' : d.icon, checked: d === S.doc, run: () => activate(d) }), pinned = S.docs.filter(d => d.pinned); menu(e.currentTarget, [...pinned.map(item), pinned.length ? '-' : null, ...S.docs.filter(d => !d.pinned).map(item)]); } });
+  const all = h('button', { class: 'icon tmore', title: 'Every open tab', 'aria-label': 'Every open tab', 'aria-haspopup': 'menu', hidden: true, html: svg('chevd', 15), onclick: e => { const at = e.currentTarget; menus().then(m => m.tabList(at)); } });
   $('#tabbar').replaceChildren(list, h('div', { class: 'tthumb', 'aria-hidden': 'true' }), all, h('button', { class: 'icon newtab', title: 'New: a notebook, a file or a folder', 'aria-label': 'New', html: svg('plus', 16), onclick: e => newMenu(e.currentTarget) }));
   if (S.doc) document.title = `${S.doc.dirty ? '• ' : ''}${S.doc.title} · Pondra`;
   list.style.scrollPaddingLeft = pins.offsetWidth + 'px'; // (a tab scrolled to is not under the pinned)
-  $('#tabbar .tab.on')?.scrollIntoView({ block: 'nearest', inline: 'nearest' }); // (the tab in front always in sight)
-  thumb();
+  thumb(); // (⌄ shown first: the room left for the tabs is then known)
+  $('#tabbar .tab.on')?.scrollIntoView({ block: 'nearest', inline: 'nearest' }); // (the tab in front in sight, its × too)
 }
 H.drawTabs = drawTabs;
 /** Where the tabs are scrolled to: a thin bar above them (dragged, it scrolls them), shown when they don't all fit. */
@@ -292,7 +284,7 @@ function thumb() {
     th.addEventListener('pointermove', move);
     th.addEventListener('pointerup', () => { th.removeEventListener('pointermove', move); th.classList.remove('drag'); }, { once: true });
   });
-  addEventListener('resize', thumb);
+  new ResizeObserver(() => { thumb(); $('#tabbar .tab.on')?.scrollIntoView({ block: 'nearest', inline: 'nearest' }); }).observe(bar); // (narrower, the tab in front still in sight)
 }
 /** Pin a tab (to the left, always in sight, not closed with the others), or unpin it. */
 H.pin = pin;
@@ -481,21 +473,13 @@ async function dataTree(box) {
   if (S.pick?.type === 'object') S.pick.t = S.objects?.find(t => t.key === S.pick.t.key) || S.pick.t; // (as it is now)
   mark(); detail();
 }
-H.newDatabase = () => newDatabase();
-H.explain = (sql, params, profile) => ({ kind: 'plan', sql: lastStatement(sql), params, profile });
+H.newDatabase = () => objects(m => m.newDatabase()); // (only a folder of lakes has databases to make)
+H.explain = (sql, params, profile, session) => ({ kind: 'plan', sql: lastStatement(sql), params, profile, session });
 /** The menus' items for a statement's plan: shown, not run; or its query profile, run with EXPLAIN ANALYZE. */
 H.planItems = go => [{ label: 'Show execution plan', icon: 'plan', keys: 'Ctrl Shift E', run: () => go(false) }, { label: 'Run query profile', run: () => go(true) }];
 // (the objects' menus, loaded as the pointer first comes over the Data tree: open at once when asked for)
 const warm = e => { if (e.target.closest?.('#data')) { removeEventListener('pointerover', warm); import('./objects.js'); } };
 addEventListener('pointerover', warm, { passive: true });
-async function newDatabase() {
-  const name = ((await prompt('New database', 'Its name (letters, digits and _)', '')) || '').trim().toLowerCase();
-  if (!name) return;
-  try {
-    await call('/databases', { method: 'POST', body: JSON.stringify({ name }), headers: { 'content-type': 'application/json' }, root: true });
-    await use(name);
-  } catch (e) { toast(e.message, true); }
-}
 H.pickDb = at => objects(m => m.dbMenu(at)); // (a database's menu, beside its row's in the Data tree)
 H.use = use;
 
@@ -527,7 +511,7 @@ function summary() {
       ['Nodes', s.nodes ? String(s.nodes.length) : null], ['This node', s.role], ['Leader', s.leader], ['Commits', s.hwm != null ? count(s.hwm) : null]]),
     h('p', { class: 'muted' }, 'Pick a table, a view or a file, or a column of an answer, to see it here.')];
 }
-const filePick = path => { const rel = path.replace(/^files\//, ''), nb = rel.match(/^notebooks\/([^/]+)$/); return { type: 'file', f: nb ? { rel, name: nb[1] + '.ipynb', notebook: true } : S.files?.find(f => f.path === 'files/' + rel) || { rel, path: 'files/' + rel } }; };
+const filePick = path => { const rel = path.replace(/^files\//, ''), nb = rel.match(/^notebooks\/([^/]+?)(?:\.ipynb)?$/); return { type: 'file', f: nb ? { rel: 'notebooks/' + nb[1], name: nb[1] + '.ipynb', notebook: true } : S.files?.find(f => f.path === 'files/' + rel) || { rel, path: 'files/' + rel } }; };
 H.pickFile = path => pick(filePick(path));
 /** The details follow the tab in front (its file, or what it is while it has none): a table or a
  * column picked stays while the tab it was picked with is in front, and gives way when another is. */
@@ -537,10 +521,6 @@ function follow(doc) {
   S.pick = saved ? filePick(saved) : doc.kind ? { type: 'doc', doc } : null;
   mark(); detail();
 }
-function docDetail(doc) {
-  return [head(doc.icon, doc.title, `a new ${doc.kind === 'notebook' ? 'notebook' : doc.kind === 'sql' ? 'SQL file' : doc.kind === 'python' ? 'Python file' : 'file'}, not saved yet`, 'k-' + doc.kind),
-    doc.dirty ? h('div', { class: 'acts2' }, act('save', 'Save', 'Save it in the lake (Ctrl+S)', () => doc.save())) : null, h('p', { class: 'muted' }, 'Once saved, it is kept in the lake\'s files: the Workspace lists it, and its size and versions show here.')];
-}
 
 /** An answer's columns, summarized from the rows it holds (a header clicked). */
 function explore(r, i, cell) { pick({ type: 'result', r, i, cell }); }
@@ -548,44 +528,43 @@ H.explore = explore;
 
 // The rarer parts, loaded when first used (more.js): History, Variables, Settings, choosing the
 // Python, a table's profile, a file run as a job.
-const more = () => import('./more.js');
+const more = () => import('./more.js'), menus = () => import('./tabs.js'); // (tabs.js: the tabs' and the panes' menus)
+const viewMenu = (at, v) => menus().then(m => m.viewMenu(at, v));
 const details = () => import('./details.js'); // (a table's, a file's, an answer's: loaded with the first pick)
-const objectDetail = async t => (await details()).objectDetail(t), fileDetail = async f => (await details()).fileDetail(f), resultDetail = async p => (await details()).resultDetail(p);
+const objectDetail = async t => (await details()).objectDetail(t), fileDetail = async f => (await details()).fileDetail(f), resultDetail = async p => (await details()).resultDetail(p), docDetail = async d => (await details()).docDetail(d);
 const runs = async () => (await more()).runs(), variables = async () => (await more()).variables(), settings = async at => (await import('./settings.js')).settings(typeof at === 'string' ? at : null);
 const choosePython = async () => (await more()).choosePython();
-Object.assign(H, { KIND, addDoc, closeDoc, act, facts, head, detail, drawLeft, drawViews, look, readVars, themeNow, choosePython, job: async (doc, every) => (await more()).job(doc, every), schedule: async doc => (await more()).job(doc, true), createAs: async sql => (await more()).createAs(sql) });
+Object.assign(H, { sideOf, moveTab, fold, folded, viewTitle, KIND, addDoc, closeDoc, act, facts, head, detail, drawLeft, drawViews, look, readVars, themeNow, choosePython, job: async (doc, every) => (await more()).job(doc, every), schedule: async doc => (await more()).job(doc, true), createAs: async sql => (await more()).createAs(sql) });
 
-// ------------------------------------------------------------------ this page's Python (a session's, on the node)
-function kernel(state) {
-  if (state) S.py = state;
+// ------------------------------------------------------------------ a tab's Python (its session's, on the node)
+function kernel(state, d = S.doc) {
+  if (state && d) d.py = state;
   S.doc?.drawPill?.();
   if (S.doc?.kind === 'python') status();
 }
 H.kernel = kernel;
-async function restart() {
-  try { await call(`/sessions/${SESSION}/python`, { method: 'DELETE' }); } catch (e) { toast(e.message, true); return; }
-  kernel('none'); S.vars = []; toast('Python restarted: its variables are gone'); if (S.tab === 'variables') detail();
+async function restart(d = S.doc) {
+  try { await call(`/sessions/${sessionOf(d)}/python`, { method: 'DELETE' }); } catch (e) { toast(e.message, true); return; }
+  kernel('none', d); if (d) d.vars = []; toast('Python restarted: its variables are gone'); if (S.tab === 'variables') detail();
 }
 H.restart = restart;
-/** A SQL cell: on the node, unless the page's Python is in it (`more.js`: a table of its named, or
- * its answer named `→ df`). */
-const sqlCell = async (text, signal, cell) => cell?.as || S.vars?.length ? (await more()).sqlCell(text, signal, cell) : run(text, signal, undefined, S.pageRows);
-async function readVars() { const v = await (await call(`/sessions/${SESSION}/python`)).json(); S.vars = v.variables || []; if (v.python) S.pyInfo = v.python; return v; }
+/** A SQL cell: on the node, unless its notebook's Python is in it (`more.js`: a table of its named,
+ * or its answer named `→ df`). */
+const sqlCell = async (text, signal, cell) => cell?.as || cell?.nb.vars?.length ? (await more()).sqlCell(text, signal, cell) : run(text, signal, undefined, S.pageRows, sessionOf(cell?.nb));
+async function readVars(d = S.doc) { const v = await (await call(`/sessions/${sessionOf(d)}/python`)).json(); if (d) d.vars = v.variables || []; if (v.python) S.pyInfo = v.python; return v; }
 /** The Python chip of a notebook's or a Python file's toolbar: whether it runs, and its menu. */
 H.pythonPill = () => {
-  const pill = h('button', { class: 'pill kernel', id: 'kernel', 'aria-haspopup': 'menu', title: 'This page\'s Python, on the node: notebooks\' cells and Python files share its variables',
-    onclick: e => menu(e.currentTarget, [S.pyInfo ? { head: `Python ${S.pyInfo.version} · ${S.pyInfo.python}` } : null,
-      S.py === 'busy' ? { label: 'Interrupt the cell running', icon: 'stop', run: interruptPython } : null,
-      { label: 'Restart Python', icon: 'restart', keys: '0 0', run: restart }, { label: 'Variables', icon: 'var', run: () => show('variables') }, '-',
-      { label: 'Choose the Python…', icon: 'settings', run: choosePython }]) });
-  const draw = () => pill.replaceChildren(h('span', { class: 'dot ' + (S.py === 'busy' ? 'busy' : S.py === 'idle' ? '' : 'idle') }), 'Python ', h('b', {}, S.py === 'none' || !S.py ? 'not started' : S.py), icon('chevd', 'ic', 12));
+  const pill = h('button', { class: 'pill kernel', id: 'kernel', 'aria-haspopup': 'menu', title: 'This tab\'s Python, on the node: its own variables, apart from other tabs\'',
+    onclick: e => { const at = e.currentTarget; more().then(m => m.pythonMenu(at)); } });
+  const draw = (py = S.doc?.py) => pill.replaceChildren(h('span', { class: 'dot ' + (py === 'busy' ? 'busy' : py === 'idle' ? '' : 'idle') }), 'Python ', h('b', {}, py || 'not started'), icon('chevd', 'ic', 12));
   draw(); pill.draw = draw;
   return pill;
 };
-/** A document's Run: a button, a ▾ with its other ways to run; while it runs, Stop in its place. */
+/** A document's Run: a button, a ▾ with its other ways to run (and `all`, Run file beside it); while it runs, Stop in its place. */
 H.runButton = (busy, o, items) => busy ? h('button', { class: 'btn stopb', id: 'runBtn', title: o.stopTitle, onclick: o.stop }, icon('stop'), 'Stop')
-  : h('span', { class: 'split' }, h('button', { class: 'btn primary', id: 'runBtn', title: o.title, onclick: o.run }, icon('play'), o.label),
-    h('button', { class: 'btn primary caret', title: 'Other ways to run it', 'aria-label': 'Other ways to run it', 'aria-haspopup': 'menu', onclick: e => menu(e.currentTarget, typeof items === 'function' ? items() : items) }, icon('chevd', 'ic', 12))); // (items: made as the menu opens, when they depend on the selection)
+  : [h('span', { class: 'split' }, h('button', { class: 'btn primary', id: 'runBtn', title: o.title, onclick: o.run }, icon('play'), o.label),
+    h('button', { class: 'btn primary caret', title: 'Other ways to run it', 'aria-label': 'Other ways to run it', 'aria-haspopup': 'menu', onclick: e => menu(e.currentTarget, typeof items === 'function' ? items() : items) }, icon('chevd', 'ic', 12))), // (items: made as the menu opens, when they depend on the selection)
+    o.all ? h('button', { class: 'btn runall', id: 'runAll', title: o.all[1], onclick: o.all[0] }, icon('playall'), 'Run file') : null];
 /** Save, shown only when there is something to save. */
 H.saveButton = doc => doc.dirty ? h('button', { class: 'btn savep', id: 'saveBtn', title: 'Save it (Ctrl+S)', onclick: () => doc.save() }, icon('save'), 'Save') : null;
 on('ran', (who, r, what) => {
@@ -596,7 +575,7 @@ on('ran', (who, r, what) => {
   S.ran.length = Math.min(S.ran.length, 100);
   if (S.tab === 'runs') detail();
   if (r?.kind === 'done' || what?.kind === 'python' || who?.kind === 'python' || /\b(create|drop|alter|attach|detach)\b/i.test(src)) later(refresh); // (the last answer of a script may be rows after its DDL)
-  if (what?.kind === 'python' || who?.kind === 'python') readVars().then(() => S.tab === 'variables' && detail(), () => {});
+  if (what?.kind === 'python' || who?.kind === 'python') readVars(who?.nb || who?.doc).then(() => S.tab === 'variables' && detail(), () => {});
 });
 
 // ------------------------------------------------------------------ the node: its stats, the database, refreshing
@@ -709,7 +688,7 @@ document.addEventListener('focusin', e => { const tree = e.target.closest?.('[ro
 // ------------------------------------------------------------------ what the core registers (as an extension would)
 function core() {
   register.cellKind({ id: 'sql', label: 'SQL', language: 'sql', placeholder: 'SELECT …', live: true, run: sqlCell });
-  register.cellKind({ id: 'python', label: 'Python', language: 'python', placeholder: 'db.sql("SELECT …")      # runs on the node; cells share variables', run: async (text, signal) => { kernel('busy'); try { return await run(doBlock(text), signal, undefined, S.pageRows); } finally { kernel('idle'); } } });
+  register.cellKind({ id: 'python', label: 'Python', language: 'python', placeholder: 'db.sql("SELECT …")      # runs on the node; cells share variables', run: async (text, signal, cell) => { kernel('busy', cell.nb); try { return await run(doBlock(text), signal, undefined, S.pageRows, sessionOf(cell.nb)); } finally { kernel('idle', cell.nb); } } });
   register.cellKind({ id: 'markdown', label: 'Markdown', language: 'markdown', placeholder: 'Markdown: # a heading, **bold**, *italic*, [a link](https://…), ![a picture](data/chart.png), - a list, | a | table |' });
   register.renderer({ id: 'error', order: 10, match: r => r.kind === 'error', render: r => h('pre', { class: 'err' }, r.message) });
   register.renderer({ id: 'rows', order: 20, match: r => r.kind === 'rows', render: (r, cell) => grid(r, { footer: !!cell, name: S.doc?.name, explore: i => explore(r, i, cell),
@@ -719,10 +698,10 @@ function core() {
   register.renderer({ id: 'figures', order: 30, match: r => r.kind === 'done' && Array.isArray(r.value?.images), render: r => h('div', { class: 'figs' }, r.value.images.map(b => h('img', { class: 'fig', alt: 'a figure the code drew', src: 'data:image/png;base64,' + b }))) });
   register.renderer({ id: 'text', order: 40, match: r => r.kind === 'text', render: r => said(r.text) });
   // (a statement's execution plan, not run, or its query profile: H.explain)
-  register.renderer({ id: 'plan', order: 50, match: r => r.kind === 'plan', render: r => { const box = h('div', { class: 'wait' }, 'Reading the plan…'); import('./plan.js').then(m => box.replaceWith(m.planView(r.sql, r.params, { profile: r.profile }))); return box; } });
+  register.renderer({ id: 'plan', order: 50, match: r => r.kind === 'plan', render: r => { const box = h('div', { class: 'wait' }, 'Reading the plan…'); import('./plan.js').then(m => box.replaceWith(m.planView(r.sql, r.params, { profile: r.profile, session: r.session }))); return box; } });
   register.renderer({ id: 'done', order: 90, match: r => r.kind === 'done', render: r => { const d = doneText(r.value) || (r.notices?.length ? '' : 'Done.'); return d && !(d === 'Done.' && r.notices?.length) ? h('div', { class: 'done' }, d) : null; } });
   register.view({ id: 'data', side: 'left', order: 10, title: () => MODE === 'lakes' ? 'Databases' : 'Data', render: box => dataTree(box), tools: [
-    { icon: 'plus', title: 'New database', domId: 'newdb', hidden: () => MODE !== 'lakes', run: newDatabase },
+    { icon: 'plus', title: 'New database', domId: 'newdb', hidden: () => MODE !== 'lakes', run: () => H.newDatabase() },
     { icon: 'refresh', title: 'Refresh', domId: 'refresh', run: () => refresh() }] });
   register.view({ id: 'workspace', side: 'left', order: 20, title: 'Workspace', render: box => workspace(box), tools: [
     { icon: 'plus', title: 'New: a notebook, a file or a folder', domId: 'newfile', menu: false, run: e => newMenu(e.currentTarget) }] });
@@ -758,7 +737,7 @@ addEventListener('beforeunload', e => { if (S.docs.some(d => d.dirty && !d.blank
 addEventListener('pagehide', () => {
   const token = T.token();
   if (keeping) { clearTimeout(keeping); keeping = 0; T.fetch('/console/settings', { method: 'PUT', keepalive: true, body: JSON.stringify(PREFS), headers: { 'content-type': 'application/json' } }).catch(() => {}); } // (a setting changed just before the page went)
-  T.fetch(base() + '/sessions/' + SESSION, { method: 'DELETE', keepalive: true, headers: { ...T.headers(), ...(token ? { authorization: 'Bearer ' + token } : {}) } }).catch(() => {}); // (the temporary tables of this page, and its Python)
+  for (const s of [SESSION, ...S.docs.map(d => d.session)]) if (s) T.fetch(base() + '/sessions/' + s, { method: 'DELETE', keepalive: true, headers: { ...T.headers(), ...(token ? { authorization: 'Bearer ' + token } : {}) } }).catch(() => {}); // (each tab's temporary tables, variables and Python)
 });
 const layout = () => `${narrow()} ${drawer('right')}`;
 let wasLayout = layout();

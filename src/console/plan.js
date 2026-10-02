@@ -8,10 +8,14 @@ import { doneText } from './notebook.js';
 
 await moreStyle();
 
+// (a statement that sets something rather than reading rows: EXPLAIN can't take it)
+const UNPLANNED = /^(?:\s|--[^\n]*|\/\*[\s\S]*?\*\/)*(declare|set|reset|begin|start|commit|rollback|use|attach|detach|\$[a-z_]\w*\s*:?=)/i;
 const MOVES = /^(RepartitionExec|CoalescePartitionsExec|SortPreservingMergeExec|CoalesceBatchesExec)$/;
 
 /** The Plan tab's view of `sql` (its `$name`s bound to `params`); `o.profile`: its query profile at once. */
 export function planView(sql, params, o = {}) {
+  const sets = UNPLANNED.exec(sql)?.[1];
+  if (sets) return h('div', { class: 'wait' }, sets[0] === '$' ? `Setting ${sets.replace(/\s*:?=$/, '')} has no plan: nothing is read.` : `${sets.toUpperCase()} has no plan: it reads no rows.`);
   const box = h('div', { class: 'planv' }), st = { how: 'graph', plan: null, profile: null, busy: false };
   const read = /^\s*(\(|select\b|with\b|values\b|from\b|table\b)/i.test(sql.replace(/--[^\n]*|\/\*[\s\S]*?\*\//g, ' ')); // (a comment before it too)
   const draw = () => {
@@ -31,7 +35,7 @@ export function planView(sql, params, o = {}) {
   const ask = async analyze => {
     const t0 = performance.now();
     try {
-      const r = await run(`EXPLAIN ${analyze ? 'ANALYZE ' : ''}${sql}`, undefined, params);
+      const r = await run(`EXPLAIN ${analyze ? 'ANALYZE ' : ''}${sql}`, undefined, params, undefined, o.session);
       if (r.kind !== 'rows') return { error: doneText(r.value) || 'No plan.' };
       const byType = Object.fromEntries(r.rows.map(x => [String(x[0]), String(x[1])]));
       const physical = byType.physical_plan || byType['Plan with Metrics'] || Object.values(byType).at(-1) || '';

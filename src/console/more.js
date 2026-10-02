@@ -1,7 +1,7 @@
 // The console's rarer parts (ADR-034, round 29), loaded when first used, so the page's first load
 // doesn't carry them: the History view (the node's runs, what this page ran), the Variables view,
 // search (Ctrl K), choosing the Python, a file run as a job or on a schedule. What they use of the shell comes through `R.helpers`.
-import { on, h, $, secs, count, bytes, utc, icon, svg, S, R, call, run, doBlock, rows, ident, quote, toast, menu, prompt, confirmed, pop, fileUrl, fileSql, writeFile, moreStyle, renaming } from './core.js';
+import { on, h, $, secs, count, bytes, utc, icon, svg, S, R, call, run, sessionOf, doBlock, rows, ident, quote, toast, menu, prompt, confirmed, pop, fileUrl, fileSql, writeFile, moreStyle, interruptPython } from './core.js';
 import { highlighted } from './editor.js';
 import { copyText } from './grid.js';
 import { iconOf, oneLine, FOLDER, download } from './files.js';
@@ -12,23 +12,30 @@ await moreStyle();
 const H = R.helpers, { KIND, pick, act, facts, head, detail, readVars, show, openFile, newFile, restart, kernel } = H;
 let again = 0;
 
-/** A SQL cell with the page's Python in it: through Python when it names a table Python holds
+/** A SQL cell with its notebook's Python in it: through Python when it names a table Python holds
  * (pandas, Polars, Arrow, a frame: sent along, as `db.sql` sends them); its answer kept in Python
  * as a frame under the cell's name (`→ df`), as a notebook's run on the node does it too. */
 export async function sqlCell(text, signal, cell) {
-  const tables = (S.vars || []).filter(v => /^(pandas|polars|pyarrow|pondra\.frame)\./.test(v.type) && new RegExp(`\\b${v.name}\\b`, 'i').test(text));
+  const nb = cell?.nb, session = sessionOf(nb), tables = (nb?.vars || []).filter(v => /^(pandas|polars|pyarrow|pondra\.frame)\./.test(v.type) && new RegExp(`\\b${v.name}\\b`, 'i').test(text));
   const query = /^\s*(select|with|from|values|table|show|describe)\b/i.test(text.replace(/--[^\n]*|\/\*[\s\S]*?\*\//g, ' ')) && !text.replace(/;\s*$/, '').includes(';');
   const name = query && /^\w+$/.test(cell?.as || '') ? cell.as : '';
   if (query && tables.length) {
-    kernel('busy');
-    try { return await run(doBlock(`${name || '_sql'} = db.sql(${JSON.stringify(text)})\n${name || '_sql'}`), signal, undefined, S.pageRows); } finally { kernel('idle'); if (name) readVars().catch(() => {}); }
+    kernel('busy', nb);
+    try { return await run(doBlock(`${name || '_sql'} = db.sql(${JSON.stringify(text)})\n${name || '_sql'}`), signal, undefined, S.pageRows, session); } finally { kernel('idle', nb); if (name) readVars(nb).catch(() => {}); }
   }
-  const r = await run(text, signal, undefined, S.pageRows);
-  if (name && r.kind === 'rows') { await run(doBlock(`${name} = db.sql(${JSON.stringify(text)})`)); readVars().catch(() => {}); }
+  const r = await run(text, signal, undefined, S.pageRows, session);
+  if (name && r.kind === 'rows') { await run(doBlock(`${name} = db.sql(${JSON.stringify(text)})`), undefined, undefined, undefined, session); readVars(nb).catch(() => {}); }
   return r;
 }
 
 
+/** The Python chip's menu: which Python, and the tab's: interrupt, restart, its variables. */
+export function pythonMenu(at) {
+  menu(at, [S.pyInfo ? { head: `Python ${S.pyInfo.version} · ${S.pyInfo.python}` } : null,
+    { label: 'Interrupt', icon: 'stop', keys: S.doc?.kind === 'notebook' ? 'I I' : null, disabled: S.doc?.py !== 'busy', run: () => interruptPython() },
+    { label: 'Restart Python', icon: 'restart', keys: '0 0', run: () => H.restart() }, { label: 'Variables', icon: 'var', run: () => H.show('variables') }, '-',
+    { label: 'Choose the Python…', icon: 'settings', run: choosePython }]);
+}
 /** Choose the Python the node runs: each this machine has, tried (its version, whether pondra and
  * pyarrow import), the one in use marked; one that lacks them says how to install them. */
 export async function choosePython() {
@@ -59,11 +66,11 @@ export async function variables() {
   try { v = await readVars(); } catch (e) { return [h('pre', { class: 'err' }, e.message)]; }
   const one = (name, ty, look) => h('div', { class: 'var' }, h('div', { class: 'line1' }, h('span', { class: 'nm' }, name), h('span', { class: 'ty' }, ty)), h('div', { class: 'look' }, look));
   const vars = await sql;
-  const py = v.busy ? 'a cell is running: they show when it is done' : v.running ? `${S.vars.length} in this page's Python` : vars.length ? '' : 'no Python yet: a Python cell or file starts it';
+  const mine = S.doc?.vars || [], py = v.busy ? 'a cell is running: they show when it is done' : v.running ? `${mine.length} in this tab's Python` : vars.length ? '' : 'none in this tab yet';
   return [head('var', 'Variables', [py, vars.length && `${vars.length} in SQL`].filter(Boolean).join(' · ')),
-    h('div', { class: 'acts2' }, act('restart', 'Restart', 'Stop this page\'s Python: its variables go (its temporary tables stay)', restart), act('refresh', 'Refresh', 'Read them again', () => detail())),
-    ...S.vars.map(x => one(x.name, x.type + (x.size ? ` · ${x.size}` : ''), x.look)),
-    // (SQL's: DECLARE $day DATE = …, $day = …; this page's session holds them)
+    h('div', { class: 'acts2' }, act('restart', 'Restart', 'Stop this tab\'s Python: its variables go (its temporary tables stay)', () => restart()), act('refresh', 'Refresh', 'Read them again', () => detail())),
+    ...mine.map(x => one(x.name, x.type + (x.size ? ` · ${x.size}` : ''), x.look)),
+    // (SQL's: DECLARE $day DATE = …, $day = …; this tab's session holds them)
     vars.length ? h('h4', { class: 'vhead' }, 'SQL') : null, ...vars.map(x => one('$' + x.name, (x.type || '').toLowerCase(), x.value ?? 'NULL'))];
 }
 
@@ -86,7 +93,7 @@ export async function runs() {
     codeOf(x) ? ['Copy the code', () => copyText(codeOf(x).code)] : null, ['Copy its id', () => copyText(String(x.id))]].filter(Boolean);
   const nodeLook = x => pop(`Run ${String(x.id).slice(0, 12)}`, h('div', {}, facts([['What', codeOf(x) ? `DO LANGUAGE ${codeOf(x).language}` : x.routine], ['Who', x.caller], ['Status', x.status], ['Started', utc(x.started).toLocaleString()], ['Ended', x.ended ? utc(x.ended).toLocaleString() : null], ['Took', took(x)], ['Id', String(x.id)]]),
     codeOf(x) ? h('pre', { class: 'defn', html: highlighted(codeOf(x).code, codeOf(x).language === 'python' ? 'python' : 'sql') }) : null, x.error ? h('pre', { class: 'err' }, x.error) : null), nodeActs(x));
-  const nodeRun = x => h('div', { class: 'run-item', role: 'button', tabindex: '0', title: 'Click: what it ran. Right-click: more', onclick: () => nodeLook(x), onkeydown: e => e.key === 'Enter' && nodeLook(x),
+  const nodeRun = x => h('div', { class: 'run-item' + (String(x.id) === String(S.jobRun) ? ' fresh' : ''), role: 'button', tabindex: '0', title: 'Click: what it ran. Right-click: more', onclick: () => nodeLook(x), onkeydown: e => e.key === 'Enter' && nodeLook(x),
     oncontextmenu: e => { e.preventDefault(); menu(e, [{ label: 'Show it', run: () => nodeLook(x) }, ...nodeActs(x).map(([label, run]) => ({ label, run }))]); } },
     h('div', { class: 'line1' }, h('span', { class: 'ic', html: svg(fileOf(x) ? iconOf(fileOf(x)) : codeOf(x)?.language === 'python' || x.routine === 'do' ? 'filepy' : 'play', 14) }), h('span', { class: 'nm' }, nameOf(x)),
       h('span', { class: 'meta ' + (x.status === 'failed' ? 'bad' : '') }, x.status === 'failed' ? 'failed' : took(x))),
@@ -116,14 +123,24 @@ function pageLook(x) {
  * (`pondra.start('run', …)`), or on a schedule, as a task. What is saved runs, with the SQL file's
  * parameters as they are now; History shows it. */
 export async function job(doc, every) {
-  if (doc.dirty && !(await doc.save())) return;
+  if (doc.dirty && !(confirmed(`A job runs the file as it is saved, on the node, apart from this tab. Save ${doc.title} and ${every ? 'schedule' : 'run'} it?`) && await doc.save())) return;
   if (every && !(every = await prompt('Schedule', 'How often', '1 hour', 'For example 15 minutes, 1 day, or cron 0 2 * * * UTC. It runs on the node as CALL run(…): Jobs lists it, History its runs.'))) return;
   const path = doc.kind === 'notebook' && !doc.plain ? `notebooks/${doc.name}` : doc.path, name = path.replace(/\.[^./]+$/, '').replace(/\W+/g, '_').replace(/^_+|_+$/g, '').toLowerCase() || 'job';
   const args = quote(path) + Object.entries(doc.params?.() || {}).map(([n, v]) => `, ${ident(n)} => ${typeof v === 'string' ? quote(v) : String(v).toUpperCase()}`).join('');
   try {
-    await run(every ? `CREATE OR REPLACE TASK ${ident(name)} SCHEDULE ${quote(every)} AS CALL run(${args})` : `SELECT pondra.start('run', ${args})`);
-    toast(every ? `Scheduled: ${name}, every ${every}` : `Started on the node: ${path}`); show(every ? 'jobs' : 'runs');
+    const r = await run(every ? `CREATE OR REPLACE TASK ${ident(name)} SCHEDULE ${quote(every)} AS CALL run(${args})` : `SELECT pondra.start('run', ${args})`);
+    S.jobRun = r.rows?.[0]?.[0]; // (its row in History, marked)
+    toast(every ? `Scheduled: ${name}, every ${every}` : `Running ${path} as a job on the node: History shows it`); show(every ? 'jobs' : 'runs');
+    if (S.jobRun) told(S.jobRun, path);
   } catch (e) { toast(e.message, true); }
+}
+/** Say how a job ended (its answers stay on the node: History has the run). */
+async function told(id, path, t0 = Date.now(), seen = false) {
+  const [x] = await rows(`SELECT status, error FROM pondra.runs WHERE id = ${quote(String(id))}`).catch(() => []);
+  if (x && !seen && S.tab === 'runs') detail(); // (History: its row, once the node has it, and again as it ends)
+  if (x?.status === 'running' || !x && Date.now() - t0 < 5000) { if (Date.now() - t0 < 6e5) setTimeout(() => told(id, path, t0, !!x), 1000); return; }
+  if (x && seen && S.tab === 'runs') detail();
+  if (x) toast(x.status === 'failed' ? `The job ${path} failed: ${(x.error || '').split('\n')[0]}` : `The job ${path} is done, in ${secs(Date.now() - t0)}`, x.status === 'failed');
 }
 
 /** Search (Ctrl K): tables, files, notebooks and commands, as you type. */
@@ -154,20 +171,6 @@ export function palette() {
     else if (e.key === 'Enter') { e.preventDefault(); go(); }
   };
   d.showModal();
-}
-
-/** A tab's right-click menu: pin it, close it or some of the others (the pinned stay), copy its path. */
-export function tabMenu(e, d) {
-  const { closeDoc: close, pin } = H, i = S.docs.indexOf(d), some = f => S.docs.filter((x, j) => x !== d && !x.pinned && f(x, j));
-  const closeAll = async list => { for (const x of list) await close(x); };
-  const others = some(() => true), right = some((_, j) => j > i), saved = some(x => !x.dirty);
-  menu(e, [{ label: d.pinned ? 'Unpin' : 'Pin', icon: 'pin', run: () => pin(d, !d.pinned) }, '-',
-    { label: 'Close', icon: 'close', keys: 'Delete', run: () => close(d) },
-    { label: 'Close others', disabled: !others.length, run: () => closeAll(others) }, { label: 'Close to the right', disabled: !right.length, run: () => closeAll(right) },
-    { label: 'Close saved', disabled: !saved.length && (d.dirty || d.pinned), run: () => closeAll(saved.concat(d.dirty || d.pinned ? [] : [d])) },
-    { label: S.docs.some(x => x.pinned) ? 'Close all but the pinned' : 'Close all', run: () => closeAll(S.docs.filter(x => !x.pinned)) },
-    d.rename ? '-' : null, d.rename ? { label: 'Rename…', icon: 'pencil', run: () => { H.activate(d); renaming(); } } : null,
-    d.rename ? { label: 'Copy path', icon: 'copy', disabled: d.kind === 'notebook' ? !d.version : !d.path, hint: 'files/…', run: () => H.copyPath(d) } : null]);
 }
 
 // ------------------------------------------------------------------ the Workspace's files: their menus, a folder, uploads, renaming, deleting

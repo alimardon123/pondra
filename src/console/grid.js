@@ -495,10 +495,10 @@ export function grid(r, o = {}) {
   }
   drawPager();
 
-  // the line under it, the same for a SQL file's answer and a cell's: how many rows and how long, the
-  // filters, the selection's sum; the pages at the right
+  // the line under it, the same for a SQL file's answer and a cell's: how many rows and how long (a
+  // cell's time is beside its Run), the filters, the selection's sum; the pages at the right
   const sumBox = o.onsum ? null : h('span', { class: 'sum' }), total = r.total ?? all.length;
-  const what = `${count(total)} row${total === 1 ? '' : 's'}${!size && r.total > all.length ? ` (${count(all.length)} here)` : ''}${r.ms != null ? ' · ' + secs(r.ms) : ''}`;
+  const what = `${count(total)} row${total === 1 ? '' : 's'}${!size && r.total > all.length ? ` (${count(all.length)} here)` : ''}${r.ms != null && !o.footer ? ' · ' + secs(r.ms) : ''}`;
   const foot = h('div', { class: 'gfoot' + (o.onsum ? ' own' : '') }, o.onsum ? null : h('span', { class: 'n-rows' }, what), chip, sumBox, more, h('span', { class: 'grow' }), pager); // (own: a data file's, its count and sum in its own footer)
   const wrap = h('div', { class: 'gridwrap' + (o.fill ? ' fill' : '') });
   if (o.footer) {

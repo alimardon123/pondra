@@ -114,15 +114,15 @@ export class Editor {
     this.ta.addEventListener('mousemove', e => this.onhover?.(e));
     this.paint();
   }
-  /** Its right-click menu, as an application's: cut, copy, paste, select all, comment, and what its
-   * document adds (`menu`: running, formatting). */
+  /** Its right-click menu, as an application's: what its document runs first (`top`), then cut,
+   * copy, paste, select all, comment, and what else its document adds (`menu`: formatting, jobs). */
   contextMenu(at) {
     const ta = this.ta, some = ta.selectionStart !== ta.selectionEnd, mod = navigator.platform?.startsWith('Mac') ? 'Cmd' : 'Ctrl';
     const exec = cmd => { ta.focus(); document.execCommand(cmd); };
-    menu(at, [{ label: 'Cut', keys: `${mod} X`, disabled: !some, run: () => exec('cut') }, { label: 'Copy', icon: 'copy', keys: `${mod} C`, disabled: !some, run: () => exec('copy') },
+    menu(at, [...this.top?.(some) || [], '-', { label: 'Cut', keys: `${mod} X`, disabled: !some, run: () => exec('cut') }, { label: 'Copy', icon: 'copy', keys: `${mod} C`, disabled: !some, run: () => exec('copy') },
       { label: 'Paste', keys: `${mod} V`, run: () => navigator.clipboard?.readText ? navigator.clipboard.readText().then(t => { ta.focus(); insert(ta, t); }, () => toast(`${mod}+V pastes here`)) : toast(`${mod}+V pastes here`) },
       { label: 'Select all', keys: `${mod} A`, run: () => { ta.focus(); ta.select(); } }, '-',
-      this.language !== 'markdown' ? { label: 'Comment the lines, or uncomment them', keys: `${mod} /`, run: () => { ta.focus(); comment(this); } } : null,
+      this.language !== 'markdown' ? { label: 'Comment / Uncomment', keys: `${mod} /`, run: () => { ta.focus(); comment(this); } } : null, '-',
       ...this.menu?.(some) || []]);
   }
   /** Replace what is selected (or, with nothing selected or `whole`, all of it) by `f` of it (`f`
@@ -276,7 +276,7 @@ function keys(e, ed) {
 const FUNCS = 'abs avg ceil coalesce concat count date_bin date_part date_trunc extract floor greatest least length lower ltrim max min now nullif regexp_replace replace round row_number rank dense_rank lag lead first_value last_value split_part stddev strpos substr sum to_char to_date to_timestamp trim upper approx_distinct approx_percentile_cont median array_agg string_agg json_get json_get_str cosine_distance read_parquet read_csv read_json files file_read range generate_series'.split(' ');
 let cm = null; // (the completion open now: its editor, where the word starts, the choices, the one on)
 /** Names that complete the word before the caret: the lake's tables and columns (those of the
- * tables the text names first), SQL's words and functions; in Python, the page's variables. */
+ * tables the text names first), SQL's words and functions; in Python, its tab's variables. */
 export function complete(ed, force) {
   const ta = ed.ta, at = ta.selectionStart, before = ta.value.slice(0, at), m = before.match(/[\w.$"]*$/), word = m[0].replace(/"/g, '');
   if (!word && !force) return false;
@@ -301,7 +301,7 @@ export function complete(ed, force) {
     for (const f of FUNCS) push(f + '(', 'function', 3);
     for (const k of SQL_KW) push(/[a-z]/.test(word) ? k.toLowerCase() : k, '', 4);
   } else if (ed.language === 'python') {
-    for (const v of S.vars || []) push(v.name, v.type, 0);
+    for (const v of S.doc?.vars || []) push(v.name, v.type, 0);
     for (const x of ['db.sql(', 'db.table(', 'db.tables()', 'db.insert(', 'pondra.col(', 'print(']) push(x, '', 1);
     for (const k of PY_KW) push(k, '', 2);
   } else return false;

@@ -321,6 +321,23 @@ def node_checks(browser, port, show):
     live.locator("label.live").click()
     ended = until(lambda: call(port, "GET", "/stats")["live_queries"], 0)
     checks["a live cell shows a row INSERTed over HTTP (a decimal to its scale); off, its query ends"] = started is True and updated == [["4", "4.00"]] and ended == 0
+    # (a browser opens six connections to a host at most: a stream per live cell held them all, and a
+    # Python cell after six of them waited for good; the page's live queries now share one)
+    many = [{"cell_type": "code", "id": f"l{i}", "metadata": {"pondra": {"live": True}}, "source": f"%%sql\nSELECT count(*) + {i} AS n FROM people", "outputs": [], "execution_count": None} for i in range(7)]
+    many.append({"cell_type": "code", "id": "py", "metadata": {}, "source": "print('still here')", "outputs": [], "execution_count": None})
+    put(port, "notebooks/lives.ipynb", json.dumps({"cells": many, "metadata": {}, "nbformat": 4, "nbformat_minor": 5}).encode())
+    p.evaluate("pondra.ui.openFile('notebooks/lives.ipynb')")
+    until(lambda: pg.tab()[0].startswith("lives"), True)
+    pg.cell(0).locator("textarea").click()
+    p.keyboard.press("Control+Shift+Enter")  # (every cell, in order: seven live, then Python)
+    watching = until(lambda: call(port, "GET", "/stats")["live_queries"], 7, 20)
+    printed = until(lambda: pg.cell(7).locator(".said").count() and pg.cell(7).locator(".said").inner_text(), "still here", 20)
+    sql(port, "INSERT INTO people (id, name, amt) VALUES (5, 'Ed', 1)")
+    followed = until(lambda: [pg.grid(pg.cell(i))[1] for i in range(7)], [[[str(5 + i)]] for i in range(7)], 20)
+    p.locator("#tabbar .tab.on .x").click()
+    closed = until(lambda: call(port, "GET", "/stats")["live_queries"], 0)
+    checks["seven live cells at once: a Python cell after them still runs, each follows an INSERT, and closing their notebook ends their queries"] = \
+        watching == 7 and printed == "still here" and followed == [[[str(5 + i)]] for i in range(7)] and closed == 0
 
     n = pg.cells().count()
     pg.cell(0).locator("textarea").click()
@@ -464,7 +481,7 @@ def files_checks(browser, port, show):
     sql(port, "CREATE TABLE fx AS SELECT value AS id, 'r' || (value % 3) AS region FROM range(0, 30)")
     top = b"SELECT region, count(*) AS n\nFROM fx\nGROUP BY region\nORDER BY region"
     put(port, "scripts/top.sql", top)
-    put(port, "scripts/since.sql", b"-- The first day counted\nDECLARE $since DATE = DATE '2026-01-01';\nDECLARE $top BIGINT DEFAULT 3;\nSELECT $since AS since, $top + 1 AS more;\nSELECT 7 AS seven")
+    put(port, "scripts/since.sql", b"-- The first day counted\nDECLARE $since DATE = DATE '2026-01-01';\nDECLARE $top BIGINT DEFAULT 3; -- how many more\nSELECT $since AS since, $top + 1 AS more;\nSELECT 7 AS seven")
     put(port, "scripts/hello.py", b'import math\nprint("pi is", round(math.pi, 4))\ndb.sql("SELECT count(*) AS n FROM fx")')
     put(port, "data/q.csv", b'id,city,amount\r\n1,Oslo,10\r\n2,"Rome, IT",20\r\n')
     put(port, "data/e.jsonl", b'{"id":1,"tag":"a"}\n{"id":2,"tag":"b"}\n')
@@ -499,31 +516,37 @@ def files_checks(browser, port, show):
     saved = until(lambda: get(port, "scripts/top.sql"), top + b"\nLIMIT 2")
     clean = until(lambda: pg.tab(), ("top.sql", False))
     checks["a SQL file changed shows it (its tab, the Workspace) and Ctrl+S saves it in place"] = dirty == (("top.sql", True), 1) and saved == top + b"\nLIMIT 2" and clean == ("top.sql", False)
-    put(port, "scripts/multi.sql", b"CREATE TABLE fm AS SELECT 1 AS a;\n-- its rows; this ; is a comment's\nSELECT a, 'x;y' AS s FROM fm;\nSELECT nope;\nSELECT 5")
+    put(port, "scripts/multi.sql", b"CREATE TABLE IF NOT EXISTS fm AS SELECT 1 AS a;\n-- its rows; this ; is a comment's\nSELECT a, 'x;y' AS s FROM fm;\nSELECT nope;\nSELECT 5")
     pg.workspace("scripts", "multi.sql").click()
     until(lambda: pg.tab()[0], "multi.sql")
-    p.click("#runBtn")
+    p.click("#runAll")
     strip = p.locator(".filedoc .stmts")
     listed = lambda: strip.evaluate("s => [...s.querySelectorAll('button.stmt')].map(b => b.querySelector('b').textContent + ' ' + b.lastChild.textContent)")
-    each = until(listed, ["1 done", "2 1 row", "3 failed"])
-    left = strip.locator(".stmts-left").inner_text()
-    strip.locator("button.stmt").nth(1).click()
+    each = until(listed, ["2 1 row", "3 failed"])  # (the answers, numbered as in the file; what the CREATE did is in Messages)
+    left = strip.locator("span.stmts-left").inner_text()
+    more_msgs = strip.locator(".stmts-left.more").inner_text()
+    strip.locator("button.stmt").first.click()
     second = until(lambda: pg.grid(body), [["a", "s"], [["1", "x;y"]]])
+    ed.focus()
+    p.keyboard.press("Control+Home")
+    p.keyboard.press("Control+Enter")  # (the statement at the caret: the CREATE alone, no rows, so Messages shows what it did)
+    created = until(lambda: p.locator(".filedoc .ptab.on").inner_text() == "Messages" and strip.count() == 0 and body.locator(".msg").count() == 1 and "CREATE TABLE" in body.locator(".msg code").inner_text(), True)
     pg.menu("Settings")
     pg.setting("Editor and results", "A SQL file's statements").locator(".seg", has_text="The last one's").click()
     p.keyboard.press("Escape")
-    p.click("#runBtn")
+    p.click("#runAll")
     last = until(lambda: body.locator(".err").count() == 1 and strip.count() == 0, True)  # (all at once: it stops at the failure too, one answer)
     ed.focus()
     p.keyboard.press("Control+a")
     p.keyboard.insert_text("SELECT 1 AS a; SELECT 2 AS b")
-    p.click("#runBtn")
+    p.click("#runAll")
     only = until(lambda: pg.grid(body), [["b"], [["2"]]])
     pg.menu("Settings")
     pg.setting("Editor and results", "A SQL file's statements").locator(".seg", has_text="An answer each").click()
     p.keyboard.press("Escape")
-    checks["a SQL file's statements each get an answer (split as the node splits them), up to a failure; Settings can say the last one's only"] = \
-        each == ["1 done", "2 1 row", "3 failed"] and left == "1 after it not run" and second == [["a", "s"], [["1", "x;y"]]] and last is True and only == [["b"], [["2"]]]
+    checks["Run file runs a SQL file's statements, each its answer (split as the node splits them; a CREATE's in Messages), up to a failure; Run (Ctrl+Enter) the statement at the caret, what it did in Messages; Settings can say the last one's only"] = \
+        each == ["2 1 row", "3 failed"] and left == "1 after it not run" and more_msgs == "1 more in Messages" and second == [["a", "s"], [["1", "x;y"]]] and created is True \
+        and last is True and only == [["b"], [["2"]]]
     p.click("#newfile")
     p.locator("#menu button", has_text="New SQL file").click()
     pg.editing()
@@ -589,28 +612,31 @@ def files_checks(browser, port, show):
         shown == ["$region"] and bound == [["n", "region"], [["10", "r1"]]] and ran is True and isinstance(task, list) and len(task) == 1 and listed == 1 and cadence == "every 1 hour" and dropped == [{"n": 0}] and gone == 0
     pg.workspace("scripts", "since.sql").click()
     until(lambda: pg.tab()[0], "since.sql")
-    params = lambda: bar.evaluate("b => [...b.querySelectorAll('.param')].map(l => [l.querySelector('span').textContent, l.querySelector('i')?.textContent, l.querySelector('input').type, l.querySelector('input').placeholder, l.title])")
-    typed = until(params, [["$since", "date", "date", "DATE '2026-01-01'", "The first day counted\nDefault: DATE '2026-01-01'"], ["$top", "bigint", "text", "3", "Default: 3"]], 5)
+    params = lambda: bar.evaluate("b => [...b.querySelectorAll('.param')].map(l => [l.querySelector('span').textContent, l.querySelector('i')?.textContent, l.querySelector('input').type, l.querySelector('input').value, l.title, l.querySelector('.pabout')?.textContent])")
+    typed = until(params, [["$since", "date", "date", "2026-01-01", "The first day counted\nDefault: DATE '2026-01-01'", "The first day counted"], ["$top", "bigint", "text", "3", "how many more\nDefault: 3", "how many more"]], 5)
     lit = p.locator(".filedoc pre.hl span.nu", has_text="$since").count() > 0
     p.wait_for_function("document.activeElement?.tagName === 'TEXTAREA'")
     ed.focus()
     p.keyboard.press("Control+Home")
-    p.keyboard.press("Control+Enter")
+    p.keyboard.press("Control+Shift+Enter")  # (the file)
     answers = lambda: strip.evaluate("s => [...s.querySelectorAll('button.stmt')].map(b => b.querySelector('b').textContent + ' ' + b.lastChild.textContent)")
-    whole = until(lambda: strip.count() and answers(), ["1 done", "2 done", "3 1 row", "4 1 row"])
-    strip.locator("button.stmt").nth(2).click()
+    whole = until(lambda: strip.count() and answers(), ["3 1 row", "4 1 row"])
+    strip.locator("button.stmt").first.click()
     defaults = until(lambda: pg.grid(body), [["since", "more"], [["2026-01-01", "4"]]])
     bar.locator("input").nth(1).fill("10")
-    bar.locator("input").nth(1).press("Enter")
-    strip.locator("button.stmt").nth(2).click()
+    marked = bar.locator(".param.set").count()
+    bar.locator("input").nth(1).press("Enter")  # (Enter in a parameter: the file runs)
+    strip.locator("button.stmt").first.click()
     given = until(lambda: pg.grid(body), [["since", "more"], [["2026-01-01", "11"]]])
     ed.focus()
     p.keyboard.press("Control+End")
-    p.keyboard.press("Control+Shift+Enter")  # (the caret in the last statement: that one alone)
+    p.keyboard.press("Control+Enter")  # (the caret in the last statement: that one alone)
     alone = until(lambda: strip.count() == 0 and pg.grid(body), [["seven"], [["7"]]])
     ed.evaluate("t => t.setSelectionRange(t.value.indexOf('AS more;') + 8, t.value.indexOf('AS more;') + 8)")  # (just after its ;: the statement before)
-    p.keyboard.press("Control+Shift+Enter")
+    p.keyboard.press("Control+Enter")
     after = until(lambda: pg.grid(body), [["since", "more"], [["2026-01-01", "11"]]])
+    bar.locator(".param").nth(1).locator(".preset").click()
+    reset = (bar.locator("input").nth(1).input_value(), bar.locator(".param.set").count())
     box, cw = ed.bounding_box(), p.evaluate("(() => { const c = document.createElement('canvas').getContext('2d'); c.font = '13px ' + getComputedStyle(document.body).getPropertyValue('--mono'); return c.measureText('0').width; })()")
     p.mouse.move(box["x"] + 14 + cw * 9.5, box["y"] + 9 + 21 * 1.5)  # (over `$since`, line 2)
     hovered = until(lambda: ed.get_attribute("title") or "", "$since DATE = DATE '2026-01-01'\nThe first day counted\nNow: 2026-01-01 (date)", 5)
@@ -623,11 +649,11 @@ def files_checks(browser, port, show):
     p.keyboard.press("Control+Space")
     completes = until(lambda: p.locator("#complete:not([hidden]) div").all_inner_texts()[:1], ["$top\nvariable"], 5)
     p.keyboard.press("Escape")
-    checks["a SQL file's DECLAREs are its parameters (type, default, what the comment above says; a date picks a date), $names highlighted; a value given replaces the default; Ctrl+Shift+Enter runs the statement at the caret (just after its ; too); hovering a $name says it; Variables lists SQL's; $ completes"] = \
-        typed == [["$since", "date", "date", "DATE '2026-01-01'", "The first day counted\nDefault: DATE '2026-01-01'"], ["$top", "bigint", "text", "3", "Default: 3"]] and lit \
-        and whole == ["1 done", "2 done", "3 1 row", "4 1 row"] and defaults == [["since", "more"], [["2026-01-01", "4"]]] and given == [["since", "more"], [["2026-01-01", "11"]]] \
+    checks["a SQL file's DECLAREs are its parameters (type, its default as the value, what the comment above or after it says; a date picks a date), $names highlighted; a value given replaces the default (marked, ↺ back); Ctrl+Shift+Enter runs the file, Ctrl+Enter the statement at the caret (just after its ; too); hovering a $name says it; Variables lists SQL's; $ completes"] = \
+        typed == [["$since", "date", "date", "2026-01-01", "The first day counted\nDefault: DATE '2026-01-01'", "The first day counted"], ["$top", "bigint", "text", "3", "how many more\nDefault: 3", "how many more"]] and lit \
+        and whole == ["3 1 row", "4 1 row"] and defaults == [["since", "more"], [["2026-01-01", "4"]]] and marked == 1 and given == [["since", "more"], [["2026-01-01", "11"]]] and reset == ("3", 0) \
         and alone == [["seven"], [["7"]]] and after == [["since", "more"], [["2026-01-01", "11"]]] and hovered.startswith("$since DATE") and shown_vars == ["$since", "$top"] and completes == ["$top\nvariable"]
-    var_info = {"typed": typed, "whole": whole, "defaults": defaults, "given": given, "alone": alone, "after": after, "hovered": hovered, "vars": shown_vars, "completes": completes}
+    var_info = {"typed": typed, "whole": whole, "marked": marked, "reset": reset, "defaults": defaults, "given": given, "alone": alone, "after": after, "hovered": hovered, "vars": shown_vars, "completes": completes}
     pg.workspace("scripts", "hello.py").click()
     until(lambda: pg.tab()[0], "hello.py")
     p.locator("#docbar button", has_text="Run file").click()
@@ -1343,7 +1369,7 @@ def layout_checks(browser, port, show):
             a.workspace("notes", "a.sql").click()
             a.p.wait_for_function("document.activeElement?.tagName === 'TEXTAREA'")
             a.p.fill(".param input", "0")
-            a.p.click("#runBtn")
+            a.p.click("#runAll")
             a.p.locator(".stmts .stmt").nth(1).wait_for(timeout=15000)
             a.p.locator(".filedoc .gt").wait_for(timeout=15000)
             found[scheme + " SQL file"] = audit(a.p, axe)
@@ -1383,12 +1409,12 @@ def budget_checks(browser, port, show):
             fresh[name] = e.code
     total = sum(sizes.values()) if all(sizes.values()) else None
     later = {}
-    for name in ["chart.js", "plan.js", "more.js", "details.js", "more.css", "data.js", "md.js", "jobs.js", "settings.js", "objects.js", "pyfile.js", "sqlfile.js", "rename.js", "versions.js", "stmts.js", "params.js"]:  # (loaded when first used)
+    for name in ["chart.js", "plan.js", "more.js", "details.js", "more.css", "data.js", "md.js", "jobs.js", "settings.js", "objects.js", "pyfile.js", "sqlfile.js", "rename.js", "versions.js", "stmts.js", "params.js", "tabs.js", "live.js"]:  # (loaded when first used)
         r = urllib.request.urlopen(urllib.request.Request(f"{base}/console/{name}", headers={"accept-encoding": "gzip"}))
         later[name] = len(r.read()) if r.headers.get("content-encoding") == "gzip" else None
     checks["the scripts and style sheet the page loads, gzipped as the node serves them: <= 70 KB; each answers 304 when the browser has it"] = total is not None and total <= 70 * 1024 \
         and set(fresh.values()) == {304}
-    checks["those loaded when first used (a chart, a plan, History, details, a data file, Markdown, Jobs, Settings, the tree's menus, a Python file, a SQL file, renaming): <= 8 KB each, gzipped"] = all(v is not None and v <= 8 * 1024 for v in later.values())
+    checks["those loaded when first used (a chart, a plan, History, details, a data file, Markdown, Jobs, Settings, the tree's menus, a Python file, a SQL file, renaming, the tabs' menus, live answers): <= 8 KB each, gzipped"] = all(v is not None and v <= 8 * 1024 for v in later.values())
     paints = []
     for _ in range(3):
         pg = Page(browser, base + "/")
