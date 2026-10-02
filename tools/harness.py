@@ -5840,6 +5840,14 @@ def begin():
     s = "s-rollback-" + uuid.uuid4().hex[:8]
     http(A.port, "BEGIN", s); http(A.port, "DELETE FROM accounts", s); http(A.port, "ROLLBACK", s)
     checks["ROLLBACK leaves nothing"] = total()["n"] == 20
+    # An UPDATE then an INSERT of one table: the UPDATE's rows carry more system columns than the
+    # INSERT's, and COMMIT sends them as one stream (an append table and a keyed one).
+    for t, key in (("ui", ""), ("uk", " PRIMARY KEY")):
+        q(f"CREATE TABLE {t} (id INT{key}, name VARCHAR)"); q(f"INSERT INTO {t} VALUES (1, 'a'), (2, 'b')")
+        s = f"s-{t}-" + uuid.uuid4().hex[:8]
+        http(A.port, "BEGIN", s); http(A.port, f"UPDATE {t} SET name = 'x' WHERE id = 1", s); http(A.port, f"INSERT INTO {t} (id, name) VALUES (3, 'c')", s)
+        end = http(A.port, "COMMIT", s)
+        checks[f"an UPDATE then an INSERT of one table commits ({'keyed' if key else 'append'})"] = end[0] == 200 and q(f"SELECT id, name FROM {t} ORDER BY id") == [{"id": 1, "name": "x"}, {"id": 2, "name": "b"}, {"id": 3, "name": "c"}]
     s = "s-failed-" + uuid.uuid4().hex[:8]
     http(A.port, "BEGIN", s)
     http(A.port, "UPDATE accounts SET balance = balance + 1 WHERE id = 3", s)

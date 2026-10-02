@@ -319,7 +319,21 @@ pub struct Commit {
 fn ipc(b: &[RecordBatch]) -> Result<String> {
     use base64::Engine;
     let b: Vec<RecordBatch> = b.iter().filter(|b| b.num_rows() > 0).cloned().collect();
-    Ok(if b.is_empty() { String::new() } else { base64::engine::general_purpose::STANDARD.encode(crate::log::encode_ipc(&b)?) })
+    if b.is_empty() {
+        return Ok(String::new());
+    }
+    // One stream has one schema: an UPDATE's rows carry `_created_at`, an INSERT's after it don't,
+    // so every batch takes every column any has (NULL where it has none).
+    let mut fields: Vec<datafusion::arrow::datatypes::Field> = vec![];
+    for f in b.iter().flat_map(|b| b.schema().fields().iter().cloned().collect::<Vec<_>>()) {
+        if !fields.iter().any(|g| g.name() == f.name()) {
+            let everywhere = b.iter().all(|b| b.column_by_name(f.name()).is_some());
+            fields.push(f.as_ref().clone().with_nullable(f.is_nullable() || !everywhere));
+        }
+    }
+    let schema = Arc::new(datafusion::arrow::datatypes::Schema::new(fields));
+    let b = b.iter().map(|b| crate::query::conform(b, &schema)).collect::<Result<Vec<_>>>()?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(crate::log::encode_ipc(&b)?))
 }
 
 fn unipc(s: &str) -> Result<Vec<RecordBatch>> {
