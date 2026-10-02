@@ -1,6 +1,6 @@
 // The tabs' and the panes' menus (ADR-034), loaded when first used, not with the page: a tab's
 // right-click menu, the list of every tab (the tab bar's ⌄), and a view's menu (moving it to the
-// other pane, folding it). What they use of the shell comes through `R.helpers`.
+// other pane, folding it) or a view dragged there. What they use of the shell comes through `R.helpers`.
 import { h, $, icon, S, R, toast, menu, moreStyle, renaming } from './core.js';
 
 moreStyle();
@@ -51,6 +51,13 @@ function moveView(v) {
   if (to === 'right') { S.tab = v.id; H.pane('right', true); } else H.pane('left', true);
   H.drawViews();
   toast(`${H.viewTitle(v)} is now in the ${to} pane`);
+}
+/** A view dropped on a pane (`side`): moved there, and on the right beside the tab `by` (after it if `after`; else last). */
+export function dropView(id, side, by, after) {
+  const v = R.views.find(x => x.id === id);
+  if (!v) return;
+  if (sideOf(v) !== side) moveView(v);
+  if (side === 'right' && by !== id) moveTab(id, by || null, by ? +!!after : 99);
 }
 /** A view's menu (its ⋯): its tools, moving it, folding it. */
 export function viewMenu(at, v) {

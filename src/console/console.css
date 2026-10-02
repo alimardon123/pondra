@@ -114,7 +114,7 @@ header{height:48px;display:flex;align-items:center;gap:10px;padding:0 10px 0 16p
 #leftEdge{right:0}#rightEdge{left:0}
 .edge:hover::after,.edge.drag::after,.edge:focus-visible::after{content:"";position:absolute;top:0;bottom:0;width:2px;background:var(--accent)}
 #leftEdge::after{right:0}#rightEdge::after{left:0}
-.group.folded{flex:none}
+.group.folded{flex:none;min-height:0}.group+.group{border-top:1px solid var(--line2)}section.group.folded:last-of-type{margin-top:auto}
 .ghead{display:flex;align-items:center;height:30px;padding:0 6px 0 4px;flex:none}
 .gtitle{display:flex;align-items:center;gap:4px;flex:1;min-width:0;height:26px;border:0;background:transparent;cursor:pointer;border-radius:6px;padding:0 4px;color:var(--muted)}
 .gtitle h2{margin:0;font-size:13px;font-weight:500;color:var(--ink)}
@@ -434,4 +434,4 @@ dialog.pop,dialog.settings{padding:0;max-width:620px}
 /* the Messages tab: each statement */
 .stmt .m{color:var(--faint)}
 /* the right pane's tabs move by dragging; the top bar's History shows when on */
-.rtab.drop{box-shadow:inset 2px 0 0 var(--accent)}#runsBtn.on{color:var(--accent);background:var(--accent-soft)}
+.rtab.drop,.tab.drop{box-shadow:inset 2px 0 0 var(--accent)}#left.drop,#rtabs.drop,.vbox.dropping{box-shadow:inset 0 0 0 2px var(--accent)}.item.dropping{background:var(--accent-soft);border-radius:6px}#runsBtn.on{color:var(--accent);background:var(--accent-soft)}

@@ -23,7 +23,7 @@
   their files; a ⋯ on every row of the Workspace (on hover, on focus, on the one picked) opens its
   menu; a notebook made in a folder is one plain file saved in place (refused over someone else's
   change), opens again after a reload, offers no jobs; a file renamed moves its tab; the +, Ctrl+K
-  and the welcome page say "Upload a file…"; the top bar has a gear for Settings, no ⋯ of its own.
+  and the welcome page say "Upload files…"; the top bar has a gear for Settings, no ⋯ of its own.
 - grid: a click lights a cell and its row, Shift+click a range (one outline), the keys move it,
   Ctrl+C copies it (Shift: with the headers), the menu filters to its values, a header's sort
   button sorts, a header's card tells its type.
@@ -432,7 +432,7 @@ def node_checks(browser, port, show):
     path = os.path.join(tempfile.mkdtemp(prefix="pondra-console-"), "from-jupyter.ipynb")
     nbformat.write(up, path)
     with p.expect_file_chooser() as chooser:
-        pg.menu("Upload a file")
+        pg.menu("Upload files")
     chooser.value.set_files(path)
     until(lambda: p.evaluate("pondra.state.cells.map(c => c.kind)"), ["markdown", "sql", "python"])
     kinds = p.evaluate("pondra.state.cells.map(c => c.kind)")
@@ -778,7 +778,7 @@ def files_checks(browser, port, show):
 
 def folders_checks(browser, port, show):
     """The Workspace's folders (a zero-byte `.folder` marker nobody sees), the ⋯ on each of its rows,
-    notebooks in any folder (one plain file saved in place), Delete folder, Upload a file."""
+    notebooks in any folder (one plain file saved in place), Delete folder, Upload files."""
     checks = {}
     base = f"http://127.0.0.1:{port}"
     put(port, "notebooks/seed/20240101T000000Z.ipynb", nbformat.writes(nbformat.v4.new_notebook()).encode())  # (so there is a notebooks folder)
@@ -790,7 +790,7 @@ def folders_checks(browser, port, show):
     in_lake = lambda folder: [(r["path"], r["size"]) for r in sql(port, f"SELECT path, size FROM files('{folder}/') ORDER BY path")]
     folder = lambda name: ws.locator(".row[aria-expanded]", has_text=name).first
     kids = lambda name: folder(name).locator("xpath=../div[contains(@class,'kids')]")
-    items = lambda: p.locator("#menu:not([hidden]) button .lb").all_inner_texts()
+    items = lambda: (p.locator("#menu:not([hidden]) button .lb").first.wait_for(timeout=5000), p.locator("#menu:not([hidden]) button .lb").all_inner_texts())[1]  # (the files' menus load when first used)
     palette = lambda q: (p.keyboard.press("Control+k"), p.fill("#palIn", q), p.locator("#palList .pi .nm").all_inner_texts(), p.keyboard.press("Escape"))[2]
     ws.locator(".row").first.wait_for(timeout=20000)
 
@@ -841,8 +841,8 @@ def folders_checks(browser, port, show):
     row.click(button="right")
     by_click = items()
     p.keyboard.press("Escape")
-    want = ["New notebook here", "New SQL file here", "New Python file here", "New folder here", "Upload a file here…", "Delete folder…"]
-    checks["a folder's ⋯ (a button with a label) shows on hover, and its menu, the same as a right-click's, has New notebook, SQL file, Python file and folder here, Upload a file here, Delete folder"] = \
+    want = ["New notebook here", "New SQL file here", "New Python file here", "New file here…", "New folder here", "Upload files here…", "Upload a folder here…", "Delete folder…"]
+    checks["a folder's ⋯ (a button with a label) shows on hover, and its menu, the same as a right-click's, has New notebook, SQL file, Python file, file and folder here, Upload files or a folder here, Delete folder"] = \
         away is False and hover is True and named == "archive: more" and by_button == want and by_click == want
     put(port, "misc/blob.bin", b"\x00\x01\x02")
     put(port, "misc/old.txt", b"old")
@@ -932,14 +932,14 @@ def folders_checks(browser, port, show):
     row.hover()
     row.locator("button.more").click()
     with p.expect_file_chooser() as chooser:
-        p.locator("#menu button", has_text="Upload a file here").click()
+        p.locator("#menu button", has_text="Upload files here").click()
     chooser.value.set_files([csv, nb])
     put_in = until(lambda: sorted(x[0] for x in in_lake("projects") if "/up." in x[0]), ["files/projects/up.csv", "files/projects/up.ipynb"])
     pg.workspace("projects", "up.ipynb").click()
     opened = until(lambda: pg.tab(), ("up.ipynb", False))
     plain = p.locator("#docbar .crumb").first.inner_text() == "projects" and p.input_value("#nbname") == "up"
     shutil.rmtree(tmp, ignore_errors=True)
-    checks["Upload a file here puts a CSV and an .ipynb in that folder; the .ipynb, clicked, opens as a notebook saved in place"] = put_in == ["files/projects/up.csv", "files/projects/up.ipynb"] \
+    checks["Upload files here puts a CSV and an .ipynb in that folder; the .ipynb, clicked, opens as a notebook saved in place"] = put_in == ["files/projects/up.csv", "files/projects/up.ipynb"] \
         and opened == ("up.ipynb", False) and plain
 
     put(port, "trash/a.txt", b"a")
@@ -967,6 +967,25 @@ def folders_checks(browser, port, show):
     moved = until(lambda: sorted(x[0] for x in in_lake("misc")), ["files/misc/blob.bin", "files/misc/new.txt"])
     titles = until(lambda: "new.txt" in p.locator("#tabbar .tab .tn").all_inner_texts() and "old.txt" not in p.locator("#tabbar .tab .tn").all_inner_texts(), True)
     checks["a file renamed from its ⋯ moves its open tab to the new name"] = moved == ["files/misc/blob.bin", "files/misc/new.txt"] and titles is True and pg.tab()[0] == "new.txt"
+    # dragging: a file onto a folder moves it (its tab follows), a folder onto another moves all it holds, files from this computer dropped on a folder go in it
+    pg.workspace("misc", "new.txt").drag_to(folder("archive"))
+    dragged = until(lambda: [x[0] for x in in_lake("archive") if x[0].endswith("new.txt")], ["files/archive/new.txt"])
+    followed = until(lambda: p.evaluate("pondra.state.doc?.path"), "archive/new.txt")
+    folder("misc").drag_to(folder("archive"))
+    nested = until(lambda: [x[0] for x in in_lake("archive/misc")], ["files/archive/misc/blob.bin"]) == ["files/archive/misc/blob.bin"] and in_lake("misc") == []
+    folder("archive").evaluate("""r => { const dt = new DataTransfer(); dt.items.add(new File(['a,b\\n1,2\\n'], 'dropped.csv', { type: 'text/csv' }));
+      for (const t of ['dragover', 'drop']) r.dispatchEvent(new DragEvent(t, { bubbles: true, cancelable: true, dataTransfer: dt })); }""")
+    landed = until(lambda: "files/archive/dropped.csv" in [x[0] for x in in_lake("archive")])
+    checks["dragged in the Workspace: a file onto a folder is moved (its tab follows), a folder onto another with all it holds; files from this computer dropped on a folder go in it"] = \
+        dragged == ["files/archive/new.txt"] and followed == "archive/new.txt" and nested and landed is True
+    # a view dragged to the other pane by its head, and back by its tab
+    if p.locator("#right").is_hidden():
+        p.locator("#panes button").nth(2).click()
+    p.locator(".group[data-view=workspace] .ghead").drag_to(p.locator("#rtabs .rtab").first)
+    to_right = until(lambda: p.locator("#rtab-workspace").count() == 1 and p.locator(".group[data-view=workspace]").count() == 0)
+    p.locator("#rtab-workspace").drag_to(p.locator("#left"))
+    to_left = until(lambda: p.locator(".group[data-view=workspace]").count() == 1 and p.locator("#rtab-workspace").count() == 0)
+    checks["a view dragged by its head onto the right pane's tabs is a tab there; its tab dragged onto the left pane, a group again"] = to_right is True and to_left is True
 
     p.locator('#left button[aria-label="Workspace: more"]').click()
     p.locator("#menu:not([hidden])").wait_for(timeout=5000)  # (a view's menu: loaded the first time)
@@ -983,12 +1002,12 @@ def folders_checks(browser, port, show):
     cmds = palette("upload")
     w = Page(browser, base + "/")
     w.p.locator("#tabbar .tab").first.click(button="middle")
-    welcome = until(lambda: w.p.locator(".welcome .btn").all_inner_texts(), ["New notebook", "New SQL file", "New Python file", "New folder", "Upload a file…"])
+    welcome = until(lambda: w.p.locator(".welcome .btn").all_inner_texts(), ["New notebook", "New SQL file", "New Python file", "New file…", "New folder", "Upload files…"])
     w.ctx.close()
-    checks["the Workspace's ⋯ lists no New item (Data's keeps Refresh); the +, Ctrl+K and the welcome page say Upload a file…; the top bar has no ⋯ of its own"] = \
+    checks["the Workspace's ⋯ lists no New item (Data's keeps Refresh); the +, Ctrl+K and the welcome page say Upload files… (the + a folder too); the top bar has no ⋯ of its own"] = \
         not [x for x in group if x.startswith("New")] and "Move to the right pane" in group and "Refresh" in data \
-        and plus == ["New notebook", "New SQL file", "New Python file", "New folder", "Upload a file…"] and top is True \
-        and cmds.count("Upload a file…") == 1 and not [x for x in cmds + welcome if "Open an" in x] and welcome == ["New notebook", "New SQL file", "New Python file", "New folder", "Upload a file…"]
+        and plus == ["New notebook", "New SQL file", "New Python file", "New file…", "New folder", "Upload files…", "Upload a folder…"] and top is True \
+        and cmds.count("Upload files…") == 1 and not [x for x in cmds + welcome if "Open an" in x] and welcome == ["New notebook", "New SQL file", "New Python file", "New file…", "New folder", "Upload files…"]
     if show:
         pg.menu("Settings")
         pg.setting("Layout", "The left pane").locator(".seg", has_text="Workspace first").click()
@@ -1161,10 +1180,14 @@ def work_checks(browser, port, show):
     p.locator("#tabbar .tmore").click()  # (its list is drawn by tabs.js, loaded when first used: waited for)
     listed = until(lambda: len([x for x in p.locator("#menu button").all_inner_texts() if x.strip()]), n, 5)
     p.keyboard.press("Escape")
+    names = lambda: p.locator("#tabbar .tab .tn").all_inner_texts()
+    before = names()
+    tabs.nth(n - 1).drag_to(tabs.nth(n - 3), target_position={"x": 4, "y": 10})  # (a tab dragged onto another goes before it)
+    moved = until(names, before[:n - 3] + [before[n - 1]] + before[n - 3:n - 1], 5) == before[:n - 3] + [before[n - 1]] + before[n - 3:n - 1]
     tabs.nth(n - 1).click(button="right")
     p.locator("#menu button", has_text="Close others").click()
     left = until(lambda: (p.locator("#tabbar .tab").count(), p.locator("#tabbar .tab.pinned").count()), (2, 1))
-    checks["tabs: one pinned stays at the left and isn't closed with the others; many scroll, and ⌄ lists them all"] = pinned == 1 and over and listed == n and left == (2, 1)
+    checks["tabs: one pinned stays at the left and isn't closed with the others; many scroll, and ⌄ lists them all; one dragged onto another goes before it"] = pinned == 1 and over and listed == n and left == (2, 1) and moved
 
     # Format: the file, or only what is selected
     pg.workspace("wk", "a.sql").click()
@@ -1307,6 +1330,34 @@ def work_checks(browser, port, show):
     checks["the Data tree's right-click: a table's Preview, Script as (SELECT … DROP, SQL or Python), Insert, Add a column, Rename, Truncate, Drop; a view's has no Insert"] = \
         {"Preview", "Preview in Python", "Script as…", "Insert rows…", "Add a column…", "Rename…", "Truncate…", "Drop…"} <= set(t_items) \
         and {"SELECT", "INSERT", "UPDATE", "DELETE", "MERGE", "CREATE", "DROP"} <= set(scripts) and py.startswith("db.") and "Insert rows…" not in v_items and "Drop…" in v_items
+    # a column's name goes in on a double-click (a click only picks it); a function, clicked, shows its details; a schema's New ▸
+    ta = p.locator(".filedoc:visible .editor textarea")
+    ta.evaluate("t => { t.value = 'SELECT  FROM wk'; t.dispatchEvent(new Event('input')); t.focus(); t.setSelectionRange(7, 7); }")
+    if wk.get_attribute("aria-expanded") == "false":
+        wk.locator(".tw").click()
+    col = wk.locator("xpath=following-sibling::div[contains(@class,'kids')]").locator(".row.col").first
+    cname = col.locator(".nm").inner_text()
+    col.click()
+    clicked = ta.input_value()
+    ta.evaluate("t => { t.focus(); t.setSelectionRange(7, 7); }")
+    col.dblclick()
+    put_in = until(lambda: ta.input_value(), f"SELECT {cname} FROM wk")
+    sql(port, "CREATE MACRO plus_one(x) AS x + 1")
+    fns = tree.locator(".row[data-kind=group]", has_text="Functions").first
+    if fns.get_attribute("aria-expanded") == "false":
+        fns.click()
+    fn = tree.locator(".row.obj", has_text="plus_one").first
+    fn.click()
+    fdetail = until(lambda: "plus_one" in p.locator("#right .dn").inner_text() and p.locator("#right pre.defn").count() == 1)
+    p.keyboard.press("Escape")
+    s_items = opened(pub)
+    p.locator("#menu button", has_text="New").first.click()
+    until(lambda: "Materialized view…" in p.locator("#menu").inner_text(), True, 5)
+    made_items = [x.split("\n")[0] for x in p.locator("#menu button").all_inner_texts()]
+    p.keyboard.press("Escape")
+    checks["the Data tree: a column's name goes in on a double-click, not a click; a function's click shows its details; a schema's New ▸ lists what it can make; Refresh and List"] = \
+        clicked == "SELECT  FROM wk" and put_in == f"SELECT {cname} FROM wk" and fdetail is True \
+        and {"Table…", "View…", "Materialized view…", "Function…", "Procedure…", "Schedule…"} <= set(made_items) and {"Refresh", "List its tables and views", "Copy the name"} <= set(s_items)
     sql(port, "DROP VIEW wk_values")
     checks["the owner's second and third lists: no page errors"] = pg.errors == []
     info = {"tabs": [pinned, over, listed, n, left], "left": left, "items": items, "formatted": [part, whole], "drawn": drawn, "picture": pic, "opened": opened, "kinds": menu_kinds, "meta": meta, "cell": cell_items, "editor": ed_items,
@@ -1484,12 +1535,12 @@ def budget_checks(browser, port, show):
             fresh[name] = e.code
     total = sum(sizes.values()) if all(sizes.values()) else None
     later = {}
-    for name in ["chart.js", "plan.js", "more.js", "details.js", "more.css", "data.js", "md.js", "jobs.js", "settings.js", "objects.js", "pyfile.js", "sqlfile.js", "rename.js", "versions.js", "stmts.js", "params.js", "tabs.js", "live.js", "gridmore.js"]:  # (loaded when first used)
+    for name in ["chart.js", "plan.js", "more.js", "details.js", "more.css", "data.js", "md.js", "jobs.js", "settings.js", "objects.js", "pyfile.js", "sqlfile.js", "rename.js", "versions.js", "stmts.js", "params.js", "tabs.js", "live.js", "gridmore.js", "groups.js", "upload.js"]:  # (loaded when first used)
         r = urllib.request.urlopen(urllib.request.Request(f"{base}/console/{name}", headers={"accept-encoding": "gzip"}))
         later[name] = len(r.read()) if r.headers.get("content-encoding") == "gzip" else None
     checks["the scripts and style sheet the page loads, gzipped as the node serves them: <= 70 KB; each answers 304 when the browser has it"] = total is not None and total <= 70 * 1024 \
         and set(fresh.values()) == {304}
-    checks["those loaded when first used (a chart, a plan, History, details, a data file, Markdown, Jobs, Settings, the tree's menus, a Python file, a SQL file, renaming, the tabs' menus, live answers): <= 8 KB each, gzipped"] = all(v is not None and v <= 8 * 1024 for v in later.values())
+    checks["those loaded when first used (a chart, a plan, History, details, a data file, Markdown, Jobs, Settings, the tree's menus and its other objects, a Python file, a SQL file, renaming and moving, uploading, the tabs' menus, live answers): <= 8 KB each, gzipped"] = all(v is not None and v <= 8 * 1024 for v in later.values())
     paints = []
     for _ in range(3):
         pg = Page(browser, base + "/")

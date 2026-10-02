@@ -71,6 +71,7 @@ export class DataDoc {
         }
       }
     }
+    if (!this.cols.length && !this.readonly) this.cols = [{ name: 'column_1', type: 'Utf8' }]; // (an empty file: a column to start from)
     // (every change a step Ctrl Z undoes and Ctrl Y does again, until it is saved and after: gridmore.js's Edits)
     const csv = this.format === 'csv';
     this.edits = this.readonly ? null : new Edits(this.cols, this.data, { blank: csv ? '' : null, parse: csv ? t => t : parseValue, onchange: () => { this.dirty = this.edits.dirty; this.footer(); emit('changed', this); } });
