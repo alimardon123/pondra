@@ -342,6 +342,10 @@ pub fn restart(why: &str) -> ! {
         panic!("restart failed: {}", cmd.exec()); // replaces this process; only returns on failure
     }
     #[cfg(not(unix))]
+    if std::env::var_os("PONDRA_SUPERVISED").is_some() {
+        std::process::exit(75); // (`pondra service`'s supervisor starts it again: one node, as exec keeps it elsewhere)
+    }
+    #[cfg(not(unix))]
     match cmd.spawn() {
         // No exec() on Windows: start the replacement, then leave (it binds our address once we're gone).
         Ok(_) => std::process::exit(0),

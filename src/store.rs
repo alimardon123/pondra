@@ -432,7 +432,9 @@ pub fn memory_limit() -> usize {
     gb.map(|g| (g * (1u64 << 30) as f64) as usize).or_else(|| ram().map(|r| r / 3)).unwrap_or(4 << 30)
 }
 
-/// The machine's memory, if it says: `/proc` on Linux, the OS's own call elsewhere.
+/// The machine's memory, if it says: `/proc` on Linux, the OS's own call elsewhere. Less when a
+/// cgroup limits this process (a container, a service with `MemoryMax`): `/proc/meminfo` is the
+/// host's, and a node in a 4 GB container on a 64 GB host sized its queries for 64 and was killed.
 pub fn ram() -> Option<usize> {
     static RAM: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
     *RAM.get_or_init(read_ram)
@@ -440,10 +442,27 @@ pub fn ram() -> Option<usize> {
 
 fn read_ram() -> Option<usize> {
     let proc = std::fs::read_to_string("/proc/meminfo").ok().and_then(|m| m.lines().find_map(|l| l.strip_prefix("MemTotal:")?.trim().strip_suffix("kB")?.trim().parse::<usize>().ok()));
-    proc.map(|kb| kb << 10).or_else(|| {
+    proc.map(|kb| (kb << 10).min(cgroup_memory().unwrap_or(usize::MAX))).or_else(|| {
         let s = sysinfo::System::new_with_specifics(sysinfo::RefreshKind::nothing().with_memory(sysinfo::MemoryRefreshKind::nothing().with_ram()));
         Some(s.total_memory() as usize).filter(|&b| b > 0)
     })
+}
+
+/// The least memory limit of this process's cgroups and their parents (v2 `memory.max`, v1
+/// `memory.limit_in_bytes`; "max" or none: no limit). In a container the cgroup is its root.
+fn cgroup_memory() -> Option<usize> {
+    let groups = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let limits = groups.lines().filter_map(|line| {
+        let (controllers, path) = line.split_once(':')?.1.split_once(':')?; // "0::/path" (v2), "4:memory:/path" (v1)
+        let (base, file) = match controllers {
+            "" => ("/sys/fs/cgroup", "memory.max"),
+            c if c.split(',').any(|c| c == "memory") => ("/sys/fs/cgroup/memory", "memory.limit_in_bytes"),
+            _ => return None,
+        };
+        let read = |dir: &std::path::Path| std::fs::read_to_string(format!("{base}{}/{file}", dir.display())).ok()?.trim().parse::<usize>().ok();
+        std::path::Path::new(path).ancestors().filter_map(read).min()
+    });
+    limits.min()
 }
 
 /// This process's resident memory, if the OS says.

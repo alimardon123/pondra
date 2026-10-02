@@ -29,7 +29,8 @@ jobs:
     permissions:
       actions: read # this commit's build run and its packages
       contents: write # the GitHub release
-      id-token: write # PyPI trusted publishing, npm provenance
+      id-token: write # PyPI trusted publishing, npm provenance, the attestations
+      attestations: write # (`gh attestation verify <file> -R alimardon123/pondra`: ADR-041)
     steps:
       - uses: actions/checkout@v5 # (Cargo.toml's version, the installers, tools/npm_publish.sh)
       - name: This commit's build run (waited for while it runs; it must have passed)
@@ -64,6 +65,11 @@ jobs:
         with:
           node-version: 22
           registry-url: https://registry.npmjs.org
+      - name: Every package attested (where it came from, signed with this workflow's identity)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: dist/*
       - name: GitHub release (with the installers, and how to install at the top)
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2

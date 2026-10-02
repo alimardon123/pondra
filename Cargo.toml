@@ -57,6 +57,9 @@ sysinfo = { version = "0.35", default-features = false, features = ["system"] } 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2" # (free disk space: statvfs)
 
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.8" # (`pondra service` on Windows: the service manager's dispatcher; its windows-sys is already built for tokio)
+
 [profile.release]
 # (panics unwind: a request's is answered as an error; the node's own loops still stop it: `panics.rs`)
 codegen-units = 16
