@@ -3228,9 +3228,13 @@ $$""")
         if os.path.exists(started):
             break
         time.sleep(0.1)
-    for pid in _workers(nodes[0].p.pid):
+    killed = _workers(nodes[0].p.pid)
+    for pid in killed:
         os.kill(pid, signal.SIGKILL)
     worker.join(60)
+    # (the idle workers die too, a moment after the signal on a busy machine: the next query may take
+    # one the node still sees running unless they are gone first, as a worker the OS kills would be)
+    until(lambda: all(_dead(pid) for pid in killed), True, 10)
     checks["a worker killed mid-query: that query fails with why, the node and the next query go on"] = "worker ended" in out.get("e", "") and nodes[0].alive() and q("SELECT slug('C d') AS s") == [{"s": "c-d"}]
     # procedures: mail through a local SMTP server, from every door
     class Box:
@@ -3414,6 +3418,14 @@ $$""")
         print(out, ran.stdout[-2000:], ran.stderr[-3000:], shell.stdout[-1000:], shell.stderr[-2000:], json.dumps(mailed, default=str))
         sys.exit(1)
     return f"functions and procedures in SQL and Python on three nodes: all {len(checks)} checks pass"
+
+
+def _dead(pid):
+    """A process gone, or a zombie its parent hasn't waited for yet."""
+    try:
+        return open(f"/proc/{pid}/stat").read().rsplit(")", 1)[1].split()[0] in ("Z", "X")
+    except OSError:
+        return True
 
 
 def _workers(parent):
