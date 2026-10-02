@@ -243,12 +243,10 @@ def helm(a):
 
     try:
         run("kubectl", "create", "namespace", ns)
-        k("create", "deployment", "s3", "--image=motoserver/moto:5.1.4", "--port=5000")
         # (moto takes a host like s3.<ns>.svc for a bucket named "s3": the nodes ask by path)
-        k("set", "env", "deployment/s3", "S3_IGNORE_SUBDOMAIN_BUCKETNAME=true")
-        k("expose", "deployment", "s3", "--port=5000")
-        k("rollout", "status", "deployment/s3", "--timeout=180s")
-        with Forward(ns, "svc/s3", 5000) as port:
+        k("run", "s3", "--image=motoserver/moto:5.1.4", "--port=5000", "--expose", "--env=S3_IGNORE_SUBDOMAIN_BUCKETNAME=true")
+        k("wait", "--for=condition=Ready", "pod/s3", "--timeout=180s")
+        with Forward(ns, "pod/s3", 5000) as port:
             urllib.request.urlopen(urllib.request.Request(f"http://127.0.0.1:{port}/lake", method="PUT"), timeout=30).read()
         k("create", "secret", "generic", "bucket", "--from-literal=AWS_ACCESS_KEY_ID=test", "--from-literal=AWS_SECRET_ACCESS_KEY=test",
           "--from-literal=AWS_REGION=us-east-1", f"--from-literal=AWS_ENDPOINT=http://s3.{ns}.svc:5000", "--from-literal=AWS_ALLOW_HTTP=true")
