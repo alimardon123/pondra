@@ -3421,11 +3421,20 @@ $$""")
 
 
 def _dead(pid):
-    """A process gone, or a zombie its parent hasn't waited for yet."""
+    """A process gone, or a zombie its parent hasn't waited for yet. Every thread counts: a killed
+    process's first thread is a zombie while the others are still ending, and until they have, its
+    parent's wait says it runs (so a node could still hand that worker the next query)."""
     try:
-        return open(f"/proc/{pid}/stat").read().rsplit(")", 1)[1].split()[0] in ("Z", "X")
+        tasks = os.listdir(f"/proc/{pid}/task")
     except OSError:
         return True
+    for t in tasks:
+        try:
+            if open(f"/proc/{pid}/task/{t}/stat").read().rsplit(")", 1)[1].split()[0] not in ("Z", "X"):
+                return False
+        except OSError:
+            pass  # (that thread just ended)
+    return True
 
 
 def _workers(parent):
