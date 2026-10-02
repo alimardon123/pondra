@@ -1,0 +1,121 @@
+name: deploy
+
+# Pondra deployed the ways ADR-041 gives, from the very packages the build workflow made for this
+# commit (nothing is compiled here: tools/ci_artifact.sh waits for them): the container image
+# (amd64 and arm64, and the one with Python), the compose cluster, the Helm chart on Kubernetes
+# (kind), and `pondra service` on Linux, macOS and Windows; each tried as a user would run it
+# (tools/deploy_check.py).
+#
+# A tag's run also publishes the image (both architectures, with its provenance and SBOM, signed
+# with GitHub's identity) and the chart to GitHub's container registry, once the repository's
+# variable PUBLISH_IMAGE is `true` (Settings -> Secrets and variables -> Actions -> Variables).
+on:
+  pull_request:
+    branches: [main]
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  actions: read # (the build run's packages)
+  contents: read
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+
+jobs:
+  image:
+    name: image, compose and chart
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: This commit's Linux packages (the build workflow's)
+        run: bash tools/ci_artifact.sh linux-x64 "$SHA" && bash tools/ci_artifact.sh linux-arm64 "$SHA"
+      - run: python3 tools/image.py --dist dist --out ctx
+      - uses: docker/setup-qemu-action@v3 # (the Python image's arm64 pip install; the other needs none)
+      - uses: docker/setup-buildx-action@v3
+      - name: The images, for both architectures, then this machine's
+        run: |
+          docker buildx build -f deploy/docker/Dockerfile --platform linux/amd64,linux/arm64 ctx
+          docker buildx build -f deploy/docker/Dockerfile --platform linux/amd64,linux/arm64 --target python ctx
+          docker buildx build -f deploy/docker/Dockerfile --load -t pondra:dev ctx
+          docker buildx build -f deploy/docker/Dockerfile --load --target python -t pondra:dev-python ctx
+          docker images pondra
+      - name: The image, the image with Python, the compose cluster
+        run: python3 tools/deploy_check.py image python compose
+      - uses: helm/kind-action@v1
+        with:
+          cluster_name: pondra
+      - name: The chart, on Kubernetes
+        run: |
+          for i in pondra:dev motoserver/moto:5.1.4 busybox:1.37; do docker image inspect $i > /dev/null 2>&1 || docker pull -q $i; kind load docker-image $i --name pondra; done
+          helm lint --strict deploy/helm/pondra --set lake=s3://bucket/lake
+          python3 tools/deploy_check.py chart helm
+
+  service:
+    name: pondra service (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { platform: linux-x64, os: ubuntu-24.04 }
+          - { platform: macos-arm64, os: macos-latest }
+          - { platform: windows-x64, os: windows-latest }
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash # (Git Bash on Windows)
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: This commit's ${{ matrix.platform }} packages (the build workflow's)
+        run: bash tools/ci_artifact.sh ${{ matrix.platform }} "$SHA"
+      - name: The binary, as the installers unpack it
+        run: |
+          mkdir -p bin
+          if [ -f dist/pondra-${{ matrix.platform }}.zip ]; then unzip -qo dist/pondra-${{ matrix.platform }}.zip -d bin; else tar xzf dist/pondra-${{ matrix.platform }}.tar.gz -C bin; fi
+          ls -l bin
+      - name: Installed, killed, installed again, uninstalled (systemd, launchd, Windows's service manager)
+        run: python tools/deploy_check.py service --bin bin/pondra${{ matrix.platform == 'windows-x64' && '.exe' || '' }}
+
+  publish:
+    name: publish the image and the chart
+    needs: [image, service]
+    if: startsWith(github.ref, 'refs/tags/v') && vars.PUBLISH_IMAGE == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: read
+      packages: write # (ghcr.io)
+      id-token: write # (the signature: GitHub's identity, no key to keep)
+      attestations: write
+    steps:
+      - uses: actions/checkout@v5
+      - run: bash tools/ci_artifact.sh linux-x64 "$SHA" && bash tools/ci_artifact.sh linux-arm64 "$SHA" && python3 tools/image.py --dist dist --out ctx
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - uses: sigstore/cosign-installer@v3
+      - name: The images (X.Y.Z, X.Y, latest; -python beside each), signed
+        run: |
+          v=${GITHUB_REF_NAME#v} image=ghcr.io/${GITHUB_REPOSITORY,,}
+          for target in pondra python; do
+            s=$([ $target = python ] && echo -python || true)
+            docker buildx build -f deploy/docker/Dockerfile --platform linux/amd64,linux/arm64 --target $target \
+              --provenance=mode=max --sbom=true --push --metadata-file meta-$target.json \
+              -t $image:$v$s -t $image:${v%.*}$s -t $image:latest$s ctx
+            cosign sign --yes "$image@$(jq -r '."containerimage.digest"' meta-$target.json)"
+          done
+      - name: The chart (oci://ghcr.io/<owner>/charts/pondra)
+        run: |
+          v=${GITHUB_REF_NAME#v}
+          echo "${{ github.token }}" | helm registry login ghcr.io -u ${{ github.actor }} --password-stdin
+          helm package deploy/helm/pondra --version $v --app-version $v
+          helm push pondra-$v.tgz oci://ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/charts

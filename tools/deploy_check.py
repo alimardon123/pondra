@@ -8,17 +8,24 @@
   one node read on another, Postgres and Kafka on their ports; the leader killed, another leads and
   takes writes; the killed one back as a follower; a leader stopped hands on at once; every node
   then has every row.
-- **helm**: `deploy/helm/pondra` on Kubernetes (kind in CI): three nodes and a reader on a bucket,
-  guarded by the chart's own tokens; the leader's pod deleted, a rolling restart and an upgrade
-  lose nothing and keep the keys; the chart with nothing set is one node that keeps its lake.
+- **python**: the image with Python runs a `LANGUAGE python` function.
+- **chart**: `deploy/helm/pondra` renders for every way it's meant to run (no cluster needed), one
+  node with nothing set and three on a bucket, and refuses what can't work.
+- **helm**: the chart on Kubernetes (kind in CI): three nodes and a reader on a bucket, guarded by
+  the chart's own tokens; the leader's pod deleted, a rolling restart and an upgrade lose nothing
+  and keep the keys; the chart with nothing set is one node that keeps its lake.
+- **service**: `pondra service` (systemd, launchd, Windows's service manager), as root: installed,
+  it serves with the variables it was installed with; killed, it's started again; installed again,
+  it moves to its new options; uninstalled, it's gone.
 
-  deploy_check.py [image] [compose] [helm] [--image pondra:dev]
+  deploy_check.py [image] [python] [compose] [chart] [helm] [service] [--image pondra:dev]
 
-The image is built from a context `tools/image.py` makes (`--bin target/release/pondra` for this
-machine's build). Docker (with compose) is all image and compose need; helm needs kubectl and helm
-pointed at a cluster that has the image (`kind load docker-image pondra:dev`).
+The images are built from a context `tools/image.py` makes (`--bin target/release/pondra` for this
+machine's build); image, python and compose need Docker with compose; chart needs helm; helm needs
+kubectl and helm pointed at a cluster that has the image (`kind load docker-image pondra:dev`);
+service needs root (it uses sudo) or, on Windows, an Administrator.
 """
-import argparse, base64, json, os, socket, struct, subprocess, sys, time, urllib.error, urllib.request
+import argparse, base64, json, re, os, socket, struct, subprocess, sys, time, urllib.error, urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -32,11 +39,11 @@ def check(name, ok, detail=None):
     return ok
 
 
-def run(*cmd, env=None, check=True, timeout=300):
+def run(*cmd, env=None, check=True, timeout=300, both=False):
     r = subprocess.run(cmd, capture_output=True, text=True, env={**os.environ, **(env or {})}, timeout=timeout)
     if check and r.returncode:
         raise RuntimeError(f"{' '.join(cmd)}: {(r.stdout + r.stderr)[-1500:]}")
-    return r.stdout.strip()
+    return (r.stdout + r.stderr).strip() if both else r.stdout.strip()
 
 
 def http(port, path, body=None, timeout=30, token=None):
@@ -91,9 +98,9 @@ def metric(port, name):
             return float(line.rsplit(" ", 1)[1])
 
 
-def image(tag):
+def image(a):
     """The image alone: a container on a volume, stopped, and a new one on the same volume."""
-    vol, name = f"pondra-check-{os.getpid()}", f"pondra-check-{os.getpid()}"
+    tag, vol, name = a.image, f"pondra-check-{os.getpid()}", f"pondra-check-{os.getpid()}"
     limit = 1 << 30
 
     def start():
@@ -137,9 +144,9 @@ def image(tag):
         run("docker", "volume", "rm", "-f", vol, check=False)
 
 
-def compose(tag):
+def compose(a):
     """deploy/compose/compose.yaml as it is: three nodes on one lake."""
-    project, env = f"pondra-check-{os.getpid()}", {"PONDRA_IMAGE": tag}
+    project, env = f"pondra-check-{os.getpid()}", {"PONDRA_IMAGE": a.image}
     dc = lambda *a, **k: run("docker", "compose", "-f", COMPOSE, "-p", project, *a, env=env, **k)
     http_port = {"node1": 8080, "node2": 8081, "node3": 8082}
     try:
@@ -211,14 +218,14 @@ class Forward:
         self.p.wait()
 
 
-def helm(tag):
+def helm(a):
     """deploy/helm/pondra on the Kubernetes cluster kubectl points at (kind in CI), the image in it
     already (`kind load docker-image`): a lake in a bucket (moto, in the cluster), three nodes and a
     reader; `helm test`; SQL with the chart's own token; the leader's pod deleted; a rolling restart;
     an upgrade keeping the keys; and the chart with nothing set (one node, its lake on its volume)."""
     ns, chart = f"pondra-check-{os.getpid()}", os.path.join(ROOT, "deploy", "helm", "pondra")
     k = lambda *a, **kw: run("kubectl", "-n", ns, *a, **kw)
-    repo, _, version = tag.rpartition(":")
+    repo, _, version = a.image.rpartition(":")
     image = ["--set", f"image.repository={repo},image.tag={version},image.pullPolicy=Never,persistence.size=1Gi"]
     kept = lambda: k("get", "secret", "p-pondra-key", "p-pondra-tokens", "-o", "jsonpath={.items[*].data}")
 
@@ -296,19 +303,107 @@ def helm(tag):
         run("kubectl", "delete", "namespace", ns, "--wait=false", check=False)
 
 
-PARTS = {"image": image, "compose": compose, "helm": helm}
+def chart(a):
+    """deploy/helm/pondra rendered without a cluster: every combination of its values makes
+    manifests, and what can't work is refused before anything is made."""
+    path = os.path.join(ROOT, "deploy", "helm", "pondra")
+    render = lambda *sets: subprocess.run(["helm", "template", "p", path, *[x for v in sets for x in ("--set", v)]], capture_output=True, text=True)
+    made = {v: render(*v.split(" ")) for v in ["replicas=1", "lake=s3://b/l", "lake=gs://b/l,readers.replicas=2,readers.autoscaling.enabled=true",
+                                                 "sharedStorage.existingClaim=nfs,kafka.enabled=true,flight.enabled=true,ack=replicated",
+                                                 "lake=az://c/l,tls.existingSecret=t,tls.mutual=true,python.enabled=true,ingress.enabled=true,ingress.hosts[0]=x.example.com,podMonitor.enabled=true",
+                                                 "lake=s3://b/l,auth.existingSecret=a,secretKey.existingSecret=k,persistence.enabled=false"]}
+    check("the chart renders for every way it's meant to run", all(r.returncode == 0 for r in made.values()), {v: r.stderr[-300:] for v, r in made.items() if r.returncode})
+    nodes = lambda r: r.stdout.count("kind: StatefulSet") == 1 and re.search(r"replicas: (\d+)", r.stdout.split("kind: StatefulSet")[1]).group(1)
+    check("with nothing set, one node; on a bucket, three", nodes(render()) == "1" and nodes(made["lake=s3://b/l"]) == "3", (nodes(render()), nodes(made["lake=s3://b/l"])))
+    refused = {"several nodes on a lake they can't share": ("replicas=3",), "readers without a shared lake": ("replicas=1", "readers.replicas=1"),
+               "a folder lake on no volume": ("persistence.enabled=false",), "Python without tokens": ("lake=s3://b/l", "python.enabled=true", "auth.enabled=false")}
+    wrong = [what for what, sets in refused.items() if render(*sets).returncode == 0]
+    check("…and what can't work is refused, saying why", not wrong, wrong)
+
+
+def python(a):
+    """The image with Python: a `LANGUAGE python` function runs in it (a token is a must there)."""
+    name = f"pondra-check-py-{os.getpid()}"
+    try:
+        run("docker", "run", "-d", "--name", name, "-p", "127.0.0.1::8080", "-e", "PONDRA_ADMIN_TOKEN=check", a.python_image)
+        port = int(run("docker", "port", name, "8080/tcp").splitlines()[0].rsplit(":", 1)[1])
+        if not check("the Python image serves (--python auto)", until(lambda: stats(port), 60), run("docker", "logs", name, check=False)[-1500:]):
+            return
+        sql(port, "CREATE FUNCTION twice(x BIGINT) RETURNS BIGINT LANGUAGE python AS $$\nreturn x * 2\n$$", token="check")
+        got = sql(port, "SELECT twice(21) AS y", token="check")
+        check("a Python function runs in it", got == [{"y": 42}], got)
+    finally:
+        run("docker", "rm", "-f", name, check=False)
+
+
+def service(a):
+    """`pondra service` on this machine, as root (sudo; an Administrator on Windows): installed, it
+    serves and keeps its rows; killed, its manager starts it again; installed again (stopped and
+    started with new options), it serves on its new port; uninstalled, it's gone."""
+    win, name, token = os.name == "nt", f"pondra-check-{os.getpid()}", "check-token"
+    lake = os.path.join(os.path.abspath(a.work), name, "lake")
+    os.makedirs(os.path.dirname(lake), exist_ok=True)
+    sudo = [*root(), "--preserve-env=PONDRA_ADMIN_TOKEN"] if root() else []
+    env = {"PONDRA_ADMIN_TOKEN": token}
+    pondra = lambda *args, **kw: run(*sudo, os.path.abspath(a.bin), "service", *args, env=env, **kw)
+    first, second = free_port(), free_port()
+    try:
+        said = pondra("install", "--name", name, "--lake", lake, "--addr", f"127.0.0.1:{first}")
+        info["installed"] = said
+        if not check("pondra service install: it serves", until(lambda: stats(first), 60), said + pondra("status", "--name", name, check=False)):
+            return
+        sql(first, "CREATE TABLE t (id BIGINT)", token=token)
+        sql(first, "INSERT INTO t SELECT x FROM generate_series(1, 1000) AS g(x)", token=token)
+        check("…with the variables it was installed with (a token)", count(first, token=token) == 1000 and count(first) is None)
+        status = pondra("status", "--name", name)
+        info["status"] = status
+        check("pondra service status: running, and the node leads", any(w in status for w in ("running", "Running")) and "leader of term" in status, status)
+        killed = kill_node(name, first)
+        check("killed, its manager starts it again, with its rows", killed and until(lambda: count(first, token=token) == 1000, 90), killed)
+        pondra("install", "--name", name, "--lake", lake, "--addr", f"127.0.0.1:{second}")
+        check("installed again with other options: stopped, started on its new port, with its rows", until(lambda: count(second, token=token) == 1000, 60) and not stats(first))
+        pondra("uninstall", "--name", name)
+        check("pondra service uninstall: stopped and gone", until(lambda: not stats(second), 30) and "no service" in pondra("status", "--name", name, check=False, both=True))
+    finally:
+        pondra("uninstall", "--name", name, check=False)
+
+
+def root():
+    """What runs a command as root here: nothing on Windows (CI's user is an Administrator) or as root."""
+    return [] if os.name == "nt" or os.geteuid() == 0 else ["sudo"]
+
+
+def kill_node(name, port):
+    """Kill the node's process outright (not its manager's own), as a crash would."""
+    if os.name == "nt":  # (the node is the supervisor's child: the pondra.exe serving)
+        ps = "Get-CimInstance Win32_Process -Filter \"Name='pondra.exe'\" | Where-Object { $_.CommandLine -like '* serve *' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force; $_.ProcessId }"
+        pid = run("powershell", "-NoProfile", "-Command", ps, check=False)
+    elif sys.platform == "darwin":
+        printed = run(*root(), "launchctl", "print", f"system/{name}", check=False)
+        pid = next((l.split("=")[1].strip() for l in printed.splitlines() if l.strip().startswith("pid =")), "")
+        pid and run(*root(), "kill", "-9", pid)
+    else:
+        pid = run("systemctl", "show", name, "-p", "MainPID", "--value", check=False)
+        pid not in ("", "0") and run(*root(), "kill", "-9", pid)
+    return pid.strip() not in ("", "0") and until(lambda: not stats(port), 10) is not None and pid.strip()
+
+
+PARTS = {"image": image, "compose": compose, "chart": chart, "helm": helm, "python": python, "service": service}
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("parts", nargs="*", help=f"any of {', '.join(PARTS)} (default: image compose)")
     ap.add_argument("--image", default="pondra:dev", help="the image to try")
+    ap.add_argument("--python-image", default="pondra:dev-python", help="the image with Python (python)")
+    ap.add_argument("--bin", default=os.path.join(ROOT, "target", "release", "pondra"), help="the binary `pondra service` installs (service)")
+    ap.add_argument("--work", default=os.path.join(ROOT, "target", "deploy-check"), help="where service's lake goes (its user must be able to write there)")
     a = ap.parse_args()
     if unknown := set(a.parts) - set(PARTS):
         ap.error(f"no such part: {', '.join(unknown)}")
     for part in a.parts or ["image", "compose"]:
         print(f"-- {part}", flush=True)
         try:
-            PARTS[part](a.image)
+            PARTS[part](a)
         except Exception as e:
             check(f"{part} ran to its end", False, str(e)[-2000:])
     ok = bool(checks) and all(checks.values())
