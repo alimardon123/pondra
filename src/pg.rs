@@ -36,6 +36,9 @@ pub async fn serve(app: App, addr: String) -> anyhow::Result<()> {
     let parser = Arc::new(NoopQueryParser::new());
     loop {
         let (socket, _) = listener.accept().await?;
+        if crate::drain::draining() {
+            continue; // (stopping: a new connection goes to another node, `drain.rs`)
+        }
         let tls = tls.clone();
         // A connection is a session: its temporary tables end with it (`temp.rs`).
         let session = format!("pg-{}", uuid::Uuid::new_v4().simple());

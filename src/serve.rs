@@ -44,7 +44,8 @@ pub async fn lookup(lake: &Lake, table: &str, meta: &TableMeta, key: &str) -> Re
         Some((row, _, _)) => Some(row),
         None => newest_in_files(lake, meta, &keys).await?,
     };
-    let deleted = |r: &RecordBatch| r.column_by_name("_deleted").and_then(|c| c.as_any().downcast_ref::<BooleanArray>().map(|b| b.value(0)));
+    // (a live row's `_deleted` is NULL, whose value bit is whatever the decoder left: check it's valid)
+    let deleted = |r: &RecordBatch| r.column_by_name("_deleted").and_then(|c| c.as_any().downcast_ref::<BooleanArray>().map(|b| b.is_valid(0) && b.value(0)));
     Ok(row.filter(|r| deleted(r) != Some(true)))
 }
 
