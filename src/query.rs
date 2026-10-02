@@ -856,9 +856,8 @@ pub async fn register_views(ctx: &SessionContext, mut views: Vec<(String, String
 pub async fn over(lake: &Lake, source: &str, rows: Vec<RecordBatch>, sql: &str) -> Result<RecordBatch> {
     let meta: TableMeta = lake.cat.get::<TableMeta>(&table_key(source)).await?.ok_or_else(|| anyhow::anyhow!("no table {source}"))?.logical(); // (rows under SQL's names)
     let sql = crate::asof::rewrite(sql)?;
-    let df = over_ctx(lake, source, schema(&meta.columns)?, rows, &sql).await?.sql(&sql).await?;
-    let out = Arc::new(df.schema().as_arrow().clone());
-    Ok(datafusion::arrow::compute::concat_batches(&out, &df.collect().await?)?)
+    let (out, batches) = crate::fresh::run(lake, source, schema(&meta.columns)?, &rows, &sql, "", Ok).await?; // (its plan kept, when it reads the rows alone)
+    Ok(datafusion::arrow::compute::concat_batches(&out, &batches)?)
 }
 
 /// A session for `sql` where table `source` is just `rows`, as columns `s`.

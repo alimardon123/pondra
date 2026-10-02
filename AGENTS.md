@@ -59,7 +59,8 @@ src/      28,600 lines of Rust, one file per concern (see the table in README.md
           API, state and node; editor.js; grid.js; notebook.js; files.js the Workspace and the
           file tabs; console.js the shell and `window.pondra`; loaded when first used: more.js
           (Runs, Variables, Settings, search, choosing Python), data.js (data files), chart.js,
-          plan.js, details.js and more.css), xlsx.rs (a download as an Excel workbook)
+          plan.js, details.js and more.css), xlsx.rs (a download as an Excel workbook); round 32 fresh.rs (a view's plan kept from one write to
+          the next)
 brand/    the logo (mark.svg), colours (colors.css) and fonts (fonts/: Geist and Geist Mono, SIL
           OFL): the only copies; tools/brand_check.py
 site/     the documentation website (Starlight; ADR-030): site/STYLE.md says how pages are written,
@@ -1277,6 +1278,15 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    are registered on each copy), or the lake would never be dropped. With the catalogs shared,
    `harness.py temps` fails at its first `CREATE TEMP TABLE … FROM orders` ("the table orders
    already exists": the last query's tables were still registered).
+200. **A view's plan is kept from one write to the next only when nothing of that write stays in it**
+   (`fresh.rs`): a view or streaming task whose SQL reads the new rows alone (its session registered
+   no other table) and calls no function that may answer otherwise next time (`now()` is folded as
+   it is planned) keeps its physical plan, keyed by its SQL, the rows' columns, the partitions and
+   the lake's functions (`f/`). The rows are a table with no statistics (DataFusion answers a
+   `count(*)` from exact ones), and each write resets every operator's state, as DataFusion runs a
+   recursive query's plan again, with that write's rows in the leaf. `harness.py flows`: "a kept
+   plan keeps no write's count…" (1, 1, 1, 1, 1 with exact statistics) and "…nor its time" fail
+   without them.
 
 ## Tests: run these before and after any change
 

@@ -37,7 +37,13 @@ optimizing; performance first):
    table's was, about half of a small query's time), stored views are expanded only when named,
    and the cores are counted once. Over HTTP, on TPC-DS's lake: `SELECT 1` 1.64 → 0.86 ms, a count
    of a small table 3.2 → 2.2 ms, a three-table join that finds nothing 10.6 → 8.7 ms.
-4. **CI the same every push:** `harness.py functions`' killed-worker check waits for the workers
+4. **Flows within 5% of ingest** (invariant 200; the bar was 10%): a view that reads a write's new
+   rows alone keeps its physical plan from one write to the next, and each write puts its rows in
+   it (planning was 60% of what a view cost a write: a GROUP BY of 4,000 rows, 0.9 ms planning and
+   0.4 ms running), one partition for a write's rows. `tools/bench/flow.py`, 4 producers of 1,000
+   rows: three stages cost 15.4% of ingest before, 5.0% now (191K rows/s against 201K with no
+   view); the node's CPU for the three 130% → 82% (53% with none); `logs/round32/flow.json`.
+5. **CI the same every push:** `harness.py functions`' killed-worker check waits for the workers
    it killed to be gone (the next query could take one the node still saw running); fuzzed nodes
    run in their test folder (`ATTACH 'nope'` had left two lakes in the repository).
 

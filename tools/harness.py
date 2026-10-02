@@ -5630,6 +5630,17 @@ def flows():
     checks["a history view (SCD type 2): every version with __start_at and __end_at, a late one in its place, a delete ending its key, on every node"] = \
         all(until(lambda: hist(p), want_h, secs=20) == want_h for p in ports) and q("SELECT id, city FROM customers_history WHERE __end_at IS NULL ORDER BY id") == [{"id": 1, "city": "rome"}, {"id": 3, "city": "lima"}]
     checks["refused: a materialized view of a history view (its ends are worked out as it is read)"] = "history view" in (err("CREATE MATERIALIZED VIEW h2 AS SELECT id FROM customers_history") or "")
+    # A view's or a task's plan is kept from one write to the next (src/fresh.rs, invariant 200):
+    # nothing of the write it was made for stays in it, neither its count (DataFusion answers a
+    # count(*) from exact statistics: 1, 1, 1, 1, 1) nor its time (now() is folded as it plans).
+    q("CREATE TABLE ticks (id BIGINT, v BIGINT)")
+    call(A.port, "POST", "/tasks/counted", json.dumps({"source": "ticks", "target": "counted", "sql": "SELECT count(*) AS n FROM ticks"}).encode())
+    q("CREATE MATERIALIZED VIEW stamped AS SELECT id, now() AS seen FROM ticks")
+    for k in range(1, 6):
+        q("INSERT INTO ticks VALUES " + ", ".join(f"({i}, 1)" for i in range(k)))  # (one node: each keeps its own plans)
+        time.sleep(0.3)
+    checks["a kept plan keeps no write's count: a task counting each write's new rows adds up to every row"] = until(lambda: q("SELECT sum(n) AS n FROM counted")[0].get("n"), 15, secs=20) == 15
+    checks["…nor its time: now() in a view differs from write to write"] = q("SELECT count(DISTINCT seen) AS t FROM stamped")[0]["t"] > 1
     info = {"sent": sent_all, "refused": (refused or "")[:200], "said": {k: (v or "")[:160] for k, v in say.items()}, "expectations": ex}
     a.kill(); b.kill()
     ok = all(checks.values())
