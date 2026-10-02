@@ -999,13 +999,13 @@ async fn sql_as(app: App, p: SqlParams, role: axum::Extension<crate::auth::Role>
     };
     own.inspect(|s| _ = crate::temp::end(s));
     match out? {
-        Outcome::Rows(batches) => Ok(([("content-type", content_type(&p))], answer(&batches, &p)?).into_response()),
+        Outcome::Rows(batches) => Ok(([("content-type", content_type(p.format.as_deref()))], answer(&batches, &p)?).into_response()),
         Outcome::Done(v) => Ok(Json(v).into_response()),
     }
 }
 
-fn content_type(p: &SqlParams) -> &'static str {
-    match p.format.as_deref() {
+fn content_type(format: Option<&str>) -> &'static str {
+    match format {
         Some("table") => "text/plain",
         Some("arrow") => "application/vnd.apache.arrow.stream",
         Some("csv") => "text/csv; charset=utf-8",
@@ -1021,7 +1021,7 @@ fn content_type(p: &SqlParams) -> &'static str {
 /// asks at the same moment).
 async fn query(app: &App, p: &SqlParams, query: &str, files: bool) -> anyhow::Result<Response> {
     let format = p.format.as_deref().unwrap_or("json");
-    let respond = |body: bytes::Bytes| ([("content-type", content_type(p))], body).into_response();
+    let respond = |body: bytes::Bytes| ([("content-type", content_type(p.format.as_deref()))], body).into_response();
     let limited = crate::auth::limited().is_some(); // (a user granted some tables: planned as it may read them, never answered from what another read, nor kept: its grants may change)
     if format == "json" && !crate::temp::mentioned(query) && !limited {
         if let Some(body) = crate::serve::point_sql(&app.lake, query).await? {
@@ -1123,7 +1123,8 @@ const MOST: usize = 100_000;
 
 /// The console's answer (`?format=typed`, `console/console.js`): the columns with their types, the
 /// first `shown` rows as lists in the columns' order (two columns may share a name: a join's), how
-/// many rows there were, and, when there were more, the id its other pages are read with (`page`).
+/// many rows there were, and the id it is kept under (`pages.rs`): its other pages, and every row
+/// downloaded, are read from there (`page`), not run again.
 fn typed(batches: &[RecordBatch], shown: usize) -> anyhow::Result<Vec<u8>> {
     let columns: Vec<Value> = batches.first().map(|b| b.schema().fields().iter().map(|f| j!({"name": f.name(), "type": crate::query::type_name(f.data_type())})).collect()).unwrap_or_default();
     let mut w = arrow_json::ArrayWriter::new(Vec::new());
@@ -1142,16 +1143,22 @@ fn typed(batches: &[RecordBatch], shown: usize) -> anyhow::Result<Vec<u8>> {
     let objects: Vec<serde_json::Map<String, Value>> = serde_json::from_slice(&w.into_inner()).unwrap_or_default();
     let rows: Vec<Value> = objects.into_iter().map(|mut o| Value::Array((0..columns.len()).map(|i| o.remove(&i.to_string()).unwrap_or(Value::Null)).collect())).collect();
     let total: usize = batches.iter().map(|b| b.num_rows()).sum();
-    let pages = if total > shown { crate::pages::keep(batches) } else { None };
+    let pages = crate::pages::keep(batches);
     Ok(serde_json::to_vec(&j!({"columns": columns, "rows": rows, "total": total, "pages": pages}))?)
 }
 
-/// `GET /sql/pages/{id}?from=10000&rows=10000`: more rows of an answer the console was sent the
-/// first page of (`pages.rs`), as `typed` has them; 410 once it is no longer kept (run it again).
-async fn page(Path(id): Path<String>, Query(q): Query<HashMap<String, usize>>) -> Response {
-    let (from, rows) = (q.get("from").copied().unwrap_or(0), q.get("rows").copied().unwrap_or(SHOWN).clamp(1, MOST));
-    match crate::pages::page(&id, from, rows).map(|b| typed(&b, rows)) {
-        Some(Ok(body)) => ([("content-type", "application/json")], body).into_response(),
+/// `GET /sql/pages/{id}?from=10000&rows=10000`: more rows of an answer the console was sent
+/// (`pages.rs`), as `typed` has them; with `&format=csv|tsv|ndjson|parquet|xlsx`, every row of it as
+/// a file to download (`render`), not run again. 410 once it is no longer kept (run it again).
+async fn page(Path(id): Path<String>, Query(q): Query<HashMap<String, String>>) -> Response {
+    let num = |k: &str, or: usize| q.get(k).and_then(|v| v.parse().ok()).unwrap_or(or);
+    let (from, rows, format) = (num("from", 0), num("rows", SHOWN).clamp(1, MOST), q.get("format").map(String::as_str).filter(|f| *f != "typed"));
+    let got = match format {
+        Some(f) => crate::pages::page(&id, 0, usize::MAX).map(|b| render(&b, Some(f))),
+        None => crate::pages::page(&id, from, rows).map(|b| typed(&b, rows).map(bytes::Bytes::from)),
+    };
+    match got {
+        Some(Ok(body)) => ([("content-type", content_type(format))], body).into_response(),
         Some(Err(e)) => E(e).into_response(),
         None => (StatusCode::GONE, "this answer's rows are no longer kept here: run it again").into_response(),
     }
