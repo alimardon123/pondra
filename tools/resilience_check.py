@@ -276,6 +276,9 @@ def storage(a):
         t0 = c.phase("errors", s, error=0.1, lost=0.05)
         check("10% of requests answered 500 or 503 and 5% applied with their replies lost: writes go on", load.since(t0) and load.stall(t0, time.time()) < 15)
         t0 = c.phase("slow", s, slow_ms=250, hang=0.02, hang_secs=20)
+        # (a request held at the phase's start holds the commits behind it for as long as the phase
+        # lasts: the next ack may come just after it, so wait a moment for one before judging)
+        until(lambda: load.since(t0), 15)
         check("every request 250 ms slower, 2% held for 20 s: writes go on", load.since(t0) and load.stall(t0, time.time()) < 30)
         before = until(lambda: one_leader(c.nodes), 60)
         before = before and (before.port, stats(before)["term"])
