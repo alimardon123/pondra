@@ -206,9 +206,19 @@ def free_port():
 class Forward:
     """`kubectl port-forward` to a pod or service, for as long as it's needed."""
     def __init__(self, ns, target, port):
-        self.local = free_port()
-        self.p = subprocess.Popen(["kubectl", "-n", ns, "port-forward", target, f"{self.local}:{port}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        until(lambda: socket.create_connection(("127.0.0.1", self.local), timeout=1).close() or True, 30)
+        # A connection the pod refuses (its server not listening yet, though the pod is Ready) ends
+        # kubectl's port-forward ("lost connection to pod"), so it is started again until a probe
+        # leaves it running: moto's pod, Ready before moto listened, failed a PR's run that way.
+        for _ in range(30):
+            self.local = free_port()
+            self.p = subprocess.Popen(["kubectl", "-n", ns, "port-forward", target, f"{self.local}:{port}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if until(lambda: socket.create_connection(("127.0.0.1", self.local), timeout=1).close() or True, 30):
+                time.sleep(1)
+                if self.p.poll() is None:
+                    return
+            self.p.kill()
+            self.p.wait()
+        raise RuntimeError(f"kubectl port-forward {target} {port} never stayed up")
 
     def __enter__(self):
         return self.local
