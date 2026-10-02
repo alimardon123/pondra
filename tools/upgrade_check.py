@@ -13,6 +13,12 @@
       must equal a lake this build made the same way from the start; other engines read the
       published tables' new versions; every row id is still unique.
 
+  upgrade_check.py drain [--s3]
+      A node told to stop drains (`drain.rs`); a leader stopped under load hands over sooner than
+      one killed, and exits at once though its followers keep sending. With --s3 the cluster's
+      lake is on s3://$PONDRA_BUCKET (AWS_* point at R2, MinIO or tools/sim_r2.py), where a
+      follower's flush is always in flight.
+
 Prints the checks as JSON and exits 1 if one fails (a failing release's lakes and node logs are
 kept in --work). Needs the Python packages in tools/requirements.txt for other engines' reads
 (deltalake, pyiceberg); without them those checks are skipped, and say so.
@@ -689,7 +695,8 @@ class Load:
 def drain_check(new_bin, work, port):
     """A node told to stop drains first (ADR-039, `drain.rs`); a leader then steps down."""
     checks, info = {}, {}
-    n = Node(new_bin, os.path.join(work, "drain-lake"), port, work).start()
+    pg_port = port + 50
+    n = Node(new_bin, os.path.join(work, "drain-lake"), port, work, "--pg", f"127.0.0.1:{pg_port}").start()
     checks["/healthz and /ready answer 200, without a token"] = n.plain("GET", "/healthz")[0] == 200 and n.plain("GET", "/ready")[0] == 200
     # A query that takes a few seconds here (each size its own: no remembered answer).
     long = lambda rows: f"SELECT sum(value % 7) AS s FROM range(0, {rows})"
@@ -712,12 +719,33 @@ def drain_check(new_bin, work, port):
             got["error"] = str(e)[:300]
         got["at"] = time.time()
 
+    try:
+        import psycopg
+        pg = psycopg.connect(host="127.0.0.1", port=pg_port, user="admin", password=TOKEN, dbname="pondra", autocommit=True)
+        pg.execute("SELECT 1").fetchall()
+    except ImportError:
+        pg = None
     th = threading.Thread(target=ask, args=(rows,))
     th.start()
     time.sleep(0.5)
     n.p.send_signal(signal.SIGTERM)
     time.sleep(0.2)
     ready, health, new = n.plain("GET", "/ready"), n.plain("GET", "/healthz"), n.plain("POST", "/sql", "SELECT 1")
+    if pg:
+        try:
+            pg.execute("SELECT 1").fetchall()
+            said = "answered"
+        except psycopg.Error as e:
+            said = e.sqlstate
+        try:
+            psycopg.connect(host="127.0.0.1", port=pg_port, user="admin", password=TOKEN, dbname="pondra", connect_timeout=5).close()
+            again = "connected"
+        except psycopg.Error:
+            again = "refused"
+        info["Postgres while stopping"] = {"a statement on a connection open before": said, "a new connection": again}
+        checks["…a statement on a Postgres connection open before is answered 57P01, a new connection refused"] = said == "57P01" and again == "refused"
+    else:
+        info["Postgres while stopping"] = "not checked: pip install psycopg"
     th.join()
     n.p.wait(60)
     info["while stopping"] = {"/ready": ready[0], "/healthz": health[0], "a new query": [new[0], new[2][:80], {k.lower(): v for k, v in new[1].items()}.get("retry-after")]}
@@ -738,31 +766,49 @@ def drain_check(new_bin, work, port):
     info["seconds to stop with PONDRA_DRAIN_SECS=1 and a longer query"] = round(took, 1)
     checks["…but for PONDRA_DRAIN_SECS at most"] = took < 4
     # A leader stopped under load hands over at once; killed, its followers wait out the lease.
-    lake = os.path.join(work, "drain-cluster")
+    lake = f"s3://{os.environ['PONDRA_BUCKET']}/drain-{os.getpid()}-{int(time.time())}" if A.s3 else os.path.join(work, "drain-cluster")
+    info["the cluster's lake"] = lake
     nodes = [Node(new_bin, lake, port + i, work).start() for i in range(3)]
     nodes[0].post("/tables/ev2", json.dumps([["producer", "Utf8"], ["seq", "Int64"], ["i", "Int64"]]))
     until(lambda: all(x.q("SELECT count(*) AS n FROM ev2") for x in nodes), 20)
     live = list(nodes)
     load = Load(live, "ev2").start()
-    stalls = {}
+    stalls, exited = {}, None
     for how in ("term", "kill"):
         time.sleep(4)
         leader = next(x for x in live if x.get("/stats")["role"] == "leader")
         t0 = time.time()
         live.remove(leader)
         leader.stop(how)
+        exited = exited or round(time.time() - t0, 2)
         until(lambda: any(x.get("/stats", timeout=2)["role"] == "leader" for x in live), 60)
         time.sleep(3)
         stalls["stopped (SIGTERM)" if how == "term" else "killed (kill -9)"] = load.longest(t0 - 0.5)
         live.append(leader.start())  # (it rejoins as a follower)
     time.sleep(3)
     result = load.finish(live[0])
-    info["a leader stopped under load"] = {"longest wait for an ack, s": stalls, **result}
+    info["a leader stopped under load"] = {"longest wait for an ack, s": stalls, "stopped, it exited after, s": exited, **result}
     checks["a leader stopped under load: every acknowledged batch once, no torn read, on every node"] = not result["lost or twice"] and not result["torn reads"] and all(
         x.q("SELECT count(*) AS n FROM ev2") == live[0].q("SELECT count(*) AS n FROM ev2") for x in live)
     checks["…its followers take over sooner than when it is killed"] = stalls["stopped (SIGTERM)"] < stalls["killed (kill -9)"]
+    # (its followers keep sending it flushes until it steps down; on a bucket one is always in
+    # flight, and a leader that waited for none waited out PONDRA_DRAIN_SECS: run with --s3)
+    checks["…and it exits within 10 s, though its followers keep sending (not after PONDRA_DRAIN_SECS)"] = exited < 10
     [x.stop() for x in live]
+    if A.s3:
+        gone(lake)
     return checks, info
+
+
+def gone(lake):
+    """A lake in a bucket deleted (the tests' own: `drain --s3`)."""
+    import boto3
+    bucket, prefix = lake[len("s3://"):].split("/", 1)
+    s3 = boto3.client("s3", endpoint_url=os.environ.get("AWS_ENDPOINT_URL") or os.environ.get("AWS_ENDPOINT"))
+    for page in s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix + "/"):
+        keys = [{"Key": o["Key"]} for o in page.get("Contents", [])]
+        if keys:
+            s3.delete_objects(Bucket=bucket, Delete={"Objects": keys})
 
 
 # ---------------------------------------------------------------- a rolling upgrade
@@ -854,6 +900,7 @@ def main():
     ap.add_argument("--work", default="", help="where lakes and logs go (default: a new temporary folder, removed if every check passes)")
     ap.add_argument("--port", type=int, default=9720)
     ap.add_argument("--verbose", action="store_true", help="what each check measured, passed or not")
+    ap.add_argument("--s3", action="store_true", help="`drain`'s cluster on s3://$PONDRA_BUCKET (AWS_* point at R2, MinIO or tools/sim_r2.py)")
     A = ap.parse_args()
     new_bin = os.path.abspath(A.new)
     work = A.work or tempfile.mkdtemp(prefix="pondra-upgrade-")

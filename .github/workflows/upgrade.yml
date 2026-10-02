@@ -1,5 +1,6 @@
 # Upgrades (ADR-039): every release's lake since 0.22 opens in this build and answers as it did,
-# then carries on; a lake of a newer format is refused; a node drains before it stops; a cluster
+# then carries on; a lake of a newer format is refused; a node drains before it stops (a leader on
+# a simulated R2 bucket too, where its followers always have a flush in flight); a cluster
 # of the newest release is upgraded to this build a node at a time under load
 # (tools/upgrade_check.py all). Every pull request to main, and by hand.
 name: upgrade
@@ -32,14 +33,23 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }} # (the releases' list: a runner's shared address has a low limit)
         run: |
           set -o pipefail   # (the check's exit status, not tee's)
-          pip install -q $(grep -E '^(pyarrow|deltalake|pyiceberg|pyiceberg-core)==' tools/requirements.txt | sed 's/ *#.*//')
+          pip install -q $(grep -E '^(pyarrow|deltalake|pyiceberg|pyiceberg-core|psycopg\[binary\]|boto3|moto\[server\])==|^boto3$' tools/requirements.txt | sed 's/ *#.*//')
           python3 tools/upgrade_check.py all --new target/release/pondra --work "$RUNNER_TEMP/upgrade" | tee upgrade.json
+      - name: A leader stopped on a bucket (simulated R2) hands over at once
+        run: |
+          set -o pipefail
+          python3 tools/sim_r2.py --port 9000 > "$RUNNER_TEMP/sim_r2.log" 2>&1 &
+          export AWS_ENDPOINT=http://127.0.0.1:9000 AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_REGION=auto AWS_ALLOW_HTTP=true PONDRA_BUCKET=testbucket
+          for i in $(seq 30); do python3 -c "import boto3; boto3.client('s3', endpoint_url='http://127.0.0.1:9000', region_name='us-east-1').create_bucket(Bucket='testbucket')" 2>/dev/null && break; sleep 1; done
+          python3 tools/upgrade_check.py drain --s3 --new target/release/pondra --work "$RUNNER_TEMP/upgrade-s3" | tee upgrade-s3.json
       - uses: actions/upload-artifact@v6
         if: always()
         with:
           name: upgrade
           path: |
             upgrade.json
+            upgrade-s3.json
             ${{ runner.temp }}/upgrade/**/*.log
+            ${{ runner.temp }}/upgrade-s3/**/*.log
           retention-days: 14
           if-no-files-found: ignore

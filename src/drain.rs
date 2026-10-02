@@ -5,10 +5,13 @@
 //!    runs), so a load balancer stops sending it work, and waits `PONDRA_DRAIN_GRACE_SECS` (0) for
 //!    one to notice;
 //! 2. new requests are turned away with an answer a client retries elsewhere (HTTP 503 with
-//!    `Retry-After`; a new Postgres connection is refused), except the cluster's own calls, which a
-//!    leader's followers and a query's other nodes still need;
+//!    `Retry-After`; a new Postgres connection is refused, a new statement on an open one answered
+//!    57P01), except the cluster's own calls, which a leader's followers and a query's other nodes
+//!    still need;
 //! 3. requests in flight at every door that has them (HTTP, each Postgres statement) finish, for up
-//!    to `PONDRA_DRAIN_SECS` (30);
+//!    to `PONDRA_DRAIN_SECS` (30). Only those that came before the signal are waited for: a leader's
+//!    followers keep sending it flushes until it steps down, and on a bucket one is always in flight,
+//!    so waiting for none held a leader the whole 30 s (and a scheduler's kill came first);
 //! 4. then the leader checkpoints its catalog and gives up its term, so the next leader takes over
 //!    at once (`main.rs`). Everything acknowledged was durable already (`--ack durable`) or is held
 //!    by the followers (`--ack replicated`), so nothing waits on the bucket here.
@@ -21,18 +24,28 @@ static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 /// Is this node stopping?
 pub fn draining() -> bool { DRAINING.load(SeqCst) }
 
-/// Held by a request's work while it runs (`panics::door`).
-pub struct Busy;
+/// Held by a request's work while it runs (`panics::door`): counted if it came before the drain.
+pub struct Busy(bool);
 
 impl Busy {
     pub fn new() -> Busy {
+        // (counted, then the flag read: with `drain` storing the flag, then reading the count, one of
+        // them sees the other, so no request that came before the drain goes uncounted)
         IN_FLIGHT.fetch_add(1, SeqCst);
-        Busy
+        if draining() {
+            IN_FLIGHT.fetch_sub(1, SeqCst);
+            return Busy(false);
+        }
+        Busy(true)
     }
 }
 
 impl Drop for Busy {
-    fn drop(&mut self) { IN_FLIGHT.fetch_sub(1, SeqCst); }
+    fn drop(&mut self) {
+        if self.0 {
+            IN_FLIGHT.fetch_sub(1, SeqCst);
+        }
+    }
 }
 
 /// Requests a draining node still takes: the cluster's own (a leader's followers, a query's other

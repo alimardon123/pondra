@@ -60,10 +60,11 @@ close the standard input of a node started with `--stop-with-stdin`. The node th
 1. `GET /ready` answers 503, so a load balancer stops sending it work. `GET /healthz` stays 200 for
    as long as the process runs.
 2. It waits `PONDRA_DRAIN_GRACE_SECS` (0 by default) for the load balancer to notice.
-3. New requests get `503` with `Retry-After: 1`, and new Postgres connections are refused, so
-   clients try another node. Calls between the cluster's own nodes are still answered.
-4. Requests already running finish: HTTP requests and Postgres statements, for up to
-   `PONDRA_DRAIN_SECS` (30 by default).
+3. New requests get `503` with `Retry-After: 1`, new Postgres connections are refused, and a new
+   statement on a connection already open gets the error `57P01`, so clients try another node.
+   Calls between the cluster's own nodes are still answered.
+4. Requests that were running when the signal came finish: HTTP requests and Postgres statements,
+   for up to `PONDRA_DRAIN_SECS` (30 by default).
 5. A leader waits until everything it acknowledged is in the bucket, saves its catalog and steps
    down. Its followers see that and one leads at once, instead of waiting out the 5-second lease that
    a leader that died needs.

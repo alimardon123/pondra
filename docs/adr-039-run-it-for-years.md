@@ -73,9 +73,13 @@ stop, and a 24-hour soak (C4). Where things stood:
 6. **A node drains before it stops** (`drain.rs`). SIGTERM, Ctrl-C or its starter's end: `/ready`
    answers 503 (`/healthz` stays 200 while the process runs), it waits
    `PONDRA_DRAIN_GRACE_SECS` (0) for a load balancer to notice, new requests get 503 with
-   `Retry-After: 1` and a new Postgres connection is refused, except the cluster's own calls; the
-   requests in flight at HTTP and each Postgres statement (`panics::door` counts them) finish, for
-   `PONDRA_DRAIN_SECS` (30) at most. A second signal stops at once. Then a leader waits until what
+   `Retry-After: 1`, a new Postgres connection is refused and a new statement on an open one gets
+   57P01, except the cluster's own calls; the requests in flight when the signal came, at HTTP and
+   each Postgres statement (`panics::door` counts them), finish, for `PONDRA_DRAIN_SECS` (30) at
+   most. The cluster's calls that come after it are answered but not waited for: a leader's
+   followers keep sending it flushes until it steps down, and on a bucket one is always in flight,
+   so a leader that waited for none in flight waited the whole 30 s (found by the soak on
+   simulated R2), and a scheduler's kill would come first. A second signal stops at once. Then a leader waits until what
    it committed is in the bucket (with `--ack replicated` too), checkpoints its catalog, **steps
    down** (`cluster/left/{term}`, put-if-absent) and releases its mark; a follower whose leader
    stops answering and has stepped down claims the next term at once, without the lease or asking

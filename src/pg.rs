@@ -309,6 +309,10 @@ impl Backend {
 
     /// `run`, a panic in it answered as an error (`panics.rs`); in a transaction, an error fails it.
     async fn caught(&self, user: &str, sql: &str, format: &Format) -> PgWireResult<Response> {
+        if crate::drain::draining() {
+            // (stopping: the statement goes to another node, as a new connection does; `drain.rs`)
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new("ERROR".into(), "57P01".into(), "this node is stopping: connect to another node".into()))));
+        }
         let run = async { crate::panics::door(self.run(user, sql, format)).await.unwrap_or_else(|m| Err(user_error(anyhow::anyhow!(m)))) };
         let out = crate::audit::statement(&self.app, sql, run).await;
         if let Err(e) = &out {
