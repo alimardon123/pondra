@@ -641,7 +641,10 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    planned; `COPY … FROM STDIN` gathers per connection and loads through the log 32 MB at a time,
    split at a line's end (for CSV, outside quotes).
 72. **A query that ran both ways goes the way that was faster** (`guard::ran_spread`), unless the
-   network is pretended (`PONDRA_LINK`: the model alone, as the tests need).
+   network is pretended (`PONDRA_LINK`: the model alone, as the tests need). One spread run slower
+   than here doesn't decide alone (`guard::spread_runs`: the other nodes saw the query cold), so
+   the model decides until a second agrees; one slow first run kept the cluster bench's q1 on one
+   node for good (`harness.py guard`: "one spread run slower than here doesn't decide alone").
 73. **`pondra_object_requests_total` counts what the store was asked to do** (`store::Counted`), not
    what SlateDB tried: a local disk refuses SlateDB's tagged PUT before writing, and it tries again
    untagged; the refusal isn't counted.

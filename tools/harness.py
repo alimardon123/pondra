@@ -2276,11 +2276,19 @@ def guard():
         q("SELECT p, count(*) AS n, sum(v) AS s FROM f GROUP BY p", fast.port)
     said = [l for l in open(fast.log) if l.startswith("spread: here")]
     few_mb = float(re.search(r"\(([\d.]+) MB", said[-1]).group(1)) if said else None
-    # A node on the real network (no PONDRA_LINK): once a query ran both ways, the faster way wins.
+    # A node on the real network (no PONDRA_LINK): one spread run slower than here is the others'
+    # first sight of the query (their caches cold), so the model decides again until a second
+    # agrees; once a query ran both ways, the faster way wins.
+    fresh = "SELECT count(*) AS n, sum(f.v * g.w) AS s FROM f JOIN g ON f.id = g.id"  # (the model spreads it: the tables meet by ranges of id)
+    timed = lambda s, spread: (lambda t: (q(s, third.port, spread), time.time() - t)[1])(time.time())
+    here = min(timed(fresh, 0) for _ in range(2))
+    slower = timed(fresh, 1) > here
+    before = spreads(third.port)
+    q(fresh, third.port)
+    again = (slower, spreads(third.port) > before)
     learned = []
     for s in queries:
-        timed = lambda spread: (lambda t: (q(s, third.port, spread), time.time() - t)[1])(time.time())
-        here, spread = min(timed(0) for _ in range(2)), min(timed(1) for _ in range(2))
+        here, spread = min(timed(s, 0) for _ in range(2)), min(timed(s, 1) for _ in range(2))
         before = spreads(third.port)
         q(s, third.port)
         went = spreads(third.port) > before
@@ -2293,10 +2301,11 @@ def guard():
               "over a slow network, queries that would shuffle stay on one node": not any(r["slow"][1] for r in out.values() if r["forced"][2]) and any(r["forced"][2] for r in out.values()),
               "over a fast one, they spread": all(r["fast"][1] for r in out.values()),
               "?spread=1 spreads anyway": all(r["forced"][1] for r in out.values()),
+              "one spread run slower than here doesn't decide alone: the query spreads again": again[1] or not again[0],
               "a query that ran both ways goes the faster way": all(learned),
               "an aggregate of a few groups is known to move little (under 1 MB)": few_mb is not None and few_mb < 1}
     ok = all(checks.values())
-    print(json.dumps({"guard": checks, "ok": ok, "learned": learned, "few_groups_mb": few_mb}, indent=1))
+    print(json.dumps({"guard": checks, "ok": ok, "learned": learned, "again": again, "few_groups_mb": few_mb}, indent=1))
     if not ok:
         print(out)
         sys.exit(1)

@@ -63,6 +63,15 @@ optimizing; performance first):
    15.7 → 13.0 s against DuckDB's 7.8–8.1 s, measured side by side. TPC-H's 22 plans don't change.
    q72 first went 10× slower: inventory joined to every date kept all 10,436 weeks, so a later
    join on the week looked like a cut (unit tests in `optimize.rs`).
+8. **The cluster bench on 0.30 (932cbad, the owner's runs #15 and #16, SF10 on GitHub's 4-vCPU
+   runners over Tailscale):** every answer the same as one node's; 3 nodes 22.4 s as the cluster
+   decides against 23.8 s on one node (34.5 s spread anyway), 6 nodes 24.2 s against 26.2 s (33.3
+   s). Two things kept time on the table. One slow first spread run (the other nodes' caches cold)
+   decided for good: q1 spread in 2.1 s the first time and 1.0 s after, yet went back to 2.4 s on
+   one node; now a second run must agree (invariant 72). And the guard's 20 round trips a step
+   keep queries that move nothing on one node (6 nodes: q12 0.50 s spread against 0.98 s, q19
+   0.68 s against 1.07 s, q3 0.67 s against 0.95 s); its next runs log each decision
+   (`PONDRA_DEBUG_SPREAD`, the nodes' logs kept), to set that from what the steps take.
 
 **Then (2026-10-01, round 31, second part so far; 0.29.0): every kind of object alike, SQL and
 Python in one notebook** (the owner's list after the first part):
