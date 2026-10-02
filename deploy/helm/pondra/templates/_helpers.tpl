@@ -111,17 +111,18 @@ ports:
   {{- if .Values.kafka.enabled }}
   - {name: kafka, containerPort: 9092}
   {{- end }}
-# (the port opens once the lake is open; a cold start on a big lake can take a while)
+# (the port opens once the lake is open; a cold start on a big lake can take a while. Ready: caught
+# up with its leader, not stopping, and able to reach the bucket. Alive: the process answers.)
 startupProbe:
-  httpGet: {path: /stats, port: http, scheme: {{ include "pondra.scheme" . }}}
+  httpGet: {path: /healthz, port: http, scheme: {{ include "pondra.scheme" . }}}
   periodSeconds: 2
   failureThreshold: 300
 readinessProbe:
-  httpGet: {path: /stats, port: http, scheme: {{ include "pondra.scheme" . }}}
+  httpGet: {path: /ready, port: http, scheme: {{ include "pondra.scheme" . }}}
   periodSeconds: 5
   failureThreshold: 2
 livenessProbe:
-  httpGet: {path: /stats, port: http, scheme: {{ include "pondra.scheme" . }}}
+  httpGet: {path: /healthz, port: http, scheme: {{ include "pondra.scheme" . }}}
   periodSeconds: 10
   timeoutSeconds: 5
   failureThreshold: 6

@@ -81,7 +81,8 @@ same answers once the fault was gone.
 A leader that can't reach the bucket can't commit, though its followers may still reach both. After
 15 seconds without reaching it (slow answers and requests to slow down count as reaching it), it
 tells its followers, one of them claims the next term at once, and meanwhile it turns requests away
-with HTTP 503 and `Retry-After` (SQLSTATE `57P03`), so a client given every node goes to another. A
+with HTTP 503 and `Retry-After` (SQLSTATE `57P03`), so a client given every node goes to another,
+and `GET /ready` answers 503, so a load balancer or Kubernetes stops sending it requests. A
 leader alone, with no other node to lead, keeps serving what it can. When it reaches the bucket
 again it follows the new leader.
 
