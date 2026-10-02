@@ -50,7 +50,7 @@ and nothing of an open transaction was applied. See [Python](/pondra/reference/p
 | **The bucket answers errors** (500, 503, replies lost) | go on | go on, a little slower: every request is retried | 106 acks a second, against 366 with no faults; the longest wait 0.7 s |
 | **The bucket slow** (every request 250 ms slower, some held 20 s) | go on | go on, slower | 3.4 acks a second; the longest wait 15.6 s (a commit waits for its slowest request) |
 | **The bucket down** for longer than a leader's lease | what the nodes hold go on | wait, then go on when it is back | the first ack 0.3 s after the bucket was back from 40 s down |
-| **Only the leader cut off from the bucket** | go on, on the other nodes | another node leads and takes them | another node took writes ⟨cut⟩ s after the cut |
+| **Only the leader cut off from the bucket** | go on, on the other nodes | another node leads and takes them | another node took writes 25 s after the cut |
 | **The lake's disk full** (a lake on local disk) | go on | wait, then all go in when there is room | 31,352 reads answered while it was full; the first ack 0.8 s after there was room |
 | **The nodes' cache disk full** (a lake on a bucket) | go on | go on | 289 acks a second, the longest wait 0.1 s; a spread query answered as on one node |
 | **A database's node killed** under [`pondra serve --lakes`](/pondra/guides/server/) | the server starts it again | the server starts it again | writes again 0.5 s after |

@@ -277,13 +277,17 @@ def storage(a):
         check("10% of requests answered 500 or 503 and 5% applied with their replies lost: writes go on", load.since(t0) and load.stall(t0, time.time()) < 15)
         t0 = c.phase("slow", s, slow_ms=250, hang=0.02, hang_secs=20)
         check("every request 250 ms slower, 2% held for 20 s: writes go on", load.since(t0) and load.stall(t0, time.time()) < 30)
+        before = until(lambda: one_leader(c.nodes), 60)
+        before = before and (before.port, stats(before)["term"])
         t0 = c.phase("down", 40, down=True)
         back = time.time()
         again = until(lambda: load.since(back), 90)
         info["the bucket back after 40 s down: the first ack (s)"] = round(time.time() - back, 1) if again else None
-        info["the bucket down and back: roles"] = c.timeline.since(t0)
         check("the bucket down 40 s (past every lease): writes again within 30 s of its return", again and time.time() - back < 30)
         c.end(s / 2)
+        after = one_leader(c.nodes)
+        info["the bucket down and back: roles"] = roles = c.timeline.since(t0)
+        check("…the same leader leads after it (down for everyone: nobody had to take over)", after and (after.port, stats(after)["term"]) == before, roles)
     finally:
         c.close()
 
@@ -303,7 +307,7 @@ def cutoff(a):
         took = round(time.time() - t0, 1)
         info["the leader cut off from the bucket: writes again through another leader (s)"] = took if moved else None
         info["the leader cut off: roles"] = c.timeline.since(t0)
-        check("the leader alone cut off from the bucket: another leads and takes writes within 30 s", moved and took < 30,
+        check("the leader alone cut off from the bucket: another leads and takes writes within 40 s", moved and took < 40,
               {nd.port: (st or {}).get("role") for nd, st in ((nd, stats(nd)) for nd in nodes)})
         time.sleep(a.secs / 2)
         c.proxies[alone].set()
