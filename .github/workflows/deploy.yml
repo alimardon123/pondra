@@ -1,14 +1,18 @@
 name: deploy
 
-# Pondra deployed the ways ADR-041 gives, from the very packages the build workflow made for this
-# commit (nothing is compiled here: tools/ci_artifact.sh waits for them): the container image
-# (amd64 and arm64, and the one with Python), the compose cluster, the Helm chart on Kubernetes
-# (kind), and `pondra service` on Linux, macOS and Windows; each tried as a user would run it
-# (tools/deploy_check.py).
+# Pondra deployed and distributed the ways ADR-041 gives, from the very packages the build
+# workflow made for this commit (nothing is compiled here: tools/ci_artifact.sh waits for them):
+# the container image (amd64 and arm64, and the one with Python), the compose cluster, the Helm
+# chart on Kubernetes (kind), `pondra service` on Linux, macOS and Windows (tools/deploy_check.py),
+# Homebrew's formula, Scoop's and winget's manifests (tools/distribute.py), and signing with a
+# certificate made for the run (tools/sign.py); each tried as a user would.
 #
-# A tag's run also publishes the image (both architectures, with its provenance and SBOM, signed
-# with GitHub's identity) and the chart to GitHub's container registry, once the repository's
-# variable PUBLISH_IMAGE is `true` (Settings -> Secrets and variables -> Actions -> Variables).
+# A tag's run also publishes, once the repository says so (Settings -> Secrets and variables ->
+# Actions): with the variable PUBLISH_IMAGE `true`, the image (both architectures, its provenance
+# and SBOM, signed with GitHub's identity) and the chart to GitHub's container registry; with
+# PUBLISH_PACKAGES `true`, the formula to <owner>/homebrew-pondra and the manifest to
+# <owner>/scoop-pondra (the secret PACKAGES_TOKEN: contents read and write on both), and a pull
+# request to microsoft/winget-pkgs (the secret WINGET_TOKEN: a classic token with public_repo).
 on:
   pull_request:
     branches: [main]
@@ -80,6 +84,60 @@ jobs:
           ls -l bin
       - name: Installed, killed, installed again, uninstalled (systemd, launchd, Windows's service manager)
         run: python tools/deploy_check.py service --bin bin/pondra${{ matrix.platform == 'windows-x64' && '.exe' || '' }}
+      - name: Homebrew's formula, Scoop's and winget's manifests, for this platform's archive (served here)
+        run: |
+          v=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          python tools/distribute.py --version "$v" --dist dist --partial --url-base http://127.0.0.1:8765 --out out
+      - name: Homebrew (a tap of this run's own) installs it, tests it, uninstalls it
+        if: matrix.platform != 'windows-x64'
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: 1
+          HOMEBREW_NO_ANALYTICS: 1
+        run: |
+          (cd dist && exec python -m http.server 8765 --bind 127.0.0.1) & sleep 1
+          brew=$(command -v brew || echo /home/linuxbrew/.linuxbrew/bin/brew) # (Linux's runner has it, off the PATH)
+          $brew tap-new --no-git pondra/check
+          cp out/homebrew/pondra.rb "$($brew --repository pondra/check)/Formula/"
+          $brew style pondra/check/pondra
+          $brew install pondra/check/pondra
+          $brew test pondra/check/pondra
+          "$($brew --prefix)/bin/pondra" --version
+          $brew uninstall pondra && $brew untap pondra/check
+      - name: Scoop installs it; winget's manifests validated (where the runner has winget)
+        if: matrix.platform == 'windows-x64'
+        shell: pwsh
+        run: |
+          Start-Process python -ArgumentList '-m', 'http.server', '8765', '--bind', '127.0.0.1' -WorkingDirectory dist
+          iex "& {$(irm get.scoop.sh)} -RunAsAdmin" # (the runner's user is an administrator)
+          $env:PATH = "$env:USERPROFILE\scoop\shims;$env:PATH"
+          scoop install out\scoop\pondra.json
+          & "$env:USERPROFILE\scoop\shims\pondra.exe" --version
+          if ($LASTEXITCODE) { exit 1 }
+          scoop uninstall pondra
+          $v = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"').Matches[0].Groups[1].Value
+          if (Get-Command winget -ErrorAction SilentlyContinue) { winget validate --manifest "out\winget\manifests\p\Pondra\Pondra\$v"; exit $LASTEXITCODE }
+          else { echo "::notice::no winget on this runner: its manifests weren't validated" }
+      - name: Signed with a certificate made for this run (tools/sign.py), and still runs
+        if: matrix.platform != 'linux-x64'
+        shell: pwsh
+        run: |
+          $bin = if ($IsWindows) { "bin\pondra.exe" } else { "bin/pondra" }
+          if ($IsWindows) {
+            $c = New-SelfSignedCertificate -Type CodeSigningCert -Subject "CN=Pondra test signing" -CertStoreLocation Cert:\CurrentUser\My -NotAfter (Get-Date).AddDays(1)
+            Export-PfxCertificate -Cert $c -FilePath cert.pfx -Password (ConvertTo-SecureString test -AsPlainText -Force) | Out-Null
+            Export-Certificate -Cert $c -FilePath cert.cer | Out-Null
+            Import-Certificate -FilePath cert.cer -CertStoreLocation Cert:\LocalMachine\Root | Out-Null # (so signtool's verify trusts it)
+            $env:WINDOWS_CERTIFICATE = [Convert]::ToBase64String([IO.File]::ReadAllBytes("$PWD\cert.pfx")); $env:WINDOWS_CERTIFICATE_PASSWORD = "test"
+          } else {
+            "[req]`ndistinguished_name=dn`nx509_extensions=ext`nprompt=no`n[dn]`nCN=Pondra test signing`n[ext]`nbasicConstraints=critical,CA:false`nkeyUsage=critical,digitalSignature`nextendedKeyUsage=critical,codeSigning`n" | Set-Content cert.cnf
+            /usr/bin/openssl req -x509 -newkey rsa:2048 -nodes -keyout key.pem -out cert.pem -days 1 -config cert.cnf
+            /usr/bin/openssl pkcs12 -export -inkey key.pem -in cert.pem -out cert.p12 -passout pass:test
+            $env:APPLE_CERTIFICATE = [Convert]::ToBase64String([IO.File]::ReadAllBytes("$PWD/cert.p12")); $env:APPLE_CERTIFICATE_PASSWORD = "test"
+          }
+          python tools/sign.py $bin
+          if ($LASTEXITCODE) { exit 1 }
+          & $bin --version
+          if ($LASTEXITCODE) { exit 1 }
 
   publish:
     name: publish the image and the chart
@@ -119,3 +177,48 @@ jobs:
           echo "${{ github.token }}" | helm registry login ghcr.io -u ${{ github.actor }} --password-stdin
           helm package deploy/helm/pondra --version $v --app-version $v
           helm push pondra-$v.tgz oci://ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/charts
+
+  packages:
+    name: publish to Homebrew, Scoop and winget
+    needs: [service]
+    if: startsWith(github.ref, 'refs/tags/v') && vars.PUBLISH_PACKAGES == 'true'
+    runs-on: windows-latest # (wingetcreate is Windows's)
+    defaults:
+      run:
+        shell: bash
+    env:
+      TOKEN: ${{ secrets.PACKAGES_TOKEN }}
+      WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: The release's archives (release.yml publishes them)
+        run: |
+          for _ in $(seq 60); do
+            gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' 2>/dev/null | grep -qx pondra-windows-x64.zip && exit 0
+            sleep 30
+          done
+          echo "::error::no release $GITHUB_REF_NAME with its archives after 30 minutes" && exit 1
+      - run: python tools/distribute.py --version "${GITHUB_REF_NAME#v}" --release --date "$(date -u +%F)" --out out
+      - name: The tap (<owner>/homebrew-pondra) and the bucket (<owner>/scoop-pondra)
+        if: env.TOKEN != ''
+        run: |
+          v=${GITHUB_REF_NAME#v}
+          for target in "homebrew-pondra Formula/pondra.rb homebrew/pondra.rb" "scoop-pondra bucket/pondra.json scoop/pondra.json"; do
+            set -- $target
+            git clone -q "https://x-access-token:$TOKEN@github.com/$GITHUB_REPOSITORY_OWNER/$1" repo
+            mkdir -p "repo/$(dirname "$2")" && cp "out/$3" "repo/$2" && git -C repo add -A
+            if git -C repo diff --cached --quiet; then echo "$1 already has pondra $v"; else
+              git -C repo -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" commit -qm "pondra $v"
+              git -C repo push -q && echo "$1: pondra $v"
+            fi
+            rm -rf repo
+          done
+      - name: winget (a pull request to microsoft/winget-pkgs, from the token's own fork)
+        if: env.WINGET_TOKEN != ''
+        run: |
+          v=${GITHUB_REF_NAME#v}
+          curl -fsSL -o wingetcreate.exe https://aka.ms/wingetcreate/latest
+          ./wingetcreate.exe submit --token "$WINGET_TOKEN" --prtitle "New version: Pondra.Pondra version $v" "out/winget/manifests/p/Pondra/Pondra/$v"
