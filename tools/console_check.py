@@ -318,21 +318,26 @@ def node_checks(browser, port, show):
     n = pg.cells().count()
     pg.cell(0).locator("textarea").click()
     p.keyboard.press("Escape")
+    # (each key waits for the page to show what the one before did: a slow runner drew a step late)
     p.keyboard.press("b")
-    added = pg.cells().count()
+    added = until(lambda: pg.cells().count(), n + 1)
     p.keyboard.press("d")
     p.keyboard.press("d")
-    deleted = pg.cells().count()
+    deleted = until(lambda: pg.cells().count(), n)
     p.keyboard.press("z")
-    back = pg.cells().count()
+    back = until(lambda: pg.cells().count(), n + 1)
     pg.cell(pg.cells().count() - 1).locator("textarea").click()
     p.keyboard.press("Escape")
     p.keyboard.press("b")  # (a cell below the last,)
+    until(lambda: pg.cells().count(), n + 2)
     p.keyboard.press("m")  # (for text)
+    text = pg.cell(pg.cells().count() - 1)
+    until(lambda: text.get_attribute("data-kind"), "markdown")
     p.keyboard.press("Enter")
     p.keyboard.insert_text("# Findings\nSome **bold** text.")
     p.keyboard.press("Shift+Enter")
-    rendered = pg.cell(pg.cells().count() - 2).locator(".md h1").inner_text()
+    rendered = until(lambda: text.locator(".md h1").inner_text(timeout=1000), "Findings")
+    keyed = [pg.cell(i).get_attribute("data-kind") for i in range(pg.cells().count())]
     typing = p.evaluate("document.activeElement.tagName")
     checks["keys: Esc, B adds a cell, D D deletes it, Z brings it back; M makes it text; Shift+Enter renders it and starts a new cell"] = \
         (added, deleted, back) == (n + 1, n, n + 1) and rendered == "Findings" and typing == "TEXTAREA" and pg.cells().count() == n + 3
@@ -442,7 +447,7 @@ def node_checks(browser, port, show):
         flow == ["pay", "→", "pay_ok", "→", "pay_sum"] and broke is True
     pg.shot(show, "console-flow.png")
     checks["every request went to the node; no page errors"] = pg.left() == [] and pg.errors == [] and len(pg.seen) > 10
-    info = {"named": [in_python, from_python], "figure": fig_said, "left": pg.left(), "errors": pg.errors, "sql_error": sql_error, "python_error": python_error, "kinds": kinds, "names": names, "types": types, "facts": facts,
+    info = {"named": [in_python, from_python], "keyed": keyed, "figure": fig_said, "left": pg.left(), "errors": pg.errors, "sql_error": sql_error, "python_error": python_error, "kinds": kinds, "names": names, "types": types, "facts": facts,
             "heads": heads, "rows": rows[:2], "m": m}
     pg.ctx.close()
     return checks, info

@@ -54,6 +54,15 @@ optimizing; performance first):
    sales `LEFT JOIN` returns, then dates and items): q80 3.4 → 0.08 s (DuckDB 0.07 s), q40 0.45 →
    0.03 s (0.02 s); TPC-DS's 99 18.2 → 15.2 s (DuckDB 7.6 s), all the same as DuckDB's.
    `tools/join_order.py` has both shapes, their plans checked.
+7. **Row estimates the order rule can trust** (`optimize::kept`, `joined`, `SemiJoinDown`): a
+   filter keeps its share by the column's distinct values and its span (a month of 200 years of
+   dates is a month, not a third), a join keeps only the key values both sides have, and a
+   subquery's semi join goes onto the smaller side before the order is chosen. 52 of TPC-DS's 99
+   plans change, none slower (each re-timed both ways, alternating): q98 0.056 → 0.036 s, q72
+   0.163 → 0.119 s, q50 0.076 → 0.057 s, q62, q58, q61 about a fifth faster; the 99 in one run
+   15.7 → 13.0 s against DuckDB's 7.8–8.1 s, measured side by side. TPC-H's 22 plans don't change.
+   q72 first went 10× slower: inventory joined to every date kept all 10,436 weeks, so a later
+   join on the week looked like a cut (unit tests in `optimize.rs`).
 
 **Then (2026-10-01, round 31, second part so far; 0.29.0): every kind of object alike, SQL and
 Python in one notebook** (the owner's list after the first part):

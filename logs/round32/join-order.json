@@ -1,14 +1,14 @@
 {
- "queries": 11,
+ "queries": 13,
  "rule_on": {
-  "well_s": 1.04,
-  "badly_s": 1.013,
-  "worst_ratio": 1.15
+  "well_s": 1.245,
+  "badly_s": 1.224,
+  "worst_ratio": 1.09
  },
  "rule_off": {
-  "well_s": 1.059,
-  "badly_s": 1.259,
-  "worst_ratio": 1.7
+  "well_s": 1.248,
+  "badly_s": 1.493,
+  "worst_ratio": 1.84
  },
  "slower_with_the_rule": {
   "well": [],
@@ -17,24 +17,24 @@
  "per_query": {
   "star": {
    "on": {
-    "well": 0.084,
+    "well": 0.086,
     "badly": 0.082,
     "same": true
    },
    "off": {
-    "well": 0.086,
-    "badly": 0.115,
+    "well": 0.083,
+    "badly": 0.112,
     "same": true
    }
   },
   "snowflake": {
    "on": {
-    "well": 0.083,
-    "badly": 0.08,
+    "well": 0.085,
+    "badly": 0.083,
     "same": true
    },
    "off": {
-    "well": 0.085,
+    "well": 0.083,
     "badly": 0.11,
     "same": true
    }
@@ -42,125 +42,166 @@
   "filtered dimension": {
    "on": {
     "well": 0.081,
-    "badly": 0.08,
+    "badly": 0.088,
     "same": true
    },
    "off": {
-    "well": 0.083,
-    "badly": 0.102,
+    "well": 0.077,
+    "badly": 0.1,
     "same": true
    }
   },
   "far from the filters": {
    "on": {
-    "well": 0.065,
-    "badly": 0.064,
+    "well": 0.069,
+    "badly": 0.07,
     "same": true
    },
    "off": {
     "well": 0.068,
-    "badly": 0.076,
+    "badly": 0.074,
+    "same": true
+   }
+  },
+  "under an exists": {
+   "on": {
+    "well": 0.139,
+    "badly": 0.131,
+    "same": true
+   },
+   "off": {
+    "well": 0.138,
+    "badly": 0.145,
+    "same": true
+   }
+  },
+  "past an outer join": {
+   "on": {
+    "well": 0.064,
+    "badly": 0.062,
+    "same": true
+   },
+   "off": {
+    "well": 0.094,
+    "badly": 0.093,
     "same": true
    }
   },
   "tpch-q2": {
    "on": {
-    "well": 0.039,
-    "badly": 0.045,
+    "well": 0.043,
+    "badly": 0.042,
     "same": true
    },
    "off": {
-    "well": 0.044,
-    "badly": 0.046,
+    "well": 0.039,
+    "badly": 0.039,
     "same": true
    }
   },
   "tpch-q3": {
    "on": {
-    "well": 0.084,
-    "badly": 0.081,
+    "well": 0.085,
+    "badly": 0.08,
     "same": true
    },
    "off": {
-    "well": 0.085,
-    "badly": 0.098,
+    "well": 0.079,
+    "badly": 0.104,
     "same": true
    }
   },
   "tpch-q5": {
    "on": {
-    "well": 0.106,
-    "badly": 0.104,
+    "well": 0.103,
+    "badly": 0.103,
     "same": true
    },
    "off": {
-    "well": 0.108,
-    "badly": 0.1,
+    "well": 0.105,
+    "badly": 0.096,
     "same": true
    }
   },
   "tpch-q9": {
    "on": {
-    "well": 0.161,
-    "badly": 0.154,
+    "well": 0.159,
+    "badly": 0.152,
     "same": true
    },
    "off": {
-    "well": 0.165,
-    "badly": 0.281,
+    "well": 0.159,
+    "badly": 0.293,
     "same": true
    }
   },
   "tpch-q10": {
    "on": {
-    "well": 0.134,
-    "badly": 0.123,
+    "well": 0.129,
+    "badly": 0.128,
     "same": true
    },
    "off": {
-    "well": 0.127,
-    "badly": 0.132,
+    "well": 0.121,
+    "badly": 0.133,
     "same": true
    }
   },
   "tpch-q11": {
    "on": {
-    "well": 0.033,
-    "badly": 0.03,
+    "well": 0.028,
+    "badly": 0.027,
     "same": true
    },
    "off": {
-    "well": 0.032,
-    "badly": 0.029,
+    "well": 0.03,
+    "badly": 0.028,
     "same": true
    }
   },
   "tpch-q18": {
    "on": {
-    "well": 0.17,
-    "badly": 0.17,
+    "well": 0.174,
+    "badly": 0.176,
     "same": true
    },
    "off": {
-    "well": 0.176,
-    "badly": 0.17,
+    "well": 0.172,
+    "badly": 0.166,
     "same": true
    }
   }
  },
- "far_from_the_filters": [
-  "orders",
-  "lineitem",
-  "part",
-  "supplier",
-  "nation"
- ],
+ "joined_from": {
+  "far from the filters": [
+   "part",
+   "lineitem",
+   "orders",
+   "supplier",
+   "nation"
+  ],
+  "under an exists": [
+   "nation",
+   "supplier",
+   "lineitem",
+   "orders",
+   "lineitem"
+  ],
+  "past an outer join": [
+   "nation",
+   "customer",
+   "orders",
+   "lineitem"
+  ]
+ },
  "checks": {
   "the badly written queries answer the same": true,
   "the badly written queries cost less with the rule": true,
   "no badly written query is slower with the rule": true,
   "no well written query is slower with the rule": true,
-  "far from the filters, written badly, starts from a filtered table": true
+  "far from the filters, written badly, starts from a filtered table": true,
+  "under an exists, written badly, starts from the nation": true,
+  "past an outer join, written badly, joins the returns last": true
  },
  "ok": true
 }

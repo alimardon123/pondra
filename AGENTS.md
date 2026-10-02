@@ -216,7 +216,11 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
 - **Join order from the catalog** (`optimize::JoinOrder`, `query::Pruned::statistics`): rows,
   bytes and each column's range (bounding its distinct values) become DataFusion statistics;
   inner joins are rebuilt greedily, from each input in turn, when that costs less than the order the query wrote,
-  which is costed the same way as the tree it is. `PONDRA_JOIN_ORDER=0` turns it off.
+  which is costed the same way as the tree it is. A filter keeps its share by distinct counts and
+  the columns' spans (`kept`: a month of dates, one year of 201), a join keeps only the key values
+  both sides have (`joined`), and a subquery's semi join goes onto the smaller side first
+  (`SemiJoinDown`). `PONDRA_JOIN_ORDER=0` turns the order off; `PONDRA_DEBUG_JOIN_ORDER=1` prints
+  each choice.
 - **Streams on their own time** (round 16, `views.rs`): the watermark of a window or session
   view is its source's newest event time less the lateness (`views::newest`: file ranges, then
   each new log segment once, in the leader's memory). Window views emit each window to
