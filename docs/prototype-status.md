@@ -114,6 +114,21 @@ optimizing; performance first):
    and one with no value yet. Found by reviewing the next change to the hot scan; 0.30 had it too.
    Where a bound can be left out, the aggregate now keeps the filter to itself.
    `harness.py minmax` checks seven shapes against a model, three times each.
+14. **A top-N of many columns decodes its Parquet files filtering as it goes**
+   (`optimize::WideTopN`): under a `LIMIT`ed sort, through projections, filters and exchanges, a
+   scan of 16 columns or more reads the filters' and the sort key's columns first and the others
+   only for the rows they keep (DataFusion's own row filter; the filters still run above). ClickBench
+   from files 11.39 → 10.17 s, q24 (`SELECT *` of a top-N) 2.26 → 0.80 s; TPC-H from files 2.20 →
+   2.15 s, no plan of it changed; every query that looked slower re-timed alone, both ways. Turned
+   on for every scan instead, the same row filter made q24 0.57 s but TPC-H from files a third
+   slower (q6 0.06 → 0.20 s), so only this shape gets it. Two other ideas were timed on and off in one
+   build and dropped: dropping rows at the in-memory scan by a top-N's bound (ClickBench's top-N by
+   time 0.006 → 0.04 s) and copying the in-memory columns into buffers of their own (TPC-H q12 from
+   memory 0.05 → 0.11 s).
+15. **A transaction's UPDATE then INSERT of one table commits:** COMMIT sent the table's rows as one
+   Arrow stream under its first batch's schema, and an UPDATE's rows carry `_created_at` where an
+   INSERT's don't, so the leader couldn't read it (found by the console thread). `harness.py begin`
+   checks an append and a keyed table.
 
 **Then (2026-10-01, round 31, second part so far; 0.29.0): every kind of object alike, SQL and
 Python in one notebook** (the owner's list after the first part):
