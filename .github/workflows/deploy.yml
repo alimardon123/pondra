@@ -81,9 +81,22 @@ jobs:
           helm lint --strict deploy/helm/pondra --set lake=s3://bucket/lake
           python3 tools/deploy_check.py chart helm
 
+  # The macOS and Windows packages, waited for on a Linux runner: macOS runners are the scarcest
+  # (the build's own macOS jobs queued for over an hour behind ones that sat waiting), so `service`
+  # takes one only once there is something for it to try.
+  waited:
+    if: github.event_name != 'pull_request' || (contains(github.event.pull_request.labels.*.name, 'full-ci') && (github.event.action != 'labeled' || github.event.label.name == 'full-ci'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 185
+    steps:
+      - uses: actions/checkout@v5
+      - run: for p in macos-arm64 windows-x64; do bash tools/ci_artifact.sh $p "$SHA"; done
+        env:
+          WAIT_MINUTES: 180
+
   service:
     name: pondra service (${{ matrix.platform }})
-    if: github.event_name != 'pull_request' || (contains(github.event.pull_request.labels.*.name, 'full-ci') && (github.event.action != 'labeled' || github.event.label.name == 'full-ci'))
+    needs: waited
     strategy:
       fail-fast: false
       matrix:
