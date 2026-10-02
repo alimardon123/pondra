@@ -61,6 +61,7 @@ mod replica;
 mod routines;
 mod scan;
 mod server;
+mod service;
 mod spill;
 mod sparksql;
 mod spmd;
@@ -243,6 +244,12 @@ enum Cmd {
         #[arg(long)]
         python: Option<String>,
     },
+    /// Keep a node running on this machine: started at boot and again if it stops (systemd,
+    /// launchd or Windows's service manager). `pondra service install --lake s3://bucket/lake`.
+    Service {
+        #[command(subcommand)]
+        cmd: service::Command,
+    },
     /// Print catalog entries whose keys start with `prefix` (t/ tables, s/ segments, p/ producers…).
     Catalog {
         #[arg(long, visible_alias = "lake")]
@@ -324,6 +331,9 @@ pub(crate) async fn stopped(stdin: bool) {
 static MAIN: std::sync::OnceLock<Arc<store::Lake>> = std::sync::OnceLock::new();
 
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("service") && std::env::args().nth(2).as_deref() == Some("run") {
+        service::run_from_manager(); // (what a service manager starts: becomes the node)
+    }
     // The work runs on threads with Linux's main stack, 8 MB: Windows gives its main thread 1 MB,
     // and planning (DataFusion's, recursive) and a session's making can need more; tokio's workers
     // get 2 MB, which procedures calling procedures 16 deep overflowed in the release build (only
@@ -678,6 +688,7 @@ async fn run() -> anyhow::Result<()> {
             let token = token.or_else(|| std::env::var("PONDRA_TOKEN").ok());
             print!("{}", shell::script(lake.as_deref().unwrap_or("lake"), url.as_deref(), token.as_deref(), body).await?);
         }
+        Cmd::Service { cmd } => service::command(cmd).await?,
         Cmd::Catalog { dir, prefix } => {
             let lake = store::Lake::open(&dir, false, false).await?;
             match prefix.starts_with("d/") {

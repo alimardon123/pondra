@@ -1,0 +1,80 @@
+{{- $full := include "pondra.fullname" . -}}
+{{- if .Values.serviceAccount.create }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "pondra.serviceAccount" . }}
+  labels: {{- include "pondra.labels" . | nindent 4 }}
+  {{- with .Values.serviceAccount.annotations }}
+  annotations: {{- toYaml . | nindent 4 }}
+  {{- end }}
+automountServiceAccountToken: false
+{{- end }}
+{{- if and .Values.podDisruptionBudget.enabled (gt (int (include "pondra.replicas" .)) 1) }}
+---
+# (one node away at a time: a drained machine never takes the cluster below what still leads)
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ $full }}
+  labels: {{- include "pondra.labels" . | nindent 4 }}
+spec:
+  maxUnavailable: {{ .Values.podDisruptionBudget.maxUnavailable }}
+  selector:
+    matchLabels: {{- include "pondra.selector" . | nindent 6 }}
+      app.kubernetes.io/component: node
+{{- end }}
+{{- if .Values.ingress.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $full }}
+  labels: {{- include "pondra.labels" . | nindent 4 }}
+  annotations:
+    {{- if .Values.tls.existingSecret }}
+    nginx.ingress.kubernetes.io/backend-protocol: HTTPS
+    {{- end }}
+    {{- with .Values.ingress.annotations }}{{ toYaml . | nindent 4 }}{{- end }}
+spec:
+  {{- with .Values.ingress.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  {{- with .Values.ingress.tls }}
+  tls: {{- toYaml . | nindent 4 }}
+  {{- end }}
+  rules:
+    {{- range .Values.ingress.hosts }}
+    - host: {{ . | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend: {service: {name: {{ $full }}, port: {name: http}}}
+    {{- end }}
+{{- end }}
+{{- if .Values.podMonitor.enabled }}
+---
+# (Prometheus Operator: every node's and reader's GET /metrics, with the read token)
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: {{ $full }}
+  labels: {{- include "pondra.labels" . | nindent 4 }}
+    {{- with .Values.podMonitor.labels }}{{ toYaml . | nindent 4 }}{{- end }}
+spec:
+  selector:
+    matchLabels: {{- include "pondra.selector" . | nindent 6 }}
+  podMetricsEndpoints:
+    - port: http
+      path: /metrics
+      interval: {{ .Values.podMonitor.interval }}
+      scheme: {{ include "pondra.scheme" . | lower }}
+      {{- if .Values.tls.existingSecret }}
+      tlsConfig: {insecureSkipVerify: true}
+      {{- end }}
+      {{- if .Values.auth.enabled }}
+      authorization:
+        credentials: {name: {{ include "pondra.tokensSecret" . }}, key: PONDRA_READ_TOKEN}
+      {{- end }}
+{{- end }}
