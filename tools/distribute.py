@@ -76,10 +76,6 @@ $linux
     bin.install "pondra"
   end
 
-  def post_install
-    (var/"pondra").mkpath
-  end
-
   # `brew services start pondra`: a node on a lake of its own, at http://127.0.0.1:8080
   service do
     run [opt_bin/"pondra", "serve", "--lake", var/"pondra/lake", "--addr", "127.0.0.1:8080"]
