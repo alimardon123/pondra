@@ -134,7 +134,7 @@ header{height:48px;display:flex;align-items:center;gap:10px;padding:0 10px 0 16p
 
 /* tabs, and the toolbar of the document in front */
 #tabbar{display:flex;align-items:flex-end;gap:2px;height:36px;padding:0 8px 0 0;background:var(--chrome);border-bottom:1px solid var(--line);flex:none;overflow:hidden;position:relative}
-.tlist{display:flex;align-items:flex-end;gap:2px;min-width:0;align-self:stretch}#rtabs .tlist{align-items:center}
+.tlist{display:flex;align-items:flex-end;gap:2px;min-width:0;align-self:stretch}#rtabs .tlist{align-items:center;overflow-x:auto;scrollbar-width:none}.rtab{flex:none;white-space:nowrap}
 /* (many tabs: each gives way to 96px, then the list scrolls, its + in reach) */
 #tabbar .tlist{overflow-x:auto;overflow-y:hidden;scrollbar-width:none}#tabbar .tlist::-webkit-scrollbar{display:none}
 #tabbar .tab{flex:none}
