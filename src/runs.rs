@@ -528,7 +528,7 @@ fn latest(e: &Every, after: u64, now: u64) -> Option<u64> {
 /// Does `sql` read one of these tables?
 pub fn mentioned(sql: &str) -> bool {
     let s = sql.to_lowercase();
-    ["pondra.runs", "pondra.routines", "pondra.tasks", "pondra.tables", "pondra.users", "pondra.grants", "pondra.audit", "pondra.flows", "pondra.expectations", "pondra.variables"].iter().any(|t| s.contains(t))
+    ["pondra.runs", "pondra.routines", "pondra.tasks", "pondra.tables", "pondra.users", "pondra.grants", "pondra.audit", "pondra.flows", "pondra.expectations", "pondra.variables", "pondra.dropped"].iter().any(|t| s.contains(t))
 }
 
 /// `pondra.routines`, `pondra.tasks` and `pondra.tables`, as they are now.
@@ -590,7 +590,21 @@ pub async fn tables(lake: &Lake) -> Result<Vec<(&'static str, Arc<dyn datafusion
         ("key", l(&|o| o.meta.as_ref().filter(|m| !m.key.is_empty()).map(|m| m.key.join(", ")))),
         ("definition", l(&|o| o.sql.clone())),
     ])?;
-    Ok(vec![("routines", mem(routines)?), ("tasks", mem(tasks)?), ("tables", mem(listed)?)])
+    // (dropped tables that UNDROP TABLE can still bring back: ADR-043)
+    let mut gone = crate::ddl::dropped(lake).await?;
+    if let Some(a) = crate::auth::limited() {
+        gone.retain(|(n, _)| a.may("select", n));
+    }
+    let g = |f: &dyn Fn(&crate::ddl::Dropped) -> u64| Arc::new(gone.iter().map(|(_, d)| Some(f(d) as i64)).collect::<Int64Array>()) as ArrayRef;
+    let when = |f: &dyn Fn(&crate::ddl::Dropped) -> u64| Arc::new(gone.iter().map(|(_, d)| Some(f(d) as i64 * 1000)).collect::<TimestampMicrosecondArray>().with_timezone("UTC")) as ArrayRef;
+    let dropped = RecordBatch::try_from_iter(vec![
+        ("name", Arc::new(gone.iter().map(|(n, _)| Some(n.clone())).collect::<StringArray>()) as ArrayRef),
+        ("dropped_at", when(&|d| d.at_ms)),
+        ("kept_until", when(&|d| d.at_ms + d.keep_ms)),
+        ("rows_in_files", g(&|d| d.meta.files.iter().map(|f| f.rows).sum::<u64>() + d.meta.sealed.as_ref().map_or(0, |s| s.rows))),
+        ("bytes_in_files", g(&|d| d.meta.files.iter().map(|f| f.bytes).sum::<u64>() + d.meta.sealed.as_ref().map_or(0, |s| s.bytes))),
+    ])?;
+    Ok(vec![("routines", mem(routines)?), ("tasks", mem(tasks)?), ("tables", mem(listed)?), ("dropped", mem(dropped)?)])
 }
 
 /// `pondra.runs` before any run: no rows, its columns.

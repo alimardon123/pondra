@@ -135,6 +135,10 @@ pub struct TableMeta {
     /// reads give each its `__start_at` and `__end_at` (`views::history_view`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history: Option<crate::views::History>,
+    /// `retention = '7 days'` (ADR-043): how long the table's past is kept; a dropped table can be
+    /// undropped that long (`ddl::KEEP_DROPPED_MS` when not set).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention_secs: Option<u64>,
 }
 
 impl TableMeta {

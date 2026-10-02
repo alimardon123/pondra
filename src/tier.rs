@@ -666,6 +666,11 @@ pub async fn expire(lake: &Lake, grace_ms: u64) -> Result<()> {
     let mut dead: Vec<String> = segs.iter().filter(|(_, s)| !s.path.is_empty()).map(|(_, s)| s.path.clone()).collect();
     let mut deletes: Vec<String> = segs.iter().map(|(k, _)| k.clone()).collect();
     deletes.extend(segs.iter().filter(|(_, s)| s.path.is_empty()).map(|(k, _)| data_key(k[2..].parse().unwrap_or(0))));
+    // Dropped tables kept past their time (ADR-043) go: their files are then orphans, swept a day on.
+    #[derive(serde::Deserialize)]
+    struct Kept { at_ms: u64, keep_ms: u64 }
+    let now = crate::log::now_ms();
+    deletes.extend(lake.cat.scan::<Kept>("dt/", "dt0").await?.into_iter().filter(|(_, d)| now >= d.at_ms + d.keep_ms).map(|(k, _)| k));
     let mut puts = vec![];
     for ((key, mut meta), idle) in tables.into_iter().zip(idle) {
         let (old, keep): (Vec<_>, Vec<_>) = meta.garbage.drain(..).partition(|(_, ts)| *ts < files_cutoff);
@@ -715,7 +720,11 @@ async fn collect_orphans(lake: &Lake) -> Result<()> {
     SWEPT.lock().unwrap().0 = now;
     use object_store::path::Path;
     let key = |raw: &str| Path::from(raw).to_string(); // (a path as the store lists it: a few characters escaped)
-    let tables = lake.cat.scan::<TableMeta>("t/", "t0").await?;
+    let mut tables = lake.cat.scan::<TableMeta>("t/", "t0").await?;
+    for (n, d) in crate::ddl::dropped(lake).await? {
+        tables.push((format!("t/{n}"), d.meta)); // (kept to be undropped: its files are in use)
+        tables.extend(d.deleted.map(|m| (format!("t/{}", crate::sys::deleted(&n)), m)));
+    }
     let folders: std::collections::HashMap<String, &TableMeta> = tables.iter().map(|(k, m)| (key(&format!("data/{}", m.folder(&k[2..]))), m)).collect();
     let listed = lake.store.list_with_delimiter(Some(&Path::from("data"))).await?; // (one request a thousand folders)
     let gone = listed.common_prefixes.iter().map(|p| p.to_string()).filter(|p| !folders.contains_key(p));

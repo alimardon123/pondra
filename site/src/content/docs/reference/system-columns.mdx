@@ -1,6 +1,6 @@
 ---
 title: System columns and tables
-description: The columns every row has, the change feed's change types, and the pondra.runs, pondra.routines, pondra.tasks, pondra.tables, pondra.flows and pondra.expectations tables.
+description: The columns every row has, the change feed's change types, and the pondra.runs, pondra.routines, pondra.tasks, pondra.tables, pondra.dropped, pondra.flows and pondra.expectations tables.
 sidebar:
   order: 16
 ---
@@ -231,6 +231,26 @@ SELECT name, kind, key FROM pondra.tables WHERE name IN ('sold', 'sold_by_item',
 
 ```sql
 SHOW MATERIALIZED VIEWS LIKE 'sold%';
+```
+
+## Dropped tables
+
+`pondra.dropped` lists the dropped tables that `UNDROP TABLE` can still bring back. A table is kept
+for a day after it is dropped, or for its [`retention`](/pondra/reference/table-options/).
+
+| Column | Meaning |
+|---|---|
+| `name` | its name; a name dropped twice has a row for each, and `UNDROP` takes the newest |
+| `dropped_at` | when it was dropped |
+| `kept_until` | when it goes for good, and its files with it |
+| `rows_in_files` | its rows (every row went to its files when it was dropped) |
+| `bytes_in_files` | the same, in bytes |
+
+```sql
+CREATE TABLE scratch (a BIGINT) WITH (retention = '2 hours');
+DROP TABLE scratch;
+SELECT name, kept_until - dropped_at AS kept FROM pondra.dropped WHERE name = 'scratch';
+DROP TABLE IF EXISTS scratch;
 ```
 
 ## Flows and expectations

@@ -120,9 +120,10 @@ A parameter goes with the request, in JSON. The Python and JavaScript clients do
 | Rename a table | `ALTER TABLE t RENAME TO u` |
 | Drop a column | `ALTER TABLE t DROP COLUMN [IF EXISTS] c` |
 | Widen a column | `ALTER TABLE t ALTER COLUMN c TYPE BIGINT` |
-| Change options | `ALTER TABLE t SET (publish = 'delta', cluster_by = 'user', ttl = 'ts:3600', order_by = 'ts')` |
+| Change options | `ALTER TABLE t SET (publish = 'delta', cluster_by = 'user', ttl = 'ts:3600', order_by = 'ts', retention = '7 days')` |
 | Empty | `TRUNCATE [TABLE] t` |
-| Drop | `DROP TABLE [IF EXISTS] t [, t2 …]` |
+| Drop | `DROP TABLE [IF EXISTS] t [, t2 …] [PURGE]` |
+| Bring back a dropped table | `UNDROP TABLE t` |
 
 A table of that name already there refuses `CREATE TABLE` (`42P07`, as in Postgres), whether it
 has the same columns or not; `IF NOT EXISTS` leaves it as it is, and `OR REPLACE` drops it and
@@ -156,6 +157,12 @@ and its Delta and Iceberg copies stay readable. A stored view reads a table by n
 it reads whatever takes the old name next. It is refused when the new name is taken, when a
 materialized view or a task follows the table, and for a materialized view.
 
+A dropped table is kept for a day, or for its `retention`, and `UNDROP TABLE t` brings it back as it
+was: every row, with its ids and versions. `pondra.dropped` lists the tables that can still come back
+(see [system tables](/pondra/reference/system-columns/#dropped-tables)). `UNDROP` takes the table
+dropped last under that name, and is refused while another table has the name: rename that one first.
+`DROP TABLE … PURGE`, or `retention = '0 seconds'`, keeps nothing.
+
 ```sql
 CREATE TABLE users (id BIGINT PRIMARY KEY, name VARCHAR, plan VARCHAR);
 CREATE TABLE clicks (ts TIMESTAMP, user VARCHAR, url VARCHAR) WITH (cluster_by = 'user', partition_by = 'day(ts)');
@@ -169,6 +176,8 @@ ALTER TABLE users DROP COLUMN years;
 ALTER TABLE clicks SET (publish = 'delta');
 ALTER TABLE big_orders RENAME TO large_orders;
 DROP TABLE large_orders;
+UNDROP TABLE large_orders;
+DROP TABLE large_orders PURGE;
 TRUNCATE accounts;
 ```
 

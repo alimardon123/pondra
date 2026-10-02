@@ -2,7 +2,8 @@
 # then carries on; a lake of a newer format is refused; a node drains before it stops (a leader on
 # a simulated R2 bucket too, where its followers always have a flush in flight); a cluster
 # of the newest release is upgraded to this build a node at a time under load
-# (tools/upgrade_check.py all). Every pull request to main, and by hand.
+# (tools/upgrade_check.py all); a table's past: UNDROP and retention (tools/history_check.py, ADR-043).
+# Every pull request to main, and by hand.
 name: upgrade
 
 on:
@@ -35,6 +36,10 @@ jobs:
           set -o pipefail   # (the check's exit status, not tee's)
           pip install -q $(grep -E '^(pyarrow|deltalake|pyiceberg|pyiceberg-core|psycopg\[binary\]|boto3|moto\[server\])==|^boto3$' tools/requirements.txt | sed 's/ *#.*//')
           python3 tools/upgrade_check.py all --new target/release/pondra --work "$RUNNER_TEMP/upgrade" | tee upgrade.json
+      - name: A table's past (UNDROP, retention)
+        run: |
+          set -o pipefail
+          python3 tools/history_check.py --new target/release/pondra --work "$RUNNER_TEMP/history" | tee history.json
       - name: A leader stopped on a bucket (simulated R2) hands over at once
         run: |
           set -o pipefail
@@ -49,6 +54,8 @@ jobs:
           path: |
             upgrade.json
             upgrade-s3.json
+            history.json
+            ${{ runner.temp }}/history/*.log
             ${{ runner.temp }}/upgrade/**/*.log
             ${{ runner.temp }}/upgrade-s3/**/*.log
           retention-days: 14
