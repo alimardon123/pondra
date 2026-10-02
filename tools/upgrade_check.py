@@ -91,8 +91,8 @@ def stop_all():
 class Node:
     """A node of `bin` serving `lake`, started and stopped as a scheduler would."""
 
-    def __init__(self, bin, lake, port, work, *flags, env=None):
-        self.bin, self.lake, self.port, self.flags, self.env = bin, lake, port, list(flags), env or {}
+    def __init__(self, bin, lake, port, work, *flags, env=None, tier_secs=0):
+        self.bin, self.lake, self.port, self.flags, self.env, self.tier = bin, lake, port, list(flags), env or {}, tier_secs
         self.log = os.path.join(work, f"node-{port}-{os.path.basename(lake)}.log")
         self.p = None
 
@@ -105,7 +105,7 @@ class Node:
             err.write(f"\n=== {self.bin} serve {self.lake} {' '.join(self.flags)}\n")
             err.flush()
             self.mark = err.tell()
-            self.p = subprocess.Popen([self.bin, "serve", "--dir", self.lake, "--addr", f"127.0.0.1:{self.port}", "--admin-token", TOKEN, "--tier-secs", "0", *self.flags],
+            self.p = subprocess.Popen([self.bin, "serve", "--dir", self.lake, "--addr", f"127.0.0.1:{self.port}", "--admin-token", TOKEN, "--tier-secs", str(self.tier), *self.flags],
                                       env=env, stdout=subprocess.DEVNULL, stderr=err, stdin=subprocess.DEVNULL)
         NODES.append(self)
         deadline = time.time() + 120
@@ -584,14 +584,16 @@ def format_check(new_bin, work, port):
     checks, info = {}, {}
     lake, later = os.path.join(work, "format-lake"), {"PONDRA_TEST_FORMAT": "2"}
     fmt = lambda n: n.get("/stats", timeout=5)["format"]
+    first = Node(new_bin, lake, port, work).start()  # makes the lake
+    checks["a lake this build makes is of its format from the start"] = until(lambda: fmt(first) == 1, 3, step=0.1)
+    first.q("CREATE TABLE t (x INT)")
+    first.q("INSERT INTO t VALUES (1), (2)")
+    first.stop()
     a = Node(new_bin, lake, port, work, env=later).start()  # leads, and knows format 2
     b = Node(new_bin, lake, port + 1, work).start()  # follows, and knows format 1
-    a.q("CREATE TABLE t (x INT)")
-    a.q("INSERT INTO t VALUES (1), (2)")
-    moved = until(lambda: fmt(a) == 1 and fmt(b) == 1, 40)
-    time.sleep(12)  # (another of the leader's looks: it must not go past what the follower knows)
+    time.sleep(22)  # (the leader's first two looks: it must not go past what the follower knows)
     info["with a node of each"] = {"leader's": fmt(a), "follower's": fmt(b), "releases": a.get("/stats")["releases"]}
-    checks["a lake moves on to the newest format every node knows, and no further"] = moved and fmt(a) == 1
+    checks["a lake moves on only to the newest format every node knows"] = fmt(a) == 1 and fmt(b) == 1
     b.stop()
     checks["…and on again once the node that didn't know the next one has gone"] = until(lambda: fmt(a) == 2, 40)
     refused = lambda x: x.p.poll() not in (None, 0) and "format 2" in x.said() and "run Pondra" in x.said()
@@ -630,9 +632,10 @@ class Load:
     live node until acknowledged), and readers asking the nodes whether each producer's batches are
     a prefix with no gaps. `nodes`: the live nodes, a list changed in place as they come and go."""
 
-    def __init__(self, nodes, table, producers=4, readers=2, size=20):
-        self.nodes, self.table, self.size = nodes, table, size
-        self.stop_, self.acked, self.waits, self.torn, self.reads = threading.Event(), collections.defaultdict(int), [], [], [0]
+    def __init__(self, nodes, table, producers=4, readers=2, size=20, rate=None):
+        self.nodes, self.table, self.size, self.rate = nodes, table, size, rate  # (rate: a producer's batches a second; None: flat out)
+        self.stop_, self.acked, self.torn, self.reads = threading.Event(), collections.defaultdict(int), [], [0]
+        self.waits = collections.deque(maxlen=500_000)  # (wait, sent at): the recent ones
         self.threads = [threading.Thread(target=self.write, args=(f"p{i}",), daemon=True) for i in range(producers)]
         self.threads += [threading.Thread(target=self.read, daemon=True) for _ in range(readers)]
 
@@ -654,13 +657,15 @@ class Load:
                     time.sleep(0.1)
             self.waits.append((time.time() - t0, t0))
             self.acked[producer] = seq
+            if self.rate:
+                time.sleep(max(0.0, t0 + 1 / self.rate - time.time()))
 
     def read(self):
         q = f"SELECT producer, count(*) AS n, count(DISTINCT seq) AS d, max(seq) AS mx FROM {self.table} GROUP BY producer"
         while not self.stop_.is_set():
             try:
                 for r in random.choice(self.nodes).q(q):
-                    if r["n"] != r["mx"] * self.size or r["d"] != r["mx"]:
+                    if (r["n"] != r["mx"] * self.size or r["d"] != r["mx"]) and len(self.torn) < 100:
                         self.torn.append(r)
                 self.reads[0] += 1
             except Exception:
@@ -677,7 +682,7 @@ class Load:
 
     def longest(self, since, until_=None):
         """The longest a batch waited for its acknowledgement, of those sent from `since` on (s)."""
-        w = [d for d, t0 in self.waits if t0 >= since and (until_ is None or t0 <= until_)]
+        w = [d for d, t0 in list(self.waits) if t0 >= since and (until_ is None or t0 <= until_)]
         return round(max(w, default=0), 2)
 
 

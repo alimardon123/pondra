@@ -1,0 +1,84 @@
+# A soak (C4, ADR-039): a cluster on one runner under steady ingest for hours, a node stopped or
+# killed now and then, its memory, log, commits and objects on a timeline (tools/soak.py). Runs
+# only when started by hand (Actions → soak → Run workflow). A runner's job lasts 6 hours at most,
+# so this is 5.5 hours at most; a 24-hour soak needs a machine of the owner's.
+#
+# storage r2 puts the lake in the bucket of cluster-bench.yml's secrets (R2_*). Mind the free tier:
+# the run's timeline says how many object writes a second it made (`object_writes_per_s`).
+name: soak
+
+on:
+  workflow_dispatch:
+    inputs:
+      hours:
+        description: "How long (5.5 at most)"
+        default: "5"
+      rate:
+        description: "Rows a second into the stream, in all"
+        default: "500"
+      nodes:
+        description: "Nodes in the cluster"
+        default: "3"
+      storage:
+        description: "local (the runner's disk) or r2 (the bucket)"
+        default: "local"
+      binary:
+        description: "ci (the build workflow's, for this commit: what ships) or build (from source)"
+        default: "ci"
+
+jobs:
+  soak:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355
+    permissions:
+      actions: read # (the build workflow's runs)
+      contents: read
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      AWS_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+      AWS_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT }}
+      AWS_REGION: auto
+      AWS_DEFAULT_REGION: auto
+      AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+      AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+      PONDRA_BUCKET: ${{ secrets.R2_BUCKET }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: The build workflow's binary, for this commit
+        if: inputs.binary == 'ci'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          run=$(bash tools/ci_build.sh "$GITHUB_SHA")
+          [ -n "$run" ] || { echo "::error::no passing build run for $GITHUB_SHA: wait for it, or use binary: build"; exit 1; }
+          gh run download "$run" --name pondra-linux-x64 --dir dl && tar -xzf dl/pondra-linux-x64.tar.gz pondra
+      - uses: dtolnay/rust-toolchain@stable
+        if: inputs.binary == 'build'
+      - name: Or build from source
+        if: inputs.binary == 'build'
+        run: cargo build --profile dist && cp target/dist/pondra pondra
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: The soak
+        env:
+          HOURS: ${{ inputs.hours }}
+          RATE: ${{ inputs.rate }}
+          NODES: ${{ inputs.nodes }}
+          STORAGE: ${{ inputs.storage }}
+        run: |
+          pip install -q $(grep -E '^boto3' tools/requirements.txt)
+          hours=$(python3 -c "import os; print(min(5.5, float(os.environ['HOURS'])))")
+          python3 tools/soak.py --hours "$hours" --rate "$RATE" --nodes "$NODES" --bin ./pondra \
+            $([ "$STORAGE" = r2 ] && echo --s3) --out soak.json --timeline soak-timeline.jsonl
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: soak
+          path: |
+            soak.json
+            soak-timeline.jsonl
+            /tmp/pondra-soak-*/*.log
+          retention-days: 30
+          if-no-files-found: ignore

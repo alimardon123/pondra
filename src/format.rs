@@ -59,11 +59,26 @@ impl std::fmt::Display for Newer {
 
 impl std::error::Error for Newer {}
 
+/// Did this process make its lake (open it to write with nothing ever committed there)?
+static MADE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Refuse a lake newer than this build; its format otherwise.
-pub async fn check(cat: &Catalog, url: &str) -> Result<u32> {
+pub async fn check(cat: &Catalog, url: &str, writer: bool) -> Result<u32> {
     let s = of(cat).await?;
     anyhow::ensure!(s.format <= known(), Newer { url: url.into(), stamp: (s.format, s.by) });
+    if writer && cat.get::<u64>("c").await?.is_none() {
+        MADE.store(true, std::sync::atomic::Ordering::Relaxed); // (every commit writes `c`)
+    }
     Ok(s.format)
+}
+
+/// Commit the lake's format.
+async fn set(lake: &Lake, to: u32) {
+    let stamp = Stamp { format: to, by: VERSION.into() };
+    match lake.cat.commit(vec![(KEY.into(), serde_json::to_vec(&stamp).expect("json"))], &[]).await {
+        Ok(()) => eprintln!("the lake is format {to} now (Pondra {VERSION})"),
+        Err(e) => eprintln!("the lake's format: {e:#}"),
+    }
 }
 
 /// The newest format a node knows, from what it said (`headers`; a node that says nothing is from
@@ -101,22 +116,20 @@ impl Drop for Streamed {
 
 /// Leader: move the lake on to the newest format every node knows, this one's at most. It first
 /// waits out two leases, so that every follower alive has said what it knows, then looks every
-/// 10 s. A migration, when a format needs one, goes here, in the commit that sets the format.
+/// 10 s. A lake this process made is of its format at once: no node older than it has read it.
+/// A migration, when a format needs one, goes here, in the commit that sets the format.
 pub fn raise(lake: Arc<Lake>, cluster: Arc<crate::cluster::Cluster>) {
     crate::panics::spawn(async move {
+        if MADE.load(std::sync::atomic::Ordering::Relaxed) {
+            return set(&lake, known()).await;
+        }
         tokio::time::sleep(Duration::from_secs(10)).await;
         loop {
             let streamed = STREAMS.lock().unwrap().keys().next().copied();
             let to = [Some(known()), cluster.least_known(), streamed].into_iter().flatten().min().unwrap_or_default();
             match of(&lake.cat).await {
                 Ok(s) if s.format >= known() => return,
-                Ok(s) if s.format < to => {
-                    let stamp = Stamp { format: to, by: VERSION.into() };
-                    match lake.cat.commit(vec![(KEY.into(), serde_json::to_vec(&stamp).expect("json"))], &[]).await {
-                        Ok(()) => eprintln!("the lake is format {to} now (Pondra {VERSION})"),
-                        Err(e) => eprintln!("the lake's format: {e:#}"),
-                    }
-                }
+                Ok(s) if s.format < to => set(&lake, to).await,
                 Ok(_) => {} // (an older node still runs: wait for it to go)
                 Err(e) => eprintln!("the lake's format: {e:#}"),
             }
@@ -132,7 +145,7 @@ pub fn watch(lake: Arc<Lake>) {
     crate::panics::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(1)).await;
-            if let Err(e) = check(&lake.cat, &lake.url).await {
+            if let Err(e) = check(&lake.cat, &lake.url, false).await {
                 if e.downcast_ref::<Newer>().is_some() {
                     eprintln!("stopping: {e}");
                     std::process::exit(1);

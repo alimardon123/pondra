@@ -1,0 +1,44 @@
+# Upgrades (ADR-039): every release's lake since 0.22 opens in this build and answers as it did,
+# then carries on; a lake of a newer format is refused; a node drains before it stops; a cluster
+# of the newest release is upgraded to this build a node at a time under load
+# (tools/upgrade_check.py all). Every pull request to main, and by hand.
+name: upgrade
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  upgrade:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: upgrade
+          cache-on-failure: true
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Build
+        run: cargo build --release
+      - name: Every release's lake, a newer format, drains, a rolling upgrade
+        env:
+          GITHUB_TOKEN: ${{ github.token }} # (the releases' list: a runner's shared address has a low limit)
+        run: |
+          pip install -q $(grep -E '^(pyarrow|deltalake|pyiceberg|pyiceberg-core)==' tools/requirements.txt)
+          python3 tools/upgrade_check.py all --new target/release/pondra --work "$RUNNER_TEMP/upgrade" | tee upgrade.json
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: upgrade
+          path: |
+            upgrade.json
+            ${{ runner.temp }}/upgrade/**/*.log
+          retention-days: 14
+          if-no-files-found: ignore

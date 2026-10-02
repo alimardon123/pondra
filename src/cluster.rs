@@ -99,8 +99,8 @@ impl Cluster {
         out
     }
 
-    /// Leader: does every live follower know `format`?
-    pub fn everyone_knows(&self, format: u32) -> bool { self.beats.lock().unwrap().values().all(|(t, _, f)| t.elapsed() >= LEASE || *f >= format) }
+    /// Leader: the newest format every live follower knows (None: no followers).
+    pub fn least_known(&self) -> Option<u32> { self.beats.lock().unwrap().values().filter(|(t, ..)| t.elapsed() < LEASE).map(|(_, _, f)| *f).min() }
 
     /// Has this node heard from the leader within the lease? Peers ask before taking over.
     pub fn leader_ok(&self) -> bool { self.is_leader() || self.last_ok.lock().unwrap().elapsed() < LEASE }

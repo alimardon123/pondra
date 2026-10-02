@@ -1,0 +1,183 @@
+---
+title: Upgrades and stopping nodes
+description: Stop a node without dropping its work, upgrade a cluster one node at a time while it serves, and know which releases can open a lake.
+sidebar:
+  order: 13.5
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components';
+
+A node told to stop finishes what it is doing first, and a leader hands over at once. That makes an
+upgrade simple: replace the nodes one at a time while the cluster keeps serving and taking writes.
+A new release opens every older release's lake, and an older release refuses a lake that a newer
+one has moved on.
+
+## Which release, which lake format
+
+Every node's `GET /stats` says its release (`version`) and the lake's format (`format`). The leader
+also lists the release of every live node (`releases`), which is how you follow an upgrade.
+
+Start two nodes on one lake to try it (any free ports will do):
+
+```bash
+mkdir -p upgrade
+for i in 1 2; do
+  nohup pondra serve upgrade/lake --addr 127.0.0.1:809$i > upgrade/node$i.log 2>&1 &
+  echo $! > upgrade/node$i.pid
+  sleep 1
+done
+until curl -sf localhost:8092/ready > /dev/null; do sleep 0.2; done
+```
+
+```python
+import requests
+
+def stats(port):
+    return requests.get(f"http://localhost:{port}/stats", timeout=5).json()
+
+[(stats(port)["role"], stats(port)["version"], stats(port)["format"]) for port in (8091, 8092)]
+```
+
+```text
+[('leader', '0.30.0', 1), ('follower', '0.30.0', 1)]
+```
+
+```python
+stats(8091)["releases"]
+```
+
+```text
+{'127.0.0.1:8091': '0.30.0', '127.0.0.1:8092': '0.30.0'}
+```
+
+## Stop a node without dropping work
+
+Send the node `SIGTERM` (what `systemctl stop`, `docker stop` and Kubernetes send), press Ctrl-C, or
+close the standard input of a node started with `--stop-with-stdin`. The node then drains:
+
+<Steps>
+
+1. `GET /ready` answers 503, so a load balancer stops sending it work. `GET /healthz` stays 200 for
+   as long as the process runs.
+2. It waits `PONDRA_DRAIN_GRACE_SECS` (0 by default) for the load balancer to notice.
+3. New requests get `503` with `Retry-After: 1`, and new Postgres connections are refused, so
+   clients try another node. Calls between the cluster's own nodes are still answered.
+4. Requests already running finish: HTTP requests and Postgres statements, for up to
+   `PONDRA_DRAIN_SECS` (30 by default).
+5. A leader waits until everything it acknowledged is in the bucket, saves its catalog and steps
+   down. Its followers see that and one leads at once, instead of waiting out the 5-second lease that
+   a leader that died needs.
+
+</Steps>
+
+A second signal stops the node at once. Kafka and Flight connections end when the process does, and
+their clients reconnect to another node as they do when a broker goes.
+
+Stop the leader of the two nodes above and the other leads straight away:
+
+```bash
+kill -TERM $(cat upgrade/node1.pid)
+until curl -sf localhost:8092/stats | grep -q '"role":"leader"'; do sleep 0.1; done
+```
+
+```python
+stats(8092)["role"], stats(8092)["term"]
+```
+
+```text
+('leader', 2)
+```
+
+## Health checks
+
+| Endpoint | Answers | Use it for |
+|---|---|---|
+| `GET /healthz` | 200 while the process runs | liveness: restart the node if it fails |
+| `GET /ready` | 200 when the node serves; 503 while it stops, or just after it started and is still catching up with its leader | readiness: send work only while it passes |
+
+Neither needs a token. Give a load balancer a few seconds to notice a node going with
+`PONDRA_DRAIN_GRACE_SECS`, and give the process manager longer than `PONDRA_DRAIN_SECS` before it
+kills the node (systemd waits 90 s by default, Kubernetes 30 s: set
+`terminationGracePeriodSeconds` above the drain).
+
+```bash
+curl -s localhost:8092/healthz; echo
+curl -s localhost:8092/ready; echo
+```
+
+```text
+ok
+ready
+```
+
+## Upgrade a cluster, one node at a time
+
+The cluster keeps serving and taking writes the whole time, with nodes of both releases in it.
+
+<Steps>
+
+1. Stop one follower (it drains), replace its binary, and start it again with the same options.
+2. Wait until its `GET /ready` answers 200.
+3. Do the same for each other follower, and for readers.
+4. Last, the leader: it steps down when it stops, and one of the upgraded followers leads at once.
+5. Check the leader's `GET /stats`: every node in `releases` says the new release.
+
+</Steps>
+
+On machines of their own that looks like this, however you run the binary:
+
+```bash norun
+sudo systemctl stop pondra          # drains, then stops
+sudo install pondra-0.31.0 /usr/local/bin/pondra
+sudo systemctl start pondra
+until curl -sf localhost:8080/ready; do sleep 1; done
+```
+
+On one machine, start the stopped node again (the new binary would go here) and wait for it:
+
+```bash
+nohup pondra serve upgrade/lake --addr 127.0.0.1:8091 > upgrade/node1.log 2>&1 &
+echo $! > upgrade/node1.pid
+until curl -sf localhost:8091/ready > /dev/null; do sleep 0.2; done
+```
+
+```python
+import time
+
+while len(stats(8092)["releases"]) < 2:  # (a node is listed from its first heartbeat)
+    time.sleep(0.2)
+stats(8091)["role"], sorted(stats(8092)["releases"])
+```
+
+```text
+('follower', ['127.0.0.1:8091', '127.0.0.1:8092'])
+```
+
+The leader can go first too; it only costs the older followers a few seconds more to take over.
+
+## Which releases can open a lake
+
+A lake has a format, a number in its catalog. A release opens every lake of its format or older:
+each release's tests open a lake made by every release since 0.22 and check every answer is the
+same. When a release brings a format change, the leader moves the lake to it only once every live
+node runs a release that knows it, so a mixed cluster never meets a lake one of its nodes can't
+read.
+
+An older release refuses a newer lake by name, before it reads anything:
+
+```text
+s3://my-bucket/lake is a lake of format 2, written by Pondra 1.2.0; this is Pondra 1.1.0, which knows formats up to 1: run Pondra 1.2.0 or newer here
+```
+
+So you can go back to the older release during an upgrade, but not once the lake has moved on.
+
+<Aside type="caution">
+Releases 0.30 and older don't know about formats, so they can't refuse a newer lake: don't start one
+on a lake a newer release has written. Kafka consumer groups whose offsets were saved by 0.26 or
+older start again from their reset policy after an upgrade (offsets are numbered differently since
+0.27).
+</Aside>
+
+```bash
+kill $(cat upgrade/node1.pid upgrade/node2.pid)
+```

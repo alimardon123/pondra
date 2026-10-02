@@ -86,6 +86,13 @@ A query is spread over the nodes of a cluster when that is cheaper than running 
 | `PONDRA_JOIN_ORDER` | `2` | how much cheaper a new join order must look before it is taken. `0` turns join reordering off |
 | `PONDRA_SQL_OPTIONS` | none | DataFusion settings, `key=value` separated by commas, applied after Pondra's own defaults |
 
+## Stopping
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `PONDRA_DRAIN_GRACE_SECS` | `0` | a node told to stop answers `GET /ready` with 503 for this long before it turns requests away, so a load balancer notices first ([upgrades](/pondra/guides/upgrades/#stop-a-node-without-dropping-work)) |
+| `PONDRA_DRAIN_SECS` | `30` | how long a stopping node waits for the requests already running to finish. Then a leader steps down and the node stops |
+
 ## Housekeeping
 
 | Variable | Default | Meaning |

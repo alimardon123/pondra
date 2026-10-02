@@ -502,12 +502,12 @@ async fn job(State(app): State<App>, Json(job): Json<crate::tier::Job>) -> Resul
 /// The commit stream (see `Frame`): who leads, then the recent frames, then every new one.
 async fn feed(State(app): State<App>, headers: axum::http::HeaderMap) -> Response {
     let cat = &app.lake.cat;
-    let older = crate::format::Older::of(crate::format::said(&headers).1); // (held while the stream is open: `format::raise`)
+    let streamed = crate::format::Streamed::to(crate::format::said(&headers).1); // (held while the stream is open: `format::raise`)
     let start = Frame::Start { term: app.cluster.leader.n, replicated: cat.replicas > 1 };
     let (recent, rx) = cat.subscribe();
     let live = futures::stream::unfold(rx, |mut rx| async move { rx.recv().await.ok().map(|f| (f, rx)) }); // a lagging follower reconnects
     let frames = futures::stream::iter([start].into_iter().chain(recent)).chain(live).map(move |f| {
-        let _ = &older;
+        let _ = &streamed;
         Ok::<_, std::io::Error>(f.encode())
     });
     Body::from_stream(frames).into_response()
