@@ -582,7 +582,7 @@ pub fn encode_ipc(batches: &[RecordBatch]) -> Result<Vec<u8>> {
     let opts = IpcWriteOptions::default().try_with_compression(Some(CompressionType::ZSTD))?;
     let mut w = StreamWriter::try_new_with_options(&mut buf, &batches[0].schema(), opts)?;
     for b in batches {
-        w.write(b)?;
+        w.write(&crate::query::compact(b.clone()))?;
     }
     w.finish()?;
     drop(w);

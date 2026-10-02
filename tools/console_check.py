@@ -342,21 +342,27 @@ def node_checks(browser, port, show):
     n = pg.cells().count()
     pg.cell(0).locator("textarea").click()
     p.keyboard.press("Escape")
+    # (each key waits for the page to show what the one before did: a slow runner drew a step late)
     p.keyboard.press("b")
-    added = pg.cells().count()
+    added = until(lambda: pg.cells().count(), n + 1)
     p.keyboard.press("d")
     p.keyboard.press("d")
-    deleted = pg.cells().count()
+    deleted = until(lambda: pg.cells().count(), n)
+    until(lambda: p.evaluate("document.activeElement === document.body || !!document.activeElement.closest('#docs')"), True)  # (keys reach the notebook)
     p.keyboard.press("z")
-    back = pg.cells().count()
+    back = until(lambda: pg.cells().count(), n + 1)
     pg.cell(pg.cells().count() - 1).locator("textarea").click()
     p.keyboard.press("Escape")
     p.keyboard.press("b")  # (a cell below the last,)
+    until(lambda: pg.cells().count(), n + 2)
     p.keyboard.press("m")  # (for text)
+    text = pg.cell(pg.cells().count() - 1)
+    until(lambda: text.get_attribute("data-kind"), "markdown")
     p.keyboard.press("Enter")
     p.keyboard.insert_text("# Findings\nSome **bold** text.")
     p.keyboard.press("Shift+Enter")
-    rendered = pg.cell(pg.cells().count() - 2).locator(".md h1").inner_text()
+    rendered = until(lambda: text.locator(".md h1").inner_text(timeout=1000), "Findings")
+    keyed = [pg.cell(i).get_attribute("data-kind") for i in range(pg.cells().count())]
     typing = p.evaluate("document.activeElement.tagName")
     checks["keys: Esc, B adds a cell, D D deletes it, Z brings it back; M makes it text; Shift+Enter renders it and starts a new cell"] = \
         (added, deleted, back) == (n + 1, n, n + 1) and rendered == "Findings" and typing == "TEXTAREA" and pg.cells().count() == n + 3
@@ -442,7 +448,7 @@ def node_checks(browser, port, show):
         p.goto(base + "/#notebook=report")  # (a link of before: the one file now)
         pg.cells().first.wait_for()
         pg.run(0, "SELECT id, name, born, amt FROM people ORDER BY id")
-        p.locator("#data .row", has_text="people").click()
+        p.locator("#data .row:not([data-kind=database])", has_text="people").click()
         p.wait_for_timeout(800)
         pg.shot(show, "console-light.png")
         dark = Page(browser, base + "/#notebook=report", "dark")
@@ -458,15 +464,15 @@ def node_checks(browser, port, show):
     sql(port, "CREATE MATERIALIZED VIEW pay_sum AS SELECT id % 2 AS odd, sum(amount) AS total, count(*) AS n FROM pay_ok GROUP BY 1")
     p.goto("about:blank")
     p.goto(base + "/")
-    p.locator("#data .row", has_text="pay_ok").first.wait_for(timeout=20000)
-    p.locator("#data .row", has_text="pay_ok").first.click()
+    p.locator("#data .row:not([data-kind=database])", has_text="pay_ok").first.wait_for(timeout=20000)
+    p.locator("#data .row:not([data-kind=database])", has_text="pay_ok").first.click()
     flow = until(lambda: p.locator("#details .flow").inner_text().split() if p.locator("#details .flow").count() else [], ["pay", "→", "pay_ok", "→", "pay_sum"])
     broke = until(lambda: "1 row broke it" in (p.locator("#details .pc", has_text="positive").inner_text() if p.locator("#details .pc", has_text="positive").count() else ""), True)
     checks["a materialized view's details draw its flow (pay → pay_ok → pay_sum) and its expectations, with the rows that broke each"] = \
         flow == ["pay", "→", "pay_ok", "→", "pay_sum"] and broke is True
     pg.shot(show, "console-flow.png")
     checks["every request went to the node; no page errors"] = pg.left() == [] and pg.errors == [] and len(pg.seen) > 10
-    info = {"named": [in_python, from_python], "figure": fig_said, "left": pg.left(), "errors": pg.errors, "sql_error": sql_error, "python_error": python_error, "kinds": kinds, "names": names, "types": types, "facts": facts,
+    info = {"named": [in_python, from_python], "keyed": keyed, "keys": {"n": n, "added": added, "deleted": deleted, "back": back, "rendered": str(rendered), "typing": typing}, "figure": fig_said, "left": pg.left(), "errors": pg.errors, "sql_error": sql_error, "python_error": python_error, "kinds": kinds, "names": names, "types": types, "facts": facts,
             "heads": heads, "rows": rows[:2], "m": m}
     pg.ctx.close()
     return checks, info
@@ -1266,7 +1272,7 @@ def layout_checks(browser, port, show):
     put(port, "notes/b.csv", b"k,v\n1,one\n")
     pg = Page(browser, base + "/")
     p = pg.p
-    ready = lambda: p.locator("#data .row", has_text="lx").wait_for(timeout=20000)
+    ready = lambda: p.locator("#data .row:not([data-kind=database])", has_text="lx").wait_for(timeout=20000)
     ready()
     p.locator('#left button[aria-label="Workspace: more"]').click()
     p.locator("#menu button", has_text="Move to the right pane").click()
@@ -1363,9 +1369,9 @@ def layout_checks(browser, port, show):
     if axe:
         for scheme in ("light", "dark"):
             a = Page(browser, base + "/", scheme)
-            a.p.locator("#data .row", has_text="lx").wait_for(timeout=20000)
+            a.p.locator("#data .row:not([data-kind=database])", has_text="lx").wait_for(timeout=20000)
             a.run(0, "SELECT id, 'one' AS s FROM lx")
-            a.p.locator("#data .row", has_text="lx").click()
+            a.p.locator("#data .row:not([data-kind=database])", has_text="lx").click()
             a.p.wait_for_timeout(400)
             found[scheme + " notebook"] = audit(a.p, axe)
             a.workspace("notes", "a.sql").click()
@@ -1472,13 +1478,13 @@ def token_checks(browser, port):
         harness.call(port, "POST", "/sql", b"CREATE TABLE secret_things AS SELECT 1 AS id", headers={"authorization": f"Bearer {token}"})
         pg = Page(browser, f"http://127.0.0.1:{port}/")
         asked = until(lambda: pg.p.locator("#tokenDlg").get_attribute("open") is not None, True)
-        hidden = pg.p.locator("#data .row", has_text="secret_things").count() == 0
+        hidden = pg.p.locator("#data .row:not([data-kind=database])", has_text="secret_things").count() == 0
         pg.p.fill("#tokenIn", token)
         pg.p.press("#tokenIn", "Enter")
-        shown = until(lambda: pg.p.locator("#data .row", has_text="secret_things").count(), 1)
+        shown = until(lambda: pg.p.locator("#data .row:not([data-kind=database])", has_text="secret_things").count(), 1)
         signed = pg.p.locator("#signin").inner_text() == "Signed in"
         pg.p.reload()
-        again = until(lambda: pg.p.locator("#data .row", has_text="secret_things").count(), 1)
+        again = until(lambda: pg.p.locator("#data .row:not([data-kind=database])", has_text="secret_things").count(), 1)
         def python_of(who):
             try:
                 return harness.call(port, "GET", "/sessions/some-page/python", headers={"authorization": f"Bearer {who}"})
@@ -1493,11 +1499,11 @@ def token_checks(browser, port):
         user.p.fill("#userIn", "cc_user")
         user.p.fill("#tokenIn", "cc-password-1")
         user.p.press("#tokenIn", "Enter")
-        as_user = until(lambda: (user.p.locator("#data .row", has_text="secret_things").count(), user.p.locator("#data .row", has_text="other_things").count(), user.p.locator("#signin").inner_text()), (1, 0, "cc_user"))
+        as_user = until(lambda: (user.p.locator("#data .row:not([data-kind=database])", has_text="secret_things").count(), user.p.locator("#data .row:not([data-kind=database])", has_text="other_things").count(), user.p.locator("#signin").inner_text()), (1, 0, "cc_user"))
         user.ctx.close()
         # The shell's link (#key=…): the page works as the shell does, asking nothing
         shell = Page(browser, f"http://127.0.0.1:{port}/#key={owner}")
-        as_shell = until(lambda: (shell.p.locator("#data .row", has_text="other_things").count(), shell.p.locator("#tokenDlg").get_attribute("open"), shell.p.evaluate("location.hash")), (1, None, ""))
+        as_shell = until(lambda: (shell.p.locator("#data .row:not([data-kind=database])", has_text="other_things").count(), shell.p.locator("#tokenDlg").get_attribute("open"), shell.p.evaluate("location.hash")), (1, None, ""))
         shell.ctx.close()
         checks = {"a user signs in with its name and password (a session) and sees only what it may read; the shell's link (#key=…) signs the page in as the shell, its key out of the address": as_user == (1, 0, "cc_user") and as_shell == (1, None, ""),
                   "with tokens, the page asks for one (Sign in), then shows the tables (and after a reload)": asked is True and hidden and shown == 1 and again == 1
@@ -1549,12 +1555,12 @@ def ext_checks(browser, port):
         served = call(port, "GET", "/console/ext/0.js").decode() == open(ext).read()
         pg = Page(browser, f"http://127.0.0.1:{port}/")
         p = pg.p
-        p.locator("#data .row", has_text="things").wait_for(timeout=20000)
+        p.locator("#data .row:not([data-kind=database])", has_text="things").wait_for(timeout=20000)
         section = p.locator("#historyTitle").text_content() == "History" and p.locator("#history .empty").count() == 1
         c = pg.run(0, "SELECT count(*) AS n FROM things")
         figure = c.locator(".ext-figure").inner_text().split("\n")
         history = until(lambda: p.locator("#history .row").all_inner_texts(), ["SELECT count(*) AS n FROM things"])
-        p.locator("#data .row", has_text="things").click()
+        p.locator("#data .row:not([data-kind=database])", has_text="things").click()
         p.locator("#rtabs .rtab", has_text="Sample").click()
         sample = until(lambda: p.locator("#sample pre.said").count(), 3)
         p.click("#moreBtn")

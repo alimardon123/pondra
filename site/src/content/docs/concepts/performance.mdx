@@ -14,7 +14,9 @@ Where another engine is ahead, the page says so.
 ## How the numbers were taken
 
 - **The machine:** one 2-vCPU virtual machine with 7 GB of memory (8 GB for the single-node TPC-H runs),
-  on local disk. Where a number says R2, it used a real Cloudflare R2 bucket. Every engine ran alone.
+  on local disk, except the latest single-machine numbers (round 32), which ran on 4 cores with 15 GB.
+  Where a number says R2, it used a real Cloudflare R2 bucket. Every engine ran alone. Each section
+  says which round measured it; Pondra has changed since the older ones.
 - **The engines:** Pondra, built on Apache DataFusion 55; Spark 4.2.0 (PySpark,
   `local[*]`); Flink 2.3.0 (PyFlink, a local MiniCluster, parallelism 2); DuckDB 1.5.5; Polars 1.44.2;
   Daft; and Bodo. Each single-node engine ran its own published TPC-H code.
@@ -25,7 +27,45 @@ Where another engine is ahead, the page says so.
 
 ## SQL on one machine
 
-### TPC-H against DuckDB, Polars, Daft and Bodo
+### Latest: TPC-H, ClickBench and TPC-DS against DuckDB 1.5 and 2.0's preview
+
+Measured on 2026-10-02 (round 32) on a 4-core machine with 15 GB of memory, so these times don't
+compare with the 2-vCPU tables further down. Best of three runs, with
+`tools/bench/singlenode.py` (`--suite clickbench` for ClickBench). Every answer was checked against
+DuckDB's. DuckDB 2.0 is a preview build (`2.0.0.dev2609250715`); its stable release is 1.5.
+
+**TPC-H, scale factor 1** (all 22 queries):
+
+| | From files (Parquet) | From memory |
+|---|---|---|
+| **Pondra** | 2.18 s | 1.22 s, hot columns |
+| DuckDB 1.5.5 | 2.19 s | **1.05 s**, its own tables |
+| DuckDB 2.0, preview | 1.98 s | **0.92 s**, its own tables |
+| Polars 1.44.2 | 1.92 s | |
+
+**ClickBench, the first 10 million rows of `hits`** (all 43 queries):
+
+| | From files (Parquet) | From memory |
+|---|---|---|
+| **Pondra** | 12.25 s | 8.22 s, hot columns |
+| DuckDB 1.5.5 | 11.11 s | **7.18 s**, its own tables |
+| DuckDB 2.0, preview | **10.89 s** | **6.22 s**, its own tables |
+
+Seven of ClickBench's answers differ from DuckDB's, and from DuckDB 2.0's to 1.5's too. They are ties
+that a `LIMIT` cuts through: `tools/bench/clickbench_ties.py` checks that each has the same row
+count, every row is a real group, and the sort key's values are the same.
+
+Reading Parquet, Pondra is level with DuckDB 1.5 on TPC-H and about 10% behind it on ClickBench.
+With the data in memory, DuckDB's own format is ahead: about 15% on both suites for 1.5, and more for
+2.0's preview. Pondra wins where the work is in the expressions: ClickBench's regular expression
+(q29) takes 1.49 s against DuckDB's 3.12 s. It loses most where a filter keeps a few rows of many
+columns. `SELECT *` of a top-N (q24) takes 1.27 s against 0.11 s, because DuckDB fetches the other
+columns only for the rows it keeps; that is round 32's next work.
+
+**TPC-DS, scale factor 1:** all 99 queries give DuckDB's answers (`tools/tpcds_check.py`). From
+memory, one run each, they take 13.4 s against DuckDB 1.5's 7.9 s on its own tables.
+
+### TPC-H against DuckDB, Polars, Daft and Bodo (round 12)
 
 All 22 queries at scale factor 1 (SF1: 6 million lineitem rows) and scale factor 10 (SF10: 60 million),
 on one 2-vCPU, 8 GB machine. Best of three runs. Pondra read its own lake, loaded with one `INSERT` per

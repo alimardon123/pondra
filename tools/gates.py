@@ -63,7 +63,7 @@ def slt(a, day):
     with open(os.path.join(LOGS, f"{day}-slt.txt"), "w") as log:
         sh(sys.executable, os.path.join(HERE, "slt_check.py"), "--slt", files, "--nodes", "1", "--out", out, stdout=log, stderr=subprocess.STDOUT, env={**os.environ, "PONDRA_BIN": a.bin})
     r = json.load(open(out))
-    return {"passed": r["passed"], "records": r["records"], "rate": r["pass_rate"]}
+    return {"passed": r["passed"], "records": r["records"], "rate": r["pass_rate"], "excepted": r.get("excepted", 0)}
 
 
 def tpch(a, day):
@@ -151,14 +151,15 @@ def drops(now, before):
 def row(day, binary, r, note):
     s, t, n = r.get("slt", {}), r.get("tpch", {}), r.get("nexmark", {})
     cell = lambda g, text: g.get("skipped") and f"skipped: {g['skipped']}" or g.get("failed") and "failed (see the log)" or (text if g else "not run")
-    slt_cell = cell(s, f"{s.get('passed', 0):,} of {s.get('records', 0):,} ({100 * s.get('rate', 0):.1f}%)")
+    # The share of all records, as the rows before named exceptions did; the rate without them after.
+    slt_cell = cell(s, f"{s.get('passed', 0):,} of {s.get('records', 0):,} ({100 * s.get('passed', 0) / max(s.get('records', 1), 1):.1f}%; {100 * s.get('rate', 0):.1f}% without {s.get('excepted', 0):,} named exceptions)")
     mem = cell(t, f"{t.get('memory_s')} s")
     files = cell(t, f"{t.get('files_s')} s")
     duck = cell(t, f"{t.get('duckdb_own_s')} s / {t.get('duckdb_files_s')} s")
     extra = [f"Nexmark 2M bids {n['secs']} s, answers {'right' if n['answers'] else 'WRONG'}"] if n.get("secs") else []
     pb = r.get("pgbench", {})
     if pb.get("runs"):
-        extra.append("pgbench " + ", ".join(f"{x['clients']}c {x['tps']} tps" for x in pb["runs"]) + f", balances {'right' if pb['balances_right'] else 'WRONG'}")
+        extra.append("pgbench " + ", ".join(f"{x['clients']}c {x['tps']:.0f} tps" for x in pb["runs"]) + f", balances {'right' if pb['balances_right'] else 'WRONG'}")
     if r.get("postgres", {}).get("details"):
         extra.append(f"vs Postgres: `{day}-postgres.txt`")
     return f"| {day} | {binary} | {slt_cell} | {mem} | {files} | {duck} | {'; '.join(extra + ([note] if note else [])) or '`tools/gates.py`'} |"

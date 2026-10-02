@@ -4,7 +4,7 @@
 and `tpcds_queries()`, written out as one Parquet file a table.
 
   tpcds_check.py prepare --data DIR [--sf 1] [--extension tpcds.duckdb_extension]
-  tpcds_check.py run --data DIR [--nodes 1|3] [--only 1,2,3] [--out logs/round31/tpcds.json]
+  tpcds_check.py run --data DIR [--nodes 1|3] [--only 1,2,3] [--hot] [--out logs/round31/tpcds.json]
 
 `prepare` needs DuckDB's extension: DuckDB fetches it itself (`INSTALL tpcds`), or give the file
 (https://extensions.duckdb.org/v<version>/<platform>/tpcds.duckdb_extension.gz, unzipped).
@@ -103,6 +103,14 @@ def run():
         if A.nodes > 1:
             while len(harness.call(A.port, "GET", "/stats")["nodes"]) < A.nodes:
                 time.sleep(0.1)
+        for run in range(2 if A.hot else 0):  # (hot.rs takes a file on its second read)
+            for n in names:
+                try:
+                    harness.call(A.port, "POST", "/sql", open(os.path.join(folder, n)).read().strip().rstrip(";").encode() + f" -- warm {run}".encode(), timeout=A.timeout)
+                except Exception:
+                    pass  # (its own run below says why)
+        if A.hot:
+            print(f"hot columns: {harness.hot_settled(A.port) / 1e9:.2f} GB", flush=True)
         for n in names:
             q = open(os.path.join(folder, n)).read().strip().rstrip(";")
             r = {}
@@ -151,5 +159,6 @@ if __name__ == "__main__":
     ap.add_argument("--port", type=int, default=9300)
     ap.add_argument("--timeout", type=int, default=600)
     ap.add_argument("--out")
+    ap.add_argument("--hot", action="store_true", help="answer from the hot columns: every query run twice first, the columns loaded")
     A = ap.parse_args()
     {"prepare": prepare, "run": run}[A.what]()

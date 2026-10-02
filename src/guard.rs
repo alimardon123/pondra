@@ -10,8 +10,8 @@
 //! would take here less a node's share of it — what it took here when last asked, else the bytes
 //! of the tables it reads at the rate this node has been reading them. Links are measured
 //! (`probe`), and so are those times (`ran_here`); until a query has run here, queries stay here.
-//! Once a query has run both ways, what each took decides (`ran_spread`): the model only guesses
-//! the first time. `?spread=1` spreads anyway.
+//! Once a query has run here and spread twice, what each took decides (`ran_spread`): the model
+//! only guesses until then. `?spread=1` spreads anyway.
 use datafusion::physical_plan::ExecutionPlan;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
@@ -108,6 +108,15 @@ fn note(times: &Times, sql: &str, took: Duration) {
 
 fn best(times: &Times, sql: &str) -> Option<f64> { times.lock().unwrap().get(&key(sql)).and_then(|t| t.iter().copied().reduce(f64::min)) }
 
+/// The best of a query's spread times, and how many there are. A first spread run is the other
+/// nodes' first sight of the query (their caches cold, the links just measured), so one alone
+/// says spreading is slower only if a second agrees: one slow first run kept a query on one node
+/// for good (the cluster bench's q1: 2.1 s spread the first time, 1.0 s after, so back to 2.4 s).
+fn spread_runs(sql: &str) -> (Option<f64>, usize) {
+    let mut all = SPREAD_TOOK.lock().unwrap();
+    all.get(&key(sql)).map_or((None, 0), |t| (t.iter().copied().reduce(f64::min), t.len()))
+}
+
 /// A query as the same query asked again (its comments and spacing aside).
 fn key(sql: &str) -> u64 {
     use std::hash::{Hash, Hasher};
@@ -122,8 +131,10 @@ fn key(sql: &str) -> u64 {
 pub fn pays(sql: &str, link: Link, moved: u64, steps: usize, bytes: u64, n: usize) -> bool {
     let known = best(&TOOK, sql);
     let learned = std::env::var_os("PONDRA_LINK").is_none(); // (a network pretended: the model alone)
-    if let (Some(here), Some(spread), true) = (known, best(&SPREAD_TOOK, sql), learned) {
-        return spread < here; // (it ran both ways: no need to guess)
+    if let (Some(here), (Some(spread), runs), true) = (known, spread_runs(sql), learned) {
+        if spread < here || runs >= 2 {
+            return spread < here; // (it ran both ways: no need to guess)
+        }
     }
     let Some(here) = known.or_else(|| HERE.lock().unwrap().map(|rate| bytes as f64 / rate)) else { return false };
     let saved = here * (1.0 - 1.0 / n as f64);

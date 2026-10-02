@@ -1,0 +1,245 @@
+{
+ "suite": "tpch",
+ "data": "/root/tpch/sf1-bench",
+ "sf": 1.0,
+ "cores": 4,
+ "runs": 3,
+ "info": {
+  "duckdb_load_s": 0.0,
+  "duckdb_version": "2.0.0.dev2609250715",
+  "duckdb_wall_s": 6.5,
+  "duckdb-native_load_s": 1.2,
+  "duckdb-native_version": "2.0.0.dev2609250715",
+  "duckdb-native_wall_s": 4.4
+ },
+ "results": {
+  "duckdb": {
+   "1": {
+    "hot": 0.117,
+    "first": 0.168,
+    "same_as_duckdb": true
+   },
+   "2": {
+    "hot": 0.038,
+    "first": 0.046,
+    "same_as_duckdb": true
+   },
+   "3": {
+    "hot": 0.09,
+    "first": 0.097,
+    "same_as_duckdb": true
+   },
+   "4": {
+    "hot": 0.056,
+    "first": 0.056,
+    "same_as_duckdb": true
+   },
+   "5": {
+    "hot": 0.099,
+    "first": 0.131,
+    "same_as_duckdb": true
+   },
+   "6": {
+    "hot": 0.056,
+    "first": 0.061,
+    "same_as_duckdb": true
+   },
+   "7": {
+    "hot": 0.098,
+    "first": 0.107,
+    "same_as_duckdb": true
+   },
+   "8": {
+    "hot": 0.106,
+    "first": 0.115,
+    "same_as_duckdb": true
+   },
+   "9": {
+    "hot": 0.19,
+    "first": 0.192,
+    "same_as_duckdb": true
+   },
+   "10": {
+    "hot": 0.154,
+    "first": 0.181,
+    "same_as_duckdb": true
+   },
+   "11": {
+    "hot": 0.017,
+    "first": 0.019,
+    "same_as_duckdb": true
+   },
+   "12": {
+    "hot": 0.061,
+    "first": 0.061,
+    "same_as_duckdb": true
+   },
+   "13": {
+    "hot": 0.137,
+    "first": 0.14,
+    "same_as_duckdb": true
+   },
+   "14": {
+    "hot": 0.07,
+    "first": 0.076,
+    "same_as_duckdb": true
+   },
+   "15": {
+    "hot": 0.054,
+    "first": 0.056,
+    "same_as_duckdb": true
+   },
+   "16": {
+    "hot": 0.036,
+    "first": 0.036,
+    "same_as_duckdb": true
+   },
+   "17": {
+    "hot": 0.099,
+    "first": 0.104,
+    "same_as_duckdb": true
+   },
+   "18": {
+    "hot": 0.116,
+    "first": 0.123,
+    "same_as_duckdb": true
+   },
+   "19": {
+    "hot": 0.085,
+    "first": 0.093,
+    "same_as_duckdb": true
+   },
+   "20": {
+    "hot": 0.076,
+    "first": 0.078,
+    "same_as_duckdb": true
+   },
+   "21": {
+    "hot": 0.169,
+    "first": 0.171,
+    "same_as_duckdb": true
+   },
+   "22": {
+    "hot": 0.058,
+    "first": 0.058,
+    "same_as_duckdb": true
+   },
+   "total_hot": 1.98,
+   "answers_match": 22
+  },
+  "duckdb-native": {
+   "1": {
+    "hot": 0.081,
+    "first": 0.115,
+    "same_as_duckdb": true
+   },
+   "2": {
+    "hot": 0.015,
+    "first": 0.02,
+    "same_as_duckdb": true
+   },
+   "3": {
+    "hot": 0.03,
+    "first": 0.03,
+    "same_as_duckdb": true
+   },
+   "4": {
+    "hot": 0.027,
+    "first": 0.031,
+    "same_as_duckdb": true
+   },
+   "5": {
+    "hot": 0.032,
+    "first": 0.034,
+    "same_as_duckdb": true
+   },
+   "6": {
+    "hot": 0.014,
+    "first": 0.014,
+    "same_as_duckdb": true
+   },
+   "7": {
+    "hot": 0.038,
+    "first": 0.038,
+    "same_as_duckdb": true
+   },
+   "8": {
+    "hot": 0.031,
+    "first": 0.032,
+    "same_as_duckdb": true
+   },
+   "9": {
+    "hot": 0.1,
+    "first": 0.1,
+    "same_as_duckdb": true
+   },
+   "10": {
+    "hot": 0.076,
+    "first": 0.082,
+    "same_as_duckdb": true
+   },
+   "11": {
+    "hot": 0.01,
+    "first": 0.011,
+    "same_as_duckdb": true
+   },
+   "12": {
+    "hot": 0.045,
+    "first": 0.045,
+    "same_as_duckdb": true
+   },
+   "13": {
+    "hot": 0.075,
+    "first": 0.075,
+    "same_as_duckdb": true
+   },
+   "14": {
+    "hot": 0.023,
+    "first": 0.029,
+    "same_as_duckdb": true
+   },
+   "15": {
+    "hot": 0.017,
+    "first": 0.017,
+    "same_as_duckdb": true
+   },
+   "16": {
+    "hot": 0.034,
+    "first": 0.037,
+    "same_as_duckdb": true
+   },
+   "17": {
+    "hot": 0.024,
+    "first": 0.025,
+    "same_as_duckdb": true
+   },
+   "18": {
+    "hot": 0.063,
+    "first": 0.067,
+    "same_as_duckdb": true
+   },
+   "19": {
+    "hot": 0.06,
+    "first": 0.06,
+    "same_as_duckdb": true
+   },
+   "20": {
+    "hot": 0.029,
+    "first": 0.03,
+    "same_as_duckdb": true
+   },
+   "21": {
+    "hot": 0.063,
+    "first": 0.066,
+    "same_as_duckdb": true
+   },
+   "22": {
+    "hot": 0.032,
+    "first": 0.033,
+    "same_as_duckdb": true
+   },
+   "total_hot": 0.92,
+   "answers_match": 22
+  }
+ }
+}

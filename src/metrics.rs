@@ -60,9 +60,11 @@ pub async fn render(app: &App) -> anyhow::Result<String> {
     let (reserved, limit) = app.lake.memory();
     metric("memory_limit_bytes", "gauge", "query memory limit (spills beyond it)", &one(limit as f64));
     metric("memory_reserved_bytes", "gauge", "query memory in use", &one(reserved as f64));
-    let (hot, hot_max) = app.lake.hot.usage();
+    let (hot, hot_max, loading) = app.lake.hot.usage();
     metric("hot_bytes", "gauge", "decoded columns kept in memory (hot.rs)", &one(hot as f64));
     metric("hot_limit_bytes", "gauge", "the most the hot columns may hold (PONDRA_HOT_GB)", &one(hot_max as f64));
+    metric("hot_loading_files", "gauge", "files whose columns are being decoded into memory, or wait to be", &one(loading as f64));
+    metric("hot_batches_skipped_total", "counter", "batches of hot columns scans skipped by their ranges", &one(crate::hot::SKIPPED.load(Relaxed) as f64));
     metric("resident_bytes", "gauge", "resident memory of the process", &one(crate::store::resident().unwrap_or(0) as f64));
     if let Some(seq) = &app.seq {
         metric("untiered_rows", "gauge", "rows in the log waiting to become Parquet", &one(app.lake.backlog.load(Relaxed) as f64));

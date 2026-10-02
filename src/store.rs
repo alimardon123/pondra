@@ -414,6 +414,7 @@ pub struct Lake {
     cached: Option<Arc<crate::cache::CachedStore>>, // what DataFusion reads the bucket through
     pub ids: crate::sys::Ids, // the row ids this process stamps rows with (a block reserved from the leader)
     pub caught: watch::Sender<bool>, // false while a node that just started catches up with its leader (`caught_up`)
+    sessions: Mutex<std::collections::HashMap<usize, datafusion::execution::SessionState>>, // (`session_with`'s, made once a partition count)
     me: std::sync::Weak<Lake>,
 }
 
@@ -587,7 +588,7 @@ impl Lake {
             },
         };
         let hwm = watch::Sender::new(cat.get::<u64>("n").await?.unwrap_or(1) - 1);
-        let lake = Arc::new_cyclic(|me| Lake { url, store, cat, hwm, backlog: Default::default(), rt, tail: Mutex::new((lru::LruCache::unbounded(), 0)), disk, groups: crate::serve::Groups::new(cache_mb() << 19), hot: Arc::new(crate::hot::Hot::new()), attached: Default::default(), ids: Default::default(), cached: cached_store, caught: watch::channel(true).0, me: me.clone() });
+        let lake = Arc::new_cyclic(|me| Lake { url, store, cat, hwm, backlog: Default::default(), rt, tail: Mutex::new((lru::LruCache::unbounded(), 0)), disk, groups: crate::serve::Groups::new(cache_mb() << 19), hot: Arc::new(crate::hot::Hot::new()), attached: Default::default(), ids: Default::default(), cached: cached_store, caught: watch::channel(true).0, sessions: Default::default(), me: me.clone() });
         lake.hot.watch(); // the decoded columns give memory back when the node needs it
         if let Some(writes) = lake.cat.unstarted.lock().unwrap().take() {
             crate::panics::spawn(lake.clone().commits(writes));
@@ -777,8 +778,23 @@ impl Lake {
     }
 
     /// A session with a fixed number of partitions: 1 for point lookups, where splitting the work
-    /// costs more than it saves and many queries run at once.
+    /// costs more than it saves and many queries run at once. Its functions, planners and rules
+    /// are the same for every query, so they are made once (`made`) and copied; each copy gets
+    /// catalogs of its own, so the tables a query registers are its alone.
     pub fn session_with(&self, partitions: usize) -> SessionContext {
+        let mut state = self.sessions.lock().unwrap().entry(partitions).or_insert_with(|| self.made(partitions).state()).clone();
+        let catalogs = datafusion::catalog::MemoryCatalogProviderList::new();
+        let catalog = datafusion::execution::SessionStateDefaults::default_catalog(state.config(), state.table_factories(), state.runtime_env());
+        datafusion::catalog::CatalogProviderList::register_catalog(&catalogs, state.config().options().catalog.default_catalog.clone(), Arc::new(catalog));
+        state.register_catalog_list(Arc::new(catalogs));
+        let ctx = SessionContext::new_with_state(state);
+        crate::files::register(&ctx, self.arc()); // files('…'), file_read(path) (here, not in what is kept: the lake would keep itself)
+        crate::ext::register_secrets(&ctx, self.arc()); // secrets()
+        ctx
+    }
+
+    /// A session made from nothing, with everything every query's session has.
+    fn made(&self, partitions: usize) -> SessionContext {
         let config = crate::optimize::config(SessionConfig::new().with_information_schema(true).with_target_partitions(partitions)
             .with_default_catalog_and_schema(crate::ddl::lake_name(self), crate::ddl::PUBLIC));
         let state = SessionStateBuilder::new().with_config(config).with_runtime_env(self.rt.clone()).with_default_features();
@@ -788,8 +804,6 @@ impl Lake {
         let mut ctx = SessionContext::new_with_state(state.build());
         spark(&ctx); // format_string, pmod, parse_url, …
         datafusion_functions_json::register_all(&mut ctx).expect("JSON functions register"); // json_get(…), ->, ->>
-        crate::files::register(&ctx, self.arc()); // files('…'), file_read(path)
-        crate::ext::register_secrets(&ctx, self.arc()); // secrets()
         crate::ai::register(&ctx); // ai_complete, ai_embed, cosine_similarity, …
         crate::asof::register(&ctx); // (ASOF JOIN's marker)
         crate::fsum::register(&ctx); // sum(DOUBLE): the same answer in any order
@@ -1593,8 +1607,11 @@ pub fn maybe_crash(point: &str) {
 /// merge what it spilled (DataFusion's default); on 4 cores with 50 MB the reserves took the
 /// budget and the merge above them failed, and smaller reserves can't merge at all.
 pub fn partitions() -> usize {
-    let cores = std::env::var("PONDRA_CORES").ok().and_then(|p| p.parse().ok()).unwrap_or_else(|| std::thread::available_parallelism().map_or(2, |n| n.get()));
-    cores.min(memory_limit() / (24 << 20)).max(2)
+    static PARTS: std::sync::OnceLock<usize> = std::sync::OnceLock::new(); // (every session asks: the cores are read from the cgroup's files)
+    *PARTS.get_or_init(|| {
+        let cores = std::env::var("PONDRA_CORES").ok().and_then(|p| p.parse().ok()).unwrap_or_else(|| std::thread::available_parallelism().map_or(2, |n| n.get()));
+        cores.min(memory_limit() / (24 << 20)).max(2)
+    })
 }
 
 /// Spark's functions whose names DataFusion doesn't have (`format_string`, `pmod`, `parse_url`,

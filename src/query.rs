@@ -448,7 +448,7 @@ pub async fn table_view(lake: &Lake, ctx: &SessionContext, name: &str, meta: &Ta
     if meta.key.is_empty() {
         let schema = read_schema(&meta.columns)?;
         let ranges = crate::manifest::ranges(name, &crate::manifest::list(lake, meta).await?, &meta.files, &schema);
-        return Ok(Arc::new(Pruned { lake: lake.arc(), name: name.into(), meta: meta.clone(), manifests: None, upto, at: upto, schema, share: None, ranges, range: None }));
+        return Ok(Arc::new(Pruned { lake: lake.arc(), name: name.into(), meta: meta.clone(), manifests: None, upto, at: upto, schema, share: None, ranges, range: None, stats: Default::default() }));
     }
     let df = raw(lake, ctx, name, meta, upto).await?;
     let aux = lake.session();
@@ -470,27 +470,15 @@ pub struct Pruned {
     pub share: Option<(u64, u64)>, // a distributed query's slice of it, and the whole table's (rows, bytes)
     pub ranges: Arc<crate::manifest::Stats>, // every column's min and max over the whole table
     pub range: Option<crate::ranges::Range>, // a distributed query's slice by a key's range: only its rows
+    pub stats: std::sync::OnceLock<datafusion::common::Statistics>, // (worked out once: the join order asks for them per input it costs)
 }
 
 impl std::fmt::Debug for Pruned {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { write!(f, "Pruned({})", self.name) }
 }
 
-#[async_trait::async_trait]
-impl TableProvider for Pruned {
-    fn schema(&self) -> SchemaRef { self.schema.clone() }
-    fn table_type(&self) -> datafusion::datasource::TableType { datafusion::datasource::TableType::Base }
-
-    fn supports_filters_pushdown(&self, filters: &[&Expr]) -> datafusion::error::Result<Vec<datafusion::logical_expr::TableProviderFilterPushDown>> {
-        Ok(vec![datafusion::logical_expr::TableProviderFilterPushDown::Inexact; filters.len()]) // (they choose files; rows are filtered above)
-    }
-
-    /// How big the table is, from what the catalog already knows: its files' row counts and bytes,
-    /// plus the sealed manifests' totals (`manifest.rs`), without opening a single footer. A
-    /// distributed query's slice reports the whole table (`share`), so every node orders its joins
-    /// alike. The log tail isn't counted — it is bounded by a tiering round, and this is for
-    /// choosing a join order (`optimize::JoinOrder`), not for counting rows.
-    fn statistics(&self) -> Option<datafusion::common::Statistics> {
+impl Pruned {
+    fn count(&self) -> datafusion::common::Statistics {
         use datafusion::common::stats::Precision;
         let (rows, bytes) = self.share.unwrap_or_else(|| {
             let sealed = self.meta.sealed.clone().unwrap_or_default();
@@ -513,7 +501,26 @@ impl TableProvider for Pruned {
                 (stats.column_statistics[i].min_value, stats.column_statistics[i].max_value) = (Precision::Inexact(lo), Precision::Inexact(hi));
             }
         }
-        Some(stats)
+        stats
+    }
+}
+
+#[async_trait::async_trait]
+impl TableProvider for Pruned {
+    fn schema(&self) -> SchemaRef { self.schema.clone() }
+    fn table_type(&self) -> datafusion::datasource::TableType { datafusion::datasource::TableType::Base }
+
+    fn supports_filters_pushdown(&self, filters: &[&Expr]) -> datafusion::error::Result<Vec<datafusion::logical_expr::TableProviderFilterPushDown>> {
+        Ok(vec![datafusion::logical_expr::TableProviderFilterPushDown::Inexact; filters.len()]) // (they choose files; rows are filtered above)
+    }
+
+    /// How big the table is, from what the catalog already knows: its files' row counts and bytes,
+    /// plus the sealed manifests' totals (`manifest.rs`), without opening a single footer. A
+    /// distributed query's slice reports the whole table (`share`), so every node orders its joins
+    /// alike. The log tail isn't counted — it is bounded by a tiering round, and this is for
+    /// choosing a join order (`optimize::JoinOrder`), not for counting rows.
+    fn statistics(&self) -> Option<datafusion::common::Statistics> {
+        Some(self.stats.get_or_init(|| self.count()).clone())
     }
 
     async fn scan(&self, _: &dyn datafusion::catalog::Session, projection: Option<&Vec<usize>>, filters: &[Expr], _: Option<usize>) -> datafusion::error::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
@@ -624,9 +631,31 @@ pub fn sent() -> bool { SENT.try_with(|t| !t.is_empty()).unwrap_or(false) }
 pub fn ipc(batches: &[RecordBatch]) -> Result<Vec<u8>> {
     let schema = batches.first().map(|b| b.schema()).unwrap_or_else(|| Arc::new(Schema::empty()));
     let mut w = datafusion::arrow::ipc::writer::StreamWriter::try_new(Vec::new(), &schema)?;
-    batches.iter().try_for_each(|b| w.write(b))?;
+    batches.iter().try_for_each(|b| w.write(&compact(b.clone())))?;
     w.finish()?;
     Ok(w.into_inner()?)
+}
+
+/// A batch whose string and binary views are copied out of buffers that mostly hold other rows'
+/// strings: those a filter, a limit or a slice kept a few rows of (decoded pages, a whole
+/// group's keys, the batch a shuffle cut it from). Arrow IPC sends every buffer a view points
+/// into, and a batch kept in memory holds them: a 10-row answer of ClickBench's was 220 MB.
+pub fn compact(b: RecordBatch) -> RecordBatch {
+    use datafusion::arrow::array::{Array, AsArray};
+    fn wasteful(held: &[datafusion::arrow::buffer::Buffer], used: usize) -> bool { held.iter().map(|b| b.len()).sum::<usize>() > 2 * used + (8 << 10) }
+    let lean = |c: &ArrayRef| -> Option<ArrayRef> {
+        match c.data_type() {
+            DataType::Utf8View => Some(c.as_string_view()).filter(|v| wasteful(v.data_buffers(), v.total_buffer_bytes_used())).map(|v| Arc::new(v.gc()) as ArrayRef),
+            DataType::BinaryView => Some(c.as_binary_view()).filter(|v| wasteful(v.data_buffers(), v.total_buffer_bytes_used())).map(|v| Arc::new(v.gc()) as ArrayRef),
+            _ => None,
+        }
+    };
+    let leaner: Vec<Option<ArrayRef>> = b.columns().iter().map(lean).collect();
+    if leaner.iter().all(Option::is_none) {
+        return b;
+    }
+    let columns = leaner.into_iter().zip(b.columns()).map(|(l, c)| l.unwrap_or_else(|| c.clone())).collect();
+    RecordBatch::try_new_with_options(b.schema(), columns, &datafusion::arrow::array::RecordBatchOptions::new().with_row_count(Some(b.num_rows()))).unwrap_or(b)
 }
 
 /// An Arrow IPC stream's batches (none for no bytes).
@@ -680,9 +709,10 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
     for s in crate::ddl::schemas(lake).await?.into_iter().filter(|s| s != PUBLIC) {
         default.register_schema(&s, Arc::new(MemorySchemaProvider::new()))?;
     }
-    for (key, meta) in lake.cat.scan::<TableMeta>("t/", "t0").await? {
+    for (key, raw) in lake.cat.scan_raw("t/", "t0").await? {
         let name = &key[2..];
         if name != except && !crate::sys::hidden(name) && (listing || mentions(&text, name)) {
+            let meta: TableMeta = serde_json::from_slice(&raw)?; // (only the tables it names: decoding every one was half of a small query's time)
             let touched = crate::txn::touched(name);
             let view = table_view(lake, &ctx, name, &if touched { crate::sys::with_sys(&meta) } else { sys(meta.clone()) }, upto).await?;
             let mut t = named(&ctx, view, &meta, names_deleted(&text))?;
@@ -721,11 +751,12 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
         if old {
             default.register_schema(&ns, Arc::new(MemorySchemaProvider::new()))?;
         }
-        for (key, meta) in other.cat.scan::<TableMeta>("t/", "t0").await? {
+        for (key, raw) in other.cat.scan_raw("t/", "t0").await? {
             let name = &key[2..];
             if crate::sys::hidden(name) || !(listing || mentions(&text, name)) {
                 continue;
             }
+            let meta: TableMeta = serde_json::from_slice(&raw)?;
             let view = named(&ctx, table_view(&other, &ctx, name, &sys(meta.clone()), None).await?, &meta, names_deleted(&text))?;
             let Some(view) = guarded(&format!("{ns}.{name}"), view, listing) else { continue }; // (a user's: granted ON ALL TABLES)
             let (s, t) = split(name);
@@ -792,18 +823,19 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
 /// The stored views (`CREATE VIEW`) `sql` names, and the ones they name; every one for a listing.
 pub async fn stored_views(lake: &Lake, sql: &str, listing: bool) -> Result<Vec<(String, String)>> {
     let (mut text, mut views) = (sql.to_string(), vec![]);
-    let mut stored = lake.cat.scan::<crate::ddl::StoredView>("q/", "q0").await?;
-    for (_, v) in stored.iter_mut() {
-        v.sql = crate::routines::expand(lake, &v.sql).await?; // (macros as they are now)
-    }
+    let stored = lake.cat.scan_raw("q/", "q0").await?; // (decoded and expanded only when named: every query paid for every view)
     loop {
-        let more: Vec<(String, String)> = stored.iter().map(|(k, v)| (k[2..].to_string(), v.sql.clone()))
-            .filter(|(n, _)| !views.iter().any(|(m, _): &(String, String)| m == n) && (listing || crate::ddl::mentions(&text, n))).collect();
+        let more: Vec<(&String, &bytes::Bytes)> = stored.iter()
+            .filter(|(k, _)| !views.iter().any(|(m, _): &(String, String)| m == &k[2..]) && (listing || crate::ddl::mentions(&text, &k[2..]))).collect();
         if more.is_empty() {
             return Ok(views);
         }
-        more.iter().for_each(|(_, s)| text.push_str(&format!(" {s}")));
-        views.extend(more);
+        for (k, raw) in more {
+            let v: crate::ddl::StoredView = serde_json::from_slice(raw)?;
+            let sql = crate::routines::expand(lake, &v.sql).await?; // (macros as they are now)
+            text.push_str(&format!(" {sql}"));
+            views.push((k[2..].to_string(), sql));
+        }
     }
 }
 
@@ -846,9 +878,8 @@ pub async fn register_views(ctx: &SessionContext, mut views: Vec<(String, String
 pub async fn over(lake: &Lake, source: &str, rows: Vec<RecordBatch>, sql: &str) -> Result<RecordBatch> {
     let meta: TableMeta = lake.cat.get::<TableMeta>(&table_key(source)).await?.ok_or_else(|| anyhow::anyhow!("no table {source}"))?.logical(); // (rows under SQL's names)
     let sql = crate::asof::rewrite(sql)?;
-    let df = over_ctx(lake, source, schema(&meta.columns)?, rows, &sql).await?.sql(&sql).await?;
-    let out = Arc::new(df.schema().as_arrow().clone());
-    Ok(datafusion::arrow::compute::concat_batches(&out, &df.collect().await?)?)
+    let (out, batches) = crate::fresh::run(lake, source, schema(&meta.columns)?, &rows, &sql, "", Ok).await?; // (its plan kept, when it reads the rows alone)
+    Ok(datafusion::arrow::compute::concat_batches(&out, &batches)?)
 }
 
 /// A session for `sql` where table `source` is just `rows`, as columns `s`.

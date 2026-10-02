@@ -965,10 +965,8 @@ async fn view_rows(lake: &Lake, v: &View, meta: &TableMeta, rows: &[RecordBatch]
     }
     let src: TableMeta = lake.cat.get::<TableMeta>(&table_key(&v.source)).await?.with_context(|| format!("no table {}", v.source))?.logical();
     let sql = crate::asof::rewrite(&v.sql)?;
-    let ctx = crate::query::over_ctx(lake, &v.source, schema(&[src.columns, ids.clone()].concat())?, rows.to_vec(), &sql).await?;
     let names: Vec<&str> = ids.iter().map(|(c, _)| c.as_str()).collect();
-    let plan = carry(ctx.sql(&sql).await?.into_unoptimized_plan(), &names)?;
-    let batches = ctx.execute_logical_plan(plan).await?.collect().await?;
+    let (_, batches) = crate::fresh::run(lake, &v.source, schema(&[src.columns, ids.clone()].concat())?, rows, &sql, &names.join(","), |p| carry(p, &names)).await?;
     let target = schema(&[meta.columns.clone(), ids].concat())?;
     let Some(first) = batches.first() else { return Ok(RecordBatch::new_empty(target)) };
     let all = datafusion::arrow::compute::concat_batches(&first.schema(), &batches)?;

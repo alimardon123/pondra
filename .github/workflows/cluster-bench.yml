@@ -85,7 +85,8 @@ jobs:
           # (256 MB for the driver to download: what the network between the machines carries)
           head -c 268435456 /dev/urandom > blob && (python3 -m http.server 8081 --bind "$ip" > /dev/null 2>&1 &)
           # (every line of the node's log with the time it was written)
-          ./pondra serve --dir "s3://$BUCKET/bench-${{ github.run_id }}" --addr "$ip:8080" --cache-gb 4 \
+          # (PONDRA_DEBUG_SPREAD: each query's spread decision in the log, the guard's estimate with it)
+          PONDRA_DEBUG_SPREAD=1 ./pondra serve --dir "s3://$BUCKET/bench-${{ github.run_id }}" --addr "$ip:8080" --cache-gb 4 \
             > >(perl -MPOSIX -pe 'BEGIN { $| = 1 } print strftime("%H:%M:%S ", gmtime)' > node.log) 2>&1 &
           pid=$!
           echo "$ip:8080" | aws s3 cp - "s3://$BUCKET/bench-results/${{ github.run_id }}/nodes/${{ matrix.i }}"
@@ -94,6 +95,9 @@ jobs:
           sleep 5
       - if: always()
         run: aws s3 cp node.log "s3://$BUCKET/bench-results/${{ github.run_id }}/logs/node-${{ matrix.i }}.log" || true
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with: { name: "node-${{ matrix.i }}-log", path: node.log, if-no-files-found: ignore }
 
   driver:
     needs: [binary]
