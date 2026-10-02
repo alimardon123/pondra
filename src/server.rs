@@ -597,7 +597,7 @@ impl App {
         match out {
             Ok((batches, spread)) => {
                 add(&SPREAD, spread as u64);
-                Ok(batches)
+                Ok(batches.into_iter().map(crate::query::compact).collect()) // (an answer kept or sent holds only its own strings)
             }
             Err(e) => {
                 add(&QUERY_ERRORS, 1);

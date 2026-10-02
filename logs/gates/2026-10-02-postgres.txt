@@ -1,0 +1,38 @@
+{
+ "lookup: Postgres (psycopg)": {
+  "p50_ms": 0.081,
+  "p99_ms": 0.18
+ },
+ "lookup: Pondra, its Postgres port (psycopg)": {
+  "p50_ms": 0.262,
+  "p99_ms": 0.853
+ },
+ "lookup: Pondra, GET /lookup (HTTP keep-alive)": {
+  "p50_ms": 0.14,
+  "p99_ms": 0.332
+ },
+ "insert one row: Postgres (fsync on)": {
+  "p50_ms": 0.232,
+  "p99_ms": 0.495
+ },
+ "insert one row: Pondra keyed table (Postgres port)": {
+  "p50_ms": 1.941,
+  "p99_ms": 4.185
+ },
+ "insert one row: Pondra append table (Postgres port)": {
+  "p50_ms": 1.929,
+  "p99_ms": 4.189
+ },
+ "load lineitem (6M rows)": {
+  "Postgres (CSV COPY, then VACUUM ANALYZE), s": 24.6,
+  "Pondra (CREATE TABLE AS from the Parquet file), s": 17.1
+ },
+ "TPC-H Q1 on SF1 lineitem, best of 3 (s)": {
+  "Postgres": 1.901,
+  "Pondra": 0.276
+ },
+ "TPC-H Q6 on SF1 lineitem, best of 3 (s)": {
+  "Postgres": 0.295,
+  "Pondra": 0.105
+ }
+}

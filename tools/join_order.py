@@ -37,15 +37,45 @@ SHAPES = {
                               where p_size = 15 and p_container = 'JUMBO BAG' and l_partkey = p_partkey
                                 and o_orderkey = l_orderkey and o_orderdate >= date '1995-01-01'""",
                            "part, lineitem, orders"),
+    # TPC-DS q72's shape: the smallest table (nation) leads only to the biggest one, and the filters
+    # are on the other side. Started from the smallest input alone, the order joined all of lineitem
+    # before any filter cut it (q72: 81 s against DuckDB's 1 s); started from every input in turn,
+    # it begins at a filtered table.
+    "far from the filters": ("""select count(*) as n from {}
+                                where s_nationkey = n_nationkey and l_suppkey = s_suppkey and o_orderkey = l_orderkey
+                                  and l_partkey = p_partkey and o_orderdate between date '1995-03-01' and date '1995-03-31'
+                                  and p_size = 15 and p_type like '%BRASS'""",
+                             "part, lineitem, orders, supplier, nation"),
+    # TPC-H q21's shape, written badly as q21 writes it: comma joins under an EXISTS. Their
+    # equalities were still conditions when the rule saw them (keys only a pass later, with
+    # projections between the joins by then), so the tree was left as written: q21 joined all of
+    # lineitem to its suppliers before the one nation cut them (0.18 s from memory; from the
+    # nation, 0.09 s). (Reversed, q21's list would start with a cross join.)
+    "under an exists": ('''select count(*) as n from {}
+                           where s_suppkey = l1.l_suppkey and o_orderkey = l1.l_orderkey and o_orderstatus = 'F'
+                             and l1.l_receiptdate > l1.l_commitdate and s_nationkey = n_nationkey and n_name = 'SAUDI ARABIA'
+                             and exists (select 1 from lineitem l2 where l2.l_orderkey = l1.l_orderkey and l2.l_suppkey <> l1.l_suppkey)''',
+                        "nation, supplier, lineitem l1, orders", "supplier, lineitem l1, orders, nation"),
+    # TPC-DS q40's and q80's shape: sales LEFT JOIN returns, then the dimensions that cut the sales.
+    # The inner joins read nothing of the returns, so they run first (`optimize::OuterLast`); as
+    # written, every sale met its returns before the dates kept a twelfth of them (q80: 3.4 s
+    # against DuckDB's 0.08 s), and the inner joins couldn't be ordered past the outer one.
+    "past an outer join": ("""select count(*) as n, count(l_orderkey) as returned from {}
+                              where o_custkey = c_custkey and c_nationkey = n_nationkey and n_name = 'KENYA'""",
+                           "nation, customer, orders left join lineitem on l_orderkey = o_orderkey and l_returnflag = 'R'"),
 }
+
+# The shapes whose plans are checked, written badly, with the rule on: the tables each is joined from.
+FIRST = {"far from the filters": ("orders", "part"), "under an exists": ("nation",), "past an outer join": ("orders", "customer", "nation")}
 
 
 def shapes():
-    """Each shape written well and written badly (the same query, tables named the other way)."""
+    """Each shape written well and written badly (the same query, tables named the other way
+    round unless the shape says how)."""
     out = {}
-    for name, (sql, order) in SHAPES.items():
+    for name, (sql, order, *badly) in SHAPES.items():
         names = [t.strip() for t in order.split(",")]
-        out[name] = (sql.format(", ".join(names)), sql.format(", ".join(reversed(names))))
+        out[name] = (sql.format(", ".join(names)), sql.format(badly[0] if badly else ", ".join(reversed(names))))
     return out
 
 
@@ -115,8 +145,16 @@ def measure(lake, queries, on):
             (well, answer) = timed(A.port, good, A.runs)
             (badly, other) = timed(A.port, bad, A.runs)
             out[q] = {"well": min(well, out[q]["well"]), "badly": min(badly, out[q]["badly"]), "same": out[q]["same"] and same(answer, other)}
+    if on:  # (at SF1 the order costs little either way, so it is checked, not timed)
+        for shape in FIRST:
+            plan = call(A.port, "POST", "/sql", ("EXPLAIN " + queries[shape][1]).encode())
+            logical = next(r["plan"] for r in plan if r["plan_type"] == "logical_plan")
+            JOINED[shape] = re.findall(r"TableScan: (\w+)", logical)
     node.kill()
     return out
+
+
+JOINED = {}  # (each FIRST shape written badly: its tables in the order its plan joins them)
 
 
 def main():
@@ -140,11 +178,14 @@ def main():
         "the badly written queries cost less with the rule": total(on, "badly") < total(off, "badly"),
         "no badly written query is slower with the rule": not slower("badly"),
         "no well written query is slower with the rule": not slower("well"),
+        "far from the filters, written badly, starts from a filtered table": JOINED["far from the filters"][0] in FIRST["far from the filters"],
+        "under an exists, written badly, starts from the nation": JOINED["under an exists"][0] in FIRST["under an exists"],
+        "past an outer join, written badly, joins the returns last": JOINED["past an outer join"][-1] == "lineitem",
     }
     out = {"queries": len(queries), "rule_on": {"well_s": total(on, "well"), "badly_s": total(on, "badly"), "worst_ratio": round(worst(on), 2)},
            "rule_off": {"well_s": total(off, "well"), "badly_s": total(off, "badly"), "worst_ratio": round(worst(off), 2)},
            "slower_with_the_rule": {k: slower(k) for k in ("well", "badly")},
-           "per_query": {q: {"on": on[q], "off": off[q]} for q in queries}, "checks": checks, "ok": all(checks.values())}
+           "per_query": {q: {"on": on[q], "off": off[q]} for q in queries}, "joined_from": JOINED, "checks": checks, "ok": all(checks.values())}
     print(json.dumps(out, indent=1))
     sys.exit(0 if out["ok"] else 1)
 

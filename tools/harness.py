@@ -52,6 +52,20 @@ def sql(port, q):
     return call(port, "POST", "/sql", q.encode())
 
 
+def hot_settled(port):
+    """Wait until the node's hot columns (hot.rs) stop loading: none being decoded and the bytes held
+    the same twice running (a file's columns load in the background after its second read)."""
+    import re
+    def now():
+        m = call(port, "GET", "/metrics")
+        return [float(g.group(1)) if (g := re.search(rb"\npondra_hot_%s (\S+)" % k, m)) else 0.0 for k in (b"bytes", b"loading_files")]
+    last = None
+    while (held := now()) != last or held[1]:
+        last = held
+        time.sleep(1)
+    return held[0]
+
+
 LAKES, NODES, S3 = [], [], []  # what this run made: removed when it exits, unless --keep or PONDRA_KEEP=1
 
 
@@ -2276,11 +2290,19 @@ def guard():
         q("SELECT p, count(*) AS n, sum(v) AS s FROM f GROUP BY p", fast.port)
     said = [l for l in open(fast.log) if l.startswith("spread: here")]
     few_mb = float(re.search(r"\(([\d.]+) MB", said[-1]).group(1)) if said else None
-    # A node on the real network (no PONDRA_LINK): once a query ran both ways, the faster way wins.
+    # A node on the real network (no PONDRA_LINK): one spread run slower than here is the others'
+    # first sight of the query (their caches cold), so the model decides again until a second
+    # agrees; once a query ran both ways, the faster way wins.
+    fresh = "SELECT count(*) AS n, sum(f.v * g.w) AS s FROM f JOIN g ON f.id = g.id"  # (the model spreads it: the tables meet by ranges of id)
+    timed = lambda s, spread: (lambda t: (q(s, third.port, spread), time.time() - t)[1])(time.time())
+    here = min(timed(fresh, 0) for _ in range(2))
+    slower = timed(fresh, 1) > here
+    before = spreads(third.port)
+    q(fresh, third.port)
+    again = (slower, spreads(third.port) > before)
     learned = []
     for s in queries:
-        timed = lambda spread: (lambda t: (q(s, third.port, spread), time.time() - t)[1])(time.time())
-        here, spread = min(timed(0) for _ in range(2)), min(timed(1) for _ in range(2))
+        here, spread = min(timed(s, 0) for _ in range(2)), min(timed(s, 1) for _ in range(2))
         before = spreads(third.port)
         q(s, third.port)
         went = spreads(third.port) > before
@@ -2293,10 +2315,11 @@ def guard():
               "over a slow network, queries that would shuffle stay on one node": not any(r["slow"][1] for r in out.values() if r["forced"][2]) and any(r["forced"][2] for r in out.values()),
               "over a fast one, they spread": all(r["fast"][1] for r in out.values()),
               "?spread=1 spreads anyway": all(r["forced"][1] for r in out.values()),
+              "one spread run slower than here doesn't decide alone: the query spreads again": again[1] or not again[0],
               "a query that ran both ways goes the faster way": all(learned),
               "an aggregate of a few groups is known to move little (under 1 MB)": few_mb is not None and few_mb < 1}
     ok = all(checks.values())
-    print(json.dumps({"guard": checks, "ok": ok, "learned": learned, "few_groups_mb": few_mb}, indent=1))
+    print(json.dumps({"guard": checks, "ok": ok, "learned": learned, "again": again, "few_groups_mb": few_mb}, indent=1))
     if not ok:
         print(out)
         sys.exit(1)
@@ -4468,6 +4491,58 @@ def across():
 
 # ---------------------------------------------------------------- round 26 (ADR-030)
 
+def hot():
+    """Hot columns skip the batches a filter rules out by their ranges, and only those (round 32):
+    a table whose rows came in time order, held in memory, asked for a range of its time, a top-N of
+    it, a key, and NULL-sensitive filters over a column with a batch of NULLs; every answer the
+    model's, and the range, the top-N and the key skip batches (`pondra_hot_batches_skipped_total`)."""
+    import re
+    lake = new_lake()
+    node = Node(lake, A.port, env={"PONDRA_HOT_GB": "1"}).start()
+    q = lambda s: sql(A.port, s)
+    skipped = lambda: float(g.group(1)) if (g := re.search(rb"\npondra_hot_batches_skipped_total (\S+)", call(A.port, "GET", "/metrics"))) else 0.0
+    t0, n = 1767225600, 200000
+    nulls = set(range(3 * 8192, 4 * 8192)) | set(range(0, n, 7))  # (a whole batch of NULLs, and every 7th row)
+    k = lambda v: None if v in nulls else v % 1000
+    q(f"CREATE TABLE ev AS SELECT value AS i, to_timestamp({t0} + value) AS ts, CASE WHEN value BETWEEN {3 * 8192} AND {4 * 8192 - 1} OR value % 7 = 0 THEN NULL ELSE value % 1000 END AS k, 'r' || value AS s FROM range(0, {n})")
+    ts = lambda v: f"to_timestamp({t0} + {v})"
+    asks = {  # what each asks, the model's answer, and whether it must skip batches
+        "a range of the time": (f"SELECT count(*) AS n, sum(i) AS s FROM ev WHERE ts >= {ts(100000)} AND ts < {ts(100500)}", [{"n": 500, "s": sum(range(100000, 100500))}], True),
+        "the oldest rows (a top-N)": ("SELECT i FROM ev ORDER BY ts LIMIT 3", [{"i": 0}, {"i": 1}, {"i": 2}], True),
+        "the newest rows (a top-N read from the end)": ("SELECT i FROM ev ORDER BY ts DESC LIMIT 3", [{"i": n - 1}, {"i": n - 2}, {"i": n - 3}], True),
+        "the newest rows a string filter keeps (read from the end, through the filter)": ("SELECT i FROM ev WHERE s LIKE 'r1%' ORDER BY ts DESC LIMIT 3", [{"i": 199999}, {"i": 199998}, {"i": 199997}], True),
+        "one key": ("SELECT count(*) AS n FROM ev WHERE i = 150000", [{"n": 1}], True),
+        "the oldest rows a string filter keeps (a top-N above a filter)": ("SELECT i FROM ev WHERE s LIKE 'r1%' ORDER BY ts LIMIT 3", [{"i": 1}, {"i": 10}, {"i": 11}], True),
+        "IS NULL": ("SELECT count(*) AS n FROM ev WHERE k IS NULL", [{"n": len(nulls)}], False),
+        "IS DISTINCT FROM": ("SELECT count(*) AS n FROM ev WHERE k IS DISTINCT FROM 5", [{"n": sum(1 for v in range(n) if k(v) != 5)}], False),
+        "NOT =": ("SELECT count(*) AS n FROM ev WHERE NOT (k = 5)", [{"n": sum(1 for v in range(n) if k(v) is not None and k(v) != 5)}], False),
+        "IN": ("SELECT count(*) AS n FROM ev WHERE k IN (1, 2, 3)", [{"n": sum(1 for v in range(n) if k(v) in (1, 2, 3))}], False),
+        "IS NOT NULL in the NULLs' batch": ("SELECT count(*) AS n FROM ev WHERE k IS NOT NULL AND i BETWEEN 24000 AND 33000", [{"n": sum(1 for v in range(24000, 33001) if k(v) is not None)}], False),
+        "coalesce(k, -1) = -1": ("SELECT count(*) AS n FROM ev WHERE coalesce(k, -1) = -1", [{"n": len(nulls)}], False),
+        "nothing": (f"SELECT count(*) AS n FROM ev WHERE i > {n}", [{"n": 0}], False),
+    }
+    checks, seen = {}, {}
+    try:
+        for run in range(2):  # (a file's columns load on its second read)
+            for ask, _, _ in asks.values():
+                q(ask + f" -- warm {run}")
+        held = hot_settled(A.port)
+        checks["the table's columns are in memory"] = held > 0
+        for name, (ask, want, skips) in asks.items():
+            before = skipped()
+            got = q(ask)
+            seen[name] = {"got": got if got != want else "== model", "skipped": skipped() - before}
+            checks[f"{name}: the model's answer" + (", batches skipped" if skips else "")] = got == want and (not skips or skipped() > before)
+    finally:
+        node.kill()
+        clean_up()
+    ok = all(checks.values())
+    print(json.dumps({"hot": checks, "seen": seen, "ok": ok}, indent=1))
+    if not ok:
+        sys.exit(1)
+    return f"hot: batches skipped by their ranges, answers the model's: all {len(checks)} checks pass"
+
+
 def found():
     """What writing the docs found (round 26), each fixed: a filtered materialized view follows
     UPDATE and DELETE; a producer's seq 0 refused (HTTP, Flight); a merge table that leaves a
@@ -4769,6 +4844,14 @@ def found():
     first = listing()
     call(port, "PUT", "/files/listed/a.txt", b"a")
     checks["files() after PUT /files lists the new file (never a remembered answer)"] = first == [] and listing() == ["files/listed/a.txt"]
+    # A few rows of a table's go with their own strings only, not the buffers of the batch they were
+    # cut from (round 32: a 10-row Arrow answer of ClickBench's was 220 MB), over HTTP and Flight.
+    q("CREATE TABLE wide AS SELECT value AS i, repeat('x', 200) || value AS s FROM range(0, 50000)")
+    few = "SELECT i, s FROM wide LIMIT 5"  # (a slice of a batch: 3.2 MB as Arrow before)
+    sent = call(port, "POST", "/sql?format=arrow", few.encode())
+    flown = client.do_get(fl.Ticket(json.dumps({"sql": few}))).read_all()
+    seen["few"] = (len(sent), flown.nbytes, flown.num_rows)
+    checks["a few rows of a table's, sent as Arrow (HTTP, Flight), carry only their own strings"] = len(sent) < 16 << 10 and flown.nbytes < 16 << 10 and flown.num_rows == 5
     node.kill(); locked.kill()
     ok = all(checks.values())
     print(json.dumps({"found": checks, "ok": ok}, indent=1))
@@ -5630,6 +5713,17 @@ def flows():
     checks["a history view (SCD type 2): every version with __start_at and __end_at, a late one in its place, a delete ending its key, on every node"] = \
         all(until(lambda: hist(p), want_h, secs=20) == want_h for p in ports) and q("SELECT id, city FROM customers_history WHERE __end_at IS NULL ORDER BY id") == [{"id": 1, "city": "rome"}, {"id": 3, "city": "lima"}]
     checks["refused: a materialized view of a history view (its ends are worked out as it is read)"] = "history view" in (err("CREATE MATERIALIZED VIEW h2 AS SELECT id FROM customers_history") or "")
+    # A view's or a task's plan is kept from one write to the next (src/fresh.rs, invariant 200):
+    # nothing of the write it was made for stays in it, neither its count (DataFusion answers a
+    # count(*) from exact statistics: 1, 1, 1, 1, 1) nor its time (now() is folded as it plans).
+    q("CREATE TABLE ticks (id BIGINT, v BIGINT)")
+    call(A.port, "POST", "/tasks/counted", json.dumps({"source": "ticks", "target": "counted", "sql": "SELECT count(*) AS n FROM ticks"}).encode())
+    q("CREATE MATERIALIZED VIEW stamped AS SELECT id, now() AS seen FROM ticks")
+    for k in range(1, 6):
+        q("INSERT INTO ticks VALUES " + ", ".join(f"({i}, 1)" for i in range(k)))  # (one node: each keeps its own plans)
+        time.sleep(0.3)
+    checks["a kept plan keeps no write's count: a task counting each write's new rows adds up to every row"] = until(lambda: q("SELECT sum(n) AS n FROM counted")[0].get("n"), 15, secs=20) == 15
+    checks["…nor its time: now() in a view differs from write to write"] = q("SELECT count(DISTINCT seen) AS t FROM stamped")[0]["t"] > 1
     info = {"sent": sent_all, "refused": (refused or "")[:200], "said": {k: (v or "")[:160] for k, v in say.items()}, "expectations": ex}
     a.kill(); b.kill()
     ok = all(checks.values())
@@ -6264,7 +6358,7 @@ finally {{ await db.close?.(); }}"""
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    out = {t.__name__: t() for t in (upsert, deal, outside, clouds, kafkas, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, found, renames, workspace, server, scale, flight, users, secrets, safety, versions, stopped, flows, begin, doors, objects, sparksql, variables, reader, crash)}
+    out = {t.__name__: t() for t in (upsert, deal, outside, clouds, kafkas, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, found, renames, workspace, server, scale, flight, users, secrets, safety, versions, stopped, flows, begin, doors, objects, sparksql, variables, hot, reader, crash)}
     A.secs = min(A.secs, 20)
     out["load"] = load()
     print(json.dumps(out, indent=1))
@@ -6272,7 +6366,7 @@ def all_tests():
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "found", "renames", "workspace", "server", "scale", "flight", "users", "secrets", "safety", "versions", "stopped", "flows", "begin", "doors", "objects", "sparksql", "variables", "load", "all"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "found", "renames", "workspace", "server", "scale", "flight", "users", "secrets", "safety", "versions", "stopped", "flows", "begin", "doors", "objects", "sparksql", "variables", "hot", "load", "all"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -6283,4 +6377,4 @@ if __name__ == "__main__":
     ap.add_argument("--secs", type=int, default=30)
     ap.add_argument("--flush-ms", type=int, default=250)
     A = ap.parse_args()
-    {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "safety": safety, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "objects": objects, "sparksql": sparksql, "variables": variables, "load": load, "all": all_tests}[A.mode]()
+    {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "safety": safety, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "objects": objects, "sparksql": sparksql, "variables": variables, "hot": hot, "load": load, "all": all_tests}[A.mode]()
