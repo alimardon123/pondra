@@ -46,6 +46,14 @@ optimizing; performance first):
 5. **CI the same every push:** `harness.py functions`' killed-worker check waits for the workers
    it killed to be gone (the next query could take one the node still saw running); fuzzed nodes
    run in their test folder (`ATTACH 'nope'` had left two lakes in the repository).
+6. **Joins the order rule couldn't see** (invariant 201): under an `EXISTS` or `IN`, comma joins'
+   equalities were still conditions when the rule looked (keys only a pass later, with projections
+   between the joins by then), so TPC-H q21 joined all of lineitem to its suppliers before its one
+   nation cut them: from memory 0.18 → 0.09 s, from files 0.23 → 0.19 s; q17 0.065 → 0.047 s. And
+   an inner join that reads nothing of a `LEFT JOIN`'s padded side now runs before it (TPC-DS's
+   sales `LEFT JOIN` returns, then dates and items): q80 3.4 → 0.08 s (DuckDB 0.07 s), q40 0.45 →
+   0.03 s (0.02 s); TPC-DS's 99 18.2 → 15.2 s (DuckDB 7.6 s), all the same as DuckDB's.
+   `tools/join_order.py` has both shapes, their plans checked.
 
 **Then (2026-10-01, round 31, second part so far; 0.29.0): every kind of object alike, SQL and
 Python in one notebook** (the owner's list after the first part):

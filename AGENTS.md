@@ -1287,6 +1287,15 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    recursive query's plan again, with that write's rows in the leaf. `harness.py flows`: "a kept
    plan keeps no write's count…" (1, 1, 1, 1, 1 with exact statistics) and "…nor its time" fail
    without them.
+201. **An inner join runs before a LEFT JOIN only when it reads nothing of the LEFT JOIN's padded side**
+   (`optimize::OuterLast`): `(a LEFT JOIN b) JOIN c ON a.x = c.y` is `(a JOIN c) LEFT JOIN b`, never
+   when the inner join's keys or condition name a column of `b` (its NULL-padded rows would meet
+   it), and never past an as-of join (`asof::marked`: its plan has a shape of its own). The order
+   rule then sees the inner joins together; it counts an equality in a join's condition as a key
+   (`optimize::equalities`), since filters pushed into joins become keys only a pass later, when
+   projections already sit between them. `join_order.py`: "past an outer join, written badly, joins
+   the returns last" and "under an exists, written badly, starts from the nation" fail without
+   them; `tpcds_check.py`: 99 of 99 the same as DuckDB.
 
 ## Tests: run these before and after any change
 

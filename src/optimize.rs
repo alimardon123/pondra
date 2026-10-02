@@ -42,6 +42,7 @@ pub fn rules() -> Vec<Arc<dyn OptimizerRule + Send + Sync>> {
     rules.insert(at, Arc::new(GroupOnlyJoined));
     if std::env::var("PONDRA_JOIN_ORDER").as_deref() != Ok("0") {
         rules.insert(at, Arc::new(JoinOrder)); // (after the filters are down: they say how big each input is)
+        rules.insert(at, Arc::new(OuterLast)); // (just before: the inner joins it gathers are its to order)
     }
     rules.insert(0, Arc::new(Seconds)); // (before a literal is folded into a timestamp)
     rules.push(Arc::new(CheapFirst));
@@ -537,6 +538,64 @@ impl OptimizerRule for SemiJoinDown {
     }
 }
 
+/// An inner join that reads nothing of a LEFT JOIN's padded side runs before it: `(a LEFT JOIN b)
+/// JOIN c ON a.x = c.y` is `(a JOIN c) LEFT JOIN b`, and the inner joins are the ones that cut rows.
+/// As written, TPC-DS q80 matched every store sale to its returns before one month of dates kept a
+/// twelfth of them (3.4 s; DuckDB 0.08 s), and `JoinOrder` couldn't see past the outer join to
+/// order the inner ones.
+#[derive(Debug)]
+struct OuterLast;
+
+impl OptimizerRule for OuterLast {
+    fn name(&self) -> &str {
+        "outer_last"
+    }
+
+    fn apply_order(&self) -> Option<ApplyOrder> {
+        Some(ApplyOrder::TopDown)
+    }
+
+    fn rewrite(&self, plan: LogicalPlan, _: &dyn OptimizerConfig) -> Result<Transformed<LogicalPlan>> {
+        let LogicalPlan::Join(j) = &plan else { return Ok(Transformed::no(plan)) };
+        if j.join_type != JoinType::Inner {
+            return Ok(Transformed::no(plan));
+        }
+        let was = Arc::new(plan);
+        let now = lifted(was.clone())?;
+        if Arc::ptr_eq(&now, &was) {
+            drop(now);
+            return Ok(Transformed::no(Arc::unwrap_or_clone(was)));
+        }
+        let schema = Arc::clone(was.schema());
+        Ok(Transformed::yes(LogicalPlan::Projection(Projection::new_from_schema(now, schema)))) // (the columns as the query had them)
+    }
+}
+
+/// `plan`'s inner joins with every LEFT JOIN among their inputs lifted above the ones that read
+/// none of its padded side, its columns in another order; `plan` itself when there is none. (An
+/// as-of join stays where it is: its plan has a shape of its own.)
+fn lifted(plan: Arc<LogicalPlan>) -> Result<Arc<LogicalPlan>> {
+    let LogicalPlan::Join(j) = plan.as_ref() else { return Ok(plan) };
+    if j.join_type != JoinType::Inner {
+        return Ok(plan);
+    }
+    let (left, right) = (lifted(j.left.clone())?, lifted(j.right.clone())?);
+    let used: Vec<&Column> = j.on.iter().flat_map(|(l, r)| [l, r]).chain(&j.filter).flat_map(|e| e.column_refs()).collect();
+    let padded = |p: &LogicalPlan| match p {
+        LogicalPlan::Join(o) if o.join_type == JoinType::Left && !crate::asof::marked(o) && !used.iter().any(|c| o.right.schema().has_column(c)) => Some(o.clone()),
+        _ => None,
+    };
+    let inner = |l, r| Ok::<_, datafusion::error::DataFusionError>(Arc::new(LogicalPlan::Join(Join::try_new(l, r, j.on.clone(), j.filter.clone(), JoinType::Inner, j.join_constraint, j.null_equality, j.null_aware)?)));
+    let (kept, outer) = match (padded(&left), padded(&right)) {
+        (Some(o), _) => (inner(o.left.clone(), right)?, o),
+        (_, Some(o)) => (inner(left, o.left.clone())?, o),
+        _ if Arc::ptr_eq(&left, &j.left) && Arc::ptr_eq(&right, &j.right) => return Ok(plan),
+        _ => return inner(left, right),
+    };
+    let kept = lifted(kept)?; // (a LEFT JOIN under that one goes up too)
+    Ok(Arc::new(LogicalPlan::Join(Join::try_new(kept, outer.right, outer.on, outer.filter, JoinType::Left, outer.join_constraint, outer.null_equality, outer.null_aware)?)))
+}
+
 /// Inner joins run in the order the query names them, so a query that starts from its biggest
 /// table carries those rows through every join after it. This picks the order by what the catalog
 /// already knows — each table's row count and each column's range (`query::Pruned::statistics`,
@@ -555,7 +614,7 @@ impl OptimizerRule for SemiJoinDown {
 /// known and every step joins on a key: a tree with a cross join in it is one these estimates say
 /// nothing useful about. And because the estimates are bounds rather than counts, the new order
 /// has to look a good deal cheaper, not a little (`PONDRA_JOIN_ORDER`: the margin, 2 by default;
-/// `0` turns the rule off).
+/// `0` turns the rule off). `PONDRA_DEBUG_JOIN_ORDER=1` prints both costs of every tree it weighs.
 #[derive(Debug)]
 struct JoinOrder;
 
@@ -611,6 +670,10 @@ impl OptimizerRule for JoinOrder {
         }
         // Both costed the same way.
         let (Some((_, was)), Some((now, order))) = (as_written(&plan, equality)?, best) else { return Ok(Transformed::no(plan)) };
+        if std::env::var_os("PONDRA_DEBUG_JOIN_ORDER").is_some() {
+            let named: Vec<String> = leaves.iter().zip(&sizes).map(|(l, s)| format!("{} ({} rows)", l.display(), s.rows)).collect();
+            eprintln!("join order: as written {was} rows moved, {now} in the order {order:?} of {named:?}");
+        }
         if order == asked || now.saturating_mul(margin()) >= was {
             return Ok(Transformed::no(plan));
         }
@@ -655,13 +718,33 @@ fn flat(j: &Join, equality: NullEquality) -> bool {
 fn flatten(plan: &LogicalPlan, equality: NullEquality, leaves: &mut Vec<LogicalPlan>, keys: &mut Vec<(Expr, Expr)>, filters: &mut Vec<Expr>) {
     match plan {
         LogicalPlan::Join(j) if flat(j, equality) => {
-            keys.extend(j.on.iter().cloned());
-            filters.extend(j.filter.iter().flat_map(split_conjunction).cloned());
+            let (on, rest) = equalities(j);
+            keys.extend(on);
+            filters.extend(rest);
             flatten(&j.left, equality, leaves, keys, filters);
             flatten(&j.right, equality, leaves, keys, filters);
         }
         _ => leaves.push(plan.clone()),
     }
+}
+
+/// A join's equi-keys — its `on`, and each equality in its condition that pairs a column of
+/// either side — and the rest of its condition. Conditions pushed into a join are not keys until
+/// the next pass (`extract_equijoin_predicate`), and by then projections sit between the joins and
+/// the tree can't be taken apart: TPC-H q21's comma joins under its EXISTS were never reordered.
+fn equalities(j: &Join) -> (Vec<(Expr, Expr)>, Vec<Expr>) {
+    let (mut keys, mut rest) = (j.on.clone(), vec![]);
+    for f in j.filter.iter().flat_map(split_conjunction) {
+        let pair = match f {
+            Expr::BinaryExpr(b) if b.op == Operator::Eq && j.null_equality == NullEquality::NullEqualsNothing => find_valid_equijoin_key_pair(&b.left, &b.right, j.left.schema(), j.right.schema()).ok().flatten(),
+            _ => None,
+        };
+        match pair {
+            Some(pair) => keys.push(pair),
+            None => rest.push(f.clone()),
+        }
+    }
+    (keys, rest)
 }
 
 /// How big a join input is: its rows, and an upper bound on each column's distinct values where
@@ -787,10 +870,11 @@ fn as_written(plan: &LogicalPlan, equality: NullEquality) -> Result<Option<(Size
         return Ok(size(plan).map(|s| (s, 0)));
     }
     let (Some((l, cl)), Some((r, cr))) = (as_written(&j.left, equality)?, as_written(&j.right, equality)?) else { return Ok(None) };
-    if j.on.is_empty() {
+    let (on, _) = equalities(j);
+    if on.is_empty() {
         return Ok(None);
     }
-    let rows = join_rows(&l, &r, &j.on.iter().map(|(a, b)| (a, b)).collect::<Vec<_>>());
+    let rows = join_rows(&l, &r, &on.iter().map(|(a, b)| (a, b)).collect::<Vec<_>>());
     Ok(Some((joined(&l, &r, rows), cl.saturating_add(cr).saturating_add(rows))))
 }
 

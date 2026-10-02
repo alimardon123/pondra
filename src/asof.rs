@@ -128,7 +128,7 @@ pub fn register(ctx: &datafusion::prelude::SessionContext) {
 // ---------------------------------------------------------------- planning
 
 /// Whether a (logical) join is an as-of one.
-fn marked(j: &datafusion::logical_expr::Join) -> bool {
+pub fn marked(j: &datafusion::logical_expr::Join) -> bool {
     use datafusion::logical_expr::Expr;
     j.filter.as_ref().is_some_and(|f| f.exists(|e| Ok(matches!(e, Expr::ScalarFunction(s) if s.name() == MARKER))).unwrap_or(false))
 }
