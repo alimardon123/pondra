@@ -1,6 +1,6 @@
 // A data file (ADR-032, ADR-034): a CSV, TSV, JSON, JSON lines or Parquet file of the lake's, as a
 // table, edited in place. Loaded when a data file first opens, not with the page.
-import { h, icon, bytes, count, S, R, emit, run, fileSql, ident, toast, prompt, readFile, writeFile, moreStyle } from './core.js';
+import { h, icon, bytes, count, S, R, emit, run, fileSql, ident, toast, prompt, readFile, writeFile, moreStyle, renaming, crumbs, renamed } from './core.js';
 import { grid, copyText } from './grid.js';
 import { btn, moreBtn, download } from './files.js';
 
@@ -40,6 +40,7 @@ export class DataDoc {
     this.el = h('div', { class: 'doc datadoc' }, this.box, this.foot);
   }
   get title() { return base(this.path); }
+  rename(name) { return renamed(this, name); }
   async load() {
     const size = S.files?.find(f => f.path === 'files/' + this.path)?.size;
     let types = [];
@@ -116,6 +117,7 @@ export class DataDoc {
     return [cells ? `${count(cells)} cell${cells === 1 ? '' : 's'} changed` : null, rowsAdded ? `${count(rowsAdded)} row${rowsAdded === 1 ? '' : 's'} added` : null, this.removed ? `${count(this.removed)} row${this.removed === 1 ? '' : 's'} deleted` : null].filter(Boolean);
   }
   async save() {
+    await this.naming;
     if (this.readonly) { toast('This file is read-only here: load it into a table to change it', true); return false; }
     const v = await writeFile(this.path, this.serialize(), this.version, this.format === 'csv' ? 'text/csv; charset=utf-8' : 'application/json');
     if (!v) return false;
@@ -136,13 +138,12 @@ export class DataDoc {
     try { await run(`CREATE TABLE ${ident(name)} AS SELECT * FROM ${fileSql(this.path)}`); toast(`Loaded into the table ${name}`); R.helpers.refresh(); } catch (e) { toast(e.message, true); }
   }
   toolbar() {
-    const parts = this.path.split('/');
-    return [...parts.slice(0, -1).flatMap(p => [h('span', { class: 'crumb' }, p), h('span', { class: 'slash' }, '/')]), h('b', { class: 'crumb cur' }, parts.at(-1)),
+    return [...crumbs(this),
       this.readonly ? h('span', { class: 'chip', title: 'Parquet files, and files too big to hold, open read-only: load one into a table to change it with SQL' }, 'Read-only') : this.dirty && this.changes().length ? h('span', { class: 'muted' }, this.changes().join(', ')) : null,
       h('span', { class: 'grow' }),
       this.readonly || !this.dirty ? null : h('button', { class: 'btn', title: 'Throw away the changes', onclick: () => this.discard() }, 'Discard'), this.readonly ? null : R.helpers.saveButton(this), h('span', { class: 'sep' }),
       btn('play', 'Query with SQL', 'Query it, in a new SQL tab', () => R.helpers.query(`SELECT * FROM ${fileSql(this.path)} LIMIT 1000`)),
-      moreBtn(() => [{ label: 'Load into a table…', icon: 'up', run: () => this.loadIntoTable() }, { label: 'Versions…', icon: 'clock', run: () => R.helpers.versions(this) }, { label: 'Download', icon: 'down', run: () => download(this.path) }, { label: 'Copy the path', icon: 'copy', run: () => copyText('files/' + this.path, 'Path copied') }])];
+      moreBtn(() => [{ label: 'Load into a table…', icon: 'up', run: () => this.loadIntoTable() }, { label: 'Versions…', icon: 'clock', run: () => R.helpers.versions(this) }, { label: 'Download', icon: 'down', run: () => download(this.path) }, { label: 'Rename…', icon: 'pencil', run: renaming }, { label: 'Copy path', icon: 'copy', run: () => copyText('files/' + this.path, 'Path copied') }])];
   }
   status() { return [`${count(this.data.length)} rows · ${this.cols.length} columns`, this.format === 'csv' ? `CSV · UTF-8 · ${this.sep === '\t' ? 'tab' : 'comma'}` : this.format.toUpperCase()]; }
 }

@@ -559,7 +559,12 @@ pub async fn variables(session: &str) -> Result<Value> {
         return Ok(json!({"running": true, "busy": true, "variables": [], "python": PYTHON.get()})); // (a cell left running: the next cell sees to it)
     }
     send(&mut k.worker, &json!({"op": "vars", "session": session}), &[]).await?;
-    let (head, _) = recv(&mut k.worker).await?;
+    k.busy = true; // (until its answer is read: a variable whose look never comes would hold the session, so the next cell sees to it)
+    let Ok(answer) = tokio::time::timeout(Duration::from_secs(10), recv(&mut k.worker)).await else {
+        return Ok(json!({"running": true, "busy": true, "variables": [], "python": PYTHON.get()}));
+    };
+    let (head, _) = answer?;
+    k.busy = false;
     Ok(json!({"running": true, "busy": false, "variables": head["variables"], "python": PYTHON.get()}))
 }
 

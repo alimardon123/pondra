@@ -1,7 +1,7 @@
 // Notebooks (ADR-030, ADR-034): SQL, Python and Markdown cells in a tab, saved in the lake as
 // Jupyter notebooks (`files/notebooks/<name>/<time>.ipynb`, a version per save), or, anywhere
 // else, as one plain `.ipynb` file, saved in place like a SQL file.
-import { h, $, icon, esc, secs, count, S, R, emit, call, rows, fileUrl, toast, menu, saveAs, numeric, Failure, said, failed, readFile, writeFile, interruptPython, formatPython } from './core.js';
+import { h, icon, esc, secs, count, S, R, emit, call, rows, fileUrl, toast, menu, saveAs, numeric, said, failed, readFile, writeFile, interruptPython, formatPython, renamed, crumbs, renaming, sessionOf } from './core.js';
 import { Editor, formatSql } from './editor.js';
 /** A Markdown cell's text drawn (md.js: loaded when a notebook first has one). Only the latest
  * call draws: calls made while md.js loads resume in any order, and an older text drawn last
@@ -32,6 +32,8 @@ function convert(src, from, to) {
   const m = from === 'python' && to === 'sql' && s.match(/^db\.sql\(\s*("""|'''|"|')([\s\S]*?)\1\s*\)$/);
   return m ? m[2].trim() : src;
 }
+/** What Python can't take as a name: its keywords, and a word starting with a digit. */
+const PY_WORD = /^(\d.*|False|None|True|and|as|assert|async|await|break|class|continue|def|del|elif|else|except|finally|for|from|global|if|import|in|is|lambda|nonlocal|not|or|pass|raise|return|try|while|with|yield)$/;
 let made = 0;
 const newId = () => 'c' + Date.now().toString(36) + (made++).toString(36); // (cell ids as nbformat has them)
 
@@ -40,7 +42,7 @@ export class Cell {
     this.nb = nb;
     this.id = /^[A-Za-z0-9_-]{1,64}$/.test(o.id || '') ? o.id : newId();
     this.kind = o.kind || 'sql';
-    this.result = null; this.count = null; this.ctl = null; this.stream = null;
+    this.result = null; this.count = null; this.ctl = null;
     // (a press on it keeps the text's focus: a Markdown cell being edited stays open while its menu is)
     this.kindSel = h('button', { class: 'kind', 'aria-haspopup': 'menu', 'aria-label': 'Kind of cell', title: 'SQL, Python or Markdown (S, P, M)', onmousedown: e => e.preventDefault(), onclick: e => this.kindMenu(e.currentTarget) });
     this.runBtn = h('button', { class: 'run', title: 'Run (Ctrl+Enter)', onclick: () => this.ctl ? this.stop() : this.run() });
@@ -52,7 +54,11 @@ export class Cell {
     // (a SQL cell's answer, a frame, in the page's Python under this name: `%%sql df <<` in the file)
     this.as = /^\w+$/.test(o.as || '') ? o.as : '';
     this.asEl = h('label', { class: 'as', title: 'Its answer as a frame of this name in the notebook\'s Python, for a Python cell to use (empty: not named)' }, icon('filepy'), 'Result in Python:',
-      h('input', { value: this.as, placeholder: 'name it', spellcheck: 'false', 'aria-label': 'Its answer\'s name in Python', onchange: e => { this.as = e.target.value.trim().replace(/\W/g, ''); e.target.value = this.as; this.nb.changed(); } }));
+      h('input', { value: this.as, placeholder: 'name it', spellcheck: 'false', 'aria-label': 'Its answer\'s name in Python', onchange: e => {
+        const name = e.target.value.trim().replace(/\W/g, '');
+        this.as = PY_WORD.test(name) ? (toast(/^\d/.test(name) ? `${name} can't be a name in Python: names don't start with a digit` : `${name} is one of Python's own words: pick another name`, true), '') : name;
+        e.target.value = this.as; this.nb.changed();
+      } }));
     const tool = (ic, title, fn) => h('button', { class: 'icon', title, 'aria-label': title, onclick: fn }, icon(ic));
     const i = () => nb.cells.indexOf(this);
     this.bar = h('div', { class: 'bar' }, this.num, this.kindSel, this.runBtn, this.liveEl, this.asEl, this.status,
@@ -60,7 +66,10 @@ export class Cell {
         tool('plus', 'Add a cell below (B)', () => nb.add({ kind: this.kind === 'markdown' ? 'sql' : this.kind }, this, true).edit()),
         tool('dots', 'More', e => { const at = e.currentTarget; import('./more.js').then(m => m.cellMenu(this, at)); })));
     this.ed = new Editor({ grow: true, value: o.src || '', label: 'Code', oninput: () => nb.changed(), onkey: e => this.key(e) });
-    this.ed.menu = () => ['-', { label: 'Run cell', icon: 'play', keys: 'Ctrl Enter', run: () => this.run() }, this.kind === 'sql' ? { label: 'Explain: its plan, not run', icon: 'plan', keys: 'Ctrl Shift E', run: () => this.explain() } : null, { label: 'Run the cells above', run: () => nb.runSome(0, i()) }, { label: 'Run this and the cells below', run: () => nb.runSome(i()) },
+    // (Run runs the cell, whatever is selected; the selection alone only from here)
+    this.ed.top = some => [{ label: 'Run cell', icon: 'play', keys: 'Ctrl Enter', run: () => this.run() }, some && this.type.run ? { label: 'Run selection', run: () => this.run(true) } : null,
+      ...this.kind === 'sql' ? R.helpers.planItems(p => this.explain(p)) : []];
+    this.ed.menu = () => [{ label: 'Run the cells above', run: () => nb.runSome(0, i()) }, { label: 'Run this and the cells below', run: () => nb.runSome(i()) },
       ...this.fmt ? ['-', ...this.ed.formats(this.fmt, 'cell', true)] : [], this.kind === 'sql' ? '-' : null, this.kind === 'sql' ? { label: 'Create as table or view…', icon: 'plus', run: () => R.helpers.createAs(this.src) } : null,
       ...['sql', 'python'].filter(k => k !== this.kind && this.kind !== 'markdown').map(k => ({ label: k === 'sql' ? 'Make it SQL' : 'Make it Python', run: () => this.setKind(k) }))];
     this.ta = this.ed.ta;
@@ -81,7 +90,7 @@ export class Cell {
   get src() { return this.ta.value; }
   kindMenu(at) { menu(at, [...R.kinds.values()].map(k => ({ label: k.label, checked: k.id === this.kind, run: () => { this.setKind(k.id); this.edit(); } }))); }
   /** Stop it: a Python cell is interrupted on the node (its variables stay); a SQL one is no longer waited for. */
-  stop() { if (this.kind === 'python') interruptPython(); else this.ctl?.abort(); }
+  stop() { if (this.kind === 'python') interruptPython(this.nb); else this.ctl?.abort(); }
   get type() { return R.kinds.get(this.kind) || R.kinds.get('sql'); }
   idle() { this.runBtn.replaceChildren(icon('play'), 'Run'); this.runBtn.classList.remove('stop'); this.runBtn.title = 'Run (Ctrl+Enter)'; }
   fold(on = !this.el.classList.contains('folded')) { this.el.classList.toggle('folded', on); }
@@ -124,11 +133,12 @@ export class Cell {
   /** How its kind is formatted: SQL here, Python by the node's Python (ruff or black); Markdown isn't. */
   get fmt() { return this.kind === 'sql' ? formatSql : this.kind === 'python' ? formatPython : null; }
   format() { if (this.fmt) this.ed.reformat(this.fmt); }
-  /** Explain: the plan of what is selected, or of its last statement, without running it. */
-  explain() { this.show(R.helpers.explain(this.ed.selected() || this.src)); }
-  async run() {
+  /** The execution plan of what is selected, or of its last statement, without running it (or, `profile`, its query profile). */
+  explain(profile) { this.show(R.helpers.explain(this.ed.selected() || this.src, undefined, profile, sessionOf(this.nb))); }
+  /** Run it (or, `only`, what is selected in it). */
+  async run(only) {
     if (!this.type.run) { drawMd(this.md, this.src); this.ta.blur(); this.el.focus({ preventScroll: true }); return { kind: 'done' }; }
-    const text = this.src.trim();
+    const text = (only && this.ed.selected() || this.src).trim();
     if (!text) return { kind: 'done' };
     this.stopLive();
     this.ctl?.abort();
@@ -150,7 +160,7 @@ export class Cell {
     }
     r.ms = performance.now() - t0;
     if (this.kind === 'sql') r.src = text; // (its plan: of what ran)
-    // (one query: Download can fetch every row of it again, not only those shown)
+    // (one query: a download can run it again once the node no longer keeps its answer)
     if (this.kind === 'sql' && r.kind === 'rows' && !text.replace(/;\s*$/, '').includes(';') && /^\s*(select|with|from|values|table)\b/i.test(text.replace(/--[^\n]*|\/\*[\s\S]*?\*\//g, ' '))) r.sql = text;
     this.show(r);
     if (r.kind === 'rows' && this.type.live && this.liveBox.checked) this.startLive();
@@ -163,42 +173,29 @@ export class Cell {
     this.out.replaceChildren(...answer(r, this));
     if (saved) this.out.append(h('div', { class: 'meta' }, h('span', { class: 'badge', title: 'As it was when the notebook was saved: run the cell for the answer now' }, 'saved')));
     this.status.className = 'st' + (r.kind === 'error' ? ' bad' : '');
-    this.status.textContent = saved || r.kind === 'rows' || r.kind === 'plan' ? '' : r.kind === 'error' ? `failed · ${secs(r.ms)}` : secs(r.ms); // (rows: their count and time under them)
+    this.status.textContent = saved || r.ms == null ? '' : r.kind === 'error' ? `failed · ${secs(r.ms)}` : secs(r.ms); // (how long it took, beside Run, whatever the kind: rows count under them)
   }
   setLive(on) {
     this.liveBox.checked = on;
     if (on) this.run(); else { this.stopLive(); this.status.textContent = ''; }
     this.nb.changed();
   }
-  stopLive() { if (this.stream) { this.stream.abort(); this.stream = null; } }
-  async startLive() {
+  stopLive() { this.going = null; this.unwatch?.(); this.unwatch = null; }
+  /** Its answer again each time a commit changes it: every live query of the page shares one
+   * connection to the node (`live.js`), so the page's other requests never wait for one. */
+  startLive() {
     this.stopLive();
-    const ctl = this.stream = new AbortController(), cols = this.result.columns, first = this.result;
+    const go = this.going = {}, cols = this.result.columns, first = this.result;
+    let seen = 0;
     this.status.className = 'st'; this.status.innerHTML = '<span class="dot"></span>waiting for changes';
-    try {
-      const r = await call('/live?sql=' + encodeURIComponent(this.src.trim()), { signal: ctl.signal });
-      const reader = r.body.getReader(), dec = new TextDecoder();
-      let buf = '', seen = 0;
-      for (;;) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        buf += dec.decode(value, { stream: true });
-        for (let i; (i = buf.indexOf('\n')) >= 0;) {
-          const line = buf.slice(0, i).trim();
-          buf = buf.slice(i + 1);
-          if (line) this.liveAnswer(JSON.parse(line), cols, first, !(seen++));
-        }
-      }
-      if (this.stream === ctl) throw new Failure('the node closed the live query');
-    } catch (e) {
-      if (e.name === 'AbortError' || this.stream !== ctl) return;
-      this.stream = null; this.liveBox.checked = false;
-      this.status.className = 'st bad'; this.status.textContent = 'live stopped';
-      this.out.prepend(h('pre', { class: 'err' }, e.message));
-    }
+    import('./live.js').then(m => { if (this.going === go) this.unwatch = m.watch(this.src.trim(), sessionOf(this.nb), a => this.liveAnswer(a, cols, first, !(seen++))); });
   }
   liveAnswer(m, cols, first, opening) {
-    if (m.error) throw new Failure(m.error);
+    if (m.error) {
+      this.stopLive(); this.liveBox.checked = false;
+      this.status.className = 'st bad'; this.status.textContent = 'live stopped';
+      return this.out.prepend(h('pre', { class: 'err' }, m.error));
+    }
     const names = cols.length ? cols.map(c => c.name) : Object.keys(m.rows[0] || {});
     const columns = cols.length ? cols : names.map(n => ({ name: n, type: '' }));
     const r = { kind: 'rows', columns, rows: m.rows.slice(0, 10000).map(o => names.map(n => o[n] ?? null)), total: m.rows.length, notices: [], ms: first.ms };
@@ -377,10 +374,8 @@ export class Notebook {
   /** Save it in place, `<dir><name>.ipynb` (the node keeps each save as a version: ADR-035 §8). A
    * notebook saved before that, as `notebooks/<name>/<time>.ipynb`, becomes `notebooks/<name>.ipynb`. */
   async save() {
-    const input = $('#nbname');
-    const name = input && input.value !== this.name ? cleanName(input.value) : this.name;
-    if (!name) { toast('Give the notebook a name first', true); input?.focus(); return false; }
-    this.name = name; if (input) input.value = name;
+    await this.naming;
+    if (!this.name) { toast('Give the notebook a name first', true); return false; }
     if (!this.plain) { this.dir = 'notebooks/'; this.version = null; }
     const path = this.path, body = JSON.stringify(this.notebook(), null, 1) + '\n';
     try {
@@ -401,23 +396,22 @@ export class Notebook {
     return true;
   }
   activate() { S.nb = this; S.sel = this.sel; this.sel?.el.focus({ preventScroll: true }); }
+  rename(name) { return renamed(this, name); }
   /** The toolbar: its name (edit it to rename), whether it is saved, and its actions. */
   toolbar() {
-    const name = h('input', { id: 'nbname', value: this.name, 'aria-label': 'Notebook name', spellcheck: 'false', title: 'The notebook\'s name: Ctrl+S saves it under this one' });
-    name.addEventListener('change', () => { this.name = cleanName(name.value) || 'untitled'; name.value = this.name; this.version = null; this.changed(); });
-    name.addEventListener('keydown', e => { if (e.key === 'Enter') name.blur(); });
     const i = () => Math.max(0, this.cells.indexOf(this.sel));
     const pill = R.helpers.pythonPill();
     this.drawPill = pill.draw;
-    return [h('span', { class: 'crumb' }, this.dir ?? 'notebooks/'), name, h('span', { class: 'grow' }),
+    return [...crumbs(this), h('span', { class: 'grow' }),
       R.helpers.runButton(this.busy, { label: 'Run all', title: 'Run every cell, in order (Ctrl+Shift+Enter)', run: () => this.runSome(0), stop: () => this.interrupt(), stopTitle: 'Stop the cells running (Python\'s are interrupted, their variables kept)' }, [
         { label: 'Run all', icon: 'play', keys: 'Ctrl Shift Enter', run: () => this.runSome(0) }, { label: 'Run the cells above', icon: 'arrowUp', run: () => this.runSome(0, i()) },
         { label: 'Run this and the cells below', icon: 'arrowDown', run: () => this.runSome(i()) }, '-', { label: 'Clear every output', icon: 'clear', run: () => this.clearOutputs() },
         '-', { label: 'Run as a job', icon: 'play', run: () => R.helpers.job(this) }, { label: 'Schedule…', icon: 'clock', run: () => R.helpers.schedule(this) }]),
       pill, R.helpers.saveButton(this),
       h('button', { class: 'icon', title: 'More', 'aria-label': 'More', onclick: e => menu(e.currentTarget, [
-        { label: 'Versions…', icon: 'clock', run: () => R.helpers.versions(this) },
-        { label: 'Download as .ipynb', icon: 'down', run: () => saveAs(JSON.stringify(this.notebook(), null, 1) + '\n', 'application/x-ipynb+json', this.name + '.ipynb') }]) }, icon('dots'))];
+        { label: 'Rename…', icon: 'pencil', run: renaming }, { label: 'Versions…', icon: 'clock', run: () => R.helpers.versions(this) },
+        { label: 'Download as .ipynb', icon: 'down', run: () => saveAs(JSON.stringify(this.notebook(), null, 1) + '\n', 'application/x-ipynb+json', this.name + '.ipynb') },
+        this.version ? { label: 'Copy path', icon: 'copy', run: () => R.helpers.copyPath(this) } : null]) }, icon('dots'))];
   }
   status() { return [`${this.cells.length} cell${this.cells.length === 1 ? '' : 's'}`, 'Notebook']; }
   /** Keys on the selected cell, after Esc (Jupyter's). */
@@ -437,7 +431,8 @@ export class Notebook {
       s: () => c.setKind('sql'), p: () => c.setKind('python'), m: () => c.setKind('markdown'),
       l: () => { if (c.type.live) c.setLive(!c.liveBox.checked); },
       o: () => c.fold(),
-      0: () => { if (prev === '0') { this.lastKey = ''; if (confirm('Restart Python? Its variables go.')) R.helpers.restart(); } },
+      0: () => { if (prev === '0') { this.lastKey = ''; if (confirm('Restart Python? Its variables go.')) R.helpers.restart(this); } },
+      i: () => { if (prev === 'i') { this.lastKey = ''; interruptPython(this); } },
     };
     if (acts[key]) { e.preventDefault(); acts[key](); return true; }
     const mine = R.keys.find(k => k.run && k.group === 'On a cell (after Esc)' && k.keys.toLowerCase() === key);

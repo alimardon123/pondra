@@ -164,6 +164,10 @@ class Page:
         row.wait_for(timeout=10000)
         return row
 
+    def editing(self):
+        """Wait for a new file's editor to have the keys (a SQL or Python file's code loads when the first opens)."""
+        self.p.wait_for_function("document.activeElement?.tagName === 'TEXTAREA' && !!document.activeElement.closest('.filedoc')", timeout=10000)
+
     def tab(self):
         """The tab in front: its title, and whether it has changes not saved."""
         t = self.p.locator("#tabbar .tab.on")
@@ -220,7 +224,10 @@ def node_checks(browser, port, show):
     profiled = until(lambda: detail.locator(".pc", has_text="born").locator(".nums").inner_text().startswith("67% null"), True)
     charts = until(lambda: (detail.locator(".pc", has_text="amt").locator(".ps svg rect").count(), detail.locator(".pc", has_text="name").locator(".bars .v").count()), (20, 3))
     amt = detail.locator(".pc", has_text="amt").inner_text()
-    checks["Profile: each column's nulls, distinct values, range, and a histogram or its commonest values"] = profiled is True and "1.50 … 2.25" in amt and charts == (20, 3)
+    # (its numbers in the text's own small letters, under the column's name: not in the editor's gutter's look, a box of code)
+    plain = detail.locator(".pc .ps .nums").first.evaluate("e => { const s = getComputedStyle(e); return [s.borderRightStyle, s.fontFamily.includes('Mono'), s.position] }")
+    checks["Profile: each column's nulls, distinct values, range, and a histogram or its commonest values, in plain small text under the column's name"] = profiled is True and "1.50 … 2.25" in amt and charts == (20, 3) \
+        and plain == ["none", False, "static"]
     tree.locator(".row", has_text="grown").click()
     checks["a view picked shows its definition"] = until(lambda: "born IS NOT NULL" in detail.locator(".defn").inner_text(), True) is True
 
@@ -230,7 +237,7 @@ def node_checks(browser, port, show):
     card = until(lambda: p.locator(".hcard").is_visible() and "BIGINT" in p.locator(".hcard").inner_text(), True)
     p.mouse.move(5, 5)
     checks["a SQL cell shows the rows, each column's type a mark and its card on hover; timestamps and decimals as written"] = heads == ["id", "name", "born", "at", "amt"] \
-        and rows[0] == ["1", "Ann", "1990-01-02", "2024-01-01 10:00:00", "1.50"] and rows[1][2] == "NULL" and c.locator(".n-rows").inner_text().startswith("3 rows · ") \
+        and rows[0] == ["1", "Ann", "1990-01-02", "2024-01-01 10:00:00", "1.50"] and rows[1][2] == "NULL" and c.locator(".n-rows").inner_text() == "3 rows" and re.fullmatch(r"[\d.]+ m?s", c.locator(".bar .st").inner_text()) \
         and [m.get_attribute("class") for m in c.locator("thead .ty-i").all()] == ["ty-i k-num", "ty-i k-text", "ty-i k-date", "ty-i k-time", "ty-i k-dec"] and card is True
     tree.locator(".row", has_text="orders").dblclick()  # (a table's first rows, in a new cell)
     peek = until(lambda: pg.grid(pg.cell(1))[1], [["1", "10.5"]])
@@ -314,6 +321,23 @@ def node_checks(browser, port, show):
     live.locator("label.live").click()
     ended = until(lambda: call(port, "GET", "/stats")["live_queries"], 0)
     checks["a live cell shows a row INSERTed over HTTP (a decimal to its scale); off, its query ends"] = started is True and updated == [["4", "4.00"]] and ended == 0
+    # (a browser opens six connections to a host at most: a stream per live cell held them all, and a
+    # Python cell after six of them waited for good; the page's live queries now share one)
+    many = [{"cell_type": "code", "id": f"l{i}", "metadata": {"pondra": {"live": True}}, "source": f"%%sql\nSELECT count(*) + {i} AS n FROM people", "outputs": [], "execution_count": None} for i in range(7)]
+    many.append({"cell_type": "code", "id": "py", "metadata": {}, "source": "print('still here')", "outputs": [], "execution_count": None})
+    put(port, "notebooks/lives.ipynb", json.dumps({"cells": many, "metadata": {}, "nbformat": 4, "nbformat_minor": 5}).encode())
+    p.evaluate("pondra.ui.openFile('notebooks/lives.ipynb')")
+    until(lambda: pg.tab()[0].startswith("lives"), True)
+    pg.cell(0).locator("textarea").click()
+    p.keyboard.press("Control+Shift+Enter")  # (every cell, in order: seven live, then Python)
+    watching = until(lambda: call(port, "GET", "/stats")["live_queries"], 7, 20)
+    printed = until(lambda: pg.cell(7).locator(".said").count() and pg.cell(7).locator(".said").inner_text(), "still here", 20)
+    sql(port, "INSERT INTO people (id, name, amt) VALUES (5, 'Ed', 1)")
+    followed = until(lambda: [pg.grid(pg.cell(i))[1] for i in range(7)], [[[str(5 + i)]] for i in range(7)], 20)
+    p.locator("#tabbar .tab.on .x").click()
+    closed = until(lambda: call(port, "GET", "/stats")["live_queries"], 0)
+    checks["seven live cells at once: a Python cell after them still runs, each follows an INSERT, and closing their notebook ends their queries"] = \
+        watching == 7 and printed == "still here" and followed == [[[str(5 + i)]] for i in range(7)] and closed == 0
 
     n = pg.cells().count()
     pg.cell(0).locator("textarea").click()
@@ -463,7 +487,7 @@ def files_checks(browser, port, show):
     sql(port, "CREATE TABLE fx AS SELECT value AS id, 'r' || (value % 3) AS region FROM range(0, 30)")
     top = b"SELECT region, count(*) AS n\nFROM fx\nGROUP BY region\nORDER BY region"
     put(port, "scripts/top.sql", top)
-    put(port, "scripts/since.sql", b"-- The first day counted\nDECLARE $since DATE = DATE '2026-01-01';\nDECLARE $top BIGINT DEFAULT 3;\nSELECT $since AS since, $top + 1 AS more;\nSELECT 7 AS seven")
+    put(port, "scripts/since.sql", b"-- The first day counted\nDECLARE $since DATE = DATE '2026-01-01';\nDECLARE $top BIGINT DEFAULT 3; -- how many more\nSELECT $since AS since, $top + 1 AS more;\nSELECT 7 AS seven")
     put(port, "scripts/hello.py", b'import math\nprint("pi is", round(math.pi, 4))\ndb.sql("SELECT count(*) AS n FROM fx")')
     put(port, "data/q.csv", b'id,city,amount\r\n1,Oslo,10\r\n2,"Rome, IT",20\r\n')
     put(port, "data/e.jsonl", b'{"id":1,"tag":"a"}\n{"id":2,"tag":"b"}\n')
@@ -498,33 +522,40 @@ def files_checks(browser, port, show):
     saved = until(lambda: get(port, "scripts/top.sql"), top + b"\nLIMIT 2")
     clean = until(lambda: pg.tab(), ("top.sql", False))
     checks["a SQL file changed shows it (its tab, the Workspace) and Ctrl+S saves it in place"] = dirty == (("top.sql", True), 1) and saved == top + b"\nLIMIT 2" and clean == ("top.sql", False)
-    put(port, "scripts/multi.sql", b"CREATE TABLE fm AS SELECT 1 AS a;\n-- its rows; this ; is a comment's\nSELECT a, 'x;y' AS s FROM fm;\nSELECT nope;\nSELECT 5")
+    put(port, "scripts/multi.sql", b"CREATE TABLE IF NOT EXISTS fm AS SELECT 1 AS a;\n-- its rows; this ; is a comment's\nSELECT a, 'x;y' AS s FROM fm;\nSELECT nope;\nSELECT 5")
     pg.workspace("scripts", "multi.sql").click()
     until(lambda: pg.tab()[0], "multi.sql")
-    p.click("#runBtn")
+    p.click("#runAll")
     strip = p.locator(".filedoc .stmts")
     listed = lambda: strip.evaluate("s => [...s.querySelectorAll('button.stmt')].map(b => b.querySelector('b').textContent + ' ' + b.lastChild.textContent)")
-    each = until(listed, ["1 done", "2 1 row", "3 failed"])
-    left = strip.locator(".stmts-left").inner_text()
-    strip.locator("button.stmt").nth(1).click()
+    each = until(listed, ["2 1 row", "3 failed"])  # (the answers, numbered as in the file; what the CREATE did is in Messages)
+    left = strip.locator("span.stmts-left").inner_text()
+    more_msgs = strip.locator(".stmts-left.more").inner_text()
+    strip.locator("button.stmt").first.click()
     second = until(lambda: pg.grid(body), [["a", "s"], [["1", "x;y"]]])
+    ed.focus()
+    p.keyboard.press("Control+Home")
+    p.keyboard.press("Control+Enter")  # (the statement at the caret: the CREATE alone, no rows, so Messages shows what it did)
+    created = until(lambda: p.locator(".filedoc .ptab.on").inner_text() == "Messages" and strip.count() == 0 and body.locator(".msg").count() == 1 and "CREATE TABLE" in body.locator(".msg code").inner_text(), True)
     pg.menu("Settings")
     pg.setting("Editor and results", "A SQL file's statements").locator(".seg", has_text="The last one's").click()
     p.keyboard.press("Escape")
-    p.click("#runBtn")
+    p.click("#runAll")
     last = until(lambda: body.locator(".err").count() == 1 and strip.count() == 0, True)  # (all at once: it stops at the failure too, one answer)
     ed.focus()
     p.keyboard.press("Control+a")
     p.keyboard.insert_text("SELECT 1 AS a; SELECT 2 AS b")
-    p.click("#runBtn")
+    p.click("#runAll")
     only = until(lambda: pg.grid(body), [["b"], [["2"]]])
     pg.menu("Settings")
     pg.setting("Editor and results", "A SQL file's statements").locator(".seg", has_text="An answer each").click()
     p.keyboard.press("Escape")
-    checks["a SQL file's statements each get an answer (split as the node splits them), up to a failure; Settings can say the last one's only"] = \
-        each == ["1 done", "2 1 row", "3 failed"] and left == "1 after it not run" and second == [["a", "s"], [["1", "x;y"]]] and last is True and only == [["b"], [["2"]]]
+    checks["Run file runs a SQL file's statements, each its answer (split as the node splits them; a CREATE's in Messages), up to a failure; Run (Ctrl+Enter) the statement at the caret, what it did in Messages; Settings can say the last one's only"] = \
+        each == ["2 1 row", "3 failed"] and left == "1 after it not run" and more_msgs == "1 more in Messages" and second == [["a", "s"], [["1", "x;y"]]] and created is True \
+        and last is True and only == [["b"], [["2"]]]
     p.click("#newfile")
     p.locator("#menu button", has_text="New SQL file").click()
+    pg.editing()
     p.keyboard.insert_text("SELECT 1 AS one")
     unsaved = until(lambda: (pg.tab(), pg.workspace("queries", "untitled.sql").locator(".dirty").count()), (("untitled.sql", True), 1))  # (in the folder it will be saved to)
     p.keyboard.press("Control+s")
@@ -535,8 +566,30 @@ def files_checks(browser, port, show):
     checks["a new SQL file asks for its path when first saved"] = made == b"SELECT 1 AS one" and until(lambda: pg.tab(), ("one.sql", False)) == ("one.sql", False)
     checks["a new SQL file shows it is not saved (its tab, its row in the folder it will be saved to) until Ctrl+S saves it"] = unsaved == (("untitled.sql", True), 1) \
         and until(lambda: (pg.workspace("scripts", "one.sql").locator(".dirty").count(), p.locator("#workspace .row", has_text="untitled.sql").count()), (0, 0)) == (0, 0)
+    put(port, "scripts/by_region.sql", b"SELECT count(*) AS n, $region AS region FROM fx WHERE region = $region")  # (before the rename, which lists the Workspace again)
+    name = p.locator("#docbar .docname")
+    as_shown = (p.locator("#docbar .crumb").first.inner_text(), name.input_value(), p.locator("#docbar .named .ext").inner_text())
+    name.fill("first")
+    name.press("Enter")
+    gone = lambda path: isinstance(_try(lambda: get(port, path)), urllib.error.HTTPError)
+    moved = until(lambda: (_try(lambda: get(port, "scripts/first.sql")), gone("scripts/one.sql")), (b"SELECT 1 AS one", True))
+    retitled = until(lambda: (pg.tab(), pg.workspace("scripts", "first.sql").count()), (("first.sql", False), 1))
+    p.locator("#tabbar .tab.on").click(button="right")
+    p.locator("#menu button", has_text="Copy path").wait_for(timeout=5000)  # (its menu is in more.js, loaded when first used)
+    tab_items = p.locator("#menu button").all_inner_texts()
+    p.locator("#menu button", has_text="Copy path").click()
+    path = until(pg.clipboard, "files/scripts/first.sql", 5)
+    named = p.locator("#docbar .dbpick").inner_text().strip()
+    p.locator("#docbar .dbpick").click()
+    p.locator("#menu button", has_text="Copy name").wait_for(timeout=5000)  # (its menu is objects.js's, loaded when first used)
+    pill = p.locator("#menu button").all_inner_texts()
+    p.locator("#menu button", has_text="Copy name").click()
+    lake = until(pg.clipboard, named, 5)
+    checks["a file's name in its toolbar renames it (moved in the lake, its tab and row with it); its tab's right-click has Rename… and Copy path; the lake's pill copies its name"] = \
+        as_shown == ("scripts", "one", ".sql") and moved == (b"SELECT 1 AS one", True) and retitled == (("first.sql", False), 1) and {"Rename…", "Copy path"} <= {t.split("\n")[0] for t in tab_items} \
+        and path == "files/scripts/first.sql" and any(t.startswith("Copy name") for t in pill) and named and lake == named
+    renamed = [as_shown, moved, retitled, tab_items, path, pill, lake]
 
-    put(port, "scripts/by_region.sql", b"SELECT count(*) AS n, $region AS region FROM fx WHERE region = $region")
     pg.workspace("scripts", "by_region.sql").click()
     until(lambda: pg.tab()[0], "by_region.sql")
     bar = p.locator(".filedoc .params")
@@ -565,28 +618,31 @@ def files_checks(browser, port, show):
         shown == ["$region"] and bound == [["n", "region"], [["10", "r1"]]] and ran is True and isinstance(task, list) and len(task) == 1 and listed == 1 and cadence == "every 1 hour" and dropped == [{"n": 0}] and gone == 0
     pg.workspace("scripts", "since.sql").click()
     until(lambda: pg.tab()[0], "since.sql")
-    params = lambda: bar.evaluate("b => [...b.querySelectorAll('.param')].map(l => [l.querySelector('span').textContent, l.querySelector('i')?.textContent, l.querySelector('input').type, l.querySelector('input').placeholder, l.title])")
-    typed = until(params, [["$since", "date", "date", "DATE '2026-01-01'", "The first day counted\nDefault: DATE '2026-01-01'"], ["$top", "bigint", "text", "3", "Default: 3"]], 5)
+    params = lambda: bar.evaluate("b => [...b.querySelectorAll('.param')].map(l => [l.querySelector('span').textContent, l.querySelector('i')?.textContent, l.querySelector('input').type, l.querySelector('input').value, l.title, l.querySelector('.pabout')?.textContent])")
+    typed = until(params, [["$since", "date", "date", "2026-01-01", "The first day counted\nDefault: DATE '2026-01-01'", "The first day counted"], ["$top", "bigint", "text", "3", "how many more\nDefault: 3", "how many more"]], 5)
     lit = p.locator(".filedoc pre.hl span.nu", has_text="$since").count() > 0
     p.wait_for_function("document.activeElement?.tagName === 'TEXTAREA'")
     ed.focus()
     p.keyboard.press("Control+Home")
-    p.keyboard.press("Control+Enter")
+    p.keyboard.press("Control+Shift+Enter")  # (the file)
     answers = lambda: strip.evaluate("s => [...s.querySelectorAll('button.stmt')].map(b => b.querySelector('b').textContent + ' ' + b.lastChild.textContent)")
-    whole = until(lambda: strip.count() and answers(), ["1 done", "2 done", "3 1 row", "4 1 row"])
-    strip.locator("button.stmt").nth(2).click()
+    whole = until(lambda: strip.count() and answers(), ["3 1 row", "4 1 row"])
+    strip.locator("button.stmt").first.click()
     defaults = until(lambda: pg.grid(body), [["since", "more"], [["2026-01-01", "4"]]])
     bar.locator("input").nth(1).fill("10")
-    bar.locator("input").nth(1).press("Enter")
-    strip.locator("button.stmt").nth(2).click()
+    marked = bar.locator(".param.set").count()
+    bar.locator("input").nth(1).press("Enter")  # (Enter in a parameter: the file runs)
+    strip.locator("button.stmt").first.click()
     given = until(lambda: pg.grid(body), [["since", "more"], [["2026-01-01", "11"]]])
     ed.focus()
     p.keyboard.press("Control+End")
-    p.keyboard.press("Control+Shift+Enter")  # (the caret in the last statement: that one alone)
+    p.keyboard.press("Control+Enter")  # (the caret in the last statement: that one alone)
     alone = until(lambda: strip.count() == 0 and pg.grid(body), [["seven"], [["7"]]])
     ed.evaluate("t => t.setSelectionRange(t.value.indexOf('AS more;') + 8, t.value.indexOf('AS more;') + 8)")  # (just after its ;: the statement before)
-    p.keyboard.press("Control+Shift+Enter")
+    p.keyboard.press("Control+Enter")
     after = until(lambda: pg.grid(body), [["since", "more"], [["2026-01-01", "11"]]])
+    bar.locator(".param").nth(1).locator(".preset").click()
+    reset = (bar.locator("input").nth(1).input_value(), bar.locator(".param.set").count())
     box, cw = ed.bounding_box(), p.evaluate("(() => { const c = document.createElement('canvas').getContext('2d'); c.font = '13px ' + getComputedStyle(document.body).getPropertyValue('--mono'); return c.measureText('0').width; })()")
     p.mouse.move(box["x"] + 14 + cw * 9.5, box["y"] + 9 + 21 * 1.5)  # (over `$since`, line 2)
     hovered = until(lambda: ed.get_attribute("title") or "", "$since DATE = DATE '2026-01-01'\nThe first day counted\nNow: 2026-01-01 (date)", 5)
@@ -599,11 +655,11 @@ def files_checks(browser, port, show):
     p.keyboard.press("Control+Space")
     completes = until(lambda: p.locator("#complete:not([hidden]) div").all_inner_texts()[:1], ["$top\nvariable"], 5)
     p.keyboard.press("Escape")
-    checks["a SQL file's DECLAREs are its parameters (type, default, what the comment above says; a date picks a date), $names highlighted; a value given replaces the default; Ctrl+Shift+Enter runs the statement at the caret (just after its ; too); hovering a $name says it; Variables lists SQL's; $ completes"] = \
-        typed == [["$since", "date", "date", "DATE '2026-01-01'", "The first day counted\nDefault: DATE '2026-01-01'"], ["$top", "bigint", "text", "3", "Default: 3"]] and lit \
-        and whole == ["1 done", "2 done", "3 1 row", "4 1 row"] and defaults == [["since", "more"], [["2026-01-01", "4"]]] and given == [["since", "more"], [["2026-01-01", "11"]]] \
+    checks["a SQL file's DECLAREs are its parameters (type, its default as the value, what the comment above or after it says; a date picks a date), $names highlighted; a value given replaces the default (marked, ↺ back); Ctrl+Shift+Enter runs the file, Ctrl+Enter the statement at the caret (just after its ; too); hovering a $name says it; Variables lists SQL's; $ completes"] = \
+        typed == [["$since", "date", "date", "2026-01-01", "The first day counted\nDefault: DATE '2026-01-01'", "The first day counted"], ["$top", "bigint", "text", "3", "how many more\nDefault: 3", "how many more"]] and lit \
+        and whole == ["3 1 row", "4 1 row"] and defaults == [["since", "more"], [["2026-01-01", "4"]]] and marked == 1 and given == [["since", "more"], [["2026-01-01", "11"]]] and reset == ("3", 0) \
         and alone == [["seven"], [["7"]]] and after == [["since", "more"], [["2026-01-01", "11"]]] and hovered.startswith("$since DATE") and shown_vars == ["$since", "$top"] and completes == ["$top\nvariable"]
-    var_info = {"typed": typed, "whole": whole, "defaults": defaults, "given": given, "alone": alone, "after": after, "hovered": hovered, "vars": shown_vars, "completes": completes}
+    var_info = {"typed": typed, "whole": whole, "marked": marked, "reset": reset, "defaults": defaults, "given": given, "alone": alone, "after": after, "hovered": hovered, "vars": shown_vars, "completes": completes}
     pg.workspace("scripts", "hello.py").click()
     until(lambda: pg.tab()[0], "hello.py")
     p.locator("#docbar button", has_text="Run file").click()
@@ -683,6 +739,7 @@ def files_checks(browser, port, show):
     lit = p.evaluate("""() => import('/console/editor.js').then(m => m.highlighted("SELECT c.x FROM fx c WHERE c.id = 1 /* c */", 'sql'))""")
     p.click("#tabbar .newtab")
     p.locator("#menu button", has_text="New SQL file").click()
+    pg.editing()
     p.keyboard.insert_text("SELECT o. FROM fx o")
     for _ in range(len(" FROM fx o")):
         p.keyboard.press("ArrowLeft")
@@ -692,7 +749,7 @@ def files_checks(browser, port, show):
     checks["the editor: an alias called c is a name, not a comment's start; after o. Tab lists the columns of the table o names"] = \
         '<span class="k">FROM</span>' in lit and '<span class="k">WHERE</span>' in lit and '<span class="c">/* c */</span>' in lit and offered == ["id", "region"]
     info_editor = {"highlighted": lit, "offered": offered}
-    info = {"editor": info_editor, "variables": var_info, "task": task, "bound": bound, "results": results, "said": said, "each": each, "not run": left, "second": second, "last": last, "only": only, "plan": plan, "dirty": dirty, "saved": saved, "clean": clean, "shown": shown, "errors": pg.errors, "left": pg.left(), "toast": pg.toast(), "folders": folders}
+    info = {"editor": info_editor, "variables": var_info, "task": task, "bound": bound, "results": results, "said": said, "each": each, "not run": left, "second": second, "last": last, "only": only, "plan": plan, "dirty": dirty, "saved": saved, "clean": clean, "shown": shown, "errors": pg.errors, "left": pg.left(), "toast": pg.toast(), "folders": folders, "renamed": renamed}
     pg.ctx.close()
     return checks, info
 
@@ -802,7 +859,7 @@ def folders_checks(browser, port, show):
     clean = until(lambda: (pg.tab(), mine("analysis.ipynb").locator(".dirty").count()), (("analysis.ipynb", False), 0))
     checks["a new notebook in a folder: no dot until something is typed, then its tab and row have the dot and Save shows; Ctrl+S saves it in place, as projects/analysis.ipynb, valid for Jupyter"] = \
         fresh == (("untitled.ipynb", False), 0) and typed == (("untitled.ipynb", True), 1, 1) and in_place == want_files and valid is True and clean == (("analysis.ipynb", False), 0) and in_lake("notebooks/analysis") == [] \
-        and "file=projects%2Fanalysis.ipynb" in p.url and p.locator("#docbar .crumb").first.inner_text() == "projects/"
+        and "file=projects%2Fanalysis.ipynb" in p.url and p.locator("#docbar .crumb").first.inner_text() == "projects"
     p.locator("#docbar button[aria-label=More]").click()
     nb_menu = items()
     p.keyboard.press("Escape")
@@ -858,7 +915,7 @@ def folders_checks(browser, port, show):
     put_in = until(lambda: sorted(x[0] for x in in_lake("projects") if "/up." in x[0]), ["files/projects/up.csv", "files/projects/up.ipynb"])
     pg.workspace("projects", "up.ipynb").click()
     opened = until(lambda: pg.tab(), ("up.ipynb", False))
-    plain = p.locator("#docbar .crumb").first.inner_text() == "projects/" and p.input_value("#nbname") == "up"
+    plain = p.locator("#docbar .crumb").first.inner_text() == "projects" and p.input_value("#nbname") == "up"
     shutil.rmtree(tmp, ignore_errors=True)
     checks["Upload a file here puts a CSV and an .ipynb in that folder; the .ipynb, clicked, opens as a notebook saved in place"] = put_in == ["files/projects/up.csv", "files/projects/up.ipynb"] \
         and opened == ("up.ipynb", False) and plain
@@ -890,9 +947,11 @@ def folders_checks(browser, port, show):
     checks["a file renamed from its ⋯ moves its open tab to the new name"] = moved == ["files/misc/blob.bin", "files/misc/new.txt"] and titles is True and pg.tab()[0] == "new.txt"
 
     p.locator('#left button[aria-label="Workspace: more"]').click()
+    p.locator("#menu:not([hidden])").wait_for(timeout=5000)  # (a view's menu: loaded the first time)
     group = items()
     p.keyboard.press("Escape")
     p.locator('#left button[aria-label="Data: more"]').click()
+    p.locator("#menu:not([hidden])").wait_for(timeout=5000)
     data = items()
     p.keyboard.press("Escape")
     p.click("#newfile")
@@ -914,6 +973,7 @@ def folders_checks(browser, port, show):
         p.keyboard.press("Escape")
         folder("projects").click(button="right")
         p.locator("#menu button", has_text="New SQL file here").click()
+        pg.editing()
         p.keyboard.insert_text("SELECT 1")
         p.wait_for_function("!document.querySelector('#toast.on')", timeout=15000)  # (the last toast gone)
         folder("projects").hover()
@@ -960,6 +1020,16 @@ def grid_checks(browser, port, show):
     c.locator(".chip-f .x").click()
     back = until(lambda: len(pg.grid(c)[1]), 10)
     checks["the menu filters to a selection's values (a chip says so, and clears it)"] = kept == ["0", "3", "6", "9"] and chip and back == 10
+    c.locator("thead th.i").click(button="right")  # (the corner, as SSMS's: every row, copied each way)
+    items = p.locator("#menu button").all_inner_texts()
+    p.locator("#menu button", has_text="Copy all with column names").click()
+    all_rows = until(lambda: pg.clipboard().splitlines(), ["n\tm\ts"] + [f"{i}\t{i % 3}\tr{i}" for i in range(10)], 5)
+    cell(2, 1).click()
+    c.locator("tbody tr:not(.gap)").nth(2).locator("td.i").click(button="right")  # (a row's number: that row, or the whole rows selected with it)
+    p.locator("#menu button", has_text="Copy as CSV").click()
+    a_row = until(pg.clipboard, "n,m,s\r\n2,2,r2\r\n", 5)
+    checks["a right-click on the grid's corner copies every row (with the column names, as CSV, JSON…), on a row's number that row"] = \
+        items[0].split("\n")[0] == "Copy all" and len(all_rows) == 11 and a_row == "n,m,s\r\n2,2,r2\r\n"
     srt = c.locator("thead th", has_text="n").first.locator(".srt")
     srt.click()
     srt.click()  # (again: the other way)
@@ -971,6 +1041,7 @@ def grid_checks(browser, port, show):
     above = cb is not None and cb["y"] + cb["height"] <= hb["y"] + hb["height"] / 2  # (the pointer is at the header's middle)
     checks["a header's button sorts (again: the other way); its card tells its type, above the pointer (it hides no rows)"] = down == "9" and card is True and above
     # Pages (round 29): an answer of more rows than come at once turns its pages, kept on the node.
+    p.evaluate("document.activeElement.blur()")  # (a menu gives the focus back to the grid, whose keys are its own)
     p.keyboard.press("Escape")
     p.keyboard.press("b")
     big = pg.run(1, "SELECT value AS n FROM range(0, 25000)")
@@ -987,7 +1058,7 @@ def grid_checks(browser, port, show):
     checks["an answer of more than 10,000 rows turns its pages (1–10,000 ▾ ‹ ›, the last page, Alt+Page Up): the node's rows, numbered on"] = \
         first == ("1–10,000", ["0"], "25,000 rows") and third == ("20,001–25,000", "20000") and second == ("10,001–20,000", "10000") and back == ("1–10,000", True)
     checks["grid: no page errors"] = pg.errors == []
-    info = {"one": one, "edges": edges, "total": total, "copied": copied, "headed": headed, "moved": moved, "kept": kept, "pages": [first, third, second], "errors": pg.errors}
+    info = {"one": one, "edges": edges, "total": total, "copied": copied, "headed": headed, "moved": moved, "kept": kept, "corner": [items, all_rows, a_row], "pages": [first, third, second], "errors": pg.errors}
     pg.ctx.close()
     return checks, info
 
@@ -1010,17 +1081,19 @@ def work_checks(browser, port, show):
     pg.cells().first.wait_for(timeout=20000)
 
     # Tabs: pinned at the left (kept after a reload), not closed with the others; many scroll, ⌄ lists them all
+    tabs = p.locator("#tabbar .tab")
+    had = tabs.count()
     for i in range(10):
         pg.menu("New SQL file")
-    tabs = p.locator("#tabbar .tab")
+    until(tabs.count, had + 10)
     tabs.nth(3).click(button="right")
     p.locator("#menu button", has_text="Pin").click()
     pinned = until(lambda: p.locator("#tabbar .pins .tab").count(), 1)
     over = p.locator("#tabbar .tlist").evaluate("l => l.scrollWidth > l.clientWidth") and p.locator("#tabbar .tmore").is_visible()
-    p.locator("#tabbar .tmore").click()
-    listed = len([x for x in p.locator("#menu button").all_inner_texts() if x.strip()])
-    p.keyboard.press("Escape")
     n = tabs.count()
+    p.locator("#tabbar .tmore").click()  # (its list is drawn by tabs.js, loaded when first used: waited for)
+    listed = until(lambda: len([x for x in p.locator("#menu button").all_inner_texts() if x.strip()]), n, 5)
+    p.keyboard.press("Escape")
     tabs.nth(n - 1).click(button="right")
     p.locator("#menu button", has_text="Close others").click()
     left = until(lambda: (p.locator("#tabbar .tab").count(), p.locator("#tabbar .tab.pinned").count()), (2, 1))
@@ -1041,6 +1114,18 @@ def work_checks(browser, port, show):
     whole = until(lambda: "SELECT a\nFROM wk" in ta.input_value() and ta.input_value(), secs=5)
     checks["Format: the Run ▾ has Format file and Format selection (off with nothing selected); each formats what it says"] = \
         any(x.startswith("Format file") for x in items) and sel_off and part == "SELECT 1;\nselect a from wk" and bool(whole) and whole.startswith("SELECT 1;")
+    # (a textarea without the focus draws no selection: the editor draws it while a menu is open)
+    bands = lambda: p.locator(".filedoc:visible .selghost > div").count()
+    lines = ta.evaluate("t => { t.focus(); t.setSelectionRange(0, t.value.indexOf('SELECT a') + 4); return t.value.slice(0, t.selectionEnd).split('\\n').length; }")
+    p.locator("#docbar .split .caret").first.click()
+    in_run = bands()
+    p.keyboard.press("Escape")
+    ta.click(button="right", position={"x": 60, "y": 15})
+    in_right = bands()
+    p.keyboard.press("Escape")
+    ta.focus()
+    checks["a selection stays in sight while the Run ▾ or the right-click menu is open (a band a line), and is the editor's own again once it has the focus"] = \
+        lines > 1 and in_run == lines and in_right == lines and bands() == 0 and ta.evaluate("t => t.selectionStart === 0 && t.selectionEnd === t.value.indexOf('SELECT a') + 4")
 
     # Markdown: a .md file's preview, and a notebook's Markdown cell
     pg.workspace("wk", "notes.md").click()
@@ -1292,7 +1377,7 @@ def layout_checks(browser, port, show):
             a.workspace("notes", "a.sql").click()
             a.p.wait_for_function("document.activeElement?.tagName === 'TEXTAREA'")
             a.p.fill(".param input", "0")
-            a.p.click("#runBtn")
+            a.p.click("#runAll")
             a.p.locator(".stmts .stmt").nth(1).wait_for(timeout=15000)
             a.p.locator(".filedoc .gt").wait_for(timeout=15000)
             found[scheme + " SQL file"] = audit(a.p, axe)
@@ -1332,12 +1417,12 @@ def budget_checks(browser, port, show):
             fresh[name] = e.code
     total = sum(sizes.values()) if all(sizes.values()) else None
     later = {}
-    for name in ["chart.js", "plan.js", "more.js", "details.js", "more.css", "data.js", "md.js", "jobs.js", "settings.js", "objects.js", "pyfile.js", "versions.js", "stmts.js", "params.js"]:  # (loaded when first used)
+    for name in ["chart.js", "plan.js", "more.js", "details.js", "more.css", "data.js", "md.js", "jobs.js", "settings.js", "objects.js", "pyfile.js", "sqlfile.js", "rename.js", "versions.js", "stmts.js", "params.js", "tabs.js", "live.js"]:  # (loaded when first used)
         r = urllib.request.urlopen(urllib.request.Request(f"{base}/console/{name}", headers={"accept-encoding": "gzip"}))
         later[name] = len(r.read()) if r.headers.get("content-encoding") == "gzip" else None
     checks["the scripts and style sheet the page loads, gzipped as the node serves them: <= 70 KB; each answers 304 when the browser has it"] = total is not None and total <= 70 * 1024 \
         and set(fresh.values()) == {304}
-    checks["those loaded when first used (a chart, a plan, History, details, a data file, Markdown, Jobs, Settings, the tree's menus, a Python file): <= 8 KB each, gzipped"] = all(v is not None and v <= 8 * 1024 for v in later.values())
+    checks["those loaded when first used (a chart, a plan, History, details, a data file, Markdown, Jobs, Settings, the tree's menus, a Python file, a SQL file, renaming, the tabs' menus, live answers): <= 8 KB each, gzipped"] = all(v is not None and v <= 8 * 1024 for v in later.values())
     paints = []
     for _ in range(3):
         pg = Page(browser, base + "/")
