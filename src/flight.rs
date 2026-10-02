@@ -83,7 +83,7 @@ async fn caller<T>(app: &App, req: &Request<T>) -> crate::auth::Principal {
 
 /// Batches as a Flight stream (the schema first, so an empty result still has columns).
 fn send(schema: SchemaRef, batches: Vec<RecordBatch>) -> Out<FlightData> {
-    let stream = futures::stream::iter(batches.into_iter().map(Ok));
+    let stream = futures::stream::iter(batches.into_iter().map(|b| Ok(crate::query::compact(b))));
     Box::pin(FlightDataEncoderBuilder::new().with_schema(schema).build(stream).map_err(Status::from))
 }
 
@@ -248,7 +248,7 @@ async fn log_stream(app: App, table: String, after: Option<u64>, columns: Option
                         continue;
                     }
                     let chunk = rows.and_then(|rows| {
-                        let rows = rows.iter().map(|b| b.project(&pick)).collect::<Result<Vec<_>, _>>().map_err(status)?;
+                        let rows = rows.iter().map(|b| b.project(&pick).map(crate::query::compact)).collect::<Result<Vec<_>, _>>().map_err(status)?;
                         let mut data: Vec<Result<FlightData, Status>> = arrow_flight::utils::batches_to_flight_data(&schema, rows).map_err(status)?.into_iter().skip(1).map(Ok).collect(); // (the schema went first)
                         data.push(Ok(FlightData { app_metadata: format!("{{\"after\":{now}}}").into_bytes().into(), ..Default::default() }));
                         Ok(data)

@@ -23,6 +23,7 @@ mod feeds;
 mod files;
 mod format;
 mod flight;
+mod fresh;
 mod fsum;
 mod hot;
 mod intervals;

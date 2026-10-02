@@ -55,7 +55,7 @@ impl Spill {
     }
 
     pub fn push(&mut self, batch: RecordBatch) -> Result<()> {
-        let batch = compact(batch)?;
+        let batch = crate::query::compact(batch); // (a shuffle cuts every batch into a piece per node and partition: without it, each piece carries, writes and sends all of the batch's strings; TPC-H q21 wrote 2.5 GB a node, not a tenth of that)
         self.schema.get_or_insert_with(|| batch.schema());
         self.bytes += size(&batch);
         self.rows.push(batch);
@@ -156,24 +156,6 @@ impl Spill {
 fn size(b: &RecordBatch) -> usize {
     use datafusion::arrow::array::Array;
     b.columns().iter().map(|c| c.to_data().get_slice_memory_size().unwrap_or_else(|_| c.get_array_memory_size())).sum()
-}
-
-/// A batch with its string and binary views copied out of the buffers they share with the batch
-/// they were cut from. A shuffle cuts every batch into a piece per node and partition; without
-/// this, each piece would carry — and write to disk, and send — all of the original's strings
-/// (TPC-H q21 wrote 2.5 GB a node instead of a tenth of that).
-fn compact(b: RecordBatch) -> Result<RecordBatch> {
-    use datafusion::arrow::array::{ArrayRef, AsArray};
-    use datafusion::arrow::datatypes::DataType;
-    if !b.columns().iter().any(|c| matches!(c.data_type(), DataType::Utf8View | DataType::BinaryView)) {
-        return Ok(b);
-    }
-    let columns = b.columns().iter().map(|c| match c.data_type() {
-        DataType::Utf8View => Arc::new(c.as_string_view().gc()) as ArrayRef,
-        DataType::BinaryView => Arc::new(c.as_binary_view().gc()) as ArrayRef,
-        _ => c.clone(),
-    });
-    Ok(RecordBatch::try_new(b.schema(), columns.collect())?)
 }
 
 /// One piece with its length before it, as `framed` sends them.

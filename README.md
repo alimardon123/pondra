@@ -429,6 +429,9 @@ python3 tools/shuffle_spill.py                 # a shuffle bigger than memory, a
 python3 tools/spread_tpch.py --expect 22        # all 22 TPC-H queries on 3 nodes == one node (13 by key ranges)
 python3 tools/skew_check.py                     # a hot join key: same answers, work shared out over the nodes
 python3 tools/join_order.py                    # the same query written badly runs as fast
+python3 tools/bench/singlenode.py run --suite clickbench --data <hits> --engines pondra,pondra-cold,duckdb,duckdb-native   # ClickBench against DuckDB
+python3 tools/bench/clickbench_ties.py --data <hits>   # ClickBench's answers that differ from DuckDB's are ties a LIMIT cuts through
+python3 tools/tpcds_check.py run --data <tpcds> [--hot] # TPC-DS's 99 queries == DuckDB's
 python3 tools/metadata_bench.py [--files 1000000]   # a table with a million files: commits, pruning, 3 nodes
 python3 tools/flight_bench.py                   # Arrow Flight in, out, and the log as a stream
 python3 tools/cloud/bench.py --nodes …          # a cluster on several machines (tools/cloud/README.md)

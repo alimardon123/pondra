@@ -59,7 +59,8 @@ src/      28,600 lines of Rust, one file per concern (see the table in README.md
           API, state and node; editor.js; grid.js; notebook.js; files.js the Workspace and the
           file tabs; console.js the shell and `window.pondra`; loaded when first used: more.js
           (Runs, Variables, Settings, search, choosing Python), data.js (data files), chart.js,
-          plan.js, details.js and more.css), xlsx.rs (a download as an Excel workbook)
+          plan.js, details.js and more.css), xlsx.rs (a download as an Excel workbook); round 32 fresh.rs (a view's plan kept from one write to
+          the next)
 brand/    the logo (mark.svg), colours (colors.css) and fonts (fonts/: Geist and Geist Mono, SIL
           OFL): the only copies; tools/brand_check.py
 site/     the documentation website (Starlight; ADR-030): site/STYLE.md says how pages are written,
@@ -81,7 +82,7 @@ tools/    harness.py, cluster.py (tests), open_check.py (Delta + Iceberg readers
           newuser_bench.py (first reads, new nodes), demo_lake.py (one of everything + the tree),
           serve_bench.py + loadgen.go (serving), bench/tpch.py (TPC-H vs DuckDB and Spark),
           sizes.py, sim_r2.py (local S3 with R2 latency), udf_server.py (a function of your own,
-          in Python, over Arrow Flight), bench/singlenode.py (TPC-H vs DuckDB, Polars, Daft, Bodo),
+          in Python, over Arrow Flight), bench/singlenode.py (TPC-H and ClickBench vs DuckDB, Polars, Daft, Bodo; bench/clickbench_ties.py: its answers that differ are ties),
           metadata_bench.py (a table with a million files), flight_bench.py (Arrow Flight),
           shuffle_spill.py (a shuffle bigger than memory, and one that loses a node),
           join_order.py (the same queries written badly: same answers, no slower),
@@ -214,8 +215,12 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
   which reads each node's results onto its own disk and finishes the query over them.
 - **Join order from the catalog** (`optimize::JoinOrder`, `query::Pruned::statistics`): rows,
   bytes and each column's range (bounding its distinct values) become DataFusion statistics;
-  inner joins are rebuilt smallest-first when that costs less than the order the query wrote,
-  which is costed the same way as the tree it is. `PONDRA_JOIN_ORDER=0` turns it off.
+  inner joins are rebuilt greedily, from each input in turn, when that costs less than the order the query wrote,
+  which is costed the same way as the tree it is. A filter keeps its share by distinct counts and
+  the columns' spans (`kept`: a month of dates, one year of 201), a join keeps only the key values
+  both sides have (`joined`), and a subquery's semi join goes onto the smaller side first
+  (`SemiJoinDown`). `PONDRA_JOIN_ORDER=0` turns the order off; `PONDRA_DEBUG_JOIN_ORDER=1` prints
+  each choice.
 - **Streams on their own time** (round 16, `views.rs`): the watermark of a window or session
   view is its source's newest event time less the lateness (`views::newest`: file ranges, then
   each new log segment once, in the leader's memory). Window views emit each window to
@@ -483,7 +488,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
 35. **A scalar subquery is answered before anything that uses it runs** (`spmd::hoist`): a shuffle
    takes the `ScalarSubqueryExec`s out of the plan, and `step()` fills their shared answer slots
    as soon as the exchanges they read are done — on every node, from the same all-gathered rows.
-   A shuffle's pieces are compacted (`spill::compact`) before they are counted or written: a
+   A shuffle's pieces are compacted (`query::compact`, invariant 202) before they are counted or written: a
    `Utf8View` slice otherwise carries every string of the batch it was cut from.
 36. **A key range holds its NULLs once.** The first range holds every NULL of the key: a piece
    that may hold one (`DataFile::nulls` lists the column, or doesn't say) is read by the first
@@ -636,7 +641,10 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    planned; `COPY … FROM STDIN` gathers per connection and loads through the log 32 MB at a time,
    split at a line's end (for CSV, outside quotes).
 72. **A query that ran both ways goes the way that was faster** (`guard::ran_spread`), unless the
-   network is pretended (`PONDRA_LINK`: the model alone, as the tests need).
+   network is pretended (`PONDRA_LINK`: the model alone, as the tests need). One spread run slower
+   than here doesn't decide alone (`guard::spread_runs`: the other nodes saw the query cold), so
+   the model decides until a second agrees; one slow first run kept the cluster bench's q1 on one
+   node for good (`harness.py guard`: "one spread run slower than here doesn't decide alone").
 73. **`pondra_object_requests_total` counts what the store was asked to do** (`store::Counted`), not
    what SlateDB tried: a local disk refuses SlateDB's tagged PUT before writing, and it tries again
    untagged; the refusal isn't counted.
@@ -1269,6 +1277,55 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    kept where nothing reads it. A run's given values replace its `DECLARE`s' defaults, cast to
    their types. `pondra.variables` and `pondra.parameters('file')` are never remembered answers
    and run on their node. `harness.py variables`.
+199. **A query's session is a copy, and only its functions are shared** (`Lake::session_with`):
+   the functions, planners and rules every session has are made once a partition count and
+   copied; each copy gets catalogs of its own, so the tables, views and temporary tables a query
+   registers are its alone, and what a session changes (settings, its functions) changes its
+   copy. Nothing that holds the lake goes into what is kept (`files()`, `file_read`, `secrets()`
+   are registered on each copy), or the lake would never be dropped. With the catalogs shared,
+   `harness.py temps` fails at its first `CREATE TEMP TABLE … FROM orders` ("the table orders
+   already exists": the last query's tables were still registered).
+200. **A view's plan is kept from one write to the next only when nothing of that write stays in it**
+   (`fresh.rs`): a view or streaming task whose SQL reads the new rows alone (its session registered
+   no other table) and calls no function that may answer otherwise next time (`now()` is folded as
+   it is planned) keeps its physical plan, keyed by its SQL, the rows' columns, the partitions and
+   the lake's functions (`f/`). The rows are a table with no statistics (DataFusion answers a
+   `count(*)` from exact ones), and each write resets every operator's state, as DataFusion runs a
+   recursive query's plan again, with that write's rows in the leaf. `harness.py flows`: "a kept
+   plan keeps no write's count…" (1, 1, 1, 1, 1 with exact statistics) and "…nor its time" fail
+   without them.
+201. **An inner join runs before a LEFT JOIN only when it reads nothing of the LEFT JOIN's padded side**
+   (`optimize::OuterLast`): `(a LEFT JOIN b) JOIN c ON a.x = c.y` is `(a JOIN c) LEFT JOIN b`, never
+   when the inner join's keys or condition name a column of `b` (its NULL-padded rows would meet
+   it), and never past an as-of join (`asof::marked`: its plan has a shape of its own). The order
+   rule then sees the inner joins together; it counts an equality in a join's condition as a key
+   (`optimize::equalities`), since filters pushed into joins become keys only a pass later, when
+   projections already sit between them. `join_order.py`: "past an outer join, written badly, joins
+   the returns last" and "under an exists, written badly, starts from the nation" fail without
+   them; `tpcds_check.py`: 99 of 99 the same as DuckDB.
+202. **An answer carries only its own rows' strings** (`query::compact`): a string or binary view
+   points into a buffer it may share with every other row of the page or batch it came from, and
+   Arrow IPC sends every buffer a view points into. So an answer (`App::query_as`), every IPC stream
+   (`query::ipc`, `log::encode_ipc`), Flight's streams and a shuffle's pieces copy out views whose
+   buffers are mostly other rows'. Without it a `LIMIT 5` of a 50,000-row table was 3.2 MB as
+   Arrow, a 10-row ClickBench answer 220 MB (and too big for the result cache).
+   `harness.py found`: "a few rows of a table's, sent as Arrow (HTTP, Flight), carry only their own
+   strings".
+203. **A hot batch is skipped only when its ranges rule it out, and its filters stay above**
+   (`hot::HotSource`, `Skip`): every hot column of an ordered type (integers, dates, times,
+   decimals; not floats or strings) keeps each 8,192-row batch's least and greatest value, NULLs
+   and rows, and a scan skips the batches its pushed filters can't match, as a Parquet scan skips
+   row groups (`PruningPredicate`), while saying `PushedDown::No`, so every row is still filtered
+   above. A fetch turns skipping off. A dynamic filter is looked at again as it moves, soon at
+   first and then ever later (a top-N moves its bound after every batch, and each look costs about
+   a batch). A top-N reads the batches in its first key's order (`TopFirst`, through filters,
+   projections and exchanges; DataFusion's own sort pushdown stops at a filter), never a scan with
+   a fetch, and its sort stays above: only the batches' order changes. The source never shows its
+   predicate (`apply_expressions`): a join builds its dynamic filter only for a plan that shows it, and
+   building them made TPC-H from memory a tenth slower. `harness.py hot`: a range of the time, a
+   top-N either way (through a filter too) and a key skip batches, and NULL-sensitive filters over
+   a batch of NULLs answer as the model does (fails on a build without it; the newest rows skip
+   nothing without `TopFirst`).
 
 ## Tests: run these before and after any change
 
@@ -1281,6 +1338,7 @@ python3 tools/fuzz_doors.py --secs 60   # malformed input at HTTP, SQL, Postgres
 python3 tools/harness.py versions       # every file keeps its versions: listed, read, restored, after a delete, retention, old notebooks
 python3 tools/harness.py stopped        # a run whose node was killed under it: stopped, not running for good
 python3 tools/harness.py variables      # DECLARE $x, $x = …, SET VARIABLE, getvariable: sessions, Postgres, procedures, file runs, db.vars, pondra.parameters
+python3 tools/harness.py hot            # hot columns skip batches by their ranges (a time range, a top-N either way, a key); NULL filters == the model
 python3 tools/harness.py sparksql       # spark.sql / spark_sql('…') in Spark's grammar: literals, LATERAL VIEW, Spark's floor and substring, frames on top, refusals
 python3 tools/harness.py flows          # views of views in one commit, rollups, expectations (keep, drop, fail), changes down the flow
 python3 tools/harness.py begin          # BEGIN … COMMIT from every door, read-your-writes, 40001 and retries, 25P02, SQLSTATEs

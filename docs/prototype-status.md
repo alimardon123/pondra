@@ -15,6 +15,99 @@ One Rust binary replaces the Kafka + Flink + Spark + metastore + ZooKeeper stack
 
 Start more copies on the same bucket to scale out. The only state is object storage. There's no JVM, no database server and no coordination service.
 
+**Then (2026-10-02, round 32 so far): lean and fast** (the owner, 2026-10-01: a round only for
+optimizing; performance first):
+
+1. **The join order from every input in turn** (`optimize::JoinOrder`): the greedy order is built
+   from each input, the cheapest taken, where it started from the smallest alone. TPC-DS q72 began
+   at its 5 warehouses, then joined all of the inventory: 81 s, now 0.17 s (DuckDB 0.31 s). A join
+   on several keys counts the one that spreads its rows most, not their product (TPC-H q9 would
+   otherwise start with partsupp joined to all of lineitem, as if 2,400 rows came out: 6 million
+   do). `tools/join_order.py` has q72's shape ("far from the filters": its plan must start from a
+   filtered table; the round 31 build starts from nation): the badly written queries 1.22 → 1.01 s,
+   the worst 1.72× its well written twin, now 1.15×. TPC-H SF1 from memory 1.38 → 1.29 s on this
+   machine; TPC-DS's 99 still equal DuckDB's (`logs/round32/`).
+2. **Planning that costs less:** orders are costed over which inputs each key reads (a bit an
+   input), not over schemas built at every step, and a table's statistics are worked out once a
+   query (its sketches' estimates were made again for every input costed). TPC-DS q64 plans in
+   0.16 s, 0.22 s before (0.71 s with the first try at the order above).
+3. **Small queries cost half what they did** (invariant 199): a query's session is a copy of one
+   made once per lake (its functions, planners and rules: registering them again was a third of
+   `SELECT 1`), with catalogs of its own; only the table entries a query names are decoded (every
+   table's was, about half of a small query's time), stored views are expanded only when named,
+   and the cores are counted once. Over HTTP, on TPC-DS's lake: `SELECT 1` 1.64 → 0.86 ms, a count
+   of a small table 3.2 → 2.2 ms, a three-table join that finds nothing 10.6 → 8.7 ms.
+4. **Flows within 5% of ingest** (invariant 200; the bar was 10%): a view that reads a write's new
+   rows alone keeps its physical plan from one write to the next, and each write puts its rows in
+   it (planning was 60% of what a view cost a write: a GROUP BY of 4,000 rows, 0.9 ms planning and
+   0.4 ms running), one partition for a write's rows. `tools/bench/flow.py`, 4 producers of 1,000
+   rows: three stages cost 15.4% of ingest before, 5.0% now (191K rows/s against 201K with no
+   view); the node's CPU for the three 130% → 82% (53% with none); `logs/round32/flow.json`.
+5. **CI the same every push:** `harness.py functions`' killed-worker check waits for the workers
+   it killed to be gone (the next query could take one the node still saw running); fuzzed nodes
+   run in their test folder (`ATTACH 'nope'` had left two lakes in the repository).
+6. **Joins the order rule couldn't see** (invariant 201): under an `EXISTS` or `IN`, comma joins'
+   equalities were still conditions when the rule looked (keys only a pass later, with projections
+   between the joins by then), so TPC-H q21 joined all of lineitem to its suppliers before its one
+   nation cut them: from memory 0.18 → 0.09 s, from files 0.23 → 0.19 s; q17 0.065 → 0.047 s. And
+   an inner join that reads nothing of a `LEFT JOIN`'s padded side now runs before it (TPC-DS's
+   sales `LEFT JOIN` returns, then dates and items): q80 3.4 → 0.08 s (DuckDB 0.07 s), q40 0.45 →
+   0.03 s (0.02 s); TPC-DS's 99 18.2 → 15.2 s (DuckDB 7.6 s), all the same as DuckDB's.
+   `tools/join_order.py` has both shapes, their plans checked.
+7. **Row estimates the order rule can trust** (`optimize::kept`, `joined`, `SemiJoinDown`): a
+   filter keeps its share by the column's distinct values and its span (a month of 200 years of
+   dates is a month, not a third), a join keeps only the key values both sides have, and a
+   subquery's semi join goes onto the smaller side before the order is chosen. 52 of TPC-DS's 99
+   plans change, none slower (each re-timed both ways, alternating): q98 0.056 → 0.036 s, q72
+   0.163 → 0.119 s, q50 0.076 → 0.057 s, q62, q58, q61 about a fifth faster; the 99 in one run
+   15.7 → 13.0 s against DuckDB's 7.8–8.1 s, measured side by side. TPC-H's 22 plans don't change.
+   q72 first went 10× slower: inventory joined to every date kept all 10,436 weeks, so a later
+   join on the week looked like a cut (unit tests in `optimize.rs`).
+8. **The cluster bench on 0.30 (932cbad, the owner's runs #15 and #16, SF10 on GitHub's 4-vCPU
+   runners over Tailscale):** every answer the same as one node's; 3 nodes 22.4 s as the cluster
+   decides against 23.8 s on one node (34.5 s spread anyway), 6 nodes 24.2 s against 26.2 s (33.3
+   s). Two things kept time on the table. One slow first spread run (the other nodes' caches cold)
+   decided for good: q1 spread in 2.1 s the first time and 1.0 s after, yet went back to 2.4 s on
+   one node; now a second run must agree (invariant 72). And the guard's 20 round trips a step
+   keep queries that move nothing on one node (6 nodes: q12 0.50 s spread against 0.98 s, q19
+   0.68 s against 1.07 s, q3 0.67 s against 0.95 s); its next runs log each decision
+   (`PONDRA_DEBUG_SPREAD`, the nodes' logs kept), to set that from what the steps take.
+9. **Answers carry only their own strings** (invariant 202): a string read from a file is a view
+   into a buffer the whole page shares, and Arrow IPC sends every buffer a view points into, so a
+   few rows took their pages with them. An answer, every IPC stream, Flight's streams and a
+   shuffle's pieces now copy out views whose buffers are mostly other rows'. A `LIMIT 5` of a
+   50,000-row table was 3.2 MB as Arrow, now under 16 KB; ClickBench's 10-row answers were up to
+   220 MB, too big for the result cache.
+10. **Hot batches skipped by their ranges, a top-N read in its key's order** (invariant 203,
+   `hot::HotSource`, `TopFirst`): each 8,192-row batch of a hot column of an ordered type keeps its
+   least and greatest value, NULLs and rows, and a scan skips the batches its filters rule out, as a
+   Parquet scan skips row groups. A top-N's bound skips them too, and it reads the batches in its
+   first key's order, so the bound is tight after the first few. The filters stay above the scan,
+   so every row is still checked. With every column hot and the build before alternated, 10 runs
+   each: ClickBench's two top-N by time (q25, q27) 0.029 → 0.007 s and 0.027 → 0.006 s, where
+   DuckDB's own tables take 0.007 and 0.006 s; the 43 about 3% faster in all; TPC-H and TPC-DS
+   from memory the same within noise (the queries one pass showed slower, re-timed alone: TPC-DS
+   q66, q78, q93, TPC-H q19, q12, q7; q7 with skipping on and off in one build, 30 runs each six
+   times over, 0.051 against 0.050 s, not a significant difference). Looking costs about 2 µs a
+   batch when nothing can be skipped: 0.3 ms per partition of `lineitem` at SF1, before its first
+   batch. The first version looked at a moving bound again after every
+   batch, which made those two top-N slower than before; it now looks soon at first and then ever
+   later. `harness.py hot` checks the answers against a model (NULLs, `IS DISTINCT FROM`, `IN`, a
+   top-N either way, through a filter) and that batches were skipped.
+11. **ClickBench, measured** (`tools/bench/singlenode.py --suite clickbench`: the first 10 million
+   rows of `hits`, 43 queries, best of 3, this 4-core, 15 GB machine; `logs/round32/`): Pondra
+   from memory 8.22 s, from files 12.25 s; DuckDB 1.5.5 over the Parquet file 11.11 s, in its own
+   tables 7.18 s; DuckDB 2.0's preview 10.89 s and 6.22 s. The 7 answers that differ from DuckDB's
+   are ties a `LIMIT` cuts through (`tools/bench/clickbench_ties.py`: the same row count, every row
+   a real group, the sort key's values the same). Pondra is ahead on the regular expression (q29:
+   1.49 s against 3.12 s) and the `LIKE` counts (q21, q22); DuckDB's own tables are far ahead where
+   a filter keeps few rows of many columns: q24 (`SELECT *` of a top-N, 1.27 s against 0.11 s:
+   DuckDB fetches the other columns only for the rows it keeps), q23, and the pages of one counter
+   (q37 to q43, 3 to 5×). Those are next.
+12. **TPC-H SF1, the same day** (`logs/round32/tpch-sf1*.json`): Pondra from memory 1.22 s, from
+   files 2.18 s; DuckDB 1.5.5 over Parquet 2.19 s, its own tables 1.05 s; DuckDB 2.0's preview
+   1.98 s and 0.92 s; Polars 1.44 1.92 s. Every answer equal to DuckDB's.
+
 **Then (2026-10-01, round 31, second part so far; 0.29.0): every kind of object alike, SQL and
 Python in one notebook** (the owner's list after the first part):
 
