@@ -8,6 +8,14 @@ use datafusion::optimizer::{optimizer::ApplyOrder, Optimizer, OptimizerConfig, O
 use datafusion::common::config::ConfigOptions;
 use datafusion::physical_optimizer::{optimizer::PhysicalOptimizer, PhysicalOptimizerRule};
 use datafusion::physical_expr::expressions::{lit, Column as PhysicalColumn, DynamicFilterPhysicalExpr};
+use datafusion::datasource::physical_plan::{FileScanConfigBuilder, ParquetSource};
+use datafusion::datasource::source::DataSourceExec;
+use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
+use datafusion::physical_plan::projection::ProjectionExec;
+use datafusion::physical_plan::repartition::RepartitionExec;
+use datafusion::physical_plan::sorts::sort::SortExec;
+use datafusion::physical_plan::union::UnionExec;
+use datafusion::physical_plan::execution_plan::replace_children_if_necessary;
 use datafusion::physical_plan::{aggregates::AggregateExec, filter::FilterExec, joins::HashJoinExec, ExecutionPlan, PhysicalExpr};
 use datafusion::prelude::SessionConfig;
 use std::collections::HashSet;
@@ -449,6 +457,7 @@ pub fn physical_rules() -> Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> {
     let end = rules.iter().position(|r| r.name() == "SanityCheckPlan").unwrap_or(rules.len());
     rules.insert(end, Arc::new(crate::hot::TopFirst)); // (after DataFusion's own sort pushdown)
     rules.insert(end, Arc::new(MinMaxBounds)); // (after the filters are pushed down)
+    rules.insert(end, Arc::new(WideTopN)); // (likewise)
     rules
 }
 
@@ -485,6 +494,59 @@ impl PhysicalOptimizerRule for MinMaxBounds {
     fn schema_check(&self) -> bool {
         true
     }
+}
+
+/// A top-N of many columns (`SELECT * … WHERE … ORDER BY t LIMIT 10`) reads its Parquet files
+/// filtering as it decodes: the filters' and the sort key's columns first, every other column only
+/// for the rows they keep, as DuckDB fetches them (ClickBench q24 from files 2.34 → 0.57 s).
+/// Anywhere else decoding all of a scan's columns at once is faster (with it on for every scan,
+/// TPC-H from files took a third longer), so only under a top-N, through what keeps its rows as they
+/// are, and only for a scan of at least `WIDE` columns. The filters still run above it.
+#[derive(Debug)]
+struct WideTopN;
+
+const WIDE: usize = 16;
+
+impl PhysicalOptimizerRule for WideTopN {
+    fn optimize(&self, plan: Arc<dyn ExecutionPlan>, _: &ConfigOptions) -> Result<Arc<dyn ExecutionPlan>> {
+        plan.transform_down(|p| {
+            if !p.downcast_ref::<SortExec>().is_some_and(|s| s.fetch().is_some()) {
+                return Ok(Transformed::no(p));
+            }
+            let child = late(p.children()[0].clone())?;
+            if Arc::ptr_eq(&child, p.children()[0]) {
+                return Ok(Transformed::no(p));
+            }
+            Ok(Transformed::new(replace_children_if_necessary(p.clone(), vec![child])?, true, TreeNodeRecursion::Jump))
+        })
+        .data()
+    }
+
+    fn name(&self) -> &str {
+        "wide_top_n"
+    }
+
+    fn schema_check(&self) -> bool {
+        true
+    }
+}
+
+/// `p` with its wide Parquet scans filtering as they decode, through nodes that keep rows as they are.
+fn late(p: Arc<dyn ExecutionPlan>) -> Result<Arc<dyn ExecutionPlan>> {
+    if let Some(scan) = p.downcast_ref::<DataSourceExec>() {
+        return Ok(match scan.downcast_to_file_source::<ParquetSource>() {
+            Some((config, parquet)) if p.schema().fields().len() >= WIDE && !parquet.table_parquet_options().global.pushdown_filters => {
+                let parquet = parquet.clone().with_pushdown_filters(true).with_reorder_filters(true);
+                DataSourceExec::from_data_source(FileScanConfigBuilder::from(config.clone()).with_source(Arc::new(parquet)).build())
+            }
+            _ => p,
+        });
+    }
+    if !(p.is::<ProjectionExec>() || p.is::<FilterExec>() || p.is::<RepartitionExec>() || p.is::<CoalescePartitionsExec>() || p.is::<UnionExec>()) {
+        return Ok(p);
+    }
+    let children = p.children().into_iter().map(|c| late(c.clone())).collect::<Result<Vec<_>>>()?;
+    replace_children_if_necessary(p, children)
 }
 
 /// Does every bound of `a`'s filter have a value as soon as any has (so none is left out while
