@@ -275,12 +275,16 @@ function keys(e, ed) {
 // ------------------------------------------------------------------ completion
 const FUNCS = 'abs avg ceil coalesce concat count date_bin date_part date_trunc extract floor greatest least length lower ltrim max min now nullif regexp_replace replace round row_number rank dense_rank lag lead first_value last_value split_part stddev strpos substr sum to_char to_date to_timestamp trim upper approx_distinct approx_percentile_cont median array_agg string_agg json_get json_get_str cosine_distance read_parquet read_csv read_json files file_read range generate_series'.split(' ');
 let cm = null; // (the completion open now: its editor, where the word starts, the choices, the one on)
+/** In Python, is the caret in the string given to a `.sql(` or `.table(` call? SQL is written there. */
+const inSql = b => { const m = [...b.matchAll(/\.(?:sql|table)\(\s*[rf]?("""|'''|"|')/g)].pop(); return !!m && !b.slice(m.index + m[0].length).includes(m[1]); };
 /** Names that complete the word before the caret: the lake's tables and columns (those of the
- * tables the text names first), SQL's words and functions; in Python, its tab's variables. */
+ * tables the text names first), SQL's words and functions, in SQL and in Python's `db.sql("…")`;
+ * in Python, its tab's variables. */
 export function complete(ed, force) {
-  const ta = ed.ta, at = ta.selectionStart, before = ta.value.slice(0, at), m = before.match(/[\w.$"]*$/), word = m[0].replace(/"/g, '');
+  const ta = ed.ta, at = ta.selectionStart, before = ta.value.slice(0, at), sql = ed.language === 'sql' || ed.language === 'python' && inSql(before);
+  const m = before.match(ed.language === 'sql' ? /[\w.$"]*$/ : /[\w.$]*$/), word = m[0].replace(/"/g, ''); // (in Python a quote starts the string, not a name)
   if (!word && !force) return false;
-  if (ed.language === 'sql' && word.includes('.')) { // (after `o.`, `sales.orders.`, `sales.`: that table's columns, or that schema's tables)
+  if (sql && word.includes('.')) { // (after `o.`, `sales.orders.`, `sales.`: that table's columns, or that schema's tables)
     const dot = word.lastIndexOf('.'), q = word.slice(0, dot).toLowerCase(), rest = word.slice(dot + 1), objs = S.objects || [];
     const named = n => objs.filter(t => [t.t, `${t.s}.${t.t}`, t.q].some(x => x.toLowerCase() === n.toLowerCase()));
     let tables = named(q);
@@ -292,7 +296,7 @@ export function complete(ed, force) {
   }
   const low = word.toLowerCase(), seen = new Set(), all = [];
   const push = (text, ty, rank) => { if (!seen.has(text) && text.toLowerCase().startsWith(low) && text.toLowerCase() !== low) { seen.add(text); all.push({ text, ty, rank }); } };
-  if (ed.language === 'sql') {
+  if (sql) {
     if (word[0] === '$') for (const n of [...ta.value.matchAll(/\$([A-Za-z_]\w*)/g)].map(m => m[1]).concat(S.sqlVars || [])) push('$' + n, 'variable', 0);
     const named = (S.objects || []).filter(t => new RegExp(`\\b${t.t.replace(/[^\w]/g, '')}\\b`, 'i').test(ta.value));
     for (const t of named) for (const col of t.columns) push(ident(col.n), sqlType(col.d), 0);

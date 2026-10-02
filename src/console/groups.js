@@ -1,11 +1,12 @@
-// The Data tree's other objects (ADR-034): functions, procedures, schedules and secrets, and an
-// extension's kinds (`register.objectKind`), each a group under the lake listed when opened; a click
-// shows one's details, a right-click its menu. Loaded when a group is first opened (objects.js has
-// the tables', schemas' and lakes' menus).
+// The Data tree's other objects (ADR-034): functions, procedures, schedules, secrets, users and
+// roles (access.js), and an extension's kinds (`register.objectKind`), each a group under the lake
+// listed when opened; a click shows one's details, a right-click its menu. Loaded when a group is
+// first opened (objects.js has the tables', schemas' and lakes' menus).
 import { h, svg, S, R, rows, ident, quote, menu, pop } from './core.js';
 import { highlighted } from './editor.js';
 import { copyText } from './grid.js';
 import { tab, danger, more, created } from './objects.js';
+import { users, newUser, access } from './access.js';
 
 const H = R.helpers;
 const fnSql = x => `CREATE OR REPLACE ${x.kind === 'procedure' ? 'PROCEDURE' : x.kind === 'macro' ? 'MACRO' : 'FUNCTION'} ${x.name}(${x.arguments || ''})${x.returns ? ` RETURNS ${x.returns}` : ''}${x.language && x.language !== 'sql' ? ` LANGUAGE ${x.language}` : ''} AS $$\n${x.body}\n$$;`;
@@ -35,7 +36,9 @@ const KINDS = {
     list: () => rows('SELECT * FROM secrets() ORDER BY name'),
     item: x => ({ name: x.name, icon: 'key', meta: x.type, title: x.scope ? `for ${x.scope}` : x.type, word: 'a secret (its values never show)' }),
     facts: x => [['Type', x.type], ['For', x.scope]],
-    menu: x => [{ label: 'Replace its values…', icon: 'pencil', run: () => tab(`CREATE OR REPLACE SECRET ${x.name} (TYPE ${x.type}, KEY_ID '…', SECRET '…'${x.scope ? `, SCOPE ${quote(x.scope)}` : ''});`) }, '-', drop('SECRET', x)] },
+    menu: x => [{ label: 'Replace its values…', icon: 'pencil', run: () => tab(`CREATE OR REPLACE SECRET ${x.name} (TYPE ${x.type}, KEY_ID '…', SECRET '…'${x.scope ? `, SCOPE ${quote(x.scope)}` : ''});`) },
+      { label: 'Who may use it…', icon: 'user', run: () => access({ on: { kind: 'secret', name: x.name } }) }, '-', drop('SECRET', x)] },
+  users,
 };
 /** A group's objects under the lake, drawn when it is opened. */
 export async function fill(kind, box, schema) {
@@ -57,9 +60,9 @@ function detail(it, k, x, items) {
   const list = items().filter(m => m && m !== '-' && !m.head), first = list.filter(m => !/^(Drop|Its definition)/.test(m.label)).slice(0, 3); // (the definition is shown below)
   const moreBtn = H.act('dots', 'More', 'Everything that can be done with it', e => menu(e.currentTarget, items())), sql = k.sql?.(x);
   return [H.head(it.icon, it.name, it.word || k.title || ''), h('div', { class: 'acts2' }, ...first.map(m => H.act(m.icon, m.label.replace(/…$/, ''), m.label, m.run)), moreBtn),
-    k.facts ? H.facts(k.facts(x)) : null, sql ? h('div', { class: 'dsect' }, 'Definition') : null, sql ? h('pre', { class: 'defn', html: highlighted(sql, 'sql') }) : null];
+    k.facts ? H.facts(k.facts(x)) : null, k.extra?.(x), sql ? h('div', { class: 'dsect' }, 'Definition') : null, sql ? h('pre', { class: 'defn', html: highlighted(sql, 'sql') }) : null];
 }
 export function groupMenu(at, kind, schema) {
   const k = R.objectKinds.find(x => x.id === kind), make = { functions: 'function', procedures: 'procedure', schedules: 'schedule', secrets: 'secret' }[kind];
-  menu(at, [make ? created(make, schema && schema !== 'public' ? `${ident(schema)}.` : '') : null, k?.create ? { label: `New ${k.title.toLowerCase()}…`, icon: 'plus', run: () => tab(k.create()) } : null, { label: 'Refresh', icon: 'refresh', run: () => H.refresh() }, ...more(kind, null)]);
+  menu(at, [make ? created(make, schema && schema !== 'public' ? `${ident(schema)}.` : '') : null, ...kind === 'users' ? [{ label: 'New user…', icon: 'user', run: () => newUser() }, { label: 'New role…', icon: 'plus', run: () => newUser(true) }] : [], k?.create ? { label: `New ${k.title.toLowerCase()}…`, icon: 'plus', run: () => tab(k.create()) } : null, { label: 'Refresh', icon: 'refresh', run: () => H.refresh() }, ...more(kind, null)]);
 }

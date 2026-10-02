@@ -311,6 +311,16 @@ def node_checks(browser, port, show):
     ta.press("Enter")
     checks["Tab completes a table's name, and lists the choices when several fit (a column first)"] = one == "SELECT * FROM people" and listed is True \
         and ta.input_value() == "SELECT name" and p.locator("#complete").is_hidden()
+    py = pg.cell(2).locator("textarea")
+    was = py.input_value()
+    completed = []
+    for code in ['x = db.sql("SELECT * FROM peo', "t = db.table('peo"]:
+        py.fill(code)
+        py.press("End")
+        py.press("Tab")
+        completed.append(py.input_value())
+    py.fill(was)
+    checks["in Python, Tab completes SQL's names inside db.sql(\"…\") and db.table('…')"] = completed == ['x = db.sql("SELECT * FROM people', "t = db.table('people"]
     pg.run(0, "SELECT id, name, born, at, amt FROM people ORDER BY id")
 
     live = pg.run(1, "SELECT count(*) AS n, sum(amt) AS amt FROM people")
@@ -609,6 +619,19 @@ def files_checks(browser, port, show):
     job = p.locator("#jobs .job", has_text="scripts_by_region")
     listed = until(lambda: job.count(), 1, 10)
     cadence = job.locator(".cad").inner_text() if listed == 1 else None
+    job.locator("button", has_text="Edit").click()  # (the editor: how often, picked or as SQL takes it, and the statement)
+    d = p.locator("dialog.pop[open]")
+    d.wait_for(timeout=5000)
+    every = d.locator(".segs .seg.on").first.inner_text()
+    d.locator(".seg", has_text="Daily").click()
+    d.locator("input[type=time]").fill("06:30")
+    d.locator("input[aria-label='Time zone']").fill("UTC")
+    d.locator("input[aria-label='Time zone']").press("Tab")
+    typed = d.locator(".as input").input_value()
+    d.locator("button", has_text="Save").click()
+    edited = until(lambda: sql(port, "SELECT schedule, statement FROM pondra.tasks"), [{"schedule": "cron 30 6 * * * UTC", "statement": "CALL run('scripts/by_region.sql', region => 'r1')"}], 10)
+    checks["Jobs: Edit opens a schedule's editor (Every 1 hour picked from it); Daily at 06:30 is the cron SQL takes, saved with its statement"] = \
+        every == "Every" and typed == "cron 30 6 * * * UTC" and edited == [{"schedule": "cron 30 6 * * * UTC", "statement": "CALL run('scripts/by_region.sql', region => 'r1')"}]
     job.locator("button[aria-label$='more']").click()
     p.locator("#menu button", has_text="Drop it").click()
     dropped = until(lambda: sql(port, "SELECT count(*) AS n FROM pondra.tasks"), [{"n": 0}], 10)
@@ -1535,12 +1558,12 @@ def budget_checks(browser, port, show):
             fresh[name] = e.code
     total = sum(sizes.values()) if all(sizes.values()) else None
     later = {}
-    for name in ["chart.js", "plan.js", "more.js", "details.js", "more.css", "data.js", "md.js", "jobs.js", "settings.js", "objects.js", "pyfile.js", "sqlfile.js", "rename.js", "versions.js", "stmts.js", "params.js", "tabs.js", "live.js", "gridmore.js", "groups.js", "upload.js"]:  # (loaded when first used)
+    for name in ["chart.js", "plan.js", "more.js", "details.js", "more.css", "data.js", "md.js", "jobs.js", "settings.js", "objects.js", "pyfile.js", "sqlfile.js", "rename.js", "versions.js", "stmts.js", "params.js", "tabs.js", "live.js", "gridmore.js", "groups.js", "upload.js", "access.js"]:  # (loaded when first used)
         r = urllib.request.urlopen(urllib.request.Request(f"{base}/console/{name}", headers={"accept-encoding": "gzip"}))
         later[name] = len(r.read()) if r.headers.get("content-encoding") == "gzip" else None
     checks["the scripts and style sheet the page loads, gzipped as the node serves them: <= 70 KB; each answers 304 when the browser has it"] = total is not None and total <= 70 * 1024 \
         and set(fresh.values()) == {304}
-    checks["those loaded when first used (a chart, a plan, History, details, a data file, Markdown, Jobs, Settings, the tree's menus and its other objects, a Python file, a SQL file, renaming and moving, uploading, the tabs' menus, live answers): <= 8 KB each, gzipped"] = all(v is not None and v <= 8 * 1024 for v in later.values())
+    checks["those loaded when first used (a chart, a plan, History, details, a data file, Markdown, Jobs, Settings, the tree's menus and its other objects, users and who has access, a Python file, a SQL file, renaming and moving, uploading, the tabs' menus, live answers): <= 8 KB each, gzipped"] = all(v is not None and v <= 8 * 1024 for v in later.values())
     paints = []
     for _ in range(3):
         pg = Page(browser, base + "/")
@@ -1623,13 +1646,35 @@ def token_checks(browser, port):
         shell = Page(browser, f"http://127.0.0.1:{port}/#key={owner}")
         as_shell = until(lambda: (shell.p.locator("#data .row:not([data-kind=database])", has_text="other_things").count(), shell.p.locator("#tokenDlg").get_attribute("open"), shell.p.evaluate("location.hash")), (1, None, ""))
         shell.ctx.close()
-        checks = {"a user signs in with its name and password (a session) and sees only what it may read; the shell's link (#key=…) signs the page in as the shell, its key out of the address": as_user == (1, 0, "cc_user") and as_shell == (1, None, ""),
+        # The admin's page: Users and roles in the Data tree, and who has access to a table, given and taken back there
+        tree = pg.p.locator("#data")
+        tree.locator(".row[data-kind=group]", has_text="Users and roles").click()
+        users_listed = until(lambda: tree.locator(".row.obj", has_text="cc_user").count(), 1)
+        tree.locator(".row", has_text="secret_things").first.click(button="right")
+        pg.p.locator("#menu:not([hidden]) button", has_text="Who has access…").click()
+        d = pg.p.locator("dialog.pop[open]")
+        line = d.locator(".gline", has_text="cc_user")
+        had = until(lambda: line.locator(".pill .pl").all_inner_texts(), ["SELECT"])
+        d.locator("select").select_option("cc_user")
+        d.locator(".segs .seg", has_text="INSERT").click()
+        d.locator(".segs .seg", has_text="SELECT").click()
+        stmt = d.locator("pre.defn").inner_text()
+        d.locator("button", has_text="Grant").click()
+        both = until(lambda: sorted(line.locator(".pill .pl").all_inner_texts()), ["INSERT", "SELECT"])
+        axe = axe_js()
+        found = audit(pg.p, axe) if axe else []
+        line.locator(".pill", has_text="INSERT").locator(".x").click()
+        taken = until(lambda: [g["privilege"] for g in adm("SELECT privilege FROM pondra.grants WHERE grantee = 'cc_user'")], ["SELECT"])
+        checks = {"Users and roles lists the lake's users; a table's Who has access… lists who may read it, grants (the GRANT shown) and takes back (×) in place; axe finds nothing there":
+                  users_listed == 1 and had == ["SELECT"] and stmt == "GRANT INSERT ON TABLE secret_things TO cc_user" and both == ["INSERT", "SELECT"] and taken == ["SELECT"] and found == []}
+        checks |= {"a user signs in with its name and password (a session) and sees only what it may read; the shell's link (#key=…) signs the page in as the shell, its key out of the address": as_user == (1, 0, "cc_user") and as_shell == (1, None, ""),
                   "with tokens, the page asks for one (Sign in), then shows the tables (and after a reload)": asked is True and hidden and shown == 1 and again == 1
                   and signed and pg.p.locator("#tokenDlg").get_attribute("open") is None,
                   "a session's Python variables are an admin's to read, as DO is": "admin" in str(python_of("console-check-reader"))
                   and python_of(token) == {"running": False, "variables": []}}
+        info = {"signin": [asked, hidden, shown, again, signed], "access": {"listed": users_listed, "had": had, "stmt": stmt, "both": both, "axe": found, "taken": taken, "asked again": pg.p.locator("#tokenDlg").get_attribute("open")}}
         pg.ctx.close()
-        return checks, {}
+        return checks, info
     finally:
         node.kill()
         shutil.rmtree(lake, ignore_errors=True)

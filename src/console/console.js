@@ -529,16 +529,6 @@ function mark() {
 const facts = pairs => h('dl', { class: 'facts' }, pairs.filter(([, v]) => v != null && v !== '' && !(Array.isArray(v) && !v.length)).flatMap(([k, v]) => [h('dt', {}, k), h('dd', {}, Array.isArray(v) ? v.join(', ') : v)]));
 const act = (ic, label, title, fn) => h('button', { class: 'btn small', title, onclick: fn }, ic ? icon(ic) : null, label);
 const head = (ic, name, kind, cls = '') => h('div', { class: 'dh' }, h('span', { class: 'dtile ' + cls, html: svg(ic, 20) }), h('div', {}, h('div', { class: 'dn' }, name), h('div', { class: 'dk' }, kind)));
-function summary() {
-  const objs = S.objects || [], by = k => objs.filter(t => t.c === home() && t.o.kind === k).length;
-  const tabled = objs.filter(t => t.c === home() && t.o.rows != null);
-  const s = S.info || {};
-  return [head('db', home() || 'Pondra', MODE === 'lakes' ? 'a database' : 'this lake', 'k-db'),
-    facts([['Tables', count(by('table'))], ['Views', count(by('view') + by('files'))], ['Materialized', by('materialized view') ? count(by('materialized view')) : null],
-      ['Rows in files', count(tabled.reduce((a, t) => a + (t.o.rows || 0), 0))], ['Size in files', bytes(tabled.reduce((a, t) => a + (t.o.bytes || 0), 0))],
-      ['Nodes', s.nodes ? String(s.nodes.length) : null], ['This node', s.role], ['Leader', s.leader], ['Commits', s.hwm != null ? count(s.hwm) : null]]),
-    h('p', { class: 'muted' }, 'Pick a table, a view or a file, or a column of an answer, to see it here.')];
-}
 const filePick = path => { const rel = path.replace(/^files\//, ''), nb = rel.match(/^notebooks\/([^/]+?)(?:\.ipynb)?$/); return { type: 'file', f: nb ? { rel: 'notebooks/' + nb[1], name: nb[1] + '.ipynb', notebook: true } : S.files?.find(f => f.path === 'files/' + rel) || { rel, path: 'files/' + rel } }; };
 H.pickFile = path => pick(filePick(path));
 /** The details follow the tab in front (its file, or what it is while it has none): a table or a
@@ -733,11 +723,11 @@ function core() {
     { icon: 'refresh', title: 'Refresh', domId: 'refresh', run: () => refresh() }] });
   register.view({ id: 'workspace', side: 'left', order: 20, title: 'Workspace', render: box => workspace(box), tools: [
     { icon: 'plus', title: 'New: a notebook, a file or a folder', domId: 'newfile', menu: false, run: e => newMenu(e.currentTarget) }] });
-  register.view({ id: 'details', side: 'right', order: 10, title: 'Details', tree: false, render: (box, p) => p?.type === 'item' ? p.render() : p?.type === 'object' ? objectDetail(p.t) : p?.type === 'file' ? fileDetail(p.f) : p?.type === 'result' ? resultDetail(p) : p?.type === 'doc' && S.docs.includes(p.doc) ? docDetail(p.doc) : summary() });
+  register.view({ id: 'details', side: 'right', order: 10, title: 'Details', tree: false, render: (box, p) => p?.type === 'item' ? p.render() : p?.type === 'object' ? objectDetail(p.t) : p?.type === 'file' ? fileDetail(p.f) : p?.type === 'result' ? resultDetail(p) : p?.type === 'doc' && S.docs.includes(p.doc) ? docDetail(p.doc) : details().then(m => m.summary()) });
   register.view({ id: 'variables', side: 'right', order: 20, title: 'Variables', tree: false, render: () => variables() });
   register.view({ id: 'runs', side: 'right', order: 30, title: 'History', tree: false, render: () => runs() });
   register.view({ id: 'jobs', side: 'right', order: 40, title: 'Jobs', tree: false, render: async () => (await import('./jobs.js')).jobs() });
-  for (const [id, title, ic, order, schema] of [['functions', 'Functions', 'fn', 10, 1], ['procedures', 'Procedures', 'play', 20, 1], ['schedules', 'Schedules', 'calendar', 30, 1], ['secrets', 'Secrets', 'key', 40]]) register.objectKind({ id, title, icon: ic, order, schema: !!schema });
+  for (const [id, title, ic, order, schema] of [['functions', 'Functions', 'fn', 10, 1], ['procedures', 'Procedures', 'play', 20, 1], ['schedules', 'Schedules', 'calendar', 30, 1], ['secrets', 'Secrets', 'key', 40], ['users', 'Users and roles', 'user', 50]]) register.objectKind({ id, title, icon: ic, order, schema: !!schema });
   registerFiles(register);
   NEW.forEach(([id, ic, title, run]) => register.command({ id, title, run }));
   for (const [id, title, keys, fn] of [['search', 'Search tables, files and commands', 'Ctrl K', palette], ['left', 'Show or hide the left pane', 'Ctrl B', () => pane('left')], ['bottom', 'Show or hide the bottom panel', 'Ctrl J', () => pane('bottom')],

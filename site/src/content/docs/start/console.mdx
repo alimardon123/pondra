@@ -237,9 +237,15 @@ A file's **Run ▾** (and a notebook's, in `notebooks`) runs it on the node, whe
 **Jobs**, in the right pane (or the calendar at the top), is what runs on its own. Each schedule is a
 card: its name and whether its last run worked, how often it runs and when next, a bar for each of its
 last runs (its height the time it took, red if it failed), and the statement it runs. Click the card
-for its last runs; **Run now** starts it at once (a `CALL` as a job), **Edit** changes how often,
-and its **⋯** opens its file, copies the statement, or drops it. **New schedule** makes one from any
-statement. Flows will be a section here too.
+for its last runs; **Run now** starts it at once (a `CALL` as a job), and its **⋯** opens its file,
+copies the statement, or drops it. Flows will be a section here too.
+
+**Edit** (and **New schedule**) opens a schedule's editor. Pick how often: **Every** so many minutes,
+hours or days, **Daily**, **Weekly** (on the days picked) or **Monthly** (on a day) at a time in a
+time zone, or **Cron** for any cron line. The line below shows it as SQL takes it (`1 hour`,
+`cron 30 6 * * 1,3 UTC`) and can be typed too: the picker follows what you type, and the line what
+you pick. Below them is the statement it runs, in an editor of its own. A schedule the node refuses
+(a cron line it can't read) keeps the editor open with why.
 
 **History**, in the right pane (or the clock at the top), is what ran:
 
@@ -415,12 +421,25 @@ tea   2     3
     its tables and views** (as an answer), **Refresh**, **Copy the name**, **Copy the table names**,
     **Drop…**;
   - the lake: **New ▸** (a schema, a table, a view, …), **Attach a lake or catalog…**, **List its
-    tables and views**, a new database (a server's), **Checkpoint**, **Refresh**, **Copy the name**,
-    and for an attached one **Detach…**;
+    tables and views**, **Who has access…**, a new database (a server's), **Checkpoint**,
+    **Refresh**, **Copy the name**, and for an attached one **Detach…**;
   - **Functions**, **Procedures** and **Schedules**, listed under each schema, as Postgres keeps
     them (`CREATE FUNCTION sales.f …` is in `sales`; a name without a schema is in `public`), and
     **Secrets** under the lake (a secret covers a bucket, not a schema): each one's definition, use
-    or call, start as a job, schedule, and drop; a secret's values are never shown, only replaced.
+    or call, start as a job, schedule, and drop; a secret's values are never shown, only replaced;
+  - **Users and roles** under the lake: **New user…** (a name, a password, superuser or not, the
+    roles it is in) and **New role…** on the group's menu, the statement shown as you fill it in
+    (the password as `'***'`). Click one for how it signs in, its roles and members, its grants (each
+    with a **×** to take it back) and its definition; its menu has **Grant…**, **Its roles…** (a click
+    joins or leaves one), **Set a password…**, **New token…** (shown once), **Limits…**, superuser or
+    not, and **Drop…**.
+- **Who has access…**, on a table's, a schema's or the lake's menu and **Who may use it…** on a
+  secret's, lists who may do what with it: granted on it, or through its schema or every table (those
+  show where they come from), and the superusers. Each grant has a **×** that takes it back at once
+  (`REVOKE`). Below, pick a user or role, what it may do (`SELECT`, `INSERT`, `UPDATE`, `DELETE`) and,
+  for reading a table, which columns, and **Grant**: the `GRANT` it runs is shown as you pick. A
+  user's **Grant…** is the same the other way round: pick what it is on. See
+  [Users, roles and grants](/pondra/guides/security/#users-roles-and-grants).
 - **Workspace** lists the lake's own files (`PUT /files/…`, `files()`) by folder, and your
   notebooks under `notebooks`, with the headings of the one in front as its outline. A new file not
   saved yet is listed too, with the dot. Whoever may read the lake may read its files, from SQL too.
@@ -437,6 +456,7 @@ The panel on the right (its button is at the top right) shows what you picked:
 | A column of an answer | the same, from the rows the answer holds |
 | A file | its size, when it was written, and how SQL reads it |
 | A function, a procedure, a schedule or a secret | what it is, its first actions as buttons (the rest in **More**), its facts (language, arguments, what it returns; how often and when next) and its definition |
+| A user or a role | how it signs in (a password, tokens: each with a **×** to drop it), its roles and members, its limits, its grants (each with a **×**) and its definition |
 | Nothing | the lake: its tables, views, rows and size, and its cluster |
 
 ## Python cells
@@ -522,7 +542,9 @@ The node needs matplotlib (or Pillow) in its Python for this: `pip install matpl
 
 The **Variables** tab of the panel on the right lists what this page's Python holds: each name,
 its type, its size (a frame's rows and columns, a list's length) and a short look at it (a
-frame's columns). **Tab** in a Python cell completes these names.
+frame's columns). **Tab** in a Python cell completes these names, and inside the string given to
+`db.sql("…")` or `db.table("…")` it completes SQL's: the lake's tables, their columns, functions and
+SQL's words, as in a SQL cell.
 
 The **Python** chip says whether a cell is running. **Restart Python** in its menu (or **0 0** on a
 cell after **Esc**) ends it: its variables go, and the next cell starts afresh (temporary tables stay,

@@ -46,6 +46,8 @@ function importFile(into) {
   document.body.append(input); input.click();
 }
 const name = async (title, label, value) => ((await prompt(title, label, value)) || '').trim();
+/** Who has access to it, given and taken back in place (access.js). */
+const access = (on, ok = true) => ok ? { label: 'Who has access…', icon: 'user', run: () => import('./access.js').then(m => m.access({ on })) } : null;
 const py = s => /"""/.test(s) ? `'''\n${s}\n'''` : `"""\n${s}\n"""`;
 
 /** A value to start a column with, by its type (an INSERT's template). */
@@ -125,6 +127,7 @@ export function tableMenu(at, t) {
     kind === 'table' || kind === 'materialized view' ? { label: 'As a Kafka topic…', icon: 'terminal', run: () => kafka(t) } : null, '-',
     table ? addColumn(t) : null,
     kind !== 'materialized view' ? { label: 'Rename…', icon: 'pencil', run: async () => { const n = await name('Rename', `The new name of ${t.q}`, t.t); if (n && n !== t.t) exec(`ALTER ${word === 'VIEW' ? 'VIEW' : 'TABLE'} ${t.q} RENAME TO ${ident(n)}`, `Renamed to ${n}`); } } : null,
+    access({ kind: 'table', name: t.s === 'public' ? t.t : `${t.s}.${t.t}`, label: t.q }, t.c === home()),
     { label: 'Refresh', icon: 'refresh', run: () => H.refresh() }, ...copyName([t.c, t.s, t.t], t.q), { label: 'Copy the column names', run: () => copyText(cols(t).map(c => ident(c.n)).join(', '), 'Copied the column names') }, { label: 'Copy as Python', run: () => copyText(`db.table("${t.q}")`, 'Copied') }, '-',
     table ? { label: 'Truncate…', run: () => danger(`Delete every row of ${t.q}? This can't be undone.`, `TRUNCATE TABLE ${t.q}`, `Emptied ${t.q}`) } : null,
     { label: 'Drop…', icon: 'trash', run: () => danger(`Drop ${t.q}?${kind === 'files' ? ' (its files stay)' : ' This can\'t be undone.'}`, `DROP ${word} ${t.q}`, `Dropped ${t.q}`) }, ...more(kind === 'files' ? 'view' : kind.replace(' ', '_'), t)]);
@@ -165,14 +168,14 @@ export function schemaMenu(at, lake, schema) {
   const q = `${ident(schema)}.`;
   menu(at, [making(at, q, ['table', 'view', 'materialized view', 'external table', '-', 'function', 'procedure', 'schedule'],
     ['-', { label: 'Table from a file…', icon: 'up', run: () => importFile((src, n) => `-- a table of ${n}'s rows\nCREATE TABLE ${q}${ident(n.replace(/\.\w+$/, '').toLowerCase().replace(/\W+/g, '_').replace(/^(\d)/, '_$1'))} AS\nSELECT * FROM ${src};`) }]),
-    listing('List its tables and views', `lake = ${quote(lake)} AND schema = ${quote(schema)}`), '-',
+    listing('List its tables and views', `lake = ${quote(lake)} AND schema = ${quote(schema)}`), access({ kind: 'schema', name: schema }, lake === home()), '-',
     { label: 'Refresh', icon: 'refresh', run: () => H.refresh() }, ...copyName([lake, schema], ident(schema)),
     { label: 'Copy the table names', run: () => copyText(S.objects.filter(t => t.c === lake && t.s === schema).map(t => t.q).join('\n'), 'Copied the table names') },
     { label: 'Drop…', icon: 'trash', run: () => danger(`Drop the schema ${schema}, and every table and view in it?`, `DROP SCHEMA ${ident(schema)} CASCADE`, `Dropped ${schema}`) }, ...more('schema', { lake, schema })]);
 }
 export function lakeMenu(at, lake, current) {
   menu(at, [current ? making(at, '', ['schema', 'table', 'view', 'materialized view', '-', 'function', 'procedure', 'schedule']) : null,
-    current ? { label: 'Attach a lake or catalog…', icon: 'db', run: () => tab(NEW.attach()) } : null, listing('List its tables and views', `lake = ${quote(lake)}`), '-',
+    current ? { label: 'Attach a lake or catalog…', icon: 'db', run: () => tab(NEW.attach()) } : null, listing('List its tables and views', `lake = ${quote(lake)}`), access({ kind: 'lake', label: 'every table' }, current), '-',
     MODE === 'lakes' ? { label: 'New database…', icon: 'plus', run: () => H.newDatabase() } : null,
     current ? { label: 'Checkpoint', run: () => exec('CHECKPOINT', 'Checkpointed: what was in the log is in the tables\' files') } : null,
     { label: 'Refresh', icon: 'refresh', run: () => H.refresh() }, ...copyName([lake], ident(lake)),
