@@ -1,6 +1,5 @@
 // The grid's less used parts (ADR-034 §7): its menus, the filter window, and editing (a cell, a
-// paste, cut, undo and redo) over `Edits`, the model a data file's rows change through and a
-// table's rows will. Loaded the first time one is used, not with the page.
+// paste, cut, undo and redo) over `Edits`, the model a data file's rows and a table's change through. Loaded the first time one is used, not with the page.
 import { h, count, numeric, menu, pop, toast, moreStyle, ICONS, ident } from './core.js';
 import { OPS, COPIES, copyItems, copyText, downloadItems, fetchRows } from './grid.js';
 
@@ -14,10 +13,11 @@ const same = (a, b) => a === b || a != null && b != null && typeof a === 'object
 /** Rows as a document that changes a step at a time: each step (a cell typed, a paste, rows added or
  * deleted, a column added) is undone and done again whole. A cell counts as changed while it
  * differs from what it held when last saved (`row.base`), so undoing back to that unmarks it.
- * `blank` is an empty cell's value and `parse(text)` a typed one's. */
+ * `blank` is an empty cell's value and `parse(text)` a typed one's; `fixed`: its columns are a
+ * table's, so a paste adds none. */
 export class Edits {
-  constructor(cols, rows, { blank = '', parse = t => t, onchange } = {}) {
-    Object.assign(this, { cols, rows, blank, parse, onchange, past: [], future: [], step: null, added: new WeakSet() });
+  constructor(cols, rows, { blank = '', parse = t => t, onchange, fixed } = {}) {
+    Object.assign(this, { cols, rows, blank, parse, onchange, fixed, past: [], future: [], step: null, added: new WeakSet() });
     this.saved();
   }
   /** As saved: nothing changed, the rows as they are now. */
@@ -168,7 +168,7 @@ export function history(x, again) {
 export function paste(x, text) {
   const ed = x.o.edit, g = x.range() || { r0: 0, r1: 0, c0: 0, c1: 0 }, block = cellsOf(text.replace(/\r?\n$/, ''));
   if (!block.length) return;
-  const one = block.length === 1 && block[0].length === 1, ht = one ? g.r1 - g.r0 + 1 : block.length, w = one ? g.c1 - g.c0 + 1 : Math.max(...block.map(b => b.length));
+  const one = block.length === 1 && block[0].length === 1, ht = one ? g.r1 - g.r0 + 1 : block.length, wide = one ? g.c1 - g.c0 + 1 : Math.max(...block.map(b => b.length)), w = ed.fixed ? Math.min(wide, x.cols.length - g.c0) : wide;
   const view = x.view, rows = [], sel = { rows, c0: g.c0, c1: g.c0 + w - 1 };
   ed.do(() => {
     if (g.c0 + w > x.cols.length) ed.addCols(newNames(x.cols, g.c0 + w - x.cols.length));

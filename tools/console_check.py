@@ -5,7 +5,7 @@
 
 - node: a new notebook has no dot until something is typed (its tab, the Workspace); the Data tree lists the lake's schemas, tables and views (each kind its icon) and columns
   (each type its coloured mark, a key's marked), with no bare numbers; a table picked shows its
-  details and its profile, a view its definition; double-clicking a table shows its first rows; the
+  details and its profile, a view its definition; double-clicking a table opens it in a tab; the
   Workspace lists the lake's files by folder; a SQL cell's answer (its types as marks, a header's
   card), a long one drawn in part, sorted and summarized; a Python cell (what it printed, its last
   expression as rows); errors in plain words; Python cells share their variables, a figure shows,
@@ -239,9 +239,14 @@ def node_checks(browser, port, show):
     checks["a SQL cell shows the rows, each column's type a mark and its card on hover; timestamps and decimals as written"] = heads == ["id", "name", "born", "at", "amt"] \
         and rows[0] == ["1", "Ann", "1990-01-02", "2024-01-01 10:00:00", "1.50"] and rows[1][2] == "NULL" and c.locator(".n-rows").inner_text() == "3 rows" and re.fullmatch(r"[\d.]+ m?s", c.locator(".bar .st").inner_text()) \
         and [m.get_attribute("class") for m in c.locator("thead .ty-i").all()] == ["ty-i k-num", "ty-i k-text", "ty-i k-date", "ty-i k-time", "ty-i k-dec"] and card is True
-    tree.locator(".row", has_text="orders").dblclick()  # (a table's first rows, in a new cell)
+    tree.locator(".row", has_text="orders").dblclick()  # (a table in a tab of its own: its rows)
+    own = until(lambda: (pg.tab()[0], pg.grid(p.locator(".tabledoc"))), ("orders", [["id", "amount"], [["1", "10.5"]]]))
+    p.locator("#tabbar .tab.on .x").click()
+    tree.locator(".row", has_text="orders").click(button="right")
+    p.locator("#menu button", has_text="Preview").first.click()  # (its first rows, in a new cell of the notebook in front)
     peek = until(lambda: pg.grid(pg.cell(1))[1], [["1", "10.5"]])
-    checks["double-clicking a table shows its first rows"] = peek == [["1", "10.5"]] and "sales.orders" in pg.cell(1).locator("textarea").input_value()
+    checks["double-clicking a table opens it in a tab of its own (its rows); Preview puts its first rows in a new cell"] = own == ("orders", [["id", "amount"], [["1", "10.5"]]]) \
+        and peek == [["1", "10.5"]] and "sales.orders" in pg.cell(1).locator("textarea").input_value()
     put(port, "reports/q1.csv", b"a,b\n1,x\n2,y\n")
     p.click("#refresh")
     row = pg.workspace("reports", "q1.csv")
@@ -1166,8 +1171,53 @@ def grid_checks(browser, port, show):
     watching = until(lambda: w.locator(".pinfo label.live input").is_checked() and call(port, "GET", "/stats")["live_queries"] == 1)
     checks["Watch it live (the Data tree's menu) opens a SQL tab of its own, Live on"] = opened == (1, True) and watching is True
     w.locator(".pinfo label.live").click()
+    # a table's own tab (batch E): its rows edited in place and saved as one transaction; a view's read only
+    sql(port, "CREATE TABLE ed (id BIGINT, amount DECIMAL(10,2), note VARCHAR)")
+    sql(port, "INSERT INTO ed VALUES (1, 5.00, 'a'), (2, 12.50, 'b'), (3, 7.25, 'c')")
+    sql(port, "CREATE VIEW ed_big AS SELECT id, amount FROM ed WHERE amount > 6")
+    p.click("#refresh")
+    p.locator("#data .row[data-kind=table]", has_text="ed").first.dblclick()
+    t = p.locator(".tabledoc")
+    tc = lambda r, col: t.locator("tbody tr:not(.gap)").nth(r).locator("td:not(.i)").nth(col)
+    shown = until(lambda: pg.grid(t), [["id", "amount", "note"], [["1", "5.00", "a"], ["2", "12.50", "b"], ["3", "7.25", "c"]]])
+    tc(0, 2).dblclick()
+    p.keyboard.press("Control+a")
+    p.keyboard.type("changed")
+    p.keyboard.press("Enter")
+    tc(2, 1).click()
+    p.evaluate("t => navigator.clipboard.writeText(t)", "8.00\tpasted\textra\n9.50\tmore")
+    p.keyboard.press("Control+v")
+    pasted = until(lambda: pg.grid(t), [["id", "amount", "note"], [["1", "5.00", "changed"], ["2", "12.50", "b"], ["3", "8.00", "pasted"], ["NULL", "9.50", "more"]]])
+    t.locator("tbody tr:not(.gap)").nth(1).locator("td.i").click(button="right")
+    p.locator("#menu button", has_text="Delete the row").click()
+    said = until(lambda: "1 row deleted" in p.locator("#docbar").inner_text() and p.locator("#docbar").inner_text())
+    p.keyboard.press("Control+s")
+    model = [{"id": 1, "amount": 5.0, "note": "changed"}, {"id": 3, "amount": 8.0, "note": "pasted"}, {"amount": 9.5, "note": "more"}]
+    stored = until(lambda: sql(port, "SELECT * FROM ed ORDER BY id NULLS LAST"), model)
+    clean = until(lambda: (pg.tab(), t.locator("td.chg").count(), len(pg.grid(t)[1])), (("ed", False), 0, 3))
+    checks["a table's own tab: a cell typed in, a block pasted past its last row (a row added, no column), a row deleted; Ctrl S saves it all as one transaction, then reads its rows again"] = \
+        shown[1] == [["1", "5.00", "a"], ["2", "12.50", "b"], ["3", "7.25", "c"]] and pasted == [["id", "amount", "note"], [["1", "5.00", "changed"], ["2", "12.50", "b"], ["3", "8.00", "pasted"], ["NULL", "9.50", "more"]]] \
+        and "3 cells changed" in str(said) and "1 row added" in str(said) and stored == model and clean == (("ed", False), 0, 3)
+    tc(0, 1).dblclick()
+    p.keyboard.press("Control+a")
+    p.keyboard.type("abc")
+    p.keyboard.press("Enter")
+    p.keyboard.press("Control+s")
+    refused = until(lambda: "amount takes a number: 'abc' is not one" in pg.toast()) is True and sql(port, "SELECT * FROM ed ORDER BY id NULLS LAST") == model
+    p.locator("#docbar button", has_text="Discard").click()
+    where = t.locator(".tpick input").first
+    where.fill("amount > 6")
+    where.press("Enter")
+    picked = until(lambda: (pg.tab()[1], sorted(r[1] for r in pg.grid(t)[1])), (False, ["8.00", "9.50"]))
+    p.locator("#data .row[data-kind=view]", has_text="ed_big").dblclick()
+    v = p.locator(".tabledoc:visible")
+    view = until(lambda: (pg.tab()[0], len(pg.grid(v)[1])), ("ed_big", 2))
+    v.locator("tbody tr:not(.gap)").first.locator("td:not(.i)").nth(1).dblclick()
+    read_only = v.locator("input.celled").count() == 0 and "Read-only" in p.locator("#docbar").inner_text()
+    checks["a value its column can't take is refused before anything is sent; WHERE picks the rows read; a view's tab is read only"] = \
+        refused and picked == (False, ["8.00", "9.50"]) and view == ("ed_big", 2) and read_only
     checks["grid: no page errors"] = pg.errors == []
-    info = {"one": one, "edges": edges, "total": total, "copied": copied, "headed": headed, "moved": moved, "kept": kept, "filters": [chip, both, marks, changed, left, back], "corner": [items, all_rows, a_row], "pages": [first, third, second], "live": [on, followed, lit, stopped, opened, watching], "errors": pg.errors}
+    info = {"one": one, "edges": edges, "total": total, "copied": copied, "headed": headed, "moved": moved, "kept": kept, "filters": [chip, both, marks, changed, left, back], "corner": [items, all_rows, a_row], "pages": [first, third, second], "live": [on, followed, lit, stopped, opened, watching], "table": [shown, pasted, said, stored, clean, refused, picked, view, read_only], "errors": pg.errors}
     pg.ctx.close()
     return checks, info
 
@@ -1558,12 +1608,12 @@ def budget_checks(browser, port, show):
             fresh[name] = e.code
     total = sum(sizes.values()) if all(sizes.values()) else None
     later = {}
-    for name in ["chart.js", "plan.js", "more.js", "details.js", "more.css", "data.js", "md.js", "jobs.js", "settings.js", "objects.js", "pyfile.js", "sqlfile.js", "rename.js", "versions.js", "stmts.js", "params.js", "tabs.js", "live.js", "gridmore.js", "groups.js", "upload.js", "access.js"]:  # (loaded when first used)
+    for name in ["chart.js", "plan.js", "more.js", "details.js", "more.css", "data.js", "md.js", "jobs.js", "settings.js", "objects.js", "pyfile.js", "sqlfile.js", "rename.js", "versions.js", "stmts.js", "params.js", "tabs.js", "live.js", "gridmore.js", "groups.js", "upload.js", "access.js", "table.js"]:  # (loaded when first used)
         r = urllib.request.urlopen(urllib.request.Request(f"{base}/console/{name}", headers={"accept-encoding": "gzip"}))
         later[name] = len(r.read()) if r.headers.get("content-encoding") == "gzip" else None
     checks["the scripts and style sheet the page loads, gzipped as the node serves them: <= 70 KB; each answers 304 when the browser has it"] = total is not None and total <= 70 * 1024 \
         and set(fresh.values()) == {304}
-    checks["those loaded when first used (a chart, a plan, History, details, a data file, Markdown, Jobs, Settings, the tree's menus and its other objects, users and who has access, a Python file, a SQL file, renaming and moving, uploading, the tabs' menus, live answers): <= 8 KB each, gzipped"] = all(v is not None and v <= 8 * 1024 for v in later.values())
+    checks["those loaded when first used (a chart, a plan, History, details, a data file, Markdown, Jobs, Settings, the tree's menus and its other objects, users and who has access, a table's own tab, a Python file, a SQL file, renaming and moving, uploading, the tabs' menus, live answers): <= 8 KB each, gzipped"] = all(v is not None and v <= 8 * 1024 for v in later.values())
     paints = []
     for _ in range(3):
         pg = Page(browser, base + "/")

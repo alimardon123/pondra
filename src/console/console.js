@@ -255,7 +255,7 @@ async function closeDoc(doc) {
 // them, a thin bar above them shows where they are, ⌄ lists them all; right-click: pin, close some)
 function drawTabs() {
   const tab = (d, i) => {
-    const t = h('div', { class: 'tab' + (d === S.doc ? ' on' : '') + (d.pinned ? ' pinned' : ''), role: 'tab', tabindex: d === S.doc ? '0' : '-1', 'aria-selected': String(d === S.doc), title: (d.path ? `files/${d.path}` : d.title) + (d.pinned ? ' (pinned)' : ''), 'aria-keyshortcuts': 'Delete',
+    const t = h('div', { class: 'tab' + (d === S.doc ? ' on' : '') + (d.pinned ? ' pinned' : ''), role: 'tab', tabindex: d === S.doc ? '0' : '-1', 'aria-selected': String(d === S.doc), title: (d.tip || (d.path ? `files/${d.path}` : d.title)) + (d.pinned ? ' (pinned)' : ''), 'aria-keyshortcuts': 'Delete',
       draggable: 'true', ondragstart: e => e.dataTransfer.setData('text/x-pondra-doc', i),
       onclick: e => { if (!e.target.closest('.x')) activate(d); }, onauxclick: e => { if (e.button === 1) closeDoc(d); }, oncontextmenu: e => { e.preventDefault(); menus().then(m => m.tabMenu(e, d)); } },
       h('span', { class: 'ic k-' + d.kind, html: svg(d.icon, 15) }), h('span', { class: 'tn' }, d.title),
@@ -473,7 +473,7 @@ function tableNode(t) {
     h('div', { class: 'row col', role: 'treeitem', tabindex: '-1', 'aria-level': '4', style: 'padding-left:69px', title: `${c.n}: ${sqlType(c.d)} (${c.d}). Double-click: put the name where you are typing; right-click: more`, onclick: e => { for (const r of document.querySelectorAll('#data .row.on')) r.classList.remove('on'); e.currentTarget.classList.add('on'); }, ondblclick: () => S.doc?.put?.(ident(c.n)), oncontextmenu: e => { e.preventDefault(); objects(m => m.columnMenu(e, t, c)); } },
       typeMark(c.d), h('span', { class: 'nm' }, c.n), keyed.has(c.n) ? icon('key', 'kk') : null, h('span', { class: 'ty' }, sqlType(c.d)))));
   const it = treeItem({ key: t.key, kids: t.columns.length ? kids : null, depth: 2, icon: ic, iconCls: 'k-table', name: t.t, dataKey: t.key, dataKind: t.o.kind, on: S.pick?.type === 'object' && S.pick.t.key === t.key,
-    title: `${t.q}: a ${word}. Click: its details; double-click: its first rows; right-click: more`, onclick: () => pick({ type: 'object', t }), ondblclick: () => query(`SELECT * FROM ${t.q} LIMIT 100`), menu: e => objects(m => m.tableMenu(e, t)) });
+    title: `${t.q}: a ${word}. Click: its details; double-click: open it (its rows${t.o.kind === 'table' ? ', to edit' : ''}); right-click: more`, onclick: () => pick({ type: 'object', t }), ondblclick: () => openFile('table:' + t.q), menu: e => objects(m => m.tableMenu(e, t)) });
   return it;
 }
 async function dataTree(box) {
@@ -536,7 +536,7 @@ H.pickFile = path => pick(filePick(path));
 function follow(doc) {
   if (S.pick && S.pick.type !== 'file' && S.pick.type !== 'doc' && S.pickedOn === doc) return;
   const saved = doc.kind === 'notebook' ? doc.version && (doc.plain ? doc.path : `notebooks/${doc.name}`) : doc.path;
-  S.pick = saved ? filePick(saved) : doc.kind ? { type: 'doc', doc } : null;
+  S.pick = doc.pickOf ? doc.pickOf() : saved ? filePick(saved) : doc.kind ? { type: 'doc', doc } : null; // (a table's tab: the table)
   mark(); detail();
 }
 
@@ -793,9 +793,9 @@ async function start() {
   started = true;
   drawActions(); drawRail();
   const nb = hash.get('notebook'), file = hash.get('file');
+  await restoreTabs(); // (the tabs open last time, then the one the address names in front)
   if (nb) await openFile('notebooks/' + nb);
   else if (file) await openFile(file);
-  if (!S.docs.length) await restoreTabs();
   if (!S.docs.length) newNotebook();
   setInterval(() => { if (document.visibilityState === 'visible') stats(); }, 15000);
   emit('start', pondra);

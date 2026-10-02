@@ -400,12 +400,22 @@ tea   2     3
   TABLE`) a page with a grid on it. Open one to see its columns: each has its type's coloured mark
   and its SQL type on the right; a key column has a key.
 - **Click** a table, a view, a function, a procedure, a schedule or a secret to see its details on
-  the right. **Double-click** a table or a view for its first 100 rows: in a new cell when a notebook
-  is in front, else in a new SQL tab. Double-click a column to put its name where you are typing (a
-  click only picks it).
+  the right. **Double-click** a table or a view to open it in a tab of its own (below). Double-click a
+  column to put its name where you are typing (a click only picks it).
+- **A table's own tab** shows its rows in the grid, with its details at the right. **WHERE** and
+  **ORDER BY** above them pick the rows it reads (Enter reads them again), and so does how many (100,
+  1,000 or 10,000). A table's rows are edited in place as a data file's are: double-click a cell or
+  type, paste a block (it adds the rows it needs, never a column), **Add row**, a row number's
+  right-click to delete rows, **Ctrl Z** and **Ctrl Y**. An empty cell is `NULL`. The toolbar says
+  what changed; click it for the SQL a save runs, in a new SQL tab. **Ctrl S** (or **Save**) runs it
+  as one transaction: the rows added, then the cells changed, then the rows deleted, each row found
+  by its `_row_id`. A value its column can't take (text in a number) is refused before anything is
+  sent. **Discard** reads the rows again. A view, a materialized view and a view of files open read
+  only. The tab comes back with the others when the page is opened again.
 - **Right-click** anything for what can be done with it, each as the SQL it runs (a change that
   can't be undone asks first):
-  - a table, a view or a materialized view: **Preview** (in SQL or Python), **Details and data
+  - a table, a view or a materialized view: **Open** (its tab), **Preview** (its first 100 rows: in a
+    new cell when a notebook is in front, else in a new SQL tab; or in Python), **Details and data
     profile**, **Watch it live** (a SQL tab of its rows, Live on), **Script as…**, **Insert rows…**, **Import rows from a file…** (a CSV,
     JSON or Parquet file from your computer, put in the lake's `imports/` folder and read in by
     column name), **Download every row…**, **As a Kafka topic…**, **New ▸** (a view of it, a

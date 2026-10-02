@@ -116,7 +116,8 @@ function ofIt(at, t) {
 }
 export function tableMenu(at, t) {
   const kind = t.o.kind, table = kind === 'table', word = { view: 'VIEW', files: 'VIEW', 'materialized view': 'MATERIALIZED VIEW' }[kind] || 'TABLE';
-  menu(at, [{ label: 'Preview', icon: 'play', keys: 'Double-click', run: () => H.query(`SELECT * FROM ${t.q} LIMIT 100`) },
+  menu(at, [{ label: table ? 'Open, to edit its rows' : 'Open', icon: 'table', keys: 'Double-click', run: () => H.openFile('table:' + t.q) },
+    { label: 'Preview', icon: 'play', run: () => H.query(`SELECT * FROM ${t.q} LIMIT 100`) },
     { label: 'Preview in Python', icon: 'filepy', run: () => tab(`db.table("${t.q}").limit(100)`, 'python') },
     { label: 'Details and data profile', icon: 'eye', run: () => H.pick({ type: 'object', t }) },
     { label: 'Watch it live', icon: 'refresh', run: () => H.query(`SELECT * FROM ${t.q} LIMIT 100`, true) }, '-',

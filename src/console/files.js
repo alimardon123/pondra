@@ -9,8 +9,8 @@ import { openPlain } from './notebook.js';
 const base = p => p.split('/').pop();
 /** An empty folder is a zero-byte object, `<folder>/.folder` (object storage has no folders): the tree and the search leave it out. */
 export const FOLDER = '.folder';
-/** Where a tab's file is, or will be saved. */
-const target = d => d?.path || d?.untitled;
+/** Where a tab's file is, or will be saved (a table's tab has none). */
+const target = d => d?.pickOf ? null : d?.path || d?.untitled;
 /** A file's kind, by its name: what opens it and which icon it has. */
 /** Files that open as text in the editor: Markdown, plain text, settings and code of other kinds, and a name with no kind (README, Makefile). */
 export const TEXT = /\.(md|txt|ya?ml|toml|ini|cfg|conf|env|xml|html?|css|m?js|ts|sh|bat|ps1|r|log)$|(^|\/)[^./]+$/i;
@@ -83,7 +83,7 @@ export function drawWorkspace(box) {
     }),
   ];
   const tree = render(root, '', 0);
-  box.replaceChildren(...tree.length ? tree : [h('div', { class: 'empty' }, 'No files yet. + makes a file or a folder, or uploads one.')]);
+  box.replaceChildren(...tree.length ? tree : [h('div', { class: 'empty', role: 'treeitem' }, 'No files yet. + makes a file or a folder, or uploads one.')]);
 }
 /** A row of a tree: its twisty (it folds, when it has kids), icon, name, a note, the unsaved dot, and (if it has a menu) a ⋯ that opens it. */
 export function treeItem({ key, kids, depth = 0, icon: ic, iconCls = '', name, meta, dirty, on, title, onclick, ondblclick, menu: onmenu, onopen, cls = '', dataKey, dataKind, dir, drag }) {
@@ -245,5 +245,6 @@ export function registerFiles(register) {
     const { DataDoc } = await import('./data.js'); // (loaded when a data file first opens)
     try { return await new DataDoc({ path }).load(); } catch (e) { if (!e.asText) throw e; const f = await readFile(path); return new TextDoc({ path, text: f.text, version: f.version, language: 'text' }); } // (a JSON document, not rows: its text)
   } });
+  register.doc({ id: 'table', label: 'Table', icon: 'table', order: 10, match: p => p.startsWith('table:'), open: async path => new (await import('./table.js')).TableDoc(path).load() }); // (a table's rows, to edit: `table:<name>`)
   register.doc({ id: 'text', label: 'Text file', icon: 'file', order: 50, match: p => TEXT.test(p), open: async path => { const f = await readFile(path); return new TextDoc({ path, text: f.text, version: f.version, language: /\.md$/i.test(path) ? 'markdown' : 'text' }); } });
 }
