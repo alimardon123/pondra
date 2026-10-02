@@ -4357,11 +4357,32 @@ console.log(JSON.stringify(seen));"""
     checks["JavaScript: for await (const rows of db.live(sql))"] = js_out.stdout.strip() == "[5,6]"
     checks["refused by name: rows sent with it, and a write"] = "never change" in _raises_text(lambda: next(db.live(db.from_arrow([{"a": 1}])))) \
         and "one query" in _raises_text(lambda: next(db.live("INSERT INTO other VALUES (2)")))
+    # several on one connection (the console's: a browser opens six to a host at most), each line its id's
+    body = json.dumps({"queries": [{"id": "a", "sql": "SELECT count(*) AS n FROM orders"}, {"id": "b", "sql": "SELECT count(*) AS n FROM other"},
+                                   {"id": "bad", "sql": "INSERT INTO other VALUES (9)"}]}).encode()
+    lines, shared = [], urllib.request.urlopen(urllib.request.Request(f"http://127.0.0.1:{A.port}/live", data=body, headers={"content-type": "application/json"}), timeout=30)
+    def read_shared():
+        try:
+            for line in shared:
+                if line.strip():
+                    lines.append(json.loads(line))
+        except (AttributeError, OSError, ValueError):  # (closed under it, below)
+            pass
+    threading.Thread(target=read_shared, daemon=True).start()
+    first = until(lambda: sorted((m["id"], m.get("rows") or m.get("error", "")[:9]) for m in lines), [("a", [{"n": 6}]), ("b", [{"n": 1}]), ("bad", "a live qu")], 10)
+    q("INSERT INTO other VALUES (2)")
+    after = until(lambda: [(m["id"], m["rows"]) for m in lines[3:]], [("b", [{"n": 2}])], 10)
+    while_open = call(A.port, "GET", "/stats")["live_queries"]
+    shared.close()
+    q("INSERT INTO orders VALUES (7, 'eu', 1)")
+    shared_after = until(lambda: call(A.port, "GET", "/stats")["live_queries"], 0, 25)
+    checks["several on one connection: each line names its query, a change answers only its own, a refused one says why alone, closed ends them all"] = \
+        first == [("a", [{"n": 6}]), ("b", [{"n": 1}]), ("bad", "a live qu")] and after == [("b", [{"n": 2}])] and while_open == 2 and shared_after == 0
     node.kill()
     ok = all(checks.values())
     print(json.dumps({"live": checks, "ok": ok}, indent=1))
     if not ok:
-        print(got, quiet, lat, open_after, js_out.stdout, js_out.stderr[-500:])
+        print(got, quiet, lat, open_after, js_out.stdout, js_out.stderr[-500:], lines)
         sys.exit(1)
     return f"live: answers pushed within {max(lat)} ms of a commit that changes them, nothing when closed: all {len(checks)} checks pass"
 
@@ -4832,9 +4853,11 @@ def found():
         gone = None
     except RuntimeError as e:
         gone = str(e)[:3]
-    checks["format=typed: 10,000 rows of a bigger answer, and an id its other pages are read with (the same rows, not run again); 410 once not kept"] = \
+    whole = call(port, "GET", f"/sql/pages/{big.get('pages')}?format=csv") if big.get("pages") else b""
+    small = call(port, "GET", f"/sql/pages/{typed.get('pages')}?format=csv") if typed.get("pages") else b""
+    checks["format=typed: 10,000 rows of a bigger answer, and an id its other pages, and every row as a file, are read with (the same rows, not run again); 410 once not kept"] = \
         (len(big["rows"]), big["total"], big["rows"][-1]) == (10000, 25000, [9999]) and len(page3.get("rows", [])) == 5000 and page3["rows"][0] == [20000] \
-        and gone == "410" and typed.get("pages") is None
+        and gone == "410" and whole.decode().split("\n")[:2] == ["n", "0"] and len(whole.decode().split()) == 25001 and small.decode().split() == ["d,big,small", "1.50,9007199254740993,7"]
     # to_timestamp over a column of text answers in its type's zone (UTC), as over a literal.
     zoned = q("SELECT to_timestamp(v) AS a, to_timestamp(d, '%Y-%m-%d') AS b, to_timestamp_millis(d, '%Y-%m-%d') AS c FROM (VALUES ('2020-09-09T00:00:00+02:00', '2020-09-08')) AS x(v, d)")
     checks["to_timestamp(column) and to_timestamp_millis(column, format): TIMESTAMP (no zone; UTC's time for text with one), as over a literal"] = zoned == [{"a": "2020-09-08T22:00:00", "b": "2020-09-08T00:00:00", "c": "2020-09-08T00:00:00"}]
@@ -6159,6 +6182,8 @@ def variables():
              "SELECT count(*) AS n, sum(amount) AS total, $region AS region FROM orders WHERE day = $day AND amount >= $min;\n")
     call(A.port, "PUT", "/files/etl/daily.sql", daily.encode())
     got["parameters"] = q("SELECT * FROM pondra.parameters('etl/daily.sql')")
+    call(A.port, "PUT", "/files/etl/sensors.sql", b"DECLARE $d VARCHAR = 's1'; -- the sensor\nDECLARE $cel INT;\n\nSELECT $d AS d, $cel AS cel;\n")
+    got["described after"] = q("SELECT name, description FROM pondra.parameters('etl/sensors.sql')")
     got["run given"] = q("CALL run('etl/daily.sql', region => 'eu', day => '2026-09-30', min => 6)")
     got["run defaults"] = q("CALL run('etl/daily.sql', region => 'us')")
     got["run missing"] = _raises_text(lambda: q("CALL run('etl/daily.sql')"))
@@ -6167,6 +6192,8 @@ def variables():
         {"name": "day", "type": "DATE", "default": "DATE '2026-09-29'", "required": False, "description": "The day to load"},
         {"name": "min", "type": "DOUBLE", "default": "0", "required": False},
         {"name": "region", "required": True, "description": "where the orders come from"}]
+    checks["a comment after a DECLARE on its line describes it, and not the DECLARE after it"] = \
+        got["described after"] == [{"name": "d", "description": "the sensor"}, {"name": "cel"}]
     checks["a run's values replace the defaults, cast to their types; a required one missing is named; the run's variables stay its own"] = \
         got["run given"] == [{"n": 1, "total": 20.0, "region": "eu"}] and got["run defaults"] == [{"n": 1, "total": 10.0, "region": "us"}] \
         and "no value for $region" in got["run missing"] and got["session after runs"] == [{"name": "day", "value": "2026-09-30"}]

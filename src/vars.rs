@@ -312,7 +312,8 @@ pub fn table() -> Result<Arc<dyn datafusion::catalog::TableProvider>> {
 
 /// A parameter of a SQL file: a `DECLARE` (its type and default as written), or a `$name` used
 /// before anything sets it (required, no type). Its description is the comment just above its
-/// `DECLARE`, or a comment line `-- $name: …` anywhere.
+/// `DECLARE`, else one after it on its line (`DECLARE $d = 's1'; -- the sensor`), or a comment
+/// line `-- $name: …` anywhere.
 #[derive(Debug, serde::Serialize)]
 pub struct Param {
     pub name: String,
@@ -327,12 +328,14 @@ pub struct Param {
 pub fn parameters(text: &str) -> Vec<Param> {
     static NAMED: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?m)^\s*--\s*\$([A-Za-z_]\w*)\s*[:—–-]\s*(.+?)\s*$").expect("a regex"));
     let (mut out, mut set): (Vec<Param>, Vec<String>) = (vec![], vec![]);
-    for s in crate::routines::split(text) {
-        match change(&s) {
+    let all = crate::routines::split(text);
+    for (i, s) in all.iter().enumerate() {
+        let s = if i > 0 { its_own(s) } else { s.as_str() };
+        match change(s) {
             Some(Change::Declare { name, ty, default }) if !set.contains(&name) => {
                 let required = default.is_none();
                 out.retain(|p| p.name != name); // (used before its DECLARE: the DECLARE says what it is)
-                out.push(Param { name: name.clone(), ty, default, required, description: above(&s) });
+                out.push(Param { name: name.clone(), ty, default, required, description: above(s).or_else(|| after(all.get(i + 1))) });
                 set.push(name);
                 continue;
             }
@@ -343,7 +346,7 @@ pub fn parameters(text: &str) -> Vec<Param> {
             }
             _ => {}
         }
-        unused(&s, &set, &mut out);
+        unused(s, &set, &mut out);
     }
     for c in NAMED.captures_iter(text) {
         if let Some(p) = out.iter_mut().find(|p| p.name == c[1]) {
@@ -360,6 +363,21 @@ fn unused(sql: &str, set: &[String], out: &mut Vec<Param>) {
             out.push(Param { name: n, ty: None, default: None, required: true, description: None });
         }
     }
+}
+
+/// A statement without what follows the `;` before it on that line (a blank, or the comment
+/// that line's statement ends with: `after`).
+fn its_own(stmt: &str) -> &str {
+    match stmt.split_once('\n') {
+        Some((first, rest)) if first.trim().is_empty() || first.trim_start().starts_with("--") => rest,
+        _ => stmt,
+    }
+}
+
+/// The comment after a statement on its line (the start of the next one's text), as one line.
+fn after(next: Option<&String>) -> Option<String> {
+    let first = next?.split('\n').next()?.trim_start();
+    first.strip_prefix("--").map(|t| t.trim_start_matches('-').trim().to_string()).filter(|t| !t.is_empty() && !t.starts_with('$'))
 }
 
 /// The comment lines just above a statement's code (`-- …`), as one line.

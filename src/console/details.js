@@ -134,6 +134,11 @@ export async function fileDetail(f) {
   }
   return out;
 }
+/** A tab's file not saved yet: what it is, Save while there is something to save. */
+export function docDetail(doc) {
+  return [head(doc.icon, doc.title, `a new ${doc.kind === 'notebook' ? 'notebook' : doc.kind === 'sql' ? 'SQL file' : doc.kind === 'python' ? 'Python file' : 'file'}, not saved yet`, 'k-' + doc.kind),
+    doc.dirty ? h('div', { class: 'acts2' }, act('save', 'Save', 'Save it in the lake (Ctrl+S)', () => doc.save())) : null, h('p', { class: 'muted' }, 'Once saved, it is kept in the lake\'s files: the Workspace lists it, and its size and versions show here.')];
+}
 export function resultDetail(p) {
   const { r, i, cell } = p, times = r.columns.map(c => /^Timestamp/.test(c.type || ''));
   const out = [head('chart', cell?.count ? `Answer [${cell.count}]` : 'Answer', `${count(r.rows.length)} row${r.rows.length === 1 ? '' : 's'}${r.total > r.rows.length ? ` of ${count(r.total)} (the ones here)` : ''} · ${r.columns.length} column${r.columns.length === 1 ? '' : 's'}`), h('div', { class: 'dsect' }, 'Columns')];

@@ -5,13 +5,23 @@
 // gives each in SQL and in Python. Kinds and actions are registries (`register.objectKind`,
 // `register.objectAction`): users, roles and grants (round 29, part 2), flows (round 30) and
 // an extension's own come in the same way. Loaded when the Data tree is first used.
-import { h, svg, S, R, run, rows, ident, quote, toast, menu, prompt, pop, confirmed, sqlType, call, moreStyle, MODE, fileUrl, fileSql } from './core.js';
+import { h, svg, S, R, run, rows, ident, quote, toast, menu, prompt, pop, confirmed, sqlType, call, moreStyle, MODE, fileUrl, fileSql, home } from './core.js';
 import { highlighted } from './editor.js';
-import { copyText, fetchRows, DOWNLOADS } from './grid.js';
+import { copyText, fetchRows, downloadItems } from './grid.js';
 
 await moreStyle();
 
 const H = R.helpers;
+
+/** A new database, in a folder of lakes (`pondra serve --lakes`): made by the server, then used. */
+export async function newDatabase() {
+  const name = ((await prompt('New database', 'Its name (letters, digits and _)', '')) || '').trim().toLowerCase();
+  if (!name) return;
+  try {
+    await call('/databases', { method: 'POST', body: JSON.stringify({ name }), headers: { 'content-type': 'application/json' }, root: true });
+    await H.use(name);
+  } catch (e) { toast(e.message, true); }
+}
 
 // ------------------------------------------------------------------ what an action does: a script in a tab, or SQL run
 /** SQL (or Python) in a new tab, to read, change and run. */
@@ -104,7 +114,7 @@ export function tableMenu(at, t) {
     { label: 'Script as…', icon: 'filesql', run: () => scriptAs(t) },
     table ? { label: 'Insert rows…', run: () => tab(scripts(t).find(x => x[0] === 'INSERT')[1]) } : null,
     table ? { label: 'Import rows from a file…', icon: 'up', run: () => importFile((src, n) => { const c = cols(t).map(c => ident(c.n)).join(', '); return `-- ${n}'s rows into ${t.q}, its columns by name\nINSERT INTO ${t.q} (${c})\nSELECT ${c}\nFROM ${src};`; }) } : null,
-    { label: 'Download every row…', icon: 'down', run: then(at, [{ head: 'Every row, as' }, ...DOWNLOADS.map(([f, label]) => ({ label, run: () => fetchRows({ sql: `SELECT * FROM ${t.q}` }, f, t.t) }))]) },
+    { label: 'Download all rows…', icon: 'down', run: then(at, downloadItems(f => fetchRows({ sql: `SELECT * FROM ${t.q}` }, f, t.t), 'All rows, as')) },
     kind === 'table' || kind === 'materialized view' ? { label: 'As a Kafka topic…', icon: 'terminal', run: () => kafka(t) } : null, '-',
     table ? { label: 'Add a column…', icon: 'plus', run: async () => { const c = await name('Add a column', `A column of ${t.q}: its name and type`, 'note VARCHAR'); if (c) exec(`ALTER TABLE ${t.q} ADD COLUMN ${c}`, `Added ${c.split(/\s/)[0]} to ${t.q}`); } } : null,
     kind !== 'materialized view' ? { label: 'Rename…', icon: 'pencil', run: async () => { const n = await name('Rename', `The new name of ${t.q}`, t.t); if (n && n !== t.t) exec(`ALTER ${word === 'VIEW' ? 'VIEW' : 'TABLE'} ${t.q} RENAME TO ${ident(n)}`, `Renamed to ${n}`); } } : null,
@@ -152,6 +162,24 @@ export function lakeMenu(at, lake, current) {
     { label: 'Refresh', icon: 'refresh', run: () => H.refresh() }, { label: 'Copy the name', icon: 'copy', run: () => copyText(lake, `Copied ${lake}`) },
     !current ? { label: 'Detach…', icon: 'trash', run: () => danger(`Detach ${lake}? Its data stays where it is.`, `DETACH ${ident(lake)}`, `Detached ${lake}`) } : null,
     MODE === 'lakes' && current ? { label: 'Drop the database…', icon: 'trash', run: () => danger(`Drop the database ${lake}, its folder and every table in it? This can't be undone.`, `DROP DATABASE ${ident(lake)}`, `Dropped ${lake}`) } : null, ...more('lake', lake)]);
+}
+
+/** The database pill's menu (a SQL file's toolbar): a server's databases to run in, or one by name;
+ * a lake and those attached (a node runs in its lake: an attached one's tables are `name.table`);
+ * its name copied. */
+export function dbMenu(at) {
+  const now = home(), copy = { label: 'Copy name', icon: 'copy', hint: now, run: () => copyText(now, 'Name copied') };
+  if (MODE === 'lakes') return menu(at, [{ head: 'Run in' }, ...(S.dbs || []).map(d => ({ label: d.name, checked: d.name === now, hint: d.running && d.name !== now ? 'running' : null, run: () => d.name !== now && H.use(d.name) })), '-',
+    { label: 'Another, by name…', icon: 'search', run: byName }, { label: 'New database…', icon: 'plus', run: () => H.newDatabase() }, copy]);
+  const attached = (S.lakes || []).filter(n => n !== now);
+  menu(at, [{ head: 'Runs in this lake' }, { label: now, checked: true, run: () => {} }, attached.length ? { head: 'Attached: click to put its name in' } : null,
+    ...attached.map(n => ({ label: n, icon: 'db', run: () => S.doc?.put?.(ident(n) + '.') })), '-', copy]);
+}
+async function byName() {
+  const name = ((await prompt('Run in', 'The database\'s name', '')) || '').trim().toLowerCase();
+  if (!name || name === home()) return;
+  if ((S.dbs || []).some(d => d.name === name)) return H.use(name);
+  toast(`No database ${name}: New database… makes one`, true);
 }
 
 // ------------------------------------------------------------------ the lake's other objects: routines, schedules, secrets
