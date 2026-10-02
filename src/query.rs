@@ -687,9 +687,10 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
     for s in crate::ddl::schemas(lake).await?.into_iter().filter(|s| s != PUBLIC) {
         default.register_schema(&s, Arc::new(MemorySchemaProvider::new()))?;
     }
-    for (key, meta) in lake.cat.scan::<TableMeta>("t/", "t0").await? {
+    for (key, raw) in lake.cat.scan_raw("t/", "t0").await? {
         let name = &key[2..];
         if name != except && !crate::sys::hidden(name) && (listing || mentions(&text, name)) {
+            let meta: TableMeta = serde_json::from_slice(&raw)?; // (only the tables it names: decoding every one was half of a small query's time)
             let touched = crate::txn::touched(name);
             let view = table_view(lake, &ctx, name, &if touched { crate::sys::with_sys(&meta) } else { sys(meta.clone()) }, upto).await?;
             let mut t = named(&ctx, view, &meta, names_deleted(&text))?;
@@ -728,11 +729,12 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
         if old {
             default.register_schema(&ns, Arc::new(MemorySchemaProvider::new()))?;
         }
-        for (key, meta) in other.cat.scan::<TableMeta>("t/", "t0").await? {
+        for (key, raw) in other.cat.scan_raw("t/", "t0").await? {
             let name = &key[2..];
             if crate::sys::hidden(name) || !(listing || mentions(&text, name)) {
                 continue;
             }
+            let meta: TableMeta = serde_json::from_slice(&raw)?;
             let view = named(&ctx, table_view(&other, &ctx, name, &sys(meta.clone()), None).await?, &meta, names_deleted(&text))?;
             let Some(view) = guarded(&format!("{ns}.{name}"), view, listing) else { continue }; // (a user's: granted ON ALL TABLES)
             let (s, t) = split(name);
@@ -799,18 +801,19 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
 /// The stored views (`CREATE VIEW`) `sql` names, and the ones they name; every one for a listing.
 pub async fn stored_views(lake: &Lake, sql: &str, listing: bool) -> Result<Vec<(String, String)>> {
     let (mut text, mut views) = (sql.to_string(), vec![]);
-    let mut stored = lake.cat.scan::<crate::ddl::StoredView>("q/", "q0").await?;
-    for (_, v) in stored.iter_mut() {
-        v.sql = crate::routines::expand(lake, &v.sql).await?; // (macros as they are now)
-    }
+    let stored = lake.cat.scan_raw("q/", "q0").await?; // (decoded and expanded only when named: every query paid for every view)
     loop {
-        let more: Vec<(String, String)> = stored.iter().map(|(k, v)| (k[2..].to_string(), v.sql.clone()))
-            .filter(|(n, _)| !views.iter().any(|(m, _): &(String, String)| m == n) && (listing || crate::ddl::mentions(&text, n))).collect();
+        let more: Vec<(&String, &bytes::Bytes)> = stored.iter()
+            .filter(|(k, _)| !views.iter().any(|(m, _): &(String, String)| m == &k[2..]) && (listing || crate::ddl::mentions(&text, &k[2..]))).collect();
         if more.is_empty() {
             return Ok(views);
         }
-        more.iter().for_each(|(_, s)| text.push_str(&format!(" {s}")));
-        views.extend(more);
+        for (k, raw) in more {
+            let v: crate::ddl::StoredView = serde_json::from_slice(raw)?;
+            let sql = crate::routines::expand(lake, &v.sql).await?; // (macros as they are now)
+            text.push_str(&format!(" {sql}"));
+            views.push((k[2..].to_string(), sql));
+        }
     }
 }
 

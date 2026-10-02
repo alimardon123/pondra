@@ -31,7 +31,13 @@ optimizing; performance first):
    input), not over schemas built at every step, and a table's statistics are worked out once a
    query (its sketches' estimates were made again for every input costed). TPC-DS q64 plans in
    0.16 s, 0.22 s before (0.71 s with the first try at the order above).
-3. **CI the same every push:** `harness.py functions`' killed-worker check waits for the workers
+3. **Small queries cost half what they did** (invariant 199): a query's session is a copy of one
+   made once per lake (its functions, planners and rules: registering them again was a third of
+   `SELECT 1`), with catalogs of its own; only the table entries a query names are decoded (every
+   table's was, about half of a small query's time), stored views are expanded only when named,
+   and the cores are counted once. Over HTTP, on TPC-DS's lake: `SELECT 1` 1.64 → 0.86 ms, a count
+   of a small table 3.2 → 2.2 ms, a three-table join that finds nothing 10.6 → 8.7 ms.
+4. **CI the same every push:** `harness.py functions`' killed-worker check waits for the workers
    it killed to be gone (the next query could take one the node still saw running); fuzzed nodes
    run in their test folder (`ATTACH 'nope'` had left two lakes in the repository).
 

@@ -1269,6 +1269,14 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    kept where nothing reads it. A run's given values replace its `DECLARE`s' defaults, cast to
    their types. `pondra.variables` and `pondra.parameters('file')` are never remembered answers
    and run on their node. `harness.py variables`.
+199. **A query's session is a copy, and only its functions are shared** (`Lake::session_with`):
+   the functions, planners and rules every session has are made once a partition count and
+   copied; each copy gets catalogs of its own, so the tables, views and temporary tables a query
+   registers are its alone, and what a session changes (settings, its functions) changes its
+   copy. Nothing that holds the lake goes into what is kept (`files()`, `file_read`, `secrets()`
+   are registered on each copy), or the lake would never be dropped. With the catalogs shared,
+   `harness.py temps` fails at its first `CREATE TEMP TABLE … FROM orders` ("the table orders
+   already exists": the last query's tables were still registered).
 
 ## Tests: run these before and after any change
 
