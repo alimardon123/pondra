@@ -107,6 +107,13 @@ optimizing; performance first):
 12. **TPC-H SF1, the same day** (`logs/round32/tpch-sf1*.json`): Pondra from memory 1.22 s, from
    files 2.18 s; DuckDB 1.5.5 over Parquet 2.19 s, its own tables 1.05 s; DuckDB 2.0's preview
    1.98 s and 0.92 s; Polars 1.44 1.92 s. Every answer equal to DuckDB's.
+13. **A wrong answer fixed (0.31.1; invariant 204):** a global min and max of two things,
+   `SELECT min(a), max(b + 1)`, came back too low when the table's rows were in several files, and
+   `min(a), max(c)` NULL when `c` was NULL in the files read first. DataFusion's filter for a global
+   min/max, which the scans skip row groups (and hot batches) by, leaves out a max of an expression
+   and one with no value yet. Found by reviewing the next change to the hot scan; 0.30 had it too.
+   Where a bound can be left out, the aggregate now keeps the filter to itself.
+   `harness.py minmax` checks seven shapes against a model, three times each.
 
 **Then (2026-10-01, round 31, second part so far; 0.29.0): every kind of object alike, SQL and
 Python in one notebook** (the owner's list after the first part):

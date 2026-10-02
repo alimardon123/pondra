@@ -4564,6 +4564,43 @@ def hot():
     return f"hot: batches skipped by their ranges, answers the model's: all {len(checks)} checks pass"
 
 
+def minmax():
+    """A global min/max hands the scans a filter of the rows that could still change its answer, and
+    the scans skip row groups by it (round 32's fix of DataFusion's): a table of 24 files read from
+    them, each file's `a` above the last's, `b` NULL in the first six and `c` in all but the last.
+    Every answer the model's; without the fix `max(b + 1)` came back too low and `max(c)` NULL."""
+    lake = new_lake()
+    node = Node(lake, A.port, env={"PONDRA_HOT_GB": "0"}).start()
+    q = lambda s: sql(A.port, s)
+    files, n = 24, 100000
+    q("CREATE TABLE t (a BIGINT, b BIGINT, c BIGINT, s VARCHAR)")
+    for f in range(files):  # (a bulk INSERT is a file of its own)
+        q(f"INSERT INTO t SELECT value + {f * n}, {'NULL' if f < 6 else f}, {f if f == files - 1 else 'NULL'}, 's' || {f} FROM range(0, {n})")
+    asks = {  # what each asks and the model's answer
+        "a min and the max of an expression": ("SELECT min(a) AS lo, max(b + 1) AS hi FROM t", [{"lo": 0, "hi": files}]),
+        "a min and the max of a column NULL in the first files": ("SELECT min(a) AS lo, max(b) AS hi FROM t", [{"lo": 0, "hi": files - 1}]),
+        "a min and the max of a column NULL in all files but the last": ("SELECT min(a) AS lo, max(c) AS hi FROM t", [{"lo": 0, "hi": files - 1}]),
+        "a min of strings and the max of a column NULL in all files but the last": ("SELECT min(s) AS lo, max(c) AS hi FROM t", [{"lo": "s0", "hi": files - 1}]),
+        "a filtered min and a max": ("SELECT min(a) FILTER (WHERE c IS NOT NULL) AS lo, max(a) AS hi FROM t", [{"lo": (files - 1) * n, "hi": files * n - 1}]),
+        "the min and max of one column": ("SELECT min(a) AS lo, max(a) AS hi FROM t", [{"lo": 0, "hi": files * n - 1}]),
+        "one max": ("SELECT max(c) AS hi FROM t", [{"hi": files - 1}]),
+    }
+    checks, seen = {}, {}
+    try:
+        for name, (ask, want) in asks.items():
+            got = [q(ask + f" -- {run}") for run in range(3)]
+            seen[name] = "== model" if all(g == want for g in got) else got
+            checks[f"{name}: the model's answer, three times"] = all(g == want for g in got)
+    finally:
+        node.kill()
+        clean_up()
+    ok = all(checks.values())
+    print(json.dumps({"minmax": checks, "seen": seen, "ok": ok}, indent=1))
+    if not ok:
+        sys.exit(1)
+    return f"minmax: a global min/max skips no row it needs: all {len(checks)} checks pass"
+
+
 def found():
     """What writing the docs found (round 26), each fixed: a filtered materialized view follows
     UPDATE and DELETE; a producer's seq 0 refused (HTTP, Flight); a merge table that leaves a
@@ -6385,7 +6422,7 @@ finally {{ await db.close?.(); }}"""
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    out = {t.__name__: t() for t in (upsert, deal, outside, clouds, kafkas, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, found, renames, workspace, server, scale, flight, users, secrets, safety, versions, stopped, flows, begin, doors, objects, sparksql, variables, hot, reader, crash)}
+    out = {t.__name__: t() for t in (upsert, deal, outside, clouds, kafkas, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, found, renames, workspace, server, scale, flight, users, secrets, safety, versions, stopped, flows, begin, doors, objects, sparksql, variables, hot, minmax, reader, crash)}
     A.secs = min(A.secs, 20)
     out["load"] = load()
     print(json.dumps(out, indent=1))
@@ -6393,7 +6430,7 @@ def all_tests():
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "found", "renames", "workspace", "server", "scale", "flight", "users", "secrets", "safety", "versions", "stopped", "flows", "begin", "doors", "objects", "sparksql", "variables", "hot", "load", "all"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "found", "renames", "workspace", "server", "scale", "flight", "users", "secrets", "safety", "versions", "stopped", "flows", "begin", "doors", "objects", "sparksql", "variables", "hot", "minmax", "load", "all"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -6404,4 +6441,4 @@ if __name__ == "__main__":
     ap.add_argument("--secs", type=int, default=30)
     ap.add_argument("--flush-ms", type=int, default=250)
     A = ap.parse_args()
-    {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "safety": safety, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "objects": objects, "sparksql": sparksql, "variables": variables, "hot": hot, "load": load, "all": all_tests}[A.mode]()
+    {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "safety": safety, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "objects": objects, "sparksql": sparksql, "variables": variables, "hot": hot, "minmax": minmax, "load": load, "all": all_tests}[A.mode]()
