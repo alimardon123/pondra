@@ -141,6 +141,16 @@ optimizing; performance first):
    TPC-H 1.24 s, every answer as DuckDB's but the same 7 ties (`logs/round32/*-arena.json`); TPC-DS
    99 of 99. The first try copied each batch's strings out, which made a join on a low-cardinality
    string column carry and count a copy per batch: TPC-H q12's build 235 MB instead of 68.
+17. **Key lookups while writes land, 16× more a second** (`serve::Tail`): a lookup looked for its key
+   in every log segment since the table's last tiering round, newest first, and a table taking 250
+   small commits a second had thousands of them; now each table's log tail is indexed by the hash
+   of its key, kept per node until the next round and brought up to date with only the segments
+   committed since (the row a hash names is checked; another key of the same hash scans as before).
+   `serve_bench.py`, 8 clients while a writer upserts 200 rows per commit: 1,676 → 27,600 lookups a
+   second, p50 4.6 → 0.22 ms; without writes 38,900 both ways. The same dashboard aggregate while
+   writing looked slower after it (300 → 180 a second), because the writer, no longer starved by
+   the lookups before it, had written twice as many rows by then: run without the lookups first,
+   both builds give 175.
 
 **Then (2026-10-01, round 31, second part so far; 0.29.0): every kind of object alike, SQL and
 Python in one notebook** (the owner's list after the first part):
