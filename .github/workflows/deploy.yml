@@ -20,6 +20,12 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
+# A pull request's newer push stops its older run (it would only wait for packages again); a
+# tag's run is never stopped.
+concurrency:
+  group: deploy-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   actions: read # (the build run's packages)
   contents: read

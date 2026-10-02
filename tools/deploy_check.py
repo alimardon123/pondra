@@ -244,6 +244,8 @@ def helm(a):
     try:
         run("kubectl", "create", "namespace", ns)
         k("create", "deployment", "s3", "--image=motoserver/moto:5.1.4", "--port=5000")
+        # (moto takes a host like s3.<ns>.svc for a bucket named "s3": the nodes ask by path)
+        k("set", "env", "deployment/s3", "S3_IGNORE_SUBDOMAIN_BUCKETNAME=true")
         k("expose", "deployment", "s3", "--port=5000")
         k("rollout", "status", "deployment/s3", "--timeout=180s")
         with Forward(ns, "svc/s3", 5000) as port:
