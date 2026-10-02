@@ -17,7 +17,7 @@ Prints the checks as JSON and exits 1 if one fails (a failing release's lakes an
 kept in --work). Needs the Python packages in tools/requirements.txt for other engines' reads
 (deltalake, pyiceberg); without them those checks are skipped, and say so.
 """
-import argparse, atexit, collections, io, json, os, platform, shutil, signal, socket, subprocess, sys, tarfile, tempfile, time, urllib.error, urllib.request
+import argparse, atexit, collections, io, json, os, platform, random, shutil, signal, socket, subprocess, sys, tarfile, tempfile, threading, time, urllib.error, urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = "alimardon123/pondra"
@@ -91,8 +91,8 @@ def stop_all():
 class Node:
     """A node of `bin` serving `lake`, started and stopped as a scheduler would."""
 
-    def __init__(self, bin, lake, port, work, *flags):
-        self.bin, self.lake, self.port, self.flags = bin, lake, port, list(flags)
+    def __init__(self, bin, lake, port, work, *flags, env=None):
+        self.bin, self.lake, self.port, self.flags, self.env = bin, lake, port, list(flags), env or {}
         self.log = os.path.join(work, f"node-{port}-{os.path.basename(lake)}.log")
         self.p = None
 
@@ -100,10 +100,11 @@ class Node:
         with socket.socket() as s:  # (a node left from a run that died would answer for this one)
             if s.connect_ex(("127.0.0.1", self.port)) == 0:
                 raise Failed(f"port {self.port} is in use: stop what serves it")
-        env = {**os.environ, "PONDRA_SECRET_KEY": SECRET_KEY, "PONDRA_OWNER_KEY": OWNER, "PONDRA_ADMIN_TOKEN": TOKEN}
+        env = {**os.environ, "PONDRA_SECRET_KEY": SECRET_KEY, "PONDRA_OWNER_KEY": OWNER, "PONDRA_ADMIN_TOKEN": TOKEN, **self.env}
         with open(self.log, "a") as err:
             err.write(f"\n=== {self.bin} serve {self.lake} {' '.join(self.flags)}\n")
             err.flush()
+            self.mark = err.tell()
             self.p = subprocess.Popen([self.bin, "serve", "--dir", self.lake, "--addr", f"127.0.0.1:{self.port}", "--admin-token", TOKEN, "--tier-secs", "0", *self.flags],
                                       env=env, stdout=subprocess.DEVNULL, stderr=err, stdin=subprocess.DEVNULL)
         NODES.append(self)
@@ -118,14 +119,32 @@ class Node:
                 time.sleep(0.05)
         raise Failed(f"{self.bin} didn't answer on {self.lake}: {open(self.log).read()[-1500:]}")
 
-    def stop(self, how="term"):
+    def stop(self, how="term", wait=True):
         if self.p and self.p.poll() is None:
             self.p.send_signal(signal.SIGKILL if how == "kill" else signal.SIGTERM)
             try:
-                self.p.wait(timeout=30)
+                self.p.wait(timeout=60 if wait else 0.001)
             except subprocess.TimeoutExpired:
-                self.p.kill()
-                self.p.wait()
+                if wait:
+                    self.p.kill()
+                    self.p.wait()
+
+    def said(self):
+        """What this node wrote to its standard error since it started."""
+        with open(self.log) as f:
+            f.seek(self.mark)
+            return f.read()
+
+    def plain(self, method, path, body=None):
+        """A request without a token, as a load balancer's probe makes it: (status, headers, text)."""
+        req = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}", data=body.encode() if body else None, method=method)
+        try:
+            r = urllib.request.urlopen(req, timeout=30)
+            return r.status, dict(r.headers), r.read().decode()
+        except urllib.error.HTTPError as e:
+            return e.code, dict(e.headers), e.read().decode(errors="replace")
+        except OSError as e:
+            return 0, {}, str(e)
 
     def call(self, method, path, body=None, headers=None, timeout=120):
         data = body if isinstance(body, (bytes, type(None))) else (body if isinstance(body, str) else json.dumps(body)).encode()
@@ -150,10 +169,13 @@ class Node:
         return self.post(f"/append/{table}?producer={producer}&seq={seq}", "".join(json.dumps(r) + "\n" for r in rows))
 
 
-def cli(bin, lake, sql):
-    """`pondra sql` on the lake, as a user's machine runs it (no node needed)."""
+def cli(bin, lake, sql, ok=True):
+    """`pondra sql` on the lake, as a user's machine runs it (no node needed): what it printed (with
+    `ok=False`, (exit code, what it printed) whatever happened)."""
     env = {**os.environ, "PONDRA_SECRET_KEY": SECRET_KEY, "PONDRA_ADMIN_TOKEN": TOKEN}
     r = subprocess.run([bin, "sql", "--dir", lake, sql], capture_output=True, text=True, timeout=300, env=env)
+    if not ok:
+        return r.returncode, r.stdout + r.stderr
     if r.returncode != 0:
         raise Failed(f"pondra sql {sql!r}: {(r.stdout + r.stderr)[-1500:]}")
     return r.stdout
@@ -542,38 +564,313 @@ def lake_check(v, old_bin, new_bin, work, port):
     return checks, info
 
 
+def until(what, secs, step=0.5):
+    """`what()` once it is true (errors count as not yet), or false after `secs`."""
+    deadline = time.time() + secs
+    while True:
+        try:
+            got = what()
+        except Exception:
+            got = False
+        if got or time.time() > deadline:
+            return got
+        time.sleep(step)
+
+
+# ---------------------------------------------------------------- the lake's format
+
+def format_check(new_bin, work, port):
+    """The lake's format (ADR-039), this build posing as a later one for a node (PONDRA_TEST_FORMAT=2)."""
+    checks, info = {}, {}
+    lake, later = os.path.join(work, "format-lake"), {"PONDRA_TEST_FORMAT": "2"}
+    fmt = lambda n: n.get("/stats", timeout=5)["format"]
+    a = Node(new_bin, lake, port, work, env=later).start()  # leads, and knows format 2
+    b = Node(new_bin, lake, port + 1, work).start()  # follows, and knows format 1
+    a.q("CREATE TABLE t (x INT)")
+    a.q("INSERT INTO t VALUES (1), (2)")
+    moved = until(lambda: fmt(a) == 1 and fmt(b) == 1, 40)
+    time.sleep(12)  # (another of the leader's looks: it must not go past what the follower knows)
+    info["with a node of each"] = {"leader's": fmt(a), "follower's": fmt(b), "releases": a.get("/stats")["releases"]}
+    checks["a lake moves on to the newest format every node knows, and no further"] = moved and fmt(a) == 1
+    b.stop()
+    checks["…and on again once the node that didn't know the next one has gone"] = until(lambda: fmt(a) == 2, 40)
+    refused = lambda x: x.p.poll() not in (None, 0) and "format 2" in x.said() and "run Pondra" in x.said()
+    b = Node(new_bin, lake, port + 1, work)
+    try:  # a node that doesn't know the lake's format: at once, or as soon as its view holds the format
+        b.start()
+        b.p.wait(20)
+    except (Failed, subprocess.TimeoutExpired):
+        pass
+    info["a follower that knows format 1 said"] = b.said()[-300:]
+    checks["a node that doesn't know the lake's format refuses it, saying which release it needs"] = refused(b)
+    b.stop("kill")
+    code, said = cli(new_bin, lake, "SELECT count(*) AS n FROM t", ok=False)
+    checks["…and so does pondra sql"] = code != 0 and "format 2" in said
+    a.stop()
+    t0 = time.time()
+    b = Node(new_bin, lake, port + 1, work)
+    try:  # (nobody leads: it would, and must give the term back)
+        b.start()
+    except Failed:
+        pass
+    b.stop("kill")
+    t1 = time.time()
+    a = Node(new_bin, lake, port, work, env=later).start()
+    info["seconds"] = {"a node of format 1 refused to lead it": round(t1 - t0, 1), "then one of format 2 led it": round(time.time() - t1, 1)}
+    checks["…without holding on to the leader's term: the next node leads at once"] = refused(b) and time.time() - t1 < 10
+    checks["the lake reads as it did"] = a.q("SELECT count(*) AS n FROM t") == [{"n": 2}]
+    a.stop()
+    return checks, info
+
+
+# ---------------------------------------------------------------- stopping
+
+class Load:
+    """Producers writing without a pause, each batch once (a producer's sequence, retried on any
+    live node until acknowledged), and readers asking the nodes whether each producer's batches are
+    a prefix with no gaps. `nodes`: the live nodes, a list changed in place as they come and go."""
+
+    def __init__(self, nodes, table, producers=4, readers=2, size=20):
+        self.nodes, self.table, self.size = nodes, table, size
+        self.stop_, self.acked, self.waits, self.torn, self.reads = threading.Event(), collections.defaultdict(int), [], [], [0]
+        self.threads = [threading.Thread(target=self.write, args=(f"p{i}",), daemon=True) for i in range(producers)]
+        self.threads += [threading.Thread(target=self.read, daemon=True) for _ in range(readers)]
+
+    def start(self):
+        [t.start() for t in self.threads]
+        return self
+
+    def write(self, producer):
+        seq = 0
+        while not self.stop_.is_set():
+            seq += 1
+            body = "".join(json.dumps({"producer": producer, "seq": seq, "i": i}) + "\n" for i in range(self.size))
+            t0 = time.time()
+            while True:
+                try:
+                    random.choice(self.nodes).call("POST", f"/append/{self.table}?producer={producer}&seq={seq}", body, timeout=20)
+                    break
+                except Exception:
+                    time.sleep(0.1)
+            self.waits.append((time.time() - t0, t0))
+            self.acked[producer] = seq
+
+    def read(self):
+        q = f"SELECT producer, count(*) AS n, count(DISTINCT seq) AS d, max(seq) AS mx FROM {self.table} GROUP BY producer"
+        while not self.stop_.is_set():
+            try:
+                for r in random.choice(self.nodes).q(q):
+                    if r["n"] != r["mx"] * self.size or r["d"] != r["mx"]:
+                        self.torn.append(r)
+                self.reads[0] += 1
+            except Exception:
+                pass  # (a node stopping, or starting)
+            time.sleep(0.05)
+
+    def finish(self, node):
+        """Stop; then what `node` holds against what was acknowledged."""
+        self.stop_.set()
+        [t.join(30) for t in self.threads]
+        held = {r["producer"]: r for r in node.q(f"SELECT producer, count(*) AS n, count(DISTINCT seq) AS d, max(seq) AS mx FROM {self.table} GROUP BY producer")}
+        wrong = {p: held.get(p) for p, seq in self.acked.items() if not held.get(p) or held[p]["d"] != held[p]["mx"] or held[p]["n"] != held[p]["mx"] * self.size or held[p]["mx"] < seq}
+        return {"batches acknowledged": sum(self.acked.values()), "lost or twice": wrong, "torn reads": self.torn[:5], "reads": self.reads[0]}
+
+    def longest(self, since, until_=None):
+        """The longest a batch waited for its acknowledgement, of those sent from `since` on (s)."""
+        w = [d for d, t0 in self.waits if t0 >= since and (until_ is None or t0 <= until_)]
+        return round(max(w, default=0), 2)
+
+
+def drain_check(new_bin, work, port):
+    """A node told to stop drains first (ADR-039, `drain.rs`); a leader then steps down."""
+    checks, info = {}, {}
+    n = Node(new_bin, os.path.join(work, "drain-lake"), port, work).start()
+    checks["/healthz and /ready answer 200, without a token"] = n.plain("GET", "/healthz")[0] == 200 and n.plain("GET", "/ready")[0] == 200
+    # A query that takes a few seconds here (each size its own: no remembered answer).
+    long = lambda rows: f"SELECT sum(value % 7) AS s FROM range(0, {rows})"
+    rows = 20_000_000
+    for _ in range(8):
+        t0 = time.time()
+        n.q(long(rows))
+        secs = time.time() - t0
+        if secs > 2:
+            break
+        rows = int(rows * min(10, 3 / max(secs, 0.05)))
+    rows += 1
+    info["a query of"] = {"rows": rows, "seconds": round(secs, 1)}
+    got = {}
+
+    def ask(rows):
+        try:
+            got["rows"] = n.q(long(rows))
+        except Exception as e:
+            got["error"] = str(e)[:300]
+        got["at"] = time.time()
+
+    th = threading.Thread(target=ask, args=(rows,))
+    th.start()
+    time.sleep(0.5)
+    n.p.send_signal(signal.SIGTERM)
+    time.sleep(0.2)
+    ready, health, new = n.plain("GET", "/ready"), n.plain("GET", "/healthz"), n.plain("POST", "/sql", "SELECT 1")
+    th.join()
+    n.p.wait(60)
+    info["while stopping"] = {"/ready": ready[0], "/healthz": health[0], "a new query": [new[0], new[2][:80], {k.lower(): v for k, v in new[1].items()}.get("retry-after")]}
+    checks["told to stop, a node isn't ready, and turns new requests away to be retried (503, Retry-After)"] = ready[0] == 503 and health[0] == 200 and new[0] == 503 and "retry-after" in {k.lower() for k in new[1]}
+    want = (rows // 7) * 21 + sum(range(rows % 7))
+    checks["…finishes the requests it has first"] = got.get("rows") == [{"s": want}]
+    info["the query running"] = {k: v for k, v in got.items() if k != "at"}
+    checks["…and then stops (exit 0)"] = n.p.returncode == 0 and time.time() - got["at"] < 5
+    n = Node(new_bin, os.path.join(work, "drain-lake"), port, work, env={"PONDRA_DRAIN_SECS": "1"}).start()
+    th = threading.Thread(target=ask, args=(rows * 4,))
+    th.start()
+    time.sleep(0.5)
+    t0 = time.time()
+    n.p.send_signal(signal.SIGTERM)
+    n.p.wait(60)
+    took = time.time() - t0
+    th.join()
+    info["seconds to stop with PONDRA_DRAIN_SECS=1 and a longer query"] = round(took, 1)
+    checks["…but for PONDRA_DRAIN_SECS at most"] = took < 4
+    # A leader stopped under load hands over at once; killed, its followers wait out the lease.
+    lake = os.path.join(work, "drain-cluster")
+    nodes = [Node(new_bin, lake, port + i, work).start() for i in range(3)]
+    nodes[0].post("/tables/ev2", json.dumps([["producer", "Utf8"], ["seq", "Int64"], ["i", "Int64"]]))
+    until(lambda: all(x.q("SELECT count(*) AS n FROM ev2") for x in nodes), 20)
+    live = list(nodes)
+    load = Load(live, "ev2").start()
+    stalls = {}
+    for how in ("term", "kill"):
+        time.sleep(4)
+        leader = next(x for x in live if x.get("/stats")["role"] == "leader")
+        t0 = time.time()
+        live.remove(leader)
+        leader.stop(how)
+        until(lambda: any(x.get("/stats", timeout=2)["role"] == "leader" for x in live), 60)
+        time.sleep(3)
+        stalls["stopped (SIGTERM)" if how == "term" else "killed (kill -9)"] = load.longest(t0 - 0.5)
+        live.append(leader.start())  # (it rejoins as a follower)
+    time.sleep(3)
+    result = load.finish(live[0])
+    info["a leader stopped under load"] = {"longest wait for an ack, s": stalls, **result}
+    checks["a leader stopped under load: every acknowledged batch once, no torn read, on every node"] = not result["lost or twice"] and not result["torn reads"] and all(
+        x.q("SELECT count(*) AS n FROM ev2") == live[0].q("SELECT count(*) AS n FROM ev2") for x in live)
+    checks["…its followers take over sooner than when it is killed"] = stalls["stopped (SIGTERM)"] < stalls["killed (kill -9)"]
+    [x.stop() for x in live]
+    return checks, info
+
+
+# ---------------------------------------------------------------- a rolling upgrade
+
+def rolling_check(old_v, old_bin, new_bin, work, port, leader_first=False):
+    """A cluster of release `old_v` upgraded to this build a node at a time, under load: the
+    followers first (or the leader first), each stopped and started again on the new binary; then
+    restarted a node at a time again, as the next upgrade from this build will be."""
+    checks, info = {}, {}
+    lake = os.path.join(work, f"rolling-{old_v}-{'leader' if leader_first else 'followers'}-first")
+    nodes = [Node(old_bin, lake, port + i, work).start() for i in range(3)]
+    nodes[0].post("/tables/ev2", json.dumps([["producer", "Utf8"], ["seq", "Int64"], ["i", "Int64"]]))
+    nodes[0].q("CREATE TABLE kv2 (k BIGINT PRIMARY KEY, v BIGINT)")
+    nodes[0].q("CREATE MATERIALIZED VIEW per_producer AS SELECT producer, count(*) AS n, max(seq) AS mx FROM ev2 GROUP BY producer")
+    until(lambda: all(x.q("SELECT count(*) AS n FROM ev2") for x in nodes), 20)
+    live = list(nodes)
+    load = Load(live, "ev2").start()
+    role = lambda x: x.get("/stats", timeout=5)["role"]
+    order = sorted(nodes, key=lambda x: (role(x) == "leader") != leader_first)  # (followers first, or the leader)
+    steps, k = {}, 0
+    for x in order:
+        time.sleep(4)
+        was = role(x)
+        k += 1
+        x.q(f"INSERT INTO kv2 VALUES ({k}, {k}) ")
+        t0 = time.time()
+        live.remove(x)
+        x.stop()
+        if was == "leader":
+            until(lambda: any(role(y) == "leader" for y in live), 60)
+        y = Node(new_bin, lake, x.port, work).start()
+        until(lambda: y.plain("GET", "/ready")[0] == 200, 30)
+        live.append(y)
+        time.sleep(2)
+        steps[f"{was} {x.port} on the new binary"] = {"longest wait for an ack, s": load.longest(t0 - 0.5), "seconds": round(time.time() - t0, 1)}
+    raised = until(lambda: all(y.get("/stats", timeout=5)["format"] >= 1 for y in live), 60)
+    # The next upgrade, from this build: each node drained and its leader stepping down.
+    since = time.time()
+    for x in sorted(list(live), key=lambda x: role(x) == "leader"):
+        time.sleep(3)
+        live.remove(x)
+        was = role(x)
+        x.stop()
+        if was == "leader":
+            until(lambda: any(role(y) == "leader" for y in live), 60)
+        y = Node(new_bin, lake, x.port, work).start()
+        until(lambda: y.plain("GET", "/ready")[0] == 200, 30)
+        live.append(y)
+    time.sleep(2)
+    restarted = load.longest(since)
+    result = load.finish(live[0])
+    leader = next(y for y in live if role(y) == "leader")
+    info.update({"steps": steps, "then restarted from this build, longest wait for an ack, s": restarted, "releases": leader.get("/stats")["releases"], **result})
+    same = lambda sql: all(y.q(sql) == live[0].q(sql) for y in live)
+    checks["every acknowledged batch once, no torn read, through every step"] = not result["lost or twice"] and not result["torn reads"]
+    checks["every node answers the same: rows, a keyed table, a view"] = same("SELECT count(*) AS n FROM ev2") and same("SELECT * FROM kv2 ORDER BY k") and same("SELECT * FROM per_producer ORDER BY producer")
+    checks["the view equals its rows"] = live[0].q("SELECT * FROM per_producer ORDER BY producer") == live[0].q("SELECT producer, count(*) AS n, max(seq) AS mx FROM ev2 GROUP BY producer ORDER BY producer")
+    checks["the lake moves to this build's format once every node runs it"] = bool(raised)
+    checks["the leader hears every node say its release (none from before formats)"] = len(info["releases"]) == 3 and "older" not in info["releases"].values()
+    checks["restarted a node at a time from this build, no batch waits more than 2 s (drained, the leader stepping down)"] = restarted < 2
+    [y.stop() for y in live]
+    return checks, info
+
+
+def run(name, results, f, *args):
+    """One check of this run, its nodes stopped whatever happened: True if it passed."""
+    t0 = time.time()
+    try:
+        checks, info = f(*args)
+    except Failed as e:
+        checks, info = {"ran without an error": False}, {"error": str(e)[:3000]}
+    finally:
+        stop_all()
+        NODES.clear()
+    good = all(checks.values())
+    results[name] = {"ok": good, "secs": round(time.time() - t0, 1), "checks": checks, **({"info": info} if not good or A.verbose else {})}
+    print(f"{name}: {'ok' if good else 'FAILED'} ({results[name]['secs']} s)", file=sys.stderr, flush=True)
+    return good
+
+
 def main():
     global A
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("what", nargs="?", default="lakes", choices=["lakes"])
+    ap.add_argument("what", nargs="?", default="all", choices=["lakes", "format", "drain", "rolling", "all"])
     ap.add_argument("--new", default=os.path.join(HERE, "..", "target", "release", "pondra"), help="this build's binary")
     ap.add_argument("--from", dest="first", default="0.22.0", help="the oldest release whose lake must open")
-    ap.add_argument("--only", default="", help="these releases only (comma-separated)")
+    ap.add_argument("--only", default="", help="these releases only (comma-separated); `rolling` upgrades the newest of them")
     ap.add_argument("--cache", default=os.path.join(os.path.expanduser("~"), ".cache", "pondra-releases"))
     ap.add_argument("--work", default="", help="where lakes and logs go (default: a new temporary folder, removed if every check passes)")
     ap.add_argument("--port", type=int, default=9720)
+    ap.add_argument("--verbose", action="store_true", help="what each check measured, passed or not")
     A = ap.parse_args()
     new_bin = os.path.abspath(A.new)
     work = A.work or tempfile.mkdtemp(prefix="pondra-upgrade-")
     os.makedirs(work, exist_ok=True)
     wanted = [v for v in A.only.split(",") if v]
-    found = [(v, url) for v, url in releases(A.first) if not wanted or v in wanted]
-    results, ok = {}, True
-    for v, url in found:
-        t0 = time.time()
-        try:
-            checks, info = lake_check(v, binary(v, url, A.cache), new_bin, work, A.port)
-        except Failed as e:
-            checks, info = {"made, opened and written without an error": False}, {"error": str(e)[:3000]}
-        finally:
-            stop_all()
-            NODES.clear()
-        good = all(checks.values())
-        ok &= good
-        results[v] = {"ok": good, "secs": round(time.time() - t0, 1), "checks": checks, **({"info": info} if not good else {})}
-        print(f"{v}: {'ok' if good else 'FAILED'} ({results[v]['secs']} s)", file=sys.stderr, flush=True)
-    ok &= bool(found)
-    print(json.dumps({"lakes": results, "releases": [v for v, _ in found], "ok": ok}, indent=1, default=str))
+    found = [(v, url) for v, url in releases(A.first) if not wanted or v in wanted] if A.what in ("lakes", "rolling", "all") else []
+    out, ok = {}, True
+    if A.what in ("lakes", "all"):
+        out["lakes"] = {}
+        for v, url in found:
+            ok &= run(v, out["lakes"], lake_check, v, binary(v, url, A.cache), new_bin, work, A.port)
+        ok &= bool(found)
+    if A.what in ("format", "all"):
+        ok &= run("format", out, format_check, new_bin, work, A.port)
+    if A.what in ("drain", "all"):
+        ok &= run("drain", out, drain_check, new_bin, work, A.port)
+    if A.what in ("rolling", "all"):
+        v, url = found[-1]
+        out["rolling"] = {}
+        for first in ("followers", "leader"):
+            ok &= run(f"{v}, {first} first", out["rolling"], rolling_check, v, binary(v, url, A.cache), new_bin, work, A.port, first == "leader")
+    print(json.dumps({**out, "releases": [v for v, _ in found], "ok": ok}, indent=1, default=str))
     if ok and not A.work:
         shutil.rmtree(work, ignore_errors=True)
     elif not ok:

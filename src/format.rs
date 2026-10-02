@@ -6,15 +6,15 @@
 //! Pondra wrote is refused, by name, before anything is read or written there, so an older binary
 //! started by mistake (a rollback, a machine left behind) never reads one wrongly.
 //!
-//! The leader moves the lake to its `FORMAT` only once every node it hears from knows that format
-//! (`raise`): each node says its release and format on every call to another (`headers`), and the
-//! leader keeps what its followers' heartbeats and commit streams said. In a rolling upgrade the
-//! format moves after the last older node has gone, never before; whatever this build writes that
-//! an older one would read wrongly waits for that format (none yet: format 1 is the mark itself).
+//! The leader moves the lake on to the newest format every node it hears from knows, its own
+//! `FORMAT` at most (`raise`): each node says its release and format on every call to another
+//! (`headers`), and the leader keeps what its followers' heartbeats and commit streams said. In a
+//! rolling upgrade the format moves after the last older node has gone, never before; whatever
+//! this build writes that an older one would read wrongly waits for that format (none yet: format
+//! 1 is the mark itself).
 use crate::store::{Catalog, Lake};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -73,39 +73,47 @@ pub fn said(headers: &axum::http::HeaderMap) -> (String, u32) {
     (get("x-pondra-version").unwrap_or_default(), get("x-pondra-format").and_then(|f| f.parse().ok()).unwrap_or(0))
 }
 
-/// Commit streams open to nodes that don't know this build's format (read-only nodes don't
+/// Commit streams open to other nodes, by the format each knows (read-only nodes don't
 /// heartbeat: their stream is how the leader knows they are there).
-static OLDER_STREAMS: AtomicUsize = AtomicUsize::new(0);
+static STREAMS: std::sync::Mutex<std::collections::BTreeMap<u32, usize>> = std::sync::Mutex::new(std::collections::BTreeMap::new());
 
-/// Held by a commit stream to an older node for as long as it is open.
-pub struct Older;
+/// Held by a commit stream for as long as it is open.
+pub struct Streamed(u32);
 
-impl Older {
-    pub fn of(format: u32) -> Option<Older> {
-        (format < known()).then(|| {
-            OLDER_STREAMS.fetch_add(1, Relaxed);
-            Older
-        })
+impl Streamed {
+    pub fn to(format: u32) -> Streamed {
+        *STREAMS.lock().unwrap().entry(format).or_default() += 1;
+        Streamed(format)
     }
 }
 
-impl Drop for Older {
-    fn drop(&mut self) { OLDER_STREAMS.fetch_sub(1, Relaxed); }
+impl Drop for Streamed {
+    fn drop(&mut self) {
+        let mut s = STREAMS.lock().unwrap();
+        if let Some(n) = s.get_mut(&self.0) {
+            *n -= 1;
+            if *n == 0 {
+                s.remove(&self.0);
+            }
+        }
+    }
 }
 
-/// Leader: move the lake to `FORMAT` once every node knows it. It first waits out two leases, so
-/// that every follower alive has said what it knows, then looks every 10 s. A migration, when a
-/// format needs one, goes here, in the commit that sets the format.
+/// Leader: move the lake on to the newest format every node knows, this one's at most. It first
+/// waits out two leases, so that every follower alive has said what it knows, then looks every
+/// 10 s. A migration, when a format needs one, goes here, in the commit that sets the format.
 pub fn raise(lake: Arc<Lake>, cluster: Arc<crate::cluster::Cluster>) {
     crate::panics::spawn(async move {
         tokio::time::sleep(Duration::from_secs(10)).await;
         loop {
+            let streamed = STREAMS.lock().unwrap().keys().next().copied();
+            let to = [Some(known()), cluster.least_known(), streamed].into_iter().flatten().min().unwrap_or_default();
             match of(&lake.cat).await {
                 Ok(s) if s.format >= known() => return,
-                Ok(_) if cluster.everyone_knows(known()) && OLDER_STREAMS.load(Relaxed) == 0 => {
-                    let stamp = Stamp { format: known(), by: VERSION.into() };
+                Ok(s) if s.format < to => {
+                    let stamp = Stamp { format: to, by: VERSION.into() };
                     match lake.cat.commit(vec![(KEY.into(), serde_json::to_vec(&stamp).expect("json"))], &[]).await {
-                        Ok(()) => return eprintln!("the lake is format {} now (Pondra {VERSION})", known()),
+                        Ok(()) => eprintln!("the lake is format {to} now (Pondra {VERSION})"),
                         Err(e) => eprintln!("the lake's format: {e:#}"),
                     }
                 }
@@ -117,12 +125,13 @@ pub fn raise(lake: Arc<Lake>, cluster: Arc<crate::cluster::Cluster>) {
     });
 }
 
-/// A node that isn't the leader: stop if the lake moves past what this build knows (it can't,
-/// unless this node was cut off while the others agreed, `raise`).
+/// A node that isn't the leader: stop if the lake moves past what this build knows. (It can't,
+/// unless this node was cut off while the others agreed, `raise`, or it started on such a lake
+/// before its catalog view held the format: it holds it once caught up, invariant 197.)
 pub fn watch(lake: Arc<Lake>) {
     crate::panics::spawn(async move {
         loop {
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
             if let Err(e) = check(&lake.cat, &lake.url).await {
                 if e.downcast_ref::<Newer>().is_some() {
                     eprintln!("stopping: {e}");
