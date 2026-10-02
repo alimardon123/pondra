@@ -1,0 +1,58 @@
+# A Pondra cluster on one machine (ADR-041): three nodes on one lake. Every node takes writes and
+# queries; one leads, and another takes over if it stops (`docker compose stop node1`, and see).
+#
+#   docker compose -f deploy/compose/compose.yaml up -d
+#
+# The console is at http://localhost:8080, Postgres at localhost:5432, Arrow Flight at
+# localhost:8815 and Kafka at localhost:9092; the other two nodes at 8081/5433/8816/9093 and
+# 8082/5434/8817/9094. The lake is a volume the nodes share. To keep it in a bucket instead, set
+# PONDRA_LAKE=s3://bucket/prefix with AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY and AWS_REGION
+# (AWS_ENDPOINT for R2 or MinIO) in a .env file beside this one, or in your shell; tokens
+# (PONDRA_ADMIN_TOKEN, PONDRA_WRITE_TOKEN, PONDRA_READ_TOKEN) the same way. PONDRA_IMAGE picks
+# another image. `docker compose down` stops the cluster; `down -v` deletes the lake too.
+name: pondra
+
+x-node: &node
+  image: ${PONDRA_IMAGE:-ghcr.io/alimardon123/pondra:latest}
+  restart: unless-stopped
+  stop_grace_period: 30s # (SIGTERM: a leader hands its term on at once; acknowledged writes are durable)
+  environment: # (passed on only when set)
+    - PONDRA_ADMIN_TOKEN
+    - PONDRA_WRITE_TOKEN
+    - PONDRA_READ_TOKEN
+    - PONDRA_SECRET_KEY
+    - AWS_ACCESS_KEY_ID
+    - AWS_SECRET_ACCESS_KEY
+    - AWS_SESSION_TOKEN
+    - AWS_REGION
+    - AWS_ENDPOINT
+    - AWS_ALLOW_HTTP
+
+services:
+  node1:
+    <<: *node
+    command: [serve, "${PONDRA_LAKE:-lake}", --addr, "0.0.0.0:8080", --advertise, "node1:8080",
+              --pg, "0.0.0.0:5432", --flight, "0.0.0.0:8815", --kafka, "0.0.0.0:9092", --kafka-advertise, "localhost:9092"]
+    ports: ["8080:8080", "5432:5432", "8815:8815", "9092:9092"]
+    # (each node's own /data: a bucket lake's SSD tier and replica files; the lake and the key that
+    # seals secrets, shared: every node opens the secrets any of them sealed)
+    volumes: [node1:/data, lake:/data/lake, keys:/data/.pondra]
+  node2:
+    <<: *node
+    command: [serve, "${PONDRA_LAKE:-lake}", --addr, "0.0.0.0:8080", --advertise, "node2:8080",
+              --pg, "0.0.0.0:5432", --flight, "0.0.0.0:8815", --kafka, "0.0.0.0:9092", --kafka-advertise, "localhost:9093"]
+    ports: ["8081:8080", "5433:5432", "8816:8815", "9093:9092"]
+    volumes: [node2:/data, lake:/data/lake, keys:/data/.pondra]
+  node3:
+    <<: *node
+    command: [serve, "${PONDRA_LAKE:-lake}", --addr, "0.0.0.0:8080", --advertise, "node3:8080",
+              --pg, "0.0.0.0:5432", --flight, "0.0.0.0:8815", --kafka, "0.0.0.0:9092", --kafka-advertise, "localhost:9094"]
+    ports: ["8082:8080", "5434:5432", "8817:8815", "9094:9092"]
+    volumes: [node3:/data, lake:/data/lake, keys:/data/.pondra]
+
+volumes:
+  node1:
+  node2:
+  node3:
+  lake:
+  keys:
