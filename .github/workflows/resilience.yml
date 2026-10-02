@@ -7,9 +7,24 @@ name: resilience
 # sql` killed mid-INSERT. Every acknowledged write must be there once, on every node. It runs the
 # binary the build workflow made for this commit (tools/ci_artifact.sh waits for it): nothing is
 # compiled here.
+#
+# A pull request runs it only when what it puts under failure changes: the node, the clients, the
+# check itself.
 on:
   pull_request:
     branches: [main]
+    paths:
+      - src/**
+      - Cargo.toml
+      - Cargo.lock
+      - python/pondra/client.py
+      - js/index.js
+      - tools/resilience_check.py
+      - tools/faulty_s3.py
+      - tools/sim_r2.py
+      - tools/harness.py
+      - tools/ci_artifact.sh
+      - .github/workflows/resilience.yml
   workflow_dispatch:
 
 concurrency:
