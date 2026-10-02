@@ -41,7 +41,9 @@ stop, and a 24-hour soak (C4). Where things stood:
    commit streams open by format (read-only nodes don't heartbeat), waits two leases after it
    starts leading, and then every 10 s raises the lake to the newest format every live node knows,
    its own at most (`format::raise`). A node from before formats says nothing: format 0, so the
-   lake stays where it is until the last one has gone. `/stats` shows the node's release and the
+   lake stays where it is until the last one has gone. A lake a build makes (nothing committed
+   before its leader opened it) is of that build's format from its first commit: no older node
+   has read it. `/stats` shows the node's release and the
    lake's format; the leader's lists every live node's release (`releases`): a rolling upgrade's
    progress.
 3. **The rule for what comes next.** A change an older release would read *wrongly* (not just
@@ -82,11 +84,14 @@ stop, and a 24-hour soak (C4). Where things stood:
    leader (invariant 197).
 7. **The soak** (`tools/soak.py`, C4): a cluster under steady ingest (appends with a producer's
    sequence, an upserting producer against a model, two views, readers checking every node), a node
-   stopped or killed in turn, each minute every node's memory, the leader's untiered rows and commit
-   times and the longest wait for an acknowledgement on a timeline; at the end every batch once,
-   the keyed table as its model, the views as their rows, the log drained, memory flat.
-   `soak.yml` runs it on a GitHub runner (5.5 hours at most, local disk or R2). A 24-hour soak needs
-   a machine that runs that long: the owner's.
+   stopped or killed in turn (by default 8 times a run, at most hourly), each minute every node's
+   memory, the leader's untiered rows and commit times, the longest wait for an acknowledgement and
+   the object writes a second on a timeline; at the end every batch once, the keyed table as its
+   model, the views as their rows, the log drained, memory flat (judged per process, since a node
+   started again starts small). `soak.yml` runs it on a GitHub runner (5.5 hours at most, local
+   disk or R2). A 24-hour soak needs a machine that runs that long: the owner's. On a bucket each
+   commit is about an object write (a durable acknowledgement waits for one), so a soak's cost is
+   its commits: `--rate / --batch` a second.
 
 ## Measured (round 33, this build, the 4-core sandbox)
 
@@ -103,6 +108,11 @@ stop, and a 24-hour soak (C4). Where things stood:
 - A 0.30.0 cluster upgraded a node at a time under load: a follower's step 0.05–0.2 s of waiting,
   the leader's about 5 s (0.30.0 doesn't step down); then restarted a node at a time from this
   build, 1.0 s at most. The lake moved to format 1 once the last node ran this build.
+
+- The soak, 5 minutes on 3 nodes at 500 rows a second in batches of 20 (a leader and a follower
+  each stopped and killed): every batch once, no torn read, the keyed table as its model, the views
+  as their rows, the log drained. A stopped leader kept batches waiting 0.13–0.45 s, a killed one
+  2.2 s. About 27 object writes a second for 27 commits a second.
 
 ## Not decided here, or later
 

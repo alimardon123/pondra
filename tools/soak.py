@@ -10,7 +10,7 @@ and then, and what drifts over time measured.
   every node that each producer's batches are a prefix with no gaps. Tiering, merging and
   compaction run as they do by default. Every --failover-mins one node goes, in turn: the leader
   stopped (SIGTERM: drained, stepping down), the leader killed (kill -9), a follower stopped, a
-  follower killed; it starts again a moment later.
+  follower killed; it starts again a moment later (by default 8 times a run, at most hourly).
 
   Each minute it writes a line to --timeline: every node's resident memory, the leader's rows not
   yet tiered and its commit times, the longest a batch waited for its acknowledgement, the lake's
@@ -18,8 +18,8 @@ and then, and what drifts over time measured.
 
   At the end the load stops and it checks: every acknowledged batch once and `kv` as the model,
   on every node; the views equal their rows; the log drained (no rows left untiered within two
-  minutes); memory flat (each node's in the last tenth of the run within 1.5x of the second tenth's,
-  after the warm-up, plus 64 MB). It reports the lake's objects (data files, log segments, the
+  minutes); memory flat (each node process that lived ten samples: the last tenth of its life
+  within 1.5x of its second tenth's, after the warm-up, plus 64 MB). It reports the lake's objects (data files, log segments, the
   catalog's) and every stop's longest wait. Prints the checks as JSON (and writes them to --out)
   and exits 1 if one fails.
 
@@ -46,7 +46,7 @@ def rss_mb(n):
 def writes(x):
     """The object-store writes a node made since it started (`/metrics`), or None."""
     try:
-        text = x.plain("GET", "/metrics")[2]
+        text = x.get("/metrics", timeout=10).decode()
         return int(float(next(l.split()[-1] for l in text.splitlines() if l.startswith('pondra_object_requests_total{op="write"}'))))
     except Exception:
         return None
@@ -94,7 +94,8 @@ def main():
     ap.add_argument("--minutes", type=float, default=10)
     ap.add_argument("--nodes", type=int, default=3)
     ap.add_argument("--rate", type=int, default=500, help="rows a second into `ev`, in all")
-    ap.add_argument("--failover-mins", type=float, default=0, help="a node stopped or killed this often (default: 8 times a run, at most every 30 minutes)")
+    ap.add_argument("--batch", type=int, default=20, help="rows a batch (each batch is a commit: on a bucket, about an object write)")
+    ap.add_argument("--failover-mins", type=float, default=0, help="a node stopped or killed this often (default: 8 times a run, at most hourly)")
     ap.add_argument("--bin", default=os.environ.get("PONDRA_BIN", os.path.join(HERE, "..", "target", "release", "pondra")))
     ap.add_argument("--s3", action="store_true")
     ap.add_argument("--keep", action="store_true", help="keep the lake and logs")
@@ -103,7 +104,7 @@ def main():
     ap.add_argument("--timeline", default="soak-timeline.jsonl")
     A = ap.parse_args()
     secs = A.hours * 3600 if A.hours else A.minutes * 60
-    every = A.failover_mins * 60 or min(1800, secs / 8)
+    every = A.failover_mins * 60 or min(3600, secs / 8)
     work = tempfile.mkdtemp(prefix="pondra-soak-")
     lake = f"s3://{os.environ['PONDRA_BUCKET']}/soak-{uuid.uuid4().hex[:8]}" if A.s3 else os.path.join(work, "lake")
     binary = os.path.abspath(A.bin)
@@ -115,17 +116,16 @@ def main():
     first.q("CREATE MATERIALIZED VIEW tens AS SELECT producer, seq, i FROM ev WHERE i = 0 AND seq % 10 = 0")
     until(lambda: all(x.q("SELECT count(*) AS n FROM ev") for x in nodes), 30)
     live = list(nodes)
-    producers, size = 4, 20
+    producers, size = 4, A.batch
     load = Load(live, "ev", producers=producers, readers=2, size=size, rate=max(0.1, A.rate / producers / size)).start()
     ups = Upserts(live, rate=2)
     ups.start()
     role = lambda x: x.get("/stats", timeout=5)["role"]
     timeline, moves, start = open(A.timeline, "w"), [], time.time()
     kinds = [("leader", "term"), ("leader", "kill"), ("follower", "term"), ("follower", "kill")]
-    next_move, last_list, samples, wrote = start + every, 0, [], {}
+    next_move, last_list, samples, wrote, mark = start + every, 0, [], {}, start
     while time.time() - start < secs:
-        minute = time.time()
-        time.sleep(max(0, 60 - (time.time() - minute)) if secs > 600 else 10)
+        time.sleep(max(0, mark + (60 if secs > 600 else 10) - time.time()))
         leader = next((x for x in live if role_or(x, role) == "leader"), None)
         stats = leader.get("/stats", timeout=10) if leader else {}
         listed, now_wrote = None, {x.port: writes(x) for x in live}
@@ -134,9 +134,14 @@ def main():
         span, wrote = time.time() - (samples[-1]["at"] if samples else start), now_wrote
         if not A.s3 or time.time() - last_list > 1800:
             listed, last_list = objects(lake), time.time()
-        line = {"t": round(time.time() - start), "at": time.time(), "object_writes_per_s": round(made / max(span, 1), 1), "rss_mb": {x.port: rss_mb(x) for x in live}, "untiered_rows": stats.get("untiered_rows"),
-                "commit_ms_p95": stats.get("commit_ms_p95"), "longest_ack_s": load.longest(minute), "acked": sum(load.acked.values()),
+        line = {"t": round(time.time() - start), "at": time.time(), "object_writes_per_s": round(made / max(span, 1), 1), "rss_mb": {x.port: rss_mb(x) for x in live}, "pids": {x.port: x.p.pid for x in live},
+                "untiered_rows": stats.get("untiered_rows"), "commit_ms_p95": stats.get("commit_ms_p95"),
+                "longest_ack_s": load.longest(mark), "acked": sum(load.acked.values()),
                 "torn": len(load.torn), **({"objects": listed} if listed else {})}
+        for m in moves:  # (a stop's longest wait, once its batches have all been answered)
+            if "window" in m and m["window"][1] < mark:
+                m["longest_ack_s"] = load.longest(*m.pop("window"))
+        mark = time.time()  # (the next line's waits start here: a stop below counts in it)
         samples.append(line)
         timeline.write(json.dumps(line) + "\n")
         timeline.flush()
@@ -151,9 +156,12 @@ def main():
                 y = Node(binary, lake, x.port, work, tier_secs=10).start()
                 until(lambda: y.plain("GET", "/ready")[0] == 200, 60)
                 live.append(y)
-                moves.append({"at_s": round(t0 - start), "node": f"{who} {x.port}", "how": "stopped" if how == "term" else "killed", "longest_ack_s": load.longest(t0 - 0.5)})
+                moves.append({"at_s": round(t0 - start), "node": f"{who} {x.port}", "how": "stopped" if how == "term" else "killed", "window": (t0 - 0.5, time.time())})
             next_move += every
     ups.stop_.set()
+    for m in moves:
+        if "window" in m:
+            m["longest_ack_s"] = load.longest(*m.pop("window"))
     result = load.finish(live[0])
     ups.join(30)
     checks, info = {}, {"moves": moves, **{k: v for k, v in result.items() if k != "reads"}, "reads": result["reads"]}
@@ -167,16 +175,18 @@ def main():
                                                          and live[0].q("SELECT count(*) AS n FROM tens") == live[0].q("SELECT count(*) AS n FROM ev WHERE i = 0 AND seq % 10 = 0")
                                                          and same("SELECT count(*) AS n FROM ev") and same("SELECT * FROM per_producer ORDER BY producer"))
     checks["the log drains: no rows left untiered two minutes after the load"] = bool(drained)
-    # Memory: each node's samples in the last tenth against the second tenth (the first is warm-up).
-    tenth = max(1, len(samples) // 10)
-    drift = {}
-    for port in {p for s in samples for p in s["rss_mb"]}:
-        early = [s["rss_mb"][port] for s in samples[tenth:2 * tenth] if s["rss_mb"].get(port)]
-        late = [s["rss_mb"][port] for s in samples[-tenth:] if s["rss_mb"].get(port)]
-        if early and late:
-            drift[port] = {"early_mb": sorted(early)[len(early) // 2], "late_mb": sorted(late)[len(late) // 2]}
+    # Memory: each process's (a node started again is another) over its life, if it lived ten
+    # samples: the median of its last tenth against that of its second (the first is warm-up).
+    lives = collections.defaultdict(list)
+    for s in samples:
+        for port, pid in s["pids"].items():
+            if s["rss_mb"].get(port):
+                lives[(port, pid)].append(s["rss_mb"][port])
+    median = lambda xs: sorted(xs)[len(xs) // 2]
+    drift = {f"{port} (pid {pid})": {"early_mb": median(xs[len(xs) // 10:max(2, 2 * len(xs) // 10)]), "late_mb": median(xs[-max(1, len(xs) // 10):]), "samples": len(xs)}
+             for (port, pid), xs in lives.items() if len(xs) >= 10}
     info["memory"] = drift
-    checks["memory flat: each node's last tenth within 1.5x (+64 MB) of its second"] = all(d["late_mb"] <= d["early_mb"] * 1.5 + 64 for d in drift.values())
+    checks["memory flat: each node's last tenth within 1.5x (+64 MB) of its second"] = bool(drift) and all(d["late_mb"] <= d["early_mb"] * 1.5 + 64 for d in drift.values())
     end = objects(lake)
     info["objects at the end"] = end
     info["object writes a second (every node)"] = round(sum(s["object_writes_per_s"] for s in samples[1:]) / max(1, len(samples) - 1), 1)

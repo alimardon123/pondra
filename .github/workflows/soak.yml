@@ -4,7 +4,9 @@
 # so this is 5.5 hours at most; a 24-hour soak needs a machine of the owner's.
 #
 # storage r2 puts the lake in the bucket of cluster-bench.yml's secrets (R2_*). Mind the free tier:
-# the run's timeline says how many object writes a second it made (`object_writes_per_s`).
+# each commit is about one object write (durable acknowledgements), so rate / batch commits a second
+# is about that many writes a second: 500 / 20 is 25 a second, 90,000 an hour (R2's free tier is a
+# million a month). The timeline says what the run made (`object_writes_per_s`).
 name: soak
 
 on:
@@ -16,6 +18,9 @@ on:
       rate:
         description: "Rows a second into the stream, in all"
         default: "500"
+      batch:
+        description: "Rows a batch (a commit each)"
+        default: "20"
       nodes:
         description: "Nodes in the cluster"
         default: "3"
@@ -65,12 +70,13 @@ jobs:
         env:
           HOURS: ${{ inputs.hours }}
           RATE: ${{ inputs.rate }}
+          BATCH: ${{ inputs.batch }}
           NODES: ${{ inputs.nodes }}
           STORAGE: ${{ inputs.storage }}
         run: |
           pip install -q $(grep -E '^boto3' tools/requirements.txt)
           hours=$(python3 -c "import os; print(min(5.5, float(os.environ['HOURS'])))")
-          python3 tools/soak.py --hours "$hours" --rate "$RATE" --nodes "$NODES" --bin ./pondra \
+          python3 tools/soak.py --hours "$hours" --rate "$RATE" --batch "$BATCH" --nodes "$NODES" --bin ./pondra \
             $([ "$STORAGE" = r2 ] && echo --s3) --out soak.json --timeline soak-timeline.jsonl
       - uses: actions/upload-artifact@v6
         if: always()
