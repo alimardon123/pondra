@@ -186,20 +186,20 @@ export class Cell {
     const go = this.going = {}, cols = this.result.columns, first = this.result;
     let seen = 0;
     this.status.className = 'st'; this.status.innerHTML = '<span class="dot"></span>waiting for changes';
-    import('./live.js').then(m => { if (this.going === go) this.unwatch = m.watch(this.src.trim(), sessionOf(this.nb), a => this.liveAnswer(a, cols, first, !(seen++))); });
+    import('./live.js').then(L => { if (this.going === go) this.unwatch = L.watch(this.src.trim(), sessionOf(this.nb), a => this.liveAnswer(a, a.error ? null : L.rowsOf(a, cols), first, !(seen++))); });
   }
-  liveAnswer(m, cols, first, opening) {
+  liveAnswer(m, got, first, opening) {
     if (m.error) {
       this.stopLive(); this.liveBox.checked = false;
       this.status.className = 'st bad'; this.status.textContent = 'live stopped';
       return this.out.prepend(h('pre', { class: 'err' }, m.error));
     }
-    const names = cols.length ? cols.map(c => c.name) : Object.keys(m.rows[0] || {});
-    const columns = cols.length ? cols : names.map(n => ({ name: n, type: '' }));
-    const r = { kind: 'rows', columns, rows: m.rows.slice(0, 10000).map(o => names.map(n => o[n] ?? null)), total: m.rows.length, notices: [], ms: first.ms };
+    const r = { kind: 'rows', ...got, notices: [], ms: first.ms }, g = this.out.querySelector('.gridwrap')?.grid;
     if (JSON.stringify(r.rows) !== JSON.stringify(this.result.rows)) {
-      this.show(r);
-      if (!opening) this.out.querySelector('.grid')?.classList.add('flash'); // (what changed since)
+      // (the rows in place, where they were scrolled, sorted and filtered, those that changed lit; a
+      // chart or a profile, or an answer in pages, drawn again)
+      if (g && !this.view && !this.result.page && r.columns === this.result.columns) g.update(r.rows, r.total);
+      else { this.show(r); if (!opening) this.out.querySelector('.grid')?.classList.add('flash'); }
     }
     this.status.className = 'st'; this.status.innerHTML = `<span class="dot"></span>updated ${new Date().toLocaleTimeString()} (commit ${esc(m.at)})`;
   }

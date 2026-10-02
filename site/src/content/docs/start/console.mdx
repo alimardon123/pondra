@@ -101,7 +101,7 @@ Click a file in the Workspace to open it in a tab (its tab comes forward if it i
 | A notebook (`notebooks/<name>`, or an `.ipynb` in any other folder) | cells: SQL, Python and Markdown | — |
 | `.sql` | an editor with line numbers | Results, Messages, Chart and Plan (or at the right) |
 | `.py` | the same editor | a console: the file's runs, and a `>>>` line |
-| `.csv`, `.tsv`, `.json`, `.jsonl`, `.parquet` | a table: CSV and JSON edited in place, Parquet read-only | — |
+| `.csv`, `.tsv`, `.json`, `.jsonl`, `.parquet` | a table: CSV and JSON edited in place, Parquet read-only | Results, Chart and Data profile, as an answer's |
 | `.md`, `.txt` | the editor (**Preview** draws a `.md` file's Markdown) | — |
 
 The Workspace's **+** (the tab bar's too) makes a notebook, a SQL or a Python file, or a folder, or
@@ -246,11 +246,23 @@ It's the workspace of [Run files as jobs](/pondra/guides/workspace/).
 
 ### Data files
 
-A CSV or JSON file opens as a table you can edit: double-click a cell (or select it and type), **Enter**
-keeps the value, **Tab** moves right, **Esc** undoes. **Add row** and **Add column** are below the
-table. A changed cell is tinted, a new row too, until you save; the toolbar says what changed, with
-**Discard** and **Save**. The lines you didn't touch are saved
-exactly as they were. **Query with SQL** reads the file as a table in a SQL tab. A Parquet file, or
+A CSV or JSON file opens as a table you can edit, in the grid every answer has (with its Chart and
+Data profile):
+
+- **Editing:** double-click a cell, or select it and type; the value is edited in the cell itself.
+  **Enter** keeps it and moves down, **Tab** moves right, **Esc** leaves the cell as it was.
+  **Delete** empties the cells selected, **Ctrl+X** cuts them.
+- **Undo:** **Ctrl+Z** takes back the last change and **Ctrl+Y** (or **Ctrl+Shift+Z**) does it
+  again, as many steps as you like, before a save and after it (the buttons under the table do the
+  same). A paste, or the rows deleted at once, is one step.
+- **Pasting:** **Ctrl+V** pastes cells copied from a spreadsheet or from the grid. One value fills
+  every cell selected; a block starts at the cell selected, and adds the columns and rows it needs
+  when it runs past the table's edges.
+- **Rows and columns:** **Add row** and **Add column** are under the table; right-click a row's
+  number to delete it (or the rows selected).
+
+A changed cell is tinted, a new row too, until you save; the toolbar says what changed, with
+**Discard** and **Save**. The lines you didn't touch are saved exactly as they were. **Query with SQL** reads the file as a table in a SQL tab. A Parquet file, or
 a file over 10 MB, opens read-only (the first 10,000 rows): load it into a table to change it. A
 JSON file that isn't a list of rows (a settings file, say) opens as text.
 
@@ -275,13 +287,16 @@ Every answer (a cell's, a SQL file's) and every data file is shown in the same g
   list of every value selected, **Filter to these values**, Sort and Profile.
 - **A header's right-click:** copy the column's name (or the names of the columns selected), as SQL
   too; copy its values with the header; sort; filter; profile it.
-- **Filtering:** **Filter *column*…** asks how to compare (contains, starts with, does not contain,
-  `=`, `≠`, `>`, `≥`, `<`, `≤`, is NULL, is not NULL) and the value. A chip below the grid shows the filters:
-  click it to change the last one, its **✕** clears them all. Each column has one filter, and they
-  all apply.
+- **Filtering:** **Filter *column*…** (a right-click) asks how to compare (contains, starts with,
+  does not contain, `=`, `≠`, `>`, `≥`, `<`, `≤`, is NULL, is not NULL) and the value; **Filter to
+  these values** keeps the rows holding a value selected. Each filter is a pill above the grid
+  (`city is Oslo`, `amount > 50`): click one to change it, its **✕** takes it away, **+ Filter**
+  adds one on any column, and **Clear all** takes them all away. They all apply. A filtered column
+  has a small filter mark by its name: click it to change its filter.
 - **Sorting:** the small arrow in a header sorts by it (again: the other way).
 - **The line under it** (a SQL file's answer and a cell's alike) says how many rows there are and
-  how long they took (`200,000 rows · 28 ms`), the filters, and the selection's sum and average.
+  how long they took (`200,000 rows · 28 ms`), how many the filters leave, and the selection's sum
+  and average.
 - **Pages:** an answer of more than 10,000 rows comes a page at a time. At the right of the line
   under it, `10,001–20,000 ▾` says which rows show, and **‹ ›** turn the pages (**Alt+Page Down**
   and **Alt+Page Up** in the grid). Its **▾** goes to a page, the first or the last, and sets the
@@ -373,7 +388,7 @@ tea   2     3
 - **Right-click** anything for what can be done with it, each as the SQL it runs (a change that
   can't be undone asks first):
   - a table, a view or a materialized view: **Preview** (in SQL or Python), **Details and data
-    profile**, **Watch it live**, **Script as…**, **Insert rows…**, **Import rows from a file…** (a CSV,
+    profile**, **Watch it live** (a SQL tab of its rows, Live on), **Script as…**, **Insert rows…**, **Import rows from a file…** (a CSV,
     JSON or Parquet file from your computer, put in the lake's `imports/` folder and read in by
     column name), **Download every row…**, **As a Kafka topic…**, **Add a column…**, **Rename…**,
     **Copy the name** (or its column names, or as Python), **Truncate…** and **Drop…**. **Script as** shows its `SELECT`, `INSERT`, upsert, `UPDATE`, `DELETE`, `MERGE`,
@@ -529,9 +544,12 @@ restarting or choosing Python, the token, the keys.
 
 ## Live answers
 
-A SQL cell's **Live** switch keeps its answer current. The node sends the answer again each time a
-commit changes a table the query reads, and the console redraws it. Nothing runs while nothing
-changes. Turn the switch off and the query stops.
+The **Live** switch keeps an answer current: a SQL cell's, or a SQL file's (at the right of its
+results bar, as a database tool's grid has it). The node sends the answer again each time a commit
+changes a table the query reads, and the console changes the rows in place, lighting the ones that
+changed a moment; a SQL file's bar says when it last changed. Nothing runs while nothing changes.
+Turn the switch off and the query stops. **Watch it live** in a table's menu (the Data tree) opens a
+SQL tab of its own with its first rows, Live on.
 
 ```sql
 SELECT region, sum(amount) AS total FROM sales GROUP BY region ORDER BY region;

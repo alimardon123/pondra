@@ -710,6 +710,28 @@ def files_checks(browser, port, show):
         and pg.tab() == ("q.csv", True)
     p.locator("#docbar button", has_text="Discard").click()  # (theirs, read again)
     checks["Discard reads the file again: theirs"] = until(lambda: pg.grid(doc)[1], [["9", "Else", "1"]]) == [["9", "Else", "1"]] and until(lambda: pg.tab(), ("q.csv", False)) == ("q.csv", False)
+    # every change a step (batch B): Ctrl Z and Ctrl Y before a save; a block pasted past the edges adds a column and rows, as one step
+    qc = lambda r, col: doc.locator("tbody tr:not(.gap)").nth(r).locator("td:not(.i)").nth(col)
+    qc(0, 1).dblclick()
+    p.keyboard.press("Control+a")
+    p.keyboard.type("Lima")
+    p.keyboard.press("Enter")
+    edited = until(lambda: (qc(0, 1).inner_text(), pg.tab()), ("Lima", ("q.csv", True)))
+    p.keyboard.press("Control+z")
+    undone = until(lambda: (qc(0, 1).inner_text(), doc.locator("td.chg").count(), pg.tab()), ("Else", 0, ("q.csv", False)))
+    p.keyboard.press("Control+y")
+    redone = until(lambda: qc(0, 1).inner_text(), "Lima")
+    qc(0, 2).click()
+    p.evaluate("t => navigator.clipboard.writeText(t)", "5\tx\n6\ty")
+    p.keyboard.press("Control+v")
+    pasted = until(lambda: pg.grid(doc), [["id", "city", "amount", "column_4"], [["9", "Lima", "5", "x"], ["", "", "6", "y"]]])
+    p.keyboard.press("Control+z")
+    unpasted = until(lambda: pg.grid(doc), [["id", "city", "amount"], [["9", "Lima", "1"]]])
+    checks["Ctrl Z undoes a change (back as saved: no mark, no dot), Ctrl Y does it again; a block pasted past the edges adds a column and a row, one Ctrl Z takes it all back"] = \
+        edited == ("Lima", ("q.csv", True)) and undone == ("Else", 0, ("q.csv", False)) and redone == "Lima" \
+        and pasted == [["id", "city", "amount", "column_4"], [["9", "Lima", "5", "x"], ["", "", "6", "y"]]] and unpasted == [["id", "city", "amount"], [["9", "Lima", "1"]]]
+    p.locator("#docbar button", has_text="Discard").click()
+    until(lambda: pg.tab(), ("q.csv", False))
 
     pg.workspace("data", "e.jsonl").click()
     doc = p.locator(".datadoc")
@@ -989,6 +1011,8 @@ def folders_checks(browser, port, show):
 def grid_checks(browser, port, show):
     """The grid (ADR-034 §5): a spreadsheet's selection, keys, copy, filter and sort."""
     checks = {}
+    sql(port, "CREATE TABLE IF NOT EXISTS live_gl (k VARCHAR, n BIGINT)")
+    sql(port, "INSERT INTO live_gl VALUES ('a', 1), ('b', 2)")
     pg = Page(browser, f"http://127.0.0.1:{port}/")
     p = pg.p
     pg.cells().first.wait_for(timeout=20000)
@@ -1016,11 +1040,28 @@ def grid_checks(browser, port, show):
     cell(0, 1).click(button="right")  # (in the selection: the menu acts on it)
     p.locator("#menu button", has_text="Filter to these values").click()
     kept = until(lambda: [r[0] for r in pg.grid(c)[1]], ["0", "3", "6", "9"])
-    chip = c.locator(".chip-f").is_visible()
-    c.locator(".chip-f .x").click()
+    pill = c.locator(".pills .pill")
+    chip = pill.is_visible() and "m is 0" in pill.inner_text() and c.locator("thead th .hf:not([hidden])").count() == 1
+    c.locator(".pills .add", has_text="Filter").click()  # (another, on any column: the window picks it)
+    dlg = p.locator("dialog.pop[open]")
+    dlg.locator("select").first.select_option(label="n")
+    dlg.locator("select").nth(1).select_option(label=">")
+    dlg.locator("input").fill("3")
+    dlg.locator("button", has_text="Filter").click()
+    both = until(lambda: [r[0] for r in pg.grid(c)[1]], ["6", "9"])
+    marks = c.locator("thead th .hf:not([hidden])").count()
+    c.locator(".pills .pill .pl").nth(1).click()  # (a pill changes in place)
+    dlg.locator("input").fill("6")
+    dlg.locator("button", has_text="Change").click()
+    changed = until(lambda: [r[0] for r in pg.grid(c)[1]], ["9"])
+    c.locator(".pills .pill .x").first.click()
+    left = until(lambda: [r[0] for r in pg.grid(c)[1]], ["7", "8", "9"])
+    c.locator(".pills .pill .x").first.click()
     back = until(lambda: len(pg.grid(c)[1]), 10)
-    checks["the menu filters to a selection's values (a chip says so, and clears it)"] = kept == ["0", "3", "6", "9"] and chip and back == 10
+    checks["the menu filters to a selection's values; filters are pills (one changed in place, × takes one away), a filtered column has a mark, a new one is on any column"] = \
+        kept == ["0", "3", "6", "9"] and chip and both == ["6", "9"] and marks == 2 and changed == ["9"] and left == ["7", "8", "9"] and back == 10 and c.locator(".pills").is_hidden()
     c.locator("thead th.i").click(button="right")  # (the corner, as SSMS's: every row, copied each way)
+    p.locator("#menu button", has_text="Copy all").first.wait_for(timeout=5000)  # (the grid's menus are in gridmore.js, loaded when first used)
     items = p.locator("#menu button").all_inner_texts()
     p.locator("#menu button", has_text="Copy all with column names").click()
     all_rows = until(lambda: pg.clipboard().splitlines(), ["n\tm\ts"] + [f"{i}\t{i % 3}\tr{i}" for i in range(10)], 5)
@@ -1057,8 +1098,34 @@ def grid_checks(browser, port, show):
     back = until(lambda: (rng(), big.locator(".pages .pg.back").is_disabled()), ("1–10,000", True))
     checks["an answer of more than 10,000 rows turns its pages (1–10,000 ▾ ‹ ›, the last page, Alt+Page Up): the node's rows, numbered on"] = \
         first == ("1–10,000", ["0"], "25,000 rows") and third == ("20,001–25,000", "20000") and second == ("10,001–20,000", "10000") and back == ("1–10,000", True)
+    # Live (batch B, as DataGrip's): a SQL file's answer follows its tables, in place
+    p.click("#tabbar .newtab")
+    p.locator("#menu button", has_text="New SQL file").click()
+    pg.editing()
+    p.keyboard.insert_text("SELECT k, sum(n) AS n FROM live_gl GROUP BY k ORDER BY k")
+    p.keyboard.press("Control+Enter")
+    f = p.locator(".filedoc:visible")
+    f.locator(".pbody .gt tbody tr[data-k]").first.wait_for(timeout=20000)
+    f.locator(".pinfo label.live").click()
+    on = until(lambda: f.locator(".pinfo .livest .dot").count() == 1)
+    sql(port, "INSERT INTO live_gl VALUES ('b', 5)")
+    followed = until(lambda: pg.grid(f)[1], [["a", "1"], ["b", "7"]])
+    lit = f.locator(".gt tr.fl").count()
+    f.locator(".pinfo label.live").click()
+    stopped = until(lambda: call(port, "GET", "/stats")["live_queries"], 0)
+    checks["a SQL file's answer turns Live: a write elsewhere changes its rows in place (the row lit); off, its query ends"] = \
+        on is True and followed == [["a", "1"], ["b", "7"]] and lit >= 1 and stopped == 0
+    tabs = p.locator("#tabbar .tab").count()
+    p.locator("#data .row", has_text="live_gl").first.click(button="right")
+    p.locator("#menu button", has_text="Watch it live").click()
+    opened = until(lambda: (p.locator("#tabbar .tab").count() - tabs, pg.tab()[0].endswith(".sql")), (1, True))
+    w = p.locator(".filedoc:visible")
+    w.locator(".pbody .gt tbody tr[data-k]").first.wait_for(timeout=20000)
+    watching = until(lambda: w.locator(".pinfo label.live input").is_checked() and call(port, "GET", "/stats")["live_queries"] == 1)
+    checks["Watch it live (the Data tree's menu) opens a SQL tab of its own, Live on"] = opened == (1, True) and watching is True
+    w.locator(".pinfo label.live").click()
     checks["grid: no page errors"] = pg.errors == []
-    info = {"one": one, "edges": edges, "total": total, "copied": copied, "headed": headed, "moved": moved, "kept": kept, "corner": [items, all_rows, a_row], "pages": [first, third, second], "errors": pg.errors}
+    info = {"one": one, "edges": edges, "total": total, "copied": copied, "headed": headed, "moved": moved, "kept": kept, "filters": [chip, both, marks, changed, left, back], "corner": [items, all_rows, a_row], "pages": [first, third, second], "live": [on, followed, lit, stopped, opened, watching], "errors": pg.errors}
     pg.ctx.close()
     return checks, info
 
@@ -1242,7 +1309,7 @@ def work_checks(browser, port, show):
         and {"SELECT", "INSERT", "UPDATE", "DELETE", "MERGE", "CREATE", "DROP"} <= set(scripts) and py.startswith("db.") and "Insert rows…" not in v_items and "Drop…" in v_items
     sql(port, "DROP VIEW wk_values")
     checks["the owner's second and third lists: no page errors"] = pg.errors == []
-    info = {"left": left, "items": items, "formatted": [part, whole], "drawn": drawn, "picture": pic, "opened": opened, "kinds": menu_kinds, "meta": meta, "cell": cell_items, "editor": ed_items,
+    info = {"tabs": [pinned, over, listed, n, left], "left": left, "items": items, "formatted": [part, whole], "drawn": drawn, "picture": pic, "opened": opened, "kinds": menu_kinds, "meta": meta, "cell": cell_items, "editor": ed_items,
             "paged": paged, "table menu": t_items, "scripts": scripts, "python": py[:80], "view menu": v_items, "errors": pg.errors}
     pg.ctx.close()
     return checks, info
@@ -1417,7 +1484,7 @@ def budget_checks(browser, port, show):
             fresh[name] = e.code
     total = sum(sizes.values()) if all(sizes.values()) else None
     later = {}
-    for name in ["chart.js", "plan.js", "more.js", "details.js", "more.css", "data.js", "md.js", "jobs.js", "settings.js", "objects.js", "pyfile.js", "sqlfile.js", "rename.js", "versions.js", "stmts.js", "params.js", "tabs.js", "live.js"]:  # (loaded when first used)
+    for name in ["chart.js", "plan.js", "more.js", "details.js", "more.css", "data.js", "md.js", "jobs.js", "settings.js", "objects.js", "pyfile.js", "sqlfile.js", "rename.js", "versions.js", "stmts.js", "params.js", "tabs.js", "live.js", "gridmore.js"]:  # (loaded when first used)
         r = urllib.request.urlopen(urllib.request.Request(f"{base}/console/{name}", headers={"accept-encoding": "gzip"}))
         later[name] = len(r.read()) if r.headers.get("content-encoding") == "gzip" else None
     checks["the scripts and style sheet the page loads, gzipped as the node serves them: <= 70 KB; each answers 304 when the browser has it"] = total is not None and total <= 70 * 1024 \

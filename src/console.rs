@@ -107,6 +107,7 @@ static FILES: LazyLock<HashMap<String, Asset>> = LazyLock::new(|| {
         ("plan.js", Asset::new(lean(include_str!("console/plan.js")), JS)),
         ("more.js", Asset::new(lean(include_str!("console/more.js")), JS)),
         ("data.js", Asset::new(lean(include_str!("console/data.js")), JS)),
+        ("gridmore.js", Asset::new(lean(include_str!("console/gridmore.js")), JS)),
         ("details.js", Asset::new(lean(include_str!("console/details.js")), JS)),
         ("md.js", Asset::new(lean(include_str!("console/md.js")), JS)),
         ("jobs.js", Asset::new(lean(include_str!("console/jobs.js")), JS)),

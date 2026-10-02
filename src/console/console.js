@@ -360,12 +360,13 @@ async function opened(path, opts) {
   } catch (e) { if (!opts.quiet) toast(`Could not open ${path}: ${e.message}`, true); return null; }
 }
 H.openFile = openFile;
-/** SQL in a tab and run: into the notebook in front (a cell), else a new SQL tab. */
-async function query(sql) {
-  if (S.doc?.kind === 'notebook') return S.doc.peek(sql);
+/** SQL in a tab and run: into the notebook in front (a cell), else a new SQL tab; `live`: always a
+ * SQL tab, its answer followed live. */
+async function query(sql, live) {
+  if (S.doc?.kind === 'notebook' && !live) return S.doc.peek(sql);
   const p = S.pick, d = await newFile('sql');
   if (p && p.type !== 'file' && p.type !== 'doc') { S.pick = p; S.pickedOn = d; mark(); detail(); } // (a table's first rows, in a tab of their own: its details stay)
-  d.ed.value = sql;
+  d.ed.value = sql; d.live = live;
   d.run();
 }
 H.query = query;
@@ -691,9 +692,9 @@ function core() {
   register.cellKind({ id: 'python', label: 'Python', language: 'python', placeholder: 'db.sql("SELECT …")      # runs on the node; cells share variables', run: async (text, signal, cell) => { kernel('busy', cell.nb); try { return await run(doBlock(text), signal, undefined, S.pageRows, sessionOf(cell.nb)); } finally { kernel('idle', cell.nb); } } });
   register.cellKind({ id: 'markdown', label: 'Markdown', language: 'markdown', placeholder: 'Markdown: # a heading, **bold**, *italic*, [a link](https://…), ![a picture](data/chart.png), - a list, | a | table |' });
   register.renderer({ id: 'error', order: 10, match: r => r.kind === 'error', render: r => h('pre', { class: 'err' }, r.message) });
-  register.renderer({ id: 'rows', order: 20, match: r => r.kind === 'rows', render: (r, cell) => grid(r, { footer: !!cell, name: S.doc?.name, explore: i => explore(r, i, cell),
-    // (a cell's: Chart, and a SQL cell's Plan, as a SQL file's pane has them; the one open, and the chart's settings, kept with the notebook)
-    chart: cell?.chartKeep, view: cell?.view, onview: v => { cell.view = v; cell.nb.changed(); },
+  register.renderer({ id: 'rows', order: 20, match: r => r.kind === 'rows', render: (r, cell) => grid(r, { footer: true, name: S.doc?.name, explore: i => explore(r, i, cell),
+    // (Chart and Data profile, and a SQL cell's Plan, as a SQL file's pane has them; a cell's open one, and its chart's settings, kept with the notebook)
+    chart: cell?.chartKeep, view: cell?.view, onview: v => { if (cell) { cell.view = v; cell.nb.changed(); } },
     views: cell?.kind === 'sql' ? [['plan', 'Plan', 'plan', () => import('./plan.js').then(m => m.planView(lastStatement(r.src || cell.src)))]] : [] }) });
   register.renderer({ id: 'figures', order: 30, match: r => r.kind === 'done' && Array.isArray(r.value?.images), render: r => h('div', { class: 'figs' }, r.value.images.map(b => h('img', { class: 'fig', alt: 'a figure the code drew', src: 'data:image/png;base64,' + b }))) });
   register.renderer({ id: 'text', order: 40, match: r => r.kind === 'text', render: r => said(r.text) });

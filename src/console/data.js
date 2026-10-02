@@ -2,6 +2,7 @@
 // table, edited in place. Loaded when a data file first opens, not with the page.
 import { h, icon, bytes, count, S, R, emit, run, fileSql, ident, toast, prompt, readFile, writeFile, moreStyle, renaming, crumbs, renamed } from './core.js';
 import { grid, copyText } from './grid.js';
+import { Edits, addRow, history } from './gridmore.js';
 import { btn, moreBtn, download } from './files.js';
 
 await moreStyle();
@@ -32,7 +33,7 @@ const csvField = (v, sep) => { const s = v == null ? '' : String(v); return s.in
 
 export class DataDoc {
   constructor({ path }) {
-    Object.assign(this, { path, kind: 'data', icon: 'filedata', dirty: false, version: null, marks: new WeakMap(), added: new WeakSet(), cols: [], data: [] });
+    Object.assign(this, { path, kind: 'data', icon: 'filedata', dirty: false, version: null, cols: [], data: [] });
     this.sep = /\.tsv$/i.test(path) ? '\t' : ',';
     this.format = /\.(csv|tsv)$/i.test(path) ? 'csv' : /\.(jsonl|ndjson)$/i.test(path) ? 'jsonl' : /\.json$/i.test(path) ? 'json' : 'parquet';
     this.box = h('div', { class: 'databox' }, h('div', { class: 'wait pulse' }, 'Reading…'));
@@ -70,61 +71,56 @@ export class DataDoc {
         }
       }
     }
+    // (every change a step Ctrl Z undoes and Ctrl Y does again, until it is saved and after: gridmore.js's Edits)
+    const csv = this.format === 'csv';
+    this.edits = this.readonly ? null : new Edits(this.cols, this.data, { blank: csv ? '' : null, parse: csv ? t => t : parseValue, onchange: () => { this.dirty = this.edits.dirty; this.footer(); emit('changed', this); } });
     this.draw();
     return this;
   }
-  async reload() { this.marks = new WeakMap(); this.added = new WeakSet(); this.dirty = false; await this.load(); emit('changed', this); }
-  mark(row, c) { (this.marks.get(row) || this.marks.set(row, new Set()).get(row)).add(c); if (!this.dirty) { this.dirty = true; emit('changed', this); } }
-  /** The grid, and what it may change: cells, rows, columns. */
+  async reload() { this.dirty = false; await this.load(); emit('changed', this); }
+  /** The grid (its Results, Chart and Data profile, as an answer's), and what it changes through. */
   draw() {
-    const d = this, r = { columns: this.cols, rows: this.data, total: this.total ?? this.data.length };
-    const edit = this.readonly ? null : {
-      set(i, c, text) { const row = d.data[i]; row[c] = d.format === 'csv' ? text : parseValue(text); d.mark(row, c); },
-      changed: (i, c) => !!d.marks.get(d.data[i])?.has(c), added: i => d.added.has(d.data[i]),
-      del(is) { const gone = new Set(is.map(i => d.data[i])); d.data = d.data.filter(row => !gone.has(row)); d.gridEl.remove(); d.draw(); d.dirty = true; d.removed = (d.removed || 0) + gone.size; emit('changed', d); },
-    };
-    this.gridEl = grid(r, { fill: true, edit, name: this.title, onsum: t => { this.sumText = t; this.footer(); }, explore: i => R.helpers.explore(r, i) });
+    const r = { columns: this.cols, rows: this.data, total: this.total ?? this.data.length };
+    this.gridEl = grid(r, { fill: true, footer: true, edit: this.edits, name: this.title, onsum: t => { this.sumText = t; this.footer(); }, explore: i => R.helpers.explore(r, i) });
     this.box.replaceChildren(...this.readonly ? [h('div', { class: 'note' }, icon('eye'), this.why)] : [], this.gridEl);
     this.footer();
   }
-  addRow() { const row = this.cols.map(() => this.format === 'csv' ? '' : null); this.data.push(row); this.added.add(row); this.dirty = true; emit('changed', this); this.gridEl.remove(); this.draw(); this.gridEl.grid.refresh(this.data.length - 1); }
+  get x() { return this.gridEl.grid.x; }
   async addColumn() {
     const name = await prompt('Add a column', 'Its name', 'column_' + (this.cols.length + 1));
     if (!name) return;
-    this.cols.push({ name, type: 'Utf8' });
-    for (const row of this.data) { row.push(this.format === 'csv' ? '' : null); this.mark(row, this.cols.length - 1); }
-    this.dirty = true; emit('changed', this); this.draw();
+    this.edits.addCols([name]);
+    this.gridEl.grid.refresh(true);
+    this.x.reveal(0, this.cols.length - 1);
   }
   footer() {
-    const b = (ic, label, title, fn) => h('button', { class: 'btn ghost small', title, onclick: fn }, icon(ic), label);
-    this.foot.replaceChildren(...this.readonly ? [] : [b('plus', 'Add row', 'A row at the end', () => this.addRow()), b('plus', 'Add column', 'A column at the right', () => this.addColumn())],
-      h('span', { class: 'sum' }, this.sumText || ''), h('span', { class: 'grow' }),
-      h('span', { class: 'hint' }, this.readonly ? 'Read-only' : 'Double-click or type to edit · Enter to keep · Esc to undo · Ctrl S to save to the file'));
+    const b = (ic, label, title, fn, off) => h('button', { class: 'btn ghost small', title, 'aria-label': label ? null : title, disabled: off, onclick: fn }, icon(ic), label);
+    const e = this.edits;
+    this.foot.replaceChildren(...e ? [b('plus', 'Add row', 'A row at the end', () => addRow(this.x)), b('plus', 'Add column', 'A column at the right', () => this.addColumn()), h('span', { class: 'sep' }),
+      b('undo', '', 'Undo (Ctrl Z)', () => history(this.x), !e.past.length), b('redo', '', 'Redo (Ctrl Y)', () => history(this.x, true), !e.future.length)] : [],
+    h('span', { class: 'sum' }, this.sumText || ''), h('span', { class: 'grow' }),
+    h('span', { class: 'hint' }, e ? 'Double-click or type to edit · Ctrl V pastes cells · Ctrl Z undoes · Ctrl S saves' : 'Read-only'));
   }
   /** The file's text as it will be saved: untouched CSV rows exactly as they were. */
   serialize() {
     if (this.format === 'csv') {
-      const nl = this.crlf ? '\r\n' : '\n', line = row => row.raw != null && !this.marks.get(row) && !this.added.has(row) ? row.raw : row.map(v => csvField(v, this.sep)).join(this.sep);
+      const nl = this.crlf ? '\r\n' : '\n', line = row => row.raw != null && !this.edits.rowChanged(row) ? row.raw : row.map(v => csvField(v, this.sep)).join(this.sep);
       return [this.cols.map(c => csvField(c.name, this.sep)).join(this.sep), ...this.data.map(line)].join(nl) + (this.last === false ? '' : nl);
     }
     const objs = this.data.map(row => Object.fromEntries(this.cols.map((c, i) => [c.name, row[i]])));
     return this.format === 'jsonl' ? objs.map(o => JSON.stringify(o)).join('\n') + '\n' : JSON.stringify(objs, null, 2) + '\n';
   }
   /** What changed since it was opened (for the details). */
-  changes() {
-    let cells = 0, rowsAdded = 0;
-    for (const row of this.data) { if (this.added.has(row)) rowsAdded++; else cells += this.marks.get(row)?.size || 0; }
-    return [cells ? `${count(cells)} cell${cells === 1 ? '' : 's'} changed` : null, rowsAdded ? `${count(rowsAdded)} row${rowsAdded === 1 ? '' : 's'} added` : null, this.removed ? `${count(this.removed)} row${this.removed === 1 ? '' : 's'} deleted` : null].filter(Boolean);
-  }
+  changes() { return this.edits?.summary() || []; }
   async save() {
     await this.naming;
     if (this.readonly) { toast('This file is read-only here: load it into a table to change it', true); return false; }
     const v = await writeFile(this.path, this.serialize(), this.version, this.format === 'csv' ? 'text/csv; charset=utf-8' : 'application/json');
     if (!v) return false;
     this.version = v;
-    for (const row of this.data) { if (this.marks.get(row) || this.added.has(row)) row.raw = null; }
-    this.marks = new WeakMap(); this.added = new WeakSet(); this.removed = 0; this.dirty = false;
-    this.draw();
+    for (const row of this.data) { if (this.edits.rowChanged(row)) row.raw = null; }
+    this.edits.saved(); this.dirty = false;
+    this.gridEl.grid.refresh(true); this.footer();
     toast(`Saved: files/${this.path}`);
     emit('changed', this); emit('saved', this, 'files/' + this.path);
     return true;

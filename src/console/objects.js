@@ -110,7 +110,7 @@ export function tableMenu(at, t) {
   menu(at, [{ label: 'Preview', icon: 'play', keys: 'Double-click', run: () => H.query(`SELECT * FROM ${t.q} LIMIT 100`) },
     { label: 'Preview in Python', icon: 'filepy', run: () => tab(`db.table("${t.q}").limit(100)`, 'python') },
     { label: 'Details and data profile', icon: 'eye', run: () => H.pick({ type: 'object', t }) },
-    { label: 'Watch it live', icon: 'refresh', run: () => { const c = H.addCell({ kind: 'sql', src: `SELECT * FROM ${t.q} LIMIT 100`, live: true }); c.edit(); c.run(); } }, '-',
+    { label: 'Watch it live', icon: 'refresh', run: () => H.query(`SELECT * FROM ${t.q} LIMIT 100`, true) }, '-',
     { label: 'Script as…', icon: 'filesql', run: () => scriptAs(t) },
     table ? { label: 'Insert rows…', run: () => tab(scripts(t).find(x => x[0] === 'INSERT')[1]) } : null,
     table ? { label: 'Import rows from a file…', icon: 'up', run: () => importFile((src, n) => { const c = cols(t).map(c => ident(c.n)).join(', '); return `-- ${n}'s rows into ${t.q}, its columns by name\nINSERT INTO ${t.q} (${c})\nSELECT ${c}\nFROM ${src};`; }) } : null,

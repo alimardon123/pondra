@@ -1,7 +1,7 @@
 // A SQL file (ADR-034): the editor, and its answers below it (or at its right): Results, Messages,
 // Chart, Data profile and Plan, an answer a statement. Loaded when a SQL file first opens, not with
 // the page.
-import { h, fill, icon, secs, S, R, emit, run, menu, MODE, failed, tip, sessionOf, moreStyle } from './core.js';
+import { h, fill, icon, secs, S, R, emit, run, menu, MODE, failed, tip, sessionOf, moreStyle, toast } from './core.js';
 import { formatSql, highlighted } from './editor.js';
 import { grid, copyText, copyItems, split, downloadItems, fetchRows } from './grid.js';
 import { answer } from './notebook.js';
@@ -17,6 +17,7 @@ export class SqlDoc extends TextDoc {
     this.body = h('div', { class: 'pbody' });
     this.tabs = h('div', { class: 'ptabs', role: 'tablist' });
     this.info = h('div', { class: 'pinfo' });
+    this.liveSt = h('span', { class: 'n t livest' });
     this.panel = h('section', { class: 'panel results', 'aria-label': 'Results' }, h('div', { class: 'phead' }, this.tabs, h('span', { class: 'grow' }), this.info), this.body);
     this.pbar = h('div', { class: 'params', role: 'group', 'aria-label': 'Parameters', hidden: true });
     this.main.prepend(this.pbar);
@@ -78,6 +79,7 @@ export class SqlDoc extends TextDoc {
     const list = each ? statements(text) : [text];
     const places = this.where(list, whole, from);
     if (this.tab === 'plan' && this.result?.kind === 'plan') this.tab = 'results'; // (the plans were asked for, not the rows: now the rows)
+    this.unwatch?.(); this.unwatch = this.watched = null;
     this.running = true; this.plan = null; this.results = []; this.result = null; this.todo = list.length; R.helpers.toolbar();
     this.body.replaceChildren(h('div', { class: 'wait pulse' }, 'Running…'));
     emit('run', { kind: 'sql', src: text, doc: this });
@@ -101,6 +103,24 @@ export class SqlDoc extends TextDoc {
     this.draw();
     emit('ran', { kind: 'sql', src: text, doc: this }, r, { kind: 'sql', src: text });
     return r;
+  }
+  close() { const ok = super.close(); if (ok) this.setLive(false, true); return ok; }
+  /** Live (as DataGrip's grid has it): the answer shown again, in place, each time a commit changes
+   * what it reads; every live query of the page shares one connection to the node (`live.js`). */
+  setLive(on, quiet) { this.live = on; this.unwatch?.(); this.unwatch = this.watched = null; this.liveSt.textContent = ''; if (!quiet) this.draw(); }
+  follow(r) {
+    this.unwatch?.(); this.unwatch = null; this.watched = r;
+    if (!this.live || !liveable(r)) return;
+    this.liveSt.innerHTML = '<span class="dot"></span>watching';
+    import('./live.js').then(L => { if (this.watched === r && !this.unwatch) this.unwatch = L.watch(r.sql, sessionOf(this), a => {
+      if (a.error) { toast('Live stopped: ' + a.error, true); return this.setLive(false); }
+      const got = L.rowsOf(a, r.columns), g = this.gridEl?.grid;
+      if (JSON.stringify(got.rows) !== JSON.stringify(r.rows)) {
+        if (this.result === r && this.tab === 'results' && g && !r.page) g.update(got.rows, got.total);
+        else { Object.assign(r, got, { page: 0, pages: null }); if (this.result === r) this.draw(); }
+      }
+      this.liveSt.innerHTML = `<span class="dot"></span>updated ${new Date().toLocaleTimeString()}`;
+    }, r.params); });
   }
   stop() { this.ctl?.abort(); this.ctl = null; this.running = false; this.body.replaceChildren(h('div', { class: 'wait' }, 'Stopped waiting. (A statement already on its way may still finish on the node.)')); R.helpers.toolbar(); }
   /** Point at a statement that ran (a double-click on its number): the caret at its start, in sight,
@@ -127,9 +147,12 @@ export class SqlDoc extends TextDoc {
     if (plan && this.tab !== 'messages') this.tab = 'plan';
     this.tabs.replaceChildren(...[plan ? null : tab('results', 'Results'), tab('messages', 'Messages'), plan ? null : tab('chart', 'Chart', 'chart'), plan ? null : tab('profile', 'Data profile', 'columns'), tab('plan', 'Plan', 'plan')].filter(Boolean));
     const name = this.title.replace(/\.sql$/i, ''), rowsOk = r?.kind === 'rows';
+    if (this.live && this.watched !== r && !this.running) this.follow(r);
+    const sw = h('input', { type: 'checkbox', checked: !!this.live, onchange: () => this.setLive(sw.checked) });
     const text = (f, headers) => this.gridEl?.grid ? this.gridEl.grid.text(f, headers) : '';
     // (how many rows and how long: on the line under the rows, as a cell's answer has it)
     fill(this.info, r && !rowsOk && r.ms != null ? h('span', { class: 'n t' }, secs(r.ms)) : null,
+      this.live ? this.liveSt : null, this.live || liveable(r) ? h('label', { class: 'live', title: 'Live: this answer again, in place, each time a commit changes what it reads' }, sw, h('span', { class: 'switch' }), 'Live') : null,
       split('copy', 'Copy with column names (tab-separated)', () => rowsOk && copyText(text('tsv', true), 'Copied with column names'), () => copyItems((f, hd) => rowsOk && copyText(text(f, hd), 'Copied')), !rowsOk),
       split('down', 'Download all rows as CSV', () => rowsOk && fetchRows(r, 'csv', name), () => downloadItems(f => fetchRows(r, f, name)), !rowsOk),
       h('button', { class: 'icon', title: this.layout === 'right' ? 'Move the results below' : 'Move the results to the right', 'aria-label': 'Move the results', onclick: () => { this.layout = this.layout === 'right' ? 'below' : 'right'; R.helpers.prefs('results', this.layout); this.place(); this.draw(); } }, icon(this.layout === 'right' ? 'panelBelow' : 'panelRight')));
@@ -173,3 +196,5 @@ export class SqlDoc extends TextDoc {
       h('span', { class: 'sep' }), db, R.helpers.saveButton(this), moreBtn(() => this.more())];
   }
 }
+/** An answer that can be followed live: the rows of one query. */
+const liveable = r => r?.kind === 'rows' && !!r.sql && /^\s*(select|with|from|values|table)\b/i.test(r.sql.replace(/--[^\n]*|\/\*[\s\S]*?\*\//g, ' '));
