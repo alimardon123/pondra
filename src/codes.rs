@@ -49,6 +49,8 @@ fn by_words(text: &str) -> &'static str {
         _ if has("divide by zero") || has("division by zero") => "22012",                       // division_by_zero
         _ if has("overflow") || has("out of range") => "22003",                                 // numeric_value_out_of_range
         _ if has("cast error") || has("cannot cast") || has("can't cast") || has("invalid input syntax") || has("could not parse") => "22P02", // invalid_text_representation
+        _ if has("can't reach the bucket") => "57P03",                                         // cannot_connect_now (a leader cut off: ask another node)
+        _ if has("error sending request") => "58030",                                           // io_error (the bucket or another node didn't answer: try again)
         _ if has("statement timeout") || has("canceling statement") || has("timed out") => "57014", // query_canceled
         _ if has("resources exhausted") || has("out of memory") || has("memory limit") => "53200", // out_of_memory
         _ if has("too many") && has("at once") => "53300",                                      // too_many_connections (a user's queries at once)
@@ -88,6 +90,8 @@ mod tests {
         assert_eq!(of("permission denied: INSERT on t (GRANT INSERT ON t TO ann)"), "42501");
         assert_eq!(of("Invalid function 'nope'.\nDid you mean 'now'?"), "42883");
         assert_eq!(of("table t already exists"), "42P07");
+        assert_eq!(of(crate::cluster::CUT_OFF_SAYS), "57P03");
+        assert_eq!(of("error sending request for url (http://10.0.0.2:8080/cluster/commit)"), "58030");
         assert_eq!(of("something else"), "XX000");
         assert_eq!(super::of(&super::coded("40001", "could not serialize access due to concurrent update")), "40001");
         assert_eq!(super::of(&anyhow::Error::new(crate::views::Violation("new row for relation \"t\" violates check constraint \"c\"".into()))), "23514");

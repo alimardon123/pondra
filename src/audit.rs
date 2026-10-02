@@ -144,6 +144,9 @@ pub async fn statement<T, E: std::fmt::Display + Refusal>(app: &App, sql: &str, 
     if INSIDE.try_with(|_| ()).is_ok() {
         return f.await;
     }
+    if app.cluster.cut_off() {
+        return Err(E::refusal("57P03", crate::cluster::CUT_OFF_SAYS.into())); // (cannot_connect_now: every door's clients retry elsewhere)
+    }
     let (class, start, quota) = (class(sql), Instant::now(), crate::users::quota());
     let out = INSIDE
         .scope((), async {

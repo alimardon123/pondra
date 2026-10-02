@@ -28,7 +28,7 @@ console.log(await db.sql("SELECT 1 AS one"));
 
 | Call | Meaning |
 |---|---|
-| `connect(url = "http://127.0.0.1:8080", { token, onNotice })` | a connection to a node |
+| `connect(url = "http://127.0.0.1:8080", { token, onNotice, retrySecs })` | a connection to a node, or to any of several (an array of URLs) |
 | `await local(dir = "lake", { port, token, flags, timeoutMs, python, onNotice })` | start a node on a lake here (a folder or `s3://bucket/prefix`) and connect to it |
 | `binary()` | the path of the `pondra` executable: `$PONDRA_BIN`, or the one npm installed for this platform |
 
@@ -41,6 +41,18 @@ console.log(await db.sql("SELECT 1 AS one"));
 | `flags` | `[]` | more `pondra serve` options, such as `["--memory-gb", "2"]` |
 | `timeoutMs` | 120000 | how long `local` waits for the node to start |
 | `python` | `true` | give the node a Python, for Python functions and procedures, if this machine has one with the `pondra` package (`--python auto`); `false` for none |
+| `retrySecs` | 60 | how long a call keeps trying while no node answers it (0: once) |
+
+Given a cluster's nodes, a connection rides out one going away, as the
+[Python client](/pondra/reference/python/#connect) does: a call no node ran goes to the next node,
+and so does one that can't be applied twice (a query, `append`, a single `INSERT`, `UPDATE`,
+`DELETE` or `MERGE`, sent with a job). While a node holds the session (a transaction, temporary
+tables, settings, variables), calls go to it alone; if it goes, the next call fails with `sqlstate`
+`08006`.
+
+```js norun
+const db = connect(["http://10.0.0.1:8080", "http://10.0.0.2:8080", "http://10.0.0.3:8080"]);
+```
 
 `local` stops its node on `db.close()` or when the process exits, and the lake stays. Because this
 program started the node, its SQL may read and write files on this machine

@@ -25,6 +25,9 @@ use std::time::{Duration, Instant};
 
 const LEASE: Duration = Duration::from_secs(5);
 const STARTUP: Duration = Duration::from_secs(30); // a new leader may need this long to open the catalog
+const CUT_OFF: Duration = Duration::from_secs(15); // a leader that hasn't reached the bucket this long steps aside
+pub const CUT_OFF_HEADER: &str = "x-pondra-cut-off"; // (a heartbeat's answer from a leader cut off)
+pub const CUT_OFF_SAYS: &str = "this node leads but can't reach the bucket: another node will lead in a moment, ask it";
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Term {
@@ -41,6 +44,7 @@ pub struct Cluster {
     last_ok: Mutex<Instant>,                 // follower: last heartbeat the leader answered
     heard: std::sync::atomic::AtomicBool,    // follower: the leader has answered us at least once
     pub shard_runs: std::sync::atomic::AtomicU64, // task shards this node has run (for /stats)
+    cut_off: std::sync::atomic::AtomicBool,       // leader: it can't reach the bucket (`keep_alive`)
 }
 
 impl Cluster {
@@ -62,7 +66,7 @@ impl Cluster {
         let view = Mutex::new(vec![]); // a follower runs no shards until the leader lists it
         let last_ok = Mutex::new(Instant::now() + STARTUP); // until we first hear from the leader
         let (beats, shard_runs, heard) = (Default::default(), Default::default(), Default::default());
-        Ok(Arc::new(Cluster { addr: addr.into(), reader, leader, beats, view, last_ok, heard, shard_runs }))
+        Ok(Arc::new(Cluster { addr: addr.into(), reader, leader, beats, view, last_ok, heard, shard_runs, cut_off: Default::default() }))
     }
 
     pub fn is_leader(&self) -> bool { self.leader.addr == self.addr }
@@ -84,17 +88,57 @@ impl Cluster {
         nodes.iter().position(|n| *n == self.addr).is_some_and(|p| shard as usize % nodes.len() == p)
     }
 
-    /// Leader side of a heartbeat: our term and the live members.
-    pub fn beat(&self, addr: String) -> (u64, Vec<String>) {
+    /// Leader side of a heartbeat: our term and the live members, or nothing while this leader
+    /// can't reach the bucket (the follower takes over: `follow`).
+    pub fn beat(&self, addr: String) -> Option<(u64, Vec<String>)> {
         self.beats.lock().unwrap().insert(addr, Instant::now());
-        (self.leader.n, self.nodes())
+        (!self.unreached()).then(|| (self.leader.n, self.nodes()))
     }
 
     /// Has this node heard from the leader within the lease? Peers ask before taking over.
     pub fn leader_ok(&self) -> bool { self.is_leader() || self.last_ok.lock().unwrap().elapsed() < LEASE }
 
     /// What peers asking `/cluster/leader` get: our leader's term, and whether we still hear it.
-    pub fn leader_status(&self) -> (u64, bool) { (self.leader.n, self.leader_ok()) }
+    pub fn leader_status(&self) -> (u64, bool) { (self.leader.n, self.leader_ok() && !self.unreached()) }
+
+    /// Leader: has it gone `CUT_OFF` without reaching the bucket, with another node there to take
+    /// over? It turns requests away then. A leader alone serves what it can, as it always did:
+    /// nobody else can lead, and its writes wait for the bucket.
+    pub fn cut_off(&self) -> bool { self.unreached() && self.nodes().len() > 1 }
+
+    fn unreached(&self) -> bool { self.cut_off.load(std::sync::atomic::Ordering::Relaxed) }
+
+    /// Leader: "still here" in the bucket every 10 s (`cluster/alive/{n}`), for machines outside
+    /// the cluster. One that hasn't managed it for `CUT_OFF` can't commit either, though its
+    /// followers may still reach it and the bucket both: it answers their heartbeats that it is
+    /// cut off, and one that reaches the bucket takes the next term at once (a new leader fences
+    /// it), instead of every write waiting for as long as its link to the bucket is down. Once it
+    /// reaches the bucket again it follows whoever leads now, or leads on if nobody took over (the
+    /// bucket was down for everyone). Meanwhile, if another node is there to lead, it turns
+    /// requests away (`cut_off`: `server::guard`, `audit::statement`): it can't commit, and what
+    /// it reads may be stale.
+    pub fn keep_alive(self: Arc<Self>, store: Store) {
+        crate::panics::spawn(async move {
+            let (mut last, mut cut) = (Instant::now(), false);
+            loop {
+                let marked = tokio::time::timeout(Duration::from_secs(5), mark_alive(&store, self.leader.n)).await;
+                if matches!(marked, Ok(Ok(()))) {
+                    last = Instant::now();
+                    // (a newer term claimed meanwhile: cut off a moment ago, or paused for longer
+                    // than a lease. SlateDB's fencing stops our commits; this stops our reads too.)
+                    if store.head(&Path::from(format!("cluster/term/{:020}", self.leader.n + 1))).await.is_ok() {
+                        restart(&format!("term {} has a newer leader", self.leader.n + 1));
+                    }
+                }
+                if cut != (last.elapsed() > CUT_OFF) {
+                    cut = !cut;
+                    self.cut_off.store(cut, std::sync::atomic::Ordering::Relaxed);
+                    eprintln!("{}", if cut { "this leader can't reach the bucket: it tells its followers, and one that reaches it takes over" } else { "this leader reaches the bucket again, and still leads" });
+                }
+                tokio::time::sleep(Duration::from_secs(if cut || last.elapsed() > Duration::from_secs(1) { 1 } else { 10 })).await;
+            }
+        });
+    }
 
     /// Follower loop: heartbeat the leader; if it's gone for `LEASE`, claim the next term.
     pub fn follow(self: Arc<Self>, store: Store) {
@@ -102,7 +146,16 @@ impl Cluster {
             loop {
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 let url = crate::tls::url(&format!("{}/cluster/beat?from={}", self.leader.addr, self.addr));
-                match http().post(url).timeout(Duration::from_secs(2)).send().await.and_then(|r| r.error_for_status()) {
+                let answer = http().post(url).timeout(Duration::from_secs(2)).send().await;
+                if answer.as_ref().is_ok_and(|r| r.headers().contains_key(CUT_OFF_HEADER)) {
+                    // The leader says it can't reach the bucket: no lease to wait out, no peer to
+                    // ask. Take the next term if this node reaches the bucket (claiming needs it).
+                    if !matches!(latest(&store).await, Ok(Some(t)) if t.n > self.leader.n) && claim(&store, self.leader.n + 1, &self.addr).await.is_err() {
+                        continue; // (nor can we: wait)
+                    }
+                    restart("the leader can't reach the bucket: the next term was claimed");
+                }
+                match answer.and_then(|r| r.error_for_status()) {
                     Ok(r) => {
                         let (term, nodes): (u64, Vec<String>) = r.json().await.unwrap_or_default();
                         if term != self.leader.n {

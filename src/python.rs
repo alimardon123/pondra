@@ -474,6 +474,9 @@ pub fn interrupt(session: &str) -> &'static str {
 type Slot = Arc<tokio::sync::Mutex<Option<Kernel>>>;
 static KERNELS: LazyLock<Mutex<HashMap<String, (Slot, Instant)>>> = LazyLock::new(Default::default);
 
+/// Has the session a Python of its own here (its `DO` blocks' variables)?
+pub fn held(session: &str) -> bool { KERNELS.lock().unwrap().contains_key(session) }
+
 /// A cell of `session`'s, on its worker (made now if it has none), and its answer.
 pub async fn ask_session(session: &str, head: Value, parts: Vec<Vec<u8>>, limit: Option<Duration>, notice: &mut (dyn FnMut(String) + Send)) -> Result<(Value, Vec<Vec<u8>>)> {
     let slot = {

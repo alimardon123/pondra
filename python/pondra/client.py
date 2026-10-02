@@ -104,19 +104,35 @@ class Result:
         return repr(self._rows) if self._rows is not None else repr(self.to_arrow())
 
 
+# A node answered that it ran nothing, or that it couldn't reach the bucket or another node: a
+# request that may be sent again goes to the next node. (57P01 admin_shutdown, 57P03
+# cannot_connect_now, 58030 io_error, 08xxx connection_exception)
+_TRY_AGAIN = {"57P01", "57P03", "58030", "08000", "08001", "08003", "08006"}
+_GONE = "08006"  # (connection_failure: the node holding the session went)
+
+
 class Pondra:
-    def __init__(self, url="http://127.0.0.1:8080", token=None, producer=None, timeout=300, headers=None, job=None, echo=True, user=None, password=None, ca=None):
+    def __init__(self, url="http://127.0.0.1:8080", token=None, producer=None, timeout=300, headers=None, job=None, echo=True, user=None, password=None, ca=None, retry_secs=60):
+        """`url`: a node, or several (a list, or separated by commas): any of a cluster's nodes
+        answers, and a node that goes away or turns work away (stopping, or a leader cut off from
+        its bucket) hands the work to the next, for up to `retry_secs` (a request it may have run
+        goes again only if that can't apply it twice: a query, an `append`, a single INSERT,
+        UPDATE, DELETE or MERGE, sent with a job). While a node holds this connection's session —
+        a transaction, temporary tables, settings, variables — every request goes to it alone."""
         global _last
-        self.url, self.token, self.timeout = url.rstrip("/"), token, timeout
+        urls = [u.strip().rstrip("/") for u in (url.split(",") if isinstance(url, str) else url) if u.strip()]
+        self.urls, self.url, self.token, self.timeout, self.retry_secs = urls, urls[0], token, timeout, retry_secs
+        self._held = None  # the node holding this connection's session, while one does (`x-pondra-session: held`)
+        self._reached = False  # (a node has answered: one that is gone now is waited for, not before)
         # (a user signs in with its name and password, or its token as the password: HTTP Basic)
         self._basic = "Basic " + base64.b64encode(f"{user}:{password}".encode()).decode() if user else None
         self.notices, self.echo = [], echo  # what the last statement's procedures printed; printed here too, unless echo=False
         self.producer = producer or f"py-{uuid.uuid4().hex[:12]}"  # exactly-once: one name, increasing seq
-        self.seq = 0
+        self.seq, self._auto = 0, itertools.count(1)
         self.session = uuid.uuid4().hex  # (this connection's temporary tables and views: the node's, until close())
         self._headers, self._job, self._jobs, self._temp = dict(headers or {}), job, itertools.count(1), {}
-        # a node on this machine is reached directly, whatever proxy the environment names
-        local = urllib.parse.urlsplit(self.url).hostname in ("127.0.0.1", "localhost", "::1")
+        # nodes on this machine are reached directly, whatever proxy the environment names
+        local = all(urllib.parse.urlsplit(u).hostname in ("127.0.0.1", "localhost", "::1") for u in urls)
         handlers = [urllib.request.ProxyHandler({})] if local else []
         if ca:  # (a node's own certificate, or its authority's: a PEM file to trust besides the system's)
             import ssl
@@ -124,7 +140,10 @@ class Pondra:
         self._open = urllib.request.build_opener(*handlers).open if handlers else urllib.request.urlopen
         _last = self
 
-    def _call(self, method, path, body=b"", headers=None, stream=False):
+    def _call(self, method, path, body=b"", headers=None, stream=False, again=None):
+        """One request. A node that is gone, or turns it away unrun, hands it to the next of
+        `urls`; one that may have run it does so only if `again` (it can't be applied twice: GETs
+        unless said otherwise), until `retry_secs` have passed (see `__init__`)."""
         h = {"x-pondra-session": self.session, **self._headers, **(headers or {})}
         if self.token:
             h["Authorization"] = f"Bearer {self.token}"
@@ -132,16 +151,50 @@ class Pondra:
             h["Authorization"] = self._basic
         if getattr(self, "owner", None):
             h["x-pondra-owner"] = self.owner  # (the node `local()` started: its SQL may read files here)
-        req = urllib.request.Request(self.url + path, data=body if method == "POST" else None, headers=h, method=method)
-        try:
-            r = self._open(req, timeout=None if stream else self.timeout)
-        except urllib.error.HTTPError as e:
-            self._heard(e.headers)
-            raise PondraError(f"{e.code}: {e.read().decode(errors='replace')}", e.headers.get("x-pondra-sqlstate") if e.headers else None, e.code) from None
-        if stream:
-            return r
-        self._heard(r.headers)
-        return r.read()
+        again = method == "GET" if again is None else again
+        deadline, wait, tried = time.monotonic() + self.retry_secs, 0.1, 0
+        while True:
+            url = self._held or self.url
+            req = urllib.request.Request(url + path, data=body if method == "POST" else None, headers=h, method=method)
+            try:
+                r = self._open(req, timeout=None if stream else self.timeout)
+                out = r if stream else r.read()
+            except urllib.error.HTTPError as e:
+                self._reached = True
+                self._heard(e.headers)
+                self._holds(url, path, e.headers)
+                code = e.headers.get("x-pondra-sqlstate") if e.headers else None
+                error = PondraError(f"{e.code}: {e.read().decode(errors='replace')}", code, e.code)
+                unrun = e.code == 503 and e.headers.get("retry-after") or code == "57P03"  # (stopping, or a leader cut off: it ran nothing)
+                if not (unrun or again and (e.code in (502, 504) or code in _TRY_AGAIN)):
+                    raise error from None
+            except (urllib.error.URLError, OSError) as e:
+                unrun = isinstance(getattr(e, "reason", e), ConnectionRefusedError)  # (nobody there: it ran nothing)
+                if not (unrun or again) or not self._reached and len(self.urls) == 1:
+                    raise  # (a node never reached is a wrong address or one not started: said at once)
+                error = e
+            else:
+                self._reached = True
+                self._holds(url, path, r.headers)
+                if not stream:
+                    self._heard(r.headers)
+                return out
+            if self._held:  # (its session's transaction, temporary tables, settings and variables went with it)
+                self._held = None
+                raise PondraError(f"the node holding this connection's session ({url}) is gone, and its transaction, temporary tables, settings and "
+                                  f"variables with it; what was sent to it last may or may not have been applied ({error})", _GONE) from None
+            if time.monotonic() > deadline or getattr(self, "process", None) and self.process.poll() is not None:
+                raise error  # (out of time, or the node `local()` started has stopped)
+            tried += 1
+            self.url = self.urls[(self.urls.index(url) + 1) % len(self.urls)] if url in self.urls else self.urls[0]
+            if tried % len(self.urls) == 0:  # (each node tried once: a moment before the next round)
+                time.sleep(max(0.0, min(wait, deadline - time.monotonic())))
+                wait = min(wait * 2, 2.0)
+
+    def _holds(self, url, path, headers):
+        """Keep to this node while it holds the session (its answers to SQL say so)."""
+        if path.startswith("/sql") and headers is not None:
+            self._held = url if headers.get("x-pondra-session") == "held" else None
 
     def _heard(self, headers):
         """What the statement's procedures printed (the node's `x-pondra-notices`): kept in
@@ -157,18 +210,22 @@ class Pondra:
         or with tables of our own too (`application/vnd.pondra.request`: the JSON's length, the
         JSON, then each table's length and Arrow IPC)."""
         format = format or ("arrow" if _has_arrow() else "json")
+        changes = _changes(sql)
+        if changes and not job:
+            job = f"{self.producer}-{next(self._auto)}"  # (sent again after a node went, it is applied once)
+        again = bool(changes) or _is_query(sql) and not re.search(r"(?i)\bstart\s*\(", _code(sql))  # (pondra.start runs something)
         path = f"/sql?format={format}" + (f"&job={urllib.parse.quote(job)}" if job else "")
         if not params and not sent and not views:
-            return self._call("POST", path, sql.encode())
+            return self._call("POST", path, sql.encode(), again=again)
         head = {"sql": sql, "params": {k: _param(v) for k, v in (params or {}).items()}, "views": views or {}, "tables": list(sent or {})}
         if not sent:
-            return self._call("POST", path, json.dumps(head).encode(), {"content-type": "application/json"})
+            return self._call("POST", path, json.dumps(head).encode(), {"content-type": "application/json"}, again=again)
         h = json.dumps(head).encode()
         body = [struct.pack("<I", len(h)), h]
         for t in sent.values():
             b = _encode(t)[0]
             body += [struct.pack("<Q", len(b)), b]
-        return self._call("POST", path, b"".join(body), {"content-type": "application/vnd.pondra.request"})
+        return self._call("POST", path, b"".join(body), {"content-type": "application/vnd.pondra.request"}, again=again)
 
     def _run(self, sql, params=None, sent=None, job=None, views=None):
         """Run statements now: the last one's rows (`Result`) or outcome (a dict)."""
@@ -406,18 +463,13 @@ class Pondra:
 
     # ------------------------------------------------------------ rows in, rows out
 
-    def append(self, table, data, retries=10):
-        """Append rows — a list of dicts, or a pandas / Polars / Arrow table — exactly once: a
-        retry after a lost answer is recognised and not applied twice."""
+    def append(self, table, data, retries=None):
+        """Append rows — a list of dicts, or a pandas / Polars / Arrow table — exactly once: sent
+        again after a lost answer, on any node, it is recognised and not applied twice (for up to
+        the connection's `retry_secs`)."""
         self.seq += 1
         body, ctype = _encode(data)
-        for attempt in range(retries):
-            try:
-                return json.loads(self._call("POST", f"/append/{table}?producer={self.producer}&seq={self.seq}", body, {"content-type": ctype}))
-            except (OSError, urllib.error.URLError):
-                if attempt == retries - 1:
-                    raise
-                time.sleep(min(0.1 * 2 ** attempt, 5))  # the same seq again: applied once
+        return json.loads(self._call("POST", f"/append/{table}?producer={self.producer}&seq={self.seq}", body, {"content-type": ctype}, again=True))
 
     def view(self, name, query, materialized=None, temporary=False, replace=None, **options):
         """A view others read by name, as SQL's `CREATE VIEW` and a frame's `to_view` make one:
@@ -472,7 +524,7 @@ class Pondra:
                 raise ValueError("a live query reads the lake: a frame of rows from Python never changes (write_table them first)")
             query, params = query.sql, {**query._params, **params}
         body = json.dumps({"sql": query, "params": {k: _param(v) for k, v in params.items()}}).encode()
-        r = self._call("POST", "/live" + (f"?every_ms={int(every_ms)}" if every_ms else ""), body, {"content-type": "application/json"}, stream=True)
+        r = self._call("POST", "/live" + (f"?every_ms={int(every_ms)}" if every_ms else ""), body, {"content-type": "application/json"}, stream=True, again=True)
         try:
             for line in r:
                 if not line.strip():
@@ -493,8 +545,9 @@ class Pondra:
         self._run("BEGIN")
         try:
             yield self
-        except BaseException:
-            self._run("ROLLBACK")
+        except BaseException as e:
+            if getattr(e, "sqlstate", None) != _GONE:  # (its node went, and the transaction with it)
+                self._run("ROLLBACK")
             raise
         self._run("COMMIT")
 
@@ -502,10 +555,12 @@ class Pondra:
         """End this connection's session (its temporary tables and views), and stop the node
         `local()` started: closing its input stops it (it hands the lake on at once), on every OS;
         it would stop the same way if Python were killed."""
+        retry_secs, self.retry_secs = self.retry_secs, 0  # (a node that's gone isn't waited for here)
         try:
             self._call("DELETE", f"/sessions/{self.session}")
         except Exception:
             pass  # (the node is gone, or never had one: an idle session ends by itself)
+        self.retry_secs = retry_secs
         p = getattr(self, "process", None)
         if p and p.poll() is None:
             p.stdin.close()
@@ -753,11 +808,12 @@ def local(dir="lake", port=None, token=None, flags=(), timeout=120, python=True)
         here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # (so its procedures import this very package)
         env = {**os.environ, "PONDRA_OWNER_KEY": owner, "PYTHONPATH": os.pathsep.join(p for p in (here, os.environ.get("PYTHONPATH")) if p)}
         proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=err, env=env)
-    db = Pondra(f"http://127.0.0.1:{port}", token)
+    db = Pondra(f"http://127.0.0.1:{port}", token, retry_secs=0)
     db.process, db.owner, deadline = proc, owner, time.time() + timeout
     while True:
         try:
             db._call("GET", "/stats")
+            db.retry_secs = 60
             break
         except (OSError, RuntimeError):
             if proc.poll() is not None or time.time() > deadline:
@@ -798,6 +854,12 @@ def _is_query(sql):
     """One statement that returns rows (so it can wait): SELECT, WITH, VALUES, SHOW, DESCRIBE…"""
     text = _code(sql)
     return ";" not in text and re.match(r"(?i)\(*\s*(select|with|values|from|table|show|describe|desc|explain)\b", text) is not None
+
+
+def _changes(sql):
+    """One INSERT, UPDATE, DELETE or MERGE (a job makes sending it again harmless)."""
+    text = _code(sql)
+    return ";" not in text and re.match(r"(?i)\s*(insert|update|delete|merge)\b", text) is not None
 
 
 def _missing(error):
