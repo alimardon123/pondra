@@ -1,0 +1,316 @@
+#!/usr/bin/env python3
+"""Pondra deployed the ways ADR-041 gives, each tried as a user would run it:
+
+- **image**: the container image serves, as a user that isn't root, from a volume it owns; its
+  queries are sized by the container's memory, not the host's; `docker stop` hands the lake on
+  cleanly (exit 0); a new container on the same volume has the rows and the key that seals secrets.
+- **compose**: `deploy/compose/compose.yaml`'s three nodes are one cluster: one leader, a write on
+  one node read on another, Postgres and Kafka on their ports; the leader killed, another leads and
+  takes writes; the killed one back as a follower; a leader stopped hands on at once; every node
+  then has every row.
+- **helm**: `deploy/helm/pondra` on Kubernetes (kind in CI): three nodes and a reader on a bucket,
+  guarded by the chart's own tokens; the leader's pod deleted, a rolling restart and an upgrade
+  lose nothing and keep the keys; the chart with nothing set is one node that keeps its lake.
+
+  deploy_check.py [image] [compose] [helm] [--image pondra:dev]
+
+The image is built from a context `tools/image.py` makes (`--bin target/release/pondra` for this
+machine's build). Docker (with compose) is all image and compose need; helm needs kubectl and helm
+pointed at a cluster that has the image (`kind load docker-image pondra:dev`).
+"""
+import argparse, base64, json, os, socket, struct, subprocess, sys, time, urllib.error, urllib.request
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+COMPOSE = os.path.join(ROOT, "deploy", "compose", "compose.yaml")
+checks, info = {}, {}
+
+
+def check(name, ok, detail=None):
+    checks[name] = bool(ok)
+    print(f"{'ok  ' if ok else 'FAIL'} {name}" + (f": {detail}" if detail is not None and not ok else ""), flush=True)
+    return ok
+
+
+def run(*cmd, env=None, check=True, timeout=300):
+    r = subprocess.run(cmd, capture_output=True, text=True, env={**os.environ, **(env or {})}, timeout=timeout)
+    if check and r.returncode:
+        raise RuntimeError(f"{' '.join(cmd)}: {(r.stdout + r.stderr)[-1500:]}")
+    return r.stdout.strip()
+
+
+def http(port, path, body=None, timeout=30, token=None):
+    req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", data=body.encode() if body is not None else None, method="POST" if body is not None else "GET",
+                                 headers={"Authorization": f"Bearer {token}"} if token else {})
+    return urllib.request.urlopen(req, timeout=timeout).read().decode()
+
+
+def sql(port, q, timeout=60, token=None):
+    return json.loads(http(port, "/sql", q, timeout, token))
+
+
+def stats(port):
+    try:
+        return json.loads(http(port, "/stats", timeout=3))
+    except Exception:
+        return None
+
+
+def until(what, secs, every=0.25):
+    """`what()` once it is truthy, or None after `secs`."""
+    deadline = time.time() + secs
+    while time.time() < deadline:
+        try:
+            got = what()
+            if got:
+                return got
+        except Exception:
+            pass
+        time.sleep(every)
+    return None
+
+
+def count(port, table="t", token=None):
+    try:
+        return sql(port, f"SELECT count(*) AS n FROM {table}", token=token)[0]["n"]
+    except Exception:
+        return None
+
+
+def postgres_answers(port):
+    """A Postgres startup message gets Postgres's answer (an authentication request, 'R')."""
+    body = struct.pack("!I", 196608) + b"user\0pondra\0database\0lake\0\0"
+    with socket.create_connection(("127.0.0.1", port), timeout=5) as s:
+        s.sendall(struct.pack("!I", len(body) + 4) + body)
+        return s.recv(1) == b"R"
+
+
+def metric(port, name):
+    for line in http(port, "/metrics").splitlines():
+        if line.startswith(name + " ") or line.startswith(name + "{"):
+            return float(line.rsplit(" ", 1)[1])
+
+
+def image(tag):
+    """The image alone: a container on a volume, stopped, and a new one on the same volume."""
+    vol, name = f"pondra-check-{os.getpid()}", f"pondra-check-{os.getpid()}"
+    limit = 1 << 30
+
+    def start():
+        run("docker", "run", "-d", "--name", name, "--memory", str(limit), "-p", "127.0.0.1::8080", "-v", f"{vol}:/data", tag)
+        port = int(run("docker", "port", name, "8080/tcp").splitlines()[0].rsplit(":", 1)[1])
+        return port if until(lambda: stats(port), 60) else None
+
+    def look(path):  # (the image has no shell: a small one looks at the volume)
+        return run("docker", "run", "--rm", "-v", f"{vol}:/data", "busybox:1.37", "sh", "-c", path)
+
+    try:
+        port = start()
+        if not check("the image serves on its own (serve lake --addr 0.0.0.0:8080)", port, run("docker", "logs", name, check=False)[-1500:]):
+            return
+        user = run("docker", "inspect", "-f", "{{.Config.User}}", tag)
+        check("it runs as a user that isn't root", user not in ("", "0", "root", "0:0"), user)
+        sql(port, "CREATE TABLE t (id BIGINT, name TEXT)")
+        sql(port, "INSERT INTO t SELECT x, 'n' || x FROM generate_series(1, 1000) AS g(x)")
+        check("SQL writes and reads in it", count(port) == 1000, count(port))
+        sql(port, "CREATE SECRET kept (TYPE s3, KEY_ID 'id', SECRET 'shh', SCOPE 's3://pondra-check-bucket')")
+        owners = look("stat -c '%u %a %n' /data /data/lake /data/.pondra /data/.pondra/secret.key /data/cache")
+        info["owners"] = owners
+        check("everything it keeps is under /data, the image user's own; the key readable by it alone",
+              all(l.split()[0] == "65532" for l in owners.splitlines()) and "600 /data/.pondra/secret.key" in owners, owners)
+        query_memory = metric(port, "pondra_memory_limit_bytes")
+        info["query memory in a 1 GB container (bytes)"] = query_memory
+        check("its queries are sized by the container's memory, not the host's", query_memory and query_memory <= limit / 2, query_memory)
+        key = look("sha256sum /data/.pondra/secret.key")
+        t0 = time.time()
+        run("docker", "stop", "-t", "30", name)
+        took, code = time.time() - t0, run("docker", "inspect", "-f", "{{.State.ExitCode}}", name)
+        info["docker stop (s)"] = round(took, 2)
+        check("docker stop ends it cleanly, at once (SIGTERM: exit 0)", code == "0" and took < 15, f"exit {code} after {took:.1f} s")
+        run("docker", "rm", name)
+        port = start()
+        check("a new container on the same volume has the rows", port and count(port) == 1000, port and count(port))
+        secrets = port and sql(port, "SELECT name FROM secrets()")
+        check("…and the key that seals its secrets", key == look("sha256sum /data/.pondra/secret.key") and secrets and {"name": "kept"} in secrets, secrets)
+    finally:
+        run("docker", "rm", "-f", name, check=False)
+        run("docker", "volume", "rm", "-f", vol, check=False)
+
+
+def compose(tag):
+    """deploy/compose/compose.yaml as it is: three nodes on one lake."""
+    project, env = f"pondra-check-{os.getpid()}", {"PONDRA_IMAGE": tag}
+    dc = lambda *a, **k: run("docker", "compose", "-f", COMPOSE, "-p", project, *a, env=env, **k)
+    http_port = {"node1": 8080, "node2": 8081, "node3": 8082}
+    try:
+        dc("up", "-d", "--quiet-pull")
+        up = until(lambda: all(stats(p) for p in http_port.values()) and [stats(p) for p in http_port.values()], 90)
+        if not check("three nodes start", up, dc("logs", "--tail", "20", check=False)):
+            return
+        settled = until(lambda: (s := [stats(p) for p in http_port.values()]) and len({(x["leader"], x["term"]) for x in s}) == 1
+                        and sorted(x["role"] for x in s) == ["follower", "follower", "leader"] and len(s[0]["nodes"]) == 3 and s, 60)
+        info["at start"] = [(x["role"], x["leader"], x["term"]) for x in settled or up]
+        check("they are one cluster: one leader, the others following it", settled, info["at start"])
+        sql(8081, "CREATE TABLE t (id BIGINT, at TIMESTAMP)")
+        sql(8081, "INSERT INTO t SELECT x, now() FROM generate_series(1, 30000) AS g(x)")
+        check("a write on one node is read on another", until(lambda: count(8082) == 30000, 30), count(8082))
+        check("Postgres answers on each node's port", all(postgres_answers(p) for p in (5432, 5433, 5434)))
+        check("Kafka listens on each node's port", all(socket.create_connection(("127.0.0.1", p), timeout=5).close() is None for p in (9092, 9093, 9094)))
+
+        def leader(among):
+            s = {n: stats(http_port[n]) for n in among}
+            leads = [n for n, x in s.items() if x and x["role"] == "leader"]
+            return leads[0] if len(leads) == 1 and all(x and x["leader"] == f"{leads[0]}:8080" for x in s.values()) else None
+
+        first = leader(http_port)
+        t0 = time.time()
+        dc("kill", first)
+        rest = [n for n in http_port if n != first]
+        second = until(lambda: leader(rest), 60)
+        info["killed leader -> a new one (s)"] = round(time.time() - t0, 1)
+        check("the leader killed, another leads", second, {n: stats(http_port[n]) for n in rest})
+        other = next(n for n in rest if n != second)
+        wrote = until(lambda: sql(http_port[other], "INSERT INTO t VALUES (30001, now())"), 60, every=1)
+        check("…and takes writes, from any node", wrote, count(http_port[other]))
+        dc("start", first)
+        back = until(lambda: (s := stats(http_port[first])) and s["role"] == "follower" and s["leader"] == f"{second}:8080", 60)
+        check("the killed node comes back as a follower", back, stats(http_port[first]))
+        t0 = time.time()
+        dc("stop", second)
+        took = time.time() - t0
+        third = until(lambda: leader([n for n in http_port if n != second]), 30)
+        info["leader stopped -> a new one (s)"] = round(time.time() - t0, 1)
+        check("a leader stopped (SIGTERM) hands on, at once", third and took < 15, f"{took:.1f} s to stop, then {info['leader stopped -> a new one (s)']} s")
+        dc("start", second)
+        same = until(lambda: all(count(p) == 30001 for p in http_port.values()), 60)
+        check("every node has every row", same, {n: count(p) for n, p in http_port.items()})
+    finally:
+        if not all(checks.values()):
+            info["logs"] = dc("logs", "--tail", "40", check=False)[-6000:]
+        dc("down", "-v", "--timeout", "30", check=False)
+
+
+def free_port():
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+class Forward:
+    """`kubectl port-forward` to a pod or service, for as long as it's needed."""
+    def __init__(self, ns, target, port):
+        self.local = free_port()
+        self.p = subprocess.Popen(["kubectl", "-n", ns, "port-forward", target, f"{self.local}:{port}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        until(lambda: socket.create_connection(("127.0.0.1", self.local), timeout=1).close() or True, 30)
+
+    def __enter__(self):
+        return self.local
+
+    def __exit__(self, *_):
+        self.p.terminate()
+        self.p.wait()
+
+
+def helm(tag):
+    """deploy/helm/pondra on the Kubernetes cluster kubectl points at (kind in CI), the image in it
+    already (`kind load docker-image`): a lake in a bucket (moto, in the cluster), three nodes and a
+    reader; `helm test`; SQL with the chart's own token; the leader's pod deleted; a rolling restart;
+    an upgrade keeping the keys; and the chart with nothing set (one node, its lake on its volume)."""
+    ns, chart = f"pondra-check-{os.getpid()}", os.path.join(ROOT, "deploy", "helm", "pondra")
+    k = lambda *a, **kw: run("kubectl", "-n", ns, *a, **kw)
+    repo, _, version = tag.rpartition(":")
+    image = ["--set", f"image.repository={repo},image.tag={version},image.pullPolicy=Never,persistence.size=1Gi"]
+    kept = lambda: k("get", "secret", "p-pondra-key", "p-pondra-tokens", "-o", "jsonpath={.items[*].data}")
+
+    def stats(pod):
+        try:
+            return json.loads(k("get", "--raw", f"/api/v1/namespaces/{ns}/pods/{pod}:8080/proxy/stats"))
+        except Exception:
+            return None
+
+    def leader():
+        pods = k("get", "pods", "-l", "app.kubernetes.io/component=node", "-o", "jsonpath={.items[*].metadata.name}").split()
+        s = {p: stats(p) for p in pods}
+        leads = [p for p, x in s.items() if x and x["role"] == "leader"]
+        return leads[0] if len(pods) == 3 and len(leads) == 1 and all(x and x["leader"].startswith(leads[0] + ".") for x in s.values()) else None
+
+    try:
+        run("kubectl", "create", "namespace", ns)
+        k("create", "deployment", "s3", "--image=motoserver/moto:5.1.4", "--port=5000")
+        k("expose", "deployment", "s3", "--port=5000")
+        k("rollout", "status", "deployment/s3", "--timeout=180s")
+        with Forward(ns, "svc/s3", 5000) as port:
+            urllib.request.urlopen(urllib.request.Request(f"http://127.0.0.1:{port}/lake", method="PUT"), timeout=30).read()
+        k("create", "secret", "generic", "bucket", "--from-literal=AWS_ACCESS_KEY_ID=test", "--from-literal=AWS_SECRET_ACCESS_KEY=test",
+          "--from-literal=AWS_REGION=us-east-1", f"--from-literal=AWS_ENDPOINT=http://s3.{ns}.svc:5000", "--from-literal=AWS_ALLOW_HTTP=true")
+        values = ["--set", "lake=s3://lake/main,bucket.existingSecret=bucket,readers.replicas=1", *image]
+        r = subprocess.run(["helm", "-n", ns, "install", "p", chart, *values, "--wait", "--timeout", "6m"], capture_output=True, text=True)
+        if not check("the chart installs: three nodes and a reader, ready", r.returncode == 0, (r.stdout + r.stderr)[-1500:] + k("get", "pods", "-o", "wide", check=False)):
+            return
+        first = until(leader, 60)
+        check("the nodes are one cluster: one leader, the others following it", first)
+        r = subprocess.run(["helm", "-n", ns, "test", "p", "--logs"], capture_output=True, text=True)
+        check("helm test: every node answers, one leader", r.returncode == 0, (r.stdout + r.stderr)[-1500:])
+        token = base64.b64decode(k("get", "secret", "p-pondra-tokens", "-o", "jsonpath={.data.PONDRA_ADMIN_TOKEN}")).decode()
+        with Forward(ns, "svc/p-pondra", 8080) as port:
+            try:
+                sql(port, "SELECT 1")
+                refused = False
+            except urllib.error.HTTPError as e:
+                refused = e.code == 401
+            check("the chart's tokens guard it: no token, no answer", refused)
+            sql(port, "CREATE TABLE t (id BIGINT, at TIMESTAMP)", token=token)
+            sql(port, "INSERT INTO t SELECT x, now() FROM generate_series(1, 20000) AS g(x)", token=token)
+            check("SQL through the service, with the chart's admin token", count(port, token=token) == 20000, count(port, token=token))
+        with Forward(ns, "svc/p-pondra-read", 8080) as port:
+            check("…and through the readers' service", until(lambda: all(count(port, token=token) == 20000 for _ in range(4)), 30), count(port, token=token))
+        before = kept()
+        k("delete", "pod", first, "--grace-period=0", "--force", "--wait=false")
+        t0 = time.time()
+        second = until(lambda: (l := leader()) and l != first and l, 120)
+        info["leader's pod deleted -> a new leader (s)"] = round(time.time() - t0, 1)
+        check("the leader's pod deleted: another leads, the pod back as a follower", second, {p: stats(p) for p in ("p-pondra-0", "p-pondra-1", "p-pondra-2")})
+        with Forward(ns, "svc/p-pondra", 8080) as port:
+            wrote = until(lambda: sql(port, "INSERT INTO t VALUES (20001, now())", token=token), 60, every=1)
+            check("…and the cluster takes writes", wrote and count(port, token=token) == 20001, count(port, token=token))
+        k("rollout", "restart", "statefulset/p-pondra")
+        k("rollout", "status", "statefulset/p-pondra", "--timeout=300s", timeout=320)
+        third = until(leader, 60)
+        with Forward(ns, "svc/p-pondra", 8080) as port:
+            check("a rolling restart (one node at a time, each handing on): one leader, every row", third and until(lambda: count(port, token=token) == 20001, 60), count(port, token=token))
+        r = subprocess.run(["helm", "-n", ns, "upgrade", "p", chart, *values, "--set", "podAnnotations.round=2", "--wait", "--timeout", "6m"], capture_output=True, text=True)
+        check("an upgrade keeps the key that seals secrets, and the tokens", r.returncode == 0 and kept() == before, (r.stdout + r.stderr)[-800:])
+        run("helm", "-n", ns, "install", "solo", chart, *image, "--wait", "--timeout", "4m")
+        token = base64.b64decode(k("get", "secret", "solo-pondra-tokens", "-o", "jsonpath={.data.PONDRA_ADMIN_TOKEN}")).decode()
+        with Forward(ns, "svc/solo-pondra", 8080) as port:
+            sql(port, "CREATE TABLE t AS SELECT 1 AS one", token=token)
+            check("the chart with nothing set: one node, its lake on its volume", count(port, token=token) == 1)
+        k("delete", "pod", "solo-pondra-0")
+        k("wait", "--for=condition=Ready", "pod/solo-pondra-0", "--timeout=180s")
+        with Forward(ns, "svc/solo-pondra", 8080) as port:
+            check("…which keeps it through a restart", count(port, token=token) == 1, count(port, token=token))
+    finally:
+        if not all(checks.values()):
+            info["pods"] = k("get", "pods", "-o", "wide", check=False)
+            info["logs"] = k("logs", "-l", "app.kubernetes.io/name=pondra", "--tail=30", "--prefix", check=False)[-6000:]
+        run("kubectl", "delete", "namespace", ns, "--wait=false", check=False)
+
+
+PARTS = {"image": image, "compose": compose, "helm": helm}
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("parts", nargs="*", help=f"any of {', '.join(PARTS)} (default: image compose)")
+    ap.add_argument("--image", default="pondra:dev", help="the image to try")
+    a = ap.parse_args()
+    if unknown := set(a.parts) - set(PARTS):
+        ap.error(f"no such part: {', '.join(unknown)}")
+    for part in a.parts or ["image", "compose"]:
+        print(f"-- {part}", flush=True)
+        try:
+            PARTS[part](a.image)
+        except Exception as e:
+            check(f"{part} ran to its end", False, str(e)[-2000:])
+    ok = bool(checks) and all(checks.values())
+    print(json.dumps({"deploy": checks, "ok": ok, "info": info}, indent=1, default=str))
+    sys.exit(0 if ok else 1)

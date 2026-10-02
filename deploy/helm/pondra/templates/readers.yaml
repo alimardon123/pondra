@@ -1,0 +1,62 @@
+{{- if or (gt (int .Values.readers.replicas) 0) .Values.readers.autoscaling.enabled }}
+{{- $full := include "pondra.fullname" . -}}
+# Readers: SQL only, never lead or vote, so any number can come and go (and autoscale). Each
+# follows the leader's commits and keeps its SSD tier in a scratch volume.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $full }}-reader
+  labels: {{- include "pondra.labels" . | nindent 4 }}
+    app.kubernetes.io/component: reader
+spec:
+  {{- if not .Values.readers.autoscaling.enabled }}
+  replicas: {{ .Values.readers.replicas }}
+  {{- end }}
+  selector:
+    matchLabels: {{- include "pondra.selector" . | nindent 6 }}
+      app.kubernetes.io/component: reader
+  template:
+    metadata:
+      labels: {{- include "pondra.selector" . | nindent 8 }}
+        app.kubernetes.io/component: reader
+        {{- with .Values.podLabels }}{{ toYaml . | nindent 8 }}{{- end }}
+      annotations:
+        checksum/secrets: {{ include (print $.Template.BasePath "/secrets.yaml") . | sha256sum | trunc 16 }}
+        {{- with .Values.podAnnotations }}{{ toYaml . | nindent 8 }}{{- end }}
+    spec:
+      {{- include "pondra.podSpec" . | nindent 6 }}
+      terminationGracePeriodSeconds: 30
+      {{- with .Values.affinity }}
+      affinity: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: pondra
+          {{- include "pondra.container" . | nindent 10 }}
+          args:
+            - serve
+            - --lake
+            - {{ include "pondra.lake" . }}
+            - --reader
+            - --advertise
+            - $(POD_IP):8080
+            {{- include "pondra.flags" . | nindent 12 }}
+          resources: {{- toYaml .Values.readers.resources | nindent 12 }}
+      volumes:
+        {{- include "pondra.volumes" . | nindent 8 }}
+        - {name: data, emptyDir: {}}
+{{- if .Values.readers.autoscaling.enabled }}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ $full }}-reader
+  labels: {{- include "pondra.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef: {apiVersion: apps/v1, kind: Deployment, name: {{ $full }}-reader}
+  minReplicas: {{ .Values.readers.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.readers.autoscaling.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource: {name: cpu, target: {type: Utilization, averageUtilization: {{ .Values.readers.autoscaling.targetCPUUtilizationPercentage }}}}
+{{- end }}
+{{- end }}

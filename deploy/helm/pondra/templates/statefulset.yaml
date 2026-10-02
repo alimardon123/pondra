@@ -1,0 +1,87 @@
+{{- include "pondra.validate" . -}}
+{{- $full := include "pondra.fullname" . -}}
+{{- $nodes := printf "%s-nodes.$(POD_NAMESPACE).svc.%s" $full .Values.clusterDomain -}}
+# The nodes that write and lead. Each keeps its name (and so its address, which is who it is to
+# the cluster), and they start at once: the first to claim the lake leads, the others follow.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $full }}
+  labels: {{- include "pondra.labels" . | nindent 4 }}
+    app.kubernetes.io/component: node
+spec:
+  serviceName: {{ $full }}-nodes
+  replicas: {{ include "pondra.replicas" . }}
+  podManagementPolicy: Parallel
+  updateStrategy: {type: RollingUpdate}
+  selector:
+    matchLabels: {{- include "pondra.selector" . | nindent 6 }}
+      app.kubernetes.io/component: node
+  template:
+    metadata:
+      labels: {{- include "pondra.selector" . | nindent 8 }}
+        app.kubernetes.io/component: node
+        {{- with .Values.podLabels }}{{ toYaml . | nindent 8 }}{{- end }}
+      annotations:
+        # (new keys or tokens restart the nodes)
+        checksum/secrets: {{ include (print $.Template.BasePath "/secrets.yaml") . | sha256sum | trunc 16 }}
+        {{- with .Values.podAnnotations }}{{ toYaml . | nindent 8 }}{{- end }}
+    spec:
+      {{- include "pondra.podSpec" . | nindent 6 }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      affinity:
+        {{- if .Values.affinity }}
+        {{- toYaml .Values.affinity | nindent 8 }}
+        {{- else }}
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels: {{- include "pondra.selector" . | nindent 20 }}
+                    app.kubernetes.io/component: node
+        {{- end }}
+      containers:
+        - name: pondra
+          {{- include "pondra.container" . | nindent 10 }}
+          args:
+            - serve
+            - --lake
+            - {{ include "pondra.lake" . }}
+            - --advertise
+            - $(POD_NAME).{{ $nodes }}:8080
+            {{- if .Values.kafka.enabled }}
+            - --kafka
+            - 0.0.0.0:9092
+            - --kafka-advertise
+            - $(POD_NAME).{{ $nodes }}:9092
+            {{- end }}
+            {{- if eq .Values.ack "replicated" }}
+            - --ack
+            - replicated
+            - --replicas
+            - {{ .Values.ackReplicas | quote }}
+            {{- end }}
+            {{- include "pondra.flags" . | nindent 12 }}
+          resources: {{- toYaml .Values.resources | nindent 12 }}
+      volumes:
+        {{- include "pondra.volumes" . | nindent 8 }}
+        {{- if not .Values.persistence.enabled }}
+        - {name: data, emptyDir: {}}
+        {{- end }}
+  {{- if .Values.persistence.enabled }}
+  persistentVolumeClaimRetentionPolicy: {whenDeleted: Retain, whenScaled: Retain}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels: {{- include "pondra.selector" . | nindent 10 }}
+      spec:
+        accessModes: {{- toYaml .Values.persistence.accessModes | nindent 10 }}
+        {{- with .Values.persistence.storageClass }}
+        storageClassName: {{ . }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.size }}
+  {{- end }}

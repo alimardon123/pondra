@@ -1,0 +1,15 @@
+apiVersion: v2
+name: pondra
+description: >-
+  Pondra on Kubernetes: nodes on one lake in a bucket (or a shared volume) form a cluster; one
+  leads, any takes over, and readers scale out reads.
+type: application
+# (a release packages the chart with its own version: `helm package --version X --app-version X`;
+# from a checkout it is this, and the image is `latest`)
+version: 0.0.0-dev
+appVersion: latest
+home: https://alimardon123.github.io/pondra/
+sources: [https://github.com/alimardon123/pondra]
+icon: https://raw.githubusercontent.com/alimardon123/pondra/main/brand/mark.svg
+keywords: [lakehouse, streaming, sql, kafka, postgres, iceberg, delta]
+kubeVersion: ">=1.25.0-0"

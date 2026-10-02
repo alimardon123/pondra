@@ -1,0 +1,150 @@
+# Pondra's chart (ADR-041). The least that makes a cluster:
+#
+#   helm install pondra deploy/helm/pondra --set lake=s3://my-bucket/lake \
+#     --set bucket.existingSecret=my-bucket-keys   # (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, …)
+#
+# With nothing set, one node keeps its lake on its own volume: `helm install pondra deploy/helm/pondra`.
+
+# Where the lake is: s3://bucket/prefix (S3, R2, MinIO), gs://bucket/prefix, az://container/prefix.
+# Empty: a folder, /data/lake, on the node's own volume (one node) or on `sharedStorage` (several).
+lake: ""
+
+# Nodes that write and lead (a StatefulSet: each keeps its name, so a restarted node is the same
+# member). Any node takes reads and writes; one leads, and another takes over within seconds.
+# Default: 3 on a shared lake (a bucket or sharedStorage), else 1.
+replicas: null
+
+image:
+  repository: ghcr.io/alimardon123/pondra
+  tag: ""                 # (the chart's appVersion)
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+# The bucket's credentials and settings, as the AWS_* (GOOGLE_*, AZURE_*) variables the node reads.
+bucket:
+  existingSecret: ""      # a Secret whose keys are those variables (envFrom)
+  env: {}                 # plain ones, e.g. {AWS_REGION: auto, AWS_ENDPOINT: "https://<account>.r2.cloudflarestorage.com"}
+
+# A folder lake shared by several nodes or readers: a ReadWriteMany claim (NFS, EFS, Filestore,
+# Azure Files). Each node mounts its `subPath` at /data/lake.
+sharedStorage:
+  existingClaim: ""
+  subPath: lake
+
+# Tokens (read, write, admin) at every door. Made once and kept across upgrades, unless given;
+# `kubectl get secret <release>-pondra-tokens -o jsonpath='{.data.PONDRA_ADMIN_TOKEN}' | base64 -d`.
+# With Argo CD or Flux (which render without the cluster), give existingSecret.
+auth:
+  enabled: true
+  existingSecret: ""      # keys PONDRA_ADMIN_TOKEN, PONDRA_WRITE_TOKEN, PONDRA_READ_TOKEN
+
+# The key that seals the lake's secrets (CREATE SECRET), the same on every node. Made once and
+# kept, unless given (key PONDRA_SECRET_KEY). Losing it loses the secrets sealed with it.
+secretKey:
+  existingSecret: ""
+
+# TLS at every door, and between the nodes (a kubernetes.io/tls Secret, as cert-manager makes:
+# tls.crt, tls.key, ca.crt). Its names must cover *.<release>-pondra-nodes.<namespace>.svc and
+# *.<release>-pondra-nodes.<namespace>.svc.cluster.local: how the nodes reach each other.
+tls:
+  existingSecret: ""
+  mutual: false           # the nodes show their certificates to each other, signed by ca.crt
+
+# The doors besides HTTP (the console, the API, MCP and the Iceberg REST catalog, on 8080).
+postgres:
+  enabled: true
+  port: 5432
+flight:
+  enabled: false
+  port: 8815
+kafka:
+  enabled: false
+  port: 9092              # (each node tells clients its own name in the cluster: Kafka inside it only)
+
+# Python functions and procedures (LANGUAGE python): the image with Python, and --python auto.
+python:
+  enabled: false
+
+# When a write is acknowledged: durable (in the bucket) or replicated (held by `replicas` nodes,
+# milliseconds on any storage; each node's /data then keeps replica files).
+ack: durable
+ackReplicas: 2
+
+# Readers: SQL only, never lead, any number (a Deployment you can scale or autoscale). They need the
+# lake shared: a bucket or sharedStorage.
+readers:
+  replicas: 0
+  resources: {}
+  autoscaling:
+    enabled: false
+    minReplicas: 1
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+
+# Each node's /data: a bucket lake's SSD tier and replica files, or (one node, no sharedStorage)
+# the lake itself.
+persistence:
+  enabled: true
+  size: 20Gi
+  storageClass: ""        # ("" the cluster's default)
+  accessModes: [ReadWriteOnce]
+
+# A node sizes its queries by its memory limit (a third of it); give one in production.
+resources: {}
+  # requests: {cpu: "2", memory: 8Gi}
+  # limits: {memory: 8Gi}
+
+# More flags for `pondra serve` (e.g. [--tier-secs, "5", --publish, "delta,iceberg"]) and variables.
+extraArgs: []
+extraEnv: []
+extraEnvFrom: []
+extraVolumes: []
+extraVolumeMounts: []
+
+service:
+  type: ClusterIP         # (the nodes behind it: any one answers; readers have <release>-pondra-read)
+  annotations: {}
+  loadBalancerSourceRanges: []
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts: []               # e.g. [pondra.example.com]: the console and the HTTP API
+  tls: []
+
+podMonitor:               # (Prometheus Operator: each pod's GET /metrics, with the read token)
+  enabled: false
+  interval: 30s
+  labels: {}
+
+podDisruptionBudget:
+  enabled: true
+  maxUnavailable: 1
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}         # (a bucket's identity: eks.amazonaws.com/role-arn, iam.gke.io/gcp-service-account, …)
+
+# A stop hands the lead on and makes acknowledged writes durable; give it the time.
+terminationGracePeriodSeconds: 60
+podAnnotations: {}
+podLabels: {}
+priorityClassName: ""
+nodeSelector: {}
+tolerations: []
+affinity: {}              # (default: nodes on different machines where possible)
+topologySpreadConstraints: []
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  fsGroupChangePolicy: OnRootMismatch
+  seccompProfile: {type: RuntimeDefault}
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities: {drop: [ALL]}
+clusterDomain: cluster.local

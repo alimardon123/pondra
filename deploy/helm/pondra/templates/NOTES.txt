@@ -1,0 +1,20 @@
+{{- $full := include "pondra.fullname" . -}}
+Pondra: {{ include "pondra.replicas" . }} node{{ if gt (int (include "pondra.replicas" .)) 1 }}s{{ end }} on {{ .Values.lake | default "a folder lake (/data/lake)" }}{{ if gt (int .Values.readers.replicas) 0 }}, {{ .Values.readers.replicas }} reader(s){{ end }}.
+
+The console and the HTTP API, from this machine:
+
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ $full }} 8080
+  open http://localhost:8080
+{{- if .Values.auth.enabled }}
+
+The admin token (the console's Sign in; Bearer for HTTP; the password of Postgres's user admin):
+
+  kubectl -n {{ .Release.Namespace }} get secret {{ include "pondra.tokensSecret" . }} -o jsonpath='{.data.PONDRA_ADMIN_TOKEN}' | base64 -d
+{{- end }}
+{{- if .Values.postgres.enabled }}
+
+Postgres, inside the cluster: {{ $full }}.{{ .Release.Namespace }}.svc:{{ .Values.postgres.port }}
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ $full }} 5432 && psql "host=localhost user=admin dbname=lake"
+{{- end }}
+
+Which node leads, and who is in the cluster (with the port forwarded): curl -s localhost:8080/stats
