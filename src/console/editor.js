@@ -99,28 +99,30 @@ export class Editor {
     this.pre = h('pre', { class: 'hl', 'aria-hidden': 'true' });
     this.ta = h('textarea', { spellcheck: 'false', autocapitalize: 'off', autocomplete: 'off', 'aria-label': label, wrap: 'off', placeholder: this.placeholder });
     this.cur = h('div', { class: 'curline', 'aria-hidden': 'true' });
+    this.ghost = h('div', { class: 'selghost', 'aria-hidden': 'true' });
     this.nums = this.gutter ? h('pre', { class: 'nums', 'aria-hidden': 'true' }, this.numText = document.createTextNode('')) : null;
-    this.body = h('div', { class: 'code' }, this.cur, this.pre, this.ta);
+    this.body = h('div', { class: 'code' }, this.cur, this.ghost, this.pre, this.ta);
     this.el = h('div', { class: 'editor' + (this.grow ? ' fit' : ' fill') }, this.nums, this.body);
     this.ta.value = value;
     this.ta.addEventListener('input', () => { this.paint(); this.oninput?.(); this.reveal(); if (cm?.ed === this) complete(this); });
     this.ta.addEventListener('keydown', e => keys(e, this));
     for (const ev of ['keyup', 'mouseup', 'focus']) this.ta.addEventListener(ev, () => this.cursor());
-    this.ta.addEventListener('blur', () => { if (cm?.ed === this) closeComplete(); });
+    this.ta.addEventListener('focus', () => this.ghost.replaceChildren());
+    this.ta.addEventListener('blur', () => { if (cm?.ed === this) closeComplete(); this.unfocused(); });
     this.ta.addEventListener('scroll', () => { this.ta.scrollTop = 0; this.ta.scrollLeft = 0; }); // (the box scrolls, never the textarea: it is as big as its text)
     this.ta.addEventListener('contextmenu', e => { e.preventDefault(); this.contextMenu(e); });
     this.ta.addEventListener('mousemove', e => this.onhover?.(e));
     this.paint();
   }
-  /** Its right-click menu, as an application's: cut, copy, paste, select all, comment, and what its
-   * document adds (`menu`: running, formatting). */
+  /** Its right-click menu, as an application's: what its document runs first (`top`), then cut,
+   * copy, paste, select all, comment, and what else its document adds (`menu`: formatting, jobs). */
   contextMenu(at) {
     const ta = this.ta, some = ta.selectionStart !== ta.selectionEnd, mod = navigator.platform?.startsWith('Mac') ? 'Cmd' : 'Ctrl';
     const exec = cmd => { ta.focus(); document.execCommand(cmd); };
-    menu(at, [{ label: 'Cut', keys: `${mod} X`, disabled: !some, run: () => exec('cut') }, { label: 'Copy', icon: 'copy', keys: `${mod} C`, disabled: !some, run: () => exec('copy') },
+    menu(at, [...this.top?.(some) || [], '-', { label: 'Cut', keys: `${mod} X`, disabled: !some, run: () => exec('cut') }, { label: 'Copy', icon: 'copy', keys: `${mod} C`, disabled: !some, run: () => exec('copy') },
       { label: 'Paste', keys: `${mod} V`, run: () => navigator.clipboard?.readText ? navigator.clipboard.readText().then(t => { ta.focus(); insert(ta, t); }, () => toast(`${mod}+V pastes here`)) : toast(`${mod}+V pastes here`) },
       { label: 'Select all', keys: `${mod} A`, run: () => { ta.focus(); ta.select(); } }, '-',
-      this.language !== 'markdown' ? { label: 'Comment the lines, or uncomment them', keys: `${mod} /`, run: () => { ta.focus(); comment(this); } } : null,
+      this.language !== 'markdown' ? { label: 'Comment / Uncomment', keys: `${mod} /`, run: () => { ta.focus(); comment(this); } } : null, '-',
       ...this.menu?.(some) || []]);
   }
   /** Replace what is selected (or, with nothing selected or `whole`, all of it) by `f` of it (`f`
@@ -147,8 +149,21 @@ export class Editor {
     const some = !!this.selected();
     return [{ label: `Format ${what}`, icon: 'format', keys: some ? null : 'Shift Alt F', run: () => this.reformat(f, true) }, some || always ? { label: 'Format selection', keys: some ? 'Shift Alt F' : null, disabled: !some, run: () => this.reformat(f) } : null];
   }
+  /** A textarea without the focus shows no selection (a menu opened from it, Run ▾, a click
+   * elsewhere): its lines are drawn under the text instead, a lighter tint, until it has it again. */
+  unfocused() {
+    const ta = this.ta, a = ta.selectionStart, b = ta.selectionEnd;
+    if (a === b || document.activeElement === ta) return; // (the window went to the back: the browser still draws it)
+    const v = ta.value, w = measure(), start = v.lastIndexOf('\n', a - 1) + 1, first = v.slice(0, a).split('\n').length - 1;
+    const col = (s, n) => { let x = 0; for (let i = 0; i < n; i++) x = s[i] === '\t' ? (Math.floor(x / 4) + 1) * 4 : x + 1; return x; }; // (tab-size 4)
+    const lines = v.slice(start, b).split('\n'), last = lines.length - 1; // (whole lines but the last, which ends where the selection does)
+    this.ghost.innerHTML = lines.map((s, k) => {
+      const from = k ? 0 : col(s, a - start), to = col(s, s.length) + (k < last ? 0.6 : 0); // (a sliver for each line's newline)
+      return to > from ? `<div style="top:${9 + (first + k) * LINE_H}px;left:${14 + from * w}px;width:${(to - from) * w}px"></div>` : '';
+    }).join('');
+  }
   get value() { return this.ta.value; }
-  set value(v) { this.ta.value = v; this.paint(); }
+  set value(v) { this.ta.value = v; this.ghost.replaceChildren(); this.paint(); }
   setLanguage(l) { this.language = l; this.src = []; this.html = []; this.states = ['']; this.pre.replaceChildren(); this.paint(); }
   /** Highlight again the lines that changed (and those after them whose state they changed);
    * size the box to the text: its width in steps, as a new width lays the whole file out again. */
@@ -261,7 +276,7 @@ function keys(e, ed) {
 const FUNCS = 'abs avg ceil coalesce concat count date_bin date_part date_trunc extract floor greatest least length lower ltrim max min now nullif regexp_replace replace round row_number rank dense_rank lag lead first_value last_value split_part stddev strpos substr sum to_char to_date to_timestamp trim upper approx_distinct approx_percentile_cont median array_agg string_agg json_get json_get_str cosine_distance read_parquet read_csv read_json files file_read range generate_series'.split(' ');
 let cm = null; // (the completion open now: its editor, where the word starts, the choices, the one on)
 /** Names that complete the word before the caret: the lake's tables and columns (those of the
- * tables the text names first), SQL's words and functions; in Python, the page's variables. */
+ * tables the text names first), SQL's words and functions; in Python, its tab's variables. */
 export function complete(ed, force) {
   const ta = ed.ta, at = ta.selectionStart, before = ta.value.slice(0, at), m = before.match(/[\w.$"]*$/), word = m[0].replace(/"/g, '');
   if (!word && !force) return false;
@@ -286,7 +301,7 @@ export function complete(ed, force) {
     for (const f of FUNCS) push(f + '(', 'function', 3);
     for (const k of SQL_KW) push(/[a-z]/.test(word) ? k.toLowerCase() : k, '', 4);
   } else if (ed.language === 'python') {
-    for (const v of S.vars || []) push(v.name, v.type, 0);
+    for (const v of S.doc?.vars || []) push(v.name, v.type, 0);
     for (const x of ['db.sql(', 'db.table(', 'db.tables()', 'db.insert(', 'pondra.col(', 'print(']) push(x, '', 1);
     for (const k of PY_KW) push(k, '', 2);
   } else return false;

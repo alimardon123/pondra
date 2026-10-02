@@ -223,6 +223,8 @@ def failure(e, head):
     where = [f"  line {f.lineno}: {lines[f.lineno - 1].strip()}" for f in traceback.extract_tb(e.__traceback__) if f.filename == here and 0 < f.lineno <= len(lines)]
     traceback.print_exception(type(e), e, e.__traceback__, file=sys.stderr)  # (the whole of it: the node's log)
     said = "Interrupted" if isinstance(e, KeyboardInterrupt) else f"{type(e).__name__}: {e}"
+    if isinstance(e, SyntaxError) and e.filename == here and e.lineno and e.text:  # (Python's own words name the body "<do>": its line instead)
+        said, where = f"{type(e).__name__}: {e.msg}", [f"  line {e.lineno}: {e.text.strip()}"]
     return said + "".join("\n" + w for w in where[-3:])
 
 
