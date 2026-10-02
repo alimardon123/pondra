@@ -1,0 +1,8 @@
+18 {'rows': True, 'every row a real group': True, "sort key as DuckDB's": True}
+22 {'rows': True, 'every row a real group': True, "sort key as DuckDB's": True}
+32 {'rows': True, 'every row a real group': True, "sort key as DuckDB's": True}
+33 {'rows': True, 'every row a real group': True, "sort key as DuckDB's": True}
+39 {'rows': True, 'every row a real group': True, "sort key as DuckDB's": True}
+40 {'rows': True, 'every row a real group': True, "sort key as DuckDB's": True}
+41 {'rows': True, 'every row a real group': True, "sort key as DuckDB's": True}
+{"duckdb": "1.5.5", "ok": true}

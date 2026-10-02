@@ -82,7 +82,7 @@ tools/    harness.py, cluster.py (tests), open_check.py (Delta + Iceberg readers
           newuser_bench.py (first reads, new nodes), demo_lake.py (one of everything + the tree),
           serve_bench.py + loadgen.go (serving), bench/tpch.py (TPC-H vs DuckDB and Spark),
           sizes.py, sim_r2.py (local S3 with R2 latency), udf_server.py (a function of your own,
-          in Python, over Arrow Flight), bench/singlenode.py (TPC-H vs DuckDB, Polars, Daft, Bodo),
+          in Python, over Arrow Flight), bench/singlenode.py (TPC-H and ClickBench vs DuckDB, Polars, Daft, Bodo; bench/clickbench_ties.py: its answers that differ are ties),
           metadata_bench.py (a table with a million files), flight_bench.py (Arrow Flight),
           shuffle_spill.py (a shuffle bigger than memory, and one that loses a node),
           join_order.py (the same queries written badly: same answers, no slower),
@@ -1311,6 +1311,21 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    Arrow, a 10-row ClickBench answer 220 MB (and too big for the result cache).
    `harness.py found`: "a few rows of a table's, sent as Arrow (HTTP, Flight), carry only their own
    strings".
+203. **A hot batch is skipped only when its ranges rule it out, and its filters stay above**
+   (`hot::HotSource`, `Skip`): every hot column of an ordered type (integers, dates, times,
+   decimals; not floats or strings) keeps each 8,192-row batch's least and greatest value, NULLs
+   and rows, and a scan skips the batches its pushed filters can't match, as a Parquet scan skips
+   row groups (`PruningPredicate`), while saying `PushedDown::No`, so every row is still filtered
+   above. A fetch turns skipping off. A dynamic filter is looked at again as it moves, soon at
+   first and then ever later (a top-N moves its bound after every batch, and each look costs about
+   a batch). A top-N reads the batches in its first key's order (`TopFirst`, through filters,
+   projections and exchanges; DataFusion's own sort pushdown stops at a filter), never a scan with
+   a fetch, and its sort stays above: only the batches' order changes. The source never shows its
+   predicate (`apply_expressions`): a join builds its dynamic filter only for a plan that shows it, and
+   building them made TPC-H from memory a tenth slower. `harness.py hot`: a range of the time, a
+   top-N either way (through a filter too) and a key skip batches, and NULL-sensitive filters over
+   a batch of NULLs answer as the model does (fails on a build without it; the newest rows skip
+   nothing without `TopFirst`).
 
 ## Tests: run these before and after any change
 
@@ -1323,6 +1338,7 @@ python3 tools/fuzz_doors.py --secs 60   # malformed input at HTTP, SQL, Postgres
 python3 tools/harness.py versions       # every file keeps its versions: listed, read, restored, after a delete, retention, old notebooks
 python3 tools/harness.py stopped        # a run whose node was killed under it: stopped, not running for good
 python3 tools/harness.py variables      # DECLARE $x, $x = …, SET VARIABLE, getvariable: sessions, Postgres, procedures, file runs, db.vars, pondra.parameters
+python3 tools/harness.py hot            # hot columns skip batches by their ranges (a time range, a top-N either way, a key); NULL filters == the model
 python3 tools/harness.py sparksql       # spark.sql / spark_sql('…') in Spark's grammar: literals, LATERAL VIEW, Spark's floor and substring, frames on top, refusals
 python3 tools/harness.py flows          # views of views in one commit, rollups, expectations (keep, drop, fail), changes down the flow
 python3 tools/harness.py begin          # BEGIN … COMMIT from every door, read-your-writes, 40001 and retries, 25P02, SQLSTATEs

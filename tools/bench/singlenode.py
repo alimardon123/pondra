@@ -278,11 +278,7 @@ def pondra_up(lake, hot, qs):
         for run in range(2):  # (the cache takes a file the second time a scan wants it)
             for q, sql in qs.items():
                 harness.call(A.port, "POST", "/sql", (sql + f" -- warm {run}").encode(), timeout=3600)
-        held = lambda: float(re.search(rb"\npondra_hot_bytes (\S+)", harness.call(A.port, "GET", "/metrics")).group(1))
-        last = -1
-        while held() != last:  # (loading runs in the background, a file at a time)
-            last = held()
-            time.sleep(2)
+        harness.hot_settled(A.port)  # (loading runs in the background, a file at a time)
     return node, time.time() - t0
 
 

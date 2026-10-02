@@ -445,6 +445,8 @@ pub fn physical_rules() -> Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> {
     let at = rules.iter().position(|r| r.name() == "join_selection").map_or(0, |i| i + 1);
     rules.insert(at, Arc::new(HavingBuilds));
     rules.insert(at + 1, Arc::new(crate::asof::Rule)); // (before the rules that add exchanges: it asks for its own)
+    let end = rules.iter().position(|r| r.name() == "SanityCheckPlan").unwrap_or(rules.len());
+    rules.insert(end, Arc::new(crate::hot::TopFirst)); // (after DataFusion's own sort pushdown)
     rules
 }
 

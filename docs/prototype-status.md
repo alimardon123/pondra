@@ -72,6 +72,41 @@ optimizing; performance first):
    keep queries that move nothing on one node (6 nodes: q12 0.50 s spread against 0.98 s, q19
    0.68 s against 1.07 s, q3 0.67 s against 0.95 s); its next runs log each decision
    (`PONDRA_DEBUG_SPREAD`, the nodes' logs kept), to set that from what the steps take.
+9. **Answers carry only their own strings** (invariant 202): a string read from a file is a view
+   into a buffer the whole page shares, and Arrow IPC sends every buffer a view points into, so a
+   few rows took their pages with them. An answer, every IPC stream, Flight's streams and a
+   shuffle's pieces now copy out views whose buffers are mostly other rows'. A `LIMIT 5` of a
+   50,000-row table was 3.2 MB as Arrow, now under 16 KB; ClickBench's 10-row answers were up to
+   220 MB, too big for the result cache.
+10. **Hot batches skipped by their ranges, a top-N read in its key's order** (invariant 203,
+   `hot::HotSource`, `TopFirst`): each 8,192-row batch of a hot column of an ordered type keeps its
+   least and greatest value, NULLs and rows, and a scan skips the batches its filters rule out, as a
+   Parquet scan skips row groups. A top-N's bound skips them too, and it reads the batches in its
+   first key's order, so the bound is tight after the first few. The filters stay above the scan,
+   so every row is still checked. With every column hot and the build before alternated, 10 runs
+   each: ClickBench's two top-N by time (q25, q27) 0.029 → 0.007 s and 0.027 → 0.006 s, where
+   DuckDB's own tables take 0.007 and 0.006 s; the 43 about 3% faster in all; TPC-H and TPC-DS
+   from memory the same within noise (the queries one pass showed slower, re-timed alone: TPC-DS
+   q66, q78, q93, TPC-H q19, q12, q7; q7 with skipping on and off in one build, 30 runs each six
+   times over, 0.051 against 0.050 s, not a significant difference). Looking costs about 2 µs a
+   batch when nothing can be skipped: 0.3 ms per partition of `lineitem` at SF1, before its first
+   batch. The first version looked at a moving bound again after every
+   batch, which made those two top-N slower than before; it now looks soon at first and then ever
+   later. `harness.py hot` checks the answers against a model (NULLs, `IS DISTINCT FROM`, `IN`, a
+   top-N either way, through a filter) and that batches were skipped.
+11. **ClickBench, measured** (`tools/bench/singlenode.py --suite clickbench`: the first 10 million
+   rows of `hits`, 43 queries, best of 3, this 4-core, 15 GB machine; `logs/round32/`): Pondra
+   from memory 8.22 s, from files 12.25 s; DuckDB 1.5.5 over the Parquet file 11.11 s, in its own
+   tables 7.18 s; DuckDB 2.0's preview 10.89 s and 6.22 s. The 7 answers that differ from DuckDB's
+   are ties a `LIMIT` cuts through (`tools/bench/clickbench_ties.py`: the same row count, every row
+   a real group, the sort key's values the same). Pondra is ahead on the regular expression (q29:
+   1.49 s against 3.12 s) and the `LIKE` counts (q21, q22); DuckDB's own tables are far ahead where
+   a filter keeps few rows of many columns: q24 (`SELECT *` of a top-N, 1.27 s against 0.11 s:
+   DuckDB fetches the other columns only for the rows it keeps), q23, and the pages of one counter
+   (q37 to q43, 3 to 5×). Those are next.
+12. **TPC-H SF1, the same day** (`logs/round32/tpch-sf1*.json`): Pondra from memory 1.22 s, from
+   files 2.18 s; DuckDB 1.5.5 over Parquet 2.19 s, its own tables 1.05 s; DuckDB 2.0's preview
+   1.98 s and 0.92 s; Polars 1.44 1.92 s. Every answer equal to DuckDB's.
 
 **Then (2026-10-01, round 31, second part so far; 0.29.0): every kind of object alike, SQL and
 Python in one notebook** (the owner's list after the first part):
