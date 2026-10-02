@@ -8,11 +8,12 @@ name: resilience
 # binary the build workflow made for this commit (tools/ci_artifact.sh waits for it): nothing is
 # compiled here.
 #
-# A pull request runs it only when what it puts under failure changes: the node, the clients, the
-# check itself.
+# A pull request runs it when it asks for CI (the label `ci` or `full-ci`: build.yml) and what it
+# puts under failure changes: the node, the clients, the check itself.
 on:
   pull_request:
     branches: [main]
+    types: [opened, synchronize, reopened, labeled] # (labeled: `ci` or `full-ci` added)
     paths:
       - src/**
       - Cargo.toml
@@ -28,7 +29,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: resilience-${{ github.event.pull_request.number || github.ref }}
+  group: resilience-${{ github.event.pull_request.number || github.ref }}${{ github.event.action == 'labeled' && github.event.label.name != 'ci' && github.event.label.name != 'full-ci' && format('-{0}', github.run_id) || '' }}
   cancel-in-progress: true
 
 permissions:
@@ -42,6 +43,10 @@ env:
 jobs:
   check:
     name: resilience (${{ matrix.parts }})
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.event.action == 'labeled' && (github.event.label.name == 'ci' || github.event.label.name == 'full-ci')) ||
+      (github.event.action != 'labeled' && (contains(github.event.pull_request.labels.*.name, 'ci') || contains(github.event.pull_request.labels.*.name, 'full-ci')))
     strategy:
       fail-fast: false
       matrix:

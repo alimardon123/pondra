@@ -14,8 +14,8 @@ name: deploy
 # <owner>/scoop-pondra (the secret PACKAGES_TOKEN: contents read and write on both), and a pull
 # request to microsoft/winget-pkgs (the secret WINGET_TOKEN: a classic token with public_repo).
 #
-# A pull request runs it only when what it tries changes, and its macOS, Windows and arm64 parts
-# need that pull request's build of every platform: the label `full-ci` (build.yml's `plan`).
+# A pull request runs it when it has the label `full-ci` (its build of every platform: build.yml)
+# and what it tries changes.
 on:
   pull_request:
     branches: [main]
@@ -54,7 +54,7 @@ env:
 jobs:
   image:
     name: image, compose and chart
-    if: github.event.action != 'labeled' || github.event.label.name == 'full-ci'
+    if: github.event_name != 'pull_request' || (contains(github.event.pull_request.labels.*.name, 'full-ci') && (github.event.action != 'labeled' || github.event.label.name == 'full-ci'))
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
@@ -83,7 +83,7 @@ jobs:
 
   service:
     name: pondra service (${{ matrix.platform }})
-    if: github.event.action != 'labeled' || github.event.label.name == 'full-ci'
+    if: github.event_name != 'pull_request' || (contains(github.event.pull_request.labels.*.name, 'full-ci') && (github.event.action != 'labeled' || github.event.label.name == 'full-ci'))
     strategy:
       fail-fast: false
       matrix:

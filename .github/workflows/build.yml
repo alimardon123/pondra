@@ -6,32 +6,36 @@ name: build
 # packages installed and tried as users get them (tools/try_packages.sh). The Linux job then runs
 # the suite on its binary, while the others finish (the slowest, macOS Intel, doesn't hold it up).
 # A tag's release (release.yml) publishes this run's packages: nothing is built twice, and what
-# the suite tested is what ships. A pull request's push builds Linux alone, with the suite, and a
-# newer push stops its older run: the runners are shared by every branch, and macOS and Windows
-# queue longest. The other four are built once before it merges, when asked (`plan`, below).
+# the suite tested is what ships. A pull request's push runs nothing (its thread builds and tests
+# where it works), unless the pull request asks: the label `ci` builds linux-x64 with the suite,
+# and `full-ci` all five, as main would, once before it merges. Decided from the labels alone, so a
+# push that asks for nothing never waits for a runner to say so; a newer push stops the older run.
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
-    types: [opened, synchronize, reopened, labeled] # (labeled: `full-ci` added)
+    types: [opened, synchronize, reopened, labeled] # (labeled: `ci` or `full-ci` added)
   workflow_dispatch:
 
 # A pull request's runs share a group, so a newer push (or `full-ci` added) stops the older run;
 # main's never do (each push's packages may be a release's), nor does another label added.
 concurrency:
-  group: build-${{ github.event.pull_request.number || github.run_id }}${{ github.event.action == 'labeled' && github.event.label.name != 'full-ci' && format('-{0}', github.run_id) || '' }}
+  group: build-${{ github.event.pull_request.number || github.run_id }}${{ github.event.action == 'labeled' && github.event.label.name != 'ci' && github.event.label.name != 'full-ci' && format('-{0}', github.run_id) || '' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   # What this run builds. A push to main whose code a pull request's run already built and tested
   # on every platform (the merge changed nothing in it: the branch was up to date with main)
   # builds nothing: release.yml and cluster-bench.yml take that run's packages (tools/ci_build.sh
-  # finds them by the commit's tree). Otherwise main builds all five. A pull request builds
-  # linux-x64 alone, unless it has the label `full-ci` or its newest commit's message says
-  # `[full-ci]`: then all five, as main would (and main reuses that run when the tree is the same).
+  # finds them by the commit's tree). Otherwise main builds all five. A pull request labelled `ci`
+  # builds linux-x64; labelled `full-ci`, all five (and main reuses that run when the tree is the
+  # same); with neither, this job and the build are skipped.
   plan:
-    if: github.event.action != 'labeled' || github.event.label.name == 'full-ci'
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.event.action == 'labeled' && (github.event.label.name == 'ci' || github.event.label.name == 'full-ci')) ||
+      (github.event.action != 'labeled' && (contains(github.event.pull_request.labels.*.name, 'ci') || contains(github.event.pull_request.labels.*.name, 'full-ci')))
     runs-on: ubuntu-24.04
     permissions:
       actions: read
@@ -44,8 +48,7 @@ jobs:
       - id: plan
         env:
           GH_TOKEN: ${{ github.token }}
-          HEAD: ${{ github.event.pull_request.head.sha }}
-          LABELED: ${{ contains(github.event.pull_request.labels.*.name, 'full-ci') }}
+          FULL: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'full-ci') }}
         run: |
           # (linux-x64 pinned: ubuntu-latest becomes 26.04 from 2026-10-19; moved on purpose, after a
           # green run there. macos-13 was retired; Intel images last until 2027.)
@@ -55,16 +58,13 @@ jobs:
             {"platform": "macos-x64", "os": "macos-15-intel", "target": "x86_64-apple-darwin"},
             {"platform": "macos-arm64", "os": "macos-latest", "target": "aarch64-apple-darwin"},
             {"platform": "windows-x64", "os": "windows-latest", "target": "x86_64-pc-windows-msvc", "exe": ".exe"}]'
-          full=true
           if [ "$GITHUB_EVENT_NAME" = push ]; then
             run=$(bash tools/ci_build.sh "$GITHUB_SHA")
             echo "run=$run" >> "$GITHUB_OUTPUT"
             if [ -n "$run" ]; then echo "Built and tested already: https://github.com/$GITHUB_REPOSITORY/actions/runs/$run" >> "$GITHUB_STEP_SUMMARY"; fi
-          elif [ "$GITHUB_EVENT_NAME" = pull_request ] && [ "$LABELED" != true ] && ! gh api "repos/$GITHUB_REPOSITORY/commits/$HEAD" --jq .commit.message | grep -qF '[full-ci]'; then
-            full=false
-            echo "Linux alone. Before merging, build all five platforms once: the label \`full-ci\` on the pull request, or \`[full-ci]\` in a commit's message." >> "$GITHUB_STEP_SUMMARY"
           fi
-          echo "matrix=$(jq -c --argjson full $full '{include: [.[] | select($full or .platform == "linux-x64")]}' <<< "$platforms")" >> "$GITHUB_OUTPUT"
+          if [ "$FULL" != true ]; then echo "linux-x64 alone (the label \`ci\`). Before merging, the label \`full-ci\` builds all five platforms." >> "$GITHUB_STEP_SUMMARY"; fi
+          echo "matrix=$(jq -c --argjson full "$FULL" '{include: [.[] | select($full or .platform == "linux-x64")]}' <<< "$platforms")" >> "$GITHUB_OUTPUT"
 
   build:
     needs: plan

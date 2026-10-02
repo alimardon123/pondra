@@ -24,10 +24,10 @@ for _ in $(seq 150); do
     echo "pondra-$platform from https://github.com/$repo/actions/runs/$run:" && ls dist
     exit 0
   fi
-  # (a pull request's push builds linux-x64 alone: build.yml's `plan` has made its jobs, and not this one)
+  # (a pull request labelled `ci` builds linux-x64 alone: build.yml's `plan` has made its jobs, and not this one)
   jobs=$([ -n "$run" ] && gh api "repos/$repo/actions/runs/$run/jobs" --jq '.jobs[] | "\(.name) \(.status)"' 2>/dev/null || true)
   if grep -qx 'plan completed' <<< "$jobs" && grep -q '^linux-x64' <<< "$jobs" && ! grep -q "^$platform " <<< "$jobs"; then
-    echo "::error::build run $run builds linux-x64 alone: add the label full-ci to the pull request (or [full-ci] to a commit's message) to build $platform" && exit 1
+    echo "::error::build run $run builds linux-x64 alone: the label full-ci on the pull request builds $platform" && exit 1
   fi
   if [ -n "$run" ] && [ "$status" = completed ]; then
     echo "::error::build run $run of $sha ended without pondra-$platform's packages" && exit 1
