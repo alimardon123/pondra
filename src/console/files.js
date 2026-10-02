@@ -1,10 +1,10 @@
 // The Workspace and its files (ADR-034): the lake's own files, as a tree; SQL, Python, data and
 // text files open in tabs, are edited there and saved back in place (`PUT /files` with
 // `If-Match`: replaced only if nobody saved it meanwhile).
-import { h, fill, icon, svg, secs, count, bytes, utc, S, R, emit, call, run, rows, fileUrl, fileSql, toast, menu, prompt, saveAs, MODE, DATA, store, failed, readFile, writeFile } from './core.js';
-import { Editor, formatSql } from './editor.js';
-import { grid, copyText, COPIES, split, DOWNLOADS, fetchRows } from './grid.js';
-import { answer, doneText, openPlain } from './notebook.js';
+import { h, icon, svg, count, bytes, utc, S, R, emit, call, run, rows, fileUrl, fileSql, toast, menu, prompt, saveAs, DATA, failed, readFile, writeFile, renamed, crumbs, renaming } from './core.js';
+import { Editor } from './editor.js';
+import { copyText } from './grid.js';
+import { openPlain } from './notebook.js';
 
 const base = p => p.split('/').pop();
 /** An empty folder is a zero-byte object, `<folder>/.folder` (object storage has no folders): the tree and the search leave it out. */
@@ -98,9 +98,9 @@ function fileMenu(e, f, kind) {
   menu(e, [kind !== 'file' ? { label: 'Open', icon: iconOf(f.notebook ? 'x.ipynb' : f.rel), run: () => R.helpers.openFile(f.rel) } : null,
     { label: 'Details', icon: 'eye', run: () => R.helpers.pick({ type: 'file', f }) },
     kind === 'data' ? { label: 'Query with SQL', icon: 'play', run: () => R.helpers.query(`SELECT * FROM ${fileSql(f.rel)} LIMIT 1000`) } : null, '-',
-    !f.notebook ? { label: 'Rename…', icon: 'pencil', run: () => later(m => m.rename(f.rel)) } : null,
+    !f.notebook ? { label: 'Rename…', icon: 'pencil', run: () => import('./rename.js').then(m => m.rename(f.rel)) } : null,
     !f.notebook ? { label: 'Download', icon: 'down', run: () => download(f.rel) } : null, { label: 'Versions…', icon: 'clock', run: () => R.helpers.versions({ path: f.notebook ? f.rel + '.ipynb' : f.rel }) },
-    { label: 'Copy the path', icon: 'copy', run: () => copyText('files/' + f.rel, 'Path copied') }, '-',
+    { label: 'Copy path', icon: 'copy', run: () => copyText('files/' + f.rel, 'Path copied') }, '-',
     { label: f.notebook ? 'Delete every version…' : 'Delete…', icon: 'trash', run: () => later(m => m.remove(f)) }]);
 }
 function folderMenu(e, at) {
@@ -137,6 +137,7 @@ export class TextDoc {
   async reload() { if (!this.path) return; const f = await readFile(this.path); this.ed.value = f.text; this.version = f.version; this.dirty = false; this.paramsBar?.(); emit('changed', this); }
   /** Save it where it is (a new file asks where first). */
   async save(as) {
+    await this.naming;
     let path = this.path;
     if (!path || as) {
       path = await prompt(as ? 'Save as' : 'Save', 'Where, under the lake\'s files', path || this.untitled);
@@ -151,17 +152,16 @@ export class TextDoc {
     emit('changed', this); emit('saved', this, 'files/' + path);
     return true;
   }
-  crumbs() {
-    const parts = (this.path || this.untitled).split('/');
-    return [...parts.slice(0, -1).flatMap(p => [h('span', { class: 'crumb' }, p), h('span', { class: 'slash' }, '/')]), h('b', { class: 'crumb cur' }, parts.at(-1))];
-  }
+  crumbs() { return crumbs(this); }
+  rename(name) { return renamed(this, name); }
   /** The menus' items that make something of the file: a table or a view of its query (SQL), a job, a schedule, a copy. */
   jobs(sql, saveAs = true) {
     return [sql ? { label: 'Create as table or view…', icon: 'plus', run: () => R.helpers.createAs(this.current()) } : null, { label: 'Run as a job', icon: 'play', run: () => R.helpers.job(this) },
       { label: 'Schedule…', icon: 'clock', run: () => R.helpers.schedule(this) }, saveAs ? '-' : null, saveAs ? { label: 'Save as…', icon: 'save', run: () => this.save(true) } : null];
   }
   more() {
-    return [{ label: 'Save as…', icon: 'save', run: () => this.save(true) }, this.path ? { label: 'Versions…', icon: 'clock', run: () => R.helpers.versions(this) } : null, this.path ? { label: 'Download', icon: 'down', run: () => saveAs(this.ed.value, 'text/plain', this.title) } : null];
+    return [{ label: 'Save as…', icon: 'save', run: () => this.save(true) }, { label: 'Rename…', icon: 'pencil', run: renaming }, this.path ? { label: 'Versions…', icon: 'clock', run: () => R.helpers.versions(this) } : null,
+      this.path ? { label: 'Download', icon: 'down', run: () => saveAs(this.ed.value, 'text/plain', this.title) } : null, this.path ? { label: 'Copy path', icon: 'copy', run: () => copyText('files/' + this.path, 'Path copied') } : null];
   }
   /** A Markdown file drawn (md.js), or its text again. */
   preview(on) {
@@ -203,149 +203,8 @@ export function splitPanel(doc, panel) {
   place();
 }
 
-// ------------------------------------------------------------------ a SQL file: its results below
-export const said = x => x.kind === 'rows' ? `${count(x.total)} row${x.total === 1 ? '' : 's'}` : x.kind === 'error' ? 'failed' : 'done';
-export class SqlDoc extends TextDoc {
-  constructor(o = {}) {
-    super({ ...o, kind: 'sql', language: 'sql', untitled: o.untitled || 'queries/untitled.sql' });
-    this.layout = R.helpers.prefs('results') || 'below';
-    this.tab = 'results'; this.result = null;
-    this.body = h('div', { class: 'pbody' });
-    this.tabs = h('div', { class: 'ptabs', role: 'tablist' });
-    this.info = h('div', { class: 'pinfo' });
-    this.panel = h('section', { class: 'panel results', 'aria-label': 'Results' }, h('div', { class: 'phead' }, this.tabs, h('span', { class: 'grow' }), this.info), this.body);
-    this.pbar = h('div', { class: 'params', role: 'group', 'aria-label': 'Parameters', hidden: true });
-    this.main.prepend(this.pbar);
-    splitPanel(this, this.panel);
-    this.ed.menu = some => ['-', ...this.runItems(some), this.explainItem(), ...this.ed.formats(formatSql, 'file', true), '-', ...this.jobs(true)];
-    this.ed.onhover = e => /\$[A-Za-z_]/.test(this.ed.value) && import('./params.js').then(m => m.hover(this, e));
-    this.draw(); this.paramsBar();
-  }
-  /** The statement the caret is in (just after its `;` too), and where it starts. */
-  statementAt() {
-    const v = this.ed.value, at = this.ed.ta.selectionStart;
-    let seek = 0, last = ['', 0];
-    for (const q of statements(v)) { const i = v.indexOf(q, seek); if (i < 0) continue; seek = i + q.length; last = [q, i]; if (at <= seek + 1) break; }
-    return last;
-  }
-  /** What is selected, or the statement the caret is in: what Explain and Create as… take. */
-  current() { return this.ed.selected() || this.statementAt()[0]; }
-  /** Explain: the plan of the statement selected, or the one the caret is in, without running it. */
-  explain() { const x = R.helpers.explain(this.current(), this.params()); this.results = [x]; this.result = x; this.todo = 1; this.tab = 'results'; this.draw(); R.helpers.pane('bottom', true); }
-  /** Run the file, Run statement: the keys each takes as Settings say (a selection: Ctrl+Enter). */
-  runItems(some, both) {
-    const st = R.helpers.prefs('enter') === 'statement', go = what => () => { const ta = this.ed.ta; ta.setSelectionRange(ta.selectionStart, ta.selectionStart); this.run(what); };
-    return [some && !both ? { label: 'Run selection', icon: 'play', keys: 'Ctrl Enter', run: () => this.run() } : null, { label: 'Run file', icon: both ? null : 'play', keys: some ? null : st ? null : 'Ctrl Enter', run: go('file') },
-      { label: 'Run statement', keys: some ? 'Ctrl Shift Enter' : st ? 'Ctrl Enter' : 'Ctrl Shift Enter', run: go('statement') }];
-  }
-  explainItem() { return { label: 'Explain: its plan, not run', icon: 'plan', keys: 'Ctrl Shift E', run: () => this.explain() }; }
-  /** Format the SQL selected (or all of it): its words in capitals, a clause a line. */
-  format() { this.ed.reformat(formatSql); }
-  key(e) {
-    if (e.shiftKey && e.altKey && e.key.toLowerCase() === 'f') { e.preventDefault(); this.format(); return true; }
-    if (e.shiftKey && (e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'e') { e.preventDefault(); this.explain(); return true; }
-    if (e.shiftKey && (e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); this.run('statement'); return true; }
-    return super.key(e);
-  }
-  get hasPanel() { return true; }
-  changed() { super.changed(); clearTimeout(this.pt); this.pt = setTimeout(() => { this.paramsBar(); this.marks(); }, 250); }
-  /** The file's parameters, an input each above the editor (params.js, loaded once it says `$name`). */
-  paramsBar() { if (/\$[A-Za-z_]/.test(this.ed.value) || !this.pbar.hidden) import('./params.js').then(m => m.bar(this)); }
-  /** The values its runs send for its parameters (as the bar has them). */
-  params() { return this.given || {}; }
-  /** Run what is selected, else the file or the statement the caret is in (`what`, else as Settings
-   * say Ctrl+Enter does): each statement its own answer (in order, stopping at a failure), or, as
-   * Settings may say, all of it at once, the last one's answer. */
-  async run(what) {
-    const sel = this.ed.selected(), [whole, from] = sel ? [sel, this.ed.ta.selectionStart] : (what || R.helpers.prefs('enter')) === 'statement' ? this.statementAt() : [this.ed.value, 0], text = whole.trim();
-    if (!text) return;
-    this.ctl?.abort();
-    const ctl = this.ctl = new AbortController(), each = (R.helpers.prefs('statements') || 'each') === 'each';
-    const list = each ? statements(text) : [text];
-    let seek = 0;
-    const places = list.map(q => { const at = whole.indexOf(q, seek); seek = at < 0 ? seek : at + q.length; return at < 0 ? null : [from + at, from + at + q.length]; }); // (where each is, to point at it)
-    this.running = true; this.plan = null; this.results = []; this.result = null; this.todo = list.length; R.helpers.toolbar();
-    this.body.replaceChildren(h('div', { class: 'wait pulse' }, 'Running…'));
-    emit('run', { kind: 'sql', src: text, doc: this });
-    let r;
-    const values = this.params();
-    for (const sql of list.length ? list : [text]) {
-      const t0 = performance.now();
-      try { r = await run(sql, ctl.signal, values, S.pageRows); } catch (e) { r = failed(e); }
-      if (this.ctl !== ctl) return;
-      r.ms = performance.now() - t0; r.sql = sql; r.at = places[this.results.length]; r.params = values;
-      this.results.push(r); this.result = r;
-      if (list.length > 1 && this.tab === 'messages' && r.kind === 'rows') this.tab = 'results';
-      this.draw();
-      if (r.kind === 'error') break;
-    }
-    this.ctl = null; this.running = false;
-    if (this.results.length === 1 && r.kind !== 'rows' && this.tab === 'results' && r.kind !== 'error') this.tab = 'messages';
-    if (r.kind === 'rows' && this.tab === 'messages') this.tab = 'results';
-    R.helpers.toolbar(); R.helpers.pane('bottom', true);
-    this.draw();
-    emit('ran', { kind: 'sql', src: text, doc: this }, r, { kind: 'sql', src: text });
-    return r;
-  }
-  stop() { this.ctl?.abort(); this.ctl = null; this.running = false; this.body.replaceChildren(h('div', { class: 'wait' }, 'Stopped waiting. (A statement already on its way may still finish on the node.)')); R.helpers.toolbar(); }
-  /** Point at a statement that ran: the caret at its start, in sight, if the text there is still
-   * it (not selected: Run would then run it alone). */
-  point(x) { const [a, b] = x.at || []; if (a != null && this.ed.value.slice(a, b) === x.sql) { this.ed.focus(); this.ed.ta.setSelectionRange(a, a); this.ed.reveal(); } }
-  /** Each answer's number beside its statement in the file (while the text there is still it), the
-   * one shown (or `hover`ed) with its lines tinted. */
-  marks(hover) { if (this.results?.length > 1 || this.ed.marks) import('./stmts.js').then(m => m.marks(this, hover)); }
-  /** The panel: Results (the grid), Messages (each statement: what it printed and did), Chart, Data
-   * profile (each column's NULLs, distinct values, range and spread) and Plan (a graph of EXPLAIN,
-   * and its query profile: the time each step took). */
-  draw() {
-    const r = this.result, tab = (id, label, ic) => h('button', { class: 'ptab' + (this.tab === id ? ' on' : ''), role: 'tab', 'aria-label': label, 'aria-selected': String(this.tab === id), onclick: () => { this.tab = id; this.draw(); } }, ic ? icon(ic) : null, h('span', { class: 'tl' }, label));
-    this.marks();
-    this.tabs.replaceChildren(tab('results', 'Results'), tab('messages', 'Messages'), tab('chart', 'Chart', 'chart'), tab('profile', 'Data profile', 'columns'), tab('plan', 'Plan', 'plan'));
-    const name = this.title.replace(/\.sql$/i, ''), rowsOk = r?.kind === 'rows';
-    const text = (f, headers) => this.gridEl?.grid ? this.gridEl.grid.text(f, headers) : '';
-    // (how many rows and how long: on the line under the rows, as a cell's answer has it)
-    fill(this.info, r && !rowsOk && r.ms != null ? h('span', { class: 'n t' }, secs(r.ms)) : null,
-      split('copy', 'Copy the rows (or the selection), tab-separated, with the headers', () => rowsOk && copyText(text('tsv', true), 'Copied, with the headers'),
-        () => [{ head: 'Copy the rows (or the selection)' }, ...COPIES.map(([f, label, headers]) => ({ label, run: () => rowsOk && copyText(text(f, headers), 'Copied') }))], !rowsOk),
-      split('down', 'Download the rows as CSV (all of them: the statement runs again on the node)', () => rowsOk && fetchRows(r, 'csv', name),
-        () => [{ head: 'Download every row (it runs again)' }, ...DOWNLOADS.map(([f, label]) => ({ label, run: () => fetchRows(r, f, name) }))], !rowsOk),
-      h('button', { class: 'icon', title: this.layout === 'right' ? 'Move the results below' : 'Move the results to the right', 'aria-label': 'Move the results', onclick: () => { this.layout = this.layout === 'right' ? 'below' : 'right'; R.helpers.prefs('results', this.layout); this.place(); this.draw(); } }, icon(this.layout === 'right' ? 'panelBelow' : 'panelRight')));
-    if (!r) { this.body.replaceChildren(h('div', { class: 'wait' }, this.running ? 'Running…' : h('span', {}, `Run the ${R.helpers.prefs('enter') || 'file'}, or what is selected: `, h('kbd', {}, 'Ctrl'), ' ', h('kbd', {}, 'Enter')))); return; }
-    const many = this.results?.length > 1 || this.running && this.todo > 1;
-    if (this.tab === 'results') {
-      const strip = many ? h('div', { class: 'stmts', role: 'group', 'aria-label': 'The statements\' answers, numbered as in the file' }, this.results.map((x, k) =>
-        h('button', { class: 'stmt' + (x === r ? ' on' : '') + (x.kind === 'error' ? ' bad' : ''), 'aria-pressed': String(x === r), title: `${x.sql}\n\n(its lines are marked ${k + 1} in the file)`,
-          onclick: () => { this.result = x; this.draw(); this.point(x); }, onmouseenter: () => this.marks(k + 1), onmouseleave: () => this.marks() }, h('b', {}, String(k + 1)), h('span', { class: 'm' }, said(x)))),
-        this.running ? h('span', { class: 'stmt wait pulse' }, h('b', {}, String(this.results.length + 1)), `of ${this.todo}…`)
-          : this.results.length < this.todo ? h('span', { class: 'stmts-left' }, `${this.todo - this.results.length} after it not run`) : null) : null;
-      if (r.kind === 'rows') { this.gridEl = grid(r, { fill: true, name, explore: i => R.helpers.explore(r, i) }); fill(this.body, strip, this.gridEl); }
-      else fill(this.body, strip, ...answer(r));
-    } else if (this.tab === 'messages') {
-      import('./stmts.js').then(m => { if (this.tab === 'messages' && this.result === r) this.body.replaceChildren(m.messages(this, r)); }); // (each statement: what it printed and did)
-    } else if (this.tab === 'profile') {
-      if (r.kind !== 'rows') { this.body.replaceChildren(h('div', { class: 'wait' }, 'A data profile needs rows.')); return; }
-      import('./details.js').then(m => { if (this.tab === 'profile' && this.result === r) this.body.replaceChildren(m.dataProfile(r)); });
-    } else if (this.tab === 'chart') {
-      if (r.kind !== 'rows') { this.body.replaceChildren(h('div', { class: 'wait' }, 'A chart needs rows.')); return; }
-      this.body.replaceChildren(h('div', { class: 'wait' }, 'Drawing…'));
-      import('./chart.js').then(m => { if (this.tab === 'chart' && this.result === r) this.body.replaceChildren(m.chartView(r, name, this.chartKeep ||= {})); });
-    } else {
-      const stmt = lastStatement(r.sql);
-      this.body.replaceChildren(h('div', { class: 'wait' }, 'Reading the plan…'));
-      import('./plan.js').then(m => { if (this.tab === 'plan' && this.result === r) this.body.replaceChildren(m.planView(stmt, r.params)); });
-    }
-  }
-  toolbar() {
-    const db = MODE === 'lakes' ? h('button', { class: 'btn', title: 'The database the file runs in', onclick: e => R.helpers.pickDb(e.currentTarget) }, icon('db'), S.db || '…', icon('chevd'))
-      : h('span', { class: 'pill', title: 'The lake the file runs in' }, icon('db'), S.lake || '');
-    const some = () => !!this.ed.selected();
-    return [...this.crumbs(), h('span', { class: 'grow' }),
-      R.helpers.runButton(this.running, { label: 'Run', title: 'Run what is selected, else the ' + (R.helpers.prefs('enter') || 'file') + ' (Ctrl+Enter)', run: () => this.run(), stop: () => this.stop(), stopTitle: 'Stop waiting for it' }, () => [
-        { label: 'Run selection', icon: 'play', keys: some() ? 'Ctrl Enter' : null, disabled: !some(), run: () => this.run() }, ...this.runItems(some(), true), this.explainItem(), '-',
-        ...this.ed.formats(formatSql, 'file', true), '-', ...this.jobs(true, false)]),
-      h('span', { class: 'sep' }), db, R.helpers.saveButton(this), moreBtn(() => this.more())];
-  }
-}
+// ------------------------------------------------------------------ a SQL file (sqlfile.js): what its answers are called
+export const said = x => x.kind === 'rows' ? `${count(x.total)} row${x.total === 1 ? '' : 's'}` : x.kind === 'error' ? 'failed' : x.kind === 'plan' ? (x.profile ? 'profiled' : 'not run') : 'done';
 /** A statement on one line: its comments out, its spaces one, at most `n` characters. */
 export const oneLine = (sql, n) => { const t = sql.replace(/--[^\n]*|\/\*[\s\S]*?\*\//g, ' ').replace(/\s+/g, ' ').trim(); return t.length > n ? t.slice(0, n - 1) + '…' : t; };
 /** A copy's or a download's button, with a ▾ for its other forms. */
@@ -377,7 +236,7 @@ export const lastStatement = sql => statements(sql).at(-1) || sql;
 export function registerFiles(register) {
   const text = (Cls, kind) => async path => { if (!path) return new Cls({}); const f = await readFile(path); return new Cls({ path, text: f.text, version: f.version, kind }); };
   register.doc({ id: 'notebook', label: 'Notebook', icon: 'notebook', match: p => /\.ipynb$/i.test(p) && !/^notebooks\/[^/]+\//.test(p), open: openPlain }); // (one file, saved in place, its versions kept by the node; notebooks/<name>/<time>.ipynb: saved before that)
-  register.doc({ id: 'sql', label: 'SQL file', icon: 'filesql', order: 20, match: p => /\.sql$/i.test(p), open: text(SqlDoc) });
+  register.doc({ id: 'sql', label: 'SQL file', icon: 'filesql', order: 20, match: p => /\.sql$/i.test(p), open: async path => { const { SqlDoc } = await import('./sqlfile.js'); return text(SqlDoc)(path); } }); // (loaded when a SQL file first opens)
   register.doc({ id: 'python', label: 'Python file', icon: 'filepy', order: 30, match: p => /\.py$/i.test(p), open: async path => { const { PythonDoc } = await import('./pyfile.js'); return text(PythonDoc)(path); } }); // (loaded when a Python file first opens)
   register.doc({ id: 'data', label: 'Data file', icon: 'filedata', order: 40, match: p => DATA.test(p), open: async path => {
     const { DataDoc } = await import('./data.js'); // (loaded when a data file first opens)

@@ -14,9 +14,9 @@
 // No framework and nothing from anywhere else: the page, its modules and its fonts come from the node.
 import { h, $, fill, said, esc, store, count, bytes,  ICONS, icon, svg, typeMark, sqlType, on, emit, R, byOrder, shell, register, T, configure,
   MODE, SESSION, S, base, call, run, rows, doBlock, ident, qualified, home, toast, menu, prompt, VERSION, ask, interruptPython } from './core.js';
-import { grid } from './grid.js';
+import { grid, copyText } from './grid.js';
 import { Notebook, openNotebook, openPlain, cleanName, doneText } from './notebook.js';
-import { workspace, drawWorkspace, treeItem, upload, newFolder, registerFiles, SqlDoc, lastStatement } from './files.js';
+import { workspace, drawWorkspace, treeItem, upload, newFolder, registerFiles, lastStatement } from './files.js';
 
 R.helpers = {};
 const H = R.helpers;
@@ -308,6 +308,7 @@ function toolbar() {
   if (S.doc) bar.replaceChildren(...S.doc.toolbar().flat().filter(Boolean));
 }
 H.toolbar = toolbar;
+H.copyPath = d => copyText('files/' + d.path, 'Path copied');
 function status() {
   const s = S.info || {}, nodes = s.nodes || [];
   const where = h('span', { class: 'st-where', title: s.leader ? `This database's cluster: ${nodes.join(', ')}. Its leader is ${s.leader}; commits so far: ${s.hwm}.` : '' }, h('span', { class: 'dot' + (S.down ? ' off' : '') }), `${home() || ''}: ${S.down ? 'not reachable' : 'ready'}`);
@@ -339,7 +340,7 @@ H.versions = doc => import('./versions.js').then(m => m.open(doc));
 /** A new SQL or Python file, to be saved in `at` (asked again when it is saved). */
 function newFile(kind, at = kind === 'python' ? 'scripts/' : 'queries/') {
   const ext = kind === 'python' ? '.py' : '.sql', untitled = at + nextName(at, ext) + ext, made = d => { addDoc(d); d.ed.focus(); return d; };
-  return kind === 'python' ? import('./pyfile.js').then(m => made(new m.PythonDoc({ untitled }))) : made(new SqlDoc({ untitled })); // (a Python file: a promise of it, its module loaded when first needed)
+  return kind === 'python' ? import('./pyfile.js').then(m => made(new m.PythonDoc({ untitled }))) : import('./sqlfile.js').then(m => made(new m.SqlDoc({ untitled }))); // (a promise of it: its module loaded when first needed)
 }
 H.newFile = newFile;
 H.close = closeDoc;
@@ -368,9 +369,9 @@ async function opened(path, opts) {
 }
 H.openFile = openFile;
 /** SQL in a tab and run: into the notebook in front (a cell), else a new SQL tab. */
-function query(sql) {
+async function query(sql) {
   if (S.doc?.kind === 'notebook') return S.doc.peek(sql);
-  const p = S.pick, d = newFile('sql');
+  const p = S.pick, d = await newFile('sql');
   if (p && p.type !== 'file' && p.type !== 'doc') { S.pick = p; S.pickedOn = d; mark(); detail(); } // (a table's first rows, in a tab of their own: its details stay)
   d.ed.value = sql;
   d.run();
@@ -474,14 +475,16 @@ async function dataTree(box) {
       box.replaceChildren(h('div', { class: 'empty' }, e.status === 401 ? 'A token is needed to see the tables.' : e.message));
       return;
     }
-    const names = [S.lake, ...[...lakes.keys()].filter(n => n !== S.lake).sort()].filter(Boolean);
+    const names = S.lakes = [S.lake, ...[...lakes.keys()].filter(n => n !== S.lake).sort()].filter(Boolean);
     box.replaceChildren(...names.map(n => lakeNode(n, lakes.get(n) || new Map(), n === S.lake, n === S.lake ? 'this lake' : 'attached')));
   }
   if (S.pick?.type === 'object') S.pick.t = S.objects?.find(t => t.key === S.pick.t.key) || S.pick.t; // (as it is now)
   mark(); detail();
 }
 H.newDatabase = () => newDatabase();
-H.explain = (sql, params) => ({ kind: 'plan', sql: lastStatement(sql), params });
+H.explain = (sql, params, profile) => ({ kind: 'plan', sql: lastStatement(sql), params, profile });
+/** The menus' items for a statement's plan: shown, not run; or its query profile, run with EXPLAIN ANALYZE. */
+H.planItems = go => [{ label: 'Show execution plan', icon: 'plan', keys: 'Ctrl Shift E', run: () => go(false) }, { label: 'Run query profile', run: () => go(true) }];
 // (the objects' menus, loaded as the pointer first comes over the Data tree: open at once when asked for)
 const warm = e => { if (e.target.closest?.('#data')) { removeEventListener('pointerover', warm); import('./objects.js'); } };
 addEventListener('pointerover', warm, { passive: true });
@@ -493,7 +496,8 @@ async function newDatabase() {
     await use(name);
   } catch (e) { toast(e.message, true); }
 }
-H.pickDb = at => menu(at, (S.dbs || []).map(d => ({ label: d.name, icon: 'db', run: () => use(d.name) })));
+H.pickDb = at => objects(m => m.dbMenu(at)); // (a database's menu, beside its row's in the Data tree)
+H.use = use;
 
 // ------------------------------------------------------------------ what was picked, and the details view
 function pick(p, tab) {
@@ -637,6 +641,7 @@ on('changed', doc => {
 on('saved', (doc, path) => {
   if (path && S.files && !S.files.some(f => f.path === path)) { S.files.push({ path, written: new Date().toISOString().slice(0, -1) }); laterWorkspace(); } // (in the tree now; its size with the listing)
   toolbar(); remember(); hashNow(); later(() => refreshViews(['workspace']));
+  if (doc === S.doc) follow(doc); // (its details are of the file at its path now: saved, or renamed)
 });
 
 // ------------------------------------------------------------------ search (Ctrl K): in more.js
@@ -713,8 +718,8 @@ function core() {
     views: cell?.kind === 'sql' ? [['plan', 'Plan', 'plan', () => import('./plan.js').then(m => m.planView(lastStatement(r.src || cell.src)))]] : [] }) });
   register.renderer({ id: 'figures', order: 30, match: r => r.kind === 'done' && Array.isArray(r.value?.images), render: r => h('div', { class: 'figs' }, r.value.images.map(b => h('img', { class: 'fig', alt: 'a figure the code drew', src: 'data:image/png;base64,' + b }))) });
   register.renderer({ id: 'text', order: 40, match: r => r.kind === 'text', render: r => said(r.text) });
-  // (Explain: a statement's plan, not run: H.explain)
-  register.renderer({ id: 'plan', order: 50, match: r => r.kind === 'plan', render: r => { const box = h('div', { class: 'wait' }, 'Reading the plan…'); import('./plan.js').then(m => box.replaceWith(m.planView(r.sql, r.params))); return box; } });
+  // (a statement's execution plan, not run, or its query profile: H.explain)
+  register.renderer({ id: 'plan', order: 50, match: r => r.kind === 'plan', render: r => { const box = h('div', { class: 'wait' }, 'Reading the plan…'); import('./plan.js').then(m => box.replaceWith(m.planView(r.sql, r.params, { profile: r.profile }))); return box; } });
   register.renderer({ id: 'done', order: 90, match: r => r.kind === 'done', render: r => { const d = doneText(r.value) || (r.notices?.length ? '' : 'Done.'); return d && !(d === 'Done.' && r.notices?.length) ? h('div', { class: 'done' }, d) : null; } });
   register.view({ id: 'data', side: 'left', order: 10, title: () => MODE === 'lakes' ? 'Databases' : 'Data', render: box => dataTree(box), tools: [
     { icon: 'plus', title: 'New database', domId: 'newdb', hidden: () => MODE !== 'lakes', run: newDatabase },

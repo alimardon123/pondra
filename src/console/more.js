@@ -1,7 +1,7 @@
 // The console's rarer parts (ADR-034, round 29), loaded when first used, so the page's first load
 // doesn't carry them: the History view (the node's runs, what this page ran), the Variables view,
 // search (Ctrl K), choosing the Python, a file run as a job or on a schedule. What they use of the shell comes through `R.helpers`.
-import { on, h, $, secs, count, bytes, utc, icon, svg, S, R, call, run, doBlock, rows, ident, quote, toast, menu, prompt, confirmed, pop, fileUrl, fileSql, writeFile, moreStyle } from './core.js';
+import { on, h, $, secs, count, bytes, utc, icon, svg, S, R, call, run, doBlock, rows, ident, quote, toast, menu, prompt, confirmed, pop, fileUrl, fileSql, writeFile, moreStyle, renaming } from './core.js';
 import { highlighted } from './editor.js';
 import { copyText } from './grid.js';
 import { iconOf, oneLine, FOLDER, download } from './files.js';
@@ -166,7 +166,8 @@ export function tabMenu(e, d) {
     { label: 'Close others', disabled: !others.length, run: () => closeAll(others) }, { label: 'Close to the right', disabled: !right.length, run: () => closeAll(right) },
     { label: 'Close saved', disabled: !saved.length && (d.dirty || d.pinned), run: () => closeAll(saved.concat(d.dirty || d.pinned ? [] : [d])) },
     { label: S.docs.some(x => x.pinned) ? 'Close all but the pinned' : 'Close all', run: () => closeAll(S.docs.filter(x => !x.pinned)) },
-    d.path ? '-' : null, d.path ? { label: 'Copy the path', icon: 'copy', run: () => copyText('files/' + d.path, 'Path copied') } : null]);
+    d.rename ? '-' : null, d.rename ? { label: 'Rename…', icon: 'pencil', run: () => { H.activate(d); renaming(); } } : null,
+    d.rename ? { label: 'Copy path', icon: 'copy', disabled: d.kind === 'notebook' ? !d.version : !d.path, hint: 'files/…', run: () => H.copyPath(d) } : null]);
 }
 
 // ------------------------------------------------------------------ the Workspace's files: their menus, a folder, uploads, renaming, deleting
@@ -204,19 +205,6 @@ export function upload(at = '') {
   };
   document.body.append(input); input.click();
 }
-export async function rename(rel) {
-  const to = await prompt('Rename', 'The new path, under the lake\'s files', rel);
-  if (!to || to === rel) return;
-  try {
-    const r = await call(fileUrl(rel));
-    await call(fileUrl(to), { method: 'PUT', body: await r.blob() });
-    await call(fileUrl(rel), { method: 'DELETE' });
-    const doc = S.docs.find(d => d.path === rel);
-    if (doc) { await R.helpers.close(doc); R.helpers.openFile(to); } // (its tab again, at the new path)
-    toast(`Renamed to ${to}`);
-  } catch (e) { toast('Not renamed: ' + e.message, true); }
-  R.helpers.refreshFiles();
-}
 /** Delete a file, a notebook (every version) or a folder (every file in it, its marker too), once asked. */
 export async function remove(f, folder) {
   try {
@@ -253,7 +241,7 @@ export function cellMenu(c, at) {
   const nb = c.nb, i = nb.cells.indexOf(c), kind = c.kind === 'markdown' ? 'sql' : c.kind;
   menu(at, [{ label: 'Run the cells above', icon: 'arrowUp', run: () => nb.runSome(0, i) }, { label: 'Run this and the cells below', icon: 'arrowDown', run: () => nb.runSome(i) }, '-',
     { label: 'Add a cell above', icon: 'plus', keys: 'A', run: () => nb.add({ kind }, c, false).edit() }, { label: 'Add a cell below', keys: 'B', run: () => nb.add({ kind }, c, true).edit() }, '-',
-    c.kind === 'sql' ? { label: 'Explain: its plan, not run', icon: 'plan', run: () => c.explain() } : null,
+    ...c.kind === 'sql' ? R.helpers.planItems(p => c.explain(p)) : [],
     { label: c.el.classList.contains('folded') ? 'Show the output' : 'Hide the output', icon: 'eye', keys: 'O', run: () => c.fold() }, { label: 'Clear the output', icon: 'clear', run: () => c.clear() }, '-',
     ...[...R.kinds.values()].map(k => ({ label: `Make it ${k.label}`, checked: k.id === c.kind, run: () => { c.setKind(k.id); c.edit(); } })), '-',
     { label: 'Delete the cell', icon: 'trash', keys: 'D D', run: () => nb.remove(c) }]);

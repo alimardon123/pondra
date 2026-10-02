@@ -1,7 +1,7 @@
 // Notebooks (ADR-030, ADR-034): SQL, Python and Markdown cells in a tab, saved in the lake as
 // Jupyter notebooks (`files/notebooks/<name>/<time>.ipynb`, a version per save), or, anywhere
 // else, as one plain `.ipynb` file, saved in place like a SQL file.
-import { h, $, icon, esc, secs, count, S, R, emit, call, rows, fileUrl, toast, menu, saveAs, numeric, Failure, said, failed, readFile, writeFile, interruptPython, formatPython } from './core.js';
+import { h, icon, esc, secs, count, S, R, emit, call, rows, fileUrl, toast, menu, saveAs, numeric, Failure, said, failed, readFile, writeFile, interruptPython, formatPython, renamed, crumbs, renaming } from './core.js';
 import { Editor, formatSql } from './editor.js';
 /** A Markdown cell's text drawn (md.js: loaded when a notebook first has one). */
 const drawMd = async (el, src) => { const m = await import('./md.js'); m.render(el, src); };
@@ -58,7 +58,7 @@ export class Cell {
         tool('plus', 'Add a cell below (B)', () => nb.add({ kind: this.kind === 'markdown' ? 'sql' : this.kind }, this, true).edit()),
         tool('dots', 'More', e => { const at = e.currentTarget; import('./more.js').then(m => m.cellMenu(this, at)); })));
     this.ed = new Editor({ grow: true, value: o.src || '', label: 'Code', oninput: () => nb.changed(), onkey: e => this.key(e) });
-    this.ed.menu = () => ['-', { label: 'Run cell', icon: 'play', keys: 'Ctrl Enter', run: () => this.run() }, this.kind === 'sql' ? { label: 'Explain: its plan, not run', icon: 'plan', keys: 'Ctrl Shift E', run: () => this.explain() } : null, { label: 'Run the cells above', run: () => nb.runSome(0, i()) }, { label: 'Run this and the cells below', run: () => nb.runSome(i()) },
+    this.ed.menu = () => ['-', { label: 'Run cell', icon: 'play', keys: 'Ctrl Enter', run: () => this.run() }, ...this.kind === 'sql' ? R.helpers.planItems(p => this.explain(p)) : [], { label: 'Run the cells above', run: () => nb.runSome(0, i()) }, { label: 'Run this and the cells below', run: () => nb.runSome(i()) },
       ...this.fmt ? ['-', ...this.ed.formats(this.fmt, 'cell', true)] : [], this.kind === 'sql' ? '-' : null, this.kind === 'sql' ? { label: 'Create as table or view…', icon: 'plus', run: () => R.helpers.createAs(this.src) } : null,
       ...['sql', 'python'].filter(k => k !== this.kind && this.kind !== 'markdown').map(k => ({ label: k === 'sql' ? 'Make it SQL' : 'Make it Python', run: () => this.setKind(k) }))];
     this.ta = this.ed.ta;
@@ -122,8 +122,8 @@ export class Cell {
   /** How its kind is formatted: SQL here, Python by the node's Python (ruff or black); Markdown isn't. */
   get fmt() { return this.kind === 'sql' ? formatSql : this.kind === 'python' ? formatPython : null; }
   format() { if (this.fmt) this.ed.reformat(this.fmt); }
-  /** Explain: the plan of what is selected, or of its last statement, without running it. */
-  explain() { this.show(R.helpers.explain(this.ed.selected() || this.src)); }
+  /** The execution plan of what is selected, or of its last statement, without running it (or, `profile`, its query profile). */
+  explain(profile) { this.show(R.helpers.explain(this.ed.selected() || this.src, undefined, profile)); }
   async run() {
     if (!this.type.run) { drawMd(this.md, this.src); this.ta.blur(); this.el.focus({ preventScroll: true }); return { kind: 'done' }; }
     const text = this.src.trim();
@@ -148,7 +148,7 @@ export class Cell {
     }
     r.ms = performance.now() - t0;
     if (this.kind === 'sql') r.src = text; // (its plan: of what ran)
-    // (one query: Download can fetch every row of it again, not only those shown)
+    // (one query: a download can run it again once the node no longer keeps its answer)
     if (this.kind === 'sql' && r.kind === 'rows' && !text.replace(/;\s*$/, '').includes(';') && /^\s*(select|with|from|values|table)\b/i.test(text.replace(/--[^\n]*|\/\*[\s\S]*?\*\//g, ' '))) r.sql = text;
     this.show(r);
     if (r.kind === 'rows' && this.type.live && this.liveBox.checked) this.startLive();
@@ -375,10 +375,8 @@ export class Notebook {
   /** Save it in place, `<dir><name>.ipynb` (the node keeps each save as a version: ADR-035 §8). A
    * notebook saved before that, as `notebooks/<name>/<time>.ipynb`, becomes `notebooks/<name>.ipynb`. */
   async save() {
-    const input = $('#nbname');
-    const name = input && input.value !== this.name ? cleanName(input.value) : this.name;
-    if (!name) { toast('Give the notebook a name first', true); input?.focus(); return false; }
-    this.name = name; if (input) input.value = name;
+    await this.naming;
+    if (!this.name) { toast('Give the notebook a name first', true); return false; }
     if (!this.plain) { this.dir = 'notebooks/'; this.version = null; }
     const path = this.path, body = JSON.stringify(this.notebook(), null, 1) + '\n';
     try {
@@ -399,23 +397,22 @@ export class Notebook {
     return true;
   }
   activate() { S.nb = this; S.sel = this.sel; this.sel?.el.focus({ preventScroll: true }); }
+  rename(name) { return renamed(this, name); }
   /** The toolbar: its name (edit it to rename), whether it is saved, and its actions. */
   toolbar() {
-    const name = h('input', { id: 'nbname', value: this.name, 'aria-label': 'Notebook name', spellcheck: 'false', title: 'The notebook\'s name: Ctrl+S saves it under this one' });
-    name.addEventListener('change', () => { this.name = cleanName(name.value) || 'untitled'; name.value = this.name; this.version = null; this.changed(); });
-    name.addEventListener('keydown', e => { if (e.key === 'Enter') name.blur(); });
     const i = () => Math.max(0, this.cells.indexOf(this.sel));
     const pill = R.helpers.pythonPill();
     this.drawPill = pill.draw;
-    return [h('span', { class: 'crumb' }, this.dir ?? 'notebooks/'), name, h('span', { class: 'grow' }),
+    return [...crumbs(this), h('span', { class: 'grow' }),
       R.helpers.runButton(this.busy, { label: 'Run all', title: 'Run every cell, in order (Ctrl+Shift+Enter)', run: () => this.runSome(0), stop: () => this.interrupt(), stopTitle: 'Stop the cells running (Python\'s are interrupted, their variables kept)' }, [
         { label: 'Run all', icon: 'play', keys: 'Ctrl Shift Enter', run: () => this.runSome(0) }, { label: 'Run the cells above', icon: 'arrowUp', run: () => this.runSome(0, i()) },
         { label: 'Run this and the cells below', icon: 'arrowDown', run: () => this.runSome(i()) }, '-', { label: 'Clear every output', icon: 'clear', run: () => this.clearOutputs() },
         '-', { label: 'Run as a job', icon: 'play', run: () => R.helpers.job(this) }, { label: 'Schedule…', icon: 'clock', run: () => R.helpers.schedule(this) }]),
       pill, R.helpers.saveButton(this),
       h('button', { class: 'icon', title: 'More', 'aria-label': 'More', onclick: e => menu(e.currentTarget, [
-        { label: 'Versions…', icon: 'clock', run: () => R.helpers.versions(this) },
-        { label: 'Download as .ipynb', icon: 'down', run: () => saveAs(JSON.stringify(this.notebook(), null, 1) + '\n', 'application/x-ipynb+json', this.name + '.ipynb') }]) }, icon('dots'))];
+        { label: 'Rename…', icon: 'pencil', run: renaming }, { label: 'Versions…', icon: 'clock', run: () => R.helpers.versions(this) },
+        { label: 'Download as .ipynb', icon: 'down', run: () => saveAs(JSON.stringify(this.notebook(), null, 1) + '\n', 'application/x-ipynb+json', this.name + '.ipynb') },
+        this.version ? { label: 'Copy path', icon: 'copy', run: () => R.helpers.copyPath(this) } : null]) }, icon('dots'))];
   }
   status() { return [`${this.cells.length} cell${this.cells.length === 1 ? '' : 's'}`, 'Notebook']; }
   /** Keys on the selected cell, after Esc (Jupyter's). */

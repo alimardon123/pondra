@@ -99,14 +99,16 @@ export class Editor {
     this.pre = h('pre', { class: 'hl', 'aria-hidden': 'true' });
     this.ta = h('textarea', { spellcheck: 'false', autocapitalize: 'off', autocomplete: 'off', 'aria-label': label, wrap: 'off', placeholder: this.placeholder });
     this.cur = h('div', { class: 'curline', 'aria-hidden': 'true' });
+    this.ghost = h('div', { class: 'selghost', 'aria-hidden': 'true' });
     this.nums = this.gutter ? h('pre', { class: 'nums', 'aria-hidden': 'true' }, this.numText = document.createTextNode('')) : null;
-    this.body = h('div', { class: 'code' }, this.cur, this.pre, this.ta);
+    this.body = h('div', { class: 'code' }, this.cur, this.ghost, this.pre, this.ta);
     this.el = h('div', { class: 'editor' + (this.grow ? ' fit' : ' fill') }, this.nums, this.body);
     this.ta.value = value;
     this.ta.addEventListener('input', () => { this.paint(); this.oninput?.(); this.reveal(); if (cm?.ed === this) complete(this); });
     this.ta.addEventListener('keydown', e => keys(e, this));
     for (const ev of ['keyup', 'mouseup', 'focus']) this.ta.addEventListener(ev, () => this.cursor());
-    this.ta.addEventListener('blur', () => { if (cm?.ed === this) closeComplete(); });
+    this.ta.addEventListener('focus', () => this.ghost.replaceChildren());
+    this.ta.addEventListener('blur', () => { if (cm?.ed === this) closeComplete(); this.unfocused(); });
     this.ta.addEventListener('scroll', () => { this.ta.scrollTop = 0; this.ta.scrollLeft = 0; }); // (the box scrolls, never the textarea: it is as big as its text)
     this.ta.addEventListener('contextmenu', e => { e.preventDefault(); this.contextMenu(e); });
     this.ta.addEventListener('mousemove', e => this.onhover?.(e));
@@ -147,8 +149,21 @@ export class Editor {
     const some = !!this.selected();
     return [{ label: `Format ${what}`, icon: 'format', keys: some ? null : 'Shift Alt F', run: () => this.reformat(f, true) }, some || always ? { label: 'Format selection', keys: some ? 'Shift Alt F' : null, disabled: !some, run: () => this.reformat(f) } : null];
   }
+  /** A textarea without the focus shows no selection (a menu opened from it, Run ▾, a click
+   * elsewhere): its lines are drawn under the text instead, a lighter tint, until it has it again. */
+  unfocused() {
+    const ta = this.ta, a = ta.selectionStart, b = ta.selectionEnd;
+    if (a === b || document.activeElement === ta) return; // (the window went to the back: the browser still draws it)
+    const v = ta.value, w = measure(), start = v.lastIndexOf('\n', a - 1) + 1, first = v.slice(0, a).split('\n').length - 1;
+    const col = (s, n) => { let x = 0; for (let i = 0; i < n; i++) x = s[i] === '\t' ? (Math.floor(x / 4) + 1) * 4 : x + 1; return x; }; // (tab-size 4)
+    const lines = v.slice(start, b).split('\n'), last = lines.length - 1; // (whole lines but the last, which ends where the selection does)
+    this.ghost.innerHTML = lines.map((s, k) => {
+      const from = k ? 0 : col(s, a - start), to = col(s, s.length) + (k < last ? 0.6 : 0); // (a sliver for each line's newline)
+      return to > from ? `<div style="top:${9 + (first + k) * LINE_H}px;left:${14 + from * w}px;width:${(to - from) * w}px"></div>` : '';
+    }).join('');
+  }
   get value() { return this.ta.value; }
-  set value(v) { this.ta.value = v; this.paint(); }
+  set value(v) { this.ta.value = v; this.ghost.replaceChildren(); this.paint(); }
   setLanguage(l) { this.language = l; this.src = []; this.html = []; this.states = ['']; this.pre.replaceChildren(); this.paint(); }
   /** Highlight again the lines that changed (and those after them whose state they changed);
    * size the box to the text: its width in steps, as a new width lays the whole file out again. */

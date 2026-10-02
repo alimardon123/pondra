@@ -4757,9 +4757,11 @@ def found():
         gone = None
     except RuntimeError as e:
         gone = str(e)[:3]
-    checks["format=typed: 10,000 rows of a bigger answer, and an id its other pages are read with (the same rows, not run again); 410 once not kept"] = \
+    whole = call(port, "GET", f"/sql/pages/{big.get('pages')}?format=csv") if big.get("pages") else b""
+    small = call(port, "GET", f"/sql/pages/{typed.get('pages')}?format=csv") if typed.get("pages") else b""
+    checks["format=typed: 10,000 rows of a bigger answer, and an id its other pages, and every row as a file, are read with (the same rows, not run again); 410 once not kept"] = \
         (len(big["rows"]), big["total"], big["rows"][-1]) == (10000, 25000, [9999]) and len(page3.get("rows", [])) == 5000 and page3["rows"][0] == [20000] \
-        and gone == "410" and typed.get("pages") is None
+        and gone == "410" and whole.decode().split("\n")[:2] == ["n", "0"] and len(whole.decode().split()) == 25001 and small.decode().split() == ["d,big,small", "1.50,9007199254740993,7"]
     # to_timestamp over a column of text answers in its type's zone (UTC), as over a literal.
     zoned = q("SELECT to_timestamp(v) AS a, to_timestamp(d, '%Y-%m-%d') AS b, to_timestamp_millis(d, '%Y-%m-%d') AS c FROM (VALUES ('2020-09-09T00:00:00+02:00', '2020-09-08')) AS x(v, d)")
     checks["to_timestamp(column) and to_timestamp_millis(column, format): TIMESTAMP (no zone; UTC's time for text with one), as over a literal"] = zoned == [{"a": "2020-09-08T22:00:00", "b": "2020-09-08T00:00:00", "c": "2020-09-08T00:00:00"}]

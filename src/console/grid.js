@@ -1,7 +1,7 @@
 // The result grid (ADR-034): query answers, notebook outputs and data files. It draws only the
 // rows in sight; a cell, a range, a row or a column can be selected and copied (tab-separated,
 // so a spreadsheet takes it as cells); a data file's cells are edited in place.
-import { h, icon, svg, count, secs, fill, numeric, sqlType, typeKind, typeMark, menu, toast, saveAs, quote, ident, pop, call, run, prompt, S, R } from './core.js';
+import { h, icon, svg, count, secs, fill, numeric, sqlType, typeKind, typeMark, menu, toast, saveAs, quote, ident, pop, call, run, prompt, esc, showTip, hideTip, S, R } from './core.js';
 
 const ROW_H = 30; // the height of a row when only the rows in sight are drawn
 let measurer;
@@ -13,6 +13,14 @@ export function shown(v, time, scale) {
   let s = typeof v === 'object' ? JSON.stringify(v) : typeof v === 'number' && scale != null ? v.toFixed(scale) : String(v); // (the decimals of a live answer: numbers)
   return time ? s.replace(/^(\d{4}-\d\d-\d\d)T/, '$1 ') : s;
 }
+/** JSON's text with its keys, strings, numbers and true/false/null tinted (a grid's cell, its card). */
+export const jsonHtml = s => esc(s).replace(/(&#34;(?:\\.|(?!&#34;).)*?&#34;)(\s*:)?|\b(true|false|null)\b|-?\b\d+(?:\.\d+)?(?:[eE][+-]?\d+)?\b/g,
+  (m, str, key, lit) => `<span class="${str ? (key ? 'jk' : 'js') : lit ? 'jl' : 'jn'}">${str || m}</span>${key || ''}`);
+/** A column holds JSON: structs, lists and maps, or text that is JSON objects or arrays (a VARIANT). */
+const isJson = (c, rows, i) => /^(Struct|Map|List|LargeList|FixedSizeList)|\[\]$/.test(c.type || '') || /^(Utf8|LargeUtf8|Utf8View)$/.test(c.type || '') && (() => {
+  const vs = []; for (const row of rows) { if (row[i] != null) vs.push(row[i]); if (vs.length === 20) break; }
+  return vs.length > 0 && vs.every(v => typeof v === 'string' && /^\s*[[{]/.test(v) && (() => { try { JSON.parse(v); return true; } catch { return false; } })());
+})();
 export function toCsv(r, sep = ',') {
   const field = v => { const s = v == null ? '' : typeof v === 'object' ? JSON.stringify(v) : String(v); return new RegExp(`["${sep}\\n\\r]`).test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; };
   return [r.columns.map(c => c.name), ...r.rows].map(row => row.map(field).join(sep)).join('\r\n') + '\r\n';
@@ -20,9 +28,10 @@ export function toCsv(r, sep = ',') {
 
 /** A filter's ways to compare: [label, whether it takes a value]. */
 const OPS = { has: ['contains', 1], starts: ['starts with', 1], not: ['does not contain', 1], eq: ['=', 1], ne: ['≠', 1], gt: ['>', 1], ge: ['≥', 1], lt: ['<', 1], le: ['≤', 1], null: ['is NULL', 0], notnull: ['is not NULL', 0] };
-/** The forms a copy takes: [format, label, with the headers]. */
-export const COPIES = [['tsv', 'Tab-separated, with the headers', true], ['tsv', 'Tab-separated, without the headers', false], ['csv', 'CSV', true], ['json', 'JSON', true],
-  ['md', 'A Markdown table', true], ['values', 'SQL: VALUES rows', false], ['list', 'SQL: a list, for IN (…)', false], ['names', 'The columns\' names', true]];
+/** A copy's menu: the rows (the selection, else every row here) in each form, `copy(format, withNames)` making it. */
+export const copyItems = copy => [{ head: 'Copy the selection, or every row here' }, ...COPIES.map(x => x === '-' ? x : { label: x[1], hint: x[3], run: () => copy(x[0], x[2]) })];
+const COPIES = [['tsv', 'With column names', true, 'TSV'], ['tsv', 'Values only', false, 'TSV'], '-', ['csv', 'CSV', true], ['json', 'JSON', true], ['md', 'Markdown table', true], '-',
+  ['values', 'SQL VALUES list', false, "(1, 'a'), …"], ['list', 'SQL IN list', false, '(1, 2, 3)'], ['names', 'Column names', true, 'a, b, c']];
 
 // ------------------------------------------------------------------ copying (works without the clipboard API too)
 let pending = null;
@@ -73,7 +82,8 @@ export function grid(r, o = {}) {
   const cols = r.columns, all = r.rows;
   if (!cols.length) return h('div', { class: 'done' }, 'No columns.');
   const nums = cols.map(c => numeric(c.type)), times = cols.map(c => /^Timestamp/.test(c.type || '')), scales = cols.map(c => { const s = +((c.type || '').match(/^Decimal\d*\(\d+,\s*(\d+)\)/)?.[1] ?? NaN); return Number.isNaN(s) ? null : s; });
-  const text = (row, i) => shown(row[i], times[i], scales[i]);
+  const text = (row, i) => shown(row[i], times[i], scales[i]), json = cols.map((c, i) => isJson(c, all, i));
+  r.widths ||= {}; // (columns resized by dragging their edge: kept with the answer, so it is drawn again as it was)
   const multi = all.slice(0, 200).some(row => row.some(v => typeof v === 'string' && v.includes('\n')));
   const virtual = !multi && (all.length > 60 || !!o.edit);
   let view = all.map((_, i) => i), sort = null, filters = [], sel = null;
@@ -83,28 +93,49 @@ export function grid(r, o = {}) {
   // the header: a type mark, the name, a sort arrow; the corner selects everything
   const heads = cols.map((c, i) => h('th', { class: nums[i] ? 'num' : null, 'data-c': i, scope: 'col' },
     h('span', { class: 'hd' }, typeMark(c.type), h('span', { class: 'hn' }, c.name), h('button', { class: 'srt', tabindex: '-1', title: 'Sort by it (again: the other way)', 'aria-label': `Sort by ${c.name}`, html: svg('sort', 13) })),
-    h('small', {}, sqlType(c.type))));
-  const corner = h('th', { class: 'i', title: 'Select everything (Ctrl A)' }, h('span', { class: 'sr' }, 'Row'));
+    h('small', {}, sqlType(c.type)), h('span', { class: 'rz', 'aria-hidden': 'true', title: 'Drag: its width. Double-click: to fit' })));
+  const corner = h('th', { class: 'i', title: 'Select everything (Ctrl A). Right-click: copy it' }, h('span', { class: 'sr' }, 'Row'));
   const body = h('tbody'), colgroup = h('colgroup');
   const table = h('table', { class: 'gt' + (o.edit ? ' editable' : ''), role: 'grid', 'aria-rowcount': String((r.total ?? all.length) + 1) }, colgroup, h('thead', {}, h('tr', {}, corner, heads)), body);
   const box = h('div', { class: 'grid' + (virtual ? ' v' : '') + (o.fill ? ' fill' : ''), tabindex: '0', 'aria-label': 'Rows' }, table);
+  const fit = (i, most = 440) => Math.min(most, Math.max(72, textWidth(cols[i].name) * 1.06 + 76, ...all.slice(0, 300).map(row => textWidth(text(row, i) ?? 'NULL') + 30)));
   const widths = () => {
-    const sample = all.slice(0, 300), ws = cols.map((c, i) => Math.min(440, Math.max(72, textWidth(c.name) * 1.06 + 76, ...sample.map(row => textWidth(text(row, i) ?? 'NULL') + 30))));
+    const ws = cols.map((c, i) => r.widths[i] ?? fit(i));
     const iw = Math.max(40, textWidth(count(Math.max(all.length, r.total || 0) + 5)) + 22);
     colgroup.replaceChildren(h('col', { style: `width:${iw}px` }), ...ws.map(w => h('col', { style: `width:${Math.ceil(w)}px` })));
     table.style.width = Math.ceil(iw + ws.reduce((a, b) => a + b, 0)) + 'px';
   };
-  if (virtual) widths();
+  if (virtual || Object.keys(r.widths).length) { widths(); table.classList.add('sized'); }
+  // a column's width, by dragging the edge of its header (a double-click fits it to what it holds)
+  box.addEventListener('pointerdown', e => {
+    const rz = e.target.closest('.rz');
+    if (!rz) return;
+    e.preventDefault(); e.stopPropagation(); hideCard();
+    const c = +rz.closest('th').dataset.c, start = e.clientX;
+    if (!table.classList.contains('sized')) { // (as drawn now, then fixed)
+      const ths = [...table.tHead.rows[0].cells];
+      colgroup.replaceChildren(...ths.map(th => h('col', { style: `width:${th.offsetWidth}px` })));
+      ths.slice(1).forEach((th, i) => { r.widths[i] ??= th.offsetWidth; });
+      table.style.width = ths.reduce((a, th) => a + th.offsetWidth, 0) + 'px'; table.classList.add('sized');
+    }
+    const was = r.widths[c] ?? fit(c);
+    rz.setPointerCapture(e.pointerId); document.body.classList.add('colrz'); rz.classList.add('on');
+    const move = ev => { r.widths[c] = Math.max(48, Math.round(was + ev.clientX - start)); widths(); };
+    rz.addEventListener('pointermove', move);
+    rz.addEventListener('pointerup', () => { rz.removeEventListener('pointermove', move); document.body.classList.remove('colrz'); rz.classList.remove('on'); }, { once: true });
+  });
+  box.addEventListener('dblclick', e => { const rz = e.target.closest('.rz'); if (rz) { const c = +rz.closest('th').dataset.c; r.widths[c] = fit(c, 900); widths(); table.classList.add('sized'); } });
 
   // rows
   const drawnRows = new Map(); // view index → its <tr>
   const cellOf = (row, k, i) => {
     const s = text(row, i), td = h('td', { 'data-c': i });
     if (s == null) td.append(h('span', { class: 'null' }, 'NULL'));
+    else if (json[i]) { td.innerHTML = jsonHtml(s.length > 5000 ? s.slice(0, 5000) + '…' : s); td.classList.add('json'); }
     else td.textContent = s.length > 5000 ? s.slice(0, 5000) + '…' : s;
     if (nums[i]) td.classList.add('num');
-    if (s && s.includes('\n')) td.classList.add('pre');
-    else if (s && s.length > 50) td.title = s.slice(0, 4000);
+    if (s && s.includes('\n') && !json[i]) td.classList.add('pre');
+    else if (s && (s.length > 40 || json[i])) td.classList.add('long'); // (its whole value in a card, on a moment's hover)
     if (o.edit?.changed(view[k], i)) td.classList.add('chg');
     return td;
   };
@@ -220,7 +251,7 @@ export function grid(r, o = {}) {
     if (e.target.closest('input.celled')) return;
     const mod = e.ctrlKey || e.metaKey;
     if (mod && e.key.toLowerCase() === 'a') { e.preventDefault(); select(0, 0, view.length - 1, cols.length - 1); return; }
-    if (mod && e.key.toLowerCase() === 'c') { if (sel) { e.preventDefault(); copyText(tsv(e.shiftKey), e.shiftKey ? 'Copied, with the headers' : 'Copied'); } return; }
+    if (mod && e.key.toLowerCase() === 'c') { if (sel) { e.preventDefault(); copyText(tsv(e.shiftKey), e.shiftKey ? 'Copied with column names' : 'Copied'); } return; }
     if (e.altKey && size && (e.key === 'PageDown' || e.key === 'PageUp')) { e.preventDefault(); turn(from / size + (e.key === 'PageDown' ? 1 : -1)); return; }
     const move = { ArrowUp: [-1, 0], ArrowDown: [1, 0], ArrowLeft: [0, -1], ArrowRight: [0, 1], PageUp: [-20, 0], PageDown: [20, 0], Home: [0, -1e9], End: [0, 1e9] }[e.key];
     if (move) {
@@ -237,28 +268,41 @@ export function grid(r, o = {}) {
     else if (e.key.length === 1 && !mod && !e.altKey) { e.preventDefault(); editCell(sel.fr, sel.fc, e.key); }
   });
   box.addEventListener('contextmenu', e => {
+    if (e.target.closest('th') === corner) { e.preventDefault(); select(0, 0, view.length - 1, cols.length - 1); copyMenu(e, true); return; }
     const th = e.target.closest('th[data-c]');
     if (th) { e.preventDefault(); headMenu(e, +th.dataset.c); return; }
     const p = at(e);
-    if (!p || p.c < 0) return;
+    if (!p) return;
     e.preventDefault();
+    if (p.c < 0) { const g = range(); if (!g || p.k < g.r0 || p.k > g.r1 || g.c0 || g.c1 < cols.length - 1) select(p.k, 0, p.k, cols.length - 1); copyMenu(e); return; } // (a row's number: its row, or the rows selected with it)
     const g = range();
     if (!g || p.k < g.r0 || p.k > g.r1 || p.c < g.c0 || p.c > g.c1) select(p.k, p.c);
     const c = sel.fc, name = cols[c].name;
-    menu(e, [{ label: 'Copy', icon: 'copy', keys: 'Ctrl C', run: () => copyText(tsv(false)) }, { label: 'Copy with headers', keys: 'Ctrl Shift C', run: () => copyText(tsv(true), 'Copied, with the headers') },
-      { label: 'Copy as CSV', run: () => copyText(as('csv', true)) }, { label: 'Copy as JSON', run: () => copyText(as('json', true)) }, { label: 'Copy as SQL: VALUES rows', run: () => copyText(as('values')) }, { label: 'Copy as SQL: a list, for IN (…)', run: () => copyText(as('list')) }, '-',
+    menu(e, [{ label: 'Copy', icon: 'copy', keys: 'Ctrl C', run: () => copyText(tsv(false)) }, { label: 'Copy with column names', keys: 'Ctrl Shift C', run: () => copyText(tsv(true), 'Copied with column names') },
+      { label: 'Copy as…', run: () => menu(e, copyItems((f, hd) => copyText(as(f, hd)))) }, '-',
       { label: 'Filter to these values', icon: 'filter', run: () => filterTo(c) }, { label: `Filter ${name}…`, run: () => askFilter(c) }, filters.length ? { label: 'Clear the filters', run: () => setFilters([]) } : null,
       { label: 'Sort ascending', icon: 'sortUp', run: () => sortBy(c, 1) }, { label: 'Sort descending', icon: 'sortDown', run: () => sortBy(c, -1) }, '-',
       o.explore ? { label: `Profile ${name}`, icon: 'chart', run: () => o.explore(c) } : null,
       o.edit ? '-' : null, o.edit ? { label: 'Delete the row' + (range().r1 > range().r0 ? 's' : ''), icon: 'trash', run: () => { const g2 = range(); o.edit.del(view.slice(g2.r0, g2.r1 + 1)); sel = null; refresh(); } } : null]);
   });
+  /** The corner's menu (every row here), or a row number's (its rows), as SSMS has them: the rows copied, each way. */
+  function copyMenu(e, every) {
+    const g = range(), n = g ? g.r1 - g.r0 + 1 : 0, paged = (r.total ?? all.length) > all.length;
+    menu(e, [{ head: every ? `${paged ? 'This page' : 'Every row'}: ${count(n)} row${n === 1 ? '' : 's'}` : `${count(n)} row${n === 1 ? '' : 's'}` },
+      { label: every ? 'Copy all' : 'Copy', icon: 'copy', keys: 'Ctrl C', run: () => copyText(tsv(false)) },
+      { label: every ? 'Copy all with column names' : 'Copy with column names', keys: 'Ctrl Shift C', run: () => copyText(tsv(true), 'Copied with column names') },
+      { label: 'Copy column names', run: () => copyText(as('names'), 'Column names copied') }, '-',
+      ...COPIES.slice(3, -1).map(x => x === '-' ? x : { label: 'Copy as ' + x[1], run: () => copyText(as(x[0])) }),
+      every ? '-' : null, every ? { label: 'Select all', keys: 'Ctrl A', run: () => { select(0, 0, view.length - 1, cols.length - 1); box.focus({ preventScroll: true }); } } : null,
+      every && (r.sql || r.pages) ? { label: 'Download all rows', icon: 'down', run: () => menu(e, downloadItems(f => fetchRows(r, f, o.name))) } : null]);
+  }
   /** A column header's menu: its name, the names of the columns selected, sorting, filtering. */
   function headMenu(e, c) {
     clearTimeout(hover); hideCard();
     const g = range(), inSel = g && c >= g.c0 && c <= g.c1 && g.r0 === 0 && g.r1 === view.length - 1, names = inSel ? cols.slice(g.c0, g.c1 + 1).map(x => x.name) : [cols[c].name];
     if (!inSel) select(0, c, view.length - 1, c);
-    menu(e, [{ label: `Copy the name${names.length > 1 ? 's' : ''}`, icon: 'copy', run: () => copyText(names.join(', ')) }, { label: `Copy as SQL: ${names.map(ident).join(', ').slice(0, 40)}`, run: () => copyText(names.map(ident).join(', ')) },
-      { label: 'Copy the values, with the header', run: () => copyText(tsv(true)) }, '-',
+    menu(e, [{ label: `Copy name${names.length > 1 ? 's' : ''}`, icon: 'copy', run: () => copyText(names.join(', ')) }, { label: 'Copy as SQL', hint: names.map(ident).join(', ').slice(0, 32), run: () => copyText(names.map(ident).join(', ')) },
+      { label: 'Copy values with column name', run: () => copyText(tsv(true)) }, '-',
       { label: 'Sort ascending', icon: 'sortUp', run: () => sortBy(c, 1) }, { label: 'Sort descending', icon: 'sortDown', run: () => sortBy(c, -1) }, sort ? { label: 'Unsorted', run: () => { sort = null; order(); } } : null, '-',
       { label: `Filter ${cols[c].name}…`, icon: 'filter', run: () => askFilter(c) }, filters.some(f => f.c === c) ? { label: 'Clear its filter', run: () => setFilters(filters.filter(f => f.c !== c)) } : null,
       filters.length ? { label: 'Clear every filter', run: () => setFilters([]) } : null, '-',
@@ -384,11 +428,21 @@ export function grid(r, o = {}) {
   // the header's card: the full type and what the rows hold
   let hover = 0, px = 0, py = 0;
   box.addEventListener('mouseover', e => {
-    const th = e.target.closest('th[data-c]');
+    const th = e.target.closest('th[data-c]'), td = e.target.closest('td.long');
     clearTimeout(hover);
-    if (!th) return;
+    if (td && !dragging) { const p = at(e); if (p) showTip(td, () => valueCard(all[view[p.k]][p.c], p.c), e.clientX); } else hideTip();
+    if (!th || e.target.closest('.rz')) return;
     hover = setTimeout(() => card(th, +th.dataset.c), 450);
   });
+  box.addEventListener('mouseleave', hideTip);
+  /** A long value, or a JSON one, whole: JSON indented and tinted. */
+  function valueCard(v, c) {
+    let s = shown(v, times[c], scales[c]) ?? '';
+    if (json[c]) { try { s = JSON.stringify(typeof v === 'string' ? JSON.parse(v) : v, null, 2); } catch { /* (as it is) */ } }
+    const lines = s.slice(0, 6000).split('\n'), cut = lines.length > 24 || s.length > 6000;
+    return [h('div', { class: 'th' }, h('b', {}, cols[c].name), sqlType(cols[c].type)),
+      h('pre', { class: json[c] ? 'jv' : null, html: (json[c] ? jsonHtml : esc)(lines.slice(0, 24).join('\n')) }), cut ? h('div', { class: 'tk' }, 'More than this: copy the cell (Ctrl C) for all of it') : null];
+  }
   box.addEventListener('mousemove', e => { px = e.clientX; py = e.clientY; }, { passive: true });
   box.addEventListener('mouseleave', () => { clearTimeout(hover); hideCard(); });
   box.addEventListener('mousedown', () => { clearTimeout(hover); hideCard(); });
@@ -465,12 +519,11 @@ export function grid(r, o = {}) {
       Promise.resolve(v[3]()).then(el => { if (open === v[0]) body.replaceChildren(el); });
     };
     wrap.append(h('div', { class: 'abar' }, tabs, h('span', { class: 'grow' }),
-      split('copy', 'Copy the rows (or the selection), tab-separated, with the headers', () => copyText(tsv(true), 'Copied, with the headers'),
-        () => [{ head: 'Copy the rows (or the selection)' }, ...COPIES.map(([f, label, headers]) => ({ label, run: () => copyText(as(f, headers), 'Copied') }))]),
+      split('copy', 'Copy with column names (tab-separated)', () => copyText(tsv(true), 'Copied with column names'), () => copyItems((f, hd) => copyText(as(f, hd), 'Copied'))),
       split('down', 'Download the rows here as CSV', () => saveAs(toCsv(r), 'text/csv', `${o.name || 'rows'}.csv`), () => [{ head: 'The rows here' },
-        { label: 'CSV', run: () => saveAs(toCsv(r), 'text/csv', `${o.name || 'rows'}.csv`) }, { label: 'TSV (tab-separated)', run: () => saveAs(toCsv(r, '\t'), 'text/tab-separated-values', `${o.name || 'rows'}.tsv`) },
-        { label: 'JSON', run: () => saveAs(JSON.stringify(all.map(row => Object.fromEntries(cols.map((c, i) => [c.name, row[i]])))), 'application/json', `${o.name || 'rows'}.json`) },
-        ...r.sql ? [{ head: 'Every row (it runs again)' }, ...DOWNLOADS.map(([f, label]) => ({ label, run: () => fetchRows(r, f, o.name) }))] : []])), body, foot);
+        { label: 'CSV', hint: '.csv', run: () => saveAs(toCsv(r), 'text/csv', `${o.name || 'rows'}.csv`) }, { label: 'TSV', hint: '.tsv', run: () => saveAs(toCsv(r, '\t'), 'text/tab-separated-values', `${o.name || 'rows'}.tsv`) },
+        { label: 'JSON', hint: '.json', run: () => saveAs(JSON.stringify(all.map(row => Object.fromEntries(cols.map((c, i) => [c.name, row[i]])))), 'application/json', `${o.name || 'rows'}.json`) },
+        ...r.sql || r.pages ? ['-', ...downloadItems(f => fetchRows(r, f, o.name))] : []])), body, foot);
     show(o.view, true);
   } else wrap.append(box, foot);
   draw();
@@ -501,13 +554,20 @@ export const names = cs => cs.map(c => ident(c.name)).join(', ');
 /** A button and its ▾: the usual way on a click, the others in its menu (Copy, Download). */
 export const split = (ic, title, run, items, disabled) => h('span', { class: 'split' }, h('button', { class: 'icon', title, 'aria-label': title, disabled, onclick: run }, icon(ic)),
   h('button', { class: 'icon caret', title: 'Other forms', 'aria-label': 'Other forms', 'aria-haspopup': 'menu', disabled, onclick: e => menu(e.currentTarget, items()) }, icon('chevd', 'ic', 12)));
-export const DOWNLOADS = [['csv', 'CSV'], ['tsv', 'TSV (tab-separated)'], ['json', 'JSON'], ['ndjson', 'JSON lines'], ['parquet', 'Parquet'], ['xlsx', 'Excel (.xlsx)']];
-/** Every row of an answer, in a file to download: its statement again on the node, in that format. */
+/** A download's menu: every row, in each format `get(format)` asks the node for. */
+export const downloadItems = (get, head = 'All rows') => [{ head }, ...DOWNLOADS.map(([f, label, ext]) => ({ label, hint: ext, run: () => get(f) }))];
+const DOWNLOADS = [['csv', 'CSV', '.csv'], ['tsv', 'TSV', '.tsv'], ['json', 'JSON', '.json'], ['ndjson', 'JSON Lines', '.jsonl'], ['parquet', 'Parquet', '.parquet'], ['xlsx', 'Excel', '.xlsx']];
+/** Every row of an answer, in a file to download: the answer as the node keeps it (`pages.rs`), or,
+ * once it doesn't (or for a table), its statement run again there, in that format. */
 export async function fetchRows(r, f, name) {
   toast('Preparing the download…');
+  const keep = (res, rerun) => res.blob().then(b => { saveAs(b, res.headers.get('content-type') || 'application/octet-stream', `${name || 'rows'}.${f === 'ndjson' ? 'jsonl' : f}`); if (rerun) toast('Its rows were no longer kept on the node: it ran again for the download'); });
+  if (r.pages) {
+    try { return await keep(await call(`/sql/pages/${r.pages}?format=${f}`)); } catch (e) { if (e.status !== 410 || !r.sql) return toast('Not downloaded: ' + e.message, true); r.pages = null; }
+  }
   try {
     const body = r.params && Object.keys(r.params).length ? JSON.stringify({ sql: r.sql, params: r.params }) : r.sql;
     const res = await call('/sql?format=' + f, { method: 'POST', body, headers: { 'content-type': r.params && Object.keys(r.params).length ? 'application/json' : 'text/plain; charset=utf-8' } });
-    saveAs(await res.blob(), res.headers.get('content-type') || 'application/octet-stream', `${name || 'rows'}.${f === 'ndjson' ? 'jsonl' : f}`);
+    await keep(res, r.pages === null);
   } catch (e) { toast('Not downloaded: ' + e.message, true); }
 }

@@ -120,6 +120,8 @@ search. A folder shows while it holds a file or a marker.
 
 Each row of the Workspace has a **⋯**. It shows when you point at the row, focus it, or have it
 picked, and opens what a right-click opens. A file's menu opens, renames, downloads and deletes it.
+An open file's name in its toolbar renames it too: click it, type, and **Enter** (**Esc** puts it
+back); its kind stays. A tab's right-click and its **⋯** have **Rename…** and **Copy path**.
 A folder's menu has **New notebook here**, **New SQL file here**, **New Python file here**, **New
 folder here**, **Upload a file here…** and **Delete folder…**, which says how many files go, then
 deletes them all, the marker too.
@@ -134,28 +136,36 @@ selection**, **Run file**, **Format file**, **Format selection**, **Create as ta
 **Create as** makes the statement at the caret (or the selection) a table (its rows as they are now),
 a view (its query, run when read) or a materialized view (kept up to date as its tables change),
 showing the `CREATE … AS` it runs; **Open in a new tab** gives you that SQL to change first.
+The database's name in the toolbar says where the file runs. Its **▾**, on a server (`pondra serve
+--lakes`), picks another database or takes one by name; on a lake, it lists the lakes attached (a
+click puts the name in the file, for `name.table`); both copy the name.
 
 - **Each statement gets an answer.** They run in order in the page's session, and stop at the first
   that fails. Above the results, a numbered tab per answer (`1 done`, `2 5 rows`, `3 failed`, in one
-  row that scrolls) picks the one shown, and the same numbers stand beside the statements in the
-  editor: the one shown has its lines tinted, pointing at a tab tints its statement, and a click on
-  a number shows its answer. **Messages** lists them all with how long each took. A `;` inside a
-  string, a comment or a `$$` body doesn't end a statement.
-- **Explain** (in **Run ▾**, a right-click, or **Ctrl+Shift+E**) shows the plan of the statement the
-  caret is in, or of what is selected, without running it: the same graph as **Plan**.
+  row that scrolls, above **Chart**, **Data profile** and **Plan** too) picks the one shown, and the
+  same numbers stand beside the statements in the editor, tinted once they ran: the one shown has
+  its lines tinted and its number filled. Pointing at a number shows its statement; a click shows
+  its answer and leaves the caret where it is, and a double-click goes to its lines in the file.
+  **Messages** lists them all with how long each took. A `;` inside a string, a comment or a `$$`
+  body doesn't end a statement.
+- **Show execution plan** (in **Run ▾**, a right-click, or **Ctrl+Shift+E**) shows the plan of the
+  statement the caret is in, or of what is selected, without running it, in the **Plan** tab.
+  **Run query profile** runs it with `EXPLAIN ANALYZE` and shows each step's rows and time.
 - **Settings → A SQL file's statements → The last one's answer** runs the file at once instead and
   shows only its last statement's answer.
 - **A `$name` in the file** gets an input above the editor. **Run** sends the values with the
   statements, and the node binds them (numbers and `true`/`false` as such, the rest as text); the
   browser keeps them for the file.
-- **Messages** lists every statement that ran: its SQL, how long it took, and what it did (`rows
-  3`), printed or said. Click one to see it all.
+- **Messages** lists every statement that ran: its number, its SQL, how long it took, what it did
+  (`rows 3`), and what it printed, set apart under **Printed**. A click picks one (its text stays
+  selectable, to copy); a double-click or **Enter** shows its answer and its lines.
 - **Chart** draws the rows: bars, lines, areas, points or a pie, by any column, of any of the number
   columns (the chart picks lines over time, else bars, until you pick). **Save** keeps it as a PNG
   picture or an SVG drawing.
 - **Plan** draws the statement's plan as a graph: each step (a scan, a filter, a join, an
   aggregate) above the steps it reads from, and a dashed box where rows move between cores, or
-  between nodes when a query is spread. **Text** shows `EXPLAIN` as it is. **Query profile** runs
+  between nodes when a query is spread. **Text** shows `EXPLAIN` as it is: the logical plan and the
+  physical one, as planned. **Query profile** runs
   the statement with `EXPLAIN ANALYZE` (it does run it) and puts each step's rows and time on it,
   the costliest marked in red, so you see where the time goes. Its download button copies the plan
   as text, or saves it as text or as a picture (SVG or PNG).
@@ -165,9 +175,10 @@ showing the `CREATE … AS` it runs; **Open in a new tab** gives you that SQL to
   *data* profile is about the rows, a *query* profile about the time the query took.)
 - **Copy** (at the right of the tabs) copies the rows, or the selection, tab-separated with
   the headers; its **▾** has the other forms: without the headers, CSV, JSON, a Markdown table, SQL
-  `VALUES` rows, a SQL list for `IN (…)`, or the columns' names. **Download** runs the statement
-  again on the node and saves every row, not only the ones shown: CSV, TSV, JSON, JSON lines,
-  Parquet or Excel (`.xlsx`).
+  `VALUES` rows, a SQL list for `IN (…)`, or the columns' names. **Download** saves every row, not
+  only the ones shown, from the answer the node keeps (it keeps each for 20 minutes after it was
+  last read; past that, the statement runs again): CSV, TSV, JSON, JSON lines, Parquet or Excel
+  (`.xlsx`).
 - The results sit below the editor or at its right (the button at the right of their bar); drag the
   line between them. In a narrow window, the results give way to keep their buttons in reach.
 - **Right-click** in the editor for cut, copy, paste, select all, comment the lines, the Run ▾'s
@@ -237,6 +248,10 @@ Every answer (a cell's, a SQL file's) and every data file is shown in the same g
   **Shift+click** for a range, a row number for a row, a header for a column (and its profile in
   Details), the corner for everything. The arrow keys move (**Shift**: extend), **Ctrl+A** takes
   all. The bar below shows the selection's sum and average.
+- **Columns:** drag a header's right edge to make a column wider or narrower; double-click the
+  edge to fit it to its values.
+- **JSON:** structs, lists, maps and text that holds JSON are shown in mono, keys, strings, numbers
+  and `true`/`null` each in their colour; point at one to see it whole, laid out.
 - **Copying:** **Ctrl+C** copies tab-separated, so it pastes into a spreadsheet as cells;
   **Ctrl+Shift+C** adds the headers. Right-click for Copy as CSV, JSON, SQL `VALUES` rows or a SQL
   list of every value selected, **Filter to these values**, Sort and Profile.
@@ -279,15 +294,16 @@ ORDER BY total DESC;
 - A statement that changes something (`INSERT`, `CREATE TABLE`) shows what it did, such as
   `rows 3`, and the tables on the left update.
 - Errors come back in plain words, such as `No field named nope. Did you mean 'sales.item'?`.
-- **Explain** (the cell's ⋯, a right-click, or **Ctrl+Shift+E**) shows the plan of what is
-  selected, or of the cell's last statement, without running it.
+- **Show execution plan** (the cell's ⋯, a right-click, or **Ctrl+Shift+E**) shows the plan of what
+  is selected, or of the cell's last statement, without running it; **Run query profile** runs it
+  and shows each step's rows and time.
 - An answer looks as a SQL file's does: **Results**, **Chart**, **Data profile** and **Plan** as
   tabs above it (a chart of the rows, each column summarized, and the plan as a graph with its
   **Query profile**), **Copy ▾** and **Download ▾** at their right, and the line under it with the
   rows, the time and the pages. The tab open, and the chart's settings, are kept with the notebook,
   so it opens with its chart. **Copy ▾** copies the rows shown in any of the forms a SQL file
-  offers, and **Download ▾** saves them as CSV, TSV or JSON; a cell that is one query can also
-  download every row (it runs again on the node).
+  offers, and **Download ▾** saves them as CSV, TSV or JSON, or every row of the answer as the node
+  keeps it (in any of the SQL file's forms).
 - Decimals keep their digits (`1.50`), and integers too big for JavaScript arrive as text, so what
   you see is exactly what the lake holds.
 

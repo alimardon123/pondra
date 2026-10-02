@@ -10,8 +10,8 @@ await moreStyle();
 
 const MOVES = /^(RepartitionExec|CoalescePartitionsExec|SortPreservingMergeExec|CoalesceBatchesExec)$/;
 
-/** The Plan tab's view of `sql` (its `$name`s bound to `params`). */
-export function planView(sql, params) {
+/** The Plan tab's view of `sql` (its `$name`s bound to `params`); `o.profile`: its query profile at once. */
+export function planView(sql, params, o = {}) {
   const box = h('div', { class: 'planv' }), st = { how: 'graph', plan: null, profile: null, busy: false };
   const read = /^\s*(\(|select\b|with\b|values\b|from\b|table\b)/i.test(sql.replace(/--[^\n]*|\/\*[\s\S]*?\*\//g, ' ')); // (a comment before it too)
   const draw = () => {
@@ -22,9 +22,9 @@ export function planView(sql, params) {
       read ? h('button', { class: 'btn small', disabled: st.busy, title: 'Run it with EXPLAIN ANALYZE: each step\'s rows and time (it runs the query)', onclick: profile }, icon('play'), st.busy ? 'Profiling…' : st.profile ? 'Query profile again' : 'Query profile') : null,
       shown?.tree ? h('button', { class: 'icon', title: 'Copy or download the plan', 'aria-label': 'Copy or download the plan', onclick: e => menu(e.currentTarget, [
         { label: 'Copy as text', icon: 'copy', run: () => copyText(shown.text, 'Copied the plan') },
-        { label: 'Download as text', icon: 'down', run: () => saveAs(shown.text, 'text/plain', 'plan.txt') },
-        { label: 'Download as a picture (SVG)', run: () => saveAs(picture(shown.tree), 'image/svg+xml', 'plan.svg') },
-        { label: 'Download as a picture (PNG)', run: () => png(picture(shown.tree)) }]) }, icon('down')) : null),
+        { label: 'Download as text', icon: 'down', hint: '.txt', run: () => saveAs(shown.text, 'text/plain', 'plan.txt') },
+        { label: 'Download as SVG', hint: '.svg', run: () => saveAs(picture(shown.tree), 'image/svg+xml', 'plan.svg') },
+        { label: 'Download as PNG', hint: '.png', run: () => png(picture(shown.tree)) }]) }, icon('down')) : null),
     !shown ? h('div', { class: 'wait' }, 'Reading the plan…') : shown.error ? h('pre', { class: 'err' }, shown.error)
       : st.how === 'text' ? h('pre', { class: 'said plan' }, shown.text) : graph(shown.tree));
   };
@@ -40,7 +40,7 @@ export function planView(sql, params) {
   };
   async function profile() { st.busy = true; draw(); st.profile = await ask(true); st.busy = false; st.how = 'graph'; draw(); }
   ask(false).then(p => { st.plan = p; draw(); });
-  draw();
+  if (o.profile && read) profile(); else draw();
   return box;
 }
 

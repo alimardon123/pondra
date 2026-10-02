@@ -22,7 +22,7 @@ def main():
     a = ap.parse_args()
     home = tempfile.mkdtemp(prefix="pondra-shots-")
     node = subprocess.Popen([BIN, "serve", "--dir", os.path.join(home, "shop"), "--addr", f"127.0.0.1:{PORT}", "--python", sys.executable],
-                            env={**os.environ, "PYTHONPATH": os.path.join(ROOT, "python")}, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                            env={**os.environ, "PYTHONPATH": os.path.join(ROOT, "python"), "PONDRA_CONFIG_DIR": os.path.join(home, "settings")}, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     base = f"http://127.0.0.1:{PORT}"
     send = lambda path, body, method="POST": urllib.request.urlopen(urllib.request.Request(base + path, data=body, method=method)).read()
     try:
@@ -52,7 +52,8 @@ def main():
                 if scheme == "light":
                     p.fill("#nbname", "sales-q1")
                     p.press("#nbname", "Enter")
-                    cells.first.locator(".kind").select_option("markdown")
+                    cells.first.locator(".kind").click()
+                    p.locator("#menu button", has_text="Markdown").click()
                     cells.first.locator("textarea").fill("# Sales by region\nYesterday's orders from the lake, against the Q1 targets.")
                     cells.first.locator("textarea").press("Shift+Enter")
                     cells.nth(1).locator("textarea").fill("SELECT region, count(*) AS orders, sum(amount) AS revenue\nFROM sales GROUP BY region ORDER BY revenue DESC")
@@ -80,6 +81,7 @@ def main():
                     p.click("#runBtn")
                     p.locator(".filedoc .gt").wait_for(timeout=20000)
                     p.wait_for_timeout(500)
+                    p.mouse.move(700, 880)
                     p.screenshot(path=os.path.join(a.out, "console-sql-file.png"))
                 ctx.close()
             browser.close()
