@@ -39,7 +39,7 @@ pub struct Cluster {
     pub addr: String, // a node is known by its address
     pub reader: bool, // read-only nodes never lead, run tasks or accept writes
     pub leader: Term, // fixed for this process's lifetime: a new leader means a restart
-    beats: Mutex<BTreeMap<String, Instant>>, // leader: follower -> last heartbeat
+    beats: Mutex<BTreeMap<String, (Instant, String, u32)>>, // leader: follower -> last heartbeat, its release and format
     view: Mutex<Vec<String>>,                // follower: live nodes, as told by the leader
     last_ok: Mutex<Instant>,                 // follower: last heartbeat the leader answered
     heard: std::sync::atomic::AtomicBool,    // follower: the leader has answered us at least once
@@ -77,7 +77,7 @@ impl Cluster {
             return if self.leader_ok() { self.view.lock().unwrap().clone() } else { vec![] }; // cut off: run no shards
         }
         let beats = self.beats.lock().unwrap();
-        let mut nodes: Vec<String> = beats.iter().filter(|(_, t)| t.elapsed() < LEASE).map(|(a, _)| a.clone()).collect();
+        let mut nodes: Vec<String> = beats.iter().filter(|(_, (t, ..))| t.elapsed() < LEASE).map(|(a, _)| a.clone()).collect();
         nodes.push(self.addr.clone());
         nodes.sort();
         nodes
@@ -89,11 +89,23 @@ impl Cluster {
     }
 
     /// Leader side of a heartbeat: our term and the live members, or nothing while this leader
-    /// can't reach the bucket (the follower takes over: `follow`).
-    pub fn beat(&self, addr: String) -> Option<(u64, Vec<String>)> {
-        self.beats.lock().unwrap().insert(addr, Instant::now());
+    /// can't reach the bucket (the follower takes over: `follow`). (`said`: the follower's release
+    /// and format, `format::said`; the answer keeps its shape, which every release reads.)
+    pub fn beat(&self, addr: String, said: (String, u32)) -> Option<(u64, Vec<String>)> {
+        self.beats.lock().unwrap().insert(addr, (Instant::now(), said.0, said.1));
         (!self.unreached()).then(|| (self.leader.n, self.nodes()))
     }
+
+    /// Leader: the live members' releases, this node's too.
+    pub fn releases(&self) -> BTreeMap<String, String> {
+        let beats = self.beats.lock().unwrap();
+        let mut out: BTreeMap<String, String> = beats.iter().filter(|(_, (t, ..))| t.elapsed() < LEASE).map(|(a, (_, v, _))| (a.clone(), if v.is_empty() { "older".into() } else { v.clone() })).collect();
+        out.insert(self.addr.clone(), crate::format::VERSION.into());
+        out
+    }
+
+    /// Leader: the newest format every live follower knows (None: no followers).
+    pub fn least_known(&self) -> Option<u32> { self.beats.lock().unwrap().values().filter(|(t, ..)| t.elapsed() < LEASE).map(|(_, _, f)| *f).min() }
 
     /// Has this node heard from the leader within the lease? Peers ask before taking over.
     pub fn leader_ok(&self) -> bool { self.is_leader() || self.last_ok.lock().unwrap().elapsed() < LEASE }
@@ -185,6 +197,13 @@ impl Cluster {
                         *self.view.lock().unwrap() = nodes;
                         *self.last_ok.lock().unwrap() = Instant::now();
                         self.heard.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    // A leader that stepped down is gone for good: the next term at once.
+                    Err(_) if stepped_down(&store, self.leader.n).await => {
+                        if !matches!(latest(&store).await, Ok(Some(t)) if t.n > self.leader.n) {
+                            claim(&store, self.leader.n + 1, &self.addr).await.ok();
+                        }
+                        restart("the leader stepped down");
                     }
                     // A member that lost the leader takes over after the lease (if no peer still
                     // hears it). One that never reached it — say, outside the cluster's network —
@@ -353,7 +372,8 @@ pub fn http() -> reqwest::Client {
         return c.clone();
     }
     let made = {
-        let headers: reqwest::header::HeaderMap = token.iter().filter_map(|t| format!("Bearer {t}").parse().ok()).map(|v| (reqwest::header::AUTHORIZATION, v)).collect();
+        let mut headers: reqwest::header::HeaderMap = token.iter().filter_map(|t| format!("Bearer {t}").parse().ok()).map(|v| (reqwest::header::AUTHORIZATION, v)).collect();
+        headers.extend(crate::format::headers().into_iter().filter_map(|(k, v)| Some((reqwest::header::HeaderName::from_static(k), v.parse().ok()?)))); // (who calls: ADR-039)
         let client = |b: reqwest::ClientBuilder| crate::tls::client(b).default_headers(headers.clone()).build(); // (HTTPS between nodes: `tls.rs`)
         client(reqwest::Client::builder()).unwrap_or_else(|e| {
             // (a minimal container image with no CA certificates: nodes talk plain HTTP anyway)
@@ -402,6 +422,16 @@ pub async fn alive(store: &Store, t: &Term) -> bool {
 pub async fn release(store: &Store, n: u64) {
     let _ = store.delete(&Path::from(format!("cluster/alive/{n:020}"))).await;
 }
+
+/// The leader of term `n` stops, drained (`drain.rs`): it says so (`cluster/left/{n}`), so its
+/// followers take over at once instead of waiting out the lease, then releases its term.
+pub async fn step_down(store: &Store, n: u64) {
+    let _ = store.put_opts(&Path::from(format!("cluster/left/{n:020}")), Vec::<u8>::new().into(), PutOptions { mode: PutMode::Create, ..Default::default() }).await;
+    release(store, n).await;
+}
+
+/// Has the leader of term `n` stepped down?
+async fn stepped_down(store: &Store, n: u64) -> bool { store.head(&Path::from(format!("cluster/left/{n:020}"))).await.is_ok() }
 
 /// Re-run this same binary with the same arguments: the new process re-reads its role.
 /// (By the path it was started with: if the binary was upgraded in place, the new one starts.)

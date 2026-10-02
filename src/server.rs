@@ -137,6 +137,8 @@ pub fn router(app: App) -> Router {
         .route("/routines", get(|State(app): State<App>| async move { Ok::<_, E>(Json(j!(*crate::routines::listed(&app.lake).await?))) }))
         .route("/secrets/{name}", get(secret))
         .route("/stats", get(stats))
+        .route("/healthz", get(|| async { "ok" })) // (the process answers: a liveness probe)
+        .route("/ready", get(ready))
         .route("/login", post(login))
         .route("/whoami", get(whoami))
         .route("/objects", get(|State(app): State<App>| async move { Ok::<_, E>(Json(crate::console::objects(&app.lake).await?)) }))
@@ -327,7 +329,10 @@ async fn list_functions(State(app): State<App>) -> Result<Json<Value>, E> {
 /// role too.
 async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response {
     let path = req.uri().path();
-    if app.cluster.cut_off() && !(path.starts_with("/cluster/") || matches!(path, "/healthz" | "/ready" | "/stats" | "/metrics")) {
+    if crate::drain::draining() && !crate::drain::still_taken(path) {
+        return (StatusCode::SERVICE_UNAVAILABLE, [("retry-after", "1")], "this node is stopping: ask another").into_response(); // (`drain.rs`)
+    }
+    if app.cluster.cut_off() && !crate::drain::still_taken(path) {
         // (a leader that can't reach the bucket can't commit, and its reads may already be stale:
         // another node leads soon. The cluster's own calls and the health checks still go through.)
         return (StatusCode::SERVICE_UNAVAILABLE, [("retry-after", "1")], crate::cluster::CUT_OFF_SAYS).into_response();
@@ -448,14 +453,14 @@ struct BeatParams {
     from: String,
 }
 
-async fn beat(State(app): State<App>, Query(p): Query<BeatParams>) -> Result<Json<(u64, Vec<String>)>, Response> {
+async fn beat(State(app): State<App>, Query(p): Query<BeatParams>, headers: axum::http::HeaderMap) -> Result<Json<(u64, Vec<String>)>, Response> {
     // Test hook: followers listed in the file $PONDRA_DROP_BEATS get no answer (a broken link to the leader).
     let dropped = std::env::var("PONDRA_DROP_BEATS").map(|f| std::fs::read_to_string(f).unwrap_or_default()).unwrap_or_default();
     if dropped.lines().any(|a| a == p.from) {
         return Err(StatusCode::SERVICE_UNAVAILABLE.into_response());
     }
     let cut_off = || (StatusCode::SERVICE_UNAVAILABLE, [(crate::cluster::CUT_OFF_HEADER, "1")]).into_response(); // (its followers take over at once)
-    app.cluster.beat(p.from).map(Json).ok_or_else(cut_off)
+    app.cluster.beat(p.from, crate::format::said(&headers)).map(Json).ok_or_else(cut_off)
 }
 
 /// A follower's flush, to be sequenced (leader only).
@@ -502,12 +507,16 @@ async fn job(State(app): State<App>, Json(job): Json<crate::tier::Job>) -> Resul
 }
 
 /// The commit stream (see `Frame`): who leads, then the recent frames, then every new one.
-async fn feed(State(app): State<App>) -> Response {
+async fn feed(State(app): State<App>, headers: axum::http::HeaderMap) -> Response {
     let cat = &app.lake.cat;
+    let streamed = crate::format::Streamed::to(crate::format::said(&headers).1); // (held while the stream is open: `format::raise`)
     let start = Frame::Start { term: app.cluster.leader.n, replicated: cat.replicas > 1 };
     let (recent, rx) = cat.subscribe();
     let live = futures::stream::unfold(rx, |mut rx| async move { rx.recv().await.ok().map(|f| (f, rx)) }); // a lagging follower reconnects
-    let frames = futures::stream::iter([start].into_iter().chain(recent)).chain(live).map(|f| Ok::<_, std::io::Error>(f.encode()));
+    let frames = futures::stream::iter([start].into_iter().chain(recent)).chain(live).map(move |f| {
+        let _ = &streamed;
+        Ok::<_, std::io::Error>(f.encode())
+    });
     Body::from_stream(frames).into_response()
 }
 
@@ -1231,12 +1240,28 @@ async fn tier_now(State(app): State<App>) -> Result<Json<Value>, E> {
     Ok(Json(j!({"rows_tiered": app.tier_all(0).await?})))
 }
 
+/// `GET /ready`: 200 once this node answers as it should (it holds what its leader had: invariant
+/// 197), 503 while it catches up or drains (`drain.rs`): a load balancer's readiness probe.
+async fn ready(State(app): State<App>) -> Response {
+    match (crate::drain::draining(), *app.lake.caught.borrow()) {
+        (true, _) => (StatusCode::SERVICE_UNAVAILABLE, "stopping").into_response(),
+        (_, false) => (StatusCode::SERVICE_UNAVAILABLE, "catching up with the leader").into_response(),
+        _ if app.cluster.cut_off() => (StatusCode::SERVICE_UNAVAILABLE, "can't reach the bucket: another node leads").into_response(),
+        _ => "ready".into_response(),
+    }
+}
+
 async fn stats(State(app): State<App>) -> Json<Value> {
     let c = &app.cluster;
     let role = if c.reader { "reader" } else if app.seq.is_some() { "leader" } else { "follower" };
     let mut s = j!({"lake": crate::ddl::lake_name(&app.lake), "role": role, "leader": c.leader.addr, "term": c.leader.n, "nodes": c.nodes(),
                     "hwm": *app.lake.hwm.borrow(), "shard_runs": c.shard_runs.load(std::sync::atomic::Ordering::Relaxed), "python_workers": crate::python::workers(),
                     "live_queries": crate::live::OPEN.load(std::sync::atomic::Ordering::Relaxed)});
+    s["version"] = j!(crate::format::VERSION);
+    s["format"] = j!(crate::format::of(&app.lake.cat).await.map(|f| f.format).unwrap_or_default()); // (the lake's: ADR-039)
+    if c.is_leader() {
+        s["releases"] = j!(c.releases()); // (each live node's: a rolling upgrade's progress)
+    }
     if let Some(seq) = &app.seq {
         s["untiered_rows"] = j!(app.lake.backlog.load(std::sync::atomic::Ordering::Relaxed));
         let mut ms = seq.commit_ms.lock().unwrap().clone();

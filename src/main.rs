@@ -21,6 +21,7 @@ mod delta;
 mod ext;
 mod feeds;
 mod files;
+mod format;
 mod flight;
 mod fresh;
 mod fsum;
@@ -38,6 +39,7 @@ mod cluster;
 mod console;
 mod xlsx;
 mod dbserver;
+mod drain;
 mod log;
 mod manifest;
 mod metrics;
@@ -450,17 +452,20 @@ async fn run() -> anyhow::Result<()> {
                 cluster.clone().keep_alive(store.clone(), &dir); // (beside the catalog's opening, not before it: C5)
             }
             // Stopped (Ctrl-C, SIGTERM from a scheduler scaling down, or the program that started
-            // this node ending): the next node leads at once instead of waiting out the lease.
-            // Acknowledged writes are already durable.
+            // this node ending): drained first (`drain.rs`; a second signal stops at once), then the
+            // next node leads at once instead of waiting out the lease.
             let (s, n) = (store.clone(), leader.then_some(cluster.leader.n));
             panics::spawn(async move {
                 stopped(stop_with_stdin).await;
+                tokio::select! { _ = drain::drain() => {}, _ = stopped(false) => {} }
                 if let Some(n) = n {
                     if let Some(l) = MAIN.get() {
-                        // (the catalog's memtable written out: the next leader replays no WAL, C5)
+                        // (what it committed in the bucket, with replicated acks too; the catalog's
+                        // memtable written out: the next leader replays no WAL, C5)
+                        let _ = tokio::time::timeout(Duration::from_secs(10), l.cat.wait_durable(l.cat.committed())).await;
                         let _ = tokio::time::timeout(Duration::from_secs(5), l.cat.checkpoint()).await;
                     }
-                    cluster::release(&s, n).await;
+                    cluster::step_down(&s, n).await;
                 }
                 std::process::exit(0);
             });
@@ -468,6 +473,13 @@ async fn run() -> anyhow::Result<()> {
             // so their reads are as fresh as a follower's instead of waiting for catalog polls.
             let streamed = !leader && !cluster.leader.addr.is_empty() && (!reader || cluster.leader_alive().await);
             let lake = match store::Lake::open(&dir, leader, streamed).await {
+                // (a lake a newer Pondra wrote: this binary must not lead or serve it, nor hold the term)
+                Err(e) if e.downcast_ref::<format::Newer>().is_some() => {
+                    if leader {
+                        cluster::release(&store, cluster.leader.n).await;
+                    }
+                    return Err(e);
+                }
                 Err(e) if leader => {
                     eprintln!("opening the lake as leader failed: {e:#}"); // e.g. a newer leader fenced us
                     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -626,7 +638,9 @@ async fn run() -> anyhow::Result<()> {
                 if lake.cat.replicas > 1 {
                     replica::members(lake.clone(), cluster.clone());
                 }
+                format::raise(lake.clone(), cluster.clone()); // (once every node knows this build's format: ADR-039)
             } else {
+                format::watch(lake.clone());
                 cluster::catch_up(lake.clone(), cluster.leader.addr.clone()); // (answers wait until this node holds what the leader had)
                 match reader {
                     false => cluster.clone().follow(store),

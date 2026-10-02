@@ -311,6 +311,8 @@ token is refused.
 | Method and path | Role | Meaning |
 |---|---|---|
 | `GET /stats` | none | health and position, as JSON |
+| `GET /healthz` | none | `ok` (200) while the process runs: a liveness check |
+| `GET /ready` | none | `ready` (200) when the node serves; 503 while it [stops](/pondra/guides/upgrades/#stop-a-node-without-dropping-work), or just after it started and is still catching up with its leader: a readiness check |
 | `POST /login` | none | `{"user", "password"}`: a session for the user, `{"token": "ps_…", "until": ms}`, to send as `Authorization: Bearer …` until it ends (`PONDRA_SESSION_HOURS`) |
 | `GET /whoami` | none | who the request signs in as: `{"user", "role", "superuser", "open"}` |
 | `GET /objects` | read | each table and view of this lake and the lakes attached to it: `catalog`, `schema`, `name`, `kind` (`table`, `view`, `materialized view`, or `files` for [a view of files](/pondra/reference/sql/)), and for a table its `rows` and `bytes` in files, `files`, `key`, `partition`, `cluster`, `publish`, `not_null`, `defaults`; for a view its `sql`. Also `files`: where the lake's own files are, for `read_csv('…')`. What the console's catalog shows |
@@ -330,8 +332,13 @@ token is refused.
 
 `GET /stats` needs no token, so a load balancer can poll it. It answers `lake` (its name), `role` (`leader`,
 `follower` or `reader`), `leader` (its address), `term`, `nodes`, `hwm` (the newest commit),
-`shard_runs`, `python_workers` and `live_queries`. On the leader it also has `untiered_rows`,
-`commits`, `commit_ms_p50` and `commit_ms_p95`.
+`shard_runs`, `python_workers`, `live_queries`, `version` (the node's release) and `format` (the
+lake's, see [upgrades](/pondra/guides/upgrades/#which-releases-can-open-a-lake)). On the leader it
+also has `untiered_rows`, `commits`, `commit_ms_p50`, `commit_ms_p95` and `releases` (each live
+node's release, by address).
+
+A node that is stopping answers every other path with 503 and `Retry-After: 1`: send the request to
+another node.
 
 ```bash
 curl -s http://localhost:8080/stats
@@ -340,7 +347,7 @@ curl -s -X POST http://localhost:8080/tier
 ```
 
 ```text
-{"lake":"lake","role":"leader","leader":"127.0.0.1:8080","term":1,"nodes":["127.0.0.1:8080"],"hwm":7,"shard_runs":1,"python_workers":0,"live_queries":0,"untiered_rows":0,"commits":9,"commit_ms_p50":1.69,"commit_ms_p95":2.98}
+{"lake":"lake","role":"leader","leader":"127.0.0.1:8080","term":1,"nodes":["127.0.0.1:8080"],"hwm":7,"shard_runs":1,"python_workers":0,"live_queries":0,"version":"0.30.0","format":1,"untiered_rows":0,"commits":9,"commit_ms_p50":1.69,"commit_ms_p95":2.98,"releases":{"127.0.0.1:8080":"0.30.0"}}
 # HELP pondra_role 1 for this node's role
 # TYPE pondra_role gauge
 pondra_role{role="leader"} 1
@@ -370,7 +377,9 @@ pondra_role{role="leader"} 1
 ## Between nodes
 
 Nodes in a cluster call each other on these paths. You don't call them, but they are why a
-firewall between nodes must let HTTP through. They need an admin token, except `commit` and
+firewall between nodes must let HTTP through. Each call carries the caller's release and the newest lake format it
+knows (`x-pondra-version`, `x-pondra-format`), so the leader knows when every node can read a newer
+format. They need an admin token, except `commit` and
 `files`, which need a write token, and `leader`, which needs none.
 
 | Path | Meaning |
