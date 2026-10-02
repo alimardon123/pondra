@@ -855,6 +855,10 @@ def cli(a):
             check(f"{where}, a node taking writes: pondra sql killed mid-INSERT; none of it or all of it, the node's writers go on",
                   after in (got, got + n) and load.since(t0) and load.stall(t0, time.time()) < 3 and nd.alive(), (after, load.stall(t0, time.time())))
             load.exactly_once(f"{where}, a node taking writes")
+            if s3:  # (SlateDB tries again for as long as a bucket says no)
+                t0 = time.time()
+                r = subprocess.run([harness.BIN, "sql", "--dir", "s3://no-such-bucket/lake", "SELECT 1"], capture_output=True, text=True, timeout=120)
+                check("pondra sql on a bucket that isn't there says so, at once", r.returncode != 0 and "NoSuchBucket" in r.stderr and time.time() - t0 < 30, r.stderr[-300:])
         finally:
             if nd:
                 nd.kill()

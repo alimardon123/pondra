@@ -447,7 +447,7 @@ async fn run() -> anyhow::Result<()> {
             let leader = cluster.is_leader();
             if leader {
                 // "Still here", in the bucket, from the start: for machines outside the cluster.
-                cluster.clone().keep_alive(store.clone()); // (beside the catalog's opening, not before it: C5)
+                cluster.clone().keep_alive(store.clone(), &dir); // (beside the catalog's opening, not before it: C5)
             }
             // Stopped (Ctrl-C, SIGTERM from a scheduler scaling down, or the program that started
             // this node ending): the next node leads at once instead of waiting out the lease.

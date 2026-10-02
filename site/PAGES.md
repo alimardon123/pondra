@@ -69,6 +69,7 @@ leave them out.
 | `lake-format.mdx` | what's in the folder, and who can read it | `docs/lake-format.md` |
 | `keyed-tables.mdx` | upserts, LSM files, compaction, merge tables, TTL, `order_by` | ADR-006, ADR-021 |
 | `freshness-and-guarantees.mdx` | exactly-once, acks (durable, replicated), what each reader sees when, the numbers | `docs/comparison-spark-flink-fluss.md` (freshness), ADR-009 |
+| `failures.mdx` | what a running lake survives (a node, the leader, the bucket erring, slow, down or cut off from the leader, a full disk, `pondra sql` killed), each door through a failover, giving clients every node, what isn't covered yet | `tools/resilience_check.py`, `python/pondra/client.py`, `js/index.js`, `src/cluster.rs` |
 | `performance.mdx` | TPC-H against DuckDB, Polars, Daft, Spark; streaming against Flink; serving; how to measure yourself | `docs/prototype-status.md`, `docs/comparison-spark-flink-fluss.md` |
 | `compared.mdx` | Pondra next to Spark, Flink, Fluss, DuckDB, Databricks and Snowflake: what each is, where Pondra fits, where they win | `docs/comparison-spark-flink-fluss.md`, ADR-002 |
 | `design-notes.mdx` | the ADRs, one line each, linked on GitHub (`https://github.com/alimardon123/pondra/blob/main/docs/…`) | `docs/README.md` |

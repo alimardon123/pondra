@@ -19,12 +19,13 @@ struct Gate {
     owed: AtomicUsize, // turns to take back as they are handed in (`cap` halved while they were out)
     calm: AtomicUsize, // answers in a row without a slow-down
     shrunk: AtomicU64, // when `cap` last halved (ms)
+    answered: AtomicU64, // when the store last answered, but for a server error (ms): `answered`
     most: usize,
 }
 
 impl Gate {
     fn new(start: usize) -> Gate {
-        Gate { turns: Semaphore::new(start), cap: AtomicUsize::new(start), owed: AtomicUsize::new(0), calm: AtomicUsize::new(0), shrunk: AtomicU64::new(0), most: start * 4 }
+        Gate { turns: Semaphore::new(start), cap: AtomicUsize::new(start), owed: AtomicUsize::new(0), calm: AtomicUsize::new(0), shrunk: AtomicU64::new(0), answered: AtomicU64::new(0), most: start * 4 }
     }
 
     /// The store said slow down: half the turns, once a second at most.
@@ -71,14 +72,21 @@ pub struct Budget {
     inner: ReqwestConnector,
 }
 
+static GATES: LazyLock<Mutex<HashMap<String, Arc<Gate>>>> = LazyLock::new(Default::default);
+
 impl Budget {
     /// The budget of the bucket at `root` (`s3://bucket`): one per node, whatever opens it.
     pub fn of(root: &str) -> Budget {
-        static GATES: LazyLock<Mutex<HashMap<String, Arc<Gate>>>> = LazyLock::new(Default::default);
         let start = std::env::var("PONDRA_BUCKET_REQUESTS").ok().and_then(|n| n.parse().ok()).unwrap_or(256usize).max(4);
         let gate = GATES.lock().unwrap().entry(root.to_string()).or_insert_with(|| Arc::new(Gate::new(start))).clone();
         Budget { gate, inner: ReqwestConnector::default() }
     }
+}
+
+/// When the bucket at `root` last answered this node with anything but a server error (ms; 0:
+/// never): slow or asking to slow down, it is still there (`cluster::keep_alive`).
+pub fn answered(root: &str) -> u64 {
+    GATES.lock().unwrap().get(root).map_or(0, |g| g.answered.load(Relaxed))
 }
 
 impl HttpConnector for Budget {
@@ -102,6 +110,9 @@ impl HttpService for Turns {
             Ok(r) if matches!(r.status().as_u16(), 429 | 503) => self.gate.slow_down(),
             Ok(_) => self.gate.calm(),
             Err(_) => {} // (no answer: not the store's word on its load)
+        }
+        if answer.as_ref().is_ok_and(|r| !matches!(r.status().as_u16(), 500 | 502 | 504)) {
+            self.gate.answered.store(crate::log::now_ms(), Relaxed);
         }
         self.gate.hand_back(turn);
         answer
