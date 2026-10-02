@@ -1617,6 +1617,16 @@ def schemas():
         and q("SELECT sum(n) AS n FROM dbo.nested", 2) == [{"n": 12000}]
     checks["CREATE VIEW over a name in use refused; OR REPLACE replaces"] = err("CREATE VIEW both_t AS SELECT 1 AS x") is not None and err("CREATE VIEW t AS SELECT 1 AS x") is not None \
         and q("CREATE OR REPLACE VIEW both_t AS SELECT k FROM t") and n("both_t") == 3 and err("CREATE TABLE both_t (a BIGINT)") is not None
+    # a view's column list names its columns (TPC-H q15's form), a materialized view's too
+    q("CREATE TABLE vc (k BIGINT, v DOUBLE)")
+    q("INSERT INTO vc VALUES (1, 1.0), (1, 2.0), (2, 5.0)")
+    q("CREATE VIEW vc_sum (key, total) AS SELECT k, sum(v) FROM vc GROUP BY k", 1)
+    q("CREATE VIEW vc_all (a, b) AS SELECT * FROM vc")
+    q("CREATE MATERIALIZED VIEW vc_m (key, total) AS SELECT k, sum(v) AS s FROM vc GROUP BY k", 2)
+    want = [{"key": 1, "total": 3.0}, {"key": 2, "total": 5.0}]
+    checks["CREATE [MATERIALIZED] VIEW v (a, b): its columns named so, over * too; a count that differs refused"] = q("SELECT key, total FROM vc_sum ORDER BY key") == want \
+        and q("SELECT key, total FROM vc_m ORDER BY key", 1) == want and q("SELECT sum(b) AS b FROM vc_all WHERE a = 1") == [{"b": 3.0}] \
+        and err("SELECT k FROM vc_sum") is not None and (err("CREATE VIEW vc_short (a) AS SELECT k, v FROM vc") is not None or err("SELECT a FROM vc_short") is not None)
     # a query over a view, spread over the three nodes: the view reads each node's share
     spread = lambda s: (lambda before: (q(s, spread=0), q(s, spread=1), metrics_of(A.port)["pondra_spread_queries_total"] + metrics_of(A.port)["pondra_shuffled_queries_total"] - before))(
         metrics_of(A.port)["pondra_spread_queries_total"] + metrics_of(A.port)["pondra_shuffled_queries_total"])

@@ -234,6 +234,41 @@ impl Stmt {
     }
 }
 
+/// A view's query with its column list (`CREATE VIEW v (a, b) AS …`, TPC-H q15's form) given to
+/// its outputs: the select list's items renamed, so a materialized view keeps the shape `views.rs`
+/// reads; a query whose outputs can't be renamed one by one (`*`, `VALUES`) is put in a subquery
+/// named so (DataFusion then says when the counts differ).
+fn view_sql(v: &ast::CreateView) -> String {
+    let names: Vec<ast::Ident> = v.columns.iter().map(|c| c.name.clone()).collect();
+    if names.is_empty() {
+        return v.query.to_string();
+    }
+    let mut q = (*v.query).clone();
+    if renamed(&mut q.body, &names) {
+        return q.to_string();
+    }
+    let names = names.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(", ");
+    format!("SELECT * FROM ({}) AS pondra_view ({names})", v.query)
+}
+
+/// A query's outputs renamed in place (a set operation's are its first branch's), if each is one.
+fn renamed(body: &mut ast::SetExpr, names: &[ast::Ident]) -> bool {
+    use ast::SelectItem::{ExprWithAlias, UnnamedExpr};
+    match body {
+        ast::SetExpr::Select(s) if s.projection.len() == names.len() && s.projection.iter().all(|i| matches!(i, UnnamedExpr(_) | ExprWithAlias { .. })) => {
+            let items = std::mem::take(&mut s.projection).into_iter().zip(names).map(|(i, n)| match i {
+                UnnamedExpr(expr) | ExprWithAlias { expr, .. } => ExprWithAlias { expr, alias: n.clone() },
+                other => other,
+            });
+            s.projection = items.collect();
+            true
+        }
+        ast::SetExpr::SetOperation { left, .. } => renamed(left, names),
+        ast::SetExpr::Query(q) => renamed(&mut q.body, names),
+        _ => false,
+    }
+}
+
 /// An option's value as text: a quoted string as it says (`'op = ''D'''` is `op = 'D'`), anything
 /// else as written.
 fn option_text(v: &ast::Expr) -> String {
@@ -461,7 +496,7 @@ pub fn parse(sql: &str) -> Option<Stmt> {
                 }).collect(),
                 _ => Default::default(),
             };
-            let made = Ddl::CreateMaterialized { name: object(&v.name), sql: v.query.to_string(), options };
+            let made = Ddl::CreateMaterialized { name: object(&v.name), sql: view_sql(&v), options };
             Stmt::Ddl(vec![match (v.or_replace, v.if_not_exists) {
                 (true, true) => return Some(Stmt::Invalid("CREATE OR REPLACE … IF NOT EXISTS: one or the other".into())),
                 (true, false) => Ddl::Replacing { name: object(&v.name), then: Box::new(made) },
@@ -470,8 +505,8 @@ pub fn parse(sql: &str) -> Option<Stmt> {
             }])
         }
         Statement::CreateView(v) if v.or_replace && v.if_not_exists => Stmt::Invalid("CREATE OR REPLACE VIEW … IF NOT EXISTS: one or the other".into()),
-        Statement::CreateView(v) if v.temporary => Stmt::TempView(object(&v.name), v.query.to_string(), v.or_replace, v.if_not_exists), // (the session's: `temp.rs`)
-        Statement::CreateView(v) => Stmt::Ddl(vec![unless(v.if_not_exists, &object(&v.name), "relation", Ddl::CreateView { name: object(&v.name), sql: v.query.to_string(), replace: v.or_replace })]),
+        Statement::CreateView(v) if v.temporary => Stmt::TempView(object(&v.name), view_sql(&v), v.or_replace, v.if_not_exists), // (the session's: `temp.rs`)
+        Statement::CreateView(v) => Stmt::Ddl(vec![unless(v.if_not_exists, &object(&v.name), "relation", Ddl::CreateView { name: object(&v.name), sql: view_sql(&v), replace: v.or_replace })]),
         Statement::AttachDatabase { schema_name, database_file_name: ast::Expr::Value(v), .. } => match &v.value {
             ast::Value::SingleQuotedString(dir) | ast::Value::DoubleQuotedString(dir) => Stmt::Ddl(vec![Ddl::Attach { name: ident(&schema_name), dir: dir.clone() }]),
             _ => return None,
