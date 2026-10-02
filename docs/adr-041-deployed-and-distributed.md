@@ -41,7 +41,7 @@ cluster or holds memory when unused (principle 6).
    memory and its cgroup's limit (v2 `memory.max`, v1 `memory.limit_in_bytes`, the smallest over
    the cgroup's ancestors). Before, a node in a 1 GB container planned a third of the *machine's*
    memory for queries: more than the container may use, so the kernel kills it before it spills. `deploy_check.py image`:
-   "its queries are sized by the container's memory".
+   "its queries are sized by the container's memory, not the host's".
 
 4. **Compose** (`deploy/compose/compose.yaml`): three nodes on one shared lake volume, each with
    its own cache, ports 8080–8082 and the Postgres, Flight and Kafka ports beside them; a bucket
