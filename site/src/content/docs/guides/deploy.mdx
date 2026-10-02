@@ -1,0 +1,498 @@
+---
+title: Deploy
+description: Run Pondra as a long-lived service from a container image, a Compose cluster, a Helm chart on Kubernetes, or a system service on Linux, macOS and Windows.
+sidebar:
+  order: 14.5
+---
+
+import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+
+A node is one program that keeps all its state in the lake, so deploying it means giving it a lake, a
+few ports, and something that starts it again when it stops. There are five ways to do that. Pick by
+where you run it:
+
+| You run it on | Use |
+|---|---|
+| One machine with Docker | [the container image](#a-container-image) |
+| One machine, as a three-node cluster | [Compose](#a-cluster-with-compose) |
+| Kubernetes | [the Helm chart](#kubernetes-with-helm) |
+| A server, a VM or a workstation | [`pondra service`](#as-a-service-on-one-machine) |
+| A laptop with a package manager | [Homebrew, winget and Scoop](#homebrew-winget-and-scoop) (not published yet) |
+
+<Aside type="caution">
+The image and the chart are published to GitHub's registry by a release once the project turns that
+on, and the first release that carries them will say so. Until then, build the image from a checkout
+of the repository: `python3 tools/image.py --release 0.30.0 --out ctx`, then
+`docker build -f deploy/docker/Dockerfile -t pondra ctx`, and install the chart from its folder,
+`deploy/helm/pondra`, with `--set image.repository=pondra` and your registry.
+</Aside>
+
+Whichever you pick, the node is the same `pondra serve`. [Clusters](/pondra/guides/clusters/) says what
+several of them do together, [object storage](/pondra/guides/object-storage/) how a bucket becomes the
+lake, and [security](/pondra/guides/security/) how to put tokens and TLS on every door.
+
+## A container image
+
+`ghcr.io/alimardon123/pondra` has an image for `linux/amd64` and `linux/arm64`. Each release is tagged
+with its version and as `latest`, and each tag has a `-python` twin:
+
+| Image | What it holds |
+|---|---|
+| `ghcr.io/alimardon123/pondra:<version>` and `:latest` | the `pondra` binary on a minimal base: CA certificates and no shell |
+| `ghcr.io/alimardon123/pondra:<version>-python` and `:latest-python` | the same on a Debian base with Python and pyarrow: a node that can run [Python functions and procedures](/pondra/guides/functions-and-procedures/) |
+
+Start a node with its lake in a volume:
+
+```bash norun
+docker run -d --name pondra --restart unless-stopped --memory 8g \
+  -p 8080:8080 -v pondra:/data \
+  ghcr.io/alimardon123/pondra:latest
+```
+
+The console and the HTTP API are now at `http://localhost:8080`, and `curl localhost:8080/stats` says
+whether the node is up. The image runs as user 65532, not as root, and its default command is
+`serve lake --addr 0.0.0.0:8080`. Because the working folder is `/data`, that lake is `/data/lake`.
+
+Everything a node keeps is under `/data`, so one volume holds all of it:
+
+| Path | What it is |
+|---|---|
+| `/data/lake` | the lake, when you name none |
+| `/data/cache` | the SSD tier and the replica files of a lake in a bucket (`PONDRA_CACHE_DIR`) |
+| `/data/.pondra` | the key that seals the lake's secrets |
+| `/data/.config` | the console's settings |
+
+`HOME` is `/data` too. A new Docker volume mounted at `/data` takes its owner from the image. A folder
+from the host keeps its own owner, so make it writable by user 65532.
+
+### Doors and options
+
+The image exposes four ports. Only HTTP is on by default; the others open when you give their flag.
+
+| Port | Door | Flag |
+|---|---|---|
+| 8080 | HTTP: the console, the API, MCP and the Iceberg REST catalog | `--addr` |
+| 5432 | Postgres | `--pg` |
+| 8815 | Arrow Flight | `--flight` |
+| 9092 | Kafka | `--kafka` |
+
+Options come after the image name. They replace the default command, so start with `serve lake` and
+`--addr` again. `--kafka-advertise` is the address Kafka clients are told to connect to:
+
+```bash norun
+docker run -d --name pondra --restart unless-stopped --memory 8g \
+  -p 8080:8080 -p 5432:5432 -p 8815:8815 -p 9092:9092 -v pondra:/data \
+  -e PONDRA_ADMIN_TOKEN -e PONDRA_WRITE_TOKEN -e PONDRA_READ_TOKEN -e PONDRA_SECRET_KEY \
+  ghcr.io/alimardon123/pondra:latest \
+  serve lake --addr 0.0.0.0:8080 --pg 0.0.0.0:5432 --flight 0.0.0.0:8815 \
+  --kafka 0.0.0.0:9092 --kafka-advertise localhost:9092
+```
+
+The `-e NAME` flags pass the tokens and the secrets key from your shell. See
+[security](/pondra/guides/security/) for what they are.
+
+<Aside type="caution">
+A node with no tokens lets everyone do everything, and `-p 8080:8080` publishes the port on every
+network interface of the host. While you try it out, publish to this machine only
+(`-p 127.0.0.1:8080:8080`), or set the tokens.
+</Aside>
+
+### A lake in a bucket
+
+Put the lake in a bucket and the volume only holds the node's cache. The credentials are the `AWS_*`
+variables ([object storage](/pondra/guides/object-storage/) has Google Cloud and Azure's, and
+`AWS_ENDPOINT` for R2 and MinIO):
+
+```bash norun
+docker run -d --name pondra --restart unless-stopped --memory 8g \
+  -p 8080:8080 -v pondra-cache:/data \
+  -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_REGION \
+  ghcr.io/alimardon123/pondra:latest \
+  serve --lake s3://my-bucket/lake --addr 0.0.0.0:8080
+```
+
+Run the same on more machines to make a cluster, giving each its own `--advertise host:port`, the
+address the other nodes reach it at.
+
+### Memory
+
+A node uses a third of its memory for queries and spills to disk beyond that. In a container it reads
+that memory from the container's limit, so give the container one (`--memory`). Without a limit it sees
+the host's memory. `--memory-gb` or `PONDRA_MEMORY_GB` sets the figure yourself.
+
+### Python functions
+
+The `-python` image starts with `--python auto`, which lets an admin make functions and procedures that
+run code on the node. That needs a token, so a node without one refuses to start:
+
+```bash norun
+docker run -d --name pondra --restart unless-stopped --memory 8g \
+  -p 8080:8080 -v pondra:/data -e PONDRA_ADMIN_TOKEN \
+  ghcr.io/alimardon123/pondra:latest-python
+```
+
+## A cluster with Compose
+
+`deploy/compose/compose.yaml` in the repository is three nodes on one lake. Every node takes writes and
+queries, one leads, and another takes over if it stops.
+
+```bash norun
+docker compose -f deploy/compose/compose.yaml up -d
+```
+
+Node 1 is on the ports you know, and the others are shifted so all three fit on one machine:
+
+| Node | HTTP and console | Postgres | Flight | Kafka |
+|---|---|---|---|---|
+| `node1` | 8080 | 5432 | 8815 | 9092 |
+| `node2` | 8081 | 5433 | 8816 | 9093 |
+| `node3` | 8082 | 5434 | 8817 | 9094 |
+
+The lake is a volume the three nodes share. Each node also has a volume of its own for `/data`, and the
+key that seals secrets is on a shared volume, so every node opens a secret any of them made. The nodes
+find each other by name on Compose's network (`--advertise node1:8080`).
+
+These variables, set in your shell or in a `.env` file beside the compose file, change it:
+
+| Variable | Default | Does |
+|---|---|---|
+| `PONDRA_IMAGE` | `ghcr.io/alimardon123/pondra:latest` | the image every node runs |
+| `PONDRA_LAKE` | `lake` | the lake: the shared volume, or `s3://bucket/prefix` |
+| `PONDRA_ADMIN_TOKEN`, `PONDRA_WRITE_TOKEN`, `PONDRA_READ_TOKEN`, `PONDRA_SECRET_KEY` | unset | passed to the nodes when you set them |
+
+For a lake in a bucket the file also passes on `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
+`AWS_SESSION_TOKEN`, `AWS_REGION`, `AWS_ENDPOINT` (for R2 or MinIO) and `AWS_ALLOW_HTTP`:
+
+```bash norun
+# .env, beside compose.yaml
+PONDRA_LAKE=s3://my-bucket/lake
+AWS_ACCESS_KEY_ID=…
+AWS_SECRET_ACCESS_KEY=…
+AWS_REGION=us-east-1
+PONDRA_ADMIN_TOKEN=…
+PONDRA_WRITE_TOKEN=…
+PONDRA_READ_TOKEN=…
+```
+
+<Aside type="caution">
+With no tokens set, anyone who can reach the host's ports can read and write the lake, and Compose
+publishes them on every interface. Set the tokens before you share the machine.
+</Aside>
+
+Stop the node that leads and watch another take over. Each node's `GET /stats` says its `role`, its
+`term` and who the `leader` is:
+
+```bash norun
+curl -s localhost:8080/stats
+docker compose -f deploy/compose/compose.yaml stop node1
+curl -s localhost:8081/stats
+curl -s localhost:8082/stats
+docker compose -f deploy/compose/compose.yaml start node1
+```
+
+If `node1` led, one of the other two now reports `"role":"leader"` on a later term, and `node1` comes
+back as a follower. Writes go to any node the whole time. Take the cluster down with `docker compose -f
+deploy/compose/compose.yaml down`; add `-v` to delete the lake and the volumes too.
+
+## Kubernetes with Helm
+
+The chart runs the nodes as a StatefulSet. Each keeps its name, so a restarted node is the same member
+of the cluster, and any of them takes over as leader within seconds. It needs Kubernetes 1.25 or newer.
+
+```bash norun
+helm install pondra oci://ghcr.io/alimardon123/charts/pondra \
+  --set lake=s3://my-bucket/lake \
+  --set bucket.existingSecret=my-bucket-keys
+```
+
+`my-bucket-keys` is a Secret whose keys are the variables the node reads for the bucket
+(`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`, …). The chart's version is the release's,
+and so is the image it runs unless you set `image.tag`.
+
+With nothing set, the same command without the `--set` flags makes one node that keeps its lake on its
+own volume. The install prints how to open the console and read the admin token.
+
+**Names.** What the chart makes is named after the release, with `-pondra` added unless the release's
+name already contains `pondra`. A release called `pondra` makes the service `pondra` and the Secret
+`pondra-tokens`; one called `lake` makes `lake-pondra` and `lake-pondra-tokens`. This page uses the
+first, and the install's own notes print the exact commands for yours.
+
+### Where the lake is
+
+| You set | The lake is | Nodes by default |
+|---|---|---|
+| nothing | a folder, `/data/lake`, on the node's own volume | 1 |
+| `lake` | a bucket: `s3://bucket/prefix`, `gs://bucket/prefix` or `az://container/prefix` | 3 |
+| `sharedStorage.existingClaim` | a folder on a ReadWriteMany claim (NFS, EFS, Filestore, Azure Files); each node mounts its `sharedStorage.subPath` (default `lake`) at `/data/lake` | 3 |
+
+`replicas` sets the number of nodes that write and lead, and the chart refuses the combinations that
+can't work, saying why: several nodes with no shared lake, readers with no shared lake, a folder lake
+with `persistence.enabled=false`, and Python without tokens.
+
+The bucket's credentials come from `bucket.existingSecret` (used as the node's environment) and
+`bucket.env`, plain variables such as the endpoint and region for R2. A bucket's identity can come from
+the service account instead, with `serviceAccount.annotations` (`eks.amazonaws.com/role-arn`,
+`iam.gke.io/gcp-service-account`).
+
+```yaml norun
+lake: s3://my-bucket/lake
+bucket:
+  existingSecret: my-bucket-keys
+  env:
+    AWS_REGION: auto
+    AWS_ENDPOINT: "https://<account>.r2.cloudflarestorage.com"
+resources:
+  requests: {cpu: "2", memory: 8Gi}
+  limits: {memory: 8Gi}
+```
+
+Give the nodes a memory limit in production (`resources.limits.memory`): a node uses a third of its limit
+for queries.
+
+### Tokens and the key
+
+`auth.enabled` is on by default. On the first install the chart makes the admin, write and read tokens
+and keeps them in a Secret named after the release (for a release called `pondra`, `pondra-tokens`),
+which an upgrade leaves as it is. Read the admin token from it:
+
+```bash norun
+kubectl get secret pondra-tokens -o jsonpath='{.data.PONDRA_ADMIN_TOKEN}' | base64 -d
+```
+
+It is the console's Sign in, the `Bearer` token for HTTP and the password of Postgres's user `admin`.
+`PONDRA_WRITE_TOKEN` and `PONDRA_READ_TOKEN` are in the same Secret. Add `-n <namespace>` if the release
+isn't in your current one.
+
+A second Secret, `pondra-key`, holds `PONDRA_SECRET_KEY`: the key that seals the lake's secrets
+(`CREATE SECRET`), the same on every node. `helm uninstall` leaves it in place, and **losing it loses
+the secrets sealed with it**, so back it up. The tokens' Secret goes with the release.
+
+To bring your own, set `auth.existingSecret` (keys `PONDRA_ADMIN_TOKEN`, `PONDRA_WRITE_TOKEN`,
+`PONDRA_READ_TOKEN`) and `secretKey.existingSecret` (key `PONDRA_SECRET_KEY`). Do that with Argo CD
+or Flux too: they render the chart without the cluster, so they can't see the Secret the chart made
+and would make new ones each time. Nodes read tokens and the key when they start, so restart the
+nodes after you change a Secret.
+
+### TLS
+
+Give `tls.existingSecret` a `kubernetes.io/tls` Secret, as cert-manager makes: `tls.crt`, `tls.key` and
+`ca.crt`. Every door then takes TLS, the nodes call each other over HTTPS, and the probes use it. The
+certificate's names must cover how the nodes reach each other: `*.pondra-nodes.<namespace>.svc` and
+`*.pondra-nodes.<namespace>.svc.cluster.local`, for a release called `pondra` (`lake-pondra-nodes` for
+one called `lake`). With `tls.mutual: true` the nodes also show certificates to each other, signed by
+`ca.crt`. [Security](/pondra/guides/security/#tls) has what each setting means.
+
+### Doors
+
+HTTP, with the console and the API, is always on at 8080. The others:
+
+| Value | Default | Door |
+|---|---|---|
+| `postgres.enabled` | `true` | Postgres, 5432 |
+| `flight.enabled` | `false` | Arrow Flight, 8815 |
+| `kafka.enabled` | `false` | Kafka, 9092 |
+
+The service `pondra` reaches any one of the nodes; its `service.type` is `ClusterIP` unless you
+change it. `postgres.port`, `flight.port` and `kafka.port` set the port the service listens on. Each
+node tells Kafka clients its own name inside the cluster, so Kafka works for clients in the cluster
+only. `ingress.enabled` with `ingress.hosts` (and `ingress.className`,
+`ingress.tls`, `ingress.annotations`) publishes HTTP and the console.
+
+Postgres from your machine goes through a port-forward:
+
+```bash norun
+kubectl port-forward svc/pondra 5432
+PGPASSWORD="$(kubectl get secret pondra-tokens -o jsonpath='{.data.PONDRA_ADMIN_TOKEN}' | base64 -d)" \
+  psql "host=localhost user=admin dbname=lake"
+```
+
+### Readers
+
+A reader answers SQL and never leads, so reads can scale apart from writes. Readers need the lake shared
+(a bucket or `sharedStorage.existingClaim`).
+
+```yaml norun
+readers:
+  replicas: 2
+  resources:
+    requests: {cpu: "1", memory: 4Gi}
+    limits: {memory: 4Gi}
+```
+
+Or let an autoscaler choose, with `readers.replicas` left out. Kubernetes scales on use of the CPU
+request, so give `readers.resources` one:
+
+```yaml norun
+readers:
+  autoscaling:
+    enabled: true
+    minReplicas: 1
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+```
+
+While there are readers, a second service, `pondra-read`, reaches the nodes and the readers together.
+Point dashboards and BI tools at it for reads; a reader refuses writes, so writers keep to `pondra`.
+
+### Check it and watch it
+
+```bash norun
+helm test pondra
+kubectl port-forward svc/pondra 8080
+curl -s localhost:8080/stats
+```
+
+`helm test` asks every node for its `/stats` and fails unless they agree on one leader. `/stats` shows
+who leads and who is in the cluster. With `podMonitor.enabled`, the Prometheus Operator scrapes every
+pod's `GET /metrics` (every `podMonitor.interval`, `30s` by default) with the read token.
+
+### More values
+
+| Value | Default | Does |
+|---|---|---|
+| `image.repository`, `image.tag`, `image.pullPolicy` | `ghcr.io/alimardon123/pondra`, the chart's `appVersion`, `IfNotPresent` | the image; `imagePullSecrets` for a private registry |
+| `python.enabled` | `false` | the `-python` image and `--python auto` (needs `auth.enabled`) |
+| `ack`, `ackReplicas` | `durable`, `2` | when a write is acknowledged: `replicated` holds it on `ackReplicas` nodes ([clusters](/pondra/guides/clusters/#failover)) |
+| `persistence.enabled`, `.size`, `.storageClass`, `.accessModes` | `true`, `20Gi`, the cluster's default, `[ReadWriteOnce]` | each node's `/data` |
+| `resources` | `{}` | CPU and memory of a node |
+| `podDisruptionBudget.enabled`, `.maxUnavailable` | `true`, `1` | one node away at a time (with more than one node) |
+| `terminationGracePeriodSeconds` | `60` | the time a stopping node has to hand the lead on |
+| `extraArgs`, `extraEnv`, `extraEnvFrom`, `extraVolumes`, `extraVolumeMounts` | `[]` | more `pondra serve` flags, variables and volumes, such as `[--tier-secs, "5", --publish, "delta,iceberg"]` |
+
+The pods run as user 65532 with a read-only root filesystem and every capability dropped. Uninstalling
+keeps each node's volume (the StatefulSet retains them on delete and scale-down), so delete those
+yourself when you mean to.
+
+## As a service on one machine
+
+`pondra service` makes the machine keep a node running: it starts at boot, starts again if it stops, and
+is stopped cleanly. It uses the system's own manager, systemd, launchd or Windows's service manager,
+so there is nothing else to install.
+
+```bash norun
+pondra service install [--name NAME] [serve options…]
+pondra service status [--name NAME]
+pondra service uninstall [--name NAME]
+```
+
+- **The options after `install` are `pondra serve`'s.** `pondra service install --help` lists them. A
+  mistake is said when you install, not in a log at boot.
+- **`--name`** is the service's name (`pondra` by default: letters, digits, `-` and `_`). Several nodes
+  on one machine need a name each, and their own ports and lakes.
+- **The lake** is `lake` under the folder you ran `install` from, unless you name one (`--lake`,
+  `--lakes` or a path). Other relative paths in the options are relative to that folder too.
+- **Variables.** The service keeps the variables that start with `PONDRA_`, `AWS_`, `AZURE_` and
+  `GOOGLE_` which are set in the terminal you install from, so set the tokens, the secrets key and the
+  bucket's credentials first. They are saved in the service's settings file, readable by the
+  service's user alone, and a new `install` is how you change them.
+- **Install again** with the same name to change the options: the service stops, takes the new ones and
+  starts.
+- **The binary** is the one you installed with, by its path. Put a newer one at that path and the next
+  start runs it.
+- **`status`** says whether the service runs, the `pondra serve` command it runs, the node's role, term
+  and leader as `/stats` gives them, and where the logs are.
+- **`uninstall`** stops and removes the service. The lake and its logs stay.
+
+<Tabs syncKey="os">
+  <TabItem label="Linux">
+    ```bash norun
+    sudo pondra service install --addr 0.0.0.0:8080 --pg 0.0.0.0:5432
+    pondra service status
+    ```
+
+    With `sudo` it is a system service, `/etc/systemd/system/pondra.service`, started at boot and run as
+    the user who called `sudo` (as root only if you were root). Without `sudo` it is a user service,
+    `~/.config/systemd/user/pondra.service`, and the command turns on lingering for you
+    (`loginctl enable-linger`) so it starts at boot and survives you logging out. If systemd refuses,
+    the output says so, and the service then runs only while you are logged in
+    (`sudo loginctl enable-linger $USER` fixes that).
+
+    systemd starts the node again two seconds after it ends and gives a stop 60 seconds. Its logs are
+    in the journal: `journalctl -u pondra`, or `journalctl --user -u pondra` for a user service. The
+    settings are `/etc/pondra/services/pondra.json` or `~/.config/pondra/services/pondra.json`.
+  </TabItem>
+  <TabItem label="macOS">
+    ```bash norun
+    sudo pondra service install --addr 0.0.0.0:8080 --pg 0.0.0.0:5432
+    pondra service status
+    ```
+
+    With `sudo` it is a launchd daemon, `/Library/LaunchDaemons/pondra.plist`, started at boot and run as
+    the user who called `sudo`. Without `sudo` it is a launchd agent,
+    `~/Library/LaunchAgents/pondra.plist`, started when you log in.
+
+    launchd keeps it alive and gives a stop 60 seconds. The log is `/Library/Logs/pondra/pondra.log` for
+    a daemon and `~/Library/Logs/pondra/pondra.log` for an agent. The settings are
+    `/etc/pondra/services/pondra.json` or `~/.config/pondra/services/pondra.json`.
+  </TabItem>
+  <TabItem label="Windows">
+    In a terminal opened as Administrator, set what the node needs, then install:
+
+    ```powershell norun
+    $env:PONDRA_ADMIN_TOKEN = "…"
+    pondra service install --addr 0.0.0.0:8080 --pg 0.0.0.0:5432
+    pondra service status
+    ```
+
+    It is a Windows service named `pondra` (shown as "Pondra (pondra)" in Services), started
+    automatically at boot and run as LocalSystem. The service manager runs a small supervisor, which
+    runs the node, starts it again whenever it ends, and stops it by closing its standard input. If
+    Windows shuts down it waits up to 60 seconds for the node.
+
+    The log is `%ProgramData%\pondra\logs\pondra.log`; past 64 MB it becomes `pondra.log.1`, and one
+    old log is kept. The settings are `%ProgramData%\pondra\services\pondra.json`, readable only by
+    SYSTEM and Administrators, so run `status` and `uninstall` from an Administrator terminal too.
+  </TabItem>
+</Tabs>
+
+On Linux and macOS, `sudo` has a `PATH` and an environment of its own. If it can't find `pondra`, run
+`sudo "$(command -v pondra)" service install …`, and keep your variables with `sudo -E`:
+
+```bash norun
+export AWS_ACCESS_KEY_ID=… AWS_SECRET_ACCESS_KEY=… AWS_REGION=us-east-1
+sudo -E pondra service install --name edge --lake s3://my-bucket/lake --addr 10.0.0.1:8080
+```
+
+## Homebrew, winget and Scoop
+
+<Aside type="caution">
+The Homebrew formula, the winget manifests and the Scoop manifest are prepared but **not published
+yet**. They come with a later release. Until then, install with the
+[installers, pip or npm](/pondra/start/install/), and use `pondra service` to keep a node running.
+</Aside>
+
+When they are out, they put the `pondra` program on your machine, and nothing more:
+
+```bash norun
+brew install alimardon123/pondra/pondra
+brew services start pondra
+winget install Pondra.Pondra
+```
+
+```powershell norun
+scoop bucket add pondra https://github.com/alimardon123/scoop-pondra
+scoop install pondra/pondra
+```
+
+`brew services start pondra` runs a node on a lake of its own at `http://127.0.0.1:8080`. winget and
+Scoop install `pondra.exe` and put it on your `PATH`.
+
+## Stop a node cleanly
+
+A node stops cleanly on SIGTERM or Ctrl-C (on Windows, when its standard input closes). A leader gives
+up its term, and another node leads within a few seconds. If a node is killed or its machine is lost, the others
+notice in about five seconds. [Clusters](/pondra/guides/clusters/#failover) has the details. Each way
+of running a node stops it this way and waits a while for it:
+
+| Run with | Stopped by | Waits up to |
+|---|---|---|
+| `docker run` | `docker stop pondra` | Docker's stop timeout, 10 seconds unless you give `--time` |
+| Compose | `docker compose stop node1` | 30 seconds (`stop_grace_period`) |
+| Helm | a pod deleted, a rolling update, a scale-down | 60 seconds (`terminationGracePeriodSeconds`) |
+| systemd | `systemctl stop pondra` | 60 seconds (`TimeoutStopSec`) |
+| launchd | the daemon or agent stopping | 60 seconds (`ExitTimeOut`) |
+| Windows service | stopping the service, or the machine shutting down | 60 seconds |
+
+A stopped node that starts again follows the new leader. Compose and the chart restart a node that
+stops on its own, and so do the system managers; for `docker run`, add `--restart unless-stopped`, as
+the examples above do.

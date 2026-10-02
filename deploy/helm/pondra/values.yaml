@@ -4,6 +4,9 @@
 #     --set bucket.existingSecret=my-bucket-keys   # (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, …)
 #
 # With nothing set, one node keeps its lake on its own volume: `helm install pondra deploy/helm/pondra`.
+#
+# What it makes is named <release>-pondra-…, or <release>-… when the release's name holds "pondra"
+# (`helm install pondra` makes pondra-tokens, pondra-nodes, pondra-read).
 
 # Where the lake is: s3://bucket/prefix (S3, R2, MinIO), gs://bucket/prefix, az://container/prefix.
 # Empty: a folder, /data/lake, on the node's own volume (one node) or on `sharedStorage` (several).
