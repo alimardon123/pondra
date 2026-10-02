@@ -448,7 +448,7 @@ pub async fn table_view(lake: &Lake, ctx: &SessionContext, name: &str, meta: &Ta
     if meta.key.is_empty() {
         let schema = read_schema(&meta.columns)?;
         let ranges = crate::manifest::ranges(name, &crate::manifest::list(lake, meta).await?, &meta.files, &schema);
-        return Ok(Arc::new(Pruned { lake: lake.arc(), name: name.into(), meta: meta.clone(), manifests: None, upto, at: upto, schema, share: None, ranges, range: None }));
+        return Ok(Arc::new(Pruned { lake: lake.arc(), name: name.into(), meta: meta.clone(), manifests: None, upto, at: upto, schema, share: None, ranges, range: None, stats: Default::default() }));
     }
     let df = raw(lake, ctx, name, meta, upto).await?;
     let aux = lake.session();
@@ -470,27 +470,15 @@ pub struct Pruned {
     pub share: Option<(u64, u64)>, // a distributed query's slice of it, and the whole table's (rows, bytes)
     pub ranges: Arc<crate::manifest::Stats>, // every column's min and max over the whole table
     pub range: Option<crate::ranges::Range>, // a distributed query's slice by a key's range: only its rows
+    pub stats: std::sync::OnceLock<datafusion::common::Statistics>, // (worked out once: the join order asks for them per input it costs)
 }
 
 impl std::fmt::Debug for Pruned {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { write!(f, "Pruned({})", self.name) }
 }
 
-#[async_trait::async_trait]
-impl TableProvider for Pruned {
-    fn schema(&self) -> SchemaRef { self.schema.clone() }
-    fn table_type(&self) -> datafusion::datasource::TableType { datafusion::datasource::TableType::Base }
-
-    fn supports_filters_pushdown(&self, filters: &[&Expr]) -> datafusion::error::Result<Vec<datafusion::logical_expr::TableProviderFilterPushDown>> {
-        Ok(vec![datafusion::logical_expr::TableProviderFilterPushDown::Inexact; filters.len()]) // (they choose files; rows are filtered above)
-    }
-
-    /// How big the table is, from what the catalog already knows: its files' row counts and bytes,
-    /// plus the sealed manifests' totals (`manifest.rs`), without opening a single footer. A
-    /// distributed query's slice reports the whole table (`share`), so every node orders its joins
-    /// alike. The log tail isn't counted — it is bounded by a tiering round, and this is for
-    /// choosing a join order (`optimize::JoinOrder`), not for counting rows.
-    fn statistics(&self) -> Option<datafusion::common::Statistics> {
+impl Pruned {
+    fn count(&self) -> datafusion::common::Statistics {
         use datafusion::common::stats::Precision;
         let (rows, bytes) = self.share.unwrap_or_else(|| {
             let sealed = self.meta.sealed.clone().unwrap_or_default();
@@ -513,7 +501,26 @@ impl TableProvider for Pruned {
                 (stats.column_statistics[i].min_value, stats.column_statistics[i].max_value) = (Precision::Inexact(lo), Precision::Inexact(hi));
             }
         }
-        Some(stats)
+        stats
+    }
+}
+
+#[async_trait::async_trait]
+impl TableProvider for Pruned {
+    fn schema(&self) -> SchemaRef { self.schema.clone() }
+    fn table_type(&self) -> datafusion::datasource::TableType { datafusion::datasource::TableType::Base }
+
+    fn supports_filters_pushdown(&self, filters: &[&Expr]) -> datafusion::error::Result<Vec<datafusion::logical_expr::TableProviderFilterPushDown>> {
+        Ok(vec![datafusion::logical_expr::TableProviderFilterPushDown::Inexact; filters.len()]) // (they choose files; rows are filtered above)
+    }
+
+    /// How big the table is, from what the catalog already knows: its files' row counts and bytes,
+    /// plus the sealed manifests' totals (`manifest.rs`), without opening a single footer. A
+    /// distributed query's slice reports the whole table (`share`), so every node orders its joins
+    /// alike. The log tail isn't counted — it is bounded by a tiering round, and this is for
+    /// choosing a join order (`optimize::JoinOrder`), not for counting rows.
+    fn statistics(&self) -> Option<datafusion::common::Statistics> {
+        Some(self.stats.get_or_init(|| self.count()).clone())
     }
 
     async fn scan(&self, _: &dyn datafusion::catalog::Session, projection: Option<&Vec<usize>>, filters: &[Expr], _: Option<usize>) -> datafusion::error::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {

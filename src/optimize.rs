@@ -541,7 +541,8 @@ impl OptimizerRule for SemiJoinDown {
 /// table carries those rows through every join after it. This picks the order by what the catalog
 /// already knows — each table's row count and each column's range (`query::Pruned::statistics`,
 /// from the file and manifest entries, which cost nothing to read) — building the tree one input
-/// at a time, each time the one that leaves the fewest rows in flight.
+/// at a time, each time the one that leaves the fewest rows in flight, from each input in turn,
+/// and taking the cheapest of those trees.
 ///
 /// A join's rows are estimated the textbook way — `rows(a) × rows(b) / distinct(key)`, a side
 /// whose distinct count nothing knows counting as one row per value, which is what a key usually
@@ -585,12 +586,31 @@ impl OptimizerRule for JoinOrder {
         if leaves.len() < 3 {
             return Ok(Transformed::no(plan)); // (two inputs: the build side is chosen by size when it runs)
         }
-        let Some(sizes) = leaves.iter().map(size).collect::<Option<Vec<Size>>>() else { return Ok(Transformed::no(plan)) };
+        let Some(mut sizes) = leaves.iter().map(size).collect::<Option<Vec<Size>>>() else { return Ok(Transformed::no(plan)) };
+        let named: std::collections::HashSet<&str> = keys.iter().flat_map(|(l, r)| [l, r]).flat_map(|e| e.column_refs()).map(|c| c.name.as_str()).collect();
+        sizes.iter_mut().for_each(|s| s.distinct.retain(|c, _| named.contains(c.as_str()))); // (only keys' bounds are ever asked for)
         let asked: Vec<usize> = (0..leaves.len()).collect();
-        let order = cheapest(&leaves, &sizes, &keys)?;
-        // Both costed the same way, and only when every step joins on a key: a tree with a cross
-        // join in it is one these estimates can say nothing useful about.
-        let (Some((_, was)), Some(now)) = (as_written(&plan, equality)?, rows_moved(&leaves, &sizes, &keys, &order)?) else { return Ok(Transformed::no(plan)) };
+        // The greedy order from every input in turn, the cheapest taken: starting from the smallest
+        // alone began TPC-DS q72 at its 5 warehouses, then all of the inventory (81 s; DuckDB's
+        // order, the sales cut by their dates and demographics first, takes 1 s). Only orders whose
+        // every step joins on a key count: a tree with a cross join in it is one these estimates
+        // can say nothing useful about.
+        // Costed over which inputs each key reads (`reads`), not over schemas built a step at a time:
+        // every start's every candidate, in an 18-table query, made q64's planning 0.5 s longer.
+        let Some(sides) = reads(&leaves, &keys, plan.schema()) else { return Ok(Transformed::no(plan)) };
+        let mut starts = asked.clone();
+        starts.sort_by_key(|&i| (sizes[i].rows, i)); // (ties: the smallest first, as before)
+        let mut best: Option<(u64, Vec<usize>)> = None;
+        for first in starts {
+            let order = cheapest(&sizes, &keys, &sides, first);
+            if let Some(cost) = rows_moved(&sizes, &keys, &sides, &order) {
+                if best.as_ref().is_none_or(|(b, _)| cost < *b) {
+                    best = Some((cost, order));
+                }
+            }
+        }
+        // Both costed the same way.
+        let (Some((_, was)), Some((now, order))) = (as_written(&plan, equality)?, best) else { return Ok(Transformed::no(plan)) };
         if order == asked || now.saturating_mul(margin()) >= was {
             return Ok(Transformed::no(plan));
         }
@@ -683,8 +703,11 @@ fn joined(a: &Size, b: &Size, rows: u64) -> Size {
 /// other that share its key, which is `rows(a) × rows(b) / distinct(key)` — the textbook estimate,
 /// and the one that catches a join on a column with few values (TPC-H q5 joins customers to
 /// suppliers by nation: 25 values, so every customer meets 400 suppliers). A side whose distinct
-/// count nothing knows counts as one row per value, which is what a key usually is.
-fn join_rows(a: &Size, b: &Size, on: &[(Expr, Expr)]) -> u64 {
+/// count nothing knows counts as one row per value, which is what a key usually is. A join on
+/// several keys counts the one that spreads the rows most, not their product: the keys of a row
+/// go together (lineitem's part and supplier are partsupp's key), and multiplied they made TPC-H q9
+/// start by joining partsupp to all of lineitem, as if 2,400 rows came out (6 million do).
+fn join_rows(a: &Size, b: &Size, on: &[(&Expr, &Expr)]) -> u64 {
     let (ra, rb) = (a.rows.max(1) as f64, b.rows.max(1) as f64);
     if on.is_empty() {
         return (ra * rb).min(u64::MAX as f64) as u64; // a cross join
@@ -692,34 +715,68 @@ fn join_rows(a: &Size, b: &Size, on: &[(Expr, Expr)]) -> u64 {
     let spread: f64 = on.iter().map(|(l, r)| {
         let d = |s: &Size, e: &Expr, rows: f64| s.of(e).map_or(rows, |n| n as f64);
         d(a, l, ra).max(d(b, r, rb)).max(1.0)
-    }).product();
+    }).fold(1.0, f64::max);
     (ra * rb / spread).max(1.0).min(u64::MAX as f64) as u64
 }
 
-/// The order to join the inputs in: the cheapest first pair, then each time the input that leaves
-/// the fewest rows. Inputs that share no key with what is built go last — a cross join the query
+/// Which inputs each key's two sides read (a bit an input), for a key every column of which is in
+/// exactly one input and that can be hashed; `None` for more than 64 inputs.
+fn reads(leaves: &[LogicalPlan], keys: &[(Expr, Expr)], all: &DFSchema) -> Option<Vec<Option<(u64, u64)>>> {
+    use datafusion::logical_expr::ExprSchemable;
+    if leaves.len() > 64 {
+        return None;
+    }
+    let side = |e: &Expr| -> Option<u64> {
+        let mut bits = 0u64;
+        for c in e.column_refs() {
+            let mut whose = leaves.iter().enumerate().filter(|(_, l)| l.schema().has_column(c)).map(|(n, _)| n);
+            let (Some(n), None) = (whose.next(), whose.next()) else { return None };
+            bits |= 1 << n;
+        }
+        (bits != 0).then_some(bits)
+    };
+    Some(keys.iter().map(|(l, r)| Some((side(l)?, side(r)?)).filter(|_| l.get_type(all).is_ok_and(|t| can_hash(&t)))).collect())
+}
+
+/// The keys that join input `i` to the inputs in `built`, each written (built side, `i`'s side), as
+/// `connect` finds them in the schemas.
+fn joining<'a>(keys: &'a [(Expr, Expr)], sides: &[Option<(u64, u64)>], built: u64, i: usize) -> Vec<(&'a Expr, &'a Expr)> {
+    let mut on: Vec<(&Expr, &Expr)> = vec![];
+    for ((l, r), side) in keys.iter().zip(sides) {
+        let pair = match *side {
+            Some((a, b)) if a & !built == 0 && b == 1 << i => (l, r),
+            Some((a, b)) if b & !built == 0 && a == 1 << i => (r, l),
+            _ => continue,
+        };
+        if !on.contains(&pair) {
+            on.push(pair);
+        }
+    }
+    on
+}
+
+/// The order to join the inputs in, starting from `first`: each time the input that leaves the
+/// fewest rows. Inputs that share no key with what is built go last — a cross join the query
 /// already asked for, never one this makes up.
-fn cheapest(leaves: &[LogicalPlan], sizes: &[Size], keys: &[(Expr, Expr)]) -> Result<Vec<usize>> {
-    let mut todo: Vec<usize> = (0..leaves.len()).collect();
+fn cheapest(sizes: &[Size], keys: &[(Expr, Expr)], sides: &[Option<(u64, u64)>], first: usize) -> Vec<usize> {
+    let mut todo: Vec<usize> = (0..sizes.len()).filter(|&i| i != first).collect();
     todo.sort_by_key(|&i| (sizes[i].rows, i));
-    let first = todo.remove(0); // (the smallest input: nothing else is joined yet, so nothing else can be costed)
-    let (mut order, mut built, mut schema) = (vec![first], sizes[first].clone(), leaves[first].schema().as_ref().clone());
+    let (mut order, mut built, mut mask) = (vec![first], sizes[first].clone(), 1u64 << first);
     while !todo.is_empty() {
         let mut best: Option<(u64, usize, usize)> = None; // (rows, whether it is joined at all, place in todo)
         for (at, &i) in todo.iter().enumerate() {
-            let on: Vec<(Expr, Expr)> = connect(keys, &schema, leaves[i].schema())?.into_iter().map(|(_, p)| p).collect();
+            let on = joining(keys, sides, mask, i);
             let rank = (join_rows(&built, &sizes[i], &on), usize::from(on.is_empty()), at);
             if best.is_none_or(|b| (rank.1, rank.0) < (b.1, b.0)) {
                 best = Some(rank);
             }
         }
-        let at = best.expect("something is left to join").2;
+        let (rows, _, at) = best.expect("something is left to join");
         let i = todo.remove(at);
-        let on: Vec<(Expr, Expr)> = connect(keys, &schema, leaves[i].schema())?.into_iter().map(|(_, p)| p).collect();
-        (built, schema) = (joined(&built, &sizes[i], join_rows(&built, &sizes[i], &on)), build_join_schema(&schema, leaves[i].schema(), &JoinType::Inner)?);
+        (built, mask) = (joined(&built, &sizes[i], rows), mask | 1 << i);
         order.push(i);
     }
-    Ok(order)
+    order
 }
 
 /// What the tree as the query wrote it costs, and how big its result is — the shape it has, which
@@ -733,22 +790,22 @@ fn as_written(plan: &LogicalPlan, equality: NullEquality) -> Result<Option<(Size
     if j.on.is_empty() {
         return Ok(None);
     }
-    let rows = join_rows(&l, &r, &j.on);
+    let rows = join_rows(&l, &r, &j.on.iter().map(|(a, b)| (a, b)).collect::<Vec<_>>());
     Ok(Some((joined(&l, &r, rows), cl.saturating_add(cr).saturating_add(rows))))
 }
 
 /// What joining them left-deep in this order costs: the rows every step leaves, added up.
-fn rows_moved(leaves: &[LogicalPlan], sizes: &[Size], keys: &[(Expr, Expr)], order: &[usize]) -> Result<Option<u64>> {
-    let (mut built, mut schema, mut total) = (sizes[order[0]].clone(), leaves[order[0]].schema().as_ref().clone(), 0u64);
+fn rows_moved(sizes: &[Size], keys: &[(Expr, Expr)], sides: &[Option<(u64, u64)>], order: &[usize]) -> Option<u64> {
+    let (mut built, mut mask, mut total) = (sizes[order[0]].clone(), 1u64 << order[0], 0u64);
     for &i in &order[1..] {
-        let on: Vec<(Expr, Expr)> = connect(keys, &schema, leaves[i].schema())?.into_iter().map(|(_, p)| p).collect();
+        let on = joining(keys, sides, mask, i);
         if on.is_empty() {
-            return Ok(None); // a step with nothing to join on: not an order worth trusting
+            return None; // a step with nothing to join on: not an order worth trusting
         }
         let rows = join_rows(&built, &sizes[i], &on);
-        (built, schema, total) = (joined(&built, &sizes[i], rows), build_join_schema(&schema, leaves[i].schema(), &JoinType::Inner)?, total.saturating_add(rows));
+        (built, mask, total) = (joined(&built, &sizes[i], rows), mask | 1 << i, total.saturating_add(rows));
     }
-    Ok(Some(total))
+    Some(total)
 }
 
 /// The keys that join `right` to what is built, each written (built side, right side) and with

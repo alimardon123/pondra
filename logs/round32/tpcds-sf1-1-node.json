@@ -1,0 +1,607 @@
+{
+ "sf": "1",
+ "nodes": 1,
+ "queries": 99,
+ "same": 99,
+ "load_s": 62.2,
+ "secs": 26,
+ "pondra_s": 18.23,
+ "duckdb_s": 7.78,
+ "not_same": {},
+ "each": {
+  "q01.sql": {
+   "duckdb_s": 0.058,
+   "pondra_s": 0.092,
+   "verdict": "same",
+   "rows": 100
+  },
+  "q02.sql": {
+   "duckdb_s": 0.061,
+   "pondra_s": 0.283,
+   "verdict": "same",
+   "rows": 2513
+  },
+  "q03.sql": {
+   "duckdb_s": 0.04,
+   "pondra_s": 0.119,
+   "verdict": "same",
+   "rows": 89
+  },
+  "q04.sql": {
+   "duckdb_s": 0.357,
+   "pondra_s": 1.149,
+   "verdict": "same",
+   "rows": 6
+  },
+  "q05.sql": {
+   "duckdb_s": 0.107,
+   "pondra_s": 0.136,
+   "verdict": "same",
+   "rows": 100
+  },
+  "q06.sql": {
+   "duckdb_s": 0.056,
+   "pondra_s": 0.073,
+   "verdict": "same",
+   "rows": 46
+  },
+  "q07.sql": {
+   "duckdb_s": 0.061,
+   "pondra_s": 0.126,
+   "verdict": "same",
+   "rows": 100
+  },
+  "q08.sql": {
+   "duckdb_s": 0.052,
+   "pondra_s": 0.086,
+   "verdict": "same",
+   "rows": 5
+  },
+  "q09.sql": {
+   "duckdb_s": 0.205,
+   "pondra_s": 0.217,
+   "verdict": "same",
+   "rows": 1
+  },
+  "q10.sql": {
+   "duckdb_s": 0.116,
+   "pondra_s": 0.094,
+   "verdict": "same",
+   "rows": 6
+  },
+  "q11.sql": {
+   "duckdb_s": 0.193,
+   "pondra_s": 0.662,
+   "verdict": "same",
+   "rows": 90
+  },
+  "q12.sql": {
+   "duckdb_s": 0.028,
+   "pondra_s": 0.085,
+   "verdict": "same",
+   "rows": 100
+  },
+  "q13.sql": {
+   "duckdb_s": 0.083,
+   "pondra_s": 0.204,
+   "verdict": "same",
+   "rows": 1
+  },
+  "q14.sql": {
+   "duckdb_s": 0.258,
+   "pondra_s": 1.223,
+   "verdict": "same",
+   "rows": 100
+  },
+  "q15.sql": {
+   "duckdb_s": 0.038,
+   "pondra_s": 0.067,
+   "verdict": "same",
+   "rows": 100
+  },
+  "q16.sql": {
+   "duckdb_s": 0.034,
+   "pondra_s": 0.046,
+   "verdict": "same",
+   "rows": 1
+  },
+  "q17.sql": {
+   "duckdb_s": 0.051,
+   "pondra_s": 0.117,
+   "verdict": "same",
+   "rows": 0
+  },
+  "q18.sql": {
+   "duckdb_s": 0.062,
+   "pondra_s": 0.096,
+   "verdict": "same",
+   "rows": 100
+  },
+  "q19.sql": {
+   "duckdb_s": 0.048,
+   "pondra_s": 0.031,
+   "verdict": "same",
+   "rows": 100
+  },
+  "q20.sql": {
+   "duckdb_s": 0.018,
+   "pondra_s": 0.071,
+   "verdict": "same",
+   "rows": 100
+  },
+  "q21.sql": {
+   "duckdb_s": 0.014,
+   "pondra_s": 0.029,
+   "verdict": "same",
+   "rows": 100
+  },
+  "q22.sql": {
+   "duckdb_s": 0.163,
+   "pondra_s": 0.468,
+   "verdict": "same",
+   "rows": 100
+  },
+  "q23.sql": {
+   "duckdb_s": 0.263,
+   "pondra_s": 0.592,
+   "verdict": "same",
+   "rows": 4
+  },
+  "q24.sql": {
+   "duckdb_s": 0.084,
+   "pondra_s": 0.07,
+   "verdict": "same",
+   "rows": 1
+  },
+  "q25.sql": {
+   "duckdb_s": 0.037,
+   "pondra_s": 0.058,
+   "verdict": "same",
+   "rows": 1
+  },
+  "q26.sql": {
+   "duckdb_s": 0.047,
+   "pondra_s": 0.049,
+   "verdict": "same",
+   "rows": 100
+  },
+  "q27.sql": {
+   "duckdb_s": 0.097,
+   "pondra_s": 0.091,
+   "verdict": "same",
+   "rows": 100
+  },
+  "q28.sql": {
+   "duckdb_s": 0.131,
+   "pondra_s": 0.201,
+   "verdict": "same",
+   "rows": 1
+  },
+  "q29.sql": {
+   "duckdb_s": 0.05,
+   "pondra_s": 0.053,
+   "verdict": "same",
+   "rows": 1
+  },
+  "q30.sql": {
+   "duckdb_s": 0.044,
+   "pondra_s": 0.06,
+   "verdict": "same",
+   "rows": 100
+  },
+  "q31.sql": {
+   "duckdb_s": 0.048,
+   "pondra_s": 0.108,
+   "verdict": "same",
+   "rows": 44
+  },
+  "q32.sql": {
+   "duckdb_s": 0.014,
+   "pondra_s": 0.022,
+   "verdict": "same",
+   "rows": 1
+  },
+  "q33.sql": {
+   "duckdb_s": 0.041,
+   "pondra_s": 0.05,
+   "verdict": "same",
+   "rows": 100
+  },
+  "q34.sql": {
+   "duckdb_s": 0.043,
+   "pondra_s": 0.046,
+   "verdict": "same",
+   "rows": 455
+  },
+  "q35.sql": {
+   "duckdb_s": 0.111,
+   "pondra_s": 0.106,
+   "verdict": "same",
+   "rows": 100
+  },
+  "q36.sql": {
+   "duckdb_s": 0.045,
+   "pondra_s": 0.101,
+   "verdict": "same",
+   "rows": 100
+  },
+  "q37.sql": {
+   "duckdb_s": 0.018,
+   "pondra_s": 0.057,
+   "verdict": "same",
+   "rows": 1
+  },
+  "q38.sql": {
+   "duckdb_s": 0.063,
+   "pondra_s": 0.055,
+   "verdict": "same",
+   "rows": 1
+  },
+  "q39.sql": {
+   "duckdb_s": 0.043,
+   "pondra_s": 0.1,
+   "verdict": "same",
+   "rows": 243
+  },
+  "q40.sql": {
+   "duckdb_s": 0.022,
+   "pondra_s": 0.449,
+   "verdict": "same",
+   "rows": 100
+  },
+  "q41.sql": {
+   "duckdb_s": 0.011,
+   "pondra_s": 0.019,
+   "verdict": "same",
+   "rows": 4
+  },
+  "q42.sql": {
+   "duckdb_s": 0.024,
+   "pondra_s": 0.021,
+   "verdict": "same",
+   "rows": 10
+  },
+  "q43.sql": {
+   "duckdb_s": 0.041,
+   "pondra_s": 0.036,
+   "verdict": "same",
+   "rows": 6
+  },
+  "q44.sql": {
+   "duckdb_s": 0.066,
+   "pondra_s": 0.048,
+   "verdict": "same",
+   "rows": 10
+  },
+  "q45.sql": {
+   "duckdb_s": 0.037,
+   "pondra_s": 0.072,
+   "verdict": "same",
+   "rows": 19
+  },
+  "q46.sql": {
+   "duckdb_s": 0.092,
+   "pondra_s": 0.073,
+   "verdict": "same",
+   "rows": 100
+  },
+  "q47.sql": {
+   "duckdb_s": 0.132,
+   "pondra_s": 0.421,
+   "verdict": "same",
+   "rows": 100
+  },
+  "q48.sql": {
+   "duckdb_s": 0.073,
+   "pondra_s": 0.087,
+   "verdict": "same",
+   "rows": 1
+  },
+  "q49.sql": {
+   "duckdb_s": 0.055,
+   "pondra_s": 0.079,
+   "verdict": "same",
+   "rows": 34
+  },
+  "q50.sql": {
+   "duckdb_s": 0.052,
+   "pondra_s": 0.103,
+   "verdict": "same",
+   "rows": 6
+  },
+  "q51.sql": {
+   "duckdb_s": 0.262,
+   "pondra_s": 0.334,
+   "verdict": "same",
+   "rows": 100
+  },
+  "q52.sql": {
+   "duckdb_s": 0.025,
+   "pondra_s": 0.019,
+   "verdict": "same",
+   "rows": 100
+  },
+  "q53.sql": {
+   "duckdb_s": 0.031,
+   "pondra_s": 0.029,
+   "verdict": "same",
+   "rows": 100
+  },
+  "q54.sql": {
+   "duckdb_s": 0.045,
+   "pondra_s": 0.043,
+   "verdict": "same",
+   "rows": 1
+  },
+  "q55.sql": {
+   "duckdb_s": 0.025,
+   "pondra_s": 0.02,
+   "verdict": "same",
+   "rows": 100
+  },
+  "q56.sql": {
+   "duckdb_s": 0.041,
+   "pondra_s": 0.046,
+   "verdict": "same",
+   "rows": 100
+  },
+  "q57.sql": {
+   "duckdb_s": 0.055,
+   "pondra_s": 0.204,
+   "verdict": "same",
+   "rows": 100
+  },
+  "q58.sql": {
+   "duckdb_s": 0.044,
+   "pondra_s": 0.715,
+   "verdict": "same",
+   "rows": 5
+  },
+  "q59.sql": {
+   "duckdb_s": 0.115,
+   "pondra_s": 0.135,
+   "verdict": "same",
+   "rows": 100
+  },
+  "q60.sql": {
+   "duckdb_s": 0.054,
+   "pondra_s": 0.049,
+   "verdict": "same",
+   "rows": 100
+  },
+  "q61.sql": {
+   "duckdb_s": 0.085,
+   "pondra_s": 0.07,
+   "verdict": "same",
+   "rows": 1
+  },
+  "q62.sql": {
+   "duckdb_s": 0.021,
+   "pondra_s": 0.041,
+   "verdict": "same",
+   "rows": 100
+  },
+  "q63.sql": {
+   "duckdb_s": 0.031,
+   "pondra_s": 0.032,
+   "verdict": "same",
+   "rows": 100
+  },
+  "q64.sql": {
+   "duckdb_s": 0.191,
+   "pondra_s": 0.433,
+   "verdict": "same",
+   "rows": 2
+  },
+  "q65.sql": {
+   "duckdb_s": 0.053,
+   "pondra_s": 0.072,
+   "verdict": "same",
+   "rows": 100
+  },
+  "q66.sql": {
+   "duckdb_s": 0.04,
+   "pondra_s": 0.102,
+   "verdict": "same",
+   "rows": 5
+  },
+  "q67.sql": {
+   "duckdb_s": 0.42,
+   "pondra_s": 0.758,
+   "verdict": "same",
+   "rows": 100
+  },
+  "q68.sql": {
+   "duckdb_s": 0.085,
+   "pondra_s": 0.109,
+   "verdict": "same",
+   "rows": 100
+  },
+  "q69.sql": {
+   "duckdb_s": 0.06,
+   "pondra_s": 0.054,
+   "verdict": "same",
+   "rows": 100
+  },
+  "q70.sql": {
+   "duckdb_s": 0.059,
+   "pondra_s": 0.128,
+   "verdict": "same",
+   "rows": 3
+  },
+  "q71.sql": {
+   "duckdb_s": 0.045,
+   "pondra_s": 0.062,
+   "verdict": "same",
+   "rows": 1031
+  },
+  "q72.sql": {
+   "duckdb_s": 0.303,
+   "pondra_s": 0.163,
+   "verdict": "same",
+   "rows": 100
+  },
+  "q73.sql": {
+   "duckdb_s": 0.043,
+   "pondra_s": 0.037,
+   "verdict": "same",
+   "rows": 1
+  },
+  "q74.sql": {
+   "duckdb_s": 0.183,
+   "pondra_s": 0.219,
+   "verdict": "same",
+   "rows": 92
+  },
+  "q75.sql": {
+   "duckdb_s": 0.126,
+   "pondra_s": 0.194,
+   "verdict": "same",
+   "rows": 100
+  },
+  "q76.sql": {
+   "duckdb_s": 0.05,
+   "pondra_s": 0.049,
+   "verdict": "same",
+   "rows": 100
+  },
+  "q77.sql": {
+   "duckdb_s": 0.053,
+   "pondra_s": 0.065,
+   "verdict": "same",
+   "rows": 44
+  },
+  "q78.sql": {
+   "duckdb_s": 0.21,
+   "pondra_s": 0.409,
+   "verdict": "same",
+   "rows": 100
+  },
+  "q79.sql": {
+   "duckdb_s": 0.067,
+   "pondra_s": 0.07,
+   "verdict": "same",
+   "rows": 100
+  },
+  "q80.sql": {
+   "duckdb_s": 0.075,
+   "pondra_s": 3.395,
+   "verdict": "same",
+   "rows": 100
+  },
+  "q81.sql": {
+   "duckdb_s": 0.048,
+   "pondra_s": 0.059,
+   "verdict": "same",
+   "rows": 100
+  },
+  "q82.sql": {
+   "duckdb_s": 0.021,
+   "pondra_s": 0.054,
+   "verdict": "same",
+   "rows": 2
+  },
+  "q83.sql": {
+   "duckdb_s": 0.021,
+   "pondra_s": 0.063,
+   "verdict": "same",
+   "rows": 24
+  },
+  "q84.sql": {
+   "duckdb_s": 0.027,
+   "pondra_s": 0.045,
+   "verdict": "same",
+   "rows": 16
+  },
+  "q85.sql": {
+   "duckdb_s": 0.059,
+   "pondra_s": 0.111,
+   "verdict": "same",
+   "rows": 1
+  },
+  "q86.sql": {
+   "duckdb_s": 0.02,
+   "pondra_s": 0.03,
+   "verdict": "same",
+   "rows": 100
+  },
+  "q87.sql": {
+   "duckdb_s": 0.068,
+   "pondra_s": 0.061,
+   "verdict": "same",
+   "rows": 1
+  },
+  "q88.sql": {
+   "duckdb_s": 0.165,
+   "pondra_s": 0.234,
+   "verdict": "same",
+   "rows": 1
+  },
+  "q89.sql": {
+   "duckdb_s": 0.039,
+   "pondra_s": 0.049,
+   "verdict": "same",
+   "rows": 100
+  },
+  "q90.sql": {
+   "duckdb_s": 0.012,
+   "pondra_s": 0.032,
+   "verdict": "same",
+   "rows": 1
+  },
+  "q91.sql": {
+   "duckdb_s": 0.034,
+   "pondra_s": 0.057,
+   "verdict": "same",
+   "rows": 2
+  },
+  "q92.sql": {
+   "duckdb_s": 0.019,
+   "pondra_s": 0.02,
+   "verdict": "same",
+   "rows": 1
+  },
+  "q93.sql": {
+   "duckdb_s": 0.065,
+   "pondra_s": 0.079,
+   "verdict": "same",
+   "rows": 100
+  },
+  "q94.sql": {
+   "duckdb_s": 0.026,
+   "pondra_s": 0.042,
+   "verdict": "same",
+   "rows": 1
+  },
+  "q95.sql": {
+   "duckdb_s": 0.212,
+   "pondra_s": 0.187,
+   "verdict": "same",
+   "rows": 1
+  },
+  "q96.sql": {
+   "duckdb_s": 0.027,
+   "pondra_s": 0.037,
+   "verdict": "same",
+   "rows": 1
+  },
+  "q97.sql": {
+   "duckdb_s": 0.063,
+   "pondra_s": 0.093,
+   "verdict": "same",
+   "rows": 1
+  },
+  "q98.sql": {
+   "duckdb_s": 0.049,
+   "pondra_s": 0.154,
+   "verdict": "same",
+   "rows": 2521
+  },
+  "q99.sql": {
+   "duckdb_s": 0.024,
+   "pondra_s": 0.068,
+   "verdict": "same",
+   "rows": 90
+  }
+ }
+}

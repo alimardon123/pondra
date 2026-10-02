@@ -1,0 +1,166 @@
+{
+ "queries": 11,
+ "rule_on": {
+  "well_s": 1.04,
+  "badly_s": 1.013,
+  "worst_ratio": 1.15
+ },
+ "rule_off": {
+  "well_s": 1.059,
+  "badly_s": 1.259,
+  "worst_ratio": 1.7
+ },
+ "slower_with_the_rule": {
+  "well": [],
+  "badly": []
+ },
+ "per_query": {
+  "star": {
+   "on": {
+    "well": 0.084,
+    "badly": 0.082,
+    "same": true
+   },
+   "off": {
+    "well": 0.086,
+    "badly": 0.115,
+    "same": true
+   }
+  },
+  "snowflake": {
+   "on": {
+    "well": 0.083,
+    "badly": 0.08,
+    "same": true
+   },
+   "off": {
+    "well": 0.085,
+    "badly": 0.11,
+    "same": true
+   }
+  },
+  "filtered dimension": {
+   "on": {
+    "well": 0.081,
+    "badly": 0.08,
+    "same": true
+   },
+   "off": {
+    "well": 0.083,
+    "badly": 0.102,
+    "same": true
+   }
+  },
+  "far from the filters": {
+   "on": {
+    "well": 0.065,
+    "badly": 0.064,
+    "same": true
+   },
+   "off": {
+    "well": 0.068,
+    "badly": 0.076,
+    "same": true
+   }
+  },
+  "tpch-q2": {
+   "on": {
+    "well": 0.039,
+    "badly": 0.045,
+    "same": true
+   },
+   "off": {
+    "well": 0.044,
+    "badly": 0.046,
+    "same": true
+   }
+  },
+  "tpch-q3": {
+   "on": {
+    "well": 0.084,
+    "badly": 0.081,
+    "same": true
+   },
+   "off": {
+    "well": 0.085,
+    "badly": 0.098,
+    "same": true
+   }
+  },
+  "tpch-q5": {
+   "on": {
+    "well": 0.106,
+    "badly": 0.104,
+    "same": true
+   },
+   "off": {
+    "well": 0.108,
+    "badly": 0.1,
+    "same": true
+   }
+  },
+  "tpch-q9": {
+   "on": {
+    "well": 0.161,
+    "badly": 0.154,
+    "same": true
+   },
+   "off": {
+    "well": 0.165,
+    "badly": 0.281,
+    "same": true
+   }
+  },
+  "tpch-q10": {
+   "on": {
+    "well": 0.134,
+    "badly": 0.123,
+    "same": true
+   },
+   "off": {
+    "well": 0.127,
+    "badly": 0.132,
+    "same": true
+   }
+  },
+  "tpch-q11": {
+   "on": {
+    "well": 0.033,
+    "badly": 0.03,
+    "same": true
+   },
+   "off": {
+    "well": 0.032,
+    "badly": 0.029,
+    "same": true
+   }
+  },
+  "tpch-q18": {
+   "on": {
+    "well": 0.17,
+    "badly": 0.17,
+    "same": true
+   },
+   "off": {
+    "well": 0.176,
+    "badly": 0.17,
+    "same": true
+   }
+  }
+ },
+ "far_from_the_filters": [
+  "orders",
+  "lineitem",
+  "part",
+  "supplier",
+  "nation"
+ ],
+ "checks": {
+  "the badly written queries answer the same": true,
+  "the badly written queries cost less with the rule": true,
+  "no badly written query is slower with the rule": true,
+  "no well written query is slower with the rule": true,
+  "far from the filters, written badly, starts from a filtered table": true
+ },
+ "ok": true
+}

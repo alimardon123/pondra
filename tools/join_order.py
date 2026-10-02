@@ -37,6 +37,15 @@ SHAPES = {
                               where p_size = 15 and p_container = 'JUMBO BAG' and l_partkey = p_partkey
                                 and o_orderkey = l_orderkey and o_orderdate >= date '1995-01-01'""",
                            "part, lineitem, orders"),
+    # TPC-DS q72's shape: the smallest table (nation) leads only to the biggest one, and the filters
+    # are on the other side. Started from the smallest input alone, the order joined all of lineitem
+    # before any filter cut it (q72: 81 s against DuckDB's 1 s); started from every input in turn,
+    # it begins at a filtered table.
+    "far from the filters": ("""select count(*) as n from {}
+                                where s_nationkey = n_nationkey and l_suppkey = s_suppkey and o_orderkey = l_orderkey
+                                  and l_partkey = p_partkey and o_orderdate between date '1995-03-01' and date '1995-03-31'
+                                  and p_size = 15 and p_type like '%BRASS'""",
+                             "part, lineitem, orders, supplier, nation"),
 }
 
 
@@ -115,8 +124,15 @@ def measure(lake, queries, on):
             (well, answer) = timed(A.port, good, A.runs)
             (badly, other) = timed(A.port, bad, A.runs)
             out[q] = {"well": min(well, out[q]["well"]), "badly": min(badly, out[q]["badly"]), "same": out[q]["same"] and same(answer, other)}
+    if on:  # (at SF1 the order costs little either way, so it is checked, not timed)
+        plan = call(A.port, "POST", "/sql", ("EXPLAIN " + queries["far from the filters"][1]).encode())
+        logical = next(r["plan"] for r in plan if r["plan_type"] == "logical_plan")
+        FAR[:] = re.findall(r"TableScan: (\w+)", logical)
     node.kill()
     return out
+
+
+FAR = []  # (the tables of "far from the filters" written badly, in the order its plan joins them)
 
 
 def main():
@@ -140,11 +156,12 @@ def main():
         "the badly written queries cost less with the rule": total(on, "badly") < total(off, "badly"),
         "no badly written query is slower with the rule": not slower("badly"),
         "no well written query is slower with the rule": not slower("well"),
+        "far from the filters, written badly, starts from a filtered table": FAR[0] in ("orders", "part"),
     }
     out = {"queries": len(queries), "rule_on": {"well_s": total(on, "well"), "badly_s": total(on, "badly"), "worst_ratio": round(worst(on), 2)},
            "rule_off": {"well_s": total(off, "well"), "badly_s": total(off, "badly"), "worst_ratio": round(worst(off), 2)},
            "slower_with_the_rule": {k: slower(k) for k in ("well", "badly")},
-           "per_query": {q: {"on": on[q], "off": off[q]} for q in queries}, "checks": checks, "ok": all(checks.values())}
+           "per_query": {q: {"on": on[q], "off": off[q]} for q in queries}, "far_from_the_filters": FAR, "checks": checks, "ok": all(checks.values())}
     print(json.dumps(out, indent=1))
     sys.exit(0 if out["ok"] else 1)
 

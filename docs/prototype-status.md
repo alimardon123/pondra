@@ -15,6 +15,26 @@ One Rust binary replaces the Kafka + Flink + Spark + metastore + ZooKeeper stack
 
 Start more copies on the same bucket to scale out. The only state is object storage. There's no JVM, no database server and no coordination service.
 
+**Then (2026-10-02, round 32 so far): lean and fast** (the owner, 2026-10-01: a round only for
+optimizing; performance first):
+
+1. **The join order from every input in turn** (`optimize::JoinOrder`): the greedy order is built
+   from each input, the cheapest taken, where it started from the smallest alone. TPC-DS q72 began
+   at its 5 warehouses, then joined all of the inventory: 81 s, now 0.17 s (DuckDB 0.31 s). A join
+   on several keys counts the one that spreads its rows most, not their product (TPC-H q9 would
+   otherwise start with partsupp joined to all of lineitem, as if 2,400 rows came out: 6 million
+   do). `tools/join_order.py` has q72's shape ("far from the filters": its plan must start from a
+   filtered table; the round 31 build starts from nation): the badly written queries 1.22 → 1.01 s,
+   the worst 1.72× its well written twin, now 1.15×. TPC-H SF1 from memory 1.38 → 1.29 s on this
+   machine; TPC-DS's 99 still equal DuckDB's (`logs/round32/`).
+2. **Planning that costs less:** orders are costed over which inputs each key reads (a bit an
+   input), not over schemas built at every step, and a table's statistics are worked out once a
+   query (its sketches' estimates were made again for every input costed). TPC-DS q64 plans in
+   0.16 s, 0.22 s before (0.71 s with the first try at the order above).
+3. **CI the same every push:** `harness.py functions`' killed-worker check waits for the workers
+   it killed to be gone (the next query could take one the node still saw running); fuzzed nodes
+   run in their test folder (`ATTACH 'nope'` had left two lakes in the repository).
+
 **Then (2026-10-01, round 31, second part so far; 0.29.0): every kind of object alike, SQL and
 Python in one notebook** (the owner's list after the first part):
 
