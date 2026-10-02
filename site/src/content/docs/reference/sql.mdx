@@ -50,6 +50,7 @@ on bytes as they do on text. A `CAST` to bytes takes `BYTEA` only.
 | `SELECT … FROM t` | any DataFusion query: joins, `WITH`, windows, `VALUES`, sub-queries |
 | `FROM t [SELECT …] [WHERE …] [GROUP BY …] [ORDER BY …] [LIMIT n]` | DuckDB's form: the `FROM` first, then any clauses |
 | `$name` | a [variable](#variables) or a parameter, bound by the node and never pasted into the text |
+| `FROM t AT (VERSION => n)`, `AT (TIMESTAMP => '…')`, `AT (OFFSET => -3600)` | the table as it was after commit `n`, at that time, or that many seconds ago ([below](#a-tables-past)) |
 | `FROM a ASOF JOIN b MATCH_CONDITION (a.ts >= b.ts) ON a.k = b.k` | each row gets the other table's row as it was at that moment (`>=`, `>`, `<=`, `<`) |
 | `EXPLAIN SELECT …` | the plan, and whether it would spread over the nodes |
 | `DESCRIBE t`, `SHOW TABLES`, `SHOW COLUMNS FROM t` | what the lake holds |
@@ -108,6 +109,24 @@ A parameter goes with the request, in JSON. The Python and JavaScript clients do
     ```
   </TabItem>
 </Tabs>
+
+
+### A table's past
+
+`t AT (…)` reads an append table as it was: after commit `n` (`VERSION => n`, a row's `_version`),
+at a time (`TIMESTAMP => '2026-10-02 12:00:00'`) or some seconds ago (`OFFSET => -3600`). It goes
+wherever a table does: a join (the same table at two moments too), a view, `CREATE TABLE … AS`,
+`INSERT … SELECT`. A table's past is kept for its `retention`, a day unless set; a moment before that
+is refused by name, and so is a keyed table, which keeps only each key's newest row.
+
+```sql
+CREATE TABLE prices (item VARCHAR, price DOUBLE);
+INSERT INTO prices VALUES ('tea', 3.5), ('cake', 4.0);
+UPDATE prices SET price = 3.8 WHERE item = 'tea';
+SELECT item, price, _version FROM prices ORDER BY item;
+SELECT item, price FROM prices AT (OFFSET => -3600);
+SELECT n.item, w.price AS was, n.price AS now FROM prices n JOIN prices AT (OFFSET => -1) w ON n.item = w.item;
+```
 
 ## Tables
 

@@ -646,7 +646,7 @@ async fn drop_table(lake: &Lake, name: &str, if_exists: bool, purge: bool) -> Re
     ensure!(lake.cat.get::<Value>(&crate::views::view_key(owner)).await?.is_none(), "{name} is materialized view {owner}'s: DROP MATERIALIZED VIEW {owner}");
     let readers = readers(lake, name).await?;
     ensure!(readers.is_empty(), "{name} is used by {}: drop them first", readers.join(", "));
-    let keep_ms = meta.retention_secs.map_or(KEEP_DROPPED_MS, |s| s * 1000);
+    let keep_ms = meta.retention_secs.map_or(KEEP_MS, |s| s * 1000);
     let deleted = crate::sys::deleted(name);
     let mut puts = vec![];
     if keep_ms > 0 && !purge && !crate::sys::hidden(name) {
@@ -670,8 +670,8 @@ async fn drop_table(lake: &Lake, name: &str, if_exists: bool, purge: bool) -> Re
     Ok(j!({"table": name, "dropped": true}))
 }
 
-/// How long a dropped table can be undropped unless its `retention` says.
-pub const KEEP_DROPPED_MS: u64 = 24 * 3_600_000;
+/// How long a table's past is kept unless its `retention` says: read as it was, or undropped.
+pub const KEEP_MS: u64 = 24 * 3_600_000;
 
 /// A dropped table, kept while it can be undropped (`dt/{name}/{at_ms}`, ADR-043): its entries as
 /// they were when it was dropped, every row in files. `tier::expire` lets it go after `keep_ms`;

@@ -135,10 +135,15 @@ pub struct TableMeta {
     /// reads give each its `__start_at` and `__end_at` (`views::history_view`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history: Option<crate::views::History>,
-    /// `retention = '7 days'` (ADR-043): how long the table's past is kept; a dropped table can be
-    /// undropped that long (`ddl::KEEP_DROPPED_MS` when not set).
+    /// `retention = '7 days'` (ADR-043): how long the table's past is kept (`ddl::KEEP_MS` when not
+    /// set): read `AT (…)` (`past.rs`), and undropped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retention_secs: Option<u64>,
+    /// From which commit (and time, ms) on the table can be read as it was: a purge let the old
+    /// versions of earlier changes go (`tier::purge`). (0, 0): all of it; None: changed before
+    /// this was kept, and whole only from its oldest purge kept (`past::kept_since`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub past_from: Option<(u64, u64)>,
 }
 
 impl TableMeta {

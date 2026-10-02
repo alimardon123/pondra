@@ -34,15 +34,22 @@ as Snowflake's. `'0 seconds'` keeps nothing.
   away when it is dropped, and published again when it comes back.
 - `pondra.dropped` lists what can still come back.
 
-**3. `AT (VERSION => n | TIMESTAMP => t)` reads an append table as of a commit (next PR).** It
-needs no history in the catalog, because the rows carry it. The table as of `n` is:
+**3. `t AT (VERSION => n | TIMESTAMP => t | OFFSET => -s)` reads an append table as it was**
+(`past.rs`). It needs no history in the catalog, because the rows carry it. The table as of `n` is:
 
 - the current rows whose `_version ≤ n`;
 - plus `{t}$deleted`'s old rows that were alive then: `_old_version ≤ n < _version`.
 
-A purge drops `{t}$deleted` files after the table's retention, not after `--retain-secs`, and it
-records how far back the table can then be read. An earlier version is refused by name. Keyed tables
-are refused, since compaction keeps only each key's newest version.
+As of a time, `_updated_at` (the commit's time) takes `_version`'s place: of a row's old versions,
+the one its first change after that time took out. `AT (…)` is rewritten where SQL comes in, on
+the tokens (sqlparser takes no `AT` after a table), to a name `"at:<spec>"` the session registers,
+so a join, a view, a CTAS or an `INSERT … SELECT` reads it as any table. Such a query runs on its node.
+
+A purge drops `{t}$deleted` files only once they are older than the table's retention, not after
+`--retain-secs` alone (`tier::settle`, on every purge call, so the past goes even when no change
+follows), and records from where the table is still whole (`TableMeta::past_from`). An earlier
+moment is refused by name. Keyed tables are refused, since compaction keeps only each key's newest
+version.
 
 **4. `RESTORE TABLE t TO VERSION n` and zero-copy `CLONE` (after it).**
 

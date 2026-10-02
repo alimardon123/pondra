@@ -214,21 +214,24 @@ pub async fn purge(lake: &Lake, table: &str, nodes: &[String], me: &str, retain_
     let Some(mut meta) = lake.cat.get::<TableMeta>(&table_key(table)).await?.filter(|m| m.changed && m.key.is_empty()) else { return Ok(false) };
     let Some(mut dmeta) = lake.cat.get::<TableMeta>(&table_key(&deleted(table))).await? else { return Ok(false) };
     let (after, upto, now) = (meta.purged(), meta.tiered.min(dmeta.tiered), crate::log::now_ms());
-    if upto <= after {
-        return Ok(false);
-    }
     let within = datafusion::prelude::col(VERSION).between(datafusion::prelude::lit(after as i64 + 1), datafusion::prelude::lit(upto as i64));
-    let gone = crate::manifest::pruned(lake, &dmeta, None, &[within], &schema(&with_sys(&dmeta).columns)?).await?;
+    let gone = match upto > after {
+        true => crate::manifest::pruned(lake, &dmeta, None, &[within], &schema(&with_sys(&dmeta).columns)?).await?,
+        false => vec![],
+    };
     let waiting: u64 = gone.iter().map(|f| f.rows).sum();
     let rows = meta.files.iter().map(|f| f.rows).sum::<u64>() + meta.sealed.as_ref().map_or(0, |s| s.rows);
     let at_least = std::env::var("PONDRA_PURGE_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(100_000);
-    if !now_anyway && meta.publish.is_empty() && waiting < at_least && waiting * 10 < rows {
+    if upto <= after || (!now_anyway && meta.publish.is_empty() && waiting < at_least && waiting * 10 < rows) {
+        // (nothing to purge yet; the old rows past the table's retention may still go)
+        if settle(&mut meta, &mut dmeta, now, retain_ms) {
+            lake.cat.commit(vec![(table_key(table), json(&meta)), (table_key(&deleted(table)), json(&dmeta))], &[]).await?;
+        }
         return Ok(false);
     }
     // The files that can hold an old row: by their `_row_id` and `_version` ranges.
     let mut dead = dead(lake, &gone, after, upto).await?;
     dead.sort_unstable();
-    let range = |s: &crate::manifest::Stats, c: &str| s.get(c).and_then(|(lo, hi)| Some((lo.parse::<i64>().ok()?, hi.parse::<i64>().ok()?)));
     let holds = |s: &crate::manifest::Stats| crate::sys::holds(&dead, s);
     let (list, mut sealed, mut hit) = (crate::manifest::list(lake, &meta).await?, vec![], vec![]);
     for (i, m) in list.iter().enumerate().filter(|(_, m)| holds(&m.stats)) {
@@ -258,17 +261,35 @@ pub async fn purge(lake: &Lake, table: &str, nodes: &[String], me: &str, retain_
         }
         // (sealed again by `maintain`, once it has rewritten the files mostly deleted)
     }
-    // (the newest purge every reader has passed, and those after it, are kept)
     meta.purges.push((upto, now));
-    let passed = meta.purges.iter().rposition(|p| now - p.1 >= retain_ms);
-    if let Some(i) = passed {
-        let settled = meta.purges[i].0 as i64;
-        meta.purges.drain(..i);
-        let done: Vec<DataFile> = dmeta.files.iter().filter(|f| range(&f.stats, VERSION).is_some_and(|(_, hi)| hi <= settled)).cloned().collect();
-        replace(&mut dmeta, &done, vec![]);
-    }
+    settle(&mut meta, &mut dmeta, now, retain_ms);
     lake.cat.commit(vec![(table_key(table), json(&meta)), (table_key(&deleted(table)), json(&dmeta))], &[]).await?;
     Ok(true)
+}
+
+/// Drops `{t}$deleted`'s files once every reader has passed the purge that covered them and they
+/// are older than the table's retention, the past `AT (…)` reads (ADR-043), and says from where the
+/// table is still whole (`past_from`). The newest purge every reader has passed, and those after it,
+/// are kept. Whether anything changed.
+fn settle(meta: &mut TableMeta, dmeta: &mut TableMeta, now: u64, retain_ms: u64) -> bool {
+    let Some(i) = meta.purges.iter().rposition(|p| now - p.1 >= retain_ms) else { return false };
+    let settled = meta.purges[i].0 as i64;
+    let kept = now.saturating_sub(meta.retention_secs.map_or(crate::ddl::KEEP_MS, |s| s * 1000)) as i64 * 1000;
+    let version = |s: &crate::manifest::Stats| s.get(crate::sys::VERSION).and_then(|(_, hi)| hi.parse::<i64>().ok());
+    let newest = |s: &crate::manifest::Stats| match datafusion::common::ScalarValue::try_from_string(s.get(crate::sys::UPDATED)?.1.clone(), &crate::sys::time()) {
+        Ok(datafusion::common::ScalarValue::TimestampMicrosecond(Some(us), _)) => Some(us),
+        _ => None,
+    };
+    let done: Vec<DataFile> = dmeta.files.iter().filter(|f| version(&f.stats).is_some_and(|hi| hi <= settled) && newest(&f.stats).is_some_and(|us| us < kept)).cloned().collect();
+    if i == 0 && done.is_empty() {
+        return false;
+    }
+    meta.purges.drain(..i);
+    if let (Some(v), Some(us)) = (done.iter().filter_map(|f| version(&f.stats)).max(), done.iter().filter_map(|f| newest(&f.stats)).max()) {
+        meta.past_from = Some(meta.past_from.unwrap_or_default().max((v as u64, us as u64 / 1000)));
+    }
+    replace(dmeta, &done, vec![]);
+    true
 }
 
 /// The places in file `f` of the rows `dead` names (sorted (`_row_id`, `_version`) pairs): from its

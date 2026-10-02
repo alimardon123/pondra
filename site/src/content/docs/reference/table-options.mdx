@@ -25,7 +25,7 @@ list is one string with commas: `cluster_by = 'user_id, url'`. Names aren't case
 | `merge` | `'col:func, …'` with `func` one of `sum`, `count`, `min`, `max` | merge | how each non-key column combines |
 | `ttl` | `'column:seconds'` | keyed | a row whose timestamp or date column is older than that many seconds is gone |
 | `order_by` | `'column'` | keyed | the row with the greatest value of this column wins, not the last to arrive |
-| `retention` | `'7 days'`, `'12 hours'`, `'0 seconds'` | all | how long the table's past is kept: dropped, it can be brought back with `UNDROP TABLE` for this long. Default: a day |
+| `retention` | `'7 days'`, `'12 hours'`, `'0 seconds'` | all | how long the table's past is kept: read as it was with `t AT (…)`, and, dropped, brought back with `UNDROP TABLE`. Default: a day |
 
 An option name that isn't in this table is refused when you `CREATE` the table, and the error names it.
 

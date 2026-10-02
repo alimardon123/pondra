@@ -46,6 +46,7 @@ mod metrics;
 mod optimize;
 mod pages;
 mod panics;
+mod past;
 mod tls;
 mod txn;
 mod mcp;

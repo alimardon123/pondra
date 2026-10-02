@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""A table's past (ADR-043): UNDROP TABLE and each table's `retention`.
+"""A table's past (ADR-043): UNDROP TABLE, each table's `retention`, and `t AT (VERSION => n |
+TIMESTAMP => t | OFFSET => -seconds)` against a model of every state the table went through.
 
   history_check.py [--new target/release/pondra] [--work DIR] [--port 9760]
 
 A node whose tiering runs only when asked (`POST /tier`), so rows can be left in the log when a table
-is dropped; `--retain-secs 1`, so the log's segments go soon after. Prints the checks as JSON and
+is dropped; `--retain-secs 1`, so the log's segments go soon after; `PONDRA_PURGE_ROWS=1`, so
+changed rows leave the table's files every round and only `t$deleted` has their old versions. Prints the checks as JSON and
 exits 1 if one fails (the lake and the node's log are then kept in --work).
 """
-import argparse, json, os, shutil, sys, tempfile, time
+import argparse, datetime, json, os, shutil, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -16,7 +18,7 @@ from upgrade_check import Node, Failed, cli, stop_all  # (a node started and sto
 
 def history_check(bin, work, port):
     lake = os.path.join(work, "lake")
-    n = Node(bin, lake, port, work, "--retain-secs", "1").start()
+    n = Node(bin, lake, port, work, "--retain-secs", "1", env={"PONDRA_PURGE_ROWS": "1"}).start()
     q = n.q
 
     def rows(sql):
@@ -119,6 +121,55 @@ def history_check(bin, work, port):
     checks["a keyed table published as Delta: dropped (its Delta log too) and undropped (other engines read it again)"] = \
         keyed == [(1, "a"), (2, "B")] and rows("SELECT id, v FROM k ORDER BY id") == keyed and log_gone \
         and delta in ([{"id": 1, "v": "a"}, {"id": 2, "v": "B"}], "skipped: no deltalake")
+
+    # AT: every state the table was in, by its commit and by its time, against what it was then.
+    q("CREATE TABLE h (id BIGINT, v VARCHAR)")
+    states = []
+
+    def snap():
+        time.sleep(0.05)
+        states.append((n.get("/stats")["hwm"], datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="milliseconds")[:23], rows("SELECT id, v FROM h ORDER BY id")))
+        time.sleep(0.05)
+
+    snap()
+    for step in ["INSERT INTO h SELECT x, 'v0' FROM generate_series(1, 300) AS s(x)",  # (files, by a bulk INSERT)
+                 "INSERT INTO h VALUES (1001, 'log'), (1002, 'log')", "UPDATE h SET v = 'u1' WHERE id % 10 = 0", "tier",
+                 "DELETE FROM h WHERE id % 7 = 0", "UPDATE h SET v = 'u2' WHERE id % 10 = 0", "INSERT INTO h VALUES (1003, 'log')", "tier",
+                 "MERGE INTO h USING (SELECT 5 AS id, 'm' AS v UNION ALL SELECT 2000, 'new') s ON h.id = s.id WHEN MATCHED THEN UPDATE SET v = s.v WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.v)",
+                 "tier", "TRUNCATE h", "INSERT INTO h VALUES (1, 'after')"]:
+        tier() if step == "tier" else q(step)
+        snap()
+    tier()
+    by_version = [rows(f"SELECT id, v FROM h AT (VERSION => {v}) ORDER BY id") == r for v, _, r in states]
+    by_time = [rows(f"SELECT id, v FROM h AT (TIMESTAMP => '{t}') ORDER BY id") == r for _, t, r in states]
+    checks["AT (VERSION => n) and AT (TIMESTAMP => t): the table as it was after each write (bulk INSERT, VALUES, UPDATE twice, DELETE, MERGE, TRUNCATE), tiered and purged"] = \
+        all(by_version) and all(by_time) and len(states) == 13
+    v3, t3, r3 = states[3]
+    sys_rows = q(f"SELECT *, _row_id, _version FROM h AT (VERSION => {v3}) WHERE id IN (10, 11) ORDER BY id")
+    now_ids = {r["_row_id"] for r in q("SELECT _row_id FROM h")}
+    joined = rows(f"SELECT count(*) FROM h AT (VERSION => {v3}) AS o JOIN h AT (VERSION => {states[1][0]}) AS b USING (id) WHERE o.v <> b.v")
+    copied = [q(f"CREATE TABLE h3 AS SELECT * FROM h AT (VERSION => {v3})"), rows("SELECT id, v FROM h3 ORDER BY id")][1]
+    q(f"CREATE VIEW h_then AS SELECT id, v FROM h AT (VERSION => {v3})")
+    bound = n.call("POST", "/sql", {"sql": "SELECT count(*) FROM h AT (VERSION => $v)", "params": {"v": v3}}, headers={"content-type": "application/json"})
+    recent = rows("SELECT count(*) FROM h AT (OFFSET => -0.001)")
+    checks["AT with system columns, joined with itself, in CREATE TABLE … AS, a view and a parameter; OFFSET seconds back"] = \
+        [list(r) for r in (tuple(x.values()) for x in sys_rows)][0][:3] == [10, "u1", sys_rows[0]["_row_id"]] and list(sys_rows[0]) == ["id", "v", "_row_id", "_version"] \
+        and sys_rows[0]["_row_id"] not in now_ids and joined == [(30,)] and copied == r3 and rows("SELECT * FROM h_then ORDER BY id") == r3 \
+        and bound == [{"count(*)": len(r3)}] and recent == [(1,)]
+    keyed = refused("SELECT * FROM k AT (VERSION => 1)")
+    q("CREATE TABLE short (a BIGINT) WITH (retention = '1 seconds')")
+    q("INSERT INTO short VALUES (1)")
+    first = n.get("/stats")["hwm"]
+    q("UPDATE short SET a = 2")
+    tier()
+    time.sleep(2.5)
+    q("INSERT INTO short VALUES (3)")
+    tier()
+    time.sleep(1.5)
+    q("INSERT INTO short VALUES (4)")
+    tier()
+    gone = refused(f"SELECT * FROM short AT (VERSION => {first})")
+    checks["AT refused by name: a keyed table, a time before the table's retention kept"] = "keyed table" in keyed and "its past is kept from version" in gone
 
     # From `pondra sql`, with no node running.
     n.stop()
