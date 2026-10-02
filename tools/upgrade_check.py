@@ -265,7 +265,8 @@ def build(n, v, work):
         q("CREATE FUNCTION twice(x BIGINT) RETURNS BIGINT RETURN x * 2")
         q("CREATE PROCEDURE note_it() LANGUAGE sql AS $$ INSERT INTO s1.t (x) VALUES (42) $$")
         q("CALL note_it()")
-        q("CREATE TASK hourly SCHEDULE '1 hour' AS INSERT INTO s1.t (x) VALUES (-1)")
+        # (a schedule no run crosses: an hourly task ticked in one lake and not the other when a run crossed the hour)
+        q("CREATE TASK yearly SCHEDULE 'cron 0 0 1 1 * UTC' AS INSERT INTO s1.t (x) VALUES (-1)")
         q("CREATE SECRET bucket_key (TYPE s3, KEY_ID 'k', SECRET 'v', SCOPE 's3://somewhere/')")
         n.call("PUT", "/files/notes/readme.md", b"# notes\n")
     if since(v, "0.26.0"):  # NOT NULL and DEFAULT, a table renamed (its folder kept), files read by name
