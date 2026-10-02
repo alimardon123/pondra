@@ -435,7 +435,7 @@ python3 tools/tpcds_check.py run --data <tpcds> [--hot] # TPC-DS's 99 queries ==
 python3 tools/metadata_bench.py [--files 1000000]   # a table with a million files: commits, pruning, 3 nodes
 python3 tools/flight_bench.py                   # Arrow Flight in, out, and the log as a stream
 python3 tools/cloud/bench.py --nodes …          # a cluster on several machines (tools/cloud/README.md)
-python3 tools/kafka_bench.py                    # Kafka ingest throughput and latency on 3 nodes
+python3 tools/kafka_bench.py                    # Kafka ingest throughput and latency on 3 nodes (--kafka DIR: an Apache Kafka broker)
 python3 tools/keyed_bench.py                    # keyed-table compaction: bytes written, correctness
 python3 tools/harness.py crash --runs 20        # kill -9 + injected crashes (PONDRA_CRASH=point:prob)
 python3 tools/cluster.py users                  # 64 writers + 16 readers + serverless reads, 3 nodes

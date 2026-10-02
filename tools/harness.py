@@ -3255,10 +3255,12 @@ $$""")
     for pid in killed:
         os.kill(pid, signal.SIGKILL)
     worker.join(60)
-    # (the idle workers die too, a moment after the signal on a busy machine: the next query may take
-    # one the node still sees running unless they are gone first, as a worker the OS kills would be)
-    until(lambda: all(_dead(pid) for pid in killed), True, 10)
-    checks["a worker killed mid-query: that query fails with why, the node and the next query go on"] = "worker ended" in out.get("e", "") and nodes[0].alive() and q("SELECT slug('C d') AS s") == [{"s": "c-d"}]
+    # (the idle workers die too, a moment after the signal: the next query may take one the node still
+    # sees running unless they are gone first, as a worker the OS kills would be. On CI's busy runner the
+    # next query once got a killed worker, likeliest one not gone within the 10 s this waited, which it
+    # didn't check: wait longer, and fail here if they never go)
+    gone = until(lambda: all(_dead(pid) for pid in killed), True, 60)
+    checks["a worker killed mid-query: that query fails with why, the node and the next query go on"] = "worker ended" in out.get("e", "") and nodes[0].alive() and gone and q("SELECT slug('C d') AS s") == [{"s": "c-d"}]
     # procedures: mail through a local SMTP server, from every door
     class Box:
         mail = []
