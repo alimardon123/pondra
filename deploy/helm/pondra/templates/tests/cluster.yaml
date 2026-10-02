@@ -1,0 +1,29 @@
+{{- $full := include "pondra.fullname" . -}}
+# `helm test`: every node answers, and they agree on one leader.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ $full }}-test
+  labels: {{- include "pondra.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: test
+    helm.sh/hook-delete-policy: before-hook-creation # (kept until the next test: `helm test --logs` reads it)
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  securityContext: {runAsNonRoot: true, runAsUser: 65532, seccompProfile: {type: RuntimeDefault}}
+  containers:
+    - name: test
+      image: busybox:1.37
+      securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+      command: [sh, -c]
+      args:
+        - |
+          set -e
+          leaders=""
+          for i in $(seq 0 {{ sub (int (include "pondra.replicas" .)) 1 }}); do
+            s=$(wget -qO- {{ if .Values.tls.existingSecret }}--no-check-certificate https{{ else }}http{{ end }}://{{ $full }}-$i.{{ $full }}-nodes:8080/stats)
+            echo "{{ $full }}-$i: $s"
+            leaders="$leaders $(echo "$s" | sed 's/.*"leader":"\([^"]*\)".*/\1/')"
+          done
+          test $(echo $leaders | tr ' ' '\n' | sort -u | wc -l) -eq 1

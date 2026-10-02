@@ -1,0 +1,65 @@
+{{- $full := include "pondra.fullname" . -}}
+# The nodes' own names (pod.<release>-pondra-nodes): how they reach each other, published before
+# they are ready, since a node starting up must reach the leader to become ready at all.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $full }}-nodes
+  labels: {{- include "pondra.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector: {{- include "pondra.selector" . | nindent 4 }}
+    app.kubernetes.io/component: node
+  ports:
+    - {name: http, port: 8080, targetPort: http}
+    {{- if .Values.kafka.enabled }}
+    - {name: kafka, port: 9092, targetPort: kafka}
+    {{- end }}
+---
+# The nodes: any one answers SQL, takes writes and serves the console.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $full }}
+  labels: {{- include "pondra.labels" . | nindent 4 }}
+  {{- with .Values.service.annotations }}
+  annotations: {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  {{- with .Values.service.loadBalancerSourceRanges }}
+  loadBalancerSourceRanges: {{- toYaml . | nindent 4 }}
+  {{- end }}
+  selector: {{- include "pondra.selector" . | nindent 4 }}
+    app.kubernetes.io/component: node
+  ports:
+    - {name: http, port: 8080, targetPort: http}
+    {{- if .Values.postgres.enabled }}
+    - {name: postgres, port: {{ .Values.postgres.port }}, targetPort: postgres}
+    {{- end }}
+    {{- if .Values.flight.enabled }}
+    - {name: flight, port: {{ .Values.flight.port }}, targetPort: flight}
+    {{- end }}
+    {{- if .Values.kafka.enabled }}
+    - {name: kafka, port: {{ .Values.kafka.port }}, targetPort: kafka}
+    {{- end }}
+{{- if or (gt (int .Values.readers.replicas) 0) .Values.readers.autoscaling.enabled }}
+---
+# The nodes and the readers, for reads (a reader refuses writes).
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $full }}-read
+  labels: {{- include "pondra.labels" . | nindent 4 }}
+spec:
+  selector: {{- include "pondra.selector" . | nindent 4 }}
+  ports:
+    - {name: http, port: 8080, targetPort: http}
+    {{- if .Values.postgres.enabled }}
+    - {name: postgres, port: {{ .Values.postgres.port }}, targetPort: postgres}
+    {{- end }}
+    {{- if .Values.flight.enabled }}
+    - {name: flight, port: {{ .Values.flight.port }}, targetPort: flight}
+    {{- end }}
+{{- end }}
