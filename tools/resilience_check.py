@@ -357,8 +357,11 @@ def disk(a):
     """Three nodes on a lake on local disk, and the disk full: reads go on, writes wait (nothing
     is acknowledged that isn't kept), and once there is room again every write lands once and
     the log drains into files."""
-    mnt, nodes = small_disk(64), []
-    if not check("a 64 MB disk for the lake", mnt, "can't mount one: needs root, or sudo without a password"):
+    # (Room for what the lake holds itself: every commit is a catalog WAL object, kept up to two
+    # minutes, 40 to 80 MB at this load. On 64 MB the lake filled the disk on its own once the
+    # filler went, and could write nothing: no room to flush the catalog, so no WAL cleared.)
+    mnt, nodes = small_disk(256), []
+    if not check("a 256 MB disk for the lake", mnt, "can't mount one: needs root, or sudo without a password"):
         return
     try:
         nodes = [Node(os.path.join(mnt, "lake"), a.port + 50 + i).start() for i in range(3)]

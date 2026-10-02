@@ -16,7 +16,7 @@ name: pondra
 x-node: &node
   image: ${PONDRA_IMAGE:-ghcr.io/alimardon123/pondra:latest}
   restart: unless-stopped
-  stop_grace_period: 30s # (SIGTERM: a leader hands its term on at once; acknowledged writes are durable)
+  stop_grace_period: 40s # (SIGTERM: a node drains for up to 30 s, PONDRA_DRAIN_SECS, then a leader hands its term on)
   environment: # (passed on only when set)
     - PONDRA_ADMIN_TOKEN
     - PONDRA_WRITE_TOKEN

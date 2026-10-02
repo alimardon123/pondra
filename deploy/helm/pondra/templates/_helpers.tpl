@@ -77,6 +77,9 @@ env:
   - {name: POD_NAMESPACE, valueFrom: {fieldRef: {fieldPath: metadata.namespace}}}
   - {name: POD_IP, valueFrom: {fieldRef: {fieldPath: status.podIP}}}
   - {name: PONDRA_SECRET_KEY, valueFrom: {secretKeyRef: {name: {{ include "pondra.keySecret" . }}, key: PONDRA_SECRET_KEY}}}
+  # (a stopping pod says it isn't ready, then waits this long before turning requests away: the
+  # Service takes a moment to stop sending it any)
+  - {name: PONDRA_DRAIN_GRACE_SECS, value: "5"}
   {{- if .Values.auth.enabled }}
   {{- range list "PONDRA_ADMIN_TOKEN" "PONDRA_WRITE_TOKEN" "PONDRA_READ_TOKEN" }}
   - {name: {{ . }}, valueFrom: {secretKeyRef: {name: {{ include "pondra.tokensSecret" $ }}, key: {{ . }}, optional: true}}}
