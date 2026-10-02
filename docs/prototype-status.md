@@ -124,11 +124,23 @@ optimizing; performance first):
    slower (q6 0.06 → 0.20 s), so only this shape gets it. Two other ideas were timed on and off in one
    build and dropped: dropping rows at the in-memory scan by a top-N's bound (ClickBench's top-N by
    time 0.006 → 0.04 s) and copying the in-memory columns into buffers of their own (TPC-H q12 from
-   memory 0.05 → 0.11 s).
+   memory 0.05 → 0.11 s), until it kept shared strings shared (item 16).
 15. **A transaction's UPDATE then INSERT of one table commits:** COMMIT sent the table's rows as one
    Arrow stream under its first batch's schema, and an UPDATE's rows carry `_created_at` where an
    INSERT's don't, so the leader couldn't read it (found by the console thread). `harness.py begin`
    checks an append and a keyed table.
+16. **The in-memory columns hold what they count** (`hot::whole`): once a file's column is decoded,
+   its batches are copied into one allocation of their own, and a buffer several batches share (the
+   Parquet page their strings point into, a dictionary's values) is copied once and stays shared.
+   Left in the decoder's buffers, the columns sat among its short-lived ones in the allocator's
+   pages and the process held about twice what they count, so the node trimmed them early. Now
+   ClickBench's columns hold 7.2 GB at 7.9 GB of the process's memory (about 5 GB before, at the
+   same limit). Side by side, from memory: ClickBench 7.66 → 6.86 s (q23 0.95 → 0.44 s), TPC-H
+   1.006 → 1.004 s; every query that looked slower re-timed alone, both ways. In `singlenode.py`'s
+   runs ClickBench from memory is 6.58 s (8.22 s in item 11; DuckDB 1.5.5 over the file 11.10 s) and
+   TPC-H 1.24 s, every answer as DuckDB's but the same 7 ties (`logs/round32/*-arena.json`); TPC-DS
+   99 of 99. The first try copied each batch's strings out, which made a join on a low-cardinality
+   string column carry and count a copy per batch: TPC-H q12's build 235 MB instead of 68.
 
 **Then (2026-10-01, round 31, second part so far; 0.29.0): every kind of object alike, SQL and
 Python in one notebook** (the owner's list after the first part):
