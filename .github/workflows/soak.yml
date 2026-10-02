@@ -74,7 +74,7 @@ jobs:
           NODES: ${{ inputs.nodes }}
           STORAGE: ${{ inputs.storage }}
         run: |
-          pip install -q $(grep -E '^boto3' tools/requirements.txt)
+          pip install -q $(grep -E '^boto3' tools/requirements.txt | sed 's/ *#.*//')
           hours=$(python3 -c "import os; print(min(5.5, float(os.environ['HOURS'])))")
           python3 tools/soak.py --hours "$hours" --rate "$RATE" --batch "$BATCH" --nodes "$NODES" --bin ./pondra \
             $([ "$STORAGE" = r2 ] && echo --s3) --out soak.json --timeline soak-timeline.jsonl

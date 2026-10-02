@@ -31,7 +31,8 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }} # (the releases' list: a runner's shared address has a low limit)
         run: |
-          pip install -q $(grep -E '^(pyarrow|deltalake|pyiceberg|pyiceberg-core)==' tools/requirements.txt)
+          set -o pipefail   # (the check's exit status, not tee's)
+          pip install -q $(grep -E '^(pyarrow|deltalake|pyiceberg|pyiceberg-core)==' tools/requirements.txt | sed 's/ *#.*//')
           python3 tools/upgrade_check.py all --new target/release/pondra --work "$RUNNER_TEMP/upgrade" | tee upgrade.json
       - uses: actions/upload-artifact@v6
         if: always()
