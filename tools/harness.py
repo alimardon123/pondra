@@ -5926,6 +5926,9 @@ def flows():
     q("CREATE MATERIALIZED VIEW big AS SELECT id, buyer, doubled FROM silver WHERE doubled > 1000", ports[1])
     time.sleep(0.5)
     q("CREATE MATERIALIZED VIEW platinum AS SELECT region, sum(n) AS n, sum(total) AS total FROM gold GROUP BY region")
+    # (by all of gold's keys: while gold holds partial rows its read is grouped by them, and
+    # DataFusion then groups by the sums they determine too, which refused this now and then)
+    again = err("CREATE MATERIALIZED VIEW gold_again AS SELECT region, buyer, sum(n) AS n, sum(total) AS total FROM gold GROUP BY region, buyer", ports[1])
     q("CREATE MATERIALIZED VIEW strict (CONSTRAINT small CHECK (amount < 100000)) AS SELECT id, amount FROM orders")
     time.sleep(0.5)
     checks = {}
@@ -5938,7 +5941,9 @@ def flows():
         "expectations on a GROUP BY view": err("CREATE MATERIALIZED VIEW bad4 (CONSTRAINT c CHECK (n > 0)) AS SELECT region, count(*) AS n FROM orders GROUP BY region"),
         "a FAIL expectation rows already break": err("CREATE MATERIALIZED VIEW bad5 (CONSTRAINT c CHECK (amount > 0)) AS SELECT id, amount FROM orders"),
         "dropping a view others follow": err("DROP MATERIALIZED VIEW silver"),
+        "a GROUP BY view's total as a rollup's key": err("CREATE MATERIALIZED VIEW bad6 AS SELECT region, buyer, total, sum(n) AS n FROM gold GROUP BY region, buyer, total"),
     }
+    checks["a rollup by all of a GROUP BY view's keys, made while rows stream in"] = again is None
     for what, e in say.items():
         checks[f"refused: {what}"] = bool(e) and ("GROUP BY view" in e or "expectation" in e or "followed by" in e)
     time.sleep(1)
@@ -5952,9 +5957,12 @@ def flows():
             "silver": (f"SELECT count(*) AS n, sum(doubled) AS d FROM silver", f"SELECT count(*) AS n, sum(amount * 2) AS d {base}"),
             "gold": ("SELECT region, buyer, n, total FROM gold ORDER BY region, buyer NULLS FIRST", f"SELECT region, buyer, count(*) AS n, sum(amount) AS total {base} GROUP BY region, buyer ORDER BY region, buyer NULLS FIRST"),
             "platinum": ("SELECT region, n, total FROM platinum ORDER BY region", f"SELECT region, count(*) AS n, sum(amount) AS total {base} GROUP BY region ORDER BY region"),
+            "gold_again": ("SELECT region, buyer, n FROM gold_again ORDER BY region, buyer NULLS FIRST", f"SELECT region, buyer, count(*) AS n {base} GROUP BY region, buyer ORDER BY region, buyer NULLS FIRST"),
             "big": ("SELECT count(*) AS n, sum(doubled) AS d FROM big", f"SELECT count(*) AS n, sum(amount * 2) AS d {base} AND amount * 2 > 1000"),
             "strict": ("SELECT count(*) AS n, sum(amount) AS s FROM strict", "SELECT count(*) AS n, sum(amount) AS s FROM orders"),
         }
+        if again is not None:
+            del want["gold_again"]  # (refused: its own check says so)
         for view, (got, expected) in want.items():
             for port in ports:
                 e = q(expected, port)
@@ -5973,7 +5981,7 @@ def flows():
     q("UPDATE orders SET amount = -amount WHERE id % 17 = 0")  # (in and out of silver's expectation)
     q("DELETE FROM orders WHERE id % 13 = 0")
     checks.update({k + ", after UPDATE and DELETE": v for k, v in same().items()})
-    checks["a view of a view made again after its flow is dropped from the end"] = all(err(f"DROP MATERIALIZED VIEW {v}") is None for v in ("platinum", "big", "gold", "silver"))
+    checks["a view of a view made again after its flow is dropped from the end"] = all(err(f"DROP MATERIALIZED VIEW {v}") is None for v in ("platinum", "gold_again", "big", "gold", "silver") if again is None or v != "gold_again")
     # History per key (SCD type 2, ADR-036 §8): versions in any order, a delete ending a key.
     q("CREATE TABLE customer_changes (id BIGINT, name VARCHAR, city VARCHAR, op VARCHAR, at BIGINT)")
     q("INSERT INTO customer_changes VALUES (1, 'ann', 'paris', 'U', 1), (1, 'ann', 'rome', 'U', 3), (2, 'bob', 'nyc', 'U', 1)")
