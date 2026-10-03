@@ -80,7 +80,7 @@ A parameter is a JSON value: a number, string, boolean, `null` or an array.
 | `await db.vars()` | this connection's SQL variables (`DECLARE $day …`, `$day = …`: [Variables](/pondra/reference/sql/#variables)) as an object of their values |
 | `await db.getVariable(name)` | one variable's value, `null` if it has none |
 | `await db.setVariable(name, value)` | sets it, as `$name = …` in SQL (the value bound, never pasted in) |
-| `await db.resetVariable(name)` | forgets it (`RESET VARIABLE`) |
+| `await db.resetVariable(name)` | forgets it (`RESET $name`) |
 | `await db.parameters(file)` | a file of the lake's parameters: each `DECLARE PARAMETER`'s name, type, default and comment, and each `$name` it needs |
 
 ```js

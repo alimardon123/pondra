@@ -15,7 +15,7 @@ export function statements(text, raw) {
   const out = [], depth = s => {
     const t = s.replace(/'(?:[^']|'')*'|"[^"]*"|--.*|\/\*[\s\S]*?\*\/|\$(\w*)\$[\s\S]*?\$\1\$/g, ' x ').toLowerCase().match(/\$?\w+|[^\s\w]/g) || [];
     let d = 0;
-    const task = t[0] == 'create' && (t[1] == 'task' || t[3] == 'task'); // (CREATE TASK … AS BEGIN …)
+    const task = t[0] == 'create' && ['task', 'procedure'].some(w => t[1] == w || t[3] == w); // (CREATE TASK … AS BEGIN …, a procedure's too)
     const close = i => { let n = 0; return t.findIndex((x, j) => j > i && !(n += (x == '(') - (x == ')'))); }; // (an IF's condition's end: `if(` before anything but THEN is the function)
     t.forEach((w, i) => {
       const b = t[i - 1], at = !i || /^(then|else|do|loop|repeat|begin|async)$/.test(b) || b == ':' && /^\w/.test(t[i - 2]) && t[i - 3] != ':' || task && b == 'as';

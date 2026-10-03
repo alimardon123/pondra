@@ -24,9 +24,9 @@ export function declared(sql) {
   all.forEach((raw, i) => {
     const st = (i ? raw.replace(/^[ \t]*(--[^\n]*)?\n/, '') : raw).trim(); // (what follows a `;` on its line is the statement before's)
     const lead = st.match(/^(?:\s*(?:--[^\n]*|\/\*[\s\S]*?\*\/))*\s*/)[0], s = st.slice(lead.length);
-    const d = /^declare\s+(?:(parameter)\s+)?\$([a-z_]\w*)\b\s*([\s\S]*?)\s*$/i.exec(s), v = /^(?:\$|set\s+variable\s+)([a-z_]\w*)\s*(?:=|\bto\b)\s*([\s\S]*?)\s*$/i.exec(s);
+    const d = /^declare\s+(?:(parameter)\s+)?\$([a-z_]\w*)\b\s*([\s\S]*?)\s*$/i.exec(s), v = /^(?:\$|set\s+\$|set\s+variable\s+\$?)([a-z_]\w*)\s*(?::=|=|\bto\b)\s*([\s\S]*?)\s*$/i.exec(s);
     if (d && !set.has(d[2])) {
-      const t = /^([\s\S]*?)\s*(?:=|\bdefault\b)\s*([\s\S]*)$/i.exec(d[3]);
+      const t = /^([\s\S]*?)\s*(?::=|=|\bdefault\b)\s*([\s\S]*)$/i.exec(d[3]);
       if (t) use(t[2]);
       out.delete(d[2]); // (used before its DECLARE: the DECLARE says what it is)
       out.set(d[2], { name: d[2], type: (t ? t[1] : d[3]) || null, default: t ? t[2] : null, required: !t && !!d[1], about: above(lead) || after(all[i + 1]), own: !d[1] });
