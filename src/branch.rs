@@ -6,7 +6,8 @@
 //! prod keeps every file that was live when the branch was made, for as long as its pin is there
 //! (`pn/`: `tier::expire`, the orphan sweep); a branch of a branch pins every lake it reads.
 use crate::ddl::Ddl;
-use crate::store::{json, Lake, TableMeta};
+use crate::store::{json, table_key, Lake, TableMeta};
+use crate::views::View;
 use crate::write::Request;
 use anyhow::{bail, ensure, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -126,7 +127,7 @@ pub async fn create(lake: &Lake, name: &str, if_not_exists: bool, dir: Option<St
     let mut lakes = inherited.lakes.clone();
     let mut pinned = vec![];
     let made = async {
-        let ms = pin_in(lake, &base, &dir, None).await?;
+        let (ms, _) = pin_in(lake, &base, &dir, None).await?;
         pinned.push(base.clone());
         for b in inherited.lakes.values() {
             pin_in(lake, &b.url, &dir, Some(b.ms)).await?;
@@ -163,13 +164,14 @@ async fn base(lake: &Lake, from: &str) -> Result<(String, Bases)> {
     Ok((other.url.clone(), bases))
 }
 
-/// Pin `branch` in the lake at `at`: here, or through its own leader (invariant 20).
-async fn pin_in(lake: &Lake, at: &str, branch: &str, ms: Option<u64>) -> Result<u64> {
+/// Pin `branch` in the lake at `at`: here, or through its own leader (invariant 20). Its time, and
+/// when it was written (by that leader's clock).
+async fn pin_in(lake: &Lake, at: &str, branch: &str, ms: Option<u64>) -> Result<(u64, u64)> {
     let v = match at == lake.url {
         true => pin(lake, branch, ms).await?,
         false => Box::pin(crate::write::send(at, Request::Ddl(Ddl::Pin { lake: branch.into(), ms }))).await?,
     };
-    v["ms"].as_u64().context("a pin's time")
+    Ok((v["ms"].as_u64().context("a pin's time")?, v["at_ms"].as_u64().unwrap_or(0)))
 }
 
 async fn unpin_in(lake: &Lake, at: &str, branch: &str) -> Result<()> {
@@ -189,7 +191,7 @@ pub async fn pin(lake: &Lake, branch: &str, ms: Option<u64>) -> Result<Value> {
         ms = ms.min(p.ms);
     }
     lake.cat.commit(vec![(key, json(&Pin { lake: branch.into(), ms, at_ms: now }))], &[]).await?;
-    Ok(j!({"pinned": branch, "ms": ms}))
+    Ok(j!({"pinned": branch, "ms": ms, "at_ms": now}))
 }
 
 pub async fn unpin(lake: &Lake, branch: &str) -> Result<Value> {
@@ -229,15 +231,7 @@ pub async fn make(lake: &Lake, m: Make) -> Result<Value> {
     let base = Lake::open(&m.base, false, false).await.with_context(|| format!("opening {}", m.base))?;
     let id = id_of(&m.base);
     let pin = pin_key(&m.me);
-    let started = std::time::Instant::now();
-    let snap = loop {
-        let all = base.cat.scan_raw("", "\x7f").await?;
-        if all.contains_key(&pin) {
-            break all;
-        }
-        ensure!(started.elapsed().as_secs() < 60, "{} didn't show its pin for this branch within a minute", m.base);
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-    };
+    let snap = snapshot(&base, &pin, 0).await?;
     let number = |k: &str| snap.get(k).and_then(|v| serde_json::from_slice::<u64>(v).ok()).unwrap_or(0);
     let (commit, next, block) = (number("c"), number("n").max(1), number("b"));
     let end = next - 1;
@@ -254,12 +248,7 @@ pub async fn make(lake: &Lake, m: Make) -> Result<Value> {
             "t" => {
                 let mut meta: TableMeta = serde_json::from_slice(v).with_context(|| k.clone())?;
                 match m.data {
-                    true => {
-                        meta.files.iter_mut().for_each(|f| rebase_file(f, &id));
-                        if let Some(s) = &mut meta.sealed {
-                            s.list = rebase(&s.list, &id);
-                        }
-                    }
+                    true => listed(&mut meta, &id),
                     false => (meta.files, meta.sealed, meta.tiered, meta.purges, meta.changed, meta.sketch, meta.rows_at) = (vec![], None, end, vec![], false, Default::default(), 0),
                 }
                 // (what the base deletes, publishes and shares is the base's: never the branch's)
@@ -315,6 +304,29 @@ pub async fn make(lake: &Lake, m: Make) -> Result<Value> {
     Ok(j!({"branch": lake.url, "of": m.base, "tables": tables}))
 }
 
+/// The base's catalog at a version that holds `pin`, written at `at_ms` or later.
+async fn snapshot(base: &Lake, pin: &str, at_ms: u64) -> Result<BTreeMap<String, bytes::Bytes>> {
+    let started = std::time::Instant::now();
+    loop {
+        let all = base.cat.scan_raw("", "\x7f").await?;
+        if all.get(pin).and_then(|v| serde_json::from_slice::<Pin>(v).ok()).is_some_and(|p| p.at_ms >= at_ms) {
+            return Ok(all);
+        }
+        ensure!(started.elapsed().as_secs() < 60, "{} didn't show its pin for this branch within a minute", base.url);
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+}
+
+/// A base's table as a branch lists it: its files where they are, and nothing the base alone does
+/// with them (deletes, publishes, shares).
+fn listed(meta: &mut TableMeta, id: &str) {
+    meta.files.iter_mut().for_each(|f| rebase_file(f, id));
+    if let Some(s) = &mut meta.sealed {
+        s.list = rebase(&s.list, id);
+    }
+    (meta.garbage, meta.garbage_deletes, meta.replaced, meta.shares, meta.publish) = Default::default();
+}
+
 /// The base's workspace files (not their kept versions), to copy.
 async fn workspace(base: &Lake) -> Result<Vec<String>> {
     use futures::TryStreamExt;
@@ -360,6 +372,119 @@ pub async fn databases(lake: &Lake) -> Result<datafusion::arrow::record_batch::R
         ("branched_at", Arc::new(rows.iter().map(|r| r.3).collect::<TimestampMicrosecondArray>().with_timezone("UTC")) as ArrayRef),
         ("branches", Arc::new(rows.iter().map(|r| Some(r.4)).collect::<Int64Array>()) as ArrayRef),
     ])?)
+}
+
+/// `ALTER DATABASE b REFRESH [t, …]` (b's leader): each table named (a view stands for the tables
+/// it reads; none named, every table b took from its base that the base still has), and every view
+/// that follows them, as the base has them now. Their files are listed where they are and their rows still in the base's
+/// log are written into b's own files, with their ids and versions; b's own rows of them go. b's
+/// counters first move past the base's, so what b writes next numbers after what it took (a newer
+/// keyed file's `ord` is greater: invariant 5). A view of them that b defines otherwise than its
+/// base, or one keeping state of its own (a window, sessions, a stream join), is refused by name.
+pub async fn refresh(lake: &Lake, seq: &crate::log::Sequencer, lock: &tokio::sync::Mutex<()>, database: Option<String>, tables: Vec<String>) -> Result<Value> {
+    if let Some(db) = database.filter(|d| *d != crate::ddl::lake_name(lake)) {
+        // (another database's: its own leader does it, and this lake's lock isn't held meanwhile)
+        let url = lake.attached.read().unwrap().iter().find(|(n, _)| *n == db).map(|(_, l)| l.url.clone());
+        let url = url.with_context(|| format!("no database {db} here"))?;
+        return Box::pin(crate::write::send(&url, Request::Ddl(Ddl::Refresh { database: None, tables }))).await;
+    }
+    let me: Bases = lake.cat.get(BASES).await?.with_context(|| format!("{} isn't a branch: REFRESH brings a branch's tables up to its base's", crate::ddl::lake_name(lake)))?;
+    // A version of the base from after this statement: the pin written again (its time kept: the
+    // files it lists now are newer) shows in it.
+    let (_, at) = pin_in(lake, &me.base, &me.me, None).await?;
+    let base = Lake::open(&me.base, false, false).await.with_context(|| format!("opening {}", me.base))?;
+    let snap = snapshot(&base, &pin_key(&me.me), at).await?;
+    let number = |k: &str| snap.get(k).and_then(|v| serde_json::from_slice::<u64>(v).ok()).unwrap_or(0);
+    let (next, block) = (number("n").max(1), number("b"));
+    let end = next - 1;
+    // The tables named, then whatever follows them, there or here: views, views of those, …
+    let theirs: BTreeMap<String, View> = snap.range("v/".to_string().."v0".to_string()).map(|(k, v)| Ok((k[2..].to_string(), serde_json::from_slice(v)?))).collect::<Result<_>>()?;
+    let ours: BTreeMap<String, View> = lake.cat.scan::<View>("v/", "v0").await?.into_iter().map(|(k, v)| (k[2..].to_string(), v)).collect();
+    let view = |n: &str| theirs.get(n).or_else(|| ours.get(n));
+    let mut set: Vec<String> = vec![];
+    if tables.is_empty() {
+        // Every table this branch took from its base that the base still has; views (and a
+        // window's `_final`) come with the tables they read, hidden tables with theirs.
+        let here = lake.cat.scan::<serde_json::Value>("t/", "t0").await?;
+        let made = |n: &str| view(n).is_some() || n.strip_suffix("_final").is_some_and(|v| view(v).is_some());
+        set = here.into_iter().map(|(k, _)| k[2..].to_string()).filter(|n| !n.contains('$') && !made(n) && snap.contains_key(&table_key(n))).collect();
+    }
+    for t in &tables {
+        let name = crate::ddl::local(lake, t).with_context(|| format!("{t}: a table of this database"))?;
+        // A view stands for the tables it reads (its rows are theirs, worked out), back to the first.
+        let mut todo = vec![name];
+        while let Some(n) = todo.pop() {
+            match view(&n) {
+                Some(v) => todo.extend(std::iter::once(v.source.clone()).chain(v.join.iter().flat_map(|j| j.tables.clone()))),
+                None if set.contains(&n) => {}
+                None => {
+                    ensure!(snap.contains_key(&table_key(&n)), "{n} isn't a table of {}", me.base);
+                    set.push(n);
+                }
+            }
+        }
+    }
+    let follows = |v: &View, set: &[String]| set.contains(&v.source) || v.join.as_ref().is_some_and(|j| j.tables.iter().any(|t| set.contains(t)));
+    loop {
+        let more: std::collections::BTreeSet<String> = theirs.iter().chain(&ours).filter(|(n, v)| !set.contains(n) && follows(v, &set)).map(|(n, _)| n.clone()).collect();
+        if more.is_empty() {
+            break;
+        }
+        set.extend(more);
+    }
+    let views: Vec<&String> = set.iter().filter(|n| theirs.contains_key(*n) || ours.contains_key(*n)).collect();
+    for v in &views {
+        let Some(t) = theirs.get(*v) else { bail!("{v} follows what REFRESH brings, and {} has no such view: drop it, REFRESH, then make it again", me.base) };
+        ensure!(ours.get(*v).is_none_or(|o| serde_json::to_value(o).ok() == serde_json::to_value(t).ok()), "{v} is defined here otherwise than in {}: drop it, REFRESH, then make it again", me.base);
+        ensure!(t.emit.is_none() && t.sessions.is_none() && t.join.is_none(), "{v} keeps state of its own (a window, sessions or a stream join): drop it, REFRESH, then make it again");
+    }
+    let all: Vec<String> = set.iter().flat_map(|t| [t.clone(), crate::sys::deleted(t)]).filter(|t| snap.contains_key(&table_key(t))).collect();
+    // Each table as the base has it, its rows not yet in files written into files of this lake.
+    let id = id_of(&me.base);
+    let mut metas = vec![];
+    for t in &all {
+        let mut meta: TableMeta = serde_json::from_slice(&snap[&table_key(t)]).with_context(|| t.clone())?;
+        let tail = match meta.tiered < end {
+            true => crate::tier::fold_into(&base, lake, t, &meta, meta.tiered, end).await?,
+            false => vec![],
+        };
+        listed(&mut meta, &id);
+        meta.files.extend(tail);
+        metas.push((t.clone(), meta));
+    }
+    let _guard = lock.lock().await;
+    // This lake's counters past the base's, then a number of its own: every table here starts
+    // after it (invariant 50), and its own rows of these tables before it are left behind.
+    let now = seq.number().await?;
+    let skip = crate::log::Flush { reserve: next.saturating_sub(now.version + 1), blocks: block.saturating_sub(now.block), ..Default::default() };
+    if skip.reserve > 0 || skip.blocks > 0 {
+        seq.submit(skip).await?;
+    }
+    let mark = seq.number().await?.version;
+    let (mut puts, now_ms) = (vec![], crate::log::now_ms());
+    for (t, mut meta) in metas {
+        meta.tiered = mark;
+        if let Some(old) = lake.cat.get::<TableMeta>(&table_key(&t)).await? {
+            // (its own files go after the retention period; its bases' are theirs)
+            meta.garbage = old.garbage.into_iter().chain(old.files.iter().filter(|f| split(&f.path).is_none()).map(|f| (f.path.clone(), now_ms))).collect();
+            let left = crate::tier::backlog(lake, old.tiered, Some(mark)).await?.get(&t).copied().unwrap_or(0);
+            lake.backlog.fetch_sub(left.min(lake.backlog.load(std::sync::atomic::Ordering::Relaxed)), std::sync::atomic::Ordering::Relaxed);
+        }
+        puts.push((table_key(&t), json(&meta)));
+    }
+    let mut fills = vec![];
+    for v in views {
+        puts.push((crate::views::view_key(v), snap[&crate::views::view_key(v)].to_vec()));
+        let fill = crate::store::producer_key(&format!("fill:{v}"));
+        if let Some(p) = snap.get(&fill) {
+            puts.push((fill, p.to_vec()));
+            fills.push(format!("fill:{v}"));
+        }
+    }
+    lake.cat.commit(puts, &[]).await?;
+    crate::views::forget(lake); // (the sequencer's views as they are now: invariant 77)
+    crate::log::forget_producers(fills);
+    Ok(j!({"refreshed": all, "from": me.base}))
 }
 
 /// `pondra.diff('a', 'b')` in a FROM: the rows of table b that differ from a's, in the change

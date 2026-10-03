@@ -1,0 +1,164 @@
+---
+title: Branches and environments
+description: Make a whole database a zero-copy branch of another, change it apart, compare it, bring tables up to date, and drop it.
+sidebar:
+  order: 9.7
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+A branch is a whole database that starts as another one is right now, with every table, view,
+function and file, without copying any data. Make one per developer, per pull request or for a test
+run, change it as you like, compare it with where it came from, and drop it when you're done.
+
+## Make a branch
+
+Say production is this node's lake. A lake is named after its folder; here it is called `lake`:
+
+```sql
+CREATE TABLE orders (id BIGINT, amount DOUBLE);
+INSERT INTO orders VALUES (1, 10.0), (2, 20.0), (3, 30.0);
+CREATE MATERIALIZED VIEW big AS SELECT id, amount FROM orders WHERE amount >= 20;
+```
+
+`CREATE DATABASE … CLONE` makes `dev` from it:
+
+```sql
+CREATE DATABASE dev CLONE lake;
+SELECT * FROM dev.orders ORDER BY id;
+```
+
+```text
+id | amount
+---+-------
+ 1 |   10.0
+ 2 |   20.0
+ 3 |   30.0
+```
+
+`dev` lists its base's files where they are, so making it takes about the same time for a table of a
+thousand rows or a billion. Only the rows the base hasn't written to files yet, and the workspace's
+files, are copied. Rows keep their `_row_id` and `_version`. The database you clone can be this
+node's own lake or any database attached to it.
+
+`pondra.databases` shows which database is a branch of which:
+
+```sql
+SELECT name, base, branches FROM pondra.databases ORDER BY name;
+```
+
+```text
+name | base | branches
+-----+------+---------
+dev  | lake |        0
+lake |      |        1
+```
+
+To take only some schemas, or only the definitions with no rows (for tests that load their own):
+
+```sql
+CREATE DATABASE fixtures CLONE lake WITH NO DATA;
+SELECT count(*) AS n FROM fixtures.orders;
+```
+
+```text
+n
+-
+0
+```
+
+`WITH (schemas = (sales, finance))` takes just those schemas.
+
+## Change it apart
+
+Writes to a branch stay in the branch. Its materialized views follow its own rows:
+
+```sql
+INSERT INTO dev.orders VALUES (4, 40.0);
+UPDATE dev.orders SET amount = 25.0 WHERE id = 2;
+SELECT (SELECT count(*) FROM dev.big) AS in_dev, (SELECT count(*) FROM big) AS here;
+```
+
+```text
+in_dev | here
+-------+-----
+     3 |    2
+```
+
+The base carries on too: its merges, compactions and retention never take away a file `dev`
+reads. It keeps them for as long as `dev` exists.
+
+## Compare two databases
+
+`pondra.diff('a', 'b')` gives the rows of table `b` that differ from table `a`, in the
+[change feed](/pondra/guides/change-rows/)'s words:
+
+```sql
+SELECT _change_type, id, amount FROM pondra.diff('orders', 'dev.orders') ORDER BY id, _change_type;
+```
+
+```text
+_change_type     | id | amount
+-----------------+----+-------
+update_postimage |  2 |   25.0
+update_preimage  |  2 |   20.0
+insert           |  4 |   40.0
+```
+
+Rows both hold alike are matched by their `_row_id` and `_version`, so comparing a big table reads
+only its rows, never a join on every column.
+
+## Bring tables up to date
+
+A branch stays as its base was when it was made. `ALTER DATABASE … REFRESH` brings tables up to the
+base's present, with the materialized views that follow them:
+
+```sql
+INSERT INTO orders VALUES (5, 50.0);
+ALTER DATABASE dev REFRESH orders;
+SELECT id, amount FROM dev.orders ORDER BY id;
+```
+
+```text
+id | amount
+---+-------
+ 1 |   10.0
+ 2 |   20.0
+ 3 |   30.0
+ 5 |   50.0
+```
+
+The branch's own changes to those tables go (here row 4 and the update); every other table stays as
+the branch has it.
+
+- `ALTER DATABASE dev REFRESH` with no names brings every table the branch took from its base.
+- `ALTER DATABASE dev REFRESH orders, customers` brings those, in one commit.
+- Naming a materialized view brings the tables it reads, and the view comes with them.
+
+REFRESH says what to do instead of guessing when the branch has a view of those tables that its
+base doesn't have, defines one otherwise, or keeps state of its own (a window emitted once,
+sessions, a stream join): drop it, refresh, then make it again.
+
+## Drop a branch
+
+```sql
+DROP DATABASE fixtures;
+DROP DATABASE dev;
+```
+
+Only what the branch wrote goes. Its base lets go of the files it kept for it. A database that still
+has branches can't be dropped; drop the branches first.
+
+## What a branch leaves behind
+
+- **Tasks start suspended**, so a branch never runs production's schedules. Resume one with
+  `ALTER TASK … RESUME`.
+- **Secrets stay with the base**, and a view fed by a Kafka topic arrives as a plain table: nothing
+  in a branch reaches outside on its own.
+- **A branch lives where its base does**: both in the same bucket, or both on the same machine.
+
+<Aside type="caution">
+`pondra plan` and `pondra deploy` (a project in Git, made true in a database) aren't here yet. Until
+then, change a branch with SQL and the [workspace](/pondra/guides/workspace/)'s files, and compare
+with `pondra.diff`.
+</Aside>

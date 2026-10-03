@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Branches (ADR-047): `CREATE DATABASE dev CLONE prod` is prod as it was, copying none of its files;
 its writes are its own; prod keeps the files it reads while it lives, through merges, purges and
-retention; `pondra.diff` tells their rows apart; a branch of a branch; `DROP DATABASE` lets go.
+retention; `pondra.diff` tells their rows apart; `ALTER DATABASE dev REFRESH [t]` brings a table
+(a view: the tables it reads; none named: all) and what follows it up to prod's present; a branch of
+a branch; `DROP DATABASE` lets go.
 
   environments_check.py [--new target/release/pondra] [--work DIR] [--port 9780] [--s3]
 
@@ -68,6 +70,8 @@ def environments_check(bin, work, port, root):
         prod.post("/tier")
     q("CREATE TABLE k (id BIGINT PRIMARY KEY, v VARCHAR)")
     q("INSERT INTO k VALUES (1, 'one'), (2, 'two'), (3, 'three')")
+    q("CREATE TABLE kv (id BIGINT PRIMARY KEY, v VARCHAR)")
+    q("INSERT INTO kv VALUES (1, 'a'), (2, 'b'), (3, 'c')")
     q("CREATE MATERIALIZED VIEW sales.totals AS SELECT id % 2 AS odd, count(*) AS n, sum(amount) AS s FROM sales.orders GROUP BY id % 2")
     prod.post("/tier")
     q("UPDATE sales.orders SET amount = -1 WHERE id <= 10")
@@ -104,6 +108,7 @@ def environments_check(bin, work, port, root):
     dev.q("UPDATE sales.orders SET amount = 0 WHERE id BETWEEN 21 AND 25")
     dev.q("DELETE FROM sales.orders WHERE id BETWEEN 26 AND 30")
     dev.q("INSERT INTO k VALUES (4, 'dev')")
+    dev.q("INSERT INTO kv VALUES (1, 'dev')")
     for _ in range(2):
         dev.post("/tier")
     model = {r[2]: r for r in before}
@@ -125,6 +130,9 @@ def environments_check(bin, work, port, root):
     q("UPDATE sales.orders SET amount = amount + 1")
     q("DELETE FROM sales.orders WHERE id > 900")
     q("DROP TABLE k")
+    q("UPDATE kv SET v = 'B' WHERE id = 2")
+    q("DELETE FROM kv WHERE id = 3")
+    q("INSERT INTO kv VALUES (5, 'e')")
     for _ in range(4):
         prod.post("/tier")
         time.sleep(3)
@@ -134,6 +142,41 @@ def environments_check(bin, work, port, root):
     dev = Node(bin, dev_dir, port + 1, work, "--retain-secs", "1", env=env).start()  # (nothing of prod's files in its memory)
     checks["while prod merges, purges, drops and lets its past go, dev's files stay: dev answers as before after a restart"] = \
         rows(dev, every) == dev_rows and rows(dev, keyed) == before_k + [(rows(dev, "SELECT _row_id FROM k WHERE id = 4")[0][0], 4, "dev")]
+
+    # REFRESH: a table and what follows it, as prod has it now (its log tail too); dev's own rows of
+    # it go; what dev writes after is newer (an upsert wins, row ids stay unique).
+    q("INSERT INTO sales.orders VALUES (3001, 3.0)")
+    q("INSERT INTO kv VALUES (6, 'f')")
+    kv = "SELECT _row_id, _version, id, v FROM kv ORDER BY id"
+    totals_sql = "SELECT odd, n, s FROM sales.totals ORDER BY odd"
+    dev.q("CREATE MATERIALIZED VIEW sales.mine AS SELECT id, amount FROM sales.orders WHERE amount > 100")
+    checks["REFRESH refused while dev has a view of the table prod doesn't, saying what to do"] = \
+        "sales.mine" in refused(prod, "ALTER DATABASE dev REFRESH sales.orders")
+    dev.q("DROP MATERIALIZED VIEW sales.mine")
+    now_rows, now_totals, now_kv, own_k = rows(prod, every), rows(prod, totals_sql), rows(prod, kv), rows(dev, keyed)
+    q("ALTER DATABASE dev REFRESH sales.orders")  # (from prod: dev's leader does it)
+    dev.q("ALTER DATABASE dev REFRESH kv")        # (from dev itself)
+    checks["ALTER DATABASE dev REFRESH t: t and its view as prod has them now (ids, versions, the log tail); other tables as they were"] = \
+        rows(dev, every) == now_rows and rows(dev, totals_sql) == now_totals and rows(dev, kv) == now_kv and rows(dev, keyed) == own_k
+    dev.q("INSERT INTO kv VALUES (1, 'after')")
+    dev.q("INSERT INTO sales.orders VALUES (6001, 6.0)")
+    dev.q("UPDATE sales.orders SET amount = 9 WHERE id = 3001")
+    for _ in range(2):
+        dev.post("/tier")
+    checks["…what dev writes after it is newer: an upsert wins through tiering, row ids stay unique, prod unchanged"] = \
+        rows(dev, "SELECT v FROM kv WHERE id = 1") == [("after",)] and rows(dev, "SELECT count(*) = count(DISTINCT _row_id) FROM sales.orders") == [(True,)] \
+        and rows(dev, "SELECT amount FROM sales.orders WHERE id IN (3001, 6001) ORDER BY id") == [(9.0,), (6.0,)] \
+        and rows(dev, "SELECT sum(n) FROM sales.totals") == rows(dev, "SELECT count(*) FROM sales.orders") and rows(prod, every) == now_rows
+    after_kv = rows(dev, kv)
+    q("ALTER DATABASE dev REFRESH sales.totals")  # (a view: the tables it reads)
+    checks["…naming a view brings the tables it reads, and only those"] = \
+        rows(dev, every) == now_rows and rows(dev, totals_sql) == now_totals and rows(dev, kv) == after_kv
+    dev.q("ALTER DATABASE dev REFRESH")  # (none named: every table dev took from prod that prod still has)
+    checks["…none named, every table dev took from prod that prod still has (prod dropped k: dev keeps its own)"] = \
+        rows(dev, kv) == now_kv and rows(dev, every) == now_rows and rows(dev, keyed) == own_k
+    checks["REFRESH refused by name: a database that isn't a branch, a table its base doesn't have"] = \
+        "isn't a branch" in refused(prod, "ALTER DATABASE prod REFRESH sales.orders") and "isn't a table" in refused(prod, "ALTER DATABASE dev REFRESH k")
+    dev_rows = rows(dev, every)
 
     # A branch of a branch reads both; its base can't go first; WITH (schemas = …) and WITH NO DATA.
     dev.stop()
@@ -158,7 +201,7 @@ def environments_check(bin, work, port, root):
         prod.post("/tier")
     checks["DROP DATABASE: the branches' folders go, prod's pins with them, and prod lets the files they held go"] = \
         not keys(dev_dir) and rows(prod, "SELECT name, branches FROM pondra.databases") == [("prod", 0)] and len(parquet(prod_dir)) < held
-    checks["prod answers as it should after it all"] = rows(prod, "SELECT count(*) FROM sales.orders") == [(len([r for r in before if r[2] <= 900]),)]
+    checks["prod answers as it should after it all"] = rows(prod, "SELECT count(*) FROM sales.orders") == [(len([r for r in before if r[2] <= 900]) + 1,)]
     checks["(cloned in {:.1f} s)".format(took)] = True
     return checks
 

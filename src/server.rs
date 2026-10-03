@@ -863,9 +863,12 @@ async fn change(State(app): State<App>, Json((sql, job, sent)): Json<(String, St
 
 /// A `CREATE`/`DROP` of a schema, view or table that a follower's SQL asked for (`ddl.rs`).
 async fn ddl(State(app): State<App>, Json(d): Json<crate::ddl::Ddl>) -> Result<Json<Value>, E> {
-    let out = {
-        let _guard = app.lock.lock().await;
-        crate::ddl::apply(&app.lake, d.clone()).await?
+    let out = match &app.seq {
+        Some(seq) => crate::write::ddl_here(&app.lake, seq, &app.lock, d.clone()).await?,
+        None => {
+            let _guard = app.lock.lock().await;
+            crate::ddl::apply(&app.lake, d.clone()).await?
+        }
     };
     crate::ddl::settle(&app.lake, &d, &app.cluster.addr).await?; // (ATTACH, CREATE DATABASE: the leader too at once, not in a second)
     Ok(Json(out))

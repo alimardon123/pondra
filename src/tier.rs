@@ -567,17 +567,34 @@ pub async fn run_job(lake: &Lake, Job { table, meta, kind }: Job) -> Result<Vec<
             return Ok(merged);
         }
     };
+    write_parts(lake, &table, &meta, batches, &keys, ord, whole).await
+}
+
+/// A job's rows as files, one a partition.
+async fn write_parts(lake: &Lake, table: &str, meta: &TableMeta, batches: Vec<RecordBatch>, keys: &[String], ord: u64, whole: bool) -> Result<Vec<DataFile>> {
     let parts = match &meta.partition {
         Some(spec) => split(spec, batches).await?,
         None => vec![(String::new(), batches)],
     };
     let mut files = vec![];
     for (part, batches) in parts {
-        if let Some(f) = write_file(lake, &table, &batches, &keys, meta.key.is_empty()).await? {
+        if let Some(f) = write_file(lake, table, &batches, keys, meta.key.is_empty()).await? {
             files.push(DataFile { ord, whole, part, ..f });
         }
     }
     Ok(files)
+}
+
+/// What a fold job of `from`'s log segments (after, upto] writes, written as files of `to`: a
+/// branch's REFRESH takes its base's rows not yet in files so (`branch::refresh`), with their
+/// system columns; a keyed table's one row per key, delete markers kept.
+pub async fn fold_into(from: &Lake, to: &Lake, table: &str, meta: &TableMeta, after: u64, upto: u64) -> Result<Vec<DataFile>> {
+    let meta = crate::sys::with_sys(meta);
+    let (keys, batches) = match meta.key.is_empty() {
+        true => (meta.cluster.clone(), crate::query::tail_of(from, table, after, Some(upto), false, true, false).await?),
+        false => (meta.key.clone(), latest(from, table, &TableMeta { files: vec![], tiered: after, ..meta.clone() }, upto, true).await?),
+    };
+    write_parts(to, table, &meta, batches, &keys, upto, false).await
 }
 
 /// A partitioned table's rows, one group per partition value (`day(ts)`: the day, `col`: the value).
