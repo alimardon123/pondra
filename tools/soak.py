@@ -3,6 +3,7 @@
 and then, and what drifts over time measured.
 
   soak.py [--hours 24 | --minutes 10] [--nodes 3] [--rate 500] [--s3] [--out soak.json]
+          [--resume STATE] [--save STATE]
 
   Steady ingest: producers append to `ev` at --rate rows a second in all, each batch once (a
   producer's sequence, retried on any live node until acknowledged); an upserting producer keeps
@@ -25,6 +26,12 @@ and then, and what drifts over time measured.
 
 --s3: the lake is s3://$PONDRA_BUCKET/soak-<id> (AWS_* point at R2, MinIO or tools/sim_r2.py),
 deleted at the end unless --keep.
+
+Legs (a day where a machine lasts six hours: GitHub's runners, soak.yml): --save ends a leg with
+its checks, stops the nodes (followers, then the leader: drained, stepping down) and writes what
+the next leg needs (the lake, every producer's acknowledged batches, the model, the time so far) to
+STATE, keeping the lake; --resume STATE starts the next on that lake, the load going on where it
+stopped. The lake lives the whole day; each node process lives a leg at most.
 """
 import argparse, collections, json, os, random, shutil, sys, tempfile, threading, time, uuid
 
@@ -68,9 +75,9 @@ def objects(lake):
 class Upserts(threading.Thread):
     """One producer upserting `kv` (1,000 keys), each batch once; the model is what was acknowledged."""
 
-    def __init__(self, nodes, rate):
+    def __init__(self, nodes, rate, model=None, seq=0):
         super().__init__(daemon=True)
-        self.nodes, self.rate, self.model, self.stop_, self.seq = nodes, rate, {}, threading.Event(), 0
+        self.nodes, self.rate, self.model, self.stop_, self.seq = nodes, rate, model or {}, threading.Event(), seq
 
     def run(self):
         while not self.stop_.is_set():
@@ -78,7 +85,7 @@ class Upserts(threading.Thread):
             rows = {random.randrange(1000): self.seq * 10 + i for i in range(10)}
             body = "".join(json.dumps({"k": k, "v": v}) + "\n" for k, v in rows.items())
             t0 = time.time()
-            while not self.stop_.is_set():
+            while True:  # (until acknowledged, as `Load`'s: a batch given up on may still have committed)
                 try:
                     random.choice(self.nodes).call("POST", f"/append/kv?producer=upserts&seq={self.seq}", body, timeout=20)
                     self.model.update(rows)
@@ -102,23 +109,27 @@ def main():
     ap.add_argument("--port", type=int, default=9760)
     ap.add_argument("--out", default="soak.json")
     ap.add_argument("--timeline", default="soak-timeline.jsonl")
+    ap.add_argument("--resume", help="a leg's STATE: go on with its lake")
+    ap.add_argument("--save", help="end this leg: keep the lake, and write what the next needs here")
     A = ap.parse_args()
+    was = json.load(open(A.resume)) if A.resume else {"elapsed": 0, "moves": 0, "legs": []}
     secs = A.hours * 3600 if A.hours else A.minutes * 60
     every = A.failover_mins * 60 or min(3600, secs / 8)
     work = tempfile.mkdtemp(prefix="pondra-soak-")
-    lake = f"s3://{os.environ['PONDRA_BUCKET']}/soak-{uuid.uuid4().hex[:8]}" if A.s3 else os.path.join(work, "lake")
+    lake = was.get("lake") or (f"s3://{os.environ['PONDRA_BUCKET']}/soak-{uuid.uuid4().hex[:8]}" if A.s3 else os.path.join(work, "lake"))
     binary = os.path.abspath(A.bin)
     nodes = [Node(binary, lake, A.port + i, work, tier_secs=10).start() for i in range(A.nodes)]
     first = nodes[0]
-    first.post("/tables/ev", json.dumps([["producer", "Utf8"], ["seq", "Int64"], ["i", "Int64"]]))
-    first.q("CREATE TABLE kv (k BIGINT PRIMARY KEY, v BIGINT)")
-    first.q("CREATE MATERIALIZED VIEW per_producer AS SELECT producer, count(*) AS n, max(seq) AS mx FROM ev GROUP BY producer")
-    first.q("CREATE MATERIALIZED VIEW tens AS SELECT producer, seq, i FROM ev WHERE i = 0 AND seq % 10 = 0")
-    until(lambda: all(x.q("SELECT count(*) AS n FROM ev") for x in nodes), 30)
+    if not A.resume:
+        first.post("/tables/ev", json.dumps([["producer", "Utf8"], ["seq", "Int64"], ["i", "Int64"]]))
+        first.q("CREATE TABLE kv (k BIGINT PRIMARY KEY, v BIGINT)")
+        first.q("CREATE MATERIALIZED VIEW per_producer AS SELECT producer, count(*) AS n, max(seq) AS mx FROM ev GROUP BY producer")
+        first.q("CREATE MATERIALIZED VIEW tens AS SELECT producer, seq, i FROM ev WHERE i = 0 AND seq % 10 = 0")
+    until(lambda: all(x.q("SELECT count(*) AS n FROM ev") for x in nodes), 120)
     live = list(nodes)
     producers, size = 4, A.batch
-    load = Load(live, "ev", producers=producers, readers=2, size=size, rate=max(0.1, A.rate / producers / size)).start()
-    ups = Upserts(live, rate=2)
+    load = Load(live, "ev", producers=producers, readers=2, size=size, rate=max(0.1, A.rate / producers / size), acked=was.get("acked")).start()
+    ups = Upserts(live, rate=2, model={int(k): v for k, v in was.get("kv", {}).items()}, seq=was.get("kv_seq", 0))
     ups.start()
     role = lambda x: x.get("/stats", timeout=5)["role"]
     timeline, moves, start = open(A.timeline, "w"), [], time.time()
@@ -134,7 +145,7 @@ def main():
         span, wrote = time.time() - (samples[-1]["at"] if samples else start), now_wrote
         if not A.s3 or time.time() - last_list > 1800:
             listed, last_list = objects(lake), time.time()
-        line = {"t": round(time.time() - start), "at": time.time(), "object_writes_per_s": round(made / max(span, 1), 1), "rss_mb": {x.port: rss_mb(x) for x in live}, "pids": {x.port: x.p.pid for x in live},
+        line = {"t": round(was["elapsed"] + time.time() - start), "at": time.time(), "object_writes_per_s": round(made / max(span, 1), 1), "rss_mb": {x.port: rss_mb(x) for x in live}, "pids": {x.port: x.p.pid for x in live},
                 "untiered_rows": stats.get("untiered_rows"), "commit_ms_p95": stats.get("commit_ms_p95"),
                 "longest_ack_s": load.longest(mark), "acked": sum(load.acked.values()),
                 "torn": len(load.torn), **({"objects": listed} if listed else {})}
@@ -146,7 +157,7 @@ def main():
         timeline.write(json.dumps(line) + "\n")
         timeline.flush()
         if time.time() >= next_move and len(live) == A.nodes:
-            who, how = kinds[len(moves) % len(kinds)]
+            who, how = kinds[(was["moves"] + len(moves)) % len(kinds)]
             x = next((y for y in live if (role_or(y, role) == "leader") == (who == "leader")), None)
             if x:
                 t0 = time.time()
@@ -156,20 +167,24 @@ def main():
                 y = Node(binary, lake, x.port, work, tier_secs=10).start()
                 until(lambda: y.plain("GET", "/ready")[0] == 200, 60)
                 live.append(y)
-                moves.append({"at_s": round(t0 - start), "node": f"{who} {x.port}", "how": "stopped" if how == "term" else "killed", "window": (t0 - 0.5, time.time())})
+                moves.append({"at_s": round(was["elapsed"] + t0 - start), "node": f"{who} {x.port}", "how": "stopped" if how == "term" else "killed", "window": (t0 - 0.5, time.time())})
             next_move += every
     ups.stop_.set()
     for m in moves:
         if "window" in m:
             m["longest_ack_s"] = load.longest(*m.pop("window"))
-    result = load.finish(live[0])
+    # (asked of the leader: it holds every commit it acknowledged, a follower a moment later)
+    leader = next(x for x in live if role_or(x, role) == "leader")
+    result = load.finish(leader)
     ups.join(30)
     checks, info = {}, {"moves": moves, **{k: v for k, v in result.items() if k != "reads"}, "reads": result["reads"]}
-    leader = next(x for x in live if role(x) == "leader")
     drained = until(lambda: leader.get("/stats")["untiered_rows"] == 0, 120, step=2)
     same = lambda sql: all(x.q(sql) == live[0].q(sql) for x in live)
     kv = {r["k"]: r["v"] for r in live[0].q("SELECT k, v FROM kv")}
-    checks["every acknowledged batch once, no torn read"] = not result["lost or twice"] and not result["torn reads"]
+    # (…and on every node once the log drained: a batch lost from the tail would leave no gap)
+    held = lambda x: sorted((r["producer"], r["n"]) for r in x.q("SELECT producer, count(*) AS n FROM ev GROUP BY producer"))
+    everywhere = all(held(x) == sorted((p, seq * size) for p, seq in load.acked.items()) for x in live)
+    checks["every acknowledged batch once, no torn read"] = not result["lost or twice"] and not result["torn reads"] and everywhere
     checks["the keyed table equals its model, on every node"] = kv == ups.model and same("SELECT k, v FROM kv ORDER BY k")
     checks["the views equal their rows, on every node"] = (live[0].q("SELECT * FROM per_producer ORDER BY producer") == live[0].q("SELECT producer, count(*) AS n, max(seq) AS mx FROM ev GROUP BY producer ORDER BY producer")
                                                          and live[0].q("SELECT count(*) AS n FROM tens") == live[0].q("SELECT count(*) AS n FROM ev WHERE i = 0 AND seq % 10 = 0")
@@ -192,12 +207,17 @@ def main():
     info["object writes a second (every node)"] = round(sum(s["object_writes_per_s"] for s in samples[1:]) / max(1, len(samples) - 1), 1)
     info["longest wait for an acknowledgement, s"] = max((s["longest_ack_s"] for s in samples), default=0)
     info["minutes"] = round((time.time() - start) / 60, 1)
-    [x.stop() for x in live]
+    # (followers first: the leader then drains, steps down, and the next leg's nodes lead at once)
+    [x.stop() for x in sorted(live, key=lambda x: role_or(x, role) == "leader")]
     ok = all(checks.values())
-    out = {"ok": ok, "checks": checks, "info": info, "lake": lake}
+    legs = was["legs"] + [{"ok": ok, "checks": checks, "minutes": info["minutes"]}]
+    out = {"ok": ok and all(leg["ok"] for leg in legs), "checks": checks, "info": info, "lake": lake, **({"legs": legs} if len(legs) > 1 or A.save else {})}
     json.dump(out, open(A.out, "w"), indent=1)
     print(json.dumps(out, indent=1))
-    if not A.keep:
+    if A.save and ok:
+        json.dump({"lake": lake, "acked": dict(load.acked), "kv": ups.model, "kv_seq": ups.seq, "elapsed": was["elapsed"] + time.time() - start,
+                   "moves": was["moves"] + len(moves), "legs": legs}, open(A.save, "w"))
+    elif not A.keep:
         remove(lake)
         if ok:
             shutil.rmtree(work, ignore_errors=True)

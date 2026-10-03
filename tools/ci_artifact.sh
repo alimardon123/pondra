@@ -9,7 +9,8 @@
 set -euo pipefail
 platform=$1 sha=${2:-$GITHUB_SHA} repo=$GITHUB_REPOSITORY
 artifact() { gh api "repos/$repo/actions/runs/$1/artifacts" --jq ".artifacts[] | select(.name == \"pondra-$platform\" and (.expired | not)) | .id" 2>/dev/null | head -1; }
-for _ in $(seq $(( ${WAIT_MINUTES:-75} * 2 ))); do
+# (once a minute: every wait polls the API, and the repository's allowance is 1,000 calls an hour)
+for _ in $(seq ${WAIT_MINUTES:-75}); do
   # (the newest run that builds: one stopped by a newer push, or skipped for a label, has nothing)
   read -r run status < <(gh run list --repo "$repo" --workflow build.yml --commit "$sha" --limit 10 --json databaseId,status,conclusion --jq '[.[] | select(.conclusion != "cancelled" and .conclusion != "skipped")][0] | "\(.databaseId) \(.status)"' 2>/dev/null || true) || true
   [ -n "${run:-}" ] && [ "$run" != null ] || { run=$(bash "$(dirname "$0")/ci_build.sh" "$sha"); status=completed; }
@@ -32,6 +33,6 @@ for _ in $(seq $(( ${WAIT_MINUTES:-75} * 2 ))); do
   if [ -n "$run" ] && [ "$status" = completed ]; then
     echo "::error::build run $run of $sha ended without pondra-$platform's packages" && exit 1
   fi
-  sleep 30
+  sleep 60
 done
 echo "::error::no pondra-$platform packages for $sha after ${WAIT_MINUTES:-75} minutes" && exit 1

@@ -593,7 +593,7 @@ impl App {
                     let o = state.config_mut().options_mut();
                     (o.optimizer.prefer_hash_join, o.execution.sort_spill_reservation_bytes) = (false, 1 << 20);
                 }
-                let df = ctx.sql_with_options(query, crate::query::read_only()).await?;
+                let df = crate::query::sql(&ctx, query).await?;
                 let (schema, task) = (Arc::new(df.schema().as_arrow().clone()), Arc::new(df.task_ctx()));
                 let plan = df.create_physical_plan().await?;
                 let out = datafusion::physical_plan::collect(plan.clone(), task).await?;

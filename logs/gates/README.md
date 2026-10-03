@@ -1,6 +1,6 @@
 # Gates, measured
 
-One line per measurement of the gates the roadmap names ("The road to 1.0": sqllogictest, TPC-H SF1
+One line per measurement of the gates the roadmap names ("Every round": sqllogictest, TPC-H SF1
 against DuckDB, `vs_postgres.py`; later a Nexmark subset). From round 29, `tools/gates.py` writes
 these; until then, by hand.
 

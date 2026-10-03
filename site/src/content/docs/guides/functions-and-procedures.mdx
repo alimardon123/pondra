@@ -28,18 +28,25 @@ A SQL function is an expression, or a query that returns a table. Its body repla
 wherever SQL comes in, so a query that uses it plans and spreads over the nodes like any other.
 
 ```sql
-CREATE FUNCTION net(x DOUBLE, rate DOUBLE DEFAULT 0.2) RETURNS DOUBLE RETURN x * (1 - rate);
+CREATE FUNCTION net(x DOUBLE, rate DOUBLE = 0.2) RETURNS DOUBLE RETURN x * (1 - rate);
+CREATE FUNCTION twice(x) AS x * 2;
 
-CREATE FUNCTION on_day(d DATE) RETURNS TABLE (id BIGINT, item VARCHAR) LANGUAGE sql
-  AS $$ SELECT id, item FROM sales WHERE ts::DATE = d $$;
+CREATE FUNCTION on_day($d DATE) RETURNS TABLE (id BIGINT, item VARCHAR)
+  AS $$ SELECT id, item FROM sales WHERE ts::DATE = $d $$;
 
-SELECT item, net(price) AS net, net(price, rate => 0.5) AS half FROM sales ORDER BY id;
+SELECT item, net(price) AS net, net(price, rate => 0.5) AS half, twice(price) AS two FROM sales ORDER BY id;
 SELECT * FROM on_day(DATE '2026-09-29');
 ```
 
-`STRICT` (NULL in, NULL out), `IMMUTABLE`, `STABLE` and `VOLATILE` are accepted, and so are `$1`-style
-parameters. DuckDB's `CREATE MACRO net(x, rate := 0.2) AS x * (1 - rate)` is the same thing under
-its own name. `DROP FUNCTION name` removes one.
+- **Parameters.** Write a parameter `x` or `$x`, with its type or without one, and its default
+  after `=` (or `DEFAULT`). In the body, `x` and `$x` both mean it. A parameter with no type takes
+  its argument as it comes.
+- **Only its own parameters.** A `$name` in the body that isn't a parameter is refused when the
+  function is made, because a function's answer depends on its arguments alone.
+- **Postgres's words work too.** `STRICT` (NULL in, NULL out), `IMMUTABLE`, `STABLE`, `VOLATILE`
+  and `$1`-style parameters are all accepted.
+- **One noun.** DuckDB's `CREATE MACRO` is another name for a SQL function. `DROP FUNCTION name`
+  removes one.
 
 A stored view reads a function as it is now; a materialized view keeps the function as it was when
 the view was made.
@@ -203,12 +210,15 @@ It runs with **its caller's rights**, so a reader's `CALL` of a procedure that w
 the write.
 
 ```sql
-CREATE PROCEDURE load_day(day DATE, min_price DOUBLE DEFAULT 0) LANGUAGE sql AS $$
+CREATE PROCEDURE load_day($day DATE, $min_price DOUBLE = 0) AS BEGIN
     DELETE FROM daily WHERE d = $day;
     INSERT INTO daily
       SELECT ts::DATE, item, count(*) FROM sales WHERE ts::DATE = $day AND price >= $min_price GROUP BY 1, 2;
-$$;
+END;
 ```
+
+Its parameters are written as a file's are (`$day DATE = …`), and its body is a script: a
+`BEGIN … END` block, or any one statement after `AS`. Postgres's `LANGUAGE sql AS $$ … $$` works too.
 
 Make the table it fills, then call it:
 

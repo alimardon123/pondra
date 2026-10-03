@@ -639,9 +639,10 @@ class Load:
     live node until acknowledged), and readers asking the nodes whether each producer's batches are
     a prefix with no gaps. `nodes`: the live nodes, a list changed in place as they come and go."""
 
-    def __init__(self, nodes, table, producers=4, readers=2, size=20, rate=None):
+    def __init__(self, nodes, table, producers=4, readers=2, size=20, rate=None, acked=None):
         self.nodes, self.table, self.size, self.rate = nodes, table, size, rate  # (rate: a producer's batches a second; None: flat out)
-        self.stop_, self.acked, self.torn, self.reads = threading.Event(), collections.defaultdict(int), [], [0]
+        # (acked: each producer's last acknowledged batch so far, to go on from: a soak's next leg)
+        self.stop_, self.acked, self.torn, self.reads = threading.Event(), collections.defaultdict(int, acked or {}), [], [0]
         self.waits = collections.deque(maxlen=500_000)  # (wait, sent at): the recent ones
         self.threads = [threading.Thread(target=self.write, args=(f"p{i}",), daemon=True) for i in range(producers)]
         self.threads += [threading.Thread(target=self.read, daemon=True) for _ in range(readers)]
@@ -651,7 +652,7 @@ class Load:
         return self
 
     def write(self, producer):
-        seq = 0
+        seq = self.acked[producer]
         while not self.stop_.is_set():
             seq += 1
             body = "".join(json.dumps({"producer": producer, "seq": seq, "i": i}) + "\n" for i in range(self.size))

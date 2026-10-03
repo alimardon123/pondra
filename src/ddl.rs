@@ -679,7 +679,7 @@ async fn create_view(lake: &Lake, name: &str, sql: String, replace: bool, extern
     ensure!(replace || lake.cat.get::<StoredView>(&query_key(&name)).await?.is_none(), "view {name} already exists (CREATE OR REPLACE VIEW)");
     let expanded = crate::routines::expand(lake, &sql).await?; // (kept as written: macros are read when it is used)
     let planned = crate::asof::rewrite(&expanded)?;
-    crate::query::session(lake, &planned, "").await?.sql(&planned).await.context(if external { "reading its files" } else { "the view's query" })?; // (it plans)
+    crate::query::sql(&crate::query::session(lake, &planned, "").await?, &planned).await.context(if external { "reading its files" } else { "the view's query" })?; // (it plans)
     lake.cat.commit(vec![(query_key(&name), json(&StoredView { sql, external }))], &[]).await?;
     Ok(match external {
         true => j!({"table": name, "files": true}),

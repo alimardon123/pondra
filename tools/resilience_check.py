@@ -13,6 +13,9 @@ once the fault is gone (how long it took is in `info`).
   node.
 - **doors**: psycopg (a DSN of every host) and an idempotent librdkafka producer through a leader
   and a follower killed: every committed INSERT and every delivered record there once.
+- **flight**: pyarrow's Flight client through a leader and a follower killed: DoPut batches
+  acknowledged once, DoGet reads never torn, and the table's log followed as a stream, resumed on
+  another node, seeing every batch once.
 - **disk**: three nodes on a lake on local disk, and the disk full: reads go on, writes wait, and
   every one lands once when there is room.
 - **cache**: three nodes on a bucket (replicated acks), their cache disk full: nothing stops.
@@ -20,9 +23,10 @@ once the fault is gone (how long it took is in `info`).
   Python client and psycopg.
 - **cli**: `pondra sql` killed mid-INSERT, on local disk and a bucket, with a node and without.
 
-  resilience_check.py [storage] [cutoff] [clients] [doors] [disk] [cache] [server] [cli] [--secs 20]
+  resilience_check.py [storage] [cutoff] [clients] [doors] [flight] [disk] [cache] [server] [cli] [--secs 20]
+  resilience_check.py --real [storage cutoff]   # the same faults in front of a real bucket (R2, S3)
 
-Needs moto's server, psycopg and confluent-kafka (tools/requirements.txt), Node.js for the
+Needs moto's server, psycopg, confluent-kafka and pyarrow (tools/requirements.txt), Node.js for the
 JavaScript client, and root or sudo for the small disks (tmpfs); prints ok/FAIL for each check
 and a JSON summary at the end; exit 1 on a failure.
 """
@@ -118,7 +122,7 @@ class Load:
         while not self.stop.is_set():
             nd, started = random.choice(self.nodes), time.time()
             try:
-                res = call(nd.port, "POST", "/sql", self.Q.encode(), timeout=20)
+                res = self.ask(nd)
             except Exception:
                 time.sleep(0.2)
                 continue
@@ -127,6 +131,9 @@ class Load:
                 if r["n"] != r["mx"] * self.size or r["d"] != r["mx"]:
                     self.bad.append(("torn", nd.port, when, r))
             self.reads.append((nd.port, started, time.time(), {r["producer"]: r["mx"] for r in res}, when))
+
+    def ask(self, nd):
+        return call(nd.port, "POST", "/sql", self.Q.encode(), timeout=20)
 
     def went_back(self):
         """Reads on a node that showed fewer batches than a read there that had finished before
@@ -168,7 +175,10 @@ class Load:
 
 
 def bucket():
-    """moto's S3 (tools/sim_r2.py, no added latency) and a bucket in it, for harness.new_lake."""
+    """moto's S3 (tools/sim_r2.py, no added latency) and a bucket in it, for harness.new_lake; or,
+    with `--real`, the bucket the environment names (nothing started)."""
+    if A.real:
+        return None, os.environ["AWS_ENDPOINT"], {"AWS_ALLOW_HTTP": "true"}
     port = 9300 + os.getpid() % 500
     p = subprocess.Popen([sys.executable, os.path.join(HERE, "sim_r2.py"), "--port", str(port), "--zero"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     import boto3
@@ -211,7 +221,8 @@ class Bucketed:
         self.sim, upstream, base = bucket()
         harness.A = argparse.Namespace(s3=True, keep=a.keep)
         self.lake = lake = harness.new_lake()
-        self.proxies = [Faulty(upstream) for _ in range(3)]
+        keys = (os.environ["AWS_ACCESS_KEY_ID"], os.environ["AWS_SECRET_ACCESS_KEY"], os.environ.get("AWS_REGION", "auto")) if A.real else None
+        self.proxies = [Faulty(upstream, sign=keys) for _ in range(3)]  # (a real bucket: each request signed again for it)
         base = {**base, "PONDRA_TRACE_START": "1", **(env or {})}  # (a new leader's steps, in its log)
         each = lambda i: {k: v.format(i=i) if isinstance(v, str) else v for k, v in flags.items()}  # ("{i}": the node's number)
         self.nodes = [Node(lake, (port or a.port) + i, env={**base, "AWS_ENDPOINT": self.proxies[i].url}, **each(i)).start() for i in range(3)]
@@ -275,8 +286,9 @@ class Bucketed:
         for nd in self.nodes:
             nd.kill()
         [p.close() for p in self.proxies]
-        self.sim.kill()
-        harness.LAKES.remove(self.lake)  # (moto's bucket was in its memory: gone with it)
+        if self.sim:
+            self.sim.kill()
+            harness.LAKES.remove(self.lake)  # (moto's bucket was in its memory: gone with it)
 
 
 def storage(a):
@@ -716,6 +728,144 @@ def doors(a):
             nd.kill()
 
 
+class Flown(Load):
+    """`Load` over Arrow Flight: a writer DoPuts a stream of ten numbered batches to any node
+    (`[table, producer, first seq]`: applied once) and, when the stream breaks, sends what wasn't
+    acknowledged to another; readers ask with DoGet SQL."""
+
+    def __init__(self, nodes, fports, **kw):
+        import pyarrow as pa, pyarrow.flight as fl
+        super().__init__(nodes, **kw)
+        self.pa, self.fl, self.fports = pa, fl, dict(zip((nd.port for nd in nodes), fports))
+        self.schema = pa.schema([("producer", pa.string()), ("seq", pa.int64()), ("i", pa.int64())])
+
+    def client(self, nd):
+        return self.fl.FlightClient(f"grpc://127.0.0.1:{self.fports[nd.port]}")
+
+    def writer(self, name):
+        pa, fl, seq = self.pa, self.fl, 1
+        batch = lambda s: pa.record_batch([pa.array([name] * self.size), pa.array([s] * self.size, pa.int64()), pa.array(range(self.size), pa.int64())], schema=self.schema)
+        while not self.stop.is_set():
+            c = self.client(random.choice(self.nodes))
+            try:
+                w, r = c.do_put(fl.FlightDescriptor.for_path("events", name, str(seq)), self.schema, options=fl.FlightCallOptions(timeout=20))
+                for s in range(seq, seq + 10):
+                    w.write_batch(batch(s))
+                w.done_writing()
+                while (buf := r.read()) is not None:
+                    if json.loads(buf.to_pybytes()).get("conflict"):
+                        raise RuntimeError("an ack of a conflict")
+                    self.acked[name] = seq
+                    self.acks.append(time.time())
+                    seq += 1
+                w.close()
+            except Exception as e:
+                self.errors[type(e).__name__] += 1
+                time.sleep(0.2)
+            finally:
+                c.close()
+
+    def ask(self, nd):
+        c = self.client(nd)
+        try:
+            q = self.fl.Ticket(json.dumps({"sql": self.Q}))
+            return c.do_get(q, options=self.fl.FlightCallOptions(timeout=20)).read_all().to_pylist()
+        finally:
+            c.close()
+
+
+def flight(a):
+    """pyarrow's Flight client through the leader killed (down past its lease) and a follower
+    killed: writers DoPut numbered batches to any node and send what wasn't acknowledged again
+    elsewhere, readers count them with DoGet SQL, and a reader follows the table's log as a stream,
+    resuming on another node from the last commit it saw whole. Every acknowledged batch is there
+    once on every node, no read was torn or went back, and the stream saw every batch once."""
+    import pyarrow.flight as fl
+    harness.A = argparse.Namespace(s3=False, keep=a.keep)
+    lake, base = harness.new_lake(), a.port + 60
+    fports = [base + 10 + i for i in range(3)]
+    nodes = [Node(lake, base + i, flight=f"127.0.0.1:{fports[i]}").start() for i in range(3)]
+    load, stop, seen, resumes = None, threading.Event(), defaultdict(int), [0]
+    streams = []
+
+    def follow():
+        """The log from its start: a commit's rows count once its `{"after": N}` comes; rows of a
+        commit cut short come again from the next node."""
+        after = 0
+        while not stop.is_set():
+            c = fl.FlightClient(f"grpc://127.0.0.1:{random.choice(fports)}")
+            try:
+                rd = c.do_get(fl.Ticket(json.dumps({"table": "events", "after": after, "columns": ["producer", "seq"]})))
+                streams.append(rd)
+                pending = []
+                while not stop.is_set():
+                    chunk = rd.read_chunk()
+                    if chunk.data is not None and chunk.data.num_rows:
+                        pending.append(chunk.data)
+                    if chunk.app_metadata is not None:
+                        after = json.loads(chunk.app_metadata.to_pybytes())["after"]
+                        for b in pending:
+                            for p, s in zip(b.column(0).to_pylist(), b.column(1).to_pylist()):
+                                seen[(p, s)] += 1
+                        pending = []
+            except Exception:
+                if not stop.is_set():
+                    resumes[0] += 1
+                    time.sleep(0.2)
+            finally:
+                c.close()
+
+    try:
+        check("three nodes, one leader", until(lambda: one_leader(nodes), 60))
+        call(base, "POST", "/sql", b"CREATE TABLE events (producer VARCHAR, seq BIGINT, i BIGINT)")
+        load = Flown(nodes, fports, writers=6, readers=3).start()
+        follower = threading.Thread(target=follow, daemon=True)
+        follower.start()
+        time.sleep(a.secs / 2)
+        lead = one_leader(nodes)
+        t_kill = time.time()
+        load.phase = "leader killed"
+        lead.kill()
+        time.sleep(8)
+        lead.start()
+        check("…the cluster leads again", until(lambda: one_leader(nodes), 60))
+        info["acks while the leader was down (8 s)"] = load.since(t_kill) - load.since(t_kill + 8)
+        load.phase = "follower killed"
+        other = next(nd for nd in nodes if nd is not one_leader(nodes))
+        other.kill()
+        time.sleep(3)
+        other.start()
+        until(lambda: one_leader(nodes), 60)
+        load.phase = "back"
+        t_back = time.time()
+        time.sleep(a.secs / 2)
+        check("writes go on once the nodes are back", load.since(t_back) > 0)
+        load.finish()
+        info["batches acknowledged"] = sum(load.acked.values())
+        info["DoPut streams broken (by error)"] = dict(load.errors)
+        load.exactly_once("Flight DoPut")
+        bad = load.bad + load.went_back()
+        check("no DoGet read was torn or went back", not bad, bad[:5])
+        # The stream follows every committed batch, acknowledged or not: once the table's own
+        # count is reached, it has seen each of them once.
+        rows = {(r["producer"], r["seq"]): r["n"] for r in call(base, "POST", "/sql", b"SELECT producer, seq, count(*) AS n FROM events GROUP BY producer, seq", timeout=60)}
+        until(lambda: sum(seen.values()) >= sum(rows.values()), 30)
+        info["log stream resumed on another node"] = resumes[0]
+        wrong = [(k, seen.get(k), n) for k, n in rows.items() if seen.get(k) != n] + [k for k in seen if k not in rows]
+        check("the log as a stream, resumed through the kills: every batch once", rows and not wrong, wrong[:6])
+    finally:
+        stop.set()
+        if load:
+            load.stop.set()
+        for rd in streams:
+            try:
+                rd.cancel()
+            except Exception:
+                pass
+        for nd in nodes:
+            nd.kill()
+
+
 def pids(*words):
     """The pondra processes whose command line has every one of `words`."""
     found = []
@@ -894,7 +1044,7 @@ def cli(a):
                 harness.LAKES.remove(lake)
 
 
-PARTS = {"storage": storage, "cutoff": cutoff, "clients": clients, "doors": doors, "disk": disk, "cache": cache, "server": server, "cli": cli}
+PARTS = {"storage": storage, "cutoff": cutoff, "clients": clients, "doors": doors, "flight": flight, "disk": disk, "cache": cache, "server": server, "cli": cli}
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -902,7 +1052,11 @@ if __name__ == "__main__":
     ap.add_argument("--secs", type=float, default=20, help="how long each fault lasts (an outage: 40 s)")
     ap.add_argument("--port", type=int, default=8700, help="the first node's port")
     ap.add_argument("--keep", action="store_true", help="keep the lakes (and the node logs)")
+    ap.add_argument("--real", action="store_true", help="a real bucket (R2, S3) for the parts on one, named by AWS_ENDPOINT, AWS_ACCESS_KEY_ID, "
+                    "AWS_SECRET_ACCESS_KEY, AWS_REGION and PONDRA_BUCKET (default parts: storage cutoff)")
     A = ap.parse_args()
+    if A.real and not A.parts:
+        A.parts = ["storage", "cutoff"]
     if unknown := set(A.parts) - set(PARTS):
         ap.error(f"no such part: {', '.join(unknown)}")
     for PART in A.parts or list(PARTS):

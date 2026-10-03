@@ -616,7 +616,7 @@ pub fn check_partition(spec: &str, columns: &[(String, String)]) -> Result<()> {
     };
     let t = columns.iter().find(|(n, _)| n == col).map(|(_, t)| t.as_str());
     let time = t.is_some_and(|t| t.starts_with("Timestamp") || t.starts_with("Date"));
-    anyhow::ensure!(t.is_some() && (unit.is_none() || (matches!(unit, Some("year" | "month" | "day" | "hour")) && time)), "partition_by: a column, or year/month/day/hour(a timestamp column)");
+    anyhow::ensure!(t.is_some() && (unit.is_none() || (matches!(unit, Some("year" | "month" | "day" | "hour")) && time)), "PARTITION BY: a column, or year/month/day/hour(a timestamp column)");
     Ok(())
 }
 
