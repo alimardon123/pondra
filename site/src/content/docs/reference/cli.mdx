@@ -8,8 +8,9 @@ sidebar:
 import { Aside } from '@astrojs/starlight/components';
 
 `pondra` is one binary. On its own it opens a SQL shell on a lake. `pondra serve` runs a node on a
-lake, or serves a folder of lakes as databases, `pondra sql` and `pondra run` run SQL, and
-`pondra catalog` prints what the lake's catalog holds.
+lake, or serves a folder of lakes as databases, `pondra sql` and `pondra run` run SQL, `pondra
+workspace` keeps the lake's files in a folder of yours, and `pondra catalog` prints what the lake's
+catalog holds.
 
 | Command | Does |
 |---|---|
@@ -17,6 +18,7 @@ lake, or serves a folder of lakes as databases, `pondra sql` and `pondra run` ru
 | `pondra serve [PATH]` | run a node on a lake, or serve every lake in a folder as a database |
 | `pondra sql --dir LAKE "SQL"` | run one statement against the lake, with no server |
 | `pondra run FILE LAKE` | run a SQL file, its `$name` parameters taking the values you pass |
+| `pondra workspace pull\|push DIR LAKE` | the lake's files in a folder of yours, for git and your editor |
 | `pondra catalog --dir LAKE PREFIX` | print catalog entries |
 | `pondra --version`, `pondra --help` | the version, and help for any command |
 
@@ -319,6 +321,30 @@ Parameters are read only after `LAKE`, so with `--url` you still give a lake fir
 `pondra run report.sql lake --url http://localhost:8080 --day 2026-09-27`. Without it,
 `--day` fails with `unexpected argument '--day' found`.
 </Aside>
+
+## pondra workspace
+
+`pondra workspace pull DIR LAKE` writes the lake's files into `DIR`; `pondra workspace push DIR
+LAKE` sends back what changed there since. A file changed on both sides is listed and left as it
+is, and the command exits 1. See [In git](/pondra/guides/workspace/#in-git).
+
+| Option | Default | Meaning |
+|---|---|---|
+| `DIR` | required | the folder (a pull makes it) |
+| `LAKE` | `lake` | the lake, unless `--url` |
+| `--url URL` | none | sync with the node at this URL |
+| `--token TOKEN` | `PONDRA_TOKEN` | a token for that node: a writer's for a push |
+
+```bash
+mkdir -p ws/etl && printf 'SELECT count(*) AS orders FROM orders;\n' > ws/etl/count.sql
+pondra workspace push ws shell-lake
+pondra workspace pull ws shell-lake
+```
+
+```text
+pushed 1, deleted 0 in the lake
+pulled 0, removed 0 here
+```
 
 ## pondra catalog
 

@@ -5072,6 +5072,59 @@ def found():
     return f"found: what writing the docs found, fixed: all {len(checks)} checks pass"
 
 
+def workspace_sync(port, token):
+    """`pondra workspace pull | push <dir>` against a node: each side's changes reach the other, a
+    file changed on both is listed and left alone, names starting with `.` stay where they are."""
+    import tempfile
+    base, auth = f"http://127.0.0.1:{port}/files/", {"authorization": f"Bearer {token}"}
+    def lake(path, body=None):
+        if body is None:
+            try:
+                with urllib.request.urlopen(urllib.request.Request(base + urllib.parse.quote(path), headers=auth)) as r:
+                    return r.read().decode(), r.headers["etag"].strip('"')
+            except urllib.error.HTTPError as e:
+                if e.code != 404:
+                    raise
+                return None, None
+        _, v = lake(path)
+        urllib.request.urlopen(urllib.request.Request(base + urllib.parse.quote(path), data=body.encode(), method="PUT", headers={**auth, **({"if-match": f'"{v}"'} if v else {})}))
+    def ws(*args):
+        r = subprocess.run([BIN, "workspace", *args, "--url", f"http://127.0.0.1:{port}", "--token", token], capture_output=True, text=True, timeout=120)
+        return r.returncode, (r.stdout + r.stderr).strip()
+    d = tempfile.mkdtemp(prefix="pondra-ws-")
+    mine = lambda p: open(os.path.join(d, *p.split("/"))).read() if os.path.exists(os.path.join(d, *p.split("/"))) else None
+    def write(p, text):
+        os.makedirs(os.path.dirname(os.path.join(d, *p.split("/"))), exist_ok=True)
+        open(os.path.join(d, *p.split("/")), "w").write(text)
+    for p, t in [("sync/a.sql", "SELECT 1"), ("sync/b.sql", "SELECT 2"), ("sync/gone.sql", "SELECT 3"), ("sync/deep/c d.sql", "SELECT 4")]:
+        lake(p, t)
+    said, checks = {}, {}
+    said["pull"] = ws("pull", d)
+    checks["workspace pull: the lake's files in a folder (subfolders, spaces), none of their kept versions"] = said["pull"][0] == 0 \
+        and mine("sync/a.sql") == "SELECT 1" and mine("sync/deep/c d.sql") == "SELECT 4" and mine("etl/orders.sql") is not None \
+        and not os.path.exists(os.path.join(d, ".versions")) and os.path.exists(os.path.join(d, ".pondra", "workspace.json"))
+    write("sync/a.sql", "SELECT 10")
+    write("sync/new.sql", "SELECT 5")
+    write(".git/HEAD", "ref: refs/heads/main")
+    os.remove(os.path.join(d, "sync", "gone.sql"))
+    said["push"] = ws("push", d)
+    checks["workspace push: a change, a new file and a deletion reach the lake; .git stays here"] = said["push"][0] == 0 and "pushed 2, deleted 1" in said["push"][1] \
+        and lake("sync/a.sql")[0] == "SELECT 10" and lake("sync/new.sql")[0] == "SELECT 5" and lake("sync/gone.sql")[0] is None and lake(".git/HEAD")[0] is None
+    lake("sync/b.sql", "SELECT 20")
+    write("sync/b.sql", "SELECT 200")
+    said["both"] = (ws("push", d), ws("pull", d))
+    checks["a file changed on both sides: push and pull list it, exit 1, and leave both as they are"] = all(r[0] == 1 and "sync/b.sql" in r[1] for r in said["both"]) \
+        and lake("sync/b.sql")[0] == "SELECT 20" and mine("sync/b.sql") == "SELECT 200"
+    write("sync/b.sql", "SELECT 20")
+    lake("sync/a.sql", "SELECT 11")
+    lake("sync/new.sql", "")  # (emptied there)
+    said["after"] = (ws("pull", d), ws("push", d))
+    checks["made the same by hand, the conflict is gone; the lake's changes come with the next pull"] = said["after"][0][0] == 0 and said["after"][1] == (0, "pushed 0, deleted 0 in the lake") \
+        and mine("sync/a.sql") == "SELECT 11" and mine("sync/new.sql") == "" and mine("sync/b.sql") == "SELECT 20"
+    shutil.rmtree(d, ignore_errors=True)
+    return {"checks": checks, "said": said}
+
+
 def workspace():
     """The workspace (ADR-033): the lake's files run, `CALL run('etl/orders.sql', day => …)`. A
     `.sql` file's `$name`s bound; a `.py` file's parameters as variables, its prints as notices,
@@ -5173,9 +5226,13 @@ console.log(JSON.stringify(await db.run("etl/orders.sql", {{ day: "2026-09-29", 
         and imm["into"] == [{"r": "imm", "n": 2}] and "USING (name => value" in imm["bad"]
     if not checks["EXECUTE IMMEDIATE FROM 'file' USING (name => …) [INTO $a, …]: Snowflake's CALL run"]:
         print("immediate:", imm)
+    synced = workspace_sync(A.port, "a-tok")
+    checks.update(synced.pop("checks"))
     node.kill()
     ok = all(checks.values())
     print(json.dumps({"workspace": checks, "ok": ok}, indent=1))
+    if not all(checks.values()):
+        print(json.dumps(synced, default=str)[:3000])
     if not ok:
         print(json.dumps({"got": got, "pg": pg, "py": py, "js": ran.stdout[-300:] + ran.stderr[-600:], "said": said, "logged": logged, "fail_row": fail_row, "by_task": by_task}, default=str)[:4000])
         sys.exit(1)
