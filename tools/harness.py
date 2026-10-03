@@ -3265,10 +3265,12 @@ $$""")
     for pid in killed:
         os.kill(pid, signal.SIGKILL)
     worker.join(60)
-    # (the idle workers die too, a moment after the signal on a busy machine: the next query may take
-    # one the node still sees running unless they are gone first, as a worker the OS kills would be)
-    until(lambda: all(_dead(pid) for pid in killed), True, 10)
-    checks["a worker killed mid-query: that query fails with why, the node and the next query go on"] = "worker ended" in out.get("e", "") and nodes[0].alive() and q("SELECT slug('C d') AS s") == [{"s": "c-d"}]
+    # (the idle workers die too, a moment after the signal: the next query may take one the node still
+    # sees running unless they are gone first, as a worker the OS kills would be. On CI's busy runner the
+    # next query once got a killed worker, likeliest one not gone within the 10 s this waited, which it
+    # didn't check: wait longer, and fail here if they never go)
+    gone = until(lambda: all(_dead(pid) for pid in killed), True, 60)
+    checks["a worker killed mid-query: that query fails with why, the node and the next query go on"] = "worker ended" in out.get("e", "") and nodes[0].alive() and gone and q("SELECT slug('C d') AS s") == [{"s": "c-d"}]
     # procedures: mail through a local SMTP server, from every door
     class Box:
         mail = []
@@ -4587,7 +4589,8 @@ def minmax():
     """A global min/max hands the scans a filter of the rows that could still change its answer, and
     the scans skip row groups by it (round 32's fix of DataFusion's): a table of 24 files read from
     them, each file's `a` above the last's, `b` NULL in the first six and `c` in all but the last.
-    Every answer the model's; without the fix `max(b + 1)` came back too low and `max(c)` NULL."""
+    Every answer the model's; without the fix `max(b + 1)` came back too low and `max(c)` NULL. And a
+    top-N of 20 columns through a filter, which decodes its files filtering as it goes."""
     lake = new_lake()
     node = Node(lake, A.port, env={"PONDRA_HOT_GB": "0"}).start()
     q = lambda s: sql(A.port, s)
@@ -4595,6 +4598,9 @@ def minmax():
     q("CREATE TABLE t (a BIGINT, b BIGINT, c BIGINT, s VARCHAR)")
     for f in range(files):  # (a bulk INSERT is a file of its own)
         q(f"INSERT INTO t SELECT value + {f * n}, {'NULL' if f < 6 else f}, {f if f == files - 1 else 'NULL'}, 's' || {f} FROM range(0, {n})")
+    cols = ", ".join(f"value + {i} AS c{i}" for i in range(18))
+    q(f"CREATE TABLE w AS SELECT value AS a, 's' || value AS s, {cols} FROM range(0, {files * n // 2})")
+    q(f"INSERT INTO w SELECT value AS a, 's' || value AS s, {cols} FROM range({files * n // 2}, {files * n})")
     asks = {  # what each asks and the model's answer
         "a min and the max of an expression": ("SELECT min(a) AS lo, max(b + 1) AS hi FROM t", [{"lo": 0, "hi": files}]),
         "a min and the max of a column NULL in the first files": ("SELECT min(a) AS lo, max(b) AS hi FROM t", [{"lo": 0, "hi": files - 1}]),
@@ -4603,6 +4609,8 @@ def minmax():
         "a filtered min and a max": ("SELECT min(a) FILTER (WHERE c IS NOT NULL) AS lo, max(a) AS hi FROM t", [{"lo": (files - 1) * n, "hi": files * n - 1}]),
         "the min and max of one column": ("SELECT min(a) AS lo, max(a) AS hi FROM t", [{"lo": 0, "hi": files * n - 1}]),
         "one max": ("SELECT max(c) AS hi FROM t", [{"hi": files - 1}]),
+        # (a top-N of many columns decodes its files filtering as it goes: `optimize::WideTopN`)
+        "a top-N of many columns through a filter": ("SELECT * FROM w WHERE s LIKE '%77%' ORDER BY a DESC LIMIT 3", [{"a": a, "s": f"s{a}", **{f"c{i}": a + i for i in range(18)}} for a in sorted((v for v in range(files * n) if "77" in f"s{v}"), reverse=True)[:3]]),
     }
     checks, seen = {}, {}
     try:
@@ -5859,6 +5867,14 @@ def begin():
     s = "s-rollback-" + uuid.uuid4().hex[:8]
     http(A.port, "BEGIN", s); http(A.port, "DELETE FROM accounts", s); http(A.port, "ROLLBACK", s)
     checks["ROLLBACK leaves nothing"] = total()["n"] == 20
+    # An UPDATE then an INSERT of one table: the UPDATE's rows carry more system columns than the
+    # INSERT's, and COMMIT sends them as one stream (an append table and a keyed one).
+    for t, key in (("ui", ""), ("uk", " PRIMARY KEY")):
+        q(f"CREATE TABLE {t} (id INT{key}, name VARCHAR)"); q(f"INSERT INTO {t} VALUES (1, 'a'), (2, 'b')")
+        s = f"s-{t}-" + uuid.uuid4().hex[:8]
+        http(A.port, "BEGIN", s); http(A.port, f"UPDATE {t} SET name = 'x' WHERE id = 1", s); http(A.port, f"INSERT INTO {t} (id, name) VALUES (3, 'c')", s)
+        end = http(A.port, "COMMIT", s)
+        checks[f"an UPDATE then an INSERT of one table commits ({'keyed' if key else 'append'})"] = end[0] == 200 and q(f"SELECT id, name FROM {t} ORDER BY id") == [{"id": 1, "name": "x"}, {"id": 2, "name": "b"}, {"id": 3, "name": "c"}]
     s = "s-failed-" + uuid.uuid4().hex[:8]
     http(A.port, "BEGIN", s)
     http(A.port, "UPDATE accounts SET balance = balance + 1 WHERE id = 3", s)
