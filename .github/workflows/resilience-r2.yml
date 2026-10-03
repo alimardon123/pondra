@@ -5,19 +5,12 @@ name: resilience-r2
 # which errs, loses replies, slows, holds and goes down as told, and signs every request again for
 # R2. Every acknowledged write must be there once, on every node.
 #
-# Nightly on main, so a slow day on the network never holds up a merge. A pull request runs it
-# only when it changes the proxy or this file and asks for CI (the label `ci` or `full-ci`). The
+# Nightly on main, so a slow day on the network never holds up a merge, and by hand. The
 # bucket and its keys are the cluster bench's secrets (R2_*). The lakes go under resilience/ in the
 # bucket and are deleted after every run, whatever happened (R2's free tier is 10 GB).
 on:
   schedule:
     - cron: "17 3 * * *"
-  pull_request:
-    branches: [main]
-    types: [opened, synchronize, reopened, labeled] # (labeled: `ci` or `full-ci` added)
-    paths:
-      - tools/faulty_s3.py
-      - .github/workflows/resilience-r2.yml
   workflow_dispatch:
 
 concurrency:
@@ -45,12 +38,8 @@ env:
 jobs:
   check:
     name: resilience on R2 (storage cutoff)
-    if: >-
-      github.event_name != 'pull_request' ||
-      (github.event.action == 'labeled' && (github.event.label.name == 'ci' || github.event.label.name == 'full-ci')) ||
-      (github.event.action != 'labeled' && (contains(github.event.pull_request.labels.*.name, 'ci') || contains(github.event.pull_request.labels.*.name, 'full-ci')))
     runs-on: ubuntu-24.04
-    timeout-minutes: 100 # (most of it waiting for the build's packages)
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
