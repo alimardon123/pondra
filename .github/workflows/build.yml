@@ -45,6 +45,7 @@ jobs:
       matrix: ${{ steps.plan.outputs.matrix }}
       resilience: ${{ steps.plan.outputs.resilience }}
       upgrade: ${{ steps.plan.outputs.upgrade }}
+      sharing: ${{ steps.plan.outputs.sharing }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -70,13 +71,14 @@ jobs:
           if [ "$FULL" != true ]; then echo "linux-x64 alone (the label \`ci\`). Before merging, the label \`full-ci\` builds all five platforms." >> "$GITHUB_STEP_SUMMARY"; fi
           echo "matrix=$(jq -c --argjson full "$FULL" '{include: [.[] | select($full or .platform == "linux-x64")]}' <<< "$platforms")" >> "$GITHUB_OUTPUT"
           # The tests of what a pull request's run builds, called below once it is built: upgrade
-          # always, resilience when what it puts under failure changes. (The files from git: the
-          # API's hourly allowance for the repository runs out on a busy day.)
+          # always, resilience when what it puts under failure changes, sharing when what it shares.
+          # (The files from git: the API's hourly allowance for the repository runs out on a busy day.)
           if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
             files=$(git diff --name-only HEAD^1 HEAD)
             if grep -qE '^(src/|Cargo\.(toml|lock)$|python/pondra/client\.py$|js/index\.js$|tools/(resilience_check|faulty_s3|sim_r2|harness)\.py$|tools/ci_artifact\.sh$|\.github/workflows/(resilience|build)\.yml$)' <<< "$files"; then resilience=true; else resilience=false; fi
-            printf 'upgrade=true\nresilience=%s\n' "$resilience" >> "$GITHUB_OUTPUT"
-            echo "After the build: upgrade$([ "$resilience" = false ] || echo ' and resilience')." >> "$GITHUB_STEP_SUMMARY"
+            if grep -qE '^(src/(shares|sharing|vend|read_delta|delta|ext|scan|audit|server)\.rs$|tools/(sharing_check|sim_r2)\.py$|tools/ci_artifact\.sh$|\.github/workflows/(sharing|build)\.yml$)' <<< "$files"; then sharing=true; else sharing=false; fi
+            printf 'upgrade=true\nresilience=%s\nsharing=%s\n' "$resilience" "$sharing" >> "$GITHUB_OUTPUT"
+            echo "After the build: upgrade$([ "$resilience" = false ] || echo ', resilience')$([ "$sharing" = false ] || echo ', sharing')." >> "$GITHUB_STEP_SUMMARY"
           fi
 
   build:
@@ -190,3 +192,8 @@ jobs:
     if: ${{ !cancelled() && needs.build.result == 'success' && needs.plan.outputs.upgrade == 'true' }}
     permissions: { actions: read, contents: read }
     uses: ./.github/workflows/upgrade.yml
+  sharing:
+    needs: [plan, build]
+    if: ${{ !cancelled() && needs.build.result == 'success' && needs.plan.outputs.sharing == 'true' }}
+    permissions: { actions: read, contents: read }
+    uses: ./.github/workflows/sharing.yml
