@@ -649,7 +649,7 @@ async fn expand_with(lake: &Lake, sql: &str, views: &HashMap<String, String>) ->
     let Ok(mut stmts) = parsed else { return Ok(sql.to_string()) };
     for s in stmts.iter_mut() {
         if !matches!(s, Statement::CreateMacro { .. } | Statement::CreateView(ast::CreateView { materialized: false, .. })) {
-            if let ControlFlow::Break(e) = s.visit(&mut Expander { lake, all: &all, views, outside: &outside, depth: 0 }) {
+            if let ControlFlow::Break(e) = s.visit(&mut Expander { lake, all: &all, views, outside: &outside, depth: 0, own: 0 }) {
                 return Err(e);
             }
         }
@@ -701,23 +701,72 @@ fn select_star(body: &mut ast::SetExpr) {
 /// the text is left as written.
 fn named_apart(sql: &str) -> Option<String> {
     static MAY: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?is)\bselect\b.*(?:::|\bcast\s*\(|,)").expect("a regex"));
-    if sql.len() > 64 << 10 || !MAY.is_match(sql) {
-        return None; // (a SELECT with more than one column or a cast; not a long INSERT's rows)
+    if sql.len() > 64 << 10 || !MAY.is_match(sql) && !VALUES_SUB.is_match(sql) {
+        return None; // (a SELECT with more than one column or a cast, or VALUES with a subquery; not a long INSERT's rows)
     }
-    struct Names(bool);
+    struct Names(bool, usize);
     impl VisitorMut for Names {
         type Break = ();
+        fn pre_visit_statement(&mut self, s: &mut Statement) -> ControlFlow<()> {
+            self.1 = own_values(s);
+            ControlFlow::Continue(())
+        }
         fn post_visit_query(&mut self, q: &mut ast::Query) -> ControlFlow<()> {
-            self.0 |= output_names(q);
+            self.0 |= output_names(q) | values_apart(q, self.1);
             ControlFlow::Continue(())
         }
     }
     let mut stmts = Parser::parse_sql(&GenericDialect {}, sql).ok()?;
-    let mut names = Names(false);
+    let mut names = Names(false, 0);
     for s in stmts.iter_mut().filter(|s| !matches!(s, Statement::CreateMacro { .. })) {
         let _ = s.visit(&mut names);
     }
     names.0.then(|| text(&stmts))
+}
+
+/// VALUES that may hold a subquery (`values_apart`).
+static VALUES_SUB: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?is)\bvalues\b.*\bselect\b").expect("a regex"));
+
+/// A VALUES list with a subquery in a row as `SELECT … AS column1, … UNION ALL SELECT …`, its
+/// ORDER BY and LIMIT kept: DataFusion works a VALUES list's rows out while it plans it, before
+/// any subquery has run ("ScalarSubqueryExpr evaluated before the subquery was executed"). True if
+/// it was one. `own` is an INSERT's own VALUES (`own_values`), left as they are: `write.rs` takes
+/// them through the log as VALUES, and `write::rows` sets them apart.
+fn values_apart(q: &mut ast::Query, own: usize) -> bool {
+    let ast::SetExpr::Values(v) = q.body.as_ref() else { return false };
+    let sub = |e: &Expr| match e {
+        Expr::Subquery(_) => ControlFlow::Break(()),
+        _ => ControlFlow::Continue(()),
+    };
+    if &*q.body as *const ast::SetExpr as usize == own || ast::visit_expressions(&v.rows, sub).is_continue() {
+        return false;
+    }
+    let select = |row: &[Expr]| format!("SELECT {}", row.iter().enumerate().map(|(i, e)| format!("{e} AS column{}", i + 1)).collect::<Vec<_>>().join(", "));
+    let Ok(union) = parse_query(&v.rows.iter().map(|r| select(&r.content)).collect::<Vec<_>>().join(" UNION ALL ")) else { return false };
+    q.body = union.body;
+    true
+}
+
+/// Where an INSERT's own VALUES are (`values_apart`), or 0.
+fn own_values(s: &Statement) -> usize {
+    match s {
+        Statement::Insert(ast::Insert { source: Some(q), .. }) if matches!(*q.body, ast::SetExpr::Values(_)) => &*q.body as *const ast::SetExpr as usize,
+        _ => 0,
+    }
+}
+
+/// A row query (`write::rows`) with its VALUES set apart if they hold a subquery.
+pub fn rows_apart(sql: &str) -> std::borrow::Cow<'_, str> {
+    if !VALUES_SUB.is_match(sql) {
+        return sql.into();
+    }
+    match parse_query(sql) {
+        Ok(mut q) => match values_apart(&mut q, 0) {
+            true => q.to_string().into(),
+            false => sql.into(),
+        },
+        Err(_) => sql.into(),
+    }
 }
 
 /// A SELECT's columns named as other engines name them, where DataFusion would refuse the query or
@@ -828,6 +877,7 @@ struct Expander<'a> {
     views: &'a HashMap<String, String>, // (a request's own: `FROM name` is its query)
     outside: &'a [(String, crate::ext::Attached)], // other engines' tables attached (`ext.rs`)
     depth: usize,
+    own: usize, // (an INSERT's own VALUES: `values_apart`)
 }
 
 impl Expander<'_> {
@@ -886,9 +936,15 @@ fn whole(name: &str, r: &Routine, args: &[FunctionArg]) -> Result<(ast::ObjectNa
 impl VisitorMut for Expander<'_> {
     type Break = anyhow::Error;
 
+    fn pre_visit_statement(&mut self, s: &mut Statement) -> ControlFlow<Self::Break> {
+        self.own = own_values(s);
+        ControlFlow::Continue(())
+    }
+
     fn post_visit_query(&mut self, q: &mut ast::Query) -> ControlFlow<Self::Break> {
         select_star(&mut q.body);
         output_names(q);
+        values_apart(q, self.own);
         ControlFlow::Continue(())
     }
 

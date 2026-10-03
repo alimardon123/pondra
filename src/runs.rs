@@ -18,7 +18,7 @@ use crate::server::App;
 use crate::store::{json, table_key, Lake, TableMeta};
 use anyhow::{bail, ensure, Context, Result};
 use chrono::{Datelike, TimeZone, Timelike};
-use datafusion::arrow::array::{ArrayRef, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray};
+use datafusion::arrow::array::{Array, ArrayRef, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray};
 use datafusion::sql::sqlparser::{keywords::Keyword, parser::Parser, tokenizer::Token};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -138,6 +138,40 @@ fn log(app: &App, line: Line, done: Option<tokio::sync::oneshot::Sender<()>>) {
     let _ = tx.send((line, done));
 }
 
+/// This node's lines are in the log (`wait` looks again).
+static WRITTEN: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// Wait for run `id` to end (`AWAIT 'id'`, the id `pondra.start` gave): its error if it failed, or
+/// if its node stopped under it. Looked for again as this node writes its lines, and every second
+/// for another node's; a run not in the log after 10 s is no run.
+pub async fn wait(app: &App, id: &str) -> Result<()> {
+    let sql = format!("SELECT status, error FROM pondra.runs WHERE id = '{}'", id.replace('\'', "''"));
+    let since = std::time::Instant::now();
+    loop {
+        let written = WRITTEN.notified(); // (woken by any write from here on)
+        let rows = Box::pin(app.query(&sql, Some("0"))).await?;
+        if let Some(b) = rows.iter().find(|b| b.num_rows() > 0) {
+            let text = |i: usize| -> Result<Option<String>> {
+                let c = datafusion::arrow::compute::cast(b.column(i), &datafusion::arrow::datatypes::DataType::Utf8)?;
+                let c = c.as_any().downcast_ref::<StringArray>().context("text")?;
+                Ok(c.is_valid(0).then(|| c.value(0).to_string()))
+            };
+            match (text(0)?.unwrap_or_default().as_str(), text(1)?) {
+                ("ok", _) => return Ok(()),
+                ("running", _) => {}
+                ("stopped", _) => bail!("run {id} stopped: its node stopped under it"),
+                (status, error) => bail!("run {id} {status}: {}", error.unwrap_or_default()),
+            }
+        } else if since.elapsed() > Duration::from_secs(10) {
+            bail!("no run {id}: AWAIT takes a handle ($h = ASYNC …) or a run's id (pondra.start)");
+        }
+        tokio::select! {
+            _ = written => {}
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+        }
+    }
+}
+
 /// This node's log writer: what came in a moment, one row per run (its newest), appended exactly
 /// once (one producer, a seq per batch, retried as it was).
 async fn write(app: App, mut rx: tokio::sync::mpsc::UnboundedReceiver<Sent>) {
@@ -156,6 +190,7 @@ async fn write(app: App, mut rx: tokio::sync::mpsc::UnboundedReceiver<Sent>) {
             match append(&app, &producer, seq, &lines, &mut made).await {
                 Ok(()) => {
                     dones.into_iter().flatten().for_each(|d| { let _ = d.send(()); });
+                    WRITTEN.notify_waiters();
                     break;
                 }
                 Err(e) if attempt >= 30 => {

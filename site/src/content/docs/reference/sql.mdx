@@ -368,6 +368,9 @@ across the nodes and a write still goes to the leader.
 | `WHILE cond DO … END WHILE` | a loop while the condition holds |
 | `REPEAT … UNTIL cond END REPEAT` · `LOOP … END LOOP` | a loop until the condition holds · until `LEAVE` |
 | `FOR r IN (query) DO … END FOR` | a loop over a query's rows: `$r.column` |
+| `FOR r IN (query) PARALLEL n DO … END FOR` | the same, up to `n` passes at once (1 to 64) |
+| `ASYNC statement` · `$h = ASYNC statement` | start a statement (a block too) and go on · its handle in `$h` |
+| `AWAIT ALL` · `AWAIT $h, …` | wait for every one started · for these: handles, or runs' ids from `pondra.start` |
 | `LEAVE [label]` · `ITERATE [label]` | leave a loop or block · go on with the next pass (`label: WHILE …`) |
 | `RETURN [value]` | stop; the value is the script's answer (`result`) |
 | `RAISE 'text %', $x` · `RAISE NOTICE …` · `RAISE` | an error (`P0001`), each `%` a value · a notice · the handled error again |
@@ -382,8 +385,14 @@ across the nodes and a write still goes to the leader.
   `division_by_zero`, `OTHERS`. Inside it, `$error` is the message and `$sqlstate` its code.
 - `BEGIN;` and `BEGIN TRANSACTION` still start a transaction; `BEGIN` followed by a statement
   starts a block.
-- A script run again with the same job (`?job=…`, a task's tick) writes each statement once, loops
-  included.
+- A `PARALLEL` pass and an `ASYNC` statement each get a copy of the script's variables: what they
+  set stays their own, so they hand results on through tables. Once a pass fails no new one starts,
+  and the loop fails with its error. `AWAIT ALL` fails with the first `ASYNC` failure's error, and a
+  script's end waits for what it started. Neither runs inside a transaction.
+- `AWAIT $h` fails with that statement's error, which `AWAIT ALL` then leaves out. `AWAIT 'id'`
+  waits for a procedure or file `pondra.start` began, from any session, and fails with its error.
+- A script run again with the same job (`?job=…`, a task's tick) writes each statement once, loops,
+  passes and `ASYNC` statements included.
 
 ```sql
 CREATE TABLE staged (id BIGINT, amount DOUBLE);
@@ -408,6 +417,25 @@ SELECT $total AS total;
 ```text
 total
 30.0
+```
+
+A backfill a few passes at a time, and two statements beside each other:
+
+```sql
+CREATE TABLE loads (part BIGINT, rows BIGINT);
+FOR p IN (SELECT value AS n FROM generate_series(1, 6)) PARALLEL 3 DO
+  INSERT INTO loads VALUES ($p.n, (SELECT count(*) FROM staged));
+END FOR;
+ASYNC INSERT INTO loads VALUES (7, 0);
+$last = ASYNC INSERT INTO loads VALUES (8, 0);
+AWAIT $last;
+AWAIT ALL;
+SELECT count(*) AS parts, sum(rows) AS rows FROM loads;
+```
+
+```text
+parts | rows
+8     | 18
 ```
 
 ## Schemas and other lakes
