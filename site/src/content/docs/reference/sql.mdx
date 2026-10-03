@@ -594,6 +594,7 @@ their values.
 | A token | `CREATE TOKEN name FOR [USER] u [EXPIRES IN '90 days']` (answers it, once), `DROP TOKEN name FOR [USER] u` |
 | List | `SELECT * FROM pondra.users`, `SELECT * FROM pondra.grants` |
 | What was done, and refused | `SELECT * FROM pondra.audit` (a superuser's): `at`, `user`, `door`, `from`, `class`, `statement`, `outcome`, `message`, `ms`, `node` |
+| Every statement | `SELECT * FROM pondra.history` (a superuser sees every row, anyone else their own): `at`, `id`, `user`, `door`, `from`, `node`, `session`, `class`, `statement`, `outcome`, `error`, `ms`, `rows`, `nodes`, and for a statement slower than `PONDRA_SLOW_MS` its `plan` (each step's rows and time) and `trace` (each node's share, as JSON) |
 
 `public` is every user: `GRANT SELECT ON t TO public`. A grant on a schema covers its tables made later
 too. Only a superuser (or the admin token) runs these. `MAX_QUERIES` and `STATEMENT_TIMEOUT` are a user's

@@ -83,7 +83,7 @@ pub fn class(sql: &str) -> &'static str {
 
 /// `sql` as the log keeps it: quoted values hidden where they may be a password, a token or a
 /// secret's; at most 4 KB.
-fn redacted(sql: &str, class: &str) -> String {
+pub fn redacted(sql: &str, class: &str) -> String {
     let mut out = String::with_capacity(sql.len().min(4096));
     match class == "role" {
         false => out.push_str(sql),
@@ -106,15 +106,7 @@ fn redacted(sql: &str, class: &str) -> String {
             }
         }
     }
-    if out.len() > 4096 {
-        let mut at = 4096;
-        while !out.is_char_boundary(at) {
-            at -= 1;
-        }
-        out.truncate(at);
-        out.push('…');
-    }
-    out
+    crate::history::cut(out, 4096)
 }
 
 tokio::task_local! {
@@ -148,28 +140,26 @@ pub async fn statement<T, E: std::fmt::Display + Refusal>(app: &App, sql: &str, 
         return Err(E::refusal("57P03", crate::cluster::CUT_OFF_SAYS.into())); // (cannot_connect_now: every door's clients retry elsewhere)
     }
     let (class, start, quota) = (class(sql), Instant::now(), crate::users::quota());
-    let out = INSIDE
-        .scope((), async {
-            let _turn = quota.turn().await.map_err(|m| E::refusal("53000", m))?; // (insufficient_resources)
-            match quota.timeout {
-                Some(t) => tokio::time::timeout(t, f).await.unwrap_or_else(|_| Err(E::refusal("57014", format!("quota: {}'s statements run at most {} s (STATEMENT_TIMEOUT); this one was stopped", quota.user, t.as_secs())))),
-                None => f.await,
-            }
-        })
-        .await;
-    if !on() {
-        return out;
-    }
+    let (out, note) = crate::history::noted(INSIDE.scope((), async {
+        let _turn = quota.turn().await.map_err(|m| E::refusal("53000", m))?; // (insufficient_resources)
+        match quota.timeout {
+            Some(t) => tokio::time::timeout(t, f).await.unwrap_or_else(|_| Err(E::refusal("57014", format!("quota: {}'s statements run at most {} s (STATEMENT_TIMEOUT); this one was stopped", quota.user, t.as_secs())))),
+            None => f.await,
+        }
+    }))
+    .await;
+    let took = start.elapsed();
     let message = out.as_ref().err().map(|e| e.to_string());
     let refused = message.as_ref().filter(|m| ["permission denied", "needs a", "needs more rights", "sign in", "quota:"].iter().any(|r| m.contains(r)));
-    if written(class) || refused.is_some() {
-        let outcome = match (&out, &refused) {
-            (Ok(_), _) => "ok",
-            (_, Some(_)) => "refused",
-            _ => "failed",
-        };
-        log(app, class, redacted(sql, class), outcome, message, Some(start.elapsed().as_millis() as i64));
+    let outcome = match (&out, &refused) {
+        (Ok(_), _) => "ok",
+        (_, Some(_)) => "refused",
+        _ => "failed",
+    };
+    if on() && (written(class) || refused.is_some()) {
+        log(app, class, redacted(sql, class), outcome, message.clone(), Some(took.as_millis() as i64));
     }
+    crate::history::ended(app, class, sql, outcome, message, took, note); // (`pondra.history`)
     out
 }
 
@@ -193,43 +183,11 @@ fn write(app: &App, line: Line) {
     if app.log.is_none() {
         return; // (a read-only node writes nothing: its own log says it)
     }
-    let tx = WRITER.get_or_init(|| {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        crate::panics::spawn(writer(app.clone(), rx));
-        tx
-    });
+    let tx = WRITER.get_or_init(|| crate::history::writer(app, TABLE, crate::ddl::Ddl::AuditLog, Duration::from_millis(50), batch));
     let _ = tx.send(line);
 }
 
-/// This node's writer: what came in a moment, appended exactly once (one producer, a seq a batch).
-async fn writer(app: App, mut rx: tokio::sync::mpsc::UnboundedReceiver<Line>) {
-    let producer = format!("audit-{}", crate::runs::new_id());
-    let (mut seq, mut made) = (0, false);
-    while let Some(first) = rx.recv().await {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        let mut lines = vec![first];
-        while let Ok(l) = rx.try_recv() {
-            lines.push(l);
-        }
-        seq += 1;
-        for attempt in 0.. {
-            match append(&app, &producer, seq, &lines, &mut made).await {
-                Ok(()) => break,
-                Err(e) if attempt >= 30 => {
-                    eprintln!("the audit log lost {} rows: {e:#}", lines.len());
-                    break;
-                }
-                Err(_) => tokio::time::sleep(Duration::from_secs(1)).await,
-            }
-        }
-    }
-}
-
-async fn append(app: &App, producer: &str, seq: u64, lines: &[Line], made: &mut bool) -> Result<()> {
-    if !*made && app.lake.cat.get::<TableMeta>(&table_key(TABLE)).await?.is_none() {
-        crate::write::on_node_as(app, crate::write::Stmt::Ddl(vec![crate::ddl::Ddl::AuditLog]), None, false).await?;
-    }
-    *made = true;
+fn batch(app: &App, lines: &[Line]) -> Result<RecordBatch> {
     let text = |f: &dyn Fn(&Line) -> Option<String>| Arc::new(lines.iter().map(f).collect::<StringArray>()) as ArrayRef;
     let node = app.cluster.addr.clone();
     let arrays = vec![
@@ -244,9 +202,7 @@ async fn append(app: &App, producer: &str, seq: u64, lines: &[Line], made: &mut 
         Arc::new(lines.iter().map(|l| l.ms).collect::<Int64Array>()) as ArrayRef,
         text(&|_| Some(node.clone())),
     ];
-    let batch = RecordBatch::try_new(crate::query::schema(&columns())?, arrays)?;
-    app.log()?.append(TABLE.into(), crate::log::Src { producer: producer.into(), seq, prev: None }, batch).await?;
-    Ok(())
+    Ok(RecordBatch::try_new(crate::query::schema(&columns())?, arrays)?)
 }
 
 /// Is `sql` about the audit log, and may the caller read it (a superuser)?

@@ -431,9 +431,17 @@ enum Kind {
 }
 
 /// Run jobs round-robin on the live nodes (each round starts where the last one stopped, so
-/// single jobs rotate too) and collect the files they wrote.
+/// single jobs rotate too) and collect the files they wrote. A round with a job that failed
+/// commits nothing, so what its other jobs wrote goes at once: left to the orphan sweep (a day
+/// on), a disk the lake had filled filled again with the files of the rounds that failed on it.
 async fn deal(lake: &Lake, jobs: Vec<Job>, nodes: &[String], me: &str) -> Result<Vec<DataFile>> {
     static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let paths = |f: &DataFile| std::iter::once(f.path.clone()).chain(f.delete_files().cloned()).collect::<Vec<_>>();
+    // (a `Positions` job hands its files back with a delete file more: never theirs to delete)
+    let given: std::collections::HashSet<String> = jobs.iter().flat_map(|j| match &j.kind {
+        Kind::Merge { files } | Kind::Squash { files } | Kind::Positions { files, .. } => files.iter().flat_map(paths).collect(),
+        Kind::Fold { .. } | Kind::Compact { .. } => vec![],
+    }).collect();
     let runs = jobs.into_iter().map(|job| {
         let node = &nodes[NEXT.fetch_add(1, Relaxed) % nodes.len()];
         async move {
@@ -445,7 +453,14 @@ async fn deal(lake: &Lake, jobs: Vec<Job>, nodes: &[String], me: &str) -> Result
             Ok(r.json().await?)
         }
     });
-    Ok(futures::future::try_join_all(runs).await?.into_iter().flatten().collect())
+    let (written, failed): (Vec<_>, Vec<_>) = futures::future::join_all(runs).await.into_iter().partition(|r| r.is_ok());
+    let written: Vec<DataFile> = written.into_iter().flat_map(Result::unwrap).collect();
+    if let Some(Err(e)) = failed.into_iter().next() {
+        let new = written.iter().flat_map(paths).filter(|p| !given.contains(p));
+        futures::stream::iter(new).for_each_concurrent(16, |p| async move { lake.delete(&p).await }).await;
+        return Err(e);
+    }
+    Ok(written)
 }
 
 /// Do one job here; returns the Parquet files written.
@@ -712,6 +727,9 @@ pub async fn expire(lake: &Lake, grace_ms: u64) -> Result<()> {
         }
     }
     if !puts.is_empty() || !deletes.is_empty() {
+        if deletes.iter().all(|k| k.starts_with("s/") || k.starts_with("d/")) {
+            puts.push((crate::store::QUIET.into(), json(&true))); // (marks moved, segments and garbage let go: no read sees it, so remembered answers stay)
+        }
         lake.cat.commit(puts, &deletes).await?;
     }
     lake.cat.wait_durable(lake.cat.committed()).await; // (replicated acks: forget objects only once the bucket has)

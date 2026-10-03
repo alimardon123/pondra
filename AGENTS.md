@@ -64,7 +64,8 @@ src/      28,600 lines of Rust, one file per concern (see the table in README.md
           tabs.js (the tabs' and the panes' menus), live.js (live queries)), xlsx.rs (a download as an Excel workbook); round 32 fresh.rs (a view's plan kept from one write to
           the next); round 33 format.rs (the lake's format, ADR-039), drain.rs (stopping without
           dropping work), service.rs (`pondra service`: systemd, launchd, a Windows service;
-          ADR-041) and past.rs (a table's past: `AT (…)`, `RESTORE`, ADR-043)
+          ADR-041), past.rs (a table's past: `AT (…)`, `RESTORE`, ADR-043) and history.rs (every
+          statement a row of `pondra.history`, slow ones with plans and traces, ADR-048)
 brand/    the logo (mark.svg), colours (colors.css) and fonts (fonts/: Geist and Geist Mono, SIL
           OFL): the only copies; tools/brand_check.py
 site/     the documentation website (Starlight; ADR-030): site/STYLE.md says how pages are written,
@@ -1441,12 +1442,41 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    transactions, and `if(` and `repeat(` are functions. A script's statements write once per job:
    each one's part is its place and its loop's pass (`{job}:{path}`). A block's `DECLARE`s, a
    loop's row and a handler's `$error` end with them (`vars::local`, `Runner::unwind`); a lone
-   `DECLARE` with no session is still refused. `harness.py scripts`.
+   `DECLARE` with no session is still refused. A `PARALLEL` pass and an `ASYNC` statement run in
+   the script's own task (never spawned: the caller, session and notices hold), each with a copy of
+   the variables (`vars::snapshot`). The `ASYNC` statements' state is shared with every step run
+   beside them (`Runner::beside`, `Started`), so an `AWAIT` in a block sees them. Their statements
+   keep their places in the job, and a script's end waits for what it started. A script that is
+   one block has that block's top as its top (`DECLARE PARAMETER`; `script::inside` for a file's
+   parameters). `harness.py scripts`.
 220. **A lake on local disk lets its catalog's garbage go within a minute** (`store::Catalog::writer`,
    `unpin`): the write-ahead log goes every 5 s, and a compaction's replaced files a minute on, once
    the compactor's 15-minute checkpoint is let go. A small disk the catalog filled otherwise had no
    room to flush, so nothing could clear it. A bucket keeps its minute (C5). `tools/resilience_check.py
    disk` on 64 MB.
+221. **An INSERT's own `VALUES` go through the log as `VALUES`** (`routines::values_apart` leaves
+   them, and `write::rows` sets apart a subquery's rows), so a subquery in a row never turns a
+   one-row INSERT into a Parquet file. `harness.py scripts`, `files`.
+222. **A task graph runs once per tick of its first task, and only forward** (`runs::due`): a task is
+   due when every task it follows passed (`ok` or `skipped`) at the same tick and it hasn't run at
+   it. Its tick (`jt/`) is committed before it runs and marked done, with its status and result,
+   after its line is in the run log, so a new leader runs an unfinished one again with its job.
+   `CREATE TASK` refuses a graph with two starts or a loop; `DROP TASK` one that others follow.
+   Every pass of a script's loop yields (`Runner::pass`), or a task's `timeout` never fires.
+   `harness.py tasks`.
+223. **Every statement a door was sent is one row of `pondra.history`, written off its path**
+   (`history::ended`, from `audit::statement` only, ADR-048): a node's writer appends a second's
+   rows through the log (one producer, a seq a batch), at most `PONDRA_HISTORY_RATE` a second, the
+   rest of the fast, good ones counted in a `skipped` row; slow (`PONDRA_SLOW_MS`) and failed ones
+   always, a slow one with its plan (`history::planned`) and each node's share (`spmd::timed`). An
+   admin reads every row, anyone else their own (`history::visible`); a query naming it is never a
+   remembered answer. Nothing a statement does may wait on it. `harness.py history`.
+224. **A quiet commit doesn't move the version remembered answers are keyed by** (`store::quiet`,
+   `Catalog::loud`): one that only adds history rows, moves its producers or its table's entry, or
+   lets segments go and moves marks (`tier::expire`'s `QUIET`). Anything else a read could see is
+   loud: a new kind of periodic commit must be quiet, or every remembered answer is forgotten at its
+   pace (history's commits every second made a repeated query 12× slower on a lake only read). The
+   leader's version is the smaller of `loud` and `committed` (`apply` comes first).
 
 ## Tests: run these before and after any change
 
@@ -1467,6 +1497,8 @@ python3 tools/harness.py scripts        # IF, CASE, loops, handlers, RETURN, EXE
 python3 tools/harness.py variables      # DECLARE $x, $x = …, SET VARIABLE, getvariable: sessions, Postgres, procedures, file runs, db.vars, pondra.parameters
 python3 tools/harness.py hot            # hot columns skip batches by their ranges (a time range, a top-N either way, a key); NULL filters == the model
 python3 tools/harness.py minmax         # a global min/max over 24 files skips no row its other answers need (an expression, NULLs so far, FILTER); a wide top-N's answer
+python3 tools/harness.py history        # pondra.history: every door's statements, slow ones' plans and three nodes' traces, the rate, off, who reads what
+python3 tools/harness.py tasks          # task graphs on three nodes: AFTER, WHEN, pondra.result, retries, timeouts, SUSPEND, refusals, a failover
 python3 tools/harness.py sparksql       # spark.sql / spark_sql('…') in Spark's grammar: literals, LATERAL VIEW, Spark's floor and substring, frames on top, refusals
 python3 tools/harness.py flows          # views of views in one commit, rollups, expectations (keep, drop, fail), changes down the flow
 python3 tools/harness.py begin          # BEGIN … COMMIT from every door, read-your-writes, 40001 and retries, 25P02, SQLSTATEs
@@ -1615,8 +1647,11 @@ pages). In the same release, round 33's first parts from the side threads: the l
 upgrades (ADR-039, 207–211), deployment (ADR-041, 205–206), every mode under failure and the five
 faults it found (214–215), a full local disk that recovers on its own (220), a table's past (`UNDROP`, retention per table, time travel `AT (…)`,
 `RESTORE`, zero-copy `CLONE`: ADR-043, 216–218), `CREATE VIEW v (a, b)`, `DECLARE PARAMETER`
-(ADR-044), scripts that branch, loop and handle errors (ADR-045, 219) and the console's batches. Left of 33: the 24-hour R2 soak (the owner's machine),
-observability, environments.
+(ADR-044), scripts that branch, loop and handle errors (ADR-045, 219) and the console's batches. After the
+release: scripts' `PARALLEL`, `ASYNC` and `AWAIT` and task graphs (ADR-045, 219, 221–222), and
+observability: every statement a row of `pondra.history`, slow ones with their plans and each
+node's share, a slow-query log (ADR-048, 223–224). Left of 33: the 24-hour R2 soak (the owner's
+machine); environments, branching data and the team's workflow are designed in their own thread.
 
 **Round 29, part 1 (ADR-034, after 0.27): the owner's console list.** The grid's outline, header
 card and menus, typed filters, Copy and Download in every form (a download is every row:

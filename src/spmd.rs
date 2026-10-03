@@ -158,19 +158,19 @@ pub async fn query(lake: &Lake, nodes: &[String], me: &str, sql: &str, force: bo
     let runs = nodes.iter().zip(&slices).map(|(node, s)| async move {
         match node == me {
             true => Ok(vec![]), // below
-            false => remote(node, s).await.map(|(_, parts)| parts),
+            false => timed("its share", node, remote(node, s)).await.map(|(_, parts)| parts),
         }
     });
     let mine_now = cut.children()[0].clone();
-    let ours = drain(&mine_now, ctx.task_ctx(), &id, "here");
+    let ours = timed("its share", me, drain(&mine_now, ctx.task_ctx(), &id, "here"));
     let tail = async {
         let (after, upto) = tail.parts[0].tail.expect("tail");
-        match upto > after { true => stage(lake, &tail).await.map(|(_, parts)| parts), false => Ok(vec![]) } // no log tail: nothing to do
+        match upto > after { true => timed("the log tail", me, stage(lake, &tail)).await.map(|(_, parts)| parts), false => Ok(vec![]) } // no log tail: nothing to do
     };
     let gathered = async {
         let (mut parts, ours, tail) = futures::future::try_join3(futures::future::try_join_all(runs), ours, tail).await?;
         parts.extend([ours, tail]);
-        finish(&ctx, &plan, Some(&cut), parts.into_iter().flatten().collect()).await
+        timed("the finish", me, finish(&ctx, &plan, Some(&cut), parts.into_iter().flatten().collect())).await
     };
     let out = gathered.await;
     crate::spill::clear(&id); // (what this node spilled for it; the others sweep theirs)
@@ -369,6 +369,14 @@ async fn drain(plan: &Arc<dyn ExecutionPlan>, ctx: Arc<datafusion::execution::Ta
         }
     });
     futures::future::try_join_all(runs).await
+}
+
+/// `f`, a part of the query on `node`, its time in the statement's trace (`history::span`).
+async fn timed<T>(what: impl Into<String>, node: &str, f: impl std::future::Future<Output = T>) -> T {
+    let began = std::time::Instant::now();
+    let out = f.await;
+    crate::history::span(what, node, began);
+    out
 }
 
 /// Another node's share, streamed onto this node's disk piece by piece: the plan's shape first,
@@ -595,8 +603,8 @@ async fn run(lake: &Lake, nodes: &[String], mine: usize, slices: &[Slice], job: 
                 (sh.step, sh.splits) = (step, splits.clone());
                 async move {
                     let once = async |s: &Slice| match i == mine {
-                        true => stage(lake, s).await,
-                        false => remote(node, s).await,
+                        true => timed(format!("step {step}"), node, stage(lake, s)).await,
+                        false => timed(format!("step {step}"), node, remote(node, s)).await,
                     };
                     // A step is the same work every time (the buckets it reads are kept until the
                     // job ends), so a node that stumbles — a timeout, a restart mid-step — gets
@@ -625,7 +633,7 @@ async fn run(lake: &Lake, nodes: &[String], mine: usize, slices: &[Slice], job: 
             }
             last = outs.into_iter().flat_map(|(.., parts)| parts).collect();
         }
-        finish(&job.ctx, &job.plan, job.cut.as_ref(), last).await
+        timed("the finish", &nodes[mine], finish(&job.ctx, &job.plan, job.cut.as_ref(), last)).await
     };
     let out = run.await;
     crate::metrics::add(&crate::metrics::SHUFFLED, (out.is_ok() && !job.exchanges.is_empty()) as u64);

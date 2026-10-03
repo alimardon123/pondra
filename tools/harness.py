@@ -4640,6 +4640,95 @@ def minmax():
     return f"minmax: a global min/max skips no row it needs: all {len(checks)} checks pass"
 
 
+def history():
+    """Every statement a door was sent is a row of `pondra.history` (ADR-048), a second later: its
+    door, user, node, session, outcome, time and rows. A slow one (`PONDRA_SLOW_MS`) keeps its plan,
+    each operator with its rows, and its trace: each node's share when it ran across three nodes, and
+    a line in the node's log. Past `PONDRA_HISTORY_RATE` a second, fast statements are counted in one
+    row, not written; `PONDRA_HISTORY=off` writes none; an admin reads every row, a user their own."""
+    import base64, psycopg
+    lake = new_lake()
+    a = Node(lake, A.port, env={"PONDRA_HISTORY_RATE": "40"}, pg=f"127.0.0.1:{A.port + 10}").start()
+    b = Node(lake, A.port + 1, env={"PONDRA_SLOW_MS": "0"}).start()  # (every statement slow: a plan each)
+    c = Node(lake, A.port + 2, env={"PONDRA_HISTORY": "off"}).start()
+    q = lambda s, i=0, path="/sql", headers=None: call(A.port + i, "POST", path, s.encode(), headers=headers)
+    rows_of = lambda tag: [r for r in q(f"SELECT * FROM pondra.history WHERE statement LIKE '%{tag}%' AND statement NOT LIKE '%pondra.history%'") if tag in r["statement"]]
+    def until(tag, want=1, secs=15):
+        deadline = time.time() + secs
+        while (got := rows_of(tag)) and len(got) < want or not got:
+            if time.time() > deadline:
+                return got
+            time.sleep(0.5)
+        return got
+    checks, seen = {}, {}
+    try:
+        q("CREATE TABLE t (k BIGINT, v VARCHAR)")
+        for f in range(6):  # (a bulk INSERT is a file of its own: something to deal out)
+            q(f"INSERT INTO t SELECT value, 'v' || value FROM range({f * 10000}, {(f + 1) * 10000})")
+        q("SELECT count(*) AS n FROM t -- h-http", headers={"x-pondra-session": "tab-0001"})
+        with psycopg.connect(f"host=127.0.0.1 port={A.port + 10} user=u dbname=lake", autocommit=True) as pg:
+            pg.execute("SELECT k FROM t WHERE k < 3 -- h-pg").fetchall()
+        try:
+            q("SELECT * FROM nope -- h-failed")
+        except RuntimeError:
+            pass
+        http, pgr, failed = until("h-http"), until("h-pg"), until("h-failed")
+        seen.update(http=http, pg=pgr, failed=failed)
+        h = http[0] if http else {}
+        checks["HTTP: door, user, node, session, outcome, time and rows"] = (h.get("door"), h.get("outcome"), h.get("rows"), h.get("node"), h.get("class")) == ("http", "ok", 1, f"127.0.0.1:{A.port}", "read") \
+            and str(h.get("session", "")).endswith("tab-0001") and h.get("ms") is not None and h.get("plan") is None and len(http) == 1
+        checks["Postgres: its door, its rows"] = [(r["door"], r["outcome"], r["rows"]) for r in pgr] == [("postgres", "ok", 3)]
+        checks["a failed statement: failed, with its error"] = [(r["outcome"], "nope" in (r["error"] or "")) for r in failed] == [("failed", True)]
+        # A slow statement (every one on b): its plan, its operators' rows; spread, each node's share
+        q("SELECT count(*) AS n FROM t WHERE k % 7 = 0 -- h-slow", 1)
+        while len(call(A.port + 1, "GET", "/stats")["nodes"]) < 3:
+            time.sleep(0.2)
+        call(A.port + 1, "POST", "/sql?spread=1", b"SELECT v, count(*) AS n FROM t GROUP BY v ORDER BY n DESC, v LIMIT 3 -- h-spread")
+        slow, spread = until("h-slow"), until("h-spread")
+        seen.update(slow=[{k: r[k] for k in ("ms", "rows", "plan")} for r in slow], spread=[{k: r[k] for k in ("nodes", "trace")} for r in spread])
+        checks["a slow statement keeps its plan, each operator with its rows"] = len(slow) == 1 and "output_rows=" in (slow[0]["plan"] or "") and slow[0]["rows"] == 1
+        trace = json.loads(spread[0]["trace"] or "[]") if spread else []
+        shares = {s["node"] for s in trace if s["what"] in ("its share", "step 0")}
+        checks["…spread over three nodes: each node's share in its trace"] = len(spread) == 1 and spread[0]["nodes"] == 3 and shares == {f"127.0.0.1:{A.port + i}" for i in range(3)}
+        checks["…and a line in the node's log"] = "slow statement:" in open(b.log).read() and "h-slow" in open(b.log).read()
+        # PONDRA_HISTORY=off: nothing from that node
+        q("SELECT 5 AS x -- h-off", 2)
+        time.sleep(2.5)
+        checks["PONDRA_HISTORY=off: none of its statements"] = rows_of("h-off") == []
+        # Past the rate (40 a second on a): counted in one row, not written
+        time.sleep(1 - time.time() % 1)
+        for i in range(120):
+            q(f"SELECT {i} AS x -- h-rate-{i:03}")
+        time.sleep(1.2)
+        q("SELECT 1 AS x -- h-after")  # (a new second: the row counting what was skipped)
+        until("h-after")
+        written = rows_of("h-rate-")
+        skipped = sum(r["rows"] for r in q("SELECT rows FROM pondra.history WHERE class = 'skipped'"))
+        seen["rate"] = {"written": len(written), "skipped": skipped}
+        checks["past PONDRA_HISTORY_RATE a second: the rest counted in one row, not written"] = 40 <= len(written) <= 80 and len(written) + skipped == 120
+        # An admin reads every row; a user, their own
+        basic = lambda u, p: {"Authorization": "Basic " + base64.b64encode(f"{u}:{p}".encode()).decode()}
+        ann, boss = basic("ann", "ann-password-1"), basic("boss", "boss-password-1")
+        q("CREATE USER boss PASSWORD 'boss-password-1' SUPERUSER")  # (then everyone signs in)
+        for s in ["CREATE USER ann PASSWORD 'ann-password-1'", "GRANT SELECT ON t TO ann"]:
+            q(s, headers=boss)
+        q("SELECT count(*) AS n FROM t -- h-ann", headers=ann)
+        time.sleep(2.5)
+        mine = q("SELECT DISTINCT \"user\" FROM pondra.history", headers=ann)
+        everyone = q("SELECT DISTINCT \"user\" FROM pondra.history", headers=boss)
+        seen["users"] = {"ann sees": mine, "boss sees": everyone}
+        checks["an admin reads every row, a user their own"] = mine == [{"user": "ann"}] and len(everyone) > 1
+    finally:
+        for n in (a, b, c):
+            n.kill()
+        clean_up()
+    ok = all(checks.values())
+    print(json.dumps({"history": checks, "seen": seen, "ok": ok}, indent=1, default=str))
+    if not ok:
+        sys.exit(1)
+    return f"history: every statement a row, slow ones with plans and traces: all {len(checks)} checks pass"
+
+
 def found():
     """What writing the docs found (round 26), each fixed: a filtered materialized view follows
     UPDATE and DELETE; a producer's seq 0 refused (HTTP, Flight); a merge table that leaves a
@@ -6882,7 +6971,7 @@ finally {{ await db.close?.(); }}"""
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    out = {t.__name__: t() for t in (upsert, deal, outside, clouds, kafkas, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, found, renames, workspace, server, scale, flight, users, secrets, safety, versions, stopped, flows, begin, doors, objects, sparksql, variables, scripts, hot, minmax, reader, crash)}
+    out = {t.__name__: t() for t in (upsert, deal, outside, clouds, kafkas, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, found, renames, workspace, server, scale, flight, users, secrets, safety, versions, stopped, flows, begin, doors, objects, sparksql, variables, scripts, hot, minmax, history, reader, crash)}
     A.secs = min(A.secs, 20)
     out["load"] = load()
     print(json.dumps(out, indent=1))
@@ -6890,7 +6979,7 @@ def all_tests():
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "found", "renames", "workspace", "server", "scale", "flight", "users", "secrets", "safety", "versions", "stopped", "flows", "begin", "doors", "objects", "sparksql", "variables", "scripts", "tasks", "hot", "minmax", "load", "all"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "found", "renames", "workspace", "server", "scale", "flight", "users", "secrets", "safety", "versions", "stopped", "flows", "begin", "doors", "objects", "sparksql", "variables", "scripts", "tasks", "hot", "minmax", "history", "load", "all"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -6902,7 +6991,7 @@ if __name__ == "__main__":
     ap.add_argument("--flush-ms", type=int, default=250)
     A = ap.parse_args()
     try:
-        {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "safety": safety, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "objects": objects, "sparksql": sparksql, "variables": variables, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "load": load, "all": all_tests}[A.mode]()
+        {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "safety": safety, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "objects": objects, "sparksql": sparksql, "variables": variables, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "load": load, "all": all_tests}[A.mode]()
     except BaseException as e:  # a failure ends the run, though threads may still wait on a node (crash's producers retry for ever)
         code = e.code if isinstance(e, SystemExit) else 1
         if not isinstance(e, SystemExit):

@@ -577,6 +577,7 @@ impl App {
             match crate::spmd::query(&self.lake, &nodes, &self.cluster.addr, query, spread == Some("1")).await {
                 Ok(Some(batches)) => {
                     crate::guard::ran_spread(query, start.elapsed());
+                    crate::history::spread(nodes.len());
                     return Ok((batches, true));
                 }
                 Ok(None) => {}
@@ -593,8 +594,10 @@ impl App {
                     (o.optimizer.prefer_hash_join, o.execution.sort_spill_reservation_bytes) = (false, 1 << 20);
                 }
                 let df = ctx.sql_with_options(query, crate::query::read_only()).await?;
-                let schema = Arc::new(df.schema().as_arrow().clone());
-                let out = df.collect().await?;
+                let (schema, task) = (Arc::new(df.schema().as_arrow().clone()), Arc::new(df.task_ctx()));
+                let plan = df.create_physical_plan().await?;
+                let out = datafusion::physical_plan::collect(plan.clone(), task).await?;
+                crate::history::planned(&plan); // (a slow statement's plan, with what each operator did)
                 anyhow::Ok(if out.is_empty() { vec![RecordBatch::new_empty(schema)] } else { out }) // (no rows: still its columns)
             };
             let here = std::time::Instant::now();
@@ -613,6 +616,7 @@ impl App {
         match out {
             Ok((batches, spread)) => {
                 add(&SPREAD, spread as u64);
+                crate::history::rows(batches.iter().map(|b| b.num_rows() as u64).sum());
                 Ok(batches.into_iter().map(crate::query::compact).collect()) // (an answer kept or sent holds only its own strings)
             }
             Err(e) => {
@@ -1040,7 +1044,7 @@ async fn query(app: &App, p: &SqlParams, query: &str, files: bool) -> anyhow::Re
     // Same query, same catalog version: same answer (unless it asks for the time or randomness,
     // or may read a file on this machine).
     let q = query.to_lowercase();
-    let volatile = files || limited || !crate::ext::names(query).is_empty() || ["now()", "random(", "current_", "uuid(", "explain", "pondra.runs", "pondra.tasks", "pondra.audit", "pondra.variables", "files("].iter().any(|f| q.contains(f)) // (files outside the lake change on their own; `files()` lists objects put since)
+    let volatile = files || limited || !crate::ext::names(query).is_empty() || ["now()", "random(", "current_", "uuid(", "explain", "pondra.runs", "pondra.tasks", "pondra.audit", "pondra.history", "pondra$history", "pondra.variables", "files("].iter().any(|f| q.contains(f)) // (files outside the lake change on their own; `files()` lists objects put since)
         || crate::temp::mentioned(query) // (the session's temporary tables change without a commit)
         || crate::settings::any() // (and its settings may change the answer)
         || crate::routines::volatile(&app.lake, query).await; // (a Python function may answer differently each time)

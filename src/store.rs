@@ -391,25 +391,34 @@ fn disk_tier(url: &str, store: &Store) -> Option<Arc<crate::cache::Disk>> {
     let dir = std::env::var("PONDRA_CACHE_DIR").map(std::path::PathBuf::from).unwrap_or_else(|_| std::env::temp_dir().join("pondra-cache"));
     let bytes = match std::env::var("PONDRA_CACHE_GB").ok().and_then(|v| v.parse::<u64>().ok()) {
         Some(gb) => gb << 30,
-        None => free_bytes(&dir).map_or(20 << 30, |free| (free / 4).min(20 << 30)),
+        None => space(&dir).map_or(20 << 30, |(free, _)| (free / 4).min(20 << 30)),
     };
     let dir = dir.join(url.trim_start_matches("s3://").replace(['/', ':', '\\'], "_")); // one folder per lake
     (bytes > 0).then(|| crate::cache::Disk::open(dir, bytes, store.clone()).ok()).flatten()
 }
 
-/// Free bytes on the disk that holds `dir` (or its nearest existing parent), where the platform says.
-fn free_bytes(dir: &std::path::Path) -> Option<u64> {
+/// Free and total bytes of the disk that holds `dir` (or its nearest existing parent), where the
+/// platform says.
+fn space(dir: &std::path::Path) -> Option<(u64, u64)> {
     #[cfg(unix)]
     {
         let at = std::ffi::CString::new(dir.ancestors().find(|a| a.exists())?.as_os_str().as_encoded_bytes()).ok()?;
         let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
-        (unsafe { libc::statvfs(at.as_ptr(), &mut s) } == 0).then(|| s.f_bavail as u64 * s.f_frsize as u64)
+        (unsafe { libc::statvfs(at.as_ptr(), &mut s) } == 0).then(|| (s.f_bavail as u64 * s.f_frsize as u64, s.f_blocks as u64 * s.f_frsize as u64))
     }
     #[cfg(not(unix))]
     {
         let _ = dir;
         None
     }
+}
+
+/// Room a lake on local disk keeps for its own upkeep: a quarter of the disk, 256 MB at most.
+/// Commits wait while less is free (`log::Sequencer`), so the catalog can still flush and
+/// tiering write the files that let the log go: a disk the lake filled to its last byte had
+/// room for neither, and kept a log that never drained.
+pub fn short_of_room(dir: &std::path::Path) -> Option<(u64, u64)> {
+    space(dir).map(|(free, total)| (free, (total / 4).min(256 << 20))).filter(|(free, keep)| free < keep)
 }
 
 pub struct Lake {
@@ -1057,6 +1066,7 @@ pub struct Catalog {
     hold: AtomicU64,              // commits before this one never arrived: read from the view alone
     follows: bool,                // follower / read-only node that gets the commit stream
     mirror: AtomicBool,           // the overlay holds the whole catalog (but inline data): read only it
+    loud: AtomicU64,              // the last commit a remembered answer may depend on (`quiet`, `version`)
 }
 
 /// A scan in progress: the streamed changes it may still lay over its (older) view stay.
@@ -1091,6 +1101,25 @@ pub struct Delta {
 
 impl Delta {
     fn bytes(&self) -> usize { self.puts.iter().map(|(k, v)| k.len() + v.len()).sum() }
+}
+
+/// A commit's key that says nothing a read sees changed (retention's marks: `tier::expire`).
+pub const QUIET: &str = "quiet";
+
+/// A commit no remembered answer depends on (`Catalog::version`): only the statements' history's
+/// rows, their producer's progress and its table's entry (`history.rs`, every second on every
+/// node), or retention letting segments go and marked `QUIET`. Counting them, every remembered
+/// answer was forgotten every second on a lake nobody wrote to.
+fn quiet(d: &Delta) -> bool {
+    let history = |k: &str| k == crate::history::KEY || k.strip_prefix("p/history-").is_some_and(|id| id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()));
+    let marked = d.puts.iter().any(|(k, _)| k == QUIET);
+    let only = |s: &Segment| s.files.is_empty() && s.parts.keys().all(|t| t == crate::history::TABLE);
+    d.deletes.iter().all(|k| k.starts_with("s/") || k.starts_with("d/"))
+        && (marked || d.puts.iter().any(|(k, _)| history(k)))
+        && d.puts.iter().all(|(k, v)| {
+            matches!(k.as_str(), "c" | "n" | "b" | QUIET) || k.starts_with("d/") || history(k) || (marked && k.starts_with("t/"))
+                || (k.starts_with("s/") && serde_json::from_slice::<Segment>(v).is_ok_and(|s| only(&s)))
+        })
 }
 
 /// What the leader streams to the other nodes (`GET /cluster/log`), in order.
@@ -1278,6 +1307,7 @@ impl Catalog {
         trace("the catalog in memory", t0);
         cat.overlay.get_mut().unwrap().extend(all.into_iter().map(|(k, v)| (k, (c, Some(v)))));
         cat.streamed.store(c, Relaxed);
+        cat.loud.store(c, Relaxed);
         cat.mirror.store(true, Relaxed);
         Ok(cat)
     }
@@ -1310,9 +1340,9 @@ impl Catalog {
 
     fn new(db: Db_) -> Self {
         let (feed, order) = (broadcast::channel(4096).0, tokio::sync::Mutex::new(1));
-        let (last_n, view, pruned, pins, streamed, hold, mirror, flushed, committed) = Default::default();
+        let (last_n, view, pruned, pins, streamed, hold, mirror, flushed, committed, loud) = Default::default();
         let (durable, acked, acks, pending, unstarted) = (watch::Sender::new(0), watch::Sender::new(()), Default::default(), Default::default(), Default::default());
-        Catalog { db, order, flushed, writes: None, unstarted, committed, durable, replicas: 1, acks, acked, pending, feed, recent: Default::default(), last_n, overlay: Default::default(), view, pruned, pins, streamed, hold, follows: false, mirror }
+        Catalog { db, order, flushed, writes: None, unstarted, committed, durable, replicas: 1, acks, acked, pending, feed, recent: Default::default(), last_n, overlay: Default::default(), view, pruned, pins, streamed, hold, follows: false, mirror, loud }
     }
 
     /// Leader: the recent frames plus a receiver for every frame from now on.
@@ -1387,6 +1417,9 @@ impl Catalog {
             false => o.extend(d.deletes.iter().map(|k| (k.clone(), (d.id, None)))),
         }
         self.streamed.fetch_max(d.id, Relaxed);
+        if !quiet(d) {
+            self.loud.fetch_max(d.id, Relaxed);
+        }
     }
 
     /// Whether a read that saw our own view at commit `c` may lay the streamed changes over it.
@@ -1461,6 +1494,7 @@ impl Catalog {
         o.retain(|_, (_, v)| v.is_some()); // (deleted keys: absent from the whole catalog)
         self.pruned.fetch_max(c, Relaxed); // older streamed commits are in the snapshot
         self.streamed.fetch_max(c, Relaxed);
+        self.loud.fetch_max(c, Relaxed);
         self.last_n.fetch_max(n, Relaxed);
         self.mirror.store(true, Relaxed);
         Ok(())
@@ -1495,11 +1529,12 @@ impl Catalog {
 
     /// The catalog version every read here reflects right now — on the leader (durable commits)
     /// or a node that holds the whole catalog in memory — or `None` where reads mix our view with
-    /// the stream. A read that starts after this sees at least this version (never older).
+    /// the stream. A read that starts after this sees at least this version (never older). Quiet
+    /// commits don't count: every read but the history's is the same across them.
     pub fn version(&self) -> Option<u64> {
         match &self.db {
-            Db_::Writer(_) => Some(self.committed.load(Relaxed)),
-            Db_::Reader(_) => self.mirror.load(Relaxed).then(|| self.streamed.load(Relaxed)),
+            Db_::Writer(_) => Some(self.loud.load(Relaxed).min(self.committed.load(Relaxed))), // (`apply` comes just before `committed`)
+            Db_::Reader(_) => self.mirror.load(Relaxed).then(|| self.loud.load(Relaxed)),
         }
     }
 
