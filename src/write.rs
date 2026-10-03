@@ -356,11 +356,19 @@ pub fn parse(sql: &str) -> Option<Stmt> {
         _ => None,
     };
     // OR REPLACE where replacing one would lose what it holds: refused, saying why.
-    static NO_REPLACE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?is)^\s*CREATE\s+OR\s+REPLACE\s+(SCHEMA|DATABASE|USER|ROLE)\b").expect("a regex"));
+    static NO_REPLACE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?is)^\s*CREATE\s+OR\s+REPLACE\s+(SCHEMA|DATABASE|USER|ROLE|SHARE|RECIPIENT)\b").expect("a regex"));
     if let Some(c) = NO_REPLACE.captures(first_word(sql)) {
         let kind = c[1].to_uppercase();
-        let lost = if matches!(kind.as_str(), "USER" | "ROLE") { "the rights given to it" } else { "everything in it" };
+        let lost = match kind.as_str() {
+            "USER" | "ROLE" => "the rights given to it",
+            "SHARE" => "its tables and grants",
+            "RECIPIENT" => "its token and the shares granted to it",
+            _ => "everything in it",
+        };
         return Some(Stmt::Invalid(format!("CREATE OR REPLACE {kind}: replacing one would drop {lost}; CREATE {kind} IF NOT EXISTS leaves one that is there as it is")));
+    }
+    if let Some(s) = crate::shares::statement(sql) {
+        return Some(s); // (CREATE SHARE and RECIPIENT, GRANT SELECT ON SHARE: `shares.rs`, before users' GRANT)
     }
     if let Some(s) = crate::users::statement(sql) {
         return Some(s); // (CREATE USER and ROLE, GRANT, REVOKE, CREATE TOKEN: `users.rs`)
