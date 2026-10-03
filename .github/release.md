@@ -1,4 +1,11 @@
-## What's new in 0.32.0 (since 0.30.0)
+## What's new in 0.33.0 (since 0.32.0)
+
+- **Every statement remembered.** `SELECT * FROM pondra.history` lists every statement from every door: who ran it, from where, on which node, how long it took, how many rows it answered and how it ended. A slow one (over a second, `PONDRA_SLOW_MS`) keeps the plan that ran, with each step's rows and time, and how long each node took; it is written to the node's log too. An admin sees everyone's, a user their own. Small queries cost what they did.
+- **Remembered answers last.** A repeated query on a lake nobody writes to is answered from memory for as long as nothing changes; background work no longer clears it.
+- **Scripts that run things at once.** `FOR … PARALLEL n`, `ASYNC`, `AWAIT ALL` and `AWAIT $h` run statements beside each other; `AWAIT 'id'` waits for a run `pondra.start` began; `VALUES` takes subqueries in its rows.
+- **Task graphs.** `CREATE TASK … AFTER`, `WHEN`, `pondra.result`, `WITH (retries, retry_delay, timeout, on_failure)`, `EXECUTE TASK` with values, `ALTER TASK … SUSPEND | RESUME`.
+
+## What was new in 0.32.0 (since 0.30.0)
 
 0.31.0 and 0.31.1 were never released, so this covers both.
 

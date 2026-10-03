@@ -712,6 +712,9 @@ pub async fn expire(lake: &Lake, grace_ms: u64) -> Result<()> {
         }
     }
     if !puts.is_empty() || !deletes.is_empty() {
+        if deletes.iter().all(|k| k.starts_with("s/") || k.starts_with("d/")) {
+            puts.push((crate::store::QUIET.into(), json(&true))); // (marks moved, segments and garbage let go: no read sees it, so remembered answers stay)
+        }
         lake.cat.commit(puts, &deletes).await?;
     }
     lake.cat.wait_durable(lake.cat.committed()).await; // (replicated acks: forget objects only once the bucket has)
