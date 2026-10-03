@@ -65,8 +65,48 @@ pub fn as_of(sql: &str) -> anyhow::Result<Cow<'_, str>> {
             _ => None,
         }
     }
-    fn joins(t: &mut TableWithJoins, found: &mut bool) -> anyhow::Result<()> {
+    fn inequality(e: &Expr) -> bool { matches!(e, Expr::BinaryOp { op: BinaryOperator::GtEq | BinaryOperator::Gt | BinaryOperator::LtEq | BinaryOperator::Lt, .. }) }
+    fn terms(e: Expr, out: &mut Vec<Expr>) {
+        match e {
+            Expr::BinaryOp { left, op: BinaryOperator::And, right } => {
+                terms(*left, out);
+                terms(*right, out);
+            }
+            Expr::Nested(n) if matches!(*n, Expr::BinaryOp { op: BinaryOperator::And, .. }) => terms(*n, out),
+            e => out.push(e),
+        }
+    }
+    // DuckDB's `ASOF [LEFT] JOIN … ON a.k = b.k AND a.t >= b.t` (marked by `friendly::asof_on`):
+    // the inequality is the match condition, and an ASOF JOIN without LEFT keeps only matched rows
+    // (`kept`: the looked-up side's operand isn't NULL where a row matched).
+    fn duckdb(j: &mut Join, kept: &mut Vec<Expr>) -> anyhow::Result<()> {
+        let JoinOperator::AsOf { match_condition, constraint } = &mut j.join_operator else { return Ok(()) };
+        let Expr::Identifier(i) = &*match_condition else { return Ok(()) };
+        let left = match i.value.as_str() {
+            "pondra_duckdb_asof" => false,
+            "pondra_duckdb_asof_left" => true,
+            _ => return Ok(()),
+        };
+        let JoinConstraint::On(on) = std::mem::replace(constraint, JoinConstraint::None) else { anyhow::bail!("ASOF JOIN: its condition goes in ON a.k = b.k AND a.t >= b.t") };
+        let mut all = Vec::new();
+        terms(on, &mut all);
+        let (ineq, keys): (Vec<Expr>, Vec<Expr>) = all.into_iter().partition(inequality);
+        let [cond] = ineq.as_slice() else { anyhow::bail!("ASOF JOIN: ON holds one inequality (a.t >= b.t), besides its keys' equalities") };
+        *match_condition = cond.clone();
+        if let Some(on) = keys.into_iter().reduce(|a, b| Expr::BinaryOp { left: Box::new(a), op: BinaryOperator::And, right: Box::new(b) }) {
+            *constraint = JoinConstraint::On(on);
+        }
+        if !left {
+            let Expr::BinaryOp { left: l, right: r, .. } = cond else { unreachable!() };
+            let theirs = |e: &Expr| matches!(e, Expr::CompoundIdentifier(p) if p.len() > 1 && Some(p[0].value.to_lowercase()) == name(&j.relation));
+            let looked_up = if theirs(l) { l } else { r };
+            kept.push(Expr::IsNotNull(looked_up.clone()));
+        }
+        Ok(())
+    }
+    fn joins(t: &mut TableWithJoins, found: &mut bool, kept: &mut Vec<Expr>) -> anyhow::Result<()> {
         for j in &mut t.joins {
+            duckdb(j, kept)?;
             let JoinOperator::AsOf { match_condition, constraint } = &j.join_operator else { continue };
             let mut cond = match_condition;
             while let Expr::Nested(e) = cond {
@@ -100,11 +140,26 @@ pub fn as_of(sql: &str) -> anyhow::Result<Cow<'_, str>> {
     impl VisitorMut for Joins {
         type Break = anyhow::Error;
         fn post_visit_select(&mut self, s: &mut Select) -> ControlFlow<anyhow::Error> {
-            s.from.iter_mut().try_for_each(|t| joins(t, &mut self.0)).map_or_else(ControlFlow::Break, ControlFlow::Continue)
+            let mut kept = Vec::new();
+            if let Err(e) = s.from.iter_mut().try_for_each(|t| joins(t, &mut self.0, &mut kept)) {
+                return ControlFlow::Break(e);
+            }
+            for k in kept {
+                s.selection = Some(match s.selection.take() {
+                    Some(w) => Expr::BinaryOp { left: Box::new(Expr::Nested(Box::new(w))), op: BinaryOperator::And, right: Box::new(k) },
+                    None => k,
+                });
+            }
+            ControlFlow::Continue(())
         }
         fn post_visit_table_factor(&mut self, t: &mut TableFactor) -> ControlFlow<anyhow::Error> {
+            let mut kept = Vec::new();
             match t {
-                TableFactor::NestedJoin { table_with_joins, .. } => joins(table_with_joins, &mut self.0).map_or_else(ControlFlow::Break, ControlFlow::Continue),
+                TableFactor::NestedJoin { table_with_joins, .. } => match joins(table_with_joins, &mut self.0, &mut kept) {
+                    Ok(()) if kept.is_empty() => ControlFlow::Continue(()),
+                    Ok(()) => ControlFlow::Break(anyhow::anyhow!("ASOF JOIN in parentheses: write it as ASOF LEFT JOIN, or outside them")),
+                    Err(e) => ControlFlow::Break(e),
+                },
                 _ => ControlFlow::Continue(()),
             }
         }

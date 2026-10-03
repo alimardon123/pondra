@@ -1,20 +1,26 @@
 # A soak (C4, ADR-039): a cluster on one runner under steady ingest for hours, a node stopped or
-# killed now and then, its memory, log, commits and objects on a timeline (tools/soak.py). Runs
-# only when started by hand (Actions → soak → Run workflow). A runner's job lasts 6 hours at most,
-# so this is 5.5 hours at most; a 24-hour soak needs a machine of the owner's.
+# killed now and then, its memory, log, commits and objects on a timeline (tools/soak.py). Started
+# by hand (Actions → soak → Run workflow), or by the label `soak` on a pull request: a day on R2
+# with the build of its head (five legs of 4.8 hours; the pull request's full-ci run must have
+# passed). A runner's job lasts 6 hours at most, so a longer soak is legs (soak-leg.yml), one after
+# another on one lake in the bucket: the lake lives the whole day, each node process a leg at most.
 #
 # storage r2 puts the lake in the bucket of cluster-bench.yml's secrets (R2_*). Mind the free tier:
 # each commit is about one object write (durable acknowledgements), so rate / batch commits a second
-# is about that many writes a second: 500 / 20 is 25 a second, 90,000 an hour (R2's free tier is a
-# million a month). The timeline says what the run made (`object_writes_per_s`).
+# is about that many writes a second: 500 / 20 is 25 a second, 90,000 an hour; 500 / 200, a day's,
+# 2.5 a second (R2's free tier is a million a month). The timeline says what the run made
+# (`object_writes_per_s`).
 name: soak
 
 on:
   workflow_dispatch:
     inputs:
       hours:
-        description: "How long (5.5 at most)"
+        description: "How long a leg (5.5 at most)"
         default: "5"
+      legs:
+        description: "Legs, one after another on one lake (1-5; more than one needs storage r2)"
+        default: "1"
       rate:
         description: "Rows a second into the stream, in all"
         default: "500"
@@ -30,61 +36,62 @@ on:
       binary:
         description: "ci (the build workflow's, for this commit: what ships) or build (from source)"
         default: "ci"
+  pull_request:
+    types: [labeled]
+
+permissions:
+  actions: read # (the build workflow's runs)
+  contents: read
 
 jobs:
-  soak:
+  plan:
+    if: github.event_name == 'workflow_dispatch' || github.event.label.name == 'soak'
     runs-on: ubuntu-24.04
-    timeout-minutes: 355
-    permissions:
-      actions: read # (the build workflow's runs)
-      contents: read
-    env:
-      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-      AWS_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
-      AWS_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT }}
-      AWS_REGION: auto
-      AWS_DEFAULT_REGION: auto
-      AWS_REQUEST_CHECKSUM_CALCULATION: when_required
-      AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
-      PONDRA_BUCKET: ${{ secrets.R2_BUCKET }}
+    outputs:
+      plan: ${{ steps.plan.outputs.plan }}
+      legs: ${{ steps.plan.outputs.legs }}
     steps:
-      - uses: actions/checkout@v5
-      - name: The build workflow's binary, for this commit
-        if: inputs.binary == 'ci'
+      - id: plan
         env:
-          GH_TOKEN: ${{ github.token }}
+          INPUTS: ${{ toJSON(inputs) }}
+          LABELLED: ${{ github.event_name == 'pull_request' }}
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
-          run=$(bash tools/ci_build.sh "$GITHUB_SHA")
-          [ -n "$run" ] || { echo "::error::no passing build run for $GITHUB_SHA: wait for it, or use binary: build"; exit 1; }
-          gh run download "$run" --name pondra-linux-x64 --dir dl && tar -xzf dl/pondra-linux-x64.tar.gz pondra
-      - uses: dtolnay/rust-toolchain@stable
-        if: inputs.binary == 'build'
-      - name: Or build from source
-        if: inputs.binary == 'build'
-        run: cargo build --profile dist && cp target/dist/pondra pondra
-      - uses: actions/setup-python@v6
-        with:
-          python-version: "3.11"
-      - name: The soak
-        env:
-          HOURS: ${{ inputs.hours }}
-          RATE: ${{ inputs.rate }}
-          BATCH: ${{ inputs.batch }}
-          NODES: ${{ inputs.nodes }}
-          STORAGE: ${{ inputs.storage }}
-        run: |
-          pip install -q $(grep -E '^boto3' tools/requirements.txt | sed 's/ *#.*//')
-          hours=$(python3 -c "import os; print(min(5.5, float(os.environ['HOURS'])))")
-          python3 tools/soak.py --hours "$hours" --rate "$RATE" --batch "$BATCH" --nodes "$NODES" --bin ./pondra \
-            $([ "$STORAGE" = r2 ] && echo --s3) --out soak.json --timeline soak-timeline.jsonl
-      - uses: actions/upload-artifact@v6
-        if: always()
-        with:
-          name: soak
-          path: |
-            soak.json
-            soak-timeline.jsonl
-            /tmp/pondra-soak-*/*.log
-          retention-days: 30
-          if-no-files-found: ignore
+          python3 - <<'EOF' >> "$GITHUB_OUTPUT"
+          import json, os
+          day = {"legs": "5", "hours": "4.8", "rate": "500", "batch": "200", "nodes": "3", "storage": "r2", "binary": "ci"}
+          p = {**(day if os.environ["LABELLED"] == "true" else json.loads(os.environ["INPUTS"])), "sha": os.environ["SHA"]}
+          p["legs"] = str(max(1, min(5, int(p.get("legs") or 1))))
+          if p["legs"] != "1" and p["storage"] != "r2":
+              raise SystemExit("::error::legs need storage r2: a runner's disk goes with its job")
+          print(f"plan={json.dumps(p)}\nlegs={p['legs']}")
+          EOF
+  leg1:
+    needs: plan
+    uses: ./.github/workflows/soak-leg.yml
+    secrets: inherit
+    with: { plan: "${{ needs.plan.outputs.plan }}", leg: 1 }
+  leg2:
+    needs: [plan, leg1]
+    if: fromJSON(needs.plan.outputs.legs) >= 2
+    uses: ./.github/workflows/soak-leg.yml
+    secrets: inherit
+    with: { plan: "${{ needs.plan.outputs.plan }}", leg: 2, after: soak-1 }
+  leg3:
+    needs: [plan, leg2]
+    if: fromJSON(needs.plan.outputs.legs) >= 3
+    uses: ./.github/workflows/soak-leg.yml
+    secrets: inherit
+    with: { plan: "${{ needs.plan.outputs.plan }}", leg: 3, after: soak-2 }
+  leg4:
+    needs: [plan, leg3]
+    if: fromJSON(needs.plan.outputs.legs) >= 4
+    uses: ./.github/workflows/soak-leg.yml
+    secrets: inherit
+    with: { plan: "${{ needs.plan.outputs.plan }}", leg: 4, after: soak-3 }
+  leg5:
+    needs: [plan, leg4]
+    if: fromJSON(needs.plan.outputs.legs) >= 5
+    uses: ./.github/workflows/soak-leg.yml
+    secrets: inherit
+    with: { plan: "${{ needs.plan.outputs.plan }}", leg: 5, after: soak-4 }

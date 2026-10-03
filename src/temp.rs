@@ -221,7 +221,7 @@ pub async fn statement(app: &App, stmt: &Stmt, files: bool) -> Result<Option<Val
                 return Ok(Some(j!({"view": name, "temporary": true, "exists": true}))); // (IF NOT EXISTS)
             }
             ensure!(*replace || !has(&s, name, false), "temporary view {name} exists (CREATE OR REPLACE TEMP VIEW replaces it)");
-            crate::query::session(&app.lake, sql, "").await?.sql(&crate::asof::rewrite(sql)?).await.with_context(|| format!("temporary view {name}"))?; // (it plans)
+            crate::query::sql(&crate::query::session(&app.lake, sql, "").await?, &crate::asof::rewrite(sql)?).await.with_context(|| format!("temporary view {name}"))?; // (it plans)
             with(&s, true, |x| Ok(x.views.insert(name.clone(), sql.clone())))?;
             return Ok(Some(j!({"view": name, "temporary": true})));
         }

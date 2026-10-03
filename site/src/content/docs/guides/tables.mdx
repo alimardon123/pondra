@@ -138,12 +138,12 @@ JavaScript, `GET /lookup/users/2` over HTTP. `WITH (key = 'id')` says the same a
 
 ### A merge table: `merge`
 
-A merge table has a key and combines the rows that share it, with `sum`, `count`, `min` or `max` per
-column. Every column except the key needs a function: `CREATE` refuses a table that leaves one out.
+A merge table has a key and combines the rows that share it, with `MERGE sum`, `count`, `min` or
+`max` on each column. Every column except the key needs one: `CREATE` refuses a table that leaves one out.
 You only `INSERT` into it.
 
 ```sql
-CREATE TABLE totals (user VARCHAR PRIMARY KEY, n BIGINT, total DOUBLE) WITH (merge = 'n:sum,total:sum');
+CREATE TABLE totals (user VARCHAR PRIMARY KEY, n BIGINT MERGE sum, total DOUBLE MERGE sum);
 INSERT INTO totals VALUES ('ann', 1, 5.0), ('bob', 1, 2.0);
 INSERT INTO totals VALUES ('ann', 1, 7.0);
 SELECT * FROM totals ORDER BY user;
@@ -158,13 +158,13 @@ SELECT * FROM totals ORDER BY user;
 +------+---+-------+
 ```
 
-### Latest by event time: `order_by`
+### Latest by event time: `SEQUENCE BY`
 
-On a keyed table, `order_by` makes the row with the latest event time current, not the last one to
+On a keyed table, `SEQUENCE BY` makes the row with the latest event time current, not the last one to
 arrive. A late row doesn't replace a newer one.
 
 ```sql
-CREATE TABLE positions (vehicle VARCHAR PRIMARY KEY, ts TIMESTAMP, lat DOUBLE, lon DOUBLE) WITH (order_by = 'ts');
+CREATE TABLE positions (vehicle VARCHAR PRIMARY KEY, ts TIMESTAMP, lat DOUBLE, lon DOUBLE) SEQUENCE BY ts;
 INSERT INTO positions VALUES ('v1', TIMESTAMP '2026-09-27 10:05:00', 41.30, 69.28);
 INSERT INTO positions VALUES ('v1', TIMESTAMP '2026-09-27 10:01:00', 41.20, 69.20);
 SELECT * FROM positions;
@@ -178,31 +178,31 @@ SELECT * FROM positions;
 +---------+---------------------+------+-------+
 ```
 
-### Expire old rows: `ttl`
+### Expire old rows: `TTL`
 
-On a keyed table, `ttl = 'column:seconds'` hides the rows whose timestamp column is older than that
-many seconds, and a full compaction of the table deletes them.
+On a keyed table, `TTL column + INTERVAL '…'` hides the rows whose timestamp column is older than
+that, and a full compaction of the table deletes them.
 
 ```sql
-CREATE TABLE sessions (sid VARCHAR PRIMARY KEY, last_seen TIMESTAMP, page VARCHAR) WITH (ttl = 'last_seen:86400');
+CREATE TABLE sessions (sid VARCHAR PRIMARY KEY, last_seen TIMESTAMP, page VARCHAR) TTL last_seen + INTERVAL '1 day';
 ```
 
 ## Lay out the files
 
-Two options decide how a table's files are written, and they combine with a key.
+Two clauses decide how a table's files are written, and they combine with a key.
 
-- **`partition_by`** keeps one partition in each file: a column (`'region'`), or the year, month, day or
-  hour of a timestamp (`'day(ts)'`). A filter on it skips every other partition's files.
-- **`cluster_by`** sorts each file by one or more columns, so a filter on them skips most of a file.
+- **`PARTITION BY`** keeps one partition in each file: a column (`region`), or the year, month, day or
+  hour of a timestamp (`day(ts)`). A filter on it skips every other partition's files.
+- **`CLUSTER BY`** sorts each file by one or more columns, so a filter on them skips most of a file.
   With two or more columns the rows follow a Hilbert curve, so a filter on any one of them still skips
   most of a file.
 
 ```sql
 CREATE TABLE events (id BIGINT, user VARCHAR, amount DOUBLE, ts TIMESTAMP)
-  WITH (partition_by = 'day(ts)', cluster_by = 'user');
+  PARTITION BY day(ts) CLUSTER BY (user);
 ```
 
-`partition_by` is fixed once the table is made. `cluster_by` can change later (see `ALTER TABLE` below).
+`PARTITION BY` is fixed once the table is made. `CLUSTER BY` can change later (see `ALTER TABLE` below).
 
 ## Publish a table for other engines
 
@@ -301,11 +301,12 @@ SELECT * FROM readings ORDER BY sensor;
 +--------+------------+------+
 ```
 
-`SET` changes a table's options: `publish`, `cluster_by`, and on keyed tables `ttl` and `order_by`.
-Files written from then on follow them.
+`CLUSTER BY` changes how files are sorted, `SET` changes a table's options (`publish`, `retention`),
+and on keyed tables `TTL` and `SEQUENCE BY` change too. Files written from then on follow them.
 
 ```sql
-ALTER TABLE events SET (publish = 'delta', cluster_by = 'user,amount');
+ALTER TABLE events CLUSTER BY (user, amount);
+ALTER TABLE events SET (publish = delta);
 ```
 
 Some changes aren't possible, and the error says what to do instead:

@@ -53,6 +53,19 @@ on bytes as they do on text. A `CAST` to bytes takes `BYTEA` only.
 | `FROM t AT (VERSION => n)`, `AT (TIMESTAMP => '…')`, `AT (OFFSET => -3600)` | the table as it was after commit `n`, at that time, or that many seconds ago ([below](#a-tables-past)) |
 | `FROM t VERSION AS OF n`, `FROM t TIMESTAMP AS OF '…'`, `FROM t FOR SYSTEM_TIME AS OF '…'` | the same, in Delta's, Spark's and SQL:2011's words: what follows is a number, a string, `TIMESTAMP '…'`, a variable or `(an expression)` |
 | `FROM a ASOF JOIN b MATCH_CONDITION (a.ts >= b.ts) ON a.k = b.k` | each row gets the other table's row as it was at that moment (`>=`, `>`, `<=`, `<`) |
+| `FROM a ASOF [LEFT] JOIN b ON a.k = b.k AND a.ts >= b.ts` | DuckDB's spelling: only rows with a match, or all of `a`'s with `LEFT` |
+| `PIVOT t ON col [IN (…)] USING agg(x) [GROUP BY …]`, `… FROM t PIVOT (agg(x) FOR col IN (…))` | a column per value of `col`; without `IN`, the values are found when it runs |
+| `UNPIVOT t ON a, b INTO NAME n VALUE v`, `… FROM t UNPIVOT [INCLUDE NULLS] (v FOR n IN (a, b))` | a row per column, NULLs left out unless included |
+| `COLUMNS('regex')`, `COLUMNS(*)`, `COLUMNS(['a', 'b'])` | the columns it picks, each named after its column (`min(COLUMNS(*))`); in a `WHERE`, each one's condition, ANDed |
+| `SELECT * RENAME (a AS b)`, `* EXCLUDE (…)`, `* REPLACE (… AS …)` | the columns `*` gives, renamed, left out or replaced |
+| `ORDER BY ALL [DESC]`, `GROUP BY ALL` | by every column of the answer, left to right; by every column not aggregated |
+| `FETCH FIRST n ROWS ONLY`, `OFFSET n ROWS FETCH NEXT m ROWS ONLY` | the standard's `LIMIT` |
+| `[x * 2 FOR x IN l IF x > 0]`, `list_transform(l, x -> x + 1)`, `LAMBDA x: x + 1` | list comprehensions and lambdas (`list_filter`, `array_any_match` and the others take them too) |
+| `max_by(x, y)`, `arg_max`, `min_by`, `arg_min`, `list(x)`, `string_split(s, ',')` | DuckDB's names (`max_by` leaves out rows whose `y` is NULL) |
+| `json_extract(j, '$.a.b[0]')`, `json_extract_string(…)`, `x::JSON` | JSON as text: a path written as a literal |
+| `SELECT x * 2 AS y FROM t WHERE y > 1` | a select's alias in its `WHERE` (a column of that name wins) |
+| `SUMMARIZE t`, `SUMMARIZE SELECT …` | a row per column: its type, min and max, distinct values about, mean, spread, quartiles, count and NULLs |
+| `FROM t USING SAMPLE 10%` (or `n ROWS`), `FROM t TABLESAMPLE (10)` (or `(n ROWS)`) | a sample: each row kept on its own, or `n` of them |
 | `EXPLAIN SELECT …` | the plan, and whether it would spread over the nodes |
 | `DESCRIBE t`, `SHOW TABLES`, `SHOW COLUMNS FROM t` | what the lake holds |
 | `SHOW VIEWS`, `SHOW MATERIALIZED VIEWS [LIKE 'p%']`, `SELECT … FROM pondra.tables` | each table and view with its kind (see [system tables](/pondra/reference/system-columns/#tables-and-views)) |
@@ -70,6 +83,10 @@ INSERT INTO quotes VALUES (TIMESTAMP '2026-09-28 10:00:00', 'ABC', 10.0), (TIMES
 FROM orders SELECT item, sum(amount) AS total GROUP BY item ORDER BY total DESC;
 FROM orders WHERE item = 'tea' ORDER BY id;
 SELECT t.ts, t.px, q.bid FROM trades t ASOF JOIN quotes q MATCH_CONDITION (t.ts >= q.ts) ON t.sym = q.sym;
+SELECT t.ts, t.px, q.bid FROM trades t ASOF JOIN quotes q ON t.sym = q.sym AND t.ts >= q.ts;
+PIVOT orders ON item USING sum(amount);
+SELECT max(COLUMNS('qty|amount')), max_by(item, amount) AS biggest FROM orders ORDER BY ALL;
+SUMMARIZE orders;
 SHOW TABLES;
 ```
 
@@ -146,7 +163,7 @@ past starts when it was made.
 
 | Statement | Syntax |
 |---|---|
-| Create | `CREATE [OR REPLACE] TABLE [IF NOT EXISTS] t (column type [NOT NULL] [DEFAULT expression] [CHECK (condition)] [PRIMARY KEY], … [, PRIMARY KEY (column, …)] [, CONSTRAINT name CHECK (condition)]) [WITH (option = 'value', …)] [PARTITION BY expression] [CLUSTER BY (column, …)]` |
+| Create | `CREATE [OR REPLACE] TABLE [IF NOT EXISTS] t (column type [NOT NULL] [DEFAULT expression] [CHECK (condition)] [PRIMARY KEY] [MERGE sum\|count\|min\|max], … [, PRIMARY KEY (column, …)] [, CONSTRAINT name CHECK (condition)]) [PARTITION BY expression] [CLUSTER BY (column, …)] [SEQUENCE BY column] [TTL column + INTERVAL '…'] [WITH (option = value, …)]`: the layout clauses in any order ([table options](/pondra/reference/table-options/)) |
 | Create like another | `CREATE TABLE t LIKE s`: an empty table with `s`'s columns and their types, as Postgres's does |
 | Create from a query | `CREATE TABLE t AS SELECT …`, `CREATE TABLE t (a INT, b VARCHAR) AS VALUES …`, or `SELECT … INTO t FROM …` |
 | Add a column | `ALTER TABLE t ADD COLUMN [IF NOT EXISTS] c type` |
@@ -154,7 +171,8 @@ past starts when it was made.
 | Rename a table | `ALTER TABLE t RENAME TO u` |
 | Drop a column | `ALTER TABLE t DROP COLUMN [IF EXISTS] c` |
 | Widen a column | `ALTER TABLE t ALTER COLUMN c TYPE BIGINT` |
-| Change options | `ALTER TABLE t SET (publish = 'delta', cluster_by = 'user', ttl = 'ts:3600', order_by = 'ts', retention = '7 days')`, or `ALTER TABLE t CLUSTER BY (user)` |
+| Change the layout | `ALTER TABLE t CLUSTER BY (user)`, `ALTER TABLE t TTL ts + INTERVAL '2 hours'`, `ALTER TABLE t SEQUENCE BY ts` |
+| Change options | `ALTER TABLE t SET (publish = delta, retention = '7 days')` |
 | Empty | `TRUNCATE [TABLE] t` |
 | Drop | `DROP TABLE [IF EXISTS] t [, t2 …] [PURGE]` |
 | Bring back a dropped table | `UNDROP TABLE t` |
@@ -206,7 +224,7 @@ dropped last under that name, and is refused while another table has the name: r
 
 ```sql
 CREATE TABLE users (id BIGINT PRIMARY KEY, name VARCHAR, plan VARCHAR);
-CREATE TABLE clicks (ts TIMESTAMP, user VARCHAR, url VARCHAR) WITH (cluster_by = 'user', partition_by = 'day(ts)');
+CREATE TABLE clicks (ts TIMESTAMP, user VARCHAR, url VARCHAR) PARTITION BY day(ts) CLUSTER BY (user);
 CREATE TABLE big_orders AS SELECT * FROM orders WHERE amount > 4;
 CREATE TABLE accounts (id BIGINT PRIMARY KEY, email VARCHAR NOT NULL, plan VARCHAR DEFAULT 'free', made TIMESTAMP DEFAULT now());
 INSERT INTO accounts (id, email) VALUES (1, 'ann@example.com');
