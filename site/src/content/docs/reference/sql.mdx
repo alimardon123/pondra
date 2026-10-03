@@ -515,6 +515,10 @@ DROP MATERIALIZED VIEW spend_by_item;
 | Run code once | `DO LANGUAGE python \| sql $$ … $$` (the language may come after the code, as in Postgres) |
 | Start | `SELECT pondra.start('p', args)`: runs it without waiting, and answers with the run's id |
 | Task | `CREATE [OR REPLACE] TASK [IF NOT EXISTS] t SCHEDULE '5 minutes' \| 'cron 0 2 * * * UTC' AS CALL p(…)` |
+| Task in a graph | `CREATE TASK t AFTER a, b [WHEN condition] [WITH (retries = 2, retry_delay = '1 minute', timeout = '1 hour', on_failure = p)] AS statement` ([Run tasks in order](/pondra/guides/functions-and-procedures/#run-tasks-in-order)) |
+| Run a task now | `EXECUTE TASK t [(name => value, …)]`: its graph, with values for its `$name`s |
+| A task's result | `pondra.result('t')`: what task `t` answered in the same run of its graph |
+| Pause a task | `ALTER TASK t SUSPEND`, `ALTER TASK t RESUME` |
 | Drop | `DROP FUNCTION [IF EXISTS] f`, `DROP PROCEDURE …`, `DROP MACRO …`, `DROP TASK [IF EXISTS] t` |
 | List | `SHOW USER FUNCTIONS`, `SHOW PROCEDURES`, `SHOW TASKS` (each takes `LIKE 'pattern'`) |
 

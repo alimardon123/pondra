@@ -206,6 +206,26 @@ ALTER TASK report SUSPEND;  ALTER TASK report RESUME;
 - **No separate schedule objects:** one task holds the schedule and the rest follow it. `CREATE
   SCHEDULE` shared by name can come later without changing anything here.
 
+**Built (phase 3).** As above, with these settled while building it:
+- **A graph has one start.** A task that would follow tasks of two schedules, or itself, is
+  refused, and so is dropping a task others follow. A run of the graph is the first task's tick,
+  and each task's run in it is `task-<name>-<tick>` in `pondra.runs`.
+- **What follows a failure doesn't run.** A failed task (after its `retries`) calls `on_failure`
+  with its name and error, and the tasks after it wait for the next run of the graph. A suspended
+  task, and so what follows it, doesn't run in the graph's runs. `EXECUTE TASK` still runs it.
+- **Results** are kept with the task's last run (`pondra.tasks.last_result`): its `RETURN`, or the
+  first value of its last query. `pondra.result('t')` is put in as that value, and is NULL when
+  `t` gave none in this run.
+- **Values passed down the graph** are `EXECUTE TASK`'s, bound as `$name` in every task, its
+  `WHEN` too. A scheduled run gives none, so a task gives its own default with `DECLARE PARAMETER`
+  at its top. A task that is one `BEGIN … END` block has that block's top as its top, and so does a
+  file that is one block.
+- **`EXECUTE TASK`** claims a tick that the leader's scheduler runs at once. It is refused while
+  the task's last run is still going.
+- **Every pass of a loop yields.** A loop that only read variables never waited, so it held its
+  worker thread: a task's `timeout` never fired, and after a failover the new leader ran it again
+  and lost a thread to it.
+
 ### 6. Built to grow
 
 - **A registry of statements** (`script.rs`): each kind of block or statement is one entry, the
@@ -228,7 +248,7 @@ ALTER TASK report SUSPEND;  ALTER TASK report RESUME;
 2. **Parallel**: `PARALLEL n` loops, `ASYNC`, `AWAIT ALL` and `AWAIT $h` or a run's id (built); then
    passes dealt to the nodes, each a run of its own in `pondra.runs`.
 3. **Task graphs**: `AFTER`, `WHEN`, results, values passed down the graph, `WITH (…)` options, `EXECUTE TASK`, `SUSPEND` and
-   `RESUME`; the console's Tasks view with the graph and the renaming.
+   `RESUME` (built); then the console's Tasks view with the graph and the renaming.
 
 ## Consequences
 

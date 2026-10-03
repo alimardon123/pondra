@@ -10,6 +10,12 @@
 //!   about to run (`jt/`), then runs it with the job `task:{name}:{tick}`, then marks it done. A
 //!   new leader finding a tick claimed but not done runs it again with the same job, so its writes
 //!   land once; ticks missed while no node led are run once, as the latest of them.
+//! - **Task graphs** (ADR-045): `CREATE TASK load AFTER nightly WHEN … WITH (retries = 2) AS …`. A
+//!   task with `AFTER` has no schedule: it runs once every task it follows has ended well in the
+//!   same run of their graph (the first task's tick, which its tick is too), claimed and marked done
+//!   as a scheduled one is. `WHEN` false is a run `skipped`, which counts as done; `RETURN`'s value
+//!   is the run's result (`pondra.result('load')`); `EXECUTE TASK nightly (day => …)` claims a tick
+//!   now, its values every task's in the graph; a suspended task takes no tick of its own.
 //! - **`pondra.routines`, `pondra.tasks`**: the catalog's functions, procedures and tasks, as
 //!   tables (`SHOW FUNCTIONS`, `SHOW PROCEDURES`, `SHOW TASKS` read them).
 use crate::auth::Role;
@@ -22,7 +28,7 @@ use datafusion::arrow::array::{Array, ArrayRef, Int64Array, RecordBatch, StringA
 use datafusion::sql::sqlparser::{keywords::Keyword, parser::Parser, tokenizer::Token};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::Duration;
 
 pub const TABLE: &str = "pondra$runs";
@@ -89,9 +95,14 @@ impl Run {
     /// The call's line, ended; the answer says when it is in the log (a task waits for it before
     /// its tick is done, so a tick that wrote is never missing from the log).
     pub fn end(self, app: &App, out: &Result<Outcome>, notices: Vec<String>) -> tokio::sync::oneshot::Receiver<()> {
+        self.ended(app, if out.is_ok() { "ok" } else { "failed" }, out.as_ref().err().map(|e| format!("{e:#}")), notices)
+    }
+
+    /// The call's line, ended as `status` says (a task's run may be `skipped`).
+    fn ended(self, app: &App, status: &'static str, error: Option<String>, notices: Vec<String>) -> tokio::sync::oneshot::Receiver<()> {
         let mut line = self.0;
-        (line.ended, line.status) = (Some(now_ms()), if out.is_ok() { "ok" } else { "failed" });
-        line.error = out.as_ref().err().map(|e| cut(format!("{e:#}")));
+        (line.ended, line.status) = (Some(now_ms()), status);
+        line.error = error.map(cut);
         line.notices = (!notices.is_empty()).then(|| cut(notices.join("\n")));
         let (done, written) = tokio::sync::oneshot::channel();
         log(app, line, Some(done));
@@ -280,49 +291,261 @@ async fn stopped(app: &App, since: u64, own_only: bool) -> Result<()> {
 // ---------------------------------------------------------------- tasks
 
 /// A statement run on a schedule, as the catalog keeps it (`j/`).
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
 pub struct Task {
+    /// When it runs (empty for a task that runs `after` others).
     pub schedule: String,
     pub sql: String,
     #[serde(default)]
     pub created_ms: u64,
+    /// The tasks it runs after, in the same run of their graph.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub after: Vec<String>,
+    /// Checked before it runs: false, and the run is `skipped`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when: Option<String>,
+    #[serde(default, skip_serializing_if = "TaskOptions::plain")]
+    pub with: TaskOptions,
+    /// `ALTER TASK … SUSPEND`: no tick of its own until `RESUME` (`EXECUTE TASK` still runs it).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub suspended: bool,
 }
 
-/// The tick a leader last took on, and whether it finished (`jt/`).
-#[derive(Serialize, Deserialize, Clone, Copy)]
+/// `WITH (retries = 2, retry_delay = '1 minute', timeout = '1 hour', on_failure = notify)`.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct TaskOptions {
+    /// Runs again after a failure, with the same job (what it wrote lands once).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub retries: u64,
+    /// Seconds between tries (10 by default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_delay: Option<u64>,
+    /// Seconds a try may take.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<u64>,
+    /// A procedure called with the task's name and its error when it fails for good.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_failure: Option<String>,
+}
+
+fn is_zero(n: &u64) -> bool { *n == 0 }
+
+impl TaskOptions {
+    fn plain(&self) -> bool { *self == TaskOptions::default() }
+}
+
+/// The tick a task last took on (a scheduled task's own; a following task's, its graph's), whether
+/// it finished, and how (`jt/`).
+#[derive(Serialize, Deserialize, Clone, Default)]
 struct Tick {
     at: u64,
     done: bool,
+    /// ok, failed or skipped (None: ok, from before graphs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    status: Option<String>,
+    /// `RETURN`'s value, as SQL (`pondra.result`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    result: Option<String>,
+    /// `EXECUTE TASK … (day => …)`'s values, the graph's.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    params: HashMap<String, serde_json::Value>,
+}
+
+impl Tick {
+    /// Ended, and well enough for what follows it.
+    fn passed(&self) -> bool { self.done && matches!(self.status.as_deref(), None | Some("ok" | "skipped")) }
 }
 
 pub fn task_key(name: &str) -> String { format!("j/{name}") }
 fn tick_key(name: &str) -> String { format!("jt/{name}") }
 
-pub const USAGE: &str = "CREATE TASK name SCHEDULE 'cron 0 2 * * * UTC' | '5 minutes' AS CALL procedure(…)";
+pub const USAGE: &str = "CREATE TASK name SCHEDULE 'cron 0 2 * * * UTC' | '5 minutes' | AFTER task, … [WHEN condition] [WITH (retries = 2, retry_delay = '1 minute', timeout = '1 hour', on_failure = procedure)] AS statement";
 
-/// The rest of `CREATE TASK`: its name, `SCHEDULE [=] '…'` and `AS` the statement it runs.
-pub fn task(p: &mut Parser) -> Result<(String, Task)> {
+/// The rest of `CREATE TASK` (`sql`: the whole statement): its name, `SCHEDULE [=] '…'` or `AFTER
+/// a, b`, `WHEN cond`, `WITH (…)` and `AS` what it runs, as written (a script too).
+pub fn task(p: &mut Parser, sql: &str) -> Result<(String, Task)> {
     let _ = p.parse_keywords(&[Keyword::IF, Keyword::NOT, Keyword::EXISTS]);
     let name = crate::write::object(&p.parse_object_name(false)?);
-    ensure!(crate::routines::word(p, "schedule"), "SCHEDULE '…' is missing");
-    let _ = p.consume_token(&Token::Eq);
-    let schedule = crate::routines::text_of(p)?.context("the schedule is a string: SCHEDULE '5 minutes'")?;
-    every(&schedule)?;
+    let mut task = Task::default();
+    if crate::routines::word(p, "schedule") {
+        let _ = p.consume_token(&Token::Eq);
+        task.schedule = crate::routines::text_of(p)?.context("the schedule is a string: SCHEDULE '5 minutes'")?;
+        every(&task.schedule)?;
+    } else if crate::routines::word(p, "after") {
+        loop {
+            task.after.push(crate::write::object(&p.parse_object_name(false)?));
+            if !p.consume_token(&Token::Comma) {
+                break;
+            }
+        }
+    } else {
+        bail!("SCHEDULE '…' or AFTER task is missing");
+    }
+    if p.parse_keyword(Keyword::WHEN) {
+        task.when = Some(p.parse_expr()?.to_string());
+    }
+    if p.parse_keyword(Keyword::WITH) {
+        task.with = task_options(p)?;
+    }
     ensure!(p.parse_keyword(Keyword::AS), "AS statement is missing");
-    let sql = p.parse_statement()?.to_string();
-    let t = p.next_token().token;
-    ensure!(matches!(t, Token::EOF | Token::SemiColon), "unexpected {t}");
-    Ok((name, Task { schedule, sql, created_ms: 0 }))
+    let body = sql[offset(sql, p.peek_token().span.start)..].trim();
+    task.sql = body.strip_suffix(';').unwrap_or(body).trim_end().to_string();
+    ensure!(!task.sql.is_empty(), "AS statement is missing");
+    Ok((name, task))
+}
+
+/// Is `sql` a `CREATE TASK`? (Its `$name`s are bound as it runs, not as it is made.)
+pub fn creates_task(sql: &str) -> bool {
+    static HEAD: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?is)^\s*create\s+(?:or\s+replace\s+)?task\b").expect("a regex"));
+    HEAD.is_match(crate::write::first_word(sql))
+}
+
+/// Where a token starts in `sql` (sqlparser counts lines and characters from 1).
+fn offset(sql: &str, at: datafusion::sql::sqlparser::tokenizer::Location) -> usize {
+    let mut from = 0;
+    for (n, line) in sql.split_inclusive('\n').enumerate() {
+        if n + 1 == at.line as usize {
+            return from + line.char_indices().nth((at.column as usize).saturating_sub(1)).map_or(line.len(), |(i, _)| i);
+        }
+        from += line.len();
+    }
+    sql.len()
+}
+
+/// A task's `WITH (…)`: each option by name; an unknown one refused.
+fn task_options(p: &mut Parser) -> Result<TaskOptions> {
+    let mut o = TaskOptions::default();
+    p.expect_token(&Token::LParen)?;
+    loop {
+        let k = p.parse_identifier()?.value.to_lowercase();
+        p.expect_token(&Token::Eq)?;
+        let v = match p.next_token().token {
+            Token::SingleQuotedString(s) | Token::Number(s, _) => s,
+            Token::Word(w) => w.value,
+            t => bail!("{k}: a value, not {t}"),
+        };
+        let secs = |v: &str| -> Result<u64> {
+            match v.parse::<u64>() {
+                Ok(n) => Ok(n),
+                Err(_) => match every(v)? {
+                    Every::Seconds(s) => Ok(s),
+                    Every::Cron(..) => bail!("{k}: how long ('10 minutes', or seconds), not a schedule"),
+                },
+            }
+        };
+        match k.as_str() {
+            "retries" => o.retries = v.parse().with_context(|| format!("retries: how many times, not {v:?}"))?,
+            "retry_delay" => o.retry_delay = Some(secs(&v)?),
+            "timeout" => o.timeout = Some(secs(&v)?.max(1)),
+            "on_failure" => o.on_failure = Some(v),
+            _ => bail!("WITH ({k} …): retries, retry_delay, timeout or on_failure"),
+        }
+        if p.consume_token(&Token::RParen) {
+            return Ok(o);
+        }
+        p.expect_token(&Token::Comma)?;
+    }
+}
+
+/// `EXECUTE TASK name [(day => value, …)]`: its name and the values' SQL, if `sql` is one.
+pub fn execute_of(sql: &str) -> Option<(String, Vec<(String, String)>)> {
+    static HEAD: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?is)^\s*execute\s+task\b").expect("a regex"));
+    if !HEAD.is_match(crate::write::first_word(sql)) {
+        return None;
+    }
+    let mut p = Parser::new(&datafusion::sql::sqlparser::dialect::GenericDialect {}).try_with_sql(crate::write::first_word(sql)).ok()?;
+    p.next_token();
+    p.next_token();
+    let name = crate::write::object(&p.parse_object_name(false).ok()?);
+    let mut args = vec![];
+    if p.consume_token(&Token::LParen) && !p.consume_token(&Token::RParen) {
+        loop {
+            let k = p.parse_identifier().ok()?.value.to_lowercase();
+            let _ = p.consume_token(&Token::RArrow) || p.consume_token(&Token::Assignment) || p.consume_token(&Token::Eq);
+            args.push((k, p.parse_expr().ok()?.to_string()));
+            if p.consume_token(&Token::RParen) {
+                break;
+            }
+            p.expect_token(&Token::Comma).ok()?;
+        }
+    }
+    let _ = p.consume_token(&Token::SemiColon);
+    matches!(p.peek_token().token, Token::EOF).then_some((name, args))
+}
+
+/// `EXECUTE TASK name (…)`: its values worked out once, here, as the caller, then the leader
+/// claims a tick for it now (`Ddl::ExecuteTask`).
+pub async fn execute(app: &App, name: String, args: Vec<(String, String)>, who: Who) -> Result<Outcome> {
+    let mut params = HashMap::new();
+    if !args.is_empty() {
+        let select = args.iter().map(|(k, v)| format!("({v}) AS \"{k}\"")).collect::<Vec<_>>().join(", ");
+        let rows = Box::pin(app.query(&format!("SELECT {select}"), Some("0"))).await?;
+        let row = datafusion::arrow::compute::concat_batches(&rows[0].schema(), &rows)?;
+        params = crate::routines::values_of(&row)?;
+    }
+    let stmt = crate::write::Stmt::Ddl(vec![crate::ddl::Ddl::ExecuteTask { name, params }]);
+    app.auth.allows(who.role, &stmt)?;
+    Ok(Outcome::Done(crate::write::on_node_as(app, stmt, None, who.files).await?))
+}
+
+/// Leader: claim a tick now for `EXECUTE TASK` (the scheduler runs it, and what follows it).
+pub async fn execute_task(lake: &Lake, name: &str, params: HashMap<String, serde_json::Value>) -> Result<serde_json::Value> {
+    let name = crate::ddl::local(lake, name).with_context(|| format!("{name}: not this lake's"))?;
+    ensure!(lake.cat.get::<Task>(&task_key(&name)).await?.is_some(), "no task {name}");
+    let last = lake.cat.get::<Tick>(&tick_key(&name)).await?;
+    if let Some(t) = last.as_ref().filter(|t| !t.done) {
+        bail!("task {name} is running (run task-{name}-{}): EXECUTE TASK once it ends", t.at);
+    }
+    let at = now_ms().max(last.map_or(0, |t| t.at + 1));
+    lake.cat.commit(vec![(tick_key(&name), json(&Tick { at, params, ..Default::default() }))], &[]).await?;
+    WAKE.notify_one();
+    Ok(serde_json::json!({"task": name, "run": format!("task-{name}-{at}")}))
+}
+
+/// Leader: `ALTER TASK name SUSPEND | RESUME`.
+pub async fn alter_task(lake: &Lake, name: &str, suspended: bool) -> Result<serde_json::Value> {
+    let name = crate::ddl::local(lake, name).with_context(|| format!("{name}: not this lake's"))?;
+    let mut task = lake.cat.get::<Task>(&task_key(&name)).await?.with_context(|| format!("no task {name}"))?;
+    task.suspended = suspended;
+    lake.cat.commit(vec![(task_key(&name), json(&task))], &[]).await?;
+    Ok(serde_json::json!({"task": name, "state": if suspended { "suspended" } else { "started" }}))
+}
+
+/// The scheduled tasks a task's graph starts from, through what it follows; refused if it would
+/// follow itself, or what it follows starts from two (they would never run in one graph's run).
+fn roots(all: &HashMap<String, Task>, name: &str, task: &Task, seen: &mut Vec<String>) -> Result<HashSet<String>> {
+    if task.after.is_empty() {
+        return Ok(HashSet::from([name.to_string()]));
+    }
+    ensure!(!seen.iter().any(|s| s == name), "AFTER: {} would follow itself", seen.join(" → "));
+    seen.push(name.to_string());
+    let mut out = HashSet::new();
+    for a in &task.after {
+        let t = all.get(a).with_context(|| format!("AFTER {a}: no task {a}"))?;
+        out.extend(roots(all, a, t, seen)?);
+    }
+    seen.pop();
+    Ok(out)
 }
 
 /// Leader: keep a task (`ddl::apply`); its first tick is the first after now.
 pub async fn create_task(lake: &Lake, name: &str, mut task: Task, replace: bool) -> Result<serde_json::Value> {
     let name = crate::ddl::new_name(lake, name).await?;
     ensure!(replace || lake.cat.get::<Task>(&task_key(&name)).await?.is_none(), "task {name} already exists (CREATE OR REPLACE TASK)");
-    every(&task.schedule)?;
+    let mut all: HashMap<String, Task> = tasks(lake).await?.iter().cloned().collect();
+    for a in task.after.iter_mut() {
+        *a = crate::ddl::local(lake, a).with_context(|| format!("AFTER {a}: not this lake's"))?;
+    }
+    all.insert(name.clone(), task.clone());
+    let graphs = roots(&all, &name, &task, &mut vec![])?;
+    ensure!(graphs.len() == 1, "AFTER: those tasks start from {} different schedules, so they never run in one graph's run", graphs.len());
+    for (other, t) in all.iter().filter(|(n, t)| **n != name && t.after.contains(&name)) {
+        roots(&all, other, t, &mut vec![])?; // (replaced: what follows it still has one start, no loop)
+    }
     task.created_ms = now_ms();
     lake.cat.commit(vec![(task_key(&name), json(&task))], &[]).await?;
-    Ok(serde_json::json!({"task": name, "next": next_after(&every(&task.schedule)?, task.created_ms)}))
+    let next = every(&task.schedule).ok().filter(|_| task.after.is_empty()).map(|e| next_after(&e, task.created_ms));
+    Ok(serde_json::json!({"task": name, "next": next, "after": task.after}))
 }
 
 pub async fn drop_task(lake: &Lake, name: &str, if_exists: bool) -> Result<serde_json::Value> {
@@ -330,6 +553,9 @@ pub async fn drop_task(lake: &Lake, name: &str, if_exists: bool) -> Result<serde
     if lake.cat.get::<Task>(&task_key(&name)).await?.is_none() {
         ensure!(if_exists, "no task {name}");
         return Ok(serde_json::json!({"dropped": false}));
+    }
+    if let Some((f, _)) = tasks(lake).await?.iter().find(|(_, t)| t.after.contains(&name)) {
+        bail!("task {f} runs after {name}: drop {f} first, or make it again without it");
     }
     lake.cat.commit(vec![], &[task_key(&name), tick_key(&name)]).await?;
     Ok(serde_json::json!({"task": name, "dropped": true}))
@@ -352,13 +578,20 @@ async fn tasks(lake: &Lake) -> Result<Arc<Vec<(String, Task)>>> {
     Ok(all)
 }
 
+/// Wakes the scheduler at once: a task ended (what follows it may run), or `EXECUTE TASK` claimed
+/// a tick.
+static WAKE: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
 /// Leader: run the tasks as their ticks come, for as long as this node leads (a new leader is a
 /// new process). Nothing to do costs a look at the catalog's version twice a second.
 pub fn schedule(app: App) {
     crate::panics::spawn(async move {
         let running: Arc<Mutex<HashSet<String>>> = Default::default();
         loop {
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+                _ = WAKE.notified() => {}
+            }
             let Ok(all) = tasks(&app.lake).await else { continue };
             for (name, task) in all.iter() {
                 if running.lock().unwrap().contains(name) {
@@ -375,39 +608,138 @@ pub fn schedule(app: App) {
                 running.lock().unwrap().insert(name.clone());
                 let (app, name, task, running) = (app.clone(), name.clone(), task.clone(), running.clone());
                 tokio::spawn(async move {
-                    let job = format!("task:{name}:{tick}");
-                    let who = Who { role: Role::Admin, files: false, depth: 0 };
-                    let none = RecordBatch::new_empty(Arc::new(datafusion::arrow::datatypes::Schema::empty()));
-                    let id = format!("task-{name}-{tick}"); // (a tick run again after a failover is the same run: its row, ended)
-                    let run = CALLER.sync_scope("schedule".into(), || Run::start(&app, &name, Role::Admin, Some(&job), &none, Some(id)));
-                    let (params, views) = (HashMap::new(), HashMap::new());
-                    let script = crate::routines::script(&app, &task.sql, &params, &views, who, Some(job));
-                    let (out, heard) = crate::routines::with_notices(CALLER.scope(format!("task:{name}"), script)).await;
-                    if let Err(e) = &out {
-                        eprintln!("task {name}, tick {tick}: {e:#}");
-                    }
-                    let _ = tokio::time::timeout(Duration::from_secs(60), run.end(&app, &out, heard)).await; // (in the log before the tick is done)
-                    let done = json(&Tick { at: tick, done: true });
-                    if let Err(e) = app.lake.cat.commit(vec![(tick_key(&name), done)], &[]).await {
-                        eprintln!("task {name}: tick {tick} ran, and couldn't be marked done ({e:#}): a new leader runs it again, with the same job");
-                    }
+                    run_tick(&app, &name, &task, tick).await;
                     running.lock().unwrap().remove(&name);
+                    WAKE.notify_one(); // (what follows it)
                 });
             }
         }
     });
 }
 
-/// The tick to run now, claimed (committed before it runs), if one is due: one a leader claimed
-/// and didn't finish, or the latest that has come since the last.
-async fn due(lake: &Lake, name: &str, task: &Task) -> Result<Option<u64>> {
-    let last = lake.cat.get::<Tick>(&tick_key(name)).await?;
-    if let Some(t) = last.filter(|t| !t.done) {
-        return Ok(Some(t.at)); // (again, with its job: what it wrote lands once)
+/// Run a task's tick: `WHEN`, then what it runs, with its graph's values and the results of the
+/// tasks before it, tried again as `retries` says (the same job: what a try wrote lands once), each
+/// try within `timeout`; then its line in the run log, then the tick marked done, with how it went.
+async fn run_tick(app: &App, name: &str, task: &Task, tick: Tick) {
+    let job = format!("task:{name}:{}", tick.at);
+    let who = Who { role: Role::Admin, files: false, depth: 0 };
+    let none = RecordBatch::new_empty(Arc::new(datafusion::arrow::datatypes::Schema::empty()));
+    let id = format!("task-{name}-{}", tick.at); // (a tick run again after a failover is the same run: its row, ended)
+    let run = CALLER.sync_scope("schedule".into(), || Run::start(app, name, Role::Admin, Some(&job), &none, Some(id)));
+    let (views, caller, mut heard) = (HashMap::new(), format!("task:{name}"), vec![]);
+    let skip = match &task.when {
+        None => Ok(false),
+        Some(cond) => {
+            let check = format!("SELECT 1 AS t WHERE ({})", results(&app.lake, cond, tick.at).await);
+            let (out, said) = crate::routines::with_notices(CALLER.scope(caller.clone(), crate::routines::script(app, &check, &tick.params, &views, who, None))).await;
+            heard.extend(said);
+            out.map(|o| !matches!(o, Outcome::Rows(b) if b.iter().any(|b| b.num_rows() > 0))).map_err(|e| e.context("WHEN"))
+        }
+    };
+    let out = match skip {
+        Ok(true) => Ok(None),
+        Err(e) => Err(e),
+        Ok(false) => {
+            let sql = results(&app.lake, &task.sql, tick.at).await;
+            let mut tries = 0;
+            loop {
+                let go = CALLER.scope(caller.clone(), crate::routines::script(app, &sql, &tick.params, &views, who, Some(job.clone())));
+                let (out, said) = crate::routines::with_notices(async {
+                    match task.with.timeout {
+                        Some(s) => tokio::time::timeout(Duration::from_secs(s), go).await.unwrap_or_else(|_| Err(anyhow::anyhow!("timed out after {s} s"))),
+                        None => go.await,
+                    }
+                })
+                .await;
+                heard.extend(said);
+                match out {
+                    Err(e) if tries < task.with.retries => {
+                        tries += 1;
+                        let wait = task.with.retry_delay.unwrap_or(10);
+                        heard.push(format!("try {tries} failed ({e:#}); again in {wait} s"));
+                        tokio::time::sleep(Duration::from_secs(wait)).await;
+                    }
+                    other => break other.map(Some),
+                }
+            }
+        }
+    };
+    if let Err(e) = &out {
+        eprintln!("task {name}, tick {}: {e:#}", tick.at);
+        if let Some(p) = &task.with.on_failure {
+            let call = format!("CALL {p}('{}', '{}')", name.replace('\'', "''"), format!("{e:#}").replace('\'', "''"));
+            let (said, more) = crate::routines::with_notices(CALLER.scope(caller.clone(), crate::routines::script(app, &call, &HashMap::new(), &views, who, None))).await;
+            heard.extend(more);
+            if let Err(f) = said {
+                heard.push(format!("on_failure {p}: {f:#}"));
+            }
+        }
     }
-    let after = last.map_or(task.created_ms, |t| t.at.max(task.created_ms));
-    let Some(tick) = latest(&every(&task.schedule)?, after, now_ms()) else { return Ok(None) };
-    lake.cat.commit(vec![(tick_key(name), json(&Tick { at: tick, done: false }))], &[]).await?;
+    let (status, result) = match &out {
+        Ok(None) => ("skipped", None),
+        Ok(Some(Outcome::Rows(b))) => ("ok", b.iter().find(|b| b.num_rows() > 0 && b.num_columns() > 0).and_then(|b| crate::vars::of_column(b.column(0).slice(0, 1).as_ref()).ok()).map(|v| v.sql)),
+        Ok(Some(_)) => ("ok", None),
+        Err(_) => ("failed", None),
+    };
+    let error = out.as_ref().err().map(|e| format!("{e:#}"));
+    let _ = tokio::time::timeout(Duration::from_secs(60), run.ended(app, status, error, heard)).await; // (in the log before the tick is done)
+    let done = json(&Tick { at: tick.at, done: true, status: Some(status.into()), result, params: tick.params });
+    if let Err(e) = app.lake.cat.commit(vec![(tick_key(name), done)], &[]).await {
+        eprintln!("task {name}: tick {} ran, and couldn't be marked done ({e:#}): a new leader runs it again, with the same job", tick.at);
+    }
+}
+
+/// `pondra.result('t')` in a task's SQL: what task `t` gave in the same run of the graph (NULL if
+/// it gave nothing, or hasn't run in it), put in as its value.
+async fn results(lake: &Lake, sql: &str, at: u64) -> String {
+    static RESULT: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?i)\bpondra\.result\s*\(\s*'((?:[^']|'')*)'\s*\)").expect("a regex"));
+    let (mut out, mut from) = (String::new(), 0);
+    for c in RESULT.captures_iter(sql) {
+        let m = c.get(0).expect("a match");
+        let name = c[1].replace("''", "'");
+        let name = crate::ddl::local(lake, &name).unwrap_or(name);
+        let tick = lake.cat.get::<Tick>(&tick_key(&name)).await.ok().flatten();
+        let value = tick.filter(|t| t.at == at && t.done).and_then(|t| t.result).unwrap_or_else(|| "NULL".into());
+        out.push_str(&sql[from..m.start()]);
+        out.push_str(&format!("({value})"));
+        from = m.end();
+    }
+    out.push_str(&sql[from..]);
+    out
+}
+
+/// The tick to run now, claimed (committed before it runs), if one is due: one claimed and not
+/// finished (a leader died in it, or `EXECUTE TASK` claimed it); for a scheduled task, the latest
+/// that has come since the last; for one that follows others, the latest run of their graph that
+/// every one of them ended well in, and it hasn't run in.
+async fn due(lake: &Lake, name: &str, task: &Task) -> Result<Option<Tick>> {
+    let last = lake.cat.get::<Tick>(&tick_key(name)).await?;
+    if let Some(t) = last.as_ref().filter(|t| !t.done) {
+        return Ok(Some(t.clone())); // (again, with its job: what it wrote lands once)
+    }
+    if task.suspended {
+        return Ok(None);
+    }
+    let tick = match task.after.is_empty() {
+        true => {
+            let after = last.as_ref().map_or(task.created_ms, |t| t.at.max(task.created_ms));
+            let Some(at) = latest(&every(&task.schedule)?, after, now_ms()) else { return Ok(None) };
+            Tick { at, ..Default::default() }
+        }
+        false => {
+            let mut before: Option<Tick> = None;
+            for a in &task.after {
+                let Some(t) = lake.cat.get::<Tick>(&tick_key(a)).await?.filter(Tick::passed) else { return Ok(None) };
+                match &before {
+                    Some(b) if b.at != t.at => return Ok(None), // (they are in different runs of the graph yet)
+                    _ => before = Some(t),
+                }
+            }
+            let Some(b) = before.filter(|b| b.at > task.created_ms && last.as_ref().is_none_or(|l| l.at < b.at)) else { return Ok(None) };
+            Tick { at: b.at, params: b.params, ..Default::default() }
+        }
+    };
+    lake.cat.commit(vec![(tick_key(name), json(&tick))], &[]).await?;
     Ok(Some(tick))
 }
 
@@ -597,12 +929,18 @@ pub async fn tables(lake: &Lake) -> Result<Vec<(&'static str, Arc<dyn datafusion
     }
     let t = |f: &dyn Fn(usize, &(String, Task)) -> Option<String>| Arc::new(all.iter().enumerate().map(|(i, x)| f(i, x)).collect::<StringArray>()) as ArrayRef;
     let at = |f: &dyn Fn(usize, &Task) -> Option<u64>| Arc::new(all.iter().enumerate().map(|(i, (_, x))| f(i, x).map(|ms| ms as i64 * 1000)).collect::<TimestampMicrosecondArray>().with_timezone("UTC")) as ArrayRef;
-    let next = |i: usize, x: &Task| every(&x.schedule).ok().map(|e| next_after(&e, ticks[i].map_or(x.created_ms, |t| t.at.max(x.created_ms)).max(now_ms().saturating_sub(1))));
+    let next = |i: usize, x: &Task| every(&x.schedule).ok().filter(|_| x.after.is_empty() && !x.suspended).map(|e| next_after(&e, ticks[i].as_ref().map_or(x.created_ms, |t| t.at.max(x.created_ms)).max(now_ms().saturating_sub(1))));
     let tasks = RecordBatch::try_from_iter(vec![
         ("name", t(&|_, (n, _)| Some(n.clone()))),
-        ("schedule", t(&|_, (_, x)| Some(x.schedule.clone()))),
+        ("schedule", t(&|_, (_, x)| Some(x.schedule.clone()).filter(|s| !s.is_empty()))),
+        ("after", t(&|_, (_, x)| Some(x.after.join(", ")).filter(|s| !s.is_empty()))),
+        ("when", t(&|_, (_, x)| x.when.clone())),
         ("statement", t(&|_, (_, x)| Some(x.sql.clone()))),
-        ("last_tick", at(&|i, _| ticks[i].map(|t| t.at))),
+        ("options", t(&|_, (_, x)| (!x.with.plain()).then(|| serde_json::to_string(&x.with).unwrap_or_default()))),
+        ("state", t(&|_, (_, x)| Some(if x.suspended { "suspended" } else { "started" }.into()))),
+        ("last_tick", at(&|i, _| ticks[i].as_ref().map(|t| t.at))),
+        ("last_status", t(&|i, _| ticks[i].as_ref().map(|t| if t.done { t.status.clone().unwrap_or_else(|| "ok".into()) } else { "running".into() }))),
+        ("last_result", t(&|i, _| ticks[i].as_ref().and_then(|t| t.result.clone()))),
         ("next_tick", at(&|i, x| next(i, x))),
     ])?;
     let mem = |b: RecordBatch| -> Result<Arc<dyn datafusion::catalog::TableProvider>> { Ok(Arc::new(MemTable::try_new(b.schema(), vec![vec![b]])?)) };
@@ -646,4 +984,26 @@ pub async fn tables(lake: &Lake) -> Result<Vec<(&'static str, Arc<dyn datafusion
 pub fn no_runs() -> Result<Arc<dyn datafusion::catalog::TableProvider>> {
     let schema = crate::query::read_schema(&columns().into_iter().filter(|(c, _)| c != "_deleted").collect::<Vec<_>>())?;
     Ok(Arc::new(datafusion::datasource::MemTable::try_new(schema, vec![vec![]])?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn execute_task() {
+        assert_eq!(execute_of("EXECUTE TASK nightly"), Some(("nightly".into(), vec![])));
+        assert_eq!(execute_of("execute task etl.nightly (day => DATE '2026-09-01', n = 2);"), Some(("etl.nightly".into(), vec![("day".into(), "DATE '2026-09-01'".into()), ("n".into(), "2".into())])));
+        assert_eq!(execute_of("EXECUTE q(1)"), None); // (a prepared statement's)
+        assert_eq!(execute_of("EXECUTE TASK t; SELECT 1"), None);
+    }
+
+    #[test]
+    fn options() {
+        let opts = |sql: &str| task_options(&mut Parser::new(&datafusion::sql::sqlparser::dialect::GenericDialect {}).try_with_sql(sql).unwrap());
+        let o = opts("(retries = 2, retry_delay = '1 minute', timeout = 90, on_failure = notify)").unwrap();
+        assert_eq!((o.retries, o.retry_delay, o.timeout, o.on_failure.as_deref()), (2, Some(60), Some(90), Some("notify")));
+        assert!(opts("(tries = 2)").unwrap_err().to_string().contains("retries, retry_delay"));
+        assert!(opts("(timeout = 'cron 0 2 * * *')").unwrap_err().to_string().contains("how long"));
+    }
 }
