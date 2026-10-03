@@ -211,6 +211,7 @@ pub enum Ddl {
     Unless { name: String, kind: String, then: Box<Ddl> }, // CREATE … IF NOT EXISTS: nothing if a `kind` ("relation", "routine", "task") of that name is there
     Replacing { name: String, then: Box<Ddl> },              // CREATE OR REPLACE MATERIALIZED VIEW: the old one dropped first (refused while another follows it)
     DetachView { name: String },                             // ALTER MATERIALIZED VIEW v DETACH: its rows stop following, and stay a table
+    Object(crate::objects::Op),                              // the registry's: COMMENT ON, CREATE OR ALTER TABLE (`objects.rs`)
 }
 
 /// What `ALTER TABLE` does to a column: rename it, drop it, or widen its type (a SQL type).
@@ -222,8 +223,18 @@ pub enum Change {
     Type(String),
 }
 
-/// Leader: carry one out (under the lake's lock).
+/// Leader: carry one out (under the lake's lock). Comments follow what it renames, and go with
+/// what it drops (`objects::follow`).
 pub async fn apply(lake: &Lake, d: Ddl) -> Result<Value> {
+    let moves = crate::objects::moves(&d);
+    let out = carry_out(lake, d).await?;
+    if moves {
+        crate::objects::follow(lake, &out).await?;
+    }
+    Ok(out)
+}
+
+async fn carry_out(lake: &Lake, d: Ddl) -> Result<Value> {
     // (this lake's own three-part names, as dbt writes them: `"lake"."schema"."t"` is `schema.t`)
     let here = |n: String| match n.split('.').collect::<Vec<_>>()[..] {
         [l, s, t] if l == lake_name(lake) => join(s, t),
@@ -266,6 +277,7 @@ pub async fn apply(lake: &Lake, d: Ddl) -> Result<Value> {
             Box::pin(apply(lake, *then)).await
         }
         Ddl::DetachView { name } => detach_view(lake, &new_name(lake, &name).await?).await,
+        Ddl::Object(op) => crate::objects::apply(lake, op).await,
         Ddl::CreateSchema { name, if_not_exists } => {
             check(&name)?;
             if has_schema(lake, &name).await? {

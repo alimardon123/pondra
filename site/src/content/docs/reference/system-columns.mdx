@@ -1,6 +1,6 @@
 ---
 title: System columns and tables
-description: The columns every row has, the change feed's change types, and the pondra.runs, pondra.routines, pondra.tasks, pondra.tables, pondra.dropped, pondra.flows and pondra.expectations tables.
+description: The columns every row has, the change feed's change types, and the pondra.runs, pondra.routines, pondra.tasks, pondra.tables, pondra.objects, pondra.kinds, pondra.dropped, pondra.flows and pondra.expectations tables.
 sidebar:
   order: 16
 ---
@@ -231,6 +231,32 @@ SELECT name, kind, key FROM pondra.tables WHERE name IN ('sold', 'sold_by_item',
 
 ```sql
 SHOW MATERIALIZED VIEWS LIKE 'sold%';
+```
+
+## Every object
+
+`pondra.objects` lists every object of this lake and the lakes attached to it, of every kind:
+schemas, tables, views, materialized views, external tables, functions, macros, table functions,
+procedures, tasks, secrets, users, roles and the lakes attached. A user given grants sees the
+tables and views they may read, and no secrets, users or roles.
+
+| Column | Meaning |
+|---|---|
+| `kind` | `schema`, `table`, `view`, `materialized view`, `external table`, `function`, `macro`, `table function`, `procedure`, `task`, `secret`, `user`, `role` or `database` |
+| `lake` | the lake it is in |
+| `schema` | its schema, or null for a kind that has none (a schema, a user, a role, a lake) |
+| `name` | its name |
+| `comment` | what [`COMMENT ON`](/pondra/reference/sql/#every-kind-of-object) said about it, or null |
+| `definition` | the statement that makes it again, as `SHOW CREATE` gives it without the comments; null for what is never shown (a secret's values, a user's password) |
+
+`pondra.kinds` lists the kinds: `kind`, `family` (kinds of one family share their names: a table and
+a view can't both be `orders`) and `statements`, the statements the kind takes.
+
+```sql
+CREATE TABLE shelf (sku VARCHAR, qty BIGINT);
+COMMENT ON TABLE shelf IS 'one row a shelf';
+SELECT kind, name, comment, definition FROM pondra.objects WHERE name = 'shelf';
+SELECT kind, statements FROM pondra.kinds WHERE kind IN ('table', 'task');
 ```
 
 ## Dropped tables

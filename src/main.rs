@@ -44,6 +44,7 @@ mod dbserver;
 mod drain;
 mod log;
 mod manifest;
+mod objects;
 mod metrics;
 mod optimize;
 mod pages;

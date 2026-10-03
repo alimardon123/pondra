@@ -671,6 +671,9 @@ async fn expand_with(lake: &Lake, sql: &str, views: &HashMap<String, String>) ->
     if let Some(q) = show(sql) {
         return Ok(q);
     }
+    if let Some(q) = crate::objects::show_create(lake, sql).await? {
+        return Ok(q); // (`SHOW CREATE TABLE t`: the statements that make it again)
+    }
     let sql = &crate::past::restore(lake, sql).await?.unwrap_or_else(|| sql.to_string()); // (`RESTORE TABLE t TO VERSION AS OF n`: a MERGE, ADR-043)
     let sql = &crate::sparksql::inline(sql)?; // (`spark_sql('…')`: Spark SQL as Pondra's, then expanded as any)
     let sql = &crate::past::syntax(sql).into_owned(); // (`t AT (VERSION => n)`: a table as it was, ADR-043)
