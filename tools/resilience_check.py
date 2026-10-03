@@ -252,8 +252,22 @@ class Bucketed:
         check("no read was torn or went back in time, through every fault", not bad, bad[:6])
         load.exactly_once("after every fault")
         check("every node is still running (or restarted itself)", all(nd.alive() for nd in nodes), [nd.log for nd in nodes if not nd.alive()])
-        drained = until(lambda: (st := stats(one_leader(nodes))) and st.get("untiered_rows") == 0, 90)
-        check("the log drains into files once the bucket is well", drained, stats(one_leader(nodes) or nodes[0]))
+        t0, left = time.time(), []  # (how the log drained: seconds, rows still in it)
+
+        def drained():
+            st = stats(one_leader(nodes))
+            n = st and st.get("untiered_rows")
+            if n is not None and (not left or left[-1][1] != n):
+                left.append((round(time.time() - t0, 1), n))
+            return n == 0
+        # A tiering job that began while the bucket failed may still be retrying a request: the
+        # store retries one for up to 180 s (object_store's retry_timeout), and a PUT whose reply
+        # was lost then fails as "already exists", so the round runs again. 90 s failed now and
+        # then (the leader's log: a job's PUT failing after 120-170 s); a log that stops draining
+        # stays undrained however long we wait.
+        ok = until(drained, 240)
+        info["the log after the faults (s, rows still in it)"] = left[:3] + ["…"] + left[-6:] if len(left) > 10 else left
+        check("the log drains into files once the bucket is well", ok, stats(one_leader(nodes) or nodes[0]))
 
     def close(self):
         self.timeline.stop.set()
