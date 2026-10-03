@@ -15,6 +15,7 @@ mod codes;
 mod copy;
 mod guard;
 mod hilbert;
+mod history;
 mod ddl;
 mod defaults;
 mod delta;

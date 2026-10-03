@@ -204,6 +204,7 @@ pub enum Ddl {
     DropTask { name: String, if_exists: bool },
     RunLog, // the run log's table (`pondra.runs`), made when a node first has a line for it
     AuditLog, // the audit log's (`pondra.audit`), the same way (`audit.rs`)
+    HistoryLog, // the query history's (`pondra.history`, `history.rs`)
     Users(crate::users::Change), // CREATE USER and ROLE, GRANT, REVOKE, CREATE TOKEN (ADR-035: `users.rs`)
     Unless { name: String, kind: String, then: Box<Ddl> }, // CREATE … IF NOT EXISTS: nothing if a `kind` ("relation", "routine", "task") of that name is there
     Replacing { name: String, then: Box<Ddl> },              // CREATE OR REPLACE MATERIALIZED VIEW: the old one dropped first (refused while another follows it)
@@ -372,6 +373,7 @@ pub async fn apply(lake: &Lake, d: Ddl) -> Result<Value> {
         Ddl::DropTask { name, if_exists } => crate::runs::drop_task(lake, &name, if_exists).await,
         Ddl::RunLog => crate::runs::create_log(lake).await,
         Ddl::AuditLog => crate::audit::create_log(lake).await,
+        Ddl::HistoryLog => crate::history::create_log(lake).await,
         Ddl::Users(c) => crate::users::apply(lake, c).await,
         Ddl::AttachOutside { name, url, kind, options } => {
             ensure!(!has_schema(lake, &name).await?, "a schema here is called {name}: attach under another name");

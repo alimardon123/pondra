@@ -793,6 +793,14 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
             };
             system.register_table("audit".into(), audit)?;
         }
+        if text.to_lowercase().contains("pondra.history") {
+            // (every statement's row: an admin's all, anyone else's their own: `history.rs`)
+            let history = match lake.cat.get::<TableMeta>(&crate::store::table_key(crate::history::TABLE)).await? {
+                Some(meta) => named(&ctx, table_view(lake, &ctx, crate::history::TABLE, &sys(meta.clone()), upto).await?, &meta, false)?,
+                None => crate::history::empty()?,
+            };
+            system.register_table("history".into(), crate::history::visible(&ctx, history)?)?;
+        }
         if text.to_lowercase().contains("pondra.flows") || text.to_lowercase().contains("pondra.expectations") {
             // (a materialized view's flow and its expectations: `views::system`)
             let counts = match lake.cat.get::<TableMeta>(&crate::store::table_key(crate::views::EXPECTED)).await? {
