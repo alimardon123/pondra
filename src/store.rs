@@ -572,6 +572,7 @@ impl Lake {
 
     pub async fn open(url: &str, writer: bool, streamed: bool) -> Result<Arc<Lake>> {
         let (url, store, bucket) = open_store(url)?;
+        let local = bucket.is_none();
         let pool = Arc::new(datafusion::execution::memory_pool::FairSpillPool::new(memory_limit()));
         // (spills go to the OS temp dir; no listing kept past its statement: DataFusion's own
         // cache of them would hide a file added to a folder outside the lake, ADR-026)
@@ -590,7 +591,7 @@ impl Lake {
         let cache = disk.as_ref().map(|d| d.dir.with_extension("catalog"));
         let cache = ObjectStoreCacheOptions { root_folder: cache, max_cache_size_bytes: Some(2 << 30), cache_on_flush: true, cache_on_compaction: true, ..Default::default() };
         let cat = match writer {
-            true => Catalog::writer(store.clone(), cache).await?,
+            true => Catalog::writer(store.clone(), cache, local).await?,
             false => match Catalog::opened(store.clone(), streamed, cache).await {
                 Ok(cat) => cat,
                 // (no catalog at all: say so, rather than the database's own words for it)
@@ -1200,9 +1201,12 @@ pub fn serving() { SERVING.send_replace(true); }
 /// The catalog's compactor and garbage collector, as SlateDB runs them beside a writer, started
 /// once the node serves (or after 10 s: a `pondra sql` writer never does), so a cold start waits
 /// for neither (C5). A failure in either stops the node, as one in the writer would.
-fn upkeep(store: Store, compactor: CompactorOptions, gc: GarbageCollectorOptions) {
+fn upkeep(store: Store, compactor: CompactorOptions, gc: GarbageCollectorOptions, local: bool) {
     crate::panics::spawn(async move {
         let _ = tokio::time::timeout(Duration::from_secs(10), SERVING.subscribe().wait_for(|s| *s)).await;
+        if local {
+            tokio::spawn(unpin(store.clone()));
+        }
         let compactor = slatedb::CompactorBuilder::new("catalog", store.clone()).with_options(compactor).build();
         let gc = slatedb::GarbageCollectorBuilder::new("catalog", store).with_options(gc).build();
         let (a, b) = tokio::join!(compactor.run(), gc.run());
@@ -1213,24 +1217,50 @@ fn upkeep(store: Store, compactor: CompactorOptions, gc: GarbageCollectorOptions
     });
 }
 
+/// SlateDB's compactor pins the files each compaction replaces with a checkpoint for 15 minutes
+/// (for a scan still reading them), whatever the collector is told: under a stream of small
+/// commits that is a GB of a local disk, and a small disk it filled stayed full that long. On a
+/// local disk every node polls its view every 250 ms and a scan takes far less than a minute, so
+/// such a checkpoint (unnamed, 15 minutes) goes a minute on; the collector then takes its files.
+async fn unpin(store: Store) {
+    let admin = slatedb::admin::Admin::builder("catalog", store).build();
+    loop {
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        let Ok(checkpoints) = admin.list_checkpoints(None).await else { continue };
+        let now = chrono::Utc::now();
+        for c in checkpoints {
+            let compactor = c.name.is_none() && c.expire_time.is_some_and(|e| e - c.create_time >= chrono::Duration::minutes(15));
+            if compactor && now - c.create_time > chrono::Duration::minutes(1) {
+                let _ = admin.delete_checkpoint(c.id).await;
+            }
+        }
+    }
+}
+
 impl Catalog {
-    async fn writer(store: Store, object_store_cache_options: ObjectStoreCacheOptions) -> Result<Self> {
+    async fn writer(store: Store, object_store_cache_options: ObjectStoreCacheOptions, local: bool) -> Result<Self> {
         // Poll object storage rarely when idle (that's an idle writer's request bill), but often
         // enough that compaction keeps up with the checkpoints.
         let compactor_options = Some(CompactorOptions { poll_interval: Duration::from_secs(5), ..Default::default() });
         // Every commit is a write-ahead-log object: clear those (and old manifests) every minute
         // once a minute old, not SlateDB's every 10 minutes — thousands would sit in the bucket.
         // (What a reader's checkpoint still needs stays.)
-        let every = |secs: u64| Some(GarbageCollectorDirectoryOptions { interval: Some(Duration::from_secs(secs)), min_age: Duration::from_secs(secs), dry_run: false });
-        let secs = std::env::var("PONDRA_GC_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(60);
-        let garbage_collector_options = Some(GarbageCollectorOptions { wal_options: every(secs), manifest_options: every(secs), ..Default::default() });
+        // On a local disk, where listing costs nothing, the WAL goes every 5 s and the compactor's
+        // replaced files a minute on, not five: a minute of WAL is a file per commit (100 MB at 400
+        // commits a second), and a disk they filled had no room to flush the catalog, so nothing
+        // could ever clear it. (A follower reads the files of a manifest it polled 250 ms ago.)
+        let every = |interval: u64, min_age: u64| Some(GarbageCollectorDirectoryOptions { interval: Some(Duration::from_secs(interval)), min_age: Duration::from_secs(min_age), dry_run: false });
+        let gc = std::env::var("PONDRA_GC_SECS").ok().and_then(|v| v.parse().ok());
+        let (wal, secs) = (gc.unwrap_or(if local { 5 } else { 60 }), gc.unwrap_or(60));
+        let compacted = if local { every(10, 60) } else { GarbageCollectorOptions::default().compacted_options };
+        let garbage_collector_options = Some(GarbageCollectorOptions { wal_options: every(wal, wal), manifest_options: every(secs, secs), compacted_options: compacted, ..Default::default() });
         // (the compactor and the garbage collector start once the node serves: their first reads
         // were most of a cold start's, C5; `upkeep`)
         let settings = Settings { garbage_collector_options: None, flush_interval: Some(Duration::from_millis(1)), manifest_poll_interval: Duration::from_secs(10), l0_sst_size_bytes: 16 << 20, l0_max_ssts: 64, l0_max_ssts_per_key: 32, max_unflushed_bytes: 64 << 20, compactor_options: None, object_store_cache_options, ..Default::default() };
         let t0 = std::time::Instant::now();
         let mut cat = Self::new(Db_::Writer(Db::builder("catalog", store.clone()).with_settings(settings).build().await?));
         trace("the catalog's writer open", t0);
-        upkeep(store, compactor_options.unwrap_or_default(), garbage_collector_options.unwrap_or_default());
+        upkeep(store, compactor_options.unwrap_or_default(), garbage_collector_options.unwrap_or_default(), local);
         cat.replicas = std::env::var("PONDRA_REPLICAS").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
         cat.last_n.store(cat.get::<u64>("n").await?.unwrap_or(1), Relaxed);
         let c = cat.get::<u64>("c").await?.unwrap_or(0);
