@@ -345,12 +345,13 @@ SELECT * FROM secrets();
 
 `CALL p(args)` waits for the procedure to finish. `pondra.start` returns at once with an id you
 can find in `pondra.runs` (see [system columns](/pondra/reference/system-columns/)). Add `AS name`
-to name the column.
+to name the column. As a statement, `START CALL p(args)` does the same.
 
 ```sql
 CREATE TABLE stamps (n BIGINT);
 CREATE PROCEDURE stamp() LANGUAGE sql AS $$ INSERT INTO stamps VALUES (1); $$;
 SELECT pondra.start('stamp') AS run_id;
+START CALL stamp();
 ```
 
 Code inside a Python function or procedure has more: `pondra.sql`, `pondra.call` and

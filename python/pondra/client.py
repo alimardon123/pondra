@@ -458,6 +458,37 @@ class Pondra:
             return f
         return make(fn) if fn else make
 
+    def task(self, name=None, sql=None, *, schedule=None, after=None, when=None, retries=None, retry_delay=None, timeout=None, on_failure=None, replace=True):
+        """`CREATE TASK`: `sql` (a statement, a script, `CALL p(…)`) run on a `schedule` (`"5 minutes"`,
+        `"cron 0 2 * * * UTC"`), or `after` other tasks (a name or a list) once they ended well in the
+        same run of their graph, if `when` (a SQL condition) holds. `retries`, `retry_delay`, `timeout`
+        and `on_failure` (a procedure called with the task's name and its error) are its options. As a
+        decorator (`@db.task(schedule="1 hour")`) the function becomes a procedure, which the task
+        calls; it is handed back as it was."""
+        if callable(name):
+            raise TypeError("a task runs on a schedule or after others: @db.task(schedule='1 hour') or @db.task(after='load')")
+        if sql is None:
+            def make(f):
+                called = name or f.__name__
+                self.procedure(f, name=called, replace=replace)
+                self.task(called, f"CALL {called}()", schedule=schedule, after=after, when=when, retries=retries, retry_delay=retry_delay,
+                          timeout=timeout, on_failure=on_failure, replace=replace)
+                return f
+            return make
+        if (schedule is None) == (after is None):
+            raise TypeError("a task takes schedule= or after=, one of them")
+        follows = [after] if isinstance(after, str) else list(after or [])
+        how = f"SCHEDULE {_literal(schedule)}" if schedule is not None else "AFTER " + ", ".join(follows)
+        options = _with({"retries": retries, "retry_delay": retry_delay, "timeout": timeout, "on_failure": on_failure})
+        return self._run(f"CREATE {'OR REPLACE ' if replace else ''}TASK {name} {how}{f' WHEN {when}' if when else ''}{options} AS {sql}")
+
+    def execute_task(self, name, **values):
+        """`EXECUTE TASK name (k => v, …)`: its graph runs now, on the leader, each task with these
+        values for its `$k`s. A `Run` of the task itself (`.wait()`); each task after it is a row of
+        `pondra.runs` too, named `task-<name>-<tick>`."""
+        given = ", ".join(f"{_quote(k)} => {_literal(v)}" for k, v in values.items())
+        return Run(self, self._run(f"EXECUTE TASK {name}{f' ({given})' if given else ''}")["run"])
+
     def routines(self):
         """This lake's functions and procedures (SQL has them as `pondra.routines`)."""
         return json.loads(self._call("GET", "/routines"))

@@ -71,13 +71,14 @@ impl Change {
     }
 }
 
-/// `DECLARE [PARAMETER] $name [type] [= | DEFAULT value]`, `$name = value`, DuckDB's `SET VARIABLE name =
-/// value` and `RESET VARIABLE name`: what `sql` does to a variable, if it is one of them.
+/// `DECLARE [PARAMETER] $name [type] [= | := | DEFAULT value]`, `$name = value` (or `:=`, or `SET $name =`),
+/// DuckDB's `SET VARIABLE name = value` and `RESET [VARIABLE] $name`: what `sql` does to a variable, if it
+/// is one of them. `SET name` without the `$` is a session setting.
 pub fn change(sql: &str) -> Option<Change> {
     static DECLARE: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?is)^declare\s+(parameter\s+)?\$([a-z_]\w*)\b\s*(.*?)\s*;?\s*$").expect("a regex"));
-    static TYPED: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?is)^(.*?)\s*(?:=|\bdefault\b)\s*(.*)$").expect("a regex"));
-    static SET: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?is)^(?:\$|set\s+variable\s+)([a-z_]\w*)\s*(?:=|\bto\b)\s*(.*?)\s*;?\s*$").expect("a regex"));
-    static RESET: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?is)^reset\s+variable\s+([a-z_]\w*)\s*;?\s*$").expect("a regex"));
+    static TYPED: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?is)^(.*?)\s*(?::=|=|\bdefault\b)\s*(.*)$").expect("a regex"));
+    static SET: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?is)^(?:\$|set\s+\$|set\s+variable\s+\$?)([a-z_]\w*)\s*(?::=|=|\bto\b)\s*(.*?)\s*;?\s*$").expect("a regex"));
+    static RESET: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?is)^reset\s+(?:\$|variable\s+\$?)([a-z_]\w*)\s*;?\s*$").expect("a regex"));
     let s = crate::write::first_word(sql);
     if !s.starts_with(['$', 'd', 'D', 's', 'S', 'r', 'R']) {
         return None;
@@ -535,5 +536,20 @@ mod tests {
         let p = super::parameters("BEGIN\n  DECLARE PARAMETER $day DATE = DATE '2026-09-01';\n  DECLARE $n = 1;\n  SELECT $day, $n, $region;\nEND;");
         let named: Vec<_> = p.iter().map(|p| (p.name.as_str(), p.default.as_deref(), p.required)).collect();
         assert_eq!(named, [("day", Some("DATE '2026-09-01'"), false), ("region", None, true)]);
+    }
+
+    #[test]
+    fn every_way_to_set_one() {
+        use super::{change, Change};
+        let set = |s: &str| match change(s) {
+            Some(Change::Set { name, value }) => Some((name, value)),
+            _ => None,
+        };
+        for s in ["$x = 2", "$x := 2", "SET $x = 2", "set $x to 2", "SET VARIABLE x = 2", "SET VARIABLE $x = 2"] {
+            assert_eq!(set(s), Some(("x".into(), "2".into())), "{s}");
+        }
+        assert!(change("SET x = 2").is_none()); // (a session setting)
+        assert!(matches!(change("RESET $x"), Some(Change::Reset(n)) if n == "x"));
+        assert!(matches!(change("DECLARE $x INT := 1"), Some(Change::Declare { ty: Some(t), default: Some(d), .. }) if t == "INT" && d == "1"));
     }
 }

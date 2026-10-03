@@ -497,6 +497,7 @@ fn session_command(sql: &str) -> Option<Response> {
         Some(Response::Query(QueryResponse::new(field, stream::iter([Ok(row.take_row())]))))
     };
     match first.as_str() {
+        "START" if crate::routines::start_of(sql).is_some() => None, // (`START CALL p(…)`: a run started)
         "SET" | "RESET" | "BEGIN" | "START" | "COMMIT" | "END" | "ROLLBACK" | "DISCARD" | "DEALLOCATE" | "CLOSE" => Some(Response::Execution(Tag::new(&first))),
         "SHOW" if !sql.to_lowercase().contains("tables") && !sql.to_lowercase().contains("datafusion.") && !sql.to_lowercase().trim_end_matches(';').trim().ends_with(" all") => {
             let name = sql.split_whitespace().skip(1).collect::<Vec<_>>().join(" ").trim_end_matches(';').to_lowercase();

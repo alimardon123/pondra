@@ -24,7 +24,34 @@ const NO_SESSION: &str = "a setting or a prepared statement is a session's: a Po
 /// Is this one of the statements kept here?
 pub fn is(sql: &str) -> bool {
     let word = crate::write::first_word(sql).split(|c: char| !c.is_ascii_alphabetic()).next().unwrap_or("").to_uppercase();
-    matches!(word.as_str(), "SET" | "RESET" | "PREPARE" | "EXECUTE" | "EXEC" | "DEALLOCATE") && crate::runs::execute_of(sql).is_none() // (EXECUTE TASK: the leader's)
+    matches!(word.as_str(), "SET" | "RESET" | "PREPARE" | "EXECUTE" | "EXEC" | "DEALLOCATE" | "ANALYZE" | "ANALYSE" | "REFRESH")
+        && crate::runs::execute_of(sql).is_none() // (EXECUTE TASK: the leader's)
+}
+
+/// What Postgres's tools send that has nothing to do here (dbt and BI tools send both): `ANALYZE
+/// [t]`, since statistics are kept with every write, and `REFRESH MATERIALIZED VIEW v`, since a
+/// view is current as rows arrive. Refused for a name that isn't one.
+async fn current(lake: &Lake, sql: &str) -> Result<Option<Done>> {
+    let name = {
+        let mut p = Parser::new(&GenericDialect {}).try_with_sql(sql)?;
+        let word = |p: &mut Parser, w: &str| crate::routines::word(p, w);
+        if word(&mut p, "analyze") || word(&mut p, "analyse") {
+            return Ok(Some(Done::Said("ANALYZE")));
+        }
+        if !word(&mut p, "refresh") {
+            return Ok(None);
+        }
+        ensure!(word(&mut p, "materialized") && word(&mut p, "view"), "REFRESH MATERIALIZED VIEW name");
+        let _ = word(&mut p, "concurrently");
+        crate::write::object(&p.parse_object_name(false)?)
+    };
+    let (other, local) = crate::ddl::resolve(lake, &name).await?;
+    let l = other.as_deref().unwrap_or(lake);
+    let (schema, view) = crate::ddl::split(&local);
+    let here = crate::ddl::lake_name(l);
+    let found = crate::ddl::listed(l).await?.into_iter().any(|t| t.lake == here && t.schema == schema && t.name == view && t.kind == "materialized view");
+    ensure!(found, "REFRESH MATERIALIZED VIEW {name}: there is no materialized view of that name");
+    Ok(Some(Done::Said("REFRESH MATERIALIZED VIEW")))
 }
 
 /// What a statement kept here comes to.
@@ -35,6 +62,9 @@ pub enum Done {
 
 /// Carry out a `SET`, `RESET`, `PREPARE`, `EXECUTE` or `DEALLOCATE` for the current session.
 pub async fn statement(lake: &Lake, sql: &str) -> Result<Done> {
+    if let Some(done) = current(lake, sql).await? {
+        return Ok(done);
+    }
     let mut parsed = Parser::parse_sql(&GenericDialect {}, sql)?;
     ensure!(parsed.len() == 1, "one statement at a time");
     let session = crate::temp::current();

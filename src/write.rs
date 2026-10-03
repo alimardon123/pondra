@@ -285,6 +285,41 @@ fn option_text(v: &ast::Expr) -> String {
     }
 }
 
+/// A partition clause as `partition_by` writes it: `ts`, `day(ts)`. Spark's and Iceberg's
+/// `days(ts)`, BigQuery's `DATE(ts)` and `TIMESTAMP_TRUNC(ts, DAY)`, and `date_trunc('day', ts)`
+/// are the same partitions.
+fn partition_text(e: &ast::Expr) -> String {
+    let column = |e: &ast::Expr| match e {
+        ast::Expr::Identifier(i) => ident(i),
+        e => e.to_string(),
+    };
+    let ast::Expr::Function(f) = e else { return column(e) };
+    let ast::FunctionArguments::List(l) = &f.args else { return e.to_string() };
+    let args: Vec<&ast::Expr> = l.args.iter().filter_map(|a| match a {
+        ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e)) => Some(e),
+        _ => None,
+    }).collect();
+    let name = object(&f.name);
+    let (unit, col) = match (name.as_str(), &args[..]) {
+        ("date_trunc" | "timestamp_trunc" | "datetime_trunc", [a @ ast::Expr::Value(_), b]) => (option_text(a), *b),
+        ("date_trunc" | "timestamp_trunc" | "datetime_trunc", [a, b]) => (b.to_string(), *a),
+        (_, [a]) => (name.clone(), *a),
+        _ => return e.to_string(),
+    };
+    let unit = unit.to_lowercase();
+    format!("{}({})", match unit.trim_end_matches('s') { "date" => "day", u => u }, column(col))
+}
+
+/// The columns a `CLUSTER BY` names: `a, b` or `(a, b)`.
+fn cluster_names(e: &ast::Expr) -> Vec<String> {
+    match e {
+        ast::Expr::Tuple(t) => t.iter().flat_map(cluster_names).collect(),
+        ast::Expr::Nested(e) => cluster_names(e),
+        ast::Expr::Identifier(i) => vec![ident(i)],
+        e => vec![e.to_string()],
+    }
+}
+
 /// A name as SQL resolves it: its parts, unquoted ones in lower case, joined by dots.
 pub fn object(n: &ast::ObjectName) -> String {
     let part = |p: &ast::ObjectNamePart| p.as_ident().map(ident).unwrap_or_else(|| p.to_string());
@@ -422,6 +457,25 @@ pub fn parse(sql: &str) -> Option<Stmt> {
     let text = parsed.to_string();
     Some(match parsed {
         Statement::CreateTable(c) => Stmt::Create(Box::new(c)),
+        // What a write may say that Pondra doesn't do is refused by name, never read and dropped:
+        // INSERT OVERWRITE appended, and RETURNING answered no rows.
+        Statement::Insert(ast::Insert { overwrite: true, .. }) => Stmt::Invalid("INSERT OVERWRITE: write BEGIN; DELETE FROM t; INSERT INTO t …; COMMIT (one commit), or CREATE OR REPLACE TABLE t AS …".into()),
+        Statement::Insert(ast::Insert { returning: Some(_), .. }) | Statement::Update(ast::Update { returning: Some(_), .. }) | Statement::Delete(ast::Delete { returning: Some(_), .. }) => {
+            Stmt::Invalid(format!("{} … RETURNING isn't taken yet: read the rows with a SELECT after it", first_word(&text).split_whitespace().next().unwrap_or("INSERT")))
+        }
+        // DuckDB's and SQLite's INSERT OR IGNORE and INSERT OR REPLACE, and MySQL's INSERT IGNORE:
+        // ON CONFLICT DO NOTHING, and DO UPDATE of every column the rows give. (Read and then
+        // dropped, OR IGNORE replaced a keyed table's row.)
+        Statement::Insert(ast::Insert { table: ast::TableObject::TableName(t), source: Some(q), columns, or, ignore, on, .. }) if or.is_some() || ignore => {
+            let update = match (or.unwrap_or(ast::SqliteOnConflict::Ignore), on) {
+                (_, Some(_)) => return Some(Stmt::Invalid("INSERT OR … ON CONFLICT: one or the other".into())),
+                (ast::SqliteOnConflict::Ignore, None) => None,
+                (ast::SqliteOnConflict::Replace, None) => Some((vec![], None)), // (an empty SET: every column the rows give, `Upsert::merge`)
+                (other, None) => return Some(Stmt::Invalid(format!("INSERT {other}: Pondra takes INSERT OR IGNORE and INSERT OR REPLACE, or ON CONFLICT (…) DO …"))),
+            };
+            let upsert = crate::change::Upsert { columns: columns.iter().map(object).collect(), query: q.to_string(), on: vec![], update };
+            Stmt::Merge(Box::new(crate::change::upsert_of(object(&t), upsert, text)))
+        }
         Statement::Insert(ast::Insert { table: ast::TableObject::TableName(t), source: Some(q), columns, on: Some(on), .. }) => match on {
             ast::OnInsert::OnConflict(oc) => {
                 let on = match oc.conflict_target {
@@ -476,6 +530,8 @@ pub fn parse(sql: &str) -> Option<Stmt> {
                 let to = to.split('.').map(|p| if p.starts_with('"') { p.trim_matches('"').to_string() } else { p.to_lowercase() }).collect::<Vec<_>>().join(".");
                 Stmt::Ddl(vec![Ddl::RenameTable { name: object(&a.name), to }])
             }
+            // Snowflake's and Databricks' `ALTER TABLE t CLUSTER BY (a, b)`: `SET (cluster_by = 'a, b')`.
+            [ast::AlterTableOperation::ClusterBy { exprs }] => Stmt::SetOptions(object(&a.name), vec![("cluster_by".into(), exprs.iter().flat_map(cluster_names).collect::<Vec<_>>().join(", "))]),
             [ast::AlterTableOperation::SetOptionsParens { options } | ast::AlterTableOperation::SetTblProperties { table_properties: options }] => Stmt::SetOptions(object(&a.name), options.iter().map(|o| match o {
                 ast::SqlOption::KeyValue { key, value } => Some((key.value.to_lowercase(), option_text(value))),
                 _ => None,
@@ -597,8 +653,15 @@ pub async fn declared(cols: &str) -> Result<Vec<datafusion::arrow::datatypes::Fi
 
 pub async fn create_spec(c: &ast::CreateTable, from: &Lake, files: bool) -> Result<String> {
     let declared = || declared_of(&c.columns);
-    let fields = match &c.query {
-        Some(q) => {
+    let fields = match (&c.like, &c.query) {
+        // `CREATE TABLE t LIKE s` takes s's columns and their types, as Postgres's does by default
+        // (made with none, it was a table of no columns).
+        (Some(ast::CreateTableLikeKind::Plain(l) | ast::CreateTableLikeKind::Parenthesized(l)), _) => {
+            ensure!(c.columns.is_empty() && c.query.is_none(), "CREATE TABLE {} LIKE {}: columns or a query, or LIKE, not both", c.name, l.name);
+            let sql = format!("SELECT * FROM {} LIMIT 0", l.name);
+            session(from, &sql, "").await?.sql(&sql).await?.schema().fields().iter().cloned().collect::<Vec<_>>()
+        }
+        (None, Some(q)) => {
             let sql = q.to_string();
             let ctx = session(from, &sql, "").await?;
             let ctx = if files { ctx.enable_url_table() } else { ctx };
@@ -611,7 +674,7 @@ pub async fn create_spec(c: &ast::CreateTable, from: &Lake, files: bool) -> Resu
                 }
             }
         }
-        None => declared().await?,
+        (None, None) => declared().await?,
     };
     let columns: Vec<(String, String)> = fields.iter().map(|f| (f.name().clone(), crate::query::type_name(f.data_type()))).collect();
     let name = |e: &ast::Expr| e.to_string().trim_matches('"').to_string();
@@ -651,6 +714,26 @@ pub async fn create_spec(c: &ast::CreateTable, from: &Lake, files: bool) -> Resu
                 opts.insert(key.value.to_lowercase(), option_text(value));
             }
         }
+    }
+    // Other engines' clauses for two of them: BigQuery's and Postgres's `PARTITION BY expr`, Spark's
+    // `PARTITIONED BY (c)`, and Snowflake's, Databricks' and BigQuery's `CLUSTER BY a, b`. (Read
+    // and then dropped, they made a table with neither.)
+    let mut clause = |k: &str, v: String| -> Result<()> {
+        ensure!(opts.insert(k.into(), v).is_none(), "CREATE TABLE {}: {k} is given twice", c.name);
+        Ok(())
+    };
+    if let Some(e) = &c.partition_by {
+        clause("partition_by", partition_text(e))?;
+    }
+    if let ast::HiveDistributionStyle::PARTITIONED { columns } = &c.hive_distribution {
+        ensure!(columns.len() == 1, "CREATE TABLE {} PARTITIONED BY (…): one column, or day(ts): each file holds one partition", c.name);
+        clause("partition_by", ident(&columns[0].name))?;
+    }
+    if let Some(ast::WrappedCollection::NoWrapping(e) | ast::WrappedCollection::Parentheses(e)) = &c.cluster_by {
+        clause("cluster_by", e.iter().flat_map(cluster_names).collect::<Vec<_>>().join(", "))?;
+    }
+    if let o @ (ast::CreateTableOptions::Plain(_) | ast::CreateTableOptions::TableProperties(_)) = &c.table_options {
+        bail!("CREATE TABLE {} … {o}: a table's options go in WITH (name = value, …)", c.name);
     }
     const OPTIONS: [&str; 7] = ["publish", "cluster_by", "partition_by", "ttl", "order_by", "merge", "retention"];
     if let Some(k) = opts.keys().find(|k| !OPTIONS.contains(&k.as_str())) {

@@ -36,6 +36,9 @@ enum At {
 /// `t AT (VERSION => …)` → `pondra_at(t, version => …) AS t`, outside strings and comments: the
 /// parser takes no `AT` after a table (only Snowflake's and Databricks' dialects do).
 pub fn syntax(sql: &str) -> Cow<'_, str> {
+    if let Cow::Owned(at) = as_of(sql) {
+        return Cow::Owned(syntax(&at).into_owned());
+    }
     static AT: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)\bAT\s*\(\s*(VERSION|TIMESTAMP|OFFSET)\s*=>").expect("a regex"));
     if !AT.is_match(sql) {
         return Cow::Borrowed(sql);
@@ -89,6 +92,73 @@ pub fn syntax(sql: &str) -> Cow<'_, str> {
     }
     out.push_str(&sql[copied..]);
     Cow::Owned(out)
+}
+
+/// Other engines' words for `AT (…)`: Delta's and Spark's `t VERSION AS OF n` and `t TIMESTAMP AS
+/// OF '…'`, and SQL:2011's and BigQuery's `t FOR SYSTEM_TIME AS OF '…'`, after a table in a FROM or
+/// a JOIN. What follows is a number, a string, `TIMESTAMP '…'`, a `$variable` or `(an expression)`.
+fn as_of(sql: &str) -> Cow<'_, str> {
+    static AS_OF: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)\b(VERSION|TIMESTAMP|SYSTEM_TIME)\s+AS\s+OF\b").expect("a regex"));
+    if !AS_OF.is_match(sql) {
+        return Cow::Borrowed(sql);
+    }
+    let Ok(tokens) = Tokenizer::new(&GenericDialect {}, sql).tokenize_with_location() else { return Cow::Borrowed(sql) };
+    let lines: Vec<usize> = std::iter::once(0).chain(sql.match_indices('\n').map(|(i, _)| i + 1)).collect();
+    let byte = |l: &Location| -> usize {
+        let start = lines.get((l.line.max(1) - 1) as usize).copied().unwrap_or(sql.len());
+        sql[start..].char_indices().nth((l.column.max(1) - 1) as usize).map_or(sql.len(), |(i, _)| start + i)
+    };
+    let solid: Vec<_> = tokens.iter().filter(|t| !matches!(t.token, Token::Whitespace(_))).collect();
+    let is = |k: usize, kw: Keyword| matches!(solid.get(k).map(|t| &t.token), Some(Token::Word(w)) if w.quote_style.is_none() && w.keyword == kw);
+    let named = |k: usize| matches!(solid.get(k).map(|t| &t.token), Some(Token::Word(_)));
+    let (mut out, mut copied, mut next) = (String::new(), 0, 1);
+    for i in 1..solid.len() {
+        if i < next {
+            continue;
+        }
+        let (when, at) = match () {
+            _ if is(i, Keyword::VERSION) && is(i + 1, Keyword::AS) && is(i + 2, Keyword::OF) => ("VERSION", i + 3),
+            _ if is(i, Keyword::TIMESTAMP) && is(i + 1, Keyword::AS) && is(i + 2, Keyword::OF) => ("TIMESTAMP", i + 3),
+            _ if is(i, Keyword::FOR) && is(i + 1, Keyword::SYSTEM_TIME) && is(i + 2, Keyword::AS) && is(i + 3, Keyword::OF) => ("TIMESTAMP", i + 4),
+            _ => continue,
+        };
+        let mut first = i - 1; // (the table's name, after FROM, JOIN or a comma)
+        while first >= 2 && matches!(solid[first - 1].token, Token::Period) && named(first - 2) {
+            first -= 2;
+        }
+        let after = first.checked_sub(1).is_some_and(|k| is(k, Keyword::FROM) || is(k, Keyword::JOIN) || matches!(solid[k].token, Token::Comma));
+        if !named(i - 1) || !after {
+            continue;
+        }
+        let end = match solid.get(at).map(|t| &t.token) {
+            Some(Token::Number(..) | Token::SingleQuotedString(_) | Token::Placeholder(_)) => at,
+            Some(Token::Word(_)) if matches!(solid.get(at + 1).map(|t| &t.token), Some(Token::SingleQuotedString(_))) => at + 1, // (TIMESTAMP '…')
+            Some(Token::LParen) => {
+                let mut depth = 0;
+                match (at..solid.len()).find(|&k| {
+                    depth += match solid[k].token {
+                        Token::LParen => 1,
+                        Token::RParen => -1,
+                        _ => 0,
+                    };
+                    depth == 0
+                }) {
+                    Some(k) => k,
+                    None => continue,
+                }
+            }
+            _ => continue,
+        };
+        let (start, stop) = (byte(&solid[i].span.start), byte(&solid[end].span.end));
+        let expr = &sql[byte(&solid[at].span.start)..stop];
+        out.push_str(&sql[copied..start]);
+        out.push_str(&format!("AT ({when} => {expr})"));
+        (copied, next) = (stop, end + 1);
+    }
+    match copied {
+        0 => Cow::Borrowed(sql),
+        _ => Cow::Owned(out + &sql[copied..]),
+    }
 }
 
 /// `pondra_at(t, version => …)` in a FROM: the table of `t` as it was, by its own name. Ok(false):
