@@ -44,17 +44,20 @@ CALL run('etl/orders.sql', day => DATE '2026-09-29', region => 'west', amount =>
 
 ## Parameters declared
 
-A `DECLARE` says what a parameter is: its type, its default, and, in the comment above it, what it
-means. A run's value takes the default's place, cast to the type; a parameter with no default must
-be given. Tools and people read them with `pondra.parameters`:
+A `DECLARE PARAMETER` says what a parameter is: its type, its default, and, in the comment above
+it, what it means. A run's value takes the default's place, cast to the type; a parameter with no
+default must be given. A plain `DECLARE` is a variable of the file's own: it never shows as a
+parameter, and a run given a value for it is refused. Tools and people read the parameters with
+`pondra.parameters`:
 
 ```bash
 curl -s -X PUT http://localhost:8080/files/etl/by_region.sql --data-binary @- <<'EOF'
 -- The day to load
-DECLARE $day DATE = current_date - 1;
+DECLARE PARAMETER $day DATE = current_date - 1;
 -- Where the orders come from
-DECLARE $region VARCHAR;
-SELECT count(*) AS n FROM orders WHERE day = $day AND region = $region;
+DECLARE PARAMETER $region VARCHAR;
+DECLARE $since = $day - 7;   -- the file's own: not a parameter
+SELECT count(*) AS n FROM orders WHERE day BETWEEN $since AND $day AND region = $region;
 EOF
 ```
 
@@ -82,10 +85,17 @@ CALL run('etl/by_region.sql', region => 'west', day => '2026-09-29');
 ## Python files and notebooks
 
 A `.py` file gets its parameters as variables. What it prints comes back as notices (psql shows
-them as `NOTICE`), and its last expression is the answer, as in a notebook cell:
+them as `NOTICE`), and its last expression is the answer, as in a notebook cell. A cell marked
+`# %% tags=["parameters"]` (jupytext's and papermill's way) holds its parameters and their
+defaults: it runs first, the values given replace its names, then the rest runs; a name it doesn't
+set is refused. Its annotations and comments are what `pondra.parameters` says:
 
 ```bash
 curl -s -X PUT http://localhost:8080/files/etl/score.py --data-binary @- <<'EOF'
+# %% tags=["parameters"]
+region: str = "east"  # where the orders come from
+
+# %%
 print("scoring", region)
 n = db.sql(f"SELECT count(*) AS n FROM orders WHERE region = '{region}'").item()
 {"region": region, "orders": n}
@@ -98,7 +108,8 @@ CALL run('etl/score.py', region => 'west');
 
 A notebook (`.ipynb`) runs its cells in order: `%%sql` cells as SQL, the others as Python, in one
 namespace for the run. Its cell tagged `parameters` (as papermill's) holds the defaults, and the
-values given replace them. SQL cells take the values as `$name`.
+values given replace them; its SQL cells' `DECLARE PARAMETER`s are parameters too. SQL cells take
+the values as `$name`.
 
 ```sql norun
 CALL run('reports/weekly.ipynb', region => 'west');

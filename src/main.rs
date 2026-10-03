@@ -299,7 +299,7 @@ fn run_help(file: Option<&str>) -> anyhow::Result<()> {
     let run = cmd.find_subcommand_mut("run").expect("the run command");
     let Some(file) = file else { return Ok(run.print_help()?) };
     let text = std::fs::read_to_string(file).map_err(|e| anyhow::anyhow!("{file}: {e}"))?;
-    let params = vars::parameters(&text);
+    let params = crate::workspace::parameters(file, &text)?.unwrap_or_default();
     let arg = |p: &vars::Param| format!("--{} {}", p.name, p.ty.as_deref().unwrap_or("VALUE").to_uppercase());
     println!("Usage: pondra run {file} [LAKE] {}", params.iter().map(|p| match p.required { true => arg(p), false => format!("[{}]", arg(p)) }).collect::<Vec<_>>().join(" "));
     println!("\n{}", match params.is_empty() { true => format!("{file} takes no parameters."), false => format!("Parameters of {file}:") });

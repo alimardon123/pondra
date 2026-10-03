@@ -14,22 +14,23 @@ const above = lead => { const out = []; for (const l of lead.trim().split('\n').
 
 /** The comment after a statement on its line (the start of the next one's text). */
 const after = next => { const t = next?.match(/^[ \t]*--+\s*([^\n]*)/)?.[1].trim() || ''; return t[0] === '$' ? '' : t; };
-/** A script's parameters as the node lists them (`pondra.parameters`, vars.rs): each DECLARE (its
- * type and default as written, what the comment above it, or after it on its line, says), and each
- * `$name` used before anything sets it (required); in the order the script declares or first uses them. */
+/** A script's parameters as the node lists them (`pondra.parameters`, vars.rs): each DECLARE
+ * PARAMETER (its type and default as written, what the comment above it, or after it on its line,
+ * says), and each `$name` used before anything sets it (required); in the order the script declares
+ * or first uses them. Its own variables (a plain DECLARE) come too, marked `own`, for the tooltip. */
 export function declared(sql) {
   const out = new Map(), set = new Set(), use = s => { for (const name of used(s)) if (!set.has(name) && !out.has(name)) out.set(name, { name, required: true }); };
   const all = statements(sql, true);
   all.forEach((raw, i) => {
     const st = (i ? raw.replace(/^[ \t]*(--[^\n]*)?\n/, '') : raw).trim(); // (what follows a `;` on its line is the statement before's)
     const lead = st.match(/^(?:\s*(?:--[^\n]*|\/\*[\s\S]*?\*\/))*\s*/)[0], s = st.slice(lead.length);
-    const d = /^declare\s+\$([a-z_]\w*)\b\s*([\s\S]*?)\s*$/i.exec(s), v = /^(?:\$|set\s+variable\s+)([a-z_]\w*)\s*(?:=|\bto\b)\s*([\s\S]*?)\s*$/i.exec(s);
-    if (d && !set.has(d[1])) {
-      const t = /^([\s\S]*?)\s*(?:=|\bdefault\b)\s*([\s\S]*)$/i.exec(d[2]);
+    const d = /^declare\s+(?:(parameter)\s+)?\$([a-z_]\w*)\b\s*([\s\S]*?)\s*$/i.exec(s), v = /^(?:\$|set\s+variable\s+)([a-z_]\w*)\s*(?:=|\bto\b)\s*([\s\S]*?)\s*$/i.exec(s);
+    if (d && !set.has(d[2])) {
+      const t = /^([\s\S]*?)\s*(?:=|\bdefault\b)\s*([\s\S]*)$/i.exec(d[3]);
       if (t) use(t[2]);
-      out.delete(d[1]); // (used before its DECLARE: the DECLARE says what it is)
-      out.set(d[1], { name: d[1], type: (t ? t[1] : d[2]) || null, default: t ? t[2] : null, required: !t, about: above(lead) || after(all[i + 1]) });
-      set.add(d[1]);
+      out.delete(d[2]); // (used before its DECLARE: the DECLARE says what it is)
+      out.set(d[2], { name: d[2], type: (t ? t[1] : d[3]) || null, default: t ? t[2] : null, required: !t && !!d[1], about: above(lead) || after(all[i + 1]), own: !d[1] });
+      set.add(d[2]);
     } else if (v) { use(v[2]); set.add(v[1]); } else use(s);
   });
   for (const m of sql.matchAll(/^\s*--\s*\$([A-Za-z_]\w*)\s*[:—–-]\s*(.+?)\s*$/gm)) if (out.has(m[1])) out.get(m[1]).about = m[2];
@@ -48,7 +49,7 @@ const literal = (p, kind) => {
  * takes it in place of its default, cast to its type), marked, and kept in this browser for the
  * file; ↺ (or the default typed again) goes back to the default. */
 export function bar(doc) {
-  const list = declared(doc.ed.value), key = 'pondra.params:' + (doc.path || doc.untitled), sig = JSON.stringify(list);
+  const list = declared(doc.ed.value).filter(p => !p.own), key = 'pondra.params:' + (doc.path || doc.untitled), sig = JSON.stringify(list);
   doc.kept ??= store.json(key, {});
   doc.pbar.hidden = !list.length;
   given(doc, list);
@@ -67,7 +68,7 @@ export function bar(doc) {
   }));
 }
 /** The values the file's runs send: numbers and true/false as such, the rest as text. */
-function given(doc, list = declared(doc.ed.value)) {
+function given(doc, list = declared(doc.ed.value).filter(p => !p.own)) {
   doc.given = Object.fromEntries(list.filter(p => (doc.kept?.[p.name] ?? '') !== '').map(({ name }) => {
     const v = doc.kept[name].trim();
     return [name, /^-?\d+(\.\d+)?$/.test(v) && Math.abs(+v) < 2 ** 53 ? +v : v === 'true' || v === 'false' ? v === 'true' : v];

@@ -345,8 +345,9 @@ class Pondra:
         return Vars(self)
 
     def parameters(self, file):
-        """A SQL file's parameters (`etl/orders.sql`): each `DECLARE $name [type] [= default]`, and each
-        `$name` it uses without setting (required), with the comment above it as its description."""
+        """A file's parameters (`etl/orders.sql`): each `DECLARE PARAMETER $name [type] [= default]`,
+        and each `$name` it uses without setting (required), with the comment above it as its
+        description; a `.py` file's `# %% tags=["parameters"]` cell's names; a notebook's."""
         return self._run(f"SELECT * FROM pondra.parameters({_literal(str(file))})").rows()
 
     def _frame_rows(self, frame, format=None):
