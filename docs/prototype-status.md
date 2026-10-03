@@ -15,7 +15,7 @@ One Rust binary replaces the Kafka + Flink + Spark + metastore + ZooKeeper stack
 
 Start more copies on the same bucket to scale out. The only state is object storage. There's no JVM, no database server and no coordination service.
 
-**Then (2026-10-02, round 32 so far): lean and fast** (the owner, 2026-10-01: a round only for
+**Then (2026-10-02, round 32, complete: 0.31.0, 0.31.1 and 0.32.0): lean and fast** (the owner, 2026-10-01: a round only for
 optimizing; performance first):
 
 1. **The join order from every input in turn** (`optimize::JoinOrder`): the greedy order is built
@@ -124,11 +124,87 @@ optimizing; performance first):
    slower (q6 0.06 → 0.20 s), so only this shape gets it. Two other ideas were timed on and off in one
    build and dropped: dropping rows at the in-memory scan by a top-N's bound (ClickBench's top-N by
    time 0.006 → 0.04 s) and copying the in-memory columns into buffers of their own (TPC-H q12 from
-   memory 0.05 → 0.11 s).
+   memory 0.05 → 0.11 s), until it kept shared strings shared (item 16).
 15. **A transaction's UPDATE then INSERT of one table commits:** COMMIT sent the table's rows as one
    Arrow stream under its first batch's schema, and an UPDATE's rows carry `_created_at` where an
    INSERT's don't, so the leader couldn't read it (found by the console thread). `harness.py begin`
    checks an append and a keyed table.
+16. **The in-memory columns hold what they count** (`hot::whole`): once a file's column is decoded,
+   its batches are copied into one allocation of their own, and a buffer several batches share (the
+   Parquet page their strings point into, a dictionary's values) is copied once and stays shared.
+   Left in the decoder's buffers, the columns sat among its short-lived ones in the allocator's
+   pages and the process held about twice what they count, so the node trimmed them early. Now
+   ClickBench's columns hold 7.2 GB at 7.9 GB of the process's memory (about 5 GB before, at the
+   same limit). Side by side, from memory: ClickBench 7.66 → 6.86 s (q23 0.95 → 0.44 s), TPC-H
+   1.006 → 1.004 s; every query that looked slower re-timed alone, both ways. In `singlenode.py`'s
+   runs ClickBench from memory is 6.58 s (8.22 s in item 11; DuckDB 1.5.5 over the file 11.10 s) and
+   TPC-H 1.24 s, every answer as DuckDB's but the same 7 ties (`logs/round32/*-arena.json`); TPC-DS
+   99 of 99. The first try copied each batch's strings out, which made a join on a low-cardinality
+   string column carry and count a copy per batch: TPC-H q12's build 235 MB instead of 68.
+17. **Key lookups while writes land, 16× more a second** (`serve::Tail`): a lookup looked for its key
+   in every log segment since the table's last tiering round, newest first, and a table taking 250
+   small commits a second had thousands of them; now each table's log tail is indexed by the hash
+   of its key, kept per node until the next round and brought up to date with only the segments
+   committed since (the row a hash names is checked; another key of the same hash scans as before).
+   `serve_bench.py`, 8 clients while a writer upserts 200 rows per commit: 1,676 → 27,600 lookups a
+   second, p50 4.6 → 0.22 ms; without writes 38,900 both ways. The same dashboard aggregate while
+   writing looked slower after it (300 → 180 a second), because the writer, no longer starved by
+   the lookups before it, had written twice as many rows by then: run without the lookups first,
+   both builds give 175.
+18. **The gates on 0.32.0** (`logs/gates/`, 2026-10-03): TPC-H SF1 from memory 1.14 s and from
+   files 2.24 s (DuckDB 1.07 / 2.12 s), every answer right; Nexmark 2 M bids 2.23 s; pgbench 198 and
+   168 transactions a second, balances right; sqllogictest 23,049 of 24,783 as before, once two
+   `CREATE DATABASE` records stopped meeting folders an earlier run left in `/tmp` (`slt_check.py`
+   now gives each file's lake a folder of its own).
+
+**Beside it, in the same release (2026-10-02, round 33's first parts):**
+
+- **Run it for years** (ADR-039, PR #6): lakes have a format version, refused by a build that
+  doesn't know it; every release's lake since 0.22 (8 of them) opens and answers row for row as
+  before, then takes writes, tiering, merges and a kill (`upgrade_check.py`, `upgrade.yml` on every
+  PR); a 0.30.0 cluster under load upgraded a node at a time, both orders, every batch once; a node
+  stopped with SIGTERM drains (`/ready` 503, Postgres 57P01, requests in flight finish) and a leader
+  steps down durable, so writers wait about 5 s for the next one (13 s when it is killed); a key
+  lookup that could miss a live key (0.22 to 0.30) fixed; `tools/soak.py` for the 24-hour soak.
+- **Deployed and distributed** (ADR-041, PR #5): a container image (amd64, arm64, and one with
+  Python), a node sized to its container's memory, a three-node compose cluster, a Helm chart,
+  `pondra service install` (systemd, launchd, Windows), Homebrew, Scoop and winget manifests made
+  from each release, signing ready for certificates, provenance attestations; each tried on every
+  PR with the build's own binary. Publishing waits on the owner's accounts.
+- **Every mode under failure** (PR #10, `tools/resilience_check.py`, 75 checks on every PR): a
+  failing bucket (errors, lost replies, held requests, down 40 s), a leader cut off alone, clients
+  and doors through kills, full disks, `pondra sql` killed; every acknowledged write there once on
+  every node, no read torn. It found five faults, all fixed: an idempotent Kafka producer that gave
+  up on a batch lost acknowledged records (12,000 of 50,800 across a leader kill: each epoch is now
+  a producer of its own); a leader cut off from its bucket held every write (now another node takes
+  over after about 25 s); the Python and JavaScript clients failed while their node was down (they
+  take every node's address now); `pondra sql` waited for ever on a missing bucket; a slow bucket
+  was taken for a lost one. A PR's push runs CI only when labelled (`ci`, `full-ci`).
+- **A full local disk recovers on its own** (PR #18, `store.rs`): the catalog's write-ahead log
+  goes every 5 s on a local disk (95 MB at 90 s of small writes before, about 6 MB now) and a
+  compaction's replaced files a minute on (600 MB at six minutes and growing before, about 250 MB
+  level now); a full disk given room acks again within a second. `resilience_check.py disk` passes
+  on 64 MB and 32 MB.
+- **A table's past** (ADR-043, PR #13, `tools/history_check.py` 12 of 12): a dropped table is kept
+  for its retention (a day unless the table says otherwise) and `UNDROP TABLE` brings it back;
+  `SELECT … FROM t AT (VERSION => n | TIMESTAMP => '…' | OFFSET => -3600)` reads an append table as
+  it was, anywhere a table goes, equal to a model of 13 states; `RESTORE TABLE t TO VERSION AS OF n`
+  puts it back in one change (ids kept, undone by another); `CREATE TABLE c CLONE t` copies no file.
+  The past is the rows' system columns and `{t}$deleted`: nothing in the catalog until it's read.
+- **`CREATE VIEW v (a, b)`** names the view's columns (PR #12; the list was ignored).
+- **`DECLARE PARAMETER`** (ADR-044, PR #15): only marked variables are a file's parameters; a plain
+  `DECLARE` is the file's own, and a run given a name that isn't a parameter is refused; a `.py`
+  file's parameters are its `# %% tags=["parameters"]` cell.
+- **Scripts that decide** (ADR-045 phase 1, PR #16, `harness.py scripts` 9 of 9): `IF … ELSEIF`,
+  `CASE`, `WHILE`, `REPEAT … UNTIL`, `LOOP`, `FOR r IN (query)`, labels with `LEAVE` and `ITERATE`,
+  `BEGIN … EXCEPTION WHEN … END`, `RETURN`, `RAISE`, `PRINT`, `ASSERT`, `EXECUTE IMMEDIATE … INTO …
+  USING`, `CALL … INTO` and `IDENTIFIER(…)`, the same from every door; each statement runs as it
+  would alone (spread, or written through the leader), and a script run again with its job writes
+  once, loops included. A loop's pass over variables alone takes 0.4 ms (no query).
+- **The console** (PRs #7 and #8, the owner's lists of 2026-10-02): every Live cell over one
+  connection (seven of them took the browser's six and hung Python), one grid everywhere with undo,
+  paste and filters as pills, the Data tree's details, drags and uploads, a schedule editor, users,
+  roles and who has access, and a table's own tab whose edits save as one transaction.
 
 **Then (2026-10-01, round 31, second part so far; 0.29.0): every kind of object alike, SQL and
 Python in one notebook** (the owner's list after the first part):

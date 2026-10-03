@@ -1,0 +1,29 @@
+%3|1790983139.938|FAIL|rdkafka#producer-1| [thrd:127.0.0.1:18280/bootstrap]: 127.0.0.1:18280/bootstrap: Connect to ipv4#127.0.0.1:18280 failed: Connection refused (after 0ms in state CONNECT)
+%3|1790983139.990|FAIL|rdkafka#producer-1| [thrd:127.0.0.1:18280/bootstrap]: 127.0.0.1:18280/bootstrap: Connect to ipv4#127.0.0.1:18280 failed: Connection refused (after 0ms in state CONNECT, 1 identical error(s) suppressed)
+%4|1790983143.158|GETPID|rdkafka#producer-2| [thrd:main]: Failed to acquire idempotence PID from broker 127.0.0.1:18280/1: Broker: Coordinator load in progress: retrying
+%4|1790983143.158|GETPID|rdkafka#producer-2| [thrd:main]: Failed to acquire idempotence PID from broker 127.0.0.1:18280/1: Broker: Coordinator load in progress: retrying
+%4|1790983143.163|GETPID|rdkafka#producer-2| [thrd:main]: Failed to acquire idempotence PID from broker 127.0.0.1:18280/1: Broker: Coordinator load in progress: retrying
+%4|1790983143.163|GETPID|rdkafka#producer-2| [thrd:main]: Failed to acquire idempotence PID from broker 127.0.0.1:18280/1: Broker: Coordinator load in progress: retrying
+%6|1790983150.435|FAIL|rdkafka#producer-4| [thrd:127.0.0.1:18280/1]: 127.0.0.1:18280/1: Disconnected: connection closed by peer: receive 0 after POLLIN (after 4970ms in state UP)
+{
+ "engine": "kafka",
+ "nodes": 1,
+ "producers": 4,
+ "flags": {},
+ "events": 2000000,
+ "wall_s": 1.8,
+ "events_per_s": 1139600,
+ "producer_s": {
+  "p3": 1.7,
+  "p0": 1.7,
+  "p2": 1.7,
+  "p1": 1.7
+ },
+ "unflushed": 0,
+ "exactly_once": true,
+ "ack_ms_p50": 1,
+ "ack_ms_p99": 4,
+ "consumer_on_other_node_ms_p50": 2,
+ "consumer_on_other_node_ms_p99": 4,
+ "probes_seen": 200
+}

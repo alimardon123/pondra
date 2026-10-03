@@ -387,7 +387,7 @@ def main():
     total, failures, per_file = collections.Counter(), [], {}
     t0 = time.time()
     for n, path in enumerate(files, 1):
-        lake = harness.new_lake()
+        lake = os.path.join(harness.new_lake(), "lake")  # (a folder of its own: CREATE DATABASE makes lakes beside it, and they go with it)
         scratch = os.path.join(os.path.dirname(A.slt.rstrip("/")), "test_files", "scratch", os.path.splitext(os.path.basename(path))[0])
         shutil.rmtree(scratch, ignore_errors=True)  # (each file's own, made afresh, as DataFusion's runner does)
         os.makedirs(scratch, exist_ok=True)

@@ -51,7 +51,8 @@ The owner's design principles, which every change must respect:
 ```
 src/      28,600 lines of Rust, one file per concern (see the table in README.md); round 25 added
           live.rs (live queries) and temp.rs (a session's temporary tables and views); round 31 vars.rs
-          (SQL variables and a file's declared parameters, ADR-037); round 26
+          (SQL variables and a file's declared parameters, ADR-037, ADR-044) and script.rs (a script's
+          blocks, branches, loops and handlers, ADR-045); round 26
           pg_catalog.rs (Postgres's catalog, for dbt and BI tools), dbserver.rs (`pondra serve
           --lakes`: a folder of lakes as databases), defaults.rs (NOT NULL and DEFAULT), ext.rs
           (files read by name: `read_*`, `CREATE EXTERNAL TABLE`) and console.rs + console/ (the
@@ -59,8 +60,11 @@ src/      28,600 lines of Rust, one file per concern (see the table in README.md
           API, state and node; editor.js; grid.js; notebook.js; files.js the Workspace and the
           file tabs; console.js the shell and `window.pondra`; loaded when first used: more.js
           (Runs, Variables, Settings, search, choosing Python), data.js (data files), chart.js,
-          plan.js, details.js and more.css), xlsx.rs (a download as an Excel workbook); round 32 fresh.rs (a view's plan kept from one write to
-          the next)
+          plan.js, details.js and more.css, sqlfile.js (a SQL file), rename.js (renaming a file),
+          tabs.js (the tabs' and the panes' menus), live.js (live queries)), xlsx.rs (a download as an Excel workbook); round 32 fresh.rs (a view's plan kept from one write to
+          the next); round 33 format.rs (the lake's format, ADR-039), drain.rs (stopping without
+          dropping work), service.rs (`pondra service`: systemd, launchd, a Windows service;
+          ADR-041) and past.rs (a table's past: `AT (…)`, `RESTORE`, ADR-043)
 brand/    the logo (mark.svg), colours (colors.css) and fonts (fonts/: Geist and Geist Mono, SIL
           OFL): the only copies; tools/brand_check.py
 site/     the documentation website (Starlight; ADR-030): site/STYLE.md says how pages are written,
@@ -72,6 +76,8 @@ python/   the Python client (pure Python, HTTP + Arrow; `local()` starts a node)
           `plpy`), `magic.py` (`%%sql`), `__main__.py` (`python -m pondra`, and `--add-to-path`);
           without pyarrow, rows come as JSON (ADR-024)
 install.sh, install.ps1   the one-line installers each release carries (ADR-024)
+deploy/   the container image (docker/Dockerfile; tools/image.py lays out its context), a compose
+          cluster (compose/) and the Helm chart (helm/pondra); ADR-041
 js/       the JavaScript client and the `pondra` npm package's files
 examples/ quickstart.ipynb (pip install to an as-of join, in the owner's notebook style),
           console-extension.js (what a console extension adds: a section, a tab, a view, an action)
@@ -106,7 +112,15 @@ tools/    harness.py, cluster.py (tests), open_check.py (Delta + Iceberg readers
           example on the website), package.py (wheels, npm packages and the binary alone from a binary), try_packages.sh
           (them installed and tried as CI does on each OS: pip without and with pyarrow, npm, the
           installer; try_install.ps1 is Windows's), npm_publish.sh (the release's npm publish; CI dry-runs it), anywhere_check.py (the shell, local(),
-          the packages, the notebook; old Linux in docker), bench/repeat.py (one query many times)
+          the packages, the notebook; old Linux in docker), bench/repeat.py (one query many times),
+          cloud/gcp.sh, cloud/tpch_parts.sh, cloud/spark.sh and cloud/scale.py (VMs on Google Cloud,
+          SF100 in parts, Spark beside, 1/3/6 nodes into scale.json), deploy_check.py (the image,
+          compose, the chart on kind, pondra service), ci_artifact.sh (a platform's packages from a
+          commit's build run), distribute.py (Homebrew's formula, Scoop's and winget's manifests from
+          a release), sign.py (macOS and Windows signing once the certificates are set),
+          upgrade_check.py (every release's lake opens, formats, the drain, rolling upgrades),
+          soak.py (C4's soak), faulty_s3.py (an S3 proxy that errs, loses replies, slows, holds and
+          goes down), resilience_check.py (every mode under failure)
 docs/     ADRs and reports; lake-format.md is the on-disk layout
 ```
 
@@ -437,7 +451,9 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    DDL); writes go through `write.rs`. Local files (`enable_url_table`) are for `pondra sql` on
    its user's own machine only (`prepare(…, files: true)`). `harness.py clients` checks both.
 22. **A Kafka batch's seq comes from its producer id and sequence** (`kafka::queue`): seq = base
-   sequence + record count, `prev` = base sequence, producer `kafka:{id}:{topic}`. Producers
+   sequence + record count, `prev` = base sequence, producer `kafka:{id}:{topic}`, or
+   `kafka:{id}/{epoch}:{topic}` once its epoch isn't 0 (an epoch is a producer of its own:
+   librdkafka numbers from 0 again after bumping it). Producers
    without a name (non-idempotent Kafka producers) are never checked (`log::commit`); nothing
    else may use an empty name.
 23. **Stored columns only grow, at the end** (`write::create_table`), and every read of log rows
@@ -882,7 +898,10 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    nothing runs once its client goes** (`live.rs`: a print of its tables' definitions and the
    commits touching them; a keep-alive line every 15 s notices a gone client). `harness.py live`:
    "…none for other tables or the same answer" and "closed: nothing runs…" (`/stats`
-   `live_queries`).
+   `live_queries`). A page's live queries share one connection (`POST /live` with `queries`, each
+   line naming its own: `live.js`): a stream each, six Live cells held all six of a browser's
+   connections to the node, and every other request waited. `harness.py live`: "several on one
+   connection…"; `console_check.py` (`work`): seven live cells, then Python.
 124. **A temporary table is its session's alone, and a query reading one runs on its node and is
    never answered from the result cache** (`temp.rs`; `temp::mentioned` in `App::query_as`,
    `server::query`). `harness.py temps`: "another session doesn't see them", "a query spread over
@@ -1129,10 +1148,17 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    through `R.helpers` (no import of `console.js`); each at most 8 KB gzipped. The first load stays
    within 149's 70 KB. Markdown (`md.js`), Jobs (`jobs.js`), Settings, the key list and the
    sign-in dialog (`settings.js`), a SQL file's Messages and its answers' numbers in the gutter
-   (`stmts.js`), and the files' menus and a cell's ⋯ (`more.js`) too. `console_check.py` (`budget`).
-171. **A page of an answer is that answer's rows** (`pages.rs`, `server::page`): an answer of more
-   rows than `typed` sends at once is kept whole, under a random id, and a page is a slice of it: the
-   same rows in the same order, never the query run again while it is kept. Kept within
+   (`stmts.js`), and the files' menus and a cell's ⋯ (`more.js`) too. A SQL file's editor and
+   answers (`sqlfile.js`, as `pyfile.js` is a Python file's), renaming a file (`rename.js`), the
+   tabs' and the panes' menus (`tabs.js`), live queries (`live.js`), the database pill's menu and
+   New database (`objects.js`), the grid's editing, menus and filter dialog (`gridmore.js`), the
+   Data tree's other objects (`groups.js`), uploads (`upload.js`), users, roles and who has access
+   (`access.js`), and a table's own tab (`table.js`) too; the lake's summary loads with Details
+   (`details.js`). `console_check.py` (`budget`).
+171. **A page of an answer is that answer's rows** (`pages.rs`, `server::page`): every answer the
+   console gets is kept whole, under a random id, and a page is a slice of it: the same rows in the
+   same order, never the query run again while it is kept; a download (`/sql/pages/{id}?format=`)
+   writes every row of it, and only once it is gone does the console run the statement again. Kept within
    `PONDRA_PAGES_MB`, 20 minutes after it was last read; a page of one gone is `410`, never another
    answer's rows. `harness.py found`, `console_check.py` (`grid`).
 172. **A notebook's Markdown runs nothing** (`md.js`): the text's HTML is escaped but for tags that
@@ -1274,9 +1300,12 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    and every `$day` after is a literal in the syntax tree (`routines::bind`). A session holds its
    variables (`temp::Session.variables`); a procedure and a file run hold their own (`vars::own`),
    lent to their Python's connection (`auth::lend`); with no session a `DECLARE` is refused, never
-   kept where nothing reads it. A run's given values replace its `DECLARE`s' defaults, cast to
-   their types. `pondra.variables` and `pondra.parameters('file')` are never remembered answers
-   and run on their node. `harness.py variables`.
+   kept where nothing reads it. A run's given values replace its `DECLARE PARAMETER`s' defaults,
+   cast to their types; a value given for a plain `DECLARE` (the script's own) is refused, and a
+   file run refuses a name that isn't one of its parameters (`workspace::parameters`: a `.py`
+   file's `# %% tags=["parameters"]` cell, a notebook's tagged cell; ADR-044). `pondra.variables` and `pondra.parameters('file')` are never remembered answers
+   and run on their node. `harness.py variables`. In the console every tab is a session of its own
+   (`core::sessionOf`): a SQL file's variables, a notebook's Python, never another tab's.
 199. **A query's session is a copy, and only its functions are shared** (`Lake::session_with`):
    the functions, planners and rules every session has are made once a partition count and
    copied; each copy gets catalogs of its own, so the tables, views and temporary tables a query
@@ -1334,6 +1363,90 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    too). Unless every bound fills at once (one aggregate; several of one column, or of columns never
    NULL, and none with a FILTER), the aggregate keeps a filter of its own and the scans keep theirs,
    which never moves from `true`. `harness.py minmax`: three of its seven checks fail without it.
+205. **A node's memory is its container's** (`store::ram`): the smaller of the machine's and its
+   cgroup's limit (v2 `memory.max`, v1 `memory.limit_in_bytes`, the smallest over its ancestors).
+   With the machine's, a node in a 1 GB container planned a third of the host's memory for
+   queries, more than the container may use. `deploy_check.py image`: "its queries are sized by
+   the container's memory, not the host's".
+206. **A service's node stops the way a node stops** (`service.rs`): systemd and launchd send
+   SIGTERM; on Windows the supervisor closes the child's standard input (invariant 46), and a
+   node that must restart to rejoin exits 75 for the supervisor to start it again
+   (`cluster::restart` under `PONDRA_SUPERVISED`), never a process the service manager doesn't
+   know. `deploy_check.py service` on all three (deploy.yml): "killed, its manager starts it again,
+   with its rows", "installed again with other options: stopped, started on its new port, with its
+   rows".
+207. **A lake newer than this build is refused before its tables are read** (`format::check` in
+   `Lake::open`), by name, at every door; a node that would lead it gives the term back first, and
+   a follower whose lake moves past it stops (`format::watch`). `upgrade_check.py format`.
+208. **The lake's format moves only to what every live node knows** (`format::raise`: followers'
+   heartbeats and the commit streams' `x-pondra-format`, after two leases; a node from before
+   formats is 0), except a lake the process made, which is its build's at once. A change an older
+   release would read wrongly is written only at its format. `upgrade_check.py format` ("…only to
+   the newest format every node knows").
+209. **Every release's lake since 0.22 opens in this build and answers as it did**
+   (`upgrade_check.py lakes`, `upgrade.yml` on every pull request): row ids and versions included,
+   then written on.
+210. **A node told to stop drains** (`drain.rs`): `/ready` 503, new requests 503 with `Retry-After`
+   (the cluster's own calls and the probes still answered), a new statement on an open Postgres
+   connection 57P01; the requests in flight when it was told to stop, and only those, finish within
+   `PONDRA_DRAIN_SECS` (a leader's followers keep sending it flushes, and on a bucket one is always
+   in flight: waiting for none held a leader the whole 30 s); a leader then waits for durability,
+   checkpoints and steps down (`cluster/left/{n}`), and a follower whose leader stopped answering
+   and stepped down claims the next term without the lease. `upgrade_check.py drain` ("…sooner than
+   when it is killed"; with `--s3`, "…exits within 10 s, though its followers keep sending").
+211. **A key lookup reads `_deleted` only where it is valid** (`serve::lookup`): a NULL's value bit
+   means nothing. `upgrade_check.py`'s "a key looked up (GET /lookup, a point query) as SQL reads it".
+212. **A hot column's batches share one allocation per file column, and a buffer several batches
+   share stays shared** (`hot::whole`): each distinct buffer is copied into it once, and each
+   batch's buffers are pieces of it that say their own size. In the decoder's buffers the columns
+   kept its short-lived ones' pages from being given back (the process held twice what they
+   count); copying each batch's strings out made a join on a low-cardinality string column carry
+   and count a copy per batch (TPC-H q12's build 235 MB instead of 68, and slower); slices of one
+   array would count a whole file per batch. `harness.py hot`; TPC-H q12's `EXPLAIN ANALYZE` from
+   memory.
+213. **A lookup's index of the log tail holds for one `tiered` mark and the key's types, and the row
+   a hash names is checked** (`serve::Tail`): it is extended with only the segments after the last
+   it holds, in order, a later row winning; when the table's `tiered` moves it is made again (the
+   segments before it may be gone), and a row whose key isn't the one asked for (two keys of one
+   hash) sends the lookup back to scanning the tail. `harness.py upsert` (3,400 lookups against a
+   model through compactions and a restart), `begin`, `dedup`, `layouts`.
+214. **A leader cut off from its bucket steps aside, and only then** (`cluster::keep_alive`,
+   `budget::answered`): cut off is 15 s with no mark written and no answer from the bucket but
+   server errors (slow, or asking to slow down, is still there). It answers heartbeats
+   `x-pondra-cut-off` and turns requests away (503, 57P03) while another node is there; a follower
+   takes the next term once it has reached the bucket for 3 s, so a bucket down for everyone keeps
+   its leader. `resilience_check.py` storage and cutoff.
+215. **A client goes to another node only with what can't apply twice** (`client.py`, `index.js`):
+   a call no node ran, a query, an append, or one INSERT/UPDATE/DELETE/MERGE sent with a job. A
+   session a node holds (`x-pondra-session: held`) stays there; its loss is 08006.
+   `resilience_check.py` clients.
+216. **A dropped table is kept whole, and only its own entry lets it go** (`ddl::drop_table`,
+   `undrop`, ADR-043). Its log rows go to files first (the log moves on). Its entries, and its
+   `{t}$deleted`'s, move to `dt/{name}/{ms}` in one commit. While one is kept, its folder is taken
+   (`ddl::free_folder`) and its files are in use for the orphan sweep (`tier::collect_orphans`).
+   `UNDROP` reads the log from its end (invariant 50). `tools/history_check.py`.
+217. **`t AT (…)` reads only a past the table still holds, or says so** (`past.rs`, `tier::settle`).
+   A purge drops `{t}$deleted` files only past the table's retention, and moves
+   `TableMeta::past_from` to the newest it dropped. A moment before that, and any keyed table, is
+   refused by name, never answered with fewer rows. `tools/history_check.py`: "AT refused by name…".
+218. **A file in a folder a clone shares is deleted only by the orphan sweep, once no table lists it**
+   (`TableMeta::shares`, `tier::expire`, `collect_orphans`): never as one table's garbage, since the
+   source's merges, the clone's merges and a `DROP` of either would take files the other reads. The
+   sweep counts every table that lists files in a folder (kept dropped tables too). A clone is never
+   published (Delta and Iceberg name files under a table's own folder). `tools/history_check.py`:
+   "a clone and its source change apart…".
+219. **A script's block is one statement on every door** (`script::joined`, `routines::statements`,
+   the console's `sqlfile.js` `statements`): a block word opens one only where a statement starts,
+   every `CASE` and `END` counts, `BEGIN;` and `BEGIN TRANSACTION|WORK|ISOLATION|READ` are
+   transactions, and `if(` and `repeat(` are functions. A script's statements write once per job:
+   each one's part is its place and its loop's pass (`{job}:{path}`). A block's `DECLARE`s, a
+   loop's row and a handler's `$error` end with them (`vars::local`, `Runner::unwind`); a lone
+   `DECLARE` with no session is still refused. `harness.py scripts`.
+220. **A lake on local disk lets its catalog's garbage go within a minute** (`store::Catalog::writer`,
+   `unpin`): the write-ahead log goes every 5 s, and a compaction's replaced files a minute on, once
+   the compactor's 15-minute checkpoint is let go. A small disk the catalog filled otherwise had no
+   room to flush, so nothing could clear it. A bucket keeps its minute (C5). `tools/resilience_check.py
+   disk` on 64 MB.
 
 ## Tests: run these before and after any change
 
@@ -1343,8 +1456,14 @@ python3 tools/harness.py all            # upsert, fence/split-brain, bulk insert
 python3 tools/gates.py [--prepare]      # the gates (sqllogictest, TPC-H SF1 vs DuckDB, vs Postgres, Nexmark): a row in logs/gates/README.md; exit 1 on a drop
 python3 tools/harness.py safety         # panics answered as errors, TLS at every door, mutual TLS, the audit log, quotas
 python3 tools/fuzz_doors.py --secs 60   # malformed input at HTTP, SQL, Postgres, Kafka and Flight: the node stays up
+python3 tools/resilience_check.py [storage cutoff clients doors disk cache server cli]   # every mode under failure: a failing bucket (faulty_s3.py), a cut-off leader, clients and doors through kills, full disks, pondra sql killed
+python3 tools/upgrade_check.py [lakes|format|drain|rolling|all] [--s3]   # every release's lake since 0.22 opens and answers as it did; newer formats refused; drains (a leader on a bucket with --s3); a rolling upgrade under load
+python3 tools/soak.py --minutes 10 [--hours 24] [--s3]                   # C4: steady ingest, nodes stopped and killed, memory, the log, commits on a timeline
+python3 tools/history_check.py   # DROP/UNDROP, retention, PURGE, Delta; AT (VERSION | TIMESTAMP | OFFSET) == a model of 13 states; RESTORE; CLONE (no copy, apart, merges and drops); refusals
+python3 tools/deploy_check.py                  # the image and compose; add python, chart, helm (kind), service: deploy.yml runs them all
 python3 tools/harness.py versions       # every file keeps its versions: listed, read, restored, after a delete, retention, old notebooks
 python3 tools/harness.py stopped        # a run whose node was killed under it: stopped, not running for good
+python3 tools/harness.py scripts        # IF, CASE, loops, handlers, RETURN, EXECUTE IMMEDIATE: errors at their line, scopes, a job run twice writing once, Postgres's protocols
 python3 tools/harness.py variables      # DECLARE $x, $x = …, SET VARIABLE, getvariable: sessions, Postgres, procedures, file runs, db.vars, pondra.parameters
 python3 tools/harness.py hot            # hot columns skip batches by their ranges (a time range, a top-N either way, a key); NULL filters == the model
 python3 tools/harness.py minmax         # a global min/max over 24 files skips no row its other answers need (an expression, NULLs so far, FILTER); a wide top-N's answer
@@ -1436,6 +1555,9 @@ failover on its own binary, and dry-runs the release's npm publish (`tools/npm_p
 --dry-run`, newest npm). A tag's `release.yml` builds nothing: it waits for that commit's build
 run, refuses one that failed or a tag that isn't Cargo.toml's version, and publishes the run's
 packages (a minute or two). `cluster-bench.yml`'s default binary (`ci`) is that run's too.
+A pull request's push runs CI only when the pull request is labelled: `ci` builds linux-x64 with
+the suite, `full-ci` all five platforms with deploy.yml; add `full-ci` once before merging, and
+never turn on auto-merge before that run starts. Main builds all five on every push.
 
 Add `--s3` to any of them with a simulated-R2 bucket to see the object-storage behaviour:
 
@@ -1473,13 +1595,28 @@ Practical notes for an agent working here:
 - Node stderr goes to `/tmp/pondra-<port>-<id>.stderr`; that's where "restarting to rejoin",
   "slow tiering" and panics show up.
 
-## State of the work (2026-09-30, round 29 part 1)
+## State of the work (2026-10-03, round 32 complete: 0.32.0)
 
 Everything in `docs/prototype-status.md` passes on local disk and on simulated R2. The round-11
 additions (manifests, partitions, shuffles, memory limits, Arrow Flight) also ran against real
 R2; round 12's are in `logs/round12/`, round 13's in `logs/round13/`, round 14's in
 `logs/round14/`, round 15's in `logs/round15/`, round 16's in `logs/round16/`, round 17's in `logs/round17/`,
-round 18's in `logs/round18/`, round 19's in `logs/round19/`, round 20's in `logs/round20/`, round 21's in `logs/round21/`, round 22's in `logs/round22/`, round 23's in `logs/round23/`, round 24's in `logs/round24/`, round 25's in `logs/round25/`, round 26's in `logs/round26/`, round 27's in `logs/round27/`, round 28's in `logs/round28/` and round 29's in `logs/round29/`.
+round 18's in `logs/round18/`, round 19's in `logs/round19/`, round 20's in `logs/round20/`, round 21's in `logs/round21/`, round 22's in `logs/round22/`, round 23's in `logs/round23/`, round 24's in `logs/round24/`, round 25's in `logs/round25/`, round 26's in `logs/round26/`, round 27's in `logs/round27/`, round 28's in `logs/round28/`, round 29's in `logs/round29/`, round 30's in `logs/round30/`, round 31's in `logs/round31/` and round 32's in `logs/round32/`.
+
+**Round 32 (after 0.30.0; 0.31.0, 0.31.1 untagged, 0.32.0): lean and fast.** The join order from
+every input (TPC-DS q72 81 s → 0.17 s; the 99 18.2 → 12.1 s), planning and small queries cheaper
+(199), flows within 5% of ingest (200), joins under `EXISTS` and past `LEFT JOIN`s (201), answers
+carrying only their own strings (202), hot batches skipped by their ranges (203), a global min/max
+that skipped rows it needed fixed (204, wrong since before 0.30), a wide top-N filtering as it
+decodes Parquet, in-memory columns holding what they count (212), key lookups indexed over the log
+tail (213). Measured against DuckDB 1.5.5 and 2.0's preview, Flink 2.3, Apache Kafka 4 and the
+single-node engines (`prototype-status.md`, round 32; the site's performance and comparison
+pages). In the same release, round 33's first parts from the side threads: the lake format and
+upgrades (ADR-039, 207–211), deployment (ADR-041, 205–206), every mode under failure and the five
+faults it found (214–215), a full local disk that recovers on its own (220), a table's past (`UNDROP`, retention per table, time travel `AT (…)`,
+`RESTORE`, zero-copy `CLONE`: ADR-043, 216–218), `CREATE VIEW v (a, b)`, `DECLARE PARAMETER`
+(ADR-044), scripts that branch, loop and handle errors (ADR-045, 219) and the console's batches. Left of 33: the 24-hour R2 soak (the owner's machine),
+observability, environments.
 
 **Round 29, part 1 (ADR-034, after 0.27): the owner's console list.** The grid's outline, header
 card and menus, typed filters, Copy and Download in every form (a download is every row:
@@ -1880,6 +2017,8 @@ Known limits, in the order they matter:
 7. **Memory is bounded by budgets, not by accounting.** What DataFusion counts is the big hash
    tables and sort buffers; Parquet decoding and the batches in flight are not counted, so the
    query budget defaults to a third of RAM and the hot columns watch the process's own memory.
+   A lake on a local disk needs room for about four minutes of its catalog's inline writes (a few
+   hundred MB under a stream of small batches); it no longer grows past that (invariant 220).
 8. **Kafka's edges:** one partition per topic, no transactions, sparse offsets, consumer groups
    in the leader's memory.
 9. **Streaming:** one watermark per source (not per partition or node), held by a quiet source;

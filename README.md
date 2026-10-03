@@ -20,6 +20,7 @@ no Postgres, no ZooKeeper, no Kafka, no JVM. Runs on a local directory, any S3-c
 | Linux, macOS | `curl -fsSL https://github.com/alimardon123/pondra/releases/latest/download/install.sh \| sh` | `pondra` |
 | Python | `pip install pondra` (add `pyarrow` for pandas, Polars and Arrow) | `pondra`, `python -m pondra`, or `import pondra` |
 | Node | `npm install -g pondra` (or `npm install pondra` in a project) | `pondra`, or `npx pondra` with no install |
+| A container | `docker run -p 8080:8080 -v pondra:/data ghcr.io/alimardon123/pondra` | `http://localhost:8080`; a cluster: `deploy/compose`, Kubernetes: `deploy/helm/pondra` |
 
 The installers put the binary in your own folder (`~/.local/bin`, or `%LOCALAPPDATA%\Programs\pondra`)
 and that folder on your PATH: no admin rights, nothing else to set up. pip puts `pondra` next to
@@ -62,6 +63,11 @@ new rows as they commit, a point-in-time join, frames and `%%sql` cells, functio
 in SQL and Python, another engine appending, and a live answer. The shell and `local()` start a node with
 `--stop-with-stdin`: it stops when the shell or program that started it exits — or is killed —
 and hands the lake on at once, so the next one opens it straight away.
+
+To keep a node running on a machine, starting at boot and again if it stops: `pondra service
+install --lake s3://bucket/lake --addr 0.0.0.0:8080` (systemd, launchd or a Windows service;
+`pondra service status`, `pondra service uninstall`). Kubernetes, compose and the image are in
+the site's deploy guide (`site/src/content/docs/guides/deploy.mdx`, ADR-041).
 
 ## Run it
 

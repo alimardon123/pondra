@@ -1,0 +1,6 @@
+{"engine": "pondra (server)", "install_mb": 118.3, "first_answer_s": 0.14, "idle_mb": 108.6, "after_query_mb": 109.3}
+{"engine": "duckdb (in process)", "install_mb": 58.6, "first_answer_s": 0.08, "idle_mb": 49.8, "after_query_mb": 50.6}
+{"engine": "polars (in process)", "install_mb": 180.5, "first_answer_s": 0.12, "idle_mb": 42.9, "after_query_mb": 61.0}
+{"engine": "spark 4 (local[2], JVM)", "install_mb": 463.5, "first_answer_s": 6.91, "idle_mb": 548.5, "after_query_mb": 572.7}
+{"engine": "flink 2 (MiniCluster, JVM)", "install_mb": 351.2, "first_answer_s": 6.41, "idle_mb": 584.8, "after_query_mb": 743.5}
+{"footprint": [{"engine": "pondra (server)", "install_mb": 118.3, "first_answer_s": 0.14, "idle_mb": 108.6, "after_query_mb": 109.3}, {"engine": "duckdb (in process)", "install_mb": 58.6, "first_answer_s": 0.08, "idle_mb": 49.8, "after_query_mb": 50.6}, {"engine": "polars (in process)", "install_mb": 180.5, "first_answer_s": 0.12, "idle_mb": 42.9, "after_query_mb": 61.0}, {"engine": "spark 4 (local[2], JVM)", "install_mb": 463.5, "first_answer_s": 6.91, "idle_mb": 548.5, "after_query_mb": 572.7}, {"engine": "flink 2 (MiniCluster, JVM)", "install_mb": 351.2, "first_answer_s": 6.41, "idle_mb": 584.8, "after_query_mb": 743.5}]}

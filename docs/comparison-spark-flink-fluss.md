@@ -18,6 +18,21 @@
 - `tools/cluster.py latency | split | spread`
 - `tools/freshness.py` (freshness, head to head), `tools/open_check.py` (outside readers)
 
+**Round 32 (2026-10-02), on a 4-core, 15 GB machine** (`logs/round32/`; the site's
+[Performance](../site/src/content/docs/concepts/performance.mdx) page has the tables):
+- TPC-H SF1 from files 2.16 s, from memory 1.24 s; DuckDB 1.5.5 over Parquet 2.05 to 2.19 s, its own
+  tables 1.05 s; DuckDB 2.0's preview 1.98 s and 0.92 s. ClickBench (10 M rows) from files 10.47 s,
+  from memory 6.58 s; DuckDB 1.5.5 11.10 s and 7.18 s, 2.0's preview 10.89 s and 6.22 s. TPC-DS SF1:
+  99 of 99 answers as DuckDB's.
+- Nexmark q1, q2, q5, q7, q11 over 10 M bids: Pondra 7.1 s (over HTTP, answers as DuckDB's), Flink
+  2.3 16.2 s (its input in process, its 6.6 s start not counted).
+- Kafka protocol, 4 librdkafka producers: one node 994,000 events/s (ack p50 3 ms), three nodes
+  1,030,000; Apache Kafka 4.3.1 1,140,000 (ack p50 1 ms). Apache Kafka is ahead here.
+- Key lookups: 38,900/s at 8 clients, 27,600/s while a writer upserts (1,700 before round 32).
+- Footprint: a 118 MB binary, first answer 0.12 to 0.14 s, idle 104 to 109 MB; DuckDB in Python
+  59 MB, 0.08 s, 50 MB; Spark 4.2 464 MB and a JVM, 6.9 s, 549 MB; Flink 2.3 351 MB and a JVM,
+  6.4 s, 585 MB.
+
 **Where the numbers come from:**
 - Stream joins and sliding windows, Hilbert clustering, a key with partitions and clustering, COPY, and far fewer objects written: round 20.
 - UPDATE, DELETE and MERGE on every table, system columns, views and a change feed that follow, and a query spread only when it pays: round 19.

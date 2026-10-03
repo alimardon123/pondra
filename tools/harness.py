@@ -32,7 +32,7 @@
   harness.py all                 quick run of everything
 """
 import http.client as http_client
-import argparse, atexit, glob as glob_, http.client, itertools, json, os, random, shutil, signal, subprocess, sys, tempfile, threading, time, urllib.request, uuid
+import argparse, atexit, glob as glob_, http.client, itertools, json, os, random, shutil, signal, subprocess, sys, tempfile, threading, time, traceback, urllib.request, uuid
 
 BIN = os.environ.get("PONDRA_BIN", os.path.join(os.path.dirname(os.path.abspath(__file__)), "../target/release/pondra"))
 A = None  # parsed args
@@ -168,6 +168,18 @@ def pct(xs, p):
 
 def crash():
     env = {"PONDRA_CRASH": "after_seg_put:0.03,after_commit:0.01,after_parquet_put:0.2"}  # commits are frequent: 1% each
+    def restart():  # a restart redoes the tiering round a crash cut short, before it answers, and each of
+        # that round's files may abort it again: a big round died 200 times in a row (CI). After 20, one
+        # start without the files' crashes gets the round through; the next start has them again.
+        try:
+            node.start()
+        except RuntimeError:
+            node.kill()
+            node.env["PONDRA_CRASH"] = "after_seg_put:0.03,after_commit:0.01"
+            try:
+                node.start()
+            finally:
+                node.env.update(env)
     totals = {}
     for run in range(1, A.runs + 1):
         lake = new_lake()
@@ -178,7 +190,7 @@ def crash():
                     return call(A.port, "POST", path, body)
                 except Exception:
                     if not node.alive():
-                        node.start()
+                        restart()
                     time.sleep(0.1)
             raise RuntimeError(f"{path}: the node kept crashing")
         setup("/tables/events", json.dumps([["producer", "Utf8"], ["seq", "Int64"], ["i", "Int64"], ["ts", "Float64"]]).encode())
@@ -193,7 +205,7 @@ def crash():
             if random.random() < 0.5:
                 kills += node.kill()
             if not node.alive():
-                node.start()
+                restart()
         time.sleep(1.5)  # let the task catch up
         node.kill()
         crashes = {pt: open(node.log).read().count(f"aborting at {pt}") for pt in ("after_seg_put", "after_commit", "after_parquet_put")}
@@ -6651,4 +6663,14 @@ if __name__ == "__main__":
     ap.add_argument("--secs", type=int, default=30)
     ap.add_argument("--flush-ms", type=int, default=250)
     A = ap.parse_args()
-    {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "safety": safety, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "objects": objects, "sparksql": sparksql, "variables": variables, "scripts": scripts, "hot": hot, "minmax": minmax, "load": load, "all": all_tests}[A.mode]()
+    try:
+        {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "safety": safety, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "objects": objects, "sparksql": sparksql, "variables": variables, "scripts": scripts, "hot": hot, "minmax": minmax, "load": load, "all": all_tests}[A.mode]()
+    except BaseException as e:  # a failure ends the run, though threads may still wait on a node (crash's producers retry for ever)
+        code = e.code if isinstance(e, SystemExit) else 1
+        if not isinstance(e, SystemExit):
+            traceback.print_exc()
+        elif not isinstance(code, int) and code is not None:
+            print(code, file=sys.stderr)
+        clean_up()
+        sys.stdout.flush(), sys.stderr.flush()
+        os._exit(code if isinstance(code, int) else 0 if code is None else 1)

@@ -283,9 +283,69 @@ async fn decode(lake: &Lake, file: &DataFile, fields: &[FieldRef], deletes: bool
             at += n as u64;
         }
         let ranges = out.iter().map(|arrays| ranges(arrays)).collect();
+        let out = out.into_iter().map(whole).collect();
         Ok((rows, out, ranges))
     })
     .await?
+}
+
+/// A file's batches of one column copied into one allocation of their own (invariant 212), each buffer a piece of
+/// it that says its own size. Kept in the decoder's buffers, the columns sat among its short-lived
+/// ones in the allocator's pages, which a column alone then kept from being given back: the process
+/// held about twice what the columns count. A buffer several batches share (the Parquet page their
+/// strings point into, a dictionary's values) is copied once and stays shared: copying each
+/// batch's strings out instead made joins on a low-cardinality string column carry and count a
+/// copy per batch (TPC-H q12's build 3.4 times its memory, and slower). Slices of one array would
+/// do the first, but each batch would then count the whole file's buffer as its own, and the
+/// operators that budget their memory by what their batches hold would think them a file's size.
+fn whole(arrays: Vec<ArrayRef>) -> Vec<ArrayRef> {
+    use datafusion::arrow::array::make_array;
+    use datafusion::arrow::buffer::{BooleanBuffer, Buffer, MutableBuffer, NullBuffer};
+    const ALIGN: usize = 64;
+    let datas: Vec<ArrayData> = arrays.iter().map(|a| a.to_data()).collect();
+    fn each(d: &ArrayData, f: &mut dyn FnMut(&Buffer)) {
+        d.buffers().iter().for_each(&mut *f);
+        if let Some(n) = d.nulls() {
+            f(n.buffer());
+        }
+        d.child_data().iter().for_each(|c| each(c, f));
+    }
+    let key = |b: &Buffer| (b.as_ptr() as usize, b.len());
+    let (mut at, mut distinct, mut total) = (HashMap::new(), vec![], 0);
+    datas.iter().for_each(|d| {
+        each(d, &mut |b| {
+            at.entry(key(b)).or_insert_with(|| {
+                distinct.push(b.clone());
+                total += b.len().next_multiple_of(ALIGN);
+                total - b.len().next_multiple_of(ALIGN)
+            });
+        })
+    });
+    let mut arena = MutableBuffer::with_capacity(total);
+    for b in &distinct {
+        arena.extend_from_slice(b.as_slice());
+        arena.resize(arena.len().next_multiple_of(ALIGN), 0);
+    }
+    let arena = Arc::new(Buffer::from(arena));
+    let pieces: HashMap<(usize, usize), Buffer> = at
+        .into_iter()
+        .map(|((ptr, len), offset)| {
+            let owner: Arc<dyn datafusion::arrow::alloc::Allocation> = arena.clone();
+            // SAFETY: `offset..offset + len` is inside the arena (laid out above), which `owner` keeps alive.
+            let p = unsafe { Buffer::from_custom_allocation(std::ptr::NonNull::new_unchecked(arena.as_ptr().add(offset) as *mut u8), len, owner) };
+            ((ptr, len), p)
+        })
+        .collect();
+    let piece = |b: &Buffer| pieces[&key(b)].clone();
+    fn rebuild(d: &ArrayData, piece: &dyn Fn(&Buffer) -> Buffer) -> ArrayData {
+        let buffers = d.buffers().iter().map(piece).collect();
+        // SAFETY: the same bits, so the same count.
+        let nulls = d.nulls().map(|n| unsafe { NullBuffer::new_unchecked(BooleanBuffer::new(piece(n.buffer()), n.offset(), n.len()), n.null_count()) });
+        let children = d.child_data().iter().map(|c| rebuild(c, piece)).collect();
+        // SAFETY: the same array, its buffers' bytes copied as they were (offsets, lengths and nulls kept).
+        unsafe { d.clone().into_builder().buffers(buffers).nulls(nulls).child_data(children).build_unchecked() }
+    }
+    datas.iter().map(|d| make_array(rebuild(d, &piece))).collect()
 }
 
 /// Each batch's least and greatest value, for a column whose order can rule a batch out: not

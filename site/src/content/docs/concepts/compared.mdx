@@ -18,13 +18,14 @@ Per machine, in the main areas, Pondra measured ahead of Spark and Flink:
 
 - **Batch SQL:** TPC-H SF1 ran about 12 times faster than Spark 4.2 (4.5 s against 56.1 s for all 22
   queries, same answers; 2026-10-01).
-- **Streaming:** Nexmark's q1, q2, q5, q7 and q11 over 10 million bids in 14.3 s against Flink 2.3's
-  30.4 s, ingest over HTTP included; about 3 times Flink's throughput on a keyed aggregation.
+- **Streaming:** Nexmark's q1, q2, q5, q7 and q11 over 10 million bids in 7.1 s against Flink 2.3's
+  16.2 s on 4 cores (14.3 s against 30.4 s on 2), ingest over HTTP included; about 3 times Flink's
+  throughput on a keyed aggregation.
 - **Into the lake:** a row is in the Delta and Iceberg tables other engines read about 0.4 s after its
   acknowledgement on local disk (3 to 10 s on R2), where Fluss's lake tables trail by 3 minutes by
   default.
-- **Light:** one binary that answers 0.07 s after it starts and idles at 42 MB of its own memory;
-  Spark and Flink take 7 to 10 s and over 550 MB.
+- **Light:** one 118 MB binary that answers about 0.1 s after it starts and idles at about 105 MB, half
+  of it its own code; Spark and Flink take 6 to 7 s and over 530 MB.
 - **Latency:** a change shows up on another node in about 5 ms. Writes are acknowledged in 2 to 4 ms on
   R2 with `--ack replicated`.
 - **Flows:** materialized views that follow each other (bronze, silver, gold) move in the commit
@@ -109,7 +110,7 @@ Flink is a stateful stream processor.
   deduplicates by event time.
 - About 3 times Flink's throughput on a keyed aggregation of 10 million events (4.2 s end to end,
   durable, over HTTP, against 13.3 s), and on the Nexmark queries q1, q2, q5, q7 and q11, 10 million
-  bids in 14.3 s against Flink 2.3's 30.4 s (2026-10-01). Flink generated its input in process,
+  bids in 7.1 s against Flink 2.3's 16.2 s on 4 cores (14.3 s against 30.4 s on 2). Flink generated its input in process,
   and Pondra took its over HTTP.
 - A change is visible on another node in 5 ms. Flink's exactly-once results become visible at a
   checkpoint.
@@ -156,14 +157,18 @@ as a service.
 **Where DuckDB is stronger:**
 
 - It is the reference for single-machine SQL, with a mature ecosystem and extensions.
-- On data in memory, DuckDB was about 9% ahead at SF1: 1.80 s against Pondra's 1.96 s. In its own
-  format it took 1.65 s against Pondra's 2.11 s in the newest recheck.
-- It is small, about 20 MB for its command line, against about 175 MB for Pondra's one binary (its
+- With the data in memory, on 4 cores (round 32), DuckDB 1.5's own format was about 15% ahead on
+  TPC-H SF1 (1.05 s against Pondra's 1.24 s), and its 2.0 preview more (0.92 s). On ClickBench 2.0's
+  preview was ahead (6.22 s against 6.58 s) and 1.5 behind (7.18 s).
+- It is small, about 20 MB for its command line, against 118 MB for Pondra's one binary (its
   server, every door, TLS and Python's bridge included).
 
 **Where Pondra fits:**
 
-- Reading Parquet files, Pondra was the fastest of five at SF10 (38.0 s, against DuckDB's 39.8 s), and
+- Reading Parquet on 4 cores (round 32), Pondra was level with DuckDB 1.5 on TPC-H SF1 (2.16 s against
+  2.05 to 2.19 s) and ahead of DuckDB 1.5 and 2.0's preview on ClickBench (10.47 s against 11.10 and
+  10.89 s).
+- Reading Parquet files on 2 vCPUs, Pondra was the fastest of five at SF10 (38.0 s, against DuckDB's 39.8 s), and
   level with Polars' streaming engine at SF1. Polars' streaming engine took 3.18 s to Pondra's 3.19 s.
   Daft took 6.11 s.
 - It also ingests, streams, serves and spreads a query over machines.
@@ -191,7 +196,8 @@ AI tools.
 **Where Pondra fits:**
 
 - Point reads and repeated dashboards: a key lookup takes 0.14 to 0.22 ms and 20,000 to 36,000 a second
-  run on two cores, where Lakehouse//RT publishes 10 ms and 12,000 queries a second on a cluster.
+  run on two cores (38,900 on four, and 27,600 while writes land), where Lakehouse//RT publishes 10 ms
+  and 12,000 queries a second on a cluster.
 - Rows a few milliseconds old, and it takes the writes itself.
 - It runs anywhere you can run a binary, with no cloud account: on your disk or in any bucket.
 - Spark 4 reads the Delta and Iceberg tables Pondra publishes, and gets Pondra's answers. Databricks'

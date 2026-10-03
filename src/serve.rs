@@ -186,59 +186,97 @@ pub async fn point_sql(lake: &Lake, sql: &str) -> Result<Option<Vec<u8>>> {
     Ok(Some(w.into_inner()))
 }
 
-/// The log tail, newest segment and row first (decoded segments are cached per node).
+/// The log tail's rows of one table by the hash of their key, each hash to its newest row
+/// (segment, batch, row; invariant 213). Kept per node while the table's `tiered` mark stays, and brought up to
+/// date with only the segments committed since, so a lookup is one probe, not a scan of every
+/// segment since the last tiering round: a table taking a few hundred small commits a second had
+/// thousands to scan (1,700 lookups a second instead of 38,000). The row a hash names is checked;
+/// another key of the same hash falls back to the scan.
+struct Tail {
+    tiered: u64,
+    types: Vec<datafusion::arrow::datatypes::DataType>, // (the key's, which the hashes are of)
+    upto: u64,                                           // every segment to here is in `rows`
+    rows: HashMap<u64, (u64, u32, u32)>,
+    segs: HashMap<u64, Arc<Segment>>,
+}
+
+const KEYS: datafusion::common::hash_utils::RandomState = datafusion::common::hash_utils::RandomState::with_seed(0);
+
+/// Each row's hash of its key columns, as the key's types.
+fn hashes(batch: &RecordBatch, keys: &[(&str, ScalarValue)]) -> Result<Vec<u64>> {
+    let cols = keys.iter().map(|(c, v)| {
+        let col = batch.column_by_name(c).context("key column missing")?;
+        Ok(if col.data_type() == &v.data_type() { col.clone() } else { cast(col, &v.data_type())? })
+    }).collect::<Result<Vec<_>>>()?;
+    let mut out = vec![0; batch.num_rows()];
+    datafusion::common::hash_utils::create_hashes(&cols, &KEYS, &mut out)?;
+    Ok(out)
+}
+
+/// The log tail's newest row of the key, with the commit that wrote it and when (`Tail`).
 async fn newest_in_log(lake: &Lake, table: &str, meta: &TableMeta, keys: &[(&str, ScalarValue)]) -> Result<Option<(RecordBatch, u64, u64)>> {
-    for (n, seg) in lake.segments_after(meta.tiered).await?.into_iter().rev() {
-        if !seg.parts.contains_key(table) {
-            continue;
+    static TAILS: std::sync::LazyLock<Mutex<lru::LruCache<(String, String), Arc<Mutex<Tail>>>>> = std::sync::LazyLock::new(|| Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(16).expect("non-zero"))));
+    let types: Vec<_> = keys.iter().map(|(_, v)| v.data_type()).collect();
+    let tail = {
+        let mut all = TAILS.lock().unwrap();
+        let id = (lake.url.clone(), table.to_string());
+        match all.get(&id).filter(|t| matches!(&*t.lock().unwrap(), t if t.tiered == meta.tiered && t.types == types)) {
+            Some(t) => t.clone(),
+            None => {
+                let t = Arc::new(Mutex::new(Tail { tiered: meta.tiered, types, upto: meta.tiered, rows: HashMap::new(), segs: HashMap::new() }));
+                all.put(id, t.clone());
+                t
+            }
         }
-        let rows = lake.segment_rows(n, &seg, table).await?;
-        for (b, batch) in rows.iter().enumerate().rev() {
-            let hit = match batch.num_rows() >= INDEXED {
-                true => probe(&(lake.url.clone(), n, table.to_string(), b, batch.num_rows()), batch, keys)?,
-                false => last_match(batch, keys, false)?,
-            };
-            if let Some(i) = hit {
-                return Ok(Some((batch.slice(i, 1), n, seg.ts_ms))); // (with the commit that wrote it, and when)
+    };
+    // The segments committed since, hashed outside the lock (their rows may have to be read).
+    let from = tail.lock().unwrap().upto;
+    let mut fresh = vec![];
+    for (n, seg) in lake.segments_after(from).await? {
+        let hashed = match seg.parts.contains_key(table) {
+            true => lake.segment_rows(n, &seg, table).await?.iter().map(|b| hashes(b, keys)).collect::<Result<Vec<_>>>()?,
+            false => vec![],
+        };
+        fresh.push((n, seg, hashed));
+    }
+    let hit = {
+        let mut t = tail.lock().unwrap();
+        for (n, seg, hashed) in fresh {
+            if n <= t.upto {
+                continue; // (another lookup brought it this far)
+            }
+            t.upto = n;
+            for (b, hs) in hashed.iter().enumerate() {
+                for (i, h) in hs.iter().enumerate() {
+                    t.rows.insert(*h, (n, b as u32, i as u32)); // (a later row wins)
+                }
+            }
+            if !hashed.is_empty() {
+                t.segs.insert(n, seg);
+            }
+        }
+        if t.rows.is_empty() {
+            return Ok(None); // (no rows of the table since its files)
+        }
+        let mut want = [0];
+        datafusion::common::hash_utils::create_hashes(&keys.iter().map(|(_, v)| v.to_array()).collect::<Result<Vec<_>, _>>()?, &KEYS, &mut want)?;
+        t.rows.get(&want[0]).map(|&(n, b, i)| (n, t.segs[&n].clone(), b as usize, i as usize))
+    };
+    let Some((n, seg, b, i)) = hit else { return Ok(None) };
+    let row = lake.segment_rows(n, &seg, table).await?[b].slice(i, 1);
+    if last_match(&row, keys, false)?.is_some() {
+        return Ok(Some((row, n, seg.ts_ms)));
+    }
+    for (n, seg) in lake.segments_after(meta.tiered).await?.into_iter().rev() {
+        if seg.parts.contains_key(table) {
+            for batch in lake.segment_rows(n, &seg, table).await?.iter().rev() {
+                if let Some(i) = last_match(batch, keys, false)? {
+                    return Ok(Some((batch.slice(i, 1), n, seg.ts_ms)));
+                }
             }
         }
     }
     Ok(None)
-}
-
-/// A log batch at least this long is looked up through an index of its keys, made once per node.
-const INDEXED: usize = 4096;
-
-type BatchId = (String, u64, String, usize, usize); // (lake, segment, table, batch, rows)
-
-/// The last row of a big log batch with these key values: its rows by key, made the first time
-/// (a long log tail not yet tiered: a lookup is a hash probe, not a scan of the batch).
-fn probe(id: &BatchId, batch: &RecordBatch, keys: &[(&str, ScalarValue)]) -> Result<Option<usize>> {
-    use datafusion::arrow::array::AsArray;
-    use datafusion::arrow::datatypes::DataType;
-    type Index = Arc<HashMap<Vec<String>, usize>>;
-    static INDEXES: std::sync::LazyLock<Mutex<lru::LruCache<BatchId, Index>>> = std::sync::LazyLock::new(|| Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(64).expect("non-zero"))));
-    let text = |c: &datafusion::arrow::array::ArrayRef| cast(c, &DataType::Utf8);
-    let index = INDEXES.lock().unwrap().get(id).cloned();
-    let index = match index {
-        Some(i) => i,
-        None => {
-            let cols = keys.iter().map(|(c, _)| text(batch.column_by_name(c).context("key column missing")?).map_err(Into::into)).collect::<Result<Vec<_>>>()?;
-            let mut map = HashMap::with_capacity(batch.num_rows());
-            for r in 0..batch.num_rows() {
-                map.insert(cols.iter().map(|c| c.as_string::<i32>().value(r).to_string()).collect::<Vec<_>>(), r); // (a later row wins)
-            }
-            let map = Arc::new(map);
-            INDEXES.lock().unwrap().put(id.clone(), map.clone());
-            map
-        }
-    };
-    let mut want = vec![];
-    for (c, v) in keys {
-        let t = batch.column_by_name(c).context("key column missing")?.data_type().clone();
-        want.push(text(&cast(&v.to_array()?, &t)?)?.as_string::<i32>().value(0).to_string());
-    }
-    Ok(index.get(&want).copied())
 }
 
 /// `lookup`, with the row's `_version` (the commit that wrote it) and `_created_at` (µs): what a

@@ -1,0 +1,23 @@
+%6|1790983089.379|FAIL|rdkafka#producer-2| [thrd:127.0.0.1:18280/1033416422]: 127.0.0.1:18280/1033416422: Disconnected: connection closed by peer: receive 0 after POLLIN (after 5274ms in state UP)
+{
+ "engine": "pondra",
+ "nodes": 1,
+ "producers": 4,
+ "flags": {},
+ "events": 2000000,
+ "wall_s": 2.0,
+ "events_per_s": 994281,
+ "producer_s": {
+  "p3": 1.8,
+  "p2": 1.8,
+  "p1": 1.9,
+  "p0": 1.8
+ },
+ "unflushed": 0,
+ "exactly_once": true,
+ "ack_ms_p50": 3,
+ "ack_ms_p99": 4,
+ "consumer_on_other_node_ms_p50": 4,
+ "consumer_on_other_node_ms_p99": 7,
+ "probes_seen": 200
+}
