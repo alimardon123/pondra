@@ -27,9 +27,15 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
+      # (Called from build.yml: its run's own packages, with no API call. By hand: a build run's.)
+      - uses: actions/download-artifact@v7
+        if: github.event_name != 'workflow_dispatch'
+        with:
+          name: pondra-linux-x64
+          path: dist
       - name: This commit's Linux binary (the build workflow's)
         run: |
-          bash tools/ci_artifact.sh linux-x64 "$SHA"
+          [ -f dist/pondra-linux-x64.tar.gz ] || bash tools/ci_artifact.sh linux-x64 "$SHA"
           mkdir -p target/release && tar xzf dist/pondra-linux-x64.tar.gz -C target/release && ls -l target/release
       - name: Every release's lake, a newer format, drains, a rolling upgrade
         env:

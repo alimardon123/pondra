@@ -5,7 +5,7 @@ name: resilience
 # from it alone; the Python and JavaScript clients, Postgres, Kafka and Arrow Flight through nodes killed; a
 # lake's disk and the nodes' cache disk full; a database's node and its server killed; `pondra
 # sql` killed mid-INSERT. Every acknowledged write must be there once, on every node. It runs the
-# binary the build workflow made for this commit (tools/ci_artifact.sh): nothing is compiled here.
+# binary the build workflow made for this commit: nothing is compiled here.
 #
 # build.yml calls it once a pull request's build is done (the label `ci` or `full-ci`) and what it
 # puts under failure changes: the node, the clients, the check itself. By hand too.
@@ -37,9 +37,15 @@ jobs:
           python-version: "3.11"
       - name: The checks' Python packages (tools/requirements.txt's versions)
         run: pip install -r <(grep -iE '^(moto|boto3|psycopg\[|confluent-kafka|pyarrow)' tools/requirements.txt)
+      # (Called from build.yml: its run's own packages, with no API call. By hand: a build run's.)
+      - uses: actions/download-artifact@v7
+        if: github.event_name != 'workflow_dispatch'
+        with:
+          name: pondra-linux-x64
+          path: dist
       - name: This commit's Linux binary (the build workflow's)
         run: |
-          bash tools/ci_artifact.sh linux-x64 "$SHA"
+          [ -f dist/pondra-linux-x64.tar.gz ] || bash tools/ci_artifact.sh linux-x64 "$SHA"
           mkdir -p bin && tar xzf dist/pondra-linux-x64.tar.gz -C bin && ls -l bin
       - name: The checks (the disks are mounted with sudo)
         env:
