@@ -621,11 +621,13 @@ async fn run() -> anyhow::Result<()> {
                         loop {
                             let start = tokio::time::Instant::now();
                             hwm.borrow_and_update();
-                            if let Err(e) = a.tier_all(0).await {
-                                eprintln!("background job failed: {e:#}");
-                            }
+                            let failed = a.tier_all(0).await.inspect_err(|e| eprintln!("background job failed: {e:#}")).is_err();
                             tokio::time::sleep_until(start + period).await;
-                            let _ = tokio::time::timeout(period * 4, hwm.changed()).await; // (right away if rows came meanwhile)
+                            // (right away if rows came meanwhile; a round that failed, say on a full
+                            // disk, is tried again then too, not only once more rows come)
+                            if !failed {
+                                let _ = tokio::time::timeout(period * 4, hwm.changed()).await;
+                            }
                         }
                     });
                 }

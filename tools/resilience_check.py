@@ -357,10 +357,12 @@ def disk(a):
     """Three nodes on a lake on local disk, and the disk full: reads go on, writes wait (nothing
     is acknowledged that isn't kept), and once there is room again every write lands once and
     the log drains into files."""
-    # (64 MB, and 32 MB passes too: a lake on local disk clears its catalog's WAL every 5 s and the
-    # files its compactor replaced a minute on. It kept two minutes of WAL (40 to 80 MB at this
-    # load) and those files 15 minutes: it filled this disk on its own once the filler went, and
-    # with no room to flush the catalog nothing could clear it.)
+    # (64 MB: a lake on local disk clears its catalog's WAL every 5 s and the files its compactor
+    # replaced a minute on, and its writes wait while less than a quarter of the disk is free, so
+    # the catalog can flush and tiering write its files. It kept two minutes of WAL and those files
+    # 15 minutes, and wrote until the disk was full: it filled this disk again on its own once the
+    # filler went (one CI run in five), and with no room to flush the catalog or write a file,
+    # nothing could clear it. On 32 MB it recovers too, its writes waiting a minute or two.)
     mnt, nodes = small_disk(64), []
     if not check("a 64 MB disk for the lake", mnt, "can't mount one: needs root, or sudo without a password"):
         return

@@ -391,25 +391,34 @@ fn disk_tier(url: &str, store: &Store) -> Option<Arc<crate::cache::Disk>> {
     let dir = std::env::var("PONDRA_CACHE_DIR").map(std::path::PathBuf::from).unwrap_or_else(|_| std::env::temp_dir().join("pondra-cache"));
     let bytes = match std::env::var("PONDRA_CACHE_GB").ok().and_then(|v| v.parse::<u64>().ok()) {
         Some(gb) => gb << 30,
-        None => free_bytes(&dir).map_or(20 << 30, |free| (free / 4).min(20 << 30)),
+        None => space(&dir).map_or(20 << 30, |(free, _)| (free / 4).min(20 << 30)),
     };
     let dir = dir.join(url.trim_start_matches("s3://").replace(['/', ':', '\\'], "_")); // one folder per lake
     (bytes > 0).then(|| crate::cache::Disk::open(dir, bytes, store.clone()).ok()).flatten()
 }
 
-/// Free bytes on the disk that holds `dir` (or its nearest existing parent), where the platform says.
-fn free_bytes(dir: &std::path::Path) -> Option<u64> {
+/// Free and total bytes of the disk that holds `dir` (or its nearest existing parent), where the
+/// platform says.
+fn space(dir: &std::path::Path) -> Option<(u64, u64)> {
     #[cfg(unix)]
     {
         let at = std::ffi::CString::new(dir.ancestors().find(|a| a.exists())?.as_os_str().as_encoded_bytes()).ok()?;
         let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
-        (unsafe { libc::statvfs(at.as_ptr(), &mut s) } == 0).then(|| s.f_bavail as u64 * s.f_frsize as u64)
+        (unsafe { libc::statvfs(at.as_ptr(), &mut s) } == 0).then(|| (s.f_bavail as u64 * s.f_frsize as u64, s.f_blocks as u64 * s.f_frsize as u64))
     }
     #[cfg(not(unix))]
     {
         let _ = dir;
         None
     }
+}
+
+/// Room a lake on local disk keeps for its own upkeep: a quarter of the disk, 256 MB at most.
+/// Commits wait while less is free (`log::Sequencer`), so the catalog can still flush and
+/// tiering write the files that let the log go: a disk the lake filled to its last byte had
+/// room for neither, and kept a log that never drained.
+pub fn short_of_room(dir: &std::path::Path) -> Option<(u64, u64)> {
+    space(dir).map(|(free, total)| (free, (total / 4).min(256 << 20))).filter(|(free, keep)| free < keep)
 }
 
 pub struct Lake {
