@@ -1,0 +1,211 @@
+{
+ "queries": 100000,
+ "agree": 99970,
+ "both_refused": 0,
+ "pondra_refused": 28,
+ "duckdb_refused": 0,
+ "partitions_checked": 42826,
+ "spread_checked": 9996,
+ "seed": 3434,
+ "nodes": 3,
+ "secs": 1353,
+ "found": [
+  {
+   "oracle": "duckdb",
+   "sql": "SELECT t1.c3 AS e0, abs(((- t1.c3) + 0.0)) AS e1 FROM t2 JOIN t1 ON t2.c1 = t1.c1 WHERE (CASE WHEN (t2.c2 IS DISTINCT FROM t1.c2) THEN COALESCE(t1.c1, t2.c1) ELSE upper(t1.c1) END IN (CASE WHEN (t1.c0 IS NULL) THEN lower(t1.c1) ELSE (NULL || NULL) END, 'a'))",
+   "pondra": "500: b'type_coercion\\ncaused by\\nError during planning: Cannot infer common string type for string concat operation Null || Null'"
+  },
+  {
+   "oracle": "partitions",
+   "sql": "SELECT abs(CASE WHEN (t2.c1 IS NOT NULL) THEN (t2.c0 * t2.c0) ELSE (t2.c0 * t2.c0) END) AS e0, COALESCE(t2.c1, DATE '2026-01-25') AS e1, COALESCE((CASE WHEN (t2.c0 < -1.25) THEN 'a' ELSE 'zz' END || lower(t2.c2)), upper(t2.c2)) AS e2 FROM t2 WHERE (COALESCE(COALESCE(t2.c1, DATE '2026-03-21'), DATE '2026-04-22') IS DISTINCT FROM COALESCE(COALESCE(t2.c1, DATE '2026-05-12'), DATE '2026-01-13')) AND ((COALESCE((NULL || NULL), t2.c2) IN (t2.c2, 'abc')))",
+   "pondra": "500: b'type_coercion\\ncaused by\\nError during planning: Cannot infer common string type for string concat operation Null || Null'"
+  },
+  {
+   "oracle": "duckdb",
+   "sql": "SELECT (t1.c0 - NULL) AS e0, 0.19 AS e1, CASE WHEN ((t0.c1 IN (t0.c1, DATE '2026-08-12')) OR ((DATE '2026-05-23' = t0.c1) AND (FALSE < t0.c4))) THEN t1.c0 ELSE (abs(t1.c0) + COALESCE(t1.c2, -413393815251)) END AS e2, (COALESCE((NULL || NULL), t0.c0) || t0.c0) AS e3 FROM t1 CROSS JOIN t0 WHERE (t0.c5 IS DISTINCT FROM COALESCE(t0.c5, DATE '2026-09-16'))",
+   "pondra": "500: b'Error during planning: Cannot infer common string type for string concat operation Null || Null'"
+  },
+  {
+   "oracle": "partitions",
+   "sql": "SELECT COALESCE(DATE '2026-06-13', DATE '2026-01-23') AS e0, ((t1.c2 <= t1.c2) AND ((-4 < t1.c2) AND (4.66 <> 4.86))) AS e1, t2.c2 AS e2, t1.c3 AS e3 FROM t2 JOIN t1 ON t2.c3 = t1.c3",
+   "split_on": "((NOT (t2.c1 IN (t1.c3, FALSE))) OR (t2.c1 IN ((t1.c1 > t1.c1), FALSE)))"
+  },
+  {
+   "oracle": "partitions",
+   "sql": "SELECT COALESCE(COALESCE(DATE '2026-09-27', NULL), DATE '2026-05-13') AS e0 FROM t1 WHERE (t1.c3 IN ((NULL IS NOT NULL), TRUE))",
+   "split_on": "(t1.c3 IN (NULL, NULL))"
+  },
+  {
+   "oracle": "duckdb",
+   "sql": "SELECT DISTINCT 5 AS e0, t1.c5 AS e1, upper((NULL || NULL)) AS e2, t1.c0 AS e3 FROM t0 JOIN t1 ON t0.c1 = t1.c5",
+   "pondra": "500: b'Error during planning: Cannot infer common string type for string concat operation Null || Null'"
+  },
+  {
+   "oracle": "duckdb",
+   "sql": "SELECT DISTINCT (NULL || NULL) AS e0, CASE WHEN ((NOT (t0.c3 <= t0.c3)) OR (t0.c2 IS NULL)) THEN CASE WHEN (t0.c3 IS NULL) THEN COALESCE(NULL, '') ELSE upper('zz') END ELSE (('zz' || 'zz') || COALESCE('b', 'abc')) END AS e1 FROM t0 WHERE (t0.c1 IS DISTINCT FROM t0.c1)",
+   "pondra": "500: b'Error during planning: Cannot infer common string type for string concat operation Null || Null'"
+  },
+  {
+   "oracle": "duckdb",
+   "sql": "SELECT t0.c1 AS k0, min(t0.c0) AS a0, max(t0.c0) AS a1, count(*) AS n FROM t0 WHERE (upper((NULL || NULL)) IS NOT NULL) GROUP BY t0.c1",
+   "pondra": "500: b'type_coercion\\ncaused by\\nError during planning: Cannot infer common string type for string concat operation Null || Null'"
+  },
+  {
+   "oracle": "partitions",
+   "sql": "SELECT t0.c0 AS e0, (t0.c1 + t0.c1) AS e1, t0.c2 AS e2 FROM t0 WHERE (t0.c0 IN ((- (- t0.c0)), -1))",
+   "split_on": "(NOT (NOT (t0.c0 IN (t0.c0, -4))))"
+  },
+  {
+   "oracle": "duckdb",
+   "sql": "SELECT CASE WHEN (CASE WHEN (t1.c2 = t1.c2) THEN t0.c1 ELSE t1.c1 END IS NOT NULL) THEN (- t0.c2) ELSE COALESCE(abs(t0.c2), abs(t0.c2)) END AS e0, t1.c3 AS e1 FROM t0 JOIN t1 ON t0.c4 = t1.c4 WHERE ((NULL || NULL) IS NOT NULL)",
+   "pondra": "500: b'type_coercion\\ncaused by\\nError during planning: Cannot infer common string type for string concat operation Null || Null'"
+  },
+  {
+   "oracle": "duckdb",
+   "sql": "SELECT abs(CASE WHEN (t0.c2 IS DISTINCT FROM t1.c2) THEN t0.c0 ELSE COALESCE(t0.c0, t1.c0) END) AS e0, t0.c1 AS e1, COALESCE(lower(lower(NULL)), t0.c2) AS e2, t1.c0 AS e3 FROM t0 LEFT JOIN t1 ON t0.c0 = t1.c0 WHERE (((- t1.c1) - abs(t1.c1)) IS DISTINCT FROM COALESCE(COALESCE(3, NULL), (-4 + -25099390234)))",
+   "pondra": "500: b\"ProjectionPushdown\\ncaused by\\nInternal error: Assertion failed: col.name() == matching_name: Input field name c0 does not match with the projection expression c2.\\nThis issue was likely caused by a bug in DataFusion's code. Please help us to resolve this by filing a bug report in our issue t"
+  },
+  {
+   "oracle": "duckdb",
+   "sql": "SELECT upper('Z') AS e0, lower((upper('Z') || (NULL || NULL))) AS e1, lower('b') AS e2 FROM t0 WHERE (((t0.c0 IS NULL) OR (t0.c2 IS NOT NULL)) OR (abs(t0.c1) IN (CASE WHEN (t0.c1 = t0.c1) THEN t0.c1 ELSE t0.c1 END, 819155472810)))",
+   "pondra": "500: b'Error during planning: Cannot infer common string type for string concat operation Null || Null'"
+  },
+  {
+   "oracle": "partitions",
+   "sql": "SELECT -2 AS e0, NULL AS e1, (-1 + (- (- -524144380312))) AS e2 FROM t0 WHERE (NOT (COALESCE(3.70, t0.c1) IS NOT NULL)) AND (((t0.c2 || (NULL || NULL)) IS NULL))",
+   "pondra": "500: b'Error during planning: Cannot infer common string type for string concat operation Null || Null'"
+  },
+  {
+   "oracle": "partitions",
+   "sql": "SELECT 5 AS e0 FROM t1 JOIN t0 ON t1.c1 = t0.c3 WHERE ((NOT (t0.c3 IS NULL)) AND (NOT ((t1.c0 < TRUE) AND ('zz' = t1.c1)))) AND (((abs(2.0) IS DISTINCT FROM (t1.c3 - NULL)) AND ((NULL || NULL) <= CASE WHEN (t1.c3 = 2.0) THEN t1.c1 ELSE '' END)))",
+   "pondra": "500: b'type_coercion\\ncaused by\\nError during planning: Cannot infer common string type for string concat operation Null || Null'"
+  },
+  {
+   "oracle": "duckdb",
+   "sql": "SELECT t1.c0 AS k0, count(t1.c1) AS a0, count(t1.c2) AS a1, count(t1.c2) AS a2, count(*) AS n FROM t1 WHERE (t1.c1 = COALESCE('ab', (NULL || NULL))) GROUP BY t1.c0",
+   "pondra": "500: b'type_coercion\\ncaused by\\nError during planning: Cannot infer common string type for string concat operation Null || Null'"
+  },
+  {
+   "oracle": "duckdb",
+   "sql": "SELECT COALESCE((('ba' || 'ba') || CASE WHEN (-0.5 = t1.c1) THEN 'Z' ELSE '' END), COALESCE('b', 'b')) AS e0, NULL AS e1, lower(COALESCE((NULL || NULL), CASE WHEN (TRUE <> t0.c2) THEN 'b' ELSE 'ab' END)) AS e2 FROM t0 JOIN t1 ON t0.c2 = t1.c3",
+   "pondra": "500: b'Error during planning: Cannot infer common string type for string concat operation Null || Null'"
+  },
+  {
+   "oracle": "duckdb",
+   "sql": "SELECT DISTINCT CASE WHEN (COALESCE(t0.c2, DATE '2026-03-27') IS DISTINCT FROM COALESCE(t0.c2, DATE '2026-06-17')) THEN COALESCE((NULL || NULL), 'ab') ELSE ('zz' || 'Z') END AS e0, (CASE WHEN (3.02 IS NULL) THEN CASE WHEN (t0.c0 > t0.c0) THEN 'ba' ELSE 'a' END ELSE upper('abc') END || upper('Z')) AS e1 FROM t1 JOIN t0 ON t1.c0 = t0.c5 WHERE ((t1.c0 < COALESCE(t0.c2, DATE '2026-03-20')) AND (NOT (2 <> t0.c0)))",
+   "pondra": "500: b'Error during planning: Cannot infer common string type for string concat operation Null || Null'"
+  },
+  {
+   "oracle": "duckdb",
+   "sql": "SELECT 'b' AS e0, ('a' || upper((NULL || NULL))) AS e1 FROM t0 JOIN t1 ON t0.c2 = t1.c1",
+   "pondra": "500: b'Error during planning: Cannot infer common string type for string concat operation Null || Null'"
+  },
+  {
+   "oracle": "duckdb",
+   "sql": "SELECT t2.c4 AS k0, t2.c5 AS k1, max(t2.c0) AS a0, max(t2.c3) AS a1, max(t2.c0) AS a2, count(*) AS n FROM t2 WHERE ((t2.c5 IN ((-1.25 <> t2.c4), TRUE)) AND (t2.c5 IN ((-1.14 = t2.c1), FALSE))) GROUP BY t2.c4, t2.c5",
+   "pondra": "[]",
+   "duckdb": "[(-1.25, False, -2.0, None, -2.0, 1.0)]"
+  },
+  {
+   "oracle": "duckdb",
+   "sql": "SELECT COALESCE(((-0.5 * 0.5) - (NULL * 3.75)), ((3.75 - 3.75) * COALESCE(0.5, -1.25))) AS e0, -0.5 AS e1, abs(abs((- NULL))) AS e2 FROM t1 LEFT JOIN t0 ON t1.c1 = t0.c4",
+   "pondra": "500: b\"Optimizer rule 'simplify_expressions' failed\\ncaused by\\nError during planning: CASE expression 'then' values had multiple data types: Decimal128(4, 2), Decimal128(8, 4)\""
+  },
+  {
+   "oracle": "duckdb",
+   "sql": "SELECT CASE WHEN ((t2.c1 IS NOT NULL) OR ((t2.c0 <> 3.75) AND (t2.c2 <= t2.c2))) THEN lower(NULL) ELSE CASE WHEN (NOT (t2.c1 < t2.c1)) THEN COALESCE('abc', 'ba') ELSE (NULL || NULL) END END AS e0, COALESCE(lower(upper('ba')), upper('ba')) AS e1, 'zz' AS e2 FROM t2 WHERE (t2.c2 IN (t2.c2, DATE '2026-06-25'))",
+   "pondra": "500: b'type_coercion\\ncaused by\\nError during planning: Cannot infer common string type for string concat operation Null || Null'"
+  },
+  {
+   "oracle": "duckdb",
+   "sql": "SELECT 'ab' AS e0, ((CASE WHEN (t2.c2 <> t2.c2) THEN NULL ELSE NULL END || NULL) || (COALESCE('', 'ba') || ('zz' || ''))) AS e1, CASE WHEN ((t2.c2 IN (DATE '2026-06-14', DATE '2026-08-11')) AND (NOT (t2.c1 <= t2.c1))) THEN 'ab' ELSE lower(lower('b')) END AS e2 FROM t2",
+   "pondra": "500: b'Error during planning: Cannot infer common string type for string concat operation Null || Null'"
+  },
+  {
+   "oracle": "partitions",
+   "sql": "SELECT t0.c2 AS e0, (t0.c1 || t0.c2) AS e1, ((t0.c1 || COALESCE('Z', t0.c2)) || CASE WHEN ('Z' IS NULL) THEN (t0.c2 || t0.c1) ELSE CASE WHEN (t0.c1 > t0.c1) THEN NULL ELSE t0.c2 END END) AS e2 FROM t0 WHERE (lower(t0.c1) IS DISTINCT FROM upper(COALESCE(t0.c2, t0.c1))) AND (((-4.64 IS DISTINCT FROM (t0.c0 + -2.26)) OR ((NULL || NULL) IS NULL)))",
+   "pondra": "500: b'type_coercion\\ncaused by\\nError during planning: Cannot infer common string type for string concat operation Null || Null'"
+  },
+  {
+   "oracle": "duckdb",
+   "sql": "SELECT t1.c2 AS k0, t1.c0 AS k1, sum(t1.c2) AS a0, count(t1.c2) AS a1, min(t1.c0) AS a2, count(*) AS n FROM t1 WHERE (((t1.c1 IN (t1.c1, '')) AND (t1.c1 IN ('abc', 'a'))) AND (NOT ((t1.c2 <> t1.c2) OR ('ab' = 'zz')))) GROUP BY t1.c2, t1.c0",
+   "pondra": "[]",
+   "duckdb": "[(-5.0, '2026-01-11', -5.0, 1.0, '2026-01-11', 1.0), (-5.0, None, -5.0, 1.0, None, 1.0), (-4.0, '2026-05-26', -4.0, 1.0, '2026-05-26', 1.0), (-4.0, '2026-06-24', -4.0, 1.0, '2026-06-24', 1.0), (-3.0, '2026-06-26', -3.0, 1.0, '2026-06-26', 1.0)]"
+  },
+  {
+   "oracle": "duckdb",
+   "sql": "SELECT COALESCE('b', lower((NULL || NULL))) AS e0 FROM t1 WHERE (((t1.c1 - t1.c1) IS DISTINCT FROM (t1.c3 + t1.c3)) OR ((- t1.c4) IS NULL))",
+   "pondra": "500: b'Error during planning: Cannot infer common string type for string concat operation Null || Null'"
+  },
+  {
+   "oracle": "duckdb",
+   "sql": "SELECT t0.c3 AS k0, min(t1.c2) AS a0, count(*) AS n FROM t1 LEFT JOIN t0 ON t1.c0 = t0.c0 WHERE (t1.c1 = CASE WHEN ('ba' IN (t1.c1, 'ba')) THEN (NULL || NULL) ELSE t1.c1 END) GROUP BY t0.c3",
+   "pondra": "500: b'type_coercion\\ncaused by\\nError during planning: Cannot infer common string type for string concat operation Null || Null'"
+  },
+  {
+   "oracle": "duckdb",
+   "sql": "SELECT DISTINCT NULL AS e0, FALSE AS e1, CASE WHEN (('ab' <= t0.c1) AND (NOT (-1.20 < t0.c2))) THEN (- COALESCE(-1.13, t0.c2)) ELSE t1.c2 END AS e2, CASE WHEN ((NULL || NULL) IS DISTINCT FROM upper(t1.c3)) THEN t0.c1 ELSE upper(upper(t1.c3)) END AS e3 FROM t1 JOIN t0 ON t1.c0 = t0.c3 WHERE (COALESCE(COALESCE(t1.c0, DATE '2026-03-11'), DATE '2026-09-15') IS NOT NULL)",
+   "pondra": "500: b'type_coercion\\ncaused by\\nError during planning: Cannot infer common string type for string concat operation Null || Null'"
+  },
+  {
+   "oracle": "duckdb",
+   "sql": "SELECT ((COALESCE(2.0, t1.c3) * CASE WHEN (t1.c3 = t1.c3) THEN t1.c3 ELSE 0.5 END) * NULL) AS e0 FROM t1",
+   "pondra": "500: b'type_coercion\\ncaused by\\nError during planning: Cannot get result type for arithmetic operation Decimal128(38, 30) * Decimal128(38, 30): Invalid argument error: Output scale of Decimal128(38, 30) * Decimal128(38, 30) would exceed max scale of 38'"
+  },
+  {
+   "oracle": "duckdb",
+   "sql": "SELECT 'b' AS e0, ((CASE WHEN (t0.c1 > t0.c1) THEN 'Z' ELSE 'Z' END || 'abc') || COALESCE((NULL || NULL), CASE WHEN (t0.c2 <> t0.c2) THEN 'b' ELSE 'ab' END)) AS e1 FROM t0 WHERE (CASE WHEN (0.5 IS NULL) THEN t0.c1 ELSE CASE WHEN (-0.5 >= t0.c3) THEN t0.c1 ELSE t0.c1 END END IS NOT NULL)",
+   "pondra": "500: b'Error during planning: Cannot infer common string type for string concat operation Null || Null'"
+  },
+  {
+   "oracle": "duckdb",
+   "sql": "SELECT CASE WHEN (TRUE IS NOT NULL) THEN NULL ELSE upper(lower('zz')) END AS e0, lower(NULL) AS e1, (COALESCE((NULL || NULL), lower('b')) || COALESCE('', ('ba' || NULL))) AS e2 FROM t1 JOIN t0 ON t1.c0 = t0.c2 WHERE ((t1.c3 IS NULL) IS NOT NULL)",
+   "pondra": "500: b'Error during planning: Cannot infer common string type for string concat operation Null || Null'"
+  },
+  {
+   "oracle": "duckdb",
+   "sql": "SELECT DISTINCT lower(CASE WHEN (t2.c0 IN (2, 193575917159)) THEN 'b' ELSE 'a' END) AS e0, ('abc' || lower('abc')) AS e1, (NULL || NULL) AS e2 FROM t2 WHERE (((- 803961421388) IS NULL) OR (NOT ((3.73 = t2.c4) AND (493512419170 < t2.c0))))",
+   "pondra": "500: b'Error during planning: Cannot infer common string type for string concat operation Null || Null'"
+  },
+  {
+   "oracle": "duckdb",
+   "sql": "SELECT t1.c1 AS k0, t1.c4 AS k1, sum(t0.c1) AS a0, min(t1.c1) AS a1, count(t0.c3) AS a2, count(*) AS n FROM t1 LEFT JOIN t0 ON t1.c1 = t0.c3 WHERE (upper((NULL || NULL)) IS DISTINCT FROM t1.c4) GROUP BY t1.c1, t1.c4",
+   "pondra": "500: b'type_coercion\\ncaused by\\nError during planning: Cannot infer common string type for string concat operation Null || Null'"
+  },
+  {
+   "oracle": "duckdb",
+   "sql": "SELECT lower((lower('zz') || '')) AS e0, ('b' || CASE WHEN ((t1.c1 > 3.65) OR (-1.06 >= 4.50)) THEN CASE WHEN (t1.c1 = t1.c1) THEN 'b' ELSE 'a' END ELSE (NULL || NULL) END) AS e1, 'Z' AS e2 FROM t1 WHERE ((t1.c2 - (- t1.c1)) IN (COALESCE(4.96, 1.92), -1.60))",
+   "pondra": "500: b'type_coercion\\ncaused by\\nError during planning: Cannot infer common string type for string concat operation Null || Null'"
+  },
+  {
+   "oracle": "duckdb",
+   "sql": "SELECT DISTINCT COALESCE(CASE WHEN ((t1.c3 >= t1.c0) OR (t0.c3 < t0.c3)) THEN CASE WHEN (t1.c1 <= t0.c1) THEN t0.c0 ELSE 2.0 END ELSE abs(3.75) END, abs(COALESCE(t0.c0, t0.c0))) AS e0, CASE WHEN ((0 < -2) IS DISTINCT FROM t0.c2) THEN ('a' || 'ba') ELSE lower(t1.c1) END AS e1, (t1.c1 = t0.c1) AS e2, t1.c3 AS e3 FROM t0 LEFT JOIN t1 ON t0.c3 = t1.c0 WHERE ((COALESCE(-932767255194, t1.c2) IS DISTINCT FROM t1.c2) OR ((t1.c2 + t1.c2) >= CASE WHEN (2 >= 3) THEN t1.c2 ELSE t1.c2 END))",
+   "pondra": "500: b\"ProjectionPushdown\\ncaused by\\nInternal error: Assertion failed: col.name() == matching_name: Input field name c0 does not match with the projection expression c3.\\nThis issue was likely caused by a bug in DataFusion's code. Please help us to resolve this by filing a bug report in our issue t"
+  },
+  {
+   "oracle": "duckdb",
+   "sql": "SELECT COALESCE((CASE WHEN (t0.c3 <= t0.c3) THEN 'zz' ELSE 'zz' END || 'zz'), ((NULL || NULL) || 'ba')) AS e0, COALESCE(('abc' || ('' || 'a')), NULL) AS e1 FROM t0",
+   "pondra": "500: b'Error during planning: Cannot infer common string type for string concat operation Null || Null'"
+  },
+  {
+   "oracle": "duckdb",
+   "sql": "SELECT 'ab' AS e0, upper('ba') AS e1, COALESCE('ab', COALESCE(COALESCE('ab', 'ba'), (NULL || NULL))) AS e2 FROM t2 LEFT JOIN t0 ON t2.c2 = t0.c0 WHERE (((0 <= t2.c0) IS NOT NULL) AND ((t0.c0 IS NULL) AND (NOT (t2.c3 <> -5))))",
+   "pondra": "500: b'Error during planning: Cannot infer common string type for string concat operation Null || Null'"
+  },
+  {
+   "oracle": "partitions",
+   "sql": "SELECT t0.c0 AS e0, t0.c1 AS e1, abs(abs(CASE WHEN (t0.c1 = t0.c0) THEN -4 ELSE t0.c2 END)) AS e2, upper(lower('b')) AS e3 FROM t0 WHERE ((abs(t0.c2) IS NOT NULL) OR (abs(0.5) IS NOT NULL))",
+   "split_on": "((COALESCE(t0.c4, NULL) IS DISTINCT FROM DATE '2026-08-12') AND ((t0.c3 IN (t0.c3, 'Z')) OR (('abc' <> t0.c3) AND (t0.c3 <> 'ab'))))"
+  },
+  {
+   "oracle": "partitions",
+   "sql": "SELECT -301904738278 AS e0 FROM t2 WHERE (t2.c0 IN (0.5, -0.5))",
+   "split_on": "(t2.c0 IN (abs((t2.c4 - t2.c4)), 3.75))"
+  },
+  {
+   "oracle": "duckdb",
+   "sql": "SELECT CASE WHEN ((0.01 IS NOT NULL) OR (1 IN (-3, -2))) THEN ((NULL || '') || CASE WHEN (t0.c2 = t0.c2) THEN 'ab' ELSE NULL END) ELSE upper(COALESCE('Z', '')) END AS e0, NULL AS e1, CASE WHEN ((t1.c0 IS DISTINCT FROM 508036939149) AND (-2 IS DISTINCT FROM t1.c1)) THEN (NULL || NULL) ELSE CASE WHEN (t1.c2 IN (t1.c2, 5)) THEN lower(NULL) ELSE CASE WHEN (-4.48 >= t0.c2) THEN 'ab' ELSE 'ba' END END END AS e2 FROM t1 CROSS JOIN t0",
+   "pondra": "500: b'Error during planning: Cannot infer common string type for string concat operation Null || Null'"
+  }
+ ]
+}

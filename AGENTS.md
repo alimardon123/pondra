@@ -1492,6 +1492,16 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    in the text (the generic dialect reads it as JSON's arrow) and becomes one where a query is
    planned (`query::sql`, at every planning site). `harness.py friendly`: 30 forms == DuckDB's
    answers, spread == one node, over Postgres, in a view and a materialized view.
+226. **What DataFusion answers wrong is mended where it goes wrong, and the query that showed it
+   stays a check** (`tools/random_sql.py`, D2): an IN list that isn't all values (a column, a NULL,
+   an expression) is ORs before DataFusion's simplifier sees it (`optimize::InListOfRows`, the
+   first logical rule: two lists of one column were intersected as sets of values, and `x NOT IN
+   (NULL)` was dropped); `ProjectionPushdown` leaves a projection on a filter that has one of its
+   own where it is (`optimize::GuardedPushdown`: DataFusion swapped them as if the filter's own
+   weren't there, and the columns pointed at others); a statement written back as text goes through
+   `routines::sql` (sqlparser writes `- -3` as `--3`, a comment); DataFusion's aggregate schema
+   check is off (its two analyses of a CASE's nullability disagree; the rows are the same).
+   `harness.py friendly`'s last five checks fail without them.
 
 ## Tests: run these before and after any change
 
@@ -1514,6 +1524,7 @@ python3 tools/harness.py hot            # hot columns skip batches by their rang
 python3 tools/harness.py minmax         # a global min/max over 24 files skips no row its other answers need (an expression, NULLs so far, FILTER); a wide top-N's answer
 python3 tools/harness.py history        # pondra.history: every door's statements, slow ones' plans and three nodes' traces, the rate, off, who reads what
 python3 tools/harness.py friendly       # DuckDB's spellings (PIVOT, COLUMNS, lambdas, ASOF … ON, SUMMARIZE, samples, …) == DuckDB's answers; spread, Postgres, views
+python3 tools/random_sql.py --queries 100000 # random queries: one node == DuckDB, every tenth == three nodes, each split three ways by a condition (TLP)
 python3 tools/harness.py tasks          # task graphs on three nodes: AFTER, WHEN, pondra.result, retries, timeouts, SUSPEND, refusals, a failover
 python3 tools/harness.py sparksql       # spark.sql / spark_sql('…') in Spark's grammar: literals, LATERAL VIEW, Spark's floor and substring, frames on top, refusals
 python3 tools/harness.py flows          # views of views in one commit, rollups, expectations (keep, drop, fail), changes down the flow
