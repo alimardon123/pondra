@@ -126,12 +126,12 @@ Measured with 2 million keys on one 2-vCPU machine, with the load generator on t
 
 ## Add up numbers: merge tables
 
-Give a keyed table `merge` and the rows for a key combine instead of replacing each other. Each
-column except the key takes `sum`, `count`, `min` or `max`, and `CREATE` refuses a table that leaves one
-out.
+Give a keyed table's columns `MERGE` and the rows for a key combine instead of replacing each
+other. Each column except the key takes `sum`, `count`, `min` or `max`, and `CREATE` refuses a table
+that leaves one out.
 
 ```sql
-CREATE TABLE spend (user VARCHAR PRIMARY KEY, total BIGINT, n BIGINT) WITH (merge = 'total:sum,n:sum');
+CREATE TABLE spend (user VARCHAR PRIMARY KEY, total BIGINT MERGE sum, n BIGINT MERGE sum);
 INSERT INTO spend VALUES ('ann', 5, 1), ('bob', 3, 1);
 INSERT INTO spend VALUES ('ann', 7, 1);
 SELECT * FROM spend ORDER BY user;
@@ -170,11 +170,11 @@ SELECT * FROM per_user ORDER BY user;
 
 ## Expire rows with a TTL
 
-`ttl = 'column:seconds'` hides rows whose timestamp column is older than that many seconds. A full
+`TTL column + INTERVAL '…'` hides rows whose timestamp column is older than that. A full
 compaction deletes them from the files.
 
 ```sql
-CREATE TABLE sessions (id VARCHAR PRIMARY KEY, seen TIMESTAMP, who VARCHAR) WITH (ttl = 'seen:3600');
+CREATE TABLE sessions (id VARCHAR PRIMARY KEY, seen TIMESTAMP, who VARCHAR) TTL seen + INTERVAL '1 hour';
 INSERT INTO sessions VALUES ('a', now(), 'ann'), ('b', TIMESTAMP '2020-01-01 00:00:00', 'bob');
 SELECT id, who FROM sessions ORDER BY id;
 ```
@@ -187,15 +187,15 @@ SELECT id, who FROM sessions ORDER BY id;
 +----+-----+
 ```
 
-Change it later with `ALTER TABLE sessions SET (ttl = 'seen:7200')`.
+Change it later with `ALTER TABLE sessions TTL seen + INTERVAL '2 hours'`.
 
 ## Keep the latest event, not the last to arrive
 
-By default the last row written for a key wins. With `order_by`, the row with the greatest value in
-that column wins, however late it arrives. This is what Flink calls deduplication by event time.
+By default the last row written for a key wins. With `SEQUENCE BY`, the row with the greatest value
+in that column wins, however late it arrives. This is what Flink calls deduplication by event time.
 
 ```sql
-CREATE TABLE readings (sensor VARCHAR PRIMARY KEY, ts TIMESTAMP, temp DOUBLE) WITH (order_by = 'ts');
+CREATE TABLE readings (sensor VARCHAR PRIMARY KEY, ts TIMESTAMP, temp DOUBLE) SEQUENCE BY ts;
 INSERT INTO readings VALUES ('s1', TIMESTAMP '2026-09-29 10:00:00', 20.0);
 INSERT INTO readings VALUES ('s1', TIMESTAMP '2026-09-29 09:00:00', 18.0);
 SELECT * FROM readings;
@@ -272,13 +272,13 @@ ls lake/data/counters | wc -l
 
 ## Partition and cluster a keyed table
 
-A key goes together with `partition_by` and `cluster_by`. Each tiering round writes a file per
+A key goes together with `PARTITION BY` and `CLUSTER BY`. Each tiering round writes a file per
 partition, sorted by the cluster columns and then the key. A newer row for a key hides an older one
 in any partition, so a row that moves to another day still has one current version.
 
 ```sql
 CREATE TABLE visits (id BIGINT PRIMARY KEY, user VARCHAR, ts TIMESTAMP, page VARCHAR)
-  WITH (partition_by = 'day(ts)', cluster_by = 'user');
+  PARTITION BY day(ts) CLUSTER BY (user);
 INSERT INTO visits VALUES (1, 'ann', TIMESTAMP '2026-09-28 10:00:00', '/a'), (2, 'bob', TIMESTAMP '2026-09-28 11:00:00', '/b');
 INSERT INTO visits VALUES (1, 'ann', TIMESTAMP '2026-09-29 09:00:00', '/c');
 SELECT id, page FROM visits ORDER BY id;
@@ -317,4 +317,4 @@ tiering rounds pile up. `CHECKPOINT` compacts a published keyed table so they se
 [ADR-006](https://github.com/alimardon123/pondra/blob/main/docs/adr-006-serving-and-lsm.md) explains
 the merge tree and the serving reads.
 [ADR-021](https://github.com/alimardon123/pondra/blob/main/docs/adr-021-fewer-objects-and-streams.md)
-covers keys with `partition_by` and `cluster_by`.
+covers keys with `PARTITION BY` and `CLUSTER BY`.

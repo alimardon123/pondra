@@ -256,11 +256,11 @@ Stream joins run on the leader alone, and start from the moment the view is made
 
 ## Keep the newest row by event time
 
-A keyed table with `order_by` keeps, for each key, the row with the latest event time, not the last
+A keyed table with `SEQUENCE BY` keeps, for each key, the row with the latest event time, not the last
 row to arrive. This is Flink's deduplication by event time.
 
 ```sql
-CREATE TABLE latest (k BIGINT PRIMARY KEY, ts BIGINT, v VARCHAR) WITH (order_by = 'ts');
+CREATE TABLE latest (k BIGINT PRIMARY KEY, ts BIGINT, v VARCHAR) SEQUENCE BY ts;
 INSERT INTO latest VALUES (1, 100, 'new');
 INSERT INTO latest VALUES (1, 50, 'old');
 SELECT * FROM latest;

@@ -199,8 +199,8 @@ in whatever else its `publish` property names), and answers its first version:
 | `boolean`, `int`, `long`, `float`, `double`, `date`, `timestamp`, `timestamptz`, `string`, `binary`, `decimal(p, s)`, a `list` of one of them | `BOOLEAN`, `INT`, `BIGINT`, `REAL`, `DOUBLE`, `DATE`, `TIMESTAMP`, `TIMESTAMPTZ`, `VARCHAR`, `BYTEA`, `DECIMAL(p, s)`, `type[]` |
 | a required field | `NOT NULL` |
 | `identifier-field-ids` | `PRIMARY KEY` |
-| a partition spec of one field: `identity`, `year`, `month`, `day`, `hour` | `partition_by = 'col'`, `'day(col)'`… |
-| a write order of columns, ascending | `cluster_by` |
+| a partition spec of one field: `identity`, `year`, `month`, `day`, `hour` | `PARTITION BY col`, `PARTITION BY day(col)`… |
+| a write order of columns, ascending | `CLUSTER BY (col, …)` |
 
 Other types (`struct`, `map`, `uuid`, `time`, `fixed`), a spec of more than one field or by `bucket`
 or `truncate`, a descending order and a staged create are refused by name. Making, renaming and
