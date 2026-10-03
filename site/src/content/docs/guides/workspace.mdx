@@ -193,43 +193,11 @@ SELECT routine, args, caller, status, error FROM pondra.runs WHERE routine LIKE 
 - **Retried with a job, a run writes once.** Over HTTP, `POST /sql?job=…`; a task's tick has its
   own. Each statement of the file (and of the files it runs) gets its part of the job.
 - **The version is the file's `etag`.** A file is replaced in place when saved, so the log names
-  which version ran; keep the files in git ([below](#in-git)) for their history.
+  which version ran; keep the files in git (the console downloads them) for their history.
 
 ```sql
 DROP TASK nightly;
 ```
-
-## In git
-
-`pondra workspace pull DIR` writes the lake's files into a folder of your own, and `pondra workspace
-push DIR` sends back what changed there: edit them in your editor, commit them with git, review them
-in a pull request, then push them to the lake that runs them.
-
-```bash
-pondra workspace pull ws --url http://localhost:8080
-printf 'SELECT count(*) AS orders FROM orders;\n' > ws/etl/count.sql
-pondra workspace push ws --url http://localhost:8080
-```
-
-```text
-pulled 4, removed 0 here
-pushed 1, deleted 0 in the lake
-```
-
-- **Each side's changes reach the other.** A pull writes the files the lake changed since the last
-  sync and removes the ones it deleted; a push sends the files changed here, new ones too, and
-  deletes there the ones deleted here.
-- **A file changed on both sides is a conflict.** It is listed, left as it is on both sides, and
-  the command exits 1. Make the two the same (or take one side's), and the next sync goes on.
-- **What the folder last agreed with the lake** is `DIR/.pondra/workspace.json`: each file's version
-  in the lake and its checksum here. A push replaces a file only if the lake still has that version
-  (`If-Match`), so nothing anyone saved since is lost. Commit it with the files, or leave it out
-  with `.gitignore`; a folder without it pulls everything again.
-- **Names starting with `.`** (`.git`, `.gitignore`, `.pondra`, the lake's kept versions) stay on
-  their own side.
-- **Without `--url`** it starts a node on the lake you name (`pondra workspace pull ws ./lake`, or
-  `s3://bucket/lake`), as `pondra run` does. With tokens, `--token` (or `PONDRA_TOKEN`) is a writer's
-  for a push.
 
 ## In the console
 

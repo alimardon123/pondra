@@ -21,7 +21,7 @@ pub async fn run(dir: &str) -> Result<()> {
 
 /// A node on `dir`, here, for this program alone: it, its address, the key that lets this program's
 /// SQL read files on this machine (`FROM 'D:\data\jan.csv'`, as DuckDB's shell does), its log.
-pub(crate) fn start(dir: &str) -> Result<(Child, String, String, std::path::PathBuf)> {
+fn start(dir: &str) -> Result<(Child, String, String, std::path::PathBuf)> {
     if !dir.contains("://") {
         std::fs::create_dir_all(dir)?;
     }
@@ -41,7 +41,7 @@ pub(crate) fn start(dir: &str) -> Result<(Child, String, String, std::path::Path
 
 /// Only ever this machine's own node, over plain HTTP: never through a proxy the environment names
 /// (it couldn't reach the node), and no CA certificates needed (minimal images have none).
-pub(crate) async fn up(base: &str, node: &mut Child, log: &Path) -> Result<reqwest::Client> {
+async fn up(base: &str, node: &mut Child, log: &Path) -> Result<reqwest::Client> {
     let (http, started) = (reqwest::Client::builder().no_proxy().tls_certs_only([]).build()?, Instant::now());
     while http.get(format!("{base}/stats")).send().await.is_err() {
         if node.try_wait()?.is_some() || started.elapsed() > Duration::from_secs(120) {
@@ -171,7 +171,7 @@ async fn session(dir: &str, base: &str, key: &str, node: &mut Child, log: &Path)
 
 /// Stop the node by closing its input (`--stop-with-stdin`): it hands the lake on at once, rather
 /// than after the lease a killed leader leaves. (It would stop the same way if this shell died.)
-pub(crate) fn stop(node: &mut Child) {
+fn stop(node: &mut Child) {
     drop(node.stdin.take());
     let deadline = Instant::now() + Duration::from_secs(10);
     while node.try_wait().ok().flatten().is_none() && Instant::now() < deadline {

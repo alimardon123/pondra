@@ -71,7 +71,6 @@ mod spill;
 mod sparksql;
 mod spmd;
 mod store;
-mod sync;
 mod sys;
 mod tasks;
 mod temp;
@@ -255,13 +254,6 @@ enum Cmd {
     Service {
         #[command(subcommand)]
         cmd: service::Command,
-    },
-    /// The lake's files kept in a folder of your own, for git and your editor: `pondra workspace
-    /// pull ./ws` writes them there, `pondra workspace push ./ws` sends back what changed. A file
-    /// changed on both sides is listed and left as it is.
-    Workspace {
-        #[command(subcommand)]
-        cmd: sync::Command,
     },
     /// Print catalog entries whose keys start with `prefix` (t/ tables, s/ segments, p/ producers…).
     Catalog {
@@ -711,7 +703,6 @@ async fn run() -> anyhow::Result<()> {
             print!("{}", shell::script(lake.as_deref().unwrap_or("lake"), url.as_deref(), token.as_deref(), body).await?);
         }
         Cmd::Service { cmd } => service::command(cmd).await?,
-        Cmd::Workspace { cmd } => sync::command(cmd).await?,
         Cmd::Catalog { dir, prefix } => {
             let lake = store::Lake::open(&dir, false, false).await?;
             match prefix.starts_with("d/") {
