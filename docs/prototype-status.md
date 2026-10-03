@@ -180,6 +180,11 @@ optimizing; performance first):
   over after about 25 s); the Python and JavaScript clients failed while their node was down (they
   take every node's address now); `pondra sql` waited for ever on a missing bucket; a slow bucket
   was taken for a lost one. A PR's push runs CI only when labelled (`ci`, `full-ci`).
+- **A full local disk recovers on its own** (PR #18, `store.rs`): the catalog's write-ahead log
+  goes every 5 s on a local disk (95 MB at 90 s of small writes before, about 6 MB now) and a
+  compaction's replaced files a minute on (600 MB at six minutes and growing before, about 250 MB
+  level now); a full disk given room acks again within a second. `resilience_check.py disk` passes
+  on 64 MB and 32 MB.
 - **A table's past** (ADR-043, PR #13, `tools/history_check.py` 12 of 12): a dropped table is kept
   for its retention (a day unless the table says otherwise) and `UNDROP TABLE` brings it back;
   `SELECT … FROM t AT (VERSION => n | TIMESTAMP => '…' | OFFSET => -3600)` reads an append table as

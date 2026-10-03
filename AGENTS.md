@@ -1442,6 +1442,11 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    each one's part is its place and its loop's pass (`{job}:{path}`). A block's `DECLARE`s, a
    loop's row and a handler's `$error` end with them (`vars::local`, `Runner::unwind`); a lone
    `DECLARE` with no session is still refused. `harness.py scripts`.
+220. **A lake on local disk lets its catalog's garbage go within a minute** (`store::Catalog::writer`,
+   `unpin`): the write-ahead log goes every 5 s, and a compaction's replaced files a minute on, once
+   the compactor's 15-minute checkpoint is let go. A small disk the catalog filled otherwise had no
+   room to flush, so nothing could clear it. A bucket keeps its minute (C5). `tools/resilience_check.py
+   disk` on 64 MB.
 
 ## Tests: run these before and after any change
 
@@ -1608,7 +1613,7 @@ tail (213). Measured against DuckDB 1.5.5 and 2.0's preview, Flink 2.3, Apache K
 single-node engines (`prototype-status.md`, round 32; the site's performance and comparison
 pages). In the same release, round 33's first parts from the side threads: the lake format and
 upgrades (ADR-039, 207–211), deployment (ADR-041, 205–206), every mode under failure and the five
-faults it found (214–215), a table's past (`UNDROP`, retention per table, time travel `AT (…)`,
+faults it found (214–215), a full local disk that recovers on its own (220), a table's past (`UNDROP`, retention per table, time travel `AT (…)`,
 `RESTORE`, zero-copy `CLONE`: ADR-043, 216–218), `CREATE VIEW v (a, b)`, `DECLARE PARAMETER`
 (ADR-044), scripts that branch, loop and handle errors (ADR-045, 219) and the console's batches. Left of 33: the 24-hour R2 soak (the owner's machine),
 observability, environments.
@@ -2012,6 +2017,8 @@ Known limits, in the order they matter:
 7. **Memory is bounded by budgets, not by accounting.** What DataFusion counts is the big hash
    tables and sort buffers; Parquet decoding and the batches in flight are not counted, so the
    query budget defaults to a third of RAM and the hot columns watch the process's own memory.
+   A lake on a local disk needs room for about four minutes of its catalog's inline writes (a few
+   hundred MB under a stream of small batches); it no longer grows past that (invariant 220).
 8. **Kafka's edges:** one partition per topic, no transactions, sparse offsets, consumer groups
    in the leader's memory.
 9. **Streaming:** one watermark per source (not per partition or node), held by a quiet source;

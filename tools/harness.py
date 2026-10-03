@@ -168,9 +168,18 @@ def pct(xs, p):
 
 def crash():
     env = {"PONDRA_CRASH": "after_seg_put:0.03,after_commit:0.01,after_parquet_put:0.2"}  # commits are frequent: 1% each
-    # A restart redoes the tiering round the crash cut short, before it answers, and each of that
-    # round's files may abort it again: with a big round, 20 deaths in a row happened (CI).
-    RESTARTS = 200
+    def restart():  # a restart redoes the tiering round a crash cut short, before it answers, and each of
+        # that round's files may abort it again: a big round died 200 times in a row (CI). After 20, one
+        # start without the files' crashes gets the round through; the next start has them again.
+        try:
+            node.start()
+        except RuntimeError:
+            node.kill()
+            node.env["PONDRA_CRASH"] = "after_seg_put:0.03,after_commit:0.01"
+            try:
+                node.start()
+            finally:
+                node.env.update(env)
     totals = {}
     for run in range(1, A.runs + 1):
         lake = new_lake()
@@ -181,7 +190,7 @@ def crash():
                     return call(A.port, "POST", path, body)
                 except Exception:
                     if not node.alive():
-                        node.start(tries=RESTARTS)
+                        restart()
                     time.sleep(0.1)
             raise RuntimeError(f"{path}: the node kept crashing")
         setup("/tables/events", json.dumps([["producer", "Utf8"], ["seq", "Int64"], ["i", "Int64"], ["ts", "Float64"]]).encode())
@@ -196,7 +205,7 @@ def crash():
             if random.random() < 0.5:
                 kills += node.kill()
             if not node.alive():
-                node.start(tries=RESTARTS)
+                restart()
         time.sleep(1.5)  # let the task catch up
         node.kill()
         crashes = {pt: open(node.log).read().count(f"aborting at {pt}") for pt in ("after_seg_put", "after_commit", "after_parquet_put")}
