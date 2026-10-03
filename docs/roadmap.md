@@ -39,9 +39,9 @@ console, a workspace of files and tasks, time travel, a query history. Measured 
 
 | Round | Theme | What you'd see at the end |
 |---|---|---|
-| 33 (closing) | Run it for years | **Left:** the 24-hour soak on R2 (the owner's machine, `tools/soak.py --hours 24 --s3`); environments (ADR-047, the owner's pick, built in its own thread); the console's History reading `pondra.history` (the console's thread). 0.33.0 when all three are in. |
+| 33 (closing) | Run it for years | **Left:** the 24-hour soak on R2 (the owner's machine, `tools/soak.py --hours 24 --s3`); environments (ADR-047, approved 2026-10-03, built in its own thread: a whole database cloned without a copy, with pins and `REFRESH`, then `pondra plan` and `deploy`); the console's History reading `pondra.history` (the console's thread). 0.33.0 when all three are in. |
 | 34 | SQL as people write it, and scale proven | **SQL parity** (from `designs/scripting-design-review.md`; rewrites where SQL comes in, no engine change): `PIVOT`/`UNPIVOT` (both spellings), `COLUMNS('re')`, `SELECT * RENAME`, `ORDER BY ALL`; list comprehensions, lambdas (`x -> x + 1`), struct field access; `arg_max`/`max_by`, `string_split`, `::json` and `json_extract`; DuckDB's `ASOF JOIN … ON a.t >= b.t`, `SUMMARIZE`, `USING SAMPLE`, `FETCH FIRST`, a select alias reused in `WHERE`; `CREATE TYPE … AS ENUM`, `CREATE SEQUENCE`, `CREATE INDEX` (a no-op) and `COMMENT ON` as the SQL language review's registry decides; identity columns and `UNIQUE`. **Proof:** 100,000 random queries, TPC-DS on three nodes; `INSERT … SELECT` and `CREATE TABLE AS` written by every node at once. **Scale** (machines: decision 1): 1 → 3 → 6 machines in one data centre, SF100 against Spark, all of Nexmark against Flink, Fluss head to head, ClickBench submitted, and what they find fixed. |
-| 35 | In-process, and fits in | `pondra.open(…)` in Python and Node without a server (the core split, B1, in a window with no side branches open), Arrow straight into pandas and Polars; Postgres and MySQL attached and their changes streamed in (G6: a feed whose place, the replication slot's commit LSN and transaction id, is the exactly-once `(producer, seq)` as Kafka feeds' offsets are; a table that meets a change it can't apply is set aside alone, its changes kept to replay once it is synced again, while the others flow; `designs/embrasure-flow-findings.md`); a keyed table published to Delta or Iceberg finds the older versions of a round's few new keys as an `IN` list, so its files' key filters skip most of them (`tier::shadow`; a key index only if that isn't enough, measured first); sinks (G7); Kafka partitions; Metabase, Superset, Grafana, Tableau and DBeaver checked; a SQLAlchemy dialect and a dbt adapter packaged. |
+| 35 | In-process, and fits in | `pondra.open(…)` in Python and Node without a server (the core split, B1, in a window with no side branches open), Arrow straight into pandas and Polars; Postgres and MySQL attached and their changes streamed in (G6: a feed whose place, the replication slot's commit LSN and transaction id, is the exactly-once `(producer, seq)` as Kafka feeds' offsets are; a table that meets a change it can't apply is set aside alone, its changes kept to replay once it is synced again, while the others flow; `designs/embrasure-flow-findings.md`); a keyed table published to Delta or Iceberg finds the older versions of a round's few new keys as an `IN` list, so its files' key filters skip most of them (`tier::shadow`; a key index only if that isn't enough, measured first); sinks (G7); Kafka partitions; measures in views (E13, its first phase: one definition of every number for BI tools and agents); Metabase, Superset, Grafana, Tableau and DBeaver checked; a SQLAlchemy dialect and a dbt adapter packaged. |
 | 36 | 1.0 | What stays stable (the lake format, SQL, the HTTP API, the clients, the command line) and how things are deprecated; a security review; signed binaries, Homebrew and winget (ADR-041, waiting on the owner's accounts and certificates); an upgrade guide; the docs complete and reorganized (each thing said once, a full reference per API, guides with a tab per way, current console pictures); every document, the site and the code reviewed against what was decided. |
 
 **Every round:** CI on five platforms; the gates (`tools/gates.py`: sqllogictest, TPC-H SF1 against
@@ -70,7 +70,7 @@ Depth by evidence, then the platform on top, each a part behind a small surface 
 - **J1:** the server's catalog (ADR-032 §9). **J3, J6:** reports and dashboards of Pondra's own,
   snappy at any scale. **J4:** connections (`CREATE CONNECTION`). **J5, J7:** a workspace exported
   whole, and ETL as code, a canvas and YAML over one definition, as plugins.
-- **E12:** sharing with other companies (ADR-046, proposed). Semantic models (proposed).
+- **E12:** sharing with other companies (ADR-046, proposed). **E13**'s rollups, before J6.
 - A vector index, `VARIANT` as a real type, a managed service.
 
 **One ecosystem (the owner, 2026-10-03).** Every object SQL makes is a catalog entry that every
@@ -92,6 +92,7 @@ The IDs other documents cite. Done items are gone from this list (their ADRs and
 | D2 | Random queries: one node == three == DuckDB, 100,000 of them | 34 |
 | E2 | BI tools checked (Power BI Desktop, Tableau, DBeaver, Metabase, Superset, Grafana) | 35 |
 | E12 | Sharing (ADR-046, proposed) | after 1.0 |
+| E13 | Semantic models as measures in views (approved 2026-10-03; `designs/semantic-models-and-dremio.md`): `sum(x) AS MEASURE m` in a `CREATE VIEW`, queried as `MEASURE(m)`, right at any grain; BI tools' `sum(m)` gives the measure; MCP `list_metrics`; Apache Ossie YAML out and in. Then rollups kept in their source's commit and read where they give the same answer; then rollups proposed from `pondra.history`. Proof: `harness.py measures` | 35 (then after 1.0, before J6) |
 | F | Depth by evidence (above) | after 1.0 |
 | G6, G7 | Databases attached with their changes streamed in; sinks | 35 |
 | I1 | Extensions (ADR-031, proposed) | after 1.0 |
@@ -101,13 +102,12 @@ The IDs other documents cite. Done items are gone from this list (their ADRs and
 
 1. **Machines for round 34:** three to six VMs in one region for a few hours at a time
    (`tools/cloud/` sets them up; a cloud trial's credit covers it). The sooner the better.
-2. **Environments** (ADR-047, in "Team workflow and environments"): the card waits.
-3. **The SQL registry** (the SQL language review's card): `CREATE TYPE`, `CREATE SEQUENCE`,
+2. **The SQL registry** (the SQL language review's card): `CREATE TYPE`, `CREATE SEQUENCE`,
    `CREATE INDEX` and `COMMENT ON` wait for it, so they are built as registry entries if it says so.
-4. **The browser after 1.0** (my recommendation): a round of its own, for no one's production work
+3. **The browser after 1.0** (my recommendation): a round of its own, for no one's production work
    today; in-process in Python and Node gives the DuckDB experience first.
-5. **Publishing:** Homebrew, winget and signing wait on the owner's accounts and certificates.
-6. **An `INSERT` of a key that exists:** it replaces the row today (an upsert, as Fluss and Paimon
+4. **Publishing:** Homebrew, winget and signing wait on the owner's accounts and certificates.
+5. **An `INSERT` of a key that exists:** it replaces the row today (an upsert, as Fluss and Paimon
    do). My recommendation: keep it, and add `WITH (on_duplicate = 'error')` for Postgres's
    behaviour, with `ON CONFLICT` working in both.
 
