@@ -6206,17 +6206,18 @@ def sparksql():
 
 
 def scripts():
-    """Scripts that decide (ADR-045, phase 1): blocks with handlers, IF / ELSEIF / CASE, WHILE,
+    """Scripts that decide (ADR-045, phases 1 and 2): blocks with handlers, IF / ELSEIF / CASE, WHILE,
     REPEAT, LOOP and FOR over a query's rows (`$r.col`), LEAVE and ITERATE by label, RETURN, RAISE
     (P0001), PRINT and RAISE NOTICE as notices, ASSERT (P0004), EXECUTE IMMEDIATE … INTO … USING,
     CALL … INTO and IDENTIFIER(), from HTTP, Python, Postgres (simple and extended protocol) and in
     procedures; a block's DECLAREs its own; a script run again with its job writes once; a file's
-    parameters leave out what its blocks bind."""
+    parameters leave out what its blocks bind. FOR … PARALLEL n runs passes at once, ASYNC runs a
+    statement beside the script and AWAIT ALL waits: each with a copy of the variables, once per job."""
     import psycopg
     lake = new_lake()
     here = os.path.dirname(os.path.abspath(__file__))
     pg = A.port + 10
-    node = Node(lake, A.port, pg=f"127.0.0.1:{pg}", env={"PYTHONPATH": os.path.join(here, "..", "python")}).start()
+    node = Node(lake, A.port, pg=f"127.0.0.1:{pg}", python="auto", env={"PYTHONPATH": os.path.join(here, "..", "python")}).start()
     h = {"x-pondra-session": "harness-scripts"}
     q = lambda s, hh=h, path="/sql": call(A.port, "POST", path, s.encode(), headers=hh)
     db = _client(A.port)
@@ -6339,6 +6340,36 @@ SELECT $big AS big, $t AS t, $c AS c, (SELECT count(*) FROM made_a) + (SELECT co
     got["parameters"] = q("SELECT name, required FROM pondra.parameters('etl/loop.sql')")
     checks["a file's parameters leave out a loop's row, a handler's $error and INTO's names ($day, used unset, still one)"] = \
         got["parameters"] == [{"name": "limit", "required": False}, {"name": "day", "required": True}]
+    # Phase 2: passes at once, and statements beside the script.
+    q("CREATE TABLE done (n BIGINT, w TEXT)")
+    got["parallel"] = q("DECLARE $total = 0; FOR d IN (SELECT value AS v FROM generate_series(1, 8)) PARALLEL 4 DO INSERT INTO done VALUES ($d.v, 'p'); $total = $total + $d.v; END FOR; SELECT $total AS total, (SELECT count(*) FROM done) AS c, (SELECT sum(n) FROM done) AS s", {})
+    checks["FOR … PARALLEL 4: every pass once, each with a copy of the variables (what one sets stays its own)"] = got["parallel"] == [{"total": 0, "c": 8, "s": 36}]
+    got["parallel refused"] = [_raises_text(lambda s=s: q(s, {})) for s in (
+        "FOR d IN (SELECT value AS v FROM generate_series(1, 6)) PARALLEL 3 DO IF $d.v = 4 THEN RAISE 'no %', $d.v; END IF; END FOR",
+        "FOR d IN (SELECT 1 AS v) PARALLEL 2 DO LEAVE; END FOR",
+        "FOR d IN (SELECT 1 AS v) PARALLEL 0 DO SELECT 1; END FOR")]
+    checks["a PARALLEL pass that fails fails the loop, naming the pass; LEAVE can't end it; PARALLEL 0 refused"] = \
+        "pass 4: no 4" in got["parallel refused"][0] and "can't end a PARALLEL loop" in got["parallel refused"][1] and "1 to 64" in got["parallel refused"][2]
+    got["async"] = q("ASYNC INSERT INTO done VALUES (100, 'a');\nASYNC BEGIN INSERT INTO done VALUES (101, 'a'); END;\nAWAIT ALL;\nSELECT count(*) AS c FROM done WHERE w = 'a'", {})
+    got["async failed"] = _raises_text(lambda: q("SELECT 1;\nASYNC SELECT 1/0;\nAWAIT ALL", {}))
+    q("ASYNC INSERT INTO done VALUES (102, 'e')", {})
+    got["async at the end"] = q("SELECT count(*) AS c FROM done WHERE w = 'e'")
+    checks["ASYNC runs beside the script and AWAIT ALL waits for it; a failure is AWAIT ALL's, at its line; a script's end waits too"] = \
+        got["async"] == [{"c": 2}] and "line 2: ASYNC" in got["async failed"] and "Divide by zero" in got["async failed"] and got["async at the end"] == [{"c": 1}]
+    twice = "FOR d IN (SELECT value AS v FROM generate_series(1, 5) ORDER BY 1) PARALLEL 3 DO INSERT INTO done VALUES ($d.v, 'j'); END FOR; ASYNC INSERT INTO done VALUES (9, 'j')"
+    q(twice, {}, path="/sql?job=harness-parallel")
+    q(twice, {}, path="/sql?job=harness-parallel")
+    got["twice"] = q("SELECT count(*) AS c FROM done WHERE w = 'j'")
+    checks["PARALLEL passes and ASYNC statements run again with their job write once"] = got["twice"] == [{"c": 6}]
+    q("CREATE PROCEDURE nap(s DOUBLE) LANGUAGE python AS $$\nimport time\ntime.sleep(s)\n$$")
+    q("CALL nap(0.01)", {})
+    timed = {}
+    for how in ("", " PARALLEL 8"):
+        t0 = time.time()
+        q(f"FOR d IN (SELECT value AS v FROM generate_series(1, 8)){how} DO CALL nap(0.3); END FOR", {})
+        timed[how.strip() or "one at a time"] = round(time.time() - t0, 2)
+    info["eight 0.3 s calls, s"] = timed
+    checks["eight 0.3 s calls PARALLEL 8 take under 0.6 of the time one at a time does"] = timed["PARALLEL 8"] < 0.6 * timed["one at a time"]
     # What deciding costs: a loop that reads only variables.
     t0 = time.time()
     q("DECLARE $i = 0; WHILE $i < 200 DO $i = $i + 1; END WHILE", {})
@@ -6349,7 +6380,7 @@ SELECT $big AS big, $t AS t, $c AS c, (SELECT count(*) FROM made_a) + (SELECT co
     print(json.dumps({"scripts": checks, "ok": ok, "info": info}, indent=1, default=str))
     if not ok:
         sys.exit(1)
-    return f"scripts: blocks, branches, loops, handlers, RETURN, dynamic SQL, from HTTP, Python and Postgres: all {len(checks)} checks pass"
+    return f"scripts: blocks, branches, loops, handlers, RETURN, dynamic SQL, PARALLEL and ASYNC, from HTTP, Python and Postgres: all {len(checks)} checks pass"
 
 
 def variables():

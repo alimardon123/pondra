@@ -17,7 +17,7 @@ export function statements(text, raw) {
     let d = 0;
     const close = i => { let n = 0; return t.findIndex((x, j) => j > i && !(n += (x == '(') - (x == ')'))); }; // (an IF's condition's end: `if(` before anything but THEN is the function)
     t.forEach((w, i) => {
-      const b = t[i - 1], at = !i || /^(then|else|do|loop|repeat|begin)$/.test(b) || b == ':' && /^\w/.test(t[i - 2]) && t[i - 3] != ':';
+      const b = t[i - 1], at = !i || /^(then|else|do|loop|repeat|begin|async)$/.test(b) || b == ':' && /^\w/.test(t[i - 2]) && t[i - 3] != ':';
       d += w == 'end' ? -1 : b == 'end' ? 0 : +(w == 'case' || at && (/^(while|loop)$/.test(w) || w == 'repeat' && t[i + 1] != '(' || w == 'if' && (!i || t[i + 1] != '(' || t[close(i) + 1] == 'then') || w == 'for' && /^(in|as)$/.test(t[i + 2]) || w == 'begin' && !!t[i + 1] && !/^(transaction|work|isolation|read|deferrable|not)$/.test(t[i + 1])));
     });
     return d;

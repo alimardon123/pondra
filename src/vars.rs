@@ -111,6 +111,13 @@ pub fn scoped() -> bool { OWN.try_with(|_| ()).is_ok() || crate::temp::current()
 /// Run `f` with variables of its own, keeping the values given (a script sent with no session).
 pub async fn local<F: std::future::Future>(f: F) -> F::Output { OWN.scope(Vars::default(), f).await }
 
+/// A copy of the variables in force, for work that runs beside its script (`PARALLEL`, `ASYNC`):
+/// what it sets stays its own.
+pub fn snapshot() -> Vars { Arc::new(Mutex::new(vars(|m| m.clone()).unwrap_or_default())) }
+
+/// Run `f` with `own` as its variables (a `snapshot`).
+pub async fn with_own<F: std::future::Future>(own: Vars, f: F) -> F::Output { OWN.scope(own, f).await }
+
 /// A variable's value now (a block keeps it, to put back when it ends: `script.rs`).
 pub fn get(name: &str) -> Option<Var> { vars(|m| m.get(name).cloned()).ok().flatten() }
 
