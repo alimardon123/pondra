@@ -26,7 +26,7 @@ const KINDS = {
     menu: x => [{ label: 'Call…', icon: 'play', run: () => tab(`CALL ${x.name}(${x.arguments ? '…' : ''});`) },
       { label: 'Start as a job…', run: () => tab(`SELECT pondra.start('${x.name}'${x.arguments ? ', …' : ''});`) },
       { label: 'Schedule…', icon: 'clock', run: () => tab(`CREATE TASK ${x.name}_daily SCHEDULE '1 day'\nAS CALL ${x.name}(${x.arguments ? '…' : ''});`) },
-      show(x.name, fnSql(x)), { label: 'Its runs', icon: 'clock', run: () => H.show('runs') }, '-', drop('PROCEDURE', x)] },
+      show(x.name, fnSql(x)), { label: 'Its runs', icon: 'clock', run: () => { (S.hist ||= {}).of = 'runs'; H.show('runs'); } }, '-', drop('PROCEDURE', x)] },
   schedules: {
     list: () => rows('SELECT name, schedule, statement, next_tick FROM pondra.tasks ORDER BY name'),
     item: x => ({ name: x.name, icon: 'calendar', meta: x.schedule, title: x.statement, word: 'a schedule' }),

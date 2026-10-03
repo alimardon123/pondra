@@ -131,6 +131,18 @@ impl Refusal for tonic::Status {
     fn refusal(_: &str, message: String) -> Self { tonic::Status::resource_exhausted(message) }
 }
 
+/// A statement dropped before it ended, its client gone (a Stop, a closed tab, a timeout): a row of
+/// the history all the same, `stopped`.
+struct Stopped<'a>(Option<(&'a App, &'static str, &'a str, Instant)>);
+
+impl Drop for Stopped<'_> {
+    fn drop(&mut self) {
+        if let Some((app, class, sql, start)) = self.0.take() {
+            crate::history::ended(app, class, sql, "stopped", Some("its client stopped waiting".into()), start.elapsed(), Default::default());
+        }
+    }
+}
+
 /// Run one statement a door was sent, within its user's quota (`users::Quota`), writing what
 /// came of it when its class is written (and a refusal always).
 pub async fn statement<T, E: std::fmt::Display + Refusal>(app: &App, sql: &str, f: impl Future<Output = std::result::Result<T, E>>) -> std::result::Result<T, E> {
@@ -141,6 +153,7 @@ pub async fn statement<T, E: std::fmt::Display + Refusal>(app: &App, sql: &str, 
         return Err(E::refusal("57P03", crate::cluster::CUT_OFF_SAYS.into())); // (cannot_connect_now: every door's clients retry elsewhere)
     }
     let (class, start, quota) = (class(sql), Instant::now(), crate::users::quota());
+    let mut stopped = Stopped(Some((app, class, sql, start)));
     let (out, note) = crate::history::noted(INSIDE.scope((), async {
         let _turn = quota.turn().await.map_err(|m| E::refusal("53000", m))?; // (insufficient_resources)
         match quota.timeout {
@@ -149,6 +162,7 @@ pub async fn statement<T, E: std::fmt::Display + Refusal>(app: &App, sql: &str, 
         }
     }))
     .await;
+    stopped.0 = None;
     let took = start.elapsed();
     let message = out.as_ref().err().map(|e| e.to_string());
     let refused = message.as_ref().filter(|m| ["permission denied", "needs a", "needs more rights", "sign in", "quota:"].iter().any(|r| m.contains(r)));
