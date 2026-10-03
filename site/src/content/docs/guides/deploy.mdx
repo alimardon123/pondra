@@ -487,8 +487,8 @@ of running a node stops it this way and waits a while for it:
 
 | Run with | Stopped by | Waits up to |
 |---|---|---|
-| `docker run` | `docker stop pondra` | Docker's stop timeout, 10 seconds unless you give `--time` |
-| Compose | `docker compose stop node1` | 30 seconds (`stop_grace_period`) |
+| `docker run` | `docker stop pondra` | Docker's stop timeout, 10 seconds unless you give `--time` (a drain can take 30: `--time 40`) |
+| Compose | `docker compose stop node1` | 40 seconds (`stop_grace_period`) |
 | Helm | a pod deleted, a rolling update, a scale-down | 60 seconds (`terminationGracePeriodSeconds`) |
 | systemd | `systemctl stop pondra` | 60 seconds (`TimeoutStopSec`) |
 | launchd | the daemon or agent stopping | 60 seconds (`ExitTimeOut`) |

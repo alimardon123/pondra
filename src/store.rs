@@ -578,7 +578,7 @@ impl Lake {
         let cache = ObjectStoreCacheOptions { root_folder: cache, max_cache_size_bytes: Some(2 << 30), cache_on_flush: true, cache_on_compaction: true, ..Default::default() };
         let cat = match writer {
             true => Catalog::writer(store.clone(), cache).await?,
-            false => match Catalog::reader(store.clone(), streamed, cache).await {
+            false => match Catalog::opened(store.clone(), streamed, cache).await {
                 Ok(cat) => cat,
                 // (no catalog at all: say so, rather than the database's own words for it)
                 Err(e) => match futures::StreamExt::next(&mut store.list(Some(&object_store::path::Path::from("catalog/manifest")))).await {
@@ -1246,6 +1246,23 @@ impl Catalog {
         cat.follows = streamed;
         cat.refresh().await?; // (one try at the in-memory catalog before serving; later refreshes retry)
         Ok(cat)
+    }
+
+    /// A reader, or why there can't be one: SlateDB tries again for as long as the bucket says no,
+    /// so a bucket that isn't there, or that refuses the credentials, left `pondra sql` waiting
+    /// for ever. When opening takes a while, a listing (after the store's own retries) says
+    /// whether there is a catalog to wait for.
+    async fn opened(store: Store, streamed: bool, cache: ObjectStoreCacheOptions) -> Result<Self> {
+        let open = Self::reader(store.clone(), streamed, cache);
+        tokio::pin!(open);
+        if let Ok(cat) = tokio::time::timeout(Duration::from_secs(3), &mut open).await {
+            return cat;
+        }
+        match futures::StreamExt::next(&mut store.list(Some(&object_store::path::Path::from("catalog/manifest")))).await {
+            Some(Err(e)) => Err(anyhow::Error::new(e).context("the lake's bucket")),
+            Some(Ok(_)) => open.await, // (a catalog, slow to open)
+            None => bail!("no catalog"), // (the caller says what to do)
+        }
     }
 
     fn new(db: Db_) -> Self {

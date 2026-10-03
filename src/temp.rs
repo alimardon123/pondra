@@ -121,6 +121,16 @@ async fn reap() {
     }
 }
 
+/// Does this node hold anything of the session's (temporary tables or views, settings,
+/// variables, prepared statements, a transaction, its Python)? A client that fails over between
+/// nodes keeps to this one while it does: `POST /sql` says so (`x-pondra-session: held`).
+pub fn holds(session: &str) -> bool {
+    let kept = SESSIONS.lock().unwrap().get(session).is_some_and(|x| {
+        !(x.tables.is_empty() && x.views.is_empty() && x.secrets.is_empty() && x.settings.is_empty() && x.prepared.is_empty() && x.variables.is_empty())
+    });
+    kept || crate::txn::held(session) || crate::python::held(session)
+}
+
 /// The current session's temporary secrets (`CREATE TEMPORARY SECRET`), by name.
 pub fn secrets() -> Vec<(String, crate::ext::Secret)> {
     let Some(s) = current() else { return vec![] };

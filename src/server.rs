@@ -328,8 +328,14 @@ async fn list_functions(State(app): State<App>) -> Result<Json<Value>, E> {
 /// Its role must cover the route; the request then runs as it (`auth::WHO`), and handlers see its
 /// role too.
 async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response {
-    if crate::drain::draining() && !crate::drain::still_taken(req.uri().path()) {
+    let path = req.uri().path();
+    if crate::drain::draining() && !crate::drain::still_taken(path) {
         return (StatusCode::SERVICE_UNAVAILABLE, [("retry-after", "1")], "this node is stopping: ask another").into_response(); // (`drain.rs`)
+    }
+    if app.cluster.cut_off() && !crate::drain::still_taken(path) {
+        // (a leader that can't reach the bucket can't commit, and its reads may already be stale:
+        // another node leads soon. The cluster's own calls and the health checks still go through.)
+        return (StatusCode::SERVICE_UNAVAILABLE, [("retry-after", "1")], crate::cluster::CUT_OFF_SAYS).into_response();
     }
     let header = req.headers().get("authorization").and_then(|v| v.to_str().ok()).map(String::from);
     let from = req.extensions().get::<axum::extract::ConnectInfo<crate::tls::Peer>>().map(|c| c.0.addr);
@@ -447,13 +453,14 @@ struct BeatParams {
     from: String,
 }
 
-async fn beat(State(app): State<App>, Query(p): Query<BeatParams>, headers: axum::http::HeaderMap) -> Result<Json<(u64, Vec<String>)>, StatusCode> {
+async fn beat(State(app): State<App>, Query(p): Query<BeatParams>, headers: axum::http::HeaderMap) -> Result<Json<(u64, Vec<String>)>, Response> {
     // Test hook: followers listed in the file $PONDRA_DROP_BEATS get no answer (a broken link to the leader).
     let dropped = std::env::var("PONDRA_DROP_BEATS").map(|f| std::fs::read_to_string(f).unwrap_or_default()).unwrap_or_default();
     if dropped.lines().any(|a| a == p.from) {
-        return Err(StatusCode::SERVICE_UNAVAILABLE);
+        return Err(StatusCode::SERVICE_UNAVAILABLE.into_response());
     }
-    Ok(Json(app.cluster.beat(p.from, crate::format::said(&headers))))
+    let cut_off = || (StatusCode::SERVICE_UNAVAILABLE, [(crate::cluster::CUT_OFF_HEADER, "1")]).into_response(); // (its followers take over at once)
+    app.cluster.beat(p.from, crate::format::said(&headers)).map(Json).ok_or_else(cut_off)
 }
 
 /// A follower's flush, to be sequenced (leader only).
@@ -932,8 +939,11 @@ async fn sql(State(app): State<App>, Query(p): Query<SqlParams>, role: axum::Ext
     let session = crate::temp::of(&headers); // (its temporary tables: `temp.rs`)
     let token = headers.get("authorization").and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer "));
     let vars = crate::auth::lent_vars(token); // (Python code a run lent a connection to: the run's variables)
-    let (out, heard) = crate::routines::with_notices(crate::vars::within(vars, crate::temp::SESSION.scope(session, crate::ext::scope(files, sql_as(app, p, role, headers, body))))).await;
+    let (out, heard) = crate::routines::with_notices(crate::vars::within(vars, crate::temp::SESSION.scope(session.clone(), crate::ext::scope(files, sql_as(app, p, role, headers, body))))).await;
     let mut r = out.unwrap_or_else(IntoResponse::into_response);
+    if session.as_deref().is_some_and(crate::temp::holds) {
+        r.headers_mut().insert("x-pondra-session", axum::http::HeaderValue::from_static("held")); // (a client keeps to this node meanwhile)
+    }
     if let Some(h) = notices(&heard) {
         r.headers_mut().insert("x-pondra-notices", h);
     }
@@ -1236,6 +1246,7 @@ async fn ready(State(app): State<App>) -> Response {
     match (crate::drain::draining(), *app.lake.caught.borrow()) {
         (true, _) => (StatusCode::SERVICE_UNAVAILABLE, "stopping").into_response(),
         (_, false) => (StatusCode::SERVICE_UNAVAILABLE, "catching up with the leader").into_response(),
+        _ if app.cluster.cut_off() => (StatusCode::SERVICE_UNAVAILABLE, "can't reach the bucket: another node leads").into_response(),
         _ => "ready".into_response(),
     }
 }

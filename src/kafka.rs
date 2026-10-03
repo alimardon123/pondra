@@ -84,6 +84,7 @@ const TRANSACTIONS_UNSUPPORTED: i16 = 53; // (TRANSACTIONAL_ID_AUTHORIZATION_FAI
 const SASL_FAILED: i16 = 58;
 const INVALID_RECORD: i16 = 87;
 const POLICY_VIOLATION: i16 = 44;
+const REQUEST_TIMED_OUT: i16 = 7; // (retried; "possibly written": an idempotent producer's retry applies once)
 
 /// How this node appears to clients.
 struct Broker {
@@ -398,14 +399,18 @@ async fn queue(app: &App, table: &str, meta: &TableMeta, records: &[u8]) -> BoxF
         }
         let src = match b.producer_id >= 0 && b.base_seq >= 0 {
             true => {
+                // A producer that gave up on a batch bumps its epoch and numbers from 0 again
+                // (librdkafka does, after a failed batch): each epoch is a producer of its own, or
+                // its first batches would be taken for the old epoch's and acknowledged unwritten.
                 let (base, count) = (b.base_seq as u64, b.recs.len() as u64);
-                Src { producer: format!("kafka:{}:{table}", b.producer_id), seq: base + count, prev: Some(base) }
+                let id = if b.epoch == 0 { b.producer_id.to_string() } else { format!("{}/{}", b.producer_id, b.epoch) };
+                Src { producer: format!("kafka:{id}:{table}"), seq: base + count, prev: Some(base) }
             }
             false => Src { producer: String::new(), seq: 0, prev: None }, // at-least-once, as in Kafka
         };
         match log.queue(table.to_string(), src, rows).await {
             Ok(ack) => acks.push(ack),
-            Err(e) => return ready((POLICY_VIOLATION, -1, Some(format!("{e:#}")))),
+            Err(e) => return ready(failed(&e)),
         }
     }
     async move {
@@ -415,12 +420,21 @@ async fn queue(app: &App, table: &str, meta: &TableMeta, records: &[u8]) -> BoxF
                 Ok(Ack { conflict: true, .. }) => return (OUT_OF_ORDER_SEQUENCE, -1, None),
                 Ok(Ack { duplicate: true, .. }) => {} // a retry of a committed batch: success
                 Ok(a) => first = first.or(Some(crate::log::ord(a.seg, a.row) as i64)),
-                Err(e) => return (POLICY_VIOLATION, -1, Some(format!("{e:#}"))),
+                Err(e) => return failed(&e),
             }
         }
         (0, first.unwrap_or(-1), None)
     }
     .boxed()
+}
+
+/// A write's failure, as Kafka says it: a row refused (a CHECK, NOT NULL, a view's expectation) is
+/// a bad record, which a producer doesn't send again; anything else — the leader moving, the
+/// bucket out of reach — passes, so it's a timeout, which a producer retries (an idempotent one's
+/// retry is applied once). Said as a policy violation, a failover failed the producer's records.
+fn failed(e: &anyhow::Error) -> Outcome {
+    let refused = crate::codes::of(e).starts_with("23");
+    (if refused { INVALID_RECORD } else { REQUEST_TIMED_OUT }, -1, Some(format!("{e:#}")))
 }
 
 struct Rec {
@@ -431,6 +445,7 @@ struct Rec {
 
 struct Batch {
     producer_id: i64,
+    epoch: i16,
     base_seq: i32,
     recs: Vec<Rec>,
 }
@@ -450,7 +465,7 @@ fn decode_batches(mut b: &[u8]) -> Result<Vec<Batch>> {
         r.i32()?; // last offset delta
         let base_ts = r.i64()?;
         r.i64()?; // max timestamp
-        let (producer_id, _epoch, base_seq, count) = (r.i64()?, r.i16()?, r.i32()?, r.i32()?);
+        let (producer_id, epoch, base_seq, count) = (r.i64()?, r.i16()?, r.i32()?, r.i32()?);
         let body = decompress(attributes & 7, &r.b[r.at..])?;
         let log_append = attributes & 8 != 0;
         let mut r = Rd { b: body.into(), at: 0 };
@@ -467,7 +482,7 @@ fn decode_batches(mut b: &[u8]) -> Result<Vec<Batch>> {
             }
             recs.push(Rec { key, value, ts: if log_append { now_ms() } else { ts } });
         }
-        out.push(Batch { producer_id, base_seq, recs });
+        out.push(Batch { producer_id, epoch, base_seq, recs });
     }
     Ok(out)
 }

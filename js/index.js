@@ -15,12 +15,32 @@ import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { createServer } from "node:net";
 
+// A node answered that it ran nothing, or that it couldn't reach the bucket or another node: a
+// request that may be sent again goes to the next node. (57P01 admin_shutdown, 57P03
+// cannot_connect_now, 58030 io_error, 08xxx connection_exception)
+const TRY_AGAIN = new Set(["57P01", "57P03", "58030", "08000", "08001", "08003", "08006"]);
+const GONE = "08006"; // (connection_failure: the node holding the session went)
+const code = (sql) => sql.replace(/'(?:[^']|'')*'|"(?:[^"]|"")*"|\$(\w*)\$[\s\S]*?\$\1\$|--[^\n]*|\/\*[\s\S]*?\*\//g, " ").trim().replace(/;$/, "");
+const isQuery = (sql) => { const c = code(sql); return !c.includes(";") && /^\(*\s*(select|with|values|from|table|show|describe|desc|explain)\b/i.test(c) && !/\bstart\s*\(/i.test(c); };
+const isChange = (sql) => { const c = code(sql); return !c.includes(";") && /^\s*(insert|update|delete|merge)\b/i.test(c); };
+
 const varName = (n) => { if (!/^[A-Za-z_]\w*$/.test(n)) throw new Error(`${n}: not a variable's name (letters, digits and _, not first a digit)`); return n; };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 export class Pondra {
-  constructor(url = "http://127.0.0.1:8080", { token, user, password, onNotice = (n) => console.log(n) } = {}) {
-    this.url = url.replace(/\/$/, "");
+  /** `url`: a node, or several (an array, or separated by commas): any of a cluster's nodes
+   * answers, and a node that goes away or turns work away (stopping, or a leader cut off from its
+   * bucket) hands the work to the next, for up to `retrySecs` (a request it may have run goes again
+   * only if that can't apply it twice: a query, an `append`, a single INSERT, UPDATE, DELETE or
+   * MERGE, sent with a job). While a node holds this connection's session — a transaction,
+   * temporary tables, settings, variables — every request goes to it alone. */
+  constructor(url = "http://127.0.0.1:8080", { token, user, password, onNotice = (n) => console.log(n), retrySecs = 60 } = {}) {
+    this.urls = (Array.isArray(url) ? url : url.split(",")).map((u) => u.trim().replace(/\/$/, "")).filter(Boolean);
+    this.url = this.urls[0];
+    this.retrySecs = retrySecs;
+    this.held = null; // the node holding this connection's session, while one does (`x-pondra-session: held`)
+    this.reached = false;
+    this.jobs = 0;
     this.token = token;
     this.basic = user ? `Basic ${Buffer.from(`${user}:${password}`).toString("base64")}` : null; // (a user: its name and password, or its token as the password)
     this.notices = []; // what the last statement's procedures printed
@@ -30,22 +50,54 @@ export class Pondra {
     this.session = randomUUID(); // this connection's temporary tables and views, on the node until close()
   }
 
-  /** One HTTP request to the node (what the methods below are made of). */
-  async request(method, path, body, type) {
+  /** One HTTP request (what the methods below are made of). A node that is gone, or turns it away
+   * unrun, hands it to the next of `urls`; one that may have run it does so only if `again` (it
+   * can't be applied twice: GETs unless said otherwise), until `retrySecs` have passed. */
+  async request(method, path, body, type, again = method === "GET") {
     const headers = { "x-pondra-session": this.session, ...(this.token ? { authorization: `Bearer ${this.token}` } : this.basic && { authorization: this.basic }), ...(type && { "content-type": type }), ...(this.owner && { "x-pondra-owner": this.owner }) };
-    const r = await fetch(this.url + path, { method, body, headers });
-    const said = r.headers.get("x-pondra-notices");
-    this.notices = said ? JSON.parse(said) : [];
-    if (this.onNotice) this.notices.forEach((n) => this.onNotice(n));
-    if (!r.ok) throw Object.assign(new Error(`${r.status}: ${(await r.text()).slice(0, 500)}`), { sqlstate: r.headers.get("x-pondra-sqlstate") || "XX000", status: r.status }); // (Postgres's code: 23514 a CHECK, 40001 try again…)
-    return r;
+    const deadline = Date.now() + this.retrySecs * 1000;
+    for (let tried = 1, wait = 100; ; tried++) {
+      const url = this.held ?? this.url;
+      let error;
+      try {
+        const r = await fetch(url + path, { method, body, headers });
+        this.reached = true; // (a node has answered: one that is gone now is waited for, not before)
+        if (path.startsWith("/sql")) this.held = r.headers.get("x-pondra-session") === "held" ? url : null; // (keep to it while it holds the session)
+        const said = r.headers.get("x-pondra-notices");
+        this.notices = said ? JSON.parse(said) : [];
+        if (this.onNotice) this.notices.forEach((n) => this.onNotice(n));
+        if (r.ok) return r;
+        const sqlstate = r.headers.get("x-pondra-sqlstate") || "XX000"; // (Postgres's code: 23514 a CHECK, 40001 try again…)
+        error = Object.assign(new Error(`${r.status}: ${(await r.text()).slice(0, 500)}`), { sqlstate, status: r.status });
+        const unrun = (r.status === 503 && r.headers.get("retry-after")) || sqlstate === "57P03"; // (stopping, or a leader cut off: it ran nothing)
+        if (!(unrun || (again && ([502, 504].includes(r.status) || TRY_AGAIN.has(sqlstate))))) throw error;
+      } catch (e) {
+        if (e === error) throw e;
+        const unrun = e.cause?.code === "ECONNREFUSED"; // (nobody there: it ran nothing)
+        if (!(unrun || again) || (!this.reached && this.urls.length === 1)) throw e; // (a node never reached: a wrong address, or not started)
+        error = e;
+      }
+      if (this.held) { // (its session's transaction, temporary tables, settings and variables went with it)
+        this.held = null;
+        throw Object.assign(new Error(`the node holding this connection's session (${url}) is gone, and its transaction, temporary tables, settings and variables with it; what was sent to it last may or may not have been applied (${error.message})`), { sqlstate: GONE, cause: error });
+      }
+      if (Date.now() > deadline || (this.process && (this.process.exitCode !== null || this.process.signalCode !== null))) throw error; // (out of time, or the node `local()` started has stopped)
+      this.url = this.urls[(this.urls.indexOf(url) + 1) % this.urls.length];
+      if (tried % this.urls.length === 0) { // (each node tried once: a moment before the next round)
+        await sleep(Math.max(0, Math.min(wait, deadline - Date.now())));
+        wait = Math.min(wait * 2, 2000);
+      }
+    }
   }
 
   /** A query's rows, as objects; for other statements (CREATE, INSERT, UPDATE, DELETE, CALL,
    * several at once), the last one's outcome. `params`: values for `$name` in it. */
   async sql(query, params) {
-    if (!params) return (await this.request("POST", "/sql", query)).json();
-    return (await this.request("POST", "/sql", JSON.stringify({ sql: query, params }), "application/json")).json();
+    const changes = isChange(query);
+    const path = changes ? `/sql?job=${this.producer}-${++this.jobs}` : "/sql"; // (sent again after a node went, a change is applied once)
+    const again = changes || isQuery(query);
+    if (!params) return (await this.request("POST", path, query, undefined, again)).json();
+    return (await this.request("POST", path, JSON.stringify({ sql: query, params }), "application/json", again)).json();
   }
 
   /** A file's statements in order, `$name` taking `params.name`: a `.sql` file here (or SQL itself)
@@ -100,18 +152,12 @@ export class Pondra {
     return this.call(name, ...args);
   }
 
-  /** Append rows exactly once: a retry after a lost answer is recognised, not applied twice. */
-  async append(table, rows, retries = 10) {
+  /** Append rows exactly once: sent again after a lost answer, on any node, it is recognised and
+   * not applied twice (for up to the connection's `retrySecs`). */
+  async append(table, rows) {
     const seq = ++this.seq;
     const body = rows.map((r) => JSON.stringify(r)).join("\n") + "\n";
-    for (let attempt = 0; ; attempt++) {
-      try {
-        return await (await this.request("POST", `/append/${table}?producer=${this.producer}&seq=${seq}`, body, "application/x-ndjson")).json();
-      } catch (e) {
-        if (/^\d{3}:/.test(e.message) || attempt === retries - 1) throw e; // (refused: retrying won't help)
-        await sleep(Math.min(100 * 2 ** attempt, 5000)); // the same seq again: applied once
-      }
-    }
+    return (await this.request("POST", `/append/${table}?producer=${this.producer}&seq=${seq}`, body, "application/x-ndjson", true)).json();
   }
 
   /** A view others read by name, as SQL's `CREATE VIEW` and Python's `db.view` make one: `sql`
@@ -157,7 +203,7 @@ export class Pondra {
    * `everyMs` (100). Leaving the loop ends it on the node.
    *   for await (const rows of db.live("SELECT region, sum(amount) AS total FROM orders GROUP BY region")) redraw(rows); */
   async *live(sql, { params = {}, everyMs } = {}) {
-    const r = await this.request("POST", "/live" + (everyMs ? `?every_ms=${everyMs}` : ""), JSON.stringify({ sql, params }), "application/json");
+    const r = await this.request("POST", "/live" + (everyMs ? `?every_ms=${everyMs}` : ""), JSON.stringify({ sql, params }), "application/json", true);
     const decoder = new TextDecoder();
     let rest = "";
     try {
@@ -181,7 +227,10 @@ export class Pondra {
    * started: closing its input stops it (it hands the lake on at once), on every OS; it would stop
    * the same way if this process were killed. */
   async close(timeoutMs = 15_000) {
+    const retrySecs = this.retrySecs;
+    this.retrySecs = 0; // (a node that's gone isn't waited for here)
     await this.request("DELETE", `/sessions/${this.session}`).catch(() => {});
+    this.retrySecs = retrySecs;
     const node = this.process;
     if (!node || node.exitCode !== null || node.signalCode !== null) return;
     const exited = new Promise((resolve) => node.once("exit", resolve));
@@ -206,13 +255,14 @@ export async function local(dir = "lake", { port, token, flags = [], timeoutMs =
   const node = spawn(binary(), args, { stdio: ["pipe", "ignore", "ignore"], env: { ...process.env, PONDRA_OWNER_KEY: owner } });
   let failed = null;
   node.on("error", (e) => (failed = e)); // (no binary, say)
-  const db = new Pondra(`http://127.0.0.1:${port}`, { token, ...(onNotice !== undefined && { onNotice }) });
+  const db = new Pondra(`http://127.0.0.1:${port}`, { token, retrySecs: 0, ...(onNotice !== undefined && { onNotice }) });
   db.process = node;
   db.owner = owner;
   process.on("exit", () => node.stdin.end());
   for (const until = Date.now() + timeoutMs; ; await sleep(50)) {
     try {
       await db.request("GET", "/stats");
+      db.retrySecs = 60;
       return db;
     } catch (e) {
       if (failed || node.exitCode !== null || Date.now() > until) throw new Error(`the node didn't start: ${(failed ?? e).message}`);

@@ -1,0 +1,102 @@
+---
+title: What Pondra survives
+description: What happens to your reads and writes when a node dies, the bucket fails or a disk fills, and what your clients should do.
+sidebar:
+  order: 4
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+This page says what a running lake does when something fails: a node, the bucket, a disk, a client's
+connection. Each failure on it is one the repository's `tools/resilience_check.py` causes on purpose,
+with writers and readers going the whole time. It checks that every acknowledged write is there
+exactly once, on every node, that no read was torn or went back in time, and that writes go on once
+the fault is gone. The times below are from that check on a 4-vCPU test machine with a simulated S3
+bucket, so they show the shape, not what your hardware will do.
+
+## Give your clients every node
+
+A client given one node's address can only wait for that node. Give it all of them, and it carries
+on when one goes away:
+
+```python norun
+db = pondra.connect(["http://10.0.0.1:8080", "http://10.0.0.2:8080", "http://10.0.0.3:8080"])
+```
+
+```js norun
+const db = connect(["http://10.0.0.1:8080", "http://10.0.0.2:8080", "http://10.0.0.3:8080"]);
+```
+
+```text
+host=10.0.0.1,10.0.0.2,10.0.0.3 port=5432 dbname=lake user=me     # psql, psycopg, any libpq driver
+bootstrap.servers=10.0.0.1:9092,10.0.0.2:9092,10.0.0.3:9092         # a Kafka producer or consumer
+```
+
+The Python and JavaScript clients send a call to the next node when no node ran it, and also when
+running it twice couldn't apply it twice: a query, an `append`, and a single `INSERT`, `UPDATE`,
+`DELETE` or `MERGE`, which they send with a job. They keep trying for `retry_secs` (60 by default).
+A connection whose node holds its session (a transaction, temporary tables, `SET`, variables) stays
+on that node, and if the node goes, its next call fails with SQLSTATE `08006`: the session is gone,
+and nothing of an open transaction was applied. See [Python](/pondra/reference/python/#connect) and
+[JavaScript](/pondra/reference/javascript/).
+
+## What each failure does
+
+| Failure | Reads | Writes | Measured |
+|---|---|---|---|
+| **A follower killed** | go on, on the other nodes | go on, on the other nodes | writes again 0.3 s after |
+| **The leader killed** | go on | wait until another node leads, then go on | writes again 7.3 s after (the lease, then the new leader opens the catalog) |
+| **The leader killed and started again** | go on | go on; it comes back as a follower | writes again 0.3 s after |
+| **The bucket answers errors** (500, 503, replies lost) | go on | go on, a little slower: every request is retried | 106 acks a second, against 366 with no faults; the longest wait 0.7 s |
+| **The bucket slow** (every request 250 ms slower, some held 20 s) | go on | go on, slower | 3.4 acks a second; the longest wait 15.6 s (a commit waits for its slowest request) |
+| **The bucket down** for longer than a leader's lease | what the nodes hold go on | wait, then go on when it is back | the first ack 0.3 s after the bucket was back from 40 s down |
+| **Only the leader cut off from the bucket** | go on, on the other nodes | another node leads and takes them | another node took writes 25 s after the cut |
+| **The lake's disk full** (a lake on local disk) | go on | wait, then all go in when there is room | 31,352 reads answered while it was full; the first ack 0.8 s after there was room |
+| **The nodes' cache disk full** (a lake on a bucket) | go on | go on | 289 acks a second, the longest wait 0.1 s; a spread query answered as on one node |
+| **A database's node killed** under [`pondra serve --lakes`](/pondra/guides/server/) | the server starts it again | the server starts it again | writes again 0.5 s after |
+| **`pondra sql` killed mid-INSERT** | — | none of its rows or all of them, never part | none applied in four kills; the next INSERT 0.1 s later (0.3 s on the bucket) |
+
+Through every one of them, no acknowledged write was lost or applied twice, and every node gave the
+same answers once the fault was gone.
+
+## Each door through a failover
+
+- **Python and JavaScript clients** given every node: no call failed through a leader killed, a
+  follower killed, and a leader killed and started again. Six Python writers and one JavaScript writer had 25,172 calls acknowledged.
+- **Postgres** (psycopg, a connection string naming every node): it reconnects to a live node at
+  once, but a statement running on the node that died, or sent in the seconds while the next leader
+  takes over, fails (SQLSTATE `58030` or `57P03`), as on any database. Run it again: an `INSERT` that
+  failed may have been applied if its answer was lost, so give such writes a key, or send them
+  through a client that adds a job. Three writers had 20,782 INSERTs acknowledged, each there once, and 3,267 refused while a leader was being replaced, in quick retries.
+- **Kafka** (an idempotent producer given every node): every record delivered once, in order,
+  through a leader and a follower killed. A producer that gives up on a batch (its
+  `delivery.timeout.ms` passed) and goes on under a new epoch has each record it was told was
+  delivered written once. 73,650 of 73,650 records delivered; of a producer that gave up on 2,840, the 27,240 it was told were delivered were each there once.
+- **`pondra sql`** on a lake nobody serves, or beside running nodes: killed mid-INSERT, it leaves
+  none of the INSERT's rows or all of them, and the next INSERT goes in at once. Pointed at a bucket
+  that isn't there, it says so (`NoSuchBucket`) instead of waiting.
+
+## A leader cut off from the bucket
+
+A leader that can't reach the bucket can't commit, though its followers may still reach both. After
+15 seconds without reaching it (slow answers and requests to slow down count as reaching it), it
+tells its followers, one of them claims the next term at once, and meanwhile it turns requests away
+with HTTP 503 and `Retry-After` (SQLSTATE `57P03`), so a client given every node goes to another,
+and `GET /ready` answers 503, so a load balancer or Kubernetes stops sending it requests. A
+leader alone, with no other node to lead, keeps serving what it can. When it reaches the bucket
+again it follows the new leader.
+
+<Aside type="caution">
+What these checks don't cover yet, or where Pondra waits instead of failing:
+
+- **Writes wait, without an error,** while the bucket is down or the lake's disk is full, for as long
+  as it lasts. Your client's timeout decides when to give up; a write that timed out may still go in,
+  so send it again with the same `producer` and `seq`, or job.
+- **A failover takes seconds:** the new leader opens the catalog before it takes writes (about 4 s
+  on the simulated bucket, longer on a slow one).
+- **A request the bucket holds holds the commits behind it,** until it is answered or times out:
+  with 2% of requests held for 20 s, writes went on at a few a second.
+- Arrow Flight clients haven't been put through these failures yet.
+- Every run so far was on one machine with a simulated bucket. Several machines and a real R2 bucket
+  are next, and so is a 24-hour soak.
+</Aside>

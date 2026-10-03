@@ -449,10 +449,7 @@ async fn run() -> anyhow::Result<()> {
             let leader = cluster.is_leader();
             if leader {
                 // "Still here", in the bucket, from the start: for machines outside the cluster.
-                let (s, n) = (store.clone(), cluster.leader.n);
-                let first = s.clone(); // (beside the catalog's opening, not before it: C5)
-                tokio::spawn(async move { cluster::mark_alive(&first, n).await.map_err(|e| eprintln!("the leader's mark: {e:#}")) });
-                every(Duration::from_secs(10), move || { let s = s.clone(); async move { cluster::mark_alive(&s, n).await } });
+                cluster.clone().keep_alive(store.clone(), &dir); // (beside the catalog's opening, not before it: C5)
             }
             // Stopped (Ctrl-C, SIGTERM from a scheduler scaling down, or the program that started
             // this node ending): drained first (`drain.rs`; a second signal stops at once), then the
