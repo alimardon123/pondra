@@ -28,6 +28,7 @@ mod fresh;
 mod fsum;
 mod hot;
 mod intervals;
+mod layout;
 mod iceberg;
 mod inbox;
 mod kafka;

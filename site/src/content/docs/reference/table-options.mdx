@@ -5,54 +5,69 @@ sidebar:
   order: 3
 ---
 
-Options go in a `WITH (name = value, …)` clause. A value is a quoted string or a number, and a
-list is one string with commas: `cluster_by = 'user_id, url'`. Names aren't case sensitive.
+A table's layout is written as clauses after its columns. Everything else goes in a
+`WITH (name = value, …)` clause, where a value is a quoted string, a number, or a list in
+parentheses: `publish = (delta, iceberg)`. Names aren't case sensitive.
 
 ## Tables
 
-`CREATE TABLE t (…) WITH (…)`. Which kind of table you get depends on the key:
+`CREATE TABLE t (…)`, then its layout clauses in any order, then `WITH (…)`. Which kind of table
+you get depends on the key:
 
 - **Append table**: no key. Every row is kept.
 - **Keyed table** (upsert table): a `PRIMARY KEY`. A new row with an existing key replaces the old one.
-- **Merge table**: a key and `merge`. Rows with the same key combine.
+- **Merge table**: a key, and `MERGE` on every other column. Rows with the same key combine.
+
+| Clause | For | Meaning |
+|---|---|---|
+| `PRIMARY KEY (a, b)` | keyed, merge | the key, as a column or table constraint |
+| `PARTITION BY col`, `PARTITION BY day(col)` | all | keep one partition per file. The units are `year`, `month`, `day` and `hour`, and need a timestamp or date column |
+| `CLUSTER BY (col1, col2)` | all | sort every file by these columns, so a filter on them skips most of a file; two or more follow a Hilbert curve |
+| `SEQUENCE BY col` | keyed | the row with the greatest value of this column wins, not the last to arrive |
+| `TTL col + INTERVAL '1 hour'` | keyed | a row whose timestamp or date column is older than that is gone |
+| `col TYPE MERGE sum` | merge | how the column combines: `sum`, `count`, `min` or `max` |
 
 | Option | Value | For | Meaning |
 |---|---|---|---|
-| `PRIMARY KEY (a, b)` | columns | keyed, merge | the key, as a column or table constraint; not a `WITH` option |
-| `publish` | `'delta'`, `'iceberg'` or `'delta,iceberg'` | all | also write the table as Delta Lake or Iceberg, for other engines. Default: none, or what `--publish` says |
-| `cluster_by` | `'col'` or `'col1, col2'` | all | sort every file by these columns, so a filter on them skips most of a file; two or more follow a Hilbert curve |
-| `partition_by` | `'col'`, or `'year(col)'`, `'month(col)'`, `'day(col)'`, `'hour(col)'` | all | keep one partition per file; the unit forms need a timestamp or date column |
-| `merge` | `'col:func, …'` with `func` one of `sum`, `count`, `min`, `max` | merge | how each non-key column combines |
-| `ttl` | `'column:seconds'` | keyed | a row whose timestamp or date column is older than that many seconds is gone |
-| `order_by` | `'column'` | keyed | the row with the greatest value of this column wins, not the last to arrive |
+| `publish` | `delta`, `iceberg` or `(delta, iceberg)` | all | also write the table as Delta Lake or Iceberg, for other engines. Default: none, or what `--publish` says |
 | `retention` | `'7 days'`, `'12 hours'`, `'0 seconds'` | all | how long the table's past is kept: read as it was with `t AT (…)`, and, dropped, brought back with `UNDROP TABLE`. Default: a day |
 
-An option name that isn't in this table is refused when you `CREATE` the table, and the error names it.
-`partition_by` and `cluster_by` may be written as clauses after the columns, as BigQuery, Snowflake and
-Databricks write them: `PARTITION BY day(ts) CLUSTER BY (user_id, url)`.
+An option name that isn't in this table is refused when you `CREATE` the table, and the error names
+it. In `CREATE TABLE t … AS SELECT …`, the clauses and `WITH` come before `AS`.
 
-`ALTER TABLE t SET (…)` changes `publish`, `cluster_by`, `ttl` and `order_by` later. Files written
-from then on follow them, and files written before keep their order until they are merged.
-`partition_by` can't change, because each file holds one partition. `merge` can't change either.
+Each clause is also an option, for tools that write options: `partition_by = 'day(ts)'`,
+`cluster_by = 'a, b'`, `order_by = 'seen'`, `ttl = 'seen:3600'` (seconds) and
+`merge = 'amount:sum, n:count'`. Giving a clause and its option both is refused. Spark's
+`PARTITIONED BY (col)` is `PARTITION BY col`.
+
+Change a table's layout later with `ALTER TABLE t CLUSTER BY (a, b)`, `ALTER TABLE t TTL seen +
+INTERVAL '2 hours'` and `ALTER TABLE t SEQUENCE BY seen`, and its options with `ALTER TABLE t SET
+(publish = iceberg, retention = '30 days')`. Files written from then on follow them, and files
+written before keep their order until they are merged. `PARTITION BY` can't change, because each
+file holds one partition, and `MERGE` can't change either.
 
 ### Append table
 
 ```sql
 CREATE TABLE clicks (ts TIMESTAMP, user_id BIGINT, url VARCHAR)
-WITH (publish = 'delta,iceberg', cluster_by = 'user_id', partition_by = 'day(ts)');
+PARTITION BY day(ts)
+CLUSTER BY (user_id)
+WITH (publish = (delta, iceberg));
 INSERT INTO clicks VALUES (TIMESTAMP '2026-01-01 10:00:00', 1, '/a'), (TIMESTAMP '2026-01-02 10:00:00', 2, '/b');
 SELECT count(*) AS n FROM clicks;
-ALTER TABLE clicks SET (cluster_by = 'user_id, url', publish = 'iceberg');
+ALTER TABLE clicks CLUSTER BY (user_id, url);
+ALTER TABLE clicks SET (publish = iceberg);
 ```
 
 ### Keyed table
 
-`order_by` lets rows arrive out of order: below, the row with the later `seen` stays, even though
-the older one is written last. `ttl` drops a row an hour after its `seen`.
+`SEQUENCE BY` lets rows arrive out of order: below, the row with the later `seen` stays, even
+though the older one is written last. `TTL` drops a row an hour after its `seen`.
 
 ```sql
 CREATE TABLE sessions (user_id BIGINT PRIMARY KEY, seen TIMESTAMP, page VARCHAR)
-WITH (order_by = 'seen', ttl = 'seen:3600');
+SEQUENCE BY seen
+TTL seen + INTERVAL '1 hour';
 INSERT INTO sessions VALUES (1, now(), '/home');
 INSERT INTO sessions VALUES (1, TIMESTAMP '2000-01-01 00:00:00', '/old');
 SELECT user_id, page FROM sessions;
@@ -71,8 +86,12 @@ Every column that isn't part of the key needs a function. `sum` and `count` both
 you write carries its own count, as `count(*)` does in a view's `GROUP BY`.
 
 ```sql
-CREATE TABLE totals (region VARCHAR PRIMARY KEY, amount DOUBLE, n BIGINT, biggest DOUBLE)
-WITH (merge = 'amount:sum, n:count, biggest:max');
+CREATE TABLE totals (
+  region  VARCHAR PRIMARY KEY,
+  amount  DOUBLE MERGE sum,
+  n       BIGINT MERGE count,
+  biggest DOUBLE MERGE max
+);
 INSERT INTO totals VALUES ('eu', 5.0, 1, 5.0);
 INSERT INTO totals VALUES ('eu', 3.0, 1, 3.0), ('us', 2.0, 1, 2.0);
 SELECT * FROM totals ORDER BY region;
@@ -84,20 +103,22 @@ eu      8.0     2  5.0
 us      2.0     1  2.0
 ```
 
-What Pondra refuses, by option:
+What Pondra refuses:
 
 | You write | Error |
 |---|---|
 | an option name the table doesn't take, such as `cluser_by` | `CREATE TABLE … WITH (cluser_by = …): tables take publish, cluster_by, partition_by, ttl, order_by, merge` |
-| `merge` without a key | `a merge table needs a key` |
-| a merge table with a non-key column left out of `merge` | `a merge table combines every column but its key: s needs a merge function too` |
-| `merge = 'b:avg'` | `merge functions: sum, count, min, max` |
-| `publish = 'parquet'` | `publish formats: delta, iceberg` |
-| `cluster_by` on a column the table lacks | `cluster_by: columns of the table` |
-| `partition_by = 'week(ts)'` | `partition_by: a column, or year/month/day/hour(a timestamp column)` |
-| `ttl` on a table with no key, or a column that isn't a timestamp or date | `ttl: a timestamp or date column of a keyed table` |
-| `order_by` naming a key column | `order_by: a column of the table, not its key` |
-| `ALTER TABLE t SET (partition_by = …)` | `partition_by can't change` |
+| `MERGE` without a key | `MERGE needs a key: a merge table combines the rows of each key` |
+| a merge table with a non-key column that has no `MERGE` | `a merge table combines every column but its key: s needs a merge function too` |
+| `b DOUBLE MERGE avg` | `MERGE: sum, count, min or max` |
+| `publish = parquet` | `publish formats: delta, iceberg` |
+| `CLUSTER BY` a column the table lacks | `CLUSTER BY: columns of the table` |
+| `PARTITION BY week(ts)` | `PARTITION BY: a column, or year/month/day/hour(a timestamp column)` |
+| `TTL` on a table with no key, or a column that isn't a timestamp or date | `TTL: a timestamp or date column of a keyed table` |
+| `TTL ts + INTERVAL '1 month'` | `an interval in seconds, minutes, hours, days or weeks` |
+| `SEQUENCE BY` a key column | `SEQUENCE BY: a column of the table, not its key` |
+| `PARTITION BY` and `partition_by` both | `partition_by is given twice, as a clause and in WITH (…)` |
+| `ALTER TABLE t SET (partition_by = …)` | `PARTITION BY can't change` |
 | `retention = 'soon'` | `retention: a time such as '7 days', '12 hours' or '0 seconds'` |
 
 ## Materialized views

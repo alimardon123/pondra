@@ -146,7 +146,7 @@ past starts when it was made.
 
 | Statement | Syntax |
 |---|---|
-| Create | `CREATE [OR REPLACE] TABLE [IF NOT EXISTS] t (column type [NOT NULL] [DEFAULT expression] [CHECK (condition)] [PRIMARY KEY], … [, PRIMARY KEY (column, …)] [, CONSTRAINT name CHECK (condition)]) [WITH (option = 'value', …)] [PARTITION BY expression] [CLUSTER BY (column, …)]` |
+| Create | `CREATE [OR REPLACE] TABLE [IF NOT EXISTS] t (column type [NOT NULL] [DEFAULT expression] [CHECK (condition)] [PRIMARY KEY] [MERGE sum\|count\|min\|max], … [, PRIMARY KEY (column, …)] [, CONSTRAINT name CHECK (condition)]) [PARTITION BY expression] [CLUSTER BY (column, …)] [SEQUENCE BY column] [TTL column + INTERVAL '…'] [WITH (option = value, …)]`: the layout clauses in any order ([table options](/pondra/reference/table-options/)) |
 | Create like another | `CREATE TABLE t LIKE s`: an empty table with `s`'s columns and their types, as Postgres's does |
 | Create from a query | `CREATE TABLE t AS SELECT …`, `CREATE TABLE t (a INT, b VARCHAR) AS VALUES …`, or `SELECT … INTO t FROM …` |
 | Add a column | `ALTER TABLE t ADD COLUMN [IF NOT EXISTS] c type` |
@@ -154,7 +154,8 @@ past starts when it was made.
 | Rename a table | `ALTER TABLE t RENAME TO u` |
 | Drop a column | `ALTER TABLE t DROP COLUMN [IF EXISTS] c` |
 | Widen a column | `ALTER TABLE t ALTER COLUMN c TYPE BIGINT` |
-| Change options | `ALTER TABLE t SET (publish = 'delta', cluster_by = 'user', ttl = 'ts:3600', order_by = 'ts', retention = '7 days')`, or `ALTER TABLE t CLUSTER BY (user)` |
+| Change the layout | `ALTER TABLE t CLUSTER BY (user)`, `ALTER TABLE t TTL ts + INTERVAL '2 hours'`, `ALTER TABLE t SEQUENCE BY ts` |
+| Change options | `ALTER TABLE t SET (publish = delta, retention = '7 days')` |
 | Empty | `TRUNCATE [TABLE] t` |
 | Drop | `DROP TABLE [IF EXISTS] t [, t2 …] [PURGE]` |
 | Bring back a dropped table | `UNDROP TABLE t` |
@@ -206,7 +207,7 @@ dropped last under that name, and is refused while another table has the name: r
 
 ```sql
 CREATE TABLE users (id BIGINT PRIMARY KEY, name VARCHAR, plan VARCHAR);
-CREATE TABLE clicks (ts TIMESTAMP, user VARCHAR, url VARCHAR) WITH (cluster_by = 'user', partition_by = 'day(ts)');
+CREATE TABLE clicks (ts TIMESTAMP, user VARCHAR, url VARCHAR) PARTITION BY day(ts) CLUSTER BY (user);
 CREATE TABLE big_orders AS SELECT * FROM orders WHERE amount > 4;
 CREATE TABLE accounts (id BIGINT PRIMARY KEY, email VARCHAR NOT NULL, plan VARCHAR DEFAULT 'free', made TIMESTAMP DEFAULT now());
 INSERT INTO accounts (id, email) VALUES (1, 'ann@example.com');

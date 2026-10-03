@@ -72,24 +72,24 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
     let columns = columns.iter().map(|(n, t)| Ok((n.clone(), crate::query::type_name(&crate::query::dtype(t)?)))).collect::<Result<Vec<_>>>()?;
     let ttl = ttl.map(|t| -> Result<(String, u64)> {
         let (c, s) = t.split_once(':').ok_or_else(|| anyhow::anyhow!("ttl: \"column:seconds\""))?;
-        ensure!(!key.is_empty() && columns.iter().any(|(n, ty)| n == c && (ty.starts_with("Timestamp") || ty.starts_with("Date"))), "ttl: a timestamp or date column of a keyed table");
+        ensure!(!key.is_empty() && columns.iter().any(|(n, ty)| n == c && (ty.starts_with("Timestamp") || ty.starts_with("Date"))), "TTL: a timestamp or date column of a keyed table");
         Ok((c.to_string(), s.trim().parse()?))
     }).transpose()?;
     schema(&columns)?; // validate types
     ensure!(columns.iter().all(|(c, _)| !crate::sys::NAMES.contains(&c.as_str()) && c != "_old_version"), "{} are system columns: every table has them (`SELECT _row_id, * FROM t`)", crate::sys::NAMES.join(", "));
-    ensure!(merge.values().all(|f| ["sum", "count", "min", "max"].contains(&f.as_str())), "merge functions: sum, count, min, max");
-    ensure!(merge.is_empty() || !key.is_empty(), "a merge table needs a key");
-    ensure!(merge.keys().all(|c| columns.iter().any(|(n, _)| n == c)), "merge: columns of the table");
+    ensure!(merge.values().all(|f| ["sum", "count", "min", "max"].contains(&f.as_str())), "MERGE: sum, count, min or max");
+    ensure!(merge.is_empty() || !key.is_empty(), "MERGE needs a key: a merge table combines the rows of each key");
+    ensure!(merge.keys().all(|c| columns.iter().any(|(n, _)| n == c)), "MERGE: columns of the table");
     if let Some((c, _)) = columns.iter().find(|(c, _)| !merge.is_empty() && !key.contains(c) && !merge.contains_key(c)) {
-        bail!("a merge table combines every column but its key: {c} needs a merge function too (merge = '…, {c}:sum|count|min|max')");
+        bail!("a merge table combines every column but its key: {c} needs a merge function too ({c} … MERGE sum|count|min|max)");
     }
     ensure!(publish.iter().flatten().all(|f| ["delta", "iceberg"].contains(&f.as_str())), "publish formats: delta, iceberg");
     // (A keyed table takes them too: each tiering round's newest rows go into a file per
     // partition, sorted by cluster_by, then the key; reads let a newer round's key shadow an older
     // round's wherever its partition, `query::upsert_view`.)
-    ensure!(cluster.iter().flatten().all(|c| columns.iter().any(|(n, _)| n == c)), "cluster_by: columns of the table");
-    ensure!(order.is_none() || (!key.is_empty() && merge.is_empty()), "order_by: a keyed table's (PRIMARY KEY), whose rows replace each other");
-    ensure!(order.iter().all(|o| columns.iter().any(|(n, _)| n == o) && !key.contains(o)), "order_by: a column of the table, not its key");
+    ensure!(cluster.iter().flatten().all(|c| columns.iter().any(|(n, _)| n == c)), "CLUSTER BY: columns of the table");
+    ensure!(order.is_none() || (!key.is_empty() && merge.is_empty()), "SEQUENCE BY: a keyed table's (PRIMARY KEY), whose rows replace each other");
+    ensure!(order.iter().all(|o| columns.iter().any(|(n, _)| n == o) && !key.contains(o)), "SEQUENCE BY: a column of the table, not its key");
     if let Some(p) = &partition {
         crate::tier::check_partition(p, &columns)?;
     }
@@ -281,6 +281,9 @@ fn renamed(body: &mut ast::SetExpr, names: &[ast::Ident]) -> bool {
 fn option_text(v: &ast::Expr) -> String {
     match v {
         ast::Expr::Value(ast::ValueWithSpan { value: ast::Value::SingleQuotedString(s) | ast::Value::DoubleQuotedString(s), .. }) => s.clone(),
+        // (a list: `publish = (delta, iceberg)`, `cluster_by = (a, b)`, as a string's commas)
+        ast::Expr::Tuple(t) => t.iter().map(option_text).collect::<Vec<_>>().join(", "),
+        ast::Expr::Nested(e) => option_text(e),
         other => other.to_string().trim_matches('\'').to_string(),
     }
 }
@@ -288,7 +291,7 @@ fn option_text(v: &ast::Expr) -> String {
 /// A partition clause as `partition_by` writes it: `ts`, `day(ts)`. Spark's and Iceberg's
 /// `days(ts)`, BigQuery's `DATE(ts)` and `TIMESTAMP_TRUNC(ts, DAY)`, and `date_trunc('day', ts)`
 /// are the same partitions.
-fn partition_text(e: &ast::Expr) -> String {
+pub fn partition_text(e: &ast::Expr) -> String {
     let column = |e: &ast::Expr| match e {
         ast::Expr::Identifier(i) => ident(i),
         e => e.to_string(),
@@ -311,7 +314,7 @@ fn partition_text(e: &ast::Expr) -> String {
 }
 
 /// The columns a `CLUSTER BY` names: `a, b` or `(a, b)`.
-fn cluster_names(e: &ast::Expr) -> Vec<String> {
+pub fn cluster_names(e: &ast::Expr) -> Vec<String> {
     match e {
         ast::Expr::Tuple(t) => t.iter().flat_map(cluster_names).collect(),
         ast::Expr::Nested(e) => cluster_names(e),
@@ -444,6 +447,11 @@ pub fn parse(sql: &str) -> Option<Stmt> {
             other => other?,
         });
     }
+    // A table's layout as clauses (`PARTITION BY day(ts)`, `TTL ts + INTERVAL '1 hour'`, …): read as its options.
+    let sql = &match crate::layout::clauses(sql) {
+        Ok(sql) => sql,
+        Err(e) => return Some(Stmt::Invalid(format!("{e:#}"))),
+    };
     let parsed = Parser::parse_sql(&GenericDialect {}, sql).or_else(|e| crate::settings::dialect().map_or(Err(e), |d| Parser::parse_sql(d.as_ref(), sql))); // (DuckDB's STRUCT(a INT), …: the session's dialect)
     let parsed = match parsed {
         Ok(mut s) => s.pop()?,
@@ -715,23 +723,7 @@ pub async fn create_spec(c: &ast::CreateTable, from: &Lake, files: bool) -> Resu
             }
         }
     }
-    // Other engines' clauses for two of them: BigQuery's and Postgres's `PARTITION BY expr`, Spark's
-    // `PARTITIONED BY (c)`, and Snowflake's, Databricks' and BigQuery's `CLUSTER BY a, b`. (Read
-    // and then dropped, they made a table with neither.)
-    let mut clause = |k: &str, v: String| -> Result<()> {
-        ensure!(opts.insert(k.into(), v).is_none(), "CREATE TABLE {}: {k} is given twice", c.name);
-        Ok(())
-    };
-    if let Some(e) = &c.partition_by {
-        clause("partition_by", partition_text(e))?;
-    }
-    if let ast::HiveDistributionStyle::PARTITIONED { columns } = &c.hive_distribution {
-        ensure!(columns.len() == 1, "CREATE TABLE {} PARTITIONED BY (…): one column, or day(ts): each file holds one partition", c.name);
-        clause("partition_by", ident(&columns[0].name))?;
-    }
-    if let Some(ast::WrappedCollection::NoWrapping(e) | ast::WrappedCollection::Parentheses(e)) = &c.cluster_by {
-        clause("cluster_by", e.iter().flat_map(cluster_names).collect::<Vec<_>>().join(", "))?;
-    }
+    // (`PARTITION BY`, `CLUSTER BY`, `SEQUENCE BY`, `TTL` and `MERGE sum` came in as these options: `layout.rs`)
     if let o @ (ast::CreateTableOptions::Plain(_) | ast::CreateTableOptions::TableProperties(_)) = &c.table_options {
         bail!("CREATE TABLE {} … {o}: a table's options go in WITH (name = value, …)", c.name);
     }
@@ -794,7 +786,7 @@ async fn alter_spec(lake: &Lake, stmt: &Stmt) -> Result<Option<String>> {
                 match k.as_str() {
                     "publish" | "cluster_by" => spec[k] = j!(list(v)),
                     "ttl" | "order_by" | "retention" => spec[k.as_str()] = j!(v),
-                    "partition_by" => bail!("partition_by can't change: each of {table}'s files holds one partition"),
+                    "partition_by" => bail!("PARTITION BY can't change: each of {table}'s files holds one partition"),
                     // Other engines' own (`write.delete.mode`, `write.merge.mode`…): kept and published
                     // for them (Iceberg's table properties); '' takes one out.
                     p if p.contains('.') && v.is_empty() => drop(spec["properties"].as_object_mut().map(|o| o.remove(p))),

@@ -6254,6 +6254,24 @@ def objects():
     info["laid"] = [shape, twice[2], engine[2]]
     checks["PARTITION BY, PARTITIONED BY and CLUSTER BY are the table's options; given twice, or ENGINE =, refused"] = \
         shape == {"laid": ("day(ts)", ["user_id", "url"]), "laid2": ("user_id", ["ts"])} and twice[0] == 500 and engine[0] == 500
+    # A table's layout as clauses, in any order and beside WITH (the SQL review's 1A, `layout.rs`)
+    q("CREATE TABLE lay_s (user_id BIGINT PRIMARY KEY, seen TIMESTAMP, page VARCHAR) CLUSTER BY (page) TTL seen + INTERVAL '1 hour' "
+      "PARTITION BY day(seen) SEQUENCE BY seen WITH (publish = (delta, iceberg), retention = '7 days')")
+    q("CREATE TABLE lay_t (region VARCHAR PRIMARY KEY, amount DOUBLE MERGE sum, n BIGINT MERGE count)")
+    q("INSERT INTO lay_t VALUES ('eu', 5.0, 1)")
+    q("INSERT INTO lay_t VALUES ('eu', 3.0, 1)")
+    q("ALTER TABLE lay_s TTL seen + INTERVAL '2 hours'")
+    laid = {o["name"]: (o.get("partition"), o.get("cluster"), o.get("order_by"), o.get("ttl_secs"), o.get("merge"), o.get("publish"))
+            for o in call(A.port, "GET", "/objects")["objects"] if o["name"] in ("lay_s", "lay_t")}
+    totals = q("SELECT region, amount, n FROM lay_t")
+    wrong = [http(s)[0] for s in ("CREATE TABLE lay_x (id BIGINT PRIMARY KEY, ts TIMESTAMP) TTL ts + INTERVAL '1 month'",
+                                   "CREATE TABLE lay_y (id BIGINT PRIMARY KEY, ts TIMESTAMP) SEQUENCE BY ts WITH (order_by = 'ts')",
+                                   "CREATE TABLE lay_z (id BIGINT PRIMARY KEY, ts TIMESTAMP) SEQUENCE BY id")]
+    info["layout"] = [laid, totals, wrong]
+    checks["SEQUENCE BY, TTL and MERGE sum are the table's options, in any order beside WITH; ALTER TABLE … TTL; mistakes refused"] = \
+        laid == {"lay_s": ("day(seen)", ["page"], "seen", ["seen", 7200], {}, ["delta", "iceberg"]),
+                 "lay_t": (None, [], None, None, {"amount": "sum", "n": "count"}, [])} \
+        and totals == [{"region": "eu", "amount": 8.0, "n": 2}] and wrong == [500, 500, 500]
     q("CREATE TABLE keyed (id BIGINT PRIMARY KEY, v VARCHAR)")
     q("INSERT INTO keyed VALUES (1, 'a'), (2, 'b')")
     q("INSERT OR IGNORE INTO keyed VALUES (1, 'x'), (3, 'c')")
