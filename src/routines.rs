@@ -670,16 +670,24 @@ async fn expand_with(lake: &Lake, sql: &str, views: &HashMap<String, String>) ->
     Ok(text(&stmts))
 }
 
-/// `SHOW USER FUNCTIONS`, `SHOW PROCEDURES`, `SHOW TASKS`, `SHOW VIEWS`, `SHOW MATERIALIZED VIEWS`
-/// (`[LIKE 'pattern']`): this lake's own, from `pondra.routines`, `pondra.tasks` and
-/// `pondra.tables`, as Snowflake has them. (`SHOW FUNCTIONS` is every function a query may call,
+/// `SHOW USER FUNCTIONS`, `SHOW PROCEDURES`, `SHOW TASKS`, `SHOW VIEWS`, `SHOW MATERIALIZED VIEWS`,
+/// `SHOW SCHEMAS`, `SHOW DATABASES`, `SHOW SECRETS`, `SHOW USERS`, `SHOW ROLES`, `SHOW GRANTS`
+/// (`[LIKE 'pattern']`): this lake's own, from `pondra.routines`, `pondra.tasks`, `pondra.tables`,
+/// `information_schema.schemata`, `secrets()`, `pondra.users` and `pondra.grants`, as Snowflake has them. (`SHOW FUNCTIONS` is every function a query may call,
 /// as DataFusion lists them: its own, and the Python ones; `SHOW TABLES` is DataFusion's.)
 fn show(sql: &str) -> Option<String> {
-    static SHOW: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?is)^\s*show\s+(user\s+functions|procedures|tasks|materialized\s+views|views)(?:\s+like\s+('(?:[^']|'')*'))?\s*;?\s*$").expect("a regex"));
+    static SHOW: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?is)^\s*show\s+(user\s+functions|procedures|tasks|materialized\s+views|views|schemas|databases|secrets|users|roles|grants)(?:\s+like\s+('(?:[^']|'')*'))?\s*;?\s*$").expect("a regex"));
     let m = SHOW.captures(sql)?;
-    let like = m.get(2).map(|l| format!(" AND name LIKE {}", l.as_str())).unwrap_or_default();
     let what = m[1].split_whitespace().map(str::to_lowercase).collect::<Vec<_>>().join(" ");
+    let named = match what.as_str() { "schemas" => "schema_name", "databases" => "catalog_name", "grants" => "grantee", _ => "name" };
+    let like = m.get(2).map(|l| format!(" AND {named} LIKE {}", l.as_str())).unwrap_or_default();
     Some(match what.as_str() {
+        "schemas" => format!("SELECT catalog_name AS lake, schema_name AS name FROM information_schema.schemata WHERE schema_name NOT IN ('information_schema', 'pg_catalog') AND schema_name NOT LIKE 'pg_temp%'{like} ORDER BY 1, 2"),
+        "databases" => format!("SELECT DISTINCT catalog_name AS name FROM information_schema.schemata WHERE true{like} ORDER BY 1"),
+        "secrets" => format!("SELECT * FROM secrets() WHERE true{like} ORDER BY name"),
+        "users" => format!("SELECT * FROM pondra.users WHERE kind <> 'role'{like} ORDER BY name"),
+        "roles" => format!("SELECT * FROM pondra.users WHERE kind = 'role'{like} ORDER BY name"),
+        "grants" => format!("SELECT * FROM pondra.grants WHERE true{like} ORDER BY 1, 2"),
         "user functions" => format!("SELECT name, kind, language, arguments, returns, volatility FROM pondra.routines WHERE kind <> 'procedure'{like} ORDER BY name"),
         "procedures" => format!("SELECT name, language, arguments FROM pondra.routines WHERE kind = 'procedure'{like} ORDER BY name"),
         "tasks" => format!("SELECT * FROM pondra.tasks WHERE true{like} ORDER BY name"),

@@ -6125,6 +6125,49 @@ def objects():
                                      "MERGE INTO orders o USING t AS o ON o.id = o.a WHEN MATCHED THEN DELETE")]
     interval = q("SELECT 3 * INTERVAL '37 seconds' AS a, INTERVAL '1 month' * 2.5 AS b")
     checks["MERGE's mistakes refused; n * INTERVAL as Postgres"] = refused == [500, 500, 500] and interval == [{"a": "1 mins 51.000000000 secs", "b": "2 mons 15 days"}]
+    # Other engines' spellings of what Pondra does, and what a write may say that it doesn't, refused
+    # (each was read and then dropped: the table had no partitions, OR IGNORE replaced the row)
+    q("CREATE TABLE laid (ts TIMESTAMP, user_id BIGINT, url VARCHAR) PARTITION BY days(ts) CLUSTER BY (user_id, url)")
+    q("CREATE TABLE laid2 (ts TIMESTAMP, user_id BIGINT) PARTITIONED BY (user_id)")
+    q("ALTER TABLE laid2 CLUSTER BY (ts)")
+    shape = {o["name"]: (o.get("partition"), o.get("cluster")) for o in call(A.port, "GET", "/objects")["objects"] if o["name"] in ("laid", "laid2")}
+    twice = http("CREATE TABLE laid3 (ts TIMESTAMP) WITH (cluster_by = 'ts') CLUSTER BY (ts)")
+    engine = http("CREATE TABLE laid4 (ts TIMESTAMP) ENGINE = MergeTree")
+    info["laid"] = [shape, twice[2], engine[2]]
+    checks["PARTITION BY, PARTITIONED BY and CLUSTER BY are the table's options; given twice, or ENGINE =, refused"] = \
+        shape == {"laid": ("day(ts)", ["user_id", "url"]), "laid2": ("user_id", ["ts"])} and twice[0] == 500 and engine[0] == 500
+    q("CREATE TABLE keyed (id BIGINT PRIMARY KEY, v VARCHAR)")
+    q("INSERT INTO keyed VALUES (1, 'a'), (2, 'b')")
+    q("INSERT OR IGNORE INTO keyed VALUES (1, 'x'), (3, 'c')")
+    q("INSERT IGNORE INTO keyed VALUES (2, 'x')")
+    q("INSERT OR REPLACE INTO keyed VALUES (2, 'B'), (4, 'd')")
+    upserted = q("SELECT id, v FROM keyed ORDER BY id")
+    refused = [http(s)[0] for s in ("INSERT OR ABORT INTO keyed VALUES (5, 'e')", "INSERT OVERWRITE TABLE keyed SELECT 6, 'f'",
+                                    "INSERT INTO keyed VALUES (7, 'g') RETURNING id", "UPDATE keyed SET v = 'h' WHERE id = 1 RETURNING id")]
+    info["keyed"] = [upserted, refused]
+    checks["INSERT OR IGNORE, INSERT IGNORE and INSERT OR REPLACE as ON CONFLICT; OR ABORT, OVERWRITE and RETURNING refused"] = \
+        upserted == [{"id": 1, "v": "a"}, {"id": 2, "v": "B"}, {"id": 3, "v": "c"}, {"id": 4, "v": "d"}] and refused == [500, 500, 500, 500] \
+        and q("SELECT count(*) AS n FROM keyed") == [{"n": 4}]
+    q("CREATE TABLE past (a BIGINT)")
+    q("INSERT INTO past VALUES (1)")
+    first = q("SELECT max(_version) AS v FROM past")[0]["v"]
+    q("INSERT INTO past VALUES (2), (3)")
+    then = [q(f"SELECT count(*) AS n FROM {w}") for w in (f"past VERSION AS OF {first}", f"past VERSION AS OF ({first})",
+                                                          "past TIMESTAMP AS OF (now())", "past FOR SYSTEM_TIME AS OF (now())")]
+    joined = q(f"SELECT count(*) AS n FROM past n JOIN past VERSION AS OF {first} w ON n.a = w.a")
+    checks["VERSION AS OF, TIMESTAMP AS OF, FOR SYSTEM_TIME AS OF: a table's past, as AT (…) reads it"] = \
+        then == [[{"n": 1}], [{"n": 1}], [{"n": 3}], [{"n": 3}]] and joined == [{"n": 1}]
+    refreshed = http("REFRESH MATERIALIZED VIEW w")
+    not_one = [http(f"REFRESH MATERIALIZED VIEW {t}")[0] for t in ("orders", "eu")]  # (eu is a table since its DETACH)
+    analyzed = [http(s)[0] for s in ("ANALYZE", "ANALYZE orders")]
+    checks["REFRESH MATERIALIZED VIEW and ANALYZE taken (nothing to do); REFRESH of a table refused"] = refreshed[0] == 200 and not_one == [500, 500] and analyzed == [200, 200]
+    # CREATE TABLE … LIKE takes the columns (it made a table of none); SHOW lists every kind
+    q("CREATE TABLE liked LIKE orders")
+    cols = lambda t: [(r["column_name"], r["data_type"]) for r in q(f"DESCRIBE {t}")]
+    shown = {w: http(f"SHOW {w}")[0] for w in ("SCHEMAS", "DATABASES", "SECRETS", "USERS", "ROLES", "GRANTS")}
+    checks["CREATE TABLE … LIKE has the other's columns; SHOW SCHEMAS, DATABASES, SECRETS, USERS, ROLES, GRANTS list"] = \
+        cols("liked") == cols("orders") and q("SELECT count(*) AS n FROM liked") == [{"n": 0}] and set(shown.values()) == {200} \
+        and any({"lake": d["name"], "name": "public"} in q("SHOW SCHEMAS") for d in q("SHOW DATABASES"))
     # A notebook run: `%%sql df <<` is a frame in its Python; a SQL cell reads a Python table
     cell = lambda src, kind="code": {"cell_type": kind, "metadata": {}, "source": src, "outputs": [], "execution_count": None}
     nb = {"cells": [cell("%%sql eu_rows <<\nSELECT id, amount FROM orders WHERE region = 'eu'"), cell("import pandas as pd\ntargets = pd.DataFrame({'region': ['eu', 'us'], 'target': [3, 1]})\nn = len(eu_rows.to_pandas())"),

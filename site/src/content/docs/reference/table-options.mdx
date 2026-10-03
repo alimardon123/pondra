@@ -28,6 +28,8 @@ list is one string with commas: `cluster_by = 'user_id, url'`. Names aren't case
 | `retention` | `'7 days'`, `'12 hours'`, `'0 seconds'` | all | how long the table's past is kept: read as it was with `t AT (…)`, and, dropped, brought back with `UNDROP TABLE`. Default: a day |
 
 An option name that isn't in this table is refused when you `CREATE` the table, and the error names it.
+`partition_by` and `cluster_by` may be written as clauses after the columns, as BigQuery, Snowflake and
+Databricks write them: `PARTITION BY day(ts) CLUSTER BY (user_id, url)`.
 
 `ALTER TABLE t SET (…)` changes `publish`, `cluster_by`, `ttl` and `order_by` later. Files written
 from then on follow them, and files written before keep their order until they are merged.
