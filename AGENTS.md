@@ -2089,8 +2089,9 @@ Known limits, in the order they matter:
 
 Good next moves: `docs/roadmap.md` (2026-10-03) is the shortest path to 1.0, at the owner's bar
 ("high quality, stable, workable, fully featured"): round 33 closes with the soak and environments;
-34 is SQL as people write it and scale on machines; 35 in-process and fitting in (databases
-attached, BI tools); 36 is 1.0 (the promises, a security review, signed packages, the docs).
+34 is SQL as people write it and scale on machines; 35 in-process and in the browser; 36 fitting
+in (databases attached, BI tools, measures in views); 37 is 1.0 (the promises, a security review,
+signed packages, the docs).
 
 ## Conventions
 
