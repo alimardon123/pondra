@@ -2,7 +2,10 @@
 
 `.github/workflows/cluster-bench.yml` starts a Pondra cluster on separate GitHub-hosted machines,
 loads TPC-H into your bucket, and runs the 22 queries on one node and across all of them. It runs
-only when started by hand, and deletes its lake when it's done.
+on main every night on 3 nodes and every Sunday on 6 (SF10), and when started by hand, and deletes
+its lake when it's done. Each run's summary compares it with the last run of as many nodes
+(`bench-results/latest-<nodes>.json`); answers that differ from one node's fail it, and a cluster
+slower than one node warns.
 
 ## What it needs
 

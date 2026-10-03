@@ -5,7 +5,7 @@ Read in this order:
 | File | What it is |
 |---|---|
 | `prototype-status.md` | Where the prototype stands: what it does, every measured number, what's missing (round 26 and its continuation, the current one) |
-| `roadmap.md` | What's left and in what order after round 26: ten tracks (runs anywhere, in-process and in the browser, proof at scale, correctness, ready for a team, depth, read and write anything, SQL and Python as one, extensions, the platform on top), lessons from DuckDB-WASM and PGlite, rounds 26–33, and the decisions only the owner can make |
+| `roadmap.md` | The shortest path to 1.0 (2026-10-03): the scorecard, the rounds left, what comes after, the tracks' open items, and the decisions only the owner can make |
 | `lake-format.md` | The lake on disk and in the bucket (same layout): the native format, who can read and write it how, small files and compaction, and the optional Delta/Iceberg metadata other engines read |
 | `comparison-spark-flink-fluss.md` | Head-to-head with Spark, Flink, Fluss, Lakehouse//RT and the single-node engines (DuckDB, Polars, Daft, Bodo): TPC-H, streaming, freshness like for like, serving, a scorecard, Fluss 1.0 item by item, what Fluss, Flink, Spark, Databricks and Snowflake are building next, and the plan for the gaps |
 | `adr-024-nothing-to-set-up.md` | 0.22.1: one-line installers on every release that leave `pondra` on PATH, `python -m pondra` (and `--add-to-path`) for pip's user installs, and rows without pyarrow |

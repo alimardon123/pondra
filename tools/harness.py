@@ -28,6 +28,7 @@
   harness.py versions            every file keeps its versions: listed, read, restored, kept after a delete, retention, old notebooks
   harness.py stopped             a run whose node was killed under it: stopped, not running for good
   harness.py variables           DECLARE $day / $day = … from every door, a file's parameters (DECLARE PARAMETER, a .py file's cell), runs and procedures of their own
+  harness.py friendly            SQL as DuckDB's users write it (PIVOT, COLUMNS, lambdas, ASOF … ON, SUMMARIZE, …) == DuckDB's answers, spread too
   harness.py load    --secs 30   throughput, ack latency, freshness, catalog commit latency
   harness.py all                 quick run of everything
 """
@@ -7073,9 +7074,138 @@ finally {{ await db.close?.(); }}"""
     if not ok:
         sys.exit(1)
 
+def friendly():
+    """SQL as DuckDB's users write it (round 34, `friendly.rs`), each form's answer equal to DuckDB's
+    over the same rows: PIVOT and UNPIVOT (DuckDB's statements and the standard's), COLUMNS(…),
+    `* RENAME`, ORDER BY ALL, FETCH FIRST, list comprehensions and lambdas, a struct's field,
+    max_by and arg_min, string_split, json_extract, DuckDB's ASOF JOIN … ON, a select's alias in
+    its WHERE, SUMMARIZE; samples that sample (TABLESAMPLE was ignored); refusals by name; and the
+    same answers spread over three nodes."""
+    import datetime, decimal, duckdb, pyarrow as pa
+    lake = new_lake()
+    import psycopg
+    nodes = [Node(lake, A.port + i, tier_secs=1, **({"pg": f"127.0.0.1:{A.port + 10}"} if i == 0 else {})).start() for i in range(3)]
+    time.sleep(1)
+    duck = duckdb.connect()
+    t0 = datetime.datetime(2026, 1, 1)
+    def row(i):
+        n = "NULL" if i % 5 == 0 else str(i / 2)
+        l = "[]" if i % 10 == 0 else f"[{i % 5}, {i % 3}]"
+        j = json.dumps({"a": {"b": i}, "s": f"v{i % 3}"}).replace("'", "''")
+        return f"({i}, {i % 7}, '{'abc'[i % 3]}', {i * 1.25 + 0.5}, {n}, {l}, TIMESTAMP '{t0 + datetime.timedelta(minutes=i)}', '{j}')"
+    setup = ["CREATE TABLE t (id INTEGER, k INTEGER, g VARCHAR, x DOUBLE, n DOUBLE, l INTEGER[], ts TIMESTAMP, j VARCHAR)",
+             "INSERT INTO t VALUES " + ", ".join(row(i) for i in range(2000)),
+             "CREATE TABLE q (k INTEGER, ts TIMESTAMP, p DOUBLE)",
+             "INSERT INTO q VALUES " + ", ".join(f"({k}, TIMESTAMP '{t0 + datetime.timedelta(minutes=37 * i + k)}', {i + k / 10})" for i in range(60) for k in range(6))]
+    for s_ in setup:
+        sql(A.port, s_)
+        duck.execute(s_)
+    time.sleep(3)  # (tiered to files: a spread query slices them)
+
+    def norm(v):
+        if isinstance(v, bool) or v is None or isinstance(v, str):
+            return v
+        if isinstance(v, (int, float, decimal.Decimal)):
+            return round(float(v), 6)
+        if isinstance(v, (list, tuple)):
+            return tuple(norm(x) for x in v)
+        if isinstance(v, dict):
+            return tuple(sorted((k, norm(x)) for k, x in v.items()))
+        if isinstance(v, (datetime.datetime, datetime.date)):
+            return v.isoformat()
+        return str(v)
+
+    def ours(q, port=A.port, spread=None):
+        path = "/sql?format=arrow" + ("" if spread is None else f"&spread={spread}")
+        t = pa.ipc.open_stream(call(port, "POST", path, q.encode(), timeout=120)).read_all()
+        return t.column_names, [tuple(norm(v) for v in r.values()) for r in t.to_pylist()]
+
+    def theirs(q):
+        r = duck.execute(q)
+        return [d[0] for d in r.description], [tuple(norm(v) for v in x) for x in r.fetchall()]
+
+    same = {  # name: (query, its columns' names compared too, its order compared too)
+        "PIVOT t ON g USING sum(x) GROUP BY k": ("PIVOT (SELECT k, g, x FROM t) ON g USING sum(x) GROUP BY k", True, False),
+        "PIVOT with aggregates named": ("PIVOT (SELECT k % 3 AS m, g, x FROM t) ON g USING sum(x) AS s, count(*) AS n", True, False),
+        "PIVOT … ON g IN (…)": ("PIVOT (SELECT k, g, x FROM t) ON g IN ('a', 'b') USING max(x) GROUP BY k", True, False),
+        "the standard's PIVOT": ("SELECT * FROM (SELECT k, g, x FROM t) PIVOT (sum(x) FOR g IN ('a' AS first, 'b'))", True, False),
+        "UNPIVOT … INTO NAME … VALUE …": ("UNPIVOT (SELECT id, x, n FROM t) ON x, n INTO NAME col VALUE val", True, False),
+        "the standard's UNPIVOT, INCLUDE NULLS": ("SELECT * FROM (SELECT id, x, n FROM t) UNPIVOT INCLUDE NULLS (val FOR col IN (x, n))", True, False),
+        "UNPIVOT … ON COLUMNS(…)": ("UNPIVOT (SELECT id, x, n FROM t) ON COLUMNS('^(x|n)$') INTO NAME col VALUE val", True, False),
+        "COLUMNS('regex')": ("SELECT COLUMNS('^(id|x)$') FROM t", True, False),
+        "min(COLUMNS(*))": ("SELECT min(COLUMNS(*)) FROM (SELECT id, x, n FROM t)", True, False),
+        "COLUMNS([…]) in a WHERE": ("SELECT id FROM t WHERE COLUMNS(['id', 'x']) > 1000", False, False),
+        "* EXCLUDE … RENAME …": ("SELECT * EXCLUDE (l, j) RENAME (g AS grp) FROM t", True, False),
+        "ORDER BY ALL": ("SELECT g, k, id FROM t ORDER BY ALL", True, True),
+        "ORDER BY ALL DESC over *": ("SELECT * FROM (SELECT g, id FROM t) ORDER BY ALL DESC", True, True),
+        "OFFSET … FETCH NEXT … ROWS ONLY": ("SELECT id FROM t ORDER BY id DESC OFFSET 3 ROWS FETCH NEXT 5 ROWS ONLY", True, True),
+        "a list comprehension": ("SELECT id, [y * 2 FOR y IN l IF y > 0] AS d FROM t", True, False),
+        "lambdas (x -> …, and AND in their bodies)": ("SELECT id, list_transform(l, y -> y + 1) AS a, list_filter(l, y -> y > 0 AND y < 4) AS b FROM t", True, False),
+        "LAMBDA y: …": ("SELECT id, list_transform(l, LAMBDA y: y * 10) AS a FROM t", True, False),
+        "a struct's field": ("SELECT ({'a': id, 'b': g}).a AS a FROM t", True, False),
+        "max_by, arg_min, min_by (named as written)": ("SELECT g, max_by(id, x), arg_min(id, x), min_by(k, x) FROM t GROUP BY g", True, False),
+        "max_by over NULLs": ("SELECT k, max_by(id, n) AS a, arg_max(id, n) AS b FROM t GROUP BY k", True, False),
+        "string_split": ("SELECT string_split(g || ',' || k, ',') AS s FROM t", True, False),
+        "json_extract, json_extract_string": ("SELECT id, json_extract(j, '$.a.b') AS b, json_extract_string(j, '$.s') AS s FROM t", True, False),
+        "DuckDB's ASOF JOIN … ON": ("SELECT t.id, q.p FROM t ASOF JOIN q ON t.k = q.k AND t.ts >= q.ts", True, False),
+        "ASOF LEFT JOIN … ON": ("SELECT t.id, q.p FROM t ASOF LEFT JOIN q ON t.k = q.k AND t.ts >= q.ts", True, False),
+        "a select's alias in its WHERE": ("SELECT x * 2 AS dbl FROM t WHERE dbl > 4000", True, False),
+        "… but a column of that name wins": ("SELECT id + 100 AS x FROM t WHERE x > 20", True, False),
+    }
+    checks, failed = {}, {}
+    for name, (q, names, ordered) in same.items():
+        try:
+            (cn, got), (dn, want) = ours(q), theirs(q)
+            ok = (got == want if ordered else sorted(got, key=repr) == sorted(want, key=repr)) and (not names or cn == dn) and len(want) > 0
+        except Exception as e:
+            ok, cn, got, dn, want = False, str(e)[:400], [], [], []
+        checks[f"{name} == DuckDB's"] = ok
+        if not ok:
+            failed[name] = {"ours": [cn, got[:4]], "duckdb": [dn, want[:4]]}
+    # SUMMARIZE: the exact columns (approximate ones and the mean's and spread's text aside)
+    cn, got = ours("SUMMARIZE t")
+    dn, want = theirs("SUMMARIZE t")
+    pick = lambda names, rows: sorted((r[0], r[1], r[names.index("count")], r[names.index("null_percentage")]) + ((r[2], r[3]) if r[0] in ("id", "k", "g") else ()) for r in rows)
+    checks["SUMMARIZE: each column's name, type, count, NULLs and (whole and text columns) min and max == DuckDB's"] = cn == dn and pick(cn, got) == pick(dn, want)
+    if not checks[list(checks)[-1]]:
+        failed["SUMMARIZE"] = {"ours": [cn, pick(cn, got)], "duckdb": [dn, pick(dn, want)]}
+    count = lambda q: sql(A.port, q)[0]["n"]
+    ids = {r["id"] for r in sql(A.port, "SELECT id FROM t USING SAMPLE 7 ROWS")}
+    share = [count("SELECT count(*) AS n FROM t USING SAMPLE 10%"), count("SELECT count(*) AS n FROM (SELECT * FROM t TABLESAMPLE SYSTEM (10)) s"),
+             count("SELECT count(*) AS n FROM (SELECT * FROM t TABLESAMPLE (5 ROWS)) s")]
+    checks["USING SAMPLE n ROWS / n%, TABLESAMPLE (n) / (n ROWS): samples of those sizes (TABLESAMPLE was ignored)"] = len(ids) == 7 and ids <= set(range(2000)) and 100 < share[0] < 320 and 100 < share[1] < 320 and share[2] == 5
+    refused = [_raises_text(lambda q=q: sql(A.port, q)) for q in ("SELECT id FROM t FETCH FIRST 10 PERCENT ROWS ONLY", "SELECT max_by(id, x) OVER () FROM t", "SELECT json_extract(j, g) FROM t")]
+    checks["refused by name: FETCH … PERCENT, max_by(…) OVER, a JSON path that isn't a literal"] = "PERCENT" in refused[0] and "first_value" in refused[1] and "literal" in refused[2]
+    spread = ["PIVOT (SELECT k, g, x FROM t) ON g USING sum(x) GROUP BY k", "SELECT min(COLUMNS(*)) FROM (SELECT id, x, n FROM t)",
+              "SELECT id, [y * 2 FOR y IN l IF y > 0] AS d FROM t", "SELECT g, max_by(id, x), arg_min(id, x) FROM t GROUP BY g",
+              "SELECT t.id, q.p FROM t ASOF JOIN q ON t.k = q.k AND t.ts >= q.ts", "UNPIVOT (SELECT id, x, n FROM t) ON x, n INTO NAME col VALUE val"]
+    apart = {q: (sorted(ours(q, spread=1)[1], key=repr), sorted(ours(q, spread=0)[1], key=repr)) for q in spread}
+    checks["spread over three nodes == one node"] = all(a == b for a, b in apart.values())
+    with psycopg.connect(f"host=127.0.0.1 port={A.port + 10} user=u dbname=lake", autocommit=True) as pg:  # (described, then run)
+        door = [sorted(norm(tuple(r)) for r in pg.execute(q, (0,)).fetchall()) for q in (
+            "SELECT id, list_filter(l, y -> y > 0 AND y < 4) AS b FROM t WHERE id >= %s", "SELECT g, max_by(id, x) FROM t WHERE k >= %s GROUP BY g")]
+    want = [sorted(theirs(q)[1]) for q in ("SELECT id, list_filter(l, y -> y > 0 AND y < 4) AS b FROM t", "SELECT g, max_by(id, x) FROM t GROUP BY g")]
+    checks["over Postgres (a lambda, max_by) == DuckDB's"] = door == want
+    sql(A.port, "CREATE VIEW best AS SELECT g, max_by(id, x) AS best, [y + 1 FOR y IN list(k)] AS ks FROM t GROUP BY g")
+    call(A.port, "POST", "/views/plus", b"SELECT id, list_transform(l, y -> y + 1) AS a FROM t")
+    sql(A.port, "INSERT INTO t VALUES (5000, 1, 'a', 9999.5, NULL, [7, 8], TIMESTAMP '2026-02-01 00:00:00', '{}')")
+    duck.execute("INSERT INTO t VALUES (5000, 1, 'a', 9999.5, NULL, [7, 8], TIMESTAMP '2026-02-01 00:00:00', '{}')")
+    view = sorted((r["g"], r["best"]) for r in sql(A.port, "SELECT g, best FROM best"))
+    plus = {r["id"]: r.get("a") for r in sql(A.port, "SELECT id, a FROM plus WHERE id IN (5000, 1)")}
+    checks["a stored view and a materialized view over them, read after a write"] = view == sorted(duck.execute("SELECT g, max_by(id, x) FROM t GROUP BY g").fetchall()) and plus == {5000: [8, 9], 1: [2, 2]}
+    for n in nodes:
+        n.kill()
+    ok = all(checks.values())
+    print(json.dumps({"friendly": checks, "ok": ok}, indent=1))
+    if not ok:
+        print(json.dumps(failed, indent=1, default=str)[:20000])
+        sys.exit(1)
+    return f"SQL as DuckDB's users write it: {len(same) + 1} forms answer as DuckDB does, samples sample, refusals by name, spread == one node"
+
+
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    out = {t.__name__: t() for t in (upsert, deal, outside, clouds, kafkas, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, found, renames, workspace, server, scale, flight, users, secrets, safety, versions, stopped, flows, begin, doors, objects, sparksql, variables, scripts, hot, minmax, history, reader, crash)}
+    out = {t.__name__: t() for t in (upsert, deal, outside, clouds, kafkas, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, found, renames, workspace, server, scale, flight, users, secrets, safety, versions, stopped, flows, begin, doors, objects, sparksql, variables, scripts, hot, minmax, history, friendly, reader, crash)}
     A.secs = min(A.secs, 20)
     out["load"] = load()
     print(json.dumps(out, indent=1))
@@ -7083,7 +7213,7 @@ def all_tests():
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "found", "renames", "workspace", "server", "scale", "flight", "users", "secrets", "safety", "versions", "stopped", "flows", "begin", "doors", "objects", "sparksql", "variables", "scripts", "tasks", "hot", "minmax", "history", "load", "all"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "found", "renames", "workspace", "server", "scale", "flight", "users", "secrets", "safety", "versions", "stopped", "flows", "begin", "doors", "objects", "sparksql", "variables", "scripts", "tasks", "hot", "minmax", "history", "friendly", "load", "all"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -7095,7 +7225,7 @@ if __name__ == "__main__":
     ap.add_argument("--flush-ms", type=int, default=250)
     A = ap.parse_args()
     try:
-        {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "safety": safety, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "objects": objects, "sparksql": sparksql, "variables": variables, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "load": load, "all": all_tests}[A.mode]()
+        {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "safety": safety, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "objects": objects, "sparksql": sparksql, "variables": variables, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "friendly": friendly, "load": load, "all": all_tests}[A.mode]()
     except BaseException as e:  # a failure ends the run, though threads may still wait on a node (crash's producers retry for ever)
         code = e.code if isinstance(e, SystemExit) else 1
         if not isinstance(e, SystemExit):
