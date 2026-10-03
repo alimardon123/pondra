@@ -375,8 +375,20 @@ DROP SCHEMA sales CASCADE;
 - `DROP TABLE` is refused while a view or task reads the table: drop those first.
 - `DROP SCHEMA` is refused for a schema that holds anything, unless you add `CASCADE`, which drops its
   views and then its tables. `public` can't be dropped.
-- A dropped table's files stay in the bucket for a day, and are then deleted. A new table with the
-  same name starts empty.
+- A dropped table is kept for a day, or for its `retention` (`WITH (retention = '7 days')`), and
+  `UNDROP TABLE` brings it back as it was. `pondra.dropped` lists the ones that can still come back.
+  After that, its files are deleted. `DROP TABLE … PURGE` keeps nothing.
+- A new table with the same name starts empty. `UNDROP` brings back the table dropped last under a
+  name, once nothing else has it: rename the new one first.
+
+```sql
+CREATE TABLE notes (id BIGINT, body VARCHAR);
+INSERT INTO notes VALUES (1, 'keep me');
+DROP TABLE notes;
+SELECT name FROM pondra.dropped WHERE name = 'notes';
+UNDROP TABLE notes;
+SELECT body FROM notes;
+```
 
 List what you have with the shell's `.tables`, or with SQL: `pondra.tables` gives each one's kind
 (`table`, `view`, `materialized view` or `external table`), and `information_schema.tables` is there

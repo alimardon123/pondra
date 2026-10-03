@@ -78,7 +78,7 @@ local.close()
 | `db.run(file, job=None, wait=True, **params)` | a `.sql` file on this machine, or else a `.sql`, `.py` or notebook file of the lake's, run on the node (`CALL run`, [Run files as jobs](/pondra/guides/workspace/)); or SQL text itself. The last statement's rows or outcome. `wait=False` starts a lake file's run and gives its `Run` |
 | `db.from_arrow(data, name=None)` | rows of this machine as a frame: a pyarrow, pandas or Polars table, or a list of dicts. Also `from_pandas`, `from_polars`, `from_rows` |
 | `db.vars` | SQL's [variables](/pondra/reference/sql/#variables): `db.vars.day` (or `db.vars["day"]`) is `$day`, `db.vars.day = date(2026, 9, 30)` sets it, `del db.vars.day` forgets it, `dict(db.vars)` has them all. In a procedure or a file run, the run's |
-| `db.parameters(file)` | a SQL file's parameters (its `DECLARE`s, and the `$name`s it uses unset): name, type, default, required, description |
+| `db.parameters(file)` | a file's parameters (a SQL file's `DECLARE PARAMETER`s and the `$name`s it uses unset; a `.py` file's `# %% tags=["parameters"]` cell): name, type, default, required, description |
 
 In `sql` and `run`, a keyword argument is a `$name` parameter in the query. A keyword whose value
 is a frame, or pandas, Polars or Arrow data, is a table by that name, written `{name}` or plain.

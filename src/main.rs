@@ -46,6 +46,7 @@ mod metrics;
 mod optimize;
 mod pages;
 mod panics;
+mod past;
 mod tls;
 mod txn;
 mod mcp;
@@ -299,7 +300,7 @@ fn run_help(file: Option<&str>) -> anyhow::Result<()> {
     let run = cmd.find_subcommand_mut("run").expect("the run command");
     let Some(file) = file else { return Ok(run.print_help()?) };
     let text = std::fs::read_to_string(file).map_err(|e| anyhow::anyhow!("{file}: {e}"))?;
-    let params = vars::parameters(&text);
+    let params = crate::workspace::parameters(file, &text)?.unwrap_or_default();
     let arg = |p: &vars::Param| format!("--{} {}", p.name, p.ty.as_deref().unwrap_or("VALUE").to_uppercase());
     println!("Usage: pondra run {file} [LAKE] {}", params.iter().map(|p| match p.required { true => arg(p), false => format!("[{}]", arg(p)) }).collect::<Vec<_>>().join(" "));
     println!("\n{}", match params.is_empty() { true => format!("{file} takes no parameters."), false => format!("Parameters of {file}:") });
@@ -738,7 +739,8 @@ async fn run() -> anyhow::Result<()> {
             match write::parse(&query) {
                 Some(stmt) => println!("{}", ext::scope(true, write::from_cli(&dir, stmt)).await?), // (its user's own machine: its files, its credentials)
                 None => {
-                    let run = async { anyhow::Ok(query::session(&lake, &query, "").await?.enable_url_table().sql(&query).await?.collect().await?) };
+                    let planned = asof::rewrite(&query)?; // (as every door: ASOF JOIN, and `*` without the system columns a query names)
+                    let run = async { anyhow::Ok(query::session(&lake, &query, "").await?.enable_url_table().sql(&planned).await?.collect().await?) };
                     let batches = ext::scope(true, run).await?;
                     println!("{}", pretty_format_batches(&batches)?);
                 }

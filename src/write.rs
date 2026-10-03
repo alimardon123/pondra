@@ -53,6 +53,8 @@ enum TableSpec {
         properties: Option<BTreeMap<String, String>>, // other engines' (`write.delete.mode`, say): published for them
         #[serde(default)]
         checks: Vec<(String, String)>, // CHECK constraints: (name, condition), made with the table
+        #[serde(default)]
+        retention: Option<String>, // how long its past is kept: '7 days' (ADR-043)
     },
 }
 
@@ -61,10 +63,11 @@ enum TableSpec {
 pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> {
     let name = &crate::ddl::new_name(lake, name).await?; // (its schema exists; `public.t` is `t`)
     ensure!(lake.cat.get::<crate::ddl::StoredView>(&crate::ddl::query_key(name)).await?.is_none(), "{name} is a view");
-    let (columns, key, merge, publish, cluster, ttl, partition, order, not_null, defaults, properties, checks) = match serde_json::from_str(spec)? {
-        TableSpec::Columns(c) => (c, vec![], BTreeMap::new(), None, None, None, None, None, vec![], BTreeMap::new(), None, vec![]),
-        TableSpec::Full { columns, key, merge, publish, cluster_by, ttl, partition_by, order_by, not_null, defaults, properties, checks } => (columns, key, merge, publish, cluster_by, ttl, partition_by, order_by, not_null, defaults, properties, checks),
+    let (columns, key, merge, publish, cluster, ttl, partition, order, not_null, defaults, properties, checks, retention) = match serde_json::from_str(spec)? {
+        TableSpec::Columns(c) => (c, vec![], BTreeMap::new(), None, None, None, None, None, vec![], BTreeMap::new(), None, vec![], None),
+        TableSpec::Full { columns, key, merge, publish, cluster_by, ttl, partition_by, order_by, not_null, defaults, properties, checks, retention } => (columns, key, merge, publish, cluster_by, ttl, partition_by, order_by, not_null, defaults, properties, checks, retention),
     };
+    let retention = retention.as_deref().map(crate::ddl::retention).transpose()?;
     // Types as the lake records them: `VARIANT` is JSON text, `Float32[]` a list (see `query::dtype`).
     let columns = columns.iter().map(|(n, t)| Ok((n.clone(), crate::query::type_name(&crate::query::dtype(t)?)))).collect::<Result<Vec<_>>>()?;
     let ttl = ttl.map(|t| -> Result<(String, u64)> {
@@ -106,7 +109,7 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
         // in segments that aren't expired yet.)
         None => {
             let folder = crate::ddl::free_folder(lake, name).await?; // (a renamed table may still have this name's folder)
-            TableMeta { columns, key, merge, publish: publish.unwrap_or_else(default_publish), cluster: cluster.unwrap_or_default(), ttl, partition, order, not_null, defaults, checks, folder, tiered: lake.visible(), ids: true, properties: properties.unwrap_or_default(), ..Default::default() }
+            TableMeta { columns, key, merge, publish: publish.unwrap_or_else(default_publish), cluster: cluster.unwrap_or_default(), ttl, partition, order, not_null, defaults, checks, folder, tiered: lake.visible(), ids: true, properties: properties.unwrap_or_default(), retention_secs: retention, ..Default::default() }
         }
         Some(mut m) => {
             // (the spec names columns as SQL does; the table keeps its stored names: ADR-022)
@@ -117,9 +120,12 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
             let (old, new) = (l.columns.len(), columns.len());
             ensure!(columns[..new.min(old)] == l.columns[..new.min(old)], "{name} exists with other columns (only new ones can be added, at the end)");
             let republish = publish.as_ref().is_some_and(|p| *p != m.publish);
+            // (Delta and Iceberg name a table's files under its folder; a clone lists others': ADR-043)
+            ensure!(!republish || m.shares.is_empty() || publish.as_ref().is_some_and(|p| p.is_empty()), "{name} is a clone, whose files are partly another table's: it can't be published (CREATE TABLE … AS SELECT * FROM {name} copies it)");
             let (recluster, rettl, reorder) = (cluster.as_ref().is_some_and(|c| *c != l.cluster), ttl.is_some() && ttl != l.ttl, order.is_some() && order != l.order);
             let reprop = properties.as_ref().is_some_and(|p| *p != m.properties);
-            if new <= old && !republish && !recluster && !rettl && !reorder && !reprop {
+            let reretain = retention.is_some() && retention != m.retention_secs;
+            if new <= old && !republish && !recluster && !rettl && !reorder && !reprop && !reretain {
                 return Ok(j!({"table": name, "publish": m.publish}));
             }
             if new > old {
@@ -154,6 +160,7 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
             m.ttl = ttl.or(m.ttl);
             m.order = order.or(m.order);
             m.properties = properties.unwrap_or(m.properties);
+            m.retention_secs = retention.or(m.retention_secs);
             if let Some(publish) = publish.filter(|_| republish) {
                 let dropped: Vec<String> = m.publish.iter().filter(|f| !publish.contains(f)).cloned().collect();
                 m.publish = publish;
@@ -374,6 +381,17 @@ pub fn parse(sql: &str) -> Option<Stmt> {
     if let Some(c) = DETACH.captures(first_word(sql)) {
         return Some(Stmt::Ddl(vec![Ddl::DetachView { name: name(&c[1]) }]));
     }
+    // `CREATE TABLE c [SHALLOW] CLONE t` (Snowflake's, Databricks'): a table of t's files as they are now, copying none (ADR-043).
+    static CLONE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r#"(?is)^\s*CREATE\s+TABLE\s+(IF\s+NOT\s+EXISTS\s+)?([\w."-]+)\s+(SHALLOW\s+)?CLONE\s+([\w."-]+)\s*;?\s*$"#).expect("a regex"));
+    if let Some(c) = CLONE.captures(first_word(sql)) {
+        let d = Ddl::Clone { name: name(&c[2]), from: name(&c[4]) };
+        return Some(Stmt::Ddl(vec![if c.get(1).is_some() { unless(true, &name(&c[2]), "relation", d) } else { d }]));
+    }
+    // `UNDROP TABLE t` (Snowflake's, Databricks'): the table dropped last under that name, back (ADR-043).
+    static UNDROP: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r#"(?is)^\s*UNDROP\s+TABLE\s+([\w."-]+)\s*;?\s*$"#).expect("a regex"));
+    if let Some(c) = UNDROP.captures(first_word(sql)) {
+        return Some(Stmt::Ddl(vec![Ddl::Undrop { name: name(&c[1]) }]));
+    }
     // DuckDB's CREATE MACRO … IF NOT EXISTS (the parser takes only OR REPLACE): read without it, kept unless one is there.
     static MACRO_QUIET: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?is)^(\s*CREATE\s+(OR\s+REPLACE\s+)?(TEMP\s+|TEMPORARY\s+)?MACRO\s+)IF\s+NOT\s+EXISTS\s+").expect("a regex"));
     if let Some(c) = MACRO_QUIET.captures(first_word(sql)) {
@@ -481,9 +499,9 @@ pub fn parse(sql: &str) -> Option<Stmt> {
         Statement::CreateSchema { schema_name: ast::SchemaName::Simple(n) | ast::SchemaName::NamedAuthorization(n, _), if_not_exists, .. } => {
             Stmt::Ddl(vec![Ddl::CreateSchema { name: object(&n), if_not_exists }])
         }
-        Statement::Drop { object_type, if_exists, names, cascade, .. } => Stmt::Ddl(names.iter().map(object).map(|name| match object_type {
+        Statement::Drop { object_type, if_exists, names, cascade, purge, .. } => Stmt::Ddl(names.iter().map(object).map(|name| match object_type {
             ast::ObjectType::Schema => Some(Ddl::DropSchema { name, if_exists, cascade }),
-            ast::ObjectType::Table => Some(Ddl::DropTable { name, if_exists }),
+            ast::ObjectType::Table => Some(Ddl::DropTable { name, if_exists, purge }),
             ast::ObjectType::View | ast::ObjectType::MaterializedView => Some(Ddl::DropView { name, if_exists }),
             ast::ObjectType::Database => Some(Ddl::DropDatabase { name: name.to_lowercase(), if_exists }),
             _ => None,
@@ -634,7 +652,7 @@ pub async fn create_spec(c: &ast::CreateTable, from: &Lake, files: bool) -> Resu
             }
         }
     }
-    const OPTIONS: [&str; 6] = ["publish", "cluster_by", "partition_by", "ttl", "order_by", "merge"];
+    const OPTIONS: [&str; 7] = ["publish", "cluster_by", "partition_by", "ttl", "order_by", "merge", "retention"];
     if let Some(k) = opts.keys().find(|k| !OPTIONS.contains(&k.as_str())) {
         bail!("CREATE TABLE … WITH ({k} = …): tables take {}", OPTIONS.join(", "));
     }
@@ -644,7 +662,7 @@ pub async fn create_spec(c: &ast::CreateTable, from: &Lake, files: bool) -> Resu
     if !key.is_empty() && merge.is_empty() && !columns.iter().any(|(c, _)| c == "_deleted") {
         columns.push(("_deleted".into(), "Boolean".into())); // (so DELETE works; writes leave it out)
     }
-    let spec = j!({"columns": columns, "key": key, "merge": merge, "publish": list("publish"), "cluster_by": list("cluster_by"), "ttl": opts.get("ttl"), "partition_by": opts.get("partition_by"), "order_by": opts.get("order_by"), "not_null": not_null, "defaults": defaults, "checks": checks});
+    let spec = j!({"columns": columns, "key": key, "merge": merge, "publish": list("publish"), "cluster_by": list("cluster_by"), "ttl": opts.get("ttl"), "partition_by": opts.get("partition_by"), "order_by": opts.get("order_by"), "not_null": not_null, "defaults": defaults, "checks": checks, "retention": opts.get("retention")});
     Ok(spec.to_string())
 }
 
@@ -673,7 +691,7 @@ async fn alter_spec(lake: &Lake, stmt: &Stmt) -> Result<Option<String>> {
     let table = stmt.table();
     let m: TableMeta = lake.cat.get::<TableMeta>(&table_key(&table)).await?.ok_or_else(|| anyhow::anyhow!("no table {table}"))?.logical(); // (as SQL names it)
     let ttl = m.ttl.as_ref().map(|(c, s)| format!("{c}:{s}"));
-    let mut spec = j!({"columns": m.columns, "key": m.key, "merge": m.merge, "publish": m.publish, "cluster_by": m.cluster, "ttl": ttl, "partition_by": m.partition, "order_by": m.order, "not_null": m.not_null, "defaults": m.defaults, "properties": m.properties, "checks": m.checks});
+    let mut spec = j!({"columns": m.columns, "key": m.key, "merge": m.merge, "publish": m.publish, "cluster_by": m.cluster, "ttl": ttl, "partition_by": m.partition, "order_by": m.order, "not_null": m.not_null, "defaults": m.defaults, "properties": m.properties, "checks": m.checks, "retention": m.retention_secs.map(|s| format!("{s} seconds"))});
     match stmt {
         Stmt::AddColumn(_, column, sql_type, if_not_exists) => {
             if m.columns.iter().any(|(c, _)| c == column) {
@@ -692,13 +710,13 @@ async fn alter_spec(lake: &Lake, stmt: &Stmt) -> Result<Option<String>> {
             for (k, v) in options {
                 match k.as_str() {
                     "publish" | "cluster_by" => spec[k] = j!(list(v)),
-                    "ttl" | "order_by" => spec[k.as_str()] = j!(v),
+                    "ttl" | "order_by" | "retention" => spec[k.as_str()] = j!(v),
                     "partition_by" => bail!("partition_by can't change: each of {table}'s files holds one partition"),
                     // Other engines' own (`write.delete.mode`, `write.merge.mode`…): kept and published
                     // for them (Iceberg's table properties); '' takes one out.
                     p if p.contains('.') && v.is_empty() => drop(spec["properties"].as_object_mut().map(|o| o.remove(p))),
                     p if p.contains('.') => spec["properties"][p] = j!(v),
-                    other => bail!("{other}: ALTER TABLE … SET takes publish, cluster_by, ttl and order_by, and other engines' properties (write.delete.mode = 'merge-on-read')"),
+                    other => bail!("{other}: ALTER TABLE … SET takes publish, cluster_by, ttl, order_by and retention, and other engines' properties (write.delete.mode = 'merge-on-read')"),
                 }
             }
         }
@@ -981,7 +999,7 @@ async fn existing(app: &crate::server::App, c: &ast::CreateTable, job: &str, fil
     match there(&app.lake, c).await? {
         Some(true) => Ok(Some(j!({"table": object(&c.name), "exists": true}))),
         Some(false) => {
-            let drop = Stmt::Ddl(vec![crate::ddl::Ddl::DropTable { name: object(&c.name), if_exists: true }]);
+            let drop = Stmt::Ddl(vec![crate::ddl::Ddl::DropTable { name: object(&c.name), if_exists: true, purge: false }]);
             Box::pin(on_node_as(app, drop, Some(format!("{job}:replaced")), files)).await.map(|_| None)
         }
         None => Ok(None),
@@ -1305,7 +1323,7 @@ async fn created(dir: &str, c: &ast::CreateTable) -> Result<Option<()>> {
     let lake = Lake::open(dir, false, false).await?;
     match there(&lake, c).await? {
         Some(true) => Ok(Some(())),
-        Some(false) => Box::pin(one_from_cli(dir, Stmt::Ddl(vec![crate::ddl::Ddl::DropTable { name: object(&c.name), if_exists: true }]))).await.map(|_| None),
+        Some(false) => Box::pin(one_from_cli(dir, Stmt::Ddl(vec![crate::ddl::Ddl::DropTable { name: object(&c.name), if_exists: true, purge: false }]))).await.map(|_| None),
         None => Ok(None),
     }
 }

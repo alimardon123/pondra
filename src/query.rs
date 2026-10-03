@@ -738,6 +738,12 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
         let view = table_view(lake, &ctx, &name, &meta, upto).await?;
         ctx.register_table(datafusion::common::TableReference::bare(name.clone()), named(&ctx, view, &meta, false)?)?; // (another engine's names for its columns)
     }
+    for name in crate::past::names(&text) {
+        let (table, t) = crate::past::table(lake, &ctx, &name, upto, crate::sys::mentioned(&text)).await?; // (`t AT (…)`: ADR-043)
+        if let Some(t) = guarded(&table, t, false) {
+            ctx.register_table(datafusion::common::TableReference::bare(name), t)?;
+        }
+    }
     let attached = lake.attached.read().unwrap().clone();
     for (ns, other) in attached {
         if !listing && !mentions(&text, &ns) {

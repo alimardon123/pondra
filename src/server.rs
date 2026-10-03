@@ -571,7 +571,7 @@ impl App {
         use crate::metrics::{add, QUERIES, QUERY_ERRORS, QUERY_US, SPREAD};
         let start = std::time::Instant::now();
         let run = async {
-            let here_only = spread == Some("0") || crate::query::sent() || crate::temp::mentioned(query) || crate::txn::open() || crate::settings::any() || crate::vars::mentioned(query) || crate::routines::pinned(&self.lake, query).await // (rows sent with a request are here only; so are the session's temporary tables, its transaction and settings, and a Python table function's call)
+            let here_only = spread == Some("0") || crate::query::sent() || crate::temp::mentioned(query) || crate::past::mentioned(query) || crate::txn::open() || crate::settings::any() || crate::vars::mentioned(query) || crate::routines::pinned(&self.lake, query).await // (rows sent with a request are here only; so are the session's temporary tables, its transaction and settings, and a Python table function's call)
                 || crate::auth::limited().is_some(); // (and a user's granted some tables: its grants are checked where it is planned, here)
             let nodes = if here_only { vec![] } else { self.cluster.nodes() };
             match crate::spmd::query(&self.lake, &nodes, &self.cluster.addr, query, spread == Some("1")).await {

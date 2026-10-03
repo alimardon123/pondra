@@ -1,6 +1,8 @@
-//! Variables, and a file's parameters (round 31). `DECLARE $day DATE = current_date - 1;` declares
-//! `$day` (its type and its default are both optional: `DECLARE $region VARCHAR;` has neither a
-//! default nor a value until one is given), and `$day = $day + 1;` changes it. Every `$day` after
+//! Variables, and a file's parameters (round 31, ADR-043). `DECLARE $mode = 'full';` declares a
+//! variable of the script's own (its type and its default are both optional: `DECLARE $n BIGINT;` is
+//! NULL), `DECLARE PARAMETER $day DATE = current_date - 1;` one its caller may give a value for
+//! (`DECLARE PARAMETER $region VARCHAR;` has no value until one is given), and `$day = $day + 1;`
+//! changes either. Every `$day` after
 //! that is its value, bound as a parameter is, never pasted in as text. DuckDB's `SET VARIABLE day
 //! = …`, `RESET VARIABLE day` and `getvariable('day')` are other names for the same; `SET` alone
 //! stays the settings' (`settings.rs`), and the `$` keeps `DECLARE` apart from Postgres's cursors.
@@ -12,8 +14,9 @@
 //!   variables as `$name` in SQL.
 //! - **Given values.** What a request, a procedure call or a file run is given (`params`, `CALL
 //!   run('f.sql', day => …)`, `pondra run f.sql --day …`, the bar above a file) is its run's
-//!   (`GIVEN`): `$day` is the value given until something sets it, and a `DECLARE` takes the value
-//!   given in place of its default, cast to its type. So in a file a `DECLARE` is a parameter with a
+//!   (`GIVEN`): `$day` is the value given until something sets it, and a `DECLARE PARAMETER` takes
+//!   the value given in place of its default, cast to its type; a plain `DECLARE` given one is
+//!   refused (it is the script's own). So in a file a `DECLARE PARAMETER` is a parameter with a
 //!   default, and a `$name` used but never set is a required one; `parameters` lists them
 //!   (`pondra.parameters('etl/orders.sql')`), the comment above each its description.
 //! - **Typed.** A variable declared with a type casts every value it takes to it; one declared
@@ -51,7 +54,8 @@ const NO_SESSION: &str = "a variable is a session's: a Postgres connection's, th
 
 /// What a statement does to a variable.
 pub enum Change {
-    Declare { name: String, ty: Option<String>, default: Option<String> },
+    /// `parameter`: `DECLARE PARAMETER`, which takes a value given (a plain one is the script's own).
+    Declare { name: String, ty: Option<String>, default: Option<String>, parameter: bool },
     Set { name: String, value: String },
     Reset(String),
 }
@@ -67,10 +71,10 @@ impl Change {
     }
 }
 
-/// `DECLARE $name [type] [= | DEFAULT value]`, `$name = value`, DuckDB's `SET VARIABLE name =
+/// `DECLARE [PARAMETER] $name [type] [= | DEFAULT value]`, `$name = value`, DuckDB's `SET VARIABLE name =
 /// value` and `RESET VARIABLE name`: what `sql` does to a variable, if it is one of them.
 pub fn change(sql: &str) -> Option<Change> {
-    static DECLARE: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?is)^declare\s+\$([a-z_]\w*)\b\s*(.*?)\s*;?\s*$").expect("a regex"));
+    static DECLARE: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?is)^declare\s+(parameter\s+)?\$([a-z_]\w*)\b\s*(.*?)\s*;?\s*$").expect("a regex"));
     static TYPED: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?is)^(.*?)\s*(?:=|\bdefault\b)\s*(.*)$").expect("a regex"));
     static SET: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?is)^(?:\$|set\s+variable\s+)([a-z_]\w*)\s*(?:=|\bto\b)\s*(.*?)\s*;?\s*$").expect("a regex"));
     static RESET: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?is)^reset\s+variable\s+([a-z_]\w*)\s*;?\s*$").expect("a regex"));
@@ -80,11 +84,11 @@ pub fn change(sql: &str) -> Option<Change> {
     }
     let some = |t: &str| Some(t.trim().to_string()).filter(|t| !t.is_empty());
     if let Some(c) = DECLARE.captures(s) {
-        let (ty, default) = match TYPED.captures(&c[2]) {
+        let (ty, default) = match TYPED.captures(&c[3]) {
             Some(t) => (some(&t[1]), Some(t[2].trim().to_string())),
-            None => (some(&c[2]), None),
+            None => (some(&c[3]), None),
         };
-        return Some(Change::Declare { name: c[1].to_string(), ty, default });
+        return Some(Change::Declare { name: c[2].to_string(), ty, default, parameter: c.get(1).is_some() });
     }
     if let Some(c) = SET.captures(s) {
         return Some(Change::Set { name: c[1].to_string(), value: c[2].to_string() });
@@ -208,13 +212,15 @@ pub async fn apply(app: &App, c: Change) -> Result<Outcome> {
             take(&name);
             (name, Var { declared, ..v })
         }
-        Change::Declare { name, ty, default } => {
+        Change::Declare { name, ty, default, parameter } => {
             if let Some(t) = &ty {
                 let known = crate::routines::data_type(t).is_ok_and(|t| !matches!(t, datafusion::sql::sqlparser::ast::DataType::Custom(..)));
                 ensure!(known, "DECLARE ${name} {t}: not a type (DATE, VARCHAR, BIGINT, DECIMAL(10, 2), …)");
             }
             ensure!(default.as_deref() != Some(""), "DECLARE ${name} = what? (`DECLARE ${name} DATE = current_date - 1`)");
-            let v = match (take(&name), &default) {
+            let given = take(&name);
+            ensure!(parameter || given.is_none(), "a value was given for ${name}, which this script declares as its own variable: `DECLARE PARAMETER ${name} …` takes one");
+            let v = match (given, &default) {
                 (Some(given), _) => {
                     let arrow = match (&ty, &default) {
                         (None, Some(d)) => type_of(app, d).await, // (cast to its default's type)
@@ -224,10 +230,11 @@ pub async fn apply(app: &App, c: Change) -> Result<Outcome> {
                     evaluate(app, &crate::routines::literal(&given)?.to_string(), to).await.with_context(|| format!("the value given for ${name}"))?
                 }
                 (None, Some(d)) => evaluate(app, d, ty.as_deref().map(Cast::Sql)).await.with_context(|| format!("${name}"))?,
+                (None, None) if !parameter => evaluate(app, "NULL", ty.as_deref().map(Cast::Sql)).await?, // (its own, no value yet: NULL, as SQL's DECLARE)
                 (None, None) => match (vars(|m| m.get(&name).cloned())?, &ty) {
                     (Some(v), None) => v,
                     (Some(v), Some(t)) => evaluate(app, &v.sql, Some(Cast::Sql(t))).await.with_context(|| format!("${name}"))?,
-                    (None, _) => bail!("no value for ${name}: DECLARE ${name} has no default, so it must be given (CALL run('…', {name} => …), pondra run … --{name} …, or the bar above the file)"),
+                    (None, _) => bail!("no value for ${name}: DECLARE PARAMETER ${name} has no default, so it must be given (CALL run('…', {name} => …), pondra run … --{name} …, or the bar above the file)"),
                 },
             };
             (name, Var { declared: ty, ..v })
@@ -310,10 +317,10 @@ pub fn table() -> Result<Arc<dyn datafusion::catalog::TableProvider>> {
 
 // ---------------------------------------------------------------- a file's parameters
 
-/// A parameter of a SQL file: a `DECLARE` (its type and default as written), or a `$name` used
-/// before anything sets it (required, no type). Its description is the comment just above its
-/// `DECLARE`, else one after it on its line (`DECLARE $d = 's1'; -- the sensor`), or a comment
-/// line `-- $name: …` anywhere.
+/// A parameter of a SQL file: a `DECLARE PARAMETER` (its type and default as written), or a `$name`
+/// used before anything sets it (required, no type); a plain `DECLARE` is the file's own variable,
+/// never one. Its description is the comment just above its `DECLARE`, else one after it on its line
+/// (`DECLARE PARAMETER $d = 's1'; -- the sensor`), or a comment line `-- $name: …` anywhere.
 #[derive(Debug, serde::Serialize)]
 pub struct Param {
     pub name: String,
@@ -322,6 +329,9 @@ pub struct Param {
     pub default: Option<String>,
     pub required: bool,
     pub description: Option<String>,
+    /// Declared (`DECLARE PARAMETER`), not only used.
+    #[serde(skip)]
+    pub declared: bool,
 }
 
 /// A SQL file's parameters, in the order it declares or first uses them.
@@ -332,10 +342,15 @@ pub fn parameters(text: &str) -> Vec<Param> {
     for (i, s) in all.iter().enumerate() {
         let s = if i > 0 { its_own(s) } else { s.as_str() };
         match change(s) {
-            Some(Change::Declare { name, ty, default }) if !set.contains(&name) => {
-                let required = default.is_none();
+            Some(Change::Declare { name, ty, default, parameter }) if !set.contains(&name) => {
+                if let Some(d) = &default {
+                    unused(d, &set, &mut out);
+                }
                 out.retain(|p| p.name != name); // (used before its DECLARE: the DECLARE says what it is)
-                out.push(Param { name: name.clone(), ty, default, required, description: above(s).or_else(|| after(all.get(i + 1))) });
+                if parameter {
+                    let required = default.is_none();
+                    out.push(Param { name: name.clone(), ty, default, required, description: above(s).or_else(|| after(all.get(i + 1))), declared: true });
+                }
                 set.push(name);
                 continue;
             }
@@ -360,7 +375,7 @@ pub fn parameters(text: &str) -> Vec<Param> {
 fn unused(sql: &str, set: &[String], out: &mut Vec<Param>) {
     for n in names(sql) {
         if !set.contains(&n) && !out.iter().any(|p| p.name == n) {
-            out.push(Param { name: n, ty: None, default: None, required: true, description: None });
+            out.push(Param { name: n, ty: None, default: None, required: true, description: None, declared: false });
         }
     }
 }
@@ -406,7 +421,7 @@ pub async fn parameters_in(lake: &crate::store::Lake, sql: &str) -> Result<Strin
         })?;
         let text = String::from_utf8(bytes.to_vec()).with_context(|| format!("pondra.parameters: {path} is not text"))?;
         out.push_str(&sql[last..m.start()]);
-        out.push_str(&rows(&parameters(&text)));
+        out.push_str(&rows(&crate::workspace::parameters(&path, &text)?.unwrap_or_default()));
         last = m.end();
     }
     out.push_str(&sql[last..]);
@@ -416,7 +431,7 @@ pub async fn parameters_in(lake: &crate::store::Lake, sql: &str) -> Result<Strin
 /// Parameters as a subquery of rows, in the file's order (one VALUES list: one batch).
 fn rows(all: &[Param]) -> String {
     let s = |v: &Option<String>| v.as_ref().map_or("CAST(NULL AS VARCHAR)".to_string(), |t| format!("CAST('{}' AS VARCHAR)", t.replace('\'', "''")));
-    let none = [Param { name: String::new(), ty: None, default: None, required: false, description: None }];
+    let none = [Param { name: String::new(), ty: None, default: None, required: false, description: None, declared: false }];
     let each = match all.is_empty() { true => &none[..], false => all };
     let values = each.iter().map(|p| format!("({}, {}, {}, {}, {})", s(&Some(p.name.clone())), s(&p.ty), s(&p.default), p.required, s(&p.description))).collect::<Vec<_>>().join(", ");
     let only = if all.is_empty() { " WHERE false" } else { "" };

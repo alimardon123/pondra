@@ -27,7 +27,7 @@
   harness.py safety              panics answered as errors, TLS at every door, mutual TLS, the audit log, quotas
   harness.py versions            every file keeps its versions: listed, read, restored, kept after a delete, retention, old notebooks
   harness.py stopped             a run whose node was killed under it: stopped, not running for good
-  harness.py variables           DECLARE $day / $day = … from every door, a file's parameters, runs and procedures of their own
+  harness.py variables           DECLARE $day / $day = … from every door, a file's parameters (DECLARE PARAMETER, a .py file's cell), runs and procedures of their own
   harness.py load    --secs 30   throughput, ack latency, freshness, catalog commit latency
   harness.py all                 quick run of everything
 """
@@ -6209,9 +6209,11 @@ def variables():
     """SQL variables (round 31): `DECLARE $day DATE = …` declares one (type and default optional),
     `$day = …` changes it, and every `$day` after is its value, bound, from every door (HTTP with a
     session, Postgres, Python's `db.vars`); DuckDB's `SET VARIABLE`, `getvariable` and `RESET
-    VARIABLE` are the same. A file's `DECLARE`s are its parameters (`pondra.parameters(…)`): a run's
-    given values replace their defaults, cast to their types. Procedures and file runs have
-    variables of their own; `SET` stays the settings'."""
+    VARIABLE` are the same. A file's `DECLARE PARAMETER`s are its parameters (`pondra.parameters(…)`,
+    ADR-043): a run's given values replace their defaults, cast to their types; a plain `DECLARE` is
+    the file's own, and a value given for it is refused; a `.py` file's are its `# %%
+    tags=["parameters"]` cell's. Procedures and file runs have variables of their own; `SET` stays
+    the settings'."""
     import datetime
     import psycopg
     lake = new_lake()
@@ -6250,11 +6252,21 @@ def variables():
         got["listed"] == [{"name": "day", "value": "2026-09-29", "type": "Date32", "declared": "DATE"}] \
         and got["listed again"] == [{"name": "day", "value": "2026-09-30", "type": "Date32", "declared": "DATE"}]
     # A file's parameters, and runs.
-    daily = ("-- The day to load\nDECLARE $day DATE = DATE '2026-09-29';\n-- $region: where the orders come from\nDECLARE $min DOUBLE DEFAULT 0;\n"
+    daily = ("-- The day to load\nDECLARE PARAMETER $day DATE = DATE '2026-09-29';\n-- $region: where the orders come from\nDECLARE PARAMETER $min DOUBLE DEFAULT 0;\n"
              "SELECT count(*) AS n, sum(amount) AS total, $region AS region FROM orders WHERE day = $day AND amount >= $min;\n")
     call(A.port, "PUT", "/files/etl/daily.sql", daily.encode())
     got["parameters"] = q("SELECT * FROM pondra.parameters('etl/daily.sql')")
-    call(A.port, "PUT", "/files/etl/sensors.sql", b"DECLARE $d VARCHAR = 's1'; -- the sensor\nDECLARE $cel INT;\n\nSELECT $d AS d, $cel AS cel;\n")
+    call(A.port, "PUT", "/files/etl/sensors.sql", b"DECLARE PARAMETER $d VARCHAR = 's1'; -- the sensor\nDECLARE PARAMETER $cel INT;\n\nSELECT $d AS d, $cel AS cel;\n")
+    own = b"DECLARE PARAMETER $day DATE = DATE '2026-09-29';\nDECLARE $since = $day - 1; -- the day before\nDECLARE $n BIGINT;\nSELECT $since AS since, $n AS n;\n"
+    call(A.port, "PUT", "/files/etl/own.sql", own)
+    got["own parameters"] = q("SELECT name FROM pondra.parameters('etl/own.sql')")
+    got["own run"] = q("CALL run('etl/own.sql', day => '2026-09-30')")
+    got["own refused"] = _raises_text(lambda: q("CALL run('etl/own.sql', since => '2026-09-01')"))
+    got["own given"] = _raises_text(lambda: call(A.port, "POST", "/sql", json.dumps({"sql": own.decode(), "params": {"since": "2026-09-01"}}).encode(), headers={**s2, "content-type": "application/json"}))
+    params_py = (b"import pondra\n\n# %% tags=[\"parameters\"]\n# the day to load\nday = \"2026-09-29\"\nlimit: int = 2  # how many\n\n"
+                 b"# %%\nprint('got', day, limit)\n")
+    call(A.port, "PUT", "/files/etl/params.py", params_py)
+    got["py parameters"] = q("SELECT * FROM pondra.parameters('etl/params.py')")
     got["described after"] = q("SELECT name, description FROM pondra.parameters('etl/sensors.sql')")
     got["run given"] = q("CALL run('etl/daily.sql', region => 'eu', day => '2026-09-30', min => 6)")
     got["run defaults"] = q("CALL run('etl/daily.sql', region => 'us')")
@@ -6266,6 +6278,12 @@ def variables():
         {"name": "region", "required": True, "description": "where the orders come from"}]
     checks["a comment after a DECLARE on its line describes it, and not the DECLARE after it"] = \
         got["described after"] == [{"name": "d", "description": "the sensor"}, {"name": "cel"}]
+    checks["a plain DECLARE is the file's own: not a parameter, NULL with no default, and a value given for it refused (a run's, a request's)"] = \
+        got["own parameters"] == [{"name": "day"}] and got["own run"] == [{"since": "2026-09-29"}] \
+        and "has no parameter since (it takes $day)" in got["own refused"] and "declares as its own variable" in got["own given"]
+    checks["a .py file's parameters are its # %% tags=[\"parameters\"] cell's (types from annotations and literals, comments as descriptions)"] = got["py parameters"] == [
+        {"name": "day", "type": "VARCHAR", "default": '"2026-09-29"', "required": False, "description": "the day to load"},
+        {"name": "limit", "type": "BIGINT", "default": "2", "required": False, "description": "how many"}]
     checks["a run's values replace the defaults, cast to their types; a required one missing is named; the run's variables stay its own"] = \
         got["run given"] == [{"n": 1, "total": 20.0, "region": "eu"}] and got["run defaults"] == [{"n": 1, "total": 10.0, "region": "us"}] \
         and "no value for $region" in got["run missing"] and got["session after runs"] == [{"name": "day", "value": "2026-09-30"}]
@@ -6295,6 +6313,16 @@ def variables():
     call(A.port, "PUT", "/files/etl/load.py", b"import pondra\nprint('given', pondra.vars.day)\npondra.vars.seen = 41\nprint(pondra.sql('SELECT $seen + 1 AS x').rows())\n")
     db.run("etl/load.py", day="2026-10-01")
     ran = list(db.notices)
+    db.run("etl/params.py", limit=5)
+    params_ran = list(db.notices)
+    try:
+        db.run("etl/params.py", nope=1)
+        params_refused = ""
+    except Exception as e:
+        params_refused = str(e)
+    info["params.py"] = {"ran": params_ran, "refused": params_refused}
+    checks["a .py file's run: its parameters cell, then the values given over its defaults, then the rest; a name it doesn't take refused"] = \
+        params_ran == ["got 2026-09-29 5"] and "has no parameter nope (it takes day, limit)" in params_refused
     db.sql("DO LANGUAGE python $$\nimport pondra\nprint('do', pondra.vars.day)\n$$")
     did = list(db.notices)
     info["python"] = {"first": str(first), "listed": {k: str(v) for k, v in listed.items()}, "total": total, "ran": ran, "did": did, "after": sorted(db.vars)}

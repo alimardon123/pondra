@@ -497,7 +497,7 @@ pub async fn companion(lake: &Lake, table: &str, meta: &TableMeta) -> Result<()>
     let mut columns = meta.columns.clone();
     columns.push(("_old_version".into(), "Int64".into()));
     let deleted = TableMeta { columns, tiered: lake.visible(), ids: true, names: meta.names.clone(), dropped: meta.dropped.clone(), ..Default::default() };
-    let changed = TableMeta { changed: true, ..meta.clone() };
+    let changed = TableMeta { changed: true, past_from: meta.past_from.or(Some((0, 0))), ..meta.clone() }; // (its past kept whole from here: `past.rs`)
     lake.cat.commit(vec![(table_key(&sys::deleted(table)), json(&deleted)), (table_key(table), json(&changed))], &[]).await
 }
 

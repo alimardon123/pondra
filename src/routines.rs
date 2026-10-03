@@ -501,6 +501,7 @@ fn bind_as(sql: &str, params: &HashMap<String, Value>, numbered: bool) -> Result
         return Ok(sql.to_string());
     }
     let sql = &crate::sparksql::inline(sql)?; // (a parameter of Spark SQL's is in its text: bound once it is Pondra's)
+    let sql = &crate::past::syntax(sql); // (`t AT (VERSION => $v)`)
     let mut stmts = Parser::parse_sql(&GenericDialect {}, sql)?;
     let values = params.iter().map(|(k, v)| Ok((k.clone(), literal(v)?))).collect::<Result<HashMap<_, _>>>()?;
     let bound = |p: &str| numbered || p.trim_start_matches('$').starts_with(|c: char| c.is_alphabetic() || c == '_');
@@ -619,12 +620,14 @@ async fn expand_with(lake: &Lake, sql: &str, views: &HashMap<String, String>) ->
     if let Some(q) = show(sql) {
         return Ok(q);
     }
+    let sql = &crate::past::restore(lake, sql).await?.unwrap_or_else(|| sql.to_string()); // (`RESTORE TABLE t TO VERSION AS OF n`: a MERGE, ADR-043)
     let sql = &crate::sparksql::inline(sql)?; // (`spark_sql('…')`: Spark SQL as Pondra's, then expanded as any)
+    let sql = &crate::past::syntax(sql).into_owned(); // (`t AT (VERSION => n)`: a table as it was, ADR-043)
     let all = listed(lake).await?;
     let outside = crate::ext::attached(lake).await?;
     let named = |n: &String| crate::ddl::mentions(sql, n);
     if !all.iter().any(|(n, r)| r.kind != Kind::Procedure && named(n)) && !views.keys().any(named) && !FROM_FIRST.is_match(sql) && !crate::ext::mentions(sql)
-        && !outside.iter().any(|(n, _)| named(n)) {
+        && !outside.iter().any(|(n, _)| named(n)) && !sql.contains("pondra_at(") {
         return Ok(named_apart(sql).unwrap_or_else(|| sql.to_string()));
     }
     // DuckDB's `FROM t WHERE …` (FROM first, with clauses after it): `SELECT * FROM t WHERE …`.
@@ -769,7 +772,8 @@ fn select_names(body: &mut ast::SetExpr, sorted: &[String]) -> bool {
                 let name = match (cast(e).is_some(), column(e)) {
                     (true, _) if star || !stars.is_empty() || (0..names.len()).any(again) || sorted.contains(&n) => e.to_string(),
                     (true, _) => n.clone(),
-                    (false, Some((q, _))) if star || q.as_ref().is_some_and(|q| stars.contains(q)) || (0..k).any(again) => {
+                    // (a `*` leaves out the system columns, and a keyed table's `_deleted`: `sys::hide`)
+                    (false, Some((q, _))) if ((star || q.as_ref().is_some_and(|q| stars.contains(q))) && !crate::sys::NAMES.contains(&n.as_str()) && n != "_deleted") || (0..k).any(again) => {
                         (1..).map(|i| format!("{n}_{i}")).find(|m| !names.iter().any(|x| x.as_deref() == Some(m.as_str()))).expect("a free name")
                     }
                     _ => continue,
@@ -925,6 +929,11 @@ impl VisitorMut for Expander<'_> {
                 Err(e) => return ControlFlow::Break(e),
                 Ok(None) => {}
             }
+        }
+        match crate::past::table_factor(self.lake, t) {
+            Ok(true) => return ControlFlow::Continue(()),
+            Err(e) => return ControlFlow::Break(e),
+            Ok(false) => {}
         }
         match crate::ext::table(t) {
             Ok(Some(files)) => {
