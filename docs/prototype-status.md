@@ -15,7 +15,7 @@ One Rust binary replaces the Kafka + Flink + Spark + metastore + ZooKeeper stack
 
 Start more copies on the same bucket to scale out. The only state is object storage. There's no JVM, no database server and no coordination service.
 
-**Then (2026-10-02, round 32 so far): lean and fast** (the owner, 2026-10-01: a round only for
+**Then (2026-10-02, round 32, complete: 0.31.0, 0.31.1 and 0.32.0): lean and fast** (the owner, 2026-10-01: a round only for
 optimizing; performance first):
 
 1. **The join order from every input in turn** (`optimize::JoinOrder`): the greedy order is built
@@ -151,6 +151,31 @@ optimizing; performance first):
    writing looked slower after it (300 → 180 a second), because the writer, no longer starved by
    the lookups before it, had written twice as many rows by then: run without the lookups first,
    both builds give 175.
+18. **The gates on 0.32.0** (`logs/gates/`, 2026-10-03): TPC-H SF1 from memory 1.14 s and from
+   files 2.24 s (DuckDB 1.07 / 2.12 s), every answer right; Nexmark 2 M bids 2.23 s; pgbench 198 and
+   168 transactions a second, balances right; sqllogictest 23,049 of 24,783 as before, once two
+   `CREATE DATABASE` records stopped meeting folders an earlier run left in `/tmp` (`slt_check.py`
+   now gives each file's lake a folder of its own).
+
+**Beside it, in the same release (2026-10-02, round 33's first parts):**
+
+- **Run it for years** (ADR-039, PR #6): lakes have a format version, refused by a build that
+  doesn't know it; every release's lake since 0.22 (8 of them) opens and answers row for row as
+  before, then takes writes, tiering, merges and a kill (`upgrade_check.py`, `upgrade.yml` on every
+  PR); a 0.30.0 cluster under load upgraded a node at a time, both orders, every batch once; a node
+  stopped with SIGTERM drains (`/ready` 503, Postgres 57P01, requests in flight finish) and a leader
+  steps down durable, so writers wait about 5 s for the next one (13 s when it is killed); a key
+  lookup that could miss a live key (0.22 to 0.30) fixed; `tools/soak.py` for the 24-hour soak.
+- **Deployed and distributed** (ADR-041, PR #5): a container image (amd64, arm64, and one with
+  Python), a node sized to its container's memory, a three-node compose cluster, a Helm chart,
+  `pondra service install` (systemd, launchd, Windows), Homebrew, Scoop and winget manifests made
+  from each release, signing ready for certificates, provenance attestations; each tried on every
+  PR with the build's own binary. Publishing waits on the owner's accounts.
+- **`CREATE VIEW v (a, b)`** names the view's columns (PR #12; the list was ignored).
+- **The console** (PRs #7 and #8, the owner's lists of 2026-10-02): every Live cell over one
+  connection (seven of them took the browser's six and hung Python), one grid everywhere with undo,
+  paste and filters as pills, the Data tree's details, drags and uploads, a schedule editor, users,
+  roles and who has access, and a table's own tab whose edits save as one transaction.
 
 **Then (2026-10-01, round 31, second part so far; 0.29.0): every kind of object alike, SQL and
 Python in one notebook** (the owner's list after the first part):

@@ -1,3 +1,16 @@
+## What's new in 0.32.0 (since 0.30.0)
+
+0.31.0 and 0.31.1 were never released, so this covers both.
+
+- **Faster.** The join order is tried from every input: TPC-DS q72 drops from 81 s to 0.17 s, and all 99 queries from 18.2 s to 12.1 s. Small queries cost half what they did. Flows stay within 5% of ingest. In-memory scans skip batches by their ranges and read a top-N in key order. A `SELECT *` top-N filters while it decodes Parquet: ClickBench from files beats DuckDB 1.5.5 (10.47 s against 11.10 s), and from memory takes 6.58 s. In-memory columns now hold what they count. Key lookups while writes land are 16× faster (27,600 a second).
+- **A wrong answer fixed.** A global `min` and `max` of two things could skip rows it needed (wrong since before 0.30.0).
+- **Runs for years.** Lakes have a format version. Every release's lake since 0.22 opens and answers as before. Rolling upgrades work. A stopped node drains (`/healthz`, `/ready`), and a leader steps down cleanly. A key lookup that could miss a live key is fixed.
+- **Deployed your way.** There is a container image, a compose cluster, a Helm chart and `pondra service install` (systemd, launchd, Windows). A node sizes itself to its container's memory.
+- **SQL.** `CREATE VIEW v (a, b)` names the view's columns. A transaction's `UPDATE` followed by an `INSERT` into the same table commits.
+- **The console.** Live cells share one connection. There is one grid everywhere, with undo, paste and filters. The Data tree has details, drag and drop and uploads. There is a schedule editor, users, roles and access, and a table's own tab that saves edits as one transaction.
+
+The details are in [`docs/prototype-status.md`](https://github.com/alimardon123/pondra/blob/main/docs/prototype-status.md) (round 32) and on the [performance page](https://alimardon123.github.io/pondra/concepts/performance/).
+
 ## Install
 
 | You have | Run | Then |

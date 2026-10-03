@@ -289,7 +289,7 @@ async fn decode(lake: &Lake, file: &DataFile, fields: &[FieldRef], deletes: bool
     .await?
 }
 
-/// A file's batches of one column copied into one allocation of their own, each buffer a piece of
+/// A file's batches of one column copied into one allocation of their own (invariant 212), each buffer a piece of
 /// it that says its own size. Kept in the decoder's buffers, the columns sat among its short-lived
 /// ones in the allocator's pages, which a column alone then kept from being given back: the process
 /// held about twice what the columns count. A buffer several batches share (the Parquet page their

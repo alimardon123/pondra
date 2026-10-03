@@ -187,7 +187,7 @@ pub async fn point_sql(lake: &Lake, sql: &str) -> Result<Option<Vec<u8>>> {
 }
 
 /// The log tail's rows of one table by the hash of their key, each hash to its newest row
-/// (segment, batch, row). Kept per node while the table's `tiered` mark stays, and brought up to
+/// (segment, batch, row; invariant 213). Kept per node while the table's `tiered` mark stays, and brought up to
 /// date with only the segments committed since, so a lookup is one probe, not a scan of every
 /// segment since the last tiering round: a table taking a few hundred small commits a second had
 /// thousands to scan (1,700 lookups a second instead of 38,000). The row a hash names is checked;
