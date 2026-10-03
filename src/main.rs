@@ -23,6 +23,7 @@ mod ext;
 mod feeds;
 mod files;
 mod format;
+mod friendly;
 mod flight;
 mod fresh;
 mod fsum;

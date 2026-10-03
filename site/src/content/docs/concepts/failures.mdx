@@ -72,6 +72,10 @@ same answers once the fault was gone.
   through a leader and a follower killed. A producer that gives up on a batch (its
   `delivery.timeout.ms` passed) and goes on under a new epoch has each record it was told was
   delivered written once. 73,650 of 73,650 records delivered; of a producer that gave up on 2,840, the 27,240 it was told were delivered were each there once.
+- **Arrow Flight** (pyarrow, a `DoPut` to `[table, producer, first seq]`): a stream cut off by a
+  node's death is sent again from its first unacknowledged batch to another node, and each batch is
+  written once; no `DoGet` answer was torn; the table's log read as a stream and resumed on another
+  node from the last `{"after": N}` it saw sees every batch once. Six writers had 37,616 batches acknowledged, each there once, 1,052 of them in the 8 seconds the leader was down.
 - **`pondra sql`** on a lake nobody serves, or beside running nodes: killed mid-INSERT, it leaves
   none of the INSERT's rows or all of them, and the next INSERT goes in at once. Pointed at a bucket
   that isn't there, it says so (`NoSuchBucket`) instead of waiting.
@@ -96,7 +100,7 @@ What these checks don't cover yet, or where Pondra waits instead of failing:
   on the simulated bucket, longer on a slow one).
 - **A request the bucket holds holds the commits behind it,** until it is answered or times out:
   with 2% of requests held for 20 s, writes went on at a few a second.
-- Arrow Flight clients haven't been put through these failures yet.
-- Every run so far was on one machine with a simulated bucket. Several machines and a real R2 bucket
-  are next, and so is a 24-hour soak.
+- Every run on a pull request is on one machine with a simulated bucket. The bucket's failures run
+  against a real R2 bucket every night (`resilience_check.py --real`); several machines and a
+  24-hour soak are next.
 </Aside>

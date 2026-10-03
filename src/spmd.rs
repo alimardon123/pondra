@@ -472,7 +472,7 @@ async fn shared(lake: &Lake, s: &Slice) -> Result<(SessionContext, datafusion::p
         ctx.register_table(table_ref(&p.table), table)?;
     }
     crate::query::register_views(&ctx, crate::query::stored_views(lake, &s.sql, false).await?, true, false).await?; // (over the shares)
-    let df = ctx.sql_with_options(&s.sql, crate::query::read_only()).await?;
+    let df = crate::query::sql(&ctx, &s.sql).await?;
     Ok((ctx, df))
 }
 

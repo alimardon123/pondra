@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The gates, as one command (roadmap, "The road to 1.0"): right answers and speed, measured the
+"""The gates, as one command (roadmap, "Every round"): right answers and speed, measured the
 same way every round, so a drop is seen before a release rather than after.
 
   gates.py [--only slt,tpch,postgres,nexmark,pgbench] [--prepare] [--note "…"] [--bin target/release/pondra]

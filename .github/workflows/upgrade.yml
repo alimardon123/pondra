@@ -3,32 +3,40 @@
 # a simulated R2 bucket too, where its followers always have a flush in flight); a cluster
 # of the newest release is upgraded to this build a node at a time under load
 # (tools/upgrade_check.py all); a table's past: UNDROP and retention (tools/history_check.py, ADR-043).
-# Every pull request to main, and by hand.
+# build.yml calls it once a pull request's build is done (the label `ci` or `full-ci`): it tries
+# the binary that run made, so nothing is compiled here. By hand too.
 name: upgrade
 
 on:
-  pull_request:
-    branches: [main]
+  workflow_call:
   workflow_dispatch:
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  SHA: ${{ github.event.pull_request.head.sha || github.sha }}
 
 jobs:
   upgrade:
     runs-on: ubuntu-24.04
     timeout-minutes: 75
     permissions:
+      actions: read # (the build run's packages)
       contents: read
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: upgrade
-          cache-on-failure: true
       - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
-      - name: Build
-        run: cargo build --release
+      # (Called from build.yml: its run's own packages, with no API call. By hand: a build run's.)
+      - uses: actions/download-artifact@v7
+        if: github.event_name != 'workflow_dispatch'
+        with:
+          name: pondra-linux-x64
+          path: dist
+      - name: This commit's Linux binary (the build workflow's)
+        run: |
+          [ -f dist/pondra-linux-x64.tar.gz ] || bash tools/ci_artifact.sh linux-x64 "$SHA"
+          mkdir -p target/release && tar xzf dist/pondra-linux-x64.tar.gz -C target/release && ls -l target/release
       - name: Every release's lake, a newer format, drains, a rolling upgrade
         env:
           GITHUB_TOKEN: ${{ github.token }} # (the releases' list: a runner's shared address has a low limit)
