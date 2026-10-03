@@ -215,6 +215,9 @@ print(spend.sort("item").rows())
 | `db.create_procedure(name, body=None, file=None, params=None, language="python", entry=None, packages=None, timeout=None, replace=True)` | a stored procedure from code (or a file of it) |
 | `@db.function` | a decorator: this Python function becomes one of the lake's functions, for SQL and frames, on every node |
 | `@db.procedure` | a decorator: this Python function becomes a stored procedure |
+| `db.task(name, sql, schedule=None, after=None, when=None, retries=None, retry_delay=None, timeout=None, on_failure=None, replace=True)` | [`CREATE TASK`](/pondra/reference/sql/#functions-procedures-and-tasks): `sql` run on a `schedule`, or `after` other tasks |
+| `@db.task(schedule=…)` or `@db.task(after=…)` | a decorator: this Python function becomes a procedure, and a task calls it |
+| `db.execute_task(name, **values)` | `EXECUTE TASK`: its graph runs now, with these values for its tasks' `$name`s; a `Run` (`.wait()`) |
 | `db.secret(name)` | a secret's values as a dict; only a procedure's code may read them |
 | `db.routines()` | the lake's functions and procedures, as a dict by name |
 

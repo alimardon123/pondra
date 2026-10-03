@@ -36,7 +36,7 @@ function schedule(t) {
     [...t.runs].reverse().map(x => h('i', { class: x.status === 'failed' ? 'bad' : x.status === 'running' ? 'run' : '', style: `height:${Math.max(18, Math.round(100 * (took(x) || longest * 0.2) / longest))}%`, title: `${utc(x.started).toLocaleString()} · ${x.status}${took(x) != null ? ' · ' + secs(took(x)) : ''}` })));
   const acts = [['play', 'Run now', 'Start it now, on the node (as a job: History shows it)', () => runNow(t)], ['pencil', 'Edit', 'Change how often it runs, and what', () => scheduleDialog(t)]];
   const more = e => menu(e.currentTarget, [file ? { label: 'Open the file', icon: 'file', run: () => H.openFile(file) } : null, { label: 'Copy the statement', icon: 'copy', run: () => copyText(t.statement) },
-    { label: 'Its runs in History', icon: 'clock', run: () => H.show('runs') }, '-', { label: 'Drop it', icon: 'trash', run: () => drop(t) }]);
+    { label: 'Its runs in History', icon: 'clock', run: () => { (S.hist ||= {}).of = 'runs'; H.show('runs'); } }, '-', { label: 'Drop it', icon: 'trash', run: () => drop(t) }]);
   const el = h('div', { class: 'job' + (open.has(t.name) ? ' open' : '') },
     h('div', { class: 'line1', role: 'button', tabindex: '0', title: 'Click: its last runs', onclick: () => { open.has(t.name) ? open.delete(t.name) : open.add(t.name); H.detail(); }, onkeydown: e => e.key === 'Enter' && e.currentTarget.click() },
       h('span', { class: 'ic', html: svg('clock', 15) }), h('span', { class: 'nm' }, t.name),

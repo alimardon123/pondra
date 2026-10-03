@@ -59,8 +59,8 @@ pondra serve lake        # then open http://localhost:8080
   **Pin** it: a pinned tab stays at the left, always in sight, shows a pin instead of its **✕**, and
   isn't closed by **Close others**, **Close to the right**, **Close saved** or **Close all**, which the
   same menu has. Pinned tabs are pinned again next time.
-- **The right pane:** **Details**, **Variables**, **History** (what ran: the node's runs, and what
-  this page ran) and **Jobs** (what runs on its own: the schedules). Drag a tab to put it in another place. Details follows the tab in front; a
+- **The right pane:** **Details**, **Variables**, **History** (what ran: every statement, slow ones
+  with their plans, and the node's runs) and **Jobs** (what runs on its own: the schedules). Drag a tab to put it in another place. Details follows the tab in front; a
   table you pick stays there until you switch tabs. In a window up to 1180 px wide the pane opens
   over the page when you pick a table or a column, and closes as soon as you go back to your work.
 - **Each view's ⋯** (or a right-click on its name) moves it to the other pane: Workspace can sit as a
@@ -248,17 +248,25 @@ time zone, or **Cron** for any cron line. The line below shows it as SQL takes i
 you pick. Below them is the statement it runs, in an editor of its own. A schedule the node refuses
 (a cron line it can't read) keeps the editor open with why.
 
-**History**, in the right pane (or the clock at the top), is what ran:
+**History**, in the right pane (or the clock at the top), is what ran, newest first. Its switch picks
+whose:
 
-- **On the node:** its runs, newest first: what ran (a file, a procedure, or a Python cell's first
-  line of code), its id, who ran it and when, how long it took or its error; a schedule's runs are
-  tagged with its name (click the tag for Jobs). A running one's row updates until it ends. Click one
-  for all of it (a cell's whole code) and to open its file, or open the code in a new file;
-  right-click to copy its id.
-- **This page:** each statement and Python run from this page, its SQL shortened to a line, with its
-  number (`#3`), its file, the time and its rows. Click one to see it whole, and to **Open in a new
-  file**, **Put it in the tab in front**, **Copy it**, **Run it again** or **See its plan**; a
-  right-click gives the same.
+- **This tab**, **This page** or **All:** statements as the node remembers them
+  ([`pondra.history`](/pondra/reference/sql/#users-and-grants)). Each shows its SQL (or a Python
+  cell's first line), how long it took or how it ended, when, its rows, and how many nodes it ran on.
+  **All** is every statement you may see, from every door (an admin sees everyone's, with who ran it),
+  but not the console's own queries. A statement shows up a second or so after it ends.
+- **Runs:** the node's runs: a file, a procedure, or a Python cell's first line of code, with its id,
+  who ran it and when, and how long it took or its error. A schedule's runs are tagged with its name
+  (click the tag for Jobs). A running one's row updates until it ends.
+
+**Slow or failed** keeps only statements that failed or took longer than `PONDRA_SLOW_MS` (1 s), and
+runs that failed. Click a statement to see it whole, who ran it, and from where. A slow one also
+shows its plan as it ran, with each step's rows and time (**Graph** or **Text**), and where its time
+went, each node's part on a timeline. **Open in a new file**, **Put it in the tab in front**, **Copy
+it**, **Run it again** and **See its plan** are its buttons, and a right-click gives the same. Click a
+run for all of it (a cell's whole code), to open its file or the code in a new file; right-click to
+copy its id.
 
 It's the workspace of [Run files as jobs](/pondra/guides/workspace/).
 

@@ -4701,6 +4701,13 @@ def history():
             and str(h.get("session", "")).endswith("tab-0001") and h.get("ms") is not None and h.get("plan") is None and len(http) == 1
         checks["Postgres: its door, its rows"] = [(r["door"], r["outcome"], r["rows"]) for r in pgr] == [("postgres", "ok", 3)]
         checks["a failed statement: failed, with its error"] = [(r["outcome"], "nope" in (r["error"] or "")) for r in failed] == [("failed", True)]
+        try:  # (a client that stops waiting: its statement is dropped on the node, and kept as stopped)
+            urllib.request.urlopen(urllib.request.Request(f"http://127.0.0.1:{A.port}/sql", b"SELECT sum(value) AS s FROM range(0, 4000000000) -- h-stopped", method="POST"), timeout=0.5)
+        except OSError:
+            pass
+        stopped = until("h-stopped")
+        seen["stopped"] = [{k: r[k] for k in ("outcome", "door", "user", "ms")} for r in stopped]
+        checks["a statement its client stopped waiting for: stopped, by its door"] = [(r["outcome"], r["door"]) for r in stopped] == [("stopped", "http")]
         # A slow statement (every one on b): its plan, its operators' rows; spread, each node's share
         q("SELECT count(*) AS n FROM t WHERE k % 7 = 0 -- h-slow", 1)
         while len(call(A.port + 1, "GET", "/stats")["nodes"]) < 3:
