@@ -163,11 +163,15 @@ What differs is only who may set it and how long it lives:
   error at its line; a script's end waits too. Neither runs inside a transaction. Their passes and
   statements keep their places in the job, so a retried script writes once (phase 2, built: eight
   0.3-second Python calls take 0.74 s with `PARALLEL 8`, 2.48 s one at a time).
+- **Waiting for one:** `$h = ASYNC <statement>` puts a handle in `$h`, and `AWAIT $h` waits for that
+  one alone, failing with its error (which `AWAIT ALL` then leaves out). A handle is a text id, as a
+  run's is, so `AWAIT` takes either: `AWAIT 'id'` waits for a procedure or file that `pondra.start`
+  began, from any session or client, reading `pondra.runs` as its node writes it (built).
 - **Dealt to the nodes** (phase 2b, next): passes and `ASYNC` statements sent to the nodes with
   room, so a backfill of 365 days uses the whole cluster. It needs a node to run statements as the
   script's caller on another's word (signed with the nodes' key), which is its own change; until
-  then each pass's statements spread as any statement does. `AWAIT $id` for one statement comes
-  with it.
+  then each pass's statements spread as any statement does. A dealt statement is a run of its own,
+  so its handle is that run's id and `AWAIT` needs nothing new.
 - **Exactly once through a retry.** A task's tick that runs again after a failover runs its script
   from the start with the same job; each statement's part is its place in the script and its
   loops' counts (`task:nightly:42:3.2#5`), so a write already made is not made twice.
@@ -221,8 +225,8 @@ ALTER TASK report SUSPEND;  ALTER TASK report RESUME;
 1. **Scripting**: blocks, branches, loops, handlers, `PRINT`, `RAISE`, `ASSERT`, `RETURN`,
    `CALL … INTO`, `EXECUTE IMMEDIATE`, `IDENTIFIER()`; the scopes of §2; in every door, procedures and tasks; the console's
    highlighting and Run at the caret taking the whole block.
-2. **Parallel**: `PARALLEL n` loops, `ASYNC` / `AWAIT ALL` (built); then passes dealt to the nodes,
-   each a run of its own in `pondra.runs`, and `AWAIT $id`.
+2. **Parallel**: `PARALLEL n` loops, `ASYNC`, `AWAIT ALL` and `AWAIT $h` or a run's id (built); then
+   passes dealt to the nodes, each a run of its own in `pondra.runs`.
 3. **Task graphs**: `AFTER`, `WHEN`, results, values passed down the graph, `WITH (…)` options, `EXECUTE TASK`, `SUSPEND` and
    `RESUME`; the console's Tasks view with the graph and the renaming.
 

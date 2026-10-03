@@ -1,6 +1,6 @@
 //! Scripts that decide (ADR-045): blocks with handlers, `IF`, `CASE`, `WHILE`, `REPEAT`, `LOOP`,
 //! `FOR r IN (query) [PARALLEL n]`, `LEAVE`, `ITERATE`, `RETURN`, `RAISE`, `PRINT`, `ASSERT`,
-//! `EXECUTE IMMEDIATE`, `CALL … INTO`, `IDENTIFIER()`, `ASYNC` and `AWAIT ALL`, the same at every
+//! `EXECUTE IMMEDIATE`, `CALL … INTO`, `IDENTIFIER()`, `ASYNC` and `AWAIT`, the same at every
 //! door (`routines::one` hands them here).
 //!
 //! - **One entry per kind** (`KINDS`): the word that opens it and how its head is read; what it does
@@ -19,8 +19,9 @@ use anyhow::{bail, ensure, Context, Result};
 use datafusion::arrow::array::{Array, AsArray, RecordBatch};
 use futures::future::BoxFuture;
 use futures::stream::{FuturesUnordered, StreamExt};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
+use std::task::Poll;
 
 // ---------------------------------------------------------------- the text's words
 
@@ -286,6 +287,13 @@ impl<'a> Reader<'a> {
             }
             _ => None,
         };
+        // `$h = ASYNC statement`: started, its handle in `$h`.
+        if let (Some(v), Some(eq), Some("async"), None) = (self.t.get(self.i).copied(), self.t.get(self.i + 1).copied(), self.word_at(self.i + 2).as_deref(), &label) {
+            if v.k == K::Var && &self.text[eq.at..eq.end] == "=" {
+                self.i += 2;
+                return async_(self, Some(self.text[v.at + 1..v.end].to_string()))?.context("an ASYNC statement");
+            }
+        }
         if let Some(parse) = self.word_at(self.i).and_then(|w| KINDS.iter().find(|(k, _)| *k == w)).map(|(_, p)| p) {
             let from = self.i;
             if let Some(step) = parse(self, label.clone())? {
@@ -313,7 +321,7 @@ fn parse(text: &str) -> Result<Steps> {
 
 static OPENER: LazyLock<regex::Regex> = LazyLock::new(|| {
     let words = KINDS.iter().map(|(w, _)| *w).collect::<Vec<_>>().join("|");
-    regex::Regex::new(&format!(r"(?is)^(?:[a-z_]\w*\s*:\s*)?(?:{words})\b")).expect("a regex")
+    regex::Regex::new(&format!(r"(?is)^(?:[a-z_]\w*\s*:\s*)?(?:{words}|\$\w+\s*=\s*async)\b")).expect("a regex")
 });
 
 /// Is `sql` a statement only a script has (a block, a branch, a loop, `PRINT`, `RAISE`, …), or one
@@ -366,13 +374,44 @@ pub struct Runner<'a> {
     /// Where the step running starts (the line an error names).
     at: usize,
     last: Outcome,
-    /// `ASYNC` statements going on beside the script, and those that failed (`AWAIT ALL` says).
-    pending: std::sync::Mutex<Pending<'a>>, // (a Mutex only to be Sync: reached by `&mut`, never locked)
-    failed: Vec<(usize, anyhow::Error)>,
+    /// `ASYNC` statements going on beside the script, and how those ended went (`AWAIT` says): shared
+    /// with what waits beside a step (`beside`), so an `AWAIT` in a block sees them too.
+    started: Arc<std::sync::Mutex<Started<'a>>>,
 }
 
-/// `ASYNC` statements going on: each where it starts, and how it ended.
-type Pending<'a> = FuturesUnordered<BoxFuture<'a, (usize, Result<()>)>>;
+/// `ASYNC` statements going on, and what those ended said.
+#[derive(Default)]
+struct Started<'a> {
+    /// Each where it starts, its handle (`$h = ASYNC …`), how it ended.
+    going: FuturesUnordered<BoxFuture<'a, (usize, Option<String>, Result<()>)>>,
+    /// Handles started and not ended.
+    running: HashSet<String>,
+    /// Handles ended: None if they did, else their error (`AWAIT $h` again says it again).
+    ended: HashMap<String, Option<String>>,
+    /// Failures not yet raised, where each started (`AWAIT ALL` raises the first).
+    failed: Vec<(usize, Option<String>, anyhow::Error)>,
+}
+
+impl Started<'_> {
+    /// Take in what has ended; Ready once nothing is going.
+    fn poll(&mut self, cx: &mut std::task::Context) -> Poll<()> {
+        loop {
+            match self.going.poll_next_unpin(cx) {
+                Poll::Ready(Some((at, h, out))) => {
+                    if let Some(h) = &h {
+                        self.running.remove(h);
+                        self.ended.insert(h.clone(), out.as_ref().err().map(|e| format!("{e:#}")));
+                    }
+                    if let Err(e) = out {
+                        self.failed.push((at, h, e));
+                    }
+                }
+                Poll::Ready(None) => return Poll::Ready(()),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
 
 /// Run `sql`, a script: its statements in turn, blocks, branches and loops as they say. The answer
 /// is its last statement's, or what `RETURN` gives.
@@ -380,11 +419,11 @@ pub async fn run(app: &App, sql: &str, views: &HashMap<String, String>, who: Who
     let steps = parse(sql)?;
     let one = steps.len() == 1;
     let go = async {
-        let mut r = Runner { app, who, job, views, blocks: vec![], nested: 0, rows: vec![], caught: vec![], at: 0, last: Outcome::Done(serde_json::json!({})), pending: Default::default(), failed: vec![] };
+        let mut r = Runner { app, who, job, views, blocks: vec![], nested: 0, rows: vec![], caught: vec![], at: 0, last: Outcome::Done(serde_json::json!({})), started: Default::default() };
         for (i, (at, s)) in steps.iter().enumerate() {
             r.at = *at;
             let path = if one { String::new() } else { i.to_string() };
-            let flow = match s.run(&mut r, *at, path).await {
+            let flow = match r.beside(s.as_ref(), *at, path).await {
                 Err(e) if one && s.plain().is_some() => return Err(e),
                 Err(e) if one => return Err(e.context(format!("line {}", line(sql, r.at)))),
                 Err(e) if s.plain().is_some() => return Err(e.context(format!("statement {}: {}", i + 1, short(s.plain().unwrap_or_default())))),
@@ -427,11 +466,7 @@ impl<'a> Runner<'a> {
             for (j, (at, s)) in steps.iter().enumerate() {
                 self.at = *at;
                 let place = if path.is_empty() { j.to_string() } else { format!("{path}.{j}") };
-                let flow = match self.pending().is_empty() {
-                    true => s.run(self, *at, place).await?,
-                    false => self.beside(s.as_ref(), *at, place).await?,
-                };
-                match flow {
+                match self.beside(s.as_ref(), *at, place).await? {
                     Flow::Next => {}
                     other => return Ok(other),
                 }
@@ -440,33 +475,33 @@ impl<'a> Runner<'a> {
         })
     }
 
-    fn pending(&mut self) -> &mut Pending<'a> { self.pending.get_mut().unwrap_or_else(|e| e.into_inner()) }
+    fn started(&self) -> std::sync::MutexGuard<'_, Started<'a>> { self.started.lock().unwrap_or_else(|e| e.into_inner()) }
 
-    /// A step run while the `ASYNC` statements started before it go on.
+    /// A step run while the `ASYNC` statements started before it go on. (One task polls both, so
+    /// the statements' state is locked only between polls, never held across one.)
     async fn beside(&mut self, s: &dyn Step, at: usize, place: String) -> Result<Flow> {
-        let (mut pending, mut failed) = (std::mem::take(self.pending()), vec![]);
-        let out = {
-            let mut step = s.run(self, at, place);
-            loop {
-                tokio::select! {
-                    out = &mut step => break out,
-                    Some((at, done)) = pending.next(), if !pending.is_empty() => failed.extend(done.err().map(|e| (at, e))),
-                }
-            }
-        };
-        self.pending().extend(pending);
-        self.failed.extend(failed);
-        out
+        if self.started().going.is_empty() {
+            return s.run(self, at, place).await;
+        }
+        let started = self.started.clone();
+        let going = std::future::poll_fn(move |cx| {
+            let _ = started.lock().unwrap_or_else(|e| e.into_inner()).poll(cx);
+            Poll::<()>::Pending
+        });
+        tokio::select! {
+            out = s.run(self, at, place) => out,
+            _ = going => unreachable!("it never ends"),
+        }
     }
 
     /// Wait for every `ASYNC` statement (`AWAIT ALL`, and a script's end): the first failure's error,
     /// at its line.
     async fn settle(&mut self) -> Result<()> {
-        while let Some((at, done)) = self.pending().next().await {
-            self.failed.extend(done.err().map(|e| (at, e)));
-        }
-        match self.failed.drain(..).next() {
-            Some((at, e)) => {
+        let started = self.started.clone();
+        std::future::poll_fn(|cx| started.lock().unwrap_or_else(|e| e.into_inner()).poll(cx)).await;
+        let failed = std::mem::take(&mut self.started().failed);
+        match failed.into_iter().next() {
+            Some((at, _, e)) => {
                 self.at = at;
                 Err(e.context("ASYNC"))
             }
@@ -474,11 +509,42 @@ impl<'a> Runner<'a> {
         }
     }
 
+    /// Wait for `id`: an `ASYNC` statement of this script's (`$h = ASYNC …`), else a run in
+    /// `pondra.runs` (`pondra.start`'s): its error if it failed.
+    async fn wait(&mut self, id: &str) -> Result<()> {
+        let started = self.started.clone();
+        let ours = std::future::poll_fn(|cx| {
+            let mut s = started.lock().unwrap_or_else(|e| e.into_inner());
+            let _ = s.poll(cx);
+            match (s.ended.get(id), s.running.contains(id)) {
+                (Some(out), _) => Poll::Ready(Some(out.clone())),
+                (None, true) => Poll::Pending,
+                (None, false) => Poll::Ready(None),
+            }
+        })
+        .await;
+        match ours {
+            None => crate::runs::wait(self.app, id).await,
+            Some(None) => Ok(()),
+            Some(Some(said)) => {
+                let mut s = self.started();
+                let i = s.failed.iter().position(|(_, h, _)| h.as_deref() == Some(id));
+                let (at, e) = match i.map(|i| s.failed.remove(i)) {
+                    Some((at, _, e)) => (Some(at), e),
+                    None => (None, anyhow::anyhow!(said)), // (raised before: said again)
+                };
+                drop(s);
+                self.at = at.unwrap_or(self.at);
+                Err(e.context("ASYNC"))
+            }
+        }
+    }
+
     /// A runner for work beside this one (a `PARALLEL` pass, an `ASYNC` statement): the same caller
     /// and job, the loops' rows in force, nothing else.
     fn child(&self) -> Runner<'a> {
-        let (blocks, caught, last, pending, failed) = (vec![], self.caught.clone(), Outcome::Done(serde_json::json!({})), Default::default(), vec![]);
-        Runner { app: self.app, who: self.who, job: self.job.clone(), views: self.views, blocks, nested: self.nested + 1, rows: self.rows.clone(), caught, at: self.at, last, pending, failed }
+        let (blocks, caught, last) = (vec![], self.caught.clone(), Outcome::Done(serde_json::json!({})));
+        Runner { app: self.app, who: self.who, job: self.job.clone(), views: self.views, blocks, nested: self.nested + 1, rows: self.rows.clone(), caught, at: self.at, last, started: Default::default() }
     }
 
     /// `FOR … PARALLEL n`: up to `n` passes at once, each with a copy of the variables (what it sets
@@ -915,50 +981,70 @@ impl Step for Loop {
 
 /// `ASYNC statement`: started, and the script goes on; `AWAIT ALL` waits for it (and the script's
 /// end does). It runs with a copy of the variables, as a `PARALLEL` pass does.
-struct Async(Arc<dyn Step>);
+/// `ASYNC statement`, or `$h = ASYNC statement` (its handle in `$h`, for `AWAIT $h`).
+struct Async(Arc<dyn Step>, Option<String>);
 
-fn async_(r: &mut Reader, _: Option<String>) -> Result<Option<Box<dyn Step>>> {
+fn async_(r: &mut Reader, handle: Option<String>) -> Result<Option<Box<dyn Step>>> {
     let line = r.line(r.at());
     r.i += 1;
     ensure!(r.t.get(r.i).is_some_and(|x| x.k != K::Semi), "line {line}: ASYNC starts a statement: ASYNC CALL load('orders'), ASYNC INSERT …, ASYNC BEGIN … END");
-    Ok(Some(Box::new(Async(Arc::from(r.step()?)))))
+    Ok(Some(Box::new(Async(Arc::from(r.step()?), handle))))
 }
 
 impl Step for Async {
     fn run<'a>(&'a self, r: &'a mut Runner<'_>, at: usize, path: String) -> BoxFuture<'a, Result<Flow>> {
         Box::pin(async move {
             ensure!(!crate::txn::open(), "ASYNC runs outside a transaction (it would share it): COMMIT first");
+            let handle = self.1.as_ref().map(|_| crate::runs::new_id());
+            if let (Some(name), Some(h)) = (&self.1, &handle) {
+                Box::pin(crate::vars::apply(r.app, crate::vars::Change::Set { name: name.clone(), value: format!("'{h}'") })).await?;
+            }
             let (step, mut child, own) = (self.0.clone(), r.child(), crate::vars::snapshot());
-            r.pending().push(Box::pin(crate::vars::with_own(own, async move {
+            let h = handle.clone();
+            let going = Box::pin(crate::vars::with_own(own, async move {
                 let out = step.run(&mut child, at, path).await;
                 let out = match (out, child.settle().await) {
                     (Err(e), _) | (_, Err(e)) => Err(e),
                     (Ok(Flow::Next), _) => Ok(()),
                     (Ok(_), _) => Err(anyhow::anyhow!("LEAVE, ITERATE and RETURN can't leave an ASYNC statement: it runs apart")),
                 };
-                (at, out)
-            })));
+                (at, h, out)
+            }));
+            let mut s = r.started();
+            s.running.extend(handle);
+            s.going.push(going);
             Ok(Flow::Next)
         })
     }
 }
 
 /// `AWAIT ALL`: the `ASYNC` statements started so far, ended; the first failure's error.
-struct Await;
+/// `AWAIT $h[, …]`: each one, a handle (`$h = ASYNC …`) or a run's id (`pondra.start`), ended.
+struct Await(Vec<String>);
 
 fn await_(r: &mut Reader, _: Option<String>) -> Result<Option<Box<dyn Step>>> {
     let line = r.line(r.at());
     r.i += 1;
-    r.eat("all");
-    ensure!(r.t.get(r.i).is_none_or(|x| x.k == K::Semi), "line {line}: AWAIT ALL waits for every ASYNC statement (one by one isn't taken yet)");
-    r.eat_semi();
-    Ok(Some(Box::new(Await)))
+    if r.eat("all") {
+        ensure!(r.t.get(r.i).is_none_or(|x| x.k == K::Semi), "line {line}: AWAIT ALL; or AWAIT $handle, …");
+        r.eat_semi();
+        return Ok(Some(Box::new(Await(vec![]))));
+    }
+    let ids = commas(&r.rest());
+    ensure!(!ids.is_empty(), "line {line}: AWAIT waits for ALL, or for a handle ($h = ASYNC …) or a run's id (pondra.start)");
+    Ok(Some(Box::new(Await(ids))))
 }
 
 impl Step for Await {
     fn run<'a>(&'a self, r: &'a mut Runner<'_>, _: usize, _: String) -> BoxFuture<'a, Result<Flow>> {
         Box::pin(async move {
-            r.settle().await?;
+            if self.0.is_empty() {
+                r.settle().await?;
+            }
+            for (e, id) in self.0.iter().zip(r.texts(&self.0).await?) {
+                let id = id.with_context(|| format!("AWAIT {e}: NULL, not a handle or a run's id"))?;
+                r.wait(&id).await?;
+            }
             Ok(Flow::Next)
         })
     }
@@ -1222,7 +1308,9 @@ mod tests {
         assert!(is("IF $n = 0 THEN PRINT 'none'; END IF"));
         assert!(is("print 'x'") && is("RAISE NOTICE 'x %', 1") && is("CALL p() INTO $x") && is("SELECT * FROM IDENTIFIER('t')"));
         assert!(!is("BEGIN") && !is("CALL p()") && !is("EXECUTE q(1)") && !is("SELECT 1") && !is("FOR x"));
-        assert!(is("ASYNC INSERT INTO t VALUES (1)") && is("AWAIT ALL") && parse("AWAIT $x").is_err());
+        assert!(is("ASYNC INSERT INTO t VALUES (1)") && is("AWAIT ALL") && is("AWAIT $x, 'run'") && is("$h = ASYNC CALL p()") && parse("AWAIT").is_err());
+        assert_eq!(split("$h = ASYNC BEGIN SELECT 1; SELECT 2; END; AWAIT $h").len(), 2);
+        assert!(binds("$h = ASYNC CALL p(); AWAIT $h").contains(&"h".to_string()));
         assert!(parse("IF a THEN SELECT 1;").err().unwrap().to_string().contains("isn't closed"));
         assert!(parse("WHILE a DO SELECT 1; END IF;").err().unwrap().to_string().contains("END IF where the WHILE on line 1 ends"));
         assert_eq!(binds("FOR r IN (SELECT 1) DO $n = $n + 1; END FOR; CALL p() INTO $a, $b"), ["error", "sqlstate", "r", "n", "a", "b"]);

@@ -6212,7 +6212,9 @@ def scripts():
     CALL … INTO and IDENTIFIER(), from HTTP, Python, Postgres (simple and extended protocol) and in
     procedures; a block's DECLAREs its own; a script run again with its job writes once; a file's
     parameters leave out what its blocks bind. FOR … PARALLEL n runs passes at once, ASYNC runs a
-    statement beside the script and AWAIT ALL waits: each with a copy of the variables, once per job."""
+    statement beside the script and AWAIT ALL waits (in a block too), `$h = ASYNC …` and `AWAIT $h` for
+    one, `AWAIT 'id'` for a run pondra.start began: each with a copy of the variables, once per job.
+    VALUES with a subquery in a row (DataFusion worked the rows out before the subquery ran)."""
     import psycopg
     lake = new_lake()
     here = os.path.dirname(os.path.abspath(__file__))
@@ -6370,6 +6372,23 @@ SELECT $big AS big, $t AS t, $c AS c, (SELECT count(*) FROM made_a) + (SELECT co
         timed[how.strip() or "one at a time"] = round(time.time() - t0, 2)
     info["eight 0.3 s calls, s"] = timed
     checks["eight 0.3 s calls PARALLEL 8 take under 0.6 of the time one at a time does"] = timed["PARALLEL 8"] < 0.6 * timed["one at a time"]
+    # ASYNC beside what follows it, AWAIT ALL in a block, handles, and runs pondra.start started.
+    t0 = time.time()
+    q("ASYNC CALL nap(0.4);\nCALL nap(0.4)", {})
+    timed["ASYNC beside a call"] = round(time.time() - t0, 2)
+    got["await in a block"], _ = said("BEGIN\n  ASYNC BEGIN CALL nap(0.2); PRINT 'async done'; END;\n  AWAIT ALL;\n  PRINT 'after AWAIT ALL';\nEND")
+    got["handles"], _ = said("$a = ASYNC BEGIN CALL nap(0.2); PRINT 'a done'; END;\n$b = ASYNC SELECT 1/0;\nAWAIT $a;\nPRINT 'after AWAIT $a';\n"
+                             "BEGIN\n  AWAIT $b;\nEXCEPTION WHEN OTHERS THEN\n  PRINT 'b: ' || $sqlstate;\nEND")
+    checks["ASYNC runs beside what follows; AWAIT ALL in a block waits; AWAIT $h waits for its own, raising its error once"] = (
+        timed["ASYNC beside a call"] < 0.7 and got["await in a block"] == ["async done", "after AWAIT ALL"]
+        and got["handles"] == ["a done", "after AWAIT $a", "b: 22012"])
+    q("CREATE PROCEDURE oops() LANGUAGE sql AS $$ SELECT 1/0 $$")
+    ran, failed = q("SELECT pondra.start('nap', 0.3) AS id")[0]["id"], q("SELECT pondra.start('oops') AS id")[0]["id"]
+    q(f"AWAIT '{ran}'", {})
+    got["awaited run"] = q(f"SELECT status FROM pondra.runs WHERE id = '{ran}'")
+    got["awaited failure"] = _raises_text(lambda: q(f"AWAIT '{failed}'", {}))
+    checks["AWAIT 'id' waits for a run pondra.start started, with its error if it failed"] = (
+        got["awaited run"] == [{"status": "ok"}] and "Divide by zero" in got["awaited failure"])
     # VALUES with a subquery in a row (DataFusion worked the rows out before the subquery ran): in a
     # loop, a transaction, over Postgres with a parameter, and as a query.
     q("CREATE TABLE tally (k BIGINT, n BIGINT)")
