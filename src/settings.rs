@@ -24,7 +24,7 @@ const NO_SESSION: &str = "a setting or a prepared statement is a session's: a Po
 /// Is this one of the statements kept here?
 pub fn is(sql: &str) -> bool {
     let word = crate::write::first_word(sql).split(|c: char| !c.is_ascii_alphabetic()).next().unwrap_or("").to_uppercase();
-    matches!(word.as_str(), "SET" | "RESET" | "PREPARE" | "EXECUTE" | "EXEC" | "DEALLOCATE")
+    matches!(word.as_str(), "SET" | "RESET" | "PREPARE" | "EXECUTE" | "EXEC" | "DEALLOCATE") && crate::runs::execute_of(sql).is_none() // (EXECUTE TASK: the leader's)
 }
 
 /// What a statement kept here comes to.

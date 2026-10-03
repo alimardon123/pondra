@@ -844,7 +844,7 @@ pub async fn follows(lake: &Lake, table: &str) -> Result<bool> {
 /// Run a row query here: its rows in the table's column order and types.
 pub async fn rows(ctx: &SessionContext, meta: &TableMeta, sql: &str) -> Result<RecordBatch> {
     let target = schema(&meta.columns)?;
-    let batches = ctx.sql(&crate::asof::rewrite(sql)?).await?.collect().await?;
+    let batches = ctx.sql(&crate::asof::rewrite(&crate::routines::rows_apart(sql))?).await?.collect().await?;
     let Some(first) = batches.first() else { return Ok(RecordBatch::new_empty(target)) };
     let all = concat_batches(&first.schema(), &batches)?;
     // An UPDATE's rows end with the ids they keep (`sys.rs`): those go along, by name.

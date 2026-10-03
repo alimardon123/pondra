@@ -6307,17 +6307,20 @@ def sparksql():
 
 
 def scripts():
-    """Scripts that decide (ADR-045, phase 1): blocks with handlers, IF / ELSEIF / CASE, WHILE,
+    """Scripts that decide (ADR-045, phases 1 and 2): blocks with handlers, IF / ELSEIF / CASE, WHILE,
     REPEAT, LOOP and FOR over a query's rows (`$r.col`), LEAVE and ITERATE by label, RETURN, RAISE
     (P0001), PRINT and RAISE NOTICE as notices, ASSERT (P0004), EXECUTE IMMEDIATE … INTO … USING,
     CALL … INTO and IDENTIFIER(), from HTTP, Python, Postgres (simple and extended protocol) and in
     procedures; a block's DECLAREs its own; a script run again with its job writes once; a file's
-    parameters leave out what its blocks bind."""
+    parameters leave out what its blocks bind. FOR … PARALLEL n runs passes at once, ASYNC runs a
+    statement beside the script and AWAIT ALL waits (in a block too), `$h = ASYNC …` and `AWAIT $h` for
+    one, `AWAIT 'id'` for a run pondra.start began: each with a copy of the variables, once per job.
+    VALUES with a subquery in a row (DataFusion worked the rows out before the subquery ran)."""
     import psycopg
     lake = new_lake()
     here = os.path.dirname(os.path.abspath(__file__))
     pg = A.port + 10
-    node = Node(lake, A.port, pg=f"127.0.0.1:{pg}", env={"PYTHONPATH": os.path.join(here, "..", "python")}).start()
+    node = Node(lake, A.port, pg=f"127.0.0.1:{pg}", python="auto", env={"PYTHONPATH": os.path.join(here, "..", "python")}).start()
     h = {"x-pondra-session": "harness-scripts"}
     q = lambda s, hh=h, path="/sql": call(A.port, "POST", path, s.encode(), headers=hh)
     db = _client(A.port)
@@ -6388,8 +6391,9 @@ SELECT getvariable('error') IS NULL AS gone"""
         "Divide by zero" in reraised and "orders: 3" in asserted and "isn't closed" in unclosed and "statement 2" in where and "line 3" in where
     # Scopes.
     got["scopes"] = said("DECLARE $x = 1; BEGIN DECLARE $x = 2; PRINT $x; $x = 3; PRINT $x; END; PRINT $x; FOR r IN (SELECT 7 AS v) DO PRINT $r.v; END FOR")
-    refused = _raises_text(lambda: q("BEGIN DECLARE PARAMETER $p = 1; END"))
-    checks["a block's DECLARE is its own (the outer one back after it); a DECLARE PARAMETER inside a block is refused"] = \
+    refused = _raises_text(lambda: q("SELECT 1; BEGIN DECLARE PARAMETER $p = 1; END"))
+    got["sole block"] = q("BEGIN DECLARE PARAMETER $p = 1; SELECT $p AS p; END")  # (a script that is one block: its top is the script's)
+    checks["a block's DECLARE is its own (the outer one back after it); a DECLARE PARAMETER inside a block is refused, unless the block is the whole script"] = got["sole block"] == [{"p": 1}] and \
         got["scopes"][0] == ["2", "3", "1", "7"] and "declared at its top" in refused
     # RETURN, dynamic SQL, names from values, CALL … INTO.
     got["return"] = said("DECLARE $n = 41; IF $n > 40 THEN RETURN $n + 1; END IF; PRINT 'not here'")
@@ -6440,6 +6444,65 @@ SELECT $big AS big, $t AS t, $c AS c, (SELECT count(*) FROM made_a) + (SELECT co
     got["parameters"] = q("SELECT name, required FROM pondra.parameters('etl/loop.sql')")
     checks["a file's parameters leave out a loop's row, a handler's $error and INTO's names ($day, used unset, still one)"] = \
         got["parameters"] == [{"name": "limit", "required": False}, {"name": "day", "required": True}]
+    # Phase 2: passes at once, and statements beside the script.
+    q("CREATE TABLE done (n BIGINT, w TEXT)")
+    got["parallel"] = q("DECLARE $total = 0; FOR d IN (SELECT value AS v FROM generate_series(1, 8)) PARALLEL 4 DO INSERT INTO done VALUES ($d.v, 'p'); $total = $total + $d.v; END FOR; SELECT $total AS total, (SELECT count(*) FROM done) AS c, (SELECT sum(n) FROM done) AS s", {})
+    checks["FOR … PARALLEL 4: every pass once, each with a copy of the variables (what one sets stays its own)"] = got["parallel"] == [{"total": 0, "c": 8, "s": 36}]
+    got["parallel refused"] = [_raises_text(lambda s=s: q(s, {})) for s in (
+        "FOR d IN (SELECT value AS v FROM generate_series(1, 6)) PARALLEL 3 DO IF $d.v = 4 THEN RAISE 'no %', $d.v; END IF; END FOR",
+        "FOR d IN (SELECT 1 AS v) PARALLEL 2 DO LEAVE; END FOR",
+        "FOR d IN (SELECT 1 AS v) PARALLEL 0 DO SELECT 1; END FOR")]
+    checks["a PARALLEL pass that fails fails the loop, naming the pass; LEAVE can't end it; PARALLEL 0 refused"] = \
+        "pass 4: no 4" in got["parallel refused"][0] and "can't end a PARALLEL loop" in got["parallel refused"][1] and "1 to 64" in got["parallel refused"][2]
+    got["async"] = q("ASYNC INSERT INTO done VALUES (100, 'a');\nASYNC BEGIN INSERT INTO done VALUES (101, 'a'); END;\nAWAIT ALL;\nSELECT count(*) AS c FROM done WHERE w = 'a'", {})
+    got["async failed"] = _raises_text(lambda: q("SELECT 1;\nASYNC SELECT 1/0;\nAWAIT ALL", {}))
+    q("ASYNC INSERT INTO done VALUES (102, 'e')", {})
+    got["async at the end"] = q("SELECT count(*) AS c FROM done WHERE w = 'e'")
+    checks["ASYNC runs beside the script and AWAIT ALL waits for it; a failure is AWAIT ALL's, at its line; a script's end waits too"] = \
+        got["async"] == [{"c": 2}] and "line 2: ASYNC" in got["async failed"] and "Divide by zero" in got["async failed"] and got["async at the end"] == [{"c": 1}]
+    twice = "FOR d IN (SELECT value AS v FROM generate_series(1, 5) ORDER BY 1) PARALLEL 3 DO INSERT INTO done VALUES ($d.v, 'j'); END FOR; ASYNC INSERT INTO done VALUES (9, 'j')"
+    q(twice, {}, path="/sql?job=harness-parallel")
+    q(twice, {}, path="/sql?job=harness-parallel")
+    got["twice"] = q("SELECT count(*) AS c FROM done WHERE w = 'j'")
+    checks["PARALLEL passes and ASYNC statements run again with their job write once"] = got["twice"] == [{"c": 6}]
+    q("CREATE PROCEDURE nap(s DOUBLE) LANGUAGE python AS $$\nimport time\ntime.sleep(s)\n$$")
+    q("CALL nap(0.01)", {})
+    timed = {}
+    for how in ("", " PARALLEL 8"):
+        t0 = time.time()
+        q(f"FOR d IN (SELECT value AS v FROM generate_series(1, 8)){how} DO CALL nap(0.3); END FOR", {})
+        timed[how.strip() or "one at a time"] = round(time.time() - t0, 2)
+    info["eight 0.3 s calls, s"] = timed
+    checks["eight 0.3 s calls PARALLEL 8 take under 0.6 of the time one at a time does"] = timed["PARALLEL 8"] < 0.6 * timed["one at a time"]
+    # ASYNC beside what follows it, AWAIT ALL in a block, handles, and runs pondra.start started.
+    t0 = time.time()
+    q("ASYNC CALL nap(0.4);\nCALL nap(0.4)", {})
+    timed["ASYNC beside a call"] = round(time.time() - t0, 2)
+    got["await in a block"], _ = said("BEGIN\n  ASYNC BEGIN CALL nap(0.2); PRINT 'async done'; END;\n  AWAIT ALL;\n  PRINT 'after AWAIT ALL';\nEND")
+    got["handles"], _ = said("$a = ASYNC BEGIN CALL nap(0.2); PRINT 'a done'; END;\n$b = ASYNC SELECT 1/0;\nAWAIT $a;\nPRINT 'after AWAIT $a';\n"
+                             "BEGIN\n  AWAIT $b;\nEXCEPTION WHEN OTHERS THEN\n  PRINT 'b: ' || $sqlstate;\nEND")
+    checks["ASYNC runs beside what follows; AWAIT ALL in a block waits; AWAIT $h waits for its own, raising its error once"] = (
+        timed["ASYNC beside a call"] < 0.7 and got["await in a block"] == ["async done", "after AWAIT ALL"]
+        and got["handles"] == ["a done", "after AWAIT $a", "b: 22012"])
+    q("CREATE PROCEDURE oops() LANGUAGE sql AS $$ SELECT 1/0 $$")
+    ran, failed = q("SELECT pondra.start('nap', 0.3) AS id")[0]["id"], q("SELECT pondra.start('oops') AS id")[0]["id"]
+    q(f"AWAIT '{ran}'", {})
+    got["awaited run"] = q(f"SELECT status FROM pondra.runs WHERE id = '{ran}'")
+    got["awaited failure"] = _raises_text(lambda: q(f"AWAIT '{failed}'", {}))
+    checks["AWAIT 'id' waits for a run pondra.start started, with its error if it failed"] = (
+        got["awaited run"] == [{"status": "ok"}] and "Divide by zero" in got["awaited failure"])
+    # VALUES with a subquery in a row (DataFusion worked the rows out before the subquery ran): in a
+    # loop, a transaction, over Postgres with a parameter, and as a query.
+    q("CREATE TABLE tally (k BIGINT, n BIGINT)")
+    q("FOR d IN (SELECT value AS v FROM generate_series(1, 3)) DO INSERT INTO tally VALUES ($d.v, (SELECT count(*) FROM tally)); END FOR", {})
+    q("BEGIN; INSERT INTO tally (n, k) VALUES ((SELECT max(n) FROM tally), 4); COMMIT", {})
+    with psycopg.connect(f"host=127.0.0.1 port={pg} user=pondra dbname=pondra", autocommit=True) as c:
+        c.execute("INSERT INTO tally VALUES (%s, (SELECT count(*) FROM tally))", (5,))
+    got["tally"] = q("SELECT k, n FROM tally ORDER BY k")
+    got["values"] = q("SELECT * FROM (VALUES ((SELECT count(*) FROM tally), 'rows'), (0, 'none')) ORDER BY column1 DESC")
+    checks["VALUES with a subquery: in a loop, a transaction, over Postgres, as a query"] = (
+        got["tally"] == [{"k": 1, "n": 0}, {"k": 2, "n": 1}, {"k": 3, "n": 2}, {"k": 4, "n": 2}, {"k": 5, "n": 4}]
+        and got["values"] == [{"column1": 5, "column2": "rows"}, {"column1": 0, "column2": "none"}])
     # What deciding costs: a loop that reads only variables.
     t0 = time.time()
     q("DECLARE $i = 0; WHILE $i < 200 DO $i = $i + 1; END WHILE", {})
@@ -6450,7 +6513,139 @@ SELECT $big AS big, $t AS t, $c AS c, (SELECT count(*) FROM made_a) + (SELECT co
     print(json.dumps({"scripts": checks, "ok": ok, "info": info}, indent=1, default=str))
     if not ok:
         sys.exit(1)
-    return f"scripts: blocks, branches, loops, handlers, RETURN, dynamic SQL, from HTTP, Python and Postgres: all {len(checks)} checks pass"
+    return f"scripts: blocks, branches, loops, handlers, RETURN, dynamic SQL, PARALLEL and ASYNC, from HTTP, Python and Postgres: all {len(checks)} checks pass"
+
+
+def tasks():
+    """Task graphs (ADR-045 §5) on three nodes: tasks AFTER others run in the same run of their
+    graph, with `EXECUTE TASK`'s values (`$day`) and the results before them (`pondra.result`), sent
+    from a follower; WHEN false skips a task and what follows it still runs; retries with the same
+    job (what a try wrote lands once), refused while a run is under way; a timeout, on_failure and
+    nothing after a failure; ALTER TASK SUSPEND and RESUME; refusals (a loop, two schedules, a
+    missing task, DROP of a followed one); a graph through a leader failover, each write once."""
+    lake = new_lake()
+    nodes = [Node(lake, A.port + i).start() for i in range(3)]
+    time.sleep(1)
+    q = lambda s, port=A.port: call(port, "POST", "/sql", s.encode(), timeout=60)
+    def err(s, port=A.port):
+        try:
+            q(s, port)
+            return ""
+        except RuntimeError as e:
+            return str(e)
+    def status(name, port=A.port):
+        r = q(f"SELECT last_status AS s FROM pondra.tasks WHERE name = '{name}'", port)
+        return r[0].get("s") if r else None
+    checks, got = {}, {}
+    # A graph: root, then load and skipper, then report.
+    q("CREATE TABLE glog (task VARCHAR, v BIGINT, day DATE)")
+    q("CREATE TASK root SCHEDULE '1 hour' AS SELECT 2 AS v")
+    q("CREATE TASK load AFTER root AS BEGIN DECLARE PARAMETER $day DATE = DATE '2026-01-01'; INSERT INTO glog VALUES ('load', pondra.result('root'), $day); RETURN 20; END")
+    q("CREATE TASK skipper AFTER root WHEN pondra.result('root') > 5 AS INSERT INTO glog VALUES ('skipper', 0, $day)")
+    q("CREATE TASK report AFTER load, skipper AS BEGIN DECLARE PARAMETER $day DATE = DATE '2026-01-02'; INSERT INTO glog VALUES ('report', pondra.result('load'), $day); END")
+    ran = q("EXECUTE TASK root (day => DATE '2026-09-01')", A.port + 2)
+    until(lambda: status("report"), "ok", 30)
+    got["graph"] = q("SELECT task, v, CAST(day AS VARCHAR) AS day FROM glog ORDER BY task")
+    got["statuses"] = {r["name"]: r.get("last_status") for r in q("SELECT name, last_status FROM pondra.tasks WHERE name IN ('root', 'load', 'skipper', 'report')")}
+    got["runs"] = q("SELECT routine, status FROM pondra.runs WHERE id LIKE 'task-%' ORDER BY routine")
+    at = ran.get("run", "").rsplit("-", 1)[-1] if isinstance(ran, dict) else ""
+    checks["a graph from a follower's EXECUTE TASK: AFTER in order, $day and pondra.result passed on, WHEN false skipped and what follows still runs"] = (
+        got["graph"] == [{"task": "load", "v": 2, "day": "2026-09-01"}, {"task": "report", "v": 20, "day": "2026-09-01"}]
+        and got["statuses"] == {"root": "ok", "load": "ok", "skipper": "skipped", "report": "ok"}
+        and got["runs"] == [{"routine": n, "status": s} for n, s in (("load", "ok"), ("report", "ok"), ("root", "ok"), ("skipper", "skipped"))]
+        and bool(at) and q(f"SELECT count(*) AS n FROM pondra.runs WHERE id LIKE 'task-%-{at}'")[0]["n"] == 4)
+    q("EXECUTE TASK root")
+    until(lambda: q("SELECT count(*) AS n FROM glog")[0]["n"], 4, 30)
+    got["defaults"] = q("SELECT task, CAST(day AS VARCHAR) AS day FROM glog WHERE day < DATE '2026-09-01' ORDER BY task")
+    checks["a run with no values: each task that is one block takes its DECLARE PARAMETER's default"] = got["defaults"] == [{"task": "load", "day": "2026-01-01"}, {"task": "report", "day": "2026-01-02"}]
+    # Retries: the same job, so what a try wrote lands once; a run under way refuses EXECUTE TASK.
+    q("CREATE TABLE tries (n BIGINT)")
+    ready = time.time() + 2.5
+    q(f"CREATE TASK flaky SCHEDULE '1 hour' WITH (retries = 4, retry_delay = '1 second') AS BEGIN INSERT INTO tries VALUES (1); IF date_part('epoch', now()) < {ready} THEN RAISE 'not yet'; END IF; END")
+    q("EXECUTE TASK flaky")
+    got["again"] = err("EXECUTE TASK flaky")
+    until(lambda: status("flaky"), "ok", 30)
+    run = q("SELECT status, notices FROM pondra.runs WHERE routine = 'flaky'")
+    got["flaky"] = run
+    checks["retries: failed tries said in the run's notices, then ok, what they wrote once; EXECUTE TASK refused while it runs"] = (
+        "is running" in got["again"] and len(run) == 1 and run[0]["status"] == "ok" and "try 1 failed" in (run[0].get("notices") or "")
+        and q("SELECT count(*) AS n FROM tries")[0]["n"] == 1)
+    # A timeout, on_failure, and nothing after a failure.
+    q("CREATE TABLE failures (t VARCHAR, e VARCHAR)")
+    q("CREATE PROCEDURE failed(t VARCHAR, e VARCHAR) LANGUAGE sql AS $$ INSERT INTO failures VALUES ($t, $e) $$")
+    q("CREATE TASK slow SCHEDULE '1 hour' WITH (timeout = '1 second', on_failure = failed) AS BEGIN DECLARE $i = 0; LOOP $i = $i + 1; END LOOP; END")
+    q("CREATE TASK after_slow AFTER slow AS INSERT INTO glog VALUES ('after_slow', 0, NULL)")
+    q("EXECUTE TASK slow")
+    until(lambda: status("slow"), "failed", 30)
+    time.sleep(1.5)
+    got["failures"] = q("SELECT t, e FROM failures")
+    got["slow"] = q("SELECT status, error FROM pondra.runs WHERE routine = 'slow'")
+    checks["a timeout fails the run, on_failure is called with the task and its error, and what follows doesn't run"] = (
+        got["failures"] == [{"t": "slow", "e": "timed out after 1 s"}] and got["slow"][0]["status"] == "failed"
+        and "timed out" in (got["slow"][0].get("error") or "") and status("after_slow") is None
+        and q("SELECT count(*) AS n FROM glog WHERE task = 'after_slow'")[0]["n"] == 0)
+    # SUSPEND and RESUME.
+    q("CREATE TABLE beats (n BIGINT)")
+    q("CREATE TASK beat SCHEDULE '1 second' AS INSERT INTO beats VALUES (1)")
+    time.sleep(3)
+    q("ALTER TASK beat SUSPEND")
+    time.sleep(1.5)
+    n1 = q("SELECT count(*) AS n FROM beats")[0]["n"]
+    state = q("SELECT state FROM pondra.tasks WHERE name = 'beat'")[0]["state"]
+    time.sleep(2.5)
+    n2 = q("SELECT count(*) AS n FROM beats")[0]["n"]
+    q("ALTER TASK beat RESUME", A.port + 1)
+    time.sleep(3)
+    n3 = q("SELECT count(*) AS n FROM beats")[0]["n"]
+    q("DROP TASK beat")
+    got["beats"] = [n1, n2, n3, state]
+    checks["ALTER TASK SUSPEND stops its ticks, RESUME starts them again"] = n1 > 0 and n2 == n1 and n3 > n2 and state == "suspended"
+    # Refusals.
+    got["refused"] = refused = {
+        "itself": err("CREATE TASK me AFTER me AS SELECT 1"),
+        "a loop": err("CREATE OR REPLACE TASK root AFTER report AS SELECT 1"),
+        "two schedules": err("CREATE TASK both AFTER root, flaky AS SELECT 1"),
+        "missing": err("CREATE TASK lost AFTER nothing AS SELECT 1"),
+        "followed": err("DROP TASK load"),
+        "no task": err("EXECUTE TASK nothing"),
+        "an option": err("CREATE TASK opt SCHEDULE '1 hour' WITH (tries = 2) AS SELECT 1"),
+    }
+    checks["refused by name: a task after itself, a loop, two schedules, a missing task, DROP of a followed one, EXECUTE of none, an unknown option"] = (
+        "follow itself" in refused["itself"] and "follow itself" in refused["a loop"] and "2 different schedules" in refused["two schedules"]
+        and "no task nothing" in refused["missing"] and "runs after load" in refused["followed"] and "no task nothing" in refused["no task"]
+        and "retries, retry_delay" in refused["an option"] and status("root") == "ok")
+    # A graph through a leader failover: the task under way runs again on the new leader, with its job.
+    q("CREATE TABLE flog (task VARCHAR, v BIGINT)")
+    q("CREATE TASK froot SCHEDULE '1 hour' AS SELECT 1")
+    q("CREATE TASK fload AFTER froot AS BEGIN INSERT INTO flog VALUES ('fload', 1); WHILE date_part('epoch', now()) < $until DO $i = 1; END WHILE; RETURN 7; END")
+    q("CREATE TASK freport AFTER fload AS INSERT INTO flog VALUES ('freport', pondra.result('fload'))")
+    q(f"EXECUTE TASK froot (until => {time.time() + 6})", A.port + 1)
+    until(lambda: q("SELECT count(*) AS n FROM flog")[0]["n"], 1, 15)
+    nodes[0].kill()
+    leader = None
+    deadline = time.time() + 60
+    while leader is None and time.time() < deadline:
+        for n in nodes[1:]:
+            try:
+                if call(n.port, "GET", "/stats", timeout=2)["role"] == "leader":
+                    leader = n
+            except Exception:
+                pass
+        time.sleep(0.5)
+    port = leader.port if leader else A.port + 1
+    until(lambda: status("freport", port), "ok", 60)
+    got["failover"] = q("SELECT task, v FROM flog ORDER BY task", port)
+    got["failover runs"] = q("SELECT routine, status FROM pondra.runs WHERE routine IN ('froot', 'fload', 'freport') ORDER BY routine", port)
+    checks["a graph through a leader failover: the task under way runs again on the new leader, each write once, and what follows gets its result"] = (
+        leader is not None and got["failover"] == [{"task": "fload", "v": 1}, {"task": "freport", "v": 7}]
+        and [r["status"] for r in got["failover runs"]] == ["ok", "ok", "ok"])
+    for n in nodes:
+        n.kill()
+    ok = all(checks.values())
+    print(json.dumps({"tasks": checks, "ok": ok, "got": got}, indent=1, default=str))
+    if not ok:
+        sys.exit(1)
+    return f"tasks: graphs, WHEN, results, values, retries, timeouts, on_failure, SUSPEND, refusals, a failover: all {len(checks)} checks pass"
 
 
 def variables():
@@ -6741,7 +6936,7 @@ def all_tests():
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "found", "renames", "workspace", "server", "scale", "flight", "users", "secrets", "safety", "versions", "stopped", "flows", "begin", "doors", "objects", "sparksql", "variables", "scripts", "hot", "minmax", "history", "load", "all"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "found", "renames", "workspace", "server", "scale", "flight", "users", "secrets", "safety", "versions", "stopped", "flows", "begin", "doors", "objects", "sparksql", "variables", "scripts", "tasks", "hot", "minmax", "history", "load", "all"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -6753,7 +6948,7 @@ if __name__ == "__main__":
     ap.add_argument("--flush-ms", type=int, default=250)
     A = ap.parse_args()
     try:
-        {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "safety": safety, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "objects": objects, "sparksql": sparksql, "variables": variables, "scripts": scripts, "hot": hot, "minmax": minmax, "history": history, "load": load, "all": all_tests}[A.mode]()
+        {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "safety": safety, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "objects": objects, "sparksql": sparksql, "variables": variables, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "load": load, "all": all_tests}[A.mode]()
     except BaseException as e:  # a failure ends the run, though threads may still wait on a node (crash's producers retry for ever)
         code = e.code if isinstance(e, SystemExit) else 1
         if not isinstance(e, SystemExit):

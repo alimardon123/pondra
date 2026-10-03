@@ -154,12 +154,24 @@ What differs is only who may set it and how long it lives:
   that is faster (`guard.rs`), a write goes to the leader as it does now. The script's own
   decisions run on the node running it.
 - **Set-based first.** A `FOR` over rows is for lists (tables, days, files), not for row-by-row
-  work: rows are read in batches as the loop goes, never all held.
-- **Parallel branches:** `FOR d IN (…) PARALLEL 8 DO … END FOR` runs up to 8 iterations at once,
-  each a run of its own (its own variables, a row in `pondra.runs`, stoppable); the loop ends when
-  all have, and fails with the first failure's error. `ASYNC <statement>` starts any statement as a
-  run and `AWAIT ALL` (or `AWAIT $id`) waits for them, as Snowflake's. Runs are dealt to the nodes
-  with room, so a backfill of 365 days uses the whole cluster (phase 2).
+  work: its query is answered before the first pass.
+- **Parallel branches:** `FOR d IN (…) PARALLEL 8 DO … END FOR` runs up to 8 passes at once (at
+  most 64: a fan-out is bounded), each with a copy of the script's variables, so what one sets stays
+  its own; once a pass fails no new one starts, and the loop fails with that pass's error after the
+  others end. `ASYNC <statement>` starts any statement (a block too) beside the script, with a copy
+  of the variables, and `AWAIT ALL` waits for every one started, failing with the first failure's
+  error at its line; a script's end waits too. Neither runs inside a transaction. Their passes and
+  statements keep their places in the job, so a retried script writes once (phase 2, built: eight
+  0.3-second Python calls take 0.74 s with `PARALLEL 8`, 2.48 s one at a time).
+- **Waiting for one:** `$h = ASYNC <statement>` puts a handle in `$h`, and `AWAIT $h` waits for that
+  one alone, failing with its error (which `AWAIT ALL` then leaves out). A handle is a text id, as a
+  run's is, so `AWAIT` takes either: `AWAIT 'id'` waits for a procedure or file that `pondra.start`
+  began, from any session or client, reading `pondra.runs` as its node writes it (built).
+- **Dealt to the nodes** (phase 2b, next): passes and `ASYNC` statements sent to the nodes with
+  room, so a backfill of 365 days uses the whole cluster. It needs a node to run statements as the
+  script's caller on another's word (signed with the nodes' key), which is its own change; until
+  then each pass's statements spread as any statement does. A dealt statement is a run of its own,
+  so its handle is that run's id and `AWAIT` needs nothing new.
 - **Exactly once through a retry.** A task's tick that runs again after a failover runs its script
   from the start with the same job; each statement's part is its place in the script and its
   loops' counts (`task:nightly:42:3.2#5`), so a write already made is not made twice.
@@ -194,6 +206,26 @@ ALTER TASK report SUSPEND;  ALTER TASK report RESUME;
 - **No separate schedule objects:** one task holds the schedule and the rest follow it. `CREATE
   SCHEDULE` shared by name can come later without changing anything here.
 
+**Built (phase 3).** As above, with these settled while building it:
+- **A graph has one start.** A task that would follow tasks of two schedules, or itself, is
+  refused, and so is dropping a task others follow. A run of the graph is the first task's tick,
+  and each task's run in it is `task-<name>-<tick>` in `pondra.runs`.
+- **What follows a failure doesn't run.** A failed task (after its `retries`) calls `on_failure`
+  with its name and error, and the tasks after it wait for the next run of the graph. A suspended
+  task, and so what follows it, doesn't run in the graph's runs. `EXECUTE TASK` still runs it.
+- **Results** are kept with the task's last run (`pondra.tasks.last_result`): its `RETURN`, or the
+  first value of its last query. `pondra.result('t')` is put in as that value, and is NULL when
+  `t` gave none in this run.
+- **Values passed down the graph** are `EXECUTE TASK`'s, bound as `$name` in every task, its
+  `WHEN` too. A scheduled run gives none, so a task gives its own default with `DECLARE PARAMETER`
+  at its top. A task that is one `BEGIN … END` block has that block's top as its top, and so does a
+  file that is one block.
+- **`EXECUTE TASK`** claims a tick that the leader's scheduler runs at once. It is refused while
+  the task's last run is still going.
+- **Every pass of a loop yields.** A loop that only read variables never waited, so it held its
+  worker thread: a task's `timeout` never fired, and after a failover the new leader ran it again
+  and lost a thread to it.
+
 ### 6. Built to grow
 
 - **A registry of statements** (`script.rs`): each kind of block or statement is one entry, the
@@ -212,10 +244,11 @@ ALTER TASK report SUSPEND;  ALTER TASK report RESUME;
 
 1. **Scripting**: blocks, branches, loops, handlers, `PRINT`, `RAISE`, `ASSERT`, `RETURN`,
    `CALL … INTO`, `EXECUTE IMMEDIATE`, `IDENTIFIER()`; the scopes of §2; in every door, procedures and tasks; the console's
-   highlighting, folding and Run at the caret taking the whole block.
-2. **Parallel**: `PARALLEL n` loops, `ASYNC` / `AWAIT`, runs dealt to the nodes.
+   highlighting and Run at the caret taking the whole block.
+2. **Parallel**: `PARALLEL n` loops, `ASYNC`, `AWAIT ALL` and `AWAIT $h` or a run's id (built); then
+   passes dealt to the nodes, each a run of its own in `pondra.runs`.
 3. **Task graphs**: `AFTER`, `WHEN`, results, values passed down the graph, `WITH (…)` options, `EXECUTE TASK`, `SUSPEND` and
-   `RESUME`; the console's Tasks view with the graph and the renaming.
+   `RESUME` (built); then the console's Tasks view with the graph and the renaming.
 
 ## Consequences
 

@@ -202,6 +202,8 @@ pub enum Ddl {
     DropSecret { name: String, if_exists: bool },
     CreateTask { name: String, task: crate::runs::Task, replace: bool }, // CREATE TASK … SCHEDULE … AS … (ADR-027: `runs.rs`)
     DropTask { name: String, if_exists: bool },
+    ExecuteTask { name: String, params: std::collections::HashMap<String, Value> }, // EXECUTE TASK name (…): a tick claimed now (ADR-045)
+    AlterTask { name: String, suspended: bool },                  // ALTER TASK name SUSPEND | RESUME
     RunLog, // the run log's table (`pondra.runs`), made when a node first has a line for it
     AuditLog, // the audit log's (`pondra.audit`), the same way (`audit.rs`)
     HistoryLog, // the query history's (`pondra.history`, `history.rs`)
@@ -371,6 +373,8 @@ pub async fn apply(lake: &Lake, d: Ddl) -> Result<Value> {
         Ddl::DropSecret { name, if_exists } => crate::ext::drop(lake, &name, if_exists).await,
         Ddl::CreateTask { name, task, replace } => crate::runs::create_task(lake, &name, task, replace).await,
         Ddl::DropTask { name, if_exists } => crate::runs::drop_task(lake, &name, if_exists).await,
+        Ddl::ExecuteTask { name, params } => crate::runs::execute_task(lake, &name, params).await,
+        Ddl::AlterTask { name, suspended } => crate::runs::alter_task(lake, &name, suspended).await,
         Ddl::RunLog => crate::runs::create_log(lake).await,
         Ddl::AuditLog => crate::audit::create_log(lake).await,
         Ddl::HistoryLog => crate::history::create_log(lake).await,
