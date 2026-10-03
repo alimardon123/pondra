@@ -1,0 +1,87 @@
+# One leg of a soak (tools/soak.py), called by soak.yml: a runner's job lasts 6 hours at most, so a
+# day is legs of a few hours, one after another on one lake in the bucket, each going on from the
+# state the leg before it saved (its artifact, `after`). The last leg checks and removes the lake.
+name: soak leg
+
+on:
+  workflow_call:
+    inputs:
+      plan:
+        description: "soak.yml's plan (JSON: legs, hours, rate, batch, nodes, storage, binary, sha)"
+        type: string
+        required: true
+      leg:
+        type: number
+        required: true
+      after:
+        description: "The leg before's artifact (none for the first)"
+        type: string
+        default: ""
+
+jobs:
+  soak:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355
+    permissions:
+      actions: read # (the build workflow's runs)
+      contents: read
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      AWS_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+      AWS_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT }}
+      AWS_REGION: auto
+      AWS_DEFAULT_REGION: auto
+      AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+      AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+      PONDRA_BUCKET: ${{ secrets.R2_BUCKET }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: The build workflow's binary, for this commit
+        if: fromJSON(inputs.plan).binary == 'ci'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ fromJSON(inputs.plan).sha }}
+        run: |
+          run=$(bash tools/ci_build.sh "$SHA")
+          [ -n "$run" ] || { echo "::error::no passing build run for $SHA: wait for it (a pull request's needs full-ci), or use binary: build"; exit 1; }
+          gh run download "$run" --name pondra-linux-x64 --dir dl && tar -xzf dl/pondra-linux-x64.tar.gz pondra
+      - uses: dtolnay/rust-toolchain@stable
+        if: fromJSON(inputs.plan).binary == 'build'
+      - name: Or build from source
+        if: fromJSON(inputs.plan).binary == 'build'
+        run: cargo build --profile dist && cp target/dist/pondra pondra
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - uses: actions/download-artifact@v7
+        if: inputs.after != ''
+        with:
+          name: ${{ inputs.after }}
+          path: before
+      - name: The soak
+        env:
+          PLAN: ${{ inputs.plan }}
+          LEG: ${{ inputs.leg }}
+        run: |
+          pip install -q $(grep -E '^boto3' tools/requirements.txt | sed 's/ *#.*//')
+          read -r hours rate batch nodes storage legs < <(python3 -c "import json, os; p = json.loads(os.environ['PLAN']); print(min(5.5, float(p['hours'])), p['rate'], p['batch'], p['nodes'], p['storage'], p['legs'])")
+          python3 tools/soak.py --hours "$hours" --rate "$rate" --batch "$batch" --nodes "$nodes" --bin ./pondra \
+            $([ "$storage" = r2 ] && echo --s3) --out soak.json --timeline soak-timeline.jsonl \
+            $([ "$LEG" -gt 1 ] && echo --resume before/soak-state.json) \
+            $([ "$LEG" -lt "$legs" ] && echo --save soak-state.json)
+      - name: The nodes' logs, beside the results
+        if: always()
+        run: mkdir -p logs && cp /tmp/pondra-soak-*/*.log logs/ 2>/dev/null || true
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: soak-${{ inputs.leg }}
+          # (all in the workspace: the next leg finds soak-state.json at the artifact's top)
+          path: |
+            soak.json
+            soak-timeline.jsonl
+            soak-state.json
+            logs/
+          retention-days: 30
+          if-no-files-found: ignore
