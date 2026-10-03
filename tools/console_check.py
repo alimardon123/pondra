@@ -1432,8 +1432,46 @@ def work_checks(browser, port, show):
         clicked == "SELECT  FROM wk" and put_in == f"SELECT {cname} FROM wk" and fdetail is True \
         and {"Table…", "View…", "Materialized view…", "Function…", "Procedure…", "Schedule…"} <= set(made_items) and {"Refresh", "List its tables and views", "Copy the name"} <= set(s_items)
     sql(port, "DROP VIEW wk_values")
+    # History: statements as the node remembers them (pondra.history): this tab's, this page's, all but the
+    # page's own queries; slow or failed; a slow one's plan as it ran (this node: PONDRA_SLOW_MS=300)
+    pg.menu("New SQL file")
+    p.wait_for_function("document.activeElement?.tagName === 'TEXTAREA'")  # (the new file's editor has the keys)
+    ta = p.locator(".filedoc:visible .editor textarea")
+    ta.fill("SELECT sum(value) AS hist_slow FROM range(0, 300000000)")
+    ta.press("Control+Enter")
+    answered = until(lambda: pg.grid(p.locator(".filedoc:visible"))[0], ["hist_slow"], 60)  # (its answer, not the editor's text)
+    ta.fill("SELECT hist_nope FROM wk")
+    ta.press("Control+Enter")
+    if not (p.locator("#runsBtn.on").count()):
+        p.click("#runsBtn")
+    hist = p.locator("#runs .run-item")
+    names = lambda: [("hist_nope" in t, "hist_slow" in t, "slow: its plan kept" in t) for t in hist.all_inner_texts()]
+    this_tab = until(names, [(True, False, False), (False, True, True)], 20)
+    seg = lambda label: p.locator("#runs .hbar .seg", has_text=label).click()
+    seg("All")
+    every = until(lambda: hist.count() > 2 and not any("pondra.history" in t or "pondra.runs" in t for t in hist.all_inner_texts()) and names()[:2], [(True, False, False), (False, True, True)], 10)
+    p.locator("#runs .hbar input[type=checkbox]").check()
+    bad = until(lambda: hist.count() >= 2 and all("\nfailed\n" in t or "slow: its plan kept" in t for t in hist.all_inner_texts()), True, 10)
+    lists = {"tab": this_tab, "all": every, "slow or failed": hist.all_inner_texts()[:4], "answered": answered}
+    planned = as_text = False
+    if hist.filter(has_text="hist_slow").count():
+        hist.filter(has_text="hist_slow").first.click()
+        d = p.locator("dialog.pop[open]")
+        planned = until(lambda: d.locator(".pgraph .pn").count() > 0 and "Aggregate" in d.locator(".pgraph").inner_text(), True, 10)
+        d.locator(".seg", has_text="Text").click()
+        as_text = "output_rows" in d.locator("pre.plan").inner_text()
+        p.keyboard.press("Escape")
+    p.locator("#runs .hbar input[type=checkbox]").uncheck()
+    seg("This tab")
+    tabs.first.click()  # (another tab: none of its statements)
+    other = until(lambda: not any(a or b for a, b, c in names()), True, 10)
+    seg("Runs")
+    runs_shown = until(lambda: p.locator("#runs .hbar .seg.on").inner_text(), "Runs", 5)
+    seg("This tab")
+    checks["History: this tab's statements from pondra.history (newest first, a failed one, a slow one with its plan kept), All without the page's own queries, Slow or failed, the plan as it ran (graph and text), another tab's none, Runs"] = \
+        this_tab == [(True, False, False), (False, True, True)] and every == [(True, False, False), (False, True, True)] and bad is True and planned is True and as_text and other is True and runs_shown == "Runs"
     checks["the owner's second and third lists: no page errors"] = pg.errors == []
-    info = {"tabs": [pinned, over, listed, n, left], "left": left, "items": items, "formatted": [part, whole], "drawn": drawn, "picture": pic, "opened": opened, "kinds": menu_kinds, "meta": meta, "cell": cell_items, "editor": ed_items,
+    info = {"history": [lists, bad, planned, as_text, other, runs_shown], "tabs": [pinned, over, listed, n, left], "left": left, "items": items, "formatted": [part, whole], "drawn": drawn, "picture": pic, "opened": opened, "kinds": menu_kinds, "meta": meta, "cell": cell_items, "editor": ed_items,
             "paged": paged, "table menu": t_items, "scripts": scripts, "python": py[:80], "view menu": v_items, "errors": pg.errors}
     pg.ctx.close()
     return checks, info
@@ -1608,7 +1646,7 @@ def budget_checks(browser, port, show):
             fresh[name] = e.code
     total = sum(sizes.values()) if all(sizes.values()) else None
     later = {}
-    for name in ["chart.js", "plan.js", "more.js", "details.js", "more.css", "data.js", "md.js", "jobs.js", "settings.js", "objects.js", "pyfile.js", "sqlfile.js", "rename.js", "versions.js", "stmts.js", "params.js", "tabs.js", "live.js", "gridmore.js", "groups.js", "upload.js", "access.js", "table.js"]:  # (loaded when first used)
+    for name in ["chart.js", "plan.js", "more.js", "details.js", "more.css", "data.js", "md.js", "jobs.js", "history.js", "settings.js", "objects.js", "pyfile.js", "sqlfile.js", "rename.js", "versions.js", "stmts.js", "params.js", "tabs.js", "live.js", "gridmore.js", "groups.js", "upload.js", "access.js", "table.js"]:  # (loaded when first used)
         r = urllib.request.urlopen(urllib.request.Request(f"{base}/console/{name}", headers={"accept-encoding": "gzip"}))
         later[name] = len(r.read()) if r.headers.get("content-encoding") == "gzip" else None
     checks["the scripts and style sheet the page loads, gzipped as the node serves them: <= 70 KB; each answers 304 when the browser has it"] = total is not None and total <= 70 * 1024 \
@@ -1802,7 +1840,7 @@ def main():
     lake = tempfile.mkdtemp(prefix="pondra-")
     # (the console's settings, kept by the node for its machine: this run's own, never the machine's)
     os.environ["PONDRA_CONFIG_DIR"] = tempfile.mkdtemp(prefix="pondra-config-")
-    node = Node(lake, A.port, env={"PYTHONPATH": os.path.join(HERE, "..", "python")}, python=sys.executable).start()
+    node = Node(lake, A.port, env={"PYTHONPATH": os.path.join(HERE, "..", "python"), "PONDRA_SLOW_MS": "300"}, python=sys.executable).start()
     results, said = {}, {}
     try:
         with sync_playwright() as pw:
