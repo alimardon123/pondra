@@ -377,10 +377,19 @@ impl Sequencer {
         crate::panics::spawn(async move {
             let mut last_seq = HashMap::new(); // producer -> last committed seq (cache of p/ keys)
             let in_flight = Arc::new(tokio::sync::Semaphore::new(COMMITS_IN_FLIGHT));
+            let disk = (!lake.url.contains("://")).then(|| std::path::PathBuf::from(&lake.url)); // (a lake on local disk)
             while let Some(first) = rx.recv().await {
                 let slot = in_flight.clone().acquire_owned().await.expect("never closed");
                 while max_backlog.is_some_and(|m| lake.backlog.load(Ordering::Relaxed) > m) {
                     tokio::time::sleep(Duration::from_millis(20)).await; // backpressure: let tiering catch up
+                }
+                // …and the room the lake's upkeep needs on its disk (`store::short_of_room`).
+                if let Some((free, keep)) = disk.as_deref().and_then(crate::store::short_of_room) {
+                    eprintln!("writes wait: the lake's disk has {} MB free, under the {} MB its upkeep keeps", free >> 20, keep >> 20);
+                    while disk.as_deref().and_then(crate::store::short_of_room).is_some() {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    eprintln!("writes go on: room on the lake's disk again");
                 }
                 // Everything that queued up during the previous commit goes into this one.
                 let mut batch = vec![first];
