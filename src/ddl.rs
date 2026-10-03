@@ -191,7 +191,10 @@ pub enum Ddl {
     DropView { name: String, if_exists: bool },
     Attach { name: String, dir: String },
     Detach { name: String, if_exists: bool },
-    CreateDatabase { name: String, if_not_exists: bool, dir: Option<String> }, // a new lake (beside this one unless `dir`), attached
+    CreateDatabase { name: String, if_not_exists: bool, dir: Option<String>, #[serde(default, skip_serializing_if = "Option::is_none")] clone: Option<crate::branch::CloneOf> }, // a new lake (beside this one unless `dir`), attached; a branch of another (ADR-047)
+    Branch(crate::branch::Make),            // the new lake's leader: make it its base as that is now (ADR-047)
+    Pin { lake: String, ms: Option<u64> },  // a base's leader: keep the files a branch reads
+    Unpin { lake: String },
     DropDatabase { name: String, if_exists: bool }, // a folder of databases' (`dbserver.rs`): its node stopped, its folder deleted (ADR-030)
     AlterColumn { table: String, column: String, change: Change }, // ALTER TABLE … RENAME/DROP/ALTER COLUMN (ADR-022)
     RenameTable { name: String, to: String }, // ALTER TABLE | VIEW … RENAME TO (ADR-030)
@@ -348,7 +351,11 @@ pub async fn apply(lake: &Lake, d: Ddl) -> Result<Value> {
                 false => j!({"attached": name, "dir": dir}),
             })
         }
-        Ddl::CreateDatabase { name, if_not_exists, dir } => {
+        Ddl::CreateDatabase { name, if_not_exists, dir, clone: Some(of) } => crate::branch::create(lake, &name, if_not_exists, dir, of).await,
+        Ddl::Branch(m) => crate::branch::make(lake, m).await,
+        Ddl::Pin { lake: branch, ms } => crate::branch::pin(lake, &branch, ms).await,
+        Ddl::Unpin { lake: branch } => crate::branch::unpin(lake, &branch).await,
+        Ddl::CreateDatabase { name, if_not_exists, dir, clone: None } => {
             check(&name)?;
             let dir = dir.unwrap_or_else(|| beside(&lake.url, &name));
             if has_catalog(&full(&dir)?).await? {
@@ -357,13 +364,37 @@ pub async fn apply(lake: &Lake, d: Ddl) -> Result<Value> {
             Box::pin(apply(lake, Ddl::Attach { name, dir })).await
         }
         Ddl::DropDatabase { name, if_exists } => {
-            let server = std::env::var("PONDRA_SERVER_URL").map_err(|_| anyhow::anyhow!("DROP DATABASE drops one of the databases `pondra serve <folder>` serves, folder and all; on a node serving one lake, DETACH {name} (its folder stays)"))?;
             ensure!(name != lake_name(lake), "this is database {name}: drop it from another one");
-            let r = crate::cluster::http().delete(format!("{server}/databases/{name}?if_exists={if_exists}")).send().await?;
-            let (ok, text) = (r.status().is_success(), r.text().await?);
-            ensure!(ok, "{text}");
+            // (a branch's pins in its bases go with it; a base goes only after its branches: ADR-047)
+            let target = lake.attached.read().unwrap().iter().find(|(n, _)| *n == name).map(|(_, l)| l.clone());
+            let (mut bases, mut branches) = (None, vec![]);
+            if let Some(t) = &target {
+                bases = t.cat.get::<crate::branch::Bases>(crate::branch::BASES).await?;
+                branches = t.cat.scan::<crate::branch::Pin>("pn/", "pn0").await?.into_iter().map(|(_, p)| p.lake).collect();
+            }
+            ensure!(branches.is_empty(), "{name} has branches ({}): drop them first", branches.join(", "));
+            let dropped = match (std::env::var("PONDRA_SERVER_URL"), &bases, &target) {
+                (Ok(server), ..) => {
+                    let r = crate::cluster::http().delete(format!("{server}/databases/{name}?if_exists={if_exists}")).send().await?;
+                    let (ok, text) = (r.status().is_success(), r.text().await?);
+                    ensure!(ok, "{text}");
+                    serde_json::from_str(&text)?
+                }
+                (Err(_), Some(_), Some(t)) => {
+                    // A branch: its own objects alone are its (its bases' files are theirs).
+                    delete_lake(&t.url).await?;
+                    if lake.cat.get::<Attachment>(&attachment_key(&name)).await?.is_some() {
+                        lake.cat.commit(vec![], &[attachment_key(&name)]).await?;
+                    }
+                    j!({"database": name, "dropped": true})
+                }
+                _ => bail!("DROP DATABASE drops a branch (CREATE DATABASE … CLONE) or one of the databases `pondra serve <folder>` serves, folder and all; on a node serving one lake, DETACH {name} (its folder stays)"),
+            };
             lake.attached.write().unwrap().retain(|(n, _)| *n != name); // (its tables are gone from here too)
-            Ok(serde_json::from_str(&text)?)
+            if let Some(b) = bases {
+                crate::branch::release(lake, &b).await;
+            }
+            Ok(dropped)
         }
         Ddl::AlterColumn { table, column, change } => alter_column(lake, &table, &column, change).await,
         Ddl::RenameTable { name, to } => rename(lake, &name, &to).await,
@@ -438,7 +469,24 @@ pub fn full(dir: &str) -> Result<String> {
     })
 }
 
-async fn has_catalog(dir: &str) -> Result<bool> {
+/// Delete a lake no process leads (`DROP DATABASE`): its folder, or every object under its prefix.
+pub async fn delete_lake(dir: &str) -> Result<()> {
+    let store = crate::store::open_store(dir)?.1;
+    if let Some(t) = crate::cluster::latest(&store).await? {
+        ensure!(!crate::cluster::alive(&store, &t).await, "another process leads the lake at {dir} ({}): stop it first", if t.addr.is_empty() { "a pondra sql" } else { &t.addr });
+    }
+    match dir.contains("://") {
+        false => std::fs::remove_dir_all(dir).with_context(|| format!("deleting {dir}"))?,
+        true => {
+            use futures::{StreamExt, TryStreamExt};
+            let listed = store.list(None).map_ok(|o| o.location).boxed();
+            store.delete_stream(listed).try_collect::<Vec<_>>().await.with_context(|| format!("deleting {dir}"))?;
+        }
+    }
+    Ok(())
+}
+
+pub async fn has_catalog(dir: &str) -> Result<bool> {
     if !dir.contains("://") && !std::path::Path::new(dir).exists() {
         return Ok(false);
     }
@@ -472,7 +520,7 @@ pub async fn lakes_in(folder: &str) -> Result<Vec<(String, String)>> {
 }
 
 /// Lake `name` in the folder (or prefix) this lake's is in.
-fn beside(url: &str, name: &str) -> String {
+pub fn beside(url: &str, name: &str) -> String {
     match url.contains("://") {
         true => format!("{}/{name}", url.trim_end_matches('/').rsplit_once('/').map_or(url, |(p, _)| p)),
         false => std::path::Path::new(url).parent().unwrap_or(std::path::Path::new(".")).join(name).to_string_lossy().to_string(),

@@ -698,7 +698,9 @@ pub async fn expire(lake: &Lake, grace_ms: u64) -> Result<()> {
         Some((_, s)) => Some(s.ts_ms),
         None => lake.cat.scan::<Segment>(&seg_key(floor + 1), &seg_key(floor + 1001)).await?.first().map(|(_, s)| s.ts_ms),
     };
-    let files_cutoff = next.map_or(cutoff, |ts| cutoff.min(ts));
+    // Files live when a branch was made stay while its pin does (ADR-047).
+    let pins = crate::branch::pins(lake).await?;
+    let files_cutoff = next.map_or(cutoff, |ts| cutoff.min(ts)).min(pins.map_or(u64::MAX, |p| p.0));
     let mut dead: Vec<String> = segs.iter().filter(|(_, s)| !s.path.is_empty()).map(|(_, s)| s.path.clone()).collect();
     let mut deletes: Vec<String> = segs.iter().map(|(k, _)| k.clone()).collect();
     deletes.extend(segs.iter().filter(|(_, s)| s.path.is_empty()).map(|(k, _)| data_key(k[2..].parse().unwrap_or(0))));
@@ -706,7 +708,8 @@ pub async fn expire(lake: &Lake, grace_ms: u64) -> Result<()> {
     #[derive(serde::Deserialize)]
     struct Kept { at_ms: u64, keep_ms: u64 }
     let now = crate::log::now_ms();
-    deletes.extend(lake.cat.scan::<Kept>("dt/", "dt0").await?.into_iter().filter(|(_, d)| now >= d.at_ms + d.keep_ms).map(|(k, _)| k));
+    // (one dropped since a branch was made stays: the branch may read its files)
+    deletes.extend(lake.cat.scan::<Kept>("dt/", "dt0").await?.into_iter().filter(|(_, d)| now >= d.at_ms + d.keep_ms && pins.is_none_or(|p| d.at_ms < p.0)).map(|(k, _)| k));
     // A folder a clone shares (ADR-043): files there go only by the orphan sweep, which counts
     // every table listing them, never as one table's garbage.
     let mut shared: std::collections::HashSet<String> = tables.iter().flat_map(|(_, m)| m.shares.iter().map(|f| format!("data/{f}/"))).collect();
@@ -763,6 +766,10 @@ async fn collect_orphans(lake: &Lake) -> Result<()> {
         return Ok(());
     }
     SWEPT.lock().unwrap().0 = now;
+    crate::branch::sweep(lake).await?; // (pins of branches gone)
+    // An object that was there when a branch was made may be one of its files (a table dropped
+    // since, purged): it stays while that branch's pin does (ADR-047).
+    let pinned = crate::branch::pins(lake).await?.map_or(0, |p| p.1) as i64;
     use object_store::path::Path;
     let key = |raw: &str| Path::from(raw).to_string(); // (a path as the store lists it: a few characters escaped)
     let mut tables = lake.cat.scan::<TableMeta>("t/", "t0").await?;
@@ -815,7 +822,7 @@ async fn collect_orphans(lake: &Lake) -> Result<()> {
         let objects: Vec<object_store::ObjectMeta> = lake.store.list(Some(&at)).try_collect().await?;
         for o in objects {
             let old = now as i64 - o.last_modified.timestamp_millis() > DAY as i64;
-            if old && !used.has(o.location.as_ref()) && !crate::delta::open_format(o.location.as_ref()) {
+            if old && o.last_modified.timestamp_millis() > pinned && !used.has(o.location.as_ref()) && !crate::delta::open_format(o.location.as_ref()) {
                 let _ = object_store::ObjectStoreExt::delete(&lake.store, &o.location).await; // (by the listed path itself)
             }
         }

@@ -387,6 +387,16 @@ pub fn parse(sql: &str) -> Option<Stmt> {
         let d = Ddl::Clone { name: name(&c[2]), from: name(&c[4]) };
         return Some(Stmt::Ddl(vec![if c.get(1).is_some() { unless(true, &name(&c[2]), "relation", d) } else { d }]));
     }
+    // `CREATE DATABASE b CLONE a [WITH (schemas = (x, y))] [WITH NO DATA]`: a branch of a, copying none
+    // of its files (ADR-047). (The parser takes `CLONE a` alone.)
+    static DB_CLONE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r#"(?is)^\s*CREATE\s+DATABASE\s+(IF\s+NOT\s+EXISTS\s+)?([\w"-]+)\s+(?:LOCATION\s+'((?:[^']|'')*)'\s+)?CLONE\s+([\w"-]+)((?:\s+WITH\s*\(\s*schemas\s*=\s*\([^)]*\)\s*\)|\s+WITH\s+NO\s+DATA)*)\s*;?\s*$"#).expect("a regex"));
+    if let Some(c) = DB_CLONE.captures(first_word(sql)) {
+        static SCHEMAS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?is)schemas\s*=\s*\(([^)]*)\)").expect("a regex"));
+        let tail = c.get(5).map_or("", |m| m.as_str());
+        let schemas = SCHEMAS.captures(tail).map(|s| s[1].split(',').map(|n| name(n.trim())).filter(|n| !n.is_empty()).collect()).unwrap_or_default();
+        let clone = crate::branch::CloneOf { from: name(&c[4]), schemas, data: !regex::Regex::new(r"(?i)WITH\s+NO\s+DATA").expect("a regex").is_match(tail) };
+        return Some(Stmt::Ddl(vec![Ddl::CreateDatabase { name: name(&c[2]), if_not_exists: c.get(1).is_some(), dir: c.get(3).map(|d| d.as_str().replace("''", "'")), clone: Some(clone) }]));
+    }
     // `UNDROP TABLE t` (Snowflake's, Databricks'): the table dropped last under that name, back (ADR-043).
     static UNDROP: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r#"(?is)^\s*UNDROP\s+TABLE\s+([\w."-]+)\s*;?\s*$"#).expect("a regex"));
     if let Some(c) = UNDROP.captures(first_word(sql)) {
@@ -529,7 +539,10 @@ pub fn parse(sql: &str) -> Option<Stmt> {
             ast::Value::SingleQuotedString(dir) | ast::Value::DoubleQuotedString(dir) => Stmt::Ddl(vec![Ddl::Attach { name: ident(&schema_name), dir: dir.clone() }]),
             _ => return None,
         },
-        Statement::CreateDatabase { db_name, if_not_exists, location, .. } => Stmt::Ddl(vec![Ddl::CreateDatabase { name: object(&db_name).to_lowercase(), if_not_exists, dir: location }]),
+        Statement::CreateDatabase { db_name, if_not_exists, location, clone, .. } => {
+            let clone = clone.map(|c| crate::branch::CloneOf { from: object(&c).to_lowercase(), schemas: vec![], data: true });
+            Stmt::Ddl(vec![Ddl::CreateDatabase { name: object(&db_name).to_lowercase(), if_not_exists, dir: location, clone }])
+        }
         Statement::DetachDuckDBDatabase { if_exists, database_alias, .. } => Stmt::Ddl(vec![Ddl::Detach { name: ident(&database_alias), if_exists }]),
         Statement::Merge(m) if crate::change::merge_refused(&m).is_some() => Stmt::Invalid(crate::change::merge_refused(&m).unwrap_or_default()),
         Statement::Merge(m) => Stmt::Merge(Box::new(crate::change::merge_of(&m)?)),
