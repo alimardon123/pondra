@@ -353,6 +353,63 @@ $day       | total
 2026-09-29 | 10.0
 ```
 
+## Scripts
+
+A script can decide: branch, loop, handle an error, and stop. It runs the same from the console, a
+`.sql` file, `POST /sql`, psql and every Postgres driver, MCP, the clients' `db.sql`, a SQL
+procedure and a task. Each statement in it runs as it would on its own, so a query still spreads
+across the nodes and a write still goes to the leader.
+
+| Statement | What it does |
+|---|---|
+| `BEGIN … [EXCEPTION WHEN … THEN …] END` | a block: its `DECLARE`s end with it; handlers catch its errors |
+| `IF … THEN … ELSEIF … ELSE … END IF` | branches (`ELSIF` too) |
+| `CASE [$x] WHEN … THEN … ELSE … END CASE` | branches by value or by condition |
+| `WHILE cond DO … END WHILE` | a loop while the condition holds |
+| `REPEAT … UNTIL cond END REPEAT` · `LOOP … END LOOP` | a loop until the condition holds · until `LEAVE` |
+| `FOR r IN (query) DO … END FOR` | a loop over a query's rows: `$r.column` |
+| `LEAVE [label]` · `ITERATE [label]` | leave a loop or block · go on with the next pass (`label: WHILE …`) |
+| `RETURN [value]` | stop; the value is the script's answer (`result`) |
+| `RAISE 'text %', $x` · `RAISE NOTICE …` · `RAISE` | an error (`P0001`), each `%` a value · a notice · the handled error again |
+| `PRINT value` | a notice: the console's Messages, psql's `NOTICE`, the clients' `notices` |
+| `ASSERT cond [, 'text']` | an error (`P0004`) unless the condition holds |
+| `EXECUTE IMMEDIATE 'sql' [INTO $a, …] [USING x, …]` | SQL built as text; `USING` values bound as `$1`, `$2` |
+| `CALL p(…) INTO $x` | a procedure's or file's answer, its first row, into variables |
+| `IDENTIFIER(value)` | a table's or column's name from a value, in any statement |
+
+- Conditions and values are SQL expressions, `EXISTS (SELECT …)` and subqueries too.
+- A handler names errors by Postgres's codes or names: `'40001'`, `serialization_failure`,
+  `division_by_zero`, `OTHERS`. Inside it, `$error` is the message and `$sqlstate` its code.
+- `BEGIN;` and `BEGIN TRANSACTION` still start a transaction; `BEGIN` followed by a statement
+  starts a block.
+- A script run again with the same job (`?job=…`, a task's tick) writes each statement once, loops
+  included.
+
+```sql
+CREATE TABLE staged (id BIGINT, amount DOUBLE);
+INSERT INTO staged VALUES (1, 10), (2, 20), (3, NULL);
+DECLARE $missing = (SELECT count(*) FROM staged WHERE amount IS NULL);
+IF $missing > 0 THEN
+  PRINT 'filling ' || $missing || ' missing amounts';
+  UPDATE staged SET amount = 0 WHERE amount IS NULL;
+END IF;
+DECLARE $total = 0;
+FOR r IN (SELECT id, amount FROM staged ORDER BY id) DO
+  $total = $total + $r.amount;
+END FOR;
+BEGIN
+  ASSERT $total > 100, 'only ' || $total;
+EXCEPTION WHEN assert_failure THEN
+  PRINT 'checked: ' || $error;
+END;
+SELECT $total AS total;
+```
+
+```text
+total
+30.0
+```
+
 ## Schemas and other lakes
 
 | Statement | Syntax |

@@ -3,7 +3,7 @@
 // and what a `$name` under the pointer is.
 import { h, fill, S, rows, store, moreStyle, sessionOf } from './core.js';
 import { measure, LINE_H } from './editor.js';
-import { statements } from './files.js';
+import { statements } from './sqlfile.js';
 
 await moreStyle(); // (the bar's look: drawn styled)
 

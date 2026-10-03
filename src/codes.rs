@@ -60,6 +60,19 @@ fn by_words(text: &str) -> &'static str {
     }
 }
 
+/// The SQLSTATE of one of Postgres's condition names (a script's `EXCEPTION WHEN unique_violation`).
+pub fn named(name: &str) -> Option<&'static str> {
+    const NAMES: &[(&str, &str)] = &[
+        ("serialization_failure", "40001"), ("check_violation", "23514"), ("not_null_violation", "23502"), ("unique_violation", "23505"),
+        ("insufficient_privilege", "42501"), ("invalid_password", "28P01"), ("syntax_error", "42601"), ("undefined_column", "42703"),
+        ("undefined_function", "42883"), ("undefined_table", "42P01"), ("invalid_schema_name", "3F000"), ("duplicate_table", "42P07"),
+        ("division_by_zero", "22012"), ("numeric_value_out_of_range", "22003"), ("invalid_text_representation", "22P02"),
+        ("query_canceled", "57014"), ("out_of_memory", "53200"), ("too_many_connections", "53300"), ("feature_not_supported", "0A000"),
+        ("read_only_sql_transaction", "25006"), ("raise_exception", "P0001"), ("assert_failure", "P0004"), ("internal_error", "XX000"),
+    ];
+    NAMES.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)).map(|(_, c)| *c)
+}
+
 /// The gRPC status nearest a SQLSTATE (Flight SQL's errors).
 pub fn grpc(code: &str) -> tonic::Code {
     match code {
