@@ -1,6 +1,6 @@
 ---
 title: Functions and procedures
-description: Write your own SQL and Python functions, procedures that do anything, and tasks that run them on a schedule.
+description: Write your own SQL and Python functions, procedures that do anything, and tasks that run them on a schedule or in order.
 sidebar:
   order: 9
 ---
@@ -465,6 +465,51 @@ A schedule is `'5 minutes'`, `'every 30 seconds'`, or cron with an optional time
 ```sql
 DROP TASK refresh;
 DROP TASK nightly;
+```
+
+## Run tasks in order
+
+A task can run **after** other tasks instead of on a schedule of its own. A scheduled task and the
+tasks that follow it form a graph, and each of its ticks is one run of the graph. A task runs once
+everything it follows has ended well in that run, so a failure stops what comes after it.
+
+```sql
+CREATE TABLE order_counts (day DATE, orders BIGINT);
+CREATE TASK count_orders SCHEDULE 'cron 0 2 * * * UTC' AS SELECT count(*) FROM orders;
+CREATE TASK load_counts AFTER count_orders
+  WHEN pondra.result('count_orders') > 0
+  WITH (retries = 2, retry_delay = '1 minute', timeout = '1 hour')
+AS BEGIN
+  DECLARE PARAMETER $day DATE = current_date - 1;
+  INSERT INTO order_counts VALUES ($day, pondra.result('count_orders'));
+  RETURN (SELECT count(*) FROM order_counts);
+END;
+CREATE TASK report AFTER load_counts AS PRINT 'days loaded: ' || pondra.result('load_counts');
+EXECUTE TASK count_orders (day => DATE '2026-09-29');
+```
+
+- `WHEN` is checked first. When it's false the task is `skipped`, and what follows it still runs.
+- `pondra.result('t')` is what task `t` answered in this run of the graph: its `RETURN`, or the
+  first value of its last query. It is NULL if `t` gave nothing.
+- `EXECUTE TASK` runs a graph now, from its first task, with values for its tasks' `$name`s. A
+  scheduled run gives none, so a task gives its own default with `DECLARE PARAMETER`. It is
+  refused while that task's last run is still going.
+- `retries` runs a failed task again with the same job, so what a try wrote lands once, and
+  `retry_delay` waits between tries (10 seconds by default). `timeout` fails a try that runs longer.
+  `on_failure` names a procedure that is called with the task's name and its error once it has
+  failed for good.
+- `ALTER TASK t SUSPEND` stops a task until `ALTER TASK t RESUME`: it has no ticks of its own, and
+  in a graph neither it nor what follows it runs. `EXECUTE TASK` still runs it.
+
+`pondra.tasks` shows each task's schedule or what it follows, its state, and its last run's status
+and result. Each run is a row of `pondra.runs` whose id is `task-<name>-<tick>`, the same for every
+task in one run of a graph. A task others follow is dropped after them.
+
+```sql
+SELECT name, after, state, last_status, last_result FROM pondra.tasks;
+DROP TASK report;
+DROP TASK load_counts;
+DROP TASK count_orders;
 ```
 
 ## See what ran

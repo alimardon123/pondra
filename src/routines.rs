@@ -133,10 +133,23 @@ pub fn of_macro(args: &Option<Vec<ast::MacroArg>>, def: &ast::MacroDefinition) -
 /// wrong, and why.
 pub fn statement(sql: &str) -> Option<Stmt> {
     let head = crate::write::first_word(sql).get(..6)?.to_lowercase();
-    if head != "create" && !head.starts_with("drop") {
+    if head != "create" && !head.starts_with("drop") && !head.starts_with("alter") {
         return None;
     }
     let mut p = Parser::new(&GenericDialect {}).try_with_sql(sql).ok()?;
+    if p.parse_keywords(&[Keyword::ALTER, Keyword::TASK]) {
+        // `ALTER TASK name SUSPEND | RESUME` (ADR-045)
+        let name = p.parse_object_name(false).ok()?;
+        let suspended = match () {
+            _ if word(&mut p, "suspend") => true,
+            _ if word(&mut p, "resume") => false,
+            _ => return Some(Stmt::Invalid("ALTER TASK name SUSPEND | RESUME".into())),
+        };
+        return Some(Stmt::Ddl(vec![Ddl::AlterTask { name: object(&name), suspended }]));
+    }
+    if head.starts_with("alter") {
+        return None;
+    }
     if p.parse_keyword(Keyword::DROP) {
         let task = p.parse_keyword(Keyword::TASK);
         if !task && !p.parse_keyword(Keyword::MACRO) {
@@ -158,7 +171,7 @@ pub fn statement(sql: &str) -> Option<Stmt> {
         return Some(Stmt::Invalid("CREATE OR REPLACE … IF NOT EXISTS: one or the other".into()));
     }
     Some(match what {
-        Keyword::TASK => crate::runs::task(&mut p).map_or_else(|e| Stmt::Invalid(format!("CREATE TASK: {e:#} ({})", crate::runs::USAGE)), |(name, task)| Stmt::Ddl(vec![crate::write::unless(quiet, &name, "task", Ddl::CreateTask { name: name.clone(), task, replace })])),
+        Keyword::TASK => crate::runs::task(&mut p, sql).map_or_else(|e| Stmt::Invalid(format!("CREATE TASK: {e:#} ({})", crate::runs::USAGE)), |(name, task)| Stmt::Ddl(vec![crate::write::unless(quiet, &name, "task", Ddl::CreateTask { name: name.clone(), task, replace })])),
         k => {
             let procedure = k == Keyword::PROCEDURE;
             let usage = match procedure {
@@ -506,8 +519,8 @@ pub fn bind_named(sql: &str, params: &HashMap<String, Value>) -> Result<String> 
 
 fn bind_as(sql: &str, params: &HashMap<String, Value>, numbered: bool) -> Result<String> {
     let getvariable = crate::vars::calls_getvariable(sql);
-    if !sql.contains('$') && !getvariable {
-        return Ok(sql.to_string());
+    if !sql.contains('$') && !getvariable || crate::runs::creates_task(sql) {
+        return Ok(sql.to_string()); // (a task's `$day`: its graph's value, each time it runs)
     }
     let sql = &crate::sparksql::inline(sql)?; // (a parameter of Spark SQL's is in its text: bound once it is Pondra's)
     let sql = &crate::past::syntax(sql); // (`t AT (VERSION => $v)`)
@@ -1245,6 +1258,9 @@ async fn one_of(app: &App, sql: &str, who: Who, job: Option<String>) -> Result<O
         let none = RecordBatch::try_new_with_options(Arc::new(datafusion::arrow::datatypes::Schema::empty()), vec![], &datafusion::arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(1)))?;
         return Box::pin(run(app, "do".into(), r, none, who, job, None)).await;
     }
+    if let Some((name, args)) = crate::runs::execute_of(sql) {
+        return Box::pin(crate::runs::execute(app, name, args, who)).await; // (EXECUTE TASK: a tick now, ADR-045)
+    }
     if crate::settings::is(sql) {
         // SET, RESET, PREPARE, EXECUTE, DEALLOCATE: the session's (round 31)
         return match Box::pin(crate::settings::statement(&app.lake, sql)).await? {
@@ -1324,7 +1340,7 @@ pub fn start_of(sql: &str) -> Option<(String, Vec<FunctionArg>, String)> {
 }
 
 /// Does `sql` run a procedure (`CALL`, `pondra.start`)? Then it goes to `one`, not to a query.
-pub fn runs_procedure(sql: &str) -> bool { call_of(sql).is_some() || start_of(sql).is_some() || do_of(sql).is_some() || crate::script::is(sql) }
+pub fn runs_procedure(sql: &str) -> bool { call_of(sql).is_some() || start_of(sql).is_some() || do_of(sql).is_some() || crate::script::is(sql) || crate::runs::execute_of(sql).is_some() }
 
 /// `DO LANGUAGE python $$ … $$` (Postgres's anonymous code block; the language may come after
 /// the code): (language, body). What a console's Python cell sends (ADR-030).

@@ -413,6 +413,13 @@ pub struct Param {
 
 /// A SQL file's parameters, in the order it declares or first uses them.
 pub fn parameters(text: &str) -> Vec<Param> {
+    match &crate::routines::split(text)[..] {
+        [one] => params_of(crate::script::inside(one).unwrap_or(text)), // (a file that is one block: its top is the file's)
+        _ => params_of(text),
+    }
+}
+
+fn params_of(text: &str) -> Vec<Param> {
     static NAMED: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?m)^\s*--\s*\$([A-Za-z_]\w*)\s*[:—–-]\s*(.+?)\s*$").expect("a regex"));
     let (mut out, mut set): (Vec<Param>, Vec<String>) = (vec![], vec![]);
     let all = crate::routines::split(text);
@@ -519,4 +526,14 @@ fn rows(all: &[Param]) -> String {
     let values = each.iter().map(|p| format!("({}, {}, {}, {}, {})", s(&Some(p.name.clone())), s(&p.ty), s(&p.default), p.required, s(&p.description))).collect::<Vec<_>>().join(", ");
     let only = if all.is_empty() { " WHERE false" } else { "" };
     format!("(SELECT * FROM (VALUES {values}) AS parameters(name, type, \"default\", required, description){only})")
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_file_of_one_block() {
+        let p = super::parameters("BEGIN\n  DECLARE PARAMETER $day DATE = DATE '2026-09-01';\n  DECLARE $n = 1;\n  SELECT $day, $n, $region;\nEND;");
+        let named: Vec<_> = p.iter().map(|p| (p.name.as_str(), p.default.as_deref(), p.required)).collect();
+        assert_eq!(named, [("day", Some("DATE '2026-09-01'"), false), ("region", None, true)]);
+    }
 }

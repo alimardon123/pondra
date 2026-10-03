@@ -82,12 +82,14 @@ fn tokens(text: &str) -> Vec<Tok> {
 
 /// What a piece of a script (the text between two `;`s) does to how deep in blocks it is: one more
 /// for each block it opens, one less for each `END`. A block's word opens one only where a statement
-/// starts (the piece's start, after `THEN`, `ELSE`, `DO`, `LOOP`, `REPEAT`, `BEGIN`, `ASYNC` or a label), so
+/// starts (the piece's start, after `THEN`, `ELSE`, `DO`, `LOOP`, `REPEAT`, `BEGIN`, `ASYNC`, a label,
+/// or a task's `AS`), so
 /// `DROP TABLE IF EXISTS` opens nothing; `CASE` always does, as an expression's ends with `END` too;
 /// `BEGIN;` and `BEGIN TRANSACTION` are a transaction's.
 pub fn depth(piece: &str) -> i32 {
     let t = tokens(piece);
     let word = |i: usize| t.get(i).filter(|x| x.k == K::Word).map(|x| piece[x.at..x.end].to_ascii_lowercase());
+    let task = word(0).as_deref() == Some("create") && [1, 3].iter().any(|&i| word(i).as_deref() == Some("task")); // (`CREATE TASK … AS BEGIN …`)
     let mut d = 0;
     for i in 0..t.len() {
         let Some(w) = word(i) else { continue };
@@ -99,7 +101,7 @@ pub fn depth(piece: &str) -> i32 {
         if before.as_deref() == Some("end") {
             continue; // (END IF)
         }
-        let starts = i == 0 || matches!(before.as_deref(), Some("then" | "else" | "do" | "loop" | "repeat" | "begin" | "async")) || labelled(&t, i);
+        let starts = i == 0 || matches!(before.as_deref(), Some("then" | "else" | "do" | "loop" | "repeat" | "begin" | "async")) || labelled(&t, i) || task && before.as_deref() == Some("as");
         d += match w.as_str() {
             "case" => 1,
             "begin" => (starts && opens(piece, &t, i)) as i32,
@@ -130,6 +132,16 @@ fn called(text: &str, t: &[Tok], i: usize) -> bool {
 
 /// Is the word at `i` after a label (`outer: WHILE …`), not a cast (`x::int`)?
 fn labelled(t: &[Tok], i: usize) -> bool { i >= 2 && t[i - 1].k == K::Colon && t[i - 2].k == K::Word && (i < 3 || t[i - 3].k != K::Colon) }
+
+/// A statement that is one block (`BEGIN … END`, no label or handlers): what is inside it, whose
+/// top is the script's (`vars::parameters` reads a file of one block's `DECLARE PARAMETER`s there).
+pub fn inside(text: &str) -> Option<&str> {
+    let t = tokens(text);
+    let word = |x: &Tok| (x.k == K::Word).then(|| text[x.at..x.end].to_ascii_lowercase());
+    let last = t.len().checked_sub(if t.last()?.k == K::Semi { 2 } else { 1 })?;
+    let blocks = t.first().and_then(word).as_deref() == Some("begin") && opens(text, &t, 0) && word(&t[last]).as_deref() == Some("end");
+    (blocks && last > 0 && t[last - 1].k == K::Semi && !t.iter().any(|x| word(x).as_deref() == Some("exception"))).then(|| &text[t[0].end..t[last].at])
+}
 
 /// Does the `BEGIN` at `i` open a block (`BEGIN` then a statement), not a transaction?
 fn opens(text: &str, t: &[Tok], i: usize) -> bool {
@@ -302,7 +314,16 @@ impl<'a> Reader<'a> {
             self.i = from;
         }
         ensure!(label.is_none(), "line {}: a label names a block or a loop", self.line(self.at()));
-        Ok(Box::new(Plain(self.rest())))
+        // (a statement holding a block, as `CREATE TASK … AS BEGIN … END` does: to the block's end)
+        let from = self.at();
+        let mut d = depth(&self.until(&[]));
+        while d > 0 && self.t.get(self.i).is_some_and(|x| x.k == K::Semi) {
+            self.i += 1;
+            d += depth(&self.until(&[]));
+        }
+        let s = self.text[from..self.at()].trim().to_string();
+        self.eat_semi();
+        Ok(Box::new(Plain(s)))
     }
     fn expr(&mut self, stop: &[&str], what: &str) -> Result<String> {
         let line = self.line(self.at());
@@ -367,6 +388,10 @@ pub struct Runner<'a> {
     blocks: Vec<Vec<(String, Option<crate::vars::Var>)>>,
     /// How deep in blocks and loops (a `DECLARE PARAMETER` only at the top).
     nested: usize,
+    /// The script is one statement, and a block that is all of it is in force: its top is the
+    /// script's (`CREATE TASK … AS BEGIN DECLARE PARAMETER …; … END`).
+    sole: bool,
+    whole: bool,
     /// A loop's row variables in force (`$r.col`).
     rows: Vec<String>,
     /// The errors handlers are handling (`RAISE;` raises the last again).
@@ -419,7 +444,7 @@ pub async fn run(app: &App, sql: &str, views: &HashMap<String, String>, who: Who
     let steps = parse(sql)?;
     let one = steps.len() == 1;
     let go = async {
-        let mut r = Runner { app, who, job, views, blocks: vec![], nested: 0, rows: vec![], caught: vec![], at: 0, last: Outcome::Done(serde_json::json!({})), started: Default::default() };
+        let mut r = Runner { app, who, job, views, blocks: vec![], nested: 0, sole: one, whole: false, rows: vec![], caught: vec![], at: 0, last: Outcome::Done(serde_json::json!({})), started: Default::default() };
         for (i, (at, s)) in steps.iter().enumerate() {
             r.at = *at;
             let path = if one { String::new() } else { i.to_string() };
@@ -544,7 +569,7 @@ impl<'a> Runner<'a> {
     /// and job, the loops' rows in force, nothing else.
     fn child(&self) -> Runner<'a> {
         let (blocks, caught, last) = (vec![], self.caught.clone(), Outcome::Done(serde_json::json!({})));
-        Runner { app: self.app, who: self.who, job: self.job.clone(), views: self.views, blocks, nested: self.nested + 1, rows: self.rows.clone(), caught, at: self.at, last, started: Default::default() }
+        Runner { app: self.app, who: self.who, job: self.job.clone(), views: self.views, blocks, nested: self.nested + 1, sole: false, whole: false, rows: self.rows.clone(), caught, at: self.at, last, started: Default::default() }
     }
 
     /// `FOR … PARALLEL n`: up to `n` passes at once, each with a copy of the variables (what it sets
@@ -681,7 +706,7 @@ impl<'a> Runner<'a> {
         let job = self.job.as_ref().map(|j| if path.is_empty() { j.clone() } else { format!("{j}:{path}") });
         let s = match crate::vars::change(&s) {
             Some(crate::vars::Change::Declare { name, parameter, .. }) if self.nested > 0 => {
-                ensure!(!parameter, "DECLARE PARAMETER ${name}: a script's parameters are declared at its top, not in a block or a loop");
+                ensure!(!parameter || (self.whole && self.nested == 1), "DECLARE PARAMETER ${name}: a script's parameters are declared at its top, not in a block or a loop");
                 self.keep(&name);
                 s
             }
@@ -702,6 +727,9 @@ impl<'a> Runner<'a> {
     /// A loop's body, run as its pass says: `Some(flow)` ends the loop with that flow.
     async fn pass(&mut self, body: &Steps, path: &str, n: usize, label: &Option<String>) -> Result<Option<Flow>> {
         let ours = |l: &Option<String>| l.is_none() || l == label;
+        // A pass that reads only variables never waits, so a loop would hold its thread for good:
+        // nothing else would run there, and a task's timeout, or a caller gone, would never stop it.
+        tokio::task::yield_now().await;
         Ok(match self.scoped(body, &format!("{path}#{n}")).await? {
             Flow::Next => None,
             Flow::Iterate(l) if ours(&l) => None,
@@ -761,8 +789,10 @@ impl Step for Block {
     fn run<'a>(&'a self, r: &'a mut Runner<'_>, at: usize, path: String) -> BoxFuture<'a, Result<Flow>> {
         Box::pin(async move {
             r.blocks.push(vec![]);
+            let whole = std::mem::replace(&mut r.whole, r.sole && r.nested == 0);
             r.nested += 1;
             let out = r.list(&self.body, &path).await;
+            r.whole = whole;
             let out = match out {
                 Err(e) => match self.handlers.iter().find(|(w, _)| catches(w, crate::codes::of(&e))) {
                     Some((_, handler)) => {
@@ -1299,6 +1329,13 @@ mod tests {
         assert_eq!(split("outer: WHILE true DO LEAVE outer; END WHILE outer; SELECT x::int FROM t").len(), 2);
         assert_eq!(split("FOR r IN (SELECT 1 AS a) DO PRINT $r.a; END FOR; SELECT repeat('a', 2)").len(), 2);
         assert_eq!(split("FOR r IN (SELECT 1 AS a) PARALLEL 4 DO SELECT 1; END FOR; ASYNC BEGIN SELECT 1; SELECT 2; END; AWAIT ALL").len(), 3);
+        assert_eq!(split("CREATE TASK t AFTER a AS BEGIN INSERT INTO x VALUES (1); RETURN 2; END; EXECUTE TASK a (day => 1)").len(), 2);
+        assert_eq!(split("CREATE OR REPLACE TASK t SCHEDULE '1 hour' AS SELECT 1; SELECT 2").len(), 2); // (AS with no block)
+        assert!(parse("CREATE TASK t AFTER a AS BEGIN SELECT 1; SELECT 2; END").is_ok_and(|s| s.len() == 1));
+        assert_eq!(inside("-- a day's load\nBEGIN DECLARE PARAMETER $d DATE; SELECT $d; END;"), Some(" DECLARE PARAMETER $d DATE; SELECT $d; "));
+        assert_eq!(inside("BEGIN; SELECT 1; END"), None); // (a transaction)
+        assert_eq!(inside("BEGIN SELECT 1; EXCEPTION WHEN OTHERS THEN SELECT 2; END"), None);
+        assert_eq!(inside("BEGIN IF a THEN SELECT 1; END IF"), None);
         let (done, rest) = crate::routines::statements("IF a THEN SELECT 1;");
         assert!(done.is_empty() && rest.contains("IF a")); // (the shell waits for END IF)
     }
