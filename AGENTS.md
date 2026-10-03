@@ -502,7 +502,9 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    `query::table_view(.., Some(upto))`): every node reads the very same rows of a small or keyed
    table, waiting (10 s) for its log to reach `upto`. Reading each node's own catalog let two
    nodes see a commit apart. Plan shapes don't count `CoalescePartitionsExec` (`shape`): whether a
-   table's partitions are gathered depends on what `hot.rs` holds decoded, not on the query.
+   table's partitions are gathered depends on what `hot.rs` holds decoded, not on the query; nor an
+   aggregate's `ordering_mode`, which follows from the orders a node's reading of a table gives it
+   (TPC-DS q66 and q75 fell back to one node).
 35. **A scalar subquery is answered before anything that uses it runs** (`spmd::hoist`): a shuffle
    takes the `ScalarSubqueryExec`s out of the plan, and `step()` fills their shared answer slots
    as soon as the exchanges they read are done — on every node, from the same all-gathered rows.
