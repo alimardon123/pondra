@@ -64,6 +64,7 @@ mod skew;
 mod replica;
 mod routines;
 mod scan;
+mod script;
 mod server;
 mod service;
 mod spill;

@@ -6208,12 +6208,159 @@ def sparksql():
 
 
 
+def scripts():
+    """Scripts that decide (ADR-045, phase 1): blocks with handlers, IF / ELSEIF / CASE, WHILE,
+    REPEAT, LOOP and FOR over a query's rows (`$r.col`), LEAVE and ITERATE by label, RETURN, RAISE
+    (P0001), PRINT and RAISE NOTICE as notices, ASSERT (P0004), EXECUTE IMMEDIATE … INTO … USING,
+    CALL … INTO and IDENTIFIER(), from HTTP, Python, Postgres (simple and extended protocol) and in
+    procedures; a block's DECLAREs its own; a script run again with its job writes once; a file's
+    parameters leave out what its blocks bind."""
+    import psycopg
+    lake = new_lake()
+    here = os.path.dirname(os.path.abspath(__file__))
+    pg = A.port + 10
+    node = Node(lake, A.port, pg=f"127.0.0.1:{pg}", env={"PYTHONPATH": os.path.join(here, "..", "python")}).start()
+    h = {"x-pondra-session": "harness-scripts"}
+    q = lambda s, hh=h, path="/sql": call(A.port, "POST", path, s.encode(), headers=hh)
+    db = _client(A.port)
+    def said(script):
+        out = db.sql(script)
+        return list(db.notices), (out.rows() if hasattr(out, "rows") else out)
+    checks, info, got = {}, {}, {}
+    q("CREATE TABLE orders (id BIGINT, day DATE, amount DOUBLE)")
+    q("INSERT INTO orders VALUES (1, DATE '2026-09-29', 10), (2, DATE '2026-09-30', 20), (3, DATE '2026-09-30', 5)")
+    # Branches, and what a script says.
+    branch = """DECLARE $n = (SELECT count(*) FROM orders WHERE day = DATE '2026-09-30');
+IF $n = 0 THEN
+  PRINT 'nothing';
+ELSEIF $n > 1 THEN
+  PRINT 'many: ' || $n;
+  RAISE NOTICE 'checked % of %', $n, (SELECT count(*) FROM orders);
+ELSE
+  PRINT 'one';
+END IF;
+CASE $n WHEN 1 THEN PRINT 'case one'; WHEN 2 THEN PRINT 'case two'; ELSE PRINT 'case else'; END CASE;
+IF EXISTS (SELECT 1 FROM orders WHERE amount > 15) THEN PRINT 'big'; END IF;
+SELECT $n AS n"""
+    got["branch"] = said(branch)
+    checks["IF … ELSEIF … ELSE and CASE take the branch their conditions say (a subquery too); PRINT and RAISE NOTICE are notices; the last statement answers"] = \
+        got["branch"] == (["many: 2", "checked 2 of 3", "case two", "big"], [{"n": 2}])
+    # Loops.
+    loops = """DECLARE $i = 0; DECLARE $odd = 0;
+outer: WHILE $i < 10 DO
+  $i = $i + 1;
+  IF $i % 2 = 0 THEN ITERATE outer; END IF;
+  IF $i > 7 THEN LEAVE outer; END IF;
+  $odd = $odd + $i;
+END WHILE outer;
+DECLARE $r = 0;
+REPEAT $r = $r + 5; UNTIL $r >= 12 END REPEAT;
+DECLARE $l = 0;
+LOOP $l = $l + 1; IF $l = 3 THEN LEAVE; END IF; END LOOP;
+DECLARE $sum = 0;
+FOR o IN (SELECT id, amount FROM orders ORDER BY id) DO
+  $sum = $sum + $o.amount * $o.id;
+END FOR;
+SELECT $i AS i, $odd AS odd, $r AS r, $l AS l, $sum AS sum"""
+    got["loops"] = said(loops)
+    checks["WHILE with ITERATE and LEAVE by label, REPEAT … UNTIL, LOOP … LEAVE, FOR over a query's rows ($o.amount)"] = \
+        got["loops"][1] == [{"i": 9, "odd": 16, "r": 15, "l": 3, "sum": 65.0}]
+    # Handlers, errors and their codes.
+    handled = """BEGIN
+  SELECT 1 / 0;
+  PRINT 'not here';
+EXCEPTION
+  WHEN unique_violation THEN PRINT 'wrong one';
+  WHEN division_by_zero THEN PRINT 'caught ' || $sqlstate;
+END;
+BEGIN
+  RAISE 'too many rows for %: %', DATE '2026-09-30', 2;
+EXCEPTION WHEN OTHERS THEN PRINT $sqlstate || ' ' || $error;
+END;
+SELECT getvariable('error') IS NULL AS gone"""
+    got["handled"] = said(handled)
+    checks["EXCEPTION WHEN takes the error its name or code says ($sqlstate, $error); RAISE formats with %; a handler's variables end with it"] = \
+        got["handled"] == (["caught 22012", "P0001 too many rows for 2026-09-30: 2"], [{"gone": True}])
+    reraised = _raises_text(lambda: q("BEGIN SELECT 1 / 0; EXCEPTION WHEN OTHERS THEN PRINT 'x'; RAISE; END"))
+    asserted = _raises_text(lambda: q("ASSERT (SELECT count(*) FROM orders) = 4, 'orders: ' || (SELECT count(*) FROM orders)"))
+    unclosed = _raises_text(lambda: q("IF true THEN SELECT 1;"))
+    where = _raises_text(lambda: q("SELECT 1;\nIF true THEN\n  SELECT nope FROM orders;\nEND IF"))
+    info["errors"] = {"reraised": reraised, "asserted": asserted, "unclosed": unclosed, "where": where}
+    checks["RAISE; in a handler raises its error again; ASSERT fails with its text; a block not closed and an error inside one say where"] = \
+        "Divide by zero" in reraised and "orders: 3" in asserted and "isn't closed" in unclosed and "statement 2" in where and "line 3" in where
+    # Scopes.
+    got["scopes"] = said("DECLARE $x = 1; BEGIN DECLARE $x = 2; PRINT $x; $x = 3; PRINT $x; END; PRINT $x; FOR r IN (SELECT 7 AS v) DO PRINT $r.v; END FOR")
+    refused = _raises_text(lambda: q("BEGIN DECLARE PARAMETER $p = 1; END"))
+    checks["a block's DECLARE is its own (the outer one back after it); a DECLARE PARAMETER inside a block is refused"] = \
+        got["scopes"][0] == ["2", "3", "1", "7"] and "declared at its top" in refused
+    # RETURN, dynamic SQL, names from values, CALL … INTO.
+    got["return"] = said("DECLARE $n = 41; IF $n > 40 THEN RETURN $n + 1; END IF; PRINT 'not here'")
+    q("CREATE PROCEDURE total(d DATE) LANGUAGE sql AS $$ SELECT sum(amount) AS t FROM orders WHERE day = $d $$")
+    q("""CREATE PROCEDURE count_to(n BIGINT) LANGUAGE sql AS $$ DECLARE $i = 0; WHILE $i < $n DO $i = $i + 1; END WHILE; RETURN $i * 10; $$""")
+    dynamic = """DECLARE $big = 0;
+EXECUTE IMMEDIATE 'SELECT count(*) FROM orders WHERE amount > $1 AND day = $2' INTO $big USING 6, DATE '2026-09-30';
+FOR t IN (SELECT 'a' AS name UNION ALL SELECT 'b' AS name ORDER BY name) DO
+  EXECUTE IMMEDIATE 'CREATE TABLE IF NOT EXISTS ' || 'made_' || $t.name || ' (x BIGINT)';
+  INSERT INTO IDENTIFIER('made_' || $t.name) VALUES (1);
+END FOR;
+CALL total(DATE '2026-09-30') INTO $t;
+CALL count_to(4) INTO $c;
+SELECT $big AS big, $t AS t, $c AS c, (SELECT count(*) FROM made_a) + (SELECT count(*) FROM made_b) AS made"""
+    got["dynamic"] = said(dynamic)
+    checks["RETURN ends the script with its value; EXECUTE IMMEDIATE … INTO … USING; IDENTIFIER() names a table; CALL … INTO (a procedure that loops and returns)"] = \
+        got["return"] == ([], [{"result": 42}]) and got["dynamic"][1] == [{"big": 1, "t": 25.0, "c": 40, "made": 2}]
+    # Exactly once: the same job, run again.
+    q("CREATE TABLE ticks (n BIGINT)")
+    tick = "DECLARE $i = 0; WHILE $i < 3 DO $i = $i + 1; INSERT INTO ticks VALUES ($i); END WHILE"
+    q(tick, path="/sql?job=harness-ticks")
+    q(tick, path="/sql?job=harness-ticks")
+    got["ticks"] = q("SELECT count(*) AS n, sum(n) AS s FROM ticks")
+    checks["a script run again with its job writes once (each statement's part its place and its loop's pass)"] = got["ticks"] == [{"n": 3, "s": 6}]
+    # Postgres: the simple protocol splits a script by its blocks; the extended one takes a block whole.
+    heard = []
+    with psycopg.connect(f"host=127.0.0.1 port={pg} user=pondra dbname=pondra", autocommit=True, cursor_factory=psycopg.ClientCursor) as c:
+        c.add_notice_handler(lambda d: heard.append(d.message_primary))
+        cur = c.execute("DECLARE $k = 2; IF $k = 2 THEN PRINT 'simple ' || $k; END IF; SELECT $k AS k")
+        simple = []
+        while True:
+            simple += cur.fetchall() if cur.description else []
+            if not cur.nextset():
+                break
+    with psycopg.connect(f"host=127.0.0.1 port={pg} user=pondra dbname=pondra", autocommit=True) as c:
+        c.add_notice_handler(lambda d: heard.append(d.message_primary))
+        c.execute("BEGIN PRINT 'extended ' || %s; END", ("too",))
+        try:
+            c.execute("RAISE 'refused %', 1")
+            code = None
+        except psycopg.Error as e:
+            code = e.sqlstate
+    info["postgres"] = {"simple": simple, "heard": heard, "code": code}
+    checks["over Postgres: a script with blocks (simple protocol), a block alone (extended), notices as NOTICE, RAISE as P0001"] = \
+        simple == [(2,)] and heard == ["simple 2", "extended too"] and code == "P0001"
+    # A file's parameters: what its blocks bind isn't one.
+    call(A.port, "PUT", "/files/etl/loop.sql", b"DECLARE PARAMETER $limit BIGINT = 2;\nFOR o IN (SELECT id FROM orders) DO\n  IF $o.id > $limit THEN PRINT $o.id; END IF;\nEND FOR;\nBEGIN SELECT 1; EXCEPTION WHEN OTHERS THEN PRINT $error; END;\nCALL total($day) INTO $t;\n")
+    got["parameters"] = q("SELECT name, required FROM pondra.parameters('etl/loop.sql')")
+    checks["a file's parameters leave out a loop's row, a handler's $error and INTO's names ($day, used unset, still one)"] = \
+        got["parameters"] == [{"name": "limit", "required": False}, {"name": "day", "required": True}]
+    # What deciding costs: a loop that reads only variables.
+    t0 = time.time()
+    q("DECLARE $i = 0; WHILE $i < 200 DO $i = $i + 1; END WHILE", {})
+    info["per pass ms"] = round((time.time() - t0) * 1000 / 200, 3)
+    info["got"] = got
+    node.kill()
+    ok = all(checks.values())
+    print(json.dumps({"scripts": checks, "ok": ok, "info": info}, indent=1, default=str))
+    if not ok:
+        sys.exit(1)
+    return f"scripts: blocks, branches, loops, handlers, RETURN, dynamic SQL, from HTTP, Python and Postgres: all {len(checks)} checks pass"
+
+
 def variables():
     """SQL variables (round 31): `DECLARE $day DATE = …` declares one (type and default optional),
     `$day = …` changes it, and every `$day` after is its value, bound, from every door (HTTP with a
     session, Postgres, Python's `db.vars`); DuckDB's `SET VARIABLE`, `getvariable` and `RESET
     VARIABLE` are the same. A file's `DECLARE PARAMETER`s are its parameters (`pondra.parameters(…)`,
-    ADR-043): a run's given values replace their defaults, cast to their types; a plain `DECLARE` is
+    ADR-044): a run's given values replace their defaults, cast to their types; a plain `DECLARE` is
     the file's own, and a value given for it is refused; a `.py` file's are its `# %%
     tags=["parameters"]` cell's. Procedures and file runs have variables of their own; `SET` stays
     the settings'."""
@@ -6488,7 +6635,7 @@ finally {{ await db.close?.(); }}"""
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    out = {t.__name__: t() for t in (upsert, deal, outside, clouds, kafkas, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, found, renames, workspace, server, scale, flight, users, secrets, safety, versions, stopped, flows, begin, doors, objects, sparksql, variables, hot, minmax, reader, crash)}
+    out = {t.__name__: t() for t in (upsert, deal, outside, clouds, kafkas, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, found, renames, workspace, server, scale, flight, users, secrets, safety, versions, stopped, flows, begin, doors, objects, sparksql, variables, scripts, hot, minmax, reader, crash)}
     A.secs = min(A.secs, 20)
     out["load"] = load()
     print(json.dumps(out, indent=1))
@@ -6496,7 +6643,7 @@ def all_tests():
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "found", "renames", "workspace", "server", "scale", "flight", "users", "secrets", "safety", "versions", "stopped", "flows", "begin", "doors", "objects", "sparksql", "variables", "hot", "minmax", "load", "all"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "found", "renames", "workspace", "server", "scale", "flight", "users", "secrets", "safety", "versions", "stopped", "flows", "begin", "doors", "objects", "sparksql", "variables", "scripts", "hot", "minmax", "load", "all"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -6508,7 +6655,7 @@ if __name__ == "__main__":
     ap.add_argument("--flush-ms", type=int, default=250)
     A = ap.parse_args()
     try:
-        {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "safety": safety, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "objects": objects, "sparksql": sparksql, "variables": variables, "hot": hot, "minmax": minmax, "load": load, "all": all_tests}[A.mode]()
+        {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "safety": safety, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "objects": objects, "sparksql": sparksql, "variables": variables, "scripts": scripts, "hot": hot, "minmax": minmax, "load": load, "all": all_tests}[A.mode]()
     except BaseException as e:  # a failure ends the run, though threads may still wait on a node (crash's producers retry for ever)
         code = e.code if isinstance(e, SystemExit) else 1
         if not isinstance(e, SystemExit):

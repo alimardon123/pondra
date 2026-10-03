@@ -51,7 +51,8 @@ The owner's design principles, which every change must respect:
 ```
 src/      28,600 lines of Rust, one file per concern (see the table in README.md); round 25 added
           live.rs (live queries) and temp.rs (a session's temporary tables and views); round 31 vars.rs
-          (SQL variables and a file's declared parameters, ADR-037, ADR-044); round 26
+          (SQL variables and a file's declared parameters, ADR-037, ADR-044) and script.rs (a script's
+          blocks, branches, loops and handlers, ADR-045); round 26
           pg_catalog.rs (Postgres's catalog, for dbt and BI tools), dbserver.rs (`pondra serve
           --lakes`: a folder of lakes as databases), defaults.rs (NOT NULL and DEFAULT), ext.rs
           (files read by name: `read_*`, `CREATE EXTERNAL TABLE`) and console.rs + console/ (the
@@ -1434,6 +1435,13 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    sweep counts every table that lists files in a folder (kept dropped tables too). A clone is never
    published (Delta and Iceberg name files under a table's own folder). `tools/history_check.py`:
    "a clone and its source change apart…".
+219. **A script's block is one statement on every door** (`script::joined`, `routines::statements`,
+   the console's `sqlfile.js` `statements`): a block word opens one only where a statement starts,
+   every `CASE` and `END` counts, `BEGIN;` and `BEGIN TRANSACTION|WORK|ISOLATION|READ` are
+   transactions, and `if(` and `repeat(` are functions. A script's statements write once per job:
+   each one's part is its place and its loop's pass (`{job}:{path}`). A block's `DECLARE`s, a
+   loop's row and a handler's `$error` end with them (`vars::local`, `Runner::unwind`); a lone
+   `DECLARE` with no session is still refused. `harness.py scripts`.
 
 ## Tests: run these before and after any change
 
@@ -1450,6 +1458,7 @@ python3 tools/history_check.py   # DROP/UNDROP, retention, PURGE, Delta; AT (VER
 python3 tools/deploy_check.py                  # the image and compose; add python, chart, helm (kind), service: deploy.yml runs them all
 python3 tools/harness.py versions       # every file keeps its versions: listed, read, restored, after a delete, retention, old notebooks
 python3 tools/harness.py stopped        # a run whose node was killed under it: stopped, not running for good
+python3 tools/harness.py scripts        # IF, CASE, loops, handlers, RETURN, EXECUTE IMMEDIATE: errors at their line, scopes, a job run twice writing once, Postgres's protocols
 python3 tools/harness.py variables      # DECLARE $x, $x = …, SET VARIABLE, getvariable: sessions, Postgres, procedures, file runs, db.vars, pondra.parameters
 python3 tools/harness.py hot            # hot columns skip batches by their ranges (a time range, a top-N either way, a key); NULL filters == the model
 python3 tools/harness.py minmax         # a global min/max over 24 files skips no row its other answers need (an expression, NULLs so far, FILTER); a wide top-N's answer
@@ -1601,7 +1610,7 @@ pages). In the same release, round 33's first parts from the side threads: the l
 upgrades (ADR-039, 207–211), deployment (ADR-041, 205–206), every mode under failure and the five
 faults it found (214–215), a table's past (`UNDROP`, retention per table, time travel `AT (…)`,
 `RESTORE`, zero-copy `CLONE`: ADR-043, 216–218), `CREATE VIEW v (a, b)`, `DECLARE PARAMETER`
-(ADR-044) and the console's batches. Left of 33: the 24-hour R2 soak (the owner's machine),
+(ADR-044), scripts that branch, loop and handle errors (ADR-045, 219) and the console's batches. Left of 33: the 24-hour R2 soak (the owner's machine),
 observability, environments.
 
 **Round 29, part 1 (ADR-034, after 0.27): the owner's console list.** The grid's outline, header

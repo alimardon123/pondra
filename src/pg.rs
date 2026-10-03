@@ -487,6 +487,9 @@ fn command_tag(sql: &str, stmt: &crate::write::Stmt) -> String {
 /// Postgres's session commands: `SHOW` of a Postgres setting (what the session set, or what
 /// clients expect), and `DISCARD` and `CLOSE` accepted. (`SET` and the rest: `settings.rs`.)
 fn session_command(sql: &str) -> Option<Response> {
+    if crate::script::is(sql) {
+        return None; // (`BEGIN … END` that opens a block is a script's)
+    }
     let first = sql.split_whitespace().next()?.to_uppercase();
     let setting = |v: &str| {
         let field = Arc::new(vec![FieldInfo::new("setting".into(), None, None, Type::VARCHAR, FieldFormat::Text)]);
@@ -863,7 +866,7 @@ impl Backend {
         }
         let n = (1..).take_while(|i| sql.contains(&format!("${i}"))).count();
         let mut types = vec![Type::VARCHAR; n];
-        if n > 0 && session_command(sql).is_none() && !crate::settings::is(sql) && crate::write::parse(sql).is_none() && Copy::of(sql).is_none() {
+        if n > 0 && session_command(sql).is_none() && !crate::settings::is(sql) && crate::write::parse(sql).is_none() && Copy::of(sql).is_none() && !crate::script::is(sql) {
             let plan = async { self.session(sql, "").await.ok()?.sql_with_options(&crate::asof::rewrite(sql).ok()?, read_only()).await.ok() }.await;
             for (name, t) in plan.and_then(|df| df.logical_plan().get_parameter_types().ok()).unwrap_or_default() {
                 if let (Some(i @ 1..), Some(t)) = (name.trim_start_matches('$').parse::<usize>().ok(), t) {
@@ -882,7 +885,7 @@ impl Backend {
             None => crate::serve::point(&self.app.lake, sql).await.ok().flatten().and_then(|p| p.schema().ok()), // (a key lookup's columns, unplanned, first)
             Some(_) => None,
         };
-        if point.is_none() && (session_command(sql).is_some() || crate::settings::is(sql) || crate::vars::change(sql).is_some() || crate::write::parse(sql).is_some() || Copy::of(sql).is_some()) {
+        if point.is_none() && (session_command(sql).is_some() || crate::settings::is(sql) || crate::vars::change(sql).is_some() || crate::write::parse(sql).is_some() || Copy::of(sql).is_some() || crate::script::is(sql)) {
             return Ok(vec![]); // (a COPY's columns come with its data)
         }
         let bound = crate::vars::bound(sql).map_err(user_error)?; // (`$day`: the connection's variable)

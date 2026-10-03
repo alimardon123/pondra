@@ -1,4 +1,4 @@
-# ADR-043: A file's parameters are declared as such; its other variables are its own
+# ADR-044: A file's parameters are declared as such; its other variables are its own
 
 **Date:** 2026-10-03 · **Status:** accepted (the owner chose `DECLARE PARAMETER` on 2026-10-03) ·
 **Changes:** ADR-037 §4 (a file's `DECLARE`s were all its parameters) · **Builds on:** ADR-033 (files

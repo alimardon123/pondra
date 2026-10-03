@@ -190,6 +190,12 @@ optimizing; performance first):
 - **`DECLARE PARAMETER`** (ADR-044, PR #15): only marked variables are a file's parameters; a plain
   `DECLARE` is the file's own, and a run given a name that isn't a parameter is refused; a `.py`
   file's parameters are its `# %% tags=["parameters"]` cell.
+- **Scripts that decide** (ADR-045 phase 1, PR #16, `harness.py scripts` 9 of 9): `IF … ELSEIF`,
+  `CASE`, `WHILE`, `REPEAT … UNTIL`, `LOOP`, `FOR r IN (query)`, labels with `LEAVE` and `ITERATE`,
+  `BEGIN … EXCEPTION WHEN … END`, `RETURN`, `RAISE`, `PRINT`, `ASSERT`, `EXECUTE IMMEDIATE … INTO …
+  USING`, `CALL … INTO` and `IDENTIFIER(…)`, the same from every door; each statement runs as it
+  would alone (spread, or written through the leader), and a script run again with its job writes
+  once, loops included. A loop's pass over variables alone takes 0.4 ms (no query).
 - **The console** (PRs #7 and #8, the owner's lists of 2026-10-02): every Live cell over one
   connection (seven of them took the browser's six and hung Python), one grid everywhere with undo,
   paste and filters as pills, the Data tree's details, drags and uploads, a schedule editor, users,

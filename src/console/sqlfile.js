@@ -5,9 +5,28 @@ import { h, fill, icon, secs, S, R, emit, run, menu, MODE, failed, tip, sessionO
 import { formatSql, highlighted } from './editor.js';
 import { grid, copyText, copyItems, split, downloadItems, fetchRows } from './grid.js';
 import { answer } from './notebook.js';
-import { TextDoc, splitPanel, btn, moreBtn, statements, lastStatement, oneLine, said } from './files.js';
+import { TextDoc, splitPanel, btn, moreBtn, statements as pieces, lastStatement, oneLine, said } from './files.js';
 
 moreStyle(); // (its strip's links, the parameters bar: more.css)
+
+/** A script's statements, each block (BEGIN … END, IF … END IF, a loop) one, as the node joins them
+ * (script.rs `depth`: a block's word counts where a statement starts; every CASE and END counts). */
+export function statements(text, raw) {
+  const out = [], depth = s => {
+    const t = s.replace(/'(?:[^']|'')*'|"[^"]*"|--.*|\/\*[\s\S]*?\*\/|\$(\w*)\$[\s\S]*?\$\1\$/g, ' x ').toLowerCase().match(/\$?\w+|[^\s\w]/g) || [];
+    let d = 0;
+    const close = i => { let n = 0; return t.findIndex((x, j) => j > i && !(n += (x == '(') - (x == ')'))); }; // (an IF's condition's end: `if(` before anything but THEN is the function)
+    t.forEach((w, i) => {
+      const b = t[i - 1], at = !i || /^(then|else|do|loop|repeat|begin)$/.test(b) || b == ':' && /^\w/.test(t[i - 2]) && t[i - 3] != ':';
+      d += w == 'end' ? -1 : b == 'end' ? 0 : +(w == 'case' || at && (/^(while|loop)$/.test(w) || w == 'repeat' && t[i + 1] != '(' || w == 'if' && (!i || t[i + 1] != '(' || t[close(i) + 1] == 'then') || w == 'for' && /^(in|as)$/.test(t[i + 2]) || w == 'begin' && !!t[i + 1] && !/^(transaction|work|isolation|read|deferrable|not)$/.test(t[i + 1])));
+    });
+    return d;
+  };
+  let open = null, d = 0;
+  for (const p of pieces(text, true)) { d = Math.max(0, d + depth(p)); const w = open == null ? p : open + ';' + p; if (d) open = w; else { out.push(w); open = null; } }
+  if (open != null) out.push(open);
+  return raw ? out : out.map(x => x.trim());
+}
 
 export class SqlDoc extends TextDoc {
   constructor(o = {}) {
