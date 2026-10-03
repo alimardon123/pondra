@@ -214,21 +214,24 @@ pub async fn purge(lake: &Lake, table: &str, nodes: &[String], me: &str, retain_
     let Some(mut meta) = lake.cat.get::<TableMeta>(&table_key(table)).await?.filter(|m| m.changed && m.key.is_empty()) else { return Ok(false) };
     let Some(mut dmeta) = lake.cat.get::<TableMeta>(&table_key(&deleted(table))).await? else { return Ok(false) };
     let (after, upto, now) = (meta.purged(), meta.tiered.min(dmeta.tiered), crate::log::now_ms());
-    if upto <= after {
-        return Ok(false);
-    }
     let within = datafusion::prelude::col(VERSION).between(datafusion::prelude::lit(after as i64 + 1), datafusion::prelude::lit(upto as i64));
-    let gone = crate::manifest::pruned(lake, &dmeta, None, &[within], &schema(&with_sys(&dmeta).columns)?).await?;
+    let gone = match upto > after {
+        true => crate::manifest::pruned(lake, &dmeta, None, &[within], &schema(&with_sys(&dmeta).columns)?).await?,
+        false => vec![],
+    };
     let waiting: u64 = gone.iter().map(|f| f.rows).sum();
     let rows = meta.files.iter().map(|f| f.rows).sum::<u64>() + meta.sealed.as_ref().map_or(0, |s| s.rows);
     let at_least = std::env::var("PONDRA_PURGE_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(100_000);
-    if !now_anyway && meta.publish.is_empty() && waiting < at_least && waiting * 10 < rows {
+    if upto <= after || (!now_anyway && meta.publish.is_empty() && waiting < at_least && waiting * 10 < rows) {
+        // (nothing to purge yet; the old rows past the table's retention may still go)
+        if settle(&mut meta, &mut dmeta, now, retain_ms) {
+            lake.cat.commit(vec![(table_key(table), json(&meta)), (table_key(&deleted(table)), json(&dmeta))], &[]).await?;
+        }
         return Ok(false);
     }
     // The files that can hold an old row: by their `_row_id` and `_version` ranges.
     let mut dead = dead(lake, &gone, after, upto).await?;
     dead.sort_unstable();
-    let range = |s: &crate::manifest::Stats, c: &str| s.get(c).and_then(|(lo, hi)| Some((lo.parse::<i64>().ok()?, hi.parse::<i64>().ok()?)));
     let holds = |s: &crate::manifest::Stats| crate::sys::holds(&dead, s);
     let (list, mut sealed, mut hit) = (crate::manifest::list(lake, &meta).await?, vec![], vec![]);
     for (i, m) in list.iter().enumerate().filter(|(_, m)| holds(&m.stats)) {
@@ -258,17 +261,35 @@ pub async fn purge(lake: &Lake, table: &str, nodes: &[String], me: &str, retain_
         }
         // (sealed again by `maintain`, once it has rewritten the files mostly deleted)
     }
-    // (the newest purge every reader has passed, and those after it, are kept)
     meta.purges.push((upto, now));
-    let passed = meta.purges.iter().rposition(|p| now - p.1 >= retain_ms);
-    if let Some(i) = passed {
-        let settled = meta.purges[i].0 as i64;
-        meta.purges.drain(..i);
-        let done: Vec<DataFile> = dmeta.files.iter().filter(|f| range(&f.stats, VERSION).is_some_and(|(_, hi)| hi <= settled)).cloned().collect();
-        replace(&mut dmeta, &done, vec![]);
-    }
+    settle(&mut meta, &mut dmeta, now, retain_ms);
     lake.cat.commit(vec![(table_key(table), json(&meta)), (table_key(&deleted(table)), json(&dmeta))], &[]).await?;
     Ok(true)
+}
+
+/// Drops `{t}$deleted`'s files once every reader has passed the purge that covered them and they
+/// are older than the table's retention, the past `AT (…)` reads (ADR-043), and says from where the
+/// table is still whole (`past_from`). The newest purge every reader has passed, and those after it,
+/// are kept. Whether anything changed.
+fn settle(meta: &mut TableMeta, dmeta: &mut TableMeta, now: u64, retain_ms: u64) -> bool {
+    let Some(i) = meta.purges.iter().rposition(|p| now - p.1 >= retain_ms) else { return false };
+    let settled = meta.purges[i].0 as i64;
+    let kept = now.saturating_sub(meta.retention_secs.map_or(crate::ddl::KEEP_MS, |s| s * 1000)) as i64 * 1000;
+    let version = |s: &crate::manifest::Stats| s.get(crate::sys::VERSION).and_then(|(_, hi)| hi.parse::<i64>().ok());
+    let newest = |s: &crate::manifest::Stats| match datafusion::common::ScalarValue::try_from_string(s.get(crate::sys::UPDATED)?.1.clone(), &crate::sys::time()) {
+        Ok(datafusion::common::ScalarValue::TimestampMicrosecond(Some(us), _)) => Some(us),
+        _ => None,
+    };
+    let done: Vec<DataFile> = dmeta.files.iter().filter(|f| version(&f.stats).is_some_and(|hi| hi <= settled) && newest(&f.stats).is_some_and(|us| us < kept)).cloned().collect();
+    if i == 0 && done.is_empty() {
+        return false;
+    }
+    meta.purges.drain(..i);
+    if let (Some(v), Some(us)) = (done.iter().filter_map(|f| version(&f.stats)).max(), done.iter().filter_map(|f| newest(&f.stats)).max()) {
+        meta.past_from = Some(meta.past_from.unwrap_or_default().max((v as u64, us as u64 / 1000)));
+    }
+    replace(dmeta, &done, vec![]);
+    true
 }
 
 /// The places in file `f` of the rows `dead` names (sorted (`_row_id`, `_version`) pairs): from its
@@ -666,13 +687,24 @@ pub async fn expire(lake: &Lake, grace_ms: u64) -> Result<()> {
     let mut dead: Vec<String> = segs.iter().filter(|(_, s)| !s.path.is_empty()).map(|(_, s)| s.path.clone()).collect();
     let mut deletes: Vec<String> = segs.iter().map(|(k, _)| k.clone()).collect();
     deletes.extend(segs.iter().filter(|(_, s)| s.path.is_empty()).map(|(k, _)| data_key(k[2..].parse().unwrap_or(0))));
+    // Dropped tables kept past their time (ADR-043) go: their files are then orphans, swept a day on.
+    #[derive(serde::Deserialize)]
+    struct Kept { at_ms: u64, keep_ms: u64 }
+    let now = crate::log::now_ms();
+    deletes.extend(lake.cat.scan::<Kept>("dt/", "dt0").await?.into_iter().filter(|(_, d)| now >= d.at_ms + d.keep_ms).map(|(k, _)| k));
+    // A folder a clone shares (ADR-043): files there go only by the orphan sweep, which counts
+    // every table listing them, never as one table's garbage.
+    let mut shared: std::collections::HashSet<String> = tables.iter().flat_map(|(_, m)| m.shares.iter().map(|f| format!("data/{f}/"))).collect();
+    for (_, d) in crate::ddl::dropped(lake).await? {
+        shared.extend(d.meta.shares.iter().chain(d.deleted.iter().flat_map(|m| &m.shares)).map(|f| format!("data/{f}/")));
+    }
     let mut puts = vec![];
     for ((key, mut meta), idle) in tables.into_iter().zip(idle) {
         let (old, keep): (Vec<_>, Vec<_>) = meta.garbage.drain(..).partition(|(_, ts)| *ts < files_cutoff);
         let (deletes, kept): (Vec<_>, Vec<_>) = meta.garbage_deletes.drain(..).partition(|(_, ts)| *ts < files_cutoff);
         if !old.is_empty() || !deletes.is_empty() || idle {
             let named = if deletes.is_empty() { Default::default() } else { named_deletes(lake, &meta).await? };
-            dead.extend(old.into_iter().chain(deletes).map(|(p, _)| p).filter(|p| !named.contains(p)));
+            dead.extend(old.into_iter().chain(deletes).map(|(p, _)| p).filter(|p| !named.contains(p) && !shared.iter().any(|f| p.starts_with(f))));
             (meta.garbage, meta.garbage_deletes) = (keep, kept);
             let garbage: std::collections::HashSet<&String> = meta.garbage.iter().map(|(p, _)| p).collect();
             meta.replaced.retain(|f| garbage.contains(&f.path));
@@ -715,8 +747,18 @@ async fn collect_orphans(lake: &Lake) -> Result<()> {
     SWEPT.lock().unwrap().0 = now;
     use object_store::path::Path;
     let key = |raw: &str| Path::from(raw).to_string(); // (a path as the store lists it: a few characters escaped)
-    let tables = lake.cat.scan::<TableMeta>("t/", "t0").await?;
-    let folders: std::collections::HashMap<String, &TableMeta> = tables.iter().map(|(k, m)| (key(&format!("data/{}", m.folder(&k[2..]))), m)).collect();
+    let mut tables = lake.cat.scan::<TableMeta>("t/", "t0").await?;
+    for (n, d) in crate::ddl::dropped(lake).await? {
+        tables.push((format!("t/{n}"), d.meta)); // (kept to be undropped: its files are in use)
+        tables.extend(d.deleted.map(|m| (format!("t/{}", crate::sys::deleted(&n)), m)));
+    }
+    // (a folder's files are listed by its table, a table kept under its old name's, and its clones)
+    let mut folders: std::collections::HashMap<String, Vec<&TableMeta>> = Default::default();
+    for (k, m) in &tables {
+        for f in std::iter::once(m.folder(&k[2..])).chain(m.shares.iter().map(String::as_str)) {
+            folders.entry(key(&format!("data/{f}"))).or_default().push(m);
+        }
+    }
     let listed = lake.store.list_with_delimiter(Some(&Path::from("data"))).await?; // (one request a thousand folders)
     let gone = listed.common_prefixes.iter().map(|p| p.to_string()).filter(|p| !folders.contains_key(p));
     let parts: Vec<String> = std::iter::once("log".to_string()).chain(folders.keys().cloned()).chain(gone).collect();
@@ -736,15 +778,17 @@ async fn collect_orphans(lake: &Lake) -> Result<()> {
                 segments.iter().for_each(|(_, s)| used.add(&key(&s.path)));
                 used
             }
-            (_, Some(m)) => {
-                let mut used = Seen::of(m.files.len() + m.garbage.len() + m.garbage_deletes.len() + m.sealed.as_ref().map_or(0, |s| s.files as usize) + 64);
-                for manifest in crate::manifest::list(lake, m).await? {
-                    crate::manifest::files(lake, &manifest).await?.iter().flat_map(named).for_each(|p| used.add(&key(&p)));
-                    used.add(&key(&manifest.path));
+            (_, Some(all)) => {
+                let mut used = Seen::of(all.iter().map(|m| m.files.len() + m.garbage.len() + m.garbage_deletes.len() + m.sealed.as_ref().map_or(0, |s| s.files as usize) + 64).sum());
+                for m in all {
+                    for manifest in crate::manifest::list(lake, m).await? {
+                        crate::manifest::files(lake, &manifest).await?.iter().flat_map(named).for_each(|p| used.add(&key(&p)));
+                        used.add(&key(&manifest.path));
+                    }
+                    m.sealed.iter().for_each(|s| used.add(&key(&s.list)));
+                    m.files.iter().flat_map(named).for_each(|p| used.add(&key(&p)));
+                    m.garbage.iter().chain(&m.garbage_deletes).for_each(|(p, _)| used.add(&key(p)));
                 }
-                m.sealed.iter().for_each(|s| used.add(&key(&s.list)));
-                m.files.iter().flat_map(named).for_each(|p| used.add(&key(&p)));
-                m.garbage.iter().chain(&m.garbage_deletes).for_each(|(p, _)| used.add(&key(p)));
                 used
             }
             _ => Seen::of(0), // (a table gone: nothing there is in use)

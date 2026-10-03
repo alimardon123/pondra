@@ -50,6 +50,7 @@ on bytes as they do on text. A `CAST` to bytes takes `BYTEA` only.
 | `SELECT … FROM t` | any DataFusion query: joins, `WITH`, windows, `VALUES`, sub-queries |
 | `FROM t [SELECT …] [WHERE …] [GROUP BY …] [ORDER BY …] [LIMIT n]` | DuckDB's form: the `FROM` first, then any clauses |
 | `$name` | a [variable](#variables) or a parameter, bound by the node and never pasted into the text |
+| `FROM t AT (VERSION => n)`, `AT (TIMESTAMP => '…')`, `AT (OFFSET => -3600)` | the table as it was after commit `n`, at that time, or that many seconds ago ([below](#a-tables-past)) |
 | `FROM a ASOF JOIN b MATCH_CONDITION (a.ts >= b.ts) ON a.k = b.k` | each row gets the other table's row as it was at that moment (`>=`, `>`, `<=`, `<`) |
 | `EXPLAIN SELECT …` | the plan, and whether it would spread over the nodes |
 | `DESCRIBE t`, `SHOW TABLES`, `SHOW COLUMNS FROM t` | what the lake holds |
@@ -109,6 +110,36 @@ A parameter goes with the request, in JSON. The Python and JavaScript clients do
   </TabItem>
 </Tabs>
 
+
+### A table's past
+
+`t AT (…)` reads an append table as it was: after commit `n` (`VERSION => n`, a row's `_version`),
+at a time (`TIMESTAMP => '2026-10-02 12:00:00'`) or some seconds ago (`OFFSET => -3600`). It goes
+wherever a table does: a join (the same table at two moments too), a view, `CREATE TABLE … AS`,
+`INSERT … SELECT`. A table's past is kept for its `retention`, a day unless set; a moment before that
+is refused by name, and so is a keyed table, which keeps only each key's newest row.
+
+```sql
+CREATE TABLE prices (item VARCHAR, price DOUBLE);
+INSERT INTO prices VALUES ('tea', 3.5), ('cake', 4.0);
+UPDATE prices SET price = 3.8 WHERE item = 'tea';
+SELECT item, price, _version FROM prices ORDER BY item;
+SELECT item, price FROM prices AT (OFFSET => -3600);
+SELECT n.item, w.price AS was, n.price AS now FROM prices n JOIN prices AT (OFFSET => -1) w ON n.item = w.item;
+CREATE TABLE prices_test CLONE prices;
+RESTORE TABLE prices TO TIMESTAMP AS OF '2026-10-02 12:00:00';
+```
+
+`RESTORE TABLE t TO VERSION AS OF n` (or `TIMESTAMP AS OF '…'`) puts an append table back as it was
+then, in one change: rows changed since get their old values (and keep their `_row_id`), rows made
+since go, rows deleted since come back. It is a change like any other, so another `RESTORE` undoes it.
+
+`CREATE TABLE c CLONE t` (or `SHALLOW CLONE`) makes a table of `t`'s rows as they are, copying no
+file: `c` lists `t`'s files where they are, and writes its own beside them. The two change apart from
+then on, and neither's merges, expiry or `DROP` deletes a file the other still reads. A clone isn't
+published for other engines (`CREATE TABLE c AS SELECT * FROM t` makes a copy that can be), and its
+past starts when it was made.
+
 ## Tables
 
 | Statement | Syntax |
@@ -120,9 +151,12 @@ A parameter goes with the request, in JSON. The Python and JavaScript clients do
 | Rename a table | `ALTER TABLE t RENAME TO u` |
 | Drop a column | `ALTER TABLE t DROP COLUMN [IF EXISTS] c` |
 | Widen a column | `ALTER TABLE t ALTER COLUMN c TYPE BIGINT` |
-| Change options | `ALTER TABLE t SET (publish = 'delta', cluster_by = 'user', ttl = 'ts:3600', order_by = 'ts')` |
+| Change options | `ALTER TABLE t SET (publish = 'delta', cluster_by = 'user', ttl = 'ts:3600', order_by = 'ts', retention = '7 days')` |
 | Empty | `TRUNCATE [TABLE] t` |
-| Drop | `DROP TABLE [IF EXISTS] t [, t2 …]` |
+| Drop | `DROP TABLE [IF EXISTS] t [, t2 …] [PURGE]` |
+| Bring back a dropped table | `UNDROP TABLE t` |
+| Copy a table without copying files | `CREATE TABLE [IF NOT EXISTS] c [SHALLOW] CLONE t` |
+| Put a table back as it was | `RESTORE TABLE t TO VERSION AS OF n`, or `TO TIMESTAMP AS OF '…'` |
 
 A table of that name already there refuses `CREATE TABLE` (`42P07`, as in Postgres), whether it
 has the same columns or not; `IF NOT EXISTS` leaves it as it is, and `OR REPLACE` drops it and
@@ -156,6 +190,12 @@ and its Delta and Iceberg copies stay readable. A stored view reads a table by n
 it reads whatever takes the old name next. It is refused when the new name is taken, when a
 materialized view or a task follows the table, and for a materialized view.
 
+A dropped table is kept for a day, or for its `retention`, and `UNDROP TABLE t` brings it back as it
+was: every row, with its ids and versions. `pondra.dropped` lists the tables that can still come back
+(see [system tables](/pondra/reference/system-columns/#dropped-tables)). `UNDROP` takes the table
+dropped last under that name, and is refused while another table has the name: rename that one first.
+`DROP TABLE … PURGE`, or `retention = '0 seconds'`, keeps nothing.
+
 ```sql
 CREATE TABLE users (id BIGINT PRIMARY KEY, name VARCHAR, plan VARCHAR);
 CREATE TABLE clicks (ts TIMESTAMP, user VARCHAR, url VARCHAR) WITH (cluster_by = 'user', partition_by = 'day(ts)');
@@ -169,6 +209,8 @@ ALTER TABLE users DROP COLUMN years;
 ALTER TABLE clicks SET (publish = 'delta');
 ALTER TABLE big_orders RENAME TO large_orders;
 DROP TABLE large_orders;
+UNDROP TABLE large_orders;
+DROP TABLE large_orders PURGE;
 TRUNCATE accounts;
 ```
 

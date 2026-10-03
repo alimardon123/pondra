@@ -28,7 +28,7 @@ pub const CREATED: &str = "_created_at";
 pub const UPDATED: &str = "_updated_at";
 pub const NAMES: [&str; 4] = [ROW_ID, VERSION, CREATED, UPDATED];
 
-fn time() -> DataType { DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())) }
+pub fn time() -> DataType { DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())) }
 
 /// The system columns, as a table's columns list them (name, type).
 pub fn columns() -> Vec<(String, String)> {
