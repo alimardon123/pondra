@@ -25,12 +25,12 @@ export async function newDatabase() {
 
 // ------------------------------------------------------------------ what an action does: a script in a tab, or SQL run
 /** SQL (or Python) in a new tab, to read, change and run. */
-async function tab(text, kind = 'sql') { const d = await H.newFile(kind); d.ed.value = text; d.changed(); d.ed.focus(); return d; }
+export const tab = (text, kind = 'sql') => H.newWith(kind, text);
 /** Run SQL now; say what it did; read the catalog again. */
 async function exec(sql, said) {
   try { await run(sql); toast(said); H.refresh(); } catch (e) { toast(e.message, true); }
 }
-const danger = (question, sql, said) => { if (confirmed(`${question}\n\n${sql}`)) exec(sql, said); };
+export const danger = (question, sql, said) => { if (confirmed(`${question}\n\n${sql}`)) exec(sql, said); };
 /** A file picked on this computer, put in the lake's files (imports/), and read by `into(SQL that
  * reads it, its name)`: the statement in a tab, run, to see what it did. */
 function importFile(into) {
@@ -46,6 +46,8 @@ function importFile(into) {
   document.body.append(input); input.click();
 }
 const name = async (title, label, value) => ((await prompt(title, label, value)) || '').trim();
+/** Who has access to it, given and taken back in place (access.js). */
+const access = (on, ok = true) => ok ? { label: 'Who has access…', icon: 'user', run: () => import('./access.js').then(m => m.access({ on })) } : null;
 const py = s => /"""/.test(s) ? `'''\n${s}\n'''` : `"""\n${s}\n"""`;
 
 /** A value to start a column with, by its type (an INSERT's template). */
@@ -101,33 +103,46 @@ export function scriptAs(t, first = 'SELECT') {
 
 // ------------------------------------------------------------------ the menus
 /** What an extension adds to a kind's menu (`register.objectAction`). */
-const more = (kind, x) => { const a = (R.objectActions || []).filter(o => o.kinds.includes(kind)); return a.length ? ['-', ...a.map(o => ({ label: o.label, icon: o.icon, run: () => o.run(x) }))] : []; };
+export const more = (kind, x) => { const a = (R.objectActions || []).filter(o => o.kinds.includes(kind)); return a.length ? ['-', ...a.map(o => ({ label: o.label, icon: o.icon, run: () => o.run(x) }))] : []; };
 /** A second menu where the first was: a menu's item that has choices of its own. */
 const then = (at, items) => () => requestAnimationFrame(() => menu(at, items));
 
+/** A table's "New ▸": a view of it, a materialized view counting it, a copy of it, each as its SQL. */
+function ofIt(at, t) {
+  const sch = t.s === 'public' ? '' : `${ident(t.s)}.`, c = cols(t), first = c[0] ? ident(c[0].n) : '1', all = c.map(x => ident(x.n)).join(', ') || '*';
+  return { label: 'New', icon: 'plus', hint: '▸', run: then(at, [{ label: 'View of it…', icon: 'view', run: () => tab(`CREATE VIEW ${sch}${ident(t.t + '_view')} AS\nSELECT ${all}\nFROM ${t.q}\nWHERE …;`) },
+    { label: 'Materialized view of it…', icon: 'matview', run: () => tab(`-- kept up to date as ${t.t} changes\nCREATE MATERIALIZED VIEW ${sch}${ident(t.t + '_by_' + (c[0]?.n || 'all'))} AS\nSELECT ${first}, count(*) AS n\nFROM ${t.q}\nGROUP BY ${first};`) },
+    { label: 'Copy of it…', icon: 'table', run: () => tab(`CREATE TABLE ${sch}${ident(t.t + '_copy')} AS\nSELECT * FROM ${t.q};`) }]) };
+}
 export function tableMenu(at, t) {
   const kind = t.o.kind, table = kind === 'table', word = { view: 'VIEW', files: 'VIEW', 'materialized view': 'MATERIALIZED VIEW' }[kind] || 'TABLE';
-  menu(at, [{ label: 'Preview', icon: 'play', keys: 'Double-click', run: () => H.query(`SELECT * FROM ${t.q} LIMIT 100`) },
+  menu(at, [{ label: table ? 'Open, to edit its rows' : 'Open', icon: 'table', keys: 'Double-click', run: () => H.openFile('table:' + t.q) },
+    { label: 'Preview', icon: 'play', run: () => H.query(`SELECT * FROM ${t.q} LIMIT 100`) },
     { label: 'Preview in Python', icon: 'filepy', run: () => tab(`db.table("${t.q}").limit(100)`, 'python') },
     { label: 'Details and data profile', icon: 'eye', run: () => H.pick({ type: 'object', t }) },
-    { label: 'Watch it live', icon: 'refresh', run: () => { const c = H.addCell({ kind: 'sql', src: `SELECT * FROM ${t.q} LIMIT 100`, live: true }); c.edit(); c.run(); } }, '-',
-    { label: 'Script as…', icon: 'filesql', run: () => scriptAs(t) },
+    { label: 'Watch it live', icon: 'refresh', run: () => H.query(`SELECT * FROM ${t.q} LIMIT 100`, true) }, '-',
+    { label: 'Script as…', icon: 'filesql', run: () => scriptAs(t) }, ofIt(at, t),
     table ? { label: 'Insert rows…', run: () => tab(scripts(t).find(x => x[0] === 'INSERT')[1]) } : null,
     table ? { label: 'Import rows from a file…', icon: 'up', run: () => importFile((src, n) => { const c = cols(t).map(c => ident(c.n)).join(', '); return `-- ${n}'s rows into ${t.q}, its columns by name\nINSERT INTO ${t.q} (${c})\nSELECT ${c}\nFROM ${src};`; }) } : null,
     { label: 'Download all rows…', icon: 'down', run: then(at, downloadItems(f => fetchRows({ sql: `SELECT * FROM ${t.q}` }, f, t.t), 'All rows, as')) },
     kind === 'table' || kind === 'materialized view' ? { label: 'As a Kafka topic…', icon: 'terminal', run: () => kafka(t) } : null, '-',
-    table ? { label: 'Add a column…', icon: 'plus', run: async () => { const c = await name('Add a column', `A column of ${t.q}: its name and type`, 'note VARCHAR'); if (c) exec(`ALTER TABLE ${t.q} ADD COLUMN ${c}`, `Added ${c.split(/\s/)[0]} to ${t.q}`); } } : null,
+    table ? addColumn(t) : null,
     kind !== 'materialized view' ? { label: 'Rename…', icon: 'pencil', run: async () => { const n = await name('Rename', `The new name of ${t.q}`, t.t); if (n && n !== t.t) exec(`ALTER ${word === 'VIEW' ? 'VIEW' : 'TABLE'} ${t.q} RENAME TO ${ident(n)}`, `Renamed to ${n}`); } } : null,
-    { label: 'Copy the name', icon: 'copy', run: () => copyText(t.q, `Copied ${t.q}`) }, { label: 'Copy the column names', run: () => copyText(cols(t).map(c => ident(c.n)).join(', '), 'Copied the column names') }, { label: 'Copy as Python', run: () => copyText(`db.table("${t.q}")`, 'Copied') }, '-',
+    access({ kind: 'table', name: t.s === 'public' ? t.t : `${t.s}.${t.t}`, label: t.q }, t.c === home()),
+    { label: 'Refresh', icon: 'refresh', run: () => H.refresh() }, ...copyName([t.c, t.s, t.t], t.q), { label: 'Copy the column names', run: () => copyText(cols(t).map(c => ident(c.n)).join(', '), 'Copied the column names') }, { label: 'Copy as Python', run: () => copyText(`db.table("${t.q}")`, 'Copied') }, '-',
     table ? { label: 'Truncate…', run: () => danger(`Delete every row of ${t.q}? This can't be undone.`, `TRUNCATE TABLE ${t.q}`, `Emptied ${t.q}`) } : null,
     { label: 'Drop…', icon: 'trash', run: () => danger(`Drop ${t.q}?${kind === 'files' ? ' (its files stay)' : ' This can\'t be undone.'}`, `DROP ${word} ${t.q}`, `Dropped ${t.q}`) }, ...more(kind === 'files' ? 'view' : kind.replace(' ', '_'), t)]);
 }
+const addColumn = t => ({ label: 'Add a column…', icon: 'plus', run: async () => { const c = await name('Add a column', `A column of ${t.q}: its name and type`, 'note VARCHAR'); if (c) exec(`ALTER TABLE ${t.q} ADD COLUMN ${c}`, `Added ${c.split(/\s/)[0]} to ${t.q}`); } });
+/** "Copy the name": the whole name (database, schema, table), and the name as SQL here says it when shorter. */
+const copyName = (parts, short) => { const full = parts.map(ident).join('.'); return [{ label: 'Copy the name', icon: 'copy', hint: full, run: () => copyText(full, `Copied ${full}`) }, short !== full ? { label: 'Copy the short name', hint: short, run: () => copyText(short, `Copied ${short}`) } : null]; };
 export function columnMenu(at, t, c) {
   const col = ident(c.n), table = t.o.kind === 'table';
   menu(at, [{ label: 'Copy the name', icon: 'copy', run: () => copyText(c.n, `Copied ${c.n}`) }, { label: 'Put it where I type', run: () => S.doc?.put?.(col) }, '-',
     { label: 'Its values, counted', icon: 'play', run: () => H.query(`SELECT ${col}, count(*) AS n\nFROM ${t.q}\nGROUP BY ${col}\nORDER BY n DESC\nLIMIT 100`) },
     { label: 'Its range and NULLs', run: () => H.query(`SELECT min(${col}) AS least, max(${col}) AS greatest, count(*) - count(${col}) AS nulls, count(DISTINCT ${col}) AS distinct_values\nFROM ${t.q}`) },
     table ? '-' : null,
+    table ? addColumn(t) : null,
     table ? { label: 'Rename…', icon: 'pencil', run: async () => { const n = await name('Rename a column', `The new name of ${c.n}`, c.n); if (n && n !== c.n) exec(`ALTER TABLE ${t.q} RENAME COLUMN ${col} TO ${ident(n)}`, `Renamed to ${n}`); } } : null,
     table ? { label: 'Change its type…', run: async () => { const ty = await name('Change the type', `${c.n} is ${sqlType(c.d)}: a wider type (INT to BIGINT, REAL to DOUBLE)`, sqlType(c.d)); if (ty) exec(`ALTER TABLE ${t.q} ALTER COLUMN ${col} TYPE ${ty}`, `${c.n} is ${ty}`); } } : null,
     table && !(t.o.key || []).includes(c.n) ? { label: 'Drop…', icon: 'trash', run: () => danger(`Drop the column ${c.n} of ${t.q}?`, `ALTER TABLE ${t.q} DROP COLUMN ${col}`, `Dropped ${c.n}`) } : null, ...more('column', { t, c })]);
@@ -145,21 +160,26 @@ const NEW = {
   secret: () => `-- its values are sealed; only a procedure's code reads them (pondra.secret)\nCREATE SECRET my_bucket (TYPE s3, KEY_ID '…', SECRET '…', REGION 'eu-west-1', SCOPE 's3://my-bucket');`,
   attach: () => `-- another lake, a Delta or Iceberg folder or catalog, or a Kafka cluster, as a catalog of tables\nATTACH 's3://bucket/warehouse' AS wh (TYPE delta);`,
 };
-const created = (kind, q = '') => ({ label: `New ${kind}…`, icon: 'plus', run: () => tab(NEW[kind](q)) });
+const ICONS = { table: 'table', view: 'view', 'materialized view': 'matview', 'external table': 'files', schema: 'schema', function: 'fn', procedure: 'play', schedule: 'calendar' };
+export const created = (kind, q = '', bare) => ({ label: bare ? `${kind[0].toUpperCase() + kind.slice(1)}…` : `New ${kind}…`, icon: ICONS[kind] || 'plus', run: () => tab(NEW[kind](q)) });
+/** "New ▸": what can be made in it, a second menu where the first was. */
+const making = (at, q, kinds, extra = []) => ({ label: 'New', icon: 'plus', hint: '▸', run: then(at, [...kinds.map(k => k === '-' ? k : created(k, q, true)), ...extra]) });
+const listing = (label, where) => ({ label, icon: 'table', run: () => H.query(`SELECT schema, name, kind FROM pondra.tables WHERE ${where} ORDER BY 1, 2`) });
 export function schemaMenu(at, lake, schema) {
   const q = `${ident(schema)}.`;
-  menu(at, [created('table', q), created('view', q), created('materialized view', q), created('external table', q),
-    { label: 'New table from a file…', icon: 'up', run: () => importFile((src, n) => `-- a table of ${n}'s rows\nCREATE TABLE ${q}${ident(n.replace(/\.\w+$/, '').toLowerCase().replace(/\W+/g, '_').replace(/^(\d)/, '_$1'))} AS\nSELECT * FROM ${src};`) }, '-',
-    created('function', q), created('procedure', q), created('schedule', q), '-',
-    { label: 'Copy the name', icon: 'copy', run: () => copyText(schema, `Copied ${schema}`) },
+  menu(at, [making(at, q, ['table', 'view', 'materialized view', 'external table', '-', 'function', 'procedure', 'schedule'],
+    ['-', { label: 'Table from a file…', icon: 'up', run: () => importFile((src, n) => `-- a table of ${n}'s rows\nCREATE TABLE ${q}${ident(n.replace(/\.\w+$/, '').toLowerCase().replace(/\W+/g, '_').replace(/^(\d)/, '_$1'))} AS\nSELECT * FROM ${src};`) }]),
+    listing('List its tables and views', `lake = ${quote(lake)} AND schema = ${quote(schema)}`), access({ kind: 'schema', name: schema }, lake === home()), '-',
+    { label: 'Refresh', icon: 'refresh', run: () => H.refresh() }, ...copyName([lake, schema], ident(schema)),
     { label: 'Copy the table names', run: () => copyText(S.objects.filter(t => t.c === lake && t.s === schema).map(t => t.q).join('\n'), 'Copied the table names') },
     { label: 'Drop…', icon: 'trash', run: () => danger(`Drop the schema ${schema}, and every table and view in it?`, `DROP SCHEMA ${ident(schema)} CASCADE`, `Dropped ${schema}`) }, ...more('schema', { lake, schema })]);
 }
 export function lakeMenu(at, lake, current) {
-  menu(at, [current ? created('schema') : null, current ? created('table') : null, current ? { label: 'Attach a lake or catalog…', icon: 'db', run: () => tab(NEW.attach()) } : null, '-',
+  menu(at, [current ? making(at, '', ['schema', 'table', 'view', 'materialized view', '-', 'function', 'procedure', 'schedule']) : null,
+    current ? { label: 'Attach a lake or catalog…', icon: 'db', run: () => tab(NEW.attach()) } : null, listing('List its tables and views', `lake = ${quote(lake)}`), access({ kind: 'lake', label: 'every table' }, current), '-',
     MODE === 'lakes' ? { label: 'New database…', icon: 'plus', run: () => H.newDatabase() } : null,
     current ? { label: 'Checkpoint', run: () => exec('CHECKPOINT', 'Checkpointed: what was in the log is in the tables\' files') } : null,
-    { label: 'Refresh', icon: 'refresh', run: () => H.refresh() }, { label: 'Copy the name', icon: 'copy', run: () => copyText(lake, `Copied ${lake}`) },
+    { label: 'Refresh', icon: 'refresh', run: () => H.refresh() }, ...copyName([lake], ident(lake)),
     !current ? { label: 'Detach…', icon: 'trash', run: () => danger(`Detach ${lake}? Its data stays where it is.`, `DETACH ${ident(lake)}`, `Detached ${lake}`) } : null,
     MODE === 'lakes' && current ? { label: 'Drop the database…', icon: 'trash', run: () => danger(`Drop the database ${lake}, its folder and every table in it? This can't be undone.`, `DROP DATABASE ${ident(lake)}`, `Dropped ${lake}`) } : null, ...more('lake', lake)]);
 }
@@ -180,49 +200,6 @@ async function byName() {
   if (!name || name === home()) return;
   if ((S.dbs || []).some(d => d.name === name)) return H.use(name);
   toast(`No database ${name}: New database… makes one`, true);
-}
-
-// ------------------------------------------------------------------ the lake's other objects: routines, schedules, secrets
-const fnSql = x => `CREATE OR REPLACE ${x.kind === 'procedure' ? 'PROCEDURE' : x.kind === 'macro' ? 'MACRO' : 'FUNCTION'} ${x.name}(${x.arguments || ''})${x.returns ? ` RETURNS ${x.returns}` : ''}${x.language && x.language !== 'sql' ? ` LANGUAGE ${x.language}` : ''} AS $$\n${x.body}\n$$;`;
-const drop = (what, x) => ({ label: 'Drop…', icon: 'trash', run: () => danger(`Drop the ${what.toLowerCase()} ${x.name}?`, `DROP ${what} ${ident(x.name)}`, `Dropped ${x.name}`) });
-const show = (title, sql, extra = []) => ({ label: 'Its definition', icon: 'eye', run: () => pop(title, h('pre', { class: 'defn', html: highlighted(sql, 'sql') }), [['Open in a new tab', () => tab(sql), true], ['Copy', () => copyText(sql)], ...extra]) });
-const KINDS = {
-  functions: {
-    list: () => rows("SELECT name, kind, language, arguments, returns, body FROM pondra.routines WHERE kind <> 'procedure' ORDER BY name"),
-    item: x => ({ name: x.name, icon: 'fn', meta: x.kind === 'function' ? x.language : x.kind, title: `${x.name}(${x.arguments || ''})${x.returns ? ' → ' + x.returns : ''}` }),
-    menu: x => [{ label: 'Use it', icon: 'play', run: () => tab(x.kind === 'table function' ? `SELECT * FROM ${x.name}(${x.arguments ? '…' : ''});` : `SELECT ${x.name}(${x.arguments ? '…' : ''});`) },
-      show(x.name, fnSql(x)), { label: 'Copy the name', icon: 'copy', run: () => copyText(x.name) }, '-', drop(x.kind === 'macro' ? 'MACRO' : 'FUNCTION', x)] },
-  procedures: {
-    list: () => rows("SELECT name, kind, language, arguments, returns, body FROM pondra.routines WHERE kind = 'procedure' ORDER BY name"),
-    item: x => ({ name: x.name, icon: 'play', meta: x.language, title: `${x.name}(${x.arguments || ''})` }),
-    menu: x => [{ label: 'Call…', icon: 'play', run: () => tab(`CALL ${x.name}(${x.arguments ? '…' : ''});`) },
-      { label: 'Start as a job…', run: () => tab(`SELECT pondra.start('${x.name}'${x.arguments ? ', …' : ''});`) },
-      { label: 'Schedule…', icon: 'clock', run: () => tab(`CREATE TASK ${x.name}_daily SCHEDULE '1 day'\nAS CALL ${x.name}(${x.arguments ? '…' : ''});`) },
-      show(x.name, fnSql(x)), { label: 'Its runs', icon: 'clock', run: () => H.show('runs') }, '-', drop('PROCEDURE', x)] },
-  schedules: {
-    list: () => rows('SELECT name, schedule, statement, next_tick FROM pondra.tasks ORDER BY name'),
-    item: x => ({ name: x.name, icon: 'calendar', meta: x.schedule, title: x.statement }),
-    menu: x => [{ label: 'In Jobs', icon: 'calendar', run: () => H.show('jobs') }, show(x.name, `CREATE OR REPLACE TASK ${x.name} SCHEDULE ${quote(x.schedule)}\nAS ${x.statement};`), '-', drop('TASK', x)] },
-  secrets: {
-    list: () => rows('SELECT * FROM secrets() ORDER BY name'),
-    item: x => ({ name: x.name, icon: 'key', meta: x.type, title: x.scope ? `for ${x.scope}` : x.type }),
-    menu: x => [{ label: 'Replace its values…', icon: 'pencil', run: () => tab(`CREATE OR REPLACE SECRET ${x.name} (TYPE ${x.type}, KEY_ID '…', SECRET '…'${x.scope ? `, SCOPE ${quote(x.scope)}` : ''});`) }, '-', drop('SECRET', x)] },
-};
-/** A group's objects under the lake, drawn when it is opened. */
-export async function fill(kind, box, schema) {
-  const k = { ...R.objectKinds.find(x => x.id === kind), ...KINDS[kind] }, of = n => n.includes('.') ? n.slice(0, n.indexOf('.')) : 'public';
-  let list;
-  try { list = await k.list(); } catch (e) { box.replaceChildren(h('div', { class: 'empty' }, e.message.split('\n')[0])); return; }
-  if (schema) list = list.filter(x => of(k.item(x).name) === schema); // (a schema's: `sales.f` in sales, `f` in public)
-  box.replaceChildren(...list.length ? list.map(x => {
-    const it = k.item(x), open = e => menu(e.currentTarget || e, [...k.menu(x), ...more(kind, x)]);
-    return h('div', { class: 'row obj', role: 'treeitem', tabindex: '-1', 'aria-level': schema ? '4' : '3', title: it.title, style: `padding-left:${schema ? 48 : 34}px`, onclick: e => open(e), oncontextmenu: e => { e.preventDefault(); open(e); } },
-      h('span', { class: 'tw none' }), h('span', { class: 'ic', html: svg(it.icon, 15) }), h('span', { class: 'nm' }, schema ? it.name.slice(it.name.indexOf('.') + 1) : it.name), it.meta ? h('span', { class: 'meta' }, it.meta) : null);
-  }) : [h('div', { class: 'empty', style: `padding:2px 8px 4px ${schema ? 66 : 52}px`, title: 'The group\'s ⋯, or a right-click on it, makes one' }, 'None yet')]); // (under the group's name)
-}
-export function groupMenu(at, kind, schema) {
-  const k = R.objectKinds.find(x => x.id === kind), make = { functions: 'function', procedures: 'procedure', schedules: 'schedule', secrets: 'secret' }[kind];
-  menu(at, [make ? created(make, schema && schema !== 'public' ? `${ident(schema)}.` : '') : null, k?.create ? { label: `New ${k.title.toLowerCase()}…`, icon: 'plus', run: () => tab(k.create()) } : null, { label: 'Refresh', icon: 'refresh', run: () => H.refresh() }, ...more(kind, null)]);
 }
 
 /** A table as a Kafka topic: where producers and consumers connect, and how. */

@@ -7,11 +7,11 @@ import { call } from './core.js';
 const subs = new Map();
 let ctl = null, timer = 0, made = 0;
 
-/** Watch `sql`, in `session`: `on` gets each answer (`{at, rows}`), or `{error}` once it stopped.
- * Returns what stops it. */
-export function watch(sql, session, on) {
+/** Watch `sql` (its `params` bound), in `session`: `on` gets each answer (`{at, rows}`), or
+ * `{error}` once it stopped. Returns what stops it. */
+export function watch(sql, session, on, params) {
   const id = 'q' + (++made).toString(36);
-  subs.set(id, { sql, session, on });
+  subs.set(id, { sql, session, on, params });
   again();
   return () => { if (subs.delete(id)) again(); };
 }
@@ -23,7 +23,7 @@ async function open() {
   ctl?.abort();
   ctl = null;
   if (!subs.size) return;
-  const mine = ctl = new AbortController(), queries = [...subs].map(([id, s]) => ({ id, sql: s.sql, session: s.session }));
+  const mine = ctl = new AbortController(), queries = [...subs].map(([id, s]) => ({ id, sql: s.sql, session: s.session, params: s.params }));
   try {
     const r = await call('/live', { method: 'POST', body: JSON.stringify({ queries }), headers: { 'content-type': 'application/json' }, signal: mine.signal });
     const reader = r.body.getReader(), dec = new TextDecoder();
@@ -51,4 +51,9 @@ function stopAll(error) {
   const all = [...subs.values()];
   subs.clear(); ctl = null;
   for (const s of all) s.on({ error });
+}
+/** A live answer's rows as a grid holds them: lists in the order of the columns it was first given. */
+export function rowsOf(m, cols) {
+  const names = cols.length ? cols.map(c => c.name) : Object.keys(m.rows[0] || {});
+  return { columns: cols.length ? cols : names.map(n => ({ name: n, type: '' })), rows: m.rows.slice(0, 10000).map(o => names.map(n => o[n] ?? null)), total: m.rows.length };
 }

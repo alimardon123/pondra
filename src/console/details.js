@@ -1,7 +1,7 @@
 // The details of a table, a view, a file or an answer (ADR-034, round 29), and a data profile (a
 // table's, an answer's): loaded the first time something is picked, not with the page. What they
 // use of the shell comes through `R.helpers`.
-import { h, count, bytes, utc, icon, typeMark, sqlType, fileSql, S, R, run, rows, ident, toast, numeric, moreStyle } from './core.js';
+import { h, count, bytes, utc, icon, typeMark, sqlType, fileSql, S, R, run, rows, ident, toast, numeric, moreStyle, home, MODE } from './core.js';
 import { highlighted } from './editor.js';
 import { spread, summarize } from './grid.js';
 import { iconOf, kindOf, download } from './files.js';
@@ -149,4 +149,15 @@ export function resultDetail(p) {
     if (k === i) requestAnimationFrame(() => box.scrollIntoView({ block: 'nearest' }));
   });
   return out;
+}
+/** Nothing picked: the lake, its tables, views and rows, and its cluster. */
+export function summary() {
+  const objs = S.objects || [], by = k => objs.filter(t => t.c === home() && t.o.kind === k).length;
+  const tabled = objs.filter(t => t.c === home() && t.o.rows != null);
+  const s = S.info || {};
+  return [head('db', home() || 'Pondra', MODE === 'lakes' ? 'a database' : 'this lake', 'k-db'),
+    facts([['Tables', count(by('table'))], ['Views', count(by('view') + by('files'))], ['Materialized', by('materialized view') ? count(by('materialized view')) : null],
+      ['Rows in files', count(tabled.reduce((a, t) => a + (t.o.rows || 0), 0))], ['Size in files', bytes(tabled.reduce((a, t) => a + (t.o.bytes || 0), 0))],
+      ['Nodes', s.nodes ? String(s.nodes.length) : null], ['This node', s.role], ['Leader', s.leader], ['Commits', s.hwm != null ? count(s.hwm) : null]]),
+    h('p', { class: 'muted' }, 'Pick a table, a view or a file, or a column of an answer, to see it here.')];
 }

@@ -114,7 +114,7 @@ header{height:48px;display:flex;align-items:center;gap:10px;padding:0 10px 0 16p
 #leftEdge{right:0}#rightEdge{left:0}
 .edge:hover::after,.edge.drag::after,.edge:focus-visible::after{content:"";position:absolute;top:0;bottom:0;width:2px;background:var(--accent)}
 #leftEdge::after{right:0}#rightEdge::after{left:0}
-.group.folded{flex:none}
+.group.folded{flex:none;min-height:0}.group+.group{border-top:1px solid var(--line2)}section.group.folded:last-of-type{margin-top:auto}
 .ghead{display:flex;align-items:center;height:30px;padding:0 6px 0 4px;flex:none}
 .gtitle{display:flex;align-items:center;gap:4px;flex:1;min-width:0;height:26px;border:0;background:transparent;cursor:pointer;border-radius:6px;padding:0 4px;color:var(--muted)}
 .gtitle h2{margin:0;font-size:13px;font-weight:500;color:var(--ink)}
@@ -134,7 +134,7 @@ header{height:48px;display:flex;align-items:center;gap:10px;padding:0 10px 0 16p
 
 /* tabs, and the toolbar of the document in front */
 #tabbar{display:flex;align-items:flex-end;gap:2px;height:36px;padding:0 8px 0 0;background:var(--chrome);border-bottom:1px solid var(--line);flex:none;overflow:hidden;position:relative}
-.tlist{display:flex;align-items:flex-end;gap:2px;min-width:0;align-self:stretch}#rtabs .tlist{align-items:center}
+.tlist{display:flex;align-items:flex-end;gap:2px;min-width:0;align-self:stretch}#rtabs .tlist{align-items:center;overflow-x:auto;scrollbar-width:none}.rtab{flex:none;white-space:nowrap}
 /* (many tabs: each gives way to 96px, then the list scrolls, its + in reach) */
 #tabbar .tlist{overflow-x:auto;overflow-y:hidden;scrollbar-width:none}#tabbar .tlist::-webkit-scrollbar{display:none}
 #tabbar .tab{flex:none}
@@ -336,29 +336,24 @@ span.stmt{cursor:default}
 .gt td.num{text-align:right}
 .gt td.pre{white-space:pre;max-width:none;font:12px/1.5 var(--mono);height:auto;padding-top:5px;padding-bottom:5px;vertical-align:top}
 .null{color:var(--faint);font-style:italic;font-size:12px}
-.gt tbody tr:hover td:not(.in):not(.i){background:var(--hover)}
+.gt tbody tr:not(.gap):hover td:not(.in):not(.i){background:var(--hover)}
 .gt tr.cur td{background:var(--rowsel)}.gt tr.cur td.i{color:var(--accent);font-weight:600}
 .gt td.i.hs{color:var(--accent);font-weight:600}
 .gt td.in{background:var(--cellsel)}
 .gt tbody td.act{background:var(--surface)}
 .gt td.el{--el:inset 2px 0 0 var(--accent)}.gt td.er{--er:inset -2px 0 0 var(--accent)}.gt td.et{--et:inset 0 2px 0 var(--accent)}.gt td.eb{--ebw:-2px;--ebc:var(--accent)}
-.gt td.chg{background:color-mix(in srgb,var(--warn) 13%,var(--surface));--el:inset 2px 0 0 var(--warn)}
-.gt tr.new td{background:color-mix(in srgb,var(--ok) 9%,var(--surface))}.gt tr.new td.i{color:var(--ok);font-weight:600}
-.gt td.editing{position:relative;overflow:visible}
-.celled{position:absolute;inset:0;width:100%;min-width:120px;height:100%;border:2px solid var(--accent);border-radius:2px;padding:0 12px;font:inherit;background:var(--surface);outline:none;z-index:3}
 tr.gap td{padding:0;border:0;box-shadow:none;height:0}
-.flash tbody td{animation:flash 1s}
+.flash tbody td,.gt tr.fl td{animation:flash 1.2s}
+.gt tr.gap td{padding:0;background:repeating-linear-gradient(transparent 0 29px,var(--line2) 0 30px)}.gt tr.gap td.i{background-color:var(--head)}
 @keyframes flash{from{background:var(--accent-soft)}to{background:transparent}}
 .sum{font-variant-numeric:tabular-nums}
 /* an answer, the same in a SQL file and a cell: (a cell's) view tabs and Copy, Download above; the rows; a line under them */
 .abar{display:flex;align-items:center;gap:4px;height:34px;margin:-6px 0 10px;border-bottom:1px solid var(--line2);align-self:stretch}.abar .ptab:first-child{padding-left:2px}
-.aview{align-self:stretch;min-width:0;display:flex;flex-direction:column;align-items:flex-start}
+.aview{align-self:stretch;min-width:0;display:flex;flex-direction:column;align-items:flex-start}.aview.fill{flex:1;min-height:0}
 .gfoot{display:flex;align-items:center;gap:8px;min-height:32px;padding-top:6px;align-self:stretch;font-size:12px;color:var(--muted);font-variant-numeric:tabular-nums;white-space:nowrap}
 .gfoot .sum:not(:empty){padding-left:8px;border-left:1px solid var(--line)}.gfoot.own:not(:has(>:not([hidden]):not(:empty))){display:none}
 .pages{display:inline-flex;align-items:center;gap:2px}.pages.busy{opacity:.5}.pg.back svg{transform:rotate(180deg)}
 .pg-r{display:inline-flex;align-items:center;gap:4px;height:28px;padding:0 6px 0 9px;border:0;border-radius:7px;background:transparent;color:var(--ink);font:500 12px var(--sans);font-variant-numeric:tabular-nums;cursor:pointer}.pg-r:hover{background:var(--hover)}.pg-r .ic{color:var(--faint)}
-.chip-f{display:inline-flex;align-items:center;gap:4px;height:22px;padding:0 4px 0 8px;border-radius:999px;background:var(--accent-soft);color:var(--accent);font-size:12px}
-.chip-f .x{display:inline-flex;border:0;background:transparent;color:inherit;cursor:pointer;border-radius:50%;padding:2px}
 .tip{position:fixed;z-index:35;max-width:min(460px,calc(100vw - 16px));padding:8px 10px;background:var(--pop);border:1px solid var(--line);border-radius:8px;box-shadow:var(--float);font-size:12px;color:var(--ink);pointer-events:none}
 .tip .th{display:flex;gap:6px;align-items:center;margin-bottom:5px;color:var(--muted);font-size:11.5px}.tip .th b{color:var(--ink);font-weight:600}
 .tip pre{margin:0;font:11.5px/1.5 var(--mono);white-space:pre-wrap;overflow-wrap:anywhere}.tip .tk{margin-top:7px;padding-top:6px;border-top:1px solid var(--line2);color:var(--faint);font-size:11px}
@@ -436,8 +431,7 @@ dialog.pop,dialog.settings{padding:0;max-width:620px}
 .pop-h{display:flex;align-items:center;gap:8px;padding:12px 12px 8px 20px;border-bottom:1px solid var(--line2)}.pop-h h3{margin:0;flex:1}
 .pop-b{padding:14px 20px 4px;max-height:65vh;overflow:auto}.pop .acts{padding:0 20px 16px}
 .pop-b .defn{max-height:40vh}
-.fform{display:grid;grid-template-columns:150px 1fr;gap:8px;align-items:center}.fform p{grid-column:1/-1}
 /* the Messages tab: each statement */
 .stmt .m{color:var(--faint)}
 /* the right pane's tabs move by dragging; the top bar's History shows when on */
-.rtab.drop{box-shadow:inset 2px 0 0 var(--accent)}#runsBtn.on{color:var(--accent);background:var(--accent-soft)}
+.rtab.drop,.tab.drop{box-shadow:inset 2px 0 0 var(--accent)}#left.drop,#rtabs.drop,.vbox.dropping{box-shadow:inset 0 0 0 2px var(--accent)}.item.dropping{background:var(--accent-soft);border-radius:6px}#runsBtn.on{color:var(--accent);background:var(--accent-soft)}

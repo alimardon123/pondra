@@ -45,14 +45,16 @@ pondra serve lake        # then open http://localhost:8080
   keys (**?**), **Settings** (the gear) and **Sign in**.
 - **The left pane:** a **Filter** box, then **Data** (databases, schemas, tables, views, columns) and
   **Workspace** (the lake's files). The filter narrows both trees to the names that hold what you
-  type; **Esc** clears it.
+  type; **Esc** clears it. Click a group's name to fold it: Data folds to the top, Workspace to the
+  bottom, with a line between them.
 - **The middle:** a tab per open file. A dot on a tab (and beside the file in the Workspace) means
   it has changes not saved; a new file gets it once you type in it. The file's toolbar shows **Save**
   only when there is something to save, and **Ctrl+S** saves the one in front.
 - **Many tabs** keep their names and scroll: the wheel over them scrolls them, a thin bar above them
   shows where you are (drag it), and **⌄** at their right lists them all: a click brings one forward,
   its **✕** closes it, a right-click gives its tab's menu, and **Ctrl** or **Shift** picks several to
-  close at once. A tab comes back where you left it: scrolled to the same place, in the same cell.
+  close at once. Drag a tab onto another to move it there. A tab comes back where you left it:
+  scrolled to the same place, in the same cell.
   **Right-click** a tab to
   **Pin** it: a pinned tab stays at the left, always in sight, shows a pin instead of its **✕**, and
   isn't closed by **Close others**, **Close to the right**, **Close saved** or **Close all**, which the
@@ -61,8 +63,10 @@ pondra serve lake        # then open http://localhost:8080
   this page ran) and **Jobs** (what runs on its own: the schedules). Drag a tab to put it in another place. Details follows the tab in front; a
   table you pick stays there until you switch tabs. In a window up to 1180 px wide the pane opens
   over the page when you pick a table or a column, and closes as soon as you go back to your work.
-- **Each view's ⋯** moves it to the other pane: Workspace can sit as a tab on the right, for
-  instance. Drag a pane's edge to set its width (a double-click resets it).
+- **Each view's ⋯** (or a right-click on its name) moves it to the other pane: Workspace can sit as a
+  tab on the right, for instance. Or drag it there: a group by its name onto the right pane's tabs
+  (it goes beside the tab you drop it on), a tab onto the left pane. Drag a pane's edge to set its
+  width (a double-click resets it).
 
 ### Settings
 
@@ -101,13 +105,16 @@ Click a file in the Workspace to open it in a tab (its tab comes forward if it i
 | A notebook (`notebooks/<name>`, or an `.ipynb` in any other folder) | cells: SQL, Python and Markdown | — |
 | `.sql` | an editor with line numbers | Results, Messages, Chart and Plan (or at the right) |
 | `.py` | the same editor | a console: the file's runs, and a `>>>` line |
-| `.csv`, `.tsv`, `.json`, `.jsonl`, `.parquet` | a table: CSV and JSON edited in place, Parquet read-only | — |
-| `.md`, `.txt` | the editor (**Preview** draws a `.md` file's Markdown) | — |
+| `.csv`, `.tsv`, `.json`, `.jsonl`, `.parquet` | a table: CSV and JSON edited in place, Parquet read-only | Results, Chart and Data profile, as an answer's |
+| `.md`, `.txt` and other text: `.yaml`, `.toml`, `.ini`, `.xml`, `.html`, `.css`, `.js`, `.sh`, a `README` or `Makefile` | the editor (**Preview** draws a `.md` file's Markdown) | — |
 
-The Workspace's **+** (the tab bar's too) makes a notebook, a SQL or a Python file, or a folder, or
-puts a file from your computer in the lake (**Upload a file…**). A new file is in the Workspace at
-once, in the folder it will be saved to; it is not in the lake until you save it, and it asks for its
-path the first time you do.
+The Workspace's **+** (the tab bar's too) makes a notebook, a SQL or a Python file, a file of any
+other kind by its name (**New file…**: `notes.md`, `config.yaml`, `rows.csv`, opened in its editor),
+or a folder, or puts files from your computer in the lake (**Upload files…**, or **Upload a
+folder…** with everything in it). Files and folders dragged from your computer onto the Workspace
+go in too, into the folder you drop them on. A new notebook, SQL or Python file is in the Workspace
+at once, in the folder it will be saved to; it is not in the lake until you save it, and it asks for
+its path the first time you do.
 
 A file is saved where it is: **Ctrl+S** replaces it in the lake. If someone else saved it since you
 opened it, your save is refused and theirs kept; open it again, or save under another name. (Over
@@ -126,8 +133,12 @@ picked, and opens what a right-click opens. A file's menu opens, renames, downlo
 An open file's name in its toolbar renames it too: click it, type, and **Enter** (**Esc** puts it
 back); its kind stays. A tab's right-click and its **⋯** have **Rename…** and **Copy path**.
 A folder's menu has **New notebook here**, **New SQL file here**, **New Python file here**, **New
-folder here**, **Upload a file here…** and **Delete folder…**, which says how many files go, then
-deletes them all, the marker too.
+file here…**, **New folder here**, **Upload files here…**, **Upload a folder here…** and **Delete
+folder…**, which says how many files go, then deletes them all, the marker too.
+
+Drag a file or a folder onto a folder to move it there (onto a file: into that file's folder; below
+the tree: to the top). A folder moves with everything in it, and an open file's tab follows it. The
+folder you would drop into lights up as you drag.
 
 ### SQL files
 
@@ -226,9 +237,15 @@ A file's **Run ▾** (and a notebook's, in `notebooks`) runs it on the node, whe
 **Jobs**, in the right pane (or the calendar at the top), is what runs on its own. Each schedule is a
 card: its name and whether its last run worked, how often it runs and when next, a bar for each of its
 last runs (its height the time it took, red if it failed), and the statement it runs. Click the card
-for its last runs; **Run now** starts it at once (a `CALL` as a job), **Edit** changes how often,
-and its **⋯** opens its file, copies the statement, or drops it. **New schedule** makes one from any
-statement. Flows will be a section here too.
+for its last runs; **Run now** starts it at once (a `CALL` as a job), and its **⋯** opens its file,
+copies the statement, or drops it. Flows will be a section here too.
+
+**Edit** (and **New schedule**) opens a schedule's editor. Pick how often: **Every** so many minutes,
+hours or days, **Daily**, **Weekly** (on the days picked) or **Monthly** (on a day) at a time in a
+time zone, or **Cron** for any cron line. The line below shows it as SQL takes it (`1 hour`,
+`cron 30 6 * * 1,3 UTC`) and can be typed too: the picker follows what you type, and the line what
+you pick. Below them is the statement it runs, in an editor of its own. A schedule the node refuses
+(a cron line it can't read) keeps the editor open with why.
 
 **History**, in the right pane (or the clock at the top), is what ran:
 
@@ -246,11 +263,23 @@ It's the workspace of [Run files as jobs](/pondra/guides/workspace/).
 
 ### Data files
 
-A CSV or JSON file opens as a table you can edit: double-click a cell (or select it and type), **Enter**
-keeps the value, **Tab** moves right, **Esc** undoes. **Add row** and **Add column** are below the
-table. A changed cell is tinted, a new row too, until you save; the toolbar says what changed, with
-**Discard** and **Save**. The lines you didn't touch are saved
-exactly as they were. **Query with SQL** reads the file as a table in a SQL tab. A Parquet file, or
+A CSV or JSON file opens as a table you can edit, in the grid every answer has (with its Chart and
+Data profile):
+
+- **Editing:** double-click a cell, or select it and type; the value is edited in the cell itself.
+  **Enter** keeps it and moves down, **Tab** moves right, **Esc** leaves the cell as it was.
+  **Delete** empties the cells selected, **Ctrl+X** cuts them.
+- **Undo:** **Ctrl+Z** takes back the last change and **Ctrl+Y** (or **Ctrl+Shift+Z**) does it
+  again, as many steps as you like, before a save and after it (the buttons under the table do the
+  same). A paste, or the rows deleted at once, is one step.
+- **Pasting:** **Ctrl+V** pastes cells copied from a spreadsheet or from the grid. One value fills
+  every cell selected; a block starts at the cell selected, and adds the columns and rows it needs
+  when it runs past the table's edges.
+- **Rows and columns:** **Add row** and **Add column** are under the table; right-click a row's
+  number to delete it (or the rows selected).
+
+A changed cell is tinted, a new row too, until you save; the toolbar says what changed, with
+**Discard** and **Save**. The lines you didn't touch are saved exactly as they were. **Query with SQL** reads the file as a table in a SQL tab. A Parquet file, or
 a file over 10 MB, opens read-only (the first 10,000 rows): load it into a table to change it. A
 JSON file that isn't a list of rows (a settings file, say) opens as text.
 
@@ -275,13 +304,16 @@ Every answer (a cell's, a SQL file's) and every data file is shown in the same g
   list of every value selected, **Filter to these values**, Sort and Profile.
 - **A header's right-click:** copy the column's name (or the names of the columns selected), as SQL
   too; copy its values with the header; sort; filter; profile it.
-- **Filtering:** **Filter *column*…** asks how to compare (contains, starts with, does not contain,
-  `=`, `≠`, `>`, `≥`, `<`, `≤`, is NULL, is not NULL) and the value. A chip below the grid shows the filters:
-  click it to change the last one, its **✕** clears them all. Each column has one filter, and they
-  all apply.
+- **Filtering:** **Filter *column*…** (a right-click) asks how to compare (contains, starts with,
+  does not contain, `=`, `≠`, `>`, `≥`, `<`, `≤`, is NULL, is not NULL) and the value; **Filter to
+  these values** keeps the rows holding a value selected. Each filter is a pill above the grid
+  (`city is Oslo`, `amount > 50`): click one to change it, its **✕** takes it away, **+ Filter**
+  adds one on any column, and **Clear all** takes them all away. They all apply. A filtered column
+  has a small filter mark by its name: click it to change its filter.
 - **Sorting:** the small arrow in a header sorts by it (again: the other way).
 - **The line under it** (a SQL file's answer and a cell's alike) says how many rows there are and
-  how long they took (`200,000 rows · 28 ms`), the filters, and the selection's sum and average.
+  how long they took (`200,000 rows · 28 ms`), how many the filters leave, and the selection's sum
+  and average.
 - **Pages:** an answer of more than 10,000 rows comes a page at a time. At the right of the line
   under it, `10,001–20,000 ▾` says which rows show, and **‹ ›** turn the pages (**Alt+Page Down**
   and **Alt+Page Up** in the grid). Its **▾** goes to a page, the first or the last, and sets the
@@ -367,28 +399,57 @@ tea   2     3
   dashed, a materialized view a grid with a solid header, and a view of files (`CREATE EXTERNAL
   TABLE`) a page with a grid on it. Open one to see its columns: each has its type's coloured mark
   and its SQL type on the right; a key column has a key.
-- **Click** a table or a view to see its details on the right. **Double-click** it for its first
-  100 rows: in a new cell when a notebook is in front, else in a new SQL tab. Click a column to put
-  its name where you are typing.
+- **Click** a table, a view, a function, a procedure, a schedule or a secret to see its details on
+  the right. **Double-click** a table or a view to open it in a tab of its own (below). Double-click a
+  column to put its name where you are typing (a click only picks it).
+- **A table's own tab** shows its rows in the grid, with its details at the right. **WHERE** and
+  **ORDER BY** above them pick the rows it reads (Enter reads them again), and so does how many (100,
+  1,000 or 10,000). A table's rows are edited in place as a data file's are: double-click a cell or
+  type, paste a block (it adds the rows it needs, never a column), **Add row**, a row number's
+  right-click to delete rows, **Ctrl Z** and **Ctrl Y**. An empty cell is `NULL`. The toolbar says
+  what changed; click it for the SQL a save runs, in a new SQL tab. **Ctrl S** (or **Save**) runs it
+  as one transaction: the rows added, then the cells changed, then the rows deleted, each row found
+  by its `_row_id`. A value its column can't take (text in a number) is refused before anything is
+  sent. **Discard** reads the rows again. A view, a materialized view and a view of files open read
+  only. The tab comes back with the others when the page is opened again.
 - **Right-click** anything for what can be done with it, each as the SQL it runs (a change that
   can't be undone asks first):
-  - a table, a view or a materialized view: **Preview** (in SQL or Python), **Details and data
-    profile**, **Watch it live**, **Script as…**, **Insert rows…**, **Import rows from a file…** (a CSV,
+  - a table, a view or a materialized view: **Open** (its tab), **Preview** (its first 100 rows: in a
+    new cell when a notebook is in front, else in a new SQL tab; or in Python), **Details and data
+    profile**, **Watch it live** (a SQL tab of its rows, Live on), **Script as…**, **Insert rows…**, **Import rows from a file…** (a CSV,
     JSON or Parquet file from your computer, put in the lake's `imports/` folder and read in by
-    column name), **Download every row…**, **As a Kafka topic…**, **Add a column…**, **Rename…**,
-    **Copy the name** (or its column names, or as Python), **Truncate…** and **Drop…**. **Script as** shows its `SELECT`, `INSERT`, upsert, `UPDATE`, `DELETE`, `MERGE`,
+    column name), **Download every row…**, **As a Kafka topic…**, **New ▸** (a view of it, a
+    materialized view counting it, a copy of it), **Add a column…**, **Rename…**, **Refresh**, **Copy
+    the name** (the whole name, `lake.schema.table`; **Copy the short name** as SQL here writes it; its
+    column names; as Python), **Truncate…** and **Drop…**. **Script as** shows its `SELECT`, `INSERT`, upsert, `UPDATE`, `DELETE`, `MERGE`,
     loading a file, exporting, `CREATE` (from the catalog: its columns, key, partitioning, options)
     and `DROP`, each in SQL or in Python (`db.table("t")`, `db.sql(…)`), to open in a tab or copy;
-  - a column: its values counted, its range and NULLs, **Rename…**, **Change its type…**, **Drop…**;
-  - a schema: a new table, view, materialized view, external table, function, procedure or
-    schedule in it (a template in a new tab), **New table from a file…**, **Copy the table names**,
+  - a column: its values counted, its range and NULLs, **Add a column…**, **Rename…**, **Change its
+    type…**, **Drop…**;
+  - a schema: **New ▸**, a second menu with a table, view, materialized view, external table,
+    function, procedure or schedule in it (a template in a new tab) and a table from a file; **List
+    its tables and views** (as an answer), **Refresh**, **Copy the name**, **Copy the table names**,
     **Drop…**;
-  - the lake: a new schema or table, **Attach a lake or catalog…**, a new database (a server's),
-    **Checkpoint**, **Refresh**, and for an attached one **Detach…**;
+  - the lake: **New ▸** (a schema, a table, a view, …), **Attach a lake or catalog…**, **List its
+    tables and views**, **Who has access…**, a new database (a server's), **Checkpoint**,
+    **Refresh**, **Copy the name**, and for an attached one **Detach…**;
   - **Functions**, **Procedures** and **Schedules**, listed under each schema, as Postgres keeps
     them (`CREATE FUNCTION sales.f …` is in `sales`; a name without a schema is in `public`), and
     **Secrets** under the lake (a secret covers a bucket, not a schema): each one's definition, use
-    or call, start as a job, schedule, and drop; a secret's values are never shown, only replaced.
+    or call, start as a job, schedule, and drop; a secret's values are never shown, only replaced;
+  - **Users and roles** under the lake: **New user…** (a name, a password, superuser or not, the
+    roles it is in) and **New role…** on the group's menu, the statement shown as you fill it in
+    (the password as `'***'`). Click one for how it signs in, its roles and members, its grants (each
+    with a **×** to take it back) and its definition; its menu has **Grant…**, **Its roles…** (a click
+    joins or leaves one), **Set a password…**, **New token…** (shown once), **Limits…**, superuser or
+    not, and **Drop…**.
+- **Who has access…**, on a table's, a schema's or the lake's menu and **Who may use it…** on a
+  secret's, lists who may do what with it: granted on it, or through its schema or every table (those
+  show where they come from), and the superusers. Each grant has a **×** that takes it back at once
+  (`REVOKE`). Below, pick a user or role, what it may do (`SELECT`, `INSERT`, `UPDATE`, `DELETE`) and,
+  for reading a table, which columns, and **Grant**: the `GRANT` it runs is shown as you pick. A
+  user's **Grant…** is the same the other way round: pick what it is on. See
+  [Users, roles and grants](/pondra/guides/security/#users-roles-and-grants).
 - **Workspace** lists the lake's own files (`PUT /files/…`, `files()`) by folder, and your
   notebooks under `notebooks`, with the headings of the one in front as its outline. A new file not
   saved yet is listed too, with the dot. Whoever may read the lake may read its files, from SQL too.
@@ -404,6 +465,8 @@ The panel on the right (its button is at the top right) shows what you picked:
 | **Data profile** (a table's or a view's) | each column's share of NULLs, its distinct values (approximate), its least and greatest value, and a histogram (numbers, dates, times) or its five commonest values. It reads the whole table: the numbers are the table's, not a sample's |
 | A column of an answer | the same, from the rows the answer holds |
 | A file | its size, when it was written, and how SQL reads it |
+| A function, a procedure, a schedule or a secret | what it is, its first actions as buttons (the rest in **More**), its facts (language, arguments, what it returns; how often and when next) and its definition |
+| A user or a role | how it signs in (a password, tokens: each with a **×** to drop it), its roles and members, its limits, its grants (each with a **×**) and its definition |
 | Nothing | the lake: its tables, views, rows and size, and its cluster |
 
 ## Python cells
@@ -489,7 +552,9 @@ The node needs matplotlib (or Pillow) in its Python for this: `pip install matpl
 
 The **Variables** tab of the panel on the right lists what this page's Python holds: each name,
 its type, its size (a frame's rows and columns, a list's length) and a short look at it (a
-frame's columns). **Tab** in a Python cell completes these names.
+frame's columns). **Tab** in a Python cell completes these names, and inside the string given to
+`db.sql("…")` or `db.table("…")` it completes SQL's: the lake's tables, their columns, functions and
+SQL's words, as in a SQL cell.
 
 The **Python** chip says whether a cell is running. **Restart Python** in its menu (or **0 0** on a
 cell after **Esc**) ends it: its variables go, and the next cell starts afresh (temporary tables stay,
@@ -524,14 +589,17 @@ its output; and deletes it. A right-click in its code has cut, copy, paste, comm
 as table or view…**, and **Make it Python** (or **Make it SQL**): the same query either way, `SELECT
 …` becoming `db.sql("""SELECT …""")` and back, so any cell moves between the two.
 The notebook's own **⋯** (in its toolbar) shows its **Versions…**, downloads it as `.ipynb` and
-clears every output. **Ctrl+K** finds every command: a new notebook, file or folder, **Upload a file…**,
+clears every output. **Ctrl+K** finds every command: a new notebook, file or folder, **Upload files…**,
 restarting or choosing Python, the token, the keys.
 
 ## Live answers
 
-A SQL cell's **Live** switch keeps its answer current. The node sends the answer again each time a
-commit changes a table the query reads, and the console redraws it. Nothing runs while nothing
-changes. Turn the switch off and the query stops.
+The **Live** switch keeps an answer current: a SQL cell's, or a SQL file's (at the right of its
+results bar, as a database tool's grid has it). The node sends the answer again each time a commit
+changes a table the query reads, and the console changes the rows in place, lighting the ones that
+changed a moment; a SQL file's bar says when it last changed. Nothing runs while nothing changes.
+Turn the switch off and the query stops. **Watch it live** in a table's menu (the Data tree) opens a
+SQL tab of its own with its first rows, Live on.
 
 ```sql
 SELECT region, sum(amount) AS total FROM sales GROUP BY region ORDER BY region;
@@ -571,9 +639,10 @@ is kept in its metadata (`pondra.view`, `pondra.chart`).
 
 - **Download** saves the notebook to your computer. Jupyter, VS Code and GitHub open it as it is. In
   Jupyter, `%load_ext pondra` makes the `%%sql` cells run (see [Notebooks](/pondra/guides/notebooks/)).
-- **Upload a file…** puts any file from your computer in the lake. An `.ipynb` (from Jupyter or
-  anywhere else) opens as a notebook instead, and **Ctrl+S** then keeps it in the lake. **Upload a
-  file here…** in a folder's menu puts it in that folder, an `.ipynb` too.
+- **Upload files…** puts any files from your computer in the lake. An `.ipynb` (from Jupyter or
+  anywhere else) opens as a notebook instead, and **Ctrl+S** then keeps it in the lake. **Upload
+  files here…** in a folder's menu puts them in that folder, an `.ipynb` too, as does dragging them
+  onto the folder.
 
 ## Keys
 

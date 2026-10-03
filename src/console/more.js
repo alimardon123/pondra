@@ -1,15 +1,14 @@
 // The console's rarer parts (ADR-034, round 29), loaded when first used, so the page's first load
 // doesn't carry them: the History view (the node's runs, what this page ran), the Variables view,
 // search (Ctrl K), choosing the Python, a file run as a job or on a schedule. What they use of the shell comes through `R.helpers`.
-import { on, h, $, secs, count, bytes, utc, icon, svg, S, R, call, run, sessionOf, doBlock, rows, ident, quote, toast, menu, prompt, confirmed, pop, fileUrl, fileSql, writeFile, moreStyle, interruptPython } from './core.js';
+import { on, h, $, secs, count, bytes, utc, icon, svg, S, R, call, run, sessionOf, doBlock, rows, ident, quote, toast, menu, prompt, confirmed, pop, fileUrl, fileSql, moreStyle, interruptPython } from './core.js';
 import { highlighted } from './editor.js';
 import { copyText } from './grid.js';
 import { iconOf, oneLine, FOLDER, download } from './files.js';
-import { cleanName } from './notebook.js';
 
 await moreStyle();
 
-const H = R.helpers, { KIND, pick, act, facts, head, detail, readVars, show, openFile, newFile, restart, kernel } = H;
+const H = R.helpers, { KIND, pick, act, facts, head, detail, readVars, show, openFile, restart, kernel } = H;
 let again = 0;
 
 /** A SQL cell with its notebook's Python in it: through Python when it names a table Python holds
@@ -89,7 +88,7 @@ export async function runs() {
   const codeOf = x => { if (x.routine !== 'do') return null; try { const a = JSON.parse(x.args || '{}'); return a.code ? { code: a.code, language: a.language || 'python' } : null; } catch { return null; } };
   const firstLine = code => { const ls = code.split('\n').map(l => l.trim()).filter(l => l && !l.startsWith('#')); return ls.length ? oneLine(ls[0], 90) + (ls.length > 1 ? ' …' : '') : ''; };
   const nameOf = x => { const c = codeOf(x); return fileOf(x) || (c ? firstLine(c.code) || 'DO' : x.routine === 'do' ? 'DO (a Python cell)' : x.routine); };
-  const nodeActs = x => [fileOf(x) ? ['Open the file', () => openFile(fileOf(x)), true] : null, codeOf(x) ? ['Open in a new file', async () => { const d = await newFile(codeOf(x).language === 'python' ? 'python' : 'sql'); d.ed.value = codeOf(x).code; d.changed(); }, true] : null,
+  const nodeActs = x => [fileOf(x) ? ['Open the file', () => openFile(fileOf(x)), true] : null, codeOf(x) ? ['Open in a new file', () => R.helpers.newWith(codeOf(x).language === 'python' ? 'python' : 'sql', codeOf(x).code), true] : null,
     codeOf(x) ? ['Copy the code', () => copyText(codeOf(x).code)] : null, ['Copy its id', () => copyText(String(x.id))]].filter(Boolean);
   const nodeLook = x => pop(`Run ${String(x.id).slice(0, 12)}`, h('div', {}, facts([['What', codeOf(x) ? `DO LANGUAGE ${codeOf(x).language}` : x.routine], ['Who', x.caller], ['Status', x.status], ['Started', utc(x.started).toLocaleString()], ['Ended', x.ended ? utc(x.ended).toLocaleString() : null], ['Took', took(x)], ['Id', String(x.id)]]),
     codeOf(x) ? h('pre', { class: 'defn', html: highlighted(codeOf(x).code, codeOf(x).language === 'python' ? 'python' : 'sql') }) : null, x.error ? h('pre', { class: 'err' }, x.error) : null), nodeActs(x));
@@ -111,7 +110,7 @@ export async function runs() {
 /** What to do with something this page ran: open it as a new file, put it in the one in front,
  * copy it, run it again, see its plan. */
 function pageActs(x) {
-  const fresh = async () => { const d = await newFile(x.kind === 'python' ? 'python' : 'sql'); d.ed.value = x.src; d.changed(); return d; };
+  const fresh = () => R.helpers.newWith(x.kind === 'python' ? 'python' : 'sql', x.src);
   return [['Open in a new file', fresh, true], S.doc?.put ? ['Put it in the tab in front', () => { S.doc.put(x.src); }] : null, ['Copy it', () => copyText(x.src)],
     ['Run it again', async () => (await fresh()).run()], x.kind === 'sql' ? ['See its plan', async () => { const d = await fresh(); d.tab = 'plan'; d.run(); }] : null].filter(Boolean);
 }
@@ -188,25 +187,17 @@ export async function newFolder(at = '') {
   } catch (err) { toast('No folder made: ' + err.message, true); }
   R.helpers.refreshFiles();
 }
-/** A file from this computer into the lake's files (a notebook opens, unless it is for a folder: then it is put there; the rest are put). */
-export function upload(at = '') {
-  const input = h('input', { type: 'file', hidden: true, multiple: true });
-  input.onchange = async () => {
-    const fs = [...input.files];
-    input.remove();
-    for (const f of fs) {
-      if (/\.ipynb$/i.test(f.name) && (!at || at === 'notebooks/')) { try { R.helpers.openNotebook(JSON.parse(await f.text()), cleanName(f.name) || 'uploaded'); toast(`Opened ${f.name}: Ctrl+S keeps it in the lake`); } catch (err) { toast(`Could not open ${f.name}: ${err.message}`, true); } continue; }
-      const rel = at + f.name;
-      try { await call(fileUrl(rel), { method: 'PUT', body: f }); toast(`Put in the lake: files/${rel}`); } catch (err) {
-        if (err.status !== 409) { toast(`${f.name}: ${err.message}`, true); continue; }
-        if (!confirmed(`files/${rel} is there already. Replace it with the one picked?`)) continue; // (a file is replaced only as it is: its version asked for)
-        const version = ((await call(fileUrl(rel), { method: 'HEAD' })).headers.get('etag') || '').replace(/"/g, '');
-        if (await writeFile(rel, f, version, f.type || 'application/octet-stream')) toast(`Replaced files/${rel}`);
-      }
-    }
-    R.helpers.refreshFiles();
-  };
-  document.body.append(input); input.click();
+/** A new file of any kind in `at`, by its name (`notes.md`, `config.yaml`, `rows.csv`): put in the lake, empty, and opened in its editor. */
+export async function newAny(at = '') {
+  const name = ((await prompt('New file', 'Its name, with its kind: notes.md, config.yaml, rows.csv, report.sql…', 'notes.md')) || '').trim().replace(/^\/+/, ''), rel = at + name;
+  if (!name) return;
+  if (/(^|\/)(\.{0,2}|\s+)(\/|$)|\/$/.test(rel)) return toast('Not a file name: no empty part, . or ..', true);
+  if (S.files?.some(f => f.path === 'files/' + rel)) { toast(`files/${rel} is there already: opened`); return R.helpers.openFile(rel); }
+  const body = /\.json$/i.test(rel) ? '[]\n' : /\.ipynb$/i.test(rel) ? JSON.stringify({ cells: [], metadata: {}, nbformat: 4, nbformat_minor: 5 }) : '';
+  try { await call(fileUrl(rel), { method: 'PUT', body }); } catch (err) { return toast('No file made: ' + err.message, true); }
+  if (rel.includes('/')) S.open.add('dir:' + rel.slice(0, rel.lastIndexOf('/'))); // (so it shows)
+  await R.helpers.refreshFiles();
+  R.helpers.openFile(rel);
 }
 /** Delete a file, a notebook (every version) or a folder (every file in it, its marker too), once asked. */
 export async function remove(f, folder) {
@@ -235,7 +226,7 @@ export function createAs(sql) {
   pop('Create as', h('div', { class: 'form' }, segs, h('label', {}, 'Its name: schema.name, or a name (in public)', input), code,
     h('small', {}, 'A table keeps the rows as they are now; a view runs its query each time it is read; a materialized view keeps its rows up to date as its tables change.')),
   [['Create', async () => { try { await run(text()); toast(`Made ${input.value.trim()}`); H.refresh(); } catch (e) { toast(e.message, true); } }, true],
-    ['Open in a new tab', async () => { const d = await newFile('sql'); d.ed.value = text(); d.changed(); }], ['Cancel', () => {}]]);
+    ['Open in a new tab', () => R.helpers.newWith('sql', text())], ['Cancel', () => {}]]);
   requestAnimationFrame(() => { input.focus(); input.select(); });
 }
 

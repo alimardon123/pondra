@@ -16,7 +16,7 @@
 /* the chart's and the plan's bars */
 .cbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:0 0 10px;font-size:12px;color:var(--muted)}.cbar .grow{flex:1}
 .csel{display:inline-flex;align-items:center;gap:6px}.csel select{height:26px;border:1px solid var(--line);border-radius:6px;background:var(--surface);color:var(--ink);font-size:12px;padding:0 6px}
-.segs{display:inline-flex;border:1px solid var(--line);border-radius:7px;overflow:hidden}.seg{height:26px;padding:0 10px;border:0;background:var(--surface);color:var(--muted);font-size:12px;cursor:pointer}.seg.on{background:var(--accent-soft);color:var(--accent);font-weight:600}
+.segs{display:inline-flex;border:1px solid var(--line);border-radius:7px;overflow:hidden}.seg{height:26px;padding:0 10px;border:0;background:var(--surface);color:var(--muted);font-size:12px;cursor:pointer}.seg.on{background:var(--accent-soft);color:color-mix(in srgb,var(--accent) 80%,var(--ink));font-weight:600}
 .art svg text{fill:var(--muted);font-size:11px}
 /* the plan as a graph: each step above those it reads */
 .pgraph{overflow:auto;padding:4px 0 16px}
@@ -111,6 +111,8 @@ dialog.pop:has(.sa){max-width:860px;width:calc(100% - 40px)}.sa{display:flex;fle
 
 /* (moved from console.css, round 29: loaded with what uses them) Python's console */
 .term{background:var(--sunk);padding:8px 14px;font:12.5px/1.55 var(--mono)}
+/* (an answer in the console is the grid every answer has, not the console's text) */
+.term .gridwrap{font:13px/1.45 var(--sans)}
 .log{display:flex;flex-direction:column;gap:8px}
 .entry .in{color:var(--muted)}.entry .res{margin-top:2px}.entry .took{color:var(--faint);font-size:11.5px}
 .entry .said{margin:0}
@@ -182,3 +184,22 @@ dialog.pop.wide{max-width:980px;width:calc(100% - 40px)}.vers{display:grid;grid-
 .param .pabout{font:400 12px var(--sans);color:var(--muted);max-width:30ch;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 /* a SQL file's answers: the statements that did something else, in Messages */
 .linkb,.stmts-left.more{border:0;background:none;padding:0;color:var(--accent);cursor:pointer;font:inherit}.stmts-left.more{font-size:12px}.linkb:hover,.stmts-left.more:hover{text-decoration:underline}
+/* the grid's less used parts (gridmore.js): a data file's cells edited, filters as pills, a filtered column's mark */
+.gt td.chg{background:color-mix(in srgb,var(--warn) 13%,var(--surface));--el:inset 2px 0 0 var(--warn)}
+.gt tr.new td{background:color-mix(in srgb,var(--ok) 9%,var(--surface))}.gt tr.new td.i{color:var(--ok);font-weight:600}
+.gt td.editing{position:relative;overflow:visible}
+.celled{position:absolute;inset:0;min-width:100%;height:100%;border:0;border-radius:0;padding:0 14px;font:inherit;color:inherit;text-align:inherit;background:var(--surface);box-shadow:inset 0 0 0 2px var(--accent);outline:none;z-index:3}
+.pills{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin:0 0 8px}
+.pill{display:inline-flex;align-items:center;height:26px;border:1px solid color-mix(in srgb,var(--accent) 35%,var(--line));border-radius:999px;background:var(--accent-soft);font-size:12px;overflow:hidden}
+.pill button,.pills>.add{display:inline-flex;align-items:center;gap:5px;height:100%;border:0;background:none;color:var(--ink);font:inherit;cursor:pointer}
+.pill .pl{padding:0 4px 0 10px}.pill .pl .ic{color:var(--accent)}.pill .x{width:26px;justify-content:center;color:var(--muted)}
+.pill button:hover{background:color-mix(in srgb,var(--accent) 14%,transparent)}.pill .x:hover{color:var(--ink)}
+.pills>.add{height:26px;padding:0 10px;border:1px dashed var(--line);border-radius:999px;color:var(--muted);font-size:12px}.pills>.add:hover{color:var(--accent);border-color:var(--accent)}
+.gt .hf{display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;flex:none;border:0;border-radius:4px;background:var(--accent-soft);color:var(--accent);cursor:pointer;padding:0}.gt .hf[hidden]{display:none}
+.fform{display:grid;grid-template-columns:auto 1fr;gap:8px 12px;align-items:center;min-width:340px}.fform label{color:var(--muted);font-size:12px}.fform p{grid-column:1/-1;margin:4px 0 0}
+.datafoot .sep{width:1px;height:16px;background:var(--line);margin:0 2px}
+.livest{display:inline-flex;align-items:center;gap:6px}
+/* a schedule's editor (jobs.js): how often, picked or as cron, kept in step; what it runs */
+dialog.pop:has(.sched){max-width:680px;width:calc(100% - 40px)}.sched .lbl{font-size:12.5px;font-weight:600;margin-bottom:6px}.sched .opts{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:10px 0}.sched .opts input,.sched .opts select{width:auto}.sched .opts label{display:inline-flex;flex-direction:row;align-items:center;gap:6px;color:var(--muted)}.sched input[type=number]{width:76px}.sched .as{display:flex;flex-direction:row;align-items:center;gap:8px;color:var(--faint);font-size:12px}.sched .as input{flex:1;height:28px;font:12px var(--mono)}.sched .opts .mono{font-family:var(--mono)}.sched .editor{border:1px solid var(--line);border-radius:8px;min-height:84px;background:var(--surface)}.sched .acts{display:flex;gap:8px;padding:4px 0 14px}.sched .bad:empty{display:none}
+.access .gform{display:flex;flex-direction:column;gap:10px}.access .glist{display:flex;flex-direction:column;gap:2px;max-height:260px;overflow:auto}.gline{display:flex;align-items:center;gap:8px;min-height:32px;padding:3px 0;border-bottom:1px solid var(--line2)}.gline .ic{display:inline-flex;color:var(--muted)}.gline .gn{font-weight:500;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.gline .meta{color:var(--faint);font-size:11.5px}.gline .pills{margin:0 0 0 auto;justify-content:flex-end}.pill.via{background:var(--sunk);border-color:var(--line);color:var(--muted)}.pill.via .pl{padding:0 10px}.access .segs.cols{display:flex;flex-wrap:wrap;gap:4px;border:0;overflow:visible}.access .segs.cols .seg{border:1px solid var(--line);border-radius:6px;font-family:var(--mono)}.access label.check{flex-direction:row;align-items:center;gap:8px}.access .opts{display:flex;gap:8px}.access .lbl small{color:var(--faint);font-weight:400}.access .sub{color:var(--muted);font-size:12px}.access .bad{color:var(--err)}.access .warn{padding:8px 10px;border-radius:8px;background:color-mix(in srgb,var(--warn) 12%,transparent)}.access .bad:empty{display:none}#details .gline+.sub,#details .dsect+.sub{color:var(--muted);font-size:12px;margin:4px 0}.access .acts{display:flex;gap:8px;padding:4px 0 2px}.tok{user-select:all;word-break:break-all;white-space:pre-wrap}#details .gline .pills{flex-wrap:wrap}
+.tpick{display:flex;align-items:center;gap:8px;flex:none;margin-bottom:8px}.tpick label{display:flex;align-items:center;flex:1;min-width:0;height:30px;border:1px solid var(--line);border-radius:6px;background:var(--bg)}.tpick label:focus-within{border-color:var(--accent)}.tpick label span{padding:0 8px;font:600 11px var(--mono);color:var(--muted)}.tpick input{flex:1;min-width:0;height:100%;border:0;background:none;outline:0;color:var(--ink);font:12.5px var(--mono)}.tpick select{height:30px;border:1px solid var(--line);border-radius:6px;background:var(--surface);color:var(--ink);font-size:12px;padding:0 6px}.docbar .tname{font-weight:600}

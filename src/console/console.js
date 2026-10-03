@@ -16,7 +16,7 @@ import { h, $, fill, said, esc, store, count, bytes,  ICONS, icon, svg, typeMark
   MODE, SESSION, sessionOf, S, base, call, run, rows, doBlock, ident, qualified, home, toast, menu, VERSION, ask } from './core.js';
 import { grid, copyText } from './grid.js';
 import { Notebook, openNotebook, openPlain, cleanName, doneText } from './notebook.js';
-import { workspace, drawWorkspace, treeItem, upload, newFolder, registerFiles, lastStatement } from './files.js';
+import { workspace, drawWorkspace, treeItem, upload, newFolder, newAny, registerFiles, lastStatement } from './files.js';
 
 R.helpers = {};
 const H = R.helpers;
@@ -101,7 +101,7 @@ function drawLeft() {
   views.forEach((v, i) => {
     renderOnce(v);
     const f = folded(v), tools = (v.tools || []).filter(t => !t.hidden?.()).map(t => h('button', { class: 'icon sm', title: t.title, 'aria-label': t.title, id: t.domId || null, onclick: e => { e.stopPropagation(); t.run(e); } }, icon(t.icon)));
-    const head = h('div', { class: 'ghead' }, h('button', { class: 'gtitle', 'aria-expanded': String(!f), onclick: () => fold(v) }, h('span', { class: 'tw', html: svg(f ? 'chev' : 'chevd', 14, 2) }), h('h2', { id: v.id + 'Title' }, viewTitle(v))),
+    const head = h('div', { class: 'ghead', draggable: 'true', ondragstart: e => e.dataTransfer.setData(VIEW, v.id), oncontextmenu: e => { e.preventDefault(); viewMenu(e, v); } }, h('button', { class: 'gtitle', 'aria-expanded': String(!f), onclick: () => fold(v) }, h('span', { class: 'tw', html: svg(f ? 'chev' : 'chevd', 14, 2) }), h('h2', { id: v.id + 'Title' }, viewTitle(v))),
       h('span', { class: 'gtools' }, tools, h('button', { class: 'icon sm', title: `${viewTitle(v)}: more`, 'aria-label': `${viewTitle(v)}: more`, onclick: e => viewMenu(e.currentTarget, v) }, icon('dots'))));
     const g = h('section', { class: 'group' + (f ? ' folded' : ''), 'data-view': v.id, style: !f && weights[v.id] ? `flex:${weights[v.id]} 1 0` : null }, head, f ? null : v.box);
     if (i && !f && parts.length && !parts.at(-1).classList.contains('folded')) parts.push(divider(parts.at(-1), g));
@@ -179,9 +179,7 @@ function drawRight() {
   const views = rightViews();
   if (!views.some(v => v.id === S.tab)) S.tab = views[0]?.id;
   const tab = v => h('button', { class: 'rtab', role: 'tab', id: 'rtab-' + v.id, tabindex: v.id === S.tab ? '0' : '-1', 'aria-selected': String(v.id === S.tab), 'aria-controls': 'rbody', draggable: 'true', title: 'Drag it to move it',
-    onclick: () => { S.tab = v.id; drawRight(); drawTop(); }, ondragstart: e => { e.dataTransfer.setData('text/x-pondra-tab', v.id); e.dataTransfer.effectAllowed = 'move'; },
-    ondragover: e => { if (e.dataTransfer.types.includes('text/x-pondra-tab')) { e.preventDefault(); e.currentTarget.classList.add('drop'); } }, ondragleave: e => e.currentTarget.classList.remove('drop'),
-    ondrop: e => { e.preventDefault(); const id = e.dataTransfer.getData('text/x-pondra-tab'); if (id && id !== v.id) moveTab(id, v.id, e.offsetX > e.currentTarget.offsetWidth / 2 ? 1 : 0); } }, viewTitle(v));
+    onclick: () => { S.tab = v.id; drawRight(); drawTop(); }, oncontextmenu: e => { e.preventDefault(); viewMenu(e, v); }, ondragstart: e => e.dataTransfer.setData(VIEW, v.id) }, viewTitle(v));
   const cur = views.find(v => v.id === S.tab);
   fill($('#rtabs'), h('div', { class: 'tlist', role: 'tablist', 'aria-label': 'The right pane' }, views.map(tab)), h('span', { class: 'grow' }), cur ? h('button', { class: 'icon sm', title: `${viewTitle(cur)}: more`, 'aria-label': `${viewTitle(cur)}: more`, onclick: e => viewMenu(e.currentTarget, cur) }, icon('dots')) : null);
   if (!cur || $('#right').hidden) return;
@@ -191,6 +189,18 @@ function drawRight() {
   renderView(cur);
 }
 const drawViews = () => { drawLeft(); drawRight(); };
+/** A view dragged by its group's head or its tab: onto the other pane it moves there, onto a tab of
+ * the right pane it goes beside it (tabs.js). */
+const VIEW = 'text/x-pondra-view';
+function viewDrops() {
+  let lit;
+  const light = x => { if (lit !== x) { lit?.classList.remove('drop'); (lit = x)?.classList.add('drop'); } };
+  for (const el of [$('#left'), $('#rtabs')]) {
+    el.addEventListener('dragover', e => { if (e.dataTransfer.types.includes(VIEW)) { e.preventDefault(); light(e.target.closest('.rtab') || el); } });
+    el.addEventListener('dragleave', e => { if (!el.contains(e.relatedTarget)) light(null); });
+    el.addEventListener('drop', e => { const id = e.dataTransfer.getData(VIEW), t = e.target.closest('.rtab'); light(null); if (id) { e.preventDefault(); menus().then(m => m.dropView(id, el === $('#left') ? 'left' : 'right', t?.id.slice(5), t && e.offsetX > t.offsetWidth / 2)); } });
+  }
+}
 /** The right pane's view again (what was picked changed). */
 function detail() { if (!$('#right').hidden) { const v = R.views.find(x => x.id === S.tab && sideOf(x) === 'right'); if (v) renderView(v); } }
 function show(id) { const v = R.views.find(x => x.id === id); if (!v) return; if (sideOf(v) === 'right') { S.tab = id; pane('right', true); } else { pane('left', true); fold(v, false); } }
@@ -245,7 +255,8 @@ async function closeDoc(doc) {
 // them, a thin bar above them shows where they are, ⌄ lists them all; right-click: pin, close some)
 function drawTabs() {
   const tab = (d, i) => {
-    const t = h('div', { class: 'tab' + (d === S.doc ? ' on' : '') + (d.pinned ? ' pinned' : ''), role: 'tab', tabindex: d === S.doc ? '0' : '-1', 'aria-selected': String(d === S.doc), title: (d.path ? `files/${d.path}` : d.title) + (d.pinned ? ' (pinned)' : ''), 'aria-keyshortcuts': 'Delete',
+    const t = h('div', { class: 'tab' + (d === S.doc ? ' on' : '') + (d.pinned ? ' pinned' : ''), role: 'tab', tabindex: d === S.doc ? '0' : '-1', 'aria-selected': String(d === S.doc), title: (d.tip || (d.path ? `files/${d.path}` : d.title)) + (d.pinned ? ' (pinned)' : ''), 'aria-keyshortcuts': 'Delete',
+      draggable: 'true', ondragstart: e => e.dataTransfer.setData('text/x-pondra-doc', i),
       onclick: e => { if (!e.target.closest('.x')) activate(d); }, onauxclick: e => { if (e.button === 1) closeDoc(d); }, oncontextmenu: e => { e.preventDefault(); menus().then(m => m.tabMenu(e, d)); } },
       h('span', { class: 'ic k-' + d.kind, html: svg(d.icon, 15) }), h('span', { class: 'tn' }, d.title),
       d.dirty ? h('span', { class: 'dirty', title: 'Not saved', 'aria-label': 'not saved' }) : null,
@@ -285,6 +296,19 @@ function thumb() {
     th.addEventListener('pointerup', () => { th.removeEventListener('pointermove', move); th.classList.remove('drag'); }, { once: true });
   });
   new ResizeObserver(() => { thumb(); $('#tabbar .tab.on')?.scrollIntoView({ block: 'nearest', inline: 'nearest' }); }).observe(bar); // (narrower, the tab in front still in sight)
+  // a tab dragged onto another goes before it (after it, past its middle); pinned ones stay in front of the rest
+  const over = e => e.dataTransfer.types.includes('text/x-pondra-doc') && e.target.closest('.tab');
+  bar.addEventListener('dragover', e => { const t = over(e); bar.querySelector('.tab.drop')?.classList.remove('drop'); if (t) { e.preventDefault(); t.classList.add('drop'); } });
+  bar.addEventListener('drop', e => {
+    const t = over(e), from = S.docs[e.dataTransfer.getData('text/x-pondra-doc')];
+    if (!t || !from) return;
+    e.preventDefault();
+    const to = S.docs[t.dataset.i];
+    S.docs.splice(S.docs.indexOf(from), 1);
+    S.docs.splice(S.docs.indexOf(to) + (e.clientX > t.getBoundingClientRect().left + t.offsetWidth / 2), 0, from);
+    drawTabs(); remember();
+  });
+  bar.addEventListener('dragend', () => bar.querySelector('.tab.drop')?.classList.remove('drop'));
 }
 /** Pin a tab (to the left, always in sight, not closed with the others), or unpin it. */
 H.pin = pin;
@@ -310,12 +334,12 @@ function status() {
 H.status = status;
 function welcome() {
   const b = ([, ic, label, fn]) => h('button', { class: 'btn', onclick: fn }, icon(ic), label);
-  return h('div', { class: 'doc welcome' }, h('div', {}, h('h1', {}, 'Pondra'), h('p', {}, 'Open a file from the Workspace, a table from Data, or start something new.'), h('div', { class: 'acts2' }, NEW.map(b))));
+  return h('div', { class: 'doc welcome' }, h('div', {}, h('h1', {}, 'Pondra'), h('p', {}, 'Open a file from the Workspace, a table from Data, or start something new.'), h('div', { class: 'acts2' }, NEW.filter(x => x[0] !== 'uploaddir').map(b))));
 }
 /** What the page makes new, for its welcome page, + menus, ⋯ menu and search: [id, icon, label, run]. */
 const NEW = [['newnb', 'notebook', 'New notebook', () => newNotebook()], ['newsql', 'filesql', 'New SQL file', () => newFile('sql')], ['newpy', 'filepy', 'New Python file', () => newFile('python')],
-  ['newdir', 'folder', 'New folder', () => newFolder()], ['upload', 'up', 'Upload a file…', () => upload()]];
-const newMenu = at => menu(at, [...NEW.slice(0, -1), '-', NEW.at(-1)].map(x => x === '-' ? x : { icon: x[1], label: x[2], run: x[3] }));
+  ['newany', 'file', 'New file…', () => newAny()], ['newdir', 'folder', 'New folder', () => newFolder()], ['upload', 'up', 'Upload files…', () => upload()], ['uploaddir', 'folder', 'Upload a folder…', () => upload('', true)]];
+const newMenu = at => menu(at, [...NEW.slice(0, -2), '-', ...NEW.slice(-2)].map(x => x === '-' ? x : { icon: x[1], label: x[2], run: x[3] }));
 let untitled = 0;
 /** A name for a new file in `dir`: `untitled`, or `untitled-2`… (one no tab has). */
 const taken = p => S.docs.some(d => (d.path || d.untitled) === p);
@@ -335,6 +359,8 @@ function newFile(kind, at = kind === 'python' ? 'scripts/' : 'queries/') {
   return kind === 'python' ? import('./pyfile.js').then(m => made(new m.PythonDoc({ untitled }))) : import('./sqlfile.js').then(m => made(new m.SqlDoc({ untitled }))); // (a promise of it: its module loaded when first needed)
 }
 H.newFile = newFile;
+/** A new tab holding `text` (a definition, a job's code, a script): unchanged until it is typed in, so it closes without asking. */
+H.newWith = async (kind, text) => { const d = await newFile(kind); d.ed.value = text; d.paramsBar?.(); d.marks?.(); d.ed.focus(); return d; };
 H.close = closeDoc;
 /** Open a lake file (a path under `files/`, or `notebooks/<name>`) in its tab: the open one comes forward. */
 const opening = new Map(); // (a path being opened: a second click waits for the same tab)
@@ -360,12 +386,13 @@ async function opened(path, opts) {
   } catch (e) { if (!opts.quiet) toast(`Could not open ${path}: ${e.message}`, true); return null; }
 }
 H.openFile = openFile;
-/** SQL in a tab and run: into the notebook in front (a cell), else a new SQL tab. */
-async function query(sql) {
-  if (S.doc?.kind === 'notebook') return S.doc.peek(sql);
+/** SQL in a tab and run: into the notebook in front (a cell), else a new SQL tab; `live`: always a
+ * SQL tab, its answer followed live. */
+async function query(sql, live) {
+  if (S.doc?.kind === 'notebook' && !live) return S.doc.peek(sql);
   const p = S.pick, d = await newFile('sql');
   if (p && p.type !== 'file' && p.type !== 'doc') { S.pick = p; S.pickedOn = d; mark(); detail(); } // (a table's first rows, in a tab of their own: its details stay)
-  d.ed.value = sql;
+  d.ed.value = sql; d.live = live;
   d.run();
 }
 H.query = query;
@@ -427,11 +454,12 @@ function lakeNode(name, schemas, current, note, depth = 0) {
  * `register.objectKind`), and a schema's (`schema: true`: functions, procedures, schedules, as
  * Postgres keeps them), filled when opened (objects.js). */
 const objects = f => import('./objects.js').then(f);
+const groups = f => import('./groups.js').then(f); // (functions, procedures, schedules, secrets)
 function groupNode(lake, g, schema) {
   const key = `g:${lake}.${schema ? schema + '.' : ''}${g.id}`, kids = h('div', { class: 'kids', role: 'group', hidden: !S.open.has(key) }, h('div', { class: 'empty' }, '…'));
-  const fill = () => objects(m => m.fill(g.id, kids, schema));
+  const fill = () => groups(m => m.fill(g.id, kids, schema));
   if (!kids.hidden) fill();
-  return treeItem({ key, kids, depth: schema ? 2 : 1, icon: g.icon, iconCls: 'k-group', name: g.title, dataKind: 'group', onopen: fill, onclick: tw => tw.click(), menu: e => objects(m => m.groupMenu(e, g.id, schema)) });
+  return treeItem({ key, kids, depth: schema ? 2 : 1, icon: g.icon, iconCls: 'k-group', name: g.title, dataKind: 'group', onopen: fill, onclick: tw => tw.click(), menu: e => groups(m => m.groupMenu(e, g.id, schema)) });
 }
 function schemaNode(lake, schema, tables, only, current) {
   const key = `s:${lake}.${schema}`;
@@ -442,10 +470,10 @@ function tableNode(t) {
   // (its columns a level in, under its name, past its guide)
   const [ic, word] = KIND[t.o.kind] || KIND.table, keyed = new Set(t.o.key || []);
   const kids = h('div', { class: 'kids', role: 'group', hidden: !S.open.has(t.key) }, t.columns.map(c =>
-    h('div', { class: 'row col', role: 'treeitem', tabindex: '-1', 'aria-level': '4', style: 'padding-left:69px', title: `${c.n}: ${sqlType(c.d)} (${c.d}). Click: put the name where you are typing; right-click: more`, onclick: () => S.doc?.put?.(ident(c.n)), oncontextmenu: e => { e.preventDefault(); objects(m => m.columnMenu(e, t, c)); } },
+    h('div', { class: 'row col', role: 'treeitem', tabindex: '-1', 'aria-level': '4', style: 'padding-left:69px', title: `${c.n}: ${sqlType(c.d)} (${c.d}). Double-click: put the name where you are typing; right-click: more`, onclick: e => { for (const r of document.querySelectorAll('#data .row.on')) r.classList.remove('on'); e.currentTarget.classList.add('on'); }, ondblclick: () => S.doc?.put?.(ident(c.n)), oncontextmenu: e => { e.preventDefault(); objects(m => m.columnMenu(e, t, c)); } },
       typeMark(c.d), h('span', { class: 'nm' }, c.n), keyed.has(c.n) ? icon('key', 'kk') : null, h('span', { class: 'ty' }, sqlType(c.d)))));
   const it = treeItem({ key: t.key, kids: t.columns.length ? kids : null, depth: 2, icon: ic, iconCls: 'k-table', name: t.t, dataKey: t.key, dataKind: t.o.kind, on: S.pick?.type === 'object' && S.pick.t.key === t.key,
-    title: `${t.q}: a ${word}. Click: its details; double-click: its first rows; right-click: more`, onclick: () => pick({ type: 'object', t }), ondblclick: () => query(`SELECT * FROM ${t.q} LIMIT 100`), menu: e => objects(m => m.tableMenu(e, t)) });
+    title: `${t.q}: a ${word}. Click: its details; double-click: open it (its rows${t.o.kind === 'table' ? ', to edit' : ''}); right-click: more`, onclick: () => pick({ type: 'object', t }), ondblclick: () => openFile('table:' + t.q), menu: e => objects(m => m.tableMenu(e, t)) });
   return it;
 }
 async function dataTree(box) {
@@ -494,23 +522,13 @@ function pick(p, tab) {
 }
 H.pick = pick;
 function mark() {
-  const key = S.pick?.type === 'object' ? S.pick.t.key : S.pick?.type === 'file' ? 'file:' + (S.pick.f.rel || S.pick.f.path?.replace(/^files\//, '')) : null;
-  document.querySelectorAll('.vbox .row.on[data-key]').forEach(r => r.classList.remove('on'));
+  const key = S.pick?.type === 'object' ? S.pick.t.key : S.pick?.type === 'item' ? S.pick.key : S.pick?.type === 'file' ? 'file:' + (S.pick.f.rel || S.pick.f.path?.replace(/^files\//, '')) : null;
+  document.querySelectorAll('.vbox .row.on[data-key], .row.col.on').forEach(r => r.classList.remove('on')); // (a column picked gives way too)
   if (key) document.querySelectorAll(`.vbox .row[data-key="${CSS.escape(key)}"]`).forEach(r => r.classList.add('on'));
 }
 const facts = pairs => h('dl', { class: 'facts' }, pairs.filter(([, v]) => v != null && v !== '' && !(Array.isArray(v) && !v.length)).flatMap(([k, v]) => [h('dt', {}, k), h('dd', {}, Array.isArray(v) ? v.join(', ') : v)]));
 const act = (ic, label, title, fn) => h('button', { class: 'btn small', title, onclick: fn }, ic ? icon(ic) : null, label);
 const head = (ic, name, kind, cls = '') => h('div', { class: 'dh' }, h('span', { class: 'dtile ' + cls, html: svg(ic, 20) }), h('div', {}, h('div', { class: 'dn' }, name), h('div', { class: 'dk' }, kind)));
-function summary() {
-  const objs = S.objects || [], by = k => objs.filter(t => t.c === home() && t.o.kind === k).length;
-  const tabled = objs.filter(t => t.c === home() && t.o.rows != null);
-  const s = S.info || {};
-  return [head('db', home() || 'Pondra', MODE === 'lakes' ? 'a database' : 'this lake', 'k-db'),
-    facts([['Tables', count(by('table'))], ['Views', count(by('view') + by('files'))], ['Materialized', by('materialized view') ? count(by('materialized view')) : null],
-      ['Rows in files', count(tabled.reduce((a, t) => a + (t.o.rows || 0), 0))], ['Size in files', bytes(tabled.reduce((a, t) => a + (t.o.bytes || 0), 0))],
-      ['Nodes', s.nodes ? String(s.nodes.length) : null], ['This node', s.role], ['Leader', s.leader], ['Commits', s.hwm != null ? count(s.hwm) : null]]),
-    h('p', { class: 'muted' }, 'Pick a table, a view or a file, or a column of an answer, to see it here.')];
-}
 const filePick = path => { const rel = path.replace(/^files\//, ''), nb = rel.match(/^notebooks\/([^/]+?)(?:\.ipynb)?$/); return { type: 'file', f: nb ? { rel: 'notebooks/' + nb[1], name: nb[1] + '.ipynb', notebook: true } : S.files?.find(f => f.path === 'files/' + rel) || { rel, path: 'files/' + rel } }; };
 H.pickFile = path => pick(filePick(path));
 /** The details follow the tab in front (its file, or what it is while it has none): a table or a
@@ -518,7 +536,7 @@ H.pickFile = path => pick(filePick(path));
 function follow(doc) {
   if (S.pick && S.pick.type !== 'file' && S.pick.type !== 'doc' && S.pickedOn === doc) return;
   const saved = doc.kind === 'notebook' ? doc.version && (doc.plain ? doc.path : `notebooks/${doc.name}`) : doc.path;
-  S.pick = saved ? filePick(saved) : doc.kind ? { type: 'doc', doc } : null;
+  S.pick = doc.pickOf ? doc.pickOf() : saved ? filePick(saved) : doc.kind ? { type: 'doc', doc } : null; // (a table's tab: the table)
   mark(); detail();
 }
 
@@ -691,9 +709,9 @@ function core() {
   register.cellKind({ id: 'python', label: 'Python', language: 'python', placeholder: 'db.sql("SELECT …")      # runs on the node; cells share variables', run: async (text, signal, cell) => { kernel('busy', cell.nb); try { return await run(doBlock(text), signal, undefined, S.pageRows, sessionOf(cell.nb)); } finally { kernel('idle', cell.nb); } } });
   register.cellKind({ id: 'markdown', label: 'Markdown', language: 'markdown', placeholder: 'Markdown: # a heading, **bold**, *italic*, [a link](https://…), ![a picture](data/chart.png), - a list, | a | table |' });
   register.renderer({ id: 'error', order: 10, match: r => r.kind === 'error', render: r => h('pre', { class: 'err' }, r.message) });
-  register.renderer({ id: 'rows', order: 20, match: r => r.kind === 'rows', render: (r, cell) => grid(r, { footer: !!cell, name: S.doc?.name, explore: i => explore(r, i, cell),
-    // (a cell's: Chart, and a SQL cell's Plan, as a SQL file's pane has them; the one open, and the chart's settings, kept with the notebook)
-    chart: cell?.chartKeep, view: cell?.view, onview: v => { cell.view = v; cell.nb.changed(); },
+  register.renderer({ id: 'rows', order: 20, match: r => r.kind === 'rows', render: (r, cell) => grid(r, { footer: true, name: S.doc?.name, explore: i => explore(r, i, cell),
+    // (Chart and Data profile, and a SQL cell's Plan, as a SQL file's pane has them; a cell's open one, and its chart's settings, kept with the notebook)
+    chart: cell?.chartKeep, view: cell?.view, onview: v => { if (cell) { cell.view = v; cell.nb.changed(); } },
     views: cell?.kind === 'sql' ? [['plan', 'Plan', 'plan', () => import('./plan.js').then(m => m.planView(lastStatement(r.src || cell.src)))]] : [] }) });
   register.renderer({ id: 'figures', order: 30, match: r => r.kind === 'done' && Array.isArray(r.value?.images), render: r => h('div', { class: 'figs' }, r.value.images.map(b => h('img', { class: 'fig', alt: 'a figure the code drew', src: 'data:image/png;base64,' + b }))) });
   register.renderer({ id: 'text', order: 40, match: r => r.kind === 'text', render: r => said(r.text) });
@@ -705,11 +723,11 @@ function core() {
     { icon: 'refresh', title: 'Refresh', domId: 'refresh', run: () => refresh() }] });
   register.view({ id: 'workspace', side: 'left', order: 20, title: 'Workspace', render: box => workspace(box), tools: [
     { icon: 'plus', title: 'New: a notebook, a file or a folder', domId: 'newfile', menu: false, run: e => newMenu(e.currentTarget) }] });
-  register.view({ id: 'details', side: 'right', order: 10, title: 'Details', tree: false, render: (box, p) => p?.type === 'object' ? objectDetail(p.t) : p?.type === 'file' ? fileDetail(p.f) : p?.type === 'result' ? resultDetail(p) : p?.type === 'doc' && S.docs.includes(p.doc) ? docDetail(p.doc) : summary() });
+  register.view({ id: 'details', side: 'right', order: 10, title: 'Details', tree: false, render: (box, p) => p?.type === 'item' ? p.render() : p?.type === 'object' ? objectDetail(p.t) : p?.type === 'file' ? fileDetail(p.f) : p?.type === 'result' ? resultDetail(p) : p?.type === 'doc' && S.docs.includes(p.doc) ? docDetail(p.doc) : details().then(m => m.summary()) });
   register.view({ id: 'variables', side: 'right', order: 20, title: 'Variables', tree: false, render: () => variables() });
   register.view({ id: 'runs', side: 'right', order: 30, title: 'History', tree: false, render: () => runs() });
   register.view({ id: 'jobs', side: 'right', order: 40, title: 'Jobs', tree: false, render: async () => (await import('./jobs.js')).jobs() });
-  for (const [id, title, ic, order, schema] of [['functions', 'Functions', 'fn', 10, 1], ['procedures', 'Procedures', 'play', 20, 1], ['schedules', 'Schedules', 'calendar', 30, 1], ['secrets', 'Secrets', 'key', 40]]) register.objectKind({ id, title, icon: ic, order, schema: !!schema });
+  for (const [id, title, ic, order, schema] of [['functions', 'Functions', 'fn', 10, 1], ['procedures', 'Procedures', 'play', 20, 1], ['schedules', 'Schedules', 'calendar', 30, 1], ['secrets', 'Secrets', 'key', 40], ['users', 'Users and roles', 'user', 50]]) register.objectKind({ id, title, icon: ic, order, schema: !!schema });
   registerFiles(register);
   NEW.forEach(([id, ic, title, run]) => register.command({ id, title, run }));
   for (const [id, title, keys, fn] of [['search', 'Search tables, files and commands', 'Ctrl K', palette], ['left', 'Show or hide the left pane', 'Ctrl B', () => pane('left')], ['bottom', 'Show or hide the bottom panel', 'Ctrl J', () => pane('bottom')],
@@ -764,7 +782,7 @@ async function start() {
   $('#helpBtn').onclick = () => settings('keys');
   for (const [id, b] of [['runs', '#runsBtn'], ['jobs', '#jobsBtn']]) $(b).onclick = () => { if (!$('#right').hidden && S.tab === id) pane('right', false); else show(id); };
   $('#signin').onclick = signin;
-  edges();
+  edges(); viewDrops();
   sides();
   drawSignin(); drawActions(); drawRail(); drawPanes(); status();
   // (extensions, loaded after these modules, register meanwhile: drawn with the core's from here on)
@@ -775,9 +793,9 @@ async function start() {
   started = true;
   drawActions(); drawRail();
   const nb = hash.get('notebook'), file = hash.get('file');
+  await restoreTabs(); // (the tabs open last time, then the one the address names in front)
   if (nb) await openFile('notebooks/' + nb);
   else if (file) await openFile(file);
-  if (!S.docs.length) await restoreTabs();
   if (!S.docs.length) newNotebook();
   setInterval(() => { if (document.visibilityState === 'visible') stats(); }, 15000);
   emit('start', pondra);
