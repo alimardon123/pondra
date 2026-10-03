@@ -369,8 +369,10 @@ pub async fn apply(lake: &Lake, d: Ddl) -> Result<Value> {
             let target = lake.attached.read().unwrap().iter().find(|(n, _)| *n == name).map(|(_, l)| l.clone());
             let (mut bases, mut branches) = (None, vec![]);
             if let Some(t) = &target {
-                bases = t.cat.get::<crate::branch::Bases>(crate::branch::BASES).await?;
-                branches = t.cat.scan::<crate::branch::Pin>("pn/", "pn0").await?.into_iter().map(|(_, p)| p.lake).collect();
+                // (as the lake is now, not as this node last saw it: a branch made or dropped just now counts)
+                let now = Lake::open(&t.url, false, false).await?;
+                bases = now.cat.get::<crate::branch::Bases>(crate::branch::BASES).await?;
+                branches = now.cat.scan::<crate::branch::Pin>("pn/", "pn0").await?.into_iter().map(|(_, p)| p.lake).collect();
             }
             ensure!(branches.is_empty(), "{name} has branches ({}): drop them first", branches.join(", "));
             let dropped = match (std::env::var("PONDRA_SERVER_URL"), &bases, &target) {

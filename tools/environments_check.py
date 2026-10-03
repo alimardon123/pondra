@@ -3,7 +3,10 @@
 its writes are its own; prod keeps the files it reads while it lives, through merges, purges and
 retention; `pondra.diff` tells their rows apart; a branch of a branch; `DROP DATABASE` lets go.
 
-  environments_check.py [--new target/release/pondra] [--work DIR] [--port 9780]
+  environments_check.py [--new target/release/pondra] [--work DIR] [--port 9780] [--s3]
+
+With --s3 the lakes are on s3://$PONDRA_BUCKET (AWS_* point at R2, MinIO or tools/sim_r2.py), where a
+branch reads its base's files through the bucket's own store.
 
 prod's node tiers only when asked (`POST /tier`), keeps its past one second (`--retain-secs 1`) and
 purges changed rows every round (`PONDRA_PURGE_ROWS=1`), so what a branch reads would be deleted at
@@ -14,15 +17,25 @@ import argparse, glob, json, os, shutil, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from upgrade_check import Node, Failed, stop_all  # (a node started and stopped as a scheduler would)
+from upgrade_check import Node, Failed, stop_all, gone  # (a node started and stopped as a scheduler would)
 
 
-def parquet(folder):
-    return sorted(glob.glob(os.path.join(folder, "data", "**", "*.parquet"), recursive=True))
+def keys(lake):
+    """Every object of a lake: a folder's files, or a bucket's keys under its prefix."""
+    if not lake.startswith("s3://"):
+        return sorted(glob.glob(os.path.join(lake, "**", "*"), recursive=True))
+    import boto3
+    bucket, prefix = lake[len("s3://"):].split("/", 1)
+    s3 = boto3.client("s3", endpoint_url=os.environ.get("AWS_ENDPOINT_URL") or os.environ.get("AWS_ENDPOINT"))
+    return sorted(o["Key"] for page in s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix + "/") for o in page.get("Contents", []))
 
 
-def environments_check(bin, work, port):
-    prod_dir, dev_dir = os.path.join(work, "prod"), os.path.join(work, "dev")
+def parquet(lake):
+    return [k for k in keys(lake) if "/data/" in k and k.endswith(".parquet")]
+
+
+def environments_check(bin, work, port, root):
+    prod_dir, dev_dir = root + "/prod", root + "/dev"
     env = {"PONDRA_PURGE_ROWS": "1"}
     prod = Node(bin, prod_dir, port, work, "--retain-secs", "1", env=env).start()
     q = prod.q
@@ -74,7 +87,7 @@ def environments_check(bin, work, port):
     took = time.time() - t0
     copied = parquet(dev_dir)
     checks["CREATE DATABASE dev CLONE prod copies no file (the log tail and the workspace only)"] = \
-        len(copied) == 0 and os.path.isdir(dev_dir) and len(parquet(prod_dir)) == files_before
+        len(copied) == 0 and len(keys(dev_dir)) > 0 and len(parquet(prod_dir)) == files_before
     checks["prod reads dev at once: every row as prod had it, ids and versions too (the log tail too)"] = \
         until(lambda: rows(prod, every.replace("sales.orders", "dev.sales.orders")) == before) is True \
         and rows(prod, keyed.replace(" k ", " dev.k ")) == before_k and rows(prod, "SELECT odd, n, s FROM dev.sales.totals ORDER BY odd") == totals
@@ -132,8 +145,9 @@ def environments_check(bin, work, port):
     checks["WITH (schemas = (sales)) takes that schema alone"] = rows(prod, "SELECT count(*) FROM sales_only.sales.orders") == rows(prod, "SELECT count(*) FROM sales.orders") \
         and "not found" in refused(prod, "SELECT * FROM sales_only.k").lower() + refused(prod, "SELECT * FROM sales_only.public.k").lower()
     checks["WITH NO DATA: the tables, empty"] = rows(prod, "SELECT count(*) FROM fixtures.sales.orders") == [(0,)]
-    checks["refused by name: a clone of a database not here, a branch in a bucket of a lake on disk"] = \
-        "no database" in refused(prod, "CREATE DATABASE x CLONE nowhere") and "lives where its base does" in refused(prod, "CREATE DATABASE y LOCATION 's3://b/y' CLONE prod")
+    elsewhere = os.path.join(work, "y") if root.startswith("s3://") else "s3://b/y"
+    checks["refused by name: a clone of a database not here, a branch where its base isn't (a bucket, a disk)"] = \
+        "no database" in refused(prod, "CREATE DATABASE x CLONE nowhere") and "lives where its base does" in refused(prod, f"CREATE DATABASE y LOCATION '{elsewhere}' CLONE prod")
 
     # DROP DATABASE lets go: prod's replaced files go once nothing pins them.
     for name in ["dev2", "dev", "sales_only", "fixtures"]:
@@ -143,7 +157,7 @@ def environments_check(bin, work, port):
         time.sleep(11)
         prod.post("/tier")
     checks["DROP DATABASE: the branches' folders go, prod's pins with them, and prod lets the files they held go"] = \
-        not os.path.exists(dev_dir) and rows(prod, "SELECT name, branches FROM pondra.databases") == [("prod", 0)] and len(parquet(prod_dir)) < held
+        not keys(dev_dir) and rows(prod, "SELECT name, branches FROM pondra.databases") == [("prod", 0)] and len(parquet(prod_dir)) < held
     checks["prod answers as it should after it all"] = rows(prod, "SELECT count(*) FROM sales.orders") == [(len([r for r in before if r[2] <= 900]),)]
     checks["(cloned in {:.1f} s)".format(took)] = True
     return checks
@@ -154,15 +168,19 @@ def main():
     ap.add_argument("--new", default=os.path.join(HERE, "..", "target", "release", "pondra"), help="this build's binary")
     ap.add_argument("--work", default="", help="where the lakes and logs go (default: a new temporary folder, removed if every check passes)")
     ap.add_argument("--port", type=int, default=9780)
+    ap.add_argument("--s3", action="store_true", help="the lakes on s3://$PONDRA_BUCKET")
     a = ap.parse_args()
     work = a.work or tempfile.mkdtemp(prefix="pondra-environments-")
     os.makedirs(work, exist_ok=True)
+    root = f"s3://{os.environ['PONDRA_BUCKET']}/environments-{os.getpid()}-{int(time.time())}" if a.s3 else work
     try:
-        checks = environments_check(os.path.abspath(a.new), work, a.port)
+        checks = environments_check(os.path.abspath(a.new), work, a.port, root)
     except Failed as e:
         checks = {"ran to the end": False, "error": str(e)}
     finally:
         stop_all()
+        if a.s3:
+            gone(root)
     ok = all(v is True for k, v in checks.items() if k != "error")
     print(json.dumps({**checks, "ok": ok}, indent=1))
     if ok and not a.work:

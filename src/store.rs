@@ -794,7 +794,11 @@ impl Lake {
             }
             _ => {}
         }
-        self.attached.write().unwrap().push((name.to_string(), other));
+        // (the catalog's sync and an ATTACH may both open it at once, on a bucket for seconds: one is kept)
+        let mut attached = self.attached.write().unwrap();
+        if !attached.iter().any(|(n, _)| n == name) {
+            attached.push((name.to_string(), other));
+        }
         Ok(())
     }
 

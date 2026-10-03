@@ -2,7 +2,8 @@
 # then carries on; a lake of a newer format is refused; a node drains before it stops (a leader on
 # a simulated R2 bucket too, where its followers always have a flush in flight); a cluster
 # of the newest release is upgraded to this build a node at a time under load
-# (tools/upgrade_check.py all); a table's past: UNDROP and retention (tools/history_check.py, ADR-043).
+# (tools/upgrade_check.py all); a table's past: UNDROP and retention (tools/history_check.py, ADR-043);
+# branch databases on disk and in a bucket (tools/environments_check.py, ADR-047).
 # Every pull request to main, and by hand.
 name: upgrade
 
@@ -40,13 +41,18 @@ jobs:
         run: |
           set -o pipefail
           python3 tools/history_check.py --new target/release/pondra --work "$RUNNER_TEMP/history" | tee history.json
-      - name: A leader stopped on a bucket (simulated R2) hands over at once
+      - name: Branch databases (CREATE DATABASE dev CLONE prod)
+        run: |
+          set -o pipefail
+          python3 tools/environments_check.py --new target/release/pondra --work "$RUNNER_TEMP/environments" | tee environments.json
+      - name: A leader stopped on a bucket (simulated R2) hands over at once; branches in a bucket
         run: |
           set -o pipefail
           python3 tools/sim_r2.py --port 9000 > "$RUNNER_TEMP/sim_r2.log" 2>&1 &
           export AWS_ENDPOINT=http://127.0.0.1:9000 AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_REGION=auto AWS_ALLOW_HTTP=true PONDRA_BUCKET=testbucket
           for i in $(seq 30); do python3 -c "import boto3; boto3.client('s3', endpoint_url='http://127.0.0.1:9000', region_name='us-east-1').create_bucket(Bucket='testbucket')" 2>/dev/null && break; sleep 1; done
           python3 tools/upgrade_check.py drain --s3 --new target/release/pondra --work "$RUNNER_TEMP/upgrade-s3" | tee upgrade-s3.json
+          python3 tools/environments_check.py --s3 --new target/release/pondra --work "$RUNNER_TEMP/environments-s3" | tee environments-s3.json
       - uses: actions/upload-artifact@v6
         if: always()
         with:
@@ -55,7 +61,10 @@ jobs:
             upgrade.json
             upgrade-s3.json
             history.json
+            environments.json
+            environments-s3.json
             ${{ runner.temp }}/history/*.log
+            ${{ runner.temp }}/environments*/**/*.log
             ${{ runner.temp }}/upgrade/**/*.log
             ${{ runner.temp }}/upgrade-s3/**/*.log
           retention-days: 14
