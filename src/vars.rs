@@ -1,4 +1,4 @@
-//! Variables, and a file's parameters (round 31, ADR-043). `DECLARE $mode = 'full';` declares a
+//! Variables, and a file's parameters (round 31, ADR-044). `DECLARE $mode = 'full';` declares a
 //! variable of the script's own (its type and its default are both optional: `DECLARE $n BIGINT;` is
 //! NULL), `DECLARE PARAMETER $day DATE = current_date - 1;` one its caller may give a value for
 //! (`DECLARE PARAMETER $region VARCHAR;` has no value until one is given), and `$day = $day + 1;`
@@ -103,6 +103,35 @@ fn vars<T>(f: impl FnOnce(&mut BTreeMap<String, Var>) -> T) -> Result<T> {
     }
     let s = crate::temp::current().context(NO_SESSION)?;
     crate::temp::with(&s, false, |x| Ok(f(&mut x.variables)))
+}
+
+/// Are there variables to keep (a procedure's or file run's own, or a session's)?
+pub fn scoped() -> bool { OWN.try_with(|_| ()).is_ok() || crate::temp::current().is_some() }
+
+/// Run `f` with variables of its own, keeping the values given (a script sent with no session).
+pub async fn local<F: std::future::Future>(f: F) -> F::Output { OWN.scope(Vars::default(), f).await }
+
+/// A variable's value now (a block keeps it, to put back when it ends: `script.rs`).
+pub fn get(name: &str) -> Option<Var> { vars(|m| m.get(name).cloned()).ok().flatten() }
+
+/// A variable set as it was (None: not there).
+pub fn put(name: &str, v: Option<Var>) {
+    let _ = vars(|m| match v {
+        Some(v) => m.insert(name.to_string(), v),
+        None => m.remove(name),
+    });
+}
+
+/// A one-row column's value as a variable's (a loop's row, `INTO`).
+pub fn of_column(col: &dyn Array) -> Result<Var> {
+    let one = datafusion::arrow::array::make_array(col.to_data());
+    var_of(&RecordBatch::try_from_iter([("v", one)])?)
+}
+
+/// Text as a variable's value (a handler's `$error`).
+pub fn text(t: &str) -> Var {
+    let sql = format!("arrow_cast('{}', 'Utf8')", t.replace('\'', "''"));
+    Var { sql, shown: Some(t.to_string()), ty: "Utf8".into(), declared: None }
 }
 
 /// Is a run's set of given values in force (a file run's cells share one)?
@@ -258,10 +287,51 @@ async fn evaluate(app: &App, expr: &str, cast: Option<Cast<'_>>) -> Result<Var> 
         None => format!("({expr})"),
     };
     let sql = crate::routines::prepare(&app.lake, &format!("SELECT {e} AS v"), &HashMap::new(), &HashMap::new()).await?;
-    let rows = Box::pin(app.query(&sql, Some("0"))).await?;
+    let rows = answer(app, &sql).await?;
     let row = datafusion::arrow::compute::concat_batches(&rows[0].schema(), &rows)?;
     ensure!(row.num_rows() == 1, "a variable holds one value: {expr} gave {} rows", row.num_rows());
     var_of(&row)
+}
+
+/// What `sql` answers. One that reads nothing (a script's `IF $i < 10`, `$i = $i + 1`) is planned
+/// and its values folded, as DataFusion folds constants, with no query run; anything else (a
+/// table, an aggregate, a function that may answer otherwise next time) runs as a query.
+pub async fn answer(app: &App, sql: &str) -> Result<Vec<RecordBatch>> {
+    if let Some(rows) = folded(&app.lake, sql).await {
+        return Ok(rows);
+    }
+    Box::pin(app.query(sql, Some("0"))).await
+}
+
+async fn folded(lake: &crate::store::Lake, sql: &str) -> Option<Vec<RecordBatch>> {
+    use datafusion::logical_expr::{simplify::SimplifyContext, Expr, LogicalPlan};
+    use datafusion::optimizer::simplify_expressions::ExprSimplifier;
+    if sql.as_bytes().windows(4).any(|w| w.eq_ignore_ascii_case(b"from")) {
+        return None; // (a table or a subquery's)
+    }
+    let plan = lake.session_with(1).state().create_logical_plan(sql).await.ok()?;
+    let simplifier = ExprSimplifier::new(SimplifyContext::builder().with_current_time().build());
+    let literal = |e: &Expr| match simplifier.simplify(e.clone().unalias()).ok()? {
+        Expr::Literal(v, _) => Some(v),
+        _ => None,
+    };
+    let LogicalPlan::Projection(p) = &plan else { return None };
+    let one = |input: &LogicalPlan| matches!(input, LogicalPlan::EmptyRelation(e) if e.produce_one_row);
+    let rows = match p.input.as_ref() {
+        input if one(input) => 1,
+        LogicalPlan::Filter(f) if one(&f.input) => match literal(&f.predicate)? {
+            datafusion::scalar::ScalarValue::Boolean(b) => b.unwrap_or(false) as usize,
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let schema = Arc::new(plan.schema().as_arrow().clone());
+    let columns = p.expr.iter().zip(schema.fields()).map(|(e, f)| {
+        let v = literal(e)?;
+        let v = if &v.data_type() == f.data_type() { v } else { v.cast_to(f.data_type()).ok()? };
+        v.to_array_of_size(rows).ok()
+    });
+    Some(vec![RecordBatch::try_new(schema.clone(), columns.collect::<Option<Vec<_>>>()?).ok()?])
 }
 
 /// The Arrow type of a default (planned, not run), for a value given in its place; None if it
@@ -357,6 +427,12 @@ pub fn parameters(text: &str) -> Vec<Param> {
             Some(Change::Set { name, value }) => {
                 unused(&value, &set, &mut out);
                 set.push(name);
+                continue;
+            }
+            _ if crate::script::is(s) => {
+                let bound = crate::script::binds(s); // (a loop's row, INTO, a block's DECLARE: the script's own)
+                unused(s, &[&set[..], &bound[..]].concat(), &mut out);
+                set.extend(bound);
                 continue;
             }
             _ => {}

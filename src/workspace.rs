@@ -219,7 +219,7 @@ async fn python(app: &App, name: &str, code: &str, vars: Option<&RecordBatch>, s
 
 // ---------------------------------------------------------------- a file's parameters
 
-/// What a file a run may be given (ADR-043), or None when it doesn't say and takes any value: a
+/// What a file a run may be given (ADR-044), or None when it doesn't say and takes any value: a
 /// `.sql` file's `DECLARE PARAMETER`s and `$name`s used before anything sets them; a `.py` file's
 /// `# %% tags=["parameters"]` cell (jupytext's and papermill's); a notebook's cell tagged
 /// `parameters` (Python or `%%sql`) and the `DECLARE PARAMETER`s of its SQL cells.

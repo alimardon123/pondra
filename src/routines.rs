@@ -400,6 +400,15 @@ async fn check(lake: &Lake, name: &str, r: &Routine) -> Result<()> {
             let mut known: HashMap<String, Value> = r.params.iter().map(|p| (p.name.clone(), Value::Null)).chain((1..=r.params.len()).map(|i| (i.to_string(), Value::Null))).collect();
             for s in split(&r.body) {
                 use crate::vars::Change;
+                if crate::script::is(&s) {
+                    // (a block, a branch, a loop: what it uses is known, or set inside it)
+                    let bound = crate::script::binds(&s);
+                    if let Some(n) = crate::vars::names(&s).into_iter().find(|n| !known.contains_key(n) && !bound.contains(n)) {
+                        bail!("{name}: no value for ${n} (give it one, or declare it: DECLARE ${n} = …)");
+                    }
+                    known.extend(bound.into_iter().map(|n| (n, Value::Null)));
+                    continue;
+                }
                 let (check, sets) = match crate::vars::change(&s) {
                     Some(Change::Declare { name, default, .. }) => (default.map(|d| format!("SELECT {d}")), Some(name)), // (its variables: known after their DECLARE)
                     Some(Change::Set { name, value }) => (Some(format!("SELECT {value}")), Some(name)),
@@ -1073,9 +1082,18 @@ pub enum Outcome {
 }
 
 /// The complete statements of `text` — each ends at a `;` outside strings (`'…'`, `$$…$$`,
-/// `$tag$…$tag$`), quoted names and comments — and what follows the last one, if it holds more
-/// than whitespace and comments (the shell waits for its `;`).
+/// `$tag$…$tag$`), quoted names and comments, a block's at its `END`'s (`script::joined`) — and what
+/// follows the last one, if it holds more than whitespace and comments (the shell waits for its `;`).
 pub fn statements(text: &str) -> (Vec<String>, String) {
+    let (out, rest) = pieces(text);
+    match crate::script::joined(out) {
+        (out, None) => (out, rest),
+        (out, Some(open)) => (out, format!("{open};{rest}")), // (a block not closed yet: what follows it)
+    }
+}
+
+/// `statements`, each `;` a statement's end (a block's statements apart).
+fn pieces(text: &str) -> (Vec<String>, String) {
     let (mut out, mut start, mut i, mut code) = (vec![], 0, 0, false);
     while i < text.len() {
         let rest = &text[i..];
@@ -1140,6 +1158,9 @@ pub async fn one(app: &App, sql: &str, who: Who, job: Option<String>) -> Result<
 }
 
 async fn one_of(app: &App, sql: &str, who: Who, job: Option<String>) -> Result<Outcome> {
+    if crate::script::is(sql) {
+        return Box::pin(crate::script::run(app, sql, &HashMap::new(), who, job)).await; // (a block, a branch, a loop, PRINT…: ADR-045)
+    }
     if let Some(c) = crate::vars::change(sql) {
         return Box::pin(crate::vars::apply(app, c)).await; // (DECLARE $day …, $day = …: the scope's variable)
     }
@@ -1201,27 +1222,7 @@ pub async fn script(app: &App, sql: &str, params: &HashMap<String, Value>, views
 }
 
 async fn script_of(app: &App, sql: &str, views: &HashMap<String, String>, who: Who, job: Option<String>) -> Result<Outcome> {
-    let (all, mut last) = (split(sql), Outcome::Done(j!({})));
-    for (i, s) in all.iter().enumerate() {
-        let job = job.as_ref().map(|j| if all.len() == 1 { j.clone() } else { format!("{j}:{i}") });
-        let out = async {
-            let s = match crate::vars::change(s) {
-                Some(_) => s.clone(), // (`DECLARE $day …`, `$day = …`: worked out by `one`)
-                None => prepare(&app.lake, s, &HashMap::new(), views).await?,
-            };
-            Box::pin(one(app, &s, who, job)).await
-        };
-        last = match out.await {
-            Err(e) if all.len() > 1 => return Err(e.context(format!("statement {}: {}", i + 1, short(s)))),
-            r => r?,
-        };
-    }
-    Ok(last)
-}
-
-fn short(s: &str) -> String {
-    let s = s.split_whitespace().collect::<Vec<_>>().join(" ");
-    if s.chars().count() > 80 { format!("{}…", s.chars().take(80).collect::<String>()) } else { s }
+    crate::script::run(app, sql, views, who, job).await // (each statement prepared and run by `one`, blocks as they say)
 }
 
 /// `CALL name(…)`: the procedure's name and arguments, if `sql` is one.
@@ -1267,7 +1268,7 @@ pub fn start_of(sql: &str) -> Option<(String, Vec<FunctionArg>, String)> {
 }
 
 /// Does `sql` run a procedure (`CALL`, `pondra.start`)? Then it goes to `one`, not to a query.
-pub fn runs_procedure(sql: &str) -> bool { call_of(sql).is_some() || start_of(sql).is_some() || do_of(sql).is_some() }
+pub fn runs_procedure(sql: &str) -> bool { call_of(sql).is_some() || start_of(sql).is_some() || do_of(sql).is_some() || crate::script::is(sql) }
 
 /// `DO LANGUAGE python $$ … $$` (Postgres's anonymous code block; the language may come after
 /// the code): (language, body). What a console's Python cell sends (ADR-030).
