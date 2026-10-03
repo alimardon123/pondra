@@ -15,6 +15,22 @@ One Rust binary replaces the Kafka + Flink + Spark + metastore + ZooKeeper stack
 
 Start more copies on the same bucket to scale out. The only state is object storage. There's no JVM, no database server and no coordination service.
 
+**Now (2026-10-03, round 33, toward 0.33.0): run it for years.**
+
+1. **Every statement remembered** (ADR-047, `history.rs`): `SELECT * FROM pondra.history` has a row
+   per statement from every door (who, which door and address, node, session, class, the
+   statement, how it ended, ms, rows, nodes), written a second later off the statement's path, at
+   most 500 rows a second a node (the rest counted). A statement over `PONDRA_SLOW_MS` (1 s) keeps
+   the plan that ran with each operator's rows and time, and its trace: each node's share when it
+   ran across three nodes, a step at a time for a shuffle; it writes a line to the node's log too.
+   An admin reads every row, a user their own. Point lookups over Postgres: 0.414 ms off, 0.418 ms
+   on (three runs each). Writing it found that any commit, history's every second included, made
+   every remembered answer stale: history's commits are quiet now (invariant 224), and a repeated
+   query on a lake only read stays at 0.30 ms instead of 3.6 ms. `harness.py history`: 9 of 9.
+2. **Scripts and tasks** (ADR-045, the console's thread, PRs #17 and #19): `FOR … PARALLEL n`,
+   `ASYNC`, `AWAIT ALL`, `AWAIT $h` and `AWAIT 'id'`; `VALUES` with a subquery; task graphs
+   (`AFTER`, `WHEN`, `pondra.result`, retries, timeouts, `on_failure`, `EXECUTE TASK`, `SUSPEND`).
+
 **Then (2026-10-02, round 32, complete: 0.31.0, 0.31.1 and 0.32.0): lean and fast** (the owner, 2026-10-01: a round only for
 optimizing; performance first):
 

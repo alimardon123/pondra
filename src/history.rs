@@ -1,4 +1,4 @@
-//! The query history (`pondra.history`, ADR-046): every statement a door was sent, a row each:
+//! The query history (`pondra.history`, ADR-047): every statement a door was sent, a row each:
 //! who ran it, through which door and from where, on which node and in which session, how long it
 //! took, how many rows it answered and how it ended. Kept `PONDRA_HISTORY_DAYS` (7) in a table of
 //! the lake's own (`pondra$history`, hidden); an admin reads every row, anyone else their own.
