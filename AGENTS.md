@@ -34,7 +34,7 @@ The owner's design principles, which every change must respect:
    - no key is written more than once a second.
 
    Round 29 builds the budget and fixes what breaks these today: log segments named by time,
-   the hourly orphan sweep's full listing, and the inbox bell (`docs/roadmap.md`, C5).
+   the hourly orphan sweep's full listing, and the inbox bell (C5: invariant 182).
 8. **Every round leaves it better on every angle** (the owner, 2026-09-30): faster, more
    performant, simpler, easier to use, more functional, versatile, scalable and powerful — while
    staying lightweight and efficient. The gates hold each round to it (`logs/gates/`: speed and
@@ -2087,24 +2087,10 @@ Known limits, in the order they matter:
     tables it would have made, Spark's function library, EXPLAIN's text (Pondra plans its own
     way), number literals typed DECIMAL (as Postgres and DuckDB do), strings read as `Utf8View`.
 
-Good next moves: `docs/roadmap.md` (2026-09-28, after round 23) is the plan, with the reasons.
-Rounds 17–23 are done except what needs the owner (publishing, cluster-bench runs). In short:
-
-1. **Round 24, SQL and Python as one** (ADR-027, proposed: `CREATE FUNCTION` in SQL and Python,
-   procedures that can do anything Python can, with round 23's secrets; decorators that take a
-   notebook's function as it is; schedules; a run log). Then round 25, the console, the server (a
-   folder of lakes as databases) and databases attached, TEMP tables and changes to attached
-   lakes; 26 security; 27 conformance to its end (D1's pass rate climbs every round from 67%);
-   28 scale proven, with burst functions; 29 in-process and the browser.
-2. **Publish 0.23.0** (ADR-025's names and round 23; `v0.22.2`, the fix of invariant 93, is
-   tagged at c47e2c7 and releases the old way): tag `v0.23.0` once its build run is green; the
-   release publishes that run's packages.
-3. **Security before anyone else's data:** TLS on the node port and mutual TLS between nodes, then
-   grants (roadmap E3).
-4. **Then:** machines in one data centre for the cluster bench, the in-process library, the
-   browser, and streaming depth by evidence (Top-N, timers, the rest of Nexmark).
-
-The owner decides whether to link their Windows laptop, and when to publish.
+Good next moves: `docs/roadmap.md` (2026-10-03) is the shortest path to 1.0, at the owner's bar
+("high quality, stable, workable, fully featured"): round 33 closes with the soak and environments;
+34 is SQL as people write it and scale on machines; 35 in-process and fitting in (databases
+attached, BI tools); 36 is 1.0 (the promises, a security review, signed packages, the docs).
 
 ## Conventions
 
