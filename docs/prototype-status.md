@@ -15,6 +15,17 @@ One Rust binary replaces the Kafka + Flink + Spark + metastore + ZooKeeper stack
 
 Start more copies on the same bucket to scale out. The only state is object storage. There's no JVM, no database server and no coordination service.
 
+**Begun (2026-10-03, round 34): SQL as people write it.** DuckDB's spellings, rewritten where SQL
+comes in (`friendly.rs`, invariant 225): `PIVOT` and `UNPIVOT` (DuckDB's statements and the
+standard's), `COLUMNS(…)`, `* RENAME`, `ORDER BY ALL`, `FETCH FIRST`, list comprehensions and
+lambdas, `({…}).a`, `max_by`/`arg_max`/`min_by`/`arg_min`, `list()`, `string_split`, `::JSON` and
+`json_extract`, DuckDB's `ASOF [LEFT] JOIN … ON`, a select's alias in its `WHERE`, `SUMMARIZE`,
+`USING SAMPLE`, and a `TABLESAMPLE` that samples (DataFusion ignored it and returned every row).
+`harness.py friendly`: 30 forms answer as DuckDB 1.5.5 does over the same 2,000 rows, and the same
+spread over three nodes, over Postgres and in views. 69 of the 73 everyday features probed on
+2026-10-03 now work; the four left (`CREATE TYPE … AS ENUM`, `CREATE SEQUENCE`, `CREATE INDEX`,
+`COMMENT ON`) wait on the SQL registry's decision.
+
 **Now (2026-10-03, round 33, toward 0.33.0): run it for years.**
 
 1. **Every statement remembered** (ADR-048, `history.rs`): `SELECT * FROM pondra.history` has a row

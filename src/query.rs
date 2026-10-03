@@ -672,6 +672,17 @@ pub fn read_only() -> datafusion::execution::context::SQLOptions {
     datafusion::execution::context::SQLOptions::new().with_allow_ddl(false).with_allow_dml(false).with_allow_statements(false)
 }
 
+/// A user's query planned (`read_only`), with a higher-order function's `x -> …` as a lambda
+/// (`friendly::lambdas`: the text keeps it as JSON's arrow, so it is planned from the tree).
+pub async fn sql(ctx: &SessionContext, sql: &str) -> Result<datafusion::dataframe::DataFrame> {
+    if let Some(stmt) = crate::friendly::lambdas(sql) {
+        let plan = ctx.state().statement_to_plan(stmt).await?;
+        read_only().verify_plan(&plan)?;
+        return Ok(ctx.execute_logical_plan(plan).await?);
+    }
+    Ok(ctx.sql_with_options(sql, read_only()).await?)
+}
+
 /// A table of this lake in a session: `t` in the default schema (`public`), `s.t` in schema `s`,
 /// exactly as named (SQL folds unquoted names to lower case; a name that isn't must be quoted).
 pub fn table_ref(name: &str) -> datafusion::common::TableReference {
@@ -862,7 +873,7 @@ pub async fn register_views(ctx: &SessionContext, mut views: Vec<(String, String
         let before = views.len();
         let mut left = vec![];
         for (name, sql) in views {
-            match ctx.sql(&crate::asof::rewrite(&sql)?).await {
+            match self::sql(ctx, &crate::asof::rewrite(&sql)?).await {
                 Ok(df) => {
                     ctx.deregister_table(table_ref(&name))?;
                     let view = Arc::new(datafusion::catalog::view::ViewTable::new(df.into_unoptimized_plan(), Some(crate::ext::readable(&sql)))); // (its files as SQL named them)

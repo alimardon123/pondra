@@ -8,7 +8,6 @@
 //! With tokens set or users made (`users.rs`), a client signs in with SCRAM-SHA-256, as Postgres's
 //! own: a user with its password (or one of its tokens), or `reader`, `writer`, `admin` with that
 //! role's token. Each statement runs as whoever signed in (`auth::WHO`).
-use crate::query::read_only;
 use crate::server::App;
 use async_trait::async_trait;
 use datafusion::arrow::array::{Array, ArrayRef, AsArray};
@@ -274,7 +273,7 @@ impl Backend {
         }
         let catalog = crate::pg_catalog::wanted(&sql);
         let batches = match catalog {
-            true => match async { self.session(&sql, user).await?.sql_with_options(&sql, read_only()).await.map_err(|e| user_error(e.into()))?.collect().await.map_err(|e| user_error(e.into())) }.await {
+            true => match async { crate::query::sql(&self.session(&sql, user).await?, &sql).await.map_err(user_error)?.collect().await.map_err(|e| user_error(e.into())) }.await {
                 Ok(b) => b,
                 // (over catalog tables that are always empty: no rows, whatever DataFusion made of it)
                 Err(e) => match crate::pg_catalog::empty_answer(&sql) {
@@ -425,7 +424,7 @@ impl Backend {
     /// A query's result columns, without running it.
     async fn schema(&self, sql: &str, user: &str) -> PgWireResult<Arc<Schema>> {
         let sql = crate::asof::rewrite(sql).map_err(user_error)?;
-        let df = self.session(&sql, user).await?.sql_with_options(&sql, read_only()).await.map_err(|e| user_error(e.into()))?;
+        let df = crate::query::sql(&self.session(&sql, user).await?, &sql).await.map_err(user_error)?;
         Ok(Arc::new(df.schema().as_arrow().clone()))
     }
 
@@ -868,7 +867,10 @@ impl Backend {
         let n = (1..).take_while(|i| sql.contains(&format!("${i}"))).count();
         let mut types = vec![Type::VARCHAR; n];
         if n > 0 && session_command(sql).is_none() && !crate::settings::is(sql) && crate::write::parse(sql).is_none() && Copy::of(sql).is_none() && !crate::script::is(sql) {
-            let plan = async { self.session(sql, "").await.ok()?.sql_with_options(&crate::asof::rewrite(sql).ok()?, read_only()).await.ok() }.await;
+            let plan = async {
+                let sql = crate::routines::expand(&self.app.lake, sql).await.ok()?;
+                crate::query::sql(&self.session(&sql, "").await.ok()?, &crate::asof::rewrite(&sql).ok()?).await.ok()
+            }.await;
             for (name, t) in plan.and_then(|df| df.logical_plan().get_parameter_types().ok()).unwrap_or_default() {
                 if let (Some(i @ 1..), Some(t)) = (name.trim_start_matches('$').parse::<usize>().ok(), t) {
                     if i <= n {
@@ -890,6 +892,7 @@ impl Backend {
             return Ok(vec![]); // (a COPY's columns come with its data)
         }
         let bound = crate::vars::bound(sql).map_err(user_error)?; // (`$day`: the connection's variable)
+        let bound = crate::routines::expand(&self.app.lake, &bound).await.map_err(user_error)?; // (macros, DuckDB's forms: as `run` has them)
         let sql: &str = &bound;
         let schema = match point {
             Some(s) => s,

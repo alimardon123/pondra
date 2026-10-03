@@ -1,9 +1,13 @@
 # A Pondra cluster on separate machines, benchmarked: TPC-H on one node and across all of them.
-# Runs only when started by hand (Actions → cluster-bench → Run workflow). See
-# tools/cloud/actions/README.md for the secrets it needs and what it costs.
+# Runs on main every night on 3 nodes and every Sunday on 6, and when started by hand (Actions →
+# cluster-bench → Run workflow). See tools/cloud/actions/README.md for the secrets it needs and
+# what it costs.
 name: cluster-bench
 
 on:
+  schedule:
+    - cron: "23 3 * * *" # (3 nodes)
+    - cron: "23 5 * * 0" # (6 nodes: the one cron the plan job reads)
   workflow_dispatch:
     inputs:
       nodes:
@@ -39,7 +43,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - name: The build workflow's, for this commit (what a release publishes; a pull request's, if main reused it)
-        if: inputs.binary == 'ci'
+        if: (inputs.binary || 'ci') == 'ci'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -59,13 +63,20 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       nodes: ${{ steps.n.outputs.nodes }}
+      count: ${{ steps.n.outputs.count }}
+      sf: ${{ steps.n.outputs.sf }}
     steps:
       - id: n
-        run: echo "nodes=$(python3 -c 'import json; print(json.dumps(list(range(${{ inputs.nodes }}))))')" >> "$GITHUB_OUTPUT"
+        # (a scheduled run has no inputs: 3 nodes, or 6 on Sunday's cron; SF10)
+        run: |
+          n=${{ inputs.nodes || (github.event.schedule == '23 5 * * 0' && '6') || '3' }}
+          echo "count=$n" >> "$GITHUB_OUTPUT"
+          echo "sf=${{ inputs.sf || '10' }}" >> "$GITHUB_OUTPUT"
+          echo "nodes=$(python3 -c "import json; print(json.dumps(list(range($n))))")" >> "$GITHUB_OUTPUT"
 
   node:
     needs: [binary, plan]
-    runs-on: ${{ inputs.runner }}
+    runs-on: ${{ inputs.runner || 'ubuntu-24.04' }}
     timeout-minutes: 300
     strategy:
       fail-fast: false
@@ -100,7 +111,7 @@ jobs:
         with: { name: "node-${{ matrix.i }}-log", path: node.log, if-no-files-found: ignore }
 
   driver:
-    needs: [binary]
+    needs: [binary, plan]
     runs-on: ubuntu-24.04
     timeout-minutes: 300
     steps:
@@ -117,15 +128,40 @@ jobs:
         run: |
           chmod +x pondra
           pip install tpchgen-cli
-          tpchgen-cli -s ${{ inputs.sf }} --format=parquet --output-dir tpch
+          tpchgen-cli -s ${{ needs.plan.outputs.sf }} --format=parquet --output-dir tpch
       - name: Wait for the nodes, run the benchmark
         run: |
           prefix="s3://$BUCKET/bench-results/${{ github.run_id }}"
-          until [ "$(aws s3 ls "$prefix/nodes/" | wc -l)" -ge "${{ inputs.nodes }}" ]; do sleep 10; done
-          nodes=$(for i in $(seq 0 $(( ${{ inputs.nodes }} - 1 ))); do aws s3 cp "$prefix/nodes/$i" -; done | paste -sd, -)
+          until [ "$(aws s3 ls "$prefix/nodes/" | wc -l)" -ge "${{ needs.plan.outputs.count }}" ]; do sleep 10; done
+          nodes=$(for i in $(seq 0 $(( ${{ needs.plan.outputs.count }} - 1 ))); do aws s3 cp "$prefix/nodes/$i" -; done | paste -sd, -)
           python3 tools/cloud/actions/driver.py --nodes "$nodes" --lake "s3://$BUCKET/bench-${{ github.run_id }}" \
             --data tpch --queries tools/bench/tpch-queries --bin ./pondra --out results.json
           aws s3 cp results.json "$prefix/results.json"
+      - name: Against the last run of as many nodes
+        # (the run's own ratio is what counts: runners differ from run to run, so one node and the
+        # cluster are timed in the same run; a wrong answer fails it, a cluster slower than one node warns)
+        run: |
+          last="s3://$BUCKET/bench-results/latest-${{ needs.plan.outputs.count }}.json"
+          aws s3 cp "$last" last.json > /dev/null 2>&1 || echo '{}' > last.json
+          python3 - <<'PY' || wrong=1
+          import json, os, sys
+          r, l = json.load(open("results.json")), json.load(open("last.json"))
+          r = {k: v for k, v in r.items() if k not in ("queries", "metrics")} | {"commit": "${{ github.sha }}"}
+          json.dump(r, open("summary.json", "w"))
+          row = lambda x, note="": f"| {x.get('commit', '?')[:7]}{note} | {x.get('load_s')} | {x.get('one_node_s')} | {x.get('cluster_s')} | {x.get('spread')} | {x.get('forced_s')} | {x.get('all_same')} |"
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as out:
+              print("### TPC-H SF${{ needs.plan.outputs.sf }} on ${{ needs.plan.outputs.count }} nodes\n", file=out)
+              print("| commit | load s | one node s | cluster s | spread | spread anyway s | same answers |\n|---|---|---|---|---|---|---|", file=out)
+              print(row(r), file=out)
+              if l: print(row(l, " (last run)"), file=out)
+          if r["cluster_s"] > 1.1 * r["one_node_s"]:
+              print(f"::warning::the cluster took {r['cluster_s']} s, one node {r['one_node_s']} s")
+          if not r["all_same"]:
+              print("::error::the cluster's answers differ from one node's")
+              sys.exit(1)
+          PY
+          aws s3 cp summary.json "$last" > /dev/null
+          exit ${wrong:-0}
       - uses: actions/upload-artifact@v6
         if: always()
         with: { name: results, path: results.json, if-no-files-found: ignore }

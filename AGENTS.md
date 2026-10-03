@@ -34,7 +34,7 @@ The owner's design principles, which every change must respect:
    - no key is written more than once a second.
 
    Round 29 builds the budget and fixes what breaks these today: log segments named by time,
-   the hourly orphan sweep's full listing, and the inbox bell (`docs/roadmap.md`, C5).
+   the hourly orphan sweep's full listing, and the inbox bell (C5: invariant 182).
 8. **Every round leaves it better on every angle** (the owner, 2026-09-30): faster, more
    performant, simpler, easier to use, more functional, versatile, scalable and powerful — while
    staying lightweight and efficient. The gates hold each round to it (`logs/gates/`: speed and
@@ -65,7 +65,8 @@ src/      28,600 lines of Rust, one file per concern (see the table in README.md
           the next); round 33 format.rs (the lake's format, ADR-039), drain.rs (stopping without
           dropping work), service.rs (`pondra service`: systemd, launchd, a Windows service;
           ADR-041), past.rs (a table's past: `AT (…)`, `RESTORE`, ADR-043) and history.rs (every
-          statement a row of `pondra.history`, slow ones with plans and traces, ADR-048)
+          statement a row of `pondra.history`, slow ones with plans and traces, ADR-048); round 34
+          friendly.rs (DuckDB's spellings, rewritten where SQL comes in: invariant 225)
 brand/    the logo (mark.svg), colours (colors.css) and fonts (fonts/: Geist and Geist Mono, SIL
           OFL): the only copies; tools/brand_check.py
 site/     the documentation website (Starlight; ADR-030): site/STYLE.md says how pages are written,
@@ -1477,6 +1478,18 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    loud: a new kind of periodic commit must be quiet, or every remembered answer is forgotten at its
    pace (history's commits every second made a repeated query 12× slower on a lake only read). The
    leader's version is the smaller of `loud` and `committed` (`apply` comes first).
+225. **DuckDB's spellings are rewritten in one place, and a text with none goes on as it was**
+   (`friendly.rs`, from `routines::expand`, ahead of every door, a view as it is read and a
+   materialized view when made): what the parser can't read is turned in the text first (`text`:
+   `PIVOT t ON …`, comprehensions, `LAMBDA x:`, DuckDB's `ASOF … ON`, `USING SAMPLE`); the rest
+   in the tree after the macros (`rewrite`), and a statement it changed nothing in is sent as it
+   came (`as_written`). What needs the data (a `PIVOT`'s values, a `FROM`'s columns for `COLUMNS`,
+   `RENAME`, an alias in a `WHERE`, `ORDER BY ALL` over `*`, `SUMMARIZE`) is asked with a query of
+   its own, as the caller, under the `WITH`s around it: one pass asks, the next takes the answers
+   in the same order, so every node of a spread query gets the same text. A lambda stays `x -> …`
+   in the text (the generic dialect reads it as JSON's arrow) and becomes one where a query is
+   planned (`query::sql`, at every planning site). `harness.py friendly`: 30 forms == DuckDB's
+   answers, spread == one node, over Postgres, in a view and a materialized view.
 
 ## Tests: run these before and after any change
 
@@ -1498,6 +1511,7 @@ python3 tools/harness.py variables      # DECLARE $x, $x = …, SET VARIABLE, ge
 python3 tools/harness.py hot            # hot columns skip batches by their ranges (a time range, a top-N either way, a key); NULL filters == the model
 python3 tools/harness.py minmax         # a global min/max over 24 files skips no row its other answers need (an expression, NULLs so far, FILTER); a wide top-N's answer
 python3 tools/harness.py history        # pondra.history: every door's statements, slow ones' plans and three nodes' traces, the rate, off, who reads what
+python3 tools/harness.py friendly       # DuckDB's spellings (PIVOT, COLUMNS, lambdas, ASOF … ON, SUMMARIZE, samples, …) == DuckDB's answers; spread, Postgres, views
 python3 tools/harness.py tasks          # task graphs on three nodes: AFTER, WHEN, pondra.result, retries, timeouts, SUSPEND, refusals, a failover
 python3 tools/harness.py sparksql       # spark.sql / spark_sql('…') in Spark's grammar: literals, LATERAL VIEW, Spark's floor and substring, frames on top, refusals
 python3 tools/harness.py flows          # views of views in one commit, rollups, expectations (keep, drop, fail), changes down the flow
@@ -2087,24 +2101,11 @@ Known limits, in the order they matter:
     tables it would have made, Spark's function library, EXPLAIN's text (Pondra plans its own
     way), number literals typed DECIMAL (as Postgres and DuckDB do), strings read as `Utf8View`.
 
-Good next moves: `docs/roadmap.md` (2026-09-28, after round 23) is the plan, with the reasons.
-Rounds 17–23 are done except what needs the owner (publishing, cluster-bench runs). In short:
-
-1. **Round 24, SQL and Python as one** (ADR-027, proposed: `CREATE FUNCTION` in SQL and Python,
-   procedures that can do anything Python can, with round 23's secrets; decorators that take a
-   notebook's function as it is; schedules; a run log). Then round 25, the console, the server (a
-   folder of lakes as databases) and databases attached, TEMP tables and changes to attached
-   lakes; 26 security; 27 conformance to its end (D1's pass rate climbs every round from 67%);
-   28 scale proven, with burst functions; 29 in-process and the browser.
-2. **Publish 0.23.0** (ADR-025's names and round 23; `v0.22.2`, the fix of invariant 93, is
-   tagged at c47e2c7 and releases the old way): tag `v0.23.0` once its build run is green; the
-   release publishes that run's packages.
-3. **Security before anyone else's data:** TLS on the node port and mutual TLS between nodes, then
-   grants (roadmap E3).
-4. **Then:** machines in one data centre for the cluster bench, the in-process library, the
-   browser, and streaming depth by evidence (Top-N, timers, the rest of Nexmark).
-
-The owner decides whether to link their Windows laptop, and when to publish.
+Good next moves: `docs/roadmap.md` (2026-10-03) is the shortest path to 1.0, at the owner's bar
+("high quality, stable, workable, fully featured"): round 33 closes with the soak and environments;
+34 is SQL as people write it and scale on machines; 35 in-process and in the browser; 36 fitting
+in (databases attached, BI tools, measures in views); 37 is 1.0 (the promises, a security review,
+signed packages, the docs).
 
 ## Conventions
 

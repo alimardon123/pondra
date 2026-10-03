@@ -91,7 +91,7 @@ pub async fn create(lake: &Lake, name: &str, task: &Task) -> Result<()> {
     if task.shards > 1 && task.shard_by.is_none() {
         bail!("shard_by is required with shards > 1");
     }
-    let out = session(lake, &task.sql, "").await?.sql(&crate::asof::rewrite(&task.sql)?).await?.schema().as_arrow().clone();
+    let out = crate::query::sql(&session(lake, &task.sql, "").await?, &crate::asof::rewrite(&task.sql)?).await?.schema().as_arrow().clone();
     let mut puts = vec![(task_key(name), json(task))];
     if lake.cat.get::<TableMeta>(&table_key(&task.target)).await?.is_none() {
         let columns = out.fields().iter().map(|f| (f.name().clone(), crate::query::type_name(f.data_type()))).collect();
