@@ -4764,8 +4764,9 @@ def plans():
     expected rows, `EXPLAIN ANALYZE` those beside the rows it got (its metrics still last, for the
     console). Every row of `pondra.history` says what it ran: a fingerprint one query's runs share
     whatever their literals, the plan's shape (`plan_id`), the commit it read at (its answer again with
-    `AT (VERSION => n)`), the tables it read, and for a query with joins how far their rows were from
-    what the planner expected (`misestimate`); a query ten times off keeps its plan though fast."""
+    `AT (VERSION => n)`), the tables it read and those it changed, and for a query with joins how many
+    times their rows were off what the planner expected (`misestimate`); ten times off, a query keeps
+    its plan though fast."""
     lake = new_lake()
     a = Node(lake, A.port, env={"PONDRA_LEARN_MS": "0"}).start()
     q = lambda s: sql(A.port, s)
@@ -4823,10 +4824,14 @@ def plans():
         again = q(f"SELECT count(*) AS n FROM orders AT (VERSION => {version})")[0]["n"] if version is not None else None
         seen["version"] = {"version": version, "then": n, "again": again, "now": q("SELECT count(*) AS n FROM orders")[0]["n"]}
         checks["the commit it read at gives its answer again (AT VERSION)"] = again == n == 100000 and seen["version"]["now"] == 100500
-        # A write reads no query's tables; a statement that isn't a query has a fingerprint all the same
+        # A write: the table it changed, and what it read
         q("INSERT INTO orders VALUES (-1, 0, 0) -- p-write")
-        w = until_rows("p-write")
-        checks["a write: a fingerprint, no tables read"] = len(w) == 1 and w[0]["fingerprint"] is not None and w[0]["reads"] is None
+        q("INSERT INTO orders SELECT -id - 2, id, 0 FROM customers WHERE id < 3 -- p-copied")
+        q("UPDATE orders SET total = 1 WHERE id = -1 -- p-update")
+        w, copied, updated = until_rows("p-write"), until_rows("p-copied"), until_rows("p-update")
+        seen["writes"] = [(r["reads"], r["writes"]) for r in w + copied + updated]
+        checks["a write: the table it changed, and what it read"] = [(r["reads"] or [], r["writes"]) for r in w + copied + updated] == [([], ["orders"]), (["customers"], ["orders"]), (["orders"], ["orders"])] \
+            and all(r["fingerprint"] is not None for r in w + copied + updated)
     finally:
         a.kill()
         clean_up()

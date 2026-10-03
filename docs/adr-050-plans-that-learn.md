@@ -85,8 +85,8 @@ New columns of `pondra.history` (names for the SQL review thread):
 | `fingerprint` | the statement with its literals taken out: one query shape's runs together (ADR-048 left it for later) | every statement |
 | `plan_id` | the shape of the plan that ran: its operators, the join order, here or spread and how | every query |
 | `version` | the commit it read at: its answer again, from the lake's past | every statement |
-| `reads` | the tables and views it read | every statement |
-| `misestimate` | the worst ratio between an operator's expected and actual rows | queries over 100 ms |
+| `reads`, `writes` | the tables and views it read; the tables it changed | every statement |
+| `misestimate` | a factor: how many times more or fewer rows its worst join gave than expected (`40`: forty times off) | queries over 100 ms |
 | `plan` (the actual plan; `actual_plan` if the SQL review renames it) | the plan that ran, every operator's rows beside what it expected, its time and bytes; each step and node for a spread query | slow statements, and any with a `misestimate` of 10 or more |
 | `estimated_plan` | the plan before it ran, kept only when it differs from the one that ran (it spread, ran frugally, or changed between steps) | as above |
 
@@ -147,11 +147,11 @@ least recently used go first, and a table's go with it.
 | a query's time here and spread | `guard.rs`'s times, moved here | the spread guard, now shared by every node and kept through restarts |
 
 ```sql
-SELECT * FROM pondra.learned WHERE "table" = 'customers';
+SELECT * FROM pondra.learned WHERE object = 'customers';
 ```
 
 ```
-table      kind    what                                    expected   actual   runs  last
+object     kind    about                                   expected   actual   runs  updated_at
 customers  filter  country = 'FR' AND city = 'Paris'      0.0015%    1.07%    14    2026-10-03 23:10
 customers  join    orders.customer_id = customers.id      1.0        1.0      14    2026-10-03 23:10
 ```
@@ -198,14 +198,14 @@ In order, each a step on the one before:
 
    ```
    object          advice          because                                                   statement
-   orders          cluster by day  82% of 3,400 reads filter on day; 9% of files hold it      ALTER TABLE orders SET (cluster_by = 'day')
+   orders          cluster by day  82% of 3,400 reads filter on day; 9% of files hold it      ALTER TABLE orders CLUSTER BY (day)
                                    narrowly
    sales_by_store  materialize     read 4,100 times today, 1.2 s each, one query shape       CREATE MATERIALIZED VIEW sales_by_store_m AS …
    clicks_2024     unread          no statement read it in 30 days                           (none)
    ```
 
-3. **Automatic, when asked**: `ALTER TABLE orders SET (cluster_by = 'auto')` (Databricks'
-   `CLUSTER BY AUTO`, Redshift's automatic table optimization): the leader picks the clustering from
+3. **Automatic, when asked**: `ALTER TABLE orders CLUSTER BY AUTO` (Databricks' words; `CLUSTER BY NONE`
+   turns it off; underneath, `cluster_by = 'auto'`; Redshift's automatic table optimization does the same): the leader picks the clustering from
    the reads, changes it rarely, and applies it in its merges (two columns along a Hilbert curve, as
    today). Materialized views stay advice: a view is something people see and pay to keep.
 
@@ -275,7 +275,7 @@ part is a small surface another part can plug into (principle 9):
 2. **Facts** (`pondra.learned` the only new name): used by the join order and the spread guard
    (`optimize.rs`, `guard.rs`: the main thread).
 3. **Adapting between steps** (`spmd.rs`: the main thread).
-4. **Maintenance where the reads are, advice, `cluster_by = 'auto'`** (`tier.rs`; the names through
+4. **Maintenance where the reads are, advice, `CLUSTER BY AUTO`** (`tier.rs`; the names through
    the SQL review thread). An AI advisor, near 1.0, plugs in as another source of advice (§7).
 5. **The console**: the two names, History's two plans and "Run as it was", Details' expected against
    actual. In the UI round at the end.

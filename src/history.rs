@@ -10,9 +10,9 @@
 //!
 //! Every row says what it ran (ADR-050): its `fingerprint` (the statement with its literals taken
 //! out, so one query's runs group together), its `plan_id` (the shape of the plan that ran), the
-//! `version` it read at (its answer again: `t AT (VERSION => n)`), the tables and views it `reads`,
-//! and, for a query of `PONDRA_LEARN_MS` (100) or more, its `misestimate`: how far its joins' rows
-//! were from what the planner expected.
+//! `version` it read at (its answer again: `t AT (VERSION => n)`), the tables and views it `reads`
+//! and those it `writes`, and, for a query of `PONDRA_LEARN_MS` (100) or more, its `misestimate`: how
+//! many times its joins' rows were off what the planner expected, at the worst of them.
 //!
 //! Nothing waits for any of it. Rows go to a writer on each node, which appends what came in a
 //! second. At most `PONDRA_HISTORY_RATE` (500) rows a second are written a node: past that, the
@@ -313,7 +313,7 @@ fn columns() -> Vec<(String, String)> {
     let int = |n: &str| (n.to_string(), "Int64".to_string());
     // (stored columns only grow, at the end: a lake's history made before keeps its rows, `create_log`)
     vec![("at".into(), ts), text("id"), text("user"), text("door"), text("from"), text("node"), text("session"), text("class"), text("statement"), text("outcome"), text("error"), int("ms"), int("rows"), int("nodes"), text("plan"), text("trace"),
-         text("fingerprint"), text("plan_id"), int("version"), ("reads".into(), "Utf8[]".into()), ("misestimate".into(), "Float64".into())]
+         text("fingerprint"), text("plan_id"), int("version"), ("reads".into(), "Utf8[]".into()), ("misestimate".into(), "Float64".into()), ("writes".into(), "Utf8[]".into())]
 }
 
 /// Leader: the table, made the first time a node has a row for it (`Ddl::HistoryLog`), or given
@@ -358,25 +358,74 @@ fn batch(app: &App, lines: &[Line]) -> Result<RecordBatch> {
         text(&|l| (l.class != "skipped").then(|| fingerprint(&l.sql)).flatten()),
         text(&|l| l.note.plan_id.clone()),
         int(&|l| l.note.version.map(|v| v as i64)),
-        reads(app, lines),
-        Arc::new(lines.iter().map(|l| l.note.misestimate).collect::<Float64Array>()) as ArrayRef,
     ];
+    let [reads, writes] = touched(app, lines);
+    let arrays = [arrays, vec![reads, Arc::new(lines.iter().map(|l| l.note.misestimate).collect::<Float64Array>()) as ArrayRef, writes]].concat();
     Ok(RecordBatch::try_new(crate::query::schema(&columns())?, arrays)?)
 }
 
-/// The tables and views each query read, as this lake names them (another lake's as `lake.schema.t`).
-fn reads(app: &App, lines: &[Line]) -> ArrayRef {
-    let mut list = ListBuilder::new(StringBuilder::new());
+/// The tables and views each statement read, and the tables it changed, as this lake names them
+/// (another lake's as `lake.schema.t`): every relation it names but an INSERT's or a CREATE TABLE …
+/// AS's own; and the table an INSERT, UPDATE, DELETE, MERGE or CREATE TABLE … AS writes.
+fn touched(app: &App, lines: &[Line]) -> [ArrayRef; 2] {
+    let (mut reads, mut writes) = (ListBuilder::new(StringBuilder::new()), ListBuilder::new(StringBuilder::new()));
+    let local = |n: &String| crate::ddl::local(&app.lake, n).unwrap_or_else(|| n.clone());
     for l in lines {
-        match crate::spmd::tables(&l.sql) {
+        use crate::write::Stmt;
+        let stmt = matches!(l.class, "write" | "ddl").then(|| crate::write::parse(&l.sql)).flatten();
+        let target = match &stmt {
+            Some(s @ (Stmt::Insert(..) | Stmt::InsertInto(..) | Stmt::Create(_) | Stmt::Define(..) | Stmt::Update(..) | Stmt::Delete(..) | Stmt::Merge(_))) => Some(local(&s.table())),
+            _ => None,
+        };
+        let pure = matches!(stmt, Some(Stmt::Insert(..) | Stmt::InsertInto(..) | Stmt::Create(_) | Stmt::Define(..))); // (its target isn't read)
+        match relations(&l.sql) {
             Some(names) => {
-                names.iter().for_each(|n| list.values().append_value(crate::ddl::local(&app.lake, n).unwrap_or_else(|| n.clone())));
-                list.append(true);
+                names.iter().map(local).filter(|n| !(pure && Some(n) == target.as_ref())).for_each(|n| reads.values().append_value(n));
+                reads.append(true);
             }
-            None => list.append(false),
+            None => reads.append(false),
+        }
+        match &target {
+            Some(t) => {
+                writes.values().append_value(t);
+                writes.append(true);
+            }
+            _ => writes.append(false),
         }
     }
-    Arc::new(list.finish())
+    [Arc::new(reads.finish()), Arc::new(writes.finish())]
+}
+
+/// Every relation one statement names, anywhere in it, once each, CTE names left out (as
+/// `spmd::tables`, for any statement).
+fn relations(sql: &str) -> Option<Vec<String>> {
+    use datafusion::sql::sqlparser::{ast::*, dialect::GenericDialect, parser::Parser};
+    use std::ops::ControlFlow;
+    #[derive(Default)]
+    struct Names {
+        tables: Vec<String>,
+        ctes: std::collections::HashSet<String>,
+    }
+    fn name(i: &Ident) -> String { if i.quote_style.is_some() { i.value.clone() } else { i.value.to_lowercase() } }
+    impl Visitor for Names {
+        type Break = ();
+        fn pre_visit_query(&mut self, q: &Query) -> ControlFlow<()> {
+            self.ctes.extend(q.with.iter().flat_map(|w| &w.cte_tables).map(|c| name(&c.alias.name)));
+            ControlFlow::Continue(())
+        }
+        fn pre_visit_relation(&mut self, r: &ObjectName) -> ControlFlow<()> {
+            let parts: Option<Vec<String>> = r.0.iter().map(|p| p.as_ident().map(name)).collect();
+            self.tables.extend(parts.map(|p| p.join(".")));
+            ControlFlow::Continue(())
+        }
+    }
+    let stmts = Parser::parse_sql(&GenericDialect {}, sql).ok()?;
+    let [stmt] = &stmts[..] else { return None };
+    let mut names = Names::default();
+    let _ = stmt.visit(&mut names);
+    let mut seen = std::collections::HashSet::new();
+    let tables: Vec<String> = names.tables.into_iter().filter(|t| !names.ctes.contains(t) && seen.insert(t.clone())).collect();
+    (!tables.is_empty()).then_some(tables)
 }
 
 /// A node's writer for a table of its own (the history, the audit log): what came in `every`,
