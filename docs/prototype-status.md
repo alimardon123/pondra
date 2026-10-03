@@ -180,7 +180,16 @@ optimizing; performance first):
   over after about 25 s); the Python and JavaScript clients failed while their node was down (they
   take every node's address now); `pondra sql` waited for ever on a missing bucket; a slow bucket
   was taken for a lost one. A PR's push runs CI only when labelled (`ci`, `full-ci`).
+- **A table's past** (ADR-043, PR #13, `tools/history_check.py` 12 of 12): a dropped table is kept
+  for its retention (a day unless the table says otherwise) and `UNDROP TABLE` brings it back;
+  `SELECT … FROM t AT (VERSION => n | TIMESTAMP => '…' | OFFSET => -3600)` reads an append table as
+  it was, anywhere a table goes, equal to a model of 13 states; `RESTORE TABLE t TO VERSION AS OF n`
+  puts it back in one change (ids kept, undone by another); `CREATE TABLE c CLONE t` copies no file.
+  The past is the rows' system columns and `{t}$deleted`: nothing in the catalog until it's read.
 - **`CREATE VIEW v (a, b)`** names the view's columns (PR #12; the list was ignored).
+- **`DECLARE PARAMETER`** (ADR-044, PR #15): only marked variables are a file's parameters; a plain
+  `DECLARE` is the file's own, and a run given a name that isn't a parameter is refused; a `.py`
+  file's parameters are its `# %% tags=["parameters"]` cell.
 - **The console** (PRs #7 and #8, the owner's lists of 2026-10-02): every Live cell over one
   connection (seven of them took the browser's six and hung Python), one grid everywhere with undo,
   paste and filters as pills, the Data tree's details, drags and uploads, a schedule editor, users,

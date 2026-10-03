@@ -51,7 +51,7 @@ The owner's design principles, which every change must respect:
 ```
 src/      28,600 lines of Rust, one file per concern (see the table in README.md); round 25 added
           live.rs (live queries) and temp.rs (a session's temporary tables and views); round 31 vars.rs
-          (SQL variables and a file's declared parameters, ADR-037); round 26
+          (SQL variables and a file's declared parameters, ADR-037, ADR-044); round 26
           pg_catalog.rs (Postgres's catalog, for dbt and BI tools), dbserver.rs (`pondra serve
           --lakes`: a folder of lakes as databases), defaults.rs (NOT NULL and DEFAULT), ext.rs
           (files read by name: `read_*`, `CREATE EXTERNAL TABLE`) and console.rs + console/ (the
@@ -62,8 +62,8 @@ src/      28,600 lines of Rust, one file per concern (see the table in README.md
           plan.js, details.js and more.css, sqlfile.js (a SQL file), rename.js (renaming a file),
           tabs.js (the tabs' and the panes' menus), live.js (live queries)), xlsx.rs (a download as an Excel workbook); round 32 fresh.rs (a view's plan kept from one write to
           the next); round 33 format.rs (the lake's format, ADR-039), drain.rs (stopping without
-          dropping work) and service.rs (`pondra service`: systemd, launchd, a Windows service;
-          ADR-041)
+          dropping work), service.rs (`pondra service`: systemd, launchd, a Windows service;
+          ADR-041) and past.rs (a table's past: `AT (…)`, `RESTORE`, ADR-043)
 brand/    the logo (mark.svg), colours (colors.css) and fonts (fonts/: Geist and Geist Mono, SIL
           OFL): the only copies; tools/brand_check.py
 site/     the documentation website (Starlight; ADR-030): site/STYLE.md says how pages are written,
@@ -1299,8 +1299,10 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    and every `$day` after is a literal in the syntax tree (`routines::bind`). A session holds its
    variables (`temp::Session.variables`); a procedure and a file run hold their own (`vars::own`),
    lent to their Python's connection (`auth::lend`); with no session a `DECLARE` is refused, never
-   kept where nothing reads it. A run's given values replace its `DECLARE`s' defaults, cast to
-   their types. `pondra.variables` and `pondra.parameters('file')` are never remembered answers
+   kept where nothing reads it. A run's given values replace its `DECLARE PARAMETER`s' defaults,
+   cast to their types; a value given for a plain `DECLARE` (the script's own) is refused, and a
+   file run refuses a name that isn't one of its parameters (`workspace::parameters`: a `.py`
+   file's `# %% tags=["parameters"]` cell, a notebook's tagged cell; ADR-044). `pondra.variables` and `pondra.parameters('file')` are never remembered answers
    and run on their node. `harness.py variables`. In the console every tab is a session of its own
    (`core::sessionOf`): a SQL file's variables, a notebook's Python, never another tab's.
 199. **A query's session is a copy, and only its functions are shared** (`Lake::session_with`):
@@ -1417,6 +1419,21 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    a call no node ran, a query, an append, or one INSERT/UPDATE/DELETE/MERGE sent with a job. A
    session a node holds (`x-pondra-session: held`) stays there; its loss is 08006.
    `resilience_check.py` clients.
+216. **A dropped table is kept whole, and only its own entry lets it go** (`ddl::drop_table`,
+   `undrop`, ADR-043). Its log rows go to files first (the log moves on). Its entries, and its
+   `{t}$deleted`'s, move to `dt/{name}/{ms}` in one commit. While one is kept, its folder is taken
+   (`ddl::free_folder`) and its files are in use for the orphan sweep (`tier::collect_orphans`).
+   `UNDROP` reads the log from its end (invariant 50). `tools/history_check.py`.
+217. **`t AT (…)` reads only a past the table still holds, or says so** (`past.rs`, `tier::settle`).
+   A purge drops `{t}$deleted` files only past the table's retention, and moves
+   `TableMeta::past_from` to the newest it dropped. A moment before that, and any keyed table, is
+   refused by name, never answered with fewer rows. `tools/history_check.py`: "AT refused by name…".
+218. **A file in a folder a clone shares is deleted only by the orphan sweep, once no table lists it**
+   (`TableMeta::shares`, `tier::expire`, `collect_orphans`): never as one table's garbage, since the
+   source's merges, the clone's merges and a `DROP` of either would take files the other reads. The
+   sweep counts every table that lists files in a folder (kept dropped tables too). A clone is never
+   published (Delta and Iceberg name files under a table's own folder). `tools/history_check.py`:
+   "a clone and its source change apart…".
 
 ## Tests: run these before and after any change
 
@@ -1429,6 +1446,7 @@ python3 tools/fuzz_doors.py --secs 60   # malformed input at HTTP, SQL, Postgres
 python3 tools/resilience_check.py [storage cutoff clients doors disk cache server cli]   # every mode under failure: a failing bucket (faulty_s3.py), a cut-off leader, clients and doors through kills, full disks, pondra sql killed
 python3 tools/upgrade_check.py [lakes|format|drain|rolling|all] [--s3]   # every release's lake since 0.22 opens and answers as it did; newer formats refused; drains (a leader on a bucket with --s3); a rolling upgrade under load
 python3 tools/soak.py --minutes 10 [--hours 24] [--s3]                   # C4: steady ingest, nodes stopped and killed, memory, the log, commits on a timeline
+python3 tools/history_check.py   # DROP/UNDROP, retention, PURGE, Delta; AT (VERSION | TIMESTAMP | OFFSET) == a model of 13 states; RESTORE; CLONE (no copy, apart, merges and drops); refusals
 python3 tools/deploy_check.py                  # the image and compose; add python, chart, helm (kind), service: deploy.yml runs them all
 python3 tools/harness.py versions       # every file keeps its versions: listed, read, restored, after a delete, retention, old notebooks
 python3 tools/harness.py stopped        # a run whose node was killed under it: stopped, not running for good
@@ -1581,8 +1599,10 @@ tail (213). Measured against DuckDB 1.5.5 and 2.0's preview, Flink 2.3, Apache K
 single-node engines (`prototype-status.md`, round 32; the site's performance and comparison
 pages). In the same release, round 33's first parts from the side threads: the lake format and
 upgrades (ADR-039, 207–211), deployment (ADR-041, 205–206), every mode under failure and the five
-faults it found (214–215), `CREATE VIEW v (a, b)` and the console's batches. Left of 33: the 24-hour R2 soak (the owner's machine), time travel and its kin (ADR-043, in
-review), observability, environments.
+faults it found (214–215), a table's past (`UNDROP`, retention per table, time travel `AT (…)`,
+`RESTORE`, zero-copy `CLONE`: ADR-043, 216–218), `CREATE VIEW v (a, b)`, `DECLARE PARAMETER`
+(ADR-044) and the console's batches. Left of 33: the 24-hour R2 soak (the owner's machine),
+observability, environments.
 
 **Round 29, part 1 (ADR-034, after 0.27): the owner's console list.** The grid's outline, header
 card and menus, typed filters, Copy and Download in every form (a download is every row:
