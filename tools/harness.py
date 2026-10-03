@@ -4641,7 +4641,7 @@ def minmax():
 
 
 def history():
-    """Every statement a door was sent is a row of `pondra.history` (ADR-047), a second later: its
+    """Every statement a door was sent is a row of `pondra.history` (ADR-048), a second later: its
     door, user, node, session, outcome, time and rows. A slow one (`PONDRA_SLOW_MS`) keeps its plan,
     each operator with its rows, and its trace: each node's share when it ran across three nodes, and
     a line in the node's log. Past `PONDRA_HISTORY_RATE` a second, fast statements are counted in one

@@ -17,7 +17,7 @@ Start more copies on the same bucket to scale out. The only state is object stor
 
 **Now (2026-10-03, round 33, toward 0.33.0): run it for years.**
 
-1. **Every statement remembered** (ADR-047, `history.rs`): `SELECT * FROM pondra.history` has a row
+1. **Every statement remembered** (ADR-048, `history.rs`): `SELECT * FROM pondra.history` has a row
    per statement from every door (who, which door and address, node, session, class, the
    statement, how it ended, ms, rows, nodes), written a second later off the statement's path, at
    most 500 rows a second a node (the rest counted). A statement over `PONDRA_SLOW_MS` (1 s) keeps

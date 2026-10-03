@@ -1,4 +1,4 @@
-# ADR-047: Every statement remembered, slow ones with their plans
+# ADR-048: Every statement remembered, slow ones with their plans
 
 **Date:** 2026-10-03 · **Status:** accepted (round 33, the main thread) · **Builds on:** ADR-035 §6
 (`audit::statement`, the one place every door's statement passes), ADR-021 (few objects), C5 (the

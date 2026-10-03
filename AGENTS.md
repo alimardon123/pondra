@@ -65,7 +65,7 @@ src/      28,600 lines of Rust, one file per concern (see the table in README.md
           the next); round 33 format.rs (the lake's format, ADR-039), drain.rs (stopping without
           dropping work), service.rs (`pondra service`: systemd, launchd, a Windows service;
           ADR-041), past.rs (a table's past: `AT (…)`, `RESTORE`, ADR-043) and history.rs (every
-          statement a row of `pondra.history`, slow ones with plans and traces, ADR-047)
+          statement a row of `pondra.history`, slow ones with plans and traces, ADR-048)
 brand/    the logo (mark.svg), colours (colors.css) and fonts (fonts/: Geist and Geist Mono, SIL
           OFL): the only copies; tools/brand_check.py
 site/     the documentation website (Starlight; ADR-030): site/STYLE.md says how pages are written,
@@ -1465,7 +1465,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    Every pass of a script's loop yields (`Runner::pass`), or a task's `timeout` never fires.
    `harness.py tasks`.
 223. **Every statement a door was sent is one row of `pondra.history`, written off its path**
-   (`history::ended`, from `audit::statement` only, ADR-047): a node's writer appends a second's
+   (`history::ended`, from `audit::statement` only, ADR-048): a node's writer appends a second's
    rows through the log (one producer, a seq a batch), at most `PONDRA_HISTORY_RATE` a second, the
    rest of the fast, good ones counted in a `skipped` row; slow (`PONDRA_SLOW_MS`) and failed ones
    always, a slow one with its plan (`history::planned`) and each node's share (`spmd::timed`). An
@@ -1650,7 +1650,7 @@ faults it found (214–215), a full local disk that recovers on its own (220), a
 (ADR-044), scripts that branch, loop and handle errors (ADR-045, 219) and the console's batches. After the
 release: scripts' `PARALLEL`, `ASYNC` and `AWAIT` and task graphs (ADR-045, 219, 221–222), and
 observability: every statement a row of `pondra.history`, slow ones with their plans and each
-node's share, a slow-query log (ADR-047, 223–224). Left of 33: the 24-hour R2 soak (the owner's
+node's share, a slow-query log (ADR-048, 223–224). Left of 33: the 24-hour R2 soak (the owner's
 machine); environments, branching data and the team's workflow are designed in their own thread.
 
 **Round 29, part 1 (ADR-034, after 0.27): the owner's console list.** The grid's outline, header
