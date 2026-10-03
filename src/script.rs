@@ -1253,6 +1253,20 @@ fn execute(r: &mut Reader, _: Option<String>) -> Result<Option<Box<dyn Step>>> {
         return Ok(None); // (EXECUTE name: a prepared statement's)
     }
     r.i += 2;
+    if r.eat("from") {
+        // (Snowflake's way to run a file: `CALL run('path', name => value, …)`)
+        let path = r.expr(&["using", "into"], "EXECUTE IMMEDIATE FROM")?;
+        let usage = "EXECUTE IMMEDIATE FROM 'path' [USING (name => value, …)] [INTO $a, …]";
+        let given = match r.eat("using") {
+            true => r.until(&["into"]).strip_prefix('(').and_then(|g| g.strip_suffix(')')).map(|g| g.trim().to_string()).with_context(|| format!("line {}: {usage}", r.line(r.at())))?,
+            false => String::new(),
+        };
+        let call = format!("CALL run({path}{}{given})", if given.is_empty() { "" } else { ", " });
+        let x = Execute { sql: None, call: Some(call), into: into(r), using: vec![] };
+        ensure!(r.i >= r.t.len() || r.t[r.i].k == K::Semi, "line {}: {usage}", r.line(r.at()));
+        r.eat_semi();
+        return Ok(Some(Box::new(x)));
+    }
     let sql = r.expr(&["into", "using"], "EXECUTE IMMEDIATE")?;
     let mut x = Execute { sql: Some(sql), call: None, into: into(r), using: vec![] };
     if r.eat("using") {

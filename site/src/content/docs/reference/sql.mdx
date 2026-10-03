@@ -370,7 +370,7 @@ across the nodes and a write still goes to the leader.
 | `FOR $r IN (query) DO … END` | a loop over a query's rows: `$r.column` |
 | `FOR r IN (query) PARALLEL n DO … END FOR` | the same, up to `n` passes at once (1 to 64) |
 | `ASYNC statement` · `$h = ASYNC statement` | start a statement (a block too) and go on · its handle in `$h` |
-| `AWAIT` · `AWAIT $h, …` | wait for every one started · for these: handles, or runs' ids from `pondra.start` |
+| `AWAIT` · `AWAIT $h, …` | wait for every one started · for these: handles, or runs' ids from `START CALL` |
 | `LEAVE [label]` · `ITERATE [label]` | leave a loop or block · go on with the next pass (`label: WHILE …`) |
 | `RETURN [value]` | stop; the value is the script's answer (`result`) |
 | `RAISE 'text %', $x` · `RAISE NOTICE …` · `RAISE` | an error (`P0001`), each `%` a value · a notice · the handled error again |
@@ -392,7 +392,7 @@ across the nodes and a write still goes to the leader.
   and the loop fails with its error. `AWAIT ALL` fails with the first `ASYNC` failure's error, and a
   script's end waits for what it started. Neither runs inside a transaction.
 - `AWAIT $h` fails with that statement's error, which `AWAIT ALL` then leaves out. `AWAIT 'id'`
-  waits for a procedure or file `pondra.start` began, from any session, and fails with its error.
+  waits for a procedure or file `START CALL` began, from any session, and fails with its error.
 - A script run again with the same job (`?job=…`, a task's tick) writes each statement once, loops,
   passes and `ASYNC` statements included.
 
@@ -515,7 +515,7 @@ DROP MATERIALIZED VIEW spend_by_item;
 | Call | `CALL p(args)` or `CALL p(name => value)` |
 | Run a file | `CALL run('etl/orders.sql', day => DATE '2026-09-29')`: a `.sql`, `.py` or notebook file of the lake's, its parameters by name ([Run files as jobs](/pondra/guides/workspace/)) |
 | Run code once | `DO LANGUAGE python \| sql $$ … $$` (the language may come after the code, as in Postgres) |
-| Start | `SELECT pondra.start('p', args)`: runs it without waiting, and answers with the run's id |
+| Start | `START CALL p(args)`: runs it without waiting, and answers with the run's id (`AWAIT` it, or find it in `pondra.runs`) |
 | Task | `CREATE [OR REPLACE] TASK [IF NOT EXISTS] t SCHEDULE '5 minutes' \| 'cron 0 2 * * * UTC' AS CALL p(…)` |
 | Task in a graph | `CREATE TASK t AFTER a, b [WHEN condition] [WITH (retries = 2, retry_delay = '1 minute', timeout = '1 hour', on_failure = p)] AS statement` ([Run tasks in order](/pondra/guides/functions-and-procedures/#run-tasks-in-order)) |
 | Run a task now | `EXECUTE TASK t [(name => value, …)]`: its graph, with values for its `$name`s |
@@ -572,6 +572,8 @@ brought from them runs as it is:
 | `FOR r IN (…)` | `FOR $r IN (…)` | Postgres, Snowflake |
 | `AWAIT ALL` | `AWAIT` | Snowflake |
 | `RAISE NOTICE 'x %', v` | `PRINT 'x ' \|\| v` | Postgres |
+| `EXECUTE IMMEDIATE FROM 'etl/x.sql' USING (day => v)` | `CALL run('etl/x.sql', day => v)` | Snowflake |
+| `SELECT pondra.start('p', args)` | `START CALL p(args)`, as a function where a query is wanted | Pondra |
 
 ## Files and secrets
 

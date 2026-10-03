@@ -3373,6 +3373,11 @@ $$""")
     checks["pondra.runs: every call, its caller, arguments and outcome"] = len(runs) == 4 and all(r["status"] == "ok" and r["caller"] == "read" for r in runs) and '"recipients":["pg@example.com"]' in runs[1]["args"]
     started = q("SELECT pondra.start('quiet') AS r")[0]["r"]
     checks["pondra.start: a run id at once, its outcome in pondra.runs"] = until(lambda: q(f"SELECT status FROM pondra.runs WHERE id = '{started}'"), [{"status": "ok"}], secs=20) == [{"status": "ok"}]
+    by_statement = q("START CALL quiet()")[0]["run"]
+    with psycopg.connect(f"host=127.0.0.1 port={A.port + 11} user=reader password=r-tok dbname=lake", autocommit=True) as c:
+        by_pg = c.execute("start call quiet()").fetchall()
+    done = lambda run: until(lambda: q(f"SELECT status FROM pondra.runs WHERE id = '{run}'"), [{"status": "ok"}], secs=20) == [{"status": "ok"}]
+    checks["START CALL p(…): pondra.start as a statement, over HTTP and Postgres"] = done(by_statement) and len(by_pg) == 1 and done(by_pg[0][0])
     q("CREATE PROCEDURE deep(n BIGINT) LANGUAGE python AS $$ pondra.call('deep', n + 1) $$")
     t0 = time.time()
     checks["procedures calling procedures take no slot of their own (two here): 16 deep, not stuck"] = "16 deep" in err("CALL deep(0)", timeout=90) and time.time() - t0 < 60
@@ -5124,6 +5129,13 @@ console.log(JSON.stringify(await db.run("etl/orders.sql", {{ day: "2026-09-29", 
     checks["mistakes said by name: no such file, not a file that runs, a value not named, a name twice, no saved notebook, run is Pondra's"] = \
         "no file files/etl/nothing.sql" in said["missing"] and ".sql, .py or .ipynb" in said["kind"] and "by name" in said["unnamed"] and "given twice" in said["twice"] \
         and "none saved" in said["none"] and "Pondra's own" in said["own"]
+    imm = {"plain": q("EXECUTE IMMEDIATE FROM 'etl/orders.sql' USING (day => DATE '2026-09-29', region => 'imm', amount => 2.0)"),
+           "into": q("BEGIN EXECUTE IMMEDIATE FROM 'etl/orders.sql' USING (day => DATE '2026-09-29', region => 'imm', amount => 1.0) INTO $r, $n; SELECT $r AS r, $n AS n; END"),
+           "bad": err("EXECUTE IMMEDIATE FROM 'etl/orders.sql' USING day => 1")}
+    checks["EXECUTE IMMEDIATE FROM 'file' USING (name => …) [INTO $a, …]: Snowflake's CALL run"] = imm["plain"] == [{"region": "imm", "n": 1, "total": 2.0}] \
+        and imm["into"] == [{"r": "imm", "n": 2}] and "USING (name => value" in imm["bad"]
+    if not checks["EXECUTE IMMEDIATE FROM 'file' USING (name => …) [INTO $a, …]: Snowflake's CALL run"]:
+        print("immediate:", imm)
     synced = workspace_sync(A.port, "a-tok")
     checks.update(synced.pop("checks"))
     node.kill()

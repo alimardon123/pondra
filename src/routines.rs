@@ -1343,9 +1343,14 @@ pub fn call_of(sql: &str) -> Option<(String, Vec<FunctionArg>)> {
     }
 }
 
-/// `SELECT pondra.start('name', …) [AS column]`: a procedure to start without waiting, its
-/// arguments, and the answer's column (`run`).
+/// `START CALL name(…)`, or `SELECT pondra.start('name', …) [AS column]`: a procedure to start
+/// without waiting, its arguments, and the answer's column (`run`).
 pub fn start_of(sql: &str) -> Option<(String, Vec<FunctionArg>, String)> {
+    static START: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?is)^start\s+(call\b.*)$").expect("a regex"));
+    if let Some(call) = START.captures(crate::write::first_word(sql)) {
+        let (name, args) = call_of(call.get(1)?.as_str())?;
+        return Some((name, args, "run".into()));
+    }
     if !sql.to_lowercase().contains("pondra.start") {
         return None;
     }
