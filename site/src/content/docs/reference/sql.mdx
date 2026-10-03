@@ -51,10 +51,12 @@ on bytes as they do on text. A `CAST` to bytes takes `BYTEA` only.
 | `FROM t [SELECT …] [WHERE …] [GROUP BY …] [ORDER BY …] [LIMIT n]` | DuckDB's form: the `FROM` first, then any clauses |
 | `$name` | a [variable](#variables) or a parameter, bound by the node and never pasted into the text |
 | `FROM t AT (VERSION => n)`, `AT (TIMESTAMP => '…')`, `AT (OFFSET => -3600)` | the table as it was after commit `n`, at that time, or that many seconds ago ([below](#a-tables-past)) |
+| `FROM t VERSION AS OF n`, `FROM t TIMESTAMP AS OF '…'`, `FROM t FOR SYSTEM_TIME AS OF '…'` | the same, in Delta's, Spark's and SQL:2011's words: what follows is a number, a string, `TIMESTAMP '…'`, a variable or `(an expression)` |
 | `FROM a ASOF JOIN b MATCH_CONDITION (a.ts >= b.ts) ON a.k = b.k` | each row gets the other table's row as it was at that moment (`>=`, `>`, `<=`, `<`) |
 | `EXPLAIN SELECT …` | the plan, and whether it would spread over the nodes |
 | `DESCRIBE t`, `SHOW TABLES`, `SHOW COLUMNS FROM t` | what the lake holds |
 | `SHOW VIEWS`, `SHOW MATERIALIZED VIEWS [LIKE 'p%']`, `SELECT … FROM pondra.tables` | each table and view with its kind (see [system tables](/pondra/reference/system-columns/#tables-and-views)) |
+| `SHOW SCHEMAS`, `SHOW DATABASES`, `SHOW SECRETS`, `SHOW USERS`, `SHOW ROLES`, `SHOW GRANTS` (each `[LIKE 'p%']`) | the schemas, the lakes a query can name, the secrets (never their values), users, roles and grants |
 | `SELECT … FROM 'file.parquet'` | a file or URL as a table (see [names](/pondra/reference/names/)) |
 | `SELECT … FROM spark_sql('SELECT …')` | a query in Spark SQL's grammar, with Spark's functions (PySpark's `spark.sql` sends this) |
 
@@ -144,14 +146,15 @@ past starts when it was made.
 
 | Statement | Syntax |
 |---|---|
-| Create | `CREATE [OR REPLACE] TABLE [IF NOT EXISTS] t (column type [NOT NULL] [DEFAULT expression] [CHECK (condition)] [PRIMARY KEY], … [, PRIMARY KEY (column, …)] [, CONSTRAINT name CHECK (condition)]) [WITH (option = 'value', …)]` |
+| Create | `CREATE [OR REPLACE] TABLE [IF NOT EXISTS] t (column type [NOT NULL] [DEFAULT expression] [CHECK (condition)] [PRIMARY KEY], … [, PRIMARY KEY (column, …)] [, CONSTRAINT name CHECK (condition)]) [WITH (option = 'value', …)] [PARTITION BY expression] [CLUSTER BY (column, …)]` |
+| Create like another | `CREATE TABLE t LIKE s`: an empty table with `s`'s columns and their types, as Postgres's does |
 | Create from a query | `CREATE TABLE t AS SELECT …`, `CREATE TABLE t (a INT, b VARCHAR) AS VALUES …`, or `SELECT … INTO t FROM …` |
 | Add a column | `ALTER TABLE t ADD COLUMN [IF NOT EXISTS] c type` |
 | Rename a column | `ALTER TABLE t RENAME COLUMN a TO b` |
 | Rename a table | `ALTER TABLE t RENAME TO u` |
 | Drop a column | `ALTER TABLE t DROP COLUMN [IF EXISTS] c` |
 | Widen a column | `ALTER TABLE t ALTER COLUMN c TYPE BIGINT` |
-| Change options | `ALTER TABLE t SET (publish = 'delta', cluster_by = 'user', ttl = 'ts:3600', order_by = 'ts', retention = '7 days')` |
+| Change options | `ALTER TABLE t SET (publish = 'delta', cluster_by = 'user', ttl = 'ts:3600', order_by = 'ts', retention = '7 days')`, or `ALTER TABLE t CLUSTER BY (user)` |
 | Empty | `TRUNCATE [TABLE] t` |
 | Drop | `DROP TABLE [IF EXISTS] t [, t2 …] [PURGE]` |
 | Bring back a dropped table | `UNDROP TABLE t` |
@@ -165,6 +168,11 @@ procedures, macros, tasks, secrets, external tables and a session's temporary ta
 secrets take both words (`OR REPLACE` and `IF NOT EXISTS` together are refused, as one contradicts
 the other). Schemas, databases, users and roles take `IF NOT EXISTS` only: replacing one would drop
 what it holds or the rights given to it.
+
+`PARTITION BY day(ts)` and `CLUSTER BY (user, url)` are the `partition_by` and `cluster_by` options in
+BigQuery's, Snowflake's and Databricks' words. `PARTITIONED BY (c)` (Spark's), `days(ts)` (Iceberg's),
+`DATE(ts)` and `TIMESTAMP_TRUNC(ts, DAY)` (BigQuery's) and `date_trunc('day', ts)` are the same
+partitions. A clause and the option it stands for, both given, are refused.
 
 A table without a primary key is an append table. With a key, a new row replaces the old one with the
 same key. The options are on [table options](/pondra/reference/table-options/). An `ALTER TABLE`
@@ -220,6 +228,7 @@ TRUNCATE accounts;
 |---|---|
 | Insert | `INSERT INTO t [(column, …)] VALUES (…), …` or `INSERT INTO t [(column, …)] SELECT …` |
 | Insert, on a key that exists | `INSERT … ON CONFLICT (key) DO NOTHING`, or `… ON CONFLICT (key) DO UPDATE SET column = t.column + excluded.column` (Postgres's) |
+| The same, shorter | `INSERT OR IGNORE INTO t …` (`ON CONFLICT DO NOTHING`), `INSERT OR REPLACE INTO t …` (every column the rows give replaces the row's), as DuckDB and SQLite write them; MySQL's `INSERT IGNORE` too |
 | Update | `UPDATE t SET column = expression [, …] [FROM other o] [WHERE condition]` |
 | Delete | `DELETE FROM t [USING other o] [WHERE condition]` |
 | Merge | `MERGE INTO t [AS x] USING source [AS s] ON condition WHEN [NOT] MATCHED [BY SOURCE] [AND condition] THEN UPDATE SET … \| DELETE \| INSERT (…) VALUES (…)` |
@@ -473,6 +482,7 @@ DROP SCHEMA sales CASCADE;
 | Materialized view | `CREATE [OR REPLACE] MATERIALIZED VIEW [IF NOT EXISTS] v [(CONSTRAINT c CHECK \| EXPECT (condition) [ON VIOLATION DROP ROW \| FAIL], …)] [WITH (option = value, …)] AS SELECT … FROM t …`: kept up to date as rows arrive; it may follow another materialized view ([Flows](/pondra/guides/flows/)) |
 | Temporary | `CREATE [OR REPLACE] TEMP TABLE [IF NOT EXISTS] t AS SELECT …`, `CREATE [OR REPLACE] TEMP VIEW [IF NOT EXISTS] v AS SELECT …`: a session's own |
 | Rename | `ALTER VIEW v RENAME TO w`: a stored view, not a materialized one |
+| Refresh | `REFRESH MATERIALIZED VIEW v`: taken, and nothing to do, since the view is current as rows arrive (dbt sends it) |
 | Detach | `ALTER MATERIALIZED VIEW v DETACH`: its rows stop following and stay, as a table of that name (a `GROUP BY` view's a merge table, its rows combining as they are read). What follows it keeps following its table. A view that keeps windows is refused |
 | Drop | `DROP VIEW [IF EXISTS] v`, `DROP MATERIALIZED VIEW [IF EXISTS] v` |
 
@@ -687,6 +697,7 @@ a query needs no table: see [names](/pondra/reference/names/).
 | Statement | Meaning |
 |---|---|
 | `CHECKPOINT` | tier every table's log into Parquet now, and write the catalog down, so other engines read what is current |
+| `ANALYZE [t]` | taken, and nothing to do: a table's statistics are kept with every write (BI tools send it) |
 
 ```sql
 CHECKPOINT;
@@ -704,6 +715,9 @@ Pondra refuses these by name, so a statement never runs and quietly does somethi
 | a `NOT NULL` column given no value, or a `DEFAULT` that doesn't cast | refused, naming the column |
 | a value that doesn't cast to its column's type (`'abc'` into a `BIGINT`) | refused, naming the value; never stored as `NULL` |
 | `INSERT … ON DUPLICATE KEY UPDATE` | refused: it is MySQL's; write `ON CONFLICT (…) DO UPDATE SET …` or `MERGE` |
+| `INSERT OVERWRITE` | refused; write `BEGIN; DELETE FROM t; INSERT INTO t …; COMMIT`, one commit |
+| `INSERT`, `UPDATE` or `DELETE` with `RETURNING` | refused, not taken yet; read the rows with a `SELECT` after it |
+| `CREATE TABLE … ENGINE = …`, `… TBLPROPERTIES (…)` | refused; a table's options go in `WITH (…)` |
 | `CREATE TABLE … WITH (…)` with an option name Pondra doesn't know | refused, with the name; see [table options](/pondra/reference/table-options/) |
 | `CREATE TEMPORARY EXTERNAL TABLE` | refused; use `CREATE TEMP VIEW v AS SELECT * FROM read_parquet('…')` |
 | `CREATE EXTERNAL TABLE … STORED AS AVRO` | refused; Pondra reads Parquet, CSV, JSON (one value a line) and Arrow |
@@ -721,7 +735,7 @@ Pondra refuses these by name, so a statement never runs and quietly does somethi
 | a column called `_row_id`, `_version`, `_created_at` or `_updated_at` | refused: every table has them already |
 | `DROP TABLE` while a view or task reads the table | refused; drop the view or task first |
 | a change to a table a window, session, join or min/max view follows | refused, with the view's name, because such a view cannot take a row back |
-| `CREATE INDEX`, `GRANT` | not supported |
+| `CREATE INDEX` | not supported: files carry their columns' ranges, and `cluster_by` orders them |
 | `SAVEPOINT`, `ROLLBACK TO` | refused: a transaction commits or rolls back whole |
 | `CREATE`, `ALTER`, `DROP` inside `BEGIN` … `COMMIT` | refused (`0A000`): run them outside the transaction |
 | a materialized view of a `GROUP BY` view that isn't a rollup | refused, saying why ([Flows](/pondra/guides/flows/)) |

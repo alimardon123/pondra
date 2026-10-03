@@ -195,7 +195,14 @@ impl Upsert {
         let insert = Clause { kind: Kind::NotMatched, when: None, action: Action::Insert(columns.clone(), columns.iter().map(|c| format!("{x}.{}", q(c))).collect()) };
         let mut clauses = vec![];
         if let Some((set, when)) = &self.update {
-            clauses.push(Clause { kind: Kind::Matched, when: when.clone(), action: Action::Update(set.clone()) });
+            // (an empty SET is INSERT OR REPLACE's: every column the rows give, but those it matched on)
+            let set = match set.is_empty() {
+                true => columns.iter().filter(|c| !on.contains(c)).map(|c| (c.clone(), format!("{x}.{}", q(c)))).collect(),
+                false => set.clone(),
+            };
+            if !set.is_empty() {
+                clauses.push(Clause { kind: Kind::Matched, when: when.clone(), action: Action::Update(set) });
+            }
         }
         clauses.push(insert);
         Ok(Merge { sql: m.sql.clone(), target: m.target.clone(), alias: m.alias.clone(), source, on: on_sql, clauses, semi: false, upsert: None })
