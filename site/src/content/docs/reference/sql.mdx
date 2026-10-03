@@ -280,7 +280,8 @@ Postgres connection's, a client's, or one script's); a procedure and a file run 
 
 | Statement | Syntax |
 |---|---|
-| Declare | `DECLARE $name [type] [= value]` (or `DEFAULT value`): type and value both optional |
+| Declare | `DECLARE $name [type] [= value]` (or `DEFAULT value`): type and value both optional; NULL with neither |
+| Declare a parameter | `DECLARE PARAMETER $name [type] [= value]`: one a run, a request or the console's bar may give |
 | Change | `$name = value` |
 | Use | `$name` wherever a value goes, or `getvariable('name')` (DuckDB's; NULL when there is none) |
 | Forget | `RESET VARIABLE name` |
@@ -292,8 +293,9 @@ Postgres connection's, a client's, or one script's); a procedure and a file run 
   refused. `$name = …` needs no `SET`; DuckDB's `SET VARIABLE name = value` is the same.
   `SET` alone is a setting's ([above](#settings-and-prepared-statements)).
 - A column that uses a variable and has no name is named as written: `$day`, `$day + 1`.
-- In a file, a `DECLARE` is a parameter with a default: a run's value for it takes the default's
-  place, cast to its type ([Run files as jobs](/pondra/guides/workspace/#parameters-declared)).
+- In a file, a `DECLARE PARAMETER` is a parameter with a default: a run's value for it takes the
+  default's place, cast to its type ([Run files as jobs](/pondra/guides/workspace/#parameters-declared)).
+  A plain `DECLARE` is the file's own variable: a value given for it is refused.
   Python's `db.vars.day` is `$day` ([Python client](/pondra/reference/python/)).
 
 ```sql

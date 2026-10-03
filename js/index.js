@@ -77,8 +77,8 @@ export class Pondra {
   /** Forget a variable (`RESET VARIABLE`). */
   async resetVariable(name) { await this.sql(`RESET VARIABLE ${varName(name)}`); }
 
-  /** A SQL file's parameters (its DECLAREs: name, type, default, required, description), a file of
-   * the lake's: `await db.parameters("etl/orders.sql")`. */
+  /** A file's parameters (its DECLARE PARAMETERs: name, type, default, required, description), a file
+   * of the lake's: `await db.parameters("etl/orders.sql")`. */
   async parameters(file) { return this.sql(`SELECT * FROM pondra.parameters('${String(file).replace(/'/g, "''")}')`); }
 
   /** A stored procedure (`CREATE PROCEDURE`), called, as Python's `con.call`: `await db.call("load_day", "2026-09-27")`. */

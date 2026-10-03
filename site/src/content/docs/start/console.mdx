@@ -177,12 +177,13 @@ click puts the name in the file, for `name.table`); both copy the name.
   (a `DECLARE` or a `SET` has none, and says so). The next **Run** shows rows again.
 - **Settings → A SQL file's statements → The last one's answer** runs the file at once instead and
   shows only its last statement's answer.
-- **A `DECLARE $name` in the file** is a parameter, with an input above the editor: its type, its
-  default as the value, and what the comment above it (or after it, on its line) says. A value you
-  change is marked, and **↺** puts the default back; **Enter** in one runs the file. **Run** sends the
-  values with the statements, and the node binds them (numbers and `true`/`false` as such, the rest
-  as text); the browser keeps them for the file. `$name = …` later in the file is a working variable,
-  not a parameter. (A `$name` used without a `DECLARE` gets an input too, with no default.)
+- **A `DECLARE PARAMETER $name` in the file** is a parameter, with an input above the editor: its
+  type, its default as the value, and what the comment above it (or after it, on its line) says. A
+  value you change is marked, and **↺** puts the default back; **Enter** in one runs the file. **Run**
+  sends the values with the statements, and the node binds them (numbers and `true`/`false` as such,
+  the rest as text); the browser keeps them for the file. A plain `DECLARE $name` and `$name = …` are
+  the file's own working variables, never in the bar. (A `$name` used and set nowhere gets an input
+  too, with no default.)
 - **Messages** lists every statement that ran: its number, its SQL, how long it took, what it did
   (`rows 3`), and what it printed, set apart under **Printed**. A click picks one (its text stays
   selectable, to copy); a double-click or **Enter** shows its answer and its lines.

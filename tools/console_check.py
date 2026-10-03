@@ -502,7 +502,7 @@ def files_checks(browser, port, show):
     sql(port, "CREATE TABLE fx AS SELECT value AS id, 'r' || (value % 3) AS region FROM range(0, 30)")
     top = b"SELECT region, count(*) AS n\nFROM fx\nGROUP BY region\nORDER BY region"
     put(port, "scripts/top.sql", top)
-    put(port, "scripts/since.sql", b"-- The first day counted\nDECLARE $since DATE = DATE '2026-01-01';\nDECLARE $top BIGINT DEFAULT 3; -- how many more\nSELECT $since AS since, $top + 1 AS more;\nSELECT 7 AS seven")
+    put(port, "scripts/since.sql", b"-- The first day counted\nDECLARE PARAMETER $since DATE = DATE '2026-01-01';\nDECLARE PARAMETER $top BIGINT DEFAULT 3; -- how many more\nDECLARE $more = $top + 1;\nSELECT $since AS since, $more AS more;\nSELECT 7 AS seven")
     put(port, "scripts/hello.py", b'import math\nprint("pi is", round(math.pi, 4))\ndb.sql("SELECT count(*) AS n FROM fx")')
     put(port, "data/q.csv", b'id,city,amount\r\n1,Oslo,10\r\n2,"Rome, IT",20\r\n')
     put(port, "data/e.jsonl", b'{"id":1,"tag":"a"}\n{"id":2,"tag":"b"}\n')
@@ -654,7 +654,7 @@ def files_checks(browser, port, show):
     p.keyboard.press("Control+Home")
     p.keyboard.press("Control+Shift+Enter")  # (the file)
     answers = lambda: strip.evaluate("s => [...s.querySelectorAll('button.stmt')].map(b => b.querySelector('b').textContent + ' ' + b.lastChild.textContent)")
-    whole = until(lambda: strip.count() and answers(), ["3 1 row", "4 1 row"])
+    whole = until(lambda: strip.count() and answers(), ["4 1 row", "5 1 row"])
     strip.locator("button.stmt").first.click()
     defaults = until(lambda: pg.grid(body), [["since", "more"], [["2026-01-01", "4"]]])
     bar.locator("input").nth(1).fill("10")
@@ -672,7 +672,7 @@ def files_checks(browser, port, show):
     bar.locator(".param").nth(1).locator(".preset").click()
     reset = (bar.locator("input").nth(1).input_value(), bar.locator(".param.set").count())
     box, cw = ed.bounding_box(), p.evaluate("(() => { const c = document.createElement('canvas').getContext('2d'); c.font = '13px ' + getComputedStyle(document.body).getPropertyValue('--mono'); return c.measureText('0').width; })()")
-    p.mouse.move(box["x"] + 14 + cw * 9.5, box["y"] + 9 + 21 * 1.5)  # (over `$since`, line 2)
+    p.mouse.move(box["x"] + 14 + cw * 19.5, box["y"] + 9 + 21 * 1.5)  # (over `$since`, line 2)
     hovered = until(lambda: ed.get_attribute("title") or "", "$since DATE = DATE '2026-01-01'\nThe first day counted\nNow: 2026-01-01 (date)", 5)
     p.locator("#rtabs .rtab", has_text="Variables").click()
     shown_vars = until(lambda: p.locator("#variables .vhead").count() == 1 and p.locator("#variables .var .nm").all_inner_texts()[-2:], ["$since", "$top"], 10)
@@ -683,9 +683,9 @@ def files_checks(browser, port, show):
     p.keyboard.press("Control+Space")
     completes = until(lambda: p.locator("#complete:not([hidden]) div").all_inner_texts()[:1], ["$top\nvariable"], 5)
     p.keyboard.press("Escape")
-    checks["a SQL file's DECLAREs are its parameters (type, its default as the value, what the comment above or after it says; a date picks a date), $names highlighted; a value given replaces the default (marked, ↺ back); Ctrl+Shift+Enter runs the file, Ctrl+Enter the statement at the caret (just after its ; too); hovering a $name says it; Variables lists SQL's; $ completes"] = \
+    checks["a SQL file's DECLARE PARAMETERs are its parameters, a plain DECLARE its own (not in the bar) (type, its default as the value, what the comment above or after it says; a date picks a date), $names highlighted; a value given replaces the default (marked, ↺ back); Ctrl+Shift+Enter runs the file, Ctrl+Enter the statement at the caret (just after its ; too); hovering a $name says it; Variables lists SQL's; $ completes"] = \
         typed == [["$since", "date", "date", "2026-01-01", "The first day counted\nDefault: DATE '2026-01-01'", "The first day counted"], ["$top", "bigint", "text", "3", "how many more\nDefault: 3", "how many more"]] and lit \
-        and whole == ["3 1 row", "4 1 row"] and defaults == [["since", "more"], [["2026-01-01", "4"]]] and marked == 1 and given == [["since", "more"], [["2026-01-01", "11"]]] and reset == ("3", 0) \
+        and whole == ["4 1 row", "5 1 row"] and defaults == [["since", "more"], [["2026-01-01", "4"]]] and marked == 1 and given == [["since", "more"], [["2026-01-01", "11"]]] and reset == ("3", 0) \
         and alone == [["seven"], [["7"]]] and after == [["since", "more"], [["2026-01-01", "11"]]] and hovered.startswith("$since DATE") and shown_vars == ["$since", "$top"] and completes == ["$top\nvariable"]
     var_info = {"typed": typed, "whole": whole, "marked": marked, "reset": reset, "defaults": defaults, "given": given, "alone": alone, "after": after, "hovered": hovered, "vars": shown_vars, "completes": completes}
     pg.workspace("scripts", "hello.py").click()

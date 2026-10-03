@@ -1,7 +1,7 @@
 //! The workspace (ADR-033): the lake's own files, run. `CALL run('etl/orders.sql', day => DATE
 //! '2026-09-29')` runs a `.sql` file's statements (`$day` bound, never pasted in), a `.py` file
-//! (`day` a variable), or a notebook (its `parameters` cell's values replaced, as papermill does),
-//! as its caller, from every door: SQL over HTTP and Postgres, the clients' `run`, MCP, a task's
+//! (`day` a variable; its `# %% tags=["parameters"]` cell's values replaced, as papermill does), or a
+//! notebook (its `parameters` cell's values replaced), as its caller, from every door: SQL over HTTP and Postgres, the clients' `run`, MCP, a task's
 //! schedule, `pondra.start('run', …)`. A file may run another. Each run is a row of the run log
 //! (`pondra.runs`), named `files/<path>@<version>`: the file and the version that ran.
 use crate::auth::Role;
@@ -12,6 +12,7 @@ use datafusion::arrow::array::{Array, RecordBatch, StringArray};
 use datafusion::sql::sqlparser::ast::{FunctionArg, FunctionArgExpr};
 use serde_json::{json as j, Value};
 use std::collections::HashMap;
+use std::sync::LazyLock;
 
 /// Is a `CALL`'s procedure this one: `run`, or `pondra.run`?
 pub fn is_run(name: &str) -> bool { matches!(name.to_ascii_lowercase().as_str(), "run" | "pondra.run") }
@@ -55,6 +56,14 @@ pub async fn run(app: &App, args: &[FunctionArg], who: Who, job: Option<String>,
         _ => e,
     })?;
     let text = String::from_utf8(bytes.to_vec()).with_context(|| format!("run: {path} is not text"))?;
+    if let Some(takes) = parameters(&path, &text)? {
+        for f in row.schema().fields() {
+            let names = takes.iter().map(|p| format!("{}{}", if kind == "py" { "" } else { "$" }, p.name)).collect::<Vec<_>>();
+            let list = if names.is_empty() { "it takes none".to_string() } else { format!("it takes {}", names.join(", ")) };
+            let why = if kind == "py" { "its # %% tags=[\"parameters\"] cell sets them" } else { "a plain DECLARE is the file's own variable, DECLARE PARAMETER one a run may give" };
+            ensure!(takes.iter().any(|p| p.name == *f.name()), "run: {path} has no parameter {} ({list}); {why}", f.name());
+        }
+    }
     let runs_python = kind == "py" || kind == "ipynb" && notebook(&text)?.iter().any(|c| c.python);
     ensure!(!runs_python || who.role >= Role::Admin, "run: {path} runs Python on the node: it needs an admin token, as DO does");
     let log = crate::runs::Run::start(app, &format!("{path}@{version}"), who.role, job.as_deref(), &row, id);
@@ -66,7 +75,19 @@ pub async fn run(app: &App, args: &[FunctionArg], who: Who, job: Option<String>,
     let out = crate::vars::own(values, async { // (the run's variables, from the values given: every cell's, and its Python's `db.vars`)
         match kind.as_str() {
             "sql" => Box::pin(crate::routines::script(app, &text, &none, &no_views, inner, job)).await,
-            "py" => python(app, &path, &text, Some(&row), &session, inner, job, &mut heard).await,
+            "py" => match cells_py(&text).into_iter().position(|c| c.0) {
+                // (its parameters cell first, the values given over its defaults, then the rest: papermill's order)
+                Some(at) => {
+                    let all = cells_py(&text);
+                    let (head, rest) = all.split_at(at + 1);
+                    let lines = |c: &[(bool, String)]| c.iter().map(|c| c.1.as_str()).collect::<Vec<_>>().join("\n");
+                    python(app, &path, &lines(head), None, &session, inner, None, &mut heard).await?;
+                    python(app, &path, "", Some(&row), &session, inner, None, &mut heard).await?;
+                    let padded = "\n".repeat(head.iter().map(|c| c.1.split('\n').count()).sum::<usize>()) + &lines(rest); // (its lines numbered as in the file)
+                    python(app, &path, &padded, None, &session, inner, job, &mut heard).await
+                }
+                None => python(app, &path, &text, Some(&row), &session, inner, job, &mut heard).await,
+            },
             _ => Box::pin(cells(app, &path, &text, &row, &session, inner, job, &mut heard)).await,
         }
     })
@@ -194,4 +215,105 @@ async fn python(app: &App, name: &str, code: &str, vars: Option<&RecordBatch>, s
         Some("sql") => Box::pin(crate::routines::one(app, answer["sql"].as_str().unwrap_or_default(), who, None)).await,
         _ => Ok(Outcome::Done(j!({"ran": name}))),
     }
+}
+
+// ---------------------------------------------------------------- a file's parameters
+
+/// What a file a run may be given (ADR-043), or None when it doesn't say and takes any value: a
+/// `.sql` file's `DECLARE PARAMETER`s and `$name`s used before anything sets them; a `.py` file's
+/// `# %% tags=["parameters"]` cell (jupytext's and papermill's); a notebook's cell tagged
+/// `parameters` (Python or `%%sql`) and the `DECLARE PARAMETER`s of its SQL cells.
+pub fn parameters(path: &str, text: &str) -> Result<Option<Vec<crate::vars::Param>>> {
+    Ok(match path.rsplit('.').next().unwrap_or_default().to_ascii_lowercase().as_str() {
+        "py" => cells_py(text).into_iter().find(|c| c.0).map(|c| python_parameters(&c.1)),
+        "ipynb" => {
+            let cells = notebook(text)?;
+            let sql = cells.iter().filter(|c| !c.python).map(|c| c.code.as_str()).collect::<Vec<_>>().join(";\n");
+            let mut out: Vec<_> = cells.iter().filter(|c| c.python && c.parameters).flat_map(|c| python_parameters(&c.code)).collect();
+            out.extend(crate::vars::parameters(&sql).into_iter().filter(|p| p.declared)); // (a `$name` its SQL uses may be its Python's `db.vars`)
+            (!out.is_empty() || cells.iter().any(|c| c.parameters)).then_some(out)
+        }
+        _ => Some(crate::vars::parameters(text)),
+    })
+}
+
+/// A `.py` file's cells, as jupytext's percent format cuts them (`# %%` lines, each its cell's
+/// first), each with whether it is the parameters cell (`# %% tags=["parameters"]`); joined with
+/// `\n` they are the file again.
+fn cells_py(text: &str) -> Vec<(bool, String)> {
+    static MARK: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"^#\s*%%").expect("a regex"));
+    static TAGGED: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r#"tags\s*=\s*\[[^\]]*["']parameters["']"#).expect("a regex"));
+    let mut out: Vec<(bool, Vec<&str>)> = vec![(false, vec![])];
+    for line in text.split('\n') {
+        if MARK.is_match(line) {
+            out.push((TAGGED.is_match(line), vec![]));
+        }
+        out.last_mut().expect("a cell").1.push(line);
+    }
+    out.into_iter().filter(|c| !c.1.is_empty()).map(|(p, lines)| (p, lines.join("\n"))).collect()
+}
+
+/// A Python parameters cell's names: each `name = value` or `name: type = value` at its top level
+/// (`name: type` alone is required), its type as SQL's (`date` DATE, `int` BIGINT, …, else what
+/// its default is), what the comment after it or the lines just above it say.
+fn python_parameters(cell: &str) -> Vec<crate::vars::Param> {
+    static ONE: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"^([A-Za-z_]\w*)\s*(?::\s*([^=]+?)\s*)?(?:=([^=].*?|))?\s*$").expect("a regex"));
+    let (mut out, mut said): (Vec<crate::vars::Param>, Vec<String>) = (vec![], vec![]);
+    for line in cell.lines() {
+        let (code, comment) = split_comment(line);
+        if line.trim_start().starts_with('#') {
+            if !line.trim_start().starts_with("# %%") { said.push(line.trim_start().trim_start_matches('#').trim().to_string()); }
+            continue;
+        }
+        let about = (!comment.is_empty()).then(|| comment.to_string()).or_else(|| Some(said.join(" ")).filter(|t| !t.is_empty()));
+        said.clear();
+        let Some(c) = ONE.captures(code.trim_end()).filter(|_| !code.starts_with(char::is_whitespace)) else { continue };
+        let (hint, default) = (c.get(2).map(|t| t.as_str().trim().to_string()), c.get(3).map(|d| d.as_str().trim().to_string()).filter(|d| !d.is_empty()));
+        if hint.is_none() && default.is_none() || out.iter().any(|p| p.name == c[1]) {
+            continue;
+        }
+        let ty = hint.as_deref().and_then(sql_type).or_else(|| default.as_deref().and_then(literal_type));
+        out.push(crate::vars::Param { name: c[1].to_string(), ty, required: default.is_none(), default, description: about, declared: true });
+    }
+    out
+}
+
+/// A line's code and its comment (`#` outside quotes).
+fn split_comment(line: &str) -> (&str, &str) {
+    let mut quote = None;
+    for (i, ch) in line.char_indices() {
+        match (quote, ch) {
+            (None, '\'' | '"') => quote = Some(ch),
+            (Some(q), c) if c == q => quote = None,
+            (None, '#') => return (&line[..i], line[i + 1..].trim()),
+            _ => {}
+        }
+    }
+    (line, "")
+}
+
+/// A Python annotation as SQL's type.
+fn sql_type(hint: &str) -> Option<String> {
+    let t = match hint.rsplit('.').next().unwrap_or(hint) {
+        "date" => "DATE",
+        "datetime" => "TIMESTAMP",
+        "int" => "BIGINT",
+        "float" => "DOUBLE",
+        "str" => "VARCHAR",
+        "bool" => "BOOLEAN",
+        _ => return None,
+    };
+    Some(t.to_string())
+}
+
+/// A Python literal's type, as SQL's.
+fn literal_type(v: &str) -> Option<String> {
+    let t = match v {
+        "True" | "False" => "BOOLEAN",
+        v if v.parse::<i64>().is_ok() => "BIGINT",
+        v if v.parse::<f64>().is_ok() => "DOUBLE",
+        v if v.starts_with(['"', '\'']) => "VARCHAR",
+        _ => return None,
+    };
+    Some(t.to_string())
 }
