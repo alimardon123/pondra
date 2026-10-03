@@ -362,7 +362,8 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
     };
     let who = match signed {
         Some(p) => p,
-        None if owner(req.headers()) || app.open().await => crate::auth::Principal::of(crate::auth::Role::Admin),
+        None if owner(req.headers()) => crate::auth::Principal::token(crate::auth::Role::Admin), // (the shell's, local()'s: this machine's own folder)
+        None if app.open().await => crate::auth::Principal::of(crate::auth::Role::Admin),
         None if header.is_some() => {
             crate::audit::refused(&app, &basic_user(header.as_deref()), "http", from, &format!("{} {}", req.method(), req.uri().path()), "wrong token, or user name and password");
             tokio::time::sleep(Duration::from_millis(400)).await; // (a guess costs time)

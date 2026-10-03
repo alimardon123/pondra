@@ -148,7 +148,7 @@ impl StartupHandler for Startup {
                             return Err(wrong(&user));
                         };
                         let who = match crate::users::BUILT_IN.contains(&user.as_str()) {
-                            true => Some(crate::auth::Principal::of(app.auth.role_of_user(&user))),
+                            true => Some(crate::auth::Principal::token(app.auth.role_of_user(&user))),
                             false => crate::users::principal(&app.lake, &user).await.ok(),
                         };
                         let Some(who) = who else { return Err(wrong(&user)) };

@@ -368,17 +368,32 @@ fn guarded(name: &str, t: Arc<dyn TableProvider>, listing: bool) -> Option<Arc<d
     if listing && columns.is_none() {
         return None;
     }
-    Some(Arc::new(Guarded { inner: t, name: name.to_string(), columns }))
+    Some(Arc::new(Guarded { inner: t, name: name.to_string(), columns, why: None }))
+}
+
+/// An attached lake's table `name` as the request being served may read it: not at all when that
+/// lake signs in on its own (`locked`, why); for a user granted some tables, by grants naming it.
+fn across(name: &str, t: Arc<dyn TableProvider>, listing: bool, locked: &Option<String>) -> Option<Arc<dyn TableProvider>> {
+    let columns = match (locked, crate::auth::limited()) {
+        (Some(_), _) => None,
+        (None, None) => return Some(t),
+        (None, Some(access)) => access.named("select", name),
+    };
+    if listing && columns.is_none() {
+        return None;
+    }
+    Some(Arc::new(Guarded { inner: t, name: name.to_string(), columns, why: locked.clone() }))
 }
 
 /// A table as a user granted some of it reads it (`users.rs`): planned as the table is (its
 /// columns are no secret, as in Postgres), but a scan of a column it may not read is refused, the
-/// columns its filters use included; and every scan, if it may read none.
+/// columns its filters use included; and every scan, if it may read none (or `why` not).
 #[derive(Debug)]
 struct Guarded {
     inner: Arc<dyn TableProvider>,
     name: String,
     columns: Option<Option<std::collections::HashSet<String>>>,
+    why: Option<String>,
 }
 
 #[async_trait::async_trait]
@@ -394,7 +409,7 @@ impl TableProvider for Guarded {
         }).collect())
     }
     async fn scan(&self, state: &dyn datafusion::catalog::Session, projection: Option<&Vec<usize>>, filters: &[Expr], limit: Option<usize>) -> datafusion::error::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
-        let denied = |what: String| datafusion::error::DataFusionError::Plan(format!("permission denied: SELECT{what} on {} (GRANT SELECT ON {} TO …)", self.name, self.name));
+        let denied = |what: String| datafusion::error::DataFusionError::Plan(self.why.clone().unwrap_or_else(|| format!("permission denied: SELECT{what} on {} (GRANT SELECT ON {} TO …)", self.name, self.name)));
         let Some(columns) = &self.columns else { return Err(denied(String::new())) };
         if let Some(allowed) = columns {
             let schema = self.inner.schema();
@@ -760,6 +775,7 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
         if !listing && !mentions(&text, &ns) {
             continue;
         }
+        let locked = crate::users::across(&other, &ns).await.err().map(|e| e.to_string()); // (its own sign-in: `users::across`)
         let catalog = Arc::new(MemoryCatalogProvider::new());
         for s in crate::ddl::schemas(&other).await? {
             catalog.register_schema(&s, Arc::new(MemorySchemaProvider::new()))?;
@@ -775,7 +791,7 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
             }
             let meta: TableMeta = serde_json::from_slice(&raw)?;
             let view = named(&ctx, table_view(&other, &ctx, name, &sys(meta.clone()), None).await?, &meta, names_deleted(&text))?;
-            let Some(view) = guarded(&format!("{ns}.{name}"), view, listing) else { continue }; // (a user's: granted ON ALL TABLES)
+            let Some(view) = across(&format!("{ns}.{name}"), view, listing, &locked) else { continue };
             let (s, t) = split(name);
             if old && s == PUBLIC {
                 default.schema(&ns).expect("registered").register_table(t.to_string(), view.clone())?;

@@ -5553,9 +5553,10 @@ def server():
     database idle for PONDRA_DATABASE_IDLE_SECS stops, and starts again when next used; each
     database's node gets `pondra serve`'s options; a connection open (or a request in flight)
     keeps its database's node running; another node joins a database's cluster through
-    the server; the server killed and started again serves the same databases; `--flight` is
-    refused, and a folder that holds other things than lakes isn't made one."""
-    import psycopg
+    the server; the server killed and started again serves the same databases; each database signs
+    in on its own (a grant in one covers none of the others, an open one opens nothing of another);
+    `--flight` is refused, and a folder that holds other things than lakes isn't made one."""
+    import base64, psycopg
     folder = new_lake()  # (a folder of lakes, here)
     for name, q in [("sales", "CREATE TABLE orders AS SELECT 1 AS id, 10.5 AS amount UNION ALL SELECT 2, 20.0"),
                     ("crm", "CREATE TABLE customers AS SELECT 1 AS id, 'ann' AS name UNION ALL SELECT 2, 'bob'"), ("lake", "CREATE TABLE notes AS SELECT 'hi' AS text")]:
@@ -5610,6 +5611,48 @@ def server():
     until(lambda: _try(lambda: sql(port, "SELECT 1")) is None, True, 10)
     srv = start(["--lakes", folder])  # (named so, nothing guessed: for services)
     checks["killed and started again, the server serves the same databases"] = sorted(running()) == ["hr", "lake", "sales"] and pq("sales", "SELECT count(*) FROM orders") == [(3,)]
+    # Each database signs in on its own (the nodes attach each other): a grant in one covers none of
+    # the others, and one nothing locks opens nothing of another.
+    def at(db, q, who=None):
+        try:
+            return call(port, "POST", f"/db/{db}/sql", q.encode(), headers={"Authorization": "Basic " + base64.b64encode(who.encode()).decode()} if who else {})
+        except Exception as e:
+            return f"ERROR {e}"
+    boss, bob, ann = "boss:boss-password-1", "bob:bob-password-1", "ann:ann-password-1"
+    at("hr", "CREATE USER boss PASSWORD 'boss-password-1' SUPERUSER")
+    until(lambda: str(at("hr", "SELECT 1 AS x")).startswith("ERROR 401"), True, 15)
+    for q in ["CREATE USER bob PASSWORD 'bob-password-1'", "GRANT SELECT, INSERT ON ALL TABLES TO bob", "CREATE USER ann PASSWORD 'ann-password-1'", "GRANT SELECT ON lake.notes TO ann"]:
+        at("hr", q, boss)
+    seen = {
+        "bob_own": at("hr", "SELECT count(*) AS n FROM people", bob),
+        "bob_lake": at("hr", "SELECT text FROM lake.notes", bob),
+        "bob_write": at("hr", "INSERT INTO lake.notes VALUES ('bob was here')", bob),
+        "ann_named": at("hr", "SELECT text FROM lake.notes", ann),
+        "boss_open": at("hr", "SELECT text FROM lake.notes", boss),
+        "open_reads": until(lambda: str(at("lake", "SELECT id FROM hr.people")).startswith("ERROR"), True, 15) and at("lake", "SELECT id FROM hr.people"),
+        "open_writes": at("lake", "INSERT INTO hr.people VALUES (9)"),
+        "open_iceberg": _raises_text(lambda: call(port, "GET", "/db/lake/v1/namespaces/hr/tables")),
+        "open_lists": at("lake", "SELECT name FROM pondra.tables ORDER BY name"),
+    }
+    at("sales", "CREATE USER sam PASSWORD 'sam-password-1' SUPERUSER")
+    until(lambda: str(at("sales", "SELECT 1 AS x")).startswith("ERROR 401"), True, 15)
+    seen["boss_locked"] = until(lambda: str(at("hr", "SELECT amount FROM sales.orders", boss)).startswith("ERROR"), True, 15) and at("hr", "SELECT amount FROM sales.orders", boss)
+    checks["a grant ON ALL TABLES in one database reads and writes none of another's; a grant naming its table does"] = seen["bob_own"] == [{"n": 1}] \
+        and "lake.notes" in str(seen["bob_lake"]) and "GRANT INSERT ON lake.notes" in str(seen["bob_write"]) and seen["ann_named"] == [{"text": "hi"}]
+    checks["a database with no sign-in reads and writes nothing of one with its own (SQL, the Iceberg catalog, listings)"] = "hr signs in on its own" in str(seen["open_reads"]) \
+        and "hr signs in on its own" in str(seen["open_writes"]) and "403" in seen["open_iceberg"] and "people" not in str(seen["open_lists"])
+    checks["a database's superuser reads another only as that one lets anyone: open, yes; signing in on its own, no"] = seen["boss_open"] == [{"text": "hi"}] \
+        and "sales signs in on its own" in str(seen["boss_locked"])
+    # Whoever runs the nodes (one of their tokens) still reads across; a user of the node's own lake doesn't.
+    mine = new_lake()
+    subprocess.run([BIN, "sql", "--dir", mine, "CREATE TABLE t AS SELECT 1 AS id"], check=True, capture_output=True)
+    tokened = Node(mine, port + 3, admin_token="tk-across-1", attach=f"hr={os.path.join(folder, 'hr')}").start()
+    tk = {"Authorization": "Bearer tk-across-1"}
+    call(port + 3, "POST", "/sql", b"CREATE USER top PASSWORD 'top-password-1' SUPERUSER", headers=tk)
+    top = {"Authorization": "Basic " + base64.b64encode(b"top:top-password-1").decode()}
+    checks["one of the nodes' tokens reads another database; a superuser of this one doesn't"] = until(lambda: _try(lambda: call(port + 3, "POST", "/sql", b"SELECT count(*) AS n FROM hr.people", headers=tk)), [{"n": 1}], 15) == [{"n": 1}] \
+        and "hr signs in on its own" in _raises_text(lambda: call(port + 3, "POST", "/sql", b"SELECT count(*) AS n FROM hr.people", headers=top))
+    tokened.kill()
     refused = subprocess.run([BIN, "serve", folder, "--addr", f"127.0.0.1:{port + 5}", "--flight", "127.0.0.1:1"], capture_output=True, text=True, timeout=30)
     checks["--flight is refused by name (a Flight port is one lake's)"] = refused.returncode != 0 and "one lake" in refused.stderr
     other = tempfile.mkdtemp(prefix="pondra-notalake-")
@@ -5696,6 +5739,13 @@ def users():
     later = until(lambda: as_(A.port + 1, bob, "SELECT id FROM sales.refunds"), [{"id": 1}], 10)
     checks["a schema's grant covers its later tables; a follower forwards a user's writes (the nodes' own key), refusing the rest"] = \
         wrote[0] == {"rows": 1} and "permission denied: INSERT on hr" in wrote[1] and "permission denied: UPDATE on sales.orders" in wrote[2] and later == [{"id": 1}]
+    # A procedure started without waiting runs with its caller's grants, as a CALL does
+    as_(A.port, boss, "CREATE PROCEDURE leak() LANGUAGE sql AS $$ INSERT INTO sales.refunds SELECT id, salary FROM hr $$")
+    called = as_(A.port, bob, "CALL leak()")
+    started = as_(A.port, bob, "SELECT pondra.start('leak') AS r")
+    run = until(lambda: as_(A.port, boss, f"SELECT status FROM pondra.runs WHERE id = '{started[0]['r']}'") if isinstance(started, list) else None, [{"status": "failed"}], 20)
+    checks["a procedure started without waiting (pondra.start) has its caller's grants, as a CALL has"] = "permission denied: SELECT on hr" in str(called) \
+        and run == [{"status": "failed"}] and as_(A.port, boss, "SELECT count(*) AS n FROM sales.refunds") == [{"n": 1}]
     # Tokens and sessions
     tok = as_(A.port, boss, "CREATE TOKEN ci FOR USER svc")
     short = as_(A.port, boss, "CREATE TOKEN brief FOR USER svc EXPIRES IN '1 second'")
