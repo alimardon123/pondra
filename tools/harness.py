@@ -6467,7 +6467,8 @@ def tasks():
     nothing after a failure; ALTER TASK SUSPEND and RESUME; refusals (a loop, two schedules, a
     missing task, DROP of a followed one); a graph through a leader failover, each write once."""
     lake = new_lake()
-    nodes = [Node(lake, A.port + i).start() for i in range(3)]
+    py = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "python")
+    nodes = [Node(lake, A.port + i, python=sys.executable, env={"PYTHONPATH": py}).start() for i in range(3)]
     time.sleep(1)
     q = lambda s, port=A.port: call(port, "POST", "/sql", s.encode(), timeout=60)
     def err(s, port=A.port):
@@ -6543,6 +6544,42 @@ def tasks():
     q("DROP TASK beat")
     got["beats"] = [n1, n2, n3, state]
     checks["ALTER TASK SUSPEND stops its ticks, RESUME starts them again"] = n1 > 0 and n2 == n1 and n3 > n2 and state == "suspended"
+    # From the clients: Python's db.task, @db.task (a procedure the task calls) and execute_task's Run;
+    # JavaScript's task, executeTask and wait.
+    q("CREATE TABLE clog (who VARCHAR, day DATE)")
+    nb = os.path.join(tempfile.mkdtemp(prefix="pondra-tasks-"), "tasks.py")
+    open(nb, "w").write(f"""import json
+from datetime import date
+import pondra
+db = pondra.connect("http://127.0.0.1:{A.port + 1}")
+db.task("croot", "INSERT INTO clog VALUES ('sql', $day)", schedule="1 hour")
+
+@db.task(after="croot", retries=1)
+def cnext():
+    pondra.sql("INSERT INTO clog VALUES ('python', NULL)")
+
+ran = db.execute_task("croot", day=date(2026, 9, 2))
+print(json.dumps(ran.wait(timeout=30)["status"]))
+""")
+    ran = subprocess.run([sys.executable, nb], capture_output=True, text=True, timeout=120, env={**os.environ, "PYTHONPATH": py})
+    until(lambda: status("cnext"), "ok", 30)
+    js = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "js", "index.js")
+    script = f"""import {{ connect }} from {json.dumps(js)};
+const db = connect("http://127.0.0.1:{A.port + 2}");
+await db.task("jroot", "INSERT INTO clog VALUES ('js', $day)", {{ schedule: "1 hour", retries: 1, timeout: "10 minutes" }});
+await db.task("jnext", "INSERT INTO clog VALUES ('js after', $day)", {{ after: ["jroot"], when: "true" }});
+await db.wait(await db.executeTask("jroot", {{ day: "2026-09-03" }}));
+console.log("done"); await db.close();"""
+    path = os.path.join(tempfile.mkdtemp(prefix="pondra-tasks-"), "tasks.mjs")
+    open(path, "w").write(script)
+    js_out = subprocess.run(["node", path], capture_output=True, text=True, timeout=120)
+    until(lambda: status("jnext"), "ok", 30)
+    got["clients"] = {"python": ran.stdout.strip() or ran.stderr[-800:], "js": js_out.stdout.strip() or js_out.stderr[-800:],
+                      "rows": q("SELECT who, CAST(day AS VARCHAR) AS day FROM clog ORDER BY who"),
+                      "options": q("SELECT name, after, options FROM pondra.tasks WHERE name IN ('cnext', 'jroot') ORDER BY name")}
+    checks["from the clients: Python's db.task, @db.task and execute_task(…).wait(); JavaScript's task, executeTask and wait"] = (
+        got["clients"]["python"] == '"ok"' and got["clients"]["js"] == "done"
+        and got["clients"]["rows"] == [{"who": "js", "day": "2026-09-03"}, {"who": "js after", "day": "2026-09-03"}, {"who": "python"}, {"who": "sql", "day": "2026-09-02"}])
     # Refusals.
     got["refused"] = refused = {
         "itself": err("CREATE TASK me AFTER me AS SELECT 1"),

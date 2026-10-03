@@ -324,16 +324,16 @@ Postgres connection's, a client's, or one script's); a procedure and a file run 
 |---|---|
 | Declare | `DECLARE $name [type] [= value]` (or `DEFAULT value`): type and value both optional; NULL with neither |
 | Declare a parameter | `DECLARE PARAMETER $name [type] [= value]`: one a run, a request or the console's bar may give |
-| Change | `$name = value` |
+| Change | `$name = value` (or `SET $name = value`) |
 | Use | `$name` wherever a value goes, or `getvariable('name')` (DuckDB's; NULL when there is none) |
-| Forget | `RESET VARIABLE name` |
+| Forget | `RESET $name` |
 | List | `SELECT * FROM pondra.variables` (name, value, type, declared) |
 
 - The value is worked out once, when it is set, and bound wherever `$name` is used, never pasted
   into the text: `$day = current_date - 1` is one day for every statement after it.
 - A declared type holds: each value the variable takes is cast to it, and one that can't be is
-  refused. `$name = …` needs no `SET`; DuckDB's `SET VARIABLE name = value` is the same.
-  `SET` alone is a setting's ([above](#settings-and-prepared-statements)).
+  refused. `$name = …` needs no `SET`; other spellings are in [Other spellings](#other-spellings).
+  `SET name` without a `$` is a setting's ([above](#settings-and-prepared-statements)).
 - A column that uses a variable and has no name is named as written: `$day`, `$day + 1`.
 - In a file, a `DECLARE PARAMETER` is a parameter with a default: a run's value for it takes the
   default's place, cast to its type ([Run files as jobs](/pondra/guides/workspace/#parameters-declared)).
@@ -363,14 +363,14 @@ across the nodes and a write still goes to the leader.
 | Statement | What it does |
 |---|---|
 | `BEGIN … [EXCEPTION WHEN … THEN …] END` | a block: its `DECLARE`s end with it; handlers catch its errors |
-| `IF … THEN … ELSEIF … ELSE … END IF` | branches (`ELSIF` too) |
+| `IF … THEN … ELSEIF … ELSE … END` | branches (`ELSIF` too) |
 | `CASE [$x] WHEN … THEN … ELSE … END CASE` | branches by value or by condition |
 | `WHILE cond DO … END WHILE` | a loop while the condition holds |
 | `REPEAT … UNTIL cond END REPEAT` · `LOOP … END LOOP` | a loop until the condition holds · until `LEAVE` |
-| `FOR r IN (query) DO … END FOR` | a loop over a query's rows: `$r.column` |
+| `FOR $r IN (query) DO … END` | a loop over a query's rows: `$r.column` |
 | `FOR r IN (query) PARALLEL n DO … END FOR` | the same, up to `n` passes at once (1 to 64) |
 | `ASYNC statement` · `$h = ASYNC statement` | start a statement (a block too) and go on · its handle in `$h` |
-| `AWAIT ALL` · `AWAIT $h, …` | wait for every one started · for these: handles, or runs' ids from `pondra.start` |
+| `AWAIT` · `AWAIT $h, …` | wait for every one started · for these: handles, or runs' ids from `pondra.start` |
 | `LEAVE [label]` · `ITERATE [label]` | leave a loop or block · go on with the next pass (`label: WHILE …`) |
 | `RETURN [value]` | stop; the value is the script's answer (`result`) |
 | `RAISE 'text %', $x` · `RAISE NOTICE …` · `RAISE` | an error (`P0001`), each `%` a value · a notice · the handled error again |
@@ -380,6 +380,8 @@ across the nodes and a write still goes to the leader.
 | `CALL p(…) INTO $x` | a procedure's or file's answer, its first row, into variables |
 | `IDENTIFIER(value)` | a table's or column's name from a value, in any statement |
 
+- `END` closes any block. `END IF`, `END WHILE`, `END FOR`, `END LOOP` and `END CASE` say which,
+  and one that names another kind of block is refused, at its line.
 - Conditions and values are SQL expressions, `EXISTS (SELECT …)` and subqueries too.
 - A handler names errors by Postgres's codes or names: `'40001'`, `serialization_failure`,
   `division_by_zero`, `OTHERS`. Inside it, `$error` is the message and `$sqlstate` its code.
@@ -505,11 +507,11 @@ DROP MATERIALIZED VIEW spend_by_item;
 
 | Statement | Syntax |
 |---|---|
-| SQL function | `CREATE [OR REPLACE] FUNCTION [IF NOT EXISTS] f(x type [DEFAULT v], …) RETURNS type RETURN expression` |
-| Table function | `CREATE FUNCTION f(…) RETURNS TABLE (c type, …) LANGUAGE sql AS $$ SELECT … $$` |
+| SQL function | `CREATE [OR REPLACE] FUNCTION [IF NOT EXISTS] f(x [type] [= v], …) [RETURNS type] AS expression`, or `RETURNS type RETURN expression` |
+| Table function | `CREATE FUNCTION f(…) RETURNS TABLE (c type, …) AS $$ SELECT … $$` |
 | Python function | `CREATE FUNCTION f(x type) RETURNS type LANGUAGE python [WITH (…)] AS $$ … $$` |
-| Macro | `CREATE [OR REPLACE] MACRO [IF NOT EXISTS] m(x) AS expression` (DuckDB's) |
-| Procedure | `CREATE [OR REPLACE] PROCEDURE [IF NOT EXISTS] p(x type [DEFAULT v], …) LANGUAGE sql \| python AS $$ … $$` |
+| Procedure | `CREATE [OR REPLACE] PROCEDURE [IF NOT EXISTS] p($x type [= v], …) AS BEGIN … END` (or any one statement after `AS`) |
+| Python procedure | `CREATE PROCEDURE p($x type, …) LANGUAGE python AS $$ … $$` |
 | Call | `CALL p(args)` or `CALL p(name => value)` |
 | Run a file | `CALL run('etl/orders.sql', day => DATE '2026-09-29')`: a `.sql`, `.py` or notebook file of the lake's, its parameters by name ([Run files as jobs](/pondra/guides/workspace/)) |
 | Run code once | `DO LANGUAGE python \| sql $$ … $$` (the language may come after the code, as in Postgres) |
@@ -522,7 +524,8 @@ DROP MATERIALIZED VIEW spend_by_item;
 | Drop | `DROP FUNCTION [IF EXISTS] f`, `DROP PROCEDURE …`, `DROP MACRO …`, `DROP TASK [IF EXISTS] t` |
 | List | `SHOW USER FUNCTIONS`, `SHOW PROCEDURES`, `SHOW TASKS` (each takes `LIKE 'pattern'`) |
 
-Inside a SQL procedure, a parameter is `$name`. `DO` runs a block of code once, with the caller's
+A parameter is `$name` in a procedure's body, and `name` or `$name` in a function's; a function's
+`$name` that isn't one of its parameters is refused when it is made. `DO` runs a block of code once, with the caller's
 rights: it needs an admin token, and Python needs a node started with `--python`. What the block prints
 comes back as notices, and its last expression, if it is a frame, table, list of dicts or value, comes
 back as rows (see [Functions and procedures](/pondra/guides/functions-and-procedures/#run-code-once-do)).
@@ -531,13 +534,13 @@ them. Every call of a procedure, and every file run, is a row of `pondra.runs`
 (see [system columns](/pondra/reference/system-columns/)).
 
 ```sql
-CREATE FUNCTION net(x DOUBLE, rate DOUBLE DEFAULT 0.2) RETURNS DOUBLE RETURN x * (1 - rate);
+CREATE FUNCTION net(x DOUBLE, rate DOUBLE = 0.2) RETURNS DOUBLE RETURN x * (1 - rate);
 CREATE FUNCTION slug(t VARCHAR) RETURNS VARCHAR LANGUAGE python AS $$ return t.lower().replace(' ', '-') $$;
-CREATE MACRO double_it(x) AS x * 2;
-CREATE PROCEDURE log_order(item VARCHAR, qty BIGINT DEFAULT 1) LANGUAGE sql AS $$
+CREATE FUNCTION double_it(x) AS x * 2;
+CREATE PROCEDURE log_order($item VARCHAR, $qty BIGINT = 1) AS BEGIN
   INSERT INTO orders VALUES (100, $item, $qty, 1.0);
   SELECT count(*) AS orders FROM orders;
-$$;
+END;
 CALL log_order('scone');
 CALL log_order(item => 'bun', qty => 3);
 DO LANGUAGE sql $$ INSERT INTO orders VALUES (101, 'roll', 1, 2.0); SELECT count(*) AS orders FROM orders $$;
@@ -550,8 +553,25 @@ DROP TASK hourly_scone;
 DROP PROCEDURE log_order;
 DROP FUNCTION net;
 DROP FUNCTION slug;
-DROP MACRO double_it;
+DROP FUNCTION double_it;
 ```
+
+## Other spellings
+
+Each thing above has one way to write it. The ways other databases write it work too, so SQL
+brought from them runs as it is:
+
+| Written as | Is | From |
+|---|---|---|
+| `CREATE MACRO m(x, r := 0.2) AS …`, `DROP MACRO m` | `CREATE FUNCTION m(x, r = 0.2) AS …`, `DROP FUNCTION m` | DuckDB |
+| `CREATE PROCEDURE p(x type DEFAULT v) LANGUAGE sql AS $$ … $$` | `CREATE PROCEDURE p($x type = v) AS BEGIN … END` | Postgres |
+| `f(x type DEFAULT v)`, `$1`, `RETURNS … RETURN …`, `AS 'expr'`, `AS (expr)` | a function's parameters and body | Postgres, Snowflake, BigQuery |
+| `SET VARIABLE x = v`, `RESET VARIABLE x`, `getvariable('x')` | `$x = v`, `RESET $x`, `$x` | DuckDB |
+| `$x := v`, `DECLARE $x type := v` | `$x = v`, `DECLARE $x type = v` | Snowflake, Postgres |
+| `END IF`, `END WHILE`, `END FOR`, `END LOOP`, `END CASE` | `END` | Postgres, Snowflake |
+| `FOR r IN (…)` | `FOR $r IN (…)` | Postgres, Snowflake |
+| `AWAIT ALL` | `AWAIT` | Snowflake |
+| `RAISE NOTICE 'x %', v` | `PRINT 'x ' \|\| v` | Postgres |
 
 ## Files and secrets
 
