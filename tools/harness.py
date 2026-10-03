@@ -3149,6 +3149,23 @@ $$""")
         print("format:", fmt, "| broken:", broken_fmt, "| has:", has)
     logged = q("SELECT args FROM pondra.runs WHERE routine = 'do' AND args LIKE '%time.sleep(60)%'")
     checks["the run log names a DO block by its code (pondra.runs.args: language and code)"] = bool(logged) and json.loads(logged[0]["args"]).get("language") == "python"
+    # The ways people write them (the design review): a procedure's body after AS, no $$, its
+    # parameters `$n` with `=` defaults; a function's `$x`, untyped parameters (DuckDB's macro), a
+    # table function's `$k` given its value; a `$name` that isn't a parameter, refused as made.
+    q("CREATE PROCEDURE plain($n BIGINT = 5) AS BEGIN\n  IF $n > 3 THEN PRINT 'big ' || $n; END IF;\n  SELECT $n * 2 AS n;\nEND;")
+    q("CREATE PROCEDURE one(n BIGINT) AS SELECT $n + 1 AS n")
+    q("CREATE FUNCTION twice(x) AS $x * 2")
+    q("CREATE FUNCTION upto(k BIGINT) RETURNS TABLE (v BIGINT) AS $$ SELECT value AS v FROM generate_series(1, $k) $$")
+    plain_said = urllib.request.urlopen(urllib.request.Request(f"http://127.0.0.1:{A.port}/sql", b"CALL plain()", headers={"authorization": "Bearer a-tok"}), timeout=120)
+    written = {"default": q("CALL plain()"), "given": q("CALL plain(n => 2)"), "one statement": q("CALL one(2)"), "untyped": q("SELECT twice(21) AS a, twice(1.5) AS b"),
+               "table": q("SELECT count(*) AS n FROM upto(4)"), "stray": err("CREATE FUNCTION stray(x INT) RETURNS INT RETURN x + $y"),
+               "python": err("CREATE PROCEDURE py() LANGUAGE python AS BEGIN SELECT 1; END"), "notices": plain_said.headers.get("x-pondra-notices") or ""}
+    checks["written as people write them: CREATE PROCEDURE p($n BIGINT = 5) AS BEGIN … END (or one statement), a function's $x, f(x) untyped, a table function's $k; $y refused as made"] = (
+        written["default"] == [{"n": 10}] and written["given"] == [{"n": 4}] and written["one statement"] == [{"n": 3}]
+        and written["untyped"] == [{"a": 42, "b": 3.0}] and written["table"] == [{"n": 4}] and "there is no parameter $y" in written["stray"]
+        and "Python procedure's body is a string" in written["python"] and "big 5" in written["notices"])
+    if not checks["written as people write them: CREATE PROCEDURE p($n BIGINT = 5) AS BEGIN … END (or one statement), a function's $x, f(x) untyped, a table function's $k; $y refused as made"]:
+        print("written:", written)
     for n in nodes:
         n.kill()
     # a node on another address with --python and no tokens refuses to start; `pondra run` runs a file
@@ -3356,6 +3373,11 @@ $$""")
     checks["pondra.runs: every call, its caller, arguments and outcome"] = len(runs) == 4 and all(r["status"] == "ok" and r["caller"] == "read" for r in runs) and '"recipients":["pg@example.com"]' in runs[1]["args"]
     started = q("SELECT pondra.start('quiet') AS r")[0]["r"]
     checks["pondra.start: a run id at once, its outcome in pondra.runs"] = until(lambda: q(f"SELECT status FROM pondra.runs WHERE id = '{started}'"), [{"status": "ok"}], secs=20) == [{"status": "ok"}]
+    by_statement = q("START CALL quiet()")[0]["run"]
+    with psycopg.connect(f"host=127.0.0.1 port={A.port + 11} user=reader password=r-tok dbname=lake", autocommit=True) as c:
+        by_pg = c.execute("start call quiet()").fetchall()
+    done = lambda run: until(lambda: q(f"SELECT status FROM pondra.runs WHERE id = '{run}'"), [{"status": "ok"}], secs=20) == [{"status": "ok"}]
+    checks["START CALL p(…): pondra.start as a statement, over HTTP and Postgres"] = done(by_statement) and len(by_pg) == 1 and done(by_pg[0][0])
     q("CREATE PROCEDURE deep(n BIGINT) LANGUAGE python AS $$ pondra.call('deep', n + 1) $$")
     t0 = time.time()
     checks["procedures calling procedures take no slot of their own (two here): 16 deep, not stuck"] = "16 deep" in err("CALL deep(0)", timeout=90) and time.time() - t0 < 60
@@ -5143,6 +5165,13 @@ console.log(JSON.stringify(await db.run("etl/orders.sql", {{ day: "2026-09-29", 
     checks["mistakes said by name: no such file, not a file that runs, a value not named, a name twice, no saved notebook, run is Pondra's"] = \
         "no file files/etl/nothing.sql" in said["missing"] and ".sql, .py or .ipynb" in said["kind"] and "by name" in said["unnamed"] and "given twice" in said["twice"] \
         and "none saved" in said["none"] and "Pondra's own" in said["own"]
+    imm = {"plain": q("EXECUTE IMMEDIATE FROM 'etl/orders.sql' USING (day => DATE '2026-09-29', region => 'imm', amount => 2.0)"),
+           "into": q("BEGIN EXECUTE IMMEDIATE FROM 'etl/orders.sql' USING (day => DATE '2026-09-29', region => 'imm', amount => 1.0) INTO $r, $n; SELECT $r AS r, $n AS n; END"),
+           "bad": err("EXECUTE IMMEDIATE FROM 'etl/orders.sql' USING day => 1")}
+    checks["EXECUTE IMMEDIATE FROM 'file' USING (name => …) [INTO $a, …]: Snowflake's CALL run"] = imm["plain"] == [{"region": "imm", "n": 1, "total": 2.0}] \
+        and imm["into"] == [{"r": "imm", "n": 2}] and "USING (name => value" in imm["bad"]
+    if not checks["EXECUTE IMMEDIATE FROM 'file' USING (name => …) [INTO $a, …]: Snowflake's CALL run"]:
+        print("immediate:", imm)
     node.kill()
     ok = all(checks.values())
     print(json.dumps({"workspace": checks, "ok": ok}, indent=1))
@@ -6214,6 +6243,49 @@ def objects():
                                      "MERGE INTO orders o USING t AS o ON o.id = o.a WHEN MATCHED THEN DELETE")]
     interval = q("SELECT 3 * INTERVAL '37 seconds' AS a, INTERVAL '1 month' * 2.5 AS b")
     checks["MERGE's mistakes refused; n * INTERVAL as Postgres"] = refused == [500, 500, 500] and interval == [{"a": "1 mins 51.000000000 secs", "b": "2 mons 15 days"}]
+    # Other engines' spellings of what Pondra does, and what a write may say that it doesn't, refused
+    # (each was read and then dropped: the table had no partitions, OR IGNORE replaced the row)
+    q("CREATE TABLE laid (ts TIMESTAMP, user_id BIGINT, url VARCHAR) PARTITION BY days(ts) CLUSTER BY (user_id, url)")
+    q("CREATE TABLE laid2 (ts TIMESTAMP, user_id BIGINT) PARTITIONED BY (user_id)")
+    q("ALTER TABLE laid2 CLUSTER BY (ts)")
+    shape = {o["name"]: (o.get("partition"), o.get("cluster")) for o in call(A.port, "GET", "/objects")["objects"] if o["name"] in ("laid", "laid2")}
+    twice = http("CREATE TABLE laid3 (ts TIMESTAMP) WITH (cluster_by = 'ts') CLUSTER BY (ts)")
+    engine = http("CREATE TABLE laid4 (ts TIMESTAMP) ENGINE = MergeTree")
+    info["laid"] = [shape, twice[2], engine[2]]
+    checks["PARTITION BY, PARTITIONED BY and CLUSTER BY are the table's options; given twice, or ENGINE =, refused"] = \
+        shape == {"laid": ("day(ts)", ["user_id", "url"]), "laid2": ("user_id", ["ts"])} and twice[0] == 500 and engine[0] == 500
+    q("CREATE TABLE keyed (id BIGINT PRIMARY KEY, v VARCHAR)")
+    q("INSERT INTO keyed VALUES (1, 'a'), (2, 'b')")
+    q("INSERT OR IGNORE INTO keyed VALUES (1, 'x'), (3, 'c')")
+    q("INSERT IGNORE INTO keyed VALUES (2, 'x')")
+    q("INSERT OR REPLACE INTO keyed VALUES (2, 'B'), (4, 'd')")
+    upserted = q("SELECT id, v FROM keyed ORDER BY id")
+    refused = [http(s)[0] for s in ("INSERT OR ABORT INTO keyed VALUES (5, 'e')", "INSERT OVERWRITE TABLE keyed SELECT 6, 'f'",
+                                    "INSERT INTO keyed VALUES (7, 'g') RETURNING id", "UPDATE keyed SET v = 'h' WHERE id = 1 RETURNING id")]
+    info["keyed"] = [upserted, refused]
+    checks["INSERT OR IGNORE, INSERT IGNORE and INSERT OR REPLACE as ON CONFLICT; OR ABORT, OVERWRITE and RETURNING refused"] = \
+        upserted == [{"id": 1, "v": "a"}, {"id": 2, "v": "B"}, {"id": 3, "v": "c"}, {"id": 4, "v": "d"}] and refused == [500, 500, 500, 500] \
+        and q("SELECT count(*) AS n FROM keyed") == [{"n": 4}]
+    q("CREATE TABLE past (a BIGINT)")
+    q("INSERT INTO past VALUES (1)")
+    first = q("SELECT max(_version) AS v FROM past")[0]["v"]
+    q("INSERT INTO past VALUES (2), (3)")
+    then = [q(f"SELECT count(*) AS n FROM {w}") for w in (f"past VERSION AS OF {first}", f"past VERSION AS OF ({first})",
+                                                          "past TIMESTAMP AS OF (now())", "past FOR SYSTEM_TIME AS OF (now())")]
+    joined = q(f"SELECT count(*) AS n FROM past n JOIN past VERSION AS OF {first} w ON n.a = w.a")
+    checks["VERSION AS OF, TIMESTAMP AS OF, FOR SYSTEM_TIME AS OF: a table's past, as AT (…) reads it"] = \
+        then == [[{"n": 1}], [{"n": 1}], [{"n": 3}], [{"n": 3}]] and joined == [{"n": 1}]
+    refreshed = http("REFRESH MATERIALIZED VIEW w")
+    not_one = [http(f"REFRESH MATERIALIZED VIEW {t}")[0] for t in ("orders", "eu")]  # (eu is a table since its DETACH)
+    analyzed = [http(s)[0] for s in ("ANALYZE", "ANALYZE orders")]
+    checks["REFRESH MATERIALIZED VIEW and ANALYZE taken (nothing to do); REFRESH of a table refused"] = refreshed[0] == 200 and not_one == [500, 500] and analyzed == [200, 200]
+    # CREATE TABLE … LIKE takes the columns (it made a table of none); SHOW lists every kind
+    q("CREATE TABLE liked LIKE orders")
+    cols = lambda t: [(r["column_name"], r["data_type"]) for r in q(f"DESCRIBE {t}")]
+    shown = {w: http(f"SHOW {w}")[0] for w in ("SCHEMAS", "DATABASES", "SECRETS", "USERS", "ROLES", "GRANTS")}
+    checks["CREATE TABLE … LIKE has the other's columns; SHOW SCHEMAS, DATABASES, SECRETS, USERS, ROLES, GRANTS list"] = \
+        cols("liked") == cols("orders") and q("SELECT count(*) AS n FROM liked") == [{"n": 0}] and set(shown.values()) == {200} \
+        and any({"lake": d["name"], "name": "public"} in q("SHOW SCHEMAS") for d in q("SHOW DATABASES"))
     # A notebook run: `%%sql df <<` is a frame in its Python; a SQL cell reads a Python table
     cell = lambda src, kind="code": {"cell_type": kind, "metadata": {}, "source": src, "outputs": [], "execution_count": None}
     nb = {"cells": [cell("%%sql eu_rows <<\nSELECT id, amount FROM orders WHERE region = 'eu'"), cell("import pandas as pd\ntargets = pd.DataFrame({'region': ['eu', 'us'], 'target': [3, 1]})\nn = len(eu_rows.to_pandas())"),
@@ -6503,6 +6575,21 @@ SELECT $big AS big, $t AS t, $c AS c, (SELECT count(*) FROM made_a) + (SELECT co
     checks["VALUES with a subquery: in a loop, a transaction, over Postgres, as a query"] = (
         got["tally"] == [{"k": 1, "n": 0}, {"k": 2, "n": 1}, {"k": 3, "n": 2}, {"k": 4, "n": 2}, {"k": 5, "n": 4}]
         and got["values"] == [{"column1": 5, "column2": "rows"}, {"column1": 0, "column2": "none"}])
+    # The ways people write it (the design review): a bare END closes any block, FOR $r, SET $x = and
+    # :=, AWAIT alone waits for all; END of another kind where a block ends is refused.
+    got["forgiving"] = q("""BEGIN
+  DECLARE $t INT := 0;
+  FOR $r IN (SELECT value AS v FROM generate_series(1, 4)) DO
+    IF $r.v % 2 = 0 THEN SET $t = $t + $r.v; END;
+  END;
+  ASYNC INSERT INTO tally VALUES (100, 0);
+  AWAIT;
+  $t := $t * 10;
+  SELECT $t AS t, (SELECT count(*) FROM tally WHERE k = 100) AS async;
+END""", {})
+    got["wrong end"] = _raises_text(lambda: q("BEGIN IF true THEN SELECT 1; END LOOP; END", {}))
+    checks["written as people write it: a bare END closes any block, FOR $r, SET $x = and :=, AWAIT alone; END LOOP where an IF ends is refused"] = (
+        got["forgiving"] == [{"t": 60, "async": 1}] and "END LOOP where the IF" in got["wrong end"])
     # What deciding costs: a loop that reads only variables.
     t0 = time.time()
     q("DECLARE $i = 0; WHILE $i < 200 DO $i = $i + 1; END WHILE", {})
@@ -6524,7 +6611,8 @@ def tasks():
     nothing after a failure; ALTER TASK SUSPEND and RESUME; refusals (a loop, two schedules, a
     missing task, DROP of a followed one); a graph through a leader failover, each write once."""
     lake = new_lake()
-    nodes = [Node(lake, A.port + i).start() for i in range(3)]
+    py = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "python")
+    nodes = [Node(lake, A.port + i, python=sys.executable, env={"PYTHONPATH": py}).start() for i in range(3)]
     time.sleep(1)
     q = lambda s, port=A.port: call(port, "POST", "/sql", s.encode(), timeout=60)
     def err(s, port=A.port):
@@ -6600,6 +6688,47 @@ def tasks():
     q("DROP TASK beat")
     got["beats"] = [n1, n2, n3, state]
     checks["ALTER TASK SUSPEND stops its ticks, RESUME starts them again"] = n1 > 0 and n2 == n1 and n3 > n2 and state == "suspended"
+    # A body is kept as written: sqlparser read COPY's bare OVERWRITE as a missing option's value.
+    q("CREATE TASK snap SCHEDULE '1 day' AS COPY (SELECT * FROM glog) TO 'out/snap' (FORMAT delta, OVERWRITE)")
+    kept = q("SELECT statement FROM pondra.tasks WHERE name = 'snap'")
+    q("DROP TASK snap")
+    checks["a task's statement is kept as written: COPY … (FORMAT delta, OVERWRITE)"] = bool(kept) and "(FORMAT delta, OVERWRITE)" in kept[0].get("statement", "")
+    # From the clients: Python's db.task, @db.task (a procedure the task calls) and execute_task's Run;
+    # JavaScript's task, executeTask and wait.
+    q("CREATE TABLE clog (who VARCHAR, day DATE)")
+    nb = os.path.join(tempfile.mkdtemp(prefix="pondra-tasks-"), "tasks.py")
+    open(nb, "w").write(f"""import json
+from datetime import date
+import pondra
+db = pondra.connect("http://127.0.0.1:{A.port + 1}")
+db.task("croot", "INSERT INTO clog VALUES ('sql', $day)", schedule="1 hour")
+
+@db.task(after="croot", retries=1)
+def cnext():
+    pondra.sql("INSERT INTO clog VALUES ('python', NULL)")
+
+ran = db.execute_task("croot", day=date(2026, 9, 2))
+print(json.dumps(ran.wait(timeout=30)["status"]))
+""")
+    ran = subprocess.run([sys.executable, nb], capture_output=True, text=True, timeout=120, env={**os.environ, "PYTHONPATH": py})
+    until(lambda: status("cnext"), "ok", 30)
+    js = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "js", "index.js")
+    script = f"""import {{ connect }} from {json.dumps(js)};
+const db = connect("http://127.0.0.1:{A.port + 2}");
+await db.task("jroot", "INSERT INTO clog VALUES ('js', $day)", {{ schedule: "1 hour", retries: 1, timeout: "10 minutes" }});
+await db.task("jnext", "INSERT INTO clog VALUES ('js after', $day)", {{ after: ["jroot"], when: "true" }});
+await db.wait(await db.executeTask("jroot", {{ day: "2026-09-03" }}));
+console.log("done"); await db.close();"""
+    path = os.path.join(tempfile.mkdtemp(prefix="pondra-tasks-"), "tasks.mjs")
+    open(path, "w").write(script)
+    js_out = subprocess.run(["node", path], capture_output=True, text=True, timeout=120)
+    until(lambda: status("jnext"), "ok", 30)
+    got["clients"] = {"python": ran.stdout.strip() or ran.stderr[-800:], "js": js_out.stdout.strip() or js_out.stderr[-800:],
+                      "rows": q("SELECT who, CAST(day AS VARCHAR) AS day FROM clog ORDER BY who"),
+                      "options": q("SELECT name, after, options FROM pondra.tasks WHERE name IN ('cnext', 'jroot') ORDER BY name")}
+    checks["from the clients: Python's db.task, @db.task and execute_task(…).wait(); JavaScript's task, executeTask and wait"] = (
+        got["clients"]["python"] == '"ok"' and got["clients"]["js"] == "done"
+        and got["clients"]["rows"] == [{"who": "js", "day": "2026-09-03"}, {"who": "js after", "day": "2026-09-03"}, {"who": "python"}, {"who": "sql", "day": "2026-09-02"}])
     # Refusals.
     got["refused"] = refused = {
         "itself": err("CREATE TASK me AFTER me AS SELECT 1"),

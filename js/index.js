@@ -24,6 +24,7 @@ const code = (sql) => sql.replace(/'(?:[^']|'')*'|"(?:[^"]|"")*"|\$(\w*)\$[\s\S]
 const isQuery = (sql) => { const c = code(sql); return !c.includes(";") && /^\(*\s*(select|with|values|from|table|show|describe|desc|explain)\b/i.test(c) && !/\bstart\s*\(/i.test(c); };
 const isChange = (sql) => { const c = code(sql); return !c.includes(";") && /^\s*(insert|update|delete|merge)\b/i.test(c); };
 
+const quoted = (v) => (typeof v === "number" ? String(v) : `'${String(v).replace(/'/g, "''")}'`); // (a SQL literal: a task's schedule and options)
 const varName = (n) => { if (!/^[A-Za-z_]\w*$/.test(n)) throw new Error(`${n}: not a variable's name (letters, digits and _, not first a digit)`); return n; };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -146,6 +147,29 @@ export class Pondra {
     const [row] = await this.sql(`SELECT pondra.start($name${given})`, params);
     return row.run;
   }
+
+  /** A task (`CREATE TASK`): `sql` (a statement, a script, `CALL p(…)`) run on `schedule` ("5 minutes",
+   * "cron 0 2 * * * UTC") or `after` other tasks (a name or a list) once they ended well in the same
+   * run of their graph, if `when` (a SQL condition) holds; `retries`, `retryDelay`, `timeout` and
+   * `onFailure` (a procedure called with the task's name and its error) are its options. */
+  async task(name, sql, { schedule, after, when, retries, retryDelay, timeout, onFailure, replace = true } = {}) {
+    if ((schedule === undefined) === (after === undefined)) throw new Error("a task takes schedule or after, one of them");
+    const how = schedule !== undefined ? `SCHEDULE ${quoted(schedule)}` : `AFTER ${[after].flat().join(", ")}`;
+    const opts = Object.entries({ retries, retry_delay: retryDelay, timeout, on_failure: onFailure }).filter(([, v]) => v !== undefined && v !== null);
+    const options = opts.length ? ` WITH (${opts.map(([k, v]) => `${k} = ${quoted(v)}`).join(", ")})` : "";
+    return this.sql(`CREATE ${replace ? "OR REPLACE " : ""}TASK ${name} ${how}${when ? ` WHEN ${when}` : ""}${options} AS ${sql}`);
+  }
+
+  /** `EXECUTE TASK name (k => v, …)`: its graph runs now, each task with these values for its `$k`s.
+   * The task's run's id: `await db.wait(id)`. */
+  async executeTask(name, values = {}) {
+    const names = Object.keys(values);
+    const given = names.length ? ` (${names.map((n, i) => `"${n.replace(/"/g, '""')}" => $p${i}`).join(", ")})` : "";
+    return (await this.sql(`EXECUTE TASK ${name}${given}`, Object.fromEntries(names.map((n, i) => [`p${i}`, values[n]])))).run;
+  }
+
+  /** Wait for a run (`start`'s or `executeTask`'s id) to end, as SQL's `AWAIT 'id'`: its error if it failed. */
+  async wait(id) { await this.sql(`AWAIT ${quoted(id)}`); }
 
   /** `call`'s name up to 0.22. */
   async callProcedure(name, ...args) {

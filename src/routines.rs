@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json as j, Value};
 use std::collections::HashMap;
 use std::ops::ControlFlow;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 pub fn key(name: &str) -> String { format!("r/{name}") }
 
@@ -175,10 +175,10 @@ pub fn statement(sql: &str) -> Option<Stmt> {
         k => {
             let procedure = k == Keyword::PROCEDURE;
             let usage = match procedure {
-                true => "CREATE PROCEDURE name(p TYPE [DEFAULT …], …) LANGUAGE sql|python AS $$ … $$",
+                true => "CREATE PROCEDURE name($p TYPE [= …], …) AS BEGIN … END, or LANGUAGE python AS $$ … $$",
                 false => "CREATE FUNCTION name(p TYPE, …) RETURNS TYPE RETURN expression, or … RETURNS TYPE|TABLE (c TYPE, …) LANGUAGE sql|python AS $$ … $$",
             };
-            routine(&mut p, procedure).map_or_else(|e| Stmt::Invalid(format!("CREATE {}: {e:#} ({usage})", if procedure { "PROCEDURE" } else { "FUNCTION" })), |(name, routine)| Stmt::Ddl(vec![crate::write::unless(quiet, &name, "routine", Ddl::CreateRoutine { name: name.clone(), routine, replace })]))
+            routine(&mut p, sql, procedure).map_or_else(|e| Stmt::Invalid(format!("CREATE {}: {e:#} ({usage})", if procedure { "PROCEDURE" } else { "FUNCTION" })), |(name, routine)| Stmt::Ddl(vec![crate::write::unless(quiet, &name, "routine", Ddl::CreateRoutine { name: name.clone(), routine, replace })]))
         }
     })
 }
@@ -211,12 +211,12 @@ pub fn text_of(p: &mut Parser) -> Result<Option<String>> {
 
 /// The rest of `CREATE FUNCTION` or `CREATE PROCEDURE`: its name, parameters, and the clauses
 /// that follow in any order — Postgres's, and `WITH (…)`.
-fn routine(p: &mut Parser, procedure: bool) -> Result<(String, Routine)> {
+fn routine(p: &mut Parser, sql: &str, procedure: bool) -> Result<(String, Routine)> {
     let name = object(&p.parse_object_name(false)?);
     let params = params(p)?;
     let mut r = Routine { kind: if procedure { Kind::Procedure } else { Kind::Macro }, params, language: String::new(), body: String::new(), returns: None, with: Options::default() };
-    let (mut body, mut expression) = (None, false);
-    loop {
+    let (mut body, mut expression, mut rest) = (None, false, false);
+    while !rest {
         if p.parse_keyword(Keyword::LANGUAGE) {
             r.language = p.parse_identifier()?.value.to_lowercase();
         } else if !procedure && p.parse_keyword(Keyword::RETURNS) {
@@ -238,7 +238,11 @@ fn routine(p: &mut Parser, procedure: bool) -> Result<(String, Routine)> {
         } else if p.parse_keyword(Keyword::AS) {
             body = match text_of(p)? {
                 Some(t) => Some(t),
-                None if procedure => bail!("the body is a string: AS $$ … $$"),
+                None if procedure => {
+                    rest = true; // (`AS BEGIN … END`, or any one statement: the rest of the text, as a task's)
+                    let b = sql[crate::runs::offset(sql, p.peek_token().span.start)..].trim();
+                    Some(b.strip_suffix(';').unwrap_or(b).trim_end().to_string()).filter(|b| !b.is_empty())
+                }
                 None if p.parse_keyword(Keyword::TABLE) => {
                     r.kind = Kind::Table; // (DuckDB's: CREATE FUNCTION f(x) AS TABLE SELECT …)
                     Some(p.parse_query()?.to_string())
@@ -267,7 +271,7 @@ fn routine(p: &mut Parser, procedure: bool) -> Result<(String, Routine)> {
             break;
         }
     }
-    let t = p.next_token().token;
+    let t = if rest { Token::EOF } else { p.next_token().token };
     ensure!(matches!(t, Token::EOF | Token::SemiColon), "unexpected {t}");
     r.body = body.context("no body: AS $$ … $$, or RETURN expression")?;
     r.language = match r.language.as_str() {
@@ -276,6 +280,7 @@ fn routine(p: &mut Parser, procedure: bool) -> Result<(String, Routine)> {
         l => bail!("LANGUAGE sql or python, not {l}"),
     };
     ensure!(!expression || r.language == "sql", "an expression's language is SQL: LANGUAGE python AS $$ … $$ for Python");
+    ensure!(!rest || r.language == "sql", "a Python procedure's body is a string: LANGUAGE python AS $$ … $$");
     ensure!(procedure || r.returns.is_some() || r.language == "sql", "a Python function says what it returns: RETURNS TYPE, or RETURNS TABLE (c TYPE, …)");
     ensure!(r.returns.as_deref().is_none_or(|t| !crate::pyfn::loose(Some(t)) || crate::pyfn::is_json(Some(t))), "RETURNS ANY: say the type it returns (VARIANT for any JSON value)");
     ensure!(!r.with.vectorized || (r.python() && r.kind == Kind::Macro), "vectorized: a Python function returning a value (not a table, or a procedure)");
@@ -307,14 +312,25 @@ fn params(p: &mut Parser) -> Result<Vec<Param>> {
             }
         })?;
         let (name, ty) = match unnamed {
-            Some(t) => (i.to_string(), t.to_string()),
-            None => (ident(&p.parse_identifier()?), p.parse_data_type()?.to_string()),
+            Some(ast::DataType::Custom(n, m)) if m.is_empty() && n.0.len() == 1 && !crate::pyfn::loose(Some(&n.to_string())) => (object(&n), None), // (`f(x)`: a name, untyped, as DuckDB's)
+            Some(t) => (i.to_string(), Some(t.to_string())),
+            None => {
+                let name = match p.peek_token().token {
+                    Token::Placeholder(n) if n.len() > 1 && !n[1..].starts_with(|c: char| c.is_ascii_digit()) => {
+                        p.next_token();
+                        n[1..].to_lowercase() // (`$day DATE`, as a file's parameter is written)
+                    }
+                    _ => ident(&p.parse_identifier()?),
+                };
+                let typed = !matches!(p.peek_token().token, Token::Comma | Token::RParen | Token::Eq) && !matches!(p.peek_token().token, Token::Word(ref w) if w.keyword == Keyword::DEFAULT);
+                (name, if typed { Some(p.parse_data_type()?.to_string()) } else { None })
+            }
         };
         let default = match p.parse_keyword(Keyword::DEFAULT) || p.consume_token(&Token::Eq) {
             true => Some(p.parse_expr()?.to_string()),
             false => None,
         };
-        Ok(Param { name, ty: Some(ty), default })
+        Ok(Param { name, ty, default })
     })?;
     p.expect_token(&Token::RParen)?;
     Ok(params)
@@ -444,20 +460,26 @@ async fn check(lake: &Lake, name: &str, r: &Routine) -> Result<()> {
     Ok(())
 }
 
-/// Every `$n` in a SQL function's body is one of its parameters (Postgres: "there is no parameter $2").
+/// Every `$n` and `$name` in a SQL function's body is one of its parameters (Postgres: "there is no
+/// parameter $2"): a function's answer depends on its arguments alone, never a session's variable.
 fn places<T: VisitMut>(r: &Routine, body: &mut T) -> Result<()> {
     let mut wrong = None;
     let _ = visit_expressions_mut(body, |e| {
         if let Expr::Value(v) = e {
             if let ast::Value::Placeholder(p) = &v.value {
-                if p.strip_prefix('$').and_then(|n| n.parse::<usize>().ok()).is_some_and(|n| n == 0 || n > r.params.len()) {
+                let n = p.trim_start_matches('$');
+                let known = match n.parse::<usize>() {
+                    Ok(i) => i > 0 && i <= r.params.len(),
+                    Err(_) => r.params.iter().any(|q| q.name.eq_ignore_ascii_case(n)),
+                };
+                if !known && wrong.is_none() {
                     wrong = Some(p.clone());
                 }
             }
         }
         ControlFlow::<()>::Continue(())
     });
-    wrong.map_or(Ok(()), |p| bail!("there is no parameter {p}"))
+    wrong.map_or(Ok(()), |p| bail!("there is no parameter {p} (a function sees only its own parameters: {})", if r.params.is_empty() { "it has none".into() } else { r.params.iter().map(|q| format!("${}", q.name)).collect::<Vec<_>>().join(", ") }))
 }
 
 /// Its parameters' names, in order.
@@ -510,6 +532,13 @@ pub async fn prepare(lake: &Lake, sql: &str, params: &HashMap<String, Value>, vi
     expand_with(lake, &sql, views).await
 }
 
+/// Is `sql` a `CREATE` of a task, procedure, function or macro? Its `$name`s are its own
+/// parameters or its graph's values, bound as it runs, never as it is made.
+pub fn makes_code(sql: &str) -> bool {
+    static HEAD: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?is)^create\s+(?:or\s+replace\s+)?(?:temp(?:orary)?\s+)?(?:task|procedure|function|macro)\b").expect("a regex"));
+    HEAD.is_match(crate::write::first_word(sql))
+}
+
 /// `$name` → the value given for it; every `$name` needs one. `getvariable('name')` (DuckDB's) is
 /// its value too, NULL if there is none.
 pub fn bind(sql: &str, params: &HashMap<String, Value>) -> Result<String> { bind_as(sql, params, true) }
@@ -519,8 +548,8 @@ pub fn bind_named(sql: &str, params: &HashMap<String, Value>) -> Result<String> 
 
 fn bind_as(sql: &str, params: &HashMap<String, Value>, numbered: bool) -> Result<String> {
     let getvariable = crate::vars::calls_getvariable(sql);
-    if !sql.contains('$') && !getvariable || crate::runs::creates_task(sql) {
-        return Ok(sql.to_string()); // (a task's `$day`: its graph's value, each time it runs)
+    if !sql.contains('$') && !getvariable || makes_code(sql) {
+        return Ok(sql.to_string()); // (a task's or a routine's `$day`: its own, each time it runs)
     }
     let sql = &crate::sparksql::inline(sql)?; // (a parameter of Spark SQL's is in its text: bound once it is Pondra's)
     let sql = &crate::past::syntax(sql); // (`t AT (VERSION => $v)`)
@@ -670,19 +699,27 @@ async fn expand_with(lake: &Lake, sql: &str, views: &HashMap<String, String>) ->
     Ok(text(&stmts))
 }
 
-/// `SHOW USER FUNCTIONS`, `SHOW PROCEDURES`, `SHOW TASKS`, `SHOW VIEWS`, `SHOW MATERIALIZED VIEWS`
-/// (`[LIKE 'pattern']`): this lake's own, from `pondra.routines`, `pondra.tasks` and
-/// `pondra.tables`, as Snowflake has them. (`SHOW FUNCTIONS` is every function a query may call,
+/// `SHOW USER FUNCTIONS`, `SHOW PROCEDURES`, `SHOW TASKS`, `SHOW VIEWS`, `SHOW MATERIALIZED VIEWS`,
+/// `SHOW SCHEMAS`, `SHOW DATABASES`, `SHOW SECRETS`, `SHOW USERS`, `SHOW ROLES`, `SHOW GRANTS`
+/// (`[LIKE 'pattern']`; shares and recipients: `show_shares`): this lake's own, from `pondra.routines`, `pondra.tasks`, `pondra.tables`,
+/// `information_schema.schemata`, `secrets()`, `pondra.users` and `pondra.grants`, as Snowflake has them. (`SHOW FUNCTIONS` is every function a query may call,
 /// as DataFusion lists them: its own, and the Python ones; `SHOW TABLES` is DataFusion's.)
 fn show(sql: &str) -> Option<String> {
-    static SHOW: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?is)^\s*show\s+(user\s+functions|procedures|tasks|materialized\s+views|views)(?:\s+like\s+('(?:[^']|'')*'))?\s*;?\s*$").expect("a regex"));
+    static SHOW: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?is)^\s*show\s+(user\s+functions|procedures|tasks|materialized\s+views|views|schemas|databases|secrets|users|roles|grants)(?:\s+like\s+('(?:[^']|'')*'))?\s*;?\s*$").expect("a regex"));
     if let Some(q) = show_shares(sql) {
         return Some(q);
     }
     let m = SHOW.captures(sql)?;
-    let like = m.get(2).map(|l| format!(" AND name LIKE {}", l.as_str())).unwrap_or_default();
     let what = m[1].split_whitespace().map(str::to_lowercase).collect::<Vec<_>>().join(" ");
+    let named = match what.as_str() { "schemas" => "schema_name", "databases" => "catalog_name", "grants" => "grantee", _ => "name" };
+    let like = m.get(2).map(|l| format!(" AND {named} LIKE {}", l.as_str())).unwrap_or_default();
     Some(match what.as_str() {
+        "schemas" => format!("SELECT catalog_name AS lake, schema_name AS name FROM information_schema.schemata WHERE schema_name NOT IN ('information_schema', 'pg_catalog') AND schema_name NOT LIKE 'pg_temp%'{like} ORDER BY 1, 2"),
+        "databases" => format!("SELECT DISTINCT catalog_name AS name FROM information_schema.schemata WHERE true{like} ORDER BY 1"),
+        "secrets" => format!("SELECT * FROM secrets() WHERE true{like} ORDER BY name"),
+        "users" => format!("SELECT * FROM pondra.users WHERE kind <> 'role'{like} ORDER BY name"),
+        "roles" => format!("SELECT * FROM pondra.users WHERE kind = 'role'{like} ORDER BY name"),
+        "grants" => format!("SELECT * FROM pondra.grants WHERE true{like} ORDER BY 1, 2"),
         "user functions" => format!("SELECT name, kind, language, arguments, returns, volatility FROM pondra.routines WHERE kind <> 'procedure'{like} ORDER BY name"),
         "procedures" => format!("SELECT name, language, arguments FROM pondra.routines WHERE kind = 'procedure'{like} ORDER BY name"),
         "tasks" => format!("SELECT * FROM pondra.tasks WHERE true{like} ORDER BY name"),
@@ -924,7 +961,10 @@ impl Expander<'_> {
             let v = match e {
                 Expr::Identifier(i) => values.get(&ident(i)),
                 Expr::Value(v) => match &v.value {
-                    ast::Value::Placeholder(p) => p.strip_prefix('$').and_then(|n| n.parse::<usize>().ok()).and_then(|n| r.params.get(n.wrapping_sub(1))).and_then(|p| values.get(&p.name)),
+                    ast::Value::Placeholder(p) => match p.trim_start_matches('$') {
+                        n if n.starts_with(|c: char| c.is_ascii_digit()) => n.parse::<usize>().ok().and_then(|n| r.params.get(n.wrapping_sub(1))).and_then(|p| values.get(&p.name)),
+                        n => values.get(&n.to_lowercase()), // (`$x`: the parameter `x`, as everywhere else)
+                    },
                     _ => None,
                 },
                 _ => None,
@@ -1327,9 +1367,14 @@ pub fn call_of(sql: &str) -> Option<(String, Vec<FunctionArg>)> {
     }
 }
 
-/// `SELECT pondra.start('name', …) [AS column]`: a procedure to start without waiting, its
-/// arguments, and the answer's column (`run`).
+/// `START CALL name(…)`, or `SELECT pondra.start('name', …) [AS column]`: a procedure to start
+/// without waiting, its arguments, and the answer's column (`run`).
 pub fn start_of(sql: &str) -> Option<(String, Vec<FunctionArg>, String)> {
+    static START: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?is)^start\s+(call\b.*)$").expect("a regex"));
+    if let Some(call) = START.captures(crate::write::first_word(sql)) {
+        let (name, args) = call_of(call.get(1)?.as_str())?;
+        return Some((name, args, "run".into()));
+    }
     if !sql.to_lowercase().contains("pondra.start") {
         return None;
     }

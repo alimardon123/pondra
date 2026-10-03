@@ -89,7 +89,7 @@ fn tokens(text: &str) -> Vec<Tok> {
 pub fn depth(piece: &str) -> i32 {
     let t = tokens(piece);
     let word = |i: usize| t.get(i).filter(|x| x.k == K::Word).map(|x| piece[x.at..x.end].to_ascii_lowercase());
-    let task = word(0).as_deref() == Some("create") && [1, 3].iter().any(|&i| word(i).as_deref() == Some("task")); // (`CREATE TASK … AS BEGIN …`)
+    let task = word(0).as_deref() == Some("create") && [1, 3].iter().any(|&i| matches!(word(i).as_deref(), Some("task" | "procedure"))); // (`CREATE TASK … AS BEGIN …`, a procedure's too)
     let mut d = 0;
     for i in 0..t.len() {
         let Some(w) = word(i) else { continue };
@@ -192,6 +192,9 @@ trait Step: Send + Sync {
 
 type Parse = fn(&mut Reader, Option<String>) -> Result<Option<Box<dyn Step>>>;
 
+/// What `END` may name: a block that `END x` closes, so `END LOOP` where an IF ends is refused, never taken for a label.
+const OPENED: &[&str] = &["if", "while", "for", "loop", "repeat", "case"];
+
 /// The kinds of statement a script has besides SQL's: the word that opens each, and how it is read
 /// (`None`: not this kind after all, a plain statement: `BEGIN;`, `EXECUTE name`, `CALL` without `INTO`).
 const KINDS: &[(&str, Parse)] = &[
@@ -268,9 +271,11 @@ impl<'a> Reader<'a> {
     fn end(&mut self, what: &str, opened: usize) -> Result<()> {
         let open = |s: &Self| format!("{} on line {}", if what.is_empty() { "BEGIN".into() } else { what.to_uppercase() }, s.line(opened));
         ensure!(self.eat("end"), "line {}: the {} isn't closed (END{})", self.line(self.at()), open(self), if what.is_empty() { String::new() } else { format!(" {}", what.to_uppercase()) });
-        if !what.is_empty() {
-            let found = self.word_at(self.i).map_or("…".into(), |w| w.to_uppercase());
-            ensure!(self.eat(what), "line {}: END {found} where the {} ends (it takes END {})", self.line(self.at()), open(self), what.to_uppercase());
+        let bare = self.t.get(self.i).is_none_or(|x| x.k == K::Semi); // (`END;` closes any block, as DuckDB would forgive)
+        let other = self.word_at(self.i).filter(|w| w != what && OPENED.contains(&w.as_str()));
+        if !what.is_empty() && !bare && (other.is_some() || !self.eat(what)) {
+            let found = other.or_else(|| self.word_at(self.i)).map_or("…".into(), |w| w.to_uppercase());
+            bail!("line {}: END {found} where the {} ends (END {}, or END)", self.line(self.at()), open(self), what.to_uppercase());
         }
         let label = self.t.get(self.i).is_some_and(|x| x.k == K::Word) && self.t.get(self.i + 1).is_none_or(|x| x.k == K::Semi);
         self.i += label as usize;
@@ -366,10 +371,10 @@ pub fn binds(sql: &str) -> Vec<String> {
     let mut out = vec!["error".to_string(), "sqlstate".to_string()];
     for i in 0..t.len() {
         match w(i).as_deref() {
-            Some("for") if matches!(w(i + 2).as_deref(), Some("in" | "as")) => out.extend(w(i + 1)),
+            Some("for") if matches!(w(i + 2).as_deref(), Some("in" | "as")) => out.extend(w(i + 1).or_else(|| v(i + 1))), // (`FOR r`, `FOR $r`)
             Some("into") => out.extend((i + 1..t.len()).step_by(2).map_while(|j| v(j).filter(|_| j == i + 1 || t[j - 1].k == K::Comma))),
             Some("declare") => out.extend(v(i + 1).or_else(|| v(i + 2))),
-            _ if t[i].k == K::Var && t.get(i + 1).is_some_and(|x| &sql[x.at..x.end] == "=") => out.extend(v(i)),
+            _ if t[i].k == K::Var && t.get(i + 1).is_some_and(|x| &sql[x.at..x.end] == "=" || x.k == K::Colon && t.get(i + 2).is_some_and(|y| &sql[y.at..y.end] == "=")) => out.extend(v(i)), // (`$x =`, `$x :=`)
             _ => {}
         }
     }
@@ -920,7 +925,8 @@ fn loop_(r: &mut Reader, label: Option<String>) -> Result<Option<Box<dyn Step>>>
 
 fn for_(r: &mut Reader, label: Option<String>) -> Result<Option<Box<dyn Step>>> {
     let opened = r.at();
-    let (Some(var), Some("in" | "as")) = (r.word_at(r.i + 1), r.word_at(r.i + 2).as_deref()) else { return Ok(None) };
+    let named = r.word_at(r.i + 1).or_else(|| r.t.get(r.i + 1).filter(|x| x.k == K::Var).map(|x| r.text[x.at + 1..x.end].to_lowercase())); // (`FOR r`, or `FOR $r` as every other variable)
+    let (Some(var), Some("in" | "as")) = (named, r.word_at(r.i + 2).as_deref()) else { return Ok(None) };
     r.i += 3;
     let mut query = r.expr(&["do", "parallel"], "FOR … IN")?;
     if wrapped(&query) {
@@ -1060,9 +1066,7 @@ fn await_(r: &mut Reader, _: Option<String>) -> Result<Option<Box<dyn Step>>> {
         r.eat_semi();
         return Ok(Some(Box::new(Await(vec![]))));
     }
-    let ids = commas(&r.rest());
-    ensure!(!ids.is_empty(), "line {line}: AWAIT waits for ALL, or for a handle ($h = ASYNC …) or a run's id (pondra.start)");
-    Ok(Some(Box::new(Await(ids))))
+    Ok(Some(Box::new(Await(commas(&r.rest()))))) // (`AWAIT` alone: ALL)
 }
 
 impl Step for Await {
@@ -1249,6 +1253,20 @@ fn execute(r: &mut Reader, _: Option<String>) -> Result<Option<Box<dyn Step>>> {
         return Ok(None); // (EXECUTE name: a prepared statement's)
     }
     r.i += 2;
+    if r.eat("from") {
+        // (Snowflake's way to run a file: `CALL run('path', name => value, …)`)
+        let path = r.expr(&["using", "into"], "EXECUTE IMMEDIATE FROM")?;
+        let usage = "EXECUTE IMMEDIATE FROM 'path' [USING (name => value, …)] [INTO $a, …]";
+        let given = match r.eat("using") {
+            true => r.until(&["into"]).strip_prefix('(').and_then(|g| g.strip_suffix(')')).map(|g| g.trim().to_string()).with_context(|| format!("line {}: {usage}", r.line(r.at())))?,
+            false => String::new(),
+        };
+        let call = format!("CALL run({path}{}{given})", if given.is_empty() { "" } else { ", " });
+        let x = Execute { sql: None, call: Some(call), into: into(r), using: vec![] };
+        ensure!(r.i >= r.t.len() || r.t[r.i].k == K::Semi, "line {}: {usage}", r.line(r.at()));
+        r.eat_semi();
+        return Ok(Some(Box::new(x)));
+    }
     let sql = r.expr(&["into", "using"], "EXECUTE IMMEDIATE")?;
     let mut x = Execute { sql: Some(sql), call: None, into: into(r), using: vec![] };
     if r.eat("using") {
@@ -1345,11 +1363,13 @@ mod tests {
         assert!(is("IF $n = 0 THEN PRINT 'none'; END IF"));
         assert!(is("print 'x'") && is("RAISE NOTICE 'x %', 1") && is("CALL p() INTO $x") && is("SELECT * FROM IDENTIFIER('t')"));
         assert!(!is("BEGIN") && !is("CALL p()") && !is("EXECUTE q(1)") && !is("SELECT 1") && !is("FOR x"));
-        assert!(is("ASYNC INSERT INTO t VALUES (1)") && is("AWAIT ALL") && is("AWAIT $x, 'run'") && is("$h = ASYNC CALL p()") && parse("AWAIT").is_err());
+        assert!(is("ASYNC INSERT INTO t VALUES (1)") && is("AWAIT ALL") && is("AWAIT $x, 'run'") && is("$h = ASYNC CALL p()") && parse("AWAIT").is_ok()); // (`AWAIT` alone: ALL)
         assert_eq!(split("$h = ASYNC BEGIN SELECT 1; SELECT 2; END; AWAIT $h").len(), 2);
         assert!(binds("$h = ASYNC CALL p(); AWAIT $h").contains(&"h".to_string()));
         assert!(parse("IF a THEN SELECT 1;").err().unwrap().to_string().contains("isn't closed"));
         assert!(parse("WHILE a DO SELECT 1; END IF;").err().unwrap().to_string().contains("END IF where the WHILE on line 1 ends"));
+        assert!(parse("WHILE a DO IF b THEN SELECT 1; END; END;").is_ok_and(|s| s.len() == 1)); // (a bare END closes any block)
+        assert_eq!(binds("FOR $r IN (SELECT 1) DO $t := $r.a; END"), ["error", "sqlstate", "r", "t"]);
         assert_eq!(binds("FOR r IN (SELECT 1) DO $n = $n + 1; END FOR; CALL p() INTO $a, $b"), ["error", "sqlstate", "r", "n", "a", "b"]);
         assert_eq!(format("a % b %% c %", &[Some("1".into()), None]), "a 1 b % c NULL");
         assert_eq!(commas("'x %', f(a, b), $c"), ["'x %'", "f(a, b)", "$c"]);
