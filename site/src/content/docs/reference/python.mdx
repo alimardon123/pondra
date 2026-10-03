@@ -19,7 +19,7 @@ db = pondra.connect("http://localhost:8080")
 
 | Call | Meaning |
 |---|---|
-| `pondra.connect(url="http://127.0.0.1:8080", token=None, **options)` | a connection to a node: with a token, or as a user (`user=`, `password=`: its password, or one of its tokens); over HTTPS, `ca=` names a PEM file to trust besides the system's (a node's own certificate) |
+| `pondra.connect(url="http://127.0.0.1:8080", token=None, **options)` | a connection to a node, or to any of several (a list of URLs): with a token, or as a user (`user=`, `password=`: its password, or one of its tokens); over HTTPS, `ca=` names a PEM file to trust besides the system's (a node's own certificate) |
 | `pondra.local(dir="lake", port=None, token=None, flags=(), timeout=120, python=True)` | start a node on a lake here (a folder or `s3://bucket/prefix`) and connect to it |
 | `pondra.current()` | the connection `pondra.sql` and its kin use |
 | `pondra.binary()` | the path of the `pondra` executable: `$PONDRA_BIN`, the one pip installed, or the one on `PATH` |
@@ -34,6 +34,21 @@ db = pondra.connect("http://localhost:8080")
 | `headers` | none | extra headers for every request |
 | `job` | none | a job id: the connection's writes are numbered under it, so a retry is applied once |
 | `echo` | `True` | print what procedures print (their notices) as well as keep them in `db.notices` |
+| `retry_secs` | 60 | how long a call keeps trying while no node answers it (0: once) |
+
+Given a cluster's nodes, a connection rides out one going away. A call that no node ran (nobody
+there, a node stopping, a leader cut off from its bucket) goes to the next node, and so does one a
+node may have run if sending it again can't apply it twice: a query, an `append`, and a single
+`INSERT`, `UPDATE`, `DELETE` or `MERGE`, which the connection sends with a job. It keeps trying for
+`retry_secs`; a single address that has never answered is said at once.
+
+```python norun
+db = pondra.connect(["http://10.0.0.1:8080", "http://10.0.0.2:8080", "http://10.0.0.3:8080"])
+```
+
+While a node holds the connection's session (a transaction, temporary tables, `SET`, variables, the
+session's Python), every call goes to that node. If it goes away, the next call fails with SQLSTATE
+`08006`, the session's state is gone, and the call after that starts again on another node.
 
 `local` starts `pondra serve` on a free port. It stops with `db.close()`, or when Python exits, and
 the lake stays. Because this program started the node, the node's SQL may read and write files on

@@ -13,17 +13,34 @@ name: deploy
 # PUBLISH_PACKAGES `true`, the formula to <owner>/homebrew-pondra and the manifest to
 # <owner>/scoop-pondra (the secret PACKAGES_TOKEN: contents read and write on both), and a pull
 # request to microsoft/winget-pkgs (the secret WINGET_TOKEN: a classic token with public_repo).
+#
+# A pull request runs it when it has the label `full-ci` (its build of every platform: build.yml)
+# and what it tries changes.
 on:
   pull_request:
     branches: [main]
+    types: [opened, synchronize, reopened, labeled] # (labeled: `full-ci` added)
+    paths:
+      - deploy/**
+      - install.sh
+      - install.ps1
+      - src/service.rs
+      - tools/image.py
+      - tools/deploy_check.py
+      - tools/distribute.py
+      - tools/sign.py
+      - tools/package.py
+      - tools/ci_artifact.sh
+      - tools/ci_build.sh
+      - .github/workflows/deploy.yml
   push:
     tags: ["v*"]
   workflow_dispatch:
 
 # A pull request's newer push stops its older run (it would only wait for packages again); a
-# tag's run is never stopped.
+# tag's run is never stopped, nor is a run by another label added.
 concurrency:
-  group: deploy-${{ github.event.pull_request.number || github.ref }}
+  group: deploy-${{ github.event.pull_request.number || github.ref }}${{ github.event.action == 'labeled' && github.event.label.name != 'full-ci' && format('-{0}', github.run_id) || '' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
@@ -37,6 +54,7 @@ env:
 jobs:
   image:
     name: image, compose and chart
+    if: github.event_name != 'pull_request' || (contains(github.event.pull_request.labels.*.name, 'full-ci') && (github.event.action != 'labeled' || github.event.label.name == 'full-ci'))
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
@@ -63,8 +81,22 @@ jobs:
           helm lint --strict deploy/helm/pondra --set lake=s3://bucket/lake
           python3 tools/deploy_check.py chart helm
 
+  # The macOS and Windows packages, waited for on a Linux runner: macOS runners are the scarcest
+  # (the build's own macOS jobs queued for over an hour behind ones that sat waiting), so `service`
+  # takes one only once there is something for it to try.
+  waited:
+    if: github.event_name != 'pull_request' || (contains(github.event.pull_request.labels.*.name, 'full-ci') && (github.event.action != 'labeled' || github.event.label.name == 'full-ci'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 185
+    steps:
+      - uses: actions/checkout@v5
+      - run: for p in macos-arm64 windows-x64; do bash tools/ci_artifact.sh $p "$SHA"; done
+        env:
+          WAIT_MINUTES: 180
+
   service:
     name: pondra service (${{ matrix.platform }})
+    needs: waited
     strategy:
       fail-fast: false
       matrix:

@@ -116,6 +116,9 @@ pub async fn command(app: &crate::server::App, word: &str) -> Result<(&'static s
 /// A session ended (its connection closed): its transaction, if open, is rolled back.
 pub fn end(session: &str) { TXNS.lock().unwrap().remove(session); }
 
+/// Has the session a transaction open here?
+pub fn held(session: &str) -> bool { TXNS.lock().unwrap().contains_key(session) }
+
 /// A statement failed in this session's transaction: it is failed now (`refuse`).
 pub fn failed(message: &str) {
     let Some(s) = crate::temp::current() else { return };

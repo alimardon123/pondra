@@ -203,7 +203,9 @@ alive[1].sql("INSERT INTO events VALUES (30002, 'u2', 3.0)")
 [30002, 30002]
 ```
 
-A reader node follows the new leader within about a second after a failover.
+A reader node follows the new leader within about a second after a failover. Give your clients
+every node's address so they carry on by themselves, and see
+[What Pondra survives](/pondra/concepts/failures/) for the bucket, disks and each door.
 
 Stop what is left when you're done:
 

@@ -130,7 +130,8 @@ serviceAccount:
   name: ""
   annotations: {}         # (a bucket's identity: eks.amazonaws.com/role-arn, iam.gke.io/gcp-service-account, …)
 
-# A stop hands the lead on and makes acknowledged writes durable; give it the time.
+# A stop drains (5 s for the Service to notice, then up to PONDRA_DRAIN_SECS, 30 s), hands the lead
+# on and makes acknowledged writes durable: give it the time (40 s at least).
 terminationGracePeriodSeconds: 60
 podAnnotations: {}
 podLabels: {}

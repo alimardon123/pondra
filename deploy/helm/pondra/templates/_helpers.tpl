@@ -77,6 +77,9 @@ env:
   - {name: POD_NAMESPACE, valueFrom: {fieldRef: {fieldPath: metadata.namespace}}}
   - {name: POD_IP, valueFrom: {fieldRef: {fieldPath: status.podIP}}}
   - {name: PONDRA_SECRET_KEY, valueFrom: {secretKeyRef: {name: {{ include "pondra.keySecret" . }}, key: PONDRA_SECRET_KEY}}}
+  # (a stopping pod says it isn't ready, then waits this long before turning requests away: the
+  # Service takes a moment to stop sending it any)
+  - {name: PONDRA_DRAIN_GRACE_SECS, value: "5"}
   {{- if .Values.auth.enabled }}
   {{- range list "PONDRA_ADMIN_TOKEN" "PONDRA_WRITE_TOKEN" "PONDRA_READ_TOKEN" }}
   - {name: {{ . }}, valueFrom: {secretKeyRef: {name: {{ include "pondra.tokensSecret" $ }}, key: {{ . }}, optional: true}}}
@@ -111,17 +114,18 @@ ports:
   {{- if .Values.kafka.enabled }}
   - {name: kafka, containerPort: 9092}
   {{- end }}
-# (the port opens once the lake is open; a cold start on a big lake can take a while)
+# (the port opens once the lake is open; a cold start on a big lake can take a while. Ready: caught
+# up with its leader, not stopping, and able to reach the bucket. Alive: the process answers.)
 startupProbe:
-  httpGet: {path: /stats, port: http, scheme: {{ include "pondra.scheme" . }}}
+  httpGet: {path: /healthz, port: http, scheme: {{ include "pondra.scheme" . }}}
   periodSeconds: 2
   failureThreshold: 300
 readinessProbe:
-  httpGet: {path: /stats, port: http, scheme: {{ include "pondra.scheme" . }}}
+  httpGet: {path: /ready, port: http, scheme: {{ include "pondra.scheme" . }}}
   periodSeconds: 5
   failureThreshold: 2
 livenessProbe:
-  httpGet: {path: /stats, port: http, scheme: {{ include "pondra.scheme" . }}}
+  httpGet: {path: /healthz, port: http, scheme: {{ include "pondra.scheme" . }}}
   periodSeconds: 10
   timeoutSeconds: 5
   failureThreshold: 6
