@@ -118,7 +118,8 @@ tools/    harness.py, cluster.py (tests), open_check.py (Delta + Iceberg readers
           commit's build run), distribute.py (Homebrew's formula, Scoop's and winget's manifests from
           a release), sign.py (macOS and Windows signing once the certificates are set),
           upgrade_check.py (every release's lake opens, formats, the drain, rolling upgrades),
-          soak.py (C4's soak)
+          soak.py (C4's soak), faulty_s3.py (an S3 proxy that errs, loses replies, slows, holds and
+          goes down), resilience_check.py (every mode under failure)
 docs/     ADRs and reports; lake-format.md is the on-disk layout
 ```
 
@@ -449,7 +450,9 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    DDL); writes go through `write.rs`. Local files (`enable_url_table`) are for `pondra sql` on
    its user's own machine only (`prepare(…, files: true)`). `harness.py clients` checks both.
 22. **A Kafka batch's seq comes from its producer id and sequence** (`kafka::queue`): seq = base
-   sequence + record count, `prev` = base sequence, producer `kafka:{id}:{topic}`. Producers
+   sequence + record count, `prev` = base sequence, producer `kafka:{id}:{topic}`, or
+   `kafka:{id}/{epoch}:{topic}` once its epoch isn't 0 (an epoch is a producer of its own:
+   librdkafka numbers from 0 again after bumping it). Producers
    without a name (non-idempotent Kafka producers) are never checked (`log::commit`); nothing
    else may use an empty name.
 23. **Stored columns only grow, at the end** (`write::create_table`), and every read of log rows
@@ -1404,6 +1407,16 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    segments before it may be gone), and a row whose key isn't the one asked for (two keys of one
    hash) sends the lookup back to scanning the tail. `harness.py upsert` (3,400 lookups against a
    model through compactions and a restart), `begin`, `dedup`, `layouts`.
+214. **A leader cut off from its bucket steps aside, and only then** (`cluster::keep_alive`,
+   `budget::answered`): cut off is 15 s with no mark written and no answer from the bucket but
+   server errors (slow, or asking to slow down, is still there). It answers heartbeats
+   `x-pondra-cut-off` and turns requests away (503, 57P03) while another node is there; a follower
+   takes the next term once it has reached the bucket for 3 s, so a bucket down for everyone keeps
+   its leader. `resilience_check.py` storage and cutoff.
+215. **A client goes to another node only with what can't apply twice** (`client.py`, `index.js`):
+   a call no node ran, a query, an append, or one INSERT/UPDATE/DELETE/MERGE sent with a job. A
+   session a node holds (`x-pondra-session: held`) stays there; its loss is 08006.
+   `resilience_check.py` clients.
 
 ## Tests: run these before and after any change
 
@@ -1413,6 +1426,7 @@ python3 tools/harness.py all            # upsert, fence/split-brain, bulk insert
 python3 tools/gates.py [--prepare]      # the gates (sqllogictest, TPC-H SF1 vs DuckDB, vs Postgres, Nexmark): a row in logs/gates/README.md; exit 1 on a drop
 python3 tools/harness.py safety         # panics answered as errors, TLS at every door, mutual TLS, the audit log, quotas
 python3 tools/fuzz_doors.py --secs 60   # malformed input at HTTP, SQL, Postgres, Kafka and Flight: the node stays up
+python3 tools/resilience_check.py [storage cutoff clients doors disk cache server cli]   # every mode under failure: a failing bucket (faulty_s3.py), a cut-off leader, clients and doors through kills, full disks, pondra sql killed
 python3 tools/upgrade_check.py [lakes|format|drain|rolling|all] [--s3]   # every release's lake since 0.22 opens and answers as it did; newer formats refused; drains (a leader on a bucket with --s3); a rolling upgrade under load
 python3 tools/soak.py --minutes 10 [--hours 24] [--s3]                   # C4: steady ingest, nodes stopped and killed, memory, the log, commits on a timeline
 python3 tools/deploy_check.py                  # the image and compose; add python, chart, helm (kind), service: deploy.yml runs them all
@@ -1509,6 +1523,9 @@ failover on its own binary, and dry-runs the release's npm publish (`tools/npm_p
 --dry-run`, newest npm). A tag's `release.yml` builds nothing: it waits for that commit's build
 run, refuses one that failed or a tag that isn't Cargo.toml's version, and publishes the run's
 packages (a minute or two). `cluster-bench.yml`'s default binary (`ci`) is that run's too.
+A pull request's push runs CI only when the pull request is labelled: `ci` builds linux-x64 with
+the suite, `full-ci` all five platforms with deploy.yml; add `full-ci` once before merging, and
+never turn on auto-merge before that run starts. Main builds all five on every push.
 
 Add `--s3` to any of them with a simulated-R2 bucket to see the object-storage behaviour:
 
@@ -1563,8 +1580,8 @@ decodes Parquet, in-memory columns holding what they count (212), key lookups in
 tail (213). Measured against DuckDB 1.5.5 and 2.0's preview, Flink 2.3, Apache Kafka 4 and the
 single-node engines (`prototype-status.md`, round 32; the site's performance and comparison
 pages). In the same release, round 33's first parts from the side threads: the lake format and
-upgrades (ADR-039, 207–211), deployment (ADR-041, 205–206), `CREATE VIEW v (a, b)` and the console's
-batches. Left of 33: the 24-hour R2 soak (the owner's machine), time travel and its kin (ADR-043, in
+upgrades (ADR-039, 207–211), deployment (ADR-041, 205–206), every mode under failure and the five
+faults it found (214–215), `CREATE VIEW v (a, b)` and the console's batches. Left of 33: the 24-hour R2 soak (the owner's machine), time travel and its kin (ADR-043, in
 review), observability, environments.
 
 **Round 29, part 1 (ADR-034, after 0.27): the owner's console list.** The grid's outline, header

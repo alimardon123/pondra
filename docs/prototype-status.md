@@ -171,6 +171,15 @@ optimizing; performance first):
   `pondra service install` (systemd, launchd, Windows), Homebrew, Scoop and winget manifests made
   from each release, signing ready for certificates, provenance attestations; each tried on every
   PR with the build's own binary. Publishing waits on the owner's accounts.
+- **Every mode under failure** (PR #10, `tools/resilience_check.py`, 75 checks on every PR): a
+  failing bucket (errors, lost replies, held requests, down 40 s), a leader cut off alone, clients
+  and doors through kills, full disks, `pondra sql` killed; every acknowledged write there once on
+  every node, no read torn. It found five faults, all fixed: an idempotent Kafka producer that gave
+  up on a batch lost acknowledged records (12,000 of 50,800 across a leader kill: each epoch is now
+  a producer of its own); a leader cut off from its bucket held every write (now another node takes
+  over after about 25 s); the Python and JavaScript clients failed while their node was down (they
+  take every node's address now); `pondra sql` waited for ever on a missing bucket; a slow bucket
+  was taken for a lost one. A PR's push runs CI only when labelled (`ci`, `full-ci`).
 - **`CREATE VIEW v (a, b)`** names the view's columns (PR #12; the list was ignored).
 - **The console** (PRs #7 and #8, the owner's lists of 2026-10-02): every Live cell over one
   connection (seven of them took the browser's six and hung Python), one grid everywhere with undo,
