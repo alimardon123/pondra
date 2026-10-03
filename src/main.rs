@@ -35,6 +35,8 @@ mod kafka_client;
 mod live;
 mod serve;
 mod settings;
+mod shares;
+mod sharing;
 mod shell;
 mod cluster;
 mod console;
@@ -78,6 +80,7 @@ mod temp;
 mod tier;
 mod udf;
 mod users;
+mod vend;
 mod vars;
 mod views;
 mod write;
@@ -447,6 +450,7 @@ async fn run() -> anyhow::Result<()> {
             let tr = |w: &str| store::trace(w, t_start);
             let listen = addr.clone();
             let addr = advertise.unwrap_or(addr); // (how others reach it: its cluster name)
+            sharing::set_endpoint(&addr); // (where a recipient's profile points: `sharing.rs`)
             let cluster = cluster::Cluster::join(&store, &addr, reader).await?;
             tr("the lease");
             let leader = cluster.is_leader();

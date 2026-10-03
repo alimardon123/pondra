@@ -676,6 +676,9 @@ async fn expand_with(lake: &Lake, sql: &str, views: &HashMap<String, String>) ->
 /// as DataFusion lists them: its own, and the Python ones; `SHOW TABLES` is DataFusion's.)
 fn show(sql: &str) -> Option<String> {
     static SHOW: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?is)^\s*show\s+(user\s+functions|procedures|tasks|materialized\s+views|views)(?:\s+like\s+('(?:[^']|'')*'))?\s*;?\s*$").expect("a regex"));
+    if let Some(q) = show_shares(sql) {
+        return Some(q);
+    }
     let m = SHOW.captures(sql)?;
     let like = m.get(2).map(|l| format!(" AND name LIKE {}", l.as_str())).unwrap_or_default();
     let what = m[1].split_whitespace().map(str::to_lowercase).collect::<Vec<_>>().join(" ");
@@ -685,6 +688,19 @@ fn show(sql: &str) -> Option<String> {
         "tasks" => format!("SELECT * FROM pondra.tasks WHERE true{like} ORDER BY name"),
         "views" => format!("SELECT lake, schema, name, kind, definition FROM pondra.tables WHERE kind <> 'table'{like} ORDER BY 1, 2, 3"),
         _ => format!("SELECT lake, schema, name, key, definition FROM pondra.tables WHERE kind = 'materialized view'{like} ORDER BY 1, 2, 3"),
+    })
+}
+
+/// `SHOW SHARES`, `SHOW RECIPIENTS`, `DESCRIBE SHARE s` (Databricks' `SHOW ALL IN SHARE s` too):
+/// what `pondra.shares` and `pondra.recipients` hold (`shares.rs`).
+fn show_shares(sql: &str) -> Option<String> {
+    static SHOW: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?is)^\s*(?:show\s+(shares|recipients)|(?:describe|desc|show\s+all\s+in)\s+share\s+([a-z_][a-z0-9_]*))\s*;?\s*$").expect("a regex"));
+    let m = SHOW.captures(sql)?;
+    Some(match (m.get(1).map(|w| w.as_str().to_lowercase()), m.get(2)) {
+        (Some(w), _) if w == "shares" => "SELECT share AS name, first_value(comment) AS comment, count(shared_as) AS tables, first_value(recipients) AS recipients, min(created) AS created FROM pondra.shares GROUP BY share ORDER BY share".into(),
+        (Some(_), _) => "SELECT * FROM pondra.recipients ORDER BY name".into(),
+        (None, Some(s)) => format!("SELECT shared_as AS name, \"table\", partitions, history FROM pondra.shares WHERE share = '{}' AND shared_as IS NOT NULL ORDER BY 1", s.as_str().to_lowercase()),
+        _ => return None,
     })
 }
 

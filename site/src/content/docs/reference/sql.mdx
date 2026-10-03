@@ -617,6 +617,23 @@ SELECT * FROM secrets();
 DROP SECRET sales;
 ```
 
+## Shares and recipients
+
+A share hands tables to another company through the Delta Sharing protocol: they read the files with their
+own compute. See [Share a table](/pondra/guides/sharing/).
+
+| Statement | Syntax |
+|---|---|
+| Make a share | `CREATE SHARE [IF NOT EXISTS] name [COMMENT '…']` |
+| Add a table | `ALTER SHARE s ADD [TABLE] t [PARTITION (col = 'v'), …] [AS schema.name] [WITH HISTORY \| WITHOUT HISTORY]`; also `GRANT SELECT ON TABLE t TO SHARE s` |
+| Take one out | `ALTER SHARE s REMOVE [TABLE] name`; also `REVOKE SELECT ON TABLE t FROM SHARE s` |
+| Make a recipient | `CREATE RECIPIENT [IF NOT EXISTS] name [COMMENT '…'] [EXPIRES IN '90 days']` (answers its profile, once) |
+| A new token | `ALTER RECIPIENT name ROTATE TOKEN [EXPIRES IN '…']` (answers the new profile; the old token ends) |
+| Grant, take back | `GRANT SELECT ON SHARE s TO RECIPIENT r, …`, `REVOKE SELECT ON SHARE s FROM RECIPIENT r, …` |
+| Drop | `DROP SHARE [IF EXISTS] name`, `DROP RECIPIENT [IF EXISTS] name` |
+| List | `SHOW SHARES`, `SHOW RECIPIENTS`, `DESCRIBE SHARE s` (`SHOW ALL IN SHARE s`); `pondra.shares`, `pondra.recipients` |
+| Read a share | `ATTACH '<profile JSON or endpoint>' AS name (TYPE share [, SHARE 'name'] [, TOKEN '…'])`, then `name.schema.table` |
+
 ## External tables
 
 `CREATE EXTERNAL TABLE` is DataFusion's statement for naming files. In Pondra it makes a stored view of them:

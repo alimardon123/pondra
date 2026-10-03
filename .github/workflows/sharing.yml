@@ -1,0 +1,94 @@
+name: sharing
+
+# Tables shared with another company (ADR-046, tools/sharing_check.py): the delta-sharing client
+# (pandas, in Parquet's and Delta's forms) and another Pondra read what the provider's SQL answers,
+# through deletes, a renamed column, partitions and history; refusals and the audit log. Once on a
+# lake on disk (links to the node) and once in a bucket (tools/sim_r2.py: the bucket's own signed
+# URLs). It runs the binary the build workflow made for this commit (tools/ci_artifact.sh waits for
+# it): nothing is compiled here.
+#
+# A pull request runs it when it asks for CI (the label `ci` or `full-ci`: build.yml) and what it
+# checks changes.
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, labeled] # (labeled: `ci` or `full-ci` added)
+    paths:
+      - src/shares.rs
+      - src/sharing.rs
+      - src/vend.rs
+      - src/read_delta.rs
+      - src/delta.rs
+      - src/ext.rs
+      - src/scan.rs
+      - src/audit.rs
+      - src/server.rs
+      - tools/sharing_check.py
+      - tools/sim_r2.py
+      - tools/ci_artifact.sh
+      - .github/workflows/sharing.yml
+  workflow_dispatch:
+
+concurrency:
+  group: sharing-${{ github.event.pull_request.number || github.ref }}${{ github.event.action == 'labeled' && github.event.label.name != 'ci' && github.event.label.name != 'full-ci' && format('-{0}', github.run_id) || '' }}
+  cancel-in-progress: true
+
+permissions:
+  actions: read # (the build run's packages)
+  contents: read
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+
+jobs:
+  check:
+    name: sharing
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.event.action == 'labeled' && (github.event.label.name == 'ci' || github.event.label.name == 'full-ci')) ||
+      (github.event.action != 'labeled' && (contains(github.event.pull_request.labels.*.name, 'ci') || contains(github.event.pull_request.labels.*.name, 'full-ci')))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90 # (most of it waiting for the build's packages)
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: The check's Python packages (delta-sharing pins pandas < 3, so not requirements.txt's)
+        run: pip install delta-sharing==1.4.2 "moto[server]==5.2.3" boto3
+      - name: This commit's Linux binary (the build workflow's)
+        run: |
+          bash tools/ci_artifact.sh linux-x64 "$SHA"
+          mkdir -p bin && tar xzf dist/pondra-linux-x64.tar.gz -C bin && ls -l bin
+      - name: A lake on disk
+        run: python tools/sharing_check.py --bin bin/pondra
+      - name: A lake in a bucket (simulated R2)
+        env:
+          AWS_ENDPOINT: http://127.0.0.1:9000
+          AWS_ACCESS_KEY_ID: test
+          AWS_SECRET_ACCESS_KEY: test
+          AWS_REGION: auto
+          AWS_ALLOW_HTTP: "true"
+          PONDRA_BUCKET: testbucket
+        run: |
+          python tools/sim_r2.py --port 9000 --zero > sim_r2.log 2>&1 &
+          python - <<'EOF'
+          import time, boto3
+          for _ in range(60):
+              try:
+                  boto3.client("s3", endpoint_url="http://127.0.0.1:9000", region_name="us-east-1").create_bucket(Bucket="testbucket")
+                  break
+              except Exception:
+                  time.sleep(0.5)
+          EOF
+          python tools/sharing_check.py --bin bin/pondra --s3
+      - name: The nodes' logs, when a check failed
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sharing-logs
+          path: |
+            /tmp/pondra-sharing-*/*.log
+            sim_r2.log
+          if-no-files-found: ignore

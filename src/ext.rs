@@ -376,7 +376,7 @@ pub fn readable_rows(batches: Vec<datafusion::arrow::record_batch::RecordBatch>)
 }
 
 /// Does this table read files on the node's machine? (Such a query stays on it.)
-pub fn local(table: &str) -> bool { spec(table).is_some_and(|s| s.urls.iter().any(|u| scheme(u).is_none_or(|s| s == "file"))) }
+pub fn local(table: &str) -> bool { spec(table).is_some_and(|s| s.format == "share" || s.urls.iter().any(|u| scheme(u).is_none_or(|s| s == "file"))) } // (a share's links: as its node got them)
 
 /// A table by name: this lake's, or the files an `ext:` name reads (checked: see `check`).
 pub async fn meta(lake: &Lake, table: &str) -> Result<Option<TableMeta>> {
@@ -477,6 +477,7 @@ async fn resolve(lake: &Lake, spec: &Spec) -> Result<TableMeta> {
     let version = |k: &str| spec.options.get(k).map(|v| v.parse::<i64>().with_context(|| format!("{k} is a number, not {v}"))).transpose();
     match spec.format.as_str() {
         "kafka" => return Ok(TableMeta { ext: Some(spec.clone()), ..crate::kafka_client::resolve(lake, &spec.urls[0]).await? }),
+        "share" => return Ok(TableMeta { ext: Some(spec.clone()), ..crate::sharing::read(lake, spec).await? }), // (its files' links are the provider's: ADR-046)
         "delta" | "iceberg" => {
             let m = match spec.format.as_str() {
                 "delta" => crate::read_delta::resolve(lake, &spec.urls[0], version("version")?).await?,
@@ -703,8 +704,8 @@ fn file_format(spec: &Spec) -> Result<Arc<dyn FileFormat>> {
 /// The rows of `files` of an `ext:` table, as `schema`: DataFusion's own readers, without the hot
 /// columns (outside the lake, a file may change under the same name).
 pub async fn read(lake: &Lake, ctx: &datafusion::prelude::SessionContext, files: &[&DataFile], schema: &datafusion::arrow::datatypes::SchemaRef, spec: &Spec, table: Option<&crate::scan::Table>) -> Result<datafusion::prelude::DataFrame> {
-    if ["delta", "iceberg"].contains(&spec.format.as_str()) {
-        return crate::scan::read(ctx, files, schema, table).await; // (another engine's table: its partition values, its deletes)
+    if ["delta", "iceberg", "share"].contains(&spec.format.as_str()) {
+        return crate::scan::read(ctx, files, schema, table).await; // (another engine's table, or a share: its partition values, its deletes)
     }
     if spec.format == "kafka" {
         return crate::kafka_client::read(lake, ctx, files, schema).await; // (a topic)
@@ -896,6 +897,15 @@ pub fn attached_table(all: &[(String, Attached)], parts: &[String]) -> Result<Op
         let [topic] = rest else { bail!("{}: a Kafka cluster's topics are {0}.topic", parts[0]) };
         return Ok(Some(name(&Spec { urls: vec![format!("{}/{topic}", a.url.trim_end_matches('/'))], format: "kafka".into(), options: BTreeMap::new() })));
     }
+    if a.kind == "share" {
+        let (schema, t) = match rest {
+            [t] => ("public", t),
+            [s, t] => (s.as_str(), t),
+            _ => bail!("{}: a share's tables are {0}.schema.table", parts[0]),
+        };
+        let options = BTreeMap::from([("share".to_string(), a.options.get("share").cloned().unwrap_or_default()), ("schema".to_string(), schema.to_string()), ("table".to_string(), t.clone())]);
+        return Ok(Some(name(&Spec { urls: vec![a.url.clone()], format: "share".into(), options })));
+    }
     let endpoint = a.options.get("endpoint").cloned().or_else(|| a.url.starts_with("http").then(|| a.url.clone()));
     let spec = match endpoint {
         Some(endpoint) => {
@@ -927,9 +937,13 @@ pub async fn outside_target(lake: &Lake, name: &str) -> Result<Option<String>> {
 /// Leader: keep an attachment of another engine's tables.
 pub async fn attach(lake: &Lake, name: &str, url: &str, kind: &str, options: BTreeMap<String, String>) -> Result<serde_json::Value> {
     crate::ddl::check(name)?;
-    ensure!(["delta", "iceberg", "kafka"].contains(&kind), "ATTACH … (TYPE {kind}): delta, iceberg or kafka (or a Pondra lake, with no TYPE)");
+    ensure!(["delta", "iceberg", "kafka", "share"].contains(&kind), "ATTACH … (TYPE {kind}): delta, iceberg, kafka or share (or a Pondra lake, with no TYPE)");
     ensure!((kind == "kafka") == url.starts_with("kafka://"), "ATTACH … (TYPE kafka) takes a kafka://brokers URL, and only it does");
-    let known = ["endpoint", "secret", "read_only"];
+    let mut options = options;
+    if kind == "share" {
+        options = crate::sharing::accept(lake, name, url, options).await?; // (its token kept as a secret)
+    }
+    let known: &[&str] = if kind == "share" { &["share"] } else { &["endpoint", "secret", "read_only"] };
     if let Some(k) = options.keys().find(|k| !known.contains(&k.as_str())) {
         bail!("ATTACH … (TYPE {kind}) has no option {k}: {}", known.join(", "));
     }
@@ -952,10 +966,12 @@ pub async fn attach(lake: &Lake, name: &str, url: &str, kind: &str, options: BTr
 
 /// Leader: DETACH one (false: not attached this way).
 pub async fn detach(lake: &Lake, name: &str) -> Result<bool> {
-    if lake.cat.get::<Attached>(&attached_key(name)).await?.is_none() {
-        return Ok(false);
+    let Some(a) = lake.cat.get::<Attached>(&attached_key(name)).await? else { return Ok(false) };
+    let mut gone = vec![attached_key(name)];
+    if a.kind == "share" {
+        gone.push(secret_key(&format!("share_{name}"))); // (its token, kept when it was attached)
     }
-    lake.cat.commit(vec![], &[attached_key(name)]).await?;
+    lake.cat.commit(vec![], &gone).await?;
     Ok(true)
 }
 
@@ -968,6 +984,13 @@ pub async fn secret_for(lake: &Lake, url: &str) -> Result<Option<BTreeMap<String
 pub fn web() -> &'static reqwest::Client {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     CLIENT.get_or_init(|| reqwest::Client::builder().timeout(std::time::Duration::from_secs(60)).build().expect("an HTTP client"))
+}
+
+/// A recipient's token for a Delta Sharing server, from the secret of TYPE share covering it.
+pub async fn share_token(lake: &Lake, endpoint: &str) -> Result<Option<String>> {
+    let all: Vec<(String, Secret)> = list(lake).await?.into_iter().filter(|(_, s)| s.kind == "share").collect();
+    let Some((name, secret)) = covering(&all, endpoint) else { return Ok(None) };
+    Ok(open(&name, &secret)?.get("token").cloned())
 }
 
 /// The bearer token for a REST catalog, from the secret covering it: its TOKEN, or one its
@@ -1026,9 +1049,10 @@ fn kind(t: &str) -> Result<(&'static [&'static str], &'static [&'static str])> {
         "azure" => (&["connection_string", "account_name", "account_key", "sas_token", "tenant_id", "client_id", "client_secret", "endpoint", "use_emulator", "provider", "scope"], &["az", "azure", "abfs", "abfss"]),
         "http" => (&["bearer_token", "scope"], &["http", "https"]),
         "iceberg" => (&["token", "client_id", "client_secret", "oauth2_server_uri", "oauth2_scope", "scope"], &["http", "https"]), // (a REST catalog)
+        "share" => (&["token", "scope"], &["http", "https"]), // (a Delta Sharing server: a recipient's token)
         "kafka" => (&["security_protocol", "sasl_mechanism", "username", "password", "scope"], &["kafka"]),
         "generic" => (&[], &[]), // (any settings: for procedures, `pondra.secret(name)`)
-        t => bail!("secrets of TYPE {t}: s3, r2, gcs, azure, http, iceberg, kafka or generic"),
+        t => bail!("secrets of TYPE {t}: s3, r2, gcs, azure, http, iceberg, share, kafka or generic"),
     })
 }
 
@@ -1132,6 +1156,19 @@ fn attach_statement(p: &mut datafusion::sql::sqlparser::parser::Parser) -> Optio
     let kind = options.remove("type").unwrap_or_default().to_lowercase();
     if kind.is_empty() || kind == "pondra" {
         return None; // (a lake: `ddl::Attach`)
+    }
+    let mut url = url;
+    if kind == "share" && url.trim_start().starts_with('{') {
+        // (a profile, as its provider gave it: where the door is, and the token)
+        let p: serde_json::Value = match serde_json::from_str(&url) {
+            Ok(p) => p,
+            Err(e) => return Some(crate::write::Stmt::Invalid(format!("ATTACH '<a share\'s profile>' AS name (TYPE share): its JSON doesn't read ({e})"))),
+        };
+        let (Some(endpoint), Some(token)) = (p["endpoint"].as_str(), p["bearerToken"].as_str()) else {
+            return Some(crate::write::Stmt::Invalid("a share's profile has its endpoint and bearerToken".into()));
+        };
+        options.insert("token".into(), token.to_string());
+        url = endpoint.to_string();
     }
     Some(crate::write::Stmt::Ddl(vec![crate::ddl::Ddl::AttachOutside { name, url, kind, options }]))
 }

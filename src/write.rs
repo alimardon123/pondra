@@ -324,6 +324,9 @@ pub fn parse(sql: &str) -> Option<Stmt> {
         let lost = if matches!(kind.as_str(), "USER" | "ROLE") { "the rights given to it" } else { "everything in it" };
         return Some(Stmt::Invalid(format!("CREATE OR REPLACE {kind}: replacing one would drop {lost}; CREATE {kind} IF NOT EXISTS leaves one that is there as it is")));
     }
+    if let Some(s) = crate::shares::statement(sql) {
+        return Some(s); // (CREATE SHARE and RECIPIENT, GRANT SELECT ON SHARE: `shares.rs`, before users' GRANT)
+    }
     if let Some(s) = crate::users::statement(sql) {
         return Some(s); // (CREATE USER and ROLE, GRANT, REVOKE, CREATE TOKEN: `users.rs`)
     }
