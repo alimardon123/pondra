@@ -65,7 +65,8 @@ src/      28,600 lines of Rust, one file per concern (see the table in README.md
           the next); round 33 format.rs (the lake's format, ADR-039), drain.rs (stopping without
           dropping work), service.rs (`pondra service`: systemd, launchd, a Windows service;
           ADR-041), past.rs (a table's past: `AT (…)`, `RESTORE`, ADR-043) and history.rs (every
-          statement a row of `pondra.history`, slow ones with plans and traces, ADR-048)
+          statement a row of `pondra.history`, slow ones with plans and traces, ADR-048); round 34
+          friendly.rs (DuckDB's spellings, rewritten where SQL comes in: invariant 225)
 brand/    the logo (mark.svg), colours (colors.css) and fonts (fonts/: Geist and Geist Mono, SIL
           OFL): the only copies; tools/brand_check.py
 site/     the documentation website (Starlight; ADR-030): site/STYLE.md says how pages are written,
@@ -1477,6 +1478,18 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    loud: a new kind of periodic commit must be quiet, or every remembered answer is forgotten at its
    pace (history's commits every second made a repeated query 12× slower on a lake only read). The
    leader's version is the smaller of `loud` and `committed` (`apply` comes first).
+225. **DuckDB's spellings are rewritten in one place, and a text with none goes on as it was**
+   (`friendly.rs`, from `routines::expand`, ahead of every door, a view as it is read and a
+   materialized view when made): what the parser can't read is turned in the text first (`text`:
+   `PIVOT t ON …`, comprehensions, `LAMBDA x:`, DuckDB's `ASOF … ON`, `USING SAMPLE`); the rest
+   in the tree after the macros (`rewrite`), and a statement it changed nothing in is sent as it
+   came (`as_written`). What needs the data (a `PIVOT`'s values, a `FROM`'s columns for `COLUMNS`,
+   `RENAME`, an alias in a `WHERE`, `ORDER BY ALL` over `*`, `SUMMARIZE`) is asked with a query of
+   its own, as the caller, under the `WITH`s around it: one pass asks, the next takes the answers
+   in the same order, so every node of a spread query gets the same text. A lambda stays `x -> …`
+   in the text (the generic dialect reads it as JSON's arrow) and becomes one where a query is
+   planned (`query::sql`, at every planning site). `harness.py friendly`: 30 forms == DuckDB's
+   answers, spread == one node, over Postgres, in a view and a materialized view.
 
 ## Tests: run these before and after any change
 
@@ -1498,6 +1511,7 @@ python3 tools/harness.py variables      # DECLARE $x, $x = …, SET VARIABLE, ge
 python3 tools/harness.py hot            # hot columns skip batches by their ranges (a time range, a top-N either way, a key); NULL filters == the model
 python3 tools/harness.py minmax         # a global min/max over 24 files skips no row its other answers need (an expression, NULLs so far, FILTER); a wide top-N's answer
 python3 tools/harness.py history        # pondra.history: every door's statements, slow ones' plans and three nodes' traces, the rate, off, who reads what
+python3 tools/harness.py friendly       # DuckDB's spellings (PIVOT, COLUMNS, lambdas, ASOF … ON, SUMMARIZE, samples, …) == DuckDB's answers; spread, Postgres, views
 python3 tools/harness.py tasks          # task graphs on three nodes: AFTER, WHEN, pondra.result, retries, timeouts, SUSPEND, refusals, a failover
 python3 tools/harness.py sparksql       # spark.sql / spark_sql('…') in Spark's grammar: literals, LATERAL VIEW, Spark's floor and substring, frames on top, refusals
 python3 tools/harness.py flows          # views of views in one commit, rollups, expectations (keep, drop, fail), changes down the flow

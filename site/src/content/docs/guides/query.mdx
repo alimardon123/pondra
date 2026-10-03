@@ -9,7 +9,7 @@ import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
 
 Pondra's SQL is [Apache DataFusion's](https://datafusion.apache.org/user-guide/sql/index.html): the
 Postgres-style SQL you know, with joins, subqueries, CTEs, window functions and the usual functions,
-plus a few DuckDB conveniences (`FROM t`, `SELECT * EXCLUDE (…)`, `GROUP BY ALL`). Pondra adds its own
+plus DuckDB's conveniences (`FROM t`, `SELECT * EXCLUDE (…)`, `GROUP BY ALL`, [and more](#write-it-as-duckdb-does)). Pondra adds its own
 statements (`MERGE`, `ASOF JOIN`, `CREATE MATERIALIZED VIEW`) and functions, which the other guides cover.
 
 Here is some data for the examples:
@@ -56,6 +56,33 @@ INSERT INTO users VALUES (1, 'ann', 'Tashkent'), (2, 'bob', 'Paris'), (3, 'cy', 
 
 `psql` needs the Postgres port (`pondra serve --pg 0.0.0.0:5432`); so do psycopg, SQLAlchemy and
 other Postgres clients.
+
+## Write it as DuckDB does
+
+Pondra takes the SQL DuckDB users write, and answers it as DuckDB does. It works the same in a
+view, over Postgres and on a query spread over several nodes:
+
+```sql
+PIVOT orders ON item USING sum(amount) GROUP BY user_id;
+UNPIVOT (SELECT id, qty, amount FROM orders) ON qty, amount INTO NAME field VALUE value;
+SELECT * EXCLUDE (ts) RENAME (amount AS total) FROM orders ORDER BY ALL;
+SELECT min(COLUMNS('qty|amount')), max_by(item, amount) AS biggest FROM orders;
+SELECT id, [q * 2 FOR q IN [qty, qty + 1] IF q > 2] AS doubled, list_transform([qty], x -> x + 1) AS plus FROM orders;
+SELECT amount * 2 AS twice FROM orders WHERE twice > 10;
+SUMMARIZE orders;
+SELECT count(*) FROM orders USING SAMPLE 50%;
+```
+
+The standard's `PIVOT (… FOR … IN (…))` and `UNPIVOT (… FOR … IN (…))` work too, and so do
+`FETCH FIRST n ROWS ONLY`, `TABLESAMPLE`, `LAMBDA x: …`, `arg_max`, `arg_min`, `min_by`, `list()`,
+`string_split`, `json_extract` and `json_extract_string`, `({'a': 1}).a`, and DuckDB's
+`ASOF JOIN … ON a.k = b.k AND a.t >= b.t` (only matched rows; `ASOF LEFT JOIN` keeps the rest).
+
+<Aside type="caution">
+A `PIVOT` without `IN (…)` finds its values with a query of its own when it runs; name them with `IN
+('a', 'b')` in a view whose values may change. `PIVOT` takes one column `ON`, `FETCH` takes no
+`PERCENT` or `WITH TIES`, and a JSON path is written as a literal (`'$.a.b[0]'`).
+</Aside>
 
 ## What a query sees
 

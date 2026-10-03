@@ -642,15 +642,21 @@ async fn expand_with(lake: &Lake, sql: &str, views: &HashMap<String, String>) ->
     if let Some(q) = show(sql) {
         return Ok(q);
     }
+    if let Some(q) = crate::friendly::summarize(lake, sql).await? {
+        return Ok(q);
+    }
     let sql = &crate::past::restore(lake, sql).await?.unwrap_or_else(|| sql.to_string()); // (`RESTORE TABLE t TO VERSION AS OF n`: a MERGE, ADR-043)
     let sql = &crate::sparksql::inline(sql)?; // (`spark_sql('…')`: Spark SQL as Pondra's, then expanded as any)
     let sql = &crate::past::syntax(sql).into_owned(); // (`t AT (VERSION => n)`: a table as it was, ADR-043)
+    let sql = &crate::friendly::text(sql)?.into_owned(); // (`PIVOT t ON g`, `[x FOR x IN l]`, DuckDB's ASOF … ON: as SQL that parses)
     let all = listed(lake).await?;
     let outside = crate::ext::attached(lake).await?;
     let named = |n: &String| crate::ddl::mentions(sql, n);
-    if !all.iter().any(|(n, r)| r.kind != Kind::Procedure && named(n)) && !views.keys().any(named) && !FROM_FIRST.is_match(sql) && !crate::ext::mentions(sql)
-        && !outside.iter().any(|(n, _)| named(n)) && !sql.contains("pondra_at(") {
-        return Ok(named_apart(sql).unwrap_or_else(|| sql.to_string()));
+    let expands = all.iter().any(|(n, r)| r.kind != Kind::Procedure && named(n)) || views.keys().any(named) || FROM_FIRST.is_match(sql) || crate::ext::mentions(sql)
+        || outside.iter().any(|(n, _)| named(n)) || sql.contains("pondra_at(");
+    let as_written = || Ok(named_apart(sql).unwrap_or_else(|| sql.to_string()));
+    if !expands && !crate::friendly::wanted(sql) {
+        return as_written();
     }
     // DuckDB's `FROM t WHERE …` (FROM first, with clauses after it): `SELECT * FROM t WHERE …`.
     static LEADING_FROM: std::sync::LazyLock<regex::Regex> =
@@ -659,13 +665,18 @@ async fn expand_with(lake: &Lake, sql: &str, views: &HashMap<String, String>) ->
         true => Parser::parse_sql(&GenericDialect {}, &format!("SELECT * {sql}")),
         false => Err(e),
     });
-    let Ok(mut stmts) = parsed else { return Ok(sql.to_string()) };
-    for s in stmts.iter_mut() {
+    let Ok(mut stmts) = parsed else { return if expands { Ok(sql.to_string()) } else { as_written() } };
+    for s in stmts.iter_mut().filter(|_| expands) {
         if !matches!(s, Statement::CreateMacro { .. } | Statement::CreateView(ast::CreateView { materialized: false, .. })) {
             if let ControlFlow::Break(e) = s.visit(&mut Expander { lake, all: &all, views, outside: &outside, depth: 0, own: 0 }) {
                 return Err(e);
             }
         }
+    }
+    // DuckDB's and Snowflake's forms (`friendly.rs`): a text sent on as it was when none is in it
+    let friendly = crate::friendly::rewrite(lake, &mut stmts).await?;
+    if !expands && !friendly {
+        return as_written();
     }
     Ok(text(&stmts))
 }
