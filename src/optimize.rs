@@ -33,7 +33,11 @@ pub fn config(mut config: SessionConfig) -> SessionConfig {
     let defaults = "datafusion.sql_parser.parse_float_as_decimal=true,\
         datafusion.execution.time_zone=+00:00,\
         datafusion.optimizer.hash_join_single_partition_threshold=33554432,\
-        datafusion.optimizer.hash_join_single_partition_threshold_rows=1048576";
+        datafusion.optimizer.hash_join_single_partition_threshold_rows=1048576,\
+        datafusion.execution.skip_physical_aggregate_schema_check=true";
+    // (the last: DataFusion 55 works out a CASE's nullability two ways, and the planner's one is
+    // the more careful, so `SELECT DISTINCT CASE WHEN a < 1 AND b = 5 THEN b ELSE 5 END` failed its
+    // check that they agree; the rows are the same either way)
     for (k, v) in defaults.split(',').chain(user.split(',')).filter_map(|kv| kv.trim().split_once('=')) {
         config = config.set_str(k, v);
     }
@@ -56,9 +60,9 @@ pub fn rules() -> Vec<Arc<dyn OptimizerRule + Send + Sync>> {
     if ordered {
         rules.insert(at, Arc::new(OuterLast)); // (the inner joins it gathers are the order's to choose)
     }
+    rules.insert(0, Arc::new(InListOfRows)); // (before DataFusion's simplifier meets two lists of one column)
     rules.insert(0, Arc::new(Seconds)); // (before a literal is folded into a timestamp)
     rules.push(Arc::new(CheapFirst));
-    rules.push(Arc::new(InListOfRows));
     rules.push(Arc::new(AsyncBelow)); // (last: after COUNT(DISTINCT) became a GROUP BY)
     rules
 }
@@ -394,10 +398,13 @@ fn cheap_first(e: &Expr, schema: &DFSchema) -> Expr {
     }
 }
 
-/// `x IN (a, b)` whose list reads the row (`c1`, `CASE WHEN c1 < 0 THEN … END`) as `x = a OR x = b`
-/// (`NOT IN`: `x <> a AND x <> b`), the same answer to NULLs too. DataFusion 55.1 tries such a list
-/// on an empty batch to see if it is constant; a `CASE` passes, and every row is then compared
-/// with what it gave there (found by `tools/random_sql.py`).
+/// `x IN (a, b)` whose list isn't all values (`c1`, `CASE WHEN c1 < 0 THEN … END`, `NULL`, `NULL +
+/// 1`) as `x = a OR x = b` (`NOT IN`: `x <> a AND x <> b`), the same answer to NULLs too, before
+/// DataFusion simplifies anything. DataFusion 55.1 tries such a list on an empty batch to see if
+/// it is constant; a `CASE` passes, and every row is then compared with what it gave there. And
+/// its simplifier meets `x IN (y, 'a') AND x IN ('a', 'b')` as sets of values: their intersection
+/// was `x IN ()`, false, and `x IN (1, 2) AND x NOT IN (NULL)` was `x IN (1, 2)` (all three found
+/// by `tools/random_sql.py`). Lists of values alone stay lists.
 #[derive(Debug)]
 struct InListOfRows;
 
@@ -415,7 +422,7 @@ impl OptimizerRule for InListOfRows {
         plan.map_expressions(|e| {
             let name = names.save(&e);
             e.transform_up(|e| match e {
-                Expr::InList(i) if !i.list.is_empty() && i.list.iter().any(|x| !x.column_refs().is_empty()) => {
+                Expr::InList(i) if !i.list.is_empty() && !i.list.iter().all(value) => {
                     let (op, join) = if i.negated { (Operator::NotEq, Operator::And) } else { (Operator::Eq, Operator::Or) };
                     let each = i.list.into_iter().map(|x| datafusion::logical_expr::binary_expr((*i.expr).clone(), op, x));
                     Ok(Transformed::yes(each.reduce(|a, b| datafusion::logical_expr::binary_expr(a, join, b)).expect("a list")))
@@ -424,6 +431,17 @@ impl OptimizerRule for InListOfRows {
             })
             .map(|t| t.update_data(|e| name.restore(e)))
         })
+    }
+}
+
+/// A value that isn't NULL, perhaps cast.
+fn value(e: &Expr) -> bool {
+    match e {
+        Expr::Literal(v, _) => !v.is_null(),
+        Expr::Cast(c) => value(&c.expr),
+        Expr::TryCast(c) => value(&c.expr),
+        Expr::Negative(e) => value(e),
+        _ => false,
     }
 }
 
@@ -451,6 +469,9 @@ fn cost(e: &Expr, schema: &DFSchema) -> usize {
 /// DataFusion's physical rules, with Pondra's placed where they work best.
 pub fn physical_rules() -> Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> {
     let mut rules = PhysicalOptimizer::new().rules;
+    for r in rules.iter_mut().filter(|r| r.name() == "ProjectionPushdown") {
+        *r = Arc::new(GuardedPushdown(r.clone()));
+    }
     let at = rules.iter().position(|r| r.name() == "join_selection").map_or(0, |i| i + 1);
     rules.insert(at, Arc::new(HavingBuilds));
     rules.insert(at + 1, Arc::new(crate::asof::Rule)); // (before the rules that add exchanges: it asks for its own)
@@ -459,6 +480,33 @@ pub fn physical_rules() -> Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> {
     rules.insert(end, Arc::new(MinMaxBounds)); // (after the filters are pushed down)
     rules.insert(end, Arc::new(WideTopN)); // (likewise)
     rules
+}
+
+/// DataFusion's `ProjectionPushdown`, but not over a projection right above a filter that already
+/// has one of its own. DataFusion 55 (and 54) pushes such a projection through the filter as if the
+/// filter's input were its output, so its columns point at others: `SELECT a.c || b.c, a.d FROM a
+/// LEFT JOIN b ON a.k = b.k WHERE b.e IS DISTINCT FROM 3` failed when it ran a second time (found
+/// by `tools/random_sql.py`), and columns of one name and type would have been taken for each
+/// other unnoticed. A projection left where it was costs next to nothing.
+#[derive(Debug)]
+struct GuardedPushdown(Arc<dyn PhysicalOptimizerRule + Send + Sync>);
+
+impl PhysicalOptimizerRule for GuardedPushdown {
+    fn optimize(&self, plan: Arc<dyn ExecutionPlan>, config: &ConfigOptions) -> Result<Arc<dyn ExecutionPlan>> {
+        let over = |p: &Arc<dyn ExecutionPlan>| p.downcast_ref::<ProjectionExec>().and_then(|p| p.input().downcast_ref::<FilterExec>()).is_some_and(|f| f.projection().is_some());
+        match plan.exists(|p| Ok(over(p)))? {
+            true => Ok(plan),
+            false => self.0.optimize(plan, config),
+        }
+    }
+
+    fn name(&self) -> &str {
+        self.0.name()
+    }
+
+    fn schema_check(&self) -> bool {
+        self.0.schema_check()
+    }
 }
 
 /// A global `min` / `max` hands the scans a filter of the rows that could still change its answer
