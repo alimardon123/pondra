@@ -480,5 +480,9 @@ mod tests {
         assert!(statement("GRANT SELECT ON sales.orders TO bob").is_none());
         assert!(statement("GRANT SELECT ON share_log TO bob").is_none());
         assert!(matches!(statement("GRANT INSERT ON SHARE acme TO RECIPIENT r"), Some(crate::write::Stmt::Invalid(_))));
+        // (OR REPLACE would drop a share's tables and grants, or end a recipient's token: refused, invariant 192)
+        for sql in ["CREATE OR REPLACE SHARE acme", "create or replace recipient acme_corp"] {
+            assert!(matches!(crate::write::parse(sql), Some(crate::write::Stmt::Invalid(e)) if e.contains("replacing one would drop")), "{sql}");
+        }
     }
 }

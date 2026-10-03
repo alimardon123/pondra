@@ -168,12 +168,14 @@ def sharing_check(bin, work, port, s3):
     checks["SHOW SHARES, SHOW RECIPIENTS, DESCRIBE SHARE"] = \
         [tuple(r.values())[:3] for r in q("SHOW SHARES")] == [("acme", "Orders for Acme", 3)] and [r["name"] for r in q("SHOW RECIPIENTS")] == ["acme_corp"] \
         and [r["name"] for r in q("DESCRIBE SHARE acme")] == ["public.kv", "sales.orders", "sales.orders_eu"]
-    checks["refused by name: a view, a table not here, a partition of another column, a share or recipient not there"] = all([
+    checks["refused by name: a view, a table not here, a partition of another column, a share or recipient not there, OR REPLACE"] = all([
         "materialized view" in refused("ALTER SHARE acme ADD TABLE information_schema.tables"),
         "no table" in refused("ALTER SHARE acme ADD TABLE nothing_here"),
         "partitioned by region" in refused("ALTER SHARE acme ADD TABLE sales.orders PARTITION (total = '1') AS sales.x"),
         "no share" in refused("GRANT SELECT ON SHARE nope TO RECIPIENT acme_corp"),
         "no recipient" in refused("GRANT SELECT ON SHARE acme TO RECIPIENT nobody"),
+        "its tables and grants" in refused("CREATE OR REPLACE SHARE acme"),
+        "its token" in refused("CREATE OR REPLACE RECIPIENT acme_corp"),
     ])
     q("DROP SHARE acme")
     checks["DROP SHARE: the recipient sees nothing"] = json.loads(door(port, "GET", "/shares", new_token)[2])["items"] == []
