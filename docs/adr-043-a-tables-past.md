@@ -51,10 +51,21 @@ follows), and records from where the table is still whole (`TableMeta::past_from
 moment is refused by name. Keyed tables are refused, since compaction keeps only each key's newest
 version.
 
-**4. `RESTORE TABLE t TO VERSION n` and zero-copy `CLONE` (after it).**
+**4. `RESTORE TABLE t TO VERSION AS OF n` (or `TIMESTAMP AS OF`, Delta's words) is one MERGE**
+from `t AT (…)` (`past::restore`, where SQL comes in, so every door has it): matched by `_row_id`, a
+row whose values differ gets the old ones (and keeps its id), a row made since goes (`WHEN NOT
+MATCHED BY SOURCE THEN DELETE`), a row deleted since comes back as a new row. It is a change like
+any other, so its own past is kept and another `RESTORE` undoes it.
 
-- `RESTORE` is one change commit: it deletes what came after `n` and inserts what was taken out since.
-- `CLONE` shares the source's files, so a file's deletion must ask every table that names it.
+**5. `CREATE TABLE c [SHALLOW] CLONE t` copies no file.** The source's log rows go to files first
+(as a rename's do); then `c`'s entry (and its `{c}$deleted`'s) is `t`'s, in a folder of its own,
+reading the log from its end, with `t`'s folder in `TableMeta::shares`. A file in a folder some
+table shares is never deleted as one table's garbage (`tier::expire`): only the orphan sweep deletes
+it, and it counts every table that lists files in a folder (a table, those kept to be undropped, and
+every clone sharing it). So `t`'s merges, `c`'s merges and `DROP TABLE t` delete nothing the other
+reads; the cost is that a shared folder's replaced files stay until the sweep (a day). A clone isn't
+published (Delta and Iceberg name a table's files under its folder) and its past starts when it was
+made (`past_from`). An `AT` clone is `CREATE TABLE c AS SELECT * FROM t AT (…)`, a copy.
 
 ## Consequences
 
@@ -65,4 +76,5 @@ version.
 - Old lakes need nothing new. A dropped table's entry is a new catalog prefix, `dt/`, which older
   releases never read (ADR-039: no format change). An older release leading the lake does not know
   the kept tables either: its orphan sweep may take their files once they are a day old.
-- Tests: `tools/history_check.py`.
+- Tests: `tools/history_check.py` (every part; the orphan sweep's counting of clones can't be shown
+  in a test, as it deletes only what is a day old).

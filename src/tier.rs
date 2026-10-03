@@ -692,13 +692,19 @@ pub async fn expire(lake: &Lake, grace_ms: u64) -> Result<()> {
     struct Kept { at_ms: u64, keep_ms: u64 }
     let now = crate::log::now_ms();
     deletes.extend(lake.cat.scan::<Kept>("dt/", "dt0").await?.into_iter().filter(|(_, d)| now >= d.at_ms + d.keep_ms).map(|(k, _)| k));
+    // A folder a clone shares (ADR-043): files there go only by the orphan sweep, which counts
+    // every table listing them, never as one table's garbage.
+    let mut shared: std::collections::HashSet<String> = tables.iter().flat_map(|(_, m)| m.shares.iter().map(|f| format!("data/{f}/"))).collect();
+    for (_, d) in crate::ddl::dropped(lake).await? {
+        shared.extend(d.meta.shares.iter().chain(d.deleted.iter().flat_map(|m| &m.shares)).map(|f| format!("data/{f}/")));
+    }
     let mut puts = vec![];
     for ((key, mut meta), idle) in tables.into_iter().zip(idle) {
         let (old, keep): (Vec<_>, Vec<_>) = meta.garbage.drain(..).partition(|(_, ts)| *ts < files_cutoff);
         let (deletes, kept): (Vec<_>, Vec<_>) = meta.garbage_deletes.drain(..).partition(|(_, ts)| *ts < files_cutoff);
         if !old.is_empty() || !deletes.is_empty() || idle {
             let named = if deletes.is_empty() { Default::default() } else { named_deletes(lake, &meta).await? };
-            dead.extend(old.into_iter().chain(deletes).map(|(p, _)| p).filter(|p| !named.contains(p)));
+            dead.extend(old.into_iter().chain(deletes).map(|(p, _)| p).filter(|p| !named.contains(p) && !shared.iter().any(|f| p.starts_with(f))));
             (meta.garbage, meta.garbage_deletes) = (keep, kept);
             let garbage: std::collections::HashSet<&String> = meta.garbage.iter().map(|(p, _)| p).collect();
             meta.replaced.retain(|f| garbage.contains(&f.path));
@@ -746,7 +752,13 @@ async fn collect_orphans(lake: &Lake) -> Result<()> {
         tables.push((format!("t/{n}"), d.meta)); // (kept to be undropped: its files are in use)
         tables.extend(d.deleted.map(|m| (format!("t/{}", crate::sys::deleted(&n)), m)));
     }
-    let folders: std::collections::HashMap<String, &TableMeta> = tables.iter().map(|(k, m)| (key(&format!("data/{}", m.folder(&k[2..]))), m)).collect();
+    // (a folder's files are listed by its table, a table kept under its old name's, and its clones)
+    let mut folders: std::collections::HashMap<String, Vec<&TableMeta>> = Default::default();
+    for (k, m) in &tables {
+        for f in std::iter::once(m.folder(&k[2..])).chain(m.shares.iter().map(String::as_str)) {
+            folders.entry(key(&format!("data/{f}"))).or_default().push(m);
+        }
+    }
     let listed = lake.store.list_with_delimiter(Some(&Path::from("data"))).await?; // (one request a thousand folders)
     let gone = listed.common_prefixes.iter().map(|p| p.to_string()).filter(|p| !folders.contains_key(p));
     let parts: Vec<String> = std::iter::once("log".to_string()).chain(folders.keys().cloned()).chain(gone).collect();
@@ -766,15 +778,17 @@ async fn collect_orphans(lake: &Lake) -> Result<()> {
                 segments.iter().for_each(|(_, s)| used.add(&key(&s.path)));
                 used
             }
-            (_, Some(m)) => {
-                let mut used = Seen::of(m.files.len() + m.garbage.len() + m.garbage_deletes.len() + m.sealed.as_ref().map_or(0, |s| s.files as usize) + 64);
-                for manifest in crate::manifest::list(lake, m).await? {
-                    crate::manifest::files(lake, &manifest).await?.iter().flat_map(named).for_each(|p| used.add(&key(&p)));
-                    used.add(&key(&manifest.path));
+            (_, Some(all)) => {
+                let mut used = Seen::of(all.iter().map(|m| m.files.len() + m.garbage.len() + m.garbage_deletes.len() + m.sealed.as_ref().map_or(0, |s| s.files as usize) + 64).sum());
+                for m in all {
+                    for manifest in crate::manifest::list(lake, m).await? {
+                        crate::manifest::files(lake, &manifest).await?.iter().flat_map(named).for_each(|p| used.add(&key(&p)));
+                        used.add(&key(&manifest.path));
+                    }
+                    m.sealed.iter().for_each(|s| used.add(&key(&s.list)));
+                    m.files.iter().flat_map(named).for_each(|p| used.add(&key(&p)));
+                    m.garbage.iter().chain(&m.garbage_deletes).for_each(|(p, _)| used.add(&key(p)));
                 }
-                m.sealed.iter().for_each(|s| used.add(&key(&s.list)));
-                m.files.iter().flat_map(named).for_each(|p| used.add(&key(&p)));
-                m.garbage.iter().chain(&m.garbage_deletes).for_each(|(p, _)| used.add(&key(p)));
                 used
             }
             _ => Seen::of(0), // (a table gone: nothing there is in use)

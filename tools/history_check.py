@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""A table's past (ADR-043): UNDROP TABLE, each table's `retention`, and `t AT (VERSION => n |
-TIMESTAMP => t | OFFSET => -seconds)` against a model of every state the table went through.
+"""A table's past (ADR-043): UNDROP TABLE, each table's `retention`, `t AT (VERSION => n |
+TIMESTAMP => t | OFFSET => -seconds)` against a model of every state the table went through,
+RESTORE TABLE and zero-copy CLONE.
 
   history_check.py [--new target/release/pondra] [--work DIR] [--port 9760]
 
@@ -170,6 +171,61 @@ def history_check(bin, work, port):
     tier()
     gone = refused(f"SELECT * FROM short AT (VERSION => {first})")
     checks["AT refused by name: a keyed table, a time before the table's retention kept"] = "keyed table" in keyed and "its past is kept from version" in gone
+
+    # RESTORE: the table as it was, by one change (ids of rows changed since kept, unchanged rows untouched).
+    q("CREATE TABLE rs (id BIGINT, v VARCHAR)")
+    q("INSERT INTO rs SELECT x, 'v' FROM generate_series(1, 5) AS s(x)")
+    v1, every = n.get("/stats")["hwm"], "SELECT _row_id, _version, id, v FROM rs ORDER BY id"
+    was = rows(every)
+    q("UPDATE rs SET v = 'u' WHERE id = 1")
+    q("DELETE FROM rs WHERE id = 2")
+    q("INSERT INTO rs VALUES (6, 'new')")
+    tier()
+    time.sleep(0.05)
+    then = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="milliseconds")[:23]
+    before_restore = rows("SELECT id, v FROM rs ORDER BY id")
+    time.sleep(0.05)
+    q(f"RESTORE TABLE rs TO VERSION AS OF {v1}")
+    back = rows(every)
+    q(f"RESTORE TABLE rs TO TIMESTAMP AS OF '{then}'")
+    undone = rows("SELECT id, v FROM rs ORDER BY id")
+    checks["RESTORE TABLE … TO VERSION AS OF and TIMESTAMP AS OF: the rows as they were; a changed row keeps its _row_id, unchanged ones aren't rewritten; a RESTORE undone by another"] = \
+        [r[2:] for r in back] == [r[2:] for r in was] and back[0][0] == was[0][0] and back[0][1] > was[0][1] and back[2:] == was[2:] \
+        and undone == before_restore == [(1, "u"), (3, "v"), (4, "v"), (5, "v"), (6, "new")]
+
+    # CLONE: the source's files listed where they are, none copied; each table's writes its own.
+    q("CREATE TABLE src (id BIGINT, v VARCHAR)")
+    for i in range(9):  # (nine small files: the next round merges them)
+        q(f"INSERT INTO src SELECT x, 'f{i}' FROM generate_series({i * 100 + 1}, {i * 100 + 100}) AS s(x)")
+    q("UPDATE src SET v = 'changed' WHERE id % 50 = 0")
+    q("INSERT INTO src VALUES (5001, 'in the log')")
+    before_clone = n.get("/stats")["hwm"]
+    every = "SELECT _row_id, id, v FROM {} ORDER BY id"
+    source = rows(every.format("src"))
+    q("CREATE TABLE cl CLONE src")
+    cloned = rows(every.format("cl"))
+    copied = os.path.exists(os.path.join(lake, "data", "cl"))
+    files = lambda t: sorted(f for f in os.listdir(os.path.join(lake, "data", t)) if f.endswith(".parquet"))
+    src_files = files("src")
+    checks["CREATE TABLE c CLONE t: t's rows (ids, changes, those in the log), no file copied"] = \
+        cloned == source and len(source) == 901 and not copied and len(src_files) >= 9
+    q("INSERT INTO cl VALUES (7001, 'clone')")
+    q("UPDATE cl SET v = 'clone changed' WHERE id = 1")
+    q("DELETE FROM src WHERE id = 2")
+    apart = rows("SELECT (SELECT count(*) FROM src) AS a, (SELECT count(*) FROM cl) AS b, (SELECT v FROM src WHERE id = 1) AS c, (SELECT v FROM cl WHERE id = 1) AS d")
+    published = refused("ALTER TABLE cl SET (publish = 'delta')")
+    past = refused(f"SELECT count(*) FROM cl AT (VERSION => {before_clone - 1})")
+    # Both merge their small files, and the replaced ones pass their retention: none the other reads goes.
+    for _ in range(2):
+        tier()
+        time.sleep(11)
+    tier()
+    still, merged = all(f in files("src") for f in src_files), len(files("src")) > len(src_files)
+    q("DROP TABLE src PURGE")
+    after = rows("SELECT count(*), count(DISTINCT _row_id), sum(id) FROM cl")
+    checks["a clone and its source change apart; their merges and expiry, and the source dropped, take none of the other's files; refused: publishing a clone, its past before the clone"] = \
+        apart == [(900, 902, "f0", "clone changed")] and "is a clone" in published and "its past is kept from version" in past \
+        and still and merged and after == [(902, 902, sum(r[1] for r in source) + 7001)]
 
     # From `pondra sql`, with no node running.
     n.stop()

@@ -184,6 +184,7 @@ pub enum Ddl {
     DropSchema { name: String, if_exists: bool, cascade: bool },
     DropTable { name: String, if_exists: bool, #[serde(default)] purge: bool }, // (PURGE: not kept to be undropped)
     Undrop { name: String },                                                   // UNDROP TABLE (ADR-043)
+    Clone { name: String, from: String },                                      // CREATE TABLE c CLONE t: t's files, none copied (ADR-043)
     CreateView { name: String, sql: String, replace: bool },
     CreateExternal { name: String, sql: String, replace: bool, if_not_exists: bool }, // DataFusion's CREATE EXTERNAL TABLE: a view of files (`ext::external`)
     CreateMaterialized { name: String, sql: String, options: std::collections::BTreeMap<String, String> }, // (`views::options`)
@@ -228,6 +229,7 @@ pub async fn apply(lake: &Lake, d: Ddl) -> Result<Value> {
     let d = match d {
         Ddl::DropTable { name, if_exists, purge } => Ddl::DropTable { name: here(name), if_exists, purge },
         Ddl::Undrop { name } => Ddl::Undrop { name: here(name) },
+        Ddl::Clone { name, from } => Ddl::Clone { name: here(name), from: here(from) },
         Ddl::CreateView { name, sql, replace } => Ddl::CreateView { name: here(name), sql, replace },
         Ddl::CreateExternal { name, sql, replace, if_not_exists } => Ddl::CreateExternal { name: here(name), sql, replace, if_not_exists },
         Ddl::CreateMaterialized { name, sql, options } => Ddl::CreateMaterialized { name: here(name), sql, options },
@@ -296,6 +298,7 @@ pub async fn apply(lake: &Lake, d: Ddl) -> Result<Value> {
         }
         Ddl::DropTable { name, if_exists, purge } => drop_table(lake, &name, if_exists, purge).await,
         Ddl::Undrop { name } => undrop(lake, &new_name(lake, &name).await?).await,
+        Ddl::Clone { name, from } => clone(lake, &new_name(lake, &name).await?, &from).await,
         Ddl::CreateView { name, sql, replace } => create_view(lake, &name, sql, replace, false).await,
         Ddl::CreateExternal { name, sql, replace, if_not_exists } => {
             let name = new_name(lake, &name).await?;
@@ -721,6 +724,49 @@ async fn undrop(lake: &Lake, name: &str) -> Result<Value> {
     Ok(j!({"table": name, "undropped": true}))
 }
 
+/// `CREATE TABLE c CLONE t`: a table whose files are t's as they are now, none copied. Its rows in
+/// the log go to files first; then c lists t's files (and its changed rows' old versions') where
+/// they are, and writes its own to a folder of its own. Files in another table's folder are never
+/// deleted by expiry, only by the orphan sweep once no table lists them (`TableMeta::shares`), so
+/// t's merges, a drop of t, or c's own merges free nothing the other still reads. It isn't
+/// published (Delta and Iceberg name files under a table's folder), and its past starts now.
+async fn clone(lake: &Lake, name: &str, from: &str) -> Result<Value> {
+    let from = local(lake, from).ok_or_else(|| anyhow::anyhow!("{from} is an attached lake's: a clone is of a table in this lake"))?;
+    let taken = lake.cat.get::<TableMeta>(&table_key(name)).await?.is_some() || lake.cat.get::<StoredView>(&query_key(name)).await?.is_some()
+        || lake.cat.get::<Value>(&crate::views::view_key(name)).await?.is_some();
+    ensure!(!taken, "{name} exists already");
+    ensure!(lake.cat.get::<TableMeta>(&table_key(&from)).await?.is_some(), "no table {from}");
+    ensure!(!crate::sys::hidden(&from), "{from} is a hidden table");
+    let deleted = crate::sys::deleted(&from);
+    for _ in 0..10 {
+        if !to_files(lake, &[from.clone(), deleted.clone()]).await? {
+            continue;
+        }
+        let (at, now) = (lake.visible(), crate::log::now_ms());
+        let mut puts = vec![];
+        for (source, target) in [(from.clone(), name.to_string()), (deleted.clone(), crate::sys::deleted(name))] {
+            let Some(mut m) = lake.cat.get::<TableMeta>(&table_key(&source)).await? else { continue };
+            let folder = m.folder(&source).to_string();
+            m.shares.push(folder);
+            m.shares.sort();
+            m.shares.dedup();
+            m.folder = free_folder(lake, &target).await?;
+            m.tiered = at;
+            m.publish.clear();
+            m.garbage.clear(); // (the source's to delete, not ours)
+            m.garbage_deletes.clear();
+            m.replaced.clear();
+            if source == from {
+                m.past_from = Some((at, now));
+            }
+            puts.push((table_key(&target), json(&m)));
+        }
+        lake.cat.commit(puts, &[]).await?;
+        return Ok(j!({"table": name, "cloned": from}));
+    }
+    bail!("{from} kept taking rows while it was cloned: try again when its writers pause")
+}
+
 /// Send `tables`' rows in the log to files, up to its end. False if more came meanwhile.
 async fn to_files(lake: &Lake, tables: &[String]) -> Result<bool> {
     let mut late = false;
@@ -799,9 +845,14 @@ async fn rename(lake: &Lake, name: &str, to: &str) -> Result<Value> {
 /// renamed table keeps its folder, a dropped one while it can be undropped): then `name__2`, `name__3`… (characters a bucket's paths
 /// take as they are).
 pub async fn free_folder(lake: &Lake, name: &str) -> Result<Option<String>> {
-    let mut used: std::collections::HashSet<String> = lake.cat.scan::<TableMeta>("t/", "t0").await?.into_iter().map(|(k, m)| m.folder(&k[2..]).to_string()).collect();
+    let mut used: std::collections::HashSet<String> = Default::default();
+    for (k, m) in lake.cat.scan::<TableMeta>("t/", "t0").await? {
+        used.insert(m.folder(&k[2..]).to_string());
+        used.extend(m.shares); // (a clone's source's, even once the source is gone: ADR-043)
+    }
     for (n, d) in dropped(lake).await? {
         used.insert(d.meta.folder(&n).to_string()); // (kept to be undropped: ADR-043)
+        used.extend(d.meta.shares);
         used.extend(d.deleted.map(|m| m.folder(&crate::sys::deleted(&n)).to_string()));
     }
     Ok(match used.contains(name) {

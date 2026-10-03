@@ -219,3 +219,27 @@ async fn when(lake: &Lake, spec: &Spec) -> Result<At> {
         _ => At::Time(v.as_primitive::<datafusion::arrow::datatypes::TimestampMicrosecondType>().value(0)),
     })
 }
+
+/// `RESTORE TABLE t TO VERSION AS OF n` (or `TIMESTAMP AS OF …`, Delta's words): t's rows as they
+/// were then, by one MERGE from `t AT (…)`. A row changed since gets its old values back (its
+/// `_row_id` kept), a row made since goes, a row deleted since comes back as a new row. It is a
+/// change like any, so it can be undone the same way. None: not a RESTORE.
+pub async fn restore(lake: &Lake, sql: &str) -> Result<Option<String>> {
+    static RESTORE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r#"(?is)^\s*RESTORE\s+(?:TABLE\s+)?([\w."-]+)\s+(?:TO\s+)?(VERSION|TIMESTAMP)\s+AS\s+OF\s+(.+?)\s*;?\s*$"#).expect("a regex")
+    });
+    let Some(c) = RESTORE.captures(sql) else { return Ok(None) };
+    let name = c[1].split('.').map(|p| if p.starts_with('"') { p.trim_matches('"').to_string() } else { p.to_lowercase() }).collect::<Vec<_>>().join(".");
+    let t = crate::ddl::local(lake, &name).ok_or_else(|| anyhow!("RESTORE {name}: a table of this lake (run it on a node of {name}'s)"))?;
+    let meta: TableMeta = lake.cat.get(&table_key(&t)).await?.ok_or_else(|| anyhow!("no table {name}"))?;
+    let cols: Vec<String> = meta.live().map(|(_, n, _)| format!("\"{}\"", n.replace('"', "\"\""))).collect();
+    let all = |p: &str| cols.iter().map(|c| format!("{p}{c}")).collect::<Vec<_>>();
+    let changed = cols.iter().map(|c| format!("(__now.{c} IS DISTINCT FROM __was.{c})")).collect::<Vec<_>>().join(" OR ");
+    let set = cols.iter().map(|c| format!("{c} = __was.{c}")).collect::<Vec<_>>().join(", ");
+    let target = &c[1];
+    Ok(Some(format!(
+        "MERGE INTO {target} AS __now USING (SELECT _row_id AS __row, {} FROM {target} AT ({} => {})) AS __was ON __now._row_id = __was.__row \
+         WHEN MATCHED AND ({changed}) THEN UPDATE SET {set} WHEN NOT MATCHED THEN INSERT ({}) VALUES ({}) WHEN NOT MATCHED BY SOURCE THEN DELETE",
+        cols.join(", "), &c[2], &c[3], cols.join(", "), all("__was.").join(", ")
+    )))
+}
