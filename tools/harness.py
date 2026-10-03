@@ -3990,9 +3990,10 @@ def ids():
             if got[-1][1] == -1:
                 break
         c.close()
-        checks["a segment of 2^24 + 10 rows of a table takes two numbers; a consumer seeking into the second reads on from there, then the next segment"] = took == 2 \
+        # (at least two: the node's own commits, history's or a tiering round's, may land while the append runs)
+        checks["a segment of 2^24 + 10 rows of a table takes two numbers; a consumer seeking into the second reads on from there, then the next segment"] = took >= 2 \
             and [v for _, v in got] == [(1 << 24) + k for k in range(5, 10)] + [-1] and [o for o, _ in got][:5] == [(seg << 24) + (1 << 24) + k for k in range(5, 10)] \
-            and got[-1][0] >> 24 == seg + 2
+            and got[-1][0] >> 24 >= seg + 2
     node.kill()
     ok = all(checks.values())
     print(json.dumps({"ids": checks, "ok": ok}, indent=1))
