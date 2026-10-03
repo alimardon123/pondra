@@ -3149,6 +3149,23 @@ $$""")
         print("format:", fmt, "| broken:", broken_fmt, "| has:", has)
     logged = q("SELECT args FROM pondra.runs WHERE routine = 'do' AND args LIKE '%time.sleep(60)%'")
     checks["the run log names a DO block by its code (pondra.runs.args: language and code)"] = bool(logged) and json.loads(logged[0]["args"]).get("language") == "python"
+    # The ways people write them (the design review): a procedure's body after AS, no $$, its
+    # parameters `$n` with `=` defaults; a function's `$x`, untyped parameters (DuckDB's macro), a
+    # table function's `$k` given its value; a `$name` that isn't a parameter, refused as made.
+    q("CREATE PROCEDURE plain($n BIGINT = 5) AS BEGIN\n  IF $n > 3 THEN PRINT 'big ' || $n; END IF;\n  SELECT $n * 2 AS n;\nEND;")
+    q("CREATE PROCEDURE one(n BIGINT) AS SELECT $n + 1 AS n")
+    q("CREATE FUNCTION twice(x) AS $x * 2")
+    q("CREATE FUNCTION upto(k BIGINT) RETURNS TABLE (v BIGINT) AS $$ SELECT value AS v FROM generate_series(1, $k) $$")
+    plain_said = urllib.request.urlopen(urllib.request.Request(f"http://127.0.0.1:{A.port}/sql", b"CALL plain()", headers={"authorization": "Bearer a-tok"}), timeout=120)
+    written = {"default": q("CALL plain()"), "given": q("CALL plain(n => 2)"), "one statement": q("CALL one(2)"), "untyped": q("SELECT twice(21) AS a, twice(1.5) AS b"),
+               "table": q("SELECT count(*) AS n FROM upto(4)"), "stray": err("CREATE FUNCTION stray(x INT) RETURNS INT RETURN x + $y"),
+               "python": err("CREATE PROCEDURE py() LANGUAGE python AS BEGIN SELECT 1; END"), "notices": plain_said.headers.get("x-pondra-notices") or ""}
+    checks["written as people write them: CREATE PROCEDURE p($n BIGINT = 5) AS BEGIN … END (or one statement), a function's $x, f(x) untyped, a table function's $k; $y refused as made"] = (
+        written["default"] == [{"n": 10}] and written["given"] == [{"n": 4}] and written["one statement"] == [{"n": 3}]
+        and written["untyped"] == [{"a": 42, "b": 3.0}] and written["table"] == [{"n": 4}] and "there is no parameter $y" in written["stray"]
+        and "Python procedure's body is a string" in written["python"] and "big 5" in written["notices"])
+    if not checks["written as people write them: CREATE PROCEDURE p($n BIGINT = 5) AS BEGIN … END (or one statement), a function's $x, f(x) untyped, a table function's $k; $y refused as made"]:
+        print("written:", written)
     for n in nodes:
         n.kill()
     # a node on another address with --python and no tokens refuses to start; `pondra run` runs a file
@@ -6414,6 +6431,21 @@ SELECT $big AS big, $t AS t, $c AS c, (SELECT count(*) FROM made_a) + (SELECT co
     checks["VALUES with a subquery: in a loop, a transaction, over Postgres, as a query"] = (
         got["tally"] == [{"k": 1, "n": 0}, {"k": 2, "n": 1}, {"k": 3, "n": 2}, {"k": 4, "n": 2}, {"k": 5, "n": 4}]
         and got["values"] == [{"column1": 5, "column2": "rows"}, {"column1": 0, "column2": "none"}])
+    # The ways people write it (the design review): a bare END closes any block, FOR $r, SET $x = and
+    # :=, AWAIT alone waits for all; END of another kind where a block ends is refused.
+    got["forgiving"] = q("""BEGIN
+  DECLARE $t INT := 0;
+  FOR $r IN (SELECT value AS v FROM generate_series(1, 4)) DO
+    IF $r.v % 2 = 0 THEN SET $t = $t + $r.v; END;
+  END;
+  ASYNC INSERT INTO tally VALUES (100, 0);
+  AWAIT;
+  $t := $t * 10;
+  SELECT $t AS t, (SELECT count(*) FROM tally WHERE k = 100) AS async;
+END""", {})
+    got["wrong end"] = _raises_text(lambda: q("BEGIN IF true THEN SELECT 1; END LOOP; END", {}))
+    checks["written as people write it: a bare END closes any block, FOR $r, SET $x = and :=, AWAIT alone; END LOOP where an IF ends is refused"] = (
+        got["forgiving"] == [{"t": 60, "async": 1}] and "END LOOP where the IF" in got["wrong end"])
     # What deciding costs: a loop that reads only variables.
     t0 = time.time()
     q("DECLARE $i = 0; WHILE $i < 200 DO $i = $i + 1; END WHILE", {})

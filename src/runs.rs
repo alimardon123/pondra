@@ -394,14 +394,9 @@ pub fn task(p: &mut Parser, sql: &str) -> Result<(String, Task)> {
     Ok((name, task))
 }
 
-/// Is `sql` a `CREATE TASK`? (Its `$name`s are bound as it runs, not as it is made.)
-pub fn creates_task(sql: &str) -> bool {
-    static HEAD: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?is)^\s*create\s+(?:or\s+replace\s+)?task\b").expect("a regex"));
-    HEAD.is_match(crate::write::first_word(sql))
-}
 
 /// Where a token starts in `sql` (sqlparser counts lines and characters from 1).
-fn offset(sql: &str, at: datafusion::sql::sqlparser::tokenizer::Location) -> usize {
+pub(crate) fn offset(sql: &str, at: datafusion::sql::sqlparser::tokenizer::Location) -> usize {
     let mut from = 0;
     for (n, line) in sql.split_inclusive('\n').enumerate() {
         if n + 1 == at.line as usize {
