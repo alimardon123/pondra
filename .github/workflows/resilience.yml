@@ -2,7 +2,7 @@ name: resilience
 
 # Pondra under failure, each way it runs (tools/resilience_check.py), with writers and readers
 # going the whole time: a bucket that errs, slows, loses replies and goes down; a leader cut off
-# from it alone; the Python and JavaScript clients, Postgres and Kafka through nodes killed; a
+# from it alone; the Python and JavaScript clients, Postgres, Kafka and Arrow Flight through nodes killed; a
 # lake's disk and the nodes' cache disk full; a database's node and its server killed; `pondra
 # sql` killed mid-INSERT. Every acknowledged write must be there once, on every node. It runs the
 # binary the build workflow made for this commit (tools/ci_artifact.sh waits for it): nothing is
@@ -50,7 +50,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        parts: ["storage cutoff", "clients doors server", "disk cache cli"]
+        parts: ["storage cutoff", "clients doors flight server", "disk cache cli"]
     runs-on: ubuntu-24.04
     timeout-minutes: 100 # (most of it waiting for the build's packages)
     steps:
