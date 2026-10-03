@@ -271,7 +271,12 @@ class Bucketed:
             if n is not None and (not left or left[-1][1] != n):
                 left.append((round(time.time() - t0, 1), n))
             return n == 0
-        ok = until(drained, 90)
+        # A tiering job that began while the bucket failed may still be retrying a request: the
+        # store retries one for up to 180 s (object_store's retry_timeout), and a PUT whose reply
+        # was lost then fails as "already exists", so the round runs again. 90 s failed now and
+        # then (the leader's log: a job's PUT failing after 120-170 s); a log that stops draining
+        # stays undrained however long we wait.
+        ok = until(drained, 240)
         info["the log after the faults (s, rows still in it)"] = left[:3] + ["…"] + left[-6:] if len(left) > 10 else left
         check("the log drains into files once the bucket is well", ok, stats(one_leader(nodes) or nodes[0]))
 
