@@ -6370,6 +6370,18 @@ SELECT $big AS big, $t AS t, $c AS c, (SELECT count(*) FROM made_a) + (SELECT co
         timed[how.strip() or "one at a time"] = round(time.time() - t0, 2)
     info["eight 0.3 s calls, s"] = timed
     checks["eight 0.3 s calls PARALLEL 8 take under 0.6 of the time one at a time does"] = timed["PARALLEL 8"] < 0.6 * timed["one at a time"]
+    # VALUES with a subquery in a row (DataFusion worked the rows out before the subquery ran): in a
+    # loop, a transaction, over Postgres with a parameter, and as a query.
+    q("CREATE TABLE tally (k BIGINT, n BIGINT)")
+    q("FOR d IN (SELECT value AS v FROM generate_series(1, 3)) DO INSERT INTO tally VALUES ($d.v, (SELECT count(*) FROM tally)); END FOR", {})
+    q("BEGIN; INSERT INTO tally (n, k) VALUES ((SELECT max(n) FROM tally), 4); COMMIT", {})
+    with psycopg.connect(f"host=127.0.0.1 port={pg} user=pondra dbname=pondra", autocommit=True) as c:
+        c.execute("INSERT INTO tally VALUES (%s, (SELECT count(*) FROM tally))", (5,))
+    got["tally"] = q("SELECT k, n FROM tally ORDER BY k")
+    got["values"] = q("SELECT * FROM (VALUES ((SELECT count(*) FROM tally), 'rows'), (0, 'none')) ORDER BY column1 DESC")
+    checks["VALUES with a subquery: in a loop, a transaction, over Postgres, as a query"] = (
+        got["tally"] == [{"k": 1, "n": 0}, {"k": 2, "n": 1}, {"k": 3, "n": 2}, {"k": 4, "n": 2}, {"k": 5, "n": 4}]
+        and got["values"] == [{"column1": 5, "column2": "rows"}, {"column1": 0, "column2": "none"}])
     # What deciding costs: a loop that reads only variables.
     t0 = time.time()
     q("DECLARE $i = 0; WHILE $i < 200 DO $i = $i + 1; END WHILE", {})
