@@ -114,10 +114,21 @@ pub async fn local<F: std::future::Future>(f: F) -> F::Output { OWN.scope(Vars::
 
 /// A copy of the variables in force, for work that runs beside its script (`PARALLEL`, `ASYNC`):
 /// what it sets stays its own.
-pub fn snapshot() -> Vars { Arc::new(Mutex::new(vars(|m| m.clone()).unwrap_or_default())) }
+pub fn snapshot() -> Apart {
+    let given = GIVEN.try_with(|g| Arc::new(Mutex::new(g.lock().unwrap().clone()))).ok();
+    Apart { own: Arc::new(Mutex::new(vars(|m| m.clone()).unwrap_or_default())), given }
+}
 
-/// Run `f` with `own` as its variables (a `snapshot`).
-pub async fn with_own<F: std::future::Future>(own: Vars, f: F) -> F::Output { OWN.scope(own, f).await }
+/// A copy of the variables and of the run's given values, for what runs beside the rest (a
+/// `PARALLEL` pass, an `ASYNC` statement): what it sets, or takes of the given values, stays its
+/// own. (Sharing the given values, the first pass to set `$n` took it from all the others.)
+pub struct Apart {
+    pub own: Vars,
+    given: Option<Given>,
+}
+
+/// Run `f` with a `snapshot` as its variables and given values.
+pub async fn with_own<F: std::future::Future>(a: Apart, f: F) -> F::Output { within(Some(Lent(Some(a.own), a.given)), f).await }
 
 /// A variable's value now (a block keeps it, to put back when it ends: `script.rs`).
 pub fn get(name: &str) -> Option<Var> { vars(|m| m.get(name).cloned()).ok().flatten() }

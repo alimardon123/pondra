@@ -57,6 +57,20 @@ tokio::task_local! {
 /// The principal of the request being served (None: no door set one: this process's own work).
 pub fn current() -> Option<Principal> { WHO.try_with(|p| p.clone()).ok() }
 
+/// `f` as the request that makes it, for work it starts and doesn't wait for (`pondra.start`): the
+/// same user (its grants) and session. A spawned task keeps no task-local, and with no principal a
+/// started procedure ran with its role's every right, past the user's grants.
+pub fn carried<F: std::future::Future>(f: F) -> impl std::future::Future<Output = F::Output> {
+    let (who, session) = (current(), crate::temp::current());
+    async move {
+        let f = crate::temp::SESSION.scope(session, f);
+        match who {
+            Some(p) => WHO.scope(p, f).await,
+            None => f.await,
+        }
+    }
+}
+
 /// May the request being served read every column of `table`? Refused with why, if not.
 pub fn check_all(table: &str) -> Result<()> {
     match current() {

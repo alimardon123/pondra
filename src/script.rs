@@ -292,7 +292,13 @@ impl<'a> Reader<'a> {
             if self.i >= self.t.len() || self.word_at(self.i).is_some_and(|w| stop.contains(&w.as_str())) {
                 return Ok(out);
             }
-            out.push((self.at(), self.step()?));
+            let (at, i) = (self.at(), self.i);
+            out.push((at, self.step()?));
+            // (a `)` with nothing open is where no step starts: taking none, the loop went on for good)
+            if self.i == i {
+                let x = self.t[i];
+                bail!("line {}: {} where a statement starts", self.line(x.at), &self.text[x.at..x.end]);
+            }
         }
     }
     fn step(&mut self) -> Result<Box<dyn Step>> {
@@ -596,7 +602,7 @@ impl<'a> Runner<'a> {
         let run = |(n, row): (usize, Vec<(String, crate::vars::Var)>)| {
             let (mut child, own, stop) = (self.child(), crate::vars::snapshot(), &stop);
             child.rows.push(var.to_string());
-            own.lock().unwrap().extend(row);
+            own.own.lock().unwrap().extend(row);
             crate::vars::with_own(own, async move {
                 if stop.load(std::sync::atomic::Ordering::Relaxed) {
                     return Ok(());
@@ -665,8 +671,11 @@ impl<'a> Runner<'a> {
         let t = tokens(&s);
         for i in (0..t.len().saturating_sub(2)).rev() {
             let (v, dot, col) = (t[i], t[i + 1], t[i + 2]);
+            if v.k != K::Var {
+                continue; // (and only a `$name` is cut after its `$`: a word may start with a wide character)
+            }
             let row = &s[v.at + 1..v.end];
-            if v.k == K::Var && dot.at == v.end && &s[dot.at..dot.end] == "." && col.k == K::Word && col.at == dot.end && self.rows.iter().any(|r| r == row) {
+            if dot.at == v.end && &s[dot.at..dot.end] == "." && col.k == K::Word && col.at == dot.end && self.rows.iter().any(|r| r == row) {
                 let to = format!("${row}__{}", s[col.at..col.end].to_lowercase());
                 s.replace_range(v.at..col.end, &to);
             }
@@ -1198,7 +1207,7 @@ impl Step for Say {
                 }
                 Say::Raise { level, args } => {
                     let all = r.texts(args).await?;
-                    let text = format(all.first().cloned().flatten().as_deref().unwrap_or(""), &all[1..]);
+                    let text = format(all.first().cloned().flatten().as_deref().unwrap_or(""), all.get(1..).unwrap_or_default());
                     match level.as_deref() {
                         None => return Err(crate::codes::coded("P0001", text)),
                         Some("warning") => crate::routines::heard(&format!("WARNING: {text}")),

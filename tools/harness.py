@@ -5801,7 +5801,8 @@ def stopped():
     """A run whose node stopped under it (round 29 part 3): a procedure started without waiting
     (pondra.start) is `running` in pondra.runs; the node is killed (-9) and started again at the
     same address; the run is then `stopped`, saying whose node, not `running` for good. A run on
-    a node still up is left alone."""
+    a node still up is left alone. A follower killed for good: the leader marks its run once the
+    node has been gone a minute."""
     here = os.path.dirname(os.path.abspath(__file__))
     env = {"PYTHONPATH": os.path.join(here, "..", "python")}
     lake = new_lake()
@@ -5817,11 +5818,22 @@ def stopped():
     short_run = sql(A.port, "SELECT pondra.start('slow', 3.0) AS run")[0]["run"]
     mid = until(lambda: status(short_run).get("status"), "running", 30)
     done = until(lambda: status(short_run).get("status"), "ok", 60)
+    # A follower killed for good: the leader marks its run once it has been gone a minute (it reads
+    # the log when a node leaves, not every 30 s).
+    other = Node(lake, A.port + 1, env=env, python=sys.executable).start()
+    until(lambda: len(call(A.port, "GET", "/stats")["nodes"]), 2, 30)
+    gone_run = sql(A.port + 1, "SELECT pondra.start('slow', 600.0) AS run")[0]["run"]
+    gone_running = until(lambda: status(gone_run).get("status"), "running", 30)
+    other.kill()
+    t0 = time.time()
+    gone_after = until(lambda: status(gone_run).get("status"), "stopped", 180)
+    gone_secs, gone_said = round(time.time() - t0, 1), status(gone_run).get("error") or ""
     checks = {"a run whose node was killed and started again: stopped, saying whose node, not running for good": running == "running" and after == "stopped" and f"127.0.0.1:{A.port}" in said and "stopped while it ran" in said,
-              "a run on the node that is up: running, then ok": mid == "running" and done == "ok"}
+              "a run on the node that is up: running, then ok": mid == "running" and done == "ok",
+              "a run on a follower killed for good: stopped by the leader once the node has been gone a minute": gone_running == "running" and gone_after == "stopped" and f"127.0.0.1:{A.port + 1}" in gone_said}
     node.kill()
     ok = all(checks.values())
-    print(json.dumps({"stopped": checks, "ok": ok, "info": {"said": said, "statuses": [running, after, mid, done]}}, indent=1, default=str))
+    print(json.dumps({"stopped": checks, "ok": ok, "info": {"said": said, "statuses": [running, after, mid, done], "a follower's run marked after (s)": gone_secs}}, indent=1, default=str))
     return ok
 
 
@@ -6635,7 +6647,7 @@ def tasks():
     from a follower; WHEN false skips a task and what follows it still runs; retries with the same
     job (what a try wrote lands once), refused while a run is under way; a timeout, on_failure and
     nothing after a failure; ALTER TASK SUSPEND and RESUME; refusals (a loop, two schedules, a
-    missing task, DROP of a followed one); a graph through a leader failover, each write once."""
+    missing task, DROP of a followed one, a schedule too long to count or that never comes); a graph through a leader failover, each write once."""
     lake = new_lake()
     py = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "python")
     nodes = [Node(lake, A.port + i, python=sys.executable, env={"PYTHONPATH": py}).start() for i in range(3)]
@@ -6764,11 +6776,17 @@ console.log("done"); await db.close();"""
         "followed": err("DROP TASK load"),
         "no task": err("EXECUTE TASK nothing"),
         "an option": err("CREATE TASK opt SCHEDULE '1 hour' WITH (tries = 2) AS SELECT 1"),
+        # (taken, 4611686018427387904 minutes wrapped around to 0 s and the leader's loop divided by
+        # it: the node stopped, and again each time it started)
+        "too long": err("CREATE TASK huge SCHEDULE '4611686018427387904 minutes' AS SELECT 1"),
+        "never": err("CREATE TASK feb30 SCHEDULE 'cron 0 0 30 2 *' AS SELECT 1"),
     }
-    checks["refused by name: a task after itself, a loop, two schedules, a missing task, DROP of a followed one, EXECUTE of none, an unknown option"] = (
+    checks["refused by name: a task after itself, a loop, two schedules, a missing task, DROP of a followed one, EXECUTE of none, an unknown option, "
+           "a schedule past a hundred years or a day that never comes (the nodes still up)"] = (
         "follow itself" in refused["itself"] and "follow itself" in refused["a loop"] and "2 different schedules" in refused["two schedules"]
         and "no task nothing" in refused["missing"] and "runs after load" in refused["followed"] and "no task nothing" in refused["no task"]
-        and "retries, retry_delay" in refused["an option"] and status("root") == "ok")
+        and "retries, retry_delay" in refused["an option"] and "a hundred years" in refused["too long"] and "never comes" in refused["never"]
+        and (time.sleep(1.5) or all(n.alive() for n in nodes)) and status("root") == "ok")
     # A graph through a leader failover: the task under way runs again on the new leader, with its job.
     q("CREATE TABLE flog (task VARCHAR, v BIGINT)")
     q("CREATE TASK froot SCHEDULE '1 hour' AS SELECT 1")

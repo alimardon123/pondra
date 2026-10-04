@@ -184,6 +184,25 @@ pub enum Use {
     Procedure { nested: bool },
 }
 
+tokio::task_local! {
+    /// Set in what a Python procedure, a session's cell or a file's run calls while it holds one of
+    /// the node's slots for them (its calls back come with its lent token: `server::sql`): those
+    /// take none, since they would wait for their caller's. Anything else takes one, however deep
+    /// it is called (a SQL procedure calling a Python one took none, so there was no limit).
+    static HELD: ();
+}
+
+/// Does the work under way run for one that holds a procedure's slot?
+pub fn holding() -> bool { HELD.try_with(|_| ()).is_ok() }
+
+/// `f`, run for one that holds a procedure's slot if `yes`.
+pub async fn holder<F: std::future::Future>(yes: bool, f: F) -> F::Output {
+    match yes {
+        true => HELD.scope((), f).await,
+        false => f.await,
+    }
+}
+
 /// The workers of one set of packages (`WITH (packages = …)`; most routines: none).
 struct Pool {
     path: Option<String>, // where its packages are (PYTHONPATH), if any
@@ -489,7 +508,10 @@ pub async fn ask_session(session: &str, head: Value, parts: Vec<Vec<u8>>, limit:
         e.0.clone()
     };
     let mut kernel = slot.lock().await; // (a session's cells, one after another)
-    let _slot = pool("").await?.procedures.clone().acquire_owned().await?; // (as a procedure: the node's slots for them)
+    let _slot = match holding() { // (as a procedure: the node's slots for them; a run inside one holds its caller's)
+        true => None,
+        false => Some(pool("").await?.procedures.clone().acquire_owned().await?),
+    };
     if kernel.as_mut().is_some_and(|k| k.worker.child.try_wait().ok().flatten().is_some()) {
         *kernel = None;
         notice("Python started again: this session's worker had stopped, and the variables it held are gone".into());
