@@ -50,13 +50,13 @@ def rss_mb(n):
         return None
 
 
-def writes(x):
-    """The object-store writes a node made since it started (`/metrics`), or None."""
+def gauges(x):
+    """A node's `/metrics`, {name with its labels: value}, or {}."""
     try:
         text = x.get("/metrics", timeout=10).decode()
-        return int(float(next(l.split()[-1] for l in text.splitlines() if l.startswith('pondra_object_requests_total{op="write"}'))))
+        return {l.rsplit(" ", 1)[0]: float(l.rsplit(" ", 1)[1]) for l in text.splitlines() if l.startswith("pondra_")}
     except Exception:
-        return None
+        return {}
 
 
 def objects(lake):
@@ -139,13 +139,14 @@ def main():
         time.sleep(max(0, mark + (60 if secs > 600 else 10) - time.time()))
         leader = next((x for x in live if role_or(x, role) == "leader"), None)
         stats = leader.get("/stats", timeout=10) if leader else {}
-        listed, now_wrote = None, {x.port: writes(x) for x in live}
+        got = {x.port: gauges(x) for x in live}
+        listed, now_wrote = None, {p: int(g['pondra_object_requests_total{op="write"}']) if 'pondra_object_requests_total{op="write"}' in g else None for p, g in got.items()}
         # (a node started again counts from 0: its writes since are its count)
         made = sum(w - (wrote.get(p) or 0) if w >= (wrote.get(p) or 0) else w for p, w in now_wrote.items() if w is not None)
         span, wrote = time.time() - (samples[-1]["at"] if samples else start), now_wrote
         if not A.s3 or time.time() - last_list > 1800:
             listed, last_list = objects(lake), time.time()
-        line = {"t": round(was["elapsed"] + time.time() - start), "at": time.time(), "object_writes_per_s": round(made / max(span, 1), 1), "rss_mb": {x.port: rss_mb(x) for x in live}, "pids": {x.port: x.p.pid for x in live},
+        line = {"t": round(was["elapsed"] + time.time() - start), "at": time.time(), "object_writes_per_s": round(made / max(span, 1), 1), "rss_mb": {x.port: rss_mb(x) for x in live}, "hot_mb": {p: round(g.get("pondra_hot_bytes", 0) / 2**20) for p, g in got.items()}, "pids": {x.port: x.p.pid for x in live},
                 "untiered_rows": stats.get("untiered_rows"), "commit_ms_p95": stats.get("commit_ms_p95"),
                 "longest_ack_s": load.longest(mark), "acked": sum(load.acked.values()),
                 "torn": len(load.torn), **({"objects": listed} if listed else {})}
@@ -191,17 +192,20 @@ def main():
                                                          and same("SELECT count(*) AS n FROM ev") and same("SELECT * FROM per_producer ORDER BY producer"))
     checks["the log drains: no rows left untiered two minutes after the load"] = bool(drained)
     # Memory: each process's (a node started again is another) over its life, if it lived ten
-    # samples: the median of its last tenth against that of its second (the first is warm-up).
+    # samples: the median of its last tenth against that of its second (the first is warm-up),
+    # less its hot columns: a cache of the columns read lately, which grows with the tables up to
+    # its own limit (hot.rs) and gives memory back past three fifths of the machine.
     lives = collections.defaultdict(list)
     for s in samples:
         for port, pid in s["pids"].items():
             if s["rss_mb"].get(port):
-                lives[(port, pid)].append(s["rss_mb"][port])
+                lives[(port, pid)].append(s["rss_mb"][port] - s.get("hot_mb", {}).get(port, 0))
     median = lambda xs: sorted(xs)[len(xs) // 2]
     drift = {f"{port} (pid {pid})": {"early_mb": median(xs[len(xs) // 10:max(2, 2 * len(xs) // 10)]), "late_mb": median(xs[-max(1, len(xs) // 10):]), "samples": len(xs)}
              for (port, pid), xs in lives.items() if len(xs) >= 10}
     info["memory"] = drift
-    checks["memory flat: each node's last tenth within 1.5x (+64 MB) of its second"] = bool(drift) and all(d["late_mb"] <= d["early_mb"] * 1.5 + 64 for d in drift.values())
+    info["hot columns at the end, MB"] = samples[-1].get("hot_mb") if samples else None
+    checks["memory flat (less the hot columns' cache): each node's last tenth within 1.5x (+64 MB) of its second"] = bool(drift) and all(d["late_mb"] <= d["early_mb"] * 1.5 + 64 for d in drift.values())
     end = objects(lake)
     info["objects at the end"] = end
     info["object writes a second (every node)"] = round(sum(s["object_writes_per_s"] for s in samples[1:]) / max(1, len(samples) - 1), 1)
