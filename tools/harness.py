@@ -299,6 +299,13 @@ def external():
     checks["what it can't do, it says: INSERT into one file, UPDATE, Avro, gzip, no files, TEMPORARY, an option it doesn't read, INSERT into a view; others' files need the owner"] = \
         "view of a folder" in said["one file"] and "UPDATE" in said["update"] and "avro" in said["avro"] and "gzip" in said["gzip"] and "no files" in said["none"] \
         and "TEMP VIEW" in said["temp"] and "null_regex" in said["option"] and "is a view" in said["view"] and "program that started the node" in said["not owner"]
+    # A lake table's files are the lake's: LOCATION was dropped and the table made in the lake; and
+    # a DELETE of an attached Delta table read "no table" with its path.
+    placed = err(f"CREATE TABLE placed (id BIGINT) LOCATION '{here}/placed/'")
+    q(f"COPY (SELECT 1 AS id) TO '{here}/wh/s/t/' (FORMAT delta)"); q(f"ATTACH '{here}/wh' AS wh (TYPE delta)")
+    checks["CREATE TABLE … LOCATION refused by name, nothing made; DELETE of an attached Delta table refused by name"] = "LOCATION" in placed and "not found" in err("SELECT * FROM placed") \
+        and "another engine's table" in err("DELETE FROM wh.s.t WHERE id = 1") and q("SELECT count(*) AS n FROM wh.s.t") == [{"n": 1}]
+    q("DETACH wh")
     # The lake's own files (PUT /files/…) are the lake's: whoever reads the lake reads them as a
     # table too, and nothing else of its folder (ADR-032); /objects says what each object is.
     call(A.port, "PUT", "/files/reports/q1.csv", b"a,b\n1,x\n")
