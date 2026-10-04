@@ -47,6 +47,26 @@ pub struct View {
     /// What each of its rows should meet (ADR-036 §2).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub expect: Vec<Expect>,
+    /// `… GROUP BY <a time bucket> EMIT FINAL`: each group once, when it's over (ADR-052).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub once: Option<Once>,
+}
+
+/// A view that keeps each group once, when it's over (`EMIT FINAL`). Its GROUP BY has one
+/// expression that only grows with a timestamp column of its source (`time`): `bucket`, with that
+/// column written `"time"`, which is its table's column `column`. A group is over once the bucket
+/// of the watermark is past it, so any such expression works, not a list of window functions. The
+/// view's entry and its partial rows are `{into}$open`; the groups that are over go to `into`, the
+/// name it was given, once (producer `emit:{into}$open`, its seq the watermark they were cut at).
+#[derive(Serialize, Deserialize, Clone)]
+pub struct Once {
+    pub into: String,
+    pub column: String,
+    pub time: String,
+    pub bucket: String,
+    pub lateness_secs: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_secs: Option<u64>,
 }
 
 /// An expectation, as Databricks' pipelines have them: a condition each of a view's rows should
@@ -156,11 +176,16 @@ pub struct Sessions {
     pub lateness_secs: u64,
     #[serde(default)]
     pub keys: Vec<String>,
+    /// `WITH (idle = '1 minute')`: once no row has come for that long, time moves on with the clock.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_secs: Option<u64>,
 }
 
 pub fn view_key(name: &str) -> String { format!("v/{name}") }
 
 impl View {
+    /// Its name as it was given (an `EMIT FINAL` view's entry is `{name}$open`).
+    pub fn shown<'a>(&'a self, name: &'a str) -> &'a str { self.once.as_ref().map_or(name, |o| o.into.as_str()) }
     /// Does this view follow `table`'s rows (its source, or either side of a stream join)?
     pub fn follows(&self, table: &str) -> bool { self.source == table || self.join.as_ref().is_some_and(|j| j.tables.iter().any(|t| t == table)) }
 }
@@ -177,15 +202,36 @@ pub struct Options {
     pub expect: Vec<Expect>,
     pub history: Option<History>,
     pub delete_when: Option<String>,
+    /// `EMIT FINAL` (`emit = 'final'`): each group once, when it's over (`once::create`).
+    pub once: bool,
+    pub lateness_secs: u64,
+    pub idle_secs: Option<u64>,
+    /// What `once::create` found: the view keeps its groups in `{v}$open` and each once in `v`.
+    pub keep: Option<Once>,
 }
 
 pub fn options(kv: &std::collections::BTreeMap<String, String>) -> Result<Options> {
-    const KNOWN: [&str; 13] = ["window", "size_secs", "slide_secs", "lateness_secs", "session", "gap_secs", "join", "time", "within_secs", "expect", "history", "sequence_by", "delete_when"];
+    const KNOWN: [&str; 16] = ["lateness", "idle", "emit", "window", "size_secs", "slide_secs", "lateness_secs", "session", "gap_secs", "join", "time", "within_secs", "expect", "history", "sequence_by", "delete_when"];
     if let Some(k) = kv.keys().find(|k| !KNOWN.contains(&k.as_str())) {
         bail!("{k}: a materialized view's options are {}", KNOWN.join(", "));
     }
     let num = |k: &str, d: u64| kv.get(k).map_or(Ok(d), |v| v.parse::<u64>().map_err(|_| anyhow::anyhow!("{k} is a number of seconds")));
-    let lateness_secs = num("lateness_secs", 0)?;
+    // (`lateness = '10 seconds'`, `idle = '1 minute'`: times as SQL writes them; `lateness_secs` the older form)
+    let time = |k: &str| kv.get(k).map(|v| match v.trim().parse::<u64>() {
+        Ok(n) => Ok(n),
+        Err(_) if v.split_whitespace().next().is_some_and(|n| n.parse() == Ok(0u64)) => Ok(0),
+        Err(_) => crate::layout::seconds(v).with_context(|| format!("{k}")),
+    }).transpose();
+    ensure!(!(kv.contains_key("lateness") && kv.contains_key("lateness_secs")), "lateness and lateness_secs say the same: give one");
+    let lateness_secs = match time("lateness")? { Some(l) => l, None => num("lateness_secs", 0)? };
+    let idle_secs = time("idle")?.filter(|&s| s > 0);
+    let once = match kv.get("emit").map(|e| e.to_lowercase()) {
+        Some(e) if e == "final" => true,
+        Some(e) => bail!("emit = '{e}': a view's query ends EMIT FINAL to keep each group once, when it's over"),
+        None => false,
+    };
+    ensure!(!once || !kv.contains_key("window"), "EMIT FINAL finds its window in the GROUP BY: leave out window = '…' and size_secs");
+    ensure!(idle_secs.is_none() || once || kv.contains_key("session"), "idle moves time on for a view that keeps what is over: its query ends EMIT FINAL");
     let slide_secs = kv.get("slide_secs").map(|_| num("slide_secs", 0)).transpose()?;
     let emit = kv.get("window").map(|w| Ok::<_, anyhow::Error>(Emit { window: w.clone(), size_secs: num("size_secs", 60)?, lateness_secs, time: None, slide_secs })).transpose()?;
     if let Some(e) = &emit {
@@ -198,7 +244,7 @@ pub fn options(kv: &std::collections::BTreeMap<String, String>) -> Result<Option
         None => None,
     };
     ensure!(join.as_ref().is_none_or(|j| j.within_secs.is_none() || !j.time.is_empty()), "within_secs needs time = '…': the column (or one per table) it bounds");
-    let sessions = kv.get("session").map(|t| Ok::<_, anyhow::Error>(Sessions { time: t.clone(), gap_secs: num("gap_secs", 1800)?, lateness_secs, keys: vec![] })).transpose()?;
+    let sessions = kv.get("session").map(|t| Ok::<_, anyhow::Error>(Sessions { time: t.clone(), gap_secs: num("gap_secs", 1800)?, lateness_secs, keys: vec![], idle_secs })).transpose()?;
     let expect: Vec<Expect> = match kv.get("expect") {
         Some(e) => serde_json::from_str(e).context("expect: a JSON list of {\"name\", \"check\", \"on\": \"keep\" | \"drop\" | \"fail\"}")?,
         None => vec![],
@@ -210,7 +256,7 @@ pub fn options(kv: &std::collections::BTreeMap<String, String>) -> Result<Option
         deletes: kv.contains_key("delete_when"),
     })).transpose()?;
     ensure!(history.is_some() || (!kv.contains_key("sequence_by") && !kv.contains_key("delete_when")), "sequence_by and delete_when go with history = 'key columns'");
-    Ok(Options { emit, sessions, join, expect, history, delete_when: kv.get("delete_when").cloned() })
+    Ok(Options { emit, sessions, join, expect, history, delete_when: kv.get("delete_when").cloned(), once, lateness_secs, idle_secs, keep: None })
 }
 /// `CREATE MATERIALIZED VIEW v (CONSTRAINT c CHECK (…) [ON VIOLATION DROP ROW | FAIL], …) AS …`:
 /// the statement without its expectations, and them (`EXPECT (…)` too, Databricks' word; a column
@@ -317,7 +363,10 @@ fn open_key(name: &str) -> String { format!("w/{name}") }
 /// Register view `name` (leader only): its table gets the query's output columns; a GROUP BY
 /// query makes it a merge table keyed by the group columns.
 pub async fn create(lake: &Lake, name: &str, sql: &str, o: Options) -> Result<()> {
-    let Options { mut emit, sessions, join, expect, history, delete_when } = o;
+    if o.once {
+        return crate::once::create(lake, name, sql, o).await; // (`EMIT FINAL`)
+    }
+    let Options { mut emit, sessions, join, expect, history, delete_when, keep, .. } = o;
     // (a history view's deletes: a column of its rows saying which versions end their key)
     let wrapped;
     let sql = match &delete_when {
@@ -331,7 +380,8 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, o: Options) -> Result<()
         let windows = |e: &Option<Emit>| e.as_ref().map(|e| (e.window.clone(), e.size_secs, e.lateness_secs, e.slide_secs));
         let gaps = |s: &Option<Sessions>| s.as_ref().map(|s| (s.time.clone(), s.gap_secs, s.lateness_secs));
         let joins = |j: &Option<Join>| j.as_ref().map(|j| (j.time.clone(), j.within_secs));
-        let same = v.sql == sql && windows(&v.emit) == windows(&emit) && gaps(&v.sessions) == gaps(&sessions) && joins(&v.join) == joins(&join) && v.expect == expect;
+        let onces = |o: &Option<Once>| o.as_ref().map(|o| (o.bucket.clone(), o.lateness_secs, o.idle_secs));
+        let same = v.sql == sql && windows(&v.emit) == windows(&emit) && gaps(&v.sessions) == gaps(&sessions) && joins(&v.join) == joins(&join) && v.expect == expect && onces(&v.once) == onces(&keep);
         ensure!(same, "view {name} already exists, with other SQL or options");
         return Ok(()); // (asked again, the same: a notebook cell run twice)
     }
@@ -381,10 +431,7 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, o: Options) -> Result<()
     }
     let mut puts = vec![(table_key(name), json(&meta))];
     if !expect.is_empty() && lake.cat.get::<TableMeta>(&table_key(EXPECTED)).await?.is_none() {
-        let s = |c: &str| (c.to_string(), "Utf8".to_string());
-        let columns = vec![s("view"), s("id"), s("expectation"), s("action"), ("failed".into(), "Int64".into())];
-        let key = ["view", "id", "expectation", "action"].map(String::from).to_vec();
-        puts.push((table_key(EXPECTED), json(&TableMeta { columns, key, merge: [("failed".to_string(), "sum".to_string())].into(), tiered: lake.visible(), ..Default::default() })));
+        puts.push((table_key(EXPECTED), json(&expected_table(lake))));
     }
     if let Some(e) = &mut emit {
         let is_time = meta.columns.iter().any(|(c, t)| *c == e.window && t.starts_with("Timestamp"));
@@ -394,9 +441,27 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, o: Options) -> Result<()
         let columns = meta.columns.iter().filter(|(c, _)| c != "_deleted").cloned().collect();
         puts.push((table_key(&format!("{name}_final")), json(&TableMeta { columns, publish: default_publish(), ids: true, tiered: lake.visible(), ..Default::default() })));
     }
+    if let Some(o) = &keep {
+        // (`EMIT FINAL`: its groups kept here, as any GROUP BY view's; each once in `o.into`, made with it)
+        ensure!(!partial, "{source} is a GROUP BY view, whose table keeps partial rows: make {} from {source}'s own source", o.into);
+        ensure!(meta.key.contains(&o.column), "EMIT FINAL: {} is the view's window, so it is one of its GROUP BY columns", o.column);
+        let columns = meta.columns.iter().filter(|(c, _)| c != "_deleted").cloned().collect();
+        puts.push((table_key(&o.into), json(&TableMeta { columns, publish: default_publish(), ids: true, tiered: lake.visible(), ..Default::default() })));
+        if lake.cat.get::<TableMeta>(&table_key(EXPECTED)).await?.is_none() && !puts.iter().any(|(k, _)| *k == table_key(EXPECTED)) {
+            puts.push((table_key(EXPECTED), json(&expected_table(lake))));
+        }
+    }
     let fill = Some(Fill { id: uuid::Uuid::new_v4().to_string(), upto: None }); // (from the rows already there)
-    puts.push((view_key(name), json(&View { source, sql: sql.into(), emit, sessions: None, ids, join: None, fill, expect })));
+    puts.push((view_key(name), json(&View { source, sql: sql.into(), emit, sessions: None, ids, join: None, fill, expect, once: keep })));
     lake.cat.commit(puts, &[]).await
+}
+
+/// `pondra$expectations`: what each view's expectations failed, and its late rows (`once::late`).
+fn expected_table(lake: &Lake) -> TableMeta {
+    let s = |c: &str| (c.to_string(), "Utf8".to_string());
+    let columns = vec![s("view"), s("id"), s("expectation"), s("action"), ("failed".into(), "Int64".into())];
+    let key = ["view", "id", "expectation", "action"].map(String::from).to_vec();
+    TableMeta { columns, key, merge: [("failed".to_string(), "sum".to_string())].into(), tiered: lake.visible(), ..Default::default() }
 }
 
 /// A new view's expectations: each a condition over its columns; and one that fails a write
@@ -504,7 +569,7 @@ async fn create_sessions(lake: &Lake, name: &str, sql: &str, source: String, src
     ensure!(s.keys.iter().all(|k| out.field_with_unqualified_name(k).is_ok()), "a session view SELECTs its GROUP BY columns, as they are named");
     let columns = out.fields().iter().map(|f| (f.name().clone(), crate::query::type_name(f.data_type()))).collect();
     let meta = TableMeta { columns, publish: default_publish(), ids: true, tiered: lake.visible(), ..Default::default() };
-    let view = View { source, sql: sql.into(), emit: None, sessions: Some(s), ids: false, join: None, fill: None, expect: vec![] };
+    let view = View { source, sql: sql.into(), emit: None, sessions: Some(s), ids: false, join: None, fill: None, expect: vec![], once: None };
     lake.cat.commit(vec![(view_key(name), json(&view)), (table_key(name), json(&meta))], &[]).await
 }
 
@@ -556,9 +621,10 @@ fn event_time(plan: &LogicalPlan, window: &str) -> Option<String> {
 /// that fails is tried again next round; the others go on).
 pub async fn emit_all(lake: &Lake, log: &crate::log::Log) -> Result<()> {
     for (key, v) in lake.cat.scan::<View>("v/", "v0").await? {
-        let done = match (&v.emit, &v.sessions) {
-            (Some(e), _) => emit(lake, log, &key[2..], &v, e).await,
-            (_, Some(s)) => sessions(lake, log, &key[2..], &v, s).await,
+        let done = match (&v.emit, &v.sessions, &v.once) {
+            (Some(e), _, _) => emit(lake, log, &key[2..], &v, e).await,
+            (_, Some(s), _) => sessions(lake, log, &key[2..], &v, s).await,
+            (_, _, Some(o)) => crate::once::emit(lake, log, &key[2..], &v, o).await,
             _ => Ok(()),
         };
         if let Err(e) = done {
@@ -602,6 +668,30 @@ async fn newest(lake: &Lake, table: &str, time: &str) -> Result<Option<i64>> {
     }
     SEEN.lock().unwrap().insert(key, (seen, newest));
     Ok(newest)
+}
+
+/// The watermark of a view over `table`'s `time`, in µs: its newest event time less the lateness.
+/// With `idle`, once no newer row has come for that long, it moves on with the clock from there
+/// (the leader's clock, from when it first saw that newest time), so a quiet source's last groups
+/// are kept too; off by default, since a table loaded in batches of older rows would see its next
+/// batch counted as late.
+pub(crate) async fn watermark(lake: &Lake, table: &str, time: &str, lateness_secs: u64, idle_secs: Option<u64>) -> Result<Option<i64>> {
+    use std::sync::{LazyLock, Mutex};
+    static SINCE: LazyLock<Mutex<std::collections::HashMap<String, (i64, u64)>>> = LazyLock::new(Default::default);
+    let Some(newest) = newest(lake, table, time).await? else { return Ok(None) };
+    let wm = newest - (lateness_secs * 1_000_000) as i64;
+    let Some(idle) = idle_secs else { return Ok(Some(wm)) };
+    let now = crate::log::now_ms();
+    let since = {
+        let mut seen = SINCE.lock().unwrap();
+        let e = seen.entry(format!("{}|{table}|{time}", lake.url)).or_insert((newest, now));
+        if e.0 != newest {
+            *e = (newest, now);
+        }
+        e.1
+    };
+    let quiet = now.saturating_sub(since);
+    Ok(Some(if quiet >= idle * 1000 { wm + (quiet * 1000) as i64 } else { wm }))
 }
 
 /// A timestamp column's values in µs.
@@ -652,7 +742,7 @@ async fn emit(lake: &Lake, log: &crate::log::Log, view: &str, v: &View, e: &Emit
 
 /// `rows` into `table` (as its columns), with `src`: output and progress commit together. (A
 /// conflict: another leader emitted first; the next round catches up.)
-async fn append(lake: &Lake, log: &crate::log::Log, table: &str, src: crate::log::Src, rows: Vec<RecordBatch>) -> Result<()> {
+pub(crate) async fn append(lake: &Lake, log: &crate::log::Log, table: &str, src: crate::log::Src, rows: Vec<RecordBatch>) -> Result<()> {
     let meta: TableMeta = lake.cat.get(&table_key(table)).await?.with_context(|| format!("no table {table}"))?;
     let s = crate::query::schema(&meta.columns)?;
     let rows = datafusion::arrow::compute::concat_batches(&s, &rows.iter().map(|b| crate::query::conform(b, &s)).collect::<Result<Vec<_>>>()?)?;
@@ -666,8 +756,7 @@ async fn append(lake: &Lake, log: &crate::log::Log, table: &str, src: crate::log
 /// closed ones run through the view's SQL and are appended to its table, with the watermark as
 /// the producer's seq, as windows are.
 async fn sessions(lake: &Lake, log: &crate::log::Log, view: &str, v: &View, s: &Sessions) -> Result<()> {
-    let Some(newest) = newest(lake, &v.source, &s.time).await? else { return Ok(()) };
-    let wm = newest - (s.lateness_secs * 1_000_000) as i64; // (rows at or before it are late)
+    let Some(wm) = watermark(lake, &v.source, &s.time, s.lateness_secs, s.idle_secs).await? else { return Ok(()) }; // (rows at or before it are late)
     let producer = format!("emit:{view}");
     let done: u64 = lake.cat.get(&producer_key(&producer)).await?.unwrap_or(0);
     if wm <= done as i64 {
@@ -723,7 +812,7 @@ async fn cannot_follow(lake: &Lake, table: &str, append: bool) -> Result<Vec<Str
         let name = &k[2..];
         let meta: TableMeta = lake.cat.get(&table_key(name)).await?.context("view without table")?;
         let why = match () {
-            _ if v.emit.is_some() || v.sessions.is_some() => Some("emits windows or sessions once"),
+            _ if v.emit.is_some() || v.sessions.is_some() || v.once.is_some() => Some("emits windows or sessions once"),
             _ if v.join.is_some() => Some("pairs two streams' rows as they arrive"),
             _ if !append => None,
             _ if meta.merge.is_empty() && !v.ids => Some("isn't row by row over the table alone (a join, DISTINCT, …), or was made before Pondra 0.19"),
@@ -735,7 +824,7 @@ async fn cannot_follow(lake: &Lake, table: &str, append: bool) -> Result<Vec<Str
             _ => None,
         };
         match why {
-            Some(w) => not.push(format!("view {name} ({w})")),
+            Some(w) => not.push(format!("view {} ({w})", v.shown(name))),
             None => not.extend(Box::pin(cannot_follow(lake, name, meta.merge.is_empty())).await?),
         }
     }
@@ -802,6 +891,9 @@ pub async fn derive(lake: &Lake, new: &BTreeMap<String, Vec<RecordBatch>>) -> Re
             let (kept, failed) = expected(&target, &v, view_rows(lake, &v, &meta, rows, false).await?, false)?;
             parts.push((target.clone(), kept));
             parts.extend(failed.map(|f| (EXPECTED.to_string(), f)));
+            if let Some(o) = &v.once {
+                parts.extend(crate::once::late(lake, &target, &v, o, rows).await?.map(|l| (EXPECTED.to_string(), l))); // (rows for groups already kept)
+            }
         }
         for gone in gone {
             match () {
@@ -868,8 +960,8 @@ pub async fn inline(lake: &Lake) -> Result<std::sync::Arc<Inline>> {
         let t = key[2..].to_string();
         i.by_source.entry(v.source.clone()).or_default().push(t.clone());
         i.tables.extend([crate::sys::deleted(&t), t.clone()]);
-        if !v.expect.is_empty() {
-            i.tables.insert(EXPECTED.into()); // (their counts)
+        if !v.expect.is_empty() || v.once.is_some() {
+            i.tables.insert(EXPECTED.into()); // (their counts, and late rows')
         }
         if v.fill.as_ref().is_some_and(|f| f.upto.is_none() && !BOUNDED.lock().unwrap().contains(&f.id)) {
             i.unbounded.push((t, v));
@@ -1110,7 +1202,7 @@ async fn create_join(lake: &Lake, name: &str, sql: &str, source: String, mut j: 
     j.tables = tables;
     let now = lake.visible();
     let meta = TableMeta { columns, publish: default_publish(), ids: true, tiered: now, ..Default::default() };
-    let view = View { source, sql: sql.into(), emit: None, sessions: None, ids: false, join: Some(j), fill: None, expect: vec![] };
+    let view = View { source, sql: sql.into(), emit: None, sessions: None, ids: false, join: Some(j), fill: None, expect: vec![], once: None };
     lake.cat.commit(vec![(table_key(name), json(&meta)), (view_key(name), json(&view)), (producer_key(&format!("join:{name}")), json(&now))], &[]).await
 }
 
@@ -1219,7 +1311,7 @@ pub async fn system(lake: &Lake, counts: Vec<RecordBatch>) -> Result<Vec<(&'stat
     use datafusion::datasource::MemTable;
     let mut views = in_order(lake.cat.scan::<View>("v/", "v0").await?);
     if let Some(a) = crate::auth::limited() {
-        views.retain(|(name, _)| a.may("select", name));
+        views.retain(|(name, v)| a.may("select", v.shown(name)));
     }
     let (mut kinds, mut histories) = (vec![], std::collections::HashSet::new());
     for (name, v) in &views {
@@ -1229,7 +1321,7 @@ pub async fn system(lake: &Lake, counts: Vec<RecordBatch>) -> Result<Vec<(&'stat
             histories.insert(name.clone());
         }
         kinds.push(match () {
-            _ if v.emit.is_some() => "window",
+            _ if v.emit.is_some() || v.once.is_some() => "window",
             _ if v.sessions.is_some() => "sessions",
             _ if v.join.is_some() => "stream join",
             _ if merged => "aggregate",
@@ -1250,12 +1342,14 @@ pub async fn system(lake: &Lake, counts: Vec<RecordBatch>) -> Result<Vec<(&'stat
     }
     let s = |f: &dyn Fn(usize, &(String, View)) -> Option<String>| std::sync::Arc::new(views.iter().enumerate().map(|(i, x)| f(i, x)).collect::<StringArray>()) as datafusion::arrow::array::ArrayRef;
     let reads = |v: &View| crate::spmd::tables(&v.sql).map(|t| t.into_iter().filter(|t| *t != v.source).collect::<Vec<_>>().join(", ")).filter(|r| !r.is_empty());
+    let late = |v: &View| failed.get(&(v.fill.as_ref().map_or(String::new(), |f| f.id.clone()), crate::once::LATE.to_string())).copied().unwrap_or(0);
     let flows = RecordBatch::try_from_iter(vec![
-        ("name", s(&|_, (n, _)| Some(n.clone()))),
+        ("name", s(&|_, (n, v)| Some(v.shown(n).to_string()))),
         ("follows", s(&|_, (_, v)| Some(v.join.as_ref().map_or(v.source.clone(), |j| j.tables.join(", "))))),
         ("kind", s(&|i, _| Some(kinds[i].to_string()))),
         ("reads", s(&|_, (_, v)| reads(v))),
         ("expectations", std::sync::Arc::new(views.iter().map(|(_, v)| v.expect.len() as i64).collect::<Int64Array>())),
+        ("late_rows", std::sync::Arc::new(views.iter().map(|(_, v)| v.once.as_ref().map(|_| late(v))).collect::<Int64Array>())),
         ("definition", s(&|_, (_, v)| Some(v.sql.clone()))),
     ])?;
     let all: Vec<(&String, &View, &Expect)> = views.iter().flat_map(|(n, v)| v.expect.iter().map(move |e| (n, v, e))).collect();
