@@ -671,6 +671,9 @@ async fn expand_with(lake: &Lake, sql: &str, views: &HashMap<String, String>) ->
     if let Some(q) = show(sql) {
         return Ok(q);
     }
+    if let Some(q) = crate::objects::show_create(lake, sql).await? {
+        return Ok(q); // (`SHOW CREATE TABLE t`: the statements that make it again)
+    }
     if let Some(q) = crate::friendly::summarize(lake, sql).await? {
         return Ok(q);
     }
