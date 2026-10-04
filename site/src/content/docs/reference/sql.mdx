@@ -344,7 +344,8 @@ ann
 
 ## Variables
 
-A variable holds one value for the statements after it. It is a session's, as settings are (a
+A variable holds one value for the statements after it: a number, text, a date, bytes, a list or a
+struct (not yet a map). It is a session's, as settings are (a
 Postgres connection's, a client's, or one script's); a procedure and a file run have their own.
 
 | Statement | Syntax |
@@ -671,6 +672,26 @@ CREATE SECRET sales (TYPE s3, KEY_ID 'your-key-id', SECRET 'your-secret', REGION
 SELECT * FROM secrets();
 DROP SECRET sales;
 ```
+
+## Shares and recipients
+
+A share hands tables to another company through the Delta Sharing protocol: they read the files with their
+own compute. See [Share a table](/pondra/guides/sharing/).
+
+| Statement | Syntax |
+|---|---|
+| Make a share | `CREATE SHARE [IF NOT EXISTS] name [COMMENT '…']` |
+| Add a table | `ALTER SHARE s ADD [TABLE] t [PARTITION (col = 'v'), …] [AS schema.name] [WITH HISTORY \| WITHOUT HISTORY]`; also `GRANT SELECT ON TABLE t TO SHARE s` |
+| Take one out | `ALTER SHARE s REMOVE [TABLE] name`; also `REVOKE SELECT ON TABLE t FROM SHARE s` |
+| Make a recipient | `CREATE RECIPIENT [IF NOT EXISTS] name [COMMENT '…'] [EXPIRES IN '90 days']` (answers its profile, once) |
+| A new token | `ALTER RECIPIENT name ROTATE TOKEN [EXPIRES IN '…']` (answers the new profile; the old token ends) |
+| Grant, take back | `GRANT SELECT ON SHARE s TO RECIPIENT r, …`, `REVOKE SELECT ON SHARE s FROM RECIPIENT r, …` |
+| Drop | `DROP SHARE [IF EXISTS] name`, `DROP RECIPIENT [IF EXISTS] name` |
+| List | `SHOW SHARES`, `SHOW RECIPIENTS`, `DESCRIBE SHARE s` (`SHOW ALL IN SHARE s`); `pondra.shares`, `pondra.recipients` |
+| Read a share | `ATTACH '<profile JSON or endpoint>' AS name (TYPE share [, SHARE 'name'] [, TOKEN '…'])`, then `name.schema.table` |
+
+`CREATE OR REPLACE SHARE` and `CREATE OR REPLACE RECIPIENT` are refused, as they are for schemas and users:
+replacing a share would drop its tables and grants, and replacing a recipient would end its token.
 
 ## External tables
 

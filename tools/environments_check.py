@@ -80,6 +80,10 @@ def environments_check(bin, work, port, root):
     q("UPDATE k SET v = 'TWO' WHERE id = 2")
     q("CREATE TASK nightly SCHEDULE '1 hour' AS INSERT INTO k VALUES (99, 'task')")
     q("CREATE SECRET s3_prod (TYPE s3, KEY_ID 'id', SECRET 'secret', SCOPE 's3://prod-bucket/')")
+    q("CREATE SHARE acme")
+    q("ALTER SHARE acme ADD TABLE sales.orders")
+    q("CREATE RECIPIENT acme_corp")
+    q("GRANT SELECT ON SHARE acme TO RECIPIENT acme_corp")
     prod.call("PUT", "/files/etl/orders.sql", "SELECT count(*) FROM sales.orders")
     every = "SELECT _row_id, _version, id, amount FROM sales.orders ORDER BY id"
     keyed = "SELECT _row_id, id, v FROM k ORDER BY id"
@@ -103,8 +107,10 @@ def environments_check(bin, work, port, root):
     # dev's own node: its writes are its own; what reaches the outside starts suspended.
     dev = Node(bin, dev_dir, port + 1, work, "--retain-secs", "1", env=env).start()
     checks["dev answers as prod did, from its own node"] = rows(dev, every) == before and rows(dev, keyed) == before_k
-    checks["dev's task starts suspended, and no secret came with it"] = rows(dev, "SELECT name, state FROM pondra.tasks") == [("nightly", "suspended")] \
-        and rows(dev, "SELECT count(*) FROM secrets()") == [(0,)] and rows(prod, "SELECT count(*) FROM secrets()") == [(1,)]
+    shared = "SELECT (SELECT count(*) FROM pondra.shares) AS shares, (SELECT count(*) FROM pondra.recipients) AS recipients"
+    checks["dev's task starts suspended, and no secret, share or recipient came with it"] = rows(dev, "SELECT name, state FROM pondra.tasks") == [("nightly", "suspended")] \
+        and rows(dev, "SELECT count(*) FROM secrets()") == [(0,)] and rows(prod, "SELECT count(*) FROM secrets()") == [(1,)] \
+        and rows(dev, shared) == [(0, 0)] and rows(prod, shared) == [(1, 1)]
     checks["dev has prod's workspace files"] = dev.get("/files/etl/orders.sql") == b"SELECT count(*) FROM sales.orders"
     dev.q("INSERT INTO sales.orders VALUES (5001, 1.0)")
     dev.q("UPDATE sales.orders SET amount = 0 WHERE id BETWEEN 21 AND 25")

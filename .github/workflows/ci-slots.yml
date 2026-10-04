@@ -1,0 +1,60 @@
+name: ci slots
+
+# At most two pull requests' CI at once (Alimardon, 2026-10-03). build.yml's plan makes a pull
+# request's run wait while two others are going: it builds nothing and fails its `waiting for a CI
+# slot` check, holding no runner. Whenever a pull request's build run ends, this starts the oldest
+# waiting ones again, as many as there are free slots. A run is started again only while it is its
+# pull request's newest and its head is still the pull request's, so a newer push is never undone.
+#
+# It is main's copy that runs (workflow_run), whatever a pull request changes, and it checks out
+# nothing: it reads runs and re-runs them. Main's runs, the soak's and the nightly ones aren't
+# counted.
+on:
+  workflow_run:
+    workflows: [build]
+    types: [completed]
+
+# (one at a time: two ending together mustn't both take the last slot; a later one counts again)
+concurrency:
+  group: ci-slots
+  cancel-in-progress: false
+
+permissions:
+  actions: write # (re-running a waiting run)
+  contents: read
+  pull-requests: read # (the open pull requests' heads)
+
+jobs:
+  start:
+    name: start waiting pull requests
+    if: github.event.workflow_run.event == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SLOTS: 2
+    steps:
+      - run: |
+          r=$GITHUB_REPOSITORY
+          runs=$(gh api "repos/$r/actions/workflows/build.yml/runs?event=pull_request&per_page=100")
+          going=$(jq '[.workflow_runs[] | select(.status != "completed")] | length' <<< "$runs")
+          free=$((SLOTS - going))
+          echo "Pull requests' runs going: $going of $SLOTS."
+          [ "$free" -gt 0 ] || exit 0
+          heads=$(gh pr list --repo "$r" --state open --limit 100 --json number,headRefOid)
+          # Each open pull request's newest run (a run for another label is skipped: not counted),
+          # if it ended red at its head; oldest first.
+          waiting=$(jq -r --argjson heads "$heads" '
+            [.workflow_runs[] | select(.conclusion != "skipped" and (.pull_requests | length) > 0)]
+            | group_by(.pull_requests[0].number) | map(max_by(.id))
+            | map(select(.status == "completed" and .conclusion == "failure") | . as $run
+                  | select(any($heads[]; .number == $run.pull_requests[0].number and .headRefOid == $run.head_sha)))
+            | sort_by(.id) | .[].id' <<< "$runs")
+          for id in $waiting; do
+            [ "$free" -gt 0 ] || break
+            # (red for want of a slot, not for a failure: its `waiting for a CI slot` check failed)
+            gh api "repos/$r/actions/runs/$id/jobs" --jq '.jobs[] | select(.name == "waiting for a CI slot") | .conclusion' | grep -qx failure || continue
+            gh run rerun "$id" --repo "$r"
+            echo "Started again: https://github.com/$r/actions/runs/$id" | tee -a "$GITHUB_STEP_SUMMARY"
+            free=$((free - 1))
+          done

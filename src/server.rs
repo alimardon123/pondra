@@ -162,6 +162,7 @@ pub fn router(app: App) -> Router {
         .route("/cluster/visible", get(|State(app): State<App>| async move { Json(app.lake.visible()) })) // (a follower's read-your-writes: `write::seen_here`)
         .route("/cluster/kafka", get(|| async { Json(crate::kafka::me()) }))
         .merge(crate::iceberg::rest())
+        .merge(crate::sharing::routes()) // (recipients sign in there with their own tokens: `sharing.rs`)
         .layer(axum::extract::DefaultBodyLimit::max(1 << 30)) // batches up to 1 GiB
         .layer(middleware::from_fn_with_state(app.clone(), guard))
         .with_state(app)
@@ -351,6 +352,13 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
         if header.as_deref().is_some_and(|h| h.starts_with("Bearer pn_")) && !peer.may_be_node() {
             return (StatusCode::UNAUTHORIZED, "the nodes' key is taken only with a certificate the nodes' authority signed (PONDRA_TLS_CA)").into_response();
         }
+    }
+    if req.uri().path().starts_with("/delta-sharing/") {
+        // (a recipient's token or a file's signed link, which the door checks: never a user's sign-in)
+        return match crate::panics::door(next.run(req)).await {
+            Ok(r) => r,
+            Err(m) => (StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
+        };
     }
     let signed = match &header {
         Some(h) => crate::users::who(&app.lake, &app.auth, Some(h)).await,
@@ -951,7 +959,8 @@ async fn sql(State(app): State<App>, Query(p): Query<SqlParams>, role: axum::Ext
     let session = crate::temp::of(&headers); // (its temporary tables: `temp.rs`)
     let token = headers.get("authorization").and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer "));
     let vars = crate::auth::lent_vars(token); // (Python code a run lent a connection to: the run's variables)
-    let (out, heard) = crate::routines::with_notices(crate::vars::within(vars, crate::temp::SESSION.scope(session.clone(), crate::ext::scope(files, sql_as(app, p, role, headers, body))))).await;
+    let go = crate::vars::within(vars.clone(), crate::temp::SESSION.scope(session.clone(), crate::ext::scope(files, sql_as(app, p, role, headers, body))));
+    let (out, heard) = crate::routines::with_notices(crate::python::holder(vars.is_some(), go)).await; // (a lent token's code holds a slot: what it calls takes none)
     let mut r = out.unwrap_or_else(IntoResponse::into_response);
     if session.as_deref().is_some_and(crate::temp::holds) {
         r.headers_mut().insert("x-pondra-session", axum::http::HeaderValue::from_static("held")); // (a client keeps to this node meanwhile)
@@ -1010,7 +1019,9 @@ async fn sql_as(app: App, p: SqlParams, role: axum::Extension<crate::auth::Role>
     use crate::routines::{Outcome, Who};
     let kind = headers.get("content-type").and_then(|v| v.to_str().ok()).unwrap_or_default();
     let req = crate::routines::Request::read(kind, &body)?;
-    let depth = headers.get("x-pondra-depth").and_then(|v| v.to_str().ok()?.parse().ok()).unwrap_or(0); // (a Python procedure's own calls)
+    // (a Python procedure's own calls, through the token lent to it; anyone else's is a first call)
+    let lent = crate::auth::lent(headers.get("authorization").and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer "))).is_some();
+    let depth = headers.get("x-pondra-depth").filter(|_| lent).and_then(|v| v.to_str().ok()?.parse().ok()).unwrap_or(0);
     let who = Who { role: role.0, files: owner(&headers), depth };
     if let Some(seg) = p.after {
         let mut hwm = app.lake.hwm.subscribe();
@@ -1064,10 +1075,14 @@ async fn query(app: &App, p: &SqlParams, query: &str, files: bool) -> anyhow::Re
     }
     // Same query, same catalog version: same answer (unless it asks for the time or randomness,
     // or may read a file on this machine).
-    let q = query.to_lowercase();
-    let volatile = files || limited || !crate::ext::names(query).is_empty() || ["now()", "random(", "current_", "uuid(", "explain", "pondra.runs", "pondra.tasks", "pondra.audit", "pondra.history", "pondra$history", "pondra.variables", "files("].iter().any(|f| q.contains(f)) // (files outside the lake change on their own; `files()` lists objects put since)
+    let asks = |text: &str| {
+        let q = text.to_lowercase();
+        !crate::ext::names(text).is_empty() || ["now()", "random(", "current_", "uuid(", "explain", "pondra.runs", "pondra.tasks", "pondra.audit", "pondra.history", "pondra$history", "pondra.variables", "files("].iter().any(|f| q.contains(f)) // (files outside the lake change on their own; `files()` lists objects put since)
+    };
+    let volatile = files || limited || asks(query)
         || crate::temp::mentioned(query) // (the session's temporary tables change without a commit)
         || crate::settings::any() // (and its settings may change the answer)
+        || crate::routines::with_views(&app.lake, query).await.map_or(true, |t| t.len() > query.len() && asks(&t)) // (and so may a view it reads: `now()`, files)
         || crate::routines::volatile(&app.lake, query).await; // (a Python function may answer differently each time)
     let Some(version) = app.lake.version_for(query).await.filter(|_| !volatile) else { return Ok(respond(run_sql(app, p, query, files).await?)) };
     let key = format!("{format}{}|{}|{query}", p.rows.map(|n| format!(":{n}")).unwrap_or_default(), p.spread.as_deref().unwrap_or(""));

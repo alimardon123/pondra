@@ -39,6 +39,7 @@ leave them out.
 | `deploy.mdx` | running a node long-term: the container image (`ghcr.io/alimardon123/pondra`, `-python`, `/data`, ports, a bucket, memory from the cgroup), the three-node Compose cluster (`PONDRA_IMAGE`, `PONDRA_LAKE`), the Helm chart (`oci://ghcr.io/alimardon123/charts/pondra`: bucket or shared volume, tokens and key Secrets, TLS, doors, readers, `helm test`), `pondra service install \| status \| uninstall` (systemd, launchd, Windows service), Homebrew / winget / Scoop (prepared, not yet published), stopping a node cleanly | ADR-041, `deploy/`, `src/service.rs` |
 | `notebooks.mdx` | Jupyter with `pondra.local()`, `%load_ext pondra` and `%%sql`, frames' display, pandas/Polars interop | ADR-023, the notebook |
 | `security.mdx` | read/write/admin tokens on every door, `--python` rules, secrets (sealed with `PONDRA_SECRET_KEY`), what's next (grants, TLS: round 29) | ADR-010, ADR-026, ADR-027 |
+| `sharing.mdx` | sharing a table with another company: `CREATE SHARE`, `ALTER SHARE … ADD TABLE` (partitions, `AS`, `WITH HISTORY`, a materialized view for less), `CREATE RECIPIENT` and its profile, `GRANT SELECT ON SHARE`, the delta-sharing client and Spark, `ATTACH … (TYPE share)`, `SHOW SHARES`, revoking and rotating, the audit log, where the bytes go | ADR-046 |
 | `dbt-and-bi.mdx` ★ | dbt and BI tools | |
 | `server.mdx` ★ | `pondra serve` on a folder of lakes (`--lakes`), local or in a bucket | ADR-030, ADR-032 |
 
