@@ -46,14 +46,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
-    def reply(self, status, body, headers=()):
-        out = json.dumps(body).encode()
-        self.send_response(status)
-        for k, v in [("content-type", "application/json"), ("content-length", str(len(out))), *headers]:
-            self.send_header(k, v)
-        self.end_headers()
-        self.wfile.write(out)
-
     def do_POST(self):
         s = self.server
         body = json.loads(self.rfile.read(int(self.headers["content-length"])))
@@ -61,30 +53,39 @@ class Handler(http.server.BaseHTTPRequestHandler):
             s.now += 1
             s.most = max(s.most, s.now)
         try:
-            time.sleep(s.delay)
-            with s.lock:
-                busy = s.mode == "busy" and s.n > 0
-                s.n -= busy
-            if busy:
-                return self.reply(429, {"error": "slow down"}, [("retry-after", "0")])
-            if self.path.endswith("/embeddings"):
-                texts = body["input"] if isinstance(body["input"], list) else [body["input"]]
-                if s.mode == "single" and isinstance(body["input"], list) and len(texts) > 1:
-                    return self.reply(400, {"error": "one text a request"})
-                with s.lock:
-                    s.embeds += 1
-                    s.texts += len(texts)
-                data = [{"index": i, "embedding": [float(t.lower().split().count(w)) for w in WORDS]} for i, t in enumerate(texts)]
-                return self.reply(200, {"data": data[::-1]})  # (out of order: the index says which)
-            text = body["messages"][-1]["content"]
-            with s.lock:
-                s.chats += 1
-            if s.mode == "boom" and "boom" in text:
-                return self.reply(500, {"error": "boom"}, [("retry-after", "0")])
-            return self.reply(200, {"choices": [{"message": {"role": "assistant", "content": f"len:{len(text)}"}}]})
+            status, out, headers = self.answer(s, body)
         finally:
-            with s.lock:
+            with s.lock:  # (before the reply goes: the node may send its next request the moment it has it)
                 s.now -= 1
+        data = json.dumps(out).encode()
+        self.send_response(status)
+        for k, v in [("content-type", "application/json"), ("content-length", str(len(data))), *headers]:
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(data)
+
+    def answer(self, s, body):
+        time.sleep(s.delay)
+        with s.lock:
+            busy = s.mode == "busy" and s.n > 0
+            s.n -= busy
+        if busy:
+            return 429, {"error": "slow down"}, [("retry-after", "0")]
+        if self.path.endswith("/embeddings"):
+            texts = body["input"] if isinstance(body["input"], list) else [body["input"]]
+            if s.mode == "single" and isinstance(body["input"], list) and len(texts) > 1:
+                return 400, {"error": "one text a request"}, []
+            with s.lock:
+                s.embeds += 1
+                s.texts += len(texts)
+            data = [{"index": i, "embedding": [float(t.lower().split().count(w)) for w in WORDS]} for i, t in enumerate(texts)]
+            return 200, {"data": data[::-1]}, []  # (out of order: the index says which)
+        text = body["messages"][-1]["content"]
+        with s.lock:
+            s.chats += 1
+        if s.mode == "boom" and "boom" in text:
+            return 500, {"error": "boom"}, [("retry-after", "0")]
+        return 200, {"choices": [{"message": {"role": "assistant", "content": f"len:{len(text)}"}}]}, []
 
 
 def ai_check(bin, work, port, vectors):
@@ -93,7 +94,7 @@ def ai_check(bin, work, port, vectors):
     env = {"PONDRA_AI_URL": f"http://127.0.0.1:{ep.server_address[1]}/v1", "PONDRA_AI_MODEL": "m", "PONDRA_EMBED_MODEL": "e",
            "PONDRA_AI_CALLS": "3", "NO_PROXY": "127.0.0.1,localhost", "no_proxy": "127.0.0.1,localhost"}
     n = Node(bin, os.path.join(work, "lake"), port, work, env=env).start()
-    q = n.q
+    q = n.q  # (the node's JSON leaves out NULLs: read them with .get)
     checks = {}
 
     def requests():
@@ -105,7 +106,7 @@ def ai_check(bin, work, port, vectors):
     q("INSERT INTO t SELECT x, CASE x % 3 WHEN 0 THEN 'tea and cake' WHEN 1 THEN 'printer refund' ELSE 'late coffee' END FROM generate_series(1, 300) AS s(x)")
     ep.reset()
     got = q("SELECT body, ai_complete(body) AS a FROM t")
-    checks["each distinct text asked once a batch"] = all(r["a"] == f"len:{len(r['body'])}" for r in got) and len(got) == 300 and ep.chats == 3
+    checks["each distinct text asked once a batch"] = all(r.get("a") == f"len:{len(r['body'])}" for r in got) and len(got) == 300 and ep.chats == 3
     checks["the model named in the call is the one asked"] = q("SELECT ai_complete('x', 'other') AS a")[0]["a"] == "len:1"
 
     # Embeddings many to a request, in order whatever order they come back in.
@@ -125,17 +126,17 @@ def ai_check(bin, work, port, vectors):
     ep.reset("busy", n=3)
     got = q("SELECT ai_complete('busy ' || id) AS a FROM t WHERE id <= 2")
     after = requests()
-    checks["a 429 is tried again: every row answered"] = all(r["a"] is not None for r in got) and after["retried"] - before["retried"] >= 3
+    checks["a 429 is tried again: every row answered"] = all(r.get("a") is not None for r in got) and after["retried"] - before["retried"] >= 3
     ep.reset("boom")
     got = q("SELECT id, ai_complete(CASE WHEN id = 1 THEN 'boom' ELSE 'fine ' || id END) AS a FROM t WHERE id <= 4 ORDER BY id")
     failed = requests()["failed"] - after["failed"]
-    checks["a call that fails for good is NULL, the rest answered, counted in /metrics"] = [r["a"] is None for r in got] == [True, False, False, False] and failed == 1
+    checks["a call that fails for good is NULL, the rest answered, counted in /metrics"] = [r.get("a") is None for r in got] == [True, False, False, False] and failed == 1
     checks["…and said on the node's standard error"] = "ai_complete:" in n.said()
 
     # The node's budget: never more than PONDRA_AI_CALLS (3) requests in flight, whatever the query.
     ep.reset(delay=0.05)
     got = q("SELECT ai_complete('q ' || id) AS a FROM t")
-    checks["at most PONDRA_AI_CALLS requests in flight"] = all(r["a"] for r in got) and 1 <= ep.most <= 3
+    checks["at most PONDRA_AI_CALLS requests in flight"] = all(r.get("a") for r in got) and 1 <= ep.most <= 3
     checks["(most in flight)"] = ep.most
 
     # A materialized view embeds each new row once.
@@ -163,7 +164,7 @@ def ai_check(bin, work, port, vectors):
     checks["every vector function == numpy, under every name"] = all(close(r[f], want[name][r["id"]]) for name, fs in names.items() for f in [name, *fs] for r in got)
     one = q("SELECT cosine_similarity([1.0, 0.0], [1.0, 0.0]) AS s, l2_distance([1, 2], [1, 2]) AS d, dot_product(CAST(NULL AS FLOAT[]), [1.0]) AS n, "
             "cosine_similarity([1.0, 2.0], [1.0]) AS m, cosine_similarity([1.0, NULL], [1.0, 2.0]) AS h, cosine_distance([0.0, 0.0], [1.0, 0.0]) AS z")[0]
-    checks["literals, NULLs, a NULL inside, lengths that differ"] = one == {"s": 1.0, "d": 0.0, "n": None, "m": None, "h": None, "z": 1.0}
+    checks["literals, NULLs, a NULL inside, lengths that differ"] = {k: one.get(k) for k in "sdnmhz"} == {"s": 1.0, "d": 0.0, "n": None, "m": None, "h": None, "z": 1.0}
     checks["a query's vector against the column (sorted by distance)"] = [r["id"] for r in q(f"SELECT id FROM vv ORDER BY cosine_distance(a, {list(map(float, a[5]))}) LIMIT 1")] == [5]
 
     # A frame's + joins text, as Polars' does (and still adds numbers).
