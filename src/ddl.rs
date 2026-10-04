@@ -748,7 +748,7 @@ async fn create_view(lake: &Lake, name: &str, sql: String, replace: bool, extern
 /// is a view's own. It is kept to be undropped for its `retention` (a day unless set: ADR-043),
 /// its rows in the log sent to files first, so nothing of it is left in a log that moves on; with
 /// PURGE, or `retention = '0 seconds'`, it isn't, and its files go once a day old
-/// (`tier::collect_orphans`).
+/// (`tier::collect_orphans`). It leaves the shares that hand it out (`shares::tables_moved`).
 async fn drop_table(lake: &Lake, name: &str, if_exists: bool, purge: bool) -> Result<Value> {
     if lake.cat.get::<StoredView>(&query_key(name)).await?.is_some_and(|v| v.external) {
         lake.cat.commit(vec![], &[query_key(name)]).await?; // (CREATE EXTERNAL TABLE's: its files stay)
@@ -784,11 +784,21 @@ async fn drop_table(lake: &Lake, name: &str, if_exists: bool, purge: bool) -> Re
     for format in &meta.publish {
         crate::delta::unpublish(lake, name, format).await?; // (no copy left for other engines)
     }
+    let (unshared, from) = crate::shares::tables_moved(lake, &[(name, None)]).await?; // (UNDROP doesn't share it again)
+    puts.extend(unshared);
     lake.cat.commit(puts, &[table_key(name), table_key(&deleted)]).await?; // (and its replaced rows)
     if !kept {
         crate::seq::drop_owned(lake, &meta).await?; // (a table kept to be undropped keeps its identity's sequences)
     }
-    Ok(j!({"table": name, "dropped": true}))
+    Ok(left_shares(j!({"table": name, "dropped": true}), from))
+}
+
+/// A drop's answer, with the shares it took the table out of.
+fn left_shares(mut out: Value, shares: Vec<String>) -> Value {
+    if !shares.is_empty() {
+        out["unshared"] = j!(shares);
+    }
+    out
 }
 
 /// How long a table's past is kept unless its `retention` says: read as it was, or undropped.
@@ -907,7 +917,8 @@ async fn to_files(lake: &Lake, tables: &[String]) -> Result<bool> {
 /// and its files stay where they are: the table keeps its folder (`TableMeta::folder`). Its rows
 /// still in the log go to files first, so none is left under the old name. Refused while a
 /// materialized view or a task follows the table; stored views read by name, so a view of the
-/// old name reads whatever takes that name next (dbt's rename-and-replace).
+/// old name reads whatever takes that name next (dbt's rename-and-replace); a share hands out the
+/// renamed table, under the name it had there.
 async fn rename(lake: &Lake, name: &str, to: &str) -> Result<Value> {
     let name = local(lake, name).ok_or_else(|| anyhow::anyhow!("{name} is an attached lake's: rename it from a node of that lake"))?;
     let to = match to.split('.').collect::<Vec<_>>()[..] {
@@ -955,6 +966,7 @@ async fn rename(lake: &Lake, name: &str, to: &str) -> Result<Value> {
                 gone.push(format!("{state}/{name}"));
             }
         }
+        puts.extend(crate::shares::tables_moved(lake, &[(name.as_str(), Some(to.as_str()))]).await?.0); // (shared under the name it had)
         lake.cat.commit(puts, &gone).await?;
         return Ok(j!({"table": name, "renamed": to}));
     }
@@ -1097,14 +1109,16 @@ pub(crate) fn widens(old: &datafusion::arrow::datatypes::DataType, new: &datafus
     }
 }
 
-/// `DROP VIEW` or `DROP MATERIALIZED VIEW`: a stored view, or a live one with its tables and state.
+/// `DROP VIEW` or `DROP MATERIALIZED VIEW`: a stored view, or a live one with its tables and state
+/// (and out of the shares that hand them out).
 async fn drop_view(lake: &Lake, name: &str, if_exists: bool) -> Result<Value> {
     if lake.cat.get::<crate::feeds::Feed>(&crate::feeds::feed_key(name)).await?.is_some() {
         let offsets: Vec<String> = lake.cat.scan::<u64>(&crate::store::producer_key(&format!("feed:{name}:")), &crate::store::producer_key(&format!("feed:{name};"))).await?.into_iter().map(|(k, _)| k).collect();
         let gone: Vec<String> = [crate::feeds::feed_key(name), table_key(name)].into_iter().chain(offsets.iter().cloned()).collect();
-        lake.cat.commit(vec![], &gone).await?;
+        let (unshared, from) = crate::shares::tables_moved(lake, &[(name, None)]).await?;
+        lake.cat.commit(unshared, &gone).await?;
         crate::log::forget_producers(offsets.into_iter().map(|k| k[2..].to_string())); // (its offsets: made again, it starts over)
-        return Ok(j!({"view": name, "dropped": true}));
+        return Ok(left_shares(j!({"view": name, "dropped": true}), from));
     }
     if lake.cat.get::<StoredView>(&query_key(name)).await?.is_some() {
         lake.cat.commit(vec![], &[query_key(name)]).await?;
@@ -1125,18 +1139,20 @@ async fn drop_view(lake: &Lake, name: &str, if_exists: bool) -> Result<Value> {
     ensure!(followers.is_empty(), "{shown} is followed by {}: drop them first", followers.join(", "));
     let producers = crate::views::producers(name);
     let mut gone: Vec<String> = [crate::views::view_key(name), format!("w/{name}")].into_iter().chain(producers.iter().map(|p| crate::store::producer_key(p))).collect();
-    for table in [name.to_string(), kept, crate::sys::deleted(name)] {
-        if let Some(meta) = lake.cat.get::<TableMeta>(&table_key(&table)).await? {
+    let tables = [name.to_string(), kept, crate::sys::deleted(name)];
+    for table in &tables {
+        if let Some(meta) = lake.cat.get::<TableMeta>(&table_key(table)).await? {
             for format in &meta.publish {
-                crate::delta::unpublish(lake, &table, format).await?;
+                crate::delta::unpublish(lake, table, format).await?;
             }
-            gone.push(table_key(&table));
+            gone.push(table_key(table));
         }
     }
-    lake.cat.commit(vec![], &gone).await?;
+    let (unshared, from) = crate::shares::tables_moved(lake, &[(tables[0].as_str(), None), (tables[1].as_str(), None)]).await?;
+    lake.cat.commit(unshared, &gone).await?;
     crate::log::forget_producers(producers); // (a view made again under this name starts over)
     crate::views::forget(lake);
-    Ok(j!({"view": shown, "dropped": true}))
+    Ok(left_shares(j!({"view": shown, "dropped": true}), from))
 }
 
 /// `ALTER MATERIALIZED VIEW v DETACH`: the view is gone and its table stays, a table like any

@@ -134,9 +134,19 @@ name, never given deleted rows.
 SHOW SHARES;
 DESCRIBE SHARE acme;
 SHOW RECIPIENTS;
+SHOW CREATE SHARE acme;
 ```
 
-`pondra.shares` and `pondra.recipients` hold the same, for queries. To take access back:
+`pondra.shares` and `pondra.recipients` hold the same, for queries. Shares and recipients are
+objects like any other: `pondra.objects` lists them, `COMMENT ON SHARE acme IS '…'` describes one,
+and `SHOW CREATE SHARE` gives the statements that make it again, its tables and grants included.
+
+A share follows a table you rename, still under the name it is shared as. A table you drop leaves
+every share, as in Snowflake, so a new table under its name is shared only once you add it. A tool
+that replaces a table by swapping names (dbt's table models) needs it added again after each full
+refresh.
+
+To take access back:
 
 ```sql
 REVOKE SELECT ON SHARE acme FROM RECIPIENT acme_corp;   -- that share, at once

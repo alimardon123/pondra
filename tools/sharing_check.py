@@ -177,6 +177,39 @@ def sharing_check(bin, work, port, s3):
         "its tables and grants" in refused("CREATE OR REPLACE SHARE acme"),
         "its token" in refused("CREATE OR REPLACE RECIPIENT acme_corp"),
     ])
+
+    # Shares and recipients are objects (ADR-049's registry): listed with their comments, described,
+    # made again from SHOW CREATE after a drop.
+    tables_of = lambda: sorted(f"{t['schema']}.{t['name']}" for t in json.loads(door(port, "GET", "/shares/acme/all-tables", new_token)[2]).get("items", []))
+    q("COMMENT ON RECIPIENT acme_corp IS 'Acme Corp, buying'")
+    listed = {(r["kind"], r["name"]): r for r in q("SELECT kind, name, comment, definition FROM pondra.objects WHERE kind IN ('share', 'recipient')")}
+    shown = q("SHOW CREATE SHARE acme")[0]["definition"]
+    q("DROP SHARE acme")
+    left = q("SELECT count(*) AS n FROM pondra.objects WHERE comment = 'Orders for Acme'")[0]["n"]
+    for stmt in shown.rstrip(";").split(";\n"):
+        q(stmt)
+    checks["shares and recipients in pondra.objects with their comments; SHOW CREATE SHARE run again after DROP SHARE makes the same share, its tables, grants and comment"] = \
+        listed.get(("share", "acme"), {}).get("comment") == "Orders for Acme" and listed.get(("recipient", "acme_corp"), {}).get("comment") == "Acme Corp, buying" \
+        and listed[("recipient", "acme_corp")].get("definition") is None and "token is shown once" in refused("SHOW CREATE RECIPIENT acme_corp") \
+        and "PARTITION (region = 'EU'), (region = 'UK') AS sales.orders_eu" in shown and "GRANT SELECT ON SHARE acme TO RECIPIENT acme_corp" in shown \
+        and left == 0 and q("SHOW CREATE SHARE acme")[0]["definition"] == shown and tables_of() == ["public.kv", "sales.orders", "sales.orders_eu"] \
+        and [tuple(r.values())[:2] for r in q("SHOW SHARES")] == [("acme", "Orders for Acme")]
+
+    # As in Snowflake: a share follows its table through a rename, and loses it with a drop.
+    q("ALTER TABLE kv RENAME TO kv_2025")
+    renamed = tables_of()
+    q("INSERT INTO kv_2025 VALUES (5, 'e', 5)")
+    tier()
+    with open(path, "w") as f:
+        json.dump((rotated if isinstance(rotated, dict) else rotated[0])["profile"], f)
+    kv3 = delta_sharing.load_as_pandas(f"{path}#acme.public.kv")
+    dropped = q("DROP TABLE kv_2025")
+    q("CREATE TABLE kv_2025 (id BIGINT, label VARCHAR, n BIGINT)")
+    checks["a shared table renamed: still shared under its name, with its new rows; dropped: it leaves the share, and a new table of its name isn't shared"] = \
+        renamed == ["public.kv", "sales.orders", "sales.orders_eu"] and frame(kv3[["id", "label", "n"]]) == [(1, "a", 1), (2, "b2", 20), (3, "c", 3), (4, "d", 4), (5, "e", 5)] \
+        and (dropped if isinstance(dropped, dict) else dropped[0]).get("unshared") == ["acme"] and tables_of() == ["sales.orders", "sales.orders_eu"] \
+        and "kv" not in q("SHOW CREATE SHARE acme")[0]["definition"]
+
     q("DROP SHARE acme")
     checks["DROP SHARE: the recipient sees nothing"] = json.loads(door(port, "GET", "/shares", new_token)[2])["items"] == []
     return checks

@@ -3,7 +3,10 @@
 //! `schema.table`; a recipient is a token another company holds, kept as its SHA-256 as users'
 //! tokens are, which signs in only at the sharing door (`sharing.rs`). `GRANT SELECT ON SHARE s TO
 //! RECIPIENT r` lets it read the share. Kept in the catalog: `sh/<share>`, `sr/<recipient>`
-//! (invariant 104). Databricks' words; Snowflake's `GRANT SELECT ON TABLE t TO SHARE s` too.
+//! (invariant 104); their comments where every object's are (`cm/share/…`, `cm/recipient/…`:
+//! `objects.rs`). Databricks' words; Snowflake's `GRANT SELECT ON TABLE t TO SHARE s` too. As in
+//! Snowflake, a share follows its table through a rename and loses it with a drop (`tables_moved`),
+//! so a new table under a dropped one's name is shared only once it is granted.
 //!
 //! A shared table publishes Delta (`delta.rs`): the door hands out the files of a version of its
 //! log, so a recipient sees what Delta's readers see — deletion vectors, renamed columns, purged
@@ -22,8 +25,6 @@ pub fn recipient_key(n: &str) -> String { format!("sr/{n}") }
 #[derive(Serialize, Deserialize, Clone, Default)]
 pub struct Share {
     pub id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub comment: Option<String>,
     #[serde(default)]
     pub tables: Vec<Shared>,
     #[serde(default)]
@@ -48,8 +49,6 @@ pub struct Shared {
 #[derive(Serialize, Deserialize, Clone, Default)]
 pub struct Recipient {
     pub id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub comment: Option<String>,
     pub hash: String, // its token's SHA-256 (hex): the token is shown once, in its profile
     pub created_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -237,6 +236,47 @@ pub async fn recipients(lake: &Lake) -> Result<Vec<(String, Recipient)>> {
 
 fn id() -> String { uuid::Uuid::new_v4().to_string() }
 
+/// A new share's or recipient's comment, kept where `COMMENT ON` keeps it (`cm/{kind}/{name}`); none
+/// takes away one a dropped namesake may have left.
+fn noted(kind: &str, name: &str, comment: Option<String>) -> (Vec<(String, Vec<u8>)>, Vec<String>) {
+    let key = format!("cm/{kind}/{name}");
+    match comment {
+        Some(c) => (vec![(key, json(&c))], vec![]),
+        None => (vec![], vec![key]),
+    }
+}
+
+/// Each share's or recipient's comment (`cm/{kind}/…`), by its name.
+async fn notes(lake: &Lake, kind: &str) -> Result<std::collections::HashMap<String, String>> {
+    let from = format!("cm/{kind}/");
+    Ok(lake.cat.scan::<String>(&from, &format!("cm/{kind}0")).await?.into_iter().map(|(k, v)| (k[from.len()..].to_string(), v)).collect())
+}
+
+/// Tables renamed (to a new name) or dropped (None): the shares that hand them out, changed to
+/// follow them or to leave them out, for the statement's own commit, and those shares' names.
+pub async fn tables_moved(lake: &Lake, moved: &[(&str, Option<&str>)]) -> Result<(Vec<(String, Vec<u8>)>, Vec<String>)> {
+    let mut puts = vec![];
+    let mut names = vec![];
+    for (n, mut s) in shares(lake).await? {
+        let before = s.tables.len();
+        let mut changed = false;
+        s.tables.retain_mut(|x| match moved.iter().find(|(t, _)| *t == x.table) {
+            Some((_, Some(to))) => {
+                x.table = to.to_string(); // (the name it is shared as stays)
+                changed = true;
+                true
+            }
+            Some((_, None)) => false,
+            None => true,
+        });
+        if changed || s.tables.len() < before {
+            puts.push((share_key(&n), json(&s)));
+            names.push(n);
+        }
+    }
+    Ok((puts, names))
+}
+
 /// Leader: carry out a change (under the lake's lock).
 pub async fn apply(lake: &Lake, c: Change) -> Result<Value> {
     let must = |name: &str, s: Option<Share>| s.ok_or_else(|| anyhow!("no share {name} (CREATE SHARE {name})"));
@@ -247,7 +287,8 @@ pub async fn apply(lake: &Lake, c: Change) -> Result<Value> {
                 ensure!(if_not_exists, "share {name} already exists");
                 return Ok(j!({"share": name, "unchanged": true}));
             }
-            lake.cat.commit(vec![put(&name, &Share { id: id(), comment, created_ms: crate::log::now_ms(), ..Default::default() })], &[]).await?;
+            let (note, gone) = noted("share", &name, comment);
+            lake.cat.commit([vec![put(&name, &Share { id: id(), created_ms: crate::log::now_ms(), ..Default::default() })], note].concat(), &gone).await?;
             j!({"share": name})
         }
         Change::DropShare { name, if_exists } => {
@@ -308,8 +349,9 @@ pub async fn apply(lake: &Lake, c: Change) -> Result<Value> {
             }
             let now = crate::log::now_ms();
             let (token, hash) = token()?;
-            let r = Recipient { id: id(), comment, hash, created_ms: now, expires_ms: expires_secs.map(|s| now + s * 1000) };
-            lake.cat.commit(vec![(recipient_key(&name), json(&r))], &[]).await?;
+            let r = Recipient { id: id(), hash, created_ms: now, expires_ms: expires_secs.map(|s| now + s * 1000) };
+            let (note, gone) = noted("recipient", &name, comment);
+            lake.cat.commit([vec![(recipient_key(&name), json(&r))], note].concat(), &gone).await?;
             j!({"recipient": name, "profile": profile(&endpoint, &token, r.expires_ms)}) // (shown this once: only its hash is kept)
         }
         Change::RotateToken { name, expires_secs, endpoint } => {
@@ -414,6 +456,7 @@ pub async fn tables(lake: &Lake) -> Result<Vec<(&'static str, Arc<dyn datafusion
     use datafusion::arrow::array::{ArrayRef, BooleanArray, RecordBatch, StringArray, TimestampMicrosecondArray};
     let mine = crate::auth::limited().is_none();
     let all = if mine { shares(lake).await? } else { vec![] };
+    let (said, told) = if mine { (notes(lake, "share").await?, notes(lake, "recipient").await?) } else { Default::default() };
     let rows: Vec<(&String, &Share, Option<&Shared>)> = all.iter().flat_map(|(n, s)| {
         let t: Vec<Option<&Shared>> = if s.tables.is_empty() { vec![None] } else { s.tables.iter().map(Some).collect() };
         t.into_iter().map(move |t| (n, s, t))
@@ -422,7 +465,7 @@ pub async fn tables(lake: &Lake) -> Result<Vec<(&'static str, Arc<dyn datafusion
     let at = |ms: &dyn Fn(usize) -> Option<u64>, n: usize| Arc::new((0..n).map(|i| ms(i).map(|m| m as i64 * 1000)).collect::<TimestampMicrosecondArray>().with_timezone("UTC")) as ArrayRef;
     let shares = RecordBatch::try_from_iter(vec![
         ("share", s(&|n, _, _| Some(n.clone()))),
-        ("comment", s(&|_, s, _| s.comment.clone())),
+        ("comment", s(&|n, _, _| said.get(n).cloned())),
         ("shared_as", s(&|_, _, t| t.map(|t| format!("{}.{}", t.schema, t.name)))),
         ("table", s(&|_, _, t| t.map(|t| t.table.clone()))),
         ("partitions", s(&|_, _, t| t.map(|t| t.partitions.join(", ")).filter(|p| !p.is_empty()))),
@@ -435,7 +478,7 @@ pub async fn tables(lake: &Lake) -> Result<Vec<(&'static str, Arc<dyn datafusion
     let r = |f: &dyn Fn(&String, &Recipient) -> Option<String>| Arc::new(people.iter().map(|(n, r)| f(n, r)).collect::<StringArray>()) as ArrayRef;
     let recipients = RecordBatch::try_from_iter(vec![
         ("name", r(&|n, _| Some(n.clone()))),
-        ("comment", r(&|_, r| r.comment.clone())),
+        ("comment", r(&|n, _| told.get(n).cloned())),
         ("shares", r(&|n, _| Some(of(n)).filter(|s| !s.is_empty()))),
         ("created", at(&|i| Some(people[i].1.created_ms), people.len())),
         ("expires", at(&|i| people[i].1.expires_ms, people.len())),
