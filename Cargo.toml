@@ -18,6 +18,7 @@ axum = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
+toml = { version = "0.8", default-features = false, features = ["parse"] } # pondra.toml (already built for slatedb's figment)
 bytes = "1"
 uuid = { version = "1", features = ["v4"] }
 clap = { version = "4", features = ["derive"] }

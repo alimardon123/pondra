@@ -557,7 +557,7 @@ pub async fn drop_task(lake: &Lake, name: &str, if_exists: bool) -> Result<serde
 }
 
 /// This lake's tasks, read again only after a commit.
-async fn tasks(lake: &Lake) -> Result<Arc<Vec<(String, Task)>>> {
+pub(crate) async fn tasks(lake: &Lake) -> Result<Arc<Vec<(String, Task)>>> {
     static SEEN: OnceLock<Mutex<HashMap<String, (u64, Arc<Vec<(String, Task)>>)>>> = OnceLock::new();
     let seen = SEEN.get_or_init(Default::default);
     let version = lake.cat.version();
@@ -890,7 +890,7 @@ fn latest(e: &Every, after: u64, now: u64) -> Option<u64> {
 /// Does `sql` read one of these tables?
 pub fn mentioned(sql: &str) -> bool {
     let s = sql.to_lowercase();
-    ["pondra.runs", "pondra.routines", "pondra.tasks", "pondra.tables", "pondra.users", "pondra.grants", "pondra.audit", "pondra.history", "pondra.flows", "pondra.expectations", "pondra.variables", "pondra.dropped", "pondra.databases"].iter().any(|t| s.contains(t))
+    ["pondra.runs", "pondra.routines", "pondra.tasks", "pondra.tables", "pondra.users", "pondra.grants", "pondra.audit", "pondra.history", "pondra.flows", "pondra.expectations", "pondra.variables", "pondra.dropped", "pondra.databases", "pondra.deploys"].iter().any(|t| s.contains(t))
 }
 
 /// `pondra.routines`, `pondra.tasks` and `pondra.tables`, as they are now.
@@ -972,7 +972,7 @@ pub async fn tables(lake: &Lake) -> Result<Vec<(&'static str, Arc<dyn datafusion
         ("rows_in_files", g(&|d| d.meta.files.iter().map(|f| f.rows).sum::<u64>() + d.meta.sealed.as_ref().map_or(0, |s| s.rows))),
         ("bytes_in_files", g(&|d| d.meta.files.iter().map(|f| f.bytes).sum::<u64>() + d.meta.sealed.as_ref().map_or(0, |s| s.bytes))),
     ])?;
-    Ok(vec![("routines", mem(routines)?), ("tasks", mem(tasks)?), ("tables", mem(listed)?), ("dropped", mem(dropped)?), ("databases", mem(crate::branch::databases(lake).await?)?)])
+    Ok(vec![("routines", mem(routines)?), ("tasks", mem(tasks)?), ("tables", mem(listed)?), ("dropped", mem(dropped)?), ("databases", mem(crate::branch::databases(lake).await?)?), ("deploys", mem(crate::deploy::table(lake).await?)?)])
 }
 
 /// `pondra.runs` before any run: no rows, its columns.

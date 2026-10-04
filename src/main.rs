@@ -18,6 +18,7 @@ mod guard;
 mod hilbert;
 mod history;
 mod ddl;
+mod deploy;
 mod defaults;
 mod delta;
 mod ext;
@@ -56,6 +57,7 @@ mod txn;
 mod mcp;
 mod pg;
 mod pg_catalog;
+mod project;
 mod query;
 mod read_delta;
 mod read_iceberg;
@@ -267,6 +269,8 @@ enum Cmd {
         #[command(subcommand)]
         cmd: sync::Command,
     },
+    #[command(flatten)]
+    Project(project::Command),
     /// Print catalog entries whose keys start with `prefix` (t/ tables, s/ segments, p/ producers…).
     Catalog {
         #[arg(long, visible_alias = "lake")]
@@ -718,6 +722,7 @@ async fn run() -> anyhow::Result<()> {
         }
         Cmd::Service { cmd } => service::command(cmd).await?,
         Cmd::Workspace { cmd } => sync::command(cmd).await?,
+        Cmd::Project(cmd) => project::command(cmd).await?,
         Cmd::Catalog { dir, prefix } => {
             let lake = store::Lake::open(&dir, false, false).await?;
             match prefix.starts_with("d/") {

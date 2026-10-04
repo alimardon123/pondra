@@ -387,6 +387,7 @@ pub fn columns_of(returns: &str) -> Result<Vec<(String, String)>> {
 pub async fn create(lake: &Lake, name: &str, r: Routine, replace: bool) -> Result<Value> {
     let name = crate::ddl::new_name(lake, name).await?;
     ensure!(r.kind != Kind::Procedure || !crate::workspace::is_run(crate::ddl::split(&name).1), "{name}: run is Pondra's own procedure (CALL run('etl/orders.sql') runs a file of the lake's)");
+    ensure!(r.kind != Kind::Procedure || !crate::deploy::is_own(crate::ddl::split(&name).1), "{name}: plan and deploy are Pondra's own procedures (CALL deploy('files/sales', env => 'prod'))");
     if let Some(old) = lake.cat.get::<Routine>(&key(&name)).await? {
         ensure!(replace, "{} {name} already exists (CREATE OR REPLACE {})", old.what(), r.what().to_uppercase());
         ensure!((old.kind == Kind::Procedure) == (r.kind == Kind::Procedure), "{name} is a {}", old.what());
@@ -1292,6 +1293,9 @@ async fn one_of(app: &App, sql: &str, who: Who, job: Option<String>) -> Result<O
     if let Some((name, args)) = call_of(sql) {
         if crate::workspace::is_run(&name) {
             return Box::pin(crate::workspace::run(app, &args, who, job, None)).await; // (a file of the lake's: ADR-033)
+        }
+        if crate::deploy::is_own(&name) {
+            return Box::pin(crate::deploy::call(app, &name, &args, who)).await; // (a project in the workspace, planned or deployed: ADR-047 §4)
         }
         let (local, r, row) = Box::pin(prepared(app, &name, &args, who)).await?;
         return Box::pin(run(app, local, r, row, who, job, None)).await;

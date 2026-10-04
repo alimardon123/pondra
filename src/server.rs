@@ -141,6 +141,10 @@ pub fn router(app: App) -> Router {
         .route("/ready", get(ready))
         .route("/login", post(login))
         .route("/whoami", get(whoami))
+        .route("/plan", post(deploy))
+        .route("/deploy", post(deploy))
+        .route("/test", post(deploy))
+        .route("/export", get(|State(app): State<App>| async move { Ok::<_, E>(Json(crate::deploy::export(&app.lake).await?)) }))
         .route("/objects", get(|State(app): State<App>| async move { Ok::<_, E>(Json(crate::console::objects(&app.lake).await?)) }))
         .route("/metrics", get(|State(app): State<App>| async move { crate::metrics::render(&app).await.map_err(E) }))
         .route("/cluster/commit", post(commit))
@@ -986,6 +990,19 @@ async fn secret(State(app): State<App>, Path(name): Path<String>, headers: axum:
     let values = crate::ext::reveal(&app.lake, &name.to_lowercase()).await?;
     crate::auth::revealed(token, values.iter().filter(|(k, _)| *k != "type" && *k != "scope").map(|(_, v)| v.clone()));
     Ok(Json(j!(values)))
+}
+
+/// `POST /plan`, `/deploy`, `/test`: a project's files planned here, deployed, or its tests run
+/// (ADR-047 §4), each with the same body.
+async fn deploy(State(app): State<App>, uri: axum::http::Uri, role: axum::Extension<crate::auth::Role>, headers: axum::http::HeaderMap, Json(ask): Json<crate::deploy::Ask>) -> Result<Json<Value>, E> {
+    use crate::deploy::Verb;
+    let verb = match uri.path().rsplit('/').next() {
+        Some("plan") => Verb::Plan,
+        Some("test") => Verb::Test,
+        _ => Verb::Deploy,
+    };
+    let who = crate::routines::Who { role: role.0, files: owner(&headers), depth: 0 };
+    Ok(Json(crate::deploy::ask(&app, verb, ask, who).await?))
 }
 
 async fn sql_as(app: App, p: SqlParams, role: axum::Extension<crate::auth::Role>, headers: axum::http::HeaderMap, body: Bytes) -> Result<Response, E> {
