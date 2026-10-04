@@ -245,13 +245,25 @@ async fn object(lake: &Lake, path: &str) -> Result<Arc<Vec<u8>>> {
 /// The table's manifests (none if nothing is sealed).
 pub async fn list(lake: &Lake, meta: &TableMeta) -> Result<Vec<Manifest>> {
     match &meta.sealed {
-        Some(s) => Ok(serde_json::from_slice(&object(lake, &s.list).await?)?),
+        Some(s) => {
+            let mut all: Vec<Manifest> = serde_json::from_slice(&object(lake, &s.list).await?)?;
+            if let Some(id) = crate::branch::base_of(&s.list) {
+                all.iter_mut().for_each(|m| m.path = crate::branch::rebase(&m.path, id)); // (a branch's base's list names its paths: ADR-047)
+            }
+            Ok(all)
+        }
         None => Ok(vec![]),
     }
 }
 
 /// The files in one manifest.
-pub async fn files(lake: &Lake, m: &Manifest) -> Result<Vec<DataFile>> { Ok(serde_json::from_slice(&object(lake, &m.path).await?)?) }
+pub async fn files(lake: &Lake, m: &Manifest) -> Result<Vec<DataFile>> {
+    let mut all: Vec<DataFile> = serde_json::from_slice(&object(lake, &m.path).await?)?;
+    if let Some(id) = crate::branch::base_of(&m.path) {
+        all.iter_mut().for_each(|f| crate::branch::rebase_file(f, id));
+    }
+    Ok(all)
+}
 
 /// The files that can hold rows matching `filters`: manifests pruned first, then files.
 /// `manifests`: a subset to look in (a distributed query's slice), else the table's list.
