@@ -6733,6 +6733,26 @@ def registry():
     info["kv"] = kv + [show("table", "kv")]
     checks["a keyed table: a column added, its _deleted its own (never in its definition), DELETE still works"] = kv[0].get("altered") == ["+ w"] \
         and kv[1].get("unchanged") is True and "_deleted" not in show("table", "kv") and q("SELECT k, w FROM kv ORDER BY k") == [{"k": 2}, {"k": 3, "w": 3}]
+    # Branches (ADR-047) are made again by their clone: DROP DATABASE deletes one, so no ATTACH would find it
+    here = q("SELECT name FROM pondra.databases")[0]["name"]
+    dev_at, slim_at = f"{lake}-dev", f"{lake}-slim"
+    LAKES.extend([dev_at, slim_at])
+    q(f"CREATE DATABASE dev LOCATION '{dev_at}' CLONE \"{here}\"")
+    q(f"CREATE DATABASE slim LOCATION '{slim_at}' CLONE \"{here}\" WITH (schemas = (sales)) WITH NO DATA")
+    q("COMMENT ON DATABASE dev IS 'a branch'")
+    branches = {n: show("database", n) for n in ("dev", "slim")}
+    listed = {r["name"]: r.get("definition") for r in q("SELECT name, definition FROM pondra.objects WHERE kind = 'database'")}
+    for n in ("slim", "dev"):
+        q(f"DROP DATABASE {n}")
+    for n in ("dev", "slim"):
+        for stmt in branches[n].split(";\n"):
+            q(stmt.rstrip(";"))
+    info["branches"] = [branches, listed]
+    checks["a branch's SHOW CREATE is its clone (where, which schemas, no data), and run again after a drop makes it again"] = \
+        branches["dev"].startswith(f"CREATE DATABASE dev LOCATION '{dev_at}' CLONE \"{here}\";\nCOMMENT ON DATABASE dev IS 'a branch'") \
+        and branches["slim"].startswith(f"CREATE DATABASE slim LOCATION '{slim_at}' CLONE \"{here}\" WITH (schemas = (sales)) WITH NO DATA") \
+        and branches["dev"].startswith(listed["dev"]) and {n: show("database", n) for n in ("dev", "slim")} == branches \
+        and q("SELECT count(*) AS n FROM slim.sales.orders_2025") == [{"n": 0}] and q("SELECT count(*) AS n FROM dev.events") == [{"n": 1}]
     kinds = call(A.port, "GET", "/kinds")
     checks["GET /kinds and pondra.kinds list every kind and its statements"] = {k["kind"] for k in kinds} >= {"table", "view", "materialized view", "function", "procedure", "task", "schema"} \
         and q("SELECT statements FROM pondra.kinds WHERE kind = 'table'")[0]["statements"].startswith("CREATE, CREATE OR ALTER")

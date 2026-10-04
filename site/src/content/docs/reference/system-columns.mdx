@@ -247,7 +247,7 @@ tables and views they may read, and no secrets, users or roles.
 | `schema` | its schema, or null for a kind that has none (a schema, a user, a role, a lake) |
 | `name` | its name |
 | `comment` | what [`COMMENT ON`](/pondra/reference/sql/#every-kind-of-object) said about it, or null |
-| `definition` | the statement that makes it again, as `SHOW CREATE` gives it without the comments; null for what is never shown (a secret's values, a user's password) |
+| `definition` | the statement that makes it again, as `SHOW CREATE` gives it without the comments (a branch's is the `CREATE DATABASE … CLONE` that made it); null for what is never shown (a secret's values, a user's password) |
 
 `pondra.kinds` lists the kinds: `kind`, `family` (kinds of one family share their names: a table and
 a view can't both be `orders`) and `statements`, the statements the kind takes.
