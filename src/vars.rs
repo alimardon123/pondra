@@ -364,14 +364,11 @@ async fn type_of(app: &App, default: &str) -> Option<String> {
 fn var_of(row: &RecordBatch) -> Result<Var> {
     use datafusion::arrow::util::display::{ArrayFormatter, FormatOptions};
     let col = row.column(0);
-    let ty = col.data_type();
-    ensure!(!ty.is_nested(), "a variable holds one value (a number, a string, a date, …), not a {ty}");
     let shown = match col.is_null(0) {
         true => None,
         false => Some(ArrayFormatter::try_new(col.as_ref(), &FormatOptions::default())?.value(0).to_string()),
     };
-    let text = shown.as_ref().map_or("NULL".to_string(), |s| format!("'{}'", s.replace('\'', "''")));
-    Ok(Var { sql: format!("arrow_cast({text}, '{ty}')"), shown, ty: ty.to_string(), declared: None })
+    Ok(Var { sql: crate::routines::exact(col.as_ref(), 0)?, shown, ty: col.data_type().to_string(), declared: None })
 }
 
 /// The variables there are now, given values not yet set among them: (name, value, type, declared).

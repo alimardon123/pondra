@@ -1046,10 +1046,14 @@ async fn query(app: &App, p: &SqlParams, query: &str, files: bool) -> anyhow::Re
     }
     // Same query, same catalog version: same answer (unless it asks for the time or randomness,
     // or may read a file on this machine).
-    let q = query.to_lowercase();
-    let volatile = files || limited || !crate::ext::names(query).is_empty() || ["now()", "random(", "current_", "uuid(", "explain", "pondra.runs", "pondra.tasks", "pondra.audit", "pondra.history", "pondra$history", "pondra.variables", "files("].iter().any(|f| q.contains(f)) // (files outside the lake change on their own; `files()` lists objects put since)
+    let asks = |text: &str| {
+        let q = text.to_lowercase();
+        !crate::ext::names(text).is_empty() || ["now()", "random(", "current_", "uuid(", "explain", "pondra.runs", "pondra.tasks", "pondra.audit", "pondra.history", "pondra$history", "pondra.variables", "files("].iter().any(|f| q.contains(f)) // (files outside the lake change on their own; `files()` lists objects put since)
+    };
+    let volatile = files || limited || asks(query)
         || crate::temp::mentioned(query) // (the session's temporary tables change without a commit)
         || crate::settings::any() // (and its settings may change the answer)
+        || crate::routines::with_views(&app.lake, query).await.map_or(true, |t| t.len() > query.len() && asks(&t)) // (and so may a view it reads: `now()`, files)
         || crate::routines::volatile(&app.lake, query).await; // (a Python function may answer differently each time)
     let Some(version) = app.lake.version_for(query).await.filter(|_| !volatile) else { return Ok(respond(run_sql(app, p, query, files).await?)) };
     let key = format!("{format}{}|{}|{query}", p.rows.map(|n| format!(":{n}")).unwrap_or_default(), p.spread.as_deref().unwrap_or(""));

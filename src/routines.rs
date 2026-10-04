@@ -336,6 +336,38 @@ fn params(p: &mut Parser) -> Result<Vec<Param>> {
     Ok(params)
 }
 
+/// Does `e` hold a query of its own (its columns may be that query's)?
+fn queries_in(e: &Expr) -> bool {
+    ast::visit_expressions(e, |x| match x {
+        Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } | Expr::Lambda(_) => ControlFlow::Break(()),
+        _ => ControlFlow::Continue(()),
+    })
+    .is_break()
+}
+
+/// The names a function's body gives the relations it reads (a table's own, or its alias).
+fn names_in<T: ast::Visit>(body: &T) -> std::collections::HashSet<String> {
+    struct Names(std::collections::HashSet<String>);
+    impl ast::Visitor for Names {
+        type Break = ();
+        fn pre_visit_table_factor(&mut self, t: &TableFactor) -> ControlFlow<()> {
+            let (name, alias) = match t {
+                TableFactor::Table { name, alias, .. } => (name.0.last().and_then(|p| p.as_ident()), alias),
+                TableFactor::Derived { alias, .. } | TableFactor::Function { alias, .. } | TableFactor::UNNEST { alias, .. } => (None, alias),
+                _ => (None, &None),
+            };
+            self.0.extend(name.into_iter().chain(alias.as_ref().map(|a| &a.name)).map(|i| i.value.to_lowercase()));
+            ControlFlow::Continue(())
+        }
+    }
+    let mut names = Names(Default::default());
+    let _ = body.visit(&mut names);
+    names.0
+}
+
+/// The longest a routine's `timeout` may be: past it a duration would overflow (`1e20`, `inf`).
+const WEEK: f64 = 7.0 * 86400.0;
+
 /// `WITH (vectorized = true, packages = 'requests, jinja2', entry = 'f', timeout = 5)`.
 fn options(p: &mut Parser, o: &mut Options) -> Result<()> {
     p.expect_token(&Token::LParen)?;
@@ -355,7 +387,7 @@ fn options(p: &mut Parser, o: &mut Options) -> Result<()> {
             "strict" => o.strict = yes()?,
             "packages" => o.packages = v.split(',').map(str::trim).filter(|s| !s.is_empty()).collect::<Vec<_>>().join(", "),
             "entry" => o.entry = v.clone(),
-            "timeout" => o.timeout = Some(v.parse::<f64>().ok().filter(|s| *s > 0.0).context("timeout: seconds")?),
+            "timeout" => o.timeout = Some(v.parse::<f64>().ok().filter(|s| *s > 0.0 && *s <= WEEK).context("timeout: seconds, more than 0 and at most a week (604800)")?),
             "cache" => o.cache = Some(match crate::runs::every(&v).context("cache: how long an answer is reused ('10 minutes', '30 seconds')")? {
                 crate::runs::Every::Seconds(s) => s,
                 crate::runs::Every::Cron(..) => bail!("cache: how long ('10 minutes'), not a schedule"),
@@ -1003,11 +1035,7 @@ impl<'a> Expander<'a> {
     /// a table of its own: Postgres passes a function values, so `f(id)` must not become its
     /// table's `id` inside `SELECT max(v) FROM t WHERE k = x`.
     fn qualify(&self, e: &mut Expr) -> Result<()> {
-        let own = ast::visit_expressions(e, |x| match x {
-            Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } | Expr::Lambda(_) => ControlFlow::Break(()),
-            _ => ControlFlow::Continue(()),
-        });
-        if own.is_break() {
+        if queries_in(e) {
             return Ok(()); // (its columns may be its own query's)
         }
         let mut out = Ok(());
@@ -1038,8 +1066,20 @@ impl<'a> Expander<'a> {
         ensure!(self.depth < 16, "{name}: functions calling functions 16 deep (a loop?)");
         let mut values = arguments(name, r, args)?;
         if crate::ddl::mentions(&r.body, "from") {
+            let theirs = names_in(&body);
             for v in values.values_mut() {
                 self.qualify(v).map_err(|e| e.context(format!("{name}'s argument {v}")))?;
+                // A column named by a relation the body names too would be read as the body's.
+                let mut clash = None;
+                let _ = ast::visit_expressions(v, |x| {
+                    if let Expr::CompoundIdentifier(p) = x {
+                        clash = clash.take().or_else(|| p.len().checked_sub(2).map(|i| p[i].value.to_lowercase()).filter(|q| theirs.contains(q)));
+                    }
+                    ControlFlow::<()>::Continue(())
+                });
+                if let Some(q) = clash.filter(|_| !queries_in(v)) {
+                    bail!("{name}'s argument {v} is a column of {q}, and {name} reads {q} too: name it otherwise in the query (FROM {q} AS x)");
+                }
             }
         }
         let values = typed(r, values)?;
@@ -1677,16 +1717,35 @@ fn start<'a>(app: &'a App, name: &'a str, args: &'a [FunctionArg], column: &'a s
 
 /// The arguments as parameters for SQL: each value exactly, at its own type.
 pub fn values_of(row: &RecordBatch) -> Result<HashMap<String, Value>> {
+    row.schema().fields().iter().zip(row.columns()).map(|(f, col)| Ok((f.name().clone(), j!({"sql": exact(col.as_ref(), 0)?})))).collect()
+}
+
+/// A value of an Arrow array as SQL that gives it back exactly, at its own type: its text cast
+/// back (`arrow_cast('2026-09-27', 'Date32')`), bytes from hex (their text is hex, which cast as
+/// it was gave the hex's own bytes), lists and structs item by item (their text doesn't cast).
+pub fn exact(col: &dyn datafusion::arrow::array::Array, i: usize) -> Result<String> {
+    use datafusion::arrow::array::AsArray;
+    use datafusion::arrow::datatypes::DataType as T;
     use datafusion::arrow::util::display::{ArrayFormatter, FormatOptions};
-    let mut out = HashMap::new();
-    for (f, col) in row.schema().fields().iter().zip(row.columns()) {
-        let v = match col.is_null(0) {
-            true => "NULL".to_string(),
-            false => quote(&ArrayFormatter::try_new(col.as_ref(), &FormatOptions::default())?.value(0).to_string()),
-        };
-        out.insert(f.name().clone(), j!({"sql": format!("arrow_cast({v}, '{}')", f.data_type())}));
-    }
-    Ok(out)
+    let ty = col.data_type();
+    let shown = || -> Result<String> { Ok(ArrayFormatter::try_new(col, &FormatOptions::default())?.value(i).to_string()) };
+    let items = |items: datafusion::arrow::array::ArrayRef| -> Result<String> {
+        Ok(format!("make_array({})", (0..items.len()).map(|j| exact(items.as_ref(), j)).collect::<Result<Vec<_>>>()?.join(", ")))
+    };
+    let value = match ty {
+        _ if col.is_null(i) => "NULL".to_string(),
+        T::Binary | T::LargeBinary | T::BinaryView | T::FixedSizeBinary(_) => format!("decode('{}', 'hex')", shown()?),
+        T::List(_) => items(col.as_list::<i32>().value(i))?,
+        T::LargeList(_) => items(col.as_list::<i64>().value(i))?,
+        T::FixedSizeList(..) => items(col.as_fixed_size_list().value(i))?,
+        T::Struct(fields) => {
+            let parts = fields.iter().zip(col.as_struct().columns()).map(|(f, c)| Ok(format!("{}, {}", quote(f.name()), exact(c.as_ref(), i)?)));
+            format!("named_struct({})", parts.collect::<Result<Vec<_>>>()?.join(", "))
+        }
+        T::Map(..) | T::Union(..) | T::ListView(_) | T::LargeListView(_) | T::RunEndEncoded(..) => bail!("a {ty} can't be passed as a value yet"),
+        _ => quote(&shown()?),
+    };
+    Ok(format!("arrow_cast({value}, '{ty}')"))
 }
 
 tokio::task_local! {
@@ -1719,7 +1778,7 @@ async fn python(app: &App, name: &str, r: &Routine, args: RecordBatch, who: Who,
     let url = format!("http://{}", app.cluster.addr.replace("0.0.0.0", "127.0.0.1"));
     let json: Vec<bool> = r.params.iter().map(|p| crate::pyfn::is_json(p.ty.as_deref())).collect();
     let head = j!({"op": "call", "name": name, "body": r.body, "entry": r.with.entry, "params": names(r), "json": json, "url": url, "token": lease.0, "depth": who.depth, "job": job});
-    let limit = r.with.timeout.map(std::time::Duration::from_secs_f64);
+    let limit = r.with.timeout.and_then(|s| std::time::Duration::try_from_secs_f64(s).ok());
     let kind = crate::python::Use::Procedure { nested: crate::python::holding() }; // (called by a procedure that holds a slot: it takes none)
     let mut notice = |n: String| {
         let n = lease.redact(&n);
@@ -1750,14 +1809,39 @@ async fn python(app: &App, name: &str, r: &Routine, args: RecordBatch, who: Who,
 }
 
 /// Does `sql` call a Python function that may answer differently each time (so its result mustn't
-/// be remembered)?
+/// be remembered)? In a view it reads too.
 pub async fn volatile(lake: &Lake, sql: &str) -> bool {
     let Ok(all) = listed(lake).await else { return true };
-    all.iter().any(|(n, r)| r.kind != Kind::Procedure && !r.cacheable() && crate::ddl::mentions(sql, n))
+    reads_any(lake, sql, all.iter().filter(|(_, r)| r.kind != Kind::Procedure && !r.cacheable())).await
 }
 
-/// Does `sql` read a Python table function? Then it runs on one node: each would call it.
+/// Does `sql` read a Python table function, itself or through a view? Then it runs on one node:
+/// each would call it.
 pub async fn pinned(lake: &Lake, sql: &str) -> bool {
     let Ok(all) = listed(lake).await else { return false };
-    all.iter().any(|(n, r)| r.kind == Kind::Table && r.python() && crate::ddl::mentions(sql, n))
+    reads_any(lake, sql, all.iter().filter(|(_, r)| r.kind == Kind::Table && r.python())).await
+}
+
+/// Does `sql`, or a stored view it reads, name one of these routines? The views are looked at only
+/// when there is one to find (most lakes have no Python function).
+async fn reads_any<'a>(lake: &Lake, sql: &str, routines: impl Iterator<Item = (&'a String, &'a Routine)>) -> bool {
+    let names: Vec<&String> = routines.map(|(n, _)| n).collect();
+    if names.is_empty() || names.iter().any(|n| crate::ddl::mentions(sql, n)) {
+        return !names.is_empty();
+    }
+    match with_views(lake, sql).await {
+        Ok(text) => names.iter().any(|n| crate::ddl::mentions(&text, n)),
+        Err(_) => true,
+    }
+}
+
+/// A query's text with the SQL of every stored view it reads, one in another too (macros
+/// expanded): what a query asks for (`now()`, files, a Python function) may be in a view of it.
+pub async fn with_views(lake: &Lake, sql: &str) -> Result<String> {
+    let mut text = sql.to_string();
+    for (_, v) in crate::query::stored_views(lake, sql, false).await? {
+        text.push(' ');
+        text.push_str(&v);
+    }
+    Ok(text)
 }

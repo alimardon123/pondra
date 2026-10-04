@@ -76,8 +76,19 @@ struct Line {
     error: Option<String>,
 }
 
-/// A call being logged: its line, written as it starts and again as it ends.
-pub struct Run(Line);
+/// A call being logged: its line, written as it starts and again as it ends; one dropped before it
+/// ended (its caller went, its task's time ran out) ends as `stopped`, never `running` for good.
+pub struct Run(Option<(App, Line)>);
+
+impl Drop for Run {
+    fn drop(&mut self) {
+        if let Some((app, mut line)) = self.0.take() {
+            (line.ended, line.status) = (Some(now_ms()), "stopped");
+            line.error = Some("it stopped before it ended: its caller went, or its time ran out".into());
+            log(&app, line, None);
+        }
+    }
+}
 
 impl Run {
     pub fn start(app: &App, routine: &str, role: Role, job: Option<&str>, args: &RecordBatch, id: Option<String>) -> Run {
@@ -89,7 +100,7 @@ impl Run {
         let caller = CALLER.try_with(|c| c.clone()).unwrap_or_else(|_| format!("{role:?}").to_lowercase());
         let line = Line { id: id.unwrap_or_else(new_id), routine: routine.into(), caller, node: app.cluster.addr.clone(), job: job.map(String::from), args: cut(args), started: now_ms(), ended: None, status: "running", notices: None, error: None };
         log(app, line.clone(), None);
-        Run(line)
+        Run(Some((app.clone(), line)))
     }
 
     /// The call's line, ended; the answer says when it is in the log (a task waits for it before
@@ -99,8 +110,8 @@ impl Run {
     }
 
     /// The call's line, ended as `status` says (a task's run may be `skipped`).
-    fn ended(self, app: &App, status: &'static str, error: Option<String>, notices: Vec<String>) -> tokio::sync::oneshot::Receiver<()> {
-        let mut line = self.0;
+    fn ended(mut self, app: &App, status: &'static str, error: Option<String>, notices: Vec<String>) -> tokio::sync::oneshot::Receiver<()> {
+        let (_, mut line) = self.0.take().expect("a run ends once");
         (line.ended, line.status) = (Some(now_ms()), status);
         line.error = error.map(cut);
         line.notices = (!notices.is_empty()).then(|| cut(notices.join("\n")));

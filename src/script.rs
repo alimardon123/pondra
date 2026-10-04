@@ -590,16 +590,17 @@ impl<'a> Runner<'a> {
         ensure!(!crate::txn::open(), "PARALLEL runs outside a transaction (its passes would share it): COMMIT first");
         let width = self.texts(&[width.to_string()]).await?.pop().flatten().and_then(|w| w.parse::<usize>().ok()).filter(|w| (1..=64).contains(w));
         let width = width.context("PARALLEL takes how many passes run at once: 1 to 64")?;
-        let mut passes = vec![];
+        let (mut passes, mut seen) = (vec![], HashMap::new());
         for b in batches {
             for row in 0..b.num_rows() {
                 let schema = b.schema();
                 let cols = schema.fields().iter().zip(b.columns()).filter(|(_, c)| !c.data_type().is_nested());
-                passes.push(cols.map(|(f, c)| Ok((format!("{var}__{}", f.name().to_lowercase()), crate::vars::of_column(c.slice(row, 1).as_ref())?))).collect::<Result<Vec<_>>>()?);
+                let vars = cols.map(|(f, c)| Ok((format!("{var}__{}", f.name().to_lowercase()), crate::vars::of_column(c.slice(row, 1).as_ref())?)));
+                passes.push((tag(b, row, &mut seen)?, vars.collect::<Result<Vec<_>>>()?));
             }
         }
         let stop = std::sync::atomic::AtomicBool::new(false);
-        let run = |(n, row): (usize, Vec<(String, crate::vars::Var)>)| {
+        let run = |(n, (tag, row)): (usize, (String, Vec<(String, crate::vars::Var)>))| {
             let (mut child, own, stop) = (self.child(), crate::vars::snapshot(), &stop);
             child.rows.push(var.to_string());
             own.own.lock().unwrap().extend(row);
@@ -607,7 +608,7 @@ impl<'a> Runner<'a> {
                 if stop.load(std::sync::atomic::Ordering::Relaxed) {
                     return Ok(());
                 }
-                let out = child.pass(body, path, n, label).await;
+                let out = child.pass(body, path, &tag, label).await;
                 let out = match (out, child.settle().await) {
                     (Err(e), _) | (_, Err(e)) => Err(e),
                     (Ok(None), _) => Ok(()),
@@ -738,8 +739,9 @@ impl<'a> Runner<'a> {
         Ok(())
     }
 
-    /// A loop's body, run as its pass says: `Some(flow)` ends the loop with that flow.
-    async fn pass(&mut self, body: &Steps, path: &str, n: usize, label: &Option<String>) -> Result<Option<Flow>> {
+    /// A loop's body, run as its pass says: `Some(flow)` ends the loop with that flow. `n` is the
+    /// pass's place in the job (its number, or a FOR row's `tag`).
+    async fn pass(&mut self, body: &Steps, path: &str, n: &str, label: &Option<String>) -> Result<Option<Flow>> {
         let ours = |l: &Option<String>| l.is_none() || l == label;
         // A pass that reads only variables never waits, so a loop would hold its thread for good:
         // nothing else would run there, and a task's timeout, or a caller gone, would never stop it.
@@ -751,6 +753,21 @@ impl<'a> Runner<'a> {
             other => Some(other),
         })
     }
+}
+
+/// A FOR row's place in its loop's job: its values, hashed, and how many equal rows came before it,
+/// never its number. A run retried with its job whose query gives the rows in another order (no
+/// ORDER BY, a spread query) gives each row the place it had, so each row's statements write once.
+fn tag(b: &RecordBatch, row: usize, seen: &mut HashMap<u64, usize>) -> Result<String> {
+    use datafusion::arrow::util::display::{ArrayFormatter, FormatOptions};
+    let mut h = 0xcbf29ce484222325u64; // (FNV-1a: the same in every build, as a job's parts must be)
+    for c in b.columns() {
+        let text = format!("{}:{}", c.data_type(), ArrayFormatter::try_new(c.as_ref(), &FormatOptions::default().with_null("\\N"))?.value(row));
+        h = text.bytes().chain([0]).fold(h, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3));
+    }
+    let k = seen.entry(h).or_insert(0);
+    *k += 1;
+    Ok(format!("{h:016x}.{}", *k - 1))
 }
 
 // ---------------------------------------------------------------- the kinds of statement
@@ -974,12 +991,13 @@ impl Step for Loop {
                 if let Some(width) = parallel {
                     return r.parallel(var, &batches, width, &self.body, &path, &self.label).await;
                 }
-                let mut n = 0;
+                let (mut n, mut seen) = (0, HashMap::new());
                 r.rows.push(var.clone());
                 r.blocks.push(vec![]);
                 let out = async {
                     for b in &batches {
                         for row in 0..b.num_rows() {
+                            let tag = tag(b, row, &mut seen)?;
                             for (f, col) in b.schema().fields().iter().zip(b.columns()) {
                                 let name = format!("{var}__{}", f.name().to_lowercase());
                                 if n == 0 {
@@ -989,7 +1007,7 @@ impl Step for Loop {
                                     crate::vars::put(&name, Some(crate::vars::of_column(col.slice(row, 1).as_ref())?));
                                 }
                             }
-                            if let Some(f) = r.pass(&self.body, &path, n, &self.label).await? {
+                            if let Some(f) = r.pass(&self.body, &path, &tag, &self.label).await? {
                                 return Ok(f);
                             }
                             n += 1;
@@ -1009,7 +1027,7 @@ impl Step for Loop {
                         break;
                     }
                 }
-                if let Some(f) = r.pass(&self.body, &path, n, &self.label).await? {
+                if let Some(f) = r.pass(&self.body, &path, &n.to_string(), &self.label).await? {
                     return Ok(f);
                 }
                 r.at = at;
