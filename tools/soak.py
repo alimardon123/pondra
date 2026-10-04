@@ -19,9 +19,10 @@ and then, and what drifts over time measured.
 
   At the end the load stops and it checks: every acknowledged batch once and `kv` as the model,
   on every node; the views equal their rows; the log drained (no rows left untiered within two
-  minutes); memory flat (each node process that lived ten samples: the last tenth of its life
-  within 1.5x of its second tenth's, after the warm-up, plus 64 MB). It reports the lake's objects (data files, log segments, the
-  catalog's) and every stop's longest wait. Prints the checks as JSON (and writes them to --out)
+  minutes); memory flat (each node process that lived ten samples: its own memory, less the hot
+  columns' cache, in the last tenth of its life within 1.5x of its second tenth's, after the
+  warm-up, plus 64 MB). It reports the lake's objects (data files, log segments, the catalog's)
+  and every stop's longest wait. Prints the checks as JSON (and writes them to --out)
   and exits 1 if one fails.
 
 --s3: the lake is s3://$PONDRA_BUCKET/soak-<id> (AWS_* point at R2, MinIO or tools/sim_r2.py),
@@ -41,11 +42,12 @@ from upgrade_check import Load, Node, stop_all, until  # noqa: E402  (the same n
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 
-def rss_mb(n):
-    """A node's resident memory (Linux), or None."""
+def rss_mb(n, kind="VmRSS"):
+    """A node's resident memory (Linux), or None; `RssAnon`: its own, without the pages of the
+    binary's code, which the kernel maps from the file (about 130 MB once the paths have run)."""
     try:
         with open(f"/proc/{n.p.pid}/status") as f:
-            return next(int(l.split()[1]) // 1024 for l in f if l.startswith("VmRSS:"))
+            return next(int(l.split()[1]) // 1024 for l in f if l.startswith(kind + ":"))
     except (OSError, StopIteration, AttributeError):
         return None
 
@@ -146,7 +148,7 @@ def main():
         span, wrote = time.time() - (samples[-1]["at"] if samples else start), now_wrote
         if not A.s3 or time.time() - last_list > 1800:
             listed, last_list = objects(lake), time.time()
-        line = {"t": round(was["elapsed"] + time.time() - start), "at": time.time(), "object_writes_per_s": round(made / max(span, 1), 1), "rss_mb": {x.port: rss_mb(x) for x in live}, "hot_mb": {p: round(g.get("pondra_hot_bytes", 0) / 2**20) for p, g in got.items()}, "pids": {x.port: x.p.pid for x in live},
+        line = {"t": round(was["elapsed"] + time.time() - start), "at": time.time(), "object_writes_per_s": round(made / max(span, 1), 1), "rss_mb": {x.port: rss_mb(x) for x in live}, "anon_mb": {x.port: rss_mb(x, "RssAnon") for x in live}, "hot_mb": {p: round(g.get("pondra_hot_bytes", 0) / 2**20) for p, g in got.items()}, "pids": {x.port: x.p.pid for x in live},
                 "untiered_rows": stats.get("untiered_rows"), "commit_ms_p95": stats.get("commit_ms_p95"),
                 "longest_ack_s": load.longest(mark), "acked": sum(load.acked.values()),
                 "torn": len(load.torn), **({"objects": listed} if listed else {})}
@@ -191,21 +193,22 @@ def main():
                                                          and live[0].q("SELECT count(*) AS n FROM tens") == live[0].q("SELECT count(*) AS n FROM ev WHERE i = 0 AND seq % 10 = 0")
                                                          and same("SELECT count(*) AS n FROM ev") and same("SELECT * FROM per_producer ORDER BY producer"))
     checks["the log drains: no rows left untiered two minutes after the load"] = bool(drained)
-    # Memory: each process's (a node started again is another) over its life, if it lived ten
+    # Memory: each process's own (a node started again is another) over its life, if it lived ten
     # samples: the median of its last tenth against that of its second (the first is warm-up),
     # less its hot columns: a cache of the columns read lately, which grows with the tables up to
     # its own limit (hot.rs) and gives memory back past three fifths of the machine.
     lives = collections.defaultdict(list)
     for s in samples:
         for port, pid in s["pids"].items():
-            if s["rss_mb"].get(port):
-                lives[(port, pid)].append(s["rss_mb"][port] - s.get("hot_mb", {}).get(port, 0))
+            own = s.get("anon_mb", s["rss_mb"]).get(port)
+            if own:
+                lives[(port, pid)].append(own - s.get("hot_mb", {}).get(port, 0))
     median = lambda xs: sorted(xs)[len(xs) // 2]
     drift = {f"{port} (pid {pid})": {"early_mb": median(xs[len(xs) // 10:max(2, 2 * len(xs) // 10)]), "late_mb": median(xs[-max(1, len(xs) // 10):]), "samples": len(xs)}
              for (port, pid), xs in lives.items() if len(xs) >= 10}
     info["memory"] = drift
     info["hot columns at the end, MB"] = samples[-1].get("hot_mb") if samples else None
-    checks["memory flat (less the hot columns' cache): each node's last tenth within 1.5x (+64 MB) of its second"] = bool(drift) and all(d["late_mb"] <= d["early_mb"] * 1.5 + 64 for d in drift.values())
+    checks["memory flat (its own, less the hot columns' cache): each node's last tenth within 1.5x (+64 MB) of its second"] = bool(drift) and all(d["late_mb"] <= d["early_mb"] * 1.5 + 64 for d in drift.values())
     end = objects(lake)
     info["objects at the end"] = end
     info["object writes a second (every node)"] = round(sum(s["object_writes_per_s"] for s in samples[1:]) / max(1, len(samples) - 1), 1)
