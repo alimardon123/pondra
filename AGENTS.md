@@ -66,7 +66,8 @@ src/      28,600 lines of Rust, one file per concern (see the table in README.md
           dropping work), service.rs (`pondra service`: systemd, launchd, a Windows service;
           ADR-041), past.rs (a table's past: `AT (…)`, `RESTORE`, ADR-043) and history.rs (every
           statement a row of `pondra.history`, slow ones with plans and traces, ADR-048); round 34
-          friendly.rs (DuckDB's spellings, rewritten where SQL comes in: invariant 225)
+          friendly.rs (DuckDB's spellings, rewritten where SQL comes in: invariant 225) and objects.rs
+          (one registry of every kind of object: ADR-049, invariant 227)
 brand/    the logo (mark.svg), colours (colors.css) and fonts (fonts/: Geist and Geist Mono, SIL
           OFL): the only copies; tools/brand_check.py
 site/     the documentation website (Starlight; ADR-030): site/STYLE.md says how pages are written,
@@ -1502,7 +1503,14 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    `routines::sql` (sqlparser writes `- -3` as `--3`, a comment); DataFusion's aggregate schema
    check is off (its two analyses of a CASE's nullability disagree; the rows are the same).
    `harness.py friendly`'s last five checks fail without them.
-227. **An `INSERT … SELECT` or `CREATE TABLE AS` is written by every node only when its rows split as
+227. **Every kind of object is one registry entry, and its comments live apart from it** (`objects.rs`,
+   ADR-049): a new kind adds a `KINDS` entry (and a lister in `FAMILIES` for a new family), never a
+   listing of its own; `pondra.objects`, `SHOW CREATE`, `COMMENT ON` and `GET /kinds` read the
+   registry. A comment is `cm/{family}/{name}` (a column's by its stored name), moved by a rename and
+   removed by a drop in `objects::follow`, which `ddl::apply` calls. `SHOW CREATE` of every kind, run
+   again after a drop, makes the same object; `CREATE OR ALTER TABLE` never loses or reinterprets a
+   row, and refuses by name what it can't do by adding at the end or widening. `harness.py registry`.
+228. **An `INSERT … SELECT` or `CREATE TABLE AS` is written by every node only when its rows split as
    they are, under one reserved commit** (`spmd::insert`, `writers`, `/cluster/insert`): the query's
    biggest append table sliced, the rest read whole, no exchange and no sort on top (a `GROUP BY`, a
    join that shuffles, an `ORDER BY` or a `LIMIT` is written from one node), and this node writes its
@@ -1537,6 +1545,7 @@ python3 tools/harness.py hot            # hot columns skip batches by their rang
 python3 tools/harness.py minmax         # a global min/max over 24 files skips no row its other answers need (an expression, NULLs so far, FILTER); a wide top-N's answer
 python3 tools/harness.py history        # pondra.history: every door's statements, slow ones' plans and three nodes' traces, the rate, off, who reads what
 python3 tools/harness.py friendly       # DuckDB's spellings (PIVOT, COLUMNS, lambdas, ASOF … ON, SUMMARIZE, samples, …) == DuckDB's answers; spread, Postgres, views
+python3 tools/harness.py registry       # pondra.objects, SHOW CREATE of every kind run again after a drop, COMMENT ON through renames, CREATE OR ALTER TABLE, GET /kinds
 python3 tools/random_sql.py --queries 100000 # random queries: one node == DuckDB, every tenth == three nodes, each split three ways by a condition (TLP)
 python3 tools/harness.py tasks          # task graphs on three nodes: AFTER, WHEN, pondra.result, retries, timeouts, SUSPEND, refusals, a failover
 python3 tools/harness.py sparksql       # spark.sql / spark_sql('…') in Spark's grammar: literals, LATERAL VIEW, Spark's floor and substring, frames on top, refusals
