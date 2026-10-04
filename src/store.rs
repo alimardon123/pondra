@@ -436,6 +436,7 @@ pub struct Lake {
     cached: Option<Arc<crate::cache::CachedStore>>, // what DataFusion reads the bucket through
     pub ids: crate::sys::Ids, // the row ids this process stamps rows with (a block reserved from the leader)
     pub caught: watch::Sender<bool>, // false while a node that just started catches up with its leader (`caught_up`)
+    bases: std::sync::RwLock<BTreeMap<String, (String, Option<Store>)>>, // a branch's bases (ADR-047): id -> place, and its store once read
     sessions: Mutex<std::collections::HashMap<usize, datafusion::execution::SessionState>>, // (`session_with`'s, made once a partition count)
     me: std::sync::Weak<Lake>,
 }
@@ -646,8 +647,9 @@ impl Lake {
         };
         crate::format::check(&cat, &url, writer).await?; // (a lake a newer Pondra wrote: refused before its tables are read, ADR-039)
         let hwm = watch::Sender::new(cat.get::<u64>("n").await?.unwrap_or(1) - 1);
-        let lake = Arc::new_cyclic(|me| Lake { url, store, cat, hwm, backlog: Default::default(), rt, tail: Default::default(), disk, groups: crate::serve::Groups::new(cache_mb() << 19), hot: Arc::new(crate::hot::Hot::new()), attached: Default::default(), ids: Default::default(), cached: cached_store, caught: watch::channel(true).0, sessions: Default::default(), me: me.clone() });
+        let lake = Arc::new_cyclic(|me| Lake { url, store, cat, hwm, backlog: Default::default(), rt, tail: Default::default(), disk, groups: crate::serve::Groups::new(cache_mb() << 19), hot: Arc::new(crate::hot::Hot::new()), attached: Default::default(), ids: Default::default(), cached: cached_store, caught: watch::channel(true).0, bases: Default::default(), sessions: Default::default(), me: me.clone() });
         lake.hot.watch(); // the decoded columns give memory back when the node needs it
+        crate::branch::load(&lake).await?; // (a branch's files listed in its bases: ADR-047)
         if let Some(writes) = lake.cat.unstarted.lock().unwrap().take() {
             crate::panics::spawn(lake.clone().commits(writes));
         }
@@ -737,7 +739,7 @@ impl Lake {
                 Some("t/") => serde_json::from_slice::<TableMeta>(value).map(|m| m.files.into_iter().filter(|f| f.bytes <= 256 << 20).map(|f| f.path).collect()).unwrap_or_default(),
                 _ => vec![], // (keys like "c" and "n" are one character long)
             };
-            paths.into_iter().filter(|p| !p.is_empty()).for_each(|p| disk.fetch_later(p));
+            paths.into_iter().filter(|p| !p.is_empty() && !p.starts_with("_base/")).for_each(|p| disk.fetch_later(p));
         }
     }
 
@@ -755,7 +757,7 @@ impl Lake {
         }
         let mut budget = disk.max / 2;
         for f in tables.iter().flat_map(|(_, m)| m.files.iter().rev()) {
-            if f.bytes <= budget {
+            if f.bytes <= budget && !f.path.starts_with("_base/") {
                 budget -= f.bytes;
                 disk.fetch_later(f.path.clone());
             }
@@ -826,7 +828,11 @@ impl Lake {
             }
             _ => {}
         }
-        self.attached.write().unwrap().push((name.to_string(), other));
+        // (the catalog's sync and an ATTACH may both open it at once, on a bucket for seconds: one is kept)
+        let mut attached = self.attached.write().unwrap();
+        if !attached.iter().any(|(n, _)| n == name) {
+            attached.push((name.to_string(), other));
+        }
         Ok(())
     }
 
@@ -878,10 +884,50 @@ impl Lake {
 
     /// Full URL of an object, for DataFusion.
     pub fn full(&self, path: &str) -> String {
-        match path.contains("://") {
-            true => path.to_string(), // (a file outside the lake: `ext.rs`)
-            false => format!("{}/{path}", self.url),
+        if path.contains("://") {
+            return path.to_string(); // (a file outside the lake: `ext.rs`)
         }
+        if let Some((id, rest)) = crate::branch::split(path) {
+            if let Some((url, _)) = self.bases.read().unwrap().get(id) {
+                return format!("{url}/{rest}"); // (a branch's file in its base: ADR-047)
+            }
+        }
+        format!("{}/{path}", self.url)
+    }
+
+    /// A branch's base (ADR-047), so the paths it lists there resolve: DataFusion reads its files
+    /// through this lake's bucket reader when they share a bucket, or one of its own.
+    pub fn add_base(&self, id: &str, url: &str) -> Result<()> {
+        if self.bases.read().unwrap().contains_key(id) {
+            return Ok(());
+        }
+        match (bucket_url(url), &self.cached) {
+            (Some(bucket), Some(ours)) if bucket_url(&self.url).as_ref() == Some(&bucket) => ours.add_lake(url[bucket.len()..].trim_start_matches('/')),
+            (Some(bucket), _) => {
+                if let Ok((_, _, Some((root, whole)))) = open_store(url) {
+                    let prefix = url[root.len()..].trim_start_matches('/').to_string();
+                    self.rt.register_object_store(&url::Url::parse(&bucket)?, Arc::new(crate::cache::CachedStore::new(whole, cache_mb() << 20, None, &prefix)));
+                }
+            }
+            _ => {}
+        }
+        self.bases.write().unwrap().insert(id.to_string(), (url.to_string(), None));
+        Ok(())
+    }
+
+    /// A branch's base's store, for the objects of the base it reads whole (manifests, segments).
+    fn base_store(&self, id: &str) -> Result<Store> {
+        let url = match self.bases.read().unwrap().get(id) {
+            Some((_, Some(store))) => return Ok(store.clone()),
+            Some((url, None)) => url.clone(),
+            None => anyhow::bail!("no base {id} in this branch"),
+        };
+        anyhow::ensure!(url.contains("://") || std::path::Path::new(&url).exists(), "this branch's base {url} is gone");
+        let store = open_store(&url)?.1;
+        if let Some(b) = self.bases.write().unwrap().get_mut(id) {
+            b.1 = Some(store.clone());
+        }
+        Ok(store)
     }
 
     /// The store DataFusion reads `url` through (for lakes on object storage: the read cache and
@@ -910,7 +956,10 @@ impl Lake {
                 return Ok(bytes.into());
             }
         }
-        let bytes = self.store.get(&Path::from(path)).await?.bytes().await?;
+        let bytes = match crate::branch::split(path) {
+            Some((id, rest)) => self.base_store(id)?.get(&Path::from(rest)).await?.bytes().await?, // (a branch's base's: ADR-047)
+            None => self.store.get(&Path::from(path)).await?.bytes().await?,
+        };
         if let Some(disk) = disk {
             disk.put(path, &bytes);
         }
@@ -1066,6 +1115,9 @@ impl Lake {
     }
 
     pub async fn delete(&self, path: &str) {
+        if path.starts_with("_base/") {
+            return; // a branch never deletes its base's files (ADR-047): the base lets them go
+        }
         self.store.delete(&Path::from(path)).await.ok();
     }
 }
@@ -1686,6 +1738,13 @@ impl Catalog {
             self.flushed.store(next, Relaxed);
         }
         Ok(())
+    }
+
+    /// A new branch's leader (ADR-047): its commits number after its base's, whose rows it holds
+    /// with their `_version`s.
+    pub async fn start_after(&self, c: u64) {
+        let mut order = self.order.lock().await;
+        *order = (*order).max(c + 1);
     }
 
     /// Write puts and deletes atomically and wait until committed (see `Lake::commits`).

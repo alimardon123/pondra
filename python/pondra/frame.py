@@ -73,9 +73,15 @@ class Expr:
     def __bool__(self):
         raise TypeError("a pondra expression has no truth value: combine them with & | ~, not and / or / not")
 
+    _text = False  # text for certain (a string value, or text joined to one): `+` joins it, as Polars' does
+
     def _op(self, op, other, right=False):
         o = expr(other)
         a, b = (o, self) if right else (self, o)
+        if op == "+" and (a._text or b._text):
+            out = Expr(f"({a.sql} || {b.sql})", a.name or b.name)
+            out._text = True
+            return out
         return Expr(f"({a.sql} {op} {b.sql})", a.name or b.name)
 
     def _fn(self, f, *args, name=None):
@@ -117,7 +123,9 @@ class Expr:
         return _floordiv(expr(o), self, expr(o).name or self.name)
 
     def alias(self, name):
-        return Expr(self.sql, name, self._over)
+        out = Expr(self.sql, name, self._over)
+        out._text = self._text
+        return out
 
     def cast(self, dtype):
         return Expr(f"CAST({self.sql} AS {sql_type(dtype)})", self.name)
@@ -358,7 +366,11 @@ def col(name):
 
 
 def lit(value):
-    return value if isinstance(value, Expr) else Expr(_literal(value), "literal")
+    if isinstance(value, Expr):
+        return value
+    out = Expr(_literal(value), "literal")
+    out._text = isinstance(value, str)
+    return out
 
 
 def sql_expr(sql):
