@@ -112,41 +112,44 @@ impl AsyncScalarUDFImpl for Ai {
 /// Every question's answer, in order (`None` where its call failed): embeddings `EMBEDS` texts to a
 /// request (by model), completions one each, at most `PONDRA_AI_CALLS` requests in flight on the node.
 async fn ask(embed: bool, questions: &[(&str, &str)]) -> Vec<Option<Value>> {
-    let mut models: Vec<(&str, Vec<usize>)> = Vec::new();
+    let mut models: Vec<Vec<usize>> = Vec::new(); // (each model's questions)
     for (n, (model, _)) in questions.iter().enumerate() {
-        match models.iter_mut().find(|(m, _)| m == model) {
-            Some((_, texts)) => texts.push(n),
-            None => models.push((model, vec![n])),
+        match models.iter_mut().find(|m| questions[m[0]].0 == *model) {
+            Some(texts) => texts.push(n),
+            None => models.push(vec![n]),
         }
     }
     let size = if embed { EMBEDS } else { 1 };
-    let requests = models.into_iter().flat_map(|(m, texts)| texts.chunks(size).map(|t| (m, t.to_vec())).collect::<Vec<_>>());
-    let one = |(model, texts): (&str, Vec<usize>)| async move {
-        let inputs: Vec<&str> = texts.iter().map(|&n| questions[n].1).collect();
-        let _turn = turns().acquire().await;
-        let answers = match call(embed, &inputs, model).await {
-            Ok(answers) => answers.into_iter().map(Some).collect(),
-            Err(e) if inputs.len() > 1 && refused(&e) => {
-                // (an endpoint that takes one text a request: each alone)
-                let mut out = Vec::new();
-                for text in &inputs {
-                    out.push(call(embed, &[text], model).await.map_err(|e| failed(embed, &e)).ok().and_then(|a| a.into_iter().next()));
-                }
-                out
-            }
-            Err(e) => {
-                failed(embed, &e);
-                vec![None; texts.len()]
-            }
-        };
-        texts.into_iter().zip(answers).collect::<Vec<_>>()
-    };
+    let requests: Vec<Vec<usize>> = models.iter().flat_map(|texts| texts.chunks(size).map(<[usize]>::to_vec)).collect();
     let mut out = vec![None; questions.len()];
-    let mut done = futures::stream::iter(requests.map(one)).buffer_unordered(usize::MAX);
+    let mut done = futures::stream::iter(requests.into_iter().map(|texts| request(embed, questions, texts))).buffer_unordered(usize::MAX);
     while let Some(answered) = done.next().await {
         answered.into_iter().for_each(|(n, a)| out[n] = a);
     }
     out
+}
+
+/// One request's answers (its questions all of one model), each with its question's number.
+async fn request(embed: bool, questions: &[(&str, &str)], texts: Vec<usize>) -> Vec<(usize, Option<Value>)> {
+    let model = questions[texts[0]].0;
+    let inputs: Vec<&str> = texts.iter().map(|&n| questions[n].1).collect();
+    let _turn = turns().acquire().await;
+    let answers = match call(embed, &inputs, model).await {
+        Ok(answers) => answers.into_iter().map(Some).collect(),
+        Err(e) if inputs.len() > 1 && refused(&e) => {
+            // (an endpoint that takes one text a request: each alone)
+            let mut out = Vec::new();
+            for &text in &inputs {
+                out.push(call(embed, &[text], model).await.map_err(|e| failed(embed, &e)).ok().and_then(|a| a.into_iter().next()));
+            }
+            out
+        }
+        Err(e) => {
+            failed(embed, &e);
+            vec![None; texts.len()]
+        }
+    };
+    texts.into_iter().zip(answers).collect::<Vec<_>>()
 }
 
 /// A batch the endpoint wouldn't take as it was sent (or answered only in part).
