@@ -77,7 +77,7 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
     }).transpose()?;
     schema(&columns)?; // validate types
     ensure!(columns.iter().all(|(c, _)| !crate::sys::NAMES.contains(&c.as_str()) && c != "_old_version"), "{} are system columns: every table has them (`SELECT _row_id, * FROM t`)", crate::sys::NAMES.join(", "));
-    ensure!(merge.values().all(|f| ["sum", "count", "min", "max"].contains(&f.as_str())), "MERGE: sum, count, min or max");
+    ensure!(merge.values().all(|f| ["sum", "count", "min", "max", crate::finish::MOMENTS].contains(&f.as_str())), "MERGE: sum, count, min or max"); // (moments: a view's variance, `finish.rs`; an ALTER of its table sends them back)
     ensure!(merge.is_empty() || !key.is_empty(), "MERGE needs a key: a merge table combines the rows of each key");
     ensure!(merge.keys().all(|c| columns.iter().any(|(n, _)| n == c)), "MERGE: columns of the table");
     if let Some((c, _)) = columns.iter().find(|(c, _)| !merge.is_empty() && !key.contains(c) && !merge.contains_key(c)) {

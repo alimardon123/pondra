@@ -26,6 +26,7 @@ mod format;
 mod friendly;
 mod flight;
 mod fresh;
+mod finish;
 mod fsum;
 mod hot;
 mod intervals;

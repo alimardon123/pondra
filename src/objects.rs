@@ -335,7 +335,7 @@ fn materialized_sql(name: &str, v: &crate::views::View, meta: Option<&TableMeta>
     }
     let expect = if expect.is_empty() { String::new() } else { format!(" (\n  {}\n)", expect.join(",\n  ")) };
     let with = if with.is_empty() { String::new() } else { format!(" WITH ({})", with.join(", ")) };
-    format!("CREATE MATERIALIZED VIEW {name}{expect}{with} AS\n{}", v.sql)
+    format!("CREATE MATERIALIZED VIEW {name}{expect}{with} AS\n{}", v.query())
 }
 
 /// `CREATE FUNCTION`, `CREATE MACRO` or `CREATE PROCEDURE`, in the form it was made in.

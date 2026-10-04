@@ -223,8 +223,9 @@ w                    sensor  total  n
 2026-01-01T10:01:00  a       30.0   1
 ```
 
-A view can't take `avg`, because partial results can't be combined. Use `sum` and `count`, and
-divide when you read.
+A window made with these options keeps `sum`, `count`, `min` and `max`. For `avg`, `stddev` or
+`HAVING`, write it as `GROUP BY` a time bucket `… EMIT FINAL` (see
+[Streaming](/pondra/guides/streaming/#windows-each-group-once-its-over)).
 
 For sliding windows, add `slide_secs`, and make the view's `date_bin` that long. This makes a
 five-minute window every minute, and each row is added once, not once per window:

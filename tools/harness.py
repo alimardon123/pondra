@@ -33,7 +33,7 @@
   harness.py all                 quick run of everything
 """
 import http.client as http_client
-import argparse, atexit, glob as glob_, http.client, itertools, json, os, random, shutil, signal, subprocess, sys, tempfile, threading, time, traceback, urllib.request, uuid
+import argparse, atexit, glob as glob_, http.client, itertools, json, math, os, random, shutil, signal, subprocess, sys, tempfile, threading, time, traceback, urllib.request, uuid
 
 BIN = os.environ.get("PONDRA_BIN", os.path.join(os.path.dirname(os.path.abspath(__file__)), "../target/release/pondra"))
 A = None  # parsed args
@@ -1613,6 +1613,139 @@ def finals():
                           "again": again, "every": every, "replaced": replaced, "upto": upto, "sessions": kept_sessions}, indent=1, default=str)[-8000:])
         sys.exit(1)
     return "windows as SQL (GROUP BY a time bucket EMIT FINAL): each group once when event time passes it, == the query ad hoc; late rows counted; idle; sessions; SHOW CREATE; a restart keeps nothing twice"
+
+
+def _close(got, want):
+    """Rows equal, floats to 1e-9 of each other (a variance kept as moments adds up in another order)."""
+    def same(a, b):
+        if isinstance(a, float) or isinstance(b, float):
+            return isinstance(a, (int, float)) and isinstance(b, (int, float)) and math.isclose(a, b, rel_tol=1e-9, abs_tol=1e-9)
+        return a == b
+    return len(got) == len(want) and all(g.keys() == w.keys() and all(same(g[k], w[k]) for k in g) for g, w in zip(got, want))
+
+
+SALES_ROWS = ("SELECT CASE WHEN i % 3 = 0 THEN 'east' WHEN i % 3 = 1 THEN 'west' ELSE 'north' END AS region, CAST(i % 7 AS INT) AS store, "
+              "CAST(i AS DOUBLE) * 1.5 + 0.1 AS amount, CAST(CAST(i % 1000 AS DECIMAL(10, 2)) / 7 AS DECIMAL(10, 2)) AS price, i % 5 <> 0 AS ok, "
+              "TIMESTAMP '2026-10-04 00:00:00' + CAST(i AS BIGINT) * INTERVAL '1 second' AS ts FROM (SELECT value AS i FROM generate_series({}, {}))")
+
+
+def finishes_on_three():
+    """`finishes`' cluster part: a finished view read whole beside a table spread over three nodes."""
+    lake, at = new_lake(), A.port + 1
+    nodes = [Node(lake, at + i, env={"PONDRA_SPREAD_MB": "0"} if i == 0 else None).start() for i in range(3)]
+    q = lambda s, spread: call(at, "POST", f"/sql?spread={spread}", s.encode())
+    q("CREATE TABLE sales (region VARCHAR, store INT, amount DOUBLE, price DECIMAL(10, 2), ok BOOLEAN, ts TIMESTAMP)", 0)
+    q("CREATE MATERIALIZED VIEW stats AS SELECT region, avg(amount) AS mean, stddev(amount) AS sd FROM sales GROUP BY region HAVING count(*) > 1", 0)
+    for k in range(6):  # (six files: a share for each node)
+        q("INSERT INTO sales " + SALES_ROWS.format(k * 5000 + 1, k * 5000 + 5000), 0)
+    while len(call(at, "GET", "/stats")["nodes"]) < 3:  # (every node heard from)
+        time.sleep(0.2)
+    joined = "SELECT s.region, s.mean, s.sd, count(*) AS n, sum(x.amount) AS total FROM sales x JOIN stats s ON x.region = s.region GROUP BY 1, 2, 3 ORDER BY 1"
+    ran = lambda: (lambda m: m["pondra_spread_queries_total"] + m["pondra_shuffled_queries_total"])(metrics_of(at))
+    before = ran()
+    one, many = q(joined, 0), q(joined, 1)
+    spread = ran() - before
+    failed = any("distributed query failed" in open(n.log).read() for n in nodes)
+    for n in nodes:
+        n.kill()
+    return spread >= 1 and not failed and len(one) == 3 and _close(many, one)
+
+
+def finishes():
+    """Materialized views whose answers need a last step (ADR-055): avg, stddev, variance, bool_and
+    and bool_or, expressions over aggregates, HAVING, ORDER BY and LIMIT, and GROUP BY keys left out
+    of the SELECT. The table keeps partial rows (sums, counts, a variance's moments) as rows arrive,
+    and every read finishes them: == the query run ad hoc, after bulk INSERTs, log INSERTs, UPDATEs
+    and DELETEs taken back, EMIT FINAL, a restart, and spread over three nodes; listed with the columns
+    they answer; what can't be kept as rows arrive refused by name."""
+    import psycopg
+    lake, pgp = new_lake(), A.port + 7
+    node = Node(lake, A.port, tier_secs=1, pg=f"127.0.0.1:{pgp}").start()
+    q = lambda s: sql(A.port, s)
+    q("CREATE TABLE sales (region VARCHAR, store INT, amount DOUBLE, price DECIMAL(10, 2), ok BOOLEAN, ts TIMESTAMP)")
+    q("CREATE TABLE orders (customer VARCHAR, amount DOUBLE)")
+    q("INSERT INTO sales " + SALES_ROWS.format(1, 600))  # (rows there before the views: they fill from them)
+    views = {
+        "stats": "SELECT region, count(*) AS n, avg(amount) AS mean, stddev(amount) AS sd, var_pop(amount) AS vp, avg(price) AS avg_price, "
+                 "sum(amount) / count(*) AS ratio, bool_and(ok) AS all_ok, bool_or(ok) AS any_ok, max(amount) - min(amount) AS spread FROM sales GROUP BY region",
+        "top_stores": "SELECT store, sum(amount) AS total FROM sales GROUP BY store HAVING count(*) > 2 ORDER BY total DESC LIMIT 3",
+        "per_store": "SELECT region, avg(amount) AS mean FROM sales GROUP BY region, store",
+        "plain": "SELECT region, count(*) AS n, sum(amount) AS total FROM sales GROUP BY region",
+    }
+    order = {"stats": " ORDER BY region NULLS FIRST", "per_store": " ORDER BY region, mean", "plain": " ORDER BY region NULLS FIRST", "top_stores": ""}
+    for name, body in views.items():
+        q(f"CREATE MATERIALIZED VIEW {name} AS {body}")
+    q("CREATE MATERIALIZED VIEW per_minute WITH (lateness = '0 seconds') AS SELECT date_bin(INTERVAL '1 minute', ts) AS minute, region, "
+      "avg(amount) AS mean, count(*) AS n FROM sales GROUP BY 1, 2 HAVING count(*) > 5 EMIT FINAL")
+    q("CREATE MATERIALIZED VIEW per_customer AS SELECT customer, count(*) AS n, avg(amount) AS mean, stddev_samp(amount) AS sd, "
+      "variance(amount) AS v FROM orders GROUP BY customer HAVING count(*) >= 1")
+    read = lambda name: q(f"SELECT * FROM {name}{order[name]}") if name in order else None
+    adhoc = lambda name: q(f"SELECT * FROM ({views[name]}){order[name]}") if order[name] else q(views[name])
+    q("INSERT INTO sales " + SALES_ROWS.format(601, 3000))  # a bulk INSERT: files, the views derived from their rows
+    q("INSERT INTO sales VALUES ('south', 9, NULL, NULL, NULL, TIMESTAMP '2026-10-04 01:00:00'), ('south', 9, 4.5, 1.25, true, TIMESTAMP '2026-10-04 01:00:01'), "
+      "(NULL, 1, 2.0, 3.50, false, TIMESTAMP '2026-10-04 01:00:02')")  # through the log: a NULL key, a NULL value, a group of one
+    time.sleep(2)  # (tiered: merged rows from files and the log both)
+    first = {k: (read(k), adhoc(k)) for k in views}
+    kept = lambda: q("SELECT * FROM per_minute ORDER BY 1, 2")
+    closed = ("SELECT date_bin(INTERVAL '1 minute', ts) AS minute, region, avg(amount) AS mean, count(*) AS n FROM sales "
+              "WHERE ts < TIMESTAMP '2026-10-04 01:00:00' GROUP BY 1, 2 HAVING count(*) > 5 ORDER BY 1, 2")
+    emitted = until(lambda: len(kept()), len(q(closed)), secs=30)
+    emitted_ok = _close(kept(), q(closed))
+    # orders: changes taken back (avg, stddev, variance follow an UPDATE and a DELETE; a group emptied goes)
+    q("INSERT INTO orders VALUES ('ann', 10), ('ann', 20), ('ann', 60), ('bob', 5), ('bob', 7), ('cy', 1)")
+    q("UPDATE orders SET amount = amount * 3 WHERE customer = 'ann' AND amount > 15")
+    q("DELETE FROM orders WHERE customer = 'cy' OR amount = 5")
+    q("INSERT INTO orders VALUES ('dee', 2.5)")
+    changed = (q("SELECT * FROM per_customer ORDER BY customer"),
+               q("SELECT customer, count(*) AS n, avg(amount) AS mean, stddev_samp(amount) AS sd, variance(amount) AS v FROM orders GROUP BY customer ORDER BY customer"))
+    shown = q("SHOW CREATE MATERIALIZED VIEW stats")[0]["definition"]
+    columns = [r["column_name"] for r in q("SELECT column_name FROM information_schema.columns WHERE table_name = 'stats' ORDER BY ordinal_position")]
+    with psycopg.connect(f"host=127.0.0.1 port={pgp} user=u dbname=lake", autocommit=True) as c:  # (as psql asks for a table's columns)
+        pg = [r[0] for r in c.execute("SELECT a.attname FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_class c ON a.attrelid = c.oid "
+                                      "WHERE c.relname = 'stats' AND a.attnum > 0 ORDER BY a.attnum").fetchall()]
+    star = list(q("SELECT * FROM stats WHERE region = 'east'")[0].keys())  # (a row with no NULL: the JSON leaves them out)
+    refused = {
+        "median": _raises_text(lambda: q("CREATE MATERIALIZED VIEW m1 AS SELECT region, median(amount) AS m FROM sales GROUP BY region")),
+        "distinct": _raises_text(lambda: q("CREATE MATERIALIZED VIEW m2 AS SELECT region, count(DISTINCT store) AS s FROM sales GROUP BY region")),
+        "of it": _raises_text(lambda: q("CREATE MATERIALIZED VIEW m3 AS SELECT region, count(*) AS n FROM stats GROUP BY region")),
+        "detach": _raises_text(lambda: q("ALTER MATERIALIZED VIEW stats DETACH")),
+        "final order": _raises_text(lambda: q("CREATE MATERIALIZED VIEW m4 AS SELECT date_bin(INTERVAL '1 minute', ts) AS minute, avg(amount) AS a FROM sales "
+                                               "GROUP BY 1 ORDER BY a LIMIT 2 EMIT FINAL")),
+        "rename": _raises_text(lambda: q("ALTER TABLE stats RENAME COLUMN mean TO average")),
+    }
+    stored = q("SELECT * FROM stats ORDER BY region NULLS FIRST")
+    node.kill()
+    node = Node(lake, A.port, tier_secs=1, pg=f"127.0.0.1:{pgp}").start()
+    restarted = q("SELECT * FROM stats ORDER BY region NULLS FIRST")
+    q("DROP MATERIALIZED VIEW stats")
+    q(shown)
+    again = until(lambda: _close(q("SELECT * FROM stats ORDER BY region NULLS FIRST"), stored), True, secs=20)
+    node.kill()
+    stats_names = ["region", "n", "mean", "sd", "vp", "avg_price", "ratio", "all_ok", "any_ok", "spread"]
+    checks = {
+        "avg, stddev, var_pop, avg of a DECIMAL, bool_and, bool_or and expressions over aggregates == the query ad hoc": _close(*first["stats"]) and len(first["stats"][0]) == 5,
+        "an avg of a DECIMAL is exact, typed as the query types it": [r["avg_price"] for r in first["stats"][0]] == [r["avg_price"] for r in first["stats"][1]],
+        "HAVING, ORDER BY and LIMIT, applied as it is read": _close(*first["top_stores"]) and len(first["top_stores"][0]) == 3,
+        "a GROUP BY key it doesn't SELECT": _close(*first["per_store"]) and len(first["per_store"][0]) == 21 + 2,
+        "a view of plain sums and counts is kept as before": _close(*first["plain"]),
+        "EMIT FINAL with avg and HAVING: each closed group once, == ad hoc": emitted > 0 and emitted_ok,
+        "UPDATE and DELETE taken back: avg, stddev, variance follow; a group emptied goes; a group of one has no sample stddev": _close(*changed)
+            and [r["customer"] for r in changed[0]] == ["ann", "bob", "dee"] and changed[0][2].get("sd") is None,  # (the node's JSON leaves NULLs out)
+        "listed with the columns it answers (SELECT *, information_schema, pg_catalog)": star == stats_names and columns == stats_names and pg == stats_names,
+        "SHOW CREATE gives the query as written; dropped and made again from it, the same answers": "avg(amount)" in shown and "stddev(amount)" in shown and again is True,
+        "a restart: the same answers": _close(restarted, stored),
+        "refused by name: median, DISTINCT, a view of one, DETACH, EMIT FINAL with ORDER BY, a renamed column": "needs every row" in refused["median"]
+            and "DISTINCT" in refused["distinct"] and "as it is read" in refused["of it"] and "as it is read" in refused["detach"]
+            and "ORDER BY" in refused["final order"] and refused["rename"] != "",
+        "spread over three nodes == one node, the view read whole beside a sliced table": finishes_on_three(),
+    }
+    ok = all(checks.values())
+    print(json.dumps({"finishes": checks, "ok": ok}, indent=1))
+    if not ok:
+        print(json.dumps({"first": first, "changed": changed, "shown": shown, "columns": columns, "pg": pg, "star": star, "refused": refused,
+                          "stored": stored, "restarted": restarted, "emitted": emitted}, indent=1, default=str)[-12000:])
+        sys.exit(1)
+    return "views that keep avg, stddev, variance, bool_and/or, HAVING, ORDER BY/LIMIT as rows arrive, finished as read: == ad hoc, changes, EMIT FINAL, restart, three nodes"
 
 
 def asof():
@@ -7496,7 +7629,7 @@ def friendly():
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    out = {t.__name__: t() for t in (upsert, deal, outside, clouds, kafkas, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, found, renames, workspace, server, scale, flight, users, secrets, safety, versions, stopped, flows, begin, doors, objects, registry, sparksql, variables, scripts, hot, minmax, history, friendly, reader, crash)}
+    out = {t.__name__: t() for t in (upsert, deal, outside, clouds, kafkas, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, found, renames, workspace, server, scale, flight, users, secrets, safety, versions, stopped, flows, begin, doors, objects, registry, sparksql, variables, scripts, hot, minmax, history, friendly, reader, crash)}
     A.secs = min(A.secs, 20)
     out["load"] = load()
     print(json.dumps(out, indent=1))
@@ -7504,7 +7637,7 @@ def all_tests():
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "found", "renames", "workspace", "server", "scale", "flight", "users", "secrets", "safety", "versions", "stopped", "flows", "begin", "doors", "objects", "registry", "sparksql", "variables", "scripts", "tasks", "hot", "minmax", "history", "friendly", "load", "all"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "found", "renames", "workspace", "server", "scale", "flight", "users", "secrets", "safety", "versions", "stopped", "flows", "begin", "doors", "objects", "registry", "sparksql", "variables", "scripts", "tasks", "hot", "minmax", "history", "friendly", "load", "all"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -7516,7 +7649,7 @@ if __name__ == "__main__":
     ap.add_argument("--flush-ms", type=int, default=250)
     A = ap.parse_args()
     try:
-        {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "safety": safety, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "objects": objects, "registry": registry, "sparksql": sparksql, "variables": variables, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "friendly": friendly, "load": load, "all": all_tests}[A.mode]()
+        {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "safety": safety, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "objects": objects, "registry": registry, "sparksql": sparksql, "variables": variables, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "friendly": friendly, "load": load, "all": all_tests}[A.mode]()
     except BaseException as e:  # a failure ends the run, though threads may still wait on a node (crash's producers retry for ever)
         code = e.code if isinstance(e, SystemExit) else 1
         if not isinstance(e, SystemExit):

@@ -66,11 +66,29 @@ A view of a filter or a projection also follows an `UPDATE` or `DELETE` of its t
 changes is changed in the view, and a row that no longer matches leaves it (see
 [Change rows](/pondra/guides/change-rows/#views-follow)).
 
+A grouped view takes the aggregates you would write by hand: `count`, `sum`, `avg`, `min`, `max`,
+`stddev` and `variance` (and their `_samp` and `_pop` forms), `bool_and` and `bool_or`, any
+expression over them, `HAVING`, and `ORDER BY … LIMIT`. Its table keeps running totals as rows
+arrive (sums, counts, and a variance's moments), and each read works the answers out from them, so
+they are as current as the rows:
+
+```sql
+CREATE MATERIALIZED VIEW IF NOT EXISTS habits AS
+  SELECT user, count(*) AS n, avg(amount) AS mean, stddev_pop(amount) AS spread
+  FROM clicks GROUP BY user HAVING count(*) > 1;
+SELECT * FROM habits;
+```
+
+```text
+user  n  mean  spread
+ann   3  3.0   1.632993161855452
+```
+
 <Aside type="caution">
-A grouped view keeps `sum`, `count`, `min` and `max`. `avg` and `count(DISTINCT …)` are refused,
-because they can't be combined from partial results: keep `sum` and `count` and divide when you
-read. A view that keeps a `min` or `max`, joins another table, or is a window, session or stream
-join can't take a row back, so an `UPDATE` or `DELETE` on its source is refused while it exists.
+`count(DISTINCT …)`, `median` and other aggregates that need every row are refused: work them out
+when you read, with a stored view (`CREATE VIEW`). A view that keeps a `min` or `max`, joins another
+table, or is a window, session or stream join can't take a row back, so an `UPDATE` or `DELETE` on
+its source is refused while it exists.
 `DROP MATERIALIZED VIEW name` first, or change a copy of the table. To change a view's query,
 `CREATE OR REPLACE MATERIALIZED VIEW` makes it again from the rows already there. A materialized
 view may follow another, in the same commit: see [Flows](/pondra/guides/flows/).

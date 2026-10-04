@@ -351,7 +351,9 @@ async fn upsert_view(lake: &Lake, ctx: &SessionContext, name: &str, meta: &Table
 /// so `SELECT *` shows the table's own columns.
 pub fn named(ctx: &SessionContext, provider: Arc<dyn TableProvider>, meta: &TableMeta, deleted: bool) -> Result<Arc<dyn TableProvider>> {
     let hide = !deleted && !meta.key.is_empty() && meta.columns.iter().any(|(c, _)| c == "_deleted");
-    if !meta.mapped() && !hide {
+    // (a view that finishes its answers reads under its query's names already: `finish.rs`, and a
+    // view's table is never renamed or dropped a column of)
+    if (!meta.mapped() && !hide) || meta.finish.is_some() {
         return Ok(Arc::new(Table(provider)));
     }
     let df = ctx.read_table(provider)?;
@@ -453,7 +455,11 @@ pub async fn table_view(lake: &Lake, ctx: &SessionContext, name: &str, meta: &Ta
     let df = raw(lake, ctx, name, meta, upto).await?;
     let aux = lake.session();
     aux.register_table("__raw", df.into_view())?;
-    Ok(aux.sql(&current_sql(meta, "__raw", upto.unwrap_or(lake.visible()))).await?.into_view())
+    let current = aux.sql(&current_sql(meta, "__raw", upto.unwrap_or(lake.visible()))).await?;
+    match &meta.finish {
+        None => Ok(current.into_view()),
+        Some(f) => crate::finish::finished(&aux, current, f).await, // (avg, HAVING, …: worked out as it is read)
+    }
 }
 
 /// An append table (or a distributed query's slice of one) that picks its files per query: those

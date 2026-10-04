@@ -372,7 +372,7 @@ pub fn written(v: &View) -> Option<(String, Vec<String>)> {
         if let Some(i) = o.idle_secs {
             with.push(format!("idle = '{}'", time(i)));
         }
-        return Some((format!("{}\nEMIT FINAL", v.sql), with));
+        return Some((format!("{}\nEMIT FINAL", v.query()), with));
     }
     let s = v.sessions.as_ref()?;
     let mut stmts = Parser::parse_sql(&GenericDialect {}, &v.sql).ok()?;

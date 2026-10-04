@@ -164,7 +164,7 @@ async fn lakes(lake: &Lake, user: &str, columns: bool) -> Result<Lakes> {
             continue;
         }
         let (schema, table) = crate::ddl::split(name);
-        let l = m.logical();
+        let l = m.described(); // (a view that finishes its answers: those columns)
         let shown = |c: &String| c != "_deleted" || l.key.is_empty(); // (as `SELECT *` shows it)
         let cols = l.columns.iter().filter(|(c, _)| shown(c)).map(|(c, t)| {
             let t = crate::query::dtype(t).unwrap_or(DataType::Utf8);

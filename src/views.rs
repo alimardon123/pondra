@@ -50,6 +50,10 @@ pub struct View {
     /// `… GROUP BY <a time bucket> EMIT FINAL`: each group once, when it's over (ADR-052).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub once: Option<Once>,
+    /// Its query as it was written, when `sql` is what its table keeps of it (`finish.rs`: avg,
+    /// HAVING, …, finished as the table is read).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub written: Option<String>,
 }
 
 /// A view that keeps each group once, when it's over (`EMIT FINAL`). Its GROUP BY has one
@@ -186,6 +190,8 @@ pub fn view_key(name: &str) -> String { format!("v/{name}") }
 impl View {
     /// Its name as it was given (an `EMIT FINAL` view's entry is `{name}$open`).
     pub fn shown<'a>(&'a self, name: &'a str) -> &'a str { self.once.as_ref().map_or(name, |o| o.into.as_str()) }
+    /// Its query as it was written (`SHOW CREATE`, the listings).
+    pub fn query(&self) -> &str { self.written.as_deref().unwrap_or(&self.sql) }
     /// Does this view follow `table`'s rows (its source, or either side of a stream join)?
     pub fn follows(&self, table: &str) -> bool { self.source == table || self.join.as_ref().is_some_and(|j| j.tables.iter().any(|t| t == table)) }
 }
@@ -381,7 +387,7 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, o: Options) -> Result<()
         let gaps = |s: &Option<Sessions>| s.as_ref().map(|s| (s.time.clone(), s.gap_secs, s.lateness_secs));
         let joins = |j: &Option<Join>| j.as_ref().map(|j| (j.time.clone(), j.within_secs));
         let onces = |o: &Option<Once>| o.as_ref().map(|o| (o.bucket.clone(), o.lateness_secs, o.idle_secs));
-        let same = v.sql == sql && windows(&v.emit) == windows(&emit) && gaps(&v.sessions) == gaps(&sessions) && joins(&v.join) == joins(&join) && v.expect == expect && onces(&v.once) == onces(&keep);
+        let same = v.query() == sql && windows(&v.emit) == windows(&emit) && gaps(&v.sessions) == gaps(&sessions) && joins(&v.join) == joins(&join) && v.expect == expect && onces(&v.once) == onces(&keep);
         ensure!(same, "view {name} already exists, with other SQL or options");
         return Ok(()); // (asked again, the same: a notebook cell run twice)
     }
@@ -394,6 +400,7 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, o: Options) -> Result<()
     // combined as they are read: what follows it must combine them too (`merges`: a rollup).
     let upstream = lake.cat.get::<View>(&view_key(&source)).await?;
     let partial = upstream.is_some() && !src.merge.is_empty();
+    ensure!(src.finish.is_none(), "{source} works its columns out as it is read (avg, HAVING, …), from partial rows a view can't follow: make {name} from {source}'s own source, or a stored view of it (CREATE VIEW {name} AS SELECT … FROM {source})");
     ensure!(src.history.is_none(), "{source} is a history view, whose __start_at and __end_at are worked out as it is read: make {name} a stored view of it (CREATE VIEW {name} AS SELECT … FROM {source})");
     ensure!(history.is_none() || (sessions.is_none() && join.is_none() && emit.is_none()), "a history view keeps each version as it comes: not with windows, sessions or a stream join");
     ensure!(expect.is_empty() || (sessions.is_none() && join.is_none() && emit.is_none()), "expectations check a view's rows as it writes them: a view that emits windows or sessions, or joins streams, writes them later. Put them on a view before it");
@@ -408,9 +415,25 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, o: Options) -> Result<()
         return create_join(lake, name, sql, source, j).await;
     }
     let planned = crate::asof::rewrite(sql)?;
-    let plan = crate::query::sql(&session(lake, &planned, "").await?, &planned).await?.logical_plan().clone();
+    let ctx = session(lake, &planned, "").await?;
+    let plan = crate::query::sql(&ctx, &planned).await?.logical_plan().clone();
+    let typed = |p: &LogicalPlan| -> Vec<(String, String)> { p.schema().fields().iter().map(|f| (f.name().clone(), crate::query::type_name(f.data_type()))).collect() };
+    let shown = typed(&plan); // (the view's columns, as it is read)
+    let written = sql;
+    // A GROUP BY whose answers need a last step (avg, HAVING, …): its table keeps the partial
+    // query's rows, and reads finish them (`finish.rs`).
+    let (sql, planned, plan, finish) = match finished(lake, &ctx, sql, &plan).await? {
+        Some((partial_sql, partial_plan, f, ordered)) => {
+            ensure!(!partial, "{source} is a GROUP BY view, whose table keeps partial rows: a view of it adds up its sums and counts (a rollup), or make {name} from {source}'s own source");
+            ensure!(emit.is_none(), "a window view of avg, HAVING or an expression over aggregates: write it as GROUP BY <a time bucket> … EMIT FINAL");
+            ensure!(keep.is_none() || !ordered, "EMIT FINAL keeps each group as it ends: ORDER BY and LIMIT when you read it");
+            (partial_sql.clone(), crate::asof::rewrite(&partial_sql)?.to_string(), partial_plan, Some(f))
+        }
+        None => (sql.to_string(), planned.to_string(), plan, None),
+    };
+    let sql = sql.as_str();
     let (key, merge) = merges(&plan, partial.then_some((source.as_str(), &src)))?;
-    let columns: Vec<(String, String)> = plan.schema().fields().iter().map(|f| (f.name().clone(), crate::query::type_name(f.data_type()))).collect();
+    let columns = typed(&plan);
     if let Some((c, _)) = columns.iter().find(|(c, _)| crate::sys::NAMES.contains(&c.as_str())) {
         bail!("{c} is a system column of the view's own table: name it something else ({c} AS source{c})");
     }
@@ -425,7 +448,7 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, o: Options) -> Result<()
         }
         ensure!(!has("__start_at") && !has("__end_at"), "__start_at and __end_at are a history view's own columns: name yours something else");
     }
-    let meta = TableMeta { columns, key, merge, publish: default_publish(), ids: true, tiered: lake.visible(), history, ..Default::default() };
+    let meta = TableMeta { columns, key, merge, publish: default_publish(), ids: true, tiered: lake.visible(), history, finish: finish.clone(), ..Default::default() };
     if !expect.is_empty() {
         expectations(lake, name, &source, &planned, &meta, &expect).await?;
     }
@@ -445,15 +468,41 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, o: Options) -> Result<()
         // (`EMIT FINAL`: its groups kept here, as any GROUP BY view's; each once in `o.into`, made with it)
         ensure!(!partial, "{source} is a GROUP BY view, whose table keeps partial rows: make {} from {source}'s own source", o.into);
         ensure!(meta.key.contains(&o.column), "EMIT FINAL: {} is the view's window, so it is one of its GROUP BY columns", o.column);
-        let columns = meta.columns.iter().filter(|(c, _)| c != "_deleted").cloned().collect();
+        let columns = shown.iter().filter(|(c, _)| c != "_deleted").cloned().collect(); // (finished, if it is)
         puts.push((table_key(&o.into), json(&TableMeta { columns, publish: default_publish(), ids: true, tiered: lake.visible(), ..Default::default() })));
         if lake.cat.get::<TableMeta>(&table_key(EXPECTED)).await?.is_none() && !puts.iter().any(|(k, _)| *k == table_key(EXPECTED)) {
             puts.push((table_key(EXPECTED), json(&expected_table(lake))));
         }
     }
     let fill = Some(Fill { id: uuid::Uuid::new_v4().to_string(), upto: None }); // (from the rows already there)
-    puts.push((view_key(name), json(&View { source, sql: sql.into(), emit, sessions: None, ids, join: None, fill, expect, once: keep })));
+    let written = finish.is_some().then(|| written.to_string());
+    puts.push((view_key(name), json(&View { source, sql: sql.into(), emit, sessions: None, ids, join: None, fill, expect, once: keep, written })));
     lake.cat.commit(puts, &[]).await
+}
+
+/// A GROUP BY query whose answers need a last step, split (`finish.rs`): the query its table keeps,
+/// planned; how reads finish it, each column as the query types it; and whether it orders or cuts
+/// its answers (ORDER BY, LIMIT).
+async fn finished(lake: &Lake, ctx: &datafusion::prelude::SessionContext, sql: &str, plan: &LogicalPlan) -> Result<Option<(String, LogicalPlan, crate::finish::Finish, bool)>> {
+    use datafusion::arrow::datatypes::DataType;
+    let names: Vec<String> = plan.schema().fields().iter().map(|f| f.name().clone()).collect();
+    let aggregates = ctx.state().aggregate_functions().keys().cloned().collect();
+    let Some(split) = crate::finish::split(sql, &names, &aggregates)? else { return Ok(None) };
+    let planned = crate::asof::rewrite(&split.partial)?;
+    let partial = crate::query::sql(&session(lake, &planned, "").await?, &planned).await?.logical_plan().clone();
+    let schema = std::sync::Arc::new(partial.schema().as_arrow().clone());
+    let decimal = |c: &str| schema.field_with_name(c).is_ok_and(|f| matches!(f.data_type(), DataType::Decimal128(..) | DataType::Decimal256(..)));
+    // (planned over an empty table of the partial rows: a column typed otherwise than the query's is cast)
+    let aux = datafusion::prelude::SessionContext::new_with_state(ctx.state());
+    aux.register_table(crate::finish::PARTIAL, std::sync::Arc::new(datafusion::datasource::MemTable::try_new(schema.clone(), vec![vec![]])?))?;
+    let mut sql = split.finish(decimal, &[]);
+    let got = aux.sql(&sql).await.with_context(|| format!("the view's answers from its partial rows: {sql}"))?.schema().clone();
+    let casts: Vec<Option<String>> = got.fields().iter().zip(plan.schema().fields()).map(|(g, w)| (g.data_type() != w.data_type()).then(|| w.data_type().to_string())).collect();
+    if casts.iter().any(Option::is_some) {
+        sql = split.finish(decimal, &casts);
+    }
+    let columns = plan.schema().fields().iter().map(|f| (f.name().clone(), crate::query::type_name(f.data_type()))).collect();
+    Ok(Some((split.partial.clone(), partial, crate::finish::Finish { sql, columns }, split.ordered)))
 }
 
 /// `pondra$expectations`: what each view's expectations failed, and its late rows (`once::late`).
@@ -569,7 +618,7 @@ async fn create_sessions(lake: &Lake, name: &str, sql: &str, source: String, src
     ensure!(s.keys.iter().all(|k| out.field_with_unqualified_name(k).is_ok()), "a session view SELECTs its GROUP BY columns, as they are named");
     let columns = out.fields().iter().map(|f| (f.name().clone(), crate::query::type_name(f.data_type()))).collect();
     let meta = TableMeta { columns, publish: default_publish(), ids: true, tiered: lake.visible(), ..Default::default() };
-    let view = View { source, sql: sql.into(), emit: None, sessions: Some(s), ids: false, join: None, fill: None, expect: vec![], once: None };
+    let view = View { source, sql: sql.into(), emit: None, sessions: Some(s), ids: false, join: None, fill: None, expect: vec![], once: None, written: None };
     lake.cat.commit(vec![(view_key(name), json(&view)), (table_key(name), json(&meta))], &[]).await
 }
 
@@ -823,7 +872,7 @@ async fn cannot_follow(lake: &Lake, table: &str, append: bool) -> Result<Vec<Str
             _ if meta.merge.is_empty() && !v.ids => Some("isn't row by row over the table alone (a join, DISTINCT, …), or was made before Pondra 0.19"),
             _ if meta.merge.is_empty() => None,
             _ if !alone(&plan(lake, &v).await?, true) => Some("reads other tables too"),
-            _ if meta.merge.values().any(|f| f != "sum" && f != "count") => Some("keeps a min or max"),
+            _ if meta.merge.values().any(|f| !["sum", "count", crate::finish::MOMENTS].contains(&f.as_str())) => Some("keeps a min or max"),
             _ if !meta.merge.values().any(|f| f == "count") => Some("has no count(*) to drop the groups a change empties"),
             _ if meta.columns.iter().any(|(c, t)| meta.merge.contains_key(c) && t.starts_with("UInt")) => Some("adds up an unsigned column (it can't subtract)"),
             _ => None,
@@ -1092,6 +1141,7 @@ fn carry(plan: LogicalPlan, names: &[&str]) -> Result<LogicalPlan> {
 fn negated(b: &RecordBatch, meta: &TableMeta) -> Result<RecordBatch> {
     let columns = b.schema().fields().iter().zip(b.columns()).map(|(f, c)| match meta.merge.get(f.name()).map(String::as_str) {
         Some("sum" | "count") => Ok(datafusion::arrow::compute::kernels::numeric::neg(c)?),
+        Some(crate::finish::MOMENTS) => crate::finish::negated(c),
         _ => Ok(c.clone()),
     }).collect::<Result<Vec<_>>>()?;
     Ok(RecordBatch::try_new(b.schema(), columns)?)
@@ -1144,7 +1194,8 @@ fn merges(plan: &LogicalPlan, up: Option<(&str, &TableMeta)>) -> Result<(Vec<Str
             "sum" => "sum",
             "min" => "min",
             "max" => "max",
-            other => bail!("{other}() can't be combined from partial results: use sum, count, min or max (e.g. avg = sum / count at query time)"),
+            crate::finish::MOMENTS => crate::finish::MOMENTS, // (a variance's: `finish.rs`)
+            other => bail!("{other}() can't be combined from partial results here: a view keeps count, sum, avg, min, max, stddev, variance, bool_and and bool_or, grouped by plain expressions"),
         };
         if let Some((source, up)) = up {
             let of = match &a.params.args[..] {
@@ -1207,7 +1258,7 @@ async fn create_join(lake: &Lake, name: &str, sql: &str, source: String, mut j: 
     j.tables = tables;
     let now = lake.visible();
     let meta = TableMeta { columns, publish: default_publish(), ids: true, tiered: now, ..Default::default() };
-    let view = View { source, sql: sql.into(), emit: None, sessions: None, ids: false, join: Some(j), fill: None, expect: vec![], once: None };
+    let view = View { source, sql: sql.into(), emit: None, sessions: None, ids: false, join: Some(j), fill: None, expect: vec![], once: None, written: None };
     lake.cat.commit(vec![(table_key(name), json(&meta)), (view_key(name), json(&view)), (producer_key(&format!("join:{name}")), json(&now))], &[]).await
 }
 
@@ -1355,7 +1406,7 @@ pub async fn system(lake: &Lake, counts: Vec<RecordBatch>) -> Result<Vec<(&'stat
         ("reads", s(&|_, (_, v)| reads(v))),
         ("expectations", std::sync::Arc::new(views.iter().map(|(_, v)| v.expect.len() as i64).collect::<Int64Array>())),
         ("late_rows", std::sync::Arc::new(views.iter().map(|(_, v)| v.once.as_ref().map(|_| late(v))).collect::<Int64Array>())),
-        ("definition", s(&|_, (_, v)| Some(v.sql.clone()))),
+        ("definition", s(&|_, (_, v)| Some(v.query().to_string()))),
     ])?;
     let all: Vec<(&String, &View, &Expect)> = views.iter().flat_map(|(n, v)| v.expect.iter().map(move |e| (n, v, e))).collect();
     let e = |f: &dyn Fn(&(&String, &View, &Expect)) -> String| std::sync::Arc::new(all.iter().map(|x| Some(f(x))).collect::<StringArray>()) as datafusion::arrow::array::ArrayRef;
