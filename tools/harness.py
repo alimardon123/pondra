@@ -3009,16 +3009,19 @@ def procedures():
     checks["a function's argument names the caller's column, not the body's table's of that name; refused by name when the tables share a name"] = \
         q("SELECT o.id, same_qty(qty) AS n FROM orders o WHERE o.id IN (1, 2, 6) ORDER BY o.id") == q("SELECT o.id, (SELECT count(*) FROM orders i WHERE i.qty = o.qty) AS n FROM orders o WHERE o.id IN (1, 2, 6) ORDER BY o.id") \
         and "reads orders too" in err("SELECT id, same_qty(qty) AS n FROM orders WHERE id = 1")
-    # A function made of functions reads them as they are now; arguments written into a body past
-    # 1 MB (a parameter used four times, ten deep) are refused, not planned.
+    # A function made of functions reads them as they are now; one written out past 100,000
+    # expressions (four calls, ten deep) is refused, not planned.
     q("CREATE MACRO base(x) AS x * 2")
     q("CREATE FUNCTION wrapped(x BIGINT) RETURNS BIGINT LANGUAGE sql RETURN base(x) + 1")
     q("CREATE OR REPLACE MACRO base(x) AS x * 3")
     q("CREATE MACRO e0(x) AS x + 1")
     for i in range(1, 11):
         q(f"CREATE MACRO e{i}(x) AS e{i - 1}(x) + e{i - 1}(x) + e{i - 1}(x) + e{i - 1}(x)")
-    checks["a function made of functions reads them as they are now; one copying its arguments past 1 MB is refused, the node up"] = \
-        q("SELECT wrapped(1) AS v") == [{"v": 4}] and "over 1 MB" in err("SELECT e10(1) AS v") and q("SELECT e2(1) AS v") == [{"v": 32}]
+    q("CREATE MACRO quad(x) AS x || x || x || x")
+    nested = lambda k: "quad(" * k + "'" + "z" * 100 + "'" + ")" * k
+    checks["a function made of functions reads them as they are now; one past 100,000 expressions written out, or copying its arguments past 1 MB, is refused, the node up"] = \
+        q("SELECT wrapped(1) AS v") == [{"v": 4}] and "100000 expressions" in err("SELECT e10(1) AS v") and q("SELECT e2(1) AS v") == [{"v": 32}] \
+        and "over 1 MB" in err(f"SELECT {nested(8)} AS v") and q(f"SELECT length({nested(3)}) AS n") == [{"n": 6400}]
     # SQL procedures
     q("CREATE TABLE log (x DOUBLE, tag VARCHAR)")
     q("""CREATE PROCEDURE twice(x DOUBLE, tag VARCHAR DEFAULT 'none') LANGUAGE sql AS $$

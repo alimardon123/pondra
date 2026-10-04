@@ -1109,12 +1109,23 @@ impl<'a> Expander<'a> {
             }
             ControlFlow::<()>::Continue(())
         });
-        match VisitMut::visit(&mut body, &mut Expander { depth: self.depth + 1, scopes: self.scopes.clone(), ..*self }) {
-            ControlFlow::Break(e) => Err(e),
-            ControlFlow::Continue(()) => Ok((body, r.params.iter().map(|p| values[&p.name].clone()).collect())),
+        if let ControlFlow::Break(e) = VisitMut::visit(&mut body, &mut Expander { depth: self.depth + 1, scopes: self.scopes.clone(), ..*self }) {
+            return Err(e);
         }
+        // (a body calling functions several times grows as theirs do: four calls, ten deep, are a
+        // million expressions, which took the node's memory before anything was planned)
+        let mut n = 0;
+        let _ = ast::visit_expressions(&body, |_| {
+            n += 1;
+            if n > LARGEST { ControlFlow::Break(()) } else { ControlFlow::Continue(()) }
+        });
+        ensure!(n <= LARGEST, "{name}: written out, it is over {LARGEST} expressions (functions calling functions several times each); work a value out once, in a CTE");
+        Ok((body, r.params.iter().map(|p| values[&p.name].clone()).collect()))
     }
 }
+
+/// The most expressions one function's call may come to, written out.
+const LARGEST: usize = 100_000;
 
 /// The columns of the lake's tables that `stmts` and the SQL functions' bodies read, by name,
 /// when a function reads a table: what an argument's columns are told apart by (`Expander::owner`).
