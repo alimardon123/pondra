@@ -33,6 +33,7 @@ pub static KINDS: &[Kind] = &[
     Kind { name: "view", family: "relation", verbs: RELATION },
     Kind { name: "materialized view", family: "relation", verbs: &["CREATE", "CREATE OR REPLACE", "ALTER", "DROP", "COMMENT ON", "SHOW CREATE"] },
     Kind { name: "external table", family: "relation", verbs: &["CREATE", "CREATE OR REPLACE", "DROP", "COMMENT ON"] },
+    Kind { name: "sequence", family: "relation", verbs: &["CREATE", "CREATE OR REPLACE", "ALTER", "DROP", "COMMENT ON", "SHOW CREATE"] },
     Kind { name: "function", family: "routine", verbs: &["CREATE", "CREATE OR REPLACE", "DROP", "COMMENT ON", "SHOW CREATE"] },
     Kind { name: "macro", family: "routine", verbs: &["CREATE", "CREATE OR REPLACE", "DROP", "COMMENT ON", "SHOW CREATE"] },
     Kind { name: "table function", family: "routine", verbs: &["CREATE", "CREATE OR REPLACE", "DROP", "COMMENT ON", "SHOW CREATE"] },
@@ -72,7 +73,7 @@ impl Object {
 type Lister = for<'a> fn(&'a Lake) -> BoxFuture<'a, Result<Vec<Object>>>;
 
 /// Each family's objects, read from the catalog alone (no query run).
-static FAMILIES: &[(&str, Lister)] = &[("schema", schemas), ("relation", relations), ("routine", routines), ("task", tasks), ("secret", secrets), ("user", users), ("database", databases)];
+static FAMILIES: &[(&str, Lister)] = &[("schema", schemas), ("relation", relations), ("relation", sequences), ("routine", routines), ("task", tasks), ("secret", secrets), ("user", users), ("database", databases)];
 
 /// Every object of this lake and the lakes attached to it, with its comment, as the caller may see
 /// them (a user limited by grants: the tables it may read, and no secrets, users or roles).
@@ -133,6 +134,21 @@ fn relations(lake: &Lake) -> BoxFuture<'_, Result<Vec<Object>>> {
             let kind = KINDS.iter().find(|k| k.name == o.kind).map_or("table", |k| k.name);
             Object::new(kind, &o.lake, &local, def)
         }).collect())
+    })
+}
+
+/// Sequences of this lake and those attached; an identity column's is its table's, not listed.
+fn sequences(lake: &Lake) -> BoxFuture<'_, Result<Vec<Object>>> {
+    Box::pin(async move {
+        let here = crate::ddl::lake_name(lake);
+        let mut all = vec![];
+        for (name, l) in lakes(lake) {
+            for (k, s) in l.cat.scan::<crate::seq::Sequence>("sq/", "sq0").await?.into_iter().filter(|(_, s)| s.owned.is_none()) {
+                let named = if name == here { name_sql(&k[3..]) } else { format!("{}.{}", ident(&name), name_sql(&k[3..])) };
+                all.push(Object::new("sequence", &name, &k[3..], Some(crate::seq::create_sql(&named, &s))));
+            }
+        }
+        Ok(all)
     })
 }
 
@@ -272,8 +288,11 @@ fn sql_type(t: &str) -> String {
 fn table_sql(name: &str, m: &TableMeta) -> String {
     let mut parts: Vec<String> = m.columns.iter().filter(|(c, _)| !m.marker(c)).map(|(c, t)| { // (a keyed table's `_deleted` is its own)
         let merge = m.merge.get(c).map(|f| format!(" MERGE {f}")).unwrap_or_default();
-        let null = if m.not_null.contains(c) && !m.key.contains(c) { " NOT NULL" } else { "" };
-        let default = m.defaults.get(c).map(|d| format!(" DEFAULT {d}")).unwrap_or_default();
+        let null = if m.not_null.contains(c) && !m.key.contains(c) && !m.identity.contains_key(c) { " NOT NULL" } else { "" };
+        let default = match m.identity.get(c) {
+            Some(i) => format!(" {}", i.sql()), // (its sequence is the table's: made with it)
+            None => m.defaults.get(c).map(|d| format!(" DEFAULT {d}")).unwrap_or_default(),
+        };
         format!("{} {}{merge}{null}{default}", ident(c), sql_type(t))
     }).collect();
     if !m.key.is_empty() {
@@ -497,7 +516,7 @@ async fn there(lake: &Lake, key: &str) -> Result<bool> {
     let (family, name) = key.split_once('/').unwrap_or((key, ""));
     let has = |k: String| async move { lake.cat.get::<Value>(&k).await.map(|v| v.is_some()) };
     Ok(match family {
-        "relation" => !crate::sys::hidden(name) && (has(table_key(name)).await? || has(crate::ddl::query_key(name)).await?),
+        "relation" => !crate::sys::hidden(name) && (has(table_key(name)).await? || has(crate::ddl::query_key(name)).await? || has(crate::seq::key(name)).await?),
         "column" => match name.rsplit_once('/') {
             Some((t, c)) => lake.cat.get::<TableMeta>(&table_key(t)).await?.is_some_and(|m| m.live().any(|(s, _, _)| s == c)),
             None => false,
@@ -544,7 +563,7 @@ async fn comment(lake: &Lake, word: &str, name: &str, text: Option<String>, if_e
 
 /// Does carrying out `d` drop or rename something a comment may be on?
 pub fn moves(d: &Ddl) -> bool {
-    matches!(d, Ddl::DropTable { .. } | Ddl::DropView { .. } | Ddl::DropSchema { .. } | Ddl::DropRoutine { .. } | Ddl::DropTask { .. } | Ddl::DropSecret { .. }
+    matches!(d, Ddl::Sequence(_) | Ddl::DropTable { .. } | Ddl::DropView { .. } | Ddl::DropSchema { .. } | Ddl::DropRoutine { .. } | Ddl::DropTask { .. } | Ddl::DropSecret { .. }
         | Ddl::Detach { .. } | Ddl::DropDatabase { .. } | Ddl::RenameTable { .. } | Ddl::AlterColumn { .. } | Ddl::Users(_))
 }
 
@@ -557,7 +576,7 @@ pub async fn follow(lake: &Lake, out: &Value) -> Result<()> {
         return Ok(());
     }
     let (mut put, mut gone) = (vec![], vec![]);
-    let renamed = match (out["table"].as_str().or(out["view"].as_str()), out["renamed"].as_str()) {
+    let renamed = match (out["table"].as_str().or(out["view"].as_str()).or(out["sequence"].as_str()), out["renamed"].as_str()) {
         (Some(from), Some(to)) => Some((from.to_string(), to.to_string())),
         _ => None,
     };

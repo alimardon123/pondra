@@ -35,6 +35,9 @@ fn by_words(text: &str) -> &'static str {
     let has = |w: &str| t.contains(w);
     match () {
         _ if has("could not serialize") => "40001",                                             // serialization_failure
+        _ if has("cannot insert a non-default value") || has("can only be updated to default") => "428C9", // generated_always
+        _ if has("nextval: reached") => "2200H",                                                // sequence_generator_limit_exceeded
+        _ if has("is not yet defined in this session") => "55000",                              // object_not_in_prerequisite_state
         _ if has("violates check constraint") => "23514",                                       // check_violation
         _ if has("is not null, and a row gives it no value") || has("violates not-null") => "23502", // not_null_violation
         _ if has("duplicate key") => "23505",                                                   // unique_violation
@@ -105,6 +108,10 @@ mod tests {
         assert_eq!(of("table t already exists"), "42P07");
         assert_eq!(of(crate::cluster::CUT_OFF_SAYS), "57P03");
         assert_eq!(of("error sending request for url (http://10.0.0.2:8080/cluster/commit)"), "58030");
+        assert_eq!(of("cannot insert a non-DEFAULT value into column \"id\" of t: it is an identity column defined as GENERATED ALWAYS"), "428C9");
+        assert_eq!(of("nextval: reached maximum value of sequence \"s\" (3)"), "2200H");
+        assert_eq!(of("currval of sequence \"s\" is not yet defined in this session"), "55000");
+        assert_eq!(of("relation \"s\" does not exist"), "42P01");
         assert_eq!(of("something else"), "XX000");
         assert_eq!(super::of(&super::coded("40001", "could not serialize access due to concurrent update")), "40001");
         assert_eq!(super::of(&anyhow::Error::new(crate::views::Violation("new row for relation \"t\" violates check constraint \"c\"".into()))), "23514");

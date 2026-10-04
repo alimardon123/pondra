@@ -116,6 +116,7 @@ struct Rel {
     columns: Vec<(String, DataType, bool, Option<String>)>, // name, type, not null, default
     key: Vec<String>,
     sql: Option<String>, // a view's definition
+    identity: BTreeMap<String, crate::seq::Identity>, // identity columns, by name (`attidentity`)
     rows: u64,
     bytes: u64,
 }
@@ -173,7 +174,7 @@ async fn lakes(lake: &Lake, user: &str, columns: bool) -> Result<Lakes> {
         let (rows, bytes) = m.files.iter().fold((0, 0), |(r, b), f| (r + f.rows, b + f.bytes));
         let sealed = m.sealed.clone().unwrap_or_default();
         let kind = if mvs.contains(name) { 'm' } else { 'r' };
-        rels.push(Rel { oid: oid("r", name), schema: schema.into(), name: table.into(), kind, columns: cols, key: l.key.clone(), sql: None, rows: rows + sealed.rows, bytes: bytes + sealed.bytes });
+        rels.push(Rel { oid: oid("r", name), schema: schema.into(), name: table.into(), kind, columns: cols, key: l.key.clone(), sql: None, identity: l.identity.clone(), rows: rows + sealed.rows, bytes: bytes + sealed.bytes });
     }
     let views = lake.cat.scan::<crate::ddl::StoredView>("q/", "q0").await?;
     // (a view's columns are its query's: planned only when a client asks for columns, in a
@@ -192,16 +193,16 @@ async fn lakes(lake: &Lake, user: &str, columns: bool) -> Result<Lakes> {
             },
             None => vec![],
         };
-        rels.push(Rel { oid: oid("r", name), schema: schema.into(), name: view.into(), kind: 'v', columns: cols, key: vec![], sql: Some(v.sql), rows: 0, bytes: 0 });
+        rels.push(Rel { oid: oid("r", name), schema: schema.into(), name: view.into(), kind: 'v', columns: cols, key: vec![], sql: Some(v.sql), identity: Default::default(), rows: 0, bytes: 0 });
     }
     // The session's own temporary tables and views, in its temporary schema (as Postgres has them).
     let (temp_tables, temp_views) = crate::temp::listed();
     for (name, cols) in temp_tables {
         let cols = cols.iter().map(|(c, t)| (c.clone(), crate::query::dtype(t).unwrap_or(DataType::Utf8), false, None)).collect();
-        rels.push(Rel { oid: oid("tmp", &name), schema: TEMP.into(), name, kind: 'r', columns: cols, key: vec![], sql: None, rows: 0, bytes: 0 });
+        rels.push(Rel { oid: oid("tmp", &name), schema: TEMP.into(), name, kind: 'r', columns: cols, key: vec![], sql: None, identity: Default::default(), rows: 0, bytes: 0 });
     }
     for (name, sql) in temp_views {
-        rels.push(Rel { oid: oid("tmp", &name), schema: TEMP.into(), name, kind: 'v', columns: vec![], key: vec![], sql: Some(sql), rows: 0, bytes: 0 });
+        rels.push(Rel { oid: oid("tmp", &name), schema: TEMP.into(), name, kind: 'v', columns: vec![], key: vec![], sql: Some(sql), identity: Default::default(), rows: 0, bytes: 0 });
     }
     let routines = lake.cat.scan::<crate::routines::Routine>("r/", "r0").await?.into_iter().map(|(k, r)| {
         let (s, n) = crate::ddl::split(&k[2..]);
@@ -282,8 +283,10 @@ fn tables(l: &Lakes) -> Result<Vec<(&'static str, Arc<MemTable>)>> {
             let (typ, typmod) = pg_of(t);
             let len = TYPES.iter().find(|x| x.0 == typ).map_or(-1, |x| x.3);
             let not_null = *not_null || r.key.contains(name);
+            let identity = r.identity.get(name).map_or("", |i| if i.always { "a" } else { "d" }); // (an identity has no default of its own, as in Postgres)
+            let default = default.as_ref().filter(|_| identity.is_empty());
             attrs.push(vec![o(r.oid), s(name.clone()), o(typ), i4(-1), i2(len), i2(i as i16 + 1), i4(0), i4(-1), i4(typmod), b(len > 0 && len <= 8), s("i"), s("x"), s(""), b(not_null),
-                b(default.is_some()), b(false), s(""), s(""), b(false), b(true), i4(0), o(if matches!(typ, 25 | 1043) { 100 } else { 0 }), n(), n()]);
+                b(default.is_some()), b(false), s(identity), s(""), b(false), b(true), i4(0), o(if matches!(typ, 25 | 1043) { 100 } else { 0 }), n(), n()]);
             if let Some(d) = default {
                 defs.push(vec![o(oid("d", &format!("{}.{}.{name}", r.schema, r.name))), o(r.oid), i2(i as i16 + 1), s(d.clone())]);
             }

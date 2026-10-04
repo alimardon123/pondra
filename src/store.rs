@@ -19,7 +19,7 @@ use object_store::{local::LocalFileSystem, path::Path, prefix::PrefixStore, Obje
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use slatedb::config::{CompactorOptions, DbReaderOptions, GarbageCollectorDirectoryOptions, GarbageCollectorOptions, DurabilityLevel, FlushOptions, FlushType, ObjectStoreCacheOptions, ReadOptions, ScanOptions, Settings};
 use slatedb::{Db, DbReader, DbReaderMode, ErrorKind, WriteBatch, WriteHandle};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
@@ -121,6 +121,10 @@ pub struct TableMeta {
     /// which every row written must not make false (`defaults.rs`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub checks: Vec<(String, String)>,
+    /// Identity columns (by stored name): each numbered by a sequence it owns, which its default
+    /// calls (`seq.rs`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub identity: BTreeMap<String, crate::seq::Identity>,
     /// Not the lake's: files outside it a query reads as a table (`ext.rs`), never in the catalog.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ext: Option<crate::ext::Spec>,
@@ -197,6 +201,7 @@ impl TableMeta {
             partition,
             not_null: self.not_null.iter().filter(|c| !self.dropped.contains(c)).map(n).collect(),
             defaults: self.defaults.iter().filter(|(c, _)| !self.dropped.contains(c)).map(|(c, e)| (n(c), e.clone())).collect(),
+            identity: self.identity.iter().filter(|(c, _)| !self.dropped.contains(c)).map(|(c, i)| (n(c), i.clone())).collect(),
             names: BTreeMap::new(),
             dropped: vec![],
             ..self.clone()
@@ -437,6 +442,8 @@ pub struct Lake {
     cached: Option<Arc<crate::cache::CachedStore>>, // what DataFusion reads the bucket through
     pub ids: crate::sys::Ids, // the row ids this process stamps rows with (a block reserved from the leader)
     pub caught: watch::Sender<bool>, // false while a node that just started catches up with its leader (`caught_up`)
+    pub to: std::sync::OnceLock<crate::log::To>, // where this process's flushes and sequences' values go: its sequencer, or the leader's
+    pub sequences: tokio::sync::Mutex<HashMap<String, crate::seq::Block>>, // the sequences' values this node hands out (`seq::next`)
     bases: std::sync::RwLock<BTreeMap<String, (String, Option<Store>)>>, // a branch's bases (ADR-047): id -> place, and its store once read
     sessions: Mutex<std::collections::HashMap<usize, datafusion::execution::SessionState>>, // (`session_with`'s, made once a partition count)
     me: std::sync::Weak<Lake>,
@@ -614,7 +621,7 @@ impl Lake {
         };
         crate::format::check(&cat, &url, writer).await?; // (a lake a newer Pondra wrote: refused before its tables are read, ADR-039)
         let hwm = watch::Sender::new(cat.get::<u64>("n").await?.unwrap_or(1) - 1);
-        let lake = Arc::new_cyclic(|me| Lake { url, store, cat, hwm, backlog: Default::default(), rt, tail: Mutex::new((lru::LruCache::unbounded(), 0)), tails: Mutex::new((lru::LruCache::unbounded(), 0)), disk, groups: crate::serve::Groups::new(cache_mb() << 19), hot: Arc::new(crate::hot::Hot::new()), attached: Default::default(), ids: Default::default(), cached: cached_store, caught: watch::channel(true).0, bases: Default::default(), sessions: Default::default(), me: me.clone() });
+        let lake = Arc::new_cyclic(|me| Lake { url, store, cat, hwm, backlog: Default::default(), rt, tail: Mutex::new((lru::LruCache::unbounded(), 0)), tails: Mutex::new((lru::LruCache::unbounded(), 0)), disk, groups: crate::serve::Groups::new(cache_mb() << 19), hot: Arc::new(crate::hot::Hot::new()), attached: Default::default(), ids: Default::default(), cached: cached_store, caught: watch::channel(true).0, to: Default::default(), sequences: Default::default(), bases: Default::default(), sessions: Default::default(), me: me.clone() });
         lake.hot.watch(); // the decoded columns give memory back when the node needs it
         crate::branch::load(&lake).await?; // (a branch's files listed in its bases: ADR-047)
         if let Some(writes) = lake.cat.unstarted.lock().unwrap().take() {
@@ -831,6 +838,7 @@ impl Lake {
         state.register_catalog_list(Arc::new(catalogs));
         let ctx = SessionContext::new_with_state(state);
         crate::files::register(&ctx, self.arc()); // files('…'), file_read(path) (here, not in what is kept: the lake would keep itself)
+        crate::seq::register(&ctx, self.arc()); // nextval, currval, setval
         crate::ext::register_secrets(&ctx, self.arc()); // secrets()
         ctx
     }
@@ -1172,7 +1180,8 @@ pub const QUIET: &str = "quiet";
 
 /// A commit no remembered answer depends on (`Catalog::version`): only the statements' history's
 /// rows, their producer's progress and its table's entry (`history.rs`, every second on every
-/// node), or retention letting segments go and marked `QUIET`. Counting them, every remembered
+/// node), retention letting segments go and marked `QUIET`, or sequences' blocks taken (`seq.rs`,
+/// marked too). Counting them, every remembered
 /// answer was forgotten every second on a lake nobody wrote to.
 fn quiet(d: &Delta) -> bool {
     let history = |k: &str| k == crate::history::KEY || k.strip_prefix("p/history-").is_some_and(|id| id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()));
@@ -1181,7 +1190,7 @@ fn quiet(d: &Delta) -> bool {
     d.deletes.iter().all(|k| k.starts_with("s/") || k.starts_with("d/"))
         && (marked || d.puts.iter().any(|(k, _)| history(k)))
         && d.puts.iter().all(|(k, v)| {
-            matches!(k.as_str(), "c" | "n" | "b" | QUIET) || k.starts_with("d/") || history(k) || (marked && k.starts_with("t/"))
+            matches!(k.as_str(), "c" | "n" | "b" | QUIET) || k.starts_with("d/") || history(k) || (marked && (k.starts_with("t/") || k.starts_with("sq/")))
                 || (k.starts_with("s/") && serde_json::from_slice::<Segment>(v).is_ok_and(|s| only(&s)))
         })
 }

@@ -820,10 +820,10 @@ async fn append(State(app): State<App>, Path(name): Path<String>, Query(p): Quer
     let batch = concat_batches(&schema, &batches)?;
     let batch = match (crate::defaults::any(&meta), given) {
         (false, _) => batch,
-        (true, Some(given)) => crate::defaults::fill(&meta, batch.clone(), |c| (!given.iter().any(|g| g == c)).then(|| crate::defaults::all(batch.num_rows()))).await?,
+        (true, Some(given)) => crate::defaults::fill(&app.lake, &meta, batch.clone(), |c| (!given.iter().any(|g| g == c)).then(|| crate::defaults::all(batch.num_rows()))).await?,
         (true, None) => {
             let absent = crate::defaults::absent_keys(&meta, &body)?; // (a JSON row without the key)
-            crate::defaults::fill(&meta, batch, |c| absent.get(c).cloned()).await?
+            crate::defaults::fill(&app.lake, &meta, batch, |c| absent.get(c).cloned()).await?
         }
     };
     Ok(Json(log.append(name, Src { producer: p.producer, seq: p.seq, prev: p.prev }, batch).await?))
@@ -1066,7 +1066,7 @@ async fn query(app: &App, p: &SqlParams, query: &str, files: bool) -> anyhow::Re
     // Same query, same catalog version: same answer (unless it asks for the time or randomness,
     // or may read a file on this machine).
     let q = query.to_lowercase();
-    let volatile = files || limited || !crate::ext::names(query).is_empty() || ["now()", "random(", "current_", "uuid(", "explain", "pondra.runs", "pondra.tasks", "pondra.audit", "pondra.history", "pondra$history", "pondra.variables", "files("].iter().any(|f| q.contains(f)) // (files outside the lake change on their own; `files()` lists objects put since)
+    let volatile = files || limited || !crate::ext::names(query).is_empty() || ["now()", "random(", "current_", "uuid(", "explain", "pondra.runs", "pondra.tasks", "pondra.audit", "pondra.history", "pondra$history", "pondra.variables", "files(", "nextval(", "currval(", "setval("].iter().any(|f| q.contains(f)) // (files outside the lake change on their own; `files()` lists objects put since)
         || crate::temp::mentioned(query) // (the session's temporary tables change without a commit)
         || crate::settings::any() // (and its settings may change the answer)
         || crate::routines::volatile(&app.lake, query).await; // (a Python function may answer differently each time)

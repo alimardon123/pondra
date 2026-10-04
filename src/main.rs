@@ -71,6 +71,7 @@ mod replica;
 mod routines;
 mod scan;
 mod script;
+mod seq;
 mod server;
 mod service;
 mod spill;
@@ -531,13 +532,12 @@ async fn run() -> anyhow::Result<()> {
             tr("followers' changes recovered");
             let max_backlog = (tier_secs > 0.0).then_some(backlog); // rows waiting to be tiered
             let seq = if leader { Some(log::Sequencer::start(lake.clone(), max_backlog).await?) } else { None };
-            let log = (!reader).then(|| {
-                let to = match &seq {
-                    Some(s) => log::To::Local(s.clone()),
-                    None => log::To::Leader(cluster.leader.addr.clone()),
-                };
-                Arc::new(log::Log::start(lake.clone(), Duration::from_millis(flush_ms), to))
-            });
+            let to = match &seq {
+                Some(s) => log::To::Local(s.clone()),
+                None => log::To::Leader(cluster.leader.addr.clone()),
+            };
+            let _ = lake.to.set(to.clone()); // (a follower's sequences' values: the leader's sequencer)
+            let log = (!reader).then(|| Arc::new(log::Log::start(lake.clone(), Duration::from_millis(flush_ms), to)));
             tr("the sequencer");
             python::init(python);
             let app = server::App { lake: lake.clone(), cluster: cluster.clone(), log, seq, lock: Default::default(), retain_ms: retain_secs * 1000, results: Default::default(), replica: replica.clone(), auth };

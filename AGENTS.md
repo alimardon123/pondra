@@ -66,8 +66,9 @@ src/      28,600 lines of Rust, one file per concern (see the table in README.md
           dropping work), service.rs (`pondra service`: systemd, launchd, a Windows service;
           ADR-041), past.rs (a table's past: `AT (…)`, `RESTORE`, ADR-043) and history.rs (every
           statement a row of `pondra.history`, slow ones with plans and traces, ADR-048); round 34
-          friendly.rs (DuckDB's spellings, rewritten where SQL comes in: invariant 225) and objects.rs
-          (one registry of every kind of object: ADR-049, invariant 227)
+          friendly.rs (DuckDB's spellings, rewritten where SQL comes in: invariant 225), objects.rs
+          (one registry of every kind of object: ADR-049, invariant 227) and seq.rs (sequences and
+          identity columns: invariant 234)
 brand/    the logo (mark.svg), colours (colors.css) and fonts (fonts/: Geist and Geist Mono, SIL
           OFL): the only copies; tools/brand_check.py
 site/     the documentation website (Starlight; ADR-030): site/STYLE.md says how pages are written,
@@ -135,7 +136,8 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
   `d/` inline segment data, `p/` producer progress (also Kafka producers, consumer-group offsets
   and window emission), `v/` views, `w/` session views' bounds, `k/` tasks, `x/` Delta and `i/`
   Iceberg publish state, `a/` lakes attached, `f/` functions, `r/` macros and procedures, `e/`
-  secrets (sealed), `o/` catalogs attached from outside and `fd/` feeds (round 23), `m` members
+  secrets (sealed), `o/` catalogs attached from outside and `fd/` feeds (round 23), `sq/` sequences
+  (round 34: only the sequencer writes them), `m` members
   (replicated acks), `n` next segment, `c` commit number. One process (the leader) writes it;
   everyone reads it.
 - **Writes:** a client POSTs a batch to *any* node. That node encodes it (Arrow IPC + ZSTD), runs
@@ -1562,6 +1564,18 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    needed room, a busy table's merges filled it with files nobody could read (Durability's soak:
    537 MB after 25 minutes, of a table of a few tens). `harness.py hot`: "a merge's replaced files
    leave memory".
+234. **A sequence's values are durable before any is handed out, and only the sequencer moves it**
+   (`seq.rs`, `sq/{name}`): `nextval` takes a block in a commit of the sequencer's own (`Flush::sequence`,
+   `seq::Held`), answered once durable, so a value given out is never given again, through a
+   leader's kill too. Every sequence op takes a log number of its own (`*next += 1`), which is the
+   sequence's `version`: a node's block from before a change (`ALTER`, `setval`, a rename) is told
+   apart by it and dropped. A commit that only takes blocks is quiet (invariant 224). `VALUES`
+   rows take theirs in order (`write::whole_rows` → `seq::taken`: DataFusion plans a `VALUES` with a
+   call in it as one-row projections run at once). An identity column owns its sequence; `ALWAYS`
+   refuses a value given or set at every SQL door (428C9); loading doors (JSON, Arrow, Kafka,
+   Flight, `COPY`) keep a given value, as Postgres's `COPY` does. `harness.py sequences`: with the
+   numbers shared, "…RESTART…" hands out the old block; "after the leader is killed…" checks no
+   value comes twice.
 
 ## Tests: run these before and after any change
 
@@ -1586,6 +1600,7 @@ python3 tools/harness.py tails          # a table's log tail kept between querie
 python3 tools/harness.py minmax         # a global min/max over 24 files skips no row its other answers need (an expression, NULLs so far, FILTER); a wide top-N's answer
 python3 tools/harness.py history        # pondra.history: every door's statements, slow ones' plans and three nodes' traces, the rate, off, who reads what
 python3 tools/harness.py friendly       # DuckDB's spellings (PIVOT, COLUMNS, lambdas, ASOF … ON, SUMMARIZE, samples, …) == DuckDB's answers; spread, Postgres, views
+python3 tools/harness.py sequences      # nextval on three nodes (every value once), identity columns from every door, ALWAYS, owned sequences, a leader's kill
 python3 tools/harness.py registry       # pondra.objects, SHOW CREATE of every kind run again after a drop, COMMENT ON through renames, CREATE OR ALTER TABLE, GET /kinds
 python3 tools/random_sql.py --queries 100000 # random queries: one node == DuckDB, every tenth == three nodes, each split three ways by a condition (TLP)
 python3 tools/harness.py tasks          # task graphs on three nodes: AFTER, WHEN, pondra.result, retries, timeouts, SUSPEND, refusals, a failover

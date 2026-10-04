@@ -419,7 +419,7 @@ impl Backend {
             // the table's columns in its order, those not given their DEFAULT, or null
             let cols = table.fields().iter().map(|f| b.column_by_name(f.name()).cloned().unwrap_or_else(|| datafusion::arrow::array::new_null_array(f.data_type(), b.num_rows()))).collect();
             let b = RecordBatch::try_new(table.clone(), cols).map_err(|e| err(e.into()))?;
-            let b = crate::defaults::fill(&meta, b.clone(), |c| (!given.iter().any(|g| g == c)).then(|| crate::defaults::all(b.num_rows()))).await.map_err(err)?;
+            let b = crate::defaults::fill(&self.app.lake, &meta, b.clone(), |c| (!given.iter().any(|g| g == c)).then(|| crate::defaults::all(b.num_rows()))).await.map_err(err)?;
             p.rows += b.num_rows() as u64;
             p.seq += 1;
             let src = crate::log::Src { producer: format!("copy:{}", p.job), seq: p.seq, prev: None };

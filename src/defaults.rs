@@ -86,10 +86,14 @@ pub fn any(meta: &TableMeta) -> bool { !meta.defaults.is_empty() }
 
 /// The value of `column`'s default for each of `n` new rows (as the column's type), or None if it
 /// has none. Each row gets its own (`uuid()` differs row to row).
-pub async fn values(meta: &TableMeta, column: &str, n: usize) -> Result<Option<ArrayRef>> {
+pub async fn values(lake: &crate::store::Lake, meta: &TableMeta, column: &str, n: usize) -> Result<Option<ArrayRef>> {
     let Some(stored) = meta.stored(column) else { return Ok(None) };
     let (Some(expr), Some((_, _, t))) = (meta.defaults.get(stored), meta.live().find(|(s, _, _)| *s == stored)) else { return Ok(None) };
-    let batches = SessionContext::new().sql(&format!("SELECT {expr} AS v FROM range({n})")).await?.collect().await?;
+    let ctx = SessionContext::new();
+    if crate::seq::calls(expr) {
+        crate::seq::register(&ctx, lake.arc()); // (an identity's `nextval('t_id_seq')`)
+    }
+    let batches = ctx.sql(&format!("SELECT {expr} AS v FROM range({n})")).await?.collect().await?;
     let rows: Vec<ArrayRef> = batches.iter().map(|b| b.column(0).clone()).collect();
     let all = datafusion::arrow::compute::concat(&rows.iter().map(|a| a.as_ref()).collect::<Vec<_>>())?;
     Ok(Some(crate::query::strict(&all, &crate::query::dtype(t)?)?))
@@ -97,7 +101,11 @@ pub async fn values(meta: &TableMeta, column: &str, n: usize) -> Result<Option<A
 
 /// A default's expression checked when the table is made: it gives one value of the column's type.
 pub async fn validate(column: &str, sql_type: &str, expr: &str) -> Result<()> {
-    let got = SessionContext::new().sql(&format!("SELECT {expr} AS v")).await;
+    let ctx = SessionContext::new();
+    let one = |_: &[datafusion::logical_expr::ColumnarValue]| Ok(datafusion::logical_expr::ColumnarValue::Scalar(datafusion::common::ScalarValue::Int64(Some(1))));
+    let int = datafusion::arrow::datatypes::DataType::Int64;
+    ctx.register_udf(datafusion::prelude::create_udf("nextval", vec![datafusion::arrow::datatypes::DataType::Utf8], int, datafusion::logical_expr::Volatility::Volatile, std::sync::Arc::new(one))); // (its type: the sequence itself is looked for by `seq::named_exist`)
+    let got = ctx.sql(&format!("SELECT {expr} AS v")).await;
     let batches = match got {
         Ok(df) => df.collect().await,
         Err(e) => Err(e),
@@ -113,14 +121,14 @@ pub async fn validate(column: &str, sql_type: &str, expr: &str) -> Result<()> {
 
 /// `rows` with defaults put where the write left a column out: `left_out(column)` says in which
 /// rows (None: in none).
-pub async fn fill(meta: &TableMeta, rows: RecordBatch, left_out: impl Fn(&str) -> Option<BooleanArray>) -> Result<RecordBatch> {
+pub async fn fill(lake: &crate::store::Lake, meta: &TableMeta, rows: RecordBatch, left_out: impl Fn(&str) -> Option<BooleanArray>) -> Result<RecordBatch> {
     if !any(meta) || rows.num_rows() == 0 {
         return Ok(rows);
     }
     let mut columns = rows.columns().to_vec();
     for (i, f) in rows.schema().fields().iter().enumerate() {
         let Some(mask) = left_out(f.name()).filter(|m| m.true_count() > 0 && m.len() == rows.num_rows()) else { continue };
-        let Some(v) = values(meta, f.name(), rows.num_rows()).await? else { continue };
+        let Some(v) = values(lake, meta, f.name(), rows.num_rows()).await? else { continue };
         columns[i] = datafusion::arrow::compute::kernels::zip::zip(&mask, &v, &columns[i])?;
     }
     Ok(RecordBatch::try_new(rows.schema(), columns)?)

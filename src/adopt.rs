@@ -191,6 +191,7 @@ pub async fn file(lake: &Lake, seq: &crate::log::Sequencer, commits: &[FileCommi
             }
             Outcome::Retry(r) if r.is_empty() => tokio::time::sleep(std::time::Duration::from_millis(10)).await, // (views changed: derive again)
             Outcome::Retry(_) => return Ok(None),
+            Outcome::Refused(why) => anyhow::bail!(why),
         }
     }
 }
@@ -213,6 +214,7 @@ pub async fn upserts(lake: &Lake, seq: &crate::log::Sequencer, table: &str, rows
             Outcome::Retry(r) if r.is_empty() => tokio::time::sleep(std::time::Duration::from_millis(10)).await, // (views changed: derive again)
             Outcome::Acks(a) => return Ok(a.iter().all(|a| !a.duplicate)),
             Outcome::Retry(_) => return Ok(false),
+            Outcome::Refused(why) => anyhow::bail!(why),
         }
     }
 }

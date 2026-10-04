@@ -67,6 +67,9 @@ pub struct Flush {
     /// and out of them, in this commit, as its segment names them (`Segment::files`).
     #[serde(skip)]
     pub filed: Vec<Filing>,
+    /// No rows: a sequence's counter to move (`seq.rs`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sequence: Option<crate::seq::Op>,
 }
 
 /// One table's part of a file commit: the table as it is to be, the files it takes out already
@@ -118,6 +121,7 @@ pub struct Reserved {
 pub enum Outcome {
     Acks(Vec<Ack>),
     Retry(Vec<(usize, Ack)>),
+    Refused(String), // (a sequence's op that can't be: `seq::Held`)
 }
 
 // ---------------------------------------------------------------- the batcher (every node)
@@ -151,8 +155,19 @@ impl To {
     /// A block of row ids only.
     pub async fn block(&self) -> Result<u64> { Ok(self.ask(Flush { block: true, ..Default::default() }).await?.block) }
 
-    async fn ask(&self, f: Flush) -> Result<Reserved> {
-        reserved(match self {
+    /// Move a sequence's counter (`seq.rs`): the sequencer's ack, or why not.
+    pub async fn sequence(&self, op: crate::seq::Op) -> Result<Ack> {
+        match self.outcome(Flush { sequence: Some(op), ..Default::default() }).await? {
+            Outcome::Acks(a) if !a.is_empty() => Ok(a[0]),
+            Outcome::Refused(e) => Err(anyhow!("{e}")),
+            _ => Err(anyhow!("no answer from the sequencer")),
+        }
+    }
+
+    async fn ask(&self, f: Flush) -> Result<Reserved> { reserved(self.outcome(f).await?) }
+
+    async fn outcome(&self, f: Flush) -> Result<Outcome> {
+        Ok(match self {
             To::Local(seq) => seq.submit(f).await?,
             To::Leader(addr) => http().post(crate::tls::url(&format!("{addr}/cluster/commit"))).body(encode_flush(&f)?).send().await?.error_for_status()?.json().await?,
         })
@@ -259,6 +274,11 @@ async fn send(lake: &Lake, to: &To, mut pending: Vec<Append>, mut turn: Option<o
             Ok(Outcome::Acks(acks)) => {
                 for (a, ack) in pending.drain(..).zip(acks) {
                     let _ = a.ack.send(Ok(ack));
+                }
+            }
+            Ok(Outcome::Refused(why)) => {
+                for a in pending.drain(..) {
+                    let _ = a.ack.send(Err(why.clone())); // (a sequence's answer: never an append's)
                 }
             }
             Ok(Outcome::Retry(retried)) => {
@@ -374,8 +394,10 @@ impl Sequencer {
         let (tx, mut rx) = mpsc::channel::<(Flush, oneshot::Sender<Outcome>)>(10_000);
         let commit_ms = Arc::new(Mutex::new(vec![]));
         let ms = commit_ms.clone();
+        let me = lake.clone();
         crate::panics::spawn(async move {
             let mut last_seq = HashMap::new(); // producer -> last committed seq (cache of p/ keys)
+            let mut sequences = crate::seq::Held::default(); // (the counters it moved: it alone writes them)
             let in_flight = Arc::new(tokio::sync::Semaphore::new(COMMITS_IN_FLIGHT));
             let disk = (!lake.url.contains("://")).then(|| std::path::PathBuf::from(&lake.url)); // (a lake on local disk)
             while let Some(first) = rx.recv().await {
@@ -396,14 +418,16 @@ impl Sequencer {
                 while let Ok(f) = rx.try_recv() {
                     batch.push(f);
                 }
-                if let Err(e) = commit(&lake, &mut next, &mut block, &mut last_seq, batch, &ms, slot).await {
+                if let Err(e) = commit(&lake, &mut next, &mut block, &mut last_seq, &mut sequences, batch, &ms, slot).await {
                     // Committed or not, we can't tell: restart and reload the state from the catalog.
                     eprintln!("sequencer failed: {e:#}");
                     crate::cluster::restart("the sequencer failed");
                 }
             }
         });
-        Ok(Arc::new(Sequencer { tx, commit_ms }))
+        let seq = Arc::new(Sequencer { tx, commit_ms });
+        let _ = me.to.set(To::Local(seq.clone())); // (where this process's own sequence values come from)
+        Ok(seq)
     }
 
     pub async fn submit(&self, f: Flush) -> Result<Outcome> { Ok(self.enqueue(f).await?.await?) }
@@ -431,7 +455,7 @@ pub fn forget_producers(names: impl IntoIterator<Item = String>) { FORGOTTEN.loc
 /// Sequence a batch of flushes and write them as one catalog commit. Without waiting for it to
 /// be committed, the next batch can follow; acks go out once this one is.
 #[allow(clippy::too_many_arguments)]
-async fn commit(lake: &Arc<Lake>, next: &mut u64, block: &mut u64, last_seq: &mut HashMap<String, u64>, batch: Vec<(Flush, oneshot::Sender<Outcome>)>, ms: &Arc<Mutex<Vec<f64>>>, slot: tokio::sync::OwnedSemaphorePermit) -> Result<()> {
+async fn commit(lake: &Arc<Lake>, next: &mut u64, block: &mut u64, last_seq: &mut HashMap<String, u64>, sequences: &mut crate::seq::Held, batch: Vec<(Flush, oneshot::Sender<Outcome>)>, ms: &Arc<Mutex<Vec<f64>>>, slot: tokio::sync::OwnedSemaphorePermit) -> Result<()> {
     let (mut puts, mut seqs, mut replies) = (vec![], HashMap::<String, u64>::new(), vec![]);
     let (mut inline, mut inline_parts) = (vec![], BTreeMap::<String, Vec<(u64, u64, u64)>>::new()); // all inline flushes: one segment
     for p in std::mem::take(&mut *FORGOTTEN.lock().unwrap()) {
@@ -439,7 +463,14 @@ async fn commit(lake: &Arc<Lake>, next: &mut u64, block: &mut u64, last_seq: &mu
     }
     let (views, blocks) = (crate::views::inline(lake).await?, *block);
     puts.extend(crate::views::bound(lake, &views, *next)); // (views made since: their filling ends before this commit)
+    let mut takes = None; // (only sequences' blocks taken: a commit no read sees)
     for (mut f, reply) in batch {
+        if let Some(op) = f.sequence.take() {
+            takes = Some(takes.unwrap_or(true) && matches!(op, crate::seq::Op::Take { .. }));
+            replies.push((reply, sequences.apply(lake, op, *next).await?)); // (answered once this commit is durable)
+            *next += 1; // (a number of its own, as a reserve's: a node tells a block from before a change by it)
+            continue;
+        }
         if f.reserve > 0 || f.block {
             // (numbers no segment will take: gaps in the log's sequence, which nothing minds)
             let ack = Ack { seg: *next, ms: now_ms(), block: *block, ..Default::default() };
@@ -544,7 +575,12 @@ async fn commit(lake: &Arc<Lake>, next: &mut u64, block: &mut u64, last_seq: &mu
     if *block != blocks {
         puts.push(("b".into(), json(block)));
     }
-    let (t0, durable) = (Instant::now(), lake.cat.write(puts, &[]).await?);
+    let (counters, dropped) = sequences.writes();
+    puts.extend(counters);
+    if takes == Some(true) {
+        puts.push((crate::store::QUIET.into(), json(&true))); // (remembered answers stay, unless something else here is loud)
+    }
+    let (t0, durable) = (Instant::now(), lake.cat.write(puts, &dropped).await?);
     last_seq.extend(seqs);
     let (lake, ms, hwm) = (lake.clone(), ms.clone(), *next - 1);
     crate::panics::spawn(async move {

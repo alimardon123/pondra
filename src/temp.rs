@@ -78,6 +78,7 @@ pub struct Session {
     pub settings: std::collections::BTreeMap<String, String>,       // SET name = value (`settings.rs`)
     pub prepared: HashMap<String, String>,                          // PREPARE name AS …: its text
     pub variables: std::collections::BTreeMap<String, crate::vars::Var>, // DECLARE $name …, $name = … (`vars.rs`)
+    pub currval: HashMap<String, i64>,                              // each sequence's last value its nextval gave (`seq.rs`)
     used: Option<Instant>,
     version: u64, // changes so far (`live.rs` watches them)
 }

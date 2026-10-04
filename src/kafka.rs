@@ -385,7 +385,7 @@ async fn queue(app: &App, table: &str, meta: &TableMeta, records: &[u8]) -> BoxF
         let rows = match to_rows(meta, &b.recs) {
             Ok((rows, lines)) if crate::defaults::any(meta) => {
                 // (a JSON row without a key takes its column's DEFAULT)
-                let filled = async { crate::defaults::fill(meta, rows, |c| crate::defaults::absent_keys(meta, &lines).ok()?.remove(c)).await };
+                let filled = async { crate::defaults::fill(&app.lake, meta, rows, |c| crate::defaults::absent_keys(meta, &lines).ok()?.remove(c)).await };
                 match filled.await {
                     Ok(rows) => rows,
                     Err(e) => return invalid(e),

@@ -215,6 +215,7 @@ pub enum Ddl {
     Replacing { name: String, then: Box<Ddl> },              // CREATE OR REPLACE MATERIALIZED VIEW: the old one dropped first (refused while another follows it)
     DetachView { name: String },                             // ALTER MATERIALIZED VIEW v DETACH: its rows stop following, and stay a table
     Object(crate::objects::Op),                              // the registry's: COMMENT ON, CREATE OR ALTER TABLE (`objects.rs`)
+    Sequence(crate::seq::Change),                            // CREATE, ALTER, DROP SEQUENCE (`seq.rs`)
 }
 
 /// What `ALTER TABLE` does to a column: rename it, drop it, or widen its type (a SQL type).
@@ -282,6 +283,7 @@ async fn carry_out(lake: &Lake, d: Ddl) -> Result<Value> {
         }
         Ddl::DetachView { name } => detach_view(lake, &new_name(lake, &name).await?).await,
         Ddl::Object(op) => crate::objects::apply(lake, op).await,
+        Ddl::Sequence(c) => crate::seq::apply(lake, c).await,
         Ddl::CreateSchema { name, if_not_exists } => {
             check(&name)?;
             if has_schema(lake, &name).await? {
@@ -340,6 +342,7 @@ async fn carry_out(lake: &Lake, d: Ddl) -> Result<Value> {
                     return Ok(j!({"view": name, "feed": true}));
                 }
             }
+            ensure!(!crate::seq::calls(&sql), "a materialized view can't call nextval or setval: its rows are worked out again as its tables change, and would be numbered again (number the rows where they are written: an identity column, or DEFAULT nextval('s'))");
             ensure!(outside.is_empty(), "a materialized view follows the rows its tables take in, and files outside the lake take none: read them into a table (CREATE TABLE … AS, INSERT … SELECT) and follow that, or make a stored view (CREATE VIEW)");
             crate::views::create(lake, &name, &sql, crate::views::options(&options)?).await?;
             crate::views::forget(lake); // (the sequencer holds flushes to it from its next commit)
@@ -724,7 +727,8 @@ async fn drop_table(lake: &Lake, name: &str, if_exists: bool, purge: bool) -> Re
     let keep_ms = meta.retention_secs.map_or(KEEP_MS, |s| s * 1000);
     let deleted = crate::sys::deleted(name);
     let mut puts = vec![];
-    if keep_ms > 0 && !purge && !crate::sys::hidden(name) {
+    let kept = keep_ms > 0 && !purge && !crate::sys::hidden(name);
+    if kept {
         let mut sent = false;
         for _ in 0..10 {
             if to_files(lake, &[name.to_string(), deleted.clone()]).await? {
@@ -742,6 +746,9 @@ async fn drop_table(lake: &Lake, name: &str, if_exists: bool, purge: bool) -> Re
         crate::delta::unpublish(lake, name, format).await?; // (no copy left for other engines)
     }
     lake.cat.commit(puts, &[table_key(name), table_key(&deleted)]).await?; // (and its replaced rows)
+    if !kept {
+        crate::seq::drop_owned(lake, &meta).await?; // (a table kept to be undropped keeps its identity's sequences)
+    }
     Ok(j!({"table": name, "dropped": true}))
 }
 

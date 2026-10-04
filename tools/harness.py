@@ -6732,6 +6732,144 @@ def objects():
         sys.exit(1)
 
 
+def sequences():
+    """Sequences and identity columns (`seq.rs`): `nextval` on three nodes at once, every value once;
+    an identity column filled from every door (VALUES in their order, INSERT … SELECT, JSON appends,
+    Postgres, `pondra sql`); currval a session's; setval, RESTART, RENAME, CYCLE and a sequence's end;
+    ALWAYS refusing a value; owned sequences gone with `DROP TABLE … PURGE`, kept with an UNDROP;
+    values past a leader's kill never handed out again."""
+    import psycopg, concurrent.futures as cf
+    lake = new_lake()
+    ports = [A.port + 1 + i for i in range(3)]
+    pg = A.port + 10
+    nodes = [Node(lake, p, **({"pg": f"127.0.0.1:{pg}"} if i == 1 else {})).start() for i, p in enumerate(ports)]
+    while len(call(ports[0], "GET", "/stats")["nodes"]) < 3:
+        time.sleep(0.1)
+    h = {"x-pondra-session": "harness-sequences"}
+    q = lambda s, port=ports[0], hh=h: call(port, "POST", "/sql", s.encode(), headers=hh, timeout=120)
+    def err(s, port=ports[0], hh=h):
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=60)
+        c.request("POST", "/sql", s.encode(), hh)
+        r = c.getresponse()
+        data = r.read()
+        return (r.status, r.getheader("x-pondra-sqlstate"), data.decode()[:300]) if r.status != 200 else (200, None, "")
+    def eventually(f, secs=10):
+        end = time.time() + secs
+        while True:
+            try:
+                return f()
+            except Exception:
+                if time.time() > end:
+                    raise
+                time.sleep(0.1)
+    checks, info = {}, {}
+    # nextval on three nodes at once: every value once
+    q("CREATE SEQUENCE s", ports[1])
+    eventually(lambda: [q("SELECT nextval('s') AS v", p) for p in ports])
+    def take(port, n=40, wait=0):  # (wait: through a failover, while the followers rejoin)
+        return [r["v"] for _ in range(n) for r in eventually(lambda: q("SELECT nextval('s') AS v FROM range(25)", port), wait)]
+    with cf.ThreadPoolExecutor(9) as ex:
+        got = [v for f in [ex.submit(take, p) for p in ports * 3] for v in f.result()]
+    info["taken"] = {"values": len(got), "distinct": len(set(got)), "least": min(got), "greatest": max(got)}
+    checks["nextval on three nodes at once, 9 clients: 9,000 values, every one once"] = len(got) == 9000 and len(set(got)) == 9000 and min(got) >= 1
+    # options in any order, ALTER, setval, currval
+    q("CREATE SEQUENCE o START 10 INCREMENT 5 CACHE 1")
+    o = [q("SELECT nextval('o') AS v")[0]["v"] for _ in range(2)]
+    cur = q("SELECT currval('o') AS v")[0]["v"]
+    before = err("SELECT currval('s') AS v", hh={"x-pondra-session": "harness-sequences-2"})
+    none = err("SELECT currval('o') AS v", hh={})
+    q("SELECT setval('o', 100)")
+    after_set = q("SELECT nextval('o') AS v")[0]["v"]
+    q("ALTER SEQUENCE o RESTART WITH 7")
+    restarted = q("SELECT nextval('o') AS v")[0]["v"]
+    q("ALTER SEQUENCE o INCREMENT BY 2")
+    stepped = [q("SELECT nextval('o') AS v")[0]["v"] for _ in range(2)]  # (after a change, every node's block goes: a gap, as Postgres's CACHE leaves)
+    info["o"] = [o, cur, before, none, after_set, restarted, stepped]
+    checks["START 10 INCREMENT 5 in any order; currval the session's last (55000 before, none without a session); setval; RESTART; INCREMENT changed"] = \
+        o == [10, 15] and cur == 15 and before[1] == "55000" and none[0] == 500 and after_set == 105 and restarted == 7 and stepped[1] - stepped[0] == 2 and stepped[0] > restarted
+    q("ALTER SEQUENCE o RENAME TO o2")
+    renamed = (q("SELECT nextval('o2') AS v")[0]["v"], err("SELECT nextval('o') AS v")[1])
+    q("CREATE SEQUENCE c AS smallint MAXVALUE 3 CYCLE")
+    q("CREATE SEQUENCE e AS smallint MAXVALUE 3")
+    cycled = [r["v"] for r in q("SELECT nextval('c') AS v FROM range(5)")]
+    ended = ([r["v"] for r in q("SELECT nextval('e') AS v FROM range(3)")], err("SELECT nextval('e') AS v"))
+    info["c"] = [renamed, cycled, ended]
+    checks["RENAME TO; CYCLE comes round; a sequence's end is 2200H"] = renamed[0] > stepped[1] and renamed[1] == "42P01" and cycled == [1, 2, 3, 1, 2] and ended[0] == [1, 2, 3] and ended[1][1] == "2200H"
+    # identity columns, from every door
+    q("CREATE TABLE orders (id BIGINT GENERATED ALWAYS AS IDENTITY, node INT, k INT)", ports[2])
+    eventually(lambda: [q("SELECT count(*) AS n FROM orders", p) for p in ports])
+    def values(port, i):
+        for j in range(10):
+            q("INSERT INTO orders (node, k) VALUES " + ", ".join(f"({i}, {j * 5 + r})" for r in range(5)), port)
+    with cf.ThreadPoolExecutor(6) as ex:
+        list(ex.map(lambda a: values(*a), [(p, i) for i, p in enumerate(ports)] * 2))
+    q("INSERT INTO orders (node, k) SELECT 7, i FROM range(1000) AS r(i)", ports[1])
+    call(ports[2], "POST", "/append/orders", "".join(f'{{"node": 8, "k": {i}}}\n' for i in range(100)).encode())
+    with psycopg.connect(f"host=127.0.0.1 port={pg} user=x dbname=x", autocommit=True) as c:
+        c.execute("INSERT INTO orders (node, k) VALUES (9, 1), (9, 2)")
+        via_pg = [c.execute("SELECT nextval('s')").fetchone()[0], c.execute("SELECT currval('s')").fetchone()[0]]
+    cli = subprocess.run([BIN, "sql", "--dir", lake, "INSERT INTO orders (node, k) VALUES (10, 1)"], capture_output=True, text=True, timeout=120)
+    totals = eventually(lambda: (lambda r: r if r["n"] == 1403 else 1 / 0)(q("SELECT count(*) AS n, count(DISTINCT id) AS ids, count(id) AS given FROM orders")[0]))
+    in_order = q("SELECT node, k, id FROM orders WHERE node = 0 ORDER BY id")
+    runs = [[r["k"] for r in in_order[i:i + 5]] for i in range(0, len(in_order), 5)]
+    info["orders"] = {"totals": totals, "pg": via_pg, "cli": cli.stderr[-300:], "runs": runs[:4]}
+    checks["an identity column from every door (VALUES on three nodes, INSERT … SELECT, JSON, Postgres, pondra sql): every row its own id"] = \
+        totals == {"n": 1403, "ids": 1403, "given": 1403} and via_pg[0] == via_pg[1] and cli.returncode == 0
+    checks["VALUES take their ids in the rows' order"] = all(r == sorted(r) for r in runs) and len(runs) == 20
+    refused = [err(x) for x in ("INSERT INTO orders (id, node, k) VALUES (1, 1, 1)", "INSERT INTO orders VALUES (1, 1, 1)", "UPDATE orders SET id = 1 WHERE k = 1")]
+    q("CREATE TABLE kinds (a BIGINT GENERATED BY DEFAULT AS IDENTITY (START WITH 100 INCREMENT BY 10), v INT)")
+    q("CREATE TABLE ser (a SERIAL, v INT)")
+    q("CREATE TABLE my (a BIGINT AUTO_INCREMENT, v INT)")
+    q("CREATE TABLE sf (a INT IDENTITY(5, 5), v INT)")
+    for t in ("kinds", "ser", "my", "sf"):
+        q(f"INSERT INTO {t} (v) VALUES (1), (2)")
+    q("INSERT INTO kinds VALUES (3, 3), (DEFAULT, 4)")
+    kinds = {t: [r["a"] for r in q(f"SELECT a FROM {t} ORDER BY v")] for t in ("kinds", "ser", "my", "sf")}
+    shown = q("SHOW CREATE TABLE kinds")[0]["definition"]
+    info["kinds"] = [refused, kinds, shown]
+    checks["ALWAYS refuses a value given or set (428C9); BY DEFAULT, SERIAL, AUTO_INCREMENT and IDENTITY(5, 5) number from their start"] = \
+        [r[1] for r in refused] == ["428C9"] * 3 and kinds == {"kinds": [100, 110, 3, 120], "ser": [1, 2], "my": [1, 2], "sf": [5, 10]} \
+        and "GENERATED BY DEFAULT AS IDENTITY (INCREMENT BY 10 START WITH 100)" in shown
+    # owned sequences live and die with their tables; what can't be is refused
+    q("CREATE TABLE d (n BIGINT DEFAULT nextval('o2'), v INT)")
+    q("INSERT INTO d (v) VALUES (1)")
+    no = [err(x) for x in ("DROP SEQUENCE o2", "DROP SEQUENCE orders_id_seq", "CREATE TABLE bad (n BIGINT DEFAULT nextval('missing'))",
+                           "CREATE MATERIALIZED VIEW mv AS SELECT nextval('s') AS n, v FROM d", "CREATE TEMP SEQUENCE t1", "ALTER TABLE d ADD COLUMN m BIGINT GENERATED ALWAYS AS IDENTITY")]
+    q("DROP TABLE ser")
+    q("UNDROP TABLE ser")
+    q("INSERT INTO ser (v) VALUES (3)")
+    undropped = [r["a"] for r in q("SELECT a FROM ser ORDER BY a")]
+    q("DROP TABLE ser PURGE")
+    gone = err("SELECT nextval('ser_a_seq')")
+    q("CREATE TABLE ser (a SERIAL, v INT)")
+    q("INSERT INTO ser (v) VALUES (1)")
+    fresh = q("SELECT a FROM ser")
+    listed = sorted(r["name"] for r in q("SELECT name FROM pondra.objects WHERE kind = 'sequence'"))
+    info["owned"] = [no, undropped, gone, fresh, listed]
+    checks["DROP SEQUENCE refused while a DEFAULT or a table uses it; a missing one, a materialized view's nextval, TEMP and an added identity refused"] = all(r[0] == 500 for r in no)
+    checks["an owned sequence: kept with a dropped table and its UNDROP, gone with PURGE, made again with the table; not listed apart"] = \
+        undropped == [1, 2, 3] and gone[1] == "42P01" and fresh == [{"a": 1}] and listed == ["c", "e", "o2", "s"]
+    # past a leader's kill, no value is handed out again
+    high = max(got + via_pg)
+    lead = next(i for i, p in enumerate(ports) if call(p, "GET", "/stats")["role"] == "leader")
+    nodes[lead].kill()
+    rest = [p for i, p in enumerate(ports) if i != lead]
+    eventually(lambda: q("SELECT nextval('s') AS v", rest[0]), 60)
+    with cf.ThreadPoolExecutor(4) as ex:  # (past each node's block from before: new ones from the new leader)
+        after = [v for f in [ex.submit(take, p, 200, 60) for p in rest * 2] for v in f.result()]
+    ids = eventually(lambda: (q("INSERT INTO orders (node, k) VALUES (11, 1)", rest[1]), q("SELECT count(*) AS n, count(DISTINCT id) AS ids FROM orders", rest[1])[0])[1], 60)
+    info["failover"] = {"high": high, "after": [min(after), max(after), len(after)], "again": len(set(after) & set(got + via_pg)), "ids": ids}
+    checks["after the leader is killed, 20,000 more values from the two left: none handed out before; ids stay unique"] = \
+        len(after) == 20000 and len(set(after)) == 20000 and not set(after) & set(got + via_pg) and max(after) > high and ids["n"] == ids["ids"] == 1404
+    for n in nodes:
+        n.kill()
+    ok = all(checks.values())
+    print(json.dumps({"sequences": checks, "ok": ok, "info": info}, indent=1, default=str))
+    if not ok:
+        sys.exit(1)
+    return f"{sum(checks.values())} of {len(checks)} sequence checks"
+
+
 def registry():
     """The statement registry (ADR-049): every kind of object in `pondra.objects` with its comment and
     definition; `SHOW CREATE` of each kind runs again to the same object; `COMMENT ON` every kind,
@@ -6764,13 +6902,15 @@ def registry():
         ("task", "tidy", "CREATE TASK tidy SCHEDULE '1 hour' WITH (retries = 2, timeout = '10 minutes') AS CALL note_click('tidy')"),
         ("task", "after_tidy", "CREATE TASK after_tidy AFTER tidy WHEN 1 = 1 AS SELECT 1"),
         ("role", "analyst", "CREATE ROLE analyst"),
+        ("sequence", "order_no", "CREATE SEQUENCE order_no AS integer START WITH 1000 INCREMENT BY 10 CACHE 5"),
+        ("table", "tickets", "CREATE TABLE tickets (id BIGINT GENERATED ALWAYS AS IDENTITY (START WITH 5), title VARCHAR)"),
     ]
     for _, _, stmt in made:
         q(stmt)
     q("ALTER TASK tidy SUSPEND")
     word = lambda k: {"macro": "FUNCTION", "table function": "FUNCTION"}.get(k, k.upper())
     comments = {"schema": "sales", "table": "sales.orders", "view": "eu_orders", "materialized view": "per_page", "function": "net",
-                "procedure": "note_click", "task": "tidy", "role": "analyst"}
+                "procedure": "note_click", "task": "tidy", "role": "analyst", "sequence": "order_no"}
     for k, n in comments.items():
         q(f"COMMENT ON {k.upper()} {n} IS 'about {n}'")
     q("COMMENT ON COLUMN sales.orders.amount IS $$in euros, it's net$$")
@@ -6787,7 +6927,7 @@ def registry():
     before = {(k, n): show(k, n) for k, n, _ in made}
     info["shown"] = {f"{k} {n}": v for (k, n), v in before.items()}
     drops = {"schema": None, "table": "DROP TABLE", "view": "DROP VIEW", "materialized view": "DROP MATERIALIZED VIEW", "macro": "DROP MACRO", "function": "DROP FUNCTION",
-             "table function": "DROP FUNCTION", "procedure": "DROP PROCEDURE", "task": "DROP TASK", "role": "DROP ROLE"}
+             "table function": "DROP FUNCTION", "procedure": "DROP PROCEDURE", "task": "DROP TASK", "role": "DROP ROLE", "sequence": "DROP SEQUENCE"}
     for k, n, _ in reversed(made):
         if drops[k] and k != "table":
             q(f"{drops[k]} {n}")
@@ -7732,7 +7872,7 @@ def friendly():
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    out = {t.__name__: t() for t in (upsert, deal, outside, clouds, kafkas, tiering, tails, pace, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, found, renames, workspace, server, scale, flight, users, secrets, safety, versions, stopped, flows, begin, doors, objects, registry, sparksql, variables, scripts, hot, minmax, history, friendly, reader, crash)}
+    out = {t.__name__: t() for t in (upsert, deal, outside, clouds, kafkas, tiering, tails, pace, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, found, renames, workspace, server, scale, flight, users, secrets, safety, versions, stopped, flows, begin, doors, objects, registry, sequences, sparksql, variables, scripts, hot, minmax, history, friendly, reader, crash)}
     A.secs = min(A.secs, 20)
     out["load"] = load()
     print(json.dumps(out, indent=1))
@@ -7740,7 +7880,7 @@ def all_tests():
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "tails", "pace", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "found", "renames", "workspace", "server", "scale", "flight", "users", "secrets", "safety", "versions", "stopped", "flows", "begin", "doors", "objects", "registry", "sparksql", "variables", "scripts", "tasks", "hot", "minmax", "history", "friendly", "load", "all"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "tails", "pace", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "found", "renames", "workspace", "server", "scale", "flight", "users", "secrets", "safety", "versions", "stopped", "flows", "begin", "doors", "objects", "registry", "sequences", "sparksql", "variables", "scripts", "tasks", "hot", "minmax", "history", "friendly", "load", "all"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -7752,7 +7892,7 @@ if __name__ == "__main__":
     ap.add_argument("--flush-ms", type=int, default=250)
     A = ap.parse_args()
     try:
-        {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "safety": safety, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "objects": objects, "registry": registry, "sparksql": sparksql, "variables": variables, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "friendly": friendly, "load": load, "all": all_tests}[A.mode]()
+        {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "safety": safety, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "objects": objects, "registry": registry, "sequences": sequences, "sparksql": sparksql, "variables": variables, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "friendly": friendly, "load": load, "all": all_tests}[A.mode]()
     except BaseException as e:  # a failure ends the run, though threads may still wait on a node (crash's producers retry for ever)
         code = e.code if isinstance(e, SystemExit) else 1
         if not isinstance(e, SystemExit):
