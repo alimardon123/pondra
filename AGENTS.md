@@ -1502,6 +1502,19 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    `routines::sql` (sqlparser writes `- -3` as `--3`, a comment); DataFusion's aggregate schema
    check is off (its two analyses of a CASE's nullability disagree; the rows are the same).
    `harness.py friendly`'s last five checks fail without them.
+227. **An `INSERT … SELECT` or `CREATE TABLE AS` is written by every node only when its rows split as
+   they are, under one reserved commit** (`spmd::insert`, `writers`, `/cluster/insert`): the query's
+   biggest append table sliced, the rest read whole, no exchange and no sort on top (a `GROUP BY`, a
+   join that shuffles, an `ORDER BY` or a `LIMIT` is written from one node), and this node writes its
+   share and the log tail. Every share stamps its rows under the one `Reserved` version with a block
+   of row ids of its own (`To::block`), or not at all when something follows the table (invariant
+   159); the shares' columns must agree, and the leader records every file in one commit with the
+   job's mark, so a retried job writes nothing. A share that fails leaves its files to the orphan
+   sweep, and this node writes it all. A spread query that names a system column gets them in its
+   tables, as `session_at` gives them (`spmd::shared`: it fell back to one node). `harness.py
+   insert`: "every node writes its share" (the followers' object writes), the rows, ids and one
+   version, "a GROUP BY is written by one node", "nothing fell back… (a spread query naming _row_id
+   too)".
 
 ## Tests: run these before and after any change
 

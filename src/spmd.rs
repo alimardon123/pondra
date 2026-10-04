@@ -480,9 +480,12 @@ async fn shared(lake: &Lake, s: &Slice) -> Result<(SessionContext, datafusion::p
     let _ = tokio::time::timeout(Duration::from_secs(10), async { while lake.visible() < s.upto && hwm.changed().await.is_ok() {} }).await;
     ensure!(lake.visible() >= s.upto, "this node is behind the lake ({} < {})", lake.visible(), s.upto);
     let views = crate::query::stored_views(lake, &s.sql, false).await?;
-    let deleted = crate::query::names_deleted(&views.iter().fold(s.sql.clone(), |t, (_, v)| format!("{t} {v}"))); // (as `session_at` decides)
+    let text = views.iter().fold(s.sql.clone(), |t, (_, v)| format!("{t} {v}"));
+    let deleted = crate::query::names_deleted(&text); // (as `session_at` decides)
+    let sys = |m: TableMeta| if crate::sys::mentioned(&text) { crate::sys::with_sys(&m) } else { m }; // (a query naming `_row_id`: its tables get their system columns, as `session_at` gives them)
     {
         for (t, meta) in &s.whole {
+            let meta = &sys(meta.clone());
             let inner = crate::query::named(&ctx, crate::query::table_view(lake, &ctx, t, meta, Some(s.upto)).await?, meta, deleted)?;
             ctx.deregister_table(table_ref(t))?;
             ctx.register_table(table_ref(t), Arc::new(WholeTable { inner, name: t.clone(), size: totals(meta) }))?;
@@ -507,7 +510,7 @@ async fn shared(lake: &Lake, s: &Slice) -> Result<(SessionContext, datafusion::p
         }
     }
     for p in &s.parts {
-        let meta: TableMeta = crate::ext::meta(lake, &p.table).await?.context("no table")?;
+        let meta: TableMeta = sys(crate::ext::meta(lake, &p.table).await?.context("no table")?);
         let (after, upto) = p.tail.unwrap_or((0, 0)); // (0, 0): no tail
         let schema = crate::query::read_schema(&meta.columns)?;
         let share = Some(totals(&meta));

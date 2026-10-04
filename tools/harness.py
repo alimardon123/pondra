@@ -980,7 +980,7 @@ def insert_spread():
     checks = {}
 
     def same(name, table, query, extra=""):
-        got = one(f"SELECT count(*) AS n, sum(v) AS s, count(DISTINCT _row_id) AS ids, count(DISTINCT _version) AS versions FROM {table}{extra}")
+        got = call(ports[0], "POST", "/sql?spread=1", f"SELECT count(*) AS n, sum(v) AS s, count(DISTINCT _row_id) AS ids, count(DISTINCT _version) AS versions FROM {table}{extra}".encode())[0]
         want = one(f"SELECT count(*) AS n, sum(v) AS s FROM ({query})")
         checks[name] = got["n"] == want["n"] > 0 and got["s"] == want["s"] and got["ids"] == got["n"] and got["versions"] == 1
         return got
@@ -1018,7 +1018,8 @@ def insert_spread():
     before = writes()
     q("INSERT INTO grouped SELECT k, count(*), sum(v) FROM src GROUP BY k")
     checks["a GROUP BY is written by one node"] = writes() == before and one("SELECT count(*) AS n, sum(n) AS rows FROM grouped") == {"n": 50, "rows": 120002}
-    checks["nothing fell back to one node"] = "across the nodes failed" not in open(nodes[0].log).read()
+    log = open(nodes[0].log).read()
+    checks["nothing fell back to one node (a spread query naming _row_id too)"] = "across the nodes failed" not in log and "distributed query failed" not in log
     for n in nodes:
         n.kill()
     print(json.dumps({"insert across the nodes": {"rows": got["n"], "secs": took, "checks": checks}}))
