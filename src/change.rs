@@ -693,7 +693,7 @@ pub async fn for_leader(query: &Lake, target: &Lake, written: &str, local: &str,
         }
     }
     let _ = VisitMut::visit(&mut stmts, &mut Rewrite { renamed: &renamed, kept: &kept });
-    Ok((stmts.iter().map(|s| s.to_string()).collect::<Vec<_>>().join("; "), sent))
+    Ok((stmts.iter().map(crate::routines::sql).collect::<Vec<_>>().join("; "), sent))
 }
 
 /// The rows a change was sent with, as tables its queries read by name (`query::SENT`).

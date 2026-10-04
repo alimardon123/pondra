@@ -736,6 +736,50 @@ SQL
 `events/` is now a folder with a file in it, and `menu.csv` is still there. A URL or a path in
 a query needs no table: see [names](/pondra/reference/names/).
 
+## Every kind of object
+
+Every kind of object a lake holds (schemas, tables, views, materialized views, external tables,
+functions, macros, procedures, tasks, secrets, users, roles and the lakes attached) takes the same
+words for being listed, described and made again.
+
+| Statement | Meaning |
+|---|---|
+| `SELECT … FROM pondra.objects` | every object, of every kind: `kind`, `lake`, `schema`, `name`, `comment`, and `definition`, the statements that make it again ([system tables](/pondra/reference/system-columns/#every-object)) |
+| `SHOW CREATE TABLE t` (or `VIEW`, `MATERIALIZED VIEW`, `FUNCTION`, `PROCEDURE`, `TASK`, `SCHEMA`, `ROLE`, `DATABASE`) | the statements that make it again, its comments included, as one `definition` |
+| `COMMENT ON TABLE t IS 'text'` | describe it; any kind above, `COLUMN t.c` too, and `IS NULL` takes it away. A comment follows a rename and goes with a drop |
+| `COMMENT IF EXISTS ON TABLE t IS 'text'` | the same, and nothing if `t` isn't there |
+| `CREATE OR ALTER TABLE t (…) [layout clauses] [WITH (…)]` | make `t`, or bring the one there to this definition without losing a row: columns added at the end, types widened, the layout and options set as written (one left out goes back to its default). A column taken away, moved or narrowed, and a changed key, partition, `NOT NULL`, `DEFAULT` or `CHECK`, is refused, saying which |
+| `CREATE OR ALTER VIEW v AS SELECT …` | the same as `CREATE OR REPLACE VIEW` |
+| `SELECT … FROM pondra.kinds` | the kinds there are, and the statements each takes |
+
+`CREATE OR ALTER TABLE` is for a project's files that run again and again (dbt, a deployment): the
+file says what the table is, and running it changes only what differs. Its answer says what it did:
+`created`, `unchanged`, or `altered` with each change.
+
+```sql
+CREATE TABLE stock (sku VARCHAR PRIMARY KEY, qty BIGINT) CLUSTER BY (sku);
+COMMENT ON TABLE stock IS 'what the shop holds';
+COMMENT ON COLUMN stock.qty IS 'units on the shelf';
+CREATE OR ALTER TABLE stock (sku VARCHAR PRIMARY KEY, qty BIGINT, shelf VARCHAR) CLUSTER BY (sku);
+SHOW CREATE TABLE stock;
+```
+
+```text
+CREATE TABLE stock (
+  sku VARCHAR,
+  qty BIGINT,
+  shelf VARCHAR,
+  PRIMARY KEY (sku)
+)
+CLUSTER BY (sku);
+COMMENT ON TABLE stock IS 'what the shop holds';
+COMMENT ON COLUMN stock.qty IS 'units on the shelf';
+```
+
+```sql
+SELECT kind, name, comment FROM pondra.objects WHERE schema = 'public' ORDER BY name;
+```
+
 ## Maintenance
 
 | Statement | Meaning |

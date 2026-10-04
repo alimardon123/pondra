@@ -194,7 +194,7 @@ export function configure(o) { Object.assign(T, o); }
 
 // ------------------------------------------------------------------ the page's state
 export const MODE = document.documentElement.dataset.mode; // lake: one lake (serve --lake); lakes: a folder of lakes, its databases
-export const SESSION = [...crypto.getRandomValues(new Uint8Array(12))].map(b => b.toString(16).padStart(2, '0')).join(''); // (the page's own queries)
+export const SESSION = 'console-' + [...crypto.getRandomValues(new Uint8Array(12))].map(b => b.toString(16).padStart(2, '0')).join(''); // (the page's own queries: History leaves them out by this form)
 let tabs = 0;
 /** A tab's session on the node, made when first used: its temporary tables, SQL variables and
  * Python, apart from every other tab's (as an editor's connection is), ended when it closes. */

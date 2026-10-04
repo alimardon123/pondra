@@ -143,6 +143,9 @@ console.log(await db.lookup("users", 7), await db.lookup("users", 8));
 | `await db.call(name, ...args)` | `CALL name(…)`: its rows or outcome. What the procedure printed is in `db.notices`, and goes to `onNotice` |
 | `await db.start(name, ...args)` | starts the procedure on the node without waiting, and answers with the run's id. The run's row in `pondra.runs` says how it went |
 | `await db.callProcedure(name, ...args)` | the same as `call`, from 0.22 |
+| `await db.task(name, sql, { schedule, after, when, retries, retryDelay, timeout, onFailure })` | [`CREATE TASK`](/pondra/reference/sql/#functions-procedures-and-tasks): `sql` run on a `schedule`, or `after` other tasks |
+| `await db.executeTask(name, values)` | `EXECUTE TASK`: its graph runs now, with these values for its tasks' `$name`s; answers with the run's id |
+| `await db.wait(id)` | waits for a run (`start`'s or `executeTask`'s) to end, as SQL's `AWAIT 'id'`; throws its error if it failed |
 
 The arguments are passed by position. A function is called from SQL.
 

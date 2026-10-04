@@ -760,7 +760,7 @@ pub fn rewrite(sql: &str, user: &str) -> String {
     for s in stmts.iter_mut() {
         let _ = s.visit(&mut r);
     }
-    stmts.iter().map(|s| s.to_string()).collect::<Vec<_>>().join("; ")
+    stmts.iter().map(crate::routines::sql).collect::<Vec<_>>().join("; ")
 }
 
 struct Rewriter<'a> {

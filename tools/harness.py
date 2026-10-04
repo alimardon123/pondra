@@ -3991,9 +3991,10 @@ def ids():
             if got[-1][1] == -1:
                 break
         c.close()
-        checks["a segment of 2^24 + 10 rows of a table takes two numbers; a consumer seeking into the second reads on from there, then the next segment"] = took == 2 \
+        # (at least two: the node's own commits, history's or a tiering round's, may land while the append runs)
+        checks["a segment of 2^24 + 10 rows of a table takes two numbers; a consumer seeking into the second reads on from there, then the next segment"] = took >= 2 \
             and [v for _, v in got] == [(1 << 24) + k for k in range(5, 10)] + [-1] and [o for o, _ in got][:5] == [(seg << 24) + (1 << 24) + k for k in range(5, 10)] \
-            and got[-1][0] >> 24 == seg + 2
+            and got[-1][0] >> 24 >= seg + 2
     node.kill()
     ok = all(checks.values())
     print(json.dumps({"ids": checks, "ok": ok}, indent=1))
@@ -4702,6 +4703,13 @@ def history():
             and str(h.get("session", "")).endswith("tab-0001") and h.get("ms") is not None and h.get("plan") is None and len(http) == 1
         checks["Postgres: its door, its rows"] = [(r["door"], r["outcome"], r["rows"]) for r in pgr] == [("postgres", "ok", 3)]
         checks["a failed statement: failed, with its error"] = [(r["outcome"], "nope" in (r["error"] or "")) for r in failed] == [("failed", True)]
+        try:  # (a client that stops waiting: its statement is dropped on the node, and kept as stopped)
+            urllib.request.urlopen(urllib.request.Request(f"http://127.0.0.1:{A.port}/sql", b"SELECT sum(value) AS s FROM range(0, 4000000000) -- h-stopped", method="POST"), timeout=0.5)
+        except OSError:
+            pass
+        stopped = until("h-stopped")
+        seen["stopped"] = [{k: r[k] for k in ("outcome", "door", "user", "ms")} for r in stopped]
+        checks["a statement its client stopped waiting for: stopped, by its door"] = [(r["outcome"], r["door"]) for r in stopped] == [("stopped", "http")]
         # A slow statement (every one on b): its plan, its operators' rows; spread, each node's share
         q("SELECT count(*) AS n FROM t WHERE k % 7 = 0 -- h-slow", 1)
         while len(call(A.port + 1, "GET", "/stats")["nodes"]) < 3:
@@ -6394,6 +6402,123 @@ def objects():
         sys.exit(1)
 
 
+def registry():
+    """The statement registry (ADR-049): every kind of object in `pondra.objects` with its comment and
+    definition; `SHOW CREATE` of each kind runs again to the same object; `COMMENT ON` every kind,
+    following a rename and gone with a drop; `CREATE OR ALTER TABLE` makes, adds, widens, takes away
+    options and refuses what would lose rows; `GET /kinds`."""
+    lake = new_lake()
+    node = Node(lake, A.port).start()
+    q = lambda s: sql(A.port, s)
+    def http(body):
+        c = http_client.HTTPConnection("127.0.0.1", A.port, timeout=60)
+        c.request("POST", "/sql", body.encode())
+        r = c.getresponse()
+        data = r.read()
+        return r.status, data.decode()[:400]
+    checks, info = {}, {}
+    made = [
+        ("schema", "sales", "CREATE SCHEMA sales"),
+        ("table", "sales.orders", "CREATE TABLE sales.orders (id BIGINT PRIMARY KEY, region VARCHAR NOT NULL, amount DECIMAL(12, 2) DEFAULT 0, at TIMESTAMP, "
+                                  "tags VARCHAR[], CONSTRAINT positive CHECK (amount >= 0)) CLUSTER BY (region) SEQUENCE BY at TTL at + INTERVAL '2 days' WITH (retention = '3 days')"),
+        ("table", "clicks", "CREATE TABLE clicks (ts TIMESTAMP, page VARCHAR, \"User\" BIGINT, \"order\" INT) PARTITION BY day(ts)"),
+        ("table", "totals", "CREATE TABLE totals (region VARCHAR PRIMARY KEY, amount DOUBLE MERGE sum, n BIGINT MERGE count)"),
+        ("view", "eu_orders", "CREATE VIEW eu_orders AS SELECT id, amount FROM sales.orders WHERE region = 'eu'"),
+        ("materialized view", "pages", "CREATE MATERIALIZED VIEW pages (CONSTRAINT some_page EXPECT (page IS NOT NULL) ON VIOLATION DROP ROW) AS SELECT ts, page FROM clicks"),
+        ("materialized view", "per_page", "CREATE MATERIALIZED VIEW per_page AS SELECT page, count(*) AS n FROM clicks GROUP BY page"),
+        ("materialized view", "per_minute", "CREATE MATERIALIZED VIEW per_minute WITH (window = 'minute', size_secs = 60, lateness_secs = 5) AS SELECT date_bin(INTERVAL '1 minute', ts) AS minute, count(*) AS n FROM clicks GROUP BY 1"),
+        ("macro", "twice", "CREATE MACRO twice(x) AS x * 2"),
+        ("function", "net", "CREATE FUNCTION net(x DOUBLE, rate DOUBLE DEFAULT 0.2) RETURNS DOUBLE IMMUTABLE RETURN x * (1 - rate)"),
+        ("table function", "big_orders", "CREATE FUNCTION big_orders(least DOUBLE) RETURNS TABLE (id BIGINT, amount DOUBLE) LANGUAGE sql AS $$ SELECT id, CAST(amount AS DOUBLE) FROM sales.orders WHERE amount > least $$"),
+        ("procedure", "note_click", "CREATE PROCEDURE note_click(p VARCHAR) LANGUAGE sql AS $$ INSERT INTO clicks VALUES (now(), p, 1, 1); $$"),
+        ("task", "tidy", "CREATE TASK tidy SCHEDULE '1 hour' WITH (retries = 2, timeout = '10 minutes') AS CALL note_click('tidy')"),
+        ("task", "after_tidy", "CREATE TASK after_tidy AFTER tidy WHEN 1 = 1 AS SELECT 1"),
+        ("role", "analyst", "CREATE ROLE analyst"),
+    ]
+    for _, _, stmt in made:
+        q(stmt)
+    q("ALTER TASK tidy SUSPEND")
+    word = lambda k: {"macro": "FUNCTION", "table function": "FUNCTION"}.get(k, k.upper())
+    comments = {"schema": "sales", "table": "sales.orders", "view": "eu_orders", "materialized view": "per_page", "function": "net",
+                "procedure": "note_click", "task": "tidy", "role": "analyst"}
+    for k, n in comments.items():
+        q(f"COMMENT ON {k.upper()} {n} IS 'about {n}'")
+    q("COMMENT ON COLUMN sales.orders.amount IS $$in euros, it's net$$")
+    q("COMMENT ON TABLE clicks IS 'gone soon'")
+    q("COMMENT ON TABLE clicks IS NULL")
+    listed = {(r["kind"], r.get("schema"), r["name"]): r for r in q("SELECT * FROM pondra.objects")}
+    info["listed"] = sorted(f"{k[0]}:{k[1]}.{k[2]}" for k in listed)
+    want = {(k, n.split(".")[0] if "." in n else (None if k in ("schema", "role") else "public"), n.split(".")[-1]) for k, n, _ in made}
+    checks["pondra.objects lists every kind, each with its comment"] = want <= set(listed) \
+        and all(listed[(k, n.split(".")[0] if "." in n else (None if k in ("schema", "role") else "public"), n.split(".")[-1])].get("comment") == f"about {n}" for k, n in comments.items()) \
+        and listed[("table", "public", "clicks")].get("comment") is None
+    # SHOW CREATE, dropped, run again: the same definition and comments
+    show = lambda k, n: q(f"SHOW CREATE {word(k)} {n}")[0]["definition"]
+    before = {(k, n): show(k, n) for k, n, _ in made}
+    info["shown"] = {f"{k} {n}": v for (k, n), v in before.items()}
+    drops = {"schema": None, "table": "DROP TABLE", "view": "DROP VIEW", "materialized view": "DROP MATERIALIZED VIEW", "macro": "DROP MACRO", "function": "DROP FUNCTION",
+             "table function": "DROP FUNCTION", "procedure": "DROP PROCEDURE", "task": "DROP TASK", "role": "DROP ROLE"}
+    for k, n, _ in reversed(made):
+        if drops[k] and k != "table":
+            q(f"{drops[k]} {n}")
+    for k, n, _ in reversed(made):
+        if k == "table":
+            q(f"DROP TABLE {n} PURGE")
+    after_drop = [r["name"] for r in q("SELECT name FROM pondra.objects WHERE comment IS NOT NULL")]
+    for k, n, _ in made:
+        for stmt in [s for s in before[(k, n)].split(";\n") if k != "schema" or not s.startswith("CREATE")]:
+            q(stmt.rstrip(";"))
+    again = {(k, n): show(k, n) for k, n, _ in made}
+    info["differs"] = {f"{k} {n}": [before[(k, n)], again[(k, n)]] for k, n, _ in made if before[(k, n)] != again[(k, n)]}
+    checks["SHOW CREATE of every kind, run again after a drop, makes the same object, comments and all; a drop takes its comments"] = \
+        not info["differs"] and after_drop == ["sales"] and "COMMENT ON COLUMN sales.orders.amount IS 'in euros, it''s net'" in again[("table", "sales.orders")]
+    q("ALTER TABLE sales.orders RENAME TO orders_2025")
+    moved = q("SELECT name, comment FROM pondra.objects WHERE kind = 'table' AND schema = 'sales'")
+    checks["a renamed table keeps its comments, its columns' too"] = moved == [{"name": "orders_2025", "comment": "about sales.orders"}] \
+        and "IS 'in euros, it''s net'" in show("table", "sales.orders_2025")
+    # CREATE OR ALTER TABLE
+    first = q("CREATE OR ALTER TABLE events (id BIGINT, kind VARCHAR) CLUSTER BY (kind) WITH (retention = '1 day')")
+    q("INSERT INTO events VALUES (1, 'a')")
+    same = q("CREATE OR ALTER TABLE events (id BIGINT, kind VARCHAR) CLUSTER BY (kind) WITH (retention = '1 day')")
+    grown = q("CREATE OR ALTER TABLE events (id BIGINT, kind VARCHAR, note VARCHAR)")
+    widened = q("CREATE OR ALTER TABLE events (id BIGINT, kind VARCHAR, note VARCHAR, n INT)")
+    widened2 = q("CREATE OR ALTER TABLE events (id BIGINT, kind VARCHAR, note VARCHAR, n BIGINT)")
+    refused = [http(s) for s in ("CREATE OR ALTER TABLE events (id BIGINT, kind VARCHAR)",
+                                 "CREATE OR ALTER TABLE events (kind VARCHAR, id BIGINT, note VARCHAR, n BIGINT)",
+                                 "CREATE OR ALTER TABLE events (id BIGINT PRIMARY KEY, kind VARCHAR, note VARCHAR, n BIGINT)",
+                                 "CREATE OR ALTER TABLE events (id INT, kind VARCHAR, note VARCHAR, n BIGINT)",
+                                 "CREATE OR ALTER TABLE events AS SELECT 1 AS id")]
+    view_again = [q("CREATE OR ALTER VIEW recent AS SELECT id FROM events"), q("CREATE OR ALTER VIEW recent AS SELECT id, kind FROM events")]
+    info["or_alter"] = [first, same, grown, widened, widened2, refused, view_again]
+    o = call(A.port, "GET", "/objects")
+    ev = next(t for t in o["tables"] if t["name"] == "events") if isinstance(o, dict) and "tables" in o else None
+    checks["CREATE OR ALTER TABLE: made, then nothing to do, a column added, options taken away, a type widened; what would lose rows refused"] = \
+        first.get("created") is True and same.get("unchanged") is True and "+ note" in grown.get("altered", []) \
+        and any(a.startswith("CLUSTER BY") for a in grown.get("altered", [])) and any(a.startswith("retention") for a in grown.get("altered", [])) \
+        and "n BIGINT" in widened2.get("altered", []) and [r[0] for r in refused] == [500] * 5 \
+        and q("SELECT id, kind, note, n FROM events") == [{"id": 1, "kind": "a"}] \
+        and q("SELECT * FROM recent") == [{"id": 1, "kind": "a"}] and "CLUSTER BY" not in show("table", "events")
+    q("CREATE TABLE kv (k BIGINT PRIMARY KEY, v VARCHAR)")
+    q("INSERT INTO kv VALUES (1, 'a'), (2, 'b')")
+    kv = [q("CREATE OR ALTER TABLE kv (k BIGINT PRIMARY KEY, v VARCHAR, w INT)"), q("CREATE OR ALTER TABLE kv (k BIGINT PRIMARY KEY, v VARCHAR, w INT)")]
+    q("INSERT INTO kv VALUES (3, 'c', 3)")
+    q("DELETE FROM kv WHERE k = 1")
+    info["kv"] = kv + [show("table", "kv")]
+    checks["a keyed table: a column added, its _deleted its own (never in its definition), DELETE still works"] = kv[0].get("altered") == ["+ w"] \
+        and kv[1].get("unchanged") is True and "_deleted" not in show("table", "kv") and q("SELECT k, w FROM kv ORDER BY k") == [{"k": 2}, {"k": 3, "w": 3}]
+    kinds = call(A.port, "GET", "/kinds")
+    checks["GET /kinds and pondra.kinds list every kind and its statements"] = {k["kind"] for k in kinds} >= {"table", "view", "materialized view", "function", "procedure", "task", "schema"} \
+        and q("SELECT statements FROM pondra.kinds WHERE kind = 'table'")[0]["statements"].startswith("CREATE, CREATE OR ALTER")
+    missing = [http(s)[0] for s in ("SHOW CREATE TABLE nothing_here", "COMMENT ON TABLE nothing_here IS 'x'", "COMMENT ON COLUMN events.nothing IS 'x'")]
+    quiet = q("COMMENT IF EXISTS ON TABLE nothing_here IS 'x'")
+    checks["what isn't there: refused by name, or nothing with IF EXISTS"] = missing == [500, 500, 500] and quiet.get("exists") is False
+    node.kill()
+    ok = all(checks.values())
+    print(json.dumps({"registry": checks, "ok": ok, "info": info}, indent=1, default=str))
+    if not ok:
+        sys.exit(1)
+
+
 def sparksql():
     """Spark SQL where PySpark code sends it (H8): `spark.sql(…)` read with Spark's grammar and
     turned into Pondra's SQL (`spark_sql('…')`): `"text"`, backticks, `LATERAL VIEW [OUTER]
@@ -7144,8 +7269,10 @@ def friendly():
     over the same rows: PIVOT and UNPIVOT (DuckDB's statements and the standard's), COLUMNS(…),
     `* RENAME`, ORDER BY ALL, FETCH FIRST, list comprehensions and lambdas, a struct's field,
     max_by and arg_min, string_split, json_extract, DuckDB's ASOF JOIN … ON, a select's alias in
-    its WHERE, SUMMARIZE; samples that sample (TABLESAMPLE was ignored); refusals by name; and the
-    same answers spread over three nodes."""
+    its WHERE, SUMMARIZE; samples that sample (TABLESAMPLE was ignored); refusals by name; the
+    same answers spread over three nodes; and what `random_sql.py` found (`- -3` written again as
+    a comment, a DISTINCT over a CASE refused, two IN lists of a column taken as sets of values,
+    columns of one name on both sides of a join mixed up)."""
     import datetime, decimal, duckdb, pyarrow as pa
     lake = new_lake()
     import psycopg
@@ -7216,6 +7343,11 @@ def friendly():
         "ASOF LEFT JOIN … ON": ("SELECT t.id, q.p FROM t ASOF LEFT JOIN q ON t.k = q.k AND t.ts >= q.ts", True, False),
         "a select's alias in its WHERE": ("SELECT x * 2 AS dbl FROM t WHERE dbl > 4000", True, False),
         "… but a column of that name wins": ("SELECT id + 100 AS x FROM t WHERE x > 20", True, False),
+        "a minus before a minus, in a text written again (it read back as a comment)": ("SELECT id, - -k AS m, - - -x AS b FROM t WHERE m > 3 AND g IS DISTINCT FROM 'b'", True, False),
+        "DISTINCT over a CASE whose WHEN shows its THEN isn't NULL (random_sql.py)": ("SELECT DISTINCT CASE WHEN k < 3 AND n = 2.5 THEN n ELSE 0 END AS c FROM t", True, False),
+        "x IN (a column, …) AND x IN (…): not the lists' intersection (random_sql.py)": ("SELECT id FROM t WHERE g IN (g, 'z') AND g IN ('a', 'b')", True, False),
+        "x IN (…) AND x NOT IN (NULL): no row (random_sql.py)": ("SELECT count(*) AS c FROM t WHERE g IN ('a', 'b') AND g NOT IN (NULL)", True, False),
+        "columns of one name on both sides of a LEFT JOIN, filtered on its padded side (random_sql.py)": ("SELECT (t.ts - q.ts) AS d, t.k FROM t LEFT JOIN q ON t.id = q.k WHERE q.k IS DISTINCT FROM 3", True, False),
     }
     checks, failed = {}, {}
     for name, (q, names, ordered) in same.items():
@@ -7270,7 +7402,7 @@ def friendly():
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    out = {t.__name__: t() for t in (upsert, deal, outside, clouds, kafkas, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, found, renames, workspace, server, scale, flight, users, secrets, safety, versions, stopped, flows, begin, doors, objects, sparksql, variables, scripts, hot, minmax, history, friendly, reader, crash)}
+    out = {t.__name__: t() for t in (upsert, deal, outside, clouds, kafkas, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, found, renames, workspace, server, scale, flight, users, secrets, safety, versions, stopped, flows, begin, doors, objects, registry, sparksql, variables, scripts, hot, minmax, history, friendly, reader, crash)}
     A.secs = min(A.secs, 20)
     out["load"] = load()
     print(json.dumps(out, indent=1))
@@ -7278,7 +7410,7 @@ def all_tests():
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "found", "renames", "workspace", "server", "scale", "flight", "users", "secrets", "safety", "versions", "stopped", "flows", "begin", "doors", "objects", "sparksql", "variables", "scripts", "tasks", "hot", "minmax", "history", "friendly", "load", "all"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "found", "renames", "workspace", "server", "scale", "flight", "users", "secrets", "safety", "versions", "stopped", "flows", "begin", "doors", "objects", "registry", "sparksql", "variables", "scripts", "tasks", "hot", "minmax", "history", "friendly", "load", "all"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -7290,7 +7422,7 @@ if __name__ == "__main__":
     ap.add_argument("--flush-ms", type=int, default=250)
     A = ap.parse_args()
     try:
-        {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "safety": safety, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "objects": objects, "sparksql": sparksql, "variables": variables, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "friendly": friendly, "load": load, "all": all_tests}[A.mode]()
+        {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "safety": safety, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "objects": objects, "registry": registry, "sparksql": sparksql, "variables": variables, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "friendly": friendly, "load": load, "all": all_tests}[A.mode]()
     except BaseException as e:  # a failure ends the run, though threads may still wait on a node (crash's producers retry for ever)
         code = e.code if isinstance(e, SystemExit) else 1
         if not isinstance(e, SystemExit):

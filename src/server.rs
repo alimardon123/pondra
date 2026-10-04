@@ -134,6 +134,7 @@ pub fn router(app: App) -> Router {
         .route("/console/settings", get(crate::console::settings).put(crate::console::save_settings))
         .route("/console/{*file}", get(crate::console::file))
         .route("/functions", get(list_functions))
+        .route("/kinds", get(|| async { Json(crate::objects::kinds()) }))
         .route("/routines", get(|State(app): State<App>| async move { Ok::<_, E>(Json(j!(*crate::routines::listed(&app.lake).await?))) }))
         .route("/secrets/{name}", get(secret))
         .route("/stats", get(stats))
