@@ -340,6 +340,14 @@ pub(crate) async fn stopped(stdin: bool) {
 static MAIN: std::sync::OnceLock<Arc<store::Lake>> = std::sync::OnceLock::new();
 
 fn main() {
+    // No transparent huge pages: mimalloc asks for them, and a node's resident memory then grows to
+    // every 2 MB its heap has touched. Under steady writes that was 1.5 GB after 15 minutes for a
+    // live heap of 250 MB (soak.py), all of it counted against a container's limit, and TPC-H SF1
+    // ran no faster with them, hot or cold. (Inherited by the processes a node starts.)
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::prctl(libc::PR_SET_THP_DISABLE, 1, 0, 0, 0);
+    }
     if std::env::args().nth(1).as_deref() == Some("service") && std::env::args().nth(2).as_deref() == Some("run") {
         service::run_from_manager(); // (what a service manager starts: becomes the node)
     }
