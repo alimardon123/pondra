@@ -159,24 +159,35 @@ fn misestimate(plan: &Arc<dyn ExecutionPlan>) -> Option<f64> {
     worst.map(|w| (w * 10.0).round() / 10.0)
 }
 
-/// A plan's shape, as a short hash: its operators in their places and the columns each leaf reads,
-/// so a join order or a build side changed is another plan, while its literals, its files and the
-/// gathers the hot columns add or take away (invariant 34) are not.
+/// A plan's shape, as a short hash: its operators in their places and the columns each table's read
+/// gives, so a join order or a build side changed is another plan, while its literals, its files and
+/// how a table is read (from files, the hot columns or the log tail, split or gathered: invariant 34)
+/// are not. A part of the plan that only reads (leaves, round-robin splits, unions, projections,
+/// filters, gathers) is one `Scan` of the columns it gives.
 fn plan_id(plan: &Arc<dyn ExecutionPlan>) -> String {
+    use datafusion::physical_plan::{repartition::RepartitionExec, Partitioning};
+    fn reads(p: &Arc<dyn ExecutionPlan>) -> bool {
+        let passes = match p.downcast_ref::<RepartitionExec>() {
+            Some(r) => !matches!(r.partitioning(), Partitioning::Hash(..)),
+            None => matches!(p.name(), "FilterExec" | "ProjectionExec" | "UnionExec" | "CoalesceBatchesExec" | "CoalescePartitionsExec" | "CooperativeExec"),
+        };
+        p.children().is_empty() || passes && p.children().into_iter().all(reads)
+    }
     fn shape(p: &Arc<dyn ExecutionPlan>, out: &mut String) {
-        let kids = p.children();
-        if p.name() == "CoalescePartitionsExec" {
-            return kids.into_iter().for_each(|k| shape(k, out));
+        if reads(p) {
+            out.push_str("Scan(");
+            p.schema().fields().iter().for_each(|f| out.extend([f.name().as_str(), ","]));
+            return out.push(')');
+        }
+        if matches!(p.name(), "CoalescePartitionsExec" | "SortPreservingMergeExec") {
+            return p.children().into_iter().for_each(|k| shape(k, out));
         }
         out.push_str(p.name());
         out.push('(');
-        match kids.is_empty() {
-            true => p.schema().fields().iter().for_each(|f| out.extend([f.name().as_str(), ","])),
-            false => kids.into_iter().for_each(|k| {
-                shape(k, out);
-                out.push(';');
-            }),
-        }
+        p.children().into_iter().for_each(|k| {
+            shape(k, out);
+            out.push(';');
+        });
         out.push(')');
     }
     let mut text = String::new();
