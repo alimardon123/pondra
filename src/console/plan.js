@@ -65,7 +65,9 @@ function tree(text) {
     const depth = line.search(/\S/), [, op, rest = ''] = line.trim().match(/^([\w]+)(?::\s*(.*))?$/) || [null, line.trim()];
     const m = rest.match(/,?\s*metrics=\[(.*)\]\s*$/), metrics = {};
     for (const [, k, v] of (m?.[1] || '').matchAll(/(\w+)=([^,\]]+)/g)) metrics[k] = v.trim();
-    const node = { op, detail: m ? rest.slice(0, m.index) : rest, metrics, kids: [] };
+    // (the node says how many rows the planner expected, after the details: kept apart, shown beside the actual)
+    const e = (m ? rest.slice(0, m.index) : rest).match(/^(.*?)(?:,\s*)?expected_rows=(\d+)$/);
+    const node = { op, detail: e ? e[1] : m ? rest.slice(0, m.index) : rest, expected: e ? +e[2] : null, metrics, kids: [] };
     while (stack.at(-1).depth >= depth) stack.pop();
     stack.at(-1).node.kids.push(node);
     stack.push({ depth, node });
@@ -86,7 +88,8 @@ function graph(steps) {
     return h('li', {}, h('div', { class: 'pn' + (moves ? ' moves' : ''), style: share ? `--heat:${Math.round(share * 100)}%` : null, title: `${n.op}${n.detail ? ': ' + n.detail : ''}${Object.keys(n.metrics).length ? '\n' + Object.entries(n.metrics).map(([k, v]) => `${k} = ${v}`).join('\n') : ''}` },
       h('b', {}, n.op.replace(/Exec$/, '')), n.detail ? h('span', { class: 'pd' }, n.detail.length > 64 ? n.detail.slice(0, 63) + '…' : n.detail) : null,
       moves ? h('span', { class: 'pm' }, 'rows move here') : null,
-      n.metrics.output_rows != null ? h('span', { class: 'pmx' }, `${count(+n.metrics.output_rows || 0)} rows · ${t ? secs(t) : '0 ms'}${share >= 0.005 ? ` · ${Math.round(share * 100)}%` : ''}`) : null),
+      n.metrics.output_rows != null ? h('span', { class: 'pmx' }, `${count(+n.metrics.output_rows || 0)} rows${n.expected != null ? ` (${count(n.expected)} expected)` : ''} · ${t ? secs(t) : '0 ms'}${share >= 0.005 ? ` · ${Math.round(share * 100)}%` : ''}`)
+        : n.expected != null ? h('span', { class: 'pmx' }, `${count(n.expected)} rows expected`) : null),
     n.kids.length ? h('ul', {}, n.kids.map(box)) : null);
   };
   return steps.length ? h('div', { class: 'pgraph' }, h('ul', { class: 'pt' }, steps.map(box))) : h('div', { class: 'empty' }, 'No plan to draw.');
@@ -97,7 +100,7 @@ function graph(steps) {
 function picture(steps) {
   const esc = t => t.replace(/[&<>"]/g, c => `&#${c.charCodeAt(0)};`), GX = 16, GY = 30, BH = 50;
   const lines = n => [n.op.replace(/Exec$/, ''), n.detail.length > 56 ? n.detail.slice(0, 55) + '…' : n.detail,
-    n.metrics.output_rows != null ? `${n.metrics.output_rows} rows · ${n.metrics.elapsed_compute || ''}` : ''].filter(Boolean);
+    n.metrics.output_rows != null ? `${n.metrics.output_rows} rows${n.expected != null ? ` (${n.expected} expected)` : ''} · ${n.metrics.elapsed_compute || ''}` : n.expected != null ? `${n.expected} rows expected` : ''].filter(Boolean);
   const span = n => { n.w = Math.max(...lines(n).map(l => l.length)) * 6.7 + 20; n.kw = n.kids.reduce((a, k) => a + span(k), 0) + GX * (n.kids.length - 1); return n.span = Math.max(n.w, n.kw); };
   let out = '', height = 0;
   const place = (n, x, y) => {

@@ -1325,6 +1325,7 @@ def work_checks(browser, port, show):
     c = pg.run(1, "SELECT region, sum(amount) AS total FROM wk GROUP BY region ORDER BY region")
     c.locator(".abar .ptab", has_text="Plan").click()
     plan = until(lambda: c.locator(".pgraph .pn").count() > 1, True, 10)
+    expected = until(lambda: "rows expected" in c.locator(".pgraph").inner_text() and "expected_rows" not in c.locator(".pgraph").inner_text(), True, 5)
     c.locator(".abar .ptab", has_text="Chart").click()
     chart = until(lambda: c.locator(".chart svg").count() > 0 and c.locator(".abar .ptab.on").all_inner_texts() == ["Chart"], True, 10)
     p.fill("#nbname", "wkbook")
@@ -1337,8 +1338,8 @@ def work_checks(browser, port, show):
     oc = other.cell(1)
     again = until(lambda: oc.locator(".chart svg").count() > 0 and oc.locator(".abar .ptab.on").all_inner_texts() == ["Chart"], True, 15)
     other.ctx.close()
-    checks["a SQL cell's answer has Chart and Plan (its graph), as a SQL file's pane; the chart open, and its settings, are kept with the notebook"] = \
-        plan is True and chart is True and meta.get("pondra", {}).get("view") == "chart" and meta["pondra"].get("chart", {}).get("x") == "region" and again is True
+    checks["a SQL cell's answer has Chart and Plan (its graph, each step's expected rows apart from its details), as a SQL file's pane; the chart open, and its settings, are kept with the notebook"] = \
+        plan is True and expected is True and chart is True and meta.get("pondra", {}).get("view") == "chart" and meta["pondra"].get("chart", {}).get("x") == "region" and again is True
 
     # The owner's third list: a cell's Data profile; SQL <-> Python; the editor's right-click; Create as; the tree's menus; rows a page
     c.locator(".abar .ptab", has_text="Data profile").click()
