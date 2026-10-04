@@ -830,10 +830,20 @@ def folders_checks(browser, port, show):
         p.fill("#askIn", name)
         p.press("#askIn", "Enter")
 
-    def more_of(row):
-        """Open a row's ⋯ menu (on hover), and what it lists."""
-        row.hover()
+    def open_more(row):
+        """Click a row's ⋯, shown on hover. The tree may draw the row again between the hover and
+        the click (a listing arriving), so the new row is hovered and clicked again."""
+        for _ in range(5):
+            row.hover()
+            try:
+                return row.locator("button.more").click(timeout=3000)
+            except Exception:  # noqa: BLE001 (drawn again under the pointer)
+                pass
         row.locator("button.more").click()
+
+    def more_of(row):
+        """Open a row's ⋯ menu, and what it lists."""
+        open_more(row)
         return items()
 
     make("projects", lambda: p.click("#newfile"))
@@ -956,9 +966,7 @@ def folders_checks(browser, port, show):
     csv, nb = os.path.join(tmp, "up.csv"), os.path.join(tmp, "up.ipynb")
     open(csv, "w").write("a,b\n1,2\n")
     nbformat.write(nbformat.v4.new_notebook(cells=[nbformat.v4.new_code_cell("%%sql\nSELECT 1 AS one")]), nb)
-    row = folder("projects")
-    row.hover()
-    row.locator("button.more").click()
+    open_more(folder("projects"))
     with p.expect_file_chooser() as chooser:
         p.locator("#menu button", has_text="Upload files here").click()
     chooser.value.set_files([csv, nb])
@@ -1572,7 +1580,8 @@ def layout_checks(browser, port, show):
     seen = lambda: p.locator("#data .row:visible .nm").all_inner_texts()
     only = until(lambda: "lx" in seen() and "ly" not in seen(), True)
     p.press("#filter", "Escape")
-    checks["the filter narrows the trees to the names that hold it (and what they are in); Esc clears it"] = only is True and "ly" in seen()
+    cleared = until(lambda: "ly" in seen(), True)
+    checks["the filter narrows the trees to the names that hold it (and what they are in); Esc clears it"] = only is True and cleared is True
     p.locator("#docs").click()
     p.keyboard.press("Control+b")
     hid = p.locator("#left").is_hidden()

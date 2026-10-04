@@ -299,6 +299,13 @@ def external():
     checks["what it can't do, it says: INSERT into one file, UPDATE, Avro, gzip, no files, TEMPORARY, an option it doesn't read, INSERT into a view; others' files need the owner"] = \
         "view of a folder" in said["one file"] and "UPDATE" in said["update"] and "avro" in said["avro"] and "gzip" in said["gzip"] and "no files" in said["none"] \
         and "TEMP VIEW" in said["temp"] and "null_regex" in said["option"] and "is a view" in said["view"] and "program that started the node" in said["not owner"]
+    # A lake table's files are the lake's: LOCATION was dropped and the table made in the lake; and
+    # a DELETE of an attached Delta table read "no table" with its path.
+    placed = err(f"CREATE TABLE placed (id BIGINT) LOCATION '{here}/placed/'")
+    q(f"COPY (SELECT 1 AS id) TO '{here}/wh/s/t/' (FORMAT delta)"); q(f"ATTACH '{here}/wh' AS wh (TYPE delta)")
+    checks["CREATE TABLE … LOCATION refused by name, nothing made; DELETE of an attached Delta table refused by name"] = "LOCATION" in placed and "not found" in err("SELECT * FROM placed") \
+        and "another engine's table" in err("DELETE FROM wh.s.t WHERE id = 1") and q("SELECT count(*) AS n FROM wh.s.t") == [{"n": 1}]
+    q("DETACH wh")
     # The lake's own files (PUT /files/…) are the lake's: whoever reads the lake reads them as a
     # table too, and nothing else of its folder (ADR-032); /objects says what each object is.
     call(A.port, "PUT", "/files/reports/q1.csv", b"a,b\n1,x\n")
@@ -1872,6 +1879,7 @@ def schemas():
     joined = q("SELECT t.k, s.qty FROM warehouse.stock s JOIN t ON s.id = t.k ORDER BY 1", 2)
     before_insert = n("warehouse.stock", 0)
     q("INSERT INTO warehouse.stock VALUES (3, 300)", 2)
+    at_once = n("warehouse.stock", 2)  # (the node that wrote it, at its next statement: `write::seen_there`)
     fresh = until(lambda: n("warehouse.stock", 0), 3, 15)  # (an answer remembered from before is not)
     nodes[2].kill()
     nodes[2].start(tries=1)
@@ -1889,8 +1897,8 @@ def schemas():
     q("DROP VIEW from_first")
     q("DETACH warehouse")
     gone = [until(lambda i=i: reach(i), False, 15) for i in range(3)]
-    checks["ATTACH 'dir' AS name on one node: every node, after a restart, pondra sql; joins and writes across; DETACH everywhere; bad ones refused"] = \
-        all(refused) and all(everywhere) and joined == [{"k": 1, "qty": 100}, {"k": 2, "qty": 200}] and (before_insert, fresh) == (2, 3) and after_restart == 3 and "| 3 |" in cli \
+    checks["ATTACH 'dir' AS name on one node: every node, after a restart, pondra sql; joins and writes across, a write read at once where it was sent; DETACH everywhere; bad ones refused"] = \
+        all(refused) and all(everywhere) and joined == [{"k": 1, "qty": 100}, {"k": 2, "qty": 200}] and (before_insert, at_once, fresh) == (2, 3, 3) and after_restart == 3 and "| 3 |" in cli \
         and {me, "other", "warehouse"} <= listed and not any(gone)
     # a new lake: ATTACH of a place with no lake makes one there; CREATE DATABASE makes one beside this lake
     fresh, beside = third + "-new", f"made_{uuid.uuid4().hex[:6]}"
@@ -1898,13 +1906,14 @@ def schemas():
     made, db = q(f"ATTACH '{fresh}' AS fresh", 1), q(f"CREATE DATABASE {beside}", 2)
     q(f"CREATE TABLE {beside}.x (a BIGINT)")
     q(f"INSERT INTO {beside}.x VALUES (1), (2)", 1)
-    checks["ATTACH of a place with no lake makes one; CREATE DATABASE makes one beside this lake, attached; twice is refused"] = made.get("created") is True and db.get("created") is True \
-        and until(lambda: _try(lambda: n(f"{beside}.x", 2)), 2, 15) == 2 and err(f"CREATE DATABASE {beside}") is not None and "unchanged" in q(f"CREATE DATABASE IF NOT EXISTS {beside}")
+    written = n(f"{beside}.x", 1)  # (through that lake's inbox, by a `pondra sql` leading it: read at once all the same)
+    checks["ATTACH of a place with no lake makes one; CREATE DATABASE makes one beside this lake, attached, written and read at once; twice is refused"] = made.get("created") is True and db.get("created") is True \
+        and written == 2 and until(lambda: _try(lambda: n(f"{beside}.x", 2)), 2, 15) == 2 and err(f"CREATE DATABASE {beside}") is not None and "unchanged" in q(f"CREATE DATABASE IF NOT EXISTS {beside}")
     [x.kill() for x in nodes + [b, c]]
     ok = all(checks.values())
     print(json.dumps({"schemas": checks, "ok": ok}, indent=1))
     if not ok:
-        print(before, over_view, got, spaces, in_dbo, by_flight, rest, used, view_owned, full, shown, refused, everywhere, joined, before_insert, fresh, after_restart, cli, listed, gone, from_first, change)
+        print(before, over_view, got, spaces, in_dbo, by_flight, rest, used, view_owned, full, shown, refused, everywhere, joined, before_insert, at_once, fresh, after_restart, cli, listed, gone, from_first, change, written)
         sys.exit(1)
     return f"schemas: lake.schema.table, attached lakes as catalogs, CREATE/DROP SCHEMA, DROP TABLE, CTAS, stored and materialized views in SQL from any node, spread over views, clients list schemas: all {len(checks)} checks pass"
 

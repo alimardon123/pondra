@@ -604,7 +604,7 @@ def format_check(new_bin, work, port):
     lake, later = os.path.join(work, "format-lake"), {"PONDRA_TEST_FORMAT": "2"}
     fmt = lambda n: n.get("/stats", timeout=5)["format"]
     first = Node(new_bin, lake, port, work).start()  # makes the lake
-    checks["a lake this build makes is of its format from the start"] = until(lambda: fmt(first) == 1, 3, step=0.1)
+    checks["a lake this build makes has the mark (format 1) from the start, and moves past it only for what needs it"] = until(lambda: fmt(first) == 1, 3, step=0.1)
     first.q("CREATE TABLE t (x INT)")
     first.q("INSERT INTO t VALUES (1), (2)")
     first.stop()

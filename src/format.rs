@@ -6,12 +6,14 @@
 //! Pondra wrote is refused, by name, before anything is read or written there, so an older binary
 //! started by mistake (a rollback, a machine left behind) never reads one wrongly.
 //!
-//! The leader moves the lake on to the newest format every node it hears from knows, its own
-//! `FORMAT` at most (`raise`): each node says its release and format on every call to another
-//! (`headers`), and the leader keeps what its followers' heartbeats and commit streams said. In a
-//! rolling upgrade the format moves after the last older node has gone, never before; whatever
-//! this build writes that an older one would read wrongly waits for that format (none yet: format
-//! 1 is the mark itself).
+//! A lake moves past format 1 only when something written needs it (`require`), as a Delta table's
+//! protocol moves only for a feature it uses: a lake this build opened but used nothing new in
+//! still opens in the release before, so going back after an upgrade works for every lake that
+//! didn't use what came with it. Even then the format moves only to what every node knows (`raise`
+//! keeps it): each node says its release and format on every call to another (`headers`), and the
+//! leader keeps what its followers' heartbeats and commit streams said. In a rolling upgrade
+//! nothing that needs the new format is written until the last older node has gone; asked for
+//! before that, it is refused by name.
 use crate::store::{Catalog, Lake};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -20,6 +22,9 @@ use std::time::Duration;
 
 /// The newest format this build reads and writes.
 pub const FORMAT: u32 = 1;
+
+/// The format every lake gets without asking: the mark itself (`raise`).
+const BASE: u32 = 1;
 
 /// `FORMAT`, unless a test says otherwise (`PONDRA_TEST_FORMAT`: a build of a later format).
 pub fn known() -> u32 {
@@ -73,12 +78,40 @@ pub async fn check(cat: &Catalog, url: &str, writer: bool) -> Result<u32> {
 }
 
 /// Commit the lake's format.
-async fn set(lake: &Lake, to: u32) {
+async fn set(lake: &Lake, to: u32) -> Result<()> {
     let stamp = Stamp { format: to, by: VERSION.into() };
-    match lake.cat.commit(vec![(KEY.into(), serde_json::to_vec(&stamp).expect("json"))], &[]).await {
-        Ok(()) => eprintln!("the lake is format {to} now (Pondra {VERSION})"),
-        Err(e) => eprintln!("the lake's format: {e:#}"),
+    lake.cat.commit(vec![(KEY.into(), serde_json::to_vec(&stamp).expect("json"))], &[]).await?;
+    eprintln!("the lake is format {to} now (Pondra {VERSION})");
+    Ok(())
+}
+
+/// What `raise` saw: 0 when it doesn't run in this process, 1 while it takes its first look, then
+/// the newest format every node knows, plus 2.
+static READY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Leader: before writing something an older release would read wrongly (`what`), move the lake to
+/// format `n`, or refuse by name while a node that doesn't know `n` runs. A leader that only just
+/// took over looks first (`raise`, 10 s at most); a process that leads without `raise` (a `pondra
+/// sql` leading for a moment: nobody else is there) moves it as far as this build knows.
+pub async fn require(lake: &Lake, n: u32, what: &str) -> Result<()> {
+    use std::sync::atomic::Ordering::Relaxed;
+    if of(&lake.cat).await?.format >= n {
+        return Ok(());
     }
+    let started = std::time::Instant::now();
+    while READY.load(Relaxed) == 1 && started.elapsed() < Duration::from_secs(15) {
+        tokio::time::sleep(Duration::from_millis(100)).await; // (the first look: `raise`)
+    }
+    let ready = match READY.load(Relaxed) {
+        0 => known(),
+        1 => 0, // (no look in 15 s: refused, never guessed)
+        r => r - 2,
+    };
+    anyhow::ensure!(
+        n <= ready,
+        "{what} needs the lake at format {n}, and a node of this cluster runs a Pondra that knows only format {ready}: once every node runs Pondra {VERSION} or newer, ask again (the lake stays as it is, so the release before still opens it)"
+    );
+    set(lake, n).await
 }
 
 /// The newest format a node knows, from what it said (`headers`; a node that says nothing is from
@@ -114,24 +147,37 @@ impl Drop for Streamed {
     }
 }
 
-/// Leader: move the lake on to the newest format every node knows, this one's at most. It first
-/// waits out two leases, so that every follower alive has said what it knows, then looks every
-/// 10 s. A lake this process made is of its format at once: no node older than it has read it.
-/// A migration, when a format needs one, goes here, in the commit that sets the format.
+/// Leader: keep what every node knows for `require`, and give a lake without a format the mark
+/// (`BASE`) once every node knows it. It first waits out two leases, so that every follower alive
+/// has said what it knows, then looks every 10 s. A lake this process made has the mark at once,
+/// and every node knows this build's format until one says otherwise: no node older than it has
+/// read it. A migration, when a format needs one, goes in the commit that sets it.
 pub fn raise(lake: Arc<Lake>, cluster: Arc<crate::cluster::Cluster>) {
+    use std::sync::atomic::Ordering::Relaxed;
     crate::panics::spawn(async move {
-        if MADE.load(std::sync::atomic::Ordering::Relaxed) {
-            return set(&lake, known()).await;
+        let mut marked = false;
+        if MADE.load(Relaxed) {
+            READY.store(known() + 2, Relaxed);
+            marked = set(&lake, BASE).await.map_err(|e| eprintln!("the lake's format: {e:#}")).is_ok();
+        } else {
+            READY.store(1, Relaxed); // (looking: `require` waits for it)
         }
         tokio::time::sleep(Duration::from_secs(10)).await;
         loop {
             let streamed = STREAMS.lock().unwrap().keys().next().copied();
-            let to = [Some(known()), cluster.least_known(), streamed].into_iter().flatten().min().unwrap_or_default();
-            match of(&lake.cat).await {
-                Ok(s) if s.format >= known() => return,
-                Ok(s) if s.format < to => set(&lake, to).await,
-                Ok(_) => {} // (an older node still runs: wait for it to go)
-                Err(e) => eprintln!("the lake's format: {e:#}"),
+            let ready = [Some(known()), cluster.least_known(), streamed].into_iter().flatten().min().unwrap_or_default();
+            READY.store(ready + 2, Relaxed);
+            if !marked && ready >= BASE {
+                let done = match of(&lake.cat).await {
+                    Ok(s) if s.format >= BASE => Ok(()),
+                    Ok(_) => set(&lake, BASE).await,
+                    Err(e) => Err(e),
+                };
+                marked = done.map_err(|e| eprintln!("the lake's format: {e:#}")).is_ok();
+            }
+            if known() > FORMAT {
+                // (a build posing as a later one, `PONDRA_TEST_FORMAT`: it writes what needs it)
+                let _ = require(&lake, known(), "this test build").await;
             }
             tokio::time::sleep(Duration::from_secs(10)).await;
         }
