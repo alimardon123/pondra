@@ -116,7 +116,7 @@ def users():
     for clients in [int(x) for x in A.users.split(",")]:
         acks.clear()
         before = rows[0]
-        r = subprocess.run([exe, "-url", f"http://127.0.0.1:{nodes[-1].port}/sql", "-bodies", mix, "-keys", str(A.keys), "-c", str(clients), "-secs", str(A.secs)],
+        r = subprocess.run([exe, "-url", f"http://127.0.0.1:{nodes[A.at].port}/sql", "-bodies", mix, "-keys", str(A.keys), "-c", str(clients), "-secs", str(A.secs)],
                            capture_output=True, text=True, check=True)
         got = json.loads(r.stdout)
         a = sorted(acks) or [0]
@@ -200,5 +200,6 @@ if __name__ == "__main__":
     ap.add_argument("--s3", action="store_true")
     ap.add_argument("--users", default="", help="dashboard clients per step, e.g. 50,100,200,400: users() instead")
     ap.add_argument("--events", type=int, default=5_000_000)
+    ap.add_argument("--at", type=int, default=-1, help="the node users() sends its queries to (0: the leader, which takes the writes)")
     A = harness.A = ap.parse_args()
     users() if A.users else main()

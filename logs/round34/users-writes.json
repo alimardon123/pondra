@@ -1,0 +1,295 @@
+{
+ "what": "serve_bench.py --users 50,100,200,400 --secs 10, one node on 4 cores: five dashboard statements beside a writer meaning to send 22,000 rows a second, a request at a time",
+ "before (one runtime)": [
+  {
+   "events": 5000000,
+   "keys": 2000000,
+   "nodes": 1,
+   "load_s": 8.1,
+   "clients": 50,
+   "qps": 870,
+   "errors": 0,
+   "p50_ms": 45.6,
+   "p99_ms": 180.1,
+   "by": [
+    {
+     "p50_ms": 54.3,
+     "p99_ms": 160.1
+    },
+    {
+     "p50_ms": 50.9,
+     "p99_ms": 152.1
+    },
+    {
+     "p50_ms": 17.7,
+     "p99_ms": 63.5
+    },
+    {
+     "p50_ms": 96.2,
+     "p99_ms": 214.1
+    },
+    {
+     "p50_ms": 41.4,
+     "p99_ms": 150.2
+    }
+   ],
+   "writes_rows_s": 9770,
+   "write_ack_p50_ms": 79.5,
+   "write_ack_p99_ms": 261.2
+  },
+  {
+   "events": 5000000,
+   "keys": 2000000,
+   "nodes": 1,
+   "load_s": 8.1,
+   "clients": 100,
+   "qps": 956,
+   "errors": 0,
+   "p50_ms": 82.4,
+   "p99_ms": 347.1,
+   "by": [
+    {
+     "p50_ms": 102.3,
+     "p99_ms": 294.1
+    },
+    {
+     "p50_ms": 90.4,
+     "p99_ms": 266.5
+    },
+    {
+     "p50_ms": 29.1,
+     "p99_ms": 103.2
+    },
+    {
+     "p50_ms": 211.7,
+     "p99_ms": 396.8
+    },
+    {
+     "p50_ms": 75.6,
+     "p99_ms": 228.1
+    }
+   ],
+   "writes_rows_s": 5780,
+   "write_ack_p50_ms": 139.4,
+   "write_ack_p99_ms": 394.0
+  },
+  {
+   "events": 5000000,
+   "keys": 2000000,
+   "nodes": 1,
+   "load_s": 8.1,
+   "clients": 200,
+   "qps": 934,
+   "errors": 0,
+   "p50_ms": 131.9,
+   "p99_ms": 829.3,
+   "by": [
+    {
+     "p50_ms": 169.8,
+     "p99_ms": 555.8
+    },
+    {
+     "p50_ms": 141.9,
+     "p99_ms": 583.2
+    },
+    {
+     "p50_ms": 41.9,
+     "p99_ms": 203.1
+    },
+    {
+     "p50_ms": 569.6,
+     "p99_ms": 877.2
+    },
+    {
+     "p50_ms": 108.9,
+     "p99_ms": 420.0
+    }
+   ],
+   "writes_rows_s": 4340,
+   "write_ack_p50_ms": 164.5,
+   "write_ack_p99_ms": 561.9
+  },
+  {
+   "events": 5000000,
+   "keys": 2000000,
+   "nodes": 1,
+   "load_s": 8.1,
+   "clients": 400,
+   "qps": 861,
+   "errors": 0,
+   "p50_ms": 220.2,
+   "p99_ms": 2194.8,
+   "by": [
+    {
+     "p50_ms": 273.4,
+     "p99_ms": 1246.4
+    },
+    {
+     "p50_ms": 240.9,
+     "p99_ms": 1294.4
+    },
+    {
+     "p50_ms": 63.8,
+     "p99_ms": 485.7
+    },
+    {
+     "p50_ms": 1486.9,
+     "p99_ms": 2327.2
+    },
+    {
+     "p50_ms": 173.6,
+     "p99_ms": 874.2
+    }
+   ],
+   "writes_rows_s": 2860,
+   "write_ack_p50_ms": 243.5,
+   "write_ack_p99_ms": 1432.4
+  }
+ ],
+ "after (queries on their own runtime, statements boxed)": [
+  {
+   "events": 5000000,
+   "keys": 2000000,
+   "nodes": 1,
+   "load_s": 6.8,
+   "clients": 50,
+   "qps": 846,
+   "errors": 0,
+   "p50_ms": 43.1,
+   "p99_ms": 224.7,
+   "by": [
+    {
+     "p50_ms": 52.8,
+     "p99_ms": 207.6
+    },
+    {
+     "p50_ms": 49.6,
+     "p99_ms": 137.4
+    },
+    {
+     "p50_ms": 1.5,
+     "p99_ms": 20.7
+    },
+    {
+     "p50_ms": 134.5,
+     "p99_ms": 312.2
+    },
+    {
+     "p50_ms": 31.6,
+     "p99_ms": 126.9
+    }
+   ],
+   "writes_rows_s": 19830,
+   "write_ack_p50_ms": 5.6,
+   "write_ack_p99_ms": 18.4
+  },
+  {
+   "events": 5000000,
+   "keys": 2000000,
+   "nodes": 1,
+   "load_s": 6.8,
+   "clients": 100,
+   "qps": 862,
+   "errors": 0,
+   "p50_ms": 65.9,
+   "p99_ms": 448.9,
+   "by": [
+    {
+     "p50_ms": 80.0,
+     "p99_ms": 298.3
+    },
+    {
+     "p50_ms": 69.2,
+     "p99_ms": 260.6
+    },
+    {
+     "p50_ms": 1.4,
+     "p99_ms": 44.5
+    },
+    {
+     "p50_ms": 339.5,
+     "p99_ms": 490.9
+    },
+    {
+     "p50_ms": 48.8,
+     "p99_ms": 201.3
+    }
+   ],
+   "writes_rows_s": 19810,
+   "write_ack_p50_ms": 5.1,
+   "write_ack_p99_ms": 18.3
+  },
+  {
+   "events": 5000000,
+   "keys": 2000000,
+   "nodes": 1,
+   "load_s": 6.8,
+   "clients": 200,
+   "qps": 796,
+   "errors": 0,
+   "p50_ms": 108.5,
+   "p99_ms": 1134.6,
+   "by": [
+    {
+     "p50_ms": 139.4,
+     "p99_ms": 524.6
+    },
+    {
+     "p50_ms": 115.1,
+     "p99_ms": 513.5
+    },
+    {
+     "p50_ms": 2.1,
+     "p99_ms": 89.5
+    },
+    {
+     "p50_ms": 901.6,
+     "p99_ms": 1192.1
+    },
+    {
+     "p50_ms": 76.3,
+     "p99_ms": 364.9
+    }
+   ],
+   "writes_rows_s": 19840,
+   "write_ack_p50_ms": 5.6,
+   "write_ack_p99_ms": 17.4
+  },
+  {
+   "events": 5000000,
+   "keys": 2000000,
+   "nodes": 1,
+   "load_s": 6.8,
+   "clients": 400,
+   "qps": 761,
+   "errors": 0,
+   "p50_ms": 194.3,
+   "p99_ms": 2503.9,
+   "by": [
+    {
+     "p50_ms": 227.0,
+     "p99_ms": 1288.9
+    },
+    {
+     "p50_ms": 186.9,
+     "p99_ms": 1200.9
+    },
+    {
+     "p50_ms": 6.8,
+     "p99_ms": 432.4
+    },
+    {
+     "p50_ms": 1926.0,
+     "p99_ms": 2651.1
+    },
+    {
+     "p50_ms": 134.1,
+     "p99_ms": 1042.4
+    }
+   ],
+   "writes_rows_s": 19940,
+   "write_ack_p50_ms": 5.8,
+   "write_ack_p99_ms": 17.1
+  }
+ ]
+}

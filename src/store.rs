@@ -677,7 +677,7 @@ impl Lake {
 
     /// Follower: a change streamed from the leader; it takes effect once committed.
     pub fn hold(&self, d: Arc<Delta>) {
-        self.prefetch(&d);
+        self.arrived(&d);
         self.cat.pending.lock().unwrap().insert(d.id, d);
     }
 
@@ -692,19 +692,30 @@ impl Lake {
         self.advance(self.cat.visible_n() - 1);
     }
 
-    /// Keep the recent lake on this node's SSD: every object a commit brings in (a log segment
-    /// another node wrote, a new Parquet file) is fetched in the background, so a query on any
-    /// node reads recent data from local disk, not from the bucket.
-    pub fn prefetch(&self, d: &Delta) {
-        let Some(disk) = &self.disk else { return };
+    /// A commit seen here. The recent lake is kept on this node's SSD: every object it brings in (a
+    /// log segment another node wrote, a new Parquet file) is fetched in the background, so a query
+    /// on any node reads recent data from local disk, not from the bucket. And the files it
+    /// replaced leave the hot columns.
+    pub fn arrived(&self, d: &Delta) {
         for (key, value) in &d.puts {
-            let paths: Vec<String> = match key.get(..2) {
-                Some("s/") => serde_json::from_slice::<Segment>(value).map(|s| vec![s.path]).unwrap_or_default(),
-                // (files a tiering round writes; not a bulk load's big files, which only the queries that need them read)
-                Some("t/") => serde_json::from_slice::<TableMeta>(value).map(|m| m.files.into_iter().filter(|f| f.bytes <= 256 << 20).map(|f| f.path).collect()).unwrap_or_default(),
-                _ => vec![], // (keys like "c" and "n" are one character long)
-            };
-            paths.into_iter().filter(|p| !p.is_empty()).for_each(|p| disk.fetch_later(p));
+            match (key.get(..2), &self.disk) {
+                (Some("s/"), Some(disk)) => {
+                    if let Ok(s) = serde_json::from_slice::<Segment>(value) {
+                        if !s.path.is_empty() {
+                            disk.fetch_later(s.path);
+                        }
+                    }
+                }
+                (Some("t/"), disk) if disk.is_some() || self.hot.on() => {
+                    let Ok(m) = serde_json::from_slice::<TableMeta>(value) else { continue };
+                    self.hot.forget(&m.garbage);
+                    // (files a tiering round writes; not a bulk load's big files, which only the queries that need them read)
+                    if let Some(disk) = disk {
+                        m.files.into_iter().filter(|f| f.bytes <= 256 << 20 && !f.path.is_empty()).for_each(|f| disk.fetch_later(f.path));
+                    }
+                }
+                _ => {} // (keys like "c" and "n" are one character long)
+            }
         }
     }
 

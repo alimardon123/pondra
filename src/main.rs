@@ -603,13 +603,14 @@ async fn run() -> anyhow::Result<()> {
                 inbox::serve(lake.clone(), seq.clone(), app.lock.clone()); // writers that can't reach us
             }
             if leader {
-                // The leader's SSD tier learns of objects other nodes wrote from its own commits.
+                // The leader's SSD tier learns of objects other nodes wrote from its own commits (and its hot
+                // columns of the files they replaced).
                 let l = lake.clone();
                 panics::spawn(async move {
                     let (_, mut commits) = l.cat.subscribe();
                     loop {
                         match commits.recv().await {
-                            Ok(store::Frame::Change(d)) => l.prefetch(&d),
+                            Ok(store::Frame::Change(d)) => l.arrived(&d),
                             Ok(_) => {}
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue, // (just fewer prefetches)
                             Err(_) => break,

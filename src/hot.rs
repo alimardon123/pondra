@@ -37,7 +37,7 @@ use datafusion::physical_plan::filter_pushdown::{FilterPushdownPropagation, Push
 use datafusion::physical_plan::{empty::EmptyExec, execution_plan::replace_children_if_necessary, union::UnionExec, ExecutionPlan};
 use futures::StreamExt;
 use datafusion::prelude::ParquetReadOptions;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -53,7 +53,7 @@ pub struct Hot {
 #[derive(Default)]
 struct State {
     cols: HashMap<(String, String), Col>, // (file, column) -> its arrays, a batch each
-    rows: HashMap<String, Vec<usize>>,    // file -> rows per batch (the same for all its columns)
+    rows: BTreeMap<String, Vec<usize>>,   // file -> rows per batch (the same for all its columns)
     used: usize,
     busy: HashSet<String>,           // files being loaded
     once: std::collections::VecDeque<String>, // files a scan read once (the next read loads them)
@@ -124,6 +124,31 @@ impl Hot {
                 }
             }
         }
+    }
+
+    /// Let go of the files a table's commit replaced (`TableMeta::garbage`): no query plans them
+    /// again, and one that already has holds its own batches. Kept until the budget needed room, a
+    /// busy table's merges filled it with files nobody could read (a soak's nodes held 537 MB of
+    /// columns after 25 minutes, of a table of a few tens).
+    pub fn forget(&self, replaced: &[(String, u64)]) {
+        if !self.on() || replaced.is_empty() {
+            return;
+        }
+        let mut s = self.state.lock().unwrap();
+        // (held as its path, or as `path#…` without its deleted rows: `key`)
+        let held = |rows: &BTreeMap<String, Vec<usize>>, p: &str| rows.range(p.to_string()..).next().is_some_and(|(k, _)| base(k) == p);
+        let gone: HashSet<&str> = replaced.iter().map(|(p, _)| p.as_str()).filter(|p| held(&s.rows, p)).collect();
+        if gone.is_empty() {
+            return; // (most commits: what they replaced went at an earlier one)
+        }
+        let mut freed = 0;
+        s.cols.retain(|(k, _), c| {
+            let keep = !gone.contains(base(k));
+            freed += if keep { 0 } else { c.bytes };
+            keep
+        });
+        s.rows.retain(|k, _| !gone.contains(base(k)));
+        s.used = s.used.saturating_sub(freed);
     }
 
     /// `file`'s batches with `schema`'s columns, if all of them are here, and their columns' ranges.
@@ -241,6 +266,9 @@ fn key(f: &DataFile, deletes: bool) -> String {
     format!("{:?}", f.deletes).hash(&mut h);
     format!("{}#{:x}", f.path, h.finish())
 }
+
+/// A name here's file: `key` without its deletes.
+fn base(key: &str) -> &str { key.rsplit_once('#').map_or(key, |(path, _)| path) }
 
 /// `fields` of `file`, cast to their types (a column the file lacks, added to the table after it
 /// was written, is null): rows per batch, and each field's arrays and their ranges. Its system

@@ -1540,6 +1540,28 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    before them rewrote a streamed table every minute or so, and every query read it cold from
    Parquet until the hot columns had it again. `harness.py tiering`: "a merged file kept while eight
    more merge".
+231. **A request's queries run on a runtime of their own once another is running** (`panics::work`,
+   `server::queries`: `/sql`, `/mcp`, `/live`, pages, bulk inserts, a spread query's stages and
+   shares, tiering jobs; every Postgres statement): appends, commits, heartbeats and the commit
+   stream keep the node's runtime, and the OS shares the cores between the two. On one runtime a
+   woken append ran after every query task ahead of it (beside 400 dashboard clients a writer landed
+   2,860 rows a second of 22,000; now 20,000, acks 5 ms). The first request runs where it came in:
+   on this VM the hop between runtimes cost 0.9 ms a statement (a parked thread woken each way),
+   which halved pgbench. Dropped, as when its client goes, the moved work stops. A new door or a
+   route whose work is a query's goes through `work` too. `harness.py pace`: a writer's acks beside
+   64 querying clients (449 ms on one runtime against 5 ms alone; 7 ms now).
+232. **A door boxes a statement's future before wrapping it** (`server::sql`: `sql_as`; `pg::told`
+   and `caught`): a statement's future is hundreds of KB, and every layer around it (scopes,
+   `door`, `work`) copied it whole on each statement. Boxed, a point lookup takes 0.16 ms over
+   Postgres (0.35 before) and 0.19 ms over HTTP (0.31), and pgbench's one client 210 transactions a
+   second (150). No test fails without it: `tools/bench/pgbench.py` and single-client point lookups
+   show it.
+233. **A file a commit replaced leaves the hot columns when the node sees that commit**
+   (`Lake::arrived` → `Hot::forget`, over the table's `garbage`, its path and its `path#…` keys):
+   no query plans it again, and one that already has holds its own batches. Kept until the budget
+   needed room, a busy table's merges filled it with files nobody could read (Durability's soak:
+   537 MB after 25 minutes, of a table of a few tens). `harness.py hot`: "a merge's replaced files
+   leave memory".
 
 ## Tests: run these before and after any change
 
@@ -1558,7 +1580,8 @@ python3 tools/harness.py versions       # every file keeps its versions: listed,
 python3 tools/harness.py stopped        # a run whose node was killed under it: stopped, not running for good
 python3 tools/harness.py scripts        # IF, CASE, loops, handlers, RETURN, EXECUTE IMMEDIATE: errors at their line, scopes, a job run twice writing once, Postgres's protocols
 python3 tools/harness.py variables      # DECLARE $x, $x = …, SET VARIABLE, getvariable: sessions, Postgres, procedures, file runs, db.vars, pondra.parameters
-python3 tools/harness.py hot            # hot columns skip batches by their ranges (a time range, a top-N either way, a key); NULL filters == the model
+python3 tools/harness.py hot            # hot columns skip batches by their ranges (a time range, a top-N either way, a key); NULL filters == the model; merged files leave memory
+python3 tools/harness.py pace           # a writer's acks beside 64 querying clients stay near its acks alone (queries on their own runtime)
 python3 tools/harness.py tails          # a table's log tail kept between queries: reads == a model while rows land, a transaction's snapshot, a column added, tiering
 python3 tools/harness.py minmax         # a global min/max over 24 files skips no row its other answers need (an expression, NULLs so far, FILTER); a wide top-N's answer
 python3 tools/harness.py history        # pondra.history: every door's statements, slow ones' plans and three nodes' traces, the rate, off, who reads what

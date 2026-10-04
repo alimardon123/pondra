@@ -41,7 +41,7 @@ pub async fn serve(app: App, addr: String) -> anyhow::Result<()> {
         let tls = tls.clone();
         // A connection is a session: its temporary tables end with it (`temp.rs`).
         let session = format!("pg-{}", uuid::Uuid::new_v4().simple());
-        let backend = Arc::new(Backend { app: app.clone(), parser: parser.clone(), session: session.clone(), who: Default::default() });
+        let backend = Arc::new_cyclic(|me| Backend { app: app.clone(), parser: parser.clone(), session: session.clone(), who: Default::default(), me: me.clone() });
         let pg = Arc::new(Pg(backend.clone(), Arc::new(Startup { backend, scram: Default::default(), plain: Default::default() })));
         tokio::spawn(async move {
             let _ = socket.set_nodelay(true);
@@ -58,6 +58,7 @@ struct Backend {
     parser: Arc<NoopQueryParser>,
     session: String,
     who: std::sync::Mutex<Option<crate::auth::Principal>>, // (whoever signed in)
+    me: std::sync::Weak<Backend>,                          // (a statement runs on the queries' runtime: `told`)
 }
 
 impl PgWireServerHandlers for Pg {
@@ -296,7 +297,13 @@ impl Backend {
     /// `run`, the notices its procedures send (what they print) sent first: psql shows NOTICE.
     async fn told<C: Sink<PgWireBackendMessage> + Unpin + Send>(&self, client: &mut C, user: &str, sql: &str, format: &Format) -> PgWireResult<Response> {
         let t0 = std::time::Instant::now();
-        let (out, heard) = crate::routines::with_notices(crate::temp::SESSION.scope(Some(self.session.clone()), crate::auth::WHO.scope(self.who(), self.caught(user, sql, format)))).await;
+        let me = self.me.upgrade().expect("its connection holds it");
+        let (u, q, f) = (user.to_string(), sql.to_string(), format.clone());
+        let run = async move {
+            let (session, who) = (Some(me.session.clone()), me.who());
+            crate::routines::with_notices(crate::temp::SESSION.scope(session, crate::auth::WHO.scope(who, me.caught(&u, &q, &f)))).await
+        };
+        let (out, heard) = crate::panics::work(Box::pin(run)).await.unwrap_or_else(|m| (Err(user_error(anyhow::anyhow!(m))), vec![]));
         for n in heard {
             let _ = client.send(PgWireBackendMessage::NoticeResponse(ErrorInfo::new("NOTICE".into(), "00000".into(), n).into())).await; // (a client gone: the answer fails too)
         }
@@ -312,7 +319,7 @@ impl Backend {
             // (stopping: the statement goes to another node, as a new connection does; `drain.rs`)
             return Err(PgWireError::UserError(Box::new(ErrorInfo::new("ERROR".into(), "57P01".into(), "this node is stopping: connect to another node".into()))));
         }
-        let run = async { crate::panics::door(self.run(user, sql, format)).await.unwrap_or_else(|m| Err(user_error(anyhow::anyhow!(m)))) };
+        let run = async { crate::panics::door(Box::pin(self.run(user, sql, format))).await.unwrap_or_else(|m| Err(user_error(anyhow::anyhow!(m)))) };
         let out = crate::audit::statement(&self.app, sql, run).await;
         if let Err(e) = &out {
             if crate::txn::control(sql).is_none() {

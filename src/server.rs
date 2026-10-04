@@ -374,10 +374,18 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
         };
     }
     req.extensions_mut().insert(who.role);
-    match crate::panics::door(crate::auth::WHO.scope(who, next.run(req))).await {
+    let heavy = queries(req.uri().path());
+    let run = crate::auth::WHO.scope(who, next.run(req));
+    match if heavy { crate::panics::work(run).await } else { crate::panics::door(run).await } {
         Ok(r) => r,
         Err(m) => (StatusCode::INTERNAL_SERVER_ERROR, m).into_response(), // (and the node stays up)
     }
+}
+
+/// The routes whose work is queries' (`panics::work`): planned and run on a runtime of their own,
+/// so appends, commits, heartbeats and the commit stream keep theirs.
+fn queries(path: &str) -> bool {
+    matches!(path, "/sql" | "/mcp" | "/live" | "/tier" | "/cluster/stage" | "/cluster/copy" | "/cluster/insert" | "/cluster/job") || path.starts_with("/sql/pages/") || path.starts_with("/insert/")
 }
 
 /// The user name in a Basic header (for the audit log: who tried).
@@ -957,7 +965,7 @@ async fn sql(State(app): State<App>, Query(p): Query<SqlParams>, role: axum::Ext
     let session = crate::temp::of(&headers); // (its temporary tables: `temp.rs`)
     let token = headers.get("authorization").and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer "));
     let vars = crate::auth::lent_vars(token); // (Python code a run lent a connection to: the run's variables)
-    let (out, heard) = crate::routines::with_notices(crate::vars::within(vars, crate::temp::SESSION.scope(session.clone(), crate::ext::scope(files, sql_as(app, p, role, headers, body))))).await;
+    let (out, heard) = crate::routines::with_notices(crate::vars::within(vars, crate::temp::SESSION.scope(session.clone(), crate::ext::scope(files, Box::pin(sql_as(app, p, role, headers, body)))))).await; // (boxed: a statement's future is big, and every layer around it would copy it)
     let mut r = out.unwrap_or_else(IntoResponse::into_response);
     if session.as_deref().is_some_and(crate::temp::holds) {
         r.headers_mut().insert("x-pondra-session", axum::http::HeaderValue::from_static("held")); // (a client keeps to this node meanwhile)

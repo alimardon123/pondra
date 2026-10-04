@@ -58,7 +58,12 @@ never changed is planned straight from its tail and files. Queries a second: 760
 clients, 826 → 956 at 100, 749 → 934 at 200, 751 → 861 at 400; p99 at 200 clients 1.54 → 0.83 s
 (`logs/round34/users.json`). TPC-H and TPC-DS from files and from memory are no slower. What it also
 showed: the writer, a request at a time, landed 9,770 rows a second beside 50 readers and 2,860
-beside 400 (acks wait behind the queries' tasks on the one runtime): next.
+beside 400, its acks waiting behind the queries' tasks on the one runtime. Now a request's queries
+run on a runtime of their own once another is running (invariant 231), and a door boxes a
+statement's future before wrapping it (232): the writer lands 19,800–19,900 rows a second at every
+count of readers, acks 5–6 ms at p50 (80–240 ms before), and the readers keep 760–860 queries a
+second (`logs/round34/users-writes.json`). A point lookup takes 0.16 ms over Postgres (0.35) and
+0.19 ms over HTTP (0.31); pgbench's one client 210 transactions a second (150).
 
 **ClickHouse beside DuckDB** (`singlenode.py`, ClickHouse 26.9.9.28 as `clickhouse local`, 4 cores,
 best of three; `logs/round34/singlenode-*-clickhouse.json`). TPC-H SF1: DuckDB 1.5.5's tables

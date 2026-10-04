@@ -936,6 +936,59 @@ def tails():
     return "a table's log tail kept between queries: reads == the model, a transaction's snapshot, columns added, tiering"
 
 
+def pace():
+    """Writes keep their pace while many clients query (`panics::work`): a writer's appends, a
+    request at a time, alone and then beside 64 clients each asking an aggregate over 2 million
+    rows. On one runtime its acks waited behind the queries' tasks (20-50 times as long)."""
+    lake = new_lake()
+    node = Node(lake, A.port).start()
+    q = lambda s: sql(A.port, s)
+    q("CREATE TABLE big (a BIGINT, b DOUBLE)")
+    q("INSERT INTO big SELECT value, value * 0.5 FROM generate_series(1, 2000000)")
+    want = q("SELECT count(*) AS n, sum(b) AS s FROM big WHERE a % 7 = 3")[0]
+    q("CREATE TABLE w (id BIGINT, s VARCHAR)")
+    stop, wrong, asked = threading.Event(), [], [0]
+
+    def acks(secs, seq0):
+        out, t_end = [], time.time() + secs
+        for seq in itertools.count(seq0):
+            if time.time() > t_end:
+                return out
+            t = time.time()
+            call(A.port, "POST", f"/append/w?producer=p&seq={seq}", "".join(json.dumps({"id": seq * 1000 + i, "s": "x"}) + "\n" for i in range(1000)).encode())
+            out.append((time.time() - t) * 1000)
+            time.sleep(0.02)
+
+    def reader():
+        c = http_client.HTTPConnection("127.0.0.1", A.port, timeout=600)
+        while not stop.is_set():
+            c.request("POST", "/sql", f"SELECT count(*) AS n, sum(b) AS s FROM big WHERE a % 7 = 3 -- {uuid.uuid4()}".encode())  # (never a remembered answer)
+            got = json.loads(c.getresponse().read())[0]
+            asked[0] += 1
+            if got != want:
+                wrong.append(got)
+
+    alone = sorted(acks(4, 1))
+    readers = [threading.Thread(target=reader, daemon=True) for _ in range(64)]
+    [r.start() for r in readers]
+    time.sleep(2)
+    beside = sorted(acks(8, 100000))
+    stop.set()
+    [r.join(60) for r in readers]
+    node.kill()
+    p50 = lambda xs: xs[len(xs) // 2]
+    checks = {
+        "64 clients' answers are right": not wrong and asked[0] > 64,
+        "a writer's acks beside 64 querying clients stay within 5x of its acks alone (or 25 ms)": p50(beside) <= max(5 * p50(alone), 25),
+    }
+    for name, good in checks.items():
+        print(f"pace: {name}: {'OK' if good else 'FAIL'}")
+    print(f"pace: acks alone p50 {p50(alone):.1f} ms, beside the readers p50 {p50(beside):.1f} ms ({len(beside)} appends), {asked[0]} queries answered, wrong {wrong[:2]}")
+    if not all(checks.values()):
+        sys.exit(1)
+    return f"writes keep their pace beside 64 querying clients: acks p50 {p50(alone):.1f} ms alone, {p50(beside):.1f} ms beside"
+
+
 def fence():
     """A second node on the same lake joins as a follower. Then the leader is frozen (SIGSTOP, like
     a network partition), the follower takes over, and the old leader wakes up still believing it
@@ -4893,7 +4946,8 @@ def hot():
     """Hot columns skip the batches a filter rules out by their ranges, and only those (round 32):
     a table whose rows came in time order, held in memory, asked for a range of its time, a top-N of
     it, a key, and NULL-sensitive filters over a column with a batch of NULLs; every answer the
-    model's, and the range, the top-N and the key skip batches (`pondra_hot_batches_skipped_total`)."""
+    model's, and the range, the top-N and the key skip batches (`pondra_hot_batches_skipped_total`).
+    Then eight small files held, merged: they leave memory with the merge's commit (`Hot::forget`)."""
     import re
     lake = new_lake()
     node = Node(lake, A.port, env={"PONDRA_HOT_GB": "1"}).start()
@@ -4931,6 +4985,22 @@ def hot():
             got = q(ask)
             seen[name] = {"got": got if got != want else "== model", "skipped": skipped() - before}
             checks[f"{name}: the model's answer" + (", batches skipped" if skips else "")] = got == want and (not skips or skipped() > before)
+        # A merge's replaced files leave memory when the node sees its commit: kept, a busy table's
+        # merges filled the budget with files no query could read again.
+        hot_bytes = lambda: float(re.search(rb"\npondra_hot_bytes (\S+)", call(A.port, "GET", "/metrics")).group(1))
+        q("CREATE TABLE m (a BIGINT, s VARCHAR)")
+        for f in range(8):  # (a bulk INSERT is a file of its own; eight small ones are merged)
+            if f == 7:
+                for run in range(2):
+                    q(f"SELECT sum(a) AS a, max(s) AS s FROM m -- warm {run}")
+                with_m = hot_settled(A.port)
+            q(f"INSERT INTO m SELECT value + {f * 50000} AS a, 'm' || value AS s FROM range(0, 50000)")
+        deadline = time.time() + 60
+        while hot_bytes() > held + (with_m - held) / 10 and time.time() < deadline:
+            time.sleep(0.5)
+        seen["merged files' columns"] = {"before": held, "with them": with_m, "after the merge": hot_bytes()}
+        checks["a merge's replaced files leave memory"] = with_m > held and hot_bytes() <= held + (with_m - held) / 10
+        checks["…and the merged rows answer"] = q("SELECT count(*) AS n, sum(a) AS a FROM m") == [{"n": 400000, "a": sum(range(400000))}]
     finally:
         node.kill()
         clean_up()
@@ -7657,7 +7727,7 @@ def friendly():
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    out = {t.__name__: t() for t in (upsert, deal, outside, clouds, kafkas, tiering, tails, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, found, renames, workspace, server, scale, flight, users, secrets, safety, versions, stopped, flows, begin, doors, objects, registry, sparksql, variables, scripts, hot, minmax, history, friendly, reader, crash)}
+    out = {t.__name__: t() for t in (upsert, deal, outside, clouds, kafkas, tiering, tails, pace, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, found, renames, workspace, server, scale, flight, users, secrets, safety, versions, stopped, flows, begin, doors, objects, registry, sparksql, variables, scripts, hot, minmax, history, friendly, reader, crash)}
     A.secs = min(A.secs, 20)
     out["load"] = load()
     print(json.dumps(out, indent=1))
@@ -7665,7 +7735,7 @@ def all_tests():
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "tails", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "found", "renames", "workspace", "server", "scale", "flight", "users", "secrets", "safety", "versions", "stopped", "flows", "begin", "doors", "objects", "registry", "sparksql", "variables", "scripts", "tasks", "hot", "minmax", "history", "friendly", "load", "all"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "tails", "pace", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "found", "renames", "workspace", "server", "scale", "flight", "users", "secrets", "safety", "versions", "stopped", "flows", "begin", "doors", "objects", "registry", "sparksql", "variables", "scripts", "tasks", "hot", "minmax", "history", "friendly", "load", "all"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -7677,7 +7747,7 @@ if __name__ == "__main__":
     ap.add_argument("--flush-ms", type=int, default=250)
     A = ap.parse_args()
     try:
-        {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "safety": safety, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "objects": objects, "registry": registry, "sparksql": sparksql, "variables": variables, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "friendly": friendly, "load": load, "all": all_tests}[A.mode]()
+        {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "safety": safety, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "objects": objects, "registry": registry, "sparksql": sparksql, "variables": variables, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "friendly": friendly, "load": load, "all": all_tests}[A.mode]()
     except BaseException as e:  # a failure ends the run, though threads may still wait on a node (crash's producers retry for ever)
         code = e.code if isinstance(e, SystemExit) else 1
         if not isinstance(e, SystemExit):
