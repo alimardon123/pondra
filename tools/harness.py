@@ -1146,10 +1146,15 @@ def insert_spread():
     same("a table a view follows", "followed", "SELECT * FROM src WHERE k < 20")
     checks["… the view follows it"] = until(lambda: one("SELECT sum(n) AS n, sum(v) AS v FROM by_k"), one("SELECT count(*) AS n, sum(v) AS v FROM followed"), 15) \
         == one("SELECT count(*) AS n, sum(v) AS v FROM followed")
-    q("CREATE TABLE grouped (k BIGINT, n BIGINT, v DOUBLE)")
-    before = writes()
-    q("INSERT INTO grouped SELECT k, count(*), sum(v) FROM src GROUP BY k")
-    checks["a GROUP BY is written by one node"] = writes() == before and one("SELECT count(*) AS n, sum(n) AS rows FROM grouped") == {"n": 50, "rows": 120002}
+    # (a tiering job dealt to a follower meanwhile writes too: a spread INSERT writes on every try, so three tries tell them apart)
+    for i in range(3):
+        q(f"CREATE TABLE grouped{i} (k BIGINT, n BIGINT, v DOUBLE)")
+        before = writes()
+        q(f"INSERT INTO grouped{i} SELECT k, count(*), sum(v) FROM src GROUP BY k")
+        alone = writes() == before
+        if alone:
+            break
+    checks["a GROUP BY is written by one node"] = alone and one(f"SELECT count(*) AS n, sum(n) AS rows FROM grouped{i}") == {"n": 50, "rows": 120002}
     # A history view: a version's __end_at is the next version's, in whichever file it is, so every
     # node reads it whole (deleted versions left out), spread or not, and it is written as it reads.
     q("CREATE TABLE ch (id BIGINT, op VARCHAR, at BIGINT)")

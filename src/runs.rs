@@ -890,7 +890,7 @@ fn latest(e: &Every, after: u64, now: u64) -> Option<u64> {
 /// Does `sql` read one of these tables?
 pub fn mentioned(sql: &str) -> bool {
     let s = sql.to_lowercase();
-    ["pondra.runs", "pondra.routines", "pondra.tasks", "pondra.tables", "pondra.users", "pondra.grants", "pondra.audit", "pondra.history", "pondra.flows", "pondra.expectations", "pondra.variables", "pondra.dropped", "pondra.objects", "pondra.kinds"].iter().any(|t| s.contains(t))
+    ["pondra.runs", "pondra.routines", "pondra.tasks", "pondra.tables", "pondra.users", "pondra.grants", "pondra.audit", "pondra.history", "pondra.flows", "pondra.expectations", "pondra.variables", "pondra.dropped", "pondra.objects", "pondra.kinds", "pondra.databases"].iter().any(|t| s.contains(t))
 }
 
 /// `pondra.routines`, `pondra.tasks` and `pondra.tables`, as they are now.
@@ -972,7 +972,7 @@ pub async fn tables(lake: &Lake) -> Result<Vec<(&'static str, Arc<dyn datafusion
         ("rows_in_files", g(&|d| d.meta.files.iter().map(|f| f.rows).sum::<u64>() + d.meta.sealed.as_ref().map_or(0, |s| s.rows))),
         ("bytes_in_files", g(&|d| d.meta.files.iter().map(|f| f.bytes).sum::<u64>() + d.meta.sealed.as_ref().map_or(0, |s| s.bytes))),
     ])?;
-    Ok(vec![("routines", mem(routines)?), ("tasks", mem(tasks)?), ("tables", mem(listed)?), ("dropped", mem(dropped)?)])
+    Ok(vec![("routines", mem(routines)?), ("tasks", mem(tasks)?), ("tables", mem(listed)?), ("dropped", mem(dropped)?), ("databases", mem(crate::branch::databases(lake).await?)?)])
 }
 
 /// `pondra.runs` before any run: no rows, its columns.
