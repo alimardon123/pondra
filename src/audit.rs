@@ -71,7 +71,8 @@ pub fn class(sql: &str) -> &'static str {
     let about = |o: &[&str]| words.iter().skip(1).take(4).any(|w| o.contains(&w.as_str()));
     match first {
         "GRANT" | "REVOKE" => "role",
-        "CREATE" | "ALTER" | "DROP" if about(&["USER", "ROLE", "TOKEN", "SECRET"]) => "role",
+        "CREATE" | "ALTER" | "DROP" if about(&["USER", "ROLE", "TOKEN", "SECRET", "SHARE", "RECIPIENT"]) => "role",
+        "ATTACH" if sql.to_uppercase().contains("TOKEN") => "role", // (a share's profile: its token is a secret)
         "CREATE" | "ALTER" | "DROP" | "TRUNCATE" | "ATTACH" | "DETACH" | "COMMENT" | "UNDROP" | "OPTIMIZE" | "VACUUM" | "CHECKPOINT" => "ddl",
         "INSERT" | "UPDATE" | "DELETE" | "MERGE" | "COPY" | "UPSERT" => "write",
         "CALL" | "DO" => "function",
@@ -181,6 +182,13 @@ pub async fn statement<T, E: std::fmt::Display + Refusal>(app: &App, sql: &str, 
 pub fn refused(app: &App, user: &str, door: &'static str, from: Option<std::net::SocketAddr>, what: &str, message: &str) {
     if on() {
         write(app, Line { at: crate::log::now_ms(), user: user.to_string(), door, from: from.map(|a| a.to_string()), class: "access", statement: redacted(what, "role"), outcome: "refused", message: Some(message.to_string()), ms: None });
+    }
+}
+
+/// A request at the sharing door (`sharing.rs`), by a recipient: always written, as refusals are.
+pub fn shared(app: &App, recipient: &str, from: Option<std::net::SocketAddr>, what: &str, outcome: &'static str, message: Option<String>) {
+    if on() {
+        write(app, Line { at: crate::log::now_ms(), user: format!("recipient {recipient}"), door: "sharing", from: from.map(|a| a.to_string()), class: "share", statement: what.to_string(), outcome, message, ms: None });
     }
 }
 

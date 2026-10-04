@@ -1431,6 +1431,22 @@ def work_checks(browser, port, show):
     checks["the Data tree: a column's name goes in on a double-click, not a click; a function's click shows its details; a schema's New ▸ lists what it can make; Refresh and List"] = \
         clicked == "SELECT  FROM wk" and put_in == f"SELECT {cname} FROM wk" and fdetail is True \
         and {"Table…", "View…", "Materialized view…", "Function…", "Procedure…", "Schedule…"} <= set(made_items) and {"Refresh", "List its tables and views", "Copy the name"} <= set(s_items)
+    # Share… on a table (ADR-046): the statements shown as they are built, run, the profile shown once
+    opened(wk)
+    p.locator("#menu button", has_text="Share with another company").click()
+    d = p.locator("dialog.pop[open]")
+    d.locator("input[list=who-list]").fill("acme_corp")
+    built = d.locator("pre.defn").inner_text()
+    d.locator("button.primary", has_text="Share").click()
+    prof = p.locator("dialog.pop[open]", has_text="acme_corp's profile")
+    shown = until(lambda: prof.count() == 1 and "bearerToken" in prof.inner_text() and prof.locator("button", has_text="Download acme_corp.share").count() == 1, True)
+    p.keyboard.press("Escape")
+    held = [(r["share"], r["shared_as"], r["recipients"]) for r in sql(port, "SELECT share, shared_as, recipients FROM pondra.shares")]
+    checks["a table's Share with another company…: the statements shown as built, run; the new recipient's profile shown once, to download or copy"] = \
+        "CREATE SHARE wk_share" in built and "ALTER SHARE wk_share ADD TABLE wk" in built and "GRANT SELECT ON SHARE wk_share TO RECIPIENT acme_corp" in built \
+        and shown is True and held == [("wk_share", "public.wk", "acme_corp")]
+    sql(port, "DROP SHARE wk_share")
+    sql(port, "DROP RECIPIENT acme_corp")
     sql(port, "DROP VIEW wk_values")
     # History: statements as the node remembers them (pondra.history): this tab's, this page's, all but the
     # page's own queries; slow or failed; a slow one's plan as it ran (this node: PONDRA_SLOW_MS=300)
@@ -1646,7 +1662,7 @@ def budget_checks(browser, port, show):
             fresh[name] = e.code
     total = sum(sizes.values()) if all(sizes.values()) else None
     later = {}
-    for name in ["chart.js", "plan.js", "more.js", "details.js", "more.css", "data.js", "md.js", "jobs.js", "history.js", "settings.js", "objects.js", "pyfile.js", "sqlfile.js", "rename.js", "versions.js", "stmts.js", "params.js", "tabs.js", "live.js", "gridmore.js", "groups.js", "upload.js", "access.js", "table.js"]:  # (loaded when first used)
+    for name in ["chart.js", "plan.js", "more.js", "details.js", "more.css", "data.js", "md.js", "jobs.js", "history.js", "settings.js", "objects.js", "pyfile.js", "sqlfile.js", "rename.js", "versions.js", "stmts.js", "params.js", "tabs.js", "live.js", "gridmore.js", "groups.js", "upload.js", "access.js", "table.js", "share.js"]:  # (loaded when first used)
         r = urllib.request.urlopen(urllib.request.Request(f"{base}/console/{name}", headers={"accept-encoding": "gzip"}))
         later[name] = len(r.read()) if r.headers.get("content-encoding") == "gzip" else None
     checks["the scripts and style sheet the page loads, gzipped as the node serves them: <= 70 KB; each answers 304 when the browser has it"] = total is not None and total <= 70 * 1024 \

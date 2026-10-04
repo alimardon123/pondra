@@ -158,6 +158,7 @@ pub fn router(app: App) -> Router {
         .route("/cluster/visible", get(|State(app): State<App>| async move { Json(app.lake.visible()) })) // (a follower's read-your-writes: `write::seen_here`)
         .route("/cluster/kafka", get(|| async { Json(crate::kafka::me()) }))
         .merge(crate::iceberg::rest())
+        .merge(crate::sharing::routes()) // (recipients sign in there with their own tokens: `sharing.rs`)
         .layer(axum::extract::DefaultBodyLimit::max(1 << 30)) // batches up to 1 GiB
         .layer(middleware::from_fn_with_state(app.clone(), guard))
         .with_state(app)
@@ -347,6 +348,13 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
         if header.as_deref().is_some_and(|h| h.starts_with("Bearer pn_")) && !peer.may_be_node() {
             return (StatusCode::UNAUTHORIZED, "the nodes' key is taken only with a certificate the nodes' authority signed (PONDRA_TLS_CA)").into_response();
         }
+    }
+    if req.uri().path().starts_with("/delta-sharing/") {
+        // (a recipient's token or a file's signed link, which the door checks: never a user's sign-in)
+        return match crate::panics::door(next.run(req)).await {
+            Ok(r) => r,
+            Err(m) => (StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
+        };
     }
     let signed = match &header {
         Some(h) => crate::users::who(&app.lake, &app.auth, Some(h)).await,

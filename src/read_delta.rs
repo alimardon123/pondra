@@ -65,10 +65,16 @@ pub async fn resolve(lake: &Lake, root: &str, version: Option<i64>) -> Result<Ta
     let root = crate::ddl::full(root)?; // (a folder named relatively: from where the node runs)
     let root = root.as_str();
     let log = replay(lake, root, version).await?;
-    features(root, &log.protocol)?;
-    let (columns, partitions, mapped) = schema(root, &log.metadata)?;
+    table(root, &log.protocol, &log.metadata, log.files.values())
+}
+
+/// A table of files from a version's protocol, metadata and add actions (a log's, or what a Delta
+/// Sharing server answered: `sharing::read`).
+pub fn table<'a>(root: &str, protocol: &Value, metadata: &Value, adds: impl Iterator<Item = &'a Value>) -> Result<TableMeta> {
+    features(root, protocol)?;
+    let (columns, partitions, mapped) = schema(root, metadata)?;
     let types: HashMap<&str, DataType> = columns.iter().map(|(p, _, t)| (p.as_str(), t.clone())).collect();
-    let mut files: Vec<DataFile> = log.files.values().map(|add| file(root, add, &partitions, &types)).collect::<Result<_>>()?;
+    let mut files: Vec<DataFile> = adds.map(|add| file(root, add, &partitions, &types)).collect::<Result<_>>()?;
     files.sort_by(|a, b| a.path.cmp(&b.path)); // (every node lists them in one order)
     Ok(TableMeta {
         columns: columns.iter().map(|(p, _, t)| (p.clone(), crate::query::type_name(t))).collect(),
