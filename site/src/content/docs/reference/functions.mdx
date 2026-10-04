@@ -99,16 +99,17 @@ document, and finish with `->>` or a typed getter.
 
 ## Vectors
 
-A vector is a `FLOAT[]` column. The three distance functions take two vectors of the same length
-and give a `DOUBLE`. If the lengths differ, or either side is `NULL`, the answer is `NULL`.
+A vector is a `FLOAT[]` column. The distance functions take two vectors of the same length and
+give a `DOUBLE`. If the lengths differ, or either side is `NULL` or holds a `NULL`, the answer is
+`NULL`. Each also answers to DuckDB's names, so SQL written for DuckDB runs as it is.
 
-| Function | Meaning |
-|---|---|
-| `cosine_similarity(a, b)` | 1 for the same direction, 0 for unrelated, -1 for opposite |
-| `l2_distance(a, b)` | Euclidean distance: 0 for the same vector |
-| `dot_product(a, b)` | the sum of the products of each pair of numbers |
+| Function | Meaning | Also called |
+|---|---|---|
+| `cosine_similarity(a, b)` | 1 for the same direction, 0 for unrelated, -1 for opposite | `array_cosine_similarity`, `list_cosine_similarity` |
+| `cosine_distance(a, b)` | `1 - cosine_similarity(a, b)`: 0 for the same direction | `array_cosine_distance`, `list_cosine_distance` |
+| `l2_distance(a, b)` | Euclidean distance: 0 for the same vector | `array_distance`, `list_distance` |
+| `dot_product(a, b)` | the sum of the products of each pair of numbers | `inner_product`, `array_inner_product`, `list_inner_product` |
 
-DataFusion's own `cosine_distance`, `array_distance` and `inner_product` work on the same columns.
 An array literal, `[1.0, 0.0, 0.0]`, is a vector, so "most like this" is an `ORDER BY`:
 
 ```sql
@@ -143,8 +144,11 @@ hosted one. Pondra carries no model.
 The node reads where to call from `PONDRA_AI_URL` (default `http://127.0.0.1:11434/v1`),
 `PONDRA_AI_KEY` (if the endpoint wants a key), and the default models `PONDRA_AI_MODEL`
 (`llama3.2`) and `PONDRA_EMBED_MODEL` (`nomic-embed-text`). See
-[environment variables](/pondra/reference/environment/). Eight rows are sent at a time, and a row
-whose call fails is `NULL`, so one bad row doesn't lose the query.
+[environment variables](/pondra/reference/environment/). Each distinct text in a batch is asked
+once, embeddings many to a request; a node has at most `PONDRA_AI_CALLS` requests in flight, and
+tries one again after a `429`, a `5xx` or a lost connection. A row whose call still fails is
+`NULL`, so one bad row doesn't lose the query, and `pondra_ai_requests_total` in
+[`/metrics`](/pondra/reference/http/) counts the requests answered, failed and tried again.
 
 ```sql norun
 SELECT id, ai_complete('Summarize in five words: ' || body) AS summary FROM tickets;

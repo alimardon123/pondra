@@ -125,6 +125,8 @@ A query is spread over the nodes of a cluster when that is cheaper than running 
 | `PONDRA_AI_KEY` | none | sent as a bearer token to that endpoint, if it wants one |
 | `PONDRA_AI_MODEL` | `llama3.2` | the model `ai_complete` uses when the call names none |
 | `PONDRA_EMBED_MODEL` | `nomic-embed-text` | the model `ai_embed` uses when the call names none |
+| `PONDRA_AI_CALLS` | `16` | requests a node has in flight to that endpoint at most, from all its queries together |
+| `PONDRA_AI_TIMEOUT_SECS` | `300` | how long one request may take before its rows are `NULL` |
 
 ## Writes with `pondra sql`
 
