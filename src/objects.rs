@@ -203,7 +203,7 @@ fn databases(lake: &Lake) -> BoxFuture<'_, Result<Vec<Object>>> {
 // ---------------------------------------------------------------- definitions
 
 /// A name in SQL: each part bare if it can be, quoted if not.
-fn name_sql(local: &str) -> String { local.split('.').map(ident).collect::<Vec<_>>().join(".") }
+pub(crate) fn name_sql(local: &str) -> String { local.split('.').map(ident).collect::<Vec<_>>().join(".") }
 
 /// One part of a name as SQL reads it back: bare when lower case and not a word SQL reserves.
 pub fn ident(n: &str) -> String {
@@ -236,7 +236,7 @@ fn span(s: u64) -> String {
 }
 
 /// An Arrow type, as the lake records it, in SQL.
-fn sql_type(t: &str) -> String {
+pub(crate) fn sql_type(t: &str) -> String {
     use datafusion::arrow::datatypes::{DataType as D, TimeUnit as U};
     fn of(d: &D) -> String {
         match d {
@@ -269,7 +269,7 @@ fn sql_type(t: &str) -> String {
 }
 
 /// `CREATE TABLE`, its layout as clauses (`layout.rs`): what makes the table again, without rows.
-fn table_sql(name: &str, m: &TableMeta) -> String {
+pub(crate) fn table_sql(name: &str, m: &TableMeta) -> String {
     let mut parts: Vec<String> = m.columns.iter().filter(|(c, _)| !m.marker(c)).map(|(c, t)| { // (a keyed table's `_deleted` is its own)
         let merge = m.merge.get(c).map(|f| format!(" MERGE {f}")).unwrap_or_default();
         let null = if m.not_null.contains(c) && !m.key.contains(c) { " NOT NULL" } else { "" };
@@ -307,7 +307,7 @@ fn table_sql(name: &str, m: &TableMeta) -> String {
 }
 
 /// `CREATE MATERIALIZED VIEW`: its expectations, its options and its query.
-fn materialized_sql(name: &str, v: &crate::views::View, meta: Option<&TableMeta>) -> String {
+pub(crate) fn materialized_sql(name: &str, v: &crate::views::View, meta: Option<&TableMeta>) -> String {
     use crate::views::OnViolation;
     let expect: Vec<String> = v.expect.iter().map(|e| match e.on {
         OnViolation::Fail => format!("CONSTRAINT {} CHECK ({})", ident(&e.name), e.check),
@@ -338,7 +338,7 @@ fn materialized_sql(name: &str, v: &crate::views::View, meta: Option<&TableMeta>
 }
 
 /// `CREATE FUNCTION`, `CREATE MACRO` or `CREATE PROCEDURE`, in the form it was made in.
-fn routine_sql(name: &str, r: &crate::routines::Routine) -> String {
+pub(crate) fn routine_sql(name: &str, r: &crate::routines::Routine) -> String {
     use crate::routines::Kind as R;
     let macro_ = r.what() == "macro";
     let params = r.params.iter().map(|p| {
@@ -385,7 +385,7 @@ fn routine_sql(name: &str, r: &crate::routines::Routine) -> String {
 }
 
 /// `CREATE TASK`: when, after what, on what condition and with what options it runs.
-fn task_sql(name: &str, t: &crate::runs::Task) -> String {
+pub(crate) fn task_sql(name: &str, t: &crate::runs::Task) -> String {
     let mut s = format!("CREATE TASK {name}");
     if t.after.is_empty() {
         s += &format!(" SCHEDULE {}", literal(&t.schedule));

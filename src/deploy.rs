@@ -23,6 +23,7 @@
 //! - **One owner per object**: a deploy refuses to change an object another project's deploy made.
 //!   In a branch, the tasks a deploy makes start suspended, as the branch's own did (ADR-047 §3).
 
+use crate::objects::{ident, materialized_sql, name_sql as quoted, routine_sql, sql_type, table_sql, task_sql}; // (`SHOW CREATE`'s statements: an export reads as it does)
 use crate::routines::{Outcome, Who};
 use crate::server::App;
 use crate::store::{json, Lake, TableMeta};
@@ -347,18 +348,6 @@ fn mentions(sql: &str, name: &str) -> bool {
     if s == crate::ddl::PUBLIC { whole(t) } else { whole(&format!("{s}.{t}")) }
 }
 
-/// A name as SQL writes it: each part bare when it can be, quoted when it must.
-fn quoted(name: &str) -> String { name.split('.').map(ident).collect::<Vec<_>>().join(".") }
-
-fn ident(part: &str) -> String {
-    use datafusion::sql::sqlparser::keywords::{RESERVED_FOR_COLUMN_ALIAS, RESERVED_FOR_TABLE_ALIAS};
-    let simple = part.starts_with(|c: char| c.is_ascii_lowercase() || c == '_') && part.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
-    let upper = part.to_uppercase();
-    let reserved = RESERVED_FOR_COLUMN_ALIAS.iter().chain(RESERVED_FOR_TABLE_ALIAS).any(|k| format!("{k:?}") == upper)
-        || ["USER", "TABLE", "DEFAULT", "CHECK", "PRIMARY", "KEY", "CREATE", "COLUMN", "CONSTRAINT", "UNIQUE", "NOT", "NULL", "ALL", "AND", "OR", "AS", "CASE", "WHEN", "THEN", "ELSE", "END", "IN", "IS", "TRUE", "FALSE", "TO", "WITH"].contains(&upper.as_str());
-    if simple && !reserved { part.to_string() } else { format!("\"{}\"", part.replace('"', "\"\"")) }
-}
-
 /// `GRANT … TO r` → `REVOKE … FROM r`.
 fn revoke(sql: &str) -> String {
     let at = sql.to_lowercase().rfind(" to ").unwrap_or(sql.len());
@@ -391,11 +380,11 @@ async fn current(lake: &Lake) -> Result<BTreeMap<String, Current>> {
             continue;
         }
         let m = meta.logical();
-        put(Kind::Table, name, table_sql(name, &m), Some(m));
+        put(Kind::Table, name, table_sql(&quoted(name), &m), Some(m));
     }
     for (name, v) in &materialized {
         let meta = lake.cat.get::<TableMeta>(&crate::store::table_key(name)).await?;
-        put(Kind::Materialized, name, materialized_sql(name, v, meta.as_ref()), None);
+        put(Kind::Materialized, name, materialized_sql(&quoted(name), v, meta.as_ref()), None);
     }
     for (k, v) in lake.cat.scan::<crate::ddl::StoredView>("q/", "q0").await? {
         let name = &k[2..];
@@ -407,10 +396,10 @@ async fn current(lake: &Lake) -> Result<BTreeMap<String, Current>> {
             "macro" => Kind::Macro,
             _ => Kind::Function,
         };
-        put(kind, name, routine_sql(name, r), None);
+        put(kind, name, routine_sql(&quoted(name), r), None);
     }
     for (name, t) in crate::runs::tasks(lake).await?.iter() {
-        put(Kind::Task, name, task_sql(name, t), None);
+        put(Kind::Task, name, task_sql(&quoted(name), t), None);
     }
     for (k, u) in lake.cat.scan::<crate::users::User>("u/", "u0").await? {
         let name = &k[2..];
@@ -445,195 +434,7 @@ async fn grants(lake: &Lake) -> Result<Vec<String>> {
     Ok(out)
 }
 
-/// A column type as SQL writes it.
-fn sql_type(stored: &str) -> String {
-    use datafusion::arrow::datatypes::DataType::*;
-    let Ok(t) = crate::query::dtype(stored) else { return stored.to_string() };
-    fn of(t: &datafusion::arrow::datatypes::DataType, stored: &str) -> String {
-        match t {
-            Int8 => "TINYINT".into(),
-            Int16 => "SMALLINT".into(),
-            Int32 => "INT".into(),
-            Int64 => "BIGINT".into(),
-            UInt8 => "TINYINT UNSIGNED".into(),
-            UInt16 => "SMALLINT UNSIGNED".into(),
-            UInt32 => "INT UNSIGNED".into(),
-            UInt64 => "BIGINT UNSIGNED".into(),
-            Float32 => "REAL".into(),
-            Float64 => "DOUBLE".into(),
-            Utf8 | LargeUtf8 | Utf8View => "VARCHAR".into(),
-            Boolean => "BOOLEAN".into(),
-            Date32 | Date64 => "DATE".into(),
-            Timestamp(_, None) => "TIMESTAMP".into(),
-            Timestamp(_, Some(_)) => "TIMESTAMPTZ".into(),
-            Time32(_) | Time64(_) => "TIME".into(),
-            Decimal128(p, s) | Decimal256(p, s) => format!("DECIMAL({p}, {s})"),
-            Binary | LargeBinary | BinaryView | FixedSizeBinary(_) => "BYTEA".into(),
-            Interval(_) | Duration(_) => "INTERVAL".into(),
-            List(f) | LargeList(f) | FixedSizeList(f, _) => format!("{}[]", of(f.data_type(), stored)),
-            _ => stored.to_string(),
-        }
-    }
-    of(&t, stored)
-}
-
 fn text(s: &str) -> String { format!("'{}'", s.replace('\'', "''")) }
-
-/// How long, as Pondra reads it: '7 days', '2 hours'.
-fn duration(secs: u64) -> String {
-    match secs {
-        s if s > 0 && s % 86400 == 0 => format!("{} days", s / 86400),
-        s if s > 0 && s % 3600 == 0 => format!("{} hours", s / 3600),
-        s if s > 0 && s % 60 == 0 => format!("{} minutes", s / 60),
-        s => format!("{s} seconds"),
-    }
-}
-
-/// A table's `CREATE TABLE`, from what the catalog says of it (the console's Script as, here).
-fn table_sql(name: &str, m: &TableMeta) -> String {
-    let key = &m.key;
-    let mut lines: Vec<String> = m.columns.iter().filter(|(c, _)| !crate::sys::NAMES.contains(&c.as_str()) && c != "_deleted").map(|(c, t)| {
-        let not_null = if m.not_null.contains(c) && !key.contains(c) { " NOT NULL" } else { "" };
-        let default = m.defaults.get(c).map(|d| format!(" DEFAULT {d}")).unwrap_or_default();
-        format!("  {} {}{not_null}{default}", ident(c), sql_type(t))
-    }).collect();
-    if !key.is_empty() {
-        lines.push(format!("  PRIMARY KEY ({})", key.iter().map(|k| ident(k)).collect::<Vec<_>>().join(", ")));
-    }
-    for (n, c) in &m.checks {
-        lines.push(format!("  CONSTRAINT {} CHECK ({c})", ident(n)));
-    }
-    let mut with = vec![];
-    if let Some(p) = &m.partition {
-        with.push(format!("partition_by = {}", text(p)));
-    }
-    if !m.cluster.is_empty() {
-        with.push(format!("cluster_by = {}", text(&m.cluster.join(", "))));
-    }
-    if m.publish != crate::store::default_publish() {
-        with.push(format!("publish = {}", text(&m.publish.join(","))));
-    }
-    if let Some((c, s)) = &m.ttl {
-        with.push(format!("ttl = {}", text(&format!("{c}:{s}"))));
-    }
-    if let Some(o) = &m.order {
-        with.push(format!("order_by = {}", text(o)));
-    }
-    if !m.merge.is_empty() {
-        with.push(format!("merge = {}", text(&m.merge.iter().map(|(c, f)| format!("{c}:{f}")).collect::<Vec<_>>().join(", "))));
-    }
-    if let Some(r) = m.retention_secs {
-        with.push(format!("retention = {}", text(&duration(r))));
-    }
-    with.extend(m.properties.iter().map(|(k, v)| format!("\"{k}\" = {}", text(v))));
-    let with = if with.is_empty() { String::new() } else { format!(" WITH ({})", with.join(", ")) };
-    format!("CREATE TABLE {} (\n{}\n){with}", quoted(name), lines.join(",\n"))
-}
-
-fn materialized_sql(name: &str, v: &crate::views::View, meta: Option<&TableMeta>) -> String {
-    let mut with: Vec<String> = vec![];
-    if let Some(e) = &v.emit {
-        with.push(format!("window = {}, size_secs = {}", text(&e.window), e.size_secs));
-        if let Some(s) = e.slide_secs {
-            with.push(format!("slide_secs = {s}"));
-        }
-        if e.lateness_secs > 0 {
-            with.push(format!("lateness_secs = {}", e.lateness_secs));
-        }
-    }
-    if let Some(s) = &v.sessions {
-        with.push(format!("session = {}, gap_secs = {}", text(&s.time), s.gap_secs));
-        if s.lateness_secs > 0 {
-            with.push(format!("lateness_secs = {}", s.lateness_secs));
-        }
-    }
-    if let Some(jn) = &v.join {
-        with.push("join = 'streams'".into());
-        if !jn.time.is_empty() {
-            with.push(format!("time = {}", text(&jn.time.join(", "))));
-        }
-        if let Some(w) = jn.within_secs {
-            with.push(format!("within_secs = {w}"));
-        }
-    }
-    if !v.expect.is_empty() {
-        with.push(format!("expect = {}", text(&serde_json::to_string(&v.expect).unwrap_or_default())));
-    }
-    if let Some(h) = meta.and_then(|m| m.history.as_ref()) {
-        with.push(format!("history = {}, sequence_by = {}", text(&h.key.join(", ")), text(&h.sequence_by)));
-    }
-    let with = if with.is_empty() { String::new() } else { format!(" WITH ({})", with.join(", ")) };
-    format!("CREATE MATERIALIZED VIEW {}{with} AS\n{}", quoted(name), v.sql.trim())
-}
-
-fn routine_sql(name: &str, r: &crate::routines::Routine) -> String {
-    let params = r.params.iter().map(|p| {
-        let n = if p.name.chars().all(|c| c.is_ascii_digit()) { String::new() } else { format!("{} ", ident(&p.name)) };
-        let default = p.default.as_ref().map(|d| format!(" DEFAULT {d}")).unwrap_or_default();
-        match &p.ty {
-            Some(t) => format!("{n}{t}{default}"),
-            None => format!("{}{default}", n.trim_end()),
-        }
-    }).collect::<Vec<_>>().join(", ");
-    let body = |b: &str| {
-        let tag = (0..).map(|i| if i == 0 { "$$".to_string() } else { format!("$b{i}$") }).find(|t| !b.contains(t.as_str())).unwrap_or_default();
-        format!("{tag}\n{}\n{tag}", b.trim_matches('\n'))
-    };
-    let o = &r.with;
-    let mut with = vec![];
-    if o.strict {
-        with.push("strict = true".to_string());
-    }
-    if let Some(v) = &o.volatility {
-        with.push(format!("volatility = {v}"));
-    }
-    if o.vectorized {
-        with.push("vectorized = true".into());
-    }
-    if !o.packages.is_empty() {
-        with.push(format!("packages = {}", text(&o.packages)));
-    }
-    if !o.entry.is_empty() {
-        with.push(format!("entry = {}", text(&o.entry)));
-    }
-    if let Some(t) = o.timeout {
-        with.push(format!("timeout = {t}"));
-    }
-    if let Some(c) = o.cache {
-        with.push(format!("cache = {}", text(&duration(c))));
-    }
-    let with = if with.is_empty() { String::new() } else { format!(" WITH ({})", with.join(", ")) };
-    match r.what() {
-        "macro" if r.kind == crate::routines::Kind::Table => format!("CREATE MACRO {}({params}) AS TABLE {}", quoted(name), r.body.trim()),
-        "macro" => format!("CREATE MACRO {}({params}) AS {}", quoted(name), r.body.trim()),
-        "procedure" => format!("CREATE PROCEDURE {}({params}) LANGUAGE {}{with} AS {}", quoted(name), r.language, body(&r.body)),
-        _ => format!("CREATE FUNCTION {}({params}) RETURNS {} LANGUAGE {}{with} AS {}", quoted(name), r.returns.as_deref().unwrap_or("VARCHAR"), r.language, body(&r.body)),
-    }
-}
-
-fn task_sql(name: &str, t: &crate::runs::Task) -> String {
-    let when = match t.after.is_empty() {
-        true => format!("SCHEDULE {}", text(&t.schedule)),
-        false => format!("AFTER {}", t.after.iter().map(|a| quoted(a)).collect::<Vec<_>>().join(", ")),
-    };
-    let cond = t.when.as_ref().map(|w| format!(" WHEN {w}")).unwrap_or_default();
-    let o = &t.with;
-    let mut with = vec![];
-    if o.retries > 0 {
-        with.push(format!("retries = {}", o.retries));
-    }
-    if let Some(d) = o.retry_delay {
-        with.push(format!("retry_delay = {}", text(&duration(d))));
-    }
-    if let Some(s) = o.timeout {
-        with.push(format!("timeout = {}", text(&duration(s))));
-    }
-    if let Some(p) = &o.on_failure {
-        with.push(format!("on_failure = {}", quoted(p)));
-    }
-    let with = if with.is_empty() { String::new() } else { format!(" WITH ({})", with.join(", ")) };
-    format!("CREATE TASK {} {when}{cond}{with} AS\n{}", quoted(name), t.sql.trim())
-}
 
 /// The lake's objects as a project's files (`pondra export`): `pondra.toml`, a file per schema's
 /// object under `objects/`, roles and their grants in `objects/access.sql`. Secrets stay out (their
