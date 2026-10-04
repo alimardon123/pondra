@@ -26,6 +26,19 @@ spread over three nodes, over Postgres and in views. 69 of the 73 everyday featu
 2026-10-03 now work; the four left (`CREATE TYPE … AS ENUM`, `CREATE SEQUENCE`, `CREATE INDEX`,
 `COMMENT ON`) wait on the SQL registry's decision.
 
+**100,000 random queries** (`tools/random_sql.py --seed 3434`, D2): each against DuckDB 1.5.5 on
+one node, every tenth spread over three, 42,826 split three ways by a condition. The first run
+found two wrong answers, both DataFusion 55's: two IN lists of one column intersected as sets of
+values (`x IN (x, '') AND x IN ('abc', 'a')` became false), and `x NOT IN (NULL)` dropped beside
+another list; and three refusals: `- -3` written back as a comment, a DISTINCT over a CASE failing
+DataFusion's schema check, and a projection pushed through a filter with the wrong columns (it
+could have swapped two columns of one name and type). All five are fixed (invariant 226,
+`harness.py friendly`). Run again: 99,974 agree, no wrong answer, every spread answer the same as
+one node's; the 26 left are refusals DataFusion makes and DuckDB doesn't (`NULL || NULL`, as
+Postgres, and two decimal types too wide) (`logs/round34/random-100k.json`). **TPC-DS on three
+nodes**: 99 of 99 the same as one node, all spread (q66 and q75 had fallen back over an
+aggregate's `ordering_mode`: invariant 34).
+
 **Now (2026-10-03, round 33, toward 0.33.0): run it for years.**
 
 1. **Every statement remembered** (ADR-048, `history.rs`): `SELECT * FROM pondra.history` has a row
