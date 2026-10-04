@@ -114,10 +114,21 @@ pub async fn local<F: std::future::Future>(f: F) -> F::Output { OWN.scope(Vars::
 
 /// A copy of the variables in force, for work that runs beside its script (`PARALLEL`, `ASYNC`):
 /// what it sets stays its own.
-pub fn snapshot() -> Vars { Arc::new(Mutex::new(vars(|m| m.clone()).unwrap_or_default())) }
+pub fn snapshot() -> Apart {
+    let given = GIVEN.try_with(|g| Arc::new(Mutex::new(g.lock().unwrap().clone()))).ok();
+    Apart { own: Arc::new(Mutex::new(vars(|m| m.clone()).unwrap_or_default())), given }
+}
 
-/// Run `f` with `own` as its variables (a `snapshot`).
-pub async fn with_own<F: std::future::Future>(own: Vars, f: F) -> F::Output { OWN.scope(own, f).await }
+/// A copy of the variables and of the run's given values, for what runs beside the rest (a
+/// `PARALLEL` pass, an `ASYNC` statement): what it sets, or takes of the given values, stays its
+/// own. (Sharing the given values, the first pass to set `$n` took it from all the others.)
+pub struct Apart {
+    pub own: Vars,
+    given: Option<Given>,
+}
+
+/// Run `f` with a `snapshot` as its variables and given values.
+pub async fn with_own<F: std::future::Future>(a: Apart, f: F) -> F::Output { within(Some(Lent(Some(a.own), a.given)), f).await }
 
 /// A variable's value now (a block keeps it, to put back when it ends: `script.rs`).
 pub fn get(name: &str) -> Option<Var> { vars(|m| m.get(name).cloned()).ok().flatten() }
@@ -353,14 +364,11 @@ async fn type_of(app: &App, default: &str) -> Option<String> {
 fn var_of(row: &RecordBatch) -> Result<Var> {
     use datafusion::arrow::util::display::{ArrayFormatter, FormatOptions};
     let col = row.column(0);
-    let ty = col.data_type();
-    ensure!(!ty.is_nested(), "a variable holds one value (a number, a string, a date, …), not a {ty}");
     let shown = match col.is_null(0) {
         true => None,
         false => Some(ArrayFormatter::try_new(col.as_ref(), &FormatOptions::default())?.value(0).to_string()),
     };
-    let text = shown.as_ref().map_or("NULL".to_string(), |s| format!("'{}'", s.replace('\'', "''")));
-    Ok(Var { sql: format!("arrow_cast({text}, '{ty}')"), shown, ty: ty.to_string(), declared: None })
+    Ok(Var { sql: crate::routines::exact(col.as_ref(), 0)?, shown, ty: col.data_type().to_string(), declared: None })
 }
 
 /// The variables there are now, given values not yet set among them: (name, value, type, declared).

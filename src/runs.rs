@@ -76,8 +76,19 @@ struct Line {
     error: Option<String>,
 }
 
-/// A call being logged: its line, written as it starts and again as it ends.
-pub struct Run(Line);
+/// A call being logged: its line, written as it starts and again as it ends; one dropped before it
+/// ended (its caller went, its task's time ran out) ends as `stopped`, never `running` for good.
+pub struct Run(Option<(App, Line)>);
+
+impl Drop for Run {
+    fn drop(&mut self) {
+        if let Some((app, mut line)) = self.0.take() {
+            (line.ended, line.status) = (Some(now_ms()), "stopped");
+            line.error = Some("it stopped before it ended: its caller went, or its time ran out".into());
+            log(&app, line, None);
+        }
+    }
+}
 
 impl Run {
     pub fn start(app: &App, routine: &str, role: Role, job: Option<&str>, args: &RecordBatch, id: Option<String>) -> Run {
@@ -89,7 +100,7 @@ impl Run {
         let caller = CALLER.try_with(|c| c.clone()).unwrap_or_else(|_| format!("{role:?}").to_lowercase());
         let line = Line { id: id.unwrap_or_else(new_id), routine: routine.into(), caller, node: app.cluster.addr.clone(), job: job.map(String::from), args: cut(args), started: now_ms(), ended: None, status: "running", notices: None, error: None };
         log(app, line.clone(), None);
-        Run(line)
+        Run(Some((app.clone(), line)))
     }
 
     /// The call's line, ended; the answer says when it is in the log (a task waits for it before
@@ -99,8 +110,8 @@ impl Run {
     }
 
     /// The call's line, ended as `status` says (a task's run may be `skipped`).
-    fn ended(self, app: &App, status: &'static str, error: Option<String>, notices: Vec<String>) -> tokio::sync::oneshot::Receiver<()> {
-        let mut line = self.0;
+    fn ended(mut self, app: &App, status: &'static str, error: Option<String>, notices: Vec<String>) -> tokio::sync::oneshot::Receiver<()> {
+        let (_, mut line) = self.0.take().expect("a run ends once");
         (line.ended, line.status) = (Some(now_ms()), status);
         line.error = error.map(cut);
         line.notices = (!notices.is_empty()).then(|| cut(notices.join("\n")));
@@ -243,30 +254,66 @@ async fn append(app: &App, producer: &str, seq: u64, lines: &[Line], made: &mut 
 
 /// Runs whose node stopped under them (killed, restarted, gone from the cluster) are marked
 /// `stopped`, so none says `running` for good: each node marks its own address's from before it
-/// started, once it serves; the leader, every 30 s, those of nodes that left the cluster a minute
-/// ago or more. (A run that ends after all writes its row again: the newest row is its row.)
+/// started, once it serves; a leader, those of every node not in the cluster when it starts to lead,
+/// then those of each node it sees leave, once it has been gone a minute. (So the log is read when a
+/// node goes, not every 30 s: a month of a task every second is millions of rows. A run that ends
+/// after all writes its row again: the newest row is its row.)
 pub fn mark_stopped(app: App) {
     crate::panics::spawn(async move {
         let since = now_ms();
-        for round in 0.. {
-            if round == 0 || app.cluster.is_leader() {
-                if let Err(e) = stopped(&app, since, round == 0).await {
-                    eprintln!("runs whose node stopped: {e:#}");
+        if let Err(e) = stopped(&app, since, Some(&app.cluster.addr)).await {
+            eprintln!("runs whose node stopped: {e:#}");
+        }
+        // (`left`: nodes gone, and since when; each is asked about once it's been gone a minute, and
+        // again while it has runs too new to tell from one just begun)
+        let (mut led, mut seen, mut left) = (false, HashSet::new(), HashMap::<String, u64>::new());
+        loop {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            if !app.cluster.is_leader() {
+                (led, seen, left) = (false, HashSet::new(), HashMap::new());
+                continue;
+            }
+            let live: HashSet<String> = app.cluster.nodes().into_iter().collect();
+            for n in seen.difference(&live) {
+                left.entry(n.clone()).or_insert_with(now_ms);
+            }
+            left.retain(|n, _| !live.contains(n));
+            seen = live;
+            let asked: Vec<Option<String>> = match led {
+                false => vec![None],
+                true => left.iter().filter(|(_, at)| now_ms().saturating_sub(**at) >= 60_000).map(|(n, _)| Some(n.clone())).collect(),
+            };
+            for whose in asked {
+                match stopped(&app, since, whose.as_deref()).await {
+                    Ok(newer) => {
+                        led = true;
+                        if let Some(n) = &whose {
+                            left.remove(n);
+                        }
+                        for n in newer {
+                            left.entry(n).or_insert_with(now_ms);
+                        }
+                    }
+                    Err(e) => eprintln!("runs whose node stopped: {e:#}"),
                 }
             }
-            tokio::time::sleep(Duration::from_secs(30)).await;
         }
     });
 }
 
-async fn stopped(app: &App, since: u64, own_only: bool) -> Result<()> {
+/// Mark the runs still `running` of `whose` (this node's own: those from before it started), or of
+/// every node not in the cluster, as stopped; the nodes gone with runs begun under a minute ago,
+/// left for later.
+async fn stopped(app: &App, since: u64, whose: Option<&str>) -> Result<HashSet<String>> {
     use datafusion::arrow::array::{Array, AsArray};
     use datafusion::arrow::datatypes::TimestampMicrosecondType;
+    let mut newer = HashSet::new();
     if app.log.is_none() {
-        return Ok(()); // (a read-only node writes nothing)
+        return Ok(newer); // (a read-only node writes nothing)
     }
     let live = app.cluster.nodes();
-    let batches = app.query("SELECT id, routine, caller, node, job, args, started FROM pondra.runs WHERE status = 'running'", None).await?;
+    let only = whose.map(|n| format!(" AND node = '{}'", n.replace('\'', "''"))).unwrap_or_default();
+    let batches = app.query(&format!("SELECT id, routine, caller, node, job, args, started FROM pondra.runs WHERE status = 'running'{only}"), None).await?;
     for b in &batches {
         let text = |i: usize| datafusion::arrow::compute::cast(b.column(i), &datafusion::arrow::datatypes::DataType::Utf8);
         let (id, routine, caller, node, job, args) = (text(0)?, text(1)?, text(2)?, text(3)?, text(4)?, text(5)?);
@@ -276,7 +323,14 @@ async fn stopped(app: &App, since: u64, own_only: bool) -> Result<()> {
             let (at, by) = ((started.value(r) / 1000) as u64, node.value(r));
             let gone = match by == app.cluster.addr {
                 true => at < since, // (this address's, from before this node started)
-                false => !own_only && !live.iter().any(|n| n == by) && now_ms().saturating_sub(at) > 60_000,
+                false if live.iter().any(|n| n == by) => false,
+                false => {
+                    let old = now_ms().saturating_sub(at) > 60_000; // (else maybe a node just come, not yet heard)
+                    if !old {
+                        newer.insert(by.to_string());
+                    }
+                    old
+                }
             };
             if gone {
                 let why = format!("its node, {by}, stopped while it ran");
@@ -285,7 +339,7 @@ async fn stopped(app: &App, since: u64, own_only: bool) -> Result<()> {
             }
         }
     }
-    Ok(())
+    Ok(newer)
 }
 
 // ---------------------------------------------------------------- tasks
@@ -370,7 +424,8 @@ pub fn task(p: &mut Parser, sql: &str) -> Result<(String, Task)> {
     if crate::routines::word(p, "schedule") {
         let _ = p.consume_token(&Token::Eq);
         task.schedule = crate::routines::text_of(p)?.context("the schedule is a string: SCHEDULE '5 minutes'")?;
-        every(&task.schedule)?;
+        let e = every(&task.schedule)?;
+        ensure!(next_after(&e, now_ms()) != u64::MAX, "{:?} never comes: no day in the next 25 years has it", task.schedule);
     } else if crate::routines::word(p, "after") {
         loop {
             task.after.push(crate::write::object(&p.parse_object_name(false)?));
@@ -601,15 +656,26 @@ pub fn schedule(app: App) {
                     }
                 };
                 running.lock().unwrap().insert(name.clone());
-                let (app, name, task, running) = (app.clone(), name.clone(), task.clone(), running.clone());
+                let (app, name, task) = (app.clone(), name.clone(), task.clone());
+                let ran = Ran(running.clone(), name.clone()); // (let go even if the tick panics: else it never ran again here)
                 tokio::spawn(async move {
                     run_tick(&app, &name, &task, tick).await;
-                    running.lock().unwrap().remove(&name);
-                    WAKE.notify_one(); // (what follows it)
+                    drop(ran);
                 });
             }
         }
     });
+}
+
+/// A task's tick running on this leader: when it ends, however it ends, the task may run again
+/// and what follows it is looked at.
+struct Ran(Arc<Mutex<HashSet<String>>>, String);
+
+impl Drop for Ran {
+    fn drop(&mut self) {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.1);
+        WAKE.notify_one(); // (what follows it)
+    }
 }
 
 /// Run a task's tick: `WHEN`, then what it runs, with its graph's values and the results of the
@@ -769,8 +835,10 @@ pub fn every(text: &str) -> Result<Every> {
         "day" | "d" => 86400,
         u => bail!("a schedule is '5 minutes', '30 seconds', '1 hour' or 'cron 0 2 * * * UTC', not {u:?}"),
     };
-    ensure!(n > 0, "a schedule's interval is at least a second");
-    Ok(Every::Seconds(n * secs))
+    // (at most a hundred years: the scheduler counts in milliseconds, and an interval that wrapped
+    // around to 0 divided by zero in the leader's own loop, which stops the node)
+    let secs = n.checked_mul(secs).filter(|s| (1..=100 * 365 * 86400).contains(s));
+    Ok(Every::Seconds(secs.with_context(|| format!("a schedule's interval is from a second to a hundred years, not {text:?}"))?))
 }
 
 /// A cron expression's five fields, as the minutes, hours, days, months and weekdays it takes.
@@ -841,7 +909,7 @@ pub fn next_after(e: &Every, t: u64) -> u64 {
         Every::Seconds(s) => (t / (s * 1000) + 1) * s * 1000,
         Every::Cron(c, tz) => {
             let mut at = (t / 60_000 + 1) * 60_000;
-            for _ in 0..600_000 {
+            for _ in 0..10_000 { // (a day a turn when the day isn't one: 25 years; February 29th's gap is 8)
                 let local = tz.timestamp_millis_opt(at as i64).single().expect("a moment is one local time");
                 let (h, m) = (local.hour() as u64, local.minute() as u64);
                 at += if !c.day(&local) {
@@ -1000,5 +1068,21 @@ mod tests {
         assert_eq!((o.retries, o.retry_delay, o.timeout, o.on_failure.as_deref()), (2, Some(60), Some(90), Some("notify")));
         assert!(opts("(tries = 2)").unwrap_err().to_string().contains("retries, retry_delay"));
         assert!(opts("(timeout = 'cron 0 2 * * *')").unwrap_err().to_string().contains("how long"));
+    }
+
+    #[test]
+    fn schedules() {
+        let secs = |t: &str| match every(t) { Ok(Every::Seconds(s)) => Ok(s), Ok(_) => Err("a cron".to_string()), Err(e) => Err(e.to_string()) };
+        assert_eq!(secs("5 minutes"), Ok(300));
+        assert_eq!(secs("every 30 seconds"), Ok(30));
+        // (4611686018427387904 minutes wrapped around to 0 seconds: the leader's loop divided by it)
+        for t in ["4611686018427387904 minutes", "0 seconds", "200000000 days", "18446744073709551615 hours"] {
+            assert!(secs(t).unwrap_err().contains("a hundred years"), "{t}");
+        }
+        let never = every("cron 0 0 30 2 * UTC").unwrap();
+        assert_eq!(next_after(&never, 0), u64::MAX);
+        let leap = every("cron 0 0 29 2 *").unwrap(); // (from 2097: 2100 is no leap year, so 2104)
+        assert_eq!(next_after(&leap, 4_013_000_000_000), 4_233_686_400_000);
+        assert_eq!(latest(&never, 0, 4_000_000_000_000), None);
     }
 }

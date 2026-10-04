@@ -3162,6 +3162,25 @@ def procedures():
     q("INSERT INTO orders VALUES (300001, 'u1', 1, 2.0)")
     checks["a stored view reads macros as they are now"] = q("SELECT p FROM priced ORDER BY id") == q("SELECT price * 100 AS p FROM orders WHERE id <= 3 ORDER BY id")
     checks["a materialized view keeps them as they were made"] = until(lambda: q("SELECT p FROM priced_live"), [{"p": 1.6}], secs=20) == [{"p": 1.6}]
+    # A function's argument is the caller's value: a column it names is the caller's, never the
+    # same-named one of a table the body reads (refused by name when only an alias could tell them apart).
+    q("CREATE MACRO same_qty(w) AS (SELECT count(*) FROM orders WHERE qty = w)")
+    checks["a function's argument names the caller's column, not the body's table's of that name; refused by name when the tables share a name"] = \
+        q("SELECT o.id, same_qty(qty) AS n FROM orders o WHERE o.id IN (1, 2, 6) ORDER BY o.id") == q("SELECT o.id, (SELECT count(*) FROM orders i WHERE i.qty = o.qty) AS n FROM orders o WHERE o.id IN (1, 2, 6) ORDER BY o.id") \
+        and "reads orders too" in err("SELECT id, same_qty(qty) AS n FROM orders WHERE id = 1")
+    # A function made of functions reads them as they are now; one written out past 100,000
+    # expressions (four calls, ten deep) is refused, not planned.
+    q("CREATE MACRO base(x) AS x * 2")
+    q("CREATE FUNCTION wrapped(x BIGINT) RETURNS BIGINT LANGUAGE sql RETURN base(x) + 1")
+    q("CREATE OR REPLACE MACRO base(x) AS x * 3")
+    q("CREATE MACRO e0(x) AS x + 1")
+    for i in range(1, 11):
+        q(f"CREATE MACRO e{i}(x) AS e{i - 1}(x) + e{i - 1}(x) + e{i - 1}(x) + e{i - 1}(x)")
+    q("CREATE MACRO quad(x) AS x || x || x || x")
+    nested = lambda k: "quad(" * k + "'" + "z" * 100 + "'" + ")" * k
+    checks["a function made of functions reads them as they are now; one past 100,000 expressions written out, or copying its arguments past 1 MB, is refused, the node up"] = \
+        q("SELECT wrapped(1) AS v") == [{"v": 4}] and "100000 expressions" in err("SELECT e10(1) AS v") and q("SELECT e2(1) AS v") == [{"v": 32}] \
+        and "over 1 MB" in err(f"SELECT {nested(8)} AS v") and q(f"SELECT length({nested(3)}) AS n") == [{"n": 6400}]
     # SQL procedures
     q("CREATE TABLE log (x DOUBLE, tag VARCHAR)")
     q("""CREATE PROCEDURE twice(x DOUBLE, tag VARCHAR DEFAULT 'none') LANGUAGE sql AS $$
@@ -3435,6 +3454,15 @@ $$""")
     a, b = q("SELECT clock() AS t"), (time.sleep(0.01), q("SELECT clock() AS t"))[1]
     c, d = q("SELECT clock_fixed() AS t"), (time.sleep(0.01), q("SELECT clock_fixed() AS t"))[1]
     checks["a volatile Python function isn't answered from the result cache (an IMMUTABLE one is)"] = a != b and c == d
+    # …nor through a view: what a view reads counts as the query's (now() in one too), and a view of a
+    # Python table function runs on one node.
+    q("CREATE VIEW clocked AS SELECT clock() AS t")
+    q("CREATE VIEW stamped AS SELECT now() AS t")
+    q("CREATE VIEW pids AS SELECT * FROM where_()")
+    e, f = q("SELECT t FROM clocked"), (time.sleep(0.01), q("SELECT t FROM clocked"))[1]
+    g, h = q("SELECT t FROM stamped"), (time.sleep(0.01), q("SELECT t FROM stamped"))[1]
+    checks["…nor through a view (one of now() neither); a view of a Python table function runs on one node"] = e != f and g != h \
+        and q("SELECT DISTINCT w.pid FROM orders o CROSS JOIN pids w", path="/sql?spread=1") == [{"pid": nodes[0].p.pid}]
     q("CREATE FUNCTION peek(x BIGINT) RETURNS BIGINT LANGUAGE python AS $$ return pondra.sql('SELECT 1 AS v').item() $$")
     checks["a function has no connection to the lake"] = "has no connection" in err("SELECT peek(1) AS v")
     q("CREATE FUNCTION nap(x BIGINT) RETURNS BIGINT LANGUAGE python WITH (timeout = 1, vectorized = true) AS $$ import time; time.sleep(30); return x $$")
@@ -3541,6 +3569,31 @@ $$""")
     q("CREATE PROCEDURE deep(n BIGINT) LANGUAGE python AS $$ pondra.call('deep', n + 1) $$")
     t0 = time.time()
     checks["procedures calling procedures take no slot of their own (two here): 16 deep, not stuck"] = "16 deep" in err("CALL deep(0)", timeout=90) and time.time() - t0 < 60
+    # Odd values and odd workers.
+    checks["a timeout past a week (1e20 s) is refused by name; the node stays up"] = \
+        "at most a week" in err("CREATE FUNCTION forever(x BIGINT) RETURNS BIGINT LANGUAGE python WITH (timeout = 1e20) AS $$ return x $$") \
+        and call(A.port, "GET", "/stats")["role"] == "leader"
+    q("CREATE FUNCTION kind(x) RETURNS VARCHAR LANGUAGE python WITH (cache = '10 minutes') AS $$ return type(x).__name__ $$")
+    checks["a kept answer is for the same arguments at the same types: a DATE, then the INT of its bytes"] = \
+        q("SELECT kind(DATE '1970-01-06') AS k") == [{"k": "date"}] and q("SELECT kind(CAST(5 AS INT)) AS k") == [{"k": "int"}]
+    q("CREATE PROCEDURE shapes(b BYTEA, l BIGINT[]) LANGUAGE sql AS $$ SELECT encode($b, 'hex') AS hex, cardinality($l) AS n, $l AS l $$")
+    checks["a procedure's BYTEA and list arguments arrive as they were (bytes, not their hex's text)"] = \
+        q("CALL shapes(X'DEADBEEF', [1, 2, NULL])") == [{"hex": "deadbeef", "n": 3, "l": [1, 2, None]}]
+    q("CREATE PROCEDURE noisy() LANGUAGE python AS $$\nimport os\nos.write(2, b'\\xff\\xfe not UTF-8\\n' + b'x' * 300000 + b'\\n' + b'y' * 300000)\nprint('said')\n$$")
+    def noisy():
+        try:
+            c = http.client.HTTPConnection("127.0.0.1", A.port, timeout=30)
+            c.request("POST", "/sql", b"CALL noisy()", {"authorization": "Bearer a-tok"})
+            r = c.getresponse()
+            return r.status, json.loads(r.getheader("x-pondra-notices") or "[]"), r.read() and None
+        except Exception as e:
+            return str(e)
+    checks["a worker writing bytes that aren't UTF-8 and 300 KB lines to its standard error answers, again and again"] = [noisy() for _ in range(3)] == [(200, ["said"], None)] * 3
+    gone = {"x-pondra-session": "harness-gone"}
+    q("DO LANGUAGE python $$ x = 1 $$", headers=gone)
+    err("DO LANGUAGE python $$ import os; os._exit(3) $$", headers=gone)
+    checks["a session's worker gone, an interrupt reaches nothing (its process id, which another process may get next, forgotten)"] = \
+        q(b"", path="/sessions/harness-gone/python") == {"done": "none"}
     # a notebook's functions, as they are
     nb = os.path.join(tempfile.mkdtemp(prefix="pondra-nb-"), "notebook.py")
     open(nb, "w").write(f"""import re, sys, json
@@ -5961,7 +6014,8 @@ def stopped():
     """A run whose node stopped under it (round 29 part 3): a procedure started without waiting
     (pondra.start) is `running` in pondra.runs; the node is killed (-9) and started again at the
     same address; the run is then `stopped`, saying whose node, not `running` for good. A run on
-    a node still up is left alone."""
+    a node still up is left alone. A follower killed for good: the leader marks its run once the
+    node has been gone a minute."""
     here = os.path.dirname(os.path.abspath(__file__))
     env = {"PYTHONPATH": os.path.join(here, "..", "python")}
     lake = new_lake()
@@ -5977,11 +6031,47 @@ def stopped():
     short_run = sql(A.port, "SELECT pondra.start('slow', 3.0) AS run")[0]["run"]
     mid = until(lambda: status(short_run).get("status"), "running", 30)
     done = until(lambda: status(short_run).get("status"), "ok", 60)
+    # A follower killed for good: the leader marks its run once it has been gone a minute (it reads
+    # the log when a node leaves, not every 30 s).
+    other = Node(lake, A.port + 1, env=env, python=sys.executable).start()
+    until(lambda: len(call(A.port, "GET", "/stats")["nodes"]), 2, 30)
+    gone_run = sql(A.port + 1, "SELECT pondra.start('slow', 600.0) AS run")[0]["run"]
+    gone_running = until(lambda: status(gone_run).get("status"), "running", 30)
+    other.kill()
+    t0 = time.time()
+    gone_after = until(lambda: status(gone_run).get("status"), "stopped", 180)
+    gone_secs, gone_said = round(time.time() - t0, 1), status(gone_run).get("error") or ""
+    # A call whose caller went (its client gave up, a task's time ran out): stopped, not running for
+    # good, and a file run's Python stops with it, not after an hour idle.
+    def gave_up(s):
+        c = http.client.HTTPConnection("127.0.0.1", A.port, timeout=3)
+        try:
+            c.request("POST", "/sql", s.encode())
+            c.getresponse()
+        except Exception:
+            pass
+        c.close()
+    pid_file = os.path.join(tempfile.mkdtemp(prefix="pondra-nap-"), "pid")
+    sql(A.port, "CREATE PROCEDURE hang() LANGUAGE python AS $$\nimport time\ntime.sleep(60)\n$$")
+    call(A.port, "PUT", "/files/nap.py", f"import os, time\nopen({pid_file!r}, 'w').write(str(os.getpid()))\ntime.sleep(60)\n".encode())
+    gave_up("CALL hang()")
+    gave_up("CALL run('nap.py')")
+    left = until(lambda: [r["status"] for r in sql(A.port, "SELECT status FROM pondra.runs WHERE routine = 'hang' OR routine LIKE 'files/nap.py@%' ORDER BY routine")], ["stopped", "stopped"], 20)
+    def alive(pid):
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+    nap = int(open(pid_file).read()) if os.path.exists(pid_file) else 0
+    nap_gone = nap > 0 and until(lambda: alive(nap), False, 20) is False
     checks = {"a run whose node was killed and started again: stopped, saying whose node, not running for good": running == "running" and after == "stopped" and f"127.0.0.1:{A.port}" in said and "stopped while it ran" in said,
-              "a run on the node that is up: running, then ok": mid == "running" and done == "ok"}
+              "a run on the node that is up: running, then ok": mid == "running" and done == "ok",
+              "a run on a follower killed for good: stopped by the leader once the node has been gone a minute": gone_running == "running" and gone_after == "stopped" and f"127.0.0.1:{A.port + 1}" in gone_said,
+              "a call and a file run whose caller went: stopped, and the file run's Python with it": left == ["stopped", "stopped"] and nap_gone}
     node.kill()
     ok = all(checks.values())
-    print(json.dumps({"stopped": checks, "ok": ok, "info": {"said": said, "statuses": [running, after, mid, done]}}, indent=1, default=str))
+    print(json.dumps({"stopped": checks, "ok": ok, "info": {"said": said, "statuses": [running, after, mid, done], "a follower's run marked after (s)": gone_secs}}, indent=1, default=str))
     return ok
 
 
@@ -6793,6 +6883,16 @@ SELECT $big AS big, $t AS t, $c AS c, (SELECT count(*) FROM made_a) + (SELECT co
     q(tick, path="/sql?job=harness-ticks")
     got["ticks"] = q("SELECT count(*) AS n, sum(n) AS s FROM ticks")
     checks["a script run again with its job writes once (each statement's part its place and its loop's pass)"] = got["ticks"] == [{"n": 3, "s": 6}]
+    # …a FOR loop's too when its rows come back in another order (no ORDER BY, a spread query): a
+    # pass's place is its row (and how many equal rows came before it), not its number.
+    q("CREATE TABLE seen (x BIGINT); CREATE TABLE halt (x BIGINT); INSERT INTO halt VALUES (3)")
+    loop = "FOR r IN (SELECT x FROM (VALUES (1), (2), (3), (2)) t(x) ORDER BY x {}) DO IF EXISTS (SELECT 1 FROM halt WHERE x = $r.x) THEN RAISE 'halt at %', $r.x; END IF; INSERT INTO seen VALUES ($r.x); END FOR"
+    halted = _raises_text(lambda: q(loop.format("ASC"), path="/sql?job=harness-order"))
+    q("DELETE FROM halt")
+    q(loop.format("DESC"), path="/sql?job=harness-order")
+    got["order"] = q("SELECT x, count(*) AS n FROM seen GROUP BY x ORDER BY x")
+    checks["a FOR loop that failed, run again with its job over its rows in another order: each row's statements once (equal rows each once)"] = \
+        "halt at 3" in halted and got["order"] == [{"x": 1, "n": 1}, {"x": 2, "n": 2}, {"x": 3, "n": 1}]
     # Postgres: the simple protocol splits a script by its blocks; the extended one takes a block whole.
     heard = []
     with psycopg.connect(f"host=127.0.0.1 port={pg} user=pondra dbname=pondra", autocommit=True, cursor_factory=psycopg.ClientCursor) as c:
@@ -6912,7 +7012,7 @@ def tasks():
     from a follower; WHEN false skips a task and what follows it still runs; retries with the same
     job (what a try wrote lands once), refused while a run is under way; a timeout, on_failure and
     nothing after a failure; ALTER TASK SUSPEND and RESUME; refusals (a loop, two schedules, a
-    missing task, DROP of a followed one); a graph through a leader failover, each write once."""
+    missing task, DROP of a followed one, a schedule too long to count or that never comes); a graph through a leader failover, each write once."""
     lake = new_lake()
     py = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "python")
     nodes = [Node(lake, A.port + i, python=sys.executable, env={"PYTHONPATH": py}).start() for i in range(3)]
@@ -7041,11 +7141,17 @@ console.log("done"); await db.close();"""
         "followed": err("DROP TASK load"),
         "no task": err("EXECUTE TASK nothing"),
         "an option": err("CREATE TASK opt SCHEDULE '1 hour' WITH (tries = 2) AS SELECT 1"),
+        # (taken, 4611686018427387904 minutes wrapped around to 0 s and the leader's loop divided by
+        # it: the node stopped, and again each time it started)
+        "too long": err("CREATE TASK huge SCHEDULE '4611686018427387904 minutes' AS SELECT 1"),
+        "never": err("CREATE TASK feb30 SCHEDULE 'cron 0 0 30 2 *' AS SELECT 1"),
     }
-    checks["refused by name: a task after itself, a loop, two schedules, a missing task, DROP of a followed one, EXECUTE of none, an unknown option"] = (
+    checks["refused by name: a task after itself, a loop, two schedules, a missing task, DROP of a followed one, EXECUTE of none, an unknown option, "
+           "a schedule past a hundred years or a day that never comes (the nodes still up)"] = (
         "follow itself" in refused["itself"] and "follow itself" in refused["a loop"] and "2 different schedules" in refused["two schedules"]
         and "no task nothing" in refused["missing"] and "runs after load" in refused["followed"] and "no task nothing" in refused["no task"]
-        and "retries, retry_delay" in refused["an option"] and status("root") == "ok")
+        and "retries, retry_delay" in refused["an option"] and "a hundred years" in refused["too long"] and "never comes" in refused["never"]
+        and (time.sleep(1.5) or all(n.alive() for n in nodes)) and status("root") == "ok")
     # A graph through a leader failover: the task under way runs again on the new leader, with its job.
     q("CREATE TABLE flog (task VARCHAR, v BIGINT)")
     q("CREATE TASK froot SCHEDULE '1 hour' AS SELECT 1")
@@ -7217,6 +7323,11 @@ console.log(JSON.stringify([all, top, rows, await db.vars(), (await db.parameter
     got["javascript"] = js_out.stdout.strip() or js_out.stderr[-1500:]
     checks["JavaScript: db.vars(), getVariable, setVariable, resetVariable, parameters"] = \
         got["javascript"] == json.dumps([{"day": "2026-09-29", "top": 2}, 2, [{"n": 1, "t": 20}], {"day": "2026-09-29"}, ["day", "min", "region"]], separators=(",", ":"))
+    got["shapes"] = q("DECLARE $b BYTEA = X'DEADBEEF'; DECLARE $ids = [3, 1, NULL]; DECLARE $s = named_struct('a', 1, 'b', 'x'); "
+                      "SELECT encode($b, 'hex') AS hex, array_has($ids, 3) AS has, cardinality($ids) AS n, $s['b'] AS b")
+    got["a map"] = _raises_text(lambda: q("DECLARE $m = MAP {'a': 1}"))
+    checks["a variable holds bytes as they are (not their hex's text), a list or a struct; a map is refused by name"] = \
+        got["shapes"] == [{"hex": "deadbeef", "has": True, "n": 3, "b": "x"}] and "be passed as a value yet" in got["a map"]
     info["got"] = got
     node.kill()
     ok = all(checks.values())

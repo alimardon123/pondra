@@ -71,6 +71,7 @@ pub async fn run(app: &App, args: &[FunctionArg], who: Who, job: Option<String>,
     let mut heard = vec![];
     let values = crate::routines::values_of(&row)?;
     let session = format!("run-{}", crate::runs::new_id());
+    let _ends = Ends(session.clone());
     let (none, no_views) = (HashMap::new(), HashMap::new());
     let out = crate::vars::own(values, async { // (the run's variables, from the values given: every cell's, and its Python's `db.vars`)
         match kind.as_str() {
@@ -92,9 +93,16 @@ pub async fn run(app: &App, args: &[FunctionArg], who: Who, job: Option<String>,
         }
     })
     .await;
-    crate::python::end_session(&session);
     let _ = log.end(app, &out, heard);
     out.map_err(|e| e.context(format!("run {path}")))
+}
+
+/// A run's own Python session, ended with the run, also when its caller stops waiting for it (a
+/// task's time ran out, a client went): its worker stops then, not after an hour idle, mid-cell.
+struct Ends(String);
+
+impl Drop for Ends {
+    fn drop(&mut self) { crate::python::end_session(&self.0); }
 }
 
 /// A notebook by name: `notebooks/<name>.ipynb` (its versions kept with it, ADR-035 §8), or, saved

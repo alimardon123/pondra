@@ -104,7 +104,7 @@ fn head(name: &str, r: &Routine, table: bool) -> serde_json::Value {
 /// Rows through a worker: the arguments' batch out, the answer back (as `out`'s columns).
 async fn ask(name: &str, r: &Routine, table: bool, args: RecordBatch, out: SchemaRef) -> Result<Vec<RecordBatch>> {
     crate::python::ready(&format!("{name} is a Python function"))?;
-    let limit = std::time::Duration::from_secs_f64(r.with.timeout.unwrap_or(60.0));
+    let limit = std::time::Duration::try_from_secs_f64(r.with.timeout.unwrap_or(60.0)).unwrap_or(std::time::Duration::from_secs(60));
     let parts = vec![crate::query::ipc(&[args])?, crate::query::ipc(&[RecordBatch::new_empty(out)])?];
     let mut log = |n: String| eprintln!("function {name}: {n}");
     let (_, parts) = crate::python::ask(&r.with.packages, crate::python::Use::Function, head(name, r, table), parts, Some(limit), &mut log).await.with_context(|| name.to_string())?;
@@ -360,11 +360,14 @@ impl Answers {
     }
 }
 
-/// Each row's key: the function (its name and definition) and the row's argument values.
+/// Each row's key: the function (its name and definition) and the row's argument values, with
+/// their types: Arrow's row bytes of `DATE '1970-01-06'` and of `5` are the same, and Python gets a
+/// date for one and a number for the other.
 fn keys(name: &str, r: &Routine, arrays: &[ArrayRef], rows: usize) -> Result<Vec<Vec<u8>>> {
     use datafusion::arrow::row::{RowConverter, SortField};
     let version = std::hash::BuildHasher::hash_one(&std::hash::BuildHasherDefault::<std::collections::hash_map::DefaultHasher>::default(), serde_json::to_vec(r)?);
-    let head = format!("{name}\0{version:x}\0").into_bytes();
+    let types = arrays.iter().map(|a| a.data_type().to_string()).collect::<Vec<_>>().join(",");
+    let head = format!("{name}\0{version:x}\0{types}\0").into_bytes();
     if arrays.is_empty() {
         return Ok(vec![head; rows]);
     }

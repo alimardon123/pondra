@@ -336,6 +336,38 @@ fn params(p: &mut Parser) -> Result<Vec<Param>> {
     Ok(params)
 }
 
+/// Does `e` hold a query of its own (its columns may be that query's)?
+fn queries_in(e: &Expr) -> bool {
+    ast::visit_expressions(e, |x| match x {
+        Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } | Expr::Lambda(_) => ControlFlow::Break(()),
+        _ => ControlFlow::Continue(()),
+    })
+    .is_break()
+}
+
+/// The names a function's body gives the relations it reads (a table's own, or its alias).
+fn names_in<T: ast::Visit>(body: &T) -> std::collections::HashSet<String> {
+    struct Names(std::collections::HashSet<String>);
+    impl ast::Visitor for Names {
+        type Break = ();
+        fn pre_visit_table_factor(&mut self, t: &TableFactor) -> ControlFlow<()> {
+            let (name, alias) = match t {
+                TableFactor::Table { name, alias, .. } => (name.0.last().and_then(|p| p.as_ident()), alias),
+                TableFactor::Derived { alias, .. } | TableFactor::Function { alias, .. } | TableFactor::UNNEST { alias, .. } => (None, alias),
+                _ => (None, &None),
+            };
+            self.0.extend(name.into_iter().chain(alias.as_ref().map(|a| &a.name)).map(|i| i.value.to_lowercase()));
+            ControlFlow::Continue(())
+        }
+    }
+    let mut names = Names(Default::default());
+    let _ = body.visit(&mut names);
+    names.0
+}
+
+/// The longest a routine's `timeout` may be: past it a duration would overflow (`1e20`, `inf`).
+const WEEK: f64 = 7.0 * 86400.0;
+
 /// `WITH (vectorized = true, packages = 'requests, jinja2', entry = 'f', timeout = 5)`.
 fn options(p: &mut Parser, o: &mut Options) -> Result<()> {
     p.expect_token(&Token::LParen)?;
@@ -355,7 +387,7 @@ fn options(p: &mut Parser, o: &mut Options) -> Result<()> {
             "strict" => o.strict = yes()?,
             "packages" => o.packages = v.split(',').map(str::trim).filter(|s| !s.is_empty()).collect::<Vec<_>>().join(", "),
             "entry" => o.entry = v.clone(),
-            "timeout" => o.timeout = Some(v.parse::<f64>().ok().filter(|s| *s > 0.0).context("timeout: seconds")?),
+            "timeout" => o.timeout = Some(v.parse::<f64>().ok().filter(|s| *s > 0.0 && *s <= WEEK).context("timeout: seconds, more than 0 and at most a week (604800)")?),
             "cache" => o.cache = Some(match crate::runs::every(&v).context("cache: how long an answer is reused ('10 minutes', '30 seconds')")? {
                 crate::runs::Every::Seconds(s) => s,
                 crate::runs::Every::Cron(..) => bail!("cache: how long ('10 minutes'), not a schedule"),
@@ -722,9 +754,13 @@ async fn expand_with(lake: &Lake, sql: &str, views: &HashMap<String, String>) ->
         false => Err(e),
     });
     let Ok(mut stmts) = parsed else { return if expands { Ok(sql.to_string()) } else { as_written() } };
+    let columns = match expands {
+        true => columns(lake, &stmts, &all).await?,
+        false => HashMap::new(),
+    };
     for s in stmts.iter_mut().filter(|_| expands) {
-        if !matches!(s, Statement::CreateMacro { .. } | Statement::CreateView(ast::CreateView { materialized: false, .. })) {
-            if let ControlFlow::Break(e) = s.visit(&mut Expander { lake, all: &all, views, outside: &outside, depth: 0, own: 0 }) {
+        if !matches!(s, Statement::CreateMacro { .. } | Statement::CreateFunction(_) | Statement::CreateView(ast::CreateView { materialized: false, .. })) {
+            if let ControlFlow::Break(e) = s.visit(&mut Expander { lake, all: &all, views, outside: &outside, depth: 0, own: 0, columns: &columns, scopes: vec![] }) {
                 return Err(e);
             }
         }
@@ -966,9 +1002,86 @@ struct Expander<'a> {
     outside: &'a [(String, crate::ext::Attached)], // other engines' tables attached (`ext.rs`)
     depth: usize,
     own: usize, // (an INSERT's own VALUES: `values_apart`)
+    columns: &'a HashMap<String, Vec<String>>, // (the lake's tables named, for an argument's columns: `owner`)
+    scopes: Vec<Option<Scope<'a>>>, // (each query's FROM around a call, innermost last; None: a UNION's)
 }
 
-impl Expander<'_> {
+/// A FROM's relations, and the columns its joins' USING (or NATURAL: `*`) make one.
+type Scope<'a> = (Vec<Relation<'a>>, Vec<String>);
+
+/// A relation in a FROM: the name its columns go by, and its columns if it is one of the lake's
+/// tables (a view, a subquery or a CTE: not known before planning).
+type Relation<'a> = (Option<ast::ObjectName>, Option<&'a [String]>);
+
+impl<'a> Expander<'a> {
+    /// The relations `from` reads, as an argument's columns are found in them.
+    fn relations(&self, from: &[ast::TableWithJoins], ctes: &[String]) -> Scope<'a> {
+        let columns = self.columns;
+        let one = |f: &TableFactor| match f {
+            TableFactor::Table { name, alias, args: None, .. } => {
+                let local = crate::ddl::local(self.lake, &object(name)).filter(|n| !ctes.contains(n));
+                (Some(alias.as_ref().map_or_else(|| name.clone(), |a| ast::ObjectName::from(vec![a.name.clone()]))), local.and_then(|n| columns.get(&n)).map(Vec::as_slice))
+            }
+            TableFactor::Table { alias, .. } | TableFactor::Derived { alias, .. } | TableFactor::Function { alias, .. } | TableFactor::UNNEST { alias, .. } => {
+                (alias.as_ref().map(|a| ast::ObjectName::from(vec![a.name.clone()])), None)
+            }
+            _ => (None, None),
+        };
+        use ast::{JoinConstraint as C, JoinOperator as J};
+        let merged = |j: &ast::Join| match &j.join_operator {
+            J::Join(c) | J::Inner(c) | J::Left(c) | J::LeftOuter(c) | J::Right(c) | J::RightOuter(c) | J::FullOuter(c) | J::Semi(c) | J::LeftSemi(c) | J::RightSemi(c) | J::Anti(c) | J::LeftAnti(c) | J::RightAnti(c) => match c {
+                C::Using(names) => names.iter().map(object).collect(),
+                C::Natural => vec!["*".to_string()],
+                _ => vec![],
+            },
+            _ => vec![],
+        };
+        let relations = from.iter().flat_map(|t| std::iter::once(one(&t.relation)).chain(t.joins.iter().map(|j| one(&j.relation)))).collect();
+        (relations, from.iter().flat_map(|t| &t.joins).flat_map(merged).collect())
+    }
+
+    /// The relation a column of an argument is from, as SQL finds it: the innermost query whose
+    /// FROM has it. One that might (a view, a subquery) stops the search, unless it is all its
+    /// query reads.
+    fn owner(&self, c: &str) -> Result<Option<ast::ObjectName>> {
+        for scope in self.scopes.iter().rev() {
+            let Some((scope, merged)) = scope else { return Ok(None) };
+            let has: Vec<_> = scope.iter().filter(|(_, cols)| cols.is_some_and(|cols| cols.iter().any(|x| x == c))).collect();
+            match (&has[..], &scope[..]) {
+                ([(q, _)], _) | ([], [(q, None)]) => return Ok(q.clone()),
+                ([(q, _), ..], _) if merged.iter().any(|m| m == c || m == "*") => return Ok(q.clone()), // (USING's one column: the first side's)
+                ([a, b, ..], _) => bail!("{c} is a column of {} and {}: name it with its table", a.0.as_ref().map(|n| n.to_string()).unwrap_or_default(), b.0.as_ref().map(|n| n.to_string()).unwrap_or_default()),
+                ([], s) if s.iter().any(|(_, cols)| cols.is_none()) => return Ok(None),
+                _ => {}
+            }
+        }
+        Ok(None)
+    }
+
+    /// An argument's columns named with their tables (`id` → `orders.id`), for a body that reads
+    /// a table of its own: Postgres passes a function values, so `f(id)` must not become its
+    /// table's `id` inside `SELECT max(v) FROM t WHERE k = x`.
+    fn qualify(&self, e: &mut Expr) -> Result<()> {
+        if queries_in(e) {
+            return Ok(()); // (its columns may be its own query's)
+        }
+        let mut out = Ok(());
+        let _ = visit_expressions_mut(e, |x| {
+            if let Expr::Identifier(i) = x {
+                match self.owner(&ident(i)) {
+                    Ok(Some(q)) => *x = Expr::CompoundIdentifier(q.0.iter().filter_map(|p| p.as_ident().cloned()).chain([i.clone()]).collect()),
+                    Ok(None) => {}
+                    Err(e) => {
+                        out = Err(e);
+                        return ControlFlow::Break(());
+                    }
+                }
+            }
+            ControlFlow::Continue(())
+        });
+        out
+    }
+
     fn find(&self, name: &ast::ObjectName, kind: Kind) -> Option<(String, &Routine)> {
         let name = crate::ddl::local(self.lake, &object(name))?;
         self.all.get(&name).filter(|r| r.kind == kind).map(|r| (name, r))
@@ -976,40 +1089,151 @@ impl Expander<'_> {
 
     /// The body with the arguments in its parameters' places (`p`, or `$1`), cast to their types,
     /// its own function calls expanded; and the arguments.
-    fn call<T: VisitMut>(&self, name: &str, r: &Routine, args: &[FunctionArg], mut body: T) -> Result<(T, Vec<Expr>)> {
+    fn call<T: VisitMut + ast::Visit>(&self, name: &str, r: &Routine, args: &[FunctionArg], mut body: T) -> Result<(T, Vec<Expr>)> {
         ensure!(self.depth < 16, "{name}: functions calling functions 16 deep (a loop?)");
-        let values = typed(r, arguments(name, r, args)?)?;
-        let _ = visit_expressions_mut(&mut body, |e| {
-            let v = match e {
-                Expr::Identifier(i) => values.get(&ident(i)),
-                Expr::Value(v) => match &v.value {
-                    ast::Value::Placeholder(p) => match p.trim_start_matches('$') {
-                        n if n.starts_with(|c: char| c.is_ascii_digit()) => n.parse::<usize>().ok().and_then(|n| r.params.get(n.wrapping_sub(1))).and_then(|p| values.get(&p.name)),
-                        n => values.get(&n.to_lowercase()), // (`$x`: the parameter `x`, as everywhere else)
-                    },
-                    _ => None,
+        let mut values = arguments(name, r, args)?;
+        if crate::ddl::mentions(&r.body, "from") {
+            let theirs = names_in(&body);
+            for v in values.values_mut() {
+                self.qualify(v).map_err(|e| e.context(format!("{name}'s argument {v}")))?;
+                // A column named by a relation the body names too would be read as the body's.
+                let mut clash = None;
+                let _ = ast::visit_expressions(v, |x| {
+                    if let Expr::CompoundIdentifier(p) = x {
+                        clash = clash.take().or_else(|| p.len().checked_sub(2).map(|i| p[i].value.to_lowercase()).filter(|q| theirs.contains(q)));
+                    }
+                    ControlFlow::<()>::Continue(())
+                });
+                if let Some(q) = clash.filter(|_| !queries_in(v)) {
+                    bail!("{name}'s argument {v} is a column of {q}, and {name} reads {q} too: name it otherwise in the query (FROM {q} AS x)");
+                }
+            }
+        }
+        let values = typed(r, values)?;
+        let param = |e: &Expr| match e {
+            Expr::Identifier(i) => values.get_key_value(&ident(i)),
+            Expr::Value(v) => match &v.value {
+                ast::Value::Placeholder(p) => match p.trim_start_matches('$') {
+                    n if n.starts_with(|c: char| c.is_ascii_digit()) => n.parse::<usize>().ok().and_then(|n| r.params.get(n.wrapping_sub(1))).and_then(|p| values.get_key_value(&p.name)),
+                    n => values.get_key_value(&n.to_lowercase()), // (`$x`: the parameter `x`, as everywhere else)
                 },
                 _ => None,
-            };
-            if let Some(v) = v {
-                *e = Expr::Nested(Box::new(v.clone()));
+            },
+            _ => None,
+        };
+        // (each use is a copy: a parameter used twice by functions calling functions doubles at every
+        // level, and 16 levels of that never finished; counted before anything is copied)
+        let sizes: HashMap<&String, usize> = values.iter().map(|(k, v)| (k, v.to_string().len())).collect();
+        let mut size = 0;
+        let _ = ast::visit_expressions(&body, |e| {
+            size += param(e).map_or(0, |(k, _)| sizes[k]);
+            ControlFlow::<()>::Continue(())
+        });
+        ensure!(size <= 1 << 20, "{name}: its arguments come to over 1 MB of SQL written into its body (a parameter used many times, by functions calling functions); pass the value once, from a CTE");
+        let _ = visit_expressions_mut(&mut body, |e| {
+            if let Some((_, v)) = param(e) {
+                *e = grouped(v.clone());
             }
             ControlFlow::<()>::Continue(())
         });
-        match body.visit(&mut Expander { depth: self.depth + 1, ..*self }) {
-            ControlFlow::Break(e) => Err(e),
-            ControlFlow::Continue(()) => Ok((body, r.params.iter().map(|p| values[&p.name].clone()).collect())),
+        if let ControlFlow::Break(e) = VisitMut::visit(&mut body, &mut Expander { depth: self.depth + 1, scopes: self.scopes.clone(), ..*self }) {
+            return Err(e);
+        }
+        // (a body calling functions several times grows as theirs do: four calls, ten deep, are a
+        // million expressions, which took the node's memory before anything was planned)
+        let mut n = 0;
+        let _ = ast::visit_expressions(&body, |_| {
+            n += 1;
+            if n > LARGEST { ControlFlow::Break(()) } else { ControlFlow::Continue(()) }
+        });
+        ensure!(n <= LARGEST, "{name}: written out, it is over {LARGEST} expressions (functions calling functions several times each); work a value out once, in a CTE");
+        Ok((body, r.params.iter().map(|p| values[&p.name].clone()).collect()))
+    }
+}
+
+/// The most expressions one function's call may come to, written out.
+const LARGEST: usize = 100_000;
+
+/// The columns of the lake's tables that `stmts` and the SQL functions' bodies read, by name,
+/// when a function reads a table: what an argument's columns are told apart by (`Expander::owner`).
+async fn columns(lake: &Lake, stmts: &[Statement], all: &HashMap<String, Routine>) -> Result<HashMap<String, Vec<String>>> {
+    let reading: Vec<&Routine> = all.values().filter(|r| r.kind != Kind::Procedure && !r.python() && crate::ddl::mentions(&r.body, "from")).collect();
+    if reading.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let mut names = std::collections::BTreeSet::new();
+    let mut add = |n: &ast::ObjectName| {
+        names.extend(crate::ddl::local(lake, &object(n)));
+        ControlFlow::<()>::Continue(())
+    };
+    for s in stmts {
+        let _ = ast::visit_relations(s, &mut add);
+    }
+    for r in reading {
+        if let Ok(q) = parse_query(query_text(&r.body)) {
+            let _ = ast::visit_relations(&q, &mut add);
         }
     }
+    let mut out = HashMap::new();
+    for n in names {
+        if let Some(m) = lake.cat.get::<crate::store::TableMeta>(&crate::store::table_key(&n)).await? {
+            let m = m.logical();
+            out.insert(n, m.columns.into_iter().map(|(c, _)| c).chain(crate::sys::NAMES.map(String::from)).collect());
+        }
+    }
+    Ok(out)
 }
 
 /// Each argument cast to its parameter's type, if it has one.
 fn typed(r: &Routine, values: HashMap<String, Expr>) -> Result<HashMap<String, Expr>> {
     let ty: HashMap<&str, &str> = r.params.iter().filter(|p| !crate::pyfn::loose(p.ty.as_deref())).filter_map(|p| Some((p.name.as_str(), p.ty.as_deref()?))).collect();
     values.into_iter().map(|(k, v)| Ok(match ty.get(k.as_str()) {
-        Some(t) => (k.clone(), parse_expr(&format!("CAST(({v}) AS {t})"))?),
+        Some(t) => (k.clone(), cast(v, t)?),
         None => (k, v),
     })).collect()
+}
+
+/// `CAST(e AS t)`, with `e` never read again as text: a function's expansion holds its
+/// arguments' and those of the functions it calls, and reading each again cost its whole size at
+/// every level.
+fn cast(e: Expr, t: &str) -> Result<Expr> {
+    let mut c = parse_expr(&format!("CAST(NULL AS {t})"))?;
+    if let Expr::Cast { expr, .. } = &mut c {
+        **expr = e;
+    }
+    Ok(c)
+}
+
+/// `e` in parentheses where an operator around it could take part of it (`x + x` into `x * 2`),
+/// and as it is otherwise: functions calling functions add their levels to every parser's limit
+/// (DataFusion's is 50).
+fn grouped(e: Expr) -> Expr {
+    match e {
+        Expr::Cast { kind: ast::CastKind::Cast | ast::CastKind::TryCast | ast::CastKind::SafeCast, .. }
+        | Expr::Nested(_)
+        | Expr::Identifier(_)
+        | Expr::CompoundIdentifier(_)
+        | Expr::Value(_)
+        | Expr::Function(_)
+        | Expr::Case { .. }
+        | Expr::Subquery(_) => e,
+        e => Expr::Nested(Box::new(e)),
+    }
+}
+
+/// `template` with `$_1`, `$_2`, … replaced by `parts` (as `cast`).
+fn around(template: &str, parts: Vec<Expr>) -> Result<Expr> {
+    let mut e = parse_expr(template)?;
+    let mut parts: Vec<Option<Expr>> = parts.into_iter().map(Some).collect();
+    let _ = visit_expressions_mut(&mut e, |x| {
+        if let Expr::Value(ast::ValueWithSpan { value: ast::Value::Placeholder(p), .. }) = x {
+            if let Some(part) = p.strip_prefix("$_").and_then(|n| n.parse::<usize>().ok()).and_then(|n| parts.get_mut(n.wrapping_sub(1))).and_then(Option::take) {
+                *x = grouped(part);
+            }
+        }
+        ControlFlow::<()>::Continue(())
+    });
+    Ok(e)
 }
 
 /// A Python function's call as its DataFusion function takes it: every argument, in order, cast
@@ -1029,10 +1253,32 @@ impl VisitorMut for Expander<'_> {
 
     fn pre_visit_statement(&mut self, s: &mut Statement) -> ControlFlow<Self::Break> {
         self.own = own_values(s);
+        let from = match s {
+            Statement::Update(u) => std::iter::once(u.table.clone()).chain(match &u.from {
+                Some(ast::UpdateTableFromKind::BeforeSet(f) | ast::UpdateTableFromKind::AfterSet(f)) => f.clone(),
+                None => vec![],
+            }).collect(),
+            Statement::Delete(d) => match &d.from {
+                ast::FromTable::WithFromKeyword(f) | ast::FromTable::WithoutKeyword(f) => f.iter().chain(d.using.iter().flatten()).cloned().collect(),
+            },
+            _ => vec![],
+        };
+        self.scopes = vec![Some(self.relations(&from, &[]))];
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_query(&mut self, q: &mut ast::Query) -> ControlFlow<Self::Break> {
+        let ctes: Vec<String> = q.with.iter().flat_map(|w| &w.cte_tables).map(|c| ident(&c.alias.name)).collect();
+        let scope = match &*q.body {
+            ast::SetExpr::Select(s) => Some(self.relations(&s.from, &ctes)),
+            _ => None,
+        };
+        self.scopes.push(scope);
         ControlFlow::Continue(())
     }
 
     fn post_visit_query(&mut self, q: &mut ast::Query) -> ControlFlow<Self::Break> {
+        self.scopes.pop();
         select_star(&mut q.body);
         output_names(q);
         values_apart(q, self.own);
@@ -1058,17 +1304,19 @@ impl VisitorMut for Expander<'_> {
         }
         let expanded = scalar_body(&r.body).and_then(|body| self.call(&name, r, &args, body)).and_then(|(e, args)| {
             let e = match &r.returns {
-                Some(t) => format!("CAST(({e}) AS {t})"),
-                None => e.to_string(),
+                Some(t) => cast(e, t)?,
+                None => e,
             };
-            let e = match (r.with.strict, args.is_empty()) {
-                (true, false) => format!("CASE WHEN {} THEN NULL ELSE {e} END", args.iter().map(|a| format!("({a}) IS NULL")).collect::<Vec<_>>().join(" OR ")),
-                _ => e,
-            };
-            parse_expr(&e)
+            match (r.with.strict, args.is_empty()) {
+                (true, false) => {
+                    let nulls = (0..args.len()).map(|i| format!("$_{} IS NULL", i + 2)).collect::<Vec<_>>().join(" OR ");
+                    around(&format!("CASE WHEN {nulls} THEN NULL ELSE $_1 END"), std::iter::once(e).chain(args).collect())
+                }
+                _ => Ok(e),
+            }
         });
         match expanded {
-            Ok(e) => *expr = Expr::Nested(Box::new(e)),
+            Ok(e) => *expr = grouped(e),
             Err(e) => return ControlFlow::Break(e),
         }
         ControlFlow::Continue(())
@@ -1108,7 +1356,7 @@ impl VisitorMut for Expander<'_> {
                 Ok(q) => q,
                 Err(e) => return ControlFlow::Break(e.context(format!("{name}"))),
             };
-            q.visit(&mut Expander { views: &NONE, depth: self.depth + 1, ..*self })?; // (its functions; its names are the lake's)
+            q.visit(&mut Expander { views: &NONE, depth: self.depth + 1, scopes: vec![], ..*self })?; // (its functions; its names are the lake's)
             let alias = alias.clone().or_else(|| Some(ast::TableAlias { explicit: true, name: ast::Ident::new(object(name)), columns: vec![], at: None }));
             *t = TableFactor::Derived { lateral: false, subquery: Box::new(q), alias, sample: None };
             return ControlFlow::Continue(());
@@ -1490,14 +1738,14 @@ fn start<'a>(app: &'a App, name: &'a str, args: &'a [FunctionArg], column: &'a s
         if crate::workspace::is_run(name) {
             let args = args.to_vec();
             crate::workspace::arguments(app, &args).await?; // (its mistakes: said now, not only in the log)
-            tokio::spawn(async move {
+            tokio::spawn(crate::auth::carried(async move {
                 let _ = Box::pin(crate::workspace::run(&app2, &args, who, job, Some(id2))).await;
-            });
+            }));
         } else {
             let (local, r, row) = Box::pin(prepared(app, name, args, who)).await?;
-            tokio::spawn(async move {
+            tokio::spawn(crate::auth::carried(async move {
                 let _ = Box::pin(run(&app2, local, r, row, who, job, Some(id2))).await; // (its outcome: the run log's)
-            });
+            }));
         }
         let ids = datafusion::arrow::array::StringArray::from(vec![id]);
         let schema = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![datafusion::arrow::datatypes::Field::new(column, datafusion::arrow::datatypes::DataType::Utf8, false)]));
@@ -1507,16 +1755,35 @@ fn start<'a>(app: &'a App, name: &'a str, args: &'a [FunctionArg], column: &'a s
 
 /// The arguments as parameters for SQL: each value exactly, at its own type.
 pub fn values_of(row: &RecordBatch) -> Result<HashMap<String, Value>> {
+    row.schema().fields().iter().zip(row.columns()).map(|(f, col)| Ok((f.name().clone(), j!({"sql": exact(col.as_ref(), 0)?})))).collect()
+}
+
+/// A value of an Arrow array as SQL that gives it back exactly, at its own type: its text cast
+/// back (`arrow_cast('2026-09-27', 'Date32')`), bytes from hex (their text is hex, which cast as
+/// it was gave the hex's own bytes), lists and structs item by item (their text doesn't cast).
+pub fn exact(col: &dyn datafusion::arrow::array::Array, i: usize) -> Result<String> {
+    use datafusion::arrow::array::AsArray;
+    use datafusion::arrow::datatypes::DataType as T;
     use datafusion::arrow::util::display::{ArrayFormatter, FormatOptions};
-    let mut out = HashMap::new();
-    for (f, col) in row.schema().fields().iter().zip(row.columns()) {
-        let v = match col.is_null(0) {
-            true => "NULL".to_string(),
-            false => quote(&ArrayFormatter::try_new(col.as_ref(), &FormatOptions::default())?.value(0).to_string()),
-        };
-        out.insert(f.name().clone(), j!({"sql": format!("arrow_cast({v}, '{}')", f.data_type())}));
-    }
-    Ok(out)
+    let ty = col.data_type();
+    let shown = || -> Result<String> { Ok(ArrayFormatter::try_new(col, &FormatOptions::default())?.value(i).to_string()) };
+    let items = |items: datafusion::arrow::array::ArrayRef| -> Result<String> {
+        Ok(format!("make_array({})", (0..items.len()).map(|j| exact(items.as_ref(), j)).collect::<Result<Vec<_>>>()?.join(", ")))
+    };
+    let value = match ty {
+        _ if col.is_null(i) => "NULL".to_string(),
+        T::Binary | T::LargeBinary | T::BinaryView | T::FixedSizeBinary(_) => format!("decode('{}', 'hex')", shown()?),
+        T::List(_) => items(col.as_list::<i32>().value(i))?,
+        T::LargeList(_) => items(col.as_list::<i64>().value(i))?,
+        T::FixedSizeList(..) => items(col.as_fixed_size_list().value(i))?,
+        T::Struct(fields) => {
+            let parts = fields.iter().zip(col.as_struct().columns()).map(|(f, c)| Ok(format!("{}, {}", quote(f.name()), exact(c.as_ref(), i)?)));
+            format!("named_struct({})", parts.collect::<Result<Vec<_>>>()?.join(", "))
+        }
+        T::Map(..) | T::Union(..) | T::ListView(_) | T::LargeListView(_) | T::RunEndEncoded(..) => bail!("a {ty} can't be passed as a value yet"),
+        _ => quote(&shown()?),
+    };
+    Ok(format!("arrow_cast({value}, '{ty}')"))
 }
 
 tokio::task_local! {
@@ -1549,8 +1816,8 @@ async fn python(app: &App, name: &str, r: &Routine, args: RecordBatch, who: Who,
     let url = format!("http://{}", app.cluster.addr.replace("0.0.0.0", "127.0.0.1"));
     let json: Vec<bool> = r.params.iter().map(|p| crate::pyfn::is_json(p.ty.as_deref())).collect();
     let head = j!({"op": "call", "name": name, "body": r.body, "entry": r.with.entry, "params": names(r), "json": json, "url": url, "token": lease.0, "depth": who.depth, "job": job});
-    let limit = r.with.timeout.map(std::time::Duration::from_secs_f64);
-    let kind = crate::python::Use::Procedure { nested: who.depth > 1 }; // (called by a procedure: it holds a worker already)
+    let limit = r.with.timeout.and_then(|s| std::time::Duration::try_from_secs_f64(s).ok());
+    let kind = crate::python::Use::Procedure { nested: crate::python::holding() }; // (called by a procedure that holds a slot: it takes none)
     let mut notice = |n: String| {
         let n = lease.redact(&n);
         let _ = NOTICES.try_with(|all| all.lock().unwrap().push(n.clone()));
@@ -1580,14 +1847,39 @@ async fn python(app: &App, name: &str, r: &Routine, args: RecordBatch, who: Who,
 }
 
 /// Does `sql` call a Python function that may answer differently each time (so its result mustn't
-/// be remembered)?
+/// be remembered)? In a view it reads too.
 pub async fn volatile(lake: &Lake, sql: &str) -> bool {
     let Ok(all) = listed(lake).await else { return true };
-    all.iter().any(|(n, r)| r.kind != Kind::Procedure && !r.cacheable() && crate::ddl::mentions(sql, n))
+    reads_any(lake, sql, all.iter().filter(|(_, r)| r.kind != Kind::Procedure && !r.cacheable())).await
 }
 
-/// Does `sql` read a Python table function? Then it runs on one node: each would call it.
+/// Does `sql` read a Python table function, itself or through a view? Then it runs on one node:
+/// each would call it.
 pub async fn pinned(lake: &Lake, sql: &str) -> bool {
     let Ok(all) = listed(lake).await else { return false };
-    all.iter().any(|(n, r)| r.kind == Kind::Table && r.python() && crate::ddl::mentions(sql, n))
+    reads_any(lake, sql, all.iter().filter(|(_, r)| r.kind == Kind::Table && r.python())).await
+}
+
+/// Does `sql`, or a stored view it reads, name one of these routines? The views are looked at only
+/// when there is one to find (most lakes have no Python function).
+async fn reads_any<'a>(lake: &Lake, sql: &str, routines: impl Iterator<Item = (&'a String, &'a Routine)>) -> bool {
+    let names: Vec<&String> = routines.map(|(n, _)| n).collect();
+    if names.is_empty() || names.iter().any(|n| crate::ddl::mentions(sql, n)) {
+        return !names.is_empty();
+    }
+    match with_views(lake, sql).await {
+        Ok(text) => names.iter().any(|n| crate::ddl::mentions(&text, n)),
+        Err(_) => true,
+    }
+}
+
+/// A query's text with the SQL of every stored view it reads, one in another too (macros
+/// expanded): what a query asks for (`now()`, files, a Python function) may be in a view of it.
+pub async fn with_views(lake: &Lake, sql: &str) -> Result<String> {
+    let mut text = sql.to_string();
+    for (_, v) in crate::query::stored_views(lake, sql, false).await? {
+        text.push(' ');
+        text.push_str(&v);
+    }
+    Ok(text)
 }
