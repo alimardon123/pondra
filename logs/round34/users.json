@@ -1,0 +1,299 @@
+{
+ "what": "tools/serve_bench.py --users 50,100,200,400 --secs 10: dashboards (MIX: five statements) from Go clients against one node while an append table takes 1,000 rows every 50 ms and a keyed one 100 upserts every 50 ms, one writer each, a request in flight; 5,000,000 events, 2,000,000 keys; 4 cores, local disk",
+ "before": "the branch before the kept tail (PR #38's spread writes)",
+ "after": "the kept tail, merges by size, plain scans, skip ranges (invariants 229-230)",
+ "runs": {
+  "before": [
+   {
+    "events": 5000000,
+    "keys": 2000000,
+    "nodes": 1,
+    "load_s": 8.3,
+    "clients": 50,
+    "qps": 760,
+    "errors": 0,
+    "p50_ms": 54.1,
+    "p99_ms": 232.4,
+    "by": [
+     {
+      "p50_ms": 64.8,
+      "p99_ms": 208.9
+     },
+     {
+      "p50_ms": 59.3,
+      "p99_ms": 256.0
+     },
+     {
+      "p50_ms": 20.8,
+      "p99_ms": 110.8
+     },
+     {
+      "p50_ms": 105.1,
+      "p99_ms": 284.8
+     },
+     {
+      "p50_ms": 51.3,
+      "p99_ms": 202.6
+     }
+    ],
+    "writes_rows_s": 8450,
+    "write_ack_p50_ms": 98.4,
+    "write_ack_p99_ms": 346.8
+   },
+   {
+    "events": 5000000,
+    "keys": 2000000,
+    "nodes": 1,
+    "load_s": 8.3,
+    "clients": 100,
+    "qps": 826,
+    "errors": 0,
+    "p50_ms": 90.9,
+    "p99_ms": 431.6,
+    "by": [
+     {
+      "p50_ms": 105.3,
+      "p99_ms": 372.8
+     },
+     {
+      "p50_ms": 95.8,
+      "p99_ms": 328.5
+     },
+     {
+      "p50_ms": 31.8,
+      "p99_ms": 131.9
+     },
+     {
+      "p50_ms": 255.8,
+      "p99_ms": 475.4
+     },
+     {
+      "p50_ms": 81.3,
+      "p99_ms": 260.4
+     }
+    ],
+    "writes_rows_s": 5750,
+    "write_ack_p50_ms": 135.9,
+    "write_ack_p99_ms": 415.5
+   },
+   {
+    "events": 5000000,
+    "keys": 2000000,
+    "nodes": 1,
+    "load_s": 8.3,
+    "clients": 200,
+    "qps": 749,
+    "errors": 0,
+    "p50_ms": 145.6,
+    "p99_ms": 1540.8,
+    "by": [
+     {
+      "p50_ms": 174.9,
+      "p99_ms": 844.7
+     },
+     {
+      "p50_ms": 139.9,
+      "p99_ms": 777.8
+     },
+     {
+      "p50_ms": 45.2,
+      "p99_ms": 348.7
+     },
+     {
+      "p50_ms": 762.5,
+      "p99_ms": 1729.0
+     },
+     {
+      "p50_ms": 137.2,
+      "p99_ms": 674.0
+     }
+    ],
+    "writes_rows_s": 3720,
+    "write_ack_p50_ms": 199.3,
+    "write_ack_p99_ms": 1636.4
+   },
+   {
+    "events": 5000000,
+    "keys": 2000000,
+    "nodes": 1,
+    "load_s": 8.3,
+    "clients": 400,
+    "qps": 751,
+    "errors": 0,
+    "p50_ms": 203.5,
+    "p99_ms": 2445.0,
+    "by": [
+     {
+      "p50_ms": 233.2,
+      "p99_ms": 1157.3
+     },
+     {
+      "p50_ms": 194.1,
+      "p99_ms": 1240.9
+     },
+     {
+      "p50_ms": 56.0,
+      "p99_ms": 429.3
+     },
+     {
+      "p50_ms": 2007.3,
+      "p99_ms": 2813.6
+     },
+     {
+      "p50_ms": 192.5,
+      "p99_ms": 990.0
+     }
+    ],
+    "writes_rows_s": 3470,
+    "write_ack_p50_ms": 177.0,
+    "write_ack_p99_ms": 1605.8
+   }
+  ],
+  "after": [
+   {
+    "events": 5000000,
+    "keys": 2000000,
+    "nodes": 1,
+    "load_s": 8.1,
+    "clients": 50,
+    "qps": 870,
+    "errors": 0,
+    "p50_ms": 45.6,
+    "p99_ms": 180.1,
+    "by": [
+     {
+      "p50_ms": 54.3,
+      "p99_ms": 160.1
+     },
+     {
+      "p50_ms": 50.9,
+      "p99_ms": 152.1
+     },
+     {
+      "p50_ms": 17.7,
+      "p99_ms": 63.5
+     },
+     {
+      "p50_ms": 96.2,
+      "p99_ms": 214.1
+     },
+     {
+      "p50_ms": 41.4,
+      "p99_ms": 150.2
+     }
+    ],
+    "writes_rows_s": 9770,
+    "write_ack_p50_ms": 79.5,
+    "write_ack_p99_ms": 261.2
+   },
+   {
+    "events": 5000000,
+    "keys": 2000000,
+    "nodes": 1,
+    "load_s": 8.1,
+    "clients": 100,
+    "qps": 956,
+    "errors": 0,
+    "p50_ms": 82.4,
+    "p99_ms": 347.1,
+    "by": [
+     {
+      "p50_ms": 102.3,
+      "p99_ms": 294.1
+     },
+     {
+      "p50_ms": 90.4,
+      "p99_ms": 266.5
+     },
+     {
+      "p50_ms": 29.1,
+      "p99_ms": 103.2
+     },
+     {
+      "p50_ms": 211.7,
+      "p99_ms": 396.8
+     },
+     {
+      "p50_ms": 75.6,
+      "p99_ms": 228.1
+     }
+    ],
+    "writes_rows_s": 5780,
+    "write_ack_p50_ms": 139.4,
+    "write_ack_p99_ms": 394.0
+   },
+   {
+    "events": 5000000,
+    "keys": 2000000,
+    "nodes": 1,
+    "load_s": 8.1,
+    "clients": 200,
+    "qps": 934,
+    "errors": 0,
+    "p50_ms": 131.9,
+    "p99_ms": 829.3,
+    "by": [
+     {
+      "p50_ms": 169.8,
+      "p99_ms": 555.8
+     },
+     {
+      "p50_ms": 141.9,
+      "p99_ms": 583.2
+     },
+     {
+      "p50_ms": 41.9,
+      "p99_ms": 203.1
+     },
+     {
+      "p50_ms": 569.6,
+      "p99_ms": 877.2
+     },
+     {
+      "p50_ms": 108.9,
+      "p99_ms": 420.0
+     }
+    ],
+    "writes_rows_s": 4340,
+    "write_ack_p50_ms": 164.5,
+    "write_ack_p99_ms": 561.9
+   },
+   {
+    "events": 5000000,
+    "keys": 2000000,
+    "nodes": 1,
+    "load_s": 8.1,
+    "clients": 400,
+    "qps": 861,
+    "errors": 0,
+    "p50_ms": 220.2,
+    "p99_ms": 2194.8,
+    "by": [
+     {
+      "p50_ms": 273.4,
+      "p99_ms": 1246.4
+     },
+     {
+      "p50_ms": 240.9,
+      "p99_ms": 1294.4
+     },
+     {
+      "p50_ms": 63.8,
+      "p99_ms": 485.7
+     },
+     {
+      "p50_ms": 1486.9,
+      "p99_ms": 2327.2
+     },
+     {
+      "p50_ms": 173.6,
+      "p99_ms": 874.2
+     }
+    ],
+    "writes_rows_s": 2860,
+    "write_ack_p50_ms": 243.5,
+    "write_ack_p99_ms": 1432.4
+   }
+  ]
+ }
+}

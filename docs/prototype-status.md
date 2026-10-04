@@ -48,6 +48,18 @@ queries, both fixed: a query naming `_row_id` fell back to one node, and a histo
 2) spread over the nodes counted its deleted versions (98,970 rows read as 100,000), since round
 33.
 
+**Dashboards while writes land** (`serve_bench.py --users`, invariants 229–230): five dashboard
+statements from Go clients against one node on 4 cores, while an append table takes 1,000 rows and a
+keyed one 100 upserts every 50 ms. Each query had conformed every log segment again and run a batch
+a segment, a streamed table's merges rewrote it every minute or so (sending reads back to cold
+Parquet), and each scan planned a small query of its own. Now a table's log tail is kept between
+queries and extended by new segments, small files merge with files of their size, and a table that
+never changed is planned straight from its tail and files. Queries a second: 760 → 870 at 50
+clients, 826 → 956 at 100, 749 → 934 at 200, 751 → 861 at 400; p99 at 200 clients 1.54 → 0.83 s
+(`logs/round34/users.json`). TPC-H and TPC-DS from files and from memory are no slower. What it also
+showed: the writer, a request at a time, landed 9,770 rows a second beside 50 readers and 2,860
+beside 400 (acks wait behind the queries' tasks on the one runtime): next.
+
 **Now (2026-10-03, round 33, toward 0.33.0): run it for years.**
 
 1. **Every statement remembered** (ADR-048, `history.rs`): `SELECT * FROM pondra.history` has a row

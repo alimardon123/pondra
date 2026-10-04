@@ -106,12 +106,16 @@ pub async fn maintain(lake: &Lake, table: &str, nodes: &[String], me: &str, now_
         shadow(lake, table, &mut meta, &new, false).await?; // (its delete markers, kept to shadow what's older)
         true
     } else if meta.key.is_empty() && (small.len() >= 2 || meta.files.iter().any(mostly_deleted)) {
-        // Small files of one partition merge together (so each file keeps one): 8 at a time, and
-        // all of them before they're sealed (manifests never change, so they'd stay small).
+        // Small files of one partition merge together (so each file keeps one): 8 of about one
+        // size at a time (`class`), and all of them before they're sealed (manifests never change,
+        // so they'd stay small).
         let sealing: std::collections::HashSet<&str> = crate::manifest::to_seal(&meta).iter().map(|f| f.path.as_str()).collect();
-        let mut by_part: BTreeMap<(&str, bool), Vec<DataFile>> = BTreeMap::new();
-        small.iter().for_each(|f| by_part.entry((f.part.as_str(), sealing.contains(f.path.as_str()))).or_default().push(f.clone()));
-        let mut groups: Vec<Vec<DataFile>> = by_part.into_iter().flat_map(|((_, sealing), g)| {
+        let mut by_part: BTreeMap<(&str, bool, u32), Vec<DataFile>> = BTreeMap::new();
+        small.iter().for_each(|f| {
+            let sealing = sealing.contains(f.path.as_str());
+            by_part.entry((f.part.as_str(), sealing, if sealing { 0 } else { class(f.bytes) })).or_default().push(f.clone())
+        });
+        let mut groups: Vec<Vec<DataFile>> = by_part.into_iter().flat_map(|((_, sealing, _), g)| {
             let (least, most) = if sealing { (2, 32) } else { (8, 8) };
             if g.len() < least {
                 return vec![];
@@ -399,6 +403,12 @@ fn run(files: &[DataFile]) -> Vec<DataFile> {
     let from = gens.get(gens.len().saturating_sub(n)).map_or(0, |g| g.0);
     by_age.into_iter().filter(|f| f.ord >= from).collect()
 }
+
+/// A small file's size class, each 4× the last (under 4 MB, under 16, under 64). A merge's file
+/// moves up a class, so it waits for others of its size instead of being merged again with every
+/// new one: merging the newest files into everything before them rewrote a streamed table every
+/// minute or so, and every query read it cold from Parquet until the hot columns had it again.
+fn class(bytes: u64) -> u32 { (bytes >> 20).max(1).ilog2() / 2 }
 
 /// Swap `old` files for `new` ones; the old ones are deleted after the retention period.
 fn replace(meta: &mut TableMeta, old: &[DataFile], new: Vec<DataFile>) {

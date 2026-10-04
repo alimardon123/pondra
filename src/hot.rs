@@ -641,7 +641,16 @@ impl Skip {
         stats
             .entry(column.to_string())
             .or_insert_with(|| {
-                let each: Vec<[ArrayRef; 4]> = self.pieces.iter().map(|(r, i)| r.get(column).map(|r| std::array::from_fn(|k| r[k].slice(*i, 1)))).collect::<Option<_>>()?;
+                // (a run of one file's batches in order is one slice: a partition holds hundreds)
+                let mut runs: Vec<(&Ranges, usize, usize)> = Vec::new();
+                for (r, i) in &self.pieces {
+                    let r = r.get(column)?;
+                    match runs.last_mut() {
+                        Some((last, start, len)) if Arc::ptr_eq(last, r) && *start + *len == *i => *len += 1,
+                        _ => runs.push((r, *i, 1)),
+                    }
+                }
+                let each: Vec<[ArrayRef; 4]> = runs.iter().map(|(r, i, n)| std::array::from_fn(|k| r[k].slice(*i, *n))).collect();
                 let all = |k: usize| datafusion::arrow::compute::concat(&each.iter().map(|r| r[k].as_ref()).collect::<Vec<_>>()).ok();
                 Some(Arc::new([all(0)?, all(1)?, all(2)?, all(3)?]))
             })

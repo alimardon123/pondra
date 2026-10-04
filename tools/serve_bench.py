@@ -2,6 +2,7 @@
 """Serving benchmark: how fast can Pondra answer point lookups and small dashboard queries,
 and how many per second, while new rows keep arriving?
   serve_bench.py [--keys 2000000] [--nodes 1] [--secs 5] [--threads 1,8,32]
+  serve_bench.py --users 50,100,200,400 [--events 5000000] [--secs 10]   # dashboards while writes land
 Prints one JSON line per measurement."""
 import argparse, io, json, os, random, shutil, statistics, subprocess, sys, tempfile, threading, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -52,6 +53,78 @@ def measure(port, make_query, threads, secs, path="/sql"):
     [t.join(10) for t in ts]
     return {"threads": threads, "queries": len(lat), "qps": round(len(lat) / secs), "errors": errs[0],
             "p50_ms": round(statistics.median(lat), 1), "p99_ms": round(sorted(lat)[int(len(lat) * .99)], 1), "max_ms": round(max(lat), 1)}
+
+
+# A dashboard's statements, one a line ({n}: 0-999, {k}: a key): a window of time by country, the
+# top users of a window, a key's row, everything's total (the same text each time), a user's own.
+MIX = """SELECT country, count(*) AS n, sum(amount) AS total FROM events WHERE ts >= {n} * 5000 AND ts < {n} * 5000 + 5000 GROUP BY country ORDER BY n DESC
+SELECT user_id, sum(amount) AS s FROM events WHERE ts >= {n} * 5000 AND ts < {n} * 5000 + 50000 GROUP BY user_id ORDER BY s DESC LIMIT 10
+SELECT id, name, amount FROM kv WHERE id = {k}
+SELECT count(*) AS n, sum(amount) AS total FROM events
+SELECT count(*) AS n, max(amount) AS top FROM events WHERE user_id = {k} AND ts >= {n} * 5000"""
+
+
+def users():
+    """Hundreds of clients on dashboards (`MIX`) while writes land: an append table taking 1,000
+    rows every 50 ms and a keyed one taking upserts. Each step's clients, queries a second, p50 and
+    p99 (each statement's too), and what the writers saw meanwhile."""
+    exe = loadgen()
+    assert exe, "needs Go (tools/loadgen.go)"
+    lake = harness.new_lake()
+    nodes = [Node(lake, A.port + i, reader=(i > 0)).start() for i in range(A.nodes)]
+    p = nodes[0].port
+    q = lambda s: call(p, "POST", "/sql", s.encode(), timeout=3600)
+    t = time.time()
+    q("CREATE TABLE events (ts BIGINT, user_id BIGINT, country VARCHAR, amount DOUBLE)")
+    step = 1_000_000
+    for lo in range(0, A.events, step):  # in time order, as events come: files narrow on ts
+        q(f"INSERT INTO events SELECT value, (value * 7919) % {A.keys}, 'c' || (value % 40), (value % 997) * 0.25 FROM generate_series({lo}, {min(lo + step, A.events) - 1})")
+    q("CREATE TABLE kv (id BIGINT PRIMARY KEY, name VARCHAR, amount BIGINT)")
+    q(f"INSERT INTO kv SELECT value, 'user' || value, value % 1000 FROM generate_series(0, {A.keys - 1})")
+    call(p, "POST", "/tier", timeout=3600)
+    out = {"events": A.events, "keys": A.keys, "nodes": A.nodes, "load_s": round(time.time() - t, 1)}
+    print(json.dumps(out), flush=True)
+    mix = os.path.join(tempfile.mkdtemp(prefix="pondra-mix-"), "mix.sql")
+    open(mix, "w").write(MIX)
+
+    stop, acks, rows = threading.Event(), [], [0]
+
+    def writer(table, make, every):
+        seq = 0
+        while not stop.is_set():
+            seq += 1
+            body = "".join(json.dumps(make()) + "\n" for _ in range(1000 if table == "events" else 100))
+            t = time.time()
+            try:
+                call(p, "POST", f"/append/{table}?producer=w-{table}&seq={seq}", body.encode())
+                acks.append((time.time() - t) * 1000)
+                rows[0] += 1000 if table == "events" else 100
+            except Exception:
+                pass
+            time.sleep(max(0, every - (time.time() - t)))
+
+    clock = [A.events]
+
+    def event():
+        clock[0] += 1
+        return {"ts": clock[0], "user_id": random.randrange(A.keys), "country": f"c{random.randrange(40)}", "amount": random.random() * 250}
+
+    ws = [threading.Thread(target=writer, args=("events", event, 0.05), daemon=True),
+          threading.Thread(target=writer, args=("kv", lambda: {"id": random.randrange(A.keys), "name": "x", "amount": random.randrange(1000)}, 0.05), daemon=True)]
+    [w.start() for w in ws]
+    time.sleep(2)
+    for clients in [int(x) for x in A.users.split(",")]:
+        acks.clear()
+        before = rows[0]
+        r = subprocess.run([exe, "-url", f"http://127.0.0.1:{nodes[-1].port}/sql", "-bodies", mix, "-keys", str(A.keys), "-c", str(clients), "-secs", str(A.secs)],
+                           capture_output=True, text=True, check=True)
+        got = json.loads(r.stdout)
+        a = sorted(acks) or [0]
+        print(json.dumps({**out, "clients": clients, "qps": got["qps"], "errors": got["errors"], "p50_ms": round(got["p50_ms"], 1), "p99_ms": round(got["p99_ms"], 1),
+                          "by": [{"p50_ms": round(b["p50_ms"], 1), "p99_ms": round(b["p99_ms"], 1)} for b in got["by"]],
+                          "writes_rows_s": round((rows[0] - before) / A.secs), "write_ack_p50_ms": round(a[len(a) // 2], 1), "write_ack_p99_ms": round(a[int(len(a) * .99)], 1)}), flush=True)
+    stop.set()
+    [nd.kill() for nd in nodes]
 
 
 def main():
@@ -125,5 +198,7 @@ if __name__ == "__main__":
     ap.add_argument("--threads", default="1,8,32,64")
     ap.add_argument("--port", type=int, default=18300)
     ap.add_argument("--s3", action="store_true")
+    ap.add_argument("--users", default="", help="dashboard clients per step, e.g. 50,100,200,400: users() instead")
+    ap.add_argument("--events", type=int, default=5_000_000)
     A = harness.A = ap.parse_args()
-    main()
+    users() if A.users else main()

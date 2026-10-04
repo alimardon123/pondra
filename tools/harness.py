@@ -848,13 +848,92 @@ def tiering():
     got = {"events": sql(A.port, "SELECT count(*) AS n FROM events")[0]["n"],
            "kv": sql(A.port, "SELECT count(*) AS n, sum(v) AS v FROM kv")[0],
            "totals": sql(A.port, "SELECT sum(amount) AS n FROM totals")[0]["n"]}
+    # Small files merge with others of about their size (`tier::class`): eight rounds' files
+    # become one of the next class, which waits for its kind instead of being merged again with
+    # every new file (each merge had rewritten the whole table).
+    call(A.port, "POST", "/tables/wide", json.dumps([["id", "Int64"], ["s", "Utf8"]]).encode())
+    listed = lambda: [f["path"] for f in json.loads(subprocess.run([BIN, "catalog", "--dir", lake, "t/wide"], capture_output=True, text=True).stdout.split(" ", 1)[1])["files"]]
+    first = None
+    for r in range(1, 17):
+        call(A.port, "POST", f"/append/wide?producer=w&seq={r}", "".join(
+            json.dumps({"id": r * 100000 + i, "s": uuid.uuid4().hex}) + "\n" for i in range(40000)).encode(), timeout=600)
+        call(A.port, "POST", "/tier", timeout=600)
+        if r == 8:
+            first = listed()
+    wide = listed()
     node.kill()
+    classes = len(first) == 1 and first[0] in wide and len(wide) == 2
     ok = (got["events"] == rounds * per and got["totals"] == rounds * per
-          and got["kv"] == {"n": 200, "v": 200 * rounds} and untiered == 0 and max(files.values()) <= 8)
-    print(f"tiering: {rounds} rounds -> files {files}, untiered rows {untiered}, rows {got} -> {'OK' if ok else 'FAIL'}")
+          and got["kv"] == {"n": 200, "v": 200 * rounds} and untiered == 0 and max(files.values()) <= 8 and classes)
+    print(f"tiering: {rounds} rounds -> files {files}, untiered rows {untiered}, rows {got}; "
+          f"a merged file kept while eight more merge: {classes} ({len(first)} then {len(wide)} files) -> {'OK' if ok else 'FAIL'}")
     if not ok:
         sys.exit(1)
-    return f"{rounds} rounds of writes and tiering: log drained, files bounded ({files}), every row exact"
+    return f"{rounds} rounds of writes and tiering: log drained, files bounded ({files}), every row exact; merges by size class"
+
+
+def tails():
+    """A table's log tail is kept from one query to the next and extended (`query::Tail`): every
+    read equals a model while rows stream into two tables, a keyed one among them; a transaction's
+    reads stay at its snapshot while other reads move the kept tail past it; an added column; and
+    a tiering round moving the table's mark."""
+    lake = new_lake()
+    node = Node(lake, A.port, tier_secs=3600).start()
+    q = lambda s: sql(A.port, s)
+    def http(body, session):
+        c = http_client.HTTPConnection("127.0.0.1", A.port, timeout=60)
+        c.request("POST", "/sql", body.encode(), {"x-pondra-session": session})
+        r = c.getresponse()
+        return json.loads(r.read())
+    q("CREATE TABLE t (id BIGINT, s VARCHAR)")
+    q("CREATE TABLE kv (k BIGINT PRIMARY KEY, v BIGINT)")
+    model, kv, wrong = [], {}, []
+    def check(where, read=q):
+        want = {"n": len(model), "s": sum(i for i, _, _ in model), "c": sum(1 for _, s, _ in model if s is not None)}
+        got = read("SELECT count(*) AS n, sum(id) AS s, count(s) AS c FROM t")[0]
+        got_kv = read("SELECT count(*) AS n, sum(v) AS v FROM kv")[0]
+        if got != want or got_kv != {"n": len(kv), "v": sum(kv.values()) if kv else None}:
+            wrong.append((where, got, want, got_kv))
+    def insert(i, x=False):
+        cols, vals = ("(id, s, x)", f"({i}, 's{i}', {i}), ({i + 100000}, NULL, NULL)") if x else ("(id, s)", f"({i}, 's{i}'), ({i + 100000}, NULL)")
+        q(f"INSERT INTO t {cols} VALUES {vals}")
+        model.extend([(i, f"s{i}", i if x else None), (i + 100000, None, None)])
+        q(f"INSERT INTO kv VALUES ({i % 7}, {i})")
+        kv[i % 7] = i
+    for i in range(40):
+        insert(i)
+        check(f"after insert {i}")
+    s = f"tail-{uuid.uuid4().hex[:8]}"
+    http("BEGIN", s)
+    snapshot = http("SELECT count(*) AS n FROM t", s)[0]["n"]
+    for i in range(40, 50):
+        insert(i)
+        check(f"after insert {i}, a transaction open")
+    held = http("SELECT count(*) AS n FROM t", s)[0]["n"]
+    http("ROLLBACK", s)
+    q("ALTER TABLE t ADD COLUMN x BIGINT")
+    for i in range(50, 60):
+        insert(i, x=True)
+        check(f"after insert {i}, a column added")
+    added = q("SELECT count(*) AS n, count(x) AS c, sum(x) AS s FROM t")[0]
+    want_added = {"n": len(model), "c": sum(1 for *_, x in model if x is not None), "s": sum(x for *_, x in model if x is not None)}
+    call(A.port, "POST", "/tier", timeout=600)
+    check("after tiering")
+    for i in range(60, 70):
+        insert(i, x=True)
+        check(f"after insert {i}, tiered")
+    node.kill()
+    checks = {
+        "every read == the model while rows stream in (two tables, one keyed)": not wrong,
+        "a transaction reads its snapshot while other reads move past it": held == snapshot == 80,
+        "rows from before an added column read it as NULL": added == want_added,
+    }
+    for name, good in checks.items():
+        print(f"tails: {name}: {'OK' if good else 'FAIL'}")
+    if not all(checks.values()):
+        print(f"tails: wrong {wrong[:3]}, snapshot {snapshot} held {held}, added {added} (want {want_added})")
+        sys.exit(1)
+    return "a table's log tail kept between queries: reads == the model, a transaction's snapshot, columns added, tiering"
 
 
 def fence():
@@ -7578,7 +7657,7 @@ def friendly():
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    out = {t.__name__: t() for t in (upsert, deal, outside, clouds, kafkas, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, found, renames, workspace, server, scale, flight, users, secrets, safety, versions, stopped, flows, begin, doors, objects, registry, sparksql, variables, scripts, hot, minmax, history, friendly, reader, crash)}
+    out = {t.__name__: t() for t in (upsert, deal, outside, clouds, kafkas, tiering, tails, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, found, renames, workspace, server, scale, flight, users, secrets, safety, versions, stopped, flows, begin, doors, objects, registry, sparksql, variables, scripts, hot, minmax, history, friendly, reader, crash)}
     A.secs = min(A.secs, 20)
     out["load"] = load()
     print(json.dumps(out, indent=1))
@@ -7586,7 +7665,7 @@ def all_tests():
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "found", "renames", "workspace", "server", "scale", "flight", "users", "secrets", "safety", "versions", "stopped", "flows", "begin", "doors", "objects", "registry", "sparksql", "variables", "scripts", "tasks", "hot", "minmax", "history", "friendly", "load", "all"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "tails", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "found", "renames", "workspace", "server", "scale", "flight", "users", "secrets", "safety", "versions", "stopped", "flows", "begin", "doors", "objects", "registry", "sparksql", "variables", "scripts", "tasks", "hot", "minmax", "history", "friendly", "load", "all"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -7598,7 +7677,7 @@ if __name__ == "__main__":
     ap.add_argument("--flush-ms", type=int, default=250)
     A = ap.parse_args()
     try:
-        {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "safety": safety, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "objects": objects, "registry": registry, "sparksql": sparksql, "variables": variables, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "friendly": friendly, "load": load, "all": all_tests}[A.mode]()
+        {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "safety": safety, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "objects": objects, "registry": registry, "sparksql": sparksql, "variables": variables, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "friendly": friendly, "load": load, "all": all_tests}[A.mode]()
     except BaseException as e:  # a failure ends the run, though threads may still wait on a node (crash's producers retry for ever)
         code = e.code if isinstance(e, SystemExit) else 1
         if not isinstance(e, SystemExit):

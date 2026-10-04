@@ -429,6 +429,7 @@ pub struct Lake {
     pub backlog: std::sync::atomic::AtomicU64, // leader: rows in the log not yet tiered (all tables)
     pub rt: Arc<RuntimeEnv>,         // shared by all queries: object store registry + Parquet metadata cache
     tail: Mutex<(lru::LruCache<(u64, String), Rows>, usize)>, // decoded (segment, table) rows; total bytes
+    pub tails: Mutex<(lru::LruCache<String, Arc<crate::query::Tail>>, usize)>, // tables' tails as queries read them (`query::Tail`); total bytes
     pub disk: Option<Arc<crate::cache::Disk>>, // lakes on object storage: the local SSD tier
     pub groups: crate::serve::Groups,          // decoded row groups for key lookups
     pub hot: Arc<crate::hot::Hot>,             // decoded columns of files queries read lately
@@ -612,7 +613,7 @@ impl Lake {
         };
         crate::format::check(&cat, &url, writer).await?; // (a lake a newer Pondra wrote: refused before its tables are read, ADR-039)
         let hwm = watch::Sender::new(cat.get::<u64>("n").await?.unwrap_or(1) - 1);
-        let lake = Arc::new_cyclic(|me| Lake { url, store, cat, hwm, backlog: Default::default(), rt, tail: Mutex::new((lru::LruCache::unbounded(), 0)), disk, groups: crate::serve::Groups::new(cache_mb() << 19), hot: Arc::new(crate::hot::Hot::new()), attached: Default::default(), ids: Default::default(), cached: cached_store, caught: watch::channel(true).0, sessions: Default::default(), me: me.clone() });
+        let lake = Arc::new_cyclic(|me| Lake { url, store, cat, hwm, backlog: Default::default(), rt, tail: Mutex::new((lru::LruCache::unbounded(), 0)), tails: Mutex::new((lru::LruCache::unbounded(), 0)), disk, groups: crate::serve::Groups::new(cache_mb() << 19), hot: Arc::new(crate::hot::Hot::new()), attached: Default::default(), ids: Default::default(), cached: cached_store, caught: watch::channel(true).0, sessions: Default::default(), me: me.clone() });
         lake.hot.watch(); // the decoded columns give memory back when the node needs it
         if let Some(writes) = lake.cat.unstarted.lock().unwrap().take() {
             crate::panics::spawn(lake.clone().commits(writes));

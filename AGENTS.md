@@ -1525,6 +1525,21 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    its deleted versions (since round 33). `harness.py insert`: "every node writes its share" (the
    followers' object writes), the rows, ids and one version, "a GROUP BY is written by one node", "a
    history view spread == one node…", "nothing fell back… (a spread query naming _row_id too)".
+229. **A table's kept log tail holds for one `tiered` mark and one read schema, and a query reads only
+   the part its snapshot covers** (`query::Tail`, `tail_rows`): it grows only by the segments after
+   `through`, in order; a query as of an older commit (a transaction's snapshot, a spread query's
+   slice) takes the rows up to its segment (`ends`), never a later one's; a slice read at an older
+   mark never replaces the node's own; a node keeps 128 MB of tails at most. An append table that
+   never changed is planned straight from its tail and its files when the hot columns are on
+   (`plain_scan`: the rows `raw` reads), any other table as before. Conforming every segment again
+   for each query, a batch a segment, made dashboards three times as costly while rows streamed in.
+   `harness.py tails`: every read == a model while rows land, a transaction's snapshot held while
+   other reads move past it, rows from before an added column, through tiering.
+230. **A merge's file waits for files of its size** (`tier::class`: under 4 MB, 16 MB, 64 MB, each
+   class merged on its own, eight files at a time): merging the newest small files into everything
+   before them rewrote a streamed table every minute or so, and every query read it cold from
+   Parquet until the hot columns had it again. `harness.py tiering`: "a merged file kept while eight
+   more merge".
 
 ## Tests: run these before and after any change
 
@@ -1544,6 +1559,7 @@ python3 tools/harness.py stopped        # a run whose node was killed under it: 
 python3 tools/harness.py scripts        # IF, CASE, loops, handlers, RETURN, EXECUTE IMMEDIATE: errors at their line, scopes, a job run twice writing once, Postgres's protocols
 python3 tools/harness.py variables      # DECLARE $x, $x = …, SET VARIABLE, getvariable: sessions, Postgres, procedures, file runs, db.vars, pondra.parameters
 python3 tools/harness.py hot            # hot columns skip batches by their ranges (a time range, a top-N either way, a key); NULL filters == the model
+python3 tools/harness.py tails          # a table's log tail kept between queries: reads == a model while rows land, a transaction's snapshot, a column added, tiering
 python3 tools/harness.py minmax         # a global min/max over 24 files skips no row its other answers need (an expression, NULLs so far, FILTER); a wide top-N's answer
 python3 tools/harness.py history        # pondra.history: every door's statements, slow ones' plans and three nodes' traces, the rate, off, who reads what
 python3 tools/harness.py friendly       # DuckDB's spellings (PIVOT, COLUMNS, lambdas, ASOF … ON, SUMMARIZE, samples, …) == DuckDB's answers; spread, Postgres, views
