@@ -115,7 +115,7 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
         // (A new table reads the log from now on: a table of this name dropped earlier left rows
         // in segments that aren't expired yet.)
         None => {
-            ensure!(lake.cat.get::<Value>(&crate::seq::key(name)).await?.is_none(), "relation \"{name}\" already exists: a sequence has the name");
+            crate::ddl::unclaimed(lake, name).await?;
             let folder = crate::ddl::free_folder(lake, name).await?; // (a renamed table may still have this name's folder)
             let mut identity = identity;
             for (c, i) in identity.iter_mut() {
@@ -391,6 +391,9 @@ pub fn parse(sql: &str) -> Option<Stmt> {
     }
     if let Some(s) = crate::seq::statement(sql) {
         return Some(s); // (CREATE, ALTER, DROP SEQUENCE)
+    }
+    if let Some(s) = crate::index::statement(sql) {
+        return Some(s); // (CREATE, ALTER, DROP INDEX)
     }
     if let Some(sql) = crate::seq::in_order(sql) {
         return parse(&sql); // (an identity's options as the parser takes them)
@@ -1249,6 +1252,9 @@ async fn on_node_listed(app: &crate::server::App, stmt: Stmt, job: Option<String
                 post(&app.cluster.leader.addr, &Request::Ddl(d.clone())).await?
             };
             crate::ddl::settle(lake, &d, &app.cluster.addr).await?; // (ATTACH, DETACH: here at once)
+            if let Some(n) = out["notice"].as_str() {
+                crate::routines::heard(n); // (carried out on the leader, perhaps over HTTP: told here, through this door)
+            }
         }
         return Ok(out);
     }

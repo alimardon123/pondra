@@ -174,6 +174,15 @@ pub async fn new_name(lake: &Lake, name: &str) -> Result<String> {
     Ok(join(s, t))
 }
 
+/// Sequences and indexes share names with tables and views (as in Postgres's `pg_class`): a table
+/// or view can't take a name one of them has.
+pub async fn unclaimed(lake: &Lake, name: &str) -> Result<()> {
+    for (key, what) in [(crate::seq::key(name), "a sequence"), (crate::index::key(name), "an index")] {
+        ensure!(lake.cat.get::<Value>(&key).await?.is_none(), "relation \"{name}\" already exists: {what} has the name");
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------- statements
 
 /// A statement that changes what the lake holds, not its rows: the leader carries it out.
@@ -216,6 +225,7 @@ pub enum Ddl {
     DetachView { name: String },                             // ALTER MATERIALIZED VIEW v DETACH: its rows stop following, and stay a table
     Object(crate::objects::Op),                              // the registry's: COMMENT ON, CREATE OR ALTER TABLE (`objects.rs`)
     Sequence(crate::seq::Change),                            // CREATE, ALTER, DROP SEQUENCE (`seq.rs`)
+    Index(crate::index::Change),                             // CREATE, ALTER, DROP INDEX (`index.rs`)
 }
 
 /// What `ALTER TABLE` does to a column: rename it, drop it, or widen its type (a SQL type).
@@ -234,6 +244,7 @@ pub async fn apply(lake: &Lake, d: Ddl) -> Result<Value> {
     let out = carry_out(lake, d).await?;
     if moves {
         crate::objects::follow(lake, &out).await?;
+        crate::index::follow(lake, &out).await?;
     }
     Ok(out)
 }
@@ -284,6 +295,7 @@ async fn carry_out(lake: &Lake, d: Ddl) -> Result<Value> {
         Ddl::DetachView { name } => detach_view(lake, &new_name(lake, &name).await?).await,
         Ddl::Object(op) => crate::objects::apply(lake, op).await,
         Ddl::Sequence(c) => crate::seq::apply(lake, c).await,
+        Ddl::Index(c) => crate::index::apply(lake, c).await,
         Ddl::CreateSchema { name, if_not_exists } => {
             check(&name)?;
             if has_schema(lake, &name).await? {
@@ -692,6 +704,7 @@ pub async fn settle(lake: &Lake, d: &Ddl, me: &str) -> Result<()> {
 /// to be sure it can be, and kept as written.
 async fn create_view(lake: &Lake, name: &str, sql: String, replace: bool, external: bool) -> Result<Value> {
     let name = new_name(lake, name).await?;
+    unclaimed(lake, &name).await?;
     ensure!(lake.cat.get::<TableMeta>(&table_key(&name)).await?.is_none(), "{name} is a table");
     ensure!(lake.cat.get::<Value>(&crate::views::view_key(&name)).await?.is_none(), "{name} is a materialized view");
     ensure!(replace || lake.cat.get::<StoredView>(&query_key(&name)).await?.is_none(), "view {name} already exists (CREATE OR REPLACE VIEW)");
@@ -879,6 +892,7 @@ async fn rename(lake: &Lake, name: &str, to: &str) -> Result<Value> {
     let taken = lake.cat.get::<TableMeta>(&table_key(&to)).await?.is_some() || lake.cat.get::<StoredView>(&query_key(&to)).await?.is_some()
         || lake.cat.get::<Value>(&crate::views::view_key(&to)).await?.is_some();
     ensure!(!taken, "{to} exists already");
+    unclaimed(lake, &to).await?;
     if let Some(v) = lake.cat.get::<StoredView>(&query_key(&name)).await? {
         lake.cat.commit(vec![(query_key(&to), json(&v))], &[query_key(&name)]).await?;
         return Ok(j!({"view": name, "renamed": to}));

@@ -386,6 +386,7 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, o: Options) -> Result<()
         return Ok(()); // (asked again, the same: a notebook cell run twice)
     }
     ensure!(lake.cat.get::<TableMeta>(&table_key(name)).await?.is_none(), "table {name} already exists");
+    crate::ddl::unclaimed(lake, name).await?;
     let (other, source) = crate::ddl::resolve(lake, &first_table(sql)?).await?;
     ensure!(other.is_none(), "a view follows a table of this lake");
     let src: TableMeta = lake.cat.get::<TableMeta>(&table_key(&source)).await?.with_context(|| format!("no table {source}"))?.logical(); // (SQL's names: ADR-022)

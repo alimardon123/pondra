@@ -29,6 +29,7 @@ mod flight;
 mod fresh;
 mod fsum;
 mod hot;
+mod index;
 mod intervals;
 mod layout;
 mod iceberg;

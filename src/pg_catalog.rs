@@ -121,7 +121,19 @@ struct Rel {
     bytes: u64,
 }
 
+/// An index made with `CREATE INDEX` (`index.rs`): a key's own index is its table's `Rel`'s.
+struct PgIndex {
+    oid: u32,
+    schema: String,
+    name: String,
+    table: u32,
+    table_name: String,
+    at: Vec<i16>, // its keys' columns, numbered from 1 (0: an expression)
+    def: String,
+}
+
 struct Lakes {
+    indexes: Vec<PgIndex>,
     database: String,
     databases: Vec<String>,
     user: String,
@@ -153,7 +165,7 @@ const CATALOG: &[(&str, u32)] = &[("pg_class", 1259), ("pg_namespace", 2615), ("
     ("pg_inherits", 2611), ("pg_enum", 3501), ("pg_collation", 3456), ("pg_extension", 3079), ("pg_roles", 1260), ("pg_settings", 12000), ("pg_tables", 12001),
     ("pg_views", 12002), ("pg_matviews", 12003), ("pg_user", 12004), ("pg_range", 3541), ("pg_trigger", 2620), ("pg_tablespace", 1213), ("pg_sequence", 2224),
     ("pg_foreign_table", 3118), ("pg_partitioned_table", 3350), ("pg_stat_activity", 12005), ("pg_policy", 3256), ("pg_statistic_ext", 3381), ("pg_publication", 6104),
-    ("pg_authid", 1260), ("pg_shdescription", 2396), ("pg_publication_namespace", 6237), ("pg_publication_rel", 6106), ("pg_language", 2612), ("pg_opclass", 2616), ("pg_event_trigger", 3466), ("pg_cast", 2605)];
+    ("pg_authid", 1260), ("pg_shdescription", 2396), ("pg_publication_namespace", 6237), ("pg_publication_rel", 6106), ("pg_language", 2612), ("pg_opclass", 2616), ("pg_event_trigger", 3466), ("pg_cast", 2605), ("pg_indexes", 12006)];
 
 async fn lakes(lake: &Lake, user: &str, columns: bool) -> Result<Lakes> {
     let schemas = crate::ddl::schemas(lake).await?;
@@ -208,13 +220,27 @@ async fn lakes(lake: &Lake, user: &str, columns: bool) -> Result<Lakes> {
         let (s, n) = crate::ddl::split(&k[2..]);
         (oid("p", &k[2..]), s.to_string(), n.to_string(), r)
     }).collect();
+    let mut indexes = vec![];
+    for (k, i) in lake.cat.scan::<crate::index::Index>("ix/", "ix0").await? {
+        let Some(r) = rels.iter().find(|r| r.oid == oid("r", &i.table)) else { continue };
+        let meta = lake.cat.get::<TableMeta>(&crate::store::table_key(&i.table)).await?;
+        let name = crate::ddl::split(&k[3..]).1.to_string();
+        let at = i.keys.iter().map(|key| {
+            let column = key.expr.strip_prefix('"').and_then(|e| e.strip_suffix('"')).filter(|c| !c.contains('"'));
+            let named = column.map(|c| meta.as_ref().map_or(c, |m| m.name_of(c)));
+            named.and_then(|c| r.columns.iter().position(|(n, ..)| n == c)).map_or(0, |p| p as i16 + 1)
+        }).collect();
+        let table = format!("{}.{}", crate::objects::ident(&r.schema), crate::objects::ident(&r.name));
+        let def = crate::index::create_sql(&crate::objects::ident(&name), &table, &i, meta.as_ref());
+        indexes.push(PgIndex { oid: oid("ix", &k[3..]), schema: r.schema.clone(), name, table: r.oid, table_name: r.name.clone(), at, def });
+    }
     let database = crate::ddl::lake_name(lake);
     let mut databases = vec![database.clone()];
     databases.extend(lake.attached.read().unwrap().iter().map(|(n, _)| n.clone()));
     let mut all_schemas: Vec<(u32, String)> = vec![(11, "pg_catalog".into()), (13_000, "information_schema".into())];
     all_schemas.extend(schemas.iter().map(|s| (schema_oid(s), s.clone())));
     all_schemas.push((schema_oid(TEMP), TEMP.into()));
-    Ok(Lakes { database, databases, user: user.into(), schemas: all_schemas, rels, routines })
+    Ok(Lakes { indexes, database, databases, user: user.into(), schemas: all_schemas, rels, routines })
 }
 
 // ---------------------------------------------------------------- tables
@@ -260,12 +286,16 @@ fn tables(l: &Lakes) -> Result<Vec<(&'static str, Arc<MemTable>)>> {
     let mut classes = vec![];
     for r in &l.rels {
         classes.push(vec![o(r.oid), s(r.name.clone()), o(ns(&r.schema)), o(0), o(0), o(owner), o(if r.kind == 'v' { 0 } else { 2 }), o(r.oid), o(0), i4((r.bytes / 8192) as i32),
-            f4(if r.kind == 'v' { -1.0 } else { r.rows as f32 }), i4(0), o(0), b(!r.key.is_empty()), b(false), s(if r.schema == TEMP { "t" } else { "p" }), s(r.kind.to_string()), i2(r.columns.len() as i16), i2(0),
+            f4(if r.kind == 'v' { -1.0 } else { r.rows as f32 }), i4(0), o(0), b(!r.key.is_empty() || l.indexes.iter().any(|i| i.table == r.oid)), b(false), s(if r.schema == TEMP { "t" } else { "p" }), s(r.kind.to_string()), i2(r.columns.len() as i16), i2(0),
             b(r.kind == 'v'), b(false), b(false), b(false), b(false), b(true), s("d"), b(false), o(0), n(), n(), n()]);
         if !r.key.is_empty() {
             classes.push(vec![o(oid("i", &format!("{}.{}", r.schema, r.name))), s(format!("{}_pkey", r.name)), o(ns(&r.schema)), o(0), o(0), o(owner), o(403), o(0), o(0), i4(1), f4(r.rows as f32),
                 i4(0), o(0), b(false), b(false), s("p"), s("i"), i2(r.key.len() as i16), i2(0), b(false), b(false), b(false), b(false), b(false), b(true), s("n"), b(false), o(0), n(), n(), n()]);
         }
+    }
+    for i in &l.indexes {
+        classes.push(vec![o(i.oid), s(i.name.clone()), o(ns(&i.schema)), o(0), o(0), o(owner), o(403), o(0), o(0), i4(1), f4(0.0),
+            i4(0), o(0), b(false), b(false), s("p"), s("i"), i2(i.at.len() as i16), i2(0), b(false), b(false), b(false), b(false), b(false), b(true), s("n"), b(false), o(0), n(), n(), n()]);
     }
     for (name, oid) in CATALOG {
         classes.push(vec![o(*oid), s(*name), o(11), o(0), o(0), o(owner), o(0), o(*oid), o(0), i4(0), f4(-1.0), i4(0), o(0), b(false), b(false), s("p"), s("v"), i2(0), i2(0),
@@ -329,6 +359,11 @@ fn tables(l: &Lakes) -> Result<Vec<(&'static str, Arc<MemTable>)>> {
         constraints.push(vec![o(oid("c", &full)), s(format!("{}_pkey", r.name)), o(ns(&r.schema)), s("p"), b(false), b(false), b(true), o(r.oid), o(0), o(oid("i", &full)), o(0), o(0), s(" "), s(" "), s(" "),
             b(true), i4(0), b(true), i2s(&at), n(), n()]);
     }
+    for i in &l.indexes {
+        let each = |v: ScalarValue| ScalarValue::List(ScalarValue::new_list_nullable(&i.at.iter().map(|_| v.clone()).collect::<Vec<_>>(), &OID));
+        indexes.push(vec![o(i.oid), o(i.table), i2(i.at.len() as i16), i2(i.at.len() as i16), b(false), b(false), b(false), b(false), b(true), b(false), b(true), b(false), b(true), b(true), b(false), i2s(&i.at), each(o(0)),
+            each(o(3124)), i2s(&i.at.iter().map(|_| 0).collect::<Vec<_>>()), n(), n()]);
+    }
     out.push(("pg_index", table(&[("indexrelid", OID), ("indrelid", OID), ("indnatts", INT2), ("indnkeyatts", INT2), ("indisunique", BOOL), ("indnullsnotdistinct", BOOL), ("indisprimary", BOOL), ("indisexclusion", BOOL),
         ("indimmediate", BOOL), ("indisclustered", BOOL), ("indisvalid", BOOL), ("indcheckxmin", BOOL), ("indisready", BOOL), ("indislive", BOOL), ("indisreplident", BOOL),
         ("indkey", list(INT2)), ("indcollation", list(OID)), ("indclass", list(OID)), ("indoption", list(INT2)), ("indexprs", TEXT), ("indpred", TEXT)], indexes)?));
@@ -339,6 +374,12 @@ fn tables(l: &Lakes) -> Result<Vec<(&'static str, Arc<MemTable>)>> {
     let rel_rows = |kind: char| l.rels.iter().filter(move |r| r.kind == kind);
     out.push(("pg_tables", table(&[("schemaname", TEXT), ("tablename", TEXT), ("tableowner", TEXT), ("tablespace", TEXT), ("hasindexes", BOOL), ("hasrules", BOOL), ("hastriggers", BOOL), ("rowsecurity", BOOL)],
         rel_rows('r').map(|r| vec![s(r.schema.clone()), s(r.name.clone()), s(l.user.clone()), n(), b(!r.key.is_empty()), b(false), b(false), b(false)]).collect())?));
+    let mut listed: Vec<Vec<ScalarValue>> = l.rels.iter().filter(|r| !r.key.is_empty()).map(|r| {
+        let def = format!("CREATE UNIQUE INDEX {}_pkey ON {}.{} USING btree ({})", r.name, r.schema, r.name, r.key.join(", "));
+        vec![s(r.schema.clone()), s(r.name.clone()), s(format!("{}_pkey", r.name)), n(), s(def)]
+    }).collect();
+    listed.extend(l.indexes.iter().map(|i| vec![s(i.schema.clone()), s(i.table_name.clone()), s(i.name.clone()), n(), s(i.def.clone())]));
+    out.push(("pg_indexes", table(&[("schemaname", TEXT), ("tablename", TEXT), ("indexname", TEXT), ("tablespace", TEXT), ("indexdef", TEXT)], listed)?));
     out.push(("pg_views", table(&[("schemaname", TEXT), ("viewname", TEXT), ("viewowner", TEXT), ("definition", TEXT)],
         rel_rows('v').map(|r| vec![s(r.schema.clone()), s(r.name.clone()), s(l.user.clone()), s(r.sql.clone().unwrap_or_default())]).collect())?));
     out.push(("pg_matviews", table(&[("schemaname", TEXT), ("matviewname", TEXT), ("matviewowner", TEXT), ("tablespace", TEXT), ("hasindexes", BOOL), ("ispopulated", BOOL), ("definition", TEXT)],
@@ -694,9 +735,10 @@ fn register_functions(ctx: &SessionContext, l: Arc<Lakes>) {
         let v = int_arg(&a[0])?;
         Ok(texts_out((0..n).map(|i| v[i].and_then(|o| k2.get(&(o as u32))).map(|(_, k)| format!("PRIMARY KEY ({})", k.join(", "))))))
     }));
+    let made: BTreeMap<u32, String> = l.indexes.iter().map(|i| (i.oid, i.def.clone())).collect();
     ctx.register_udf(udf("pg_get_indexdef", to_text, move |a, n| {
         let v = int_arg(&a[0])?;
-        Ok(texts_out((0..n).map(|i| v[i].and_then(|o| keys.get(&(o as u32))).map(|(t, k)| format!("CREATE UNIQUE INDEX {t}_pkey ON {t} USING btree ({})", k.join(", "))))))
+        Ok(texts_out((0..n).map(|i| v[i].and_then(|o| made.get(&(o as u32)).cloned().or_else(|| keys.get(&(o as u32)).map(|(t, k)| format!("CREATE UNIQUE INDEX {t}_pkey ON {t} USING btree ({})", k.join(", "))))))))
     }));
     // Functions and procedures: what they take and give, as `\df` shows them.
     let sigs: Arc<BTreeMap<u32, (String, String)>> = Arc::new(l.routines.iter().map(|(oid, _, _, r)| {
@@ -786,7 +828,7 @@ fn regproc(e: &ast::Expr) -> bool {
 
 fn boolean(e: &ast::Expr) -> bool {
     static NAMES: std::sync::LazyLock<std::collections::HashSet<String>> = std::sync::LazyLock::new(|| {
-        let empty = Lakes { database: String::new(), databases: vec![], user: String::new(), schemas: vec![], rels: vec![], routines: vec![] };
+        let empty = Lakes { database: String::new(), databases: vec![], user: String::new(), schemas: vec![], rels: vec![], routines: vec![], indexes: vec![] };
         tables(&empty).unwrap_or_default().iter().flat_map(|(_, t)| datafusion::datasource::TableProvider::schema(t.as_ref()).fields().iter().filter(|f| *f.data_type() == DataType::Boolean).map(|f| f.name().clone()).collect::<Vec<_>>()).collect()
     });
     let name = match e {

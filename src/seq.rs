@@ -180,7 +180,7 @@ pub fn statement(sql: &str) -> Option<Stmt> {
 }
 
 /// A name as SQL resolves it (`S` is `s`, `"S"` is `S`), as `nextval('…')` and `ALTER` give it.
-fn object_of(name: &str) -> String {
+pub fn object_of(name: &str) -> String {
     use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
     let parsed = Parser::new(&GenericDialect {}).try_with_sql(name).and_then(|mut p| p.parse_object_name(false));
     parsed.map(|n| crate::write::object(&n)).unwrap_or_else(|_| name.to_lowercase())
@@ -339,9 +339,9 @@ pub async fn apply(lake: &Lake, c: Change) -> Result<Value> {
     }
 }
 
-/// A table or view of that name?
+/// A table, view or index of that name?
 async fn relation(lake: &Lake, name: &str) -> Result<bool> {
-    Ok(lake.cat.get::<Value>(&crate::store::table_key(name)).await?.is_some() || lake.cat.get::<Value>(&crate::ddl::query_key(name)).await?.is_some())
+    Ok(lake.cat.get::<Value>(&crate::store::table_key(name)).await?.is_some() || lake.cat.get::<Value>(&crate::ddl::query_key(name)).await?.is_some() || lake.cat.get::<Value>(&crate::index::key(name)).await?.is_some())
 }
 
 /// The sequence a name resolves to in this lake.

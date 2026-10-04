@@ -67,8 +67,8 @@ src/      28,600 lines of Rust, one file per concern (see the table in README.md
           ADR-041), past.rs (a table's past: `AT (…)`, `RESTORE`, ADR-043) and history.rs (every
           statement a row of `pondra.history`, slow ones with plans and traces, ADR-048); round 34
           friendly.rs (DuckDB's spellings, rewritten where SQL comes in: invariant 225), objects.rs
-          (one registry of every kind of object: ADR-049, invariant 227) and seq.rs (sequences and
-          identity columns: invariant 234)
+          (one registry of every kind of object: ADR-049, invariant 227), seq.rs (sequences and
+          identity columns: invariant 234) and index.rs (indexes kept as objects: invariant 235)
 brand/    the logo (mark.svg), colours (colors.css) and fonts (fonts/: Geist and Geist Mono, SIL
           OFL): the only copies; tools/brand_check.py
 site/     the documentation website (Starlight; ADR-030): site/STYLE.md says how pages are written,
@@ -137,7 +137,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
   and window emission), `v/` views, `w/` session views' bounds, `k/` tasks, `x/` Delta and `i/`
   Iceberg publish state, `a/` lakes attached, `f/` functions, `r/` macros and procedures, `e/`
   secrets (sealed), `o/` catalogs attached from outside and `fd/` feeds (round 23), `sq/` sequences
-  (round 34: only the sequencer writes them), `m` members
+  (round 34: only the sequencer writes them), `ix/` indexes (round 34), `m` members
   (replicated acks), `n` next segment, `c` commit number. One process (the leader) writes it;
   everyone reads it.
 - **Writes:** a client POSTs a batch to *any* node. That node encodes it (Arrow IPC + ZSTD), runs
@@ -1576,6 +1576,13 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    Flight, `COPY`) keep a given value, as Postgres's `COPY` does. `harness.py sequences`: with the
    numbers shared, "…RESTART…" hands out the old block; "after the leader is killed…" checks no
    value comes twice.
+235. **An index is an object, never a promise of speed** (`index.rs`, `ix/{schema.name}`): `CREATE
+   INDEX` keeps its definition (keys over stored column names, so a rename is followed), says in a
+   notice that nothing is built (files' ranges and `CLUSTER BY` are what skip data), and shares the
+   relation names of tables, views and sequences (`ddl::unclaimed`, `seq::relation`). It goes with
+   its table, and with a column it names (`index::follow`, after `objects::follow`). What would be
+   a promise (`UNIQUE`, `USING hnsw | ivfflat | bm25`) is refused by name until it is kept.
+   `harness.py registry`: an index through a column's rename, a table's rename and drops; refusals.
 
 ## Tests: run these before and after any change
 

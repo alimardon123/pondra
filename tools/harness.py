@@ -6876,7 +6876,7 @@ def registry():
     following a rename and gone with a drop; `CREATE OR ALTER TABLE` makes, adds, widens, takes away
     options and refuses what would lose rows; `GET /kinds`."""
     lake = new_lake()
-    node = Node(lake, A.port).start()
+    node = Node(lake, A.port, pg=f"127.0.0.1:{A.port + 10}").start()
     q = lambda s: sql(A.port, s)
     def http(body):
         c = http_client.HTTPConnection("127.0.0.1", A.port, timeout=60)
@@ -6904,13 +6904,15 @@ def registry():
         ("role", "analyst", "CREATE ROLE analyst"),
         ("sequence", "order_no", "CREATE SEQUENCE order_no AS integer START WITH 1000 INCREMENT BY 10 CACHE 5"),
         ("table", "tickets", "CREATE TABLE tickets (id BIGINT GENERATED ALWAYS AS IDENTITY (START WITH 5), title VARCHAR)"),
+        ("index", "sales.orders_region_at_idx", "CREATE INDEX ON sales.orders (region, at DESC)"),
+        ("index", "clicks_lower_page", "CREATE INDEX clicks_lower_page ON clicks USING brin (lower(page)) WHERE page IS NOT NULL"),
     ]
     for _, _, stmt in made:
         q(stmt)
     q("ALTER TASK tidy SUSPEND")
     word = lambda k: {"macro": "FUNCTION", "table function": "FUNCTION"}.get(k, k.upper())
     comments = {"schema": "sales", "table": "sales.orders", "view": "eu_orders", "materialized view": "per_page", "function": "net",
-                "procedure": "note_click", "task": "tidy", "role": "analyst", "sequence": "order_no"}
+                "procedure": "note_click", "task": "tidy", "role": "analyst", "sequence": "order_no", "index": "clicks_lower_page"}
     for k, n in comments.items():
         q(f"COMMENT ON {k.upper()} {n} IS 'about {n}'")
     q("COMMENT ON COLUMN sales.orders.amount IS $$in euros, it's net$$")
@@ -6927,7 +6929,7 @@ def registry():
     before = {(k, n): show(k, n) for k, n, _ in made}
     info["shown"] = {f"{k} {n}": v for (k, n), v in before.items()}
     drops = {"schema": None, "table": "DROP TABLE", "view": "DROP VIEW", "materialized view": "DROP MATERIALIZED VIEW", "macro": "DROP MACRO", "function": "DROP FUNCTION",
-             "table function": "DROP FUNCTION", "procedure": "DROP PROCEDURE", "task": "DROP TASK", "role": "DROP ROLE", "sequence": "DROP SEQUENCE"}
+             "table function": "DROP FUNCTION", "procedure": "DROP PROCEDURE", "task": "DROP TASK", "role": "DROP ROLE", "sequence": "DROP SEQUENCE", "index": "DROP INDEX"}
     for k, n, _ in reversed(made):
         if drops[k] and k != "table":
             q(f"{drops[k]} {n}")
@@ -6946,6 +6948,40 @@ def registry():
     moved = q("SELECT name, comment FROM pondra.objects WHERE kind = 'table' AND schema = 'sales'")
     checks["a renamed table keeps its comments, its columns' too"] = moved == [{"name": "orders_2025", "comment": "about sales.orders"}] \
         and "IS 'in euros, it''s net'" in show("table", "sales.orders_2025")
+    # Indexes: objects with a notice, in pg_indexes, following renames, gone with their columns and tables
+    def told(stmt):
+        c = http_client.HTTPConnection("127.0.0.1", A.port, timeout=60)
+        c.request("POST", "/sql", stmt.encode())
+        r = c.getresponse()
+        r.read()
+        return r.status, " ".join(json.loads(r.getheader("x-pondra-notices") or "[]"))
+    q("CREATE TABLE visits (page VARCHAR, n INT)")
+    notice = told("CREATE INDEX ON visits (page)")
+    again = told("CREATE INDEX IF NOT EXISTS visits_page_idx ON visits (page)")
+    q("CREATE INDEX visits_lower ON visits USING brin (lower(page)) WHERE page IS NOT NULL")
+    q("ALTER TABLE visits RENAME COLUMN page TO path")
+    import psycopg
+    with psycopg.connect(f"host=127.0.0.1 port={A.port + 10} user=pondra dbname=pondra", autocommit=True) as c:  # (Postgres's catalog is the Postgres port's)
+        pg = [{"indexname": n, "indexdef": d} for n, d in c.execute("SELECT indexname, indexdef FROM pg_indexes WHERE tablename = 'visits' ORDER BY indexname").fetchall()]
+    q("ALTER INDEX visits_page_idx RENAME TO visits_path")
+    indexes = lambda: [r["name"] for r in q("SELECT name FROM pondra.objects WHERE kind = 'index' ORDER BY name")]
+    renamed = indexes()
+    refused_ix = [http(s) for s in ("CREATE INDEX v_idx ON eu_orders (id)", "CREATE INDEX ON visits (nothing)", "CREATE INDEX ON visits USING hnsw (path)",
+                                    "CREATE UNIQUE INDEX ON visits (path)", "CREATE TABLE visits_path (x INT)", "CREATE INDEX visits ON totals (region)")]
+    q("ALTER TABLE visits DROP COLUMN path")
+    after_column = indexes()
+    q("CREATE INDEX ON totals (region)")
+    q("DROP TABLE totals")
+    after_table = indexes()
+    info["indexes"] = [notice, again, pg, renamed, refused_ix, after_column, after_table, show("index", "sales.orders_region_at_idx")]
+    checks["CREATE INDEX: an object with a notice, in pg_indexes, renamed, refused by name where it can't be, gone with its column and its table"] = \
+        notice[0] == 200 and "nothing is built" in notice[1] and again == (200, 'relation "visits_page_idx" already exists, skipping') \
+        and pg == [{"indexname": "visits_lower", "indexdef": "CREATE INDEX visits_lower ON public.visits USING brin (lower(path)) WHERE (path IS NOT NULL)"},
+                   {"indexname": "visits_page_idx", "indexdef": "CREATE INDEX visits_page_idx ON public.visits (path)"}] \
+        and renamed == ["clicks_lower_page", "orders_region_at_idx", "visits_lower", "visits_path"] and [r[0] for r in refused_ix] == [500] * 6 \
+        and "hnsw" in refused_ix[2][1] and "a view" in refused_ix[0][1] and "an index has the name" in refused_ix[4][1] \
+        and after_column == ["clicks_lower_page", "orders_region_at_idx"] and after_table == after_column \
+        and show("index", "sales.orders_region_at_idx") == "CREATE INDEX orders_region_at_idx ON sales.orders_2025 (region, at DESC);"
     # CREATE OR ALTER TABLE
     first = q("CREATE OR ALTER TABLE events (id BIGINT, kind VARCHAR) CLUSTER BY (kind) WITH (retention = '1 day')")
     q("INSERT INTO events VALUES (1, 'a')")

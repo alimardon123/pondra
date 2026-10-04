@@ -286,6 +286,34 @@ INSERT INTO invoices (amount) VALUES (12.50);
   2 | no coffee
 ```
 
+### Indexes
+
+| Statement | Syntax |
+|---|---|
+| Make one | `CREATE INDEX [IF NOT EXISTS] [name] ON t [USING method] (column \| (expression) [ASC \| DESC] [NULLS FIRST \| LAST], …) [INCLUDE (column, …)] [WHERE condition]` |
+| Rename | `ALTER INDEX [IF EXISTS] name RENAME TO new_name` |
+| Drop | `DROP INDEX [IF EXISTS] name [, …]` |
+
+An index is an object like a table's others: listed in `pondra.objects` and `pg_indexes`, shown by
+`SHOW CREATE INDEX`, described by `COMMENT ON INDEX`. Nothing is built for it, and a notice says so:
+every file keeps its columns' ranges, which a filter skips files and row groups by, and
+`CLUSTER BY` orders a table's rows to keep those ranges narrow. So a schema copied from Postgres,
+an ORM's migrations or dbt's indexes run as they are. An index is in its table's schema, shares
+names with tables, views and sequences, follows a renamed table or column, and goes with its table
+or a column it names. Left without a name it is called `{table}_{columns}_idx`. `CREATE UNIQUE
+INDEX` and vector and text indexes (`USING hnsw`, `ivfflat`, `bm25`) are refused by name.
+
+```sql
+CREATE INDEX ON tickets (title);
+SELECT name, definition FROM pondra.objects WHERE kind = 'index';
+```
+
+```text
+       name       |                    definition
+------------------+---------------------------------------------------
+ tickets_title_idx | CREATE INDEX tickets_title_idx ON tickets (title)
+```
+
 ## Rows
 
 | Statement | Syntax |
@@ -866,7 +894,7 @@ Pondra refuses these by name, so a statement never runs and quietly does somethi
 | a column called `_row_id`, `_version`, `_created_at` or `_updated_at` | refused: every table has them already |
 | `DROP TABLE` while a view or task reads the table | refused; drop the view or task first |
 | a change to a table a window, session, join or min/max view follows | refused, with the view's name, because such a view cannot take a row back |
-| `CREATE INDEX` | not supported: files carry their columns' ranges, and `cluster_by` orders them |
+| `CREATE UNIQUE INDEX`; `CREATE INDEX … USING hnsw \| ivfflat \| bm25` | refused by name ([Indexes](#indexes): an index is kept, nothing is built) |
 | `SAVEPOINT`, `ROLLBACK TO` | refused: a transaction commits or rolls back whole |
 | `CREATE`, `ALTER`, `DROP` inside `BEGIN` … `COMMIT` | refused (`0A000`): run them outside the transaction |
 | a materialized view of a `GROUP BY` view that isn't a rollup | refused, saying why ([Flows](/pondra/guides/flows/)) |
