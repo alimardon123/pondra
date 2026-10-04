@@ -10,6 +10,7 @@ name: build
 # where it works), unless the pull request asks: the label `ci` builds linux-x64 with the suite,
 # and `full-ci` all five, as main would, once before it merges. Decided from the labels alone, so a
 # push that asks for nothing never waits for a runner to say so; a newer push stops the older run.
+# Two pull requests' runs go at once: a third waits, holding no runner, until ci-slots.yml starts it.
 on:
   push:
     branches: [main]
@@ -45,6 +46,8 @@ jobs:
       matrix: ${{ steps.plan.outputs.matrix }}
       resilience: ${{ steps.plan.outputs.resilience }}
       upgrade: ${{ steps.plan.outputs.upgrade }}
+      deploy: ${{ steps.plan.outputs.deploy }}
+      wait: ${{ steps.plan.outputs.wait }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -53,6 +56,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           FULL: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'full-ci') }}
+          PR: ${{ github.event.pull_request.number }}
         run: |
           # (linux-x64 pinned: ubuntu-latest becomes 26.04 from 2026-10-19; moved on purpose, after a
           # green run there. macos-13 was retired; Intel images last until 2027.)
@@ -70,18 +74,41 @@ jobs:
           if [ "$FULL" != true ]; then echo "linux-x64 alone (the label \`ci\`). Before merging, the label \`full-ci\` builds all five platforms." >> "$GITHUB_STEP_SUMMARY"; fi
           echo "matrix=$(jq -c --argjson full "$FULL" '{include: [.[] | select($full or .platform == "linux-x64")]}' <<< "$platforms")" >> "$GITHUB_OUTPUT"
           # The tests of what a pull request's run builds, called below once it is built: upgrade
-          # always, resilience when what it puts under failure changes. (The files from git: the
-          # API's hourly allowance for the repository runs out on a busy day.)
+          # always, resilience when what it puts under failure changes, deploy's (all five
+          # platforms: `full-ci`) when what it tries changes. (The files from git: the API's hourly
+          # allowance for the repository runs out on a busy day.)
           if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
             files=$(git diff --name-only HEAD^1 HEAD)
             if grep -qE '^(src/|Cargo\.(toml|lock)$|python/pondra/client\.py$|js/index\.js$|tools/(resilience_check|faulty_s3|sim_r2|harness)\.py$|tools/ci_artifact\.sh$|\.github/workflows/(resilience|build)\.yml$)' <<< "$files"; then resilience=true; else resilience=false; fi
-            printf 'upgrade=true\nresilience=%s\n' "$resilience" >> "$GITHUB_OUTPUT"
-            echo "After the build: upgrade$([ "$resilience" = false ] || echo ' and resilience')." >> "$GITHUB_STEP_SUMMARY"
+            if [ "$FULL" = true ] && grep -qE '^(deploy/|install\.(sh|ps1)$|src/service\.rs$|tools/(image|deploy_check|distribute|sign|package)\.py$|tools/ci_(artifact|build)\.sh$|\.github/workflows/(deploy|deploy-check|build)\.yml$)' <<< "$files"; then deploy=true; else deploy=false; fi
+            printf 'upgrade=true\nresilience=%s\ndeploy=%s\n' "$resilience" "$deploy" >> "$GITHUB_OUTPUT"
+            echo "After the build: upgrade$([ "$resilience" = false ] || echo ', resilience')$([ "$deploy" = false ] || echo ', deploy')." >> "$GITHUB_STEP_SUMMARY"
+            # At most two pull requests' CI at once (Alimardon, 2026-10-03): with two older runs of
+            # other pull requests going, this one waits. It builds nothing, its check `waiting for a
+            # CI slot` fails, it holds no runner, and ci-slots.yml starts it again when a run ends.
+            # (If the API can't be asked, it runs: a slot is never worth a stuck pull request.)
+            going=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/build.yml/runs?event=pull_request&per_page=100" \
+              --jq "[.workflow_runs[] | select(.id < $GITHUB_RUN_ID and .status != \"completed\" and (.pull_requests[0].number // 0) != $PR)] | length") || going=0
+            if [ "$going" -ge 2 ]; then
+              echo wait=true >> "$GITHUB_OUTPUT"
+              echo "Waiting for a CI slot: $going other pull requests' runs are going (two at a time). ci-slots.yml starts this run again when one ends." >> "$GITHUB_STEP_SUMMARY"
+            fi
           fi
+
+  # A pull request over the two at a time: red until it runs, so nobody takes it for passed.
+  slot:
+    name: waiting for a CI slot
+    needs: plan
+    if: needs.plan.outputs.wait == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - run: |
+          echo "::error title=Waiting for a CI slot::Two other pull requests' CI runs are going, and only two run at once. This run starts again by itself when one ends (ci-slots.yml): nothing to do."
+          exit 1
 
   build:
     needs: plan
-    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.run == '' }}
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.run == '' && needs.plan.outputs.wait != 'true' }}
     name: ${{ matrix.platform == 'linux-x64' && 'linux-x64 (build and suite)' || matrix.platform }}
     strategy:
       fail-fast: false
@@ -190,3 +217,10 @@ jobs:
     if: ${{ !cancelled() && needs.build.result == 'success' && needs.plan.outputs.upgrade == 'true' }}
     permissions: { actions: read, contents: read }
     uses: ./.github/workflows/upgrade.yml
+  deploy:
+    needs: [plan, build]
+    if: ${{ !cancelled() && needs.build.result == 'success' && needs.plan.outputs.deploy == 'true' }}
+    permissions: { actions: read, contents: read }
+    uses: ./.github/workflows/deploy-check.yml
+    with:
+      from_run: true

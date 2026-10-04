@@ -1,47 +1,22 @@
 name: deploy
 
-# Pondra deployed and distributed the ways ADR-041 gives, from the very packages the build
-# workflow made for this commit (nothing is compiled here: tools/ci_artifact.sh waits for them):
-# the container image (amd64 and arm64, and the one with Python), the compose cluster, the Helm
-# chart on Kubernetes (kind), `pondra service` on Linux, macOS and Windows (tools/deploy_check.py),
-# Homebrew's formula, Scoop's and winget's manifests (tools/distribute.py), and signing with a
-# certificate made for the run (tools/sign.py); each tried as a user would.
+# A tag's release, deployed and distributed (ADR-041). First every way is tried as a user would,
+# from the packages the build workflow made for that commit (deploy-check.yml: the image, compose,
+# the chart, `pondra service`, the package managers' files, signing). Then it publishes, once the
+# repository says so (Settings -> Secrets and variables -> Actions): with the variable
+# PUBLISH_IMAGE `true`, the image (both architectures, its provenance and SBOM, signed with
+# GitHub's identity) and the chart to GitHub's container registry; with PUBLISH_PACKAGES `true`,
+# the formula to <owner>/homebrew-pondra and the manifest to <owner>/scoop-pondra (the secret
+# PACKAGES_TOKEN: contents read and write on both), and a pull request to microsoft/winget-pkgs
+# (the secret WINGET_TOKEN: a classic token with public_repo).
 #
-# A tag's run also publishes, once the repository says so (Settings -> Secrets and variables ->
-# Actions): with the variable PUBLISH_IMAGE `true`, the image (both architectures, its provenance
-# and SBOM, signed with GitHub's identity) and the chart to GitHub's container registry; with
-# PUBLISH_PACKAGES `true`, the formula to <owner>/homebrew-pondra and the manifest to
-# <owner>/scoop-pondra (the secret PACKAGES_TOKEN: contents read and write on both), and a pull
-# request to microsoft/winget-pkgs (the secret WINGET_TOKEN: a classic token with public_repo).
-#
-# A pull request runs it when it has the label `full-ci` (its build of every platform: build.yml)
-# and what it tries changes.
+# A pull request's run of the same checks is build.yml's, once its build is done (`full-ci`, and
+# what they try changes): waiting here for its packages held runners, and pull requests' CI runs
+# two at a time.
 on:
-  pull_request:
-    branches: [main]
-    types: [opened, synchronize, reopened, labeled] # (labeled: `full-ci` added)
-    paths:
-      - deploy/**
-      - install.sh
-      - install.ps1
-      - src/service.rs
-      - tools/image.py
-      - tools/deploy_check.py
-      - tools/distribute.py
-      - tools/sign.py
-      - tools/package.py
-      - tools/ci_artifact.sh
-      - tools/ci_build.sh
-      - .github/workflows/deploy.yml
   push:
     tags: ["v*"]
   workflow_dispatch:
-
-# A pull request's newer push stops its older run (it would only wait for packages again); a
-# tag's run is never stopped, nor is a run by another label added.
-concurrency:
-  group: deploy-${{ github.event.pull_request.number || github.ref }}${{ github.event.action == 'labeled' && github.event.label.name != 'full-ci' && format('-{0}', github.run_id) || '' }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   actions: read # (the build run's packages)
@@ -52,134 +27,12 @@ env:
   SHA: ${{ github.event.pull_request.head.sha || github.sha }}
 
 jobs:
-  image:
-    name: image, compose and chart
-    if: github.event_name != 'pull_request' || (contains(github.event.pull_request.labels.*.name, 'full-ci') && (github.event.action != 'labeled' || github.event.label.name == 'full-ci'))
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v5
-      - name: This commit's Linux packages (the build workflow's)
-        run: bash tools/ci_artifact.sh linux-x64 "$SHA" && bash tools/ci_artifact.sh linux-arm64 "$SHA"
-      - run: python3 tools/image.py --dist dist --out ctx
-      - uses: docker/setup-qemu-action@v3 # (the Python image's arm64 pip install; the other needs none)
-      - uses: docker/setup-buildx-action@v3
-      - name: The images, for both architectures, then this machine's
-        run: |
-          docker buildx build -f deploy/docker/Dockerfile --platform linux/amd64,linux/arm64 ctx
-          docker buildx build -f deploy/docker/Dockerfile --platform linux/amd64,linux/arm64 --target python ctx
-          docker buildx build -f deploy/docker/Dockerfile --load -t pondra:dev ctx
-          docker buildx build -f deploy/docker/Dockerfile --load --target python -t pondra:dev-python ctx
-          docker images pondra
-      - name: The image, the image with Python, the compose cluster
-        run: python3 tools/deploy_check.py image python compose
-      - uses: helm/kind-action@v1
-        with:
-          cluster_name: pondra
-      - name: The chart, on Kubernetes
-        run: |
-          for i in pondra:dev motoserver/moto:5.1.4 busybox:1.37; do docker image inspect $i > /dev/null 2>&1 || docker pull -q $i; kind load docker-image $i --name pondra; done
-          helm lint --strict deploy/helm/pondra --set lake=s3://bucket/lake
-          python3 tools/deploy_check.py chart helm
-
-  # The macOS and Windows packages, waited for on a Linux runner: macOS runners are the scarcest
-  # (the build's own macOS jobs queued for over an hour behind ones that sat waiting), so `service`
-  # takes one only once there is something for it to try.
-  waited:
-    if: github.event_name != 'pull_request' || (contains(github.event.pull_request.labels.*.name, 'full-ci') && (github.event.action != 'labeled' || github.event.label.name == 'full-ci'))
-    runs-on: ubuntu-24.04
-    timeout-minutes: 185
-    steps:
-      - uses: actions/checkout@v5
-      - run: for p in macos-arm64 windows-x64; do bash tools/ci_artifact.sh $p "$SHA"; done
-        env:
-          WAIT_MINUTES: 180
-
-  service:
-    name: pondra service (${{ matrix.platform }})
-    needs: waited
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { platform: linux-x64, os: ubuntu-24.04 }
-          - { platform: macos-arm64, os: macos-latest }
-          - { platform: windows-x64, os: windows-latest }
-    runs-on: ${{ matrix.os }}
-    defaults:
-      run:
-        shell: bash # (Git Bash on Windows)
-    steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
-        with:
-          python-version: "3.11"
-      - name: This commit's ${{ matrix.platform }} packages (the build workflow's)
-        run: bash tools/ci_artifact.sh ${{ matrix.platform }} "$SHA"
-      - name: The binary, as the installers unpack it
-        run: |
-          mkdir -p bin
-          if [ -f dist/pondra-${{ matrix.platform }}.zip ]; then unzip -qo dist/pondra-${{ matrix.platform }}.zip -d bin; else tar xzf dist/pondra-${{ matrix.platform }}.tar.gz -C bin; fi
-          ls -l bin
-      - name: Installed, killed, installed again, uninstalled (systemd, launchd, Windows's service manager)
-        run: python tools/deploy_check.py service --bin bin/pondra${{ matrix.platform == 'windows-x64' && '.exe' || '' }}
-      - name: Homebrew's formula, Scoop's and winget's manifests, for this platform's archive (served here)
-        run: |
-          v=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-          python tools/distribute.py --version "$v" --dist dist --partial --url-base http://127.0.0.1:8765 --out out
-      - name: Homebrew (a tap of this run's own) installs it, tests it, uninstalls it
-        if: matrix.platform != 'windows-x64'
-        env:
-          HOMEBREW_NO_AUTO_UPDATE: 1
-          HOMEBREW_NO_ANALYTICS: 1
-        run: |
-          (cd dist && exec python -m http.server 8765 --bind 127.0.0.1) & sleep 1
-          brew=$(command -v brew || echo /home/linuxbrew/.linuxbrew/bin/brew) # (Linux's runner has it, off the PATH)
-          $brew tap-new --no-git pondra/check
-          cp out/homebrew/pondra.rb "$($brew --repository pondra/check)/Formula/"
-          $brew style pondra/check/pondra
-          $brew install pondra/check/pondra
-          $brew test pondra/check/pondra
-          "$($brew --prefix)/bin/pondra" --version
-          $brew uninstall pondra && $brew untap pondra/check
-      - name: Scoop installs it; winget's manifests validated (where the runner has winget)
-        if: matrix.platform == 'windows-x64'
-        shell: pwsh
-        run: |
-          Start-Process python -ArgumentList '-m', 'http.server', '8765', '--bind', '127.0.0.1' -WorkingDirectory dist
-          iex "& {$(irm get.scoop.sh)} -RunAsAdmin" # (the runner's user is an administrator)
-          $env:PATH = "$env:USERPROFILE\scoop\shims;$env:PATH"
-          scoop install out\scoop\pondra.json
-          & "$env:USERPROFILE\scoop\shims\pondra.exe" --version
-          if ($LASTEXITCODE) { exit 1 }
-          scoop uninstall pondra
-          $v = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"').Matches[0].Groups[1].Value
-          if (Get-Command winget -ErrorAction SilentlyContinue) { winget validate --manifest "out\winget\manifests\p\Pondra\Pondra\$v"; exit $LASTEXITCODE }
-          else { echo "::notice::no winget on this runner: its manifests weren't validated" }
-      - name: Signed with a certificate made for this run (tools/sign.py), and still runs
-        if: matrix.platform != 'linux-x64'
-        shell: pwsh
-        run: |
-          $bin = if ($IsWindows) { "bin\pondra.exe" } else { "bin/pondra" }
-          if ($IsWindows) {
-            $c = New-SelfSignedCertificate -Type CodeSigningCert -Subject "CN=Pondra test signing" -CertStoreLocation Cert:\CurrentUser\My -NotAfter (Get-Date).AddDays(1)
-            Export-PfxCertificate -Cert $c -FilePath cert.pfx -Password (ConvertTo-SecureString test -AsPlainText -Force) | Out-Null
-            Export-Certificate -Cert $c -FilePath cert.cer | Out-Null
-            Import-Certificate -FilePath cert.cer -CertStoreLocation Cert:\LocalMachine\Root | Out-Null # (so signtool's verify trusts it)
-            $env:WINDOWS_CERTIFICATE = [Convert]::ToBase64String([IO.File]::ReadAllBytes("$PWD\cert.pfx")); $env:WINDOWS_CERTIFICATE_PASSWORD = "test"
-          } else {
-            "[req]`ndistinguished_name=dn`nx509_extensions=ext`nprompt=no`n[dn]`nCN=Pondra test signing`n[ext]`nbasicConstraints=critical,CA:false`nkeyUsage=critical,digitalSignature`nextendedKeyUsage=critical,codeSigning`n" | Set-Content cert.cnf
-            /usr/bin/openssl req -x509 -newkey rsa:2048 -nodes -keyout key.pem -out cert.pem -days 1 -config cert.cnf
-            /usr/bin/openssl pkcs12 -export -inkey key.pem -in cert.pem -out cert.p12 -passout pass:test
-            $env:APPLE_CERTIFICATE = [Convert]::ToBase64String([IO.File]::ReadAllBytes("$PWD/cert.p12")); $env:APPLE_CERTIFICATE_PASSWORD = "test"
-          }
-          python tools/sign.py $bin
-          if ($LASTEXITCODE) { exit 1 }
-          & $bin --version
-          if ($LASTEXITCODE) { exit 1 }
+  check:
+    uses: ./.github/workflows/deploy-check.yml
 
   publish:
     name: publish the image and the chart
-    needs: [image, service]
+    needs: [check]
     if: startsWith(github.ref, 'refs/tags/v') && vars.PUBLISH_IMAGE == 'true'
     runs-on: ubuntu-24.04
     permissions:
@@ -218,7 +71,7 @@ jobs:
 
   packages:
     name: publish to Homebrew, Scoop and winget
-    needs: [service]
+    needs: [check]
     if: startsWith(github.ref, 'refs/tags/v') && vars.PUBLISH_PACKAGES == 'true'
     runs-on: windows-latest # (wingetcreate is Windows's)
     defaults:
