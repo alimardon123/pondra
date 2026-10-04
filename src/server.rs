@@ -148,6 +148,7 @@ pub fn router(app: App) -> Router {
         .route("/cluster/log", get(feed))
         .route("/cluster/stage", post(stage))
         .route("/cluster/copy", post(copy))
+        .route("/cluster/insert", post(insert_share))
         .route("/cluster/shuffle", get(bucket))
         .route("/cluster/job", post(job))
         .route("/cluster/probe", get(|Query(p): Query<HashMap<String, usize>>| async move { crate::guard::probe(p.get("bytes").copied().unwrap_or(0)) }))
@@ -477,6 +478,12 @@ async fn stage(State(app): State<App>, Json(slice): Json<crate::spmd::Slice>) ->
     Ok(Body::from_stream(crate::spmd::reply(&shape, parts, done)).into_response())
 }
 
+/// This node's share of an `INSERT … SELECT`, written into the table's folder (see `spmd::insert`):
+/// its columns and files.
+async fn insert_share(State(app): State<App>, Json((slice, table, stamp)): Json<(crate::spmd::Slice, String, Option<crate::log::Reserved>)>) -> Result<Json<(crate::spmd::Columns, Vec<crate::store::DataFile>)>, E> {
+    Ok(Json(crate::spmd::insert_share(&app.lake, &slice, &table, stamp).await?))
+}
+
 /// This node's share of a `COPY … TO` a folder, written (see `spmd::copy`): how many rows.
 async fn copy(State(app): State<App>, Json((slice, target)): Json<(crate::spmd::Slice, crate::copy::Target)>) -> Result<Json<u64>, E> {
     Ok(Json(crate::spmd::copy_share(&app.lake, &slice, &target).await?))
@@ -568,13 +575,19 @@ impl App {
         Box::pin(crate::ext::listing(self.query_listed(query, spread, files))) // (every door: files listed once a statement)
     }
 
+    /// Whether `query` must run on this node alone: rows sent with the request are here only; so are
+    /// the session's temporary tables, its transaction, settings and variables, a past it reads, and
+    /// a Python table function's call; and a user granted some tables has its grants checked where
+    /// the query is planned, here.
+    pub async fn here_only(&self, query: &str) -> bool {
+        crate::query::sent() || crate::temp::mentioned(query) || crate::past::mentioned(query) || crate::txn::open() || crate::settings::any() || crate::vars::mentioned(query) || crate::routines::pinned(&self.lake, query).await || crate::auth::limited().is_some()
+    }
+
     async fn query_listed(&self, query: &str, spread: Option<&str>, files: bool) -> anyhow::Result<Vec<RecordBatch>> {
         use crate::metrics::{add, QUERIES, QUERY_ERRORS, QUERY_US, SPREAD};
         let start = std::time::Instant::now();
         let run = async {
-            let here_only = spread == Some("0") || crate::query::sent() || crate::temp::mentioned(query) || crate::past::mentioned(query) || crate::txn::open() || crate::settings::any() || crate::vars::mentioned(query) || crate::routines::pinned(&self.lake, query).await // (rows sent with a request are here only; so are the session's temporary tables, its transaction and settings, and a Python table function's call)
-                || crate::auth::limited().is_some(); // (and a user's granted some tables: its grants are checked where it is planned, here)
-            let nodes = if here_only { vec![] } else { self.cluster.nodes() };
+            let nodes = if spread == Some("0") || self.here_only(query).await { vec![] } else { self.cluster.nodes() };
             match crate::spmd::query(&self.lake, &nodes, &self.cluster.addr, query, spread == Some("1")).await {
                 Ok(Some(batches)) => {
                     crate::guard::ran_spread(query, start.elapsed());

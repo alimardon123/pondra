@@ -670,13 +670,13 @@ pub async fn create_spec(c: &ast::CreateTable, from: &Lake, files: bool) -> Resu
         (Some(ast::CreateTableLikeKind::Plain(l) | ast::CreateTableLikeKind::Parenthesized(l)), _) => {
             ensure!(c.columns.is_empty() && c.query.is_none(), "CREATE TABLE {} LIKE {}: columns or a query, or LIKE, not both", c.name, l.name);
             let sql = format!("SELECT * FROM {} LIMIT 0", l.name);
-            session(from, &sql, "").await?.sql(&sql).await?.schema().fields().iter().cloned().collect::<Vec<_>>()
+            crate::query::sql(&session(from, &sql, "").await?, &sql).await?.schema().fields().iter().cloned().collect::<Vec<_>>()
         }
         (None, Some(q)) => {
             let sql = q.to_string();
             let ctx = session(from, &sql, "").await?;
             let ctx = if files { ctx.enable_url_table() } else { ctx };
-            let fields = ctx.sql(&sql).await?.schema().fields().iter().cloned().collect::<Vec<_>>();
+            let fields = crate::query::sql(&ctx, &sql).await?.schema().fields().iter().cloned().collect::<Vec<_>>();
             match c.columns.is_empty() {
                 true => fields,
                 false => {
@@ -922,7 +922,7 @@ pub async fn follows(lake: &Lake, table: &str) -> Result<bool> {
 /// Run a row query here: its rows in the table's column order and types.
 pub async fn rows(ctx: &SessionContext, meta: &TableMeta, sql: &str) -> Result<RecordBatch> {
     let target = schema(&meta.columns)?;
-    let batches = ctx.sql(&crate::asof::rewrite(&crate::routines::rows_apart(sql))?).await?.collect().await?;
+    let batches = crate::query::sql(ctx, &crate::asof::rewrite(&crate::routines::rows_apart(sql))?).await?.collect().await?;
     let Some(first) = batches.first() else { return Ok(RecordBatch::new_empty(target)) };
     let all = concat_batches(&first.schema(), &batches)?;
     // An UPDATE's rows end with the ids they keep (`sys.rs`): those go along, by name.
@@ -965,18 +965,29 @@ impl Files {
 /// `stamp`: the commit number and time the rows' system columns get (`sys.rs`); None: the leader
 /// stamps them when it records the files (`record`).
 pub async fn write_files(lake: &Lake, ctx: &SessionContext, table: &str, query: &str, job: &str, stamp: Option<crate::log::Reserved>) -> Result<Option<Files>> {
-    use datafusion::arrow::datatypes::DataType;
-    use datafusion::prelude::{cast as cast_to, Expr};
-    if lake.cat.get::<u64>(&producer_key(&format!("job:{job}"))).await?.is_some() {
+    if recorded(lake, job).await? {
         return Ok(None);
     }
-    // Each partition of the query writes its own files, in the order its rows come: data that
-    // arrives in order (by time, by key) lands in files that each hold a narrow range of it, which
-    // is what lets a filter skip files and a distributed query split tables by key (`spmd`).
-    // (Round-robin repartitioning would interleave them, so it is off here.)
-    ctx.state_ref().write().config_mut().options_mut().optimizer.enable_round_robin_repartition = false;
-    // The query's columns, by position, as the table's (or, for a new table, with plain Utf8 strings).
-    let df = ctx.sql(&crate::asof::rewrite(query)?).await?;
+    in_order(ctx);
+    let df = crate::query::sql(ctx, &crate::asof::rewrite(query)?).await?;
+    let (columns, files) = write_rows(lake, ctx, table, df, stamp).await?;
+    Ok(Some(Files { table: table.into(), job: job.into(), columns, files }))
+}
+
+/// Whether the leader has recorded this INSERT's files already.
+async fn recorded(lake: &Lake, job: &str) -> Result<bool> { Ok(lake.cat.get::<u64>(&producer_key(&format!("job:{job}"))).await?.is_some()) }
+
+/// Each partition of a query planned in `ctx` from now on writes its own files, in the order its
+/// rows come: data that arrives in order (by time, by key) lands in files that each hold a narrow
+/// range of it, which is what lets a filter skip files and a distributed query split tables by
+/// key (`spmd`). (Round-robin repartitioning would interleave them, so it is off.)
+pub fn in_order(ctx: &SessionContext) { ctx.state_ref().write().config_mut().options_mut().optimizer.enable_round_robin_repartition = false; }
+
+/// `df`'s rows written as Parquet into the table's folder, by position as the table's columns (or,
+/// for a new table, the query's, with plain Utf8 strings): the columns, and the files.
+pub async fn write_rows(lake: &Lake, ctx: &SessionContext, table: &str, df: datafusion::prelude::DataFrame, stamp: Option<crate::log::Reserved>) -> Result<(Vec<(String, String)>, Vec<DataFile>)> {
+    use datafusion::arrow::datatypes::DataType;
+    use datafusion::prelude::{cast as cast_to, Expr};
     let meta = lake.cat.get::<TableMeta>(&table_key(table)).await?;
     // (a table's live columns, in order, written under their stored names: ADR-022)
     let target: Vec<(String, DataType)> = match &meta {
@@ -1006,8 +1017,7 @@ pub async fn write_files(lake: &Lake, ctx: &SessionContext, table: &str, query: 
         None => Ok(rows),
     });
     let writes = streams.collect::<Result<Vec<_>>>()?.into_iter().map(|rows| crate::tier::write_stream(lake, table, rows, 1_000_000, &[], true, partition.as_deref()));
-    let files = futures::future::try_join_all(writes).await?.concat();
-    Ok(Some(Files { table: table.into(), job: job.into(), columns, files }))
+    Ok((columns, futures::future::try_join_all(writes).await?.concat()))
 }
 
 /// Leader: record an INSERT's files in one commit through the log (`adopt::file`), creating the
@@ -1208,8 +1218,13 @@ async fn on_node_listed(app: &crate::server::App, stmt: Stmt, job: Option<String
     let sql = match (&meta, &stmt) {
         (Some(m), _) if through_log(m, &stmt) => rows_sql(m, &stmt)?,
         (_, Stmt::Insert(_, query)) => {
-            let ctx = open(session(lake, query, "").await?);
-            let Some(f) = write_files(lake, &ctx, &table, query, &job, stamp(lake, &table, Some(&app.to())).await?).await? else { return Ok(j!({"duplicate": true})) };
+            let to = app.to();
+            let stamped = stamp(lake, &table, Some(&to)).await?;
+            let f = match everywhere(app, &table, query, &job, stamped, &to, files || meta.is_none()).await? {
+                Some(f) => f,
+                None => write_files(lake, &open(session(lake, query, "").await?), &table, query, &job, stamped).await?,
+            };
+            let Some(f) = f else { return Ok(j!({"duplicate": true})) };
             return match app.record_files(f).await {
                 Err(e) if format!("{e:#}").contains(AGAIN) => {
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await; // (this node sees the view by then: without them)
@@ -1237,6 +1252,28 @@ async fn on_node_listed(app: &crate::server::App, stmt: Stmt, job: Option<String
     let n = batch.num_rows();
     let ack = app.log()?.append(table, Src { producer: format!("sql:{job}"), seq: 1, prev: None }, batch).await?;
     Ok(if ack.duplicate { j!({"duplicate": true}) } else { j!({"rows": n}) })
+}
+
+/// An INSERT's files written by every node at once (`spmd::insert`), when its query's rows split
+/// over them as they are; None: from here (`here`: a query that reads this machine's files, or a
+/// table not made yet). A spread that fails leaves what it wrote to the orphan sweep (no entry
+/// names those files), and this node writes it all.
+async fn everywhere(app: &crate::server::App, table: &str, query: &str, job: &str, stamp: Option<crate::log::Reserved>, to: &crate::log::To, here: bool) -> Result<Option<Option<Files>>> {
+    let query = crate::asof::rewrite(query)?;
+    if here || app.here_only(&query).await {
+        return Ok(crate::spmd::refused("it reads what only this node has"));
+    }
+    if recorded(&app.lake, job).await? {
+        return Ok(Some(None));
+    }
+    match crate::spmd::insert(&app.lake, &app.cluster.nodes(), &app.cluster.addr, &query, table, stamp.map(|r| (r, to))).await {
+        Ok(Some((columns, files))) => Ok(Some(Some(Files { table: table.into(), job: job.into(), columns, files }))),
+        Ok(None) => Ok(None),
+        Err(e) => {
+            eprintln!("INSERT into {table} across the nodes failed, writing it from here: {e:#}");
+            Ok(None)
+        }
+    }
 }
 
 /// The statement as the leader's to carry out (`change.rs`), if it is one: an UPDATE or DELETE of

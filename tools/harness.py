@@ -955,7 +955,77 @@ def insert():
     print(f"insert: first={first} retry={retry} summary={s} -> {'OK' if ok else 'FAIL'}")
     if not ok:
         sys.exit(1)
-    return "bulk INSERT … SELECT writes Parquet directly; a retried job id is applied once"
+    spread = insert_spread()
+    return f"bulk INSERT … SELECT writes Parquet directly; a retried job id is applied once; {spread}"
+
+
+def insert_spread():
+    """An INSERT … SELECT or CREATE TABLE AS on three nodes is written by every node from its own
+    share (`spmd::insert`), recorded in one commit: the rows the query gives, row ids unique, one
+    version; a retried job writes nothing; a query whose rows don't split as they are (a GROUP BY)
+    is written by one node."""
+    lake = new_lake()
+    ports = [A.port + 1 + i for i in range(3)]
+    nodes = [Node(lake, p, env={"PONDRA_SPREAD_MB": "0"} if i == 0 else {}).start() for i, p in enumerate(ports)]
+    while len(call(ports[0], "GET", "/stats")["nodes"]) < 3:
+        time.sleep(0.1)
+    q = lambda s, job=None: call(ports[0], "POST", "/sql" + (f"?job={job}" if job else ""), s.encode(), timeout=600)
+    one = lambda s: q(s)[0]
+    writes = lambda: [metrics_of(p).get('pondra_object_requests_total{op="write"}', 0) for p in ports[1:]]
+    q("CREATE TABLE src (id BIGINT, k BIGINT, v DOUBLE, s VARCHAR)")
+    for i in range(6):
+        q(f"INSERT INTO src SELECT value + {i * 20000}, value % 50, value * 0.5, 'x' || (value % 7) FROM generate_series(1, 20000)")
+    call(ports[0], "POST", "/tier", timeout=600)
+    q("INSERT INTO src VALUES (1000001, 1, 1.0, 'log'), (1000002, 2, 2.0, 'log')")  # a log tail: the coordinator's
+    checks = {}
+
+    def same(name, table, query, extra=""):
+        got = one(f"SELECT count(*) AS n, sum(v) AS s, count(DISTINCT _row_id) AS ids, count(DISTINCT _version) AS versions FROM {table}{extra}")
+        want = one(f"SELECT count(*) AS n, sum(v) AS s FROM ({query})")
+        checks[name] = got["n"] == want["n"] > 0 and got["s"] == want["s"] and got["ids"] == got["n"] and got["versions"] == 1
+        return got
+
+    def spread(stmt, job=None):
+        before = writes()
+        q(stmt, job)
+        checks.setdefault("every node writes its share", True)
+        checks["every node writes its share"] &= all(b > a for a, b in zip(before, writes()))
+
+    q("CREATE TABLE dst (id BIGINT, k BIGINT, v DOUBLE, s VARCHAR)")
+    t = time.time()
+    spread("INSERT INTO dst SELECT * FROM src WHERE k < 40", job="spread-1")
+    took = round(time.time() - t, 2)
+    got = same("the query's rows, row ids unique, one version", "dst", "SELECT * FROM src WHERE k < 40")
+    checks["a retried job writes nothing"] = q("INSERT INTO dst SELECT * FROM src WHERE k < 40", job="spread-1") == {"duplicate": True} \
+        and one("SELECT count(*) AS n FROM dst")["n"] == got["n"]
+    spread("CREATE TABLE ctas AS SELECT id, v, list_transform([k], x -> x + 1) AS l FROM src")
+    same("CREATE TABLE AS, a lambda in it", "ctas", "SELECT * FROM src")
+    checks["… the lambda's values"] = one("SELECT count(*) AS n FROM ctas JOIN src USING (id) WHERE ctas.l[1] <> src.k + 1")["n"] == 0
+    q("CREATE TABLE parts (id BIGINT, k BIGINT, v DOUBLE, s VARCHAR) WITH (partition_by = 'k')")
+    spread("INSERT INTO parts SELECT * FROM src WHERE k < 5")
+    same("a partitioned table", "parts", "SELECT * FROM src WHERE k < 5")
+    import pyarrow.parquet as pq
+    folder = os.path.join(lake, "data", "parts")
+    paths = [os.path.join(r, f) for r, _, fs in os.walk(folder) for f in fs if f.endswith(".parquet")]
+    checks["… each file one partition value"] = len(paths) >= 5 and all(len(set(pq.read_table(f, columns=["k"]).column("k").to_pylist())) == 1 for f in paths)
+    q("CREATE TABLE followed (id BIGINT, k BIGINT, v DOUBLE, s VARCHAR)")
+    q("CREATE MATERIALIZED VIEW by_k AS SELECT k, count(*) AS n, sum(v) AS v FROM followed GROUP BY k")
+    spread("INSERT INTO followed SELECT * FROM src WHERE k < 20")
+    same("a table a view follows", "followed", "SELECT * FROM src WHERE k < 20")
+    checks["… the view follows it"] = until(lambda: one("SELECT sum(n) AS n, sum(v) AS v FROM by_k"), one("SELECT count(*) AS n, sum(v) AS v FROM followed"), 15) \
+        == one("SELECT count(*) AS n, sum(v) AS v FROM followed")
+    q("CREATE TABLE grouped (k BIGINT, n BIGINT, v DOUBLE)")
+    before = writes()
+    q("INSERT INTO grouped SELECT k, count(*), sum(v) FROM src GROUP BY k")
+    checks["a GROUP BY is written by one node"] = writes() == before and one("SELECT count(*) AS n, sum(n) AS rows FROM grouped") == {"n": 50, "rows": 120002}
+    checks["nothing fell back to one node"] = "across the nodes failed" not in open(nodes[0].log).read()
+    for n in nodes:
+        n.kill()
+    print(json.dumps({"insert across the nodes": {"rows": got["n"], "secs": took, "checks": checks}}))
+    if not all(checks.values()):
+        print("insert: failed: " + ", ".join(k for k, v in checks.items() if not v))
+        sys.exit(1)
+    return f"on three nodes every node writes its share ({got['n']:,} rows in {took} s), one commit, ids unique; {len(checks)} checks"
 
 
 def serverless():

@@ -53,7 +53,7 @@ pub async fn copy_to(lake: &Lake, query: &str, to: &str, options: &BTreeMap<Stri
     }
     let query = crate::routines::expand(lake, query).await?; // (the files, macros and FROM-first queries it reads)
     if to.starts_with("kafka://") {
-        let df = crate::query::session(lake, &query, "").await?.sql_with_options(&query, crate::query::read_only()).await?;
+        let df = crate::query::sql(&crate::query::session(lake, &query, "").await?, &query).await?;
         return crate::kafka_client::copy_to(lake, df, to, options).await; // (rows as records: a topic's)
     }
     ensure!(!options.contains_key("key"), "KEY is a Kafka topic's (COPY … TO 'kafka://brokers/topic')");
@@ -63,7 +63,7 @@ pub async fn copy_to(lake: &Lake, query: &str, to: &str, options: &BTreeMap<Stri
     };
     if format == "delta" || format == "iceberg" {
         ensure!(!options.contains_key("partition_by"), "COPY … TO as {format}: PARTITION_BY (a partitioned {format} table): not yet");
-        let df = crate::query::session(lake, &query, "").await?.sql_with_options(&query, crate::query::read_only()).await?;
+        let df = crate::query::sql(&crate::query::session(lake, &query, "").await?, &query).await?;
         return crate::write_outside::copy_table(lake, df, to, &format, on("append"), on("overwrite")).await; // (a table, not files: ADR-028)
     }
     ensure!(["parquet", "csv", "json", "arrow"].contains(&format.as_str()), "COPY … TO as {format}: parquet, csv, json, arrow, delta or iceberg");
@@ -97,7 +97,7 @@ pub async fn copy_to(lake: &Lake, query: &str, to: &str, options: &BTreeMap<Stri
             }
         }
     }
-    let df = crate::query::session(lake, &query, "").await?.sql_with_options(&query, crate::query::read_only()).await?;
+    let df = crate::query::sql(&crate::query::session(lake, &query, "").await?, &query).await?;
     let rows = write(df, &target).await?;
     Ok(serde_json::json!({"copied": rows, "to": to}))
 }

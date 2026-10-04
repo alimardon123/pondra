@@ -304,7 +304,7 @@ async fn select_as(lake: &Lake, meta: &TableMeta, set: Option<&[(String, String)
     }
     let sql = format!("SELECT {} {rest}", items.join(", "));
     let ctx = session(lake, &sql, upto).await?;
-    let batches = ctx.sql(&crate::asof::as_of(&sql)?).await?.collect().await?;
+    let batches = crate::query::sql(&ctx, &crate::asof::as_of(&sql)?).await?.collect().await?;
     let Some(first) = batches.first() else { return Ok((vec![], vec![])) };
     let all = concat_batches(&first.schema(), &batches)?;
     let old = if insert.is_none() { vec![part(&all, meta, "__o_", true)?] } else { vec![] };

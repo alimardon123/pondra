@@ -105,7 +105,7 @@ pub struct Ack {
 
 /// A reservation: a commit number of its own and its time (the `_version` and times of rows a
 /// writer stamps itself), and a block of row ids for them (`sys.rs`).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct Reserved {
     pub version: u64,
     pub ms: u64,
