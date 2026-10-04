@@ -50,6 +50,8 @@ pub async fn render(app: &App) -> anyhow::Result<String> {
     metric("files_skipped_total", "counter", "Parquet files queries skipped by min/max, unopened", &one(get(&FILES_SKIPPED)));
     let requests = [("write", &OBJECT_WRITES), ("list", &OBJECT_LISTS), ("delete", &OBJECT_DELETES)].map(|(op, c)| (format!("{{op=\"{op}\"}}"), get(c)));
     metric("object_requests_total", "counter", "object-store writes, lists and deletes this process made (what a bucket bills and rate-limits most)", &requests);
+    let ai = [("answered", &crate::ai::CALLS), ("failed", &crate::ai::FAILED), ("retried", &crate::ai::RETRIED)].map(|(r, c)| (format!("{{result=\"{r}\"}}"), get(c)));
+    metric("ai_requests_total", "counter", "requests ai_complete and ai_embed made to the model's endpoint: answered, failed for good (their rows NULL), tried again", &ai);
     metric("shuffle_spilled_bytes_total", "counter", "shuffle rows written to this node's disk", &one(get(&SPILLED)));
     metric("shuffle_disk_bytes", "gauge", "shuffle buckets on this node's disk now", &one(crate::spill::held() as f64));
     metric("shuffle_skew", "gauge", "worst bucket vs the average one in a shuffle here (1 = even)", &one(get(&SKEW) / 100.0));
