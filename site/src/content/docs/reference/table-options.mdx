@@ -123,13 +123,16 @@ What Pondra refuses:
 
 ## Materialized views
 
-`CREATE MATERIALIZED VIEW v [WITH (…)] AS SELECT …`. Without options, the view is kept current
-with every row its table takes in. The options make it emit what is final: windows, sessions, and
-joins of two streams. Time is in seconds. An option the view doesn't know is an error that lists
-the ones it does.
+`CREATE MATERIALIZED VIEW v [WITH (…)] AS SELECT … [EMIT FINAL]`. Without options, the view is
+kept current with every row its table takes in. `EMIT FINAL` keeps each group of a time bucket once
+it is over ([windows](#windows-emit-final)). The other options make windows, sessions and joins of
+two streams the older way. An option the view doesn't know is an error that lists the ones it does.
 
 | Option | Value | Default | Meaning |
 |---|---|---|---|
+| `lateness` | a time, such as `'10 seconds'` | `'0 seconds'` | `EMIT FINAL`: how far out of order a row may arrive and still count |
+| `idle` | a time | none | `EMIT FINAL`: once no newer row has come for this long, the watermark moves on with the clock |
+| `emit` | `'final'` | | the same as `EMIT FINAL` at the statement's end, for clients that build the statement |
 | `window` | column name | | the view's window-start column, made by `date_bin(…)` in `GROUP BY`; each window goes to `{view}_final` once, when it is final |
 | `size_secs` | seconds | 60 | how long a window is |
 | `slide_secs` | seconds | none | a new window every this many seconds: a divisor of `size_secs`, less than it. Make the view's `date_bin` this long |
@@ -144,24 +147,65 @@ the ones it does.
 | `sequence_by` | column name | | a history view's order of versions: a time, or a number that grows |
 | `delete_when` | a condition | none | a history view's version that ends its key, not shown |
 
-A window closes when the **watermark** passes its end. The watermark is the newest event time in
-the source, less `lateness_secs`. A row that arrives after its window closed still updates the
-view, but not what was emitted.
+### Windows: EMIT FINAL
 
-### Tumbling and sliding windows
+`GROUP BY` a bucket of the source's event-time column that only grows with time (`date_bin`,
+`date_trunc`, `CAST(ts AS DATE)`, `floor(date_part('epoch', ts) / 60)`, …) and end the statement
+with `EMIT FINAL`. The view keeps each group once, when the **watermark** (the newest event time in
+the source, less `lateness`) has passed it. A bucket that comes back round (`hour(ts)`) is refused.
+A row for a group already kept is late: the view keeps what it had, and `pondra.flows` counts it
+(`late_rows`). `GROUP BY key, SESSION(ts, INTERVAL '30 minutes')` keeps sessions instead, as
+`session` and `gap_secs` below do.
 
 ```sql
 CREATE TABLE readings (ts TIMESTAMP, sensor VARCHAR, temp DOUBLE);
-CREATE MATERIALIZED VIEW per_minute WITH (window = 'w', size_secs = 60, lateness_secs = 10) AS
-  SELECT date_bin(INTERVAL '1 minute', ts) AS w, sensor, sum(temp) AS total, count(*) AS n
-  FROM readings GROUP BY 1, 2;
+CREATE MATERIALIZED VIEW per_minute WITH (lateness = '10 seconds') AS
+  SELECT date_bin(INTERVAL '1 minute', ts) AS minute, sensor, sum(temp) AS total, count(*) AS n
+  FROM readings GROUP BY 1, 2
+  EMIT FINAL;
 INSERT INTO readings VALUES
   (TIMESTAMP '2026-01-01 10:00:05', 'a', 20.0), (TIMESTAMP '2026-01-01 10:00:40', 'a', 22.0),
   (TIMESTAMP '2026-01-01 10:01:30', 'a', 30.0), (TIMESTAMP '2026-01-01 10:03:00', 'a', 25.0);
-SELECT * FROM per_minute ORDER BY w;
 ```
 
-The view has a row for every window, still open or not. `per_minute_final` has the ones that are
+```bash
+sleep 2   # the leader looks for groups that are over twice a second
+```
+
+```sql
+SELECT minute, sensor, total, n FROM per_minute ORDER BY minute;
+```
+
+```text
+minute               sensor  total  n
+2026-01-01T10:00:00  a       42.0   2
+2026-01-01T10:01:00  a       30.0   1
+```
+
+The 10:03 row moved the watermark to 10:02:50: the minutes before 10:02 are over. `SHOW CREATE
+MATERIALIZED VIEW per_minute` gives the statement back, `EMIT FINAL` and its options with it.
+
+### Windows and sessions as options
+
+Before `EMIT FINAL`, windows were options, and they still work. A window closes when the watermark
+passes its end. The watermark is the newest event time in the source, less `lateness_secs`. The
+view keeps every window, open or not; each one goes once to `{view}_final`. A row that arrives after
+its window closed still updates the view, but not what was emitted.
+
+#### Tumbling and sliding windows
+
+```sql
+CREATE TABLE gauges (ts TIMESTAMP, sensor VARCHAR, temp DOUBLE);
+CREATE MATERIALIZED VIEW per_minute_open WITH (window = 'w', size_secs = 60, lateness_secs = 10) AS
+  SELECT date_bin(INTERVAL '1 minute', ts) AS w, sensor, sum(temp) AS total, count(*) AS n
+  FROM gauges GROUP BY 1, 2;
+INSERT INTO gauges VALUES
+  (TIMESTAMP '2026-01-01 10:00:05', 'a', 20.0), (TIMESTAMP '2026-01-01 10:00:40', 'a', 22.0),
+  (TIMESTAMP '2026-01-01 10:01:30', 'a', 30.0), (TIMESTAMP '2026-01-01 10:03:00', 'a', 25.0);
+SELECT * FROM per_minute_open ORDER BY w;
+```
+
+The view has a row for every window, still open or not. `per_minute_open_final` has the ones that are
 final, a moment after the watermark passes them: here the first two, because the 10:03 row moved
 the watermark past them.
 
@@ -170,7 +214,7 @@ sleep 5   # windows close a moment after the watermark passes them
 ```
 
 ```sql
-SELECT w, sensor, total, n FROM per_minute_final ORDER BY w;
+SELECT w, sensor, total, n FROM per_minute_open_final ORDER BY w;
 ```
 
 ```text
@@ -192,7 +236,7 @@ CREATE MATERIALIZED VIEW per_five WITH (window = 'w', size_secs = 300, slide_sec
   FROM visits GROUP BY 1, 2;
 ```
 
-### Session windows
+#### Session windows
 
 A session is one key's rows with no gap of `gap_secs` between them. The view gets a row for each
 session, once, with `session_start` and `session_end` (the last row plus the gap). The view's
