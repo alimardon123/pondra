@@ -503,15 +503,16 @@ DROP SCHEMA sales CASCADE;
 | Statement | Syntax |
 |---|---|
 | Stored view | `CREATE [OR REPLACE] VIEW [IF NOT EXISTS] v AS SELECT …`: a query run over the tables as they are when read |
-| Materialized view | `CREATE [OR REPLACE] MATERIALIZED VIEW [IF NOT EXISTS] v [(CONSTRAINT c CHECK \| EXPECT (condition) [ON VIOLATION DROP ROW \| FAIL], …)] [WITH (option = value, …)] AS SELECT … FROM t …`: kept up to date as rows arrive; it may follow another materialized view ([Flows](/pondra/guides/flows/)) |
+| Materialized view | `CREATE [OR REPLACE] MATERIALIZED VIEW [IF NOT EXISTS] v [(CONSTRAINT c CHECK \| EXPECT (condition) [ON VIOLATION DROP ROW \| FAIL], …)] [WITH (option = value, …)] AS SELECT … FROM t … [EMIT FINAL]`: kept up to date as rows arrive; it may follow another materialized view ([Flows](/pondra/guides/flows/)). `EMIT FINAL` keeps each group of a time bucket (or `SESSION(ts, INTERVAL …)`) once it is over ([windows](/pondra/guides/streaming/#windows-each-group-once-its-over)) |
 | Temporary | `CREATE [OR REPLACE] TEMP TABLE [IF NOT EXISTS] t AS SELECT …`, `CREATE [OR REPLACE] TEMP VIEW [IF NOT EXISTS] v AS SELECT …`: a session's own |
 | Rename | `ALTER VIEW v RENAME TO w`: a stored view, not a materialized one |
 | Refresh | `REFRESH MATERIALIZED VIEW v`: taken, and nothing to do, since the view is current as rows arrive (dbt sends it) |
 | Detach | `ALTER MATERIALIZED VIEW v DETACH`: its rows stop following and stay, as a table of that name (a `GROUP BY` view's a merge table, its rows combining as they are read). What follows it keeps following its table. A view that keeps windows is refused |
 | Drop | `DROP VIEW [IF EXISTS] v`, `DROP MATERIALIZED VIEW [IF EXISTS] v` |
 
-A materialized view is filled from the rows already in its table, then follows every new row. Its
-options make windows, sessions and stream joins: see [table options](/pondra/reference/table-options/).
+A materialized view is filled from the rows already in its table, then follows every new row.
+`EMIT FINAL` and its options make windows and sessions, and other options stream joins: see
+[table options](/pondra/reference/table-options/#materialized-views).
 `WITH (history = 'id', sequence_by = 'at' [, delete_when = '…'])` keeps every version of each key
 with its `__start_at` and `__end_at` ([history per key](/pondra/guides/flows/#history-per-key-scd-type-2)).
 A temporary table lives in the memory of the node a session talks to, and ends with the session (a

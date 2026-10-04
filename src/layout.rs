@@ -174,7 +174,7 @@ fn ttl(e: &ast::Expr) -> Result<String> {
 
 /// '1 hour', '90 minutes', '1 day 12 hours', '2 weeks': in seconds. Months and years vary in
 /// length, so they are refused.
-fn seconds(text: &str) -> Result<u64> {
+pub(crate) fn seconds(text: &str) -> Result<u64> {
     let words: Vec<String> = text.to_lowercase().split_whitespace().map(String::from).collect();
     ensure!(!words.is_empty() && words.len() % 2 == 0, "an interval such as '1 hour', '30 minutes' or '7 days', not {text:?}");
     let mut total = 0u64;

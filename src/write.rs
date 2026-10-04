@@ -396,6 +396,18 @@ pub fn parse(sql: &str) -> Option<Stmt> {
             Err(e) => Stmt::Invalid(format!("{e}")),
         });
     }
+    // CREATE MATERIALIZED VIEW v AS SELECT … GROUP BY … EMIT FINAL: each group once, when it's over.
+    if let Some(rest) = crate::once::emit_final(sql) {
+        let wrong = || Stmt::Invalid("EMIT FINAL ends a materialized view's query: CREATE MATERIALIZED VIEW v AS SELECT … GROUP BY … EMIT FINAL".into());
+        return Some(match parse(&rest) {
+            Some(Stmt::Ddl(mut d)) if d.len() == 1 => match crate::once::mark(&mut d[0]) {
+                true => Stmt::Ddl(d),
+                false => wrong(),
+            },
+            Some(Stmt::Invalid(e)) => Stmt::Invalid(e),
+            _ => wrong(),
+        });
+    }
     // CREATE MATERIALIZED VIEW v (CONSTRAINT c CHECK (…) ON VIOLATION DROP ROW, …): its
     // expectations (ADR-036 §2), which the parser doesn't take.
     match crate::views::constraints(sql) {

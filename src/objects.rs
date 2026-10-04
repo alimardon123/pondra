@@ -127,7 +127,7 @@ fn relations(lake: &Lake) -> BoxFuture<'_, Result<Vec<Object>>> {
             let def = match o.kind {
                 "table" => o.meta.as_ref().map(|m| table_sql(&named, m)),
                 "view" => o.sql.as_ref().map(|s| format!("CREATE VIEW {named} AS\n{s}")),
-                "materialized view" => views.get(&(o.lake.clone(), local.clone())).map(|v| materialized_sql(&named, v, o.meta.as_ref())),
+                "materialized view" => views.get(&(o.lake.clone(), local.clone())).or_else(|| views.get(&(o.lake.clone(), crate::once::open(&local)))).map(|v| materialized_sql(&named, v, o.meta.as_ref())),
                 _ => None, // (an external table's statement isn't kept as written; a window view's `_final` table is made with it)
             };
             let kind = KINDS.iter().find(|k| k.name == o.kind).map_or("table", |k| k.name);
@@ -230,7 +230,7 @@ fn dollar(body: &str) -> String {
 }
 
 /// Seconds as SQL's interval text: `2 hours`, `7 days`, `90 seconds`.
-fn span(s: u64) -> String {
+pub(crate) fn span(s: u64) -> String {
     let (n, unit) = [(86400, "day"), (3600, "hour"), (60, "minute"), (1, "second")].into_iter().find(|(u, _)| s >= *u && s % u == 0).map_or((s, "second"), |(u, w)| (s / u, w));
     format!("{n} {unit}{}", if n == 1 { "" } else { "s" })
 }
@@ -314,15 +314,16 @@ pub(crate) fn materialized_sql(name: &str, v: &crate::views::View, meta: Option<
         OnViolation::Keep => format!("CONSTRAINT {} EXPECT ({})", ident(&e.name), e.check),
         OnViolation::Drop => format!("CONSTRAINT {} EXPECT ({}) ON VIOLATION DROP ROW", ident(&e.name), e.check),
     }).collect();
+    if let Some((sql, with)) = crate::once::written(v) {
+        // (EMIT FINAL's, a session view's too: the window in the GROUP BY)
+        let with = if with.is_empty() { String::new() } else { format!(" WITH ({})", with.join(", ")) };
+        return format!("CREATE MATERIALIZED VIEW {name}{with} AS\n{sql}");
+    }
     let mut with: Vec<String> = vec![];
     if let Some(e) = &v.emit {
         with.push(format!("window = {}, size_secs = {}", literal(&e.window), e.size_secs));
         with.extend(e.slide_secs.map(|s| format!("slide_secs = {s}")));
         with.extend((e.lateness_secs > 0).then(|| format!("lateness_secs = {}", e.lateness_secs)));
-    }
-    if let Some(s) = &v.sessions {
-        with.push(format!("session = {}, gap_secs = {}", literal(&s.time), s.gap_secs));
-        with.extend((s.lateness_secs > 0).then(|| format!("lateness_secs = {}", s.lateness_secs)));
     }
     if let Some(jn) = &v.join {
         with.push("join = 'streams'".into());
