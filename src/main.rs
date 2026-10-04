@@ -5,6 +5,7 @@ mod adopt;
 mod audit;
 mod ai;
 mod avro;
+mod branch;
 mod bridge;
 mod asof;
 mod auth;
