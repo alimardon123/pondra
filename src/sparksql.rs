@@ -35,7 +35,7 @@ pub fn inline(sql: &str) -> Result<String> {
         return Err(e);
     }
     Ok(match found.0 {
-        true => stmts.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(";\n"),
+        true => stmts.iter().map(crate::routines::sql).collect::<Vec<_>>().join(";\n"),
         false => sql.to_string(),
     })
 }

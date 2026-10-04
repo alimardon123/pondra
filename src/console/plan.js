@@ -48,6 +48,15 @@ export function planView(sql, params, o = {}) {
   return box;
 }
 
+/** A plan kept with a slow statement (`pondra.history`'s `plan`): each step's rows and time as it ran. */
+export function keptPlan(text) {
+  const box = h('div', { class: 'planv' }), draw = how => box.replaceChildren(h('div', { class: 'cbar' }, h('span', { class: 'segs' },
+    ...[['graph', 'Graph'], ['text', 'Text']].map(([id, label]) => h('button', { class: 'seg' + (how === id ? ' on' : ''), 'aria-pressed': String(how === id), onclick: () => draw(id) }, label)))),
+  how === 'text' ? h('pre', { class: 'said plan' }, text) : graph(tree(text)));
+  draw('graph');
+  return box;
+}
+
 /** EXPLAIN's indented lines as a tree: each step, its details, its metrics (if analyzed), the steps under it. */
 function tree(text) {
   const root = { kids: [] }, stack = [{ depth: -1, node: root }];

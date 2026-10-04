@@ -550,7 +550,7 @@ const more = () => import('./more.js'), menus = () => import('./tabs.js'); // (t
 const viewMenu = (at, v) => menus().then(m => m.viewMenu(at, v));
 const details = () => import('./details.js'); // (a table's, a file's, an answer's: loaded with the first pick)
 const objectDetail = async t => (await details()).objectDetail(t), fileDetail = async f => (await details()).fileDetail(f), resultDetail = async p => (await details()).resultDetail(p), docDetail = async d => (await details()).docDetail(d);
-const runs = async () => (await more()).runs(), variables = async () => (await more()).variables(), settings = async at => (await import('./settings.js')).settings(typeof at === 'string' ? at : null);
+const runs = async () => (await import('./history.js')).runs(), variables = async () => (await more()).variables(), settings = async at => (await import('./settings.js')).settings(typeof at === 'string' ? at : null);
 const choosePython = async () => (await more()).choosePython();
 Object.assign(H, { sideOf, moveTab, fold, folded, viewTitle, KIND, addDoc, closeDoc, act, facts, head, detail, drawLeft, drawViews, look, readVars, themeNow, choosePython, job: async (doc, every) => (await more()).job(doc, every), schedule: async doc => (await more()).job(doc, true), createAs: async sql => (await more()).createAs(sql) });
 

@@ -47,12 +47,24 @@ def releases(first):
     """Every release on GitHub since `first`, oldest first: [(version, URL of this platform's binary)]."""
     os_name = {"linux": "linux", "darwin": "macos", "win32": "windows"}.get(sys.platform, sys.platform)
     arch = "arm64" if platform.machine().lower() in ("arm64", "aarch64") else "x64"
-    headers = {"Accept": "application/vnd.github+json"}
+    plain = {"Accept": "application/vnd.github+json"}
+    headers = dict(plain)
     if os.environ.get("GITHUB_TOKEN"):  # (CI: the API's limit for a runner's shared address is low)
         headers["Authorization"] = f"Bearer {os.environ['GITHUB_TOKEN']}"
-    req = urllib.request.Request(f"https://api.github.com/repos/{REPO}/releases?per_page=100", headers=headers)
+    for attempt in range(6):
+        # (a 403 or 429 is the API's limit, and the token's is shared by every run in the repository
+        # at once: try again a little later, every other time without it, on the runner's own limit)
+        req = urllib.request.Request(f"https://api.github.com/repos/{REPO}/releases?per_page=100",
+                                     headers=headers if attempt % 2 == 0 else plain)
+        try:
+            listed = json.load(urllib.request.urlopen(req, timeout=60))
+            break
+        except urllib.error.HTTPError as e:
+            if e.code not in (403, 429, 500, 502, 503) or attempt == 5:
+                raise
+            time.sleep(min(int(e.headers.get("Retry-After") or 0) or 15 * (attempt + 1), 120))
     found = []
-    for r in json.load(urllib.request.urlopen(req, timeout=60)):
+    for r in listed:
         v = r["tag_name"].lstrip("v")
         if r["draft"] or r["prerelease"] or not since(v, first):
             continue

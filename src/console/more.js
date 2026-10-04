@@ -1,15 +1,13 @@
 // The console's rarer parts (ADR-034, round 29), loaded when first used, so the page's first load
-// doesn't carry them: the History view (the node's runs, what this page ran), the Variables view,
-// search (Ctrl K), choosing the Python, a file run as a job or on a schedule. What they use of the shell comes through `R.helpers`.
-import { on, h, $, secs, count, bytes, utc, icon, svg, S, R, call, run, sessionOf, doBlock, rows, ident, quote, toast, menu, prompt, confirmed, pop, fileUrl, fileSql, moreStyle, interruptPython } from './core.js';
+// doesn't carry them: the Variables view, search (Ctrl K), choosing the Python, a file run as a job or on a schedule. What they use of the shell comes through `R.helpers`.
+import { on, h, $, secs, bytes, icon, svg, S, R, call, run, sessionOf, doBlock, rows, ident, quote, toast, menu, prompt, confirmed, pop, fileUrl, fileSql, moreStyle, interruptPython } from './core.js';
 import { highlighted } from './editor.js';
 import { copyText } from './grid.js';
-import { iconOf, oneLine, FOLDER, download } from './files.js';
+import { iconOf, FOLDER, download } from './files.js';
 
 await moreStyle();
 
 const H = R.helpers, { KIND, pick, act, facts, head, detail, readVars, show, openFile, restart, kernel } = H;
-let again = 0;
 
 /** A SQL cell with its notebook's Python in it: through Python when it names a table Python holds
  * (pandas, Polars, Arrow, a frame: sent along, as `db.sql` sends them); its answer kept in Python
@@ -73,51 +71,6 @@ export async function variables() {
     vars.length ? h('h4', { class: 'vhead' }, 'SQL') : null, ...vars.map(x => one('$' + x.name, (x.type || '').toLowerCase(), x.value ?? 'NULL'))];
 }
 
-/** History: what ran, newest first: the node's runs (jobs, files run, procedures, schedules' runs:
- * `pondra.runs`), and what this page ran. What runs on a schedule is in Jobs (jobs.js). */
-export async function runs() {
-  let node = [];
-  try { node = await rows('SELECT id, routine, caller, status, started, ended, args, error FROM pondra.runs ORDER BY started DESC LIMIT 30'); } catch { /* (no run yet, or no rights) */ }
-  clearTimeout(again);
-  // (until it ends; a run whose node stopped under it says running for good: not looked at again after a day)
-  if (node.some(x => x.status === 'running' && Date.now() - utc(x.started) < 864e5)) again = setTimeout(() => { if (S.tab === 'runs') detail(); }, 2000);
-  const sched = x => x.caller === 'schedule' ? x.routine : x.caller?.startsWith('task:') ? x.caller.slice(5) : null;
-  const took = x => x.ended ? secs(utc(x.ended) - utc(x.started)) : 'running';
-  const fileOf = x => /^files\/.+@/.test(x.routine) ? x.routine.replace(/^files\//, '').replace(/@[^@]*$/, '') : null;
-  // (a DO block: its code, a console's Python cell or file run on the node)
-  const codeOf = x => { if (x.routine !== 'do') return null; try { const a = JSON.parse(x.args || '{}'); return a.code ? { code: a.code, language: a.language || 'python' } : null; } catch { return null; } };
-  const firstLine = code => { const ls = code.split('\n').map(l => l.trim()).filter(l => l && !l.startsWith('#')); return ls.length ? oneLine(ls[0], 90) + (ls.length > 1 ? ' …' : '') : ''; };
-  const nameOf = x => { const c = codeOf(x); return fileOf(x) || (c ? firstLine(c.code) || 'DO' : x.routine === 'do' ? 'DO (a Python cell)' : x.routine); };
-  const nodeActs = x => [fileOf(x) ? ['Open the file', () => openFile(fileOf(x)), true] : null, codeOf(x) ? ['Open in a new file', () => R.helpers.newWith(codeOf(x).language === 'python' ? 'python' : 'sql', codeOf(x).code), true] : null,
-    codeOf(x) ? ['Copy the code', () => copyText(codeOf(x).code)] : null, ['Copy its id', () => copyText(String(x.id))]].filter(Boolean);
-  const nodeLook = x => pop(`Run ${String(x.id).slice(0, 12)}`, h('div', {}, facts([['What', codeOf(x) ? `DO LANGUAGE ${codeOf(x).language}` : x.routine], ['Who', x.caller], ['Status', x.status], ['Started', utc(x.started).toLocaleString()], ['Ended', x.ended ? utc(x.ended).toLocaleString() : null], ['Took', took(x)], ['Id', String(x.id)]]),
-    codeOf(x) ? h('pre', { class: 'defn', html: highlighted(codeOf(x).code, codeOf(x).language === 'python' ? 'python' : 'sql') }) : null, x.error ? h('pre', { class: 'err' }, x.error) : null), nodeActs(x));
-  const nodeRun = x => h('div', { class: 'run-item' + (String(x.id) === String(S.jobRun) ? ' fresh' : ''), role: 'button', tabindex: '0', title: 'Click: what it ran. Right-click: more', onclick: () => nodeLook(x), onkeydown: e => e.key === 'Enter' && nodeLook(x),
-    oncontextmenu: e => { e.preventDefault(); menu(e, [{ label: 'Show it', run: () => nodeLook(x) }, ...nodeActs(x).map(([label, run]) => ({ label, run }))]); } },
-    h('div', { class: 'line1' }, h('span', { class: 'ic', html: svg(fileOf(x) ? iconOf(fileOf(x)) : codeOf(x)?.language === 'python' || x.routine === 'do' ? 'filepy' : 'play', 14) }), h('span', { class: 'nm' }, nameOf(x)),
-      h('span', { class: 'meta ' + (x.status === 'failed' ? 'bad' : '') }, x.status === 'failed' ? 'failed' : took(x))),
-    // (a schedule's run, and what it called: tagged with the schedule, which Jobs shows)
-    h('div', { class: 'sub' }, sched(x) ? h('button', { class: 'tag', title: 'It ran on a schedule: Jobs has the schedules', onclick: e => { e.stopPropagation(); show('jobs'); } }, icon('calendar', 'ic', 11), sched(x)) : null,
-      `${sched(x) ? '' : `${String(x.id).slice(0, 8)} · ${x.caller} · `}${utc(x.started).toLocaleString()}`), x.error ? h('div', { class: 'sub bad' }, x.error.split('\n')[0].slice(0, 200)) : null);
-  const page = x => h('div', { class: 'run-item', role: 'button', tabindex: '0', title: 'Click: what it ran, and what to do with it. Right-click: the same', onclick: () => pageLook(x), onkeydown: e => e.key === 'Enter' && pageLook(x),
-    oncontextmenu: e => { e.preventDefault(); menu(e, pageActs(x).map(([label, run]) => ({ label, run }))); } },
-    h('div', { class: 'line1' }, h('span', { class: 'ic k-' + x.kind, html: svg(x.kind === 'python' ? 'filepy' : 'filesql', 14) }), h('span', { class: 'nm' }, x.kind === 'python' ? firstLine(x.src) : oneLine(x.src, 90)), h('span', { class: 'meta ' + (x.ok ? '' : 'bad') }, x.ok ? secs(x.ms) : 'failed')),
-    h('div', { class: 'sub' }, `#${x.id} · ${x.where} · ${new Date(x.at).toLocaleTimeString()}${x.rows != null ? ` · ${count(x.rows)} row${x.rows === 1 ? '' : 's'}` : ''}`));
-  return [head('clock', 'History', 'what ran, on the node and on this page'),
-    h('div', { class: 'dsect' }, 'On the node'), ...node.length ? node.map(nodeRun) : [h('div', { class: 'empty' }, 'No job yet: a file\'s Run ▾ runs it as one.')],
-    h('div', { class: 'dsect' }, 'This page'), ...S.ran.length ? S.ran.map(page) : [h('div', { class: 'empty' }, 'Nothing run yet.')]];
-}
-/** What to do with something this page ran: open it as a new file, put it in the one in front,
- * copy it, run it again, see its plan. */
-function pageActs(x) {
-  const fresh = () => R.helpers.newWith(x.kind === 'python' ? 'python' : 'sql', x.src);
-  return [['Open in a new file', fresh, true], S.doc?.put ? ['Put it in the tab in front', () => { S.doc.put(x.src); }] : null, ['Copy it', () => copyText(x.src)],
-    ['Run it again', async () => (await fresh()).run()], x.kind === 'sql' ? ['See its plan', async () => { const d = await fresh(); d.tab = 'plan'; d.run(); }] : null].filter(Boolean);
-}
-function pageLook(x) {
-  pop(`Run #${x.id}`, h('div', {}, facts([['Where', x.where], ['When', new Date(x.at).toLocaleString()], ['Took', secs(x.ms)], ['Answer', x.ok ? x.rows != null ? `${count(x.rows)} row${x.rows === 1 ? '' : 's'}` : 'done' : 'failed']]),
-    h('pre', { class: 'defn', html: highlighted(x.src, x.kind === 'python' ? 'python' : 'sql') }), x.error ? h('pre', { class: 'err' }, x.error) : null), pageActs(x));
-}
 /** A file (or a saved notebook) run on the node, not waited for (ADR-033): now, as a job
  * (`pondra.start('run', …)`), or on a schedule, as a task. What is saved runs, with the SQL file's
  * parameters as they are now; History shows it. */
@@ -129,7 +82,7 @@ export async function job(doc, every) {
   try {
     const r = await run(every ? `CREATE OR REPLACE TASK ${ident(name)} SCHEDULE ${quote(every)} AS CALL run(${args})` : `SELECT pondra.start('run', ${args})`);
     S.jobRun = r.rows?.[0]?.[0]; // (its row in History, marked)
-    toast(every ? `Scheduled: ${name}, every ${every}` : `Running ${path} as a job on the node: History shows it`); show(every ? 'jobs' : 'runs');
+    toast(every ? `Scheduled: ${name}, every ${every}` : `Running ${path} as a job on the node: History shows it`); if (!every) (S.hist ||= {}).of = 'runs'; show(every ? 'jobs' : 'runs');
     if (S.jobRun) told(S.jobRun, path);
   } catch (e) { toast(e.message, true); }
 }
