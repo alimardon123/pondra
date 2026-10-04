@@ -29,16 +29,21 @@ pub async fn send(store: &Store, r: &Request, wake: Option<&str>) -> Result<Opti
     // (R2 takes one write a second to a key: a ring refused (429) means it just rang, so it counts
     // as rung; and the leader looks every 30 s anyway: C5)
     let _ = store.put(&Path::from(BELL), id.to_string().into_bytes().into()).await;
-    if let Some(dir) = wake {
+    let woke = wake.map(|dir| {
         let dir = dir.to_string();
-        crate::panics::spawn(async move { lead_once(&dir).await });
-    }
+        crate::panics::spawn(async move { lead_once(&dir).await })
+    });
     for tick in 1.. {
         tokio::time::sleep(Duration::from_millis(500)).await;
         match store.get(&out).await {
             Ok(r) => {
                 let answer: Value = serde_json::from_slice(&r.bytes().await?)?;
                 let _ = store.delete(&out).await;
+                if let Some(w) = woke {
+                    // (it answers, then checkpoints and lets go: the caller's next step may need the
+                    // lake free, as DROP DATABASE of a branch just unpinned does)
+                    let _ = tokio::time::timeout(Duration::from_secs(60), w).await;
+                }
                 return match answer.get("error") {
                     Some(e) => bail!("the leader: {}", e.as_str().unwrap_or_default()),
                     None => Ok(Some(answer["ok"].clone())),

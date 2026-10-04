@@ -217,19 +217,7 @@ impl Server {
             drop(n.child.stdin.take());
             let _ = tokio::time::timeout(Duration::from_secs(20), n.child.wait()).await;
         }
-        let store = crate::store::open_store(&dir)?.1;
-        if let Some(t) = crate::cluster::latest(&store).await? {
-            anyhow::ensure!(!crate::cluster::alive(&store, &t).await, "another process leads database {name} ({}): stop it first", if t.addr.is_empty() { "a pondra sql" } else { &t.addr });
-        }
-        match dir.contains("://") {
-            false => std::fs::remove_dir_all(&dir).with_context(|| format!("deleting {dir}"))?,
-            true => {
-                // (a bucket's prefix: every object under it, as a folder's files are deleted)
-                use futures::{StreamExt, TryStreamExt};
-                let listed = store.list(None).map_ok(|o| o.location).boxed();
-                store.delete_stream(listed).try_collect::<Vec<_>>().await.with_context(|| format!("deleting {dir}"))?;
-            }
-        }
+        crate::ddl::delete_lake(&dir).await.with_context(|| format!("database {name}"))?; // (a bucket's prefix: every object under it)
         Ok(j!({"database": name, "dropped": true}))
     }
 }
