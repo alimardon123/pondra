@@ -291,6 +291,13 @@ enum Cmd {
         attach: Vec<String>,
         query: String,
     },
+    /// Lead a lake for a moment: make it if nothing is there yet, answer what waits in its inbox,
+    /// let go. A node runs it for a lake nobody leads (`inbox::lead_once`, invariant 62).
+    #[command(hide = true)]
+    Lead {
+        #[arg(long)]
+        dir: String,
+    },
     /// Run a SQL file — its statements in order, `$name` taking the value of `--name` — on a node
     /// of the lake started for it (`pondra run load.sql lake --day 2026-09-27`), or on a node
     /// already running (`--url http://host:8080`). `pondra run load.sql --help` lists its parameters.
@@ -736,6 +743,7 @@ async fn run() -> anyhow::Result<()> {
                 }
             }
         }
+        Cmd::Lead { dir } => write::lead_only(&dir).await?,
         Cmd::Sql { dir, query, attach: attached } if write::checkpoint(&query) => {
             // (the leader's work; with nobody leading, the next node to start tiers the log)
             let store = store::open_store(&dir)?.1;

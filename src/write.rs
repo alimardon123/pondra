@@ -1380,6 +1380,14 @@ pub async fn made(dir: &str) -> Result<Arc<Lake>> {
     Lake::open(dir, false, false).await
 }
 
+/// `pondra lead`: lead the lake at `dir` once, making it if it's new, for what waits in its inbox
+/// (or nothing, when someone leads it already: they answer the bell). No reader of the lake is
+/// opened and no statement run, so a node's CREATE DATABASE, a branch's first commit and a write
+/// to a lake nobody leads pay for one lead, not two and four catalogs opened.
+pub async fn lead_only(dir: &str) -> Result<()> {
+    deliver(dir, Some(None), &Stmt::Invalid(String::new()), "", true).await.map(drop)
+}
+
 pub async fn from_cli(dir: &str, stmt: Stmt) -> Result<Value> {
     if let Stmt::Invalid(why) = stmt {
         bail!(why); // (said as a node says it)

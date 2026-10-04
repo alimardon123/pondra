@@ -19,8 +19,8 @@ const BELL: &str = "inbox/bell";
 
 /// Writer: leave a request and wait for the answer. None if no leader is alive any more (the
 /// caller then leads itself; the request is withdrawn, and a retry of it would be a duplicate).
-/// `wake`: nobody leads the lake at that place, so once the request is in, a `pondra sql` of its
-/// own leads it for a moment and answers it (`lead_once`).
+/// `wake`: nobody leads the lake at that place, so once the request is in, a process of its own
+/// leads it for a moment and answers it (`lead_once`).
 pub async fn send(store: &Store, r: &Request, wake: Option<&str>) -> Result<Option<Value>> {
     let (kind, body) = r.inbox()?;
     let id = uuid::Uuid::new_v4();
@@ -61,11 +61,11 @@ pub async fn send(store: &Store, r: &Request, wake: Option<&str>) -> Result<Opti
 }
 
 /// Lead the lake at `dir` for a moment — making it, if nothing is there yet — and answer its
-/// inbox, in a `pondra sql` process of its own. A node never leads another lake itself: that
+/// inbox, in a `pondra lead` process of its own. A node never leads another lake itself: that
 /// lake's catalog writer would outlive the moment in the node, and a later leader of it would
 /// fence it out.
 pub async fn lead_once(dir: &str) -> Result<()> {
-    let out = tokio::process::Command::new(std::env::current_exe()?).args(["sql", "--dir", dir, "CREATE SCHEMA IF NOT EXISTS public"])
+    let out = tokio::process::Command::new(std::env::current_exe()?).args(["lead", "--dir", dir])
         .env_remove("PONDRA_JOB").env_remove("PONDRA_TRIES").stdin(std::process::Stdio::null()).output().await?;
     anyhow::ensure!(out.status.success(), "couldn't lead the lake at {dir}: {}", String::from_utf8_lossy(&out.stderr).trim());
     Ok(())

@@ -90,6 +90,8 @@ def environments_check(bin, work, port, root):
     made = q("CREATE DATABASE dev CLONE prod")
     took = time.time() - t0
     copied = parquet(dev_dir)
+    checks["CREATE DATABASE dev CLONE prod leads dev once: one term (`pondra lead`), not a second for a statement"] = \
+        len([k for k in keys(dev_dir) if "/cluster/term/" in k]) == 1
     checks["CREATE DATABASE dev CLONE prod copies no file (the log tail and the workspace only)"] = \
         len(copied) == 0 and len(keys(dev_dir)) > 0 and len(parquet(prod_dir)) == files_before
     checks["prod reads dev at once: every row as prod had it, ids and versions too (the log tail too)"] = \
