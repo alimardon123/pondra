@@ -160,9 +160,14 @@ The leader can go first too; it only costs the older followers a few seconds mor
 
 A lake has a format, a number in its catalog. A release opens every lake of its format or older:
 each release's tests open a lake made by every release since 0.22 and check every answer is the
-same. When a release brings a format change, the leader moves the lake to it only once every live
-node runs a release that knows it, so a mixed cluster never meets a lake one of its nodes can't
-read.
+same. A lake moves to a newer format only when something written in it needs one, and only once
+every live node runs a release that knows it, so a mixed cluster never meets a lake one of its nodes
+can't read. Until something moves it, the release before still opens it.
+
+| Format | Since | What moves a lake to it |
+|---|---|---|
+| 1 | 0.32 | every lake, as soon as a release that knows formats opens it |
+| 2 | 0.33 | a materialized view that works its answers out as it is read (`avg`, `stddev`, `HAVING`, …) |
 
 An older release refuses a newer lake by name, before it reads anything:
 
