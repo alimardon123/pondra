@@ -66,7 +66,7 @@ on bytes as they do on text. A `CAST` to bytes takes `BYTEA` only.
 | `SELECT x * 2 AS y FROM t WHERE y > 1` | a select's alias in its `WHERE` (a column of that name wins) |
 | `SUMMARIZE t`, `SUMMARIZE SELECT …` | a row per column: its type, min and max, distinct values about, mean, spread, quartiles, count and NULLs |
 | `FROM t USING SAMPLE 10%` (or `n ROWS`), `FROM t TABLESAMPLE (10)` (or `(n ROWS)`) | a sample: each row kept on its own, or `n` of them |
-| `EXPLAIN SELECT …` | the plan, and whether it would spread over the nodes |
+| `EXPLAIN SELECT …`, `EXPLAIN ANALYZE SELECT …` | the estimated plan, each step with the rows it expects (`expected_rows`), and whether it would spread over the nodes; run, the actual plan: each step's rows (`output_rows`) and time beside what it expected |
 | `DESCRIBE t`, `SHOW TABLES`, `SHOW COLUMNS FROM t` | what the lake holds |
 | `SHOW VIEWS`, `SHOW MATERIALIZED VIEWS [LIKE 'p%']`, `SELECT … FROM pondra.tables` | each table and view with its kind (see [system tables](/pondra/reference/system-columns/#tables-and-views)) |
 | `SHOW SCHEMAS`, `SHOW DATABASES`, `SHOW SECRETS`, `SHOW USERS`, `SHOW ROLES`, `SHOW GRANTS` (each `[LIKE 'p%']`) | the schemas, the lakes a query can name, the secrets (never their values), users, roles and grants |
@@ -634,7 +634,7 @@ their values.
 | A token | `CREATE TOKEN name FOR [USER] u [EXPIRES IN '90 days']` (answers it, once), `DROP TOKEN name FOR [USER] u` |
 | List | `SELECT * FROM pondra.users`, `SELECT * FROM pondra.grants` |
 | What was done, and refused | `SELECT * FROM pondra.audit` (a superuser's): `at`, `user`, `door`, `from`, `class`, `statement`, `outcome`, `message`, `ms`, `node` |
-| Every statement | `SELECT * FROM pondra.history` (a superuser sees every row, anyone else their own): `at`, `id`, `user`, `door`, `from`, `node`, `session`, `class`, `statement`, `outcome`, `error`, `ms`, `rows`, `nodes`, and for a statement slower than `PONDRA_SLOW_MS` its `plan` (each step's rows and time) and `trace` (each node's share, as JSON) |
+| Every statement | `SELECT * FROM pondra.history` (a superuser sees every row, anyone else their own): `at`, `id`, `user`, `door`, `from`, `node`, `session`, `class`, `statement`, `outcome`, `error`, `ms`, `rows`, `nodes`; `fingerprint` (the statement with its literals left out: one query's runs share it), `plan_id` (the shape of the plan it ran), `version` (the commit it read at: `t AT (VERSION => n)` reads what it read), `reads` and `writes` (the tables and views it read, the tables it changed), `misestimate` (for a query of `PONDRA_LEARN_MS` or more, a factor: how many times more or fewer rows its worst join gave than expected, so `40` is forty times off); and for a statement slower than `PONDRA_SLOW_MS`, or ten times off, its `plan` (each step's rows beside its expected rows, and its time) and `trace` (each node's share, as JSON) |
 
 `public` is every user: `GRANT SELECT ON t TO public`. A grant on a schema covers its tables made later
 too. Only a superuser (or the admin token) runs these. `MAX_QUERIES` and `STATEMENT_TIMEOUT` are a user's
