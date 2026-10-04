@@ -379,6 +379,9 @@ pub fn parse(sql: &str) -> Option<Stmt> {
     if let Some(s) = crate::routines::statement(sql) {
         return Some(s); // (CREATE FUNCTION and PROCEDURE as Postgres writes them, CREATE TASK, DROP TASK, DROP MACRO)
     }
+    if let Some(s) = crate::objects::statement(sql) {
+        return Some(s); // (COMMENT ON, CREATE OR ALTER TABLE | VIEW: the registry's)
+    }
     // `ALTER VIEW v RENAME TO w` (dbt's): the parser takes only ALTER VIEW … AS.
     static VIEW_RENAME: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(r#"(?is)^\s*ALTER\s+(MATERIALIZED\s+)?VIEW\s+(IF\s+EXISTS\s+)?([\w."-]+)\s+RENAME\s+TO\s+([\w."-]+)\s*;?\s*$"#).expect("a regex")
