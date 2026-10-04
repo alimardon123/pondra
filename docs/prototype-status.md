@@ -60,6 +60,17 @@ clients, 826 → 956 at 100, 749 → 934 at 200, 751 → 861 at 400; p99 at 200 
 showed: the writer, a request at a time, landed 9,770 rows a second beside 50 readers and 2,860
 beside 400 (acks wait behind the queries' tasks on the one runtime): next.
 
+**ClickHouse beside DuckDB** (`singlenode.py`, ClickHouse 26.9.9.28 as `clickhouse local`, 4 cores,
+best of three; `logs/round34/singlenode-*-clickhouse.json`). TPC-H SF1: DuckDB 1.5.5's tables
+0.97 s, Pondra from memory 1.20 s, DuckDB over Parquet 2.02 s, Pondra from files 2.17 s, ClickHouse's
+MergeTree tables 2.56 s, ClickHouse over Parquet 4.98 s. ClickBench's first 10 million rows:
+ClickHouse's MergeTree 4.63 s, DuckDB's tables 6.69 s, Pondra from memory 6.73 s, ClickHouse over
+Parquet 7.89 s, Pondra from files 9.86 s, DuckDB over Parquet 10.71 s. Where ClickHouse's tables are
+far ahead: q29's `REGEXP_REPLACE` (0.46 s against 1.29 s), q28 (0.04 s, its `length` counting bytes
+and its table sorted by the grouped key), q24's wide top-N (0.20 s against 0.50 s), q23, q19. Its
+answers that differ are its own: `0.06 - 0.01` a float (TPC-H q6), sums of doubles in any order
+(q15, now and then), `length` in bytes (q28, q29), `avg` of a BIGINT wrapping (q4).
+
 **Now (2026-10-03, round 33, toward 0.33.0): run it for years.**
 
 1. **Every statement remembered** (ADR-048, `history.rs`): `SELECT * FROM pondra.history` has a row
