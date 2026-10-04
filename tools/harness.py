@@ -7204,8 +7204,10 @@ def friendly():
     over the same rows: PIVOT and UNPIVOT (DuckDB's statements and the standard's), COLUMNS(…),
     `* RENAME`, ORDER BY ALL, FETCH FIRST, list comprehensions and lambdas, a struct's field,
     max_by and arg_min, string_split, json_extract, DuckDB's ASOF JOIN … ON, a select's alias in
-    its WHERE, SUMMARIZE; samples that sample (TABLESAMPLE was ignored); refusals by name; and the
-    same answers spread over three nodes."""
+    its WHERE, SUMMARIZE; samples that sample (TABLESAMPLE was ignored); refusals by name; the
+    same answers spread over three nodes; and what `random_sql.py` found (`- -3` written again as
+    a comment, a DISTINCT over a CASE refused, two IN lists of a column taken as sets of values,
+    columns of one name on both sides of a join mixed up)."""
     import datetime, decimal, duckdb, pyarrow as pa
     lake = new_lake()
     import psycopg
@@ -7276,6 +7278,11 @@ def friendly():
         "ASOF LEFT JOIN … ON": ("SELECT t.id, q.p FROM t ASOF LEFT JOIN q ON t.k = q.k AND t.ts >= q.ts", True, False),
         "a select's alias in its WHERE": ("SELECT x * 2 AS dbl FROM t WHERE dbl > 4000", True, False),
         "… but a column of that name wins": ("SELECT id + 100 AS x FROM t WHERE x > 20", True, False),
+        "a minus before a minus, in a text written again (it read back as a comment)": ("SELECT id, - -k AS m, - - -x AS b FROM t WHERE m > 3 AND g IS DISTINCT FROM 'b'", True, False),
+        "DISTINCT over a CASE whose WHEN shows its THEN isn't NULL (random_sql.py)": ("SELECT DISTINCT CASE WHEN k < 3 AND n = 2.5 THEN n ELSE 0 END AS c FROM t", True, False),
+        "x IN (a column, …) AND x IN (…): not the lists' intersection (random_sql.py)": ("SELECT id FROM t WHERE g IN (g, 'z') AND g IN ('a', 'b')", True, False),
+        "x IN (…) AND x NOT IN (NULL): no row (random_sql.py)": ("SELECT count(*) AS c FROM t WHERE g IN ('a', 'b') AND g NOT IN (NULL)", True, False),
+        "columns of one name on both sides of a LEFT JOIN, filtered on its padded side (random_sql.py)": ("SELECT (t.ts - q.ts) AS d, t.k FROM t LEFT JOIN q ON t.id = q.k WHERE q.k IS DISTINCT FROM 3", True, False),
     }
     checks, failed = {}, {}
     for name, (q, names, ordered) in same.items():
