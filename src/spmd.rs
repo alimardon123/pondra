@@ -1097,6 +1097,12 @@ fn shape(p: &Arc<dyn ExecutionPlan>) -> String {
     };
     // (a subquery's answer, shown in the line, may differ in its last digit from node to node)
     let what = what.split("scalar_subquery(").enumerate().map(|(i, part)| if i == 0 { part } else { part.split_once(')').map_or(part, |(_, rest)| rest) }).collect::<Vec<_>>().join("scalar_subquery()");
+    // (an aggregate's ordering_mode follows from the orders and constants below it, which depend on
+    // how this node reads a table, as `scan` says: its groups, partitions and answer are the same)
+    let what = match what.split_once(", ordering_mode=") {
+        Some((head, tail)) => format!("{head}{}", tail.strip_prefix("PartiallySorted(").map_or(tail.trim_start_matches(char::is_alphanumeric), |t| t.split_once(')').map_or("", |(_, rest)| rest))),
+        None => what,
+    };
     format!("{}[{}]", what.trim(), p.children().iter().map(|c| shape(c)).collect::<Vec<_>>().join(", "))
 }
 

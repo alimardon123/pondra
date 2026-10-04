@@ -169,7 +169,7 @@ pub fn as_of(sql: &str) -> anyhow::Result<Cow<'_, str>> {
         return Err(e);
     }
     Ok(match v.0 {
-        true => Cow::Owned(stmts.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(";\n")),
+        true => Cow::Owned(stmts.iter().map(crate::routines::sql).collect::<Vec<_>>().join(";\n")),
         false => Cow::Borrowed(sql),
     })
 }

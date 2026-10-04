@@ -56,7 +56,7 @@ class Gen:
         if kind in ("i", "b", "d", "f"):
             a, b = self.expr(cols, kind, depth + 1), self.expr(cols, kind, depth + 1)
             return r.choice([f"({a} + {b})", f"({a} - {b})", f"({a} * {b})" if kind in ("d", "f") else f"({a} + {b})", f"abs({a})", f"COALESCE({a}, {b})",
-                             f"CASE WHEN {self.pred(cols, depth + 1)} THEN {a} ELSE {b} END", f"(-{a})"])
+                             f"CASE WHEN {self.pred(cols, depth + 1)} THEN {a} ELSE {b} END", f"(- {a})"])
         if kind == "s":
             a, b = self.expr(cols, "s", depth + 1), self.expr(cols, "s", depth + 1)
             return r.choice([f"({a} || {b})", f"upper({a})", f"lower({a})", f"COALESCE({a}, {b})", f"CASE WHEN {self.pred(cols, depth + 1)} THEN {a} ELSE {b} END"])
@@ -175,7 +175,11 @@ def main():
                 if not tail and "DISTINCT" not in head:  # (ternary logic partitioning: a plain query's rows, split three ways)
                     p = g.pred(cols)
                     glue = " AND " if where else " WHERE "
-                    parts = [pondra(A.port, head + where + glue + c) for c in (f"({p})", f"(NOT ({p}))", f"(({p}) IS NULL)")]
+                    try:
+                        parts = [pondra(A.port, head + where + glue + c) for c in (f"({p})", f"(NOT ({p}))", f"(({p}) IS NULL)")]
+                    except Exception as e:  # (a part refused that the whole query took is a finding too)
+                        found.append({"oracle": "partitions", "sql": head + where + glue + f"({p})", "pondra": str(e)[:300]})
+                        continue
                     stats["partitions_checked"] += 1
                     if bag([r for part in parts for r in part]) != bag(mine):
                         found.append({"oracle": "partitions", "sql": sql, "split_on": p})
