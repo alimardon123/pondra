@@ -788,7 +788,7 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
         // (`pondra.runs`, `pondra.routines`, `pondra.tasks`; a schema of the lake's own called pondra wins)
         use datafusion::catalog::SchemaProvider;
         let system = Arc::new(MemorySchemaProvider::new());
-        for (name, table) in crate::runs::tables(lake).await?.into_iter().chain(crate::users::tables(lake).await?) {
+        for (name, table) in crate::runs::tables(lake).await?.into_iter().chain(crate::users::tables(lake).await?).chain(crate::objects::tables(lake, &text).await?) {
             system.register_table(name.into(), table)?;
         }
         let runs = match lake.cat.get::<TableMeta>(&crate::store::table_key(crate::runs::TABLE)).await? {
