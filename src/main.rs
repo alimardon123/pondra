@@ -46,6 +46,7 @@ mod drain;
 mod log;
 mod manifest;
 mod objects;
+mod once;
 mod metrics;
 mod optimize;
 mod pages;
