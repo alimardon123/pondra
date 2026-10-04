@@ -448,6 +448,10 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, o: Options) -> Result<()
         }
         ensure!(!has("__start_at") && !has("__end_at"), "__start_at and __end_at are a history view's own columns: name yours something else");
     }
+    if finish.is_some() {
+        // (0.32 would read its partial rows as the view's: ADR-055)
+        crate::format::require(lake, 2, "a materialized view that works its answers out as it is read (avg, stddev, HAVING, …)").await?;
+    }
     let meta = TableMeta { columns, key, merge, publish: default_publish(), ids: true, tiered: lake.visible(), history, finish: finish.clone(), ..Default::default() };
     if !expect.is_empty() {
         expectations(lake, name, &source, &planned, &meta, &expect).await?;
