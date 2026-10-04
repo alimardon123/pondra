@@ -787,7 +787,12 @@ async fn sessions(lake: &Lake, log: &crate::log::Log, view: &str, v: &View, s: &
     let with = sessionized(&v.sql)?;
     let out = crate::query::sql(&crate::query::over_ctx(lake, &v.source, extended(&src, &s.time)?, closed, &with).await?, &with).await?.collect().await?;
     append(lake, log, view, crate::log::Src { producer, seq: wm as u64, prev: Some(done) }, out).await?;
-    lake.cat.commit(vec![(open_key(view), json(&open))], &[]).await // (a lower bound: stale is safe, only slower)
+    // Read from a gap before the earliest open session: a row that comes later, behind the
+    // watermark, still belongs to a session that ends after it (its own, or an open one it reaches
+    // back to), as Flink's rule has it. From the open session's start, a new key's such row was
+    // never read, or read only when it beat the round that moved the bound.
+    let reach = open - s.gap_secs as i64 * 1_000_000;
+    lake.cat.commit(vec![(open_key(view), json(&reach))], &[]).await // (a lower bound: stale is safe, only slower)
 }
 
 /// Can what follows `table` take its rows' changes (UPDATE, DELETE, MERGE)? A view over the table

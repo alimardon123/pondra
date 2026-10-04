@@ -250,7 +250,8 @@ bob   1  2      2026-09-29T10:02:00  2026-09-29T10:02:30
 
 Bob's rows at 10:00:25 and 10:02:00 are more than 30 seconds apart, so they are two sessions. Cy's
 row moved the watermark to 10:04:55, which closed everything before it. A row that falls inside a
-session already kept is late, and is left out.
+session already kept is late, and is left out. A row behind the watermark whose session isn't over
+yet still counts.
 
 <Aside type="caution">
 A session view starts from the moment it is created; rows already in the table are not part of
@@ -461,5 +462,5 @@ it has no live queries.
 - There is one watermark per source table, not per partition or node. A source that goes quiet
   holds it: its last sessions wait for more rows (a window view's `idle` moves it on).
 - Top-N by event time, timers and `MATCH_RECOGNIZE` don't exist.
-- Late rows are counted (`pondra.flows`' `late_rows`), not kept apart; there's no side output for
-  them.
+- A window view's late rows are counted (`pondra.flows`' `late_rows`), not kept apart; there's no
+  side output for them. A session view leaves its late rows out without counting them yet.

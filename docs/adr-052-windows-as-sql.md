@@ -49,7 +49,11 @@ functions (`TUMBLE(…)`, `HOP(…)`), which Alimardon found neither simple nor 
    clients that build the statement from options (Python's and JavaScript's `db.view`).
 6. **Sessions are `GROUP BY key, SESSION(ts, INTERVAL '30 minutes') EMIT FINAL`**, the same view
    `WITH (session = 'ts', gap_secs = 1800)` made (`views::Sessions`, `session_start`,
-   `session_end`), and `SHOW CREATE` writes a session view this way.
+   `session_end`), and `SHOW CREATE` writes a session view this way. A row that comes behind the
+   watermark is kept when its session isn't over (it ends after the watermark), as Flink keeps it:
+   each round reads from a gap before the earliest open session (`w/{view}`). From that session's
+   start, as before, a new key's row was lost when a round had moved the bound past it first, and
+   kept when it came before that round.
 7. **Sliding windows are a window frame over the kept groups** (`sum(n) OVER (ORDER BY minute RANGE
    BETWEEN INTERVAL '4 minutes' PRECEDING AND CURRENT ROW)`): each row counted once, in its bucket.
 8. **The options form stays** (`window`, `size_secs`, `slide_secs`, `session`, `gap_secs`,
@@ -64,4 +68,6 @@ functions (`TUMBLE(…)`, `HOP(…)`), which Alimardon found neither simple nor 
   a view as a plain GROUP BY view of `{view}$open` and stops keeping groups until it is upgraded.
 - What it doesn't do: a window over a join (a stream join's view is the source to group instead), a
   bucket of an expression over two columns, per-key or per-partition watermarks (ADR-017's limit
-  stands), and a side output of the late rows themselves.
+  stands), and a side output of the late rows themselves. A session view doesn't count its late
+  rows yet: a session is cut again each round from the rows it reads, so telling a row new since
+  the last round apart needs a mark of its own.
