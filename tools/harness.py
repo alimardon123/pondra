@@ -492,7 +492,7 @@ def outside():
     checks["…written by every node at once, each its own share's files"] = len(names("out/by_region/")) == 3
     q("CREATE TABLE spread_me (id BIGINT, amount BIGINT)")
     for i in range(3):
-        q(f"INSERT INTO spread_me SELECT id, amount FROM {glob} WHERE id % 3 = {i}")
+        q(f"INSERT INTO spread_me SELECT id, amount FROM {glob} WHERE id % 3 = {i}", 1)  # (from one node: a file each, not merged away)
         call(A.port, "POST", "/tier", timeout=600)
     q("INSERT INTO spread_me VALUES " + ", ".join(f"({i}, {i})" for i in range(10)))  # (in the log only, for now)
     copied = q("COPY spread_me TO 's3://ext/out/lake/' (FORMAT parquet)")
@@ -1018,6 +1018,17 @@ def insert_spread():
     before = writes()
     q("INSERT INTO grouped SELECT k, count(*), sum(v) FROM src GROUP BY k")
     checks["a GROUP BY is written by one node"] = writes() == before and one("SELECT count(*) AS n, sum(n) AS rows FROM grouped") == {"n": 50, "rows": 120002}
+    # A history view: a version's __end_at is the next version's, in whichever file it is, so every
+    # node reads it whole (deleted versions left out), spread or not, and it is written as it reads.
+    q("CREATE TABLE ch (id BIGINT, op VARCHAR, at BIGINT)")
+    q("CREATE MATERIALIZED VIEW h WITH (history = 'id', sequence_by = 'at', delete_when = 'op = ''D''') AS SELECT id, op, at FROM ch")
+    for i in range(3):
+        q(f"INSERT INTO ch SELECT value % 1000, CASE WHEN value % 97 = 0 THEN 'D' ELSE 'U' END, value + {i * 100000} FROM generate_series(1, 20000)")
+        call(ports[0], "POST", "/tier", timeout=600)
+    q("CREATE TABLE h_copy AS SELECT id, op, __end_at FROM h")
+    hist = lambda t, how: call(ports[0], "POST", f"/sql?spread={how}", f"SELECT count(*) AS n, count(__end_at) AS ended, count(*) FILTER (WHERE op = 'D') AS d FROM {t}".encode())[0]
+    checks["a history view spread == one node, deleted versions left out, and copied as it reads"] = \
+        hist("h", 1) == hist("h", 0) == hist("h_copy", 1) and hist("h", 1)["d"] == 0 and hist("h", 1)["ended"] > 0
     log = open(nodes[0].log).read()
     checks["nothing fell back to one node (a spread query naming _row_id too)"] = "across the nodes failed" not in log and "distributed query failed" not in log
     for n in nodes:

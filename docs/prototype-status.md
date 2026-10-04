@@ -22,9 +22,9 @@ lambdas, `({…}).a`, `max_by`/`arg_max`/`min_by`/`arg_min`, `list()`, `string_s
 `json_extract`, DuckDB's `ASOF [LEFT] JOIN … ON`, a select's alias in its `WHERE`, `SUMMARIZE`,
 `USING SAMPLE`, and a `TABLESAMPLE` that samples (DataFusion ignored it and returned every row).
 `harness.py friendly`: 30 forms answer as DuckDB 1.5.5 does over the same 2,000 rows, and the same
-spread over three nodes, over Postgres and in views. 69 of the 73 everyday features probed on
-2026-10-03 now work; the four left (`CREATE TYPE … AS ENUM`, `CREATE SEQUENCE`, `CREATE INDEX`,
-`COMMENT ON`) wait on the SQL registry's decision.
+spread over three nodes, over Postgres and in views. 70 of the 73 everyday features probed on
+2026-10-03 now work (`COMMENT ON` came with the statement registry, invariant 227); `CREATE TYPE …
+AS ENUM`, `CREATE SEQUENCE` and `CREATE INDEX` build on it.
 
 **100,000 random queries** (`tools/random_sql.py --seed 3434`, D2): each against DuckDB 1.5.5 on
 one node, every tenth spread over three, 42,826 split three ways by a condition. The first run
@@ -38,6 +38,15 @@ one node's; the 26 left are refusals DataFusion makes and DuckDB doesn't (`NULL 
 Postgres, and two decimal types too wide) (`logs/round34/random-100k.json`). **TPC-DS on three
 nodes**: 99 of 99 the same as one node, all spread (q66 and q75 had fallen back over an
 aggregate's `ordering_mode`: invariant 34).
+
+**Big writes on every node** (invariant 228): an `INSERT … SELECT` or `CREATE TABLE AS` whose rows
+split as they are is written by every node from its own share, recorded in one commit, row ids
+unique, a retried job writing nothing. Three nodes sharing one 4-core box: a copy of TPC-H SF1's
+lineitem (6,001,215 rows) 5.9 s on one node, 3.6 s on three; a filtered copy (3,426,687 rows) 2.8 s
+against 1.5 s (`logs/round34/insert-spread.json`). Building it found two read bugs on spread
+queries, both fixed: a query naming `_row_id` fell back to one node, and a history view (SCD type
+2) spread over the nodes counted its deleted versions (98,970 rows read as 100,000), since round
+33.
 
 **Now (2026-10-03, round 33, toward 0.33.0): run it for years.**
 

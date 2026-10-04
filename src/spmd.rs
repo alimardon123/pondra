@@ -16,7 +16,7 @@
 //!   keys of it. The last stage's results go to the coordinator.
 //!
 //! Which queries: any single query — joins of every kind, subqueries, CTEs, unions — over this
-//! lake's tables; keyed tables are read whole, at the coordinator's snapshot. Whether a plan may
+//! lake's tables; keyed tables and history views are read whole, at the coordinator's snapshot. Whether a plan may
 //! be split is decided operator by operator (`spread`): only what stays correct run this way runs
 //! this way, and anything else runs on one node.
 use crate::manifest::Manifest;
@@ -178,7 +178,7 @@ pub async fn query(lake: &Lake, nodes: &[String], me: &str, sql: &str, force: bo
 }
 
 /// What a query spread over the nodes reads: its tables, those of files outside the lake, and the
-/// one sliced — the biggest append table. Keyed tables are read whole: a key's versions are spread
+/// one sliced — the biggest append table. Keyed tables (and history views) are read whole: a key's versions are spread
 /// over the files, so a share of the files isn't a share of the rows. None: it runs on one node.
 struct Main {
     tables: Vec<String>,
@@ -186,6 +186,10 @@ struct Main {
     main: String,
     meta: TableMeta,
 }
+
+/// Whether a table's files may be dealt out: not a keyed table's (a key's versions are spread over
+/// them) nor a history view's (each version's `__end_at` is the next version's, in any file).
+fn sliceable(m: &TableMeta) -> bool { m.key.is_empty() && m.history.is_none() }
 
 async fn sliced(lake: &Lake, nodes: usize, sql: &str, force: bool) -> Result<Option<Main>> {
     let Some(tables) = read(lake, sql).await? else { return Ok(refused("not a single query")) };
@@ -195,7 +199,7 @@ async fn sliced(lake: &Lake, nodes: usize, sql: &str, force: bool) -> Result<Opt
     let ext = crate::ext::of(lake, &tables).await?; // (tables of files outside the lake, listed once: every node reads these)
     let mut main: Option<(String, TableMeta, u64)> = None;
     for t in &tables {
-        let Some(meta) = crate::ext::meta(lake, t).await?.filter(|m| m.key.is_empty()) else { continue };
+        let Some(meta) = crate::ext::meta(lake, t).await?.filter(sliceable) else { continue };
         let bytes = size(&meta).1;
         if main.as_ref().is_none_or(|m| bytes > m.2) {
             main = Some((t.clone(), meta, bytes));
@@ -486,7 +490,10 @@ async fn shared(lake: &Lake, s: &Slice) -> Result<(SessionContext, datafusion::p
     {
         for (t, meta) in &s.whole {
             let meta = &sys(meta.clone());
-            let inner = crate::query::named(&ctx, crate::query::table_view(lake, &ctx, t, meta, Some(s.upto)).await?, meta, deleted)?;
+            let mut inner = crate::query::named(&ctx, crate::query::table_view(lake, &ctx, t, meta, Some(s.upto)).await?, meta, deleted)?;
+            if let Some(h) = &meta.history {
+                inner = crate::views::history_view(&ctx, inner, h, crate::sys::mentioned(&text)).await?; // (as `session_at` reads it)
+            }
             ctx.deregister_table(table_ref(t))?;
             ctx.register_table(table_ref(t), Arc::new(WholeTable { inner, name: t.clone(), size: totals(meta) }))?;
         }
@@ -593,7 +600,7 @@ async fn spread_once(lake: &Lake, nodes: &[String], mine: usize, sql: &str, tabl
         // Its append tables (the biggest first), as of now.
         let mut appends: Vec<(String, TableMeta)> = vec![];
         for t in tables {
-            if let Some(meta) = crate::ext::meta(lake, t).await?.filter(|m| m.key.is_empty()) {
+            if let Some(meta) = crate::ext::meta(lake, t).await?.filter(sliceable) {
                 appends.insert(if t == main { 0 } else { appends.len() }, (t.clone(), meta));
             }
         }

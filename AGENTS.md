@@ -1519,10 +1519,12 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    159); the shares' columns must agree, and the leader records every file in one commit with the
    job's mark, so a retried job writes nothing. A share that fails leaves its files to the orphan
    sweep, and this node writes it all. A spread query that names a system column gets them in its
-   tables, as `session_at` gives them (`spmd::shared`: it fell back to one node). `harness.py
-   insert`: "every node writes its share" (the followers' object writes), the rows, ids and one
-   version, "a GROUP BY is written by one node", "nothing fell back… (a spread query naming _row_id
-   too)".
+   tables, as `session_at` gives them (`spmd::shared`: it fell back to one node). A history view
+   (invariant 183) is never sliced (`spmd::sliceable`: a version's `__end_at` is the next version's,
+   in whichever file) and every node reads it through `views::history_view`: a spread read counted
+   its deleted versions (since round 33). `harness.py insert`: "every node writes its share" (the
+   followers' object writes), the rows, ids and one version, "a GROUP BY is written by one node", "a
+   history view spread == one node…", "nothing fell back… (a spread query naming _row_id too)".
 
 ## Tests: run these before and after any change
 
