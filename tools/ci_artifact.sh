@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # One platform's packages from the build workflow's run of a commit, into dist/:
 #   tools/ci_artifact.sh linux-x64 [SHA]
-# For a workflow that tries what the build made (deploy.yml) without building it again. The build
-# uploads each platform's packages as soon as they are made, before its suite runs, so this waits
-# for them while that run goes on (`WAIT_MINUTES`, 75), or takes a passed run of the same tree
+# For a workflow that tries what the build made, started apart from it (deploy-check.yml on a tag,
+# a test started by hand), without building it again. The build uploads each platform's packages
+# as soon as they are made, before its suite runs, so this waits for them while that run goes on
+# (`WAIT_MINUTES`, 75), or takes a passed run of the same tree
 # (`ci_build.sh`: a merge or a tag whose code a pull request's run built). Needs `gh` with
 # GH_TOKEN (actions: read) and GITHUB_REPOSITORY.
 set -euo pipefail

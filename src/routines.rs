@@ -656,7 +656,30 @@ fn parse_expr(sql: &str) -> Result<Expr> { Ok(Parser::new(&GenericDialect {}).tr
 
 fn parse_query(sql: &str) -> Result<ast::Query> { Ok(*Parser::new(&GenericDialect {}).try_with_sql(sql)?.parse_query()?) }
 
-fn text(stmts: &[Statement]) -> String { stmts.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(";\n") }
+fn text(stmts: &[Statement]) -> String { stmts.iter().map(sql).collect::<Vec<_>>().join(";\n") }
+
+/// A statement as SQL text again. sqlparser writes `- -3` (or `- $x`, `$x` bound to -3) as `--3`,
+/// which reads back as a comment, so a minus before anything written with a minus first gets
+/// parentheses.
+pub fn sql(s: &Statement) -> String {
+    let twice = |e: &Expr| matches!(e, Expr::UnaryOp { op: ast::UnaryOperator::Minus, expr } if expr.to_string().starts_with('-'));
+    let mut doubled = false;
+    let _ = ast::visit_expressions(s, |e| {
+        doubled |= twice(e);
+        ControlFlow::<()>::Continue(())
+    });
+    if !doubled {
+        return s.to_string();
+    }
+    let mut s = s.clone();
+    let _ = visit_expressions_mut(&mut s, |e| {
+        if let (true, Expr::UnaryOp { expr, .. }) = (twice(e), &mut *e) {
+            **expr = Expr::Nested(Box::new(std::mem::replace(&mut **expr, Expr::Value(ast::Value::Null.into()))));
+        }
+        ControlFlow::<()>::Continue(())
+    });
+    s.to_string()
+}
 
 /// Every SQL function call in `sql` replaced by its body (a function's own calls too, 16 deep at
 /// most), and every Python function's call made whole: its arguments in their places, defaults
@@ -679,6 +702,7 @@ async fn expand_with(lake: &Lake, sql: &str, views: &HashMap<String, String>) ->
     }
     let sql = &crate::past::restore(lake, sql).await?.unwrap_or_else(|| sql.to_string()); // (`RESTORE TABLE t TO VERSION AS OF n`: a MERGE, ADR-043)
     let sql = &crate::sparksql::inline(sql)?; // (`spark_sql('…')`: Spark SQL as Pondra's, then expanded as any)
+    let sql = &crate::branch::diffs(sql)?; // (`pondra.diff('prod.t', 'dev.t')`: rows apart, ADR-047)
     let sql = &crate::past::syntax(sql).into_owned(); // (`t AT (VERSION => n)`: a table as it was, ADR-043)
     let sql = &crate::friendly::text(sql)?.into_owned(); // (`PIVOT t ON g`, `[x FOR x IN l]`, DuckDB's ASOF … ON: as SQL that parses)
     let all = listed(lake).await?;

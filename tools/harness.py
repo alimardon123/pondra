@@ -1456,6 +1456,165 @@ def sessions():
     return "session windows: each closed by event time, emitted once, whole; out-of-order rows within the lateness join their session; late rows inside an emitted session are left out; a leader restart emits nothing twice"
 
 
+def finals_on_three():
+    """`finals`' cluster part: rows appended to three nodes, exactly once, while the leader is
+    killed twice; each group kept once, equal to the ad hoc query, on every node."""
+    import datetime
+    lake, at = new_lake(), A.port + 1
+    nodes = [Node(lake, at + i, tier_secs=1).start() for i in range(3)]
+    q = lambda s, i=0: sql(at + i, s)
+    q("CREATE TABLE clicks (visitor VARCHAR, ts TIMESTAMP, amount BIGINT)")
+    q("CREATE MATERIALIZED VIEW per_minute WITH (lateness = '2 seconds') AS SELECT date_bin(INTERVAL '1 minute', ts) AS minute, visitor, count(*) AS n, sum(amount) AS total FROM clicks GROUP BY 1, 2 EMIT FINAL")
+    base, seqs, killed = 1_790_000_000 // 60 * 60, {}, 0
+    iso = lambda s: datetime.datetime.fromtimestamp(s, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+
+    def append(rows, k):
+        name = f"p{k % 3}"
+        seqs[name] = seqs.get(name, 0) + 1
+        body = "".join(json.dumps(r) + "\n" for r in rows).encode()
+        for t in range(200):  # (whichever node answers: the same seq is applied once)
+            if nodes[(k + t) % 3].alive():
+                try:
+                    return call(at + (k + t) % 3, "POST", f"/append/clicks?producer={name}&seq={seqs[name]}", body, timeout=15)
+                except Exception:
+                    time.sleep(0.2)
+        raise RuntimeError("an append was never acknowledged")
+
+    for k in range(120):  # 20 minutes of event time
+        append([{"visitor": f"v{(k + j) % 4}", "ts": iso(base + k * 10 + j), "amount": k * 10 + j} for j in range(5)], k)
+        if k in (40, 80):
+            lead = next(i for i in range(3) if call(at + i, "GET", "/stats", timeout=5)["role"] == "leader")
+            nodes[lead].kill()
+            killed += 1
+            time.sleep(6)
+            nodes[lead] = Node(lake, at + lead, tier_secs=1).start()
+    append([{"visitor": "v0", "ts": iso(base + 3600), "amount": 0}], 0)  # the watermark past them all
+    want = q(f"SELECT date_bin(INTERVAL '1 minute', ts) AS minute, visitor, count(*) AS n, sum(amount) AS total FROM clicks WHERE ts < '{iso(base + 1200)}' GROUP BY 1, 2 ORDER BY 1, 2")
+    got = [until(lambda i=i: q("SELECT minute, visitor, n, total FROM per_minute ORDER BY 1, 2", i), want, 60) for i in range(3)]
+    groups = q("SELECT count(*) AS g, count(DISTINCT (minute, visitor)) AS d FROM per_minute")[0]
+    for n in nodes:
+        n.kill()
+    return killed == 2 and len(want) == 80 and groups["g"] == groups["d"] == 80 and all(g == want for g in got)
+
+
+def finals():
+    """Windows as plain SQL (`… GROUP BY <a time bucket> EMIT FINAL`, ADR-052): each group kept
+    once, when event time passes it, equal to the same query run ad hoc over the rows it had; any
+    bucket that only grows (`date_bin`, a date, minutes since the epoch), one that comes back round
+    refused; a late row counted in `pondra.flows`, the groups kept unchanged; `lateness`; `idle`
+    keeps a quiet source's last group; `SESSION(ts, INTERVAL …)` as the options form; `SHOW CREATE`
+    runs again; `DROP`, `OR REPLACE`; a leader restart keeps nothing twice, nor three nodes whose
+    leader is killed twice."""
+    import datetime
+    lake = new_lake()
+    node = Node(lake, A.port, tier_secs=1).start()
+    q = lambda s: sql(A.port, s)
+    q("CREATE TABLE clicks (visitor VARCHAR, ts TIMESTAMP, amount BIGINT)")
+    day = 86_400
+    base = (1_790_000_000 // day + 1) * day - 180  # minute 3 starts a new day
+    iso = lambda s: datetime.datetime.fromtimestamp(s, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    made = {
+        "per_minute": "CREATE MATERIALIZED VIEW per_minute WITH (lateness = '10 seconds') AS SELECT date_bin(INTERVAL '1 minute', ts) AS minute, visitor, "
+                      "count(*) AS n, sum(amount) AS spent FROM clicks GROUP BY 1, 2 EMIT FINAL",
+        "per_day": "CREATE MATERIALIZED VIEW per_day AS SELECT CAST(ts AS DATE) AS day, count(*) AS n FROM clicks GROUP BY 1 EMIT FINAL",
+        "by_epoch": "CREATE MATERIALIZED VIEW by_epoch AS SELECT floor(date_part('epoch', ts) / 60) AS m, count(*) AS n FROM clicks GROUP BY 1 EMIT FINAL",
+        "quiet": "CREATE MATERIALIZED VIEW quiet WITH (idle = '2 seconds') AS SELECT date_trunc('minute', ts) AS minute, count(*) AS n FROM clicks GROUP BY 1 EMIT FINAL",
+        "visits": "CREATE MATERIALIZED VIEW visits WITH (lateness = '5 seconds') AS SELECT visitor, count(*) AS n, sum(amount) AS spent FROM clicks "
+                  "GROUP BY visitor, SESSION(ts, INTERVAL '20 seconds') EMIT FINAL",
+    }
+    q(made["per_minute"])
+    seq = 0
+    def send(rows):
+        nonlocal seq
+        seq += 1
+        call(A.port, "POST", f"/append/clicks?producer=p&seq={seq}", "".join(json.dumps({"visitor": v, "ts": iso(base + t), "amount": a}) + "\n" for v, t, a in rows).encode())
+    # minutes 0-3, the first 30 s of each: a twice as often as b (rows before the other views are made, so they fill)
+    send([("a" if i % 3 else "b", m * 60 + i, m + i) for m in range(2) for i in range(30)])
+    for k in ("per_day", "by_epoch", "quiet", "visits"):
+        q(made[k])
+    q(made["visits"].replace("visits", "visits_by_options").replace(" EMIT FINAL", "").replace(", SESSION(ts, INTERVAL '20 seconds')", "")
+      .replace("lateness = '5 seconds'", "session = 'ts', gap_secs = 20, lateness_secs = 5"))
+    send([("a" if i % 3 else "b", m * 60 + i, m + i) for m in range(2, 4) for i in range(30)])
+    minutes = lambda t, col="minute": sorted({int(datetime.datetime.fromisoformat(r[col]).replace(tzinfo=datetime.timezone.utc).timestamp() - base) // 60 for r in q(f"SELECT {col} FROM {t}")})
+    first = until(lambda: minutes("per_minute"), [0, 1, 2])  # newest 3:29, lateness 10 s: minutes 0-2 are over
+    days = until(lambda: len(q("SELECT * FROM per_day")), 1)  # the day before minute 3 is over
+    send([("a", 3 * 60 + 55, 1)])  # the watermark to 3:45 …
+    time.sleep(3)  # (the session views' rounds see it: their watermark 3:50 closes a's and b's sessions)
+    send([("c", 3 * 60 + 40, 1)])  # … and a row 15 s out of order still counts: minute 3 is open
+    # (another visitor's, so it can't join a session already closed. For the session views it is
+    # behind the watermark, but its session, to 4:00, isn't over: kept, as Flink keeps it)
+    send([("late", 5, 1)])  # for minute 0, kept already
+    time.sleep(3)
+    middle = minutes("per_minute")
+    late = {r["name"]: r.get("late_rows") for r in q("SELECT name, late_rows FROM pondra.flows")}
+    send([("a", 4 * 60 + 58, 1)])  # 4:58: minute 3 is over; minute 4 only once the source is quiet
+    until(lambda: minutes("per_minute"), [0, 1, 2, 3])
+    quiet = until(lambda: minutes("quiet"), [0, 1, 2, 3, 4], secs=20)
+    time.sleep(1)
+    waits = minutes("per_minute")
+    adhoc = q("SELECT date_bin(INTERVAL '1 minute', ts) AS minute, visitor, count(*) AS n, sum(amount) AS spent FROM clicks "
+              f"WHERE visitor <> 'late' AND ts < '{iso(base + 240)}' GROUP BY 1, 2 ORDER BY 1, 2")
+    kept = q("SELECT * FROM per_minute ORDER BY 1, 2")
+    epoch = q("SELECT m, n FROM by_epoch ORDER BY m")
+    per_m = q(f"SELECT CAST(floor(date_part('epoch', ts) / 60) AS DOUBLE) AS m, count(*) AS n FROM clicks WHERE visitor <> 'late' AND ts < '{iso(base + 240)}' GROUP BY 1 ORDER BY 1")
+    sessions = lambda t: q(f"SELECT visitor, session_start, session_end, n, spent FROM {t} ORDER BY 1, 2")
+    both = until(lambda: sessions("visits") == sessions("visits_by_options") and len(sessions("visits")) == 10, True)
+    kept_sessions = {t: sessions(t) for t in ("visits", "visits_by_options")}
+    sliding = q("SELECT minute, sum(n) OVER (ORDER BY minute RANGE BETWEEN INTERVAL '2 minutes' PRECEDING AND CURRENT ROW) AS three FROM quiet ORDER BY minute")
+    refused = {
+        "comes back round": _raises_text(lambda: q("CREATE MATERIALIZED VIEW hourly AS SELECT hour(ts) AS h, count(*) AS n FROM clicks GROUP BY 1 EMIT FINAL")),
+        "a time bucket": _raises_text(lambda: q("CREATE MATERIALIZED VIEW nope AS SELECT visitor, count(*) AS n FROM clicks GROUP BY 1 EMIT FINAL")),
+        "DROP TABLE": _raises_text(lambda: q("DROP TABLE per_minute")),
+    }
+    shown = {k: q(f"SHOW CREATE MATERIALIZED VIEW {k}")[0]["definition"] for k in ("per_minute", "quiet", "visits")}
+    before = {k: q(f"SELECT * FROM {k} ORDER BY 1, 2") for k in ("per_minute", "per_day", "by_epoch", "quiet")}
+    node.kill()
+    node = Node(lake, A.port, tier_secs=1).start()  # (a new leader: nothing kept twice)
+    time.sleep(3)
+    after = {k: q(f"SELECT * FROM {k} ORDER BY 1, 2") for k in before}
+    q("DROP MATERIALIZED VIEW quiet")
+    q(shown["quiet"])  # made again from what SHOW CREATE gave, from the rows there (the late one is no longer late)
+    every = q("SELECT date_trunc('minute', ts) AS minute, count(*) AS n FROM clicks GROUP BY 1 ORDER BY 1")
+    again = until(lambda: q("SELECT * FROM quiet ORDER BY 1"), every, secs=20)
+    q(made["by_epoch"].replace("CREATE ", "CREATE OR REPLACE "))
+    upto = q(f"SELECT floor(date_part('epoch', ts) / 60) AS m, count(*) AS n FROM clicks WHERE ts < '{iso(base + 240)}' GROUP BY 1 ORDER BY 1")
+    replaced = until(lambda: q("SELECT * FROM by_epoch ORDER BY 1"), upto, secs=20)
+    listed = {r["name"]: r["kind"] for r in q("SELECT * FROM pondra.tables")}
+    node.kill()
+    want_sliding = []
+    for r in sliding:
+        t = datetime.datetime.fromisoformat(r["minute"])
+        want_sliding.append(sum(x["n"] for x in before["quiet"] if datetime.timedelta(0) <= t - datetime.datetime.fromisoformat(x["minute"]) <= datetime.timedelta(minutes=2)))
+    checks = {
+        "a group is kept when event time passes it, less the lateness": first == [0, 1, 2] and middle == [0, 1, 2] and days == 1,
+        "each group once, equal to the query run ad hoc over the rows it had": kept == adhoc and len(kept) == 9,
+        "a bucket that only grows: a date, minutes since the epoch": len(before["per_day"]) == 1 and [r["n"] for r in epoch] == [r["n"] for r in per_m] and len(epoch) == 4,
+        "a late row: counted in pondra.flows, the groups kept unchanged": late.get("per_minute") == 1 and late.get("by_epoch") == 1 and late.get("per_day") == 1
+            and not any(r["visitor"] == "late" for r in kept),
+        "idle keeps a quiet source's last group; without it the group waits": quiet == [0, 1, 2, 3, 4] and waits == [0, 1, 2, 3],
+        "SESSION(ts, INTERVAL …) EMIT FINAL == the options form; a row behind the watermark whose session isn't over is kept": both is True
+            and any(r["visitor"] == "c" for r in kept_sessions["visits"]),
+        "a sliding window is a window frame over the kept minutes": [r["three"] for r in sliding] == want_sliding and len(sliding) == 5,
+        "a bucket that comes back round, no bucket, DROP TABLE: refused by name": "comes back round" in refused["comes back round"]
+            and "time bucket" in refused["a time bucket"] and "MATERIALIZED VIEW" in refused["DROP TABLE"],
+        "SHOW CREATE gives the statement, EMIT FINAL and its options": all("EMIT FINAL" in v for v in shown.values()) and "lateness" in shown["per_minute"]
+            and "idle" in shown["quiet"] and "SESSION(ts, INTERVAL '20 seconds')" in shown["visits"],
+        "a leader restart keeps nothing twice": after == before,
+        "dropped and made again from SHOW CREATE, or OR REPLACE: from the rows there, each group that is over": again == every and len(every) == 5
+            and replaced == upto and len(upto) == 4,
+        "listed as materialized views, under their own names": all(listed.get(k) == "materialized view" for k in made) and not any("$" in k for k in listed),
+        "three nodes, rows appended to each, the leader killed twice: each group once, == ad hoc, on every node": finals_on_three(),
+    }
+    ok = all(checks.values())
+    print(json.dumps({"finals": checks, "ok": ok}, indent=1))
+    if not ok:
+        print(json.dumps({"first": first, "middle": middle, "days": days, "late": late, "quiet": quiet, "waits": waits, "kept": kept, "adhoc": adhoc, "epoch": epoch,
+                          "per_m": per_m, "sliding": sliding, "want_sliding": want_sliding, "refused": refused, "shown": shown, "listed": listed,
+                          "again": again, "every": every, "replaced": replaced, "upto": upto, "sessions": kept_sessions}, indent=1, default=str)[-8000:])
+        sys.exit(1)
+    return "windows as SQL (GROUP BY a time bucket EMIT FINAL): each group once when event time passes it, == the query ad hoc; late rows counted; idle; sessions; SHOW CREATE; a restart keeps nothing twice"
+
+
 def asof():
     """Point-in-time joins over a stream: an inline view gives each trade the price its symbol had
     at the trade's own time (`ASOF JOIN … MATCH_CONDITION (t.ts >= p.ts)`), whatever the price is
@@ -7287,8 +7446,10 @@ def friendly():
     over the same rows: PIVOT and UNPIVOT (DuckDB's statements and the standard's), COLUMNS(…),
     `* RENAME`, ORDER BY ALL, FETCH FIRST, list comprehensions and lambdas, a struct's field,
     max_by and arg_min, string_split, json_extract, DuckDB's ASOF JOIN … ON, a select's alias in
-    its WHERE, SUMMARIZE; samples that sample (TABLESAMPLE was ignored); refusals by name; and the
-    same answers spread over three nodes."""
+    its WHERE, SUMMARIZE; samples that sample (TABLESAMPLE was ignored); refusals by name; the
+    same answers spread over three nodes; and what `random_sql.py` found (`- -3` written again as
+    a comment, a DISTINCT over a CASE refused, two IN lists of a column taken as sets of values,
+    columns of one name on both sides of a join mixed up)."""
     import datetime, decimal, duckdb, pyarrow as pa
     lake = new_lake()
     import psycopg
@@ -7359,6 +7520,11 @@ def friendly():
         "ASOF LEFT JOIN … ON": ("SELECT t.id, q.p FROM t ASOF LEFT JOIN q ON t.k = q.k AND t.ts >= q.ts", True, False),
         "a select's alias in its WHERE": ("SELECT x * 2 AS dbl FROM t WHERE dbl > 4000", True, False),
         "… but a column of that name wins": ("SELECT id + 100 AS x FROM t WHERE x > 20", True, False),
+        "a minus before a minus, in a text written again (it read back as a comment)": ("SELECT id, - -k AS m, - - -x AS b FROM t WHERE m > 3 AND g IS DISTINCT FROM 'b'", True, False),
+        "DISTINCT over a CASE whose WHEN shows its THEN isn't NULL (random_sql.py)": ("SELECT DISTINCT CASE WHEN k < 3 AND n = 2.5 THEN n ELSE 0 END AS c FROM t", True, False),
+        "x IN (a column, …) AND x IN (…): not the lists' intersection (random_sql.py)": ("SELECT id FROM t WHERE g IN (g, 'z') AND g IN ('a', 'b')", True, False),
+        "x IN (…) AND x NOT IN (NULL): no row (random_sql.py)": ("SELECT count(*) AS c FROM t WHERE g IN ('a', 'b') AND g NOT IN (NULL)", True, False),
+        "columns of one name on both sides of a LEFT JOIN, filtered on its padded side (random_sql.py)": ("SELECT (t.ts - q.ts) AS d, t.k FROM t LEFT JOIN q ON t.id = q.k WHERE q.k IS DISTINCT FROM 3", True, False),
     }
     checks, failed = {}, {}
     for name, (q, names, ordered) in same.items():
@@ -7413,7 +7579,7 @@ def friendly():
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    out = {t.__name__: t() for t in (upsert, deal, outside, clouds, kafkas, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, found, renames, workspace, server, scale, flight, users, secrets, safety, versions, stopped, flows, begin, doors, objects, registry, sparksql, variables, scripts, hot, minmax, history, plans, friendly, reader, crash)}
+    out = {t.__name__: t() for t in (upsert, deal, outside, clouds, kafkas, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, found, renames, workspace, server, scale, flight, users, secrets, safety, versions, stopped, flows, begin, doors, objects, registry, sparksql, variables, scripts, hot, minmax, history, plans, friendly, reader, crash)}
     A.secs = min(A.secs, 20)
     out["load"] = load()
     print(json.dumps(out, indent=1))
@@ -7421,7 +7587,7 @@ def all_tests():
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "found", "renames", "workspace", "server", "scale", "flight", "users", "secrets", "safety", "versions", "stopped", "flows", "begin", "doors", "objects", "registry", "sparksql", "variables", "scripts", "tasks", "hot", "minmax", "history", "plans", "friendly", "load", "all"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "found", "renames", "workspace", "server", "scale", "flight", "users", "secrets", "safety", "versions", "stopped", "flows", "begin", "doors", "objects", "registry", "sparksql", "variables", "scripts", "tasks", "hot", "minmax", "history", "plans", "friendly", "load", "all"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -7433,7 +7599,7 @@ if __name__ == "__main__":
     ap.add_argument("--flush-ms", type=int, default=250)
     A = ap.parse_args()
     try:
-        {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "safety": safety, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "objects": objects, "registry": registry, "sparksql": sparksql, "variables": variables, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "friendly": friendly, "load": load, "all": all_tests}[A.mode]()
+        {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "safety": safety, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "objects": objects, "registry": registry, "sparksql": sparksql, "variables": variables, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "friendly": friendly, "load": load, "all": all_tests}[A.mode]()
     except BaseException as e:  # a failure ends the run, though threads may still wait on a node (crash's producers retry for ever)
         code = e.code if isinstance(e, SystemExit) else 1
         if not isinstance(e, SystemExit):
