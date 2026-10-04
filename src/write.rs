@@ -479,6 +479,11 @@ pub fn parse(sql: &str) -> Option<Stmt> {
     };
     let text = parsed.to_string();
     Some(match parsed {
+        // A lake's tables keep their files in the lake: LOCATION and Hive's STORED AS were read and
+        // dropped, and the table made in the lake as if they weren't there.
+        Statement::CreateTable(c) if c.location.is_some() || c.file_format.is_some() || c.hive_formats.as_ref().is_some_and(|h| h.location.is_some() || h.storage.is_some() || h.row_format.is_some() || h.serde_properties.is_some()) => {
+            Stmt::Invalid("CREATE TABLE … LOCATION / STORED AS: a lake's tables keep their files in the lake; files elsewhere are CREATE EXTERNAL TABLE t … STORED AS PARQUET LOCATION '…' (a view of them), and a Delta or Iceberg table elsewhere is ATTACH 'url' AS name (TYPE delta | iceberg)".into())
+        }
         Statement::CreateTable(c) => Stmt::Create(Box::new(c)),
         // What a write may say that Pondra doesn't do is refused by name, never read and dropped:
         // INSERT OVERWRITE appended, and RETURNING answered no rows.
@@ -1182,6 +1187,11 @@ async fn on_node_listed(app: &crate::server::App, stmt: Stmt, job: Option<String
             Stmt::Insert(_, query) => crate::write_outside::insert(lake, &target, query, &job).await,
             _ => bail!("{}: another engine's table takes INSERTs from Pondra (UPDATE, DELETE and MERGE: not yet)", stmt.table()),
         };
+    }
+    // (an UPDATE's, DELETE's or MERGE's target reaches here named as its files already: it read
+    // "no table" with a quoted path)
+    if let Some(spec) = crate::ext::spec(&stmt.table()) {
+        bail!("{}: files or another engine's table; Pondra INSERTs into a Delta or Iceberg table (UPDATE, DELETE and MERGE: not yet)", spec.urls.join(", "));
     }
     // UPDATE and DELETE of an append table, and MERGE: the leader's (of the table's lake), from
     // one snapshot (`change.rs`). Another leader is sent what it can't read (ADR-028).
