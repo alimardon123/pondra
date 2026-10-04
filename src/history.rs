@@ -128,11 +128,12 @@ pub fn expected(text: &str) -> String {
 /// `EXPLAIN`'s rows with each operator's estimate made readable (`expected`).
 pub fn explained(batches: Vec<RecordBatch>) -> Result<Vec<RecordBatch>> {
     batches.into_iter().map(|b| {
-        let columns = b.columns().iter().zip(b.schema().fields()).map(|(c, f)| match (f.name().as_str(), c.as_any().downcast_ref::<StringArray>()) {
+        let schema = b.schema();
+        let columns = b.columns().iter().zip(schema.fields()).map(|(c, f)| match (f.name().as_str(), c.as_any().downcast_ref::<StringArray>()) {
             ("plan", Some(text)) => Arc::new(text.iter().map(|t| t.map(expected)).collect::<StringArray>()) as ArrayRef,
             _ => c.clone(),
         });
-        Ok(RecordBatch::try_new(b.schema(), columns.collect())?)
+        Ok(RecordBatch::try_new(schema.clone(), columns.collect())?)
     }).collect()
 }
 

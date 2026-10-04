@@ -4770,7 +4770,7 @@ def plans():
     lake = new_lake()
     a = Node(lake, A.port, env={"PONDRA_LEARN_MS": "0"}).start()
     q = lambda s: sql(A.port, s)
-    rows_of = lambda tag: [r for r in q(f"SELECT * FROM pondra.history WHERE statement LIKE '%{tag}%' AND statement NOT LIKE '%pondra.history%' ORDER BY at") if tag in r["statement"]]
+    rows_of = lambda tag: [r for r in q(f"SELECT * FROM pondra.history WHERE statement LIKE '%{tag}%' AND statement NOT LIKE '%pondra.history%' ORDER BY at") if tag in r.get("statement")]
     def until_rows(tag, want=1, secs=15):
         deadline = time.time() + secs
         while len(got := rows_of(tag)) < want and time.time() < deadline:
@@ -4802,25 +4802,25 @@ def plans():
         q("SELECT count(*) AS n FROM orders WHERE total = 41 AND id IN (7, 8) -- p-same-2")
         q("SELECT count(*) AS n FROM orders WHERE total > 3 -- p-other")
         one, two, other = until_rows("p-same-1"), until_rows("p-same-2"), until_rows("p-other")
-        seen["fingerprints"] = [(r["fingerprint"], r["plan_id"]) for r in one + two + other]
-        checks["one query asked with other values: the same fingerprint and plan"] = len(one) == len(two) == 1 and one[0]["fingerprint"] == two[0]["fingerprint"] is not None \
-            and one[0]["plan_id"] == two[0]["plan_id"] is not None
-        checks["another query: another fingerprint"] = len(other) == 1 and other[0]["fingerprint"] not in (None, one[0]["fingerprint"] if one else None)
+        seen["fingerprints"] = [(r.get("fingerprint"), r.get("plan_id")) for r in one + two + other]
+        checks["one query asked with other values: the same fingerprint and plan"] = len(one) == len(two) == 1 and one[0].get("fingerprint") == two[0].get("fingerprint") is not None \
+            and one[0].get("plan_id") == two[0].get("plan_id") is not None
+        checks["another query: another fingerprint"] = len(other) == 1 and other[0].get("fingerprint") not in (None, one[0].get("fingerprint") if one else None)
         # The tables it read, and how far its joins were from what was expected
         q(join + " -- p-join")
         joined = until_rows("p-join")
-        seen["join"] = [{k: r[k] for k in ("reads", "misestimate", "plan_id", "ms")} | {"plan": (r["plan"] or "")[:2000]} for r in joined]
+        seen["join"] = [{k: r.get(k) for k in ("reads", "misestimate", "plan_id", "ms")} | {"plan": (r.get("plan") or "")[:2000]} for r in joined]
         j = joined[0] if joined else {}
-        checks["the tables it read"] = sorted(j.get("reads") or []) == ["customers", "orders"] and (one[0]["reads"] if one else None) == ["orders"]
-        checks["a query with joins: how far they were from what was expected"] = isinstance(j.get("misestimate"), (int, float)) and j["misestimate"] >= 1 \
-            and (one[0]["misestimate"] if one else 0) is None
-        checks["…ten times off: its plan kept, though fast"] = j.get("misestimate") is not None and (j["misestimate"] < 10 or ("expected_rows=" in (j.get("plan") or "") and "output_rows=" in j["plan"]))
-        checks["a join's plan is another plan"] = j.get("plan_id") not in (None, one[0]["plan_id"] if one else None)
+        checks["the tables it read"] = sorted(j.get("reads") or []) == ["customers", "orders"] and (one[0].get("reads") if one else None) == ["orders"]
+        checks["a query with joins: how far they were from what was expected"] = isinstance(j.get("misestimate"), (int, float)) and j.get("misestimate") >= 1 \
+            and (one[0].get("misestimate") if one else 0) is None
+        checks["…ten times off: its plan kept, though fast"] = j.get("misestimate") is not None and (j.get("misestimate") < 10 or ("expected_rows=" in (j.get("plan") or "") and "output_rows=" in j.get("plan")))
+        checks["a join's plan is another plan"] = j.get("plan_id") not in (None, one[0].get("plan_id") if one else None)
         # The commit it read at: its answer again, after more rows came
         n = q("SELECT count(*) AS n FROM orders -- p-version")[0]["n"]
         at = until_rows("p-version")
         q("INSERT INTO orders SELECT value, value % 20000, 1 FROM range(100000, 100500)")
-        version = at[0]["version"] if at else None
+        version = at[0].get("version") if at else None
         again = q(f"SELECT count(*) AS n FROM orders AT (VERSION => {version})")[0]["n"] if version is not None else None
         seen["version"] = {"version": version, "then": n, "again": again, "now": q("SELECT count(*) AS n FROM orders")[0]["n"]}
         checks["the commit it read at gives its answer again (AT VERSION)"] = again == n == 100000 and seen["version"]["now"] == 100500
@@ -4829,9 +4829,9 @@ def plans():
         q("INSERT INTO orders SELECT -id - 2, id, 0 FROM customers WHERE id < 3 -- p-copied")
         q("UPDATE orders SET total = 1 WHERE id = -1 -- p-update")
         w, copied, updated = until_rows("p-write"), until_rows("p-copied"), until_rows("p-update")
-        seen["writes"] = [(r["reads"], r["writes"]) for r in w + copied + updated]
-        checks["a write: the table it changed, and what it read"] = [(r["reads"] or [], r["writes"]) for r in w + copied + updated] == [([], ["orders"]), (["customers"], ["orders"]), (["orders"], ["orders"])] \
-            and all(r["fingerprint"] is not None for r in w + copied + updated)
+        seen["writes"] = [(r.get("reads"), r.get("writes")) for r in w + copied + updated]
+        checks["a write: the table it changed, and what it read"] = [(r.get("reads") or [], r.get("writes")) for r in w + copied + updated] == [([], ["orders"]), (["customers"], ["orders"]), (["orders"], ["orders"])] \
+            and all(r.get("fingerprint") is not None for r in w + copied + updated)
     finally:
         a.kill()
         clean_up()
