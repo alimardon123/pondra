@@ -342,14 +342,6 @@ pub(crate) async fn stopped(stdin: bool) {
 static MAIN: std::sync::OnceLock<Arc<store::Lake>> = std::sync::OnceLock::new();
 
 fn main() {
-    // No transparent huge pages: mimalloc asks for them, and a node's resident memory then grows to
-    // every 2 MB its heap has touched. Under steady writes that was 1.5 GB after 15 minutes for a
-    // live heap of 250 MB (soak.py), all of it counted against a container's limit, and TPC-H SF1
-    // ran no faster with them, hot or cold. (Inherited by the processes a node starts.)
-    #[cfg(target_os = "linux")]
-    unsafe {
-        libc::prctl(libc::PR_SET_THP_DISABLE, 1, 0, 0, 0);
-    }
     if std::env::args().nth(1).as_deref() == Some("service") && std::env::args().nth(2).as_deref() == Some("run") {
         service::run_from_manager(); // (what a service manager starts: becomes the node)
     }
@@ -360,8 +352,8 @@ fn main() {
     let work = std::thread::Builder::new().name("pondra".into()).stack_size(8 << 20).spawn(|| {
         // Blocking threads (file reads and writes, the SSD tier) go after a second idle, not tokio's
         // ten: tiering every 10 s kept ~70 of them alive on 4 cores, and each kept the memory its
-        // biggest piece of work had used. A node under steady writes held 400 MB of its own after
-        // ten minutes, growing 26 MB a minute; with this, 157 MB, growing 7 (soak.py).
+        // biggest piece of work had used. A node under steady writes held 1 GB of its own after ten
+        // minutes, growing 60 MB a minute; with this, 250 MB, growing 7 (soak.py).
         let keep = std::time::Duration::from_secs(1);
         tokio::runtime::Builder::new_multi_thread().enable_all().thread_stack_size(8 << 20).thread_keep_alive(keep).build().expect("a runtime").block_on(async {
             // An error is said in words, its causes after it: a backtrace (RUST_BACKTRACE) is for panics.
