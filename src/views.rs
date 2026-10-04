@@ -54,6 +54,9 @@ pub struct View {
     /// HAVING, …, finished as the table is read).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub written: Option<String>,
+    /// Kept current by key (ADR-056): the groups new and changed rows touch, worked out again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bykey: Option<crate::bykey::ByKey>,
 }
 
 /// A view that keeps each group once, when it's over (`EMIT FINAL`). Its GROUP BY has one
@@ -194,6 +197,16 @@ impl View {
     pub fn query(&self) -> &str { self.written.as_deref().unwrap_or(&self.sql) }
     /// Does this view follow `table`'s rows (its source, or either side of a stream join)?
     pub fn follows(&self, table: &str) -> bool { self.source == table || self.join.as_ref().is_some_and(|j| j.tables.iter().any(|t| t == table)) }
+    /// Are its rows derived as flushes are packed (`derive`)? Sessions are cut as they close,
+    /// stream joins and views kept by key run once rows commit.
+    pub fn inline(&self) -> bool { self.sessions.is_none() && self.join.is_none() && self.bykey.is_none() }
+}
+
+/// The producers a view's rows are written under (what goes when it is dropped or detached).
+pub fn producers(name: &str) -> Vec<String> {
+    let mut p: Vec<String> = ["emit", "join", "fill"].iter().map(|p| format!("{p}:{name}")).collect();
+    p.extend([crate::bykey::producer(name), format!("{}:deleted", crate::bykey::producer(name))]);
+    p
 }
 
 /// `CREATE MATERIALIZED VIEW … WITH (window = 'w', size_secs = 60, lateness_secs = 10)` (and
@@ -214,10 +227,22 @@ pub struct Options {
     pub idle_secs: Option<u64>,
     /// What `once::create` found: the view keeps its groups in `{v}$open` and each once in `v`.
     pub keep: Option<Once>,
+    /// `refresh = 'incremental' | 'by key'`: the way it is kept current, asked for (ADR-056).
+    pub refresh: Option<Refresh>,
+    /// `lag = '1 minute'`: a view kept by key runs at most once a lag.
+    pub lag_secs: Option<u64>,
+}
+
+/// How a view is kept current, when asked for: from each write's rows in its commit, refused if it
+/// can't be; or by key, even when it could be kept from the rows alone.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Refresh {
+    Incremental,
+    ByKey,
 }
 
 pub fn options(kv: &std::collections::BTreeMap<String, String>) -> Result<Options> {
-    const KNOWN: [&str; 16] = ["lateness", "idle", "emit", "window", "size_secs", "slide_secs", "lateness_secs", "session", "gap_secs", "join", "time", "within_secs", "expect", "history", "sequence_by", "delete_when"];
+    const KNOWN: [&str; 18] = ["lateness", "idle", "emit", "window", "size_secs", "slide_secs", "lateness_secs", "session", "gap_secs", "join", "time", "within_secs", "expect", "history", "sequence_by", "delete_when", "refresh", "lag"];
     if let Some(k) = kv.keys().find(|k| !KNOWN.contains(&k.as_str())) {
         bail!("{k}: a materialized view's options are {}", KNOWN.join(", "));
     }
@@ -262,7 +287,15 @@ pub fn options(kv: &std::collections::BTreeMap<String, String>) -> Result<Option
         deletes: kv.contains_key("delete_when"),
     })).transpose()?;
     ensure!(history.is_some() || (!kv.contains_key("sequence_by") && !kv.contains_key("delete_when")), "sequence_by and delete_when go with history = 'key columns'");
-    Ok(Options { emit, sessions, join, expect, history, delete_when: kv.get("delete_when").cloned(), once, lateness_secs, idle_secs, keep: None })
+    let refresh = match kv.get("refresh").map(|r| r.trim().to_lowercase().replace(['_', '-'], " ")) {
+        Some(r) if r == "incremental" => Some(Refresh::Incremental),
+        Some(r) if r == "by key" => Some(Refresh::ByKey),
+        Some(r) => bail!("refresh = '{r}': a view is kept current 'incremental' (from each write's rows) or 'by key' (the groups they touch, worked out again)"),
+        None => None,
+    };
+    let lag_secs = time("lag")?.filter(|&s| s > 0);
+    ensure!(lag_secs.is_none() || refresh != Some(Refresh::Incremental), "lag spaces out the runs of a view kept by key: an incremental view is current in each write's commit");
+    Ok(Options { emit, sessions, join, expect, history, delete_when: kv.get("delete_when").cloned(), once, lateness_secs, idle_secs, keep: None, refresh, lag_secs })
 }
 /// `CREATE MATERIALIZED VIEW v (CONSTRAINT c CHECK (…) [ON VIOLATION DROP ROW | FAIL], …) AS …`:
 /// the statement without its expectations, and them (`EXPECT (…)` too, Databricks' word; a column
@@ -372,7 +405,7 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, o: Options) -> Result<()
     if o.once {
         return crate::once::create(lake, name, sql, o).await; // (`EMIT FINAL`)
     }
-    let Options { mut emit, sessions, join, expect, history, delete_when, keep, .. } = o;
+    let Options { mut emit, sessions, join, expect, history, delete_when, keep, refresh, lag_secs, .. } = o;
     // (a history view's deletes: a column of its rows saying which versions end their key)
     let wrapped;
     let sql = match &delete_when {
@@ -387,7 +420,10 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, o: Options) -> Result<()
         let gaps = |s: &Option<Sessions>| s.as_ref().map(|s| (s.time.clone(), s.gap_secs, s.lateness_secs));
         let joins = |j: &Option<Join>| j.as_ref().map(|j| (j.time.clone(), j.within_secs));
         let onces = |o: &Option<Once>| o.as_ref().map(|o| (o.bucket.clone(), o.lateness_secs, o.idle_secs));
-        let same = v.query() == sql && windows(&v.emit) == windows(&emit) && gaps(&v.sessions) == gaps(&sessions) && joins(&v.join) == joins(&join) && v.expect == expect && onces(&v.once) == onces(&keep);
+        let keyed = |b: &Option<crate::bykey::ByKey>| b.as_ref().map(|b| (b.asked, b.lag_secs));
+        let asked = (refresh == Some(Refresh::ByKey) || lag_secs.is_some()).then_some((refresh == Some(Refresh::ByKey), lag_secs));
+        let same = v.query() == sql && windows(&v.emit) == windows(&emit) && gaps(&v.sessions) == gaps(&sessions) && joins(&v.join) == joins(&join) && v.expect == expect && onces(&v.once) == onces(&keep)
+            && (keyed(&v.bykey) == asked || (asked.is_none() && keyed(&v.bykey) == Some((false, None)))) && (refresh != Some(Refresh::Incremental) || v.bykey.is_none());
         ensure!(same, "view {name} already exists, with other SQL or options");
         return Ok(()); // (asked again, the same: a notebook cell run twice)
     }
@@ -404,6 +440,7 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, o: Options) -> Result<()
     ensure!(src.history.is_none(), "{source} is a history view, whose __start_at and __end_at are worked out as it is read: make {name} a stored view of it (CREATE VIEW {name} AS SELECT … FROM {source})");
     ensure!(history.is_none() || (sessions.is_none() && join.is_none() && emit.is_none()), "a history view keeps each version as it comes: not with windows, sessions or a stream join");
     ensure!(expect.is_empty() || (sessions.is_none() && join.is_none() && emit.is_none()), "expectations check a view's rows as it writes them: a view that emits windows or sessions, or joins streams, writes them later. Put them on a view before it");
+    ensure!(upstream.as_ref().is_none_or(|u| u.bykey.is_none()) || (sessions.is_none() && join.is_none()), "{source} is kept by key: its rows are replaced as their groups are worked out again, and sessions and stream joins take each row once. Make {name} from {source}'s own source");
     if let Some(s) = sessions {
         ensure!(emit.is_none() && join.is_none(), "a view emits windows or sessions, or joins streams: one of them");
         ensure!(!partial, "{source} is a GROUP BY view, whose table keeps partial rows: sessions are cut from rows, so make {name} from {source}'s own source");
@@ -412,6 +449,7 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, o: Options) -> Result<()
     if let Some(j) = join {
         ensure!(emit.is_none(), "a view emits windows or joins streams, not both");
         ensure!(!partial, "{source} is a GROUP BY view, whose table keeps partial rows: streams are joined row by row, so make {name} from {source}'s own source");
+        ensure!(refresh.is_none() && lag_secs.is_none(), "a stream join pairs rows as they arrive: not by key or with a lag");
         return create_join(lake, name, sql, source, j).await;
     }
     let planned = crate::asof::rewrite(sql)?;
@@ -420,25 +458,52 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, o: Options) -> Result<()
     let typed = |p: &LogicalPlan| -> Vec<(String, String)> { p.schema().fields().iter().map(|f| (f.name().clone(), crate::query::type_name(f.data_type()))).collect() };
     let shown = typed(&plan); // (the view's columns, as it is read)
     let written = sql;
+    // Kept by key (ADR-056) when asked, or when the rows alone can't keep it (`median`, …).
+    let plain = emit.is_none() && keep.is_none() && history.is_none() && expect.is_empty();
+    let by_key = |why: Option<String>| crate::bykey::create(lake, name, written, &source, &src, upstream.as_ref(), &plan, why, lag_secs);
+    if refresh == Some(Refresh::ByKey) || lag_secs.is_some() {
+        ensure!(plain, "a view kept by key writes its groups' rows as it works them out again: not with windows, EMIT FINAL, history or expectations");
+        return by_key(None).await;
+    }
     // A GROUP BY whose answers need a last step (avg, HAVING, …): its table keeps the partial
     // query's rows, and reads finish them (`finish.rs`).
-    let (sql, planned, plan, finish) = match finished(lake, &ctx, sql, &plan).await? {
-        Some((partial_sql, partial_plan, f, ordered)) => {
-            ensure!(!partial, "{source} is a GROUP BY view, whose table keeps partial rows: a view of it adds up its sums and counts (a rollup), or make {name} from {source}'s own source");
-            ensure!(emit.is_none(), "a window view of avg, HAVING or an expression over aggregates: write it as GROUP BY <a time bucket> … EMIT FINAL");
-            ensure!(keep.is_none() || !ordered, "EMIT FINAL keeps each group as it ends: ORDER BY and LIMIT when you read it");
-            (partial_sql.clone(), crate::asof::rewrite(&partial_sql)?.to_string(), partial_plan, Some(f))
-        }
-        None => (sql.to_string(), planned.to_string(), plan, None),
+    let kept = async {
+        let (sql, planned, plan, finish) = match finished(lake, &ctx, sql, &plan).await? {
+            Some((partial_sql, partial_plan, f, ordered)) => {
+                ensure!(!partial, "{source} is a GROUP BY view, whose table keeps partial rows: a view of it adds up its sums and counts (a rollup), or make {name} from {source}'s own source");
+                ensure!(emit.is_none(), "a window view of avg, HAVING or an expression over aggregates: write it as GROUP BY <a time bucket> … EMIT FINAL");
+                ensure!(keep.is_none() || !ordered, "EMIT FINAL keeps each group as it ends: ORDER BY and LIMIT when you read it");
+                (partial_sql.clone(), crate::asof::rewrite(&partial_sql)?.to_string(), partial_plan, Some(f))
+            }
+            None => (sql.to_string(), planned.to_string(), plan.clone(), None),
+        };
+        let (key, merge) = merges(&plan, partial.then_some((source.as_str(), &src)))?;
+        Ok::<_, anyhow::Error>((sql, planned, plan, finish, key, merge))
+    };
+    let (sql, planned, plan, finish, key, merge) = match kept.await {
+        Ok(k) => k,
+        // (what the rows alone can't keep: by key, if it can be; else why not)
+        Err(e) if plain && refresh.is_none() => match (crate::bykey::needs(&plan), crate::bykey::keys(&plan)) {
+            (Some(need), Ok(_)) => return by_key(Some(format!("{need}: the groups a change touches are worked out again"))).await,
+            (Some(need), Err(why)) => bail!("{need}, so the view would be kept by key; {why:#}"),
+            (None, _) => return Err(e),
+        },
+        Err(e) => return Err(e),
     };
     let sql = sql.as_str();
-    let (key, merge) = merges(&plan, partial.then_some((source.as_str(), &src)))?;
     let columns = typed(&plan);
     if let Some((c, _)) = columns.iter().find(|(c, _)| crate::sys::NAMES.contains(&c.as_str())) {
         bail!("{c} is a system column of the view's own table: name it something else ({c} AS source{c})");
     }
-    // (row by row over a table, or over a view that is: then a row keeps its first source row's id)
-    let ids = merge.is_empty() && alone(&plan, false) && upstream.as_ref().is_none_or(|u| u.ids);
+    // (row by row over a table, or over a view that is, or one kept by key, whose rows change:
+    // then a row keeps its first source row's id)
+    let ids = merge.is_empty() && alone(&plan, false) && upstream.as_ref().is_none_or(|u| u.ids || u.bykey.is_some());
+    if upstream.as_ref().is_some_and(|u| u.bykey.is_some()) {
+        // (its rows are replaced as their groups are worked out again: what follows must take them back)
+        let subtracts = !merge.is_empty() && alone(&plan, true) && merge.values().all(|f| ["sum", "count", crate::finish::MOMENTS].contains(&f.as_str())) && merge.values().any(|f| f == "count");
+        ensure!(emit.is_none() && keep.is_none() && history.is_none() && (ids || subtracts),
+            "{source} is kept by key: its rows are replaced as their groups are worked out again, so a view of it takes rows back: row by row, or a GROUP BY of sums and counts (with count(*)), or one kept by key itself (WITH (refresh = 'by key'))");
+    }
     ensure!(expect.is_empty() || merge.is_empty(), "{name} is a GROUP BY view: its table keeps partial rows, so expectations can't check its totals. Put them on the rows before it (a view of {source} without GROUP BY, which {name} then follows)");
     if let Some(h) = &history {
         ensure!(merge.is_empty(), "a history view keeps every version of each key as it comes: no GROUP BY");
@@ -480,7 +545,7 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, o: Options) -> Result<()
     }
     let fill = Some(Fill { id: uuid::Uuid::new_v4().to_string(), upto: None }); // (from the rows already there)
     let written = finish.is_some().then(|| written.to_string());
-    puts.push((view_key(name), json(&View { source, sql: sql.into(), emit, sessions: None, ids, join: None, fill, expect, once: keep, written })));
+    puts.push((view_key(name), json(&View { source, sql: sql.into(), emit, sessions: None, ids, join: None, fill, expect, once: keep, written, bykey: None })));
     lake.cat.commit(puts, &[]).await
 }
 
@@ -622,7 +687,7 @@ async fn create_sessions(lake: &Lake, name: &str, sql: &str, source: String, src
     ensure!(s.keys.iter().all(|k| out.field_with_unqualified_name(k).is_ok()), "a session view SELECTs its GROUP BY columns, as they are named");
     let columns = out.fields().iter().map(|f| (f.name().clone(), crate::query::type_name(f.data_type()))).collect();
     let meta = TableMeta { columns, publish: default_publish(), ids: true, tiered: lake.visible(), ..Default::default() };
-    let view = View { source, sql: sql.into(), emit: None, sessions: Some(s), ids: false, join: None, fill: None, expect: vec![], once: None, written: None };
+    let view = View { source, sql: sql.into(), emit: None, sessions: Some(s), ids: false, join: None, fill: None, expect: vec![], once: None, written: None, bykey: None };
     lake.cat.commit(vec![(view_key(name), json(&view)), (table_key(name), json(&meta))], &[]).await
 }
 
@@ -872,6 +937,7 @@ async fn cannot_follow(lake: &Lake, table: &str, append: bool) -> Result<Vec<Str
         let why = match () {
             _ if v.emit.is_some() || v.sessions.is_some() || v.once.is_some() => Some("emits windows or sessions once"),
             _ if v.join.is_some() => Some("pairs two streams' rows as they arrive"),
+            _ if v.bykey.is_some() => None, // (it works the groups a change touches out again)
             _ if !append => None,
             _ if meta.merge.is_empty() && !v.ids => Some("isn't row by row over the table alone (a join, DISTINCT, …), or was made before Pondra 0.19"),
             _ if meta.merge.is_empty() => None,
@@ -916,7 +982,7 @@ async fn plan(lake: &Lake, v: &View) -> Result<LogicalPlan> {
 /// Does a view read its source alone, row by row: projections and filters over one table, no
 /// subquery (`grouped`: under a GROUP BY too)? Only then can it take a changed row back, since
 /// anything else it read would be as it is when the change comes, not as it was.
-fn alone(p: &LogicalPlan, grouped: bool) -> bool {
+pub(crate) fn alone(p: &LogicalPlan, grouped: bool) -> bool {
     use datafusion::common::tree_node::TreeNode;
     use datafusion::logical_expr::LogicalPlan::*;
     let node = matches!(p, Projection(_) | Filter(_) | SubqueryAlias(_) | TableScan(_)) || (grouped && matches!(p, Aggregate(_)));
@@ -934,8 +1000,8 @@ fn alone(p: &LogicalPlan, grouped: bool) -> bool {
 pub async fn derive(lake: &Lake, new: &BTreeMap<String, Vec<RecordBatch>>) -> Result<Vec<(String, RecordBatch)>> {
     let (mut out, mut made) = (vec![], BTreeMap::<String, Vec<RecordBatch>>::new());
     for (target, v) in in_order(lake.cat.scan::<View>("v/", "v0").await?) {
-        if v.sessions.is_some() || v.join.is_some() {
-            continue; // (sessions are cut as they close; stream joins run once rows commit)
+        if !v.inline() {
+            continue; // (sessions are cut as they close; stream joins and views kept by key run once rows commit)
         }
         let gone_from = crate::sys::deleted(&v.source);
         let rows: Vec<&Vec<RecordBatch>> = [new.get(&v.source), made.get(&v.source)].into_iter().flatten().collect();
@@ -1012,7 +1078,7 @@ pub async fn inline(lake: &Lake) -> Result<std::sync::Arc<Inline>> {
     }
     let mut i = Inline::default();
     for (key, v) in lake.cat.scan::<View>("v/", "v0").await? {
-        if v.sessions.is_some() || v.join.is_some() {
+        if !v.inline() {
             continue;
         }
         let t = key[2..].to_string();
@@ -1252,6 +1318,10 @@ async fn create_join(lake: &Lake, name: &str, sql: &str, source: String, mut j: 
         }
     }
     ensure!(tables.len() == 2 && tables[0] == source, "join = 'streams': the query joins two append tables of this lake (it names {tables:?})");
+    for t in &tables {
+        let kept = lake.cat.get::<View>(&view_key(t)).await?.is_some_and(|v| v.bykey.is_some());
+        ensure!(!kept, "{t} is kept by key: its rows are replaced as their groups are worked out again, and a stream join pairs each row once. Join its own source");
+    }
     for (i, t) in tables.iter().enumerate() {
         if let Some(c) = j.time.get(i).or(j.time.first()) {
             let meta: TableMeta = lake.cat.get(&table_key(t)).await?.context("no table")?;
@@ -1262,7 +1332,7 @@ async fn create_join(lake: &Lake, name: &str, sql: &str, source: String, mut j: 
     j.tables = tables;
     let now = lake.visible();
     let meta = TableMeta { columns, publish: default_publish(), ids: true, tiered: now, ..Default::default() };
-    let view = View { source, sql: sql.into(), emit: None, sessions: None, ids: false, join: Some(j), fill: None, expect: vec![], once: None, written: None };
+    let view = View { source, sql: sql.into(), emit: None, sessions: None, ids: false, join: Some(j), fill: None, expect: vec![], once: None, written: None, bykey: None };
     lake.cat.commit(vec![(table_key(name), json(&meta)), (view_key(name), json(&view)), (producer_key(&format!("join:{name}")), json(&now))], &[]).await
 }
 
@@ -1384,7 +1454,7 @@ pub async fn system(lake: &Lake, counts: Vec<RecordBatch>) -> Result<Vec<(&'stat
             _ if v.emit.is_some() || v.once.is_some() => "window",
             _ if v.sessions.is_some() => "sessions",
             _ if v.join.is_some() => "stream join",
-            _ if merged => "aggregate",
+            _ if merged || v.bykey.is_some() => "aggregate",
             _ if histories.contains(name) => "history",
             _ => "rows",
         });
@@ -1407,6 +1477,8 @@ pub async fn system(lake: &Lake, counts: Vec<RecordBatch>) -> Result<Vec<(&'stat
         ("name", s(&|_, (n, v)| Some(v.shown(n).to_string()))),
         ("follows", s(&|_, (_, v)| Some(v.join.as_ref().map_or(v.source.clone(), |j| j.tables.join(", "))))),
         ("kind", s(&|i, _| Some(kinds[i].to_string()))),
+        ("refresh", s(&|_, (_, v)| Some(if v.bykey.is_some() { "by key" } else { "incremental" }.to_string()))),
+        ("reason", s(&|_, (_, v)| v.bykey.as_ref().map(|b| b.reason.clone()))),
         ("reads", s(&|_, (_, v)| reads(v))),
         ("expectations", std::sync::Arc::new(views.iter().map(|(_, v)| v.expect.len() as i64).collect::<Int64Array>())),
         ("late_rows", std::sync::Arc::new(views.iter().map(|(_, v)| v.once.as_ref().map(|_| late(v))).collect::<Int64Array>())),

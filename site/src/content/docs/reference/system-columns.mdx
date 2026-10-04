@@ -288,8 +288,11 @@ DROP TABLE IF EXISTS scratch;
 | `name` | the view |
 | `follows` | the table or view whose rows it follows (a stream join's two tables) |
 | `kind` | `rows` (no `GROUP BY`), `aggregate`, `window`, `sessions`, `stream join` or `history` |
+| `refresh` | `incremental` (from each write's rows, in its commit) or `by key` (the groups a commit touched, worked out again right after it) |
+| `reason` | why a view is kept by key, or null |
 | `reads` | other tables its query reads, or null |
 | `expectations` | how many it has |
+| `late_rows` | an `EMIT FINAL` view's rows that came for a group already kept, or null |
 | `definition` | its query |
 
 `pondra.expectations` has a row per expectation: `view`, `expectation`, `condition`,

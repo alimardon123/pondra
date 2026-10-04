@@ -633,11 +633,20 @@ pub async fn settle(lake: &Lake, d: &Ddl, me: &str) -> Result<()> {
         let name = local(lake, name).unwrap_or_default();
         let open = crate::once::open(&name);
         let name = if lake.cat.get::<crate::views::View>(&crate::views::view_key(&open)).await?.is_some() { open } else { name }; // (EMIT FINAL's)
-        let filled = crate::store::producer_key(&format!("fill:{name}"));
+        let (filled, worked) = (crate::store::producer_key(&format!("fill:{name}")), crate::store::producer_key(&crate::bykey::producer(&name)));
         for _ in 0..12_000 {
             let view = lake.cat.get::<crate::views::View>(&crate::views::view_key(&name)).await?;
-            if view.is_none_or(|v| v.fill.is_none()) || lake.cat.get::<u64>(&filled).await?.is_some() {
+            let Some(view) = view else { break };
+            let ready = match (&view.fill, &view.bykey) {
+                (Some(_), _) => &filled,
+                (None, Some(_)) => &worked, // (kept by key: its first run works every group out)
+                (None, None) => break,
+            };
+            if lake.cat.get::<u64>(ready).await?.is_some() {
                 break;
+            }
+            if let Some(e) = view.bykey.as_ref().and_then(|_| crate::bykey::failing(lake, &name)) {
+                bail!("{name} is made, but its first run fails: {e}");
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
@@ -1075,9 +1084,9 @@ async fn drop_view(lake: &Lake, name: &str, if_exists: bool) -> Result<Value> {
     followers.extend(readers(lake, &kept).await?);
     followers.retain(|r| !r.starts_with("view ") && r != &format!("materialized view {name}") && r != &format!("materialized view {shown}"));
     ensure!(followers.is_empty(), "{shown} is followed by {}: drop them first", followers.join(", "));
-    let producers = ["emit", "join", "fill"].map(|p| format!("{p}:{name}"));
+    let producers = crate::views::producers(name);
     let mut gone: Vec<String> = [crate::views::view_key(name), format!("w/{name}")].into_iter().chain(producers.iter().map(|p| crate::store::producer_key(p))).collect();
-    for table in [name.to_string(), kept] {
+    for table in [name.to_string(), kept, crate::sys::deleted(name)] {
         if let Some(meta) = lake.cat.get::<TableMeta>(&table_key(&table)).await? {
             for format in &meta.publish {
                 crate::delta::unpublish(lake, &table, format).await?;
@@ -1111,7 +1120,7 @@ async fn detach_view(lake: &Lake, name: &str) -> Result<Value> {
         "{name} works its answers out as it is read (avg, HAVING, …), from partial rows only the view keeps: make a table of what it has (CREATE TABLE t AS SELECT * FROM {name}), then drop it");
     ensure!(lake.cat.get::<TableMeta>(&table_key(&format!("{name}_final"))).await?.is_none(),
         "{name} keeps windows, and those still open would be left half counted: make a table of what it has (CREATE TABLE t AS SELECT * FROM {name}_final), then drop it");
-    let producers = ["emit", "join", "fill"].map(|p| format!("{p}:{name}"));
+    let producers = crate::views::producers(name);
     let gone: Vec<String> = [crate::views::view_key(name), format!("w/{name}")].into_iter().chain(producers.iter().map(|p| crate::store::producer_key(p))).collect();
     lake.cat.commit(vec![], &gone).await?;
     crate::log::forget_producers(producers);

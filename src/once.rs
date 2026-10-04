@@ -47,6 +47,7 @@ pub fn mark(d: &mut Ddl) -> bool {
 pub async fn create(lake: &Lake, name: &str, sql: &str, o: Options) -> Result<()> {
     ensure!(o.emit.is_none() && o.join.is_none() && o.history.is_none() && o.sessions.is_none(), "EMIT FINAL finds its window in the GROUP BY: no window, session, join or history options with it");
     ensure!(o.expect.is_empty(), "EMIT FINAL keeps a group once it's over: put expectations on a view of the rows before it");
+    ensure!(o.refresh != Some(crate::views::Refresh::ByKey) && o.lag_secs.is_none(), "EMIT FINAL keeps each group once, when it's over, from the rows as they come: not by key or with a lag");
     let (select, mut stmt) = select(sql)?;
     if let Some((time, gap_secs, rest)) = session(&select, &mut stmt)? {
         let s = Sessions { time, gap_secs, lateness_secs: o.lateness_secs, keys: vec![], idle_secs: o.idle_secs };

@@ -355,6 +355,11 @@ fn materialized_sql(name: &str, v: &crate::views::View, meta: Option<&TableMeta>
     if let Some(h) = meta.and_then(|m| m.history.as_ref()) {
         with.push(format!("history = {}, sequence_by = {}", literal(&h.key.join(", ")), literal(&h.sequence_by)));
     }
+    if let Some(b) = v.bykey.as_ref().filter(|b| b.asked) {
+        // (chosen, it is chosen again from the query; asked for, it is asked for again)
+        with.extend(b.lag_secs.is_none().then(|| "refresh = 'by key'".to_string()));
+        with.extend(b.lag_secs.map(|s| format!("lag = '{s} seconds'")));
+    }
     let expect = if expect.is_empty() { String::new() } else { format!(" (\n  {}\n)", expect.join(",\n  ")) };
     let with = if with.is_empty() { String::new() } else { format!(" WITH ({})", with.join(", ")) };
     format!("CREATE MATERIALIZED VIEW {name}{expect}{with} AS\n{}", v.query())

@@ -676,6 +676,13 @@ pub async fn expire(lake: &Lake, grace_ms: u64) -> Result<()> {
             }
         }
     }
+    // (a view kept by key reads what other engines' commits took out of its source from the log)
+    for (key, v) in lake.cat.scan::<crate::views::View>("v/", "v0").await?.into_iter().filter(|(_, v)| v.bykey.is_some()) {
+        let done = lake.cat.get(&producer_key(&crate::bykey::producer(&key[2..]))).await?.unwrap_or(0);
+        if done < floor && lake.cat.scan::<Segment>(&seg_key(done + 1), &seg_key(floor + 1)).await?.iter().any(|(_, s)| crate::bykey::moved(s, &v.source)) {
+            floor = done;
+        }
+    }
     // Only segments that were ALREADY below the floor `grace_ms` ago: a query that read a table's
     // metadata just before it was tiered may still be reading them.
     static FLOORS: std::sync::Mutex<std::collections::VecDeque<(u64, u64)>> = std::sync::Mutex::new(std::collections::VecDeque::new());
