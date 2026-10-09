@@ -341,6 +341,16 @@ def cutoff(a):
         info["the leader cut off: roles"] = c.timeline.since(t0)
         check("the leader alone cut off from the bucket: another leads and takes writes within 40 s", moved and took < 40,
               {nd.port: (st or {}).get("role") for nd, st in ((nd, stats(nd)) for nd in nodes)})
+        # (its followers beat to the new leader now: a lease on, it looked alone to itself, and held
+        # every write sent to it until the client gave up: no ack anywhere for 17 s on a slow takeover)
+        time.sleep(6)
+        t1, rows = time.time(), "".join(f'{{"producer":"probe","seq":1,"i":{i}}}\n' for i in range(load.size)).encode()
+        try:
+            answer = call(lead.port, "POST", "/append/events?producer=probe&seq=1", rows, timeout=20) and "taken"
+        except Exception as e:
+            answer = f"{type(e).__name__}: {str(e)[:60]}"
+        check("…and the cut-off leader turns writes away once its followers follow another, never holds them",
+              answer.startswith("RuntimeError: 503") and time.time() - t1 < 5, (answer, round(time.time() - t1, 1)))
         time.sleep(a.secs / 2)
         c.proxies[alone].set()
         t1 = time.time()
