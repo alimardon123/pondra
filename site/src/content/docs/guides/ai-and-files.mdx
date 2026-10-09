@@ -38,7 +38,8 @@ UPDATE notes SET v = embed(body);
 ```
 
 Now "most like this" is an `ORDER BY`. `cosine_similarity` is 1 for the same direction and 0 for
-unrelated; `l2_distance` and `dot_product` are there too.
+unrelated; `cosine_distance`, `l2_distance` and `dot_product` are there too, under DuckDB's names
+as well (`array_cosine_similarity`, `array_distance`, …).
 
 <Tabs syncKey="lang">
   <TabItem label="SQL">
@@ -183,11 +184,15 @@ SELECT id, ai_complete('Summarize in five words: ' || body) AS summary FROM tick
 UPDATE tickets SET v = ai_embed(body) WHERE v IS NULL;
 
 SELECT id, body FROM tickets
-ORDER BY cosine_similarity(v, ai_embed('printer problems')) DESC LIMIT 5;
+ORDER BY cosine_distance(v, ai_embed('printer problems')) LIMIT 5;
 ```
 
-A second argument names the model: `ai_complete(prompt, 'llama3.2')`. Eight rows are in flight at a time,
-and a row whose call fails is `NULL`, so one bad row doesn't lose the query. The
+A second argument names the model: `ai_complete(prompt, 'llama3.2')`. Sorting by a distance,
+smallest first, leaves rows with no vector yet at the end; sorting by `cosine_similarity …
+DESC` puts them first, as `DESC` puts every `NULL` first. Each distinct text in a batch is asked once
+and embeddings go many to a request; a node keeps at most `PONDRA_AI_CALLS` requests in flight and
+tries one again after a `429`, a `5xx` or a lost connection. A row whose call still fails is
+`NULL`, so one bad row doesn't lose the query. The
 [reference](/pondra/reference/functions/#models) lists the settings (`PONDRA_AI_KEY` and the default
 models).
 

@@ -441,7 +441,7 @@ pub struct Lake {
     pub hwm: watch::Sender<u64>, // the last committed segment this node knows of
     pub backlog: std::sync::atomic::AtomicU64, // leader: rows in the log not yet tiered (all tables)
     pub rt: Arc<RuntimeEnv>,         // shared by all queries: object store registry + Parquet metadata cache
-    tail: Mutex<(lru::LruCache<(u64, String), Rows>, usize)>, // decoded (segment, table) rows; total bytes
+    tail: Mutex<Tail>, // decoded log rows
     pub disk: Option<Arc<crate::cache::Disk>>, // lakes on object storage: the local SSD tier
     pub groups: crate::serve::Groups,          // decoded row groups for key lookups
     pub hot: Arc<crate::hot::Hot>,             // decoded columns of files queries read lately
@@ -513,6 +513,40 @@ pub fn resident() -> Option<usize> {
 }
 
 pub type Rows = Arc<Vec<datafusion::arrow::record_batch::RecordBatch>>;
+
+/// Decoded log rows, each table's by segment, `TAIL_BYTES` at most. A table's log is read only
+/// after its `tiered` mark (a read that began before reads its own from the store), so its rows up
+/// to the mark go as soon as a read finds it moved, and past the limit the oldest segment goes.
+/// Kept by recent use instead, every node held 256 MB of rows long since in files.
+#[derive(Default)]
+struct Tail {
+    rows: std::collections::HashMap<String, BTreeMap<u64, Rows>>,
+    bytes: usize,
+}
+
+impl Tail {
+    fn size(rows: &Rows) -> usize { rows.iter().map(|b| b.get_array_memory_size()).sum() }
+
+    fn forget(&mut self, table: &str, upto: u64) {
+        let Some(t) = self.rows.get_mut(table) else { return };
+        let kept = t.split_off(&upto.saturating_add(1));
+        self.bytes -= std::mem::replace(t, kept).values().map(Self::size).sum::<usize>();
+        if t.is_empty() {
+            self.rows.remove(table);
+        }
+    }
+
+    fn keep(&mut self, table: &str, n: u64, rows: Rows) {
+        self.bytes += Self::size(&rows);
+        if let Some(old) = self.rows.entry(table.to_string()).or_default().insert(n, rows) {
+            self.bytes -= Self::size(&old);
+        }
+        while self.bytes > TAIL_BYTES {
+            let Some((first, oldest)) = self.rows.iter().filter_map(|(t, r)| Some((*r.keys().next()?, t.clone()))).min() else { break };
+            self.forget(&oldest, first);
+        }
+    }
+}
 
 /// Open a lake's object store. For a bucket (`s3://`, `gs://`, `az://`, `abfss://`), also returns
 /// the bucket-level client that query scans use (DataFusion addresses objects by their full path
@@ -626,7 +660,7 @@ impl Lake {
         };
         crate::format::check(&cat, &url, writer).await?; // (a lake a newer Pondra wrote: refused before its tables are read, ADR-039)
         let hwm = watch::Sender::new(cat.get::<u64>("n").await?.unwrap_or(1) - 1);
-        let lake = Arc::new_cyclic(|me| Lake { url, store, cat, hwm, backlog: Default::default(), rt, tail: Mutex::new((lru::LruCache::unbounded(), 0)), disk, groups: crate::serve::Groups::new(cache_mb() << 19), hot: Arc::new(crate::hot::Hot::new()), attached: Default::default(), ids: Default::default(), cached: cached_store, caught: watch::channel(true).0, bases: Default::default(), sessions: Default::default(), me: me.clone() });
+        let lake = Arc::new_cyclic(|me| Lake { url, store, cat, hwm, backlog: Default::default(), rt, tail: Default::default(), disk, groups: crate::serve::Groups::new(cache_mb() << 19), hot: Arc::new(crate::hot::Hot::new()), attached: Default::default(), ids: Default::default(), cached: cached_store, caught: watch::channel(true).0, bases: Default::default(), sessions: Default::default(), me: me.clone() });
         lake.hot.watch(); // the decoded columns give memory back when the node needs it
         crate::branch::load(&lake).await?; // (a branch's files listed in its bases: ADR-047)
         if let Some(writes) = lake.cat.unstarted.lock().unwrap().take() {
@@ -1034,8 +1068,7 @@ impl Lake {
     }
 
     pub async fn segment_rows(&self, n: u64, seg: &Segment, table: &str) -> Result<Rows> {
-        let key = (n, table.to_string());
-        if let Some(rows) = self.tail.lock().unwrap().0.get(&key) {
+        if let Some(rows) = self.tail.lock().unwrap().rows.get(table).and_then(|t| t.get(&n)) {
             return Ok(rows.clone());
         }
         let Some(parts) = seg.parts.get(table) else { return Ok(Rows::default()) };
@@ -1050,13 +1083,13 @@ impl Lake {
             }
         }
         let rows: Rows = Arc::new(rows);
-        let size = rows.iter().map(|b| b.get_array_memory_size()).sum::<usize>();
+        #[derive(Deserialize)]
+        struct Tiered { tiered: u64 }
+        let tiered = self.cat.get::<Tiered>(&table_key(table)).await?.map_or(0, |t| t.tiered);
         let mut c = self.tail.lock().unwrap();
-        c.1 += size;
-        c.0.put(key, rows.clone());
-        while c.1 > TAIL_BYTES {
-            let Some((_, old)) = c.0.pop_lru() else { break };
-            c.1 -= old.iter().map(|b| b.get_array_memory_size()).sum::<usize>();
+        c.forget(table, tiered);
+        if n > tiered {
+            c.keep(table, n, rows.clone());
         }
         Ok(rows)
     }
@@ -1293,6 +1326,17 @@ static SERVING: LazyLock<watch::Sender<bool>> = LazyLock::new(|| watch::Sender::
 /// The node serves now (`main.rs`).
 pub fn serving() { SERVING.send_replace(true); }
 
+/// The catalog's blocks kept in memory: 32 MB of data and 32 MB of indexes and filters. SlateDB's
+/// own default is 512 and 128 MB, and the leader put every block it flushed in it, so a node under
+/// steady writes grew by the catalog's size until it held 640 MB for a cache it hardly reads:
+/// everything committed is in the overlay (`mirror`), and an inline segment's rows are read once
+/// and kept decoded (`Lake::tail`).
+fn blocks() -> Arc<dyn slatedb::db_cache::DbCache> {
+    use slatedb::db_cache::{moka::{MokaCache, MokaCacheOptions}, SplitCache};
+    let moka = |mb: u64| Some(Arc::new(MokaCache::new_with_opts(MokaCacheOptions { max_capacity: mb << 20, time_to_live: None, time_to_idle: None })) as Arc<dyn slatedb::db_cache::DbCache>);
+    Arc::new(SplitCache::new().with_block_cache(moka(32)).with_meta_cache(moka(32)).build())
+}
+
 /// The catalog's compactor and garbage collector, as SlateDB runs them beside a writer, started
 /// once the node serves (or after 10 s: a `pondra sql` writer never does), so a cold start waits
 /// for neither (C5). A failure in either stops the node, as one in the writer would.
@@ -1353,7 +1397,10 @@ impl Catalog {
         // were most of a cold start's, C5; `upkeep`)
         let settings = Settings { garbage_collector_options: None, flush_interval: Some(Duration::from_millis(1)), manifest_poll_interval: Duration::from_secs(10), l0_sst_size_bytes: 16 << 20, l0_max_ssts: 64, l0_max_ssts_per_key: 32, max_unflushed_bytes: 64 << 20, compactor_options: None, object_store_cache_options, ..Default::default() };
         let t0 = std::time::Instant::now();
-        let mut cat = Self::new(Db_::Writer(Db::builder("catalog", store.clone()).with_settings(settings).build().await?));
+        // (a flush's blocks stay out of the cache: everything committed is in the overlay already)
+        let flushed = slatedb::BlockCachePolicy::default().with_flush_targets(&[slatedb::CacheTarget::Index, slatedb::CacheTarget::Filters]);
+        let db = Db::builder("catalog", store.clone()).with_settings(settings).with_db_cache(blocks()).with_block_cache_policy(flushed);
+        let mut cat = Self::new(Db_::Writer(db.build().await?));
         trace("the catalog's writer open", t0);
         upkeep(store, compactor_options.unwrap_or_default(), garbage_collector_options.unwrap_or_default(), local);
         cat.replicas = std::env::var("PONDRA_REPLICAS").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
@@ -1381,7 +1428,8 @@ impl Catalog {
     async fn reader(store: Store, streamed: bool, object_store_cache_options: ObjectStoreCacheOptions) -> Result<Self> {
         let opts = DbReaderOptions { manifest_poll_interval: Duration::from_millis(250), skip_wal_replay: streamed, object_store_cache_options, ..Default::default() };
         // FollowLatest writes nothing, so readers work with read-only bucket credentials.
-        let mut cat = Self::new(Db_::Reader(DbReader::open("catalog", store, DbReaderMode::FollowLatest, opts).await?));
+        let reader = DbReader::builder("catalog", store).with_reader_mode(DbReaderMode::FollowLatest).with_options(opts).with_db_cache(blocks());
+        let mut cat = Self::new(Db_::Reader(reader.build().await?));
         cat.follows = streamed;
         cat.refresh().await?; // (one try at the in-memory catalog before serving; later refreshes retry)
         Ok(cat)

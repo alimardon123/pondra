@@ -830,10 +830,20 @@ def folders_checks(browser, port, show):
         p.fill("#askIn", name)
         p.press("#askIn", "Enter")
 
-    def more_of(row):
-        """Open a row's ⋯ menu (on hover), and what it lists."""
-        row.hover()
+    def open_more(row):
+        """Click a row's ⋯, shown on hover. The tree may draw the row again between the hover and
+        the click (a listing arriving), so the new row is hovered and clicked again."""
+        for _ in range(5):
+            row.hover()
+            try:
+                return row.locator("button.more").click(timeout=3000)
+            except Exception:  # noqa: BLE001 (drawn again under the pointer)
+                pass
         row.locator("button.more").click()
+
+    def more_of(row):
+        """Open a row's ⋯ menu, and what it lists."""
+        open_more(row)
         return items()
 
     make("projects", lambda: p.click("#newfile"))
@@ -956,9 +966,7 @@ def folders_checks(browser, port, show):
     csv, nb = os.path.join(tmp, "up.csv"), os.path.join(tmp, "up.ipynb")
     open(csv, "w").write("a,b\n1,2\n")
     nbformat.write(nbformat.v4.new_notebook(cells=[nbformat.v4.new_code_cell("%%sql\nSELECT 1 AS one")]), nb)
-    row = folder("projects")
-    row.hover()
-    row.locator("button.more").click()
+    open_more(folder("projects"))
     with p.expect_file_chooser() as chooser:
         p.locator("#menu button", has_text="Upload files here").click()
     chooser.value.set_files([csv, nb])
@@ -1317,6 +1325,7 @@ def work_checks(browser, port, show):
     c = pg.run(1, "SELECT region, sum(amount) AS total FROM wk GROUP BY region ORDER BY region")
     c.locator(".abar .ptab", has_text="Plan").click()
     plan = until(lambda: c.locator(".pgraph .pn").count() > 1, True, 10)
+    expected = until(lambda: "rows expected" in c.locator(".pgraph").inner_text() and "expected_rows" not in c.locator(".pgraph").inner_text(), True, 5)
     c.locator(".abar .ptab", has_text="Chart").click()
     chart = until(lambda: c.locator(".chart svg").count() > 0 and c.locator(".abar .ptab.on").all_inner_texts() == ["Chart"], True, 10)
     p.fill("#nbname", "wkbook")
@@ -1329,8 +1338,8 @@ def work_checks(browser, port, show):
     oc = other.cell(1)
     again = until(lambda: oc.locator(".chart svg").count() > 0 and oc.locator(".abar .ptab.on").all_inner_texts() == ["Chart"], True, 15)
     other.ctx.close()
-    checks["a SQL cell's answer has Chart and Plan (its graph), as a SQL file's pane; the chart open, and its settings, are kept with the notebook"] = \
-        plan is True and chart is True and meta.get("pondra", {}).get("view") == "chart" and meta["pondra"].get("chart", {}).get("x") == "region" and again is True
+    checks["a SQL cell's answer has Chart and Plan (its graph, each step's expected rows apart from its details), as a SQL file's pane; the chart open, and its settings, are kept with the notebook"] = \
+        plan is True and expected is True and chart is True and meta.get("pondra", {}).get("view") == "chart" and meta["pondra"].get("chart", {}).get("x") == "region" and again is True
 
     # The owner's third list: a cell's Data profile; SQL <-> Python; the editor's right-click; Create as; the tree's menus; rows a page
     c.locator(".abar .ptab", has_text="Data profile").click()
@@ -1431,6 +1440,22 @@ def work_checks(browser, port, show):
     checks["the Data tree: a column's name goes in on a double-click, not a click; a function's click shows its details; a schema's New ▸ lists what it can make; Refresh and List"] = \
         clicked == "SELECT  FROM wk" and put_in == f"SELECT {cname} FROM wk" and fdetail is True \
         and {"Table…", "View…", "Materialized view…", "Function…", "Procedure…", "Schedule…"} <= set(made_items) and {"Refresh", "List its tables and views", "Copy the name"} <= set(s_items)
+    # Share… on a table (ADR-046): the statements shown as they are built, run, the profile shown once
+    opened(wk)
+    p.locator("#menu button", has_text="Share with another company").click()
+    d = p.locator("dialog.pop[open]")
+    d.locator("input[list=who-list]").fill("acme_corp")
+    built = d.locator("pre.defn").inner_text()
+    d.locator("button.primary", has_text="Share").click()
+    prof = p.locator("dialog.pop[open]", has_text="acme_corp's profile")
+    shown = until(lambda: prof.count() == 1 and "bearerToken" in prof.inner_text() and prof.locator("button", has_text="Download acme_corp.share").count() == 1, True)
+    p.keyboard.press("Escape")
+    held = [(r["share"], r["shared_as"], r["recipients"]) for r in sql(port, "SELECT share, shared_as, recipients FROM pondra.shares")]
+    checks["a table's Share with another company…: the statements shown as built, run; the new recipient's profile shown once, to download or copy"] = \
+        "CREATE SHARE wk_share" in built and "ALTER SHARE wk_share ADD TABLE wk" in built and "GRANT SELECT ON SHARE wk_share TO RECIPIENT acme_corp" in built \
+        and shown is True and held == [("wk_share", "public.wk", "acme_corp")]
+    sql(port, "DROP SHARE wk_share")
+    sql(port, "DROP RECIPIENT acme_corp")
     sql(port, "DROP VIEW wk_values")
     # History: statements as the node remembers them (pondra.history): this tab's, this page's, all but the
     # page's own queries; slow or failed; a slow one's plan as it ran (this node: PONDRA_SLOW_MS=300)
@@ -1556,7 +1581,8 @@ def layout_checks(browser, port, show):
     seen = lambda: p.locator("#data .row:visible .nm").all_inner_texts()
     only = until(lambda: "lx" in seen() and "ly" not in seen(), True)
     p.press("#filter", "Escape")
-    checks["the filter narrows the trees to the names that hold it (and what they are in); Esc clears it"] = only is True and "ly" in seen()
+    cleared = until(lambda: "ly" in seen(), True)
+    checks["the filter narrows the trees to the names that hold it (and what they are in); Esc clears it"] = only is True and cleared is True
     p.locator("#docs").click()
     p.keyboard.press("Control+b")
     hid = p.locator("#left").is_hidden()
@@ -1646,7 +1672,7 @@ def budget_checks(browser, port, show):
             fresh[name] = e.code
     total = sum(sizes.values()) if all(sizes.values()) else None
     later = {}
-    for name in ["chart.js", "plan.js", "more.js", "details.js", "more.css", "data.js", "md.js", "jobs.js", "history.js", "settings.js", "objects.js", "pyfile.js", "sqlfile.js", "rename.js", "versions.js", "stmts.js", "params.js", "tabs.js", "live.js", "gridmore.js", "groups.js", "upload.js", "access.js", "table.js"]:  # (loaded when first used)
+    for name in ["chart.js", "plan.js", "more.js", "details.js", "more.css", "data.js", "md.js", "jobs.js", "history.js", "settings.js", "objects.js", "pyfile.js", "sqlfile.js", "rename.js", "versions.js", "stmts.js", "params.js", "tabs.js", "live.js", "gridmore.js", "groups.js", "upload.js", "access.js", "table.js", "share.js"]:  # (loaded when first used)
         r = urllib.request.urlopen(urllib.request.Request(f"{base}/console/{name}", headers={"accept-encoding": "gzip"}))
         later[name] = len(r.read()) if r.headers.get("content-encoding") == "gzip" else None
     checks["the scripts and style sheet the page loads, gzipped as the node serves them: <= 70 KB; each answers 304 when the browser has it"] = total is not None and total <= 70 * 1024 \

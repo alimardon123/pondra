@@ -27,6 +27,9 @@ pub const FORMAT: u32 = 2;
 /// The format every lake gets without asking: the mark itself (`raise`).
 const BASE: u32 = 1;
 
+/// The format every lake gets without asking: the mark itself (`raise`).
+const BASE: u32 = 1;
+
 /// `FORMAT`, unless a test says otherwise (`PONDRA_TEST_FORMAT`: a build of a later format).
 pub fn known() -> u32 {
     static KNOWN: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| std::env::var("PONDRA_TEST_FORMAT").ok().and_then(|f| f.parse().ok()).unwrap_or(FORMAT));

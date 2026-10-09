@@ -66,7 +66,7 @@ on bytes as they do on text. A `CAST` to bytes takes `BYTEA` only.
 | `SELECT x * 2 AS y FROM t WHERE y > 1` | a select's alias in its `WHERE` (a column of that name wins) |
 | `SUMMARIZE t`, `SUMMARIZE SELECT …` | a row per column: its type, min and max, distinct values about, mean, spread, quartiles, count and NULLs |
 | `FROM t USING SAMPLE 10%` (or `n ROWS`), `FROM t TABLESAMPLE (10)` (or `(n ROWS)`) | a sample: each row kept on its own, or `n` of them |
-| `EXPLAIN SELECT …` | the plan, and whether it would spread over the nodes |
+| `EXPLAIN SELECT …`, `EXPLAIN ANALYZE SELECT …` | the estimated plan, each step with the rows it expects (`expected_rows`), and whether it would spread over the nodes; run, the actual plan: each step's rows (`output_rows`) and time beside what it expected |
 | `DESCRIBE t`, `SHOW TABLES`, `SHOW COLUMNS FROM t` | what the lake holds |
 | `SHOW VIEWS`, `SHOW MATERIALIZED VIEWS [LIKE 'p%']`, `SELECT … FROM pondra.tables` | each table and view with its kind (see [system tables](/pondra/reference/system-columns/#tables-and-views)) |
 | `SHOW SCHEMAS`, `SHOW DATABASES`, `SHOW SECRETS`, `SHOW USERS`, `SHOW ROLES`, `SHOW GRANTS` (each `[LIKE 'p%']`) | the schemas, the lakes a query can name, the secrets (never their values), users, roles and grants |
@@ -344,7 +344,8 @@ ann
 
 ## Variables
 
-A variable holds one value for the statements after it. It is a session's, as settings are (a
+A variable holds one value for the statements after it: a number, text, a date, bytes, a list or a
+struct (not yet a map). It is a session's, as settings are (a
 Postgres connection's, a client's, or one script's); a procedure and a file run have their own.
 
 | Statement | Syntax |
@@ -635,7 +636,7 @@ their values.
 | A token | `CREATE TOKEN name FOR [USER] u [EXPIRES IN '90 days']` (answers it, once), `DROP TOKEN name FOR [USER] u` |
 | List | `SELECT * FROM pondra.users`, `SELECT * FROM pondra.grants` |
 | What was done, and refused | `SELECT * FROM pondra.audit` (a superuser's): `at`, `user`, `door`, `from`, `class`, `statement`, `outcome`, `message`, `ms`, `node` |
-| Every statement | `SELECT * FROM pondra.history` (a superuser sees every row, anyone else their own): `at`, `id`, `user`, `door`, `from`, `node`, `session`, `class`, `statement`, `outcome`, `error`, `ms`, `rows`, `nodes`, and for a statement slower than `PONDRA_SLOW_MS` its `plan` (each step's rows and time) and `trace` (each node's share, as JSON) |
+| Every statement | `SELECT * FROM pondra.history` (a superuser sees every row, anyone else their own): `at`, `id`, `user`, `door`, `from`, `node`, `session`, `class`, `statement`, `outcome`, `error`, `ms`, `rows`, `nodes`; `fingerprint` (the statement with its literals left out: one query's runs share it), `plan_id` (the shape of the plan it ran), `version` (the commit it read at: `t AT (VERSION => n)` reads what it read), `reads` and `writes` (the tables and views it read, the tables it changed), `misestimate` (for a query of `PONDRA_LEARN_MS` or more, a factor: how many times more or fewer rows its worst join gave than expected, so `40` is forty times off); and for a statement slower than `PONDRA_SLOW_MS`, or ten times off, its `plan` (each step's rows beside its expected rows, and its time) and `trace` (each node's share, as JSON) |
 
 `public` is every user: `GRANT SELECT ON t TO public`. A grant on a schema covers its tables made later
 too. Only a superuser (or the admin token) runs these. `MAX_QUERIES` and `STATEMENT_TIMEOUT` are a user's
@@ -667,6 +668,26 @@ CREATE SECRET sales (TYPE s3, KEY_ID 'your-key-id', SECRET 'your-secret', REGION
 SELECT * FROM secrets();
 DROP SECRET sales;
 ```
+
+## Shares and recipients
+
+A share hands tables to another company through the Delta Sharing protocol: they read the files with their
+own compute. See [Share a table](/pondra/guides/sharing/).
+
+| Statement | Syntax |
+|---|---|
+| Make a share | `CREATE SHARE [IF NOT EXISTS] name [COMMENT '…']` |
+| Add a table | `ALTER SHARE s ADD [TABLE] t [PARTITION (col = 'v'), …] [AS schema.name] [WITH HISTORY \| WITHOUT HISTORY]`; also `GRANT SELECT ON TABLE t TO SHARE s` |
+| Take one out | `ALTER SHARE s REMOVE [TABLE] name`; also `REVOKE SELECT ON TABLE t FROM SHARE s` |
+| Make a recipient | `CREATE RECIPIENT [IF NOT EXISTS] name [COMMENT '…'] [EXPIRES IN '90 days']` (answers its profile, once) |
+| A new token | `ALTER RECIPIENT name ROTATE TOKEN [EXPIRES IN '…']` (answers the new profile; the old token ends) |
+| Grant, take back | `GRANT SELECT ON SHARE s TO RECIPIENT r, …`, `REVOKE SELECT ON SHARE s FROM RECIPIENT r, …` |
+| Drop | `DROP SHARE [IF EXISTS] name`, `DROP RECIPIENT [IF EXISTS] name` |
+| List | `SHOW SHARES`, `SHOW RECIPIENTS`, `DESCRIBE SHARE s` (`SHOW ALL IN SHARE s`); `pondra.shares`, `pondra.recipients` |
+| Read a share | `ATTACH '<profile JSON or endpoint>' AS name (TYPE share [, SHARE 'name'] [, TOKEN '…'])`, then `name.schema.table` |
+
+`CREATE OR REPLACE SHARE` and `CREATE OR REPLACE RECIPIENT` are refused, as they are for schemas and users:
+replacing a share would drop its tables and grants, and replacing a recipient would end its token.
 
 ## External tables
 

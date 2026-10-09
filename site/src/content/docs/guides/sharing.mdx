@@ -1,0 +1,172 @@
+---
+title: Share a table
+description: Share a table, some of its partitions or a materialized view with another company through the Delta Sharing protocol; they read it with pandas, Spark, Power BI or another Pondra, with their own compute, and no key to your bucket leaves.
+sidebar:
+  order: 16.2
+---
+
+import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+
+To give another company one table, make a **share**, put the table in it, make a **recipient** for
+the company and grant it the share. The recipient gets a small profile file. With it, their pandas,
+Spark, Power BI, Tableau or Pondra reads the table's files straight from your bucket, with their own
+compute. Your node answers only which files to read, and signs a link to each that lasts 15 minutes.
+No key to the bucket leaves, and nothing else in the lake is reachable.
+
+This is the [Delta Sharing](https://delta.io/sharing/) protocol, the one Databricks shares with, so
+every client that reads Delta Sharing reads Pondra's shares.
+
+## Share a table
+
+```sql
+CREATE TABLE orders (id BIGINT, region VARCHAR, total DOUBLE) WITH (partition_by = 'region');
+INSERT INTO orders VALUES (1, 'EU', 10.5), (2, 'US', 20.0), (3, 'EU', 7.25), (4, 'UK', 3.0);
+
+CREATE SHARE acme COMMENT 'Orders for Acme';
+ALTER SHARE acme ADD TABLE orders;
+CHECKPOINT;   -- (the rows to files now, not at the next tiering round)
+```
+
+A share holds tables and materialized views. Adding a table publishes it as Delta from then on
+(the files stay where they are). New rows reach the recipient with the next tiering round (every 10
+seconds by default), as they reach every Delta reader.
+
+## Make a recipient and send the profile
+
+```python
+import json
+import pondra
+db = pondra.connect("http://localhost:8080")
+
+profile = db.sql("CREATE RECIPIENT acme_corp COMMENT 'Acme Corp' EXPIRES IN '90 days'")["profile"]
+db.sql("GRANT SELECT ON SHARE acme TO RECIPIENT acme_corp")
+with open("acme_corp.share", "w") as f:
+    json.dump(profile, f)
+sorted(profile)
+```
+
+```text
+['bearerToken', 'endpoint', 'expirationTime', 'shareCredentialsVersion']
+```
+
+`CREATE RECIPIENT` answers the profile once: Pondra keeps only its token's hash. Send the file to
+the company by a safe way: whoever has it can read what is granted to it until it expires. In the
+console, a table's menu has **Share with another company…**, which builds the same statements and
+offers the profile to download.
+
+The profile's `endpoint` is the node's address. Behind a load balancer or a public name, set
+`PONDRA_SHARING_URL` (say `https://data.example.com/delta-sharing`) on every node.
+
+## What they run
+
+<Tabs syncKey="lang">
+  <TabItem label="Python">
+    ```python norun
+    import delta_sharing                     # pip install delta-sharing
+
+    delta_sharing.load_as_pandas("acme_corp.share#acme.public.orders")
+    ```
+  </TabItem>
+  <TabItem label="PySpark">
+    ```python norun
+    spark.read.format("deltaSharing").load("acme_corp.share#acme.public.orders")
+    ```
+  </TabItem>
+</Tabs>
+
+A table outside `public` is listed under its schema (`acme.sales.orders`). Power BI and Tableau have
+Delta Sharing connectors that take the same file.
+
+### Another Pondra
+
+A profile is an invite, and attaching it accepts it. The other lake reads the share with its own
+compute, and joins it with its own tables:
+
+```python
+db.sql(f"ATTACH '{json.dumps(profile)}' AS acme (TYPE share)")
+db.sql("SELECT region, sum(total) AS total FROM acme.orders GROUP BY region ORDER BY region").rows()
+```
+
+```text
+[{'region': 'EU', 'total': 17.75}, {'region': 'UK', 'total': 3.0}, {'region': 'US', 'total': 20.0}]
+```
+
+The token is kept as a sealed secret of the attachment (`share_acme`) and never shown; `DETACH acme`
+drops it. A share with more than one name is picked with `SHARE 'name'`; a server's address with
+its token works too: `ATTACH 'https://…/delta-sharing' AS acme (TYPE share, SHARE 'acme', TOKEN
+'…')`. Any Delta Sharing server can be attached this way, Databricks' included.
+
+## Share less than a table
+
+A share hands out whole files, so it can hold a table's partitions by its `partition_by` column, under
+a name of their own:
+
+```sql
+ALTER SHARE acme ADD TABLE orders PARTITION (region = 'EU'), (region = 'UK') AS public.orders_europe;
+```
+
+Some columns, or rows picked any other way, are a materialized view: it is kept fresh as rows land,
+and the recipient reads its files.
+
+```sql
+CREATE MATERIALIZED VIEW acme_totals AS SELECT id, total FROM orders WHERE total > 5;
+ALTER SHARE acme ADD TABLE acme_totals;
+```
+
+Snowflake's way of saying it works too: `GRANT SELECT ON TABLE orders TO SHARE acme`.
+
+## Older versions
+
+`WITH HISTORY` lets the recipient read the table as it was at a version or a time
+(`load_as_pandas(…, version=3)`, `timestamp='…'`). Without it, only the current version is served.
+
+```sql
+ALTER SHARE acme ADD TABLE orders AS public.orders_history WITH HISTORY;
+```
+
+Rows you update or delete reach the recipient as Delta's deletion vectors, which pandas (from
+delta-sharing 1.1), Spark and Pondra read. A client that can't read them is refused that table by
+name, never given deleted rows.
+
+## See and take back
+
+```sql
+SHOW SHARES;
+DESCRIBE SHARE acme;
+SHOW RECIPIENTS;
+```
+
+`pondra.shares` and `pondra.recipients` hold the same, for queries. To take access back:
+
+```sql
+REVOKE SELECT ON SHARE acme FROM RECIPIENT acme_corp;   -- that share, at once
+ALTER SHARE acme REMOVE TABLE orders_europe;            -- that table, for everyone
+```
+
+`ALTER RECIPIENT acme_corp ROTATE TOKEN` answers a new profile and ends the old token;
+`DROP RECIPIENT` and `DROP SHARE` end everything they held. Links already handed out end within 15
+minutes (`PONDRA_SHARE_URL_SECS`).
+
+Every request at the sharing door is a row of `pondra.audit`, refusals too, with the recipient, the
+table and how it ended:
+
+```sql
+SELECT at, "user", statement, outcome FROM pondra.audit WHERE door = 'sharing' ORDER BY at DESC LIMIT 10;
+```
+
+## Where the bytes go
+
+| Lake | The recipient reads |
+|---|---|
+| S3, R2, GCS, Azure | the bucket, by URLs it signs with the lake's own credentials (they must be able to sign: an access key, a service account's key, an account key) |
+| a local disk | the node, by links it signs with the lake's key, a range at a time |
+
+Their reads are GETs on your bucket. On S3, GCS and Azure their egress is yours to pay; on R2 it is
+free. Each recipient is held to `PONDRA_SHARE_FILES_PER_MINUTE` links a minute on each node
+(10,000).
+
+<Aside type="caution">
+Refused by name: an external table, a clone, a table of an attached lake, and tables with `merge` or
+`order_by` (their files hold more than their current rows). Share a materialized view of them
+instead. A share's changes as a feed (Delta Sharing's `changes`) are not served yet.
+</Aside>

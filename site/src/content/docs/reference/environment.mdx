@@ -35,6 +35,7 @@ A number that is left unset, or set to something that is not a number, takes its
 | `PONDRA_HISTORY_RATE` | `500` | at most this many rows a second a node in `pondra.history`; past it, fast statements that went well are counted in one row (`class = 'skipped'`). Slow and failed ones are always written |
 | `PONDRA_HISTORY_DAYS` | `7` | how many days `pondra.history` keeps. Read when it is first made |
 | `PONDRA_SLOW_MS` | `1000` | a statement this slow keeps its plan and trace in `pondra.history` and writes a line to the node's log |
+| `PONDRA_LEARN_MS` | `100` | a query this slow notes in `pondra.history` how far its joins' rows were from what was expected (`misestimate`); ten times off, it keeps its plan too |
 | `PONDRA_USER_QUERIES` | none | how many statements a user without its own `MAX_QUERIES` runs at once on a node ([quotas](/pondra/guides/security/#quotas)) |
 | `PONDRA_USER_TIMEOUT` | none | how many seconds a statement of a user without its own `STATEMENT_TIMEOUT` may run |
 
@@ -125,6 +126,8 @@ A query is spread over the nodes of a cluster when that is cheaper than running 
 | `PONDRA_AI_KEY` | none | sent as a bearer token to that endpoint, if it wants one |
 | `PONDRA_AI_MODEL` | `llama3.2` | the model `ai_complete` uses when the call names none |
 | `PONDRA_EMBED_MODEL` | `nomic-embed-text` | the model `ai_embed` uses when the call names none |
+| `PONDRA_AI_CALLS` | `16` | requests a node has in flight to that endpoint at most, from all its queries together |
+| `PONDRA_AI_TIMEOUT_SECS` | `300` | how long one request may take before its rows are `NULL` |
 
 ## Writes with `pondra sql`
 
