@@ -463,7 +463,7 @@ def differences(old, new, columns_of_old=True):
     out = {}
     for k, rows in old.items():
         got = new.get(k)
-        if got is not None and columns_of_old and k.startswith("rows of ") and rows:
+        if got is not None and columns_of_old and rows and all(r.startswith("{") for r in rows):  # (a system table gains columns between releases; text answers are not rows)
             keep = set().union(*(json.loads(r) for r in rows))  # (a row leaves out its nulls)
             got = sorted(json.dumps({c: x for c, x in json.loads(r).items() if c in keep}, sort_keys=True) for r in got)
         if got != rows:
