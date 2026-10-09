@@ -25,12 +25,15 @@ asked to fix before calling `EMIT FINAL` done.
    aggregates is that expression over their columns, `HAVING` becomes its `WHERE`, and `ORDER BY`,
    `LIMIT` and `QUALIFY` stay. A query that needs no finishing step (plain `count`, `sum`, `min`,
    `max`) is kept exactly as before, so nothing already made changes.
-2. **A variance is kept as moments** (`pondra_moments`: a struct of the count, the mean and the sum
-   of squared deviations). Rows are folded in one pass (Welford) and partial rows are combined
-   with Chan's formula, so `stddev`, `variance` and their `_samp` and `_pop` forms stay exact to the
-   last few bits however the rows were split across nodes, files and commits. A row taken back
-   (`UPDATE`, `DELETE`: ADR-020) is its moments with the count and the squares negated, which the
-   same formula subtracts. `bool_and` and `bool_or` are a `min` and a `max`.
+2. **A variance is kept as moments** (`pondra_moments`: a struct of the count and the values' sum
+   and sum of squares, each taken from a shift, the first value the part saw). Parts are moved to
+   one shift and added, so `stddev`, `variance` and their `_samp` and `_pop` forms stay exact to the
+   last few bits however the rows were split across nodes, files and commits, where plain sums of
+   squares lose every digit. A row taken back (`UPDATE`, `DELETE`: ADR-020) is its moments with the
+   count and both sums negated. An `UPDATE`'s part (its new value in, its old one out) has a count
+   of 0 and still changes the variance; a count, mean and sum of squared deviations (Chan's
+   formula) can't hold that, and lost it when a fold combined the two. `bool_and` and `bool_or` are
+   a `min` and a `max`.
 3. **Every read finishes it** (`TableMeta::finish`, applied in `query::table_view`'s merge branch).
    That is the one place the merge table is read. So a query, a spread query's whole tables
    (invariant 34) and `EMIT FINAL`'s emission (ADR-052) all see finished answers. Each

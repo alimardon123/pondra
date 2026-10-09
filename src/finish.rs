@@ -3,8 +3,8 @@
 //! a window function over the groups, `HAVING`, `ORDER BY` and `LIMIT`.
 //!
 //! The view's table keeps what adds up as rows arrive, one column each: counts, sums, mins, maxes
-//! and moments (`pondra_moments`: a count, a mean and a sum of squared differences, combined as
-//! Chan's formula does, so a variance stays exact where a sum of squares would cancel). The GROUP
+//! and moments (`pondra_moments`: a count and the values' sums and squares taken from a shift, so
+//! a variance stays exact where plain sums of squares would cancel). The GROUP
 //! BY view machinery already keeps such a table, from every node, in the same commit as the rows,
 //! and takes back a changed row's part. Its answers are a SELECT over those columns
 //! (`TableMeta::finish`), worked out as it is read (`query::table_view`): one projection more.
@@ -242,7 +242,9 @@ impl Parts {
             }
             "var" | "var_samp" | "var_sample" | "variance" | "var_pop" | "var_population" | "stddev" | "stddev_samp" | "std" | "stddev_pop" => {
                 let m = self.column(renamed(MOMENTS), MOMENTS);
-                let (n, m2) = (format!("get_field(\"{m}\", 'n')"), format!("get_field(\"{m}\", 'm2')"));
+                let field = |f: &str| format!("get_field(\"{m}\", '{f}')");
+                let n = field("n");
+                let m2 = format!("({} - {} * {} / {n})", field("s2"), field("s1"), field("s1"));
                 let pop = fname.ends_with("pop") || fname.ends_with("population");
                 let var = match pop {
                     true => format!("CASE WHEN {n} > 0 THEN greatest({m2} / {n}, 0) END"),
@@ -293,10 +295,13 @@ fn parse_query(sql: &str) -> Result<ast::Query> {
     }
 }
 
-/// `pondra_moments(x)`: a column's count, mean and sum of squared differences from it (`m2`),
-/// for a variance. Over numbers it adds each in (Welford's way); over its own results it combines
-/// them (Chan's), so it is both what a view's partial rows hold and how they merge. A part with a
-/// negative count takes rows back. A NULL is passed over, as `var` does.
+/// `pondra_moments(x)`: a column's count and its values' sum and sum of squares taken from a shift
+/// `k` (the first value it saw), for a variance. Parts add up in any order: a part with a negative
+/// count takes rows back, and one whose count came to 0 still holds what it changed (an UPDATE's
+/// new value less its old one), where a mean would be undefined and Chan's formula loses it.
+/// Values near `k` keep their digits, which plain sums of squares would cancel. Over its own
+/// results it combines them, so it is both what a view's partial rows hold and how they merge. A
+/// NULL is passed over, as `var` does.
 pub const MOMENTS: &str = "pondra_moments";
 
 /// Adds `pondra_moments` to a session.
@@ -308,7 +313,7 @@ pub fn register(ctx: &datafusion::prelude::SessionContext) {
 }
 
 fn moment_fields() -> Fields {
-    Fields::from(vec![Field::new("n", DataType::Int64, false), Field::new("mean", DataType::Float64, false), Field::new("m2", DataType::Float64, false)])
+    Fields::from(vec![Field::new("n", DataType::Int64, false), Field::new("k", DataType::Float64, false), Field::new("s1", DataType::Float64, false), Field::new("s2", DataType::Float64, false)])
 }
 
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -336,27 +341,32 @@ impl AggregateUDFImpl for Moments {
 #[derive(Debug, Default, Clone, Copy)]
 struct Moment {
     n: i64,
-    mean: f64,
-    m2: f64,
+    k: f64,
+    s1: f64,
+    s2: f64,
 }
 
 impl Moment {
-    /// Chan's combination of two parts (either may have taken rows back: a negative count).
-    fn add(&mut self, n: i64, mean: f64, m2: f64) {
-        let total = self.n + n;
-        if total == 0 {
-            *self = Moment::default();
+    /// Another part added in, moved to this one's shift (either may have taken rows back).
+    fn add(&mut self, n: i64, k: f64, s1: f64, s2: f64) {
+        if self.n == 0 && self.s1 == 0.0 && self.s2 == 0.0 {
+            *self = Moment { n, k, s1, s2 }; // (nothing yet: its shift is the part's)
             return;
         }
-        let delta = mean - self.mean;
-        self.mean += delta * n as f64 / total as f64;
-        self.m2 += m2 + delta * delta * self.n as f64 * n as f64 / total as f64;
-        self.n = total;
+        let (d, m) = (k - self.k, n as f64);
+        self.s2 += s2 + 2.0 * d * s1 + m * d * d;
+        self.s1 += s1 + m * d;
+        self.n += n;
     }
 
-    fn parts(&mut self, n: &Int64Array, mean: &Float64Array, m2: &Float64Array, valid: Option<&datafusion::arrow::buffer::NullBuffer>) {
+    #[cfg(test)]
+    fn m2(&self) -> f64 { self.s2 - self.s1 * self.s1 / self.n as f64 }
+
+    fn parts(&mut self, columns: [&ArrayRef; 4], valid: Option<&datafusion::arrow::buffer::NullBuffer>) {
+        let n = columns[0].as_primitive::<Int64Type>();
+        let [k, s1, s2] = [1, 2, 3].map(|i| columns[i].as_primitive::<Float64Type>());
         for i in (0..n.len()).filter(|&i| valid.is_none_or(|v| v.is_valid(i)) && n.is_valid(i)) {
-            self.add(n.value(i), mean.value(i), m2.value(i));
+            self.add(n.value(i), k.value(i), s1.value(i), s2.value(i));
         }
     }
 }
@@ -366,39 +376,38 @@ impl Accumulator for Moment {
         let v = &values[0];
         if let DataType::Struct(_) = v.data_type() {
             let s = v.as_struct();
-            let (n, mean, m2) = (s.column(0).as_primitive::<Int64Type>(), s.column(1).as_primitive::<Float64Type>(), s.column(2).as_primitive::<Float64Type>());
-            self.parts(n, mean, m2, s.nulls());
+            self.parts([0, 1, 2, 3].map(|i| s.column(i)), s.nulls());
             return Ok(());
         }
         let x = datafusion::arrow::compute::cast(v, &DataType::Float64)?;
         for x in x.as_primitive::<Float64Type>().iter().flatten() {
-            self.add(1, x, 0.0);
+            self.add(1, x, 0.0, 0.0);
         }
         Ok(())
     }
 
     fn merge_batch(&mut self, states: &[ArrayRef]) -> datafusion::common::Result<()> {
-        self.parts(states[0].as_primitive::<Int64Type>(), states[1].as_primitive::<Float64Type>(), states[2].as_primitive::<Float64Type>(), None);
+        self.parts([&states[0], &states[1], &states[2], &states[3]], None);
         Ok(())
     }
 
     fn state(&mut self) -> datafusion::common::Result<Vec<ScalarValue>> {
-        Ok(vec![ScalarValue::Int64(Some(self.n)), ScalarValue::Float64(Some(self.mean)), ScalarValue::Float64(Some(self.m2))])
+        Ok(vec![ScalarValue::Int64(Some(self.n)), ScalarValue::Float64(Some(self.k)), ScalarValue::Float64(Some(self.s1)), ScalarValue::Float64(Some(self.s2))])
     }
 
     fn evaluate(&mut self) -> datafusion::common::Result<ScalarValue> {
-        let columns: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(vec![self.n])), Arc::new(Float64Array::from(vec![self.mean])), Arc::new(Float64Array::from(vec![self.m2]))];
+        let columns: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(vec![self.n])), Arc::new(Float64Array::from(vec![self.k])), Arc::new(Float64Array::from(vec![self.s1])), Arc::new(Float64Array::from(vec![self.s2]))];
         Ok(ScalarValue::Struct(Arc::new(StructArray::new(moment_fields(), columns, None))))
     }
 
     fn size(&self) -> usize { std::mem::size_of_val(self) }
 }
 
-/// Moments taken back (a change's old rows): the count and the squared differences negated.
+/// Moments taken back (a change's old rows): the count and both sums negated, the shift kept.
 pub fn negated(a: &ArrayRef) -> Result<ArrayRef> {
     let s = a.as_struct();
     let neg = |c: &ArrayRef| datafusion::arrow::compute::kernels::numeric::neg(c);
-    let columns = vec![neg(s.column(0))?, s.column(1).clone(), neg(s.column(2))?];
+    let columns = vec![neg(s.column(0))?, s.column(1).clone(), neg(s.column(2))?, neg(s.column(3))?];
     Ok(Arc::new(StructArray::new(moment_fields(), columns, s.nulls().cloned())))
 }
 
@@ -447,12 +456,25 @@ mod tests {
     fn moments_combine_as_one_pass_would() {
         let xs = [1.0e9 + 1.0, 1.0e9 + 2.0, 1.0e9 + 4.0, 1.0e9 + 8.0];
         let (mut a, mut b) = (Moment::default(), Moment::default());
-        xs[..2].iter().for_each(|x| a.add(1, *x, 0.0));
-        xs[2..].iter().for_each(|x| b.add(1, *x, 0.0));
-        a.add(b.n, b.mean, b.m2);
+        xs[..2].iter().for_each(|x| a.add(1, *x, 0.0, 0.0));
+        xs[2..].iter().for_each(|x| b.add(1, *x, 0.0, 0.0));
+        a.add(b.n, b.k, b.s1, b.s2);
         assert_eq!(a.n, 4);
-        assert!((a.m2 / 3.0 - 9.583333333333334).abs() < 1e-6, "{}", a.m2 / 3.0); // (a sum of squares loses every digit here)
-        a.add(-b.n, b.mean, -b.m2); // (taken back)
-        assert!((a.m2 - 0.5).abs() < 1e-6 && a.n == 2, "{} {}", a.n, a.m2);
+        assert!((a.m2() / 3.0 - 9.583333333333334).abs() < 1e-6, "{}", a.m2() / 3.0); // (a sum of squares loses every digit here)
+        a.add(-b.n, b.k, -b.s1, -b.s2); // (taken back)
+        assert!((a.m2() - 0.5).abs() < 1e-6 && a.n == 2, "{} {}", a.n, a.m2());
+        // An UPDATE's part: its new value in, its old one out, a count of 0 that still changes the
+        // variance, added before or after the rows it changes.
+        let one = |x: f64| { let mut m = Moment::default(); m.add(1, x, 0.0, 0.0); m };
+        let (mut change, old) = (one(1.0e9 + 50.0), one(1.0e9 + 2.0));
+        change.add(-old.n, old.k, -old.s1, -old.s2);
+        assert_eq!(change.n, 0);
+        let mut first = change;
+        xs.iter().for_each(|x| first.add(1, *x, 0.0, 0.0));
+        let mut last = Moment::default();
+        xs.iter().for_each(|x| last.add(1, *x, 0.0, 0.0));
+        last.add(change.n, change.k, change.s1, change.s2);
+        let want = { let ys = [1.0e9 + 1.0, 1.0e9 + 50.0, 1.0e9 + 4.0, 1.0e9 + 8.0]; let mean = ys.iter().sum::<f64>() / 4.0; ys.iter().map(|y| (y - mean).powi(2)).sum::<f64>() };
+        assert!((first.m2() - want).abs() < 1e-3 && (last.m2() - want).abs() < 1e-3, "{} {} {want}", first.m2(), last.m2());
     }
 }
