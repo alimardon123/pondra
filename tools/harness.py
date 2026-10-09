@@ -1774,13 +1774,15 @@ BYKEY_VIEWS = {
 
 def _bykey_same(q, name, query, by, secs=30):
     """The view == its query run ad hoc, once a run has caught up (a view kept by key follows a
-    moment after the commit)."""
-    want = lambda: q(f"SELECT * FROM ({query}) ORDER BY {by} NULLS FIRST")
-    got = lambda: q(f"SELECT * FROM {name} ORDER BY {by} NULLS FIRST")
+    moment after the commit). The answer is the poll that matched: asking both again after it
+    could straddle a commit and compare two moments."""
     deadline = time.time() + secs
-    while not _close(got(), want()) and time.time() < deadline:
+    while True:
+        if _close(q(f"SELECT * FROM {name} ORDER BY {by} NULLS FIRST"), q(f"SELECT * FROM ({query}) ORDER BY {by} NULLS FIRST")):
+            return True
+        if time.time() > deadline:
+            return False
         time.sleep(0.3)
-    return _close(got(), want())
 
 
 def bykey_on_three():
@@ -2005,9 +2007,11 @@ def bykey():
     q("CREATE MATERIALIZED VIEW sizes AS SELECT customers > 10 AS big, count(*) AS regions, sum(customers) AS c FROM regulars GROUP BY 1")
     q("UPDATE orders SET customer = 'solo' WHERE region = 'west'")  # (west's distinct customers: 1)
     q("INSERT INTO orders VALUES ('east', 'new2', NULL, 1.0, TIMESTAMP '2026-10-07 00:00:00')")
-    follows = {"busy": _bykey_same(q, "busy", "SELECT region, customers FROM regulars WHERE customers > 9", "region"),
-               "sizes": _bykey_same(q, "sizes", "SELECT customers > 10 AS big, count(*) AS regions, sum(customers) AS c FROM regulars GROUP BY 1", "big"),
-               "regulars": _bykey_same(q, "regulars", views["regulars"][0], "region")}
+    # (regulars first: it matches only once its runs have caught up with both writes, so the views
+    # of it are compared after them, not before, when they'd match trivially)
+    follows = {"regulars": _bykey_same(q, "regulars", views["regulars"][0], "region"),
+               "busy": _bykey_same(q, "busy", "SELECT region, customers FROM regulars WHERE customers > 9", "region"),
+               "sizes": _bykey_same(q, "sizes", "SELECT customers > 10 AS big, count(*) AS regions, sum(customers) AS c FROM regulars GROUP BY 1", "big")}
     if not all(follows.values()):
         follows["rows"] = {v: q(f"SELECT * FROM {v}") for v in ("regulars", "busy", "sizes")}
     flows = all(follows[k] for k in ("busy", "sizes", "regulars"))
