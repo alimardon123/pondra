@@ -752,7 +752,7 @@ impl App {
             Some(seq) => {
                 crate::views::fill_all(&self.lake, seq, self.log()?, &self.lock).await?; // (the leader: views filled from the rows already there)
                 crate::views::join_all(&self.lake, self.log()?).await?; // (and stream joins)
-                crate::bykey::run_all(&self.lake, seq, &self.lock).await // (and views kept by key: each in a task of its own)
+                crate::rerun::run_all(&self.lake, seq, &self.lock).await // (and views kept by key: each in a task of its own)
             }
             None => Ok(()),
         }

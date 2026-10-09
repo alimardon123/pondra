@@ -355,9 +355,9 @@ fn materialized_sql(name: &str, v: &crate::views::View, meta: Option<&TableMeta>
     if let Some(h) = meta.and_then(|m| m.history.as_ref()) {
         with.push(format!("history = {}, sequence_by = {}", literal(&h.key.join(", ")), literal(&h.sequence_by)));
     }
-    if let Some(b) = v.bykey.as_ref().filter(|b| b.asked) {
+    if let Some(b) = v.rerun.as_ref().filter(|b| b.asked) {
         // (chosen, it is chosen again from the query; asked for, it is asked for again)
-        with.extend(b.lag_secs.is_none().then(|| "refresh = 'by key'".to_string()));
+        with.push(format!("refresh = '{}'", if b.full.is_some() { "full" } else { "by key" }));
         with.extend(b.lag_secs.map(|s| format!("lag = '{s} seconds'")));
     }
     let expect = if expect.is_empty() { String::new() } else { format!(" (\n  {}\n)", expect.join(",\n  ")) };

@@ -1714,12 +1714,16 @@ def finishes():
     refused = {
         "median": _raises_text(lambda: q("CREATE MATERIALIZED VIEW m1 WITH (refresh = 'incremental') AS SELECT region, median(amount) AS m FROM sales GROUP BY region")),
         "distinct": _raises_text(lambda: q("CREATE MATERIALIZED VIEW m2 WITH (refresh = 'incremental') AS SELECT region, count(DISTINCT store) AS s FROM sales GROUP BY region")),
-        "of it": _raises_text(lambda: q("CREATE MATERIALIZED VIEW m3 AS SELECT region, count(*) AS n FROM stats GROUP BY region")),
         "detach": _raises_text(lambda: q("ALTER MATERIALIZED VIEW stats DETACH")),
         "final order": _raises_text(lambda: q("CREATE MATERIALIZED VIEW m4 AS SELECT date_bin(INTERVAL '1 minute', ts) AS minute, avg(amount) AS a FROM sales "
                                                "GROUP BY 1 ORDER BY a LIMIT 2 EMIT FINAL")),
         "rename": _raises_text(lambda: q("ALTER TABLE stats RENAME COLUMN mean TO average")),
     }
+    # (a view of one runs its query whole again, ADR-057: what it reads is worked out as it is read)
+    q("CREATE MATERIALIZED VIEW m3 AS SELECT region, count(*) AS n FROM stats GROUP BY region")
+    of_it = q("SELECT region, n FROM m3 ORDER BY region NULLS FIRST") == q("SELECT region, count(*) AS n FROM stats GROUP BY region ORDER BY region NULLS FIRST") \
+        and q("SELECT refresh FROM pondra.flows WHERE name = 'm3'") == [{"refresh": "full"}]
+    q("DROP MATERIALIZED VIEW m3")
     stored = q("SELECT * FROM stats ORDER BY region NULLS FIRST")
     node.kill()
     node = Node(lake, A.port, tier_secs=1, pg=f"127.0.0.1:{pgp}").start()
@@ -1741,8 +1745,9 @@ def finishes():
         "listed with the columns it answers (SELECT *, information_schema, pg_catalog)": star == stats_names and columns == stats_names and pg == stats_names,
         "SHOW CREATE gives the query as written; dropped and made again from it, the same answers": "avg(amount)" in shown and "stddev(amount)" in shown and again is True,
         "a restart: the same answers": _close(restarted, stored),
-        "refused by name: median and DISTINCT asked to be incremental (else kept by key: `bykey`), a view of one, DETACH, EMIT FINAL with ORDER BY, a renamed column": "needs every row" in refused["median"]
-            and "DISTINCT" in refused["distinct"] and "as it is read" in refused["of it"] and "as it is read" in refused["detach"]
+        "a view of one runs whole, == ad hoc": of_it,
+        "refused by name: median and DISTINCT asked to be incremental (else kept by key: `bykey`), DETACH, EMIT FINAL with ORDER BY, a renamed column": "needs every row" in refused["median"]
+            and "DISTINCT" in refused["distinct"] and "as it is read" in refused["detach"]
             and "ORDER BY" in refused["final order"] and refused["rename"] != "",
         "spread over three nodes == one node, the view read whole beside a sliced table": finishes_on_three(),
     }
@@ -1810,6 +1815,151 @@ def bykey_on_three():
     return ok
 
 
+FULL_VIEWS = {
+    "top": ("SELECT customer, amount FROM orders ORDER BY amount DESC, customer LIMIT 5", "amount, customer"),
+    "ranks": ("SELECT region, customer, amount, rank() OVER (PARTITION BY region ORDER BY amount DESC) AS r FROM orders WHERE amount > 90", "region, customer, amount, r"),
+    "kinds": ("SELECT DISTINCT region, coupon FROM orders", "region, coupon"),
+    "above": ("SELECT customer, amount FROM orders WHERE amount > (SELECT avg(amount) * 1.9 FROM orders)", "customer, amount"),
+    "by_tier": ("SELECT c.tier, median(o.amount) AS med, count(DISTINCT o.customer) AS customers FROM orders o JOIN tiers c ON o.customer = c.customer GROUP BY c.tier", "tier"),
+    "overall": ("SELECT count(*) AS n, median(amount) AS med, sum(amount) AS total FROM orders", "n"),
+    "price_med": ("SELECT CAST(id % 3 AS BIGINT) AS bucket, median(amount) AS med FROM prices GROUP BY 1", "bucket"),
+}
+
+
+def full_on_three():
+    """`refreshed`'s cluster part: rows written on followers while the leader is killed and comes
+    back; every view == its query, read on every node."""
+    lake = new_lake()
+    nodes = [Node(lake, A.port + i, tier_secs=0.5).start() for i in range(3)]
+    q = lambda s, port=A.port: sql(port, s)
+    q("CREATE TABLE orders (region VARCHAR, customer VARCHAR, coupon VARCHAR, amount DOUBLE, ts TIMESTAMP)")
+    q("CREATE TABLE tiers (customer VARCHAR, tier VARCHAR)")
+    q("CREATE TABLE prices (id BIGINT PRIMARY KEY, amount DOUBLE)")
+    q("INSERT INTO tiers SELECT 'c' || CAST(value AS VARCHAR), CASE WHEN value % 2 = 0 THEN 'gold' ELSE 'plain' END FROM generate_series(0, 10)")
+    q("INSERT INTO orders " + ORDER_ROWS.format(1, 300))
+    for name, (query, _) in FULL_VIEWS.items():
+        q(f"CREATE MATERIALIZED VIEW {name} AS {query}", A.port + 1)
+    def retry(s, port):
+        deadline = time.time() + 90
+        while True:
+            try:
+                return q(s, port)
+            except Exception:
+                if time.time() > deadline:
+                    raise
+                time.sleep(0.3)
+    for k in range(10):
+        port = A.port + 1 + k % 2
+        retry("INSERT INTO orders " + ORDER_ROWS.format(1000 + k * 50, 1049 + k * 50), port)
+        retry(f"INSERT INTO prices VALUES ({k}, {k * 1.5}), ({k + 100}, {k * 2.5})", port)
+        retry(f"UPDATE tiers SET tier = 'gold' WHERE customer = 'c{k % 11}'", port)
+        if k == 4:
+            nodes[0].kill(); nodes[0].start()  # (the leader, between runs)
+    ok = all(_bykey_same(lambda s: q(s, port), name, query, by, secs=60) for name, (query, by) in FULL_VIEWS.items() for port in (A.port, A.port + 1, A.port + 2))
+    for n in nodes:
+        n.kill()
+    return ok
+
+
+def refreshed():
+    """Materialized views run whole again (ADR-057): ORDER BY … LIMIT, a window, DISTINCT, a
+    subquery over its own table, a join with a median, a global aggregate and a keyed table's
+    median, chosen because the rows can't keep them. Each == its query run ad hoc right after CREATE,
+    after bulk and log INSERTs, UPDATEs and DELETEs (of the joined table too), a restart and on three
+    nodes through a leader kill. A row that came out the same isn't written again; a view calling
+    now() follows the clock with no write; what follows one takes its rows back; listed in
+    `pondra.flows` with why and what it follows; SHOW CREATE gives back `refresh = 'full'` when asked;
+    `lag` on an incremental view, and what each way can't do, refused by name."""
+    lake = new_lake()
+    node = Node(lake, A.port, tier_secs=1).start()
+    q = lambda s: sql(A.port, s)
+    q("CREATE TABLE orders (region VARCHAR, customer VARCHAR, coupon VARCHAR, amount DOUBLE, ts TIMESTAMP)")
+    q("CREATE TABLE tiers (customer VARCHAR, tier VARCHAR)")
+    q("CREATE TABLE prices (id BIGINT PRIMARY KEY, amount DOUBLE)")
+    q("INSERT INTO tiers SELECT 'c' || CAST(value AS VARCHAR), CASE WHEN value % 2 = 0 THEN 'gold' ELSE 'plain' END FROM generate_series(0, 10)")
+    q("INSERT INTO prices VALUES (1, 10), (2, 20), (3, 30), (4, 40)")
+    q("INSERT INTO orders " + ORDER_ROWS.format(1, 500))
+    views = dict(FULL_VIEWS)
+    views["asked"] = ("SELECT region, sum(amount) AS total FROM orders GROUP BY region", "region")
+    for name, (query, _) in views.items():
+        q(f"CREATE MATERIALIZED VIEW {name}{' WITH (refresh = ' + chr(39) + 'full' + chr(39) + ')' if name == 'asked' else ''} AS {query}")
+    later = False
+    same = lambda: {name: _bykey_same(q, name, query, by, secs=2 if not later else 30) for name, (query, by) in views.items()}
+    made = same()  # (CREATE waited for the first run: no polling)
+    later = True
+    q("INSERT INTO orders " + ORDER_ROWS.format(501, 2500))  # a bulk INSERT: a file commit
+    q("INSERT INTO orders VALUES ('south', 'c1', NULL, 196.5, TIMESTAMP '2026-10-05 00:00:00'), (NULL, 'c4', 'k2', 1.5, TIMESTAMP '2026-10-05 02:00:00')")
+    q("INSERT INTO prices VALUES (2, 25), (5, 50)")  # (an upsert and a new key)
+    inserted = same()
+    q("UPDATE orders SET amount = amount * 2 WHERE customer = 'c3'")
+    q("DELETE FROM orders WHERE customer = 'c5' OR region IS NULL")
+    q("UPDATE tiers SET tier = 'gold' WHERE customer IN ('c1', 'c3')")  # (only the joined table)
+    q("DELETE FROM prices WHERE id = 1")
+    changed = same()
+    # A row that came out the same stays as it was.
+    rows = lambda: q("SELECT customer, amount, _row_id, _version FROM top")
+    before = rows()
+    q("INSERT INTO orders VALUES ('west', 'zz', NULL, 500.0, TIMESTAMP '2026-10-06 00:00:00')")
+    until(lambda: any(r["customer"] == "zz" for r in rows()), True, secs=30)
+    after = rows()
+    was = {(r["_row_id"], r["_version"]) for r in before}
+    kept_as_is = len(after) == 5 and all((r["_row_id"], r["_version"]) in was for r in after if r["customer"] != "zz")
+    # A view calling now() follows the clock, with no write: a row 3 seconds ahead counts once it's past.
+    soon = q("SELECT CAST(now() + INTERVAL '3 seconds' AS VARCHAR) AS t")[0]["t"]
+    q(f"INSERT INTO orders VALUES ('east', 'later', NULL, 1.0, TIMESTAMP '{soon}')")
+    clock_sql = "SELECT count(*) AS n FROM orders WHERE ts <= now() AND customer = 'later'"
+    q(f"CREATE MATERIALIZED VIEW clock WITH (lag = '1 second') AS {clock_sql}")
+    first = q("SELECT n FROM clock")[0]["n"]
+    clock = first == 0 and until(lambda: q("SELECT n FROM clock")[0]["n"], 1, secs=20) == 1
+    # What follows a full view takes its rows back.
+    q("CREATE MATERIALIZED VIEW top_names AS SELECT customer FROM top WHERE amount > 150")
+    q("INSERT INTO orders VALUES ('west', 'yy', NULL, 600.0, TIMESTAMP '2026-10-06 00:00:00')")
+    follows = _bykey_same(q, "top_names", "SELECT customer FROM top WHERE amount > 150", "customer") and \
+        _bykey_same(q, "top", views["top"][0], views["top"][1])
+    listed = {r["name"]: r for r in q("SELECT name, kind, follows, refresh, reason FROM pondra.flows")}
+    shown = q("SHOW CREATE MATERIALIZED VIEW asked")[0]["definition"]
+    refused = {
+        "lag": _raises_text(lambda: q("CREATE MATERIALIZED VIEW r1 WITH (lag = '1 minute') AS SELECT region, sum(amount) AS t FROM orders GROUP BY region")),
+        "incremental": _raises_text(lambda: q("CREATE MATERIALIZED VIEW r2 WITH (refresh = 'incremental') AS SELECT customer FROM orders ORDER BY amount LIMIT 3")),
+        "final": _raises_text(lambda: q("CREATE MATERIALIZED VIEW r3 WITH (refresh = 'full') AS SELECT date_bin(INTERVAL '1 day', ts) AS d, count(*) AS n FROM orders GROUP BY 1 EMIT FINAL")),
+        "nonsense": _raises_text(lambda: q("CREATE MATERIALIZED VIEW r4 WITH (refresh = 'sometimes') AS SELECT * FROM orders")),
+    }
+    stored = {name: q(f"SELECT * FROM {name} ORDER BY {by} NULLS FIRST") for name, (_, by) in views.items()}
+    node.kill()
+    node = Node(lake, A.port, tier_secs=1).start()
+    restarted = all(_close(q(f"SELECT * FROM {name} ORDER BY {by} NULLS FIRST"), stored[name]) for name, (_, by) in views.items())
+    q("INSERT INTO orders " + ORDER_ROWS.format(3001, 3400))
+    after_restart = same()
+    q("DROP MATERIALIZED VIEW top_names"); q("DROP MATERIALIZED VIEW asked")
+    q(shown)
+    again = _bykey_same(q, "asked", views["asked"][0], "region")
+    node.kill()
+    checks = {
+        "right after CREATE: each view == its query (its first run works it out)": all(made.values()),
+        "ORDER BY … LIMIT, a window, DISTINCT, a subquery over its own table, a join with a median, a global aggregate, a keyed table's median, a sum asked == ad hoc after bulk and log INSERTs and upserts": all(inserted.values()),
+        "UPDATEs and DELETEs, of the joined table alone too: == ad hoc": all(changed.values()),
+        "a row that came out the same isn't written again": kept_as_is and any(r["customer"] == "zz" for r in after),
+        "a view calling now() follows the clock with no write (lag)": clock,
+        "what follows it takes its rows back": follows,
+        "pondra.flows: refresh 'full', why, and every table it follows": all(listed[n]["refresh"] == "full" for n in FULL_VIEWS)
+            and "ORDER BY" in listed["top"]["reason"] and "window" in listed["ranks"]["reason"] and "DISTINCT" in listed["kinds"]["reason"]
+            and "twice" in listed["above"]["reason"] and "median()" in listed["by_tier"]["reason"] and "asked" in listed["asked"]["reason"]
+            and sorted(listed["by_tier"]["follows"].split(", ")) == ["orders", "tiers"] and listed["by_tier"]["kind"] == "aggregate"
+            and listed["price_med"]["follows"] == "prices" and "keyed" in listed["price_med"]["reason"],
+        "SHOW CREATE gives back what makes it (refresh = 'full' when asked)": "refresh = 'full'" in shown and again,
+        "a restart: the same rows, and it goes on": restarted and all(after_restart.values()),
+        "refused by name: a lag on an incremental view, ORDER BY … LIMIT asked incremental, EMIT FINAL run whole, an unknown way":
+            "lag" in refused["lag"] and "ORDER BY" in refused["incremental"] and "EMIT FINAL" in refused["final"] and "'full'" in refused["nonsense"],
+        "three nodes, rows written on followers through a leader kill: == ad hoc on every node": full_on_three(),
+    }
+    ok = all(checks.values())
+    print(json.dumps({"refreshed": checks, "ok": ok}, indent=1))
+    if not ok:
+        print(json.dumps({"made": made, "inserted": inserted, "changed": changed, "before": before, "after": after, "first": first, "listed": listed,
+                          "shown": shown, "refused": refused}, indent=1, default=str)[-12000:])
+    return "views run whole again: ORDER BY/LIMIT, windows, DISTINCT, subqueries, joins, now(): == ad hoc, changes, restart, three nodes"
+
+
 def bykey():
     """Materialized views kept by key (ADR-056): median, count(DISTINCT …), string_agg, array_agg,
     HAVING, a NULL key and an expression key, and a sum asked to be kept by key. Each == its query
@@ -1860,23 +2010,27 @@ def bykey():
         _bykey_same(q, "regulars", views["regulars"][0], "region")
     listed = {r["name"]: r for r in q("SELECT name, kind, refresh, reason FROM pondra.flows")}
     shown = q("SHOW CREATE MATERIALIZED VIEW totals")[0]["definition"]
+    by_key = " WITH (refresh = 'by key') AS "
     refused = {
-        "order": _raises_text(lambda: q("CREATE MATERIALIZED VIEW r1 AS SELECT region, median(amount) AS m FROM orders GROUP BY region ORDER BY m LIMIT 2")),
-        "join": _raises_text(lambda: q("CREATE MATERIALIZED VIEW r2 AS SELECT o.region, median(p.amount) AS m FROM orders o JOIN prices p ON o.amount = p.id GROUP BY o.region")),
-        "now": _raises_text(lambda: q("CREATE MATERIALIZED VIEW r3 AS SELECT region, median(amount) AS m FROM orders WHERE ts < now() GROUP BY region")),
-        "keyed": _raises_text(lambda: q("CREATE MATERIALIZED VIEW r4 AS SELECT amount, count(DISTINCT id) AS n FROM prices GROUP BY amount")),
-        "unselected": _raises_text(lambda: q("CREATE MATERIALIZED VIEW r5 AS SELECT median(amount) AS m FROM orders GROUP BY region")),
+        "order": _raises_text(lambda: q("CREATE MATERIALIZED VIEW r1" + by_key + "SELECT region, median(amount) AS m FROM orders GROUP BY region ORDER BY m LIMIT 2")),
+        "join": _raises_text(lambda: q("CREATE MATERIALIZED VIEW r2" + by_key + "SELECT o.region, median(p.amount) AS m FROM orders o JOIN prices p ON o.amount = p.id GROUP BY o.region")),
+        "now": _raises_text(lambda: q("CREATE MATERIALIZED VIEW r3" + by_key + "SELECT region, median(amount) AS m FROM orders WHERE ts < now() GROUP BY region")),
+        "keyed": _raises_text(lambda: q("CREATE MATERIALIZED VIEW r4" + by_key + "SELECT amount, count(DISTINCT id) AS n FROM prices GROUP BY amount")),
+        "unselected": _raises_text(lambda: q("CREATE MATERIALIZED VIEW r5" + by_key + "SELECT median(amount) AS m FROM orders GROUP BY region")),
         "incremental": _raises_text(lambda: q("CREATE MATERIALIZED VIEW r6 WITH (refresh = 'incremental') AS SELECT region, median(amount) AS m FROM orders GROUP BY region")),
-        "max of it": _raises_text(lambda: q("CREATE MATERIALIZED VIEW r7 AS SELECT region, max(customers) AS m FROM regulars GROUP BY region")),
         "final": _raises_text(lambda: q("CREATE MATERIALIZED VIEW r8 WITH (refresh = 'by key') AS SELECT date_bin(INTERVAL '1 day', ts) AS d, count(*) AS n FROM orders GROUP BY 1 EMIT FINAL")),
     }
+    # (a max over a view kept by key can't take its rows back from the rows alone: kept by key too)
+    q("CREATE MATERIALIZED VIEW most AS SELECT region, max(customers) AS m FROM regulars GROUP BY region")
+    most = _bykey_same(q, "most", "SELECT region, max(customers) AS m FROM regulars GROUP BY region", "region") and \
+        q("SELECT refresh FROM pondra.flows WHERE name = 'most'")[0]["refresh"] == "by key"
     stored = {name: q(f"SELECT * FROM {name} ORDER BY {by} NULLS FIRST") for name, (_, by) in views.items()}
     node.kill()
     node = Node(lake, A.port, tier_secs=1).start()
     restarted = all(_close(q(f"SELECT * FROM {name} ORDER BY {by} NULLS FIRST"), stored[name]) for name, (_, by) in views.items())
     q("INSERT INTO orders " + ORDER_ROWS.format(3001, 3400))
     after_restart = same()
-    q("DROP MATERIALIZED VIEW sizes"); q("DROP MATERIALIZED VIEW busy")
+    q("DROP MATERIALIZED VIEW sizes"); q("DROP MATERIALIZED VIEW busy"); q("DROP MATERIALIZED VIEW most")
     q("DROP MATERIALIZED VIEW totals")
     q(shown)
     again = _bykey_same(q, "totals", views["totals"][0], "region")
@@ -1892,10 +2046,10 @@ def bykey():
             and listed["busy"]["refresh"] == "incremental",
         "SHOW CREATE gives back what makes it (refresh = 'by key' when asked)": "refresh = 'by key'" in shown and again,
         "a restart: the same rows, and it goes on": restarted and all(after_restart.values()),
-        "refused by name: ORDER BY across groups, a join, now(), a keyed source, a key not selected, incremental asked, a max over one, EMIT FINAL":
+        "by key asked, refused by name: ORDER BY across groups, a join, now(), a keyed source, a key not selected, incremental asked, EMIT FINAL; a max over one is kept by key":
             "ORDER BY" in refused["order"] and "one table" in refused["join"] and "now()" in refused["now"] and "keyed" in refused["keyed"]
-            and "every GROUP BY" in refused["unselected"] and "needs every row" in refused["incremental"] and "kept by key" in refused["max of it"]
-            and "EMIT FINAL" in refused["final"],
+            and "isn't selected" in refused["unselected"] and "needs every row" in refused["incremental"] and "EMIT FINAL" in refused["final"]
+            and all("refresh = 'full'" in refused[k] for k in ("order", "join", "now", "keyed", "unselected")) and most,
         "three nodes, rows written on followers through a leader kill: == ad hoc on every node": bykey_on_three(),
     }
     ok = all(checks.values())
@@ -2109,9 +2263,11 @@ def schemas():
     got = until(lambda: q("SELECT k, n, s FROM dbo.per_k ORDER BY k"), want, 30)
     checks["CREATE MATERIALIZED VIEW: the rows already there and those written after; WITH (window …) emits to _final; bad options refused"] = got == want and len(want) == 3 \
         and n("per_min_final") == 0 and err("CREATE MATERIALIZED VIEW m2 WITH (windw = 'w') AS SELECT k FROM t") is not None
-    # a view of a view (a flow, ADR-036): of a GROUP BY view's partial rows only a rollup; of a _final, as of a table
+    # a view of a view (a flow, ADR-036): of a GROUP BY view's partial rows a rollup, or run whole (ADR-057); of a _final, as of a table
     over = [err("CREATE MATERIALIZED VIEW m3 AS SELECT k FROM dbo.per_k"), err("CREATE MATERIALIZED VIEW m4 AS SELECT w FROM per_min_final")]
-    checks["a materialized view of a GROUP BY view that isn't a rollup is refused, saying what to do; of a _final, made"] = "GROUP BY view" in str(over[0]) and over[1] is None
+    checks["a materialized view of a GROUP BY view that isn't a rollup runs whole; of a _final, made"] = over == [None, None] \
+        and q("SELECT k FROM m3 ORDER BY k") == q("SELECT k FROM dbo.per_k ORDER BY k") and q("SELECT refresh FROM pondra.flows WHERE name = 'm3'") == [{"refresh": "full"}]
+    q("DROP MATERIALIZED VIEW m3")
     # clients see the schemas
     with psycopg.connect(f"host=127.0.0.1 port={A.port + 10} dbname={me} user=x", autocommit=True) as c:
         spaces = {r[0] for r in c.execute("SELECT nspname FROM pg_catalog.pg_namespace").fetchall()}
@@ -6333,10 +6489,15 @@ def flows():
     checks = {}
     refused = err("INSERT INTO orders VALUES (1, 'r0', 'u1', 500000, 'paid'), (2, 'r0', 'u1', 5, 'paid')", ports[1])
     checks["a row a FAIL expectation refuses fails its INSERT, naming it"] = bool(refused) and 'violates check constraint "small"' in refused
+    # (what a GROUP BY view's partial rows can't keep as they come runs its query again, ADR-057)
+    whole = {
+        "rich": ("SELECT * FROM gold WHERE total > 100", "region, buyer NULLS FIRST"),
+        "buyers": ("SELECT region, count(*) AS n FROM gold GROUP BY region", "region"),
+        "above5": ("SELECT region, sum(total) AS t FROM gold WHERE total > 5 GROUP BY region", "region"),
+    }
+    made = {v: err(f"CREATE MATERIALIZED VIEW {v} AS {s}") for v, (s, _) in whole.items()}
+    checks["a view of a GROUP BY view's partial rows, count(*) of them or a WHERE on their totals: made, run whole"] = not any(made.values())
     say = {
-        "a view of a GROUP BY view's partial rows, without GROUP BY": err("CREATE MATERIALIZED VIEW bad1 AS SELECT * FROM gold WHERE total > 100"),
-        "count(*) of a GROUP BY view's rows": err("CREATE MATERIALIZED VIEW bad2 AS SELECT region, count(*) AS n FROM gold GROUP BY region"),
-        "a WHERE on a GROUP BY view's totals": err("CREATE MATERIALIZED VIEW bad3 AS SELECT region, sum(total) AS t FROM gold WHERE total > 5 GROUP BY region"),
         "expectations on a GROUP BY view": err("CREATE MATERIALIZED VIEW bad4 (CONSTRAINT c CHECK (n > 0)) AS SELECT region, count(*) AS n FROM orders GROUP BY region"),
         "a FAIL expectation rows already break": err("CREATE MATERIALIZED VIEW bad5 (CONSTRAINT c CHECK (amount > 0)) AS SELECT id, amount FROM orders"),
         "dropping a view others follow": err("DROP MATERIALIZED VIEW silver"),
@@ -6363,19 +6524,24 @@ def flows():
                 out[f"{view} == its query over orders (:{port})"] = until(lambda: q(got, port), e, secs=30) == e
         return out
     checks.update(same())
+    def ran():
+        return all(until(lambda: q(f"SELECT * FROM {v} ORDER BY {o}", p), q(f"{s} ORDER BY {o}", p), secs=30) == q(f"{s} ORDER BY {o}", p) for v, (s, o) in whole.items() for p in ports)
+    checks["…== their queries over gold, on every node"] = ran()
     sent_all = sum(sent)
     checks["every row sent is there once, beside the refused INSERT"] = q("SELECT count(*) AS n FROM orders")[0]["n"] == sent_all
     ex = {r["expectation"]: r for r in q("SELECT * FROM pondra.expectations ORDER BY view, expectation")}
     bad = q("SELECT count(*) FILTER (WHERE amount <= 0) AS neg, count(*) FILTER (WHERE buyer IS NULL) AS nobuyer FROM orders WHERE status <> 'test'")[0]
     checks["pondra.expectations counts each expectation's failed rows, filled and streamed"] = ex.get("positive", {}).get("failed_rows") == bad["neg"] and ex.get("has_buyer", {}).get("failed_rows") == bad["nobuyer"] and ex.get("small", {}).get("on_violation") == "fail"
-    pipe = {r["name"]: r for r in q("SELECT name, follows, kind FROM pondra.flows")}
+    pipe = {r["name"]: r for r in q("SELECT name, follows, kind, refresh FROM pondra.flows")}
     checks["pondra.flows: orders → silver → gold → platinum, silver → big"] = [pipe.get(n, {}).get("follows") for n in ("silver", "gold", "platinum", "big")] == ["orders", "silver", "gold", "silver"] and pipe["gold"]["kind"] == "aggregate"
+    checks["…and gold → the views run whole, so listed"] = all(pipe.get(v, {}).get("follows") == "gold" and pipe[v].get("refresh") == "full" for v in whole)
     # Changes of orders flow down the flow, in the same commit.
     q("UPDATE orders SET amount = amount + 7 WHERE id % 10 = 0")
     q("UPDATE orders SET amount = -amount WHERE id % 17 = 0")  # (in and out of silver's expectation)
     q("DELETE FROM orders WHERE id % 13 = 0")
     checks.update({k + ", after UPDATE and DELETE": v for k, v in same().items()})
-    checks["a view of a view made again after its flow is dropped from the end"] = all(err(f"DROP MATERIALIZED VIEW {v}") is None for v in ("platinum", "big", "gold", "silver"))
+    checks["…and the views run whole, after UPDATE and DELETE"] = ran()
+    checks["a view of a view made again after its flow is dropped from the end"] = all(err(f"DROP MATERIALIZED VIEW {v}") is None for v in (*whole, "platinum", "big", "gold", "silver"))
     # History per key (SCD type 2, ADR-036 §8): versions in any order, a delete ending a key.
     q("CREATE TABLE customer_changes (id BIGINT, name VARCHAR, city VARCHAR, op VARCHAR, at BIGINT)")
     q("INSERT INTO customer_changes VALUES (1, 'ann', 'paris', 'U', 1), (1, 'ann', 'rome', 'U', 3), (2, 'bob', 'nyc', 'U', 1)")
@@ -6389,7 +6555,12 @@ def flows():
     hist = lambda port: [{k: r.get(k) for k in ("id", "city", "__start_at", "__end_at")} for r in q("SELECT id, city, __start_at, __end_at FROM customers_history ORDER BY id, __start_at", port)]  # (JSON leaves out NULLs)
     checks["a history view (SCD type 2): every version with __start_at and __end_at, a late one in its place, a delete ending its key, on every node"] = \
         all(until(lambda: hist(p), want_h, secs=20) == want_h for p in ports) and q("SELECT id, city FROM customers_history WHERE __end_at IS NULL ORDER BY id") == [{"id": 1, "city": "rome"}, {"id": 3, "city": "lima"}]
-    checks["refused: a materialized view of a history view (its ends are worked out as it is read)"] = "history view" in (err("CREATE MATERIALIZED VIEW h2 AS SELECT id FROM customers_history") or "")
+    q("CREATE MATERIALIZED VIEW h2 AS SELECT id, city FROM customers_history WHERE __end_at IS NULL")
+    current = q("SELECT id, city FROM customers_history WHERE __end_at IS NULL ORDER BY id")
+    checks["a materialized view of a history view runs whole (its ends are worked out as it is read)"] = \
+        q("SELECT id, city FROM h2 ORDER BY id") == current and "history view" in q("SELECT reason FROM pondra.flows WHERE name = 'h2'")[0]["reason"]
+    q("INSERT INTO customer_changes VALUES (3, 'cy', 'kyiv', 'U', 6)")
+    checks["…and follows it"] = until(lambda: q("SELECT id, city FROM h2 ORDER BY id"), [{"id": 1, "city": "rome"}, {"id": 3, "city": "kyiv"}], secs=20) == [{"id": 1, "city": "rome"}, {"id": 3, "city": "kyiv"}]
     # A view's or a task's plan is kept from one write to the next (src/fresh.rs, invariant 200):
     # nothing of the write it was made for stays in it, neither its count (DataFusion answers a
     # count(*) from exact statistics: 1, 1, 1, 1, 1) nor its time (now() is folded as it plans).
@@ -6401,7 +6572,7 @@ def flows():
         time.sleep(0.3)
     checks["a kept plan keeps no write's count: a task counting each write's new rows adds up to every row"] = until(lambda: q("SELECT sum(n) AS n FROM counted")[0].get("n"), 15, secs=20) == 15
     checks["…nor its time: now() in a view differs from write to write"] = q("SELECT count(DISTINCT seen) AS t FROM stamped")[0]["t"] > 1
-    info = {"sent": sent_all, "refused": (refused or "")[:200], "said": {k: (v or "")[:160] for k, v in say.items()}, "expectations": ex}
+    info = {"sent": sent_all, "refused": (refused or "")[:200], "said": {k: (v or "")[:160] for k, v in say.items()}, "made": made, "expectations": ex}
     a.kill(); b.kill()
     ok = all(checks.values())
     print(json.dumps({"flows": checks, "ok": ok, "info": info}, indent=1, default=str))
@@ -7808,7 +7979,7 @@ def friendly():
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    out = {t.__name__: t() for t in (upsert, deal, outside, clouds, kafkas, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, found, renames, workspace, server, scale, flight, users, secrets, safety, versions, stopped, flows, begin, doors, objects, registry, sparksql, variables, scripts, hot, minmax, history, friendly, reader, crash)}
+    out = {t.__name__: t() for t in (upsert, deal, outside, clouds, kafkas, tiering, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, found, renames, workspace, server, scale, flight, users, secrets, safety, versions, stopped, flows, begin, doors, objects, registry, sparksql, variables, scripts, hot, minmax, history, friendly, reader, crash)}
     A.secs = min(A.secs, 20)
     out["load"] = load()
     print(json.dumps(out, indent=1))
@@ -7816,7 +7987,7 @@ def all_tests():
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "found", "renames", "workspace", "server", "scale", "flight", "users", "secrets", "safety", "versions", "stopped", "flows", "begin", "doors", "objects", "registry", "sparksql", "variables", "scripts", "tasks", "hot", "minmax", "history", "friendly", "load", "all"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "found", "renames", "workspace", "server", "scale", "flight", "users", "secrets", "safety", "versions", "stopped", "flows", "begin", "doors", "objects", "registry", "sparksql", "variables", "scripts", "tasks", "hot", "minmax", "history", "friendly", "load", "all"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -7828,7 +7999,7 @@ if __name__ == "__main__":
     ap.add_argument("--flush-ms", type=int, default=250)
     A = ap.parse_args()
     try:
-        {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "safety": safety, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "objects": objects, "registry": registry, "sparksql": sparksql, "variables": variables, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "friendly": friendly, "load": load, "all": all_tests}[A.mode]()
+        {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "safety": safety, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "objects": objects, "registry": registry, "sparksql": sparksql, "variables": variables, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "friendly": friendly, "load": load, "all": all_tests}[A.mode]()
     except BaseException as e:  # a failure ends the run, though threads may still wait on a node (crash's producers retry for ever)
         code = e.code if isinstance(e, SystemExit) else 1
         if not isinstance(e, SystemExit):

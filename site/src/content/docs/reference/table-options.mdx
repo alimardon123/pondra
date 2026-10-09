@@ -133,8 +133,8 @@ two streams the older way. An option the view doesn't know is an error that list
 | `lateness` | a time, such as `'10 seconds'` | `'0 seconds'` | `EMIT FINAL`: how far out of order a row may arrive and still count |
 | `idle` | a time | none | `EMIT FINAL`: once no newer row has come for this long, the watermark moves on with the clock |
 | `emit` | `'final'` | | the same as `EMIT FINAL` at the statement's end, for clients that build the statement |
-| `refresh` | `'incremental'` or `'by key'` | chosen | how the view is kept current: from each write's rows, in its commit, or by working out again the groups a commit touched, right after it ([kept by key](/pondra/guides/streaming/#medians-and-distinct-counts-kept-by-key)). Unset, a view is incremental when it can be and by key when it needs every row of a group (`median`, `count(DISTINCT …)`) |
-| `lag` | a time, such as `'1 minute'` | none | a view kept by key works its groups out at most once this long |
+| `refresh` | `'incremental'`, `'by key'` or `'full'` | chosen | how the view is kept current: from each write's rows, in its commit; by working out again the groups a commit touched, right after it ([kept by key](/pondra/guides/streaming/#medians-and-distinct-counts-kept-by-key)); or by running its query whole again ([run whole](/pondra/guides/streaming/#anything-else-run-whole)). Unset, the first of these that can keep it |
+| `lag` | a time, such as `'1 minute'` | none | a view kept by key or run whole runs at most once this long; one that calls `now()` runs this often (a minute unless given). Refused on an incremental view |
 | `window` | column name | | the view's window-start column, made by `date_bin(…)` in `GROUP BY`; each window goes to `{view}_final` once, when it is final |
 | `size_secs` | seconds | 60 | how long a window is |
 | `slide_secs` | seconds | none | a new window every this many seconds: a divisor of `size_secs`, less than it. Make the view's `date_bin` this long |

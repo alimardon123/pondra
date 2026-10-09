@@ -823,7 +823,6 @@ Pondra refuses these by name, so a statement never runs and quietly does somethi
 | `CREATE INDEX` | not supported: files carry their columns' ranges, and `cluster_by` orders them |
 | `SAVEPOINT`, `ROLLBACK TO` | refused: a transaction commits or rolls back whole |
 | `CREATE`, `ALTER`, `DROP` inside `BEGIN` … `COMMIT` | refused (`0A000`): run them outside the transaction |
-| a materialized view of a `GROUP BY` view that isn't a rollup | refused, saying why ([Flows](/pondra/guides/flows/)) |
 | `COPY … TO` a path on the node's machine | refused unless the program that started the node sends it |
 | `COPY … TO` a folder inside a lake | refused; a lake's files are its own |
 | Python functions and procedures on a node started without `--python` | refused, with the flag to use |

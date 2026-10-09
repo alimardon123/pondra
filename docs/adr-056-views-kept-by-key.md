@@ -27,7 +27,7 @@ touches.
    refused as before, with why. `WITH (refresh = 'by key')` asks for it on any such view (a sum
    too), `WITH (refresh = 'incremental')` refuses rather than fall back, and `WITH (lag = '1
    minute')` runs it at most once a lag. `pondra.flows` gains `refresh` and `reason`.
-2. **A run, after commits, on the leader** (`bykey::run_all`, beside stream joins). The groups the
+2. **A run, after commits, on the leader** (`rerun::run_all`, beside stream joins). The groups the
    commits since its last run touched are the view's `GROUP BY` over the rows they changed: what
    they wrote (`_version`), the old versions they replaced or deleted (`{t}$deleted`), and the rows
    other engines' file commits took out. Those groups are worked out again from the source as of
@@ -38,7 +38,7 @@ touches.
    table that changes as `UPDATE` changes one (ADR-020): the old rows of the touched groups go to
    `{view}$deleted`. A row that came out the same stays; a group that came out different keeps its
    row's id, so the change feed shows an update; an emptied group's row goes. Both parts are
-   committed under the producer `bykey:{view}` (and `…:deleted`), seq the run's commit and `prev`
+   committed under the producer `rerun:{view}` (and `…:deleted`), seq the run's commit and `prev`
    the last, so a run another leader already made is refused whole.
 4. **Light on the leader.** A run is a task of its own and never holds up the leader's other work.
    A view runs again only once as long as its last run took has passed (and its `lag`). A run

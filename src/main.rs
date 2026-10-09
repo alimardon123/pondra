@@ -7,7 +7,7 @@ mod ai;
 mod avro;
 mod branch;
 mod bridge;
-mod bykey;
+mod rerun;
 mod asof;
 mod auth;
 mod budget;

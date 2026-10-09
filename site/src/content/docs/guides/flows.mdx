@@ -105,12 +105,13 @@ its totals aren't there to check. Put them on the view before it.
 - **A view of a `GROUP BY` view** sees that view's partial rows (a few per key, combined as you
   read them), not its totals. So it must combine them the same way, a **rollup**: `GROUP BY` some of
   the view's keys, a `WHERE` on those keys only, `sum()` of its sums and counts, `min()` of its
-  mins, `max()` of its maxes. Anything else is refused, saying why. To filter or reshape the
-  totals, make a stored view (`CREATE VIEW … AS SELECT … FROM gold WHERE total > 100`), which reads
-  them as they are when asked.
-- **A view of a view with `avg`, `stddev`, `HAVING` or an expression over its aggregates** is
-  refused: such a view works its answers out as it is read, so there is nothing to follow. Make a
-  stored view of it, or a view of its own source.
+  mins, `max()` of its maxes. Anything else (`SELECT * FROM gold WHERE total > 100`) runs its
+  query whole again after each change instead, as `pondra.flows` says
+  ([Streaming](/pondra/guides/streaming/#anything-else-run-whole)); a stored view
+  (`CREATE VIEW`) reads the totals as they are when asked, and costs nothing until then.
+- **A view of a view with `avg`, `stddev`, `HAVING` or an expression over its aggregates**, or of a
+  history view, runs whole too: such a view works its answers out as it is read, so there are no
+  rows to follow.
 - A flow is dropped from its end: `DROP MATERIALIZED VIEW silver` is refused while gold
   follows it.
 

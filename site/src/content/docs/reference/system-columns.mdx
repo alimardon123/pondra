@@ -286,10 +286,10 @@ DROP TABLE IF EXISTS scratch;
 | Column | Meaning |
 |---|---|
 | `name` | the view |
-| `follows` | the table or view whose rows it follows (a stream join's two tables) |
+| `follows` | the table or view whose rows it follows (a stream join's two tables, every table a view run whole reads) |
 | `kind` | `rows` (no `GROUP BY`), `aggregate`, `window`, `sessions`, `stream join` or `history` |
-| `refresh` | `incremental` (from each write's rows, in its commit) or `by key` (the groups a commit touched, worked out again right after it) |
-| `reason` | why a view is kept by key, or null |
+| `refresh` | `incremental` (from each write's rows, in its commit), `by key` (the groups a commit touched, worked out again right after it) or `full` (its query run whole again) |
+| `reason` | why a view is kept by key or run whole, or null |
 | `reads` | other tables its query reads, or null |
 | `expectations` | how many it has |
 | `late_rows` | an `EMIT FINAL` view's rows that came for a group already kept, or null |

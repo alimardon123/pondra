@@ -633,11 +633,11 @@ pub async fn settle(lake: &Lake, d: &Ddl, me: &str) -> Result<()> {
         let name = local(lake, name).unwrap_or_default();
         let open = crate::once::open(&name);
         let name = if lake.cat.get::<crate::views::View>(&crate::views::view_key(&open)).await?.is_some() { open } else { name }; // (EMIT FINAL's)
-        let (filled, worked) = (crate::store::producer_key(&format!("fill:{name}")), crate::store::producer_key(&crate::bykey::producer(&name)));
+        let (filled, worked) = (crate::store::producer_key(&format!("fill:{name}")), crate::store::producer_key(&crate::rerun::producer(&name)));
         for _ in 0..12_000 {
             let view = lake.cat.get::<crate::views::View>(&crate::views::view_key(&name)).await?;
             let Some(view) = view else { break };
-            let ready = match (&view.fill, &view.bykey) {
+            let ready = match (&view.fill, &view.rerun) {
                 (Some(_), _) => &filled,
                 (None, Some(_)) => &worked, // (kept by key: its first run works every group out)
                 (None, None) => break,
@@ -645,7 +645,7 @@ pub async fn settle(lake: &Lake, d: &Ddl, me: &str) -> Result<()> {
             if lake.cat.get::<u64>(ready).await?.is_some() {
                 break;
             }
-            if let Some(e) = view.bykey.as_ref().and_then(|_| crate::bykey::failing(lake, &name)) {
+            if let Some(e) = view.rerun.as_ref().and_then(|_| crate::rerun::failing(lake, &name)) {
                 bail!("{name} is made, but its first run fails: {e}");
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
