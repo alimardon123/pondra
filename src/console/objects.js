@@ -129,6 +129,7 @@ export function tableMenu(at, t) {
     table ? addColumn(t) : null,
     kind !== 'materialized view' ? { label: 'Rename…', icon: 'pencil', run: async () => { const n = await name('Rename', `The new name of ${t.q}`, t.t); if (n && n !== t.t) exec(`ALTER ${word === 'VIEW' ? 'VIEW' : 'TABLE'} ${t.q} RENAME TO ${ident(n)}`, `Renamed to ${n}`); } } : null,
     access({ kind: 'table', name: t.s === 'public' ? t.t : `${t.s}.${t.t}`, label: t.q }, t.c === home()),
+    (table || kind === 'materialized view') && t.c === home() ? { label: 'Share with another company…', icon: 'user', run: () => import('./share.js').then(m => m.share(t)) } : null,
     { label: 'Refresh', icon: 'refresh', run: () => H.refresh() }, ...copyName([t.c, t.s, t.t], t.q), { label: 'Copy the column names', run: () => copyText(cols(t).map(c => ident(c.n)).join(', '), 'Copied the column names') }, { label: 'Copy as Python', run: () => copyText(`db.table("${t.q}")`, 'Copied') }, '-',
     table ? { label: 'Truncate…', run: () => danger(`Delete every row of ${t.q}? This can't be undone.`, `TRUNCATE TABLE ${t.q}`, `Emptied ${t.q}`) } : null,
     { label: 'Drop…', icon: 'trash', run: () => danger(`Drop ${t.q}?${kind === 'files' ? ' (its files stay)' : ' This can\'t be undone.'}`, `DROP ${word} ${t.q}`, `Dropped ${t.q}`) }, ...more(kind === 'files' ? 'view' : kind.replace(' ', '_'), t)]);

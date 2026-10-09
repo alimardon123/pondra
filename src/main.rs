@@ -40,6 +40,8 @@ mod kafka_client;
 mod live;
 mod serve;
 mod settings;
+mod shares;
+mod sharing;
 mod shell;
 mod cluster;
 mod console;
@@ -86,6 +88,7 @@ mod temp;
 mod tier;
 mod udf;
 mod users;
+mod vend;
 mod vars;
 mod views;
 mod write;
@@ -353,7 +356,12 @@ fn main() {
     // get 2 MB, which procedures calling procedures 16 deep overflowed in the release build (only
     // the pages a thread touches are memory).
     let work = std::thread::Builder::new().name("pondra".into()).stack_size(8 << 20).spawn(|| {
-        tokio::runtime::Builder::new_multi_thread().enable_all().thread_stack_size(8 << 20).build().expect("a runtime").block_on(async {
+        // Blocking threads (file reads and writes, the SSD tier) go after a second idle, not tokio's
+        // ten: tiering every 10 s kept ~70 of them alive on 4 cores, and each kept the memory its
+        // biggest piece of work had used. A node under steady writes held 1 GB of its own after ten
+        // minutes, growing 60 MB a minute; with this, 250 MB, growing 7 (soak.py).
+        let keep = std::time::Duration::from_secs(1);
+        tokio::runtime::Builder::new_multi_thread().enable_all().thread_stack_size(8 << 20).thread_keep_alive(keep).build().expect("a runtime").block_on(async {
             // An error is said in words, its causes after it: a backtrace (RUST_BACKTRACE) is for panics.
             if let Err(e) = run().await {
                 eprintln!("Error: {}", ext::said(&e));
@@ -455,6 +463,7 @@ async fn run() -> anyhow::Result<()> {
             let tr = |w: &str| store::trace(w, t_start);
             let listen = addr.clone();
             let addr = advertise.unwrap_or(addr); // (how others reach it: its cluster name)
+            sharing::set_endpoint(&addr); // (where a recipient's profile points: `sharing.rs`)
             let cluster = cluster::Cluster::join(&store, &addr, reader).await?;
             tr("the lease");
             let leader = cluster.is_leader();

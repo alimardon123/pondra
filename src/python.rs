@@ -184,6 +184,25 @@ pub enum Use {
     Procedure { nested: bool },
 }
 
+tokio::task_local! {
+    /// Set in what a Python procedure, a session's cell or a file's run calls while it holds one of
+    /// the node's slots for them (its calls back come with its lent token: `server::sql`): those
+    /// take none, since they would wait for their caller's. Anything else takes one, however deep
+    /// it is called (a SQL procedure calling a Python one took none, so there was no limit).
+    static HELD: ();
+}
+
+/// Does the work under way run for one that holds a procedure's slot?
+pub fn holding() -> bool { HELD.try_with(|_| ()).is_ok() }
+
+/// `f`, run for one that holds a procedure's slot if `yes`.
+pub async fn holder<F: std::future::Future>(yes: bool, f: F) -> F::Output {
+    match yes {
+        true => HELD.scope((), f).await,
+        false => f.await,
+    }
+}
+
 /// The workers of one set of packages (`WITH (packages = …)`; most routines: none).
 struct Pool {
     path: Option<String>, // where its packages are (PYTHONPATH), if any
@@ -237,6 +256,9 @@ async fn install(packages: &str) -> Result<String> {
 fn which(name: &str) -> Option<std::path::PathBuf> {
     std::env::var_os("PATH").and_then(|paths| std::env::split_paths(&paths).map(|p| p.join(name)).find(|p| p.is_file()))
 }
+
+/// The most of one line of a worker's standard error kept.
+const LINE: usize = 4096;
 
 /// A short, stable name for a text (FNV-1a).
 fn fnv(s: &str) -> u64 { s.bytes().fold(0xcbf29ce484222325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3)) }
@@ -296,14 +318,31 @@ async fn spawn(path: Option<&str>) -> Result<Worker> {
     if let Some(err) = child.stderr.take() {
         let said = said.clone();
         tokio::spawn(async move {
-            let mut lines = BufReader::new(err).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                eprintln!("{line}");
-                let mut s = said.lock().unwrap();
-                if s.len() == 20 {
-                    s.pop_front();
+            // Read to its end whatever it writes (bytes that aren't UTF-8, a line with no end): a
+            // reader that stopped would leave its pipe full, and the worker stuck writing to it.
+            let (mut err, mut line) = (BufReader::new(err), Vec::new());
+            loop {
+                let Ok(buf) = err.fill_buf().await else { break };
+                let (ends, done) = (buf.iter().position(|&b| b == b'\n'), buf.is_empty());
+                let took = ends.map_or(buf.len(), |i| i + 1);
+                line.extend_from_slice(&buf[..took.min(LINE.saturating_sub(line.len()))]); // (a line kept to its first 4 KB)
+                err.consume(took);
+                if ends.is_none() && !done {
+                    continue;
                 }
-                s.push_back(line);
+                let text = String::from_utf8_lossy(&line).trim_end().to_string();
+                line.clear();
+                if !text.is_empty() {
+                    eprintln!("{text}");
+                    let mut s = said.lock().unwrap();
+                    if s.len() == 20 {
+                        s.pop_front();
+                    }
+                    s.push_back(text);
+                }
+                if done {
+                    break;
+                }
             }
         });
     }
@@ -369,11 +408,15 @@ async fn put(w: &mut Worker, bytes: &[u8]) -> Result<()> {
     Ok(w.input.write_all(bytes).await?)
 }
 
+/// One frame. Its buffer grows as its bytes come, not to the length it says: a worker whose code
+/// wrote to its standard output itself (a C library's printf) says lengths of anything.
 async fn get(w: &mut Worker) -> Result<Vec<u8>> {
     let mut n = [0u8; 4];
     w.output.read_exact(&mut n).await.context("the worker stopped")?;
-    let mut buf = vec![0u8; u32::from_le_bytes(n) as usize];
-    w.output.read_exact(&mut buf).await.context("the worker stopped")?;
+    let n = u32::from_le_bytes(n) as usize;
+    let mut buf = Vec::with_capacity(n.min(1 << 24));
+    (&mut w.output).take(n as u64).read_to_end(&mut buf).await.context("the worker stopped")?;
+    ensure!(buf.len() == n, "the worker stopped (early eof)");
     Ok(buf)
 }
 
@@ -448,6 +491,18 @@ pub async fn ask(packages: &str, kind: Use, head: Value, parts: Vec<Vec<u8>>, li
 struct Kernel {
     worker: Worker,
     busy: bool, // a cell sent, its answer not read: its request went away (the page's Stop) before it came
+    session: String,
+}
+
+/// A session's worker gone (stopped, restarted, reaped, its session ended) takes its process id out
+/// of `PIDS`, so an interrupt never reaches whatever process has that id next.
+impl Drop for Kernel {
+    fn drop(&mut self) {
+        let mut pids = PIDS.lock().unwrap();
+        if pids.get(&self.session).is_some_and(|p| Some(*p) == self.worker.child.id()) {
+            pids.remove(&self.session);
+        }
+    }
 }
 
 /// Each session's worker's process id: an interrupt reaches it while a cell holds its slot.
@@ -489,7 +544,10 @@ pub async fn ask_session(session: &str, head: Value, parts: Vec<Vec<u8>>, limit:
         e.0.clone()
     };
     let mut kernel = slot.lock().await; // (a session's cells, one after another)
-    let _slot = pool("").await?.procedures.clone().acquire_owned().await?; // (as a procedure: the node's slots for them)
+    let _slot = match holding() { // (as a procedure: the node's slots for them; a run inside one holds its caller's)
+        true => None,
+        false => Some(pool("").await?.procedures.clone().acquire_owned().await?),
+    };
     if kernel.as_mut().is_some_and(|k| k.worker.child.try_wait().ok().flatten().is_some()) {
         *kernel = None;
         notice("Python started again: this session's worker had stopped, and the variables it held are gone".into());
@@ -514,7 +572,7 @@ pub async fn ask_session(session: &str, head: Value, parts: Vec<Vec<u8>>, limit:
         if let Some(pid) = worker.child.id() {
             PIDS.lock().unwrap().insert(session.to_string(), pid);
         }
-        *kernel = Some(Kernel { worker, busy: false });
+        *kernel = Some(Kernel { worker, busy: false, session: session.to_string() });
     }
     kernel.as_mut().expect("a kernel").busy = true;
     let w = &mut kernel.as_mut().expect("a kernel").worker;

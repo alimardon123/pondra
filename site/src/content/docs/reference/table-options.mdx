@@ -340,7 +340,7 @@ id  name
 | `volatility` | `'immutable'`, `'stable'` or `'volatile'` | `'volatile'` | a query calling a volatile Python function is never answered from the result cache |
 | `packages` | `'requests, jinja2'` | none | packages the code needs; each node installs them once |
 | `entry` | function name | none | the body is a module, and this function of it runs |
-| `timeout` | seconds | 60 for a function; none for a procedure | how long one call (a function: one batch) may take before its worker is stopped |
+| `timeout` | seconds, at most a week | 60 for a function; none for a procedure | how long one call (a function: one batch) may take before its worker is stopped |
 | `cache` | `'10 minutes'`, `'30 seconds'` | none | reuse an answer for the same arguments this long, so an API or a model isn't called again |
 
 `vectorized`, `cache` and `strict` are for functions only. A Python function says what it returns,

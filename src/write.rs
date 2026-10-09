@@ -377,11 +377,19 @@ pub fn parse(sql: &str) -> Option<Stmt> {
         _ => None,
     };
     // OR REPLACE where replacing one would lose what it holds: refused, saying why.
-    static NO_REPLACE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?is)^\s*CREATE\s+OR\s+REPLACE\s+(SCHEMA|DATABASE|USER|ROLE)\b").expect("a regex"));
+    static NO_REPLACE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?is)^\s*CREATE\s+OR\s+REPLACE\s+(SCHEMA|DATABASE|USER|ROLE|SHARE|RECIPIENT)\b").expect("a regex"));
     if let Some(c) = NO_REPLACE.captures(first_word(sql)) {
         let kind = c[1].to_uppercase();
-        let lost = if matches!(kind.as_str(), "USER" | "ROLE") { "the rights given to it" } else { "everything in it" };
+        let lost = match kind.as_str() {
+            "USER" | "ROLE" => "the rights given to it",
+            "SHARE" => "its tables and grants",
+            "RECIPIENT" => "its token and the shares granted to it",
+            _ => "everything in it",
+        };
         return Some(Stmt::Invalid(format!("CREATE OR REPLACE {kind}: replacing one would drop {lost}; CREATE {kind} IF NOT EXISTS leaves one that is there as it is")));
+    }
+    if let Some(s) = crate::shares::statement(sql) {
+        return Some(s); // (CREATE SHARE and RECIPIENT, GRANT SELECT ON SHARE: `shares.rs`, before users' GRANT)
     }
     if let Some(s) = crate::users::statement(sql) {
         return Some(s); // (CREATE USER and ROLE, GRANT, REVOKE, CREATE TOKEN: `users.rs`)
@@ -519,6 +527,11 @@ pub fn parse(sql: &str) -> Option<Stmt> {
     };
     let text = parsed.to_string();
     Some(match parsed {
+        // A lake's tables keep their files in the lake: LOCATION and Hive's STORED AS were read and
+        // dropped, and the table made in the lake as if they weren't there.
+        Statement::CreateTable(c) if c.location.is_some() || c.file_format.is_some() || c.hive_formats.as_ref().is_some_and(|h| h.location.is_some() || h.storage.is_some() || h.row_format.is_some() || h.serde_properties.is_some()) => {
+            Stmt::Invalid("CREATE TABLE … LOCATION / STORED AS: a lake's tables keep their files in the lake; files elsewhere are CREATE EXTERNAL TABLE t … STORED AS PARQUET LOCATION '…' (a view of them), and a Delta or Iceberg table elsewhere is ATTACH 'url' AS name (TYPE delta | iceberg)".into())
+        }
         Statement::CreateTable(c) => Stmt::Create(Box::new(c)),
         // What a write may say that Pondra doesn't do is refused by name, never read and dropped:
         // INSERT OVERWRITE appended, and RETURNING answered no rows.
@@ -1227,6 +1240,19 @@ pub async fn seen_here(app: &crate::server::App) {
     }
 }
 
+/// A write to an attached lake is in this node's reads of it before it answers, as one here is
+/// (`seen_here`): our view of that lake follows its catalog every 250 ms, so the next statement
+/// could read it from before the write (`smoke.py`'s CREATE TABLE … AS SELECT into another
+/// database counted 0 rows, once, on macOS). It waits until the view holds the write's own mark
+/// (`mark`: its job's progress, or the table made), 5 s at most.
+async fn seen_there(other: &Lake, mark: Option<String>) {
+    let Some(key) = mark else { return };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !matches!(other.cat.get::<Value>(&key).await, Ok(Some(_))) && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
 async fn on_node_listed(app: &crate::server::App, stmt: Stmt, job: Option<String>, files: bool) -> Result<Value> {
     if let Some(out) = crate::temp::statement(app, &stmt, files).await? {
         return Ok(out); // (the session's own tables and views: on this node, in memory)
@@ -1290,6 +1316,11 @@ async fn on_node_listed(app: &crate::server::App, stmt: Stmt, job: Option<String
             _ => bail!("{}: another engine's table takes INSERTs from Pondra (UPDATE, DELETE and MERGE: not yet)", stmt.table()),
         };
     }
+    // (an UPDATE's, DELETE's or MERGE's target reaches here named as its files already: it read
+    // "no table" with a quoted path)
+    if let Some(spec) = crate::ext::spec(&stmt.table()) {
+        bail!("{}: files or another engine's table; Pondra INSERTs into a Delta or Iceberg table (UPDATE, DELETE and MERGE: not yet)", spec.urls.join(", "));
+    }
     // UPDATE and DELETE of an append table, and MERGE: the leader's (of the table's lake), from
     // one snapshot (`change.rs`). Another leader is sent what it can't read (ADR-028).
     if let Some(sql) = changes(lake, &stmt).await? {
@@ -1300,16 +1331,24 @@ async fn on_node_listed(app: &crate::server::App, stmt: Stmt, job: Option<String
         }
         let target = other.clone().unwrap_or_else(|| lake.arc());
         let (sql, sent) = crate::change::for_leader(lake, &target, &stmt.table(), &local, &sql, files).await?;
-        return match other {
-            None => post(&app.cluster.leader.addr, &Request::Change(sql, job, sent)).await,
-            Some(o) => deliver(&o.url, Some(Some(Request::Change(sql, job.clone(), sent))), &stmt, &job, false).await,
-        };
+        let Some(o) = other else { return post(&app.cluster.leader.addr, &Request::Change(sql, job, sent)).await };
+        let out = deliver(&o.url, Some(Some(Request::Change(sql, job.clone(), sent))), &stmt, &job, false).await?;
+        seen_there(&o, Some(producer_key(&format!("sql:{job}")))).await;
+        return Ok(out);
     }
     // A table of an attached lake: the work runs here, that lake's leader records it.
     let (other, table) = crate::ddl::resolve(lake, &stmt.table()).await?;
     if let Some(other) = other {
         let req = prepare(lake, &other, &table, &stmt, &job, files).await?;
-        return deliver(&other.url, Some(req), &stmt, &job, false).await;
+        let mark = match &req {
+            Some(Request::Files(f)) => Some(producer_key(&format!("job:{}", f.job))),
+            Some(Request::Flush(_)) => Some(producer_key(&format!("sql:{job}"))),
+            Some(Request::Table(name, _)) => Some(table_key(name)),
+            _ => None,
+        };
+        let out = deliver(&other.url, Some(req), &stmt, &job, false).await?;
+        seen_there(&other, mark).await;
+        return Ok(out);
     }
     let stmt = stmt.on(table.clone());
     match &stmt {

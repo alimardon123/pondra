@@ -134,11 +134,12 @@ pub fn statement(sql: &str) -> Option<crate::write::Stmt> {
     })
 }
 
-/// SQL's tokens, without spaces and comments (so quoting is SQL's, not a pattern's).
-struct Words(Vec<W>);
+/// SQL's tokens, without spaces and comments (so quoting is SQL's, not a pattern's); `shares.rs`
+/// reads its statements with them too.
+pub(crate) struct Words(pub(crate) Vec<W>);
 
 #[derive(Clone, Debug)]
-enum W {
+pub(crate) enum W {
     Word(String, bool), // (its text as SQL resolves it, and whether it was quoted)
     Str(String),
     Num(String),
@@ -146,7 +147,7 @@ enum W {
 }
 
 impl W {
-    fn word(&self) -> String {
+    pub(crate) fn word(&self) -> String {
         match self {
             W::Word(w, false) => w.clone(),
             _ => String::new(),
@@ -155,7 +156,7 @@ impl W {
 }
 
 impl Words {
-    fn of(sql: &str) -> Option<Words> {
+    pub(crate) fn of(sql: &str) -> Option<Words> {
         use datafusion::sql::sqlparser::{dialect::GenericDialect, tokenizer::{Token, Tokenizer}};
         let tokens = Tokenizer::new(&GenericDialect {}, sql).tokenize().ok()?;
         let mut out = vec![];
@@ -178,25 +179,25 @@ impl Words {
         out.reverse(); // (taken from the end: the next is the last)
         Some(Words(out))
     }
-    fn peek_word(&self) -> Option<String> { self.0.last().map(|w| w.word()) }
-    fn next(&mut self) -> Option<W> { self.0.pop() }
+    pub(crate) fn peek_word(&self) -> Option<String> { self.0.last().map(|w| w.word()) }
+    pub(crate) fn next(&mut self) -> Option<W> { self.0.pop() }
     /// The next word, if it is `w` (taken).
-    fn is(&mut self, w: &str) -> bool {
+    pub(crate) fn is(&mut self, w: &str) -> bool {
         let yes = self.peek_word().as_deref() == Some(w);
         if yes {
             self.0.pop();
         }
         yes
     }
-    fn expect(&mut self, w: &str) -> Result<()> { if self.is(w) { Ok(()) } else { bail!("expected {} {}", w.to_uppercase(), self.near()) } }
-    fn sym(&mut self, c: char) -> bool {
+    pub(crate) fn expect(&mut self, w: &str) -> Result<()> { if self.is(w) { Ok(()) } else { bail!("expected {} {}", w.to_uppercase(), self.near()) } }
+    pub(crate) fn sym(&mut self, c: char) -> bool {
         let yes = matches!(self.0.last(), Some(W::Sym(s)) if *s == c);
         if yes {
             self.0.pop();
         }
         yes
     }
-    fn near(&self) -> String {
+    pub(crate) fn near(&self) -> String {
         match self.0.last() {
             None => "at the end".into(),
             Some(W::Word(w, _)) | Some(W::Str(w)) | Some(W::Num(w)) => format!("near {w}"),
@@ -204,7 +205,7 @@ impl Words {
         }
     }
     /// A name: `a`, `"A"`, or dotted (`s.t`, `lake.s.t`).
-    fn name(&mut self) -> Result<String> {
+    pub(crate) fn name(&mut self) -> Result<String> {
         let mut parts = vec![];
         loop {
             match self.next() {
@@ -216,20 +217,20 @@ impl Words {
             }
         }
     }
-    fn names(&mut self) -> Result<Vec<String>> {
+    pub(crate) fn names(&mut self) -> Result<Vec<String>> {
         let mut all = vec![self.name()?];
         while self.sym(',') {
             all.push(self.name()?);
         }
         Ok(all)
     }
-    fn string(&mut self) -> Result<String> {
+    pub(crate) fn string(&mut self) -> Result<String> {
         match self.next() {
             Some(W::Str(s)) => Ok(s),
             _ => bail!("expected a quoted string {}", self.near()),
         }
     }
-    fn done(&self) -> Result<()> { if self.0.is_empty() { Ok(()) } else { bail!("unexpected words {}", self.near()) } }
+    pub(crate) fn done(&self) -> Result<()> { if self.0.is_empty() { Ok(()) } else { bail!("unexpected words {}", self.near()) } }
 }
 
 fn parse(mut w: Words) -> Result<Change> {
@@ -711,6 +712,9 @@ pub async fn node_key(lake: &Lake) -> Result<String> { Ok(keys(lake).await?.node
 /// How long a signed-in session lasts: `PONDRA_SESSION_HOURS` (12).
 fn session_ms() -> u64 { std::env::var("PONDRA_SESSION_HOURS").ok().and_then(|h| h.parse::<f64>().ok()).map_or(12 * 3_600_000, |h| (h * 3_600_000.0) as u64) }
 
+/// `data` signed with the lake's key (base64url): what `vend.rs` puts in a file's link.
+pub async fn sign(lake: &Lake, data: &[u8]) -> Result<String> { Ok(B64U.encode(hmac256(&B64.decode(keys(lake).await?.session)?, data))) }
+
 /// A session for `user`: `ps_<payload>.<signature>`, checked by any node with the lake's key.
 pub async fn session(lake: &Lake, user: &str) -> Result<(String, u64)> {
     let until = crate::log::now_ms() + session_ms();
@@ -973,7 +977,9 @@ pub async fn tables(lake: &Lake) -> Result<Vec<(&'static str, Arc<dyn datafusion
         ("columns", g(&|_, g| Some(g.columns.join(", ")).filter(|c| !c.is_empty()))),
     ])?;
     let mem = |b: RecordBatch| -> Result<Arc<dyn datafusion::catalog::TableProvider>> { Ok(Arc::new(MemTable::try_new(b.schema(), vec![vec![b]])?)) };
-    Ok(vec![("users", mem(users)?), ("grants", mem(grants)?)])
+    let mut out = vec![("users", mem(users)?), ("grants", mem(grants)?)];
+    out.extend(crate::shares::tables(lake).await?); // (`pondra.shares`, `pondra.recipients`)
+    Ok(out)
 }
 
 #[cfg(test)]

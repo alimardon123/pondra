@@ -43,6 +43,12 @@ SELECT * FROM on_day(DATE '2026-09-29');
   its argument as it comes.
 - **Only its own parameters.** A `$name` in the body that isn't a parameter is refused when the
   function is made, because a function's answer depends on its arguments alone.
+- **An argument is the caller's value.** In `count_like(qty)` the `qty` is the query's column, even
+  when the body reads a table with a `qty` of its own. When the query and the body read the same
+  table under the same name, the function is refused with how to tell them apart: give the query's
+  an alias (`FROM orders AS o`).
+- **Read as they are now.** A function that calls another uses that function as it is when the
+  query runs, so changing one changes every function built on it.
 - **Postgres's words work too.** `STRICT` (NULL in, NULL out), `IMMUTABLE`, `STABLE`, `VOLATILE`
   and `$1`-style parameters are all accepted.
 - **One noun.** DuckDB's `CREATE MACRO` is another name for a SQL function. `DROP FUNCTION name`
