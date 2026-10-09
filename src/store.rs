@@ -125,6 +125,10 @@ pub struct TableMeta {
     /// calls (`seq.rs`).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub identity: BTreeMap<String, crate::seq::Identity>,
+    /// UNIQUE, and PRIMARY KEY and FOREIGN KEY said NOT ENFORCED, by stored column names
+    /// (`constraints.rs`, ADR-057): an enforced UNIQUE has every write checked on the leader.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub constraints: Vec<crate::constraints::Constraint>,
     /// Not the lake's: files outside it a query reads as a table (`ext.rs`), never in the catalog.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ext: Option<crate::ext::Spec>,
@@ -202,6 +206,7 @@ impl TableMeta {
             not_null: self.not_null.iter().filter(|c| !self.dropped.contains(c)).map(n).collect(),
             defaults: self.defaults.iter().filter(|(c, _)| !self.dropped.contains(c)).map(|(c, e)| (n(c), e.clone())).collect(),
             identity: self.identity.iter().filter(|(c, _)| !self.dropped.contains(c)).map(|(c, i)| (n(c), i.clone())).collect(),
+            constraints: self.constraints.iter().map(|c| c.named(&n)).collect(),
             names: BTreeMap::new(),
             dropped: vec![],
             ..self.clone()
@@ -1613,6 +1618,12 @@ impl Catalog {
 
     pub async fn get<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>> {
         self.get_raw(key).await?.map(|v| serde_json::from_slice(&v).context(key.to_string())).transpose()
+    }
+
+    /// The commit that last wrote `key`, where the catalog is in memory (the leader's always is).
+    pub fn written_at(&self, key: &str) -> Option<u64> {
+        let o = self.overlay.lock().unwrap();
+        self.mirror.load(Relaxed).then(|| o.get(key).map(|(id, _)| *id)).flatten()
     }
 
     pub async fn get_raw(&self, key: &str) -> Result<Option<Bytes>> {

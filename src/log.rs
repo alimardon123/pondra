@@ -70,6 +70,11 @@ pub struct Flush {
     /// No rows: a sequence's counter to move (`seq.rs`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sequence: Option<crate::seq::Op>,
+    /// Made by the leader's change path (`change::submit`), which checked its rows against the
+    /// tables' UNIQUE constraints under the lake's lock. Never sent: a flush from another node is
+    /// never checked.
+    #[serde(skip)]
+    pub checked: bool,
 }
 
 /// One table's part of a file commit: the table as it is to be, the files it takes out already
@@ -98,6 +103,8 @@ pub struct Ack {
     pub seg: u64,
     pub duplicate: bool, // this seq was already committed: nothing to do
     pub conflict: bool,  // `prev` didn't match: someone else committed first; re-read and retry
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub refused: bool, // rows for a table with a UNIQUE constraint that the leader's check didn't make
     #[serde(default)]
     pub row: u64, // where the rows start among the table's rows in `seg` (their `_ord`: `ord(seg, row)`)
     #[serde(default)]
@@ -236,6 +243,7 @@ impl Log {
     /// order, so a client can have several batches in flight (the Kafka protocol does).
     pub async fn queue(&self, table: String, src: Src, batch: RecordBatch) -> Result<impl std::future::Future<Output = Result<Ack>> + use<>> {
         if let Some(m) = self.lake.cat.get::<TableMeta>(&table_key(&table)).await? {
+            crate::constraints::door(&m, &table)?; // (an enforced UNIQUE's rows are checked on the leader)
             crate::defaults::check(&m, &table, &batch)?; // (NOT NULL, whichever door the rows came in by)
         }
         let (ack, rx) = oneshot::channel();
@@ -273,7 +281,8 @@ async fn send(lake: &Lake, to: &To, mut pending: Vec<Append>, mut turn: Option<o
         match outcome.await {
             Ok(Outcome::Acks(acks)) => {
                 for (a, ack) in pending.drain(..).zip(acks) {
-                    let _ = a.ack.send(Ok(ack));
+                    let answered = answer(&a, ack);
+                    let _ = a.ack.send(answered);
                 }
             }
             Ok(Outcome::Refused(why)) => {
@@ -286,7 +295,9 @@ async fn send(lake: &Lake, to: &To, mut pending: Vec<Append>, mut turn: Option<o
                     tokio::time::sleep(Duration::from_millis(10)).await; // (packed with views this node didn't know of yet: again)
                 }
                 for (i, ack) in retried.into_iter().rev() {
-                    let _ = pending.remove(i).ack.send(Ok(ack)); // and go again with the rest
+                    let a = pending.remove(i);
+                    let answered = answer(&a, ack);
+                    let _ = a.ack.send(answered); // and go again with the rest
                 }
             }
             Err(e) if crate::views::refused(&e) && pending.len() > 1 => {
@@ -312,6 +323,14 @@ async fn send(lake: &Lake, to: &To, mut pending: Vec<Append>, mut turn: Option<o
                 }
             }
         }
+    }
+}
+
+/// An append's answer: its ack, or why the sequencer refused it.
+fn answer(a: &Append, ack: Ack) -> Result<Ack, String> {
+    match ack.refused {
+        true => Err(format!("{} has a UNIQUE constraint: it takes rows through SQL's INSERT, UPDATE and MERGE, which check them on the leader", a.table)),
+        false => Ok(ack),
     }
 }
 
@@ -489,10 +508,21 @@ async fn commit(lake: &Arc<Lake>, next: &mut u64, block: &mut u64, last_seq: &mu
             replies.push((reply, Outcome::Retry(vec![])));
             continue;
         }
-        // 1. Skip retries of committed batches, and batches whose `prev` no longer holds.
         let (mut acks, mut bad, mut mine) = (vec![Ack::default(); f.parts.len()], vec![], HashMap::new());
+        // 1. A table with a UNIQUE constraint takes rows only from the leader's check: a node that
+        // didn't know of the constraint yet (an ALTER TABLE … ADD a moment ago) is refused here.
+        if !f.checked {
+            for (i, p) in f.parts.iter().enumerate().filter(|(_, p)| p.src.is_some() && p.rows > 0) {
+                if crate::constraints::sequenced(lake, &p.table).await? {
+                    acks[i].refused = true;
+                    bad.push(i);
+                }
+            }
+        }
+        // 2. Skip retries of committed batches, and batches whose `prev` no longer holds.
         // (A part without a producer name is at-least-once: nothing to check.)
-        for (i, src) in f.parts.iter().enumerate().filter_map(|(i, p)| Some((i, p.src.as_ref().filter(|s| !s.producer.is_empty())?))) {
+        let refused = bad.clone();
+        for (i, src) in f.parts.iter().enumerate().filter(|(i, _)| !refused.contains(i)).filter_map(|(i, p)| Some((i, p.src.as_ref().filter(|s| !s.producer.is_empty())?))) {
             let last = match mine.get(&src.producer).or(seqs.get(&src.producer)).or(last_seq.get(&src.producer)) {
                 Some(s) => *s,
                 None => lake.cat.get(&producer_key(&src.producer)).await?.unwrap_or(0),
@@ -517,7 +547,7 @@ async fn commit(lake: &Arc<Lake>, next: &mut u64, block: &mut u64, last_seq: &mu
             continue;
         }
         seqs.extend(mine);
-        // 2. An object flush becomes the next segment, and so does a file commit; inline flushes
+        // 3. An object flush becomes the next segment, and so does a file commit; inline flushes
         // all go into one (below).
         let filings = std::mem::take(&mut f.filed);
         let inlined = f.path.is_empty() && filings.is_empty();

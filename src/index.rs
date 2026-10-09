@@ -65,6 +65,10 @@ pub fn statement(sql: &str) -> Option<Stmt> {
     let ddl = |c: Change| Some(Stmt::Ddl(vec![crate::ddl::Ddl::Index(c)]));
     if CREATE.is_match(first) {
         return Some(match Parser::parse_sql(&GenericDialect {}, sql).map(|mut s| s.pop()) {
+            Ok(Some(ast::Statement::CreateIndex(c))) if c.unique => match crate::constraints::unique_index(&c) {
+                Ok(d) => Stmt::Ddl(vec![d]),
+                Err(e) => Stmt::Invalid(format!("{e:#}")),
+            },
             Ok(Some(ast::Statement::CreateIndex(c))) => match create(c) {
                 Ok(c) => return ddl(c),
                 Err(e) => Stmt::Invalid(format!("{e:#}")),
@@ -92,7 +96,6 @@ pub fn statement(sql: &str) -> Option<Stmt> {
 
 /// What a `CREATE INDEX` says, checked as far as it can be without the table.
 fn create(c: ast::CreateIndex) -> Result<Change> {
-    ensure!(!c.unique, "CREATE UNIQUE INDEX: a unique index isn't taken yet (a PRIMARY KEY keeps one row a key)");
     ensure!(c.alter_options.is_empty(), "CREATE INDEX … {}: MySQL's options for ALTER TABLE aren't taken", c.alter_options.iter().map(|o| o.to_string()).collect::<Vec<_>>().join(" "));
     let using = c.using.as_ref().or_else(|| c.index_options.iter().find_map(|o| match o {
         ast::IndexOption::Using(u) => Some(u),
@@ -192,7 +195,14 @@ pub async fn apply(lake: &Lake, c: Change) -> Result<Value> {
             for n in names {
                 match find(lake, &n).await? {
                     Some((n, _)) => gone.push(n),
-                    None => ensure!(if_exists, "index \"{n}\" does not exist"),
+                    None => {
+                        // (a unique index is its table's UNIQUE constraint: `constraints::unique_index`)
+                        let (schema, short) = crate::ddl::split(&n);
+                        match crate::constraints::index_of(lake, schema, short).await? {
+                            Some(t) => drop(crate::constraints::apply(lake, &t, crate::constraints::Change::Drop { name: short.into(), if_exists: false }).await?),
+                            None => ensure!(if_exists, "index \"{n}\" does not exist"),
+                        }
+                    }
                 }
             }
             lake.cat.commit(vec![], &gone.iter().map(|n| key(n)).collect::<Vec<_>>()).await?;

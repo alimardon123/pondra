@@ -117,6 +117,7 @@ struct Rel {
     key: Vec<String>,
     sql: Option<String>, // a view's definition
     identity: BTreeMap<String, crate::seq::Identity>, // identity columns, by name (`attidentity`)
+    constraints: Vec<crate::constraints::Constraint>, // UNIQUE, and keys said NOT ENFORCED (SQL's names)
     rows: u64,
     bytes: u64,
 }
@@ -130,6 +131,7 @@ struct PgIndex {
     table_name: String,
     at: Vec<i16>, // its keys' columns, numbered from 1 (0: an expression)
     def: String,
+    unique: bool, // an enforced UNIQUE constraint's
 }
 
 struct Lakes {
@@ -186,7 +188,7 @@ async fn lakes(lake: &Lake, user: &str, columns: bool) -> Result<Lakes> {
         let (rows, bytes) = m.files.iter().fold((0, 0), |(r, b), f| (r + f.rows, b + f.bytes));
         let sealed = m.sealed.clone().unwrap_or_default();
         let kind = if mvs.contains(name) { 'm' } else { 'r' };
-        rels.push(Rel { oid: oid("r", name), schema: schema.into(), name: table.into(), kind, columns: cols, key: l.key.clone(), sql: None, identity: l.identity.clone(), rows: rows + sealed.rows, bytes: bytes + sealed.bytes });
+        rels.push(Rel { oid: oid("r", name), schema: schema.into(), name: table.into(), kind, columns: cols, key: l.key.clone(), sql: None, identity: l.identity.clone(), constraints: l.constraints.clone(), rows: rows + sealed.rows, bytes: bytes + sealed.bytes });
     }
     let views = lake.cat.scan::<crate::ddl::StoredView>("q/", "q0").await?;
     // (a view's columns are its query's: planned only when a client asks for columns, in a
@@ -205,16 +207,16 @@ async fn lakes(lake: &Lake, user: &str, columns: bool) -> Result<Lakes> {
             },
             None => vec![],
         };
-        rels.push(Rel { oid: oid("r", name), schema: schema.into(), name: view.into(), kind: 'v', columns: cols, key: vec![], sql: Some(v.sql), identity: Default::default(), rows: 0, bytes: 0 });
+        rels.push(Rel { oid: oid("r", name), schema: schema.into(), name: view.into(), kind: 'v', columns: cols, key: vec![], sql: Some(v.sql), identity: Default::default(), constraints: vec![], rows: 0, bytes: 0 });
     }
     // The session's own temporary tables and views, in its temporary schema (as Postgres has them).
     let (temp_tables, temp_views) = crate::temp::listed();
     for (name, cols) in temp_tables {
         let cols = cols.iter().map(|(c, t)| (c.clone(), crate::query::dtype(t).unwrap_or(DataType::Utf8), false, None)).collect();
-        rels.push(Rel { oid: oid("tmp", &name), schema: TEMP.into(), name, kind: 'r', columns: cols, key: vec![], sql: None, identity: Default::default(), rows: 0, bytes: 0 });
+        rels.push(Rel { oid: oid("tmp", &name), schema: TEMP.into(), name, kind: 'r', columns: cols, key: vec![], sql: None, identity: Default::default(), constraints: vec![], rows: 0, bytes: 0 });
     }
     for (name, sql) in temp_views {
-        rels.push(Rel { oid: oid("tmp", &name), schema: TEMP.into(), name, kind: 'v', columns: vec![], key: vec![], sql: Some(sql), identity: Default::default(), rows: 0, bytes: 0 });
+        rels.push(Rel { oid: oid("tmp", &name), schema: TEMP.into(), name, kind: 'v', columns: vec![], key: vec![], sql: Some(sql), identity: Default::default(), constraints: vec![], rows: 0, bytes: 0 });
     }
     let routines = lake.cat.scan::<crate::routines::Routine>("r/", "r0").await?.into_iter().map(|(k, r)| {
         let (s, n) = crate::ddl::split(&k[2..]);
@@ -232,7 +234,16 @@ async fn lakes(lake: &Lake, user: &str, columns: bool) -> Result<Lakes> {
         }).collect();
         let table = format!("{}.{}", crate::objects::ident(&r.schema), crate::objects::ident(&r.name));
         let def = crate::index::create_sql(&crate::objects::ident(&name), &table, &i, meta.as_ref());
-        indexes.push(PgIndex { oid: oid("ix", &k[3..]), schema: r.schema.clone(), name, table: r.oid, table_name: r.name.clone(), at, def });
+        indexes.push(PgIndex { oid: oid("ix", &k[3..]), schema: r.schema.clone(), name, table: r.oid, table_name: r.name.clone(), at, def, unique: false });
+    }
+    // An enforced UNIQUE is an index too, as Postgres makes one for it (`\d` lists it).
+    for r in &rels {
+        for c in r.constraints.iter().filter(|c| c.enforced && c.kind == crate::constraints::Kind::Unique) {
+            let table = format!("{}.{}", crate::objects::ident(&r.schema), crate::objects::ident(&r.name));
+            let cols = c.columns.iter().map(|c| crate::objects::ident(c)).collect::<Vec<_>>().join(", ");
+            let def = format!("CREATE UNIQUE INDEX {} ON {table} USING btree ({cols})", crate::objects::ident(&c.name));
+            indexes.push(PgIndex { oid: oid("uq", &format!("{}.{}.{}", r.schema, r.name, c.name)), schema: r.schema.clone(), name: c.name.clone(), table: r.oid, table_name: r.name.clone(), at: at_of(r, &c.columns), def, unique: true });
+        }
     }
     let database = crate::ddl::lake_name(lake);
     let mut databases = vec![database.clone()];
@@ -265,6 +276,18 @@ fn i2(v: i16) -> ScalarValue { ScalarValue::Int16(Some(v)) }
 fn i4(v: i32) -> ScalarValue { ScalarValue::Int32(Some(v)) }
 fn f4(v: f32) -> ScalarValue { ScalarValue::Float32(Some(v)) }
 fn n() -> ScalarValue { ScalarValue::Null }
+/// Columns' places in a relation, numbered from 1 (0: not one of its columns).
+fn at_of(r: &Rel, columns: &[String]) -> Vec<i16> { columns.iter().map(|c| r.columns.iter().position(|(n, ..)| n == c).map_or(0, |p| p as i16 + 1)).collect() }
+
+/// The relation a foreign key names, as the lake names tables (`schema.table`, or `table`).
+fn referred<'a>(rels: &'a [Rel], name: &str) -> Option<&'a Rel> {
+    let (schema, table) = crate::ddl::split(name);
+    rels.iter().find(|r| r.kind != 'v' && r.schema == schema && r.name == table)
+}
+
+/// A constraint's oid: its table's, then its name.
+fn constraint_oid(r: &Rel, c: &crate::constraints::Constraint) -> u32 { oid("cn", &format!("{}.{}.{}", r.schema, r.name, c.name)) }
+
 fn i2s(v: &[i16]) -> ScalarValue { ScalarValue::List(ScalarValue::new_list_nullable(&v.iter().map(|x| i2(*x)).collect::<Vec<_>>(), &DataType::Int16)) }
 fn texts(v: &[String]) -> ScalarValue { ScalarValue::List(ScalarValue::new_list_nullable(&v.iter().map(|x| s(x.clone())).collect::<Vec<_>>(), &DataType::Utf8)) }
 
@@ -357,19 +380,37 @@ fn tables(l: &Lakes) -> Result<Vec<(&'static str, Arc<MemTable>)>> {
         indexes.push(vec![o(oid("i", &full)), o(r.oid), i2(at.len() as i16), i2(at.len() as i16), b(true), b(false), b(true), b(false), b(true), b(false), b(true), b(false), b(true), b(true), b(false), i2s(&at), ScalarValue::List(ScalarValue::new_list_nullable(&at.iter().map(|_| o(0)).collect::<Vec<_>>(), &OID)),
             ScalarValue::List(ScalarValue::new_list_nullable(&at.iter().map(|_| o(3124)).collect::<Vec<_>>(), &OID)), i2s(&at.iter().map(|_| 0).collect::<Vec<_>>()), n(), n()]);
         constraints.push(vec![o(oid("c", &full)), s(format!("{}_pkey", r.name)), o(ns(&r.schema)), s("p"), b(false), b(false), b(true), o(r.oid), o(0), o(oid("i", &full)), o(0), o(0), s(" "), s(" "), s(" "),
-            b(true), i4(0), b(true), i2s(&at), n(), n()]);
+            b(true), i4(0), b(true), i2s(&at), n(), n(), b(true)]);
     }
     for i in &l.indexes {
         let each = |v: ScalarValue| ScalarValue::List(ScalarValue::new_list_nullable(&i.at.iter().map(|_| v.clone()).collect::<Vec<_>>(), &OID));
-        indexes.push(vec![o(i.oid), o(i.table), i2(i.at.len() as i16), i2(i.at.len() as i16), b(false), b(false), b(false), b(false), b(true), b(false), b(true), b(false), b(true), b(true), b(false), i2s(&i.at), each(o(0)),
+        indexes.push(vec![o(i.oid), o(i.table), i2(i.at.len() as i16), i2(i.at.len() as i16), b(i.unique), b(false), b(false), b(false), b(true), b(false), b(true), b(false), b(true), b(true), b(false), i2s(&i.at), each(o(0)),
             each(o(3124)), i2s(&i.at.iter().map(|_| 0).collect::<Vec<_>>()), n(), n()]);
+    }
+    for r in &l.rels {
+        for c in &r.constraints {
+            let (kind, index) = match c.kind {
+                crate::constraints::Kind::Unique => ("u", if c.enforced { oid("uq", &format!("{}.{}.{}", r.schema, r.name, c.name)) } else { 0 }),
+                crate::constraints::Kind::PrimaryKey => ("p", 0),
+                crate::constraints::Kind::ForeignKey => ("f", 0),
+            };
+            let to = c.references.as_ref().and_then(|(t, _)| referred(&l.rels, t));
+            let to_cols = match (to, &c.references) {
+                (Some(t), Some((_, cols))) if !cols.is_empty() => i2s(&at_of(t, cols)),
+                (Some(t), _) => i2s(&at_of(t, &t.key)),
+                _ => n(),
+            };
+            let foreign = c.kind == crate::constraints::Kind::ForeignKey;
+            constraints.push(vec![o(constraint_oid(r, c)), s(c.name.clone()), o(ns(&r.schema)), s(kind), b(false), b(false), b(c.enforced), o(r.oid), o(0), o(index), o(0), o(to.map_or(0, |t| t.oid)),
+                s(if foreign { "a" } else { " " }), s(if foreign { "a" } else { " " }), s(if foreign { "s" } else { " " }), b(true), i4(0), b(true), i2s(&at_of(r, &c.columns)), if foreign { to_cols } else { n() }, n(), b(c.enforced)]);
+        }
     }
     out.push(("pg_index", table(&[("indexrelid", OID), ("indrelid", OID), ("indnatts", INT2), ("indnkeyatts", INT2), ("indisunique", BOOL), ("indnullsnotdistinct", BOOL), ("indisprimary", BOOL), ("indisexclusion", BOOL),
         ("indimmediate", BOOL), ("indisclustered", BOOL), ("indisvalid", BOOL), ("indcheckxmin", BOOL), ("indisready", BOOL), ("indislive", BOOL), ("indisreplident", BOOL),
         ("indkey", list(INT2)), ("indcollation", list(OID)), ("indclass", list(OID)), ("indoption", list(INT2)), ("indexprs", TEXT), ("indpred", TEXT)], indexes)?));
     out.push(("pg_constraint", table(&[("oid", OID), ("conname", TEXT), ("connamespace", OID), ("contype", TEXT), ("condeferrable", BOOL), ("condeferred", BOOL), ("convalidated", BOOL),
         ("conrelid", OID), ("contypid", OID), ("conindid", OID), ("conparentid", OID), ("confrelid", OID), ("confupdtype", TEXT), ("confdeltype", TEXT), ("confmatchtype", TEXT),
-        ("conislocal", BOOL), ("coninhcount", INT4), ("connoinherit", BOOL), ("conkey", list(INT2)), ("confkey", list(INT2)), ("conbin", TEXT)], constraints)?));
+        ("conislocal", BOOL), ("coninhcount", INT4), ("connoinherit", BOOL), ("conkey", list(INT2)), ("confkey", list(INT2)), ("conbin", TEXT), ("conenforced", BOOL)], constraints)?));
     // The views Postgres builds over those.
     let rel_rows = |kind: char| l.rels.iter().filter(move |r| r.kind == kind);
     out.push(("pg_tables", table(&[("schemaname", TEXT), ("tablename", TEXT), ("tableowner", TEXT), ("tablespace", TEXT), ("hasindexes", BOOL), ("hasrules", BOOL), ("hastriggers", BOOL), ("rowsecurity", BOOL)],
@@ -495,13 +536,53 @@ fn information_schema(l: &Lakes) -> Result<Vec<(&'static str, Arc<MemTable>)>> {
     out.push(("views", table(&[("table_catalog", TEXT), ("table_schema", TEXT), ("table_name", TEXT), ("view_definition", TEXT), ("check_option", TEXT), ("is_updatable", TEXT),
         ("is_insertable_into", TEXT), ("is_trigger_updatable", TEXT), ("is_trigger_deletable", TEXT), ("is_trigger_insertable_into", TEXT)],
         l.rels.iter().filter(|r| r.kind == 'v').map(|r| vec![db(), s(r.schema.clone()), s(r.name.clone()), s(r.sql.clone().unwrap_or_default()), s("NONE"), s("NO"), s("NO"), s("NO"), s("NO"), s("NO")]).collect())?));
+    // Each table's key, then its declared constraints, as the standard lists them.
+    let yes = |b: bool| s(if b { "YES" } else { "NO" });
     let keyed: Vec<&Rel> = l.rels.iter().filter(|r| !r.key.is_empty()).collect();
+    let mut table_constraints: Vec<Vec<ScalarValue>> = keyed.iter().map(|r| vec![db(), s(r.schema.clone()), s(format!("{}_pkey", r.name)), db(), s(r.schema.clone()), s(r.name.clone()), s("PRIMARY KEY"), s("NO"), s("NO"), s("YES"), n()]).collect();
+    let mut key_columns: Vec<Vec<ScalarValue>> = keyed.iter().flat_map(|r| r.key.iter().enumerate().map(move |(i, k)| (r, i, k))).map(|(r, i, k)| vec![db(), s(r.schema.clone()), s(format!("{}_pkey", r.name)), db(), s(r.schema.clone()), s(r.name.clone()), s(k.clone()), i4(i as i32 + 1), n()]).collect();
+    let mut used: Vec<Vec<ScalarValue>> = keyed.iter().flat_map(|r| r.key.iter().map(move |k| (r, k))).map(|(r, k)| vec![db(), s(r.schema.clone()), s(r.name.clone()), s(k.clone()), db(), s(r.schema.clone()), s(format!("{}_pkey", r.name))]).collect();
+    let mut referential = vec![];
+    for r in &l.rels {
+        for c in &r.constraints {
+            use crate::constraints::Kind;
+            let kind = match c.kind {
+                Kind::Unique => "UNIQUE",
+                Kind::PrimaryKey => "PRIMARY KEY",
+                Kind::ForeignKey => "FOREIGN KEY",
+            };
+            table_constraints.push(vec![db(), s(r.schema.clone()), s(c.name.clone()), db(), s(r.schema.clone()), s(r.name.clone()), s(kind), s("NO"), s("NO"), yes(c.enforced), if c.kind == Kind::Unique { s("YES") } else { n() }]);
+            // (a foreign key's columns, and the key of the table it names: by place)
+            let to = c.references.as_ref().and_then(|(t, _)| referred(&l.rels, t));
+            let to_cols = match (&c.references, to) {
+                (Some((_, cols)), _) if !cols.is_empty() => cols.clone(),
+                (_, Some(t)) => t.key.clone(),
+                _ => vec![],
+            };
+            for (i, col) in c.columns.iter().enumerate() {
+                let place = if c.kind == Kind::ForeignKey && i < to_cols.len() { i4(i as i32 + 1) } else { n() };
+                key_columns.push(vec![db(), s(r.schema.clone()), s(c.name.clone()), db(), s(r.schema.clone()), s(r.name.clone()), s(col.clone()), i4(i as i32 + 1), place]);
+            }
+            match (c.kind, to) {
+                (Kind::ForeignKey, to) => {
+                    if let Some(t) = to {
+                        used.extend(to_cols.iter().map(|col| vec![db(), s(t.schema.clone()), s(t.name.clone()), s(col.clone()), db(), s(r.schema.clone()), s(c.name.clone())]));
+                    }
+                    // (the referred table's key or UNIQUE of those columns, when it has one)
+                    let unique = to.and_then(|t| match t.key == to_cols {
+                        true if !t.key.is_empty() => Some((t.schema.clone(), format!("{}_pkey", t.name))),
+                        _ => t.constraints.iter().find(|u| u.kind != Kind::ForeignKey && u.columns == to_cols).map(|u| (t.schema.clone(), u.name.clone())),
+                    });
+                    referential.push(vec![db(), s(r.schema.clone()), s(c.name.clone()), unique.as_ref().map_or(n(), |_| db()), unique.as_ref().map_or(n(), |u| s(u.0.clone())), unique.map_or(n(), |u| s(u.1)), s("NONE"), s("NO ACTION"), s("NO ACTION")]);
+                }
+                _ => used.extend(c.columns.iter().map(|col| vec![db(), s(r.schema.clone()), s(r.name.clone()), s(col.clone()), db(), s(r.schema.clone()), s(c.name.clone())])),
+            }
+        }
+    }
     out.push(("table_constraints", table(&[("constraint_catalog", TEXT), ("constraint_schema", TEXT), ("constraint_name", TEXT), ("table_catalog", TEXT), ("table_schema", TEXT), ("table_name", TEXT),
-        ("constraint_type", TEXT), ("is_deferrable", TEXT), ("initially_deferred", TEXT), ("enforced", TEXT), ("nulls_distinct", TEXT)],
-        keyed.iter().map(|r| vec![db(), s(r.schema.clone()), s(format!("{}_pkey", r.name)), db(), s(r.schema.clone()), s(r.name.clone()), s("PRIMARY KEY"), s("NO"), s("NO"), s("YES"), n()]).collect())?));
+        ("constraint_type", TEXT), ("is_deferrable", TEXT), ("initially_deferred", TEXT), ("enforced", TEXT), ("nulls_distinct", TEXT)], table_constraints)?));
     out.push(("key_column_usage", table(&[("constraint_catalog", TEXT), ("constraint_schema", TEXT), ("constraint_name", TEXT), ("table_catalog", TEXT), ("table_schema", TEXT), ("table_name", TEXT),
-        ("column_name", TEXT), ("ordinal_position", INT4), ("position_in_unique_constraint", INT4)],
-        keyed.iter().flat_map(|r| r.key.iter().enumerate().map(move |(i, k)| (r, i, k))).map(|(r, i, k)| vec![db(), s(r.schema.clone()), s(format!("{}_pkey", r.name)), db(), s(r.schema.clone()), s(r.name.clone()), s(k.clone()), i4(i as i32 + 1), n()]).collect())?));
+        ("column_name", TEXT), ("ordinal_position", INT4), ("position_in_unique_constraint", INT4)], key_columns)?));
     out.push(("routines", table(&[("specific_catalog", TEXT), ("specific_schema", TEXT), ("specific_name", TEXT), ("routine_catalog", TEXT), ("routine_schema", TEXT), ("routine_name", TEXT),
         ("routine_type", TEXT), ("data_type", TEXT), ("routine_body", TEXT), ("routine_definition", TEXT), ("external_language", TEXT), ("is_deterministic", TEXT)],
         l.routines.iter().map(|(oid, schema, name, r)| {
@@ -510,10 +591,9 @@ fn information_schema(l: &Lakes) -> Result<Vec<(&'static str, Arc<MemTable>)>> {
                 s(if r.language == "python" { "EXTERNAL" } else { "SQL" }), s(r.body.clone()), s(if r.language.is_empty() { "SQL".to_string() } else { r.language.to_uppercase() }), s("NO")]
         }).collect())?));
     out.push(("referential_constraints", table(&[("constraint_catalog", TEXT), ("constraint_schema", TEXT), ("constraint_name", TEXT), ("unique_constraint_catalog", TEXT),
-        ("unique_constraint_schema", TEXT), ("unique_constraint_name", TEXT), ("match_option", TEXT), ("update_rule", TEXT), ("delete_rule", TEXT)], vec![])?));
+        ("unique_constraint_schema", TEXT), ("unique_constraint_name", TEXT), ("match_option", TEXT), ("update_rule", TEXT), ("delete_rule", TEXT)], referential)?));
     out.push(("constraint_column_usage", table(&[("table_catalog", TEXT), ("table_schema", TEXT), ("table_name", TEXT), ("column_name", TEXT), ("constraint_catalog", TEXT),
-        ("constraint_schema", TEXT), ("constraint_name", TEXT)],
-        keyed.iter().flat_map(|r| r.key.iter().map(move |k| (r, k))).map(|(r, k)| vec![db(), s(r.schema.clone()), s(r.name.clone()), s(k.clone()), db(), s(r.schema.clone()), s(format!("{}_pkey", r.name))]).collect())?));
+        ("constraint_schema", TEXT), ("constraint_name", TEXT)], used)?));
     Ok(out)
 }
 
@@ -731,9 +811,10 @@ fn register_functions(ctx: &SessionContext, l: Arc<Lakes>) {
         [(oid("c", &full), (r.name.clone(), r.key.clone())), (oid("i", &full), (r.name.clone(), r.key.clone()))]
     }).collect());
     let k2 = keys.clone();
+    let declared: BTreeMap<u32, String> = l.rels.iter().flat_map(|r| r.constraints.iter().map(move |c| (constraint_oid(r, c), c.def(&|n| crate::objects::ident(n))))).collect();
     ctx.register_udf(udf("pg_get_constraintdef", to_text, move |a, n| {
         let v = int_arg(&a[0])?;
-        Ok(texts_out((0..n).map(|i| v[i].and_then(|o| k2.get(&(o as u32))).map(|(_, k)| format!("PRIMARY KEY ({})", k.join(", "))))))
+        Ok(texts_out((0..n).map(|i| v[i].and_then(|o| declared.get(&(o as u32)).cloned().or_else(|| k2.get(&(o as u32)).map(|(_, k)| format!("PRIMARY KEY ({})", k.join(", "))))))))
     }));
     let made: BTreeMap<u32, String> = l.indexes.iter().map(|i| (i.oid, i.def.clone())).collect();
     ctx.register_udf(udf("pg_get_indexdef", to_text, move |a, n| {

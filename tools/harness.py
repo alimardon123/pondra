@@ -6870,6 +6870,182 @@ def sequences():
     return f"{sum(checks.values())} of {len(checks)} sequence checks"
 
 
+def constraints():
+    """UNIQUE, PRIMARY KEY and FOREIGN KEY as tables declare them (`constraints.rs`, ADR-057): an
+    enforced UNIQUE refuses a value twice (23505) from INSERT, INSERT … SELECT, UPDATE, MERGE, a keyed
+    table's upserts, a transaction and `pondra sql`, on three nodes at once; NULLs are distinct; the
+    doors that skip the leader's check refuse its table; NOT ENFORCED keeps a fact and checks nothing;
+    ALTER TABLE … ADD | DROP CONSTRAINT, DROP COLUMN, SHOW CREATE and the Postgres catalog."""
+    import psycopg, concurrent.futures as cf
+    lake = new_lake()
+    ports = [A.port + 1 + i for i in range(3)]
+    pg = A.port + 10
+    nodes = [Node(lake, p, **({"pg": f"127.0.0.1:{pg}"} if i == 0 else {})).start() for i, p in enumerate(ports)]
+    while len(call(ports[0], "GET", "/stats")["nodes"]) < 3:
+        time.sleep(0.1)
+    temp = {"x-pondra-session": "harness-constraints"}
+    q = lambda s, port=ports[0], hh=None: call(port, "POST", "/sql", s.encode(), timeout=120, headers=hh)
+    def err(s, port=ports[0], path="/sql", hh=None):
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=60)
+        c.request("POST", path, s.encode(), hh or {})
+        r = c.getresponse()
+        data = r.read()
+        return (r.status, r.getheader("x-pondra-sqlstate"), data.decode()[:300]) if r.status != 200 else (200, None, "")
+    def eventually(f, secs=10):
+        end = time.time() + secs
+        while True:
+            try:
+                return f()
+            except Exception:
+                if time.time() > end:
+                    raise
+                time.sleep(0.1)
+    rows = lambda t, port=ports[0]: [list(r.values()) for r in q(f"SELECT * FROM {t} ORDER BY 1", port)]
+    checks, info = {}, {}
+    # An append table with a UNIQUE column: every way of writing it
+    q("CREATE TABLE users (id INT, email TEXT UNIQUE, name TEXT)")
+    q("INSERT INTO users VALUES (1, 'a@x', 'Ann'), (2, 'b@x', 'Bo'), (3, NULL, 'Cy'), (4, NULL, 'Di')")
+    refused = [err(x) for x in ("INSERT INTO users VALUES (5, 'a@x', 'Ann again')", "INSERT INTO users VALUES (5, 'c@x', 'C'), (6, 'c@x', 'C again')",
+                                "INSERT INTO users SELECT id + 10, email, name FROM users WHERE id = 2", "UPDATE users SET email = 'a@x' WHERE id = 2",
+                                "MERGE INTO users t USING (SELECT 7 AS id, 'b@x' AS email) s ON t.id = s.id WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.email, 'M')")]
+    q("UPDATE users SET email = CASE id WHEN 1 THEN 'b@x' ELSE 'a@x' END WHERE id IN (1, 2)")  # (a swap: the statement as a whole holds)
+    q("MERGE INTO users t USING (SELECT 1 AS id, 'a1@x' AS email) s ON t.id = s.id WHEN MATCHED THEN UPDATE SET email = s.email")
+    users = [[r.get(c) for c in ("id", "email", "name")] for r in q("SELECT id, email, name FROM users ORDER BY id")]  # (the node's JSON leaves NULLs out)
+    info["refused"] = [refused, users]
+    checks["UNIQUE refuses a value twice (23505): an INSERT's VALUES, two in one INSERT, INSERT … SELECT, UPDATE, MERGE; NULLs are distinct; a swap in one UPDATE holds"] = \
+        all(r[1] == "23505" for r in refused) and "users_email_key" in refused[0][2] and "(a@x)" in refused[0][2] and \
+        users == [[1, "a1@x", "Ann"], [2, "a@x", "Bo"], [3, None, "Cy"], [4, None, "Di"]]
+    # Three nodes writing the same values at once: each goes in once
+    def put(port, i):
+        return err(f"INSERT INTO users VALUES ({100 + i}, 'race{i}@x', 'n{port}')", port)[0]
+    with cf.ThreadPoolExecutor(12) as ex:
+        got = [f.result() for f in [ex.submit(put, p, i) for i in range(40) for p in ports]]
+    counted = q("SELECT count(*) AS n, count(DISTINCT email) AS d FROM users WHERE email LIKE 'race%'")[0]
+    info["race"] = {"ok": got.count(200), "refused": len(got) - got.count(200), "rows": counted}
+    checks["three nodes inserting the same 40 values at once: 40 go in, 80 refused, no value twice"] = got.count(200) == 40 and counted == {"n": 40, "d": 40}
+    # A keyed table: a key's new version may keep its value; another key may not take it
+    q("CREATE TABLE accounts (id INT PRIMARY KEY, handle TEXT, CONSTRAINT one_handle UNIQUE (handle))")
+    q("INSERT INTO accounts VALUES (1, 'ann'), (2, 'bo')")
+    q("INSERT INTO accounts VALUES (1, 'ann')")  # (an upsert of its own row)
+    q("UPDATE accounts SET handle = 'bob' WHERE id = 2")
+    keyed = [err("INSERT INTO accounts VALUES (3, 'ann')"), err("UPDATE accounts SET handle = 'ann' WHERE id = 2")]
+    q("INSERT INTO accounts VALUES (2, 'bo'), (3, 'bob')")  # (2 lets 'bob' go as 3 takes it, in one statement)
+    info["keyed"] = [keyed, rows("accounts")]
+    checks["a keyed table: a key's upsert keeps its value; another key taking it is refused; a value let go and taken in one statement holds"] = \
+        all(r[1] == "23505" for r in keyed) and rows("accounts") == [[1, "ann"], [2, "bo"], [3, "bob"]]
+    # A transaction, Postgres, pondra sql
+    with psycopg.connect(f"host=127.0.0.1 port={pg} user=u dbname=lake", autocommit=True) as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN")
+        cur.execute("INSERT INTO users VALUES (200, 't@x', 'T')")
+        cur.execute("INSERT INTO users VALUES (201, 't@x', 'T again')")
+        try:
+            cur.execute("COMMIT")
+            txn = None
+        except psycopg.Error as e:
+            txn = e.sqlstate
+        try:
+            cur.execute("INSERT INTO users VALUES (202, 'a@x', 'over Postgres')")
+            pgs = None
+        except psycopg.Error as e:
+            pgs = e.sqlstate
+        try:
+            with cur.copy("COPY users FROM STDIN") as cp:
+                cp.write("300\tcopy@x\tC\n")
+            copied = None
+        except psycopg.Error as e:
+            copied = str(e)[:200]
+    cli_ok = subprocess.run([BIN, "sql", "--dir", lake, "INSERT INTO users VALUES (400, 'cli@x', 'Cli')"], capture_output=True, text=True, timeout=120)
+    cli_dup = subprocess.run([BIN, "sql", "--dir", lake, "INSERT INTO users VALUES (401, 'cli@x', 'Cli again')"], capture_output=True, text=True, timeout=120)
+    appended = [err('{"id": 500, "email": "app@x"}\n', p, "/append/users") for p in ports]
+    info["doors"] = [txn, pgs, copied, cli_ok.returncode, cli_ok.stderr[-200:], cli_dup.returncode, cli_dup.stderr[-200:], appended]
+    checks["a transaction's two rows of one value refused at COMMIT (23505); Postgres's INSERT (23505); pondra sql checks too"] = \
+        txn == "23505" and pgs == "23505" and cli_ok.returncode == 0 and cli_dup.returncode != 0 and "unique constraint" in cli_dup.stderr
+    checks["the doors that skip the leader's check refuse the table, by name: an append on every node, COPY FROM STDIN"] = \
+        all(a[0] != 200 and "UNIQUE" in a[2] for a in appended) and copied is not None and "UNIQUE" in copied
+    # NOT ENFORCED: facts, never checked; a reference must say so
+    q("CREATE TABLE orders (id INT PRIMARY KEY NOT ENFORCED, user_id INT REFERENCES users (id) NOT ENFORCED, code TEXT UNIQUE NOT ENFORCED)")
+    q("INSERT INTO orders VALUES (1, 1, 'x'), (1, 99, 'x')")
+    facts = rows("orders")
+    no = [err(x) for x in ("CREATE TABLE bad1 (a INT REFERENCES users (id))", "CREATE TABLE bad2 (a INT, UNIQUE NULLS NOT DISTINCT (a))",
+                           "CREATE TABLE bad3 (a INT UNIQUE DEFERRABLE)", "CREATE TABLE bad4 (a INT PRIMARY KEY, b INT, PRIMARY KEY (b) NOT ENFORCED)",
+                           "CREATE TABLE bad6 (a INT, UNIQUE (b))")]
+    no.append(err("CREATE TEMP TABLE bad5 (a INT UNIQUE)", hh=temp))
+    q("CREATE TEMP TABLE fine (a INT UNIQUE NOT ENFORCED)", hh=temp)
+    info["facts"] = [facts, no]
+    checks["NOT ENFORCED keeps a fact and checks nothing (a PRIMARY KEY makes no key); a reference, NULLS NOT DISTINCT, DEFERRABLE, two keys, a temporary table's UNIQUE and a missing column refused"] = \
+        facts == [[1, 1, "x"], [1, 99, "x"]] and all(r[0] == 500 for r in no)
+    # ALTER TABLE … ADD | DROP CONSTRAINT
+    q("CREATE TABLE tags (id INT, tag TEXT)")
+    q("INSERT INTO tags VALUES (1, 'a'), (2, 'a'), (3, 'b')")
+    dup = err("ALTER TABLE tags ADD CONSTRAINT one_tag UNIQUE (tag)")
+    after_dup = q("INSERT INTO tags VALUES (4, 'a')")
+    q("DELETE FROM tags WHERE id IN (2, 4)")
+    q("ALTER TABLE tags ADD CONSTRAINT one_tag UNIQUE (tag)")
+    now = [err("INSERT INTO tags VALUES (5, 'a')", p) for p in ports]
+    again = err("ALTER TABLE tags ADD CONSTRAINT one_tag UNIQUE (id)")
+    q("ALTER TABLE tags ADD CONSTRAINT short CHECK (length(tag) < 5)")
+    long = err("INSERT INTO tags VALUES (6, 'longer')")
+    q("ALTER TABLE tags DROP CONSTRAINT one_tag")
+    q("ALTER TABLE tags DROP CONSTRAINT IF EXISTS one_tag")
+    q("INSERT INTO tags VALUES (7, 'a')")
+    missing = err("ALTER TABLE tags DROP CONSTRAINT one_tag")
+    info["alter"] = [dup, now, again, long, missing]
+    checks["ADD CONSTRAINT UNIQUE over a value twice refused (23505) and not kept; added over clean rows, every node refuses a duplicate; DROP CONSTRAINT lets it in; ADD CHECK; a name taken, one missing refused"] = \
+        dup[1] == "23505" and after_dup and all(r[1] == "23505" for r in now) and again[0] == 500 and long[1] == "23514" and missing[0] == 500 and \
+        [r[1] for r in rows("tags")] == ["a", "b", "a"]
+    # CREATE UNIQUE INDEX, as ORMs write a UNIQUE (Prisma's @unique)
+    q('CREATE TABLE "User" (id INT, "email" TEXT)')
+    q('CREATE UNIQUE INDEX "User_email_key" ON "User"("email")')
+    q('CREATE UNIQUE INDEX IF NOT EXISTS "User_email_key" ON "User"("email")')
+    q('INSERT INTO "User" VALUES (1, \'p@x\')')
+    by_index = [err('INSERT INTO "User" VALUES (2, \'p@x\')'), err('CREATE UNIQUE INDEX ON "User" (lower(email))'), err('CREATE UNIQUE INDEX ON "User" (id) WHERE id > 0')]
+    q('DROP INDEX "User_email_key"')
+    q('INSERT INTO "User" VALUES (2, \'p@x\')')
+    info["index"] = by_index
+    checks["CREATE UNIQUE INDEX [IF NOT EXISTS] on columns is a UNIQUE (23505), DROP INDEX drops it; on an expression or with WHERE refused"] = \
+        by_index[0][1] == "23505" and "User_email_key" in by_index[0][2] and by_index[1][0] == by_index[2][0] == 500 and \
+        q('SELECT count(*) AS n FROM "User"')[0]["n"] == 2
+    q("ALTER TABLE users RENAME COLUMN email TO mail")
+    renamed = err("INSERT INTO users VALUES (600, 'a@x', 'renamed')")
+    shown = q("SHOW CREATE TABLE users")[0]
+    shown = next(v for v in shown.values() if "CREATE" in str(v))
+    q("ALTER TABLE users DROP COLUMN mail")
+    left = q("SHOW CREATE TABLE users")[0]
+    left = next(v for v in left.values() if "CREATE" in str(v))
+    orders = next(v for v in q("SHOW CREATE TABLE orders")[0].values() if "CREATE" in str(v))
+    q("DROP TABLE orders")
+    q(orders.rstrip(";"))
+    orders2 = next(v for v in q("SHOW CREATE TABLE orders")[0].values() if "CREATE" in str(v))
+    info["shown"] = [renamed, shown, left, orders, orders2]
+    checks["a renamed column keeps its UNIQUE; SHOW CREATE writes the constraints and runs again to the same table; DROP COLUMN takes its UNIQUE with it"] = \
+        renamed[1] == "23505" and "CONSTRAINT users_email_key UNIQUE (mail)" in shown and "UNIQUE" not in left and orders == orders2 and \
+        "PRIMARY KEY (id) NOT ENFORCED" in orders and "REFERENCES users(id) NOT ENFORCED" in orders and "UNIQUE (code) NOT ENFORCED" in orders
+    # The Postgres catalog
+    with psycopg.connect(f"host=127.0.0.1 port={pg} user=u dbname=lake", autocommit=True) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT table_name, constraint_name, constraint_type, enforced FROM information_schema.table_constraints ORDER BY 1, 2")
+        tc = [list(r) for r in cur.fetchall()]
+        cur.execute("SELECT conname, contype, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'orders'::regclass ORDER BY 1")
+        pc = [list(r) for r in cur.fetchall()]
+        cur.execute("SELECT indexname, indexdef FROM pg_indexes WHERE tablename = 'accounts' ORDER BY 1")
+        ix = [list(r) for r in cur.fetchall()]
+        cur.execute("SELECT constraint_name, unique_constraint_name FROM information_schema.referential_constraints")
+        rc = [list(r) for r in cur.fetchall()]
+    info["catalog"] = [tc, pc, ix, rc]
+    checks["information_schema and pg_catalog list them (enforced YES/NO, contype, pg_get_constraintdef, the UNIQUE's index)"] = \
+        ["accounts", "one_handle", "UNIQUE", "YES"] in tc and ["orders", "orders_code_key", "UNIQUE", "NO"] in tc and ["orders", "orders_user_id_fkey", "FOREIGN KEY", "NO"] in tc and \
+        ["orders_pkey", "p", "PRIMARY KEY (id) NOT ENFORCED"] in pc and ["orders_user_id_fkey", "f", "FOREIGN KEY (user_id) REFERENCES users(id) NOT ENFORCED"] in pc and \
+        ["one_handle", "CREATE UNIQUE INDEX one_handle ON public.accounts USING btree (handle)"] in ix and ["orders_user_id_fkey", None] in rc
+    for n in nodes:
+        n.kill()
+    ok = all(checks.values())
+    print(json.dumps({"constraints": checks, "ok": ok, "info": info}, indent=1, default=str))
+    if not ok:
+        sys.exit(1)
+    return f"{sum(checks.values())} of {len(checks)} constraint checks"
+
+
 def registry():
     """The statement registry (ADR-049): every kind of object in `pondra.objects` with its comment and
     definition; `SHOW CREATE` of each kind runs again to the same object; `COMMENT ON` every kind,
@@ -6967,7 +7143,7 @@ def registry():
     indexes = lambda: [r["name"] for r in q("SELECT name FROM pondra.objects WHERE kind = 'index' ORDER BY name")]
     renamed = indexes()
     refused_ix = [http(s) for s in ("CREATE INDEX v_idx ON eu_orders (id)", "CREATE INDEX ON visits (nothing)", "CREATE INDEX ON visits USING hnsw (path)",
-                                    "CREATE UNIQUE INDEX ON visits (path)", "CREATE TABLE visits_path (x INT)", "CREATE INDEX visits ON totals (region)")]
+                                    "CREATE UNIQUE INDEX ON visits (lower(path))", "CREATE TABLE visits_path (x INT)", "CREATE INDEX visits ON totals (region)")]
     q("ALTER TABLE visits DROP COLUMN path")
     after_column = indexes()
     q("CREATE INDEX ON totals (region)")
@@ -7908,7 +8084,7 @@ def friendly():
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    out = {t.__name__: t() for t in (upsert, deal, outside, clouds, kafkas, tiering, tails, pace, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, found, renames, workspace, server, scale, flight, users, secrets, safety, versions, stopped, flows, begin, doors, objects, registry, sequences, sparksql, variables, scripts, hot, minmax, history, friendly, reader, crash)}
+    out = {t.__name__: t() for t in (upsert, deal, outside, clouds, kafkas, tiering, tails, pace, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, found, renames, workspace, server, scale, flight, users, secrets, safety, versions, stopped, flows, begin, doors, objects, registry, sequences, constraints, sparksql, variables, scripts, hot, minmax, history, friendly, reader, crash)}
     A.secs = min(A.secs, 20)
     out["load"] = load()
     print(json.dumps(out, indent=1))
@@ -7916,7 +8092,7 @@ def all_tests():
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "tails", "pace", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "found", "renames", "workspace", "server", "scale", "flight", "users", "secrets", "safety", "versions", "stopped", "flows", "begin", "doors", "objects", "registry", "sequences", "sparksql", "variables", "scripts", "tasks", "hot", "minmax", "history", "friendly", "load", "all"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "clouds", "kafkas", "tiering", "tails", "pace", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "found", "renames", "workspace", "server", "scale", "flight", "users", "secrets", "safety", "versions", "stopped", "flows", "begin", "doors", "objects", "registry", "sequences", "constraints", "sparksql", "variables", "scripts", "tasks", "hot", "minmax", "history", "friendly", "load", "all"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -7928,7 +8104,7 @@ if __name__ == "__main__":
     ap.add_argument("--flush-ms", type=int, default=250)
     A = ap.parse_args()
     try:
-        {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "safety": safety, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "objects": objects, "registry": registry, "sequences": sequences, "sparksql": sparksql, "variables": variables, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "friendly": friendly, "load": load, "all": all_tests}[A.mode]()
+        {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "users": users, "secrets": secrets, "safety": safety, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "objects": objects, "registry": registry, "sequences": sequences, "constraints": constraints, "sparksql": sparksql, "variables": variables, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "friendly": friendly, "load": load, "all": all_tests}[A.mode]()
     except BaseException as e:  # a failure ends the run, though threads may still wait on a node (crash's producers retry for ever)
         code = e.code if isinstance(e, SystemExit) else 1
         if not isinstance(e, SystemExit):

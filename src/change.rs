@@ -239,9 +239,12 @@ pub async fn run(lake: &Lake, seq: &Sequencer, sql: &str, job: &str) -> Result<V
     ensure!(view.is_none() && meta.merge.is_empty(), "{table} is a view's: change the table it follows");
     let append = meta.key.is_empty();
     ensure!(meta.ids || !append, "{table} holds rows from before row ids (made before Pondra 0.19): copy it once (CREATE TABLE t2 AS SELECT * FROM {table}) and change the copy");
-    crate::views::can_follow(lake, &table, append).await?;
-    if let Some(v) = crate::views::filling(lake, &table).await? {
-        bail!("materialized view {v} is still being filled from {table}'s rows: change them once it is (in a moment)"); // (it reads them as they were)
+    if !matches!(stmt, crate::write::Stmt::Insert(..)) {
+        // (an INSERT takes no row back: what follows the table takes its rows as any write's)
+        crate::views::can_follow(lake, &table, append).await?;
+        if let Some(v) = crate::views::filling(lake, &table).await? {
+            bail!("materialized view {v} is still being filled from {table}'s rows: change them once it is (in a moment)"); // (it reads them as they were)
+        }
     }
     let upto = lake.visible(); // (one snapshot for every query below: the lock keeps its files)
     let point = match &stmt {
@@ -263,6 +266,11 @@ pub async fn rows_of(lake: &Lake, table: &str, meta: &TableMeta, stmt: &crate::w
         crate::write::Stmt::Update(_, set, cond) => update(lake, table, meta, set, cond, upto).await?,
         crate::write::Stmt::Delete(_, cond) => (select(lake, table, meta, &[], &format!("FROM {} {}", from(table), filter(cond)), upto).await?.0, vec![]),
         crate::write::Stmt::Merge(m) => merge(lake, table, meta, m, upto).await?,
+        crate::write::Stmt::Insert(_, query) => (vec![], vec![crate::write::rows(&session(lake, query, upto).await?, meta, query).await?]), // (a checked table's: `constraints.rs`)
+        crate::write::Stmt::InsertInto(t, names, query) => {
+            let query = crate::write::whole_rows(lake, t, names, query).await?;
+            (vec![], vec![crate::write::rows(&session(lake, &query, upto).await?, meta, &query).await?])
+        }
         _ => bail!("not an UPDATE, DELETE or MERGE"),
     })
 }
@@ -398,7 +406,8 @@ async fn commit(lake: &Lake, seq: &Sequencer, table: &str, meta: &TableMeta, old
 /// Appends as one flush, packed again while the views change under it.
 pub async fn submit(lake: &Lake, seq: &Sequencer, pending: &[Append]) -> Result<Outcome> {
     loop {
-        match seq.submit(pack(lake, pending).await?).await? {
+        let flush = crate::log::Flush { checked: true, ..pack(lake, pending).await? }; // (its rows met the UNIQUE constraints: `appends`)
+        match seq.submit(flush).await? {
             Outcome::Retry(r) if r.is_empty() => tokio::time::sleep(std::time::Duration::from_millis(10)).await, // (views changed: pack again)
             o => return Ok(o),
         }
@@ -429,6 +438,9 @@ pub async fn appends(lake: &Lake, seq: &Sequencer, table: &str, meta: &TableMeta
     let new = one(new, ids.clone())?;
     if let Some(n) = &new {
         crate::defaults::check(meta, table, n)?; // (an UPDATE may not empty a NOT NULL column)
+    }
+    if crate::constraints::checked(meta) {
+        crate::constraints::check(lake, table, meta, old.as_ref(), new.as_ref()).await?; // (under the lake's lock: no other write of the table between)
     }
     let inserted = new.as_ref().and_then(|n| Some(n.column_by_name(ROW_ID)?.null_count())).unwrap_or(0); // (new rows: no id yet)
     let src = |p: &str| Src { producer: format!("{producer}{p}"), seq: 1, prev: None };

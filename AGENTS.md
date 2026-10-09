@@ -61,14 +61,18 @@ src/      28,600 lines of Rust, one file per concern (see the table in README.md
           file tabs; console.js the shell and `window.pondra`; loaded when first used: more.js
           (Runs, Variables, Settings, search, choosing Python), data.js (data files), chart.js,
           plan.js, details.js and more.css, sqlfile.js (a SQL file), rename.js (renaming a file),
-          tabs.js (the tabs' and the panes' menus), live.js (live queries)), xlsx.rs (a download as an Excel workbook); round 32 fresh.rs (a view's plan kept from one write to
+          tabs.js (the tabs' and the panes' menus), live.js (live queries), share.js (sharing a
+          table with another company)), xlsx.rs (a download as an Excel workbook); round 32 fresh.rs (a view's plan kept from one write to
           the next); round 33 format.rs (the lake's format, ADR-039), drain.rs (stopping without
           dropping work), service.rs (`pondra service`: systemd, launchd, a Windows service;
           ADR-041), past.rs (a table's past: `AT (…)`, `RESTORE`, ADR-043) and history.rs (every
           statement a row of `pondra.history`, slow ones with plans and traces, ADR-048); round 34
           friendly.rs (DuckDB's spellings, rewritten where SQL comes in: invariant 225), objects.rs
           (one registry of every kind of object: ADR-049, invariant 227), seq.rs (sequences and
-          identity columns: invariant 234) and index.rs (indexes kept as objects: invariant 235)
+          identity columns: invariant 234), index.rs (indexes kept as objects: invariant 235),
+          constraints.rs (UNIQUE checked on the leader, other keys kept as facts: invariant 236),
+          and shares.rs, sharing.rs and vend.rs (sharing with other companies, ADR-046: invariants
+          237–239)
 brand/    the logo (mark.svg), colours (colors.css) and fonts (fonts/: Geist and Geist Mono, SIL
           OFL): the only copies; tools/brand_check.py
 site/     the documentation website (Starlight; ADR-030): site/STYLE.md says how pages are written,
@@ -137,7 +141,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
   and window emission), `v/` views, `w/` session views' bounds, `k/` tasks, `x/` Delta and `i/`
   Iceberg publish state, `a/` lakes attached, `f/` functions, `r/` macros and procedures, `e/`
   secrets (sealed), `o/` catalogs attached from outside and `fd/` feeds (round 23), `sq/` sequences
-  (round 34: only the sequencer writes them), `ix/` indexes (round 34), `m` members
+  (round 34: only the sequencer writes them), `ix/` indexes (round 34), `sh/` shares and `sr/` recipients (ADR-046), `m` members
   (replicated acks), `n` next segment, `c` commit number. One process (the leader) writes it;
   everyone reads it.
 - **Writes:** a client POSTs a batch to *any* node. That node encodes it (Arrow IPC + ZSTD), runs
@@ -1581,8 +1585,36 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    notice that nothing is built (files' ranges and `CLUSTER BY` are what skip data), and shares the
    relation names of tables, views and sequences (`ddl::unclaimed`, `seq::relation`). It goes with
    its table, and with a column it names (`index::follow`, after `objects::follow`). What would be
-   a promise (`UNIQUE`, `USING hnsw | ivfflat | bm25`) is refused by name until it is kept.
+   a promise (`USING hnsw | ivfflat | bm25`) is refused by name until it is kept; `CREATE UNIQUE
+   INDEX` on columns is a UNIQUE constraint (invariant 236), on anything else refused.
    `harness.py registry`: an index through a column's rename, a table's rename and drops; refusals.
+236. **A UNIQUE holds because only the leader's check writes its table** (`constraints.rs`, ADR-057):
+   every SQL write to a table with an enforced UNIQUE goes to the change path (`write::changes`),
+   whose `constraints::check` runs under the lake's lock against the table at `visible()`, and the
+   sequencer takes that table's rows only from a flush the change path made (`Flush::checked`,
+   never sent between nodes; `constraints::sequenced`). The other doors refuse the table by name. A
+   UNIQUE added to a table is committed before the rows there are checked (with one flush through
+   the sequencer between, so those sequenced before it are in), and put back if two share a value.
+   Without `checked`, an `ALTER TABLE … ADD CONSTRAINT` raced by a node that hadn't seen it would let
+   a duplicate in (no test reproduces that race yet). `harness.py constraints`: three nodes inserting
+   the same 40 values at once, 40 go in (more without the lock); every door; ADD over duplicates;
+   `CREATE UNIQUE INDEX`; the Postgres catalog.
+237. **A recipient reads only what is shared with it, at a published version, through links that end**
+   (`sharing.rs`, `vend.rs`, ADR-046). The sharing door serves a table's published Delta log
+   (`read_delta::replay`; so only durable state, invariant 16). Its files are filtered by the
+   share's partitions, and a file whose partition isn't known is left out. Each link reads one
+   object for `PONDRA_SHARE_URL_SECS`: the bucket's signed URL, or the node's, signed with the
+   lake's key over the object, its end and its recipient. The door takes recipients' tokens only,
+   and users' tokens mean nothing there. A client that can't read deletion vectors or column
+   mapping is refused, never given deleted rows. A branch holds none of its base's shares or
+   recipients (`branch::make`). `tools/sharing_check.py`, `tools/environments_check.py`.
+238. **A node's link carries its signature as a query parameter** (`vend::links`: `?sp=r&sig=…`).
+   Delta's kernel, which reads for the delta-sharing client, takes an http link as a link only when
+   it has one of the clouds' signature parameters. With the signature in the path, it looked for the
+   link's path on the client's own disk. `sharing_check.py`: "a shared table read with pandas…".
+239. **Every request at the sharing door is a row of `pondra.audit`, refusals too** (`audit::shared`,
+   door `sharing`, class `share`). An `ATTACH` naming a token or a profile is kept with them as
+   `'***'`. `sharing_check.py`.
 
 ## Tests: run these before and after any change
 
@@ -1595,6 +1627,7 @@ python3 tools/fuzz_doors.py --secs 60   # malformed input at HTTP, SQL, Postgres
 python3 tools/resilience_check.py [storage cutoff clients doors disk cache server cli]   # every mode under failure: a failing bucket (faulty_s3.py), a cut-off leader, clients and doors through kills, full disks, pondra sql killed
 python3 tools/upgrade_check.py [lakes|format|drain|rolling|all] [--s3]   # every release's lake since 0.22 opens and answers as it did; newer formats refused; drains (a leader on a bucket with --s3); a rolling upgrade under load
 python3 tools/soak.py --minutes 10 [--hours 24] [--s3]                   # C4: steady ingest, nodes stopped and killed, memory, the log, commits on a timeline
+python3 tools/sharing_check.py [--s3]   # shares read by the delta-sharing client (its own venv: it pins pandas < 3) and another Pondra == the provider's rows; refusals; the audit log
 python3 tools/history_check.py   # DROP/UNDROP, retention, PURGE, Delta; AT (VERSION | TIMESTAMP | OFFSET) == a model of 13 states; RESTORE; CLONE (no copy, apart, merges and drops); refusals
 python3 tools/deploy_check.py                  # the image and compose; add python, chart, helm (kind), service: deploy.yml runs them all
 python3 tools/harness.py versions       # every file keeps its versions: listed, read, restored, after a delete, retention, old notebooks
@@ -1608,6 +1641,7 @@ python3 tools/harness.py minmax         # a global min/max over 24 files skips n
 python3 tools/harness.py history        # pondra.history: every door's statements, slow ones' plans and three nodes' traces, the rate, off, who reads what
 python3 tools/harness.py friendly       # DuckDB's spellings (PIVOT, COLUMNS, lambdas, ASOF … ON, SUMMARIZE, samples, …) == DuckDB's answers; spread, Postgres, views
 python3 tools/harness.py sequences      # nextval on three nodes (every value once), identity columns from every door, ALWAYS, owned sequences, a leader's kill
+python3 tools/harness.py constraints    # UNIQUE from every door and three nodes at once (23505), NOT ENFORCED facts, ADD/DROP CONSTRAINT, SHOW CREATE, the Postgres catalog
 python3 tools/harness.py registry       # pondra.objects, SHOW CREATE of every kind run again after a drop, COMMENT ON through renames, CREATE OR ALTER TABLE, GET /kinds
 python3 tools/random_sql.py --queries 100000 # random queries: one node == DuckDB, every tenth == three nodes, each split three ways by a condition (TLP)
 python3 tools/harness.py tasks          # task graphs on three nodes: AFTER, WHEN, pondra.result, retries, timeouts, SUSPEND, refusals, a failover

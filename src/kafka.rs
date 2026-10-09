@@ -394,7 +394,7 @@ async fn queue(app: &App, table: &str, meta: &TableMeta, records: &[u8]) -> BoxF
             Ok((rows, _)) => rows,
             Err(e) => return invalid(e),
         };
-        if let Err(e) = crate::defaults::check(meta, table, &rows) {
+        if let Err(e) = crate::constraints::door(meta, table).and_then(|_| crate::defaults::check(meta, table, &rows)) {
             return invalid(e); // (NOT NULL: said as a bad record, which a producer doesn't retry)
         }
         let src = match b.producer_id >= 0 && b.base_seq >= 0 {

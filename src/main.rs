@@ -30,6 +30,7 @@ mod fresh;
 mod fsum;
 mod hot;
 mod index;
+mod constraints;
 mod intervals;
 mod layout;
 mod iceberg;

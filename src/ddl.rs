@@ -226,6 +226,7 @@ pub enum Ddl {
     Object(crate::objects::Op),                              // the registry's: COMMENT ON, CREATE OR ALTER TABLE (`objects.rs`)
     Sequence(crate::seq::Change),                            // CREATE, ALTER, DROP SEQUENCE (`seq.rs`)
     Index(crate::index::Change),                             // CREATE, ALTER, DROP INDEX (`index.rs`)
+    Constraint { table: String, change: crate::constraints::Change }, // ALTER TABLE … ADD | DROP CONSTRAINT (`constraints.rs`)
 }
 
 /// What `ALTER TABLE` does to a column: rename it, drop it, or widen its type (a SQL type).
@@ -296,6 +297,11 @@ async fn carry_out(lake: &Lake, d: Ddl) -> Result<Value> {
         Ddl::Object(op) => crate::objects::apply(lake, op).await,
         Ddl::Sequence(c) => crate::seq::apply(lake, c).await,
         Ddl::Index(c) => crate::index::apply(lake, c).await,
+        Ddl::Constraint { table, change } => {
+            let (other, table) = resolve(lake, &table).await?;
+            ensure!(other.is_none(), "{table} is an attached lake's: change its constraints from a node of that lake");
+            crate::constraints::apply(lake, &table, change).await
+        }
         Ddl::CreateSchema { name, if_not_exists } => {
             check(&name)?;
             if has_schema(lake, &name).await? {
@@ -1020,6 +1026,7 @@ async fn alter_column(lake: &Lake, table: &str, column: &str, change: Change) ->
             m.cluster.retain(|c| *c != stored);
             m.merge.remove(&stored);
             m.names.remove(&stored);
+            crate::constraints::without_column(&mut m, &stored); // (its UNIQUE and the facts naming it go with it, as in Postgres)
             m.dropped.push(stored.clone());
             j!({"dropped": column})
         }

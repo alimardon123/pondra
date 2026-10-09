@@ -465,7 +465,8 @@ pub fn calls(sql: &str) -> bool {
 
 /// A positional `INSERT INTO t query` gives every column: refused when one is an ALWAYS identity.
 pub async fn check_every(lake: &Lake, table: &str) -> Result<()> {
-    let (other, name) = crate::ddl::resolve(lake, table).await?;
+    // (a name not in a lake here, say an outside catalog's table: the INSERT's own path takes it)
+    let Ok((other, name)) = crate::ddl::resolve(lake, table).await else { return Ok(()) };
     let Some(meta) = other.as_deref().unwrap_or(lake).cat.get::<TableMeta>(&crate::store::table_key(&name)).await? else { return Ok(()) };
     let first = always(&meta).next().map(str::to_string);
     match first {

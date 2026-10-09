@@ -320,6 +320,7 @@ fn table_sql(name: &str, m: &TableMeta) -> String {
         parts.push(format!("PRIMARY KEY ({})", list_sql(&m.key)));
     }
     parts.extend(m.checks.iter().map(|(n, c)| format!("CONSTRAINT {} CHECK ({c})", ident(n))));
+    parts.extend(m.constraints.iter().map(|c| c.sql(&ident)));
     let mut s = format!("CREATE TABLE {name} (\n  {}\n)", parts.join(",\n  "));
     if let Some(p) = &m.partition {
         s += &format!("\nPARTITION BY {p}");
@@ -665,6 +666,8 @@ async fn or_alter(lake: &Lake, name: &str, sql: &str) -> Result<Value> {
     }
     let checks: Vec<(String, String)> = serde_json::from_value(s["checks"].clone()).unwrap_or_default();
     ensure!(checks == old.checks, "{table}'s CHECK constraints can't change yet");
+    let constraints: Vec<crate::constraints::Constraint> = serde_json::from_value(s["constraints"].clone()).unwrap_or_default();
+    ensure!(constraints == old.constraints, "{table}'s UNIQUE, PRIMARY KEY and FOREIGN KEY constraints change with ALTER TABLE {table} ADD | DROP CONSTRAINT");
     // Types widened, as ALTER COLUMN … TYPE does (and refuses, by name, one that would narrow).
     let mut changed = vec![];
     for ((c, t), (_, new)) in was.iter().zip(&columns) {

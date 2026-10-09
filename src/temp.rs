@@ -282,6 +282,7 @@ async fn create(app: &App, s: &str, c: &ast::CreateTable, files: bool) -> Result
     let spec: Value = serde_json::from_str(&crate::write::create_spec(c, &app.lake, files).await?)?;
     let keyed = spec["key"].as_array().is_some_and(|k| !k.is_empty()) || spec["merge"].as_object().is_some_and(|m| !m.is_empty());
     ensure!(!keyed, "{name}: a temporary table keeps its rows as they come (PRIMARY KEY and merge are a lake table's)");
+    ensure!(!spec["constraints"].as_array().is_some_and(|k| k.iter().any(|k| k["enforced"] == true)), "{name}: a temporary table keeps its rows as they come (UNIQUE is a lake table's; NOT ENFORCED keeps none)");
     let columns: Vec<(String, String)> = serde_json::from_value(spec["columns"].clone())?;
     let columns = columns.iter().map(|(n, t)| Ok((n.clone(), crate::query::type_name(&crate::write::stored(&crate::query::dtype(t)?))))).collect::<Result<Vec<_>>>()?;
     ensure!(columns.iter().all(|(c, _)| !crate::sys::NAMES.contains(&c.as_str())), "{}: system columns (every table has them)", crate::sys::NAMES.join(", "));
