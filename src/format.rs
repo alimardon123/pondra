@@ -21,11 +21,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// The newest format this build reads and writes. 2: a materialized view that finishes its answers
-/// as it is read (`TableMeta::finish`, ADR-055).
+/// as it is read (`TableMeta::finish`, ADR-055) or runs its query again (`View::rerun`, ADR-056, 057).
 pub const FORMAT: u32 = 2;
-
-/// The format every lake gets without asking: the mark itself (`raise`).
-const BASE: u32 = 1;
 
 /// The format every lake gets without asking: the mark itself (`raise`).
 const BASE: u32 = 1;
