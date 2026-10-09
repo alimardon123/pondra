@@ -10,7 +10,8 @@ name: build
 # A tag's release (release.yml) publishes this run's packages: nothing is built twice, and what
 # the suite tested is what ships. A pull request's push runs nothing (its thread builds and tests
 # where it works), unless the pull request asks: the label `ci` builds linux-x64 with the suite,
-# and `full-ci` all five, as main would, once before it merges. Decided from the labels alone, so a
+# and `full-ci` every platform but macOS Intel, once before it merges (macOS Intel's build is the
+# slowest by far, 31 to 50 minutes, and is main's alone). Decided from the labels alone, so a
 # push that asks for nothing never waits for a runner to say so; a newer push stops the older run.
 # Two pull requests' runs go at once: a third waits, holding no runner, until ci-slots.yml starts it.
 on:
@@ -32,8 +33,8 @@ jobs:
   # on every platform (the merge changed nothing in it: the branch was up to date with main)
   # builds nothing: release.yml and cluster-bench.yml take that run's packages (tools/ci_build.sh
   # finds them by the commit's tree). Otherwise main builds all five. A pull request labelled `ci`
-  # builds linux-x64; labelled `full-ci`, all five (and main reuses that run when the tree is the
-  # same); with neither, this job and the build are skipped.
+  # builds linux-x64; labelled `full-ci`, all but macOS Intel (so main builds a merge of it again);
+  # with neither, this job and the build are skipped.
   plan:
     if: >-
       github.event_name != 'pull_request' ||
@@ -76,15 +77,16 @@ jobs:
             echo "run=$run" >> "$GITHUB_OUTPUT"
             if [ -n "$run" ]; then echo "Built and tested already: https://github.com/$GITHUB_REPOSITORY/actions/runs/$run" >> "$GITHUB_STEP_SUMMARY"; fi
           fi
-          if [ "$FULL" != true ]; then echo "linux-x64 alone (the label \`ci\`). Before merging, the label \`full-ci\` builds all five platforms." >> "$GITHUB_STEP_SUMMARY"; fi
+          if [ "$FULL" != true ]; then echo "linux-x64 alone (the label \`ci\`). Before merging, the label \`full-ci\` builds the other platforms but macOS Intel (main's alone)." >> "$GITHUB_STEP_SUMMARY"; fi
           # (linux-x64 apart: the suite and the tests after the build start once it is built, and
           # never wait for the slowest platform)
           echo "linux=$(jq -c '{include: [.[] | select(.platform == "linux-x64")]}' <<< "$platforms")" >> "$GITHUB_OUTPUT"
-          echo "others=$(jq -c '{include: [.[] | select(.platform != "linux-x64")]}' <<< "$platforms")" >> "$GITHUB_OUTPUT"
+          # (macOS Intel on main alone: a pull request's full-ci waited for it, the slowest by far)
+          echo "others=$(jq -c --arg event "$GITHUB_EVENT_NAME" '{include: [.[] | select(.platform != "linux-x64" and ($event != "pull_request" or .platform != "macos-x64"))]}' <<< "$platforms")" >> "$GITHUB_OUTPUT"
           echo "full=$FULL" >> "$GITHUB_OUTPUT"
           # The tests of what a pull request's run builds, called below once it is built: upgrade
           # always, resilience when what it puts under failure changes, sharing when what it shares,
-          # deploy's (all five platforms: `full-ci`) when what it tries changes. (The files from git:
+          # deploy's (`full-ci`: the platforms it tries) when what it tries changes. (The files from git:
           # the API's hourly allowance for the repository runs out on a busy day.)
           if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
             files=$(git diff --name-only HEAD^1 HEAD)
@@ -187,7 +189,7 @@ jobs:
           name: pondra-npm
           path: dist/pondra-[0-9]*.tgz
 
-  # The other four platforms (`full-ci`, and main), with the same steps.
+  # The other platforms (main; `full-ci` all but macOS Intel), with the same steps.
   build:
     needs: plan
     if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.run == '' && needs.plan.outputs.wait != 'true' && needs.plan.outputs.full == 'true' }}
