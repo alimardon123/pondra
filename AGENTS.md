@@ -50,6 +50,12 @@ The owner's design principles, which every change must respect:
    applies everywhere, with no copies to chase. Users customize and extend the whole product
    (their own objects, functions, settings, extensions) as fully as the core does. Reliability,
    simplicity, performance and efficiency stay the bar, and every review holds a change to this.
+10. **Every feature through every door** (the owner, 2026-10-09): what Pondra can do, it can do from
+   SQL, Python, JavaScript, the command line, HTTP, Flight, the Postgres port, MCP and the console,
+   as far as a door allows (Kafka's protocol carries rows, not statements). A door that can't take
+   something refuses it by name, never quietly. A new feature adds its row to the doors matrix
+   (`harness.py doors`), and the promises scorecard in `docs/roadmap.md` lists where the doors
+   still differ and the round that closes each gap.
 
 ## Layout
 
