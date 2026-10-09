@@ -34,6 +34,7 @@ mod types;
 mod constraints;
 mod intervals;
 mod layout;
+mod learned;
 mod iceberg;
 mod inbox;
 mod kafka;
